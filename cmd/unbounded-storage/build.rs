@@ -74,6 +74,7 @@ fn generate_config_schema() {
         "Config",
         "P2pCfg",
         "RoutingPlan",
+        "FabricAddress",
         "PeerSpec",
         "DiskSpec",
         "BackendSpec",

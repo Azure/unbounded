@@ -591,7 +591,7 @@ local_node_id = {local_id}
 
 [[peers]]
 id = {peer_id}
-address = "{peer_addr}"
+address = {{ socket = "{peer_addr}" }}
 
 [[disks]]
 path = "{disk_path}"

@@ -127,13 +127,22 @@ message RoutingPlan {
   optional uint64 predecessor = 3;
 }
 
+message FabricAddress {
+  // Numeric IP socket address usable by libfabric/RDMA CM, e.g.
+  // "10.0.0.1:9000". On InfiniBand this is usually an IPoIB address;
+  // on tcp fallback it is a normal TCP socket address.
+  string socket = 1;
+  // Provider-native escape hatch for RDMA deployments without socket
+  // addressing. Currently encoded as "hex:<fi_getname-bytes>" so a
+  // controller can publish the raw provider address when needed.
+  string native = 2;
+}
+
 message PeerSpec {
-  reserved 2;
-  reserved "transport";
   uint64 id = 1;
-  string address = 3;
-  optional uint32 hca_numa = 4;
-  repeated string labels = 5;
+  FabricAddress address = 2;
+  optional uint32 hca_numa = 3;
+  repeated string labels = 4;
 }
 
 message DiskSpec {

@@ -93,7 +93,7 @@ impl ConfigDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{BackendSpec, DiskSpec, FrontendSpec, PeerSpec};
+    use crate::config::schema::{BackendSpec, DiskSpec, FabricAddress, FrontendSpec, PeerSpec};
 
     fn base() -> Config {
         let mut c: Config = toml::from_str("").unwrap();
@@ -117,7 +117,10 @@ mod tests {
         b.p2p.as_mut().unwrap().local_node_id = Some(1);
         b.peers.push(PeerSpec {
             id: 2,
-            address: "127.0.0.1:9000".to_string(),
+            address: Some(FabricAddress {
+                socket: "127.0.0.1:9000".to_string(),
+                native: String::new(),
+            }),
             labels: vec![],
             hca_numa: None,
         });

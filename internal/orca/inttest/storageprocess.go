@@ -144,7 +144,7 @@ local_node_id = %d
 
 [[peers]]
 id = %d
-address = "%s"
+address = { socket = "%s" }
 
 [[disks]]
 path = "%s"

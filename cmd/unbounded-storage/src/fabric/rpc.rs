@@ -599,8 +599,7 @@ where
                 // Full success sends no terminator (the client ends on
                 // "all pages landed"); only a short/zero-page response
                 // needs an explicit RESPONSE_END. See module docs.
-                let terminated_by_last_ack =
-                    header.dest_pages > 0 && next_idx == header.dest_pages;
+                let terminated_by_last_ack = header.dest_pages > 0 && next_idx == header.dest_pages;
                 if !terminated_by_last_ack {
                     let _ = send_response_end(shared, ep, header.request_id);
                 }

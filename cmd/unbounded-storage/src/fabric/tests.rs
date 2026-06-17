@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::fabric::PeerId;
-use crate::fabric::{ConnectionSpec, Fabric, FabricConfig, FabricError, Provider, defaults_for};
+use crate::fabric::{
+    ConnectionSpec, Fabric, FabricAddress, FabricConfig, FabricError, Provider, defaults_for,
+};
 use crate::runtime::{DefaultRuntime, Threading, WorkerIdx};
 
 use super::ffi;
@@ -112,7 +114,7 @@ fn add_remove_add_cycle() {
     let addr = wire_addr_of(&peer);
     let spec = ConnectionSpec {
         peer: PeerId(42),
-        wire_addr: addr.clone(),
+        address: FabricAddress::socket(addr.clone()),
         hca_numa: None,
         labels: Vec::new(),
     };
@@ -140,7 +142,7 @@ fn background_reconnect_dials_desired_peer() {
     let peer = new_tcp_fabric();
     let spec = ConnectionSpec {
         peer: PeerId(99),
-        wire_addr: wire_addr_of(&peer),
+        address: FabricAddress::socket(wire_addr_of(&peer)),
         hca_numa: None,
         labels: Vec::new(),
     };
@@ -179,7 +181,7 @@ fn numa_mismatch_rejects() {
     let f = Fabric::new(cfg).expect("Fabric::new failed after provider availability gate");
     let spec = ConnectionSpec {
         peer: PeerId(7),
-        wire_addr: "127.0.0.1:1".to_string(),
+        address: FabricAddress::socket("127.0.0.1:1".to_string()),
         hca_numa: Some(1),
         labels: Vec::new(),
     };
@@ -341,7 +343,7 @@ fn paired_fabrics(n_pages: usize) -> (Arc<Fabric>, Arc<Fabric>, MrHandle, MrHand
     server
         .add_connection(ConnectionSpec {
             peer: PeerId(1), // client peer-id in server's table
-            wire_addr: client_addr,
+            address: FabricAddress::socket(client_addr),
             hca_numa: None,
             labels: Vec::new(),
         })
@@ -349,7 +351,7 @@ fn paired_fabrics(n_pages: usize) -> (Arc<Fabric>, Arc<Fabric>, MrHandle, MrHand
     client
         .add_connection(ConnectionSpec {
             peer: PeerId(2), // server peer-id in client's table
-            wire_addr: server_addr,
+            address: FabricAddress::socket(server_addr),
             hca_numa: None,
             labels: Vec::new(),
         })
@@ -778,7 +780,7 @@ fn paired_with_pool_handler(
     server
         .add_connection(ConnectionSpec {
             peer: PeerId(1),
-            wire_addr: client_addr,
+            address: FabricAddress::socket(client_addr),
             hca_numa: None,
             labels: Vec::new(),
         })
@@ -786,7 +788,7 @@ fn paired_with_pool_handler(
     client
         .add_connection(ConnectionSpec {
             peer: PeerId(2),
-            wire_addr: server_addr,
+            address: FabricAddress::socket(server_addr),
             hca_numa: None,
             labels: Vec::new(),
         })
@@ -1128,28 +1130,28 @@ fn recursive_chain(
     let c_addr = wire_addr_of(&c);
     a.add_connection(ConnectionSpec {
         peer: PeerId(2),
-        wire_addr: b_addr.clone(),
+        address: FabricAddress::socket(b_addr.clone()),
         hca_numa: None,
         labels: Vec::new(),
     })
     .expect("a -> b connection");
     b.add_connection(ConnectionSpec {
         peer: PeerId(1),
-        wire_addr: a_addr,
+        address: FabricAddress::socket(a_addr),
         hca_numa: None,
         labels: Vec::new(),
     })
     .expect("b -> a connection");
     b.add_connection(ConnectionSpec {
         peer: PeerId(3),
-        wire_addr: c_addr,
+        address: FabricAddress::socket(c_addr),
         hca_numa: None,
         labels: Vec::new(),
     })
     .expect("b -> c connection");
     c.add_connection(ConnectionSpec {
         peer: PeerId(2),
-        wire_addr: b_addr,
+        address: FabricAddress::socket(b_addr),
         hca_numa: None,
         labels: Vec::new(),
     })

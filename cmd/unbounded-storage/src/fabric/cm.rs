@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::error::{FabricError, Result, check};
 use super::ffi;
-use super::types::PeerId;
+use super::types::{FabricAddress, PeerId};
 
 /// Bounded wait for a single connection-manager event, in
 /// milliseconds. Generous: bring-up handshakes complete in well under a
@@ -137,10 +137,10 @@ impl Listener {
         })
     }
 
-    /// The local address the passive endpoint is bound to, rendered as
-    /// numeric "ip:port" (or "[ip]:port" for IPv6). Resolves the actual
-    /// port chosen by the provider when the source was bound with port
-    /// 0.
+    /// The local address the passive endpoint is bound to, rendered as a
+    /// socket address when possible and as `hex:<fi_getname-bytes>` for
+    /// provider-native addresses. Resolves the actual port chosen by the
+    /// provider when the source was bound with port 0.
     pub(crate) fn local_addr(&self) -> Result<String> {
         getname_string(ffi::as_fid_pep(self.pep))
     }
@@ -443,8 +443,8 @@ unsafe impl Send for Connection {}
 // concurrent `&self` operations are sound.
 unsafe impl Sync for Connection {}
 
-/// Dial `dest` ("ip:port") and return an established [`Connection`]
-/// bundling `qps` endpoints (QPs).
+/// Dial `dest` and return an established [`Connection`] bundling `qps`
+/// endpoints (QPs).
 ///
 /// Opens a private EQ on `fabric`, builds `qps` active endpoints from
 /// `info` on `domain`, and issues one `fi_connect` per endpoint, each
@@ -458,7 +458,7 @@ pub(crate) fn connect(
     fabric: *mut ffi::fid_fabric,
     domain: *mut ffi::fid_domain,
     info: *mut ffi::fi_info,
-    dest: &str,
+    dest: &FabricAddress,
     local: PeerId,
     remote: PeerId,
     numa: Option<u16>,
@@ -466,15 +466,7 @@ pub(crate) fn connect(
 ) -> Result<Connection> {
     let qps = qps.max(1);
 
-    let mut sockaddr = [0u8; 128];
-    let dest_c =
-        std::ffi::CString::new(dest).map_err(|_| FabricError::BadConfig("dest has NUL"))?;
-    let len = unsafe {
-        ffi::ub_fi_parse_sockaddr(dest_c.as_ptr(), sockaddr.as_mut_ptr(), sockaddr.len())
-    };
-    if len < 0 {
-        return Err(FabricError::Pkg("ub_fi_parse_sockaddr", len as i32));
-    }
+    let dest_addr = encode_connect_addr(dest)?;
 
     let eq = open_eq(fabric)?;
     let eq_guard = FidGuard(ffi::as_fid_eq(eq));
@@ -496,7 +488,7 @@ pub(crate) fn connect(
         let rc = unsafe {
             ffi::ub_fi_connect(
                 ep,
-                sockaddr.as_ptr() as *const std::ffi::c_void,
+                dest_addr.as_ptr() as *const std::ffi::c_void,
                 private.as_ptr() as *const std::ffi::c_void,
                 CONNECT_PRIVATE_LEN,
             )
@@ -532,6 +524,59 @@ pub(crate) fn connect(
         numa,
         next: AtomicUsize::new(0),
     })
+}
+
+fn encode_connect_addr(dest: &FabricAddress) -> Result<Vec<u8>> {
+    match dest {
+        FabricAddress::Socket(addr) => encode_socket_addr(addr),
+        FabricAddress::Native(addr) => decode_native_addr(addr),
+    }
+}
+
+fn encode_socket_addr(dest: &str) -> Result<Vec<u8>> {
+    let mut sockaddr = [0u8; 128];
+    let dest_c =
+        std::ffi::CString::new(dest).map_err(|_| FabricError::BadConfig("dest has NUL"))?;
+    let len = unsafe {
+        ffi::ub_fi_parse_sockaddr(dest_c.as_ptr(), sockaddr.as_mut_ptr(), sockaddr.len())
+    };
+    if len < 0 {
+        return Err(FabricError::Pkg("ub_fi_parse_sockaddr", len as i32));
+    }
+    Ok(sockaddr[..len as usize].to_vec())
+}
+
+pub(crate) fn decode_native_addr(addr: &str) -> Result<Vec<u8>> {
+    let Some(hex) = addr.strip_prefix("hex:") else {
+        return Err(FabricError::BadConfig(
+            "native address must start with hex:",
+        ));
+    };
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return Err(FabricError::BadConfig(
+            "native address hex has invalid length",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let hi = hex_nibble(pair[0])?;
+        let lo = hex_nibble(pair[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(FabricError::BadConfig(
+            "native address hex contains non-hex digit",
+        )),
+    }
 }
 
 /// Open a connection-event queue on `fabric` with a blocking wait
@@ -670,9 +715,8 @@ fn connect_private(local: PeerId, qp_index: u16, qp_total: u16) -> [u8; CONNECT_
     p
 }
 
-/// `fi_getname` on `fid`, formatted as numeric "ip:port". Probes the
-/// length first (libfabric returns `-FI_ETOOSMALL` with `len` set), then
-/// renders the sockaddr via the shim.
+/// `fi_getname` on `fid`, formatted as numeric "ip:port" when it is a
+/// socket address, otherwise as `hex:<fi_getname-bytes>`.
 fn getname_string(fid: *mut ffi::fid) -> Result<String> {
     let mut len: usize = 0;
     let rc = unsafe { ffi::ub_fi_getname(fid, ptr::null_mut(), &mut len) };
@@ -683,6 +727,7 @@ fn getname_string(fid: *mut ffi::fid) -> Result<String> {
     let rc =
         unsafe { ffi::ub_fi_getname(fid, addr.as_mut_ptr() as *mut std::ffi::c_void, &mut len) };
     check("fi_getname", rc)?;
+    addr.truncate(len);
 
     let mut out = [0i8; 128];
     let written = unsafe {
@@ -694,10 +739,21 @@ fn getname_string(fid: *mut ffi::fid) -> Result<String> {
         )
     };
     if written < 0 {
-        return Err(FabricError::Pkg("ub_fi_format_sockaddr", written as i32));
+        return Ok(encode_native_addr(&addr));
     }
     let bytes: Vec<u8> = out[..written as usize].iter().map(|&b| b as u8).collect();
     String::from_utf8(bytes).map_err(|_| FabricError::NotFound("sockaddr not utf8"))
+}
+
+fn encode_native_addr(addr: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(4 + addr.len() * 2);
+    out.push_str("hex:");
+    for &b in addr {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Close-on-drop guard for a libfabric resource, used to keep the
@@ -849,7 +905,7 @@ mod tests {
             cli_fabric,
             cli_domain,
             cli_info,
-            &addr,
+            &FabricAddress::socket(addr.as_str()),
             client_peer,
             server_peer,
             Some(7),
@@ -924,7 +980,7 @@ mod tests {
             cli_fabric,
             cli_domain,
             cli_info,
-            &addr,
+            &FabricAddress::socket(addr.as_str()),
             client_peer,
             server_peer,
             Some(2),

@@ -356,6 +356,11 @@ unsafe extern "C" {
 
     pub fn ub_fi_build_hints(prov_name: *const c_char) -> *mut fi_info;
     pub fn ub_fi_hints_set_domain(hints: *mut fi_info, name: *const c_char) -> c_int;
+    pub fn ub_fi_hints_set_src_addr(
+        hints: *mut fi_info,
+        addr: *const c_void,
+        addrlen: usize,
+    ) -> c_int;
     pub fn ub_fi_info_fabric_attr(info: *mut fi_info) -> *mut fi_fabric_attr;
     pub fn ub_fi_info_mr_mode(info: *mut fi_info) -> c_int;
     pub fn ub_fi_info_threading(info: *mut fi_info) -> c_int;

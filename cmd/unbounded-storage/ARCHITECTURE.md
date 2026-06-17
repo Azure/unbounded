@@ -71,8 +71,10 @@ The crate produces two binaries:
 
 ### libfabric
 
-The fabric layer links the native libfabric `tcp` RDM provider (requires
-libfabric 2.0+; the experimental `net` provider has been merged into `tcp`).
+The fabric layer links libfabric and uses connection-managed MSG endpoints
+for both `verbs` and `tcp` providers. The pinned libfabric build provides the
+native `tcp` provider (requires libfabric 2.0+; the experimental `net`
+provider has been merged into `tcp`).
 `make libfabric` installs the pinned `LIBFABRIC_VERSION` under
 `tmp/libfabric/<version>/`, and the Makefile exports
 `LIBFABRIC_PKG_CONFIG_PATH` and `LD_LIBRARY_PATH`. The build compiles a small C
@@ -103,9 +105,9 @@ excluded from the live-reload diff.
   bytes, no suffix; `0` -> 128 MiB) - the total backing pool, split
   evenly across the serving shards so the host footprint stays fixed
   regardless of the auto-scaled shard count.
-- `[startup.fabric]` - `listen_addr` (default `0.0.0.0:0`),
-  `progress_threads` (2), `progress_poll_us` (10),
-  `rpc_worker_threads` (4), `max_inflight` (1024) - the per-shard fabric
+- `[startup.fabric]` - `listen_addr` (default `0.0.0.0:0`, or `hex:...`
+  for provider-native binds), `progress_threads` (2), `progress_poll_us`
+  (10), `rpc_worker_threads` (4), `max_inflight` (1024) - the fabric
   endpoint, thread pools, and in-flight cap.
 - `[startup.topology]` - `serving_cores` (`0` = auto-fill every usable
   CPU), `nic_workers` (fabric CPUs per active HCA, `0` -> 4),
@@ -577,8 +579,12 @@ Sections (all optional, each falling back to defaults):
   historical defaults hold. See the CLI section for the per-field
   defaults.
 - `[[peers]]` - `id` (unique `u64`, doubles as both `NodeId` and `PeerId`),
-  `address` (a `host:port` `SocketAddr`), `hca_numa` (optional), and
-  `labels`. Fabric/provider selection is local-HCA based.
+  `address`, `hca_numa` (optional), and `labels`. The normal address form is
+  `{ socket = "10.0.0.1:9000" }`, a numeric IP socket address usable by
+  libfabric/RDMA CM for the selected local HCA. On InfiniBand this is usually
+  IPoIB; tcp fallback uses a normal TCP socket address. The escape hatch is
+  `{ native = "hex:..." }`, a controller-generated raw provider address for
+  deployments where socket addressing is unavailable.
 - `[[disks]]` - `path` (unique), `kind` (`0` = nvme default | `1` = block |
   `2` = file), `numa` (optional), `queue_depth` (optional), plus `size`,
   `page_size_bytes`, `bypass_admission`, and `skip_recovery_scan_if_no_meta`

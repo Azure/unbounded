@@ -2,6 +2,19 @@
 // Licensed under the MIT License.
 
 //! Read and validate the daemon's configuration.
+//!
+//! Two on-disk encodings are supported, selected by the file
+//! extension:
+//!
+//! - `.binpb` is decoded as a raw binary protobuf wire message
+//!   (`prost::Message::decode`), keeping protobuf's forward-compatible
+//!   unknown-field semantics.
+//! - any other extension (notably `.toml`) is parsed as strict TOML,
+//!   where unknown keys are rejected.
+//!
+//! Both paths feed the same [`Config::apply_defaults`] and
+//! [`validate`] finalization, so the encoding only affects how bytes
+//! become a `Config`, not what counts as a valid one.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -10,12 +23,15 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 
+use prost::Message;
+
 use super::schema::{BackendKind, Config, DiskKind, FrontendKind};
 
 #[derive(Debug)]
 pub enum ConfigError {
     Io(io::Error),
     Toml(toml::de::Error),
+    Protobuf(prost::DecodeError),
     DuplicatePeer(u64),
     DuplicateDiskPath(String),
     MissingFileDiskSize(String),
@@ -26,7 +42,13 @@ pub enum ConfigError {
         page_size: u64,
     },
     SizeOnlyForFileDisk(String),
+    MissingPeerAddr(u64),
+    AmbiguousPeerAddr(u64),
     InvalidPeerAddr {
+        peer_id: u64,
+        addr: String,
+    },
+    InvalidNativePeerAddr {
         peer_id: u64,
         addr: String,
     },
@@ -86,6 +108,7 @@ impl fmt::Display for ConfigError {
         match self {
             ConfigError::Io(e) => write!(f, "io error reading config: {e}"),
             ConfigError::Toml(e) => write!(f, "toml parse error: {e}"),
+            ConfigError::Protobuf(e) => write!(f, "protobuf decode error: {e}"),
             ConfigError::DuplicatePeer(id) => write!(f, "duplicate peer id: {id}"),
             ConfigError::DuplicateDiskPath(p) => {
                 write!(f, "duplicate disk path: {p}")
@@ -107,8 +130,20 @@ impl fmt::Display for ConfigError {
             ConfigError::SizeOnlyForFileDisk(p) => {
                 write!(f, "disk {p}: `size` is only valid for kind = \"file\"")
             }
+            ConfigError::MissingPeerAddr(peer_id) => {
+                write!(f, "peer {peer_id}: address requires `socket` or `native`")
+            }
+            ConfigError::AmbiguousPeerAddr(peer_id) => {
+                write!(
+                    f,
+                    "peer {peer_id}: address must set only one of `socket` or `native`"
+                )
+            }
             ConfigError::InvalidPeerAddr { peer_id, addr } => {
                 write!(f, "peer {peer_id}: invalid socket address {addr:?}")
+            }
+            ConfigError::InvalidNativePeerAddr { peer_id, addr } => {
+                write!(f, "peer {peer_id}: invalid native fabric address {addr:?}")
             }
             ConfigError::EmptyDiskPath => write!(f, "disk path must not be empty"),
             ConfigError::MissingLocalNodeId => write!(
@@ -196,6 +231,7 @@ impl std::error::Error for ConfigError {
         match self {
             ConfigError::Io(e) => Some(e),
             ConfigError::Toml(e) => Some(e),
+            ConfigError::Protobuf(e) => Some(e),
             _ => None,
         }
     }
@@ -213,18 +249,34 @@ impl From<toml::de::Error> for ConfigError {
     }
 }
 
+impl From<prost::DecodeError> for ConfigError {
+    fn from(e: prost::DecodeError) -> Self {
+        ConfigError::Protobuf(e)
+    }
+}
+
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         load(path.as_ref())
     }
 }
 
-/// Loads a TOML config from `path` and applies defaulting and validation.
+/// Loads a config from `path`, decoding raw binary protobuf for a
+/// `.binpb` extension and strict TOML for anything else. Both encodings
+/// share the same defaulting and validation finalization.
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
-    let mut cfg: Config = toml::from_str(&fs::read_to_string(path)?)?;
+    let mut cfg = if has_binpb_extension(path) {
+        Config::decode(fs::read(path)?.as_slice())?
+    } else {
+        toml::from_str(&fs::read_to_string(path)?)?
+    };
     cfg.apply_defaults();
     validate(&cfg)?;
     Ok(cfg)
+}
+
+fn has_binpb_extension(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("binpb")
 }
 
 fn validate(cfg: &Config) -> Result<(), ConfigError> {
@@ -241,12 +293,7 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         if p2p.local_node_id == Some(p.id) {
             return Err(ConfigError::LocalNodeIdCollidesWithPeer(p.id));
         }
-        if p.address.parse::<SocketAddr>().is_err() {
-            return Err(ConfigError::InvalidPeerAddr {
-                peer_id: p.id,
-                addr: p.address.clone(),
-            });
-        }
+        validate_peer_address(p.id, p.address.as_ref())?;
     }
 
     // Disjoint-discovery routing plan: every referenced id must name a
@@ -391,6 +438,47 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_peer_address(
+    peer_id: u64,
+    address: Option<&super::schema::FabricAddress>,
+) -> Result<(), ConfigError> {
+    let Some(address) = address else {
+        return Err(ConfigError::MissingPeerAddr(peer_id));
+    };
+
+    let has_socket = !address.socket.is_empty();
+    let has_native = !address.native.is_empty();
+    match (has_socket, has_native) {
+        (false, false) => Err(ConfigError::MissingPeerAddr(peer_id)),
+        (true, true) => Err(ConfigError::AmbiguousPeerAddr(peer_id)),
+        (true, false) => {
+            if address.socket.parse::<SocketAddr>().is_err() {
+                return Err(ConfigError::InvalidPeerAddr {
+                    peer_id,
+                    addr: address.socket.clone(),
+                });
+            }
+            Ok(())
+        }
+        (false, true) => {
+            if !is_valid_native_address(&address.native) {
+                return Err(ConfigError::InvalidNativePeerAddr {
+                    peer_id,
+                    addr: address.native.clone(),
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+fn is_valid_native_address(addr: &str) -> bool {
+    let Some(hex) = addr.strip_prefix("hex:") else {
+        return false;
+    };
+    !hex.is_empty() && hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::schema::BackendKind;
@@ -403,6 +491,20 @@ mod tests {
         f.write_all(contents.as_bytes()).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    fn write_binpb(bytes: &[u8]) -> NamedTempFile {
+        let mut f = tempfile::Builder::new()
+            .suffix(".binpb")
+            .tempfile()
+            .unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    fn encode_config(cfg: &Config) -> Vec<u8> {
+        cfg.encode_to_vec()
     }
 
     #[test]
@@ -420,11 +522,11 @@ local_node_id = 99
 
 [[peers]]
 id = 1
-address = "10.0.0.1:9000"
+address = { socket = "10.0.0.1:9000" }
 
 [[peers]]
 id = 2
-address = "10.0.0.2:9000"
+address = { socket = "10.0.0.2:9000" }
 hca_numa = 0
 
 [[disks]]
@@ -450,11 +552,11 @@ local_node_id = 99
 
 [[peers]]
 id = 1
-address = "10.0.0.1:9000"
+address = { socket = "10.0.0.1:9000" }
 
 [[peers]]
 id = 1
-address = "10.0.0.2:9000"
+address = { socket = "10.0.0.2:9000" }
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -487,7 +589,7 @@ local_node_id = 1
 
 [[peers]]
 id = 7
-address = "not-an-addr"
+address = { socket = "not-an-addr" }
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -504,12 +606,81 @@ local_node_id = 1
 
 [[peers]]
 id = 8
-address = "example.com:9000"
+address = { socket = "example.com:9000" }
 "#;
         let f = write_cfg(s);
         assert!(matches!(
             load(f.path()),
             Err(ConfigError::InvalidPeerAddr { peer_id: 8, .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_native_peer_addr() {
+        let s = r#"
+[p2p]
+local_node_id = 1
+
+[[peers]]
+id = 9
+address = { native = "hex:01020304" }
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("load should succeed");
+        assert_eq!(
+            cfg.peers[0].address.as_ref().unwrap().native,
+            "hex:01020304"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_peer_addr_variant() {
+        let s = r#"
+[p2p]
+local_node_id = 1
+
+[[peers]]
+id = 9
+address = {}
+"#;
+        let f = write_cfg(s);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::MissingPeerAddr(9))
+        ));
+    }
+
+    #[test]
+    fn rejects_ambiguous_peer_addr() {
+        let s = r#"
+[p2p]
+local_node_id = 1
+
+[[peers]]
+id = 9
+address = { socket = "10.0.0.9:9000", native = "hex:0102" }
+"#;
+        let f = write_cfg(s);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::AmbiguousPeerAddr(9))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_native_peer_addr() {
+        let s = r#"
+[p2p]
+local_node_id = 1
+
+[[peers]]
+id = 9
+address = { native = "gid:bad" }
+"#;
+        let f = write_cfg(s);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::InvalidNativePeerAddr { peer_id: 9, .. })
         ));
     }
 
@@ -617,7 +788,7 @@ size = 16777216
         let s = r#"
 [[peers]]
 id = 1
-address = "10.0.0.1:9000"
+address = { socket = "10.0.0.1:9000" }
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -634,7 +805,7 @@ local_node_id = 7
 
 [[peers]]
 id = 1
-address = "10.0.0.1:9000"
+address = { socket = "10.0.0.1:9000" }
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
@@ -650,7 +821,7 @@ local_node_id = 1
 
 [[peers]]
 id = 1
-address = "10.0.0.1:9000"
+address = { socket = "10.0.0.1:9000" }
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -925,6 +1096,76 @@ fingers_per_nod = 128
 "#;
         let f = write_cfg(s);
         assert!(matches!(load(f.path()), Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn loads_binpb_config() {
+        // A `.binpb` file is decoded from the protobuf wire format that
+        // the TOML loader's `Config` round-trips to.
+        let toml = r#"
+[p2p]
+local_node_id = 99
+
+[[peers]]
+id = 1
+address = { socket = "10.0.0.1:9000" }
+
+[[disks]]
+path = "/dev/nvme0n1"
+kind = 0
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let f = write_binpb(&encode_config(&cfg));
+        let loaded = load(f.path()).unwrap();
+        assert_eq!(loaded.peers.len(), 1);
+        assert_eq!(loaded.peers[0].id, 1);
+        assert_eq!(loaded.disks.len(), 1);
+        assert_eq!(loaded.p2p().local_node_id, Some(99));
+    }
+
+    #[test]
+    fn binpb_applies_defaults() {
+        // The binpb path shares the TOML path's defaulting finalization.
+        let f = write_binpb(&encode_config(&Config::default()));
+        let loaded = load(f.path()).unwrap();
+        assert_eq!(loaded.p2p().fingers_per_node, 100);
+        assert_eq!(loaded.startup().topology().hcas_per_numa_node, 1);
+    }
+
+    #[test]
+    fn binpb_runs_validation() {
+        // Validation runs regardless of encoding: a duplicate peer id is
+        // rejected even when it arrives over the protobuf wire path.
+        let toml = r#"
+[p2p]
+local_node_id = 99
+
+[[peers]]
+id = 1
+address = { socket = "10.0.0.1:9000" }
+
+[[peers]]
+id = 2
+address = { socket = "10.0.0.2:9000" }
+"#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.peers[1].id = 1;
+        let f = write_binpb(&encode_config(&cfg));
+        match load(f.path()) {
+            Err(ConfigError::DuplicatePeer(1)) => {}
+            other => panic!("expected DuplicatePeer(1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_binpb_bytes() {
+        // A field tag with a truncated varint payload is not a valid
+        // protobuf message and surfaces as a decode error.
+        let f = write_binpb(&[0x08]);
+        match load(f.path()) {
+            Err(ConfigError::Protobuf(_)) => {}
+            other => panic!("expected Protobuf decode error, got {other:?}"),
+        }
     }
 
     fn rejects_out_of_range_disk_kind() {

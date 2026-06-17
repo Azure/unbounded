@@ -10,7 +10,9 @@
 //!
 //! Both providers (`verbs` and `tcp`) speak native `FI_EP_MSG`; there
 //! is no address vector and no tagged/RDM path. Remote addressing is by
-//! numeric "ip:port", resolved through the connection manager.
+//! ordinary socket addresses through RDMA CM/libfabric, with a native
+//! raw-address escape hatch for deployments that cannot use socket
+//! addressing on their RDMA fabric.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -159,21 +161,35 @@ impl Fabric {
             }
         }
 
-        // When listening, split the bind address into node/service for
-        // fi_getinfo with FI_SOURCE. Applies to both providers now: the
-        // MSG hints request FI_SOCKADDR_IN, so verbs binds an IPoIB
-        // "ip:port" just like tcp.
+        // When listening, socket binds are passed to fi_getinfo as
+        // node/service. Native binds seed hints->src_addr with raw
+        // provider bytes and still use FI_SOURCE.
         let (node_cstr, service_cstr): (Option<CString>, Option<CString>) = if cfg.listen {
             match cfg.listen_addr.as_deref() {
                 Some(addr) => {
-                    let (host, port) = addr
-                        .rsplit_once(':')
-                        .ok_or(FabricError::BadConfig("listen_addr must be host:port"))?;
-                    let host = CString::new(host)
-                        .map_err(|_| FabricError::BadConfig("listen_addr has NUL"))?;
-                    let port = CString::new(port)
-                        .map_err(|_| FabricError::BadConfig("listen_addr has NUL"))?;
-                    (Some(host), Some(port))
+                    if addr.starts_with("hex:") {
+                        let native = cm::decode_native_addr(addr)?;
+                        let rc = unsafe {
+                            ffi::ub_fi_hints_set_src_addr(
+                                hints,
+                                native.as_ptr() as *const std::ffi::c_void,
+                                native.len(),
+                            )
+                        };
+                        if rc != 0 {
+                            return Err(FabricError::Pkg("ub_fi_hints_set_src_addr", rc));
+                        }
+                        (None, None)
+                    } else {
+                        let (host, port) = addr.rsplit_once(':').ok_or(FabricError::BadConfig(
+                            "listen_addr must be host:port or hex:<bytes>",
+                        ))?;
+                        let host = CString::new(host)
+                            .map_err(|_| FabricError::BadConfig("listen_addr has NUL"))?;
+                        let port = CString::new(port)
+                            .map_err(|_| FabricError::BadConfig("listen_addr has NUL"))?;
+                        (Some(host), Some(port))
+                    }
                 }
                 None => (None, None),
             }
@@ -392,8 +408,9 @@ impl Fabric {
         result
     }
 
-    /// The bound listen address as numeric "ip:port". Errors when this
-    /// fabric was not configured to listen.
+    /// The bound listen address as a numeric socket address when
+    /// libfabric reports one, otherwise as `hex:<fi_getname-bytes>`.
+    /// Errors when this fabric was not configured to listen.
     pub fn self_address(&self) -> Result<String> {
         match self.inner.listener.as_ref() {
             Some(l) => l.local_addr(),

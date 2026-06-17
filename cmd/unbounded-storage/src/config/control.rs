@@ -31,9 +31,9 @@
 //! here as [`ShardControlGroup`].
 
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvError, Sender};
-use std::sync::Arc;
 
 use crate::config::{Config, ConfigDiff};
 use crate::p2p::RoutingSnapshot;
@@ -416,12 +416,12 @@ impl ShardControlGroup {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::mpsc;
     use std::sync::Arc;
+    use std::sync::mpsc;
     use std::thread;
 
     use super::*;
-    use crate::p2p::{node_to_ring, FingerTable, FingerTableConfig, PeerEntry, RoutingSnapshot};
+    use crate::p2p::{FingerTable, FingerTableConfig, PeerEntry, RoutingSnapshot, node_to_ring};
 
     fn empty_routing() -> RoutingSnapshot {
         let local = PeerEntry {
@@ -513,9 +513,11 @@ mod tests {
     fn broadcast_apply_on_empty_group_is_a_noop() {
         let group = ShardControlGroup::new(Vec::new());
         assert!(group.is_empty());
-        assert!(group
-            .broadcast_apply(Arc::new(Config::default()), empty_routing())
-            .is_ok());
+        assert!(
+            group
+                .broadcast_apply(Arc::new(Config::default()), empty_routing())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -569,11 +571,18 @@ mod tests {
         c.p2p.as_mut().unwrap().local_node_id = Some(0);
         c.peers.push(crate::config::PeerSpec {
             id: 1,
-            address: "127.0.0.1:9999".to_string(),
+            address: Some(socket_addr("127.0.0.1:9999")),
             hca_numa: None,
             labels: Vec::new(),
         });
         c
+    }
+
+    fn socket_addr(addr: impl Into<String>) -> crate::config::FabricAddress {
+        crate::config::FabricAddress {
+            socket: addr.into(),
+            native: String::new(),
+        }
     }
 
     #[test]
@@ -612,7 +621,7 @@ mod tests {
         let mut next = config_with_peer(2);
         next.peers.push(crate::config::PeerSpec {
             id: 2,
-            address: "127.0.0.1:9998".to_string(),
+            address: Some(socket_addr("127.0.0.1:9998")),
             hca_numa: None,
             labels: Vec::new(),
         });
@@ -620,11 +629,12 @@ mod tests {
         let out = ctrl.apply(Arc::new(next)).unwrap();
         assert_eq!(out.tier, ApplyTier::InPlace);
         assert_eq!(ctrl.target_mut().in_place, 1);
-        assert!(ctrl
-            .target_mut()
-            .last_diff
-            .unwrap()
-            .requires_routing_reload());
+        assert!(
+            ctrl.target_mut()
+                .last_diff
+                .unwrap()
+                .requires_routing_reload()
+        );
         assert_eq!(ctrl.config_versions().applied(), 2);
     }
 
@@ -665,7 +675,7 @@ mod tests {
         let mut next = config_with_peer(5);
         next.peers.push(crate::config::PeerSpec {
             id: 2,
-            address: "127.0.0.1:9998".to_string(),
+            address: Some(socket_addr("127.0.0.1:9998")),
             hca_numa: None,
             labels: Vec::new(),
         });
@@ -702,7 +712,7 @@ mod tests {
         let mut next = config_with_peer(11);
         next.peers.push(crate::config::PeerSpec {
             id: 2,
-            address: "127.0.0.1:9998".to_string(),
+            address: Some(socket_addr("127.0.0.1:9998")),
             hca_numa: None,
             labels: Vec::new(),
         });
@@ -734,7 +744,7 @@ mod tests {
         let mut failing = config_with_peer(7);
         failing.peers.push(crate::config::PeerSpec {
             id: 2,
-            address: "127.0.0.1:9998".to_string(),
+            address: Some(socket_addr("127.0.0.1:9998")),
             hca_numa: None,
             labels: Vec::new(),
         });
@@ -749,7 +759,7 @@ mod tests {
         let mut next = config_with_peer(8);
         next.peers.push(crate::config::PeerSpec {
             id: 3,
-            address: "127.0.0.1:9997".to_string(),
+            address: Some(socket_addr("127.0.0.1:9997")),
             hca_numa: None,
             labels: Vec::new(),
         });

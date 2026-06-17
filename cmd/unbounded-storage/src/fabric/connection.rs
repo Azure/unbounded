@@ -273,7 +273,7 @@ impl Dialer {
             self.fabric,
             self.domain,
             self.dial_info,
-            &spec.wire_addr,
+            &spec.address,
             self.self_peer,
             spec.peer,
             self.numa,
@@ -345,7 +345,7 @@ impl Fabric {
                 eprintln!(
                     "fabric: dial to peer {} ({}) failed: {e:?}; relying on \
                      background reconnect",
-                    spec.peer.0, spec.wire_addr,
+                    spec.peer.0, spec.address,
                 );
             }
         }

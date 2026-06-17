@@ -54,7 +54,7 @@ restart.
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--config <PATH>` | `/etc/unbounded-storage/config.toml` | TOML config file. Missing default path is non-fatal; missing explicit path is fatal. |
+| `--config <PATH>` | `/etc/unbounded-storage/config.toml` | TOML or `.binpb` config file. Missing default path is non-fatal; missing explicit path is fatal. |
 | `-h, --help` | - | Print help. |
 | `-V, --version` | - | Print version. |
 
@@ -64,7 +64,8 @@ deterministic order (disks closed first, then fabric / pool drops).
 ## Configuration file
 
 The schema is defined by `proto/config.proto` and is the source of
-truth; the daemon loads it from strict TOML. The schema is deliberately
+truth; the daemon can load strict TOML or a raw binary protobuf wire
+message with a `.binpb` extension. The schema is deliberately
 proto3-native rather than idiomatic TOML:
 
 - Enum fields are plain integers (the enum discriminant), not strings.
@@ -74,7 +75,8 @@ proto3-native rather than idiomatic TOML:
   filled with the documented default after load. Unknown keys are
   rejected: the TOML loader is strict, so a typo fails loudly at parse
   time, and enum integers outside their defined values are rejected by
-  validation.
+  validation. (The protobuf wire path stays forward-compatible by
+  protobuf's own unknown-field semantics.)
 
 Every section, and the table itself, is optional; omitted values fall
 back to the documented defaults. The config holds both the dynamically
@@ -110,8 +112,11 @@ fingers_per_node = 100           # routing finger-table fanout per node.
 
 [[peers]]                        # repeat per remote peer; ids must be unique.
 id        = 1                    # u64, unique within the daemon.
-address   = "10.0.0.1:9000"      # peer fabric listen address as host:port.
-                                 # Fabric/provider selection is local-HCA based.
+address   = { socket = "10.0.0.1:9000" }
+                                  # numeric fabric listen address. On InfiniBand
+                                  # this is usually IPoIB; tcp fallback uses TCP.
+                                  # Use { native = "hex:..." } only for
+                                  # controller-generated provider-native addresses.
 hca_numa  = 0                    # optional u16; pin connection setup to this NUMA node.
 
 [[disks]]                        # repeat per local device; paths must be unique.
@@ -126,7 +131,8 @@ memory_total_bytes = 134217728   # u64 bytes (no K/M/G suffix). Total backing po
                                  #   evenly across serving shards. 0 -> 128 MiB.
 
 [startup.fabric]
-listen_addr         = "0.0.0.0:0" # per-shard fabric listen address; :0 picks a free port.
+listen_addr         = "0.0.0.0:0" # fabric listen address; :0 picks a free port.
+                                 # Use "hex:..." only for provider-native binds.
 progress_threads    = 2          # libfabric progress threads per shard.
 progress_poll_us    = 10         # progress-thread busy-poll budget (us).
 rpc_worker_threads  = 4          # fabric RPC worker threads per shard.

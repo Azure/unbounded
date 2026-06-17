@@ -255,8 +255,9 @@ struct fi_info *ub_fi_build_hints(const char *prov_name) {
  * completion source), and there is no AV. mr_mode is requested the same
  * way; the provider pares it down (tcp negotiates an empty mr_mode and
  * uses 0-based RMA offsets, verbs keeps FI_MR_VIRT_ADDR and uses
- * absolute addresses). addr_format is FI_SOCKADDR_IN so connect targets
- * are plain "ip:port" reachable over IPoIB (verbs) or loopback (tcp).
+ * absolute addresses). addr_format is left unspecified so socket
+ * addresses remain the simple default while provider-native address
+ * bytes can still be passed to fi_connect as an escape hatch.
  *
  * Freed with fi_freeinfo by the caller.
  */
@@ -266,7 +267,7 @@ struct fi_info *ub_fi_build_msg_hints(const char *prov_name) {
         return NULL;
     }
     hints->caps = FI_MSG | FI_RMA;
-    hints->addr_format = FI_SOCKADDR_IN;
+    hints->addr_format = FI_FORMAT_UNSPEC;
     if (hints->ep_attr) {
         hints->ep_attr->type = FI_EP_MSG;
     }
@@ -312,6 +313,29 @@ int ub_fi_hints_set_domain(struct fi_info *hints, const char *name) {
     memcpy(dup, name, n);
     free(hints->domain_attr->name);
     hints->domain_attr->name = dup;
+    return 0;
+}
+
+/*
+ * Seed a provider-native source address on hints for FI_SOURCE lookups.
+ * This is the listen-side companion to passing raw native bytes to
+ * fi_connect: socket listeners still use node/service strings, while
+ * non-socket RDMA fabrics can bind using controller-generated fi_getname
+ * bytes. The copy is owned by hints and released by fi_freeinfo.
+ */
+int ub_fi_hints_set_src_addr(struct fi_info *hints, const void *addr,
+                             size_t addrlen) {
+    if (!hints || !addr || addrlen == 0) {
+        return -1;
+    }
+    void *copy = malloc(addrlen);
+    if (!copy) {
+        return -1;
+    }
+    memcpy(copy, addr, addrlen);
+    free(hints->src_addr);
+    hints->src_addr = copy;
+    hints->src_addrlen = addrlen;
     return 0;
 }
 

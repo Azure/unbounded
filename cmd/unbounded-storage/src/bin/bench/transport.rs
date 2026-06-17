@@ -99,8 +99,8 @@ use unbounded_storage::bufferpool::{
     StripeKey,
 };
 use unbounded_storage::fabric::{
-    ConnectionSpec, Fabric, FabricTransport, PeerId, PoolHandler, Provider, RpcServerHandle,
-    StaticPeer, apply_tcp_env_defaults, defaults_for,
+    ConnectionSpec, Fabric, FabricAddress, FabricTransport, PeerId, PoolHandler, Provider,
+    RpcServerHandle, StaticPeer, apply_tcp_env_defaults, defaults_for,
 };
 use unbounded_storage::memory::{Backing, BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
 use unbounded_storage::runtime::{
@@ -1207,7 +1207,7 @@ fn run_server(args: ServerArgs) -> Result<(), String> {
                 for (ep, client_addr) in endpoints.iter().zip(&client_addrs) {
                     if let Err(e) = ep.fabric.add_connection(ConnectionSpec {
                         peer: CLIENT_PEER_ID,
-                        wire_addr: client_addr.clone(),
+                        address: FabricAddress::socket(client_addr.clone()),
                         hca_numa: None,
                         labels: Vec::new(),
                     }) {
@@ -1271,7 +1271,7 @@ fn run_client(args: ClientArgs) -> Result<(), String> {
     for (f, server_addr) in fabrics.iter().zip(&server_addrs) {
         f.add_connection(ConnectionSpec {
             peer: SERVER_PEER_ID,
-            wire_addr: server_addr.clone(),
+            address: FabricAddress::socket(server_addr.clone()),
             hca_numa: None,
             labels: Vec::new(),
         })

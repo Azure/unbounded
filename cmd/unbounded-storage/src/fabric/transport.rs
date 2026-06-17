@@ -873,7 +873,10 @@ mod tests {
 
         // SAFETY: stream is pinned on the stack and never moved.
         let mut stream = unsafe { Pin::new_unchecked(&mut stream) };
-        assert!(matches!(stream.as_mut().poll_next(&mut cx), Poll::Ready(None)));
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
     }
 
     #[test]
@@ -942,7 +945,10 @@ mod tests {
             stream.as_mut().poll_next(&mut cx),
             Poll::Ready(Some(Ok(PageRef { page_idx: 0, .. })))
         ));
-        assert!(matches!(stream.as_mut().poll_next(&mut cx), Poll::Ready(None)));
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
     }
 
     #[test]

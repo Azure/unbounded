@@ -255,7 +255,7 @@ predecessor = 64
         let s = r#"
 [[peers]]
 id = 1
-address = "127.0.0.1:9000"
+address = { socket = "127.0.0.1:9000" }
 labels = ["us-west", "az1", "row3", "rack7"]
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
