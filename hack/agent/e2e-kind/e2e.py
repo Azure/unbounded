@@ -283,15 +283,6 @@ def apply_manifest(path: Path) -> None:
     kubectl(["apply", "-f", str(path)])
 
 
-def controller_manifest_order(path: Path) -> tuple[int, str]:
-    """Sort controller manifests while keeping the deployment last."""
-
-    if path.name == "03-deployment.yaml":
-        return (1, path.name)
-
-    return (0, path.name)
-
-
 def set_manifest_image_pull_policy(path: Path, policy: str) -> None:
     """Set the single imagePullPolicy in a rendered manifest."""
 
@@ -2259,10 +2250,7 @@ def deploy_unbounded_net_controller() -> None:
     log("Installing unbounded-net CRDs and controller manifests...")
     for crd_path in sorted((rendered / "crd").glob("*.yaml")):
         apply_manifest(crd_path)
-    for manifest_path in sorted(rendered.glob("*.yaml")) + sorted(
-        controller.glob("*.yaml"),
-        key=controller_manifest_order,
-    ):
+    for manifest_path in sorted(rendered.glob("*.yaml")) + sorted(controller.glob("*.yaml")):
         apply_manifest(manifest_path)
 
     try:
