@@ -287,20 +287,6 @@ it a simple loop to drive work without an async runtime.
 - Key fields consumed by main: `plan.serving_shards` (one shard thread each),
   `plan.nic_workers` (the fabric worker groups), and `plan.storage_cores`,
   which main maps to one `DiskCpuSlot` per NVMe drive.
-- **HCA-to-NUMA spreading matters for multi-HCA throughput.** On hosts with
-  several HCAs, two HCAs attached to the same NUMA node share that node's PCIe
-  uplink, so driving both at once does not add bandwidth: each is capped at
-  roughly half a single HCA's line rate and per-request latency roughly
-  doubles. Measured cross-VM over verbs (one HCA approx 130 Gb/s, approx 4 ms
-  p50): a same-NUMA HCA pair reached only approx 114 Gb/s at approx 9 ms p50,
-  while a cross-NUMA pair (one HCA per node) reached approx 266 Gb/s at approx
-  4 ms p50, and one-HCA-per-NUMA across four nodes scaled near-linearly to
-  approx 520 Gb/s while holding the approx 4 ms p50. The takeaway when
-  selecting a subset of a host's HCAs (for benchmarking or for partial
-  enablement): spread the chosen HCAs across distinct NUMA nodes rather than
-  filling one node's HCAs first. Beware that sysfs/`mlx5_N` index order is not
-  NUMA order, so the naive `mlx5_0..N` ordering tends to pair same-node HCAs.
-
 ### 7.3 `memory/` - NUMA-local backings
 
 - `Backing` is a pinned, NUMA-local memory region carved into fixed-size pages
@@ -585,15 +571,14 @@ Sections (all optional, each falling back to defaults):
   (`no_hugepages`, `memory_total_bytes`), `[startup.fabric]` (`listen_addr`,
   `progress_threads`, `progress_poll_us`, `rpc_worker_threads`,
   `max_inflight`), and `[startup.topology]` (`serving_cores`,
-  `nic_workers`, `use_smt_siblings`, `ignore_isolated`,
+  `nic_workers`, `hcas_per_numa_node`, `use_smt_siblings`, `ignore_isolated`,
   `include_node_cpu0`, `allow_inactive_port`, `disable_rdma`).
   `startup_to_core_plan_config` inverts the negative plan fields so the
   historical defaults hold. See the CLI section for the per-field
   defaults.
 - `[[peers]]` - `id` (unique `u64`, doubles as both `NodeId` and `PeerId`),
-  `transport` (`0` = tcp | `1` = rdma), `address` (a `host:port`
-  `SocketAddr` for tcp, or a lowercase even-length hex raw libfabric
-  address for rdma), `hca_numa` (optional), and `labels`.
+  `address` (a `host:port` `SocketAddr`), `hca_numa` (optional), and
+  `labels`. Fabric/provider selection is local-HCA based.
 - `[[disks]]` - `path` (unique), `kind` (`0` = nvme default | `1` = block |
   `2` = file), `numa` (optional), `queue_depth` (optional), plus `size`,
   `page_size_bytes`, `bypass_admission`, and `skip_recovery_scan_if_no_meta`

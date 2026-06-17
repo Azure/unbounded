@@ -54,7 +54,7 @@ restart.
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--config <PATH>` | `/etc/unbounded-storage/config.toml` | TOML or `.binpb` config file. Missing default path is non-fatal; missing explicit path is fatal. |
+| `--config <PATH>` | `/etc/unbounded-storage/config.toml` | TOML config file. Missing default path is non-fatal; missing explicit path is fatal. |
 | `-h, --help` | - | Print help. |
 | `-V, --version` | - | Print version. |
 
@@ -64,9 +64,8 @@ deterministic order (disks closed first, then fabric / pool drops).
 ## Configuration file
 
 The schema is defined by `proto/config.proto` and is the source of
-truth; the daemon can still load a TOML file today, but clients are
-expected to speak protobuf directly going forward. The schema is
-deliberately proto3-native rather than idiomatic TOML:
+truth; the daemon loads it from strict TOML. The schema is deliberately
+proto3-native rather than idiomatic TOML:
 
 - Enum fields are plain integers (the enum discriminant), not strings.
 - Byte-size fields are plain integer byte counts, with no K/M/G
@@ -75,8 +74,7 @@ deliberately proto3-native rather than idiomatic TOML:
   filled with the documented default after load. Unknown keys are
   rejected: the TOML loader is strict, so a typo fails loudly at parse
   time, and enum integers outside their defined values are rejected by
-  validation. (The protobuf wire path stays forward-compatible by
-  protobuf's own unknown-field semantics.)
+  validation.
 
 Every section, and the table itself, is optional; omitted values fall
 back to the documented defaults. The config holds both the dynamically
@@ -112,10 +110,8 @@ fingers_per_node = 100           # routing finger-table fanout per node.
 
 [[peers]]                        # repeat per remote peer; ids must be unique.
 id        = 1                    # u64, unique within the daemon.
-transport = 0                    # 0 = tcp, 1 = rdma.
-address   = "10.0.0.1:9000"      # tcp: host:port, parsed as SocketAddr.
-                                 # rdma: lowercase even-length ASCII hex
-                                 #       (raw libfabric address).
+address   = "10.0.0.1:9000"      # peer fabric listen address as host:port.
+                                 # Fabric/provider selection is local-HCA based.
 hca_numa  = 0                    # optional u16; pin connection setup to this NUMA node.
 
 [[disks]]                        # repeat per local device; paths must be unique.
@@ -139,13 +135,10 @@ max_inflight        = 1024       # max in-flight fabric ops per shard (back-pres
 [startup.topology]
 serving_cores         = 0        # serving shards; 0 = auto-fill every usable CPU.
 nic_workers           = 4        # fabric CPUs pinned per active HCA (0 -> 4).
-hcas_per_numa_node    = 1        # max HCAs used per NUMA node (0 -> 1). Two
-                                 # same-node HCAs collapse below one HCA, so the
-                                 # default fans out one per node; raise to use more.
+hcas_per_numa_node    = 1        # max HCAs used per NUMA node (0 -> 1).
 use_smt_siblings      = false    # also place shards on SMT sibling CPUs.
 ignore_isolated       = false    # also schedule onto isolcpus-isolated CPUs.
 include_node_cpu0     = false    # allow placing a shard on each NUMA node's CPU 0.
 allow_inactive_port   = false    # use HCA ports not in the active state.
 disable_rdma          = false    # disable RDMA and force the libfabric tcp provider.
 ```
-

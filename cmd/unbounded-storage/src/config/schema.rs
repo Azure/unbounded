@@ -17,9 +17,7 @@
 //! The TOML loader is strict: each message derives
 //! `#[serde(default, deny_unknown_fields)]`, so an unknown key fails
 //! loudly at parse time, and `config::load::validate` rejects enum
-//! integers outside their defined discriminants. This strictness applies
-//! only to the TOML path; decoding a protobuf wire message keeps
-//! protobuf's forward-compatible unknown-field semantics.
+//! integers outside their defined discriminants.
 
 include!(concat!(env!("OUT_DIR"), "/unbounded.storage.config.rs"));
 
@@ -159,8 +157,7 @@ mod tests {
     fn unknown_fields_are_rejected() {
         // The TOML loader is strict: an unknown key fails loudly at parse
         // time (deny_unknown_fields) so operator typos are caught rather
-        // than silently dropped. The protobuf wire path stays forward-
-        // compatible by protobuf's own unknown-field semantics.
+        // than silently dropped.
         assert!(toml::from_str::<Config>("nonsense = 1\n").is_err());
     }
 
@@ -258,7 +255,6 @@ predecessor = 64
         let s = r#"
 [[peers]]
 id = 1
-transport = 0
 address = "127.0.0.1:9000"
 labels = ["us-west", "az1", "row3", "rack7"]
 "#;

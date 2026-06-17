@@ -43,13 +43,8 @@ use super::ffi;
 use super::types::PeerId;
 use super::wire::{MSG_HEADER_LEN, MsgHeader, RECV_BUF_LEN};
 
-/// A pool of self-reposting untagged receives bound to one connected
-/// endpoint. Dropping the pool does not cancel the outstanding recvs;
-/// closing the owning endpoint does, which drains them through their
-/// handlers.
-pub(crate) struct RecvPool {
-    shared: Arc<RecvPoolShared>,
-}
+/// Arms self-reposting untagged receives for one connected endpoint.
+pub(crate) struct RecvPool;
 
 struct RecvPoolShared {
     ep: EpPtr,
@@ -82,7 +77,7 @@ impl RecvPool {
         dispatch: Arc<InboundDispatch>,
         depth: usize,
         local_ctx: LocalMrCtx,
-    ) -> Result<Self> {
+    ) -> Result<()> {
         let shared = Arc::new(RecvPoolShared {
             ep: EpPtr(ep),
             peer,
@@ -105,14 +100,7 @@ impl RecvPool {
                 ffi::ub_fi_eagain()
             }));
         }
-        Ok(RecvPool { shared })
-    }
-
-    /// Number of receive completions that failed (excluding the clean
-    /// cancellation path). Test/metrics visibility.
-    #[cfg(test)]
-    pub(crate) fn error_count(&self) -> u64 {
-        self.shared.errors.load(Ordering::Relaxed)
+        Ok(())
     }
 }
 

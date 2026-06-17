@@ -6,9 +6,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -24,18 +24,18 @@ use unbounded_storage::fanout::{
 };
 use unbounded_storage::frontend::{HttpDriver, HttpFrontend, S3Driver, S3Frontend};
 use unbounded_storage::p2p::{
-    FingerTable, FingerTableConfig, NodeId, PeerEntry, RoutedTransport, TopologyLabels,
-    node_to_ring,
+    node_to_ring, FingerTable, FingerTableConfig, NodeId, PeerEntry, RoutedTransport,
+    TopologyLabels,
 };
 use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
-use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{
     DiskChannelDirectory, DiskRegistry, LiveShardLocalStore, UringDiskTarget,
 };
+use unbounded_storage::storage::StripeReq;
 use unbounded_storage::topology::{CorePlan, CorePlanConfig, DiskCpuSlot, Host, ServingShard};
 
-use unbounded_storage::memory::{BackingKind, BackingRequest, allocate};
+use unbounded_storage::memory::{allocate, BackingKind, BackingRequest};
 use unbounded_storage::metrics;
 
 mod fabric_group;
@@ -1432,9 +1432,6 @@ impl Drop for PhaseBGuard {
 )]
 struct Cli {
     /// Path to the config file.
-    ///
-    /// A `.binpb` extension is decoded as a raw binary protobuf wire
-    /// message; any other extension is parsed as TOML.
     ///
     /// If left at the default and the file is missing, the daemon
     /// continues with built-in defaults. An explicit path that is

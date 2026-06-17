@@ -55,15 +55,14 @@ pub struct FabricConfig {
     /// modest per-connection sliding window, NOT a server-wide total. It
     /// bounds how many inbound messages one peer can have in flight before
     /// the progress thread re-arms. The shared registry is sized to
-    /// `max_inflight + max_connections * rpc_posted_recvs` so outbound
-    /// sends/RMA always have slots regardless of how many peers connect.
+    /// `max_inflight * write_pipeline_depth + max_connections * rpc_posted_recvs`
+    /// so outbound sends/RMA always have slots regardless of how many peers connect.
     pub rpc_posted_recvs: usize,
     /// Upper bound on the number of concurrent connections (inbound
     /// accepted plus outbound dialed) the completion registry budgets
     /// receive slots for. The registry is fixed-capacity at `Fabric::new`
     /// while connections are added dynamically, so this caps the recv-pool
-    /// slot reservation: registry capacity is
-    /// `max_inflight + max_connections * rpc_posted_recvs`. Must be `>= 1`.
+    /// slot reservation. Must be `>= 1`.
     pub max_connections: usize,
     /// Number of long-lived worker threads the RPC server spawns to
     /// serve inbound requests. Each request is enqueued by the progress

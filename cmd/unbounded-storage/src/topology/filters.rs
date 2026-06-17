@@ -32,12 +32,10 @@ pub(super) struct Filters {
 /// Apply HCA filters from `f`. Preserves the input order and keeps the
 /// original slice index so callers can still point at the right
 /// `host.hcas[i]`. After the active-port filter, caps the number of
-/// kept HCAs per NUMA node at `f.hcas_per_numa` (>=1): with two same-node
-/// HCAs the storage RPC pattern collapses below a single HCA, so the
-/// default of 1 fans out one HCA per node. Because `host.hcas` is sorted
-/// by BDF, the survivors are the lowest-BDF HCAs on each node, making the
-/// selection deterministic. HCAs whose NUMA node is unknown (`None`) are
-/// never capped.
+/// kept HCAs per NUMA node at `f.hcas_per_numa` (>=1). Because
+/// `host.hcas` is sorted by BDF, the survivors are the lowest-BDF HCAs on
+/// each node, making the selection deterministic. HCAs whose NUMA node is
+/// unknown (`None`) are never capped.
 pub(super) fn filter_hcas<'a>(hcas: &'a [Hca], f: &Filters) -> Vec<(usize, &'a Hca)> {
     use std::collections::BTreeMap;
 
@@ -72,8 +70,7 @@ pub(super) fn filter_hcas<'a>(hcas: &'a [Hca], f: &Filters) -> Vec<(usize, &'a H
                     true
                 }
             }
-            // Unknown NUMA: never capped (we cannot prove same-node
-            // contention without a node id).
+            // Unknown NUMA: never capped because there is no node id to group by.
             None => true,
         })
         .collect()

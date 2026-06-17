@@ -255,14 +255,20 @@ impl CommonArgs {
     /// otherwise the single `--device` is used. Order is significant:
     /// endpoint `i` on the server is paired with endpoint `i` on the
     /// client.
-    fn device_list(&self) -> Vec<String> {
+    fn device_list(&self) -> Result<Vec<String>, String> {
         match &self.devices {
-            Some(list) => list
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
-            None => vec![self.device.clone()],
+            Some(list) => {
+                let devices: Vec<String> = list
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if devices.is_empty() {
+                    return Err("--devices must include at least one device".to_string());
+                }
+                Ok(devices)
+            }
+            None => Ok(vec![self.device.clone()]),
         }
     }
 
@@ -283,7 +289,7 @@ impl CommonArgs {
     /// device defaults to `127.0.0.1:0` so tcp loopback works out of the
     /// box; cross-host verbs runs must pass each HCA's RoCE IP.
     fn listen_addr_list(&self) -> Result<Vec<String>, String> {
-        let devices = self.device_list();
+        let devices = self.device_list()?;
         let raw: Vec<String> = match &self.listen_addrs {
             Some(list) => list
                 .split(',')
@@ -475,7 +481,11 @@ fn fill_byte(key: &StripeKey) -> u8 {
 /// come from `topology::CorePlan`, falling back to an unpinned
 /// `DefaultRuntime` with a warning when topology cannot supply `needed`
 /// distinct CPUs or `--no-pin` is set.
-fn build_runtime(no_pin: bool, needed: usize) -> (Arc<dyn Threading>, String, Vec<WorkerSpec>) {
+fn build_runtime(
+    host: &Host,
+    no_pin: bool,
+    needed: usize,
+) -> (Arc<dyn Threading>, String, Vec<WorkerSpec>) {
     if no_pin {
         return (
             DefaultRuntime::new(needed),
@@ -483,7 +493,6 @@ fn build_runtime(no_pin: bool, needed: usize) -> (Arc<dyn Threading>, String, Ve
             Vec::new(),
         );
     }
-    let host = Host::discover();
     if host.cpus.is_empty() {
         eprintln!("bench: sysfs topology empty (no CPUs visible); running unpinned");
         return (
@@ -496,7 +505,7 @@ fn build_runtime(no_pin: bool, needed: usize) -> (Arc<dyn Threading>, String, Ve
     // cpu0-excluded cores. We pin one distinct CPU per worker slot,
     // drawing from all three classes so both RDMA and non-RDMA hosts
     // yield enough cores.
-    let plan = CorePlan::for_host(&host, &CorePlanConfig::default());
+    let plan = CorePlan::for_host(host, &CorePlanConfig::default());
     // Distinct CPUs in plan order across the three classes; the planner
     // already keeps them disjoint and cpu0-excluded, so the dedup is a
     // safety net that also preserves ordering.
@@ -542,7 +551,7 @@ fn build_runtime(no_pin: bool, needed: usize) -> (Arc<dyn Threading>, String, Ve
 /// to that device's HCA. `specs` is the runtime's ordered worker list
 /// (`WorkerIdx(i)` pins to `specs[i].cpu`); when it is empty (an unpinned
 /// runtime) the slots are handed out sequentially because pinning is then
-/// a no-op. The HCA's NUMA node comes from sysfs via `Host::discover`.
+/// a no-op. The HCA's NUMA node comes from the discovered host topology.
 ///
 /// Drawing each fabric's progress thread (and, on the client, its read
 /// shard) from a CPU on the HCA's own NUMA node avoids the cross-socket
@@ -551,6 +560,7 @@ fn build_runtime(no_pin: bool, needed: usize) -> (Arc<dyn Threading>, String, Ve
 /// exhausted, the next free slot from any node is used so we never run
 /// short, losing only locality for the overflow.
 fn plan_numa_slots(
+    host: &Host,
     specs: &[WorkerSpec],
     devices: &[String],
     slots_per_device: usize,
@@ -572,7 +582,6 @@ fn plan_numa_slots(
             })
             .collect();
     }
-    let host = Host::discover();
     // Slot indices grouped by their CPU's NUMA node, in spec order.
     let mut by_numa: BTreeMap<Option<u16>, VecDeque<usize>> = BTreeMap::new();
     for (idx, spec) in specs.iter().enumerate() {
@@ -620,13 +629,12 @@ fn plan_numa_slots(
     out
 }
 
-/// The NUMA node each device's HCA is attached to, in `devices` order,
-/// read from sysfs via `Host::discover`. `None` when the device is not
-/// found or the host does not expose a node for it. Used to first-touch
-/// each fabric's RMA backing on the HCA's local node so the NIC DMAs into
-/// near memory instead of bouncing across sockets.
-fn hca_numa_list(devices: &[String]) -> Vec<Option<u16>> {
-    let host = Host::discover();
+/// The NUMA node each device's HCA is attached to, in `devices` order.
+/// `None` when the device is not found or the host does not expose a node
+/// for it. Used to first-touch each fabric's RMA backing on the HCA's
+/// local node so the NIC DMAs into near memory instead of bouncing across
+/// sockets.
+fn hca_numa_list(host: &Host, devices: &[String]) -> Vec<Option<u16>> {
     devices
         .iter()
         .map(|d| {
@@ -877,13 +885,21 @@ fn run_client_workload(
         let seed = cw
             .seed
             .wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let shard_max_ops = shard_op_budget(max_ops, i, n);
         let (tx, rx) = mpsc::channel::<Result<(Duration, Vec<WorkerStat>), String>>();
         let handle = runtime.spawn_pinned(
             shard_slots[i],
             "bench-transport-client",
             Box::new(move || {
-                let res =
-                    client_shard(backing, transport, workers, deadline, max_ops, seed, verify);
+                let res = client_shard(
+                    backing,
+                    transport,
+                    workers,
+                    deadline,
+                    shard_max_ops,
+                    seed,
+                    verify,
+                );
                 let _ = tx.send(res);
             }),
         );
@@ -927,6 +943,14 @@ fn run_client_workload(
     Ok(report)
 }
 
+fn shard_op_budget(total: Option<u64>, shard: usize, shards: usize) -> Option<u64> {
+    total.map(|ops| {
+        let base = ops / shards as u64;
+        let extra = u64::from((shard as u64) < (ops % shards as u64));
+        base + extra
+    })
+}
+
 /// The client shard body: runs on the pinned worker thread, owns the
 /// `!Send` `Pool`, and drives the worker futures to completion.
 fn client_shard(
@@ -953,7 +977,7 @@ fn client_shard(
     let stats: Vec<Rc<RefCell<WorkerStat>>> = (0..workers)
         .map(|_| Rc::new(RefCell::new(WorkerStat::new())))
         .collect();
-    let per_worker_ops = max_ops.map(|n| n.div_ceil(workers as u64).max(1));
+    let remaining_ops = max_ops.map(|n| Rc::new(Cell::new(n)));
 
     // Drive every worker on the shard's cooperative future-set loop, the
     // same discipline the production shards use (`runtime::ShardLoop`).
@@ -968,8 +992,9 @@ fn client_shard(
         let pool = Rc::clone(&pool);
         let stat = Rc::clone(stat);
         let remaining = Rc::clone(&remaining);
+        let remaining_ops = remaining_ops.as_ref().map(Rc::clone);
         shard.spawn(async move {
-            client_worker(pool, stat, w as u64, deadline, per_worker_ops, seed).await;
+            client_worker(pool, stat, w as u64, deadline, remaining_ops, seed).await;
             remaining.set(remaining.get() - 1);
         });
     }
@@ -1002,7 +1027,7 @@ async fn client_worker(
     stat: Rc<RefCell<WorkerStat>>,
     worker_id: u64,
     deadline: Instant,
-    max_ops: Option<u64>,
+    remaining_ops: Option<Rc<Cell<u64>>>,
     seed: u64,
 ) {
     let page_len = PAGE_BYTES as u64;
@@ -1014,10 +1039,12 @@ async fn client_worker(
         if Instant::now() >= deadline {
             break;
         }
-        if let Some(cap) = max_ops {
-            if stat.borrow().ops >= cap {
+        if let Some(ops) = &remaining_ops {
+            let remaining = ops.get();
+            if remaining == 0 {
                 break;
             }
+            ops.set(remaining - 1);
         }
         let key = make_key(seed, worker_id, seq);
         seq = seq.wrapping_add(1);
@@ -1046,6 +1073,9 @@ async fn client_worker(
         let mut s = stat.borrow_mut();
         if failed {
             s.errors += 1;
+            if let Some(ops) = &remaining_ops {
+                ops.set(ops.get() + 1);
+            }
         } else {
             s.record(bytes, elapsed);
         }
@@ -1117,16 +1147,16 @@ const VERIFY_SEED: u64 = 0x5E_71_F0_00_u64;
 // ---------------------------------------------------------------------
 
 fn run_server(args: ServerArgs) -> Result<(), String> {
-    let devices = args.common.device_list();
+    let devices = args.common.device_list()?;
     let n = devices.len();
+    let host = Host::discover();
     // Server pins one CPU per fabric for that fabric's progress threads,
     // chosen NUMA-local to the HCA so CQ polling stays on-socket. No
     // client shard runs in this process.
-    let (runtime, pin_label, specs) = build_runtime(args.common.no_pin, n);
-    let slots = plan_numa_slots(&specs, &devices, 1);
-    let hca_numa = hca_numa_list(&devices);
+    let (runtime, pin_label, specs) = build_runtime(&host, args.common.no_pin, n);
+    let slots = plan_numa_slots(&host, &specs, &devices, 1);
+    let hca_numa = hca_numa_list(&host, &devices);
     let listen_addrs = args.common.listen_addr_list()?;
-    let provider = args.common.provider.to_fabric();
 
     let mut endpoints = Vec::with_capacity(n);
     for (i, dev) in devices.iter().enumerate() {
@@ -1192,22 +1222,20 @@ fn run_server(args: ServerArgs) -> Result<(), String> {
             }
             Err(e) => eprintln!("server: handshake with {peer} failed: {e}"),
         }
-        // Keep the provider plumbed; the verbs/tcp providers accept
-        // multiple clients sequentially. Loop back to accept.
-        let _ = provider;
     }
     Ok(())
 }
 
 fn run_client(args: ClientArgs) -> Result<(), String> {
-    let devices = args.common.device_list();
+    let devices = args.common.device_list()?;
     let n = devices.len();
+    let host = Host::discover();
     // Client pins 2 CPUs per fabric: one for the fabric's progress
     // threads and one for that fabric's read-issuing shard. Both are
     // drawn NUMA-local to the HCA so neither the CQ polling nor the
     // shard's submission path crosses sockets.
-    let (runtime, pin_label, specs) = build_runtime(args.common.no_pin, 2 * n);
-    let slots = plan_numa_slots(&specs, &devices, 2);
+    let (runtime, pin_label, specs) = build_runtime(&host, args.common.no_pin, 2 * n);
+    let slots = plan_numa_slots(&host, &specs, &devices, 2);
     let listen_addrs = args.common.listen_addr_list()?;
     let provider = args.common.provider.to_fabric();
 
@@ -1254,7 +1282,7 @@ fn run_client(args: ClientArgs) -> Result<(), String> {
 
     let peers = vec![SERVER_PEER_ID; n];
     let shard_slots: Vec<WorkerIdx> = (0..n).map(|i| slots[i][1]).collect();
-    let hca_numa = hca_numa_list(&devices);
+    let hca_numa = hca_numa_list(&host, &devices);
 
     if args.client.verify {
         run_client_workload(

@@ -487,18 +487,6 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                             }
                             MsgKind::ResponseEnd => {
                                 *ended = true;
-                                if acked.iter().any(|acked| !*acked) {
-                                    if let Some(mut l) = log.take() {
-                                        l.finish_err(
-                                            "RESPONSE_END before all requested pages were delivered",
-                                        );
-                                    }
-                                    return Poll::Ready(Some(Err(PoolError::transport(
-                                        FabricError::BadConfig(
-                                            "RESPONSE_END before all requested pages were delivered",
-                                        ),
-                                    ))));
-                                }
                                 if let Some(mut l) = log.take() {
                                     l.field("acked", acked.iter().filter(|a| **a).count())
                                         .finish_ok();
@@ -865,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn response_end_before_all_pages_returns_transport_error() {
+    fn response_end_with_no_pages_returns_eof() {
         let dsts = [
             PageRef {
                 page_idx: 0,
@@ -885,16 +873,7 @@ mod tests {
 
         // SAFETY: stream is pinned on the stack and never moved.
         let mut stream = unsafe { Pin::new_unchecked(&mut stream) };
-        match stream.as_mut().poll_next(&mut cx) {
-            Poll::Ready(Some(Err(PoolError::Transport(err)))) => {
-                assert!(
-                    err.to_string()
-                        .contains("RESPONSE_END before all requested pages were delivered"),
-                    "unexpected error: {err}",
-                );
-            }
-            other => panic!("expected transport error, got {other:?}"),
-        }
+        assert!(matches!(stream.as_mut().poll_next(&mut cx), Poll::Ready(None)));
     }
 
     #[test]
@@ -938,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn response_end_rejects_missing_ack_despite_matching_count() {
+    fn response_end_after_short_success_returns_eof() {
         let dsts = [
             PageRef {
                 page_idx: 0,
@@ -951,23 +930,19 @@ mod tests {
                 len: 4096,
             },
         ];
-        let mut stream = active_stream(&dsts, vec![true, false]);
+        let mut stream = active_stream(&dsts, vec![false, false]);
+        push_page_ack(&mut stream, 0);
         push_response_end(&mut stream);
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
         // SAFETY: stream is pinned on the stack and never moved.
         let mut stream = unsafe { Pin::new_unchecked(&mut stream) };
-        match stream.as_mut().poll_next(&mut cx) {
-            Poll::Ready(Some(Err(PoolError::Transport(err)))) => {
-                assert!(
-                    err.to_string()
-                        .contains("RESPONSE_END before all requested pages were delivered"),
-                    "unexpected error: {err}",
-                );
-            }
-            other => panic!("expected transport error, got {other:?}"),
-        }
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut cx),
+            Poll::Ready(Some(Ok(PageRef { page_idx: 0, .. })))
+        ));
+        assert!(matches!(stream.as_mut().poll_next(&mut cx), Poll::Ready(None)));
     }
 
     #[test]

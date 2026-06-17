@@ -39,6 +39,20 @@
 #include <rdma/fi_rma.h>
 #include <rdma/fi_tagged.h>
 
+struct ub_fi_cq_err_entry {
+    void *op_context;
+    uint64_t flags;
+    size_t len;
+    void *buf;
+    uint64_t data;
+    uint64_t tag;
+    size_t olen;
+    int err;
+    int prov_errno;
+    void *err_data;
+    size_t err_data_size;
+};
+
 /* ------------------------------------------------------------------
  * Inline-function wrappers.
  * ------------------------------------------------------------------ */
@@ -87,9 +101,24 @@ ssize_t ub_fi_cq_readfrom(struct fid_cq *cq, void *buf, size_t count,
     return fi_cq_readfrom(cq, buf, count, src_addr);
 }
 
-ssize_t ub_fi_cq_readerr(struct fid_cq *cq, struct fi_cq_err_entry *buf,
+ssize_t ub_fi_cq_readerr(struct fid_cq *cq, struct ub_fi_cq_err_entry *buf,
                          uint64_t flags) {
-    return fi_cq_readerr(cq, buf, flags);
+    struct fi_cq_err_entry native;
+    ssize_t rc = fi_cq_readerr(cq, &native, flags);
+    if (rc > 0 && buf != NULL) {
+        buf->op_context = native.op_context;
+        buf->flags = native.flags;
+        buf->len = native.len;
+        buf->buf = native.buf;
+        buf->data = native.data;
+        buf->tag = native.tag;
+        buf->olen = native.olen;
+        buf->err = native.err;
+        buf->prov_errno = native.prov_errno;
+        buf->err_data = native.err_data;
+        buf->err_data_size = native.err_data_size;
+    }
+    return rc;
 }
 
 int ub_fi_getname(struct fid *fid, void *addr, size_t *addrlen) {
@@ -394,7 +423,6 @@ int ub_fi_enodata(void) { return FI_ENODATA; }
 #define UB_FI_FIELD_CQ_ERR_ENTRY_PROV_ERRNO 23
 #define UB_FI_FIELD_CQ_ERR_ENTRY_ERR_DATA 24
 #define UB_FI_FIELD_CQ_ERR_ENTRY_ERR_DATA_SIZE 25
-#define UB_FI_FIELD_CQ_ERR_ENTRY_SRC_ADDR 26
 #define UB_FI_FIELD_RMA_IOV_ADDR 27
 #define UB_FI_FIELD_RMA_IOV_LEN 28
 #define UB_FI_FIELD_RMA_IOV_KEY 29
@@ -420,7 +448,7 @@ size_t ub_fi_layout(int type, int field) {
         case UB_FI_LAYOUT_FI_AV_ATTR: return sizeof(struct fi_av_attr);
         case UB_FI_LAYOUT_FI_CQ_DATA_ENTRY: return sizeof(struct fi_cq_data_entry);
         case UB_FI_LAYOUT_FI_CQ_TAGGED_ENTRY: return sizeof(struct fi_cq_tagged_entry);
-        case UB_FI_LAYOUT_FI_CQ_ERR_ENTRY: return sizeof(struct fi_cq_err_entry);
+        case UB_FI_LAYOUT_FI_CQ_ERR_ENTRY: return sizeof(struct ub_fi_cq_err_entry);
         case UB_FI_LAYOUT_FI_RMA_IOV: return sizeof(struct fi_rma_iov);
         case UB_FI_LAYOUT_FI_EQ_ATTR: return sizeof(struct fi_eq_attr);
         case UB_FI_LAYOUT_FI_EQ_CM_ENTRY: return sizeof(struct fi_eq_cm_entry);
@@ -473,18 +501,17 @@ size_t ub_fi_layout(int type, int field) {
         }
     case UB_FI_LAYOUT_FI_CQ_ERR_ENTRY:
         switch (field) {
-        case UB_FI_FIELD_CQ_ENTRY_OP_CONTEXT: return offsetof(struct fi_cq_err_entry, op_context);
-        case UB_FI_FIELD_CQ_ENTRY_FLAGS: return offsetof(struct fi_cq_err_entry, flags);
-        case UB_FI_FIELD_CQ_ENTRY_LEN: return offsetof(struct fi_cq_err_entry, len);
-        case UB_FI_FIELD_CQ_ENTRY_BUF: return offsetof(struct fi_cq_err_entry, buf);
-        case UB_FI_FIELD_CQ_ENTRY_DATA: return offsetof(struct fi_cq_err_entry, data);
-        case UB_FI_FIELD_CQ_ENTRY_TAG: return offsetof(struct fi_cq_err_entry, tag);
-        case UB_FI_FIELD_CQ_ERR_ENTRY_OLEN: return offsetof(struct fi_cq_err_entry, olen);
-        case UB_FI_FIELD_CQ_ERR_ENTRY_ERR: return offsetof(struct fi_cq_err_entry, err);
-        case UB_FI_FIELD_CQ_ERR_ENTRY_PROV_ERRNO: return offsetof(struct fi_cq_err_entry, prov_errno);
-        case UB_FI_FIELD_CQ_ERR_ENTRY_ERR_DATA: return offsetof(struct fi_cq_err_entry, err_data);
-        case UB_FI_FIELD_CQ_ERR_ENTRY_ERR_DATA_SIZE: return offsetof(struct fi_cq_err_entry, err_data_size);
-        case UB_FI_FIELD_CQ_ERR_ENTRY_SRC_ADDR: return offsetof(struct fi_cq_err_entry, src_addr);
+        case UB_FI_FIELD_CQ_ENTRY_OP_CONTEXT: return offsetof(struct ub_fi_cq_err_entry, op_context);
+        case UB_FI_FIELD_CQ_ENTRY_FLAGS: return offsetof(struct ub_fi_cq_err_entry, flags);
+        case UB_FI_FIELD_CQ_ENTRY_LEN: return offsetof(struct ub_fi_cq_err_entry, len);
+        case UB_FI_FIELD_CQ_ENTRY_BUF: return offsetof(struct ub_fi_cq_err_entry, buf);
+        case UB_FI_FIELD_CQ_ENTRY_DATA: return offsetof(struct ub_fi_cq_err_entry, data);
+        case UB_FI_FIELD_CQ_ENTRY_TAG: return offsetof(struct ub_fi_cq_err_entry, tag);
+        case UB_FI_FIELD_CQ_ERR_ENTRY_OLEN: return offsetof(struct ub_fi_cq_err_entry, olen);
+        case UB_FI_FIELD_CQ_ERR_ENTRY_ERR: return offsetof(struct ub_fi_cq_err_entry, err);
+        case UB_FI_FIELD_CQ_ERR_ENTRY_PROV_ERRNO: return offsetof(struct ub_fi_cq_err_entry, prov_errno);
+        case UB_FI_FIELD_CQ_ERR_ENTRY_ERR_DATA: return offsetof(struct ub_fi_cq_err_entry, err_data);
+        case UB_FI_FIELD_CQ_ERR_ENTRY_ERR_DATA_SIZE: return offsetof(struct ub_fi_cq_err_entry, err_data_size);
         default: return (size_t)-1;
         }
     case UB_FI_LAYOUT_FI_RMA_IOV:

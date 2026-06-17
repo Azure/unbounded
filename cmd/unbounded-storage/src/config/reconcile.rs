@@ -605,7 +605,6 @@ pub fn reconcile_backends_and_frontends(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::PeerTransport;
     use std::cell::RefCell;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -669,7 +668,6 @@ mod tests {
     fn peer(id: u64) -> PeerSpec {
         PeerSpec {
             id,
-            transport: PeerTransport::Tcp as i32,
             address: format!("10.0.0.{id}:9000"),
             hca_numa: None,
             labels: Vec::new(),
@@ -679,7 +677,6 @@ mod tests {
     fn peer_addr(id: u64, addr: &str) -> PeerSpec {
         PeerSpec {
             id,
-            transport: PeerTransport::Tcp as i32,
             address: addr.to_string(),
             hca_numa: None,
             labels: Vec::new(),
@@ -689,7 +686,6 @@ mod tests {
     fn peer_labels(id: u64, labels: &[&str]) -> PeerSpec {
         PeerSpec {
             id,
-            transport: PeerTransport::Tcp as i32,
             address: format!("10.0.0.{id}:9000"),
             hca_numa: None,
             labels: labels.iter().map(|s| s.to_string()).collect(),

@@ -591,8 +591,6 @@ local_node_id = {local_id}
 
 [[peers]]
 id = {peer_id}
-# transport: 0 = tcp, 1 = rdma.
-transport = 0
 address = "{peer_addr}"
 
 [[disks]]

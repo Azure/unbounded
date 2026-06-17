@@ -231,7 +231,7 @@ pub struct fi_cq_tagged_entry {
     pub tag: u64,
 }
 
-/// CQ error entry. Stable libfabric ABI.
+/// CQ error entry copied by the C shim from libfabric's native layout.
 #[repr(C)]
 pub struct fi_cq_err_entry {
     pub op_context: *mut c_void,
@@ -245,7 +245,6 @@ pub struct fi_cq_err_entry {
     pub prov_errno: c_int,
     pub err_data: *mut c_void,
     pub err_data_size: usize,
-    pub src_addr: fi_addr_t,
 }
 
 #[repr(C)]
@@ -591,7 +590,6 @@ mod tests {
     const CQ_ERR_ENTRY_PROV_ERRNO: c_int = 23;
     const CQ_ERR_ENTRY_ERR_DATA: c_int = 24;
     const CQ_ERR_ENTRY_ERR_DATA_SIZE: c_int = 25;
-    const CQ_ERR_ENTRY_SRC_ADDR: c_int = 26;
     const RMA_IOV_ADDR: c_int = 27;
     const RMA_IOV_LEN: c_int = 28;
     const RMA_IOV_KEY: c_int = 29;
@@ -784,11 +782,6 @@ mod tests {
             FI_CQ_ERR_ENTRY,
             CQ_ERR_ENTRY_ERR_DATA_SIZE,
             offset_of!(fi_cq_err_entry, err_data_size),
-        );
-        assert_offset(
-            FI_CQ_ERR_ENTRY,
-            CQ_ERR_ENTRY_SRC_ADDR,
-            offset_of!(fi_cq_err_entry, src_addr),
         );
         assert_size(FI_RMA_IOV, size_of::<fi_rma_iov>());
         assert_offset(FI_RMA_IOV, RMA_IOV_ADDR, offset_of!(fi_rma_iov, addr));

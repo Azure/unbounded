@@ -2,19 +2,6 @@
 // Licensed under the MIT License.
 
 //! Read and validate the daemon's configuration.
-//!
-//! Two on-disk encodings are supported, selected by the file
-//! extension:
-//!
-//! - `.binpb` is decoded as a raw binary protobuf wire message
-//!   (`prost::Message::decode`), keeping protobuf's forward-compatible
-//!   unknown-field semantics.
-//! - any other extension (notably `.toml`) is parsed as strict TOML,
-//!   where unknown keys are rejected.
-//!
-//! Both paths feed the same [`Config::apply_defaults`] and
-//! [`validate`] finalization, so the encoding only affects how bytes
-//! become a `Config`, not what counts as a valid one.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -23,15 +10,12 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 
-use prost::Message;
-
-use super::schema::{BackendKind, Config, DiskKind, FrontendKind, PeerTransport};
+use super::schema::{BackendKind, Config, DiskKind, FrontendKind};
 
 #[derive(Debug)]
 pub enum ConfigError {
     Io(io::Error),
     Toml(toml::de::Error),
-    Protobuf(prost::DecodeError),
     DuplicatePeer(u64),
     DuplicateDiskPath(String),
     MissingFileDiskSize(String),
@@ -42,12 +26,9 @@ pub enum ConfigError {
         page_size: u64,
     },
     SizeOnlyForFileDisk(String),
-    InvalidTcpAddr {
+    InvalidPeerAddr {
         peer_id: u64,
         addr: String,
-    },
-    InvalidRdmaHex {
-        peer_id: u64,
     },
     EmptyDiskPath,
     MissingLocalNodeId,
@@ -83,10 +64,6 @@ pub enum ConfigError {
         frontend_id: String,
         backend_id: String,
     },
-    InvalidPeerTransport {
-        peer_id: u64,
-        value: i32,
-    },
     InvalidDiskKind {
         path: String,
         value: i32,
@@ -109,7 +86,6 @@ impl fmt::Display for ConfigError {
         match self {
             ConfigError::Io(e) => write!(f, "io error reading config: {e}"),
             ConfigError::Toml(e) => write!(f, "toml parse error: {e}"),
-            ConfigError::Protobuf(e) => write!(f, "protobuf decode error: {e}"),
             ConfigError::DuplicatePeer(id) => write!(f, "duplicate peer id: {id}"),
             ConfigError::DuplicateDiskPath(p) => {
                 write!(f, "duplicate disk path: {p}")
@@ -131,11 +107,8 @@ impl fmt::Display for ConfigError {
             ConfigError::SizeOnlyForFileDisk(p) => {
                 write!(f, "disk {p}: `size` is only valid for kind = \"file\"")
             }
-            ConfigError::InvalidTcpAddr { peer_id, addr } => {
-                write!(f, "peer {peer_id}: invalid tcp socket address {addr:?}")
-            }
-            ConfigError::InvalidRdmaHex { peer_id } => {
-                write!(f, "peer {peer_id}: invalid rdma hex address")
+            ConfigError::InvalidPeerAddr { peer_id, addr } => {
+                write!(f, "peer {peer_id}: invalid socket address {addr:?}")
             }
             ConfigError::EmptyDiskPath => write!(f, "disk path must not be empty"),
             ConfigError::MissingLocalNodeId => write!(
@@ -199,10 +172,6 @@ impl fmt::Display for ConfigError {
                 "frontend {frontend_id:?} references backend {backend_id:?} which is not defined \
                  in any [[backends]] entry"
             ),
-            ConfigError::InvalidPeerTransport { peer_id, value } => write!(
-                f,
-                "peer {peer_id}: transport {value} is not a valid value (0 = tcp, 1 = rdma)"
-            ),
             ConfigError::InvalidDiskKind { path, value } => write!(
                 f,
                 "disk {path}: kind {value} is not a valid value (0 = nvme, 1 = block, 2 = file)"
@@ -244,34 +213,18 @@ impl From<toml::de::Error> for ConfigError {
     }
 }
 
-impl From<prost::DecodeError> for ConfigError {
-    fn from(e: prost::DecodeError) -> Self {
-        ConfigError::Protobuf(e)
-    }
-}
-
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         load(path.as_ref())
     }
 }
 
-/// Loads a config from `path`, decoding raw binary protobuf for a
-/// `.binpb` extension and strict TOML for anything else. Both encodings
-/// share the same defaulting and validation finalization.
+/// Loads a TOML config from `path` and applies defaulting and validation.
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
-    let mut cfg = if has_binpb_extension(path) {
-        Config::decode(fs::read(path)?.as_slice())?
-    } else {
-        toml::from_str(&fs::read_to_string(path)?)?
-    };
+    let mut cfg: Config = toml::from_str(&fs::read_to_string(path)?)?;
     cfg.apply_defaults();
     validate(&cfg)?;
     Ok(cfg)
-}
-
-fn has_binpb_extension(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some("binpb")
 }
 
 fn validate(cfg: &Config) -> Result<(), ConfigError> {
@@ -288,26 +241,11 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         if p2p.local_node_id == Some(p.id) {
             return Err(ConfigError::LocalNodeIdCollidesWithPeer(p.id));
         }
-        if PeerTransport::try_from(p.transport).is_err() {
-            return Err(ConfigError::InvalidPeerTransport {
+        if p.address.parse::<SocketAddr>().is_err() {
+            return Err(ConfigError::InvalidPeerAddr {
                 peer_id: p.id,
-                value: p.transport,
+                addr: p.address.clone(),
             });
-        }
-        match p.transport() {
-            PeerTransport::Tcp => {
-                if p.address.parse::<SocketAddr>().is_err() {
-                    return Err(ConfigError::InvalidTcpAddr {
-                        peer_id: p.id,
-                        addr: p.address.clone(),
-                    });
-                }
-            }
-            PeerTransport::Rdma => {
-                if !is_valid_even_hex(&p.address) {
-                    return Err(ConfigError::InvalidRdmaHex { peer_id: p.id });
-                }
-            }
         }
     }
 
@@ -453,10 +391,6 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn is_valid_even_hex(s: &str) -> bool {
-    !s.is_empty() && s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::schema::BackendKind;
@@ -486,13 +420,11 @@ local_node_id = 99
 
 [[peers]]
 id = 1
-transport = 0
 address = "10.0.0.1:9000"
 
 [[peers]]
 id = 2
-transport = 1
-address = "deadbeef"
+address = "10.0.0.2:9000"
 hca_numa = 0
 
 [[disks]]
@@ -518,12 +450,10 @@ local_node_id = 99
 
 [[peers]]
 id = 1
-transport = 0
 address = "10.0.0.1:9000"
 
 [[peers]]
 id = 1
-transport = 0
 address = "10.0.0.2:9000"
 "#;
         let f = write_cfg(s);
@@ -550,64 +480,37 @@ path = "/dev/nvme0n1"
     }
 
     #[test]
-    fn rejects_invalid_tcp_addr() {
+    fn rejects_invalid_peer_addr() {
         let s = r#"
 [p2p]
 local_node_id = 1
 
 [[peers]]
 id = 7
-transport = 0
 address = "not-an-addr"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
-            Err(ConfigError::InvalidTcpAddr { peer_id: 7, .. }) => {}
-            other => panic!("expected InvalidTcpAddr, got {other:?}"),
+            Err(ConfigError::InvalidPeerAddr { peer_id: 7, .. }) => {}
+            other => panic!("expected InvalidPeerAddr, got {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_hostname_for_tcp() {
+    fn rejects_hostname_for_peer_addr() {
         let s = r#"
 [p2p]
 local_node_id = 1
 
 [[peers]]
 id = 8
-transport = 0
 address = "example.com:9000"
 "#;
         let f = write_cfg(s);
         assert!(matches!(
             load(f.path()),
-            Err(ConfigError::InvalidTcpAddr { peer_id: 8, .. })
+            Err(ConfigError::InvalidPeerAddr { peer_id: 8, .. })
         ));
-    }
-
-    #[test]
-    fn rejects_invalid_rdma_hex() {
-        for bad in ["xyzz", "abc", "", "deadbeefg0"] {
-            let s = format!(
-                r#"
-[p2p]
-local_node_id = 1
-
-[[peers]]
-id = 3
-transport = 1
-address = "{bad}"
-"#
-            );
-            let f = write_cfg(&s);
-            assert!(
-                matches!(
-                    load(f.path()),
-                    Err(ConfigError::InvalidRdmaHex { peer_id: 3 })
-                ),
-                "expected InvalidRdmaHex for {bad:?}"
-            );
-        }
     }
 
     #[test]
@@ -714,7 +617,6 @@ size = 16777216
         let s = r#"
 [[peers]]
 id = 1
-transport = 0
 address = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
@@ -732,7 +634,6 @@ local_node_id = 7
 
 [[peers]]
 id = 1
-transport = 0
 address = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
@@ -749,7 +650,6 @@ local_node_id = 1
 
 [[peers]]
 id = 1
-transport = 0
 address = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
@@ -1027,28 +927,6 @@ fingers_per_nod = 128
         assert!(matches!(load(f.path()), Err(ConfigError::Toml(_))));
     }
 
-    #[test]
-    fn rejects_out_of_range_peer_transport() {
-        let s = r#"
-[p2p]
-local_node_id = 99
-
-[[peers]]
-id = 1
-transport = 5
-address = "10.0.0.1:9000"
-"#;
-        let f = write_cfg(s);
-        match load(f.path()) {
-            Err(ConfigError::InvalidPeerTransport {
-                peer_id: 1,
-                value: 5,
-            }) => {}
-            other => panic!("expected InvalidPeerTransport, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn rejects_out_of_range_disk_kind() {
         let s = r#"
 [[disks]]
@@ -1104,93 +982,6 @@ backend = "b"
         }
     }
 
-    fn write_binpb(bytes: &[u8]) -> NamedTempFile {
-        let mut f = tempfile::Builder::new()
-            .suffix(".binpb")
-            .tempfile()
-            .unwrap();
-        f.write_all(bytes).unwrap();
-        f.flush().unwrap();
-        f
-    }
-
-    fn encode_config(cfg: &Config) -> Vec<u8> {
-        cfg.encode_to_vec()
-    }
-
-    #[test]
-    fn loads_binpb_config() {
-        // A `.binpb` file is decoded from the protobuf wire format that
-        // the TOML loader's `Config` round-trips to.
-        let toml = r#"
-[p2p]
-local_node_id = 99
-
-[[peers]]
-id = 1
-transport = 0
-address = "10.0.0.1:9000"
-
-[[disks]]
-path = "/dev/nvme0n1"
-kind = 0
-"#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let f = write_binpb(&encode_config(&cfg));
-        let loaded = load(f.path()).unwrap();
-        assert_eq!(loaded.peers.len(), 1);
-        assert_eq!(loaded.peers[0].id, 1);
-        assert_eq!(loaded.disks.len(), 1);
-        assert_eq!(loaded.p2p().local_node_id, Some(99));
-    }
-
-    #[test]
-    fn binpb_applies_defaults() {
-        // The binpb path shares the TOML path's defaulting finalization.
-        let f = write_binpb(&encode_config(&Config::default()));
-        let loaded = load(f.path()).unwrap();
-        assert_eq!(loaded.p2p().fingers_per_node, 100);
-    }
-
-    #[test]
-    fn binpb_runs_validation() {
-        // Validation runs regardless of encoding: a duplicate peer id is
-        // rejected even when it arrives over the protobuf wire path.
-        let toml = r#"
-[p2p]
-local_node_id = 99
-
-[[peers]]
-id = 1
-transport = 0
-address = "10.0.0.1:9000"
-
-[[peers]]
-id = 2
-transport = 0
-address = "10.0.0.2:9000"
-"#;
-        let mut cfg: Config = toml::from_str(toml).unwrap();
-        cfg.peers[1].id = 1;
-        let f = write_binpb(&encode_config(&cfg));
-        match load(f.path()) {
-            Err(ConfigError::DuplicatePeer(1)) => {}
-            other => panic!("expected DuplicatePeer(1), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_invalid_binpb_bytes() {
-        // A field tag with a truncated varint payload is not a valid
-        // protobuf message and surfaces as a decode error.
-        let f = write_binpb(&[0x08]);
-        match load(f.path()) {
-            Err(ConfigError::Protobuf(_)) => {}
-            other => panic!("expected Protobuf decode error, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn loads_startup_defaults_via_toml() {
         // An omitted [startup] section is populated entirely from the
         // documented defaults during load.
@@ -1224,29 +1015,5 @@ disable_rdma = true
         assert!(cfg.startup().topology().disable_rdma);
         // Unset siblings still default.
         assert_eq!(cfg.startup().fabric().progress_threads, 2);
-    }
-
-    #[test]
-    fn startup_round_trips_through_binpb() {
-        // The startup section survives the protobuf wire encoding and is
-        // re-defaulted on decode, identically to the TOML path.
-        let toml = r#"
-[startup.fabric]
-listen_addr = "10.0.0.2:8000"
-max_inflight = 4096
-
-[startup.topology]
-disable_rdma = true
-"#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let f = write_binpb(&encode_config(&cfg));
-        let loaded = load(f.path()).unwrap();
-        assert_eq!(loaded.startup().fabric().listen_addr, "10.0.0.2:8000");
-        assert_eq!(loaded.startup().fabric().max_inflight, 4096);
-        assert!(loaded.startup().topology().disable_rdma);
-        assert_eq!(
-            loaded.startup().memory().memory_total_bytes,
-            128 * 1024 * 1024
-        );
     }
 }

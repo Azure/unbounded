@@ -92,12 +92,9 @@ message TopologyCfg {
   uint64 serving_cores = 9;
   // NIC-worker CPUs to pin per active HCA. 0 -> 4.
   uint64 nic_workers = 10;
-  // Maximum number of HCAs to use per NUMA node. 0 -> 1 (one HCA per
-  // NUMA node, the default). Driving two HCAs on the same NUMA node with
-  // the storage RPC pattern collapses aggregate throughput below a single
-  // HCA (a same-node PCIe contention effect), so the default fans out one
-  // HCA per node. Raise this to use additional same-node HCAs. HCAs whose
-  // NUMA node is unknown are never capped.
+  // Maximum number of HCAs to use per NUMA node. 0 -> 1. Raise this to
+  // use additional HCAs on a NUMA node. HCAs whose NUMA node is unknown
+  // are never capped.
   uint64 hcas_per_numa_node = 11;
 }
 
@@ -131,16 +128,12 @@ message RoutingPlan {
 }
 
 message PeerSpec {
+  reserved 2;
+  reserved "transport";
   uint64 id = 1;
-  PeerTransport transport = 2;
   string address = 3;
   optional uint32 hca_numa = 4;
   repeated string labels = 5;
-}
-
-enum PeerTransport {
-  PEER_TRANSPORT_TCP = 0;
-  PEER_TRANSPORT_RDMA = 1;
 }
 
 message DiskSpec {

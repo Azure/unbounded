@@ -23,13 +23,10 @@ pub fn peer_spec_to_connection(p: &PeerSpec) -> ConnectionSpec {
 mod tests {
     use super::*;
 
-    use crate::config::schema::PeerTransport;
-
     #[test]
     fn peer_spec_maps_directly() {
         let p = PeerSpec {
             id: 42,
-            transport: PeerTransport::Tcp as i32,
             address: "10.0.0.1:9000".into(),
             hca_numa: Some(1),
             labels: vec!["us-west".to_string(), "rack7".to_string()],

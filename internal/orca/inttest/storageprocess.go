@@ -53,10 +53,6 @@ const (
 	storageBackendKindS3  = 1
 	storageFrontendKindS3 = 1
 
-	// storagePeerTransportTCP is the proto3 PeerTransport discriminant
-	// for the libfabric tcp provider (PEER_TRANSPORT_TCP == 0).
-	storagePeerTransportTCP = 0
-
 	// storageDiskKindFile is the proto3 DiskKind discriminant for a
 	// file-backed disk (DISK_KIND_FILE == 2).
 	storageDiskKindFile = 2
@@ -148,7 +144,6 @@ local_node_id = %d
 
 [[peers]]
 id = %d
-transport = %d
 address = "%s"
 
 [[disks]]
@@ -180,7 +175,7 @@ listen_addr = "%s"
 [startup.topology]
 disable_rdma = true
 `, localID,
-		peerID, storagePeerTransportTCP, peerAddr,
+		peerID, peerAddr,
 		diskPath, storageDiskKindFile, storageDiskSize, storagePageSize,
 		storageBackendKindS3, orcaEdge, storageStripeSize,
 		storageFrontendKindS3, frontendBind,

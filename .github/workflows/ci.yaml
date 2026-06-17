@@ -180,7 +180,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config ca-certificates curl liburing-dev
+            build-essential pkg-config ca-certificates curl liburing-dev \
+            libibverbs-dev librdmacm-dev
 
       - name: Cache libfabric
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5

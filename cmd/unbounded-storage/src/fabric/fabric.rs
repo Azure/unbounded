@@ -257,9 +257,10 @@ impl Fabric {
             check("fi_domain", rc)?;
             let domain_guard = CloseFidOnDrop(ffi::as_fid_domain(domain_p));
 
-            // Each connection arms one RecvPool per QP, so the per-connection
-            // recv reservation scales with `qps_per_connection`.
-            let registry_capacity = cfg.max_inflight.saturating_add(
+            // Each admitted request can hold a pipeline of reverse RMA writes,
+            // and each connection arms one RecvPool per QP.
+            let write_slots = cfg.max_inflight.saturating_mul(cfg.write_pipeline_depth);
+            let registry_capacity = write_slots.saturating_add(
                 cfg.max_connections
                     .saturating_mul(cfg.rpc_posted_recvs)
                     .saturating_mul(cfg.qps_per_connection),
@@ -291,27 +292,18 @@ impl Fabric {
                 None => Vec::new(),
             };
 
-            // Listening endpoint + accept loop, when configured.
+            // Listening endpoint, when configured. The accept loop is
+            // spawned after `FabricInner` owns teardown for every raw
+            // handle it can touch.
             let accept_shutdown = Arc::new(AtomicBool::new(false));
             let connections = Arc::new(ConnectionTable::new());
-            let (listener, accept_thread) = if cfg.listen {
-                let listener = Arc::new(cm::Listener::new(fabric_p, info)?);
-                let handle = spawn_accept_loop(
-                    Arc::clone(&listener),
-                    DomainPtr(domain_p),
-                    cfg.numa,
-                    cfg.rpc_posted_recvs,
-                    Arc::clone(&completions),
-                    Arc::clone(&dispatch),
-                    Arc::clone(&progress),
-                    Arc::clone(&connections),
-                    Arc::clone(&accept_shutdown),
-                    local_ctx.clone(),
-                );
-                (Some(listener), Some(handle))
+            let listener = if cfg.listen {
+                Some(Arc::new(cm::Listener::new(fabric_p, info)?))
             } else {
-                (None, None)
+                None
             };
+            let accept_local_ctx = local_ctx.clone();
+            let cfg_inner = cfg.clone();
 
             std::mem::forget(fabric_guard);
             std::mem::forget(domain_guard);
@@ -338,43 +330,61 @@ impl Fabric {
                 local_ctx,
             ));
 
+            let desired = Arc::new(RwLock::new(HashMap::new()));
+            let reconnect_shutdown = Arc::new(AtomicBool::new(false));
+
+            let mut inner = FabricInner {
+                info: info_ptr,
+                dial_info: dial_info_ptr,
+                fabric: fabric_p,
+                domain: domain_p,
+                cfg: cfg_inner,
+                connections,
+                mrs: RwLock::new(initial_mrs),
+                next_mr_key,
+                mr_virt_addr,
+                needs_local_mr,
+                threading,
+                domain_mr_cnt,
+                progress,
+                dispatch,
+                listener,
+                accept_shutdown,
+                accept_thread: None,
+                completions,
+                dialer,
+                desired,
+                reconnect_shutdown,
+                reconnect_thread: None,
+                send_pool,
+            };
+
+            if let Some(listener) = inner.listener.as_ref().map(Arc::clone) {
+                inner.accept_thread = Some(spawn_accept_loop(
+                    listener,
+                    DomainPtr(inner.domain),
+                    inner.cfg.numa,
+                    inner.cfg.rpc_posted_recvs,
+                    Arc::clone(&inner.completions),
+                    Arc::clone(&inner.dispatch),
+                    Arc::clone(&inner.progress),
+                    Arc::clone(&inner.connections),
+                    Arc::clone(&inner.accept_shutdown),
+                    accept_local_ctx,
+                ));
+            }
+
             // Background reconnect loop: re-dials any desired peer with no
             // live connection, covering the startup race (both directed
             // dials lost) and peers that come up later.
-            let desired = Arc::new(RwLock::new(HashMap::new()));
-            let reconnect_shutdown = Arc::new(AtomicBool::new(false));
-            let reconnect_thread = Some(spawn_reconnect_loop(
-                Arc::clone(&dialer),
-                Arc::clone(&desired),
-                Arc::clone(&reconnect_shutdown),
+            inner.reconnect_thread = Some(spawn_reconnect_loop(
+                Arc::clone(&inner.dialer),
+                Arc::clone(&inner.desired),
+                Arc::clone(&inner.reconnect_shutdown),
             ));
 
             Ok(Fabric {
-                inner: Arc::new(FabricInner {
-                    info: info_ptr,
-                    dial_info: dial_info_ptr,
-                    fabric: fabric_p,
-                    domain: domain_p,
-                    cfg: cfg.clone(),
-                    connections,
-                    mrs: RwLock::new(initial_mrs),
-                    next_mr_key,
-                    mr_virt_addr,
-                    needs_local_mr,
-                    threading,
-                    domain_mr_cnt,
-                    progress,
-                    dispatch,
-                    listener,
-                    accept_shutdown,
-                    accept_thread,
-                    completions,
-                    dialer,
-                    desired,
-                    reconnect_shutdown,
-                    reconnect_thread,
-                    send_pool,
-                }),
+                inner: Arc::new(inner),
             })
         })();
 

@@ -117,7 +117,6 @@ mod tests {
         b.p2p.as_mut().unwrap().local_node_id = Some(1);
         b.peers.push(PeerSpec {
             id: 2,
-            transport: 0,
             address: "127.0.0.1:9000".to_string(),
             labels: vec![],
             hca_numa: None,

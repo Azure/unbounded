@@ -115,11 +115,8 @@ pub struct CorePlanConfig {
     /// Optional cap on serving shards. `None` claims every remaining
     /// usable CPU (the default).
     pub serving_cores: Option<usize>,
-    /// Maximum number of HCAs to use per NUMA node. Defaults to 1 (one
-    /// HCA per node): driving two same-node HCAs with the storage RPC
-    /// pattern collapses aggregate throughput below a single HCA, so the
-    /// planner fans out one HCA per node by default. Raise to use more.
-    /// HCAs with an unknown NUMA node are never capped.
+    /// Maximum number of HCAs to use per NUMA node. Defaults to 1.
+    /// Raise to use more. HCAs with an unknown NUMA node are never capped.
     pub hcas_per_numa: usize,
     pub use_smt_siblings: bool,
     pub respect_isolated: bool,
