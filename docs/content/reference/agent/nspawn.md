@@ -68,6 +68,7 @@ configuration.
 | [`agent-ubuntu2404-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2404-nvidia) | `ghcr.io/azure/agent-ubuntu2404-nvidia` | Extends the base image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2404-nvidia/Containerfile)) |
 | [`agent-ubuntu2604`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2604) | `ghcr.io/azure/agent-ubuntu2604` | Ubuntu 26.04 base image with systemd, dbus, curl, iproute2, nftables, kmod, wireguard-tools, and bpftool. ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2604/Containerfile)) |
 | [`agent-ubuntu2604-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2604-nvidia) | `ghcr.io/azure/agent-ubuntu2604-nvidia` | Ubuntu 26.04 image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2604-nvidia/Containerfile)) |
+| [`agent-azlinux3`](https://github.com/Azure/unbounded/pkgs/container/agent-azlinux3) | `ghcr.io/azure/agent-azlinux3` | Azure Linux 3.0 base image with systemd, dbus, curl, iproute, nftables, kmod, wireguard-tools, and bpftool. ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-azlinux3/Containerfile)) |
 
 The agent pins a specific image tag by default at build time. The `OCIImage`
 field in the agent config can override the full image reference for custom or
