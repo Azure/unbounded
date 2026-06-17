@@ -546,6 +546,7 @@ func (r *Reconciler) advanceReplace(ctx context.Context, machine *v1alpha3.Machi
 		machine.Status.Operations.RepaveCounter >= target.TargetOperations.RepaveCounter &&
 		apimeta.IsStatusConditionTrue(machine.Status.Conditions, v1alpha3.MachineConditionRepaved) {
 		nodeName := nodeNameForMachine(machine)
+
 		var node corev1.Node
 		if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
 			if apierrors.IsNotFound(err) {
