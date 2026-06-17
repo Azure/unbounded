@@ -68,15 +68,13 @@ truth; the daemon can load strict TOML or a raw binary protobuf wire
 message with a `.binpb` extension. The schema is deliberately
 proto3-native rather than idiomatic TOML:
 
-- Enum fields are plain integers (the enum discriminant), not strings.
 - Byte-size fields are plain integer byte counts, with no K/M/G
   suffixes.
 - Any field left at its proto3 zero value is treated as "unset" and
   filled with the documented default after load. Unknown keys are
   rejected: the TOML loader is strict, so a typo fails loudly at parse
-  time, and enum integers outside their defined values are rejected by
-  validation. (The protobuf wire path stays forward-compatible by
-  protobuf's own unknown-field semantics.)
+  time. (The protobuf wire path stays forward-compatible by protobuf's
+  own unknown-field semantics.)
 
 Every section, and the table itself, is optional; omitted values fall
 back to the documented defaults. The config holds both the dynamically
@@ -94,36 +92,64 @@ version behind until the daemon restarts.
 ```toml
 # unbounded-storage.toml
 
-[p2p]
+[[backends]]
+id = "origin"
+
+[backends.config.http]
+endpoint = "127.0.0.1:8080"     # host:port origin endpoint.
+stripe_size_bytes = 4194304      # 4 MiB stripes; 0 -> 4 MiB.
+
+[[neighborhoods]]
+id = "p2p"
+binds_to = "origin"             # backend id used for cache misses.
 local_node_id   = 1              # u64; this daemon's node id (required with peers).
 fingers_per_node = 100           # routing finger-table fanout per node.
 
 # Optional. Disjoint discovery: configure this node with ONLY its direct
 # routing neighbors instead of the full cluster. When present, the global
 # finger-table build is bypassed and these ids are used verbatim. Every id
-# must reference a [[peers]] entry below and must not be local_node_id. The
+# must reference a [[neighborhoods.peers]] entry below and must not be
+# local_node_id. The
 # resulting routes are identical to the global build fed the same neighbors,
 # so a controller with global view can plan these per node (see
 # designs/storage-disjoint-routing-parity.md).
-# [p2p.routing_plan]
+# [neighborhoods.routing_plan]
 # fingers     = [2, 5, 9, 17]    # ids of this node's finger neighbors.
 # successor   = 2                # id of the nearest forward neighbor on the ring.
 # predecessor = 64               # id of the nearest backward neighbor on the ring.
 
-[[peers]]                        # repeat per remote peer; ids must be unique.
+[[neighborhoods.peers]]          # repeat per remote peer; ids must be unique.
 id        = 1                    # u64, unique within the daemon.
-address   = { socket = "10.0.0.1:9000" }
-                                  # numeric fabric listen address. On InfiniBand
-                                  # this is usually IPoIB; tcp fallback uses TCP.
-                                  # Use { native = "hex:..." } only for
-                                  # controller-generated provider-native addresses.
-hca_numa  = 0                    # optional u16; pin connection setup to this NUMA node.
 
-[[disks]]                        # repeat per local device; paths must be unique.
+[neighborhoods.peers.config.tcp]
+addr      = "10.0.0.1:9000"      # parsed as SocketAddr.
+
+# Or, for RDMA peers:
+# [neighborhoods.peers.config.rdma]
+# addr     = "hex:deadbeef"      # provider-native libfabric address bytes.
+# hca_numa = 0                   # optional u16; pin connection setup to this NUMA node.
+
+[[caches]]
+id = "cache"
+binds_to = "p2p"                 # backend or neighborhood id.
+
+[[caches.disks]]                 # repeat per local device; paths must be unique.
 path        = "/dev/nvme0n1"     # required.
-kind        = 0                  # 0 = nvme (default), 1 = block, 2 = file.
-numa        = 0                  # optional u16; biases the open onto a CPU on this node.
 queue_depth = 32                 # optional u32; per-disk io_uring depth.
+
+[caches.disks.config.block]
+numa        = 0                  # optional u16; biases the open onto a CPU on this node.
+
+# Or, for file-backed disks:
+# [caches.disks.config.file]
+# size = 1073741824              # required bytes for file-backed disks.
+
+[[frontends]]
+id = "http"
+binds_to = "cache"               # backend, cache, or neighborhood id.
+
+[frontends.config.http]
+addr = "0.0.0.0:8081"
 
 [startup.memory]                 # startup-fixed; read once at process start.
 no_hugepages   = false           # true allocates per-shard backing from the heap.
@@ -131,8 +157,8 @@ memory_total_bytes = 134217728   # u64 bytes (no K/M/G suffix). Total backing po
                                  #   evenly across serving shards. 0 -> 128 MiB.
 
 [startup.fabric]
-listen_addr         = "0.0.0.0:0" # fabric listen address; :0 picks a free port.
-                                 # Use "hex:..." only for provider-native binds.
+addr                = "0.0.0.0:0" # fabric listen address; :0 picks a free port.
+                                  # Use "hex:..." only for provider-native binds.
 progress_threads    = 2          # libfabric progress threads per shard.
 progress_poll_us    = 10         # progress-thread busy-poll budget (us).
 rpc_worker_threads  = 4          # fabric RPC worker threads per shard.

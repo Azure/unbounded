@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Open/close lifecycle for `[[disks]]` entries from the TOML config.
+//! Open/close lifecycle for projected cache disks from the TOML config.
 //!
 //! The supervisor tracks which disk paths are currently "open" and
 //! reconciles that set against the desired list each time the config
@@ -23,8 +23,9 @@
 //! operations to the storage core that owns the engine and ring; see
 //! the sub-module docs for the device-side details.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::config::schema::DiskSpec;
 use crate::storage::PageChannel;
@@ -36,7 +37,7 @@ mod shard_view;
 mod uring;
 
 pub use channels::DiskChannelDirectory;
-pub use shard_view::LiveShardLocalStore;
+pub use shard_view::{CacheDirectorySet, ChainLocalStore, LiveShardLocalStore};
 #[cfg(target_os = "linux")]
 pub use uring::{UringDiskHandle, UringDiskTarget};
 
@@ -62,6 +63,18 @@ pub trait DiskTarget: Send + Sync + 'static {
         spec: &DiskSpec,
         pin: Option<DiskCpuSlot>,
     ) -> Result<(Self::Handle, PageChannel), DiskError>;
+}
+
+impl<T: DiskTarget> DiskTarget for Arc<T> {
+    type Handle = T::Handle;
+
+    fn open(
+        &self,
+        spec: &DiskSpec,
+        pin: Option<DiskCpuSlot>,
+    ) -> Result<(Self::Handle, PageChannel), DiskError> {
+        (**self).open(spec, pin)
+    }
 }
 
 /// Reasons a disk open can fail. Kept simple by design: every variant
@@ -107,6 +120,12 @@ pub struct DiskRegistry<T: DiskTarget> {
     placement: HashMap<PathBuf, Option<DiskCpuSlot>>,
 }
 
+pub struct DiskRegistrySet<T: DiskTarget> {
+    target: Arc<T>,
+    disk_slots: Vec<DiskCpuSlot>,
+    registries: HashMap<String, DiskRegistry<Arc<T>>>,
+}
+
 impl<T: DiskTarget> DiskRegistry<T> {
     /// Build an empty registry. `disk_slots` are the topology plan's
     /// disjoint NVMe CPU slots; the registry assigns them to disks
@@ -128,8 +147,8 @@ impl<T: DiskTarget> DiskRegistry<T> {
     /// Paths missing from `desired` are dropped (closing the handle).
     /// Paths present in `desired` but not currently open are opened.
     /// Paths whose [`DiskSpec`] drifted in any field that affects how
-    /// the disk is opened (kind / numa / queue_depth / page_size_bytes
-    /// / bypass_admission / skip_recovery_scan_if_no_meta) are treated
+    /// the disk is opened (config / queue_depth / page_size_bytes /
+    /// bypass_admission / skip_recovery_scan_if_no_meta) are treated
     /// as a remove followed by an add. Partial failures during opens
     /// are reported but do not abort the reconcile.
     pub fn reconcile(&mut self, desired: &[DiskSpec]) -> DiskReport {
@@ -248,6 +267,55 @@ impl<T: DiskTarget> DiskRegistry<T> {
     }
 }
 
+impl<T: DiskTarget> DiskRegistrySet<T> {
+    pub fn new(target: T, disk_slots: Vec<DiskCpuSlot>) -> Self {
+        Self {
+            target: Arc::new(target),
+            disk_slots,
+            registries: HashMap::new(),
+        }
+    }
+
+    pub fn reconcile_cache(&mut self, cache_id: &str, disks: &[DiskSpec]) -> DiskReport {
+        self.registries
+            .entry(cache_id.to_string())
+            .or_insert_with(|| DiskRegistry::new(self.target.clone(), self.disk_slots.clone()))
+            .reconcile(disks)
+    }
+
+    pub fn channels_snapshot(&self, cache_id: &str) -> Vec<(PathBuf, PageChannel, Option<u16>)> {
+        self.registries
+            .get(cache_id)
+            .map(DiskRegistry::channels_snapshot)
+            .unwrap_or_default()
+    }
+
+    pub fn reconcile_ids<I>(&mut self, cache_ids: I)
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        let desired: HashSet<String> = cache_ids.into_iter().map(Into::into).collect();
+        let removed: Vec<String> = self
+            .registries
+            .keys()
+            .filter(|id| !desired.contains(*id))
+            .cloned()
+            .collect();
+        for id in removed {
+            if let Some(registry) = self.registries.remove(&id) {
+                registry.drain();
+            }
+        }
+    }
+
+    pub fn drain(mut self) {
+        for (_, registry) in self.registries.drain() {
+            registry.drain();
+        }
+    }
+}
+
 /// Deterministically assign disk CPU slots to the `desired` disks.
 ///
 /// `open` holds the slot each currently-open (surviving) disk already
@@ -294,7 +362,7 @@ fn assign_disk_cpus(
         let local = slots
             .iter()
             .enumerate()
-            .find(|(i, s)| !used[*i] && s.numa == spec.numa.map(|n| n as u16));
+            .find(|(i, s)| !used[*i] && s.numa == spec.numa().map(|n| n as u16));
         let pick = local.or_else(|| slots.iter().enumerate().find(|(i, _)| !used[*i]));
         match pick {
             Some((i, slot)) => {
@@ -314,9 +382,7 @@ fn specs_drifted(prev: Option<&DiskSpec>, next: &DiskSpec) -> bool {
     match prev {
         None => false,
         Some(p) => {
-            p.kind != next.kind
-                || p.numa != next.numa
-                || p.size != next.size
+            p.config != next.config
                 || p.queue_depth != next.queue_depth
                 || p.page_size_bytes != next.page_size_bytes
                 || p.bypass_admission != next.bypass_admission
@@ -328,7 +394,7 @@ fn specs_drifted(prev: Option<&DiskSpec>, next: &DiskSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::DiskKind;
+    use crate::config::schema::{BlockDiskConfig, FileDiskConfig, disk_spec};
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
@@ -401,14 +467,19 @@ mod tests {
     fn spec(path: &str, qd: Option<u32>) -> DiskSpec {
         DiskSpec {
             path: path.to_string(),
-            kind: DiskKind::Nvme as i32,
-            size: None,
-            numa: None,
             queue_depth: qd,
             page_size_bytes: None,
             bypass_admission: false,
             skip_recovery_scan_if_no_meta: false,
+            config: Some(disk_spec::Config::Block(BlockDiskConfig { numa: None })),
         }
+    }
+
+    fn set_numa(spec: &mut DiskSpec, numa: u32) {
+        let Some(disk_spec::Config::Block(cfg)) = spec.config.as_mut() else {
+            panic!("expected block disk config")
+        };
+        cfg.numa = Some(numa);
     }
 
     fn slot(cpu: u32, numa: Option<u16>) -> DiskCpuSlot {
@@ -537,9 +608,9 @@ mod tests {
             slots,
         );
         let mut d0 = spec("/a", None);
-        d0.numa = Some(0);
+        set_numa(&mut d0, 0);
         let mut d1 = spec("/b", None);
-        d1.numa = Some(1);
+        set_numa(&mut d1, 1);
         let d2 = spec("/c", None); // numa: None
         reg.reconcile(&[d0, d1, d2]);
         let got = hints.lock().unwrap().clone();
@@ -567,9 +638,9 @@ mod tests {
             slots,
         );
         let mut d0 = spec("/a", None);
-        d0.numa = Some(0);
+        set_numa(&mut d0, 0);
         let mut d1 = spec("/b", None);
-        d1.numa = Some(0);
+        set_numa(&mut d1, 0);
         reg.reconcile(&[d0, d1]);
         let got = hints.lock().unwrap().clone();
         let assigned: Vec<Option<usize>> = got.iter().map(|(_, h)| *h).collect();
@@ -592,11 +663,11 @@ mod tests {
             slots,
         );
         let mut d0 = spec("/a", None);
-        d0.numa = Some(0);
+        set_numa(&mut d0, 0);
         let mut d1 = spec("/b", None);
-        d1.numa = Some(0);
+        set_numa(&mut d1, 0);
         let mut d2 = spec("/c", None);
-        d2.numa = Some(0);
+        set_numa(&mut d2, 0);
         reg.reconcile(&[d0, d1, d2]);
         let got = hints.lock().unwrap().clone();
         let some_count = got.iter().filter(|(_, h)| h.is_some()).count();
@@ -716,13 +787,11 @@ mod tests {
     fn size_drift_is_detected() {
         let file_spec = |size: u64| DiskSpec {
             path: "/a".to_string(),
-            kind: DiskKind::File as i32,
-            size: Some(size),
-            numa: None,
             queue_depth: None,
             page_size_bytes: None,
             bypass_admission: false,
             skip_recovery_scan_if_no_meta: false,
+            config: Some(disk_spec::Config::File(FileDiskConfig { size: Some(size) })),
         };
         let a = file_spec(64 * 4096);
         let b = file_spec(128 * 4096);
@@ -784,9 +853,9 @@ mod tests {
         let (target, _state) = MockDiskTarget::new();
         let mut reg = DiskRegistry::new(target, slots);
         let mut d0 = spec("/a", None);
-        d0.numa = Some(0);
+        set_numa(&mut d0, 0);
         let mut d1 = spec("/b", None);
-        d1.numa = Some(1);
+        set_numa(&mut d1, 1);
         let d2 = spec("/c", None); // unpinned: both NUMA slots taken
         reg.reconcile(&[d0, d1, d2]);
         let numa: Vec<(PathBuf, Option<u16>)> = reg

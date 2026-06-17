@@ -64,10 +64,14 @@ Build only through the top-level `Makefile`, never raw `cargo`:
 
 All cargo invocations use `--locked`.
 
-The crate produces two binaries:
+The crate produces one binary:
 
 - `unbounded-storage` (`src/main.rs`) - the daemon.
-- `bench` (`src/bin/bench.rs`) - a benchmarking harness.
+
+Synthetic benchmark traffic is generated in-process by configuring a
+`loadgen` frontend. Results are exposed through the daemon's normal
+Prometheus metrics, alongside the storage, backend, bufferpool, and fabric
+metrics from the service path being exercised.
 
 ### libfabric
 
@@ -105,7 +109,7 @@ excluded from the live-reload diff.
   bytes, no suffix; `0` -> 128 MiB) - the total backing pool, split
   evenly across the serving shards so the host footprint stays fixed
   regardless of the auto-scaled shard count.
-- `[startup.fabric]` - `listen_addr` (default `0.0.0.0:0`, or `hex:...`
+- `[startup.fabric]` - `addr` (default `0.0.0.0:0`, or `hex:...`
   for provider-native binds), `progress_threads` (2), `progress_poll_us`
   (10), `rpc_worker_threads` (4), `max_inflight` (1024) - the fabric
   endpoint, thread pools, and in-flight cap.
@@ -533,12 +537,11 @@ encoded into its page, rather than object data.
 
 The schema is defined by `api/unbounded-storage/config.proto` (prost-generated, with
 serde `Deserialize` derived on each message so a TOML file still loads)
-and is proto3-native: enum fields are plain integers, byte sizes are
-plain integer byte counts, and any field left at its proto3 zero value is
-promoted to the documented default by `Config::apply_defaults`. The TOML
-loader is strict (`deny_unknown_fields`), so a typo'd key fails loudly at
-parse time, and `validate` rejects enum integers outside their defined
-values. Protobuf is used here purely as the schema IDL (the prost-generated
+and is proto3-native: byte sizes are plain integer byte counts, and any
+field left at its proto3 zero value is promoted to the documented default
+by `Config::apply_defaults`. The TOML loader is strict
+(`deny_unknown_fields`), so a typo'd key fails loudly at parse time.
+Protobuf is used here purely as the schema IDL (the prost-generated
 structs replace hand-written ones); the on-disk config format and the only
 load path are TOML, and the config file is the sole configuration interface
 for the foreseeable future. The top-level `version` field is an opaque,
@@ -560,17 +563,9 @@ section), not reloadable config fields.
 Sections (all optional, each falling back to defaults):
 
 - `version` - top-level opaque `u64` config version (0 = unversioned).
-- `[p2p]` - `local_node_id`, `local_labels`, `fingers_per_node` (100),
-  and an optional `[p2p.routing_plan]` (`fingers`, `successor`,
-  `predecessor`). When `routing_plan` is present the node skips the
-  global finger-table build and uses exactly the listed neighbor ids
-  (each must be a `[[peers]]` id, none may be `local_node_id`). This is
-  "disjoint discovery": a node is told only its direct routing neighbors
-  rather than the full cluster, yet routes identically to the global
-  build (see `designs/storage-disjoint-routing-parity.md`).
 - `[startup]` - startup-fixed knobs, read once at process start and
   excluded from the live-reload diff: `[startup.memory]`
-  (`no_hugepages`, `memory_total_bytes`), `[startup.fabric]` (`listen_addr`,
+  (`no_hugepages`, `memory_total_bytes`), `[startup.fabric]` (`addr`,
   `progress_threads`, `progress_poll_us`, `rpc_worker_threads`,
   `max_inflight`), and `[startup.topology]` (`serving_cores`,
   `nic_workers`, `hcas_per_numa_node`, `use_smt_siblings`, `ignore_isolated`,
@@ -578,18 +573,30 @@ Sections (all optional, each falling back to defaults):
   `startup_to_core_plan_config` inverts the negative plan fields so the
   historical defaults hold. See the CLI section for the per-field
   defaults.
-- `[[peers]]` - `id` (unique `u64`, doubles as both `NodeId` and `PeerId`),
-  `address`, `hca_numa` (optional), and `labels`. The normal address form is
-  `{ socket = "10.0.0.1:9000" }`, a numeric IP socket address usable by
-  libfabric/RDMA CM for the selected local HCA. On InfiniBand this is usually
-  IPoIB; tcp fallback uses a normal TCP socket address. The escape hatch is
-  `{ native = "hex:..." }`, a controller-generated raw provider address for
-  deployments where socket addressing is unavailable.
-- `[[disks]]` - `path` (unique), `kind` (`0` = nvme default | `1` = block |
-  `2` = file), `numa` (optional), `queue_depth` (optional), plus `size`,
-  `page_size_bytes`, `bypass_admission`, and `skip_recovery_scan_if_no_meta`
-  (the same four extra fields that disk reconcile treats as drift, see 7.10).
-- frontends/backends specs.
+- `[[backends]]` - origin backends keyed by `id`. The `config` oneof selects
+  `http`, `s3`, `azure`, or synthetic `fake` backend settings.
+- `[[neighborhoods]]` - P2P route domains keyed by `id`, bound to a backend
+  with `binds_to`, with `local_node_id`, `local_labels`, `fingers_per_node`
+  (100), and an optional `[neighborhoods.routing_plan]` (`fingers`,
+  `successor`, `predecessor`). When `routing_plan` is present the node skips
+  the global finger-table build and uses exactly the listed neighbor ids
+  (each must be a `[[neighborhoods.peers]]` id, none may be `local_node_id`).
+  This is "disjoint discovery": a node is told only its direct routing
+  neighbors rather than the full cluster, yet routes identically to the global
+  build (see `designs/storage-disjoint-routing-parity.md`).
+- `[[neighborhoods.peers]]` - `id` (unique within a neighborhood), `labels`,
+  and one `config` table: `tcp` with a numeric `SocketAddr`, or `rdma` with a
+  provider-native address encoded as `hex:<fi_getname-bytes>` plus optional
+  `hca_numa`. Runtime fabric peer ids are scoped by neighborhood id.
+- `[[caches]]` - cache graphs keyed by `id`, bound via `binds_to` to either a
+  backend or a neighborhood. `[[caches.disks]]` entries carry `path` (unique
+  across all caches), one `config` table (`block` with optional `numa`, or
+  `file` with required `size`), `queue_depth` (optional), `page_size_bytes`,
+  `bypass_admission`, and `skip_recovery_scan_if_no_meta` (fields that disk
+  reconcile treats as drift, see 7.10).
+- `[[frontends]]` - listener or loadgen frontends keyed by `id`, bound via
+  `binds_to` to a backend, cache, or neighborhood. The `config` oneof selects
+  `http`, `s3`, or `loadgen`.
 
 The watcher (`notify`-based) emits `ConfigUpdate`s; main's
 `wait_for_shutdown_with_updates` reconciles peers (remove + add on address/numa

@@ -632,7 +632,7 @@ fn check_origin_status(status: StatusCode, start: u64) -> Result<(), Error> {
 /// every served read to the object length, so that padding is never
 /// returned to a client. A `body` larger than the pages can hold is a
 /// protocol error.
-fn copy_body_into_pages(
+pub(super) fn copy_body_into_pages(
     body: &[u8],
     dsts: &[PageRef],
     backing_base: *mut u8,

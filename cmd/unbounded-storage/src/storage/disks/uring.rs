@@ -55,7 +55,7 @@ use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::config::schema::{DiskKind, DiskSpec};
+use crate::config::schema::DiskSpec;
 use crate::ring::{StorageRingConfig, clear_current_storage_ring, set_current_storage_ring};
 use crate::runtime::{PinnedRuntime, WorkerSpec, noop_waker};
 use crate::storage::blockdev::{
@@ -128,12 +128,12 @@ impl DiskTarget for UringDiskTarget {
         // sized here, on the supervisor thread, before the storage core
         // opens it (capacity comes from the file length). Size validity is
         // guaranteed by config validation.
-        if spec.kind() == DiskKind::File {
+        if spec.is_file() {
             ring_cfg.iopoll = false;
             ring_cfg.single_issuer = false;
             ring_cfg.defer_taskrun = false;
             let size = spec
-                .size
+                .file_size()
                 .expect("file disk size is validated at config load");
             if let Err(e) = provision_file(Path::new(&spec.path), size) {
                 return Err(DiskError::Open(format!(

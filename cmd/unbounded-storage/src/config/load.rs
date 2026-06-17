@@ -25,7 +25,8 @@ use std::path::Path;
 
 use prost::Message;
 
-use super::schema::{BackendKind, Config, DiskKind, FrontendKind};
+use super::graph::{runtime_projection, validate_binding_graph};
+use super::schema::{Config, backend_spec, disk_spec, frontend_spec, peer_spec};
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -41,10 +42,7 @@ pub enum ConfigError {
         size: u64,
         page_size: u64,
     },
-    SizeOnlyForFileDisk(String),
-    MissingPeerAddr(u64),
-    AmbiguousPeerAddr(u64),
-    InvalidPeerAddr {
+    InvalidTcpAddr {
         peer_id: u64,
         addr: String,
     },
@@ -66,41 +64,35 @@ pub enum ConfigError {
     RoutingPlanDuplicateFinger(u64),
     DuplicateBackendId(String),
     DuplicateFrontendId(String),
+    DuplicateCacheId(String),
+    DuplicateNeighborhoodId(String),
     EmptyBackendId,
     EmptyFrontendId,
+    EmptyCacheId,
+    EmptyNeighborhoodId,
+    MissingBackendConfig(String),
+    MissingFrontendConfig(String),
     EmptyBackendEndpoint(String),
-    EmptyFrontendBind(String),
+    EmptyFrontendAddr(String),
     StripeSizeNotPowerOfTwo {
         backend_id: String,
         stripe_size_bytes: u64,
     },
-    InvalidFrontendBind {
+    InvalidFrontendAddr {
         frontend_id: String,
-        bind: String,
+        addr: String,
     },
-    DuplicateFrontendBind {
+    DuplicateFrontendAddr {
         frontend_id: String,
-        bind: String,
+        addr: String,
     },
-    DanglingFrontendBackend {
-        frontend_id: String,
-        backend_id: String,
+    MissingPeerConfig(u64),
+    MissingDiskConfig(String),
+    InvalidMetricsAddr {
+        addr: String,
     },
-    InvalidDiskKind {
-        path: String,
-        value: i32,
-    },
-    InvalidBackendKind {
-        backend_id: String,
-        value: i32,
-    },
-    InvalidFrontendKind {
-        frontend_id: String,
-        value: i32,
-    },
-    InvalidMetricsBind {
-        bind: String,
-    },
+    InvalidBindingGraph(String),
+    UnsupportedRuntimeProjection(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -114,7 +106,7 @@ impl fmt::Display for ConfigError {
                 write!(f, "duplicate disk path: {p}")
             }
             ConfigError::MissingFileDiskSize(p) => {
-                write!(f, "disk {p}: kind = \"file\" requires a `size`")
+                write!(f, "disk {p}: file config requires a `size`")
             }
             ConfigError::ZeroFileDiskSize(p) => {
                 write!(f, "disk {p}: file size must be greater than zero")
@@ -127,20 +119,8 @@ impl fmt::Display for ConfigError {
                 f,
                 "disk {path}: file size {size} must be a positive multiple of the page size {page_size}"
             ),
-            ConfigError::SizeOnlyForFileDisk(p) => {
-                write!(f, "disk {p}: `size` is only valid for kind = \"file\"")
-            }
-            ConfigError::MissingPeerAddr(peer_id) => {
-                write!(f, "peer {peer_id}: address requires `socket` or `native`")
-            }
-            ConfigError::AmbiguousPeerAddr(peer_id) => {
-                write!(
-                    f,
-                    "peer {peer_id}: address must set only one of `socket` or `native`"
-                )
-            }
-            ConfigError::InvalidPeerAddr { peer_id, addr } => {
-                write!(f, "peer {peer_id}: invalid socket address {addr:?}")
+            ConfigError::InvalidTcpAddr { peer_id, addr } => {
+                write!(f, "peer {peer_id}: invalid tcp socket address {addr:?}")
             }
             ConfigError::InvalidNativePeerAddr { peer_id, addr } => {
                 write!(f, "peer {peer_id}: invalid native fabric address {addr:?}")
@@ -148,36 +128,51 @@ impl fmt::Display for ConfigError {
             ConfigError::EmptyDiskPath => write!(f, "disk path must not be empty"),
             ConfigError::MissingLocalNodeId => write!(
                 f,
-                "p2p.local_node_id must be set when [[peers]] are configured: a multi-node \
+                "neighborhood local_node_id must be set when peers are configured: a multi-node \
                  deployment requires a stable local node id to avoid silent NodeId(0) collisions"
             ),
             ConfigError::LocalNodeIdCollidesWithPeer(id) => write!(
                 f,
-                "p2p.local_node_id {id} collides with a peer id: the local node and a peer \
+                "neighborhood local_node_id {id} collides with a peer id: the local node and a peer \
                  cannot share a node id, or the p2p finger table will silently drop that peer"
             ),
             ConfigError::RoutingPlanUnknownPeer { id, role } => write!(
                 f,
-                "p2p.routing_plan {role} {id} does not reference any [[peers]] id: every \
+                "neighborhood routing_plan {role} {id} does not reference any peer id: every \
                  routing-plan neighbor must have a matching peer so a fabric connection exists"
             ),
             ConfigError::RoutingPlanSelfReference { id, role } => write!(
                 f,
-                "p2p.routing_plan {role} {id} equals p2p.local_node_id: a node cannot list \
+                "neighborhood routing_plan {role} {id} equals local_node_id: a node cannot list \
                  itself as a routing neighbor"
             ),
             ConfigError::RoutingPlanDuplicateFinger(id) => {
-                write!(f, "p2p.routing_plan.fingers contains duplicate id {id}")
+                write!(
+                    f,
+                    "neighborhood routing_plan.fingers contains duplicate id {id}"
+                )
             }
             ConfigError::DuplicateBackendId(id) => write!(f, "duplicate backend id: {id:?}"),
             ConfigError::DuplicateFrontendId(id) => write!(f, "duplicate frontend id: {id:?}"),
+            ConfigError::DuplicateCacheId(id) => write!(f, "duplicate cache id: {id:?}"),
+            ConfigError::DuplicateNeighborhoodId(id) => {
+                write!(f, "duplicate neighborhood id: {id:?}")
+            }
             ConfigError::EmptyBackendId => write!(f, "backend id must not be empty"),
             ConfigError::EmptyFrontendId => write!(f, "frontend id must not be empty"),
+            ConfigError::EmptyCacheId => write!(f, "cache id must not be empty"),
+            ConfigError::EmptyNeighborhoodId => write!(f, "neighborhood id must not be empty"),
+            ConfigError::MissingBackendConfig(id) => {
+                write!(f, "backend {id:?}: config must set one backend type")
+            }
+            ConfigError::MissingFrontendConfig(id) => {
+                write!(f, "frontend {id:?}: config must set one frontend type")
+            }
             ConfigError::EmptyBackendEndpoint(id) => {
                 write!(f, "backend {id:?}: endpoint must not be empty")
             }
-            ConfigError::EmptyFrontendBind(id) => {
-                write!(f, "frontend {id:?}: bind must not be empty")
+            ConfigError::EmptyFrontendAddr(id) => {
+                write!(f, "frontend {id:?}: addr must not be empty")
             }
             ConfigError::StripeSizeNotPowerOfTwo {
                 backend_id,
@@ -187,40 +182,30 @@ impl fmt::Display for ConfigError {
                 "backend {backend_id:?}: stripe_size_bytes {stripe_size_bytes} must be a power of \
                  two for deterministic StripeKey derivation"
             ),
-            ConfigError::InvalidFrontendBind { frontend_id, bind } => {
+            ConfigError::InvalidFrontendAddr { frontend_id, addr } => {
                 write!(
                     f,
-                    "frontend {frontend_id:?}: invalid bind socket address {bind:?}"
+                    "frontend {frontend_id:?}: invalid addr socket address {addr:?}"
                 )
             }
-            ConfigError::DuplicateFrontendBind { frontend_id, bind } => {
+            ConfigError::DuplicateFrontendAddr { frontend_id, addr } => {
                 write!(
                     f,
-                    "frontend {frontend_id:?}: duplicate bind address {bind:?}"
+                    "frontend {frontend_id:?}: duplicate addr address {addr:?}"
                 )
             }
-            ConfigError::DanglingFrontendBackend {
-                frontend_id,
-                backend_id,
-            } => write!(
-                f,
-                "frontend {frontend_id:?} references backend {backend_id:?} which is not defined \
-                 in any [[backends]] entry"
-            ),
-            ConfigError::InvalidDiskKind { path, value } => write!(
-                f,
-                "disk {path}: kind {value} is not a valid value (0 = nvme, 1 = block, 2 = file)"
-            ),
-            ConfigError::InvalidBackendKind { backend_id, value } => write!(
-                f,
-                "backend {backend_id:?}: kind {value} is not a valid value (0 = http, 1 = s3, 2 = azure)"
-            ),
-            ConfigError::InvalidFrontendKind { frontend_id, value } => write!(
-                f,
-                "frontend {frontend_id:?}: kind {value} is not a valid value (0 = http, 1 = s3)"
-            ),
-            ConfigError::InvalidMetricsBind { bind } => {
-                write!(f, "metrics bind {bind:?} is not a valid socket address")
+            ConfigError::MissingPeerConfig(peer_id) => {
+                write!(f, "peer {peer_id}: config must set one peer transport")
+            }
+            ConfigError::MissingDiskConfig(path) => {
+                write!(f, "disk {path}: config must set one disk type")
+            }
+            ConfigError::InvalidMetricsAddr { addr } => {
+                write!(f, "metrics addr {addr:?} is not a valid socket address")
+            }
+            ConfigError::InvalidBindingGraph(msg) => write!(f, "invalid binding graph: {msg}"),
+            ConfigError::UnsupportedRuntimeProjection(msg) => {
+                write!(f, "unsupported runtime projection: {msg}")
             }
         }
     }
@@ -280,27 +265,173 @@ fn has_binpb_extension(path: &Path) -> bool {
 }
 
 fn validate(cfg: &Config) -> Result<(), ConfigError> {
-    let p2p = cfg.p2p();
-    if !cfg.peers.is_empty() && p2p.local_node_id.is_none() {
+    let mut seen_backends: HashSet<&str> = HashSet::new();
+    for b in &cfg.backends {
+        if b.id.is_empty() {
+            return Err(ConfigError::EmptyBackendId);
+        }
+        if !seen_backends.insert(b.id.as_str()) {
+            return Err(ConfigError::DuplicateBackendId(b.id.clone()));
+        }
+        let stripe_size_bytes = match b.config.as_ref() {
+            Some(backend_spec::Config::Http(cfg)) => {
+                validate_backend_endpoint(&b.id, &cfg.endpoint)?;
+                cfg.stripe_size_bytes
+            }
+            Some(backend_spec::Config::S3(cfg)) => {
+                validate_backend_endpoint(&b.id, &cfg.endpoint)?;
+                cfg.stripe_size_bytes
+            }
+            Some(backend_spec::Config::Azure(cfg)) => {
+                validate_backend_endpoint(&b.id, &cfg.endpoint)?;
+                cfg.stripe_size_bytes
+            }
+            Some(backend_spec::Config::Fake(cfg)) => cfg.stripe_size_bytes,
+            None => return Err(ConfigError::MissingBackendConfig(b.id.clone())),
+        };
+        if !stripe_size_bytes.is_power_of_two() {
+            return Err(ConfigError::StripeSizeNotPowerOfTwo {
+                backend_id: b.id.clone(),
+                stripe_size_bytes,
+            });
+        }
+    }
+
+    let mut seen_caches: HashSet<&str> = HashSet::new();
+    let mut seen_disk_paths: HashSet<&str> = HashSet::new();
+    for cache in &cfg.caches {
+        if cache.id.is_empty() {
+            return Err(ConfigError::EmptyCacheId);
+        }
+        if !seen_caches.insert(cache.id.as_str()) {
+            return Err(ConfigError::DuplicateCacheId(cache.id.clone()));
+        }
+        validate_disks(&cache.disks)?;
+        for disk in &cache.disks {
+            if !seen_disk_paths.insert(disk.path.as_str()) {
+                return Err(ConfigError::DuplicateDiskPath(disk.path.clone()));
+            }
+        }
+    }
+
+    let mut seen_neighborhoods: HashSet<&str> = HashSet::new();
+    for neighborhood in &cfg.neighborhoods {
+        if neighborhood.id.is_empty() {
+            return Err(ConfigError::EmptyNeighborhoodId);
+        }
+        if !seen_neighborhoods.insert(neighborhood.id.as_str()) {
+            return Err(ConfigError::DuplicateNeighborhoodId(
+                neighborhood.id.clone(),
+            ));
+        }
+        validate_neighborhood(neighborhood)?;
+    }
+
+    let mut seen_frontends: HashSet<&str> = HashSet::new();
+    let mut seen_addrs: HashSet<&str> = HashSet::new();
+    for fr in &cfg.frontends {
+        if fr.id.is_empty() {
+            return Err(ConfigError::EmptyFrontendId);
+        }
+        if !seen_frontends.insert(fr.id.as_str()) {
+            return Err(ConfigError::DuplicateFrontendId(fr.id.clone()));
+        }
+        match fr.config.as_ref() {
+            Some(frontend_spec::Config::Http(cfg)) => {
+                validate_frontend_addr(&fr.id, &cfg.addr, &mut seen_addrs)?;
+            }
+            Some(frontend_spec::Config::S3(cfg)) => {
+                validate_frontend_addr(&fr.id, &cfg.addr, &mut seen_addrs)?;
+            }
+            Some(frontend_spec::Config::Loadgen(_)) => {}
+            None => return Err(ConfigError::MissingFrontendConfig(fr.id.clone())),
+        }
+    }
+
+    validate_binding_graph(cfg).map_err(ConfigError::InvalidBindingGraph)?;
+    runtime_projection(cfg).map_err(ConfigError::UnsupportedRuntimeProjection)?;
+
+    // The metrics exporter addr is optional; when set it must parse as a
+    // socket address (an empty value disables the exporter).
+    let metrics_addr = &cfg.startup().metrics().addr;
+    if !metrics_addr.is_empty() && metrics_addr.parse::<SocketAddr>().is_err() {
+        return Err(ConfigError::InvalidMetricsAddr {
+            addr: metrics_addr.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_backend_endpoint(backend_id: &str, endpoint: &str) -> Result<(), ConfigError> {
+    if endpoint.is_empty() {
+        return Err(ConfigError::EmptyBackendEndpoint(backend_id.to_string()));
+    }
+
+    Ok(())
+}
+
+fn validate_frontend_addr<'a>(
+    frontend_id: &str,
+    addr: &'a str,
+    seen_addrs: &mut HashSet<&'a str>,
+) -> Result<(), ConfigError> {
+    if addr.is_empty() {
+        return Err(ConfigError::EmptyFrontendAddr(frontend_id.to_string()));
+    }
+    if addr.parse::<SocketAddr>().is_err() {
+        return Err(ConfigError::InvalidFrontendAddr {
+            frontend_id: frontend_id.to_string(),
+            addr: addr.to_string(),
+        });
+    }
+    if !seen_addrs.insert(addr) {
+        return Err(ConfigError::DuplicateFrontendAddr {
+            frontend_id: frontend_id.to_string(),
+            addr: addr.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_neighborhood(
+    neighborhood: &super::schema::NeighborhoodSpec,
+) -> Result<(), ConfigError> {
+    if !neighborhood.peers.is_empty() && neighborhood.local_node_id.is_none() {
         return Err(ConfigError::MissingLocalNodeId);
     }
 
     let mut seen_peers: HashSet<u64> = HashSet::new();
-    for p in &cfg.peers {
+    for p in &neighborhood.peers {
         if !seen_peers.insert(p.id) {
             return Err(ConfigError::DuplicatePeer(p.id));
         }
-        if p2p.local_node_id == Some(p.id) {
+        if neighborhood.local_node_id == Some(p.id) {
             return Err(ConfigError::LocalNodeIdCollidesWithPeer(p.id));
         }
-        validate_peer_address(p.id, p.address.as_ref())?;
+        match p.config.as_ref() {
+            Some(peer_spec::Config::Tcp(cfg)) => {
+                if cfg.addr.parse::<SocketAddr>().is_err() {
+                    return Err(ConfigError::InvalidTcpAddr {
+                        peer_id: p.id,
+                        addr: cfg.addr.clone(),
+                    });
+                }
+            }
+            Some(peer_spec::Config::Rdma(cfg)) => {
+                if !is_valid_native_address(&cfg.addr) {
+                    return Err(ConfigError::InvalidNativePeerAddr {
+                        peer_id: p.id,
+                        addr: cfg.addr.clone(),
+                    });
+                }
+            }
+            None => return Err(ConfigError::MissingPeerConfig(p.id)),
+        }
     }
 
-    // Disjoint-discovery routing plan: every referenced id must name a
-    // configured peer (so a fabric connection exists), must not be the
-    // local node, and fingers must be free of duplicates. `seen_peers`
-    // now holds every peer id.
-    if let Some(plan) = &p2p.routing_plan {
+    if let Some(plan) = &neighborhood.routing_plan {
         let mut seen_fingers: HashSet<u64> = HashSet::new();
         for &id in &plan.fingers {
             if !seen_fingers.insert(id) {
@@ -314,7 +445,7 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
             .chain(plan.successor.map(|id| (id, "successor")))
             .chain(plan.predecessor.map(|id| (id, "predecessor")))
         {
-            if p2p.local_node_id == Some(id) {
+            if neighborhood.local_node_id == Some(id) {
                 return Err(ConfigError::RoutingPlanSelfReference { id, role });
             }
             if !seen_peers.contains(&id) {
@@ -323,24 +454,22 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         }
     }
 
+    Ok(())
+}
+
+fn validate_disks(disks: &[super::schema::DiskSpec]) -> Result<(), ConfigError> {
     let mut seen_paths: HashSet<&str> = HashSet::new();
-    for d in &cfg.disks {
+    for d in disks {
         if d.path.is_empty() {
             return Err(ConfigError::EmptyDiskPath);
         }
         if !seen_paths.insert(d.path.as_str()) {
             return Err(ConfigError::DuplicateDiskPath(d.path.clone()));
         }
-        if DiskKind::try_from(d.kind).is_err() {
-            return Err(ConfigError::InvalidDiskKind {
-                path: d.path.clone(),
-                value: d.kind,
-            });
-        }
-        match d.kind() {
-            DiskKind::File => {
+        match d.config.as_ref() {
+            Some(disk_spec::Config::File(cfg)) => {
                 let page_size = d.page_size_bytes.unwrap_or(4096);
-                let size = match d.size {
+                let size = match cfg.size {
                     Some(s) => s,
                     None => return Err(ConfigError::MissingFileDiskSize(d.path.clone())),
                 };
@@ -355,121 +484,12 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
                     });
                 }
             }
-            _ => {
-                if d.size.is_some() {
-                    return Err(ConfigError::SizeOnlyForFileDisk(d.path.clone()));
-                }
-            }
+            Some(disk_spec::Config::Block(_)) => {}
+            None => return Err(ConfigError::MissingDiskConfig(d.path.clone())),
         }
-    }
-
-    let mut seen_backends: HashSet<&str> = HashSet::new();
-    for b in &cfg.backends {
-        if b.id.is_empty() {
-            return Err(ConfigError::EmptyBackendId);
-        }
-        if !seen_backends.insert(b.id.as_str()) {
-            return Err(ConfigError::DuplicateBackendId(b.id.clone()));
-        }
-        if BackendKind::try_from(b.kind).is_err() {
-            return Err(ConfigError::InvalidBackendKind {
-                backend_id: b.id.clone(),
-                value: b.kind,
-            });
-        }
-        if b.endpoint.is_empty() {
-            return Err(ConfigError::EmptyBackendEndpoint(b.id.clone()));
-        }
-        if !b.stripe_size_bytes.is_power_of_two() {
-            return Err(ConfigError::StripeSizeNotPowerOfTwo {
-                backend_id: b.id.clone(),
-                stripe_size_bytes: b.stripe_size_bytes,
-            });
-        }
-    }
-
-    let mut seen_frontends: HashSet<&str> = HashSet::new();
-    let mut seen_binds: HashSet<&str> = HashSet::new();
-    for fr in &cfg.frontends {
-        if fr.id.is_empty() {
-            return Err(ConfigError::EmptyFrontendId);
-        }
-        if !seen_frontends.insert(fr.id.as_str()) {
-            return Err(ConfigError::DuplicateFrontendId(fr.id.clone()));
-        }
-        if FrontendKind::try_from(fr.kind).is_err() {
-            return Err(ConfigError::InvalidFrontendKind {
-                frontend_id: fr.id.clone(),
-                value: fr.kind,
-            });
-        }
-        if fr.bind.is_empty() {
-            return Err(ConfigError::EmptyFrontendBind(fr.id.clone()));
-        }
-        if fr.bind.parse::<SocketAddr>().is_err() {
-            return Err(ConfigError::InvalidFrontendBind {
-                frontend_id: fr.id.clone(),
-                bind: fr.bind.clone(),
-            });
-        }
-        if !seen_binds.insert(fr.bind.as_str()) {
-            return Err(ConfigError::DuplicateFrontendBind {
-                frontend_id: fr.id.clone(),
-                bind: fr.bind.clone(),
-            });
-        }
-        if !seen_backends.contains(fr.backend.as_str()) {
-            return Err(ConfigError::DanglingFrontendBackend {
-                frontend_id: fr.id.clone(),
-                backend_id: fr.backend.clone(),
-            });
-        }
-    }
-
-    // The metrics exporter bind is optional; when set it must parse as a
-    // socket address (an empty value disables the exporter).
-    let metrics_bind = &cfg.startup().metrics().bind;
-    if !metrics_bind.is_empty() && metrics_bind.parse::<SocketAddr>().is_err() {
-        return Err(ConfigError::InvalidMetricsBind {
-            bind: metrics_bind.clone(),
-        });
     }
 
     Ok(())
-}
-
-fn validate_peer_address(
-    peer_id: u64,
-    address: Option<&super::schema::FabricAddress>,
-) -> Result<(), ConfigError> {
-    let Some(address) = address else {
-        return Err(ConfigError::MissingPeerAddr(peer_id));
-    };
-
-    let has_socket = !address.socket.is_empty();
-    let has_native = !address.native.is_empty();
-    match (has_socket, has_native) {
-        (false, false) => Err(ConfigError::MissingPeerAddr(peer_id)),
-        (true, true) => Err(ConfigError::AmbiguousPeerAddr(peer_id)),
-        (true, false) => {
-            if address.socket.parse::<SocketAddr>().is_err() {
-                return Err(ConfigError::InvalidPeerAddr {
-                    peer_id,
-                    addr: address.socket.clone(),
-                });
-            }
-            Ok(())
-        }
-        (false, true) => {
-            if !is_valid_native_address(&address.native) {
-                return Err(ConfigError::InvalidNativePeerAddr {
-                    peer_id,
-                    addr: address.native.clone(),
-                });
-            }
-            Ok(())
-        }
-    }
 }
 
 fn is_valid_native_address(addr: &str) -> bool {
@@ -481,7 +501,6 @@ fn is_valid_native_address(addr: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::schema::BackendKind;
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -507,56 +526,132 @@ mod tests {
         cfg.encode_to_vec()
     }
 
+    fn backend_toml() -> &'static str {
+        r#"
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+"#
+    }
+
+    fn neighborhood_toml() -> &'static str {
+        r#"
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
+local_node_id = 99
+"#
+    }
+
+    fn cache_toml() -> &'static str {
+        r#"
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[caches]]
+id = "c"
+binds_to = "b"
+"#
+    }
+
     #[test]
     fn loads_minimal_config() {
         let f = write_cfg("");
         let cfg = load(f.path()).unwrap();
-        assert!(cfg.peers.is_empty());
+        assert!(cfg.neighborhoods.is_empty());
+        assert!(cfg.caches.is_empty());
     }
 
     #[test]
     fn loads_full_happy_path() {
         let s = r#"
-[p2p]
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
 local_node_id = 99
 
-[[peers]]
+[[neighborhoods.peers]]
 id = 1
-address = { socket = "10.0.0.1:9000" }
 
-[[peers]]
+[neighborhoods.peers.config.tcp]
+addr = "10.0.0.1:9000"
+
+[[neighborhoods.peers]]
 id = 2
-address = { socket = "10.0.0.2:9000" }
+
+[neighborhoods.peers.config.rdma]
+addr = "hex:deadbeef"
 hca_numa = 0
 
-[[disks]]
+[[caches]]
+id = "c"
+binds_to = "n"
+
+[[caches.disks]]
 path = "/dev/nvme0n1"
-kind = 0
+
+[caches.disks.config.block]
 numa = 0
 
-[[disks]]
+[[caches.disks]]
 path = "/dev/nvme1n1"
+
+[caches.disks.config.block]
+
+[[frontends]]
+id = "f"
+binds_to = "c"
+
+[frontends.config.http]
+addr = "0.0.0.0:9000"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).unwrap();
-        assert_eq!(cfg.peers.len(), 2);
-        assert_eq!(cfg.disks.len(), 2);
-        assert_eq!(cfg.p2p().local_node_id, Some(99));
+        assert_eq!(cfg.neighborhoods[0].peers.len(), 2);
+        assert_eq!(cfg.caches[0].disks.len(), 2);
+        assert_eq!(cfg.neighborhoods[0].local_node_id, Some(99));
+        let projection = runtime_projection(&cfg).unwrap();
+        assert!(!projection.frontends["f"].bypass_cache);
+        assert_eq!(projection.frontends["f"].backend_id, "b");
     }
 
     #[test]
     fn rejects_duplicate_peer_ids() {
         let s = r#"
-[p2p]
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
 local_node_id = 99
 
-[[peers]]
+[[neighborhoods.peers]]
 id = 1
-address = { socket = "10.0.0.1:9000" }
 
-[[peers]]
+[neighborhoods.peers.config.tcp]
+addr = "10.0.0.1:9000"
+
+[[neighborhoods.peers]]
 id = 1
-address = { socket = "10.0.0.2:9000" }
+
+[neighborhoods.peers.config.tcp]
+addr = "10.0.0.2:9000"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -567,12 +662,52 @@ address = { socket = "10.0.0.2:9000" }
 
     #[test]
     fn rejects_duplicate_disk_paths() {
-        let s = r#"
-[[disks]]
+        let s = format!(
+            r#"{}
+[[caches.disks]]
 path = "/dev/nvme0n1"
 
-[[disks]]
+[caches.disks.config.block]
+
+[[caches.disks]]
 path = "/dev/nvme0n1"
+
+[caches.disks.config.block]
+"#,
+            cache_toml()
+        );
+        let f = write_cfg(&s);
+        match load(f.path()) {
+            Err(ConfigError::DuplicateDiskPath(_)) => {}
+            other => panic!("expected DuplicateDiskPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_disk_paths_across_caches() {
+        let s = r#"
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[caches]]
+id = "c1"
+binds_to = "b"
+
+[[caches.disks]]
+path = "/dev/nvme0n1"
+
+[caches.disks.config.block]
+
+[[caches]]
+id = "c2"
+binds_to = "b"
+
+[[caches.disks]]
+path = "/dev/nvme0n1"
+
+[caches.disks.config.block]
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -582,141 +717,130 @@ path = "/dev/nvme0n1"
     }
 
     #[test]
-    fn rejects_invalid_peer_addr() {
-        let s = r#"
-[p2p]
-local_node_id = 1
-
-[[peers]]
+    fn rejects_invalid_tcp_addr() {
+        let s = format!(
+            r#"{}
+[[neighborhoods.peers]]
 id = 7
-address = { socket = "not-an-addr" }
-"#;
-        let f = write_cfg(s);
+
+[neighborhoods.peers.config.tcp]
+addr = "not-an-addr"
+"#,
+            neighborhood_toml()
+        );
+        let f = write_cfg(&s);
         match load(f.path()) {
-            Err(ConfigError::InvalidPeerAddr { peer_id: 7, .. }) => {}
-            other => panic!("expected InvalidPeerAddr, got {other:?}"),
+            Err(ConfigError::InvalidTcpAddr { peer_id: 7, .. }) => {}
+            other => panic!("expected InvalidTcpAddr, got {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_hostname_for_peer_addr() {
-        let s = r#"
-[p2p]
-local_node_id = 1
-
-[[peers]]
+    fn rejects_hostname_for_tcp() {
+        let s = format!(
+            r#"{}
+[[neighborhoods.peers]]
 id = 8
-address = { socket = "example.com:9000" }
-"#;
-        let f = write_cfg(s);
+
+[neighborhoods.peers.config.tcp]
+addr = "example.com:9000"
+"#,
+            neighborhood_toml()
+        );
+        let f = write_cfg(&s);
         assert!(matches!(
             load(f.path()),
-            Err(ConfigError::InvalidPeerAddr { peer_id: 8, .. })
+            Err(ConfigError::InvalidTcpAddr { peer_id: 8, .. })
         ));
     }
 
     #[test]
     fn accepts_native_peer_addr() {
-        let s = r#"
-[p2p]
-local_node_id = 1
-
-[[peers]]
+        let s = format!(
+            r#"{}
+[[neighborhoods.peers]]
 id = 9
-address = { native = "hex:01020304" }
-"#;
-        let f = write_cfg(s);
-        let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(
-            cfg.peers[0].address.as_ref().unwrap().native,
-            "hex:01020304"
+
+[neighborhoods.peers.config.rdma]
+addr = "hex:01020304"
+"#,
+            neighborhood_toml()
         );
-    }
-
-    #[test]
-    fn rejects_missing_peer_addr_variant() {
-        let s = r#"
-[p2p]
-local_node_id = 1
-
-[[peers]]
-id = 9
-address = {}
-"#;
-        let f = write_cfg(s);
-        assert!(matches!(
-            load(f.path()),
-            Err(ConfigError::MissingPeerAddr(9))
-        ));
-    }
-
-    #[test]
-    fn rejects_ambiguous_peer_addr() {
-        let s = r#"
-[p2p]
-local_node_id = 1
-
-[[peers]]
-id = 9
-address = { socket = "10.0.0.9:9000", native = "hex:0102" }
-"#;
-        let f = write_cfg(s);
-        assert!(matches!(
-            load(f.path()),
-            Err(ConfigError::AmbiguousPeerAddr(9))
-        ));
+        let f = write_cfg(&s);
+        let cfg = load(f.path()).expect("load should succeed");
+        match cfg.neighborhoods[0].peers[0].config.as_ref().unwrap() {
+            peer_spec::Config::Rdma(cfg) => assert_eq!(cfg.addr, "hex:01020304"),
+            other => panic!("expected rdma config, got {other:?}"),
+        }
     }
 
     #[test]
     fn rejects_invalid_native_peer_addr() {
-        let s = r#"
-[p2p]
-local_node_id = 1
-
-[[peers]]
+        for bad in ["gid:bad", "hex:", "hex:abc", "hex:deadbeefg0"] {
+            let s = format!(
+                r#"{}
+[[neighborhoods.peers]]
 id = 9
-address = { native = "gid:bad" }
-"#;
-        let f = write_cfg(s);
-        assert!(matches!(
-            load(f.path()),
-            Err(ConfigError::InvalidNativePeerAddr { peer_id: 9, .. })
-        ));
+
+[neighborhoods.peers.config.rdma]
+addr = "{bad}"
+"#,
+                neighborhood_toml()
+            );
+            let f = write_cfg(&s);
+            assert!(
+                matches!(
+                    load(f.path()),
+                    Err(ConfigError::InvalidNativePeerAddr { peer_id: 9, .. })
+                ),
+                "expected InvalidNativePeerAddr for {bad:?}"
+            );
+        }
     }
 
     #[test]
     fn rejects_empty_disk_path() {
-        let s = r#"
-[[disks]]
+        let s = format!(
+            r#"{}
+[[caches.disks]]
 path = ""
-"#;
-        let f = write_cfg(s);
+"#,
+            cache_toml()
+        );
+        let f = write_cfg(&s);
         assert!(matches!(load(f.path()), Err(ConfigError::EmptyDiskPath)));
     }
 
     #[test]
     fn loads_file_disk_with_size() {
-        let s = r#"
-[[disks]]
+        let s = format!(
+            r#"{}
+[[caches.disks]]
 path = "/tmp/unbounded-file-disk"
-kind = 2
+
+[caches.disks.config.file]
 size = 16777216
-"#;
-        let f = write_cfg(s);
+"#,
+            cache_toml()
+        );
+        let f = write_cfg(&s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.disks[0].kind(), DiskKind::File);
-        assert!(cfg.disks[0].size.is_some());
-        assert_eq!(cfg.disks[0].size.unwrap(), 16 * 1024 * 1024);
+        assert_eq!(cfg.caches[0].disks[0].kind_name(), "file");
+        assert_eq!(cfg.caches[0].disks[0].file_size(), Some(16 * 1024 * 1024));
     }
 
     #[test]
     fn rejects_file_disk_without_size() {
-        let s = r#"
-[[disks]]
+        let s = format!(
+            r#"{}
+[[caches.disks]]
 path = "/tmp/unbounded-file-disk"
-kind = 2
-"#;
-        let f = write_cfg(s);
+
+[caches.disks.config.file]
+"#,
+            cache_toml()
+        );
+        let f = write_cfg(&s);
         assert!(matches!(
             load(f.path()),
             Err(ConfigError::MissingFileDiskSize(_))
@@ -725,13 +849,17 @@ kind = 2
 
     #[test]
     fn rejects_file_disk_with_zero_size() {
-        let s = r#"
-[[disks]]
+        let s = format!(
+            r#"{}
+[[caches.disks]]
 path = "/tmp/unbounded-file-disk"
-kind = 2
+
+[caches.disks.config.file]
 size = 0
-"#;
-        let f = write_cfg(s);
+"#,
+            cache_toml()
+        );
+        let f = write_cfg(&s);
         assert!(matches!(
             load(f.path()),
             Err(ConfigError::ZeroFileDiskSize(_))
@@ -740,13 +868,17 @@ size = 0
 
     #[test]
     fn rejects_file_disk_size_not_page_multiple() {
-        let s = r#"
-[[disks]]
+        let s = format!(
+            r#"{}
+[[caches.disks]]
 path = "/tmp/unbounded-file-disk"
-kind = 2
+
+[caches.disks.config.file]
 size = 5000
-"#;
-        let f = write_cfg(s);
+"#,
+            cache_toml()
+        );
+        let f = write_cfg(&s);
         assert!(matches!(
             load(f.path()),
             Err(ConfigError::FileDiskSizeNotPageMultiple { .. })
@@ -754,18 +886,19 @@ size = 5000
     }
 
     #[test]
-    fn rejects_size_on_non_file_disk() {
-        let s = r#"
-[[disks]]
+    fn rejects_size_key_on_non_file_disk() {
+        let s = format!(
+            r#"{}
+[[caches.disks]]
 path = "/dev/nvme0n1"
-kind = 0
 size = 16777216
-"#;
-        let f = write_cfg(s);
-        assert!(matches!(
-            load(f.path()),
-            Err(ConfigError::SizeOnlyForFileDisk(_))
-        ));
+
+[caches.disks.config.block]
+"#,
+            cache_toml()
+        );
+        let f = write_cfg(&s);
+        assert!(matches!(load(f.path()), Err(ConfigError::Toml(_))));
     }
 
     #[test]
@@ -786,9 +919,20 @@ size = 16777216
     #[test]
     fn rejects_peers_without_local_node_id() {
         let s = r#"
-[[peers]]
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
+
+[[neighborhoods.peers]]
 id = 1
-address = { socket = "10.0.0.1:9000" }
+
+[neighborhoods.peers.config.tcp]
+addr = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -800,28 +944,46 @@ address = { socket = "10.0.0.1:9000" }
     #[test]
     fn accepts_peers_with_local_node_id() {
         let s = r#"
-[p2p]
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
 local_node_id = 7
 
-[[peers]]
+[[neighborhoods.peers]]
 id = 1
-address = { socket = "10.0.0.1:9000" }
+
+[neighborhoods.peers.config.tcp]
+addr = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.p2p().local_node_id, Some(7));
-        assert_eq!(cfg.peers.len(), 1);
+        assert_eq!(cfg.neighborhoods[0].local_node_id, Some(7));
+        assert_eq!(cfg.neighborhoods[0].peers.len(), 1);
     }
 
     #[test]
     fn rejects_local_node_id_colliding_with_peer() {
         let s = r#"
-[p2p]
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
 local_node_id = 1
 
-[[peers]]
+[[neighborhoods.peers]]
 id = 1
-address = { socket = "10.0.0.1:9000" }
+
+[neighborhoods.peers.config.tcp]
+addr = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -835,14 +997,16 @@ address = { socket = "10.0.0.1:9000" }
         let s = r#"
 [[backends]]
 id = "primary-http"
-kind = 0
+
+[backends.config.http]
 endpoint = "https://origin.example.com"
 
 [[frontends]]
 id = "workload-http"
-kind = 0
-bind = "0.0.0.0:9000"
-backend = "primary-http"
+binds_to = "primary-http"
+
+[frontends.config.http]
+addr = "0.0.0.0:9000"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
@@ -855,12 +1019,14 @@ backend = "primary-http"
         let s = r#"
 [[backends]]
 id = "dup"
-kind = 0
+
+[backends.config.http]
 endpoint = "https://e"
 
 [[backends]]
 id = "dup"
-kind = 0
+
+[backends.config.http]
 endpoint = "https://e2"
 "#;
         let f = write_cfg(s);
@@ -875,20 +1041,23 @@ endpoint = "https://e2"
         let s = r#"
 [[backends]]
 id = "b"
-kind = 0
+
+[backends.config.http]
 endpoint = "https://e"
 
 [[frontends]]
 id = "dup"
-kind = 0
-bind = "0.0.0.0:9000"
-backend = "b"
+binds_to = "b"
+
+[frontends.config.http]
+addr = "0.0.0.0:9000"
 
 [[frontends]]
 id = "dup"
-kind = 0
-bind = "0.0.0.0:9001"
-backend = "b"
+binds_to = "b"
+
+[frontends.config.http]
+addr = "0.0.0.0:9001"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -898,26 +1067,25 @@ backend = "b"
     }
 
     #[test]
-    fn rejects_dangling_frontend_backend_reference() {
+    fn rejects_dangling_frontend_binding_reference() {
         let s = r#"
 [[backends]]
 id = "real"
-kind = 0
+
+[backends.config.http]
 endpoint = "https://e"
 
 [[frontends]]
 id = "f"
-kind = 0
-bind = "0.0.0.0:9000"
-backend = "ghost"
+binds_to = "ghost"
+
+[frontends.config.http]
+addr = "0.0.0.0:9000"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
-            Err(ConfigError::DanglingFrontendBackend {
-                frontend_id,
-                backend_id,
-            }) if frontend_id == "f" && backend_id == "ghost" => {}
-            other => panic!("expected DanglingFrontendBackend, got {other:?}"),
+            Err(ConfigError::InvalidBindingGraph(msg)) if msg.contains("ghost") => {}
+            other => panic!("expected InvalidBindingGraph, got {other:?}"),
         }
     }
 
@@ -926,7 +1094,8 @@ backend = "ghost"
         let no_endpoint = r#"
 [[backends]]
 id = "b"
-kind = 0
+
+[backends.config.http]
 endpoint = ""
 "#;
         let f = write_cfg(no_endpoint);
@@ -937,11 +1106,33 @@ endpoint = ""
     }
 
     #[test]
+    fn accepts_fake_backend_without_endpoint() {
+        // The fake backend dials no origin, so the otherwise-required
+        // endpoint may be omitted; its object size defaults in.
+        let s = r#"
+[[backends]]
+id = "synthetic"
+
+[backends.config.fake]
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("fake backend without endpoint should load");
+        assert_eq!(cfg.backends[0].id, "synthetic");
+        match cfg.backends[0].config.as_ref().expect("backend config set") {
+            backend_spec::Config::Fake(fake) => {
+                assert_eq!(fake.object_size_bytes, 1024 * 1024);
+            }
+            other => panic!("expected fake backend config, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_non_power_of_two_stripe_size() {
         let s = r#"
 [[backends]]
 id = "b"
-kind = 0
+
+[backends.config.http]
 endpoint = "https://e"
 stripe_size_bytes = 3000000
 "#;
@@ -957,106 +1148,168 @@ stripe_size_bytes = 3000000
         let s = r#"
 [[backends]]
 id = "b"
-kind = 0
+
+[backends.config.http]
 endpoint = "https://e"
 stripe_size_bytes = 8388608
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.backends[0].stripe_size_bytes, 8 * 1024 * 1024);
+        assert_eq!(cfg.backends[0].stripe_size_bytes(), 8 * 1024 * 1024);
     }
 
     #[test]
-    fn rejects_invalid_frontend_bind() {
+    fn rejects_invalid_frontend_addr() {
         let s = r#"
 [[backends]]
 id = "b"
-kind = 0
+
+[backends.config.http]
 endpoint = "https://e"
 
 [[frontends]]
 id = "f"
-kind = 0
-bind = "not-an-addr"
-backend = "b"
+binds_to = "b"
+
+[frontends.config.http]
+addr = "not-an-addr"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
-            Err(ConfigError::InvalidFrontendBind { frontend_id, .. }) if frontend_id == "f" => {}
-            other => panic!("expected InvalidFrontendBind, got {other:?}"),
+            Err(ConfigError::InvalidFrontendAddr { frontend_id, .. }) if frontend_id == "f" => {}
+            other => panic!("expected InvalidFrontendAddr, got {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_hostname_for_frontend_bind() {
+    fn rejects_hostname_for_frontend_addr() {
         let s = r#"
 [[backends]]
 id = "b"
-kind = 0
+
+[backends.config.http]
 endpoint = "https://e"
 
 [[frontends]]
 id = "f"
-kind = 0
-bind = "example.com:9000"
-backend = "b"
+binds_to = "b"
+
+[frontends.config.http]
+addr = "example.com:9000"
 "#;
         let f = write_cfg(s);
         assert!(matches!(
             load(f.path()),
-            Err(ConfigError::InvalidFrontendBind { .. })
+            Err(ConfigError::InvalidFrontendAddr { .. })
         ));
     }
 
     #[test]
-    fn accepts_valid_metrics_bind() {
-        let f = write_cfg("[startup.metrics]\nbind = \"0.0.0.0:9100\"\n");
-        let cfg = load(f.path()).expect("valid metrics bind loads");
-        assert_eq!(cfg.startup().metrics().bind, "0.0.0.0:9100");
+    fn accepts_valid_metrics_addr() {
+        let f = write_cfg("[startup.metrics]\naddr = \"0.0.0.0:9100\"\n");
+        let cfg = load(f.path()).expect("valid metrics addr loads");
+        assert_eq!(cfg.startup().metrics().addr, "0.0.0.0:9100");
     }
 
     #[test]
-    fn empty_metrics_bind_is_allowed() {
+    fn empty_metrics_addr_is_allowed() {
         let f = write_cfg("");
         let cfg = load(f.path()).expect("absent metrics section loads");
-        assert_eq!(cfg.startup().metrics().bind, "");
+        assert_eq!(cfg.startup().metrics().addr, "");
     }
 
     #[test]
-    fn rejects_invalid_metrics_bind() {
-        let f = write_cfg("[startup.metrics]\nbind = \"not-an-addr\"\n");
+    fn rejects_invalid_metrics_addr() {
+        let f = write_cfg("[startup.metrics]\naddr = \"not-an-addr\"\n");
         match load(f.path()) {
-            Err(ConfigError::InvalidMetricsBind { bind }) if bind == "not-an-addr" => {}
-            other => panic!("expected InvalidMetricsBind, got {other:?}"),
+            Err(ConfigError::InvalidMetricsAddr { addr }) if addr == "not-an-addr" => {}
+            other => panic!("expected InvalidMetricsAddr, got {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_duplicate_frontend_bind() {
+    fn rejects_duplicate_frontend_addr() {
         let s = r#"
 [[backends]]
 id = "b"
-kind = 0
+
+[backends.config.http]
 endpoint = "https://e"
 
 [[frontends]]
 id = "f1"
-kind = 0
-bind = "0.0.0.0:9000"
-backend = "b"
+binds_to = "b"
+
+[frontends.config.http]
+addr = "0.0.0.0:9000"
 
 [[frontends]]
 id = "f2"
-kind = 0
-bind = "0.0.0.0:9000"
-backend = "b"
+binds_to = "b"
+
+[frontends.config.http]
+addr = "0.0.0.0:9000"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
-            Err(ConfigError::DuplicateFrontendBind { frontend_id, bind })
-                if frontend_id == "f2" && bind == "0.0.0.0:9000" => {}
-            other => panic!("expected DuplicateFrontendBind, got {other:?}"),
+            Err(ConfigError::DuplicateFrontendAddr { frontend_id, addr })
+                if frontend_id == "f2" && addr == "0.0.0.0:9000" => {}
+            other => panic!("expected DuplicateFrontendAddr, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn accepts_loadgen_frontend_without_addr() {
+        let s = r#"
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[frontends]]
+id = "lg"
+binds_to = "b"
+
+[frontends.config.loadgen]
+workers = 4
+read_bytes = 65536
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("loadgen frontend without addr should load");
+        assert_eq!(cfg.frontends[0].kind_name(), "loadgen");
+        assert_eq!(cfg.frontends[0].addr(), None);
+    }
+
+    #[test]
+    fn loadgen_empty_addr_does_not_collide_with_socket_frontends() {
+        let s = r#"
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[frontends]]
+id = "lg1"
+binds_to = "b"
+
+[frontends.config.loadgen]
+
+[[frontends]]
+id = "lg2"
+binds_to = "b"
+
+[frontends.config.loadgen]
+
+[[frontends]]
+id = "http"
+binds_to = "b"
+
+[frontends.config.http]
+addr = "0.0.0.0:9000"
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("empty loadgen addrs should not collide");
+        assert_eq!(cfg.frontends.len(), 3);
     }
 
     #[test]
@@ -1064,13 +1317,14 @@ backend = "b"
         let s = r#"
 [[backends]]
 id = "s3"
-kind = 1
+
+[backends.config.s3]
 endpoint = "s3.example.com:443"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.backends[0].kind(), BackendKind::S3);
-        assert!(cfg.backends[0].bucket.is_none());
+        assert_eq!(cfg.backends[0].kind_name(), "s3");
+        assert_eq!(cfg.backends[0].endpoint(), Some("s3.example.com:443"));
     }
 
     #[test]
@@ -1078,12 +1332,13 @@ endpoint = "s3.example.com:443"
         let s = r#"
 [[backends]]
 id = "azure"
-kind = 2
+
+[backends.config.azure]
 endpoint = "acct.blob.core.windows.net:443"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.backends[0].kind(), BackendKind::Azure);
+        assert_eq!(cfg.backends[0].kind_name(), "azure");
     }
 
     #[test]
@@ -1091,7 +1346,8 @@ endpoint = "acct.blob.core.windows.net:443"
         // A typo in a key now fails loudly at parse time instead of being
         // silently dropped (deny_unknown_fields on the TOML path).
         let s = r#"
-[p2p]
+[[neighborhoods]]
+id = "n"
 fingers_per_nod = 128
 "#;
         let f = write_cfg(s);
@@ -1099,28 +1355,88 @@ fingers_per_nod = 128
     }
 
     #[test]
+    fn rejects_missing_peer_config() {
+        let s = r#"
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
+local_node_id = 99
+
+[[neighborhoods.peers]]
+id = 1
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::MissingPeerConfig(1)) => {}
+            other => panic!("expected MissingPeerConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_missing_disk_config() {
+        let s = format!(
+            r#"{}
+[[caches.disks]]
+path = "/dev/nvme0n1"
+"#,
+            cache_toml()
+        );
+        let f = write_cfg(&s);
+        match load(f.path()) {
+            Err(ConfigError::MissingDiskConfig(path)) if path == "/dev/nvme0n1" => {}
+            other => panic!("expected MissingDiskConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn loads_binpb_config() {
         // A `.binpb` file is decoded from the protobuf wire format that
         // the TOML loader's `Config` round-trips to.
         let toml = r#"
-[p2p]
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
 local_node_id = 99
 
-[[peers]]
+[[neighborhoods.peers]]
 id = 1
-address = { socket = "10.0.0.1:9000" }
 
-[[disks]]
+[neighborhoods.peers.config.tcp]
+addr = "10.0.0.1:9000"
+
+[[caches]]
+id = "c"
+binds_to = "n"
+
+[[caches.disks]]
 path = "/dev/nvme0n1"
-kind = 0
+
+[caches.disks.config.block]
+
+[[frontends]]
+id = "f"
+binds_to = "c"
+
+[frontends.config.http]
+addr = "0.0.0.0:9000"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         let f = write_binpb(&encode_config(&cfg));
         let loaded = load(f.path()).unwrap();
-        assert_eq!(loaded.peers.len(), 1);
-        assert_eq!(loaded.peers[0].id, 1);
-        assert_eq!(loaded.disks.len(), 1);
-        assert_eq!(loaded.p2p().local_node_id, Some(99));
+        assert_eq!(loaded.neighborhoods[0].peers.len(), 1);
+        assert_eq!(loaded.neighborhoods[0].peers[0].id, 1);
+        assert_eq!(loaded.caches[0].disks.len(), 1);
+        assert_eq!(loaded.neighborhoods[0].local_node_id, Some(99));
     }
 
     #[test]
@@ -1128,8 +1444,8 @@ kind = 0
         // The binpb path shares the TOML path's defaulting finalization.
         let f = write_binpb(&encode_config(&Config::default()));
         let loaded = load(f.path()).unwrap();
-        assert_eq!(loaded.p2p().fingers_per_node, 100);
-        assert_eq!(loaded.startup().topology().hcas_per_numa_node, 1);
+        assert!(loaded.neighborhoods.is_empty());
+        assert_eq!(loaded.startup().fabric().addr, "0.0.0.0:0");
     }
 
     #[test]
@@ -1137,19 +1453,30 @@ kind = 0
         // Validation runs regardless of encoding: a duplicate peer id is
         // rejected even when it arrives over the protobuf wire path.
         let toml = r#"
-[p2p]
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
 local_node_id = 99
 
-[[peers]]
+[[neighborhoods.peers]]
 id = 1
-address = { socket = "10.0.0.1:9000" }
 
-[[peers]]
+[neighborhoods.peers.config.tcp]
+addr = "10.0.0.1:9000"
+
+[[neighborhoods.peers]]
 id = 2
-address = { socket = "10.0.0.2:9000" }
+
+[neighborhoods.peers.config.tcp]
+addr = "10.0.0.2:9000"
 "#;
         let mut cfg: Config = toml::from_str(toml).unwrap();
-        cfg.peers[1].id = 1;
+        cfg.neighborhoods[0].peers[1].id = 1;
         let f = write_binpb(&encode_config(&cfg));
         match load(f.path()) {
             Err(ConfigError::DuplicatePeer(1)) => {}
@@ -1168,61 +1495,7 @@ address = { socket = "10.0.0.2:9000" }
         }
     }
 
-    fn rejects_out_of_range_disk_kind() {
-        let s = r#"
-[[disks]]
-path = "/dev/nvme0n1"
-kind = 3
-"#;
-        let f = write_cfg(s);
-        match load(f.path()) {
-            Err(ConfigError::InvalidDiskKind { path, value: 3 }) if path == "/dev/nvme0n1" => {}
-            other => panic!("expected InvalidDiskKind, got {other:?}"),
-        }
-    }
-
     #[test]
-    fn rejects_out_of_range_backend_kind() {
-        let s = r#"
-[[backends]]
-id = "b"
-kind = 3
-endpoint = "https://e"
-"#;
-        let f = write_cfg(s);
-        match load(f.path()) {
-            Err(ConfigError::InvalidBackendKind {
-                backend_id,
-                value: 3,
-            }) if backend_id == "b" => {}
-            other => panic!("expected InvalidBackendKind, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_out_of_range_frontend_kind() {
-        let s = r#"
-[[backends]]
-id = "b"
-kind = 0
-endpoint = "https://e"
-
-[[frontends]]
-id = "f"
-kind = 2
-bind = "0.0.0.0:9000"
-backend = "b"
-"#;
-        let f = write_cfg(s);
-        match load(f.path()) {
-            Err(ConfigError::InvalidFrontendKind {
-                frontend_id,
-                value: 2,
-            }) if frontend_id == "f" => {}
-            other => panic!("expected InvalidFrontendKind, got {other:?}"),
-        }
-    }
-
     fn loads_startup_defaults_via_toml() {
         // An omitted [startup] section is populated entirely from the
         // documented defaults during load.
@@ -1230,9 +1503,10 @@ backend = "b"
         let cfg = load(f.path()).unwrap();
         let s = cfg.startup();
         assert_eq!(s.memory().memory_total_bytes, 128 * 1024 * 1024);
-        assert_eq!(s.fabric().listen_addr, "0.0.0.0:0");
+        assert_eq!(s.fabric().addr, "0.0.0.0:0");
         assert_eq!(s.fabric().max_inflight, 1024);
         assert_eq!(s.topology().nic_workers, 4);
+        assert_eq!(s.topology().hcas_per_numa_node, 1);
     }
 
     #[test]
@@ -1243,7 +1517,7 @@ no_hugepages = true
 memory_total_bytes = 67108864
 
 [startup.fabric]
-listen_addr = "10.0.0.1:7000"
+addr = "10.0.0.1:7000"
 
 [startup.topology]
 disable_rdma = true
@@ -1252,9 +1526,33 @@ disable_rdma = true
         let cfg = load(f.path()).unwrap();
         assert!(cfg.startup().memory().no_hugepages);
         assert_eq!(cfg.startup().memory().memory_total_bytes, 64 * 1024 * 1024);
-        assert_eq!(cfg.startup().fabric().listen_addr, "10.0.0.1:7000");
+        assert_eq!(cfg.startup().fabric().addr, "10.0.0.1:7000");
         assert!(cfg.startup().topology().disable_rdma);
         // Unset siblings still default.
         assert_eq!(cfg.startup().fabric().progress_threads, 2);
+    }
+
+    #[test]
+    fn startup_round_trips_through_binpb() {
+        // The startup section survives the protobuf wire encoding and is
+        // re-defaulted on decode, identically to the TOML path.
+        let toml = r#"
+[startup.fabric]
+addr = "10.0.0.2:8000"
+max_inflight = 4096
+
+[startup.topology]
+disable_rdma = true
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let f = write_binpb(&encode_config(&cfg));
+        let loaded = load(f.path()).unwrap();
+        assert_eq!(loaded.startup().fabric().addr, "10.0.0.2:8000");
+        assert_eq!(loaded.startup().fabric().max_inflight, 4096);
+        assert!(loaded.startup().topology().disable_rdma);
+        assert_eq!(
+            loaded.startup().memory().memory_total_bytes,
+            128 * 1024 * 1024
+        );
     }
 }

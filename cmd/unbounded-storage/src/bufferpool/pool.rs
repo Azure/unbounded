@@ -812,7 +812,17 @@ where
                 // leader; parked subscribers wait). On error,
                 // transition to `Error` and propagate.
                 let fetch_result: Result<bool, Error> = async {
-                    let hit = inner.blockstore.read_page(key, stripe_off, dst).await?;
+                    // A bypass request bridges straight to the origin:
+                    // skip the local-disk lookup so the miss path always
+                    // drives the transport (which forces the origin too).
+                    let hit = if req.as_ref().bypass() {
+                        false
+                    } else {
+                        inner
+                            .blockstore
+                            .read_page(req.as_ref(), stripe_off, dst)
+                            .await?
+                    };
                     if !hit {
                         let bulk = BulkRef {
                             stripe: key,
@@ -867,7 +877,8 @@ where
                 // "Pull-through with tee"). The page stays pinned
                 // across the tee via `tee_pending` plus the
                 // leader's `ConsumerHold`.
-                let need_tee = !hit;
+                // A bypass request never admits to the disk cache.
+                let need_tee = !hit && !req.as_ref().bypass();
                 if need_tee {
                     slot.tee_pending.set(true);
                 }
@@ -887,7 +898,10 @@ where
                 // designs/bufferpool.md TODO(partial-failure)).
                 if need_tee {
                     let _tee_pending_guard = TeePendingGuard { slot: &slot };
-                    let _ = inner.blockstore.write_page(key, stripe_off, dst).await;
+                    let _ = inner
+                        .blockstore
+                        .write_page(req.as_ref(), stripe_off, dst)
+                        .await;
                 }
 
                 leader_hold.forget();

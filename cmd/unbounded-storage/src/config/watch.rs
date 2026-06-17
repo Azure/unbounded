@@ -226,14 +226,44 @@ mod tests {
     use tempfile::TempDir;
 
     const VALID_A: &str = r#"
-[p2p]
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
 fingers_per_node = 1234
 "#;
 
     const VALID_B: &str = r#"
-[p2p]
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
 fingers_per_node = 5678
 "#;
+
+    fn valid_config_with_fingers(fingers_per_node: u32) -> String {
+        format!(
+            r#"
+[[backends]]
+id = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
+fingers_per_node = {fingers_per_node}
+"#,
+        )
+    }
 
     fn write(path: &Path, contents: &str) {
         let mut f = fs::OpenOptions::new()
@@ -289,7 +319,7 @@ fingers_per_node = 5678
         // systems (e.g. CI) and turns this into a flaky timing test.
         let start = Instant::now();
         for i in 0..5 {
-            let body = format!("[p2p]\nfingers_per_node = {}\n", 4000 + i);
+            let body = valid_config_with_fingers(4000 + i);
             write(&path, &body);
         }
         assert!(
@@ -353,7 +383,7 @@ fingers_per_node = 5678
         write(&path, VALID_B);
         let update = recv_within(&rx, Duration::from_secs(3))
             .expect("a valid modification must yield a ConfigUpdate");
-        assert_eq!(update.config.p2p().fingers_per_node, 5678);
+        assert_eq!(update.config.neighborhoods[0].fingers_per_node, 5678);
         assert!(update.generation >= 1, "generation must advance");
 
         // (2a) An unrelated sibling write is filtered out.
@@ -369,7 +399,7 @@ fingers_per_node = 5678
         write(&path, VALID_A);
         let update = recv_within(&rx, Duration::from_secs(3))
             .expect("a config change after a sibling write must still emit");
-        assert_eq!(update.config.p2p().fingers_per_node, 1234);
+        assert_eq!(update.config.neighborhoods[0].fingers_per_node, 1234);
     }
 
     fn event_for(paths: &[&Path]) -> notify::Event {

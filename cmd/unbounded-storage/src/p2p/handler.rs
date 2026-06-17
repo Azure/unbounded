@@ -50,7 +50,9 @@ use crate::bufferpool::{BlockStore, BulkRef, PageRef, PageStream, Req, StripeKey
 use crate::fabric::Result as FabResult;
 use crate::fabric::{Fabric, FabricTransport, Handler, HandlerStream, MrHandle, PeerId};
 use crate::memory::Backing;
-use crate::p2p::{FingerRouter, FingerTable, NodeId, RingId, RoutingHandle, stripe_to_ring};
+use crate::p2p::{
+    ChainFingerRouter, FingerTable, NodeId, RingId, RouteTableHandle, RoutingHandle, stripe_to_ring,
+};
 use crate::runtime::{block_on_cooperative, noop_waker};
 
 /// Error surfaced by [`RecursiveHandler`]'s response stream.
@@ -106,12 +108,8 @@ where
 {
     store: Arc<S>,
     scratch: Arc<ScratchBacking>,
-    /// Shared, live-reloadable routing surface. `forward`'s
-    /// `FingerRouter` shares this same handle, so a peer-set republish
-    /// updates both the owner/forward classify below (next request's
-    /// snapshot) and the forward routing at once.
-    routing: RoutingHandle,
-    forward: FabricTransport<B::Req, FingerRouter>,
+    routes: RouteTableHandle,
+    forward: FabricTransport<B::Req, ChainFingerRouter>,
     backend: B,
 }
 
@@ -148,11 +146,19 @@ where
         page_size: usize,
         backend: B,
     ) -> FabResult<Self> {
-        Self::with_routing(
+        let mut routes = HashMap::new();
+        routes.insert(
+            RouteTableHandle::LEGACY_ROUTE_ID.to_string(),
+            crate::p2p::RoutingSnapshot {
+                fingers,
+                node_to_peer,
+            },
+        );
+        Self::with_routes(
             store,
             scratch,
             scratch_pages,
-            RoutingHandle::new(fingers, node_to_peer),
+            RouteTableHandle::new(routes),
             fabric,
             scratch_mr,
             page_size,
@@ -176,18 +182,50 @@ where
         page_size: usize,
         backend: B,
     ) -> FabResult<Self> {
+        let snap = routing.snapshot();
+        let mut routes = HashMap::new();
+        routes.insert(
+            RouteTableHandle::LEGACY_ROUTE_ID.to_string(),
+            crate::p2p::RoutingSnapshot {
+                fingers: snap.fingers.clone(),
+                node_to_peer: snap.node_to_peer.clone(),
+            },
+        );
+        Self::with_routes(
+            store,
+            scratch,
+            scratch_pages,
+            RouteTableHandle::new(routes),
+            fabric,
+            scratch_mr,
+            page_size,
+            backend,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_routes(
+        store: Arc<S>,
+        scratch: Backing,
+        scratch_pages: u32,
+        routes: RouteTableHandle,
+        fabric: Arc<Fabric>,
+        scratch_mr: MrHandle,
+        page_size: usize,
+        backend: B,
+    ) -> FabResult<Self> {
         let usable = scratch_pages.min(scratch.page_count as u32);
         let free: Vec<u32> = (0..usable).collect();
         let scratch = Arc::new(ScratchBacking {
             backing: scratch,
             free: Mutex::new(free),
         });
-        let router = FingerRouter::from_handle(routing.clone());
+        let router = ChainFingerRouter::new(routes.clone());
         let forward = FabricTransport::new(fabric, scratch_mr, router, page_size)?;
         Ok(Self {
             store,
             scratch,
-            routing,
+            routes,
             forward,
             backend,
         })
@@ -211,10 +249,7 @@ where
         RecursiveHandlerStream {
             store: self.store.clone(),
             scratch: self.scratch.clone(),
-            // Capture a consistent routing snapshot for this request's
-            // lifetime. A concurrent peer-set republish affects only
-            // requests that start after the store.
-            fingers: self.routing.snapshot().fingers.clone(),
+            fingers: self.routes.route_for_req(req).map(|route| route.fingers),
             forward: &self.forward,
             backend: &self.backend,
             req,
@@ -316,8 +351,8 @@ where
 {
     store: Arc<S>,
     scratch: Arc<ScratchBacking>,
-    fingers: Arc<FingerTable>,
-    forward: &'a FabricTransport<R, FingerRouter>,
+    fingers: Option<Arc<FingerTable>>,
+    forward: &'a FabricTransport<R, ChainFingerRouter>,
     backend: &'a B,
     req: &'a R,
     key: StripeKey,
@@ -374,7 +409,12 @@ where
     fn serve(&mut self) -> Result<PageRef, RecursiveHandlerError> {
         let page_size = self.scratch.backing.page_size;
         let target = stripe_to_ring(self.key);
-        match classify(&self.fingers, target, self.hops_remaining) {
+        let route = self
+            .fingers
+            .as_deref()
+            .map(|fingers| classify(fingers, target, self.hops_remaining))
+            .unwrap_or(Route::Owner);
+        match route {
             Route::HopLimit => {
                 crate::metrics::p2p_hop_limit_exceeded();
                 Err(RecursiveHandlerError::HopLimitExceeded)
@@ -387,7 +427,7 @@ where
                     .ok_or(RecursiveHandlerError::NoScratchPage)?;
                 self.page_idx = Some(idx);
                 let dst = scratch_page(idx, page_size);
-                serve_owned(&self.store, self.backend, self.req, self.key, self.src, dst)?;
+                serve_owned(&self.store, self.backend, self.req, self.src, dst)?;
                 Ok(self.clamped_page(idx, page_size))
             }
             Route::Forward => {
@@ -455,7 +495,6 @@ fn serve_owned<R, S, B>(
     store: &Arc<S>,
     backend: &B,
     req: &R,
-    key: StripeKey,
     src: BulkRef,
     dst: PageRef,
 ) -> Result<(), RecursiveHandlerError>
@@ -464,7 +503,7 @@ where
     S: BlockStore + Send + Sync + 'static,
     B: Backend<Req = R>,
 {
-    let hit = block_on_local(store.read_page(key, src.offset, dst))
+    let hit = block_on_local(store.read_page(req, src.offset, dst))
         .map_err(RecursiveHandlerError::BlockStore)?;
     if hit {
         return Ok(());
@@ -484,7 +523,7 @@ where
 /// would land the page in slot 0 and the relay would ship stale bytes
 /// from slot `dst_idx`.
 fn serve_forward<R>(
-    forward: &FabricTransport<R, FingerRouter>,
+    forward: &FabricTransport<R, ChainFingerRouter>,
     req: &R,
     src: BulkRef,
     ttl: u32,
@@ -570,12 +609,13 @@ mod tests {
             Ok(())
         }
 
-        async fn read_page(
+        async fn read_page<R: Req + ?Sized>(
             &self,
-            key: StripeKey,
+            req: &R,
             _stripe_off: u64,
             dst: PageRef,
         ) -> Result<bool, Error> {
+            let key = req.key();
             self.reads.fetch_add(1, Ordering::Relaxed);
             if self.poison.contains(&key.0) {
                 return Err(Error::Io(libc::EIO));
@@ -594,9 +634,9 @@ mod tests {
             }
         }
 
-        async fn write_page(
+        async fn write_page<R: Req + ?Sized>(
             &self,
-            _key: StripeKey,
+            _req: &R,
             _stripe_off: u64,
             _page: PageRef,
         ) -> Result<(), Error> {
@@ -754,8 +794,7 @@ mod tests {
         let req = TestReq(key);
         let dst = scratch_page(0, PAGE);
 
-        serve_owned(&store, &backend, &req, key, src_for(key), dst)
-            .expect("resident read must succeed");
+        serve_owned(&store, &backend, &req, src_for(key), dst).expect("resident read must succeed");
         assert_eq!(page_byte(base, 0), 0xAB, "store did not fill the page");
         assert_eq!(store.reads.load(Ordering::Relaxed), 1);
     }
@@ -774,7 +813,7 @@ mod tests {
         let req = TestReq(key);
         let dst = scratch_page(1, PAGE);
 
-        serve_owned(&store, &backend, &req, key, src_for(key), dst)
+        serve_owned(&store, &backend, &req, src_for(key), dst)
             .expect("backend fallback must succeed");
         assert_eq!(page_byte(base, 1), 0xCD, "backend did not fill the page");
     }
@@ -788,7 +827,7 @@ mod tests {
         let req = TestReq(key);
         let dst = scratch_page(0, PAGE);
 
-        match serve_owned(&store, &backend, &req, key, src_for(key), dst) {
+        match serve_owned(&store, &backend, &req, src_for(key), dst) {
             Err(RecursiveHandlerError::Backend(_)) => {}
             other => panic!("expected Backend error, got {other:?}"),
         }
@@ -803,7 +842,7 @@ mod tests {
         let req = TestReq(key);
         let dst = scratch_page(0, PAGE);
 
-        match serve_owned(&store, &backend, &req, key, src_for(key), dst) {
+        match serve_owned(&store, &backend, &req, src_for(key), dst) {
             Err(RecursiveHandlerError::BlockStore(_)) => {}
             other => panic!("expected BlockStore error, got {other:?}"),
         }

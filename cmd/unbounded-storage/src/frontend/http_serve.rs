@@ -41,7 +41,7 @@ use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE};
 use ::http::{Response, StatusCode};
 
 use crate::bufferpool::{BufferPool, ReadStream, StripeKey, StripePlan};
-use crate::config::{FrontendKind, FrontendSpec};
+use crate::config::{FrontendSpec, frontend_spec};
 use crate::fanout::{FanoutTable, FetchChannel, FetchReply, Owner};
 use crate::frontend::FrontendError;
 use crate::frontend::range::{
@@ -65,25 +65,24 @@ use crate::storage::{ObjectMetadata, OriginRef, StripeReq};
 /// driver directly.
 pub struct HttpFrontend {
     id: String,
-    bind: SocketAddr,
-    backend_id: String,
+    addr: SocketAddr,
 }
 
 impl HttpFrontend {
-    /// Construct from a [`FrontendSpec`], validating the kind and
-    /// parsing the bind address.
+    /// Construct from a [`FrontendSpec`], validating the config type and
+    /// parsing the listen address.
     pub fn from_spec(spec: &FrontendSpec) -> Result<Self, FrontendError> {
-        if spec.kind() != FrontendKind::Http {
-            return Err(FrontendError::UnsupportedKind("non-http frontend kind"));
-        }
-        let bind = spec
-            .bind
+        let cfg = match spec.config.as_ref() {
+            Some(frontend_spec::Config::Http(cfg)) => cfg,
+            _ => return Err(FrontendError::UnsupportedKind("non-http frontend config")),
+        };
+        let addr = cfg
+            .addr
             .parse::<SocketAddr>()
-            .map_err(|_| FrontendError::BadBind(spec.bind.clone()))?;
+            .map_err(|_| FrontendError::BadBind(cfg.addr.clone()))?;
         Ok(Self {
             id: spec.id.clone(),
-            bind,
-            backend_id: spec.backend.clone(),
+            addr,
         })
     }
 
@@ -92,15 +91,9 @@ impl HttpFrontend {
         &self.id
     }
 
-    /// The backend id this frontend resolves origin metadata and stripe
-    /// fetches against.
-    pub fn backend_id(&self) -> &str {
-        &self.backend_id
-    }
-
     /// The configured listen address.
     pub fn bind(&self) -> SocketAddr {
-        self.bind
+        self.addr
     }
 
     /// Create, bind, and listen the per-shard accept socket with
@@ -110,7 +103,7 @@ impl HttpFrontend {
     /// The caller owns the returned fd and is responsible for closing
     /// it; [`HttpDriver`] only reads it for `accept`.
     pub fn bind_listener(&self) -> Result<RawFd, FrontendError> {
-        bind_listener(self.bind).map_err(|_| FrontendError::BadBind(self.bind.to_string()))
+        bind_listener(self.addr).map_err(|_| FrontendError::BadBind(self.addr.to_string()))
     }
 }
 
@@ -131,9 +124,12 @@ pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
     listen_fd: RawFd,
     frontend_id: Rc<str>,
     backend_id: String,
+    cache_id: Option<String>,
+    neighborhood_id: Option<String>,
     stripe_size: u64,
     page_size: usize,
     fanout: Rc<FanoutTable>,
+    bypass: bool,
     accept_fut: Pin<Box<dyn Future<Output = std::io::Result<RawFd>>>>,
     conns: Vec<Pin<Box<dyn Future<Output = ()>>>>,
     waker: Waker,
@@ -145,16 +141,20 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
     /// `stripe_size` and `page_size` come from the shard's pool
     /// geometry. `fanout` is this shard's view of the stripe-ownership
     /// ring; for single-shard deployments it routes every stripe to the
-    /// local pool.
+    /// local pool. When `bypass` is set, the frontend bridges straight
+    /// to its backend: cache, peer routing, and fanout are all skipped.
     pub fn new(
         pool: Rc<P>,
         handle: NetHandle,
         listen_fd: RawFd,
         frontend_id: Rc<str>,
         backend_id: String,
+        cache_id: Option<String>,
+        neighborhood_id: Option<String>,
         stripe_size: u64,
         page_size: usize,
         fanout: Rc<FanoutTable>,
+        bypass: bool,
     ) -> Self {
         let accept_fut = Box::pin(handle.accept(listen_fd));
         Self {
@@ -163,9 +163,12 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
             listen_fd,
             frontend_id,
             backend_id,
+            cache_id,
+            neighborhood_id,
             stripe_size,
             page_size,
             fanout,
+            bypass,
             accept_fut,
             conns: Vec::new(),
             waker: noop_waker(),
@@ -207,9 +210,12 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
                             fd,
                             Rc::clone(&self.frontend_id),
                             self.backend_id.clone(),
+                            self.cache_id.clone(),
+                            self.neighborhood_id.clone(),
                             self.stripe_size,
                             self.page_size,
                             Rc::clone(&self.fanout),
+                            self.bypass,
                         );
                         self.conns.push(Box::pin(serve));
                     }
@@ -263,9 +269,12 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
     conn_fd: RawFd,
     frontend_id: Rc<str>,
     backend_id: String,
+    cache_id: Option<String>,
+    neighborhood_id: Option<String>,
     stripe_size: u64,
     page_size: usize,
     fanout: Rc<FanoutTable>,
+    bypass: bool,
 ) {
     let _fd = FdGuard(conn_fd);
     let _conn = ConnGuard::new();
@@ -277,9 +286,12 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
         &handle,
         conn_fd,
         &backend_id,
+        cache_id.as_deref(),
+        neighborhood_id.as_deref(),
         stripe_size,
         page_size,
         &fanout,
+        bypass,
         &mut log,
         &mut outcome,
     )
@@ -299,9 +311,12 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     handle: &NetHandle,
     conn_fd: RawFd,
     backend_id: &str,
+    cache_id: Option<&str>,
+    neighborhood_id: Option<&str>,
     stripe_size: u64,
     page_size: usize,
     fanout: &Rc<FanoutTable>,
+    bypass: bool,
     log: &mut crate::obs::ReqLog,
     outcome: &mut ReqOutcome,
 ) -> Result<(), ()> {
@@ -367,9 +382,17 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     // metadata entry through the pool. The HTTP backend fills it from
     // an origin HEAD on a miss; local-disk and peer hits skip the
     // origin entirely.
-    let len = read_object_length(pool, backend_id, &path, page_size)
-        .await
-        .map_err(|_| ())?;
+    let len = read_object_length(
+        pool,
+        backend_id,
+        cache_id,
+        neighborhood_id,
+        &path,
+        page_size,
+        bypass,
+    )
+    .await
+    .map_err(|_| ())?;
 
     // 6. Resolve the requested range against the length.
     let resolved = match range {
@@ -419,10 +442,13 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         fanout,
         conn_fd,
         backend_id,
+        cache_id,
+        neighborhood_id,
         &path,
         page_size,
         resolved,
         stripe_size,
+        bypass,
     )
     .await
 }
@@ -457,14 +483,27 @@ enum Ticket {
 }
 
 /// Build the content-addressed key and pool request for one stripe slice.
-fn stripe_request(backend_id: &str, path: &str, slice: StripeSlice) -> (StripeKey, StripeReq) {
+fn stripe_request(
+    backend_id: &str,
+    cache_id: Option<&str>,
+    neighborhood_id: Option<&str>,
+    path: &str,
+    slice: StripeSlice,
+    bypass: bool,
+) -> (StripeKey, StripeReq) {
     let origin_ref = OriginRef {
         backend_id: backend_id.to_string(),
         origin_object_id: path.to_string(),
         stripe_idx: slice.stripe_idx,
     };
     let key = origin_ref.stripe_key();
-    let req = StripeReq::new(key).with_origin(origin_ref);
+    let req = StripeReq::new(key)
+        .with_origin(origin_ref)
+        .with_chain(
+            cache_id.map(ToOwned::to_owned),
+            neighborhood_id.map(ToOwned::to_owned),
+        )
+        .with_bypass(bypass);
     (key, req)
 }
 
@@ -524,11 +563,14 @@ async fn send_region(
 async fn dispatch_ticket(
     fanout: &Rc<FanoutTable>,
     backend_id: &str,
+    cache_id: Option<&str>,
+    neighborhood_id: Option<&str>,
     path: &str,
     slice: StripeSlice,
+    bypass: bool,
 ) -> Ticket {
-    let (key, req) = stripe_request(backend_id, path, slice);
-    match fanout.owner_of(&key, slice.intra_offset) {
+    let (key, req) = stripe_request(backend_id, cache_id, neighborhood_id, path, slice, bypass);
+    match fanout.owner_of_cache(&key, cache_id, slice.intra_offset) {
         Owner::Local => Ticket::Local { slice },
         Owner::Peer(peer) => {
             let buf_index = peer.buf_index;
@@ -570,18 +612,25 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
     fanout: &Rc<FanoutTable>,
     conn_fd: RawFd,
     backend_id: &str,
+    cache_id: Option<&str>,
+    neighborhood_id: Option<&str>,
     path: &str,
     page_size: usize,
     resolved: ResolvedRange,
     stripe_size: u64,
+    bypass: bool,
 ) -> Result<(), ()> {
     let slices = stripe_set(resolved, stripe_size);
 
-    if fanout.shard_count() <= 1 {
+    // A bypass frontend never fans out across shards: every stripe is
+    // served from the local pool (which bridges straight to the origin),
+    // so take the single pipelined-read path regardless of shard count.
+    if bypass || fanout.shard_count() <= 1 {
         let plans: Vec<StripePlan<StripeReq>> = slices
             .into_iter()
             .map(|slice| {
-                let (_key, req) = stripe_request(backend_id, path, slice);
+                let (_key, req) =
+                    stripe_request(backend_id, cache_id, neighborhood_id, path, slice, bypass);
                 StripePlan {
                     req,
                     intra_offset: slice.intra_offset,
@@ -604,12 +653,24 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
     let mut next = 0usize;
     let mut window: VecDeque<Ticket> = VecDeque::new();
     while next < slices.len() && window.len() < WINDOW {
-        window.push_back(dispatch_ticket(fanout, backend_id, path, slices[next]).await);
+        window.push_back(
+            dispatch_ticket(
+                fanout,
+                backend_id,
+                cache_id,
+                neighborhood_id,
+                path,
+                slices[next],
+                bypass,
+            )
+            .await,
+        );
         next += 1;
     }
 
     let local_plan = |slice: StripeSlice| {
-        let (_key, req) = stripe_request(backend_id, path, slice);
+        let (_key, req) =
+            stripe_request(backend_id, cache_id, neighborhood_id, path, slice, bypass);
         StripePlan {
             req,
             intra_offset: slice.intra_offset,
@@ -660,7 +721,16 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
                     // its pins, so retries eventually succeed.
                     Err(crate::bufferpool::Error::Busy) => {
                         yield_now().await;
-                        let retry = dispatch_ticket(fanout, backend_id, path, slice).await;
+                        let retry = dispatch_ticket(
+                            fanout,
+                            backend_id,
+                            cache_id,
+                            neighborhood_id,
+                            path,
+                            slice,
+                            bypass,
+                        )
+                        .await;
                         window.push_front(retry);
                         continue;
                     }
@@ -694,7 +764,18 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
         }
 
         while next < slices.len() && window.len() < WINDOW {
-            window.push_back(dispatch_ticket(fanout, backend_id, path, slices[next]).await);
+            window.push_back(
+                dispatch_ticket(
+                    fanout,
+                    backend_id,
+                    cache_id,
+                    neighborhood_id,
+                    path,
+                    slices[next],
+                    bypass,
+                )
+                .await,
+            );
             next += 1;
         }
     }
@@ -709,11 +790,20 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
 async fn read_object_length<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     backend_id: &str,
+    cache_id: Option<&str>,
+    neighborhood_id: Option<&str>,
     path: &str,
     page_size: usize,
+    bypass: bool,
 ) -> Result<u64, ()> {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
-    let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
+    let req = StripeReq::new(origin_ref.stripe_key())
+        .with_origin(origin_ref)
+        .with_chain(
+            cache_id.map(ToOwned::to_owned),
+            neighborhood_id.map(ToOwned::to_owned),
+        )
+        .with_bypass(bypass);
     let mut rs: ReadStream = pool.read(&req, 0, page_size as u64).await.map_err(|_| ())?;
     let page = rs.next_page().await.ok_or(())?.map_err(|_| ())?;
     let meta = ObjectMetadata::decode(page.as_slice()).map_err(|_| ())?;
@@ -779,17 +869,19 @@ fn status_line_response(status: u16) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::bufferpool::{Error, PipelinedRead, ReadStream, WindowedRead};
+    use crate::config::HttpFrontendConfig;
     use crate::fanout::NumaShardTable;
     use crate::frontend::range::StripeSlice;
-    use crate::storage::disks::DiskChannelDirectory;
+    use crate::storage::disks::CacheDirectorySet;
     use std::cell::RefCell;
 
-    fn spec(id: &str, bind: &str) -> FrontendSpec {
+    fn spec(id: &str, addr: &str) -> FrontendSpec {
         FrontendSpec {
             id: id.to_string(),
-            kind: FrontendKind::Http as i32,
-            bind: bind.to_string(),
-            backend: "primary".to_string(),
+            binds_to: "primary".to_string(),
+            config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
+                addr: addr.to_string(),
+            })),
         }
     }
 
@@ -797,7 +889,6 @@ mod tests {
     fn from_spec_validates_kind_and_bind() {
         let f = HttpFrontend::from_spec(&spec("workload", "0.0.0.0:9000")).unwrap();
         assert_eq!(f.id(), "workload");
-        assert_eq!(f.backend_id(), "primary");
         assert_eq!(f.bind(), "0.0.0.0:9000".parse().unwrap());
 
         let bad = HttpFrontend::from_spec(&spec("f", "not-an-addr"));
@@ -940,6 +1031,35 @@ mod tests {
     }
 
     #[test]
+    fn stripe_request_stamps_bypass_flag() {
+        use crate::bufferpool::Req;
+
+        let slice = StripeSlice {
+            stripe_idx: 2,
+            intra_offset: 0,
+            intra_len: 4,
+        };
+        // Non-bypass requests carry the cache path (bypass == false).
+        let (_k, normal) = stripe_request(
+            "primary",
+            Some("cache-a"),
+            Some("site-a"),
+            "/o",
+            slice,
+            false,
+        );
+        assert!(!normal.bypass());
+        assert_eq!(normal.cache_id(), Some("cache-a"));
+        assert_eq!(normal.neighborhood_id(), Some("site-a"));
+        // Bridge-mode frontends stamp bypass == true onto every request.
+        let (k, bridged) = stripe_request("primary", None, None, "/o", slice, true);
+        assert!(bridged.bypass());
+        // The flag does not perturb the routing key or origin mapping.
+        assert_eq!(normal.key(), k);
+        assert_eq!(bridged.origin(), normal.origin());
+    }
+
+    #[test]
     fn metadata_entry_request_is_well_formed() {
         use crate::bufferpool::Req;
         use crate::storage::{METADATA_STRIPE_IDX, stripe_key};
@@ -1014,14 +1134,17 @@ mod tests {
             listen_fd,
             Rc::from("primary"),
             "primary".to_string(),
+            None,
+            None,
             4 * 1024 * 1024,
             2 * 1024 * 1024,
             Rc::new(FanoutTable::new(
                 0,
                 vec![None],
                 NumaShardTable::from_shards([(0, None)]),
-                DiskChannelDirectory::new(),
+                CacheDirectorySet::new(),
             )),
+            false,
         );
         // No client has connected: accept is pending, no conns, so the
         // engine reports no work and stays idle.

@@ -7,8 +7,8 @@
 //! `../../api/unbounded-storage/config.proto` (see `build.rs`) and pulled
 //! in via the `include!` below. The `.proto` is the schema source of truth.
 //!
-//! The schema is proto3-native: enums are integers, byte sizes are
-//! plain integers, and every field's proto3 zero value means "unset".
+//! The schema is proto3-native: byte sizes are plain integers, and every
+//! field's proto3 zero value means "unset".
 //! [`Config::apply_defaults`] runs after deserialization and promotes
 //! those zero values to the documented defaults. Section messages are
 //! `Option` in prost and are guaranteed `Some` after `apply_defaults`,
@@ -16,10 +16,15 @@
 //!
 //! The TOML loader is strict: each message derives
 //! `#[serde(default, deny_unknown_fields)]`, so an unknown key fails
-//! loudly at parse time, and `config::load::validate` rejects enum
-//! integers outside their defined discriminants.
+//! loudly at parse time. This strictness applies only to the TOML path;
+//! decoding a protobuf wire message keeps
+//! protobuf's forward-compatible unknown-field semantics.
 
 include!(concat!(env!("OUT_DIR"), "/unbounded.storage.config.rs"));
+
+const DEFAULT_STRIPE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
+const DEFAULT_HTTP_CONCURRENCY: u32 = 64;
+const DEFAULT_FAKE_OBJECT_SIZE_BYTES: u64 = 1024 * 1024;
 
 impl Config {
     /// Populates every omitted section and promotes proto3 zero values
@@ -27,18 +32,14 @@ impl Config {
     /// a non-zero value is left untouched. Run once after load (or after
     /// decoding a protobuf message) before the config is consumed.
     pub fn apply_defaults(&mut self) {
-        let p2p = self.p2p.get_or_insert_with(P2pCfg::default);
-        if p2p.fingers_per_node == 0 {
-            p2p.fingers_per_node = 100;
+        for n in &mut self.neighborhoods {
+            if n.fingers_per_node == 0 {
+                n.fingers_per_node = 100;
+            }
         }
 
-        for b in &mut self.backends {
-            if b.stripe_size_bytes == 0 {
-                b.stripe_size_bytes = 4 * 1024 * 1024;
-            }
-            if b.http_concurrency == 0 {
-                b.http_concurrency = 64;
-            }
+        for backend in &mut self.backends {
+            backend.apply_defaults();
         }
 
         let startup = self.startup.get_or_insert_with(StartupCfg::default);
@@ -49,8 +50,8 @@ impl Config {
         }
 
         let fabric = startup.fabric.get_or_insert_with(FabricCfg::default);
-        if fabric.listen_addr.is_empty() {
-            fabric.listen_addr = "0.0.0.0:0".to_string();
+        if fabric.addr.is_empty() {
+            fabric.addr = "0.0.0.0:0".to_string();
         }
         if fabric.progress_threads == 0 {
             fabric.progress_threads = 2;
@@ -75,16 +76,10 @@ impl Config {
         // `serving_cores` keeps its proto3 zero, which the planner reads
         // as "auto-fill every usable core".
 
-        // Metrics: the exporter is opt-in, so an empty bind (the proto3
+        // Metrics: the exporter is opt-in, so an empty addr (the proto3
         // zero value) is the intended "disabled" default and is left as
         // is. Materialize the section so the accessor never panics.
         startup.metrics.get_or_insert_with(MetricsCfg::default);
-    }
-
-    /// P2p section. Panics if called before [`Config::apply_defaults`]
-    /// on a `Config` with no p2p section; always valid after `load`.
-    pub fn p2p(&self) -> &P2pCfg {
-        self.p2p.as_ref().expect("p2p section populated")
     }
 
     /// Startup-fixed settings section. Panics if called before
@@ -93,6 +88,150 @@ impl Config {
     /// `Some` once defaults have been applied.
     pub fn startup(&self) -> &StartupCfg {
         self.startup.as_ref().expect("startup section populated")
+    }
+}
+
+impl BackendSpec {
+    fn apply_defaults(&mut self) {
+        match self.config.as_mut() {
+            Some(backend_spec::Config::Http(cfg)) => {
+                apply_http_backend_defaults(&mut cfg.stripe_size_bytes, &mut cfg.http_concurrency)
+            }
+            Some(backend_spec::Config::S3(cfg)) => {
+                apply_http_backend_defaults(&mut cfg.stripe_size_bytes, &mut cfg.http_concurrency)
+            }
+            Some(backend_spec::Config::Azure(cfg)) => {
+                apply_http_backend_defaults(&mut cfg.stripe_size_bytes, &mut cfg.http_concurrency)
+            }
+            Some(backend_spec::Config::Fake(cfg)) => {
+                if cfg.stripe_size_bytes == 0 {
+                    cfg.stripe_size_bytes = DEFAULT_STRIPE_SIZE_BYTES;
+                }
+                if cfg.object_size_bytes == 0 {
+                    cfg.object_size_bytes = DEFAULT_FAKE_OBJECT_SIZE_BYTES;
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self.config {
+            Some(backend_spec::Config::Http(_)) => "http",
+            Some(backend_spec::Config::S3(_)) => "s3",
+            Some(backend_spec::Config::Azure(_)) => "azure",
+            Some(backend_spec::Config::Fake(_)) => "fake",
+            None => "missing",
+        }
+    }
+
+    pub fn stripe_size_bytes(&self) -> u64 {
+        match self.config.as_ref() {
+            Some(backend_spec::Config::Http(cfg)) => cfg.stripe_size_bytes,
+            Some(backend_spec::Config::S3(cfg)) => cfg.stripe_size_bytes,
+            Some(backend_spec::Config::Azure(cfg)) => cfg.stripe_size_bytes,
+            Some(backend_spec::Config::Fake(cfg)) => cfg.stripe_size_bytes,
+            None => 0,
+        }
+    }
+
+    pub fn endpoint(&self) -> Option<&str> {
+        match self.config.as_ref() {
+            Some(backend_spec::Config::Http(cfg)) => Some(cfg.endpoint.as_str()),
+            Some(backend_spec::Config::S3(cfg)) => Some(cfg.endpoint.as_str()),
+            Some(backend_spec::Config::Azure(cfg)) => Some(cfg.endpoint.as_str()),
+            Some(backend_spec::Config::Fake(_)) | None => None,
+        }
+    }
+
+    pub fn http_concurrency(&self) -> Option<u32> {
+        match self.config.as_ref() {
+            Some(backend_spec::Config::Http(cfg)) => Some(cfg.http_concurrency),
+            Some(backend_spec::Config::S3(cfg)) => Some(cfg.http_concurrency),
+            Some(backend_spec::Config::Azure(cfg)) => Some(cfg.http_concurrency),
+            Some(backend_spec::Config::Fake(_)) | None => None,
+        }
+    }
+}
+
+impl PeerSpec {
+    pub fn transport_name(&self) -> &'static str {
+        match self.config {
+            Some(peer_spec::Config::Tcp(_)) => "tcp",
+            Some(peer_spec::Config::Rdma(_)) => "rdma",
+            None => "missing",
+        }
+    }
+
+    pub fn wire_addr(&self) -> Option<&str> {
+        match self.config.as_ref() {
+            Some(peer_spec::Config::Tcp(cfg)) => Some(cfg.addr.as_str()),
+            Some(peer_spec::Config::Rdma(cfg)) => Some(cfg.addr.as_str()),
+            None => None,
+        }
+    }
+
+    pub fn hca_numa(&self) -> Option<u32> {
+        match self.config.as_ref() {
+            Some(peer_spec::Config::Rdma(cfg)) => cfg.hca_numa,
+            Some(peer_spec::Config::Tcp(_)) | None => None,
+        }
+    }
+}
+
+impl DiskSpec {
+    pub fn kind_name(&self) -> &'static str {
+        match self.config {
+            Some(disk_spec::Config::Block(_)) => "block",
+            Some(disk_spec::Config::File(_)) => "file",
+            None => "missing",
+        }
+    }
+
+    pub fn is_file(&self) -> bool {
+        matches!(self.config, Some(disk_spec::Config::File(_)))
+    }
+
+    pub fn file_size(&self) -> Option<u64> {
+        match self.config.as_ref() {
+            Some(disk_spec::Config::File(cfg)) => cfg.size,
+            Some(disk_spec::Config::Block(_)) | None => None,
+        }
+    }
+
+    pub fn numa(&self) -> Option<u32> {
+        match self.config.as_ref() {
+            Some(disk_spec::Config::Block(cfg)) => cfg.numa,
+            Some(disk_spec::Config::File(_)) | None => None,
+        }
+    }
+}
+
+impl FrontendSpec {
+    pub fn kind_name(&self) -> &'static str {
+        match self.config {
+            Some(frontend_spec::Config::Http(_)) => "http",
+            Some(frontend_spec::Config::S3(_)) => "s3",
+            Some(frontend_spec::Config::Loadgen(_)) => "loadgen",
+            None => "missing",
+        }
+    }
+
+    pub fn addr(&self) -> Option<&str> {
+        match self.config.as_ref() {
+            Some(frontend_spec::Config::Http(cfg)) => Some(cfg.addr.as_str()),
+            Some(frontend_spec::Config::S3(cfg)) => Some(cfg.addr.as_str()),
+            Some(frontend_spec::Config::Loadgen(_)) | None => None,
+        }
+    }
+}
+
+fn apply_http_backend_defaults(stripe_size_bytes: &mut u64, http_concurrency: &mut u32) {
+    if *stripe_size_bytes == 0 {
+        *stripe_size_bytes = DEFAULT_STRIPE_SIZE_BYTES;
+    }
+    if *http_concurrency == 0 {
+        *http_concurrency = DEFAULT_HTTP_CONCURRENCY;
     }
 }
 
@@ -127,11 +266,8 @@ mod tests {
         let mut c: Config = toml::from_str("").unwrap();
         c.apply_defaults();
         assert_eq!(c.version, 0);
-        assert_eq!(c.p2p().fingers_per_node, 100);
-        assert!(c.p2p().local_node_id.is_none());
-        assert!(c.p2p().local_labels.is_empty());
-        assert!(c.peers.is_empty());
-        assert!(c.disks.is_empty());
+        assert!(c.neighborhoods.is_empty());
+        assert!(c.caches.is_empty());
         assert!(c.backends.is_empty());
         assert!(c.frontends.is_empty());
     }
@@ -140,8 +276,8 @@ mod tests {
     fn metrics_section_defaults_to_disabled() {
         let mut c: Config = toml::from_str("").unwrap();
         c.apply_defaults();
-        // The exporter is opt-in: the bind stays empty unless configured.
-        assert_eq!(c.startup().metrics().bind, "");
+        // The exporter is opt-in: the addr stays empty unless configured.
+        assert_eq!(c.startup().metrics().addr, "");
     }
 
     #[test]
@@ -162,59 +298,81 @@ mod tests {
     }
 
     #[test]
-    fn disk_kind_defaults_to_nvme() {
+    fn block_disk_config_round_trips() {
         let s = r#"
-[[disks]]
+[[caches]]
+id = "cache"
+binds_to = "n"
+
+[[caches.disks]]
 path = "/dev/nvme0n1"
+
+[caches.disks.config.block]
+numa = 1
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.disks[0].kind(), DiskKind::Nvme);
+        assert_eq!(c.caches[0].disks[0].kind_name(), "block");
+        assert_eq!(c.caches[0].disks[0].numa(), Some(1));
     }
 
     #[test]
     fn disk_engine_fields_default_to_unset_and_off() {
         let s = r#"
-[[disks]]
+[[caches]]
+id = "cache"
+binds_to = "n"
+
+[[caches.disks]]
 path = "/dev/nvme0n1"
+
+[caches.disks.config.block]
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.disks[0].page_size_bytes, None);
-        assert!(!c.disks[0].bypass_admission);
-        assert!(!c.disks[0].skip_recovery_scan_if_no_meta);
+        assert_eq!(c.caches[0].disks[0].page_size_bytes, None);
+        assert!(!c.caches[0].disks[0].bypass_admission);
+        assert!(!c.caches[0].disks[0].skip_recovery_scan_if_no_meta);
     }
 
     #[test]
     fn disk_engine_fields_round_trip() {
         let s = r#"
-[[disks]]
+[[caches]]
+id = "cache"
+binds_to = "n"
+
+[[caches.disks]]
 path = "/dev/nvme0n1"
 page_size_bytes = 4096
 bypass_admission = true
 skip_recovery_scan_if_no_meta = true
+
+[caches.disks.config.block]
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.disks[0].page_size_bytes, Some(4096));
-        assert!(c.disks[0].bypass_admission);
-        assert!(c.disks[0].skip_recovery_scan_if_no_meta);
+        assert_eq!(c.caches[0].disks[0].page_size_bytes, Some(4096));
+        assert!(c.caches[0].disks[0].bypass_admission);
+        assert!(c.caches[0].disks[0].skip_recovery_scan_if_no_meta);
     }
 
     #[test]
-    fn p2p_round_trips() {
+    fn neighborhood_round_trips() {
         let s = r#"
-[p2p]
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
 fingers_per_node = 128
 local_node_id = 42
 local_labels = ["us-west", "az1", "row3", "rack7"]
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.p2p().fingers_per_node, 128);
-        assert_eq!(c.p2p().local_node_id, Some(42));
+        assert_eq!(c.neighborhoods[0].fingers_per_node, 128);
+        assert_eq!(c.neighborhoods[0].local_node_id, Some(42));
         assert_eq!(
-            c.p2p().local_labels,
+            c.neighborhoods[0].local_labels,
             vec![
                 "us-west".to_string(),
                 "az1".to_string(),
@@ -225,43 +383,56 @@ local_labels = ["us-west", "az1", "row3", "rack7"]
     }
 
     #[test]
-    fn p2p_routing_plan_round_trips() {
+    fn neighborhood_routing_plan_round_trips() {
         let s = r#"
-[p2p]
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
 local_node_id = 1
 
-[p2p.routing_plan]
+[neighborhoods.routing_plan]
 fingers = [2, 5, 9, 17]
 successor = 2
 predecessor = 64
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        let plan = c.p2p().routing_plan.as_ref().expect("routing_plan set");
+        let plan = c.neighborhoods[0]
+            .routing_plan
+            .as_ref()
+            .expect("routing_plan set");
         assert_eq!(plan.fingers, vec![2, 5, 9, 17]);
         assert_eq!(plan.successor, Some(2));
         assert_eq!(plan.predecessor, Some(64));
     }
 
     #[test]
-    fn p2p_routing_plan_absent_by_default() {
-        let mut c: Config = toml::from_str("[p2p]\nlocal_node_id = 1\n").unwrap();
+    fn neighborhood_routing_plan_absent_by_default() {
+        let mut c: Config =
+            toml::from_str("[[neighborhoods]]\nid = \"n\"\nbinds_to = \"b\"\nlocal_node_id = 1\n")
+                .unwrap();
         c.apply_defaults();
-        assert!(c.p2p().routing_plan.is_none());
+        assert!(c.neighborhoods[0].routing_plan.is_none());
     }
 
     #[test]
     fn peer_labels_round_trip() {
         let s = r#"
-[[peers]]
+[[neighborhoods]]
+id = "n"
+binds_to = "b"
+
+[[neighborhoods.peers]]
 id = 1
-address = { socket = "127.0.0.1:9000" }
 labels = ["us-west", "az1", "row3", "rack7"]
+
+[neighborhoods.peers.config.tcp]
+addr = "127.0.0.1:9000"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(
-            c.peers[0].labels,
+            c.neighborhoods[0].peers[0].labels,
             vec![
                 "us-west".to_string(),
                 "az1".to_string(),
@@ -276,33 +447,58 @@ labels = ["us-west", "az1", "row3", "rack7"]
         let s = r#"
 [[backends]]
 id = "primary-http"
-kind = 0
+
+[backends.config.http]
 endpoint = "https://origin.example.com"
 stripe_size_bytes = 8388608
 http_concurrency = 32
 
 [[frontends]]
 id = "workload-http"
-kind = 0
-bind = "0.0.0.0:9000"
-backend = "primary-http"
+binds_to = "primary-http"
+
+[frontends.config.http]
+addr = "0.0.0.0:9000"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(c.backends.len(), 1);
         let b = &c.backends[0];
         assert_eq!(b.id, "primary-http");
-        assert_eq!(b.kind(), BackendKind::Http);
-        assert_eq!(b.endpoint, "https://origin.example.com");
-        assert_eq!(b.stripe_size_bytes, 8 * 1024 * 1024);
-        assert_eq!(b.http_concurrency, 32);
+        match b.config.as_ref().expect("backend config set") {
+            backend_spec::Config::Http(cfg) => {
+                assert_eq!(cfg.endpoint, "https://origin.example.com");
+                assert_eq!(cfg.stripe_size_bytes, 8 * 1024 * 1024);
+                assert_eq!(cfg.http_concurrency, 32);
+            }
+            other => panic!("expected http backend config, got {other:?}"),
+        }
 
         assert_eq!(c.frontends.len(), 1);
         let f = &c.frontends[0];
         assert_eq!(f.id, "workload-http");
-        assert_eq!(f.kind(), FrontendKind::Http);
-        assert_eq!(f.bind, "0.0.0.0:9000");
-        assert_eq!(f.backend, "primary-http");
+        assert_eq!(f.addr(), Some("0.0.0.0:9000"));
+        assert_eq!(f.binds_to, "primary-http");
+    }
+
+    #[test]
+    fn cache_and_frontend_binding_round_trip() {
+        let s = r#"
+[[caches]]
+id = "cache"
+binds_to = "n"
+
+[[frontends]]
+id = "cached-http"
+binds_to = "cache"
+
+[frontends.config.http]
+addr = "0.0.0.0:9000"
+"#;
+        let mut c: Config = toml::from_str(s).unwrap();
+        c.apply_defaults();
+        assert_eq!(c.caches[0].id, "cache");
+        assert_eq!(c.frontends[0].binds_to, "cache");
     }
 
     #[test]
@@ -310,44 +506,99 @@ backend = "primary-http"
         let s = r#"
 [[backends]]
 id = "b"
-kind = 0
+
+[backends.config.http]
 endpoint = "https://example.com"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        let b = &c.backends[0];
-        assert_eq!(b.stripe_size_bytes, 4 * 1024 * 1024);
-        assert_eq!(b.http_concurrency, 64);
+        match c.backends[0].config.as_ref().expect("backend config set") {
+            backend_spec::Config::Http(cfg) => {
+                assert_eq!(cfg.stripe_size_bytes, 4 * 1024 * 1024);
+                assert_eq!(cfg.http_concurrency, 64);
+            }
+            other => panic!("expected http backend config, got {other:?}"),
+        }
     }
 
     #[test]
-    fn s3_backend_round_trips_with_bucket() {
+    fn s3_backend_round_trips() {
         let s = r#"
 [[backends]]
 id = "primary-s3"
-kind = 1
+
+[backends.config.s3]
 endpoint = "s3.us-east-1.amazonaws.com:443"
-bucket = "my-bucket"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        let b = &c.backends[0];
-        assert_eq!(b.kind(), BackendKind::S3);
-        assert_eq!(b.bucket.as_deref(), Some("my-bucket"));
+        assert_eq!(c.backends[0].kind_name(), "s3");
+        assert_eq!(
+            c.backends[0].endpoint(),
+            Some("s3.us-east-1.amazonaws.com:443")
+        );
     }
 
     #[test]
-    fn s3_frontend_kind_round_trips() {
+    fn s3_frontend_round_trips() {
         let s = r#"
 [[frontends]]
 id = "workload-s3"
-kind = 1
-bind = "0.0.0.0:9000"
-backend = "b"
+binds_to = "b"
+
+[frontends.config.s3]
+addr = "0.0.0.0:9000"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.frontends[0].kind(), FrontendKind::S3);
+        assert_eq!(c.frontends[0].kind_name(), "s3");
+        assert_eq!(c.frontends[0].addr(), Some("0.0.0.0:9000"));
+    }
+
+    #[test]
+    fn loadgen_frontend_round_trips() {
+        let s = r#"
+[[frontends]]
+id = "synthetic"
+binds_to = "cache"
+
+[frontends.config.loadgen]
+workers = 8
+seed = 1234
+object_count = 4096
+read_bytes = 131072
+verify = true
+"#;
+        let mut c: Config = toml::from_str(s).unwrap();
+        c.apply_defaults();
+
+        let f = &c.frontends[0];
+        assert_eq!(f.kind_name(), "loadgen");
+        assert_eq!(f.addr(), None);
+        assert_eq!(f.binds_to, "cache");
+
+        let loadgen = match f.config.as_ref().expect("loadgen config set") {
+            frontend_spec::Config::Loadgen(cfg) => cfg,
+            other => panic!("expected loadgen frontend config, got {other:?}"),
+        };
+        assert_eq!(loadgen.workers, 8);
+        assert_eq!(loadgen.seed, 1234);
+        assert_eq!(loadgen.object_count, 4096);
+        assert_eq!(loadgen.read_bytes, 128 * 1024);
+        assert!(loadgen.verify);
+    }
+
+    #[test]
+    fn unknown_loadgen_fields_are_rejected() {
+        let s = r#"
+[[frontends]]
+id = "synthetic"
+binds_to = "cache"
+
+[frontends.config.loadgen]
+workerz = 8
+"#;
+        assert!(toml::from_str::<Config>(s).is_err());
     }
 
     #[test]
@@ -357,7 +608,7 @@ backend = "b"
         let s = c.startup();
         assert!(!s.memory().no_hugepages);
         assert_eq!(s.memory().memory_total_bytes, 128 * 1024 * 1024);
-        assert_eq!(s.fabric().listen_addr, "0.0.0.0:0");
+        assert_eq!(s.fabric().addr, "0.0.0.0:0");
         assert_eq!(s.fabric().progress_threads, 2);
         assert_eq!(s.fabric().progress_poll_us, 10);
         assert_eq!(s.fabric().rpc_worker_threads, 4);
@@ -385,7 +636,7 @@ no_hugepages = true
 memory_total_bytes = 67108864
 
 [startup.fabric]
-listen_addr = "10.0.0.1:7000"
+addr = "10.0.0.1:7000"
 progress_threads = 3
 progress_poll_us = 25
 rpc_worker_threads = 8
@@ -406,7 +657,7 @@ hcas_per_numa_node = 2
         let st = c.startup();
         assert!(st.memory().no_hugepages);
         assert_eq!(st.memory().memory_total_bytes, 64 * 1024 * 1024);
-        assert_eq!(st.fabric().listen_addr, "10.0.0.1:7000");
+        assert_eq!(st.fabric().addr, "10.0.0.1:7000");
         assert_eq!(st.fabric().progress_threads, 3);
         assert_eq!(st.fabric().progress_poll_us, 25);
         assert_eq!(st.fabric().rpc_worker_threads, 8);

@@ -29,11 +29,12 @@ use arc_swap::ArcSwap;
 
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::config::reconcile::BackendReconcileTarget;
-use crate::config::{BackendKind, BackendSpec};
+use crate::config::{BackendSpec, backend_spec};
 use crate::storage::StripeReq;
 
 use super::{
-    AzureBackend, Backend, HttpBackend, OriginBackend, OriginRing, OriginStream, S3Backend,
+    AzureBackend, Backend, FakeBackend, HttpBackend, OriginBackend, OriginRing, OriginStream,
+    S3Backend,
 };
 
 /// The build context a registry needs to (re)construct an
@@ -118,52 +119,62 @@ impl BackendRegistry {
 
 impl BuildCtx {
     /// Build one [`OriginBackend`] from `spec`, selecting the concrete
-    /// origin implementation by [`BackendSpec::kind`]. For an `s3`
+    /// origin implementation by [`BackendSpec::config`]. For an `s3`
     /// backend the origin IP is resolved from the endpoint the same way
     /// as for HTTP (IPv4-only, v1), but the host authority is extracted
     /// separately for the `Host:` header.
     fn build(&self, spec: &BackendSpec) -> io::Result<OriginBackend> {
-        match spec.kind() {
-            BackendKind::Http => {
-                let origin = HttpBackend::resolve_origin(&spec.endpoint)?;
+        match spec.config.as_ref() {
+            Some(backend_spec::Config::Http(cfg)) => {
+                let origin = HttpBackend::resolve_origin(&cfg.endpoint)?;
                 Ok(OriginBackend::Http(HttpBackend::new(
                     self.ring.clone(),
                     origin,
                     spec.id.clone(),
-                    spec.stripe_size_bytes,
+                    cfg.stripe_size_bytes,
                     self.page_size,
                     self.backing_base,
-                    spec.http_concurrency as usize,
+                    cfg.http_concurrency as usize,
                 )))
             }
-            BackendKind::S3 => {
-                let origin = S3Backend::resolve_origin(&spec.endpoint)?;
-                let host = extract_host_authority(&spec.endpoint);
+            Some(backend_spec::Config::S3(cfg)) => {
+                let origin = S3Backend::resolve_origin(&cfg.endpoint)?;
+                let host = extract_host_authority(&cfg.endpoint);
                 Ok(OriginBackend::S3(S3Backend::new(
                     self.ring.clone(),
                     origin,
                     host,
                     spec.id.clone(),
-                    spec.stripe_size_bytes,
+                    cfg.stripe_size_bytes,
                     self.page_size,
                     self.backing_base,
-                    spec.http_concurrency as usize,
+                    cfg.http_concurrency as usize,
                 )))
             }
-            BackendKind::Azure => {
-                let origin = AzureBackend::resolve_origin(&spec.endpoint)?;
-                let host = extract_host_authority(&spec.endpoint);
+            Some(backend_spec::Config::Azure(cfg)) => {
+                let origin = AzureBackend::resolve_origin(&cfg.endpoint)?;
+                let host = extract_host_authority(&cfg.endpoint);
                 Ok(OriginBackend::Azure(AzureBackend::new(
                     self.ring.clone(),
                     origin,
                     host,
                     spec.id.clone(),
-                    spec.stripe_size_bytes,
+                    cfg.stripe_size_bytes,
                     self.page_size,
                     self.backing_base,
-                    spec.http_concurrency as usize,
+                    cfg.http_concurrency as usize,
                 )))
             }
+            Some(backend_spec::Config::Fake(cfg)) => Ok(OriginBackend::Fake(FakeBackend::new(
+                spec.id.clone(),
+                cfg.object_size_bytes,
+                self.page_size,
+                self.backing_base,
+            ))),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("backend {} missing config", spec.id),
+            )),
         }
     }
 }
@@ -280,18 +291,28 @@ mod tests {
     use std::ptr;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 
-    use crate::config::BackendKind;
+    use crate::config::{FakeBackendConfig, HttpBackendConfig, backend_spec};
 
     use super::*;
 
     fn http_spec(id: &str, endpoint: &str) -> BackendSpec {
         BackendSpec {
             id: id.to_string(),
-            kind: BackendKind::Http as i32,
-            endpoint: endpoint.to_string(),
-            stripe_size_bytes: 4 * 1024 * 1024,
-            http_concurrency: 64,
-            bucket: None,
+            config: Some(backend_spec::Config::Http(HttpBackendConfig {
+                endpoint: endpoint.to_string(),
+                stripe_size_bytes: 4 * 1024 * 1024,
+                http_concurrency: 64,
+            })),
+        }
+    }
+
+    fn fake_spec(id: &str, object_size: u64) -> BackendSpec {
+        BackendSpec {
+            id: id.to_string(),
+            config: Some(backend_spec::Config::Fake(FakeBackendConfig {
+                stripe_size_bytes: 4 * 1024 * 1024,
+                object_size_bytes: object_size,
+            })),
         }
     }
 
@@ -381,6 +402,15 @@ mod tests {
             matches!(second, Poll::Ready(None)),
             "expected end-of-stream after the error",
         );
+    }
+
+    #[test]
+    fn seeds_a_fake_backend_with_no_endpoint() {
+        // A fake backend needs no endpoint and no ring, so it must build
+        // even against the null backing base these tests use.
+        let reg = registry(&[fake_spec("synthetic", 1024 * 1024)]);
+        assert_eq!(reg.len(), 1);
+        assert!(reg.contains("synthetic"));
     }
 
     #[test]

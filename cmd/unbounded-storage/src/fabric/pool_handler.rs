@@ -42,7 +42,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use crate::bufferpool::{BlockStore, BulkRef, PageRef, Req, StripeKey};
+use crate::bufferpool::{BlockStore, BulkRef, PageRef, Req};
 use crate::memory::Backing;
 
 use super::handler::{Handler, HandlerStream};
@@ -112,12 +112,12 @@ impl<S: BlockStore + Send + Sync + 'static> PoolHandler<S> {
 
 impl<R, S> Handler<R> for PoolHandler<S>
 where
-    R: Req,
+    R: Req + Sync,
     S: BlockStore + Send + Sync + 'static,
 {
     type Error = PoolHandlerError;
     type Stream<'a>
-        = PoolHandlerStream<S>
+        = PoolHandlerStream<'a, R, S>
     where
         Self: 'a,
         R: 'a;
@@ -126,7 +126,7 @@ where
         PoolHandlerStream {
             store: self.store.clone(),
             scratch: self.scratch.clone(),
-            key: req.key(),
+            req,
             src,
             state: StreamState::Pending,
             page_idx: None,
@@ -171,16 +171,16 @@ enum StreamState {
 /// ends. The scratch page (if any) is returned to the free list on
 /// drop, which happens after the RPC layer has finished `fi_write`ing
 /// it to the peer.
-pub struct PoolHandlerStream<S: BlockStore + Send + Sync + 'static> {
+pub struct PoolHandlerStream<'a, R: Req, S: BlockStore + Send + Sync + 'static> {
     store: Arc<S>,
     scratch: Arc<ScratchBacking>,
-    key: StripeKey,
+    req: &'a R,
     src: BulkRef,
     state: StreamState,
     page_idx: Option<u32>,
 }
 
-impl<S: BlockStore + Send + Sync + 'static> HandlerStream for PoolHandlerStream<S> {
+impl<R: Req, S: BlockStore + Send + Sync + 'static> HandlerStream for PoolHandlerStream<'_, R, S> {
     type Error = PoolHandlerError;
 
     fn poll_next(
@@ -209,7 +209,7 @@ impl<S: BlockStore + Send + Sync + 'static> HandlerStream for PoolHandlerStream<
     }
 }
 
-impl<S: BlockStore + Send + Sync + 'static> PoolHandlerStream<S> {
+impl<R: Req, S: BlockStore + Send + Sync + 'static> PoolHandlerStream<'_, R, S> {
     /// Reserve a scratch page, fill it from the local store, and turn
     /// it into a `PageRef`. The `BlockStore::read_page` future is
     /// created and driven to completion entirely within this call so
@@ -228,7 +228,7 @@ impl<S: BlockStore + Send + Sync + 'static> PoolHandlerStream<S> {
             len: page_size as u32,
         };
 
-        let hit = block_on_local(self.store.read_page(self.key, self.src.offset, dst))
+        let hit = block_on_local(self.store.read_page(self.req, self.src.offset, dst))
             .map_err(PoolHandlerError::BlockStore)?;
         if !hit {
             return Err(PoolHandlerError::NotResident);
@@ -246,7 +246,7 @@ impl<S: BlockStore + Send + Sync + 'static> PoolHandlerStream<S> {
     }
 }
 
-impl<S: BlockStore + Send + Sync + 'static> Drop for PoolHandlerStream<S> {
+impl<R: Req, S: BlockStore + Send + Sync + 'static> Drop for PoolHandlerStream<'_, R, S> {
     fn drop(&mut self) {
         if let Some(idx) = self.page_idx.take() {
             self.scratch.give(idx);
@@ -267,7 +267,7 @@ fn block_on_local<F: std::future::Future>(fut: F) -> F::Output {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bufferpool::Error;
+    use crate::bufferpool::{Error, StripeKey};
     use crate::runtime::noop_waker;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -295,12 +295,13 @@ mod tests {
             Ok(())
         }
 
-        async fn read_page(
+        async fn read_page<R: Req + ?Sized>(
             &self,
-            key: StripeKey,
+            req: &R,
             _stripe_off: u64,
             dst: PageRef,
         ) -> Result<bool, Error> {
+            let key = req.key();
             self.reads.fetch_add(1, Ordering::Relaxed);
             if self.poison.contains(&key.0) {
                 return Err(Error::Io(libc::EIO));
@@ -320,9 +321,9 @@ mod tests {
             }
         }
 
-        async fn write_page(
+        async fn write_page<R: Req + ?Sized>(
             &self,
-            _key: StripeKey,
+            _req: &R,
             _stripe_off: u64,
             _page: PageRef,
         ) -> Result<(), Error> {

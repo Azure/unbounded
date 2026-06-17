@@ -21,15 +21,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use unbounded_storage::backend::{BackendRegistry, FixedRegion, OriginRing};
-use unbounded_storage::config::{self, BackendSpec, PeerSpec};
+use unbounded_storage::bufferpool::BlockStore;
+use unbounded_storage::config::{self, BackendSpec, RuntimePeer};
 use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, PeerId, Provider, RpcServerHandle};
 use unbounded_storage::memory::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
-use unbounded_storage::p2p::{
-    FingerTable, NodeId, RecursiveHandler, RoutingHandle, RoutingSnapshot,
-};
+use unbounded_storage::p2p::{RecursiveHandler, RouteTableHandle, RouteTableSnapshot};
 use unbounded_storage::runtime::{Threading, WorkerIdx};
 use unbounded_storage::storage::StripeReq;
-use unbounded_storage::storage::disks::{DiskChannelDirectory, LiveShardLocalStore};
+use unbounded_storage::storage::disks::{CacheDirectorySet, ChainLocalStore};
 use unbounded_storage::topology::{NicWorkerGroup, ServingShard};
 
 use crate::FabricStartup;
@@ -72,8 +71,8 @@ pub struct FabricPlan {
 /// `shard_devices` is all-`None` (tcp fallback) or all-`Some` (verbs),
 /// per `assign_shard_devices`:
 /// - tcp: a single `lo` endpoint shared by every serving shard, pinned to
-///   worker 0. Peers reach a node through one static `[[peers]] address`
-///   (== its `listen_addr`), so a node must expose exactly one inbound
+///   worker 0. Peers reach a node through one static neighborhood peer addr,
+///   so a node must expose exactly one inbound
 ///   fabric endpoint on that fixed port; binding one endpoint per shard
 ///   would make every shard past the first collide on the port
 ///   (`fi_endpoint` -> EADDRINUSE) once `serving_cores > 1`.
@@ -94,8 +93,8 @@ pub fn plan_fabric_units(
 }
 
 /// tcp fallback: a single `lo` endpoint shared by every serving shard,
-/// pinned to worker 0. A node advertises one static address (its
-/// `listen_addr`) to its peers, so it must bind exactly one inbound
+/// pinned to worker 0. A node advertises one static fabric address to its
+/// peers, so it must bind exactly one inbound
 /// endpoint on that fixed port; one endpoint per shard would collide
 /// (`fi_endpoint` -> EADDRINUSE) as soon as more than one shard serves.
 /// The shared unit carries no NUMA affinity (`numa = None`) so shards
@@ -218,12 +217,13 @@ fn verbs_worker_for_device(
 /// covers), so the parameters exist solely so a unit test can substitute
 /// drop-logging stand-ins and lock this ordering hardware-free; see
 /// `fabric_unit_drops_resources_in_teardown_order`.
-struct FabricUnit<S = RpcServerHandle, Rg = BackendRegistry, Rt = RoutingHandle, F = Arc<Fabric>> {
+struct FabricUnit<S = RpcServerHandle, Rg = BackendRegistry, Rt = RouteTableHandle, F = Arc<Fabric>>
+{
     // Held only for its Drop: see the struct doc for the teardown order.
     #[allow(dead_code)]
     rpc_server: S,
     handler_registry: Rg,
-    routing: Rt,
+    routes: Rt,
     fabric: F,
     applied_peers: HashMap<PeerId, ConnectionSpec>,
     last_backends: HashMap<String, BackendSpec>,
@@ -253,10 +253,9 @@ impl FabricGroup {
         backing_kind: BackingKind,
         fabric_startup: &FabricStartup,
         backend_specs: &[BackendSpec],
-        disk_channels: Arc<DiskChannelDirectory>,
-        fingers: &Arc<FingerTable>,
-        node_to_peer: &Arc<HashMap<NodeId, PeerId>>,
-        peers: &[PeerSpec],
+        cache_directories: Arc<CacheDirectorySet>,
+        routes: &RouteTableSnapshot,
+        peers: &[RuntimePeer],
         self_peer: PeerId,
     ) -> Result<Self, Vec<String>> {
         let mut units = Vec::with_capacity(plan.units.len());
@@ -269,9 +268,8 @@ impl FabricGroup {
                 backing_kind,
                 fabric_startup,
                 backend_specs,
-                &disk_channels,
-                fingers,
-                node_to_peer,
+                &cache_directories,
+                routes,
                 peers,
                 self_peer,
             ) {
@@ -305,19 +303,23 @@ impl FabricGroup {
     /// Reload every endpoint's RPC-handler routing from a new snapshot.
     /// Driven in lockstep with the per-shard transport reload so the
     /// classify and forward paths move together.
-    pub fn reload_routing(&self, snapshot: &RoutingSnapshot) {
+    pub fn reload_routes(&self, snapshot: &RouteTableSnapshot) {
         for unit in &self.units {
-            unit.routing
-                .store(snapshot.fingers.clone(), snapshot.node_to_peer.clone());
+            unit.routes.store_snapshot(snapshot.clone());
         }
     }
 
     /// Re-drive every endpoint's fabric connection table toward `peers`.
     /// Connections live at the fabric/address-vector level, so this runs
     /// once per endpoint rather than once per shard.
-    pub fn reconcile_peers(&mut self, peers: &[PeerSpec]) {
+    pub fn reconcile_peers(&mut self, peers: &[RuntimePeer]) {
+        let desired = runtime_peer_connections(peers);
         for unit in &mut self.units {
-            let report = config::reconcile_peers(&unit.fabric, peers, Some(&unit.applied_peers));
+            let report = config::reconcile::reconcile_connections(
+                &unit.fabric,
+                &desired,
+                Some(&unit.applied_peers),
+            );
             unit.applied_peers = report.applied;
             for (peer, err) in &report.failures {
                 eprintln!("fabric peer reconcile failed: peer={} err={err}", peer.0);
@@ -327,8 +329,7 @@ impl FabricGroup {
             // race, and so peers dropped from config (that never
             // connected, hence were never removed by reconcile) are
             // pruned from the desired set.
-            unit.fabric
-                .set_desired_peers(peers.iter().map(config::peer_spec_to_connection).collect());
+            unit.fabric.set_desired_peers(desired.clone());
         }
     }
 
@@ -361,10 +362,9 @@ fn build_unit(
     backing_kind: BackingKind,
     fabric_startup: &FabricStartup,
     backend_specs: &[BackendSpec],
-    disk_channels: &Arc<DiskChannelDirectory>,
-    fingers: &Arc<FingerTable>,
-    node_to_peer: &Arc<HashMap<NodeId, PeerId>>,
-    peers: &[PeerSpec],
+    cache_directories: &Arc<CacheDirectorySet>,
+    routes: &RouteTableSnapshot,
+    peers: &[RuntimePeer],
     self_peer: PeerId,
 ) -> Result<FabricUnit, String> {
     let worker = spec.worker_idx.0;
@@ -416,15 +416,15 @@ fn build_unit(
         .register_backing(&scratch, spec.numa)
         .map_err(|e| format!("worker={worker}: register rpc scratch: {e}"))?;
 
-    let routing = RoutingHandle::new(fingers.clone(), node_to_peer.clone());
+    let routes = RouteTableHandle::from_snapshot(routes.clone());
 
     // The handler resolves disk reads into scratch pages, so it needs a
     // `BlockStore` whose single registered backing IS the scratch
     // region; it shares the same disk-channel directory as the shards'
     // data-path stores but keeps page resolution unambiguous.
-    let rpc_store = Arc::new(LiveShardLocalStore::new(disk_channels.clone()));
+    let rpc_store = ChainLocalStore::new(cache_directories.clone());
     rpc_store
-        .register_backing(&scratch)
+        .register_pages(&scratch)
         .map_err(|e| format!("worker={worker}: rpc scratch blockstore register: {e}"))?;
 
     // The handler runs on a persistent RPC worker thread, so its origin
@@ -449,17 +449,17 @@ fn build_unit(
     // value handle shared by copy between the handler's forwarding
     // transport and the RPC server's `local_mr`.
     let rpc_handler = Arc::new(
-        RecursiveHandler::with_routing(
+        RecursiveHandler::with_routes(
             rpc_store,
             scratch,
             RPC_SCRATCH_PAGES,
-            routing.clone(),
+            routes.clone(),
             fabric.clone(),
             scratch_mr,
             page_size,
             handler_registry.clone(),
         )
-        .map_err(|e| format!("worker={worker}: RecursiveHandler::with_routing: {e}"))?,
+        .map_err(|e| format!("worker={worker}: RecursiveHandler::with_routes: {e}"))?,
     );
     let rpc_server = fabric
         .start_rpc_server::<StripeReq, _>(rpc_handler, Some(scratch_mr), page_size)
@@ -467,10 +467,12 @@ fn build_unit(
 
     fabric.check_shared_domain_capacity(spec.expected_mr);
 
-    let applied_peers = config::reconcile_peers(&fabric, peers, None).applied;
+    let desired_peers = runtime_peer_connections(peers);
+    let applied_peers =
+        config::reconcile::reconcile_connections(&fabric, &desired_peers, None).applied;
     // Seed the desired-peer set so the background reconnect thread can
     // retry any peer whose initial dial lost the startup race.
-    fabric.set_desired_peers(peers.iter().map(config::peer_spec_to_connection).collect());
+    fabric.set_desired_peers(desired_peers.clone());
     let last_backends = backend_specs
         .iter()
         .map(|b| (b.id.clone(), b.clone()))
@@ -479,11 +481,35 @@ fn build_unit(
     Ok(FabricUnit {
         rpc_server,
         handler_registry,
-        routing,
+        routes,
         fabric,
         applied_peers,
         last_backends,
     })
+}
+
+fn runtime_peer_connections(peers: &[RuntimePeer]) -> Vec<ConnectionSpec> {
+    peers
+        .iter()
+        .map(|peer| ConnectionSpec {
+            peer: peer.fabric_peer_id,
+            address: runtime_peer_address(&peer.spec),
+            hca_numa: peer.spec.hca_numa().map(|n| n as u16),
+            labels: peer.spec.labels.clone(),
+        })
+        .collect()
+}
+
+fn runtime_peer_address(peer: &config::PeerSpec) -> fabric::FabricAddress {
+    match peer.config.as_ref() {
+        Some(config::peer_spec::Config::Tcp(cfg)) => {
+            fabric::FabricAddress::socket(cfg.addr.clone())
+        }
+        Some(config::peer_spec::Config::Rdma(cfg)) => {
+            fabric::FabricAddress::native(cfg.addr.clone())
+        }
+        None => fabric::FabricAddress::native(""),
+    }
 }
 
 #[cfg(test)]
@@ -625,7 +651,7 @@ mod tests {
         // A `FabricUnit`'s field order is its drop order, and that order
         // is the teardown contract: the RPC server (and the worker
         // threads it joins) must stop touching the domain before the
-        // fabric closes it, with the registry and routing handle in
+        // fabric closes it, with the registry and route handle in
         // between. Bringing a real unit up needs a live libfabric domain
         // (covered by the smoke test), so here we substitute drop-logging
         // tokens for the four hardware-bound resources. This binds to the
@@ -636,7 +662,7 @@ mod tests {
         let unit: FabricUnit<DropToken, DropToken, DropToken, DropToken> = FabricUnit {
             rpc_server: DropToken::new("rpc_server", &log),
             handler_registry: DropToken::new("handler_registry", &log),
-            routing: DropToken::new("routing", &log),
+            routes: DropToken::new("routes", &log),
             fabric: DropToken::new("fabric", &log),
             applied_peers: HashMap::new(),
             last_backends: HashMap::new(),
@@ -646,7 +672,7 @@ mod tests {
 
         assert_eq!(
             *log.borrow(),
-            vec!["rpc_server", "handler_registry", "routing", "fabric"],
+            vec!["rpc_server", "handler_registry", "routes", "fabric"],
         );
     }
 }

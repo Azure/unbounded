@@ -36,18 +36,20 @@ use crate::backend::Backend;
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream, Req, Transport};
 use crate::fabric::Result as FabResult;
 use crate::fabric::{Fabric, FabricTransport, MrHandle, PeerId};
-use crate::p2p::{FingerRouter, FingerTable, NodeId, RoutingHandle, stripe_to_ring};
+use crate::p2p::{
+    ChainFingerRouter, FingerTable, NodeId, RouteTableHandle, RoutingHandle, stripe_to_ring,
+};
 
 /// Transport that selects the first hop per request by finger-table
 /// ownership: the local origin `Backend` when this node owns the
 /// stripe, otherwise the fabric peer path.
 pub struct RoutedTransport<R, B: Backend<Req = R>> {
-    fabric_transport: FabricTransport<R, FingerRouter>,
+    fabric_transport: FabricTransport<R, ChainFingerRouter>,
     /// Shared, live-reloadable routing surface. The inner
     /// `FabricTransport`'s `FingerRouter` shares this same handle, so a
     /// peer-set republish through any clone updates both the
     /// local-ownership pre-check below and the fabric routing at once.
-    routing: RoutingHandle,
+    routes: RouteTableHandle,
     backend: B,
     _marker: PhantomData<fn() -> R>,
 }
@@ -65,11 +67,19 @@ impl<R, B: Backend<Req = R>> RoutedTransport<R, B> {
         node_to_peer: Arc<HashMap<NodeId, PeerId>>,
         backend: B,
     ) -> FabResult<Self> {
-        Self::with_routing(
+        let mut routes = HashMap::new();
+        routes.insert(
+            RouteTableHandle::LEGACY_ROUTE_ID.to_string(),
+            crate::p2p::RoutingSnapshot {
+                fingers,
+                node_to_peer,
+            },
+        );
+        Self::with_routes(
             fabric,
             mr,
             page_size,
-            RoutingHandle::new(fingers, node_to_peer),
+            RouteTableHandle::new(routes),
             backend,
         )
     }
@@ -86,11 +96,36 @@ impl<R, B: Backend<Req = R>> RoutedTransport<R, B> {
         routing: RoutingHandle,
         backend: B,
     ) -> FabResult<Self> {
-        let router = FingerRouter::from_handle(routing.clone());
+        let snap = routing.snapshot();
+        let mut routes = HashMap::new();
+        routes.insert(
+            RouteTableHandle::LEGACY_ROUTE_ID.to_string(),
+            crate::p2p::RoutingSnapshot {
+                fingers: snap.fingers.clone(),
+                node_to_peer: snap.node_to_peer.clone(),
+            },
+        );
+        Self::with_routes(
+            fabric,
+            mr,
+            page_size,
+            RouteTableHandle::new(routes),
+            backend,
+        )
+    }
+
+    pub fn with_routes(
+        fabric: Arc<Fabric>,
+        mr: MrHandle,
+        page_size: usize,
+        routes: RouteTableHandle,
+        backend: B,
+    ) -> FabResult<Self> {
+        let router = ChainFingerRouter::new(routes.clone());
         let fabric_transport = FabricTransport::new(fabric, mr, router, page_size)?;
         Ok(Self {
             fabric_transport,
-            routing,
+            routes,
             backend,
             _marker: PhantomData,
         })
@@ -104,11 +139,10 @@ impl<R, B: Backend<Req = R>> RoutedTransport<R, B> {
     where
         R: Req,
     {
-        self.routing
-            .snapshot()
-            .fingers
-            .next_hop(stripe_to_ring(req.key()))
-            .is_none()
+        let Some(route) = self.routes.route_for_req(req) else {
+            return true;
+        };
+        route.fingers.next_hop(stripe_to_ring(req.key())).is_none()
     }
 }
 
@@ -124,7 +158,9 @@ where
         R: 'a;
 
     fn bulk_get<'a>(&'a self, req: &'a R, src: BulkRef, dsts: &'a [PageRef]) -> Self::Stream<'a> {
-        if self.owns_locally(req) {
+        // A bypass request bridges straight to the origin backend,
+        // skipping the Chord peer hop regardless of stripe ownership.
+        if req.bypass() || self.owns_locally(req) {
             crate::metrics::bufferpool_miss_source(crate::metrics::MissSource::Origin);
             RoutedStream::Backend(self.backend.bulk_get(req, src, dsts))
         } else {
@@ -143,7 +179,7 @@ where
     R: Req + Serialize + DeserializeOwned + 'static,
     B: Backend + 'a,
 {
-    Fabric(<FabricTransport<R, FingerRouter> as Transport<R>>::Stream<'a>),
+    Fabric(<FabricTransport<R, ChainFingerRouter> as Transport<R>>::Stream<'a>),
     Backend(B::Stream<'a>),
 }
 
@@ -188,11 +224,15 @@ mod tests {
     use super::RoutedStream;
 
     #[derive(Serialize, Deserialize)]
-    struct TestReq(StripeKey);
+    struct TestReq(StripeKey, bool);
 
     impl Req for TestReq {
         fn key(&self) -> StripeKey {
             self.0
+        }
+
+        fn bypass(&self) -> bool {
+            self.1
         }
     }
 
@@ -292,10 +332,40 @@ mod tests {
             std::slice::from_ref(&other),
             FingerTableConfig { k: 8 },
         );
-        let req = TestReq(key_for_ring(other.ring.0));
+        let req = TestReq(key_for_ring(other.ring.0), false);
         assert!(
             fingers.next_hop(stripe_to_ring(req.key())).is_some(),
             "peer-owned stripe must route off-node (Fabric arm)",
+        );
+    }
+
+    #[test]
+    fn bypass_request_routes_to_backend_even_when_peer_owns() {
+        // Two-node ring with the stripe owned by the peer, so
+        // `owns_locally` is false and a normal request would take the
+        // Fabric (peer) arm. A bypass request must instead select the
+        // Backend (origin) arm regardless of ring ownership. This
+        // mirrors the `req.bypass() || self.owns_locally(req)` arm
+        // selection in `RoutedTransport::bulk_get`.
+        let local = peer(1);
+        let other = peer(2);
+        let fingers = FingerTable::build(
+            local,
+            std::slice::from_ref(&other),
+            FingerTableConfig { k: 8 },
+        );
+        let key = key_for_ring(other.ring.0);
+        let owns_locally = fingers.next_hop(stripe_to_ring(key)).is_none();
+        assert!(!owns_locally, "precondition: the peer owns this stripe");
+
+        let selects_backend = |r: &TestReq| r.bypass() || owns_locally;
+        assert!(
+            !selects_backend(&TestReq(key, false)),
+            "normal request must take the Fabric arm",
+        );
+        assert!(
+            selects_backend(&TestReq(key, true)),
+            "bypass request must take the Backend arm",
         );
     }
 
@@ -304,7 +374,7 @@ mod tests {
         // Drive the Backend arm directly: a `RoutedStream::Backend`
         // wrapping the EchoBackend must yield the requested pages.
         let backend = EchoBackend;
-        let req = TestReq(StripeKey([7u8; 32]));
+        let req = TestReq(StripeKey([7u8; 32]), false);
         let src = BulkRef {
             stripe: req.key(),
             offset: 0,

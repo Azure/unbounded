@@ -700,12 +700,13 @@ impl BlockStore for MemBlockStore {
         Ok(())
     }
 
-    async fn read_page(
+    async fn read_page<R: Req + ?Sized>(
         &self,
-        key: StripeKey,
+        req: &R,
         _stripe_off: u64,
         dst: PageRef,
     ) -> Result<bool, PoolError> {
+        let key = req.key();
         match self.present.get(&key.0) {
             Some(&fill) => {
                 // SAFETY: dst.page_idx indexes into the scratch
@@ -720,9 +721,9 @@ impl BlockStore for MemBlockStore {
         }
     }
 
-    async fn write_page(
+    async fn write_page<R: Req + ?Sized>(
         &self,
-        _key: StripeKey,
+        _req: &R,
         _stripe_off: u64,
         _page: PageRef,
     ) -> Result<(), PoolError> {

@@ -10,9 +10,11 @@
 //! [`ConfigApplyTarget`](crate::config::ConfigApplyTarget) can skip
 //! untouched work:
 //!
-//! * **Routing (`[p2p]`, `[[peers]]`).** Rebuilds the finger table,
+//! * **`[[neighborhoods]]`.** Rebuilds the projected routing surface,
 //!   republishes it to every shard, and reconciles fabric connections.
-//! * **`[[disks]]`.** Reconciled in place against the disk registry.
+//! * **`[[caches]]`.** Reconciled in place against the disk registry;
+//!   cache bindings also participate in route selection, so cache
+//!   changes reload the projected routing surface.
 //! * **`[[backends]]` / `[[frontends]]`.** Broadcast to every shard,
 //!   which reconciles its own origin-backend and frontend registries on
 //!   its own thread (binding/closing listeners and rebuilding backends
@@ -40,15 +42,12 @@ use crate::config::schema::Config;
 /// two configs. Construct with [`ConfigDiff::between`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ConfigDiff {
-    /// `[p2p]` section changed (local node id/labels, fingers-per-node).
-    /// Rebuilds the routing surface.
-    pub p2p_changed: bool,
-    /// `[[peers]]` changed. Reconciles fabric connections and rebuilds
-    /// the routing surface.
-    pub peers_changed: bool,
-    /// `[[disks]]` changed. Reconciled in place against the disk
-    /// registry.
-    pub disks_changed: bool,
+    /// `[[caches]]` changed. Reconciled in place against the disk registry;
+    /// may also alter which neighborhood a cache routes through.
+    pub caches_changed: bool,
+    /// `[[neighborhoods]]` changed. Reconciles fabric connections and
+    /// rebuilds the routing surface.
+    pub neighborhoods_changed: bool,
     /// `[[backends]]` changed. Broadcast to every shard, which rebuilds
     /// its origin-backend registry in place (no shard restart).
     pub backends_changed: bool,
@@ -65,9 +64,8 @@ impl ConfigDiff {
     /// defaults compare equal and do not register as spurious changes.
     pub fn between(old: &Config, new: &Config) -> Self {
         Self {
-            p2p_changed: old.p2p != new.p2p,
-            peers_changed: old.peers != new.peers,
-            disks_changed: old.disks != new.disks,
+            caches_changed: old.caches != new.caches,
+            neighborhoods_changed: old.neighborhoods != new.neighborhoods,
             backends_changed: old.backends != new.backends,
             frontends_changed: old.frontends != new.frontends,
         }
@@ -76,24 +74,28 @@ impl ConfigDiff {
     /// Whether anything changed at all. A no-op apply (`!any()`) can be
     /// acknowledged immediately without touching the shards.
     pub fn any(&self) -> bool {
-        self.p2p_changed
-            || self.peers_changed
-            || self.disks_changed
+        self.caches_changed
+            || self.neighborhoods_changed
             || self.backends_changed
             || self.frontends_changed
     }
 
-    /// Whether the routing surface must be rebuilt and republished. True
-    /// iff the `[p2p]` section or the peer set changed.
+    /// Whether the routing surface must be rebuilt and republished.
+    /// Neighborhood changes alter the projected route table directly;
+    /// cache changes can move request traffic between neighborhoods.
     pub fn requires_routing_reload(&self) -> bool {
-        self.p2p_changed || self.peers_changed
+        self.neighborhoods_changed || self.caches_changed
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{BackendSpec, DiskSpec, FabricAddress, FrontendSpec, PeerSpec};
+    use crate::config::schema::{
+        BackendSpec, BlockDiskConfig, CacheSpec, DiskSpec, FrontendSpec, HttpBackendConfig,
+        HttpFrontendConfig, NeighborhoodSpec, PeerSpec, TcpPeerConfig, backend_spec, disk_spec,
+        frontend_spec, peer_spec,
+    };
 
     fn base() -> Config {
         let mut c: Config = toml::from_str("").unwrap();
@@ -111,53 +113,67 @@ mod tests {
     }
 
     #[test]
-    fn peer_change_is_routing_reload() {
+    fn neighborhood_peer_change_is_routing_reload() {
         let a = base();
         let mut b = base();
-        b.p2p.as_mut().unwrap().local_node_id = Some(1);
-        b.peers.push(PeerSpec {
-            id: 2,
-            address: Some(FabricAddress {
-                socket: "127.0.0.1:9000".to_string(),
-                native: String::new(),
-            }),
-            labels: vec![],
-            hca_numa: None,
+        b.neighborhoods.push(NeighborhoodSpec {
+            id: "n".to_string(),
+            binds_to: "b".to_string(),
+            fingers_per_node: 100,
+            local_node_id: Some(1),
+            local_labels: vec![],
+            routing_plan: None,
+            peers: vec![PeerSpec {
+                id: 2,
+                labels: vec![],
+                config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
+                    addr: "127.0.0.1:9000".to_string(),
+                })),
+            }],
         });
         let d = ConfigDiff::between(&a, &b);
-        assert!(d.peers_changed);
-        assert!(d.p2p_changed);
+        assert!(d.neighborhoods_changed);
         assert!(d.requires_routing_reload());
     }
 
     #[test]
-    fn p2p_only_change_is_routing_reload() {
+    fn neighborhood_only_change_is_routing_reload() {
         let a = base();
         let mut b = base();
-        b.p2p.as_mut().unwrap().fingers_per_node = 64;
+        b.neighborhoods.push(NeighborhoodSpec {
+            id: "n".to_string(),
+            binds_to: "b".to_string(),
+            fingers_per_node: 64,
+            local_node_id: None,
+            local_labels: vec![],
+            routing_plan: None,
+            peers: vec![],
+        });
         let d = ConfigDiff::between(&a, &b);
-        assert!(d.p2p_changed);
+        assert!(d.neighborhoods_changed);
         assert!(d.requires_routing_reload());
     }
 
     #[test]
-    fn disk_change_is_not_routing_reload() {
+    fn cache_change_is_routing_reload() {
         let a = base();
         let mut b = base();
-        b.disks.push(DiskSpec {
-            path: "/dev/nvme0n1".to_string(),
-            kind: 0,
-            size: None,
-            numa: None,
-            queue_depth: None,
-            page_size_bytes: None,
-            bypass_admission: false,
-            skip_recovery_scan_if_no_meta: false,
+        b.caches.push(CacheSpec {
+            id: "c".to_string(),
+            binds_to: "n".to_string(),
+            disks: vec![DiskSpec {
+                path: "/dev/nvme0n1".to_string(),
+                queue_depth: None,
+                page_size_bytes: None,
+                bypass_admission: false,
+                skip_recovery_scan_if_no_meta: false,
+                config: Some(disk_spec::Config::Block(BlockDiskConfig { numa: None })),
+            }],
         });
         let d = ConfigDiff::between(&a, &b);
-        assert!(d.disks_changed);
+        assert!(d.caches_changed);
         assert!(d.any());
-        assert!(!d.requires_routing_reload());
+        assert!(d.requires_routing_reload());
     }
 
     #[test]
@@ -166,11 +182,11 @@ mod tests {
         let mut b = base();
         b.backends.push(BackendSpec {
             id: "b".to_string(),
-            kind: 0,
-            endpoint: "https://example.com".to_string(),
-            stripe_size_bytes: 4 * 1024 * 1024,
-            http_concurrency: 64,
-            bucket: None,
+            config: Some(backend_spec::Config::Http(HttpBackendConfig {
+                endpoint: "https://example.com".to_string(),
+                stripe_size_bytes: 4 * 1024 * 1024,
+                http_concurrency: 64,
+            })),
         });
         let d = ConfigDiff::between(&a, &b);
         assert!(d.backends_changed);
@@ -184,9 +200,10 @@ mod tests {
         let mut b = base();
         b.frontends.push(FrontendSpec {
             id: "f".to_string(),
-            kind: 0,
-            bind: "0.0.0.0:9000".to_string(),
-            backend: "b".to_string(),
+            binds_to: "b".to_string(),
+            config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
+                addr: "0.0.0.0:9000".to_string(),
+            })),
         });
         let d = ConfigDiff::between(&a, &b);
         assert!(d.frontends_changed);

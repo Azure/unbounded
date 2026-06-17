@@ -103,14 +103,21 @@ pub fn reconcile_peers(
     desired: &[PeerSpec],
     last_applied: Option<&HashMap<PeerId, ConnectionSpec>>,
 ) -> ReconcileReport {
+    let desired: Vec<ConnectionSpec> = desired.iter().map(peer_spec_to_connection).collect();
+    reconcile_connections(target, &desired, last_applied)
+}
+
+pub fn reconcile_connections(
+    target: &dyn PeerReconcileTarget,
+    desired: &[ConnectionSpec],
+    last_applied: Option<&HashMap<PeerId, ConnectionSpec>>,
+) -> ReconcileReport {
     let mut report = ReconcileReport::default();
 
     let desired_map: HashMap<PeerId, ConnectionSpec> = desired
         .iter()
-        .map(|p| {
-            let spec = peer_spec_to_connection(p);
-            (spec.peer, spec)
-        })
+        .cloned()
+        .map(|spec| (spec.peer, spec))
         .collect();
 
     let current: HashSet<PeerId> = target.list().into_iter().collect();
@@ -543,6 +550,7 @@ pub fn reconcile_backends_and_frontends(
     frontend_target: &dyn FrontendReconcileTarget,
     desired_backends: &[BackendSpec],
     desired_frontends: &[FrontendSpec],
+    frontend_backends: &HashMap<String, String>,
     last_backends: Option<&HashMap<String, BackendSpec>>,
     last_frontends: Option<&HashMap<String, FrontendSpec>>,
 ) -> ResourceReconcileReport {
@@ -584,13 +592,16 @@ pub fn reconcile_backends_and_frontends(
     let frontends = reconcile_add_phase(
         frontend_state,
         |spec| frontend_target.add(spec),
-        |_id, spec: &FrontendSpec| {
-            if present_backends.contains(&spec.backend) {
+        |id, _spec: &FrontendSpec| {
+            let Some(backend_id) = frontend_backends.get(id) else {
+                return Err("deferred: frontend has no resolved backend".to_string());
+            };
+            if present_backends.contains(backend_id) {
                 Ok(())
             } else {
                 Err(format!(
                     "deferred: referenced backend {:?} not present",
-                    spec.backend
+                    backend_id
                 ))
             }
         },
@@ -605,7 +616,10 @@ pub fn reconcile_backends_and_frontends(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::FabricAddress;
+    use crate::config::schema::{
+        HttpBackendConfig, HttpFrontendConfig, TcpPeerConfig, backend_spec, frontend_spec,
+        peer_spec,
+    };
     use std::cell::RefCell;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -669,34 +683,30 @@ mod tests {
     fn peer(id: u64) -> PeerSpec {
         PeerSpec {
             id,
-            address: Some(socket_addr(format!("10.0.0.{id}:9000"))),
-            hca_numa: None,
             labels: Vec::new(),
+            config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
+                addr: format!("10.0.0.{id}:9000"),
+            })),
         }
     }
 
     fn peer_addr(id: u64, addr: &str) -> PeerSpec {
         PeerSpec {
             id,
-            address: Some(socket_addr(addr)),
-            hca_numa: None,
             labels: Vec::new(),
+            config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
+                addr: addr.to_string(),
+            })),
         }
     }
 
     fn peer_labels(id: u64, labels: &[&str]) -> PeerSpec {
         PeerSpec {
             id,
-            address: Some(socket_addr(format!("10.0.0.{id}:9000"))),
-            hca_numa: None,
             labels: labels.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    fn socket_addr(addr: impl Into<String>) -> FabricAddress {
-        FabricAddress {
-            socket: addr.into(),
-            native: String::new(),
+            config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
+                addr: format!("10.0.0.{id}:9000"),
+            })),
         }
     }
 
@@ -932,7 +942,7 @@ mod tests {
 
     // ---- backend / frontend reconcile ----
 
-    use crate::config::schema::{BackendKind, BackendSpec, FrontendKind, FrontendSpec};
+    use crate::config::schema::{BackendSpec, FrontendSpec};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum SpecOp {
@@ -1019,21 +1029,29 @@ mod tests {
     fn backend(id: &str, endpoint: &str) -> BackendSpec {
         BackendSpec {
             id: id.to_string(),
-            kind: BackendKind::Http as i32,
-            endpoint: endpoint.to_string(),
-            stripe_size_bytes: 4 * 1024 * 1024,
-            http_concurrency: 64,
-            bucket: None,
+            config: Some(backend_spec::Config::Http(HttpBackendConfig {
+                endpoint: endpoint.to_string(),
+                stripe_size_bytes: 4 * 1024 * 1024,
+                http_concurrency: 64,
+            })),
         }
     }
 
     fn frontend(id: &str, backend_id: &str) -> FrontendSpec {
         FrontendSpec {
             id: id.to_string(),
-            kind: FrontendKind::Http as i32,
-            bind: "0.0.0.0:9000".to_string(),
-            backend: backend_id.to_string(),
+            binds_to: backend_id.to_string(),
+            config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
+                addr: "0.0.0.0:9000".to_string(),
+            })),
         }
+    }
+
+    fn frontend_backends(frontends: &[FrontendSpec]) -> HashMap<String, String> {
+        frontends
+            .iter()
+            .map(|f| (f.id.clone(), f.binds_to.clone()))
+            .collect()
     }
 
     #[test]
@@ -1081,7 +1099,7 @@ mod tests {
             *t.ops.borrow(),
             vec![SpecOp::Remove("a".into()), SpecOp::Add("a".into())]
         );
-        assert_eq!(r.applied["a"].endpoint, "new-endpoint");
+        assert_eq!(r.applied["a"].endpoint(), Some("new-endpoint"));
     }
 
     #[test]
@@ -1124,7 +1142,7 @@ mod tests {
         assert_eq!(r.updated, 0);
         assert_eq!(r.failures.len(), 1);
         assert!(r.failures[0].1.starts_with("update-remove:"));
-        assert_eq!(r.applied["a"].endpoint, "old");
+        assert_eq!(r.applied["a"].endpoint(), Some("old"));
         assert_eq!(*t.ops.borrow(), vec![SpecOp::Remove("a".into())]);
     }
 
@@ -1148,7 +1166,7 @@ mod tests {
             *t2.ops.borrow(),
             vec![SpecOp::Remove("f1".into()), SpecOp::Add("f1".into())]
         );
-        assert_eq!(r2.applied["f1"].backend, "b2");
+        assert_eq!(r2.applied["f1"].binds_to, "b2");
 
         // Remove: no longer desired.
         let t3 = SpecMock::new(&["f1"]);
@@ -1237,7 +1255,16 @@ mod tests {
         let combo = ComboMock::new(&[], &[]);
         let backends = vec![backend("b", "e")];
         let frontends = vec![frontend("f", "b")];
-        let r = reconcile_backends_and_frontends(&combo, &combo, &backends, &frontends, None, None);
+        let frontend_backends = frontend_backends(&frontends);
+        let r = reconcile_backends_and_frontends(
+            &combo,
+            &combo,
+            &backends,
+            &frontends,
+            &frontend_backends,
+            None,
+            None,
+        );
         assert_eq!(r.backends.added, 1);
         assert_eq!(r.frontends.added, 1);
         assert!(r.frontends.deferred.is_empty());
@@ -1270,6 +1297,7 @@ mod tests {
             &combo,
             &[],
             &[],
+            &HashMap::new(),
             Some(&last_backends),
             Some(&last_frontends),
         );
@@ -1296,7 +1324,16 @@ mod tests {
         let combo = ComboMock::new(&[], &[]).with_backend_add_failure("b");
         let backends = vec![backend("b", "e")];
         let frontends = vec![frontend("f", "b")];
-        let r = reconcile_backends_and_frontends(&combo, &combo, &backends, &frontends, None, None);
+        let frontend_backends = frontend_backends(&frontends);
+        let r = reconcile_backends_and_frontends(
+            &combo,
+            &combo,
+            &backends,
+            &frontends,
+            &frontend_backends,
+            None,
+            None,
+        );
         // Backend add failed; backend is not present.
         assert_eq!(r.backends.added, 0);
         assert_eq!(r.backends.failures.len(), 1);
@@ -1317,11 +1354,14 @@ mod tests {
     fn combined_defers_frontend_when_backend_absent() {
         // Backend referenced by the frontend is not defined at all.
         let combo = ComboMock::new(&[], &[]);
+        let frontends = vec![frontend("f", "ghost")];
+        let frontend_backends = frontend_backends(&frontends);
         let r = reconcile_backends_and_frontends(
             &combo,
             &combo,
             &[],
-            &[frontend("f", "ghost")],
+            &frontends,
+            &frontend_backends,
             None,
             None,
         );
@@ -1340,11 +1380,13 @@ mod tests {
         last_backends.insert("b".to_string(), backend("b", "e"));
         let backends = vec![backend("b", "e")];
         let frontends = vec![frontend("f", "b")];
+        let frontend_backends = frontend_backends(&frontends);
         let r = reconcile_backends_and_frontends(
             &combo,
             &combo,
             &backends,
             &frontends,
+            &frontend_backends,
             Some(&last_backends),
             None,
         );
