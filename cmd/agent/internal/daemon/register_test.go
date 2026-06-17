@@ -48,6 +48,7 @@ func Test_buildMachineCR(t *testing.T) {
 
 	assert.Equal(t, "test-machine", machine.Name)
 	require.NotNil(t, machine.Spec.Kubernetes)
+	require.NotNil(t, machine.Spec.Kubernetes.BootstrapTokenRef)
 	assert.Equal(t, "bootstrap-token-abc123", machine.Spec.Kubernetes.BootstrapTokenRef.Name)
 	assert.Equal(t, map[string]string{"env": "test"}, machine.Spec.Kubernetes.NodeLabels)
 	assert.Equal(t, []string{"dedicated=test:NoSchedule"}, machine.Spec.Kubernetes.RegisterWithTaints)
@@ -58,6 +59,7 @@ func Test_buildMachineCR_TokenNoDot(t *testing.T) {
 	cfg.Kubelet.Auth.BootstrapToken = "abc123"
 	machine := buildMachineCR(cfg)
 
+	require.NotNil(t, machine.Spec.Kubernetes.BootstrapTokenRef)
 	assert.Equal(t, "bootstrap-token-abc123", machine.Spec.Kubernetes.BootstrapTokenRef.Name)
 }
 
@@ -153,6 +155,7 @@ func Test_registerMachine_NotFound_Creates(t *testing.T) {
 	err = c.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &machine)
 	require.NoError(t, err)
 	assert.Equal(t, "test-machine", machine.Name)
+	require.NotNil(t, machine.Spec.Kubernetes.BootstrapTokenRef)
 	assert.Equal(t, "bootstrap-token-abc123", machine.Spec.Kubernetes.BootstrapTokenRef.Name)
 }
 

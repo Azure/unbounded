@@ -28,6 +28,8 @@ NODE_NAME = "smoke-node"
 NODE_NS = "default"
 API_GROUP = "unbounded-cloud.io"
 API_VERSION = f"{API_GROUP}/v1alpha3"
+NODE_LABEL_KEY = "unbounded-cloud.io/smoke-test"
+NODE_LABEL_VALUE = "metalman"
 VM_NAME = "unbounded-metal-smoke"
 NET_NAME = "unbounded-metal-smoke"
 SUBNET = "192.168.200"
@@ -205,7 +207,7 @@ def collect_debug_logs() -> None:
     """
     log("Collecting debug logs from VM via QEMU guest agent...")
     commands = [
-        # Network diagnostics — must come first to diagnose download hangs.
+        # Network diagnostics - must come first to diagnose download hangs.
         ("resolv.conf", "cat /etc/resolv.conf"),
         ("ip addr", "ip -4 addr show"),
         ("ip route", "ip route show"),
@@ -642,6 +644,23 @@ def assert_node_ready(name: str, timeout: int = 720) -> None:
     die(f"Timed out waiting for Node '{name}' to become Ready")
 
 
+def assert_node_label(name: str, key: str, value: str) -> None:
+    result = subprocess.run(
+        [KUBECTL, "get", "node", name, "-o", "json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        die(f"Failed to read Node '{name}': {result.stderr.strip()}")
+
+    node = json.loads(result.stdout)
+    labels = node.get("metadata", {}).get("labels", {})
+    got = labels.get(key)
+    if got != value:
+        die(f"Node '{name}' label {key!r} = {got!r}, want {value!r}")
+
+    log(f"  Node '{name}' has label {key}={value}")
+
+
 def assert_cloud_init_done(timeout: int = 900) -> None:
     """Assert the Machine's CloudInitDone condition reaches True/Succeeded.
 
@@ -1001,7 +1020,7 @@ def main() -> None:
                     "url": sushy_url,
                     "username": "",
                     "deviceID": VM_NAME,
-				"passwordRef": {"name": "bmc-pass", "key": "password", "namespace": NODE_NS},
+                    "passwordRef": {"name": "bmc-pass", "key": "password", "namespace": NODE_NS},
                 },
                 "dhcpLeases": [{
                     "mac": MAC_ADDRESS,
@@ -1014,6 +1033,9 @@ def main() -> None:
             "agent": {
                 "image": AGENT_IMAGE_NAME_VM,
             },
+            "kubernetes": {
+                "nodeLabels": {NODE_LABEL_KEY: NODE_LABEL_VALUE},
+            },
         },
     }
     kubectl(["apply", "-f", "-"], input=json.dumps(protonode).encode(),
@@ -1021,8 +1043,12 @@ def main() -> None:
     log("  Resources created")
 
     log("Starting metalman serve-pxe")
+    metalman_env = [f"METALMAN_APISERVER_URL={server_url}"]
+    if kubeconfig := os.environ.get("KUBECONFIG"):
+        metalman_env.append(f"KUBECONFIG={kubeconfig}")
+
     proc = spawn([
-        "sudo", "env", f"METALMAN_APISERVER_URL={server_url}",
+        "sudo", "env", *metalman_env,
         str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
         f"--cache-dir={CACHE_DIR}",
         f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",
@@ -1050,6 +1076,7 @@ def main() -> None:
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
     assert_node_ready(NODE_NAME, timeout=720)
+    assert_node_label(NODE_NAME, NODE_LABEL_KEY, NODE_LABEL_VALUE)
 
     run_operation_smoke_suite()
 
