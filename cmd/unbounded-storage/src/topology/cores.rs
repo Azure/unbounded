@@ -115,6 +115,12 @@ pub struct CorePlanConfig {
     /// Optional cap on serving shards. `None` claims every remaining
     /// usable CPU (the default).
     pub serving_cores: Option<usize>,
+    /// Maximum number of HCAs to use per NUMA node. Defaults to 1 (one
+    /// HCA per node): driving two same-node HCAs with the storage RPC
+    /// pattern collapses aggregate throughput below a single HCA, so the
+    /// planner fans out one HCA per node by default. Raise to use more.
+    /// HCAs with an unknown NUMA node are never capped.
+    pub hcas_per_numa: usize,
     pub use_smt_siblings: bool,
     pub respect_isolated: bool,
     pub exclude_node_cpu0: bool,
@@ -128,6 +134,7 @@ impl Default for CorePlanConfig {
         Self {
             nic_workers: 4,
             serving_cores: None,
+            hcas_per_numa: 1,
             use_smt_siblings: false,
             respect_isolated: true,
             exclude_node_cpu0: true,
@@ -147,6 +154,7 @@ impl CorePlanConfig {
             require_node_type_ca: self.require_node_type_ca,
             require_active_port: self.require_active_port,
             disable_rdma: self.disable_rdma,
+            hcas_per_numa: self.hcas_per_numa,
         }
     }
 }
@@ -425,6 +433,8 @@ mod tests {
     #[test]
     fn gb200_shape_two_nodes_two_hcas_each() {
         // 2 NUMA nodes, 16 cpus each, 2 active HCAs per node, no NVMe.
+        // hcas_per_numa=2 opts into using both HCAs on each node (the
+        // default of 1 is covered by the test below).
         let host = fake_host(
             vec![
                 (0, (0..16).collect(), vec![]),
@@ -439,7 +449,11 @@ mod tests {
             ],
             vec![],
         );
-        let plan = CorePlan::for_host(&host, &defaults());
+        let cfg = CorePlanConfig {
+            hcas_per_numa: 2,
+            ..defaults()
+        };
+        let plan = CorePlan::for_host(&host, &cfg);
 
         // 4 groups of 4 nic workers, each local to its HCA's node.
         assert_eq!(plan.nic_workers.len(), 4);
@@ -465,6 +479,52 @@ mod tests {
             assert_eq!(serving, 7, "node {node} serving shards");
         }
         // Everything disjoint.
+        let cpus = all_cpus(&plan);
+        assert_eq!(set(cpus.clone()).len(), cpus.len());
+        assert_eq!(cpus.len(), 30);
+    }
+
+    #[test]
+    fn gb200_shape_default_caps_one_hca_per_node() {
+        // Same shape as above, but with the default hcas_per_numa=1 the
+        // planner keeps only the lowest-BDF HCA on each node: 2 nic
+        // groups total, and the freed CPUs become serving shards.
+        let host = fake_host(
+            vec![
+                (0, (0..16).collect(), vec![]),
+                (1, (16..32).collect(), vec![]),
+            ],
+            vec![],
+            vec![
+                hca("mlx5_0", "0000:01:00.0", Some(0), true),
+                hca("mlx5_1", "0000:02:00.0", Some(0), true),
+                hca("mlx5_2", "0000:81:00.0", Some(1), true),
+                hca("mlx5_3", "0000:82:00.0", Some(1), true),
+            ],
+            vec![],
+        );
+        let plan = CorePlan::for_host(&host, &defaults());
+
+        // One HCA per node survives: mlx5_0 (node 0), mlx5_2 (node 1).
+        assert_eq!(plan.nic_workers.len(), 2);
+        let kept: Vec<usize> = plan.nic_workers.iter().map(|g| g.hca).collect();
+        assert_eq!(kept, vec![0, 2]);
+        for node in [0u16, 1] {
+            let nic = plan
+                .nic_workers
+                .iter()
+                .filter(|g| g.numa == Some(node))
+                .flat_map(|g| g.workers.iter().map(|w| w.cpu))
+                .count();
+            let serving = plan
+                .serving_shards
+                .iter()
+                .filter(|s| s.numa == Some(node))
+                .count();
+            // 15 usable per node; 4 nic workers (1 HCA), 11 serving.
+            assert_eq!(nic, 4, "node {node} nic workers");
+            assert_eq!(serving, 11, "node {node} serving shards");
+        }
         let cpus = all_cpus(&plan);
         assert_eq!(set(cpus.clone()).len(), cpus.len());
         assert_eq!(cpus.len(), 30);

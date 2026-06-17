@@ -92,6 +92,13 @@ message TopologyCfg {
   uint64 serving_cores = 9;
   // NIC-worker CPUs to pin per active HCA. 0 -> 4.
   uint64 nic_workers = 10;
+  // Maximum number of HCAs to use per NUMA node. 0 -> 1 (one HCA per
+  // NUMA node, the default). Driving two HCAs on the same NUMA node with
+  // the storage RPC pattern collapses aggregate throughput below a single
+  // HCA (a same-node PCIe contention effect), so the default fans out one
+  // HCA per node. Raise this to use additional same-node HCAs. HCAs whose
+  // NUMA node is unknown are never capped.
+  uint64 hcas_per_numa_node = 11;
 }
 
 message P2pCfg {

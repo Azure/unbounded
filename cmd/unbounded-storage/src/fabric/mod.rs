@@ -1,28 +1,34 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Direct libfabric transport. Phase 1 laid types, error plumbing, and
-//! FFI declarations; Phase 3 brings up the libfabric class lifecycle
-//! plus one pinned progress thread per CQ; Phase 4 adds connection
-//! CRUD, MR registration, and tagged ping/pong; Phase 5a adds the
-//! streaming RPC server (`rpc`), the server-side `Handler` trait
-//! (`handler`), and the client-side `Transport` impl (`transport`).
+//! Direct libfabric transport over connection-managed `FI_EP_MSG`
+//! endpoints. The connection manager (`cm`) dials and accepts peer
+//! connections; each connection self-reposts a `RecvPool` whose
+//! completions are demultiplexed by the inbound `dispatch` using an
+//! 8-byte message header (`wire`). A per-NUMA `ProgressGroup`
+//! (`progress`) drives the CQs. The streaming RPC server (`rpc`) and
+//! the server-side `Handler` trait (`handler`) answer requests; the
+//! client-side `Transport` impl (`transport`) issues them.
 
 mod backing;
+mod cm;
 mod completion;
 mod config;
 mod connection;
+mod dispatch;
 mod error;
 mod fabric;
 mod ffi;
 mod handler;
-mod ping;
 mod pool_handler;
 mod progress;
+mod recvpool;
 mod rpc;
 mod rpc_queue;
+mod sendpool;
 mod transport;
 mod types;
+mod wire;
 
 #[cfg(test)]
 mod tests;
@@ -33,9 +39,7 @@ pub use config::{FabricConfig, Provider, apply_tcp_env_defaults, defaults_for};
 pub use error::{FabricError, Result, check};
 pub use fabric::{Fabric, provider_available};
 pub use handler::{Handler, HandlerStream};
-pub use ping::{PING_TAG, PONG_TAG};
 pub use pool_handler::{PoolHandler, PoolHandlerError, PoolHandlerStream};
-pub use progress::ProgressThread;
 pub use rpc::{
     MAX_HOPS, PageWritePlan, RequestHeader, RequestPlan, RpcServer, RpcServerHandle,
     plan_page_write,

@@ -33,6 +33,7 @@ use unbounded_storage::bufferpool::{PoolGroup, Req};
 use unbounded_storage::config::{
     self, ApplyError, Config, ConfigApplyTarget, ConfigDiff, ShardControlGroup,
 };
+use unbounded_storage::fabric::PeerId;
 use unbounded_storage::p2p::RoutingSnapshot;
 use unbounded_storage::runtime::{JoinHandle, Threading, WorkerIdx};
 use unbounded_storage::storage::StripeReq;
@@ -127,6 +128,11 @@ pub fn spawn_shard_layer(
     let frontend_specs = Arc::new(config.frontends.clone());
     let backend_specs = Arc::new(config.backends.clone());
     let (fingers, node_to_peer) = crate::build_routing(config);
+    // The local node's own peer identity, sent as connection-manager
+    // private data on every outbound dial so the accepting peer keys the
+    // inbound connection correctly. Falls back to 0 when unset (single
+    // node, no peers configured), matching `build_routing`.
+    let self_peer = PeerId(config.p2p().local_node_id.unwrap_or(0));
 
     // Bring up the shared fabric endpoints before spawning any shards:
     // each shard registers its data backing against the endpoint it maps
@@ -142,6 +148,7 @@ pub fn spawn_shard_layer(
         &fingers,
         &node_to_peer,
         &config.peers,
+        self_peer,
     )?;
 
     let (ready_tx, ready_rx) = mpsc::channel::<crate::ShardReady>();

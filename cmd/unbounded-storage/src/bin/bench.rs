@@ -233,6 +233,7 @@ struct BlockArgs {
 }
 
 fn main() -> ExitCode {
+    unbounded_storage::obs::init_from_env();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Storage { cmd } => match cmd {

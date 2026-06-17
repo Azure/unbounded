@@ -24,15 +24,29 @@ pub(super) struct Filters {
     pub require_node_type_ca: bool,
     pub require_active_port: bool,
     pub disable_rdma: bool,
+    /// Maximum HCAs to keep per NUMA node (>=1). HCAs with an unknown
+    /// NUMA node are never capped.
+    pub hcas_per_numa: usize,
 }
 
 /// Apply HCA filters from `f`. Preserves the input order and keeps the
 /// original slice index so callers can still point at the right
-/// `host.hcas[i]`.
+/// `host.hcas[i]`. After the active-port filter, caps the number of
+/// kept HCAs per NUMA node at `f.hcas_per_numa` (>=1): with two same-node
+/// HCAs the storage RPC pattern collapses below a single HCA, so the
+/// default of 1 fans out one HCA per node. Because `host.hcas` is sorted
+/// by BDF, the survivors are the lowest-BDF HCAs on each node, making the
+/// selection deterministic. HCAs whose NUMA node is unknown (`None`) are
+/// never capped.
 pub(super) fn filter_hcas<'a>(hcas: &'a [Hca], f: &Filters) -> Vec<(usize, &'a Hca)> {
+    use std::collections::BTreeMap;
+
     if f.disable_rdma {
         return Vec::new();
     }
+
+    let cap = f.hcas_per_numa.max(1);
+    let mut per_numa: BTreeMap<u16, usize> = BTreeMap::new();
 
     hcas.iter()
         .enumerate()
@@ -47,6 +61,20 @@ pub(super) fn filter_hcas<'a>(hcas: &'a [Hca], f: &Filters) -> Vec<(usize, &'a H
             }
 
             true
+        })
+        .filter(|(_, h)| match h.numa {
+            Some(node) => {
+                let count = per_numa.entry(node).or_insert(0);
+                if *count >= cap {
+                    false
+                } else {
+                    *count += 1;
+                    true
+                }
+            }
+            // Unknown NUMA: never capped (we cannot prove same-node
+            // contention without a node id).
+            None => true,
         })
         .collect()
 }
@@ -134,6 +162,7 @@ mod tests {
             require_node_type_ca: true,
             require_active_port: true,
             disable_rdma: false,
+            hcas_per_numa: usize::MAX,
         }
     }
 
@@ -173,6 +202,52 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].0, 0);
         assert_eq!(kept[1].0, 1);
+    }
+
+    #[test]
+    fn filter_hcas_caps_one_per_numa_by_default() {
+        // Two HCAs per node; cap=1 keeps the lowest-BDF HCA on each
+        // node and preserves original slice indices.
+        let hcas = vec![
+            hca("mlx5_0", "0000:01:00.0", Some(0), true),
+            hca("mlx5_1", "0000:02:00.0", Some(0), true),
+            hca("mlx5_2", "0000:81:00.0", Some(1), true),
+            hca("mlx5_3", "0000:82:00.0", Some(1), true),
+        ];
+        let mut f = filters();
+        f.hcas_per_numa = 1;
+        let kept = filter_hcas(&hcas, &f);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].0, 0);
+        assert_eq!(kept[0].1.dev_name, "mlx5_0");
+        assert_eq!(kept[1].0, 2);
+        assert_eq!(kept[1].1.dev_name, "mlx5_2");
+    }
+
+    #[test]
+    fn filter_hcas_cap_two_keeps_both_per_numa() {
+        let hcas = vec![
+            hca("mlx5_0", "0000:01:00.0", Some(0), true),
+            hca("mlx5_1", "0000:02:00.0", Some(0), true),
+            hca("mlx5_2", "0000:81:00.0", Some(1), true),
+        ];
+        let mut f = filters();
+        f.hcas_per_numa = 2;
+        let kept = filter_hcas(&hcas, &f);
+        assert_eq!(kept.len(), 3, "cap >= per-node count keeps all");
+    }
+
+    #[test]
+    fn filter_hcas_unknown_numa_never_capped() {
+        // numa=None HCAs are never capped even at cap=1.
+        let hcas = vec![
+            hca("mlx5_0", "0000:01:00.0", None, true),
+            hca("mlx5_1", "0000:02:00.0", None, true),
+        ];
+        let mut f = filters();
+        f.hcas_per_numa = 1;
+        let kept = filter_hcas(&hcas, &f);
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]

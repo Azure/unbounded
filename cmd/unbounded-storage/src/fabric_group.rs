@@ -257,6 +257,7 @@ impl FabricGroup {
         fingers: &Arc<FingerTable>,
         node_to_peer: &Arc<HashMap<NodeId, PeerId>>,
         peers: &[PeerSpec],
+        self_peer: PeerId,
     ) -> Result<Self, Vec<String>> {
         let mut units = Vec::with_capacity(plan.units.len());
         let mut errors = Vec::new();
@@ -272,6 +273,7 @@ impl FabricGroup {
                 fingers,
                 node_to_peer,
                 peers,
+                self_peer,
             ) {
                 Ok(unit) => units.push(unit),
                 Err(e) => errors.push(e),
@@ -320,6 +322,13 @@ impl FabricGroup {
             for (peer, err) in &report.failures {
                 eprintln!("fabric peer reconcile failed: peer={} err={err}", peer.0);
             }
+            // Publish the full desired set so the background reconnect
+            // thread keeps retrying peers whose dial lost the startup
+            // race, and so peers dropped from config (that never
+            // connected, hence were never removed by reconcile) are
+            // pruned from the desired set.
+            unit.fabric
+                .set_desired_peers(peers.iter().map(config::peer_spec_to_connection).collect());
         }
     }
 
@@ -356,6 +365,7 @@ fn build_unit(
     fingers: &Arc<FingerTable>,
     node_to_peer: &Arc<HashMap<NodeId, PeerId>>,
     peers: &[PeerSpec],
+    self_peer: PeerId,
 ) -> Result<FabricUnit, String> {
     let worker = spec.worker_idx.0;
 
@@ -368,6 +378,12 @@ fn build_unit(
     cfg.progress_threads = fabric_startup.progress_threads as u8;
     cfg.progress_poll_us = fabric_startup.progress_poll_us;
     cfg.numa = spec.numa;
+    // The local peer identity is the connection-manager private data this
+    // node sends on every outbound dial; the accepting side keys the
+    // inbound connection by it. `defaults_for` leaves it PeerId(0), so it
+    // must be set here from the node's configured local id or accepted
+    // connections are mis-keyed and `resolve_peer` cannot find the peer.
+    cfg.self_peer = self_peer;
 
     let fabric = Arc::new(Fabric::new(cfg).map_err(|e| format!("worker={worker}: fabric: {e}"))?);
     let self_addr = fabric
@@ -452,6 +468,9 @@ fn build_unit(
     fabric.check_shared_domain_capacity(spec.expected_mr);
 
     let applied_peers = config::reconcile_peers(&fabric, peers, None).applied;
+    // Seed the desired-peer set so the background reconnect thread can
+    // retry any peer whose initial dial lost the startup race.
+    fabric.set_desired_peers(peers.iter().map(config::peer_spec_to_connection).collect());
     let last_backends = backend_specs
         .iter()
         .map(|b| (b.id.clone(), b.clone()))

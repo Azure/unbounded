@@ -139,6 +139,9 @@ max_inflight        = 1024       # max in-flight fabric ops per shard (back-pres
 [startup.topology]
 serving_cores         = 0        # serving shards; 0 = auto-fill every usable CPU.
 nic_workers           = 4        # fabric CPUs pinned per active HCA (0 -> 4).
+hcas_per_numa_node    = 1        # max HCAs used per NUMA node (0 -> 1). Two
+                                 # same-node HCAs collapse below one HCA, so the
+                                 # default fans out one per node; raise to use more.
 use_smt_siblings      = false    # also place shards on SMT sibling CPUs.
 ignore_isolated       = false    # also schedule onto isolcpus-isolated CPUs.
 include_node_cpu0     = false    # allow placing a shard on each NUMA node's CPU 0.

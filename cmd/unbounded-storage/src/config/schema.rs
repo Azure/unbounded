@@ -71,6 +71,9 @@ impl Config {
         if topology.nic_workers == 0 {
             topology.nic_workers = 4;
         }
+        if topology.hcas_per_numa_node == 0 {
+            topology.hcas_per_numa_node = 1;
+        }
         // `serving_cores` keeps its proto3 zero, which the planner reads
         // as "auto-fill every usable core".
 
@@ -366,6 +369,8 @@ backend = "b"
         assert_eq!(s.topology().nic_workers, 4);
         // `serving_cores` stays at its proto3 zero (auto-fill).
         assert_eq!(s.topology().serving_cores, 0);
+        // One HCA per NUMA node by default.
+        assert_eq!(s.topology().hcas_per_numa_node, 1);
         // The inverted-sense flags default to false so the historical
         // safe behavior (respect isolated, exclude cpu0, require active
         // port) is preserved.
@@ -398,6 +403,7 @@ allow_inactive_port = true
 disable_rdma = true
 serving_cores = 12
 nic_workers = 6
+hcas_per_numa_node = 2
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
@@ -416,8 +422,8 @@ nic_workers = 6
         assert!(st.topology().disable_rdma);
         assert_eq!(st.topology().serving_cores, 12);
         assert_eq!(st.topology().nic_workers, 6);
+        assert_eq!(st.topology().hcas_per_numa_node, 2);
     }
-
     #[test]
     fn startup_defaults_are_idempotent() {
         let mut c: Config = toml::from_str("[startup.fabric]\nprogress_threads = 7\n").unwrap();

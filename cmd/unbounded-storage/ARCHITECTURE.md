@@ -108,7 +108,8 @@ excluded from the live-reload diff.
   `rpc_worker_threads` (4), `max_inflight` (1024) - the per-shard fabric
   endpoint, thread pools, and in-flight cap.
 - `[startup.topology]` - `serving_cores` (`0` = auto-fill every usable
-  CPU), `nic_workers` (fabric CPUs per active HCA, `0` -> 4), and the
+  CPU), `nic_workers` (fabric CPUs per active HCA, `0` -> 4),
+  `hcas_per_numa_node` (max HCAs used per NUMA node, `0` -> 1), and the
   toggles `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
   `allow_inactive_port`, `disable_rdma` - feed
   `startup_to_core_plan_config`, which builds the `topology::CorePlanConfig`
@@ -286,6 +287,19 @@ it a simple loop to drive work without an async runtime.
 - Key fields consumed by main: `plan.serving_shards` (one shard thread each),
   `plan.nic_workers` (the fabric worker groups), and `plan.storage_cores`,
   which main maps to one `DiskCpuSlot` per NVMe drive.
+- **HCA-to-NUMA spreading matters for multi-HCA throughput.** On hosts with
+  several HCAs, two HCAs attached to the same NUMA node share that node's PCIe
+  uplink, so driving both at once does not add bandwidth: each is capped at
+  roughly half a single HCA's line rate and per-request latency roughly
+  doubles. Measured cross-VM over verbs (one HCA approx 130 Gb/s, approx 4 ms
+  p50): a same-NUMA HCA pair reached only approx 114 Gb/s at approx 9 ms p50,
+  while a cross-NUMA pair (one HCA per node) reached approx 266 Gb/s at approx
+  4 ms p50, and one-HCA-per-NUMA across four nodes scaled near-linearly to
+  approx 520 Gb/s while holding the approx 4 ms p50. The takeaway when
+  selecting a subset of a host's HCAs (for benchmarking or for partial
+  enablement): spread the chosen HCAs across distinct NUMA nodes rather than
+  filling one node's HCAs first. Beware that sysfs/`mlx5_N` index order is not
+  NUMA order, so the naive `mlx5_0..N` ordering tends to pair same-node HCAs.
 
 ### 7.3 `memory/` - NUMA-local backings
 

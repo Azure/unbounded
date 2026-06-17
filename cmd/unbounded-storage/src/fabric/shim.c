@@ -22,6 +22,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -96,6 +97,71 @@ int ub_fi_getname(struct fid *fid, void *addr, size_t *addrlen) {
 }
 
 /* ------------------------------------------------------------------
+ * Connection-manager wrappers (FI_EP_MSG).
+ *
+ * The native verbs and tcp MSG endpoint types are connection oriented:
+ * a passive endpoint listens, active endpoints connect, and connection
+ * state transitions (FI_CONNREQ / FI_CONNECTED / FI_SHUTDOWN) are
+ * delivered on an event queue. None of these entry points exist on the
+ * connectionless RDM path, so they live behind their own shim section.
+ * ------------------------------------------------------------------ */
+
+int ub_fi_eq_open(struct fid_fabric *fabric, struct fi_eq_attr *attr,
+                  struct fid_eq **eq, void *context) {
+    return fi_eq_open(fabric, attr, eq, context);
+}
+
+int ub_fi_passive_ep(struct fid_fabric *fabric, struct fi_info *info,
+                     struct fid_pep **pep, void *context) {
+    return fi_passive_ep(fabric, info, pep, context);
+}
+
+int ub_fi_pep_bind(struct fid_pep *pep, struct fid *bfid, uint64_t flags) {
+    return fi_pep_bind(pep, bfid, flags);
+}
+
+int ub_fi_listen(struct fid_pep *pep) {
+    return fi_listen(pep);
+}
+
+int ub_fi_connect(struct fid_ep *ep, const void *addr, const void *param,
+                  size_t paramlen) {
+    return fi_connect(ep, addr, param, paramlen);
+}
+
+int ub_fi_accept(struct fid_ep *ep, const void *param, size_t paramlen) {
+    return fi_accept(ep, param, paramlen);
+}
+
+ssize_t ub_fi_eq_sread(struct fid_eq *eq, uint32_t *event, void *buf,
+                       size_t len, int timeout, uint64_t flags) {
+    return fi_eq_sread(eq, event, buf, len, timeout, flags);
+}
+
+ssize_t ub_fi_eq_read(struct fid_eq *eq, uint32_t *event, void *buf, size_t len,
+                      uint64_t flags) {
+    return fi_eq_read(eq, event, buf, len, flags);
+}
+
+ssize_t ub_fi_eq_readerr(struct fid_eq *eq, struct fi_eq_err_entry *buf,
+                         uint64_t flags) {
+    return fi_eq_readerr(eq, buf, flags);
+}
+
+/*
+ * Connection-management event discriminants, exposed as functions so the
+ * Rust side never hardcodes the `enum` values (libfabric could renumber
+ * them across versions).
+ */
+uint32_t ub_fi_connreq(void) { return FI_CONNREQ; }
+uint32_t ub_fi_connected(void) { return FI_CONNECTED; }
+uint32_t ub_fi_shutdown(void) { return FI_SHUTDOWN; }
+
+int ub_fi_ep_bind_eq(struct fid_ep *ep, struct fid_eq *eq, uint64_t flags) {
+    return fi_ep_bind(ep, &eq->fid, flags);
+}
+
+/* ------------------------------------------------------------------
  * Hints builders. Keep Rust away from `fi_info` layout entirely.
  * ------------------------------------------------------------------ */
 
@@ -150,6 +216,74 @@ struct fi_info *ub_fi_build_hints(const char *prov_name) {
         hints->fabric_attr->prov_name = dup;
     }
     return hints;
+}
+
+/*
+ * Build hints for the connection-oriented MSG transport (native verbs
+ * or tcp). Differs from the RDM hints above: ep type is FI_EP_MSG, the
+ * caps drop FI_TAGGED (untagged demux moves into our wire header) and
+ * FI_SOURCE (peer identity comes from the owning connection, not the
+ * completion source), and there is no AV. mr_mode is requested the same
+ * way; the provider pares it down (tcp negotiates an empty mr_mode and
+ * uses 0-based RMA offsets, verbs keeps FI_MR_VIRT_ADDR and uses
+ * absolute addresses). addr_format is FI_SOCKADDR_IN so connect targets
+ * are plain "ip:port" reachable over IPoIB (verbs) or loopback (tcp).
+ *
+ * Freed with fi_freeinfo by the caller.
+ */
+struct fi_info *ub_fi_build_msg_hints(const char *prov_name) {
+    struct fi_info *hints = fi_allocinfo();
+    if (!hints) {
+        return NULL;
+    }
+    hints->caps = FI_MSG | FI_RMA;
+    hints->addr_format = FI_SOCKADDR_IN;
+    if (hints->ep_attr) {
+        hints->ep_attr->type = FI_EP_MSG;
+    }
+    if (hints->domain_attr) {
+        hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR
+                                    | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+        hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
+        hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+        hints->domain_attr->threading = FI_THREAD_SAFE;
+    }
+    if (prov_name && hints->fabric_attr) {
+        size_t n = strlen(prov_name) + 1;
+        char *dup = (char *)malloc(n);
+        if (!dup) {
+            fi_freeinfo(hints);
+            return NULL;
+        }
+        memcpy(dup, prov_name, n);
+        hints->fabric_attr->prov_name = dup;
+    }
+    return hints;
+}
+
+/*
+ * Pin `hints->domain_attr->name` to a specific provider domain so
+ * fi_getinfo returns only the matching HCA's info entries. Without this,
+ * a multi-HCA host (for example 8x mlx5_N verbs domains) returns every
+ * domain in the info chain and the caller, taking the chain head, binds
+ * every fabric instance to the first domain. The verbs/rxm domain name
+ * is exactly the device name ("mlx5_0".."mlx5_7"). Returns 0 on success,
+ * -1 if hints has no domain_attr or the allocation fails. The string is
+ * freed by fi_freeinfo with free(3), matching how prov_name is handled.
+ */
+int ub_fi_hints_set_domain(struct fi_info *hints, const char *name) {
+    if (!hints || !hints->domain_attr || !name) {
+        return -1;
+    }
+    size_t n = strlen(name) + 1;
+    char *dup = (char *)malloc(n);
+    if (!dup) {
+        return -1;
+    }
+    memcpy(dup, name, n);
+    free(hints->domain_attr->name);
+    hints->domain_attr->name = dup;
+    return 0;
 }
 
 /*
@@ -230,6 +364,9 @@ int ub_fi_enodata(void) { return FI_ENODATA; }
 #define UB_FI_LAYOUT_FI_CQ_TAGGED_ENTRY 4
 #define UB_FI_LAYOUT_FI_CQ_ERR_ENTRY 5
 #define UB_FI_LAYOUT_FI_RMA_IOV 6
+#define UB_FI_LAYOUT_FI_EQ_ATTR 7
+#define UB_FI_LAYOUT_FI_EQ_CM_ENTRY 8
+#define UB_FI_LAYOUT_FI_EQ_ERR_ENTRY 9
 
 #define UB_FI_FIELD_SIZE 0
 #define UB_FI_FIELD_CQ_ATTR_SIZE 1
@@ -261,6 +398,20 @@ int ub_fi_enodata(void) { return FI_ENODATA; }
 #define UB_FI_FIELD_RMA_IOV_ADDR 27
 #define UB_FI_FIELD_RMA_IOV_LEN 28
 #define UB_FI_FIELD_RMA_IOV_KEY 29
+#define UB_FI_FIELD_EQ_ATTR_SIZE 30
+#define UB_FI_FIELD_EQ_ATTR_FLAGS 31
+#define UB_FI_FIELD_EQ_ATTR_WAIT_OBJ 32
+#define UB_FI_FIELD_EQ_ATTR_SIGNALING_VECTOR 33
+#define UB_FI_FIELD_EQ_ATTR_WAIT_SET 34
+#define UB_FI_FIELD_EQ_CM_ENTRY_FID 35
+#define UB_FI_FIELD_EQ_CM_ENTRY_INFO 36
+#define UB_FI_FIELD_EQ_ERR_ENTRY_FID 37
+#define UB_FI_FIELD_EQ_ERR_ENTRY_CONTEXT 38
+#define UB_FI_FIELD_EQ_ERR_ENTRY_DATA 39
+#define UB_FI_FIELD_EQ_ERR_ENTRY_ERR 40
+#define UB_FI_FIELD_EQ_ERR_ENTRY_PROV_ERRNO 41
+#define UB_FI_FIELD_EQ_ERR_ENTRY_ERR_DATA 42
+#define UB_FI_FIELD_EQ_ERR_ENTRY_ERR_DATA_SIZE 43
 
 size_t ub_fi_layout(int type, int field) {
     if (field == UB_FI_FIELD_SIZE) {
@@ -271,6 +422,9 @@ size_t ub_fi_layout(int type, int field) {
         case UB_FI_LAYOUT_FI_CQ_TAGGED_ENTRY: return sizeof(struct fi_cq_tagged_entry);
         case UB_FI_LAYOUT_FI_CQ_ERR_ENTRY: return sizeof(struct fi_cq_err_entry);
         case UB_FI_LAYOUT_FI_RMA_IOV: return sizeof(struct fi_rma_iov);
+        case UB_FI_LAYOUT_FI_EQ_ATTR: return sizeof(struct fi_eq_attr);
+        case UB_FI_LAYOUT_FI_EQ_CM_ENTRY: return sizeof(struct fi_eq_cm_entry);
+        case UB_FI_LAYOUT_FI_EQ_ERR_ENTRY: return sizeof(struct fi_eq_err_entry);
         default: return (size_t)-1;
         }
     }
@@ -340,6 +494,32 @@ size_t ub_fi_layout(int type, int field) {
         case UB_FI_FIELD_RMA_IOV_KEY: return offsetof(struct fi_rma_iov, key);
         default: return (size_t)-1;
         }
+    case UB_FI_LAYOUT_FI_EQ_ATTR:
+        switch (field) {
+        case UB_FI_FIELD_EQ_ATTR_SIZE: return offsetof(struct fi_eq_attr, size);
+        case UB_FI_FIELD_EQ_ATTR_FLAGS: return offsetof(struct fi_eq_attr, flags);
+        case UB_FI_FIELD_EQ_ATTR_WAIT_OBJ: return offsetof(struct fi_eq_attr, wait_obj);
+        case UB_FI_FIELD_EQ_ATTR_SIGNALING_VECTOR: return offsetof(struct fi_eq_attr, signaling_vector);
+        case UB_FI_FIELD_EQ_ATTR_WAIT_SET: return offsetof(struct fi_eq_attr, wait_set);
+        default: return (size_t)-1;
+        }
+    case UB_FI_LAYOUT_FI_EQ_CM_ENTRY:
+        switch (field) {
+        case UB_FI_FIELD_EQ_CM_ENTRY_FID: return offsetof(struct fi_eq_cm_entry, fid);
+        case UB_FI_FIELD_EQ_CM_ENTRY_INFO: return offsetof(struct fi_eq_cm_entry, info);
+        default: return (size_t)-1;
+        }
+    case UB_FI_LAYOUT_FI_EQ_ERR_ENTRY:
+        switch (field) {
+        case UB_FI_FIELD_EQ_ERR_ENTRY_FID: return offsetof(struct fi_eq_err_entry, fid);
+        case UB_FI_FIELD_EQ_ERR_ENTRY_CONTEXT: return offsetof(struct fi_eq_err_entry, context);
+        case UB_FI_FIELD_EQ_ERR_ENTRY_DATA: return offsetof(struct fi_eq_err_entry, data);
+        case UB_FI_FIELD_EQ_ERR_ENTRY_ERR: return offsetof(struct fi_eq_err_entry, err);
+        case UB_FI_FIELD_EQ_ERR_ENTRY_PROV_ERRNO: return offsetof(struct fi_eq_err_entry, prov_errno);
+        case UB_FI_FIELD_EQ_ERR_ENTRY_ERR_DATA: return offsetof(struct fi_eq_err_entry, err_data);
+        case UB_FI_FIELD_EQ_ERR_ENTRY_ERR_DATA_SIZE: return offsetof(struct fi_eq_err_entry, err_data_size);
+        default: return (size_t)-1;
+        }
     default:
         return (size_t)-1;
     }
@@ -402,11 +582,17 @@ ssize_t ub_fi_trecv(struct fid_ep *ep, void *buf, size_t len, void *desc,
 
 ssize_t ub_fi_send(struct fid_ep *ep, const void *buf, size_t len, void *desc,
                    fi_addr_t dest_addr, void *context) {
+    if (!ep) {
+        return -FI_EINVAL;
+    }
     return fi_send(ep, buf, len, desc, dest_addr, context);
 }
 
 ssize_t ub_fi_recv(struct fid_ep *ep, void *buf, size_t len, void *desc,
                    fi_addr_t src_addr, void *context) {
+    if (!ep) {
+        return -FI_EINVAL;
+    }
     return fi_recv(ep, buf, len, desc, src_addr, context);
 }
 
@@ -478,15 +664,65 @@ ssize_t ub_fi_parse_sockaddr(const char *s, uint8_t *out, size_t out_cap) {    i
 }
 
 /* ------------------------------------------------------------------
+ * Format a raw sockaddr (as handed back by fi_getname on a bound MSG
+ * endpoint, or carried in a CONNREQ cm_entry) into a numeric
+ * "ip:port" string. Used to learn the locally bound listen address
+ * (which port the provider chose for a ":0" bind) and to render peer
+ * addresses for logging.
+ *
+ * Returns the string length written (excluding the NUL) on success, a
+ * negative value on failure. `out` is always NUL-terminated when cap > 0.
+ * ------------------------------------------------------------------ */
+ssize_t ub_fi_format_sockaddr(const void *addr, size_t addrlen, char *out,
+                              size_t cap) {
+    if (!addr || !out || cap == 0) {
+        return -FI_EINVAL;
+    }
+    char host[NI_MAXHOST];
+    char serv[NI_MAXSERV];
+    int rc = getnameinfo((const struct sockaddr *)addr, (socklen_t)addrlen,
+                         host, sizeof(host), serv, sizeof(serv),
+                         NI_NUMERICHOST | NI_NUMERICSERV);
+    if (rc != 0) {
+        out[0] = '\0';
+        return -FI_EINVAL;
+    }
+    int is_v6 = ((const struct sockaddr *)addr)->sa_family == AF_INET6;
+    int n = is_v6 ? snprintf(out, cap, "[%s]:%s", host, serv)
+                  : snprintf(out, cap, "%s:%s", host, serv);
+    if (n < 0 || (size_t)n >= cap) {
+        out[0] = '\0';
+        return -FI_ETOOSMALL;
+    }
+    return (ssize_t)n;
+}
+
+/* ------------------------------------------------------------------
  * RMA write + cancel wrappers used by the fabric RPC layer.
  * ------------------------------------------------------------------ */
 
 ssize_t ub_fi_write(struct fid_ep *ep, const void *buf, size_t len, void *desc,
                     fi_addr_t dest_addr, uint64_t addr, uint64_t key,
                     void *context) {
+    if (!ep) {
+        return -FI_EINVAL;
+    }
     return fi_write(ep, buf, len, desc, dest_addr, addr, key, context);
 }
 
+ssize_t ub_fi_writedata(struct fid_ep *ep, const void *buf, size_t len,
+                        void *desc, uint64_t data, fi_addr_t dest_addr,
+                        uint64_t addr, uint64_t key, void *context) {
+    if (!ep) {
+        return -FI_EINVAL;
+    }
+    return fi_writedata(ep, buf, len, desc, data, dest_addr, addr, key,
+                        context);
+}
+
 ssize_t ub_fi_cancel(struct fid *fid, void *context) {
+    if (!fid) {
+        return -FI_EINVAL;
+    }
     return fi_cancel(fid, context);
 }
