@@ -679,7 +679,11 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 
 	upstream, err := s.resolveUpstream(r)
 	if err != nil {
-		s.logger.Debug("mirror: unknown ?ns=",
+		// The ?ns= value is not in upstream_registries. Log at Warn so
+		// operators notice misconfigured registry lists - this causes
+		// containerd to bypass the mirror entirely for that registry,
+		// defeating P2P distribution silently at Info log level.
+		s.logger.Warn("mirror: ignoring request for unconfigured registry - add it to upstream_registries",
 			slog.String("ns", r.URL.Query().Get("ns")),
 			slog.String("path", path),
 		)
