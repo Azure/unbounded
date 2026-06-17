@@ -99,6 +99,9 @@ pub enum ConfigError {
         frontend_id: String,
         value: i32,
     },
+    InvalidMetricsBind {
+        bind: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -212,6 +215,9 @@ impl fmt::Display for ConfigError {
                 f,
                 "frontend {frontend_id:?}: kind {value} is not a valid value (0 = http, 1 = s3)"
             ),
+            ConfigError::InvalidMetricsBind { bind } => {
+                write!(f, "metrics bind {bind:?} is not a valid socket address")
+            }
         }
     }
 }
@@ -434,6 +440,16 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
             });
         }
     }
+
+    // The metrics exporter bind is optional; when set it must parse as a
+    // socket address (an empty value disables the exporter).
+    let metrics_bind = &cfg.startup().metrics().bind;
+    if !metrics_bind.is_empty() && metrics_bind.parse::<SocketAddr>().is_err() {
+        return Err(ConfigError::InvalidMetricsBind {
+            bind: metrics_bind.clone(),
+        });
+    }
+
     Ok(())
 }
 
@@ -922,6 +938,29 @@ backend = "b"
     }
 
     #[test]
+    fn accepts_valid_metrics_bind() {
+        let f = write_cfg("[startup.metrics]\nbind = \"0.0.0.0:9100\"\n");
+        let cfg = load(f.path()).expect("valid metrics bind loads");
+        assert_eq!(cfg.startup().metrics().bind, "0.0.0.0:9100");
+    }
+
+    #[test]
+    fn empty_metrics_bind_is_allowed() {
+        let f = write_cfg("");
+        let cfg = load(f.path()).expect("absent metrics section loads");
+        assert_eq!(cfg.startup().metrics().bind, "");
+    }
+
+    #[test]
+    fn rejects_invalid_metrics_bind() {
+        let f = write_cfg("[startup.metrics]\nbind = \"not-an-addr\"\n");
+        match load(f.path()) {
+            Err(ConfigError::InvalidMetricsBind { bind }) if bind == "not-an-addr" => {}
+            other => panic!("expected InvalidMetricsBind, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_duplicate_frontend_bind() {
         let s = r#"
 [[backends]]
@@ -1158,10 +1197,10 @@ address = "10.0.0.2:9000"
         let f = write_cfg("");
         let cfg = load(f.path()).unwrap();
         let s = cfg.startup();
-        assert_eq!(s.memory().bytes_per_shard, 128 * 1024 * 1024);
+        assert_eq!(s.memory().memory_total_bytes, 128 * 1024 * 1024);
         assert_eq!(s.fabric().listen_addr, "0.0.0.0:0");
         assert_eq!(s.fabric().max_inflight, 1024);
-        assert_eq!(s.topology().rdma_handlers_per_hca, 4);
+        assert_eq!(s.topology().nic_workers, 4);
     }
 
     #[test]
@@ -1169,7 +1208,7 @@ address = "10.0.0.2:9000"
         let s = r#"
 [startup.memory]
 no_hugepages = true
-bytes_per_shard = 67108864
+memory_total_bytes = 67108864
 
 [startup.fabric]
 listen_addr = "10.0.0.1:7000"
@@ -1180,7 +1219,7 @@ disable_rdma = true
         let f = write_cfg(s);
         let cfg = load(f.path()).unwrap();
         assert!(cfg.startup().memory().no_hugepages);
-        assert_eq!(cfg.startup().memory().bytes_per_shard, 64 * 1024 * 1024);
+        assert_eq!(cfg.startup().memory().memory_total_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.startup().fabric().listen_addr, "10.0.0.1:7000");
         assert!(cfg.startup().topology().disable_rdma);
         // Unset siblings still default.
@@ -1205,6 +1244,9 @@ disable_rdma = true
         assert_eq!(loaded.startup().fabric().listen_addr, "10.0.0.2:8000");
         assert_eq!(loaded.startup().fabric().max_inflight, 4096);
         assert!(loaded.startup().topology().disable_rdma);
-        assert_eq!(loaded.startup().memory().bytes_per_shard, 128 * 1024 * 1024);
+        assert_eq!(
+            loaded.startup().memory().memory_total_bytes,
+            128 * 1024 * 1024
+        );
     }
 }

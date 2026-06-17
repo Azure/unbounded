@@ -38,6 +38,7 @@ use crate::config::{FrontendKind, FrontendSpec};
 use crate::frontend::FrontendError;
 use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, stripe_set};
 use crate::frontend::s3_xml::{S3ErrorCode, error_xml};
+use crate::frontend::serve_metrics::{ConnGuard, ReqOutcome};
 use crate::http::{
     FdGuard, HttpRequest, MAX_HEADER_BYTES, Method, ParseError, RECV_CHUNK, bind_listener,
     send_all, serialize_response_head, split_query,
@@ -132,6 +133,7 @@ pub struct S3Driver<P: BufferPool<Req = StripeReq> + 'static> {
     pool: Rc<P>,
     handle: NetHandle,
     listen_fd: RawFd,
+    frontend_id: Rc<str>,
     backend_id: String,
     stripe_size: u64,
     page_size: usize,
@@ -149,6 +151,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
         pool: Rc<P>,
         handle: NetHandle,
         listen_fd: RawFd,
+        frontend_id: Rc<str>,
         backend_id: String,
         stripe_size: u64,
         page_size: usize,
@@ -158,6 +161,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
             pool,
             handle,
             listen_fd,
+            frontend_id,
             backend_id,
             stripe_size,
             page_size,
@@ -200,6 +204,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
                             Rc::clone(&self.pool),
                             self.handle.clone(),
                             fd,
+                            Rc::clone(&self.frontend_id),
                             self.backend_id.clone(),
                             self.stripe_size,
                             self.page_size,
@@ -255,13 +260,17 @@ async fn serve_connection_s3<P: BufferPool<Req = StripeReq>>(
     pool: Rc<P>,
     handle: NetHandle,
     conn_fd: RawFd,
+    frontend_id: Rc<str>,
     backend_id: String,
     stripe_size: u64,
     page_size: usize,
 ) {
     let _fd = FdGuard(conn_fd);
+    let _conn = ConnGuard::new();
     let mut log = crate::obs::ReqLog::new("frontend.s3");
-    match serve_request_s3(
+    let start = std::time::Instant::now();
+    let mut outcome = ReqOutcome::default();
+    let result = serve_request_s3(
         &pool,
         &handle,
         conn_fd,
@@ -269,9 +278,11 @@ async fn serve_connection_s3<P: BufferPool<Req = StripeReq>>(
         stripe_size,
         page_size,
         &mut log,
+        &mut outcome,
     )
-    .await
-    {
+    .await;
+    outcome.record(&frontend_id, start.elapsed().as_secs_f64());
+    match result {
         Ok(()) => log.finish_ok(),
         Err(()) => log.finish_err("connection error"),
     }
@@ -289,6 +300,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     stripe_size: u64,
     page_size: usize,
     log: &mut crate::obs::ReqLog,
+    outcome: &mut ReqOutcome,
 ) -> Result<(), ()> {
     let request_id = next_request_id();
     log.str_field("req_id", &request_id);
@@ -314,6 +326,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 let bytes = error_bytes(S3ErrorCode::InvalidRequest, "/", &request_id, false, None);
                 let _ = send_all(handle, conn_fd, bytes).await;
                 log.field("status", 400);
+                outcome.status = 400;
                 return Ok(());
             }
         }
@@ -341,9 +354,11 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
             );
             let _ = send_all(handle, conn_fd, bytes).await;
             log.field("status", 405);
+            outcome.status = 405;
             return Ok(());
         }
     };
+    outcome.method = if is_head { "HEAD" } else { "GET" };
     log.str_field("method", if is_head { "HEAD" } else { "GET" });
 
     // 4. Optional Range header. A malformed Range is a 400; an
@@ -361,6 +376,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 );
                 let _ = send_all(handle, conn_fd, bytes).await;
                 log.field("status", 400);
+                outcome.status = 400;
                 return Ok(());
             }
         },
@@ -377,6 +393,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
             let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
             let _ = send_all(handle, conn_fd, bytes).await;
             log.field("status", 404);
+            outcome.status = 404;
             return Ok(());
         }
         LenResult::Other => {
@@ -389,6 +406,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
             );
             let _ = send_all(handle, conn_fd, bytes).await;
             log.field("status", 500);
+            outcome.status = 500;
             return Ok(());
         }
     };
@@ -411,6 +429,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 );
                 let _ = send_all(handle, conn_fd, bytes).await;
                 log.field("status", 416);
+                outcome.status = 416;
                 return Ok(());
             }
             Err(_) => {
@@ -423,6 +442,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 );
                 let _ = send_all(handle, conn_fd, bytes).await;
                 log.field("status", 400);
+                outcome.status = 400;
                 return Ok(());
             }
         },
@@ -434,6 +454,10 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     } else {
         full_head(len, &request_id)
     };
+    outcome.status = if range.is_some() { 206 } else { 200 };
+    // HEAD carries no body, so no body bytes are streamed to the client;
+    // only count the body length for requests that actually send one.
+    outcome.bytes = if is_head { 0 } else { resolved.len() };
     log.field("status", if range.is_some() { 206 } else { 200 })
         .field("bytes", resolved.len());
     send_all(handle, conn_fd, head).await?;
@@ -826,6 +850,7 @@ mod tests {
             Rc::new(MockPool),
             handle,
             listen_fd,
+            Rc::from("primary"),
             "primary".to_string(),
             4 * 1024 * 1024,
             2 * 1024 * 1024,

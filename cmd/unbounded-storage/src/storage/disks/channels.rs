@@ -47,10 +47,19 @@ pub struct DiskChannelDirectory {
 struct ChannelSnapshotInner {
     channels: ChannelSnapshot,
     generation: u64,
-    /// Path-sorted `(path, service identity)` of the published set,
-    /// retained so a re-apply of the identical set is recognized as a
-    /// no-op and skipped. Empty when no channels are published.
-    key: Vec<(PathBuf, usize)>,
+    /// Per-drive NUMA node, aligned index-for-index with `channels`
+    /// (and therefore with the `disk_for` drive index). `None` for a
+    /// drive whose storage core is unpinned or whose node is unknown.
+    /// Empty (not `None`-filled) when no channels are published, which
+    /// is the signal the router uses to fall back to plain hashing.
+    drive_numa: Arc<Vec<Option<u16>>>,
+    /// Path-sorted `(path, service identity, numa)` of the published
+    /// set, retained so a re-apply of the identical set is recognized
+    /// as a no-op and skipped. NUMA participates in the key so a
+    /// re-pinning that moves a drive to a different node republishes
+    /// (the router keys NUMA-local ownership off this). Empty when no
+    /// channels are published.
+    key: Vec<(PathBuf, usize, Option<u16>)>,
 }
 
 impl DiskChannelDirectory {
@@ -61,6 +70,7 @@ impl DiskChannelDirectory {
             current: ArcSwap::new(Arc::new(ChannelSnapshotInner {
                 channels: None,
                 generation: 0,
+                drive_numa: Arc::new(Vec::new()),
                 key: Vec::new(),
             })),
         })
@@ -68,16 +78,20 @@ impl DiskChannelDirectory {
 
     /// Replace the channel set with `channels`, published in
     /// path-sorted order so the `disk_for` index of any given page
-    /// is stable. The generation is bumped only when the published
-    /// set actually changes (a different path set, or the same path
-    /// bound to a different storage-core service); a re-apply of the
-    /// identical set is a no-op so consumers do not needlessly
-    /// reseat per-shard registrations.
-    pub fn apply_channels(&self, mut channels: Vec<(PathBuf, PageChannel)>) {
+    /// is stable. Each entry carries the drive's NUMA node (the node
+    /// its pinned storage core lives on, or `None` when unpinned),
+    /// published as a parallel `drive_numa` vector the router uses to
+    /// keep a stripe's serving shard on the same node as its disk.
+    /// The generation is bumped only when the published set actually
+    /// changes (a different path set, the same path bound to a
+    /// different storage-core service, or a drive that moved NUMA
+    /// node); a re-apply of the identical set is a no-op so consumers
+    /// do not needlessly reseat per-shard registrations.
+    pub fn apply_channels(&self, mut channels: Vec<(PathBuf, PageChannel, Option<u16>)>) {
         channels.sort_by(|a, b| a.0.cmp(&b.0));
-        let key: Vec<(PathBuf, usize)> = channels
+        let key: Vec<(PathBuf, usize, Option<u16>)> = channels
             .iter()
-            .map(|(p, c)| (p.clone(), c.service_id()))
+            .map(|(p, c, numa)| (p.clone(), c.service_id(), *numa))
             .collect();
 
         // `apply_channels` is the only writer of `current`; callers
@@ -91,7 +105,8 @@ impl DiskChannelDirectory {
             return;
         }
 
-        let ordered: Vec<PageChannel> = channels.into_iter().map(|(_, c)| c).collect();
+        let drive_numa: Vec<Option<u16>> = channels.iter().map(|(_, _, numa)| *numa).collect();
+        let ordered: Vec<PageChannel> = channels.into_iter().map(|(_, c, _)| c).collect();
         let n = ordered.len();
         let snapshot: ChannelSnapshot = if ordered.is_empty() {
             None
@@ -106,6 +121,7 @@ impl DiskChannelDirectory {
         self.current.store(Arc::new(ChannelSnapshotInner {
             channels: snapshot,
             generation: gen_n,
+            drive_numa: Arc::new(drive_numa),
             key,
         }));
         eprintln!("disks: hot-swap to generation {gen_n} (cache cold; channel count={n})");
@@ -125,6 +141,16 @@ impl DiskChannelDirectory {
     /// also needs the generation.
     pub fn current(&self) -> ChannelSnapshot {
         self.current.load_full().channels.clone()
+    }
+
+    /// Per-drive NUMA node, aligned with the published channel order
+    /// (and therefore with the `disk_for` drive index). Empty when no
+    /// disks are open, which the router treats as "no NUMA hint, hash
+    /// across all shards". A single atomic load, so the returned
+    /// vector's length always matches the channel set it was published
+    /// with.
+    pub fn drive_numa(&self) -> Arc<Vec<Option<u16>>> {
+        self.current.load_full().drive_numa.clone()
     }
 
     /// Generation of the currently-published snapshot. Observability
@@ -150,12 +176,13 @@ mod tests {
         let t = DiskChannelDirectory::new();
         assert!(t.current().is_none());
         assert_eq!(t.generation(), 0);
+        assert!(t.drive_numa().is_empty());
     }
 
     #[test]
     fn apply_bumps_generation_and_publishes_snapshot() {
         let t = DiskChannelDirectory::new();
-        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel())]);
+        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), None)]);
         assert_eq!(t.generation(), 1);
         let snap = t.current().expect("snapshot present");
         assert_eq!(snap.len(), 1);
@@ -167,9 +194,9 @@ mod tests {
         // Supplied out of order; publication must be path-sorted so
         // `disk_for` indices stay stable.
         t.apply_channels(vec![
-            (PathBuf::from("/c"), dummy_channel()),
-            (PathBuf::from("/a"), dummy_channel()),
-            (PathBuf::from("/b"), dummy_channel()),
+            (PathBuf::from("/c"), dummy_channel(), None),
+            (PathBuf::from("/a"), dummy_channel(), None),
+            (PathBuf::from("/b"), dummy_channel(), None),
         ]);
         let snap = t.current().unwrap();
         assert_eq!(snap.len(), 3);
@@ -177,14 +204,30 @@ mod tests {
     }
 
     #[test]
+    fn drive_numa_is_published_path_sorted_and_aligned() {
+        // The NUMA vector must be reordered with the channels (by path)
+        // so `drive_numa[disk_for(...)]` names the node of that drive.
+        let t = DiskChannelDirectory::new();
+        t.apply_channels(vec![
+            (PathBuf::from("/c"), dummy_channel(), Some(2)),
+            (PathBuf::from("/a"), dummy_channel(), Some(0)),
+            (PathBuf::from("/b"), dummy_channel(), None),
+        ]);
+        let numa = t.drive_numa();
+        // Path order /a,/b,/c -> NUMA 0, None, 2.
+        assert_eq!(&*numa, &[Some(0), None, Some(2)]);
+        assert_eq!(numa.len(), t.current().unwrap().len());
+    }
+
+    #[test]
     fn removed_path_drops_channel() {
         let t = DiskChannelDirectory::new();
         t.apply_channels(vec![
-            (PathBuf::from("/a"), dummy_channel()),
-            (PathBuf::from("/b"), dummy_channel()),
+            (PathBuf::from("/a"), dummy_channel(), None),
+            (PathBuf::from("/b"), dummy_channel(), None),
         ]);
         assert_eq!(t.current().unwrap().len(), 2);
-        t.apply_channels(vec![(PathBuf::from("/b"), dummy_channel())]);
+        t.apply_channels(vec![(PathBuf::from("/b"), dummy_channel(), None)]);
         assert_eq!(t.current().unwrap().len(), 1);
         assert_eq!(t.generation(), 2);
     }
@@ -192,10 +235,12 @@ mod tests {
     #[test]
     fn apply_empty_publishes_none() {
         let t = DiskChannelDirectory::new();
-        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel())]);
+        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), Some(0))]);
         assert!(t.current().is_some());
+        assert_eq!(t.drive_numa().len(), 1);
         t.apply_channels(vec![]);
         assert!(t.current().is_none());
+        assert!(t.drive_numa().is_empty());
         assert_eq!(t.generation(), 2);
     }
 
@@ -212,13 +257,13 @@ mod tests {
         assert_eq!(g0, 0);
         assert_eq!(g0, t.generation());
 
-        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel())]);
+        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), None)]);
         let (c1, g1) = t.snapshot();
         assert_eq!(g1, 1);
         assert_eq!(g1, t.generation());
         let c1 = c1.expect("snapshot present after apply");
 
-        t.apply_channels(vec![(PathBuf::from("/b"), dummy_channel())]);
+        t.apply_channels(vec![(PathBuf::from("/b"), dummy_channel(), None)]);
         let (c2, g2) = t.snapshot();
         assert_eq!(g2, 2);
         assert_eq!(g2, t.generation());
@@ -236,11 +281,11 @@ mod tests {
         // or republish, so consumers keep their seated registrations.
         let t = DiskChannelDirectory::new();
         let c = dummy_channel();
-        t.apply_channels(vec![(PathBuf::from("/a"), c.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(1))]);
         assert_eq!(t.generation(), 1);
         let first = t.current().expect("snapshot present");
 
-        t.apply_channels(vec![(PathBuf::from("/a"), c.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(1))]);
         assert_eq!(t.generation(), 1, "identical re-apply must not bump");
         let second = t.current().expect("snapshot still present");
         assert!(
@@ -254,10 +299,26 @@ mod tests {
         // Same path, but a distinct service identity (a fresh channel)
         // is a real change and must republish.
         let t = DiskChannelDirectory::new();
-        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel())]);
+        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), None)]);
         assert_eq!(t.generation(), 1);
-        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel())]);
+        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), None)]);
         assert_eq!(t.generation(), 2);
+    }
+
+    #[test]
+    fn numa_repinning_bumps_generation_and_republishes() {
+        // Same path bound to the same service, but the drive moved to a
+        // different NUMA node: a real routing-topology change that must
+        // republish so the router sees the new node.
+        let t = DiskChannelDirectory::new();
+        let c = dummy_channel();
+        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(0))]);
+        assert_eq!(t.generation(), 1);
+        assert_eq!(&*t.drive_numa(), &[Some(0)]);
+
+        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(1))]);
+        assert_eq!(t.generation(), 2, "NUMA move must bump");
+        assert_eq!(&*t.drive_numa(), &[Some(1)]);
     }
 
     #[test]
@@ -269,13 +330,13 @@ mod tests {
         let a = dummy_channel();
         let b = dummy_channel();
         t.apply_channels(vec![
-            (PathBuf::from("/a"), a.clone()),
-            (PathBuf::from("/b"), b.clone()),
+            (PathBuf::from("/a"), a.clone(), Some(0)),
+            (PathBuf::from("/b"), b.clone(), Some(1)),
         ]);
         assert_eq!(t.generation(), 1);
         t.apply_channels(vec![
-            (PathBuf::from("/b"), b.clone()),
-            (PathBuf::from("/a"), a.clone()),
+            (PathBuf::from("/b"), b.clone(), Some(1)),
+            (PathBuf::from("/a"), a.clone(), Some(0)),
         ]);
         assert_eq!(t.generation(), 1);
     }

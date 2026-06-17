@@ -84,6 +84,7 @@ fn generate_config_schema() {
         "MemoryCfg",
         "FabricCfg",
         "TopologyCfg",
+        "MetricsCfg",
     ] {
         prost.type_attribute(msg, "#[derive(::serde::Deserialize)]");
         prost.type_attribute(msg, "#[serde(default, deny_unknown_fields)]");

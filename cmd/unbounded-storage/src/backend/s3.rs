@@ -148,15 +148,19 @@ impl S3Backend {
                 .field("pages", dsts_owned.len());
             let fut = Box::pin(crate::obs::instrument(
                 log,
-                fetch_metadata(
-                    handle,
-                    origin_addr,
-                    host,
-                    path,
-                    dsts_owned.clone(),
-                    backing_base,
-                    page_size,
-                    self.limiter.clone(),
+                crate::metrics::instrument_backend(
+                    self.backend_id().to_string(),
+                    page_size as u64,
+                    fetch_metadata(
+                        handle,
+                        origin_addr,
+                        host,
+                        path,
+                        dsts_owned.clone(),
+                        backing_base,
+                        page_size,
+                        self.limiter.clone(),
+                    ),
                 ),
             ));
             return S3FetchStream::pending(fut, dsts_owned);
@@ -174,17 +178,21 @@ impl S3Backend {
             .field("pages", dsts_owned.len());
         let fut = Box::pin(crate::obs::instrument(
             log,
-            fetch(
-                handle,
-                origin_addr,
-                host,
-                path,
-                start,
+            crate::metrics::instrument_backend(
+                self.backend_id().to_string(),
                 len,
-                dsts_owned.clone(),
-                backing_base,
-                page_size,
-                self.limiter.clone(),
+                fetch(
+                    handle,
+                    origin_addr,
+                    host,
+                    path,
+                    start,
+                    len,
+                    dsts_owned.clone(),
+                    backing_base,
+                    page_size,
+                    self.limiter.clone(),
+                ),
             ),
         ));
         S3FetchStream::pending(fut, dsts_owned)

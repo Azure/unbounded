@@ -8,10 +8,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::bufferpool::pipeline::{PipelinedRead, StripePlan};
 use crate::bufferpool::stream::ReadStream;
 use crate::bufferpool::types::{BulkRef, Error, PageRef, StripeKey};
 use crate::bufferpool::window::WindowedRead;
-use crate::bufferpool::pipeline::{PipelinedRead, StripePlan};
 use crate::memory::Backing;
 
 pub trait Req {

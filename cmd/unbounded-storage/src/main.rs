@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -14,26 +14,31 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use unbounded_storage::backend::{BackendRegistry, FixedRegion, OriginRing};
+use unbounded_storage::backend::{BackendRegistry, OriginRing};
 use unbounded_storage::bufferpool::{Pool, PoolConfig, ShardDescriptor, StripeKey};
 use unbounded_storage::config::{self, BackendSpec, Config, FrontendKind, FrontendSpec};
 use unbounded_storage::fabric::PeerId;
 use unbounded_storage::fabric::{self, Fabric, Provider};
+use unbounded_storage::fanout::{
+    FanoutPeer, FanoutTable, FetchChannel, FetchService, NumaShardTable,
+};
 use unbounded_storage::frontend::{HttpDriver, HttpFrontend, S3Driver, S3Frontend};
 use unbounded_storage::p2p::{
-    FingerTable, FingerTableConfig, NodeId, PeerEntry, RecursiveHandler, RoutedTransport,
-    TopologyLabels, node_to_ring,
+    FingerTable, FingerTableConfig, NodeId, PeerEntry, RoutedTransport, TopologyLabels,
+    node_to_ring,
 };
 use unbounded_storage::ring::{NetHandle, NetworkRing};
-use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, Threading, WorkerIdx};
+use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
 use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{
     DiskChannelDirectory, DiskRegistry, LiveShardLocalStore, UringDiskTarget,
 };
-use unbounded_storage::topology::{Host, Plan, PlanConfig, Role, Worker};
+use unbounded_storage::topology::{CorePlan, CorePlanConfig, DiskCpuSlot, Host, ServingShard};
 
 use unbounded_storage::memory::{BackingKind, BackingRequest, allocate};
+use unbounded_storage::metrics;
 
+mod fabric_group;
 mod shard_layer;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
@@ -62,9 +67,13 @@ type ShardPool =
 /// the startup config version.
 pub struct StartupSettings {
     pub fabric: FabricStartup,
-    pub bytes_per_shard: usize,
+    /// Total backing pool across all serving shards. The shard layer
+    /// divides this by the serving-shard count so each shard gets a
+    /// NUMA-local slice and the host footprint stays fixed regardless of
+    /// the auto-scaled core count.
+    pub memory_total_bytes: usize,
     pub backing_kind: BackingKind,
-    pub plan_config: PlanConfig,
+    pub core_plan_config: CorePlanConfig,
 }
 
 /// Startup-fixed fabric endpoint and thread-pool knobs, including the
@@ -80,9 +89,9 @@ pub struct FabricStartup {
     pub max_inflight: u32,
 }
 
-/// Build the host-`Plan` configuration from the config file's
+/// Build the [`CorePlanConfig`] from the config file's
 /// `[startup.topology]` knobs. Fields with no corresponding knob retain
-/// their `PlanConfig` defaults.
+/// their `CorePlanConfig` defaults.
 /// Decide whether to force the tcp provider fallback because the
 /// discovered RDMA hardware cannot back a working libfabric `verbs`
 /// provider. Returns true only when RDMA is not already disabled, at
@@ -92,27 +101,103 @@ fn should_force_tcp_fallback(disable_rdma: bool, hca_count: usize, verbs_availab
     !disable_rdma && hca_count > 0 && !verbs_available
 }
 
-fn startup_to_plan_config(topology: &config::TopologyCfg) -> PlanConfig {
-    let defaults = PlanConfig::default();
-    PlanConfig {
-        rdma_progress_per_hca: topology.rdma_progress_per_hca as usize,
-        rdma_handlers_per_hca: topology.rdma_handlers_per_hca as usize,
-        nvme_threads_per_drive: defaults.nvme_threads_per_drive,
-        network_shards_per_nic: defaults.network_shards_per_nic,
+fn startup_to_core_plan_config(topology: &config::TopologyCfg) -> CorePlanConfig {
+    let defaults = CorePlanConfig::default();
+    CorePlanConfig {
+        nic_workers: if topology.nic_workers == 0 {
+            defaults.nic_workers
+        } else {
+            topology.nic_workers as usize
+        },
+        serving_cores: match topology.serving_cores {
+            0 => None,
+            n => Some(n as usize),
+        },
         use_smt_siblings: topology.use_smt_siblings,
         respect_isolated: !topology.ignore_isolated,
         exclude_node_cpu0: !topology.include_node_cpu0,
         require_node_type_ca: defaults.require_node_type_ca,
         require_active_port: !topology.allow_inactive_port,
-        tcp_fallback_threads: topology.tcp_fallback_threads as usize,
         disable_rdma: topology.disable_rdma,
     }
+}
+
+/// Resolve the HCA device name each serving shard should bind for its
+/// fabric endpoint. Every serving shard is assigned one active-HCA
+/// device, preferring an HCA on the shard's own NUMA node and
+/// round-robining within that node for spread. Shards on a node with no
+/// local HCA fall back to a flat round-robin over all active HCAs. When
+/// the plan kept no HCAs (RDMA disabled or none usable) every shard gets
+/// `None`, i.e. the tcp loopback fallback. This decides only per-shard
+/// device affinity; `plan_fabric_units` then groups shards that share a
+/// device onto a single endpoint (one per HCA), and `FabricGroup` owns
+/// the resulting fabrics. `hca_dev_names` is indexed by HCA index,
+/// matching `NicWorkerGroup::hca`.
+fn assign_shard_devices(plan: &CorePlan, hca_dev_names: &[String]) -> Vec<Option<String>> {
+    let active: Vec<(Option<u16>, String)> = plan
+        .nic_workers
+        .iter()
+        .map(|group| (group.numa, hca_dev_names[group.hca].clone()))
+        .collect();
+
+    let shard_count = plan.serving_shards.len();
+    if active.is_empty() {
+        return vec![None; shard_count];
+    }
+
+    let mut by_numa: BTreeMap<u16, Vec<String>> = BTreeMap::new();
+    for (numa, dev) in &active {
+        if let Some(node) = numa {
+            by_numa.entry(*node).or_default().push(dev.clone());
+        }
+    }
+    let flat: Vec<String> = active.iter().map(|(_, dev)| dev.clone()).collect();
+
+    let mut numa_cursor: HashMap<u16, usize> = HashMap::new();
+    let mut flat_cursor = 0usize;
+    let mut out = Vec::with_capacity(shard_count);
+    for shard in &plan.serving_shards {
+        let local = shard
+            .numa
+            .and_then(|node| by_numa.get(&node).map(|devs| (node, devs)))
+            .filter(|(_, devs)| !devs.is_empty());
+        let dev = match local {
+            Some((node, devs)) => {
+                let cursor = numa_cursor.entry(node).or_insert(0);
+                let dev = devs[*cursor % devs.len()].clone();
+                *cursor += 1;
+                dev
+            }
+            None => {
+                let dev = flat[flat_cursor % flat.len()].clone();
+                flat_cursor += 1;
+                dev
+            }
+        };
+        out.push(Some(dev));
+    }
+    out
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
     unbounded_storage::obs::init_from_env();
+
+    metrics::init();
+
+    #[cfg(feature = "profiling")]
+    {
+        use unbounded_storage::profiling;
+
+        match profiling::ProfilingConfig::from_env() {
+            Ok(cfg) => {
+                profiling::install_signal_handler();
+                profiling::spawn(cfg, || SHUTDOWN.load(Ordering::Acquire));
+            }
+            Err(e) => eprintln!("profiling: disabled: {e}"),
+        }
+    }
 
     fabric::apply_tcp_env_defaults();
 
@@ -138,12 +223,16 @@ fn main() -> ExitCode {
     let startup = config.startup();
     let memory = startup.memory();
     let fabric_cfg = startup.fabric();
+    // The metrics exporter bind address is a startup-fixed knob; capture
+    // it now while `startup` borrows `config`, before `config` is moved
+    // into the controller below. An empty string disables the exporter.
+    let metrics_bind = startup.metrics().bind.clone();
     let backing_kind = if memory.no_hugepages {
         BackingKind::Heap
     } else {
         BackingKind::Hugepage2Mb
     };
-    let bytes_per_shard = memory.bytes_per_shard as usize;
+    let memory_total_bytes = memory.memory_total_bytes as usize;
 
     let host = Host::discover();
 
@@ -156,9 +245,9 @@ fn main() -> ExitCode {
     // detected, force the tcp fallback (the same path as the
     // `disable_rdma` escape hatch) so the daemon comes up over the tcp
     // provider instead of failing every shard at bring-up.
-    let mut plan_config = startup_to_plan_config(startup.topology());
+    let mut core_plan_config = startup_to_core_plan_config(startup.topology());
     if should_force_tcp_fallback(
-        plan_config.disable_rdma,
+        core_plan_config.disable_rdma,
         host.hcas.len(),
         fabric::provider_available(Provider::Verbs),
     ) {
@@ -167,7 +256,7 @@ fn main() -> ExitCode {
              unavailable; forcing the tcp provider fallback",
             host.hcas.len(),
         );
-        plan_config.disable_rdma = true;
+        core_plan_config.disable_rdma = true;
     }
 
     let settings = Arc::new(StartupSettings {
@@ -178,42 +267,57 @@ fn main() -> ExitCode {
             rpc_worker_threads: fabric_cfg.rpc_worker_threads,
             max_inflight: fabric_cfg.max_inflight,
         },
-        bytes_per_shard,
+        memory_total_bytes,
         backing_kind,
-        plan_config,
+        core_plan_config,
     });
 
-    let plan = Plan::for_host(&host, &settings.plan_config);
+    let core_plan = CorePlan::for_host(&host, &settings.core_plan_config);
 
-    let counts = RoleCounts::from_plan(&plan);
+    let nic_worker_cpus: usize = core_plan
+        .nic_workers
+        .iter()
+        .map(|group| group.workers.len())
+        .sum();
     eprintln!(
-        "topology plan: workers={} progress={} handlers={} numa_pools={:?}",
-        plan.workers.len(),
-        counts.progress,
-        counts.handlers,
-        plan.numa_pools,
+        "topology plan: serving_shards={} nic_workers={} storage_cores={} numa_pools={:?}",
+        core_plan.serving_shards.len(),
+        nic_worker_cpus,
+        core_plan.storage_cores.len(),
+        core_plan.numa_pools,
     );
 
-    // RDMA progress workers are spawned here as shard threads. The
-    // per-disk storage cores are now wired separately by the disk
-    // supervisor below: each disk runs on its own pinned storage core
-    // hosting the engine and ring, exposed to shards as a
-    // `PageChannel`. RDMA handler placements are still only computed
-    // and logged, not spawned as their own threads. The `NvmeIoUring`
-    // and `NetworkShard` plan roles are vestigial and intentionally
-    // left uncounted.
-    // Per-shard `Worker` metadata, in plan order. `rdma_progress()`
-    // filters `plan.workers` by `Role::RdmaProgress`, the SAME
-    // predicate the `from_plan` closure below uses, so `WorkerIdx(i)`
-    // (which addresses the i-th retained worker in the runtime) lines
-    // up with `progress[i]`. Keep these two filters in sync.
-    let progress: Vec<Worker> = plan.rdma_progress().cloned().collect();
-    if progress.is_empty() {
-        eprintln!("topology plan produced no RDMA progress workers; exiting");
+    // Serving shards are the per-shard threads (HTTP frontend, checksum,
+    // `Rc<Pool>` + io_uring socket ring, fanout). Their count is now
+    // decoupled from the HCA count: it auto-fills the usable cores left
+    // after the storage and NIC-worker reservations. The per-disk storage
+    // cores are wired separately by the disk supervisor below. The fabric
+    // endpoints the shards register against are built once by the shard
+    // layer from the plan computed below, not per serving shard.
+    if core_plan.serving_shards.is_empty() {
+        eprintln!("topology plan produced no serving shards; exiting");
         return ExitCode::FAILURE;
     }
 
-    let runtime = PinnedRuntime::from_plan(&plan, |w| matches!(w.role, Role::RdmaProgress { .. }));
+    // `WorkerIdx(i)` addresses the i-th pinned runtime worker. The first
+    // `serving_shards.len()` workers are the serving shards (index-aligned
+    // with `core_plan.serving_shards`); the NIC-worker groups follow,
+    // flattened in group order, so a verbs fabric unit can pin its
+    // progress and RPC threads to a dedicated NIC-worker core. The planner
+    // in `fabric_group` relies on exactly this layout to resolve a
+    // device's worker index (`serving_count` + the group's flattened
+    // base).
+    let mut worker_specs: Vec<WorkerSpec> = core_plan
+        .serving_shards
+        .iter()
+        .map(|shard| WorkerSpec::new(shard.cpu, shard.numa))
+        .collect();
+    for group in &core_plan.nic_workers {
+        for worker in &group.workers {
+            worker_specs.push(WorkerSpec::new(worker.cpu, worker.numa));
+        }
+    }
+    let runtime = PinnedRuntime::new(worker_specs);
     install_signal_handler();
 
     // Hot-swap publication surface for shards. The disk supervisor
@@ -224,21 +328,31 @@ fn main() -> ExitCode {
     // the shard loop so each shard receives a clone.
     let disk_channels: Arc<DiskChannelDirectory> = DiskChannelDirectory::new();
 
-    // Precompute the per-shard worker list: each progress worker plus
-    // the HCA device name it should bind, resolved here while `host` is
-    // in scope. The shard layer owns this list for the lifetime of the
+    // Precompute the per-shard worker list: each serving shard plus the
+    // HCA device name it should bind, resolved here while `host` is in
+    // scope. The shard layer owns this list for the lifetime of the
     // process and re-uses it verbatim on a coordinated rebuild.
-    let workers: Vec<(Worker, Option<String>)> = progress
+    let hca_dev_names: Vec<String> = host.hcas.iter().map(|h| h.dev_name.clone()).collect();
+    let shard_devices = assign_shard_devices(&core_plan, &hca_dev_names);
+
+    // Plan how serving shards map onto fabric endpoints. This is the
+    // single tcp/verbs seam: tcp gets one loopback fabric per shard,
+    // verbs gets one shared fabric per HCA (see `fabric_group`). Built
+    // here, before `shard_devices` is consumed by the worker zip below,
+    // and owned by the shard layer for the lifetime of the process so a
+    // coordinated rebuild reuses the same plan.
+    let fabric_plan = fabric_group::plan_fabric_units(
+        &core_plan.serving_shards,
+        &shard_devices,
+        &core_plan.nic_workers,
+        &hca_dev_names,
+    );
+
+    let workers: Vec<(ServingShard, Option<String>)> = core_plan
+        .serving_shards
         .iter()
-        .map(|worker| {
-            let dev_name = match worker.role {
-                Role::RdmaProgress { hca } if hca != usize::MAX => {
-                    Some(host.hcas[hca].dev_name.clone())
-                }
-                _ => None,
-            };
-            (worker.clone(), dev_name)
-        })
+        .copied()
+        .zip(shard_devices)
         .collect();
 
     let deps = shard_layer::ShardSpawnDeps {
@@ -246,19 +360,27 @@ fn main() -> ExitCode {
         workers,
         settings: settings.clone(),
         disk_channels: disk_channels.clone(),
+        fabric_plan,
     };
 
     // Disk supervisor: reconcile `[[disks]]` entries onto pinned
     // storage cores. Each disk runs on its own storage core hosting the
     // engine and ring, and publishes a `PageChannel` that carries the
     // page data path cross-core from the shards. CPU pin hints come from
-    // the topology plan's disjoint NVMe (`Role::NvmeIoUring`) slots: the
-    // registry assigns each disk a NUMA-local slot that is disjoint from
-    // the shard cores by construction. If the plan discovered no NVMe
-    // devices the slot list is empty and disks run unpinned. The
+    // the topology plan's per-drive storage cores: each one already
+    // inherits the drive's NUMA node and is disjoint from the serving
+    // and NIC-worker cores by construction. If the host discovered no
+    // NVMe devices the slot list is empty and disks run unpinned. The
     // registry is owned by the apply target so live `[[disks]]` changes
     // reconcile through the same funnel as the rest of the config.
-    let disk_slots = plan.disk_cpu_slots();
+    let disk_slots: Vec<DiskCpuSlot> = core_plan
+        .storage_cores
+        .iter()
+        .map(|core| DiskCpuSlot {
+            cpu: core.cpu,
+            numa: core.numa,
+        })
+        .collect();
     let mut disk_registry = DiskRegistry::new(UringDiskTarget::new(runtime.clone()), disk_slots);
 
     // Bring up the initial shard layer. A bring-up failure is fatal:
@@ -307,6 +429,26 @@ fn main() -> ExitCode {
     // realized here at process start, since the `[startup]` knobs it
     // tracks only take effect on restart.
     let mut controller = config::ConfigController::new(target, Arc::new(config));
+
+    // Start the Prometheus exporter once the controller exists, so it can
+    // publish the live config-version gauges. A bind failure is logged
+    // but non-fatal: the daemon serves data without metrics rather than
+    // refusing to start. The thread parks off the pinned shard cores and
+    // exits when `SHUTDOWN` is set.
+    let metrics_exporter = if metrics_bind.is_empty() {
+        None
+    } else {
+        match metrics::spawn(&metrics_bind, controller.config_versions(), &SHUTDOWN) {
+            Ok(handle) => {
+                eprintln!("metrics: exporter listening on {metrics_bind}");
+                Some(handle)
+            }
+            Err(e) => {
+                eprintln!("metrics: exporter disabled: {e}");
+                None
+            }
+        }
+    };
 
     // Watch the config file and drive each update through the
     // controller until shutdown. Every apply is in place; an apply error
@@ -360,6 +502,13 @@ fn main() -> ExitCode {
     drop(disk_channels);
     disk_registry.drain();
 
+    // The exporter polls `SHUTDOWN` on its accept loop; join it last so a
+    // late scrape can still observe the final config versions during
+    // teardown. Bounded by the accept poll interval.
+    if let Some(handle) = metrics_exporter {
+        let _ = handle.join();
+    }
+
     exit_code
 }
 
@@ -370,69 +519,36 @@ fn main() -> ExitCode {
 /// together.
 fn run_shard(
     widx: WorkerIdx,
-    worker: Worker,
-    dev_name: Option<String>,
-    runtime: Arc<dyn Threading>,
+    shard: ServingShard,
+    fabric: Arc<Fabric>,
     tx: mpsc::Sender<ShardReady>,
     backing_kind: BackingKind,
     bytes_per_shard: usize,
-    fabric_startup: Arc<FabricStartup>,
-    max_inflight: u64,
     disk_channels: Arc<DiskChannelDirectory>,
     fingers: Arc<FingerTable>,
     node_to_peer: Arc<HashMap<NodeId, PeerId>>,
     frontend_specs: Arc<Vec<FrontendSpec>>,
     backend_specs: Arc<Vec<BackendSpec>>,
     ctrl_rx: mpsc::Receiver<config::ShardCommand>,
+    peer_rx: mpsc::Receiver<Arc<Vec<PeerPublish>>>,
+    phaseb_tx: mpsc::Sender<PhaseBReport>,
     layer_stop: Arc<AtomicBool>,
 ) {
-    // Default to the loopback device when no HCA is bound to this
-    // shard; the `tcp` provider is the fallback path.
-    let device_name = dev_name.clone().unwrap_or_else(|| "lo".to_string());
-    let provider = match &dev_name {
-        Some(name) => Provider::from_device_name(name),
-        None => Provider::Tcp,
-    };
-    let mut cfg = fabric::defaults_for(device_name, runtime, widx);
-    cfg.provider = provider;
-    cfg.listen = true;
-    cfg.listen_addr = Some(fabric_startup.listen_addr.clone());
-    cfg.max_inflight = max_inflight as usize;
-    cfg.rpc_worker_threads = fabric_startup.rpc_worker_threads as usize;
-    cfg.progress_threads = fabric_startup.progress_threads as u8;
-    cfg.progress_poll_us = fabric_startup.progress_poll_us;
-    cfg.numa = worker.numa;
-
-    let fabric = match Fabric::new(cfg).and_then(|f| f.self_address().map(|a| (f, a))) {
-        Ok((fabric, self_addr)) => {
-            println!(
-                "shard up: worker={} dev={} numa={} cpu={} self_addr_bytes={}",
-                widx.0,
-                dev_name.as_deref().unwrap_or("tcp-fallback"),
-                worker
-                    .numa
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "none".into()),
-                worker.cpu,
-                self_addr.len(),
-            );
-            Arc::new(fabric)
-        }
-        Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!("worker={}: {e}", widx.0)));
-            return;
-        }
-    };
+    // The fabric endpoint is built and owned by the `FabricGroup` in the
+    // shard layer and shared by every shard mapped onto it (one per shard
+    // for the tcp fallback, one per HCA for verbs). This shard registers
+    // its data backing and client transport against it; it neither
+    // creates nor tears it down.
 
     // NUMA-local backing. Allocated on the pinned shard thread so the
     // `PinnedRuntime`'s `set_mempolicy` keeps the pages on the intended
     // node; the hugepage variant additionally pins via `mbind` when
-    // `worker.numa` is known. Register it with the fabric before
+    // `shard.numa` is known. Register it with the fabric before
     // building the transport.
     let backing = match allocate(BackingRequest {
         kind: backing_kind,
         bytes: bytes_per_shard,
-        numa: worker.numa,
+        numa: shard.numa,
     }) {
         Ok(b) => b,
         Err(e) => {
@@ -444,7 +560,7 @@ fn run_shard(
         }
     };
     let page_size = backing.page_size;
-    let mr = match fabric.register_backing(&backing, worker.numa) {
+    let mr = match fabric.register_backing(&backing, shard.numa) {
         Ok(mr) => mr,
         Err(e) => {
             let _ = tx.send(ShardReady::Failed(format!(
@@ -483,6 +599,22 @@ fn run_shard(
     // the socket ring and the pool share; the `HttpBackend` memcpys
     // origin bytes directly into pages carved from this base.
     let backing_base = backing.base;
+
+    // Total registered length of the backing, captured before
+    // `Pool::new` moves it. Peers register `(backing_base, backing_len)`
+    // on their own socket rings so they can `SEND_ZC` from this shard's
+    // pinned pages.
+    let backing_len = backing.page_size * backing.page_count;
+
+    // Shared Drop carrier for this shard's backing allocation, captured
+    // before `Pool::new` moves the `Backing`. Published to the layer so
+    // it can keep the mapping alive until every shard thread has joined:
+    // a peer coordinator's socket ring registers this region as a
+    // `SEND_ZC` source, and that ring is only guaranteed torn down once
+    // the peer's thread joins. Freeing the backing when this shard's
+    // `Pool` drops (which happens inside this thread, before the layer
+    // joins anyone) would leave a peer ring pointing at unmapped memory.
+    let backing_keepalive = backing.keepalive();
 
     // Stripe geometry per backend id, shared (behind an `Rc`) with the
     // frontend registry and the control-drain hook so a live backend
@@ -596,135 +728,9 @@ fn run_shard(
         pool.recv_quarantine_handle(),
     );
 
-    // Bring up the per-shard RPC server so remote peers can fetch
-    // stripes this node has resident locally (a peer "cache hit") and
-    // so this node can act as an intermediate Chord hop, forwarding to
-    // the next hop and relaying the downstream page back upstream. The
-    // production `RecursiveHandler` serves and forwards out of a
-    // dedicated scratch backing that only the RPC worker threads ever
-    // touch, sidestepping the `Send + Sync` requirement on `Handler`
-    // without sharing the `!Send` `Rc<Pool>` or its free list off the
-    // shard thread. The scratch backing doubles as a fabric MR (the
-    // `fi_write` source for serving and the `fi_write` destination for
-    // forwarded pages) and a `BlockStore` extra buffer. Sized at a
-    // small, fixed page count: one in-flight request consumes one
-    // scratch page for the duration of its serve/forward. See
-    // `p2p/handler.rs` for the soundness argument.
-    const RPC_SCRATCH_PAGES: u32 = 8;
-    let scratch = match allocate(BackingRequest {
-        kind: backing_kind,
-        bytes: page_size * RPC_SCRATCH_PAGES as usize,
-        numa: worker.numa,
-    }) {
-        Ok(b) => b,
-        Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: rpc scratch backing allocation failed: {e}",
-                widx.0,
-            )));
-            return;
-        }
-    };
-    let scratch_mr = match fabric.register_backing(&scratch, worker.numa) {
-        Ok(mr) => mr,
-        Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: rpc scratch register_backing: {e}",
-                widx.0,
-            )));
-            return;
-        }
-    };
-    // The RPC handler resolves disk reads into scratch pages, so it
-    // needs a `BlockStore` whose single registered backing IS the
-    // scratch region: `LiveShardLocalStore::resolve` maps a `PageRef`
-    // through exactly one backing's geometry and refuses to guess among
-    // several. The data-path `blockstore` already owns the (much
-    // larger) pool backing, so it cannot also host scratch. We give the
-    // handler its own store over the *same* disk channel directory:
-    // scratch is still registered as an io_uring fixed buffer against
-    // every disk channel (via the shared directory's replay), but page
-    // resolution stays unambiguous.
-    let rpc_store = Arc::new(LiveShardLocalStore::new(disk_channels));
-    if let Err(e) = rpc_store.register_backing(&scratch) {
-        let _ = tx.send(ShardReady::Failed(format!(
-            "worker={}: rpc scratch blockstore register: {e}",
-            widx.0,
-        )));
-        return;
-    }
-    // `MrHandle` is a `Copy` value handle (the underlying `fid_mr` is
-    // owned by the `Fabric`), so a single scratch registration is
-    // shared by copy between the handler's forwarding `FabricTransport`
-    // (whose downstream `fi_write`s land in scratch) and the RPC
-    // server's `local_mr` (the `fi_write` source that ships served
-    // pages back to the requester). One backing, one MR, no double
-    // allocation.
-    // Capture the scratch backing's base before `scratch` is moved into
-    // the handler below. The RPC handler serves peer cache-misses into
-    // scratch pages (see `serve_owned` in `p2p/handler.rs`), so its
-    // origin backend must memcpy origin bytes into the scratch region,
-    // not the pool backing the data-path transport uses.
-    let scratch_base = scratch.base;
-    // The handler runs on one of the persistent `fabric-rpc-worker`
-    // pool threads, so it must NOT touch the shard ring (the shard
-    // thread progresses it concurrently; a cross-thread `RefCell`
-    // borrow panics). A worker-local ring keeps every origin op on the
-    // serving thread; it is lazily initialized once per long-lived pool
-    // thread and reused across the many RPCs that thread serves.
-    let handler_registry = match BackendRegistry::new(
-        &backend_specs,
-        OriginRing::WorkerLocal {
-            queue_depth: 256,
-            region: Some(FixedRegion {
-                base: scratch_base,
-                len: page_size * RPC_SCRATCH_PAGES as usize,
-            }),
-        },
-        page_size,
-        scratch_base,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: build rpc backend registry: {e}",
-                widx.0,
-            )));
-            return;
-        }
-    };
-    let rpc_handler = Arc::new(
-        match RecursiveHandler::with_routing(
-            rpc_store.clone(),
-            scratch,
-            RPC_SCRATCH_PAGES,
-            routing.clone(),
-            fabric.clone(),
-            scratch_mr,
-            page_size,
-            handler_registry.clone(),
-        ) {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = tx.send(ShardReady::Failed(format!(
-                    "worker={}: RecursiveHandler::new: {e}",
-                    widx.0,
-                )));
-                return;
-            }
-        },
-    );
-    let rpc_server =
-        match fabric.start_rpc_server::<StripeReq, _>(rpc_handler, Some(scratch_mr), page_size) {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = tx.send(ShardReady::Failed(format!(
-                    "worker={}: start_rpc_server: {e}",
-                    widx.0,
-                )));
-                return;
-            }
-        };
+    // The RPC server that serves peer cache-hits and forwards Chord hops
+    // is brought up and owned by the `FabricGroup` (shared across every
+    // shard mapped onto this fabric), so it is no longer created here.
 
     // Build the shard's cooperative loop and register its progress
     // sources. The socket ring's `progress()` is a tick hook; the
@@ -741,6 +747,97 @@ fn run_shard(
         shard_loop.add_tick_hook(move || socket.borrow().progress());
     }
 
+    // Cross-shard fan-out channel. This shard publishes the sender half
+    // (so peer coordinators can request stripes it owns) and keeps the
+    // receiver half to drive its own fetch service below.
+    let (fetch_channel, fetch_rx) = FetchChannel::new();
+
+    // PHASE A: announce readiness, publishing our backing region and
+    // fetch channel, then block until the layer broadcasts the full peer
+    // set. Bring-up is two-phase because registering a peer's backing
+    // re-registers the socket ring's whole fixed-buffer table, which is
+    // only safe while the ring is quiescent (no I/O in flight) - i.e.
+    // before the serve loop starts. A broadcast `Err` means the layer
+    // hit a bring-up failure on another shard and tore down before
+    // publishing; exit cleanly by returning (the shard locals drop in
+    // reverse declaration order; the shared `fabric` is released by the
+    // `FabricGroup`, not here).
+    let _ = tx.send(ShardReady::Up {
+        descriptor: ShardDescriptor {
+            worker_idx: widx,
+            numa: shard.numa,
+        },
+        publish: ShardPublish {
+            backing_base: backing_base as usize,
+            backing_len,
+            numa: shard.numa,
+            fetch_channel,
+            backing_keepalive,
+        },
+    });
+    let peers = match peer_rx.recv() {
+        Ok(peers) => peers,
+        Err(_) => return,
+    };
+
+    // From here on this shard owes the layer exactly one PhaseB report.
+    // The guard sends `Failed` on any early return or panic so the
+    // layer's bounded Phase-B collection never hangs waiting on a shard
+    // that aborted (mirroring `report_on_panic` for Phase A).
+    let mut phaseb_guard = PhaseBGuard::new(widx, phaseb_tx);
+
+    // PHASE B: register every peer shard's backing on our socket ring
+    // (recording the fixed-buffer index each lands at) and assemble the
+    // routing table. The ring is still quiescent here.
+    let own_shard_index = peers
+        .iter()
+        .position(|p| p.worker_idx == widx)
+        .expect("own shard present in broadcast peer set");
+    let shard_count = peers.len();
+    let mut routed: Vec<Option<FanoutPeer>> = (0..shard_count).map(|_| None).collect();
+    for peer in peers.iter() {
+        if peer.shard_index == own_shard_index {
+            continue;
+        }
+        let buf_index = match socket
+            .borrow()
+            .register_region_indexed(peer.backing_base as *mut u8, peer.backing_len)
+        {
+            Ok(idx) => idx,
+            Err(e) => {
+                phaseb_guard.report_failed(format!(
+                    "worker={}: register peer shard {} backing: {e}",
+                    widx.0, peer.shard_index,
+                ));
+                return;
+            }
+        };
+        routed[peer.shard_index] = Some(FanoutPeer {
+            channel: peer.channel.clone(),
+            buf_index,
+        });
+    }
+    // NUMA -> serving-shard table for NUMA-local fetch routing: a stripe
+    // is routed to a shard co-located with the drive that backs it,
+    // spreading across that node's shards. Built from the full peer set
+    // (each peer carries its shard index and NUMA node).
+    let numa_shards = NumaShardTable::from_shards(peers.iter().map(|p| (p.shard_index, p.numa)));
+    let fanout = Rc::new(FanoutTable::new(
+        own_shard_index,
+        routed,
+        numa_shards,
+        disk_channels.clone(),
+    ));
+
+    // Owner-side fetch service: serves stripe requests this shard owns by
+    // pinning pages in its backing and replying with their byte offsets.
+    // Registered as a tick hook so it shares the shard's cooperative loop.
+    {
+        let mut fetch_service =
+            FetchService::new(pool.clone(), fetch_rx, page_size, shard_loop.waker());
+        shard_loop.add_tick_hook(move || fetch_service.progress());
+    }
+
     // Shard-local registry of running frontend drivers, seeded with every
     // configured frontend. A single permanent tick hook (registered
     // below) drives whichever drivers are live, and the control-drain
@@ -751,6 +848,7 @@ fn run_shard(
     let frontend_ctx = FrontendBuildCtx {
         pool: pool.clone(),
         handle: NetHandle::new(socket.clone()),
+        fanout: fanout.clone(),
         geometry: geometry.clone(),
         page_size,
     };
@@ -765,10 +863,11 @@ fn run_shard(
     // Control-drain tick hook: applies live config changes on this
     // shard's own thread so all `!Send` per-shard state stays
     // thread-local. Each `ShardCommand::ApplyConfig` republishes the
-    // routing surface through the shared `RoutingHandle` (observed
-    // atomically by the transport and the recursive handler), refreshes
-    // the stripe geometry, reconciles the origin-backend registries and
-    // the frontend registry toward the new config, and then acknowledges
+    // routing surface through this shard's `RoutingHandle` (observed
+    // atomically by its transport; the fabric RPC handlers are reloaded
+    // separately by the `FabricGroup`), refreshes the stripe geometry,
+    // reconciles the transport origin-backend registry and the frontend
+    // registry toward the new config, and then acknowledges
     // so the coordinator's blocking apply can complete. Everything is
     // driven from this one thread so the `ArcSwap` publishes are ordered
     // and the build-from-spec (DNS resolve, listener bind) stays off the
@@ -776,7 +875,6 @@ fn run_shard(
     {
         let routing = routing.clone();
         let transport_registry = transport_registry.clone();
-        let handler_registry = handler_registry.clone();
         let frontend_registry = frontend_registry.clone();
         let geometry = geometry.clone();
         let mut last_backends: HashMap<String, BackendSpec> = backend_specs
@@ -808,16 +906,6 @@ fn run_shard(
                             }
                         }
 
-                        // The RPC handler's backend registry is a second
-                        // copy of the same desired set; reconcile it in
-                        // lockstep with identical inputs so it converges to
-                        // the same applied map.
-                        let handler_report = config::reconcile::reconcile_backends(
-                            &handler_registry,
-                            desired_backends,
-                            Some(&last_backends),
-                        );
-
                         // Drive the transport backend registry and the
                         // frontend registry together so frontend adds are
                         // gated on their referenced backend being present.
@@ -832,8 +920,7 @@ fn run_shard(
                         last_backends = combined.backends.applied;
                         last_frontends = combined.frontends.applied;
 
-                        let mut failures = handler_report.failures;
-                        failures.extend(combined.backends.failures);
+                        let mut failures = combined.backends.failures;
                         failures.extend(combined.frontends.failures);
                         let result = if failures.is_empty() {
                             Ok(())
@@ -862,13 +949,10 @@ fn run_shard(
         shard_loop.add_tick_hook(move || frontend_registry.progress());
     }
 
-    let _ = tx.send(ShardReady::Up {
-        descriptor: ShardDescriptor {
-            worker_idx: widx,
-            numa: worker.numa,
-        },
-        fabric: fabric.clone(),
-    });
+    // PHASE B complete: peers registered, fan-out and frontend drivers
+    // built. Report readiness so the layer can finish bring-up.
+    phaseb_guard.report_ready();
+    metrics::shards_delta(1);
 
     // Drive the shard's cooperative future set until shutdown. The loop
     // busy-polls socket I/O and frontend work while active and idles
@@ -879,25 +963,23 @@ fn run_shard(
         Duration::from_micros(100),
     );
 
+    metrics::shards_delta(-1);
+
     // Drop order matters:
     //   1. `shard_loop` first - clears tick hooks and futures, releasing
     //      their `Rc<socket>` clones and (if registered) the `HttpDriver`
     //      that holds the pool and a `NetHandle`.
     //   2. `pool` - tears down `Pool` and its `FabricTransport`, which
-    //      holds an `Arc<Fabric>` clone that must go before `fabric`.
-    //      The pool's `HttpBackend` also holds an `Rc<socket>` clone.
+    //      holds an `Arc<Fabric>` clone; releasing it here lets the
+    //      `FabricGroup` close the shared endpoint during layer teardown
+    //      once this thread has joined.
     //   3. `socket` - the last shard-local `Rc<socket>` clone.
-    //   4. `rpc_server` - signals shutdown to the persistent RPC worker
-    //      pool, closes its job queue, and joins every worker thread;
-    //      this must complete while `fabric` (which they use) is still
-    //      alive.
-    //   5. `fabric` last - joins its progress threads, closes the
-    //      scratch MR the RPC server used, and tears libfabric down.
+    // The `fabric` parameter is a clone of a group-owned endpoint; it is
+    // released when this function returns, before the layer drops the
+    // `FabricGroup`.
     drop(shard_loop);
     drop(pool);
     drop(socket);
-    drop(rpc_server);
-    drop(fabric);
 }
 
 /// Run a shard thread body `f`, guaranteeing exactly one
@@ -1023,16 +1105,13 @@ fn build_routing(config: &Config) -> (Arc<FingerTable>, Arc<HashMap<NodeId, Peer
     (Arc::new(fingers), Arc::new(node_to_peer))
 }
 
-/// Hash a `StripeKey` into a shard index. The first eight bytes of
-/// the 32-byte key are interpreted as a little-endian `u64`; that
-/// distributes uniformly under a content-addressed key (which is
-/// already a hash) and avoids pulling in a hash crate. The modulus
-/// is the shard count; `shard_count` is asserted non-zero by
-/// `PoolGroup::new`.
+/// Hash a `StripeKey` into a shard index. Delegates to the library
+/// [`unbounded_storage::fanout::owner_shard`] so the binary's
+/// `PoolGroup` router and the library frontend's fan-out path share one
+/// ownership function. The modulus is the shard count; `shard_count` is
+/// asserted non-zero by `PoolGroup::new`.
 fn stripe_key_to_shard(key: &StripeKey, shard_count: usize) -> usize {
-    let bytes = &key.0[..8];
-    let h = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
-    (h as usize) % shard_count
+    unbounded_storage::fanout::owner_shard(key, shard_count)
 }
 
 /// Validate and log the configured backends.
@@ -1086,6 +1165,11 @@ impl ShardFrontendDriver {
 struct FrontendBuildCtx {
     pool: Rc<ShardPool>,
     handle: NetHandle,
+    /// Per-shard cross-shard routing surface. The HTTP serve path
+    /// consults it to fan each stripe out to its owner shard (or serve
+    /// locally). Shared behind an `Rc` so cloning the context stays
+    /// cheap.
+    fanout: Rc<FanoutTable>,
     /// Backend id -> stripe size, shared (and live-updated) with the
     /// control-drain hook so a frontend brought up after a backend
     /// stripe change sees the new geometry. A frontend's stripe size is
@@ -1128,9 +1212,11 @@ impl FrontendBuildCtx {
                     self.pool.clone(),
                     self.handle.clone(),
                     listen_fd,
+                    Rc::from(spec.id.as_str()),
                     spec.backend.clone(),
                     stripe_size,
                     self.page_size,
+                    self.fanout.clone(),
                 )))
             }
             FrontendKind::S3 => {
@@ -1143,6 +1229,7 @@ impl FrontendBuildCtx {
                     self.pool.clone(),
                     self.handle.clone(),
                     listen_fd,
+                    Rc::from(spec.id.as_str()),
                     spec.backend.clone(),
                     stripe_size,
                     self.page_size,
@@ -1222,31 +1309,102 @@ impl config::reconcile::FrontendReconcileTarget for FrontendRegistry {
 enum ShardReady {
     Up {
         descriptor: ShardDescriptor,
-        fabric: Arc<Fabric>,
+        /// Cross-shard fan-out endpoints this shard exposes: its
+        /// registered backing region and the channel to its fetch
+        /// service. The layer collects these from every shard and
+        /// broadcasts the full set back so each shard can register its
+        /// peers' backings and build its [`FanoutTable`].
+        publish: ShardPublish,
     },
     Failed(String),
 }
 
-/// Per-role worker counts derived from a [`Plan`]; used for the
-/// startup observability line.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-struct RoleCounts {
-    progress: usize,
-    handlers: usize,
+/// Phase-A publication from one shard: the backing region other shards
+/// must register to `SEND_ZC` from this shard's pinned pages, plus the
+/// channel to this shard's [`FetchService`]. The base is shipped as a
+/// `usize` because the raw `*mut u8` is `!Send`; it is re-cast to a
+/// pointer by the peer that registers it.
+struct ShardPublish {
+    backing_base: usize,
+    backing_len: usize,
+    /// NUMA node this shard's cores and backing are pinned to (`None`
+    /// when unpinned). Forwarded into [`PeerPublish`] so every shard can
+    /// build its NUMA -> serving-shard table for NUMA-local fetch
+    /// routing.
+    numa: Option<u16>,
+    fetch_channel: FetchChannel,
+    /// Shared Drop carrier for this shard's backing allocation. The
+    /// layer retains it (in [`shard_layer::ShardLayer`]) and frees it
+    /// only after every shard thread has joined, so a peer
+    /// coordinator's still-live socket ring never references unmapped
+    /// pages during teardown. Not forwarded into [`PeerPublish`]: peers
+    /// only need the region's base/len to register it, not ownership.
+    backing_keepalive: Arc<dyn Send + Sync>,
 }
 
-impl RoleCounts {
-    fn from_plan(plan: &Plan) -> Self {
-        let mut c = Self::default();
-        for w in &plan.workers {
-            match w.role {
-                Role::RdmaProgress { .. } => c.progress += 1,
-                Role::RdmaHandler { .. } => c.handlers += 1,
-                Role::NvmeIoUring { .. } => {}
-                Role::NetworkShard { .. } => {}
-            }
+/// One entry in the broadcast peer list every shard receives in phase B.
+/// `shard_index` is the position in the worker-index-sorted shard order,
+/// matching [`stripe_key_to_shard`] and the process `PoolGroup` so
+/// ownership indices are consistent across the data path.
+struct PeerPublish {
+    shard_index: usize,
+    worker_idx: WorkerIdx,
+    backing_base: usize,
+    backing_len: usize,
+    channel: FetchChannel,
+    /// NUMA node this peer shard is pinned to (`None` when unpinned).
+    /// Feeds each shard's NUMA -> serving-shard table so fetches land on
+    /// a shard co-located with the drive that backs the stripe.
+    numa: Option<u16>,
+}
+
+/// Phase-B readiness a shard reports after registering its peers'
+/// backings and building its fan-out surface. Separate from
+/// [`ShardReady`] so the layer can wait for the second rendezvous (peer
+/// registration) independently of the first (fabric/pool bring-up).
+enum PhaseBReport {
+    Ready(WorkerIdx),
+    Failed(String),
+}
+
+/// RAII guard ensuring a shard that has entered phase B reports exactly
+/// once. `report_ready`/`report_failed` send the terminal report and
+/// disarm; if the shard returns early or panics before reporting, `Drop`
+/// sends `Failed` so the layer's bounded phase-B collection never hangs.
+struct PhaseBGuard {
+    widx: WorkerIdx,
+    tx: mpsc::Sender<PhaseBReport>,
+    reported: bool,
+}
+
+impl PhaseBGuard {
+    fn new(widx: WorkerIdx, tx: mpsc::Sender<PhaseBReport>) -> Self {
+        Self {
+            widx,
+            tx,
+            reported: false,
         }
-        c
+    }
+
+    fn report_ready(&mut self) {
+        self.reported = true;
+        let _ = self.tx.send(PhaseBReport::Ready(self.widx));
+    }
+
+    fn report_failed(&mut self, msg: String) {
+        self.reported = true;
+        let _ = self.tx.send(PhaseBReport::Failed(msg));
+    }
+}
+
+impl Drop for PhaseBGuard {
+    fn drop(&mut self) {
+        if !self.reported {
+            let _ = self.tx.send(PhaseBReport::Failed(format!(
+                "worker={}: aborted during phase B bring-up",
+                self.widx.0
+            )));
+        }
     }
 }
 
@@ -1358,7 +1516,7 @@ fn install_signal_handler() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unbounded_storage::topology::NumaPool;
+    use unbounded_storage::topology::{NicWorker, NicWorkerGroup};
 
     use clap::error::ErrorKind;
 
@@ -1375,52 +1533,163 @@ mod tests {
     }
 
     #[test]
-    fn startup_to_plan_config_default_mapping() {
+    fn startup_to_core_plan_config_default_mapping() {
         // The defaults-populated `[startup.topology]` must map to the
-        // historical PlanConfig defaults the old CLI flag defaults
-        // produced.
-        let pc = startup_to_plan_config(&default_topology());
-        let d = PlanConfig::default();
-        assert_eq!(pc.rdma_progress_per_hca, 1);
-        assert_eq!(pc.rdma_handlers_per_hca, 4);
-        assert_eq!(pc.tcp_fallback_threads, 1);
+        // `CorePlanConfig` defaults: nic_workers=4, serving_cores=auto,
+        // and the historical safe placement flags.
+        let cc = startup_to_core_plan_config(&default_topology());
+        let d = CorePlanConfig::default();
+        assert_eq!(cc.nic_workers, 4);
+        assert_eq!(cc.serving_cores, None);
         // Default-off topology flags map to the historical defaults.
-        assert!(!pc.use_smt_siblings);
-        assert!(pc.respect_isolated);
-        assert!(pc.exclude_node_cpu0);
-        assert!(pc.require_active_port);
-        assert!(!pc.disable_rdma);
-        // Fields with no knob retain PlanConfig defaults.
-        assert_eq!(pc.nvme_threads_per_drive, d.nvme_threads_per_drive);
-        assert_eq!(pc.network_shards_per_nic, d.network_shards_per_nic);
-        assert_eq!(pc.require_node_type_ca, d.require_node_type_ca);
+        assert!(!cc.use_smt_siblings);
+        assert!(cc.respect_isolated);
+        assert!(cc.exclude_node_cpu0);
+        assert!(cc.require_active_port);
+        assert!(!cc.disable_rdma);
+        // Fields with no knob retain CorePlanConfig defaults.
+        assert_eq!(cc.require_node_type_ca, d.require_node_type_ca);
     }
 
     #[test]
-    fn startup_to_plan_config_inverts_negative_flags() {
+    fn startup_to_core_plan_config_inverts_negative_flags() {
         // The inverted-sense topology knobs (ignore_isolated,
         // include_node_cpu0, allow_inactive_port) must flip the
-        // corresponding PlanConfig fields, and the numeric counts must
-        // pass through.
+        // corresponding CorePlanConfig fields, and nic_workers /
+        // serving_cores must pass through.
         let topology = config::TopologyCfg {
-            rdma_progress_per_hca: 3,
-            rdma_handlers_per_hca: 7,
-            tcp_fallback_threads: 2,
             use_smt_siblings: true,
             ignore_isolated: true,
             include_node_cpu0: true,
             allow_inactive_port: true,
             disable_rdma: true,
+            serving_cores: 12,
+            nic_workers: 6,
         };
-        let pc = startup_to_plan_config(&topology);
-        assert_eq!(pc.rdma_progress_per_hca, 3);
-        assert_eq!(pc.rdma_handlers_per_hca, 7);
-        assert_eq!(pc.tcp_fallback_threads, 2);
-        assert!(pc.use_smt_siblings);
-        assert!(!pc.respect_isolated);
-        assert!(!pc.exclude_node_cpu0);
-        assert!(!pc.require_active_port);
-        assert!(pc.disable_rdma);
+        let cc = startup_to_core_plan_config(&topology);
+        assert_eq!(cc.nic_workers, 6);
+        assert_eq!(cc.serving_cores, Some(12));
+        assert!(cc.use_smt_siblings);
+        assert!(!cc.respect_isolated);
+        assert!(!cc.exclude_node_cpu0);
+        assert!(!cc.require_active_port);
+        assert!(cc.disable_rdma);
+    }
+
+    #[test]
+    fn startup_to_core_plan_config_zero_nic_workers_defaults() {
+        // A zero `nic_workers` (unset before defaulting) maps to the
+        // CorePlanConfig default of 4, and serving_cores=0 means auto.
+        let topology = config::TopologyCfg {
+            nic_workers: 0,
+            serving_cores: 0,
+            ..default_topology()
+        };
+        let cc = startup_to_core_plan_config(&topology);
+        assert_eq!(cc.nic_workers, 4);
+        assert_eq!(cc.serving_cores, None);
+    }
+
+    #[test]
+    fn assign_shard_devices_decouples_serving_from_hca_count() {
+        // One active HCA but three serving shards: every shard still
+        // gets a device, proving serving capacity is no longer pinned
+        // to the HCA count (the Phase 2.5 decoupling invariant).
+        let plan = CorePlan {
+            storage_cores: vec![],
+            nic_workers: vec![NicWorkerGroup {
+                hca: 0,
+                numa: Some(0),
+                workers: vec![NicWorker {
+                    cpu: 1,
+                    numa: Some(0),
+                }],
+            }],
+            serving_shards: vec![
+                ServingShard {
+                    cpu: 2,
+                    numa: Some(0),
+                },
+                ServingShard {
+                    cpu: 3,
+                    numa: Some(0),
+                },
+                ServingShard {
+                    cpu: 4,
+                    numa: Some(0),
+                },
+            ],
+            numa_pools: vec![],
+        };
+        let devs = assign_shard_devices(&plan, &["mlx5_0".to_string()]);
+        assert_eq!(
+            devs,
+            vec![
+                Some("mlx5_0".to_string()),
+                Some("mlx5_0".to_string()),
+                Some("mlx5_0".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn assign_shard_devices_prefers_numa_local_hca() {
+        // Two HCAs on different nodes; each shard binds the HCA on its
+        // own NUMA node.
+        let plan = CorePlan {
+            storage_cores: vec![],
+            nic_workers: vec![
+                NicWorkerGroup {
+                    hca: 0,
+                    numa: Some(0),
+                    workers: vec![],
+                },
+                NicWorkerGroup {
+                    hca: 1,
+                    numa: Some(1),
+                    workers: vec![],
+                },
+            ],
+            serving_shards: vec![
+                ServingShard {
+                    cpu: 10,
+                    numa: Some(1),
+                },
+                ServingShard {
+                    cpu: 11,
+                    numa: Some(0),
+                },
+            ],
+            numa_pools: vec![],
+        };
+        let devs = assign_shard_devices(&plan, &["mlx5_0".to_string(), "mlx5_1".to_string()]);
+        assert_eq!(
+            devs,
+            vec![Some("mlx5_1".to_string()), Some("mlx5_0".to_string())],
+        );
+    }
+
+    #[test]
+    fn assign_shard_devices_tcp_fallback_when_no_active_hca() {
+        // No NIC-worker groups (RDMA disabled or none usable): every
+        // shard takes the tcp loopback fallback (`None`).
+        let plan = CorePlan {
+            storage_cores: vec![],
+            nic_workers: vec![],
+            serving_shards: vec![
+                ServingShard {
+                    cpu: 2,
+                    numa: Some(0),
+                },
+                ServingShard {
+                    cpu: 3,
+                    numa: Some(0),
+                },
+            ],
+            numa_pools: vec![],
+        };
+        let devs = assign_shard_devices(&plan, &[]);
+        assert_eq!(devs, vec![None, None]);
     }
 
     #[test]
@@ -1519,7 +1788,7 @@ mod tests {
         // These accessors panic if defaults were not applied.
         assert_eq!(cfg.p2p().fingers_per_node, 100);
         assert_eq!(cfg.startup().fabric().listen_addr, "0.0.0.0:0");
-        assert_eq!(cfg.startup().memory().bytes_per_shard, 128 * 1024 * 1024);
+        assert_eq!(cfg.startup().memory().memory_total_bytes, 128 * 1024 * 1024);
     }
 
     #[test]
@@ -1528,64 +1797,6 @@ mod tests {
         // path is allowed to silently fall back to built-in defaults.
         let path = Path::new("/definitely/not/a/real/path/unbounded-storage.toml");
         assert!(load_config(path, true).is_err());
-    }
-
-    #[test]
-    fn role_counts_aggregate_per_role() {
-        // Synthetic plan: 2 progress, 3 handlers, 1 nvme. We do not
-        // route this through `Plan::for_host`; we just want to
-        // confirm `RoleCounts::from_plan` walks the worker list
-        // correctly because main.rs feeds that into the startup
-        // observability line. NvmeIoUring workers are intentionally
-        // not counted: the production daemon no longer pins per-disk
-        // progress threads from the topology plan, so any such
-        // worker that survives in a synthetic fixture is ignored.
-        let plan = Plan {
-            workers: vec![
-                Worker {
-                    cpu: 1,
-                    numa: Some(0),
-                    role: Role::NvmeIoUring { nvme: 0 },
-                },
-                Worker {
-                    cpu: 2,
-                    numa: Some(0),
-                    role: Role::RdmaProgress { hca: 0 },
-                },
-                Worker {
-                    cpu: 3,
-                    numa: Some(0),
-                    role: Role::RdmaProgress { hca: 1 },
-                },
-                Worker {
-                    cpu: 4,
-                    numa: Some(0),
-                    role: Role::RdmaHandler { hca: 0 },
-                },
-                Worker {
-                    cpu: 5,
-                    numa: Some(0),
-                    role: Role::RdmaHandler { hca: 0 },
-                },
-                Worker {
-                    cpu: 6,
-                    numa: Some(0),
-                    role: Role::RdmaHandler { hca: 1 },
-                },
-            ],
-            numa_pools: vec![NumaPool {
-                numa: 0,
-                workers: 6,
-            }],
-        };
-        let c = RoleCounts::from_plan(&plan);
-        assert_eq!(
-            c,
-            RoleCounts {
-                progress: 2,
-                handlers: 3,
-            }
-        );
     }
 
     fn backend_spec(id: &str) -> BackendSpec {

@@ -77,6 +77,16 @@ UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
 UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
 CARGO ?= cargo
 
+# Optional cargo features for unbounded-storage release builds. Set
+# UNBOUNDED_STORAGE_PROFILING=1 to compile in the SIGUSR1 CPU profiler
+# (see cmd/unbounded-storage/src/profiling.rs); this threads through
+# unbounded-storage-build and therefore the tarball/push dev workflow.
+ifeq ($(UNBOUNDED_STORAGE_PROFILING),1)
+UNBOUNDED_STORAGE_CARGO_FEATURES := --features profiling
+else
+UNBOUNDED_STORAGE_CARGO_FEATURES :=
+endif
+
 # libfabric is built from source because distro packages predate the
 # merge of the experimental `net` provider into `tcp` (libfabric 2.0),
 # so they lack a native FI_EP_RDM `tcp` provider. We pin a recent
@@ -222,6 +232,7 @@ help: ## Show this help
 	@echo ""
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
+	@echo "  UNBOUNDED_STORAGE_PROFILING=1     Set on any build/push to compile in the SIGUSR1 CPU profiler"
 	@echo "  unbounded-storage-smoke          Run the end-to-end smoke test (uses sudo)"
 	@echo "  unbounded-storage-tarball        Package unbounded-storage + libfabric into a release tarball"
 	@echo "  unbounded-storage-push           Push the unbounded-storage release tarball to Azure blob storage"
@@ -550,11 +561,11 @@ libfabric: $(LIBFABRIC_STAMP) ## Build/install the pinned libfabric ($(LIBFABRIC
 unbounded-storage-check: $(LIBFABRIC_STAMP) ## Run cargo check for unbounded-storage
 	$(CARGO_FABRIC_ENV) $(CARGO) check --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
 
-unbounded-storage-test: $(LIBFABRIC_STAMP) ## Run cargo tests for unbounded-storage
-	$(CARGO_FABRIC_ENV) $(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
+unbounded-storage-test: $(LIBFABRIC_STAMP) ## Run cargo tests for unbounded-storage (includes the profiling feature so it always compiles)
+	$(CARGO_FABRIC_ENV) $(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets --features profiling
 
-unbounded-storage-build: $(LIBFABRIC_STAMP) ## Build the unbounded-storage binary (no test)
-	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
+unbounded-storage-build: $(LIBFABRIC_STAMP) ## Build the unbounded-storage binary (no test; UNBOUNDED_STORAGE_PROFILING=1 adds the CPU profiler)
+	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked $(UNBOUNDED_STORAGE_CARGO_FEATURES)
 	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
 
@@ -639,9 +650,18 @@ unbounded-storage-push: unbounded-storage-tarball ## Push the unbounded-storage 
 		--account-name $(STORAGE_BLOB_ACCOUNT) \
 		--account-key $(AZURE_STORAGE_KEY) \
 		--overwrite
+	@az storage blob upload \
+		--file hack/scripts/gen-storage-mesh-config.sh \
+		--container-name $(STORAGE_BLOB_CONTAINER) \
+		--name $(VERSION)/gen-config.sh \
+		--account-name $(STORAGE_BLOB_ACCOUNT) \
+		--account-key $(AZURE_STORAGE_KEY) \
+		--overwrite
 	@echo "Uploaded $(STORAGE_TARBALL_STEM).tar.gz to https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
 	@echo "Install with:"
 	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/install.sh | bash -s -- https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
+	@echo "Generate a mesh config with:"
+	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/gen-config.sh | bash"
 
 bench: $(LIBFABRIC_STAMP) ## Build the bench tool (excluded from images)
 	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench

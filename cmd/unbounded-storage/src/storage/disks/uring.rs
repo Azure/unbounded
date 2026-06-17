@@ -408,6 +408,7 @@ fn engine_config_from(spec: &DiskSpec) -> EngineConfig {
     }
     cfg.bypass_admission = spec.bypass_admission;
     cfg.skip_recovery_scan_if_no_meta = spec.skip_recovery_scan_if_no_meta;
+    cfg.disk_id = spec.path.clone();
     cfg
 }
 

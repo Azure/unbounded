@@ -49,7 +49,7 @@ fn backing(base: *mut u8, page_size: usize, page_count: usize) -> Backing {
         base,
         page_size,
         page_count,
-        _own: Box::new(()),
+        keepalive: std::sync::Arc::new(()),
     }
 }
 const PAGE_TYPE_META: u8 = 3;
