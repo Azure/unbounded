@@ -549,7 +549,7 @@ $(LIBFABRIC_STAMP):
 	@mkdir -p $(CURDIR)/tmp/libfabric/src
 	@curl -fsSL $(LIBFABRIC_URL) | tar -xj -C $(CURDIR)/tmp/libfabric/src --strip-components=1
 	cd $(CURDIR)/tmp/libfabric/src && ./configure --prefix=$(LIBFABRIC_PREFIX) \
-		--enable-tcp=yes --with-uring=yes --disable-verbs --disable-rxm \
+		--enable-tcp=yes --with-uring=yes --enable-verbs=yes --enable-rxm=yes \
 		--disable-sockets --disable-psm3 --disable-efa --disable-shm
 	$(MAKE) -C $(CURDIR)/tmp/libfabric/src -j$$(nproc)
 	$(MAKE) -C $(CURDIR)/tmp/libfabric/src install

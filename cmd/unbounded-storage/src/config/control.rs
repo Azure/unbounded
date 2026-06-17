@@ -571,12 +571,18 @@ mod tests {
         c.p2p.as_mut().unwrap().local_node_id = Some(0);
         c.peers.push(crate::config::PeerSpec {
             id: 1,
-            transport: 0,
-            address: "127.0.0.1:9999".to_string(),
+            address: Some(socket_addr("127.0.0.1:9999")),
             hca_numa: None,
             labels: Vec::new(),
         });
         c
+    }
+
+    fn socket_addr(addr: impl Into<String>) -> crate::config::FabricAddress {
+        crate::config::FabricAddress {
+            socket: addr.into(),
+            native: String::new(),
+        }
     }
 
     #[test]
@@ -615,8 +621,7 @@ mod tests {
         let mut next = config_with_peer(2);
         next.peers.push(crate::config::PeerSpec {
             id: 2,
-            transport: 0,
-            address: "127.0.0.1:9998".to_string(),
+            address: Some(socket_addr("127.0.0.1:9998")),
             hca_numa: None,
             labels: Vec::new(),
         });
@@ -670,8 +675,7 @@ mod tests {
         let mut next = config_with_peer(5);
         next.peers.push(crate::config::PeerSpec {
             id: 2,
-            transport: 0,
-            address: "127.0.0.1:9998".to_string(),
+            address: Some(socket_addr("127.0.0.1:9998")),
             hca_numa: None,
             labels: Vec::new(),
         });
@@ -708,8 +712,7 @@ mod tests {
         let mut next = config_with_peer(11);
         next.peers.push(crate::config::PeerSpec {
             id: 2,
-            transport: 0,
-            address: "127.0.0.1:9998".to_string(),
+            address: Some(socket_addr("127.0.0.1:9998")),
             hca_numa: None,
             labels: Vec::new(),
         });
@@ -741,8 +744,7 @@ mod tests {
         let mut failing = config_with_peer(7);
         failing.peers.push(crate::config::PeerSpec {
             id: 2,
-            transport: 0,
-            address: "127.0.0.1:9998".to_string(),
+            address: Some(socket_addr("127.0.0.1:9998")),
             hca_numa: None,
             labels: Vec::new(),
         });
@@ -757,8 +759,7 @@ mod tests {
         let mut next = config_with_peer(8);
         next.peers.push(crate::config::PeerSpec {
             id: 3,
-            transport: 0,
-            address: "127.0.0.1:9997".to_string(),
+            address: Some(socket_addr("127.0.0.1:9997")),
             hca_numa: None,
             labels: Vec::new(),
         });

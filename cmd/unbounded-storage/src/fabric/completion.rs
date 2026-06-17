@@ -90,6 +90,9 @@ pub struct CompletionInfo {
     pub tag: u64,
     pub src_addr: u64,
     pub op_context: usize,
+    /// Remote CQ immediate data (`FI_REMOTE_CQ_DATA`), valid only on
+    /// completions whose `flags` carry that bit; zero otherwise.
+    pub data: u64,
 }
 
 pub(crate) struct SlotInner {
@@ -344,6 +347,7 @@ mod tests {
             tag: 0,
             src_addr: 0,
             op_context: raw as usize,
+            data: 0,
         }));
         drop(reclaimed);
         assert_eq!(reg.live_count(), 0);
@@ -429,6 +433,7 @@ mod tests {
             tag: 0,
             src_addr: 0,
             op_context: raw as usize,
+            data: 0,
         }));
         drop(reclaimed);
 
@@ -450,6 +455,7 @@ mod tests {
             tag: 7,
             src_addr: 9,
             op_context: 0,
+            data: 0,
         });
         match ok.into_io_result() {
             Ok(c) => assert_eq!(c.bytes, 4096),

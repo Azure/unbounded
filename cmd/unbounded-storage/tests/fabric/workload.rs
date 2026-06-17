@@ -95,7 +95,7 @@ pub fn run_workload(w: Workload) -> RunReport {
         w.dest_base as usize,
         w.dest_pages as usize * HUGEPAGE_2MB,
     );
-    let header = RequestHeader::new(w.request_id, &dest_mr, w.dest_pages, w.src, MAX_HOPS);
+    let header = RequestHeader::new(w.request_id, 0, &dest_mr, w.dest_pages, w.src, MAX_HOPS);
     let request_plan = RequestPlan {
         dest_mr_base: header.dest_mr_base,
         dest_pages: header.dest_pages,
