@@ -5,6 +5,9 @@ name: unbounded metalman smoke test
 
 on:
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "designs/**"
   push:
     branches: [main]
     paths:
