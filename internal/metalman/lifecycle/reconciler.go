@@ -17,6 +17,8 @@ import (
 )
 
 const (
+	cloudInitReasonTimedOut = "TimedOut"
+
 	repaveTimeout = 30 * time.Minute // TODO: Make this configurable
 )
 
@@ -43,6 +45,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
+	if retryCloudInitTimeout(&node) {
+		log.Info("cloud-init timed out after repave, triggering retry")
+
+		return ctrl.Result{}, r.Client.Status().Update(ctx, &node)
+	}
+
 	pendingRepave := node.Spec.Operations.RepaveCounter > node.Status.Operations.RepaveCounter
 	if !pendingRepave {
 		return ctrl.Result{}, nil
@@ -59,11 +67,38 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	log.Info("repave timed out, triggering retry", "elapsed", elapsed)
+	retryRepaveBoot(&node)
+
+	return ctrl.Result{}, r.Client.Status().Update(ctx, &node)
+}
+
+func retryCloudInitTimeout(node *v1alpha3.Machine) bool {
+	cloudInitCond := meta.FindStatusCondition(node.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cloudInitCond == nil || cloudInitCond.Status != metav1.ConditionUnknown || cloudInitCond.Reason != cloudInitReasonTimedOut {
+		return false
+	}
+
+	if node.Spec.Operations.RebootCounter <= 0 || node.Spec.Operations.RepaveCounter <= 0 {
+		return false
+	}
+
+	if node.Status.Operations.RebootCounter < node.Spec.Operations.RebootCounter ||
+		node.Status.Operations.RepaveCounter < node.Spec.Operations.RepaveCounter {
+		return false
+	}
+
+	meta.RemoveStatusCondition(&node.Status.Conditions, v1alpha3.MachineConditionRepaved)
+	meta.RemoveStatusCondition(&node.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	node.Status.Operations.RebootCounter = node.Spec.Operations.RebootCounter - 1
+	node.Status.Operations.RepaveCounter = node.Spec.Operations.RepaveCounter - 1
+
+	return true
+}
+
+func retryRepaveBoot(node *v1alpha3.Machine) {
 	meta.RemoveStatusCondition(&node.Status.Conditions, v1alpha3.MachineConditionRepaved)
 
 	if node.Status.Operations.RebootCounter > 0 {
 		node.Status.Operations.RebootCounter--
 	}
-
-	return ctrl.Result{}, r.Client.Status().Update(ctx, &node)
 }

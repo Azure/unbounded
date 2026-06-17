@@ -5,6 +5,7 @@
 //! allocator that maps or heap-allocates one.
 
 use std::fmt;
+use std::sync::Arc;
 
 use super::numa::mbind_to_node;
 
@@ -14,7 +15,7 @@ pub const HUGEPAGE_2MB: usize = 2 * 1024 * 1024;
 
 /// Pinned, NUMA-local backing. The embedder allocates it (e.g.
 /// `mmap(MAP_HUGETLB | MAP_HUGE_2MB)`); the pool just carves pages
-/// out of it. `_own` holds the Drop handle for the underlying
+/// out of it. `keepalive` holds the Drop handle for the underlying
 /// allocation; the pool never touches it.
 ///
 /// `base` is a raw pointer, so `Backing` is `!Send + !Sync` by
@@ -26,9 +27,17 @@ pub struct Backing {
     pub base: *mut u8,
     pub page_size: usize,
     pub page_count: usize,
-    /// Drop carrier for the underlying allocation. The pool never
-    /// touches this; it exists so the mapping outlives the pool.
-    pub _own: Box<dyn Send + Sync>,
+    /// Shared Drop carrier for the underlying allocation. The pool
+    /// never touches this; it exists so the mapping outlives the pool.
+    /// It is an `Arc` (not a `Box`) so the shard layer can hold an
+    /// independent reference and keep every shard's backing mapped
+    /// until *all* shard threads have joined: a coordinator shard's
+    /// io_uring ring may still hold a peer shard's pages as a
+    /// registered `SEND_ZC` source after that peer's `Pool` (and its
+    /// `Backing` handle) has dropped, so the physical mapping must not
+    /// be freed until the last ring referencing it is gone. See
+    /// [`Backing::keepalive`].
+    pub keepalive: Arc<dyn Send + Sync>,
 }
 
 // SAFETY: per-NUMA pinning is the embedder's responsibility (see
@@ -38,6 +47,17 @@ pub struct Backing {
 // pinned executor thread.
 unsafe impl Send for Backing {}
 unsafe impl Sync for Backing {}
+
+impl Backing {
+    /// Clone the shared Drop carrier so a caller can keep the
+    /// underlying allocation mapped independently of this `Backing`
+    /// value's lifetime. The shard layer uses this to retain every
+    /// shard's backing until all shard threads (and thus every
+    /// io_uring ring that may reference a peer's pages) have joined.
+    pub fn keepalive(&self) -> Arc<dyn Send + Sync> {
+        self.keepalive.clone()
+    }
+}
 
 impl fmt::Debug for Backing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -228,7 +248,7 @@ fn allocate_hugepage(
         base: ptr as *mut u8,
         page_size,
         page_count,
-        _own: Box::new(HugepageOwner { ptr, size }),
+        keepalive: Arc::new(HugepageOwner { ptr, size }),
     })
 }
 
@@ -249,7 +269,7 @@ fn allocate_heap(
         base: ptr,
         page_size,
         page_count,
-        _own: Box::new(HeapOwner { ptr, layout }),
+        keepalive: Arc::new(HeapOwner { ptr, layout }),
     })
 }
 

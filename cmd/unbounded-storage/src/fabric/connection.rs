@@ -107,6 +107,9 @@ impl Fabric {
             unsafe {
                 let _ = ffi::ub_fi_av_remove(self.inner().av(), &mut prev, 1, 0);
             }
+        } else {
+            // A brand-new peer (not a replacement) grows the table.
+            crate::metrics::fabric_connections_delta(1);
         }
         Ok(())
     }
@@ -128,7 +131,9 @@ impl Fabric {
         };
         // SAFETY: `fi_addr` was previously inserted via `fi_av_insert`.
         let rc = unsafe { ffi::ub_fi_av_remove(self.inner().av(), &mut fi_addr, 1, 0) };
-        check("fi_av_remove", rc)
+        check("fi_av_remove", rc)?;
+        crate::metrics::fabric_connections_delta(-1);
+        Ok(())
     }
 
     /// Snapshot of currently-known peers.

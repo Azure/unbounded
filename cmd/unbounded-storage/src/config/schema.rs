@@ -46,8 +46,8 @@ impl Config {
         let startup = self.startup.get_or_insert_with(StartupCfg::default);
 
         let memory = startup.memory.get_or_insert_with(MemoryCfg::default);
-        if memory.bytes_per_shard == 0 {
-            memory.bytes_per_shard = 128 * 1024 * 1024;
+        if memory.memory_total_bytes == 0 {
+            memory.memory_total_bytes = 128 * 1024 * 1024;
         }
 
         let fabric = startup.fabric.get_or_insert_with(FabricCfg::default);
@@ -68,15 +68,16 @@ impl Config {
         }
 
         let topology = startup.topology.get_or_insert_with(TopologyCfg::default);
-        if topology.rdma_progress_per_hca == 0 {
-            topology.rdma_progress_per_hca = 1;
+        if topology.nic_workers == 0 {
+            topology.nic_workers = 4;
         }
-        if topology.rdma_handlers_per_hca == 0 {
-            topology.rdma_handlers_per_hca = 4;
-        }
-        if topology.tcp_fallback_threads == 0 {
-            topology.tcp_fallback_threads = 1;
-        }
+        // `serving_cores` keeps its proto3 zero, which the planner reads
+        // as "auto-fill every usable core".
+
+        // Metrics: the exporter is opt-in, so an empty bind (the proto3
+        // zero value) is the intended "disabled" default and is left as
+        // is. Materialize the section so the accessor never panics.
+        startup.metrics.get_or_insert_with(MetricsCfg::default);
     }
 
     /// P2p section. Panics if called before [`Config::apply_defaults`]
@@ -109,6 +110,11 @@ impl StartupCfg {
     pub fn topology(&self) -> &TopologyCfg {
         self.topology.as_ref().expect("topology section populated")
     }
+
+    /// Metrics section. Valid after [`Config::apply_defaults`].
+    pub fn metrics(&self) -> &MetricsCfg {
+        self.metrics.as_ref().expect("metrics section populated")
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +133,14 @@ mod tests {
         assert!(c.disks.is_empty());
         assert!(c.backends.is_empty());
         assert!(c.frontends.is_empty());
+    }
+
+    #[test]
+    fn metrics_section_defaults_to_disabled() {
+        let mut c: Config = toml::from_str("").unwrap();
+        c.apply_defaults();
+        // The exporter is opt-in: the bind stays empty unless configured.
+        assert_eq!(c.startup().metrics().bind, "");
     }
 
     #[test]
@@ -343,15 +357,15 @@ backend = "b"
         c.apply_defaults();
         let s = c.startup();
         assert!(!s.memory().no_hugepages);
-        assert_eq!(s.memory().bytes_per_shard, 128 * 1024 * 1024);
+        assert_eq!(s.memory().memory_total_bytes, 128 * 1024 * 1024);
         assert_eq!(s.fabric().listen_addr, "0.0.0.0:0");
         assert_eq!(s.fabric().progress_threads, 2);
         assert_eq!(s.fabric().progress_poll_us, 10);
         assert_eq!(s.fabric().rpc_worker_threads, 4);
         assert_eq!(s.fabric().max_inflight, 1024);
-        assert_eq!(s.topology().rdma_progress_per_hca, 1);
-        assert_eq!(s.topology().rdma_handlers_per_hca, 4);
-        assert_eq!(s.topology().tcp_fallback_threads, 1);
+        assert_eq!(s.topology().nic_workers, 4);
+        // `serving_cores` stays at its proto3 zero (auto-fill).
+        assert_eq!(s.topology().serving_cores, 0);
         // The inverted-sense flags default to false so the historical
         // safe behavior (respect isolated, exclude cpu0, require active
         // port) is preserved.
@@ -367,7 +381,7 @@ backend = "b"
         let s = r#"
 [startup.memory]
 no_hugepages = true
-bytes_per_shard = 67108864
+memory_total_bytes = 67108864
 
 [startup.fabric]
 listen_addr = "10.0.0.1:7000"
@@ -377,33 +391,31 @@ rpc_worker_threads = 8
 max_inflight = 2048
 
 [startup.topology]
-rdma_progress_per_hca = 2
-rdma_handlers_per_hca = 6
-tcp_fallback_threads = 4
 use_smt_siblings = true
 ignore_isolated = true
 include_node_cpu0 = true
 allow_inactive_port = true
 disable_rdma = true
+serving_cores = 12
+nic_workers = 6
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         let st = c.startup();
         assert!(st.memory().no_hugepages);
-        assert_eq!(st.memory().bytes_per_shard, 64 * 1024 * 1024);
+        assert_eq!(st.memory().memory_total_bytes, 64 * 1024 * 1024);
         assert_eq!(st.fabric().listen_addr, "10.0.0.1:7000");
         assert_eq!(st.fabric().progress_threads, 3);
         assert_eq!(st.fabric().progress_poll_us, 25);
         assert_eq!(st.fabric().rpc_worker_threads, 8);
         assert_eq!(st.fabric().max_inflight, 2048);
-        assert_eq!(st.topology().rdma_progress_per_hca, 2);
-        assert_eq!(st.topology().rdma_handlers_per_hca, 6);
-        assert_eq!(st.topology().tcp_fallback_threads, 4);
         assert!(st.topology().use_smt_siblings);
         assert!(st.topology().ignore_isolated);
         assert!(st.topology().include_node_cpu0);
         assert!(st.topology().allow_inactive_port);
         assert!(st.topology().disable_rdma);
+        assert_eq!(st.topology().serving_cores, 12);
+        assert_eq!(st.topology().nic_workers, 6);
     }
 
     #[test]
@@ -415,6 +427,6 @@ disable_rdma = true
         // unset siblings keep their documented defaults.
         assert_eq!(c.startup().fabric().progress_threads, 7);
         assert_eq!(c.startup().fabric().rpc_worker_threads, 4);
-        assert_eq!(c.startup().memory().bytes_per_shard, 128 * 1024 * 1024);
+        assert_eq!(c.startup().memory().memory_total_bytes, 128 * 1024 * 1024);
     }
 }

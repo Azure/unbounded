@@ -306,6 +306,9 @@ unsafe extern "C" {
     pub fn ub_fi_build_hints(prov_name: *const c_char) -> *mut fi_info;
     pub fn ub_fi_info_fabric_attr(info: *mut fi_info) -> *mut fi_fabric_attr;
     pub fn ub_fi_info_mr_mode(info: *mut fi_info) -> c_int;
+    pub fn ub_fi_info_threading(info: *mut fi_info) -> c_int;
+    pub fn ub_fi_thread_safe_value() -> c_int;
+    pub fn ub_fi_info_mr_cnt(info: *mut fi_info) -> usize;
 
     pub fn ub_fi_eagain() -> c_int;
     pub fn ub_fi_eavail() -> c_int;

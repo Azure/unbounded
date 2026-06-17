@@ -41,7 +41,7 @@
 //! drive's NUMA domain. We satisfy that by spawning one OS shard
 //! thread per (device, thread-slot) pair via the crate's
 //! `runtime::PinnedRuntime`, with placement derived from
-//! `topology::Plan`. Each storage-core thread installs its own
+//! `topology::CorePlan`. Each storage-core thread installs its own
 //! `StorageRing` into the thread-local registry, then builds a
 //! `CoreLocalDevice` (which resolves that ring), a `StorageEngine`,
 //! hugepage `Backing`, and a single-engine `LocalStorage` so the
@@ -76,11 +76,10 @@ use unbounded_storage::runtime::{
 };
 use unbounded_storage::storage::blockdev::{BlockDevice, CoreLocalDevice, OpenDisk, UringDevice};
 use unbounded_storage::storage::{EngineConfig, LocalStorage, StorageEngine};
-use unbounded_storage::topology::{Host, Nvme, Plan, PlanConfig, Role};
+use unbounded_storage::topology::{CorePlan, CorePlanConfig, Host, Nvme};
 
 #[path = "bench/transport.rs"]
 mod transport;
-
 
 const _: () = assert!(HUGEPAGE_2MB == 2 * 1024 * 1024);
 
@@ -100,8 +99,8 @@ const PAGE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_SEED: u64 = 0xBE_DE_CA_FE_u64;
 
 /// Default IO threads per NVMe drive. Matches the design's "fixed
-/// small N (e.g. 2-4) per drive" guidance and mirrors
-/// `PlanConfig::nvme_threads_per_drive`'s default.
+/// small N (e.g. 2-4) per drive" guidance; the bench uses it to size
+/// its own per-device workload sharding.
 const DEFAULT_THREADS_PER_DEVICE: usize = 2;
 
 /// Latency-sample ring per worker. Picked to bound memory while
@@ -273,9 +272,8 @@ fn run_block(args: BlockArgs) -> ExitCode {
     // fall back to an unpinned runtime so the bench still runs in
     // containers / dev hosts. We only spawn one OS thread per
     // device because all shards on a device share a single
-    // `StorageEngine` (see `run_device`); see `build_pinned_specs`
-    // for how `threads_per_device` still influences CPU planning.
-    let pinned_specs = build_pinned_specs(&args.device, threads_per_device);
+    // `StorageEngine` (see `run_device`).
+    let pinned_specs = build_pinned_specs(&args.device);
     let runtime: Arc<dyn Threading> = match pinned_specs {
         Some(specs) => {
             debug_assert_eq!(specs.len(), num_devices);
@@ -411,13 +409,11 @@ fn run_block(args: BlockArgs) -> ExitCode {
 /// prints a warning and returns `None` to signal "no pinning
 /// available, use a `DefaultRuntime` fallback".
 ///
-/// `threads_per_device` is still consulted so the topology planner
-/// reserves disjoint CPU sets per drive (the bench then picks the
-/// first slot for the device's owning OS thread). The remaining
-/// pinned slots are not used as OS threads today: all shards on a
-/// given device share one engine and one ring on one OS thread to
-/// preserve crash-consistency invariants on the device's LBA space.
-fn build_pinned_specs(devices: &[PathBuf], threads_per_device: usize) -> Option<Vec<WorkerSpec>> {
+/// The three-class [`CorePlan`] reserves exactly one storage core per
+/// NVMe drive, NUMA-local where possible and disjoint from every other
+/// pinned core, so the bench pins each device's owning OS thread to its
+/// drive's storage core.
+fn build_pinned_specs(devices: &[PathBuf]) -> Option<Vec<WorkerSpec>> {
     let host = Host::discover();
     if host.cpus.is_empty() {
         eprintln!(
@@ -451,12 +447,10 @@ fn build_pinned_specs(devices: &[PathBuf], threads_per_device: usize) -> Option<
         matched_nvmes.push(nvme);
     }
 
-    // Build a synthetic Host with just the matched NVMes (in
-    // --device order) and no HCAs / TCP fallback. Plan::for_host
-    // then schedules CPUs disjointly across `threads_per_device`
-    // workers per drive, NUMA-local where possible. We pass an
-    // explicit PlanConfig overriding only the knobs we care about
-    // here.
+    // Build a synthetic Host with just the matched NVMes (in --device
+    // order) and no HCAs. CorePlan::for_host then reserves one
+    // NUMA-local storage core per drive, disjoint from every other
+    // pinned core.
     let synthetic = Host {
         cpus: host.cpus.clone(),
         numa_nodes: host.numa_nodes.clone(),
@@ -465,38 +459,21 @@ fn build_pinned_specs(devices: &[PathBuf], threads_per_device: usize) -> Option<
         nics: Vec::new(),
         isolated: host.isolated.clone(),
     };
-    let cfg = PlanConfig {
-        nvme_threads_per_drive: threads_per_device,
-        rdma_progress_per_hca: 0,
-        rdma_handlers_per_hca: 0,
-        tcp_fallback_threads: 0,
-        ..Default::default()
-    };
-    let plan = Plan::for_host(&synthetic, &cfg);
+    let plan = CorePlan::for_host(&synthetic, &CorePlanConfig::default());
 
-    // Take the first plan worker per drive as the device's owning
-    // OS thread; the remaining `threads_per_device - 1` planner
-    // slots stay disjoint from other drives but are not used as
-    // separate OS threads (see the function doc).
-    let all_nvme: Vec<&_> = plan
-        .workers
-        .iter()
-        .filter(|w| matches!(w.role, Role::NvmeIoUring { .. }))
-        .collect();
-    let expected_total = devices.len() * threads_per_device;
-    if all_nvme.len() != expected_total {
+    // Exactly one storage core per drive, in --device order.
+    if plan.storage_cores.len() != devices.len() {
         eprintln!(
-            "bench: topology plan produced {} nvme workers, expected {}; pinning disabled",
-            all_nvme.len(),
-            expected_total,
+            "bench: topology plan produced {} storage cores, expected {}; pinning disabled",
+            plan.storage_cores.len(),
+            devices.len(),
         );
         return None;
     }
-    let specs: Vec<WorkerSpec> = (0..devices.len())
-        .map(|device_idx| {
-            let w = all_nvme[device_idx * threads_per_device];
-            WorkerSpec::new(w.cpu, w.numa)
-        })
+    let specs: Vec<WorkerSpec> = plan
+        .storage_cores
+        .iter()
+        .map(|sc| WorkerSpec::new(sc.cpu, sc.numa))
         .collect();
     Some(specs)
 }

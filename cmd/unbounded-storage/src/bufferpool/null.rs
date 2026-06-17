@@ -89,7 +89,7 @@ mod tests {
             base: std::ptr::null_mut(),
             page_size: 4096,
             page_count: 0,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         assert!(s.register_pages(&backing).is_ok());
     }

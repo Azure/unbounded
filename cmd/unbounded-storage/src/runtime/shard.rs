@@ -97,6 +97,19 @@ impl ShardLoop {
         self.tick_hooks.push(Box::new(hook));
     }
 
+    /// A clone of the shard's flag-flipping waker (see [`flag_waker`]).
+    ///
+    /// Tick hooks that poll their own futures (rather than spawning them
+    /// onto the loop) should poll with this waker instead of a noop one
+    /// so a cross-thread completion (a disk reply or fabric event landing
+    /// on another core) sets the shard's `wake_flag` and suppresses the
+    /// next idle park. Without it such a hook would have to report itself
+    /// perpetually busy to force re-polling, which busy-spins the shard
+    /// thread and starves co-located threads on a CPU-constrained host.
+    pub fn waker(&self) -> Waker {
+        self.waker.clone()
+    }
+
     /// Run every tick hook then poll every live future once, dropping
     /// any future that completed. Returns whether the iteration was
     /// *busy*: true if any tick hook reported work (futures completing

@@ -36,30 +36,6 @@ impl PinnedRuntime {
         Arc::new(Self { workers })
     }
 
-    /// Build a runtime from a topology [`Plan`](crate::topology::Plan),
-    /// keeping only workers for which `filter` returns true, in the
-    /// plan's iteration order. Each retained worker maps to a
-    /// [`WorkerSpec`] over its CPU and NUMA node, so `WorkerIdx(i)`
-    /// addresses the i-th retained worker. Because the order is
-    /// preserved, callers that independently filter `plan.workers`
-    /// with the *same* predicate get a matching index space.
-    pub fn from_plan(
-        plan: &crate::topology::Plan,
-        filter: impl Fn(&crate::topology::Worker) -> bool,
-    ) -> Arc<Self> {
-        let workers = plan
-            .workers
-            .iter()
-            .filter(|w| filter(w))
-            .map(|w| WorkerSpec::new(w.cpu, w.numa))
-            .collect::<Vec<_>>();
-        assert!(
-            !workers.is_empty(),
-            "PinnedRuntime::from_plan: no workers matched the filter"
-        );
-        Self::new(workers)
-    }
-
     /// Spawn a named OS thread and, when `spec` is `Some`, pin it
     /// (CPU affinity + NUMA mempolicy) inside the new thread before
     /// running `f`. `None` spawns an unpinned thread. This is the one

@@ -9,11 +9,12 @@
 //! [`UringDiskTarget`]; tests plug in a mock target.
 //!
 //! CPU placement for disk storage cores comes from the topology
-//! [`Plan`](crate::topology::Plan): the registry is seeded with the
-//! plan's [`DiskCpuSlot`](crate::topology::DiskCpuSlot)s (one per
-//! `Role::NvmeIoUring` worker), which are disjoint from the shard
-//! CPUs by construction. On each reconcile a deterministic assignment
-//! maps disks to slots, preferring NUMA-local slots; disks beyond the
+//! [`CorePlan`](crate::topology::CorePlan): the registry is seeded with
+//! one [`DiskCpuSlot`](crate::topology::DiskCpuSlot) per
+//! [`StorageCore`](crate::topology::StorageCore) (one per NVMe drive),
+//! which are disjoint from the NIC-worker and serving-shard CPUs by
+//! construction. On each reconcile a deterministic assignment maps
+//! disks to slots, preferring NUMA-local slots; disks beyond the
 //! available slot count run unpinned.
 //!
 //! Each successful open returns both a per-disk handle (whose `Drop`
@@ -194,12 +195,23 @@ impl<T: DiskTarget> DiskRegistry<T> {
     /// Snapshot of currently-open page channels suitable for handing
     /// to [`DiskChannelDirectory::apply_channels`]. Returned in
     /// path-sorted order so downstream hashing is stable across
-    /// reconciles.
-    pub fn channels_snapshot(&self) -> Vec<(PathBuf, PageChannel)> {
-        let mut out: Vec<(PathBuf, PageChannel)> = self
+    /// reconciles. Each entry carries the drive's NUMA node, taken
+    /// from its assigned CPU slot (the node its storage core runs on);
+    /// an unpinned disk carries `None`. The router uses this to keep a
+    /// stripe's serving shard on the same node as its disk.
+    pub fn channels_snapshot(&self) -> Vec<(PathBuf, PageChannel, Option<u16>)> {
+        let mut out: Vec<(PathBuf, PageChannel, Option<u16>)> = self
             .channels
             .iter()
-            .map(|(p, c)| (p.clone(), c.clone()))
+            .map(|(p, c)| {
+                let numa = self
+                    .placement
+                    .get(p)
+                    .copied()
+                    .flatten()
+                    .and_then(|s| s.numa);
+                (p.clone(), c.clone(), numa)
+            })
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -752,13 +764,42 @@ mod tests {
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/c", None), spec("/a", None), spec("/b", None)]);
         let snap = reg.channels_snapshot();
-        let paths: Vec<PathBuf> = snap.into_iter().map(|(p, _)| p).collect();
+        let paths: Vec<PathBuf> = snap.into_iter().map(|(p, _, _)| p).collect();
         assert_eq!(
             paths,
             vec![
                 PathBuf::from("/a"),
                 PathBuf::from("/b"),
                 PathBuf::from("/c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn channels_snapshot_carries_numa_from_placement() {
+        // The published NUMA per drive is the node of its assigned CPU
+        // slot; a disk that ran out of NUMA-local slots and fell back
+        // to unpinned carries None. Mirrors `cpu_hint_per_disk_from_slots`.
+        let slots = vec![slot(7, Some(0)), slot(11, Some(1))];
+        let (target, _state) = MockDiskTarget::new();
+        let mut reg = DiskRegistry::new(target, slots);
+        let mut d0 = spec("/a", None);
+        d0.numa = Some(0);
+        let mut d1 = spec("/b", None);
+        d1.numa = Some(1);
+        let d2 = spec("/c", None); // unpinned: both NUMA slots taken
+        reg.reconcile(&[d0, d1, d2]);
+        let numa: Vec<(PathBuf, Option<u16>)> = reg
+            .channels_snapshot()
+            .into_iter()
+            .map(|(p, _, n)| (p, n))
+            .collect();
+        assert_eq!(
+            numa,
+            vec![
+                (PathBuf::from("/a"), Some(0)),
+                (PathBuf::from("/b"), Some(1)),
+                (PathBuf::from("/c"), None),
             ]
         );
     }

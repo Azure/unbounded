@@ -126,7 +126,8 @@ queue_depth = 32                 # optional u32; per-disk io_uring depth.
 
 [startup.memory]                 # startup-fixed; read once at process start.
 no_hugepages   = false           # true allocates per-shard backing from the heap.
-bytes_per_shard = 134217728      # u64 bytes (no K/M/G suffix). 0 -> 128 MiB.
+memory_total_bytes = 134217728   # u64 bytes (no K/M/G suffix). Total backing pool split
+                                 #   evenly across serving shards. 0 -> 128 MiB.
 
 [startup.fabric]
 listen_addr         = "0.0.0.0:0" # per-shard fabric listen address; :0 picks a free port.
@@ -136,9 +137,8 @@ rpc_worker_threads  = 4          # fabric RPC worker threads per shard.
 max_inflight        = 1024       # max in-flight fabric ops per shard (back-pressure).
 
 [startup.topology]
-rdma_progress_per_hca = 1        # RDMA progress engines per HCA.
-rdma_handlers_per_hca = 4        # RDMA completion handlers per HCA.
-tcp_fallback_threads  = 1        # TCP-fallback threads when RDMA is unavailable.
+serving_cores         = 0        # serving shards; 0 = auto-fill every usable CPU.
+nic_workers           = 4        # fabric CPUs pinned per active HCA (0 -> 4).
 use_smt_siblings      = false    # also place shards on SMT sibling CPUs.
 ignore_isolated       = false    # also schedule onto isolcpus-isolated CPUs.
 include_node_cpu0     = false    # allow placing a shard on each NUMA node's CPU 0.

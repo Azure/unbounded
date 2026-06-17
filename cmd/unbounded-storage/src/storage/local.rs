@@ -457,7 +457,7 @@ mod tests {
             base: buf_a.as_mut_ptr(),
             page_size: 4096,
             page_count: 32,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         let store_a = ShardLocalStore::new(inner.clone());
         store_a.register_pages(&backing_a).unwrap();
@@ -468,7 +468,7 @@ mod tests {
             base: buf_b.as_mut_ptr(),
             page_size: 4096,
             page_count: 32,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         let store_b = ShardLocalStore::new(inner.clone());
         store_b.register_pages(&backing_b).unwrap();

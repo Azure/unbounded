@@ -82,6 +82,14 @@ pub enum Error {
     /// it on the speculative path and a head fetch is never
     /// speculative.
     PrefetchBackoff,
+    /// Transient back-pressure: a non-blocking (cross-shard remote)
+    /// head fetch found no free page available without parking, so it
+    /// failed fast rather than holding pins while blocked. Retryable:
+    /// the caller (a remote coordinator) should re-dispatch the fetch
+    /// after yielding. See [`crate::bufferpool::Pool::read_owned`] and
+    /// `FreeList::try_alloc_head`. Used only on the owned-read path;
+    /// local blocking reads never produce it.
+    Busy,
     /// The requested origin object does not exist (an HTTP/S3 404 from
     /// the origin). Distinct from a transport failure: the fetch
     /// completed, the origin simply has no such object.
@@ -134,6 +142,7 @@ impl fmt::Display for Error {
             Error::Transport(e) => write!(f, "transport error: {e}"),
             Error::BlockStore(e) => write!(f, "block store error: {e}"),
             Error::PrefetchBackoff => write!(f, "speculative prefetch backed off"),
+            Error::Busy => write!(f, "pool busy: no free page for non-blocking fetch"),
             Error::OriginNotFound => write!(f, "origin object not found"),
         }
     }
