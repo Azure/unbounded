@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -35,6 +36,7 @@ func main() {
 		modulesPath    string
 		authMode       string
 		kubeconfigPath string
+		insecureTLS    bool
 	)
 
 	rootCmd := &cobra.Command{
@@ -47,6 +49,7 @@ func main() {
 				modulesPath:    modulesPath,
 				authMode:       authMode,
 				kubeconfigPath: kubeconfigPath,
+				insecureTLS:    insecureTLS,
 			})
 		},
 	}
@@ -58,6 +61,7 @@ func main() {
 	flags.StringVar(&modulesPath, "modules-config", "/etc/unbounded-dashboard/modules.yaml", "Path to the static module registry YAML")
 	flags.StringVar(&authMode, "auth-mode", "none", "Authorization mode: none or sar (Kubernetes SubjectAccessReview)")
 	flags.StringVar(&kubeconfigPath, "kubeconfig", "", "Path to kubeconfig (sar mode only; uses in-cluster config if empty)")
+	flags.BoolVar(&insecureTLS, "module-insecure-tls", false, "Skip TLS verification when calling module backends (prototype: net controller serves a self-signed cert)")
 
 	rootCmd.AddCommand(version.Command())
 
@@ -72,6 +76,7 @@ type runConfig struct {
 	modulesPath    string
 	authMode       string
 	kubeconfigPath string
+	insecureTLS    bool
 }
 
 func run(parent context.Context, cfg runConfig) error {
@@ -87,10 +92,20 @@ func run(parent context.Context, cfg runConfig) error {
 		return err
 	}
 
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+
+	if cfg.insecureTLS {
+		klog.Warning("dashboard: module-insecure-tls enabled, module TLS certificates are not verified (prototype)")
+
+		httpClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // prototype: self-signed module cert
+		}
+	}
+
 	srv, err := server.New(server.Options{
 		Registry:   reg,
 		Authorizer: authorizer,
-		HTTPClient: &http.Client{Timeout: 10 * time.Second},
+		HTTPClient: httpClient,
 	})
 	if err != nil {
 		return err

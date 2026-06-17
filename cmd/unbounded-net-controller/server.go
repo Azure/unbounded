@@ -130,6 +130,7 @@ func startServer(ctx context.Context, healthPort int, requireDashboardAuth bool,
 	registerStatusHandlers(mux, health, requireDashboardAuth, webhookServer, dashAuthorizer, tokenIssuer)
 	registerPushHandlers(mux, health, webhookServer, wsSemaphore, tokenIssuer)
 	registerDashboardHandlers(mux, health, broadcaster, requireDashboardAuth, webhookServer, dashAuthorizer, tokenIssuer)
+	registerDashboardModuleHandlers(mux, health, requireDashboardAuth, webhookServer, dashAuthorizer, tokenIssuer)
 	registerTokenEndpoints(mux, health, webhookServer, tokenIssuer, tokenCfg)
 	startStatusCacheCleanupLoop(health)
 

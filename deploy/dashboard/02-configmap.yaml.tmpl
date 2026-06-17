@@ -17,3 +17,10 @@ data:
     modules:
       - id: example
         baseURL: http://dashboard-example.{{ default "unbounded-dashboard" .Namespace }}.svc:8090/dashboard/v1
+      # The net module is served by the unbounded-net-controller itself over its
+      # self-signed TLS endpoint (port 9999). Requires the dashboard to run with
+      # --module-insecure-tls and the controller with dashboard auth disabled
+      # (prototype). Adjust the namespace if the controller runs elsewhere.
+      - id: net
+        baseURL: https://unbounded-net-controller.{{ default "unbounded-net" .NetNamespace }}.svc:9999/dashboard/v1
+

@@ -30,6 +30,9 @@ spec:
             # Prototype default: authorization disabled. Switch to --auth-mode=sar
             # (and ensure the ClusterRole in 01-rbac is bound) to enforce RBAC.
             - --auth-mode=none
+            # The net module backend serves a self-signed TLS cert; skip
+            # verification for the prototype.
+            - --module-insecure-tls
           ports:
             - name: http
               containerPort: 8080

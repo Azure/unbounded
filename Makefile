@@ -611,7 +611,8 @@ dashboard-manifests: ## Render dashboard prototype manifests into deploy/dashboa
 		--output-dir $(DASHBOARD_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(DASHBOARD_NAMESPACE) \
 		--set DashboardImage=$(DASHBOARD_IMAGE) \
-		--set ExampleImage=$(DASHBOARD_EXAMPLE_IMAGE)
+		--set ExampleImage=$(DASHBOARD_EXAMPLE_IMAGE) \
+		--set NetNamespace=$(NET_NAMESPACE)
 	@echo "Rendered dashboard manifests into $(DASHBOARD_MANIFEST_RENDERED_DIR)"
 
 ##@ Rust Binaries
