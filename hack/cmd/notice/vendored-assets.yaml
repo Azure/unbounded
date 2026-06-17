@@ -23,3 +23,9 @@ assets:
     license:
       - name: BSD 2-Clause "Simplified" License
         link: https://github.com/bigskysoftware/htmx-extensions/blob/main/LICENSE
+  - dependency: cytoscape
+    copyright:
+      - Copyright (c) 2016-2024 The Cytoscape Consortium
+    license:
+      - name: MIT License
+        link: https://github.com/cytoscape/cytoscape.js/blob/v3.30.2/LICENSE

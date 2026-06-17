@@ -58,6 +58,36 @@ func (c *Client) Summary(ctx context.Context) (*contract.Summary, error) {
 	return &s, nil
 }
 
+// Overview fetches the composed overview surface (ordered panels).
+func (c *Client) Overview(ctx context.Context) (*contract.Overview, error) {
+	var o contract.Overview
+	if err := c.getJSON(ctx, "/overview", &o); err != nil {
+		return nil, err
+	}
+
+	return &o, nil
+}
+
+// Graph fetches the topology graph surface.
+func (c *Client) Graph(ctx context.Context) (*contract.Graph, error) {
+	var g contract.Graph
+	if err := c.getJSON(ctx, "/graph", &g); err != nil {
+		return nil, err
+	}
+
+	return &g, nil
+}
+
+// Matrix fetches the connectivity matrix surface.
+func (c *Client) Matrix(ctx context.Context) (*contract.Matrix, error) {
+	var m contract.Matrix
+	if err := c.getJSON(ctx, "/matrix", &m); err != nil {
+		return nil, err
+	}
+
+	return &m, nil
+}
+
 // Resources fetches the resource list for the given kind.
 func (c *Client) Resources(ctx context.Context, kind string) (*contract.ResourceList, error) {
 	var rl contract.ResourceList

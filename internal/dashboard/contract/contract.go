@@ -32,6 +32,13 @@ const (
 	CapabilityActions Capability = "actions"
 	// CapabilityStream indicates the module exposes a live update stream.
 	CapabilityStream Capability = "stream"
+	// CapabilityOverview indicates the module serves a composed Overview surface
+	// (an ordered list of panels) rather than just a flat Summary.
+	CapabilityOverview Capability = "overview"
+	// CapabilityGraph indicates the module serves a topology Graph surface.
+	CapabilityGraph Capability = "graph"
+	// CapabilityMatrix indicates the module serves a connectivity Matrix surface.
+	CapabilityMatrix Capability = "matrix"
 )
 
 // Health is a coarse status classification shared by summaries, badges, and
@@ -195,10 +202,104 @@ type ActionResult struct {
 	Message string `json:"message"`
 }
 
-// StreamEvent is one server-sent event on a module's live stream. Surface
-// names the surface that changed (e.g. "summary") so the dashboard knows which
-// region to refresh.
+// StreamEvent is one server-sent event on a module's live stream.
+//
+// StreamKey names the panel/region that changed (e.g. "summary", "graph",
+// "matrix", "nodes"). The dashboard uses it to refetch just the affected panel
+// via htmx ("signal + refetch"), so the event itself does not need to carry the
+// rendered data. Summary is included opportunistically for the summary surface
+// where a tiny payload avoids an extra round-trip.
 type StreamEvent struct {
-	Surface string   `json:"surface"`
-	Summary *Summary `json:"summary,omitempty"`
+	StreamKey string   `json:"streamKey"`
+	Summary   *Summary `json:"summary,omitempty"`
+}
+
+// --- Composed overview (panel/widget model) ------------------------------
+
+// PanelType identifies how a Panel's Data should be rendered.
+type PanelType string
+
+const (
+	// PanelMetrics renders Data as []Metric metric cards.
+	PanelMetrics PanelType = "metrics"
+	// PanelAlerts renders Data as []Alert.
+	PanelAlerts PanelType = "alerts"
+	// PanelTable renders Data as a ResourceList table.
+	PanelTable PanelType = "table"
+	// PanelGraph renders Data as a Graph (topology).
+	PanelGraph PanelType = "graph"
+	// PanelMatrix renders Data as a Matrix (connectivity heatmap).
+	PanelMatrix PanelType = "matrix"
+	// PanelDetailList renders Data as []DetailSection.
+	PanelDetailList PanelType = "detaillist"
+)
+
+// Overview is a composed page surface: an ordered list of typed panels. It lets
+// a module present a rich landing page (metrics + graph + heatmap + tables)
+// while the dashboard owns layout and rendering.
+type Overview struct {
+	Title  string  `json:"title,omitempty"`
+	Panels []Panel `json:"panels"`
+}
+
+// Panel is one widget on an Overview. Exactly one of the typed fields is set
+// according to Type. StreamKey, when set, binds the panel to live updates: the
+// dashboard refetches the panel when a StreamEvent with the same key arrives.
+type Panel struct {
+	Type      PanelType `json:"type"`
+	Title     string    `json:"title,omitempty"`
+	StreamKey string    `json:"streamKey,omitempty"`
+	// Width is an optional Bootstrap-grid column span (1-12). 0 means full row.
+	Width int `json:"width,omitempty"`
+
+	Metrics  []Metric        `json:"metrics,omitempty"`
+	Alerts   []Alert         `json:"alerts,omitempty"`
+	Table    *ResourceList   `json:"table,omitempty"`
+	Graph    *Graph          `json:"graph,omitempty"`
+	Matrix   *Matrix         `json:"matrix,omitempty"`
+	Sections []DetailSection `json:"sections,omitempty"`
+}
+
+// --- Graph (topology) ----------------------------------------------------
+
+// Graph is a node/edge topology rendered by the dashboard's graph primitive.
+// Modules supply structured data only; the dashboard owns the rendering library.
+type Graph struct {
+	Nodes []GraphNode `json:"nodes"`
+	Edges []GraphEdge `json:"edges"`
+}
+
+// GraphNode is one vertex. Kind/Group let the dashboard style families of nodes
+// (e.g. site vs gateway-pool vs worker) consistently.
+type GraphNode struct {
+	ID     string `json:"id"`
+	Label  string `json:"label"`
+	Kind   string `json:"kind,omitempty"`
+	Group  string `json:"group,omitempty"`
+	Health Health `json:"health,omitempty"`
+}
+
+// GraphEdge is one link between two GraphNode IDs.
+type GraphEdge struct {
+	Source string `json:"source"`
+	Target string `json:"target"`
+	Kind   string `json:"kind,omitempty"`
+	Health Health `json:"health,omitempty"`
+	Label  string `json:"label,omitempty"`
+}
+
+// --- Matrix (connectivity heatmap) ---------------------------------------
+
+// Matrix is a 2D connectivity grid rendered as a heatmap table. Rows and
+// Columns are axis labels; Cells maps row label -> column label -> cell.
+type Matrix struct {
+	Rows    []string                   `json:"rows"`
+	Columns []string                   `json:"columns"`
+	Cells   map[string]map[string]Cell `json:"cells"`
+}
+
+// Cell is one matrix entry.
+type Cell struct {
+	Value  string `json:"value,omitempty"`
+	Health Health `json:"health,omitempty"`
 }

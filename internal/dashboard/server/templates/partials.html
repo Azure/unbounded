@@ -3,3 +3,129 @@ Copyright (c) Microsoft Corporation.
 Licensed under the MIT License.
 */ -}}
 {{define "badge"}}<span class="badge text-bg-{{healthClass .}}">{{healthLabel .}}</span>{{end}}
+
+{{- /*
+panel dispatches one contract.Panel to the right renderer by type. A panel with
+a StreamKey is wrapped in a live region that refetches itself when the module's
+SSE stream signals that key (htmx "signal + refetch").
+*/ -}}
+{{define "panel"}}
+{{- $col := "col-12"}}{{if .Panel.Width}}{{$col = printf "col-md-%d" .Panel.Width}}{{end}}
+<div class="{{$col}} mb-4">
+  <div class="ub-panel"
+    {{- if .Panel.StreamKey}} id="panel-{{.Panel.StreamKey}}"
+       hx-get="/modules/{{.ModuleID}}/panels/{{.Panel.StreamKey}}"
+       hx-trigger="sse:{{.Panel.StreamKey}}"
+       hx-swap="outerHTML"{{end}}>
+    {{- if .Panel.Title}}<h2 class="h6 text-uppercase text-muted mb-3">{{.Panel.Title}}</h2>{{end}}
+    {{- if eq .Panel.Type "metrics"}}{{template "metricsPanel" .Panel}}
+    {{- else if eq .Panel.Type "alerts"}}{{template "alertsPanel" .Panel}}
+    {{- else if eq .Panel.Type "table"}}{{template "tablePanel" .}}
+    {{- else if eq .Panel.Type "graph"}}{{template "graphPanel" .}}
+    {{- else if eq .Panel.Type "matrix"}}{{template "matrixPanel" .Panel}}
+    {{- else if eq .Panel.Type "detaillist"}}{{template "detailListPanel" .Panel}}
+    {{- else}}<div class="text-muted">unsupported panel type {{.Panel.Type}}</div>{{end}}
+  </div>
+</div>
+{{end}}
+
+{{define "metricsPanel"}}
+<div class="row">
+  {{- range .Metrics}}
+  <div class="col mb-2">
+    <div class="card text-center border-{{healthClass .Health}}">
+      <div class="card-body py-3">
+        <div class="display-6">{{.Value}}{{if .Unit}} <small class="text-muted fs-6">{{.Unit}}</small>{{end}}</div>
+        <div class="text-muted small">{{.Label}}</div>
+      </div>
+    </div>
+  </div>
+  {{- end}}
+</div>
+{{end}}
+
+{{define "alertsPanel"}}
+{{- if not .Alerts}}<div class="text-muted small">No active alerts.</div>{{end}}
+{{- range .Alerts}}
+<div class="alert alert-{{healthClass .Health}} py-2 mb-2">
+  <strong>{{.Title}}</strong>{{if .Detail}} - {{.Detail}}{{end}}
+  {{- if .Source}}<span class="float-end small text-muted">{{.Source}}</span>{{end}}
+</div>
+{{- end}}
+{{end}}
+
+{{define "tablePanel"}}
+{{- with .Panel.Table}}
+{{- if not .Rows}}<div class="text-muted small">No rows.</div>
+{{- else}}
+<table class="table table-sm table-hover mb-0">
+  <thead><tr><th></th>{{range .Columns}}<th>{{.Title}}</th>{{end}}</tr></thead>
+  <tbody>
+    {{- $cols := .Columns}}{{$kind := .Kind}}{{$mod := $.ModuleID}}
+    {{- range .Rows}}
+    {{- $row := .}}
+    <tr>
+      <td>{{template "badge" .Health}}</td>
+      {{- range $cols}}
+      <td>
+        {{- if eq .Key "name"}}<a href="/modules/{{$mod}}/resources/{{$kind}}/{{$row.Name}}">{{index $row.Cells .Key}}</a>
+        {{- else}}{{index $row.Cells .Key}}{{end}}
+      </td>
+      {{- end}}
+    </tr>
+    {{- end}}
+  </tbody>
+</table>
+{{- end}}
+{{- end}}
+{{end}}
+
+{{- /*
+graphPanel emits a container the vendored graph primitive (graph-init.js)
+hydrates by fetching the module's /graph JSON. No framework, no build step.
+*/ -}}
+{{define "graphPanel"}}
+<div class="ub-graph" data-graph-url="/modules/{{.ModuleID}}/graph" style="height: 420px;"></div>
+<noscript><div class="text-muted small">Topology graph requires JavaScript.</div></noscript>
+{{end}}
+
+{{define "matrixPanel"}}
+{{- with .Matrix}}
+{{- if not .Rows}}<div class="text-muted small">No connectivity data.</div>
+{{- else}}
+<div class="table-responsive">
+<table class="table table-sm ub-matrix mb-0">
+  <thead>
+    <tr><th></th>{{range .Columns}}<th class="ub-matrix-col">{{.}}</th>{{end}}</tr>
+  </thead>
+  <tbody>
+    {{- $cols := .Columns}}{{$cells := .Cells}}
+    {{- range $row := .Rows}}
+    <tr>
+      <th class="ub-matrix-row">{{$row}}</th>
+      {{- range $col := $cols}}
+      {{- $cell := index (index $cells $row) $col}}
+      <td class="ub-matrix-cell text-bg-{{healthClass $cell.Health}}" title="{{$row}} -> {{$col}}: {{$cell.Value}}">{{$cell.Value}}</td>
+      {{- end}}
+    </tr>
+    {{- end}}
+  </tbody>
+</table>
+</div>
+{{- end}}
+{{- end}}
+{{end}}
+
+{{define "detailListPanel"}}
+{{- range .Sections}}
+{{- if .Title}}<h3 class="h6 mt-2">{{.Title}}</h3>{{end}}
+<ul class="list-group list-group-flush mb-2">
+  {{- range .Fields}}
+  <li class="list-group-item d-flex justify-content-between py-1">
+    <span class="text-muted">{{.Label}}</span>
+    <span class="text-{{healthClass .Health}}">{{.Value}}</span>
+  </li>
+  {{- end}}
+</ul>
+{{- end}}
+{{end}}

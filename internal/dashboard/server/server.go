@@ -100,6 +100,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /{$}", s.handleOverview)
 	mux.HandleFunc("GET /modules", s.handleModules)
 	mux.HandleFunc("GET /modules/{id}", s.handleModule)
+	mux.HandleFunc("GET /modules/{id}/panels/{key}", s.handlePanel)
 	mux.HandleFunc("GET /modules/{id}/resources/{kind}", s.handleResources)
 	mux.HandleFunc("GET /modules/{id}/resources/{kind}/{name}", s.handleResourceDetail)
 	mux.HandleFunc("GET /modules/{id}/stream", s.handleStream)
@@ -108,8 +109,14 @@ func (s *Server) Handler() http.Handler {
 	// JSON surfaces.
 	mux.HandleFunc("GET /api/dashboard/v1/modules", s.handleAPIModules)
 	mux.HandleFunc("GET /api/dashboard/v1/modules/{id}/summary", s.handleAPISummary)
+	mux.HandleFunc("GET /api/dashboard/v1/modules/{id}/overview", s.handleAPIOverview)
+	mux.HandleFunc("GET /api/dashboard/v1/modules/{id}/graph", s.handleAPIGraph)
+	mux.HandleFunc("GET /api/dashboard/v1/modules/{id}/matrix", s.handleAPIMatrix)
 	mux.HandleFunc("GET /api/dashboard/v1/modules/{id}/resources/{kind}", s.handleAPIResources)
 	mux.HandleFunc("GET /api/dashboard/v1/modules/{id}/resources/{kind}/{name}", s.handleAPIResourceDetail)
+
+	// Graph data for the graph primitive (HTML clients consume this via JS).
+	mux.HandleFunc("GET /modules/{id}/graph", s.handleAPIGraph)
 
 	return mux
 }
@@ -243,12 +250,20 @@ func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 
 	data := struct {
 		Manifest *contract.Manifest
+		Overview *contract.Overview
 		Summary  *contract.Summary
 		Stream   string
 		Error    string
 	}{Manifest: mf}
 
-	if mf.HasCapability(contract.CapabilitySummary) {
+	switch {
+	case mf.HasCapability(contract.CapabilityOverview):
+		if ov, err := mod.client.Overview(r.Context()); err == nil {
+			data.Overview = ov
+		} else {
+			data.Error = err.Error()
+		}
+	case mf.HasCapability(contract.CapabilitySummary):
 		if sum, err := mod.client.Summary(r.Context()); err == nil {
 			data.Summary = sum
 		} else {
@@ -264,6 +279,38 @@ func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 		Nav:  s.nav(r.Context(), mod.id),
 		Data: data,
 	})
+}
+
+// handlePanel renders a single overview panel as an HTML fragment, for htmx
+// live refetches driven by SSE stream events. The panel is located by its
+// StreamKey within the module's current overview.
+func (s *Server) handlePanel(w http.ResponseWriter, r *http.Request) {
+	sub, mod, mf, ok := s.resolveModule(w, r)
+	if !ok {
+		return
+	}
+
+	if !s.authorizeManifest(r.Context(), sub, mf) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	ov, err := mod.client.Overview(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	key := r.PathValue("key")
+
+	for _, p := range ov.Panels {
+		if p.StreamKey == key {
+			s.renderer.renderPanel(w, panelView{ModuleID: mod.id, Panel: p})
+			return
+		}
+	}
+
+	http.NotFound(w, r)
 }
 
 func (s *Server) handleResources(w http.ResponseWriter, r *http.Request) {
@@ -453,6 +500,54 @@ func (s *Server) handleAPISummary(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, sum)
+}
+
+func (s *Server) handleAPIOverview(w http.ResponseWriter, r *http.Request) {
+	mod, ok := s.byID[r.PathValue("id")]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	ov, err := mod.client.Overview(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	writeJSON(w, ov)
+}
+
+func (s *Server) handleAPIGraph(w http.ResponseWriter, r *http.Request) {
+	mod, ok := s.byID[r.PathValue("id")]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	g, err := mod.client.Graph(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	writeJSON(w, g)
+}
+
+func (s *Server) handleAPIMatrix(w http.ResponseWriter, r *http.Request) {
+	mod, ok := s.byID[r.PathValue("id")]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	m, err := mod.client.Matrix(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	writeJSON(w, m)
 }
 
 func (s *Server) handleAPIResources(w http.ResponseWriter, r *http.Request) {

@@ -67,6 +67,51 @@ func TestToggleHealthChangesSummary(t *testing.T) {
 	}
 }
 
+func TestOverviewHasAllPanelTypes(t *testing.T) {
+	srv := newServer(t)
+
+	var ov contract.Overview
+	getJSON(t, srv.URL+"/dashboard/v1/overview", &ov)
+
+	types := map[contract.PanelType]bool{}
+	for _, p := range ov.Panels {
+		types[p.Type] = true
+	}
+
+	for _, want := range []contract.PanelType{
+		contract.PanelMetrics, contract.PanelGraph, contract.PanelMatrix,
+		contract.PanelAlerts, contract.PanelTable,
+	} {
+		if !types[want] {
+			t.Errorf("overview missing panel type %q", want)
+		}
+	}
+}
+
+func TestGraphAndMatrixShape(t *testing.T) {
+	srv := newServer(t)
+
+	var g contract.Graph
+	getJSON(t, srv.URL+"/dashboard/v1/graph", &g)
+
+	if len(g.Nodes) == 0 || len(g.Edges) == 0 {
+		t.Fatalf("graph empty: %d nodes, %d edges", len(g.Nodes), len(g.Edges))
+	}
+
+	var m contract.Matrix
+	getJSON(t, srv.URL+"/dashboard/v1/matrix", &m)
+
+	if len(m.Rows) != len(m.Columns) || len(m.Rows) == 0 {
+		t.Fatalf("matrix axes wrong: %d rows, %d cols", len(m.Rows), len(m.Columns))
+	}
+
+	for _, name := range m.Rows {
+		if got := m.Cells[name][name].Value; got != "-" {
+			t.Errorf("diagonal cell %s = %q, want -", name, got)
+		}
+	}
+}
+
 func TestWidgetDetailNotFound(t *testing.T) {
 	srv := newServer(t)
 

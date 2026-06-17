@@ -22,3 +22,35 @@
 .breadcrumb {
   --bs-breadcrumb-divider: '>';
 }
+
+/* Topology graph primitive container. */
+.ub-graph {
+  width: 100%;
+  border: 1px solid var(--bs-border-color, #dee2e6);
+  border-radius: 0.375rem;
+  background: #fff;
+}
+
+/* Connectivity matrix / heatmap. */
+.ub-matrix {
+  border-collapse: collapse;
+}
+
+.ub-matrix-cell {
+  width: 2rem;
+  height: 2rem;
+  text-align: center;
+  font-size: 0.7rem;
+  border: 1px solid rgba(0, 0, 0, 0.05);
+}
+
+.ub-matrix-row,
+.ub-matrix-col {
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.ub-panel {
+  height: 100%;
+}
+

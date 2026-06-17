@@ -132,6 +132,64 @@ func TestUnknownModule404(t *testing.T) {
 	}
 }
 
+func TestOverviewPanelsRender(t *testing.T) {
+	h := newStack(t, authz.AllowAll{})
+
+	resp, body := get(t, h, "/modules/example")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+
+	for _, want := range []string{"ub-graph", "ub-matrix-cell", "sse-connect", "panel-summary"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("module overview missing %q", want)
+		}
+	}
+}
+
+func TestPanelFragmentRefetch(t *testing.T) {
+	h := newStack(t, authz.AllowAll{})
+
+	resp, body := get(t, h, "/modules/example/panels/summary")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+
+	// Fragment must be the panel only, not a full HTML page.
+	if strings.Contains(body, "<html") {
+		t.Errorf("panel fragment should not include full page chrome")
+	}
+
+	if !strings.Contains(body, "panel-summary") {
+		t.Errorf("panel fragment missing panel wrapper; body=%s", body)
+	}
+}
+
+func TestPanelFragmentUnknownKey404(t *testing.T) {
+	h := newStack(t, authz.AllowAll{})
+
+	if resp, _ := get(t, h, "/modules/example/panels/nope"); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown panel key, got %d", resp.StatusCode)
+	}
+}
+
+func TestAPIGraphAndMatrix(t *testing.T) {
+	h := newStack(t, authz.AllowAll{})
+
+	if _, body := get(t, h, "/api/dashboard/v1/modules/example/graph"); !strings.Contains(body, `"nodes"`) {
+		t.Errorf("graph JSON missing nodes; body=%s", body)
+	}
+
+	if _, body := get(t, h, "/api/dashboard/v1/modules/example/matrix"); !strings.Contains(body, `"rows"`) {
+		t.Errorf("matrix JSON missing rows; body=%s", body)
+	}
+
+	// The JS graph primitive consumes this HTML-path endpoint too.
+	if resp, _ := get(t, h, "/modules/example/graph"); resp.StatusCode != http.StatusOK {
+		t.Errorf("graph data endpoint status = %d", resp.StatusCode)
+	}
+}
+
 func TestStreamProxyEmitsSummaryEvent(t *testing.T) {
 	h := newStack(t, authz.AllowAll{})
 

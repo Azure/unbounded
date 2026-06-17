@@ -59,6 +59,9 @@ func New() *Module {
 func (m *Module) Routes(mux *http.ServeMux, basePath string) {
 	mux.HandleFunc("GET "+basePath+"/manifest", m.handleManifest)
 	mux.HandleFunc("GET "+basePath+"/summary", m.handleSummary)
+	mux.HandleFunc("GET "+basePath+"/overview", m.handleOverview)
+	mux.HandleFunc("GET "+basePath+"/graph", m.handleGraph)
+	mux.HandleFunc("GET "+basePath+"/matrix", m.handleMatrix)
 	mux.HandleFunc("GET "+basePath+"/resources/widgets", m.handleWidgets)
 	mux.HandleFunc("GET "+basePath+"/resources/widgets/{name}", m.handleWidgetDetail)
 	mux.HandleFunc("POST "+basePath+"/actions/toggle-health", m.handleToggleHealth)
@@ -73,10 +76,13 @@ func (m *Module) handleManifest(w http.ResponseWriter, _ *http.Request) {
 		Description: "A demonstration module exercising the dashboard contract.",
 		Capabilities: []contract.Capability{
 			contract.CapabilitySummary,
+			contract.CapabilityOverview,
 			contract.CapabilityResources,
 			contract.CapabilityDetails,
 			contract.CapabilityActions,
 			contract.CapabilityStream,
+			contract.CapabilityGraph,
+			contract.CapabilityMatrix,
 		},
 		ResourceKinds: []contract.ResourceKind{
 			{Kind: "widgets", Title: "Widgets", Singular: "Widget"},
@@ -86,6 +92,94 @@ func (m *Module) handleManifest(w http.ResponseWriter, _ *http.Request) {
 
 func (m *Module) handleSummary(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, m.summary())
+}
+
+// handleOverview composes the example module's landing page from typed panels,
+// exercising every panel type the dashboard supports.
+func (m *Module) handleOverview(w http.ResponseWriter, _ *http.Request) {
+	sum := m.summary()
+
+	writeJSON(w, contract.Overview{
+		Title: "Example Overview",
+		Panels: []contract.Panel{
+			{Type: contract.PanelMetrics, Title: "Metrics", StreamKey: "summary", Metrics: sum.Metrics},
+			{Type: contract.PanelGraph, Title: "Topology", Width: 6, StreamKey: "graph"},
+			{Type: contract.PanelMatrix, Title: "Connectivity", Width: 6, StreamKey: "matrix", Matrix: m.matrix()},
+			{Type: contract.PanelAlerts, Title: "Alerts", StreamKey: "summary", Alerts: sum.Alerts},
+			{Type: contract.PanelTable, Title: "Widgets", Table: m.widgetList()},
+		},
+	})
+}
+
+func (m *Module) handleGraph(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, m.graph())
+}
+
+func (m *Module) handleMatrix(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, m.matrix())
+}
+
+// graph builds a small topology: a central "hub" linked to each widget,
+// coloured by widget health.
+func (m *Module) graph() contract.Graph {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	g := contract.Graph{
+		Nodes: []contract.GraphNode{{ID: "hub", Label: "hub", Kind: "hub", Group: "core", Health: contract.HealthOK}},
+	}
+
+	for _, wg := range m.sortedWidgetsLocked() {
+		g.Nodes = append(g.Nodes, contract.GraphNode{
+			ID:     "widget:" + wg.name,
+			Label:  wg.name,
+			Kind:   "widget",
+			Group:  wg.region,
+			Health: healthOf(wg.healthy),
+		})
+		g.Edges = append(g.Edges, contract.GraphEdge{
+			Source: "hub",
+			Target: "widget:" + wg.name,
+			Health: healthOf(wg.healthy),
+		})
+	}
+
+	return g
+}
+
+// matrix builds a widget-to-widget connectivity grid: healthy widgets reach
+// each other, unhealthy ones do not.
+func (m *Module) matrix() *contract.Matrix {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	widgets := m.sortedWidgetsLocked()
+	names := make([]string, 0, len(widgets))
+
+	for _, wg := range widgets {
+		names = append(names, wg.name)
+	}
+
+	cells := make(map[string]map[string]contract.Cell, len(widgets))
+
+	for _, src := range widgets {
+		row := make(map[string]contract.Cell, len(widgets))
+
+		for _, dst := range widgets {
+			switch {
+			case src.name == dst.name:
+				row[dst.name] = contract.Cell{Value: "-", Health: contract.HealthUnknown}
+			case src.healthy && dst.healthy:
+				row[dst.name] = contract.Cell{Value: "OK", Health: contract.HealthOK}
+			default:
+				row[dst.name] = contract.Cell{Value: "x", Health: contract.HealthError}
+			}
+		}
+
+		cells[src.name] = row
+	}
+
+	return &contract.Matrix{Rows: names, Columns: names, Cells: cells}
 }
 
 func (m *Module) summary() contract.Summary {
@@ -137,9 +231,23 @@ func (m *Module) summary() contract.Summary {
 
 func (m *Module) handleWidgets(w http.ResponseWriter, _ *http.Request) {
 	m.mu.Lock()
+	list := m.widgetListLocked()
+	m.mu.Unlock()
+
+	writeJSON(w, list)
+}
+
+// widgetList returns the widgets table, taking the lock.
+func (m *Module) widgetList() *contract.ResourceList {
+	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	list := contract.ResourceList{
+	return m.widgetListLocked()
+}
+
+// widgetListLocked builds the widgets table. Caller must hold m.mu.
+func (m *Module) widgetListLocked() *contract.ResourceList {
+	list := &contract.ResourceList{
 		Kind:  "widgets",
 		Title: "Widgets",
 		Columns: []contract.Column{
@@ -161,7 +269,7 @@ func (m *Module) handleWidgets(w http.ResponseWriter, _ *http.Request) {
 		})
 	}
 
-	writeJSON(w, list)
+	return list
 }
 
 func (m *Module) handleWidgetDetail(w http.ResponseWriter, r *http.Request) {
@@ -287,14 +395,14 @@ func (m *Module) handleStream(w http.ResponseWriter, r *http.Request) {
 	keepalive := time.NewTicker(20 * time.Second)
 	defer keepalive.Stop()
 
-	m.sendSummaryEvent(w, flusher)
+	m.sendEvents(w, flusher)
 
 	for {
 		select {
 		case <-r.Context().Done():
 			return
 		case <-ch:
-			m.sendSummaryEvent(w, flusher)
+			m.sendEvents(w, flusher)
 		case <-keepalive.C:
 			fmt.Fprint(w, ": keepalive\n\n") //nolint:errcheck // best-effort SSE keepalive
 			flusher.Flush()
@@ -302,15 +410,18 @@ func (m *Module) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (m *Module) sendSummaryEvent(w http.ResponseWriter, flusher http.Flusher) {
+// sendEvents emits one SSE event per panel stream key affected by a state
+// change. The summary event carries a payload; graph and matrix are signals
+// that prompt the dashboard to refetch those panels.
+func (m *Module) sendEvents(w http.ResponseWriter, flusher http.Flusher) {
 	summary := m.summary()
 
-	payload, err := json.Marshal(contract.StreamEvent{Surface: "summary", Summary: &summary})
-	if err != nil {
-		return
+	if payload, err := json.Marshal(contract.StreamEvent{StreamKey: "summary", Summary: &summary}); err == nil {
+		fmt.Fprintf(w, "event: summary\ndata: %s\n\n", payload) //nolint:errcheck // best-effort SSE write
 	}
 
-	fmt.Fprintf(w, "event: summary\ndata: %s\n\n", payload) //nolint:errcheck // best-effort SSE write
+	fmt.Fprint(w, "event: graph\ndata: {}\n\n")  //nolint:errcheck // signal-only event
+	fmt.Fprint(w, "event: matrix\ndata: {}\n\n") //nolint:errcheck // signal-only event
 	flusher.Flush()
 }
 

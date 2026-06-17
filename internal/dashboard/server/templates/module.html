@@ -13,11 +13,21 @@ Licensed under the MIT License.
 <div class="alert alert-danger">Module unreachable: {{.Data.Error}}</div>
 {{- else}}
 
+{{- if .Data.Overview}}
+{{- /* Composed overview: ordered typed panels. The row subscribes once to the
+       module SSE stream; individual panels self-refetch on their stream key. */ -}}
+<div class="row"{{if .Data.Stream}} hx-ext="sse" sse-connect="{{.Data.Stream}}"{{end}}>
+  {{- $mod := .Data.Manifest.ID}}
+  {{- range .Data.Overview.Panels}}
+  {{- template "panel" (panelData $mod .)}}
+  {{- end}}
+</div>
+
+{{- else}}
+{{- /* Fallback: flat summary surface for modules without an overview. */ -}}
 {{- with .Data.Summary}}
 {{- if .Message}}<p class="lead">{{.Message}}</p>{{end}}
-
-<div class="row mb-4"
-  {{- if $.Data.Stream}} hx-ext="sse" sse-connect="{{$.Data.Stream}}"{{end}}>
+<div class="row mb-4"{{if $.Data.Stream}} hx-ext="sse" sse-connect="{{$.Data.Stream}}"{{end}}>
   {{- range .Metrics}}
   <div class="col-md-3 mb-3">
     <div class="card text-center border-{{healthClass .Health}}">
@@ -29,13 +39,13 @@ Licensed under the MIT License.
   </div>
   {{- end}}
 </div>
-
 {{- range .Alerts}}
 <div class="alert alert-{{healthClass .Health}}">
   <strong>{{.Title}}</strong>
   {{- if .Detail}} - {{.Detail}}{{end}}
   {{- if .Source}}<span class="float-end small text-muted">{{.Source}}</span>{{end}}
 </div>
+{{- end}}
 {{- end}}
 {{- end}}
 

@@ -9,13 +9,16 @@ Licensed under the MIT License.
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{block "title" .}}Unbounded{{end}} - Unbounded</title>
   <!--
-    Bootstrap 5 and htmx are vendored under static/vendor and embedded into the
-    binary, so the dashboard works in air-gapped clusters with no external CDN.
+    Bootstrap 5, htmx, and Cytoscape are vendored under static/assets and
+    embedded into the binary, so the dashboard works in air-gapped clusters
+    with no external CDN.
   -->
   <link rel="stylesheet" href="/static/assets/bootstrap.min.css">
   <link rel="stylesheet" href="/static/dashboard.css">
   <script src="/static/assets/htmx.min.js" defer></script>
   <script src="/static/assets/htmx-ext-sse.min.js" defer></script>
+  <script src="/static/assets/cytoscape.min.js" defer></script>
+  <script src="/static/assets/graph-init.js" defer></script>
 </head>
 <body>
   <nav class="navbar navbar-expand-lg navbar-dark ub-navbar mb-4">

@@ -35,11 +35,19 @@ type pageData struct {
 	Data any
 }
 
+// panelView is the value passed to the "panel" template: a panel plus the
+// module id it belongs to (needed for table links and live-refetch URLs).
+type panelView struct {
+	ModuleID string
+	Panel    contract.Panel
+}
+
 // templateFuncs are the shared helpers available to all templates. They keep
 // status colour decisions in one place so modules stay consistent.
 var templateFuncs = template.FuncMap{
 	"healthClass": healthClass,
 	"healthLabel": healthLabel,
+	"panelData":   func(moduleID string, p contract.Panel) panelView { return panelView{ModuleID: moduleID, Panel: p} },
 }
 
 func healthClass(h contract.Health) string {
@@ -71,7 +79,8 @@ func healthLabel(h contract.Health) string {
 // renderer parses each page template together with the base layout and shared
 // partials, then renders them with the shared func map.
 type renderer struct {
-	pages map[string]*template.Template
+	pages    map[string]*template.Template
+	fragment *template.Template
 }
 
 // pageNames are the content templates rendered through the base layout.
@@ -114,6 +123,24 @@ func newRenderer() (*renderer, error) {
 		r.pages[name] = tmpl
 	}
 
+	// Fragment template: partials (panel renderers) plus the panelFragment
+	// wrapper, for htmx live refetches that render a single panel without the
+	// base layout.
+	fragSrc, err := templatesFS.ReadFile("templates/panel.html")
+	if err != nil {
+		return nil, fmt.Errorf("reading panel fragment template: %w", err)
+	}
+
+	frag := template.New("fragment").Funcs(templateFuncs)
+
+	for _, src := range [][]byte{partials, fragSrc} {
+		if _, err := frag.Parse(string(src)); err != nil {
+			return nil, fmt.Errorf("parsing fragment template: %w", err)
+		}
+	}
+
+	r.fragment = frag
+
 	return r, nil
 }
 
@@ -139,6 +166,24 @@ func (r *renderer) render(w http.ResponseWriter, status int, page string, data p
 
 	if _, err := buf.WriteTo(w); err != nil {
 		klog.V(4).Infof("dashboard: writing page %q: %v", page, err)
+	}
+}
+
+// renderPanel writes a single panel fragment (used for htmx live refetches).
+func (r *renderer) renderPanel(w http.ResponseWriter, view panelView) {
+	var buf bytes.Buffer
+	if err := r.fragment.ExecuteTemplate(&buf, "panelFragment", view); err != nil {
+		klog.Errorf("dashboard: rendering panel fragment: %v", err)
+		http.Error(w, "internal error rendering panel", http.StatusInternalServerError)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+
+	if _, err := buf.WriteTo(w); err != nil {
+		klog.V(4).Infof("dashboard: writing panel fragment: %v", err)
 	}
 }
 
