@@ -244,14 +244,26 @@ func extractTarGz(archivePath, destDir string) error {
 
 		switch header.Typeflag {
 		case tar.TypeDir:
+			if err := ensurePathWithinBase(destDir, target); err != nil {
+				return err
+			}
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return fmt.Errorf("mkdir %q: %w", target, err)
 			}
 		case tar.TypeReg:
+			if err := ensurePathWithinBase(destDir, target); err != nil {
+				return err
+			}
 			if err := writeFileFromTar(tr, target, os.FileMode(header.Mode)); err != nil {
 				return err
 			}
 		case tar.TypeSymlink:
+			if err := ensurePathWithinBase(destDir, target); err != nil {
+				return err
+			}
+			if err := ensureSymlinkTargetWithinBase(destDir, target, header.Linkname); err != nil {
+				return err
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return fmt.Errorf("mkdir for symlink %q: %w", target, err)
 			}
@@ -339,4 +351,57 @@ func safeJoin(base, rel string) (string, error) {
 	}
 
 	return target, nil
+}
+
+func ensurePathWithinBase(base, target string) error {
+	baseEval, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return fmt.Errorf("resolve base %q: %w", base, err)
+	}
+
+	parentEval, err := filepath.EvalSymlinks(filepath.Dir(target))
+	if err != nil {
+		return fmt.Errorf("resolve parent %q: %w", filepath.Dir(target), err)
+	}
+
+	candidate := filepath.Join(parentEval, filepath.Base(target))
+	if !isWithinBase(baseEval, candidate) {
+		return fmt.Errorf("unsafe extraction path: %q", target)
+	}
+
+	return nil
+}
+
+func ensureSymlinkTargetWithinBase(base, linkPath, linkName string) error {
+	baseEval, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return fmt.Errorf("resolve base %q: %w", base, err)
+	}
+
+	linkParentEval, err := filepath.EvalSymlinks(filepath.Dir(linkPath))
+	if err != nil {
+		return fmt.Errorf("resolve symlink parent %q: %w", filepath.Dir(linkPath), err)
+	}
+
+	var resolvedTarget string
+	if filepath.IsAbs(linkName) {
+		resolvedTarget = filepath.Clean(linkName)
+	} else {
+		resolvedTarget = filepath.Clean(filepath.Join(linkParentEval, filepath.FromSlash(linkName)))
+	}
+
+	if !isWithinBase(baseEval, resolvedTarget) {
+		return fmt.Errorf("unsafe symlink target %q for link %q", linkName, linkPath)
+	}
+
+	return nil
+}
+
+func isWithinBase(base, candidate string) bool {
+	rel, err := filepath.Rel(base, candidate)
+	if err != nil {
+		return false
+	}
+	rel = filepath.Clean(rel)
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
