@@ -110,6 +110,14 @@ type MetricsHooks struct {
 	// OnPleasePullStarted is called once per digest the server
 	// transitions into in_flight from a please_pull batch.
 	OnPleasePullStarted func()
+	// OnPleasePullDeclined fires once per digest the server declines to
+	// start (PumpDeclined): the puller-pump refused the work because the
+	// node is at its concurrent-pull ceiling or is shutting down. The
+	// digest is reported to the requester as OUTCOME_UNSPECIFIED. This is
+	// the load-shedding signal operators watch during large rollouts; a
+	// sustained nonzero rate means designated pullers are saturated and
+	// requesters are falling through to direct-origin fallback (NF5).
+	OnPleasePullDeclined func()
 	// OnStreamError fires for any malformed or oversized stream.
 	OnStreamError func()
 }
@@ -512,6 +520,10 @@ func (s *Server) StartLocalPull(ctx context.Context, registry, repository string
 
 			chunkOut, err := s.StartLocalPull(ctx, registry, repository, kind, digests[start:end])
 			if err != nil {
+				// Return the outcomes accumulated so far alongside the error.
+				// The only error source here is ctx cancellation, and the
+				// cold-start caller is per-digest, so partial progress lets
+				// already-started digests be observed rather than discarded.
 				return out, err
 			}
 
@@ -550,7 +562,17 @@ func (s *Server) StartLocalPull(ctx context.Context, registry, repository string
 				s.hooks.OnPleasePullStarted()
 			}
 		case PumpDeclined:
+			// Load-shed: the pump refused (at the concurrent-pull ceiling or
+			// shutting down). OUTCOME_UNSPECIFIED is overloaded here - it also
+			// means "no pump wired" - but the cold-start resolver treats both
+			// the same way (give up on this puller for this digest), so the
+			// transient-vs-permanent distinction is observable only via the
+			// declined counter, not the wire outcome.
 			oc.Outcome = ifaces.PleasePullUnspecified
+
+			if s.hooks.OnPleasePullDeclined != nil {
+				s.hooks.OnPleasePullDeclined()
+			}
 		}
 
 		out = append(out, oc)
@@ -570,6 +592,11 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 	}
 
 	if s.maxDigestsPerPleasePull > 0 && len(req.GetDigests()) > s.maxDigestsPerPleasePull {
+		// Wire path rejects rather than chunks: a well-behaved client (see
+		// Client.PleasePull) already splits into <= max batches, so an
+		// oversized request on the wire is either a misconfiguration or a
+		// client whose max exceeds ours (version skew). Reject loudly instead
+		// of silently fanning out work the operator did not size for.
 		s.bumpStreamErr()
 		return nil, fmt.Errorf("please_pull: too many digests: got %d, max %d", len(req.GetDigests()), s.maxDigestsPerPleasePull)
 	}
@@ -616,7 +643,17 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 				s.hooks.OnPleasePullStarted()
 			}
 		case PumpDeclined:
+			// Load-shed: the pump refused (at the concurrent-pull ceiling or
+			// shutting down). OUTCOME_UNSPECIFIED is overloaded here - it also
+			// means "no pump wired" - but the cold-start resolver treats both
+			// the same way (give up on this puller for this digest), so the
+			// transient-vs-permanent distinction is observable only via the
+			// declined counter, not the wire outcome.
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_UNSPECIFIED
+
+			if s.hooks.OnPleasePullDeclined != nil {
+				s.hooks.OnPleasePullDeclined()
+			}
 		}
 
 		results = append(results, r)
@@ -774,6 +811,10 @@ func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry,
 
 			chunkOut, err := c.PleasePull(ctx, target, registry, repository, kind, digests[start:end])
 			if err != nil {
+				// Unlike the local StartLocalPull path, a failed chunk here is
+				// an RPC-level failure (a partial response from one chunk is
+				// not trustworthy), so discard partial results and surface the
+				// error; the caller retries the whole request.
 				return nil, err
 			}
 

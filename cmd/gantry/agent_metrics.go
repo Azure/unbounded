@@ -149,6 +149,7 @@ type phase3Metrics struct {
 	coordPullIntentStorageUnavailable prometheus.Counter
 	coordPleasePullServed             prometheus.Counter
 	coordPleasePullStarted            prometheus.Counter
+	coordPleasePullDeclined           prometheus.Counter
 	coordStreamError                  prometheus.Counter
 	prefetchBatchesTotal              prometheus.Counter
 	prefetchDigestsTotal              prometheus.Counter
@@ -196,6 +197,10 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		coordPleasePullStarted: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_please_pull_started_total",
 			Help: "Digests transitioned to in_flight via please_pull on this node.",
+		}),
+		coordPleasePullDeclined: reg.NewCounter("coord", prometheus.CounterOpts{
+			Name: "p2p_coord_please_pull_declined_total",
+			Help: "Digests this node declined to start via please_pull because the puller-pump was at its concurrent-pull ceiling or shutting down (reported as OUTCOME_UNSPECIFIED). A sustained nonzero rate means designated pullers are saturated and requesters are falling through to direct-origin fallback (NF5).",
 		}),
 		coordStreamError: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_stream_error_total",

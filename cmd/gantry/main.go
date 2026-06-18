@@ -415,6 +415,7 @@ func runAgent(args []string) error {
 			OnPullIntentStorageUnavailable: func() { p3.coordPullIntentStorageUnavailable.Inc() },
 			OnPleasePullServed:             func() { p3.coordPleasePullServed.Inc() },
 			OnPleasePullStarted:            func() { p3.coordPleasePullStarted.Inc() },
+			OnPleasePullDeclined:           func() { p3.coordPleasePullDeclined.Inc() },
 			OnStreamError:                  func() { p3.coordStreamError.Inc() },
 		}),
 		coord.WithNegativeCache(negCacheAdapter{c: negCache}),

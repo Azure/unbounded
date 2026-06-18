@@ -173,6 +173,60 @@ func TestPleasePull_Started(t *testing.T) {
 	}
 }
 
+func TestPleasePull_DeclinedFiresHook(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	c := fakes.NewCache()
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
+		ifaces.Node{ID: ifaces.NodeID(hServer.ID().String()), Addr: "x"},
+	)
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	// Pump always declines, simulating a node at its concurrent-pull
+	// ceiling or shutting down.
+	pump := coord.PullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
+		return coord.PumpResult{Status: coord.PumpDeclined}
+	})
+
+	var declined, started int32
+
+	srv := coord.NewServer(c, members, infl,
+		coord.WithPullerPump(pump),
+		coord.WithMetrics(coord.MetricsHooks{
+			OnPleasePullDeclined: func() { atomic.AddInt32(&declined, 1) },
+			OnPleasePullStarted:  func() { atomic.AddInt32(&started, 1) },
+		}),
+	)
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	d1 := digest.MustParse("sha256:" + rep('1', 64))
+	d2 := digest.MustParse("sha256:" + rep('2', 64))
+
+	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d1, d2})
+	if err != nil {
+		t.Fatalf("PleasePull: %v", err)
+	}
+
+	for _, o := range outs {
+		if o.Outcome != ifaces.PleasePullUnspecified {
+			t.Errorf("outcome for %s = %v, want PleasePullUnspecified", o.Digest, o.Outcome)
+		}
+	}
+
+	if got := atomic.LoadInt32(&declined); got != 2 {
+		t.Errorf("OnPleasePullDeclined fired %d times, want 2", got)
+	}
+
+	if got := atomic.LoadInt32(&started); got != 0 {
+		t.Errorf("OnPleasePullStarted fired %d times, want 0", got)
+	}
+}
+
 func TestPleasePull_RejectsOversizedBatch(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
