@@ -30,6 +30,11 @@ const (
 	defaultSystemctl   = "systemctl"
 	defaultHostRoot    = "/"
 
+	// defaultStorageRingLabel is the node label whose value partitions nodes
+	// into storage rings. Every node sharing a value forms one peer set: each
+	// member is published to the others as an unbounded-storage peer.
+	defaultStorageRingLabel = "unbounded-cloud.io/storage-ring"
+
 	// defaultPoolBytes is the buffer-pool size (bytes) the hugepage reservation
 	// is sized for. Matches the daemon's default 128 MiB per-shard backing.
 	defaultPoolBytes = 134217728
@@ -70,6 +75,19 @@ type Config struct {
 	// projected one file per dotted key. The run supervisor reads these and
 	// renders ConfigPath; install does not use it.
 	SourceDir string
+	// NodeName is the Kubernetes node this supervisor runs on, sourced from
+	// the NODE_NAME downward-API env. The run supervisor uses it to find this
+	// node in the cluster (its ring label value, its InternalIP) and to
+	// exclude itself from its own peer set. Empty disables peer discovery
+	// (the run loop renders startup settings only).
+	NodeName string
+	// StorageRingLabel is the node label key whose value groups nodes into a
+	// storage ring. Nodes sharing a value become each other's peers.
+	StorageRingLabel string
+	// Kubeconfig is an out-of-cluster kubeconfig path for peer discovery. Empty
+	// means in-cluster service-account discovery. This is the developer/test
+	// path; in production the run container relies on the in-cluster config.
+	Kubeconfig string
 	// StorageArgs are extra arguments appended to the daemon ExecStart line.
 	StorageArgs string
 	// Arch is the normalized target architecture ("amd64" or "arm64").
@@ -115,6 +133,10 @@ func LoadConfig() (Config, error) {
 		HostRoot:    envOr("HOST_ROOT", defaultHostRoot),
 		Systemctl:   strings.Fields(envOr("SYSTEMCTL", defaultSystemctl)),
 	}
+
+	cfg.NodeName = os.Getenv("NODE_NAME")
+	cfg.StorageRingLabel = envOr("STORAGE_RING_LABEL", defaultStorageRingLabel)
+	cfg.Kubeconfig = os.Getenv("KUBECONFIG")
 
 	// SOURCE takes precedence; LOCAL_TARBALL is honored for backward
 	// compatibility with the shell installer when SOURCE is unset.

@@ -38,7 +38,7 @@ func TestReconcileRendersFile(t *testing.T) {
 	})
 	dest := filepath.Join(t.TempDir(), "config.binpb")
 
-	require.NoError(t, reconcile(Config{SourceDir: src, ConfigPath: dest}))
+	require.NoError(t, reconcile(Config{SourceDir: src, ConfigPath: dest}, nil))
 
 	cfg := decodeFile(t, dest)
 	assert.Equal(t, uint64(5), cfg.Version)
@@ -49,7 +49,7 @@ func TestReconcileBadValueErrors(t *testing.T) {
 	src := writeKeys(t, map[string]string{"version": "nope"})
 	dest := filepath.Join(t.TempDir(), "config.binpb")
 
-	require.Error(t, reconcile(Config{SourceDir: src, ConfigPath: dest}))
+	require.Error(t, reconcile(Config{SourceDir: src, ConfigPath: dest}, nil))
 }
 
 func TestRunRendersInitialAndReRenders(t *testing.T) {

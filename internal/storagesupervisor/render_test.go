@@ -34,7 +34,7 @@ func writeKeys(t *testing.T, keys map[string]string) string {
 func decode(t *testing.T, dir string) *storageconfig.Config {
 	t.Helper()
 
-	data, err := RenderConfig(dir)
+	data, err := RenderConfig(dir, ringState{})
 	require.NoError(t, err)
 
 	var cfg storageconfig.Config
@@ -139,7 +139,7 @@ func TestRenderConfigInvalidValues(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := writeKeys(t, map[string]string{tt.key: tt.val})
 
-			_, err := RenderConfig(dir)
+			_, err := RenderConfig(dir, ringState{})
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.key)
 		})
@@ -158,6 +158,60 @@ func TestRenderConfigTrimsWhitespace(t *testing.T) {
 
 	assert.Equal(t, uint32(2048), cfg.GetStartup().GetFabric().GetMaxInflight())
 	assert.Equal(t, "10.0.0.1:7000", cfg.GetStartup().GetFabric().GetListenAddr())
+}
+
+func TestRenderConfigActiveRingOverlay(t *testing.T) {
+	// An active ring injects local_node_id + peers and overrides the
+	// ConfigMap's listen_addr with this node's own routable bind, while the
+	// rest of the startup settings still come from the source.
+	dir := writeKeys(t, map[string]string{
+		"version":                     "3",
+		"startup.fabric.listen_addr":  "0.0.0.0:9000",
+		"startup.fabric.max_inflight": "2048",
+	})
+
+	ring := ringState{
+		active:         true,
+		localNodeID:    42,
+		selfListenAddr: "10.0.0.5:9000",
+		peers: []*storageconfig.PeerSpec{
+			{Id: 7, Address: &storageconfig.FabricAddress{Socket: "10.0.0.6:9000"}},
+			{Id: 9, Address: &storageconfig.FabricAddress{Socket: "10.0.0.7:9000"}},
+		},
+	}
+
+	data, err := RenderConfig(dir, ring)
+	require.NoError(t, err)
+
+	var cfg storageconfig.Config
+
+	require.NoError(t, proto.Unmarshal(data, &cfg))
+
+	assert.Equal(t, uint64(3), cfg.Version)
+	assert.Equal(t, uint32(2048), cfg.GetStartup().GetFabric().GetMaxInflight())
+	// listen_addr is overridden with the node's own routable address.
+	assert.Equal(t, "10.0.0.5:9000", cfg.GetStartup().GetFabric().GetListenAddr())
+	assert.Equal(t, uint64(42), cfg.GetP2P().GetLocalNodeId())
+
+	require.Len(t, cfg.GetPeers(), 2)
+	assert.Equal(t, uint64(7), cfg.GetPeers()[0].GetId())
+	assert.Equal(t, "10.0.0.6:9000", cfg.GetPeers()[0].GetAddress().GetSocket())
+	assert.Equal(t, uint64(9), cfg.GetPeers()[1].GetId())
+	assert.Equal(t, "10.0.0.7:9000", cfg.GetPeers()[1].GetAddress().GetSocket())
+}
+
+func TestRenderConfigInactiveRingPassesThrough(t *testing.T) {
+	// An inactive ring leaves the per-node sections empty and the ConfigMap's
+	// listen_addr untouched.
+	dir := writeKeys(t, map[string]string{
+		"startup.fabric.listen_addr": "0.0.0.0:0",
+	})
+
+	cfg := decode(t, dir)
+
+	assert.Nil(t, cfg.GetP2P())
+	assert.Empty(t, cfg.GetPeers())
+	assert.Equal(t, "0.0.0.0:0", cfg.GetStartup().GetFabric().GetListenAddr())
 }
 
 func TestWriteConfigAtomic(t *testing.T) {

@@ -17,15 +17,22 @@ import (
 
 // RenderConfig reads the startup-tuning ConfigMap projected one file per
 // dotted key under sourceDir and renders it into the daemon's binary
-// protobuf config wire format.
+// protobuf config wire format, then overlays the per-node ring state.
 //
-// Only startup-fixed settings (version + the startup.{memory,fabric,topology,
-// metrics} sections) are sourced here; per-node sections are injected
-// elsewhere. A missing key file leaves its proto3 zero value in place, which
-// the daemon promotes to the documented default. A present file with an
-// unparseable value is a hard error so an operator typo fails loudly rather
-// than silently reverting a field to its default.
-func RenderConfig(sourceDir string) ([]byte, error) {
+// Startup-fixed settings (version + the startup.{memory,fabric,topology,
+// metrics} sections) are sourced from the ConfigMap. A missing key file leaves
+// its proto3 zero value in place, which the daemon promotes to the documented
+// default. A present file with an unparseable value is a hard error so an
+// operator typo fails loudly rather than silently reverting a field to its
+// default.
+//
+// The per-node sections (p2p.local_node_id, peers) are not in the ConfigMap;
+// they come from ring, computed from the Kubernetes node watch. When the ring
+// is active, this node's id and its peers are injected and the ConfigMap's
+// listen_addr is overridden with the node's own routable bind. When ring is
+// inactive (no node watch, no ring membership, or no fixed fabric port) the
+// rendered config is startup-only, exactly as before.
+func RenderConfig(sourceDir string, ring ringState) ([]byte, error) {
 	cfg := &storageconfig.Config{
 		Startup: &storageconfig.StartupCfg{
 			Memory:   &storageconfig.MemoryCfg{},
@@ -60,6 +67,20 @@ func RenderConfig(sourceDir string) ([]byte, error) {
 
 	if r.err != nil {
 		return nil, r.err
+	}
+
+	// Overlay the per-node ring: this node's id and peers, plus an own-IP
+	// listen_addr so the fabric binds an address peers can dial. Skipped when
+	// the ring is inactive so a non-cluster render stays startup-only.
+	if ring.active {
+		cfg.P2P = &storageconfig.P2PCfg{
+			LocalNodeId: proto.Uint64(ring.localNodeID),
+		}
+		cfg.Peers = ring.peers
+
+		if ring.selfListenAddr != "" {
+			cfg.Startup.Fabric.ListenAddr = ring.selfListenAddr
+		}
 	}
 
 	out, err := proto.Marshal(cfg)
