@@ -122,6 +122,14 @@ data:
     hrw_k: 3
     hrw_topology_scope: "cluster"
     zone_label_key: "topology.kubernetes.io/zone"
+    # Max digests accepted in one please_pull batch. 256 is far above
+    # normal manifest child counts while staying well below the 1 MiB
+    # coord envelope limit.
+    coord_max_digests_per_request: 256
+    # Max background origin pulls an inbound please_pull can start on
+    # one node. Each pull holds an HTTP body, containerd writer,
+    # goroutine, and lease.
+    coord_max_concurrent_pulls: 16
 
     # ---------- DHT / NF5 (§7.7) ----------
     nf5_jitter_base: "3s"
