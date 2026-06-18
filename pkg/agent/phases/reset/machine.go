@@ -128,6 +128,9 @@ func (t *removeMachine) Do(ctx context.Context) error {
 		if err == nil {
 			return nil // machinectl removed both image metadata and directory
 		}
+		if !machineExists(ctx, t.log, t.machineName) {
+			break
+		}
 
 		select {
 		case <-ctx.Done():
