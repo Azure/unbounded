@@ -331,6 +331,7 @@ func TestMirror_PeerFallback_FiltersSelfProviderAfterLocalMiss(t *testing.T) {
 	dht := fakes.NewDHT()
 	dht.Inject(d,
 		ifaces.Provider{NodeID: "self-node", Addr: "127.0.0.1:1"},
+		ifaces.Provider{NodeID: "self-peer-id", Addr: "127.0.0.1:2"},
 		ifaces.Provider{NodeID: "peer-good", Addr: peerAddr},
 	)
 
@@ -339,6 +340,7 @@ func TestMirror_PeerFallback_FiltersSelfProviderAfterLocalMiss(t *testing.T) {
 	m := mirror.New(cfg, c, oc,
 		mirror.WithDiscovery(dht, transfer.NewClient()),
 		mirror.WithSelfNodeID("self-node"),
+		mirror.WithSelfPeerID("self-peer-id"),
 		mirror.WithPeerBudgets(time.Second, 2*time.Second, 1),
 		mirror.WithPeerMetrics(func(outcome string) {
 			if outcome == "hit" {

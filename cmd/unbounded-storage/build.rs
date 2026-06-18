@@ -56,10 +56,8 @@ fn main() {
 /// partial TOML file: any omitted key falls back to the proto3 zero value,
 /// which `Config::apply_defaults` then promotes to the documented default.
 /// `deny_unknown_fields` makes the TOML loader reject typo'd keys loudly at
-/// parse time; this is the serde/TOML path only - decoding a protobuf wire
-/// message keeps protobuf's forward-compatible unknown-field semantics.
-/// Enums deserialize as their integer discriminant (range-checked later by
-/// `config::load::validate`) and byte sizes as plain integers.
+/// parse time. Enums deserialize as their integer discriminant (range-checked
+/// later by `config::load::validate`) and byte sizes as plain integers.
 fn generate_config_schema() {
     // Use the vendored protoc so no system protoc install is required.
     let protoc =
@@ -76,6 +74,7 @@ fn generate_config_schema() {
         "Config",
         "P2pCfg",
         "RoutingPlan",
+        "FabricAddress",
         "PeerSpec",
         "DiskSpec",
         "BackendSpec",

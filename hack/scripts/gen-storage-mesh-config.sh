@@ -287,8 +287,6 @@ for i in "${!NAMES[@]}"; do
 [[peers]]
 # peer node: ${NAMES[$i]}
 id = $peer_id
-# transport: 0 = tcp, 1 = rdma.
-transport = 0
 address = "${IPS[$i]}:$OPT_PORT"
 EOF
 done

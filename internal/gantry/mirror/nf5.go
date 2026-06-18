@@ -76,6 +76,11 @@ type DirectOriginFallbackOptions struct {
 	// The jitter window is `[0, JitterBase × ln(ClusterSize))`.
 	JitterBase time.Duration
 
+	// JitterCap is a hard ceiling on the computed jitter window
+	// (`nf5_jitter_cap`). Zero means no cap. When set, the effective
+	// window is min(JitterBase*ln(N), JitterCap).
+	JitterCap time.Duration
+
 	// PerNodeRateLimit is the `nf5_per_node_rate_limit`
 	// (default 2 tokens/minute when ≤0). Refill is continuous
 	// (fractional tokens accrue at PerNodeRateLimit/60 per second).
@@ -291,6 +296,10 @@ func (n *DirectOriginFallbackController) computeJitter() time.Duration {
 	maxJ := time.Duration(float64(n.opts.JitterBase) * math.Log(float64(N)))
 	if maxJ <= 0 {
 		return 0
+	}
+
+	if n.opts.JitterCap > 0 && maxJ > n.opts.JitterCap {
+		maxJ = n.opts.JitterCap
 	}
 
 	n.rngMu.Lock()

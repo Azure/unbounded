@@ -129,7 +129,13 @@ fn set_affinity(cpu: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-fn set_preferred_node(node: u16) -> std::io::Result<()> {
+/// Set the calling thread's NUMA memory policy to `MPOL_PREFERRED` for
+/// `node`, so subsequent first-touch allocations on this thread fault in
+/// on `node` when capacity allows. Non-strict: the kernel may spill to
+/// remote memory under pressure. Used both by worker-thread pinning and
+/// by setup code that allocates per-HCA buffers it wants placed NUMA-local
+/// to the HCA that will DMA them.
+pub fn set_preferred_node(node: u16) -> std::io::Result<()> {
     // MPOL_PREFERRED: allocate from `node` if possible, fall back
     // otherwise. Strict binding is too aggressive for a cache that
     // can spill onto remote memory when local is full.
