@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
@@ -404,6 +405,151 @@ func TestHTTPRegistryDoesNotSendBasicToTokenEndpoint(t *testing.T) {
 
 	if got := atomic.LoadInt32(&tokenReqs); got != 1 {
 		t.Fatalf("token endpoint calls = %d, want 1", got)
+	}
+}
+
+// TestPullStripsAuthOnHTTPSDowngradeRedirect proves the registry's HTTP client
+// refuses to carry an Authorization header onto a plaintext hop when an HTTPS
+// endpoint redirects to HTTP on the same hostname. net/http copies the header
+// across same-hostname redirects (it only compares hostnames, not schemes), so
+// without the scheme-aware CheckRedirect wired up by newRegistry the bearer
+// token would arrive at the HTTP target in clear text.
+func TestPullStripsAuthOnHTTPSDowngradeRedirect(t *testing.T) {
+	body := []byte("downgrade-protected")
+	d := digestOf(body)
+
+	var leaked int32
+
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			atomic.StoreInt32(&leaked, 1)
+		}
+
+		_, _ = w.Write(body) //nolint:errcheck // best-effort write
+	}))
+	defer httpSrv.Close()
+
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, httpSrv.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer tlsSrv.Close()
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: tlsSrv.URL})
+	reg := c.registries["reg"]
+
+	// Trust the test TLS cert but keep the production redirect policy so the
+	// credential-stripping behavior wired up by newRegistry is exercised. If
+	// newRegistry stopped setting CheckRedirect this copies nil and the test
+	// fails when net/http leaks the header to the plaintext target.
+	tlsClient := tlsSrv.Client()
+	tlsClient.CheckRedirect = reg.hc.CheckRedirect
+	reg.hc = tlsClient
+
+	// Seed a cached bearer token so do() attaches an Authorization header to
+	// the first request against the HTTPS endpoint.
+	reg.setToken("deadbeef", time.Hour)
+
+	rc, _, err := c.Pull(context.Background(), ifaces.OriginRef{
+		Registry: "reg", Repository: "library/nginx", Digest: d,
+	})
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+
+	if string(got) != string(body) {
+		t.Errorf("body = %q", got)
+	}
+
+	if atomic.LoadInt32(&leaked) != 0 {
+		t.Fatal("Authorization header leaked onto plain-HTTP redirect target")
+	}
+}
+
+func TestCheckRedirect(t *testing.T) {
+	t.Run("strips Authorization on http downgrade", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "http://reg.example.com/v2/", nil)
+		req.Header.Set("Authorization", "Bearer secret")
+
+		if err := checkRedirect(req, nil); err != nil {
+			t.Fatalf("checkRedirect: %v", err)
+		}
+
+		if got := req.Header.Get("Authorization"); got != "" {
+			t.Fatalf("Authorization preserved on http downgrade: %q", got)
+		}
+	})
+
+	t.Run("keeps Authorization on https redirect", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "https://reg.example.com/v2/", nil)
+		req.Header.Set("Authorization", "Bearer secret")
+
+		if err := checkRedirect(req, nil); err != nil {
+			t.Fatalf("checkRedirect: %v", err)
+		}
+
+		if got := req.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Fatalf("Authorization stripped on https redirect: %q", got)
+		}
+	})
+
+	t.Run("stops after 10 redirects", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "https://reg.example.com/v2/", nil)
+
+		if err := checkRedirect(req, make([]*http.Request, 10)); err == nil {
+			t.Fatal("expected error after 10 redirects")
+		}
+	})
+}
+
+// TestFetchBearerTokenPreservesRealmQueryAndFragment verifies the token URL is
+// assembled from the parsed realm: a pre-existing realm query survives, the
+// service/scope params are added, and a realm fragment does not swallow them.
+// Raw string concatenation would have appended "&service=...&scope=..." after
+// the "#frag", which url.Parse folds into the fragment so those params never
+// reach the wire.
+func TestFetchBearerTokenPreservesRealmQueryAndFragment(t *testing.T) {
+	var gotService, gotScope, gotExtra string
+
+	tokenSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		gotService = q.Get("service")
+		gotScope = q.Get("scope")
+		gotExtra = q.Get("extra")
+
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "deadbeef"}) //nolint:errcheck // best-effort
+	}))
+	defer tokenSrv.Close()
+
+	r := &registry{
+		base: mustParseURL(t, "https://reg.example.com"),
+		hc:   tokenSrv.Client(),
+	}
+
+	realm := tokenSrv.URL + "/token?extra=keep#frag"
+	challenge := `Bearer realm="` + realm + `",service="reg",scope="repository:library/nginx:pull"`
+
+	tok, _, err := r.fetchBearerToken(context.Background(), challenge)
+	if err != nil {
+		t.Fatalf("fetchBearerToken: %v", err)
+	}
+
+	if tok != "deadbeef" {
+		t.Fatalf("token = %q, want deadbeef", tok)
+	}
+
+	if gotService != "reg" {
+		t.Errorf("service = %q, want reg", gotService)
+	}
+
+	if gotScope != "repository:library/nginx:pull" {
+		t.Errorf("scope = %q, want repository:library/nginx:pull", gotScope)
+	}
+
+	if gotExtra != "keep" {
+		t.Errorf("extra = %q, want keep (pre-existing realm query dropped)", gotExtra)
 	}
 }
 

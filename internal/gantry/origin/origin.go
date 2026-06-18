@@ -264,7 +264,7 @@ func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, er
 	r := &registry{
 		name:   ur.Name,
 		base:   u,
-		hc:     &http.Client{Timeout: 5 * time.Minute},
+		hc:     &http.Client{Timeout: 5 * time.Minute, CheckRedirect: checkRedirect},
 		logger: logger.With(slog.String("registry", ur.Name)),
 	}
 	if ur.CredentialsPath != "" {
@@ -562,7 +562,12 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 
 	scope := params["scope"]
 
-	q := url.Values{}
+	// Build the token URL from the parsed/validated realm so the query is
+	// placed correctly even when the realm carries an existing query or a
+	// fragment. Concatenating onto the raw realm string could append the query
+	// after a "#fragment", which url.Parse then folds into the fragment and
+	// drops service/scope from the request that reaches the wire.
+	q := realmURL.Query()
 	if svc := params["service"]; svc != "" {
 		q.Set("service", svc)
 	}
@@ -571,18 +576,9 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 		q.Set("scope", scope)
 	}
 
-	tokenURL := realm
+	realmURL.RawQuery = q.Encode()
 
-	if len(q) > 0 {
-		sep := "?"
-		if strings.Contains(realm, "?") {
-			sep = "&"
-		}
-
-		tokenURL = realm + sep + q.Encode()
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, realmURL.String(), nil)
 	if err != nil {
 		return "", 0, err
 	}
@@ -639,6 +635,25 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 
 func (r *registry) canSendBasicAuth() bool {
 	return r.base != nil && strings.EqualFold(r.base.Scheme, "https")
+}
+
+// checkRedirect mirrors net/http's default policy (stop after 10 hops) while
+// additionally stripping the Authorization header on any redirect whose target
+// is not HTTPS. net/http already drops sensitive headers on cross-host
+// redirects, but it preserves them across a same-host HTTPS->HTTP downgrade,
+// which would leak Basic or bearer credentials onto a plaintext hop. This is
+// defense in depth on top of canSendBasicAuth and the bearer realm HTTPS
+// validation.
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+
+	if !strings.EqualFold(req.URL.Scheme, "https") {
+		req.Header.Del("Authorization")
+	}
+
+	return nil
 }
 
 func (r *registry) cachedToken() string {
