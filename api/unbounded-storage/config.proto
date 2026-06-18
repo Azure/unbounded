@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package unbounded.storage.config;
 
+option go_package = "github.com/Azure/unbounded/api/unbounded-storage;storageconfig";
+
 message Config {
   // Operator-assigned configuration version. The daemon treats it as an
   // opaque counter: it never drives behavior, but it is tracked as the

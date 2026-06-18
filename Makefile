@@ -72,6 +72,15 @@ GANTRY_CMD=./cmd/gantry
 GANTRY_IMAGE ?= $(CONTAINER_REGISTRY)/gantry:$(VERSION)
 GANTRY_NAMESPACE ?= gantry
 
+# unbounded-storage-supervisor (Go binary; distinct from the Rust crate below)
+UNBOUNDED_STORAGE_SUPERVISOR_BIN=bin/unbounded-storage-supervisor
+UNBOUNDED_STORAGE_SUPERVISOR_CMD=./cmd/unbounded-storage-supervisor
+UNBOUNDED_STORAGE_SUPERVISOR_TAG ?= latest
+UNBOUNDED_STORAGE_SUPERVISOR_IMAGE=$(CONTAINER_REGISTRY)/unbounded-storage-supervisor:$(UNBOUNDED_STORAGE_SUPERVISOR_TAG)
+UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE ?= unbounded-kube
+UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-storage-supervisor
+UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-storage-supervisor/rendered
+
 # Rust binaries
 UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
 UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
@@ -183,6 +192,7 @@ REACT_DEV ?= false
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric
+.PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
 
 ##@ General
 
@@ -229,6 +239,7 @@ help: ## Show this help
 	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
+	@echo "  unbounded-storage-supervisor | unbounded-storage-supervisor-build  Build the storage supervisor (with/without lint/test)"
 	@echo ""
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
@@ -252,6 +263,8 @@ help: ## Show this help
 	@echo "  image-inventory-inspector-push   Build and push the inventory-inspector container image"
 	@echo "  image-inventory-viewer-local     Build a local inventory-viewer container image"
 	@echo "  image-inventory-viewer-push      Build and push the inventory-viewer container image"
+	@echo "  image-unbounded-storage-supervisor-local Build a local unbounded-storage-supervisor container image"
+	@echo "  image-unbounded-storage-supervisor-push  Build and push the unbounded-storage-supervisor container image"
 	@echo "  image-machina-local              Build machina image with \$$(CONTAINER_ENGINE)"
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-metalman-local             Build metalman image"
@@ -282,6 +295,7 @@ help: ## Show this help
 	@echo "  machine-ops-manifests            Render machine-ops manifests into deploy/machine-ops/rendered"
 	@echo "  net-manifests                    Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
 	@echo "  orca-manifests                   Render orca manifests into deploy/orca/rendered"
+	@echo "  unbounded-storage-supervisor-manifests  Render storage supervisor manifests into deploy/unbounded-storage-supervisor/rendered"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
 	@echo "  See \`make -C hack/net help\` for cluster deploy/undeploy targets."
@@ -537,6 +551,21 @@ gantry-build: ## Build the gantry binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(GANTRY_BIN) $(GANTRY_CMD)
 
 gantry: test gantry-build ## Build gantry (implies test)
+
+unbounded-storage-supervisor-build: ## Build the unbounded-storage-supervisor binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_STORAGE_SUPERVISOR_BIN) $(UNBOUNDED_STORAGE_SUPERVISOR_CMD)
+
+unbounded-storage-supervisor: test unbounded-storage-supervisor-build ## Build the unbounded-storage-supervisor (implies test)
+
+unbounded-storage-supervisor-manifests: ## Render unbounded-storage-supervisor manifests into deploy/unbounded-storage-supervisor/rendered
+	@mkdir -p $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR)
+	@find $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE) \
+		--set Image=$(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE)
+	@echo "Rendered unbounded-storage-supervisor manifests into $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE))"
 
 ##@ Rust Binaries
 
@@ -806,6 +835,20 @@ image-inventory-viewer-local: ## Build the inventory-viewer container image
 .PHONY: image-inventory-viewer-push
 image-inventory-viewer-push: image-inventory-viewer-local ## Build and push the inventory-viewer container image
 	$(CONTAINER_ENGINE) push $(INVENTORY_VIEWER_IMAGE)
+
+.PHONY: image-unbounded-storage-supervisor-local
+image-unbounded-storage-supervisor-local: ## Build the unbounded-storage-supervisor container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t unbounded-storage-supervisor:$(UNBOUNDED_STORAGE_SUPERVISOR_TAG) -t $(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE) \
+		-f ./images/unbounded-storage-supervisor/Containerfile .
+	$(call trivy-maybe,$(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE))
+
+.PHONY: image-unbounded-storage-supervisor-push
+image-unbounded-storage-supervisor-push: image-unbounded-storage-supervisor-local ## Build and push the unbounded-storage-supervisor container image
+	$(CONTAINER_ENGINE) push $(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE)
 
 image-machina-local: ## Build the machina container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \

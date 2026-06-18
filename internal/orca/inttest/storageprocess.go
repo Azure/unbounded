@@ -44,7 +44,7 @@ const (
 	// must be a multiple of the page size and large enough to hold every
 	// stripe of the largest object on one node. The proto3-native config
 	// schema takes byte sizes as plain integers (see
-	// cmd/unbounded-storage/proto/config.proto), so this is 2 GiB.
+	// api/unbounded-storage/config.proto), so this is 2 GiB.
 	storageDiskSize = 2 * 1024 * 1024 * 1024
 
 	// storageBackendKindS3 and storageFrontendKindS3 are the proto3
