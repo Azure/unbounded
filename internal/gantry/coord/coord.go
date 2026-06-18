@@ -232,6 +232,13 @@ func (s *Server) Bind(h host.Host) {
 	h.SetStreamHandler(ProtocolID, s.handleStream)
 }
 
+// Unbind removes the stream handler registered by Bind. Shutdown calls this
+// before waiting on puller-pump goroutines so no new inbound coord stream can
+// start another background origin pull while the pump gate is draining.
+func (s *Server) Unbind(h host.Host) {
+	h.RemoveStreamHandler(ProtocolID)
+}
+
 // handleStream is invoked by libp2p for each inbound stream. The
 // design pins "one stream per request/response pair" - we read one
 // length-delimited envelope, dispatch, write one envelope, close.

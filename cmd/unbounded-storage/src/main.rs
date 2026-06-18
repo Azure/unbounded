@@ -113,6 +113,10 @@ fn startup_to_core_plan_config(topology: &config::TopologyCfg) -> CorePlanConfig
             0 => None,
             n => Some(n as usize),
         },
+        hcas_per_numa: match topology.hcas_per_numa_node {
+            0 => defaults.hcas_per_numa,
+            n => n as usize,
+        },
         use_smt_siblings: topology.use_smt_siblings,
         respect_isolated: !topology.ignore_isolated,
         exclude_node_cpu0: !topology.include_node_cpu0,
@@ -1445,7 +1449,12 @@ struct Cli {
 /// parse errors - is fatal.
 fn load_config(path: &Path, explicit: bool) -> Result<Config, String> {
     match Config::load(path) {
-        Ok(c) => Ok(c),
+        Ok(c) => {
+            if path.extension().and_then(|e| e.to_str()) == Some("binpb") {
+                eprintln!("config: loaded {} (binpb):\n{c:#?}", path.display());
+            }
+            Ok(c)
+        }
         Err(config::ConfigError::Io(e))
             if !explicit && e.kind() == std::io::ErrorKind::NotFound =>
         {
@@ -1541,6 +1550,7 @@ mod tests {
         let d = CorePlanConfig::default();
         assert_eq!(cc.nic_workers, 4);
         assert_eq!(cc.serving_cores, None);
+        assert_eq!(cc.hcas_per_numa, 1);
         // Default-off topology flags map to the historical defaults.
         assert!(!cc.use_smt_siblings);
         assert!(cc.respect_isolated);
@@ -1565,10 +1575,12 @@ mod tests {
             disable_rdma: true,
             serving_cores: 12,
             nic_workers: 6,
+            hcas_per_numa_node: 2,
         };
         let cc = startup_to_core_plan_config(&topology);
         assert_eq!(cc.nic_workers, 6);
         assert_eq!(cc.serving_cores, Some(12));
+        assert_eq!(cc.hcas_per_numa, 2);
         assert!(cc.use_smt_siblings);
         assert!(!cc.respect_isolated);
         assert!(!cc.exclude_node_cpu0);
@@ -1583,11 +1595,13 @@ mod tests {
         let topology = config::TopologyCfg {
             nic_workers: 0,
             serving_cores: 0,
+            hcas_per_numa_node: 0,
             ..default_topology()
         };
         let cc = startup_to_core_plan_config(&topology);
         assert_eq!(cc.nic_workers, 4);
         assert_eq!(cc.serving_cores, None);
+        assert_eq!(cc.hcas_per_numa, 1);
     }
 
     #[test]

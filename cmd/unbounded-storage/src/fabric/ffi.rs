@@ -61,6 +61,7 @@ pub const FI_READ: u64 = 1 << 8;
 pub const FI_WRITE: u64 = 1 << 9;
 pub const FI_REMOTE_READ: u64 = 1 << 12;
 pub const FI_REMOTE_WRITE: u64 = 1 << 13;
+pub const FI_REMOTE_CQ_DATA: u64 = 1 << 17;
 pub const FI_SOURCE: u64 = 1 << 57;
 
 // fi_ep_type enum discriminants (rdma/fabric.h::enum fi_ep_type).
@@ -134,6 +135,20 @@ pub struct fid_av {
 
 #[repr(C)]
 pub struct fid_mr {
+    _private: [u8; 0],
+}
+
+/// Passive (listening) endpoint, used by the connection manager on the
+/// server side. Opaque; only ever touched through shim wrappers.
+#[repr(C)]
+pub struct fid_pep {
+    _private: [u8; 0],
+}
+
+/// Event queue. Carries connection-manager events (`FI_CONNREQ`,
+/// `FI_CONNECTED`, `FI_SHUTDOWN`) for `FI_EP_MSG` endpoints.
+#[repr(C)]
+pub struct fid_eq {
     _private: [u8; 0],
 }
 
@@ -216,7 +231,7 @@ pub struct fi_cq_tagged_entry {
     pub tag: u64,
 }
 
-/// CQ error entry. Stable libfabric ABI.
+/// CQ error entry copied by the C shim from libfabric's native layout.
 #[repr(C)]
 pub struct fi_cq_err_entry {
     pub op_context: *mut c_void,
@@ -230,7 +245,6 @@ pub struct fi_cq_err_entry {
     pub prov_errno: c_int,
     pub err_data: *mut c_void,
     pub err_data_size: usize,
-    pub src_addr: fi_addr_t,
 }
 
 #[repr(C)]
@@ -238,6 +252,43 @@ pub struct fi_rma_iov {
     pub addr: u64,
     pub len: usize,
     pub key: u64,
+}
+
+/// Event-queue open attributes. Rust zero-initializes this and writes
+/// `wait_obj`; everything else stays at provider defaults. Layout
+/// matches libfabric 1.x (stable ABI).
+#[repr(C)]
+pub struct fi_eq_attr {
+    pub size: usize,
+    pub flags: u64,
+    pub wait_obj: u32,
+    pub signaling_vector: c_int,
+    pub wait_set: *mut fid,
+}
+
+/// Connection-manager event payload read off the EQ for `FI_CONNREQ`,
+/// `FI_CONNECTED`, and `FI_SHUTDOWN`. The trailing `data[]` flexible
+/// array (connect private data) is not represented here; callers that
+/// need it read past the struct. `info` is non-null only for
+/// `FI_CONNREQ` and must be consumed (used to build the active EP) or
+/// freed.
+#[repr(C)]
+pub struct fi_eq_cm_entry {
+    pub fid: *mut fid,
+    pub info: *mut fi_info,
+}
+
+/// EQ error entry, read via `ub_fi_eq_readerr` after the EQ reports
+/// `-FI_EAVAIL`. Stable libfabric ABI.
+#[repr(C)]
+pub struct fi_eq_err_entry {
+    pub fid: *mut fid,
+    pub context: *mut c_void,
+    pub data: u64,
+    pub err: c_int,
+    pub prov_errno: c_int,
+    pub err_data: *mut c_void,
+    pub err_data_size: usize,
 }
 
 unsafe extern "C" {
@@ -304,6 +355,12 @@ unsafe extern "C" {
     pub fn ub_fi_getname(fid: *mut fid, addr: *mut c_void, addrlen: *mut usize) -> c_int;
 
     pub fn ub_fi_build_hints(prov_name: *const c_char) -> *mut fi_info;
+    pub fn ub_fi_hints_set_domain(hints: *mut fi_info, name: *const c_char) -> c_int;
+    pub fn ub_fi_hints_set_src_addr(
+        hints: *mut fi_info,
+        addr: *const c_void,
+        addrlen: usize,
+    ) -> c_int;
     pub fn ub_fi_info_fabric_attr(info: *mut fi_info) -> *mut fi_fabric_attr;
     pub fn ub_fi_info_mr_mode(info: *mut fi_info) -> c_int;
     pub fn ub_fi_info_threading(info: *mut fi_info) -> c_int;
@@ -380,6 +437,12 @@ unsafe extern "C" {
     ) -> ssize_t;
 
     pub fn ub_fi_parse_sockaddr(s: *const c_char, out: *mut u8, out_cap: usize) -> ssize_t;
+    pub fn ub_fi_format_sockaddr(
+        addr: *const c_void,
+        addrlen: usize,
+        out: *mut c_char,
+        cap: usize,
+    ) -> ssize_t;
 
     pub fn ub_fi_write(
         ep: *mut fid_ep,
@@ -392,7 +455,63 @@ unsafe extern "C" {
         context: *mut c_void,
     ) -> ssize_t;
 
+    pub fn ub_fi_writedata(
+        ep: *mut fid_ep,
+        buf: *const c_void,
+        len: usize,
+        desc: *mut c_void,
+        data: u64,
+        dest_addr: fi_addr_t,
+        addr: u64,
+        key: u64,
+        context: *mut c_void,
+    ) -> ssize_t;
+
     pub fn ub_fi_cancel(fid: *mut fid, context: *mut c_void) -> ssize_t;
+
+    // Connection-manager wrappers (FI_EP_MSG). See src/fabric/shim.c.
+    pub fn ub_fi_build_msg_hints(prov_name: *const c_char) -> *mut fi_info;
+    pub fn ub_fi_eq_open(
+        fabric: *mut fid_fabric,
+        attr: *mut fi_eq_attr,
+        eq: *mut *mut fid_eq,
+        context: *mut c_void,
+    ) -> c_int;
+    pub fn ub_fi_passive_ep(
+        fabric: *mut fid_fabric,
+        info: *mut fi_info,
+        pep: *mut *mut fid_pep,
+        context: *mut c_void,
+    ) -> c_int;
+    pub fn ub_fi_pep_bind(pep: *mut fid_pep, bfid: *mut fid, flags: u64) -> c_int;
+    pub fn ub_fi_listen(pep: *mut fid_pep) -> c_int;
+    pub fn ub_fi_ep_bind_eq(ep: *mut fid_ep, eq: *mut fid_eq, flags: u64) -> c_int;
+    pub fn ub_fi_connect(
+        ep: *mut fid_ep,
+        addr: *const c_void,
+        param: *const c_void,
+        paramlen: usize,
+    ) -> c_int;
+    pub fn ub_fi_accept(ep: *mut fid_ep, param: *const c_void, paramlen: usize) -> c_int;
+    pub fn ub_fi_eq_sread(
+        eq: *mut fid_eq,
+        event: *mut u32,
+        buf: *mut c_void,
+        len: usize,
+        timeout: c_int,
+        flags: u64,
+    ) -> ssize_t;
+    pub fn ub_fi_eq_read(
+        eq: *mut fid_eq,
+        event: *mut u32,
+        buf: *mut c_void,
+        len: usize,
+        flags: u64,
+    ) -> ssize_t;
+    pub fn ub_fi_eq_readerr(eq: *mut fid_eq, buf: *mut fi_eq_err_entry, flags: u64) -> ssize_t;
+    pub fn ub_fi_connreq() -> u32;
+    pub fn ub_fi_connected() -> u32;
+    pub fn ub_fi_shutdown() -> u32;
 
     #[cfg(test)]
     fn ub_fi_layout(type_: c_int, field: c_int) -> usize;
@@ -426,6 +545,14 @@ pub fn as_fid_av(p: *mut fid_av) -> *mut fid {
 pub fn as_fid_mr(p: *mut fid_mr) -> *mut fid {
     p as *mut fid
 }
+#[inline]
+pub fn as_fid_pep(p: *mut fid_pep) -> *mut fid {
+    p as *mut fid
+}
+#[inline]
+pub fn as_fid_eq(p: *mut fid_eq) -> *mut fid {
+    p as *mut fid
+}
 
 #[cfg(test)]
 mod tests {
@@ -438,6 +565,9 @@ mod tests {
     const FI_CQ_TAGGED_ENTRY: c_int = 4;
     const FI_CQ_ERR_ENTRY: c_int = 5;
     const FI_RMA_IOV: c_int = 6;
+    const FI_EQ_ATTR: c_int = 7;
+    const FI_EQ_CM_ENTRY: c_int = 8;
+    const FI_EQ_ERR_ENTRY: c_int = 9;
 
     const SIZE: c_int = 0;
     const CQ_ATTR_SIZE: c_int = 1;
@@ -465,10 +595,23 @@ mod tests {
     const CQ_ERR_ENTRY_PROV_ERRNO: c_int = 23;
     const CQ_ERR_ENTRY_ERR_DATA: c_int = 24;
     const CQ_ERR_ENTRY_ERR_DATA_SIZE: c_int = 25;
-    const CQ_ERR_ENTRY_SRC_ADDR: c_int = 26;
     const RMA_IOV_ADDR: c_int = 27;
     const RMA_IOV_LEN: c_int = 28;
     const RMA_IOV_KEY: c_int = 29;
+    const EQ_ATTR_SIZE: c_int = 30;
+    const EQ_ATTR_FLAGS: c_int = 31;
+    const EQ_ATTR_WAIT_OBJ: c_int = 32;
+    const EQ_ATTR_SIGNALING_VECTOR: c_int = 33;
+    const EQ_ATTR_WAIT_SET: c_int = 34;
+    const EQ_CM_ENTRY_FID: c_int = 35;
+    const EQ_CM_ENTRY_INFO: c_int = 36;
+    const EQ_ERR_ENTRY_FID: c_int = 37;
+    const EQ_ERR_ENTRY_CONTEXT: c_int = 38;
+    const EQ_ERR_ENTRY_DATA: c_int = 39;
+    const EQ_ERR_ENTRY_ERR: c_int = 40;
+    const EQ_ERR_ENTRY_PROV_ERRNO: c_int = 41;
+    const EQ_ERR_ENTRY_ERR_DATA: c_int = 42;
+    const EQ_ERR_ENTRY_ERR_DATA_SIZE: c_int = 43;
 
     fn c_layout(type_: c_int, field: c_int) -> usize {
         unsafe { ub_fi_layout(type_, field) }
@@ -645,14 +788,77 @@ mod tests {
             CQ_ERR_ENTRY_ERR_DATA_SIZE,
             offset_of!(fi_cq_err_entry, err_data_size),
         );
-        assert_offset(
-            FI_CQ_ERR_ENTRY,
-            CQ_ERR_ENTRY_SRC_ADDR,
-            offset_of!(fi_cq_err_entry, src_addr),
-        );
         assert_size(FI_RMA_IOV, size_of::<fi_rma_iov>());
         assert_offset(FI_RMA_IOV, RMA_IOV_ADDR, offset_of!(fi_rma_iov, addr));
         assert_offset(FI_RMA_IOV, RMA_IOV_LEN, offset_of!(fi_rma_iov, len));
         assert_offset(FI_RMA_IOV, RMA_IOV_KEY, offset_of!(fi_rma_iov, key));
+
+        assert_size(FI_EQ_ATTR, size_of::<fi_eq_attr>());
+        assert_offset(FI_EQ_ATTR, EQ_ATTR_SIZE, offset_of!(fi_eq_attr, size));
+        assert_offset(FI_EQ_ATTR, EQ_ATTR_FLAGS, offset_of!(fi_eq_attr, flags));
+        assert_offset(
+            FI_EQ_ATTR,
+            EQ_ATTR_WAIT_OBJ,
+            offset_of!(fi_eq_attr, wait_obj),
+        );
+        assert_offset(
+            FI_EQ_ATTR,
+            EQ_ATTR_SIGNALING_VECTOR,
+            offset_of!(fi_eq_attr, signaling_vector),
+        );
+        assert_offset(
+            FI_EQ_ATTR,
+            EQ_ATTR_WAIT_SET,
+            offset_of!(fi_eq_attr, wait_set),
+        );
+
+        assert_size(FI_EQ_CM_ENTRY, size_of::<fi_eq_cm_entry>());
+        assert_offset(
+            FI_EQ_CM_ENTRY,
+            EQ_CM_ENTRY_FID,
+            offset_of!(fi_eq_cm_entry, fid),
+        );
+        assert_offset(
+            FI_EQ_CM_ENTRY,
+            EQ_CM_ENTRY_INFO,
+            offset_of!(fi_eq_cm_entry, info),
+        );
+
+        assert_size(FI_EQ_ERR_ENTRY, size_of::<fi_eq_err_entry>());
+        assert_offset(
+            FI_EQ_ERR_ENTRY,
+            EQ_ERR_ENTRY_FID,
+            offset_of!(fi_eq_err_entry, fid),
+        );
+        assert_offset(
+            FI_EQ_ERR_ENTRY,
+            EQ_ERR_ENTRY_CONTEXT,
+            offset_of!(fi_eq_err_entry, context),
+        );
+        assert_offset(
+            FI_EQ_ERR_ENTRY,
+            EQ_ERR_ENTRY_DATA,
+            offset_of!(fi_eq_err_entry, data),
+        );
+        assert_offset(
+            FI_EQ_ERR_ENTRY,
+            EQ_ERR_ENTRY_ERR,
+            offset_of!(fi_eq_err_entry, err),
+        );
+        assert_offset(
+            FI_EQ_ERR_ENTRY,
+            EQ_ERR_ENTRY_PROV_ERRNO,
+            offset_of!(fi_eq_err_entry, prov_errno),
+        );
+        assert_offset(
+            FI_EQ_ERR_ENTRY,
+            EQ_ERR_ENTRY_ERR_DATA,
+            offset_of!(fi_eq_err_entry, err_data),
+        );
+        assert_offset(
+            FI_EQ_ERR_ENTRY,
+            EQ_ERR_ENTRY_ERR_DATA_SIZE,
+            offset_of!(fi_eq_err_entry, err_data_size),
+        );
     }
 }

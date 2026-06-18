@@ -34,6 +34,11 @@ html {
   font-size: 16px;
   -webkit-font-smoothing: antialiased;
   overflow-y: scroll;
+  scroll-padding-top: calc(var(--nav-height) + 1.5rem);
+}
+
+:target {
+  scroll-margin-top: calc(var(--nav-height) + 1.5rem);
 }
 
 body {

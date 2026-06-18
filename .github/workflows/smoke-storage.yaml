@@ -47,7 +47,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config ca-certificates curl liburing-dev
+            build-essential pkg-config ca-certificates curl liburing-dev \
+            libibverbs-dev librdmacm-dev
 
       # The distro libfabric (1.x) predates the merge of the experimental
       # `net` provider into `tcp`, so it lacks a native FI_EP_RDM `tcp`

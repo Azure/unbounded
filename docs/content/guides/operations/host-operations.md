@@ -167,6 +167,10 @@ Operation completion means the replacement VM or host has been created. It does
 not mean the Kubernetes Node is Ready. The Machine controller continues tracking
 whether the Node disappears and rejoins.
 
+For bare-metal PXE replacements, metalman keeps the `MachineOperation` active
+until the replacement Node object exists so provisioning retries can continue if
+cloud-init times out before the node rejoins.
+
 ### Provider Behavior
 
 **Azure VM** - reads the existing VM model, detaches NICs and data disks,
@@ -183,7 +187,8 @@ replacement flow with fresh `user_data` injection has not been verified.
 selected host OS image, installs or configures the agent, and lets the agent
 create the nspawn node. The `MachineOperation` records per-machine progress in
 `status.targets[]`; each target completes after the Machine status shows the
-requested repave and reboot counters were observed and `Repaved=True`.
+requested repave and reboot counters were observed, `Repaved=True`, and the
+corresponding Kubernetes Node object exists.
 
 ### HostReplace vs Node Recreation
 

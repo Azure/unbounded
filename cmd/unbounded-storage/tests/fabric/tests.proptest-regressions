@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc feab94a984d01ceae9ef27a1e294fffd7d4ef483040fd73877d258f0930f2a06 # shrinks to w = Workload { request_id: 0, remote_key: 0, src: BulkRef { stripe: StripeKey([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), offset: 0, len: 0 }, local_base: 0, dest_base: 0, local_pages: 1, dest_pages: 0, page: PageRef { page_idx: 0, offset: 0, len: 0 }, dest_idx: 0, available_slots: 0, dst_count: 0 }

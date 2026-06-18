@@ -252,7 +252,7 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 		},
 		Spec: v1alpha3.MachineSpec{
 			Kubernetes: &v1alpha3.KubernetesSpec{
-				BootstrapTokenRef: v1alpha3.LocalObjectReference{
+				BootstrapTokenRef: &v1alpha3.LocalObjectReference{
 					Name: "bootstrap-token-" + tokenID,
 				},
 				NodeLabels:         cfg.Kubelet.Labels,
