@@ -284,6 +284,10 @@ func extractTarGz(archivePath, destDir string) error {
 			return fmt.Errorf("read tar: %w", err)
 		}
 
+		if strings.Contains(header.Name, "..") {
+			return fmt.Errorf("reject tar entry %q: contains '..'", header.Name)
+		}
+
 		rel, ok := stripComponent(header.Name)
 		if !ok {
 			// Top-level entry itself (the stripped directory); skip it.

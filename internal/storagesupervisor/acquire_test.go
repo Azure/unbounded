@@ -117,8 +117,9 @@ func TestExtractTarGzStripsTopLevel(t *testing.T) {
 
 func TestExtractTarGzRejectsTraversal(t *testing.T) {
 	tests := []struct {
-		name    string
-		entries []tarEntry
+		name      string
+		entries   []tarEntry
+		alwaysErr bool
 	}{
 		{
 			name: "dotdot escape",
@@ -126,6 +127,7 @@ func TestExtractTarGzRejectsTraversal(t *testing.T) {
 				{name: "top/", typ: tar.TypeDir, mode: 0o755},
 				{name: "top/../escape", body: "x", mode: 0o644},
 			},
+			alwaysErr: true,
 		},
 		{
 			name: "absolute path",
@@ -142,6 +144,10 @@ func TestExtractTarGzRejectsTraversal(t *testing.T) {
 			dest := t.TempDir()
 
 			err := extractTarGz(archive, dest)
+			if tt.alwaysErr {
+				require.Error(t, err)
+			}
+
 			if err == nil {
 				// Absolute-style names may normalize into dest; ensure nothing
 				// escaped the destination directory.
