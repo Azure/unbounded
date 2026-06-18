@@ -414,9 +414,6 @@ async fn fetch(
         buf.extend_from_slice(&chunk);
     };
 
-    if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
-        return Err(Error::from("http backend: origin returned non-2xx status"));
-    }
     check_origin_status(status, start)?;
 
     // An origin that answers a different slice than we asked for would
@@ -626,8 +623,16 @@ fn expected_body_len(
 /// ignored our `Range` and is streaming the whole object from byte 0;
 /// that is only usable when we asked from offset 0, otherwise the body
 /// would not begin at `start` and copying it would silently corrupt the
-/// stripe. Non-2xx is rejected by the caller before this is reached.
+/// stripe. A `412 Precondition Failed` means the cached ETag no longer
+/// matches the origin object and the metadata entry must be refreshed.
+/// Other non-2xx statuses are generic transport failures.
 fn check_origin_status(status: StatusCode, start: u64) -> Result<(), Error> {
+    if status == StatusCode::PRECONDITION_FAILED {
+        return Err(Error::OriginVersionMismatch);
+    }
+    if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
+        return Err(Error::from("http backend: origin returned non-2xx status"));
+    }
     if status == StatusCode::OK && start != 0 {
         return Err(Error::from(
             "http backend: origin ignored Range (200) for a non-zero offset",
@@ -947,6 +952,10 @@ mod tests {
         // it would corrupt the stripe, so it must be rejected.
         assert!(check_origin_status(StatusCode::OK, 1).is_err());
         assert!(check_origin_status(StatusCode::OK, 4096).is_err());
+        let err = check_origin_status(StatusCode::PRECONDITION_FAILED, 0).unwrap_err();
+        assert!(matches!(err, Error::OriginVersionMismatch));
+        let err = check_origin_status(StatusCode::FORBIDDEN, 0).unwrap_err();
+        assert!(matches!(err, Error::Transport(_)));
     }
 
     #[test]

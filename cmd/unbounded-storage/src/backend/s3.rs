@@ -569,10 +569,15 @@ fn expected_body_len(
 /// ignored our `Range` and is streaming the whole object from byte 0;
 /// that is only usable when we asked from offset 0. A `404 Not Found`
 /// maps to [`Error::OriginNotFound`] so the pool can tell a missing
-/// object apart from a transport failure. Other non-2xx are generic.
+/// object apart from a transport failure. A `412 Precondition Failed`
+/// means the cached ETag no longer matches the origin object and the
+/// metadata entry must be refreshed. Other non-2xx are generic.
 fn check_origin_status(status: StatusCode, start: u64) -> Result<(), Error> {
     if status == StatusCode::NOT_FOUND {
         return Err(Error::OriginNotFound);
+    }
+    if status == StatusCode::PRECONDITION_FAILED {
+        return Err(Error::OriginVersionMismatch);
     }
     if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
         return Err(Error::from("s3 backend: origin returned non-2xx status"));
@@ -855,6 +860,8 @@ mod tests {
         assert!(check_origin_status(StatusCode::PARTIAL_CONTENT, 4096).is_ok());
         assert!(check_origin_status(StatusCode::OK, 0).is_ok());
         assert!(check_origin_status(StatusCode::OK, 1).is_err());
+        let err = check_origin_status(StatusCode::PRECONDITION_FAILED, 0).unwrap_err();
+        assert!(matches!(err, Error::OriginVersionMismatch));
         // Other non-2xx stay generic (not OriginNotFound).
         let err = check_origin_status(StatusCode::FORBIDDEN, 0).unwrap_err();
         assert!(matches!(err, Error::Transport(_)));

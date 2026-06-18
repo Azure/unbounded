@@ -168,19 +168,31 @@ impl OriginRef {
 pub struct StripeReq {
     key: StripeKey,
     origin: Option<OriginRef>,
+    force_refresh_cached_page: bool,
 }
 
 impl StripeReq {
     /// Construct a request that carries only the routing key, with no
     /// origin mapping attached.
     pub fn new(key: StripeKey) -> Self {
-        Self { key, origin: None }
+        Self {
+            key,
+            origin: None,
+            force_refresh_cached_page: false,
+        }
     }
 
     /// Attach the origin mapping the HTTP backend uses to resolve a
     /// miss to an origin byte range, returning the updated request.
     pub fn with_origin(mut self, origin: OriginRef) -> Self {
         self.origin = Some(origin);
+        self
+    }
+
+    /// Force a cached metadata entry to be re-read from its backend even
+    /// if its TTL still marks it fresh.
+    pub fn with_force_refresh_cached_page(mut self) -> Self {
+        self.force_refresh_cached_page = true;
         self
     }
 
@@ -202,6 +214,9 @@ impl Req for StripeReq {
         };
         if !origin.is_metadata_entry() {
             return Ok(false);
+        }
+        if self.force_refresh_cached_page {
+            return Ok(true);
         }
         let Ok(meta) = ObjectMetadata::decode(page) else {
             return Ok(true);
@@ -414,6 +429,26 @@ mod tests {
         let req = StripeReq::new(k).with_origin(origin.clone());
         assert_eq!(req.key(), k);
         assert_eq!(req.origin(), Some(&origin));
+    }
+
+    #[test]
+    fn forced_metadata_refresh_overrides_fresh_entry() {
+        let origin = OriginRef::metadata_entry("primary-s3", "models/llama.bin");
+        let page = ObjectMetadata::from_origin_head(
+            123,
+            Some("\"etag-1\""),
+            Some("max-age=3600"),
+            now_unix_millis(),
+        )
+        .encode()
+        .unwrap();
+        let req = StripeReq::new(origin.stripe_key()).with_origin(origin.clone());
+        assert!(!req.should_refresh_cached_page(&page).unwrap());
+
+        let req = StripeReq::new(origin.stripe_key())
+            .with_origin(origin)
+            .with_force_refresh_cached_page();
+        assert!(req.should_refresh_cached_page(&page).unwrap());
     }
 
     #[test]

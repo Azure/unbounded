@@ -387,7 +387,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
     // the plain HTTP frontend, a length-read failure is never a silently
     // dropped connection.
-    let meta = match read_object_metadata_s3(pool, backend_id, &path, page_size).await {
+    let meta = match read_object_metadata_s3(pool, backend_id, &path, page_size, false).await {
         LenResult::Metadata(m) => m,
         LenResult::NotFound => {
             let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
@@ -504,7 +504,14 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
         .collect();
     let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
     while let Some(page) = rs.next_page().await {
-        let page = page.map_err(|_| ())?;
+        let page = match page {
+            Ok(page) => page,
+            Err(Error::OriginVersionMismatch) => {
+                let _ = read_object_metadata_s3(pool, backend_id, &path, page_size, true).await;
+                return Err(());
+            }
+            Err(_) => return Err(()),
+        };
         let pr = page.page_ref();
         let page_byte_offset = pr.page_idx as usize * page_size + pr.offset as usize;
         let n = pr.len as usize;
@@ -562,9 +569,13 @@ async fn read_object_metadata_s3<P: BufferPool<Req = StripeReq>>(
     backend_id: &str,
     path: &str,
     page_size: usize,
+    force_refresh: bool,
 ) -> LenResult {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
-    let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
+    let mut req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
+    if force_refresh {
+        req = req.with_force_refresh_cached_page();
+    }
     let mut rs = match pool.read(&req, 0, page_size as u64).await {
         Ok(rs) => rs,
         Err(Error::OriginNotFound) => return LenResult::NotFound,

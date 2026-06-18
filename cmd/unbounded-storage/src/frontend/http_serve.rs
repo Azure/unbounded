@@ -40,7 +40,7 @@ use std::task::{Context, Poll, Waker};
 use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE};
 use ::http::{Response, StatusCode};
 
-use crate::bufferpool::{BufferPool, ReadStream, StripeKey, StripePlan};
+use crate::bufferpool::{BufferPool, Error, ReadStream, StripeKey, StripePlan};
 use crate::config::{FrontendKind, FrontendSpec};
 use crate::fanout::{FanoutTable, FetchChannel, FetchReply, Owner};
 use crate::frontend::FrontendError;
@@ -366,7 +366,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     // 5. Resolve object metadata through the pool. The HTTP backend
     // fills it from an origin HEAD on a miss or after a backend-provided
     // TTL expires.
-    let meta = read_object_metadata(pool, backend_id, &path, page_size)
+    let meta = read_object_metadata(pool, backend_id, &path, page_size, false)
         .await
         .map_err(|_| ())?;
     let len = meta.length;
@@ -414,7 +414,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
 
     // 8. Stream the body, fanning each stripe out to its content-address
     // owner shard (or the local pool when this shard owns it).
-    stream_body(
+    match stream_body(
         pool,
         handle,
         fanout,
@@ -427,6 +427,14 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         stripe_size,
     )
     .await
+    {
+        Ok(()) => Ok(()),
+        Err(Error::OriginVersionMismatch) => {
+            let _ = read_object_metadata(pool, backend_id, &path, page_size, true).await;
+            Err(())
+        }
+        Err(_) => Err(()),
+    }
 }
 
 /// Type-erased cross-shard fetch future. Holds the channel round-trip to
@@ -496,24 +504,23 @@ async fn yield_now() {
 }
 
 /// Send `len` bytes from registered fixed buffer `buf_index` starting at
-/// `offset`, looping over short `SEND_ZC` completions. `Err(())` on a
-/// zero-length completion (peer closed) or ring error.
+/// `offset`, looping over short `SEND_ZC` completions.
 async fn send_region(
     handle: &NetHandle,
     conn_fd: RawFd,
     buf_index: u16,
     offset: usize,
     len: usize,
-) -> Result<(), ()> {
+) -> Result<(), Error> {
     let mut sent_offset = offset;
     let mut remaining = len;
     while remaining > 0 {
         let sent = handle
             .send_zc_fixed(conn_fd, buf_index, sent_offset, remaining)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| Error::Io(libc::EIO))?;
         if sent == 0 {
-            return Err(());
+            return Err(Error::Io(libc::EIO));
         }
         sent_offset += sent;
         remaining -= sent;
@@ -582,7 +589,7 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
     page_size: usize,
     resolved: ResolvedRange,
     stripe_size: u64,
-) -> Result<(), ()> {
+) -> Result<(), Error> {
     let slices = stripe_set(resolved, stripe_size);
 
     if fanout.shard_count() <= 1 {
@@ -597,9 +604,9 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
                 }
             })
             .collect();
-        let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
+        let mut rs = pool.read_pipelined(plans, usize::MAX)?;
         while let Some(page) = rs.next_page().await {
-            let page = page.map_err(|_| ())?;
+            let page = page?;
             let pr = page.page_ref();
             let offset = pr.page_idx as usize * page_size + pr.offset as usize;
             send_region(handle, conn_fd, 0, offset, pr.len as usize).await?;
@@ -642,9 +649,9 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
                         plans.push(local_plan(slice));
                     }
                 }
-                let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
+                let mut rs = pool.read_pipelined(plans, usize::MAX)?;
                 while let Some(page) = rs.next_page().await {
-                    let page = page.map_err(|_| ())?;
+                    let page = page?;
                     let pr = page.page_ref();
                     let offset = pr.page_idx as usize * page_size + pr.offset as usize;
                     send_region(handle, conn_fd, 0, offset, pr.len as usize).await?;
@@ -676,7 +683,7 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
                         window.push_front(retry);
                         continue;
                     }
-                    Err(_) => return Err(()),
+                    Err(e) => return Err(e),
                 };
                 // Send every page in stripe order from the owner's
                 // backing, then release the owner's pin. The pin must
@@ -696,7 +703,7 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
                     .await
                     .is_err()
                     {
-                        result = Err(());
+                        result = Err(Error::Io(libc::EIO));
                         break;
                     }
                 }
@@ -725,9 +732,13 @@ async fn read_object_metadata<P: BufferPool<Req = StripeReq>>(
     backend_id: &str,
     path: &str,
     page_size: usize,
+    force_refresh: bool,
 ) -> Result<ObjectMetadata, ()> {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
-    let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
+    let mut req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
+    if force_refresh {
+        req = req.with_force_refresh_cached_page();
+    }
     let mut rs: ReadStream = pool.read(&req, 0, page_size as u64).await.map_err(|_| ())?;
     let page = rs.next_page().await.ok_or(())?.map_err(|_| ())?;
     ObjectMetadata::decode(page.as_slice()).map_err(|_| ())

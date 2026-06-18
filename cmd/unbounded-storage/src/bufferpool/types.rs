@@ -94,6 +94,9 @@ pub enum Error {
     /// the origin). Distinct from a transport failure: the fetch
     /// completed, the origin simply has no such object.
     OriginNotFound,
+    /// The origin rejected a conditional GET because the object version
+    /// changed after its metadata entry was cached.
+    OriginVersionMismatch,
 }
 
 impl Error {
@@ -144,6 +147,7 @@ impl fmt::Display for Error {
             Error::PrefetchBackoff => write!(f, "speculative prefetch backed off"),
             Error::Busy => write!(f, "pool busy: no free page for non-blocking fetch"),
             Error::OriginNotFound => write!(f, "origin object not found"),
+            Error::OriginVersionMismatch => write!(f, "origin object version mismatch"),
         }
     }
 }
