@@ -25,7 +25,6 @@ func Provision(log *slog.Logger, gs *goalstates.RootFS) phases.Task {
 			DownloadCNIBinaries(log, gs),
 			ConfigureOS(gs),
 			DisableResolved(gs),
-			DisableImageFirewall(gs),
 		),
 	)
 }
