@@ -19,6 +19,7 @@ The test follows a single linear sequence:
 Options:
     --verbose                          Enable diagnostic output (network diags).
     --node-config PATH                 JSON file with node config variant settings.
+    AGENT_OCI_IMAGE                    Optional OCI rootfs image for the agent node.
 
 Subcommands (called as individual workflow steps):
     create-vm                          Create bridge networking and launch a QEMU VM.
@@ -88,6 +89,7 @@ KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
 KIND_CONTAINER = f"{KIND_CLUSTER_NAME}-control-plane"
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
+AGENT_OCI_IMAGE = os.environ.get("AGENT_OCI_IMAGE", "")
 
 # Site name used when generating the bootstrap script via kubectl-unbounded.
 E2E_SITE_NAME = os.environ.get("E2E_SITE_NAME", "e2e")
@@ -253,8 +255,18 @@ def install_bpftool(machine: str) -> None:
     # TODO: remove this once agent-ubuntu2404 and agent-ubuntu2404-nvidia
     # images containing bpftool have been published and are used by e2e.
     machine_shell(machine, textwrap.dedent("""\
-        apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y linux-tools-common
+        if command -v bpftool >/dev/null 2>&1; then
+            exit 0
+        fi
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y linux-tools-common
+        elif command -v tdnf >/dev/null 2>&1; then
+            tdnf install -y bpftool
+        else
+            echo "no supported package manager found for bpftool" >&2
+            exit 1
+        fi
     """))
 
 
@@ -1388,6 +1400,9 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         "--site", E2E_SITE_NAME,
         *node_config_bootstrap_args(node_config),
     ]
+    if AGENT_OCI_IMAGE:
+        log(f"Using OCI rootfs image: {AGENT_OCI_IMAGE}")
+        bootstrap_args.extend(["--oci-image", AGENT_OCI_IMAGE])
     bootstrap_script = capture(bootstrap_args)
 
     # The kubeconfig uses a localhost address that is not reachable from the VM.
