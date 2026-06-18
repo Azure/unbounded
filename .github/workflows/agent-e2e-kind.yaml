@@ -60,6 +60,9 @@ jobs:
           - host-base-os: ubuntu2404
             nspawn-base-os: ubuntu2404
             nspawn-oci-image: ""
+          # Fedora covers the RPM host path for Azure Linux nspawn testing.
+          # Azure Linux 3 does not currently publish a QEMU-ready VHD that this
+          # e2e can boot directly as the host VM.
           - host-base-os: fedora
             nspawn-base-os: azlinux3
             nspawn-oci-image: ghcr.io/azure/agent-azlinux3:b34af7297c411003e5766a95c79b98dca8a44a60
