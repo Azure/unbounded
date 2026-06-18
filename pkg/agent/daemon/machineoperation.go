@@ -85,7 +85,7 @@ func (r *MachinaMachineOperationReconciler) ReconcileMachineOperation(
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if op.Status.Phase != "" {
+	if op.Status.IsTerminal() {
 		return ctrl.Result{}, nil
 	}
 
