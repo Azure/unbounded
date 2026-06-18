@@ -326,5 +326,17 @@ func safeJoin(base, rel string) (string, error) {
 		return "", fmt.Errorf("unsafe tar entry name: %q", rel)
 	}
 
-	return filepath.Join(base, cleaned), nil
+	baseAbs, err := filepath.Abs(base)
+	if err != nil {
+		return "", fmt.Errorf("resolve base path %q: %w", base, err)
+	}
+	baseAbs = filepath.Clean(baseAbs)
+
+	target := filepath.Clean(filepath.Join(baseAbs, cleaned))
+	basePrefix := baseAbs + string(filepath.Separator)
+	if target != baseAbs && !strings.HasPrefix(target, basePrefix) {
+		return "", fmt.Errorf("unsafe tar entry name: %q", rel)
+	}
+
+	return target, nil
 }
