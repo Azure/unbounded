@@ -60,12 +60,6 @@ jobs:
           - host-base-os: ubuntu2404
             nspawn-base-os: ubuntu2404
             nspawn-oci-image: ""
-          - host-base-os: ubuntu2404
-            nspawn-base-os: azlinux3
-            nspawn-oci-image: ghcr.io/azure/agent-azlinux3:b34af7297c411003e5766a95c79b98dca8a44a60
-          - host-base-os: fedora
-            nspawn-base-os: ubuntu2404
-            nspawn-oci-image: ""
           - host-base-os: fedora
             nspawn-base-os: azlinux3
             nspawn-oci-image: ghcr.io/azure/agent-azlinux3:b34af7297c411003e5766a95c79b98dca8a44a60

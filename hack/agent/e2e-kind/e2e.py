@@ -83,6 +83,7 @@ VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
 HOST_BASE_OS = os.environ.get("HOST_BASE_OS", "ubuntu2404")
 HOST_IMAGE_URL = os.environ.get("HOST_IMAGE_URL", "")
 NSPAWN_OCI_IMAGE = os.environ.get("NSPAWN_OCI_IMAGE", "")
+VM_SSH_USER = os.environ.get("VM_SSH_USER", "ubuntu")
 NODE_CONFIG_DIR = REPO_ROOT / "hack" / "agent" / "e2e-kind" / "node-configs"
 
 KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
@@ -113,7 +114,7 @@ SSH_OPTS = [
     "-o", "ConnectTimeout=10",
     "-i", str(SSH_KEY),
 ]
-SSH_TARGET = f"ubuntu@{VM_IP}"
+SSH_TARGET = f"{VM_SSH_USER}@{VM_IP}"
 
 KUBECTL = "kubectl"
 KUBECTL_UNBOUNDED = str(REPO_ROOT / "bin" / "kubectl-unbounded")
@@ -906,6 +907,7 @@ class HostImage:
     url: str
     file_name: str
     backing_format: str
+    uefi: bool
 
 
 def host_image() -> HostImage:
@@ -915,6 +917,7 @@ def host_image() -> HostImage:
             or "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img",
             file_name="ubuntu-cloud-amd64.img",
             backing_format="qcow2",
+            uefi=False,
         )
     if HOST_BASE_OS == "ubuntu2604":
         return HostImage(
@@ -922,37 +925,68 @@ def host_image() -> HostImage:
             or "https://cloud-images.ubuntu.com/minimal/releases/resolute/release/ubuntu-26.04-minimal-cloudimg-amd64.img",
             file_name="ubuntu-26.04-minimal-cloudimg-amd64.img",
             backing_format="qcow2",
+            uefi=False,
+        )
+    if HOST_BASE_OS == "fedora":
+        return HostImage(
+            url=HOST_IMAGE_URL
+            or "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2",
+            file_name="fedora-cloud-amd64.qcow2",
+            backing_format="qcow2",
+            uefi=False,
         )
 
-    die(f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; expected ubuntu2404 or ubuntu2604")
+    die(f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; expected ubuntu2404, ubuntu2604, or fedora")
 
 
-def _launch_vm(ssh_pub_key: str) -> None:
-    """Create a fresh VM disk, cloud-init ISO, launch QEMU, and wait for SSH.
+def _cloud_init_user_data(ssh_pub_key: str, mac_address: str) -> str:
+    if HOST_BASE_OS == "fedora":
+        return textwrap.dedent(f"""\
+            #cloud-config
+            users:
+              - name: {VM_SSH_USER}
+                sudo: ALL=(ALL) NOPASSWD:ALL
+                shell: /bin/bash
+                groups: [wheel]
+                lock_passwd: false
+                ssh_authorized_keys:
+                  - {ssh_pub_key}
 
-    Assumes VM_DIR, the base cloud image, and the SSH key pair already exist.
-    Networking (bridge, TAP, NAT) must already be configured.
-    """
+            package_update: true
+            package_upgrade: false
+            packages:
+              - curl
+              - jq
+              - ca-certificates
+              - net-tools
 
-    image = host_image()
-    image_file = VM_DIR / image.file_name
-    if not image_file.exists():
-        die(f"Base cloud image not found: {image_file}. Run create-vm first.")
+            write_files:
+              - path: /etc/systemd/network/10-e2e.network
+                content: |
+                  [Match]
+                  MACAddress={mac_address}
 
-    # Create VM disk
-    vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
-    log(f"Creating snapshot disk: {vm_disk}")
-    run(["qemu-img", "create", "-f", "qcow2", "-b", str(image_file),
-         "-F", image.backing_format, str(vm_disk), VM_DISK_SIZE])
+                  [Network]
+                  Address={VM_IP}/24
+                  Gateway={VM_GATEWAY}
+                  DNS=8.8.8.8
+                  DNS=8.8.4.4
+                permissions: "0644"
 
-    # cloud-init configuration
-    log("Generating cloud-init configuration...")
+            runcmd:
+              - systemctl restart systemd-networkd
+              - mkdir -p /etc/agent
+              - |
+                cat > /etc/agent/provisioned <<'MARKER'
+                provisioned=true
+                MARKER
+              - 'echo "cloud-init: done"'
+        """)
 
-    user_data = VM_DIR / "user-data"
-    user_data.write_text(textwrap.dedent(f"""\
+    return textwrap.dedent(f"""\
         #cloud-config
         users:
-          - name: ubuntu
+          - name: {VM_SSH_USER}
             sudo: ALL=(ALL) NOPASSWD:ALL
             shell: /bin/bash
             groups: [sudo]
@@ -995,7 +1029,33 @@ def _launch_vm(ssh_pub_key: str) -> None:
             provisioned=true
             MARKER
           - 'echo "cloud-init: done"'
-    """))
+    """)
+
+
+def _launch_vm(ssh_pub_key: str) -> None:
+    """Create a fresh VM disk, cloud-init ISO, launch QEMU, and wait for SSH.
+
+    Assumes VM_DIR, the base cloud image, and the SSH key pair already exist.
+    Networking (bridge, TAP, NAT) must already be configured.
+    """
+
+    image = host_image()
+    image_file = VM_DIR / image.file_name
+    if not image_file.exists():
+        die(f"Base cloud image not found: {image_file}. Run create-vm first.")
+
+    # Create VM disk
+    vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
+    log(f"Creating snapshot disk: {vm_disk}")
+    run(["qemu-img", "create", "-f", "qcow2", "-b", str(image_file),
+         "-F", image.backing_format, str(vm_disk), VM_DISK_SIZE])
+
+    # cloud-init configuration
+    log("Generating cloud-init configuration...")
+    mac_address = qemu_mac_address()
+
+    user_data = VM_DIR / "user-data"
+    user_data.write_text(_cloud_init_user_data(ssh_pub_key, mac_address))
 
     meta_data = VM_DIR / "meta-data"
     # Use a unique instance-id so cloud-init treats this as a new instance
@@ -1030,8 +1090,6 @@ def _launch_vm(ssh_pub_key: str) -> None:
     # Launch QEMU VM
     pid_file = VM_DIR / f"{VM_NAME}.pid"
     qemu_log = VM_DIR / f"{VM_NAME}.log"
-    mac_address = qemu_mac_address()
-
     log("============================================")
     log(f"  Launching VM: {VM_NAME}")
     log(f"  Host OS:      {HOST_BASE_OS}")
@@ -1044,7 +1102,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     log(f"  Log:          {qemu_log}")
     log("============================================")
 
-    run([
+    qemu_args = [
         "qemu-system-x86_64",
         "-cpu", "host", "-accel", "kvm",
         "-m", VM_MEMORY, "-smp", VM_CPUS,
@@ -1055,7 +1113,12 @@ def _launch_vm(ssh_pub_key: str) -> None:
         "-daemonize", "-pidfile", str(pid_file),
         "-serial", f"file:{qemu_log}",
         "-display", "none",
-    ])
+    ]
+    if image.uefi:
+        qemu_args.extend([
+            "-drive", "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd",
+        ])
+    run(qemu_args)
 
     qemu_pid = pid_file.read_text().strip()
     log(f"VM started in background (PID: {qemu_pid})")
@@ -2623,7 +2686,7 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
         "-o", "ConnectTimeout=5",
         "-i", str(vm_dir / "ssh" / "id_ed25519"),
     ]
-    ssh_target = f"ubuntu@{vm_ip}"
+    ssh_target = f"{VM_SSH_USER}@{vm_ip}"
 
     def ssh_log(name: str, command: str) -> None:
         _write_command_log(logs_dir / f"{prefix}{name}", ["ssh", *ssh_opts, ssh_target, command])
