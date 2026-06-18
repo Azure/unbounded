@@ -48,15 +48,17 @@ permissions:
 
 jobs:
   agent-e2e:
-    name: agent e2e (host ${{ matrix.host-base-os }})
+    name: agent e2e (host ${{ matrix.host-base-os }}, nspawn ${{ matrix.nspawn-base-os }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        host-base-os:
-          - ubuntu2404
-          - ubuntu2604
+        include:
+          - host-base-os: ubuntu2404
+            nspawn-base-os: ubuntu2404
+          - host-base-os: ubuntu2604
+            nspawn-base-os: ubuntu2604
     env:
       KIND_CLUSTER_NAME: agent-e2e-${{ matrix.host-base-os }}
       VM_NAME: agent-e2e-${{ matrix.host-base-os }}
@@ -64,6 +66,7 @@ jobs:
       VM_IP: "192.168.100.10"
       AGENT_MACHINE_NAME: agent-e2e-${{ matrix.host-base-os }}
       HOST_BASE_OS: ${{ matrix.host-base-os }}
+      NSPAWN_OCI_IMAGE: ${{ matrix.nspawn-base-os == 'ubuntu2604' && 'ghcr.io/azure/agent-ubuntu2604:16840beaa438c76540b1b819f7a0265deac5ef5a' || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3

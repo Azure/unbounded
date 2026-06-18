@@ -81,6 +81,7 @@ VM_GATEWAY = f"{VM_SUBNET}.1"
 VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
 HOST_BASE_OS = os.environ.get("HOST_BASE_OS", "ubuntu2404")
 HOST_IMAGE_URL = os.environ.get("HOST_IMAGE_URL", "")
+NSPAWN_OCI_IMAGE = os.environ.get("NSPAWN_OCI_IMAGE", "")
 NODE_CONFIG_DIR = REPO_ROOT / "hack" / "agent" / "e2e-kind" / "node-configs"
 
 KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
@@ -354,6 +355,8 @@ def expected_node_taints(node_config: NodeConfig) -> list[dict[str, str]]:
 def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
     """Return manual-bootstrap flags for the active node config variant."""
     args: list[str] = []
+    if NSPAWN_OCI_IMAGE:
+        args.extend(["--oci-image", NSPAWN_OCI_IMAGE])
     if node_config.node_ip:
         args.extend(["--node-ip", expected_node_ip(node_config)])
     for key, value in sorted(expected_node_labels(node_config).items()):
@@ -369,6 +372,7 @@ def log_active_node_config(node_config: NodeConfig) -> None:
     taints = expected_node_taint_strings(node_config)
     log(f"Agent e2e node config variant: {node_config.name}")
     log(f"  node ip: {expected_node_ip(node_config) if node_config.node_ip else '<default>'}")
+    log(f"  nspawn oci image: {NSPAWN_OCI_IMAGE or '<default>'}")
     log(f"  node labels: {', '.join(labels) if labels else '<none>'}")
     log(f"  register-with-taints: {', '.join(taints) if taints else '<none>'}")
 
