@@ -56,6 +56,8 @@ use crate::ring::NetHandle;
 use crate::runtime::noop_waker;
 use crate::storage::{ObjectMetadata, OriginRef, StripeReq};
 
+const VERSIONED_BODY_VERIFY_ATTEMPTS: usize = 2;
+
 /// HTTP serving frontend factory. Built once per [`FrontendSpec`];
 /// holds only the immutable configuration distilled from the spec.
 ///
@@ -363,33 +365,88 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         None => None,
     };
 
-    // 5. Resolve object metadata through the pool. The HTTP backend
-    // fills it from an origin HEAD on a miss or after a backend-provided
-    // TTL expires.
-    let meta = read_object_metadata(pool, backend_id, &path, page_size, !is_head)
-        .await
-        .map_err(|_| ())?;
-    let len = meta.length;
-    let cache_key_version = meta.cache_key_version().map(str::to_string);
+    let mut verify_attempts = 0;
+    let (len, cache_key_version, resolved) = loop {
+        // 5. Resolve object metadata through the pool. The HTTP backend
+        // fills it from an origin HEAD on a miss or after a backend-provided
+        // TTL expires.
+        let meta = read_object_metadata(pool, backend_id, &path, page_size, !is_head)
+            .await
+            .map_err(|_| ())?;
+        let len = meta.length;
+        let cache_key_version = meta.cache_key_version().map(str::to_string);
 
-    // 6. Resolve the requested range against the length.
-    let resolved = match range {
-        None => full_object(len),
-        Some(br) => match br.resolve(len) {
-            Ok(r) => r,
-            Err(RangeError::Unsatisfiable { object_len }) => {
-                let _ = send_all(handle, conn_fd, unsatisfiable_response(object_len)).await;
-                log.field("status", 416);
-                outcome.status = 416;
-                return Ok(());
+        // 6. Resolve the requested range against the length.
+        let resolved = match range {
+            None => full_object(len),
+            Some(br) => match br.resolve(len) {
+                Ok(r) => r,
+                Err(RangeError::Unsatisfiable { object_len }) => {
+                    let _ = send_all(handle, conn_fd, unsatisfiable_response(object_len)).await;
+                    log.field("status", 416);
+                    outcome.status = 416;
+                    return Ok(());
+                }
+                Err(_) => {
+                    let _ = send_all(handle, conn_fd, status_line_response(400)).await;
+                    log.field("status", 400);
+                    outcome.status = 400;
+                    return Ok(());
+                }
+            },
+        };
+
+        if is_head || cache_key_version.is_none() || resolved.len() == 0 {
+            break (len, cache_key_version, resolved);
+        }
+
+        let verify_result = match process_body(
+            pool,
+            BodyMode::Verify,
+            BodySource::OriginAllowed,
+            fanout,
+            backend_id,
+            &path,
+            cache_key_version.as_deref(),
+            page_size,
+            resolved,
+            stripe_size,
+        )
+        .await
+        {
+            Ok(()) => {
+                process_body(
+                    pool,
+                    BodyMode::Verify,
+                    BodySource::CacheOnly,
+                    fanout,
+                    backend_id,
+                    &path,
+                    cache_key_version.as_deref(),
+                    page_size,
+                    resolved,
+                    stripe_size,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+
+        match verify_result {
+            Ok(()) => break (len, cache_key_version, resolved),
+            Err(Error::OriginVersionMismatch)
+                if verify_attempts + 1 < VERSIONED_BODY_VERIFY_ATTEMPTS =>
+            {
+                verify_attempts += 1;
+                continue;
             }
             Err(_) => {
-                let _ = send_all(handle, conn_fd, status_line_response(400)).await;
-                log.field("status", 400);
-                outcome.status = 400;
+                let _ = send_all(handle, conn_fd, status_line_response(500)).await;
+                log.field("status", 500);
+                outcome.status = 500;
                 return Ok(());
             }
-        },
+        }
     };
 
     // 7. Response head: 206 if the client sent a Range, else 200.
@@ -413,12 +470,19 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     }
 
     // 8. Stream the body, fanning each stripe out to its content-address
-    // owner shard (or the local pool when this shard owns it).
-    match stream_body(
+    // owner shard (or the local pool when this shard owns it). Versioned
+    // bodies were verified before the success head, so the send pass is
+    // cache-only and cannot reach the origin with a now-stale If-Match.
+    let body_source = if cache_key_version.is_some() {
+        BodySource::CacheOnly
+    } else {
+        BodySource::OriginAllowed
+    };
+    match process_body(
         pool,
-        handle,
+        BodyMode::Send { handle, conn_fd },
+        body_source,
         fanout,
-        conn_fd,
         backend_id,
         &path,
         cache_key_version.as_deref(),
@@ -466,19 +530,37 @@ enum Ticket {
     },
 }
 
+enum BodyMode<'a> {
+    Verify,
+    Send {
+        handle: &'a NetHandle,
+        conn_fd: RawFd,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum BodySource {
+    OriginAllowed,
+    CacheOnly,
+}
+
 /// Build the content-addressed key and pool request for one stripe slice.
 fn stripe_request(
     backend_id: &str,
     path: &str,
     cache_key_version: Option<&str>,
     slice: StripeSlice,
+    source: BodySource,
 ) -> (StripeKey, StripeReq) {
     let mut origin_ref = OriginRef::new(backend_id, path, slice.stripe_idx);
     if let Some(version) = cache_key_version {
         origin_ref = origin_ref.with_cache_key_version(version);
     }
     let key = origin_ref.stripe_key();
-    let req = StripeReq::new(key).with_origin(origin_ref);
+    let mut req = StripeReq::new(key);
+    if matches!(source, BodySource::OriginAllowed) {
+        req = req.with_origin(origin_ref);
+    }
     (key, req)
 }
 
@@ -528,6 +610,20 @@ async fn send_region(
     Ok(())
 }
 
+async fn process_region(
+    mode: &BodyMode<'_>,
+    buf_index: u16,
+    offset: usize,
+    len: usize,
+) -> Result<(), Error> {
+    match mode {
+        BodyMode::Verify => Ok(()),
+        BodyMode::Send { handle, conn_fd } => {
+            send_region(handle, *conn_fd, buf_index, offset, len).await
+        }
+    }
+}
+
 /// Route one stripe to its owner and, for remote owners, kick the fetch
 /// so its command reaches the owner shard before we start sending the
 /// stripes ahead of it. A single poll is enough: `FetchChannel::fetch`
@@ -540,8 +636,9 @@ async fn dispatch_ticket(
     path: &str,
     cache_key_version: Option<&str>,
     slice: StripeSlice,
+    source: BodySource,
 ) -> Ticket {
-    let (key, req) = stripe_request(backend_id, path, cache_key_version, slice);
+    let (key, req) = stripe_request(backend_id, path, cache_key_version, slice, source);
     match fanout.owner_of(&key, slice.intra_offset) {
         Owner::Local => Ticket::Local { slice },
         Owner::Peer(peer) => {
@@ -578,11 +675,11 @@ async fn dispatch_ticket(
 /// head stripe is being sent, so a single TCP connection drives all
 /// shards' NICs.
 #[allow(clippy::too_many_arguments)]
-async fn stream_body<P: BufferPool<Req = StripeReq>>(
+async fn process_body<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
-    handle: &NetHandle,
+    mode: BodyMode<'_>,
+    source: BodySource,
     fanout: &Rc<FanoutTable>,
-    conn_fd: RawFd,
     backend_id: &str,
     path: &str,
     cache_key_version: Option<&str>,
@@ -596,7 +693,8 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
         let plans: Vec<StripePlan<StripeReq>> = slices
             .into_iter()
             .map(|slice| {
-                let (_key, req) = stripe_request(backend_id, path, cache_key_version, slice);
+                let (_key, req) =
+                    stripe_request(backend_id, path, cache_key_version, slice, source);
                 StripePlan {
                     req,
                     intra_offset: slice.intra_offset,
@@ -609,7 +707,7 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
             let page = page?;
             let pr = page.page_ref();
             let offset = pr.page_idx as usize * page_size + pr.offset as usize;
-            send_region(handle, conn_fd, 0, offset, pr.len as usize).await?;
+            process_region(&mode, 0, offset, pr.len as usize).await?;
             drop(page);
         }
         return Ok(());
@@ -620,13 +718,21 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
     let mut window: VecDeque<Ticket> = VecDeque::new();
     while next < slices.len() && window.len() < WINDOW {
         window.push_back(
-            dispatch_ticket(fanout, backend_id, path, cache_key_version, slices[next]).await,
+            dispatch_ticket(
+                fanout,
+                backend_id,
+                path,
+                cache_key_version,
+                slices[next],
+                source,
+            )
+            .await,
         );
         next += 1;
     }
 
     let local_plan = |slice: StripeSlice| {
-        let (_key, req) = stripe_request(backend_id, path, cache_key_version, slice);
+        let (_key, req) = stripe_request(backend_id, path, cache_key_version, slice, source);
         StripePlan {
             req,
             intra_offset: slice.intra_offset,
@@ -654,7 +760,7 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
                     let page = page?;
                     let pr = page.page_ref();
                     let offset = pr.page_idx as usize * page_size + pr.offset as usize;
-                    send_region(handle, conn_fd, 0, offset, pr.len as usize).await?;
+                    process_region(&mode, 0, offset, pr.len as usize).await?;
                     drop(page);
                 }
             }
@@ -677,9 +783,15 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
                     // its pins, so retries eventually succeed.
                     Err(crate::bufferpool::Error::Busy) => {
                         yield_now().await;
-                        let retry =
-                            dispatch_ticket(fanout, backend_id, path, cache_key_version, slice)
-                                .await;
+                        let retry = dispatch_ticket(
+                            fanout,
+                            backend_id,
+                            path,
+                            cache_key_version,
+                            slice,
+                            source,
+                        )
+                        .await;
                         window.push_front(retry);
                         continue;
                     }
@@ -693,9 +805,8 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
                 // error so a dropped client does not leak the owner pin.
                 let mut result = Ok(());
                 for ploc in &reply.pages {
-                    if send_region(
-                        handle,
-                        conn_fd,
+                    if process_region(
+                        &mode,
                         buf_index,
                         ploc.page_byte_offset as usize,
                         ploc.len as usize,
@@ -714,7 +825,15 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
 
         while next < slices.len() && window.len() < WINDOW {
             window.push_back(
-                dispatch_ticket(fanout, backend_id, path, cache_key_version, slices[next]).await,
+                dispatch_ticket(
+                    fanout,
+                    backend_id,
+                    path,
+                    cache_key_version,
+                    slices[next],
+                    source,
+                )
+                .await,
             );
             next += 1;
         }
@@ -986,15 +1105,57 @@ mod tests {
             intra_offset: 0,
             intra_len: 10,
         };
-        let (base_key, _) = stripe_request("primary", "/o", None, slice);
-        let (v1_key, v1_req) = stripe_request("primary", "/o", Some("etag-1"), slice);
-        let (v2_key, v2_req) = stripe_request("primary", "/o", Some("etag-2"), slice);
+        let (base_key, _) = stripe_request("primary", "/o", None, slice, BodySource::OriginAllowed);
+        let (v1_key, v1_req) = stripe_request(
+            "primary",
+            "/o",
+            Some("etag-1"),
+            slice,
+            BodySource::OriginAllowed,
+        );
+        let (v2_key, v2_req) = stripe_request(
+            "primary",
+            "/o",
+            Some("etag-2"),
+            slice,
+            BodySource::OriginAllowed,
+        );
 
         assert_ne!(base_key, v1_key);
         assert_ne!(v1_key, v2_key);
         assert_eq!(v1_req.key(), v1_key);
         assert_eq!(v1_req.origin().unwrap().origin_object_id, "/o");
         assert_eq!(v2_req.origin().unwrap().origin_object_id, "/o");
+    }
+
+    #[test]
+    fn stripe_request_can_disable_origin_fetches() {
+        use crate::bufferpool::Req;
+
+        let slice = StripeSlice {
+            stripe_idx: 1,
+            intra_offset: 0,
+            intra_len: 10,
+        };
+        let (origin_key, origin_req) = stripe_request(
+            "primary",
+            "/o",
+            Some("etag-1"),
+            slice,
+            BodySource::OriginAllowed,
+        );
+        let (cache_key, cache_req) = stripe_request(
+            "primary",
+            "/o",
+            Some("etag-1"),
+            slice,
+            BodySource::CacheOnly,
+        );
+
+        assert_eq!(cache_key, origin_key);
+        assert_eq!(cache_req.key(), origin_key);
+        assert!(origin_req.origin().is_some());
+        assert!(cache_req.origin().is_none());
     }
 
     /// A mock pool whose `read` never constructs a `ReadStream` (that

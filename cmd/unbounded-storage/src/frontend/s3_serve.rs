@@ -50,6 +50,7 @@ use crate::storage::{ObjectMetadata, OriginRef, StripeReq};
 /// The `x-amz-request-id` response header name. Present on every
 /// response (success and error) so clients and proxies can correlate.
 const X_AMZ_REQUEST_ID: &str = "x-amz-request-id";
+const VERSIONED_BODY_VERIFY_ATTEMPTS: usize = 2;
 
 /// Monotonic source for per-request `x-amz-request-id` values. A plain
 /// process-global counter is enough: the ids only need to be present
@@ -383,71 +384,132 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
         None => None,
     };
 
-    // 5. Resolve object length, distinguishing a missing origin object
-    // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
-    // the plain HTTP frontend, a length-read failure is never a silently
-    // dropped connection.
-    let meta = match read_object_metadata_s3(pool, backend_id, &path, page_size, !is_head).await {
-        LenResult::Metadata(m) => m,
-        LenResult::NotFound => {
-            let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
-            let _ = send_all(handle, conn_fd, bytes).await;
-            log.field("status", 404);
-            outcome.status = 404;
-            return Ok(());
-        }
-        LenResult::Other => {
-            let bytes = error_bytes(
-                S3ErrorCode::InternalError,
-                &path,
-                &request_id,
-                is_head,
-                None,
-            );
-            let _ = send_all(handle, conn_fd, bytes).await;
-            log.field("status", 500);
-            outcome.status = 500;
-            return Ok(());
-        }
-    };
-    let len = meta.length;
-    let cache_key_version = meta.cache_key_version().map(str::to_string);
-
-    // 6. Resolve the requested range against the length.
-    let resolved = match range {
-        None => full_object(len),
-        Some(br) => match br.resolve(len) {
-            Ok(r) => r,
-            Err(RangeError::Unsatisfiable { object_len }) => {
-                // 416 InvalidRange: include `Content-Range: bytes */LEN`
-                // for both GET and HEAD; GET additionally carries the
-                // XML body, HEAD carries only the head.
-                let bytes = error_bytes(
-                    S3ErrorCode::InvalidRange,
-                    &path,
-                    &request_id,
-                    is_head,
-                    Some(object_len),
-                );
+    let mut verify_attempts = 0;
+    let (len, cache_key_version, resolved) = loop {
+        // 5. Resolve object length, distinguishing a missing origin object
+        // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
+        // the plain HTTP frontend, a length-read failure is never a silently
+        // dropped connection.
+        let meta = match read_object_metadata_s3(pool, backend_id, &path, page_size, !is_head).await
+        {
+            LenResult::Metadata(m) => m,
+            LenResult::NotFound => {
+                let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
                 let _ = send_all(handle, conn_fd, bytes).await;
-                log.field("status", 416);
-                outcome.status = 416;
+                log.field("status", 404);
+                outcome.status = 404;
                 return Ok(());
             }
-            Err(_) => {
+            LenResult::Other => {
                 let bytes = error_bytes(
-                    S3ErrorCode::InvalidRequest,
+                    S3ErrorCode::InternalError,
                     &path,
                     &request_id,
                     is_head,
                     None,
                 );
                 let _ = send_all(handle, conn_fd, bytes).await;
-                log.field("status", 400);
-                outcome.status = 400;
+                log.field("status", 500);
+                outcome.status = 500;
                 return Ok(());
             }
-        },
+        };
+        let len = meta.length;
+        let cache_key_version = meta.cache_key_version().map(str::to_string);
+
+        // 6. Resolve the requested range against the length.
+        let resolved = match range {
+            None => full_object(len),
+            Some(br) => match br.resolve(len) {
+                Ok(r) => r,
+                Err(RangeError::Unsatisfiable { object_len }) => {
+                    // 416 InvalidRange: include `Content-Range: bytes */LEN`
+                    // for both GET and HEAD; GET additionally carries the
+                    // XML body, HEAD carries only the head.
+                    let bytes = error_bytes(
+                        S3ErrorCode::InvalidRange,
+                        &path,
+                        &request_id,
+                        is_head,
+                        Some(object_len),
+                    );
+                    let _ = send_all(handle, conn_fd, bytes).await;
+                    log.field("status", 416);
+                    outcome.status = 416;
+                    return Ok(());
+                }
+                Err(_) => {
+                    let bytes = error_bytes(
+                        S3ErrorCode::InvalidRequest,
+                        &path,
+                        &request_id,
+                        is_head,
+                        None,
+                    );
+                    let _ = send_all(handle, conn_fd, bytes).await;
+                    log.field("status", 400);
+                    outcome.status = 400;
+                    return Ok(());
+                }
+            },
+        };
+
+        if is_head || cache_key_version.is_none() || resolved.len() == 0 {
+            break (len, cache_key_version, resolved);
+        }
+
+        let verify_result = match process_body_s3(
+            pool,
+            S3BodyMode::Verify,
+            S3BodySource::OriginAllowed,
+            backend_id,
+            &path,
+            cache_key_version.as_deref(),
+            page_size,
+            resolved,
+            stripe_size,
+        )
+        .await
+        {
+            Ok(()) => {
+                process_body_s3(
+                    pool,
+                    S3BodyMode::Verify,
+                    S3BodySource::CacheOnly,
+                    backend_id,
+                    &path,
+                    cache_key_version.as_deref(),
+                    page_size,
+                    resolved,
+                    stripe_size,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+
+        match verify_result {
+            Ok(()) => break (len, cache_key_version, resolved),
+            Err(Error::OriginVersionMismatch)
+                if verify_attempts + 1 < VERSIONED_BODY_VERIFY_ATTEMPTS =>
+            {
+                verify_attempts += 1;
+                continue;
+            }
+            Err(_) => {
+                let bytes = error_bytes(
+                    S3ErrorCode::InternalError,
+                    &path,
+                    &request_id,
+                    is_head,
+                    None,
+                );
+                let _ = send_all(handle, conn_fd, bytes).await;
+                log.field("status", 500);
+                outcome.status = 500;
+                return Ok(());
+            }
+        }
     };
 
     // 7. Response head: 206 if the client sent a Range, else 200.
@@ -471,7 +533,9 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     }
 
     // 8. Stream the body out of the bufferpool, pipelined across
-    // stripe boundaries.
+    // stripe boundaries. Versioned bodies were verified before the
+    // success head, so the send pass is cache-only and cannot reach the
+    // origin with a now-stale If-Match.
     //
     // The whole byte range is handed to the pool as one ordered list
     // of per-stripe slices via the pipelined read path, so the pool
@@ -488,54 +552,100 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // `read_pipelined` clamps it to the pool's configured
     // `max_inflight_pages` budget, so prefetch depth is governed by
     // that single knob.
+    let body_source = if cache_key_version.is_some() {
+        S3BodySource::CacheOnly
+    } else {
+        S3BodySource::OriginAllowed
+    };
+    match process_body_s3(
+        pool,
+        S3BodyMode::Send { handle, conn_fd },
+        body_source,
+        backend_id,
+        &path,
+        cache_key_version.as_deref(),
+        page_size,
+        resolved,
+        stripe_size,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(Error::OriginVersionMismatch) => {
+            let _ = read_object_metadata_s3(pool, backend_id, &path, page_size, true).await;
+            Err(())
+        }
+        Err(_) => Err(()),
+    }
+}
+
+enum S3BodyMode<'a> {
+    Verify,
+    Send {
+        handle: &'a NetHandle,
+        conn_fd: RawFd,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum S3BodySource {
+    OriginAllowed,
+    CacheOnly,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_body_s3<P: BufferPool<Req = StripeReq>>(
+    pool: &Rc<P>,
+    mode: S3BodyMode<'_>,
+    source: S3BodySource,
+    backend_id: &str,
+    path: &str,
+    cache_key_version: Option<&str>,
+    page_size: usize,
+    resolved: ResolvedRange,
+    stripe_size: u64,
+) -> Result<(), Error> {
     let plans: Vec<StripePlan<StripeReq>> = stripe_set(resolved, stripe_size)
         .into_iter()
         .map(|slice| {
-            let mut origin_ref = OriginRef::new(backend_id, &path, slice.stripe_idx);
-            if let Some(version) = cache_key_version.as_deref() {
+            let mut origin_ref = OriginRef::new(backend_id, path, slice.stripe_idx);
+            if let Some(version) = cache_key_version {
                 origin_ref = origin_ref.with_cache_key_version(version);
             }
+            let mut req = StripeReq::new(origin_ref.stripe_key());
+            if matches!(source, S3BodySource::OriginAllowed) {
+                req = req.with_origin(origin_ref);
+            }
             StripePlan {
-                req: StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref),
+                req,
                 intra_offset: slice.intra_offset,
                 intra_len: slice.intra_len,
             }
         })
         .collect();
-    let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
+    let mut rs = pool.read_pipelined(plans, usize::MAX)?;
     while let Some(page) = rs.next_page().await {
-        let page = match page {
-            Ok(page) => page,
-            Err(Error::OriginVersionMismatch) => {
-                let _ = read_object_metadata_s3(pool, backend_id, &path, page_size, true).await;
-                return Err(());
-            }
-            Err(_) => return Err(()),
-        };
+        let page = page?;
         let pr = page.page_ref();
         let page_byte_offset = pr.page_idx as usize * page_size + pr.offset as usize;
         let n = pr.len as usize;
-        // The PageGuard must stay alive until the SEND_ZC notification
-        // (when the kernel is done with the source page); awaiting here
-        // holds it across every partial send, then we drop it before
-        // the next `next_page` as the stream contract requires.
-        //
-        // SEND_ZC's CQE `res` is the count the kernel accepted, which
-        // can be short under socket-send-buffer pressure, so we loop
-        // advancing the byte offset until the whole page is on the
-        // wire. A zero count means the peer closed.
-        let mut sent_offset = page_byte_offset;
-        let mut remaining = n;
-        while remaining > 0 {
-            let sent = handle
-                .send_zc_fixed(conn_fd, 0, sent_offset, remaining)
-                .await
-                .map_err(|_| ())?;
-            if sent == 0 {
-                return Err(());
+        match &mode {
+            S3BodyMode::Verify => {}
+            S3BodyMode::Send { handle, conn_fd } => {
+                let mut sent_offset = page_byte_offset;
+                let mut remaining = n;
+                while remaining > 0 {
+                    let sent = handle
+                        .send_zc_fixed(*conn_fd, 0, sent_offset, remaining)
+                        .await
+                        .map_err(|_| Error::Io(libc::EIO))?;
+                    if sent == 0 {
+                        return Err(Error::Io(libc::EIO));
+                    }
+                    sent_offset += sent;
+                    remaining -= sent;
+                }
             }
-            sent_offset += sent;
-            remaining -= sent;
         }
         drop(page);
     }
