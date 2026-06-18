@@ -531,7 +531,7 @@ encoded into its page, rather than object data.
 
 ### 7.11 `config/` - typed, validated, hot-reloadable schema
 
-The schema is defined by `proto/config.proto` (prost-generated, with
+The schema is defined by `api/unbounded-storage/config.proto` (prost-generated, with
 serde `Deserialize` derived on each message so a TOML file still loads)
 and is proto3-native: enum fields are plain integers, byte sizes are
 plain integer byte counts, and any field left at its proto3 zero value is
