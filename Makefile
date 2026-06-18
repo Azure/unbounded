@@ -66,6 +66,9 @@ UNPING_CMD=./cmd/unping
 UNROUTE_BIN=bin/unroute
 UNROUTE_CMD=./cmd/unroute
 
+UNBOUNDED_STORAGE_BENCH_BIN=bin/unbounded-storage-bench
+UNBOUNDED_STORAGE_BENCH_CMD=./cmd/unbounded-storage-bench
+
 # Gantry (peer-to-peer OCI distribution)
 GANTRY_BIN=bin/gantry
 GANTRY_CMD=./cmd/gantry
@@ -187,7 +190,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build unbounded-storage-bench unbounded-storage-bench-build notice notice-check gantry gantry-build
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -240,6 +243,7 @@ help: ## Show this help
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
 	@echo "  unbounded-storage-supervisor | unbounded-storage-supervisor-build  Build the storage supervisor (with/without lint/test)"
+	@echo "  unbounded-storage-bench          Build/run unbounded-storage benchmark harness"
 	@echo ""
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
@@ -543,6 +547,12 @@ unroute-build: ## Build the unroute utility binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNROUTE_BIN) $(UNROUTE_CMD)
 
 unroute: test unroute-build ## Build the unroute utility (implies test)
+
+unbounded-storage-bench-build: ## Build the unbounded-storage benchmark harness (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_STORAGE_BENCH_BIN) $(UNBOUNDED_STORAGE_BENCH_CMD)
+
+unbounded-storage-bench: unbounded-storage-bench-build ## Run unbounded-storage benchmarks over SSH; pass ARGS="..."
+	$(UNBOUNDED_STORAGE_BENCH_BIN) $(ARGS)
 
 ##@ Gantry (peer-to-peer OCI distribution)
 
