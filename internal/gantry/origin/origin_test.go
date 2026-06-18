@@ -193,6 +193,71 @@ func TestPull_UnknownRegistry(t *testing.T) {
 	}
 }
 
+func TestPull_InvalidRepositoryRejectedBeforeRequest(t *testing.T) {
+	var hits int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var failures int32
+
+	c, err := New(&config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg", Endpoint: srv.URL}}}, WithMetrics(nil, func(_, _ string) {
+		atomic.AddInt32(&failures, 1)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := digestOf([]byte("x"))
+	_, _, err = c.Pull(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "../../etc", Digest: d})
+	if err == nil {
+		t.Fatal("Pull: expected invalid repository error")
+	}
+
+	var oe *ifaces.OriginError
+	if !errors.As(err, &oe) || oe.Class != ifaces.FailureNotFound {
+		t.Fatalf("err = %v, want OriginError{Class=not_found}", err)
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Fatalf("origin requests = %d, want 0", got)
+	}
+
+	if got := atomic.LoadInt32(&failures); got != 1 {
+		t.Fatalf("failure callbacks = %d, want 1", got)
+	}
+}
+
+func TestHead_InvalidRepositoryRejectedBeforeRequest(t *testing.T) {
+	var hits int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
+	d := digestOf([]byte("x"))
+
+	_, _, err := c.Head(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "foo?bar", Digest: d})
+	if err == nil {
+		t.Fatal("Head: expected invalid repository error")
+	}
+
+	var oe *ifaces.OriginError
+	if !errors.As(err, &oe) || oe.Class != ifaces.FailureNotFound {
+		t.Fatalf("err = %v, want OriginError{Class=not_found}", err)
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Fatalf("origin requests = %d, want 0", got)
+	}
+}
+
 func TestPull_BearerTokenFlow(t *testing.T) {
 	body := []byte("token-protected")
 	d := digestOf(body)

@@ -41,6 +41,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/oci"
 )
 
 // Client is the concrete OriginPuller. It fans out to one *registry per
@@ -147,6 +148,13 @@ func (c *Client) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser,
 		c.metrics.onPullStart(kind)
 	}
 
+	if err := oci.ValidateRepositoryName(ref.Repository); err != nil {
+		err := &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: err}
+		c.recordFailure(kind, err)
+
+		return nil, 0, err
+	}
+
 	r, ok := c.registries[ref.Registry]
 	if !ok {
 		err := &ifaces.OriginError{
@@ -211,6 +219,10 @@ func (c *Client) recordFailure(kind string, err error) {
 // surface to operators via the mirror's HTTP status and
 // access log alone.
 func (c *Client) Head(ctx context.Context, ref ifaces.OriginRef) (int64, string, error) {
+	if err := oci.ValidateRepositoryName(ref.Repository); err != nil {
+		return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: err}
+	}
+
 	r, ok := c.registries[ref.Registry]
 	if !ok {
 		return 0, "", &ifaces.OriginError{
