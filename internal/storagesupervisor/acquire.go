@@ -204,6 +204,54 @@ func sha256OfFile(path string) (string, error) {
 // the single top-level directory (equivalent to tar --strip-components=1) so
 // bin/ and lib/ land directly under destDir. Entry names are validated to
 // prevent path traversal.
+func resolvePathAllowingNonExistent(path string) (string, error) {
+	cleaned := filepath.Clean(path)
+	cur := cleaned
+	var tail []string
+
+	for {
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			for i := len(tail) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, tail[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+
+		if errors.Is(err, os.ErrNotExist) {
+			parent := filepath.Dir(cur)
+			if parent == cur {
+				return "", err
+			}
+			tail = append(tail, filepath.Base(cur))
+			cur = parent
+			continue
+		}
+
+		return "", err
+	}
+}
+
+func isPathWithinBase(base, candidate string) (bool, error) {
+	resolvedBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return false, fmt.Errorf("resolve base %q: %w", base, err)
+	}
+
+	resolvedCandidate, err := resolvePathAllowingNonExistent(candidate)
+	if err != nil {
+		return false, fmt.Errorf("resolve candidate %q: %w", candidate, err)
+	}
+
+	rel, err := filepath.Rel(resolvedBase, resolvedCandidate)
+	if err != nil {
+		return false, err
+	}
+
+	rel = filepath.Clean(rel)
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)), nil
+}
+
 func extractTarGz(archivePath, destDir string) error {
 	f, err := os.Open(archivePath)
 	if err != nil {
@@ -266,6 +314,15 @@ func extractTarGz(archivePath, destDir string) error {
 			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return fmt.Errorf("mkdir for symlink %q: %w", target, err)
+			}
+
+			linkTargetPath := filepath.Join(filepath.Dir(target), header.Linkname)
+			ok, err := isPathWithinBase(destDir, linkTargetPath)
+			if err != nil {
+				return fmt.Errorf("validate symlink %q -> %q: %w", target, header.Linkname, err)
+			}
+			if !ok {
+				return fmt.Errorf("reject symlink %q -> %q: target escapes destination", target, header.Linkname)
 			}
 
 			_ = os.Remove(target) //nolint:errcheck // overwrite existing
