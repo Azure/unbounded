@@ -533,7 +533,7 @@ func (r *registry) repeatWithoutToken(ctx context.Context, method, urlStr string
 		return nil, err
 	}
 
-	if r.username != "" {
+	if r.canSendBasicAuth() && r.username != "" {
 		req.SetBasicAuth(r.username, r.password)
 	}
 
@@ -549,6 +549,15 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 	realm := params["realm"]
 	if realm == "" {
 		return "", 0, fmt.Errorf("bearer challenge missing realm: %q", challenge)
+	}
+
+	realmURL, err := url.Parse(realm)
+	if err != nil {
+		return "", 0, fmt.Errorf("bearer challenge invalid realm %q: %w", realm, err)
+	}
+
+	if !realmURL.IsAbs() || realmURL.Host == "" || !strings.EqualFold(realmURL.Scheme, "https") {
+		return "", 0, fmt.Errorf("bearer challenge realm %q: token endpoint must be an absolute https URL", realm)
 	}
 
 	scope := params["scope"]
@@ -578,7 +587,7 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 		return "", 0, err
 	}
 
-	if r.username != "" {
+	if r.canSendBasicAuth() && r.username != "" {
 		req.SetBasicAuth(r.username, r.password)
 	}
 
@@ -626,6 +635,10 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 	}
 
 	return tok, ttl, nil
+}
+
+func (r *registry) canSendBasicAuth() bool {
+	return r.base != nil && strings.EqualFold(r.base.Scheme, "https")
 }
 
 func (r *registry) cachedToken() string {

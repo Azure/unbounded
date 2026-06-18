@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,17 @@ func digestOf(b []byte) digest.Digest {
 	}
 
 	return d
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", raw, err)
+	}
+
+	return u
 }
 
 func newClient(t *testing.T, ur config.UpstreamRegistry) *Client {
@@ -186,11 +198,7 @@ func TestPull_BearerTokenFlow(t *testing.T) {
 
 	var authReqs, tokenReqs, dataReqs int32
 
-	// Set up the token endpoint first so we know its URL.
 	tokenMux := http.NewServeMux()
-
-	tokenSrv := httptest.NewServer(tokenMux)
-	defer tokenSrv.Close()
 
 	tokenMux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&tokenReqs, 1)
@@ -203,11 +211,18 @@ func TestPull_BearerTokenFlow(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"token": "deadbeef"}) //nolint:errcheck // best-effort
 	})
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var srv *httptest.Server
+
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			tokenMux.ServeHTTP(w, r)
+			return
+		}
+
 		if r.Header.Get("Authorization") != "Bearer deadbeef" {
 			atomic.AddInt32(&authReqs, 1)
 			w.Header().Set("WWW-Authenticate",
-				`Bearer realm="`+tokenSrv.URL+`/token",service="reg",scope="repository:library/nginx:pull"`)
+				`Bearer realm="`+srv.URL+`/token",service="reg",scope="repository:library/nginx:pull"`)
 			w.WriteHeader(401)
 
 			return
@@ -227,6 +242,7 @@ func TestPull_BearerTokenFlow(t *testing.T) {
 	}
 
 	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
+	c.registries["reg"].hc = srv.Client()
 
 	rc, _, err := c.Pull(context.Background(), ifaces.OriginRef{
 		Registry: "reg", Repository: "library/nginx", Digest: d,
@@ -259,6 +275,135 @@ func TestPull_BearerTokenFlow(t *testing.T) {
 
 	if atomic.LoadInt32(&tokenReqs) != 1 {
 		t.Errorf("tokenReqs after 2nd pull = %d, want 1 (cached)", tokenReqs)
+	}
+}
+
+func TestFetchBearerTokenRejectsHTTPRealm(t *testing.T) {
+	var tokenReqs int32
+
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&tokenReqs, 1)
+
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "deadbeef"}) //nolint:errcheck // best-effort
+	}))
+	defer tokenSrv.Close()
+
+	r := &registry{
+		base:     mustParseURL(t, "https://reg.example.com"),
+		username: "alice",
+		password: "secret",
+		hc:       tokenSrv.Client(),
+	}
+
+	_, _, err := r.fetchBearerToken(context.Background(), `Bearer realm="`+tokenSrv.URL+`/token",service="reg"`)
+	if err == nil {
+		t.Fatal("expected non-https token realm to be rejected")
+	}
+
+	if !strings.Contains(err.Error(), "absolute https URL") {
+		t.Fatalf("error = %v, want https URL rejection", err)
+	}
+
+	if got := atomic.LoadInt32(&tokenReqs); got != 0 {
+		t.Fatalf("token endpoint was called %d times; want 0", got)
+	}
+}
+
+func TestFetchBearerTokenAllowsCrossHostHTTPSRealm(t *testing.T) {
+	var tokenReqs int32
+
+	tokenSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&tokenReqs, 1)
+
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "alice" || pass != "secret" {
+			t.Errorf("token auth missing/wrong: ok=%v user=%q", ok, user)
+		}
+
+		if r.URL.Query().Get("service") != "reg" {
+			t.Errorf("service query = %q", r.URL.Query().Get("service"))
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "deadbeef"}) //nolint:errcheck // best-effort
+	}))
+	defer tokenSrv.Close()
+
+	r := &registry{
+		base:     mustParseURL(t, "https://reg.example.com"),
+		username: "alice",
+		password: "secret",
+		hc:       tokenSrv.Client(),
+	}
+
+	tok, _, err := r.fetchBearerToken(context.Background(), `Bearer realm="`+tokenSrv.URL+`/token",service="reg"`)
+	if err != nil {
+		t.Fatalf("fetchBearerToken: %v", err)
+	}
+
+	if tok != "deadbeef" {
+		t.Fatalf("token = %q, want deadbeef", tok)
+	}
+
+	if got := atomic.LoadInt32(&tokenReqs); got != 1 {
+		t.Fatalf("token endpoint calls = %d, want 1", got)
+	}
+}
+
+func TestHTTPRegistryDoesNotSendBasicToTokenEndpoint(t *testing.T) {
+	body := []byte("token-protected")
+	d := digestOf(body)
+
+	var tokenReqs int32
+
+	tokenSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&tokenReqs, 1)
+
+		if user, _, ok := r.BasicAuth(); ok {
+			t.Errorf("token request unexpectedly included Basic auth for user %q", user)
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "deadbeef"}) //nolint:errcheck // best-effort
+	}))
+	defer tokenSrv.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer deadbeef" {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="`+tokenSrv.URL+`/token",service="reg"`)
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		_, _ = w.Write(body) //nolint:errcheck // best-effort write
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+
+	credsPath := filepath.Join(dir, "creds")
+	if err := os.WriteFile(credsPath, []byte("alice:secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
+	c.registries["reg"].hc = tokenSrv.Client()
+
+	rc, _, err := c.Pull(context.Background(), ifaces.OriginRef{
+		Registry: "reg", Repository: "library/nginx", Digest: d,
+	})
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+
+	if string(got) != string(body) {
+		t.Errorf("body = %q", got)
+	}
+
+	if got := atomic.LoadInt32(&tokenReqs); got != 1 {
+		t.Fatalf("token endpoint calls = %d, want 1", got)
 	}
 }
 
