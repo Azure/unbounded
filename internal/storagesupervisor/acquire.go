@@ -207,6 +207,7 @@ func sha256OfFile(path string) (string, error) {
 func resolvePathAllowingNonExistent(path string) (string, error) {
 	cleaned := filepath.Clean(path)
 	cur := cleaned
+
 	var tail []string
 
 	for {
@@ -215,6 +216,7 @@ func resolvePathAllowingNonExistent(path string) (string, error) {
 			for i := len(tail) - 1; i >= 0; i-- {
 				resolved = filepath.Join(resolved, tail[i])
 			}
+
 			return filepath.Clean(resolved), nil
 		}
 
@@ -223,8 +225,10 @@ func resolvePathAllowingNonExistent(path string) (string, error) {
 			if parent == cur {
 				return "", err
 			}
+
 			tail = append(tail, filepath.Base(cur))
 			cur = parent
+
 			continue
 		}
 
@@ -249,6 +253,7 @@ func isPathWithinBase(base, candidate string) (bool, error) {
 	}
 
 	rel = filepath.Clean(rel)
+
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)), nil
 }
 
@@ -295,6 +300,7 @@ func extractTarGz(archivePath, destDir string) error {
 			if err := ensurePathWithinBase(destDir, target); err != nil {
 				return err
 			}
+
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return fmt.Errorf("mkdir %q: %w", target, err)
 			}
@@ -302,6 +308,7 @@ func extractTarGz(archivePath, destDir string) error {
 			if err := ensurePathWithinBase(destDir, target); err != nil {
 				return err
 			}
+
 			if err := writeFileFromTar(tr, target, os.FileMode(header.Mode)); err != nil {
 				return err
 			}
@@ -309,18 +316,22 @@ func extractTarGz(archivePath, destDir string) error {
 			if err := ensurePathWithinBase(destDir, target); err != nil {
 				return err
 			}
+
 			if err := ensureSymlinkTargetWithinBase(destDir, target, header.Linkname); err != nil {
 				return err
 			}
+
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return fmt.Errorf("mkdir for symlink %q: %w", target, err)
 			}
 
 			linkTargetPath := filepath.Join(filepath.Dir(target), header.Linkname)
+
 			ok, err := isPathWithinBase(destDir, linkTargetPath)
 			if err != nil {
 				return fmt.Errorf("validate symlink %q -> %q: %w", target, header.Linkname, err)
 			}
+
 			if !ok {
 				return fmt.Errorf("reject symlink %q -> %q: target escapes destination", target, header.Linkname)
 			}
@@ -399,9 +410,11 @@ func safeJoin(base, rel string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve base path %q: %w", base, err)
 	}
+
 	baseAbs = filepath.Clean(baseAbs)
 
 	target := filepath.Clean(filepath.Join(baseAbs, cleaned))
+
 	basePrefix := baseAbs + string(filepath.Separator)
 	if target != baseAbs && !strings.HasPrefix(target, basePrefix) {
 		return "", fmt.Errorf("unsafe tar entry name: %q", rel)
@@ -459,6 +472,8 @@ func isWithinBase(base, candidate string) bool {
 	if err != nil {
 		return false
 	}
+
 	rel = filepath.Clean(rel)
+
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
