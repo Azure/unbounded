@@ -30,9 +30,9 @@ var debianRequiredPackages = []string{
 	"util-linux",
 }
 
-// azureLinuxRequiredPackages lists the OS packages that must be installed on an Azure Linux host.
-// Azure Linux hosts are supported for OCI-image rootfs provisioning, so debootstrap is not required.
-var azureLinuxRequiredPackages = []string{
+// rpmRequiredPackages lists the OS packages that must be installed on an RPM-based host.
+// RPM-based hosts are supported for OCI-image rootfs provisioning, so debootstrap is not required.
+var rpmRequiredPackages = []string{
 	"systemd-container",
 	"curl",
 	"nftables",
@@ -110,7 +110,7 @@ func detectHostPackageManager(lookupPath func(string) (string, error)) (*hostPac
 	if _, err := lookupPath("tdnf"); err == nil {
 		return &hostPackageManager{
 			name:             "tdnf",
-			requiredPackages: azureLinuxRequiredPackages,
+			requiredPackages: rpmRequiredPackages,
 			command:          executil.Tdnf(),
 			refreshArgs:      []string{"makecache"},
 			installArgs:      []string{"install", "-y"},
@@ -118,7 +118,18 @@ func detectHostPackageManager(lookupPath func(string) (string, error)) (*hostPac
 		}, nil
 	}
 
-	return nil, fmt.Errorf("unsupported host package manager: apt-get or tdnf is required")
+	if _, err := lookupPath("dnf"); err == nil {
+		return &hostPackageManager{
+			name:             "dnf",
+			requiredPackages: rpmRequiredPackages,
+			command:          executil.Dnf(),
+			refreshArgs:      []string{"makecache"},
+			installArgs:      []string{"install", "-y"},
+			installed:        isRPMPackageInstalled,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("unsupported host package manager: apt-get, tdnf, or dnf is required")
 }
 
 // isDebianPackageInstalled checks whether a package is fully installed using dpkg-query.

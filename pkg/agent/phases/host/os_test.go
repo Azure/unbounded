@@ -30,7 +30,20 @@ func TestDetectHostPackageManagerUsesTdnf(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, "tdnf", pm.name)
-	require.Equal(t, azureLinuxRequiredPackages, pm.requiredPackages)
+	require.Equal(t, rpmRequiredPackages, pm.requiredPackages)
+	require.NotContains(t, pm.requiredPackages, "debootstrap")
+	require.Equal(t, []string{"makecache"}, pm.refreshArgs)
+	require.Equal(t, []string{"install", "-y"}, pm.installArgs)
+}
+
+func TestDetectHostPackageManagerUsesDnf(t *testing.T) {
+	t.Parallel()
+
+	pm, err := detectHostPackageManager(existingPathLookup("dnf"))
+	require.NoError(t, err)
+
+	require.Equal(t, "dnf", pm.name)
+	require.Equal(t, rpmRequiredPackages, pm.requiredPackages)
 	require.NotContains(t, pm.requiredPackages, "debootstrap")
 	require.Equal(t, []string{"makecache"}, pm.refreshArgs)
 	require.Equal(t, []string{"install", "-y"}, pm.installArgs)

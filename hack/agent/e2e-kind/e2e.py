@@ -960,21 +960,7 @@ def _cloud_init_user_data(ssh_pub_key: str, mac_address: str) -> str:
               - ca-certificates
               - net-tools
 
-            write_files:
-              - path: /etc/systemd/network/10-e2e.network
-                content: |
-                  [Match]
-                  MACAddress={mac_address}
-
-                  [Network]
-                  Address={VM_IP}/24
-                  Gateway={VM_GATEWAY}
-                  DNS=8.8.8.8
-                  DNS=8.8.4.4
-                permissions: "0644"
-
             runcmd:
-              - systemctl restart systemd-networkd
               - mkdir -p /etc/agent
               - |
                 cat > /etc/agent/provisioned <<'MARKER'
