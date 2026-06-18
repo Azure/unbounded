@@ -135,6 +135,7 @@ func TestPleasePull_Started(t *testing.T) {
 		// Claim in-flight as the real puller would; that gates re-pulls.
 		h, e, already := infl.Start(d, kind, 0)
 		_ = h // leak intentionally for test brevity //nolint:errcheck // best-effort
+
 		if already {
 			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: e.StartedAt}
 		}
@@ -296,6 +297,7 @@ func TestPleasePull_AlreadyPulling(t *testing.T) {
 	pump := coord.PullerPump(func(_ context.Context, _, _ string, d digest.Digest, kind ifaces.OriginRefKind) coord.PumpResult {
 		h, e, already := infl.Start(d, kind, 0)
 		_ = h //nolint:errcheck // best-effort
+
 		if already {
 			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: e.StartedAt}
 		}
@@ -452,6 +454,7 @@ func TestPleasePull_KindRoundtrip(t *testing.T) {
 		observedDigest = d
 		h, e, already := infl.Start(d, kind, 0)
 		_ = h //nolint:errcheck // best-effort
+
 		if already {
 			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: e.StartedAt}
 		}
@@ -501,6 +504,7 @@ func TestPleasePull_KindConfigRoundtrip(t *testing.T) {
 		observedKind = kind
 		h, e, already := infl.Start(d, kind, 0)
 		_ = h //nolint:errcheck // best-effort
+
 		if already {
 			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: e.StartedAt}
 		}
