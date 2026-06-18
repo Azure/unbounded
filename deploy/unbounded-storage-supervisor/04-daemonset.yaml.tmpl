@@ -6,7 +6,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: unbounded-storage-supervisor
-  namespace: unbounded-kube #{{ default "unbounded-kube" .Namespace }}
+  namespace: {{ default "unbounded-kube" .Namespace }}
   labels:
     app.kubernetes.io/name: unbounded-storage-supervisor
     app.kubernetes.io/component: storage
@@ -40,7 +40,7 @@ spec:
         # unit under /etc/systemd/system, then drives systemctl in the host's
         # namespaces via the nsenter wrapper configured in SYSTEMCTL.
         - name: install
-          image: stargatetmedev.azurecr.io/unbounded-storage-supervisor:latest #{{ .Image }}
+          image: {{ .Image }}
           imagePullPolicy: Always
           args:
             - install
@@ -65,7 +65,7 @@ spec:
       containers:
         # Supervise the installed daemon for the lifetime of the pod.
         - name: run
-          image: stargatetmedev.azurecr.io/unbounded-storage-supervisor:latest #{{ .Image }}
+          image: {{ .Image }}
           imagePullPolicy: Always
           args:
             - run
