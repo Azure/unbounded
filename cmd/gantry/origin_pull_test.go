@@ -198,6 +198,67 @@ func TestPullerPumpDeclinesWhenSaturated(t *testing.T) {
 	gate.Wait()
 }
 
+// TestPullerPumpSameDigestPiggybacksWhenSaturated proves the fanout bound does
+// not starve same-digest dedup: while one pull of d holds the only concurrency
+// slot, a second please_pull for the SAME d must report AlreadyPulling (ride
+// the in-flight pull) rather than Declined. Gating a piggybacking request on
+// the concurrent-pull ceiling would wrongly shed load that starts no new work,
+// and the peek-before-claim ordering must not leave a phantom inflight entry.
+func TestPullerPumpSameDigestPiggybacksWhenSaturated(t *testing.T) {
+	d := trackerDigestOf([]byte("popular"))
+	originPuller := newBlockingOriginPuller()
+	cache := fakes.NewCache()
+	gate := newPullerPumpGate()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	pump := newPullerPump(
+		inflight.New(inflight.DefaultStalls(), nil),
+		originPuller,
+		cache,
+		nil,
+		logger,
+		gate,
+		1,
+		func(context.Context, digest.Digest) bool { return true },
+		func(string, int64) {},
+		func(string, string) {},
+		leaseMetricHooks{},
+	)
+
+	first := pump(context.Background(), "registry.example.com", "library/test", d, ifaces.KindBlob)
+	if first.Status != coord.PumpStarted {
+		t.Fatalf("first status = %v, want PumpStarted", first.Status)
+	}
+
+	select {
+	case <-originPuller.started:
+	case <-time.After(time.Second):
+		t.Fatal("first origin pull did not start")
+	}
+
+	// Saturated (the only slot is held by the in-flight pull of d), but a
+	// second request for the SAME digest must piggyback, not be declined.
+	second := pump(context.Background(), "registry.example.com", "library/test", d, ifaces.KindBlob)
+	if second.Status != coord.PumpAlreadyPulling {
+		t.Fatalf("second status = %v, want PumpAlreadyPulling", second.Status)
+	}
+
+	if second.StartedAt.IsZero() {
+		t.Fatal("AlreadyPulling result missing StartedAt")
+	}
+
+	close(originPuller.release)
+	gate.Wait()
+
+	// The blocking puller signals started exactly once per Pull invocation
+	// (buffered, cap 1). We drained the first signal above; once every pull
+	// goroutine has finished, an empty buffer proves the piggybacking second
+	// call spawned no new origin pull (and left no phantom inflight entry).
+	if n := len(originPuller.started); n != 0 {
+		t.Fatalf("a second origin pull started (started buffer = %d); want piggyback with no new pull", n)
+	}
+}
+
 func TestPullerPumpDeclinesWhenContextCanceled(t *testing.T) {
 	d := trackerDigestOf([]byte("cancelled"))
 	originPuller := fakes.NewOriginPuller()

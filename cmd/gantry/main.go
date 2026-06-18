@@ -2047,23 +2047,30 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 		if err := pumpCtx.Err(); err != nil {
 			return coord.PumpResult{Status: coord.PumpDeclined}
 		}
-		// Dedupe at this node: if a pull is already running, the
-		// stream handler must report ALREADY_PULLING with the existing
-		// start time so the requester can run the stall check.
-		h, existing, already := infl.Start(d, kind, 0)
-		if already {
+
+		// Dedupe at this node BEFORE reserving a fanout slot: if a pull is
+		// already running, report ALREADY_PULLING with the existing start
+		// time so the requester can run the stall check. A piggybacking
+		// request starts no new work, so it must NOT be gated by the
+		// concurrent-pull ceiling - otherwise a saturated node would wrongly
+		// decline same-digest requests that should ride the in-flight pull.
+		// This is a peek (no claim), so it leaves no entry behind.
+		if existing, inflightNow := infl.LookupForIntent(d); inflightNow {
 			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: existing.StartedAt}
 		}
 
-		startedAt := existing.StartedAt
-
-		// Refuse new work once graceful shutdown has closed the gate. The
-		// gate also tracks outstanding pulls so shutdown can wait for the
-		// advertise flush at the end of runOriginPull before closing the
-		// libp2p host (graceful-shutdown contract).
+		// Reserve the right to start a NEW pull before claiming the inflight
+		// entry. Claiming first and then declining (gate closed or fanout
+		// saturated) would insert a transient entry and cancel it via
+		// h.Done(); a concurrent please_pull for the same digest could observe
+		// that entry as ALREADY_PULLING and then wait on a pull that never
+		// actually starts.
+		//
+		// Refuse new work once graceful shutdown has closed the gate. The gate
+		// also tracks outstanding pulls so shutdown can wait for the advertise
+		// flush at the end of runOriginPull before closing the libp2p host
+		// (graceful-shutdown contract).
 		if !gate.TryAdd() {
-			h.Done()
-
 			return coord.PumpResult{Status: coord.PumpDeclined}
 		}
 
@@ -2075,10 +2082,24 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 		case pullSem <- struct{}{}:
 		default:
 			gate.Done()
-			h.Done()
 
 			return coord.PumpResult{Status: coord.PumpDeclined}
 		}
+
+		// Atomically claim the inflight entry. LookupForIntent above was only
+		// a peek, so a concurrent request for the same digest may have claimed
+		// it in between; Start is the authoritative check. If we lost that
+		// race, release the gate and fanout slots we reserved (the winner owns
+		// the real pull) and report its in-flight entry.
+		h, existing, already := infl.Start(d, kind, 0)
+		if already {
+			<-pullSem
+			gate.Done()
+
+			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: existing.StartedAt}
+		}
+
+		startedAt := existing.StartedAt
 
 		// Detach the actual fetch from the stream handler. The pump returns
 		// immediately; the goroutine owns the inflight handle, the gate slot,
