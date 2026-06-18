@@ -387,7 +387,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
     // the plain HTTP frontend, a length-read failure is never a silently
     // dropped connection.
-    let meta = match read_object_metadata_s3(pool, backend_id, &path, page_size, false).await {
+    let meta = match read_object_metadata_s3(pool, backend_id, &path, page_size, !is_head).await {
         LenResult::Metadata(m) => m,
         LenResult::NotFound => {
             let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);

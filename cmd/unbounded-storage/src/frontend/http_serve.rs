@@ -366,7 +366,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     // 5. Resolve object metadata through the pool. The HTTP backend
     // fills it from an origin HEAD on a miss or after a backend-provided
     // TTL expires.
-    let meta = read_object_metadata(pool, backend_id, &path, page_size, false)
+    let meta = read_object_metadata(pool, backend_id, &path, page_size, !is_head)
         .await
         .map_err(|_| ())?;
     let len = meta.length;
