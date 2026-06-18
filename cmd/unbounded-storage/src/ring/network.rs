@@ -1343,7 +1343,7 @@ mod tests {
             base: store.as_mut_ptr(),
             page_size: PAGE,
             page_count: 2,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         if let Err(e) = ring.register_backing(&backing) {
             eprintln!("recv_fixed_msg: register_backing failed: {e}; skipping");

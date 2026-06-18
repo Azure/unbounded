@@ -864,7 +864,7 @@ fn run_shard(
     let frontend_registry = match FrontendRegistry::new(&frontend_specs, frontend_ctx) {
         Ok(r) => r,
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!("worker={}: {e}", widx.0)));
+            phaseb_guard.report_failed(format!("worker={}: {e}", widx.0));
             return;
         }
     };
