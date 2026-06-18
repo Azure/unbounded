@@ -89,6 +89,11 @@ func TestMachinaMachineOperationReconcilerDispatchesTarget(t *testing.T) {
 func TestMachinaMachineOperationReconcilerSkipsTerminalAndIgnoresUnsupported(t *testing.T) {
 	t.Parallel()
 
+	inProgress := &machinav1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "in-progress"},
+		Spec:       machinav1alpha3.MachineOperationSpec{OperationKind: machinav1alpha3.OperationNodeReboot},
+		Status:     machinav1alpha3.MachineOperationStatus{Phase: machinav1alpha3.OperationPhaseInProgress},
+	}
 	terminal := &machinav1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "terminal"},
 		Spec:       machinav1alpha3.MachineOperationSpec{OperationKind: machinav1alpha3.OperationNodeReboot},
@@ -101,13 +106,17 @@ func TestMachinaMachineOperationReconcilerSkipsTerminalAndIgnoresUnsupported(t *
 	target := &recordingMachineOperationTargetState{}
 
 	reconciler, err := NewMachinaMachineOperationReconciler(
-		fakeMachineOperationClient(terminal, unsupported),
+		fakeMachineOperationClient(inProgress, terminal, unsupported),
 		"machine-1",
 		"node-1",
 		MachineOperationHandlers{machinav1alpha3.OperationNodeReboot: target.reconcile},
 	)
 	if err != nil {
 		t.Fatalf("NewMachinaMachineOperationReconciler: %v", err)
+	}
+
+	if _, err := reconciler.ReconcileMachineOperation(context.Background(), "in-progress"); err != nil {
+		t.Fatalf("ReconcileMachineOperation in-progress: %v", err)
 	}
 
 	if _, err := reconciler.ReconcileMachineOperation(context.Background(), "terminal"); err != nil {
