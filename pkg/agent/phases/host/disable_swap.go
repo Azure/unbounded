@@ -62,6 +62,12 @@ func (d *disableSwap) disableSystemdSwapUnits(ctx context.Context) error {
 	}
 
 	units := parseSystemdSwapUnits(out)
+	for _, unit := range zramSetupUnitsForSwapUnits(units) {
+		if err := executil.RunCmdAt(ctx, d.log, slog.LevelInfo, executil.Systemctl(), "mask", "--now", unit); err != nil {
+			return fmt.Errorf("masking systemd zram setup unit %s: %w", unit, err)
+		}
+	}
+
 	for _, unit := range units {
 		if err := executil.RunCmdAt(ctx, d.log, slog.LevelInfo, executil.Systemctl(), "mask", "--now", unit); err != nil {
 			return fmt.Errorf("masking systemd swap unit %s: %w", unit, err)
@@ -94,6 +100,41 @@ func parseSystemdSwapUnits(out string) []string {
 	sort.Strings(units)
 
 	return units
+}
+
+func zramSetupUnitsForSwapUnits(swapUnits []string) []string {
+	seen := map[string]struct{}{}
+
+	for _, swapUnit := range swapUnits {
+		device, ok := zramDeviceFromSwapUnit(swapUnit)
+		if !ok {
+			continue
+		}
+
+		seen["systemd-zram-setup@"+device+".service"] = struct{}{}
+	}
+
+	units := make([]string, 0, len(seen))
+	for unit := range seen {
+		units = append(units, unit)
+	}
+
+	sort.Strings(units)
+
+	return units
+}
+
+func zramDeviceFromSwapUnit(unit string) (string, bool) {
+	if !strings.HasPrefix(unit, "dev-zram") || !strings.HasSuffix(unit, ".swap") {
+		return "", false
+	}
+
+	device := strings.TrimSuffix(strings.TrimPrefix(unit, "dev-"), ".swap")
+	if device == "" {
+		return "", false
+	}
+
+	return device, true
 }
 
 // commentOutSwapInFstab reads the fstab file at the given path, comments out

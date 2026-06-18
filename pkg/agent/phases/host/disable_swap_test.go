@@ -22,3 +22,15 @@ dev-zram0.swap loaded active active duplicate`
 		"dev-zram0.swap",
 	}, parseSystemdSwapUnits(out))
 }
+
+func TestZramSetupUnitsForSwapUnits(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, []string{
+		"systemd-zram-setup@zram0.service",
+	}, zramSetupUnitsForSwapUnits([]string{
+		`dev-disk-by\x2dlabel-zram0.swap`,
+		"dev-zram0.swap",
+		"dev-zram0.swap",
+	}))
+}
