@@ -409,8 +409,7 @@ func TestHTTPRegistryDoesNotSendBasicToTokenEndpoint(t *testing.T) {
 }
 
 func TestHTTPRegistryRepeatWithoutTokenDoesNotSendBasic(t *testing.T) {
-	var reqs int32
-	var sawBasic int32
+	var reqs, sawBasic int32
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&reqs, 1)
@@ -425,6 +424,7 @@ func TestHTTPRegistryRepeatWithoutTokenDoesNotSendBasic(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
+
 	credsPath := filepath.Join(dir, "creds")
 	if err := os.WriteFile(credsPath, []byte("alice:secret\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -432,6 +432,7 @@ func TestHTTPRegistryRepeatWithoutTokenDoesNotSendBasic(t *testing.T) {
 
 	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
 	d := digestOf([]byte("x"))
+
 	_, _, err := c.Pull(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "library/nginx", Digest: d})
 	if err == nil {
 		t.Fatal("expected Pull to fail")
