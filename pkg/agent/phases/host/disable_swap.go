@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 
 	"github.com/Azure/unbounded/internal/executil"
@@ -26,7 +27,9 @@ type disableSwap struct {
 // DisableSwap returns a task that disables swap on the host. Kubernetes
 // requires swap to be off so the kubelet memory management and pod QoS
 // guarantees work correctly. The task runs swapoff -a and comments out any
-// swap entries in /etc/fstab so swap stays disabled across reboots.
+// swap entries in /etc/fstab so swap stays disabled across reboots. It also
+// masks any active systemd swap units, such as Fedora's zram swap unit, because
+// those are generated outside of /etc/fstab.
 func DisableSwap(log *slog.Logger) phases.Task {
 	return &disableSwap{log: log}
 }
@@ -34,6 +37,10 @@ func DisableSwap(log *slog.Logger) phases.Task {
 func (d *disableSwap) Name() string { return "disable-swap" }
 
 func (d *disableSwap) Do(ctx context.Context) error {
+	if err := d.disableSystemdSwapUnits(ctx); err != nil {
+		return err
+	}
+
 	if err := executil.RunCmd(ctx, d.log, swapoff(), "-a"); err != nil {
 		return fmt.Errorf("swapoff -a: %w", err)
 	}
@@ -43,6 +50,50 @@ func (d *disableSwap) Do(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (d *disableSwap) disableSystemdSwapUnits(ctx context.Context) error {
+	out, err := executil.OutputCmdAt(ctx, d.log, slog.LevelDebug,
+		"systemctl", "list-units", "--type=swap", "--all", "--no-legend", "--plain")
+	if err != nil {
+		d.log.DebugContext(ctx, "listing systemd swap units failed, continuing with swapoff", "err", err)
+
+		return nil
+	}
+
+	units := parseSystemdSwapUnits(out)
+	for _, unit := range units {
+		if err := executil.RunCmdAt(ctx, d.log, slog.LevelInfo, executil.Systemctl(), "mask", "--now", unit); err != nil {
+			return fmt.Errorf("masking systemd swap unit %s: %w", unit, err)
+		}
+	}
+
+	return nil
+}
+
+func parseSystemdSwapUnits(out string) []string {
+	seen := map[string]struct{}{}
+
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+
+		unit := fields[0]
+		if strings.HasSuffix(unit, ".swap") {
+			seen[unit] = struct{}{}
+		}
+	}
+
+	units := make([]string, 0, len(seen))
+	for unit := range seen {
+		units = append(units, unit)
+	}
+
+	sort.Strings(units)
+
+	return units
 }
 
 // commentOutSwapInFstab reads the fstab file at the given path, comments out
