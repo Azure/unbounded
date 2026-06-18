@@ -131,7 +131,7 @@ func TestIntegration_FullProvisioningLifecycle(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "v1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 			},
 		},
 	}
@@ -269,7 +269,7 @@ func TestIntegration_JoiningStaysJoiningWithoutNode(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "v1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 			},
 		},
 	}
@@ -343,7 +343,7 @@ func TestIntegration_ProvisioningFailureThenRetry(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "v1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 			},
 		},
 	}
@@ -453,7 +453,7 @@ func TestIntegration_AddKubernetesConfigToReadyMachine(t *testing.T) {
 	// Add kubernetes config.
 	m.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{
 		Version:           "v1.34.0",
-		BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
+		BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 	}
 	require.NoError(t, fakeClient.Update(context.Background(), m))
 
@@ -495,7 +495,7 @@ func TestIntegration_JoiningMachineBecomesUnreachable(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "v1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 			},
 		},
 	}
@@ -571,7 +571,7 @@ func TestIntegration_MultipleMachines(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "v1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 			},
 		},
 	}
@@ -585,7 +585,7 @@ func TestIntegration_MultipleMachines(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "v1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 			},
 		},
 	}
@@ -597,7 +597,7 @@ func TestIntegration_MultipleMachines(t *testing.T) {
 				Username:      "user",
 				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "key"},
 			},
-			// No kubernetes config — should stay Ready.
+			// No kubernetes config - should stay Ready.
 		},
 	}
 
@@ -664,7 +664,7 @@ func TestIntegration_ProvisioningPhaseBlocksReProvision(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "v1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 			},
 		},
 		Status: unboundedv1alpha3.MachineStatus{
@@ -712,7 +712,7 @@ func TestIntegration_MachineDeletedReturnsNoError(t *testing.T) {
 
 	s := newIntegrationScheme(t)
 
-	// No machine object — simulates deletion.
+	// No machine object - simulates deletion.
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(&unboundedv1alpha3.Machine{}).
@@ -764,7 +764,7 @@ func TestIntegration_ConditionTransitions(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "v1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 			},
 		},
 	}
@@ -854,7 +854,7 @@ func TestIntegration_ProvisioningWithBootstrapToken(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 			},
 		},
 	}
@@ -902,7 +902,7 @@ func TestIntegration_BootstrapTokenMissing(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "v1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-missing"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-missing"},
 			},
 		},
 	}
@@ -962,7 +962,7 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "v1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 			},
 		},
 	}
@@ -1074,7 +1074,7 @@ func TestIntegration_ReadyMachineBecomesUnreachable(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "v1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 			},
 		},
 	}

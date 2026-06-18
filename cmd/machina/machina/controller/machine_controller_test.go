@@ -88,7 +88,7 @@ func newTestMachine(name, host, username string, kubernetes *unboundedv1alpha3.K
 func defaultKubernetes() *unboundedv1alpha3.KubernetesSpec {
 	return &unboundedv1alpha3.KubernetesSpec{
 		Version:           "v1.34.0",
-		BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
+		BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-abc123"},
 	}
 }
 
@@ -497,7 +497,7 @@ func TestMachineReconciler_Provisioning_JoiningSkipsReProvision(t *testing.T) {
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.False(t, provisioner.called, "provisioner should NOT be called — Joining phase routes to Node join")
+	require.False(t, provisioner.called, "provisioner should NOT be called - Joining phase routes to Node join")
 	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 }
 
@@ -663,7 +663,7 @@ func TestMachineReconciler_ProvisioningPhase_RecentProvisioningRequeues(t *testi
 
 	result, err := reconciler.Reconcile(context.Background(), req)
 	require.NoError(t, err)
-	require.False(t, provisioner.called, "provisioner should NOT be called — still within timeout")
+	require.False(t, provisioner.called, "provisioner should NOT be called - still within timeout")
 	require.Equal(t, RequeueAfterPending, result.RequeueAfter)
 
 	// Phase should remain Provisioning (no status update).
@@ -1335,7 +1335,7 @@ func TestReconcileNodeJoin_Ready_NodeDisappears(t *testing.T) {
 		},
 	}
 
-	// No Node in the cluster — it disappeared.
+	// No Node in the cluster - it disappeared.
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(s).
 		WithObjects(machine).
