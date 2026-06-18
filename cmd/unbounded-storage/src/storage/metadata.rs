@@ -140,8 +140,9 @@ impl ObjectMetadata {
 
     /// Build metadata from an origin `HEAD` response. Backends express
     /// per-key TTLs through the standard `Cache-Control` header; the cache
-    /// currently honors `s-maxage` or `max-age` when an ETag is present so
-    /// revalidation can compare object versions safely.
+    /// currently honors directives that require immediate revalidation, plus
+    /// `s-maxage` or `max-age` when an ETag is present so revalidation can
+    /// compare object versions safely.
     pub fn from_origin_head(
         length: u64,
         etag: Option<&str>,
@@ -149,12 +150,13 @@ impl ObjectMetadata {
         fetched_at_ms: u64,
     ) -> Self {
         let mut meta = Self::new(length);
+        let ttl_ms = cache_control.and_then(cache_control_ttl_ms);
         if let Some(etag) = etag.filter(|v| is_strong_etag(v)) {
             meta.set_etag(etag);
-            if let Some(ttl_ms) = cache_control.and_then(cache_control_ttl_ms) {
-                meta.set_cache_ttl_ms(ttl_ms);
-                meta.set_fetched_at_unix_ms(fetched_at_ms);
-            }
+        }
+        if matches!(ttl_ms, Some(0)) || (meta.etag().is_some() && ttl_ms.is_some()) {
+            meta.set_cache_ttl_ms(ttl_ms.unwrap());
+            meta.set_fetched_at_unix_ms(fetched_at_ms);
         }
         meta
     }
@@ -208,16 +210,23 @@ fn cache_control_ttl_ms(value: &str) -> Option<u64> {
     let mut shared_max_age = None;
     for directive in value.split(',') {
         let directive = directive.trim();
-        let Some((name, raw_value)) = directive.split_once('=') else {
+        let (name, raw_value) = directive
+            .split_once('=')
+            .map_or((directive, None), |(name, value)| (name, Some(value)));
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("no-cache") || name.eq_ignore_ascii_case("no-store") {
+            return Some(0);
+        }
+        let Some(raw_value) = raw_value else {
             continue;
         };
         let Ok(seconds) = raw_value.trim().trim_matches('"').parse::<u64>() else {
             continue;
         };
         let ttl_ms = seconds.saturating_mul(1000);
-        if name.trim().eq_ignore_ascii_case("s-maxage") {
+        if name.eq_ignore_ascii_case("s-maxage") {
             shared_max_age = Some(ttl_ms);
-        } else if name.trim().eq_ignore_ascii_case("max-age") {
+        } else if name.eq_ignore_ascii_case("max-age") {
             max_age = Some(ttl_ms);
         }
     }
@@ -287,11 +296,43 @@ mod tests {
     }
 
     #[test]
+    fn origin_head_treats_no_cache_as_immediately_stale() {
+        let meta = ObjectMetadata::from_origin_head(
+            1,
+            Some("etag"),
+            Some("public, max-age=60, no-cache"),
+            10,
+        );
+        assert_eq!(meta.cache_ttl_ms(), Some(0));
+        assert_eq!(meta.fetched_at_unix_ms(), Some(10));
+        assert!(!meta.is_fresh_at(10));
+    }
+
+    #[test]
+    fn origin_head_treats_no_store_as_immediately_stale() {
+        let meta =
+            ObjectMetadata::from_origin_head(1, Some("etag"), Some("s-maxage=60, no-store"), 10);
+        assert_eq!(meta.cache_ttl_ms(), Some(0));
+        assert_eq!(meta.fetched_at_unix_ms(), Some(10));
+        assert!(!meta.is_fresh_at(10));
+    }
+
+    #[test]
     fn origin_head_ignores_ttl_without_etag() {
         let meta = ObjectMetadata::from_origin_head(1, None, Some("max-age=5"), 10);
         assert_eq!(meta.etag(), None);
         assert_eq!(meta.cache_ttl_ms(), None);
         assert!(meta.is_fresh_at(u64::MAX));
+    }
+
+    #[test]
+    fn origin_head_honors_immediate_revalidation_without_etag() {
+        let meta = ObjectMetadata::from_origin_head(1, None, Some("no-cache"), 10);
+        assert_eq!(meta.etag(), None);
+        assert_eq!(meta.cache_ttl_ms(), Some(0));
+        assert_eq!(meta.fetched_at_unix_ms(), Some(10));
+        assert_eq!(meta.cache_key_version(), None);
+        assert!(!meta.is_fresh_at(10));
     }
 
     #[test]
