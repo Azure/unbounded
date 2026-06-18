@@ -53,6 +53,26 @@ func TestParseV2Path(t *testing.T) {
 			wantOK:   true,
 		},
 		{
+			// Repo component literally named "manifests" preceding a
+			// /blobs/ separator: the rightmost separator (blobs) must win.
+			name:     "manifests-named component before blobs separator",
+			path:     "/v2/acme/manifests/cache/blobs/sha256:abc",
+			wantRepo: "acme/manifests/cache",
+			wantKind: ifaces.KindBlob,
+			wantRef:  "sha256:abc",
+			wantOK:   true,
+		},
+		{
+			// Symmetric case: repo component named "blobs" preceding a
+			// /manifests/ separator; rightmost separator (manifests) wins.
+			name:     "blobs-named component before manifests separator",
+			path:     "/v2/acme/blobs/cache/manifests/v1.0",
+			wantRepo: "acme/blobs/cache",
+			wantKind: ifaces.KindManifest,
+			wantRef:  "v1.0",
+			wantOK:   true,
+		},
+		{
 			name:   "not /v2/ prefix",
 			path:   "/v1/library/nginx/manifests/latest",
 			wantOK: false,

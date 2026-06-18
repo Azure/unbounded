@@ -66,10 +66,14 @@ func ValidateRepositoryName(repo string) error {
 // e.g. `library/nginx`), the resource kind (manifest vs blob), the
 // reference (tag or digest), and ok=false if the path doesn't match.
 //
-// The match uses `strings.LastIndex` on the kind separators so a repo
-// name like `cdn/manifests-mirror/foo` doesn't get clipped at the first
-// `/manifests/` substring - the canonical Distribution semantics are
-// "last occurrence wins".
+// The kind separator is the RIGHTMOST `/manifests/` or `/blobs/` in the
+// path, not the first one of a fixed kind. A repository path component may
+// itself be named `manifests` or `blobs` (both match the OCI name grammar),
+// so a path like `/v2/acme/manifests/cache/blobs/<digest>` must parse as
+// repo=`acme/manifests/cache`, kind=blob - testing `/manifests/` first would
+// wrongly clip it to repo=`acme`. The reference (tag or digest) never
+// contains a slash, so the last separator of either kind unambiguously splits
+// repo from reference; whichever separator sits further right wins.
 //
 // The extracted repository is validated against ValidateRepositoryName;
 // a path whose repository component is outside the OCI name grammar
@@ -88,23 +92,36 @@ func ParseV2Path(path string) (repo string, kind ifaces.OriginRefKind, ref strin
 	}
 
 	rest := path[len(prefix):]
-	if idx := strings.LastIndex(rest, "/manifests/"); idx >= 0 {
-		repo = rest[:idx]
-		if ValidateRepositoryName(repo) != nil {
-			return "", 0, "", false
-		}
 
-		return repo, ifaces.KindManifest, rest[idx+len("/manifests/"):], true
+	const (
+		manifestsSep = "/manifests/"
+		blobsSep     = "/blobs/"
+	)
+
+	mIdx := strings.LastIndex(rest, manifestsSep)
+	bIdx := strings.LastIndex(rest, blobsSep)
+
+	// Pick the rightmost separator. Indices are distinct when both are
+	// present (the two literals can't start at the same offset), so there is
+	// no tie to break.
+	var (
+		sep    string
+		sepIdx int
+	)
+
+	switch {
+	case mIdx < 0 && bIdx < 0:
+		return "", 0, "", false
+	case bIdx > mIdx:
+		kind, sep, sepIdx = ifaces.KindBlob, blobsSep, bIdx
+	default:
+		kind, sep, sepIdx = ifaces.KindManifest, manifestsSep, mIdx
 	}
 
-	if idx := strings.LastIndex(rest, "/blobs/"); idx >= 0 {
-		repo = rest[:idx]
-		if ValidateRepositoryName(repo) != nil {
-			return "", 0, "", false
-		}
-
-		return repo, ifaces.KindBlob, rest[idx+len("/blobs/"):], true
+	repo = rest[:sepIdx]
+	if ValidateRepositoryName(repo) != nil {
+		return "", 0, "", false
 	}
 
-	return "", 0, "", false
+	return repo, kind, rest[sepIdx+len(sep):], true
 }
