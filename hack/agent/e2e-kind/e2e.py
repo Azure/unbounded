@@ -251,26 +251,6 @@ def assert_bpffs_sentinel_absent(machine: str) -> None:
         die(f"bpffs sentinel from previous machine is visible in '{machine}'")
 
 
-def install_bpftool(machine: str) -> None:
-    log(f"Installing bpftool in nspawn machine '{machine}'...")
-    # TODO: remove this once agent-ubuntu2404 and agent-ubuntu2404-nvidia
-    # images containing bpftool have been published and are used by e2e.
-    machine_shell(machine, textwrap.dedent("""\
-        if command -v bpftool >/dev/null 2>&1; then
-            exit 0
-        fi
-        if command -v apt-get >/dev/null 2>&1; then
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y linux-tools-common
-        elif command -v tdnf >/dev/null 2>&1; then
-            tdnf install -y bpftool
-        else
-            echo "no supported package manager found for bpftool" >&2
-            exit 1
-        fi
-    """))
-
-
 def _b64(val: str) -> str:
     """Base64-encode a string (no newlines)."""
     return base64.b64encode(val.encode()).decode()
@@ -907,7 +887,6 @@ class HostImage:
     url: str
     file_name: str
     backing_format: str
-    uefi: bool
 
 
 def host_image() -> HostImage:
@@ -917,7 +896,6 @@ def host_image() -> HostImage:
             or "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img",
             file_name="ubuntu-cloud-amd64.img",
             backing_format="qcow2",
-            uefi=False,
         )
     if HOST_BASE_OS == "ubuntu2604":
         return HostImage(
@@ -925,7 +903,6 @@ def host_image() -> HostImage:
             or "https://cloud-images.ubuntu.com/minimal/releases/resolute/release/ubuntu-26.04-minimal-cloudimg-amd64.img",
             file_name="ubuntu-26.04-minimal-cloudimg-amd64.img",
             backing_format="qcow2",
-            uefi=False,
         )
     if HOST_BASE_OS == "fedora":
         return HostImage(
@@ -933,7 +910,6 @@ def host_image() -> HostImage:
             or "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2",
             file_name="fedora-cloud-amd64.qcow2",
             backing_format="qcow2",
-            uefi=False,
         )
 
     die(f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; expected ubuntu2404, ubuntu2604, or fedora")
@@ -1100,10 +1076,6 @@ def _launch_vm(ssh_pub_key: str) -> None:
         "-serial", f"file:{qemu_log}",
         "-display", "none",
     ]
-    if image.uefi:
-        qemu_args.extend([
-            "-drive", "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd",
-        ])
     run(qemu_args)
 
     qemu_pid = pid_file.read_text().strip()
@@ -2613,7 +2585,6 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
         die("Resolved target MachineConfigurationVersion was empty")
 
     old_nspawn = active_nspawn_machine()
-    install_bpftool(old_nspawn)
     create_bpffs_sentinel(old_nspawn)
 
     log(f"Assigning Machine '{AGENT_MACHINE_NAME}' to {target_mcv}...")
