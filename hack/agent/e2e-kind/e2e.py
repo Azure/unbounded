@@ -903,7 +903,7 @@ def host_image() -> HostImage:
     if HOST_BASE_OS == "ubuntu2604":
         return HostImage(
             url=HOST_IMAGE_URL
-            or "https://cloud-images.ubuntu.com/minimal/releases/26.04/release/ubuntu-26.04-minimal-cloudimg-amd64.img",
+            or "https://cloud-images.ubuntu.com/minimal/releases/resolute/release/ubuntu-26.04-minimal-cloudimg-amd64.img",
             file_name="ubuntu-26.04-minimal-cloudimg-amd64.img",
             backing_format="qcow2",
         )
