@@ -49,7 +49,8 @@ pub(super) struct PageSlot {
     /// refresh in place. They do not hold the page bytes, but they keep
     /// the slot from being recycled while they are parked.
     pub refresh_waiters: Cell<u32>,
-    pub refresh_wakers: RefCell<Vec<Waker>>,
+    pub next_refresh_waiter_id: Cell<u64>,
+    pub refresh_wakers: RefCell<Vec<(u64, Waker)>>,
 }
 
 impl PageSlot {
@@ -61,6 +62,7 @@ impl PageSlot {
             consumer_holds: Cell::new(0),
             tee_pending: Cell::new(false),
             refresh_waiters: Cell::new(0),
+            next_refresh_waiter_id: Cell::new(0),
             refresh_wakers: RefCell::new(Vec::new()),
         }
     }

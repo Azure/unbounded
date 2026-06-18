@@ -1012,21 +1012,63 @@ impl<'a> Drop for TeePendingGuard<'a> {
 
 fn wake_refresh_waiters(slot: &Rc<PageSlot>) {
     let wakers = std::mem::take(&mut *slot.refresh_wakers.borrow_mut());
-    for w in wakers {
+    for (_, w) in wakers {
         w.wake();
     }
 }
 
+fn register_refresh_waker(slot: &Rc<PageSlot>, waiter_id: u64, waker: &std::task::Waker) {
+    let mut wakers = slot.refresh_wakers.borrow_mut();
+    if let Some((_, existing)) = wakers.iter_mut().find(|(id, _)| *id == waiter_id) {
+        if !existing.will_wake(waker) {
+            *existing = waker.clone();
+        }
+        return;
+    }
+    wakers.push((waiter_id, waker.clone()));
+}
+
+fn unregister_refresh_waker(slot: &Rc<PageSlot>, waiter_id: u64) {
+    slot.refresh_wakers
+        .borrow_mut()
+        .retain(|(id, _)| *id != waiter_id);
+}
+
 struct WaitForReusable {
     slot: Rc<PageSlot>,
-    registered: bool,
+    waiter_id: Option<u64>,
 }
 
 impl WaitForReusable {
     fn new(slot: Rc<PageSlot>) -> Self {
         Self {
             slot,
-            registered: false,
+            waiter_id: None,
+        }
+    }
+
+    fn register_waiter(&mut self) -> u64 {
+        match self.waiter_id {
+            Some(id) => id,
+            None => {
+                let id = self.slot.next_refresh_waiter_id.get();
+                let next = id.checked_add(1).expect("refresh waiter id overflow");
+                self.slot.next_refresh_waiter_id.set(next);
+                self.slot
+                    .refresh_waiters
+                    .set(self.slot.refresh_waiters.get() + 1);
+                self.waiter_id = Some(id);
+                id
+            }
+        }
+    }
+
+    fn unregister_waiter(&mut self) {
+        if let Some(id) = self.waiter_id.take() {
+            unregister_refresh_waker(&self.slot, id);
+            self.slot
+                .refresh_waiters
+                .set(self.slot.refresh_waiters.get().saturating_sub(1));
         }
     }
 }
@@ -1037,29 +1079,18 @@ impl Future for WaitForReusable {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
         if this.slot.consumer_holds.get() == 0 && !this.slot.tee_pending.get() {
+            this.unregister_waiter();
             return Poll::Ready(());
         }
-        if !this.registered {
-            this.slot
-                .refresh_waiters
-                .set(this.slot.refresh_waiters.get() + 1);
-            this.registered = true;
-        }
-        this.slot
-            .refresh_wakers
-            .borrow_mut()
-            .push(cx.waker().clone());
+        let waiter_id = this.register_waiter();
+        register_refresh_waker(&this.slot, waiter_id, cx.waker());
         Poll::Pending
     }
 }
 
 impl Drop for WaitForReusable {
     fn drop(&mut self) {
-        if self.registered {
-            self.slot
-                .refresh_waiters
-                .set(self.slot.refresh_waiters.get().saturating_sub(1));
-        }
+        self.unregister_waiter();
     }
 }
 
@@ -1205,4 +1236,47 @@ enum Outcome {
     Ready,
     Error(Error),
     Retry,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::pin;
+    use std::task::{Context, Poll};
+
+    use super::*;
+    use crate::runtime::noop_waker;
+
+    #[test]
+    fn wait_for_reusable_keeps_one_waker_per_waiter() {
+        let slot = Rc::new(PageSlot::new(0));
+        slot.consumer_holds.set(1);
+        slot.tee_pending.set(true);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut wait = pin!(WaitForReusable::new(slot.clone()));
+
+        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(slot.refresh_waiters.get(), 1);
+        assert_eq!(slot.refresh_wakers.borrow().len(), 1);
+
+        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(slot.refresh_waiters.get(), 1);
+        assert_eq!(slot.refresh_wakers.borrow().len(), 1);
+
+        slot.consumer_holds.set(0);
+        wake_refresh_waiters(&slot);
+        assert_eq!(slot.refresh_waiters.get(), 1);
+        assert_eq!(slot.refresh_wakers.borrow().len(), 0);
+
+        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(slot.refresh_waiters.get(), 1);
+        assert_eq!(slot.refresh_wakers.borrow().len(), 1);
+
+        slot.tee_pending.set(false);
+        wake_refresh_waiters(&slot);
+        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert_eq!(slot.refresh_waiters.get(), 0);
+        assert_eq!(slot.refresh_wakers.borrow().len(), 0);
+    }
 }
