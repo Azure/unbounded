@@ -102,7 +102,12 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		return provision.UnboundedAgentConfig{}, err
 	}
 
-	bootstrapToken, err := r.getBootstrapToken(ctx, machine.Spec.Kubernetes.BootstrapTokenRef.Name)
+	bootstrapTokenRef := machine.Spec.Kubernetes.BootstrapTokenRef
+	if bootstrapTokenRef == nil {
+		return provision.UnboundedAgentConfig{}, fmt.Errorf("machine spec.kubernetes.bootstrapTokenRef.name is required for HostReplace")
+	}
+
+	bootstrapToken, err := r.getBootstrapToken(ctx, bootstrapTokenRef.Name)
 	if err != nil {
 		return provision.UnboundedAgentConfig{}, err
 	}
