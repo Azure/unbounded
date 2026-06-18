@@ -173,15 +173,20 @@ func reconcile(cfg Config, peers *peerWatcher) error {
 
 // ringSnapshot resolves the current ring state from the node watch, reading
 // the shared fabric port from the ConfigMap's listen_addr. It returns the
-// inactive zero value when peer discovery is disabled.
+// inactive zero value when peer discovery is disabled. A source that cannot be
+// loaded yields an inactive ring; the subsequent RenderConfig surfaces the same
+// error in reconcile, which keeps the previously rendered config in place.
 func ringSnapshot(cfg Config, peers *peerWatcher) ringState {
 	if peers == nil {
 		return ringState{}
 	}
 
-	r := sourceReader{dir: cfg.SourceDir}
-	listenAddr, _ := r.read("startup.fabric.listen_addr")
-	port, ok := parseFabricPort(listenAddr)
+	sc, err := loadSourceConfig(cfg.SourceDir)
+	if err != nil {
+		return peers.snapshot(0, false)
+	}
+
+	port, ok := parseFabricPort(sc.GetStartup().GetFabric().GetListenAddr())
 
 	return peers.snapshot(port, ok)
 }

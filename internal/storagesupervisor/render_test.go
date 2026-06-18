@@ -15,16 +15,14 @@ import (
 	storageconfig "github.com/Azure/unbounded/api/unbounded-storage"
 )
 
-// writeKeys projects a map of dotted config keys to a temp directory one file
-// per key, mirroring how Kubernetes projects a ConfigMap volume.
-func writeKeys(t *testing.T, keys map[string]string) string {
+// writeSource projects a ConfigMap-style source directory holding a single
+// config.yaml document, mirroring how Kubernetes projects the ConfigMap volume.
+func writeSource(t *testing.T, configYAML string) string {
 	t.Helper()
 
 	dir := t.TempDir()
 
-	for k, v := range keys {
-		require.NoError(t, os.WriteFile(filepath.Join(dir, k), []byte(v), 0o644))
-	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, sourceConfigFile), []byte(configYAML), 0o644))
 
 	return dir
 }
@@ -44,25 +42,30 @@ func decode(t *testing.T, dir string) *storageconfig.Config {
 	return &cfg
 }
 
-func TestRenderConfigFullKeys(t *testing.T) {
-	dir := writeKeys(t, map[string]string{
-		"version":                              "7",
-		"startup.memory.no_hugepages":          "true",
-		"startup.memory.memory_total_bytes":    "134217728",
-		"startup.fabric.listen_addr":           "10.0.0.1:7000",
-		"startup.fabric.progress_threads":      "3",
-		"startup.fabric.progress_poll_us":      "25",
-		"startup.fabric.rpc_worker_threads":    "8",
-		"startup.fabric.max_inflight":          "2048",
-		"startup.topology.use_smt_siblings":    "true",
-		"startup.topology.ignore_isolated":     "true",
-		"startup.topology.include_node_cpu0":   "true",
-		"startup.topology.allow_inactive_port": "true",
-		"startup.topology.disable_rdma":        "true",
-		"startup.topology.serving_cores":       "12",
-		"startup.topology.nic_workers":         "6",
-		"startup.metrics.bind":                 "0.0.0.0:9100",
-	})
+func TestRenderConfigFullSchema(t *testing.T) {
+	dir := writeSource(t, `
+version: 7
+startup:
+  memory:
+    no_hugepages: true
+    memory_total_bytes: 134217728
+  fabric:
+    listen_addr: "10.0.0.1:7000"
+    progress_threads: 3
+    progress_poll_us: 25
+    rpc_worker_threads: 8
+    max_inflight: 2048
+  topology:
+    use_smt_siblings: true
+    ignore_isolated: true
+    include_node_cpu0: true
+    allow_inactive_port: true
+    disable_rdma: true
+    serving_cores: 12
+    nic_workers: 6
+  metrics:
+    bind: "0.0.0.0:9100"
+`)
 
 	cfg := decode(t, dir)
 
@@ -88,16 +91,21 @@ func TestRenderConfigDefaultsConfigMap(t *testing.T) {
 	// The committed ConfigMap defaults render to a config the daemon accepts.
 	// Unset/zero values are left for the daemon's apply_defaults; here we just
 	// confirm the documented default values round-trip through the wire format.
-	dir := writeKeys(t, map[string]string{
-		"version":                           "0",
-		"startup.memory.no_hugepages":       "false",
-		"startup.memory.memory_total_bytes": "134217728",
-		"startup.fabric.listen_addr":        "0.0.0.0:0",
-		"startup.fabric.max_inflight":       "1024",
-		"startup.topology.serving_cores":    "0",
-		"startup.topology.nic_workers":      "4",
-		"startup.metrics.bind":              "",
-	})
+	dir := writeSource(t, `
+version: 0
+startup:
+  memory:
+    no_hugepages: false
+    memory_total_bytes: 134217728
+  fabric:
+    listen_addr: "0.0.0.0:0"
+    max_inflight: 1024
+  topology:
+    serving_cores: 0
+    nic_workers: 4
+  metrics:
+    bind: ""
+`)
 
 	cfg := decode(t, dir)
 
@@ -109,10 +117,10 @@ func TestRenderConfigDefaultsConfigMap(t *testing.T) {
 	assert.Empty(t, cfg.GetStartup().GetMetrics().GetBind())
 }
 
-func TestRenderConfigMissingKeysLeaveZero(t *testing.T) {
-	// An empty source directory yields a message with no fields set; every
-	// field is the proto3 zero value, which the daemon promotes to defaults.
-	dir := t.TempDir()
+func TestRenderConfigEmptyLeavesZero(t *testing.T) {
+	// An empty config.yaml yields a message with no fields set; every field is
+	// the proto3 zero value, which the daemon promotes to defaults.
+	dir := writeSource(t, "")
 
 	cfg := decode(t, dir)
 
@@ -122,53 +130,49 @@ func TestRenderConfigMissingKeysLeaveZero(t *testing.T) {
 	assert.Empty(t, cfg.GetStartup().GetFabric().GetListenAddr())
 }
 
+func TestRenderConfigMissingFileLeavesZero(t *testing.T) {
+	// An absent config.yaml (e.g. before the ConfigMap projects) is tolerated
+	// and renders an empty config rather than failing.
+	cfg := decode(t, t.TempDir())
+
+	assert.Equal(t, uint64(0), cfg.Version)
+	assert.Empty(t, cfg.GetStartup().GetFabric().GetListenAddr())
+}
+
 func TestRenderConfigInvalidValues(t *testing.T) {
 	tests := []struct {
 		name string
-		key  string
-		val  string
+		yaml string
 	}{
-		{name: "bad uint64 version", key: "version", val: "lots"},
-		{name: "bad bool", key: "startup.memory.no_hugepages", val: "yes-please"},
-		{name: "bad uint32", key: "startup.fabric.max_inflight", val: "-1"},
-		{name: "overflow uint32", key: "startup.fabric.progress_threads", val: "4294967296"},
-		{name: "bad uint64 cores", key: "startup.topology.serving_cores", val: "1.5"},
+		{name: "malformed yaml", yaml: "version: : :\n  - broken"},
+		{name: "unknown field", yaml: "versionn: 7"},
+		{name: "unknown nested field", yaml: "startup:\n  fabric:\n    listen_address: \"x\""},
+		{name: "wrong type bool", yaml: "startup:\n  memory:\n    no_hugepages: \"yes-please\""},
+		{name: "wrong type uint", yaml: "startup:\n  fabric:\n    max_inflight: \"lots\""},
+		{name: "negative uint", yaml: "startup:\n  fabric:\n    max_inflight: -1"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := writeKeys(t, map[string]string{tt.key: tt.val})
+			dir := writeSource(t, tt.yaml)
 
 			_, err := RenderConfig(dir, ringState{})
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.key)
 		})
 	}
-}
-
-func TestRenderConfigTrimsWhitespace(t *testing.T) {
-	// ConfigMap values commonly carry a trailing newline; it must be trimmed
-	// before parsing.
-	dir := writeKeys(t, map[string]string{
-		"startup.fabric.max_inflight": "2048\n",
-		"startup.fabric.listen_addr":  "  10.0.0.1:7000  \n",
-	})
-
-	cfg := decode(t, dir)
-
-	assert.Equal(t, uint32(2048), cfg.GetStartup().GetFabric().GetMaxInflight())
-	assert.Equal(t, "10.0.0.1:7000", cfg.GetStartup().GetFabric().GetListenAddr())
 }
 
 func TestRenderConfigActiveRingOverlay(t *testing.T) {
 	// An active ring injects local_node_id + peers and overrides the
 	// ConfigMap's listen_addr with this node's own routable bind, while the
 	// rest of the startup settings still come from the source.
-	dir := writeKeys(t, map[string]string{
-		"version":                     "3",
-		"startup.fabric.listen_addr":  "0.0.0.0:9000",
-		"startup.fabric.max_inflight": "2048",
-	})
+	dir := writeSource(t, `
+version: 3
+startup:
+  fabric:
+    listen_addr: "0.0.0.0:9000"
+    max_inflight: 2048
+`)
 
 	ring := ringState{
 		active:         true,
@@ -200,17 +204,107 @@ func TestRenderConfigActiveRingOverlay(t *testing.T) {
 	assert.Equal(t, "10.0.0.7:9000", cfg.GetPeers()[1].GetAddress().GetSocket())
 }
 
+func TestRenderConfigActiveRingMergesPeers(t *testing.T) {
+	// Peers declared in the YAML are merged with discovered peers, and
+	// YAML-declared p2p scalars (fingers_per_node, local_labels) are preserved
+	// while local_node_id is stamped in.
+	dir := writeSource(t, `
+p2p:
+  fingers_per_node: 5
+  local_labels: ["rack-a"]
+peers:
+  - id: 100
+    address:
+      socket: "10.0.0.100:9000"
+startup:
+  fabric:
+    listen_addr: "0.0.0.0:9000"
+`)
+
+	ring := ringState{
+		active:         true,
+		localNodeID:    42,
+		selfListenAddr: "10.0.0.5:9000",
+		peers: []*storageconfig.PeerSpec{
+			{Id: 9, Address: &storageconfig.FabricAddress{Socket: "10.0.0.7:9000"}},
+			{Id: 7, Address: &storageconfig.FabricAddress{Socket: "10.0.0.6:9000"}},
+		},
+	}
+
+	data, err := RenderConfig(dir, ring)
+	require.NoError(t, err)
+
+	var cfg storageconfig.Config
+
+	require.NoError(t, proto.Unmarshal(data, &cfg))
+
+	// YAML p2p scalars preserved; local id injected.
+	assert.Equal(t, uint64(42), cfg.GetP2P().GetLocalNodeId())
+	assert.Equal(t, uint32(5), cfg.GetP2P().GetFingersPerNode())
+	assert.Equal(t, []string{"rack-a"}, cfg.GetP2P().GetLocalLabels())
+
+	// Discovered {7,9} merged with declared {100}, sorted by id.
+	require.Len(t, cfg.GetPeers(), 3)
+	assert.Equal(t, uint64(7), cfg.GetPeers()[0].GetId())
+	assert.Equal(t, uint64(9), cfg.GetPeers()[1].GetId())
+	assert.Equal(t, uint64(100), cfg.GetPeers()[2].GetId())
+	assert.Equal(t, "10.0.0.100:9000", cfg.GetPeers()[2].GetAddress().GetSocket())
+}
+
+func TestRenderConfigMergeDropsCollisionsAndSelf(t *testing.T) {
+	// A declared peer whose id collides with a discovered peer is dropped in
+	// favor of the discovered one; a declared peer whose id equals the local
+	// node id is dropped entirely.
+	dir := writeSource(t, `
+peers:
+  - id: 7
+    address:
+      socket: "10.9.9.9:9000"
+  - id: 42
+    address:
+      socket: "10.9.9.42:9000"
+`)
+
+	ring := ringState{
+		active:      true,
+		localNodeID: 42,
+		peers: []*storageconfig.PeerSpec{
+			{Id: 7, Address: &storageconfig.FabricAddress{Socket: "10.0.0.6:9000"}},
+		},
+	}
+
+	data, err := RenderConfig(dir, ring)
+	require.NoError(t, err)
+
+	var cfg storageconfig.Config
+
+	require.NoError(t, proto.Unmarshal(data, &cfg))
+
+	// Only the discovered peer 7 survives; its address wins the collision and
+	// the self-id peer (42) is gone.
+	require.Len(t, cfg.GetPeers(), 1)
+	assert.Equal(t, uint64(7), cfg.GetPeers()[0].GetId())
+	assert.Equal(t, "10.0.0.6:9000", cfg.GetPeers()[0].GetAddress().GetSocket())
+}
+
 func TestRenderConfigInactiveRingPassesThrough(t *testing.T) {
-	// An inactive ring leaves the per-node sections empty and the ConfigMap's
-	// listen_addr untouched.
-	dir := writeKeys(t, map[string]string{
-		"startup.fabric.listen_addr": "0.0.0.0:0",
-	})
+	// An inactive ring leaves the YAML-declared per-node sections untouched and
+	// the ConfigMap's listen_addr unchanged.
+	dir := writeSource(t, `
+peers:
+  - id: 100
+    address:
+      socket: "10.0.0.100:9000"
+startup:
+  fabric:
+    listen_addr: "0.0.0.0:0"
+`)
 
 	cfg := decode(t, dir)
 
 	assert.Nil(t, cfg.GetP2P())
-	assert.Empty(t, cfg.GetPeers())
+	require.Len(t, cfg.GetPeers(), 1)
+	assert.Equal(t, uint64(100), cfg.GetPeers()[0].GetId())
 	assert.Equal(t, "0.0.0.0:0", cfg.GetStartup().GetFabric().GetListenAddr())
 }
 

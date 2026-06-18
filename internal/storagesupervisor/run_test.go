@@ -32,10 +32,7 @@ func decodeFile(t *testing.T, path string) *storageconfig.Config {
 }
 
 func TestReconcileRendersFile(t *testing.T) {
-	src := writeKeys(t, map[string]string{
-		"version":                     "5",
-		"startup.fabric.max_inflight": "2048",
-	})
+	src := writeSource(t, "version: 5\nstartup:\n  fabric:\n    max_inflight: 2048\n")
 	dest := filepath.Join(t.TempDir(), "config.binpb")
 
 	require.NoError(t, reconcile(Config{SourceDir: src, ConfigPath: dest}, nil))
@@ -46,14 +43,14 @@ func TestReconcileRendersFile(t *testing.T) {
 }
 
 func TestReconcileBadValueErrors(t *testing.T) {
-	src := writeKeys(t, map[string]string{"version": "nope"})
+	src := writeSource(t, "version: \"nope\"")
 	dest := filepath.Join(t.TempDir(), "config.binpb")
 
 	require.Error(t, reconcile(Config{SourceDir: src, ConfigPath: dest}, nil))
 }
 
 func TestRunRendersInitialAndReRenders(t *testing.T) {
-	src := writeKeys(t, map[string]string{"version": "1"})
+	src := writeSource(t, "version: 1")
 	dest := filepath.Join(t.TempDir(), "config.binpb")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -71,8 +68,9 @@ func TestRunRendersInitialAndReRenders(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 	assert.Equal(t, uint64(1), decodeFile(t, dest).Version)
 
-	// Mutate a source key; the watcher should re-render with the new value.
-	require.NoError(t, os.WriteFile(filepath.Join(src, "version"), []byte("2"), 0o644))
+	// Mutate the source document; the watcher should re-render with the new
+	// value.
+	require.NoError(t, os.WriteFile(filepath.Join(src, sourceConfigFile), []byte("version: 2"), 0o644))
 
 	require.Eventually(t, func() bool {
 		return decodeFile(t, dest).Version == 2
@@ -91,7 +89,7 @@ func TestRunRendersInitialAndReRenders(t *testing.T) {
 func TestRunInitialRenderFails(t *testing.T) {
 	// A bad source value surfaces as an error from the initial render rather
 	// than starting the watch loop.
-	src := writeKeys(t, map[string]string{"version": "bad"})
+	src := writeSource(t, "version: \"bad\"")
 	dest := filepath.Join(t.TempDir(), "config.binpb")
 
 	err := Run(context.Background(), Config{SourceDir: src, ConfigPath: dest})
@@ -99,9 +97,9 @@ func TestRunInitialRenderFails(t *testing.T) {
 }
 
 func TestRunMissingSourceDirErrors(t *testing.T) {
-	// RenderConfig tolerates absent key files, but the watcher cannot watch a
-	// nonexistent source directory, so Run fails after the (empty) initial
-	// render.
+	// RenderConfig tolerates an absent config.yaml, but the watcher cannot
+	// watch a nonexistent source directory, so Run fails after the (empty)
+	// initial render.
 	dest := filepath.Join(t.TempDir(), "config.binpb")
 
 	err := Run(context.Background(), Config{

@@ -30,6 +30,12 @@ const (
 	defaultSystemctl   = "systemctl"
 	defaultHostRoot    = "/"
 
+	// sourceConfigFile is the single YAML document, projected from the
+	// ConfigMap under SourceDir, that holds the daemon Config (the full
+	// api/unbounded-storage/config.proto schema in snake_case). The run
+	// supervisor unmarshals it into protobuf and renders ConfigPath.
+	sourceConfigFile = "config.yaml"
+
 	// defaultStorageRingLabel is the node label whose value partitions nodes
 	// into storage rings. Every node sharing a value forms one peer set: each
 	// member is published to the others as an unbounded-storage peer.
@@ -72,8 +78,9 @@ type Config struct {
 	// any other extension is parsed as strict TOML.
 	ConfigPath string
 	// SourceDir is the host/container path where the cluster ConfigMap is
-	// projected one file per dotted key. The run supervisor reads these and
-	// renders ConfigPath; install does not use it.
+	// projected. It holds a single sourceConfigFile (config.yaml) carrying the
+	// daemon Config as YAML. The run supervisor unmarshals it and renders
+	// ConfigPath; install does not use it.
 	SourceDir string
 	// NodeName is the Kubernetes node this supervisor runs on, sourced from
 	// the NODE_NAME downward-API env. The run supervisor uses it to find this

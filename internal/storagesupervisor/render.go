@@ -5,82 +5,44 @@ package storagesupervisor
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
+	"sort"
 	"strings"
 
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"sigs.k8s.io/yaml"
 
 	storageconfig "github.com/Azure/unbounded/api/unbounded-storage"
 )
 
-// RenderConfig reads the startup-tuning ConfigMap projected one file per
-// dotted key under sourceDir and renders it into the daemon's binary
-// protobuf config wire format, then overlays the per-node ring state.
+// RenderConfig reads the daemon Config expressed as YAML from the projected
+// ConfigMap (a single sourceConfigFile under sourceDir), unmarshals it into the
+// protobuf Config message, overlays the per-node ring state, and returns the
+// daemon's binary protobuf config wire format.
 //
-// Startup-fixed settings (version + the startup.{memory,fabric,topology,
-// metrics} sections) are sourced from the ConfigMap. A missing key file leaves
-// its proto3 zero value in place, which the daemon promotes to the documented
-// default. A present file with an unparseable value is a hard error so an
-// operator typo fails loudly rather than silently reverting a field to its
-// default.
+// The YAML is the full Config schema (api/unbounded-storage/config.proto) with
+// snake_case field names. Unknown fields are rejected so an operator typo fails
+// loudly rather than silently dropping a setting. Any field left unset keeps its
+// proto3 zero value, which the daemon promotes to the documented default.
 //
-// The per-node sections (p2p.local_node_id, peers) are not in the ConfigMap;
-// they come from ring, computed from the Kubernetes node watch. When the ring
-// is active, this node's id and its peers are injected and the ConfigMap's
-// listen_addr is overridden with the node's own routable bind. When ring is
-// inactive (no node watch, no ring membership, or no fixed fabric port) the
-// rendered config is startup-only, exactly as before.
+// The per-node sections (p2p.local_node_id and the discovered peer set) come
+// from ring, computed from the Kubernetes node watch. When the ring is active,
+// this node's id is injected, discovered peers are merged with any peers
+// declared in the YAML (discovered peers win on id collision), and the
+// listen_addr is overridden with the node's own routable bind. When the ring is
+// inactive (no node watch, no ring membership, or no fixed fabric port) the YAML
+// is rendered as-is, including any hand-declared p2p/peers.
 func RenderConfig(sourceDir string, ring ringState) ([]byte, error) {
-	cfg := &storageconfig.Config{
-		Startup: &storageconfig.StartupCfg{
-			Memory:   &storageconfig.MemoryCfg{},
-			Fabric:   &storageconfig.FabricCfg{},
-			Topology: &storageconfig.TopologyCfg{},
-			Metrics:  &storageconfig.MetricsCfg{},
-		},
+	cfg, err := loadSourceConfig(sourceDir)
+	if err != nil {
+		return nil, err
 	}
 
-	r := sourceReader{dir: sourceDir}
-
-	r.u64("version", &cfg.Version)
-
-	r.boolean("startup.memory.no_hugepages", &cfg.Startup.Memory.NoHugepages)
-	r.u64("startup.memory.memory_total_bytes", &cfg.Startup.Memory.MemoryTotalBytes)
-
-	r.str("startup.fabric.listen_addr", &cfg.Startup.Fabric.ListenAddr)
-	r.u32("startup.fabric.progress_threads", &cfg.Startup.Fabric.ProgressThreads)
-	r.u32("startup.fabric.progress_poll_us", &cfg.Startup.Fabric.ProgressPollUs)
-	r.u32("startup.fabric.rpc_worker_threads", &cfg.Startup.Fabric.RpcWorkerThreads)
-	r.u32("startup.fabric.max_inflight", &cfg.Startup.Fabric.MaxInflight)
-
-	r.boolean("startup.topology.use_smt_siblings", &cfg.Startup.Topology.UseSmtSiblings)
-	r.boolean("startup.topology.ignore_isolated", &cfg.Startup.Topology.IgnoreIsolated)
-	r.boolean("startup.topology.include_node_cpu0", &cfg.Startup.Topology.IncludeNodeCpu0)
-	r.boolean("startup.topology.allow_inactive_port", &cfg.Startup.Topology.AllowInactivePort)
-	r.boolean("startup.topology.disable_rdma", &cfg.Startup.Topology.DisableRdma)
-	r.u64("startup.topology.serving_cores", &cfg.Startup.Topology.ServingCores)
-	r.u64("startup.topology.nic_workers", &cfg.Startup.Topology.NicWorkers)
-
-	r.str("startup.metrics.bind", &cfg.Startup.Metrics.Bind)
-
-	if r.err != nil {
-		return nil, r.err
-	}
-
-	// Overlay the per-node ring: this node's id and peers, plus an own-IP
-	// listen_addr so the fabric binds an address peers can dial. Skipped when
-	// the ring is inactive so a non-cluster render stays startup-only.
 	if ring.active {
-		cfg.P2P = &storageconfig.P2PCfg{
-			LocalNodeId: proto.Uint64(ring.localNodeID),
-		}
-		cfg.Peers = ring.peers
-
-		if ring.selfListenAddr != "" {
-			cfg.Startup.Fabric.ListenAddr = ring.selfListenAddr
-		}
+		applyRing(cfg, ring)
 	}
 
 	out, err := proto.Marshal(cfg)
@@ -91,88 +53,116 @@ func RenderConfig(sourceDir string, ring ringState) ([]byte, error) {
 	return out, nil
 }
 
-// sourceReader reads typed values from per-key files under dir, accumulating
-// the first error so a chain of reads can be expressed without a per-call
-// error check. A key whose file is absent is left at its zero value.
-type sourceReader struct {
-	dir string
-	err error
-}
+// loadSourceConfig reads the YAML Config document projected from the ConfigMap
+// and unmarshals it into a protobuf Config message. An absent or empty file
+// yields an empty Config (every field at its proto3 zero value); a present but
+// malformed document, or one carrying an unknown field, is a hard error.
+func loadSourceConfig(sourceDir string) (*storageconfig.Config, error) {
+	path := filepath.Join(sourceDir, sourceConfigFile)
 
-// read returns the trimmed contents of the key file, ok=false when the file
-// is absent. A missing key is not an error: the proto3 zero value stands and
-// the daemon applies the documented default.
-func (r *sourceReader) read(key string) (string, bool) {
-	if r.err != nil {
-		return "", false
-	}
-
-	b, err := os.ReadFile(filepath.Join(r.dir, key))
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", false
+			return &storageconfig.Config{}, nil
 		}
 
-		r.err = fmt.Errorf("read config key %q: %w", key, err)
-
-		return "", false
+		return nil, fmt.Errorf("read config source %q: %w", path, err)
 	}
 
-	return strings.TrimSpace(string(b)), true
-}
-
-func (r *sourceReader) str(key string, dst *string) {
-	if v, ok := r.read(key); ok {
-		*dst = v
-	}
-}
-
-func (r *sourceReader) boolean(key string, dst *bool) {
-	v, ok := r.read(key)
-	if !ok {
-		return
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return &storageconfig.Config{}, nil
 	}
 
-	parsed, err := strconv.ParseBool(v)
+	jsonBytes, err := yaml.YAMLToJSON(raw)
 	if err != nil {
-		r.err = fmt.Errorf("config key %q: invalid bool %q", key, v)
-
-		return
+		return nil, fmt.Errorf("convert config %q yaml to json: %w", path, err)
 	}
 
-	*dst = parsed
+	cfg := &storageconfig.Config{}
+
+	// DiscardUnknown defaults to false, so an unknown field (typically an
+	// operator typo) is rejected rather than silently ignored.
+	if err := protojson.Unmarshal(jsonBytes, cfg); err != nil {
+		return nil, fmt.Errorf("unmarshal config %q: %w", path, err)
+	}
+
+	return cfg, nil
 }
 
-func (r *sourceReader) u32(key string, dst *uint32) {
-	v, ok := r.read(key)
-	if !ok {
-		return
+// applyRing overlays the per-node ring state onto a Config parsed from the
+// ConfigMap YAML. It injects this node's local id, merges the discovered peer
+// set with any peers declared in the YAML, and rebinds the fabric listen_addr
+// to the node's own routable address.
+func applyRing(cfg *storageconfig.Config, ring ringState) {
+	// Preserve YAML-declared p2p scalars (fingers_per_node, local_labels,
+	// routing_plan); only stamp in the locally computed node id.
+	if cfg.P2P == nil {
+		cfg.P2P = &storageconfig.P2PCfg{}
 	}
 
-	parsed, err := strconv.ParseUint(v, 10, 32)
-	if err != nil {
-		r.err = fmt.Errorf("config key %q: invalid uint32 %q", key, v)
+	cfg.P2P.LocalNodeId = proto.Uint64(ring.localNodeID)
 
-		return
+	cfg.Peers = mergePeers(cfg.Peers, ring.peers, ring.localNodeID)
+
+	if ring.selfListenAddr != "" {
+		if cfg.Startup == nil {
+			cfg.Startup = &storageconfig.StartupCfg{}
+		}
+
+		if cfg.Startup.Fabric == nil {
+			cfg.Startup.Fabric = &storageconfig.FabricCfg{}
+		}
+
+		cfg.Startup.Fabric.ListenAddr = ring.selfListenAddr
 	}
-
-	*dst = uint32(parsed)
 }
 
-func (r *sourceReader) u64(key string, dst *uint64) {
-	v, ok := r.read(key)
-	if !ok {
-		return
+// mergePeers combines the label-discovered peer set with any peers declared in
+// the ConfigMap YAML, deduplicated by peer id. Discovered peers are
+// authoritative: a YAML peer whose id collides with a discovered peer is
+// dropped. Any peer whose id equals the local node id is dropped (the daemon's
+// validate() rejects a self-peer, and discovery already excludes self). The
+// result is sorted by id so an unchanged input renders byte-for-byte
+// identically and never triggers a spurious config swap.
+func mergePeers(declared, discovered []*storageconfig.PeerSpec, localNodeID uint64) []*storageconfig.PeerSpec {
+	byID := make(map[uint64]*storageconfig.PeerSpec, len(declared)+len(discovered))
+
+	add := func(peers []*storageconfig.PeerSpec, fromYAML bool) {
+		for _, p := range peers {
+			if p == nil {
+				continue
+			}
+
+			if p.GetId() == localNodeID {
+				slog.Warn("dropping peer whose id equals local node id", "id", p.GetId())
+
+				continue
+			}
+
+			if _, ok := byID[p.GetId()]; ok {
+				if fromYAML {
+					slog.Warn("dropping declared peer; id already discovered", "id", p.GetId())
+				}
+
+				continue
+			}
+
+			byID[p.GetId()] = p
+		}
 	}
 
-	parsed, err := strconv.ParseUint(v, 10, 64)
-	if err != nil {
-		r.err = fmt.Errorf("config key %q: invalid uint64 %q", key, v)
+	// Discovered first so they win id collisions against declared peers.
+	add(discovered, false)
+	add(declared, true)
 
-		return
+	merged := make([]*storageconfig.PeerSpec, 0, len(byID))
+	for _, p := range byID {
+		merged = append(merged, p)
 	}
 
-	*dst = parsed
+	sort.Slice(merged, func(i, j int) bool { return merged[i].GetId() < merged[j].GetId() })
+
+	return merged
 }
 
 // WriteConfigAtomic writes data to path via a temp file in the same directory
