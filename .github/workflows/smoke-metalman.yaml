@@ -5,24 +5,24 @@ name: unbounded metalman smoke test
 
 on:
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "designs/**"
-  push:
-    branches: [main]
     paths:
+      - cmd/agent/**
       - cmd/metalman/**
       - internal/metalman/**
       - api/machina/v1alpha3/**
-      - deploy/machina/**
-      - deploy/net/**
-      - hack/smoke-metalman.py
-      - hack/kind-smoke-config.yaml
-      - images/host-ubuntu2404/**
+      - deploy/machina/crd/**
       - images/agent-ubuntu2404/**
-      - go.mod
-      - go.sum
-      - .github/workflows/smoke-metalman.yaml
+  push:
+    branches: [main]
+    paths:
+      - cmd/agent/**
+      - cmd/metalman/**
+      - internal/metalman/**
+      - api/machina/v1alpha3/**
+      - deploy/machina/crd/**
+      - images/agent-ubuntu2404/**
+  schedule:
+    - cron: "0 7 * * *"
   workflow_dispatch:
 
 permissions:
