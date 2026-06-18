@@ -148,8 +148,8 @@ func (c *Client) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser,
 		c.metrics.onPullStart(kind)
 	}
 
-	if err := oci.ValidateRepositoryName(ref.Repository); err != nil {
-		err := &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: err}
+	if verr := oci.ValidateRepositoryName(ref.Repository); verr != nil {
+		err := &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: verr}
 		c.recordFailure(kind, err)
 
 		return nil, 0, err
