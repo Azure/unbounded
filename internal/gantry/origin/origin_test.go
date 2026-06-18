@@ -408,6 +408,44 @@ func TestHTTPRegistryDoesNotSendBasicToTokenEndpoint(t *testing.T) {
 	}
 }
 
+func TestHTTPRegistryRepeatWithoutTokenDoesNotSendBasic(t *testing.T) {
+	var reqs int32
+	var sawBasic int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqs, 1)
+
+		if _, _, ok := r.BasicAuth(); ok {
+			atomic.StoreInt32(&sawBasic, 1)
+		}
+
+		w.Header().Set("WWW-Authenticate", `Basic realm="reg"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	credsPath := filepath.Join(dir, "creds")
+	if err := os.WriteFile(credsPath, []byte("alice:secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
+	d := digestOf([]byte("x"))
+	_, _, err := c.Pull(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "library/nginx", Digest: d})
+	if err == nil {
+		t.Fatal("expected Pull to fail")
+	}
+
+	if got := atomic.LoadInt32(&reqs); got != 2 {
+		t.Fatalf("requests = %d, want 2 (initial + repeatWithoutToken)", got)
+	}
+
+	if atomic.LoadInt32(&sawBasic) != 0 {
+		t.Fatal("Basic auth was sent to an http:// registry endpoint")
+	}
+}
+
 // TestPullStripsAuthOnHTTPSDowngradeRedirect proves the registry's HTTP client
 // refuses to carry an Authorization header onto a plaintext hop when an HTTPS
 // endpoint redirects to HTTP on the same hostname. net/http copies the header
