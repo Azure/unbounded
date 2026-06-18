@@ -427,6 +427,48 @@ def apiserver_url() -> str:
     return url
 
 
+def configure_kind_control_plane_node_ip(container: str, node_ip: str) -> None:
+    """Make the kind control-plane Node advertise its VM-reachable IP."""
+    log(f"Configuring {container} kubelet node IP as {node_ip}")
+    script = textwrap.dedent(f"""\
+        set -eu
+        . /var/lib/kubelet/kubeadm-flags.env
+        set -- $KUBELET_KUBEADM_ARGS
+        new_args=""
+        for arg do
+          case "$arg" in
+            --node-ip=*) ;;
+            *) new_args="$new_args $arg" ;;
+          esac
+        done
+        new_args="${{new_args# }}"
+        printf 'KUBELET_KUBEADM_ARGS="%s --node-ip={node_ip}"\n' "$new_args" >/var/lib/kubelet/kubeadm-flags.env
+        systemctl restart kubelet
+    """)
+    run(["docker", "exec", container, "sh", "-c", script])
+
+    for elapsed in range(120):
+        result = subprocess.run(
+            [KUBECTL, "get", "node", container, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            node = json.loads(result.stdout)
+            internal_ips = [
+                address.get("address", "")
+                for address in node.get("status", {}).get("addresses", [])
+                if address.get("type") == "InternalIP"
+            ]
+            if internal_ips == [node_ip]:
+                log(f"  Node '{container}' advertises InternalIP {node_ip}")
+                return
+            if elapsed > 0 and elapsed % 15 == 0:
+                log(f"    ({elapsed}s) InternalIP addresses: {internal_ips}")
+        time.sleep(1)
+
+    die(f"Timed out waiting for Node '{container}' to advertise only InternalIP {node_ip}")
+
+
 def _probe_vm_network() -> None:
     """Run quick network diagnostics inside the VM via guest agent."""
     log("  Probing VM network (one-time diagnostic)...")
@@ -851,6 +893,7 @@ def main() -> None:
          "ip", "addr", "add", f"{KIND_SMOKE_IP}/24", "dev", "eth-smoke"])
     run(["sudo", "nsenter", "-t", kind_pid, "-n",
          "ip", "link", "set", "eth-smoke", "up"])
+    configure_kind_control_plane_node_ip("kind-control-plane", KIND_SMOKE_IP)
 
     # Kindnet's CONTROL_PLANE_ENDPOINT defaults to "kind-control-plane:6443"
     # which is unresolvable from the bare-metal VM (it's not in Docker's DNS).
