@@ -57,14 +57,17 @@ becomes `/etc/containerd/config.toml` inside the container).
 
 ### OCI Images
 
-The agent ships with two pre-built rootfs images based on Ubuntu 24.04 (Noble).
-The correct image is selected automatically based on whether NVIDIA GPUs are
-detected on the host.
+The default rootfs images are based on Ubuntu 24.04 (Noble). The correct default
+image is selected automatically based on whether NVIDIA GPUs are detected on the
+host. Ubuntu 26.04 images are also available for explicit `OCIImage`
+configuration.
 
 | Image | Default repository | Description |
 |---|---|---|
 | [`agent-ubuntu2404`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2404) | `ghcr.io/azure/agent-ubuntu2404` | Base image with systemd, dbus, curl, iproute2, nftables, kmod, wireguard-tools, and bpftool. ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2404/Containerfile)) |
 | [`agent-ubuntu2404-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2404-nvidia) | `ghcr.io/azure/agent-ubuntu2404-nvidia` | Extends the base image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2404-nvidia/Containerfile)) |
+| [`agent-ubuntu2604`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2604) | `ghcr.io/azure/agent-ubuntu2604` | Ubuntu 26.04 base image with systemd, dbus, curl, iproute2, nftables, kmod, wireguard-tools, and bpftool. ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2604/Containerfile)) |
+| [`agent-ubuntu2604-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2604-nvidia) | `ghcr.io/azure/agent-ubuntu2604-nvidia` | Ubuntu 26.04 image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2604-nvidia/Containerfile)) |
 
 The agent pins a specific image tag by default at build time. The `OCIImage`
 field in the agent config can override the full image reference for custom or
