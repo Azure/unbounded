@@ -105,7 +105,14 @@ type MetricsHooks struct {
 	// OnPleasePullStarted is called once per digest the server
 	// transitions into in_flight from a please_pull batch.
 	OnPleasePullStarted func()
-	// OnStreamError fires for any malformed or oversized stream.
+	// OnStreamError fires once per inbound stream that is dropped without a
+	// normal reply. Besides a malformed or oversized envelope, this includes
+	// read/decode/deadline failures, the concurrent-stream limit, dispatch
+	// and serve errors, and response marshal/write failures. With peer-authz
+	// enforce enabled, an unauthorized-peer rejection is also a dispatch
+	// error and lands here; such rejections are additionally recorded (by
+	// reason) via OnUnauthorizedPeer, so attribute an authz-driven increase
+	// to that metric rather than to genuine protocol errors.
 	OnStreamError func()
 	// OnUnauthorizedPeer fires once per inbound request whose remote
 	// libp2p peer ID is not present in the current membership view. The
