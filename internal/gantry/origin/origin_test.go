@@ -212,6 +212,7 @@ func TestPull_InvalidRepositoryRejectedBeforeRequest(t *testing.T) {
 	}
 
 	d := digestOf([]byte("x"))
+
 	_, _, err = c.Pull(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "../../etc", Digest: d})
 	if err == nil {
 		t.Fatal("Pull: expected invalid repository error")
