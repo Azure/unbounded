@@ -48,14 +48,22 @@ permissions:
 
 jobs:
   agent-e2e:
+    name: agent e2e (host ${{ matrix.host-base-os }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        host-base-os:
+          - ubuntu2404
+          - ubuntu2604
     env:
-      KIND_CLUSTER_NAME: kind
-      VM_NAME: agent-e2e
+      KIND_CLUSTER_NAME: agent-e2e-${{ matrix.host-base-os }}
+      VM_NAME: agent-e2e-${{ matrix.host-base-os }}
       VM_SUBNET: "192.168.100"
       VM_IP: "192.168.100.10"
-      AGENT_MACHINE_NAME: agent-e2e
+      AGENT_MACHINE_NAME: agent-e2e-${{ matrix.host-base-os }}
+      HOST_BASE_OS: ${{ matrix.host-base-os }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -135,7 +143,7 @@ jobs:
         if: always()
         uses: ./.github/actions/agent-e2e-kind-logs
         with:
-          artifact-name: agent-e2e-kind-logs
+          artifact-name: agent-e2e-kind-${{ matrix.host-base-os }}-logs
 
       - name: Cleanup
         if: always()
