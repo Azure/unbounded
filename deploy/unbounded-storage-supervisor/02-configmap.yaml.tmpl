@@ -18,11 +18,13 @@ metadata:
 # are rejected, so a typo fails the render loudly. Any field left unset keeps
 # its proto3 zero value, which the daemon promotes to the documented default.
 #
-# Per-node sections are supervisor-injected and should not be set here:
-# p2p.local_node_id and the listen_addr (when a storage ring is active) are
-# overridden per node, and label-discovered peers are merged into peers
-# (discovered peers win id collisions). Peers declared here are kept only when
-# no ring is active or when their ids do not collide with discovered peers.
+# Per-node sections are supervisor-injected when a storage ring is active:
+# startup.fabric.addr is overridden per node, and every declared neighborhood
+# gets its local_node_id plus label-discovered peers merged into
+# neighborhoods[].peers (discovered peers win id collisions). Declare
+# neighborhoods here when this deployment should participate in a P2P ring; the
+# supervisor will not invent one because each neighborhood needs an explicit
+# source backend.
 data:
   config.yaml: |
     # Operator-assigned config version (opaque counter; 0 means unversioned).
@@ -36,7 +38,7 @@ data:
         memory_total_bytes: 134217728
       fabric:
         # Per-shard fabric listen address (":0" picks a free port).
-        listen_addr: "0.0.0.0:0"
+        addr: "0.0.0.0:0"
         # libfabric progress threads per shard.
         progress_threads: 2
         # Progress-thread busy-poll budget in microseconds.
@@ -60,6 +62,8 @@ data:
         serving_cores: 0
         # NIC-worker CPUs to pin per active HCA.
         nic_workers: 4
+        # Maximum number of HCAs to use per NUMA node.
+        hcas_per_numa_node: 1
       metrics:
         # Prometheus exporter listen address ("" disables the exporter).
-        bind: ""
+        addr: ""

@@ -90,7 +90,7 @@ func TestComputeRingMembership(t *testing.T) {
 	// hashed ids and InternalIP:port sockets, and self is excluded.
 	got := map[uint64]string{}
 	for _, p := range ring.peers {
-		got[p.GetId()] = p.GetAddress().GetSocket()
+		got[p.GetId()] = p.GetTcp().GetAddr()
 	}
 
 	assert.Equal(t, "10.0.0.2:9000", got[nodeID("peer-a")])
@@ -132,7 +132,7 @@ func TestComputeRingSelfMissing(t *testing.T) {
 }
 
 func TestComputeRingSelfNoInternalIP(t *testing.T) {
-	// self has no InternalIP: cannot form a routable listen_addr, inactive.
+	// self has no InternalIP: cannot form a routable fabric addr, inactive.
 	nodes := []*corev1.Node{
 		node("self", "red", ""),
 		node("peer-a", "red", "10.0.0.2"),
@@ -158,7 +158,7 @@ func TestComputeRingSkipsPeerWithoutInternalIP(t *testing.T) {
 }
 
 func TestComputeRingSingleMember(t *testing.T) {
-	// A lone ring member still activates so its listen_addr is made routable,
+	// A lone ring member still activates so its fabric addr is made routable,
 	// with an empty peer set.
 	nodes := []*corev1.Node{node("self", "red", "10.0.0.1")}
 
@@ -225,5 +225,5 @@ func TestPeerWatcherSnapshotFromInformer(t *testing.T) {
 	assert.Equal(t, "10.0.0.1:9000", ring.selfListenAddr)
 	require.Len(t, ring.peers, 1)
 	assert.Equal(t, nodeID("peer-a"), ring.peers[0].GetId())
-	assert.Equal(t, "10.0.0.2:9000", ring.peers[0].GetAddress().GetSocket())
+	assert.Equal(t, "10.0.0.2:9000", ring.peers[0].GetTcp().GetAddr())
 }

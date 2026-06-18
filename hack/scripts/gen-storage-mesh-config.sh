@@ -276,15 +276,15 @@ cat >&3 <<EOF
 # <name>.
 
 [[backends]]
-id = "origin"
+name = "origin"
 
 [backends.config.s3]
-endpoint = "$OPT_ORIGIN"
+url = "$OPT_ORIGIN"
 stripe_size_bytes = $STRIPE_SIZE
 
 [[neighborhoods]]
-id = "p2p"
-binds_to = "origin"
+name = "p2p"
+source = "origin"
 local_node_id = $LOCAL_ID
 EOF
 
@@ -306,21 +306,20 @@ done
 cat >&3 <<EOF
 
 [[caches]]
-id = "cache"
-binds_to = "p2p"
+name = "cache"
+source = "p2p"
 
 [[caches.disks]]
-path = "/tmp/unbounded-storage-${LOCAL_NAME}.disk"
 page_size_bytes = 4096
-bypass_admission = true
-skip_recovery_scan_if_no_meta = true
+skip_recovery_scan = true
 
 [caches.disks.config.file]
+path = "/tmp/unbounded-storage-${LOCAL_NAME}.disk"
 size = $DISK_SIZE
 
 [[frontends]]
-id = "fe"
-binds_to = "cache"
+name = "fe"
+source = "cache"
 
 [frontends.config.http]
 addr = "0.0.0.0:$OPT_FRONTEND_PORT"

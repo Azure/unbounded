@@ -573,7 +573,7 @@ def write_config(
     metrics_addr: str,
 ) -> None:
     # The config schema is proto3-native: byte sizes are plain integer
-    # byte counts (see cmd/unbounded-storage/proto/config.proto).
+    # byte counts (see api/unbounded-storage/config.proto).
     # Backend and frontend implementations are selected by the oneof
     # config table name.
     #
@@ -586,15 +586,15 @@ def write_config(
     path.write_text(
         f"""\
 [[backends]]
-id = "origin"
+name = "origin"
 
 [backends.config.{kind}]
-endpoint = "{origin_addr}"
+url = "{origin_addr}"
 stripe_size_bytes = {STRIPE_SIZE}
 
 [[neighborhoods]]
-id = "p2p"
-binds_to = "origin"
+name = "p2p"
+source = "origin"
 local_node_id = {local_id}
 
 [[neighborhoods.peers]]
@@ -604,21 +604,20 @@ id = {peer_id}
 addr = "{peer_addr}"
 
 [[caches]]
-id = "cache"
-binds_to = "p2p"
+name = "cache"
+source = "p2p"
 
 [[caches.disks]]
-path = "{disk_path}"
 page_size_bytes = 4096
-bypass_admission = true
-skip_recovery_scan_if_no_meta = true
+skip_recovery_scan = true
 
 [caches.disks.config.file]
+path = "{disk_path}"
 size = {DISK_SIZE}
 
 [[frontends]]
-id = "fe"
-binds_to = "cache"
+name = "fe"
+source = "cache"
 
 [frontends.config.{kind}]
 addr = "{frontend_addr}"
