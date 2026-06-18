@@ -2645,12 +2645,19 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
     ssh_log("vm-journal.log", "sudo journalctl --no-pager -l")
     ssh_log("vm-unbounded-agent.log", "sudo journalctl -u unbounded-agent --no-pager -l")
     ssh_log("vm-unbounded-agent-daemon.log", "sudo journalctl -u unbounded-agent-daemon --no-pager -l")
+    ssh_log("vm-systemd-machined.log", "sudo journalctl -u systemd-machined --no-pager -l")
     ssh_log("vm-machines.txt", "sudo machinectl list --no-pager")
+    ssh_log("vm-nspawn-locks.txt", "sudo ls -la /run/systemd/nspawn/locks 2>&1 || true")
+    ssh_log("vm-lslocks.txt", "sudo lslocks || true")
+    ssh_log("vm-selinux-avc.txt", "sudo ausearch -m AVC,USER_AVC -ts recent 2>&1 || true")
     for machine in NSPAWN_MACHINE_NAMES:
         ssh_log(f"nspawn-{machine}-journal.log", f"sudo journalctl -M {machine} --no-pager -l")
         ssh_log(f"nspawn-{machine}-kubelet.log", f"sudo journalctl -M {machine} -u kubelet --no-pager -l")
         ssh_log(f"nspawn-{machine}-containerd.log", f"sudo journalctl -M {machine} -u containerd --no-pager -l")
         ssh_log(f"vm-machine-{machine}-status.txt", f"sudo machinectl status {machine} --no-pager")
+        ssh_log(f"vm-machine-{machine}-service-status.txt", f"sudo systemctl status systemd-nspawn@{machine}.service --no-pager")
+        ssh_log(f"vm-machine-{machine}-mounts.txt", f"sudo findmnt -R /var/lib/machines/{machine} 2>&1 || true")
+        ssh_log(f"vm-machine-{machine}-rootfs.txt", f"sudo ls -la /var/lib/machines/{machine} 2>&1 || true")
         ssh_log(
             f"nspawn-{machine}-units.txt",
             f"sudo machinectl shell {machine} /usr/bin/systemctl list-units --no-pager",
