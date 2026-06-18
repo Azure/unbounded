@@ -1500,7 +1500,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
 def wait_for_node() -> None:
     """Wait for the agent node to appear and become Ready."""
 
-    node_timeout = int(os.environ.get("NODE_TIMEOUT", "180"))
+    node_timeout = int(os.environ.get("NODE_TIMEOUT", "300"))
     ready_timeout = int(os.environ.get("READY_TIMEOUT", "720"))
 
     # Wait for node to appear
