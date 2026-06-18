@@ -415,7 +415,7 @@ func runAgent(args []string) error {
 			OnPleasePullServed:             func() { p3.coordPleasePullServed.Inc() },
 			OnPleasePullStarted:            func() { p3.coordPleasePullStarted.Inc() },
 			OnStreamError:                  func() { p3.coordStreamError.Inc() },
-			OnUnauthorizedPeer:             func() { p3.coordUnauthorizedPeer.Inc() },
+			OnUnauthorizedPeer:             func(reason string) { p3.coordUnauthorizedPeer.WithLabelValues(reason).Inc() },
 		}),
 		coord.WithNegativeCache(negCacheAdapter{c: negCache}),
 		coord.WithPullerPump(pullerPump),

@@ -150,7 +150,7 @@ type phase3Metrics struct {
 	coordPleasePullServed             prometheus.Counter
 	coordPleasePullStarted            prometheus.Counter
 	coordStreamError                  prometheus.Counter
-	coordUnauthorizedPeer             prometheus.Counter
+	coordUnauthorizedPeer             *prometheus.CounterVec
 	prefetchBatchesTotal              prometheus.Counter
 	prefetchDigestsTotal              prometheus.Counter
 	prefetchPullersPerBatch           prometheus.Histogram
@@ -202,10 +202,10 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 			Name: "p2p_coord_stream_error_total",
 			Help: "Malformed or oversized coord streams rejected by this node.",
 		}),
-		coordUnauthorizedPeer: reg.NewCounter("coord", prometheus.CounterOpts{
+		coordUnauthorizedPeer: reg.NewCounterVec("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_unauthorized_peer_total",
-			Help: "Inbound coord requests whose libp2p peer ID was not found in the membership view, or whose membership view had no published peer IDs under enforce mode. Fires in observe-only for recognized misses and in enforce mode for both misses and unevaluable membership. Verify peer-id annotations are published before using zero as an enforcement-readiness signal.",
-		}),
+			Help: "Inbound coord requests whose libp2p peer ID was not authorized against the membership view, labelled by reason: \"unrecognized\" (membership has published peer IDs but none match the dialing peer) or \"unevaluable\" (no member has published a peer ID yet, only reported in enforce mode). Fires in observe-only for recognized misses and in enforce mode for both. Verify peer-id annotations are published before using zero as an enforcement-readiness signal.",
+		}, []string{"reason"}),
 		prefetchBatchesTotal: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_prefetch_batches_total",
 			Help: "Speculative manifest-pre-fan PleasePull batches dispatched (one per distinct HRW rank-0 puller per manifest serve,).",

@@ -553,11 +553,14 @@ func TestPeerAuthz_ObserveOnlyServesAndCounts(t *testing.T) {
 		ifaces.Node{ID: "server-node", PeerID: hServer.ID().String()},
 	)
 
-	var unauthorized int32
+	var (
+		unauthorized int32
+		reason       atomic.Pointer[string]
+	)
 
 	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
 		coord.WithMetrics(coord.MetricsHooks{
-			OnUnauthorizedPeer: func() { atomic.AddInt32(&unauthorized, 1) },
+			OnUnauthorizedPeer: func(r string) { atomic.AddInt32(&unauthorized, 1); reason.Store(&r) },
 		}),
 	)
 	srv.Bind(hServer)
@@ -575,6 +578,10 @@ func TestPeerAuthz_ObserveOnlyServesAndCounts(t *testing.T) {
 	if got := atomic.LoadInt32(&unauthorized); got != 1 {
 		t.Fatalf("unauthorized metric = %d, want 1", got)
 	}
+
+	if r := reason.Load(); r == nil || *r != "unrecognized" {
+		t.Fatalf("reason = %v, want \"unrecognized\"", r)
+	}
 }
 
 // TestPeerAuthz_EnforceRejectsUnknownPeer asserts that, with enforcement
@@ -587,12 +594,15 @@ func TestPeerAuthz_EnforceRejectsUnknownPeer(t *testing.T) {
 		ifaces.Node{ID: "server-node", PeerID: hServer.ID().String()},
 	)
 
-	var unauthorized int32
+	var (
+		unauthorized int32
+		reason       atomic.Pointer[string]
+	)
 
 	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
 		coord.WithPeerAuthz(true),
 		coord.WithMetrics(coord.MetricsHooks{
-			OnUnauthorizedPeer: func() { atomic.AddInt32(&unauthorized, 1) },
+			OnUnauthorizedPeer: func(r string) { atomic.AddInt32(&unauthorized, 1); reason.Store(&r) },
 		}),
 	)
 	srv.Bind(hServer)
@@ -609,6 +619,10 @@ func TestPeerAuthz_EnforceRejectsUnknownPeer(t *testing.T) {
 
 	if got := atomic.LoadInt32(&unauthorized); got != 1 {
 		t.Fatalf("unauthorized metric = %d, want 1", got)
+	}
+
+	if r := reason.Load(); r == nil || *r != "unrecognized" {
+		t.Fatalf("reason = %v, want \"unrecognized\"", r)
 	}
 }
 
@@ -628,7 +642,7 @@ func TestPeerAuthz_EnforceAllowsKnownPeer(t *testing.T) {
 	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
 		coord.WithPeerAuthz(true),
 		coord.WithMetrics(coord.MetricsHooks{
-			OnUnauthorizedPeer: func() { atomic.AddInt32(&unauthorized, 1) },
+			OnUnauthorizedPeer: func(string) { atomic.AddInt32(&unauthorized, 1) },
 		}),
 	)
 	srv.Bind(hServer)
@@ -666,7 +680,7 @@ func TestPeerAuthz_ObserveOnlyFailsOpenWhenNoPeerIDsPublished(t *testing.T) {
 
 	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
 		coord.WithMetrics(coord.MetricsHooks{
-			OnUnauthorizedPeer: func() { atomic.AddInt32(&unauthorized, 1) },
+			OnUnauthorizedPeer: func(string) { atomic.AddInt32(&unauthorized, 1) },
 		}),
 	)
 	srv.Bind(hServer)
@@ -697,12 +711,15 @@ func TestPeerAuthz_EnforceRejectsWhenNoPeerIDsPublished(t *testing.T) {
 		ifaces.Node{ID: "client-node", Addr: "y"},
 	)
 
-	var unauthorized int32
+	var (
+		unauthorized int32
+		reason       atomic.Pointer[string]
+	)
 
 	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
 		coord.WithPeerAuthz(true),
 		coord.WithMetrics(coord.MetricsHooks{
-			OnUnauthorizedPeer: func() { atomic.AddInt32(&unauthorized, 1) },
+			OnUnauthorizedPeer: func(r string) { atomic.AddInt32(&unauthorized, 1); reason.Store(&r) },
 		}),
 	)
 	srv.Bind(hServer)
@@ -719,5 +736,9 @@ func TestPeerAuthz_EnforceRejectsWhenNoPeerIDsPublished(t *testing.T) {
 
 	if got := atomic.LoadInt32(&unauthorized); got != 1 {
 		t.Fatalf("unauthorized metric = %d, want 1", got)
+	}
+
+	if r := reason.Load(); r == nil || *r != "unevaluable" {
+		t.Fatalf("reason = %v, want \"unevaluable\"", r)
 	}
 }

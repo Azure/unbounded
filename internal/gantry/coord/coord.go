@@ -108,10 +108,14 @@ type MetricsHooks struct {
 	// OnStreamError fires for any malformed or oversized stream.
 	OnStreamError func()
 	// OnUnauthorizedPeer fires once per inbound request whose remote
-	// libp2p peer ID is not present in the current membership view.
-	// It fires in both observe-only and enforce mode so operators can
-	// size the false-positive rate before flipping enforcement on.
-	OnUnauthorizedPeer func()
+	// libp2p peer ID is not present in the current membership view. The
+	// reason label distinguishes "unrecognized" (members have published
+	// peer IDs but none match remote) from "unevaluable" (no member has
+	// published a peer ID yet, so authorization cannot be evaluated - only
+	// reported in enforce mode). It fires in both observe-only and enforce
+	// mode so operators can size the false-positive rate before flipping
+	// enforcement on.
+	OnUnauthorizedPeer func(reason string)
 }
 
 // Server handles inbound coord streams: pull_intent_query and
@@ -141,6 +145,10 @@ type Server struct {
 	// authzEnforce flips peer authorization from observe-only (record
 	// the metric, still serve) to enforce (reject before dispatch).
 	authzEnforce bool
+	// authzWarn rate-limits unauthorized-peer warnings so a flood of
+	// unrecognized peers cannot swamp the log; the metric carries exact
+	// counts. nil disables throttling (every occurrence logs).
+	authzWarn *logThrottle
 }
 
 // NegativeCache is the read interface coord needs from the
@@ -238,6 +246,7 @@ func NewServer(store ifaces.LocalContentStore, members ifaces.Members, inflight 
 		inflight:               inflight,
 		streamHandshakeTimeout: DefaultStreamHandshakeTimeout,
 		streamSem:              make(chan struct{}, DefaultMaxConcurrentStreams),
+		authzWarn:              &logThrottle{interval: 30 * time.Second},
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -342,13 +351,21 @@ func (s *Server) handleStream(str network.Stream) {
 }
 
 func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envelope) (*coordv1.Envelope, error) {
-	if !s.authorizePeer(remote) && s.authzEnforce {
+	// Snapshot membership once per request and thread it through both
+	// authorization and pull-intent HRW ranking, instead of each taking its
+	// own O(N) copy.
+	nodes := s.snapshotMembers()
+
+	// authorizePeer is always evaluated (it records the observe-only metric);
+	// the boolean only gates the request under enforce mode.
+	authorized := s.authorizePeer(remote, nodes)
+	if s.authzEnforce && !authorized {
 		return nil, fmt.Errorf("coord: unauthorized peer %s", remote)
 	}
 
 	switch m := in.GetMsg().(type) {
 	case *coordv1.Envelope_PullIntentRequest:
-		resp, err := s.servePullIntent(ctx, m.PullIntentRequest)
+		resp, err := s.servePullIntent(ctx, m.PullIntentRequest, nodes)
 		if err != nil {
 			return nil, err
 		}
@@ -379,8 +396,8 @@ func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envel
 // authorizePeer reports whether remote is a recognised cluster member.
 //
 // It compares remote's libp2p peer ID against the PeerID values published
-// in the current membership snapshot. members.Snapshot() is treated as
-// telemetry input, not an authoritative security oracle:
+// in the supplied membership snapshot. Membership is treated as telemetry
+// input, not an authoritative security oracle:
 //
 //   - A node that has not yet published its gantry.io/peer-id annotation
 //     has an empty PeerID; empty PeerIDs are ignored so they never match.
@@ -392,10 +409,10 @@ func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envel
 //     gate and should not get a silent fail-open.
 //
 // On a genuine miss (the membership view has published peer IDs but none
-// match) the OnUnauthorizedPeer metric fires and a warning is logged in
-// both observe-only and enforce mode; the boolean return then drives the
-// enforce-mode rejection in dispatch.
-func (s *Server) authorizePeer(remote peer.ID) bool {
+// match) the OnUnauthorizedPeer metric fires and a rate-limited warning is
+// logged in both observe-only and enforce mode; the boolean return then
+// drives the enforce-mode rejection in dispatch.
+func (s *Server) authorizePeer(remote peer.ID, nodes []ifaces.Node) bool {
 	if s.members == nil {
 		return true
 	}
@@ -404,7 +421,7 @@ func (s *Server) authorizePeer(remote peer.ID) bool {
 
 	known := 0
 
-	for _, n := range s.members.Snapshot() {
+	for _, n := range nodes {
 		if n.PeerID == "" {
 			continue
 		}
@@ -417,41 +434,81 @@ func (s *Server) authorizePeer(remote peer.ID) bool {
 	}
 
 	if known == 0 {
+		// Authorization is unevaluable. Observe-only fails open quietly;
+		// enforce mode rejects (and records it as a distinct reason) because
+		// the operator asked for a hard gate.
 		if !s.authzEnforce {
 			return true
 		}
 
-		if s.hooks.OnUnauthorizedPeer != nil {
-			s.hooks.OnUnauthorizedPeer()
-		}
-
-		s.logger.Warn("coord: peer authorization unevaluable",
-			slog.String("peer", want),
-			slog.Bool("enforce", s.authzEnforce),
-		)
+		s.recordUnauthorized(want, "unevaluable")
 
 		return false
 	}
 
-	if s.hooks.OnUnauthorizedPeer != nil {
-		s.hooks.OnUnauthorizedPeer()
-	}
-
-	s.logger.Warn("coord: unauthorized peer",
-		slog.String("peer", want),
-		slog.Bool("enforce", s.authzEnforce),
-	)
+	s.recordUnauthorized(want, "unrecognized")
 
 	return false
 }
 
-func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentRequest) (*coordv1.PullIntentResponse, error) {
+// snapshotMembers returns the current membership view, or nil when no
+// membership is wired. The returned slice is owned by the caller.
+func (s *Server) snapshotMembers() []ifaces.Node {
+	if s.members == nil {
+		return nil
+	}
+
+	return s.members.Snapshot()
+}
+
+// recordUnauthorized fires the unauthorized-peer metric (labelled by reason)
+// for every occurrence and emits a rate-limited warning. The metric carries
+// exact counts; the log is only a human-facing heads-up, so a flood of
+// unrecognized peers (rolling upgrade, annotation lag, or a hostile peer)
+// cannot swamp the log pipeline.
+func (s *Server) recordUnauthorized(peerStr, reason string) {
+	if s.hooks.OnUnauthorizedPeer != nil {
+		s.hooks.OnUnauthorizedPeer(reason)
+	}
+
+	if s.authzWarn == nil || s.authzWarn.allow(time.Now()) {
+		s.logger.Warn("coord: unauthorized peer",
+			slog.String("peer", peerStr),
+			slog.String("reason", reason),
+			slog.Bool("enforce", s.authzEnforce),
+		)
+	}
+}
+
+// logThrottle bounds how often a repeated log line is emitted, regardless of
+// how many events arrive. The first event always logs; subsequent events
+// within interval are suppressed (the associated metric still counts them).
+type logThrottle struct {
+	mu       sync.Mutex
+	interval time.Duration
+	last     time.Time
+}
+
+func (t *logThrottle) allow(now time.Time) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if !t.last.IsZero() && now.Sub(t.last) < t.interval {
+		return false
+	}
+
+	t.last = now
+
+	return true
+}
+
+func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentRequest, nodes []ifaces.Node) (*coordv1.PullIntentResponse, error) {
 	d, err := digest.Parse(req.GetDigest())
 	if err != nil {
 		return nil, fmt.Errorf("pull_intent: %w", err)
 	}
 
-	intent := s.computeLocalIntent(ctx, d)
+	intent := s.computeLocalIntent(ctx, d, nodes)
 
 	resp := &coordv1.PullIntentResponse{
 		HasCached:      intent.HasCached,
@@ -477,7 +534,7 @@ func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentReq
 // cold-start orchestrator uses it to include self as a first-class
 // participant in the rule cascade.
 func (s *Server) LocalPullIntent(ctx context.Context, d digest.Digest) ifaces.PullIntent {
-	return s.computeLocalIntent(ctx, d)
+	return s.computeLocalIntent(ctx, d, s.snapshotMembers())
 }
 
 // computeLocalIntent is the shared implementation behind
@@ -486,7 +543,11 @@ func (s *Server) LocalPullIntent(ctx context.Context, d digest.Digest) ifaces.Pu
 // that the cold-start cascade's HRW-rank-0-on-self decision matches
 // what every peer would compute for us. See the step 4 and the
 // LocalIntentProvider interface doc.
-func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest) ifaces.PullIntent {
+//
+// nodes is the membership snapshot to rank against; callers pass the
+// snapshot they already took (dispatch shares one per request) so this
+// does not take a second O(N) copy.
+func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest, nodes []ifaces.Node) ifaces.PullIntent {
 	intent := ifaces.PullIntent{RecipientRank: -1}
 
 	// has_cached. The local content store is the single source of
@@ -527,7 +588,6 @@ func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest) ifaces
 
 	// hrw_rank - own rank in own membership view.
 	if s.members != nil {
-		nodes := s.members.Snapshot()
 		intent.RecipientRank = hrw.RankOf(nodes, s.members.Self(), d)
 	}
 
