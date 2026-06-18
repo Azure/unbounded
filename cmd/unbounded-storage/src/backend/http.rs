@@ -31,7 +31,7 @@ use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use ::http::header::{CONNECTION, HOST, RANGE};
+use ::http::header::{CONNECTION, HOST, IF_MATCH, RANGE};
 
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::http::{Method, ResponseHead, StatusCode, serialize_request};
@@ -200,6 +200,7 @@ impl HttpBackend {
 
         debug_assert!(!origin.is_metadata_entry());
         let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
+        let cache_key_version = origin.cache_key_version.clone();
 
         let mut log = crate::obs::ReqLog::new("backend.http");
         log.str_field("op", "GET")
@@ -218,6 +219,7 @@ impl HttpBackend {
                     origin_addr,
                     host,
                     path,
+                    cache_key_version,
                     start,
                     len,
                     dsts_owned.clone(),
@@ -346,6 +348,7 @@ async fn fetch(
     origin: SockAddr,
     host: String,
     path: String,
+    cache_key_version: Option<String>,
     start: u64,
     len: u64,
     dsts: Vec<PageRef>,
@@ -379,7 +382,13 @@ async fn fetch(
     // own slot.
     handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
-    let request = format_get_request(&path, &host, start, start + len - 1)?;
+    let request = format_get_request(
+        &path,
+        &host,
+        cache_key_version.as_deref(),
+        start,
+        start + len - 1,
+    )?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
 
     // Accumulate until the full header block has arrived. The origin
@@ -807,13 +816,23 @@ fn absolute_range(stripe_idx: u64, stripe_size: u64, src_offset: u64, src_len: u
 /// Format a ranged HTTP/1.1 GET request. `start`/`end` are inclusive
 /// byte offsets for the `Range` header. `Connection: close` keeps v1
 /// simple (one connection per fetch).
-fn format_get_request(path: &str, host: &str, start: u64, end: u64) -> Result<Vec<u8>, Error> {
-    let req = ::http::Request::builder()
+fn format_get_request(
+    path: &str,
+    host: &str,
+    cache_key_version: Option<&str>,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, Error> {
+    let mut builder = ::http::Request::builder()
         .method(Method::GET)
         .uri(path)
         .header(HOST, host)
         .header(RANGE, format!("bytes={start}-{end}"))
-        .header(CONNECTION, "close")
+        .header(CONNECTION, "close");
+    if let Some(version) = cache_key_version {
+        builder = builder.header(IF_MATCH, version);
+    }
+    let req = builder
         .body(())
         .map_err(|_| Error::from("http backend: failed to build origin GET request"))?;
     Ok(serialize_request(&req))
@@ -890,7 +909,7 @@ mod tests {
 
     #[test]
     fn format_get_request_emits_request_line_and_headers() {
-        let req = format_get_request("/models/llama.bin", "10.0.0.1:8080", 0, 4095).unwrap();
+        let req = format_get_request("/models/llama.bin", "10.0.0.1:8080", None, 0, 4095).unwrap();
         let s = std::str::from_utf8(&req).unwrap();
         assert!(
             s.starts_with("GET /models/llama.bin HTTP/1.1\r\n"),
@@ -904,10 +923,17 @@ mod tests {
 
     #[test]
     fn format_get_request_nonzero_range() {
-        let req = format_get_request("/o", "h:1", 4096, 8191).unwrap();
+        let req = format_get_request("/o", "h:1", None, 4096, 8191).unwrap();
         let s = std::str::from_utf8(&req).unwrap();
         assert!(s.contains("range: bytes=4096-8191\r\n"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn format_get_request_includes_if_match_for_versioned_key() {
+        let req = format_get_request("/o", "h:1", Some("\"etag-1\""), 0, 4095).unwrap();
+        let s = std::str::from_utf8(&req).unwrap();
+        assert!(s.contains("if-match: \"etag-1\"\r\n"), "got: {s}");
     }
 
     #[test]

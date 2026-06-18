@@ -24,7 +24,7 @@ use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use ::http::header::{CONNECTION, HOST, RANGE};
+use ::http::header::{CONNECTION, HOST, IF_MATCH, RANGE};
 
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::http::{Method, ResponseHead, StatusCode, serialize_request};
@@ -166,6 +166,7 @@ impl AzureBackend {
 
         debug_assert!(!origin.is_metadata_entry());
         let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
+        let cache_key_version = origin.cache_key_version.clone();
 
         let fut = Box::pin(crate::metrics::instrument_backend(
             self.backend_id().to_string(),
@@ -175,6 +176,7 @@ impl AzureBackend {
                 origin_addr,
                 host,
                 path,
+                cache_key_version,
                 start,
                 len,
                 dsts_owned.clone(),
@@ -293,6 +295,7 @@ async fn fetch(
     origin: SockAddr,
     host: String,
     path: String,
+    cache_key_version: Option<String>,
     start: u64,
     len: u64,
     dsts: Vec<PageRef>,
@@ -322,7 +325,13 @@ async fn fetch(
     // ring).
     handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
-    let request = format_get_request(&path, &host, start, start + len - 1)?;
+    let request = format_get_request(
+        &path,
+        &host,
+        cache_key_version.as_deref(),
+        start,
+        start + len - 1,
+    )?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
 
     let mut buf: Vec<u8> = Vec::new();
@@ -736,14 +745,24 @@ fn absolute_range(stripe_idx: u64, stripe_size: u64, src_offset: u64, src_len: u
 /// Format a ranged HTTP/1.1 GET request against the Azure Blob origin.
 /// `start`/`end` are inclusive byte offsets for the `Range` header. The
 /// `x-ms-version` header pins the Azure Blob REST API version.
-fn format_get_request(path: &str, host: &str, start: u64, end: u64) -> Result<Vec<u8>, Error> {
-    let req = ::http::Request::builder()
+fn format_get_request(
+    path: &str,
+    host: &str,
+    cache_key_version: Option<&str>,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, Error> {
+    let mut builder = ::http::Request::builder()
         .method(Method::GET)
         .uri(path)
         .header(HOST, host)
         .header(RANGE, format!("bytes={start}-{end}"))
         .header("x-ms-version", AZURE_MS_VERSION)
-        .header(CONNECTION, "close")
+        .header(CONNECTION, "close");
+    if let Some(version) = cache_key_version {
+        builder = builder.header(IF_MATCH, version);
+    }
+    let req = builder
         .body(())
         .map_err(|_| Error::from("azure backend: failed to build origin GET request"))?;
     Ok(serialize_request(&req))
@@ -835,8 +854,14 @@ mod tests {
 
     #[test]
     fn get_request_has_expected_headers() {
-        let req =
-            format_get_request("/container/key", "acct.blob.core.windows.net", 0, 4095).unwrap();
+        let req = format_get_request(
+            "/container/key",
+            "acct.blob.core.windows.net",
+            None,
+            0,
+            4095,
+        )
+        .unwrap();
         let s = std::str::from_utf8(&req).unwrap();
         assert!(s.starts_with("GET /container/key HTTP/1.1\r\n"), "got: {s}");
         assert!(
@@ -849,6 +874,20 @@ mod tests {
         // v1 is anonymous: no shared-key signature or SAS authorization.
         assert!(!s.contains("authorization"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
+    }
+
+    #[test]
+    fn get_request_includes_if_match_for_versioned_key() {
+        let req = format_get_request(
+            "/container/key",
+            "acct.blob.core.windows.net",
+            Some("\"abc\""),
+            0,
+            4095,
+        )
+        .unwrap();
+        let s = std::str::from_utf8(&req).unwrap();
+        assert!(s.contains("if-match: \"abc\"\r\n"), "got: {s}");
     }
 
     #[test]
