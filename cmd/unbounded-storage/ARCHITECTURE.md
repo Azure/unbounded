@@ -186,7 +186,7 @@ per-shard `!Send` object graph:
    pinned thread** (mempolicy keeps pages local; the hugepage variant `mbind`s).
    Register it with the fabric as a memory region (MR), and register it with the
    socket ring as a fixed buffer for zero-copy send/recv.
-3. **Origin backend.** Resolve the origin endpoint and build an `HttpBackend`
+3. **Origin backend.** Resolve the origin URL and build an `HttpBackend`
    over the shard socket, carving origin-fetch pages from the backing.
 4. **Transport + blockstore + pool.** Build a `RoutedTransport` (Chord routing +
    fabric transport + origin backend), a `LiveShardLocalStore` over the disk
@@ -197,7 +197,7 @@ per-shard `!Send` object graph:
    `PageRef` resolves through exactly one backing's geometry, so scratch needs a
    distinct store). Build a `RecursiveHandler` and start the fabric RPC server.
 6. **Frontends.** A shard hosts a `FrontendRegistry` of any number of
-   frontends keyed by id. Each spec binds its listener with `SO_REUSEPORT` and
+   frontends keyed by component name. Each spec binds its listener with `SO_REUSEPORT` and
    builds an `HttpDriver`/`S3Driver`; the registry can add and remove frontends
    in place on a live config apply (a removed driver's `Drop` closes its
    listener fd).
@@ -479,8 +479,9 @@ touches the kernel device) -> `alloc` + `refcount` (pure LBA tables) -> `btree`
 `eviction_watermark` 0.9, `probationary_fraction` 0.1,
 `admission_sketch_multiplier` 2, `singleflight_shards` 64,
 `restart_scan_queue_depth` 256, `bypass_admission` false (bench/tooling only),
-and `skip_recovery_scan_if_no_meta` false (production keeps it false so partial
-recovery runs).
+and `skip_recovery_scan_if_no_meta` false (set from the public
+`skip_recovery_scan` config flag; production keeps it false so partial recovery
+runs).
 
 **CoW B+tree** (`btree/`): not `Sync`. Commits flow through a single mutator
 task holding only a `RefCell` borrow on `MutatorState`; lookups are wait-free
@@ -518,7 +519,7 @@ bufferpool `Backing`.
 a pinned storage core) and a mock for tests. `DiskRegistry<T>` is seeded with the
 plan's disjoint NVMe `DiskCpuSlot`s and `reconcile(desired)` closes missing
 paths, opens new ones, and treats any spec drift (kind/numa/size/queue_depth/
-page_size/bypass_admission/skip_recovery_scan) as a remove + add.
+page_size/skip_recovery_scan) as a remove + add.
 `assign_disk_cpus` keeps survivors on their physical pin (preserving the
 disjoint-CPU invariant and idempotence under churn) and assigns new disks
 NUMA-local-first, then any free slot, then unpinned. `channels_snapshot()` is
@@ -563,6 +564,18 @@ section), not reloadable config fields.
 Sections (all optional, each falling back to defaults):
 
 - `version` - top-level opaque `u64` config version (0 = unversioned).
+- `[[backends]]` - `name` and one `config` table: `http`, `s3`, or `azure`
+  with a required `url`, or `fake` for synthetic objects. Backend stripe size
+  must be a power of two.
+- `[[neighborhoods]]` - `name`, `source` (a backend component name),
+  `local_node_id`, `local_tags`, `fingers_per_node` (100), and an optional
+  `[neighborhoods.routing_plan]` (`fingers`, `successor`, `predecessor`). When
+  `routing_plan` is present the node skips the global finger-table build and
+  uses exactly the listed neighbor ids (each must be a
+  `[[neighborhoods.peers]]` id, none may be `local_node_id`). This is "disjoint
+  discovery": a node is told only its direct routing neighbors rather than the
+  full cluster, yet routes identically to the global build (see
+  `designs/storage-disjoint-routing-parity.md`).
 - `[startup]` - startup-fixed knobs, read once at process start and
   excluded from the live-reload diff: `[startup.memory]`
   (`no_hugepages`, `memory_total_bytes`), `[startup.fabric]` (`addr`,
@@ -573,30 +586,18 @@ Sections (all optional, each falling back to defaults):
   `startup_to_core_plan_config` inverts the negative plan fields so the
   historical defaults hold. See the CLI section for the per-field
   defaults.
-- `[[backends]]` - origin backends keyed by `id`. The `config` oneof selects
-  `http`, `s3`, `azure`, or synthetic `fake` backend settings.
-- `[[neighborhoods]]` - P2P route domains keyed by `id`, bound to a backend
-  with `binds_to`, with `local_node_id`, `local_labels`, `fingers_per_node`
-  (100), and an optional `[neighborhoods.routing_plan]` (`fingers`,
-  `successor`, `predecessor`). When `routing_plan` is present the node skips
-  the global finger-table build and uses exactly the listed neighbor ids
-  (each must be a `[[neighborhoods.peers]]` id, none may be `local_node_id`).
-  This is "disjoint discovery": a node is told only its direct routing
-  neighbors rather than the full cluster, yet routes identically to the global
-  build (see `designs/storage-disjoint-routing-parity.md`).
-- `[[neighborhoods.peers]]` - `id` (unique within a neighborhood), `labels`,
-  and one `config` table: `tcp` with a numeric `SocketAddr`, or `rdma` with a
-  provider-native address encoded as `hex:<fi_getname-bytes>` plus optional
-  `hca_numa`. Runtime fabric peer ids are scoped by neighborhood id.
-- `[[caches]]` - cache graphs keyed by `id`, bound via `binds_to` to either a
-  backend or a neighborhood. `[[caches.disks]]` entries carry `path` (unique
-  across all caches), one `config` table (`block` with optional `numa`, or
-  `file` with required `size`), `queue_depth` (optional), `page_size_bytes`,
-  `bypass_admission`, and `skip_recovery_scan_if_no_meta` (fields that disk
-  reconcile treats as drift, see 7.10).
-- `[[frontends]]` - listener or loadgen frontends keyed by `id`, bound via
-  `binds_to` to a backend, cache, or neighborhood. The `config` oneof selects
-  `http`, `s3`, or `loadgen`.
+- `[[neighborhoods.peers]]` - `id` (unique `u64` within the neighborhood,
+  doubles as both `NodeId` and `PeerId`), `tags`, and one `config` table (`tcp`
+  with a `SocketAddr`, or `rdma` with a provider-native address encoded as
+  `hex:<fi_getname-bytes>` and optional `hca_numa`).
+- `[[caches]]` - `name`, `source` (a backend or neighborhood component name),
+  and `[[caches.disks]]`. Each disk has one `config` table (`block` with
+  `path` and optional `numa`, or `file` with `path` and required `size`),
+  `queue_depth` (optional), `page_size_bytes`, and `skip_recovery_scan` (fields
+  that disk reconcile treats as drift, see 7.10). Disk paths must be unique
+  across all caches.
+- `[[frontends]]` - `name`, `source` (a backend, cache, or neighborhood
+  component name), and one `config` table (`http`, `s3`, or `loadgen`).
 
 The watcher (`notify`-based) emits `ConfigUpdate`s; main's
 `wait_for_shutdown_with_updates` reconciles peers (remove + add on address/numa

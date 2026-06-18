@@ -215,7 +215,7 @@ mod tests {
     use crate::bufferpool::{BulkRef, Error, PageRef, PageStream, Req, StripeKey};
     use crate::fabric::PeerId;
     use crate::p2p::{
-        FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyLabels, node_to_ring,
+        FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyTags, node_to_ring,
         stripe_to_ring,
     };
     use crate::runtime::noop_waker;
@@ -280,7 +280,7 @@ mod tests {
         PeerEntry {
             node: NodeId(node),
             ring: node_to_ring(NodeId(node)),
-            labels: TopologyLabels(vec!["r".to_string()]),
+            tags: TopologyTags(vec!["r".to_string()]),
         }
     }
 

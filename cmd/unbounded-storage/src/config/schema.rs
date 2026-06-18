@@ -135,11 +135,11 @@ impl BackendSpec {
         }
     }
 
-    pub fn endpoint(&self) -> Option<&str> {
+    pub fn url(&self) -> Option<&str> {
         match self.config.as_ref() {
-            Some(backend_spec::Config::Http(cfg)) => Some(cfg.endpoint.as_str()),
-            Some(backend_spec::Config::S3(cfg)) => Some(cfg.endpoint.as_str()),
-            Some(backend_spec::Config::Azure(cfg)) => Some(cfg.endpoint.as_str()),
+            Some(backend_spec::Config::Http(cfg)) => Some(cfg.url.as_str()),
+            Some(backend_spec::Config::S3(cfg)) => Some(cfg.url.as_str()),
+            Some(backend_spec::Config::Azure(cfg)) => Some(cfg.url.as_str()),
             Some(backend_spec::Config::Fake(_)) | None => None,
         }
     }
@@ -196,6 +196,14 @@ impl DiskSpec {
         match self.config.as_ref() {
             Some(disk_spec::Config::File(cfg)) => cfg.size,
             Some(disk_spec::Config::Block(_)) | None => None,
+        }
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        match self.config.as_ref() {
+            Some(disk_spec::Config::Block(cfg)) => Some(cfg.path.as_str()),
+            Some(disk_spec::Config::File(cfg)) => Some(cfg.path.as_str()),
+            None => None,
         }
     }
 
@@ -301,18 +309,18 @@ mod tests {
     fn block_disk_config_round_trips() {
         let s = r#"
 [[caches]]
-id = "cache"
-binds_to = "n"
+name = "cache"
+source = "n"
 
 [[caches.disks]]
-path = "/dev/nvme0n1"
-
 [caches.disks.config.block]
+path = "/dev/nvme0n1"
 numa = 1
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(c.caches[0].disks[0].kind_name(), "block");
+        assert_eq!(c.caches[0].disks[0].path(), Some("/dev/nvme0n1"));
         assert_eq!(c.caches[0].disks[0].numa(), Some(1));
     }
 
@@ -320,59 +328,55 @@ numa = 1
     fn disk_engine_fields_default_to_unset_and_off() {
         let s = r#"
 [[caches]]
-id = "cache"
-binds_to = "n"
+name = "cache"
+source = "n"
 
 [[caches.disks]]
-path = "/dev/nvme0n1"
-
 [caches.disks.config.block]
+path = "/dev/nvme0n1"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(c.caches[0].disks[0].page_size_bytes, None);
-        assert!(!c.caches[0].disks[0].bypass_admission);
-        assert!(!c.caches[0].disks[0].skip_recovery_scan_if_no_meta);
+        assert!(!c.caches[0].disks[0].skip_recovery_scan);
     }
 
     #[test]
     fn disk_engine_fields_round_trip() {
         let s = r#"
 [[caches]]
-id = "cache"
-binds_to = "n"
+name = "cache"
+source = "n"
 
 [[caches.disks]]
-path = "/dev/nvme0n1"
 page_size_bytes = 4096
-bypass_admission = true
-skip_recovery_scan_if_no_meta = true
+skip_recovery_scan = true
 
 [caches.disks.config.block]
+path = "/dev/nvme0n1"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(c.caches[0].disks[0].page_size_bytes, Some(4096));
-        assert!(c.caches[0].disks[0].bypass_admission);
-        assert!(c.caches[0].disks[0].skip_recovery_scan_if_no_meta);
+        assert!(c.caches[0].disks[0].skip_recovery_scan);
     }
 
     #[test]
     fn neighborhood_round_trips() {
         let s = r#"
 [[neighborhoods]]
-id = "n"
-binds_to = "b"
+name = "n"
+source = "b"
 fingers_per_node = 128
 local_node_id = 42
-local_labels = ["us-west", "az1", "row3", "rack7"]
+local_tags = ["us-west", "az1", "row3", "rack7"]
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(c.neighborhoods[0].fingers_per_node, 128);
         assert_eq!(c.neighborhoods[0].local_node_id, Some(42));
         assert_eq!(
-            c.neighborhoods[0].local_labels,
+            c.neighborhoods[0].local_tags,
             vec![
                 "us-west".to_string(),
                 "az1".to_string(),
@@ -386,8 +390,8 @@ local_labels = ["us-west", "az1", "row3", "rack7"]
     fn neighborhood_routing_plan_round_trips() {
         let s = r#"
 [[neighborhoods]]
-id = "n"
-binds_to = "b"
+name = "n"
+source = "b"
 local_node_id = 1
 
 [neighborhoods.routing_plan]
@@ -409,22 +413,22 @@ predecessor = 64
     #[test]
     fn neighborhood_routing_plan_absent_by_default() {
         let mut c: Config =
-            toml::from_str("[[neighborhoods]]\nid = \"n\"\nbinds_to = \"b\"\nlocal_node_id = 1\n")
+            toml::from_str("[[neighborhoods]]\nname = \"n\"\nsource = \"b\"\nlocal_node_id = 1\n")
                 .unwrap();
         c.apply_defaults();
         assert!(c.neighborhoods[0].routing_plan.is_none());
     }
 
     #[test]
-    fn peer_labels_round_trip() {
+    fn peer_tags_round_trip() {
         let s = r#"
 [[neighborhoods]]
-id = "n"
-binds_to = "b"
+name = "n"
+source = "b"
 
 [[neighborhoods.peers]]
 id = 1
-labels = ["us-west", "az1", "row3", "rack7"]
+tags = ["us-west", "az1", "row3", "rack7"]
 
 [neighborhoods.peers.config.tcp]
 addr = "127.0.0.1:9000"
@@ -432,7 +436,7 @@ addr = "127.0.0.1:9000"
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(
-            c.neighborhoods[0].peers[0].labels,
+            c.neighborhoods[0].peers[0].tags,
             vec![
                 "us-west".to_string(),
                 "az1".to_string(),
@@ -446,16 +450,16 @@ addr = "127.0.0.1:9000"
     fn backend_and_frontend_round_trip() {
         let s = r#"
 [[backends]]
-id = "primary-http"
+name = "primary-http"
 
 [backends.config.http]
-endpoint = "https://origin.example.com"
+url = "https://origin.example.com"
 stripe_size_bytes = 8388608
 http_concurrency = 32
 
 [[frontends]]
-id = "workload-http"
-binds_to = "primary-http"
+name = "workload-http"
+source = "primary-http"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -464,10 +468,10 @@ addr = "0.0.0.0:9000"
         c.apply_defaults();
         assert_eq!(c.backends.len(), 1);
         let b = &c.backends[0];
-        assert_eq!(b.id, "primary-http");
+        assert_eq!(b.name, "primary-http");
         match b.config.as_ref().expect("backend config set") {
             backend_spec::Config::Http(cfg) => {
-                assert_eq!(cfg.endpoint, "https://origin.example.com");
+                assert_eq!(cfg.url, "https://origin.example.com");
                 assert_eq!(cfg.stripe_size_bytes, 8 * 1024 * 1024);
                 assert_eq!(cfg.http_concurrency, 32);
             }
@@ -476,39 +480,39 @@ addr = "0.0.0.0:9000"
 
         assert_eq!(c.frontends.len(), 1);
         let f = &c.frontends[0];
-        assert_eq!(f.id, "workload-http");
+        assert_eq!(f.name, "workload-http");
         assert_eq!(f.addr(), Some("0.0.0.0:9000"));
-        assert_eq!(f.binds_to, "primary-http");
+        assert_eq!(f.source, "primary-http");
     }
 
     #[test]
     fn cache_and_frontend_binding_round_trip() {
         let s = r#"
 [[caches]]
-id = "cache"
-binds_to = "n"
+name = "cache"
+source = "n"
 
 [[frontends]]
-id = "cached-http"
-binds_to = "cache"
+name = "cached-http"
+source = "cache"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.caches[0].id, "cache");
-        assert_eq!(c.frontends[0].binds_to, "cache");
+        assert_eq!(c.caches[0].name, "cache");
+        assert_eq!(c.frontends[0].source, "cache");
     }
 
     #[test]
     fn backend_optional_fields_default() {
         let s = r#"
 [[backends]]
-id = "b"
+name = "b"
 
 [backends.config.http]
-endpoint = "https://example.com"
+url = "https://example.com"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
@@ -525,26 +529,23 @@ endpoint = "https://example.com"
     fn s3_backend_round_trips() {
         let s = r#"
 [[backends]]
-id = "primary-s3"
+name = "primary-s3"
 
 [backends.config.s3]
-endpoint = "s3.us-east-1.amazonaws.com:443"
+url = "s3.us-east-1.amazonaws.com:443"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(c.backends[0].kind_name(), "s3");
-        assert_eq!(
-            c.backends[0].endpoint(),
-            Some("s3.us-east-1.amazonaws.com:443")
-        );
+        assert_eq!(c.backends[0].url(), Some("s3.us-east-1.amazonaws.com:443"));
     }
 
     #[test]
     fn s3_frontend_round_trips() {
         let s = r#"
 [[frontends]]
-id = "workload-s3"
-binds_to = "b"
+name = "workload-s3"
+source = "b"
 
 [frontends.config.s3]
 addr = "0.0.0.0:9000"
@@ -559,8 +560,8 @@ addr = "0.0.0.0:9000"
     fn loadgen_frontend_round_trips() {
         let s = r#"
 [[frontends]]
-id = "synthetic"
-binds_to = "cache"
+name = "synthetic"
+source = "cache"
 
 [frontends.config.loadgen]
 workers = 8
@@ -575,7 +576,7 @@ verify = true
         let f = &c.frontends[0];
         assert_eq!(f.kind_name(), "loadgen");
         assert_eq!(f.addr(), None);
-        assert_eq!(f.binds_to, "cache");
+        assert_eq!(f.source, "cache");
 
         let loadgen = match f.config.as_ref().expect("loadgen config set") {
             frontend_spec::Config::Loadgen(cfg) => cfg,
@@ -592,8 +593,8 @@ verify = true
     fn unknown_loadgen_fields_are_rejected() {
         let s = r#"
 [[frontends]]
-id = "synthetic"
-binds_to = "cache"
+name = "synthetic"
+source = "cache"
 
 [frontends.config.loadgen]
 workerz = 8

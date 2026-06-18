@@ -87,12 +87,12 @@ impl S3Frontend {
             .parse::<SocketAddr>()
             .map_err(|_| FrontendError::BadBind(cfg.addr.clone()))?;
         Ok(Self {
-            id: spec.id.clone(),
+            id: spec.name.clone(),
             addr,
         })
     }
 
-    /// Stable identifier, matching [`FrontendSpec::id`].
+    /// Stable identifier, matching [`FrontendSpec::name`].
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -715,8 +715,8 @@ mod tests {
 
     fn spec(id: &str, addr: &str) -> FrontendSpec {
         FrontendSpec {
-            id: id.to_string(),
-            binds_to: "primary".to_string(),
+            name: id.to_string(),
+            source: "primary".to_string(),
             config: Some(frontend_spec::Config::S3(S3FrontendConfig {
                 addr: addr.to_string(),
             })),

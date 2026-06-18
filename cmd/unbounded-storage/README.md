@@ -93,16 +93,17 @@ version behind until the daemon restarts.
 # unbounded-storage.toml
 
 [[backends]]
-id = "origin"
+name = "origin"
 
 [backends.config.http]
-endpoint = "127.0.0.1:8080"     # host:port origin endpoint.
-stripe_size_bytes = 4194304      # 4 MiB stripes; 0 -> 4 MiB.
+url = "origin.example.com:80"    # host:port resolved for origin fetches.
+stripe_size_bytes = 4194304      # optional; must be a power of two.
 
 [[neighborhoods]]
-id = "p2p"
-binds_to = "origin"             # backend id used for cache misses.
-local_node_id   = 1              # u64; this daemon's node id (required with peers).
+name = "p2p"
+source = "origin"               # backend component name.
+local_node_id = 1                # u64; this daemon's node id (required with peers).
+local_tags = ["region-a", "rack-1"]
 fingers_per_node = 100           # routing finger-table fanout per node.
 
 # Optional. Disjoint discovery: configure this node with ONLY its direct
@@ -119,7 +120,8 @@ fingers_per_node = 100           # routing finger-table fanout per node.
 # predecessor = 64               # id of the nearest backward neighbor on the ring.
 
 [[neighborhoods.peers]]          # repeat per remote peer; ids must be unique.
-id        = 1                    # u64, unique within the daemon.
+id        = 2                    # u64, unique within this neighborhood.
+tags      = ["region-a", "rack-2"]
 
 [neighborhoods.peers.config.tcp]
 addr      = "10.0.0.1:9000"      # parsed as SocketAddr.
@@ -130,26 +132,28 @@ addr      = "10.0.0.1:9000"      # parsed as SocketAddr.
 # hca_numa = 0                   # optional u16; pin connection setup to this NUMA node.
 
 [[caches]]
-id = "cache"
-binds_to = "p2p"                 # backend or neighborhood id.
+name = "cache"
+source = "p2p"                  # backend or neighborhood component name.
 
 [[caches.disks]]                 # repeat per local device; paths must be unique.
-path        = "/dev/nvme0n1"     # required.
 queue_depth = 32                 # optional u32; per-disk io_uring depth.
+skip_recovery_scan = false       # only for fresh or benchmark disks.
 
 [caches.disks.config.block]
+path        = "/dev/nvme0n1"     # required for block disks.
 numa        = 0                  # optional u16; biases the open onto a CPU on this node.
 
 # Or, for file-backed disks:
 # [caches.disks.config.file]
+# path = "/var/lib/unbounded-storage/disk0.img"
 # size = 1073741824              # required bytes for file-backed disks.
 
 [[frontends]]
-id = "http"
-binds_to = "cache"               # backend, cache, or neighborhood id.
+name = "http"
+source = "cache"                # backend, cache, or neighborhood component name.
 
 [frontends.config.http]
-addr = "0.0.0.0:8081"
+addr = "0.0.0.0:9000"
 
 [startup.memory]                 # startup-fixed; read once at process start.
 no_hugepages   = false           # true allocates per-shard backing from the heap.
@@ -157,7 +161,7 @@ memory_total_bytes = 134217728   # u64 bytes (no K/M/G suffix). Total backing po
                                  #   evenly across serving shards. 0 -> 128 MiB.
 
 [startup.fabric]
-addr                = "0.0.0.0:0" # fabric listen address; :0 picks a free port.
+addr                = "0.0.0.0:0" # per-shard fabric listen address; :0 picks a free port.
                                   # Use "hex:..." only for provider-native binds.
 progress_threads    = 2          # libfabric progress threads per shard.
 progress_poll_us    = 10         # progress-thread busy-poll budget (us).

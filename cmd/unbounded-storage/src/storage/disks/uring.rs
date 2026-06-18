@@ -106,6 +106,7 @@ impl DiskTarget for UringDiskTarget {
         spec: &DiskSpec,
         pin: Option<DiskCpuSlot>,
     ) -> Result<(UringDiskHandle, PageChannel), DiskError> {
+        let disk_path = spec.path().expect("disk path is validated at config load");
         let engine_cfg = engine_config_from(spec);
         // The device page size must equal the engine's LBA unit. The
         // allocator counts btree pages (`alloc_contig` LBAs are btree-page
@@ -135,17 +136,17 @@ impl DiskTarget for UringDiskTarget {
             let size = spec
                 .file_size()
                 .expect("file disk size is validated at config load");
-            if let Err(e) = provision_file(Path::new(&spec.path), size) {
+            if let Err(e) = provision_file(Path::new(disk_path), size) {
                 return Err(DiskError::Open(format!(
                     "provision file {}: {e}",
-                    spec.path
+                    disk_path
                 )));
             }
         }
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thr = stop.clone();
-        let path = PathBuf::from(&spec.path);
+        let path = PathBuf::from(disk_path);
         let name = format!("ub-disk-{}", path.display());
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<PageChannel, String>>(1);
 
@@ -399,16 +400,18 @@ fn run_core_loop<B, R>(
 
 /// Build an [`EngineConfig`] from a [`DiskSpec`]. Production defaults
 /// come from [`EngineConfig::default`]; the spec only overrides what
-/// the operator chose to expose: `page_size_bytes`, `bypass_admission`,
-/// and `skip_recovery_scan_if_no_meta`.
+/// the operator chose to expose: `page_size_bytes` and
+/// `skip_recovery_scan`.
 fn engine_config_from(spec: &DiskSpec) -> EngineConfig {
     let mut cfg = EngineConfig::default();
     if let Some(p) = spec.page_size_bytes {
         cfg.page_size_bytes = p as usize;
     }
-    cfg.bypass_admission = spec.bypass_admission;
-    cfg.skip_recovery_scan_if_no_meta = spec.skip_recovery_scan_if_no_meta;
-    cfg.disk_id = spec.path.clone();
+    cfg.skip_recovery_scan_if_no_meta = spec.skip_recovery_scan;
+    cfg.disk_id = spec
+        .path()
+        .expect("disk path is validated at config load")
+        .to_string();
     cfg
 }
 

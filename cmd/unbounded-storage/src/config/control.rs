@@ -562,7 +562,7 @@ mod tests {
         c.apply_defaults();
         c.version = version;
         c.backends.push(crate::config::BackendSpec {
-            id: "b".to_string(),
+            name: "b".to_string(),
             config: Some(crate::config::backend_spec::Config::Fake(
                 crate::config::FakeBackendConfig {
                     stripe_size_bytes: 4 * 1024 * 1024,
@@ -571,11 +571,11 @@ mod tests {
             )),
         });
         c.neighborhoods.push(crate::config::NeighborhoodSpec {
-            id: "n".to_string(),
-            binds_to: "b".to_string(),
+            name: "n".to_string(),
+            source: "b".to_string(),
             fingers_per_node: 100,
             local_node_id: Some(0),
-            local_labels: Vec::new(),
+            local_tags: Vec::new(),
             routing_plan: None,
             peers: vec![tcp_peer(1, "127.0.0.1:9999")],
         });
@@ -585,7 +585,7 @@ mod tests {
     fn tcp_peer(id: u64, addr: &str) -> crate::config::PeerSpec {
         crate::config::PeerSpec {
             id,
-            labels: Vec::new(),
+            tags: Vec::new(),
             config: Some(crate::config::peer_spec::Config::Tcp(
                 crate::config::TcpPeerConfig {
                     addr: addr.to_string(),
@@ -651,10 +651,10 @@ mod tests {
 
         let mut next = config_with_peer(3);
         next.backends.push(crate::config::schema::BackendSpec {
-            id: "b".to_string(),
+            name: "b".to_string(),
             config: Some(crate::config::backend_spec::Config::Http(
                 crate::config::HttpBackendConfig {
-                    endpoint: "https://example.com".to_string(),
+                    url: "https://example.com".to_string(),
                     stripe_size_bytes: 4 * 1024 * 1024,
                     http_concurrency: 64,
                 },

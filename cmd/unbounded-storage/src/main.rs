@@ -28,7 +28,7 @@ use unbounded_storage::frontend::{
 };
 use unbounded_storage::p2p::{
     FingerTable, FingerTableConfig, NodeId, PeerEntry, RouteTableHandle, RouteTableSnapshot,
-    RoutedTransport, RoutingSnapshot, TopologyLabels, node_to_ring,
+    RoutedTransport, RoutingSnapshot, TopologyTags, node_to_ring,
 };
 use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
@@ -604,21 +604,21 @@ fn run_shard(
     // joins anyone) would leave a peer ring pointing at unmapped memory.
     let backing_keepalive = backing.keepalive();
 
-    // Stripe geometry per backend id, shared (behind an `Rc`) with the
+    // Stripe geometry per backend name, shared (behind an `Rc`) with the
     // frontend registry and the control-drain hook so a live backend
     // add/replace keeps every frontend's stripe size in sync. A frontend
-    // references a backend by id; load-time validation guarantees the
+    // references a backend by name; load-time validation guarantees the
     // referent exists, but the registry falls back to the default stripe
     // size if a lookup races an as-yet-unapplied backend add.
     let geometry: Rc<RefCell<HashMap<String, u64>>> = Rc::new(RefCell::new(
         backend_specs
             .iter()
-            .map(|b| (b.id.clone(), b.stripe_size_bytes()))
+            .map(|b| (b.name.clone(), b.stripe_size_bytes()))
             .collect(),
     ));
 
     // Build the shard's origin-backend registry: every configured
-    // backend, keyed by id, behind an `ArcSwap` so a live config apply
+    // backend, keyed by name, behind an `ArcSwap` so a live config apply
     // can add/remove/replace a tier without tearing down the shard.
     // Each request names its backend through the `OriginRef` the
     // frontend stamps, so the registry resolves the tier per fetch.
@@ -869,11 +869,11 @@ fn run_shard(
         let bindings = frontend_registry.ctx.bindings.clone();
         let mut last_backends: HashMap<String, BackendSpec> = backend_specs
             .iter()
-            .map(|b| (b.id.clone(), b.clone()))
+            .map(|b| (b.name.clone(), b.clone()))
             .collect();
         let mut last_frontends: HashMap<String, FrontendSpec> = frontend_specs
             .iter()
-            .map(|f| (f.id.clone(), f.clone()))
+            .map(|f| (f.name.clone(), f.clone()))
             .collect();
         let mut last_bindings: HashMap<String, ResolvedFrontendBinding> =
             (*frontend_bindings).clone();
@@ -908,7 +908,7 @@ fn run_shard(
                             let mut g = geometry.borrow_mut();
                             g.clear();
                             for b in desired_backends {
-                                g.insert(b.id.clone(), b.stripe_size_bytes());
+                                g.insert(b.name.clone(), b.stripe_size_bytes());
                             }
                         }
 
@@ -1064,7 +1064,7 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
             let local = PeerEntry {
                 node: NodeId(local_id),
                 ring: node_to_ring(NodeId(local_id)),
-                labels: TopologyLabels(neighborhood.p2p.local_labels.clone()),
+                tags: TopologyTags(neighborhood.p2p.local_tags.clone()),
             };
             let node_to_peer: HashMap<NodeId, unbounded_storage::fabric::PeerId> = neighborhood
                 .peers
@@ -1072,12 +1072,12 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
                 .map(|peer| (peer.node_id, peer.fabric_peer_id))
                 .collect();
             let fingers = if let Some(plan) = &neighborhood.p2p.routing_plan {
-                let labels_of = |node: NodeId| -> TopologyLabels {
+                let tags_of = |node: NodeId| -> TopologyTags {
                     neighborhood
                         .peers
                         .iter()
                         .find(|peer| peer.node_id == node)
-                        .map(|peer| TopologyLabels(peer.spec.labels.clone()))
+                        .map(|peer| TopologyTags(peer.spec.tags.clone()))
                         .unwrap_or_default()
                 };
                 let entry_of = |raw: u64| {
@@ -1085,7 +1085,7 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
                     PeerEntry {
                         node,
                         ring: node_to_ring(node),
-                        labels: labels_of(node),
+                        tags: tags_of(node),
                     }
                 };
                 Arc::new(FingerTable::from_explicit(
@@ -1101,7 +1101,7 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
                     .map(|peer| PeerEntry {
                         node: peer.node_id,
                         ring: node_to_ring(peer.node_id),
-                        labels: TopologyLabels(peer.spec.labels.clone()),
+                        tags: TopologyTags(peer.spec.tags.clone()),
                     })
                     .collect();
                 Arc::new(FingerTable::build(
@@ -1172,11 +1172,11 @@ fn stripe_key_to_shard(key: &StripeKey, shard_count: usize) -> usize {
 fn log_backend_registry(widx: WorkerIdx, specs: &[BackendSpec]) -> usize {
     for spec in specs {
         eprintln!(
-            "shard {}: backend {} kind={} endpoint={} stripe_size={} http_concurrency={} (OriginBackend active)",
+            "shard {}: backend {} kind={} url={} stripe_size={} http_concurrency={} (OriginBackend active)",
             widx.0,
-            spec.id,
+            spec.name,
             spec.kind_name(),
-            spec.endpoint().unwrap_or(""),
+            spec.url().unwrap_or(""),
             spec.stripe_size_bytes(),
             spec.http_concurrency().unwrap_or(0),
         );
@@ -1218,7 +1218,7 @@ struct FrontendBuildCtx {
     /// locally). Shared behind an `Rc` so cloning the context stays
     /// cheap.
     fanout: Rc<FanoutTable>,
-    /// Backend id -> stripe size, shared (and live-updated) with the
+    /// Backend name -> stripe size, shared (and live-updated) with the
     /// control-drain hook so a frontend brought up after a backend
     /// stripe change sees the new geometry. A frontend's stripe size is
     /// that of the backend it serves.
@@ -1251,8 +1251,8 @@ fn frontend_rebuild_ids(
     let changed_backend_geometry: HashSet<String> = desired_backends
         .iter()
         .filter_map(|backend| {
-            let old = last_backends.get(&backend.id)?;
-            (old.stripe_size_bytes() != backend.stripe_size_bytes()).then(|| backend.id.clone())
+            let old = last_backends.get(&backend.name)?;
+            (old.stripe_size_bytes() != backend.stripe_size_bytes()).then(|| backend.name.clone())
         })
         .collect();
 
@@ -1279,22 +1279,22 @@ impl FrontendBuildCtx {
         let binding = self
             .bindings
             .borrow()
-            .get(&spec.id)
+            .get(&spec.name)
             .cloned()
-            .ok_or_else(|| format!("frontend {} has no resolved binding", spec.id))?;
+            .ok_or_else(|| format!("frontend {} has no resolved binding", spec.name))?;
         let stripe_size = frontend_stripe_size(&self.geometry.borrow(), &binding.backend_id);
         match spec.config.as_ref() {
             Some(frontend_spec::Config::Http(_)) => {
                 let frontend = HttpFrontend::from_spec(spec)
-                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.id))?;
+                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.name))?;
                 let listen_fd = frontend
                     .bind_listener()
-                    .map_err(|e| format!("frontend {} bind_listener: {e}", spec.id))?;
+                    .map_err(|e| format!("frontend {} bind_listener: {e}", spec.name))?;
                 Ok(ShardFrontendDriver::Http(HttpDriver::new(
                     self.pool.clone(),
                     self.handle.clone(),
                     listen_fd,
-                    Rc::from(spec.id.as_str()),
+                    Rc::from(spec.name.as_str()),
                     binding.backend_id.clone(),
                     binding.cache_id.clone(),
                     binding.neighborhood_id.clone(),
@@ -1306,15 +1306,15 @@ impl FrontendBuildCtx {
             }
             Some(frontend_spec::Config::S3(_)) => {
                 let frontend = S3Frontend::from_spec(spec)
-                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.id))?;
+                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.name))?;
                 let listen_fd = frontend
                     .bind_listener()
-                    .map_err(|e| format!("frontend {} bind_listener: {e}", spec.id))?;
+                    .map_err(|e| format!("frontend {} bind_listener: {e}", spec.name))?;
                 Ok(ShardFrontendDriver::S3(S3Driver::new(
                     self.pool.clone(),
                     self.handle.clone(),
                     listen_fd,
-                    Rc::from(spec.id.as_str()),
+                    Rc::from(spec.name.as_str()),
                     binding.backend_id.clone(),
                     binding.cache_id.clone(),
                     binding.neighborhood_id.clone(),
@@ -1325,7 +1325,7 @@ impl FrontendBuildCtx {
             }
             Some(frontend_spec::Config::Loadgen(_)) => {
                 let frontend = LoadgenFrontend::from_spec(spec)
-                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.id))?;
+                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.name))?;
                 Ok(ShardFrontendDriver::Loadgen(LoadgenDriver::new(
                     frontend,
                     self.pool.clone(),
@@ -1338,18 +1338,18 @@ impl FrontendBuildCtx {
                     self.worker_idx,
                 )))
             }
-            None => Err(format!("frontend {} missing config", spec.id)),
+            None => Err(format!("frontend {} missing config", spec.name)),
         }
     }
 }
 
 /// Shard-local registry of running frontend drivers, keyed by frontend
-/// id. A single permanent tick hook drives whichever drivers are live,
+/// name. A single permanent tick hook drives whichever drivers are live,
 /// and the control-drain hook adds/removes drivers on a config apply;
 /// the [`ShardLoop`] has no hook-removal API, so the registry (not the
 /// hook set) is the unit of liveness. Each frontend stamps its backend
-/// id into every request, so per-frontend origin routing falls out of
-/// the backend registry resolving that id.
+/// backend name into every request, so per-frontend origin routing falls
+/// out of the backend registry resolving that name.
 #[derive(Clone)]
 struct FrontendRegistry {
     drivers: Rc<RefCell<HashMap<String, ShardFrontendDriver>>>,
@@ -1371,7 +1371,7 @@ impl FrontendRegistry {
             registry
                 .drivers
                 .borrow_mut()
-                .insert(spec.id.clone(), driver);
+                .insert(spec.name.clone(), driver);
         }
         Ok(registry)
     }
@@ -1396,7 +1396,7 @@ impl config::reconcile::FrontendReconcileTarget for FrontendRegistry {
 
     fn add(&self, spec: &FrontendSpec) -> Result<(), String> {
         let driver = self.ctx.build(spec)?;
-        self.drivers.borrow_mut().insert(spec.id.clone(), driver);
+        self.drivers.borrow_mut().insert(spec.name.clone(), driver);
         Ok(())
     }
 
@@ -1914,10 +1914,10 @@ mod tests {
 
     fn backend_spec(id: &str) -> BackendSpec {
         BackendSpec {
-            id: id.to_string(),
+            name: id.to_string(),
             config: Some(config::backend_spec::Config::Http(
                 config::HttpBackendConfig {
-                    endpoint: "https://example.com".to_string(),
+                    url: "https://example.com".to_string(),
                     stripe_size_bytes: 4 * 1024 * 1024,
                     http_concurrency: 64,
                 },
@@ -1972,7 +1972,7 @@ mod tests {
         cfg.stripe_size_bytes *= 2;
 
         let mut last_backends = HashMap::new();
-        last_backends.insert(old_backend.id.clone(), old_backend);
+        last_backends.insert(old_backend.name.clone(), old_backend);
 
         assert_eq!(
             frontend_rebuild_ids(

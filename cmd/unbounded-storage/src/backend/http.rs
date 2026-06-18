@@ -103,16 +103,16 @@ impl HttpBackend {
         &self.backend_id
     }
 
-    /// Resolve a `host:port` endpoint to a single IPv4 [`SockAddr`].
+    /// Resolve a `host:port` URL value to a single IPv4 [`SockAddr`].
     ///
     /// Takes the first IPv4 address `ToSocketAddrs` yields. DNS at
     /// startup is acceptable for the origin tier. If only IPv6
     /// addresses resolve, this returns an error: v1 dials IPv4 only.
-    pub fn resolve_origin(endpoint: &str) -> std::io::Result<SockAddr> {
+    pub fn resolve_origin(url: &str) -> std::io::Result<SockAddr> {
         use std::net::{SocketAddr, ToSocketAddrs};
 
         let mut last_v6 = false;
-        for addr in endpoint.to_socket_addrs()? {
+        for addr in url.to_socket_addrs()? {
             match addr {
                 SocketAddr::V4(v4) => {
                     let sin = libc::sockaddr_in {

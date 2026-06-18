@@ -245,7 +245,7 @@ fn smoke() {
     let w = Workload {
         peer_count: 8,
         topology_groups: 2,
-        label_depth: 2,
+        tag_depth: 2,
         k: 4,
         max_hop_delay: 1,
         hop_fault_rate: 0,

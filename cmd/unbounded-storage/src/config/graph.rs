@@ -22,7 +22,7 @@ pub struct ResolvedFrontendBinding {
 pub struct RuntimeP2p {
     pub fingers_per_node: u32,
     pub local_node_id: Option<u64>,
-    pub local_labels: Vec<String>,
+    pub local_tags: Vec<String>,
     pub routing_plan: Option<RoutingPlan>,
 }
 
@@ -58,51 +58,51 @@ pub struct RuntimeGraph {
 pub fn validate_binding_graph(config: &Config) -> Result<(), String> {
     let mut ids = HashSet::new();
     for b in &config.backends {
-        insert_id(&mut ids, "backend", &b.id)?;
+        insert_id(&mut ids, "backend", &b.name)?;
     }
     for c in &config.caches {
-        insert_id(&mut ids, "cache", &c.id)?;
-        require_target("cache", &c.id, &c.binds_to)?;
+        insert_id(&mut ids, "cache", &c.name)?;
+        require_source("cache", &c.name, &c.source)?;
     }
     for n in &config.neighborhoods {
-        insert_id(&mut ids, "neighborhood", &n.id)?;
-        require_target("neighborhood", &n.id, &n.binds_to)?;
+        insert_id(&mut ids, "neighborhood", &n.name)?;
+        require_source("neighborhood", &n.name, &n.source)?;
     }
     for f in &config.frontends {
-        insert_id(&mut ids, "frontend", &f.id)?;
-        require_target("frontend", &f.id, &f.binds_to)?;
+        insert_id(&mut ids, "frontend", &f.name)?;
+        require_source("frontend", &f.name, &f.source)?;
     }
 
-    let backends = by_id(&config.backends, |b| b.id.as_str());
-    let caches = by_id(&config.caches, |c| c.id.as_str());
-    let neighborhoods = by_id(&config.neighborhoods, |n| n.id.as_str());
+    let backends = by_id(&config.backends, |b| b.name.as_str());
+    let caches = by_id(&config.caches, |c| c.name.as_str());
+    let neighborhoods = by_id(&config.neighborhoods, |n| n.name.as_str());
 
     for c in &config.caches {
-        if !neighborhoods.contains_key(c.binds_to.as_str())
-            && !backends.contains_key(c.binds_to.as_str())
+        if !neighborhoods.contains_key(c.source.as_str())
+            && !backends.contains_key(c.source.as_str())
         {
             return Err(format!(
-                "cache {:?} binds_to {:?}, which is not a backend or neighborhood",
-                c.id, c.binds_to
+                "cache {:?} source {:?}, which is not a backend or neighborhood",
+                c.name, c.source
             ));
         }
     }
     for n in &config.neighborhoods {
-        if !backends.contains_key(n.binds_to.as_str()) {
+        if !backends.contains_key(n.source.as_str()) {
             return Err(format!(
-                "neighborhood {:?} binds_to {:?}, which is not a backend",
-                n.id, n.binds_to
+                "neighborhood {:?} source {:?}, which is not a backend",
+                n.name, n.source
             ));
         }
     }
     for f in &config.frontends {
-        if !backends.contains_key(f.binds_to.as_str())
-            && !caches.contains_key(f.binds_to.as_str())
-            && !neighborhoods.contains_key(f.binds_to.as_str())
+        if !backends.contains_key(f.source.as_str())
+            && !caches.contains_key(f.source.as_str())
+            && !neighborhoods.contains_key(f.source.as_str())
         {
             return Err(format!(
-                "frontend {:?} binds_to {:?}, which is not a backend, cache, or neighborhood",
-                f.id, f.binds_to
+                "frontend {:?} source {:?}, which is not a backend, cache, or neighborhood",
+                f.name, f.source
             ));
         }
     }
@@ -113,48 +113,48 @@ pub fn validate_binding_graph(config: &Config) -> Result<(), String> {
 pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
     validate_binding_graph(config)?;
 
-    let backends = by_id(&config.backends, |b| b.id.as_str());
-    let caches = by_id(&config.caches, |c| c.id.as_str());
-    let neighborhoods = by_id(&config.neighborhoods, |n| n.id.as_str());
+    let backends = by_id(&config.backends, |b| b.name.as_str());
+    let caches = by_id(&config.caches, |c| c.name.as_str());
+    let neighborhoods = by_id(&config.neighborhoods, |n| n.name.as_str());
 
     let mut bindings = HashMap::new();
 
     for frontend in &config.frontends {
-        let binding = if backends.contains_key(frontend.binds_to.as_str()) {
+        let binding = if backends.contains_key(frontend.source.as_str()) {
             ResolvedFrontendBinding {
-                frontend_id: frontend.id.clone(),
-                backend_id: frontend.binds_to.clone(),
+                frontend_id: frontend.name.clone(),
+                backend_id: frontend.source.clone(),
                 cache_id: None,
                 neighborhood_id: None,
                 bypass_cache: true,
             }
-        } else if let Some(cache) = caches.get(frontend.binds_to.as_str()) {
+        } else if let Some(cache) = caches.get(frontend.source.as_str()) {
             let (backend_id, neighborhood_id) =
-                if let Some(neighborhood) = neighborhoods.get(cache.binds_to.as_str()) {
-                    (neighborhood.binds_to.clone(), Some(neighborhood.id.clone()))
+                if let Some(neighborhood) = neighborhoods.get(cache.source.as_str()) {
+                    (neighborhood.source.clone(), Some(neighborhood.name.clone()))
                 } else {
-                    (cache.binds_to.clone(), None)
+                    (cache.source.clone(), None)
                 };
             ResolvedFrontendBinding {
-                frontend_id: frontend.id.clone(),
+                frontend_id: frontend.name.clone(),
                 backend_id,
-                cache_id: Some(cache.id.clone()),
+                cache_id: Some(cache.name.clone()),
                 neighborhood_id,
                 bypass_cache: false,
             }
         } else {
             let neighborhood = neighborhoods
-                .get(frontend.binds_to.as_str())
+                .get(frontend.source.as_str())
                 .expect("binding graph validation checked frontend target");
             ResolvedFrontendBinding {
-                frontend_id: frontend.id.clone(),
-                backend_id: neighborhood.binds_to.clone(),
+                frontend_id: frontend.name.clone(),
+                backend_id: neighborhood.source.clone(),
                 cache_id: None,
-                neighborhood_id: Some(neighborhood.id.clone()),
+                neighborhood_id: Some(neighborhood.name.clone()),
                 bypass_cache: false,
             }
         };
-        bindings.insert(frontend.id.clone(), binding);
+        bindings.insert(frontend.name.clone(), binding);
     }
 
     let caches = config
@@ -162,9 +162,9 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
         .iter()
         .map(|cache| {
             (
-                cache.id.clone(),
+                cache.name.clone(),
                 RuntimeCache {
-                    id: cache.id.clone(),
+                    id: cache.name.clone(),
                     disks: cache.disks.clone(),
                 },
             )
@@ -179,21 +179,21 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
                 .peers
                 .iter()
                 .map(|peer| RuntimePeer {
-                    neighborhood_id: neighborhood.id.clone(),
+                    neighborhood_id: neighborhood.name.clone(),
                     node_id: NodeId(peer.id),
-                    fabric_peer_id: scoped_peer_id(&neighborhood.id, peer.id),
+                    fabric_peer_id: scoped_peer_id(&neighborhood.name, peer.id),
                     spec: peer.clone(),
                 })
                 .collect();
             (
-                neighborhood.id.clone(),
+                neighborhood.name.clone(),
                 RuntimeNeighborhood {
-                    id: neighborhood.id.clone(),
-                    backend_id: neighborhood.binds_to.clone(),
+                    id: neighborhood.name.clone(),
+                    backend_id: neighborhood.source.clone(),
                     p2p: RuntimeP2p {
                         fingers_per_node: neighborhood.fingers_per_node.max(1),
                         local_node_id: neighborhood.local_node_id,
-                        local_labels: neighborhood.local_labels.clone(),
+                        local_tags: neighborhood.local_tags.clone(),
                         routing_plan: neighborhood.routing_plan.clone(),
                     },
                     peers,
@@ -213,7 +213,7 @@ pub fn empty_runtime_p2p() -> RuntimeP2p {
     RuntimeP2p {
         fingers_per_node: 100,
         local_node_id: None,
-        local_labels: Vec::new(),
+        local_tags: Vec::new(),
         routing_plan: None,
     }
 }
@@ -282,7 +282,7 @@ pub fn compat_runtime_projection(config: &Config) -> Result<CompatRuntimeProject
             RuntimeP2p {
                 fingers_per_node: 100,
                 local_node_id: None,
-                local_labels: Vec::new(),
+                local_tags: Vec::new(),
                 routing_plan: None,
             },
             Vec::new(),
@@ -313,19 +313,21 @@ pub fn frontend_backend_map(
         .collect()
 }
 
-fn insert_id(ids: &mut HashSet<String>, kind: &str, id: &str) -> Result<(), String> {
-    if id.is_empty() {
+fn insert_id(ids: &mut HashSet<String>, kind: &str, name: &str) -> Result<(), String> {
+    if name.is_empty() {
         return Ok(());
     }
-    if !ids.insert(id.to_string()) {
-        return Err(format!("duplicate component id {id:?} while adding {kind}"));
+    if !ids.insert(name.to_string()) {
+        return Err(format!(
+            "duplicate component name {name:?} while adding {kind}"
+        ));
     }
     Ok(())
 }
 
-fn require_target(kind: &str, id: &str, target: &str) -> Result<(), String> {
-    if target.is_empty() {
-        return Err(format!("{kind} {id:?}: binds_to must not be empty"));
+fn require_source(kind: &str, name: &str, source: &str) -> Result<(), String> {
+    if source.is_empty() {
+        return Err(format!("{kind} {name:?}: source must not be empty"));
     }
     Ok(())
 }
@@ -344,39 +346,39 @@ mod tests {
 
     fn backend(id: &str) -> BackendSpec {
         BackendSpec {
-            id: id.to_string(),
+            name: id.to_string(),
             config: Some(backend_spec::Config::Http(HttpBackendConfig {
-                endpoint: "https://example.com".to_string(),
+                url: "https://example.com".to_string(),
                 stripe_size_bytes: 4 * 1024 * 1024,
                 http_concurrency: 64,
             })),
         }
     }
 
-    fn cache(id: &str, binds_to: &str) -> CacheSpec {
+    fn cache(id: &str, source: &str) -> CacheSpec {
         CacheSpec {
-            id: id.to_string(),
-            binds_to: binds_to.to_string(),
+            name: id.to_string(),
+            source: source.to_string(),
             disks: Vec::new(),
         }
     }
 
-    fn neighborhood(id: &str, binds_to: &str) -> NeighborhoodSpec {
+    fn neighborhood(id: &str, source: &str) -> NeighborhoodSpec {
         NeighborhoodSpec {
-            id: id.to_string(),
-            binds_to: binds_to.to_string(),
+            name: id.to_string(),
+            source: source.to_string(),
             fingers_per_node: 100,
             local_node_id: Some(1),
-            local_labels: Vec::new(),
+            local_tags: Vec::new(),
             routing_plan: None,
             peers: Vec::new(),
         }
     }
 
-    fn frontend(id: &str, binds_to: &str) -> FrontendSpec {
+    fn frontend(id: &str, source: &str) -> FrontendSpec {
         FrontendSpec {
-            id: id.to_string(),
-            binds_to: binds_to.to_string(),
+            name: id.to_string(),
+            source: source.to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: format!("127.0.0.1:{}", 9000 + id.len()),
             })),

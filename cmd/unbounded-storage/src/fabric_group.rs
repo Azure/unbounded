@@ -475,7 +475,7 @@ fn build_unit(
     fabric.set_desired_peers(desired_peers.clone());
     let last_backends = backend_specs
         .iter()
-        .map(|b| (b.id.clone(), b.clone()))
+        .map(|b| (b.name.clone(), b.clone()))
         .collect();
 
     Ok(FabricUnit {
@@ -495,7 +495,7 @@ fn runtime_peer_connections(peers: &[RuntimePeer]) -> Vec<ConnectionSpec> {
             peer: peer.fabric_peer_id,
             address: runtime_peer_address(&peer.spec),
             hca_numa: peer.spec.hca_numa().map(|n| n as u16),
-            labels: peer.spec.labels.clone(),
+            tags: peer.spec.tags.clone(),
         })
         .collect()
 }

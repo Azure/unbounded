@@ -572,7 +572,7 @@ mod tests {
     use super::*;
     use crate::backend::NullBackend;
     use crate::bufferpool::Error;
-    use crate::p2p::{FingerTableConfig, PeerEntry, TopologyLabels, node_to_ring};
+    use crate::p2p::{FingerTableConfig, PeerEntry, TopologyTags, node_to_ring};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const PAGE: usize = 4096;
@@ -723,7 +723,7 @@ mod tests {
         PeerEntry {
             node: NodeId(node),
             ring: node_to_ring(NodeId(node)),
-            labels: TopologyLabels(vec!["r".to_string()]),
+            tags: TopologyTags(vec!["r".to_string()]),
         }
     }
 

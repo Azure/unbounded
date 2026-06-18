@@ -14,7 +14,7 @@ pub fn peer_spec_to_connection(p: &PeerSpec) -> ConnectionSpec {
         peer: PeerId(p.id),
         address: peer_address(p),
         hca_numa: p.hca_numa().map(|n| n as u16),
-        labels: p.labels.clone(),
+        tags: p.tags.clone(),
     }
 }
 
@@ -30,13 +30,13 @@ fn peer_address(p: &PeerSpec) -> FabricAddress {
 mod tests {
     use super::*;
 
-    use crate::config::schema::TcpPeerConfig;
+    use crate::config::schema::{RdmaPeerConfig, TcpPeerConfig};
 
     #[test]
-    fn peer_spec_maps_directly() {
+    fn tcp_peer_spec_maps_directly() {
         let p = PeerSpec {
             id: 42,
-            labels: vec!["us-west".to_string(), "rack7".to_string()],
+            tags: vec!["us-west".to_string(), "rack7".to_string()],
             config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
                 addr: "10.0.0.1:9000".into(),
             })),
@@ -45,6 +45,23 @@ mod tests {
         assert_eq!(c.peer, PeerId(42));
         assert_eq!(c.address, FabricAddress::socket("10.0.0.1:9000"));
         assert_eq!(c.hca_numa, None);
-        assert_eq!(c.labels, p.labels);
+        assert_eq!(c.tags, p.tags);
+    }
+
+    #[test]
+    fn rdma_peer_spec_maps_directly() {
+        let p = PeerSpec {
+            id: 42,
+            tags: vec!["us-west".to_string(), "rack7".to_string()],
+            config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
+                addr: "hex:01020304".into(),
+                hca_numa: Some(1),
+            })),
+        };
+        let c = peer_spec_to_connection(&p);
+        assert_eq!(c.peer, PeerId(42));
+        assert_eq!(c.address, FabricAddress::native("hex:01020304"));
+        assert_eq!(c.hca_numa, Some(1));
+        assert_eq!(c.tags, p.tags);
     }
 }

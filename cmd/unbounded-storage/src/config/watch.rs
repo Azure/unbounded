@@ -227,25 +227,25 @@ mod tests {
 
     const VALID_A: &str = r#"
 [[backends]]
-id = "b"
+name = "b"
 
 [backends.config.fake]
 
 [[neighborhoods]]
-id = "n"
-binds_to = "b"
+name = "n"
+source = "b"
 fingers_per_node = 1234
 "#;
 
     const VALID_B: &str = r#"
 [[backends]]
-id = "b"
+name = "b"
 
 [backends.config.fake]
 
 [[neighborhoods]]
-id = "n"
-binds_to = "b"
+name = "n"
+source = "b"
 fingers_per_node = 5678
 "#;
 
@@ -253,13 +253,13 @@ fingers_per_node = 5678
         format!(
             r#"
 [[backends]]
-id = "b"
+name = "b"
 
 [backends.config.fake]
 
 [[neighborhoods]]
-id = "n"
-binds_to = "b"
+name = "n"
+source = "b"
 fingers_per_node = {fingers_per_node}
 "#,
         )

@@ -82,7 +82,7 @@ mod tests {
     use crate::bufferpool::{Req, StripeKey};
     use crate::fabric::{PeerId, PeerRouter};
     use crate::p2p::{
-        FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyLabels, node_to_ring,
+        FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyTags, node_to_ring,
         stripe_to_ring,
     };
 
@@ -100,7 +100,7 @@ mod tests {
         PeerEntry {
             node: NodeId(node),
             ring: node_to_ring(NodeId(node)),
-            labels: TopologyLabels(vec!["r".to_string()]),
+            tags: TopologyTags(vec!["r".to_string()]),
         }
     }
 

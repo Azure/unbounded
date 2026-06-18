@@ -27,4 +27,4 @@ pub use handler::{RecursiveHandler, RecursiveHandlerError, RecursiveHandlerStrea
 pub use ring::{node_to_ring, splitmix64, stripe_to_ring};
 pub use routing_handle::{RouteTableHandle, RouteTableSnapshot, RoutingHandle, RoutingSnapshot};
 pub use transport::{RoutedStream, RoutedTransport};
-pub use types::{NodeId, P2pReq, PeerEntry, RingId, TopologyLabels};
+pub use types::{NodeId, P2pReq, PeerEntry, RingId, TopologyTags};

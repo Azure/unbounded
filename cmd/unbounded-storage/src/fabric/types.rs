@@ -48,11 +48,11 @@ pub struct ConnectionSpec {
     pub peer: ConnectionId,
     pub address: FabricAddress,
     pub hca_numa: Option<u16>,
-    /// Topology labels for the peer, propagated from
-    /// `PeerSpec.labels`. Consumed by the p2p FingerTable's
+    /// Topology tags for the peer, propagated from
+    /// `PeerSpec.tags`. Consumed by the p2p FingerTable's
     /// topology-distance heuristic when peers are added to the local
     /// routing table; ignored by the fabric itself.
-    pub labels: Vec<String>,
+    pub tags: Vec<String>,
 }
 
 /// Newtype around a buffer-pool page so the fabric layer can attach

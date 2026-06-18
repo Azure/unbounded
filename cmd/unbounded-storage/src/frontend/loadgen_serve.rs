@@ -49,7 +49,7 @@ impl LoadgenFrontend {
             }
         };
         Ok(Self {
-            id: spec.id.clone(),
+            id: spec.name.clone(),
             workers: default_u32(loadgen.workers, DEFAULT_WORKERS),
             seed: default_u64(loadgen.seed, DEFAULT_SEED),
             object_count: default_u64(loadgen.object_count, DEFAULT_OBJECT_COUNT),
@@ -289,8 +289,8 @@ mod tests {
 
     fn loadgen_spec() -> FrontendSpec {
         FrontendSpec {
-            id: "lg".to_string(),
-            binds_to: "cache".to_string(),
+            name: "lg".to_string(),
+            source: "cache".to_string(),
             config: Some(frontend_spec::Config::Loadgen(
                 LoadgenFrontendConfig::default(),
             )),

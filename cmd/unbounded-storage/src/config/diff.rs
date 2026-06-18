@@ -117,15 +117,15 @@ mod tests {
         let a = base();
         let mut b = base();
         b.neighborhoods.push(NeighborhoodSpec {
-            id: "n".to_string(),
-            binds_to: "b".to_string(),
+            name: "n".to_string(),
+            source: "b".to_string(),
             fingers_per_node: 100,
             local_node_id: Some(1),
-            local_labels: vec![],
+            local_tags: vec![],
             routing_plan: None,
             peers: vec![PeerSpec {
                 id: 2,
-                labels: vec![],
+                tags: vec![],
                 config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
                     addr: "127.0.0.1:9000".to_string(),
                 })),
@@ -141,11 +141,11 @@ mod tests {
         let a = base();
         let mut b = base();
         b.neighborhoods.push(NeighborhoodSpec {
-            id: "n".to_string(),
-            binds_to: "b".to_string(),
+            name: "n".to_string(),
+            source: "b".to_string(),
             fingers_per_node: 64,
             local_node_id: None,
-            local_labels: vec![],
+            local_tags: vec![],
             routing_plan: None,
             peers: vec![],
         });
@@ -159,15 +159,16 @@ mod tests {
         let a = base();
         let mut b = base();
         b.caches.push(CacheSpec {
-            id: "c".to_string(),
-            binds_to: "n".to_string(),
+            name: "c".to_string(),
+            source: "n".to_string(),
             disks: vec![DiskSpec {
-                path: "/dev/nvme0n1".to_string(),
                 queue_depth: None,
                 page_size_bytes: None,
-                bypass_admission: false,
-                skip_recovery_scan_if_no_meta: false,
-                config: Some(disk_spec::Config::Block(BlockDiskConfig { numa: None })),
+                skip_recovery_scan: false,
+                config: Some(disk_spec::Config::Block(BlockDiskConfig {
+                    numa: None,
+                    path: "/dev/nvme0n1".to_string(),
+                })),
             }],
         });
         let d = ConfigDiff::between(&a, &b);
@@ -181,9 +182,9 @@ mod tests {
         let a = base();
         let mut b = base();
         b.backends.push(BackendSpec {
-            id: "b".to_string(),
+            name: "b".to_string(),
             config: Some(backend_spec::Config::Http(HttpBackendConfig {
-                endpoint: "https://example.com".to_string(),
+                url: "https://example.com".to_string(),
                 stripe_size_bytes: 4 * 1024 * 1024,
                 http_concurrency: 64,
             })),
@@ -199,8 +200,8 @@ mod tests {
         let a = base();
         let mut b = base();
         b.frontends.push(FrontendSpec {
-            id: "f".to_string(),
-            binds_to: "b".to_string(),
+            name: "f".to_string(),
+            source: "b".to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: "0.0.0.0:9000".to_string(),
             })),

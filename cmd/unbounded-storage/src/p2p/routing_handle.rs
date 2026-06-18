@@ -134,13 +134,13 @@ impl RouteTableHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::p2p::{FingerTableConfig, PeerEntry, TopologyLabels, node_to_ring};
+    use crate::p2p::{FingerTableConfig, PeerEntry, TopologyTags, node_to_ring};
 
     fn peer(node: u64) -> PeerEntry {
         PeerEntry {
             node: NodeId(node),
             ring: node_to_ring(NodeId(node)),
-            labels: TopologyLabels(vec!["r".to_string()]),
+            tags: TopologyTags(vec!["r".to_string()]),
         }
     }
 

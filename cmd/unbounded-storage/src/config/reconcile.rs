@@ -134,7 +134,7 @@ pub fn reconcile_connections(
             if let Some(old_spec) = prev.get(id) {
                 if old_spec.address != new_spec.address
                     || old_spec.hca_numa != new_spec.hca_numa
-                    || old_spec.labels != new_spec.labels
+                    || old_spec.tags != new_spec.tags
                 {
                     to_update.insert(*id);
                 }
@@ -209,7 +209,7 @@ pub fn reconcile_connections(
     // id-not-in-current branch rather than re-detect drift.
     //
     // For a peer that is still desired and was NOT part of an update
-    // (`to_update`), every observable field - addr, hca, and labels -
+    // (`to_update`), every observable field - addr, hca, and tags -
     // already matches the last applied spec by construction, so
     // recording the desired spec is equivalent to keeping the old
     // one. Ids that are not desired (plain failed-remove) or that are
@@ -233,7 +233,7 @@ pub fn reconcile_connections(
 }
 
 /// Reconciliation target for the origin-tier backends, keyed by
-/// `id`. Mirrors [`PeerReconcileTarget`]: the live config watcher
+/// `name`. Mirrors [`PeerReconcileTarget`]: the live config watcher
 /// drives the runtime registry toward a desired set, the trait is the
 /// seam so the reconciler is unit-testable without a real registry.
 /// The backend runtime does not exist yet, so today the only
@@ -242,17 +242,17 @@ pub fn reconcile_connections(
 pub trait BackendReconcileTarget {
     fn list(&self) -> Vec<String>;
     fn add(&self, spec: &BackendSpec) -> Result<(), String>;
-    fn remove(&self, id: &str) -> Result<(), String>;
+    fn remove(&self, name: &str) -> Result<(), String>;
 }
 
 /// Reconciliation target for the workload-facing frontends, keyed by
-/// `id`. Mirrors [`PeerReconcileTarget`]; see
+/// `name`. Mirrors [`PeerReconcileTarget`]; see
 /// [`BackendReconcileTarget`] for the rationale on why only a test
 /// mock implements it today.
 pub trait FrontendReconcileTarget {
     fn list(&self) -> Vec<String>;
     fn add(&self, spec: &FrontendSpec) -> Result<(), String>;
-    fn remove(&self, id: &str) -> Result<(), String>;
+    fn remove(&self, name: &str) -> Result<(), String>;
 }
 
 /// Outcome of one [`reconcile_backends`] / [`reconcile_frontends`]
@@ -266,7 +266,7 @@ pub struct SpecReconcileReport<S> {
     pub removed: usize,
     pub updated: usize,
     pub failures: Vec<(String, String)>,
-    /// Ids whose `add` was intentionally skipped this pass (rather than
+    /// Names whose `add` was intentionally skipped this pass (rather than
     /// failed): used by the combined backend/frontend orchestrator to
     /// record a frontend deferred because its referenced backend was
     /// not yet present. Empty for plain `reconcile_backends` /
@@ -292,25 +292,27 @@ pub type BackendReconcileReport = SpecReconcileReport<BackendSpec>;
 pub type FrontendReconcileReport = SpecReconcileReport<FrontendSpec>;
 
 /// Drive `target` toward the backend set described by `desired`,
-/// keyed by `id`.
+/// keyed by component name.
 ///
 /// The semantics mirror [`reconcile_peers`] exactly, specialized to
 /// the string-keyed `BackendSpec`: removals first, then additions; an
-/// id present in both `current` and `desired` whose spec differs from
+/// name present in both `current` and `desired` whose spec differs from
 /// `last_applied` is a remove-then-add ("update"); failures are
 /// accumulated and never abort the pass; the returned `applied` map is
 /// the set the target now holds and is the caller's input on the next
 /// pass. The failure carry-forward rules match `reconcile_peers`: a
 /// failed update-remove or plain remove preserves the old spec so the
 /// next pass retries, while a failed update-add (remove succeeded)
-/// drops the id so the next pass re-adds via the not-current branch.
+/// drops the name so the next pass re-adds via the not-current branch.
 pub fn reconcile_backends(
     target: &dyn BackendReconcileTarget,
     desired: &[BackendSpec],
     last_applied: Option<&HashMap<String, BackendSpec>>,
 ) -> BackendReconcileReport {
-    let desired_map: HashMap<String, BackendSpec> =
-        desired.iter().map(|b| (b.id.clone(), b.clone())).collect();
+    let desired_map: HashMap<String, BackendSpec> = desired
+        .iter()
+        .map(|b| (b.name.clone(), b.clone()))
+        .collect();
     reconcile_specs(
         &desired_map,
         last_applied,
@@ -321,15 +323,17 @@ pub fn reconcile_backends(
 }
 
 /// Drive `target` toward the frontend set described by `desired`,
-/// keyed by `id`. Semantics mirror [`reconcile_backends`] /
+/// keyed by component name. Semantics mirror [`reconcile_backends`] /
 /// [`reconcile_peers`].
 pub fn reconcile_frontends(
     target: &dyn FrontendReconcileTarget,
     desired: &[FrontendSpec],
     last_applied: Option<&HashMap<String, FrontendSpec>>,
 ) -> FrontendReconcileReport {
-    let desired_map: HashMap<String, FrontendSpec> =
-        desired.iter().map(|f| (f.id.clone(), f.clone())).collect();
+    let desired_map: HashMap<String, FrontendSpec> = desired
+        .iter()
+        .map(|f| (f.name.clone(), f.clone()))
+        .collect();
     reconcile_specs(
         &desired_map,
         last_applied,
@@ -342,7 +346,7 @@ pub fn reconcile_frontends(
 /// Shared string-keyed reconcile core for backends and frontends.
 ///
 /// Factored out because the two specs differ only in their concrete
-/// type, not in the diff algorithm. An id whose desired spec is not
+/// type, not in the diff algorithm. A name whose desired spec is not
 /// equal to its `last_applied` spec is treated as an update
 /// (remove-then-add). The carry-forward rules are identical to
 /// [`reconcile_peers`].
@@ -556,11 +560,11 @@ pub fn reconcile_backends_and_frontends(
 ) -> ResourceReconcileReport {
     let desired_backend_map: HashMap<String, BackendSpec> = desired_backends
         .iter()
-        .map(|b| (b.id.clone(), b.clone()))
+        .map(|b| (b.name.clone(), b.clone()))
         .collect();
     let desired_frontend_map: HashMap<String, FrontendSpec> = desired_frontends
         .iter()
-        .map(|f| (f.id.clone(), f.clone()))
+        .map(|f| (f.name.clone(), f.clone()))
         .collect();
 
     // 1. Frontend removals, so they land before any backend removal.
@@ -683,7 +687,7 @@ mod tests {
     fn peer(id: u64) -> PeerSpec {
         PeerSpec {
             id,
-            labels: Vec::new(),
+            tags: Vec::new(),
             config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
                 addr: format!("10.0.0.{id}:9000"),
             })),
@@ -693,17 +697,17 @@ mod tests {
     fn peer_addr(id: u64, addr: &str) -> PeerSpec {
         PeerSpec {
             id,
-            labels: Vec::new(),
+            tags: Vec::new(),
             config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
                 addr: addr.to_string(),
             })),
         }
     }
 
-    fn peer_labels(id: u64, labels: &[&str]) -> PeerSpec {
+    fn peer_tags(id: u64, tags: &[&str]) -> PeerSpec {
         PeerSpec {
             id,
-            labels: labels.iter().map(|s| s.to_string()).collect(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
             config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
                 addr: format!("10.0.0.{id}:9000"),
             })),
@@ -800,17 +804,17 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_label_only_change_churns_connection() {
-        // A relabel with identical address/hca_numa must drive a
-        // remove-then-add so the new labels reach the runtime, and
-        // the tracked applied spec must reflect the NEW labels.
+    fn reconcile_tag_only_change_churns_connection() {
+        // Retagging with identical address/hca_numa must drive a
+        // remove-then-add so the new tags reach the runtime, and
+        // the tracked applied spec must reflect the NEW tags.
         let t = MockTarget::new(&[1]);
         let mut prev = HashMap::new();
         prev.insert(
             PeerId(1),
-            peer_spec_to_connection(&peer_labels(1, &["us-west"])),
+            peer_spec_to_connection(&peer_tags(1, &["us-west"])),
         );
-        let peers = vec![peer_labels(1, &["us-east", "rack9"])];
+        let peers = vec![peer_tags(1, &["us-east", "rack9"])];
         let r = reconcile_peers(&t, &peers, Some(&prev));
         assert_eq!(r.added, 0);
         assert_eq!(r.removed, 0);
@@ -818,9 +822,9 @@ mod tests {
         assert!(r.failures.is_empty());
         // The connection was churned via remove-then-add.
         assert_eq!(*t.ops.borrow(), vec![Op::Remove(1), Op::Add(1)]);
-        // Applied state carries the freshest desired labels.
+        // Applied state carries the freshest desired tags.
         assert_eq!(
-            r.applied[&PeerId(1)].labels,
+            r.applied[&PeerId(1)].tags,
             vec!["us-east".to_string(), "rack9".to_string()]
         );
         // Address/HCA are unchanged.
@@ -1007,7 +1011,7 @@ mod tests {
             self.do_list()
         }
         fn add(&self, spec: &BackendSpec) -> Result<(), String> {
-            self.do_add(&spec.id)
+            self.do_add(&spec.name)
         }
         fn remove(&self, id: &str) -> Result<(), String> {
             self.do_remove(id)
@@ -1019,18 +1023,18 @@ mod tests {
             self.do_list()
         }
         fn add(&self, spec: &FrontendSpec) -> Result<(), String> {
-            self.do_add(&spec.id)
+            self.do_add(&spec.name)
         }
         fn remove(&self, id: &str) -> Result<(), String> {
             self.do_remove(id)
         }
     }
 
-    fn backend(id: &str, endpoint: &str) -> BackendSpec {
+    fn backend(id: &str, url: &str) -> BackendSpec {
         BackendSpec {
-            id: id.to_string(),
+            name: id.to_string(),
             config: Some(backend_spec::Config::Http(HttpBackendConfig {
-                endpoint: endpoint.to_string(),
+                url: url.to_string(),
                 stripe_size_bytes: 4 * 1024 * 1024,
                 http_concurrency: 64,
             })),
@@ -1039,8 +1043,8 @@ mod tests {
 
     fn frontend(id: &str, backend_id: &str) -> FrontendSpec {
         FrontendSpec {
-            id: id.to_string(),
-            binds_to: backend_id.to_string(),
+            name: id.to_string(),
+            source: backend_id.to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: "0.0.0.0:9000".to_string(),
             })),
@@ -1050,7 +1054,7 @@ mod tests {
     fn frontend_backends(frontends: &[FrontendSpec]) -> HashMap<String, String> {
         frontends
             .iter()
-            .map(|f| (f.id.clone(), f.binds_to.clone()))
+            .map(|f| (f.name.clone(), f.source.clone()))
             .collect()
     }
 
@@ -1088,8 +1092,8 @@ mod tests {
     fn reconcile_backends_detects_change_as_update() {
         let t = SpecMock::new(&["a"]);
         let mut prev = HashMap::new();
-        prev.insert("a".to_string(), backend("a", "old-endpoint"));
-        let desired = vec![backend("a", "new-endpoint")];
+        prev.insert("a".to_string(), backend("a", "old-url"));
+        let desired = vec![backend("a", "new-url")];
         let r = reconcile_backends(&t, &desired, Some(&prev));
         assert_eq!(r.added, 0);
         assert_eq!(r.removed, 0);
@@ -1099,7 +1103,7 @@ mod tests {
             *t.ops.borrow(),
             vec![SpecOp::Remove("a".into()), SpecOp::Add("a".into())]
         );
-        assert_eq!(r.applied["a"].endpoint(), Some("new-endpoint"));
+        assert_eq!(r.applied["a"].url(), Some("new-url"));
     }
 
     #[test]
@@ -1142,7 +1146,7 @@ mod tests {
         assert_eq!(r.updated, 0);
         assert_eq!(r.failures.len(), 1);
         assert!(r.failures[0].1.starts_with("update-remove:"));
-        assert_eq!(r.applied["a"].endpoint(), Some("old"));
+        assert_eq!(r.applied["a"].url(), Some("old"));
         assert_eq!(*t.ops.borrow(), vec![SpecOp::Remove("a".into())]);
     }
 
@@ -1166,7 +1170,7 @@ mod tests {
             *t2.ops.borrow(),
             vec![SpecOp::Remove("f1".into()), SpecOp::Add("f1".into())]
         );
-        assert_eq!(r2.applied["f1"].binds_to, "b2");
+        assert_eq!(r2.applied["f1"].source, "b2");
 
         // Remove: no longer desired.
         let t3 = SpecMock::new(&["f1"]);
@@ -1216,11 +1220,11 @@ mod tests {
         fn add(&self, spec: &BackendSpec) -> Result<(), String> {
             self.log
                 .borrow_mut()
-                .push(format!("backend-add:{}", spec.id));
-            if self.fail_backend_add.as_deref() == Some(spec.id.as_str()) {
+                .push(format!("backend-add:{}", spec.name));
+            if self.fail_backend_add.as_deref() == Some(spec.name.as_str()) {
                 return Err("forced failure".to_string());
             }
-            self.backends.borrow_mut().insert(spec.id.clone());
+            self.backends.borrow_mut().insert(spec.name.clone());
             Ok(())
         }
         fn remove(&self, id: &str) -> Result<(), String> {
@@ -1239,8 +1243,8 @@ mod tests {
         fn add(&self, spec: &FrontendSpec) -> Result<(), String> {
             self.log
                 .borrow_mut()
-                .push(format!("frontend-add:{}", spec.id));
-            self.frontends.borrow_mut().insert(spec.id.clone());
+                .push(format!("frontend-add:{}", spec.name));
+            self.frontends.borrow_mut().insert(spec.name.clone());
             Ok(())
         }
         fn remove(&self, id: &str) -> Result<(), String> {

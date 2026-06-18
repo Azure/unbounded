@@ -8,7 +8,7 @@
 //! [`OriginRef::backend_id`](crate::storage::OriginRef), stamped by the
 //! frontend that accepted it, so the data path can resolve which
 //! configured backend to fetch from per request. [`BackendRegistry`]
-//! owns the `id -> OriginBackend` map behind an [`ArcSwap`] so the
+//! owns the `name -> OriginBackend` map behind an [`ArcSwap`] so the
 //! config watcher can add, remove, or replace a backend at runtime
 //! without tearing down the shard: a reconcile pass builds the new map
 //! and publishes it atomically, and the next fetch observes it.
@@ -49,7 +49,7 @@ struct BuildCtx {
     backing_base: *mut u8,
 }
 
-/// A shard-local set of origin backends keyed by `id`, swappable at
+/// A shard-local set of origin backends keyed by component name, swappable at
 /// runtime. Clones share the same underlying map (cheap `Arc` clone),
 /// so a clone handed to the control-drain tick hook reconciles the
 /// very map the data path reads.
@@ -72,7 +72,7 @@ unsafe impl Sync for BackendRegistry {}
 impl BackendRegistry {
     /// Build a registry seeded from `specs`, fetching through `ring`
     /// into the region based at `backing_base`. A spec that fails to
-    /// build (e.g. an endpoint that does not resolve) aborts the seed
+    /// build (e.g. a URL that does not resolve) aborts the seed
     /// with the error, because startup must fail loudly rather than
     /// silently drop a configured backend.
     pub fn new(
@@ -88,7 +88,7 @@ impl BackendRegistry {
         };
         let mut map: HashMap<String, Arc<OriginBackend>> = HashMap::with_capacity(specs.len());
         for spec in specs {
-            map.insert(spec.id.clone(), Arc::new(ctx.build(spec)?));
+            map.insert(spec.name.clone(), Arc::new(ctx.build(spec)?));
         }
         Ok(Self {
             backends: Arc::new(ArcSwap::from_pointee(map)),
@@ -102,7 +102,7 @@ impl BackendRegistry {
         self.backends.load().len()
     }
 
-    /// Whether a backend with `id` is currently registered.
+    /// Whether a backend with `name` is currently registered.
     #[cfg(test)]
     pub fn contains(&self, id: &str) -> bool {
         self.backends.load().contains_key(id)
@@ -120,17 +120,17 @@ impl BackendRegistry {
 impl BuildCtx {
     /// Build one [`OriginBackend`] from `spec`, selecting the concrete
     /// origin implementation by [`BackendSpec::config`]. For an `s3`
-    /// backend the origin IP is resolved from the endpoint the same way
+    /// backend the origin IP is resolved from the URL the same way
     /// as for HTTP (IPv4-only, v1), but the host authority is extracted
     /// separately for the `Host:` header.
     fn build(&self, spec: &BackendSpec) -> io::Result<OriginBackend> {
         match spec.config.as_ref() {
             Some(backend_spec::Config::Http(cfg)) => {
-                let origin = HttpBackend::resolve_origin(&cfg.endpoint)?;
+                let origin = HttpBackend::resolve_origin(&cfg.url)?;
                 Ok(OriginBackend::Http(HttpBackend::new(
                     self.ring.clone(),
                     origin,
-                    spec.id.clone(),
+                    spec.name.clone(),
                     cfg.stripe_size_bytes,
                     self.page_size,
                     self.backing_base,
@@ -138,13 +138,13 @@ impl BuildCtx {
                 )))
             }
             Some(backend_spec::Config::S3(cfg)) => {
-                let origin = S3Backend::resolve_origin(&cfg.endpoint)?;
-                let host = extract_host_authority(&cfg.endpoint);
+                let origin = S3Backend::resolve_origin(&cfg.url)?;
+                let host = extract_host_authority(&cfg.url);
                 Ok(OriginBackend::S3(S3Backend::new(
                     self.ring.clone(),
                     origin,
                     host,
-                    spec.id.clone(),
+                    spec.name.clone(),
                     cfg.stripe_size_bytes,
                     self.page_size,
                     self.backing_base,
@@ -152,13 +152,13 @@ impl BuildCtx {
                 )))
             }
             Some(backend_spec::Config::Azure(cfg)) => {
-                let origin = AzureBackend::resolve_origin(&cfg.endpoint)?;
-                let host = extract_host_authority(&cfg.endpoint);
+                let origin = AzureBackend::resolve_origin(&cfg.url)?;
+                let host = extract_host_authority(&cfg.url);
                 Ok(OriginBackend::Azure(AzureBackend::new(
                     self.ring.clone(),
                     origin,
                     host,
-                    spec.id.clone(),
+                    spec.name.clone(),
                     cfg.stripe_size_bytes,
                     self.page_size,
                     self.backing_base,
@@ -166,14 +166,14 @@ impl BuildCtx {
                 )))
             }
             Some(backend_spec::Config::Fake(cfg)) => Ok(OriginBackend::Fake(FakeBackend::new(
-                spec.id.clone(),
+                spec.name.clone(),
                 cfg.object_size_bytes,
                 self.page_size,
                 self.backing_base,
             ))),
             None => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("backend {} missing config", spec.id),
+                format!("backend {} missing config", spec.name),
             )),
         }
     }
@@ -215,10 +215,10 @@ impl BackendReconcileTarget for BackendRegistry {
         let backend = self
             .ctx
             .build(spec)
-            .map_err(|e| format!("build backend {}: {e}", spec.id))?;
+            .map_err(|e| format!("build backend {}: {e}", spec.name))?;
         let built = Arc::new(backend);
         self.mutate(|map| {
-            map.insert(spec.id.clone(), built);
+            map.insert(spec.name.clone(), built);
         });
         Ok(())
     }
@@ -268,16 +268,16 @@ impl PageStream for RegistryFetchStream {
     }
 }
 
-/// Extract the `host[:port]` authority from a backend `endpoint` for
+/// Extract the `host[:port]` authority from a backend `url` for
 /// use as the S3 `Host:` header.
 ///
 /// Strips an optional `scheme://` prefix and any `/path` or `?query`
 /// suffix, but preserves the port so the `Host:` header stays
 /// RFC 7230 conformant for custom-port origins (e.g. MinIO on `:9000`).
-fn extract_host_authority(endpoint: &str) -> String {
-    let after_scheme = match endpoint.split_once("://") {
+fn extract_host_authority(url: &str) -> String {
+    let after_scheme = match url.split_once("://") {
         Some((_, rest)) => rest,
-        None => endpoint,
+        None => url,
     };
     after_scheme
         .split(['/', '?'])
@@ -295,11 +295,11 @@ mod tests {
 
     use super::*;
 
-    fn http_spec(id: &str, endpoint: &str) -> BackendSpec {
+    fn http_spec(id: &str, url: &str) -> BackendSpec {
         BackendSpec {
-            id: id.to_string(),
+            name: id.to_string(),
             config: Some(backend_spec::Config::Http(HttpBackendConfig {
-                endpoint: endpoint.to_string(),
+                url: url.to_string(),
                 stripe_size_bytes: 4 * 1024 * 1024,
                 http_concurrency: 64,
             })),
@@ -308,7 +308,7 @@ mod tests {
 
     fn fake_spec(id: &str, object_size: u64) -> BackendSpec {
         BackendSpec {
-            id: id.to_string(),
+            name: id.to_string(),
             config: Some(backend_spec::Config::Fake(FakeBackendConfig {
                 stripe_size_bytes: 4 * 1024 * 1024,
                 object_size_bytes: object_size,
@@ -374,11 +374,11 @@ mod tests {
     }
 
     #[test]
-    fn add_with_unresolvable_endpoint_leaves_map_untouched() {
+    fn add_with_unresolvable_url_leaves_map_untouched() {
         let reg = registry(&[http_spec("a", "127.0.0.1:1")]);
         let err = reg
-            .add(&http_spec("b", "this is not a valid endpoint"))
-            .expect_err("bad endpoint should fail to build");
+            .add(&http_spec("b", "this is not a valid url"))
+            .expect_err("bad url should fail to build");
         assert!(err.contains("build backend b"), "unexpected error: {err}");
         // The failed build must not have disturbed the live map.
         assert_eq!(reg.len(), 1);
@@ -405,8 +405,8 @@ mod tests {
     }
 
     #[test]
-    fn seeds_a_fake_backend_with_no_endpoint() {
-        // A fake backend needs no endpoint and no ring, so it must build
+    fn seeds_a_fake_backend_with_no_url() {
+        // A fake backend needs no URL and no ring, so it must build
         // even against the null backing base these tests use.
         let reg = registry(&[fake_spec("synthetic", 1024 * 1024)]);
         assert_eq!(reg.len(), 1);
