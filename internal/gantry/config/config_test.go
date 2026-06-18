@@ -218,6 +218,7 @@ upstream_registries:
     endpoint: https://registry.example.com
     credentials_path: /etc/gantry/creds.txt
 hrw_k: 5
+coord_peer_authz_enforce: true
 nf5_jitter_base: 7s
 log_level: debug
 `)
@@ -237,6 +238,10 @@ log_level: debug
 
 	if c.HRWK != 5 {
 		t.Errorf("HRWK = %d, want 5", c.HRWK)
+	}
+
+	if !c.CoordPeerAuthzEnforce {
+		t.Error("CoordPeerAuthzEnforce = false, want true")
 	}
 
 	if c.NF5JitterBase != 7*time.Second {

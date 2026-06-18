@@ -415,9 +415,11 @@ func runAgent(args []string) error {
 			OnPleasePullServed:             func() { p3.coordPleasePullServed.Inc() },
 			OnPleasePullStarted:            func() { p3.coordPleasePullStarted.Inc() },
 			OnStreamError:                  func() { p3.coordStreamError.Inc() },
+			OnUnauthorizedPeer:             func() { p3.coordUnauthorizedPeer.Inc() },
 		}),
 		coord.WithNegativeCache(negCacheAdapter{c: negCache}),
 		coord.WithPullerPump(pullerPump),
+		coord.WithPeerAuthz(c.CoordPeerAuthzEnforce),
 	}
 	coordServer := coord.NewServer(cstore, memberView, inflightMap, coordOpts...)
 	coordServer.Bind(disco.LibP2P())

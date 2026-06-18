@@ -107,6 +107,11 @@ type MetricsHooks struct {
 	OnPleasePullStarted func()
 	// OnStreamError fires for any malformed or oversized stream.
 	OnStreamError func()
+	// OnUnauthorizedPeer fires once per inbound request whose remote
+	// libp2p peer ID is not present in the current membership view.
+	// It fires in both observe-only and enforce mode so operators can
+	// size the false-positive rate before flipping enforcement on.
+	OnUnauthorizedPeer func()
 }
 
 // Server handles inbound coord streams: pull_intent_query and
@@ -133,6 +138,9 @@ type Server struct {
 	streamHandshakeTimeout time.Duration
 	// streamSem bounds concurrent inbound stream handlers.
 	streamSem chan struct{}
+	// authzEnforce flips peer authorization from observe-only (record
+	// the metric, still serve) to enforce (reject before dispatch).
+	authzEnforce bool
 }
 
 // NegativeCache is the read interface coord needs from the
@@ -206,6 +214,18 @@ func WithMaxConcurrentStreams(n int) Option {
 			s.streamSem = make(chan struct{}, n)
 		}
 	}
+}
+
+// WithPeerAuthz configures peer authorization for inbound coord requests.
+//
+// Authorization compares the dialing peer's libp2p peer ID against the
+// PeerID values published in the current membership view. When enforce is
+// false (the default) an unrecognised peer is recorded via
+// MetricsHooks.OnUnauthorizedPeer and still served, so operators can size
+// the false-positive rate before flipping enforcement on. When enforce is
+// true an unrecognised peer is rejected before its request is dispatched.
+func WithPeerAuthz(enforce bool) Option {
+	return func(s *Server) { s.authzEnforce = enforce }
 }
 
 // NewServer constructs a coord server. The store + members + inflight
@@ -322,6 +342,10 @@ func (s *Server) handleStream(str network.Stream) {
 }
 
 func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envelope) (*coordv1.Envelope, error) {
+	if !s.authorizePeer(remote) && s.authzEnforce {
+		return nil, fmt.Errorf("coord: unauthorized peer %s", remote)
+	}
+
 	switch m := in.GetMsg().(type) {
 	case *coordv1.Envelope_PullIntentRequest:
 		resp, err := s.servePullIntent(ctx, m.PullIntentRequest)
@@ -350,6 +374,75 @@ func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envel
 	default:
 		return nil, fmt.Errorf("coord: unexpected message %T (this side is a server only)", m)
 	}
+}
+
+// authorizePeer reports whether remote is a recognised cluster member.
+//
+// It compares remote's libp2p peer ID against the PeerID values published
+// in the current membership snapshot. members.Snapshot() is treated as
+// telemetry input, not an authoritative security oracle:
+//
+//   - A node that has not yet published its gantry.io/peer-id annotation
+//     has an empty PeerID; empty PeerIDs are ignored so they never match.
+//   - When NO member has published a peer ID yet (cold boot, informer lag,
+//     a single-self dev membership), authorization cannot be evaluated. In
+//     observe-only mode authorizePeer returns true and stays quiet so bootstrap
+//     traffic does not generate unauthorized-peer noise. In enforce mode the
+//     same state is rejected because the operator explicitly requested a hard
+//     gate and should not get a silent fail-open.
+//
+// On a genuine miss (the membership view has published peer IDs but none
+// match) the OnUnauthorizedPeer metric fires and a warning is logged in
+// both observe-only and enforce mode; the boolean return then drives the
+// enforce-mode rejection in dispatch.
+func (s *Server) authorizePeer(remote peer.ID) bool {
+	if s.members == nil {
+		return true
+	}
+
+	want := remote.String()
+
+	known := 0
+
+	for _, n := range s.members.Snapshot() {
+		if n.PeerID == "" {
+			continue
+		}
+
+		known++
+
+		if n.PeerID == want {
+			return true
+		}
+	}
+
+	if known == 0 {
+		if !s.authzEnforce {
+			return true
+		}
+
+		if s.hooks.OnUnauthorizedPeer != nil {
+			s.hooks.OnUnauthorizedPeer()
+		}
+
+		s.logger.Warn("coord: peer authorization unevaluable",
+			slog.String("peer", want),
+			slog.Bool("enforce", s.authzEnforce),
+		)
+
+		return false
+	}
+
+	if s.hooks.OnUnauthorizedPeer != nil {
+		s.hooks.OnUnauthorizedPeer()
+	}
+
+	s.logger.Warn("coord: unauthorized peer",
+		slog.String("peer", want),
+		slog.Bool("enforce", s.authzEnforce),
+	)
+
+	return false
 }
 
 func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentRequest) (*coordv1.PullIntentResponse, error) {

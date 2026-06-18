@@ -150,6 +150,7 @@ type phase3Metrics struct {
 	coordPleasePullServed             prometheus.Counter
 	coordPleasePullStarted            prometheus.Counter
 	coordStreamError                  prometheus.Counter
+	coordUnauthorizedPeer             prometheus.Counter
 	prefetchBatchesTotal              prometheus.Counter
 	prefetchDigestsTotal              prometheus.Counter
 	prefetchPullersPerBatch           prometheus.Histogram
@@ -200,6 +201,10 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		coordStreamError: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_stream_error_total",
 			Help: "Malformed or oversized coord streams rejected by this node.",
+		}),
+		coordUnauthorizedPeer: reg.NewCounter("coord", prometheus.CounterOpts{
+			Name: "p2p_coord_unauthorized_peer_total",
+			Help: "Inbound coord requests whose libp2p peer ID was not found in the membership view, or whose membership view had no published peer IDs under enforce mode. Fires in observe-only for recognized misses and in enforce mode for both misses and unevaluable membership. Verify peer-id annotations are published before using zero as an enforcement-readiness signal.",
 		}),
 		prefetchBatchesTotal: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_prefetch_batches_total",

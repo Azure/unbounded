@@ -122,6 +122,13 @@ data:
     hrw_k: 3
     hrw_topology_scope: "cluster"
     zone_label_key: "topology.kubernetes.io/zone"
+    # Coord peer authorization. Default false ships observe-only: an
+    # inbound coord request from a peer not in the membership view only
+    # increments p2p_coord_unauthorized_peer_total and is still served.
+    # Flip to true to reject such requests only after peer-id
+    # annotations are visible for every ready Gantry pod and the metric
+    # stays at zero across a full DaemonSet rollout.
+    coord_peer_authz_enforce: false
 
     # ---------- DHT / NF5 (§7.7) ----------
     nf5_jitter_base: "3s"

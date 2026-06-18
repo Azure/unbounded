@@ -539,3 +539,185 @@ func rep(c byte, n int) string {
 
 	return string(b)
 }
+
+// TestPeerAuthz_ObserveOnlyServesAndCounts asserts that, with enforcement
+// off (the default), an inbound request from a peer absent from the
+// membership view is still served but increments the unauthorized-peer
+// metric so operators can size the false-positive rate.
+func TestPeerAuthz_ObserveOnlyServesAndCounts(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	// Membership knows the server but NOT the client peer, and publishes a
+	// non-empty PeerID so authorization can actually be evaluated.
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
+		ifaces.Node{ID: "server-node", PeerID: hServer.ID().String()},
+	)
+
+	var unauthorized int32
+
+	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
+		coord.WithMetrics(coord.MetricsHooks{
+			OnUnauthorizedPeer: func() { atomic.AddInt32(&unauthorized, 1) },
+		}),
+	)
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	if _, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d); err != nil {
+		t.Fatalf("PullIntentQuery (observe-only must still serve): %v", err)
+	}
+
+	if got := atomic.LoadInt32(&unauthorized); got != 1 {
+		t.Fatalf("unauthorized metric = %d, want 1", got)
+	}
+}
+
+// TestPeerAuthz_EnforceRejectsUnknownPeer asserts that, with enforcement
+// on, an inbound request from a peer absent from the membership view is
+// rejected before dispatch and still counted.
+func TestPeerAuthz_EnforceRejectsUnknownPeer(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
+		ifaces.Node{ID: "server-node", PeerID: hServer.ID().String()},
+	)
+
+	var unauthorized int32
+
+	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
+		coord.WithPeerAuthz(true),
+		coord.WithMetrics(coord.MetricsHooks{
+			OnUnauthorizedPeer: func() { atomic.AddInt32(&unauthorized, 1) },
+		}),
+	)
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	if _, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d); err == nil {
+		t.Fatal("PullIntentQuery: want rejection under enforce mode, got nil error")
+	}
+
+	if got := atomic.LoadInt32(&unauthorized); got != 1 {
+		t.Fatalf("unauthorized metric = %d, want 1", got)
+	}
+}
+
+// TestPeerAuthz_EnforceAllowsKnownPeer asserts an authorized peer (its
+// libp2p peer ID is published in the membership view) is served under
+// enforce mode and never trips the unauthorized-peer metric.
+func TestPeerAuthz_EnforceAllowsKnownPeer(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
+		ifaces.Node{ID: "server-node", PeerID: hServer.ID().String()},
+		ifaces.Node{ID: "client-node", PeerID: hClient.ID().String()},
+	)
+
+	var unauthorized int32
+
+	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
+		coord.WithPeerAuthz(true),
+		coord.WithMetrics(coord.MetricsHooks{
+			OnUnauthorizedPeer: func() { atomic.AddInt32(&unauthorized, 1) },
+		}),
+	)
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	if _, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d); err != nil {
+		t.Fatalf("PullIntentQuery (known peer must be served): %v", err)
+	}
+
+	if got := atomic.LoadInt32(&unauthorized); got != 0 {
+		t.Fatalf("unauthorized metric = %d, want 0", got)
+	}
+}
+
+// TestPeerAuthz_ObserveOnlyFailsOpenWhenNoPeerIDsPublished asserts that when
+// no member has published a libp2p peer ID yet (cold boot, informer lag),
+// observe-only mode does not generate unauthorized-peer noise and still serves.
+func TestPeerAuthz_ObserveOnlyFailsOpenWhenNoPeerIDsPublished(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	// Members exist but none have a published PeerID (annotation not set
+	// yet). In observe-only mode, authorization is unevaluable -> fail open
+	// without metric noise.
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
+		ifaces.Node{ID: "server-node", Addr: "x"},
+		ifaces.Node{ID: "client-node", Addr: "y"},
+	)
+
+	var unauthorized int32
+
+	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
+		coord.WithMetrics(coord.MetricsHooks{
+			OnUnauthorizedPeer: func() { atomic.AddInt32(&unauthorized, 1) },
+		}),
+	)
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	if _, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d); err != nil {
+		t.Fatalf("PullIntentQuery (observe-only unevaluable authz must serve): %v", err)
+	}
+
+	if got := atomic.LoadInt32(&unauthorized); got != 0 {
+		t.Fatalf("unauthorized metric = %d, want 0 (cannot evaluate -> no miss)", got)
+	}
+}
+
+// TestPeerAuthz_EnforceRejectsWhenNoPeerIDsPublished asserts that enforcement
+// is a hard gate. If no PeerIDs are published, authorization is unevaluable and
+// must reject rather than silently failing open.
+func TestPeerAuthz_EnforceRejectsWhenNoPeerIDsPublished(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()),
+		ifaces.Node{ID: "server-node", Addr: "x"},
+		ifaces.Node{ID: "client-node", Addr: "y"},
+	)
+
+	var unauthorized int32
+
+	srv := coord.NewServer(fakes.NewCache(), members, inflight.New(inflight.DefaultStalls(), nil),
+		coord.WithPeerAuthz(true),
+		coord.WithMetrics(coord.MetricsHooks{
+			OnUnauthorizedPeer: func() { atomic.AddInt32(&unauthorized, 1) },
+		}),
+	)
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	if _, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d); err == nil {
+		t.Fatal("PullIntentQuery: want rejection when authz is unevaluable under enforce mode, got nil error")
+	}
+
+	if got := atomic.LoadInt32(&unauthorized); got != 1 {
+		t.Fatalf("unauthorized metric = %d, want 1", got)
+	}
+}
