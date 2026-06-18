@@ -887,6 +887,10 @@ class HostImage:
     url: str
     file_name: str
     backing_format: str
+    sudo_group: str
+    packages: list[str]
+    write_files: str = ""
+    pre_marker_commands: list[str] | None = None
 
 
 def host_image() -> HostImage:
@@ -896,6 +900,10 @@ def host_image() -> HostImage:
             or "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img",
             file_name="ubuntu-cloud-amd64.img",
             backing_format="qcow2",
+            sudo_group="sudo",
+            packages=["curl", "jq", "apt-transport-https", "ca-certificates", "net-tools"],
+            write_files=ubuntu_netplan_write_files(),
+            pre_marker_commands=["netplan apply"],
         )
     if HOST_BASE_OS == "ubuntu2604":
         return HostImage(
@@ -903,6 +911,10 @@ def host_image() -> HostImage:
             or "https://cloud-images.ubuntu.com/minimal/releases/resolute/release/ubuntu-26.04-minimal-cloudimg-amd64.img",
             file_name="ubuntu-26.04-minimal-cloudimg-amd64.img",
             backing_format="qcow2",
+            sudo_group="sudo",
+            packages=["curl", "jq", "apt-transport-https", "ca-certificates", "net-tools"],
+            write_files=ubuntu_netplan_write_files(),
+            pre_marker_commands=["netplan apply"],
         )
     if HOST_BASE_OS == "fedora":
         return HostImage(
@@ -910,61 +922,15 @@ def host_image() -> HostImage:
             or "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2",
             file_name="fedora-cloud-amd64.qcow2",
             backing_format="qcow2",
+            sudo_group="wheel",
+            packages=["curl", "jq", "ca-certificates", "net-tools"],
         )
 
     die(f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; expected ubuntu2404, ubuntu2604, or fedora")
 
 
-def _cloud_init_user_data(ssh_pub_key: str, mac_address: str) -> str:
-    if HOST_BASE_OS == "fedora":
-        return textwrap.dedent(f"""\
-            #cloud-config
-            users:
-              - name: {VM_SSH_USER}
-                sudo: ALL=(ALL) NOPASSWD:ALL
-                shell: /bin/bash
-                groups: [wheel]
-                lock_passwd: false
-                ssh_authorized_keys:
-                  - {ssh_pub_key}
-
-            package_update: true
-            package_upgrade: false
-            packages:
-              - curl
-              - jq
-              - ca-certificates
-              - net-tools
-
-            runcmd:
-              - mkdir -p /etc/agent
-              - |
-                cat > /etc/agent/provisioned <<'MARKER'
-                provisioned=true
-                MARKER
-              - 'echo "cloud-init: done"'
-        """)
-
+def ubuntu_netplan_write_files() -> str:
     return textwrap.dedent(f"""\
-        #cloud-config
-        users:
-          - name: {VM_SSH_USER}
-            sudo: ALL=(ALL) NOPASSWD:ALL
-            shell: /bin/bash
-            groups: [sudo]
-            lock_passwd: false
-            ssh_authorized_keys:
-              - {ssh_pub_key}
-
-        package_update: true
-        package_upgrade: false
-        packages:
-          - curl
-          - jq
-          - apt-transport-https
-          - ca-certificates
-          - net-tools
-
         write_files:
           - path: /etc/netplan/99-static.yaml
             content: |
@@ -982,16 +948,45 @@ def _cloud_init_user_data(ssh_pub_key: str, mac_address: str) -> str:
                         - 8.8.8.8
                         - 8.8.4.4
             permissions: "0600"
-
-        runcmd:
-          - netplan apply
-          - mkdir -p /etc/agent
-          - |
-            cat > /etc/agent/provisioned <<'MARKER'
-            provisioned=true
-            MARKER
-          - 'echo "cloud-init: done"'
     """)
+
+
+def yaml_list(items: list[str], indent: str) -> str:
+    return "\n".join(f"{indent}- {item}" for item in items)
+
+
+def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
+    packages = yaml_list(image.packages, "  ")
+    commands = [*(image.pre_marker_commands or []), "mkdir -p /etc/agent"]
+    runcmd = yaml_list(commands, "  ")
+    write_files = image.write_files.rstrip()
+    write_files_block = f"\n{write_files}\n" if write_files else ""
+
+    return (
+        f"#cloud-config\n"
+        f"users:\n"
+        f"  - name: {VM_SSH_USER}\n"
+        f"    sudo: ALL=(ALL) NOPASSWD:ALL\n"
+        f"    shell: /bin/bash\n"
+        f"    groups: [{image.sudo_group}]\n"
+        f"    lock_passwd: false\n"
+        f"    ssh_authorized_keys:\n"
+        f"      - {ssh_pub_key}\n"
+        f"\n"
+        f"package_update: true\n"
+        f"package_upgrade: false\n"
+        f"packages:\n"
+        f"{packages}\n"
+        f"{write_files_block}"
+        f"runcmd:\n"
+        f"{runcmd}\n"
+        f"  - |\n"
+        f"    cat > /etc/agent/provisioned <<'MARKER'\n"
+        f"    provisioned=true\n"
+        f"    MARKER\n"
+        f"  - 'echo \"cloud-init: done\"'\n"
+    )
+
 
 
 def _launch_vm(ssh_pub_key: str) -> None:
@@ -1017,7 +1012,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     mac_address = qemu_mac_address()
 
     user_data = VM_DIR / "user-data"
-    user_data.write_text(_cloud_init_user_data(ssh_pub_key, mac_address))
+    user_data.write_text(_cloud_init_user_data(image, ssh_pub_key))
 
     meta_data = VM_DIR / "meta-data"
     # Use a unique instance-id so cloud-init treats this as a new instance
