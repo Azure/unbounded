@@ -93,7 +93,7 @@ impl ObjectMetadata {
         self.get(ENTRY_ETAG)
     }
 
-    /// Store the origin entity tag exactly as returned in the header.
+    /// Store a strong origin entity tag exactly as returned in the header.
     pub fn set_etag(&mut self, etag: impl Into<String>) {
         self.insert(ENTRY_ETAG, etag);
     }
@@ -149,7 +149,7 @@ impl ObjectMetadata {
         fetched_at_ms: u64,
     ) -> Self {
         let mut meta = Self::new(length);
-        if let Some(etag) = etag.filter(|v| !v.is_empty()) {
+        if let Some(etag) = etag.filter(|v| is_strong_etag(v)) {
             meta.set_etag(etag);
             if let Some(ttl_ms) = cache_control.and_then(cache_control_ttl_ms) {
                 meta.set_cache_ttl_ms(ttl_ms);
@@ -224,6 +224,10 @@ fn cache_control_ttl_ms(value: &str) -> Option<u64> {
     shared_max_age.or(max_age)
 }
 
+fn is_strong_etag(value: &str) -> bool {
+    !value.is_empty() && !value.starts_with("W/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +292,14 @@ mod tests {
         assert_eq!(meta.etag(), None);
         assert_eq!(meta.cache_ttl_ms(), None);
         assert!(meta.is_fresh_at(u64::MAX));
+    }
+
+    #[test]
+    fn origin_head_ignores_weak_etag() {
+        let meta = ObjectMetadata::from_origin_head(1, Some("W/\"abc\""), Some("max-age=5"), 10);
+        assert_eq!(meta.etag(), None);
+        assert_eq!(meta.cache_ttl_ms(), None);
+        assert_eq!(meta.cache_key_version(), None);
     }
 
     #[test]
