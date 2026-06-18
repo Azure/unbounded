@@ -45,6 +45,11 @@ pub(super) struct PageSlot {
     /// the page index cannot be recycled until both this flag is
     /// false and `consumer_holds == 0`.
     pub tee_pending: Cell<bool>,
+    /// Fetchers waiting for a stale ready page to become safe to
+    /// refresh in place. They do not hold the page bytes, but they keep
+    /// the slot from being recycled while they are parked.
+    pub refresh_waiters: Cell<u32>,
+    pub refresh_wakers: RefCell<Vec<Waker>>,
 }
 
 impl PageSlot {
@@ -55,6 +60,8 @@ impl PageSlot {
             page_idx: Cell::new(None),
             consumer_holds: Cell::new(0),
             tee_pending: Cell::new(false),
+            refresh_waiters: Cell::new(0),
+            refresh_wakers: RefCell::new(Vec::new()),
         }
     }
 
@@ -62,7 +69,7 @@ impl PageSlot {
     /// the free list and the slot itself can be removed from the
     /// `StripeFetch`.
     pub fn is_recyclable(&self) -> bool {
-        self.consumer_holds.get() == 0 && !self.tee_pending.get()
+        self.consumer_holds.get() == 0 && !self.tee_pending.get() && self.refresh_waiters.get() == 0
     }
 }
 

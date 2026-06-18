@@ -610,6 +610,59 @@ fn stale_ram_hit_refreshes_before_serving() {
 }
 
 #[test]
+fn stale_ram_hit_waits_for_pinned_page_before_refreshing() {
+    const P: usize = 4096;
+    let (pool, transport, store) = make_pool_v2(P, 4);
+    let k = key(0xB3);
+    transport.put_stripe(k, vec![1u8; P]);
+
+    let req = TestReq {
+        key: k,
+        refresh_cached_pages: true,
+    };
+    let (first, second) = block_on(async {
+        let mut s1 = pool.read(&req, 0, P as u64).await.unwrap();
+        let g1 = s1.next_page().await.unwrap().unwrap();
+        let first = g1.as_slice().to_vec();
+
+        transport.put_stripe(k, vec![3u8; P]);
+        let mut s2 = pool.read(&req, 0, P as u64).await.unwrap();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let second = {
+            let mut next = pin!(s2.next_page());
+            assert!(
+                matches!(next.as_mut().poll(&mut cx), Poll::Pending),
+                "stale pinned page must not be served"
+            );
+            assert_eq!(transport.calls(), 1, "refresh waits for old guard");
+
+            drop(g1);
+            let mut spins = 0u64;
+            loop {
+                match next.as_mut().poll(&mut cx) {
+                    Poll::Ready(Some(Ok(g))) => break g.as_slice().to_vec(),
+                    Poll::Ready(Some(Err(e))) => panic!("unexpected fetch error: {e}"),
+                    Poll::Ready(None) => panic!("unexpected EOF"),
+                    Poll::Pending => {
+                        spins += 1;
+                        assert!(spins < 1_000_000, "second fetch stuck");
+                    }
+                }
+            }
+        };
+        drop(s2);
+        drop(s1);
+        (first, second)
+    });
+
+    assert_eq!(first, vec![1u8; P]);
+    assert_eq!(second, vec![3u8; P]);
+    assert_eq!(transport.calls(), 2);
+    assert_eq!(store.writes(), 2);
+}
+
+#[test]
 fn multi_page_window_with_intra_page_offsets() {
     const P: usize = 1024;
     let (pool, transport, _store) = make_pool_v2(P, 8);

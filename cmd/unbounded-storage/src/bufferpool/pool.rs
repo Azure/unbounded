@@ -478,6 +478,9 @@ fn release_guard<T, S, R>(
     };
     let prev = slot.consumer_holds.get();
     slot.consumer_holds.set(prev.saturating_sub(1));
+    if slot.consumer_holds.get() == 0 {
+        wake_refresh_waiters(&slot);
+    }
     recycle_if_terminal(inner, key, fetch, &slot, page_no);
 }
 
@@ -550,6 +553,9 @@ where
         }
         let prev = self.slot.consumer_holds.get();
         self.slot.consumer_holds.set(prev.saturating_sub(1));
+        if self.slot.consumer_holds.get() == 0 {
+            wake_refresh_waiters(&self.slot);
+        }
         recycle_if_terminal(&self.inner, self.key, &self.fetch, &self.slot, self.page_no);
     }
 }
@@ -702,7 +708,7 @@ where
                             *st = SlotState::Loading(Vec::new());
                             Action::Lead
                         }
-                        Ok(true) => Action::Ready,
+                        Ok(true) => Action::WaitReusable,
                         Err(e) => Action::Error(e),
                     }
                 }
@@ -749,6 +755,10 @@ where
                     ParkOutcome::Error(e) => return Err(e),
                     ParkOutcome::Retry => continue,
                 }
+            }
+            Action::WaitReusable => {
+                WaitForReusable::new(slot.clone()).await;
+                continue;
             }
             Action::Lead => {
                 // Leader-owned `ConsumerHold` covers the entire I/O
@@ -926,6 +936,7 @@ enum Action {
     Ready,
     Error(Error),
     Park,
+    WaitReusable,
     Lead,
 }
 
@@ -995,6 +1006,60 @@ struct TeePendingGuard<'a> {
 impl<'a> Drop for TeePendingGuard<'a> {
     fn drop(&mut self) {
         self.slot.tee_pending.set(false);
+        wake_refresh_waiters(self.slot);
+    }
+}
+
+fn wake_refresh_waiters(slot: &Rc<PageSlot>) {
+    let wakers = std::mem::take(&mut *slot.refresh_wakers.borrow_mut());
+    for w in wakers {
+        w.wake();
+    }
+}
+
+struct WaitForReusable {
+    slot: Rc<PageSlot>,
+    registered: bool,
+}
+
+impl WaitForReusable {
+    fn new(slot: Rc<PageSlot>) -> Self {
+        Self {
+            slot,
+            registered: false,
+        }
+    }
+}
+
+impl Future for WaitForReusable {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        if this.slot.consumer_holds.get() == 0 && !this.slot.tee_pending.get() {
+            return Poll::Ready(());
+        }
+        if !this.registered {
+            this.slot
+                .refresh_waiters
+                .set(this.slot.refresh_waiters.get() + 1);
+            this.registered = true;
+        }
+        this.slot
+            .refresh_wakers
+            .borrow_mut()
+            .push(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+impl Drop for WaitForReusable {
+    fn drop(&mut self) {
+        if self.registered {
+            self.slot
+                .refresh_waiters
+                .set(self.slot.refresh_waiters.get().saturating_sub(1));
+        }
     }
 }
 
