@@ -81,6 +81,9 @@ VM_SUBNET = os.environ.get("VM_SUBNET", "192.168.100")
 VM_IP = os.environ.get("VM_IP", f"{VM_SUBNET}.10")
 VM_GATEWAY = f"{VM_SUBNET}.1"
 VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
+HOST_BASE_OS = os.environ.get("HOST_BASE_OS", "ubuntu2404")
+HOST_IMAGE_URL = os.environ.get("HOST_IMAGE_URL", "")
+NSPAWN_OCI_IMAGE = os.environ.get("NSPAWN_OCI_IMAGE", "")
 NODE_CONFIG_DIR = REPO_ROOT / "hack" / "agent" / "e2e-kind" / "node-configs"
 
 KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
@@ -562,6 +565,8 @@ def expected_node_taints(node_config: NodeConfig) -> list[dict[str, str]]:
 def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
     """Return manual-bootstrap flags for the active node config variant."""
     args: list[str] = []
+    if NSPAWN_OCI_IMAGE:
+        args.extend(["--oci-image", NSPAWN_OCI_IMAGE])
     if node_config.node_ip:
         args.extend(["--node-ip", expected_node_ip(node_config)])
     for key, value in sorted(expected_node_labels(node_config).items()):
@@ -577,6 +582,7 @@ def log_active_node_config(node_config: NodeConfig) -> None:
     taints = expected_node_taint_strings(node_config)
     log(f"Agent e2e node config variant: {node_config.name}")
     log(f"  node ip: {expected_node_ip(node_config) if node_config.node_ip else '<default>'}")
+    log(f"  nspawn oci image: {NSPAWN_OCI_IMAGE or '<default>'}")
     log(f"  node labels: {', '.join(labels) if labels else '<none>'}")
     log(f"  register-with-taints: {', '.join(taints) if taints else '<none>'}")
 
@@ -1093,6 +1099,32 @@ def _stop_qemu() -> None:
     _stop_qemu_by_pid_file(VM_DIR / f"{VM_NAME}.pid", VM_NAME)
 
 
+@dataclass(frozen=True)
+class HostImage:
+    url: str
+    file_name: str
+    backing_format: str
+
+
+def host_image() -> HostImage:
+    if HOST_BASE_OS == "ubuntu2404":
+        return HostImage(
+            url=HOST_IMAGE_URL
+            or "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img",
+            file_name="ubuntu-cloud-amd64.img",
+            backing_format="qcow2",
+        )
+    if HOST_BASE_OS == "ubuntu2604":
+        return HostImage(
+            url=HOST_IMAGE_URL
+            or "https://cloud-images.ubuntu.com/minimal/releases/resolute/release/ubuntu-26.04-minimal-cloudimg-amd64.img",
+            file_name="ubuntu-26.04-minimal-cloudimg-amd64.img",
+            backing_format="qcow2",
+        )
+
+    die(f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; expected ubuntu2404 or ubuntu2604")
+
+
 def _launch_vm(ssh_pub_key: str) -> None:
     """Create a fresh VM disk, cloud-init ISO, launch QEMU, and wait for SSH.
 
@@ -1100,7 +1132,8 @@ def _launch_vm(ssh_pub_key: str) -> None:
     Networking (bridge, TAP, NAT) must already be configured.
     """
 
-    image_file = VM_DIR / "ubuntu-cloud-amd64.img"
+    image = host_image()
+    image_file = VM_DIR / image.file_name
     if not image_file.exists():
         die(f"Base cloud image not found: {image_file}. Run create-vm first.")
 
@@ -1108,7 +1141,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
     log(f"Creating snapshot disk: {vm_disk}")
     run(["qemu-img", "create", "-f", "qcow2", "-b", str(image_file),
-         "-F", "qcow2", str(vm_disk), VM_DISK_SIZE])
+         "-F", image.backing_format, str(vm_disk), VM_DISK_SIZE])
 
     # cloud-init configuration
     log("Generating cloud-init configuration...")
@@ -1199,6 +1232,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
 
     log("============================================")
     log(f"  Launching VM: {VM_NAME}")
+    log(f"  Host OS:      {HOST_BASE_OS}")
     log(f"  Memory:       {VM_MEMORY} MB")
     log(f"  CPUs:         {VM_CPUS}")
     log(f"  Disk:         {vm_disk}")
@@ -1308,14 +1342,14 @@ def launch_vm() -> None:
     run(["sudo", "ip", "link", "set", TAP_NAME, "up"])
     _nm_unmanage(TAP_NAME)
 
-    # Download Ubuntu cloud image
-    image_url = "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img"
-    image_file = VM_DIR / "ubuntu-cloud-amd64.img"
+    image = host_image()
+    image_file = VM_DIR / image.file_name
     if not image_file.exists():
-        log("Downloading Ubuntu 24.04 cloud image...")
-        run(["curl", "-fsSL", "-o", str(image_file), image_url])
+        log(f"Downloading {HOST_BASE_OS} cloud image...")
+        run(["curl", "-fsSL", "-o", str(image_file), image.url])
     else:
         log(f"Using existing image: {image_file}")
+    run(["qemu-img", "info", "-f", image.backing_format, str(image_file)])
 
     _launch_vm(ssh_pub_key)
 

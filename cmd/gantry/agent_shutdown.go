@@ -7,7 +7,6 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/cdsub"
@@ -15,7 +14,9 @@ import (
 )
 
 // shutdownDeps bundles the subsystems the agent has to drain on
-// SIGTERM. All fields are required; nil is undefined behaviour.
+// SIGTERM. coordStop and pullerPumpGate are optional and may be nil
+// (gracefulShutdown skips them when unset); every other field is
+// required and a nil value is undefined behaviour.
 type shutdownDeps struct {
 	logger         *slog.Logger
 	mirrorSrv      *mirror.Server
@@ -23,7 +24,8 @@ type shutdownDeps struct {
 	mirrorStop     func(context.Context) error
 	cdsubSrc       cdsub.ImageSource
 	cdsubDone      <-chan error
-	pullerPumpWG   *sync.WaitGroup
+	coordStop      func()
+	pullerPumpGate *pullerPumpGate
 	metricsHTTP    *http.Server
 	shutdownBudget time.Duration
 }
@@ -73,13 +75,23 @@ func gracefulShutdown(d shutdownDeps) {
 			d.logger.Warn("cdsub source close error", slog.Any("err", err))
 		}
 	}
+
+	if d.coordStop != nil {
+		d.coordStop()
+	}
+
+	if d.pullerPumpGate != nil {
+		d.pullerPumpGate.StopAccepting()
+	}
 	// "flushes DHT Provide for any newly committed entries."
 	// runOriginPull goroutines own one inflight handle and one advertiser
-	// mark-present call each; pullerPumpWG counts them so we can let
-	// pending advertisement flush before disco.Close fires below.
+	// mark-present call each; pullerPumpGate counts them so we can let
+	// pending advertisement flush before disco.Close fires below. The gate is
+	// closed before Wait starts so no later please_pull can call Add while the
+	// shutdown goroutine is waiting.
 	pumpDone := make(chan struct{})
 
-	go func() { d.pullerPumpWG.Wait(); close(pumpDone) }()
+	go func() { d.pullerPumpGate.Wait(); close(pumpDone) }()
 
 	select {
 	case <-pumpDone:

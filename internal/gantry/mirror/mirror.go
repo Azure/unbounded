@@ -87,6 +87,7 @@ type Server struct {
 	peerFetchBudget  time.Duration
 	maxPeerAttempts  int
 	selfNodeID       ifaces.NodeID
+	selfPeerID       ifaces.NodeID
 
 	staleProviderTTL     time.Duration
 	unavailablePeerTTL   time.Duration
@@ -479,10 +480,18 @@ func WithPeerBudgets(lookup, fetch time.Duration, maxAttempts int) Option {
 	}
 }
 
-// WithSelfNodeID configures the local node identity used to filter stale self
-// provider records from DHT lookup results after a local cache miss.
+// WithSelfNodeID configures the local Kubernetes node identity used to filter
+// stale self provider records after a local cache miss. Membership/cold-start
+// providers use Kubernetes node names as NodeID values.
 func WithSelfNodeID(id ifaces.NodeID) Option {
 	return func(s *Server) { s.selfNodeID = id }
+}
+
+// WithSelfPeerID configures the local libp2p peer identity used to filter stale
+// self provider records from DHT lookup results after a local cache miss. DHT
+// providers use libp2p peer IDs as NodeID values.
+func WithSelfPeerID(id ifaces.NodeID) Option {
+	return func(s *Server) { s.selfPeerID = id }
 }
 
 // WithProviderFailureCacheTTL configures TTLs used to suppress immediate
@@ -1581,7 +1590,7 @@ func (s *Server) filterProvidersForDigest(d digest.Digest, providers []ifaces.Pr
 	var summary peerAttemptSummary
 
 	for _, p := range providers {
-		if s.selfNodeID != "" && p.NodeID == s.selfNodeID {
+		if s.isSelfProvider(p) {
 			summary.selfFiltered++
 			continue
 		}
@@ -1606,6 +1615,11 @@ func (s *Server) filterProvidersForDigest(d digest.Digest, providers []ifaces.Pr
 	}
 
 	return filtered, summary
+}
+
+func (s *Server) isSelfProvider(p ifaces.Provider) bool {
+	return (s.selfNodeID != "" && p.NodeID == s.selfNodeID) ||
+		(s.selfPeerID != "" && p.NodeID == s.selfPeerID)
 }
 
 func updatePeerSummary(summary peerAttemptSummary, outcome peerFetchOutcomeKind) peerAttemptSummary {

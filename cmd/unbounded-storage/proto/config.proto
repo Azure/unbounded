@@ -92,6 +92,10 @@ message TopologyCfg {
   uint64 serving_cores = 9;
   // NIC-worker CPUs to pin per active HCA. 0 -> 4.
   uint64 nic_workers = 10;
+  // Maximum number of HCAs to use per NUMA node. 0 -> 1. Raise this to
+  // use additional HCAs on a NUMA node. HCAs whose NUMA node is unknown
+  // are never capped.
+  uint64 hcas_per_numa_node = 11;
 }
 
 message P2pCfg {
@@ -123,17 +127,22 @@ message RoutingPlan {
   optional uint64 predecessor = 3;
 }
 
-message PeerSpec {
-  uint64 id = 1;
-  PeerTransport transport = 2;
-  string address = 3;
-  optional uint32 hca_numa = 4;
-  repeated string labels = 5;
+message FabricAddress {
+  // Numeric IP socket address usable by libfabric/RDMA CM, e.g.
+  // "10.0.0.1:9000". On InfiniBand this is usually an IPoIB address;
+  // on tcp fallback it is a normal TCP socket address.
+  string socket = 1;
+  // Provider-native escape hatch for RDMA deployments without socket
+  // addressing. Currently encoded as "hex:<fi_getname-bytes>" so a
+  // controller can publish the raw provider address when needed.
+  string native = 2;
 }
 
-enum PeerTransport {
-  PEER_TRANSPORT_TCP = 0;
-  PEER_TRANSPORT_RDMA = 1;
+message PeerSpec {
+  uint64 id = 1;
+  FabricAddress address = 2;
+  optional uint32 hca_numa = 3;
+  repeated string labels = 4;
 }
 
 message DiskSpec {
