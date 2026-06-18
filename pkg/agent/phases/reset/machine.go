@@ -126,13 +126,16 @@ func (t *removeMachine) Do(ctx context.Context) error {
 
 	deadline := time.Now().Add(retryTimeout)
 	dumpedDiagnostics := false
+
 	for time.Now().Before(deadline) {
 		err := executil.RunCmd(ctx, t.log, executil.Machinectl(), "remove", t.machineName)
 		if err == nil {
 			return nil // machinectl removed both image metadata and directory
 		}
+
 		if !dumpedDiagnostics {
 			dumpMachineRemoveDiagnostics(ctx, t.log, t.machineName, machineDir)
+
 			dumpedDiagnostics = true
 		}
 
@@ -165,13 +168,14 @@ func serviceIsActive(ctx context.Context, log *slog.Logger, service string) bool
 func dumpMachineRemoveDiagnostics(ctx context.Context, log *slog.Logger, machineName, machineDir string) {
 	log.Info("machinectl remove failed, collecting host diagnostics", "machine", machineName, "dir", machineDir)
 
-	runDiagnostic := func(label string, command string, args ...string) {
+	runDiagnostic := func(label, command string, args ...string) {
 		out, err := exec.CommandContext(ctx, command, args...).CombinedOutput()
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 			if line != "" {
 				log.Info("diagnostic output", "label", label, "line", line)
 			}
 		}
+
 		if err != nil {
 			log.Info("diagnostic command failed", "label", label, "command", command, "error", err)
 		}
