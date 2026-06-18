@@ -130,13 +130,16 @@ func TestPleasePull_Started(t *testing.T) {
 
 	var pumpCalls int32
 
-	pump := coord.PullerPump(func(ctx context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
+	pump := coord.PullerPump(func(ctx context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) coord.PumpResult {
 		atomic.AddInt32(&pumpCalls, 1)
 		// Claim in-flight as the real puller would; that gates re-pulls.
-		h, _, already := infl.Start(d, kind, 0)
+		h, e, already := infl.Start(d, kind, 0)
 		_ = h // leak intentionally for test brevity //nolint:errcheck // best-effort
+		if already {
+			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: e.StartedAt}
+		}
 
-		return time.Now(), already, nil
+		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: e.StartedAt}
 	})
 	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
 	srv.Bind(hServer)
@@ -169,6 +172,115 @@ func TestPleasePull_Started(t *testing.T) {
 	}
 }
 
+func TestPleasePull_RejectsOversizedBatch(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	c := fakes.NewCache()
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	var pumpCalls int32
+
+	pump := coord.PullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
+		atomic.AddInt32(&pumpCalls, 1)
+		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
+	})
+	srv := coord.NewServer(c, members, infl,
+		coord.WithPullerPump(pump),
+		coord.WithMaxDigestsPerPleasePull(1),
+	)
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient, coord.WithClientMaxDigestsPerPleasePull(10))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	d1 := digest.MustParse("sha256:" + rep('1', 64))
+	d2 := digest.MustParse("sha256:" + rep('2', 64))
+
+	if _, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d1, d2}); err == nil {
+		t.Fatal("expected oversized please_pull to fail")
+	}
+
+	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
+		t.Fatalf("pumpCalls = %d, want 0", got)
+	}
+}
+
+func TestPleasePull_ClientChunksBatches(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	c := fakes.NewCache()
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	var pumpCalls int32
+
+	pump := coord.PullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
+		atomic.AddInt32(&pumpCalls, 1)
+		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
+	})
+	srv := coord.NewServer(c, members, infl,
+		coord.WithPullerPump(pump),
+		coord.WithMaxDigestsPerPleasePull(1),
+	)
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient, coord.WithClientMaxDigestsPerPleasePull(1))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	d1 := digest.MustParse("sha256:" + rep('1', 64))
+	d2 := digest.MustParse("sha256:" + rep('2', 64))
+
+	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d1, d2})
+	if err != nil {
+		t.Fatalf("PleasePull: %v", err)
+	}
+
+	if len(outs) != 2 {
+		t.Fatalf("len(outs) = %d, want 2", len(outs))
+	}
+
+	if got := atomic.LoadInt32(&pumpCalls); got != 2 {
+		t.Fatalf("pumpCalls = %d, want 2", got)
+	}
+}
+
+func TestStartLocalPull_RespectsCanceledContext(t *testing.T) {
+	c := fakes.NewCache()
+	members := fakes.NewMembers("self")
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	var pumpCalls int32
+
+	pump := coord.PullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
+		atomic.AddInt32(&pumpCalls, 1)
+		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
+	})
+	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	d := digest.MustParse("sha256:" + rep('3', 64))
+
+	outs, err := srv.StartLocalPull(ctx, "reg", "repo", ifaces.KindBlob, []digest.Digest{d})
+	if err == nil {
+		t.Fatal("expected canceled context error")
+	}
+
+	if len(outs) != 0 {
+		t.Fatalf("len(outs) = %d, want 0", len(outs))
+	}
+
+	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
+		t.Fatalf("pumpCalls = %d, want 0", got)
+	}
+}
+
 func TestPleasePull_AlreadyPulling(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
@@ -181,11 +293,14 @@ func TestPleasePull_AlreadyPulling(t *testing.T) {
 	pre, _, _ := infl.Start(d, ifaces.KindBlob, 0)
 	defer pre.Done()
 
-	pump := coord.PullerPump(func(_ context.Context, _, _ string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
+	pump := coord.PullerPump(func(_ context.Context, _, _ string, d digest.Digest, kind ifaces.OriginRefKind) coord.PumpResult {
 		h, e, already := infl.Start(d, kind, 0)
 		_ = h //nolint:errcheck // best-effort
+		if already {
+			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: e.StartedAt}
+		}
 
-		return e.StartedAt, already, nil
+		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: e.StartedAt}
 	})
 	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
 	srv.Bind(hServer)
@@ -270,12 +385,13 @@ func TestPleasePull_RecentlyFailedShortCircuit(t *testing.T) {
 	// consult its negcache before starting an origin pull).
 	var pumpCalls int32
 
-	pump := coord.PullerPump(func(_ context.Context, _, _ string, _ digest.Digest, _ ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
+	pump := coord.PullerPump(func(_ context.Context, _, _ string, _ digest.Digest, _ ifaces.OriginRefKind) coord.PumpResult {
 		atomic.AddInt32(&pumpCalls, 1)
 
-		return time.Time{}, false, &coord.NegativeEntry{
+		return coord.PumpResult{
+			Status:        coord.PumpRecentlyFailed,
 			CooldownUntil: cooldownUntil,
-			Class:         ifaces.FailureAuth,
+			FailureClass:  ifaces.FailureAuth,
 		}
 	})
 	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
@@ -331,13 +447,16 @@ func TestPleasePull_KindRoundtrip(t *testing.T) {
 		observedDigest digest.Digest
 	)
 
-	pump := coord.PullerPump(func(_ context.Context, _, _ string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
+	pump := coord.PullerPump(func(_ context.Context, _, _ string, d digest.Digest, kind ifaces.OriginRefKind) coord.PumpResult {
 		observedKind = kind
 		observedDigest = d
-		h, _, already := infl.Start(d, kind, 0)
+		h, e, already := infl.Start(d, kind, 0)
 		_ = h //nolint:errcheck // best-effort
+		if already {
+			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: e.StartedAt}
+		}
 
-		return time.Now(), already, nil
+		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: e.StartedAt}
 	})
 	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
 	srv.Bind(hServer)
@@ -378,12 +497,15 @@ func TestPleasePull_KindConfigRoundtrip(t *testing.T) {
 
 	var observedKind ifaces.OriginRefKind
 
-	pump := coord.PullerPump(func(_ context.Context, _, _ string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
+	pump := coord.PullerPump(func(_ context.Context, _, _ string, d digest.Digest, kind ifaces.OriginRefKind) coord.PumpResult {
 		observedKind = kind
-		h, _, already := infl.Start(d, kind, 0)
+		h, e, already := infl.Start(d, kind, 0)
 		_ = h //nolint:errcheck // best-effort
+		if already {
+			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: e.StartedAt}
+		}
 
-		return time.Now(), already, nil
+		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: e.StartedAt}
 	})
 	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
 	srv.Bind(hServer)

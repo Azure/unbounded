@@ -84,6 +84,11 @@ const DefaultStreamHandshakeTimeout = 5 * time.Second
 // local gate.
 const DefaultMaxConcurrentStreams = 512
 
+// DefaultMaxDigestsPerPleasePull caps a single inbound please_pull batch. It
+// is well above normal OCI manifest child counts while preventing a 1 MiB
+// coord envelope from expanding into thousands of pump calls.
+const DefaultMaxDigestsPerPleasePull = 256
+
 // MetricsHooks lets callers wire Prometheus counters/gauges without
 // importing the metrics package. All fields may be nil.
 type MetricsHooks struct {
@@ -133,6 +138,8 @@ type Server struct {
 	streamHandshakeTimeout time.Duration
 	// streamSem bounds concurrent inbound stream handlers.
 	streamSem chan struct{}
+	// maxDigestsPerPleasePull bounds a single inbound please_pull batch.
+	maxDigestsPerPleasePull int
 }
 
 // NegativeCache is the read interface coord needs from the
@@ -154,9 +161,28 @@ type NegativeEntry struct {
 // until pump returns. Long-running work (the actual origin pull) MUST
 // be moved to a goroutine inside the pump's implementation.
 //
-// The returned (started_at, alreadyPulling) tuple drives the wire-
-// level OUTCOME_STARTED vs OUTCOME_ALREADY_PULLING decision.
-type PullerPump func(ctx context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) (startedAt time.Time, alreadyPulling bool, fail *NegativeEntry)
+// PullerPump returns a PumpResult describing whether the digest started,
+// piggy-backed on existing work, short-circuited on a recent failure, or was
+// declined before background work was started.
+type PullerPump func(ctx context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) PumpResult
+
+// PumpStatus is the in-process status returned by PullerPump.
+type PumpStatus int
+
+const (
+	PumpStarted PumpStatus = iota
+	PumpAlreadyPulling
+	PumpRecentlyFailed
+	PumpDeclined
+)
+
+// PumpResult is the in-process result returned by PullerPump.
+type PumpResult struct {
+	Status        PumpStatus
+	StartedAt     time.Time
+	CooldownUntil time.Time
+	FailureClass  ifaces.FailureClass
+}
 
 // Option configures a Server.
 type Option func(*Server)
@@ -208,16 +234,27 @@ func WithMaxConcurrentStreams(n int) Option {
 	}
 }
 
+// WithMaxDigestsPerPleasePull overrides DefaultMaxDigestsPerPleasePull.
+// Non-positive values are ignored.
+func WithMaxDigestsPerPleasePull(n int) Option {
+	return func(s *Server) {
+		if n > 0 {
+			s.maxDigestsPerPleasePull = n
+		}
+	}
+}
+
 // NewServer constructs a coord server. The store + members + inflight
 // dependencies are required (everything else is optional via Option).
 func NewServer(store ifaces.LocalContentStore, members ifaces.Members, inflight *inflight.Map, opts ...Option) *Server {
 	s := &Server{
-		logger:                 slog.Default().With(slog.String("subsystem", "coord")),
-		store:                  store,
-		members:                members,
-		inflight:               inflight,
-		streamHandshakeTimeout: DefaultStreamHandshakeTimeout,
-		streamSem:              make(chan struct{}, DefaultMaxConcurrentStreams),
+		logger:                  slog.Default().With(slog.String("subsystem", "coord")),
+		store:                   store,
+		members:                 members,
+		inflight:                inflight,
+		streamHandshakeTimeout:  DefaultStreamHandshakeTimeout,
+		streamSem:               make(chan struct{}, DefaultMaxConcurrentStreams),
+		maxDigestsPerPleasePull: DefaultMaxDigestsPerPleasePull,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -465,30 +502,55 @@ func (s *Server) StartLocalPull(ctx context.Context, registry, repository string
 		return nil, errors.New("start_local_pull: missing registry/repository")
 	}
 
+	if s.maxDigestsPerPleasePull > 0 && len(digests) > s.maxDigestsPerPleasePull {
+		out := make([]ifaces.PleasePullOutcome, 0, len(digests))
+		for start := 0; start < len(digests); start += s.maxDigestsPerPleasePull {
+			end := start + s.maxDigestsPerPleasePull
+			if end > len(digests) {
+				end = len(digests)
+			}
+
+			chunkOut, err := s.StartLocalPull(ctx, registry, repository, kind, digests[start:end])
+			if err != nil {
+				return out, err
+			}
+
+			out = append(out, chunkOut...)
+		}
+
+		return out, nil
+	}
+
 	out := make([]ifaces.PleasePullOutcome, 0, len(digests))
 	for _, d := range digests {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+
 		oc := ifaces.PleasePullOutcome{Digest: d}
 		if s.pullerPump == nil {
 			out = append(out, oc)
 			continue
 		}
 
-		startedAt, already, fail := s.pullerPump(ctx, registry, repository, d, kind)
-		switch {
-		case fail != nil:
+		res := s.pullerPump(ctx, registry, repository, d, kind)
+		switch res.Status {
+		case PumpRecentlyFailed:
 			oc.Outcome = ifaces.PleasePullRecentlyFailed
-			oc.CooldownUntil = fail.CooldownUntil
-			oc.FailureClass = fail.Class
-		case already:
+			oc.CooldownUntil = res.CooldownUntil
+			oc.FailureClass = res.FailureClass
+		case PumpAlreadyPulling:
 			oc.Outcome = ifaces.PleasePullAlreadyPulling
-			oc.StartedAt = startedAt
-		default:
+			oc.StartedAt = res.StartedAt
+		case PumpStarted:
 			oc.Outcome = ifaces.PleasePullStarted
-			oc.StartedAt = startedAt
+			oc.StartedAt = res.StartedAt
 
 			if s.hooks.OnPleasePullStarted != nil {
 				s.hooks.OnPleasePullStarted()
 			}
+		case PumpDeclined:
+			oc.Outcome = ifaces.PleasePullUnspecified
 		}
 
 		out = append(out, oc)
@@ -507,8 +569,17 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 		return &coordv1.PleasePullResponse{}, nil
 	}
 
+	if s.maxDigestsPerPleasePull > 0 && len(req.GetDigests()) > s.maxDigestsPerPleasePull {
+		s.bumpStreamErr()
+		return nil, fmt.Errorf("please_pull: too many digests: got %d, max %d", len(req.GetDigests()), s.maxDigestsPerPleasePull)
+	}
+
 	results := make([]*coordv1.PleasePullResponse_Result, 0, len(req.GetDigests()))
 	for _, raw := range req.GetDigests() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		d, err := digest.Parse(raw)
 		if err != nil {
 			s.bumpStreamErr()
@@ -528,22 +599,24 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 			continue
 		}
 
-		startedAt, already, fail := s.pullerPump(ctx, req.GetUpstreamRegistry(), req.GetRepository(), d, pleasePullKindFromProto(req.GetKind()))
-		switch {
-		case fail != nil:
+		res := s.pullerPump(ctx, req.GetUpstreamRegistry(), req.GetRepository(), d, pleasePullKindFromProto(req.GetKind()))
+		switch res.Status {
+		case PumpRecentlyFailed:
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_RECENTLY_FAILED
-			r.CooldownUntil = timestamppb.New(fail.CooldownUntil)
-			r.FailureClass = failureClassToProto(fail.Class)
-		case already:
+			r.CooldownUntil = timestamppb.New(res.CooldownUntil)
+			r.FailureClass = failureClassToProto(res.FailureClass)
+		case PumpAlreadyPulling:
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_ALREADY_PULLING
-			r.StartedAt = timestamppb.New(startedAt)
-		default:
+			r.StartedAt = timestamppb.New(res.StartedAt)
+		case PumpStarted:
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_STARTED
-			r.StartedAt = timestamppb.New(startedAt)
+			r.StartedAt = timestamppb.New(res.StartedAt)
 
 			if s.hooks.OnPleasePullStarted != nil {
 				s.hooks.OnPleasePullStarted()
 			}
+		case PumpDeclined:
+			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_UNSPECIFIED
 		}
 
 		results = append(results, r)
@@ -570,12 +643,13 @@ func (s *Server) bumpStreamErr() {
 // owned by `internal/members` and surfaces through a richer Node type
 // in +.
 type Client struct {
-	h            host.Host
-	dialTimeout  time.Duration
-	rpcTimeout   time.Duration
-	logger       *slog.Logger
-	resolveMu    sync.RWMutex
-	resolveCache map[ifaces.NodeID]peer.ID
+	h                       host.Host
+	dialTimeout             time.Duration
+	rpcTimeout              time.Duration
+	maxDigestsPerPleasePull int
+	logger                  *slog.Logger
+	resolveMu               sync.RWMutex
+	resolveCache            map[ifaces.NodeID]peer.ID
 	// resolveFn is consulted before the static cache. It lets higher
 	// layers (members) supply a live NodeID -> peer.ID mapping derived
 	// from pod-annotation announcements without polling. Returns
@@ -601,6 +675,16 @@ func WithRPCTimeout(d time.Duration) ClientOption {
 	return func(c *Client) {
 		if d > 0 {
 			c.rpcTimeout = d
+		}
+	}
+}
+
+// WithClientMaxDigestsPerPleasePull overrides the client-side chunk size used
+// for PleasePull. Non-positive values are ignored.
+func WithClientMaxDigestsPerPleasePull(n int) ClientOption {
+	return func(c *Client) {
+		if n > 0 {
+			c.maxDigestsPerPleasePull = n
 		}
 	}
 }
@@ -632,11 +716,12 @@ func WithPeerIDResolver(fn func(ifaces.NodeID) (peer.ID, bool)) ClientOption {
 // host already participating in the coord protocol's transports.
 func NewClient(h host.Host, opts ...ClientOption) *Client {
 	c := &Client{
-		h:            h,
-		dialTimeout:  2 * time.Second,
-		rpcTimeout:   2 * time.Second,
-		logger:       slog.Default().With(slog.String("subsystem", "coord-client")),
-		resolveCache: map[ifaces.NodeID]peer.ID{},
+		h:                       h,
+		dialTimeout:             2 * time.Second,
+		rpcTimeout:              2 * time.Second,
+		maxDigestsPerPleasePull: DefaultMaxDigestsPerPleasePull,
+		logger:                  slog.Default().With(slog.String("subsystem", "coord-client")),
+		resolveCache:            map[ifaces.NodeID]peer.ID{},
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -674,6 +759,30 @@ func (c *Client) PullIntentQuery(ctx context.Context, target ifaces.NodeID, d di
 
 // PleasePull implements ifaces.Coordinator.
 func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+	maxDigests := c.maxDigestsPerPleasePull
+	if maxDigests <= 0 {
+		maxDigests = DefaultMaxDigestsPerPleasePull
+	}
+
+	if len(digests) > maxDigests {
+		outs := make([]ifaces.PleasePullOutcome, 0, len(digests))
+		for start := 0; start < len(digests); start += maxDigests {
+			end := start + maxDigests
+			if end > len(digests) {
+				end = len(digests)
+			}
+
+			chunkOut, err := c.PleasePull(ctx, target, registry, repository, kind, digests[start:end])
+			if err != nil {
+				return nil, err
+			}
+
+			outs = append(outs, chunkOut...)
+		}
+
+		return outs, nil
+	}
+
 	raws := make([]string, len(digests))
 	for i, d := range digests {
 		raws[i] = d.String()

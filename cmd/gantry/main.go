@@ -366,6 +366,7 @@ func runAgent(args []string) error {
 
 	coordClient := coord.NewClient(disco.LibP2P(),
 		coord.WithClientLogger(logger),
+		coord.WithClientMaxDigestsPerPleasePull(c.CoordMaxDigestsPerRequest),
 		// Resolve NodeID -> peer.ID via the live membership snapshot:
 		// each peer publishes its libp2p peer.ID into a pod
 		// annotation (the design doc) which Members reads in Snapshot. This
@@ -404,7 +405,7 @@ func runAgent(args []string) error {
 
 		p9.containerdIngestFailure.Inc()
 	}
-	pullerPump := newPullerPump(inflightMap, pullOriginClient, cstore, negCache, logger, pullerPumpGate, func(ctx context.Context, d digest.Digest) bool {
+	pullerPump := newPullerPump(inflightMap, pullOriginClient, cstore, negCache, logger, pullerPumpGate, c.CoordMaxConcurrentPulls, func(ctx context.Context, d digest.Digest) bool {
 		return adv.Notify(ctx, d, true)
 	}, originSuccessWithIngest, downstreamFailureWithIngest, leaseHooks)
 	coordOpts := []coord.Option{
@@ -418,6 +419,7 @@ func runAgent(args []string) error {
 		}),
 		coord.WithNegativeCache(negCacheAdapter{c: negCache}),
 		coord.WithPullerPump(pullerPump),
+		coord.WithMaxDigestsPerPleasePull(c.CoordMaxDigestsPerRequest),
 	}
 	coordServer := coord.NewServer(cstore, memberView, inflightMap, coordOpts...)
 	coordServer.Bind(disco.LibP2P())
@@ -1982,18 +1984,25 @@ func (g *pullerPumpGate) Wait() {
 	g.wg.Wait()
 }
 
-func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, logger *slog.Logger, gate *pullerPumpGate, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks) coord.PullerPump {
+func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, logger *slog.Logger, gate *pullerPumpGate, maxConcurrentPulls int, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks) coord.PullerPump {
 	lg := logger.With(slog.String("subsystem", "puller-pump"))
 
-	return func(_ context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
+	if maxConcurrentPulls < 1 {
+		maxConcurrentPulls = 1
+	}
+
+	pullSem := make(chan struct{}, maxConcurrentPulls)
+
+	return func(pumpCtx context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) coord.PumpResult {
 		// the design doc short-circuit: if we're inside a cooldown window, refuse
 		// to start a new origin pull and surface the existing entry so
 		// the requester gets recently_failed without round-tripping.
 		if neg != nil {
 			if e, ok := neg.Lookup(d); ok {
-				return time.Time{}, false, &coord.NegativeEntry{
+				return coord.PumpResult{
+					Status:        coord.PumpRecentlyFailed,
 					CooldownUntil: e.CooldownUntil,
-					Class:         e.Class,
+					FailureClass:  e.Class,
 				}
 			}
 		}
@@ -2009,7 +2018,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 		// caller's cold-start cascade polls DHT once and finds us as a
 		// provider, same flow as the in-flight case below.
 		if cstore != nil {
-			ctxHas, cancelHas := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			ctxHas, cancelHas := context.WithTimeout(pumpCtx, 100*time.Millisecond)
 			has, hasErr := cstore.Has(ctxHas, d)
 
 			cancelHas()
@@ -2030,39 +2039,57 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 			}
 
 			if has {
-				return time.Now(), true, nil
+				return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: time.Now()}
 			}
+		}
+
+		if err := pumpCtx.Err(); err != nil {
+			return coord.PumpResult{Status: coord.PumpDeclined}
 		}
 		// Dedupe at this node: if a pull is already running, the
 		// stream handler must report ALREADY_PULLING with the existing
 		// start time so the requester can run the stall check.
 		h, existing, already := infl.Start(d, kind, 0)
 		if already {
-			return existing.StartedAt, true, nil
+			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: existing.StartedAt}
 		}
-		// Detach the actual fetch from the stream handler. The pump
-		// returns immediately; the goroutine owns the inflight handle.
-		// wg lets graceful shutdown wait for the advertise flush at
-		// the end of runOriginPull before closing the libp2p host
-		// (graceful-shutdown contract).
+
 		startedAt := existing.StartedAt
 
+		// Refuse new work once graceful shutdown has closed the gate. The
+		// gate also tracks outstanding pulls so shutdown can wait for the
+		// advertise flush at the end of runOriginPull before closing the
+		// libp2p host (graceful-shutdown contract).
 		if !gate.TryAdd() {
 			h.Done()
 
-			// The current please_pull wire protocol has no DECLINED outcome.
-			// During shutdown, report a non-started already-pulling result rather
-			// than spawning work after the pump gate has closed.
-			return startedAt, true, nil
+			return coord.PumpResult{Status: coord.PumpDeclined}
 		}
 
+		// Bound please-pull fanout: if we're already at the concurrent-pull
+		// ceiling, release the gate slot we just took and decline so the
+		// requester falls through to another provider instead of queueing
+		// unbounded origin fetches on this node.
+		select {
+		case pullSem <- struct{}{}:
+		default:
+			gate.Done()
+			h.Done()
+
+			return coord.PumpResult{Status: coord.PumpDeclined}
+		}
+
+		// Detach the actual fetch from the stream handler. The pump returns
+		// immediately; the goroutine owns the inflight handle, the gate slot,
+		// and the fanout semaphore slot, releasing all three on exit.
 		go func() {
 			defer gate.Done()
+			defer func() { <-pullSem }()
 
 			runOriginPull(originClient, cstore, neg, lg, h, registry, repository, d, kind, markPresent, onOriginSuccess, onDownstreamFailure, leaseHooks)
 		}()
 
-		return startedAt, false, nil
+		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: startedAt}
 	}
 }
 
