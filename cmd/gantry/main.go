@@ -379,7 +379,7 @@ func runAgent(args []string) error {
 	// mark-present happen in a detached goroutine. pullerPumpWG tracks
 	// outstanding goroutines so graceful shutdown can let the final
 	// advertise path flush before disco.Close fires .
-	var pullerPumpWG sync.WaitGroup
+	pullerPumpGate := newPullerPumpGate()
 
 	leaseHooks := leaseMetricHooks{
 		onCreated:  func() { p9.containerdLeaseCreated.Inc() },
@@ -404,7 +404,7 @@ func runAgent(args []string) error {
 
 		p9.containerdIngestFailure.Inc()
 	}
-	pullerPump := newPullerPump(inflightMap, pullOriginClient, cstore, negCache, logger, &pullerPumpWG, func(ctx context.Context, d digest.Digest) bool {
+	pullerPump := newPullerPump(inflightMap, pullOriginClient, cstore, negCache, logger, pullerPumpGate, func(ctx context.Context, d digest.Digest) bool {
 		return adv.Notify(ctx, d, true)
 	}, originSuccessWithIngest, downstreamFailureWithIngest, leaseHooks)
 	coordOpts := []coord.Option{
@@ -934,7 +934,8 @@ func runAgent(args []string) error {
 		mirrorStop:     mirrorStop,
 		cdsubSrc:       cdsubSrc,
 		cdsubDone:      cdsubDone,
-		pullerPumpWG:   &pullerPumpWG,
+		coordStop:      func() { coordServer.Unbind(disco.LibP2P()) },
+		pullerPumpGate: pullerPumpGate,
 		metricsHTTP:    metricsHTTP,
 		shutdownBudget: 10 * time.Second,
 	})
@@ -1927,7 +1928,60 @@ type preIngestLeaseStore interface {
 	CreateLease(ctx context.Context, d digest.Digest, registry, repository string) (*containerdstore.LeaseGuard, error)
 }
 
-func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, logger *slog.Logger, wg *sync.WaitGroup, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks) coord.PullerPump {
+type pullerPumpGate struct {
+	mu        sync.Mutex
+	accepting bool
+	wg        sync.WaitGroup
+}
+
+func newPullerPumpGate() *pullerPumpGate {
+	return &pullerPumpGate{accepting: true}
+}
+
+func (g *pullerPumpGate) TryAdd() bool {
+	if g == nil {
+		return true
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if !g.accepting {
+		return false
+	}
+
+	g.wg.Add(1)
+
+	return true
+}
+
+func (g *pullerPumpGate) Done() {
+	if g == nil {
+		return
+	}
+
+	g.wg.Done()
+}
+
+func (g *pullerPumpGate) StopAccepting() {
+	if g == nil {
+		return
+	}
+
+	g.mu.Lock()
+	g.accepting = false
+	g.mu.Unlock()
+}
+
+func (g *pullerPumpGate) Wait() {
+	if g == nil {
+		return
+	}
+
+	g.wg.Wait()
+}
+
+func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, logger *slog.Logger, gate *pullerPumpGate, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks) coord.PullerPump {
 	lg := logger.With(slog.String("subsystem", "puller-pump"))
 
 	return func(_ context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
@@ -1992,14 +2046,17 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 		// (graceful-shutdown contract).
 		startedAt := existing.StartedAt
 
-		if wg != nil {
-			wg.Add(1)
+		if !gate.TryAdd() {
+			h.Done()
+
+			// The current please_pull wire protocol has no DECLINED outcome.
+			// During shutdown, report a non-started already-pulling result rather
+			// than spawning work after the pump gate has closed.
+			return startedAt, true, nil
 		}
 
 		go func() {
-			if wg != nil {
-				defer wg.Done()
-			}
+			defer gate.Done()
 
 			runOriginPull(originClient, cstore, neg, lg, h, registry, repository, d, kind, markPresent, onOriginSuccess, onDownstreamFailure, leaseHooks)
 		}()

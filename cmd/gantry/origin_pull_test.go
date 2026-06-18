@@ -97,3 +97,51 @@ func TestRunOriginPull_MarkPresentFailurePreventsSuccess(t *testing.T) {
 		t.Fatalf("cache.Has after commit = %v, %v; want true, nil", ok, err)
 	}
 }
+
+func TestPullerPumpStopsAcceptingBeforeWait(t *testing.T) {
+	body := []byte("late-please-pull")
+	d := trackerDigestOf(body)
+	originPuller := fakes.NewOriginPuller()
+	originPuller.Put(d, body)
+
+	cache := fakes.NewCache()
+	gate := newPullerPumpGate()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var starts int32
+
+	pump := newPullerPump(
+		inflight.New(inflight.DefaultStalls(), nil),
+		originPuller,
+		cache,
+		nil,
+		logger,
+		gate,
+		func(context.Context, digest.Digest) bool { return true },
+		func(string, int64) { atomic.AddInt32(&starts, 1) },
+		func(string, string) {},
+		leaseMetricHooks{},
+	)
+
+	gate.StopAccepting()
+	gate.Wait()
+
+	startedAt, already, fail := pump(context.Background(), "registry.example.com", "library/test", d, ifaces.KindBlob)
+	if fail != nil {
+		t.Fatalf("fail = %#v, want nil", fail)
+	}
+
+	if !already || startedAt.IsZero() {
+		t.Fatalf("pump result = startedAt=%v already=%v, want already with non-zero start time", startedAt, already)
+	}
+
+	gate.Wait()
+
+	if got := atomic.LoadInt32(&starts); got != 0 {
+		t.Fatalf("origin pulls started after gate closed = %d, want 0", got)
+	}
+
+	if ok, err := cache.Has(context.Background(), d); err != nil || ok {
+		t.Fatalf("cache.Has after declined pump = %v, %v; want false, nil", ok, err)
+	}
+}
