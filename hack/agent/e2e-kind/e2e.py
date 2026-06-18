@@ -2632,24 +2632,45 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
     _assert_expected_node_config(node, node_config)
 
-    machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
-    status_config = machine.get("status", {}).get("configuration", {})
-    if status_config.get("version") != target_version_number or status_config.get("versionName") != target_mcv:
-        die(f"Machine status.configuration did not record {target_mcv}: {status_config}")
-
-    conditions = machine.get("status", {}).get("conditions", [])
-    repave_applied = [
-        c for c in conditions
-        if c.get("type") == "RepavePending" and c.get("status") == "False" and c.get("reason") == "Applied"
-    ]
-    if not repave_applied:
-        die(f"Machine missing RepavePending=False/Applied condition: {conditions}")
+    wait_for_machine_applied_configuration(target_version_number, target_mcv)
 
     log("============================================")
     log("  OnDelete repave upgrade validation PASSED")
     log("============================================")
     kubectl(["get", "machine", AGENT_MACHINE_NAME, "-o", "wide"])
     kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
+
+
+def wait_for_machine_applied_configuration(target_version_number: int, target_mcv: str) -> None:
+    """Wait for the agent daemon to report the applied MachineConfiguration."""
+
+    timeout_secs = 120
+    elapsed = 0
+    last_status_config: dict[str, Any] = {}
+    last_conditions: list[dict[str, Any]] = []
+    while elapsed < timeout_secs:
+        machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
+        last_status_config = machine.get("status", {}).get("configuration", {})
+        last_conditions = machine.get("status", {}).get("conditions", [])
+        repave_applied = [
+            c for c in last_conditions
+            if c.get("type") == "RepavePending" and c.get("status") == "False" and c.get("reason") == "Applied"
+        ]
+        if (
+            last_status_config.get("version") == target_version_number
+            and last_status_config.get("versionName") == target_mcv
+            and repave_applied
+        ):
+            log(f"Machine status.configuration recorded {target_mcv} after {elapsed}s")
+            return
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) waiting for Machine status.configuration={target_mcv}; "
+                f"last={last_status_config}")
+        time.sleep(5)
+        elapsed += 5
+
+    die(f"Machine status.configuration did not record {target_mcv}: "
+        f"{last_status_config}; conditions: {last_conditions}")
 
 
 # ---------------------------------------------------------------------------

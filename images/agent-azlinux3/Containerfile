@@ -3,9 +3,21 @@
 
 FROM mcr.microsoft.com/azurelinux/base/core:3.0
 
+# Azure Linux's packaged iptables.service restores default DROP policies.
+# nspawn shares the host network namespace, so those rules block
+# apiserver-to-kubelet traffic on port 10250 after the agent flushes host
+# nftables. Keep firewall policy owned by the host bootstrap instead.
 RUN tdnf install -y \
       systemd dbus curl ca-certificates \
       iproute nftables iptables kmod systemd-udev procps-ng wireguard-tools bpftool \
+    && rm -f \
+      /usr/lib/systemd/system/iptables.service \
+      /usr/lib/systemd/system/ip6tables.service \
+      /usr/lib/systemd/system/nftables.service \
+      /etc/systemd/scripts/iptables \
+      /etc/systemd/scripts/iptables.stop \
+      /etc/systemd/scripts/ip4save \
+      /etc/systemd/scripts/ip6save \
     && tdnf clean all
 
 # TODO: pre-install containerd / runc / kubernetes binaries
