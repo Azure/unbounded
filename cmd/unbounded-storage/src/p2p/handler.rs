@@ -387,7 +387,16 @@ where
                     .ok_or(RecursiveHandlerError::NoScratchPage)?;
                 self.page_idx = Some(idx);
                 let dst = scratch_page(idx, page_size);
-                serve_owned(&self.store, self.backend, self.req, self.key, self.src, dst)?;
+                serve_owned(
+                    &self.store,
+                    self.backend,
+                    self.req,
+                    self.key,
+                    self.src,
+                    dst,
+                    self.scratch.backing.base,
+                    page_size,
+                )?;
                 Ok(self.clamped_page(idx, page_size))
             }
             Route::Forward => {
@@ -458,6 +467,8 @@ fn serve_owned<R, S, B>(
     key: StripeKey,
     src: BulkRef,
     dst: PageRef,
+    backing_base: *mut u8,
+    page_size: usize,
 ) -> Result<(), RecursiveHandlerError>
 where
     R: Req,
@@ -467,7 +478,21 @@ where
     let hit = block_on_local(store.read_page(key, src.offset, dst))
         .map_err(RecursiveHandlerError::BlockStore)?;
     if hit {
-        return Ok(());
+        // SAFETY: `dst` is a checked-out scratch page owned by this
+        // handler stream, and every scratch slot has exactly `page_size`
+        // bytes in the registered backing.
+        let page = unsafe {
+            std::slice::from_raw_parts(
+                backing_base.add(dst.page_idx as usize * page_size),
+                page_size,
+            )
+        };
+        if !req
+            .should_refresh_cached_page(page)
+            .map_err(RecursiveHandlerError::BlockStore)?
+        {
+            return Ok(());
+        }
     }
     let stream = backend.bulk_get(req, src, std::slice::from_ref(&dst));
     drive_page_stream(stream).map_err(RecursiveHandlerError::Backend)
@@ -539,11 +564,18 @@ mod tests {
     const PAGE: usize = 4096;
     const SCRATCH_PAGES: usize = 2;
 
-    struct TestReq(StripeKey);
+    struct TestReq {
+        key: StripeKey,
+        refresh_cached_page: bool,
+    }
 
     impl Req for TestReq {
         fn key(&self) -> StripeKey {
-            self.0
+            self.key
+        }
+
+        fn should_refresh_cached_page(&self, _page: &[u8]) -> Result<bool, Error> {
+            Ok(self.refresh_cached_page)
         }
     }
 
@@ -679,6 +711,20 @@ mod tests {
         unsafe { *base.add(idx as usize * PAGE) }
     }
 
+    fn test_req(key: StripeKey) -> TestReq {
+        TestReq {
+            key,
+            refresh_cached_page: false,
+        }
+    }
+
+    fn refresh_req(key: StripeKey) -> TestReq {
+        TestReq {
+            key,
+            refresh_cached_page: true,
+        }
+    }
+
     fn peer(node: u64) -> PeerEntry {
         PeerEntry {
             node: NodeId(node),
@@ -751,12 +797,31 @@ mod tests {
         let key = key_for_ring(42);
         let store = mem_store(base, &[(key.0, 0xAB)], &[]);
         let backend = NullBackend::<TestReq>::new();
-        let req = TestReq(key);
+        let req = test_req(key);
         let dst = scratch_page(0, PAGE);
 
-        serve_owned(&store, &backend, &req, key, src_for(key), dst)
+        serve_owned(&store, &backend, &req, key, src_for(key), dst, base, PAGE)
             .expect("resident read must succeed");
         assert_eq!(page_byte(base, 0), 0xAB, "store did not fill the page");
+        assert_eq!(store.reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn owner_resident_refresh_uses_backend_fill() {
+        let (_backing, base) = scratch_backing();
+        let key = key_for_ring(43);
+        let store = mem_store(base, &[(key.0, 0xAB)], &[]);
+        let backend = FillBackend {
+            base,
+            page_size: PAGE,
+            fill: 0xCD,
+        };
+        let req = refresh_req(key);
+        let dst = scratch_page(0, PAGE);
+
+        serve_owned(&store, &backend, &req, key, src_for(key), dst, base, PAGE)
+            .expect("stale resident read must refresh from backend");
+        assert_eq!(page_byte(base, 0), 0xCD, "backend did not refresh the page");
         assert_eq!(store.reads.load(Ordering::Relaxed), 1);
     }
 
@@ -771,10 +836,10 @@ mod tests {
             page_size: PAGE,
             fill: 0xCD,
         };
-        let req = TestReq(key);
+        let req = test_req(key);
         let dst = scratch_page(1, PAGE);
 
-        serve_owned(&store, &backend, &req, key, src_for(key), dst)
+        serve_owned(&store, &backend, &req, key, src_for(key), dst, base, PAGE)
             .expect("backend fallback must succeed");
         assert_eq!(page_byte(base, 1), 0xCD, "backend did not fill the page");
     }
@@ -785,10 +850,10 @@ mod tests {
         let key = key_for_ring(9);
         let store = mem_store(base, &[], &[]);
         let backend = NullBackend::<TestReq>::new();
-        let req = TestReq(key);
+        let req = test_req(key);
         let dst = scratch_page(0, PAGE);
 
-        match serve_owned(&store, &backend, &req, key, src_for(key), dst) {
+        match serve_owned(&store, &backend, &req, key, src_for(key), dst, base, PAGE) {
             Err(RecursiveHandlerError::Backend(_)) => {}
             other => panic!("expected Backend error, got {other:?}"),
         }
@@ -800,10 +865,10 @@ mod tests {
         let key = key_for_ring(3);
         let store = mem_store(base, &[], &[key.0]);
         let backend = NullBackend::<TestReq>::new();
-        let req = TestReq(key);
+        let req = test_req(key);
         let dst = scratch_page(0, PAGE);
 
-        match serve_owned(&store, &backend, &req, key, src_for(key), dst) {
+        match serve_owned(&store, &backend, &req, key, src_for(key), dst, base, PAGE) {
             Err(RecursiveHandlerError::BlockStore(_)) => {}
             other => panic!("expected BlockStore error, got {other:?}"),
         }

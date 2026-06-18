@@ -366,7 +366,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     };
 
     let mut verify_attempts = 0;
-    let (len, cache_key_version, resolved) = loop {
+    let (len, cache_key_version, origin_match_version, resolved) = loop {
         // 5. Resolve object metadata through the pool. The HTTP backend
         // fills it from an origin HEAD on a miss or after a backend-provided
         // TTL expires.
@@ -375,6 +375,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
             .map_err(|_| ())?;
         let len = meta.length;
         let cache_key_version = meta.cache_key_version().map(str::to_string);
+        let origin_match_version = meta.origin_match_version().map(str::to_string);
 
         // 6. Resolve the requested range against the length.
         let resolved = match range {
@@ -397,7 +398,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         };
 
         if is_head || cache_key_version.is_none() || resolved.len() == 0 {
-            break (len, cache_key_version, resolved);
+            break (len, cache_key_version, origin_match_version, resolved);
         }
 
         let verify_result = match process_body(
@@ -408,6 +409,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
             backend_id,
             &path,
             cache_key_version.as_deref(),
+            origin_match_version.as_deref(),
             page_size,
             resolved,
             stripe_size,
@@ -423,6 +425,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
                     backend_id,
                     &path,
                     cache_key_version.as_deref(),
+                    origin_match_version.as_deref(),
                     page_size,
                     resolved,
                     stripe_size,
@@ -433,7 +436,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         };
 
         match verify_result {
-            Ok(()) => break (len, cache_key_version, resolved),
+            Ok(()) => break (len, cache_key_version, origin_match_version, resolved),
             Err(Error::OriginVersionMismatch)
                 if verify_attempts + 1 < VERSIONED_BODY_VERIFY_ATTEMPTS =>
             {
@@ -486,6 +489,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         backend_id,
         &path,
         cache_key_version.as_deref(),
+        origin_match_version.as_deref(),
         page_size,
         resolved,
         stripe_size,
@@ -549,12 +553,16 @@ fn stripe_request(
     backend_id: &str,
     path: &str,
     cache_key_version: Option<&str>,
+    origin_match_version: Option<&str>,
     slice: StripeSlice,
     source: BodySource,
 ) -> (StripeKey, StripeReq) {
     let mut origin_ref = OriginRef::new(backend_id, path, slice.stripe_idx);
     if let Some(version) = cache_key_version {
         origin_ref = origin_ref.with_cache_key_version(version);
+    }
+    if let Some(version) = origin_match_version {
+        origin_ref = origin_ref.with_origin_match_version(version);
     }
     let key = origin_ref.stripe_key();
     let mut req = StripeReq::new(key);
@@ -635,10 +643,18 @@ async fn dispatch_ticket(
     backend_id: &str,
     path: &str,
     cache_key_version: Option<&str>,
+    origin_match_version: Option<&str>,
     slice: StripeSlice,
     source: BodySource,
 ) -> Ticket {
-    let (key, req) = stripe_request(backend_id, path, cache_key_version, slice, source);
+    let (key, req) = stripe_request(
+        backend_id,
+        path,
+        cache_key_version,
+        origin_match_version,
+        slice,
+        source,
+    );
     match fanout.owner_of(&key, slice.intra_offset) {
         Owner::Local => Ticket::Local { slice },
         Owner::Peer(peer) => {
@@ -683,6 +699,7 @@ async fn process_body<P: BufferPool<Req = StripeReq>>(
     backend_id: &str,
     path: &str,
     cache_key_version: Option<&str>,
+    origin_match_version: Option<&str>,
     page_size: usize,
     resolved: ResolvedRange,
     stripe_size: u64,
@@ -693,8 +710,14 @@ async fn process_body<P: BufferPool<Req = StripeReq>>(
         let plans: Vec<StripePlan<StripeReq>> = slices
             .into_iter()
             .map(|slice| {
-                let (_key, req) =
-                    stripe_request(backend_id, path, cache_key_version, slice, source);
+                let (_key, req) = stripe_request(
+                    backend_id,
+                    path,
+                    cache_key_version,
+                    origin_match_version,
+                    slice,
+                    source,
+                );
                 StripePlan {
                     req,
                     intra_offset: slice.intra_offset,
@@ -723,6 +746,7 @@ async fn process_body<P: BufferPool<Req = StripeReq>>(
                 backend_id,
                 path,
                 cache_key_version,
+                origin_match_version,
                 slices[next],
                 source,
             )
@@ -732,7 +756,14 @@ async fn process_body<P: BufferPool<Req = StripeReq>>(
     }
 
     let local_plan = |slice: StripeSlice| {
-        let (_key, req) = stripe_request(backend_id, path, cache_key_version, slice, source);
+        let (_key, req) = stripe_request(
+            backend_id,
+            path,
+            cache_key_version,
+            origin_match_version,
+            slice,
+            source,
+        );
         StripePlan {
             req,
             intra_offset: slice.intra_offset,
@@ -788,6 +819,7 @@ async fn process_body<P: BufferPool<Req = StripeReq>>(
                             backend_id,
                             path,
                             cache_key_version,
+                            origin_match_version,
                             slice,
                             source,
                         )
@@ -830,6 +862,7 @@ async fn process_body<P: BufferPool<Req = StripeReq>>(
                     backend_id,
                     path,
                     cache_key_version,
+                    origin_match_version,
                     slices[next],
                     source,
                 )
@@ -1105,10 +1138,18 @@ mod tests {
             intra_offset: 0,
             intra_len: 10,
         };
-        let (base_key, _) = stripe_request("primary", "/o", None, slice, BodySource::OriginAllowed);
+        let (base_key, _) = stripe_request(
+            "primary",
+            "/o",
+            None,
+            None,
+            slice,
+            BodySource::OriginAllowed,
+        );
         let (v1_key, v1_req) = stripe_request(
             "primary",
             "/o",
+            Some("etag-1"),
             Some("etag-1"),
             slice,
             BodySource::OriginAllowed,
@@ -1116,6 +1157,7 @@ mod tests {
         let (v2_key, v2_req) = stripe_request(
             "primary",
             "/o",
+            Some("etag-2"),
             Some("etag-2"),
             slice,
             BodySource::OriginAllowed,
@@ -1125,7 +1167,47 @@ mod tests {
         assert_ne!(v1_key, v2_key);
         assert_eq!(v1_req.key(), v1_key);
         assert_eq!(v1_req.origin().unwrap().origin_object_id, "/o");
+        assert_eq!(
+            v1_req.origin().unwrap().origin_match_version.as_deref(),
+            Some("etag-1")
+        );
         assert_eq!(v2_req.origin().unwrap().origin_object_id, "/o");
+    }
+
+    #[test]
+    fn stripe_request_can_use_local_cache_version_without_origin_match() {
+        use crate::bufferpool::Req;
+
+        let slice = StripeSlice {
+            stripe_idx: 1,
+            intra_offset: 0,
+            intra_len: 10,
+        };
+        let (base_key, _) = stripe_request(
+            "primary",
+            "/o",
+            None,
+            None,
+            slice,
+            BodySource::OriginAllowed,
+        );
+        let (local_key, local_req) = stripe_request(
+            "primary",
+            "/o",
+            Some("unvalidated:10:1"),
+            None,
+            slice,
+            BodySource::OriginAllowed,
+        );
+
+        assert_ne!(base_key, local_key);
+        assert_eq!(local_req.key(), local_key);
+        let origin = local_req.origin().unwrap();
+        assert_eq!(
+            origin.cache_key_version.as_deref(),
+            Some("unvalidated:10:1")
+        );
+        assert_eq!(origin.origin_match_version, None);
     }
 
     #[test]
@@ -1141,12 +1223,14 @@ mod tests {
             "primary",
             "/o",
             Some("etag-1"),
+            Some("etag-1"),
             slice,
             BodySource::OriginAllowed,
         );
         let (cache_key, cache_req) = stripe_request(
             "primary",
             "/o",
+            Some("etag-1"),
             Some("etag-1"),
             slice,
             BodySource::CacheOnly,

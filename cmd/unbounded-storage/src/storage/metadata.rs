@@ -30,6 +30,8 @@
 //! does not fit in the entry's page.
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -40,8 +42,12 @@ use crate::bufferpool::Error;
 /// bincode payload on the page.
 const BLOB_LEN_PREFIX: usize = 8;
 const ENTRY_ETAG: &str = "etag";
+const ENTRY_CACHE_KEY_VERSION: &str = "cache-key-version";
 const ENTRY_CACHE_TTL_MS: &str = "cache-ttl-ms";
 const ENTRY_FETCHED_AT_UNIX_MS: &str = "fetched-at-unix-ms";
+
+static UNVALIDATED_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
+static UNVALIDATED_CACHE_SALT: LazyLock<u64> = LazyLock::new(rand::random::<u64>);
 
 /// An object's metadata: its byte length plus a small set of opaque
 /// key/value pairs.
@@ -98,6 +104,17 @@ impl ObjectMetadata {
         self.insert(ENTRY_ETAG, etag);
     }
 
+    /// Local body-cache namespace used when the origin requires
+    /// revalidation but did not provide a strong validator.
+    pub fn local_cache_key_version(&self) -> Option<&str> {
+        self.get(ENTRY_CACHE_KEY_VERSION)
+    }
+
+    /// Store a local body-cache namespace.
+    pub fn set_local_cache_key_version(&mut self, version: impl Into<String>) {
+        self.insert(ENTRY_CACHE_KEY_VERSION, version);
+    }
+
     /// Cache freshness TTL in milliseconds, if the backend supplied one.
     pub fn cache_ttl_ms(&self) -> Option<u64> {
         self.get(ENTRY_CACHE_TTL_MS)?.parse().ok()
@@ -131,18 +148,25 @@ impl ObjectMetadata {
         now_ms < fetched_at_ms.saturating_add(ttl_ms)
     }
 
-    /// The version string folded into data stripe keys. When the origin
-    /// ETag changes, the frontend naturally addresses a new set of data
-    /// pages while old pages remain unreachable until eviction.
+    /// The version string folded into data stripe keys. Strong ETags are
+    /// preferred because they can also validate origin GETs; for
+    /// cache-controlled responses without a strong ETag, this falls back
+    /// to a local generation so refreshed metadata cannot address old
+    /// body stripes.
     pub fn cache_key_version(&self) -> Option<&str> {
+        self.etag().or_else(|| self.local_cache_key_version())
+    }
+
+    /// Strong origin validator safe to send as `If-Match` on data GETs.
+    pub fn origin_match_version(&self) -> Option<&str> {
         self.etag()
     }
 
     /// Build metadata from an origin `HEAD` response. Backends express
-    /// per-key TTLs through the standard `Cache-Control` header; the cache
-    /// currently honors directives that require immediate revalidation, plus
-    /// `s-maxage` or `max-age` when an ETag is present so revalidation can
-    /// compare object versions safely.
+    /// per-key TTLs through the standard `Cache-Control` header. Strong
+    /// ETags are used as origin validators; without one, cache-controlled
+    /// responses receive a local body namespace so revalidation never
+    /// reuses stripes fetched for an older metadata observation.
     pub fn from_origin_head(
         length: u64,
         etag: Option<&str>,
@@ -154,9 +178,12 @@ impl ObjectMetadata {
         if let Some(etag) = etag.filter(|v| is_strong_etag(v)) {
             meta.set_etag(etag);
         }
-        if matches!(ttl_ms, Some(0)) || (meta.etag().is_some() && ttl_ms.is_some()) {
-            meta.set_cache_ttl_ms(ttl_ms.unwrap());
+        if let Some(ttl_ms) = ttl_ms {
+            meta.set_cache_ttl_ms(ttl_ms);
             meta.set_fetched_at_unix_ms(fetched_at_ms);
+            if meta.etag().is_none() {
+                meta.set_local_cache_key_version(next_unvalidated_cache_version(fetched_at_ms));
+            }
         }
         meta
     }
@@ -237,6 +264,14 @@ fn is_strong_etag(value: &str) -> bool {
     !value.is_empty() && !value.starts_with("W/")
 }
 
+fn next_unvalidated_cache_version(fetched_at_ms: u64) -> String {
+    let generation = UNVALIDATED_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "unvalidated:{:016x}:{fetched_at_ms}:{generation}",
+        *UNVALIDATED_CACHE_SALT
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +319,7 @@ mod tests {
         assert_eq!(meta.cache_ttl_ms(), Some(60_000));
         assert_eq!(meta.fetched_at_unix_ms(), Some(1_000));
         assert_eq!(meta.cache_key_version(), Some("\"abc\""));
+        assert_eq!(meta.origin_match_version(), Some("\"abc\""));
         assert!(meta.is_fresh_at(60_999));
         assert!(!meta.is_fresh_at(61_000));
     }
@@ -318,11 +354,27 @@ mod tests {
     }
 
     #[test]
-    fn origin_head_ignores_ttl_without_etag() {
+    fn origin_head_uses_local_cache_namespace_without_etag() {
         let meta = ObjectMetadata::from_origin_head(1, None, Some("max-age=5"), 10);
         assert_eq!(meta.etag(), None);
-        assert_eq!(meta.cache_ttl_ms(), None);
-        assert!(meta.is_fresh_at(u64::MAX));
+        assert_eq!(meta.cache_ttl_ms(), Some(5_000));
+        assert_eq!(meta.fetched_at_unix_ms(), Some(10));
+        assert_eq!(meta.cache_key_version(), meta.local_cache_key_version());
+        assert!(meta.cache_key_version().is_some());
+        assert_eq!(meta.origin_match_version(), None);
+        assert!(meta.is_fresh_at(5_009));
+        assert!(!meta.is_fresh_at(5_010));
+    }
+
+    #[test]
+    fn ttl_without_etag_changes_body_cache_namespace() {
+        let a = ObjectMetadata::from_origin_head(1, None, Some("max-age=5"), 10);
+        let b = ObjectMetadata::from_origin_head(1, None, Some("max-age=5"), 10);
+
+        assert_ne!(a.cache_key_version(), None);
+        assert_ne!(a.cache_key_version(), b.cache_key_version());
+        assert_eq!(a.origin_match_version(), None);
+        assert_eq!(b.origin_match_version(), None);
     }
 
     #[test]
@@ -331,16 +383,42 @@ mod tests {
         assert_eq!(meta.etag(), None);
         assert_eq!(meta.cache_ttl_ms(), Some(0));
         assert_eq!(meta.fetched_at_unix_ms(), Some(10));
-        assert_eq!(meta.cache_key_version(), None);
+        assert!(meta.cache_key_version().is_some());
+        assert_eq!(meta.origin_match_version(), None);
         assert!(!meta.is_fresh_at(10));
     }
 
     #[test]
-    fn origin_head_ignores_weak_etag() {
+    fn immediate_revalidation_without_etag_changes_body_cache_namespace() {
+        let a = ObjectMetadata::from_origin_head(1, None, Some("no-cache"), 10);
+        let b = ObjectMetadata::from_origin_head(1, None, Some("no-cache"), 10);
+
+        assert_ne!(a.cache_key_version(), None);
+        assert_ne!(a.cache_key_version(), b.cache_key_version());
+        assert_eq!(a.origin_match_version(), None);
+        assert_eq!(b.origin_match_version(), None);
+    }
+
+    #[test]
+    fn weak_etag_with_ttl_gets_local_cache_namespace() {
         let meta = ObjectMetadata::from_origin_head(1, Some("W/\"abc\""), Some("max-age=5"), 10);
         assert_eq!(meta.etag(), None);
-        assert_eq!(meta.cache_ttl_ms(), None);
-        assert_eq!(meta.cache_key_version(), None);
+        assert_eq!(meta.cache_ttl_ms(), Some(5_000));
+        assert_eq!(meta.fetched_at_unix_ms(), Some(10));
+        assert_eq!(meta.cache_key_version(), meta.local_cache_key_version());
+        assert!(meta.cache_key_version().is_some());
+        assert_eq!(meta.origin_match_version(), None);
+        assert!(meta.is_fresh_at(5_009));
+        assert!(!meta.is_fresh_at(5_010));
+    }
+
+    #[test]
+    fn weak_etag_with_immediate_revalidation_gets_local_cache_namespace() {
+        let meta = ObjectMetadata::from_origin_head(1, Some("W/\"abc\""), Some("no-store"), 10);
+        assert_eq!(meta.etag(), None);
+        assert_eq!(meta.cache_ttl_ms(), Some(0));
+        assert!(meta.cache_key_version().is_some());
+        assert_eq!(meta.origin_match_version(), None);
     }
 
     #[test]

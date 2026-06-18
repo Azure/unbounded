@@ -63,6 +63,7 @@ pub struct OriginRef {
     pub origin_object_id: String,
     pub stripe_idx: u64,
     pub cache_key_version: Option<String>,
+    pub origin_match_version: Option<String>,
 }
 
 impl OriginRef {
@@ -76,6 +77,7 @@ impl OriginRef {
             origin_object_id: origin_object_id.into(),
             stripe_idx,
             cache_key_version: None,
+            origin_match_version: None,
         }
     }
 
@@ -93,6 +95,7 @@ impl OriginRef {
             origin_object_id: origin_object_id.into(),
             stripe_idx: METADATA_STRIPE_IDX,
             cache_key_version: None,
+            origin_match_version: None,
         }
     }
 
@@ -102,6 +105,17 @@ impl OriginRef {
         let version = version.into();
         if !version.is_empty() {
             self.cache_key_version = Some(version);
+        }
+        self
+    }
+
+    /// Return a copy whose origin GETs are conditioned on `version`.
+    /// This must only carry strong origin validators, never local cache
+    /// generations.
+    pub fn with_origin_match_version(mut self, version: impl Into<String>) -> Self {
+        let version = version.into();
+        if !version.is_empty() {
+            self.origin_match_version = Some(version);
         }
         self
     }
@@ -402,8 +416,35 @@ mod tests {
         let b = OriginRef::metadata_entry("b", "obj");
 
         assert_eq!(a.cache_key_version, None);
+        assert_eq!(a.origin_match_version, None);
         assert_eq!(a.stripe_key(), b.stripe_key());
         assert_eq!(a.stripe_key(), stripe_key("b", "obj", METADATA_STRIPE_IDX));
+    }
+
+    #[test]
+    fn origin_match_version_does_not_change_cache_key() {
+        let base = OriginRef::new("b", "obj", 3);
+        let matched = base.clone().with_origin_match_version("\"etag-1\"");
+
+        assert_eq!(base.stripe_key(), matched.stripe_key());
+        assert_eq!(matched.origin_match_version, Some("\"etag-1\"".to_string()));
+    }
+
+    #[test]
+    fn unvalidated_metadata_generations_change_body_cache_keys() {
+        let a = ObjectMetadata::from_origin_head(1, None, Some("no-cache"), 10);
+        let b = ObjectMetadata::from_origin_head(1, None, Some("no-cache"), 10);
+
+        let a_origin =
+            OriginRef::new("b", "obj", 3).with_cache_key_version(a.cache_key_version().unwrap());
+        let b_origin =
+            OriginRef::new("b", "obj", 3).with_cache_key_version(b.cache_key_version().unwrap());
+
+        assert_ne!(a_origin.stripe_key(), b_origin.stripe_key());
+        assert_eq!(a.origin_match_version(), None);
+        assert_eq!(b.origin_match_version(), None);
+        assert_eq!(a_origin.origin_match_version, None);
+        assert_eq!(b_origin.origin_match_version, None);
     }
 
     #[test]

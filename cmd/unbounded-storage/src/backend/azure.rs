@@ -166,7 +166,7 @@ impl AzureBackend {
 
         debug_assert!(!origin.is_metadata_entry());
         let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
-        let cache_key_version = origin.cache_key_version.clone();
+        let origin_match_version = origin.origin_match_version.clone();
 
         let fut = Box::pin(crate::metrics::instrument_backend(
             self.backend_id().to_string(),
@@ -176,7 +176,7 @@ impl AzureBackend {
                 origin_addr,
                 host,
                 path,
-                cache_key_version,
+                origin_match_version,
                 start,
                 len,
                 dsts_owned.clone(),
@@ -295,7 +295,7 @@ async fn fetch(
     origin: SockAddr,
     host: String,
     path: String,
-    cache_key_version: Option<String>,
+    origin_match_version: Option<String>,
     start: u64,
     len: u64,
     dsts: Vec<PageRef>,
@@ -328,7 +328,7 @@ async fn fetch(
     let request = format_get_request(
         &path,
         &host,
-        cache_key_version.as_deref(),
+        origin_match_version.as_deref(),
         start,
         start + len - 1,
     )?;
@@ -753,7 +753,7 @@ fn absolute_range(stripe_idx: u64, stripe_size: u64, src_offset: u64, src_len: u
 fn format_get_request(
     path: &str,
     host: &str,
-    cache_key_version: Option<&str>,
+    origin_match_version: Option<&str>,
     start: u64,
     end: u64,
 ) -> Result<Vec<u8>, Error> {
@@ -764,7 +764,7 @@ fn format_get_request(
         .header(RANGE, format!("bytes={start}-{end}"))
         .header("x-ms-version", AZURE_MS_VERSION)
         .header(CONNECTION, "close");
-    if let Some(version) = cache_key_version {
+    if let Some(version) = origin_match_version {
         builder = builder.header(IF_MATCH, version);
     }
     let req = builder
