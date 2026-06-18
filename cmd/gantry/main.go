@@ -376,9 +376,9 @@ func runAgent(args []string) error {
 	// pullerPump bridges inbound please_pull RPCs to the local origin
 	// puller (the step 7). The pump itself MUST NOT block the coord
 	// stream handler; the actual origin fetch + cache write + advertiser
-	// mark-present happen in a detached goroutine. pullerPumpWG tracks
+	// mark-present happen in a detached goroutine. pullerPumpGate tracks
 	// outstanding goroutines so graceful shutdown can let the final
-	// advertise path flush before disco.Close fires .
+	// advertise path flush before disco.Close fires.
 	pullerPumpGate := newPullerPumpGate()
 
 	leaseHooks := leaseMetricHooks{

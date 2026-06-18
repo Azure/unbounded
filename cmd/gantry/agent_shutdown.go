@@ -14,7 +14,9 @@ import (
 )
 
 // shutdownDeps bundles the subsystems the agent has to drain on
-// SIGTERM. All fields are required; nil is undefined behaviour.
+// SIGTERM. coordStop and pullerPumpGate are optional and may be nil
+// (gracefulShutdown skips them when unset); every other field is
+// required and a nil value is undefined behaviour.
 type shutdownDeps struct {
 	logger         *slog.Logger
 	mirrorSrv      *mirror.Server
@@ -73,6 +75,7 @@ func gracefulShutdown(d shutdownDeps) {
 			d.logger.Warn("cdsub source close error", slog.Any("err", err))
 		}
 	}
+
 	if d.coordStop != nil {
 		d.coordStop()
 	}

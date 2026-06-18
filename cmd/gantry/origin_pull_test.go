@@ -145,3 +145,81 @@ func TestPullerPumpStopsAcceptingBeforeWait(t *testing.T) {
 		t.Fatalf("cache.Has after declined pump = %v, %v; want false, nil", ok, err)
 	}
 }
+
+// TestPullerPumpDeclinesLateCallWhileShutdownWaits exercises the original race
+// the gate was added to close: one origin pull is in flight (gate counter > 0),
+// graceful shutdown calls StopAccepting then parks in Wait, and a late
+// please_pull lands while Wait is still blocked. The late call must be declined
+// without starting new work and without panicking, and Wait must return only
+// after the in-flight pull releases its handle.
+func TestPullerPumpDeclinesLateCallWhileShutdownWaits(t *testing.T) {
+	body := []byte("late-please-pull-during-wait")
+	d := trackerDigestOf(body)
+	originPuller := fakes.NewOriginPuller()
+	originPuller.Put(d, body)
+
+	cache := fakes.NewCache()
+	gate := newPullerPumpGate()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var starts int32
+
+	pump := newPullerPump(
+		inflight.New(inflight.DefaultStalls(), nil),
+		originPuller,
+		cache,
+		nil,
+		logger,
+		gate,
+		func(context.Context, digest.Digest) bool { return true },
+		func(string, int64) { atomic.AddInt32(&starts, 1) },
+		func(string, string) {},
+		leaseMetricHooks{},
+	)
+
+	// Simulate one origin pull already in flight: the counter is > 0, exactly
+	// as it is after a please_pull spawned runOriginPull but before that
+	// goroutine called Done.
+	if !gate.TryAdd() {
+		t.Fatal("TryAdd on a fresh gate = false, want true")
+	}
+
+	// Shutdown stops accepting, signals once that happened, then parks in Wait
+	// until the in-flight pull releases. Gating the late call on stopped keeps
+	// the test deterministic while still modelling shutdown's StopAccepting+Wait
+	// ordering (StopAccepting always precedes Wait in gracefulShutdown).
+	stopped := make(chan struct{})
+	waitReturned := make(chan struct{})
+
+	go func() {
+		gate.StopAccepting()
+		close(stopped)
+		gate.Wait()
+		close(waitReturned)
+	}()
+
+	<-stopped
+
+	// The late please_pull arrives while Wait is blocked on the in-flight pull.
+	startedAt, already, fail := pump(context.Background(), "registry.example.com", "library/test", d, ifaces.KindBlob)
+	if fail != nil {
+		t.Fatalf("fail = %#v, want nil", fail)
+	}
+
+	if !already || startedAt.IsZero() {
+		t.Fatalf("late pump result = startedAt=%v already=%v, want already with non-zero start time", startedAt, already)
+	}
+
+	// Releasing the in-flight pull is the only thing that may unblock Wait; if
+	// the late call had leaked a counter this would never close.
+	gate.Done()
+	<-waitReturned
+
+	if got := atomic.LoadInt32(&starts); got != 0 {
+		t.Fatalf("origin pulls started after gate closed = %d, want 0", got)
+	}
+
+	if ok, err := cache.Has(context.Background(), d); err != nil || ok {
+		t.Fatalf("cache.Has after declined pump = %v, %v; want false, nil", ok, err)
+	}
+}
