@@ -387,8 +387,8 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
     // the plain HTTP frontend, a length-read failure is never a silently
     // dropped connection.
-    let len = match read_object_length_s3(pool, backend_id, &path, page_size).await {
-        LenResult::Len(l) => l,
+    let meta = match read_object_metadata_s3(pool, backend_id, &path, page_size).await {
+        LenResult::Metadata(m) => m,
         LenResult::NotFound => {
             let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
             let _ = send_all(handle, conn_fd, bytes).await;
@@ -410,6 +410,8 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
             return Ok(());
         }
     };
+    let len = meta.length;
+    let cache_key_version = meta.cache_key_version().map(str::to_string);
 
     // 6. Resolve the requested range against the length.
     let resolved = match range {
@@ -489,11 +491,10 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     let plans: Vec<StripePlan<StripeReq>> = stripe_set(resolved, stripe_size)
         .into_iter()
         .map(|slice| {
-            let origin_ref = OriginRef {
-                backend_id: backend_id.to_string(),
-                origin_object_id: path.clone(),
-                stripe_idx: slice.stripe_idx,
-            };
+            let mut origin_ref = OriginRef::new(backend_id, &path, slice.stripe_idx);
+            if let Some(version) = cache_key_version.as_deref() {
+                origin_ref = origin_ref.with_cache_key_version(version);
+            }
             StripePlan {
                 req: StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref),
                 intra_offset: slice.intra_offset,
@@ -534,12 +535,12 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     Ok(())
 }
 
-/// Outcome of reading an object's length entry, preserving the one
+/// Outcome of reading an object's metadata entry, preserving the one
 /// distinction the S3 frontend acts on: a missing origin object maps to
 /// a 404, every other failure to a 500.
 enum LenResult {
-    /// The metadata entry resolved to this byte length.
-    Len(u64),
+    /// The metadata entry resolved to this object metadata.
+    Metadata(ObjectMetadata),
     /// The origin reported the object does not exist
     /// ([`Error::OriginNotFound`]).
     NotFound,
@@ -547,16 +548,16 @@ enum LenResult {
     Other,
 }
 
-/// Resolve an object's length by reading its dedicated content-addressed
-/// metadata entry through the pool, preserving an
+/// Resolve an object's metadata by reading its dedicated metadata entry
+/// through the pool, preserving an
 /// [`Error::OriginNotFound`] as [`LenResult::NotFound`].
 ///
 /// This is the S3 frontend's own variant of
-/// `http_serve::read_object_length`, which collapses every error into
+/// `http_serve::read_object_metadata`, which collapses every error into
 /// `Err(())`. Here the error is inspected at both fallible points (the
 /// `read` call and the first `next_page`) so a 404 can be told apart
 /// from a 500.
-async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
+async fn read_object_metadata_s3<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     backend_id: &str,
     path: &str,
@@ -576,7 +577,7 @@ async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
         None => return LenResult::Other,
     };
     match ObjectMetadata::decode(page.as_slice()) {
-        Ok(meta) => LenResult::Len(meta.length),
+        Ok(meta) => LenResult::Metadata(meta),
         Err(_) => LenResult::Other,
     }
 }

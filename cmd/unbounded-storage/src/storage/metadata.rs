@@ -30,6 +30,7 @@
 //! does not fit in the entry's page.
 
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +39,9 @@ use crate::bufferpool::Error;
 /// Width of the little-endian `blob_len` prefix that precedes the
 /// bincode payload on the page.
 const BLOB_LEN_PREFIX: usize = 8;
+const ENTRY_ETAG: &str = "etag";
+const ENTRY_CACHE_TTL_MS: &str = "cache-ttl-ms";
+const ENTRY_FETCHED_AT_UNIX_MS: &str = "fetched-at-unix-ms";
 
 /// An object's metadata: its byte length plus a small set of opaque
 /// key/value pairs.
@@ -84,6 +88,77 @@ impl ObjectMetadata {
         self.entries.is_empty()
     }
 
+    /// Entity tag returned by the origin metadata `HEAD`, if present.
+    pub fn etag(&self) -> Option<&str> {
+        self.get(ENTRY_ETAG)
+    }
+
+    /// Store the origin entity tag exactly as returned in the header.
+    pub fn set_etag(&mut self, etag: impl Into<String>) {
+        self.insert(ENTRY_ETAG, etag);
+    }
+
+    /// Cache freshness TTL in milliseconds, if the backend supplied one.
+    pub fn cache_ttl_ms(&self) -> Option<u64> {
+        self.get(ENTRY_CACHE_TTL_MS)?.parse().ok()
+    }
+
+    /// Store the backend-supplied cache freshness TTL in milliseconds.
+    pub fn set_cache_ttl_ms(&mut self, ttl_ms: u64) {
+        self.insert(ENTRY_CACHE_TTL_MS, ttl_ms.to_string());
+    }
+
+    /// Unix timestamp in milliseconds when this metadata was fetched.
+    pub fn fetched_at_unix_ms(&self) -> Option<u64> {
+        self.get(ENTRY_FETCHED_AT_UNIX_MS)?.parse().ok()
+    }
+
+    /// Store the Unix timestamp in milliseconds when this metadata was fetched.
+    pub fn set_fetched_at_unix_ms(&mut self, fetched_at_ms: u64) {
+        self.insert(ENTRY_FETCHED_AT_UNIX_MS, fetched_at_ms.to_string());
+    }
+
+    /// Whether this cached metadata entry is still fresh at `now_ms`.
+    /// Entries without a backend TTL are immutable from the cache's point
+    /// of view and never require revalidation.
+    pub fn is_fresh_at(&self, now_ms: u64) -> bool {
+        let Some(ttl_ms) = self.cache_ttl_ms() else {
+            return true;
+        };
+        let Some(fetched_at_ms) = self.fetched_at_unix_ms() else {
+            return false;
+        };
+        now_ms < fetched_at_ms.saturating_add(ttl_ms)
+    }
+
+    /// The version string folded into data stripe keys. When the origin
+    /// ETag changes, the frontend naturally addresses a new set of data
+    /// pages while old pages remain unreachable until eviction.
+    pub fn cache_key_version(&self) -> Option<&str> {
+        self.etag()
+    }
+
+    /// Build metadata from an origin `HEAD` response. Backends express
+    /// per-key TTLs through the standard `Cache-Control` header; the cache
+    /// currently honors `s-maxage` or `max-age` when an ETag is present so
+    /// revalidation can compare object versions safely.
+    pub fn from_origin_head(
+        length: u64,
+        etag: Option<&str>,
+        cache_control: Option<&str>,
+        fetched_at_ms: u64,
+    ) -> Self {
+        let mut meta = Self::new(length);
+        if let Some(etag) = etag.filter(|v| !v.is_empty()) {
+            meta.set_etag(etag);
+            if let Some(ttl_ms) = cache_control.and_then(cache_control_ttl_ms) {
+                meta.set_cache_ttl_ms(ttl_ms);
+                meta.set_fetched_at_unix_ms(fetched_at_ms);
+            }
+        }
+        meta
+    }
+
     /// Encode into the on-page byte layout: an 8-byte little-endian
     /// payload-length prefix followed by the bincode payload. The
     /// caller writes this into the metadata entry's page (zero-filling
@@ -119,6 +194,36 @@ impl ObjectMetadata {
     }
 }
 
+/// Current Unix timestamp in milliseconds for metadata freshness stamps.
+pub fn now_unix_millis() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    millis.min(u128::from(u64::MAX)) as u64
+}
+
+fn cache_control_ttl_ms(value: &str) -> Option<u64> {
+    let mut max_age = None;
+    let mut shared_max_age = None;
+    for directive in value.split(',') {
+        let directive = directive.trim();
+        let Some((name, raw_value)) = directive.split_once('=') else {
+            continue;
+        };
+        let Ok(seconds) = raw_value.trim().trim_matches('"').parse::<u64>() else {
+            continue;
+        };
+        let ttl_ms = seconds.saturating_mul(1000);
+        if name.trim().eq_ignore_ascii_case("s-maxage") {
+            shared_max_age = Some(ttl_ms);
+        } else if name.trim().eq_ignore_ascii_case("max-age") {
+            max_age = Some(ttl_ms);
+        }
+    }
+    shared_max_age.or(max_age)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +256,38 @@ mod tests {
         );
         assert_eq!(decoded.get("etag"), Some("\"abc123\""));
         assert_eq!(decoded.get("missing"), None);
+    }
+
+    #[test]
+    fn origin_head_stores_etag_ttl_and_fetch_time() {
+        let meta = ObjectMetadata::from_origin_head(
+            123,
+            Some("\"abc\""),
+            Some("public, max-age=60"),
+            1_000,
+        );
+        assert_eq!(meta.length, 123);
+        assert_eq!(meta.etag(), Some("\"abc\""));
+        assert_eq!(meta.cache_ttl_ms(), Some(60_000));
+        assert_eq!(meta.fetched_at_unix_ms(), Some(1_000));
+        assert_eq!(meta.cache_key_version(), Some("\"abc\""));
+        assert!(meta.is_fresh_at(60_999));
+        assert!(!meta.is_fresh_at(61_000));
+    }
+
+    #[test]
+    fn origin_head_prefers_shared_max_age() {
+        let meta =
+            ObjectMetadata::from_origin_head(1, Some("etag"), Some("max-age=60, s-maxage=5"), 10);
+        assert_eq!(meta.cache_ttl_ms(), Some(5_000));
+    }
+
+    #[test]
+    fn origin_head_ignores_ttl_without_etag() {
+        let meta = ObjectMetadata::from_origin_head(1, None, Some("max-age=5"), 10);
+        assert_eq!(meta.etag(), None);
+        assert_eq!(meta.cache_ttl_ms(), None);
+        assert!(meta.is_fresh_at(u64::MAX));
     }
 
     #[test]

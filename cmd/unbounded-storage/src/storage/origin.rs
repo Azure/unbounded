@@ -28,7 +28,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::bufferpool::{Req, StripeKey};
+use crate::bufferpool::{Error, Req, StripeKey};
+
+use super::metadata::{ObjectMetadata, now_unix_millis};
 
 /// Reserved sentinel `stripe_idx` for an object's metadata entry.
 ///
@@ -60,6 +62,7 @@ pub struct OriginRef {
     pub backend_id: String,
     pub origin_object_id: String,
     pub stripe_idx: u64,
+    pub cache_key_version: Option<String>,
 }
 
 impl OriginRef {
@@ -72,6 +75,7 @@ impl OriginRef {
             backend_id: backend_id.into(),
             origin_object_id: origin_object_id.into(),
             stripe_idx,
+            cache_key_version: None,
         }
     }
 
@@ -88,7 +92,18 @@ impl OriginRef {
             backend_id: backend_id.into(),
             origin_object_id: origin_object_id.into(),
             stripe_idx: METADATA_STRIPE_IDX,
+            cache_key_version: None,
         }
+    }
+
+    /// Return a copy whose cache key includes `version`. The origin path
+    /// stays unchanged; only the content-addressed cache identity changes.
+    pub fn with_cache_key_version(mut self, version: impl Into<String>) -> Self {
+        let version = version.into();
+        if !version.is_empty() {
+            self.cache_key_version = Some(version);
+        }
+        self
     }
 
     /// Derive the canonical content-addressed [`StripeKey`] for this
@@ -106,6 +121,9 @@ impl OriginRef {
     /// 3. `origin_object_id.len()` as 8 little-endian bytes.
     /// 4. `origin_object_id` as raw UTF-8 bytes.
     /// 5. `stripe_idx` as 8 little-endian bytes (`u64::to_le_bytes`).
+    /// 6. If present, a one-byte version marker, then
+    ///    `cache_key_version.len()` as 8 little-endian bytes, then
+    ///    `cache_key_version` as raw UTF-8 bytes.
     ///
     /// The 32-byte blake3 digest is the [`StripeKey`]. blake3's output
     /// is already 32 bytes, so no truncation or expansion is needed.
@@ -117,7 +135,12 @@ impl OriginRef {
     /// pinned out-of-band for correctness. The 8-byte little-endian
     /// `stripe_idx` suffix is fixed width.
     pub fn stripe_key(&self) -> StripeKey {
-        stripe_key(&self.backend_id, &self.origin_object_id, self.stripe_idx)
+        stripe_key_versioned(
+            &self.backend_id,
+            &self.origin_object_id,
+            self.stripe_idx,
+            self.cache_key_version.as_deref(),
+        )
     }
 
     /// Whether this reference names an object's metadata entry rather
@@ -172,18 +195,45 @@ impl Req for StripeReq {
     fn key(&self) -> StripeKey {
         self.key
     }
+
+    fn should_refresh_cached_page(&self, page: &[u8]) -> Result<bool, Error> {
+        let Some(origin) = self.origin() else {
+            return Ok(false);
+        };
+        if !origin.is_metadata_entry() {
+            return Ok(false);
+        }
+        let Ok(meta) = ObjectMetadata::decode(page) else {
+            return Ok(true);
+        };
+        Ok(!meta.is_fresh_at(now_unix_millis()))
+    }
 }
 
 /// Free-function form of [`OriginRef::stripe_key`], for callers that
 /// have the parts in hand without an `OriginRef` value. See
 /// [`OriginRef::stripe_key`] for the exact byte layout.
 pub fn stripe_key(backend_id: &str, origin_object_id: &str, stripe_idx: u64) -> StripeKey {
+    stripe_key_versioned(backend_id, origin_object_id, stripe_idx, None)
+}
+
+fn stripe_key_versioned(
+    backend_id: &str,
+    origin_object_id: &str,
+    stripe_idx: u64,
+    cache_key_version: Option<&str>,
+) -> StripeKey {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&(backend_id.len() as u64).to_le_bytes());
     hasher.update(backend_id.as_bytes());
     hasher.update(&(origin_object_id.len() as u64).to_le_bytes());
     hasher.update(origin_object_id.as_bytes());
     hasher.update(&stripe_idx.to_le_bytes());
+    if let Some(version) = cache_key_version {
+        hasher.update(&[1]);
+        hasher.update(&(version.len() as u64).to_le_bytes());
+        hasher.update(version.as_bytes());
+    }
     StripeKey(*hasher.finalize().as_bytes())
 }
 
@@ -317,6 +367,28 @@ mod tests {
         for idx in [0u64, 1, 2, 1000] {
             assert_ne!(me, OriginRef::new("b", "obj", idx).stripe_key());
         }
+    }
+
+    #[test]
+    fn versioned_data_key_changes_identity_without_changing_origin_path() {
+        let base = OriginRef::new("b", "obj", 3);
+        let v1 = base.clone().with_cache_key_version("etag-1");
+        let v2 = base.clone().with_cache_key_version("etag-2");
+
+        assert_eq!(v1.origin_object_id, "obj");
+        assert_eq!(v1.stripe_idx, 3);
+        assert_ne!(base.stripe_key(), v1.stripe_key());
+        assert_ne!(v1.stripe_key(), v2.stripe_key());
+    }
+
+    #[test]
+    fn metadata_key_is_stable_without_version() {
+        let a = OriginRef::metadata_entry("b", "obj");
+        let b = OriginRef::metadata_entry("b", "obj");
+
+        assert_eq!(a.cache_key_version, None);
+        assert_eq!(a.stripe_key(), b.stripe_key());
+        assert_eq!(a.stripe_key(), stripe_key("b", "obj", METADATA_STRIPE_IDX));
     }
 
     #[test]

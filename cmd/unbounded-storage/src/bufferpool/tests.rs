@@ -115,11 +115,16 @@ fn heap_backing(page_size: usize, page_count: usize) -> Backing {
 #[derive(Clone, Debug)]
 struct TestReq {
     key: StripeKey,
+    refresh_cached_pages: bool,
 }
 
 impl Req for TestReq {
     fn key(&self) -> StripeKey {
         self.key
+    }
+
+    fn should_refresh_cached_page(&self, _page: &[u8]) -> Result<bool, Error> {
+        Ok(self.refresh_cached_pages)
     }
 }
 
@@ -417,6 +422,13 @@ fn key(b: u8) -> StripeKey {
     StripeKey([b; 32])
 }
 
+fn req(key: StripeKey) -> TestReq {
+    TestReq {
+        key,
+        refresh_cached_pages: false,
+    }
+}
+
 /// Pool owns the mocks via these adapters; tests retain a clone of
 /// the inner `Rc` so they can poke the mocks directly.
 struct TransportRc(Rc<MockTransport>);
@@ -496,7 +508,7 @@ fn disk_hit_returns_bytes_no_transport_call() {
     }
     store.preload(k, 0, data.clone());
 
-    let req = TestReq { key: k };
+    let req = req(k);
     let bytes = block_on(async {
         let mut s = pool.read(&req, 0, P as u64).await.unwrap();
         let g = s.next_page().await.unwrap().unwrap();
@@ -524,7 +536,7 @@ fn disk_miss_peer_fetch_with_tee_writes_blockstore() {
     }
     transport.put_stripe(k, stripe.clone());
 
-    let req = TestReq { key: k };
+    let req = req(k);
     let bytes = block_on(async {
         let mut s = pool.read(&req, 0, P as u64).await.unwrap();
         let g = s.next_page().await.unwrap().unwrap();
@@ -535,6 +547,66 @@ fn disk_miss_peer_fetch_with_tee_writes_blockstore() {
     assert_eq!(store.writes(), 1, "tee landed");
     assert_eq!(pool.free_pages(), 4);
     assert_eq!(pool.inflight_entries(), 0);
+}
+
+#[test]
+fn stale_disk_hit_refreshes_from_transport_and_retees() {
+    const P: usize = 4096;
+    let (pool, transport, store) = make_pool_v2(P, 4);
+    let k = key(0xB1);
+    store.preload(k, 0, vec![1u8; P]);
+    transport.put_stripe(k, vec![2u8; P]);
+
+    let req = TestReq {
+        key: k,
+        refresh_cached_pages: true,
+    };
+    let bytes = block_on(async {
+        let mut s = pool.read(&req, 0, P as u64).await.unwrap();
+        s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+    });
+
+    assert_eq!(bytes, vec![2u8; P]);
+    assert_eq!(store.reads(), 1);
+    assert_eq!(
+        transport.calls(),
+        1,
+        "stale hit revalidated through transport"
+    );
+    assert_eq!(store.writes(), 1, "refreshed bytes were written back");
+}
+
+#[test]
+fn stale_ram_hit_refreshes_before_serving() {
+    const P: usize = 4096;
+    let (pool, transport, store) = make_pool_v2(P, 4);
+    let k = key(0xB2);
+    transport.put_stripe(k, vec![1u8; P]);
+
+    let req = TestReq {
+        key: k,
+        refresh_cached_pages: true,
+    };
+    let (first, second) = block_on(async {
+        let mut s1 = pool.read(&req, 0, P as u64).await.unwrap();
+        let g1 = s1.next_page().await.unwrap().unwrap();
+        let first = g1.as_slice().to_vec();
+        drop(g1);
+
+        transport.put_stripe(k, vec![3u8; P]);
+        let mut s2 = pool.read(&req, 0, P as u64).await.unwrap();
+        let g2 = s2.next_page().await.unwrap().unwrap();
+        let second = g2.as_slice().to_vec();
+        drop(g2);
+        drop(s2);
+        drop(s1);
+        (first, second)
+    });
+
+    assert_eq!(first, vec![1u8; P]);
+    assert_eq!(second, vec![3u8; P]);
+    assert_eq!(transport.calls(), 2);
+    assert_eq!(store.writes(), 2);
 }
 
 #[test]
@@ -552,7 +624,7 @@ fn multi_page_window_with_intra_page_offsets() {
     // on first and last.
     let off = (P / 2) as u64;
     let len = (P + P) as u64; // total 2*P bytes; spans 3 pages
-    let req = TestReq { key: k };
+    let req = req(k);
     let bytes = block_on(async {
         let mut out = Vec::new();
         let mut s = pool.read(&req, off, len).await.unwrap();
@@ -579,8 +651,8 @@ fn single_flight_coalesces_concurrent_reads() {
     transport.put_stripe(k, stripe.clone());
     transport.set_pend_polls(2);
 
-    let req1 = TestReq { key: k };
-    let req2 = TestReq { key: k };
+    let req1 = req(k);
+    let req2 = req(k);
     let f1 = async {
         let mut s = pool.read(&req1, 0, P as u64).await.unwrap();
         s.next_page().await.unwrap().unwrap().as_slice().to_vec()
@@ -603,7 +675,7 @@ fn eof_terminates_with_none() {
     let (pool, _transport, store) = make_pool_v2(P, 4);
     let k = key(1);
     store.preload(k, 0, vec![9u8; P]);
-    let req = TestReq { key: k };
+    let req = req(k);
     block_on(async {
         let mut s = pool.read(&req, 0, P as u64).await.unwrap();
         let g = s.next_page().await.unwrap().unwrap();
@@ -620,7 +692,7 @@ fn transport_error_propagates_and_recycles_pages() {
     let k = key(2);
     transport.put_stripe(k, vec![0u8; P]);
     transport.set_error_mode(true);
-    let req = TestReq { key: k };
+    let req = req(k);
     let r: Result<(), Error> = block_on(async {
         let mut s = pool.read(&req, 0, P as u64).await.unwrap();
         match s.next_page().await {
@@ -652,7 +724,7 @@ fn dropped_leader_promotes_new_leader() {
     transport.put_stripe(k, stripe.clone());
     transport.set_pend_polls(2);
 
-    let req = TestReq { key: k };
+    let req = req(k);
 
     // Start reader 1; poll once so it becomes leader and parks
     // on bulk_get (pend_polls=2 -> pends twice).
@@ -704,8 +776,8 @@ fn free_list_parking_unblocks_on_release() {
     store.preload(k1, 0, vec![1u8; P]);
     store.preload(k2, 0, vec![2u8; P]);
 
-    let req1 = TestReq { key: k1 };
-    let req2 = TestReq { key: k2 };
+    let req1 = req(k1);
+    let req2 = req(k2);
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -765,7 +837,7 @@ fn stream_limit_enforced() {
         BlockStoreRc(s.clone()),
     )
     .unwrap();
-    let req = TestReq { key: key(0) };
+    let req = req(key(0));
     block_on(async {
         let s1 = pool.read(&req, 0, P as u64).await.unwrap();
         let r2 = pool.read(&req, 0, P as u64).await;
@@ -815,8 +887,8 @@ fn non_leader_consumes_concurrently_with_tee() {
     transport.put_stripe(k, stripe.clone());
     store.set_write_pend_polls(8);
 
-    let req1 = TestReq { key: k };
-    let req2 = TestReq { key: k };
+    let req1 = req(k);
+    let req2 = req(k);
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -875,8 +947,8 @@ fn page_pinned_across_tee_until_subscriber_drops() {
     transport.put_stripe(k, vec![0xAAu8; P]);
     store.set_write_pend_polls(4);
 
-    let req1 = TestReq { key: k };
-    let req2 = TestReq { key: k };
+    let req1 = req(k);
+    let req2 = req(k);
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -942,7 +1014,7 @@ fn leader_drop_during_tee_releases_page() {
     transport.put_stripe(k, vec![0xCDu8; P]);
     store.set_write_pend_polls(8);
 
-    let req = TestReq { key: k };
+    let req = req(k);
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -994,7 +1066,7 @@ fn pipelined_delivers_bytes_in_order_across_stripes() {
         transport.put_stripe(k, stripe.clone());
         expected.extend_from_slice(&stripe);
         plans.push(StripePlan {
-            req: TestReq { key: k },
+            req: req(k),
             intra_offset: 0,
             intra_len: (P * 2) as u64,
         });
@@ -1031,7 +1103,7 @@ fn pipelined_prefetch_overlaps_across_stripe_boundaries() {
         transport.put_stripe(k, stripe.clone());
         expected.extend_from_slice(&stripe);
         plans.push(StripePlan {
-            req: TestReq { key: k },
+            req: req(k),
             intra_offset: 0,
             intra_len: P as u64,
         });
@@ -1075,12 +1147,12 @@ fn pipelined_partial_first_and_last_slice() {
     // (partial single page).
     let plans = vec![
         StripePlan {
-            req: TestReq { key: k0 },
+            req: req(k0),
             intra_offset: 512,
             intra_len: 1536,
         },
         StripePlan {
-            req: TestReq { key: k1 },
+            req: req(k1),
             intra_offset: 0,
             intra_len: 512,
         },
@@ -1114,7 +1186,7 @@ fn pipelined_drop_midway_recycles_pages_and_budget() {
         let k = key(0x80 + i);
         transport.put_stripe(k, fill(P * 2, i));
         plans.push(StripePlan {
-            req: TestReq { key: k },
+            req: req(k),
             intra_offset: 0,
             intra_len: (P * 2) as u64,
         });
@@ -1148,17 +1220,17 @@ fn pipelined_skips_zero_length_slices() {
     // A zero-length middle slice must be dropped entirely.
     let plans = vec![
         StripePlan {
-            req: TestReq { key: k0 },
+            req: req(k0),
             intra_offset: 0,
             intra_len: P as u64,
         },
         StripePlan {
-            req: TestReq { key: key(0xFF) },
+            req: req(key(0xFF)),
             intra_offset: 0,
             intra_len: 0,
         },
         StripePlan {
-            req: TestReq { key: k1 },
+            req: req(k1),
             intra_offset: 0,
             intra_len: P as u64,
         },

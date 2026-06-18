@@ -18,8 +18,8 @@
 //!    one future per live connection) advanced by [`HttpDriver::progress`],
 //!    which the shard loop registers as a tick hook.
 //!
-//! The hot serve path is: parse the request, resolve the object length
-//! by reading the object's dedicated length entry through the pool,
+//! The hot serve path is: parse the request, resolve the object metadata
+//! by reading the object's dedicated metadata entry through the pool,
 //! resolve the byte range, write the
 //! response head, then stream the body stripe-by-stripe out of the
 //! bufferpool with zero-copy `SEND_ZC`, holding each [`PageGuard`]
@@ -363,13 +363,14 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         None => None,
     };
 
-    // 5. Resolve object length by reading the object's dedicated
-    // metadata entry through the pool. The HTTP backend fills it from
-    // an origin HEAD on a miss; local-disk and peer hits skip the
-    // origin entirely.
-    let len = read_object_length(pool, backend_id, &path, page_size)
+    // 5. Resolve object metadata through the pool. The HTTP backend
+    // fills it from an origin HEAD on a miss or after a backend-provided
+    // TTL expires.
+    let meta = read_object_metadata(pool, backend_id, &path, page_size)
         .await
         .map_err(|_| ())?;
+    let len = meta.length;
+    let cache_key_version = meta.cache_key_version().map(str::to_string);
 
     // 6. Resolve the requested range against the length.
     let resolved = match range {
@@ -420,6 +421,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         conn_fd,
         backend_id,
         &path,
+        cache_key_version.as_deref(),
         page_size,
         resolved,
         stripe_size,
@@ -457,12 +459,16 @@ enum Ticket {
 }
 
 /// Build the content-addressed key and pool request for one stripe slice.
-fn stripe_request(backend_id: &str, path: &str, slice: StripeSlice) -> (StripeKey, StripeReq) {
-    let origin_ref = OriginRef {
-        backend_id: backend_id.to_string(),
-        origin_object_id: path.to_string(),
-        stripe_idx: slice.stripe_idx,
-    };
+fn stripe_request(
+    backend_id: &str,
+    path: &str,
+    cache_key_version: Option<&str>,
+    slice: StripeSlice,
+) -> (StripeKey, StripeReq) {
+    let mut origin_ref = OriginRef::new(backend_id, path, slice.stripe_idx);
+    if let Some(version) = cache_key_version {
+        origin_ref = origin_ref.with_cache_key_version(version);
+    }
     let key = origin_ref.stripe_key();
     let req = StripeReq::new(key).with_origin(origin_ref);
     (key, req)
@@ -525,9 +531,10 @@ async fn dispatch_ticket(
     fanout: &Rc<FanoutTable>,
     backend_id: &str,
     path: &str,
+    cache_key_version: Option<&str>,
     slice: StripeSlice,
 ) -> Ticket {
-    let (key, req) = stripe_request(backend_id, path, slice);
+    let (key, req) = stripe_request(backend_id, path, cache_key_version, slice);
     match fanout.owner_of(&key, slice.intra_offset) {
         Owner::Local => Ticket::Local { slice },
         Owner::Peer(peer) => {
@@ -571,6 +578,7 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
     conn_fd: RawFd,
     backend_id: &str,
     path: &str,
+    cache_key_version: Option<&str>,
     page_size: usize,
     resolved: ResolvedRange,
     stripe_size: u64,
@@ -581,7 +589,7 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
         let plans: Vec<StripePlan<StripeReq>> = slices
             .into_iter()
             .map(|slice| {
-                let (_key, req) = stripe_request(backend_id, path, slice);
+                let (_key, req) = stripe_request(backend_id, path, cache_key_version, slice);
                 StripePlan {
                     req,
                     intra_offset: slice.intra_offset,
@@ -604,12 +612,14 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
     let mut next = 0usize;
     let mut window: VecDeque<Ticket> = VecDeque::new();
     while next < slices.len() && window.len() < WINDOW {
-        window.push_back(dispatch_ticket(fanout, backend_id, path, slices[next]).await);
+        window.push_back(
+            dispatch_ticket(fanout, backend_id, path, cache_key_version, slices[next]).await,
+        );
         next += 1;
     }
 
     let local_plan = |slice: StripeSlice| {
-        let (_key, req) = stripe_request(backend_id, path, slice);
+        let (_key, req) = stripe_request(backend_id, path, cache_key_version, slice);
         StripePlan {
             req,
             intra_offset: slice.intra_offset,
@@ -660,7 +670,9 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
                     // its pins, so retries eventually succeed.
                     Err(crate::bufferpool::Error::Busy) => {
                         yield_now().await;
-                        let retry = dispatch_ticket(fanout, backend_id, path, slice).await;
+                        let retry =
+                            dispatch_ticket(fanout, backend_id, path, cache_key_version, slice)
+                                .await;
                         window.push_front(retry);
                         continue;
                     }
@@ -694,30 +706,31 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
         }
 
         while next < slices.len() && window.len() < WINDOW {
-            window.push_back(dispatch_ticket(fanout, backend_id, path, slices[next]).await);
+            window.push_back(
+                dispatch_ticket(fanout, backend_id, path, cache_key_version, slices[next]).await,
+            );
             next += 1;
         }
     }
     Ok(())
 }
 
-/// Resolve an object's length by reading its dedicated content-addressed
+/// Resolve an object's metadata by reading its dedicated content-addressed
 /// metadata entry through the pool. The entry's single page carries the
 /// object's [`ObjectMetadata`]; the HTTP backend fills it from an origin
 /// `HEAD` on a miss, while local-disk and peer hits avoid the origin
 /// entirely. The whole page is read (a zero-copy borrow) and decoded.
-async fn read_object_length<P: BufferPool<Req = StripeReq>>(
+async fn read_object_metadata<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     backend_id: &str,
     path: &str,
     page_size: usize,
-) -> Result<u64, ()> {
+) -> Result<ObjectMetadata, ()> {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
     let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
     let mut rs: ReadStream = pool.read(&req, 0, page_size as u64).await.map_err(|_| ())?;
     let page = rs.next_page().await.ok_or(())?.map_err(|_| ())?;
-    let meta = ObjectMetadata::decode(page.as_slice()).map_err(|_| ())?;
-    Ok(meta.length)
+    ObjectMetadata::decode(page.as_slice()).map_err(|_| ())
 }
 
 /// Format the `200 OK` head for serving a whole object.
@@ -951,6 +964,26 @@ mod tests {
         assert!(req.origin().unwrap().is_metadata_entry());
         assert_eq!(req.key(), stripe_key("primary", "/o", METADATA_STRIPE_IDX));
         assert_eq!(METADATA_STRIPE_IDX, u64::MAX);
+    }
+
+    #[test]
+    fn stripe_request_uses_etag_as_cache_key_version() {
+        use crate::bufferpool::Req;
+
+        let slice = StripeSlice {
+            stripe_idx: 1,
+            intra_offset: 0,
+            intra_len: 10,
+        };
+        let (base_key, _) = stripe_request("primary", "/o", None, slice);
+        let (v1_key, v1_req) = stripe_request("primary", "/o", Some("etag-1"), slice);
+        let (v2_key, v2_req) = stripe_request("primary", "/o", Some("etag-2"), slice);
+
+        assert_ne!(base_key, v1_key);
+        assert_ne!(v1_key, v2_key);
+        assert_eq!(v1_req.key(), v1_key);
+        assert_eq!(v1_req.origin().unwrap().origin_object_id, "/o");
+        assert_eq!(v2_req.origin().unwrap().origin_object_id, "/o");
     }
 
     /// A mock pool whose `read` never constructs a `ReadStream` (that

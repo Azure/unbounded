@@ -29,7 +29,7 @@ use ::http::header::{CONNECTION, HOST, RANGE};
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::http::{Method, ResponseHead, StatusCode, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
-use crate::storage::{ObjectMetadata, StripeReq};
+use crate::storage::{ObjectMetadata, StripeReq, now_unix_millis};
 
 use super::Backend;
 use super::limiter::FetchLimiter;
@@ -466,7 +466,7 @@ async fn fetch_metadata(
     let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
     if capacity < 8 {
         return Err(Error::from(
-            "s3 backend: length entry destination smaller than 8 bytes",
+            "s3 backend: metadata entry destination smaller than 8 bytes",
         ));
     }
 
@@ -483,11 +483,16 @@ async fn fetch_metadata(
 
     const MAX_HEAD: usize = 64 * 1024;
     let mut buf: Vec<u8> = Vec::new();
-    let (status, content_length) = loop {
+    let (status, content_length, etag, cache_control) = loop {
         if let Some(h) = ResponseHead::parse(&buf)
             .map_err(|_| Error::from("s3 backend: malformed origin response head"))?
         {
-            break (h.status, h.content_length());
+            break (
+                h.status,
+                h.content_length(),
+                h.header("etag").map(str::to_string),
+                h.header("cache-control").map(str::to_string),
+            );
         }
         if buf.len() >= MAX_HEAD {
             return Err(Error::from(
@@ -514,7 +519,13 @@ async fn fetch_metadata(
     let length = content_length
         .ok_or_else(|| Error::from("s3 backend: metadata HEAD missing Content-Length"))?;
 
-    let body = ObjectMetadata::new(length).encode()?;
+    let body = ObjectMetadata::from_origin_head(
+        length,
+        etag.as_deref(),
+        cache_control.as_deref(),
+        now_unix_millis(),
+    )
+    .encode()?;
     copy_body_into_pages(&body, &dsts, backing_base, page_size)?;
     Ok(())
 }

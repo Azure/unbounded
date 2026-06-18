@@ -689,7 +689,23 @@ where
         let action = {
             let mut st = slot.state.borrow_mut();
             match &mut *st {
-                SlotState::Ready => Action::Ready,
+                SlotState::Ready => {
+                    let pi = slot
+                        .page_idx
+                        .get()
+                        .expect("page_idx must be set when slot is Ready");
+                    let can_refresh_in_place =
+                        slot.consumer_holds.get() == 0 && !slot.tee_pending.get();
+                    match req.should_refresh_cached_page(page_slice(&inner, pi)) {
+                        Ok(false) => Action::Ready,
+                        Ok(true) if can_refresh_in_place => {
+                            *st = SlotState::Loading(Vec::new());
+                            Action::Lead
+                        }
+                        Ok(true) => Action::Ready,
+                        Err(e) => Action::Error(e),
+                    }
+                }
                 SlotState::Error(e) => Action::Error(e.clone()),
                 SlotState::Loading(_) => Action::Park,
                 SlotState::Idle => {
@@ -811,9 +827,18 @@ where
                 // Phase 1: get bytes into the page (blocking the
                 // leader; parked subscribers wait). On error,
                 // transition to `Error` and propagate.
-                let fetch_result: Result<bool, Error> = async {
+                let fetch_result: Result<FetchOutcome, Error> = async {
                     let hit = inner.blockstore.read_page(key, stripe_off, dst).await?;
-                    if !hit {
+                    let mut refreshed = false;
+                    if hit && req.should_refresh_cached_page(page_slice(&inner, pi))? {
+                        let bulk = BulkRef {
+                            stripe: key,
+                            offset: stripe_off,
+                            len: inner.page_size as u32,
+                        };
+                        inner.transport.fetch_one(req.as_ref(), bulk, dst).await?;
+                        refreshed = true;
+                    } else if !hit {
                         let bulk = BulkRef {
                             stripe: key,
                             offset: stripe_off,
@@ -821,13 +846,13 @@ where
                         };
                         inner.transport.fetch_one(req.as_ref(), bulk, dst).await?;
                     }
-                    Ok(hit)
+                    Ok(FetchOutcome { hit, refreshed })
                 }
                 .await;
 
-                let hit = match fetch_result {
-                    Ok(h) => {
-                        crate::metrics::bufferpool_request(if h {
+                let outcome = match fetch_result {
+                    Ok(o) => {
+                        crate::metrics::bufferpool_request(if o.hit && !o.refreshed {
                             crate::metrics::Lookup::Hit
                         } else {
                             crate::metrics::Lookup::Miss
@@ -836,12 +861,12 @@ where
                         // local disk. The peer/origin sources are
                         // recorded inside `Transport::bulk_get` on the
                         // miss path, where that distinction is known.
-                        if h {
+                        if o.hit && !o.refreshed {
                             crate::metrics::bufferpool_miss_source(
                                 crate::metrics::MissSource::Disk,
                             );
                         }
-                        h
+                        o
                     }
                     Err(e) => {
                         let wakers = take_loading_wakers(&slot);
@@ -867,7 +892,7 @@ where
                 // "Pull-through with tee"). The page stays pinned
                 // across the tee via `tee_pending` plus the
                 // leader's `ConsumerHold`.
-                let need_tee = !hit;
+                let need_tee = !outcome.hit || outcome.refreshed;
                 if need_tee {
                     slot.tee_pending.set(true);
                 }
@@ -902,6 +927,24 @@ enum Action {
     Error(Error),
     Park,
     Lead,
+}
+
+struct FetchOutcome {
+    hit: bool,
+    refreshed: bool,
+}
+
+fn page_slice<T, S, R>(inner: &PoolInner<T, S, R>, page_idx: u32) -> &[u8]
+where
+    T: Transport<R>,
+    S: BlockStore,
+    R: Req,
+{
+    let offset = page_idx as usize * inner.page_size;
+    // SAFETY: `page_idx` comes from this pool's free list, so it is within
+    // the registered backing. The returned borrow is used synchronously for
+    // cache-freshness inspection only.
+    unsafe { std::slice::from_raw_parts(inner.backing.base.add(offset), inner.page_size) }
 }
 
 struct LeaderGuard<'a> {

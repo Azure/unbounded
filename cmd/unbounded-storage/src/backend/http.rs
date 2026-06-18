@@ -25,10 +25,6 @@
 //!
 //! - Connection pooling / keep-alive bounded by `http_concurrency` to
 //!   amortize the TCP+`connect` handshake across fetches.
-//! - Conditional revalidation via ETag. Per the content-addressed
-//!   design the ETag should fold into the stripe key's identity (a new
-//!   ETag yields a new key), rather than being tracked as separate
-//!   per-stripe metadata.
 
 use std::future::Future;
 use std::os::fd::RawFd;
@@ -40,7 +36,7 @@ use ::http::header::{CONNECTION, HOST, RANGE};
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::http::{Method, ResponseHead, StatusCode, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
-use crate::storage::{ObjectMetadata, StripeReq};
+use crate::storage::{ObjectMetadata, StripeReq, now_unix_millis};
 
 use super::Backend;
 use super::limiter::FetchLimiter;
@@ -503,15 +499,14 @@ async fn fetch(
     Ok(())
 }
 
-/// Fill a length entry: HEAD the origin object, take its
-/// `Content-Length` as the object's byte length, and write that length
-/// as a little-endian `u64` into the (single) destination page. HEAD
-/// has no body, so only the header block is read.
+/// Fill a metadata entry: HEAD the origin object, take its headers as
+/// object metadata, and encode that metadata into the destination page.
+/// HEAD has no body, so only the header block is read.
 ///
-/// The 8 length bytes are written through the same
-/// [`copy_body_into_pages`] path as the data fetch, which copies them
-/// into the first page bytes and zero-fills the remainder of the
-/// destination pages.
+/// The encoded metadata is written through the same
+/// [`copy_body_into_pages`] path as the data fetch, which copies it into
+/// the first page bytes and zero-fills the remainder of the destination
+/// pages.
 async fn fetch_metadata(
     handle: NetHandle,
     origin: SockAddr,
@@ -525,7 +520,7 @@ async fn fetch_metadata(
     let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
     if capacity < 8 {
         return Err(Error::from(
-            "http backend: length entry destination smaller than 8 bytes",
+            "http backend: metadata entry destination smaller than 8 bytes",
         ));
     }
 
@@ -543,11 +538,16 @@ async fn fetch_metadata(
     // header buffer so a pathological origin cannot grow it unbounded.
     const MAX_HEAD: usize = 64 * 1024;
     let mut buf: Vec<u8> = Vec::new();
-    let (status, content_length) = loop {
+    let (status, content_length, etag, cache_control) = loop {
         if let Some(h) = ResponseHead::parse(&buf)
             .map_err(|_| Error::from("http backend: malformed origin response head"))?
         {
-            break (h.status, h.content_length());
+            break (
+                h.status,
+                h.content_length(),
+                h.header("etag").map(str::to_string),
+                h.header("cache-control").map(str::to_string),
+            );
         }
         if buf.len() >= MAX_HEAD {
             return Err(Error::from(
@@ -571,7 +571,13 @@ async fn fetch_metadata(
     let length = content_length
         .ok_or_else(|| Error::from("http backend: metadata HEAD missing Content-Length"))?;
 
-    let body = ObjectMetadata::new(length).encode()?;
+    let body = ObjectMetadata::from_origin_head(
+        length,
+        etag.as_deref(),
+        cache_control.as_deref(),
+        now_unix_millis(),
+    )
+    .encode()?;
     copy_body_into_pages(&body, &dsts, backing_base, page_size)?;
     Ok(())
 }

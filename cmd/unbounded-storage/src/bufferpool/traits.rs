@@ -16,6 +16,14 @@ use crate::memory::Backing;
 
 pub trait Req {
     fn key(&self) -> StripeKey;
+
+    /// Whether a cached page for this request must be refreshed from the
+    /// transport before being served. Most cache entries are immutable and
+    /// use the default `false`; metadata requests can override this to
+    /// honor backend-supplied freshness TTLs.
+    fn should_refresh_cached_page(&self, _page: &[u8]) -> Result<bool, Error> {
+        Ok(false)
+    }
 }
 
 /// `Stream`-like surface for a transport's bulk-get response. We
