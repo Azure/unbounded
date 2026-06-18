@@ -387,7 +387,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
     // the plain HTTP frontend, a length-read failure is never a silently
     // dropped connection.
-    let mut meta = match read_object_metadata_s3(pool, backend_id, &path, page_size, false).await {
+    let meta = match read_object_metadata_s3(pool, backend_id, &path, page_size, false).await {
         LenResult::Metadata(m) => m,
         LenResult::NotFound => {
             let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
@@ -410,31 +410,6 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
             return Ok(());
         }
     };
-    if !is_head && meta.cache_key_version().is_some() {
-        meta = match read_object_metadata_s3(pool, backend_id, &path, page_size, true).await {
-            LenResult::Metadata(m) => m,
-            LenResult::NotFound => {
-                let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
-                let _ = send_all(handle, conn_fd, bytes).await;
-                log.field("status", 404);
-                outcome.status = 404;
-                return Ok(());
-            }
-            LenResult::Other => {
-                let bytes = error_bytes(
-                    S3ErrorCode::InternalError,
-                    &path,
-                    &request_id,
-                    is_head,
-                    None,
-                );
-                let _ = send_all(handle, conn_fd, bytes).await;
-                log.field("status", 500);
-                outcome.status = 500;
-                return Ok(());
-            }
-        };
-    }
     let len = meta.length;
     let cache_key_version = meta.cache_key_version().map(str::to_string);
 
