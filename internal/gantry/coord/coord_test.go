@@ -586,7 +586,9 @@ func TestPeerAuthz_ObserveOnlyServesAndCounts(t *testing.T) {
 
 // TestPeerAuthz_EnforceRejectsUnknownPeer asserts that, with enforcement
 // on, an inbound request from a peer absent from the membership view is
-// rejected before dispatch and still counted.
+// rejected before dispatch and counted in the unauthorized-peer metric, but
+// NOT in the stream-error metric (the rejection is a policy decision, not a
+// protocol error).
 func TestPeerAuthz_EnforceRejectsUnknownPeer(t *testing.T) {
 	hClient, hServer := makeHostPair(t)
 
@@ -596,6 +598,7 @@ func TestPeerAuthz_EnforceRejectsUnknownPeer(t *testing.T) {
 
 	var (
 		unauthorized int32
+		streamErr    int32
 		reason       atomic.Pointer[string]
 	)
 
@@ -603,6 +606,7 @@ func TestPeerAuthz_EnforceRejectsUnknownPeer(t *testing.T) {
 		coord.WithPeerAuthz(true),
 		coord.WithMetrics(coord.MetricsHooks{
 			OnUnauthorizedPeer: func(r string) { atomic.AddInt32(&unauthorized, 1); reason.Store(&r) },
+			OnStreamError:      func() { atomic.AddInt32(&streamErr, 1) },
 		}),
 	)
 	srv.Bind(hServer)
@@ -623,6 +627,10 @@ func TestPeerAuthz_EnforceRejectsUnknownPeer(t *testing.T) {
 
 	if r := reason.Load(); r == nil || *r != "unrecognized" {
 		t.Fatalf("reason = %v, want \"unrecognized\"", r)
+	}
+
+	if got := atomic.LoadInt32(&streamErr); got != 0 {
+		t.Fatalf("stream-error metric = %d, want 0 (authz rejection is not a protocol error)", got)
 	}
 }
 

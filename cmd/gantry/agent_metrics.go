@@ -200,7 +200,7 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		}),
 		coordStreamError: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_stream_error_total",
-			Help: "Inbound coord streams dropped without a normal reply: malformed or oversized envelopes, read/decode/deadline failures, concurrent-stream-limit drops, dispatch or serve errors, and response marshal/write failures. With peer-authz enforce enabled, rejected unauthorized peers also increment this counter and are additionally tracked, by reason, in p2p_coord_unauthorized_peer_total (use that metric to attribute an authz-driven increase).",
+			Help: "Inbound coord streams dropped without a normal reply: malformed or oversized envelopes, read/decode/deadline failures, concurrent-stream-limit drops, dispatch or serve errors, and response marshal/write failures. Enforce-mode peer-authz rejections are NOT counted here (they are tracked, by reason, in p2p_coord_unauthorized_peer_total), so enabling peer authz does not inflate this protocol-error signal.",
 		}),
 		coordUnauthorizedPeer: reg.NewCounterVec("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_unauthorized_peer_total",

@@ -57,6 +57,12 @@ import (
 // ProtocolID is the libp2p stream protocol the coord handler binds.
 const ProtocolID protocol.ID = "/gantry/coord/1.0.0"
 
+// errUnauthorizedPeer is the sentinel returned by dispatch when peer
+// authorization is in enforce mode and the dialing peer is not a recognised
+// member. handleStream skips the stream-error metric for it because the
+// rejection is already counted, by reason, in p2p_coord_unauthorized_peer_total.
+var errUnauthorizedPeer = errors.New("coord: unauthorized peer")
+
 // MaxMessageBytes caps a single inbound Envelope. PullIntentRequest is
 // tiny; PleasePullRequest grows linearly with batch size. 1 MiB is
 // orders of magnitude beyond the realistic ceiling but keeps memory
@@ -106,13 +112,12 @@ type MetricsHooks struct {
 	// transitions into in_flight from a please_pull batch.
 	OnPleasePullStarted func()
 	// OnStreamError fires once per inbound stream that is dropped without a
-	// normal reply. Besides a malformed or oversized envelope, this includes
-	// read/decode/deadline failures, the concurrent-stream limit, dispatch
-	// and serve errors, and response marshal/write failures. With peer-authz
-	// enforce enabled, an unauthorized-peer rejection is also a dispatch
-	// error and lands here; such rejections are additionally recorded (by
-	// reason) via OnUnauthorizedPeer, so attribute an authz-driven increase
-	// to that metric rather than to genuine protocol errors.
+	// normal reply: a malformed or oversized envelope, read/decode/deadline
+	// failures, the concurrent-stream limit, dispatch and serve errors, and
+	// response marshal/write failures. Enforce-mode authz rejections are
+	// deliberately NOT counted here (they are a policy decision, recorded by
+	// reason in OnUnauthorizedPeer), so enabling peer authz does not inflate
+	// the protocol-error signal.
 	OnStreamError func()
 	// OnUnauthorizedPeer fires once per inbound request whose remote
 	// libp2p peer ID is not present in the current membership view. The
@@ -331,7 +336,14 @@ func (s *Server) handleStream(str network.Stream) {
 
 	out, err := s.dispatch(ctx, str.Conn().RemotePeer(), in)
 	if err != nil {
-		s.bumpStreamErr()
+		// An enforce-mode authz rejection is a policy decision, not a
+		// protocol error: it is already counted (by reason) in
+		// p2p_coord_unauthorized_peer_total, so don't also inflate the
+		// stream-error metric when peer authz is enabled.
+		if !errors.Is(err, errUnauthorizedPeer) {
+			s.bumpStreamErr()
+		}
+
 		s.logger.Debug("coord: dispatch", slog.Any("err", err))
 
 		return
@@ -364,10 +376,12 @@ func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envel
 	nodes := s.snapshotMembers()
 
 	// authorizePeer is always evaluated (it records the observe-only metric);
-	// the boolean only gates the request under enforce mode.
+	// the boolean only gates the request under enforce mode. The rejection
+	// wraps errUnauthorizedPeer so handleStream can skip the stream-error
+	// metric (the rejection is already counted in p2p_coord_unauthorized_peer_total).
 	authorized := s.authorizePeer(remote, nodes)
 	if s.authzEnforce && !authorized {
-		return nil, fmt.Errorf("coord: unauthorized peer %s", remote)
+		return nil, fmt.Errorf("%w %s", errUnauthorizedPeer, remote)
 	}
 
 	switch m := in.GetMsg().(type) {
