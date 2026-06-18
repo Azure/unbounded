@@ -574,6 +574,7 @@ func runAgent(args []string) error {
 		}),
 		mirror.WithDiscovery(disco, peerClient),
 		mirror.WithSelfNodeID(memberView.Self()),
+		mirror.WithSelfPeerID(ifaces.NodeID(disco.PeerID().String())),
 		mirror.WithPeerMetrics(
 			func(outcome string) { p2.peerFetch.WithLabelValues(outcome).Inc() },
 			func(success bool) {
