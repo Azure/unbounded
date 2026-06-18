@@ -31,6 +31,17 @@ func TestZramSetupUnitsForSwapUnits(t *testing.T) {
 	}, zramSetupUnitsForSwapUnits([]string{
 		`dev-disk-by\x2dlabel-zram0.swap`,
 		"dev-zram0.swap",
+	}))
+}
+
+func TestSystemdSwapUnitsToMask(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, []string{
+		"dev-zram0.swap",
+	}, systemdSwapUnitsToMask([]string{
+		`dev-disk-by\x2dlabel-zram0.swap`,
+		`dev-disk-by\x2duuid-123.swap`,
 		"dev-zram0.swap",
 	}))
 }

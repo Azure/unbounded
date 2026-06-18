@@ -68,7 +68,7 @@ func (d *disableSwap) disableSystemdSwapUnits(ctx context.Context) error {
 		}
 	}
 
-	for _, unit := range units {
+	for _, unit := range systemdSwapUnitsToMask(units) {
 		if err := executil.RunCmdAt(ctx, d.log, slog.LevelInfo, executil.Systemctl(), "mask", "--now", unit); err != nil {
 			return fmt.Errorf("masking systemd swap unit %s: %w", unit, err)
 		}
@@ -124,12 +124,43 @@ func zramSetupUnitsForSwapUnits(swapUnits []string) []string {
 	return units
 }
 
+func systemdSwapUnitsToMask(swapUnits []string) []string {
+	units := make([]string, 0, len(swapUnits))
+	for _, unit := range swapUnits {
+		if isDiskBySwapUnit(unit) {
+			continue
+		}
+
+		units = append(units, unit)
+	}
+
+	return units
+}
+
+func isDiskBySwapUnit(unit string) bool {
+	return strings.HasPrefix(unit, `dev-disk-by\x2d`) && strings.HasSuffix(unit, ".swap")
+}
+
 func zramDeviceFromSwapUnit(unit string) (string, bool) {
-	if !strings.HasPrefix(unit, "dev-zram") || !strings.HasSuffix(unit, ".swap") {
+	if !strings.HasSuffix(unit, ".swap") {
 		return "", false
 	}
 
-	device := strings.TrimSuffix(strings.TrimPrefix(unit, "dev-"), ".swap")
+	name := strings.TrimSuffix(unit, ".swap")
+	if strings.HasPrefix(name, `dev-disk-by\x2dlabel-zram`) {
+		device := strings.TrimPrefix(name, `dev-disk-by\x2dlabel-`)
+		if device == "zram" {
+			return "", false
+		}
+
+		return device, true
+	}
+
+	if !strings.HasPrefix(name, "dev-zram") {
+		return "", false
+	}
+
+	device := strings.TrimPrefix(name, "dev-")
 	if device == "" {
 		return "", false
 	}
