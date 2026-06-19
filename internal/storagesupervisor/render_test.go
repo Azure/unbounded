@@ -59,7 +59,8 @@ startup:
     no_hugepages: true
     memory_total_bytes: 134217728
   fabric:
-    addr: "10.0.0.1:7000"
+    tcp:
+      addr: "10.0.0.1:7000"
     progress_threads: 3
     progress_poll_us: 25
     rpc_worker_threads: 8
@@ -82,7 +83,7 @@ startup:
 	assert.Equal(t, uint64(7), cfg.Version)
 	assert.True(t, cfg.GetStartup().GetMemory().GetNoHugepages())
 	assert.Equal(t, uint64(134217728), cfg.GetStartup().GetMemory().GetMemoryTotalBytes())
-	assert.Equal(t, "10.0.0.1:7000", cfg.GetStartup().GetFabric().GetAddr())
+	assert.Equal(t, "10.0.0.1:7000", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
 	assert.Equal(t, uint32(3), cfg.GetStartup().GetFabric().GetProgressThreads())
 	assert.Equal(t, uint32(25), cfg.GetStartup().GetFabric().GetProgressPollUs())
 	assert.Equal(t, uint32(8), cfg.GetStartup().GetFabric().GetRpcWorkerThreads())
@@ -109,7 +110,8 @@ startup:
     no_hugepages: false
     memory_total_bytes: 134217728
   fabric:
-    addr: "0.0.0.0:0"
+    tcp:
+      addr: "0.0.0.0:0"
     max_inflight: 1024
   topology:
     serving_cores: 0
@@ -123,7 +125,7 @@ startup:
 
 	assert.Equal(t, uint64(0), cfg.Version)
 	assert.False(t, cfg.GetStartup().GetMemory().GetNoHugepages())
-	assert.Equal(t, "0.0.0.0:0", cfg.GetStartup().GetFabric().GetAddr())
+	assert.Equal(t, "0.0.0.0:0", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
 	assert.Equal(t, uint32(1024), cfg.GetStartup().GetFabric().GetMaxInflight())
 	assert.Equal(t, uint64(4), cfg.GetStartup().GetTopology().GetNicWorkers())
 	assert.Equal(t, uint64(1), cfg.GetStartup().GetTopology().GetHcasPerNumaNode())
@@ -140,7 +142,7 @@ func TestRenderConfigEmptyLeavesZero(t *testing.T) {
 	assert.Equal(t, uint64(0), cfg.Version)
 	assert.Equal(t, uint32(0), cfg.GetStartup().GetFabric().GetMaxInflight())
 	assert.Equal(t, uint64(0), cfg.GetStartup().GetTopology().GetNicWorkers())
-	assert.Empty(t, cfg.GetStartup().GetFabric().GetAddr())
+	assert.Empty(t, cfg.GetStartup().GetFabric().GetTcp().GetAddr())
 }
 
 func TestRenderConfigMissingFileLeavesZero(t *testing.T) {
@@ -149,7 +151,7 @@ func TestRenderConfigMissingFileLeavesZero(t *testing.T) {
 	cfg := decode(t, t.TempDir())
 
 	assert.Equal(t, uint64(0), cfg.Version)
-	assert.Empty(t, cfg.GetStartup().GetFabric().GetAddr())
+	assert.Empty(t, cfg.GetStartup().GetFabric().GetTcp().GetAddr())
 }
 
 func TestRenderConfigInvalidValues(t *testing.T) {
@@ -183,7 +185,8 @@ func TestRenderConfigActiveRingOverlay(t *testing.T) {
 version: 3
 startup:
   fabric:
-    addr: "0.0.0.0:9000"
+    tcp:
+      addr: "0.0.0.0:9000"
     max_inflight: 2048
 backends:
   - name: origin
@@ -213,7 +216,7 @@ neighborhoods:
 	assert.Equal(t, uint64(3), cfg.Version)
 	assert.Equal(t, uint32(2048), cfg.GetStartup().GetFabric().GetMaxInflight())
 	// addr is overridden with the node's own routable address.
-	assert.Equal(t, "10.0.0.5:9000", cfg.GetStartup().GetFabric().GetAddr())
+	assert.Equal(t, "10.0.0.5:9000", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
 
 	require.Len(t, cfg.GetNeighborhoods(), 1)
 	neighborhood := cfg.GetNeighborhoods()[0]
@@ -233,7 +236,8 @@ func TestRenderConfigActiveRingMergesPeers(t *testing.T) {
 	dir := writeSource(t, `
 startup:
   fabric:
-    addr: "0.0.0.0:9000"
+    tcp:
+      addr: "0.0.0.0:9000"
 backends:
   - name: origin
     fake: {}
@@ -331,7 +335,8 @@ func TestRenderConfigInactiveRingPassesThrough(t *testing.T) {
 	dir := writeSource(t, `
 startup:
   fabric:
-    addr: "0.0.0.0:0"
+    tcp:
+      addr: "0.0.0.0:0"
 backends:
   - name: origin
     fake: {}
@@ -350,7 +355,7 @@ neighborhoods:
 	assert.Zero(t, cfg.GetNeighborhoods()[0].GetLocalNodeId())
 	require.Len(t, cfg.GetNeighborhoods()[0].GetPeers(), 1)
 	assert.Equal(t, uint64(100), cfg.GetNeighborhoods()[0].GetPeers()[0].GetId())
-	assert.Equal(t, "0.0.0.0:0", cfg.GetStartup().GetFabric().GetAddr())
+	assert.Equal(t, "0.0.0.0:0", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
 }
 
 func TestWriteConfigAtomic(t *testing.T) {

@@ -13,7 +13,7 @@ pub fn peer_spec_to_connection(p: &PeerSpec) -> ConnectionSpec {
     ConnectionSpec {
         peer: PeerId(p.id),
         address: peer_address(p),
-        hca_numa: p.hca_numa().map(|n| n as u16),
+        hca_numa: None,
         tags: p.tags.clone(),
     }
 }
@@ -55,13 +55,12 @@ mod tests {
             tags: vec!["us-west".to_string(), "rack7".to_string()],
             config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
                 addr: "hex:01020304".into(),
-                hca_numa: Some(1),
             })),
         };
         let c = peer_spec_to_connection(&p);
         assert_eq!(c.peer, PeerId(42));
         assert_eq!(c.address, FabricAddress::native("hex:01020304"));
-        assert_eq!(c.hca_numa, Some(1));
+        assert_eq!(c.hca_numa, None);
         assert_eq!(c.tags, p.tags);
     }
 }

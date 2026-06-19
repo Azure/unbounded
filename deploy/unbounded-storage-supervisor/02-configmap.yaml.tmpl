@@ -19,7 +19,7 @@ metadata:
 # its proto3 zero value, which the daemon promotes to the documented default.
 #
 # Per-node sections are supervisor-injected when a storage ring is active:
-# startup.fabric.addr is overridden per node, and every declared neighborhood
+# startup.fabric.tcp.addr is overridden per node, and every declared neighborhood
 # gets its local_node_id plus label-discovered peers merged into
 # neighborhoods[].peers (discovered peers win id collisions). Declare
 # neighborhoods here when this deployment should participate in a P2P ring; the
@@ -37,8 +37,9 @@ data:
         # Total backing pool across all serving shards in bytes (128 MiB).
         memory_total_bytes: 134217728
       fabric:
-        # Per-shard fabric listen address (":0" picks a free port).
-        addr: "0.0.0.0:0"
+        tcp:
+          # Per-shard TCP fabric listen address (":0" picks a free port).
+          addr: "0.0.0.0:0"
         # libfabric progress threads per shard.
         progress_threads: 2
         # Progress-thread busy-poll budget in microseconds.

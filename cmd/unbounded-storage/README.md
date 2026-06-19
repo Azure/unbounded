@@ -129,7 +129,6 @@ addr      = "10.0.0.1:9000"      # parsed as SocketAddr.
 # Or, for RDMA peers:
 # [neighborhoods.peers.config.rdma]
 # addr     = "hex:deadbeef"      # provider-native libfabric address bytes.
-# hca_numa = 0                   # optional u16; pin connection setup to this NUMA node.
 
 [[caches]]
 name = "cache"

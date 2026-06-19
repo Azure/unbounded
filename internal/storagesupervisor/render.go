@@ -32,10 +32,10 @@ import (
 // come from ring, computed from the Kubernetes node watch. When the ring is
 // active, this node's id is injected into every declared neighborhood,
 // discovered peers are merged with any neighborhood peers declared in the YAML
-// (discovered peers win on id collision), and startup.fabric.addr is overridden
-// with the node's own routable bind. When the ring is inactive (no node watch,
-// no ring membership, or no fixed fabric port) the YAML is rendered as-is,
-// including any hand-declared neighborhoods/peers.
+// (discovered peers win on id collision), and startup.fabric.tcp.addr is
+// overridden with the node's own routable bind. When the ring is inactive (no
+// node watch, no ring membership, or no fixed fabric port) the YAML is rendered
+// as-is, including any hand-declared neighborhoods/peers.
 func RenderConfig(sourceDir string, ring ringState) ([]byte, error) {
 	cfg, err := loadSourceConfig(sourceDir)
 	if err != nil {
@@ -93,7 +93,7 @@ func loadSourceConfig(sourceDir string) (*storageconfig.Config, error) {
 // applyRing overlays the per-node ring state onto a Config parsed from the
 // ConfigMap YAML. It injects this node's local id into declared neighborhoods,
 // merges the discovered peer set with each neighborhood's declared peers, and
-// rebinds the fabric address to the node's own routable address.
+// rebinds the TCP fabric address to the node's own routable address.
 func applyRing(cfg *storageconfig.Config, ring ringState) {
 	for _, neighborhood := range cfg.Neighborhoods {
 		if neighborhood == nil {
@@ -115,7 +115,9 @@ func applyRing(cfg *storageconfig.Config, ring ringState) {
 			cfg.Startup.Fabric = &storageconfig.FabricCfg{}
 		}
 
-		cfg.Startup.Fabric.Addr = ring.selfListenAddr
+		cfg.Startup.Fabric.Binds = &storageconfig.FabricCfg_Tcp{
+			Tcp: &storageconfig.TcpFabricBinds{Addr: ring.selfListenAddr},
+		}
 	}
 }
 

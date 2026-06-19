@@ -166,7 +166,7 @@ func (w *peerWatcher) signal() {
 // unreachable, so emitting peers would be misleading.
 func (w *peerWatcher) snapshot(port int, portOK bool) ringState {
 	if !portOK || port == 0 {
-		slog.Warn("storage ring inactive: no fixed fabric port set in startup.fabric.addr; "+
+		slog.Warn("storage ring inactive: no fixed fabric port set in startup.fabric.tcp.addr; "+
 			"set a non-zero port (e.g. 0.0.0.0:9000) to enable peering", "node", w.selfName)
 
 		return ringState{}

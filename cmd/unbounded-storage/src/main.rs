@@ -85,10 +85,19 @@ pub struct StartupSettings {
 #[derive(Clone, Debug)]
 pub struct FabricStartup {
     pub listen_addr: String,
+    pub rdma_listen_addrs: Vec<String>,
     pub progress_threads: u32,
     pub progress_poll_us: u32,
     pub rpc_worker_threads: u32,
     pub max_inflight: u32,
+}
+
+impl FabricStartup {
+    pub fn listen_addr_for_unit(&self, unit_idx: usize) -> &str {
+        self.rdma_listen_addrs
+            .get(unit_idx)
+            .map_or(self.listen_addr.as_str(), String::as_str)
+    }
 }
 
 /// Build the [`CorePlanConfig`] from the config file's
@@ -267,7 +276,11 @@ fn main() -> ExitCode {
 
     let settings = Arc::new(StartupSettings {
         fabric: FabricStartup {
-            listen_addr: fabric_cfg.addr.clone(),
+            listen_addr: fabric_cfg
+                .default_listen_addr()
+                .expect("fabric listen address defaulted")
+                .to_string(),
+            rdma_listen_addrs: fabric_cfg.rdma_listen_addrs().map(str::to_string).collect(),
             progress_threads: fabric_cfg.progress_threads,
             progress_poll_us: fabric_cfg.progress_poll_us,
             rpc_worker_threads: fabric_cfg.rpc_worker_threads,
@@ -1900,7 +1913,10 @@ mod tests {
         let path = Path::new("/definitely/not/a/real/path/unbounded-storage.toml");
         let cfg = load_config(path, false).expect("missing default path falls back to defaults");
         // These accessors panic if defaults were not applied.
-        assert_eq!(cfg.startup().fabric().addr, "0.0.0.0:0");
+        assert_eq!(
+            cfg.startup().fabric().default_listen_addr(),
+            Some("0.0.0.0:0")
+        );
         assert_eq!(cfg.startup().memory().memory_total_bytes, 128 * 1024 * 1024);
     }
 

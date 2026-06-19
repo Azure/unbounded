@@ -96,6 +96,9 @@ fn generate_config_schema() {
         "StartupCfg",
         "MemoryCfg",
         "FabricCfg",
+        "TcpFabricBinds",
+        "RdmaFabricBinds",
+        "RdmaFabricBind",
         "TopologyCfg",
         "MetricsCfg",
     ] {
@@ -105,6 +108,7 @@ fn generate_config_schema() {
 
     for oneof in [
         "PeerSpec.config",
+        "FabricCfg.binds",
         "DiskSpec.config",
         "BackendSpec.config",
         "FrontendSpec.config",

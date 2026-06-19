@@ -50,8 +50,16 @@ impl Config {
         }
 
         let fabric = startup.fabric.get_or_insert_with(FabricCfg::default);
-        if fabric.addr.is_empty() {
-            fabric.addr = "0.0.0.0:0".to_string();
+        match fabric.binds.as_mut() {
+            Some(fabric_cfg::Binds::Tcp(tcp)) if tcp.addr.is_empty() => {
+                tcp.addr = "0.0.0.0:0".to_string();
+            }
+            Some(fabric_cfg::Binds::Tcp(_)) | Some(fabric_cfg::Binds::Rdma(_)) => {}
+            None => {
+                fabric.binds = Some(fabric_cfg::Binds::Tcp(TcpFabricBinds {
+                    addr: "0.0.0.0:0".to_string(),
+                }));
+            }
         }
         if fabric.progress_threads == 0 {
             fabric.progress_threads = 2;
@@ -170,12 +178,27 @@ impl PeerSpec {
             None => None,
         }
     }
+}
 
-    pub fn hca_numa(&self) -> Option<u32> {
-        match self.config.as_ref() {
-            Some(peer_spec::Config::Rdma(cfg)) => cfg.hca_numa,
-            Some(peer_spec::Config::Tcp(_)) | None => None,
+impl FabricCfg {
+    pub fn default_listen_addr(&self) -> Option<&str> {
+        match self.binds.as_ref() {
+            Some(fabric_cfg::Binds::Tcp(cfg)) => Some(cfg.addr.as_str()),
+            Some(fabric_cfg::Binds::Rdma(cfg)) => cfg.binds.first().map(|bind| bind.addr.as_str()),
+            None => None,
         }
+    }
+
+    pub fn rdma_listen_addrs(&self) -> impl Iterator<Item = &str> {
+        self.binds
+            .as_ref()
+            .into_iter()
+            .filter_map(|binds| match binds {
+                fabric_cfg::Binds::Rdma(cfg) => Some(cfg.binds.as_slice()),
+                fabric_cfg::Binds::Tcp(_) => None,
+            })
+            .flatten()
+            .map(|bind| bind.addr.as_str())
     }
 }
 
@@ -286,6 +309,31 @@ mod tests {
         c.apply_defaults();
         // The exporter is opt-in: the addr stays empty unless configured.
         assert_eq!(c.startup().metrics().addr, "");
+    }
+
+    #[test]
+    fn fabric_binds_round_trip() {
+        let s = r#"
+[startup.fabric]
+max_inflight = 2048
+
+[startup.fabric.binds.rdma]
+
+[[startup.fabric.binds.rdma.binds]]
+addr = "192.168.252.1:49151"
+
+[[startup.fabric.binds.rdma.binds]]
+addr = "192.168.253.1:49151"
+"#;
+        let mut c: Config = toml::from_str(s).unwrap();
+        c.apply_defaults();
+
+        let fabric = c.startup().fabric();
+        assert_eq!(fabric.default_listen_addr(), Some("192.168.252.1:49151"));
+        let binds: Vec<_> = fabric.rdma_listen_addrs().collect();
+        assert_eq!(binds.len(), 2);
+        assert_eq!(binds[0], "192.168.252.1:49151");
+        assert_eq!(binds[1], "192.168.253.1:49151");
     }
 
     #[test]
@@ -609,7 +657,7 @@ workerz = 8
         let s = c.startup();
         assert!(!s.memory().no_hugepages);
         assert_eq!(s.memory().memory_total_bytes, 128 * 1024 * 1024);
-        assert_eq!(s.fabric().addr, "0.0.0.0:0");
+        assert_eq!(s.fabric().default_listen_addr(), Some("0.0.0.0:0"));
         assert_eq!(s.fabric().progress_threads, 2);
         assert_eq!(s.fabric().progress_poll_us, 10);
         assert_eq!(s.fabric().rpc_worker_threads, 4);
@@ -637,11 +685,13 @@ no_hugepages = true
 memory_total_bytes = 67108864
 
 [startup.fabric]
-addr = "10.0.0.1:7000"
 progress_threads = 3
 progress_poll_us = 25
 rpc_worker_threads = 8
 max_inflight = 2048
+
+[startup.fabric.binds.tcp]
+addr = "10.0.0.1:7000"
 
 [startup.topology]
 use_smt_siblings = true
@@ -658,7 +708,7 @@ hcas_per_numa_node = 2
         let st = c.startup();
         assert!(st.memory().no_hugepages);
         assert_eq!(st.memory().memory_total_bytes, 64 * 1024 * 1024);
-        assert_eq!(st.fabric().addr, "10.0.0.1:7000");
+        assert_eq!(st.fabric().default_listen_addr(), Some("10.0.0.1:7000"));
         assert_eq!(st.fabric().progress_threads, 3);
         assert_eq!(st.fabric().progress_poll_us, 25);
         assert_eq!(st.fabric().rpc_worker_threads, 8);

@@ -94,6 +94,7 @@ pub fn validate_binding_graph(config: &Config) -> Result<(), String> {
                 n.name, n.source
             ));
         }
+        validate_peer_ids(n)?;
     }
     for f in &config.frontends {
         if !backends.contains_key(f.source.as_str())
@@ -103,6 +104,21 @@ pub fn validate_binding_graph(config: &Config) -> Result<(), String> {
             return Err(format!(
                 "frontend {:?} source {:?}, which is not a backend, cache, or neighborhood",
                 f.name, f.source
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_peer_ids(neighborhood: &super::schema::NeighborhoodSpec) -> Result<(), String> {
+    let mut seen = HashSet::new();
+
+    for peer in &neighborhood.peers {
+        if !seen.insert(peer.id) {
+            return Err(format!(
+                "neighborhood {:?} peer {} is duplicated",
+                neighborhood.name, peer.id,
             ));
         }
     }
@@ -340,7 +356,8 @@ fn by_id<'a, T>(items: &'a [T], id: impl Fn(&'a T) -> &'a str) -> HashMap<&'a st
 mod tests {
     use super::super::schema::{
         BackendSpec, CacheSpec, FrontendSpec, HttpBackendConfig, HttpFrontendConfig,
-        NeighborhoodSpec, backend_spec, frontend_spec,
+        NeighborhoodSpec, PeerSpec, RdmaPeerConfig, TcpPeerConfig, backend_spec, frontend_spec,
+        peer_spec,
     };
     use super::*;
 
@@ -385,6 +402,26 @@ mod tests {
         }
     }
 
+    fn tcp_peer(id: u64, addr: &str) -> PeerSpec {
+        PeerSpec {
+            id,
+            tags: Vec::new(),
+            config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
+                addr: addr.to_string(),
+            })),
+        }
+    }
+
+    fn rdma_peer(id: u64, addr: &str) -> PeerSpec {
+        PeerSpec {
+            id,
+            tags: Vec::new(),
+            config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
+                addr: addr.to_string(),
+            })),
+        }
+    }
+
     #[test]
     fn runtime_projection_accepts_all_chain_shapes() {
         let mut cfg = Config::default();
@@ -423,6 +460,51 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a, c);
         assert_ne!(a, PeerId(0));
+    }
+
+    #[test]
+    fn runtime_projection_accepts_unique_rdma_peer_ids() {
+        let mut cfg = Config::default();
+        cfg.backends.push(backend("b"));
+        let mut n = neighborhood("n", "b");
+        n.peers.push(rdma_peer(7, "hex:00"));
+        n.peers.push(rdma_peer(8, "hex:01"));
+        cfg.neighborhoods.push(n);
+
+        let graph = runtime_projection(&cfg).unwrap();
+        let peers = &graph.neighborhoods["n"].peers;
+
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].node_id, NodeId(7));
+        assert_eq!(peers[1].node_id, NodeId(8));
+        assert_eq!(peers[0].fabric_peer_id, scoped_peer_id("n", 7));
+        assert_eq!(peers[1].fabric_peer_id, scoped_peer_id("n", 8));
+    }
+
+    #[test]
+    fn runtime_projection_rejects_duplicate_peer_ids() {
+        let mut cfg = Config::default();
+        cfg.backends.push(backend("b"));
+        let mut n = neighborhood("n", "b");
+        n.peers.push(tcp_peer(7, "127.0.0.1:1"));
+        n.peers.push(tcp_peer(7, "127.0.0.1:2"));
+        cfg.neighborhoods.push(n);
+
+        let err = runtime_projection(&cfg).unwrap_err();
+        assert!(err.contains("peer 7 is duplicated"), "{err}");
+    }
+
+    #[test]
+    fn runtime_projection_rejects_duplicate_rdma_peer_ids() {
+        let mut cfg = Config::default();
+        cfg.backends.push(backend("b"));
+        let mut n = neighborhood("n", "b");
+        n.peers.push(rdma_peer(7, "hex:00"));
+        n.peers.push(rdma_peer(7, "hex:01"));
+        cfg.neighborhoods.push(n);
+
+        let err = runtime_projection(&cfg).unwrap_err();
+        assert!(err.contains("peer 7 is duplicated"), "{err}");
     }
 
     fn assert_binding(

@@ -41,51 +41,71 @@ message MemoryCfg {
 }
 
 message FabricCfg {
-  // Per-shard fabric listen address; empty defaults to "0.0.0.0:0" and picks a free port.
-  string addr = 1;
+  oneof binds {
+    TcpFabricBinds tcp = 1;
+    RdmaFabricBinds rdma = 2;
+  }
 
   // Maximum in-flight fabric operations per shard; 0 defaults to 1024.
-  uint32 max_inflight = 2;
+  uint32 max_inflight = 3;
 
   // libfabric progress threads per shard; 0 defaults to 2.
-  uint32 progress_threads = 3;
+  uint32 progress_threads = 4;
 
   // Fabric RPC worker threads per shard; 0 defaults to 4.
-  uint32 rpc_worker_threads = 4;
+  uint32 rpc_worker_threads = 5;
 
   // Progress-thread busy-poll budget in microseconds; 0 defaults to 10.
-  uint32 progress_poll_us = 5;
+  uint32 progress_poll_us = 6;
+}
+
+message TcpFabricBinds {
+  string addr = 1;
+}
+
+message RdmaFabricBinds {
+  repeated RdmaFabricBind binds = 1;
+}
+
+message RdmaFabricBind {
+  // Provider-native RDMA fabric address encoded as "hex:<fi_getname-bytes>".
+  string addr = 1;
 }
 
 message TopologyCfg {
   // Place shards on SMT sibling CPUs as well as physical cores.
+  // TODO: Expand comment to explain the default
   bool use_smt_siblings = 1;
 
-  // Schedule shards onto isolcpus-isolated CPUs too. The proto3 false
-  // default preserves the historical "respect isolated CPUs" behavior.
+  // Schedule shards onto isolcpus-isolated CPUs too.
+  // TODO: Expand comment to explain the default
   bool ignore_isolated = 2;
 
-  // Allow placing a shard on each NUMA node's CPU 0. The proto3 false
-  // default preserves the historical "exclude node CPU 0" behavior.
+  // Allow placing a shard on each NUMA node's CPU 0.
+  // TODO: Expand comment to explain the default
   bool include_node_cpu0 = 3;
 
-  // Use HCA ports that are not in the active state. The proto3 false
-  // default preserves the historical "require active port" behavior.
+  // Use HCA ports that are not in the active state.
   bool allow_inactive_port = 4;
 
   // Disable RDMA and force the libfabric tcp provider.
+  // TODO: Is this actually required? Ideally we don't need it
   bool disable_rdma = 5;
 
   // Cap on the number of serving-shard CPUs to pin. 0 -> auto (claim
   // every usable core left after storage and NIC-worker reservations).
+  // TODO: Make optional instead of using 0 as magic value
   uint64 serving_cores = 6;
 
   // NIC-worker CPUs to pin per active HCA. 0 -> 4.
+  // TODO: Make optional instead of using 0 as magic value
   uint64 nic_workers = 7;
 
   // Maximum number of HCAs to use per NUMA node. 0 -> 1. Raise this to
   // use additional HCAs on a NUMA node. HCAs whose NUMA node is unknown
   // are never capped.
+  // TODO: Remove this field. Add a new option to FabricCfg.binds that enables "auto rdma binding" (or something like that).
+  //       The goal is to automatically bind to `n` HCAs per NUMA node, defaulting n=1, only when that binding type is configured.
   uint64 hcas_per_numa_node = 8;
 }
 
@@ -94,6 +114,7 @@ message NeighborhoodSpec {
   string source = 2;
 
   // Number of deterministic finger-table entries to derive per node; 0 defaults to 100.
+  // TODO: Use optional to set default (IMPORTANT apply this to ALL similar fields.)
   uint32 fingers_per_node = 3;
 
   // Local node id on the P2P ring; required when peers are configured and must not match a peer id.
@@ -147,9 +168,6 @@ message TcpPeerConfig {
 message RdmaPeerConfig {
   // Provider-native RDMA fabric address encoded as "hex:<fi_getname-bytes>".
   string addr = 1;
-
-  // Optional local HCA NUMA preference for this peer connection.
-  optional uint32 hca_numa = 2;
 }
 
 message CacheSpec {

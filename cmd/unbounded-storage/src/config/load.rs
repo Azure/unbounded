@@ -413,11 +413,9 @@ fn validate_neighborhood(
         return Err(ConfigError::MissingLocalNodeId);
     }
 
-    let mut seen_peers: HashSet<u64> = HashSet::new();
+    let mut peer_ids: HashSet<u64> = HashSet::new();
     for p in &neighborhood.peers {
-        if !seen_peers.insert(p.id) {
-            return Err(ConfigError::DuplicatePeer(p.id));
-        }
+        peer_ids.insert(p.id);
         if neighborhood.local_node_id == Some(p.id) {
             return Err(ConfigError::LocalNodeIdCollidesWithPeer(p.id));
         }
@@ -459,7 +457,7 @@ fn validate_neighborhood(
             if neighborhood.local_node_id == Some(id) {
                 return Err(ConfigError::RoutingPlanSelfReference { id, role });
             }
-            if !seen_peers.contains(&id) {
+            if !peer_ids.contains(&id) {
                 return Err(ConfigError::RoutingPlanUnknownPeer { id, role });
             }
         }
@@ -622,7 +620,6 @@ id = 2
 
 [neighborhoods.peers.config.rdma]
 addr = "hex:deadbeef"
-hca_numa = 0
 
 [[caches]]
 name = "c"
@@ -681,8 +678,10 @@ addr = "10.0.0.2:9000"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
-            Err(ConfigError::DuplicatePeer(1)) => {}
-            other => panic!("expected DuplicatePeer(1), got {other:?}"),
+            Err(ConfigError::InvalidBindingGraph(err)) => {
+                assert!(err.contains("peer 1 is duplicated"), "{err}");
+            }
+            other => panic!("expected duplicate peer error, got {other:?}"),
         }
     }
 
@@ -1466,13 +1465,17 @@ addr = "0.0.0.0:9000"
         let f = write_binpb(&encode_config(&Config::default()));
         let loaded = load(f.path()).unwrap();
         assert!(loaded.neighborhoods.is_empty());
-        assert_eq!(loaded.startup().fabric().addr, "0.0.0.0:0");
+        assert_eq!(
+            loaded.startup().fabric().default_listen_addr(),
+            Some("0.0.0.0:0")
+        );
     }
 
     #[test]
     fn binpb_runs_validation() {
-        // Validation runs regardless of encoding: a duplicate peer id is
-        // rejected even when it arrives over the protobuf wire path.
+        // Validation runs regardless of encoding: duplicate unscoped peer
+        // endpoints are rejected even when they arrive over the protobuf wire
+        // path.
         let toml = r#"
 [[backends]]
 name = "b"
@@ -1500,8 +1503,10 @@ addr = "10.0.0.2:9000"
         cfg.neighborhoods[0].peers[1].id = 1;
         let f = write_binpb(&encode_config(&cfg));
         match load(f.path()) {
-            Err(ConfigError::DuplicatePeer(1)) => {}
-            other => panic!("expected DuplicatePeer(1), got {other:?}"),
+            Err(ConfigError::InvalidBindingGraph(err)) => {
+                assert!(err.contains("peer 1 is duplicated"), "{err}");
+            }
+            other => panic!("expected duplicate peer error, got {other:?}"),
         }
     }
 
@@ -1524,7 +1529,7 @@ addr = "10.0.0.2:9000"
         let cfg = load(f.path()).unwrap();
         let s = cfg.startup();
         assert_eq!(s.memory().memory_total_bytes, 128 * 1024 * 1024);
-        assert_eq!(s.fabric().addr, "0.0.0.0:0");
+        assert_eq!(s.fabric().default_listen_addr(), Some("0.0.0.0:0"));
         assert_eq!(s.fabric().max_inflight, 1024);
         assert_eq!(s.topology().nic_workers, 4);
         assert_eq!(s.topology().hcas_per_numa_node, 1);
@@ -1538,6 +1543,8 @@ no_hugepages = true
 memory_total_bytes = 67108864
 
 [startup.fabric]
+
+[startup.fabric.binds.tcp]
 addr = "10.0.0.1:7000"
 
 [startup.topology]
@@ -1547,7 +1554,10 @@ disable_rdma = true
         let cfg = load(f.path()).unwrap();
         assert!(cfg.startup().memory().no_hugepages);
         assert_eq!(cfg.startup().memory().memory_total_bytes, 64 * 1024 * 1024);
-        assert_eq!(cfg.startup().fabric().addr, "10.0.0.1:7000");
+        assert_eq!(
+            cfg.startup().fabric().default_listen_addr(),
+            Some("10.0.0.1:7000")
+        );
         assert!(cfg.startup().topology().disable_rdma);
         // Unset siblings still default.
         assert_eq!(cfg.startup().fabric().progress_threads, 2);
@@ -1559,8 +1569,10 @@ disable_rdma = true
         // re-defaulted on decode, identically to the TOML path.
         let toml = r#"
 [startup.fabric]
-addr = "10.0.0.2:8000"
 max_inflight = 4096
+
+[startup.fabric.binds.tcp]
+addr = "10.0.0.2:8000"
 
 [startup.topology]
 disable_rdma = true
@@ -1568,7 +1580,10 @@ disable_rdma = true
         let cfg: Config = toml::from_str(toml).unwrap();
         let f = write_binpb(&encode_config(&cfg));
         let loaded = load(f.path()).unwrap();
-        assert_eq!(loaded.startup().fabric().addr, "10.0.0.2:8000");
+        assert_eq!(
+            loaded.startup().fabric().default_listen_addr(),
+            Some("10.0.0.2:8000")
+        );
         assert_eq!(loaded.startup().fabric().max_inflight, 4096);
         assert!(loaded.startup().topology().disable_rdma);
         assert_eq!(

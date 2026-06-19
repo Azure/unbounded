@@ -44,6 +44,7 @@ const RPC_SCRATCH_PAGES: u32 = 8;
 /// [`plan_fabric_units`] and realized by [`FabricGroup::new`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FabricUnitSpec {
+    pub unit_idx: usize,
     pub device_name: String,
     pub provider: Provider,
     /// Worker the fabric's progress and RPC threads pin to.
@@ -107,6 +108,7 @@ fn plan_tcp_units(serving_shards: &[ServingShard]) -> FabricPlan {
 
     let shards_assigned: Vec<usize> = (0..serving_shards.len()).collect();
     let units = vec![FabricUnitSpec {
+        unit_idx: 0,
         device_name: "lo".to_string(),
         provider: Provider::Tcp,
         worker_idx: WorkerIdx(0),
@@ -146,6 +148,7 @@ fn plan_verbs_units(
             let (worker_idx, numa) =
                 verbs_worker_for_device(&device, serving_count, nic_workers, hca_dev_names);
             units.push(FabricUnitSpec {
+                unit_idx: idx,
                 device_name: device.clone(),
                 provider: Provider::from_device_name(&device),
                 worker_idx,
@@ -225,6 +228,7 @@ struct FabricUnit<S = RpcServerHandle, Rg = BackendRegistry, Rt = RouteTableHand
     handler_registry: Rg,
     routes: Rt,
     fabric: F,
+    hca_numa: Option<u16>,
     applied_peers: HashMap<PeerId, ConnectionSpec>,
     last_backends: HashMap<String, BackendSpec>,
 }
@@ -313,8 +317,8 @@ impl FabricGroup {
     /// Connections live at the fabric/address-vector level, so this runs
     /// once per endpoint rather than once per shard.
     pub fn reconcile_peers(&mut self, peers: &[RuntimePeer]) {
-        let desired = runtime_peer_connections(peers);
         for unit in &mut self.units {
+            let desired = runtime_peer_connections(peers);
             let report = config::reconcile::reconcile_connections(
                 &unit.fabric,
                 &desired,
@@ -329,7 +333,7 @@ impl FabricGroup {
             // race, and so peers dropped from config (that never
             // connected, hence were never removed by reconcile) are
             // pruned from the desired set.
-            unit.fabric.set_desired_peers(desired.clone());
+            unit.fabric.set_desired_peers(desired);
         }
     }
 
@@ -372,7 +376,11 @@ fn build_unit(
     let mut cfg = fabric::defaults_for(spec.device_name.clone(), runtime.clone(), spec.worker_idx);
     cfg.provider = spec.provider;
     cfg.listen = true;
-    cfg.listen_addr = Some(fabric_startup.listen_addr.clone());
+    cfg.listen_addr = Some(
+        fabric_startup
+            .listen_addr_for_unit(spec.unit_idx)
+            .to_string(),
+    );
     cfg.max_inflight = fabric_startup.max_inflight as usize;
     cfg.rpc_worker_threads = fabric_startup.rpc_worker_threads as usize;
     cfg.progress_threads = fabric_startup.progress_threads as u8;
@@ -483,6 +491,7 @@ fn build_unit(
         handler_registry,
         routes,
         fabric,
+        hca_numa: spec.numa,
         applied_peers,
         last_backends,
     })
@@ -494,7 +503,7 @@ fn runtime_peer_connections(peers: &[RuntimePeer]) -> Vec<ConnectionSpec> {
         .map(|peer| ConnectionSpec {
             peer: peer.fabric_peer_id,
             address: runtime_peer_address(&peer.spec),
-            hca_numa: peer.spec.hca_numa().map(|n| n as u16),
+            hca_numa: None,
             tags: peer.spec.tags.clone(),
         })
         .collect()
@@ -519,6 +528,9 @@ mod tests {
 
     use super::*;
 
+    use unbounded_storage::config::{PeerSpec, RdmaPeerConfig, peer_spec};
+    use unbounded_storage::p2p::NodeId;
+
     fn shard(cpu: u32, numa: Option<u16>) -> ServingShard {
         ServingShard { cpu, numa }
     }
@@ -533,6 +545,21 @@ mod tests {
                     numa,
                 })
                 .collect(),
+        }
+    }
+
+    fn runtime_peer(id: u64, addr: &str) -> RuntimePeer {
+        RuntimePeer {
+            neighborhood_id: "n".to_string(),
+            node_id: NodeId(id),
+            fabric_peer_id: PeerId(id),
+            spec: PeerSpec {
+                id,
+                tags: Vec::new(),
+                config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
+                    addr: addr.to_string(),
+                })),
+            },
         }
     }
 
@@ -624,6 +651,25 @@ mod tests {
         assert_eq!(plan.units[0].expected_mr, 3); // 2 shards + 1 scratch
     }
 
+    #[test]
+    fn rdma_peer_connections_are_unscoped_by_numa() {
+        let peers = [runtime_peer(1, "hex:00"), runtime_peer(2, "hex:ff")];
+
+        let connections = runtime_peer_connections(&peers);
+
+        assert_eq!(connections.len(), 2);
+        assert_eq!(
+            connections[0].address,
+            fabric::FabricAddress::native("hex:00")
+        );
+        assert_eq!(connections[0].hca_numa, None);
+        assert_eq!(
+            connections[1].address,
+            fabric::FabricAddress::native("hex:ff")
+        );
+        assert_eq!(connections[1].hca_numa, None);
+    }
+
     /// Drop-logging stand-in for a `FabricUnit` resource: records its
     /// label when dropped so a test can observe field teardown order.
     struct DropToken {
@@ -664,6 +710,7 @@ mod tests {
             handler_registry: DropToken::new("handler_registry", &log),
             routes: DropToken::new("routes", &log),
             fabric: DropToken::new("fabric", &log),
+            hca_numa: None,
             applied_peers: HashMap::new(),
             last_backends: HashMap::new(),
         };
