@@ -106,7 +106,7 @@ func (t *removeMachine) Name() string { return "remove-machine" }
 func (t *removeMachine) Do(ctx context.Context) error {
 	machineDir := fmt.Sprintf("/var/lib/machines/%s", t.machineName)
 
-	// Skip entirely if the machine directory doesn't exist — nothing to remove.
+	// Skip entirely if the machine directory doesn't exist - nothing to remove.
 	if _, err := os.Stat(machineDir); errors.Is(err, os.ErrNotExist) {
 		t.log.Info("machine rootfs not present, nothing to remove", "machine", t.machineName)
 		return nil
@@ -123,10 +123,21 @@ func (t *removeMachine) Do(ctx context.Context) error {
 	)
 
 	deadline := time.Now().Add(retryTimeout)
+
 	for time.Now().Before(deadline) {
 		err := executil.RunCmd(ctx, t.log, executil.Machinectl(), "remove", t.machineName)
 		if err == nil {
 			return nil // machinectl removed both image metadata and directory
+		}
+
+		if !machineExists(ctx, t.log, t.machineName) {
+			// Once machined no longer knows the machine, the nspawn service is stopped
+			// and the rootfs can be deleted directly. Some host configurations can still
+			// make machinectl remove fail at this point. Fedora with SELinux enforcing,
+			// for example, can deny systemd-machined permission to create its nspawn
+			// image lock file under /run/systemd/nspawn/locks, returning "Access denied"
+			// even though the machine is already gone.
+			break
 		}
 
 		select {
