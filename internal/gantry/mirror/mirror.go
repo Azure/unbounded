@@ -42,6 +42,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containerd/errdefs"
+
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/digestpipe"
@@ -1685,9 +1687,24 @@ func isDialUnavailable(err error) bool {
 	return strings.Contains(errText, "connection refused") || strings.Contains(errText, "no route to host")
 }
 
+// isDigestMismatchErr reports whether err signals that a peer served
+// bytes that failed content verification. Two typed sources are
+// recognized, one per fetch path:
+//
+//   - digestpipe.ErrDigestMismatch from the live stream-through verifier
+//     (streamDigestToClient).
+//   - errdefs.ErrFailedPrecondition from a containerd content-store
+//     Commit, which wraps it for both "unexpected commit digest" and
+//     "unexpected commit size" - either way the peer's bytes did not
+//     match what we asked for.
+//
+// Substring matching on the message is deliberately avoided: the real
+// containerd commit error says "unexpected commit digest", not "digest
+// mismatch", so the old text match silently misclassified a corrupt
+// peer as a generic local error and never quarantined it.
 func isDigestMismatchErr(err error) bool {
-	errText := strings.ToLower(err.Error())
-	return strings.Contains(errText, "digest mismatch")
+	return errors.Is(err, digestpipe.ErrDigestMismatch) ||
+		errors.Is(err, errdefs.ErrFailedPrecondition)
 }
 
 func (s *Server) markProviderStale(d digest.Digest, p ifaces.Provider) {
