@@ -68,6 +68,7 @@ configuration.
 | [`agent-ubuntu2404-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2404-nvidia) | `ghcr.io/azure/agent-ubuntu2404-nvidia` | Extends the base image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2404-nvidia/Containerfile)) |
 | [`agent-ubuntu2604`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2604) | `ghcr.io/azure/agent-ubuntu2604` | Ubuntu 26.04 base image with systemd, dbus, curl, iproute2, nftables, kmod, wireguard-tools, and bpftool. ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2604/Containerfile)) |
 | [`agent-ubuntu2604-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2604-nvidia) | `ghcr.io/azure/agent-ubuntu2604-nvidia` | Ubuntu 26.04 image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2604-nvidia/Containerfile)) |
+| [`agent-azlinux3`](https://github.com/Azure/unbounded/pkgs/container/agent-azlinux3) | `ghcr.io/azure/agent-azlinux3` | Azure Linux 3.0 base image with systemd, dbus, curl, iproute, nftables, kmod, wireguard-tools, and bpftool. ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-azlinux3/Containerfile)) |
 
 The agent pins a specific image tag by default at build time. The `OCIImage`
 field in the agent config can override the full image reference for custom or
@@ -179,6 +180,23 @@ The agent's three-phase bootstrap drives the nspawn lifecycle:
 
 3. **Node start.** Starts the nspawn machine, polls until it is responsive,
    then enables containerd and kubelet inside it.
+
+### Removal
+
+During reset and blue/green repave operations, the agent first stops the active
+`systemd-nspawn@<MachineName>.service` and waits until `machinectl` no longer
+knows the machine. It then asks `machinectl remove <MachineName>` to remove the
+image/rootfs registration.
+
+On some hosts, `machinectl remove` can still fail after the machine is stopped
+because of host-side policy or packaging behavior rather than because the
+container is still running. Fedora with SELinux enforcing can deny
+`systemd-machined` permission to create its nspawn image lock file under
+`/run/systemd/nspawn/locks`, causing `machinectl remove` to report
+`Access denied` even though `machinectl show <MachineName>` already reports no
+such machine. In that state, the agent falls back to deleting the inactive
+rootfs directory directly so the same machine name can be reused on a later
+blue/green cycle.
 
 ## Networking
 
