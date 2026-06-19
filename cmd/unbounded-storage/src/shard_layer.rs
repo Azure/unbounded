@@ -132,7 +132,8 @@ pub fn spawn_shard_layer(
     let backend_specs = Arc::new(config.backends.clone());
     let routes = crate::build_routes(config);
     let runtime_peers = config::runtime_peers(&projection);
-    let self_peer = local_self_peer(&projection);
+    let self_peer = local_self_peer(&projection)
+        .map_err(|e| vec![format!("unsupported fabric identity config: {e}")])?;
 
     // Bring up the shared fabric endpoints before spawning any shards:
     // each shard registers its data backing against the endpoint it maps
@@ -339,17 +340,29 @@ pub fn spawn_shard_layer(
     })
 }
 
-fn local_self_peer(projection: &config::RuntimeGraph) -> PeerId {
+fn local_self_peer(projection: &config::RuntimeGraph) -> Result<PeerId, String> {
     let mut local_ids: Vec<(&str, u64)> = projection
         .neighborhoods
         .values()
         .filter_map(|n| n.p2p.local_node_id.map(|id| (n.id.as_str(), id)))
         .collect();
     local_ids.sort_by_key(|(neighborhood_id, _)| *neighborhood_id);
-    local_ids
+
+    if local_ids.len() > 1 {
+        let configured = local_ids
+            .iter()
+            .map(|(neighborhood_id, node_id)| format!("{neighborhood_id}:{node_id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "multiple neighborhoods declare local_node_id, but the storage fabric currently supports one self identity ({configured})"
+        ));
+    }
+
+    Ok(local_ids
         .first()
         .map(|(neighborhood_id, node_id)| config::scoped_peer_id(neighborhood_id, *node_id))
-        .unwrap_or(PeerId(0))
+        .unwrap_or(PeerId(0)))
 }
 
 /// Retire a shard layer: signal its shards to exit, then join every
@@ -480,5 +493,71 @@ impl ConfigApplyTarget for ProcessApplyTarget {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn graph_with_local_ids(ids: &[(&str, Option<u64>)]) -> config::RuntimeGraph {
+        let neighborhoods = ids
+            .iter()
+            .map(|(id, local_node_id)| {
+                (
+                    (*id).to_string(),
+                    config::RuntimeNeighborhood {
+                        id: (*id).to_string(),
+                        backend_id: "backend".to_string(),
+                        p2p: config::RuntimeP2p {
+                            fingers_per_node: 100,
+                            local_node_id: *local_node_id,
+                            local_tags: Vec::new(),
+                            routing_plan: None,
+                        },
+                        peers: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+
+        config::RuntimeGraph {
+            caches: HashMap::new(),
+            neighborhoods,
+            frontends: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn local_self_peer_is_zero_without_local_node_id() {
+        let graph = graph_with_local_ids(&[("n-a", None), ("n-b", None)]);
+
+        assert_eq!(local_self_peer(&graph).unwrap(), PeerId(0));
+    }
+
+    #[test]
+    fn local_self_peer_scopes_single_local_node_id() {
+        let graph = graph_with_local_ids(&[("n-a", None), ("n-b", Some(7))]);
+
+        assert_eq!(
+            local_self_peer(&graph).unwrap(),
+            config::scoped_peer_id("n-b", 7)
+        );
+    }
+
+    #[test]
+    fn local_self_peer_rejects_multiple_local_node_ids() {
+        let graph = graph_with_local_ids(&[("n-b", Some(2)), ("n-a", Some(1))]);
+
+        let err = local_self_peer(&graph).unwrap_err();
+
+        assert!(
+            err.contains("multiple neighborhoods declare local_node_id"),
+            "{err}"
+        );
+        assert!(err.contains("n-a:1"), "{err}");
+        assert!(err.contains("n-b:2"), "{err}");
     }
 }
