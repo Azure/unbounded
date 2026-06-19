@@ -25,7 +25,7 @@ use std::path::Path;
 
 use prost::Message;
 
-use super::graph::{runtime_projection, validate_binding_graph};
+use super::graph::runtime_projection;
 use super::schema::{Config, backend_spec, disk_spec, frontend_spec, peer_spec};
 
 #[derive(Debug)]
@@ -33,7 +33,6 @@ pub enum ConfigError {
     Io(io::Error),
     Toml(toml::de::Error),
     Protobuf(prost::DecodeError),
-    DuplicatePeer(u64),
     DuplicateDiskPath(String),
     MissingFileDiskSize(String),
     ZeroFileDiskSize(String),
@@ -87,12 +86,11 @@ pub enum ConfigError {
         addr: String,
     },
     MissingPeerConfig(u64),
-    MissingDiskConfig(String),
+    MissingDiskConfig,
     InvalidMetricsAddr {
         addr: String,
     },
     InvalidBindingGraph(String),
-    UnsupportedRuntimeProjection(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -101,7 +99,6 @@ impl fmt::Display for ConfigError {
             ConfigError::Io(e) => write!(f, "io error reading config: {e}"),
             ConfigError::Toml(e) => write!(f, "toml parse error: {e}"),
             ConfigError::Protobuf(e) => write!(f, "protobuf decode error: {e}"),
-            ConfigError::DuplicatePeer(id) => write!(f, "duplicate peer id: {id}"),
             ConfigError::DuplicateDiskPath(p) => {
                 write!(f, "duplicate disk path: {p}")
             }
@@ -207,16 +204,11 @@ impl fmt::Display for ConfigError {
             ConfigError::MissingPeerConfig(peer_id) => {
                 write!(f, "peer {peer_id}: config must set one peer transport")
             }
-            ConfigError::MissingDiskConfig(path) => {
-                write!(f, "disk {path}: config must set one disk type")
-            }
+            ConfigError::MissingDiskConfig => write!(f, "disk config must set one disk type"),
             ConfigError::InvalidMetricsAddr { addr } => {
                 write!(f, "metrics addr {addr:?} is not a valid socket address")
             }
             ConfigError::InvalidBindingGraph(msg) => write!(f, "invalid binding graph: {msg}"),
-            ConfigError::UnsupportedRuntimeProjection(msg) => {
-                write!(f, "unsupported runtime projection: {msg}")
-            }
         }
     }
 }
@@ -359,8 +351,7 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         }
     }
 
-    validate_binding_graph(cfg).map_err(ConfigError::InvalidBindingGraph)?;
-    runtime_projection(cfg).map_err(ConfigError::UnsupportedRuntimeProjection)?;
+    runtime_projection(cfg).map_err(ConfigError::InvalidBindingGraph)?;
 
     // The metrics exporter addr is optional; when set it must parse as a
     // socket address (an empty value disables the exporter).
@@ -497,7 +488,7 @@ fn validate_disks(disks: &[super::schema::DiskSpec]) -> Result<(), ConfigError> 
                     return Err(ConfigError::DuplicateDiskPath(path.to_string()));
                 }
             }
-            None => return Err(ConfigError::MissingDiskConfig(String::new())),
+            None => return Err(ConfigError::MissingDiskConfig),
         }
     }
 
@@ -506,7 +497,7 @@ fn validate_disks(disks: &[super::schema::DiskSpec]) -> Result<(), ConfigError> 
 
 fn validated_disk_path(disk: &super::schema::DiskSpec) -> Result<&str, ConfigError> {
     let Some(path) = disk.path() else {
-        return Err(ConfigError::MissingDiskConfig(String::new()));
+        return Err(ConfigError::MissingDiskConfig);
     };
     if path.is_empty() {
         return Err(ConfigError::EmptyDiskPath);
@@ -1409,7 +1400,7 @@ id = 1
         );
         let f = write_cfg(&s);
         match load(f.path()) {
-            Err(ConfigError::MissingDiskConfig(path)) if path.is_empty() => {}
+            Err(ConfigError::MissingDiskConfig) => {}
             other => panic!("expected MissingDiskConfig, got {other:?}"),
         }
     }

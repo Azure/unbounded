@@ -20,10 +20,9 @@ pub use control::{
 };
 pub use diff::ConfigDiff;
 pub use graph::{
-    CompatRuntimeProjection, ResolvedFrontendBinding, RuntimeCache, RuntimeGraph,
-    RuntimeNeighborhood, RuntimeP2p, RuntimePeer, compat_runtime_projection, frontend_backend_map,
-    runtime_disks, runtime_p2p_or_default, runtime_peers, runtime_projection, scoped_peer_id,
-    validate_binding_graph,
+    ResolvedFrontendBinding, RuntimeCache, RuntimeGraph, RuntimeNeighborhood, RuntimeP2p,
+    RuntimePeer, frontend_backend_map, runtime_disks, runtime_peers, runtime_projection,
+    scoped_peer_id, validate_binding_graph,
 };
 pub use load::ConfigError;
 pub use reconcile::{

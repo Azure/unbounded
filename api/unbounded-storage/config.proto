@@ -178,6 +178,9 @@ message CacheSpec {
 }
 
 message DiskSpec {
+  reserved 1, 4;
+  reserved "path", "numa";
+
   // Optional io_uring queue depth override for this disk.
   optional uint32 queue_depth = 2;
 

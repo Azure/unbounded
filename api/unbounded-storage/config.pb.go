@@ -2074,7 +2074,7 @@ const file_config_proto_rawDesc = "" +
 	"\tCacheSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06source\x18\x02 \x01(\tR\x06source\x128\n" +
-	"\x05disks\x18\x03 \x03(\v2\".unbounded.storage.config.DiskSpecR\x05disks\"\xbc\x02\n" +
+	"\x05disks\x18\x03 \x03(\v2\".unbounded.storage.config.DiskSpecR\x05disks\"\xd4\x02\n" +
 	"\bDiskSpec\x12$\n" +
 	"\vqueue_depth\x18\x02 \x01(\rH\x01R\n" +
 	"queueDepth\x88\x01\x01\x12+\n" +
@@ -2084,7 +2084,7 @@ const file_config_proto_rawDesc = "" +
 	"\x04file\x18\a \x01(\v2(.unbounded.storage.config.FileDiskConfigH\x00R\x04fileB\b\n" +
 	"\x06configB\x0e\n" +
 	"\f_queue_depthB\x12\n" +
-	"\x10_page_size_bytes\"G\n" +
+	"\x10_page_size_bytesJ\x04\b\x01\x10\x02J\x04\b\x04\x10\x05R\x04pathR\x04numa\"G\n" +
 	"\x0fBlockDiskConfig\x12\x17\n" +
 	"\x04numa\x18\x01 \x01(\rH\x00R\x04numa\x88\x01\x01\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04pathB\a\n" +

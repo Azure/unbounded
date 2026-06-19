@@ -207,7 +207,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
                     id: neighborhood.name.clone(),
                     backend_id: neighborhood.source.clone(),
                     p2p: RuntimeP2p {
-                        fingers_per_node: neighborhood.fingers_per_node.unwrap_or(0).max(1),
+                        fingers_per_node: neighborhood.fingers_per_node.unwrap_or(100).max(1),
                         local_node_id: neighborhood.local_node_id,
                         local_tags: neighborhood.local_tags.clone(),
                         routing_plan: neighborhood.routing_plan.clone(),
@@ -225,15 +225,6 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
     })
 }
 
-pub fn empty_runtime_p2p() -> RuntimeP2p {
-    RuntimeP2p {
-        fingers_per_node: 100,
-        local_node_id: None,
-        local_tags: Vec::new(),
-        routing_plan: None,
-    }
-}
-
 pub fn scoped_peer_id(neighborhood_id: &str, node_id: u64) -> PeerId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"unbounded-storage scoped peer id v1");
@@ -245,15 +236,6 @@ pub fn scoped_peer_id(neighborhood_id: &str, node_id: u64) -> PeerId {
     bytes.copy_from_slice(&digest.as_bytes()[0..8]);
     let id = u64::from_le_bytes(bytes);
     if id == 0 { PeerId(1) } else { PeerId(id) }
-}
-
-#[allow(dead_code)]
-pub fn legacy_empty_projection() -> RuntimeGraph {
-    RuntimeGraph {
-        caches: HashMap::new(),
-        neighborhoods: HashMap::new(),
-        frontends: HashMap::new(),
-    }
 }
 
 pub fn runtime_disks(graph: &RuntimeGraph) -> Vec<DiskSpec> {
@@ -270,54 +252,6 @@ pub fn runtime_peers(graph: &RuntimeGraph) -> Vec<RuntimePeer> {
         peers.extend(neighborhood.peers.clone());
     }
     peers
-}
-
-pub fn runtime_p2p_or_default(graph: &RuntimeGraph) -> RuntimeP2p {
-    match graph.neighborhoods.values().next() {
-        Some(neighborhood) => neighborhood.p2p.clone(),
-        None => empty_runtime_p2p(),
-    }
-}
-
-pub fn first_runtime_neighborhood(graph: &RuntimeGraph) -> Option<&RuntimeNeighborhood> {
-    graph.neighborhoods.values().next()
-}
-
-pub fn first_runtime_cache(graph: &RuntimeGraph) -> Option<&RuntimeCache> {
-    graph.caches.values().next()
-}
-
-pub fn compat_runtime_projection(config: &Config) -> Result<CompatRuntimeProjection, String> {
-    let graph = runtime_projection(config)?;
-    let (p2p, peers) = match first_runtime_neighborhood(&graph) {
-        Some(neighborhood) => (
-            neighborhood.p2p.clone(),
-            neighborhood.peers.iter().map(|p| p.spec.clone()).collect(),
-        ),
-        None => (
-            RuntimeP2p {
-                fingers_per_node: 100,
-                local_node_id: None,
-                local_tags: Vec::new(),
-                routing_plan: None,
-            },
-            Vec::new(),
-        ),
-    };
-    Ok(CompatRuntimeProjection {
-        p2p,
-        peers,
-        disks: runtime_disks(&graph),
-        frontends: graph.frontends,
-    })
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct CompatRuntimeProjection {
-    pub p2p: RuntimeP2p,
-    pub peers: Vec<PeerSpec>,
-    pub disks: Vec<DiskSpec>,
-    pub frontends: HashMap<String, ResolvedFrontendBinding>,
 }
 
 pub fn frontend_backend_map(
