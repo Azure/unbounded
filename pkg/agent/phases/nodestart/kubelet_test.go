@@ -72,3 +72,69 @@ func TestConfigureKubeletOmitsNodeIPWhenEmpty(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, string(data), "--node-ip=")
 }
+
+func TestConfigureKubeletWritesNodeLabelsAndTaints(t *testing.T) {
+	t.Parallel()
+
+	machineDir := t.TempDir()
+	goalState := &goalstates.NodeStart{
+		MachineDir: machineDir,
+		NodeName:   "worker-1",
+		Kubelet: goalstates.Kubelet{
+			APIServer:  "https://api.example.com",
+			CACertData: []byte("ca"),
+			KubeletAuthInfo: config.KubeletAuthInfo{
+				BootstrapToken: "token",
+			},
+			ClusterDNS: "10.0.0.10",
+			NodeLabels: map[string]string{
+				"team": "infra",
+				"env":  "prod",
+			},
+			RegisterWithTaints: []string{
+				"workload=batch:NoSchedule",
+				"dedicated=gpu:NoSchedule",
+			},
+		},
+	}
+
+	require.NoError(t, ConfigureKubelet(goalState).Do(context.Background()))
+
+	data, err := os.ReadFile(filepath.Join(
+		machineDir,
+		goalstates.KubeletServiceDropInDir,
+		"20-node-config.conf",
+	))
+	require.NoError(t, err)
+	require.Contains(t, string(data), "--node-labels=env=prod,team=infra")
+	require.Contains(t, string(data), "--register-with-taints=dedicated=gpu:NoSchedule,workload=batch:NoSchedule")
+}
+
+func TestConfigureKubeletOmitsEmptyNodeLabelsAndTaints(t *testing.T) {
+	t.Parallel()
+
+	machineDir := t.TempDir()
+	goalState := &goalstates.NodeStart{
+		MachineDir: machineDir,
+		NodeName:   "worker-1",
+		Kubelet: goalstates.Kubelet{
+			APIServer:  "https://api.example.com",
+			CACertData: []byte("ca"),
+			KubeletAuthInfo: config.KubeletAuthInfo{
+				BootstrapToken: "token",
+			},
+			ClusterDNS: "10.0.0.10",
+		},
+	}
+
+	require.NoError(t, ConfigureKubelet(goalState).Do(context.Background()))
+
+	data, err := os.ReadFile(filepath.Join(
+		machineDir,
+		goalstates.KubeletServiceDropInDir,
+		"20-node-config.conf",
+	))
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "--node-labels=")
+	require.NotContains(t, string(data), "--register-with-taints=")
+}

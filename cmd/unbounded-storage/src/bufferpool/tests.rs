@@ -15,7 +15,7 @@ use std::task::{Context, Poll};
 
 use crate::bufferpool::{
     BlockStore, BufferPool, BulkRef, Error, PageRef, PageStream, Pool, PoolConfig, Req, StripeKey,
-    Transport,
+    StripePlan, Transport,
 };
 use crate::memory::Backing;
 use crate::runtime::noop_waker;
@@ -104,7 +104,7 @@ fn heap_backing(page_size: usize, page_count: usize) -> Backing {
         base: owner.ptr,
         page_size,
         page_count,
-        _own: Box::new(owner),
+        keepalive: std::sync::Arc::new(owner),
     }
 }
 
@@ -136,10 +136,27 @@ struct MockTransport {
     pend_polls: RefCell<usize>,
     /// Force `bulk_get` to return an error instead of completing.
     error_mode: RefCell<bool>,
+    /// Number of `do_bulk_get` futures currently executing (between
+    /// first poll and completion). Tracks overlap.
+    cur_in_flight: RefCell<usize>,
+    /// High-water mark of `cur_in_flight`. A value above 1 proves
+    /// fetches overlapped; with one-page stripes that overlap can
+    /// only come from cross-stripe pipelining.
+    max_in_flight: RefCell<usize>,
     /// Bound at construction (the embedder pre-registers the
     /// backing; `Transport` no longer carries a registration hook).
     base: *mut u8,
     page_size: usize,
+}
+
+/// Decrements `cur_in_flight` when a `do_bulk_get` future completes or
+/// is cancelled, so the high-water mark reflects true overlap.
+struct InFlightGuard<'a>(&'a MockTransport);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.cur_in_flight.borrow_mut() -= 1;
+    }
 }
 
 impl MockTransport {
@@ -149,6 +166,8 @@ impl MockTransport {
             calls: RefCell::new(0),
             pend_polls: RefCell::new(0),
             error_mode: RefCell::new(false),
+            cur_in_flight: RefCell::new(0),
+            max_in_flight: RefCell::new(0),
             base,
             page_size,
         }
@@ -170,10 +189,28 @@ impl MockTransport {
         *self.error_mode.borrow_mut() = on;
     }
 
+    fn max_in_flight(&self) -> usize {
+        *self.max_in_flight.borrow()
+    }
+
     async fn do_bulk_get(&self, _req: &TestReq, src: BulkRef, dst: PageRef) -> Result<(), Error> {
+        {
+            let mut cur = self.cur_in_flight.borrow_mut();
+            *cur += 1;
+            let mut mx = self.max_in_flight.borrow_mut();
+            if *cur > *mx {
+                *mx = *cur;
+            }
+        }
+        let _in_flight = InFlightGuard(self);
         // Pend the configured number of polls (one polling round
-        // per pend, decremented on each call).
-        for _ in 0..*self.pend_polls.borrow() {
+        // per pend, decremented on each call). Bind the count to a
+        // local so the `RefCell` borrow is not held across the
+        // awaits below (the `for` range temporary would otherwise
+        // live for the whole loop and collide with overlapping
+        // fetches).
+        let pend = *self.pend_polls.borrow();
+        for _ in 0..pend {
             PendOnce { fired: false }.await;
         }
         *self.pend_polls.borrow_mut() = 0;
@@ -748,7 +785,7 @@ fn rejects_bad_backing() {
         base: 0x1000 as *mut u8,
         page_size: 0,
         page_count: 1,
-        _own: Box::new(()),
+        keepalive: std::sync::Arc::new(()),
     };
     let t = TransportRc(Rc::new(MockTransport::new(
         backing.base,
@@ -932,4 +969,214 @@ fn leader_drop_during_tee_releases_page() {
     assert_eq!(transport.calls(), 1);
     // write_page never completed (best-effort tee).
     assert_eq!(store.writes(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Pipelined (cross-stripe) reader tests.
+// ---------------------------------------------------------------------------
+
+/// Deterministic per-stripe byte pattern.
+fn fill(n: usize, seed: u8) -> Vec<u8> {
+    (0..n).map(|i| (i as u8).wrapping_add(seed)).collect()
+}
+
+#[test]
+fn pipelined_delivers_bytes_in_order_across_stripes() {
+    const P: usize = 1024;
+    let (pool, transport, _store) = make_pool_v2(P, 16);
+
+    // Four stripes, two pages each.
+    let mut expected = Vec::new();
+    let mut plans: Vec<StripePlan<TestReq>> = Vec::new();
+    for i in 0..4u8 {
+        let k = key(0x40 + i);
+        let stripe = fill(P * 2, i);
+        transport.put_stripe(k, stripe.clone());
+        expected.extend_from_slice(&stripe);
+        plans.push(StripePlan {
+            req: TestReq { key: k },
+            intra_offset: 0,
+            intra_len: (P * 2) as u64,
+        });
+    }
+
+    let bytes = block_on(async {
+        let mut out = Vec::new();
+        let mut rs = pool.read_pipelined(plans, usize::MAX).unwrap();
+        while let Some(r) = rs.next_page().await {
+            out.extend_from_slice(r.unwrap().as_slice());
+        }
+        out
+    });
+
+    assert_eq!(bytes, expected, "bytes delivered in global order");
+    assert_eq!(transport.calls(), 8, "one fetch per page");
+    assert_eq!(pool.free_pages(), 16, "all pages returned");
+    assert_eq!(pool.inflight_entries(), 0, "inflight cleaned up");
+}
+
+#[test]
+fn pipelined_prefetch_overlaps_across_stripe_boundaries() {
+    const P: usize = 1024;
+    let (pool, transport, _store) = make_pool_v2(P, 16);
+
+    // Eight single-page stripes. Because each stripe is exactly one
+    // page, any overlap in `do_bulk_get` can only come from the
+    // pipeline reaching across stripe boundaries.
+    let mut expected = Vec::new();
+    let mut plans: Vec<StripePlan<TestReq>> = Vec::new();
+    for i in 0..8u8 {
+        let k = key(0x60 + i);
+        let stripe = fill(P, i);
+        transport.put_stripe(k, stripe.clone());
+        expected.extend_from_slice(&stripe);
+        plans.push(StripePlan {
+            req: TestReq { key: k },
+            intra_offset: 0,
+            intra_len: P as u64,
+        });
+    }
+    // Make fetches pend so several overlap before any completes.
+    transport.set_pend_polls(3);
+
+    let bytes = block_on(async {
+        let mut out = Vec::new();
+        let mut rs = pool.read_pipelined(plans, usize::MAX).unwrap();
+        while let Some(r) = rs.next_page().await {
+            out.extend_from_slice(r.unwrap().as_slice());
+        }
+        out
+    });
+
+    assert_eq!(bytes, expected, "still delivered in order");
+    assert!(
+        transport.max_in_flight() >= 2,
+        "fetches must overlap across stripe boundaries (saw {})",
+        transport.max_in_flight()
+    );
+    assert_eq!(pool.free_pages(), 16);
+    assert_eq!(pool.inflight_entries(), 0);
+}
+
+#[test]
+fn pipelined_partial_first_and_last_slice() {
+    const P: usize = 1024;
+    let (pool, transport, _store) = make_pool_v2(P, 16);
+
+    let k0 = key(0x70);
+    let k1 = key(0x71);
+    let s0 = fill(P * 2, 0);
+    let s1 = fill(P * 2, 1);
+    transport.put_stripe(k0, s0.clone());
+    transport.put_stripe(k1, s1.clone());
+
+    // Slice 0: bytes [512, 2048) of stripe 0 (spans both its pages,
+    // partial first page). Slice 1: bytes [0, 512) of stripe 1
+    // (partial single page).
+    let plans = vec![
+        StripePlan {
+            req: TestReq { key: k0 },
+            intra_offset: 512,
+            intra_len: 1536,
+        },
+        StripePlan {
+            req: TestReq { key: k1 },
+            intra_offset: 0,
+            intra_len: 512,
+        },
+    ];
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&s0[512..2048]);
+    expected.extend_from_slice(&s1[0..512]);
+
+    let bytes = block_on(async {
+        let mut out = Vec::new();
+        let mut rs = pool.read_pipelined(plans, usize::MAX).unwrap();
+        while let Some(r) = rs.next_page().await {
+            out.extend_from_slice(r.unwrap().as_slice());
+        }
+        out
+    });
+
+    assert_eq!(bytes, expected);
+    assert_eq!(pool.free_pages(), 16);
+    assert_eq!(pool.inflight_entries(), 0);
+}
+
+#[test]
+fn pipelined_drop_midway_recycles_pages_and_budget() {
+    const P: usize = 1024;
+    let (pool, transport, _store) = make_pool_v2(P, 16);
+
+    let mut plans: Vec<StripePlan<TestReq>> = Vec::new();
+    for i in 0..4u8 {
+        let k = key(0x80 + i);
+        transport.put_stripe(k, fill(P * 2, i));
+        plans.push(StripePlan {
+            req: TestReq { key: k },
+            intra_offset: 0,
+            intra_len: (P * 2) as u64,
+        });
+    }
+
+    block_on(async {
+        let mut rs = pool.read_pipelined(plans, usize::MAX).unwrap();
+        // Consume only the first two pages, then drop mid-stream while
+        // later stripes are prefetching.
+        let _ = rs.next_page().await.unwrap().unwrap();
+        let _ = rs.next_page().await.unwrap().unwrap();
+    });
+
+    assert_eq!(pool.free_pages(), 16, "all pages recycled after drop");
+    assert_eq!(pool.inflight_entries(), 0, "no inflight left after drop");
+    assert_eq!(pool.prefetch_inflight(), 0, "prefetch budget returned");
+}
+
+#[test]
+fn pipelined_skips_zero_length_slices() {
+    const P: usize = 1024;
+    let (pool, transport, _store) = make_pool_v2(P, 8);
+
+    let k0 = key(0x90);
+    let k1 = key(0x91);
+    let s0 = fill(P, 0);
+    let s1 = fill(P, 1);
+    transport.put_stripe(k0, s0.clone());
+    transport.put_stripe(k1, s1.clone());
+
+    // A zero-length middle slice must be dropped entirely.
+    let plans = vec![
+        StripePlan {
+            req: TestReq { key: k0 },
+            intra_offset: 0,
+            intra_len: P as u64,
+        },
+        StripePlan {
+            req: TestReq { key: key(0xFF) },
+            intra_offset: 0,
+            intra_len: 0,
+        },
+        StripePlan {
+            req: TestReq { key: k1 },
+            intra_offset: 0,
+            intra_len: P as u64,
+        },
+    ];
+
+    let mut expected = s0.clone();
+    expected.extend_from_slice(&s1);
+
+    let bytes = block_on(async {
+        let mut out = Vec::new();
+        let mut rs = pool.read_pipelined(plans, usize::MAX).unwrap();
+        while let Some(r) = rs.next_page().await {
+            out.extend_from_slice(r.unwrap().as_slice());
+        }
+        out
+    });
+
+    assert_eq!(bytes, expected);
+    assert_eq!(transport.calls(), 2, "zero-length slice issued no fetch");
+    assert_eq!(pool.free_pages(), 8);
 }

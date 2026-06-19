@@ -429,7 +429,7 @@ func TestMachineOperationReconciler_BuildsReplaceUserData(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(s))
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
+	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-test"},
@@ -519,7 +519,7 @@ func TestMachineOperationReconciler_ReexecutesInProgressHostReplace(t *testing.T
 	require.NoError(t, corev1.AddToScheme(s))
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
+	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
 	op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
 	op.Status.StartedAt = ptrTo(fixedOperationNow())
@@ -554,7 +554,7 @@ func TestMachineOperationReconciler_PatchesReplacementProviderIDBeforeCleanup(t 
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
 	machine.Spec.ProviderID = "oci://old-instance"
-	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
+	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-test"},

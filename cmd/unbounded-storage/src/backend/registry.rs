@@ -32,7 +32,9 @@ use crate::config::reconcile::BackendReconcileTarget;
 use crate::config::{BackendKind, BackendSpec};
 use crate::storage::StripeReq;
 
-use super::{Backend, HttpBackend, OriginBackend, OriginRing, OriginStream, S3Backend};
+use super::{
+    AzureBackend, Backend, HttpBackend, OriginBackend, OriginRing, OriginStream, S3Backend,
+};
 
 /// The build context a registry needs to (re)construct an
 /// [`OriginBackend`] from a [`BackendSpec`]. Captured once per registry
@@ -138,6 +140,20 @@ impl BuildCtx {
                 let origin = S3Backend::resolve_origin(&spec.endpoint)?;
                 let host = extract_host_authority(&spec.endpoint);
                 Ok(OriginBackend::S3(S3Backend::new(
+                    self.ring.clone(),
+                    origin,
+                    host,
+                    spec.id.clone(),
+                    spec.stripe_size_bytes,
+                    self.page_size,
+                    self.backing_base,
+                    spec.http_concurrency as usize,
+                )))
+            }
+            BackendKind::Azure => {
+                let origin = AzureBackend::resolve_origin(&spec.endpoint)?;
+                let host = extract_host_authority(&spec.endpoint);
+                Ok(OriginBackend::Azure(AzureBackend::new(
                     self.ring.clone(),
                     origin,
                     host,

@@ -31,7 +31,16 @@ rand = "0.8"
 rand_chacha = "0.3"
 toml = "0.8"
 notify = "6"
+prometheus = { version = "0.13", default-features = false }
 prost = "0.13"
+pprof = { version = "0.14", default-features = false, features = ["protobuf-codec"], optional = true }
+
+[features]
+# CPU sampling profiler. Off by default so standard builds stay
+# dependency-free; enable with `--features profiling`. When enabled the
+# daemon listens for SIGUSR1 and writes a pprof protobuf file. See
+# src/profiling.rs.
+profiling = ["dep:pprof"]
 
 [build-dependencies]
 cc = "1"

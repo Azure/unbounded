@@ -177,15 +177,27 @@ impl HttpBackend {
         // metadata. The sentinel `stripe_idx` would overflow
         // `absolute_range`, so this must branch before that is computed.
         if origin.is_metadata_entry() {
-            let fut = Box::pin(fetch_metadata(
-                handle,
-                origin_addr,
-                host,
-                path,
-                dsts_owned.clone(),
-                backing_base,
-                page_size,
-                self.limiter.clone(),
+            let mut log = crate::obs::ReqLog::new("backend.http");
+            log.str_field("op", "HEAD")
+                .str_field("backend", self.backend_id())
+                .str_field("path", &path)
+                .field("pages", dsts_owned.len());
+            let fut = Box::pin(crate::obs::instrument(
+                log,
+                crate::metrics::instrument_backend(
+                    self.backend_id().to_string(),
+                    page_size as u64,
+                    fetch_metadata(
+                        handle,
+                        origin_addr,
+                        host,
+                        path,
+                        dsts_owned.clone(),
+                        backing_base,
+                        page_size,
+                        self.limiter.clone(),
+                    ),
+                ),
             ));
             return HttpFetchStream::pending(fut, dsts_owned);
         }
@@ -193,17 +205,31 @@ impl HttpBackend {
         debug_assert!(!origin.is_metadata_entry());
         let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
 
-        let fut = Box::pin(fetch(
-            handle,
-            origin_addr,
-            host,
-            path,
-            start,
-            len,
-            dsts_owned.clone(),
-            backing_base,
-            page_size,
-            self.limiter.clone(),
+        let mut log = crate::obs::ReqLog::new("backend.http");
+        log.str_field("op", "GET")
+            .str_field("backend", self.backend_id())
+            .str_field("path", &path)
+            .field("off", start)
+            .field("len", len)
+            .field("pages", dsts_owned.len());
+        let fut = Box::pin(crate::obs::instrument(
+            log,
+            crate::metrics::instrument_backend(
+                self.backend_id().to_string(),
+                len,
+                fetch(
+                    handle,
+                    origin_addr,
+                    host,
+                    path,
+                    start,
+                    len,
+                    dsts_owned.clone(),
+                    backing_base,
+                    page_size,
+                    self.limiter.clone(),
+                ),
+            ),
         ));
         HttpFetchStream::pending(fut, dsts_owned)
     }

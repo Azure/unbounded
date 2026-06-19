@@ -193,7 +193,7 @@ func buildBootstrapRESTConfig(cfg *provision.AgentConfig) (*rest.Config, error) 
 }
 
 // registerMachine ensures a Machine CR exists for this node. If the CR
-// already exists, it is left untouched. Otherwise a minimal CR is created
+// already exists, it is left untouched. Otherwise, a minimal CR is created
 // from the applied config. This supports dynamic environments where a
 // Machine CR may not have been pre-created by machina.
 func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg *provision.AgentConfig) error {
@@ -252,7 +252,7 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 		},
 		Spec: v1alpha3.MachineSpec{
 			Kubernetes: &v1alpha3.KubernetesSpec{
-				BootstrapTokenRef: v1alpha3.LocalObjectReference{
+				BootstrapTokenRef: &v1alpha3.LocalObjectReference{
 					Name: "bootstrap-token-" + tokenID,
 				},
 				NodeLabels:         cfg.Kubelet.Labels,

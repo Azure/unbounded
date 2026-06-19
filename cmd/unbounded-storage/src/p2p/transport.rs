@@ -125,8 +125,10 @@ where
 
     fn bulk_get<'a>(&'a self, req: &'a R, src: BulkRef, dsts: &'a [PageRef]) -> Self::Stream<'a> {
         if self.owns_locally(req) {
+            crate::metrics::bufferpool_miss_source(crate::metrics::MissSource::Origin);
             RoutedStream::Backend(self.backend.bulk_get(req, src, dsts))
         } else {
+            crate::metrics::bufferpool_miss_source(crate::metrics::MissSource::Peer);
             RoutedStream::Fabric(self.fabric_transport.bulk_get(req, src, dsts))
         }
     }

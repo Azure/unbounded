@@ -63,10 +63,10 @@ deterministic order (disks closed first, then fabric / pool drops).
 
 ## Configuration file
 
-The schema is defined by `proto/config.proto` and is the source of
-truth; the daemon can still load a TOML file today, but clients are
-expected to speak protobuf directly going forward. The schema is
-deliberately proto3-native rather than idiomatic TOML:
+The schema is defined by `api/unbounded-storage/config.proto` and is the source of
+truth; the daemon can load strict TOML or a raw binary protobuf wire
+message with a `.binpb` extension. The schema is deliberately
+proto3-native rather than idiomatic TOML:
 
 - Enum fields are plain integers (the enum discriminant), not strings.
 - Byte-size fields are plain integer byte counts, with no K/M/G
@@ -112,10 +112,11 @@ fingers_per_node = 100           # routing finger-table fanout per node.
 
 [[peers]]                        # repeat per remote peer; ids must be unique.
 id        = 1                    # u64, unique within the daemon.
-transport = 0                    # 0 = tcp, 1 = rdma.
-address   = "10.0.0.1:9000"      # tcp: host:port, parsed as SocketAddr.
-                                 # rdma: lowercase even-length ASCII hex
-                                 #       (raw libfabric address).
+address   = { socket = "10.0.0.1:9000" }
+                                  # numeric fabric listen address. On InfiniBand
+                                  # this is usually IPoIB; tcp fallback uses TCP.
+                                  # Use { native = "hex:..." } only for
+                                  # controller-generated provider-native addresses.
 hca_numa  = 0                    # optional u16; pin connection setup to this NUMA node.
 
 [[disks]]                        # repeat per local device; paths must be unique.
@@ -126,23 +127,24 @@ queue_depth = 32                 # optional u32; per-disk io_uring depth.
 
 [startup.memory]                 # startup-fixed; read once at process start.
 no_hugepages   = false           # true allocates per-shard backing from the heap.
-bytes_per_shard = 134217728      # u64 bytes (no K/M/G suffix). 0 -> 128 MiB.
+memory_total_bytes = 134217728   # u64 bytes (no K/M/G suffix). Total backing pool split
+                                 #   evenly across serving shards. 0 -> 128 MiB.
 
 [startup.fabric]
-listen_addr         = "0.0.0.0:0" # per-shard fabric listen address; :0 picks a free port.
+listen_addr         = "0.0.0.0:0" # fabric listen address; :0 picks a free port.
+                                 # Use "hex:..." only for provider-native binds.
 progress_threads    = 2          # libfabric progress threads per shard.
 progress_poll_us    = 10         # progress-thread busy-poll budget (us).
 rpc_worker_threads  = 4          # fabric RPC worker threads per shard.
 max_inflight        = 1024       # max in-flight fabric ops per shard (back-pressure).
 
 [startup.topology]
-rdma_progress_per_hca = 1        # RDMA progress engines per HCA.
-rdma_handlers_per_hca = 4        # RDMA completion handlers per HCA.
-tcp_fallback_threads  = 1        # TCP-fallback threads when RDMA is unavailable.
+serving_cores         = 0        # serving shards; 0 = auto-fill every usable CPU.
+nic_workers           = 4        # fabric CPUs pinned per active HCA (0 -> 4).
+hcas_per_numa_node    = 1        # max HCAs used per NUMA node (0 -> 1).
 use_smt_siblings      = false    # also place shards on SMT sibling CPUs.
 ignore_isolated       = false    # also schedule onto isolcpus-isolated CPUs.
 include_node_cpu0     = false    # allow placing a shard on each NUMA node's CPU 0.
 allow_inactive_port   = false    # use HCA ports not in the active state.
 disable_rdma          = false    # disable RDMA and force the libfabric tcp provider.
 ```
-

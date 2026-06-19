@@ -13,7 +13,7 @@ mod shard;
 mod context;
 
 #[cfg(target_os = "linux")]
-pub use pinned::{PinnedRuntime, WorkerSpec};
+pub use pinned::{PinnedRuntime, WorkerSpec, set_preferred_node};
 
 #[cfg(target_os = "linux")]
 pub use context::ShardContext;

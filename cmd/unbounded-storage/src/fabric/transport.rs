@@ -4,51 +4,46 @@
 //! Client-side `bufferpool::Transport<R>` implementation over the
 //! fabric module. One transport per NUMA shard.
 //!
-//! Wire protocol (mirror of the server-side responder in `rpc.rs`):
+//! Wire protocol (mirror of the server-side responder in `rpc.rs`),
+//! carried over the connection-managed `FI_EP_MSG` transport. Every
+//! message is an 8-byte [`MsgHeader`] (`kind` + `request_id`) followed
+//! by a kind-specific body:
 //!
-//! 1. Client allocates a `request_id` (32 bits), serializes a
-//!    [`super::rpc::RequestHeader`] plus the bincode-encoded `R`
-//!    into a single buffer, and `fi_tsend`s it with
-//!    `tag = REQUEST_TAG_BASE | request_id` to the routed peer.
-//! 2. Client posts one recv per expected destination page tagged
-//!    `PAGE_ACK_TAG_BASE | request_id`, plus separate recvs for
-//!    `RESPONSE_END_TAG_BASE | request_id` and
-//!    `ERROR_ACK_TAG_BASE | request_id`. Launch rejects requests that
-//!    cannot fit within the completion registry before posting any recv.
-//! 3. For each `PAGE_ACK`, the stream yields
-//!    `dsts[page_idx_from_payload]`. Once every requested page is acked
-//!    the stream resolves with `None` on the next poll, with no separate
-//!    `RESPONSE_END` (the client knows `dsts.len()` and page acks arrive
-//!    in order, so the final ack is the end of stream).
-//! 4. `RESPONSE_END` (sent only for a short success that delivered fewer
-//!    than `dsts.len()` pages, including zero) resolves the stream with
-//!    `None`; `ERROR_ACK` yields `Some(Err(_))` and then `None`.
+//! 1. Client allocates a `request_id` (32 bits), registers an
+//!    [`AckSink`] for it on the fabric's inbound dispatch, then frames
+//!    a [`MsgKind::Request`] message whose body is a
+//!    [`super::rpc::RequestHeader`] plus the bincode-encoded `R` and
+//!    `fi_send`s it to the routed peer's connection.
+//! 2. The server replies on the same connection with framed
+//!    [`MsgKind::PageAck`] / [`MsgKind::ResponseEnd`] /
+//!    [`MsgKind::ErrorAck`] messages. The per-connection `RecvPool`
+//!    receives them and the inbound dispatch routes each to this
+//!    stream's `AckSink` by `request_id`. The client posts no recvs of
+//!    its own.
+//! 3. For each `PageAck`, the stream yields `dsts[page_idx_from_body]`.
+//!    Once every requested page is acked the stream resolves with
+//!    `None` on the next poll, with no separate `RESPONSE_END` (the
+//!    client knows `dsts.len()` and page acks arrive in order, so the
+//!    final ack is the end of stream).
+//! 4. `RESPONSE_END` (sent only for a short success that delivered
+//!    fewer than `dsts.len()` pages, including zero) resolves the
+//!    stream with `None`; `ERROR_ACK` yields `Some(Err(_))` and then
+//!    `None`.
 //!
-//! Drop: outstanding recv contexts are `fi_cancel`led so libfabric
-//! reclaims its references promptly. A full success sends no terminator,
-//! so the common path has no in-flight server message racing those
-//! cancels (otherwise a `RESPONSE_END` that lost the race would be
-//! stranded as an unexpected message in the provider's bounded receive
-//! buffer). The client does not currently signal the server about
-//! mid-stream cancellation - the server noticing falls out of the same
-//! fabric tear-down at the end of a test (Phase 5b will reconsider once
-//! the wire is exercised under real workloads).
+//! Drop: the stream unregisters its `AckSink` from the inbound
+//! dispatch so no late reply is routed to a dead stream. There are no
+//! client-posted recv contexts to cancel.
 //!
 //! **MR strategy**: page data lands directly in the caller-provided
 //! `MrHandle` (the buffer pool's registered backing) via server-side
 //! `fi_write`; the transport never copies page bytes through its own
-//! buffers. Per-operation control buffers (request header+body send,
-//! `PAGE_ACK`/`RESPONSE_END`/`ERROR_ACK` recvs) are heap-allocated
-//! `Box<[u8; N]>`s sized for the wire payload and freed by the
-//! completion handler. There is no shared bounce-buffer MR; the
-//! provider-required local descriptors are satisfied with
-//! `desc=NULL` (mirroring `ping.rs`).
+//! buffers. The per-operation request control buffer is a heap
+//! `Box<[u8]>` freed by the send completion handler. The
+//! provider-required local descriptor is satisfied with `desc=NULL`.
 
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::ptr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -59,14 +54,12 @@ use crate::bufferpool::{BulkRef, Error as PoolError, PageRef, PageStream, Req, T
 use crate::fabric::PeerId;
 
 use super::backing::MrHandle;
-use super::completion::{CompletionInfo, CompletionSlot};
+use super::dispatch::{AckSink, InboundDispatch};
 use super::error::{FabricError, Result as FabResult};
 use super::fabric::Fabric;
 use super::ffi;
-use super::rpc::{
-    ERROR_ACK_TAG_BASE, ErrorAck, PAGE_ACK_TAG_BASE, PageAck, REQUEST_TAG_BASE,
-    RESPONSE_END_TAG_BASE, RequestHeader,
-};
+use super::rpc::{ErrorAck, PageAck, RequestHeader};
+use super::wire::{MsgHeader, MsgKind};
 
 /// Selects a peer for a given request. Returns `Option` so the
 /// no-peer case (empty routing table) is non-fatal at construction
@@ -93,7 +86,6 @@ pub struct FabricTransport<R, P> {
     mr: MrHandle,
     router: P,
     page_size: usize,
-    next_request_id: AtomicU32,
     _marker: PhantomData<fn() -> R>,
 }
 
@@ -119,7 +111,6 @@ impl<R, P> FabricTransport<R, P> {
             mr,
             router,
             page_size,
-            next_request_id: AtomicU32::new(1),
             _marker: PhantomData,
         })
     }
@@ -224,10 +215,11 @@ fn forward_dest_mr(mr: MrHandle, dest_offset: usize) -> MrHandle {
     }
 }
 
-/// Shared state between the stream and the per-slot completion
-/// handlers running on the progress thread.
+/// Shared state between the stream and the inbound dispatch, which
+/// delivers acks from the progress thread. Implements [`AckSink`] so
+/// the dispatch can route replies straight into the queue.
 pub(crate) struct StreamShared {
-    /// FIFO of recv results arriving from completion handlers.
+    /// FIFO of reply messages arriving from the dispatch.
     queue: Mutex<VecDeque<RecvCompletion>>,
     /// Waker registered by the stream when it last returned Pending.
     waker: Mutex<Option<Waker>>,
@@ -246,19 +238,38 @@ impl StreamShared {
     }
 }
 
-struct RecvCompletion {
-    op_context: usize,
-    result: FabResult<RecvPayload>,
+impl AckSink for StreamShared {
+    fn deliver(&self, kind: MsgKind, body: &[u8]) {
+        self.push(RecvCompletion {
+            kind,
+            payload: body.to_vec(),
+        });
+    }
+
+    fn deliver_page(&self, ordinal: u32) {
+        // A page-landed write-with-immediate carries no framed body.
+        // Re-encode it as the internal `PAGE_ACK` event so the poll
+        // loop's existing ack bookkeeping (bounds, dedup, end-of-stream)
+        // handles it verbatim. A serialize failure is impossible for a
+        // fixed-size struct; fall back to an empty body, which the poll
+        // loop rejects as a malformed ack rather than panicking on the
+        // progress thread.
+        let payload = bincode::serialize(&PageAck { page_idx: ordinal }).unwrap_or_default();
+        self.push(RecvCompletion {
+            kind: MsgKind::PageAck,
+            payload,
+        });
+    }
 }
 
-struct RecvPayload {
-    tag: u64,
+struct RecvCompletion {
+    kind: MsgKind,
     payload: Vec<u8>,
 }
 
 /// Stream returned by `FabricTransport::bulk_get`. On first poll it
-/// posts all recvs and the request send; subsequent polls drain
-/// completions and yield pages.
+/// registers the ack sink and sends the request; subsequent polls
+/// drain replies and yield pages.
 pub struct FabricBulkStream<'a, R> {
     state: StreamState<'a>,
     _marker: PhantomData<fn() -> R>,
@@ -270,8 +281,8 @@ enum StreamState<'a> {
     Failed {
         error: Option<FabricError>,
     },
-    /// Pre-launch state: nothing posted yet. We hold &Transport so
-    /// the first poll can drive submission.
+    /// Pre-launch state: nothing sent yet. We hold &Transport so the
+    /// first poll can drive submission.
     Pending {
         fabric: Arc<Fabric>,
         mr: MrHandle,
@@ -282,27 +293,23 @@ enum StreamState<'a> {
         dsts: &'a [PageRef],
         ttl: u32,
     },
-    /// Active state: recvs posted, awaiting acks.
+    /// Active state: ack sink registered, request sent, awaiting acks.
     Active {
         shared: Arc<StreamShared>,
         dsts: &'a [PageRef],
-        /// Raw recv contexts we may need to cancel on drop. Each is
-        /// a `*mut CompletionSlot` we minted via `into_raw`. When a
-        /// completion arrives the handler removes its entry.
-        recv_ctxs: Mutex<Vec<*mut std::ffi::c_void>>,
-        /// Allocated recv buffers (Box leaks owned by handlers).
-        ep: *mut ffi::fid_ep,
+        /// Dispatch we registered the sink on; Drop unregisters here.
+        dispatch: Arc<InboundDispatch>,
+        request_id: u32,
+        /// Recycled 16-bit page handle bound to this stream's sink for
+        /// the write-with-immediate path; Drop releases it.
+        page_handle: u16,
         acked: Vec<bool>,
         ended: bool,
         emitted_error: bool,
+        log: Option<crate::obs::ReqLog>,
     },
     Done,
 }
-
-// SAFETY: We hold raw pointers to libfabric resources that are
-// thread-safe per its docs; the contexts in `recv_ctxs` are only
-// touched by the stream's own Drop and by the progress thread.
-unsafe impl<'a, R> Send for FabricBulkStream<'a, R> {}
 
 impl<'a, R> FabricBulkStream<'a, R>
 where
@@ -321,8 +328,10 @@ where
     {
         // Allocate request_id eagerly so it's stable for the stream's
         // lifetime. Error materialization waits until first poll so
-        // the trait signature stays infallible.
-        let request_id = transport.next_request_id.fetch_add(1, Ordering::Relaxed);
+        // the trait signature stays infallible. The id is drawn from the
+        // fabric-wide dispatch allocator so it is unique across every
+        // transport sharing this fabric (see `alloc_request_id`).
+        let request_id = transport.fabric.dispatch().alloc_request_id();
         let (peer, req_bytes) = match route_and_serialize(&transport.router, req) {
             Ok(v) => v,
             Err(error) => return Self::failed(error),
@@ -382,20 +391,31 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                         } => (fabric, mr, peer, request_id, src, req_bytes, dsts, ttl),
                         _ => unreachable!(),
                     };
+                    let mut log = crate::obs::ReqLog::new("fabric.fetch");
+                    log.field("peer", peer.0)
+                        .field("req_id", request_id)
+                        .hexkey("stripe", &src.stripe.0)
+                        .field("off", src.offset)
+                        .field("len", src.len)
+                        .field("pages", dsts.len())
+                        .field("ttl", ttl);
                     match launch(&fabric, &mr, peer, request_id, src, &req_bytes, dsts, ttl) {
-                        Ok((shared, ep, recv_ctxs)) => {
+                        Ok((shared, page_handle)) => {
                             this.state = StreamState::Active {
                                 shared,
                                 dsts,
-                                recv_ctxs: Mutex::new(recv_ctxs),
-                                ep,
+                                dispatch: Arc::clone(fabric.dispatch()),
+                                request_id,
+                                page_handle,
                                 acked: vec![false; dsts.len()],
                                 ended: false,
                                 emitted_error: false,
+                                log: Some(log),
                             };
                             // Fall through to poll the Active state.
                         }
                         Err(e) => {
+                            log.finish_err(&e);
                             return Poll::Ready(Some(Err(PoolError::transport(e))));
                         }
                     }
@@ -403,11 +423,13 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                 StreamState::Active {
                     shared,
                     dsts,
-                    recv_ctxs,
-                    ep: _,
+                    dispatch: _,
+                    request_id: _,
+                    page_handle: _,
                     acked,
                     ended,
                     emitted_error,
+                    log,
                 } => {
                     if *ended {
                         return Poll::Ready(None);
@@ -419,24 +441,15 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                     let item = shared.queue.lock().ok().and_then(|mut q| q.pop_front());
                     match item {
                         None => return Poll::Pending,
-                        Some(item) => {
-                            if let Ok(mut ctxs) = recv_ctxs.lock() {
-                                remove_recv_context(&mut ctxs, item.op_context);
-                            }
-                            let RecvCompletion { result, .. } = item;
-                            let RecvPayload { tag, payload } = match result {
-                                Ok(payload) => payload,
-                                Err(e) => {
-                                    *ended = true;
-                                    return Poll::Ready(Some(Err(PoolError::transport(e))));
-                                }
-                            };
-                            let tag_base = tag & 0xFFFF_FFFF_0000_0000u64;
-                            if tag_base == PAGE_ACK_TAG_BASE {
+                        Some(RecvCompletion { kind, payload }) => match kind {
+                            MsgKind::PageAck => {
                                 let ack: PageAck = match bincode::deserialize(&payload) {
                                     Ok(v) => v,
                                     Err(_) => {
                                         *ended = true;
+                                        if let Some(mut l) = log.take() {
+                                            l.finish_err("malformed PAGE_ACK");
+                                        }
                                         return Poll::Ready(Some(Err(PoolError::transport(
                                             FabricError::BadConfig("malformed PAGE_ACK"),
                                         ))));
@@ -445,12 +458,18 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                 let idx = ack.page_idx as usize;
                                 if idx >= dsts.len() {
                                     *ended = true;
+                                    if let Some(mut l) = log.take() {
+                                        l.finish_err("PAGE_ACK index out of range");
+                                    }
                                     return Poll::Ready(Some(Err(PoolError::transport(
                                         FabricError::BadConfig("PAGE_ACK index out of range"),
                                     ))));
                                 }
                                 if acked[idx] {
                                     *ended = true;
+                                    if let Some(mut l) = log.take() {
+                                        l.finish_err("duplicate PAGE_ACK index");
+                                    }
                                     return Poll::Ready(Some(Err(PoolError::transport(
                                         FabricError::BadConfig("duplicate PAGE_ACK index"),
                                     ))));
@@ -460,19 +479,21 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                 // the last in-order ack ends the stream.
                                 if acked.iter().all(|a| *a) {
                                     *ended = true;
+                                    if let Some(mut l) = log.take() {
+                                        l.field("acked", acked.len()).finish_ok();
+                                    }
                                 }
                                 return Poll::Ready(Some(Ok(dsts[idx])));
-                            } else if tag_base == RESPONSE_END_TAG_BASE {
+                            }
+                            MsgKind::ResponseEnd => {
                                 *ended = true;
-                                if acked.iter().any(|acked| !*acked) {
-                                    return Poll::Ready(Some(Err(PoolError::transport(
-                                        FabricError::BadConfig(
-                                            "RESPONSE_END before all requested pages were delivered",
-                                        ),
-                                    ))));
+                                if let Some(mut l) = log.take() {
+                                    l.field("acked", acked.iter().filter(|a| **a).count())
+                                        .finish_ok();
                                 }
                                 return Poll::Ready(None);
-                            } else if tag_base == ERROR_ACK_TAG_BASE {
+                            }
+                            MsgKind::ErrorAck => {
                                 *ended = true;
                                 if *emitted_error {
                                     return Poll::Ready(None);
@@ -481,14 +502,17 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                 let msg = bincode::deserialize::<ErrorAck>(&payload)
                                     .map(|e| e.message)
                                     .unwrap_or_else(|_| "server error (undecodable)".into());
+                                if let Some(mut l) = log.take() {
+                                    l.finish_err(&msg);
+                                }
                                 return Poll::Ready(Some(Err(PoolError::transport(ServerError(
                                     msg,
                                 )))));
-                            } else {
-                                // Stray completion; drop and continue.
-                                continue;
                             }
-                        }
+                            // A REQUEST is never routed to a client ack
+                            // sink; ignore any stray delivery.
+                            MsgKind::Request => continue,
+                        },
                     }
                 }
             }
@@ -515,19 +539,22 @@ where
 
 impl<'a, R> Drop for FabricBulkStream<'a, R> {
     fn drop(&mut self) {
-        if let StreamState::Active { recv_ctxs, ep, .. } = &mut self.state {
-            if let Ok(ctxs) = recv_ctxs.lock() {
-                for ctx in ctxs.iter() {
-                    // Best-effort cancel. Outstanding completions will
-                    // surface as cancel errors on the CQ; their handlers
-                    // free their buffers/slots.
-                    // SAFETY: `ep` is owned by the live fabric; `*ctx`
-                    // is the same context we passed to `fi_trecv`.
-                    unsafe {
-                        let _ = ffi::ub_fi_cancel(ffi::as_fid_ep(*ep), *ctx);
-                    }
-                }
+        if let StreamState::Active {
+            dispatch,
+            request_id,
+            page_handle,
+            log,
+            ..
+        } = &mut self.state
+        {
+            if let Some(mut l) = log.take() {
+                l.finish_err("stream dropped before completion");
             }
+            // Drop the dispatch entries so no late reply is routed to a
+            // dead stream: the framed terminator sink and the recycled
+            // page handle both reference this stream's `StreamShared`.
+            dispatch.unregister_stream(*request_id);
+            dispatch.free_page_handle(*page_handle);
         }
     }
 }
@@ -545,9 +572,9 @@ impl std::fmt::Display for ServerError {
 
 impl std::error::Error for ServerError {}
 
-/// Submit the request and post the recvs. Returns the shared state
-/// plus the EP pointer and contexts the stream Drop must cancel if
-/// they remain outstanding.
+/// Register the ack sink and submit the framed request. Returns the
+/// shared state the stream drains. On any failure the dispatch entry is
+/// rolled back so a failed launch leaks nothing.
 fn launch(
     fabric: &Arc<Fabric>,
     mr: &MrHandle,
@@ -557,247 +584,80 @@ fn launch(
     req_bytes: &[u8],
     dsts: &[PageRef],
     ttl: u32,
-) -> FabResult<(
-    Arc<StreamShared>,
-    *mut ffi::fid_ep,
-    Vec<*mut std::ffi::c_void>,
-)> {
+) -> FabResult<(Arc<StreamShared>, u16)> {
     ensure_launch_fits_registry(fabric.completions().available_count(), dsts.len())?;
 
-    let fi_addr = fabric.lookup_fi_addr(peer)?;
-    let inner = fabric.inner();
-    let ep = inner.ep();
+    // The page ordinal occupies the low 16 bits of the 32-bit immediate,
+    // so a request can address at most 2^16 destination pages.
+    if dsts.len() > u16::MAX as usize + 1 {
+        return Err(FabricError::BadConfig(
+            "bulk_get request exceeds 16-bit page ordinal space",
+        ));
+    }
+
+    let (ep, _addr) = fabric.resolve_peer(peer)?;
 
     let shared = Arc::new(StreamShared {
         queue: Mutex::new(VecDeque::new()),
         waker: Mutex::new(None),
     });
 
-    let mut recv_guard = PostedRecvGuard::new(ep, expected_recv_count(dsts.len()).unwrap_or(0));
-
-    // Post one PAGE_ACK recv per expected destination page.
-    let page_ack_tag = PAGE_ACK_TAG_BASE | (request_id as u64);
-    for _ in 0..dsts.len() {
-        let (slot, _fut) = fabric.completions().allocate()?;
-        let buf: Box<[u8; 512]> = Box::new([0u8; 512]);
-        let buf_ptr = Box::into_raw(buf);
-        let ctx_addr = (&*slot as *const CompletionSlot) as usize;
-        let shared_for_handler = shared.clone();
-        let buf_addr = buf_ptr as usize;
-        slot.set_handler(move |result| {
-            // SAFETY: buf_addr was just produced by Box::into_raw.
-            let recv_buf: Box<[u8; 512]> = unsafe { Box::from_raw(buf_addr as *mut [u8; 512]) };
-            shared_for_handler.push(recv_completion(result, ctx_addr, &recv_buf));
-        });
-        let ctx = slot.into_raw();
-        let rc = unsafe {
-            ffi::ub_fi_trecv(
-                ep,
-                buf_ptr as *mut std::ffi::c_void,
-                512,
-                ptr::null_mut(),
-                ffi::FI_ADDR_UNSPEC,
-                page_ack_tag,
-                0,
-                ctx,
-            )
-        };
-        if rc < 0 {
-            // Reclaim the current unposted operation. The guard
-            // cancels any earlier recvs before launch returns.
-            // SAFETY: ctx was just produced from into_raw.
-            let _ = unsafe { CompletionSlot::from_raw(ctx) };
-            // SAFETY: same for the buffer.
-            let _ = unsafe { Box::from_raw(buf_ptr) };
-            return Err(FabricError::Pkg("fi_trecv (page_ack)", rc as i32));
+    // Register the ack sink BEFORE sending so no reply can race ahead
+    // of the dispatch entry. The same sink is bound to both the
+    // request_id (for framed RESPONSE_END/ERROR_ACK terminators) and a
+    // recycled 16-bit page handle (for write-with-immediate page-landed
+    // signals).
+    let sink: Arc<dyn AckSink> = shared.clone();
+    fabric.dispatch().register_stream(request_id, sink.clone());
+    let page_handle = match fabric.dispatch().alloc_page_handle(sink) {
+        Some(h) => h,
+        None => {
+            fabric.dispatch().unregister_stream(request_id);
+            return Err(FabricError::BadConfig("page handle space exhausted"));
         }
-        recv_guard.push(ctx);
-    }
+    };
 
-    // Post a RESPONSE_END recv.
-    let end_tag = RESPONSE_END_TAG_BASE | (request_id as u64);
-    {
-        let (slot, _fut) = fabric.completions().allocate()?;
-        let buf: Box<[u8; 512]> = Box::new([0u8; 512]);
-        let buf_ptr = Box::into_raw(buf);
-        let ctx_addr = (&*slot as *const CompletionSlot) as usize;
-        let shared_for_handler = shared.clone();
-        let buf_addr = buf_ptr as usize;
-        slot.set_handler(move |result| {
-            // SAFETY: buf_addr was just produced by Box::into_raw.
-            let recv_buf: Box<[u8; 512]> = unsafe { Box::from_raw(buf_addr as *mut [u8; 512]) };
-            shared_for_handler.push(recv_completion(result, ctx_addr, &recv_buf));
-        });
-        let ctx = slot.into_raw();
-        let rc = unsafe {
-            ffi::ub_fi_trecv(
-                ep,
-                buf_ptr as *mut std::ffi::c_void,
-                512,
-                ptr::null_mut(),
-                ffi::FI_ADDR_UNSPEC,
-                end_tag,
-                0,
-                ctx,
-            )
-        };
-        if rc < 0 {
-            // SAFETY: ctx just produced.
-            let _ = unsafe { CompletionSlot::from_raw(ctx) };
-            let _ = unsafe { Box::from_raw(buf_ptr) };
-            return Err(FabricError::Pkg("fi_trecv (resp_end)", rc as i32));
-        }
-        recv_guard.push(ctx);
-    }
-    // Also post an ERROR_ACK recv.
-    let err_tag = ERROR_ACK_TAG_BASE | (request_id as u64);
-    {
-        let (slot, _fut) = fabric.completions().allocate()?;
-        let buf: Box<[u8; 4096]> = Box::new([0u8; 4096]);
-        let buf_ptr = Box::into_raw(buf);
-        let ctx_addr = (&*slot as *const CompletionSlot) as usize;
-        let shared_for_handler = shared.clone();
-        let buf_addr = buf_ptr as usize;
-        slot.set_handler(move |result| {
-            // SAFETY: buf_addr was just produced by Box::into_raw.
-            let recv_buf: Box<[u8; 4096]> = unsafe { Box::from_raw(buf_addr as *mut [u8; 4096]) };
-            shared_for_handler.push(recv_completion(result, ctx_addr, &recv_buf));
-        });
-        let ctx = slot.into_raw();
-        let rc = unsafe {
-            ffi::ub_fi_trecv(
-                ep,
-                buf_ptr as *mut std::ffi::c_void,
-                4096,
-                ptr::null_mut(),
-                ffi::FI_ADDR_UNSPEC,
-                err_tag,
-                0,
-                ctx,
-            )
-        };
-        if rc < 0 {
-            // SAFETY: ctx just produced.
-            let _ = unsafe { CompletionSlot::from_raw(ctx) };
-            let _ = unsafe { Box::from_raw(buf_ptr) };
-            return Err(FabricError::Pkg("fi_trecv (err_ack)", rc as i32));
-        }
-        recv_guard.push(ctx);
-    }
-
-    // Build and send the request: header followed by the
-    // bincode-serialized req body.
-    let header = RequestHeader::new(request_id, mr, dsts.len() as u32, src, ttl);
-    let mut buf: Vec<u8> = bincode::serialize(&header).map_err(|e| {
+    // Build the request body: header followed by the bincode-serialized
+    // req body, then frame it with the message header.
+    let header = RequestHeader::new(request_id, page_handle, mr, dsts.len() as u32, src, ttl);
+    let mut body: Vec<u8> = bincode::serialize(&header).map_err(|e| {
+        fabric.dispatch().free_page_handle(page_handle);
+        fabric.dispatch().unregister_stream(request_id);
         FabricError::Encode(Arc::new(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("header encode: {e}"),
         )))
     })?;
-    buf.extend_from_slice(req_bytes);
+    body.extend_from_slice(req_bytes);
+    let framed = MsgHeader::frame(MsgKind::Request, request_id, &body);
 
-    let (send_slot, _send_fut) = fabric.completions().allocate()?;
-    let send_len = buf.len();
-    let send_box: Box<[u8]> = buf.into_boxed_slice();
-    let send_buf_ptr = Box::into_raw(send_box);
-    let buf_addr = send_buf_ptr as *mut u8 as usize;
-    let buf_len = send_len;
-    send_slot.set_handler(move |_| {
-        // SAFETY: buf_addr/buf_len were just produced by Box::into_raw
-        // on a Box<[u8]>; libfabric returns ownership exactly once.
-        let _ = unsafe {
-            Box::from_raw(std::slice::from_raw_parts_mut(buf_addr as *mut u8, buf_len) as *mut [u8])
-        };
-    });
-    let send_ctx = send_slot.into_raw();
-    let send_tag = REQUEST_TAG_BASE | (request_id as u64);
-    // The first `fi_tsend` to a peer can return `-FI_EAGAIN` while a
-    // connection-oriented provider (the `tcp` RDM provider) lazily
-    // establishes the underlying connection, or whenever the transmit
-    // queue is briefly full. EAGAIN does not consume the buffer or
-    // context, so we retry the same operation while the progress
-    // thread advances the CQ, up to a bounded deadline.
-    let rc = {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            // SAFETY: ep, buffer, and ctx all remain live for the call;
-            // on `-FI_EAGAIN` libfabric neither consumes the buffer nor
-            // generates a completion, so reusing them on retry is sound.
-            let rc = unsafe {
-                ffi::ub_fi_tsend(
-                    ep,
-                    send_buf_ptr as *const std::ffi::c_void,
-                    send_len,
-                    ptr::null_mut(),
-                    fi_addr,
-                    send_tag,
-                    send_ctx,
-                )
-            };
-            if rc as i32 != -ffi::FI_EAGAIN {
-                break rc;
-            }
-            if std::time::Instant::now() >= deadline {
-                break rc;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+    match send_request(fabric, ep, framed) {
+        Ok(()) => Ok((shared, page_handle)),
+        Err(e) => {
+            fabric.dispatch().free_page_handle(page_handle);
+            fabric.dispatch().unregister_stream(request_id);
+            Err(e)
         }
-    };
-    if rc < 0 {
-        // SAFETY: just produced.
-        let _ = unsafe { CompletionSlot::from_raw(send_ctx) };
-        // SAFETY: just produced.
-        let _ = unsafe {
-            Box::from_raw(
-                std::slice::from_raw_parts_mut(send_buf_ptr as *mut u8, send_len) as *mut [u8],
-            )
-        };
-        return Err(FabricError::Pkg("fi_tsend (request)", rc as i32));
     }
-
-    Ok((shared, ep, recv_guard.into_contexts()))
 }
 
-struct PostedRecvGuard {
-    ep: *mut ffi::fid_ep,
-    ctxs: Vec<*mut std::ffi::c_void>,
-    armed: bool,
-}
-
-impl PostedRecvGuard {
-    fn new(ep: *mut ffi::fid_ep, capacity: usize) -> Self {
-        Self {
+/// `fi_send` the framed request buffer on `ep` via the fabric's
+/// pre-registered send pool, which frees/recycles the buffer from the
+/// completion handler and registers a transient local MR only on the
+/// fallback path. The first send to a peer can return `-FI_EAGAIN`
+/// while the transmit queue is briefly full; the pool retries the same
+/// operation up to a bounded deadline.
+fn send_request(fabric: &Arc<Fabric>, ep: *mut ffi::fid_ep, framed: Vec<u8>) -> FabResult<()> {
+    fabric
+        .inner()
+        .send_pool()
+        .send_framed(
             ep,
-            ctxs: Vec::with_capacity(capacity),
-            armed: true,
-        }
-    }
-
-    fn push(&mut self, ctx: *mut std::ffi::c_void) {
-        self.ctxs.push(ctx);
-    }
-
-    fn into_contexts(mut self) -> Vec<*mut std::ffi::c_void> {
-        self.armed = false;
-        std::mem::take(&mut self.ctxs)
-    }
-}
-
-impl Drop for PostedRecvGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        for ctx in self.ctxs.iter() {
-            // Best-effort cancel; the completion handler reclaims the
-            // buffer and slot when the provider reports cancellation.
-            // SAFETY: `ep` is owned by the live fabric and each `ctx`
-            // was accepted by `fi_trecv` before it was pushed here.
-            unsafe {
-                let _ = ffi::ub_fi_cancel(ffi::as_fid_ep(self.ep), *ctx);
-            }
-        }
-    }
+            framed,
+            "fi_send (request)",
+            std::time::Duration::from_secs(10),
+        )
+        .map(|_fut| ())
 }
 
 #[doc(hidden)]
@@ -810,45 +670,15 @@ pub fn ensure_launch_fits_registry(available_slots: usize, dst_count: usize) -> 
     }
 }
 
+/// Completion slots the client consumes for one `bulk_get`. Under the
+/// `FI_EP_MSG` protocol the client posts no recvs of its own (the
+/// per-connection `RecvPool` receives all replies), so a request costs
+/// exactly one slot: the request send. The `dst_count` is retained for
+/// API stability but no longer affects the count.
 #[doc(hidden)]
 pub fn required_completion_slots(dst_count: usize) -> Option<usize> {
-    expected_recv_count(dst_count)?.checked_add(1)
-}
-
-fn expected_recv_count(dst_count: usize) -> Option<usize> {
-    dst_count.checked_add(2)
-}
-
-fn recv_completion<const N: usize>(
-    result: &FabResult<CompletionInfo>,
-    op_context: usize,
-    recv_buf: &[u8; N],
-) -> RecvCompletion {
-    match result {
-        Ok(info) => {
-            let len = info.bytes.min(recv_buf.len());
-            RecvCompletion {
-                op_context: info.op_context,
-                result: Ok(RecvPayload {
-                    tag: info.tag,
-                    payload: recv_buf[..len].to_vec(),
-                }),
-            }
-        }
-        Err(e) => RecvCompletion {
-            op_context,
-            result: Err(e.clone()),
-        },
-    }
-}
-
-fn remove_recv_context(ctxs: &mut Vec<*mut std::ffi::c_void>, completed: usize) -> bool {
-    if let Some(pos) = ctxs.iter().position(|ctx| *ctx as usize == completed) {
-        ctxs.swap_remove(pos);
-        true
-    } else {
-        false
-    }
+    let _ = dst_count;
+    Some(1)
 }
 
 #[cfg(test)]
@@ -900,14 +730,6 @@ mod tests {
     }
 
     fn active_stream<'a>(dsts: &'a [PageRef], acked: Vec<bool>) -> FabricBulkStream<'a, ()> {
-        active_stream_with_contexts(dsts, acked, Vec::new())
-    }
-
-    fn active_stream_with_contexts<'a>(
-        dsts: &'a [PageRef],
-        acked: Vec<bool>,
-        recv_ctxs: Vec<*mut std::ffi::c_void>,
-    ) -> FabricBulkStream<'a, ()> {
         assert_eq!(acked.len(), dsts.len());
         FabricBulkStream {
             state: StreamState::Active {
@@ -916,11 +738,13 @@ mod tests {
                     waker: Mutex::new(None),
                 }),
                 dsts,
-                recv_ctxs: Mutex::new(recv_ctxs),
-                ep: ptr::null_mut(),
+                dispatch: InboundDispatch::new(),
+                request_id: 1,
+                page_handle: 0,
                 acked,
                 ended: false,
                 emitted_error: false,
+                log: None,
             },
             _marker: PhantomData,
         }
@@ -932,35 +756,9 @@ mod tests {
         };
         let payload = bincode::serialize(&PageAck { page_idx }).expect("serialize page ack");
         shared.push(RecvCompletion {
-            op_context: 0,
-            result: Ok(RecvPayload {
-                tag: PAGE_ACK_TAG_BASE,
-                payload,
-            }),
+            kind: MsgKind::PageAck,
+            payload,
         });
-    }
-
-    fn push_recv_error(stream: &mut FabricBulkStream<'_, ()>, op_context: usize) {
-        let StreamState::Active { shared, .. } = &stream.state else {
-            panic!("expected active stream");
-        };
-        shared.push(RecvCompletion {
-            op_context,
-            result: Err(FabricError::Cq {
-                prov_errno: -3,
-                err: -5,
-            }),
-        });
-    }
-
-    fn page_ack_info(payload_len: usize) -> CompletionInfo {
-        CompletionInfo {
-            flags: 0,
-            bytes: payload_len,
-            tag: PAGE_ACK_TAG_BASE,
-            src_addr: 0,
-            op_context: 0,
-        }
     }
 
     fn push_response_end(stream: &mut FabricBulkStream<'_, ()>) {
@@ -968,12 +766,18 @@ mod tests {
             panic!("expected active stream");
         };
         shared.push(RecvCompletion {
-            op_context: 0,
-            result: Ok(RecvPayload {
-                tag: RESPONSE_END_TAG_BASE,
-                payload: Vec::new(),
-            }),
+            kind: MsgKind::ResponseEnd,
+            payload: Vec::new(),
         });
+    }
+
+    fn push_page_landed(stream: &mut FabricBulkStream<'_, ()>, ordinal: u32) {
+        let StreamState::Active { shared, .. } = &stream.state else {
+            panic!("expected active stream");
+        };
+        // Drive the write-with-immediate page-landed path the inbound
+        // dispatch invokes for an RDMA immediate completion.
+        AckSink::deliver_page(shared.as_ref(), ordinal);
     }
 
     fn poll_once<R>(
@@ -1027,62 +831,21 @@ mod tests {
     }
 
     #[test]
-    fn recv_completion_preserves_success_payload() {
-        let payload = bincode::serialize(&PageAck { page_idx: 7 }).expect("serialize page ack");
-        let mut recv_buf = [0u8; 64];
-        recv_buf[..payload.len()].copy_from_slice(&payload);
-        let info = page_ack_info(payload.len());
-
-        let completion = recv_completion(&Ok(info), 0x1234, &recv_buf);
-
-        assert_eq!(completion.op_context, 0);
-        match completion.result {
-            Ok(payload) => {
-                assert_eq!(payload.tag, PAGE_ACK_TAG_BASE);
-                let ack: PageAck = bincode::deserialize(&payload.payload).expect("page ack");
-                assert_eq!(ack.page_idx, 7);
-            }
-            Err(err) => panic!("unexpected recv error: {err}"),
-        }
-    }
-
-    #[test]
-    fn recv_completion_preserves_error_context() {
-        let completion = recv_completion(
-            &Err(FabricError::Cq {
-                prov_errno: -3,
-                err: -5,
-            }),
-            0x1234,
-            &[0u8; 64],
-        );
-
-        assert_eq!(completion.op_context, 0x1234);
-        assert!(matches!(
-            completion.result,
-            Err(FabricError::Cq {
-                prov_errno: -3,
-                err: -5
-            })
-        ));
-    }
-
-    #[test]
-    fn required_completion_slots_counts_page_end_error_and_send() {
-        assert_eq!(required_completion_slots(0), Some(3));
-        assert_eq!(required_completion_slots(1), Some(4));
-        assert_eq!(required_completion_slots(128), Some(131));
+    fn required_completion_slots_counts_request_send_only() {
+        assert_eq!(required_completion_slots(0), Some(1));
+        assert_eq!(required_completion_slots(1), Some(1));
+        assert_eq!(required_completion_slots(128), Some(1));
     }
 
     #[test]
     fn launch_available_slot_preflight_accepts_boundary() {
-        assert!(ensure_launch_fits_registry(3, 0).is_ok());
-        assert!(ensure_launch_fits_registry(4, 1).is_ok());
+        assert!(ensure_launch_fits_registry(1, 0).is_ok());
+        assert!(ensure_launch_fits_registry(1, 128).is_ok());
     }
 
     #[test]
-    fn launch_available_slot_preflight_rejects_oversized_request() {
-        let err = ensure_launch_fits_registry(3, 1).unwrap_err();
+    fn launch_available_slot_preflight_rejects_empty_registry() {
+        let err = ensure_launch_fits_registry(0, 0).unwrap_err();
         assert!(matches!(
             err,
             FabricError::BadConfig("bulk_get request exceeds available completion slots")
@@ -1090,16 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_available_slot_preflight_rejects_overflow() {
-        let err = ensure_launch_fits_registry(usize::MAX, usize::MAX).unwrap_err();
-        assert!(matches!(
-            err,
-            FabricError::BadConfig("bulk_get request exceeds available completion slots")
-        ));
-    }
-
-    #[test]
-    fn response_end_before_all_pages_returns_transport_error() {
+    fn response_end_with_no_pages_returns_eof() {
         let dsts = [
             PageRef {
                 page_idx: 0,
@@ -1119,67 +873,10 @@ mod tests {
 
         // SAFETY: stream is pinned on the stack and never moved.
         let mut stream = unsafe { Pin::new_unchecked(&mut stream) };
-        match stream.as_mut().poll_next(&mut cx) {
-            Poll::Ready(Some(Err(PoolError::Transport(err)))) => {
-                assert!(
-                    err.to_string()
-                        .contains("RESPONSE_END before all requested pages were delivered"),
-                    "unexpected error: {err}",
-                );
-            }
-            other => panic!("expected transport error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn recv_error_returns_transport_error_and_removes_context_once() {
-        let dsts = [PageRef {
-            page_idx: 0,
-            offset: 0,
-            len: 4096,
-        }];
-        let ctx = 0x20usize as *mut std::ffi::c_void;
-        let mut stream = active_stream_with_contexts(&dsts, vec![false], vec![ctx, ctx]);
-        push_recv_error(&mut stream, ctx as usize);
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        // SAFETY: stream is pinned on the stack and never moved.
-        let mut stream = unsafe { Pin::new_unchecked(&mut stream) };
-        match stream.as_mut().poll_next(&mut cx) {
-            Poll::Ready(Some(Err(PoolError::Transport(err)))) => {
-                assert!(
-                    err.to_string().contains("libfabric cq error"),
-                    "unexpected error: {err}",
-                );
-            }
-            other => panic!("expected transport error, got {other:?}"),
-        }
-        {
-            let StreamState::Active {
-                recv_ctxs, ended, ..
-            } = &stream.state
-            else {
-                panic!("expected active stream");
-            };
-            assert!(*ended);
-            let ctxs = recv_ctxs.lock().expect("recv ctxs");
-            assert_eq!(ctxs.len(), 1);
-            assert_eq!(ctxs[0], ctx);
-        }
-
         assert!(matches!(
             stream.as_mut().poll_next(&mut cx),
             Poll::Ready(None)
         ));
-        let StreamState::Active { recv_ctxs, .. } = &stream.state else {
-            panic!("expected active stream");
-        };
-        let ctxs = recv_ctxs.lock().expect("recv ctxs");
-        assert_eq!(ctxs.len(), 1);
-        assert_eq!(ctxs[0], ctx);
-        drop(ctxs);
-        recv_ctxs.lock().expect("recv ctxs").clear();
     }
 
     #[test]
@@ -1223,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn response_end_rejects_missing_ack_despite_matching_count() {
+    fn response_end_after_short_success_returns_eof() {
         let dsts = [
             PageRef {
                 page_idx: 0,
@@ -1236,23 +933,22 @@ mod tests {
                 len: 4096,
             },
         ];
-        let mut stream = active_stream(&dsts, vec![true, false]);
+        let mut stream = active_stream(&dsts, vec![false, false]);
+        push_page_ack(&mut stream, 0);
         push_response_end(&mut stream);
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
         // SAFETY: stream is pinned on the stack and never moved.
         let mut stream = unsafe { Pin::new_unchecked(&mut stream) };
-        match stream.as_mut().poll_next(&mut cx) {
-            Poll::Ready(Some(Err(PoolError::Transport(err)))) => {
-                assert!(
-                    err.to_string()
-                        .contains("RESPONSE_END before all requested pages were delivered"),
-                    "unexpected error: {err}",
-                );
-            }
-            other => panic!("expected transport error, got {other:?}"),
-        }
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut cx),
+            Poll::Ready(Some(Ok(PageRef { page_idx: 0, .. })))
+        ));
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
     }
 
     #[test]
@@ -1321,30 +1017,42 @@ mod tests {
     }
 
     #[test]
-    fn remove_recv_context_removes_exactly_one_match() {
-        let a = 0x10usize as *mut std::ffi::c_void;
-        let b = 0x20usize as *mut std::ffi::c_void;
-        let c = 0x30usize as *mut std::ffi::c_void;
-        let mut ctxs = vec![a, b, c, b];
+    fn page_landed_immediate_yields_page_and_ends_stream() {
+        // The write-with-immediate path delivers page ordinals through
+        // `deliver_page`; the stream must yield each destination page and
+        // self-terminate once all pages have landed, with no terminator.
+        let dsts = [
+            PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: 4096,
+            },
+            PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4096,
+            },
+        ];
+        let mut stream = active_stream(&dsts, vec![false, false]);
+        push_page_landed(&mut stream, 0);
+        push_page_landed(&mut stream, 1);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
 
-        assert!(remove_recv_context(&mut ctxs, b as usize));
-
-        assert_eq!(ctxs.len(), 3);
-        assert_eq!(ctxs.iter().filter(|ctx| **ctx == b).count(), 1);
-        assert!(ctxs.contains(&a));
-        assert!(ctxs.contains(&c));
-    }
-
-    #[test]
-    fn remove_recv_context_leaves_missing_contexts_unchanged() {
-        let a = 0x10usize as *mut std::ffi::c_void;
-        let b = 0x20usize as *mut std::ffi::c_void;
-        let missing = 0x30usize as *mut std::ffi::c_void;
-        let mut ctxs = vec![a, b];
-
-        assert!(!remove_recv_context(&mut ctxs, missing as usize));
-
-        assert_eq!(ctxs, vec![a, b]);
+        // SAFETY: stream is pinned on the stack and never moved.
+        let mut stream = unsafe { Pin::new_unchecked(&mut stream) };
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut cx),
+            Poll::Ready(Some(Ok(PageRef { page_idx: 0, .. })))
+        ));
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut cx),
+            Poll::Ready(Some(Ok(PageRef { page_idx: 1, .. })))
+        ));
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::bufferpool::pipeline::{PipelinedRead, StripePlan};
 use crate::bufferpool::stream::ReadStream;
 use crate::bufferpool::types::{BulkRef, Error, PageRef, StripeKey};
 use crate::bufferpool::window::WindowedRead;
@@ -191,4 +192,23 @@ pub trait BufferPool {
         len: u64,
         window: usize,
     ) -> Result<WindowedRead<'p>, Error>;
+
+    /// Cross-stripe counterpart to [`BufferPool::read_windowed`].
+    /// Takes the ordered list of per-stripe slices that make up a
+    /// byte range and returns a [`PipelinedRead`] that keeps up to
+    /// `window` `fetch_page` futures outstanding ahead of the
+    /// consumer cursor *across stripe boundaries*, while still
+    /// delivering pages strictly in order, one at a time. This is the
+    /// throughput path for multi-stripe reads: it overlaps origin and
+    /// peer fetches of pages many stripes ahead with the in-order
+    /// consumption (and slow client send) of the current page, so a
+    /// single large GET keeps the whole `max_inflight_pages` budget
+    /// saturated instead of collapsing to one stripe's depth. `window`
+    /// is clamped by the implementation to the pool's configured
+    /// prefetch budget.
+    fn read_pipelined<'p>(
+        &'p self,
+        stripes: Vec<StripePlan<Self::Req>>,
+        window: usize,
+    ) -> Result<PipelinedRead<'p>, Error>;
 }

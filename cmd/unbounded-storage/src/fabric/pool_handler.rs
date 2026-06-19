@@ -348,7 +348,7 @@ mod tests {
             base,
             page_size: PAGE,
             page_count: SCRATCH_PAGES as usize,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         (backing, base)
     }

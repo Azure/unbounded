@@ -571,7 +571,7 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version: "1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{
 					Name: "bootstrap-token-abc123",
 				},
 			},
@@ -619,13 +619,13 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 		}
 	}
 
-	// Command: script copy — verify a script was sent, not its exact contents.
+	// Command: script copy - verify a script was sent, not its exact contents.
 	require.NotNil(t, copyCmd, "expected a script copy command")
 	require.Contains(t, copyCmd.command, "chmod +x")
 	require.NotEmpty(t, copyCmd.stdin, "script content should have been piped via stdin")
 	require.Contains(t, string(copyCmd.stdin), "#!/bin/bash", "script should start with a shebang")
 
-	// Command: config upload — verify JSON config was sent.
+	// Command: config upload - verify JSON config was sent.
 	require.NotNil(t, configCmd, "expected a config upload command")
 
 	var agentConfig provision.AgentConfig
@@ -642,7 +642,7 @@ func TestProvisionMachine_EndToEnd(t *testing.T) {
 	require.Contains(t, execCmd.command, "UNBOUNDED_AGENT_CONFIG_FILE")
 	require.Contains(t, execCmd.command, remoteConfigPath)
 
-	// Command: cleanup — should remove both script and config.
+	// Command: cleanup - should remove both script and config.
 	require.NotNil(t, cleanupCmd, "expected a cleanup command")
 	require.Contains(t, cleanupCmd.command, remoteScriptPath)
 	require.Contains(t, cleanupCmd.command, remoteConfigPath)
@@ -843,7 +843,7 @@ func TestProvisionMachine_KubeVersionPrefixing(t *testing.T) {
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				Version:           "1.34.0",
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bt"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bt"},
 			},
 		},
 	}
@@ -900,7 +900,7 @@ func TestProvisionMachine_LabelMerge(t *testing.T) {
 				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "ssh-key-secret"},
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bt"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bt"},
 				NodeLabels: map[string]string{
 					"env":  "production",
 					"team": "platform",
@@ -963,7 +963,7 @@ func TestProvisionMachine_Taints(t *testing.T) {
 				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "ssh-key-secret"},
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bt"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bt"},
 				RegisterWithTaints: []string{
 					"dedicated=gpu:NoSchedule",
 					"special=true:NoExecute",
@@ -1024,7 +1024,7 @@ func TestProvisionMachine_OCIImage(t *testing.T) {
 				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "ssh-key-secret"},
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bt"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bt"},
 			},
 			Agent: &unboundedv1alpha3.AgentSpec{
 				Image: "ghcr.io/azure/rootfs:v1.0.0",
@@ -1084,10 +1084,10 @@ func TestProvisionMachine_ProviderLabelsOverride(t *testing.T) {
 				PrivateKeyRef: unboundedv1alpha3.SecretKeySelector{Name: "ssh-key-secret"},
 			},
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{Name: "bt"},
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bt"},
 				NodeLabels: map[string]string{
 					"env": "production",
-					// User tries to override provider label — provider should win.
+					// User tries to override provider label - provider should win.
 					"kubernetes.azure.com/managed": "true",
 				},
 			},
@@ -1231,7 +1231,7 @@ func TestDialViaBastion_FallsBackToMachineKey(t *testing.T) {
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
-	// Bastion has no PrivateKeyRef — should fall back to machine's SSH key.
+	// Bastion has no PrivateKeyRef - should fall back to machine's SSH key.
 	machine := &unboundedv1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
 		Spec: unboundedv1alpha3.MachineSpec{
@@ -1296,7 +1296,7 @@ func TestDialViaBastion_DefaultPort(t *testing.T) {
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
-	// Bastion host has no port — hostPort() should default to :22.
+	// Bastion host has no port - hostPort() should default to :22.
 	machine := &unboundedv1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
 		Spec: unboundedv1alpha3.MachineSpec{
@@ -1519,7 +1519,7 @@ func TestDefaultReachabilityChecker_BastionFallsBackToMachineKey(t *testing.T) {
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
-	// Bastion has no PrivateKeyRef — should fall back to machine's SSH key.
+	// Bastion has no PrivateKeyRef - should fall back to machine's SSH key.
 	machine := &unboundedv1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "bastion-fallback-test"},
 		Spec: unboundedv1alpha3.MachineSpec{
@@ -1560,7 +1560,7 @@ func TestDefaultReachabilityChecker_BastionKeySecretMissing(t *testing.T) {
 	require.NoError(t, unboundedv1alpha3.AddToScheme(s))
 	require.NoError(t, corev1.AddToScheme(s))
 
-	// No secret created — should fail when trying to look it up.
+	// No secret created - should fail when trying to look it up.
 	machine := &unboundedv1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "bastion-no-key-test"},
 		Spec: unboundedv1alpha3.MachineSpec{

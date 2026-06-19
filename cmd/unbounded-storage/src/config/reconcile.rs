@@ -72,7 +72,7 @@ pub fn apply_peers_startup(target: &dyn PeerReconcileTarget, peers: &[PeerSpec])
 
 /// Drive `target` toward the peer set described by `desired`.
 ///
-/// When `last_applied` is `Some`, an existing peer whose `wire_addr` or
+/// When `last_applied` is `Some`, an existing peer whose `address` or
 /// `hca_numa` has changed is treated as a remove+add (an "update").
 /// When it is `None` we cannot tell stored specs from the trait, so
 /// only id-level additions and removals are performed; this is the
@@ -125,7 +125,7 @@ pub fn reconcile_peers(
                 continue;
             }
             if let Some(old_spec) = prev.get(id) {
-                if old_spec.wire_addr != new_spec.wire_addr
+                if old_spec.address != new_spec.address
                     || old_spec.hca_numa != new_spec.hca_numa
                     || old_spec.labels != new_spec.labels
                 {
@@ -605,7 +605,7 @@ pub fn reconcile_backends_and_frontends(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::PeerTransport;
+    use crate::config::schema::FabricAddress;
     use std::cell::RefCell;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -669,8 +669,7 @@ mod tests {
     fn peer(id: u64) -> PeerSpec {
         PeerSpec {
             id,
-            transport: PeerTransport::Tcp as i32,
-            address: format!("10.0.0.{id}:9000"),
+            address: Some(socket_addr(format!("10.0.0.{id}:9000"))),
             hca_numa: None,
             labels: Vec::new(),
         }
@@ -679,8 +678,7 @@ mod tests {
     fn peer_addr(id: u64, addr: &str) -> PeerSpec {
         PeerSpec {
             id,
-            transport: PeerTransport::Tcp as i32,
-            address: addr.to_string(),
+            address: Some(socket_addr(addr)),
             hca_numa: None,
             labels: Vec::new(),
         }
@@ -689,10 +687,16 @@ mod tests {
     fn peer_labels(id: u64, labels: &[&str]) -> PeerSpec {
         PeerSpec {
             id,
-            transport: PeerTransport::Tcp as i32,
-            address: format!("10.0.0.{id}:9000"),
+            address: Some(socket_addr(format!("10.0.0.{id}:9000"))),
             hca_numa: None,
             labels: labels.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn socket_addr(addr: impl Into<String>) -> FabricAddress {
+        FabricAddress {
+            socket: addr.into(),
+            native: String::new(),
         }
     }
 
@@ -779,12 +783,15 @@ mod tests {
         assert_eq!(r.updated, 1);
         assert!(r.failures.is_empty());
         assert_eq!(*t.ops.borrow(), vec![Op::Remove(1), Op::Add(1)]);
-        assert_eq!(r.applied[&PeerId(1)].wire_addr, "b:2");
+        assert_eq!(
+            r.applied[&PeerId(1)].address,
+            crate::fabric::FabricAddress::socket("b:2")
+        );
     }
 
     #[test]
     fn reconcile_label_only_change_churns_connection() {
-        // A relabel with identical wire_addr/hca_numa must drive a
+        // A relabel with identical address/hca_numa must drive a
         // remove-then-add so the new labels reach the runtime, and
         // the tracked applied spec must reflect the NEW labels.
         let t = MockTarget::new(&[1]);
@@ -807,7 +814,10 @@ mod tests {
             vec!["us-east".to_string(), "rack9".to_string()]
         );
         // Address/HCA are unchanged.
-        assert_eq!(r.applied[&PeerId(1)].wire_addr, "10.0.0.1:9000");
+        assert_eq!(
+            r.applied[&PeerId(1)].address,
+            crate::fabric::FabricAddress::socket("10.0.0.1:9000")
+        );
         assert_eq!(r.applied[&PeerId(1)].hca_numa, None);
     }
 
@@ -841,7 +851,10 @@ mod tests {
         assert_eq!(r.failures.len(), 1);
         assert_eq!(r.failures[0].0, PeerId(1));
         assert!(r.failures[0].1.starts_with("update-remove:"));
-        assert_eq!(r.applied[&PeerId(1)].wire_addr, "a:1");
+        assert_eq!(
+            r.applied[&PeerId(1)].address,
+            crate::fabric::FabricAddress::socket("a:1")
+        );
         assert_eq!(*t.ops.borrow(), vec![Op::Remove(1)]);
 
         // Second pass: with the recovered remove, drift detection
@@ -851,7 +864,10 @@ mod tests {
         let r2 = reconcile_peers(&t2, &peers, Some(&prev2));
         assert_eq!(r2.updated, 1);
         assert!(r2.failures.is_empty());
-        assert_eq!(r2.applied[&PeerId(1)].wire_addr, "b:2");
+        assert_eq!(
+            r2.applied[&PeerId(1)].address,
+            crate::fabric::FabricAddress::socket("b:2")
+        );
         assert_eq!(*t2.ops.borrow(), vec![Op::Remove(1), Op::Add(1)]);
     }
 
@@ -882,7 +898,10 @@ mod tests {
         assert_eq!(r2.added, 1);
         assert_eq!(r2.updated, 0);
         assert!(r2.failures.is_empty());
-        assert_eq!(r2.applied[&PeerId(1)].wire_addr, "b:2");
+        assert_eq!(
+            r2.applied[&PeerId(1)].address,
+            crate::fabric::FabricAddress::socket("b:2")
+        );
         assert_eq!(*t2.ops.borrow(), vec![Op::Add(1)]);
     }
 
@@ -904,7 +923,10 @@ mod tests {
         assert_eq!(r.failures.len(), 1);
         assert_eq!(r.failures[0].0, PeerId(1));
         assert!(r.failures[0].1.starts_with("remove:"));
-        assert_eq!(r.applied[&PeerId(1)].wire_addr, "a:1");
+        assert_eq!(
+            r.applied[&PeerId(1)].address,
+            crate::fabric::FabricAddress::socket("a:1")
+        );
         assert_eq!(*t.ops.borrow(), vec![Op::Remove(1)]);
     }
 

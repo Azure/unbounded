@@ -50,12 +50,20 @@ impl ConfigWatcher {
         let (update_tx, update_rx) = mpsc::channel::<ConfigUpdate>();
 
         let event_tx = raw_tx.clone();
+        let filter_path = path.clone();
         let mut watcher: RecommendedWatcher =
             notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-                // Surface only the fact that *something* changed; the
-                // debounce thread re-reads the file from disk.
-                if res.is_ok() {
-                    let _ = event_tx.send(());
+                // The watch is on the config file's *parent* directory (so
+                // atomic rename / symlink swaps are observed), which means
+                // it also sees writes to unrelated sibling files living in
+                // that directory (e.g. log or data files). Forward only
+                // events that actually touch the config file; otherwise an
+                // unrelated sibling write would trigger a needless reload
+                // and apply churn. The debounce thread re-reads the file.
+                if let Ok(event) = res {
+                    if event_affects_config(&event, &filter_path) {
+                        let _ = event_tx.send(());
+                    }
                 }
             })?;
 
@@ -96,6 +104,32 @@ impl Drop for ConfigWatcher {
             let _ = h.join();
         }
     }
+}
+
+// Kubernetes mounts a ConfigMap by writing the data into a timestamped
+// directory and atomically swapping a `..data` symlink to point at it;
+// the config file itself is a symlink into `..data`. Such an update
+// surfaces as an event on the `..data` entry rather than on the config
+// file's own name, so it must be treated as a config change too.
+const CONFIGMAP_DATA_SENTINEL: &str = "..data";
+
+/// Whether `event` touches `config_path` (or the ConfigMap `..data`
+/// symlink that aliases it), as opposed to an unrelated sibling file in
+/// the watched parent directory.
+///
+/// Events carrying no paths are treated as relevant: some backends emit
+/// pathless rescan notifications, and dropping those could miss a real
+/// change. The cost of a false positive is only a redundant re-read.
+fn event_affects_config(event: &notify::Event, config_path: &Path) -> bool {
+    if event.paths.is_empty() {
+        return true;
+    }
+    let config_name = config_path.file_name();
+    event.paths.iter().any(|p| {
+        p == config_path
+            || (config_name.is_some() && p.file_name() == config_name)
+            || p.file_name() == Some(CONFIGMAP_DATA_SENTINEL.as_ref())
+    })
 }
 
 fn debounce_loop(
@@ -217,22 +251,6 @@ fingers_per_node = 5678
     }
 
     #[test]
-    fn emits_update_on_modification() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        write(&path, VALID_A);
-
-        let (_w, rx) = ConfigWatcher::new(path.clone()).unwrap();
-        // Small settle so the watcher is fully armed.
-        thread::sleep(Duration::from_millis(100));
-        write(&path, VALID_B);
-
-        let upd = recv_within(&rx, Duration::from_secs(3))
-            .expect("expected a ConfigUpdate after modification");
-        assert_eq!(upd.generation, 1);
-    }
-
-    #[test]
     fn bad_toml_does_not_emit() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
@@ -306,5 +324,90 @@ fingers_per_node = 5678
             thread::sleep(Duration::from_millis(50));
         }
         // If Drop didn't join cleanly we'd hang or panic above.
+    }
+
+    #[test]
+    fn modification_emits_update_and_sibling_is_filtered() {
+        // End-to-end coverage through the real notify watcher, replacing
+        // the old `emits_update_on_modification` test. It pins down two
+        // properties in a single watcher lifetime (so the suite does not
+        // pay for an extra concurrent watcher):
+        //   1. A valid config modification surfaces a `ConfigUpdate`
+        //      whose parsed contents reflect the new file, with an
+        //      advancing generation.
+        //   2. A write to an unrelated sibling file in the watched parent
+        //      directory is filtered out (`event_affects_config`) and
+        //      yields no update; a subsequent real config change still
+        //      does, which also proves the watcher stayed live.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let sibling = dir.path().join("node1.disk");
+        write(&path, VALID_A);
+
+        let (_w, rx) = ConfigWatcher::new(path.clone()).unwrap();
+        // Let the notify backend finish installing the watch before the
+        // first edit so the modification is observed.
+        thread::sleep(Duration::from_millis(100));
+
+        // (1) A valid modification is surfaced with the new contents.
+        write(&path, VALID_B);
+        let update = recv_within(&rx, Duration::from_secs(3))
+            .expect("a valid modification must yield a ConfigUpdate");
+        assert_eq!(update.config.p2p().fingers_per_node, 5678);
+        assert!(update.generation >= 1, "generation must advance");
+
+        // (2a) An unrelated sibling write is filtered out.
+        write(&sibling, "not a config file");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(800)).is_err(),
+            "a sibling write must be filtered out and yield no update",
+        );
+
+        // (2b) A real config change after the sibling write still emits,
+        // proving the watcher is alive and the silence above was genuine
+        // filtering rather than a dead watch.
+        write(&path, VALID_A);
+        let update = recv_within(&rx, Duration::from_secs(3))
+            .expect("a config change after a sibling write must still emit");
+        assert_eq!(update.config.p2p().fingers_per_node, 1234);
+    }
+
+    fn event_for(paths: &[&Path]) -> notify::Event {
+        notify::Event {
+            kind: notify::EventKind::Any,
+            paths: paths.iter().map(|p| p.to_path_buf()).collect(),
+            attrs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn filter_matches_config_path() {
+        let cfg = Path::new("/etc/storage/config.toml");
+        assert!(event_affects_config(&event_for(&[cfg]), cfg));
+    }
+
+    #[test]
+    fn filter_ignores_unrelated_sibling() {
+        let cfg = Path::new("/var/run/smoke/node1.toml");
+        let disk = Path::new("/var/run/smoke/node1.disk");
+        let log = Path::new("/var/run/smoke/node1.log");
+        assert!(!event_affects_config(&event_for(&[disk]), cfg));
+        assert!(!event_affects_config(&event_for(&[log]), cfg));
+        // A batched event touching both a sibling and the config still
+        // counts as a config change.
+        assert!(event_affects_config(&event_for(&[disk, cfg]), cfg));
+    }
+
+    #[test]
+    fn filter_matches_configmap_data_swap() {
+        let cfg = Path::new("/etc/storage/config.toml");
+        let data = Path::new("/etc/storage/..data");
+        assert!(event_affects_config(&event_for(&[data]), cfg));
+    }
+
+    #[test]
+    fn filter_treats_pathless_event_as_relevant() {
+        let cfg = Path::new("/etc/storage/config.toml");
+        assert!(event_affects_config(&event_for(&[]), cfg));
     }
 }

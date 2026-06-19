@@ -25,7 +25,7 @@ use std::path::Path;
 
 use prost::Message;
 
-use super::schema::{BackendKind, Config, DiskKind, FrontendKind, PeerTransport};
+use super::schema::{BackendKind, Config, DiskKind, FrontendKind};
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -42,12 +42,15 @@ pub enum ConfigError {
         page_size: u64,
     },
     SizeOnlyForFileDisk(String),
-    InvalidTcpAddr {
+    MissingPeerAddr(u64),
+    AmbiguousPeerAddr(u64),
+    InvalidPeerAddr {
         peer_id: u64,
         addr: String,
     },
-    InvalidRdmaHex {
+    InvalidNativePeerAddr {
         peer_id: u64,
+        addr: String,
     },
     EmptyDiskPath,
     MissingLocalNodeId,
@@ -83,10 +86,6 @@ pub enum ConfigError {
         frontend_id: String,
         backend_id: String,
     },
-    InvalidPeerTransport {
-        peer_id: u64,
-        value: i32,
-    },
     InvalidDiskKind {
         path: String,
         value: i32,
@@ -98,6 +97,9 @@ pub enum ConfigError {
     InvalidFrontendKind {
         frontend_id: String,
         value: i32,
+    },
+    InvalidMetricsBind {
+        bind: String,
     },
 }
 
@@ -128,11 +130,20 @@ impl fmt::Display for ConfigError {
             ConfigError::SizeOnlyForFileDisk(p) => {
                 write!(f, "disk {p}: `size` is only valid for kind = \"file\"")
             }
-            ConfigError::InvalidTcpAddr { peer_id, addr } => {
-                write!(f, "peer {peer_id}: invalid tcp socket address {addr:?}")
+            ConfigError::MissingPeerAddr(peer_id) => {
+                write!(f, "peer {peer_id}: address requires `socket` or `native`")
             }
-            ConfigError::InvalidRdmaHex { peer_id } => {
-                write!(f, "peer {peer_id}: invalid rdma hex address")
+            ConfigError::AmbiguousPeerAddr(peer_id) => {
+                write!(
+                    f,
+                    "peer {peer_id}: address must set only one of `socket` or `native`"
+                )
+            }
+            ConfigError::InvalidPeerAddr { peer_id, addr } => {
+                write!(f, "peer {peer_id}: invalid socket address {addr:?}")
+            }
+            ConfigError::InvalidNativePeerAddr { peer_id, addr } => {
+                write!(f, "peer {peer_id}: invalid native fabric address {addr:?}")
             }
             ConfigError::EmptyDiskPath => write!(f, "disk path must not be empty"),
             ConfigError::MissingLocalNodeId => write!(
@@ -155,10 +166,9 @@ impl fmt::Display for ConfigError {
                 "p2p.routing_plan {role} {id} equals p2p.local_node_id: a node cannot list \
                  itself as a routing neighbor"
             ),
-            ConfigError::RoutingPlanDuplicateFinger(id) => write!(
-                f,
-                "p2p.routing_plan.fingers contains duplicate id {id}"
-            ),
+            ConfigError::RoutingPlanDuplicateFinger(id) => {
+                write!(f, "p2p.routing_plan.fingers contains duplicate id {id}")
+            }
             ConfigError::DuplicateBackendId(id) => write!(f, "duplicate backend id: {id:?}"),
             ConfigError::DuplicateFrontendId(id) => write!(f, "duplicate frontend id: {id:?}"),
             ConfigError::EmptyBackendId => write!(f, "backend id must not be empty"),
@@ -197,22 +207,21 @@ impl fmt::Display for ConfigError {
                 "frontend {frontend_id:?} references backend {backend_id:?} which is not defined \
                  in any [[backends]] entry"
             ),
-            ConfigError::InvalidPeerTransport { peer_id, value } => write!(
-                f,
-                "peer {peer_id}: transport {value} is not a valid value (0 = tcp, 1 = rdma)"
-            ),
             ConfigError::InvalidDiskKind { path, value } => write!(
                 f,
                 "disk {path}: kind {value} is not a valid value (0 = nvme, 1 = block, 2 = file)"
             ),
             ConfigError::InvalidBackendKind { backend_id, value } => write!(
                 f,
-                "backend {backend_id:?}: kind {value} is not a valid value (0 = http, 1 = s3)"
+                "backend {backend_id:?}: kind {value} is not a valid value (0 = http, 1 = s3, 2 = azure)"
             ),
             ConfigError::InvalidFrontendKind { frontend_id, value } => write!(
                 f,
                 "frontend {frontend_id:?}: kind {value} is not a valid value (0 = http, 1 = s3)"
             ),
+            ConfigError::InvalidMetricsBind { bind } => {
+                write!(f, "metrics bind {bind:?} is not a valid socket address")
+            }
         }
     }
 }
@@ -222,6 +231,7 @@ impl std::error::Error for ConfigError {
         match self {
             ConfigError::Io(e) => Some(e),
             ConfigError::Toml(e) => Some(e),
+            ConfigError::Protobuf(e) => Some(e),
             _ => None,
         }
     }
@@ -283,27 +293,7 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         if p2p.local_node_id == Some(p.id) {
             return Err(ConfigError::LocalNodeIdCollidesWithPeer(p.id));
         }
-        if PeerTransport::try_from(p.transport).is_err() {
-            return Err(ConfigError::InvalidPeerTransport {
-                peer_id: p.id,
-                value: p.transport,
-            });
-        }
-        match p.transport() {
-            PeerTransport::Tcp => {
-                if p.address.parse::<SocketAddr>().is_err() {
-                    return Err(ConfigError::InvalidTcpAddr {
-                        peer_id: p.id,
-                        addr: p.address.clone(),
-                    });
-                }
-            }
-            PeerTransport::Rdma => {
-                if !is_valid_even_hex(&p.address) {
-                    return Err(ConfigError::InvalidRdmaHex { peer_id: p.id });
-                }
-            }
-        }
+        validate_peer_address(p.id, p.address.as_ref())?;
     }
 
     // Disjoint-discovery routing plan: every referenced id must name a
@@ -435,11 +425,58 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
             });
         }
     }
+
+    // The metrics exporter bind is optional; when set it must parse as a
+    // socket address (an empty value disables the exporter).
+    let metrics_bind = &cfg.startup().metrics().bind;
+    if !metrics_bind.is_empty() && metrics_bind.parse::<SocketAddr>().is_err() {
+        return Err(ConfigError::InvalidMetricsBind {
+            bind: metrics_bind.clone(),
+        });
+    }
+
     Ok(())
 }
 
-fn is_valid_even_hex(s: &str) -> bool {
-    !s.is_empty() && s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit())
+fn validate_peer_address(
+    peer_id: u64,
+    address: Option<&super::schema::FabricAddress>,
+) -> Result<(), ConfigError> {
+    let Some(address) = address else {
+        return Err(ConfigError::MissingPeerAddr(peer_id));
+    };
+
+    let has_socket = !address.socket.is_empty();
+    let has_native = !address.native.is_empty();
+    match (has_socket, has_native) {
+        (false, false) => Err(ConfigError::MissingPeerAddr(peer_id)),
+        (true, true) => Err(ConfigError::AmbiguousPeerAddr(peer_id)),
+        (true, false) => {
+            if address.socket.parse::<SocketAddr>().is_err() {
+                return Err(ConfigError::InvalidPeerAddr {
+                    peer_id,
+                    addr: address.socket.clone(),
+                });
+            }
+            Ok(())
+        }
+        (false, true) => {
+            if !is_valid_native_address(&address.native) {
+                return Err(ConfigError::InvalidNativePeerAddr {
+                    peer_id,
+                    addr: address.native.clone(),
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+fn is_valid_native_address(addr: &str) -> bool {
+    let Some(hex) = addr.strip_prefix("hex:") else {
+        return false;
+    };
+    !hex.is_empty() && hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -454,6 +491,20 @@ mod tests {
         f.write_all(contents.as_bytes()).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    fn write_binpb(bytes: &[u8]) -> NamedTempFile {
+        let mut f = tempfile::Builder::new()
+            .suffix(".binpb")
+            .tempfile()
+            .unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    fn encode_config(cfg: &Config) -> Vec<u8> {
+        cfg.encode_to_vec()
     }
 
     #[test]
@@ -471,13 +522,11 @@ local_node_id = 99
 
 [[peers]]
 id = 1
-transport = 0
-address = "10.0.0.1:9000"
+address = { socket = "10.0.0.1:9000" }
 
 [[peers]]
 id = 2
-transport = 1
-address = "deadbeef"
+address = { socket = "10.0.0.2:9000" }
 hca_numa = 0
 
 [[disks]]
@@ -503,13 +552,11 @@ local_node_id = 99
 
 [[peers]]
 id = 1
-transport = 0
-address = "10.0.0.1:9000"
+address = { socket = "10.0.0.1:9000" }
 
 [[peers]]
 id = 1
-transport = 0
-address = "10.0.0.2:9000"
+address = { socket = "10.0.0.2:9000" }
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -535,64 +582,106 @@ path = "/dev/nvme0n1"
     }
 
     #[test]
-    fn rejects_invalid_tcp_addr() {
+    fn rejects_invalid_peer_addr() {
         let s = r#"
 [p2p]
 local_node_id = 1
 
 [[peers]]
 id = 7
-transport = 0
-address = "not-an-addr"
+address = { socket = "not-an-addr" }
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
-            Err(ConfigError::InvalidTcpAddr { peer_id: 7, .. }) => {}
-            other => panic!("expected InvalidTcpAddr, got {other:?}"),
+            Err(ConfigError::InvalidPeerAddr { peer_id: 7, .. }) => {}
+            other => panic!("expected InvalidPeerAddr, got {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_hostname_for_tcp() {
+    fn rejects_hostname_for_peer_addr() {
         let s = r#"
 [p2p]
 local_node_id = 1
 
 [[peers]]
 id = 8
-transport = 0
-address = "example.com:9000"
+address = { socket = "example.com:9000" }
 "#;
         let f = write_cfg(s);
         assert!(matches!(
             load(f.path()),
-            Err(ConfigError::InvalidTcpAddr { peer_id: 8, .. })
+            Err(ConfigError::InvalidPeerAddr { peer_id: 8, .. })
         ));
     }
 
     #[test]
-    fn rejects_invalid_rdma_hex() {
-        for bad in ["xyzz", "abc", "", "deadbeefg0"] {
-            let s = format!(
-                r#"
+    fn accepts_native_peer_addr() {
+        let s = r#"
 [p2p]
 local_node_id = 1
 
 [[peers]]
-id = 3
-transport = 1
-address = "{bad}"
-"#
-            );
-            let f = write_cfg(&s);
-            assert!(
-                matches!(
-                    load(f.path()),
-                    Err(ConfigError::InvalidRdmaHex { peer_id: 3 })
-                ),
-                "expected InvalidRdmaHex for {bad:?}"
-            );
-        }
+id = 9
+address = { native = "hex:01020304" }
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("load should succeed");
+        assert_eq!(
+            cfg.peers[0].address.as_ref().unwrap().native,
+            "hex:01020304"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_peer_addr_variant() {
+        let s = r#"
+[p2p]
+local_node_id = 1
+
+[[peers]]
+id = 9
+address = {}
+"#;
+        let f = write_cfg(s);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::MissingPeerAddr(9))
+        ));
+    }
+
+    #[test]
+    fn rejects_ambiguous_peer_addr() {
+        let s = r#"
+[p2p]
+local_node_id = 1
+
+[[peers]]
+id = 9
+address = { socket = "10.0.0.9:9000", native = "hex:0102" }
+"#;
+        let f = write_cfg(s);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::AmbiguousPeerAddr(9))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_native_peer_addr() {
+        let s = r#"
+[p2p]
+local_node_id = 1
+
+[[peers]]
+id = 9
+address = { native = "gid:bad" }
+"#;
+        let f = write_cfg(s);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::InvalidNativePeerAddr { peer_id: 9, .. })
+        ));
     }
 
     #[test]
@@ -699,8 +788,7 @@ size = 16777216
         let s = r#"
 [[peers]]
 id = 1
-transport = 0
-address = "10.0.0.1:9000"
+address = { socket = "10.0.0.1:9000" }
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -717,8 +805,7 @@ local_node_id = 7
 
 [[peers]]
 id = 1
-transport = 0
-address = "10.0.0.1:9000"
+address = { socket = "10.0.0.1:9000" }
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
@@ -734,8 +821,7 @@ local_node_id = 1
 
 [[peers]]
 id = 1
-transport = 0
-address = "10.0.0.1:9000"
+address = { socket = "10.0.0.1:9000" }
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -923,6 +1009,29 @@ backend = "b"
     }
 
     #[test]
+    fn accepts_valid_metrics_bind() {
+        let f = write_cfg("[startup.metrics]\nbind = \"0.0.0.0:9100\"\n");
+        let cfg = load(f.path()).expect("valid metrics bind loads");
+        assert_eq!(cfg.startup().metrics().bind, "0.0.0.0:9100");
+    }
+
+    #[test]
+    fn empty_metrics_bind_is_allowed() {
+        let f = write_cfg("");
+        let cfg = load(f.path()).expect("absent metrics section loads");
+        assert_eq!(cfg.startup().metrics().bind, "");
+    }
+
+    #[test]
+    fn rejects_invalid_metrics_bind() {
+        let f = write_cfg("[startup.metrics]\nbind = \"not-an-addr\"\n");
+        match load(f.path()) {
+            Err(ConfigError::InvalidMetricsBind { bind }) if bind == "not-an-addr" => {}
+            other => panic!("expected InvalidMetricsBind, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_duplicate_frontend_bind() {
         let s = r#"
 [[backends]]
@@ -965,6 +1074,19 @@ endpoint = "s3.example.com:443"
     }
 
     #[test]
+    fn accepts_azure_backend() {
+        let s = r#"
+[[backends]]
+id = "azure"
+kind = 2
+endpoint = "acct.blob.core.windows.net:443"
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("load should succeed");
+        assert_eq!(cfg.backends[0].kind(), BackendKind::Azure);
+    }
+
+    #[test]
     fn rejects_unknown_key() {
         // A typo in a key now fails loudly at parse time instead of being
         // silently dropped (deny_unknown_fields on the TOML path).
@@ -977,27 +1099,75 @@ fingers_per_nod = 128
     }
 
     #[test]
-    fn rejects_out_of_range_peer_transport() {
-        let s = r#"
+    fn loads_binpb_config() {
+        // A `.binpb` file is decoded from the protobuf wire format that
+        // the TOML loader's `Config` round-trips to.
+        let toml = r#"
 [p2p]
 local_node_id = 99
 
 [[peers]]
 id = 1
-transport = 5
-address = "10.0.0.1:9000"
+address = { socket = "10.0.0.1:9000" }
+
+[[disks]]
+path = "/dev/nvme0n1"
+kind = 0
 "#;
-        let f = write_cfg(s);
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let f = write_binpb(&encode_config(&cfg));
+        let loaded = load(f.path()).unwrap();
+        assert_eq!(loaded.peers.len(), 1);
+        assert_eq!(loaded.peers[0].id, 1);
+        assert_eq!(loaded.disks.len(), 1);
+        assert_eq!(loaded.p2p().local_node_id, Some(99));
+    }
+
+    #[test]
+    fn binpb_applies_defaults() {
+        // The binpb path shares the TOML path's defaulting finalization.
+        let f = write_binpb(&encode_config(&Config::default()));
+        let loaded = load(f.path()).unwrap();
+        assert_eq!(loaded.p2p().fingers_per_node, 100);
+        assert_eq!(loaded.startup().topology().hcas_per_numa_node, 1);
+    }
+
+    #[test]
+    fn binpb_runs_validation() {
+        // Validation runs regardless of encoding: a duplicate peer id is
+        // rejected even when it arrives over the protobuf wire path.
+        let toml = r#"
+[p2p]
+local_node_id = 99
+
+[[peers]]
+id = 1
+address = { socket = "10.0.0.1:9000" }
+
+[[peers]]
+id = 2
+address = { socket = "10.0.0.2:9000" }
+"#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.peers[1].id = 1;
+        let f = write_binpb(&encode_config(&cfg));
         match load(f.path()) {
-            Err(ConfigError::InvalidPeerTransport {
-                peer_id: 1,
-                value: 5,
-            }) => {}
-            other => panic!("expected InvalidPeerTransport, got {other:?}"),
+            Err(ConfigError::DuplicatePeer(1)) => {}
+            other => panic!("expected DuplicatePeer(1), got {other:?}"),
         }
     }
 
     #[test]
+    fn rejects_invalid_binpb_bytes() {
+        // A field tag with a truncated varint payload is not a valid
+        // protobuf message and surfaces as a decode error.
+        let f = write_binpb(&[0x08]);
+        match load(f.path()) {
+            Err(ConfigError::Protobuf(_)) => {}
+            other => panic!("expected Protobuf decode error, got {other:?}"),
+        }
+    }
+
     fn rejects_out_of_range_disk_kind() {
         let s = r#"
 [[disks]]
@@ -1016,14 +1186,14 @@ kind = 3
         let s = r#"
 [[backends]]
 id = "b"
-kind = 2
+kind = 3
 endpoint = "https://e"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
             Err(ConfigError::InvalidBackendKind {
                 backend_id,
-                value: 2,
+                value: 3,
             }) if backend_id == "b" => {}
             other => panic!("expected InvalidBackendKind, got {other:?}"),
         }
@@ -1053,103 +1223,16 @@ backend = "b"
         }
     }
 
-    fn write_binpb(bytes: &[u8]) -> NamedTempFile {
-        let mut f = tempfile::Builder::new()
-            .suffix(".binpb")
-            .tempfile()
-            .unwrap();
-        f.write_all(bytes).unwrap();
-        f.flush().unwrap();
-        f
-    }
-
-    fn encode_config(cfg: &Config) -> Vec<u8> {
-        cfg.encode_to_vec()
-    }
-
-    #[test]
-    fn loads_binpb_config() {
-        // A `.binpb` file is decoded from the protobuf wire format that
-        // the TOML loader's `Config` round-trips to.
-        let toml = r#"
-[p2p]
-local_node_id = 99
-
-[[peers]]
-id = 1
-transport = 0
-address = "10.0.0.1:9000"
-
-[[disks]]
-path = "/dev/nvme0n1"
-kind = 0
-"#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let f = write_binpb(&encode_config(&cfg));
-        let loaded = load(f.path()).unwrap();
-        assert_eq!(loaded.peers.len(), 1);
-        assert_eq!(loaded.peers[0].id, 1);
-        assert_eq!(loaded.disks.len(), 1);
-        assert_eq!(loaded.p2p().local_node_id, Some(99));
-    }
-
-    #[test]
-    fn binpb_applies_defaults() {
-        // The binpb path shares the TOML path's defaulting finalization.
-        let f = write_binpb(&encode_config(&Config::default()));
-        let loaded = load(f.path()).unwrap();
-        assert_eq!(loaded.p2p().fingers_per_node, 100);
-    }
-
-    #[test]
-    fn binpb_runs_validation() {
-        // Validation runs regardless of encoding: a duplicate peer id is
-        // rejected even when it arrives over the protobuf wire path.
-        let toml = r#"
-[p2p]
-local_node_id = 99
-
-[[peers]]
-id = 1
-transport = 0
-address = "10.0.0.1:9000"
-
-[[peers]]
-id = 2
-transport = 0
-address = "10.0.0.2:9000"
-"#;
-        let mut cfg: Config = toml::from_str(toml).unwrap();
-        cfg.peers[1].id = 1;
-        let f = write_binpb(&encode_config(&cfg));
-        match load(f.path()) {
-            Err(ConfigError::DuplicatePeer(1)) => {}
-            other => panic!("expected DuplicatePeer(1), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_invalid_binpb_bytes() {
-        // A field tag with a truncated varint payload is not a valid
-        // protobuf message and surfaces as a decode error.
-        let f = write_binpb(&[0x08]);
-        match load(f.path()) {
-            Err(ConfigError::Protobuf(_)) => {}
-            other => panic!("expected Protobuf decode error, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn loads_startup_defaults_via_toml() {
         // An omitted [startup] section is populated entirely from the
         // documented defaults during load.
         let f = write_cfg("");
         let cfg = load(f.path()).unwrap();
         let s = cfg.startup();
-        assert_eq!(s.memory().bytes_per_shard, 128 * 1024 * 1024);
+        assert_eq!(s.memory().memory_total_bytes, 128 * 1024 * 1024);
         assert_eq!(s.fabric().listen_addr, "0.0.0.0:0");
         assert_eq!(s.fabric().max_inflight, 1024);
-        assert_eq!(s.topology().rdma_handlers_per_hca, 4);
+        assert_eq!(s.topology().nic_workers, 4);
     }
 
     #[test]
@@ -1157,7 +1240,7 @@ address = "10.0.0.2:9000"
         let s = r#"
 [startup.memory]
 no_hugepages = true
-bytes_per_shard = 67108864
+memory_total_bytes = 67108864
 
 [startup.fabric]
 listen_addr = "10.0.0.1:7000"
@@ -1168,31 +1251,10 @@ disable_rdma = true
         let f = write_cfg(s);
         let cfg = load(f.path()).unwrap();
         assert!(cfg.startup().memory().no_hugepages);
-        assert_eq!(cfg.startup().memory().bytes_per_shard, 64 * 1024 * 1024);
+        assert_eq!(cfg.startup().memory().memory_total_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.startup().fabric().listen_addr, "10.0.0.1:7000");
         assert!(cfg.startup().topology().disable_rdma);
         // Unset siblings still default.
         assert_eq!(cfg.startup().fabric().progress_threads, 2);
-    }
-
-    #[test]
-    fn startup_round_trips_through_binpb() {
-        // The startup section survives the protobuf wire encoding and is
-        // re-defaulted on decode, identically to the TOML path.
-        let toml = r#"
-[startup.fabric]
-listen_addr = "10.0.0.2:8000"
-max_inflight = 4096
-
-[startup.topology]
-disable_rdma = true
-"#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let f = write_binpb(&encode_config(&cfg));
-        let loaded = load(f.path()).unwrap();
-        assert_eq!(loaded.startup().fabric().listen_addr, "10.0.0.2:8000");
-        assert_eq!(loaded.startup().fabric().max_inflight, 4096);
-        assert!(loaded.startup().topology().disable_rdma);
-        assert_eq!(loaded.startup().memory().bytes_per_shard, 128 * 1024 * 1024);
     }
 }

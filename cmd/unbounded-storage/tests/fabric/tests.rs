@@ -97,7 +97,12 @@ fn assert_page_write_planning(report: &RunReport) -> Result<(), TestCaseError> {
 }
 
 fn assert_launch_availability_accounting(report: &RunReport) -> Result<(), TestCaseError> {
-    let expected_required = report.dst_count.checked_add(3);
+    // Under the FI_EP_MSG protocol the client posts no recvs of its own;
+    // the per-connection RecvPool receives all replies. A bulk_get therefore
+    // costs exactly one completion slot (the request send), independent of
+    // dst_count, which is retained only for API stability.
+    let _ = report.dst_count;
+    let expected_required = Some(1);
     prop_assert_eq!(report.required_slots, expected_required);
     let should_fit = expected_required.is_some_and(|required| required <= report.available_slots);
     prop_assert_eq!(report.availability_result.is_ok(), should_fit);
