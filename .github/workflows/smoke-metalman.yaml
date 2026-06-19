@@ -18,7 +18,7 @@ on:
       - deploy/net/**
       - hack/smoke-metalman.py
       - hack/kind-smoke-config.yaml
-      - images/host-ubuntu2404/**
+      - images/host-azurelinux3/**
       - images/agent-ubuntu2404/**
       - go.mod
       - go.sum
@@ -37,7 +37,7 @@ jobs:
         run: |
           # GitHub-hosted runners have ~14 GB free; the smoke test needs
           # much more because it builds two Docker images (one containing a
-          # full Ubuntu cloud image) and creates a 20 GB qcow2 VM disk that
+          # bootable host disk) and creates a 20 GB qcow2 VM disk that
           # grows dynamically.  Remove the largest pre-installed toolchains
           # in parallel and prune unused Docker images.
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet \
@@ -86,15 +86,15 @@ jobs:
         with:
           driver-opts: network=host
 
-      - name: Build host-ubuntu2404 image
+      - name: Build host-azurelinux3 image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
-          file: images/host-ubuntu2404/Containerfile
+          file: images/host-azurelinux3/Containerfile
           load: true
-          tags: localhost:5555/unbounded/host-ubuntu2404:smoke
-          cache-from: type=gha,scope=host-ubuntu2404
-          cache-to: type=gha,mode=max,scope=host-ubuntu2404
+          tags: localhost:5555/unbounded/host-azurelinux3:smoke
+          cache-from: type=gha,scope=host-azurelinux3
+          cache-to: type=gha,mode=max,scope=host-azurelinux3
           provenance: false
 
       - name: Build agent-ubuntu2404 image

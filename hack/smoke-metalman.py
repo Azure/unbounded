@@ -44,7 +44,7 @@ ARTIFACT_DIR = TMPDIR / "artifacts"
 SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
 REGISTRY_PORT = 5555
 REGISTRY_CONTAINER = "unbounded-smoke-registry"
-IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
+IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-azurelinux3:smoke"
 AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 # The agent runs inside a VM on an isolated libvirt network. "localhost" inside
 # the VM resolves to the VM's own loopback, not the host.  Use the host's
@@ -423,6 +423,23 @@ def apiserver_url() -> str:
         log(f"  Rewrote apiserver URL to {url} (kind container on virbr-smoke)")
 
     return url
+
+
+def kubeconfig_for_sudo() -> str:
+    kubeconfig = os.environ.get("KUBECONFIG")
+    if kubeconfig:
+        return kubeconfig
+
+    path = TMPDIR / "kubeconfig"
+    result = run(
+        [KUBECTL, "config", "view", "--raw", "--minify"],
+        capture_output=True,
+        text=True,
+    )
+    path.write_text(result.stdout)
+    os.chmod(path, 0o600)
+
+    return str(path)
 
 
 def _probe_vm_network() -> None:
@@ -860,7 +877,7 @@ def main() -> None:
         "--connect", "qemu:///system",
         "--name", VM_NAME, "--ram", "4096", "--vcpus", "2",
         "--disk", f"path={disk},format=qcow2,bus=virtio",
-        "--network", f"network={NET_NAME},mac={MAC_ADDRESS}",
+        "--network", f"network={NET_NAME},mac={MAC_ADDRESS},model=virtio",
         "--boot", f"uefi,loader=/usr/share/OVMF/OVMF_CODE_4M.fd,nvram={ovmf_vars},hd,network",
         "--tpm", "backend.type=emulator,backend.version=2.0",
         "--serial", f"unix,path={SERIAL_SOCK},mode=bind",
@@ -950,12 +967,12 @@ def main() -> None:
     else:
         die("Local OCI registry did not become ready")
 
-    # Both Docker images (host-ubuntu2404 and agent-ubuntu2404) are pre-built
+    # Both Docker images (host-azurelinux3 and agent-ubuntu2404) are pre-built
     # by the GitHub Actions workflow using docker/build-push-action with GHA
     # layer caching.  They are already loaded into the local Docker daemon
     # with the correct tags (IMAGE_NAME and AGENT_IMAGE_NAME).
     log("Verifying pre-built OCI images are available")
-    for name, tag in [("host-ubuntu2404", IMAGE_NAME),
+    for name, tag in [("host-azurelinux3", IMAGE_NAME),
                       ("agent-ubuntu2404", AGENT_IMAGE_NAME)]:
         result = subprocess.run(
             ["docker", "image", "inspect", tag],
@@ -977,8 +994,8 @@ def main() -> None:
     run(["docker", "push", IMAGE_NAME])
     run(["docker", "push", AGENT_IMAGE_NAME])
 
-    # Reclaim disk space consumed by Docker build cache.  The host-ubuntu2404
-    # build downloads a ~2 GB Ubuntu cloud image and converts it to raw; the
+    # Reclaim disk space consumed by Docker build cache. The host image
+    # build assembles a bootable raw disk image; the
     # intermediate layers are no longer needed once the images are pushed.
     # Only prune the build cache (not running container images) to avoid
     # disturbing the registry container.
@@ -1021,8 +1038,9 @@ def main() -> None:
     log("  Resources created")
 
     log("Starting metalman serve-pxe")
+    kubeconfig = kubeconfig_for_sudo()
     proc = spawn([
-        "sudo", "env", f"METALMAN_APISERVER_URL={server_url}",
+        "sudo", "env", f"KUBECONFIG={kubeconfig}", f"METALMAN_APISERVER_URL={server_url}",
         str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
         f"--cache-dir={CACHE_DIR}",
         f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",

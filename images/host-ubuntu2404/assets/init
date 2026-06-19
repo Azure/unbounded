@@ -190,12 +190,18 @@ if [ -n "$DS_URL" ]; then
 
     retry 5 2 "mount $ROOT_PART" mount "$ROOT_PART" /mnt || fatal "failed to mount $ROOT_PART"
 
-    mkdir -p /mnt/etc/cloud/cloud.cfg.d
+    mkdir -p /mnt/etc/cloud/cloud.cfg.d /mnt/var/lib/cloud/seed/nocloud
+    wget -q -O /mnt/var/lib/cloud/seed/nocloud/meta-data "${DS_URL}meta-data" \
+        || fatal "failed to download cloud-init meta-data"
+    wget -q -O /mnt/var/lib/cloud/seed/nocloud/user-data "${DS_URL}user-data" \
+        || fatal "failed to download cloud-init user-data"
+    wget -q -O /mnt/var/lib/cloud/seed/nocloud/vendor-data "${DS_URL}vendor-data" \
+        || fatal "failed to download cloud-init vendor-data"
     cat > /mnt/etc/cloud/cloud.cfg.d/99-unbounded-metal.cfg <<CLOUDINIT
 datasource_list: [NoCloud]
 datasource:
   NoCloud:
-    seedfrom: ${DS_URL}
+    seedfrom: /var/lib/cloud/seed/nocloud/
 CLOUDINIT
     rm -f /mnt/etc/cloud/cloud-init.disabled
     log "wrote cloud-init datasource config"
@@ -210,6 +216,63 @@ APISERVER_URL=${APISERVER_URL}
 UMCONFIG
         log "wrote /etc/unbounded-metal/config"
     fi
+
+	if [ -n "$CLIENT_IP" ] && [ -n "$PREFIX" ] && [ -n "$GW" ] && [ -n "$IFACE" ]; then
+		mkdir -p /mnt/etc/systemd/network
+		IFACE_MAC=$(cat "/sys/class/net/$IFACE/address" 2>/dev/null || true)
+        if [ -n "$IFACE_MAC" ]; then
+            MATCH="MACAddress=${IFACE_MAC}"
+        else
+            MATCH="Name=${IFACE}"
+        fi
+        cat > /mnt/etc/systemd/network/10-unbounded-static.network <<NETCONFIG
+[Match]
+${MATCH}
+
+[Network]
+Address=${CLIENT_IP}/${PREFIX}
+Gateway=${GW}
+DNS=8.8.8.8
+NETCONFIG
+		mkdir -p /mnt/usr/local/sbin /mnt/etc/systemd/system/network-pre.target.wants
+		cat > /mnt/usr/local/sbin/unbounded-metal-network <<NETSCRIPT
+#!/bin/sh
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+iface=""
+for dev in /sys/class/net/*; do
+    [ -e "\$dev/address" ] || continue
+    if [ "\$(cat "\$dev/address")" = "$IFACE_MAC" ]; then
+        iface="\$(basename "\$dev")"
+        break
+    fi
+done
+if [ -z "\$iface" ]; then
+    iface="$IFACE"
+fi
+
+ip link set dev "\$iface" up
+ip addr replace "$CLIENT_IP/$PREFIX" dev "\$iface"
+ip route replace default via "$GW" dev "\$iface"
+NETSCRIPT
+		chmod 0755 /mnt/usr/local/sbin/unbounded-metal-network
+		cat > /mnt/etc/systemd/system/unbounded-metal-network.service <<NETSERVICE
+[Unit]
+Description=Configure Unbounded Metal static network
+DefaultDependencies=no
+Before=network-pre.target systemd-networkd.service cloud-init-local.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/unbounded-metal-network
+
+[Install]
+WantedBy=network-pre.target
+NETSERVICE
+		ln -sf ../unbounded-metal-network.service /mnt/etc/systemd/system/network-pre.target.wants/unbounded-metal-network.service
+		log "wrote static networkd config for $IFACE"
+	fi
 
     sync
     umount /mnt
@@ -245,6 +308,8 @@ if [ -d /sys/firmware/efi ]; then
         if mount -t vfat "$ESP_PART" /mnt/esp 2>/dev/null; then
             if [ -f /mnt/esp/EFI/ubuntu/shimx64.efi ]; then
                 LOADER='\EFI\ubuntu\shimx64.efi'
+            elif [ -f /mnt/esp/EFI/BOOT/grubx64.efi ]; then
+                LOADER='\EFI\BOOT\grubx64.efi'
             elif [ -f /mnt/esp/EFI/BOOT/BOOTX64.EFI ]; then
                 LOADER='\EFI\BOOT\BOOTX64.EFI'
             else

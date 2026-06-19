@@ -1,0 +1,244 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Build the unbounded-agent binary.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.4-trixie@sha256:0dcba0d95dbfb072e9917a106b9e07d7cc298097dc83e9307056ef1889de654d AS gobuilder
+
+ARG TARGETARCH
+ARG VERSION=dev
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
+    -ldflags "-s -w \
+      -X github.com/Azure/unbounded/internal/version.Version=${VERSION} \
+      -X github.com/Azure/unbounded/internal/version.GitCommit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+    -o /unbounded-agent ./cmd/agent
+
+# Prepare Azure Linux rootfs and netboot artifacts.
+FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS azurebuild
+
+ARG TARGETARCH
+
+RUN if [ "${TARGETARCH}" != "amd64" ]; then \
+        echo "host-azurelinux3 currently supports linux/amd64 only" >&2; exit 1; \
+    fi
+
+RUN mkdir -p /var/lib/rpm-state && \
+    tdnf install -y --refresh \
+      ca-certificates cpio dracut efibootmgr gzip iproute kmod kernel \
+      shim grub2-efi-binary util-linux wget tar && \
+    tdnf clean all
+
+RUN mkdir -p /rootfs/var/lib/rpm-state && \
+    tdnf install -y --refresh --releasever 3.0 --installroot /rootfs \
+      filesystem azurelinux-release shadow-utils systemd && \
+    tdnf install -y --refresh --releasever 3.0 --installroot /rootfs \
+      ca-certificates cloud-init cloud-utils-growpart curl debootstrap \
+      e2fsprogs efibootmgr iproute iptables kmod nftables procps-ng qemu-guest-agent sudo \
+      systemd-container tdnf rpm util-linux && \
+    rm -rf /rootfs/var/cache/tdnf/* /rootfs/tmp/* /rootfs/var/tmp/* /rootfs/var/log/*
+
+COPY --from=gobuilder /unbounded-agent /rootfs/usr/local/bin/unbounded-agent
+COPY images/host-ubuntu2404/assets/init /tmp/initrd-root/init
+
+RUN set -eux; \
+    KVER=$(ls /lib/modules | sort -V | tail -1); \
+    mkdir -p /artifacts /rootfs/boot /rootfs/lib/modules /rootfs/boot/grub2 \
+      /rootfs/etc/cloud/cloud.cfg.d /rootfs/etc/systemd/network /rootfs/etc/systemd/system \
+      /rootfs/etc/modules-load.d \
+      /rootfs/etc/unbounded/agent /rootfs/usr/local/bin; \
+    chmod 0755 /rootfs/usr/local/bin/unbounded-agent; \
+    cp "/boot/vmlinuz-${KVER}" /artifacts/vmlinuz; \
+    cp "/boot/vmlinuz-${KVER}" "/rootfs/boot/vmlinuz-${KVER}"; \
+    cp -a "/lib/modules/${KVER}" "/rootfs/lib/modules/"; \
+    dracut --no-hostonly --kver "${KVER}" \
+      --install "sh mount modprobe ip wget gzip gunzip dd blockdev mountpoint efibootmgr reboot seq grep head cut tr ls cat sleep sync umount mkdir basename rm uname" \
+      /artifacts/initrd; \
+    dracut --no-hostonly --add-drivers "e1000 e1000e virtio_net virtio_pci virtio_blk virtio_console" \
+      --kver "${KVER}" "/rootfs/boot/initramfs-${KVER}.img"; \
+    printf '%s\n' e1000 e1000e virtio_net virtio_pci virtio_blk virtio_console \
+      > /rootfs/etc/modules-load.d/unbounded-metal.conf; \
+    chmod 0755 /tmp/initrd-root/init; \
+    (cd /tmp/initrd-root && find . -print0 | cpio --create --format=newc --quiet --null > /artifacts/init.cpio); \
+    cp /boot/efi/EFI/BOOT/bootx64.efi /artifacts/bootx64.efi; \
+    cp /boot/efi/EFI/BOOT/grubx64.efi /artifacts/grubx64.efi; \
+    cp /boot/efi/EFI/BOOT/mmx64.efi /artifacts/mmx64.efi; \
+    printf '%s\n' \
+      'LABEL=AZLROOT / ext4 defaults 0 1' \
+      'LABEL=AZLEFI /boot/efi vfat umask=0077,nofail,x-systemd.device-timeout=1s 0 2' \
+      > /rootfs/etc/fstab
+RUN set -eux; \
+    KVER=$(ls /lib/modules | sort -V | tail -1); \
+    printf '%s\n' \
+      'set default=0' \
+      'set timeout=0' \
+      '' \
+      "menuentry 'Azure Linux' {" \
+      '  insmod part_gpt' \
+      '  insmod ext2' \
+      '  search --no-floppy --set=root --label AZLROOT' \
+      "  linux /boot/vmlinuz-${KVER} root=LABEL=AZLROOT rw console=tty0 console=ttyS0,115200n8 net.ifnames=0 rd.driver.pre=e1000,e1000e,virtio_net,virtio_pci,virtio_blk,virtio_console" \
+      "  initrd /boot/initramfs-${KVER}.img" \
+      '}' \
+      > /rootfs/boot/grub2/grub.cfg
+
+RUN printf '%s\n' \
+      '[Match]' \
+      'Name=eth* en* ens* enp*' \
+      '' \
+      '[Network]' \
+      'DHCP=yes' \
+      > /rootfs/etc/systemd/network/20-dhcp.network
+
+RUN printf '%s\n' \
+      '[Unit]' \
+      'Description=Load Unbounded Metal VM modules' \
+      'DefaultDependencies=no' \
+      'Before=network-pre.target systemd-networkd.service' \
+      '' \
+      '[Service]' \
+      'Type=oneshot' \
+      'ExecStart=-/usr/sbin/modprobe e1000' \
+      'ExecStart=-/usr/sbin/modprobe e1000e' \
+      'ExecStart=-/usr/sbin/modprobe virtio_net' \
+      'ExecStart=-/usr/sbin/modprobe virtio_pci' \
+      'ExecStart=-/usr/sbin/modprobe virtio_blk' \
+      'ExecStart=-/usr/sbin/modprobe virtio_console' \
+      '' \
+      '[Install]' \
+      'WantedBy=network-pre.target' \
+      > /rootfs/etc/systemd/system/unbounded-metal-modules.service
+
+RUN printf '%s\n' \
+      '[Unit]' \
+      'Description=Apply Unbounded Metal sysctl settings' \
+      'DefaultDependencies=no' \
+      'After=systemd-modules-load.service' \
+      'Before=sysinit.target machines.target systemd-nspawn@kube1.service unbounded-agent-daemon.service' \
+      '' \
+      '[Service]' \
+      'Type=oneshot' \
+      'ExecStart=/usr/sbin/sysctl --system' \
+      '' \
+      '[Install]' \
+      'WantedBy=sysinit.target' \
+      > /rootfs/etc/systemd/system/unbounded-metal-sysctl.service
+
+RUN mkdir -p /rootfs/usr/local/sbin && \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'set -eu' \
+      '' \
+      'PATH=/usr/sbin:/usr/bin:/sbin:/bin' \
+      'i=0' \
+      'while [ "$i" -lt 60 ]; do' \
+      '    if [ -e /dev/virtio-ports/org.qemu.guest_agent.0 ]; then' \
+      '        exec /usr/bin/qemu-ga --method=virtio-serial --path=/dev/virtio-ports/org.qemu.guest_agent.0' \
+      '    fi' \
+      '    i=$((i + 1))' \
+      '    sleep 1' \
+      'done' \
+      'echo "unbounded-metal: qemu guest agent virtio port is missing" > /dev/console' \
+      'ls -la /dev/virtio-ports > /dev/console 2>&1 || true' \
+      'exit 1' \
+      > /rootfs/usr/local/sbin/unbounded-qga-start && \
+    chmod 0755 /rootfs/usr/local/sbin/unbounded-qga-start && \
+    printf '%s\n' \
+      '[Unit]' \
+      'Description=QEMU Guest Agent' \
+      'After=systemd-modules-load.service' \
+      '' \
+      '[Service]' \
+      'Type=simple' \
+      'ExecStart=/usr/local/sbin/unbounded-qga-start' \
+      'Restart=always' \
+      'RestartSec=5' \
+      '' \
+      '[Install]' \
+      'WantedBy=multi-user.target' \
+      > /rootfs/etc/systemd/system/qemu-guest-agent.service
+
+RUN set -eux; \
+    echo azurelinux > /rootfs/etc/hostname; \
+    : > /rootfs/etc/machine-id; \
+    rm -f /rootfs/etc/resolv.conf; \
+    printf '%s\n' 'nameserver 8.8.8.8' > /rootfs/etc/resolv.conf; \
+    printf '%s\n' 'datasource_list: [NoCloud]' \
+      > /rootfs/etc/cloud/cloud.cfg.d/99-unbounded.cfg; \
+    printf '%s\n' 'policy: enabled' \
+      > /rootfs/etc/cloud/ds-identify.cfg
+RUN set -eux; \
+    systemctl --root=/rootfs enable \
+      unbounded-metal-modules.service \
+      unbounded-metal-sysctl.service \
+      systemd-networkd.service \
+      cloud-init-local.service cloud-init.service cloud-config.service cloud-final.service \
+      qemu-guest-agent.service; \
+    rm -rf /rootfs/var/cache/tdnf/* /rootfs/tmp/* /rootfs/var/tmp/* /rootfs/var/log/*; \
+    tar -C /rootfs -cf /rootfs.tar .
+
+# Assemble the raw GPT disk image using libguestfs. This avoids loop mounts,
+# which are not available in most Docker build environments.
+FROM docker.io/library/ubuntu:24.04 AS diskbuild
+
+ARG DISK_SIZE=8192M
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates cpio dosfstools e2fsprogs libguestfs-tools \
+      linux-image-generic pigz qemu-utils && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=azurebuild /rootfs.tar /tmp/rootfs.tar
+COPY --from=azurebuild /artifacts /artifacts
+
+RUN mkdir -p /disk/grub /disk/boot/grub2 /disk/cloud-init && \
+    cp /artifacts/vmlinuz /artifacts/initrd /artifacts/init.cpio \
+       /artifacts/bootx64.efi /artifacts/grubx64.efi /artifacts/mmx64.efi /disk/
+
+COPY images/host-azurelinux3/assets/grub.cfg.tmpl    /disk/grub/grub.cfg.tmpl
+COPY images/host-azurelinux3/assets/grub.cfg.tmpl    /disk/boot/grub2/grub.cfg.tmpl
+COPY images/host-azurelinux3/assets/meta-data.tmpl   /disk/cloud-init/meta-data.tmpl
+COPY images/host-azurelinux3/assets/vendor-data.tmpl /disk/cloud-init/vendor-data.tmpl
+
+RUN echo "dhcpBootImageName: bootx64.efi" > /disk/metadata.yaml
+
+RUN truncate -s "${DISK_SIZE}" /tmp/disk.img && \
+    printf '%s\n' \
+      'search --no-floppy --set=root --label AZLROOT' \
+      'configfile /boot/grub2/grub.cfg' \
+      > /tmp/efi-grub.cfg && \
+    printf '%s\n' \
+      'run' \
+      'part-init /dev/sda gpt' \
+      'part-add /dev/sda p 2048 206847' \
+      'part-add /dev/sda p 206848 -2048' \
+      'part-set-gpt-type /dev/sda 1 C12A7328-F81F-11D2-BA4B-00A0C93EC93B' \
+      'part-set-bootable /dev/sda 1 true' \
+      'mkfs vfat /dev/sda1 label:AZLEFI' \
+      'mkfs ext4 /dev/sda2 label:AZLROOT' \
+      'mount /dev/sda2 /' \
+      'tar-in /tmp/rootfs.tar /' \
+      'mkdir-p /boot/efi' \
+      'mount /dev/sda1 /boot/efi' \
+      'mkdir-p /boot/efi/EFI/BOOT' \
+      'mkdir-p /boot/efi/boot/grub2' \
+      'copy-in /artifacts/bootx64.efi /boot/efi/EFI/BOOT' \
+      'copy-in /artifacts/grubx64.efi /boot/efi/EFI/BOOT' \
+      'copy-in /artifacts/mmx64.efi /boot/efi/EFI/BOOT' \
+      'copy-in /tmp/efi-grub.cfg /boot/efi/EFI/BOOT' \
+      'copy-in /tmp/efi-grub.cfg /boot/efi/boot/grub2' \
+      'mv /boot/efi/EFI/BOOT/efi-grub.cfg /boot/efi/EFI/BOOT/grub.cfg' \
+      'mv /boot/efi/boot/grub2/efi-grub.cfg /boot/efi/boot/grub2/grub.cfg' \
+      > /tmp/disk.guestfish && \
+    LIBGUESTFS_BACKEND=direct guestfish -a /tmp/disk.img -f /tmp/disk.guestfish
+RUN pigz -1 /tmp/disk.img && mv /tmp/disk.img.gz /disk/disk.img.gz
+
+COPY --from=gobuilder /unbounded-agent /disk/unbounded-agent
+
+FROM scratch
+COPY --from=diskbuild /disk /disk

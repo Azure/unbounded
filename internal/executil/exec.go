@@ -165,6 +165,13 @@ func AptGet() func(context.Context) *exec.Cmd {
 	}
 }
 
+// DNF returns a command factory for dnf.
+func DNF() func(context.Context) *exec.Cmd {
+	return func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "dnf")
+	}
+}
+
 // Ip returns a command factory for the ip networking utility.
 func Ip() func(context.Context) *exec.Cmd {
 	return func(ctx context.Context) *exec.Cmd {
@@ -190,6 +197,13 @@ func Mountpoint() func(context.Context) *exec.Cmd {
 func Sysctl() func(context.Context) *exec.Cmd {
 	return func(ctx context.Context) *exec.Cmd {
 		return exec.CommandContext(ctx, "sysctl")
+	}
+}
+
+// TDNF returns a command factory for tdnf.
+func TDNF() func(context.Context) *exec.Cmd {
+	return func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "tdnf")
 	}
 }
 

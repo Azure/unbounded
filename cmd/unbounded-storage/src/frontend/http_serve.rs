@@ -37,7 +37,9 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE};
+use ::http::header::{
+    ACCEPT_RANGES, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, ETAG,
+};
 use ::http::{Response, StatusCode};
 
 use crate::bufferpool::{BufferPool, Error, ReadStream, StripeKey, StripePlan};
@@ -366,11 +368,18 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     };
 
     let mut verify_attempts = 0;
-    let (len, cache_key_version, origin_match_version, resolved) = loop {
+    let (meta, cache_key_version, origin_match_version, resolved) = loop {
         // 5. Resolve object metadata through the pool. The HTTP backend
         // fills it from an origin HEAD on a miss or after a backend-provided
-        // TTL expires.
-        let meta = read_object_metadata(pool, backend_id, &path, page_size, !is_head)
+        // TTL expires. The first read honors that TTL: forcing a re-HEAD on
+        // every GET would defeat the cache and serialize hot objects behind
+        // an origin round-trip. Correctness for versioned bodies is upheld
+        // by the verify pass below, which does a conditional GET (If-Match
+        // on the cached ETag); a stale ETag returns 412 and we retry. Only
+        // that retry forces a re-HEAD, because re-reading the same stale
+        // metadata would loop on the same stale If-Match.
+        let force_refresh = verify_attempts > 0;
+        let meta = read_object_metadata(pool, backend_id, &path, page_size, force_refresh)
             .await
             .map_err(|_| ())?;
         let len = meta.length;
@@ -398,7 +407,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         };
 
         if is_head || cache_key_version.is_none() || resolved.len() == 0 {
-            break (len, cache_key_version, origin_match_version, resolved);
+            break (meta, cache_key_version, origin_match_version, resolved);
         }
 
         let verify_result = match process_body(
@@ -436,7 +445,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         };
 
         match verify_result {
-            Ok(()) => break (len, cache_key_version, origin_match_version, resolved),
+            Ok(()) => break (meta, cache_key_version, origin_match_version, resolved),
             Err(Error::OriginVersionMismatch)
                 if verify_attempts + 1 < VERSIONED_BODY_VERIFY_ATTEMPTS =>
             {
@@ -451,12 +460,13 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
             }
         }
     };
+    let len = meta.length;
 
     // 7. Response head: 206 if the client sent a Range, else 200.
     let head = if range.is_some() {
-        partial_head(resolved, len)
+        partial_head(resolved, &meta)
     } else {
-        full_head(len)
+        full_head(&meta)
     };
     outcome.status = if range.is_some() { 206 } else { 200 };
     // HEAD carries no body, so no body bytes are streamed to the client;
@@ -897,10 +907,11 @@ async fn read_object_metadata<P: BufferPool<Req = StripeReq>>(
 }
 
 /// Format the `200 OK` head for serving a whole object.
-fn full_head(len: u64) -> Vec<u8> {
-    let resp = Response::builder()
+fn full_head(meta: &ObjectMetadata) -> Vec<u8> {
+    let builder = response_metadata_headers(Response::builder(), meta);
+    let resp = builder
         .status(StatusCode::OK)
-        .header(CONTENT_LENGTH, len.to_string())
+        .header(CONTENT_LENGTH, meta.length.to_string())
         .header(ACCEPT_RANGES, "bytes")
         .header(CONNECTION, "close")
         .body(())
@@ -910,19 +921,38 @@ fn full_head(len: u64) -> Vec<u8> {
 
 /// Format the `206 Partial Content` head for a resolved byte range.
 /// `END` in `Content-Range` is inclusive (`resolved.end - 1`).
-fn partial_head(resolved: ResolvedRange, total: u64) -> Vec<u8> {
+fn partial_head(resolved: ResolvedRange, meta: &ObjectMetadata) -> Vec<u8> {
     let start = resolved.start;
     let end_incl = resolved.end - 1;
     let clen = resolved.len();
-    let resp = Response::builder()
+    let builder = response_metadata_headers(Response::builder(), meta);
+    let resp = builder
         .status(StatusCode::PARTIAL_CONTENT)
-        .header(CONTENT_RANGE, format!("bytes {start}-{end_incl}/{total}"))
+        .header(
+            CONTENT_RANGE,
+            format!("bytes {start}-{end_incl}/{}", meta.length),
+        )
         .header(CONTENT_LENGTH, clen.to_string())
         .header(ACCEPT_RANGES, "bytes")
         .header(CONNECTION, "close")
         .body(())
         .expect("valid partial-content response head");
     serialize_response_head(&resp)
+}
+
+fn response_metadata_headers(
+    mut builder: ::http::response::Builder,
+    meta: &ObjectMetadata,
+) -> ::http::response::Builder {
+    if let Some(etag) = meta.etag() {
+        builder = builder.header(ETAG, etag);
+    }
+    if meta.etag().is_some() {
+        if let Some(cache_control) = meta.cache_control() {
+            builder = builder.header(CACHE_CONTROL, cache_control);
+        }
+    }
+    builder
 }
 
 /// Format a `416 Range Not Satisfiable` head with `Content-Range: bytes
@@ -982,7 +1012,7 @@ mod tests {
 
     #[test]
     fn full_head_exact_bytes() {
-        let head = full_head(4096);
+        let head = full_head(&ObjectMetadata::new(4096));
         let s = std::str::from_utf8(&head).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "got: {s}");
         assert!(s.contains("content-length: 4096\r\n"), "got: {s}");
@@ -992,9 +1022,40 @@ mod tests {
     }
 
     #[test]
+    fn full_head_includes_strong_validator_metadata() {
+        let meta = ObjectMetadata::from_origin_head(
+            4096,
+            Some("\"etag-1\""),
+            Some("public, max-age=60"),
+            100,
+        );
+        let head = full_head(&meta);
+        let s = std::str::from_utf8(&head).unwrap();
+
+        assert!(s.contains("etag: \"etag-1\"\r\n"), "got: {s}");
+        assert!(
+            s.contains("cache-control: public, max-age=60\r\n"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn full_head_omits_unvalidated_local_cache_metadata() {
+        let meta = ObjectMetadata::from_origin_head(4096, None, Some("max-age=60"), 100);
+        let head = full_head(&meta);
+        let s = std::str::from_utf8(&head).unwrap();
+
+        assert!(!s.contains("etag:"), "got: {s}");
+        assert!(!s.contains("cache-control:"), "got: {s}");
+    }
+
+    #[test]
     fn partial_head_exact_bytes_inclusive_end() {
         // Resolved [0, 100) of a 1000-byte object -> bytes 0-99/1000.
-        let head = partial_head(ResolvedRange { start: 0, end: 100 }, 1000);
+        let head = partial_head(
+            ResolvedRange { start: 0, end: 100 },
+            &ObjectMetadata::new(1000),
+        );
         let s = std::str::from_utf8(&head).unwrap();
         assert!(
             s.starts_with("HTTP/1.1 206 Partial Content\r\n"),
@@ -1015,7 +1076,7 @@ mod tests {
                 start: 70,
                 end: 100,
             },
-            100,
+            &ObjectMetadata::new(100),
         );
         let s = std::str::from_utf8(&head).unwrap();
         assert!(s.contains("content-range: bytes 70-99/100\r\n"), "got: {s}");

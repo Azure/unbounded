@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"fmt"
 	"log/slog"
+	"os/exec"
 	"strings"
 
 	"github.com/Azure/unbounded/internal/executil"
@@ -34,8 +35,6 @@ type installPackages struct {
 }
 
 // InstallPackages returns a task that installs the required OS packages on the host.
-//
-// TODO: support package managers beyond apt (e.g. dnf, zypper) for non-Debian distros.
 func InstallPackages(log *slog.Logger) phases.Task {
 	return &installPackages{log: log}
 }
@@ -43,12 +42,15 @@ func InstallPackages(log *slog.Logger) phases.Task {
 func (ip *installPackages) Name() string { return "install-packages" }
 
 func (ip *installPackages) Do(ctx context.Context) error {
-	aptGet := executil.AptGet()
+	pm, err := detectPackageManager()
+	if err != nil {
+		return err
+	}
 
 	var missing []string
 
 	for _, pkg := range requiredPackages {
-		if !isDebianPackageInstalled(ctx, ip.log, pkg) {
+		if !pm.isInstalled(ctx, ip.log, pkg) {
 			missing = append(missing, pkg)
 		}
 	}
@@ -57,16 +59,87 @@ func (ip *installPackages) Do(ctx context.Context) error {
 		return nil
 	}
 
-	// Refresh the package index before installing.
-	if err := executil.RunCmd(ctx, ip.log, aptGet, "update", "-y"); err != nil {
+	if err := pm.install(ctx, ip.log, missing); err != nil {
+		return fmt.Errorf("%s install %s: %w", pm.name, strings.Join(missing, " "), err)
+	}
+
+	return nil
+}
+
+type packageManager struct {
+	name        string
+	isInstalled func(context.Context, *slog.Logger, string) bool
+	install     func(context.Context, *slog.Logger, []string) error
+}
+
+func detectPackageManager() (*packageManager, error) {
+	return packageManagerForCommands(func(name string) bool {
+		_, err := exec.LookPath(name)
+
+		return err == nil
+	})
+}
+
+func packageManagerForCommands(hasCommand func(string) bool) (*packageManager, error) {
+	if hasCommand("apt-get") && hasCommand("dpkg-query") {
+		return &packageManager{
+			name:        "apt-get",
+			isInstalled: isDebianPackageInstalled,
+			install:     installDebianPackages,
+		}, nil
+	}
+
+	if hasCommand("tdnf") && hasCommand("rpm") {
+		return &packageManager{
+			name:        "tdnf",
+			isInstalled: isRPMPackageInstalled,
+			install:     installTDNFPackages,
+		}, nil
+	}
+
+	if hasCommand("dnf") && hasCommand("rpm") {
+		return &packageManager{
+			name:        "dnf",
+			isInstalled: isRPMPackageInstalled,
+			install:     installDNFPackages,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("no supported package manager found: need apt-get/dpkg-query, tdnf/rpm, or dnf/rpm")
+}
+
+func installDebianPackages(ctx context.Context, log *slog.Logger, missing []string) error {
+	aptGet := executil.AptGet()
+
+	if err := executil.RunCmd(ctx, log, aptGet, "update", "-y"); err != nil {
 		return fmt.Errorf("apt-get update: %w", err)
 	}
 
-	// Install all missing packages in a single invocation.
 	args := append([]string{"install", "-y", "--no-install-recommends"}, missing...)
+	if err := executil.RunCmd(ctx, log, aptGet, args...); err != nil {
+		return fmt.Errorf("apt-get install: %w", err)
+	}
 
-	if err := executil.RunCmd(ctx, ip.log, aptGet, args...); err != nil {
-		return fmt.Errorf("apt-get install %s: %w", strings.Join(missing, " "), err)
+	return nil
+}
+
+func installTDNFPackages(ctx context.Context, log *slog.Logger, missing []string) error {
+	args := append([]string{"install", "-y", "--refresh"}, missing...)
+	if err := executil.RunCmd(ctx, log, executil.TDNF(), args...); err != nil {
+		return fmt.Errorf("tdnf install: %w", err)
+	}
+
+	return nil
+}
+
+func installDNFPackages(ctx context.Context, log *slog.Logger, missing []string) error {
+	if err := executil.RunCmd(ctx, log, executil.DNF(), "makecache"); err != nil {
+		return fmt.Errorf("dnf makecache: %w", err)
+	}
+
+	args := append([]string{"install", "-y", "--setopt=install_weak_deps=False"}, missing...)
+	if err := executil.RunCmd(ctx, log, executil.DNF(), args...); err != nil {
+		return fmt.Errorf("dnf install: %w", err)
 	}
 
 	return nil
@@ -83,6 +156,12 @@ func isDebianPackageInstalled(ctx context.Context, log *slog.Logger, pkg string)
 	}
 
 	return strings.TrimSpace(output) == "installed"
+}
+
+func isRPMPackageInstalled(ctx context.Context, log *slog.Logger, pkg string) bool {
+	_, err := executil.OutputCmdAt(ctx, log, slog.LevelDebug, "rpm", "-q", pkg)
+
+	return err == nil
 }
 
 // Kubernetes sysctl settings. Inside systemd-nspawn, /proc/sys is a read-only

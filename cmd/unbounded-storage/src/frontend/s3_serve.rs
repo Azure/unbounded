@@ -30,7 +30,9 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE};
+use ::http::header::{
+    ACCEPT_RANGES, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+};
 use ::http::{Response, StatusCode};
 
 use crate::bufferpool::{BufferPool, Error, StripePlan};
@@ -385,12 +387,18 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     };
 
     let mut verify_attempts = 0;
-    let (len, cache_key_version, origin_match_version, resolved) = loop {
+    let (meta, cache_key_version, origin_match_version, resolved) = loop {
         // 5. Resolve object length, distinguishing a missing origin object
         // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
         // the plain HTTP frontend, a length-read failure is never a silently
-        // dropped connection.
-        let meta = match read_object_metadata_s3(pool, backend_id, &path, page_size, !is_head).await
+        // dropped connection. The first read honors the backend TTL; only a
+        // verify retry (below) forces a re-HEAD. See the matching note in the
+        // HTTP frontend: forcing a re-HEAD on every GET would defeat the
+        // cache, and versioned-body correctness comes from the verify pass's
+        // conditional GET, not from re-HEADing here.
+        let force_refresh = verify_attempts > 0;
+        let meta = match read_object_metadata_s3(pool, backend_id, &path, page_size, force_refresh)
+            .await
         {
             LenResult::Metadata(m) => m,
             LenResult::NotFound => {
@@ -456,7 +464,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
         };
 
         if is_head || cache_key_version.is_none() || resolved.len() == 0 {
-            break (len, cache_key_version, origin_match_version, resolved);
+            break (meta, cache_key_version, origin_match_version, resolved);
         }
 
         let verify_result = match process_body_s3(
@@ -492,7 +500,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
         };
 
         match verify_result {
-            Ok(()) => break (len, cache_key_version, origin_match_version, resolved),
+            Ok(()) => break (meta, cache_key_version, origin_match_version, resolved),
             Err(Error::OriginVersionMismatch)
                 if verify_attempts + 1 < VERSIONED_BODY_VERIFY_ATTEMPTS =>
             {
@@ -514,12 +522,13 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
             }
         }
     };
+    let len = meta.length;
 
     // 7. Response head: 206 if the client sent a Range, else 200.
     let head = if range.is_some() {
-        partial_head(resolved, len, &request_id)
+        partial_head(resolved, &meta, &request_id)
     } else {
-        full_head(len, &request_id)
+        full_head(&meta, &request_id)
     };
     outcome.status = if range.is_some() { 206 } else { 200 };
     // HEAD carries no body, so no body bytes are streamed to the client;
@@ -712,10 +721,11 @@ async fn read_object_metadata_s3<P: BufferPool<Req = StripeReq>>(
 }
 
 /// Format the `200 OK` head for serving a whole object.
-fn full_head(len: u64, request_id: &str) -> Vec<u8> {
-    let resp = Response::builder()
+fn full_head(meta: &ObjectMetadata, request_id: &str) -> Vec<u8> {
+    let builder = response_metadata_headers(Response::builder(), meta);
+    let resp = builder
         .status(StatusCode::OK)
-        .header(CONTENT_LENGTH, len.to_string())
+        .header(CONTENT_LENGTH, meta.length.to_string())
         .header(ACCEPT_RANGES, "bytes")
         .header(X_AMZ_REQUEST_ID, request_id)
         .header(CONNECTION, "close")
@@ -726,13 +736,17 @@ fn full_head(len: u64, request_id: &str) -> Vec<u8> {
 
 /// Format the `206 Partial Content` head for a resolved byte range.
 /// `END` in `Content-Range` is inclusive (`resolved.end - 1`).
-fn partial_head(resolved: ResolvedRange, total: u64, request_id: &str) -> Vec<u8> {
+fn partial_head(resolved: ResolvedRange, meta: &ObjectMetadata, request_id: &str) -> Vec<u8> {
     let start = resolved.start;
     let end_incl = resolved.end - 1;
     let clen = resolved.len();
-    let resp = Response::builder()
+    let builder = response_metadata_headers(Response::builder(), meta);
+    let resp = builder
         .status(StatusCode::PARTIAL_CONTENT)
-        .header(CONTENT_RANGE, format!("bytes {start}-{end_incl}/{total}"))
+        .header(
+            CONTENT_RANGE,
+            format!("bytes {start}-{end_incl}/{}", meta.length),
+        )
         .header(CONTENT_LENGTH, clen.to_string())
         .header(ACCEPT_RANGES, "bytes")
         .header(X_AMZ_REQUEST_ID, request_id)
@@ -740,6 +754,21 @@ fn partial_head(resolved: ResolvedRange, total: u64, request_id: &str) -> Vec<u8
         .body(())
         .expect("valid partial-content response head");
     serialize_response_head(&resp)
+}
+
+fn response_metadata_headers(
+    mut builder: ::http::response::Builder,
+    meta: &ObjectMetadata,
+) -> ::http::response::Builder {
+    if let Some(etag) = meta.etag() {
+        builder = builder.header(ETAG, etag);
+    }
+    if meta.etag().is_some() {
+        if let Some(cache_control) = meta.cache_control() {
+            builder = builder.header(CACHE_CONTROL, cache_control);
+        }
+    }
+    builder
 }
 
 /// Build the full byte response for an S3 error.
@@ -835,7 +864,7 @@ mod tests {
 
     #[test]
     fn full_head_has_request_id_and_accept_ranges() {
-        let head = full_head(4096, "deadbeef");
+        let head = full_head(&ObjectMetadata::new(4096), "deadbeef");
         let s = std::str::from_utf8(&head).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "got: {s}");
         assert!(s.contains("content-length: 4096\r\n"), "got: {s}");
@@ -846,8 +875,40 @@ mod tests {
     }
 
     #[test]
+    fn full_head_includes_strong_validator_metadata() {
+        let meta = ObjectMetadata::from_origin_head(
+            4096,
+            Some("\"etag-1\""),
+            Some("public, max-age=60"),
+            100,
+        );
+        let head = full_head(&meta, "deadbeef");
+        let s = std::str::from_utf8(&head).unwrap();
+
+        assert!(s.contains("etag: \"etag-1\"\r\n"), "got: {s}");
+        assert!(
+            s.contains("cache-control: public, max-age=60\r\n"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn full_head_omits_unvalidated_local_cache_metadata() {
+        let meta = ObjectMetadata::from_origin_head(4096, None, Some("max-age=60"), 100);
+        let head = full_head(&meta, "deadbeef");
+        let s = std::str::from_utf8(&head).unwrap();
+
+        assert!(!s.contains("etag:"), "got: {s}");
+        assert!(!s.contains("cache-control:"), "got: {s}");
+    }
+
+    #[test]
     fn partial_head_inclusive_end_and_request_id() {
-        let head = partial_head(ResolvedRange { start: 0, end: 100 }, 1000, "id1");
+        let head = partial_head(
+            ResolvedRange { start: 0, end: 100 },
+            &ObjectMetadata::new(1000),
+            "id1",
+        );
         let s = std::str::from_utf8(&head).unwrap();
         assert!(
             s.starts_with("HTTP/1.1 206 Partial Content\r\n"),
