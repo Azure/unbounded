@@ -81,8 +81,11 @@ impl ConfigDiff {
     }
 
     /// Whether the routing surface must be rebuilt and republished.
-    /// Neighborhood changes alter the projected route table directly;
-    /// cache changes can move request traffic between neighborhoods.
+    /// Neighborhood changes alter the projected route table directly.
+    /// Cache diffs are intentionally conservative: disk-only changes do not
+    /// affect routes, but cache source changes can move request traffic
+    /// between neighborhoods and peers, so the whole cache section reloads the
+    /// projected routing surface for now.
     pub fn requires_routing_reload(&self) -> bool {
         self.neighborhoods_changed || self.caches_changed
     }
