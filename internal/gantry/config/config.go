@@ -258,6 +258,15 @@ type Config struct {
 	// `topology.kubernetes.io/zone` (the design doc).
 	ZoneLabelKey string `yaml:"zone_label_key"`
 
+	// CoordPeerAuthzEnforce flips coord peer authorization from
+	// observe-only (record the unauthorized-peer metric, still serve) to
+	// enforce (reject inbound coord requests whose libp2p peer ID is not
+	// in the membership view). Default false: ship observe-only first,
+	// verify peer-id annotations are visible for every ready Gantry pod,
+	// size p2p_coord_unauthorized_peer_total across a full rollout, then
+	// flip to true once it stays at zero.
+	CoordPeerAuthzEnforce bool `yaml:"coord_peer_authz_enforce"`
+
 	// CoordMaxDigestsPerRequest caps a single please_pull batch. The default
 	// 256 is intentionally far above normal manifest child counts while staying
 	// well below the 1 MiB coord envelope budget.
@@ -391,6 +400,7 @@ func NewDefault() *Config {
 		HRWTopologyScope: "cluster",
 		ZoneLabelKey:     "topology.kubernetes.io/zone",
 
+		CoordPeerAuthzEnforce:     false,
 		CoordMaxDigestsPerRequest: 256,
 		CoordMaxConcurrentPulls:   16,
 
@@ -502,6 +512,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("HRW_K", &c.HRWK)
 	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
 	setStr("ZONE_LABEL_KEY", &c.ZoneLabelKey)
+	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
 	setInt("COORD_MAX_DIGESTS_PER_REQUEST", &c.CoordMaxDigestsPerRequest)
 	setInt("COORD_MAX_CONCURRENT_PULLS", &c.CoordMaxConcurrentPulls)
 
@@ -557,6 +568,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "HRW top-K size")
 	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, `HRW scope: "cluster" or "zone"`)
 	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "Kubernetes node label identifying the zone (used when hrw-topology-scope=zone)")
+	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "reject inbound coord requests from peers not in the membership view (default false = observe-only)")
 	fs.IntVar(&c.CoordMaxDigestsPerRequest, "coord-max-digests-per-request", c.CoordMaxDigestsPerRequest, "maximum digests accepted in one please_pull batch")
 	fs.IntVar(&c.CoordMaxConcurrentPulls, "coord-max-concurrent-pulls", c.CoordMaxConcurrentPulls, "maximum background origin pulls started by inbound please_pull")
 
