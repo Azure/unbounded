@@ -96,6 +96,7 @@ func loadSourceConfig(sourceDir string) (*storageconfig.Config, error) {
 // rebinds the TCP fabric address to the node's own routable address.
 func applyRing(cfg *storageconfig.Config, ring ringState) {
 	injected := false
+
 	for _, neighborhood := range cfg.Neighborhoods {
 		if neighborhood == nil {
 			continue

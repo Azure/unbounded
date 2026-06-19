@@ -178,21 +178,18 @@ message CacheSpec {
 }
 
 message DiskSpec {
-  reserved 1, 4;
-  reserved "path", "numa";
-
   // Optional io_uring queue depth override for this disk.
-  optional uint32 queue_depth = 2;
+  optional uint32 queue_depth = 1;
 
   // Optional cache page size override in bytes; defaults to the storage engine page size.
-  optional uint64 page_size_bytes = 3;
+  optional uint64 page_size_bytes = 2;
 
   // Skips the recovery scan when no metadata page is valid; intended only for fresh or benchmark disks.
-  bool skip_recovery_scan = 5;
+  bool skip_recovery_scan = 3;
 
   oneof config {
-    BlockDiskConfig block = 6;
-    FileDiskConfig file = 7;
+    BlockDiskConfig block = 4;
+    FileDiskConfig file = 5;
   }
 }
 

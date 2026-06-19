@@ -1116,11 +1116,11 @@ func (x *CacheSpec) GetDisks() []*DiskSpec {
 type DiskSpec struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Optional io_uring queue depth override for this disk.
-	QueueDepth *uint32 `protobuf:"varint,2,opt,name=queue_depth,json=queueDepth,proto3,oneof" json:"queue_depth,omitempty"`
+	QueueDepth *uint32 `protobuf:"varint,1,opt,name=queue_depth,json=queueDepth,proto3,oneof" json:"queue_depth,omitempty"`
 	// Optional cache page size override in bytes; defaults to the storage engine page size.
-	PageSizeBytes *uint64 `protobuf:"varint,3,opt,name=page_size_bytes,json=pageSizeBytes,proto3,oneof" json:"page_size_bytes,omitempty"`
+	PageSizeBytes *uint64 `protobuf:"varint,2,opt,name=page_size_bytes,json=pageSizeBytes,proto3,oneof" json:"page_size_bytes,omitempty"`
 	// Skips the recovery scan when no metadata page is valid; intended only for fresh or benchmark disks.
-	SkipRecoveryScan bool `protobuf:"varint,5,opt,name=skip_recovery_scan,json=skipRecoveryScan,proto3" json:"skip_recovery_scan,omitempty"`
+	SkipRecoveryScan bool `protobuf:"varint,3,opt,name=skip_recovery_scan,json=skipRecoveryScan,proto3" json:"skip_recovery_scan,omitempty"`
 	// Types that are valid to be assigned to Config:
 	//
 	//	*DiskSpec_Block
@@ -1211,11 +1211,11 @@ type isDiskSpec_Config interface {
 }
 
 type DiskSpec_Block struct {
-	Block *BlockDiskConfig `protobuf:"bytes,6,opt,name=block,proto3,oneof"`
+	Block *BlockDiskConfig `protobuf:"bytes,4,opt,name=block,proto3,oneof"`
 }
 
 type DiskSpec_File struct {
-	File *FileDiskConfig `protobuf:"bytes,7,opt,name=file,proto3,oneof"`
+	File *FileDiskConfig `protobuf:"bytes,5,opt,name=file,proto3,oneof"`
 }
 
 func (*DiskSpec_Block) isDiskSpec_Config() {}
@@ -2074,17 +2074,17 @@ const file_config_proto_rawDesc = "" +
 	"\tCacheSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06source\x18\x02 \x01(\tR\x06source\x128\n" +
-	"\x05disks\x18\x03 \x03(\v2\".unbounded.storage.config.DiskSpecR\x05disks\"\xd4\x02\n" +
+	"\x05disks\x18\x03 \x03(\v2\".unbounded.storage.config.DiskSpecR\x05disks\"\xbc\x02\n" +
 	"\bDiskSpec\x12$\n" +
-	"\vqueue_depth\x18\x02 \x01(\rH\x01R\n" +
+	"\vqueue_depth\x18\x01 \x01(\rH\x01R\n" +
 	"queueDepth\x88\x01\x01\x12+\n" +
-	"\x0fpage_size_bytes\x18\x03 \x01(\x04H\x02R\rpageSizeBytes\x88\x01\x01\x12,\n" +
-	"\x12skip_recovery_scan\x18\x05 \x01(\bR\x10skipRecoveryScan\x12A\n" +
-	"\x05block\x18\x06 \x01(\v2).unbounded.storage.config.BlockDiskConfigH\x00R\x05block\x12>\n" +
-	"\x04file\x18\a \x01(\v2(.unbounded.storage.config.FileDiskConfigH\x00R\x04fileB\b\n" +
+	"\x0fpage_size_bytes\x18\x02 \x01(\x04H\x02R\rpageSizeBytes\x88\x01\x01\x12,\n" +
+	"\x12skip_recovery_scan\x18\x03 \x01(\bR\x10skipRecoveryScan\x12A\n" +
+	"\x05block\x18\x04 \x01(\v2).unbounded.storage.config.BlockDiskConfigH\x00R\x05block\x12>\n" +
+	"\x04file\x18\x05 \x01(\v2(.unbounded.storage.config.FileDiskConfigH\x00R\x04fileB\b\n" +
 	"\x06configB\x0e\n" +
 	"\f_queue_depthB\x12\n" +
-	"\x10_page_size_bytesJ\x04\b\x01\x10\x02J\x04\b\x04\x10\x05R\x04pathR\x04numa\"G\n" +
+	"\x10_page_size_bytes\"G\n" +
 	"\x0fBlockDiskConfig\x12\x17\n" +
 	"\x04numa\x18\x01 \x01(\rH\x00R\x04numa\x88\x01\x01\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04pathB\a\n" +
