@@ -112,8 +112,8 @@ const (
 
 	// Default OCI images for the nspawn rootfs when no image is explicitly
 	// configured or set via AGENT_OCI_IMAGE.
-	DefaultOCIImage      = "ghcr.io/azure/agent-ubuntu2404:v20260427"
-	DefaultNvidiaOCImage = "ghcr.io/azure/agent-ubuntu2404-nvidia:v20260427"
+	DefaultOCIImage      = "ghcr.io/azure/agent-ubuntu2404:v20260619"
+	DefaultNvidiaOCImage = "ghcr.io/azure/agent-ubuntu2404-nvidia:v20260619"
 
 	SystemdUnitContainerd   = "containerd.service"
 	ContainerdConfigPath    = "/etc/containerd/config.toml"

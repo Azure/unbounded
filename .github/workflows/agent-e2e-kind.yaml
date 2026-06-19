@@ -65,10 +65,10 @@ jobs:
           # e2e can boot directly as the host VM.
           - host-base-os: fedora
             nspawn-base-os: azlinux3
-            nspawn-oci-image: ghcr.io/azure/agent-azlinux3:74b229eb99792fb46b3d5757e17df1a39225f091
+            nspawn-oci-image: ghcr.io/azure/agent-azlinux3:v20260619
           - host-base-os: ubuntu2604
             nspawn-base-os: ubuntu2604
-            nspawn-oci-image: ghcr.io/azure/agent-ubuntu2604:16840beaa438c76540b1b819f7a0265deac5ef5a
+            nspawn-oci-image: ghcr.io/azure/agent-ubuntu2604:v20260619
     env:
       KIND_CLUSTER_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
       VM_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
