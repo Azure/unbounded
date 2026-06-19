@@ -17,6 +17,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/oci"
 )
 
 // Client implements ifaces.PeerDialer over HTTP/2 cleartext (h2c).
@@ -133,8 +134,11 @@ func buildPeerURL(peerAddr string, ref ifaces.OriginRef) (string, error) {
 	repo := ref.Repository
 	if repo == "" {
 		// Peer endpoint doesn't actually use the repo path, but OCI URL
-		// shape requires one. Use a placeholder.
-		repo = "_"
+		// shape requires one. Use a valid placeholder so our own transfer
+		// server's repository validation accepts the URL.
+		repo = "gantry"
+	} else if err := oci.ValidateRepositoryName(repo); err != nil {
+		return "", err
 	}
 	// Construct: http://<peerAddr>/v2/<repo>/{manifests|blobs}/<digest>
 	return "http://" + peerAddr + "/v2/" + repo + "/" + kind + "/" + ref.Digest.String(), nil
