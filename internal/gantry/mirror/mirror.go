@@ -49,6 +49,8 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/oci"
 )
 
+const providerFailureSweepInterval = time.Minute
+
 // Server is the mirror HTTP handler.
 type Server struct {
 	cfg     *config.Config
@@ -89,13 +91,14 @@ type Server struct {
 	selfNodeID       ifaces.NodeID
 	selfPeerID       ifaces.NodeID
 
-	staleProviderTTL     time.Duration
-	unavailablePeerTTL   time.Duration
-	suspiciousPeerTTL    time.Duration
-	providerFailureMu    sync.Mutex
-	staleProviders       map[providerDigestKey]time.Time
-	suspiciousProviders  map[providerDigestKey]time.Time
-	unavailableProviders map[string]time.Time
+	staleProviderTTL         time.Duration
+	unavailablePeerTTL       time.Duration
+	suspiciousPeerTTL        time.Duration
+	providerFailureMu        sync.Mutex
+	staleProviders           map[providerDigestKey]time.Time
+	suspiciousProviders      map[providerDigestKey]time.Time
+	unavailableProviders     map[string]time.Time
+	nextProviderFailureSweep time.Time
 
 	// defaultUpstream is the upstream to use when exactly one is
 	// configured and ?ns= is absent.
@@ -1585,6 +1588,7 @@ func (s *Server) resolveViaColdStart(ctx context.Context, d digest.Digest, kind 
 
 func (s *Server) filterProvidersForDigest(d digest.Digest, providers []ifaces.Provider) ([]ifaces.Provider, peerAttemptSummary) {
 	now := time.Now()
+	s.sweepProviderFailures(now)
 	filtered := make([]ifaces.Provider, 0, len(providers))
 
 	var summary peerAttemptSummary
@@ -1698,7 +1702,9 @@ func (s *Server) markProviderStale(d digest.Digest, p ifaces.Provider) {
 	s.providerFailureMu.Lock()
 	defer s.providerFailureMu.Unlock()
 
-	s.staleProviders[providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}] = time.Now().Add(s.staleProviderTTL)
+	now := time.Now()
+	s.sweepProviderFailuresLocked(now)
+	s.staleProviders[providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}] = now.Add(s.staleProviderTTL)
 }
 
 func (s *Server) markProviderSuspicious(d digest.Digest, p ifaces.Provider) {
@@ -1709,7 +1715,9 @@ func (s *Server) markProviderSuspicious(d digest.Digest, p ifaces.Provider) {
 	s.providerFailureMu.Lock()
 	defer s.providerFailureMu.Unlock()
 
-	s.suspiciousProviders[providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}] = time.Now().Add(s.suspiciousPeerTTL)
+	now := time.Now()
+	s.sweepProviderFailuresLocked(now)
+	s.suspiciousProviders[providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}] = now.Add(s.suspiciousPeerTTL)
 }
 
 func (s *Server) markProviderUnavailable(p ifaces.Provider) {
@@ -1720,7 +1728,44 @@ func (s *Server) markProviderUnavailable(p ifaces.Provider) {
 	s.providerFailureMu.Lock()
 	defer s.providerFailureMu.Unlock()
 
-	s.unavailableProviders[p.Addr] = time.Now().Add(s.unavailablePeerTTL)
+	now := time.Now()
+	s.sweepProviderFailuresLocked(now)
+	s.unavailableProviders[p.Addr] = now.Add(s.unavailablePeerTTL)
+}
+
+func (s *Server) sweepProviderFailures(now time.Time) {
+	s.providerFailureMu.Lock()
+	defer s.providerFailureMu.Unlock()
+
+	s.sweepProviderFailuresLocked(now)
+}
+
+func (s *Server) sweepProviderFailuresLocked(now time.Time) {
+	if !s.nextProviderFailureSweep.IsZero() && now.Before(s.nextProviderFailureSweep) {
+		return
+	}
+
+	s.nextProviderFailureSweep = now.Add(providerFailureSweepInterval)
+	s.sweepProviderDigestMapLocked(s.staleProviders, now)
+	s.sweepProviderDigestMapLocked(s.suspiciousProviders, now)
+
+	for addr, until := range s.unavailableProviders {
+		if !now.After(until) {
+			continue
+		}
+
+		delete(s.unavailableProviders, addr)
+	}
+}
+
+func (s *Server) sweepProviderDigestMapLocked(m map[providerDigestKey]time.Time, now time.Time) {
+	for key, until := range m {
+		if !now.After(until) {
+			continue
+		}
+
+		delete(m, key)
+	}
 }
 
 func (s *Server) isProviderInWindow(m map[providerDigestKey]time.Time, key providerDigestKey, now time.Time) bool {

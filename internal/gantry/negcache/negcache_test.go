@@ -119,6 +119,46 @@ func TestLookup_ExpiredEntryEvicted(t *testing.T) {
 	}
 }
 
+func TestSweep_EvictsExpiredEntriesWhenDifferentDigestTouched(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0).UTC()
+	nowFn, setNow := fakeClock(start)
+	var sizes []int
+
+	c := New(Options{
+		Initial:       10 * time.Second,
+		Max:           time.Minute,
+		Now:           nowFn,
+		SweepInterval: time.Second,
+		OnSize:        func(n int) { sizes = append(sizes, n) },
+	})
+	dx := mustDigest(t, dA)
+	dy := mustDigest(t, dB)
+
+	c.RecordFailure(dx, ifaces.FailureRateLimited)
+	if got := c.Len(); got != 1 {
+		t.Fatalf("Len after first failure = %d, want 1", got)
+	}
+
+	setNow(start.Add(11 * time.Second))
+	c.RecordFailure(dy, ifaces.FailureTransient)
+
+	if _, ok := c.Lookup(dx); ok {
+		t.Fatal("expired digest still present after unrelated mutation")
+	}
+
+	if _, ok := c.Lookup(dy); !ok {
+		t.Fatal("new digest missing after sweep")
+	}
+
+	if got := c.Len(); got != 1 {
+		t.Fatalf("Len after sweep+new failure = %d, want 1", got)
+	}
+
+	if len(sizes) == 0 || sizes[len(sizes)-1] != 1 {
+		t.Fatalf("OnSize calls = %v, want final size 1", sizes)
+	}
+}
+
 func TestRecordSuccess_ClearsEntry(t *testing.T) {
 	c := New(Options{Initial: 10 * time.Second})
 	d := mustDigest(t, dA)
