@@ -95,15 +95,22 @@ func loadSourceConfig(sourceDir string) (*storageconfig.Config, error) {
 // merges the discovered peer set with each neighborhood's declared peers, and
 // rebinds the TCP fabric address to the node's own routable address.
 func applyRing(cfg *storageconfig.Config, ring ringState) {
+	injected := false
 	for _, neighborhood := range cfg.Neighborhoods {
 		if neighborhood == nil {
 			continue
 		}
 
+		injected = true
+
 		// Preserve YAML-declared neighborhood scalars (fingers_per_node,
 		// local_tags, routing_plan); only stamp in the locally computed node id.
 		neighborhood.LocalNodeId = proto.Uint64(ring.localNodeID)
 		neighborhood.Peers = mergePeers(neighborhood.Peers, ring.peers, ring.localNodeID)
+	}
+
+	if !injected {
+		slog.Warn("ring discovery active but config declares no neighborhoods; discovered storage peers were not injected")
 	}
 
 	if ring.selfListenAddr != "" {

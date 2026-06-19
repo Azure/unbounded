@@ -4,6 +4,8 @@
 package storagesupervisor
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -297,6 +299,43 @@ neighborhoods:
 	assert.Equal(t, uint64(9), neighborhood.GetPeers()[1].GetId())
 	assert.Equal(t, uint64(100), neighborhood.GetPeers()[2].GetId())
 	assert.Equal(t, "10.0.0.100:9000", neighborhood.GetPeers()[2].GetTcp().GetAddr())
+}
+
+func TestRenderConfigActiveRingWarnsWithoutNeighborhoods(t *testing.T) {
+	dir := writeSource(t, `
+startup:
+  fabric:
+    tcp:
+      addr: "0.0.0.0:9000"
+backends:
+  - name: origin
+    fake: {}
+`)
+
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	ring := ringState{
+		active:         true,
+		localNodeID:    42,
+		selfListenAddr: "10.0.0.5:9000",
+		peers: []*storageconfig.PeerSpec{
+			tcpPeer(7, "10.0.0.6:9000"),
+		},
+	}
+
+	data, err := RenderConfig(dir, ring)
+	require.NoError(t, err)
+
+	var cfg storageconfig.Config
+
+	require.NoError(t, proto.Unmarshal(data, &cfg))
+
+	assert.Empty(t, cfg.GetNeighborhoods())
+	assert.Equal(t, "10.0.0.5:9000", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
+	assert.Contains(t, logs.String(), "discovered storage peers were not injected")
 }
 
 func TestRenderConfigMergeDropsCollisionsAndSelf(t *testing.T) {
