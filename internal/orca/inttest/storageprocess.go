@@ -125,7 +125,7 @@ func freeLoopbackPort(t *testing.T) int {
 // proto3-native, so byte sizes are plain integer byte counts and
 // backend/frontend/peer/disk implementations are selected by oneof
 // config table names. The startup-fixed knobs (heap backing, fabric
-// address, forcing the tcp provider) live in the `[startup.*]` sections.
+// bind address, forcing the tcp provider) live in the `[startup.*]` sections.
 func writeStorageConfig(t *testing.T, path, fabricAddr string, localID, peerID int, peerAddr, diskPath, orcaEdge, frontendBind string) {
 	t.Helper()
 
@@ -169,7 +169,7 @@ addr = "%s"
 [startup.memory]
 no_hugepages = true
 
-[startup.fabric]
+[startup.fabric.binds.tcp]
 addr = "%s"
 
 [startup.topology]

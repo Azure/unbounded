@@ -578,7 +578,7 @@ def write_config(
     # config table name.
     #
     # Startup-fixed knobs live in the `[startup]` section of the config:
-    # the fabric address, the per-shard hugepage backing size
+    # the fabric bind address, the per-shard hugepage backing size
     # (memory_total_bytes, leaving the daemon's hugepage default in place), and
     # forcing the libfabric tcp provider (disable_rdma) even on hosts that
     # expose an unusable RDMA HCA in sysfs. They only take effect at process
@@ -629,7 +629,7 @@ addr = "{frontend_addr}"
 # reservation.
 memory_total_bytes = {MEMORY_TOTAL_BYTES}
 
-[startup.fabric]
+[startup.fabric.binds.tcp]
 addr = "{fabric_addr}"
 
 [startup.metrics]
