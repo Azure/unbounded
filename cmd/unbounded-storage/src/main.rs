@@ -115,19 +115,15 @@ fn should_force_tcp_fallback(disable_rdma: bool, hca_count: usize, verbs_availab
 fn startup_to_core_plan_config(topology: &config::TopologyCfg) -> CorePlanConfig {
     let defaults = CorePlanConfig::default();
     CorePlanConfig {
-        nic_workers: if topology.nic_workers == 0 {
-            defaults.nic_workers
-        } else {
-            topology.nic_workers as usize
-        },
-        serving_cores: match topology.serving_cores {
-            0 => None,
-            n => Some(n as usize),
-        },
-        hcas_per_numa: match topology.hcas_per_numa_node {
-            0 => defaults.hcas_per_numa,
-            n => n as usize,
-        },
+        nic_workers: topology
+            .nic_workers
+            .map(|n| n as usize)
+            .unwrap_or(defaults.nic_workers),
+        serving_cores: topology.serving_cores.map(|n| n as usize),
+        hcas_per_numa: topology
+            .hcas_per_numa_node
+            .map(|n| n as usize)
+            .unwrap_or(defaults.hcas_per_numa),
         use_smt_siblings: topology.use_smt_siblings,
         respect_isolated: !topology.ignore_isolated,
         exclude_node_cpu0: !topology.include_node_cpu0,
@@ -247,7 +243,9 @@ fn main() -> ExitCode {
     } else {
         BackingKind::Hugepage2Mb
     };
-    let memory_total_bytes = memory.memory_total_bytes as usize;
+    let memory_total_bytes = memory
+        .memory_total_bytes
+        .expect("memory_total_bytes defaulted") as usize;
 
     let host = Host::discover();
 
@@ -281,10 +279,16 @@ fn main() -> ExitCode {
                 .expect("fabric listen address defaulted")
                 .to_string(),
             rdma_listen_addrs: fabric_cfg.rdma_listen_addrs().map(str::to_string).collect(),
-            progress_threads: fabric_cfg.progress_threads,
-            progress_poll_us: fabric_cfg.progress_poll_us,
-            rpc_worker_threads: fabric_cfg.rpc_worker_threads,
-            max_inflight: fabric_cfg.max_inflight,
+            progress_threads: fabric_cfg
+                .progress_threads
+                .expect("progress_threads defaulted"),
+            progress_poll_us: fabric_cfg
+                .progress_poll_us
+                .expect("progress_poll_us defaulted"),
+            rpc_worker_threads: fabric_cfg
+                .rpc_worker_threads
+                .expect("rpc_worker_threads defaulted"),
+            max_inflight: fabric_cfg.max_inflight.expect("max_inflight defaulted"),
         },
         memory_total_bytes,
         backing_kind,
@@ -1686,9 +1690,9 @@ mod tests {
             include_node_cpu0: true,
             allow_inactive_port: true,
             disable_rdma: true,
-            serving_cores: 12,
-            nic_workers: 6,
-            hcas_per_numa_node: 2,
+            serving_cores: Some(12),
+            nic_workers: Some(6),
+            hcas_per_numa_node: Some(2),
         };
         let cc = startup_to_core_plan_config(&topology);
         assert_eq!(cc.nic_workers, 6);
@@ -1702,13 +1706,13 @@ mod tests {
     }
 
     #[test]
-    fn startup_to_core_plan_config_zero_nic_workers_defaults() {
-        // A zero `nic_workers` (unset before defaulting) maps to the
-        // CorePlanConfig default of 4, and serving_cores=0 means auto.
+    fn startup_to_core_plan_config_absent_fields_default() {
+        // Absent optional topology knobs map to CorePlanConfig defaults,
+        // and absent serving_cores means auto.
         let topology = config::TopologyCfg {
-            nic_workers: 0,
-            serving_cores: 0,
-            hcas_per_numa_node: 0,
+            nic_workers: None,
+            serving_cores: None,
+            hcas_per_numa_node: None,
             ..default_topology()
         };
         let cc = startup_to_core_plan_config(&topology);
@@ -1917,7 +1921,10 @@ mod tests {
             cfg.startup().fabric().default_listen_addr(),
             Some("0.0.0.0:0")
         );
-        assert_eq!(cfg.startup().memory().memory_total_bytes, 128 * 1024 * 1024);
+        assert_eq!(
+            cfg.startup().memory().memory_total_bytes,
+            Some(128 * 1024 * 1024)
+        );
     }
 
     #[test]
@@ -1934,8 +1941,8 @@ mod tests {
             config: Some(config::backend_spec::Config::Http(
                 config::HttpBackendConfig {
                     url: "https://example.com".to_string(),
-                    stripe_size_bytes: 4 * 1024 * 1024,
-                    http_concurrency: 64,
+                    stripe_size_bytes: Some(4 * 1024 * 1024),
+                    http_concurrency: Some(64),
                 },
             )),
         }
@@ -1985,7 +1992,7 @@ mod tests {
         let Some(config::backend_spec::Config::Http(cfg)) = new_backend.config.as_mut() else {
             panic!("expected http backend config");
         };
-        cfg.stripe_size_bytes *= 2;
+        *cfg.stripe_size_bytes.as_mut().expect("stripe size set") *= 2;
 
         let mut last_backends = HashMap::new();
         last_backends.insert(old_backend.name.clone(), old_backend);

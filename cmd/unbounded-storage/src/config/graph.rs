@@ -207,7 +207,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
                     id: neighborhood.name.clone(),
                     backend_id: neighborhood.source.clone(),
                     p2p: RuntimeP2p {
-                        fingers_per_node: neighborhood.fingers_per_node.max(1),
+                        fingers_per_node: neighborhood.fingers_per_node.unwrap_or(0).max(1),
                         local_node_id: neighborhood.local_node_id,
                         local_tags: neighborhood.local_tags.clone(),
                         routing_plan: neighborhood.routing_plan.clone(),
@@ -366,8 +366,8 @@ mod tests {
             name: id.to_string(),
             config: Some(backend_spec::Config::Http(HttpBackendConfig {
                 url: "https://example.com".to_string(),
-                stripe_size_bytes: 4 * 1024 * 1024,
-                http_concurrency: 64,
+                stripe_size_bytes: Some(4 * 1024 * 1024),
+                http_concurrency: Some(64),
             })),
         }
     }
@@ -384,7 +384,7 @@ mod tests {
         NeighborhoodSpec {
             name: id.to_string(),
             source: source.to_string(),
-            fingers_per_node: 100,
+            fingers_per_node: Some(100),
             local_node_id: Some(1),
             local_tags: Vec::new(),
             routing_plan: None,

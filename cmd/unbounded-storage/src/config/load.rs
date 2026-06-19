@@ -286,17 +286,17 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         let stripe_size_bytes = match b.config.as_ref() {
             Some(backend_spec::Config::Http(cfg)) => {
                 validate_backend_url(&b.name, &cfg.url)?;
-                cfg.stripe_size_bytes
+                cfg.stripe_size_bytes.unwrap_or(0)
             }
             Some(backend_spec::Config::S3(cfg)) => {
                 validate_backend_url(&b.name, &cfg.url)?;
-                cfg.stripe_size_bytes
+                cfg.stripe_size_bytes.unwrap_or(0)
             }
             Some(backend_spec::Config::Azure(cfg)) => {
                 validate_backend_url(&b.name, &cfg.url)?;
-                cfg.stripe_size_bytes
+                cfg.stripe_size_bytes.unwrap_or(0)
             }
-            Some(backend_spec::Config::Fake(cfg)) => cfg.stripe_size_bytes,
+            Some(backend_spec::Config::Fake(cfg)) => cfg.stripe_size_bytes.unwrap_or(0),
             None => return Err(ConfigError::MissingBackendConfig(b.name.clone())),
         };
         if !stripe_size_bytes.is_power_of_two() {
@@ -1138,7 +1138,7 @@ name = "synthetic"
         assert_eq!(cfg.backends[0].name, "synthetic");
         match cfg.backends[0].config.as_ref().expect("backend config set") {
             backend_spec::Config::Fake(fake) => {
-                assert_eq!(fake.object_size_bytes, 1024 * 1024);
+                assert_eq!(fake.object_size_bytes, Some(1024 * 1024));
             }
             other => panic!("expected fake backend config, got {other:?}"),
         }
@@ -1528,11 +1528,11 @@ addr = "10.0.0.2:9000"
         let f = write_cfg("");
         let cfg = load(f.path()).unwrap();
         let s = cfg.startup();
-        assert_eq!(s.memory().memory_total_bytes, 128 * 1024 * 1024);
+        assert_eq!(s.memory().memory_total_bytes, Some(128 * 1024 * 1024));
         assert_eq!(s.fabric().default_listen_addr(), Some("0.0.0.0:0"));
-        assert_eq!(s.fabric().max_inflight, 1024);
-        assert_eq!(s.topology().nic_workers, 4);
-        assert_eq!(s.topology().hcas_per_numa_node, 1);
+        assert_eq!(s.fabric().max_inflight, Some(1024));
+        assert_eq!(s.topology().nic_workers, Some(4));
+        assert_eq!(s.topology().hcas_per_numa_node, Some(1));
     }
 
     #[test]
@@ -1553,14 +1553,17 @@ disable_rdma = true
         let f = write_cfg(s);
         let cfg = load(f.path()).unwrap();
         assert!(cfg.startup().memory().no_hugepages);
-        assert_eq!(cfg.startup().memory().memory_total_bytes, 64 * 1024 * 1024);
+        assert_eq!(
+            cfg.startup().memory().memory_total_bytes,
+            Some(64 * 1024 * 1024)
+        );
         assert_eq!(
             cfg.startup().fabric().default_listen_addr(),
             Some("10.0.0.1:7000")
         );
         assert!(cfg.startup().topology().disable_rdma);
         // Unset siblings still default.
-        assert_eq!(cfg.startup().fabric().progress_threads, 2);
+        assert_eq!(cfg.startup().fabric().progress_threads, Some(2));
     }
 
     #[test]
@@ -1584,11 +1587,11 @@ disable_rdma = true
             loaded.startup().fabric().default_listen_addr(),
             Some("10.0.0.2:8000")
         );
-        assert_eq!(loaded.startup().fabric().max_inflight, 4096);
+        assert_eq!(loaded.startup().fabric().max_inflight, Some(4096));
         assert!(loaded.startup().topology().disable_rdma);
         assert_eq!(
             loaded.startup().memory().memory_total_bytes,
-            128 * 1024 * 1024
+            Some(128 * 1024 * 1024)
         );
     }
 }

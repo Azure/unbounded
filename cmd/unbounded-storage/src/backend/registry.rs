@@ -131,10 +131,10 @@ impl BuildCtx {
                     self.ring.clone(),
                     origin,
                     spec.name.clone(),
-                    cfg.stripe_size_bytes,
+                    cfg.stripe_size_bytes.expect("stripe_size_bytes defaulted"),
                     self.page_size,
                     self.backing_base,
-                    cfg.http_concurrency as usize,
+                    cfg.http_concurrency.expect("http_concurrency defaulted") as usize,
                 )))
             }
             Some(backend_spec::Config::S3(cfg)) => {
@@ -145,10 +145,10 @@ impl BuildCtx {
                     origin,
                     host,
                     spec.name.clone(),
-                    cfg.stripe_size_bytes,
+                    cfg.stripe_size_bytes.expect("stripe_size_bytes defaulted"),
                     self.page_size,
                     self.backing_base,
-                    cfg.http_concurrency as usize,
+                    cfg.http_concurrency.expect("http_concurrency defaulted") as usize,
                 )))
             }
             Some(backend_spec::Config::Azure(cfg)) => {
@@ -159,15 +159,15 @@ impl BuildCtx {
                     origin,
                     host,
                     spec.name.clone(),
-                    cfg.stripe_size_bytes,
+                    cfg.stripe_size_bytes.expect("stripe_size_bytes defaulted"),
                     self.page_size,
                     self.backing_base,
-                    cfg.http_concurrency as usize,
+                    cfg.http_concurrency.expect("http_concurrency defaulted") as usize,
                 )))
             }
             Some(backend_spec::Config::Fake(cfg)) => Ok(OriginBackend::Fake(FakeBackend::new(
                 spec.name.clone(),
-                cfg.object_size_bytes,
+                cfg.object_size_bytes.expect("object_size_bytes defaulted"),
                 self.page_size,
                 self.backing_base,
             ))),
@@ -300,8 +300,8 @@ mod tests {
             name: id.to_string(),
             config: Some(backend_spec::Config::Http(HttpBackendConfig {
                 url: url.to_string(),
-                stripe_size_bytes: 4 * 1024 * 1024,
-                http_concurrency: 64,
+                stripe_size_bytes: Some(4 * 1024 * 1024),
+                http_concurrency: Some(64),
             })),
         }
     }
@@ -310,8 +310,8 @@ mod tests {
         BackendSpec {
             name: id.to_string(),
             config: Some(backend_spec::Config::Fake(FakeBackendConfig {
-                stripe_size_bytes: 4 * 1024 * 1024,
-                object_size_bytes: object_size,
+                stripe_size_bytes: Some(4 * 1024 * 1024),
+                object_size_bytes: Some(object_size),
             })),
         }
     }

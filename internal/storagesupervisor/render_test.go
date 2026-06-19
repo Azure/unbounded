@@ -82,27 +82,35 @@ startup:
 
 	assert.Equal(t, uint64(7), cfg.Version)
 	assert.True(t, cfg.GetStartup().GetMemory().GetNoHugepages())
+	assert.NotNil(t, cfg.GetStartup().GetMemory().MemoryTotalBytes)
 	assert.Equal(t, uint64(134217728), cfg.GetStartup().GetMemory().GetMemoryTotalBytes())
 	assert.Equal(t, "10.0.0.1:7000", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
+	assert.NotNil(t, cfg.GetStartup().GetFabric().ProgressThreads)
 	assert.Equal(t, uint32(3), cfg.GetStartup().GetFabric().GetProgressThreads())
+	assert.NotNil(t, cfg.GetStartup().GetFabric().ProgressPollUs)
 	assert.Equal(t, uint32(25), cfg.GetStartup().GetFabric().GetProgressPollUs())
+	assert.NotNil(t, cfg.GetStartup().GetFabric().RpcWorkerThreads)
 	assert.Equal(t, uint32(8), cfg.GetStartup().GetFabric().GetRpcWorkerThreads())
+	assert.NotNil(t, cfg.GetStartup().GetFabric().MaxInflight)
 	assert.Equal(t, uint32(2048), cfg.GetStartup().GetFabric().GetMaxInflight())
 	assert.True(t, cfg.GetStartup().GetTopology().GetUseSmtSiblings())
 	assert.True(t, cfg.GetStartup().GetTopology().GetIgnoreIsolated())
 	assert.True(t, cfg.GetStartup().GetTopology().GetIncludeNodeCpu0())
 	assert.True(t, cfg.GetStartup().GetTopology().GetAllowInactivePort())
 	assert.True(t, cfg.GetStartup().GetTopology().GetDisableRdma())
+	assert.NotNil(t, cfg.GetStartup().GetTopology().ServingCores)
 	assert.Equal(t, uint64(12), cfg.GetStartup().GetTopology().GetServingCores())
+	assert.NotNil(t, cfg.GetStartup().GetTopology().NicWorkers)
 	assert.Equal(t, uint64(6), cfg.GetStartup().GetTopology().GetNicWorkers())
+	assert.NotNil(t, cfg.GetStartup().GetTopology().HcasPerNumaNode)
 	assert.Equal(t, uint64(2), cfg.GetStartup().GetTopology().GetHcasPerNumaNode())
 	assert.Equal(t, "0.0.0.0:9100", cfg.GetStartup().GetMetrics().GetAddr())
 }
 
 func TestRenderConfigDefaultsConfigMap(t *testing.T) {
 	// The committed ConfigMap defaults render to a config the daemon accepts.
-	// Unset/zero values are left for the daemon's apply_defaults; here we just
-	// confirm the documented default values round-trip through the wire format.
+	// Explicit values are preserved for the daemon to consume; absent optional
+	// fields are left for the daemon's apply_defaults.
 	dir := writeSource(t, `
 version: 0
 startup:
@@ -126,15 +134,22 @@ startup:
 	assert.Equal(t, uint64(0), cfg.Version)
 	assert.False(t, cfg.GetStartup().GetMemory().GetNoHugepages())
 	assert.Equal(t, "0.0.0.0:0", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
+	assert.NotNil(t, cfg.GetStartup().GetMemory().MemoryTotalBytes)
+	assert.Equal(t, uint64(134217728), cfg.GetStartup().GetMemory().GetMemoryTotalBytes())
+	assert.NotNil(t, cfg.GetStartup().GetFabric().MaxInflight)
 	assert.Equal(t, uint32(1024), cfg.GetStartup().GetFabric().GetMaxInflight())
+	assert.NotNil(t, cfg.GetStartup().GetTopology().ServingCores)
+	assert.Equal(t, uint64(0), cfg.GetStartup().GetTopology().GetServingCores())
+	assert.NotNil(t, cfg.GetStartup().GetTopology().NicWorkers)
 	assert.Equal(t, uint64(4), cfg.GetStartup().GetTopology().GetNicWorkers())
+	assert.NotNil(t, cfg.GetStartup().GetTopology().HcasPerNumaNode)
 	assert.Equal(t, uint64(1), cfg.GetStartup().GetTopology().GetHcasPerNumaNode())
 	assert.Empty(t, cfg.GetStartup().GetMetrics().GetAddr())
 }
 
-func TestRenderConfigEmptyLeavesZero(t *testing.T) {
-	// An empty config.yaml yields a message with no fields set; every field is
-	// the proto3 zero value, which the daemon promotes to defaults.
+func TestRenderConfigEmptyLeavesUnset(t *testing.T) {
+	// An empty config.yaml yields a message with no optional defaults set; the
+	// daemon promotes absent/null values to documented defaults.
 	dir := writeSource(t, "")
 
 	cfg := decode(t, dir)
@@ -142,6 +157,8 @@ func TestRenderConfigEmptyLeavesZero(t *testing.T) {
 	assert.Equal(t, uint64(0), cfg.Version)
 	assert.Equal(t, uint32(0), cfg.GetStartup().GetFabric().GetMaxInflight())
 	assert.Equal(t, uint64(0), cfg.GetStartup().GetTopology().GetNicWorkers())
+	assert.Nil(t, cfg.GetStartup().GetFabric())
+	assert.Nil(t, cfg.GetStartup().GetTopology())
 	assert.Empty(t, cfg.GetStartup().GetFabric().GetTcp().GetAddr())
 }
 
@@ -214,6 +231,7 @@ neighborhoods:
 	require.NoError(t, proto.Unmarshal(data, &cfg))
 
 	assert.Equal(t, uint64(3), cfg.Version)
+	assert.NotNil(t, cfg.GetStartup().GetFabric().MaxInflight)
 	assert.Equal(t, uint32(2048), cfg.GetStartup().GetFabric().GetMaxInflight())
 	// addr is overridden with the node's own routable address.
 	assert.Equal(t, "10.0.0.5:9000", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
@@ -274,6 +292,7 @@ neighborhoods:
 
 	// YAML neighborhood scalars preserved; local id injected.
 	assert.Equal(t, uint64(42), neighborhood.GetLocalNodeId())
+	assert.NotNil(t, neighborhood.FingersPerNode)
 	assert.Equal(t, uint32(5), neighborhood.GetFingersPerNode())
 	assert.Equal(t, []string{"rack-a"}, neighborhood.GetLocalTags())
 

@@ -7,12 +7,11 @@
 //! `../../api/unbounded-storage/config.proto` (see `build.rs`) and pulled
 //! in via the `include!` below. The `.proto` is the schema source of truth.
 //!
-//! The schema is proto3-native: byte sizes are plain integers, and every
-//! field's proto3 zero value means "unset".
-//! [`Config::apply_defaults`] runs after deserialization and promotes
-//! those zero values to the documented defaults. Section messages are
-//! `Option` in prost and are guaranteed `Some` after `apply_defaults`,
-//! so the section accessors below never panic.
+//! The schema is proto3-native: byte sizes are plain integers, and fields
+//! with documented defaults use proto3 `optional` presence. [`Config::apply_defaults`]
+//! runs after deserialization and fills absent values with the documented
+//! defaults. Section messages are `Option` in prost and are guaranteed
+//! `Some` after `apply_defaults`, so the section accessors below never panic.
 //!
 //! The TOML loader is strict: each message derives
 //! `#[serde(default, deny_unknown_fields)]`, so an unknown key fails
@@ -27,15 +26,13 @@ const DEFAULT_HTTP_CONCURRENCY: u32 = 64;
 const DEFAULT_FAKE_OBJECT_SIZE_BYTES: u64 = 1024 * 1024;
 
 impl Config {
-    /// Populates every omitted section and promotes proto3 zero values
-    /// to their documented defaults. Idempotent: a field already set to
-    /// a non-zero value is left untouched. Run once after load (or after
+    /// Populates every omitted section and optional defaulted field with
+    /// documented defaults. Idempotent: a field already set, including an
+    /// explicit zero, is left untouched. Run once after load (or after
     /// decoding a protobuf message) before the config is consumed.
     pub fn apply_defaults(&mut self) {
         for n in &mut self.neighborhoods {
-            if n.fingers_per_node == 0 {
-                n.fingers_per_node = 100;
-            }
+            n.fingers_per_node.get_or_insert(100);
         }
 
         for backend in &mut self.backends {
@@ -45,9 +42,7 @@ impl Config {
         let startup = self.startup.get_or_insert_with(StartupCfg::default);
 
         let memory = startup.memory.get_or_insert_with(MemoryCfg::default);
-        if memory.memory_total_bytes == 0 {
-            memory.memory_total_bytes = 128 * 1024 * 1024;
-        }
+        memory.memory_total_bytes.get_or_insert(128 * 1024 * 1024);
 
         let fabric = startup.fabric.get_or_insert_with(FabricCfg::default);
         match fabric.binds.as_mut() {
@@ -61,28 +56,15 @@ impl Config {
                 }));
             }
         }
-        if fabric.progress_threads == 0 {
-            fabric.progress_threads = 2;
-        }
-        if fabric.progress_poll_us == 0 {
-            fabric.progress_poll_us = 10;
-        }
-        if fabric.rpc_worker_threads == 0 {
-            fabric.rpc_worker_threads = 4;
-        }
-        if fabric.max_inflight == 0 {
-            fabric.max_inflight = 1024;
-        }
+        fabric.progress_threads.get_or_insert(2);
+        fabric.progress_poll_us.get_or_insert(10);
+        fabric.rpc_worker_threads.get_or_insert(4);
+        fabric.max_inflight.get_or_insert(1024);
 
         let topology = startup.topology.get_or_insert_with(TopologyCfg::default);
-        if topology.nic_workers == 0 {
-            topology.nic_workers = 4;
-        }
-        if topology.hcas_per_numa_node == 0 {
-            topology.hcas_per_numa_node = 1;
-        }
-        // `serving_cores` keeps its proto3 zero, which the planner reads
-        // as "auto-fill every usable core".
+        topology.nic_workers.get_or_insert(4);
+        topology.hcas_per_numa_node.get_or_insert(1);
+        // `serving_cores = None` means auto-fill every usable core.
 
         // Metrics: the exporter is opt-in, so an empty addr (the proto3
         // zero value) is the intended "disabled" default and is left as
@@ -112,12 +94,10 @@ impl BackendSpec {
                 apply_http_backend_defaults(&mut cfg.stripe_size_bytes, &mut cfg.http_concurrency)
             }
             Some(backend_spec::Config::Fake(cfg)) => {
-                if cfg.stripe_size_bytes == 0 {
-                    cfg.stripe_size_bytes = DEFAULT_STRIPE_SIZE_BYTES;
-                }
-                if cfg.object_size_bytes == 0 {
-                    cfg.object_size_bytes = DEFAULT_FAKE_OBJECT_SIZE_BYTES;
-                }
+                cfg.stripe_size_bytes
+                    .get_or_insert(DEFAULT_STRIPE_SIZE_BYTES);
+                cfg.object_size_bytes
+                    .get_or_insert(DEFAULT_FAKE_OBJECT_SIZE_BYTES);
             }
             None => {}
         }
@@ -135,10 +115,10 @@ impl BackendSpec {
 
     pub fn stripe_size_bytes(&self) -> u64 {
         match self.config.as_ref() {
-            Some(backend_spec::Config::Http(cfg)) => cfg.stripe_size_bytes,
-            Some(backend_spec::Config::S3(cfg)) => cfg.stripe_size_bytes,
-            Some(backend_spec::Config::Azure(cfg)) => cfg.stripe_size_bytes,
-            Some(backend_spec::Config::Fake(cfg)) => cfg.stripe_size_bytes,
+            Some(backend_spec::Config::Http(cfg)) => cfg.stripe_size_bytes.unwrap_or(0),
+            Some(backend_spec::Config::S3(cfg)) => cfg.stripe_size_bytes.unwrap_or(0),
+            Some(backend_spec::Config::Azure(cfg)) => cfg.stripe_size_bytes.unwrap_or(0),
+            Some(backend_spec::Config::Fake(cfg)) => cfg.stripe_size_bytes.unwrap_or(0),
             None => 0,
         }
     }
@@ -154,9 +134,9 @@ impl BackendSpec {
 
     pub fn http_concurrency(&self) -> Option<u32> {
         match self.config.as_ref() {
-            Some(backend_spec::Config::Http(cfg)) => Some(cfg.http_concurrency),
-            Some(backend_spec::Config::S3(cfg)) => Some(cfg.http_concurrency),
-            Some(backend_spec::Config::Azure(cfg)) => Some(cfg.http_concurrency),
+            Some(backend_spec::Config::Http(cfg)) => cfg.http_concurrency,
+            Some(backend_spec::Config::S3(cfg)) => cfg.http_concurrency,
+            Some(backend_spec::Config::Azure(cfg)) => cfg.http_concurrency,
             Some(backend_spec::Config::Fake(_)) | None => None,
         }
     }
@@ -257,13 +237,12 @@ impl FrontendSpec {
     }
 }
 
-fn apply_http_backend_defaults(stripe_size_bytes: &mut u64, http_concurrency: &mut u32) {
-    if *stripe_size_bytes == 0 {
-        *stripe_size_bytes = DEFAULT_STRIPE_SIZE_BYTES;
-    }
-    if *http_concurrency == 0 {
-        *http_concurrency = DEFAULT_HTTP_CONCURRENCY;
-    }
+fn apply_http_backend_defaults(
+    stripe_size_bytes: &mut Option<u64>,
+    http_concurrency: &mut Option<u32>,
+) {
+    stripe_size_bytes.get_or_insert(DEFAULT_STRIPE_SIZE_BYTES);
+    http_concurrency.get_or_insert(DEFAULT_HTTP_CONCURRENCY);
 }
 
 impl StartupCfg {
@@ -421,7 +400,7 @@ local_tags = ["us-west", "az1", "row3", "rack7"]
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.neighborhoods[0].fingers_per_node, 128);
+        assert_eq!(c.neighborhoods[0].fingers_per_node, Some(128));
         assert_eq!(c.neighborhoods[0].local_node_id, Some(42));
         assert_eq!(
             c.neighborhoods[0].local_tags,
@@ -520,8 +499,8 @@ addr = "0.0.0.0:9000"
         match b.config.as_ref().expect("backend config set") {
             backend_spec::Config::Http(cfg) => {
                 assert_eq!(cfg.url, "https://origin.example.com");
-                assert_eq!(cfg.stripe_size_bytes, 8 * 1024 * 1024);
-                assert_eq!(cfg.http_concurrency, 32);
+                assert_eq!(cfg.stripe_size_bytes, Some(8 * 1024 * 1024));
+                assert_eq!(cfg.http_concurrency, Some(32));
             }
             other => panic!("expected http backend config, got {other:?}"),
         }
@@ -566,8 +545,8 @@ url = "https://example.com"
         c.apply_defaults();
         match c.backends[0].config.as_ref().expect("backend config set") {
             backend_spec::Config::Http(cfg) => {
-                assert_eq!(cfg.stripe_size_bytes, 4 * 1024 * 1024);
-                assert_eq!(cfg.http_concurrency, 64);
+                assert_eq!(cfg.stripe_size_bytes, Some(4 * 1024 * 1024));
+                assert_eq!(cfg.http_concurrency, Some(64));
             }
             other => panic!("expected http backend config, got {other:?}"),
         }
@@ -630,10 +609,10 @@ verify = true
             frontend_spec::Config::Loadgen(cfg) => cfg,
             other => panic!("expected loadgen frontend config, got {other:?}"),
         };
-        assert_eq!(loadgen.workers, 8);
-        assert_eq!(loadgen.seed, 1234);
-        assert_eq!(loadgen.object_count, 4096);
-        assert_eq!(loadgen.read_bytes, 128 * 1024);
+        assert_eq!(loadgen.workers, Some(8));
+        assert_eq!(loadgen.seed, Some(1234));
+        assert_eq!(loadgen.object_count, Some(4096));
+        assert_eq!(loadgen.read_bytes, Some(128 * 1024));
         assert!(loadgen.verify);
     }
 
@@ -656,17 +635,17 @@ workerz = 8
         c.apply_defaults();
         let s = c.startup();
         assert!(!s.memory().no_hugepages);
-        assert_eq!(s.memory().memory_total_bytes, 128 * 1024 * 1024);
+        assert_eq!(s.memory().memory_total_bytes, Some(128 * 1024 * 1024));
         assert_eq!(s.fabric().default_listen_addr(), Some("0.0.0.0:0"));
-        assert_eq!(s.fabric().progress_threads, 2);
-        assert_eq!(s.fabric().progress_poll_us, 10);
-        assert_eq!(s.fabric().rpc_worker_threads, 4);
-        assert_eq!(s.fabric().max_inflight, 1024);
-        assert_eq!(s.topology().nic_workers, 4);
-        // `serving_cores` stays at its proto3 zero (auto-fill).
-        assert_eq!(s.topology().serving_cores, 0);
+        assert_eq!(s.fabric().progress_threads, Some(2));
+        assert_eq!(s.fabric().progress_poll_us, Some(10));
+        assert_eq!(s.fabric().rpc_worker_threads, Some(4));
+        assert_eq!(s.fabric().max_inflight, Some(1024));
+        assert_eq!(s.topology().nic_workers, Some(4));
+        // `serving_cores` stays absent, which means auto-fill.
+        assert_eq!(s.topology().serving_cores, None);
         // One HCA per NUMA node by default.
-        assert_eq!(s.topology().hcas_per_numa_node, 1);
+        assert_eq!(s.topology().hcas_per_numa_node, Some(1));
         // The inverted-sense flags default to false so the historical
         // safe behavior (respect isolated, exclude cpu0, require active
         // port) is preserved.
@@ -707,20 +686,20 @@ hcas_per_numa_node = 2
         c.apply_defaults();
         let st = c.startup();
         assert!(st.memory().no_hugepages);
-        assert_eq!(st.memory().memory_total_bytes, 64 * 1024 * 1024);
+        assert_eq!(st.memory().memory_total_bytes, Some(64 * 1024 * 1024));
         assert_eq!(st.fabric().default_listen_addr(), Some("10.0.0.1:7000"));
-        assert_eq!(st.fabric().progress_threads, 3);
-        assert_eq!(st.fabric().progress_poll_us, 25);
-        assert_eq!(st.fabric().rpc_worker_threads, 8);
-        assert_eq!(st.fabric().max_inflight, 2048);
+        assert_eq!(st.fabric().progress_threads, Some(3));
+        assert_eq!(st.fabric().progress_poll_us, Some(25));
+        assert_eq!(st.fabric().rpc_worker_threads, Some(8));
+        assert_eq!(st.fabric().max_inflight, Some(2048));
         assert!(st.topology().use_smt_siblings);
         assert!(st.topology().ignore_isolated);
         assert!(st.topology().include_node_cpu0);
         assert!(st.topology().allow_inactive_port);
         assert!(st.topology().disable_rdma);
-        assert_eq!(st.topology().serving_cores, 12);
-        assert_eq!(st.topology().nic_workers, 6);
-        assert_eq!(st.topology().hcas_per_numa_node, 2);
+        assert_eq!(st.topology().serving_cores, Some(12));
+        assert_eq!(st.topology().nic_workers, Some(6));
+        assert_eq!(st.topology().hcas_per_numa_node, Some(2));
     }
     #[test]
     fn startup_defaults_are_idempotent() {
@@ -729,8 +708,11 @@ hcas_per_numa_node = 2
         c.apply_defaults();
         // An explicitly set value survives repeated defaulting, and the
         // unset siblings keep their documented defaults.
-        assert_eq!(c.startup().fabric().progress_threads, 7);
-        assert_eq!(c.startup().fabric().rpc_worker_threads, 4);
-        assert_eq!(c.startup().memory().memory_total_bytes, 128 * 1024 * 1024);
+        assert_eq!(c.startup().fabric().progress_threads, Some(7));
+        assert_eq!(c.startup().fabric().rpc_worker_threads, Some(4));
+        assert_eq!(
+            c.startup().memory().memory_total_bytes,
+            Some(128 * 1024 * 1024)
+        );
     }
 }

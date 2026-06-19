@@ -50,10 +50,10 @@ impl LoadgenFrontend {
         };
         Ok(Self {
             id: spec.name.clone(),
-            workers: default_u32(loadgen.workers, DEFAULT_WORKERS),
-            seed: default_u64(loadgen.seed, DEFAULT_SEED),
-            object_count: default_u64(loadgen.object_count, DEFAULT_OBJECT_COUNT),
-            read_bytes: loadgen.read_bytes,
+            workers: loadgen.workers.unwrap_or(DEFAULT_WORKERS),
+            seed: loadgen.seed.unwrap_or(DEFAULT_SEED),
+            object_count: loadgen.object_count.unwrap_or(DEFAULT_OBJECT_COUNT),
+            read_bytes: loadgen.read_bytes.unwrap_or(0),
             verify: loadgen.verify,
         })
     }
@@ -273,14 +273,6 @@ fn object_id(
     format!("/__loadgen/{frontend_id}/{shard_idx}/{worker_idx}/{ordinal}")
 }
 
-fn default_u32(value: u32, default: u32) -> u32 {
-    if value == 0 { default } else { value }
-}
-
-fn default_u64(value: u64, default: u64) -> u64 {
-    if value == 0 { default } else { value }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +315,23 @@ mod tests {
         assert_eq!(frontend.object_count, DEFAULT_OBJECT_COUNT);
         assert_eq!(frontend.read_bytes, 0);
         assert!(!frontend.verify);
+    }
+
+    #[test]
+    fn explicit_zeroes_are_preserved() {
+        let mut spec = loadgen_spec();
+        spec.config = Some(frontend_spec::Config::Loadgen(LoadgenFrontendConfig {
+            workers: Some(0),
+            seed: Some(0),
+            object_count: Some(0),
+            read_bytes: Some(0),
+            verify: false,
+        }));
+        let frontend = LoadgenFrontend::from_spec(&spec).unwrap();
+        assert_eq!(frontend.workers, 0);
+        assert_eq!(frontend.seed, 0);
+        assert_eq!(frontend.object_count, 0);
+        assert_eq!(frontend.read_bytes, 0);
     }
 
     #[test]

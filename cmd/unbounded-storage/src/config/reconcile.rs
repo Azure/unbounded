@@ -1035,8 +1035,8 @@ mod tests {
             name: id.to_string(),
             config: Some(backend_spec::Config::Http(HttpBackendConfig {
                 url: url.to_string(),
-                stripe_size_bytes: 4 * 1024 * 1024,
-                http_concurrency: 64,
+                stripe_size_bytes: Some(4 * 1024 * 1024),
+                http_concurrency: Some(64),
             })),
         }
     }

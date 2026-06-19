@@ -383,7 +383,7 @@ fingers_per_node = {fingers_per_node}
         write(&path, VALID_B);
         let update = recv_within(&rx, Duration::from_secs(3))
             .expect("a valid modification must yield a ConfigUpdate");
-        assert_eq!(update.config.neighborhoods[0].fingers_per_node, 5678);
+        assert_eq!(update.config.neighborhoods[0].fingers_per_node, Some(5678));
         assert!(update.generation >= 1, "generation must advance");
 
         // (2a) An unrelated sibling write is filtered out.
@@ -399,7 +399,7 @@ fingers_per_node = {fingers_per_node}
         write(&path, VALID_A);
         let update = recv_within(&rx, Duration::from_secs(3))
             .expect("a config change after a sibling write must still emit");
-        assert_eq!(update.config.neighborhoods[0].fingers_per_node, 1234);
+        assert_eq!(update.config.neighborhoods[0].fingers_per_node, Some(1234));
     }
 
     fn event_for(paths: &[&Path]) -> notify::Event {

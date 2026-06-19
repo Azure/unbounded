@@ -106,16 +106,16 @@ excluded from the live-reload diff.
 
 - `[startup.memory]` - `no_hugepages` (allocate shard backings from
   the heap instead of 2 MiB hugepages) and `memory_total_bytes` (u64
-  bytes, no suffix; `0` -> 128 MiB) - the total backing pool, split
-  evenly across the serving shards so the host footprint stays fixed
-  regardless of the auto-scaled shard count.
+  bytes, no suffix; unset/null defaults to 128 MiB) - the total backing
+  pool, split evenly across the serving shards so the host footprint stays
+  fixed regardless of the auto-scaled shard count.
 - `[startup.fabric]` - `addr` (default `0.0.0.0:0`, or `hex:...`
   for provider-native binds), `progress_threads` (2), `progress_poll_us`
   (10), `rpc_worker_threads` (4), `max_inflight` (1024) - the fabric
   endpoint, thread pools, and in-flight cap.
-- `[startup.topology]` - `serving_cores` (`0` = auto-fill every usable
-  CPU), `nic_workers` (fabric CPUs per active HCA, `0` -> 4),
-  `hcas_per_numa_node` (max HCAs used per NUMA node, `0` -> 1), and the
+- `[startup.topology]` - `serving_cores` (unset/null = auto-fill every usable
+  CPU), `nic_workers` (fabric CPUs per active HCA, unset/null defaults to 4),
+  `hcas_per_numa_node` (max HCAs used per NUMA node, unset/null defaults to 1), and the
   toggles `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
   `allow_inactive_port`, `disable_rdma` - feed
   `startup_to_core_plan_config`, which builds the `topology::CorePlanConfig`
@@ -538,10 +538,11 @@ encoded into its page, rather than object data.
 
 The schema is defined by `api/unbounded-storage/config.proto` (prost-generated, with
 serde `Deserialize` derived on each message so a TOML file still loads)
-and is proto3-native: byte sizes are plain integer byte counts, and any
-field left at its proto3 zero value is promoted to the documented default
-by `Config::apply_defaults`. The TOML loader is strict
-(`deny_unknown_fields`), so a typo'd key fails loudly at parse time.
+and is proto3-native: byte sizes are plain integer byte counts, and scalar
+fields with documented defaults use proto3 `optional` presence. `Config::apply_defaults`
+promotes absent/null values to documented defaults while preserving an
+explicit numeric zero. The TOML loader is strict (`deny_unknown_fields`), so a
+typo'd key fails loudly at parse time.
 Protobuf is used here purely as the schema IDL (the prost-generated
 structs replace hand-written ones); the on-disk config format and the only
 load path are TOML, and the config file is the sole configuration interface

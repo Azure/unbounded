@@ -565,15 +565,15 @@ mod tests {
             name: "b".to_string(),
             config: Some(crate::config::backend_spec::Config::Fake(
                 crate::config::FakeBackendConfig {
-                    stripe_size_bytes: 4 * 1024 * 1024,
-                    object_size_bytes: 1024 * 1024,
+                    stripe_size_bytes: Some(4 * 1024 * 1024),
+                    object_size_bytes: Some(1024 * 1024),
                 },
             )),
         });
         c.neighborhoods.push(crate::config::NeighborhoodSpec {
             name: "n".to_string(),
             source: "b".to_string(),
-            fingers_per_node: 100,
+            fingers_per_node: Some(100),
             local_node_id: Some(0),
             local_tags: Vec::new(),
             routing_plan: None,
@@ -655,8 +655,8 @@ mod tests {
             config: Some(crate::config::backend_spec::Config::Http(
                 crate::config::HttpBackendConfig {
                     url: "https://example.com".to_string(),
-                    stripe_size_bytes: 4 * 1024 * 1024,
-                    http_concurrency: 64,
+                    stripe_size_bytes: Some(4 * 1024 * 1024),
+                    http_concurrency: Some(64),
                 },
             )),
         });

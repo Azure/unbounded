@@ -36,8 +36,8 @@ message MemoryCfg {
   // Allocates per-shard backing from the heap instead of 2 MiB hugepages.
   bool no_hugepages = 1;
 
-  // Total backing pool across serving shards, in bytes; 0 defaults to 128 MiB.
-  uint64 memory_total_bytes = 2;
+  // Total backing pool across serving shards, in bytes. Defaults to 128 MiB when unset.
+  optional uint64 memory_total_bytes = 2;
 }
 
 message FabricCfg {
@@ -46,17 +46,17 @@ message FabricCfg {
     RdmaFabricBinds rdma = 2;
   }
 
-  // Maximum in-flight fabric operations per shard; 0 defaults to 1024.
-  uint32 max_inflight = 3;
+  // Maximum in-flight fabric operations per shard. Defaults to 1024 when unset.
+  optional uint32 max_inflight = 3;
 
-  // libfabric progress threads per shard; 0 defaults to 2.
-  uint32 progress_threads = 4;
+  // libfabric progress threads per shard. Defaults to 2 when unset.
+  optional uint32 progress_threads = 4;
 
-  // Fabric RPC worker threads per shard; 0 defaults to 4.
-  uint32 rpc_worker_threads = 5;
+  // Fabric RPC worker threads per shard. Defaults to 4 when unset.
+  optional uint32 rpc_worker_threads = 5;
 
-  // Progress-thread busy-poll budget in microseconds; 0 defaults to 10.
-  uint32 progress_poll_us = 6;
+  // Progress-thread busy-poll budget in microseconds. Defaults to 10 when unset.
+  optional uint32 progress_poll_us = 6;
 }
 
 message TcpFabricBinds {
@@ -92,30 +92,27 @@ message TopologyCfg {
   // TODO: Is this actually required? Ideally we don't need it
   bool disable_rdma = 5;
 
-  // Cap on the number of serving-shard CPUs to pin. 0 -> auto (claim
-  // every usable core left after storage and NIC-worker reservations).
-  // TODO: Make optional instead of using 0 as magic value
-  uint64 serving_cores = 6;
+  // Cap on the number of serving-shard CPUs to pin. When unset, claims every
+  // usable core left after storage and NIC-worker reservations.
+  optional uint64 serving_cores = 6;
 
-  // NIC-worker CPUs to pin per active HCA. 0 -> 4.
-  // TODO: Make optional instead of using 0 as magic value
-  uint64 nic_workers = 7;
+  // NIC-worker CPUs to pin per active HCA. Defaults to 4 when unset.
+  optional uint64 nic_workers = 7;
 
-  // Maximum number of HCAs to use per NUMA node. 0 -> 1. Raise this to
-  // use additional HCAs on a NUMA node. HCAs whose NUMA node is unknown
-  // are never capped.
+  // Maximum number of HCAs to use per NUMA node. Defaults to 1 when unset.
+  // Raise this to use additional HCAs on a NUMA node. HCAs whose NUMA node is
+  // unknown are never capped.
   // TODO: Remove this field. Add a new option to FabricCfg.binds that enables "auto rdma binding" (or something like that).
   //       The goal is to automatically bind to `n` HCAs per NUMA node, defaulting n=1, only when that binding type is configured.
-  uint64 hcas_per_numa_node = 8;
+  optional uint64 hcas_per_numa_node = 8;
 }
 
 message NeighborhoodSpec {
   string name = 1;
   string source = 2;
 
-  // Number of deterministic finger-table entries to derive per node; 0 defaults to 100.
-  // TODO: Use optional to set default (IMPORTANT apply this to ALL similar fields.)
-  uint32 fingers_per_node = 3;
+  // Number of deterministic finger-table entries to derive per node. Defaults to 100 when unset.
+  optional uint32 fingers_per_node = 3;
 
   // Local node id on the P2P ring; required when peers are configured and must not match a peer id.
   optional uint64 local_node_id = 4;
@@ -225,41 +222,45 @@ message HttpBackendConfig {
   // Origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
   string url = 1;
 
-  // Stripe granularity in bytes for origin references; must be a power of two and defaults to 4 MiB.
-  uint64 stripe_size_bytes = 2;
+  // Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
+  // Must be a power of two.
+  optional uint64 stripe_size_bytes = 2;
 
-  // Maximum concurrent origin HTTP fetches; 0 defaults to 64.
-  uint32 http_concurrency = 3;
+  // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
+  optional uint32 http_concurrency = 3;
 }
 
 message S3BackendConfig {
   // S3-compatible origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
   string url = 1;
 
-  // Stripe granularity in bytes for origin references; must be a power of two and defaults to 4 MiB.
-  uint64 stripe_size_bytes = 2;
+  // Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
+  // Must be a power of two.
+  optional uint64 stripe_size_bytes = 2;
 
-  // Maximum concurrent origin HTTP fetches; 0 defaults to 64.
-  uint32 http_concurrency = 3;
+  // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
+  optional uint32 http_concurrency = 3;
 }
 
 message AzureBackendConfig {
   // Azure Blob-compatible origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
   string url = 1;
 
-  // Stripe granularity in bytes for origin references; must be a power of two and defaults to 4 MiB.
-  uint64 stripe_size_bytes = 2;
+  // Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
+  // Must be a power of two.
+  optional uint64 stripe_size_bytes = 2;
 
-  // Maximum concurrent origin HTTP fetches; 0 defaults to 64.
-  uint32 http_concurrency = 3;
+  // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
+  optional uint32 http_concurrency = 3;
 }
 
 message FakeBackendConfig {
-  // Stripe granularity in bytes for synthetic origin references; must be a power of two and defaults to 4 MiB.
-  uint64 stripe_size_bytes = 1;
+  // Stripe granularity in bytes for synthetic origin references. Defaults to 4 MiB when unset.
+  // Must be a power of two.
+  optional uint64 stripe_size_bytes = 1;
 
-  // Size of each synthetic zero-filled object in bytes; 0 defaults to 1 MiB.
-  uint64 object_size_bytes = 2;
+  // Size of each synthetic zero-filled object in bytes. Defaults to 1 MiB when unset.
+  optional uint64 object_size_bytes = 2;
 }
 
 message FrontendSpec {
@@ -284,17 +285,17 @@ message S3FrontendConfig {
 }
 
 message LoadgenFrontendConfig {
-  // Synthetic read workers per serving shard; 0 defaults to 1.
-  uint32 workers = 1;
+  // Synthetic read workers per serving shard. Defaults to 1 when unset.
+  optional uint32 workers = 1;
 
-  // Deterministic object stream seed; 0 uses the loadgen frontend default.
-  uint64 seed = 2;
+  // Deterministic object stream seed. Defaults to the loadgen frontend seed when unset.
+  optional uint64 seed = 2;
 
-  // Number of distinct synthetic object ids to cycle over; 0 defaults to 1,000,000.
-  uint64 object_count = 3;
+  // Number of distinct synthetic object ids to cycle over. Defaults to 1,000,000 when unset.
+  optional uint64 object_count = 3;
 
-  // Bytes to read from the start of each object; 0 reads the full resolved object length.
-  uint64 read_bytes = 4;
+  // Bytes to read from the start of each object. When unset, reads the full resolved object length.
+  optional uint64 read_bytes = 4;
 
   // Verify every returned body byte is zero. Intended for fake backends.
   bool verify = 5;
