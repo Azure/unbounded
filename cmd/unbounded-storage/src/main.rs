@@ -1449,7 +1449,12 @@ struct Cli {
 /// parse errors - is fatal.
 fn load_config(path: &Path, explicit: bool) -> Result<Config, String> {
     match Config::load(path) {
-        Ok(c) => Ok(c),
+        Ok(c) => {
+            if path.extension().and_then(|e| e.to_str()) == Some("binpb") {
+                eprintln!("config: loaded {} (binpb):\n{c:#?}", path.display());
+            }
+            Ok(c)
+        }
         Err(config::ConfigError::Io(e))
             if !explicit && e.kind() == std::io::ErrorKind::NotFound =>
         {

@@ -63,7 +63,7 @@ deterministic order (disks closed first, then fabric / pool drops).
 
 ## Configuration file
 
-The schema is defined by `proto/config.proto` and is the source of
+The schema is defined by `api/unbounded-storage/config.proto` and is the source of
 truth; the daemon can load strict TOML or a raw binary protobuf wire
 message with a `.binpb` extension. The schema is deliberately
 proto3-native rather than idiomatic TOML:
