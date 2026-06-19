@@ -516,10 +516,11 @@ bufferpool `Backing`.
 
 **Disk lifecycle** (`disks/`): `trait DiskTarget { open(spec, pin) ->
 (Handle, PageChannel) }`, with `UringDiskTarget` in production (runs the disk on
-a pinned storage core) and a mock for tests. `DiskRegistry<T>` is seeded with the
-plan's disjoint NVMe `DiskCpuSlot`s and `reconcile(desired)` closes missing
-paths, opens new ones, and treats any spec drift (kind/numa/size/queue_depth/
-page_size/skip_recovery_scan) as a remove + add.
+a pinned storage core) and a mock for tests. `DiskRegistrySet<T>` is seeded with
+the plan's disjoint NVMe `DiskCpuSlot`s, keeps those slots globally disjoint
+across per-cache registries, and `reconcile(desired)` closes missing paths, opens
+new ones, and treats any spec drift (kind/numa/size/queue_depth/page_size/
+skip_recovery_scan) as a remove + add.
 `assign_disk_cpus` keeps survivors on their physical pin (preserving the
 disjoint-CPU invariant and idempotence under churn) and assigns new disks
 NUMA-local-first, then any free slot, then unpinned. `channels_snapshot()` is

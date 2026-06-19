@@ -9,13 +9,15 @@
 //! [`UringDiskTarget`]; tests plug in a mock target.
 //!
 //! CPU placement for disk storage cores comes from the topology
-//! [`CorePlan`](crate::topology::CorePlan): the registry is seeded with
-//! one [`DiskCpuSlot`](crate::topology::DiskCpuSlot) per
+//! [`CorePlan`](crate::topology::CorePlan): the registry set is seeded
+//! with one [`DiskCpuSlot`](crate::topology::DiskCpuSlot) per
 //! [`StorageCore`](crate::topology::StorageCore) (one per NVMe drive),
 //! which are disjoint from the NIC-worker and serving-shard CPUs by
 //! construction. On each reconcile a deterministic assignment maps
 //! disks to slots, preferring NUMA-local slots; disks beyond the
-//! available slot count run unpinned.
+//! available slot count run unpinned. Per-cache registries reserve slots
+//! already held by other caches so the storage-core pins stay globally
+//! disjoint.
 //!
 //! Each successful open returns both a per-disk handle (whose `Drop`
 //! tears down the disk thread) and a [`PageChannel`] published into
@@ -152,6 +154,14 @@ impl<T: DiskTarget> DiskRegistry<T> {
     /// Partial failures during opens are reported but do not abort the
     /// reconcile.
     pub fn reconcile(&mut self, desired: &[DiskSpec]) -> DiskReport {
+        self.reconcile_with_reserved(desired, &[])
+    }
+
+    fn reconcile_with_reserved(
+        &mut self,
+        desired: &[DiskSpec],
+        reserved_slots: &[DiskCpuSlot],
+    ) -> DiskReport {
         let mut report = DiskReport::default();
 
         let mut desired_paths: HashMap<&Path, &DiskSpec> = HashMap::new();
@@ -185,7 +195,11 @@ impl<T: DiskTarget> DiskRegistry<T> {
         // invariant). This is idempotent across reconciles (same
         // desired set -> same assignment) and never leaks a slot when a
         // disk churns out and back in.
-        let assignment = assign_disk_cpus(desired, &self.disk_slots, &self.placement);
+        let assignment = if reserved_slots.is_empty() {
+            assign_disk_cpus(desired, &self.disk_slots, &self.placement)
+        } else {
+            assign_disk_cpus_reserved(desired, &self.disk_slots, &self.placement, reserved_slots)
+        };
 
         for spec in desired {
             let path = disk_path(spec);
@@ -276,10 +290,12 @@ impl<T: DiskTarget> DiskRegistrySet<T> {
     }
 
     pub fn reconcile_cache(&mut self, cache_id: &str, disks: &[DiskSpec]) -> DiskReport {
+        let reserved_slots = self.reserved_slots_except(cache_id);
+
         self.registries
             .entry(cache_id.to_string())
             .or_insert_with(|| DiskRegistry::new(self.target.clone(), self.disk_slots.clone()))
-            .reconcile(disks)
+            .reconcile_with_reserved(disks, &reserved_slots)
     }
 
     pub fn channels_snapshot(&self, cache_id: &str) -> Vec<(PathBuf, PageChannel, Option<u16>)> {
@@ -313,6 +329,14 @@ impl<T: DiskTarget> DiskRegistrySet<T> {
             registry.drain();
         }
     }
+
+    fn reserved_slots_except(&self, cache_id: &str) -> Vec<DiskCpuSlot> {
+        self.registries
+            .iter()
+            .filter(|(id, _)| id.as_str() != cache_id)
+            .flat_map(|(_, registry)| registry.placement.values().copied().flatten())
+            .collect()
+    }
 }
 
 /// Deterministically assign disk CPU slots to the `desired` disks.
@@ -332,11 +356,26 @@ fn assign_disk_cpus(
     slots: &[DiskCpuSlot],
     open: &HashMap<PathBuf, Option<DiskCpuSlot>>,
 ) -> HashMap<PathBuf, Option<DiskCpuSlot>> {
+    assign_disk_cpus_reserved(desired, slots, open, &[])
+}
+
+fn assign_disk_cpus_reserved(
+    desired: &[DiskSpec],
+    slots: &[DiskCpuSlot],
+    open: &HashMap<PathBuf, Option<DiskCpuSlot>>,
+    reserved_slots: &[DiskCpuSlot],
+) -> HashMap<PathBuf, Option<DiskCpuSlot>> {
     let mut sorted: Vec<&DiskSpec> = desired.iter().collect();
     sorted.sort_by(|a, b| disk_path(a).cmp(disk_path(b)));
 
     let mut used = vec![false; slots.len()];
     let mut out: HashMap<PathBuf, Option<DiskCpuSlot>> = HashMap::new();
+
+    for reserved in reserved_slots {
+        if let Some(i) = slots.iter().position(|s| s == reserved) {
+            used[i] = true;
+        }
+    }
 
     // Lock in the slots held by surviving open disks before assigning
     // anything new. Their pin is physically fixed for the lifetime of
@@ -653,6 +692,42 @@ mod tests {
         assert!(assigned.contains(&Some(5)));
         // Distinct cpus for the two disks.
         assert_ne!(got[0].1, got[1].1);
+    }
+
+    #[test]
+    fn registry_set_reserves_slots_across_caches() {
+        let slots = vec![slot(4, None), slot(5, None)];
+        let hints = Arc::new(Mutex::new(Vec::new()));
+        let mut set = DiskRegistrySet::new(
+            CpuRecorder {
+                hints: hints.clone(),
+            },
+            slots,
+        );
+
+        set.reconcile_ids(["cache-a", "cache-b"]);
+
+        let report_a = set.reconcile_cache("cache-a", &[spec("/cache-a-disk", None)]);
+        assert_eq!(report_a.added, 1);
+        assert_eq!(report_a.removed, 0);
+        assert!(report_a.failures.is_empty());
+
+        let report_b = set.reconcile_cache("cache-b", &[spec("/cache-b-disk", None)]);
+        assert_eq!(report_b.added, 1);
+        assert_eq!(report_b.removed, 0);
+        assert!(report_b.failures.is_empty());
+
+        let got = hints.lock().unwrap().clone();
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|(_, cpu)| cpu.is_some()));
+        assert_ne!(got[0].1, got[1].1, "caches shared a disk CPU slot");
+
+        let before = set.registries["cache-a"].placement_snapshot();
+        let report_a = set.reconcile_cache("cache-a", &[spec("/cache-a-disk", None)]);
+        assert_eq!(report_a.added, 0);
+        assert_eq!(report_a.removed, 0);
+        assert_eq!(set.registries["cache-a"].placement_snapshot(), before);
+        assert_eq!(hints.lock().unwrap().len(), 2);
     }
 
     #[test]
