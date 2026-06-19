@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
-	"strings"
 	"time"
 
 	"github.com/Azure/unbounded/internal/executil"
@@ -125,7 +123,6 @@ func (t *removeMachine) Do(ctx context.Context) error {
 	)
 
 	deadline := time.Now().Add(retryTimeout)
-	dumpedDiagnostics := false
 
 	for time.Now().Before(deadline) {
 		err := executil.RunCmd(ctx, t.log, executil.Machinectl(), "remove", t.machineName)
@@ -133,10 +130,14 @@ func (t *removeMachine) Do(ctx context.Context) error {
 			return nil // machinectl removed both image metadata and directory
 		}
 
-		if !dumpedDiagnostics {
-			dumpMachineRemoveDiagnostics(ctx, t.log, t.machineName, machineDir)
-
-			dumpedDiagnostics = true
+		if !machineExists(ctx, t.log, t.machineName) {
+			// Once machined no longer knows the machine, the nspawn service is stopped
+			// and the rootfs can be deleted directly. Some host configurations can still
+			// make machinectl remove fail at this point. Fedora with SELinux enforcing,
+			// for example, can deny systemd-machined permission to create its nspawn
+			// image lock file under /run/systemd/nspawn/locks, returning "Access denied"
+			// even though the machine is already gone.
+			break
 		}
 
 		select {
@@ -163,31 +164,4 @@ func machineExists(ctx context.Context, log *slog.Logger, name string) bool {
 func serviceIsActive(ctx context.Context, log *slog.Logger, service string) bool {
 	err := executil.RunCmd(ctx, log, executil.Systemctl(), "is-active", "--quiet", service)
 	return err == nil
-}
-
-func dumpMachineRemoveDiagnostics(ctx context.Context, log *slog.Logger, machineName, machineDir string) {
-	log.Info("machinectl remove failed, collecting host diagnostics", "machine", machineName, "dir", machineDir)
-
-	runDiagnostic := func(label, command string, args ...string) {
-		out, err := exec.CommandContext(ctx, command, args...).CombinedOutput()
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			if line != "" {
-				log.Info("diagnostic output", "label", label, "line", line)
-			}
-		}
-
-		if err != nil {
-			log.Info("diagnostic command failed", "label", label, "command", command, "error", err)
-		}
-	}
-
-	serviceName := fmt.Sprintf("systemd-nspawn@%s.service", machineName)
-	runDiagnostic("machine-status", "machinectl", "status", machineName, "--no-pager")
-	runDiagnostic("machine-list", "machinectl", "list", "--no-pager")
-	runDiagnostic("nspawn-service-status", "systemctl", "status", serviceName, "--no-pager")
-	runDiagnostic("rootfs-mounts", "findmnt", "-R", machineDir)
-	runDiagnostic("host-locks", "lslocks")
-	runDiagnostic("nspawn-lock-dir", "ls", "-la", "/run/systemd/nspawn/locks")
-	runDiagnostic("machine-dir", "ls", "-la", machineDir)
-	runDiagnostic("selinux-avc", "ausearch", "-m", "AVC,USER_AVC", "-ts", "recent")
 }

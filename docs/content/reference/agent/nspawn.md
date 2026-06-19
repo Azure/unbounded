@@ -181,6 +181,23 @@ The agent's three-phase bootstrap drives the nspawn lifecycle:
 3. **Node start.** Starts the nspawn machine, polls until it is responsive,
    then enables containerd and kubelet inside it.
 
+### Removal
+
+During reset and blue/green repave operations, the agent first stops the active
+`systemd-nspawn@<MachineName>.service` and waits until `machinectl` no longer
+knows the machine. It then asks `machinectl remove <MachineName>` to remove the
+image/rootfs registration.
+
+On some hosts, `machinectl remove` can still fail after the machine is stopped
+because of host-side policy or packaging behavior rather than because the
+container is still running. Fedora with SELinux enforcing can deny
+`systemd-machined` permission to create its nspawn image lock file under
+`/run/systemd/nspawn/locks`, causing `machinectl remove` to report
+`Access denied` even though `machinectl show <MachineName>` already reports no
+such machine. In that state, the agent falls back to deleting the inactive
+rootfs directory directly so the same machine name can be reused on a later
+blue/green cycle.
+
 ## Networking
 
 The container operates in the host's network namespace (`VirtualEthernet=no`):
