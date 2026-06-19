@@ -173,7 +173,7 @@ addr                = "0.0.0.0:0" # fabric listen address; :0 picks a free port.
 # hcas_per_numa_node = 1        # max HCAs used per NUMA node.
 
 [startup.topology]
-serving_cores         = 0        # serving shards; 0 = auto-fill every usable CPU.
+# serving_cores       = 12       # optional serving-shard cap; omit to use every usable CPU.
 nic_workers           = 4        # fabric CPUs pinned per active HCA (0 -> 4).
 use_smt_siblings      = false    # also place shards on SMT sibling CPUs.
 ignore_isolated       = false    # also schedule onto isolcpus-isolated CPUs.

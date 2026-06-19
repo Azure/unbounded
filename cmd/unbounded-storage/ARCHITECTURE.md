@@ -591,10 +591,10 @@ Sections (all optional, each falling back to defaults):
   `startup_to_core_plan_config` inverts the negative plan fields so the
   historical defaults hold. See the CLI section for the per-field
   defaults.
-- `[[neighborhoods.peers]]` - `id` (unique `u64` within the neighborhood,
-  doubles as both `NodeId` and `PeerId`), `tags`, and one `config` table (`tcp`
-  with a `SocketAddr`, or `rdma` with a provider-native address encoded as
-  `hex:<fi_getname-bytes>` and optional `hca_numa`).
+- `[[neighborhoods.peers]]` - `id` (unique `u64` within the neighborhood;
+  fabric peer ids are scoped by neighborhood), `tags` for placement-aware
+  routing, and one transport table (`tcp` with a `SocketAddr`, or `rdma` with a
+  provider-native address encoded as `hex:<fi_getname-bytes>`).
 - `[[caches]]` - `name`, `source` (a backend or neighborhood component name),
   and `[[caches.disks]]`. Each disk has one `config` table (`block` with
   `path` and optional `numa`, or `file` with `path` and required `size`),

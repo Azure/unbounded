@@ -19,8 +19,8 @@ metadata:
 # its proto3 zero value, which the daemon promotes to the documented default.
 #
 # Per-node sections are supervisor-injected when a storage ring is active:
-# startup.fabric.tcp.addr is overridden per node, and every declared neighborhood
-# gets its local_node_id plus label-discovered peers merged into
+# startup.fabric.binds.tcp.addr is overridden per node, and every declared
+# neighborhood gets its local_node_id plus label-discovered peers merged into
 # neighborhoods[].peers (discovered peers win id collisions). Declare
 # neighborhoods here when this deployment should participate in a P2P ring; the
 # supervisor will not invent one because each neighborhood needs an explicit
@@ -59,8 +59,8 @@ data:
         allow_inactive_port: false
         # Disable RDMA and force the libfabric tcp provider.
         disable_rdma: false
-        # Cap on serving-shard CPUs to pin (0 = auto: claim every usable core).
-        serving_cores: 0
+        # Cap on serving-shard CPUs to pin. Omit to claim every usable core.
+        # serving_cores: 12
         # NIC-worker CPUs to pin per active HCA.
         nic_workers: 4
       metrics:
