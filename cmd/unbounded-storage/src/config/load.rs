@@ -1532,7 +1532,6 @@ addr = "10.0.0.2:9000"
         assert_eq!(s.fabric().default_listen_addr(), Some("0.0.0.0:0"));
         assert_eq!(s.fabric().max_inflight, Some(1024));
         assert_eq!(s.topology().nic_workers, Some(4));
-        assert_eq!(s.topology().hcas_per_numa_node, Some(1));
     }
 
     #[test]

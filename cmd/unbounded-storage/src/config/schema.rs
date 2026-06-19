@@ -49,6 +49,9 @@ impl Config {
             Some(fabric_cfg::Binds::Tcp(tcp)) if tcp.addr.is_empty() => {
                 tcp.addr = "0.0.0.0:0".to_string();
             }
+            Some(fabric_cfg::Binds::AutoRdma(auto)) => {
+                auto.hcas_per_numa_node.get_or_insert(1);
+            }
             Some(fabric_cfg::Binds::Tcp(_)) | Some(fabric_cfg::Binds::Rdma(_)) => {}
             None => {
                 fabric.binds = Some(fabric_cfg::Binds::Tcp(TcpFabricBinds {
@@ -63,7 +66,6 @@ impl Config {
 
         let topology = startup.topology.get_or_insert_with(TopologyCfg::default);
         topology.nic_workers.get_or_insert(4);
-        topology.hcas_per_numa_node.get_or_insert(1);
         // `serving_cores = None` means auto-fill every usable core.
 
         // Metrics: the exporter is opt-in, so an empty addr (the proto3
@@ -165,7 +167,15 @@ impl FabricCfg {
         match self.binds.as_ref() {
             Some(fabric_cfg::Binds::Tcp(cfg)) => Some(cfg.addr.as_str()),
             Some(fabric_cfg::Binds::Rdma(cfg)) => cfg.binds.first().map(|bind| bind.addr.as_str()),
+            Some(fabric_cfg::Binds::AutoRdma(_)) => Some("0.0.0.0:0"),
             None => None,
+        }
+    }
+
+    pub fn auto_hcas_per_numa_node(&self) -> Option<u64> {
+        match self.binds.as_ref() {
+            Some(fabric_cfg::Binds::AutoRdma(cfg)) => cfg.hcas_per_numa_node,
+            Some(fabric_cfg::Binds::Tcp(_)) | Some(fabric_cfg::Binds::Rdma(_)) | None => None,
         }
     }
 
@@ -175,7 +185,7 @@ impl FabricCfg {
             .into_iter()
             .filter_map(|binds| match binds {
                 fabric_cfg::Binds::Rdma(cfg) => Some(cfg.binds.as_slice()),
-                fabric_cfg::Binds::Tcp(_) => None,
+                fabric_cfg::Binds::Tcp(_) | fabric_cfg::Binds::AutoRdma(_) => None,
             })
             .flatten()
             .map(|bind| bind.addr.as_str())
@@ -313,6 +323,21 @@ addr = "192.168.253.1:49151"
         assert_eq!(binds.len(), 2);
         assert_eq!(binds[0], "192.168.252.1:49151");
         assert_eq!(binds[1], "192.168.253.1:49151");
+    }
+
+    #[test]
+    fn auto_rdma_bind_defaults_hca_cap() {
+        let s = r#"
+[startup.fabric]
+
+[startup.fabric.binds.auto_rdma]
+"#;
+        let mut c: Config = toml::from_str(s).unwrap();
+        c.apply_defaults();
+
+        let fabric = c.startup().fabric();
+        assert_eq!(fabric.default_listen_addr(), Some("0.0.0.0:0"));
+        assert_eq!(fabric.auto_hcas_per_numa_node(), Some(1));
     }
 
     #[test]
@@ -644,8 +669,6 @@ workerz = 8
         assert_eq!(s.topology().nic_workers, Some(4));
         // `serving_cores` stays absent, which means auto-fill.
         assert_eq!(s.topology().serving_cores, None);
-        // One HCA per NUMA node by default.
-        assert_eq!(s.topology().hcas_per_numa_node, Some(1));
         // The inverted-sense flags default to false so the historical
         // safe behavior (respect isolated, exclude cpu0, require active
         // port) is preserved.
@@ -669,8 +692,8 @@ progress_poll_us = 25
 rpc_worker_threads = 8
 max_inflight = 2048
 
-[startup.fabric.binds.tcp]
-addr = "10.0.0.1:7000"
+[startup.fabric.binds.auto_rdma]
+hcas_per_numa_node = 2
 
 [startup.topology]
 use_smt_siblings = true
@@ -680,14 +703,14 @@ allow_inactive_port = true
 disable_rdma = true
 serving_cores = 12
 nic_workers = 6
-hcas_per_numa_node = 2
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         let st = c.startup();
         assert!(st.memory().no_hugepages);
         assert_eq!(st.memory().memory_total_bytes, Some(64 * 1024 * 1024));
-        assert_eq!(st.fabric().default_listen_addr(), Some("10.0.0.1:7000"));
+        assert_eq!(st.fabric().default_listen_addr(), Some("0.0.0.0:0"));
+        assert_eq!(st.fabric().auto_hcas_per_numa_node(), Some(2));
         assert_eq!(st.fabric().progress_threads, Some(3));
         assert_eq!(st.fabric().progress_poll_us, Some(25));
         assert_eq!(st.fabric().rpc_worker_threads, Some(8));
@@ -699,7 +722,6 @@ hcas_per_numa_node = 2
         assert!(st.topology().disable_rdma);
         assert_eq!(st.topology().serving_cores, Some(12));
         assert_eq!(st.topology().nic_workers, Some(6));
-        assert_eq!(st.topology().hcas_per_numa_node, Some(2));
     }
     #[test]
     fn startup_defaults_are_idempotent() {

@@ -59,8 +59,8 @@ startup:
     no_hugepages: true
     memory_total_bytes: 134217728
   fabric:
-    tcp:
-      addr: "10.0.0.1:7000"
+    auto_rdma:
+      hcas_per_numa_node: 2
     progress_threads: 3
     progress_poll_us: 25
     rpc_worker_threads: 8
@@ -73,7 +73,6 @@ startup:
     disable_rdma: true
     serving_cores: 12
     nic_workers: 6
-    hcas_per_numa_node: 2
   metrics:
     addr: "0.0.0.0:9100"
 `)
@@ -84,7 +83,8 @@ startup:
 	assert.True(t, cfg.GetStartup().GetMemory().GetNoHugepages())
 	assert.NotNil(t, cfg.GetStartup().GetMemory().MemoryTotalBytes)
 	assert.Equal(t, uint64(134217728), cfg.GetStartup().GetMemory().GetMemoryTotalBytes())
-	assert.Equal(t, "10.0.0.1:7000", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
+	assert.NotNil(t, cfg.GetStartup().GetFabric().GetAutoRdma().HcasPerNumaNode)
+	assert.Equal(t, uint64(2), cfg.GetStartup().GetFabric().GetAutoRdma().GetHcasPerNumaNode())
 	assert.NotNil(t, cfg.GetStartup().GetFabric().ProgressThreads)
 	assert.Equal(t, uint32(3), cfg.GetStartup().GetFabric().GetProgressThreads())
 	assert.NotNil(t, cfg.GetStartup().GetFabric().ProgressPollUs)
@@ -102,8 +102,6 @@ startup:
 	assert.Equal(t, uint64(12), cfg.GetStartup().GetTopology().GetServingCores())
 	assert.NotNil(t, cfg.GetStartup().GetTopology().NicWorkers)
 	assert.Equal(t, uint64(6), cfg.GetStartup().GetTopology().GetNicWorkers())
-	assert.NotNil(t, cfg.GetStartup().GetTopology().HcasPerNumaNode)
-	assert.Equal(t, uint64(2), cfg.GetStartup().GetTopology().GetHcasPerNumaNode())
 	assert.Equal(t, "0.0.0.0:9100", cfg.GetStartup().GetMetrics().GetAddr())
 }
 
@@ -124,7 +122,6 @@ startup:
   topology:
     serving_cores: 0
     nic_workers: 4
-    hcas_per_numa_node: 1
   metrics:
     addr: ""
 `)
@@ -142,8 +139,6 @@ startup:
 	assert.Equal(t, uint64(0), cfg.GetStartup().GetTopology().GetServingCores())
 	assert.NotNil(t, cfg.GetStartup().GetTopology().NicWorkers)
 	assert.Equal(t, uint64(4), cfg.GetStartup().GetTopology().GetNicWorkers())
-	assert.NotNil(t, cfg.GetStartup().GetTopology().HcasPerNumaNode)
-	assert.Equal(t, uint64(1), cfg.GetStartup().GetTopology().GetHcasPerNumaNode())
 	assert.Empty(t, cfg.GetStartup().GetMetrics().GetAddr())
 }
 

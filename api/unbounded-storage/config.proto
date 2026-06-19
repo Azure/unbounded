@@ -44,19 +44,20 @@ message FabricCfg {
   oneof binds {
     TcpFabricBinds tcp = 1;
     RdmaFabricBinds rdma = 2;
+    AutoRdmaFabricBinds auto_rdma = 3;
   }
 
   // Maximum in-flight fabric operations per shard. Defaults to 1024 when unset.
-  optional uint32 max_inflight = 3;
+  optional uint32 max_inflight = 4;
 
   // libfabric progress threads per shard. Defaults to 2 when unset.
-  optional uint32 progress_threads = 4;
+  optional uint32 progress_threads = 5;
 
   // Fabric RPC worker threads per shard. Defaults to 4 when unset.
-  optional uint32 rpc_worker_threads = 5;
+  optional uint32 rpc_worker_threads = 6;
 
   // Progress-thread busy-poll budget in microseconds. Defaults to 10 when unset.
-  optional uint32 progress_poll_us = 6;
+  optional uint32 progress_poll_us = 7;
 }
 
 message TcpFabricBinds {
@@ -65,6 +66,13 @@ message TcpFabricBinds {
 
 message RdmaFabricBinds {
   repeated RdmaFabricBind binds = 1;
+}
+
+message AutoRdmaFabricBinds {
+  // Maximum number of HCAs to bind per NUMA node. Defaults to 1 when unset.
+  // Raise this to use additional HCAs on a NUMA node. HCAs whose NUMA node is
+  // unknown are never capped.
+  optional uint64 hcas_per_numa_node = 1;
 }
 
 message RdmaFabricBind {
@@ -98,13 +106,6 @@ message TopologyCfg {
 
   // NIC-worker CPUs to pin per active HCA. Defaults to 4 when unset.
   optional uint64 nic_workers = 7;
-
-  // Maximum number of HCAs to use per NUMA node. Defaults to 1 when unset.
-  // Raise this to use additional HCAs on a NUMA node. HCAs whose NUMA node is
-  // unknown are never capped.
-  // TODO: Remove this field. Add a new option to FabricCfg.binds that enables "auto rdma binding" (or something like that).
-  //       The goal is to automatically bind to `n` HCAs per NUMA node, defaulting n=1, only when that binding type is configured.
-  optional uint64 hcas_per_numa_node = 8;
 }
 
 message NeighborhoodSpec {

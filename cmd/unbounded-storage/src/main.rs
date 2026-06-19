@@ -112,7 +112,10 @@ fn should_force_tcp_fallback(disable_rdma: bool, hca_count: usize, verbs_availab
     !disable_rdma && hca_count > 0 && !verbs_available
 }
 
-fn startup_to_core_plan_config(topology: &config::TopologyCfg) -> CorePlanConfig {
+fn startup_to_core_plan_config(
+    topology: &config::TopologyCfg,
+    fabric: &config::FabricCfg,
+) -> CorePlanConfig {
     let defaults = CorePlanConfig::default();
     CorePlanConfig {
         nic_workers: topology
@@ -120,8 +123,8 @@ fn startup_to_core_plan_config(topology: &config::TopologyCfg) -> CorePlanConfig
             .map(|n| n as usize)
             .unwrap_or(defaults.nic_workers),
         serving_cores: topology.serving_cores.map(|n| n as usize),
-        hcas_per_numa: topology
-            .hcas_per_numa_node
+        hcas_per_numa: fabric
+            .auto_hcas_per_numa_node()
             .map(|n| n as usize)
             .unwrap_or(defaults.hcas_per_numa),
         use_smt_siblings: topology.use_smt_siblings,
@@ -258,7 +261,7 @@ fn main() -> ExitCode {
     // detected, force the tcp fallback (the same path as the
     // `disable_rdma` escape hatch) so the daemon comes up over the tcp
     // provider instead of failing every shard at bring-up.
-    let mut core_plan_config = startup_to_core_plan_config(startup.topology());
+    let mut core_plan_config = startup_to_core_plan_config(startup.topology(), fabric_cfg);
     if should_force_tcp_fallback(
         core_plan_config.disable_rdma,
         host.hcas.len(),
@@ -1658,12 +1661,27 @@ mod tests {
         cfg.startup().topology().clone()
     }
 
+    fn default_fabric() -> config::FabricCfg {
+        let mut cfg = Config::default();
+        cfg.apply_defaults();
+        cfg.startup().fabric().clone()
+    }
+
+    fn auto_rdma_fabric(hcas_per_numa_node: Option<u64>) -> config::FabricCfg {
+        config::FabricCfg {
+            binds: Some(config::fabric_cfg::Binds::AutoRdma(
+                config::AutoRdmaFabricBinds { hcas_per_numa_node },
+            )),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn startup_to_core_plan_config_default_mapping() {
         // The defaults-populated `[startup.topology]` must map to the
         // `CorePlanConfig` defaults: nic_workers=4, serving_cores=auto,
         // and the historical safe placement flags.
-        let cc = startup_to_core_plan_config(&default_topology());
+        let cc = startup_to_core_plan_config(&default_topology(), &default_fabric());
         let d = CorePlanConfig::default();
         assert_eq!(cc.nic_workers, 4);
         assert_eq!(cc.serving_cores, None);
@@ -1692,9 +1710,8 @@ mod tests {
             disable_rdma: true,
             serving_cores: Some(12),
             nic_workers: Some(6),
-            hcas_per_numa_node: Some(2),
         };
-        let cc = startup_to_core_plan_config(&topology);
+        let cc = startup_to_core_plan_config(&topology, &auto_rdma_fabric(Some(2)));
         assert_eq!(cc.nic_workers, 6);
         assert_eq!(cc.serving_cores, Some(12));
         assert_eq!(cc.hcas_per_numa, 2);
@@ -1712,10 +1729,9 @@ mod tests {
         let topology = config::TopologyCfg {
             nic_workers: None,
             serving_cores: None,
-            hcas_per_numa_node: None,
             ..default_topology()
         };
-        let cc = startup_to_core_plan_config(&topology);
+        let cc = startup_to_core_plan_config(&topology, &auto_rdma_fabric(None));
         assert_eq!(cc.nic_workers, 4);
         assert_eq!(cc.serving_cores, None);
         assert_eq!(cc.hcas_per_numa, 1);

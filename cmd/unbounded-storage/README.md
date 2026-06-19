@@ -160,17 +160,21 @@ memory_total_bytes = 134217728   # u64 bytes (no K/M/G suffix). Total backing po
                                  #   evenly across serving shards. 0 -> 128 MiB.
 
 [startup.fabric]
-addr                = "0.0.0.0:0" # per-shard fabric listen address; :0 picks a free port.
-                                  # Use "hex:..." only for provider-native binds.
 progress_threads    = 2          # libfabric progress threads per shard.
 progress_poll_us    = 10         # progress-thread busy-poll budget (us).
 rpc_worker_threads  = 4          # fabric RPC worker threads per shard.
 max_inflight        = 1024       # max in-flight fabric ops per shard (back-pressure).
 
+[startup.fabric.binds.tcp]
+addr                = "0.0.0.0:0" # fabric listen address; :0 picks a free port.
+
+# Or use automatic RDMA HCA binding:
+# [startup.fabric.binds.auto_rdma]
+# hcas_per_numa_node = 1        # max HCAs used per NUMA node.
+
 [startup.topology]
 serving_cores         = 0        # serving shards; 0 = auto-fill every usable CPU.
 nic_workers           = 4        # fabric CPUs pinned per active HCA (0 -> 4).
-hcas_per_numa_node    = 1        # max HCAs used per NUMA node (0 -> 1).
 use_smt_siblings      = false    # also place shards on SMT sibling CPUs.
 ignore_isolated       = false    # also schedule onto isolcpus-isolated CPUs.
 include_node_cpu0     = false    # allow placing a shard on each NUMA node's CPU 0.

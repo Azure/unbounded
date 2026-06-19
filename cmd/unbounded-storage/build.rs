@@ -98,6 +98,7 @@ fn generate_config_schema() {
         "FabricCfg",
         "TcpFabricBinds",
         "RdmaFabricBinds",
+        "AutoRdmaFabricBinds",
         "RdmaFabricBind",
         "TopologyCfg",
         "MetricsCfg",
@@ -114,7 +115,7 @@ fn generate_config_schema() {
         "FrontendSpec.config",
     ] {
         prost.type_attribute(oneof, "#[derive(::serde::Deserialize)]");
-        prost.type_attribute(oneof, "#[serde(rename_all = \"lowercase\")]");
+        prost.type_attribute(oneof, "#[serde(rename_all = \"snake_case\")]");
     }
 
     prost

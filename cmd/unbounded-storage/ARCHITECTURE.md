@@ -109,14 +109,14 @@ excluded from the live-reload diff.
   bytes, no suffix; unset/null defaults to 128 MiB) - the total backing
   pool, split evenly across the serving shards so the host footprint stays
   fixed regardless of the auto-scaled shard count.
-- `[startup.fabric]` - `addr` (default `0.0.0.0:0`, or `hex:...`
-  for provider-native binds), `progress_threads` (2), `progress_poll_us`
-  (10), `rpc_worker_threads` (4), `max_inflight` (1024) - the fabric
-  endpoint, thread pools, and in-flight cap.
+- `[startup.fabric]` - one `binds` table (`tcp`, `rdma`, or `auto_rdma`),
+  `progress_threads` (2), `progress_poll_us` (10), `rpc_worker_threads` (4),
+  `max_inflight` (1024) - the fabric endpoint, thread pools, and in-flight
+  cap. `auto_rdma.hcas_per_numa_node` caps automatically selected HCAs per
+  NUMA node and defaults to 1 when `auto_rdma` is configured.
 - `[startup.topology]` - `serving_cores` (unset/null = auto-fill every usable
   CPU), `nic_workers` (fabric CPUs per active HCA, unset/null defaults to 4),
-  `hcas_per_numa_node` (max HCAs used per NUMA node, unset/null defaults to 1), and the
-  toggles `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
+  and the toggles `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
   `allow_inactive_port`, `disable_rdma` - feed
   `startup_to_core_plan_config`, which builds the `topology::CorePlanConfig`
   consumed by `CorePlan::for_host`. The toggles default off; the three
@@ -579,11 +579,11 @@ Sections (all optional, each falling back to defaults):
   `designs/storage-disjoint-routing-parity.md`).
 - `[startup]` - startup-fixed knobs, read once at process start and
   excluded from the live-reload diff: `[startup.memory]`
-  (`no_hugepages`, `memory_total_bytes`), `[startup.fabric]` (`addr`,
+  (`no_hugepages`, `memory_total_bytes`), `[startup.fabric]` (`binds`,
   `progress_threads`, `progress_poll_us`, `rpc_worker_threads`,
-  `max_inflight`), and `[startup.topology]` (`serving_cores`,
-  `nic_workers`, `hcas_per_numa_node`, `use_smt_siblings`, `ignore_isolated`,
-  `include_node_cpu0`, `allow_inactive_port`, `disable_rdma`).
+  `max_inflight`), and `[startup.topology]` (`serving_cores`, `nic_workers`,
+  `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
+  `allow_inactive_port`, `disable_rdma`).
   `startup_to_core_plan_config` inverts the negative plan fields so the
   historical defaults hold. See the CLI section for the per-field
   defaults.
