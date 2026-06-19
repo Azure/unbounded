@@ -115,7 +115,7 @@ const (
 	DefaultOCIImage       = "ghcr.io/azure/agent-ubuntu2404:v20260619"
 	DefaultNvidiaOCIImage = "ghcr.io/azure/agent-ubuntu2404-nvidia:v20260619"
 
-	// Deprecated: use DefaultNvidiaOCIImage.
+	// Deprecated: use DefaultNvidiaOCIImage. This alias will be removed in v0.1.19.
 	DefaultNvidiaOCImage = DefaultNvidiaOCIImage
 
 	SystemdUnitContainerd   = "containerd.service"
