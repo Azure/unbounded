@@ -324,7 +324,7 @@ source = "cache"
 [frontends.config.http]
 addr = "0.0.0.0:$OPT_FRONTEND_PORT"
 
-[startup.fabric]
+[startup.fabric.binds.tcp]
 # Bind the node's own routable IP, not 0.0.0.0. This must be the exact
 # address peers use to reach this node (their [[neighborhoods.peers]] TCP addr
 # points here); the libfabric tcp provider uses it both to bind and as its
