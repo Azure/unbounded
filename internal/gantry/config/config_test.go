@@ -82,6 +82,38 @@ func TestValidate_HRWScope(t *testing.T) {
 	}
 }
 
+func TestValidate_CoordBoundsMustBePositive(t *testing.T) {
+	tests := []struct {
+		name string
+		mut  func(*Config)
+		want string
+	}{
+		{
+			name: "max digests",
+			mut:  func(c *Config) { c.CoordMaxDigestsPerRequest = 0 },
+			want: "coord_max_digests_per_request",
+		},
+		{
+			name: "max pulls",
+			mut:  func(c *Config) { c.CoordMaxConcurrentPulls = 0 },
+			want: "coord_max_concurrent_pulls",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			tt.mut(c)
+
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("want %s error, got %v", tt.want, err)
+			}
+		})
+	}
+}
+
 // TestValidate_NodeNameRequiresPodName pins the fail-fast
 // rule: production K8s mode set via GANTRY_NODE_NAME but without
 // GANTRY_POD_NAME is the silent-peer-coordination-failure case the
@@ -218,6 +250,8 @@ upstream_registries:
     endpoint: https://registry.example.com
     credentials_path: /etc/gantry/creds.txt
 hrw_k: 5
+coord_max_digests_per_request: 12
+coord_max_concurrent_pulls: 4
 nf5_jitter_base: 7s
 log_level: debug
 `)
@@ -239,6 +273,14 @@ log_level: debug
 		t.Errorf("HRWK = %d, want 5", c.HRWK)
 	}
 
+	if c.CoordMaxDigestsPerRequest != 12 {
+		t.Errorf("CoordMaxDigestsPerRequest = %d, want 12", c.CoordMaxDigestsPerRequest)
+	}
+
+	if c.CoordMaxConcurrentPulls != 4 {
+		t.Errorf("CoordMaxConcurrentPulls = %d, want 4", c.CoordMaxConcurrentPulls)
+	}
+
 	if c.NF5JitterBase != 7*time.Second {
 		t.Errorf("NF5JitterBase = %v, want 7s", c.NF5JitterBase)
 	}
@@ -253,10 +295,12 @@ func TestLoadEnv(t *testing.T) {
 	env := map[string]string{
 		// Deprecated env vars are no longer read; setting them
 		// here proves they are ignored.
-		"GANTRY_CACHE_DIR":          "/etc/gantry/cache",
-		"GANTRY_CACHE_BUDGET_BYTES": "7777",
-		"GANTRY_HRW_K":              "9",
-		"GANTRY_NF5_JITTER_BASE":    "4500ms",
+		"GANTRY_CACHE_DIR":                     "/etc/gantry/cache",
+		"GANTRY_CACHE_BUDGET_BYTES":            "7777",
+		"GANTRY_HRW_K":                         "9",
+		"GANTRY_COORD_MAX_DIGESTS_PER_REQUEST": "11",
+		"GANTRY_COORD_MAX_CONCURRENT_PULLS":    "3",
+		"GANTRY_NF5_JITTER_BASE":               "4500ms",
 	}
 
 	getenv := func(k string) string { return env[k] }
@@ -274,6 +318,14 @@ func TestLoadEnv(t *testing.T) {
 
 	if c.HRWK != 9 {
 		t.Errorf("HRWK = %d", c.HRWK)
+	}
+
+	if c.CoordMaxDigestsPerRequest != 11 {
+		t.Errorf("CoordMaxDigestsPerRequest = %d", c.CoordMaxDigestsPerRequest)
+	}
+
+	if c.CoordMaxConcurrentPulls != 3 {
+		t.Errorf("CoordMaxConcurrentPulls = %d", c.CoordMaxConcurrentPulls)
 	}
 
 	if c.NF5JitterBase != 4500*time.Millisecond {
