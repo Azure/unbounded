@@ -25,6 +25,7 @@ func TestHonorWindowSweep_EvictsExpiredEntriesWhenDifferentDigestTouched(t *test
 	d2 := digest.MustParse("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 
 	r.recordHonorWindow(d1, now.Add(10*time.Second))
+
 	if got := len(r.honorUntil); got != 1 {
 		t.Fatalf("len after first record = %d, want 1", got)
 	}

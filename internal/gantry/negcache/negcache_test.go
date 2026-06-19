@@ -122,6 +122,7 @@ func TestLookup_ExpiredEntryEvicted(t *testing.T) {
 func TestSweep_EvictsExpiredEntriesWhenDifferentDigestTouched(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0).UTC()
 	nowFn, setNow := fakeClock(start)
+
 	var sizes []int
 
 	c := New(Options{
@@ -135,6 +136,7 @@ func TestSweep_EvictsExpiredEntriesWhenDifferentDigestTouched(t *testing.T) {
 	dy := mustDigest(t, dB)
 
 	c.RecordFailure(dx, ifaces.FailureRateLimited)
+
 	if got := c.Len(); got != 1 {
 		t.Fatalf("Len after first failure = %d, want 1", got)
 	}

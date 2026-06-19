@@ -215,12 +215,14 @@ func (c *Cache) sweepExpiredLocked(now time.Time) {
 	}
 
 	removed := false
+
 	for d, e := range c.m {
 		if !now.After(e.CooldownUntil) {
 			continue
 		}
 
 		delete(c.m, d)
+
 		removed = true
 	}
 

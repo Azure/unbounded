@@ -1589,6 +1589,7 @@ func (s *Server) resolveViaColdStart(ctx context.Context, d digest.Digest, kind 
 func (s *Server) filterProvidersForDigest(d digest.Digest, providers []ifaces.Provider) ([]ifaces.Provider, peerAttemptSummary) {
 	now := time.Now()
 	s.sweepProviderFailures(now)
+
 	filtered := make([]ifaces.Provider, 0, len(providers))
 
 	var summary peerAttemptSummary
