@@ -1,0 +1,65 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-storage-config
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-storage-supervisor
+    app.kubernetes.io/component: storage
+# Cluster-wide daemon configuration. The single config.yaml key is the full
+# unbounded-storage Config schema expressed as YAML (see
+# api/unbounded-storage/config.proto and src/config/schema.rs); field names use
+# the proto snake_case paths. The run supervisor unmarshals it into protobuf
+# and renders the host config (binary protobuf at config.binpb). Unknown fields
+# are rejected, so a typo fails the render loudly. Any field left unset keeps
+# its proto3 zero value, which the daemon promotes to the documented default.
+#
+# Per-node sections are supervisor-injected and should not be set here:
+# p2p.local_node_id and the listen_addr (when a storage ring is active) are
+# overridden per node, and label-discovered peers are merged into peers
+# (discovered peers win id collisions). Peers declared here are kept only when
+# no ring is active or when their ids do not collide with discovered peers.
+data:
+  config.yaml: |
+    # Operator-assigned config version (opaque counter; 0 means unversioned).
+    version: 0
+
+    startup:
+      memory:
+        # Allocate per-shard backing from the heap instead of 2 MiB hugepages.
+        no_hugepages: false
+        # Total backing pool across all serving shards in bytes (128 MiB).
+        memory_total_bytes: 134217728
+      fabric:
+        # Per-shard fabric listen address (":0" picks a free port).
+        listen_addr: "0.0.0.0:0"
+        # libfabric progress threads per shard.
+        progress_threads: 2
+        # Progress-thread busy-poll budget in microseconds.
+        progress_poll_us: 10
+        # Fabric RPC worker threads per shard.
+        rpc_worker_threads: 4
+        # Max in-flight fabric operations per shard (back-pressure limit).
+        max_inflight: 1024
+      topology:
+        # Place shards on SMT sibling CPUs as well as physical cores.
+        use_smt_siblings: false
+        # Schedule shards onto isolcpus-isolated CPUs too.
+        ignore_isolated: false
+        # Allow placing a shard on each NUMA node's CPU 0.
+        include_node_cpu0: false
+        # Use HCA ports that are not in the active state.
+        allow_inactive_port: false
+        # Disable RDMA and force the libfabric tcp provider.
+        disable_rdma: false
+        # Cap on serving-shard CPUs to pin (0 = auto: claim every usable core).
+        serving_cores: 0
+        # NIC-worker CPUs to pin per active HCA.
+        nic_workers: 4
+      metrics:
+        # Prometheus exporter listen address ("" disables the exporter).
+        bind: ""

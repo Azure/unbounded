@@ -149,7 +149,9 @@ type phase3Metrics struct {
 	coordPullIntentStorageUnavailable prometheus.Counter
 	coordPleasePullServed             prometheus.Counter
 	coordPleasePullStarted            prometheus.Counter
+	coordPleasePullDeclined           prometheus.Counter
 	coordStreamError                  prometheus.Counter
+	coordUnauthorizedPeer             *prometheus.CounterVec
 	prefetchBatchesTotal              prometheus.Counter
 	prefetchDigestsTotal              prometheus.Counter
 	prefetchPullersPerBatch           prometheus.Histogram
@@ -197,10 +199,18 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 			Name: "p2p_coord_please_pull_started_total",
 			Help: "Digests transitioned to in_flight via please_pull on this node.",
 		}),
+		coordPleasePullDeclined: reg.NewCounter("coord", prometheus.CounterOpts{
+			Name: "p2p_coord_please_pull_declined_total",
+			Help: "Digests this node declined to start via please_pull because the puller-pump was at its concurrent-pull ceiling or shutting down (reported as OUTCOME_UNSPECIFIED). A sustained nonzero rate means designated pullers are saturated and requesters are falling through to direct-origin fallback (NF5).",
+		}),
 		coordStreamError: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_coord_stream_error_total",
-			Help: "Malformed or oversized coord streams rejected by this node.",
+			Help: "Inbound coord streams dropped without a normal reply: malformed or oversized envelopes, read/decode/deadline failures, concurrent-stream-limit drops, dispatch or serve errors, and response marshal/write failures. Enforce-mode peer-authz rejections are NOT counted here (they are tracked, by reason, in p2p_coord_unauthorized_peer_total), so enabling peer authz does not inflate this protocol-error signal.",
 		}),
+		coordUnauthorizedPeer: reg.NewCounterVec("coord", prometheus.CounterOpts{
+			Name: "p2p_coord_unauthorized_peer_total",
+			Help: "Inbound coord requests whose libp2p peer ID was not authorized against the membership view, labelled by reason: \"unrecognized\" (membership has published peer IDs but none match the dialing peer) or \"unevaluable\" (no member has published a peer ID yet, only reported in enforce mode). Fires in observe-only for recognized misses and in enforce mode for both. Verify peer-id annotations are published before using zero as an enforcement-readiness signal.",
+		}, []string{"reason"}),
 		prefetchBatchesTotal: reg.NewCounter("coord", prometheus.CounterOpts{
 			Name: "p2p_prefetch_batches_total",
 			Help: "Speculative manifest-pre-fan PleasePull batches dispatched (one per distinct HRW rank-0 puller per manifest serve,).",
