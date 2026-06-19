@@ -33,3 +33,34 @@ func TestDiscoverKVMDevicePath_Absent(t *testing.T) {
 		t.Errorf("discoverKVMDevicePath(absent) = %q, want empty string", got)
 	}
 }
+
+func TestDiscoverHostDevicePaths_DisabledReturnsNil(t *testing.T) {
+	// When passthrough is disabled the host must not be probed and no
+	// devices may be exposed, regardless of whether /dev/kvm exists on the
+	// machine running the test.
+	if got := DiscoverHostDevicePaths(false); got != nil {
+		t.Errorf("DiscoverHostDevicePaths(false) = %v, want nil", got)
+	}
+}
+
+func TestDiscoverHostDevicePaths_EnabledMatchesProbe(t *testing.T) {
+	// When enabled the result must equal the underlying probe for /dev/kvm:
+	// either ["/dev/kvm"] on a KVM-capable host or nil otherwise. This keeps
+	// the test host-independent while still exercising the enabled path.
+	got := DiscoverHostDevicePaths(true)
+
+	var want []string
+	if p := discoverKVMDevicePath(kvmDevicePath); p != "" {
+		want = append(want, p)
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("DiscoverHostDevicePaths(true) = %v, want %v", got, want)
+	}
+
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("DiscoverHostDevicePaths(true)[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
