@@ -417,9 +417,11 @@ func runAgent(args []string) error {
 			OnPleasePullStarted:            func() { p3.coordPleasePullStarted.Inc() },
 			OnPleasePullDeclined:           func() { p3.coordPleasePullDeclined.Inc() },
 			OnStreamError:                  func() { p3.coordStreamError.Inc() },
+			OnUnauthorizedPeer:             func(reason string) { p3.coordUnauthorizedPeer.WithLabelValues(reason).Inc() },
 		}),
 		coord.WithNegativeCache(negCacheAdapter{c: negCache}),
 		coord.WithPullerPump(pullerPump),
+		coord.WithPeerAuthz(c.CoordPeerAuthzEnforce),
 		coord.WithMaxDigestsPerPleasePull(c.CoordMaxDigestsPerRequest),
 	}
 	coordServer := coord.NewServer(cstore, memberView, inflightMap, coordOpts...)
