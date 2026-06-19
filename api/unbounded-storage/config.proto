@@ -81,23 +81,24 @@ message RdmaFabricBind {
 }
 
 message TopologyCfg {
-  // Place shards on SMT sibling CPUs as well as physical cores.
-  // TODO: Expand comment to explain the default
+  // Place shards on SMT sibling CPUs as well as physical cores. Defaults to false,
+  // so one serving shard is placed per physical core unless explicitly enabled.
   bool use_smt_siblings = 1;
 
-  // Schedule shards onto isolcpus-isolated CPUs too.
-  // TODO: Expand comment to explain the default
+  // Schedule shards onto isolcpus-isolated CPUs too. Defaults to false, so CPUs
+  // isolated by the kernel are reserved for other workloads unless explicitly included.
   bool ignore_isolated = 2;
 
-  // Allow placing a shard on each NUMA node's CPU 0.
-  // TODO: Expand comment to explain the default
+  // Allow placing a shard on each NUMA node's CPU 0. Defaults to false, reserving
+  // those CPUs for kernel and housekeeping work unless explicitly included.
   bool include_node_cpu0 = 3;
 
   // Use HCA ports that are not in the active state.
   bool allow_inactive_port = 4;
 
-  // Disable RDMA and force the libfabric tcp provider.
-  // TODO: Is this actually required? Ideally we don't need it
+  // Disable RDMA and force the libfabric tcp provider. Defaults to false. This is
+  // an operator escape hatch for hosts where discovered RDMA devices are present
+  // but should not be used by this daemon.
   bool disable_rdma = 5;
 
   // Cap on the number of serving-shard CPUs to pin. When unset, claims every

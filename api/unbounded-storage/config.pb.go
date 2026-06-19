@@ -593,19 +593,20 @@ func (x *RdmaFabricBind) GetAddr() string {
 
 type TopologyCfg struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Place shards on SMT sibling CPUs as well as physical cores.
-	// TODO: Expand comment to explain the default
+	// Place shards on SMT sibling CPUs as well as physical cores. Defaults to false,
+	// so one serving shard is placed per physical core unless explicitly enabled.
 	UseSmtSiblings bool `protobuf:"varint,1,opt,name=use_smt_siblings,json=useSmtSiblings,proto3" json:"use_smt_siblings,omitempty"`
-	// Schedule shards onto isolcpus-isolated CPUs too.
-	// TODO: Expand comment to explain the default
+	// Schedule shards onto isolcpus-isolated CPUs too. Defaults to false, so CPUs
+	// isolated by the kernel are reserved for other workloads unless explicitly included.
 	IgnoreIsolated bool `protobuf:"varint,2,opt,name=ignore_isolated,json=ignoreIsolated,proto3" json:"ignore_isolated,omitempty"`
-	// Allow placing a shard on each NUMA node's CPU 0.
-	// TODO: Expand comment to explain the default
+	// Allow placing a shard on each NUMA node's CPU 0. Defaults to false, reserving
+	// those CPUs for kernel and housekeeping work unless explicitly included.
 	IncludeNodeCpu0 bool `protobuf:"varint,3,opt,name=include_node_cpu0,json=includeNodeCpu0,proto3" json:"include_node_cpu0,omitempty"`
 	// Use HCA ports that are not in the active state.
 	AllowInactivePort bool `protobuf:"varint,4,opt,name=allow_inactive_port,json=allowInactivePort,proto3" json:"allow_inactive_port,omitempty"`
-	// Disable RDMA and force the libfabric tcp provider.
-	// TODO: Is this actually required? Ideally we don't need it
+	// Disable RDMA and force the libfabric tcp provider. Defaults to false. This is
+	// an operator escape hatch for hosts where discovered RDMA devices are present
+	// but should not be used by this daemon.
 	DisableRdma bool `protobuf:"varint,5,opt,name=disable_rdma,json=disableRdma,proto3" json:"disable_rdma,omitempty"`
 	// Cap on the number of serving-shard CPUs to pin. When unset, claims every
 	// usable core left after storage and NIC-worker reservations.
