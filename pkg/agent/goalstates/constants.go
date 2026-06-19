@@ -115,6 +115,9 @@ const (
 	DefaultOCIImage       = "ghcr.io/azure/agent-ubuntu2404:v20260619"
 	DefaultNvidiaOCIImage = "ghcr.io/azure/agent-ubuntu2404-nvidia:v20260619"
 
+	// Deprecated: use DefaultNvidiaOCIImage.
+	DefaultNvidiaOCImage = DefaultNvidiaOCIImage
+
 	SystemdUnitContainerd   = "containerd.service"
 	ContainerdConfigPath    = "/etc/containerd/config.toml"
 	ContainerdConfDropInDir = "/etc/containerd/conf.d"
