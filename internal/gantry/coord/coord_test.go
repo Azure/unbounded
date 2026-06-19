@@ -720,6 +720,66 @@ func rep(c byte, n int) string {
 	return string(b)
 }
 
+// TestPleasePull_RejectsInvalidRepository asserts the server rejects a
+// please_pull whose repository is outside the OCI name grammar before it
+// reaches the puller pump, so an unvalidated repository never flows into
+// origin URL construction.
+func TestPleasePull_RejectsInvalidRepository(t *testing.T) {
+	hClient, hServer := makeHostPair(t)
+
+	c := fakes.NewCache()
+	members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	var pumpCalls int32
+
+	pump := coord.PullerPump(func(_ context.Context, _, _ string, _ digest.Digest, _ ifaces.OriginRefKind) coord.PumpResult {
+		atomic.AddInt32(&pumpCalls, 1)
+		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
+	})
+	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+	srv.Bind(hServer)
+
+	cli := coord.NewClient(hClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	if _, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "../../etc/passwd", ifaces.KindBlob, []digest.Digest{d}); err == nil {
+		t.Fatal("PleasePull: want rejection for invalid repository, got nil error")
+	}
+
+	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
+		t.Fatalf("pumpCalls = %d, want 0 (invalid repository must not reach pump)", got)
+	}
+}
+
+// TestStartLocalPull_RejectsInvalidRepository asserts the in-process
+// self-pull path applies the same repository validation.
+func TestStartLocalPull_RejectsInvalidRepository(t *testing.T) {
+	c := fakes.NewCache()
+	members := fakes.NewMembers("self")
+	infl := inflight.New(inflight.DefaultStalls(), nil)
+
+	var pumpCalls int32
+
+	pump := coord.PullerPump(func(_ context.Context, _, _ string, _ digest.Digest, _ ifaces.OriginRefKind) coord.PumpResult {
+		atomic.AddInt32(&pumpCalls, 1)
+		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
+	})
+	srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+
+	d := digest.MustParse("sha256:" + rep('a', 64))
+	if _, err := srv.StartLocalPull(context.Background(), "reg", "Bad Repo?", ifaces.KindBlob, []digest.Digest{d}); err == nil {
+		t.Fatal("StartLocalPull: want rejection for invalid repository, got nil error")
+	}
+
+	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
+		t.Fatalf("pumpCalls = %d, want 0 (invalid repository must not reach pump)", got)
+	}
+}
+
 // TestPeerAuthz_ObserveOnlyServesAndCounts asserts that, with enforcement
 // off (the default), an inbound request from a peer absent from the
 // membership view is still served but increments the unauthorized-peer

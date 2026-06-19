@@ -51,6 +51,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
+	"github.com/Azure/unbounded/internal/gantry/oci"
 	coordv1 "github.com/Azure/unbounded/internal/gantry/proto/coord/v1"
 )
 
@@ -684,6 +685,10 @@ func (s *Server) StartLocalPull(ctx context.Context, registry, repository string
 		return nil, errors.New("start_local_pull: missing registry/repository")
 	}
 
+	if err := oci.ValidateRepositoryName(repository); err != nil {
+		return nil, fmt.Errorf("start_local_pull: %w", err)
+	}
+
 	if s.maxDigestsPerPleasePull > 0 && len(digests) > s.maxDigestsPerPleasePull {
 		out := make([]ifaces.PleasePullOutcome, 0, len(digests))
 		for start := 0; start < len(digests); start += s.maxDigestsPerPleasePull {
@@ -759,6 +764,11 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 	// the design doc invariant: one repo per batch. Empty / malformed -> reject.
 	if req.GetUpstreamRegistry() == "" || req.GetRepository() == "" {
 		return nil, errors.New("please_pull: missing registry/repository")
+	}
+
+	if err := oci.ValidateRepositoryName(req.GetRepository()); err != nil {
+		s.bumpStreamErr()
+		return nil, fmt.Errorf("please_pull: %w", err)
 	}
 
 	if len(req.GetDigests()) == 0 {
