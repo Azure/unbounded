@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"fmt"
 	"log/slog"
+	"os/exec"
 
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -47,6 +48,7 @@ type hardenAPT struct {
 	// above via the HardenAPT() constructor.
 	aptDropInPath         string
 	needrestartDropInPath string
+	lookupPath            func(string) (string, error)
 }
 
 // HardenAPT returns a task that writes drop-ins which prevent
@@ -57,12 +59,24 @@ func HardenAPT(log *slog.Logger) phases.Task {
 		log:                   log,
 		aptDropInPath:         aptDropInPath,
 		needrestartDropInPath: needrestartDropInPath,
+		lookupPath:            exec.LookPath,
 	}
 }
 
 func (h *hardenAPT) Name() string { return "harden-apt" }
 
 func (h *hardenAPT) Do(_ context.Context) error {
+	lookupPath := h.lookupPath
+	if lookupPath == nil {
+		lookupPath = exec.LookPath
+	}
+
+	if _, err := lookupPath("apt-get"); err != nil {
+		h.log.Debug("skipping apt hardening because apt-get is not available")
+
+		return nil
+	}
+
 	if err := utilio.WriteFile(h.aptDropInPath, aptUnattendedUpgradesConfig, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", h.aptDropInPath, err)
 	}
@@ -71,7 +85,8 @@ func (h *hardenAPT) Do(_ context.Context) error {
 		return fmt.Errorf("write %s: %w", h.needrestartDropInPath, err)
 	}
 
-	h.log.Info("apt and needrestart hardened against systemd-machined restarts",
+	h.log.Info(
+		"apt and needrestart hardened against systemd-machined restarts",
 		"apt_dropin", h.aptDropInPath,
 		"needrestart_dropin", h.needrestartDropInPath,
 	)

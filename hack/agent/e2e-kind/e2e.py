@@ -19,6 +19,7 @@ The test follows a single linear sequence:
 Options:
     --verbose                          Enable diagnostic output (network diags).
     --node-config PATH                 JSON file with node config variant settings.
+    AGENT_OCI_IMAGE                    Optional OCI rootfs image for the agent node.
 
 Subcommands (called as individual workflow steps):
     create-vm                          Create bridge networking and launch a QEMU VM.
@@ -84,12 +85,14 @@ VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
 HOST_BASE_OS = os.environ.get("HOST_BASE_OS", "ubuntu2404")
 HOST_IMAGE_URL = os.environ.get("HOST_IMAGE_URL", "")
 NSPAWN_OCI_IMAGE = os.environ.get("NSPAWN_OCI_IMAGE", "")
+VM_SSH_USER = os.environ.get("VM_SSH_USER", "ubuntu")
 NODE_CONFIG_DIR = REPO_ROOT / "hack" / "agent" / "e2e-kind" / "node-configs"
 
 KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
 KIND_CONTAINER = f"{KIND_CLUSTER_NAME}-control-plane"
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
+AGENT_OCI_IMAGE = os.environ.get("AGENT_OCI_IMAGE", "")
 
 # Site name used when generating the bootstrap script via kubectl-unbounded.
 E2E_SITE_NAME = os.environ.get("E2E_SITE_NAME", "e2e")
@@ -113,7 +116,7 @@ SSH_OPTS = [
     "-o", "ConnectTimeout=10",
     "-i", str(SSH_KEY),
 ]
-SSH_TARGET = f"ubuntu@{VM_IP}"
+SSH_TARGET = f"{VM_SSH_USER}@{VM_IP}"
 
 KUBECTL = "kubectl"
 KUBECTL_UNBOUNDED = str(REPO_ROOT / "bin" / "kubectl-unbounded")
@@ -456,16 +459,6 @@ def assert_bpffs_sentinel_absent(machine: str) -> None:
     result = machine_shell_quiet(machine, f"test ! -e /sys/fs/bpf/{BPFFS_SENTINEL}")
     if result.returncode != 0:
         die(f"bpffs sentinel from previous machine is visible in '{machine}'")
-
-
-def install_bpftool(machine: str) -> None:
-    log(f"Installing bpftool in nspawn machine '{machine}'...")
-    # TODO: remove this once agent-ubuntu2404 and agent-ubuntu2404-nvidia
-    # images containing bpftool have been published and are used by e2e.
-    machine_shell(machine, textwrap.dedent("""\
-        apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y linux-tools-common
-    """))
 
 
 def _b64(val: str) -> str:
@@ -1104,6 +1097,10 @@ class HostImage:
     url: str
     file_name: str
     backing_format: str
+    sudo_group: str
+    packages: list[str]
+    write_files: str = ""
+    pre_marker_commands: list[str] | None = None
 
 
 def host_image() -> HostImage:
@@ -1113,6 +1110,10 @@ def host_image() -> HostImage:
             or "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img",
             file_name="ubuntu-cloud-amd64.img",
             backing_format="qcow2",
+            sudo_group="sudo",
+            packages=["curl", "jq", "apt-transport-https", "ca-certificates", "net-tools"],
+            write_files=ubuntu_netplan_write_files(),
+            pre_marker_commands=["netplan apply"],
         )
     if HOST_BASE_OS == "ubuntu2604":
         return HostImage(
@@ -1120,9 +1121,82 @@ def host_image() -> HostImage:
             or "https://cloud-images.ubuntu.com/minimal/releases/resolute/release/ubuntu-26.04-minimal-cloudimg-amd64.img",
             file_name="ubuntu-26.04-minimal-cloudimg-amd64.img",
             backing_format="qcow2",
+            sudo_group="sudo",
+            packages=["curl", "jq", "apt-transport-https", "ca-certificates", "net-tools"],
+            write_files=ubuntu_netplan_write_files(),
+            pre_marker_commands=["netplan apply"],
+        )
+    if HOST_BASE_OS == "fedora":
+        return HostImage(
+            url=HOST_IMAGE_URL
+            or "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2",
+            file_name="fedora-cloud-amd64.qcow2",
+            backing_format="qcow2",
+            sudo_group="wheel",
+            packages=["curl", "jq", "ca-certificates", "net-tools"],
         )
 
-    die(f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; expected ubuntu2404 or ubuntu2604")
+    die(f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; expected ubuntu2404, ubuntu2604, or fedora")
+
+
+def ubuntu_netplan_write_files() -> str:
+    return textwrap.dedent(f"""\
+        write_files:
+          - path: /etc/netplan/99-static.yaml
+            content: |
+              network:
+                version: 2
+                ethernets:
+                  ens3:
+                    addresses:
+                      - {VM_IP}/24
+                    routes:
+                      - to: default
+                        via: {VM_GATEWAY}
+                    nameservers:
+                      addresses:
+                        - 8.8.8.8
+                        - 8.8.4.4
+            permissions: "0600"
+    """)
+
+
+def yaml_list(items: list[str], indent: str) -> str:
+    return "\n".join(f"{indent}- {item}" for item in items)
+
+
+def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
+    packages = yaml_list(image.packages, "  ")
+    commands = [*(image.pre_marker_commands or []), "mkdir -p /etc/agent"]
+    runcmd = yaml_list(commands, "  ")
+    write_files = image.write_files.rstrip()
+    write_files_block = f"\n{write_files}\n" if write_files else ""
+
+    return (
+        f"#cloud-config\n"
+        f"users:\n"
+        f"  - name: {VM_SSH_USER}\n"
+        f"    sudo: ALL=(ALL) NOPASSWD:ALL\n"
+        f"    shell: /bin/bash\n"
+        f"    groups: [{image.sudo_group}]\n"
+        f"    lock_passwd: false\n"
+        f"    ssh_authorized_keys:\n"
+        f"      - {ssh_pub_key}\n"
+        f"\n"
+        f"package_update: true\n"
+        f"package_upgrade: false\n"
+        f"packages:\n"
+        f"{packages}\n"
+        f"{write_files_block}"
+        f"runcmd:\n"
+        f"{runcmd}\n"
+        f"  - |\n"
+        f"    cat > /etc/agent/provisioned <<'MARKER'\n"
+        f"    provisioned=true\n"
+        f"    MARKER\n"
+        f"  - 'echo \"cloud-init: done\"'\n"
+    )
+
 
 
 def _launch_vm(ssh_pub_key: str) -> None:
@@ -1145,55 +1219,10 @@ def _launch_vm(ssh_pub_key: str) -> None:
 
     # cloud-init configuration
     log("Generating cloud-init configuration...")
+    mac_address = qemu_mac_address()
 
     user_data = VM_DIR / "user-data"
-    user_data.write_text(textwrap.dedent(f"""\
-        #cloud-config
-        users:
-          - name: ubuntu
-            sudo: ALL=(ALL) NOPASSWD:ALL
-            shell: /bin/bash
-            groups: [sudo]
-            lock_passwd: false
-            ssh_authorized_keys:
-              - {ssh_pub_key}
-
-        package_update: true
-        package_upgrade: false
-        packages:
-          - curl
-          - jq
-          - apt-transport-https
-          - ca-certificates
-          - net-tools
-
-        write_files:
-          - path: /etc/netplan/99-static.yaml
-            content: |
-              network:
-                version: 2
-                ethernets:
-                  ens3:
-                    addresses:
-                      - {VM_IP}/24
-                    routes:
-                      - to: default
-                        via: {VM_GATEWAY}
-                    nameservers:
-                      addresses:
-                        - 8.8.8.8
-                        - 8.8.4.4
-            permissions: "0600"
-
-        runcmd:
-          - netplan apply
-          - mkdir -p /etc/agent
-          - |
-            cat > /etc/agent/provisioned <<'MARKER'
-            provisioned=true
-            MARKER
-          - 'echo "cloud-init: done"'
-    """))
+    user_data.write_text(_cloud_init_user_data(image, ssh_pub_key))
 
     meta_data = VM_DIR / "meta-data"
     # Use a unique instance-id so cloud-init treats this as a new instance
@@ -1228,8 +1257,6 @@ def _launch_vm(ssh_pub_key: str) -> None:
     # Launch QEMU VM
     pid_file = VM_DIR / f"{VM_NAME}.pid"
     qemu_log = VM_DIR / f"{VM_NAME}.log"
-    mac_address = qemu_mac_address()
-
     log("============================================")
     log(f"  Launching VM: {VM_NAME}")
     log(f"  Host OS:      {HOST_BASE_OS}")
@@ -1242,7 +1269,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     log(f"  Log:          {qemu_log}")
     log("============================================")
 
-    run([
+    qemu_args = [
         "qemu-system-x86_64",
         "-cpu", "host", "-accel", "kvm",
         "-m", VM_MEMORY, "-smp", VM_CPUS,
@@ -1253,7 +1280,8 @@ def _launch_vm(ssh_pub_key: str) -> None:
         "-daemonize", "-pidfile", str(pid_file),
         "-serial", f"file:{qemu_log}",
         "-display", "none",
-    ])
+    ]
+    run(qemu_args)
 
     qemu_pid = pid_file.read_text().strip()
     log(f"VM started in background (PID: {qemu_pid})")
@@ -1592,6 +1620,9 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         "--site", E2E_SITE_NAME,
         *node_config_bootstrap_args(node_config),
     ]
+    if AGENT_OCI_IMAGE:
+        log(f"Using OCI rootfs image: {AGENT_OCI_IMAGE}")
+        bootstrap_args.extend(["--oci-image", AGENT_OCI_IMAGE])
     bootstrap_script = capture(bootstrap_args)
 
     # The kubeconfig uses a localhost address that is not reachable from the VM.
@@ -1640,7 +1671,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
 def wait_for_node() -> None:
     """Wait for the agent node to appear and become Ready."""
 
-    node_timeout = int(os.environ.get("NODE_TIMEOUT", "180"))
+    node_timeout = int(os.environ.get("NODE_TIMEOUT", "300"))
     ready_timeout = int(os.environ.get("READY_TIMEOUT", "720"))
 
     # Wait for node to appear
@@ -2791,7 +2822,6 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
         die("Resolved target MachineConfigurationVersion was empty")
 
     old_nspawn = active_nspawn_machine()
-    install_bpftool(old_nspawn)
     create_bpffs_sentinel(old_nspawn)
 
     log(f"Assigning Machine '{AGENT_MACHINE_NAME}' to {target_mcv}...")
@@ -2829,7 +2859,6 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     kubectl(["get", "machine", AGENT_MACHINE_NAME, "-o", "wide"])
     kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
 
-
 # ---------------------------------------------------------------------------
 # collect-logs
 # ---------------------------------------------------------------------------
@@ -2850,7 +2879,7 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
         "-o", "ConnectTimeout=5",
         "-i", str(vm_dir / "ssh" / "id_ed25519"),
     ]
-    ssh_target = f"ubuntu@{vm_ip}"
+    ssh_target = f"{VM_SSH_USER}@{vm_ip}"
 
     def ssh_log(name: str, command: str) -> None:
         _write_command_log(logs_dir / f"{prefix}{name}", ["ssh", *ssh_opts, ssh_target, command])
@@ -2858,12 +2887,19 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
     ssh_log("vm-journal.log", "sudo journalctl --no-pager -l")
     ssh_log("vm-unbounded-agent.log", "sudo journalctl -u unbounded-agent --no-pager -l")
     ssh_log("vm-unbounded-agent-daemon.log", "sudo journalctl -u unbounded-agent-daemon --no-pager -l")
+    ssh_log("vm-systemd-machined.log", "sudo journalctl -u systemd-machined --no-pager -l")
     ssh_log("vm-machines.txt", "sudo machinectl list --no-pager")
+    ssh_log("vm-nspawn-locks.txt", "sudo ls -la /run/systemd/nspawn/locks 2>&1 || true")
+    ssh_log("vm-lslocks.txt", "sudo lslocks || true")
+    ssh_log("vm-selinux-avc.txt", "sudo ausearch -m AVC,USER_AVC -ts recent 2>&1 || true")
     for machine in NSPAWN_MACHINE_NAMES:
         ssh_log(f"nspawn-{machine}-journal.log", f"sudo journalctl -M {machine} --no-pager -l")
         ssh_log(f"nspawn-{machine}-kubelet.log", f"sudo journalctl -M {machine} -u kubelet --no-pager -l")
         ssh_log(f"nspawn-{machine}-containerd.log", f"sudo journalctl -M {machine} -u containerd --no-pager -l")
         ssh_log(f"vm-machine-{machine}-status.txt", f"sudo machinectl status {machine} --no-pager")
+        ssh_log(f"vm-machine-{machine}-service-status.txt", f"sudo systemctl status systemd-nspawn@{machine}.service --no-pager")
+        ssh_log(f"vm-machine-{machine}-mounts.txt", f"sudo findmnt -R /var/lib/machines/{machine} 2>&1 || true")
+        ssh_log(f"vm-machine-{machine}-rootfs.txt", f"sudo ls -la /var/lib/machines/{machine} 2>&1 || true")
         ssh_log(
             f"nspawn-{machine}-units.txt",
             f"sudo machinectl shell {machine} /usr/bin/systemctl list-units --no-pager",
