@@ -178,7 +178,7 @@ func ResolveOCIImage(log *slog.Logger, configImage string, nvidiaGPUAvailable bo
 
 	var image string
 	if nvidiaGPUAvailable {
-		image = DefaultNvidiaOCImage
+		image = DefaultNvidiaOCIImage
 	} else {
 		image = DefaultOCIImage
 	}

@@ -99,7 +99,7 @@ func TestResolveOCIImage_DefaultWithGPU(t *testing.T) {
 	t.Setenv("AGENT_OCI_IMAGE", "")
 
 	got := ResolveOCIImage(discardLogger(), "", true)
-	assert.Equal(t, DefaultNvidiaOCImage, got)
+	assert.Equal(t, DefaultNvidiaOCIImage, got)
 }
 
 func TestResolveOCIImage_Priority(t *testing.T) {
@@ -123,7 +123,7 @@ func TestResolveOCIImage_Priority(t *testing.T) {
 	// 4. No config, disable off, no env var - GPU default.
 	t.Setenv("AGENT_OCI_IMAGE", "")
 
-	assert.Equal(t, DefaultNvidiaOCImage, ResolveOCIImage(log, "", true))
+	assert.Equal(t, DefaultNvidiaOCIImage, ResolveOCIImage(log, "", true))
 	assert.Equal(t, DefaultOCIImage, ResolveOCIImage(log, "", false))
 }
 
