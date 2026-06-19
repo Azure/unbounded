@@ -116,7 +116,9 @@ message NeighborhoodSpec {
   // Number of deterministic finger-table entries to derive per node. Defaults to 100 when unset.
   optional uint32 fingers_per_node = 3;
 
-  // Local node id on the P2P ring; required when peers are configured and must not match a peer id.
+  // Local node id on the P2P ring and process-wide fabric peer id; required when
+  // peers are configured, shared by every neighborhood when set, and must not
+  // match any peer id.
   optional uint64 local_node_id = 4;
 
   // Local tags used by placement-aware planning.
@@ -126,7 +128,9 @@ message NeighborhoodSpec {
   // When set, `peers` can be "sparse"; containing only this process's neighbors.
   optional RoutingPlan routing_plan = 6;
 
-  // Peer definitions available to this neighborhood.
+  // Peer definitions available to this neighborhood. Peer ids are process-wide
+  // fabric peer ids; repeating an id across neighborhoods requires the same
+  // peer data.
   repeated PeerSpec peers = 7;
 }
 
@@ -147,7 +151,8 @@ message RoutingPlan {
 }
 
 message PeerSpec {
-  // Unique node id within the neighborhood, used for ring position and route references.
+  // Process-wide fabric peer id, also used for this neighborhood's ring
+  // position and route references.
   uint64 id = 1;
 
   // Peer tags used by placement-aware planning.

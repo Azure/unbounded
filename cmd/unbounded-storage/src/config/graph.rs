@@ -96,6 +96,7 @@ pub fn validate_binding_graph(config: &Config) -> Result<(), String> {
         }
         validate_peer_ids(n)?;
     }
+    validate_fabric_peer_ids(config)?;
     for f in &config.frontends {
         if !backends.contains_key(f.source.as_str())
             && !caches.contains_key(f.source.as_str())
@@ -120,6 +121,57 @@ fn validate_peer_ids(neighborhood: &super::schema::NeighborhoodSpec) -> Result<(
                 "neighborhood {:?} peer {} is duplicated",
                 neighborhood.name, peer.id,
             ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_fabric_peer_ids(config: &Config) -> Result<(), String> {
+    let mut local_ids = Vec::new();
+    for neighborhood in &config.neighborhoods {
+        if let Some(local_node_id) = neighborhood.local_node_id {
+            local_ids.push((neighborhood.name.as_str(), local_node_id));
+        }
+    }
+    local_ids.sort_by_key(|(name, _)| *name);
+
+    let process_local_id = match local_ids.first().map(|(_, id)| *id) {
+        Some(id) => {
+            if local_ids.iter().any(|(_, other)| *other != id) {
+                let configured = local_ids
+                    .iter()
+                    .map(|(neighborhood_id, node_id)| format!("{neighborhood_id}:{node_id}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "neighborhoods declare different local_node_id values, but the storage fabric uses one process-wide peer id ({configured})"
+                ));
+            }
+            Some(id)
+        }
+        None => None,
+    };
+
+    let mut peers_by_id: HashMap<u64, (&str, &PeerSpec)> = HashMap::new();
+    for neighborhood in &config.neighborhoods {
+        for peer in &neighborhood.peers {
+            if Some(peer.id) == process_local_id {
+                return Err(format!(
+                    "neighborhood {:?} peer {} collides with process local_node_id {}",
+                    neighborhood.name, peer.id, peer.id
+                ));
+            }
+            if let Some((first_neighborhood, first_peer)) = peers_by_id.get(&peer.id) {
+                if *first_peer != peer {
+                    return Err(format!(
+                        "peer id {} is declared with different peer data in neighborhoods {:?} and {:?}",
+                        peer.id, first_neighborhood, neighborhood.name
+                    ));
+                }
+            } else {
+                peers_by_id.insert(peer.id, (neighborhood.name.as_str(), peer));
+            }
         }
     }
 
@@ -197,7 +249,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
                 .map(|peer| RuntimePeer {
                     neighborhood_id: neighborhood.name.clone(),
                     node_id: NodeId(peer.id),
-                    fabric_peer_id: scoped_peer_id(&neighborhood.name, peer.id),
+                    fabric_peer_id: PeerId(peer.id),
                     spec: peer.clone(),
                 })
                 .collect();
@@ -223,19 +275,6 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
         neighborhoods,
         frontends: bindings,
     })
-}
-
-pub fn scoped_peer_id(neighborhood_id: &str, node_id: u64) -> PeerId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"unbounded-storage scoped peer id v1");
-    hasher.update(&(neighborhood_id.len() as u64).to_le_bytes());
-    hasher.update(neighborhood_id.as_bytes());
-    hasher.update(&node_id.to_le_bytes());
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&digest.as_bytes()[0..8]);
-    let id = u64::from_le_bytes(bytes);
-    if id == 0 { PeerId(1) } else { PeerId(id) }
 }
 
 pub fn runtime_disks(graph: &RuntimeGraph) -> Vec<DiskSpec> {
@@ -386,17 +425,6 @@ mod tests {
     }
 
     #[test]
-    fn scoped_peer_ids_are_per_neighborhood() {
-        let a = scoped_peer_id("n-a", 7);
-        let b = scoped_peer_id("n-b", 7);
-        let c = scoped_peer_id("n-a", 7);
-
-        assert_ne!(a, b);
-        assert_eq!(a, c);
-        assert_ne!(a, PeerId(0));
-    }
-
-    #[test]
     fn runtime_projection_accepts_unique_rdma_peer_ids() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
@@ -411,8 +439,94 @@ mod tests {
         assert_eq!(peers.len(), 2);
         assert_eq!(peers[0].node_id, NodeId(7));
         assert_eq!(peers[1].node_id, NodeId(8));
-        assert_eq!(peers[0].fabric_peer_id, scoped_peer_id("n", 7));
-        assert_eq!(peers[1].fabric_peer_id, scoped_peer_id("n", 8));
+        assert_eq!(peers[0].fabric_peer_id, PeerId(7));
+        assert_eq!(peers[1].fabric_peer_id, PeerId(8));
+    }
+
+    #[test]
+    fn runtime_projection_accepts_reused_peer_id_with_same_endpoint() {
+        let mut cfg = Config::default();
+        cfg.backends.push(backend("b"));
+        let mut a = neighborhood("n-a", "b");
+        a.peers.push(tcp_peer(7, "127.0.0.1:7"));
+        let mut b = neighborhood("n-b", "b");
+        b.peers.push(tcp_peer(7, "127.0.0.1:7"));
+        cfg.neighborhoods.push(a);
+        cfg.neighborhoods.push(b);
+
+        let graph = runtime_projection(&cfg).unwrap();
+
+        assert_eq!(
+            graph.neighborhoods["n-a"].peers[0].fabric_peer_id,
+            PeerId(7)
+        );
+        assert_eq!(
+            graph.neighborhoods["n-b"].peers[0].fabric_peer_id,
+            PeerId(7)
+        );
+    }
+
+    #[test]
+    fn runtime_projection_rejects_reused_peer_id_with_different_peer_data() {
+        let mut cfg = Config::default();
+        cfg.backends.push(backend("b"));
+        let mut a = neighborhood("n-a", "b");
+        a.peers.push(tcp_peer(7, "127.0.0.1:7"));
+        let mut b = neighborhood("n-b", "b");
+        b.peers.push(tcp_peer(7, "127.0.0.1:8"));
+        cfg.neighborhoods.push(a);
+        cfg.neighborhoods.push(b);
+
+        let err = runtime_projection(&cfg).unwrap_err();
+
+        assert!(err.contains("different peer data"), "{err}");
+    }
+
+    #[test]
+    fn runtime_projection_accepts_same_local_node_id_across_neighborhoods() {
+        let mut cfg = Config::default();
+        cfg.backends.push(backend("b"));
+        let mut a = neighborhood("n-a", "b");
+        a.local_node_id = Some(7);
+        let mut b = neighborhood("n-b", "b");
+        b.local_node_id = Some(7);
+        cfg.neighborhoods.push(a);
+        cfg.neighborhoods.push(b);
+
+        runtime_projection(&cfg).unwrap();
+    }
+
+    #[test]
+    fn runtime_projection_rejects_different_local_node_ids() {
+        let mut cfg = Config::default();
+        cfg.backends.push(backend("b"));
+        let mut a = neighborhood("n-a", "b");
+        a.local_node_id = Some(7);
+        let mut b = neighborhood("n-b", "b");
+        b.local_node_id = Some(8);
+        cfg.neighborhoods.push(a);
+        cfg.neighborhoods.push(b);
+
+        let err = runtime_projection(&cfg).unwrap_err();
+
+        assert!(err.contains("different local_node_id values"), "{err}");
+    }
+
+    #[test]
+    fn runtime_projection_rejects_peer_colliding_with_process_local_node_id() {
+        let mut cfg = Config::default();
+        cfg.backends.push(backend("b"));
+        let mut a = neighborhood("n-a", "b");
+        a.local_node_id = Some(7);
+        let mut b = neighborhood("n-b", "b");
+        b.local_node_id = Some(7);
+        b.peers.push(tcp_peer(7, "127.0.0.1:7"));
+        cfg.neighborhoods.push(a);
+        cfg.neighborhoods.push(b);
+
+        let err = runtime_projection(&cfg).unwrap_err();
+
+        assert!(err.contains("collides with process local_node_id"), "{err}");
     }
 
     #[test]

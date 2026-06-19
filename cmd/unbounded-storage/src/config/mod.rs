@@ -22,7 +22,7 @@ pub use diff::ConfigDiff;
 pub use graph::{
     ResolvedFrontendBinding, RuntimeCache, RuntimeGraph, RuntimeNeighborhood, RuntimeP2p,
     RuntimePeer, frontend_backend_map, runtime_disks, runtime_peers, runtime_projection,
-    scoped_peer_id, validate_binding_graph,
+    validate_binding_graph,
 };
 pub use load::ConfigError;
 pub use reconcile::{

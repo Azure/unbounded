@@ -348,20 +348,22 @@ fn local_self_peer(projection: &config::RuntimeGraph) -> Result<PeerId, String> 
         .collect();
     local_ids.sort_by_key(|(neighborhood_id, _)| *neighborhood_id);
 
-    if local_ids.len() > 1 {
+    if let Some((_, self_peer)) = local_ids.first()
+        && local_ids.iter().any(|(_, node_id)| node_id != self_peer)
+    {
         let configured = local_ids
             .iter()
             .map(|(neighborhood_id, node_id)| format!("{neighborhood_id}:{node_id}"))
             .collect::<Vec<_>>()
             .join(", ");
         return Err(format!(
-            "multiple neighborhoods declare local_node_id, but the storage fabric currently supports one self identity ({configured})"
+            "neighborhoods declare different local_node_id values, but the storage fabric uses one process-wide peer id ({configured})"
         ));
     }
 
     Ok(local_ids
         .first()
-        .map(|(neighborhood_id, node_id)| config::scoped_peer_id(neighborhood_id, *node_id))
+        .map(|(_, node_id)| PeerId(*node_id))
         .unwrap_or(PeerId(0)))
 }
 
@@ -538,25 +540,26 @@ mod tests {
     }
 
     #[test]
-    fn local_self_peer_scopes_single_local_node_id() {
+    fn local_self_peer_uses_raw_node_id() {
         let graph = graph_with_local_ids(&[("n-a", None), ("n-b", Some(7))]);
 
-        assert_eq!(
-            local_self_peer(&graph).unwrap(),
-            config::scoped_peer_id("n-b", 7)
-        );
+        assert_eq!(local_self_peer(&graph).unwrap(), PeerId(7));
     }
 
     #[test]
-    fn local_self_peer_rejects_multiple_local_node_ids() {
+    fn local_self_peer_accepts_repeated_local_node_id() {
+        let graph = graph_with_local_ids(&[("n-b", Some(7)), ("n-a", Some(7))]);
+
+        assert_eq!(local_self_peer(&graph).unwrap(), PeerId(7));
+    }
+
+    #[test]
+    fn local_self_peer_rejects_different_local_node_ids() {
         let graph = graph_with_local_ids(&[("n-b", Some(2)), ("n-a", Some(1))]);
 
         let err = local_self_peer(&graph).unwrap_err();
 
-        assert!(
-            err.contains("multiple neighborhoods declare local_node_id"),
-            "{err}"
-        );
+        assert!(err.contains("different local_node_id values"), "{err}");
         assert!(err.contains("n-a:1"), "{err}");
         assert!(err.contains("n-b:2"), "{err}");
     }

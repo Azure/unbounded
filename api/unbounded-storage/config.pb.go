@@ -702,14 +702,18 @@ type NeighborhoodSpec struct {
 	Source string                 `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
 	// Number of deterministic finger-table entries to derive per node. Defaults to 100 when unset.
 	FingersPerNode *uint32 `protobuf:"varint,3,opt,name=fingers_per_node,json=fingersPerNode,proto3,oneof" json:"fingers_per_node,omitempty"`
-	// Local node id on the P2P ring; required when peers are configured and must not match a peer id.
+	// Local node id on the P2P ring and process-wide fabric peer id; required when
+	// peers are configured, shared by every neighborhood when set, and must not
+	// match any peer id.
 	LocalNodeId *uint64 `protobuf:"varint,4,opt,name=local_node_id,json=localNodeId,proto3,oneof" json:"local_node_id,omitempty"`
 	// Local tags used by placement-aware planning.
 	LocalTags []string `protobuf:"bytes,5,rep,name=local_tags,json=localTags,proto3" json:"local_tags,omitempty"`
 	// Precomputed routing table that replaces automatic finger-table derivation when set.
 	// When set, `peers` can be "sparse"; containing only this process's neighbors.
 	RoutingPlan *RoutingPlan `protobuf:"bytes,6,opt,name=routing_plan,json=routingPlan,proto3,oneof" json:"routing_plan,omitempty"`
-	// Peer definitions available to this neighborhood.
+	// Peer definitions available to this neighborhood. Peer ids are process-wide
+	// fabric peer ids; repeating an id across neighborhoods requires the same
+	// peer data.
 	Peers         []*PeerSpec `protobuf:"bytes,7,rep,name=peers,proto3" json:"peers,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -864,7 +868,8 @@ func (x *RoutingPlan) GetPredecessor() uint64 {
 
 type PeerSpec struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Unique node id within the neighborhood, used for ring position and route references.
+	// Process-wide fabric peer id, also used for this neighborhood's ring
+	// position and route references.
 	Id uint64 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
 	// Peer tags used by placement-aware planning.
 	Tags []string `protobuf:"bytes,2,rep,name=tags,proto3" json:"tags,omitempty"`

@@ -102,7 +102,7 @@ stripe_size_bytes = 4194304      # optional; must be a power of two.
 [[neighborhoods]]
 name = "p2p"
 source = "origin"               # backend component name.
-local_node_id = 1                # u64; this daemon's node id (required with peers).
+local_node_id = 1                # u64; daemon/fabric id, shared across neighborhoods.
 local_tags = ["region-a", "rack-1"]
 fingers_per_node = 100           # routing finger-table fanout per node.
 
@@ -119,8 +119,8 @@ fingers_per_node = 100           # routing finger-table fanout per node.
 # successor   = 2                # id of the nearest forward neighbor on the ring.
 # predecessor = 64               # id of the nearest backward neighbor on the ring.
 
-[[neighborhoods.peers]]          # repeat per remote peer; ids must be unique.
-id        = 2                    # u64, unique within this neighborhood.
+[[neighborhoods.peers]]          # repeat per remote peer; ids are fabric ids.
+id        = 2                    # u64, process-wide peer id and ring position.
 tags      = ["region-a", "rack-2"]
 
 [neighborhoods.peers.config.tcp]

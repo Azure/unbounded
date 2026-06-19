@@ -580,7 +580,9 @@ Sections (all optional, each falling back to defaults):
   `[[neighborhoods.peers]]` id, none may be `local_node_id`). This is "disjoint
   discovery": a node is told only its direct routing neighbors rather than the
   full cluster, yet routes identically to the global build (see
-  `designs/storage-disjoint-routing-parity.md`).
+  `designs/storage-disjoint-routing-parity.md`). If multiple neighborhoods set
+  `local_node_id`, they must set the same value because the fabric connection
+  layer has one process-wide self peer id.
 - `[startup]` - startup-fixed knobs, read once at process start and
   excluded from the live-reload diff: `[startup.memory]`
   (`no_hugepages`, `memory_total_bytes`), `[startup.fabric]` (`binds`,
@@ -591,10 +593,12 @@ Sections (all optional, each falling back to defaults):
   `startup_to_core_plan_config` inverts the negative plan fields so the
   historical defaults hold. See the CLI section for the per-field
   defaults.
-- `[[neighborhoods.peers]]` - `id` (unique `u64` within the neighborhood;
-  fabric peer ids are scoped by neighborhood), `tags` for placement-aware
-  routing, and one transport table (`tcp` with a `SocketAddr`, or `rdma` with a
-  provider-native address encoded as `hex:<fi_getname-bytes>`).
+- `[[neighborhoods.peers]]` - `id` (process-wide fabric peer id, also used as
+  the node's ring position within this neighborhood), `tags` for
+  placement-aware routing, and one transport table (`tcp` with a `SocketAddr`,
+  or `rdma` with a provider-native address encoded as
+  `hex:<fi_getname-bytes>`). The same peer id may appear in multiple
+  neighborhoods only with identical peer data.
 - `[[caches]]` - `name`, `source` (a backend or neighborhood component name),
   and `[[caches.disks]]`. Each disk has one `config` table (`block` with
   `path` and optional `numa`, or `file` with `path` and required `size`),
