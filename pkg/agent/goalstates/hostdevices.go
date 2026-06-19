@@ -13,15 +13,7 @@ const kvmDevicePath = "/dev/kvm"
 // DiscoverHostDevicePaths probes the host for device nodes that should be
 // bind-mounted into the nspawn container and returns their paths in a stable
 // order so that repeated calls produce the same config output.
-//
-// Device passthrough is opt-in: when passthroughKVM is false the function
-// returns nil without probing the host, so no host devices are exposed to the
-// container. When true it probes for /dev/kvm and includes it when present.
-func DiscoverHostDevicePaths(passthroughKVM bool) []string {
-	if !passthroughKVM {
-		return nil
-	}
-
+func DiscoverHostDevicePaths() []string {
 	var paths []string
 
 	if p := discoverKVMDevicePath(kvmDevicePath); p != "" {

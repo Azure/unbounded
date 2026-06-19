@@ -87,7 +87,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		Downloads:         downloads,
 		OCIImage:          ociImage,
 		Nvidia:            nvidia,
-		HostDevicePaths:   DiscoverHostDevicePaths(cfg.PassthroughKVM),
+		HostDevicePaths:   DiscoverHostDevicePaths(),
 	}
 
 	nodeStart := &NodeStart{

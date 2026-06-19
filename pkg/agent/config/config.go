@@ -47,14 +47,6 @@ type AgentConfig struct {
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
 	// When empty the agent falls back to debootstrap.
 	OCIImage string `json:"OCIImage,omitempty"`
-
-	// PassthroughKVM, when true, exposes the host's KVM device (/dev/kvm)
-	// to the nspawn container so that KVM-accelerated workloads (e.g.
-	// KubeVirt virtual machines) can run on the node. When enabled the
-	// device is bind-mounted into the container and granted via the cgroup
-	// device controller, but only if /dev/kvm is actually present on the
-	// host; on hosts without it this is a no-op. Defaults to false.
-	PassthroughKVM bool `json:"PassthroughKVM,omitempty"`
 }
 
 // BackfillNodeName resolves and stores the Kubernetes Node name once. An
