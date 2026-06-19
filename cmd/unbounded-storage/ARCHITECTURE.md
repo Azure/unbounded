@@ -215,7 +215,9 @@ scratch MR, and tears libfabric down).
 ## 6. Module Map (`src/lib.rs`)
 
 All subsystems are `pub mod`: `backend`, `bufferpool`, `config`, `fabric`,
-`frontend`, `http`, `memory`, `p2p`, `ring`, `runtime`, `storage`, `topology`.
+`fanout`, `frontend`, `http`, `io`, `memory`, `metrics`, `obs`, `p2p`,
+`ring`, `runtime`, `storage`, and `topology`. The `profiling` module is
+exported when the `profiling` feature is enabled.
 
 Each subsystem follows the same layout convention: `src/<area>/mod.rs` declares
 private submodules and re-exports a curated public surface via `pub use`. Files
@@ -269,7 +271,6 @@ it a simple loop to drive work without an async runtime.
   `PinnedRuntime` is the Linux implementation.
 - `ShardLoop` is the cooperative driver: `add_tick_hook(FnMut() -> bool)` and
   `run_until_with(stop, idle_sleep)`. Tick hooks return `true` to stay hot.
-- `NumaHint { Any, Worker, Numa }` is declared for future use.
 
 ### 7.2 `topology/` - hardware discovery and planning
 
@@ -380,8 +381,8 @@ between them, and the origin `Backend` is the final fallback.
     the handler yields it, and the RPC server relays it upstream.
   - `Some` with no hops remaining -> `HopLimitExceeded`.
   It owns a dedicated scratch `Backing` (its own fabric MR and an extra
-  `BlockStore` buffer); a `Mutex` free list hands out one scratch page per
-  in-flight request, reclaimed when the response stream drops.
+  `BlockStore` buffer); the shared scratch allocator hands out one zeroed
+  scratch page per in-flight request, reclaimed when the response stream drops.
 - Ring math lives in `ring.rs`: `node_to_ring`, `stripe_to_ring`, `splitmix64`.
 
 ### 7.7 `fabric/` - the libfabric RDMA transport
@@ -402,16 +403,18 @@ streaming RPC server plus client `Transport`.
 - The completion machinery (`CompletionFuture`, `CompletionInfo`,
   `CompletionRegistry`, `CompletionSlot`) bridges libfabric CQ entries to
   futures.
-- **RPC server model** (`rpc.rs`): per in-flight request a **dedicated OS
-  thread** drives the `Handler` stream synchronously with a noop waker, submits
-  libfabric ops, and spin-polls `CompletionFuture`s. Wire framing uses reserved
-  tag bases (`REQUEST_TAG_BASE = 0xFFFF_FFFC_0000_0000`, `PAGE_ACK_TAG_BASE`,
-  `RESPONSE_END_TAG_BASE`, `ERROR_ACK_TAG_BASE`); the low 32 bits carry the
-  request id. The client `fi_tsend`s a bincode `RequestHeader` plus the bincode
-  request body; the server `fi_write`s each page into the client's destination
-  MR and `fi_tsend`s one `PageAck` per page, then a `RESPONSE_END` (success) or
-  `ERROR_ACK`. `RpcServerHandle::drop` sets a shutdown flag the workers poll
-  between handler-stream polls.
+- **RPC server model** (`rpc.rs`): `start_rpc_server` spawns a fixed pool of
+  `rpc_worker_threads` long-lived OS threads pinned to the shard's worker slot.
+  The connection receive path decodes framed requests and enqueues jobs onto a
+  bounded `JobQueue` capped by `max_inflight`; excess requests receive an
+  overload `ERROR_ACK`. A worker pulls a job, drives the `Handler` stream,
+  submits libfabric writes/sends, and parks on completion futures with a real
+  thread waker. Wire framing uses an 8-byte `MsgHeader` prefix with a message
+  kind and request id. The client sends a bincode `RequestHeader` plus request
+  body; the server `fi_write`s each page into the client's destination MR and
+  sends one `PageAck` per page. A short success sends `RESPONSE_END`; any error
+  sends `ERROR_ACK`. `RpcServerHandle::drop` uninstalls the request sink, closes
+  the queue, signals shutdown, and joins the workers.
 - `Handler`/`HandlerStream` is the server-side resolution trait;
   `PoolHandler`/`PoolHandlerStream` serve locally-resident pages.
 - The client side (`transport`) provides `FabricTransport`, the `PeerRouter`
@@ -615,7 +618,7 @@ routing snapshot. It republishes the channel snapshot each update, logs
 | Shard | One pinned OS thread per `ServingShard` | Owns `!Send` pool, transport, frontend, RPC handler |
 | Shard loop | Cooperative tick hooks, noop waker | Busy-poll active, sleep 100us idle |
 | Fabric progress | One pinned thread per CQ | Self-driving |
-| Fabric RPC serve | One dedicated OS thread per in-flight request | Synchronous noop-waker drive |
+| Fabric RPC serve | Fixed worker pool per shard | Bounded job queue, real-waker completion waits |
 | Storage engine | One pinned storage core per disk | Reached only via `PageChannel` mpsc |
 | Config watcher | `notify` thread + main loop | Reconciles peers/disks live |
 

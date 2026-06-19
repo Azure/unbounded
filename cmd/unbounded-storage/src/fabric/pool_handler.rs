@@ -6,9 +6,8 @@
 //!
 //! # Why this does not touch the shard `Pool`
 //!
-//! [`crate::fabric::rpc`] drives each in-flight request on a
-//! dedicated auxiliary OS thread (`runtime.spawn_pinned` ->
-//! `run_worker`), so the [`Handler`] trait requires
+//! [`crate::fabric::rpc`] drives requests on a fixed worker pool,
+//! so the [`Handler`] trait requires
 //! `Send + Sync + 'static`. The per-shard
 //! [`crate::bufferpool::Pool`] is `Rc`-based and `!Send`: it lives
 //! on, and may only be touched from, its own shard thread. Reaching
@@ -20,9 +19,9 @@
 //! touch. The scratch backing is registered as its own fabric MR (used
 //! as the `local_mr` source for `fi_write`) and as a `BlockStore`
 //! extra buffer (so the disk io_uring path can DMA into it). A tiny
-//! free list behind a [`Mutex`] hands out one scratch page per
-//! in-flight request; the page is reclaimed when the response stream
-//! drops, after the RPC layer has finished `fi_write`ing it to the
+//! free stack hands out one scratch page per in-flight request; the
+//! page is reclaimed when the response stream drops, after the RPC
+//! layer has finished `fi_write`ing it to the
 //! peer (the worker blocks on the write completion before re-polling
 //! the stream).
 //!
@@ -39,13 +38,14 @@
 //! resident on this node.
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::bufferpool::{BlockStore, BulkRef, PageRef, Req};
 use crate::memory::Backing;
 
 use super::handler::{Handler, HandlerStream};
+use super::scratch::ScratchBacking;
 
 /// Error surfaced by [`PoolHandler`]'s response stream.
 #[derive(Debug)]
@@ -99,13 +99,10 @@ impl<S: BlockStore + Send + Sync + 'static> PoolHandler<S> {
     /// will hand out concurrently; it must be `<= scratch.page_count`.
     pub fn new(store: Arc<S>, scratch: Backing, scratch_pages: u32) -> Self {
         let usable = scratch_pages.min(scratch.page_count as u32);
-        let free: Vec<u32> = (0..usable).collect();
+
         Self {
             store,
-            scratch: Arc::new(ScratchBacking {
-                _backing: scratch,
-                free: Mutex::new(free),
-            }),
+            scratch: Arc::new(ScratchBacking::new(scratch, usable)),
         }
     }
 }
@@ -134,28 +131,6 @@ where
     }
 }
 
-/// Scratch backing plus its free list of available page indices.
-/// Reads and writes to the underlying pages only ever happen from
-/// RPC worker threads; the free list is the only shared mutable
-/// state, guarded by a `Mutex`.
-struct ScratchBacking {
-    _backing: Backing,
-    free: Mutex<Vec<u32>>,
-}
-
-impl ScratchBacking {
-    fn take(&self) -> Option<u32> {
-        self.free.lock().expect("scratch free list poisoned").pop()
-    }
-
-    fn give(&self, idx: u32) {
-        self.free
-            .lock()
-            .expect("scratch free list poisoned")
-            .push(idx);
-    }
-}
-
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum StreamState {
     /// Have not yet attempted the local read.
@@ -168,7 +143,7 @@ enum StreamState {
 
 /// Response stream for one request. Yields exactly one page on a
 /// local hit, then ends; on a miss or error it yields the error then
-/// ends. The scratch page (if any) is returned to the free list on
+/// ends. The scratch page (if any) is returned to the allocator on
 /// drop, which happens after the RPC layer has finished `fi_write`ing
 /// it to the peer.
 pub struct PoolHandlerStream<'a, R: Req, S: BlockStore + Send + Sync + 'static> {
@@ -214,12 +189,15 @@ impl<R: Req, S: BlockStore + Send + Sync + 'static> PoolHandlerStream<'_, R, S> 
     /// it into a `PageRef`. The `BlockStore::read_page` future is
     /// created and driven to completion entirely within this call so
     /// the stream itself holds no future and is trivially `Send`.
-    /// Blocking here is acceptable: each request has its own RPC
-    /// worker thread (see [`crate::fabric::rpc`]) and disk progress
+    /// Blocking here is acceptable: the RPC worker pool is separate
+    /// from shard threads (see [`crate::fabric::rpc`]) and disk progress
     /// runs concurrently on the per-disk io_uring threads.
     fn serve_local_page(&mut self) -> Result<PageRef, PoolHandlerError> {
-        let page_size = self.scratch._backing.page_size;
-        let idx = self.scratch.take().ok_or(PoolHandlerError::NoScratchPage)?;
+        let page_size = self.scratch.page_size();
+        let idx = self
+            .scratch
+            .take_zeroed()
+            .ok_or(PoolHandlerError::NoScratchPage)?;
         self.page_idx = Some(idx);
 
         let dst = PageRef {
@@ -473,7 +451,7 @@ mod tests {
 
     #[test]
     fn exhausted_scratch_pool_reports_no_scratch_page() {
-        // Hold streams open (do not drop) until the free list drains,
+        // Hold streams open (do not drop) until the scratch allocator drains,
         // then the next handle()+poll must report NoScratchPage.
         let (scratch, base) = scratch_backing();
         let key = [6u8; 32];

@@ -30,16 +30,14 @@
 //!
 //! Like [`crate::fabric::PoolHandler`], this handler owns a dedicated
 //! scratch [`Backing`] registered as its own fabric MR and as a
-//! [`BlockStore`] extra buffer. A `Mutex`-guarded free list hands out
-//! one scratch page per in-flight request; the page is reclaimed when
-//! the response stream drops, after the RPC layer has finished
-//! `fi_write`ing it to the peer. The free list helper is duplicated
-//! here (rather than shared with `pool_handler.rs`) to keep the two
-//! handlers decoupled.
+//! [`BlockStore`] extra buffer. A shared scratch allocator hands out
+//! one zeroed scratch page per in-flight request; the page is reclaimed
+//! when the response stream drops, after the RPC layer has finished
+//! `fi_write`ing it to the peer.
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use serde::Serialize;
@@ -48,6 +46,7 @@ use serde::de::DeserializeOwned;
 use crate::backend::Backend;
 use crate::bufferpool::{BlockStore, BulkRef, PageRef, PageStream, Req, StripeKey};
 use crate::fabric::Result as FabResult;
+use crate::fabric::scratch::ScratchBacking;
 use crate::fabric::{Fabric, FabricTransport, Handler, HandlerStream, MrHandle, PeerId};
 use crate::memory::Backing;
 use crate::p2p::{
@@ -214,12 +213,7 @@ where
         page_size: usize,
         backend: B,
     ) -> FabResult<Self> {
-        let usable = scratch_pages.min(scratch.page_count as u32);
-        let free: Vec<u32> = (0..usable).collect();
-        let scratch = Arc::new(ScratchBacking {
-            backing: scratch,
-            free: Mutex::new(free),
-        });
+        let scratch = Arc::new(ScratchBacking::new(scratch, scratch_pages));
         let router = ChainFingerRouter::new(routes.clone());
         let forward = FabricTransport::new(fabric, scratch_mr, router, page_size)?;
         Ok(Self {
@@ -262,51 +256,6 @@ where
     }
 }
 
-/// Scratch backing plus its free list of available page indices.
-/// Reads and writes to the underlying pages only ever happen from
-/// RPC worker threads; the free list is the only shared mutable
-/// state, guarded by a `Mutex`. The `backing` field is read directly
-/// to derive page base pointers when a checked-out slot must be
-/// zeroed before it is filled.
-struct ScratchBacking {
-    backing: Backing,
-    free: Mutex<Vec<u32>>,
-}
-
-impl ScratchBacking {
-    /// Pop a free page index, zeroing the full extent of that scratch
-    /// slot before returning it. Every data-bearing request path must
-    /// check out through this method so a recycled page can never
-    /// carry residual bytes from a prior request into a new response;
-    /// the relayed length is derived from remote-supplied input and a
-    /// short fill would otherwise expose stale in-page bytes.
-    fn take_zeroed(&self) -> Option<u32> {
-        let idx = self.take()?;
-        let page_size = self.backing.page_size;
-        // SAFETY: `idx` came off the free list, so this request owns
-        // the slot exclusively until the matching `give`. The region
-        // `[base + idx*page_size, +page_size)` lies within the
-        // registered backing because `idx < page_count` (the free list
-        // is seeded with indices `0..usable <= page_count`).
-        unsafe {
-            let slot = self.backing.base.add(idx as usize * page_size);
-            std::ptr::write_bytes(slot, 0, page_size);
-        }
-        Some(idx)
-    }
-
-    fn take(&self) -> Option<u32> {
-        self.free.lock().expect("scratch free list poisoned").pop()
-    }
-
-    fn give(&self, idx: u32) {
-        self.free
-            .lock()
-            .expect("scratch free list poisoned")
-            .push(idx);
-    }
-}
-
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum StreamState {
     /// Have not yet attempted to resolve the request.
@@ -341,7 +290,7 @@ fn classify(fingers: &FingerTable, target: RingId, hops_remaining: u32) -> Route
 
 /// Response stream for one request. Resolves on first poll, yields
 /// exactly one page on success then ends, or yields the error then
-/// ends. The scratch page (if reserved) is returned to the free list
+/// ends. The scratch page (if reserved) is returned to the allocator
 /// on drop, which happens after the RPC layer has finished
 /// `fi_write`ing it to the peer.
 pub struct RecursiveHandlerStream<'a, R, S, B>
@@ -405,9 +354,9 @@ where
     /// work (`read_page`, the backend stream, the forward stream) is
     /// driven to completion within this call so the stream holds no
     /// future and is trivially `Send`; blocking here is acceptable
-    /// because each request has its own RPC worker thread.
+    /// because RPC worker threads are separate from shard threads.
     fn serve(&mut self) -> Result<PageRef, RecursiveHandlerError> {
-        let page_size = self.scratch.backing.page_size;
+        let page_size = self.scratch.page_size();
         let target = stripe_to_ring(self.key);
         let route = self
             .fingers
@@ -857,6 +806,10 @@ mod tests {
         }
     }
 
+    fn dirty_scratch_slot(base: *mut u8, idx: u32, byte: u8) {
+        fill_page(base, idx, byte);
+    }
+
     fn page_all(base: *mut u8, idx: u32) -> Vec<u8> {
         // SAFETY: idx is within the test backing.
         unsafe { std::slice::from_raw_parts(base.add(idx as usize * PAGE), PAGE).to_vec() }
@@ -865,15 +818,12 @@ mod tests {
     #[test]
     fn recycled_scratch_page_is_zeroed_on_checkout() {
         let (backing, base) = scratch_backing();
-        let scratch = ScratchBacking {
-            backing,
-            free: Mutex::new(vec![0]),
-        };
+        let scratch = ScratchBacking::new(backing, 1);
 
         // A prior request leaves a recognizable non-zero pattern across
-        // the full extent of the slot, then returns it to the free list.
-        let idx = scratch.take().expect("slot available");
-        fill_page(base, idx, 0xEE);
+        // the full extent of the slot, then returns it to the allocator.
+        let idx = scratch.take_zeroed().expect("slot available");
+        dirty_scratch_slot(base, idx, 0xEE);
         scratch.give(idx);
 
         // Re-acquiring through the zeroing checkout must hand back a
@@ -893,14 +843,11 @@ mod tests {
         // restrict to the page head, and assert the tail is zero rather
         // than the prior pattern.
         let (backing, base) = scratch_backing();
-        let scratch = ScratchBacking {
-            backing,
-            free: Mutex::new(vec![0]),
-        };
+        let scratch = ScratchBacking::new(backing, 1);
 
         // Prior request dirties the entire slot.
-        let idx = scratch.take().expect("slot available");
-        fill_page(base, idx, 0xEE);
+        let idx = scratch.take_zeroed().expect("slot available");
+        dirty_scratch_slot(base, idx, 0xEE);
         scratch.give(idx);
 
         // New checkout zeroes the slot; a short fill (head only) leaves
