@@ -136,6 +136,10 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 		return true
 	}
 
+	if applied.DisableNvidia != desired.DisableNvidia {
+		return true
+	}
+
 	if applied.Kubelet.ApiServer != desired.Kubelet.ApiServer {
 		return true
 	}

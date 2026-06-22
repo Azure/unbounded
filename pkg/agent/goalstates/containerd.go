@@ -17,7 +17,7 @@ type Containerd struct {
 }
 
 // ResolveContainerd returns the containerd configuration goal state.
-func ResolveContainerd() Containerd {
+func ResolveContainerd(nvidia NvidiaHost) Containerd {
 	return Containerd{
 		SandboxImage:      SandboxImage,
 		ContainerdBinPath: filepath.Join("/"+BinDir, "containerd"),
@@ -25,6 +25,6 @@ func ResolveContainerd() Containerd {
 		CNIBinDir:         CNIBinDir,
 		CNIConfDir:        CNIConfigDir,
 		MetricsAddress:    ContainerdMetricsAddress,
-		NvidiaRuntime:     resolveNvidiaRuntime(),
+		NvidiaRuntime:     resolveNvidiaRuntime(nvidia),
 	}
 }

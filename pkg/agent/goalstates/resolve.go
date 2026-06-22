@@ -25,9 +25,9 @@ type MachineGoalState struct {
 	NodeStart *NodeStart
 }
 
-// ResolveMachine probes the host (kernel version, hostname, GPU hardware) and
-// resolves the complete goal state for the named nspawn machine from an agent
-// config.
+// ResolveMachine probes the host (kernel version, hostname, GPU hardware unless
+// disabled) and resolves the complete goal state for the named nspawn machine
+// from an agent config.
 func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
 	kernel, err := hostKernel()
 	if err != nil {
@@ -39,9 +39,15 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		return nil, fmt.Errorf("get host hostname: %w", err)
 	}
 
-	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
-	if err != nil {
-		return nil, fmt.Errorf("resolve nvidia host: %w", err)
+	var nvidia NvidiaHost
+	if cfg.DisableNvidia {
+		log.Info("NVIDIA support disabled by agent config")
+	} else {
+		var err error
+		nvidia, err = ResolveNvidiaHost(runtime.GOARCH)
+		if err != nil {
+			return nil, fmt.Errorf("resolve nvidia host: %w", err)
+		}
 	}
 
 	ociImage := ResolveOCIImage(log, cfg.OCIImage, len(nvidia.GPUDevicePaths) > 0)
@@ -95,7 +101,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		KubeMachineName: cfg.MachineName,
 		NodeName:        cfg.NodeName,
 		MachineDir:      filepath.Join("/var/lib/machines", machineName),
-		Containerd:      ResolveContainerd(),
+		Containerd:      ResolveContainerd(nvidia),
 		Kubelet:         kubelet,
 		Nvidia:          nvidia,
 	}

@@ -8,6 +8,12 @@ The unbounded-agent automatically detects NVIDIA GPUs on the host, forwards the
 driver's userspace libraries into the nspawn container, generates a CDI
 specification, and configures containerd so that GPU workloads can be scheduled on the node.
 
+Set `DisableNvidia` to `true` in the agent config to disable NVIDIA GPU
+discovery and runtime setup even when `/dev/nvidia*` devices are present on the
+host. When disabled, the agent does not select the default NVIDIA OCI image,
+bind-mount NVIDIA devices or libraries, generate the NVIDIA CDI spec, or
+register the NVIDIA containerd runtime.
+
 ## Prerequisites
 
 Before the agent can expose GPUs, the **host VM** must have:

@@ -84,7 +84,8 @@ func TestCRIConfig_JSONRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	cfg := AgentConfig{
-		MachineName: "test",
+		MachineName:   "test",
+		DisableNvidia: true,
 		CRI: CRIConfig{
 			Containerd: ContainerdConfig{Version: "2.1.0"},
 			Runc:       RuncConfig{Version: "1.2.0"},
@@ -101,6 +102,7 @@ func TestCRIConfig_JSONRoundTrip(t *testing.T) {
 	assert.Equal(t, "2.1.0", decoded.CRI.Containerd.Version)
 	assert.Equal(t, "1.2.0", decoded.CRI.Runc.Version)
 	assert.Equal(t, "1.6.0", decoded.CNI.PluginVersion)
+	assert.True(t, decoded.DisableNvidia)
 }
 
 func TestCRIConfig_OmittedWhenEmpty(t *testing.T) {
@@ -124,6 +126,7 @@ func TestCRIConfig_OmittedWhenEmpty(t *testing.T) {
 
 	cni := parsed["CNI"].(map[string]interface{})
 	assert.NotContains(t, cni, "PluginVersion")
+	assert.NotContains(t, parsed, "DisableNvidia")
 }
 
 func TestAgentConfig_DeepCopy(t *testing.T) {

@@ -6,6 +6,7 @@ package goalstates
 import (
 	"log/slog"
 	"os"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -100,6 +101,44 @@ func TestResolveOCIImage_DefaultWithGPU(t *testing.T) {
 
 	got := ResolveOCIImage(discardLogger(), "", true)
 	assert.Equal(t, DefaultNvidiaOCImage, got)
+}
+
+func TestResolveContainerd_NvidiaRuntimeFollowsResolvedHost(t *testing.T) {
+	withoutGPU := ResolveContainerd(NvidiaHost{})
+	assert.False(t, withoutGPU.NvidiaRuntime.Enabled)
+
+	withGPU := ResolveContainerd(NvidiaHost{GPUDevicePaths: []string{"/dev/nvidia0"}})
+	assert.True(t, withGPU.NvidiaRuntime.Enabled)
+}
+
+func TestResolveMachine_DisableNvidia(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ResolveMachine requires Linux host kernel discovery")
+	}
+
+	t.Setenv("AGENT_DISABLE_OCI_IMAGE", "")
+	t.Setenv("AGENT_OCI_IMAGE", "")
+
+	cfg := &config.AgentConfig{
+		MachineName:   "machine-1",
+		DisableNvidia: true,
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, DefaultOCIImage, got.RootFS.OCIImage)
+	assert.Empty(t, got.RootFS.Nvidia.GPUDevicePaths)
+	assert.Empty(t, got.RootFS.Nvidia.LibMappings)
+	assert.Empty(t, got.RootFS.Nvidia.LibDirMounts)
+	assert.Empty(t, got.NodeStart.Nvidia.GPUDevicePaths)
+	assert.False(t, got.NodeStart.Containerd.NvidiaRuntime.Enabled)
 }
 
 func TestResolveOCIImage_Priority(t *testing.T) {
@@ -223,6 +262,10 @@ func TestResolveKubelet_InvalidNodeIPRejected(t *testing.T) {
 }
 
 func TestResolveMachine_UsesConfigNodeName(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ResolveMachine requires Linux host kernel discovery")
+	}
+
 	cfg := &config.AgentConfig{
 		MachineName: "machine-1",
 		NodeName:    "configured-node",

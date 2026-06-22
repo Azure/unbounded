@@ -47,6 +47,10 @@ type AgentConfig struct {
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
 	// When empty the agent falls back to debootstrap.
 	OCIImage string `json:"OCIImage,omitempty"`
+
+	// DisableNvidia disables NVIDIA GPU discovery and runtime setup even when
+	// NVIDIA devices are present on the host.
+	DisableNvidia bool `json:"DisableNvidia,omitempty"`
 }
 
 // BackfillNodeName resolves and stores the Kubernetes Node name once. An

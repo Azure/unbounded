@@ -98,6 +98,13 @@ func Test_hasDrift_OciImageChange(t *testing.T) {
 	assert.True(t, hasDrift(applied, desired))
 }
 
+func Test_hasDrift_DisableNvidiaChange(t *testing.T) {
+	applied := baseConfig()
+	desired := baseConfig()
+	desired.DisableNvidia = true
+	assert.True(t, hasDrift(applied, desired))
+}
+
 func Test_hasDrift_LabelsChange(t *testing.T) {
 	applied := baseConfig()
 	desired := baseConfig()
