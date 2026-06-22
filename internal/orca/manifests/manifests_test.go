@@ -124,6 +124,35 @@ func TestDevManifestsRender(t *testing.T) {
 	)
 }
 
+// TestStableGarageManifestsRender renders the integration-cluster
+// (unbounded-stable) Garage manifest under hack/orca/stable/. Unlike
+// the dev Garage (deploy/orca/dev/), this one is PVC-backed and serves
+// only as Orca's cachestore, so the required-kind set includes a
+// PersistentVolumeClaim. The Service must be ClusterIP (Orca reaches
+// Garage in-cluster via its Service DNS).
+func TestStableGarageManifestsRender(t *testing.T) {
+	t.Parallel()
+
+	root := repoRoot(t)
+	templatesDir := filepath.Join(root, "hack", "orca", "stable")
+
+	renderAndValidate(t, templatesDir, stableGarageData(),
+		expectKindsAtLeastOnce("Deployment", "Service", "ConfigMap", "PersistentVolumeClaim"),
+		expectAllServicesClusterIP(),
+	)
+}
+
+// stableGarageData supplies realistic template variables for the
+// hack/orca/stable Garage manifest.
+func stableGarageData() map[string]string {
+	return map[string]string{
+		"Namespace":          "unbounded-kube",
+		"CachestoreRegion":   "us-east-1",
+		"GarageStorage":      "100Gi",
+		"GarageStorageClass": "managed-csi",
+	}
+}
+
 // productionData supplies realistic template variables for the
 // production-shape templates. Templates use sprig's `default` for
 // missing keys; we set values that exercise the non-default paths

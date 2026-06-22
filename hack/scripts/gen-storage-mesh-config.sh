@@ -271,10 +271,20 @@ cat >&3 <<EOF
 #   internal ip: $LOCAL_IP
 #   node id:     $LOCAL_ID  (of $NODE_COUNT nodes; ids assigned by sorted name)
 #
-# Every other node in the cluster is wired in below as a TCP peer. Regenerate
-# the peer config for a different node with --local-node <name>.
+# Every other node in the cluster is wired into the p2p neighborhood below as a
+# TCP peer. Regenerate the peer config for a different node with --local-node
+# <name>.
 
-[p2p]
+[[backends]]
+name = "origin"
+
+[backends.config.s3]
+url = "$OPT_ORIGIN"
+stripe_size_bytes = $STRIPE_SIZE
+
+[[neighborhoods]]
+name = "p2p"
+source = "origin"
 local_node_id = $LOCAL_ID
 EOF
 
@@ -284,50 +294,48 @@ for i in "${!NAMES[@]}"; do
 	peer_id=$((i + 1))
 	cat >&3 <<EOF
 
-[[peers]]
+[[neighborhoods.peers]]
 # peer node: ${NAMES[$i]}
 id = $peer_id
-address = "${IPS[$i]}:$OPT_PORT"
+
+[neighborhoods.peers.config.tcp]
+addr = "${IPS[$i]}:$OPT_PORT"
 EOF
 done
 
 cat >&3 <<EOF
 
-[[disks]]
-path = "/tmp/unbounded-storage-${LOCAL_NAME}.disk"
-# kind: 0 = nvme, 1 = block, 2 = file.
-kind = 2
-size = $DISK_SIZE
-page_size_bytes = 4096
-bypass_admission = true
-skip_recovery_scan_if_no_meta = true
+[[caches]]
+name = "cache"
+source = "p2p"
 
-[[backends]]
-id = "origin"
-# kind: 0 = http, 1 = s3.
-kind = 1
-endpoint = "$OPT_ORIGIN"
-stripe_size_bytes = $STRIPE_SIZE
+[[caches.disks]]
+page_size_bytes = 4096
+skip_recovery_scan = true
+
+[caches.disks.config.file]
+path = "/tmp/unbounded-storage-${LOCAL_NAME}.disk"
+size = $DISK_SIZE
 
 [[frontends]]
-id = "fe"
-# kind: 0 = http, 1 = s3.
-kind = 0
-bind = "0.0.0.0:$OPT_FRONTEND_PORT"
-backend = "origin"
+name = "fe"
+source = "cache"
 
-[startup.fabric]
+[frontends.config.http]
+addr = "0.0.0.0:$OPT_FRONTEND_PORT"
+
+[startup.fabric.binds.tcp]
 # Bind the node's own routable IP, not 0.0.0.0. This must be the exact
-# address peers use to reach this node (their [[peers]] address == this
-# listen_addr); the libfabric tcp provider uses it both to bind and as its
+# address peers use to reach this node (their [[neighborhoods.peers]] TCP addr
+# points here); the libfabric tcp provider uses it both to bind and as its
 # connection-manager identity and does not come up on an INADDR_ANY bind.
-listen_addr = "$LOCAL_IP:$OPT_PORT"
+addr = "$LOCAL_IP:$OPT_PORT"
 
 [startup.metrics]
 # Prometheus text-format exporter on GET /metrics. Bind 0.0.0.0 so an
 # in-cluster scraper (e.g. AKS managed Prometheus) can reach it across the
 # network; an empty bind disables the exporter.
-bind = "0.0.0.0:$OPT_METRICS_PORT"
+addr = "0.0.0.0:$OPT_METRICS_PORT"
 EOF
 
 # Close the output fd and report where the config landed (file mode only).
