@@ -12,6 +12,11 @@ a full systemd init tree so that kubelet, containerd, and their dependencies
 are managed as regular systemd services, decoupled from anything running on the
 host.
 
+The nspawn machine is a lifecycle and state boundary, not a hardware security
+boundary. The agent deliberately exposes the host device tree to the machine so
+Kubernetes workloads, device plugins, and node-local storage/network daemons can
+use GPUs, NVMe devices, HCAs, KVM, and other host hardware directly.
+
 ![Host and nspawn container boundary: unbounded-agent, machinectl, and systemd-nspawn on the host; systemd, containerd, kubelet, CNI plugins, and pod containers inside the nspawn container; shared network namespace across both](../../../img/nspawn-host-container-boundary.svg)
 
 ## Why nspawn
@@ -88,6 +93,15 @@ kube-proxy can set network sysctls, while the rest of `/proc/sys` stays
 read-only. Cgroups v2 is forced inside the container to ensure consistent
 behavior regardless of the systemd version in the rootfs.
 
+The host's full `/dev` tree is recursively bind-mounted into the machine, and
+host udev metadata under `/run/udev` is exposed read-only. This lets tools
+inside the machine resolve device properties for the host-managed device nodes.
+The container-side `systemd-udevd` service and sockets are masked during rootfs
+preparation because the host remains responsible for managing devices. The
+service override also clears the device allow-list inherited from the stock
+`systemd-nspawn@.service` template, sets `DevicePolicy=auto`, and removes the
+top-level task cap with `TasksMax=infinity`.
+
 The default `systemd-nspawn@.service` launcher may still show flags such as
 `--network-veth`. Those flags come from the systemd template, but the generated
 `.nspawn` file is written to the trusted `/etc/systemd/nspawn/` directory and
@@ -96,15 +110,11 @@ the template runs with `--settings=override`. As a result, the generated
 network namespace. Host interfaces, host firewall and routing rules, and
 loopback listeners are therefore visible from inside the nspawn machine.
 
-When NVIDIA GPUs are detected on the host, the agent automatically bind-mounts
-the GPU device nodes (e.g. `/dev/nvidia0`, `/dev/nvidiactl`) and the host's
-driver libraries into the container, and grants the necessary cgroup device
-permissions. See [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}) for
-the full GPU pipeline.
-
-When the KVM character device (`/dev/kvm`) is present on the host, the agent
-automatically bind-mounts it into the container so that workloads inside the
-container can use hardware virtualisation (e.g. QEMU/KVM virtual machines).
+Because `/dev` is passed through as a whole, device-specific bind-mounts are not
+generated for KVM, NVIDIA GPUs, NVMe devices, or other hardware. NVIDIA support
+still discovers GPU devices to decide whether to use a GPU-capable rootfs image
+and to generate CDI state after boot, but the device nodes themselves come from
+the full host `/dev` passthrough. See [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}) for the full GPU pipeline.
 
 The configuration is written to two files on the host before the machine boots:
 
@@ -121,13 +131,17 @@ The configuration is written to two files on the host before the machine boots:
 | `PrivateUsers=no` | nspawn config | Disables user namespace remapping so runc can use real root. |
 | `SystemCallFilter=@keyring bpf perf_event_open` | nspawn config | Allows kernel keyring, eBPF, and perf event syscalls used by containerd, runc, and eBPF CNIs. |
 | `VirtualEthernet=no` | nspawn config | Shares the host network namespace. |
+| `Bind=/dev:/dev:rbind` | nspawn config | Recursively exposes the host-managed device tree inside the machine. |
+| `BindReadOnly=/run/udev` | nspawn config | Exposes host udev metadata for device discovery tools. |
+| `BindReadOnly=/lib/modules` | nspawn config | Exposes host kernel modules read-only. |
 | `Bind=/run/bpffs/<MachineName>:/sys/fs/bpf` | nspawn config | Exposes a machine-scoped bpffs mount to eBPF CNIs such as Cilium. |
+| `BindReadOnly=/run/host-nvidia/<index>` | nspawn config | Exposes host NVIDIA driver library directories when GPUs are detected. |
 | bpffs `ExecStartPre=` mount commands | Service override | Creates and mounts the machine-scoped host bpffs before the machine starts. |
 | `SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1` | Service override | Forces cgroups v2 inside the container. |
 | `SYSTEMD_NSPAWN_API_VFS_WRITABLE=network` | Service override | Makes `/proc/sys/net` writable for CNI and kube-proxy. |
-| `Bind=/dev/kvm` | nspawn config | KVM device bind-mount (auto-generated when `/dev/kvm` is present). |
-| `Bind=` / `BindReadOnly=` | nspawn config | GPU device and library bind-mounts (auto-generated when GPUs are present). |
-| `DeviceAllow=` | Service override | Cgroup device permissions for GPU nodes (auto-generated when GPUs are present). |
+| `DeviceAllow=` | Service override | Clears the inherited device allow-list from the stock nspawn service template. |
+| `DevicePolicy=auto` | Service override | Uses the non-restrictive device policy after the inherited allow-list is cleared. |
+| `TasksMax=infinity` | Service override | Removes the top-level task cap from the nspawn machine service. |
 
 #### System call filter
 
@@ -159,8 +173,9 @@ The **unbounded-agent** itself and host-side management tools such as
 **machinectl** and **systemctl** remain on the host. `machinectl` is used to
 start, inspect, and access the machine, while the lifecycle of the backing
 `systemd-nspawn@<MachineName>.service` is managed via `systemctl`. NVIDIA
-kernel drivers and userspace libraries also stay on the host and are forwarded
-into the container via bind-mounts.
+kernel drivers and userspace libraries also stay on the host. Device nodes are
+visible through the full `/dev` bind mount; userspace driver libraries are
+forwarded into the container via read-only bind-mounts when GPUs are detected.
 
 ## Lifecycle
 
@@ -176,7 +191,9 @@ The agent's three-phase bootstrap drives the nspawn lifecycle:
 
 2. **Rootfs preparation.** Creates the rootfs, writes the `.nspawn` config and
    service override, downloads Kubernetes and container runtime binaries, and
-   configures the OS inside the rootfs (hostname, DNS, kernel modules).
+   configures the OS inside the rootfs (hostname, DNS, kernel modules). It also
+   masks container-side `systemd-resolved` and `systemd-udevd` units so DNS and
+   device management remain host-controlled where required.
 
 3. **Node start.** Starts the nspawn machine, polls until it is responsive,
    then enables containerd and kubelet inside it.
@@ -234,7 +251,7 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 - **[Agent Configuration]({{< relref "reference/agent/configuration" >}})**:
   JSON config file specification including `MachineName` and `OCIImage`.
 - **[NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}})**:
-  How GPU devices and libraries are forwarded into the nspawn container.
+  How GPU libraries, CDI, and runtime configuration are set up in the nspawn container.
 - **[Agent Guide]({{< relref "guides/agent" >}})**:
   End-to-end walkthrough of the three-phase bootstrap.
 - **[Agent Operations]({{< relref "guides/operations/agent-operations" >}})**:

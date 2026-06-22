@@ -6,7 +6,9 @@ description: "How the unbounded-agent discovers, configures, and exposes NVIDIA 
 
 The unbounded-agent automatically detects NVIDIA GPUs on the host, forwards the
 driver's userspace libraries into the nspawn container, generates a CDI
-specification, and configures containerd so that GPU workloads can be scheduled on the node.
+specification, and configures containerd so that GPU workloads can be scheduled
+on the node. GPU device nodes are visible through the agent's full host `/dev`
+passthrough rather than through NVIDIA-specific device bind-mounts.
 
 ## Prerequisites
 
@@ -40,9 +42,10 @@ full sequence is:
 2. **Library discovery.** Queries `ldconfig -p` on the host and filters for
    NVIDIA libraries matching the host architecture. Deduplicates parent
    directories and assigns each a numbered mount index.
-3. **nspawn configuration.** Writes device bind-mounts, read-only library
-   bind-mounts at `/run/host-nvidia/<index>/`, and `DeviceAllow` cgroup
-   entries into the nspawn and systemd service override configs.
+3. **nspawn configuration.** The general nspawn configuration exposes the full
+   host `/dev` tree and read-only `/run/udev` metadata. NVIDIA-specific rootfs
+   setup adds read-only driver library bind-mounts at
+   `/run/host-nvidia/<index>/`.
 4. **NVIDIA setup.** After the nspawn boots, creates symlinks in the
    container's multiarch library directory pointing into `/run/host-nvidia/`,
    runs `ldconfig`, then runs `nvidia-ctk cdi generate` to produce the CDI
@@ -75,7 +78,8 @@ images with the NVIDIA Container Toolkit:
 - `libnvidia-container`: low-level library for GPU container setup.
 
 The image does **not** include NVIDIA kernel drivers or userspace libraries.
-Those are forwarded from the host at boot time via the bind-mount mechanism
+Device nodes are provided by the full host `/dev` passthrough. Userspace driver
+libraries are forwarded from the host at boot time via the bind-mount mechanism
 described above.
 
 ## Troubleshooting

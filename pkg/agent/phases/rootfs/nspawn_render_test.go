@@ -52,9 +52,27 @@ func requireRenderedSnapshot(t *testing.T, goldenFile, templateName string, data
 
 	if templateName == "service-override.conf" {
 		requireBPFFSExecStartPreOrder(t, buf.String(), data.BPFFSMountPath)
+		requireFullDeviceAccess(t, buf.String())
+	} else if templateName == "nspawn.conf" {
+		requireFullDevPassthrough(t, buf.String())
 	}
 
 	return buf.String()
+}
+
+func requireFullDeviceAccess(t *testing.T, out string) {
+	t.Helper()
+
+	require.Contains(t, out, "DeviceAllow=\n")
+	require.Contains(t, out, "DevicePolicy=auto\n")
+	require.Contains(t, out, "TasksMax=infinity\n")
+}
+
+func requireFullDevPassthrough(t *testing.T, out string) {
+	t.Helper()
+
+	require.Contains(t, out, "Bind=/dev:/dev:rbind\n")
+	require.Contains(t, out, "BindReadOnly=/run/udev\n")
 }
 
 func requireBPFFSExecStartPreOrder(t *testing.T, out, bpffsPath string) {

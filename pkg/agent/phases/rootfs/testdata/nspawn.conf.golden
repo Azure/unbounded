@@ -21,6 +21,14 @@ SystemCallFilter=@keyring bpf perf_event_open
 VirtualEthernet=no
 
 [Files]
+# Bind-mount the host's full device tree into the container. The nspawn
+# machine is a lifecycle boundary, not a hardware security boundary; kubelet,
+# device plugins, storage daemons, and privileged workloads need to see the
+# host's devices directly.
+Bind=/dev:/dev:rbind
+# Expose host udev metadata read-only so device discovery tools can resolve
+# properties for the host-managed /dev tree.
+BindReadOnly=/run/udev
 # Bind-mount the host's kernel modules directory read-only into the container.
 # This is required to export the host kernel to the machine.
 BindReadOnly=/lib/modules

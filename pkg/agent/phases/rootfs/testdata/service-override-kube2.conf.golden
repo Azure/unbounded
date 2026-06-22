@@ -30,6 +30,12 @@
 # and is a bpffs mount before the .nspawn Bind= directive exposes it inside the
 # machine. eBPF CNIs need a usable bpffs at /sys/fs/bpf to create and share BPF
 # maps, but each nspawn machine should get its own pinned-object namespace.
+#
+# The default systemd-nspawn@.service template restricts device access with
+# DevicePolicy=closed and explicit DeviceAllow= entries. Full hardware
+# passthrough requires clearing that inherited allow-list and returning to the
+# non-restrictive auto policy. TasksMax=infinity removes the template's task
+# cap so the machine itself is not a top-level resource throttle.
 
 [Unit]
 StartLimitIntervalSec=0
@@ -42,3 +48,6 @@ ExecStartPre=/usr/bin/mkdir -p /run/bpffs/kube2
 ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q /run/bpffs/kube2 || /usr/bin/mount -t bpf bpf /run/bpffs/kube2'
 Environment=SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1
 Environment=SYSTEMD_NSPAWN_API_VFS_WRITABLE=network
+DeviceAllow=
+DevicePolicy=auto
+TasksMax=infinity

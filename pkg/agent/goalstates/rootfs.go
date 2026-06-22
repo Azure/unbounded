@@ -30,12 +30,7 @@ type RootFS struct {
 	OCIImage string
 
 	// Nvidia holds NVIDIA GPU state discovered on the host: device paths,
-	// driver library mappings, and bind-mount specifications for the nspawn
-	// container. Empty on non-GPU hosts.
+	// driver library mappings, and bind-mount specifications for host driver
+	// libraries. Empty on non-GPU hosts.
 	Nvidia NvidiaHost
-
-	// HostDevicePaths lists host device node paths to be bind-mounted into
-	// the nspawn container (e.g. ["/dev/kvm"]). Device nodes are discovered
-	// at agent startup. Empty on hosts without any supported devices.
-	HostDevicePaths []string
 }

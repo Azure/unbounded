@@ -336,7 +336,8 @@ my-node    Ready    <none>   20s   v1.33.1   192.168.100.10   <none>        Ubun
 
 When NVIDIA GPUs are detected on the host, the agent automatically:
 
-- Bind-mounts GPU devices and driver libraries into the nspawn machine.
+- Exposes GPU devices through the nspawn machine's full host `/dev` passthrough
+  and bind-mounts host driver libraries read-only.
 - Generates a CDI spec and registers the NVIDIA container runtime with
   containerd.
 
