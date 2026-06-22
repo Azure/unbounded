@@ -8,10 +8,6 @@ publish = false
 name = "unbounded-storage"
 path = "src/main.rs"
 
-[[bin]]
-name = "bench"
-path = "src/bin/bench.rs"
-
 [lib]
 name = "unbounded_storage"
 path = "src/lib.rs"
@@ -55,4 +51,3 @@ io-uring = "0.6"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
-

@@ -34,7 +34,7 @@ use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, C
 use ::http::{Response, StatusCode};
 
 use crate::bufferpool::{BufferPool, Error, StripePlan};
-use crate::config::{FrontendKind, FrontendSpec};
+use crate::config::{FrontendSpec, frontend_spec};
 use crate::frontend::FrontendError;
 use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, stripe_set};
 use crate::frontend::s3_xml::{S3ErrorCode, error_xml};
@@ -66,47 +66,40 @@ static REQUEST_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 /// [`S3Frontend::bind_listener`] and constructs the driver directly.
 pub struct S3Frontend {
     id: String,
-    bind: SocketAddr,
-    backend_id: String,
+    addr: SocketAddr,
 }
 
 impl S3Frontend {
-    /// Construct from a [`FrontendSpec`], validating the kind and
-    /// parsing the bind address.
+    /// Construct from a [`FrontendSpec`], validating the config type and
+    /// parsing the listen address.
     ///
     /// Mirrors [`HttpFrontend::from_spec`](crate::frontend::HttpFrontend):
-    /// a spec whose [`FrontendKind`] is not `S3` is rejected with
+    /// a spec whose config is not `s3` is rejected with
     /// [`FrontendError::UnsupportedKind`], so a misrouted spec fails
     /// loudly rather than being served by the wrong engine.
     pub fn from_spec(spec: &FrontendSpec) -> Result<Self, FrontendError> {
-        if spec.kind() != FrontendKind::S3 {
-            return Err(FrontendError::UnsupportedKind("non-s3 frontend kind"));
-        }
-        let bind = spec
-            .bind
+        let cfg = match spec.config.as_ref() {
+            Some(frontend_spec::Config::S3(cfg)) => cfg,
+            _ => return Err(FrontendError::UnsupportedKind("non-s3 frontend config")),
+        };
+        let addr = cfg
+            .addr
             .parse::<SocketAddr>()
-            .map_err(|_| FrontendError::BadBind(spec.bind.clone()))?;
+            .map_err(|_| FrontendError::BadBind(cfg.addr.clone()))?;
         Ok(Self {
-            id: spec.id.clone(),
-            bind,
-            backend_id: spec.backend.clone(),
+            id: spec.name.clone(),
+            addr,
         })
     }
 
-    /// Stable identifier, matching [`FrontendSpec::id`].
+    /// Stable identifier, matching [`FrontendSpec::name`].
     pub fn id(&self) -> &str {
         &self.id
     }
 
-    /// The backend id this frontend resolves origin metadata and stripe
-    /// fetches against.
-    pub fn backend_id(&self) -> &str {
-        &self.backend_id
-    }
-
     /// The configured listen address.
     pub fn bind(&self) -> SocketAddr {
-        self.bind
+        self.addr
     }
 
     /// Create, bind, and listen the per-shard accept socket with
@@ -116,7 +109,7 @@ impl S3Frontend {
     /// The caller owns the returned fd and is responsible for closing
     /// it; [`S3Driver`] only reads it for `accept`.
     pub fn bind_listener(&self) -> Result<RawFd, FrontendError> {
-        bind_listener(self.bind).map_err(|_| FrontendError::BadBind(self.bind.to_string()))
+        bind_listener(self.addr).map_err(|_| FrontendError::BadBind(self.addr.to_string()))
     }
 }
 
@@ -135,8 +128,11 @@ pub struct S3Driver<P: BufferPool<Req = StripeReq> + 'static> {
     listen_fd: RawFd,
     frontend_id: Rc<str>,
     backend_id: String,
+    cache_id: Option<String>,
+    neighborhood_id: Option<String>,
     stripe_size: u64,
     page_size: usize,
+    bypass: bool,
     accept_fut: Pin<Box<dyn Future<Output = std::io::Result<RawFd>>>>,
     conns: Vec<Pin<Box<dyn Future<Output = ()>>>>,
     waker: Waker,
@@ -146,15 +142,19 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
     /// Build a serving engine over a bound `listen_fd`.
     ///
     /// `stripe_size` and `page_size` come from the shard's pool
-    /// geometry.
+    /// geometry. When `bypass` is set, the frontend bridges straight to
+    /// its backend, skipping the disk cache and peer routing.
     pub fn new(
         pool: Rc<P>,
         handle: NetHandle,
         listen_fd: RawFd,
         frontend_id: Rc<str>,
         backend_id: String,
+        cache_id: Option<String>,
+        neighborhood_id: Option<String>,
         stripe_size: u64,
         page_size: usize,
+        bypass: bool,
     ) -> Self {
         let accept_fut = Box::pin(handle.accept(listen_fd));
         Self {
@@ -163,8 +163,11 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
             listen_fd,
             frontend_id,
             backend_id,
+            cache_id,
+            neighborhood_id,
             stripe_size,
             page_size,
+            bypass,
             accept_fut,
             conns: Vec::new(),
             waker: noop_waker(),
@@ -206,8 +209,11 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
                             fd,
                             Rc::clone(&self.frontend_id),
                             self.backend_id.clone(),
+                            self.cache_id.clone(),
+                            self.neighborhood_id.clone(),
                             self.stripe_size,
                             self.page_size,
+                            self.bypass,
                         );
                         self.conns.push(Box::pin(serve));
                     }
@@ -262,8 +268,11 @@ async fn serve_connection_s3<P: BufferPool<Req = StripeReq>>(
     conn_fd: RawFd,
     frontend_id: Rc<str>,
     backend_id: String,
+    cache_id: Option<String>,
+    neighborhood_id: Option<String>,
     stripe_size: u64,
     page_size: usize,
+    bypass: bool,
 ) {
     let _fd = FdGuard(conn_fd);
     let _conn = ConnGuard::new();
@@ -275,8 +284,11 @@ async fn serve_connection_s3<P: BufferPool<Req = StripeReq>>(
         &handle,
         conn_fd,
         &backend_id,
+        cache_id.as_deref(),
+        neighborhood_id.as_deref(),
         stripe_size,
         page_size,
+        bypass,
         &mut log,
         &mut outcome,
     )
@@ -297,8 +309,11 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     handle: &NetHandle,
     conn_fd: RawFd,
     backend_id: &str,
+    cache_id: Option<&str>,
+    neighborhood_id: Option<&str>,
     stripe_size: u64,
     page_size: usize,
+    bypass: bool,
     log: &mut crate::obs::ReqLog,
     outcome: &mut ReqOutcome,
 ) -> Result<(), ()> {
@@ -387,7 +402,17 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
     // the plain HTTP frontend, a length-read failure is never a silently
     // dropped connection.
-    let len = match read_object_length_s3(pool, backend_id, &path, page_size).await {
+    let len = match read_object_length_s3(
+        pool,
+        backend_id,
+        cache_id,
+        neighborhood_id,
+        &path,
+        page_size,
+        bypass,
+    )
+    .await
+    {
         LenResult::Len(l) => l,
         LenResult::NotFound => {
             let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
@@ -495,7 +520,13 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 stripe_idx: slice.stripe_idx,
             };
             StripePlan {
-                req: StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref),
+                req: StripeReq::new(origin_ref.stripe_key())
+                    .with_origin(origin_ref)
+                    .with_chain(
+                        cache_id.map(ToOwned::to_owned),
+                        neighborhood_id.map(ToOwned::to_owned),
+                    )
+                    .with_bypass(bypass),
                 intra_offset: slice.intra_offset,
                 intra_len: slice.intra_len,
             }
@@ -559,11 +590,20 @@ enum LenResult {
 async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     backend_id: &str,
+    cache_id: Option<&str>,
+    neighborhood_id: Option<&str>,
     path: &str,
     page_size: usize,
+    bypass: bool,
 ) -> LenResult {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
-    let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
+    let req = StripeReq::new(origin_ref.stripe_key())
+        .with_origin(origin_ref)
+        .with_chain(
+            cache_id.map(ToOwned::to_owned),
+            neighborhood_id.map(ToOwned::to_owned),
+        )
+        .with_bypass(bypass);
     let mut rs = match pool.read(&req, 0, page_size as u64).await {
         Ok(rs) => rs,
         Err(Error::OriginNotFound) => return LenResult::NotFound,
@@ -670,15 +710,16 @@ fn next_request_id() -> String {
 mod tests {
     use super::*;
     use crate::bufferpool::{PipelinedRead, ReadStream, WindowedRead};
-    use crate::config::FrontendKind;
+    use crate::config::{HttpFrontendConfig, S3FrontendConfig};
     use std::cell::RefCell;
 
-    fn spec(id: &str, bind: &str) -> FrontendSpec {
+    fn spec(id: &str, addr: &str) -> FrontendSpec {
         FrontendSpec {
-            id: id.to_string(),
-            kind: FrontendKind::S3 as i32,
-            bind: bind.to_string(),
-            backend: "primary".to_string(),
+            name: id.to_string(),
+            source: "primary".to_string(),
+            config: Some(frontend_spec::Config::S3(S3FrontendConfig {
+                addr: addr.to_string(),
+            })),
         }
     }
 
@@ -686,7 +727,6 @@ mod tests {
     fn from_spec_validates_kind_and_bind() {
         let f = S3Frontend::from_spec(&spec("workload", "0.0.0.0:9000")).unwrap();
         assert_eq!(f.id(), "workload");
-        assert_eq!(f.backend_id(), "primary");
         assert_eq!(f.bind(), "0.0.0.0:9000".parse().unwrap());
 
         let bad = S3Frontend::from_spec(&spec("f", "not-an-addr"));
@@ -696,7 +736,9 @@ mod tests {
     #[test]
     fn from_spec_rejects_non_s3_kind() {
         let mut s = spec("f", "127.0.0.1:9000");
-        s.kind = FrontendKind::Http as i32;
+        s.config = Some(frontend_spec::Config::Http(HttpFrontendConfig {
+            addr: "127.0.0.1:9000".to_string(),
+        }));
         assert!(matches!(
             S3Frontend::from_spec(&s),
             Err(FrontendError::UnsupportedKind(_))
@@ -852,8 +894,11 @@ mod tests {
             listen_fd,
             Rc::from("primary"),
             "primary".to_string(),
+            None,
+            None,
             4 * 1024 * 1024,
             2 * 1024 * 1024,
+            false,
         );
         // No client has connected: accept is pending, no conns, so the
         // engine reports no work and stays idle.
