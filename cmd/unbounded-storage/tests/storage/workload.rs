@@ -700,7 +700,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                             len: byte_len as u32,
                         };
                         oracle.record_write(key, offset, bytes);
-                        match local.write_page(key, offset, page).await {
+                        match local.write_page(&key, offset, page).await {
                             Ok(()) => outcomes.borrow_mut().push(Outcome::WriteOk),
                             Err(e) => outcomes
                                 .borrow_mut()
@@ -723,7 +723,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                             offset: 0,
                             len: byte_len as u32,
                         };
-                        match local.read_page(key, offset, page).await {
+                        match local.read_page(&key, offset, page).await {
                             Ok(true) => {
                                 let bytes = unsafe {
                                     let p = (pool_base_v as *const u8).add(pool_slot * page_size);
@@ -887,7 +887,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                         offset: 0,
                         len: byte_len as u32,
                     };
-                    match local.read_page(key, offset, page).await {
+                    match local.read_page(&key, offset, page).await {
                         Ok(true) => {
                             let bytes = unsafe {
                                 let p = (pool_base_v as *const u8).add(pool_slot * w2.page_size);

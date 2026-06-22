@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -16,22 +16,25 @@ use clap::Parser;
 
 use unbounded_storage::backend::{BackendRegistry, OriginRing};
 use unbounded_storage::bufferpool::{Pool, PoolConfig, ShardDescriptor, StripeKey};
-use unbounded_storage::config::{self, BackendSpec, Config, FrontendKind, FrontendSpec};
-use unbounded_storage::fabric::PeerId;
+use unbounded_storage::config::{
+    self, BackendSpec, Config, FrontendSpec, ResolvedFrontendBinding, frontend_spec,
+};
 use unbounded_storage::fabric::{self, Fabric, Provider};
 use unbounded_storage::fanout::{
     FanoutPeer, FanoutTable, FetchChannel, FetchService, NumaShardTable,
 };
-use unbounded_storage::frontend::{HttpDriver, HttpFrontend, S3Driver, S3Frontend};
+use unbounded_storage::frontend::{
+    HttpDriver, HttpFrontend, LoadgenDriver, LoadgenFrontend, S3Driver, S3Frontend,
+};
 use unbounded_storage::p2p::{
-    FingerTable, FingerTableConfig, NodeId, PeerEntry, RoutedTransport, TopologyLabels,
-    node_to_ring,
+    FingerTable, FingerTableConfig, NodeId, PeerEntry, RouteTableHandle, RouteTableSnapshot,
+    RoutedTransport, RoutingSnapshot, TopologyTags, node_to_ring,
 };
 use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
 use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{
-    DiskChannelDirectory, DiskRegistry, LiveShardLocalStore, UringDiskTarget,
+    CacheDirectorySet, ChainLocalStore, DiskRegistrySet, UringDiskTarget,
 };
 use unbounded_storage::topology::{CorePlan, CorePlanConfig, DiskCpuSlot, Host, ServingShard};
 
@@ -55,8 +58,7 @@ const DEFAULT_STRIPE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 /// the main thread plus every shard thread.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-type ShardPool =
-    Pool<RoutedTransport<StripeReq, BackendRegistry>, Arc<LiveShardLocalStore>, StripeReq>;
+type ShardPool = Pool<RoutedTransport<StripeReq, BackendRegistry>, Arc<ChainLocalStore>, StripeReq>;
 
 /// Startup-fixed settings sourced from the config file's `[startup]`
 /// section, distinct from the dynamically reloadable parts of the
@@ -83,10 +85,19 @@ pub struct StartupSettings {
 #[derive(Clone, Debug)]
 pub struct FabricStartup {
     pub listen_addr: String,
+    pub rdma_listen_addrs: Vec<String>,
     pub progress_threads: u32,
     pub progress_poll_us: u32,
     pub rpc_worker_threads: u32,
     pub max_inflight: u32,
+}
+
+impl FabricStartup {
+    pub fn listen_addr_for_unit(&self, unit_idx: usize) -> &str {
+        self.rdma_listen_addrs
+            .get(unit_idx)
+            .map_or(self.listen_addr.as_str(), String::as_str)
+    }
 }
 
 /// Build the [`CorePlanConfig`] from the config file's
@@ -101,22 +112,21 @@ fn should_force_tcp_fallback(disable_rdma: bool, hca_count: usize, verbs_availab
     !disable_rdma && hca_count > 0 && !verbs_available
 }
 
-fn startup_to_core_plan_config(topology: &config::TopologyCfg) -> CorePlanConfig {
+fn startup_to_core_plan_config(
+    topology: &config::TopologyCfg,
+    fabric: &config::FabricCfg,
+) -> CorePlanConfig {
     let defaults = CorePlanConfig::default();
     CorePlanConfig {
-        nic_workers: if topology.nic_workers == 0 {
-            defaults.nic_workers
-        } else {
-            topology.nic_workers as usize
-        },
-        serving_cores: match topology.serving_cores {
-            0 => None,
-            n => Some(n as usize),
-        },
-        hcas_per_numa: match topology.hcas_per_numa_node {
-            0 => defaults.hcas_per_numa,
-            n => n as usize,
-        },
+        nic_workers: topology
+            .nic_workers
+            .map(|n| n as usize)
+            .unwrap_or(defaults.nic_workers),
+        serving_cores: topology.serving_cores.map(|n| n as usize),
+        hcas_per_numa: fabric
+            .auto_hcas_per_numa_node()
+            .map(|n| n as usize)
+            .unwrap_or(defaults.hcas_per_numa),
         use_smt_siblings: topology.use_smt_siblings,
         respect_isolated: !topology.ignore_isolated,
         exclude_node_cpu0: !topology.include_node_cpu0,
@@ -227,16 +237,18 @@ fn main() -> ExitCode {
     let startup = config.startup();
     let memory = startup.memory();
     let fabric_cfg = startup.fabric();
-    // The metrics exporter bind address is a startup-fixed knob; capture
+    // The metrics exporter addr is a startup-fixed knob; capture
     // it now while `startup` borrows `config`, before `config` is moved
     // into the controller below. An empty string disables the exporter.
-    let metrics_bind = startup.metrics().bind.clone();
+    let metrics_bind = startup.metrics().addr.clone();
     let backing_kind = if memory.no_hugepages {
         BackingKind::Heap
     } else {
         BackingKind::Hugepage2Mb
     };
-    let memory_total_bytes = memory.memory_total_bytes as usize;
+    let memory_total_bytes = memory
+        .memory_total_bytes
+        .expect("memory_total_bytes defaulted") as usize;
 
     let host = Host::discover();
 
@@ -249,7 +261,7 @@ fn main() -> ExitCode {
     // detected, force the tcp fallback (the same path as the
     // `disable_rdma` escape hatch) so the daemon comes up over the tcp
     // provider instead of failing every shard at bring-up.
-    let mut core_plan_config = startup_to_core_plan_config(startup.topology());
+    let mut core_plan_config = startup_to_core_plan_config(startup.topology(), fabric_cfg);
     if should_force_tcp_fallback(
         core_plan_config.disable_rdma,
         host.hcas.len(),
@@ -265,11 +277,21 @@ fn main() -> ExitCode {
 
     let settings = Arc::new(StartupSettings {
         fabric: FabricStartup {
-            listen_addr: fabric_cfg.listen_addr.clone(),
-            progress_threads: fabric_cfg.progress_threads,
-            progress_poll_us: fabric_cfg.progress_poll_us,
-            rpc_worker_threads: fabric_cfg.rpc_worker_threads,
-            max_inflight: fabric_cfg.max_inflight,
+            listen_addr: fabric_cfg
+                .default_listen_addr()
+                .expect("fabric listen address defaulted")
+                .to_string(),
+            rdma_listen_addrs: fabric_cfg.rdma_listen_addrs().map(str::to_string).collect(),
+            progress_threads: fabric_cfg
+                .progress_threads
+                .expect("progress_threads defaulted"),
+            progress_poll_us: fabric_cfg
+                .progress_poll_us
+                .expect("progress_poll_us defaulted"),
+            rpc_worker_threads: fabric_cfg
+                .rpc_worker_threads
+                .expect("rpc_worker_threads defaulted"),
+            max_inflight: fabric_cfg.max_inflight.expect("max_inflight defaulted"),
         },
         memory_total_bytes,
         backing_kind,
@@ -324,13 +346,10 @@ fn main() -> ExitCode {
     let runtime = PinnedRuntime::new(worker_specs);
     install_signal_handler();
 
-    // Hot-swap publication surface for shards. The disk supervisor
-    // runs each disk on its own pinned storage core hosting the engine
-    // and ring, and hands a `PageChannel` to that core back here for
-    // publication. Shards observe the channel set through
-    // `LiveShardLocalStore` and ship page ops over it. Created before
-    // the shard loop so each shard receives a clone.
-    let disk_channels: Arc<DiskChannelDirectory> = DiskChannelDirectory::new();
+    // Hot-swap publication surface for cache disks. The disk supervisor
+    // publishes one channel directory per configured cache; shard stores
+    // select the directory from the request's cache id.
+    let cache_directories = CacheDirectorySet::new();
 
     // Precompute the per-shard worker list: each serving shard plus the
     // HCA device name it should bind, resolved here while `host` is in
@@ -363,11 +382,11 @@ fn main() -> ExitCode {
         runtime: runtime.clone(),
         workers,
         settings: settings.clone(),
-        disk_channels: disk_channels.clone(),
+        cache_directories: cache_directories.clone(),
         fabric_plan,
     };
 
-    // Disk supervisor: reconcile `[[disks]]` entries onto pinned
+    // Disk supervisor: reconcile projected cache disks onto pinned
     // storage cores. Each disk runs on its own storage core hosting the
     // engine and ring, and publishes a `PageChannel` that carries the
     // page data path cross-core from the shards. CPU pin hints come from
@@ -375,7 +394,7 @@ fn main() -> ExitCode {
     // inherits the drive's NUMA node and is disjoint from the serving
     // and NIC-worker cores by construction. If the host discovered no
     // NVMe devices the slot list is empty and disks run unpinned. The
-    // registry is owned by the apply target so live `[[disks]]` changes
+    // registry is owned by the apply target so live cache disk changes
     // reconcile through the same funnel as the rest of the config.
     let disk_slots: Vec<DiskCpuSlot> = core_plan
         .storage_cores
@@ -385,7 +404,7 @@ fn main() -> ExitCode {
             numa: core.numa,
         })
         .collect();
-    let mut disk_registry = DiskRegistry::new(UringDiskTarget::new(runtime.clone()), disk_slots);
+    let mut disk_registry = DiskRegistrySet::new(UringDiskTarget::new(runtime.clone()), disk_slots);
 
     // Bring up the initial shard layer. A bring-up failure is fatal:
     // there is no running process to reconcile into.
@@ -401,29 +420,15 @@ fn main() -> ExitCode {
 
     // Reconcile the startup disk set now that the shards are up, then
     // publish the channel set so shards can reach their disks.
-    let report = disk_registry.reconcile(&config.disks);
-    eprintln!(
-        "config: disks: added={} removed={} failures={}",
-        report.added,
-        report.removed,
-        report.failures.len(),
-    );
-    for (path, msg) in &report.failures {
-        eprintln!("disk {}: open failed: {msg}", path.display());
-    }
-    for (path, hint) in disk_registry.placement_snapshot() {
-        match hint {
-            Some(slot) => eprintln!("disk {}: pinned to cpu {}", path.display(), slot.cpu),
-            None => eprintln!("disk {}: unpinned (no plan slot available)", path.display()),
-        }
-    }
-    disk_channels.apply_channels(disk_registry.channels_snapshot());
+    let projection =
+        config::runtime_projection(&config).expect("loaded config projects to runtime");
+    reconcile_cache_disks(&mut disk_registry, &cache_directories, &projection);
 
     // The config controller is the single funnel for live changes. It
     // owns the running shard layer and disk supervisor (via the apply
     // target) and blocks each apply until the process has converged onto
     // the new config.
-    let target = shard_layer::ProcessApplyTarget::new(layer, disk_registry, disk_channels.clone());
+    let target = shard_layer::ProcessApplyTarget::new(layer, disk_registry, cache_directories);
     // Seeds the latest-known, latest-applied, and startup config
     // versions from the startup config's top-level `version`.
     // `controller.config_versions()` hands out a cloneable handle to all
@@ -503,7 +508,6 @@ fn main() -> ExitCode {
     if let Some(layer) = layer {
         shard_layer::teardown_shard_layer(layer);
     }
-    drop(disk_channels);
     disk_registry.drain();
 
     // The exporter polls `SHUTDOWN` on its accept loop; join it last so a
@@ -528,10 +532,10 @@ fn run_shard(
     tx: mpsc::Sender<ShardReady>,
     backing_kind: BackingKind,
     bytes_per_shard: usize,
-    disk_channels: Arc<DiskChannelDirectory>,
-    fingers: Arc<FingerTable>,
-    node_to_peer: Arc<HashMap<NodeId, PeerId>>,
+    cache_directories: Arc<CacheDirectorySet>,
+    routes: RouteTableHandle,
     frontend_specs: Arc<Vec<FrontendSpec>>,
+    frontend_bindings: Arc<HashMap<String, ResolvedFrontendBinding>>,
     backend_specs: Arc<Vec<BackendSpec>>,
     ctrl_rx: mpsc::Receiver<config::ShardCommand>,
     peer_rx: mpsc::Receiver<Arc<Vec<PeerPublish>>>,
@@ -620,21 +624,21 @@ fn run_shard(
     // joins anyone) would leave a peer ring pointing at unmapped memory.
     let backing_keepalive = backing.keepalive();
 
-    // Stripe geometry per backend id, shared (behind an `Rc`) with the
+    // Stripe geometry per backend name, shared (behind an `Rc`) with the
     // frontend registry and the control-drain hook so a live backend
     // add/replace keeps every frontend's stripe size in sync. A frontend
-    // references a backend by id; load-time validation guarantees the
+    // references a backend by name; load-time validation guarantees the
     // referent exists, but the registry falls back to the default stripe
     // size if a lookup races an as-yet-unapplied backend add.
     let geometry: Rc<RefCell<HashMap<String, u64>>> = Rc::new(RefCell::new(
         backend_specs
             .iter()
-            .map(|b| (b.id.clone(), b.stripe_size_bytes))
+            .map(|b| (b.name.clone(), b.stripe_size_bytes()))
             .collect(),
     ));
 
     // Build the shard's origin-backend registry: every configured
-    // backend, keyed by id, behind an `ArcSwap` so a live config apply
+    // backend, keyed by name, behind an `ArcSwap` so a live config apply
     // can add/remove/replace a tier without tearing down the shard.
     // Each request names its backend through the `OriginRef` the
     // frontend stamps, so the registry resolves the tier per fetch.
@@ -675,12 +679,11 @@ fn run_shard(
     // the control-drain tick hook below. A `ShardCommand::ApplyConfig`
     // republishes through this single handle so all consumers observe
     // the new finger table atomically without a restart.
-    let routing = unbounded_storage::p2p::RoutingHandle::new(fingers, node_to_peer);
-    let transport = match RoutedTransport::with_routing(
+    let transport = match RoutedTransport::with_routes(
         fabric.clone(),
         mr,
         page_size,
-        routing.clone(),
+        routes.clone(),
         transport_registry.clone(),
     ) {
         Ok(t) => t,
@@ -698,7 +701,7 @@ fn run_shard(
     // disks open")`. Once the disk supervisor publishes engines, the
     // view's `current_or_replay` catches the swap and replays buffer
     // registration before delegating.
-    let blockstore = Arc::new(LiveShardLocalStore::new(disk_channels.clone()));
+    let blockstore = ChainLocalStore::new(cache_directories.clone());
     let pool: ShardPool = match Pool::new(
         PoolConfig::default(),
         backing,
@@ -830,7 +833,7 @@ fn run_shard(
         own_shard_index,
         routed,
         numa_shards,
-        disk_channels.clone(),
+        cache_directories.clone(),
     ));
 
     // Owner-side fetch service: serves stripe requests this shard owns by
@@ -854,7 +857,9 @@ fn run_shard(
         handle: NetHandle::new(socket.clone()),
         fanout: fanout.clone(),
         geometry: geometry.clone(),
+        bindings: Rc::new(RefCell::new((*frontend_bindings).clone())),
         page_size,
+        worker_idx: widx.0,
     };
     let frontend_registry = match FrontendRegistry::new(&frontend_specs, frontend_ctx) {
         Ok(r) => r,
@@ -877,27 +882,44 @@ fn run_shard(
     // and the build-from-spec (DNS resolve, listener bind) stays off the
     // fast path.
     {
-        let routing = routing.clone();
+        let routes = routes.clone();
         let transport_registry = transport_registry.clone();
         let frontend_registry = frontend_registry.clone();
         let geometry = geometry.clone();
+        let bindings = frontend_registry.ctx.bindings.clone();
         let mut last_backends: HashMap<String, BackendSpec> = backend_specs
             .iter()
-            .map(|b| (b.id.clone(), b.clone()))
+            .map(|b| (b.name.clone(), b.clone()))
             .collect();
         let mut last_frontends: HashMap<String, FrontendSpec> = frontend_specs
             .iter()
-            .map(|f| (f.id.clone(), f.clone()))
+            .map(|f| (f.name.clone(), f.clone()))
             .collect();
+        let mut last_bindings: HashMap<String, ResolvedFrontendBinding> =
+            (*frontend_bindings).clone();
         shard_loop.add_tick_hook(move || {
             let mut did_work = false;
             while let Ok(cmd) = ctrl_rx.try_recv() {
                 match cmd {
                     config::ShardCommand::ApplyConfig(apply) => {
-                        routing.store(apply.routing.fingers, apply.routing.node_to_peer);
+                        routes.store_snapshot(apply.routes.clone());
+
+                        let projection = match config::runtime_projection(&apply.config) {
+                            Ok(projection) => projection,
+                            Err(e) => {
+                                let _ = apply.ack.send(config::ShardAck {
+                                    worker: widx,
+                                    result: Err(format!("config projection failed: {e}")),
+                                });
+                                did_work = true;
+                                continue;
+                            }
+                        };
 
                         let desired_backends = apply.config.backends.as_slice();
                         let desired_frontends = apply.config.frontends.as_slice();
+                        let desired_frontend_backends =
+                            config::frontend_backend_map(&projection.frontends);
 
                         // Refresh stripe geometry before building any
                         // frontend so a co-applied backend stripe change
@@ -906,9 +928,26 @@ fn run_shard(
                             let mut g = geometry.borrow_mut();
                             g.clear();
                             for b in desired_backends {
-                                g.insert(b.id.clone(), b.stripe_size_bytes);
+                                g.insert(b.name.clone(), b.stripe_size_bytes());
                             }
                         }
+
+                        let frontends_to_rebuild = frontend_rebuild_ids(
+                            &last_bindings,
+                            &projection.frontends,
+                            &last_backends,
+                            desired_backends,
+                        );
+                        if !frontends_to_rebuild.is_empty() {
+                            for id in frontends_to_rebuild {
+                                let _ = config::reconcile::FrontendReconcileTarget::remove(
+                                    &frontend_registry,
+                                    &id,
+                                );
+                                last_frontends.remove(&id);
+                            }
+                        }
+                        *bindings.borrow_mut() = projection.frontends.clone();
 
                         // Drive the transport backend registry and the
                         // frontend registry together so frontend adds are
@@ -918,11 +957,13 @@ fn run_shard(
                             &frontend_registry,
                             desired_backends,
                             desired_frontends,
+                            &desired_frontend_backends,
                             Some(&last_backends),
                             Some(&last_frontends),
                         );
                         last_backends = combined.backends.applied;
                         last_frontends = combined.frontends.applied;
+                        last_bindings = projection.frontends;
 
                         let mut failures = combined.backends.failures;
                         failures.extend(combined.frontends.failures);
@@ -1033,80 +1074,101 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> &str {
     }
 }
 
-/// Build the shared p2p routing surface from the loaded config: the
-/// local node's finger table over the configured peers, plus the
-/// `node -> peer` map the `FingerRouter` uses to resolve a finger's
-/// `NodeId` to the fabric `PeerId`.
-///
-/// When `[p2p.routing_plan]` is present the table is built from that
-/// precomputed neighbor set verbatim (disjoint discovery); otherwise
-/// it is derived from the full `peers` list via `FingerTable::build`.
-/// Either way `node_to_peer` is keyed off `peers`, which carry the
-/// fabric connection info, so a node only connects to the peers it is
-/// configured with.
-///
-/// `local_node_id` falls back to `0` when unset. Load-time
-/// validation rejects an unset id when peers are configured, so the
-/// fallback only fires for a single-node (no-peer) deployment, where
-/// the table routes every stripe to self/backend regardless of the
-/// id. `PeerSpec.id` doubles as both the `NodeId` and the `PeerId`,
-/// matching `config::reconcile_peers`, which adds connections keyed
-/// by `PeerId(spec.id)`.
-fn build_routing(config: &Config) -> (Arc<FingerTable>, Arc<HashMap<NodeId, PeerId>>) {
-    let local_id = config.p2p().local_node_id.unwrap_or(0);
-    let local = PeerEntry {
-        node: NodeId(local_id),
-        ring: node_to_ring(NodeId(local_id)),
-        labels: TopologyLabels(config.p2p().local_labels.clone()),
-    };
-
-    let node_to_peer: HashMap<NodeId, PeerId> = config
-        .peers
+fn build_routes(config: &Config) -> RouteTableSnapshot {
+    let projection = config::runtime_projection(config).expect("loaded config projects to runtime");
+    let routes = projection
+        .neighborhoods
         .iter()
-        .map(|spec| (NodeId(spec.id), PeerId(spec.id)))
-        .collect();
-
-    if let Some(plan) = &config.p2p().routing_plan {
-        // Disjoint discovery: a global-view planner already selected
-        // this node's neighbors, so build the table from them verbatim
-        // instead of deriving it from the full peer set. Ring positions
-        // are derived from ids; labels (which do not affect runtime
-        // routing) are carried over from the matching peer when present.
-        let labels_of = |id: u64| -> TopologyLabels {
-            config
+        .map(|(id, neighborhood)| {
+            let local_id = neighborhood.p2p.local_node_id.unwrap_or(0);
+            let local = PeerEntry {
+                node: NodeId(local_id),
+                ring: node_to_ring(NodeId(local_id)),
+                tags: TopologyTags(neighborhood.p2p.local_tags.clone()),
+            };
+            let node_to_peer: HashMap<NodeId, unbounded_storage::fabric::PeerId> = neighborhood
                 .peers
                 .iter()
-                .find(|p| p.id == id)
-                .map(|p| TopologyLabels(p.labels.clone()))
-                .unwrap_or_default()
-        };
-        let entry_of = |id: u64| PeerEntry {
-            node: NodeId(id),
-            ring: node_to_ring(NodeId(id)),
-            labels: labels_of(id),
-        };
-        let fingers = plan.fingers.iter().map(|id| entry_of(*id)).collect();
-        let successor = plan.successor.map(entry_of);
-        let predecessor = plan.predecessor.map(entry_of);
-        let table = FingerTable::from_explicit(local, fingers, successor, predecessor);
-        return (Arc::new(table), Arc::new(node_to_peer));
-    }
-
-    let peers: Vec<PeerEntry> = config
-        .peers
-        .iter()
-        .map(|spec| PeerEntry {
-            node: NodeId(spec.id),
-            ring: node_to_ring(NodeId(spec.id)),
-            labels: TopologyLabels(spec.labels.clone()),
+                .map(|peer| (peer.node_id, peer.fabric_peer_id))
+                .collect();
+            let fingers = if let Some(plan) = &neighborhood.p2p.routing_plan {
+                let tags_of = |node: NodeId| -> TopologyTags {
+                    neighborhood
+                        .peers
+                        .iter()
+                        .find(|peer| peer.node_id == node)
+                        .map(|peer| TopologyTags(peer.spec.tags.clone()))
+                        .unwrap_or_default()
+                };
+                let entry_of = |raw: u64| {
+                    let node = NodeId(raw);
+                    PeerEntry {
+                        node,
+                        ring: node_to_ring(node),
+                        tags: tags_of(node),
+                    }
+                };
+                Arc::new(FingerTable::from_explicit(
+                    local,
+                    plan.fingers.iter().map(|id| entry_of(*id)).collect(),
+                    plan.successor.map(entry_of),
+                    plan.predecessor.map(entry_of),
+                ))
+            } else {
+                let peers: Vec<PeerEntry> = neighborhood
+                    .peers
+                    .iter()
+                    .map(|peer| PeerEntry {
+                        node: peer.node_id,
+                        ring: node_to_ring(peer.node_id),
+                        tags: TopologyTags(peer.spec.tags.clone()),
+                    })
+                    .collect();
+                Arc::new(FingerTable::build(
+                    local,
+                    &peers,
+                    FingerTableConfig {
+                        k: neighborhood.p2p.fingers_per_node.max(1),
+                    },
+                ))
+            };
+            (
+                id.clone(),
+                RoutingSnapshot {
+                    fingers,
+                    node_to_peer: Arc::new(node_to_peer),
+                },
+            )
         })
         .collect();
+    RouteTableSnapshot { routes }
+}
 
-    let cfg = FingerTableConfig {
-        k: config.p2p().fingers_per_node.max(1),
-    };
-    let fingers = FingerTable::build(local, &peers, cfg);
-    (Arc::new(fingers), Arc::new(node_to_peer))
+fn reconcile_cache_disks(
+    disk_registry: &mut DiskRegistrySet<UringDiskTarget>,
+    cache_directories: &CacheDirectorySet,
+    projection: &config::RuntimeGraph,
+) {
+    let mut cache_ids: Vec<String> = projection.caches.keys().cloned().collect();
+    cache_ids.sort();
+    disk_registry.reconcile_ids(cache_ids.clone());
+    cache_directories.reconcile(cache_ids.iter().cloned());
+
+    for cache_id in cache_ids {
+        let cache = &projection.caches[&cache_id];
+        let report = disk_registry.reconcile_cache(&cache_id, &cache.disks);
+        eprintln!(
+            "config: cache={} disks: added={} removed={} failures={}",
+            cache_id,
+            report.added,
+            report.removed,
+            report.failures.len(),
+        );
+        for (path, msg) in &report.failures {
+            eprintln!("disk {}: open failed: {msg}", path.display());
+        }
+        cache_directories.apply_channels(&cache_id, disk_registry.channels_snapshot(&cache_id));
+    }
 }
 
 /// Hash a `StripeKey` into a shard index. Delegates to the library
@@ -1122,7 +1184,7 @@ fn stripe_key_to_shard(key: &StripeKey, shard_count: usize) -> usize {
 ///
 /// [`OriginBackend`] is now the active origin tier: it is built per
 /// shard from the matching [`BackendSpec`] (an [`HttpBackend`] or an
-/// [`S3Backend`], selected by `spec.kind`) and plugged into the
+/// [`S3Backend`], selected by `spec.config`) and plugged into the
 /// `RoutedTransport`'s backend slot (see `run_shard`). This function
 /// surfaces the configured backend set for observability and returns
 /// the number of backends seen so the caller (and tests) can assert the
@@ -1130,24 +1192,25 @@ fn stripe_key_to_shard(key: &StripeKey, shard_count: usize) -> usize {
 fn log_backend_registry(widx: WorkerIdx, specs: &[BackendSpec]) -> usize {
     for spec in specs {
         eprintln!(
-            "shard {}: backend {} kind={:?} endpoint={} stripe_size={} http_concurrency={} (OriginBackend active)",
+            "shard {}: backend {} kind={} url={} stripe_size={} http_concurrency={} (OriginBackend active)",
             widx.0,
-            spec.id,
-            spec.kind,
-            spec.endpoint,
-            spec.stripe_size_bytes,
-            spec.http_concurrency,
+            spec.name,
+            spec.kind_name(),
+            spec.url().unwrap_or(""),
+            spec.stripe_size_bytes(),
+            spec.http_concurrency().unwrap_or(0),
         );
     }
     specs.len()
 }
 
-/// Per-shard frontend driver, selected by [`FrontendKind`]. Both
+/// Per-shard frontend driver, selected by [`FrontendSpec::config`]. All
 /// variants are registered as a shard-loop tick hook through
 /// [`Self::progress`]; the enum lets a single boxed closure drive
 /// whichever concrete driver the frontend kind produced.
 enum ShardFrontendDriver {
     Http(HttpDriver<ShardPool>),
+    Loadgen(LoadgenDriver<ShardPool>),
     S3(S3Driver<ShardPool>),
 }
 
@@ -1155,6 +1218,7 @@ impl ShardFrontendDriver {
     fn progress(&mut self) -> bool {
         match self {
             ShardFrontendDriver::Http(d) => d.progress(),
+            ShardFrontendDriver::Loadgen(d) => d.progress(),
             ShardFrontendDriver::S3(d) => d.progress(),
         }
     }
@@ -1174,12 +1238,14 @@ struct FrontendBuildCtx {
     /// locally). Shared behind an `Rc` so cloning the context stays
     /// cheap.
     fanout: Rc<FanoutTable>,
-    /// Backend id -> stripe size, shared (and live-updated) with the
+    /// Backend name -> stripe size, shared (and live-updated) with the
     /// control-drain hook so a frontend brought up after a backend
     /// stripe change sees the new geometry. A frontend's stripe size is
     /// that of the backend it serves.
     geometry: Rc<RefCell<HashMap<String, u64>>>,
+    bindings: Rc<RefCell<HashMap<String, ResolvedFrontendBinding>>>,
     page_size: usize,
+    worker_idx: u16,
 }
 
 /// Resolve the stripe size a frontend should serve from the shard's
@@ -1196,6 +1262,32 @@ fn frontend_stripe_size(geometry: &HashMap<String, u64>, backend_id: &str) -> u6
         .unwrap_or(DEFAULT_STRIPE_SIZE_BYTES)
 }
 
+fn frontend_rebuild_ids(
+    last_bindings: &HashMap<String, ResolvedFrontendBinding>,
+    next_bindings: &HashMap<String, ResolvedFrontendBinding>,
+    last_backends: &HashMap<String, BackendSpec>,
+    desired_backends: &[BackendSpec],
+) -> Vec<String> {
+    let changed_backend_geometry: HashSet<String> = desired_backends
+        .iter()
+        .filter_map(|backend| {
+            let old = last_backends.get(&backend.name)?;
+            (old.stripe_size_bytes() != backend.stripe_size_bytes()).then(|| backend.name.clone())
+        })
+        .collect();
+
+    let mut rebuild: Vec<String> = next_bindings
+        .iter()
+        .filter_map(|(id, binding)| {
+            (last_bindings.get(id) != Some(binding)
+                || changed_backend_geometry.contains(&binding.backend_id))
+            .then(|| id.clone())
+        })
+        .collect();
+    rebuild.sort();
+    rebuild
+}
+
 impl FrontendBuildCtx {
     /// Turn one [`FrontendSpec`] into a bound, ready-to-drive
     /// [`ShardFrontendDriver`]. Validates the spec, binds the shard's
@@ -1204,52 +1296,80 @@ impl FrontendBuildCtx {
     /// backend is not yet known). Returns a human-readable error string
     /// so it slots into the reconcile traits' `Result<_, String>`.
     fn build(&self, spec: &FrontendSpec) -> Result<ShardFrontendDriver, String> {
-        let stripe_size = frontend_stripe_size(&self.geometry.borrow(), &spec.backend);
-        match spec.kind() {
-            FrontendKind::Http => {
+        let binding = self
+            .bindings
+            .borrow()
+            .get(&spec.name)
+            .cloned()
+            .ok_or_else(|| format!("frontend {} has no resolved binding", spec.name))?;
+        let stripe_size = frontend_stripe_size(&self.geometry.borrow(), &binding.backend_id);
+        match spec.config.as_ref() {
+            Some(frontend_spec::Config::Http(_)) => {
                 let frontend = HttpFrontend::from_spec(spec)
-                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.id))?;
+                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.name))?;
                 let listen_fd = frontend
                     .bind_listener()
-                    .map_err(|e| format!("frontend {} bind_listener: {e}", spec.id))?;
+                    .map_err(|e| format!("frontend {} bind_listener: {e}", spec.name))?;
                 Ok(ShardFrontendDriver::Http(HttpDriver::new(
                     self.pool.clone(),
                     self.handle.clone(),
                     listen_fd,
-                    Rc::from(spec.id.as_str()),
-                    spec.backend.clone(),
+                    Rc::from(spec.name.as_str()),
+                    binding.backend_id.clone(),
+                    binding.cache_id.clone(),
+                    binding.neighborhood_id.clone(),
                     stripe_size,
                     self.page_size,
                     self.fanout.clone(),
+                    binding.bypass_cache,
                 )))
             }
-            FrontendKind::S3 => {
+            Some(frontend_spec::Config::S3(_)) => {
                 let frontend = S3Frontend::from_spec(spec)
-                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.id))?;
+                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.name))?;
                 let listen_fd = frontend
                     .bind_listener()
-                    .map_err(|e| format!("frontend {} bind_listener: {e}", spec.id))?;
+                    .map_err(|e| format!("frontend {} bind_listener: {e}", spec.name))?;
                 Ok(ShardFrontendDriver::S3(S3Driver::new(
                     self.pool.clone(),
                     self.handle.clone(),
                     listen_fd,
-                    Rc::from(spec.id.as_str()),
-                    spec.backend.clone(),
+                    Rc::from(spec.name.as_str()),
+                    binding.backend_id.clone(),
+                    binding.cache_id.clone(),
+                    binding.neighborhood_id.clone(),
                     stripe_size,
                     self.page_size,
+                    binding.bypass_cache,
                 )))
             }
+            Some(frontend_spec::Config::Loadgen(_)) => {
+                let frontend = LoadgenFrontend::from_spec(spec)
+                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.name))?;
+                Ok(ShardFrontendDriver::Loadgen(LoadgenDriver::new(
+                    frontend,
+                    self.pool.clone(),
+                    binding.backend_id.clone(),
+                    binding.cache_id.clone(),
+                    binding.neighborhood_id.clone(),
+                    stripe_size,
+                    self.page_size,
+                    binding.bypass_cache,
+                    self.worker_idx,
+                )))
+            }
+            None => Err(format!("frontend {} missing config", spec.name)),
         }
     }
 }
 
 /// Shard-local registry of running frontend drivers, keyed by frontend
-/// id. A single permanent tick hook drives whichever drivers are live,
+/// name. A single permanent tick hook drives whichever drivers are live,
 /// and the control-drain hook adds/removes drivers on a config apply;
 /// the [`ShardLoop`] has no hook-removal API, so the registry (not the
 /// hook set) is the unit of liveness. Each frontend stamps its backend
-/// id into every request, so per-frontend origin routing falls out of
-/// the backend registry resolving that id.
+/// backend name into every request, so per-frontend origin routing falls
+/// out of the backend registry resolving that name.
 #[derive(Clone)]
 struct FrontendRegistry {
     drivers: Rc<RefCell<HashMap<String, ShardFrontendDriver>>>,
@@ -1271,7 +1391,7 @@ impl FrontendRegistry {
             registry
                 .drivers
                 .borrow_mut()
-                .insert(spec.id.clone(), driver);
+                .insert(spec.name.clone(), driver);
         }
         Ok(registry)
     }
@@ -1296,7 +1416,7 @@ impl config::reconcile::FrontendReconcileTarget for FrontendRegistry {
 
     fn add(&self, spec: &FrontendSpec) -> Result<(), String> {
         let driver = self.ctx.build(spec)?;
-        self.drivers.borrow_mut().insert(spec.id.clone(), driver);
+        self.drivers.borrow_mut().insert(spec.name.clone(), driver);
         Ok(())
     }
 
@@ -1415,7 +1535,7 @@ impl Drop for PhaseBGuard {
 /// Parsed command-line options for one run of the daemon.
 ///
 /// The daemon takes all of its configuration - both the dynamically
-/// reloadable cluster state (`[p2p]`, peers, disks, backends, frontends)
+/// reloadable cluster state (neighborhoods, caches, backends, frontends)
 /// and the startup-fixed knobs (`[startup]`: memory sizing, fabric
 /// endpoint/thread pools, CPU-topology selection) - from the config
 /// file. The only command-line option is the path to that file, since
@@ -1541,12 +1661,27 @@ mod tests {
         cfg.startup().topology().clone()
     }
 
+    fn default_fabric() -> config::FabricCfg {
+        let mut cfg = Config::default();
+        cfg.apply_defaults();
+        cfg.startup().fabric().clone()
+    }
+
+    fn auto_rdma_fabric(hcas_per_numa_node: Option<u64>) -> config::FabricCfg {
+        config::FabricCfg {
+            binds: Some(config::fabric_cfg::Binds::AutoRdma(
+                config::AutoRdmaFabricBinds { hcas_per_numa_node },
+            )),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn startup_to_core_plan_config_default_mapping() {
         // The defaults-populated `[startup.topology]` must map to the
         // `CorePlanConfig` defaults: nic_workers=4, serving_cores=auto,
         // and the historical safe placement flags.
-        let cc = startup_to_core_plan_config(&default_topology());
+        let cc = startup_to_core_plan_config(&default_topology(), &default_fabric());
         let d = CorePlanConfig::default();
         assert_eq!(cc.nic_workers, 4);
         assert_eq!(cc.serving_cores, None);
@@ -1573,11 +1708,10 @@ mod tests {
             include_node_cpu0: true,
             allow_inactive_port: true,
             disable_rdma: true,
-            serving_cores: 12,
-            nic_workers: 6,
-            hcas_per_numa_node: 2,
+            serving_cores: Some(12),
+            nic_workers: Some(6),
         };
-        let cc = startup_to_core_plan_config(&topology);
+        let cc = startup_to_core_plan_config(&topology, &auto_rdma_fabric(Some(2)));
         assert_eq!(cc.nic_workers, 6);
         assert_eq!(cc.serving_cores, Some(12));
         assert_eq!(cc.hcas_per_numa, 2);
@@ -1589,16 +1723,15 @@ mod tests {
     }
 
     #[test]
-    fn startup_to_core_plan_config_zero_nic_workers_defaults() {
-        // A zero `nic_workers` (unset before defaulting) maps to the
-        // CorePlanConfig default of 4, and serving_cores=0 means auto.
+    fn startup_to_core_plan_config_absent_fields_default() {
+        // Absent optional topology knobs map to CorePlanConfig defaults,
+        // and absent serving_cores means auto.
         let topology = config::TopologyCfg {
-            nic_workers: 0,
-            serving_cores: 0,
-            hcas_per_numa_node: 0,
+            nic_workers: None,
+            serving_cores: None,
             ..default_topology()
         };
-        let cc = startup_to_core_plan_config(&topology);
+        let cc = startup_to_core_plan_config(&topology, &auto_rdma_fabric(None));
         assert_eq!(cc.nic_workers, 4);
         assert_eq!(cc.serving_cores, None);
         assert_eq!(cc.hcas_per_numa, 1);
@@ -1795,14 +1928,19 @@ mod tests {
         // A missing default (non-explicit) config path falls back to the
         // built-in defaults. That fallback must run `apply_defaults` so
         // the section accessors are populated; a raw `Config::default()`
-        // leaves `startup`/`p2p` as `None` and panics the daemon at
+        // leaves `startup` unset and panics the daemon at
         // startup when it reads `cfg.startup()`.
         let path = Path::new("/definitely/not/a/real/path/unbounded-storage.toml");
         let cfg = load_config(path, false).expect("missing default path falls back to defaults");
         // These accessors panic if defaults were not applied.
-        assert_eq!(cfg.p2p().fingers_per_node, 100);
-        assert_eq!(cfg.startup().fabric().listen_addr, "0.0.0.0:0");
-        assert_eq!(cfg.startup().memory().memory_total_bytes, 128 * 1024 * 1024);
+        assert_eq!(
+            cfg.startup().fabric().default_listen_addr(),
+            Some("0.0.0.0:0")
+        );
+        assert_eq!(
+            cfg.startup().memory().memory_total_bytes,
+            Some(128 * 1024 * 1024)
+        );
     }
 
     #[test]
@@ -1815,12 +1953,24 @@ mod tests {
 
     fn backend_spec(id: &str) -> BackendSpec {
         BackendSpec {
-            id: id.to_string(),
-            kind: config::BackendKind::Http as i32,
-            endpoint: "https://example.com".to_string(),
-            stripe_size_bytes: 4 * 1024 * 1024,
-            http_concurrency: 64,
-            bucket: None,
+            name: id.to_string(),
+            config: Some(config::backend_spec::Config::Http(
+                config::HttpBackendConfig {
+                    url: "https://example.com".to_string(),
+                    stripe_size_bytes: Some(4 * 1024 * 1024),
+                    http_concurrency: Some(64),
+                },
+            )),
+        }
+    }
+
+    fn binding(frontend_id: &str, backend_id: &str) -> ResolvedFrontendBinding {
+        ResolvedFrontendBinding {
+            frontend_id: frontend_id.to_string(),
+            backend_id: backend_id.to_string(),
+            cache_id: None,
+            neighborhood_id: None,
+            bypass_cache: true,
         }
     }
 
@@ -1842,6 +1992,35 @@ mod tests {
         assert_eq!(
             frontend_stripe_size(&geometry, "missing"),
             DEFAULT_STRIPE_SIZE_BYTES,
+        );
+    }
+
+    #[test]
+    fn backend_stripe_size_change_rebuilds_frontend() {
+        let mut last_bindings = HashMap::new();
+        last_bindings.insert("f".to_string(), binding("f", "b"));
+
+        let mut next_bindings = HashMap::new();
+        next_bindings.insert("f".to_string(), binding("f", "b"));
+
+        let old_backend = backend_spec("b");
+        let mut new_backend = old_backend.clone();
+        let Some(config::backend_spec::Config::Http(cfg)) = new_backend.config.as_mut() else {
+            panic!("expected http backend config");
+        };
+        *cfg.stripe_size_bytes.as_mut().expect("stripe size set") *= 2;
+
+        let mut last_backends = HashMap::new();
+        last_backends.insert(old_backend.name.clone(), old_backend);
+
+        assert_eq!(
+            frontend_rebuild_ids(
+                &last_bindings,
+                &next_bindings,
+                &last_backends,
+                &[new_backend]
+            ),
+            vec!["f".to_string()],
         );
     }
 

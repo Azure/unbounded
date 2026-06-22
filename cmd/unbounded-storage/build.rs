@@ -58,8 +58,9 @@ fn main() {
 /// partial TOML file: any omitted key falls back to the proto3 zero value,
 /// which `Config::apply_defaults` then promotes to the documented default.
 /// `deny_unknown_fields` makes the TOML loader reject typo'd keys loudly at
-/// parse time. Enums deserialize as their integer discriminant (range-checked
-/// later by `config::load::validate`) and byte sizes as plain integers.
+/// parse time; this is the serde/TOML path only - decoding a protobuf wire
+/// message keeps protobuf's forward-compatible unknown-field semantics.
+/// Oneofs deserialize as tagged TOML tables, and byte sizes as plain integers.
 fn generate_config_schema() {
     // Use the vendored protoc so no system protoc install is required.
     let protoc =
@@ -74,21 +75,47 @@ fn generate_config_schema() {
 
     for msg in [
         "Config",
-        "P2pCfg",
         "RoutingPlan",
-        "FabricAddress",
         "PeerSpec",
+        "TcpPeerConfig",
+        "RdmaPeerConfig",
         "DiskSpec",
+        "BlockDiskConfig",
+        "FileDiskConfig",
+        "CacheSpec",
+        "NeighborhoodSpec",
         "BackendSpec",
+        "HttpBackendConfig",
+        "S3BackendConfig",
+        "AzureBackendConfig",
+        "FakeBackendConfig",
         "FrontendSpec",
+        "HttpFrontendConfig",
+        "S3FrontendConfig",
+        "LoadgenFrontendConfig",
         "StartupCfg",
         "MemoryCfg",
         "FabricCfg",
+        "TcpFabricBinds",
+        "RdmaFabricBinds",
+        "AutoRdmaFabricBinds",
+        "RdmaFabricBind",
         "TopologyCfg",
         "MetricsCfg",
     ] {
         prost.type_attribute(msg, "#[derive(::serde::Deserialize)]");
         prost.type_attribute(msg, "#[serde(default, deny_unknown_fields)]");
+    }
+
+    for oneof in [
+        "PeerSpec.config",
+        "FabricCfg.binds",
+        "DiskSpec.config",
+        "BackendSpec.config",
+        "FrontendSpec.config",
+    ] {
+        prost.type_attribute(oneof, "#[derive(::serde::Deserialize)]");
+        prost.type_attribute(oneof, "#[serde(rename_all = \"snake_case\")]");
     }
 
     prost

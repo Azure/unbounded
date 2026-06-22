@@ -235,7 +235,6 @@ pub enum FetchOutcome {
 pub struct RunReport {
     pub outcomes: Vec<FetchOutcome>,
     pub free_pages_at_end: usize,
-    pub inflight_entries_at_end: usize,
     pub total_pool_pages: usize,
     pub page_size: usize,
     pub io_fault_rate: u32,
@@ -500,7 +499,6 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     exec.run(step_budget)?;
 
     let free_pages_at_end = pool.free_pages();
-    let inflight_entries_at_end = pool.inflight_entries();
 
     // Service-shutdown probe: the service task has returned and dropped
     // the receiver, so a fetch on a surviving channel clone must error
@@ -523,7 +521,6 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     Ok(RunReport {
         outcomes,
         free_pages_at_end,
-        inflight_entries_at_end,
         total_pool_pages,
         page_size: w.page_size,
         io_fault_rate: w.io_fault_rate,

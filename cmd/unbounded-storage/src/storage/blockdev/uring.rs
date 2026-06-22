@@ -14,8 +14,8 @@
 //! installation into the registry and teardown order.
 //!
 //! [`provision_file`] and the private capacity helpers round out the
-//! `kind = "file"` disk lifecycle: create-and-size a backing file on
-//! startup and derive its page capacity.
+//! file disk lifecycle: create-and-size a backing file on startup and
+//! derive its page capacity.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -142,8 +142,7 @@ fn open_file(path: &Path, o_direct: bool) -> Result<File, Error> {
 /// support fallocate (for example tmpfs) the allocation step is
 /// skipped and the file is left sparse at the requested length.
 ///
-/// Intended for `kind = "file"` disks; production block devices never
-/// go through here.
+/// Intended for file disks; production block devices never go through here.
 pub fn provision_file(path: &Path, size_bytes: u64) -> Result<(), Error> {
     let cpath =
         CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error::Io(libc::EINVAL))?;

@@ -25,6 +25,7 @@ mod progress;
 mod recvpool;
 mod rpc;
 mod rpc_queue;
+pub(crate) mod scratch;
 mod sendpool;
 mod transport;
 mod types;
