@@ -24,170 +24,16 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-type DiskKind int32
-
-const (
-	DiskKind_DISK_KIND_NVME  DiskKind = 0
-	DiskKind_DISK_KIND_BLOCK DiskKind = 1
-	DiskKind_DISK_KIND_FILE  DiskKind = 2
-)
-
-// Enum value maps for DiskKind.
-var (
-	DiskKind_name = map[int32]string{
-		0: "DISK_KIND_NVME",
-		1: "DISK_KIND_BLOCK",
-		2: "DISK_KIND_FILE",
-	}
-	DiskKind_value = map[string]int32{
-		"DISK_KIND_NVME":  0,
-		"DISK_KIND_BLOCK": 1,
-		"DISK_KIND_FILE":  2,
-	}
-)
-
-func (x DiskKind) Enum() *DiskKind {
-	p := new(DiskKind)
-	*p = x
-	return p
-}
-
-func (x DiskKind) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (DiskKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_config_proto_enumTypes[0].Descriptor()
-}
-
-func (DiskKind) Type() protoreflect.EnumType {
-	return &file_config_proto_enumTypes[0]
-}
-
-func (x DiskKind) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use DiskKind.Descriptor instead.
-func (DiskKind) EnumDescriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{0}
-}
-
-type BackendKind int32
-
-const (
-	BackendKind_BACKEND_KIND_HTTP  BackendKind = 0
-	BackendKind_BACKEND_KIND_S3    BackendKind = 1
-	BackendKind_BACKEND_KIND_AZURE BackendKind = 2
-)
-
-// Enum value maps for BackendKind.
-var (
-	BackendKind_name = map[int32]string{
-		0: "BACKEND_KIND_HTTP",
-		1: "BACKEND_KIND_S3",
-		2: "BACKEND_KIND_AZURE",
-	}
-	BackendKind_value = map[string]int32{
-		"BACKEND_KIND_HTTP":  0,
-		"BACKEND_KIND_S3":    1,
-		"BACKEND_KIND_AZURE": 2,
-	}
-)
-
-func (x BackendKind) Enum() *BackendKind {
-	p := new(BackendKind)
-	*p = x
-	return p
-}
-
-func (x BackendKind) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (BackendKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_config_proto_enumTypes[1].Descriptor()
-}
-
-func (BackendKind) Type() protoreflect.EnumType {
-	return &file_config_proto_enumTypes[1]
-}
-
-func (x BackendKind) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use BackendKind.Descriptor instead.
-func (BackendKind) EnumDescriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{1}
-}
-
-type FrontendKind int32
-
-const (
-	FrontendKind_FRONTEND_KIND_HTTP FrontendKind = 0
-	FrontendKind_FRONTEND_KIND_S3   FrontendKind = 1
-)
-
-// Enum value maps for FrontendKind.
-var (
-	FrontendKind_name = map[int32]string{
-		0: "FRONTEND_KIND_HTTP",
-		1: "FRONTEND_KIND_S3",
-	}
-	FrontendKind_value = map[string]int32{
-		"FRONTEND_KIND_HTTP": 0,
-		"FRONTEND_KIND_S3":   1,
-	}
-)
-
-func (x FrontendKind) Enum() *FrontendKind {
-	p := new(FrontendKind)
-	*p = x
-	return p
-}
-
-func (x FrontendKind) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (FrontendKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_config_proto_enumTypes[2].Descriptor()
-}
-
-func (FrontendKind) Type() protoreflect.EnumType {
-	return &file_config_proto_enumTypes[2]
-}
-
-func (x FrontendKind) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use FrontendKind.Descriptor instead.
-func (FrontendKind) EnumDescriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{2}
-}
-
 type Config struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Operator-assigned configuration version. The daemon treats it as an
-	// opaque counter: it never drives behavior, but it is tracked as the
-	// latest-known and latest-applied config versions so operators can
-	// confirm a pushed config has been realized across the process. The
-	// proto3 zero value (0) means "unversioned".
-	Version   uint64          `protobuf:"varint,6,opt,name=version,proto3" json:"version,omitempty"`
-	P2P       *P2PCfg         `protobuf:"bytes,1,opt,name=p2p,proto3" json:"p2p,omitempty"`
-	Peers     []*PeerSpec     `protobuf:"bytes,2,rep,name=peers,proto3" json:"peers,omitempty"`
-	Disks     []*DiskSpec     `protobuf:"bytes,3,rep,name=disks,proto3" json:"disks,omitempty"`
-	Backends  []*BackendSpec  `protobuf:"bytes,4,rep,name=backends,proto3" json:"backends,omitempty"`
-	Frontends []*FrontendSpec `protobuf:"bytes,5,rep,name=frontends,proto3" json:"frontends,omitempty"`
-	// Startup-fixed settings (memory backing, fabric endpoint/threads, CPU
-	// topology placement). Unlike the rest of the config these cannot be
-	// hot-reloaded: they are read exactly once when the process starts and
-	// changing them requires a restart. They are deliberately excluded from
-	// ConfigDiff; operators observe which config version's startup settings
-	// are realized via the separately tracked "startup" config version.
-	Startup       *StartupCfg `protobuf:"bytes,7,opt,name=startup,proto3" json:"startup,omitempty"`
+	// Operator-assigned opaque version tracked so operators can confirm which config has been applied. 0 means unversioned.
+	Version uint64 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	// Startup options are only read once during initialization.
+	Startup       *StartupCfg         `protobuf:"bytes,2,opt,name=startup,proto3" json:"startup,omitempty"`
+	Frontends     []*FrontendSpec     `protobuf:"bytes,3,rep,name=frontends,proto3" json:"frontends,omitempty"`
+	Backends      []*BackendSpec      `protobuf:"bytes,4,rep,name=backends,proto3" json:"backends,omitempty"`
+	Caches        []*CacheSpec        `protobuf:"bytes,5,rep,name=caches,proto3" json:"caches,omitempty"`
+	Neighborhoods []*NeighborhoodSpec `protobuf:"bytes,6,rep,name=neighborhoods,proto3" json:"neighborhoods,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -229,30 +75,9 @@ func (x *Config) GetVersion() uint64 {
 	return 0
 }
 
-func (x *Config) GetP2P() *P2PCfg {
+func (x *Config) GetStartup() *StartupCfg {
 	if x != nil {
-		return x.P2P
-	}
-	return nil
-}
-
-func (x *Config) GetPeers() []*PeerSpec {
-	if x != nil {
-		return x.Peers
-	}
-	return nil
-}
-
-func (x *Config) GetDisks() []*DiskSpec {
-	if x != nil {
-		return x.Disks
-	}
-	return nil
-}
-
-func (x *Config) GetBackends() []*BackendSpec {
-	if x != nil {
-		return x.Backends
+		return x.Startup
 	}
 	return nil
 }
@@ -264,16 +89,27 @@ func (x *Config) GetFrontends() []*FrontendSpec {
 	return nil
 }
 
-func (x *Config) GetStartup() *StartupCfg {
+func (x *Config) GetBackends() []*BackendSpec {
 	if x != nil {
-		return x.Startup
+		return x.Backends
 	}
 	return nil
 }
 
-// Startup-fixed settings, grouped by the subsystem that consumes them.
-// Every field's proto3 zero value means "unset" and is promoted to the
-// documented default by Config::apply_defaults.
+func (x *Config) GetCaches() []*CacheSpec {
+	if x != nil {
+		return x.Caches
+	}
+	return nil
+}
+
+func (x *Config) GetNeighborhoods() []*NeighborhoodSpec {
+	if x != nil {
+		return x.Neighborhoods
+	}
+	return nil
+}
+
 type StartupCfg struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Memory        *MemoryCfg             `protobuf:"bytes,1,opt,name=memory,proto3" json:"memory,omitempty"`
@@ -344,9 +180,8 @@ func (x *StartupCfg) GetMetrics() *MetricsCfg {
 
 type MetricsCfg struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Listen address for the Prometheus metrics exporter (e.g.
-	// "0.0.0.0:9100"). "" -> exporter disabled.
-	Bind          string `protobuf:"bytes,1,opt,name=bind,proto3" json:"bind,omitempty"`
+	// Prometheus metrics listen address, such as "0.0.0.0:9100". Empty disables the exporter.
+	Addr          string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -381,22 +216,19 @@ func (*MetricsCfg) Descriptor() ([]byte, []int) {
 	return file_config_proto_rawDescGZIP(), []int{2}
 }
 
-func (x *MetricsCfg) GetBind() string {
+func (x *MetricsCfg) GetAddr() string {
 	if x != nil {
-		return x.Bind
+		return x.Addr
 	}
 	return ""
 }
 
 type MemoryCfg struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Allocate per-shard backing from the heap instead of 2 MiB hugepages.
+	// Allocates per-shard backing from the heap instead of 2 MiB hugepages.
 	NoHugepages bool `protobuf:"varint,1,opt,name=no_hugepages,json=noHugepages,proto3" json:"no_hugepages,omitempty"`
-	// Total backing pool across all serving shards, in bytes. Each serving
-	// shard is allocated `memory_total_bytes / serving_shard_count`,
-	// NUMA-local, so the host footprint stays fixed regardless of the
-	// auto-scaled serving-core count. 0 -> 128 MiB.
-	MemoryTotalBytes uint64 `protobuf:"varint,2,opt,name=memory_total_bytes,json=memoryTotalBytes,proto3" json:"memory_total_bytes,omitempty"`
+	// Total backing pool across serving shards, in bytes. Defaults to 128 MiB when unset.
+	MemoryTotalBytes *uint64 `protobuf:"varint,2,opt,name=memory_total_bytes,json=memoryTotalBytes,proto3,oneof" json:"memory_total_bytes,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -439,28 +271,30 @@ func (x *MemoryCfg) GetNoHugepages() bool {
 }
 
 func (x *MemoryCfg) GetMemoryTotalBytes() uint64 {
-	if x != nil {
-		return x.MemoryTotalBytes
+	if x != nil && x.MemoryTotalBytes != nil {
+		return *x.MemoryTotalBytes
 	}
 	return 0
 }
 
 type FabricCfg struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Per-shard fabric listen address. "" -> "0.0.0.0:0" (":0" picks a free
-	// port).
-	ListenAddr string `protobuf:"bytes,1,opt,name=listen_addr,json=listenAddr,proto3" json:"listen_addr,omitempty"`
-	// libfabric progress threads per shard. 0 -> 2.
-	ProgressThreads uint32 `protobuf:"varint,2,opt,name=progress_threads,json=progressThreads,proto3" json:"progress_threads,omitempty"`
-	// Progress-thread busy-poll budget in microseconds. 0 -> 10.
-	ProgressPollUs uint32 `protobuf:"varint,3,opt,name=progress_poll_us,json=progressPollUs,proto3" json:"progress_poll_us,omitempty"`
-	// Fabric RPC worker threads per shard. 0 -> 4.
-	RpcWorkerThreads uint32 `protobuf:"varint,4,opt,name=rpc_worker_threads,json=rpcWorkerThreads,proto3" json:"rpc_worker_threads,omitempty"`
-	// Max in-flight fabric operations per shard (back-pressure limit that
-	// sizes the completion registry and server-side request cap). 0 -> 1024.
-	MaxInflight   uint32 `protobuf:"varint,5,opt,name=max_inflight,json=maxInflight,proto3" json:"max_inflight,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Types that are valid to be assigned to Binds:
+	//
+	//	*FabricCfg_Tcp
+	//	*FabricCfg_Rdma
+	//	*FabricCfg_AutoRdma
+	Binds isFabricCfg_Binds `protobuf_oneof:"binds"`
+	// Maximum in-flight fabric operations per shard. Defaults to 1024 when unset.
+	MaxInflight *uint32 `protobuf:"varint,4,opt,name=max_inflight,json=maxInflight,proto3,oneof" json:"max_inflight,omitempty"`
+	// libfabric progress threads per shard. Defaults to 2 when unset.
+	ProgressThreads *uint32 `protobuf:"varint,5,opt,name=progress_threads,json=progressThreads,proto3,oneof" json:"progress_threads,omitempty"`
+	// Fabric RPC worker threads per shard. Defaults to 4 when unset.
+	RpcWorkerThreads *uint32 `protobuf:"varint,6,opt,name=rpc_worker_threads,json=rpcWorkerThreads,proto3,oneof" json:"rpc_worker_threads,omitempty"`
+	// Progress-thread busy-poll budget in microseconds. Defaults to 10 when unset.
+	ProgressPollUs *uint32 `protobuf:"varint,7,opt,name=progress_poll_us,json=progressPollUs,proto3,oneof" json:"progress_poll_us,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *FabricCfg) Reset() {
@@ -493,72 +327,299 @@ func (*FabricCfg) Descriptor() ([]byte, []int) {
 	return file_config_proto_rawDescGZIP(), []int{4}
 }
 
-func (x *FabricCfg) GetListenAddr() string {
+func (x *FabricCfg) GetBinds() isFabricCfg_Binds {
 	if x != nil {
-		return x.ListenAddr
+		return x.Binds
 	}
-	return ""
+	return nil
 }
 
-func (x *FabricCfg) GetProgressThreads() uint32 {
+func (x *FabricCfg) GetTcp() *TcpFabricBinds {
 	if x != nil {
-		return x.ProgressThreads
+		if x, ok := x.Binds.(*FabricCfg_Tcp); ok {
+			return x.Tcp
+		}
+	}
+	return nil
+}
+
+func (x *FabricCfg) GetRdma() *RdmaFabricBinds {
+	if x != nil {
+		if x, ok := x.Binds.(*FabricCfg_Rdma); ok {
+			return x.Rdma
+		}
+	}
+	return nil
+}
+
+func (x *FabricCfg) GetAutoRdma() *AutoRdmaFabricBinds {
+	if x != nil {
+		if x, ok := x.Binds.(*FabricCfg_AutoRdma); ok {
+			return x.AutoRdma
+		}
+	}
+	return nil
+}
+
+func (x *FabricCfg) GetMaxInflight() uint32 {
+	if x != nil && x.MaxInflight != nil {
+		return *x.MaxInflight
 	}
 	return 0
 }
 
-func (x *FabricCfg) GetProgressPollUs() uint32 {
-	if x != nil {
-		return x.ProgressPollUs
+func (x *FabricCfg) GetProgressThreads() uint32 {
+	if x != nil && x.ProgressThreads != nil {
+		return *x.ProgressThreads
 	}
 	return 0
 }
 
 func (x *FabricCfg) GetRpcWorkerThreads() uint32 {
-	if x != nil {
-		return x.RpcWorkerThreads
+	if x != nil && x.RpcWorkerThreads != nil {
+		return *x.RpcWorkerThreads
 	}
 	return 0
 }
 
-func (x *FabricCfg) GetMaxInflight() uint32 {
-	if x != nil {
-		return x.MaxInflight
+func (x *FabricCfg) GetProgressPollUs() uint32 {
+	if x != nil && x.ProgressPollUs != nil {
+		return *x.ProgressPollUs
 	}
 	return 0
 }
 
-type TopologyCfg struct {
+type isFabricCfg_Binds interface {
+	isFabricCfg_Binds()
+}
+
+type FabricCfg_Tcp struct {
+	Tcp *TcpFabricBinds `protobuf:"bytes,1,opt,name=tcp,proto3,oneof"`
+}
+
+type FabricCfg_Rdma struct {
+	Rdma *RdmaFabricBinds `protobuf:"bytes,2,opt,name=rdma,proto3,oneof"`
+}
+
+type FabricCfg_AutoRdma struct {
+	AutoRdma *AutoRdmaFabricBinds `protobuf:"bytes,3,opt,name=auto_rdma,json=autoRdma,proto3,oneof"`
+}
+
+func (*FabricCfg_Tcp) isFabricCfg_Binds() {}
+
+func (*FabricCfg_Rdma) isFabricCfg_Binds() {}
+
+func (*FabricCfg_AutoRdma) isFabricCfg_Binds() {}
+
+type TcpFabricBinds struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Addr          string                 `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TcpFabricBinds) Reset() {
+	*x = TcpFabricBinds{}
+	mi := &file_config_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TcpFabricBinds) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TcpFabricBinds) ProtoMessage() {}
+
+func (x *TcpFabricBinds) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TcpFabricBinds.ProtoReflect.Descriptor instead.
+func (*TcpFabricBinds) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *TcpFabricBinds) GetAddr() string {
+	if x != nil {
+		return x.Addr
+	}
+	return ""
+}
+
+type RdmaFabricBinds struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Binds         []*RdmaFabricBind      `protobuf:"bytes,1,rep,name=binds,proto3" json:"binds,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RdmaFabricBinds) Reset() {
+	*x = RdmaFabricBinds{}
+	mi := &file_config_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RdmaFabricBinds) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RdmaFabricBinds) ProtoMessage() {}
+
+func (x *RdmaFabricBinds) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RdmaFabricBinds.ProtoReflect.Descriptor instead.
+func (*RdmaFabricBinds) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *RdmaFabricBinds) GetBinds() []*RdmaFabricBind {
+	if x != nil {
+		return x.Binds
+	}
+	return nil
+}
+
+type AutoRdmaFabricBinds struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Place shards on SMT sibling CPUs as well as physical cores.
-	UseSmtSiblings bool `protobuf:"varint,4,opt,name=use_smt_siblings,json=useSmtSiblings,proto3" json:"use_smt_siblings,omitempty"`
-	// Schedule shards onto isolcpus-isolated CPUs too. The proto3 false
-	// default preserves the historical "respect isolated CPUs" behavior.
-	IgnoreIsolated bool `protobuf:"varint,5,opt,name=ignore_isolated,json=ignoreIsolated,proto3" json:"ignore_isolated,omitempty"`
-	// Allow placing a shard on each NUMA node's CPU 0. The proto3 false
-	// default preserves the historical "exclude node CPU 0" behavior.
-	IncludeNodeCpu0 bool `protobuf:"varint,6,opt,name=include_node_cpu0,json=includeNodeCpu0,proto3" json:"include_node_cpu0,omitempty"`
-	// Use HCA ports that are not in the active state. The proto3 false
-	// default preserves the historical "require active port" behavior.
-	AllowInactivePort bool `protobuf:"varint,7,opt,name=allow_inactive_port,json=allowInactivePort,proto3" json:"allow_inactive_port,omitempty"`
-	// Disable RDMA and force the libfabric tcp provider.
-	DisableRdma bool `protobuf:"varint,8,opt,name=disable_rdma,json=disableRdma,proto3" json:"disable_rdma,omitempty"`
-	// Cap on the number of serving-shard CPUs to pin. 0 -> auto (claim
-	// every usable core left after storage and NIC-worker reservations).
-	ServingCores uint64 `protobuf:"varint,9,opt,name=serving_cores,json=servingCores,proto3" json:"serving_cores,omitempty"`
-	// NIC-worker CPUs to pin per active HCA. 0 -> 4.
-	NicWorkers uint64 `protobuf:"varint,10,opt,name=nic_workers,json=nicWorkers,proto3" json:"nic_workers,omitempty"`
-	// Maximum number of HCAs to use per NUMA node. 0 -> 1. Raise this to
-	// use additional HCAs on a NUMA node. HCAs whose NUMA node is unknown
-	// are never capped.
-	HcasPerNumaNode uint64 `protobuf:"varint,11,opt,name=hcas_per_numa_node,json=hcasPerNumaNode,proto3" json:"hcas_per_numa_node,omitempty"`
+	// Maximum number of HCAs to bind per NUMA node. Defaults to 1 when unset.
+	// Raise this to use additional HCAs on a NUMA node. HCAs whose NUMA node is
+	// unknown are never capped.
+	HcasPerNumaNode *uint64 `protobuf:"varint,1,opt,name=hcas_per_numa_node,json=hcasPerNumaNode,proto3,oneof" json:"hcas_per_numa_node,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
 
+func (x *AutoRdmaFabricBinds) Reset() {
+	*x = AutoRdmaFabricBinds{}
+	mi := &file_config_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AutoRdmaFabricBinds) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AutoRdmaFabricBinds) ProtoMessage() {}
+
+func (x *AutoRdmaFabricBinds) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AutoRdmaFabricBinds.ProtoReflect.Descriptor instead.
+func (*AutoRdmaFabricBinds) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *AutoRdmaFabricBinds) GetHcasPerNumaNode() uint64 {
+	if x != nil && x.HcasPerNumaNode != nil {
+		return *x.HcasPerNumaNode
+	}
+	return 0
+}
+
+type RdmaFabricBind struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Provider-native RDMA fabric address encoded as "hex:<fi_getname-bytes>".
+	Addr          string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RdmaFabricBind) Reset() {
+	*x = RdmaFabricBind{}
+	mi := &file_config_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RdmaFabricBind) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RdmaFabricBind) ProtoMessage() {}
+
+func (x *RdmaFabricBind) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RdmaFabricBind.ProtoReflect.Descriptor instead.
+func (*RdmaFabricBind) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *RdmaFabricBind) GetAddr() string {
+	if x != nil {
+		return x.Addr
+	}
+	return ""
+}
+
+type TopologyCfg struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Place shards on SMT sibling CPUs as well as physical cores. Defaults to false,
+	// so one serving shard is placed per physical core unless explicitly enabled.
+	UseSmtSiblings bool `protobuf:"varint,1,opt,name=use_smt_siblings,json=useSmtSiblings,proto3" json:"use_smt_siblings,omitempty"`
+	// Schedule shards onto isolcpus-isolated CPUs too. Defaults to false, so CPUs
+	// isolated by the kernel are reserved for other workloads unless explicitly included.
+	IgnoreIsolated bool `protobuf:"varint,2,opt,name=ignore_isolated,json=ignoreIsolated,proto3" json:"ignore_isolated,omitempty"`
+	// Allow placing a shard on each NUMA node's CPU 0. Defaults to false, reserving
+	// those CPUs for kernel and housekeeping work unless explicitly included.
+	IncludeNodeCpu0 bool `protobuf:"varint,3,opt,name=include_node_cpu0,json=includeNodeCpu0,proto3" json:"include_node_cpu0,omitempty"`
+	// Use HCA ports that are not in the active state.
+	AllowInactivePort bool `protobuf:"varint,4,opt,name=allow_inactive_port,json=allowInactivePort,proto3" json:"allow_inactive_port,omitempty"`
+	// Disable RDMA and force the libfabric tcp provider. Defaults to false. This is
+	// an operator escape hatch for hosts where discovered RDMA devices are present
+	// but should not be used by this daemon.
+	DisableRdma bool `protobuf:"varint,5,opt,name=disable_rdma,json=disableRdma,proto3" json:"disable_rdma,omitempty"`
+	// Cap on the number of serving-shard CPUs to pin. When unset, claims every
+	// usable core left after storage and NIC-worker reservations.
+	ServingCores *uint64 `protobuf:"varint,6,opt,name=serving_cores,json=servingCores,proto3,oneof" json:"serving_cores,omitempty"`
+	// NIC-worker CPUs to pin per active HCA. Defaults to 4 when unset.
+	NicWorkers    *uint64 `protobuf:"varint,7,opt,name=nic_workers,json=nicWorkers,proto3,oneof" json:"nic_workers,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
 func (x *TopologyCfg) Reset() {
 	*x = TopologyCfg{}
-	mi := &file_config_proto_msgTypes[5]
+	mi := &file_config_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -570,7 +631,7 @@ func (x *TopologyCfg) String() string {
 func (*TopologyCfg) ProtoMessage() {}
 
 func (x *TopologyCfg) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[5]
+	mi := &file_config_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -583,7 +644,7 @@ func (x *TopologyCfg) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TopologyCfg.ProtoReflect.Descriptor instead.
 func (*TopologyCfg) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{5}
+	return file_config_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *TopologyCfg) GetUseSmtSiblings() bool {
@@ -622,58 +683,57 @@ func (x *TopologyCfg) GetDisableRdma() bool {
 }
 
 func (x *TopologyCfg) GetServingCores() uint64 {
-	if x != nil {
-		return x.ServingCores
+	if x != nil && x.ServingCores != nil {
+		return *x.ServingCores
 	}
 	return 0
 }
 
 func (x *TopologyCfg) GetNicWorkers() uint64 {
-	if x != nil {
-		return x.NicWorkers
+	if x != nil && x.NicWorkers != nil {
+		return *x.NicWorkers
 	}
 	return 0
 }
 
-func (x *TopologyCfg) GetHcasPerNumaNode() uint64 {
-	if x != nil {
-		return x.HcasPerNumaNode
-	}
-	return 0
-}
-
-type P2PCfg struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	FingersPerNode uint32                 `protobuf:"varint,1,opt,name=fingers_per_node,json=fingersPerNode,proto3" json:"fingers_per_node,omitempty"`
-	LocalNodeId    *uint64                `protobuf:"varint,2,opt,name=local_node_id,json=localNodeId,proto3,oneof" json:"local_node_id,omitempty"`
-	LocalLabels    []string               `protobuf:"bytes,3,rep,name=local_labels,json=localLabels,proto3" json:"local_labels,omitempty"`
-	// When set, the daemon uses this precomputed routing table verbatim
-	// instead of deriving fingers from the full peer set. This is the
-	// "disjoint discovery" mode: a global-view planner selects each
-	// node's neighbors and ships them here, so a node only needs to know
-	// (and connect to) its direct routing neighbors. When unset, the
-	// daemon falls back to building the finger table from `peers` using
-	// `fingers_per_node`.
-	RoutingPlan   *RoutingPlan `protobuf:"bytes,4,opt,name=routing_plan,json=routingPlan,proto3,oneof" json:"routing_plan,omitempty"`
+type NeighborhoodSpec struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Name   string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Source string                 `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
+	// Number of deterministic finger-table entries to derive per node. Defaults to 100 when unset.
+	FingersPerNode *uint32 `protobuf:"varint,3,opt,name=fingers_per_node,json=fingersPerNode,proto3,oneof" json:"fingers_per_node,omitempty"`
+	// Local node id on the P2P ring and process-wide fabric peer id; required when
+	// peers are configured, shared by every neighborhood when set, and must not
+	// match any peer id.
+	LocalNodeId *uint64 `protobuf:"varint,4,opt,name=local_node_id,json=localNodeId,proto3,oneof" json:"local_node_id,omitempty"`
+	// Local tags used by placement-aware planning.
+	LocalTags []string `protobuf:"bytes,5,rep,name=local_tags,json=localTags,proto3" json:"local_tags,omitempty"`
+	// Precomputed routing table that replaces automatic finger-table derivation when set.
+	// When set, `peers` can be "sparse"; containing only this process's neighbors.
+	RoutingPlan *RoutingPlan `protobuf:"bytes,6,opt,name=routing_plan,json=routingPlan,proto3,oneof" json:"routing_plan,omitempty"`
+	// Peer definitions available to this neighborhood. Peer ids are process-wide
+	// fabric peer ids; repeating an id across neighborhoods requires the same
+	// peer data.
+	Peers         []*PeerSpec `protobuf:"bytes,7,rep,name=peers,proto3" json:"peers,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *P2PCfg) Reset() {
-	*x = P2PCfg{}
-	mi := &file_config_proto_msgTypes[6]
+func (x *NeighborhoodSpec) Reset() {
+	*x = NeighborhoodSpec{}
+	mi := &file_config_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *P2PCfg) String() string {
+func (x *NeighborhoodSpec) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*P2PCfg) ProtoMessage() {}
+func (*NeighborhoodSpec) ProtoMessage() {}
 
-func (x *P2PCfg) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[6]
+func (x *NeighborhoodSpec) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -684,35 +744,56 @@ func (x *P2PCfg) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use P2PCfg.ProtoReflect.Descriptor instead.
-func (*P2PCfg) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{6}
+// Deprecated: Use NeighborhoodSpec.ProtoReflect.Descriptor instead.
+func (*NeighborhoodSpec) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{10}
 }
 
-func (x *P2PCfg) GetFingersPerNode() uint32 {
+func (x *NeighborhoodSpec) GetName() string {
 	if x != nil {
-		return x.FingersPerNode
+		return x.Name
+	}
+	return ""
+}
+
+func (x *NeighborhoodSpec) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
+}
+
+func (x *NeighborhoodSpec) GetFingersPerNode() uint32 {
+	if x != nil && x.FingersPerNode != nil {
+		return *x.FingersPerNode
 	}
 	return 0
 }
 
-func (x *P2PCfg) GetLocalNodeId() uint64 {
+func (x *NeighborhoodSpec) GetLocalNodeId() uint64 {
 	if x != nil && x.LocalNodeId != nil {
 		return *x.LocalNodeId
 	}
 	return 0
 }
 
-func (x *P2PCfg) GetLocalLabels() []string {
+func (x *NeighborhoodSpec) GetLocalTags() []string {
 	if x != nil {
-		return x.LocalLabels
+		return x.LocalTags
 	}
 	return nil
 }
 
-func (x *P2PCfg) GetRoutingPlan() *RoutingPlan {
+func (x *NeighborhoodSpec) GetRoutingPlan() *RoutingPlan {
 	if x != nil {
 		return x.RoutingPlan
+	}
+	return nil
+}
+
+func (x *NeighborhoodSpec) GetPeers() []*PeerSpec {
+	if x != nil {
+		return x.Peers
 	}
 	return nil
 }
@@ -720,12 +801,11 @@ func (x *P2PCfg) GetRoutingPlan() *RoutingPlan {
 // A precomputed routing table for a single node, produced by a
 // global-view planner. All ids reference `PeerSpec.id` values in the
 // `peers` list (each must be present so a fabric connection exists).
-// Ring positions are derived from ids, and labels do not affect runtime
+// Ring positions are derived from ids, and tags do not affect runtime
 // routing, so only ids are carried here.
 type RoutingPlan struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Peer ids selected as fingers. The local node id is excluded and
-	// the order is irrelevant (routing scans all fingers regardless).
+	// Peer ids selected for this routing plan.
 	Fingers []uint64 `protobuf:"varint,1,rep,packed,name=fingers,proto3" json:"fingers,omitempty"`
 	// Peer id of the nearest-forward neighbor on the ring.
 	Successor *uint64 `protobuf:"varint,2,opt,name=successor,proto3,oneof" json:"successor,omitempty"`
@@ -737,7 +817,7 @@ type RoutingPlan struct {
 
 func (x *RoutingPlan) Reset() {
 	*x = RoutingPlan{}
-	mi := &file_config_proto_msgTypes[7]
+	mi := &file_config_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -749,7 +829,7 @@ func (x *RoutingPlan) String() string {
 func (*RoutingPlan) ProtoMessage() {}
 
 func (x *RoutingPlan) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[7]
+	mi := &file_config_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -762,7 +842,7 @@ func (x *RoutingPlan) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RoutingPlan.ProtoReflect.Descriptor instead.
 func (*RoutingPlan) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{7}
+	return file_config_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *RoutingPlan) GetFingers() []uint64 {
@@ -786,77 +866,25 @@ func (x *RoutingPlan) GetPredecessor() uint64 {
 	return 0
 }
 
-type FabricAddress struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Numeric IP socket address usable by libfabric/RDMA CM, e.g.
-	// "10.0.0.1:9000". On InfiniBand this is usually an IPoIB address;
-	// on tcp fallback it is a normal TCP socket address.
-	Socket string `protobuf:"bytes,1,opt,name=socket,proto3" json:"socket,omitempty"`
-	// Provider-native escape hatch for RDMA deployments without socket
-	// addressing. Currently encoded as "hex:<fi_getname-bytes>" so a
-	// controller can publish the raw provider address when needed.
-	Native        string `protobuf:"bytes,2,opt,name=native,proto3" json:"native,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *FabricAddress) Reset() {
-	*x = FabricAddress{}
-	mi := &file_config_proto_msgTypes[8]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *FabricAddress) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*FabricAddress) ProtoMessage() {}
-
-func (x *FabricAddress) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[8]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use FabricAddress.ProtoReflect.Descriptor instead.
-func (*FabricAddress) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{8}
-}
-
-func (x *FabricAddress) GetSocket() string {
-	if x != nil {
-		return x.Socket
-	}
-	return ""
-}
-
-func (x *FabricAddress) GetNative() string {
-	if x != nil {
-		return x.Native
-	}
-	return ""
-}
-
 type PeerSpec struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            uint64                 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
-	Address       *FabricAddress         `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
-	HcaNuma       *uint32                `protobuf:"varint,3,opt,name=hca_numa,json=hcaNuma,proto3,oneof" json:"hca_numa,omitempty"`
-	Labels        []string               `protobuf:"bytes,4,rep,name=labels,proto3" json:"labels,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Process-wide fabric peer id, also used for this neighborhood's ring
+	// position and route references.
+	Id uint64 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Peer tags used by placement-aware planning.
+	Tags []string `protobuf:"bytes,2,rep,name=tags,proto3" json:"tags,omitempty"`
+	// Types that are valid to be assigned to Config:
+	//
+	//	*PeerSpec_Tcp
+	//	*PeerSpec_Rdma
+	Config        isPeerSpec_Config `protobuf_oneof:"config"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PeerSpec) Reset() {
 	*x = PeerSpec{}
-	mi := &file_config_proto_msgTypes[9]
+	mi := &file_config_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -868,7 +896,7 @@ func (x *PeerSpec) String() string {
 func (*PeerSpec) ProtoMessage() {}
 
 func (x *PeerSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[9]
+	mi := &file_config_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -881,7 +909,7 @@ func (x *PeerSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerSpec.ProtoReflect.Descriptor instead.
 func (*PeerSpec) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{9}
+	return file_config_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *PeerSpec) GetId() uint64 {
@@ -891,44 +919,225 @@ func (x *PeerSpec) GetId() uint64 {
 	return 0
 }
 
-func (x *PeerSpec) GetAddress() *FabricAddress {
+func (x *PeerSpec) GetTags() []string {
 	if x != nil {
-		return x.Address
+		return x.Tags
 	}
 	return nil
 }
 
-func (x *PeerSpec) GetHcaNuma() uint32 {
-	if x != nil && x.HcaNuma != nil {
-		return *x.HcaNuma
+func (x *PeerSpec) GetConfig() isPeerSpec_Config {
+	if x != nil {
+		return x.Config
 	}
-	return 0
+	return nil
 }
 
-func (x *PeerSpec) GetLabels() []string {
+func (x *PeerSpec) GetTcp() *TcpPeerConfig {
 	if x != nil {
-		return x.Labels
+		if x, ok := x.Config.(*PeerSpec_Tcp); ok {
+			return x.Tcp
+		}
+	}
+	return nil
+}
+
+func (x *PeerSpec) GetRdma() *RdmaPeerConfig {
+	if x != nil {
+		if x, ok := x.Config.(*PeerSpec_Rdma); ok {
+			return x.Rdma
+		}
+	}
+	return nil
+}
+
+type isPeerSpec_Config interface {
+	isPeerSpec_Config()
+}
+
+type PeerSpec_Tcp struct {
+	Tcp *TcpPeerConfig `protobuf:"bytes,3,opt,name=tcp,proto3,oneof"`
+}
+
+type PeerSpec_Rdma struct {
+	Rdma *RdmaPeerConfig `protobuf:"bytes,4,opt,name=rdma,proto3,oneof"`
+}
+
+func (*PeerSpec_Tcp) isPeerSpec_Config() {}
+
+func (*PeerSpec_Rdma) isPeerSpec_Config() {}
+
+type TcpPeerConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// TCP socket address used as this peer's fabric wire address.
+	Addr          string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TcpPeerConfig) Reset() {
+	*x = TcpPeerConfig{}
+	mi := &file_config_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TcpPeerConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TcpPeerConfig) ProtoMessage() {}
+
+func (x *TcpPeerConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TcpPeerConfig.ProtoReflect.Descriptor instead.
+func (*TcpPeerConfig) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *TcpPeerConfig) GetAddr() string {
+	if x != nil {
+		return x.Addr
+	}
+	return ""
+}
+
+type RdmaPeerConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Provider-native RDMA fabric address encoded as "hex:<fi_getname-bytes>".
+	Addr          string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RdmaPeerConfig) Reset() {
+	*x = RdmaPeerConfig{}
+	mi := &file_config_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RdmaPeerConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RdmaPeerConfig) ProtoMessage() {}
+
+func (x *RdmaPeerConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RdmaPeerConfig.ProtoReflect.Descriptor instead.
+func (*RdmaPeerConfig) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *RdmaPeerConfig) GetAddr() string {
+	if x != nil {
+		return x.Addr
+	}
+	return ""
+}
+
+type CacheSpec struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Name   string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Source string                 `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
+	// Disk definitions attached to this cache.
+	Disks         []*DiskSpec `protobuf:"bytes,3,rep,name=disks,proto3" json:"disks,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CacheSpec) Reset() {
+	*x = CacheSpec{}
+	mi := &file_config_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CacheSpec) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CacheSpec) ProtoMessage() {}
+
+func (x *CacheSpec) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CacheSpec.ProtoReflect.Descriptor instead.
+func (*CacheSpec) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *CacheSpec) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *CacheSpec) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
+}
+
+func (x *CacheSpec) GetDisks() []*DiskSpec {
+	if x != nil {
+		return x.Disks
 	}
 	return nil
 }
 
 type DiskSpec struct {
-	state                    protoimpl.MessageState `protogen:"open.v1"`
-	Path                     string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
-	Kind                     DiskKind               `protobuf:"varint,2,opt,name=kind,proto3,enum=unbounded.storage.config.DiskKind" json:"kind,omitempty"`
-	Size                     *uint64                `protobuf:"varint,3,opt,name=size,proto3,oneof" json:"size,omitempty"`
-	Numa                     *uint32                `protobuf:"varint,4,opt,name=numa,proto3,oneof" json:"numa,omitempty"`
-	QueueDepth               *uint32                `protobuf:"varint,5,opt,name=queue_depth,json=queueDepth,proto3,oneof" json:"queue_depth,omitempty"`
-	PageSizeBytes            *uint64                `protobuf:"varint,6,opt,name=page_size_bytes,json=pageSizeBytes,proto3,oneof" json:"page_size_bytes,omitempty"`
-	BypassAdmission          bool                   `protobuf:"varint,7,opt,name=bypass_admission,json=bypassAdmission,proto3" json:"bypass_admission,omitempty"`
-	SkipRecoveryScanIfNoMeta bool                   `protobuf:"varint,8,opt,name=skip_recovery_scan_if_no_meta,json=skipRecoveryScanIfNoMeta,proto3" json:"skip_recovery_scan_if_no_meta,omitempty"`
-	unknownFields            protoimpl.UnknownFields
-	sizeCache                protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Optional io_uring queue depth override for this disk.
+	QueueDepth *uint32 `protobuf:"varint,1,opt,name=queue_depth,json=queueDepth,proto3,oneof" json:"queue_depth,omitempty"`
+	// Optional cache page size override in bytes; defaults to the storage engine page size.
+	PageSizeBytes *uint64 `protobuf:"varint,2,opt,name=page_size_bytes,json=pageSizeBytes,proto3,oneof" json:"page_size_bytes,omitempty"`
+	// Skips the recovery scan when no metadata page is valid; intended only for fresh or benchmark disks.
+	SkipRecoveryScan bool `protobuf:"varint,3,opt,name=skip_recovery_scan,json=skipRecoveryScan,proto3" json:"skip_recovery_scan,omitempty"`
+	// Types that are valid to be assigned to Config:
+	//
+	//	*DiskSpec_Block
+	//	*DiskSpec_File
+	Config        isDiskSpec_Config `protobuf_oneof:"config"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DiskSpec) Reset() {
 	*x = DiskSpec{}
-	mi := &file_config_proto_msgTypes[10]
+	mi := &file_config_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -940,7 +1149,7 @@ func (x *DiskSpec) String() string {
 func (*DiskSpec) ProtoMessage() {}
 
 func (x *DiskSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[10]
+	mi := &file_config_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -953,35 +1162,7 @@ func (x *DiskSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiskSpec.ProtoReflect.Descriptor instead.
 func (*DiskSpec) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{10}
-}
-
-func (x *DiskSpec) GetPath() string {
-	if x != nil {
-		return x.Path
-	}
-	return ""
-}
-
-func (x *DiskSpec) GetKind() DiskKind {
-	if x != nil {
-		return x.Kind
-	}
-	return DiskKind_DISK_KIND_NVME
-}
-
-func (x *DiskSpec) GetSize() uint64 {
-	if x != nil && x.Size != nil {
-		return *x.Size
-	}
-	return 0
-}
-
-func (x *DiskSpec) GetNuma() uint32 {
-	if x != nil && x.Numa != nil {
-		return *x.Numa
-	}
-	return 0
+	return file_config_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *DiskSpec) GetQueueDepth() uint32 {
@@ -998,35 +1179,179 @@ func (x *DiskSpec) GetPageSizeBytes() uint64 {
 	return 0
 }
 
-func (x *DiskSpec) GetBypassAdmission() bool {
+func (x *DiskSpec) GetSkipRecoveryScan() bool {
 	if x != nil {
-		return x.BypassAdmission
+		return x.SkipRecoveryScan
 	}
 	return false
 }
 
-func (x *DiskSpec) GetSkipRecoveryScanIfNoMeta() bool {
+func (x *DiskSpec) GetConfig() isDiskSpec_Config {
 	if x != nil {
-		return x.SkipRecoveryScanIfNoMeta
+		return x.Config
 	}
-	return false
+	return nil
+}
+
+func (x *DiskSpec) GetBlock() *BlockDiskConfig {
+	if x != nil {
+		if x, ok := x.Config.(*DiskSpec_Block); ok {
+			return x.Block
+		}
+	}
+	return nil
+}
+
+func (x *DiskSpec) GetFile() *FileDiskConfig {
+	if x != nil {
+		if x, ok := x.Config.(*DiskSpec_File); ok {
+			return x.File
+		}
+	}
+	return nil
+}
+
+type isDiskSpec_Config interface {
+	isDiskSpec_Config()
+}
+
+type DiskSpec_Block struct {
+	Block *BlockDiskConfig `protobuf:"bytes,4,opt,name=block,proto3,oneof"`
+}
+
+type DiskSpec_File struct {
+	File *FileDiskConfig `protobuf:"bytes,5,opt,name=file,proto3,oneof"`
+}
+
+func (*DiskSpec_Block) isDiskSpec_Config() {}
+
+func (*DiskSpec_File) isDiskSpec_Config() {}
+
+type BlockDiskConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Optional NUMA node hint used when placing storage work for this block device.
+	Numa *uint32 `protobuf:"varint,1,opt,name=numa,proto3,oneof" json:"numa,omitempty"`
+	// Block device path; paths must be unique across all caches.
+	Path          string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BlockDiskConfig) Reset() {
+	*x = BlockDiskConfig{}
+	mi := &file_config_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BlockDiskConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BlockDiskConfig) ProtoMessage() {}
+
+func (x *BlockDiskConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BlockDiskConfig.ProtoReflect.Descriptor instead.
+func (*BlockDiskConfig) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *BlockDiskConfig) GetNuma() uint32 {
+	if x != nil && x.Numa != nil {
+		return *x.Numa
+	}
+	return 0
+}
+
+func (x *BlockDiskConfig) GetPath() string {
+	if x != nil {
+		return x.Path
+	}
+	return ""
+}
+
+type FileDiskConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Required file-backed disk capacity in bytes; the file is provisioned to this size before opening.
+	Size *uint64 `protobuf:"varint,1,opt,name=size,proto3,oneof" json:"size,omitempty"`
+	// Backing-file path; paths must be unique across all caches.
+	Path          string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FileDiskConfig) Reset() {
+	*x = FileDiskConfig{}
+	mi := &file_config_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FileDiskConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FileDiskConfig) ProtoMessage() {}
+
+func (x *FileDiskConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FileDiskConfig.ProtoReflect.Descriptor instead.
+func (*FileDiskConfig) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *FileDiskConfig) GetSize() uint64 {
+	if x != nil && x.Size != nil {
+		return *x.Size
+	}
+	return 0
+}
+
+func (x *FileDiskConfig) GetPath() string {
+	if x != nil {
+		return x.Path
+	}
+	return ""
 }
 
 type BackendSpec struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	Id              string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Kind            BackendKind            `protobuf:"varint,2,opt,name=kind,proto3,enum=unbounded.storage.config.BackendKind" json:"kind,omitempty"`
-	Endpoint        string                 `protobuf:"bytes,3,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
-	StripeSizeBytes uint64                 `protobuf:"varint,4,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3" json:"stripe_size_bytes,omitempty"`
-	HttpConcurrency uint32                 `protobuf:"varint,5,opt,name=http_concurrency,json=httpConcurrency,proto3" json:"http_concurrency,omitempty"`
-	Bucket          *string                `protobuf:"bytes,6,opt,name=bucket,proto3,oneof" json:"bucket,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Types that are valid to be assigned to Config:
+	//
+	//	*BackendSpec_Http
+	//	*BackendSpec_S3
+	//	*BackendSpec_Azure
+	//	*BackendSpec_Fake
+	Config        isBackendSpec_Config `protobuf_oneof:"config"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *BackendSpec) Reset() {
 	*x = BackendSpec{}
-	mi := &file_config_proto_msgTypes[11]
+	mi := &file_config_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1038,7 +1363,7 @@ func (x *BackendSpec) String() string {
 func (*BackendSpec) ProtoMessage() {}
 
 func (x *BackendSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[11]
+	mi := &file_config_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1051,64 +1376,351 @@ func (x *BackendSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackendSpec.ProtoReflect.Descriptor instead.
 func (*BackendSpec) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{11}
+	return file_config_proto_rawDescGZIP(), []int{19}
 }
 
-func (x *BackendSpec) GetId() string {
+func (x *BackendSpec) GetName() string {
 	if x != nil {
-		return x.Id
+		return x.Name
 	}
 	return ""
 }
 
-func (x *BackendSpec) GetKind() BackendKind {
+func (x *BackendSpec) GetConfig() isBackendSpec_Config {
 	if x != nil {
-		return x.Kind
+		return x.Config
 	}
-	return BackendKind_BACKEND_KIND_HTTP
+	return nil
 }
 
-func (x *BackendSpec) GetEndpoint() string {
+func (x *BackendSpec) GetHttp() *HttpBackendConfig {
 	if x != nil {
-		return x.Endpoint
+		if x, ok := x.Config.(*BackendSpec_Http); ok {
+			return x.Http
+		}
+	}
+	return nil
+}
+
+func (x *BackendSpec) GetS3() *S3BackendConfig {
+	if x != nil {
+		if x, ok := x.Config.(*BackendSpec_S3); ok {
+			return x.S3
+		}
+	}
+	return nil
+}
+
+func (x *BackendSpec) GetAzure() *AzureBackendConfig {
+	if x != nil {
+		if x, ok := x.Config.(*BackendSpec_Azure); ok {
+			return x.Azure
+		}
+	}
+	return nil
+}
+
+func (x *BackendSpec) GetFake() *FakeBackendConfig {
+	if x != nil {
+		if x, ok := x.Config.(*BackendSpec_Fake); ok {
+			return x.Fake
+		}
+	}
+	return nil
+}
+
+type isBackendSpec_Config interface {
+	isBackendSpec_Config()
+}
+
+type BackendSpec_Http struct {
+	Http *HttpBackendConfig `protobuf:"bytes,2,opt,name=http,proto3,oneof"`
+}
+
+type BackendSpec_S3 struct {
+	S3 *S3BackendConfig `protobuf:"bytes,3,opt,name=s3,proto3,oneof"`
+}
+
+type BackendSpec_Azure struct {
+	Azure *AzureBackendConfig `protobuf:"bytes,4,opt,name=azure,proto3,oneof"`
+}
+
+type BackendSpec_Fake struct {
+	Fake *FakeBackendConfig `protobuf:"bytes,5,opt,name=fake,proto3,oneof"`
+}
+
+func (*BackendSpec_Http) isBackendSpec_Config() {}
+
+func (*BackendSpec_S3) isBackendSpec_Config() {}
+
+func (*BackendSpec_Azure) isBackendSpec_Config() {}
+
+func (*BackendSpec_Fake) isBackendSpec_Config() {}
+
+type HttpBackendConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+	Url string `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
+	// Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
+	// Must be a power of two.
+	StripeSizeBytes *uint64 `protobuf:"varint,2,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
+	// Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
+	HttpConcurrency *uint32 `protobuf:"varint,3,opt,name=http_concurrency,json=httpConcurrency,proto3,oneof" json:"http_concurrency,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *HttpBackendConfig) Reset() {
+	*x = HttpBackendConfig{}
+	mi := &file_config_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HttpBackendConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HttpBackendConfig) ProtoMessage() {}
+
+func (x *HttpBackendConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HttpBackendConfig.ProtoReflect.Descriptor instead.
+func (*HttpBackendConfig) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *HttpBackendConfig) GetUrl() string {
+	if x != nil {
+		return x.Url
 	}
 	return ""
 }
 
-func (x *BackendSpec) GetStripeSizeBytes() uint64 {
-	if x != nil {
-		return x.StripeSizeBytes
+func (x *HttpBackendConfig) GetStripeSizeBytes() uint64 {
+	if x != nil && x.StripeSizeBytes != nil {
+		return *x.StripeSizeBytes
 	}
 	return 0
 }
 
-func (x *BackendSpec) GetHttpConcurrency() uint32 {
-	if x != nil {
-		return x.HttpConcurrency
+func (x *HttpBackendConfig) GetHttpConcurrency() uint32 {
+	if x != nil && x.HttpConcurrency != nil {
+		return *x.HttpConcurrency
 	}
 	return 0
 }
 
-func (x *BackendSpec) GetBucket() string {
-	if x != nil && x.Bucket != nil {
-		return *x.Bucket
+type S3BackendConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// S3-compatible origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+	Url string `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
+	// Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
+	// Must be a power of two.
+	StripeSizeBytes *uint64 `protobuf:"varint,2,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
+	// Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
+	HttpConcurrency *uint32 `protobuf:"varint,3,opt,name=http_concurrency,json=httpConcurrency,proto3,oneof" json:"http_concurrency,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *S3BackendConfig) Reset() {
+	*x = S3BackendConfig{}
+	mi := &file_config_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *S3BackendConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*S3BackendConfig) ProtoMessage() {}
+
+func (x *S3BackendConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use S3BackendConfig.ProtoReflect.Descriptor instead.
+func (*S3BackendConfig) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *S3BackendConfig) GetUrl() string {
+	if x != nil {
+		return x.Url
 	}
 	return ""
+}
+
+func (x *S3BackendConfig) GetStripeSizeBytes() uint64 {
+	if x != nil && x.StripeSizeBytes != nil {
+		return *x.StripeSizeBytes
+	}
+	return 0
+}
+
+func (x *S3BackendConfig) GetHttpConcurrency() uint32 {
+	if x != nil && x.HttpConcurrency != nil {
+		return *x.HttpConcurrency
+	}
+	return 0
+}
+
+type AzureBackendConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Azure Blob-compatible origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+	Url string `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
+	// Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
+	// Must be a power of two.
+	StripeSizeBytes *uint64 `protobuf:"varint,2,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
+	// Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
+	HttpConcurrency *uint32 `protobuf:"varint,3,opt,name=http_concurrency,json=httpConcurrency,proto3,oneof" json:"http_concurrency,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *AzureBackendConfig) Reset() {
+	*x = AzureBackendConfig{}
+	mi := &file_config_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AzureBackendConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AzureBackendConfig) ProtoMessage() {}
+
+func (x *AzureBackendConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AzureBackendConfig.ProtoReflect.Descriptor instead.
+func (*AzureBackendConfig) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *AzureBackendConfig) GetUrl() string {
+	if x != nil {
+		return x.Url
+	}
+	return ""
+}
+
+func (x *AzureBackendConfig) GetStripeSizeBytes() uint64 {
+	if x != nil && x.StripeSizeBytes != nil {
+		return *x.StripeSizeBytes
+	}
+	return 0
+}
+
+func (x *AzureBackendConfig) GetHttpConcurrency() uint32 {
+	if x != nil && x.HttpConcurrency != nil {
+		return *x.HttpConcurrency
+	}
+	return 0
+}
+
+type FakeBackendConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Stripe granularity in bytes for synthetic origin references. Defaults to 4 MiB when unset.
+	// Must be a power of two.
+	StripeSizeBytes *uint64 `protobuf:"varint,1,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
+	// Size of each synthetic zero-filled object in bytes. Defaults to 1 MiB when unset.
+	ObjectSizeBytes *uint64 `protobuf:"varint,2,opt,name=object_size_bytes,json=objectSizeBytes,proto3,oneof" json:"object_size_bytes,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *FakeBackendConfig) Reset() {
+	*x = FakeBackendConfig{}
+	mi := &file_config_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FakeBackendConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FakeBackendConfig) ProtoMessage() {}
+
+func (x *FakeBackendConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FakeBackendConfig.ProtoReflect.Descriptor instead.
+func (*FakeBackendConfig) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *FakeBackendConfig) GetStripeSizeBytes() uint64 {
+	if x != nil && x.StripeSizeBytes != nil {
+		return *x.StripeSizeBytes
+	}
+	return 0
+}
+
+func (x *FakeBackendConfig) GetObjectSizeBytes() uint64 {
+	if x != nil && x.ObjectSizeBytes != nil {
+		return *x.ObjectSizeBytes
+	}
+	return 0
 }
 
 type FrontendSpec struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Kind          FrontendKind           `protobuf:"varint,2,opt,name=kind,proto3,enum=unbounded.storage.config.FrontendKind" json:"kind,omitempty"`
-	Bind          string                 `protobuf:"bytes,3,opt,name=bind,proto3" json:"bind,omitempty"`
-	Backend       string                 `protobuf:"bytes,4,opt,name=backend,proto3" json:"backend,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Name   string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Source string                 `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
+	// Types that are valid to be assigned to Config:
+	//
+	//	*FrontendSpec_Http
+	//	*FrontendSpec_S3
+	//	*FrontendSpec_Loadgen
+	Config        isFrontendSpec_Config `protobuf_oneof:"config"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *FrontendSpec) Reset() {
 	*x = FrontendSpec{}
-	mi := &file_config_proto_msgTypes[12]
+	mi := &file_config_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1120,7 +1732,7 @@ func (x *FrontendSpec) String() string {
 func (*FrontendSpec) ProtoMessage() {}
 
 func (x *FrontendSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[12]
+	mi := &file_config_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1133,50 +1745,262 @@ func (x *FrontendSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FrontendSpec.ProtoReflect.Descriptor instead.
 func (*FrontendSpec) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{12}
+	return file_config_proto_rawDescGZIP(), []int{24}
 }
 
-func (x *FrontendSpec) GetId() string {
+func (x *FrontendSpec) GetName() string {
 	if x != nil {
-		return x.Id
+		return x.Name
 	}
 	return ""
 }
 
-func (x *FrontendSpec) GetKind() FrontendKind {
+func (x *FrontendSpec) GetSource() string {
 	if x != nil {
-		return x.Kind
-	}
-	return FrontendKind_FRONTEND_KIND_HTTP
-}
-
-func (x *FrontendSpec) GetBind() string {
-	if x != nil {
-		return x.Bind
+		return x.Source
 	}
 	return ""
 }
 
-func (x *FrontendSpec) GetBackend() string {
+func (x *FrontendSpec) GetConfig() isFrontendSpec_Config {
 	if x != nil {
-		return x.Backend
+		return x.Config
+	}
+	return nil
+}
+
+func (x *FrontendSpec) GetHttp() *HttpFrontendConfig {
+	if x != nil {
+		if x, ok := x.Config.(*FrontendSpec_Http); ok {
+			return x.Http
+		}
+	}
+	return nil
+}
+
+func (x *FrontendSpec) GetS3() *S3FrontendConfig {
+	if x != nil {
+		if x, ok := x.Config.(*FrontendSpec_S3); ok {
+			return x.S3
+		}
+	}
+	return nil
+}
+
+func (x *FrontendSpec) GetLoadgen() *LoadgenFrontendConfig {
+	if x != nil {
+		if x, ok := x.Config.(*FrontendSpec_Loadgen); ok {
+			return x.Loadgen
+		}
+	}
+	return nil
+}
+
+type isFrontendSpec_Config interface {
+	isFrontendSpec_Config()
+}
+
+type FrontendSpec_Http struct {
+	Http *HttpFrontendConfig `protobuf:"bytes,3,opt,name=http,proto3,oneof"`
+}
+
+type FrontendSpec_S3 struct {
+	S3 *S3FrontendConfig `protobuf:"bytes,4,opt,name=s3,proto3,oneof"`
+}
+
+type FrontendSpec_Loadgen struct {
+	Loadgen *LoadgenFrontendConfig `protobuf:"bytes,5,opt,name=loadgen,proto3,oneof"`
+}
+
+func (*FrontendSpec_Http) isFrontendSpec_Config() {}
+
+func (*FrontendSpec_S3) isFrontendSpec_Config() {}
+
+func (*FrontendSpec_Loadgen) isFrontendSpec_Config() {}
+
+type HttpFrontendConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Socket address for HTTP listeners; each serving shard binds it with SO_REUSEPORT.
+	Addr          string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HttpFrontendConfig) Reset() {
+	*x = HttpFrontendConfig{}
+	mi := &file_config_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HttpFrontendConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HttpFrontendConfig) ProtoMessage() {}
+
+func (x *HttpFrontendConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HttpFrontendConfig.ProtoReflect.Descriptor instead.
+func (*HttpFrontendConfig) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *HttpFrontendConfig) GetAddr() string {
+	if x != nil {
+		return x.Addr
 	}
 	return ""
+}
+
+type S3FrontendConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Socket address for S3-compatible listeners; each serving shard binds it with SO_REUSEPORT.
+	Addr          string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *S3FrontendConfig) Reset() {
+	*x = S3FrontendConfig{}
+	mi := &file_config_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *S3FrontendConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*S3FrontendConfig) ProtoMessage() {}
+
+func (x *S3FrontendConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use S3FrontendConfig.ProtoReflect.Descriptor instead.
+func (*S3FrontendConfig) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *S3FrontendConfig) GetAddr() string {
+	if x != nil {
+		return x.Addr
+	}
+	return ""
+}
+
+type LoadgenFrontendConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Synthetic read workers per serving shard. Defaults to 1 when unset.
+	Workers *uint32 `protobuf:"varint,1,opt,name=workers,proto3,oneof" json:"workers,omitempty"`
+	// Deterministic object stream seed. Defaults to the loadgen frontend seed when unset.
+	Seed *uint64 `protobuf:"varint,2,opt,name=seed,proto3,oneof" json:"seed,omitempty"`
+	// Number of distinct synthetic object ids to cycle over. Defaults to 1,000,000 when unset.
+	ObjectCount *uint64 `protobuf:"varint,3,opt,name=object_count,json=objectCount,proto3,oneof" json:"object_count,omitempty"`
+	// Bytes to read from the start of each object. When unset, reads the full resolved object length.
+	ReadBytes *uint64 `protobuf:"varint,4,opt,name=read_bytes,json=readBytes,proto3,oneof" json:"read_bytes,omitempty"`
+	// Verify every returned body byte is zero. Intended for fake backends.
+	Verify        bool `protobuf:"varint,5,opt,name=verify,proto3" json:"verify,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LoadgenFrontendConfig) Reset() {
+	*x = LoadgenFrontendConfig{}
+	mi := &file_config_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LoadgenFrontendConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LoadgenFrontendConfig) ProtoMessage() {}
+
+func (x *LoadgenFrontendConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LoadgenFrontendConfig.ProtoReflect.Descriptor instead.
+func (*LoadgenFrontendConfig) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *LoadgenFrontendConfig) GetWorkers() uint32 {
+	if x != nil && x.Workers != nil {
+		return *x.Workers
+	}
+	return 0
+}
+
+func (x *LoadgenFrontendConfig) GetSeed() uint64 {
+	if x != nil && x.Seed != nil {
+		return *x.Seed
+	}
+	return 0
+}
+
+func (x *LoadgenFrontendConfig) GetObjectCount() uint64 {
+	if x != nil && x.ObjectCount != nil {
+		return *x.ObjectCount
+	}
+	return 0
+}
+
+func (x *LoadgenFrontendConfig) GetReadBytes() uint64 {
+	if x != nil && x.ReadBytes != nil {
+		return *x.ReadBytes
+	}
+	return 0
+}
+
+func (x *LoadgenFrontendConfig) GetVerify() bool {
+	if x != nil {
+		return x.Verify
+	}
+	return false
 }
 
 var File_config_proto protoreflect.FileDescriptor
 
 const file_config_proto_rawDesc = "" +
 	"\n" +
-	"\fconfig.proto\x12\x18unbounded.storage.config\"\x93\x03\n" +
+	"\fconfig.proto\x12\x18unbounded.storage.config\"\xfa\x02\n" +
 	"\x06Config\x12\x18\n" +
-	"\aversion\x18\x06 \x01(\x04R\aversion\x122\n" +
-	"\x03p2p\x18\x01 \x01(\v2 .unbounded.storage.config.P2pCfgR\x03p2p\x128\n" +
-	"\x05peers\x18\x02 \x03(\v2\".unbounded.storage.config.PeerSpecR\x05peers\x128\n" +
-	"\x05disks\x18\x03 \x03(\v2\".unbounded.storage.config.DiskSpecR\x05disks\x12A\n" +
-	"\bbackends\x18\x04 \x03(\v2%.unbounded.storage.config.BackendSpecR\bbackends\x12D\n" +
-	"\tfrontends\x18\x05 \x03(\v2&.unbounded.storage.config.FrontendSpecR\tfrontends\x12>\n" +
-	"\astartup\x18\a \x01(\v2$.unbounded.storage.config.StartupCfgR\astartup\"\x89\x02\n" +
+	"\aversion\x18\x01 \x01(\x04R\aversion\x12>\n" +
+	"\astartup\x18\x02 \x01(\v2$.unbounded.storage.config.StartupCfgR\astartup\x12D\n" +
+	"\tfrontends\x18\x03 \x03(\v2&.unbounded.storage.config.FrontendSpecR\tfrontends\x12A\n" +
+	"\bbackends\x18\x04 \x03(\v2%.unbounded.storage.config.BackendSpecR\bbackends\x12;\n" +
+	"\x06caches\x18\x05 \x03(\v2#.unbounded.storage.config.CacheSpecR\x06caches\x12P\n" +
+	"\rneighborhoods\x18\x06 \x03(\v2*.unbounded.storage.config.NeighborhoodSpecR\rneighborhoods\"\x89\x02\n" +
 	"\n" +
 	"StartupCfg\x12;\n" +
 	"\x06memory\x18\x01 \x01(\v2#.unbounded.storage.config.MemoryCfgR\x06memory\x12;\n" +
@@ -1185,33 +2009,54 @@ const file_config_proto_rawDesc = "" +
 	"\ametrics\x18\x04 \x01(\v2$.unbounded.storage.config.MetricsCfgR\ametrics\" \n" +
 	"\n" +
 	"MetricsCfg\x12\x12\n" +
-	"\x04bind\x18\x01 \x01(\tR\x04bind\"\\\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"x\n" +
 	"\tMemoryCfg\x12!\n" +
-	"\fno_hugepages\x18\x01 \x01(\bR\vnoHugepages\x12,\n" +
-	"\x12memory_total_bytes\x18\x02 \x01(\x04R\x10memoryTotalBytes\"\xd2\x01\n" +
-	"\tFabricCfg\x12\x1f\n" +
-	"\vlisten_addr\x18\x01 \x01(\tR\n" +
-	"listenAddr\x12)\n" +
-	"\x10progress_threads\x18\x02 \x01(\rR\x0fprogressThreads\x12(\n" +
-	"\x10progress_poll_us\x18\x03 \x01(\rR\x0eprogressPollUs\x12,\n" +
-	"\x12rpc_worker_threads\x18\x04 \x01(\rR\x10rpcWorkerThreads\x12!\n" +
-	"\fmax_inflight\x18\x05 \x01(\rR\vmaxInflight\"\xa8\x03\n" +
+	"\fno_hugepages\x18\x01 \x01(\bR\vnoHugepages\x121\n" +
+	"\x12memory_total_bytes\x18\x02 \x01(\x04H\x00R\x10memoryTotalBytes\x88\x01\x01B\x15\n" +
+	"\x13_memory_total_bytes\"\xed\x03\n" +
+	"\tFabricCfg\x12<\n" +
+	"\x03tcp\x18\x01 \x01(\v2(.unbounded.storage.config.TcpFabricBindsH\x00R\x03tcp\x12?\n" +
+	"\x04rdma\x18\x02 \x01(\v2).unbounded.storage.config.RdmaFabricBindsH\x00R\x04rdma\x12L\n" +
+	"\tauto_rdma\x18\x03 \x01(\v2-.unbounded.storage.config.AutoRdmaFabricBindsH\x00R\bautoRdma\x12&\n" +
+	"\fmax_inflight\x18\x04 \x01(\rH\x01R\vmaxInflight\x88\x01\x01\x12.\n" +
+	"\x10progress_threads\x18\x05 \x01(\rH\x02R\x0fprogressThreads\x88\x01\x01\x121\n" +
+	"\x12rpc_worker_threads\x18\x06 \x01(\rH\x03R\x10rpcWorkerThreads\x88\x01\x01\x12-\n" +
+	"\x10progress_poll_us\x18\a \x01(\rH\x04R\x0eprogressPollUs\x88\x01\x01B\a\n" +
+	"\x05bindsB\x0f\n" +
+	"\r_max_inflightB\x13\n" +
+	"\x11_progress_threadsB\x15\n" +
+	"\x13_rpc_worker_threadsB\x13\n" +
+	"\x11_progress_poll_us\"$\n" +
+	"\x0eTcpFabricBinds\x12\x12\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"Q\n" +
+	"\x0fRdmaFabricBinds\x12>\n" +
+	"\x05binds\x18\x01 \x03(\v2(.unbounded.storage.config.RdmaFabricBindR\x05binds\"^\n" +
+	"\x13AutoRdmaFabricBinds\x120\n" +
+	"\x12hcas_per_numa_node\x18\x01 \x01(\x04H\x00R\x0fhcasPerNumaNode\x88\x01\x01B\x15\n" +
+	"\x13_hcas_per_numa_node\"$\n" +
+	"\x0eRdmaFabricBind\x12\x12\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"\xd1\x02\n" +
 	"\vTopologyCfg\x12(\n" +
-	"\x10use_smt_siblings\x18\x04 \x01(\bR\x0euseSmtSiblings\x12'\n" +
-	"\x0fignore_isolated\x18\x05 \x01(\bR\x0eignoreIsolated\x12*\n" +
-	"\x11include_node_cpu0\x18\x06 \x01(\bR\x0fincludeNodeCpu0\x12.\n" +
-	"\x13allow_inactive_port\x18\a \x01(\bR\x11allowInactivePort\x12!\n" +
-	"\fdisable_rdma\x18\b \x01(\bR\vdisableRdma\x12#\n" +
-	"\rserving_cores\x18\t \x01(\x04R\fservingCores\x12\x1f\n" +
-	"\vnic_workers\x18\n" +
-	" \x01(\x04R\n" +
-	"nicWorkers\x12+\n" +
-	"\x12hcas_per_numa_node\x18\v \x01(\x04R\x0fhcasPerNumaNodeJ\x04\b\x01\x10\x02J\x04\b\x02\x10\x03J\x04\b\x03\x10\x04R\x15rdma_progress_per_hcaR\x15rdma_handlers_per_hcaR\x14tcp_fallback_threads\"\xf0\x01\n" +
-	"\x06P2pCfg\x12(\n" +
-	"\x10fingers_per_node\x18\x01 \x01(\rR\x0efingersPerNode\x12'\n" +
-	"\rlocal_node_id\x18\x02 \x01(\x04H\x00R\vlocalNodeId\x88\x01\x01\x12!\n" +
-	"\flocal_labels\x18\x03 \x03(\tR\vlocalLabels\x12M\n" +
-	"\frouting_plan\x18\x04 \x01(\v2%.unbounded.storage.config.RoutingPlanH\x01R\vroutingPlan\x88\x01\x01B\x10\n" +
+	"\x10use_smt_siblings\x18\x01 \x01(\bR\x0euseSmtSiblings\x12'\n" +
+	"\x0fignore_isolated\x18\x02 \x01(\bR\x0eignoreIsolated\x12*\n" +
+	"\x11include_node_cpu0\x18\x03 \x01(\bR\x0fincludeNodeCpu0\x12.\n" +
+	"\x13allow_inactive_port\x18\x04 \x01(\bR\x11allowInactivePort\x12!\n" +
+	"\fdisable_rdma\x18\x05 \x01(\bR\vdisableRdma\x12(\n" +
+	"\rserving_cores\x18\x06 \x01(\x04H\x00R\fservingCores\x88\x01\x01\x12$\n" +
+	"\vnic_workers\x18\a \x01(\x04H\x01R\n" +
+	"nicWorkers\x88\x01\x01B\x10\n" +
+	"\x0e_serving_coresB\x0e\n" +
+	"\f_nic_workers\"\xf6\x02\n" +
+	"\x10NeighborhoodSpec\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
+	"\x06source\x18\x02 \x01(\tR\x06source\x12-\n" +
+	"\x10fingers_per_node\x18\x03 \x01(\rH\x00R\x0efingersPerNode\x88\x01\x01\x12'\n" +
+	"\rlocal_node_id\x18\x04 \x01(\x04H\x01R\vlocalNodeId\x88\x01\x01\x12\x1d\n" +
+	"\n" +
+	"local_tags\x18\x05 \x03(\tR\tlocalTags\x12M\n" +
+	"\frouting_plan\x18\x06 \x01(\v2%.unbounded.storage.config.RoutingPlanH\x02R\vroutingPlan\x88\x01\x01\x128\n" +
+	"\x05peers\x18\a \x03(\v2\".unbounded.storage.config.PeerSpecR\x05peersB\x13\n" +
+	"\x11_fingers_per_nodeB\x10\n" +
 	"\x0e_local_node_idB\x0f\n" +
 	"\r_routing_plan\"\x8f\x01\n" +
 	"\vRoutingPlan\x12\x18\n" +
@@ -1220,54 +2065,92 @@ const file_config_proto_rawDesc = "" +
 	"\vpredecessor\x18\x03 \x01(\x04H\x01R\vpredecessor\x88\x01\x01B\f\n" +
 	"\n" +
 	"_successorB\x0e\n" +
-	"\f_predecessor\"?\n" +
-	"\rFabricAddress\x12\x16\n" +
-	"\x06socket\x18\x01 \x01(\tR\x06socket\x12\x16\n" +
-	"\x06native\x18\x02 \x01(\tR\x06native\"\xa2\x01\n" +
+	"\f_predecessor\"\xb5\x01\n" +
 	"\bPeerSpec\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\x04R\x02id\x12A\n" +
-	"\aaddress\x18\x02 \x01(\v2'.unbounded.storage.config.FabricAddressR\aaddress\x12\x1e\n" +
-	"\bhca_numa\x18\x03 \x01(\rH\x00R\ahcaNuma\x88\x01\x01\x12\x16\n" +
-	"\x06labels\x18\x04 \x03(\tR\x06labelsB\v\n" +
-	"\t_hca_numa\"\xfd\x02\n" +
-	"\bDiskSpec\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04path\x126\n" +
-	"\x04kind\x18\x02 \x01(\x0e2\".unbounded.storage.config.DiskKindR\x04kind\x12\x17\n" +
-	"\x04size\x18\x03 \x01(\x04H\x00R\x04size\x88\x01\x01\x12\x17\n" +
-	"\x04numa\x18\x04 \x01(\rH\x01R\x04numa\x88\x01\x01\x12$\n" +
-	"\vqueue_depth\x18\x05 \x01(\rH\x02R\n" +
+	"\x02id\x18\x01 \x01(\x04R\x02id\x12\x12\n" +
+	"\x04tags\x18\x02 \x03(\tR\x04tags\x12;\n" +
+	"\x03tcp\x18\x03 \x01(\v2'.unbounded.storage.config.TcpPeerConfigH\x00R\x03tcp\x12>\n" +
+	"\x04rdma\x18\x04 \x01(\v2(.unbounded.storage.config.RdmaPeerConfigH\x00R\x04rdmaB\b\n" +
+	"\x06config\"#\n" +
+	"\rTcpPeerConfig\x12\x12\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"$\n" +
+	"\x0eRdmaPeerConfig\x12\x12\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"q\n" +
+	"\tCacheSpec\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
+	"\x06source\x18\x02 \x01(\tR\x06source\x128\n" +
+	"\x05disks\x18\x03 \x03(\v2\".unbounded.storage.config.DiskSpecR\x05disks\"\xbc\x02\n" +
+	"\bDiskSpec\x12$\n" +
+	"\vqueue_depth\x18\x01 \x01(\rH\x01R\n" +
 	"queueDepth\x88\x01\x01\x12+\n" +
-	"\x0fpage_size_bytes\x18\x06 \x01(\x04H\x03R\rpageSizeBytes\x88\x01\x01\x12)\n" +
-	"\x10bypass_admission\x18\a \x01(\bR\x0fbypassAdmission\x12?\n" +
-	"\x1dskip_recovery_scan_if_no_meta\x18\b \x01(\bR\x18skipRecoveryScanIfNoMetaB\a\n" +
-	"\x05_sizeB\a\n" +
-	"\x05_numaB\x0e\n" +
+	"\x0fpage_size_bytes\x18\x02 \x01(\x04H\x02R\rpageSizeBytes\x88\x01\x01\x12,\n" +
+	"\x12skip_recovery_scan\x18\x03 \x01(\bR\x10skipRecoveryScan\x12A\n" +
+	"\x05block\x18\x04 \x01(\v2).unbounded.storage.config.BlockDiskConfigH\x00R\x05block\x12>\n" +
+	"\x04file\x18\x05 \x01(\v2(.unbounded.storage.config.FileDiskConfigH\x00R\x04fileB\b\n" +
+	"\x06configB\x0e\n" +
 	"\f_queue_depthB\x12\n" +
-	"\x10_page_size_bytes\"\xf3\x01\n" +
-	"\vBackendSpec\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\x129\n" +
-	"\x04kind\x18\x02 \x01(\x0e2%.unbounded.storage.config.BackendKindR\x04kind\x12\x1a\n" +
-	"\bendpoint\x18\x03 \x01(\tR\bendpoint\x12*\n" +
-	"\x11stripe_size_bytes\x18\x04 \x01(\x04R\x0fstripeSizeBytes\x12)\n" +
-	"\x10http_concurrency\x18\x05 \x01(\rR\x0fhttpConcurrency\x12\x1b\n" +
-	"\x06bucket\x18\x06 \x01(\tH\x00R\x06bucket\x88\x01\x01B\t\n" +
-	"\a_bucket\"\x88\x01\n" +
-	"\fFrontendSpec\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\x12:\n" +
-	"\x04kind\x18\x02 \x01(\x0e2&.unbounded.storage.config.FrontendKindR\x04kind\x12\x12\n" +
-	"\x04bind\x18\x03 \x01(\tR\x04bind\x12\x18\n" +
-	"\abackend\x18\x04 \x01(\tR\abackend*G\n" +
-	"\bDiskKind\x12\x12\n" +
-	"\x0eDISK_KIND_NVME\x10\x00\x12\x13\n" +
-	"\x0fDISK_KIND_BLOCK\x10\x01\x12\x12\n" +
-	"\x0eDISK_KIND_FILE\x10\x02*Q\n" +
-	"\vBackendKind\x12\x15\n" +
-	"\x11BACKEND_KIND_HTTP\x10\x00\x12\x13\n" +
-	"\x0fBACKEND_KIND_S3\x10\x01\x12\x16\n" +
-	"\x12BACKEND_KIND_AZURE\x10\x02*<\n" +
-	"\fFrontendKind\x12\x16\n" +
-	"\x12FRONTEND_KIND_HTTP\x10\x00\x12\x14\n" +
-	"\x10FRONTEND_KIND_S3\x10\x01B@Z>github.com/Azure/unbounded/api/unbounded-storage;storageconfigb\x06proto3"
+	"\x10_page_size_bytes\"G\n" +
+	"\x0fBlockDiskConfig\x12\x17\n" +
+	"\x04numa\x18\x01 \x01(\rH\x00R\x04numa\x88\x01\x01\x12\x12\n" +
+	"\x04path\x18\x02 \x01(\tR\x04pathB\a\n" +
+	"\x05_numa\"F\n" +
+	"\x0eFileDiskConfig\x12\x17\n" +
+	"\x04size\x18\x01 \x01(\x04H\x00R\x04size\x88\x01\x01\x12\x12\n" +
+	"\x04path\x18\x02 \x01(\tR\x04pathB\a\n" +
+	"\x05_size\"\xb4\x02\n" +
+	"\vBackendSpec\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12A\n" +
+	"\x04http\x18\x02 \x01(\v2+.unbounded.storage.config.HttpBackendConfigH\x00R\x04http\x12;\n" +
+	"\x02s3\x18\x03 \x01(\v2).unbounded.storage.config.S3BackendConfigH\x00R\x02s3\x12D\n" +
+	"\x05azure\x18\x04 \x01(\v2,.unbounded.storage.config.AzureBackendConfigH\x00R\x05azure\x12A\n" +
+	"\x04fake\x18\x05 \x01(\v2+.unbounded.storage.config.FakeBackendConfigH\x00R\x04fakeB\b\n" +
+	"\x06config\"\xb1\x01\n" +
+	"\x11HttpBackendConfig\x12\x10\n" +
+	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
+	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
+	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01B\x14\n" +
+	"\x12_stripe_size_bytesB\x13\n" +
+	"\x11_http_concurrency\"\xaf\x01\n" +
+	"\x0fS3BackendConfig\x12\x10\n" +
+	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
+	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
+	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01B\x14\n" +
+	"\x12_stripe_size_bytesB\x13\n" +
+	"\x11_http_concurrency\"\xb2\x01\n" +
+	"\x12AzureBackendConfig\x12\x10\n" +
+	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
+	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
+	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01B\x14\n" +
+	"\x12_stripe_size_bytesB\x13\n" +
+	"\x11_http_concurrency\"\xa1\x01\n" +
+	"\x11FakeBackendConfig\x12/\n" +
+	"\x11stripe_size_bytes\x18\x01 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12/\n" +
+	"\x11object_size_bytes\x18\x02 \x01(\x04H\x01R\x0fobjectSizeBytes\x88\x01\x01B\x14\n" +
+	"\x12_stripe_size_bytesB\x14\n" +
+	"\x12_object_size_bytes\"\x93\x02\n" +
+	"\fFrontendSpec\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
+	"\x06source\x18\x02 \x01(\tR\x06source\x12B\n" +
+	"\x04http\x18\x03 \x01(\v2,.unbounded.storage.config.HttpFrontendConfigH\x00R\x04http\x12<\n" +
+	"\x02s3\x18\x04 \x01(\v2*.unbounded.storage.config.S3FrontendConfigH\x00R\x02s3\x12K\n" +
+	"\aloadgen\x18\x05 \x01(\v2/.unbounded.storage.config.LoadgenFrontendConfigH\x00R\aloadgenB\b\n" +
+	"\x06config\"(\n" +
+	"\x12HttpFrontendConfig\x12\x12\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"&\n" +
+	"\x10S3FrontendConfig\x12\x12\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"\xe8\x01\n" +
+	"\x15LoadgenFrontendConfig\x12\x1d\n" +
+	"\aworkers\x18\x01 \x01(\rH\x00R\aworkers\x88\x01\x01\x12\x17\n" +
+	"\x04seed\x18\x02 \x01(\x04H\x01R\x04seed\x88\x01\x01\x12&\n" +
+	"\fobject_count\x18\x03 \x01(\x04H\x02R\vobjectCount\x88\x01\x01\x12\"\n" +
+	"\n" +
+	"read_bytes\x18\x04 \x01(\x04H\x03R\treadBytes\x88\x01\x01\x12\x16\n" +
+	"\x06verify\x18\x05 \x01(\bR\x06verifyB\n" +
+	"\n" +
+	"\b_workersB\a\n" +
+	"\x05_seedB\x0f\n" +
+	"\r_object_countB\r\n" +
+	"\v_read_bytesB@Z>github.com/Azure/unbounded/api/unbounded-storage;storageconfigb\x06proto3"
 
 var (
 	file_config_proto_rawDescOnce sync.Once
@@ -1281,47 +2164,70 @@ func file_config_proto_rawDescGZIP() []byte {
 	return file_config_proto_rawDescData
 }
 
-var file_config_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_config_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_config_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
 var file_config_proto_goTypes = []any{
-	(DiskKind)(0),         // 0: unbounded.storage.config.DiskKind
-	(BackendKind)(0),      // 1: unbounded.storage.config.BackendKind
-	(FrontendKind)(0),     // 2: unbounded.storage.config.FrontendKind
-	(*Config)(nil),        // 3: unbounded.storage.config.Config
-	(*StartupCfg)(nil),    // 4: unbounded.storage.config.StartupCfg
-	(*MetricsCfg)(nil),    // 5: unbounded.storage.config.MetricsCfg
-	(*MemoryCfg)(nil),     // 6: unbounded.storage.config.MemoryCfg
-	(*FabricCfg)(nil),     // 7: unbounded.storage.config.FabricCfg
-	(*TopologyCfg)(nil),   // 8: unbounded.storage.config.TopologyCfg
-	(*P2PCfg)(nil),        // 9: unbounded.storage.config.P2pCfg
-	(*RoutingPlan)(nil),   // 10: unbounded.storage.config.RoutingPlan
-	(*FabricAddress)(nil), // 11: unbounded.storage.config.FabricAddress
-	(*PeerSpec)(nil),      // 12: unbounded.storage.config.PeerSpec
-	(*DiskSpec)(nil),      // 13: unbounded.storage.config.DiskSpec
-	(*BackendSpec)(nil),   // 14: unbounded.storage.config.BackendSpec
-	(*FrontendSpec)(nil),  // 15: unbounded.storage.config.FrontendSpec
+	(*Config)(nil),                // 0: unbounded.storage.config.Config
+	(*StartupCfg)(nil),            // 1: unbounded.storage.config.StartupCfg
+	(*MetricsCfg)(nil),            // 2: unbounded.storage.config.MetricsCfg
+	(*MemoryCfg)(nil),             // 3: unbounded.storage.config.MemoryCfg
+	(*FabricCfg)(nil),             // 4: unbounded.storage.config.FabricCfg
+	(*TcpFabricBinds)(nil),        // 5: unbounded.storage.config.TcpFabricBinds
+	(*RdmaFabricBinds)(nil),       // 6: unbounded.storage.config.RdmaFabricBinds
+	(*AutoRdmaFabricBinds)(nil),   // 7: unbounded.storage.config.AutoRdmaFabricBinds
+	(*RdmaFabricBind)(nil),        // 8: unbounded.storage.config.RdmaFabricBind
+	(*TopologyCfg)(nil),           // 9: unbounded.storage.config.TopologyCfg
+	(*NeighborhoodSpec)(nil),      // 10: unbounded.storage.config.NeighborhoodSpec
+	(*RoutingPlan)(nil),           // 11: unbounded.storage.config.RoutingPlan
+	(*PeerSpec)(nil),              // 12: unbounded.storage.config.PeerSpec
+	(*TcpPeerConfig)(nil),         // 13: unbounded.storage.config.TcpPeerConfig
+	(*RdmaPeerConfig)(nil),        // 14: unbounded.storage.config.RdmaPeerConfig
+	(*CacheSpec)(nil),             // 15: unbounded.storage.config.CacheSpec
+	(*DiskSpec)(nil),              // 16: unbounded.storage.config.DiskSpec
+	(*BlockDiskConfig)(nil),       // 17: unbounded.storage.config.BlockDiskConfig
+	(*FileDiskConfig)(nil),        // 18: unbounded.storage.config.FileDiskConfig
+	(*BackendSpec)(nil),           // 19: unbounded.storage.config.BackendSpec
+	(*HttpBackendConfig)(nil),     // 20: unbounded.storage.config.HttpBackendConfig
+	(*S3BackendConfig)(nil),       // 21: unbounded.storage.config.S3BackendConfig
+	(*AzureBackendConfig)(nil),    // 22: unbounded.storage.config.AzureBackendConfig
+	(*FakeBackendConfig)(nil),     // 23: unbounded.storage.config.FakeBackendConfig
+	(*FrontendSpec)(nil),          // 24: unbounded.storage.config.FrontendSpec
+	(*HttpFrontendConfig)(nil),    // 25: unbounded.storage.config.HttpFrontendConfig
+	(*S3FrontendConfig)(nil),      // 26: unbounded.storage.config.S3FrontendConfig
+	(*LoadgenFrontendConfig)(nil), // 27: unbounded.storage.config.LoadgenFrontendConfig
 }
 var file_config_proto_depIdxs = []int32{
-	9,  // 0: unbounded.storage.config.Config.p2p:type_name -> unbounded.storage.config.P2pCfg
-	12, // 1: unbounded.storage.config.Config.peers:type_name -> unbounded.storage.config.PeerSpec
-	13, // 2: unbounded.storage.config.Config.disks:type_name -> unbounded.storage.config.DiskSpec
-	14, // 3: unbounded.storage.config.Config.backends:type_name -> unbounded.storage.config.BackendSpec
-	15, // 4: unbounded.storage.config.Config.frontends:type_name -> unbounded.storage.config.FrontendSpec
-	4,  // 5: unbounded.storage.config.Config.startup:type_name -> unbounded.storage.config.StartupCfg
-	6,  // 6: unbounded.storage.config.StartupCfg.memory:type_name -> unbounded.storage.config.MemoryCfg
-	7,  // 7: unbounded.storage.config.StartupCfg.fabric:type_name -> unbounded.storage.config.FabricCfg
-	8,  // 8: unbounded.storage.config.StartupCfg.topology:type_name -> unbounded.storage.config.TopologyCfg
-	5,  // 9: unbounded.storage.config.StartupCfg.metrics:type_name -> unbounded.storage.config.MetricsCfg
-	10, // 10: unbounded.storage.config.P2pCfg.routing_plan:type_name -> unbounded.storage.config.RoutingPlan
-	11, // 11: unbounded.storage.config.PeerSpec.address:type_name -> unbounded.storage.config.FabricAddress
-	0,  // 12: unbounded.storage.config.DiskSpec.kind:type_name -> unbounded.storage.config.DiskKind
-	1,  // 13: unbounded.storage.config.BackendSpec.kind:type_name -> unbounded.storage.config.BackendKind
-	2,  // 14: unbounded.storage.config.FrontendSpec.kind:type_name -> unbounded.storage.config.FrontendKind
-	15, // [15:15] is the sub-list for method output_type
-	15, // [15:15] is the sub-list for method input_type
-	15, // [15:15] is the sub-list for extension type_name
-	15, // [15:15] is the sub-list for extension extendee
-	0,  // [0:15] is the sub-list for field type_name
+	1,  // 0: unbounded.storage.config.Config.startup:type_name -> unbounded.storage.config.StartupCfg
+	24, // 1: unbounded.storage.config.Config.frontends:type_name -> unbounded.storage.config.FrontendSpec
+	19, // 2: unbounded.storage.config.Config.backends:type_name -> unbounded.storage.config.BackendSpec
+	15, // 3: unbounded.storage.config.Config.caches:type_name -> unbounded.storage.config.CacheSpec
+	10, // 4: unbounded.storage.config.Config.neighborhoods:type_name -> unbounded.storage.config.NeighborhoodSpec
+	3,  // 5: unbounded.storage.config.StartupCfg.memory:type_name -> unbounded.storage.config.MemoryCfg
+	4,  // 6: unbounded.storage.config.StartupCfg.fabric:type_name -> unbounded.storage.config.FabricCfg
+	9,  // 7: unbounded.storage.config.StartupCfg.topology:type_name -> unbounded.storage.config.TopologyCfg
+	2,  // 8: unbounded.storage.config.StartupCfg.metrics:type_name -> unbounded.storage.config.MetricsCfg
+	5,  // 9: unbounded.storage.config.FabricCfg.tcp:type_name -> unbounded.storage.config.TcpFabricBinds
+	6,  // 10: unbounded.storage.config.FabricCfg.rdma:type_name -> unbounded.storage.config.RdmaFabricBinds
+	7,  // 11: unbounded.storage.config.FabricCfg.auto_rdma:type_name -> unbounded.storage.config.AutoRdmaFabricBinds
+	8,  // 12: unbounded.storage.config.RdmaFabricBinds.binds:type_name -> unbounded.storage.config.RdmaFabricBind
+	11, // 13: unbounded.storage.config.NeighborhoodSpec.routing_plan:type_name -> unbounded.storage.config.RoutingPlan
+	12, // 14: unbounded.storage.config.NeighborhoodSpec.peers:type_name -> unbounded.storage.config.PeerSpec
+	13, // 15: unbounded.storage.config.PeerSpec.tcp:type_name -> unbounded.storage.config.TcpPeerConfig
+	14, // 16: unbounded.storage.config.PeerSpec.rdma:type_name -> unbounded.storage.config.RdmaPeerConfig
+	16, // 17: unbounded.storage.config.CacheSpec.disks:type_name -> unbounded.storage.config.DiskSpec
+	17, // 18: unbounded.storage.config.DiskSpec.block:type_name -> unbounded.storage.config.BlockDiskConfig
+	18, // 19: unbounded.storage.config.DiskSpec.file:type_name -> unbounded.storage.config.FileDiskConfig
+	20, // 20: unbounded.storage.config.BackendSpec.http:type_name -> unbounded.storage.config.HttpBackendConfig
+	21, // 21: unbounded.storage.config.BackendSpec.s3:type_name -> unbounded.storage.config.S3BackendConfig
+	22, // 22: unbounded.storage.config.BackendSpec.azure:type_name -> unbounded.storage.config.AzureBackendConfig
+	23, // 23: unbounded.storage.config.BackendSpec.fake:type_name -> unbounded.storage.config.FakeBackendConfig
+	25, // 24: unbounded.storage.config.FrontendSpec.http:type_name -> unbounded.storage.config.HttpFrontendConfig
+	26, // 25: unbounded.storage.config.FrontendSpec.s3:type_name -> unbounded.storage.config.S3FrontendConfig
+	27, // 26: unbounded.storage.config.FrontendSpec.loadgen:type_name -> unbounded.storage.config.LoadgenFrontendConfig
+	27, // [27:27] is the sub-list for method output_type
+	27, // [27:27] is the sub-list for method input_type
+	27, // [27:27] is the sub-list for extension type_name
+	27, // [27:27] is the sub-list for extension extendee
+	0,  // [0:27] is the sub-list for field type_name
 }
 
 func init() { file_config_proto_init() }
@@ -1329,24 +2235,54 @@ func file_config_proto_init() {
 	if File_config_proto != nil {
 		return
 	}
-	file_config_proto_msgTypes[6].OneofWrappers = []any{}
+	file_config_proto_msgTypes[3].OneofWrappers = []any{}
+	file_config_proto_msgTypes[4].OneofWrappers = []any{
+		(*FabricCfg_Tcp)(nil),
+		(*FabricCfg_Rdma)(nil),
+		(*FabricCfg_AutoRdma)(nil),
+	}
 	file_config_proto_msgTypes[7].OneofWrappers = []any{}
 	file_config_proto_msgTypes[9].OneofWrappers = []any{}
 	file_config_proto_msgTypes[10].OneofWrappers = []any{}
 	file_config_proto_msgTypes[11].OneofWrappers = []any{}
+	file_config_proto_msgTypes[12].OneofWrappers = []any{
+		(*PeerSpec_Tcp)(nil),
+		(*PeerSpec_Rdma)(nil),
+	}
+	file_config_proto_msgTypes[16].OneofWrappers = []any{
+		(*DiskSpec_Block)(nil),
+		(*DiskSpec_File)(nil),
+	}
+	file_config_proto_msgTypes[17].OneofWrappers = []any{}
+	file_config_proto_msgTypes[18].OneofWrappers = []any{}
+	file_config_proto_msgTypes[19].OneofWrappers = []any{
+		(*BackendSpec_Http)(nil),
+		(*BackendSpec_S3)(nil),
+		(*BackendSpec_Azure)(nil),
+		(*BackendSpec_Fake)(nil),
+	}
+	file_config_proto_msgTypes[20].OneofWrappers = []any{}
+	file_config_proto_msgTypes[21].OneofWrappers = []any{}
+	file_config_proto_msgTypes[22].OneofWrappers = []any{}
+	file_config_proto_msgTypes[23].OneofWrappers = []any{}
+	file_config_proto_msgTypes[24].OneofWrappers = []any{
+		(*FrontendSpec_Http)(nil),
+		(*FrontendSpec_S3)(nil),
+		(*FrontendSpec_Loadgen)(nil),
+	}
+	file_config_proto_msgTypes[27].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_config_proto_rawDesc), len(file_config_proto_rawDesc)),
-			NumEnums:      3,
-			NumMessages:   13,
+			NumEnums:      0,
+			NumMessages:   28,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_config_proto_goTypes,
 		DependencyIndexes: file_config_proto_depIdxs,
-		EnumInfos:         file_config_proto_enumTypes,
 		MessageInfos:      file_config_proto_msgTypes,
 	}.Build()
 	File_config_proto = out.File

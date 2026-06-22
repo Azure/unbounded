@@ -6,9 +6,8 @@
 //!
 //! # Why this does not touch the shard `Pool`
 //!
-//! [`crate::fabric::rpc`] drives each in-flight request on a
-//! dedicated auxiliary OS thread (`runtime.spawn_pinned` ->
-//! `run_worker`), so the [`Handler`] trait requires
+//! [`crate::fabric::rpc`] drives requests on a fixed worker pool,
+//! so the [`Handler`] trait requires
 //! `Send + Sync + 'static`. The per-shard
 //! [`crate::bufferpool::Pool`] is `Rc`-based and `!Send`: it lives
 //! on, and may only be touched from, its own shard thread. Reaching
@@ -20,9 +19,9 @@
 //! touch. The scratch backing is registered as its own fabric MR (used
 //! as the `local_mr` source for `fi_write`) and as a `BlockStore`
 //! extra buffer (so the disk io_uring path can DMA into it). A tiny
-//! free list behind a [`Mutex`] hands out one scratch page per
-//! in-flight request; the page is reclaimed when the response stream
-//! drops, after the RPC layer has finished `fi_write`ing it to the
+//! free stack hands out one scratch page per in-flight request; the
+//! page is reclaimed when the response stream drops, after the RPC
+//! layer has finished `fi_write`ing it to the
 //! peer (the worker blocks on the write completion before re-polling
 //! the stream).
 //!
@@ -39,13 +38,14 @@
 //! resident on this node.
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::bufferpool::{BlockStore, BulkRef, PageRef, Req, StripeKey};
+use crate::bufferpool::{BlockStore, BulkRef, PageRef, Req};
 use crate::memory::Backing;
 
 use super::handler::{Handler, HandlerStream};
+use super::scratch::ScratchBacking;
 
 /// Error surfaced by [`PoolHandler`]'s response stream.
 #[derive(Debug)]
@@ -99,25 +99,22 @@ impl<S: BlockStore + Send + Sync + 'static> PoolHandler<S> {
     /// will hand out concurrently; it must be `<= scratch.page_count`.
     pub fn new(store: Arc<S>, scratch: Backing, scratch_pages: u32) -> Self {
         let usable = scratch_pages.min(scratch.page_count as u32);
-        let free: Vec<u32> = (0..usable).collect();
+
         Self {
             store,
-            scratch: Arc::new(ScratchBacking {
-                _backing: scratch,
-                free: Mutex::new(free),
-            }),
+            scratch: Arc::new(ScratchBacking::new(scratch, usable)),
         }
     }
 }
 
 impl<R, S> Handler<R> for PoolHandler<S>
 where
-    R: Req,
+    R: Req + Sync,
     S: BlockStore + Send + Sync + 'static,
 {
     type Error = PoolHandlerError;
     type Stream<'a>
-        = PoolHandlerStream<S>
+        = PoolHandlerStream<'a, R, S>
     where
         Self: 'a,
         R: 'a;
@@ -126,33 +123,11 @@ where
         PoolHandlerStream {
             store: self.store.clone(),
             scratch: self.scratch.clone(),
-            key: req.key(),
+            req,
             src,
             state: StreamState::Pending,
             page_idx: None,
         }
-    }
-}
-
-/// Scratch backing plus its free list of available page indices.
-/// Reads and writes to the underlying pages only ever happen from
-/// RPC worker threads; the free list is the only shared mutable
-/// state, guarded by a `Mutex`.
-struct ScratchBacking {
-    _backing: Backing,
-    free: Mutex<Vec<u32>>,
-}
-
-impl ScratchBacking {
-    fn take(&self) -> Option<u32> {
-        self.free.lock().expect("scratch free list poisoned").pop()
-    }
-
-    fn give(&self, idx: u32) {
-        self.free
-            .lock()
-            .expect("scratch free list poisoned")
-            .push(idx);
     }
 }
 
@@ -168,19 +143,19 @@ enum StreamState {
 
 /// Response stream for one request. Yields exactly one page on a
 /// local hit, then ends; on a miss or error it yields the error then
-/// ends. The scratch page (if any) is returned to the free list on
+/// ends. The scratch page (if any) is returned to the allocator on
 /// drop, which happens after the RPC layer has finished `fi_write`ing
 /// it to the peer.
-pub struct PoolHandlerStream<S: BlockStore + Send + Sync + 'static> {
+pub struct PoolHandlerStream<'a, R: Req, S: BlockStore + Send + Sync + 'static> {
     store: Arc<S>,
     scratch: Arc<ScratchBacking>,
-    key: StripeKey,
+    req: &'a R,
     src: BulkRef,
     state: StreamState,
     page_idx: Option<u32>,
 }
 
-impl<S: BlockStore + Send + Sync + 'static> HandlerStream for PoolHandlerStream<S> {
+impl<R: Req, S: BlockStore + Send + Sync + 'static> HandlerStream for PoolHandlerStream<'_, R, S> {
     type Error = PoolHandlerError;
 
     fn poll_next(
@@ -209,17 +184,20 @@ impl<S: BlockStore + Send + Sync + 'static> HandlerStream for PoolHandlerStream<
     }
 }
 
-impl<S: BlockStore + Send + Sync + 'static> PoolHandlerStream<S> {
+impl<R: Req, S: BlockStore + Send + Sync + 'static> PoolHandlerStream<'_, R, S> {
     /// Reserve a scratch page, fill it from the local store, and turn
     /// it into a `PageRef`. The `BlockStore::read_page` future is
     /// created and driven to completion entirely within this call so
     /// the stream itself holds no future and is trivially `Send`.
-    /// Blocking here is acceptable: each request has its own RPC
-    /// worker thread (see [`crate::fabric::rpc`]) and disk progress
+    /// Blocking here is acceptable: the RPC worker pool is separate
+    /// from shard threads (see [`crate::fabric::rpc`]) and disk progress
     /// runs concurrently on the per-disk io_uring threads.
     fn serve_local_page(&mut self) -> Result<PageRef, PoolHandlerError> {
-        let page_size = self.scratch._backing.page_size;
-        let idx = self.scratch.take().ok_or(PoolHandlerError::NoScratchPage)?;
+        let page_size = self.scratch.page_size();
+        let idx = self
+            .scratch
+            .take_zeroed()
+            .ok_or(PoolHandlerError::NoScratchPage)?;
         self.page_idx = Some(idx);
 
         let dst = PageRef {
@@ -228,7 +206,7 @@ impl<S: BlockStore + Send + Sync + 'static> PoolHandlerStream<S> {
             len: page_size as u32,
         };
 
-        let hit = block_on_local(self.store.read_page(self.key, self.src.offset, dst))
+        let hit = block_on_local(self.store.read_page(self.req, self.src.offset, dst))
             .map_err(PoolHandlerError::BlockStore)?;
         if !hit {
             return Err(PoolHandlerError::NotResident);
@@ -246,7 +224,7 @@ impl<S: BlockStore + Send + Sync + 'static> PoolHandlerStream<S> {
     }
 }
 
-impl<S: BlockStore + Send + Sync + 'static> Drop for PoolHandlerStream<S> {
+impl<R: Req, S: BlockStore + Send + Sync + 'static> Drop for PoolHandlerStream<'_, R, S> {
     fn drop(&mut self) {
         if let Some(idx) = self.page_idx.take() {
             self.scratch.give(idx);
@@ -267,7 +245,7 @@ fn block_on_local<F: std::future::Future>(fut: F) -> F::Output {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bufferpool::Error;
+    use crate::bufferpool::{Error, StripeKey};
     use crate::runtime::noop_waker;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -295,12 +273,13 @@ mod tests {
             Ok(())
         }
 
-        async fn read_page(
+        async fn read_page<R: Req + ?Sized>(
             &self,
-            key: StripeKey,
+            req: &R,
             _stripe_off: u64,
             dst: PageRef,
         ) -> Result<bool, Error> {
+            let key = req.key();
             self.reads.fetch_add(1, Ordering::Relaxed);
             if self.poison.contains(&key.0) {
                 return Err(Error::Io(libc::EIO));
@@ -320,9 +299,9 @@ mod tests {
             }
         }
 
-        async fn write_page(
+        async fn write_page<R: Req + ?Sized>(
             &self,
-            _key: StripeKey,
+            _req: &R,
             _stripe_off: u64,
             _page: PageRef,
         ) -> Result<(), Error> {
@@ -472,7 +451,7 @@ mod tests {
 
     #[test]
     fn exhausted_scratch_pool_reports_no_scratch_page() {
-        // Hold streams open (do not drop) until the free list drains,
+        // Hold streams open (do not drop) until the scratch allocator drains,
         // then the next handle()+poll must report NoScratchPage.
         let (scratch, base) = scratch_backing();
         let key = [6u8; 32];

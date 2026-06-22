@@ -39,6 +39,7 @@ func TestReconcileRendersFile(t *testing.T) {
 
 	cfg := decodeFile(t, dest)
 	assert.Equal(t, uint64(5), cfg.Version)
+	assert.NotNil(t, cfg.GetStartup().GetFabric().MaxInflight)
 	assert.Equal(t, uint32(2048), cfg.GetStartup().GetFabric().GetMaxInflight())
 }
 

@@ -18,9 +18,9 @@
 //! entirely in place via [`ProcessApplyTarget::apply_in_place`]:
 //! routing is republished to every shard (blocking until each acks via
 //! the control group), each shard reconciles its own backend/frontend
-//! registries from the broadcast config, and disks are reconciled in
-//! place against the shared channel directory. No shard restart is ever
-//! required for a config change.
+//! registries from the broadcast config, and projected cache disks are
+//! reconciled in place against the shared channel directory. No shard
+//! restart is ever required for a config change.
 //!
 //! [`ConfigController`]: crate::config::ConfigController
 //! [`ConfigApplyTarget`]: crate::config::ConfigApplyTarget
@@ -34,10 +34,10 @@ use unbounded_storage::config::{
     self, ApplyError, Config, ConfigApplyTarget, ConfigDiff, ShardControlGroup,
 };
 use unbounded_storage::fabric::PeerId;
-use unbounded_storage::p2p::RoutingSnapshot;
+use unbounded_storage::p2p::RouteTableHandle;
 use unbounded_storage::runtime::{JoinHandle, Threading, WorkerIdx};
 use unbounded_storage::storage::StripeReq;
-use unbounded_storage::storage::disks::{DiskChannelDirectory, DiskRegistry, UringDiskTarget};
+use unbounded_storage::storage::disks::{CacheDirectorySet, DiskRegistrySet, UringDiskTarget};
 use unbounded_storage::topology::ServingShard;
 
 use crate::StartupSettings;
@@ -56,9 +56,9 @@ pub struct ShardSpawnDeps {
     /// allocator kind, total memory pool) sourced from CLI flags / env
     /// vars. Shared and not reloadable.
     pub settings: Arc<StartupSettings>,
-    /// Live disk-channel directory every shard reads through. Shared and
-    /// reconciled in place, never rebuilt per layer.
-    pub disk_channels: Arc<DiskChannelDirectory>,
+    /// Live per-cache disk-channel directories every shard reads through.
+    /// Shared and reconciled in place, never rebuilt per layer.
+    pub cache_directories: Arc<CacheDirectorySet>,
     /// How serving shards map onto fabric endpoints (one endpoint per
     /// shard on the TCP path, one per HCA device on verbs). Built once at
     /// startup and realized into the layer's [`FabricGroup`].
@@ -125,14 +125,15 @@ pub fn spawn_shard_layer(
     } else {
         settings.memory_total_bytes / worker_count
     };
+    let projection = config::runtime_projection(config)
+        .map_err(|e| vec![format!("config projection failed: {e}")])?;
     let frontend_specs = Arc::new(config.frontends.clone());
+    let frontend_bindings = Arc::new(projection.frontends.clone());
     let backend_specs = Arc::new(config.backends.clone());
-    let (fingers, node_to_peer) = crate::build_routing(config);
-    // The local node's own peer identity, sent as connection-manager
-    // private data on every outbound dial so the accepting peer keys the
-    // inbound connection correctly. Falls back to 0 when unset (single
-    // node, no peers configured), matching `build_routing`.
-    let self_peer = PeerId(config.p2p().local_node_id.unwrap_or(0));
+    let routes = crate::build_routes(config);
+    let runtime_peers = config::runtime_peers(&projection);
+    let self_peer = local_self_peer(&projection)
+        .map_err(|e| vec![format!("unsupported fabric identity config: {e}")])?;
 
     // Bring up the shared fabric endpoints before spawning any shards:
     // each shard registers its data backing against the endpoint it maps
@@ -144,10 +145,9 @@ pub fn spawn_shard_layer(
         settings.backing_kind,
         &settings.fabric,
         &config.backends,
-        deps.disk_channels.clone(),
-        &fingers,
-        &node_to_peer,
-        &config.peers,
+        deps.cache_directories.clone(),
+        &routes,
+        &runtime_peers,
         self_peer,
     )?;
 
@@ -177,10 +177,10 @@ pub fn spawn_shard_layer(
         let fabric = fabric_group.fabric_for_shard(i);
         let tx = ready_tx.clone();
         let backing_kind = settings.backing_kind;
-        let disk_channels = deps.disk_channels.clone();
-        let fingers = fingers.clone();
-        let node_to_peer = node_to_peer.clone();
+        let cache_directories = deps.cache_directories.clone();
+        let route_handle = RouteTableHandle::from_snapshot(routes.clone());
         let frontend_specs = frontend_specs.clone();
+        let frontend_bindings = frontend_bindings.clone();
         let backend_specs = backend_specs.clone();
         let layer_stop = layer_stop.clone();
         let rt = deps.runtime.clone();
@@ -197,10 +197,10 @@ pub fn spawn_shard_layer(
                         tx,
                         backing_kind,
                         bytes_per_shard,
-                        disk_channels,
-                        fingers,
-                        node_to_peer,
+                        cache_directories,
+                        route_handle,
                         frontend_specs,
+                        frontend_bindings,
                         backend_specs,
                         ctrl_rx,
                         peer_rx,
@@ -340,6 +340,33 @@ pub fn spawn_shard_layer(
     })
 }
 
+fn local_self_peer(projection: &config::RuntimeGraph) -> Result<PeerId, String> {
+    let mut local_ids: Vec<(&str, u64)> = projection
+        .neighborhoods
+        .values()
+        .filter_map(|n| n.p2p.local_node_id.map(|id| (n.id.as_str(), id)))
+        .collect();
+    local_ids.sort_by_key(|(neighborhood_id, _)| *neighborhood_id);
+
+    if let Some((_, self_peer)) = local_ids.first()
+        && local_ids.iter().any(|(_, node_id)| node_id != self_peer)
+    {
+        let configured = local_ids
+            .iter()
+            .map(|(neighborhood_id, node_id)| format!("{neighborhood_id}:{node_id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "neighborhoods declare different local_node_id values, but the storage fabric uses one process-wide peer id ({configured})"
+        ));
+    }
+
+    Ok(local_ids
+        .first()
+        .map(|(_, node_id)| PeerId(*node_id))
+        .unwrap_or(PeerId(0)))
+}
+
 /// Retire a shard layer: signal its shards to exit, then join every
 /// thread in reverse spawn order so teardown mirrors bring-up.
 pub fn teardown_shard_layer(layer: ShardLayer) {
@@ -383,64 +410,55 @@ pub struct ProcessApplyTarget {
     /// `Option` so the layer can be moved out at shutdown via
     /// [`Self::into_parts`]. Always `Some` while the process is serving.
     layer: Option<ShardLayer>,
-    disk_registry: DiskRegistry<UringDiskTarget>,
-    disk_channels: Arc<DiskChannelDirectory>,
+    disk_registry: DiskRegistrySet<UringDiskTarget>,
+    cache_directories: Arc<CacheDirectorySet>,
 }
 
 impl ProcessApplyTarget {
     pub fn new(
         layer: ShardLayer,
-        disk_registry: DiskRegistry<UringDiskTarget>,
-        disk_channels: Arc<DiskChannelDirectory>,
+        disk_registry: DiskRegistrySet<UringDiskTarget>,
+        cache_directories: Arc<CacheDirectorySet>,
     ) -> Self {
         Self {
             layer: Some(layer),
             disk_registry,
-            disk_channels,
+            cache_directories,
         }
     }
 
-    /// Reconcile disks in place against `config` and republish the
+    /// Reconcile projected cache disks in place and republish the
     /// resulting channel set to the live directory (idempotent when the
     /// disk set is unchanged).
-    fn reconcile_disks(&mut self, config: &Config) {
-        let report = self.disk_registry.reconcile(&config.disks);
-        eprintln!(
-            "config: disks: added={} removed={} failures={}",
-            report.added,
-            report.removed,
-            report.failures.len(),
-        );
-        for (path, msg) in &report.failures {
-            eprintln!("disk {}: open failed: {msg}", path.display());
-        }
-        self.disk_channels
-            .apply_channels(self.disk_registry.channels_snapshot());
+    fn reconcile_disks(&mut self, projection: &config::RuntimeGraph) {
+        crate::reconcile_cache_disks(&mut self.disk_registry, &self.cache_directories, projection);
     }
 
     /// Consume the target at shutdown, returning the live layer (if any)
     /// and the disk registry so the caller can tear them down in the
     /// correct order (shards first, then disks).
-    pub fn into_parts(self) -> (Option<ShardLayer>, DiskRegistry<UringDiskTarget>) {
+    pub fn into_parts(self) -> (Option<ShardLayer>, DiskRegistrySet<UringDiskTarget>) {
         (self.layer, self.disk_registry)
     }
 }
 
 impl ConfigApplyTarget for ProcessApplyTarget {
     fn apply_in_place(&mut self, new: &Arc<Config>, diff: &ConfigDiff) -> Result<(), ApplyError> {
-        // The shards must see a new config whenever their routing surface
-        // or their per-shard backend/frontend registries need to change.
-        // A disks-only change is absorbed entirely in `reconcile_disks`
-        // below (shared channel directory), so it needs no broadcast.
-        let needs_broadcast =
-            diff.requires_routing_reload() || diff.backends_changed || diff.frontends_changed;
+        let projection = config::runtime_projection(new)
+            .map_err(|e| ApplyError::Target(format!("config projection failed: {e}")))?;
+
+        // The shards must see a new config whenever their routing surface,
+        // graph projection, or per-shard backend/frontend registries need
+        // to change. Pure projected-disk changes are absorbed by
+        // `reconcile_disks` below, but cache graph changes can also alter
+        // frontend backend/bypass resolution, so they are broadcast.
+        let needs_broadcast = diff.requires_routing_reload()
+            || diff.caches_changed
+            || diff.backends_changed
+            || diff.frontends_changed;
 
         if needs_broadcast {
-            let (fingers, node_to_peer) = crate::build_routing(new);
-            let snapshot = RoutingSnapshot {
-                fingers,
-                node_to_peer,
-            };
+            let routes = crate::build_routes(new);
             let layer = self
                 .layer
                 .as_mut()
@@ -452,8 +470,9 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             // touching when the routing surface (p2p/peers) changed; a
             // backend/frontend-only change leaves them untouched.
             if diff.requires_routing_reload() {
-                layer.fabric_group.reload_routing(&snapshot);
-                layer.fabric_group.reconcile_peers(&new.peers);
+                layer.fabric_group.reload_routes(&routes);
+                let runtime_peers = config::runtime_peers(&projection);
+                layer.fabric_group.reconcile_peers(&runtime_peers);
             }
 
             // The RPC-side backend registries also live on the shared
@@ -468,13 +487,80 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             // each has acked, so the apply (routing surface and the
             // per-shard backend/frontend reconcile each shard performs on
             // receipt) has provably landed everywhere before we return.
-            layer.control.broadcast_apply(new.clone(), snapshot)?;
+            layer.control.broadcast_apply(new.clone(), routes)?;
         }
 
-        if diff.disks_changed {
-            self.reconcile_disks(new);
+        if diff.caches_changed {
+            self.reconcile_disks(&projection);
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn graph_with_local_ids(ids: &[(&str, Option<u64>)]) -> config::RuntimeGraph {
+        let neighborhoods = ids
+            .iter()
+            .map(|(id, local_node_id)| {
+                (
+                    (*id).to_string(),
+                    config::RuntimeNeighborhood {
+                        id: (*id).to_string(),
+                        backend_id: "backend".to_string(),
+                        p2p: config::RuntimeP2p {
+                            fingers_per_node: 100,
+                            local_node_id: *local_node_id,
+                            local_tags: Vec::new(),
+                            routing_plan: None,
+                        },
+                        peers: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+
+        config::RuntimeGraph {
+            caches: HashMap::new(),
+            neighborhoods,
+            frontends: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn local_self_peer_is_zero_without_local_node_id() {
+        let graph = graph_with_local_ids(&[("n-a", None), ("n-b", None)]);
+
+        assert_eq!(local_self_peer(&graph).unwrap(), PeerId(0));
+    }
+
+    #[test]
+    fn local_self_peer_uses_raw_node_id() {
+        let graph = graph_with_local_ids(&[("n-a", None), ("n-b", Some(7))]);
+
+        assert_eq!(local_self_peer(&graph).unwrap(), PeerId(7));
+    }
+
+    #[test]
+    fn local_self_peer_accepts_repeated_local_node_id() {
+        let graph = graph_with_local_ids(&[("n-b", Some(7)), ("n-a", Some(7))]);
+
+        assert_eq!(local_self_peer(&graph).unwrap(), PeerId(7));
+    }
+
+    #[test]
+    fn local_self_peer_rejects_different_local_node_ids() {
+        let graph = graph_with_local_ids(&[("n-b", Some(2)), ("n-a", Some(1))]);
+
+        let err = local_self_peer(&graph).unwrap_err();
+
+        assert!(err.contains("different local_node_id values"), "{err}");
+        assert!(err.contains("n-a:1"), "{err}");
+        assert!(err.contains("n-b:2"), "{err}");
     }
 }
