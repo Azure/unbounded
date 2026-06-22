@@ -460,7 +460,7 @@ jobs:
   # part of the shippable release tarball. release.yaml DOES build and
   # push the Orca image (<registry>/orca:<tag>), but its manifests plus
   # the test-only Garage cachestore are deployed here from hack/orca via
-  # hack/orca/deploy-stable.sh.
+  # hack/orca/deploy-integration.sh.
   #
   # Origin is real Azure Blob storage; cachestore is an in-cluster
   # single-node Garage backed by a PVC. Confidential values (Azure
@@ -547,7 +547,7 @@ jobs:
           set -euo pipefail
           IMAGE="${REGISTRY,,}/orca:${TAG}"
           echo "Deploying Orca image: ${IMAGE}"
-          ./hack/orca/deploy-stable.sh \
+          ./hack/orca/deploy-integration.sh \
             --image "${IMAGE}" \
             --azure-account "${ORCA_AZURE_ACCOUNT}" \
             --azure-container "${ORCA_AZURE_CONTAINER}" \
