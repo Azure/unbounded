@@ -285,13 +285,13 @@ impl SimCluster {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unbounded_storage::p2p::TopologyLabels;
+    use unbounded_storage::p2p::TopologyTags;
 
     fn peer(node: u64, ring: u64) -> PeerEntry {
         PeerEntry {
             node: NodeId(node),
             ring: RingId(ring),
-            labels: TopologyLabels(vec!["g0".to_string()]),
+            tags: TopologyTags(vec!["g0".to_string()]),
         }
     }
 

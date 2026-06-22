@@ -308,12 +308,13 @@ impl BlockStore for DstBlockStore {
         Ok(())
     }
 
-    async fn read_page(
+    async fn read_page<R: Req + ?Sized>(
         &self,
-        key: StripeKey,
+        req: &R,
         stripe_off: u64,
         dst: PageRef,
     ) -> Result<bool, Error> {
+        let key = req.key();
         let delay = draw_delay(&self.cfg);
         let hit = self.hit_rate.get() > 0
             && with_sim(|s| s.rng.gen_ratio(self.hit_rate.get().min(100), 100));
@@ -343,9 +344,9 @@ impl BlockStore for DstBlockStore {
         Ok(true)
     }
 
-    async fn write_page(
+    async fn write_page<R: Req + ?Sized>(
         &self,
-        _key: StripeKey,
+        _req: &R,
         _stripe_off: u64,
         _page: PageRef,
     ) -> Result<(), Error> {

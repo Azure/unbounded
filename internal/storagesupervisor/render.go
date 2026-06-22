@@ -28,13 +28,14 @@ import (
 // loudly rather than silently dropping a setting. Any field left unset keeps its
 // proto3 zero value, which the daemon promotes to the documented default.
 //
-// The per-node sections (p2p.local_node_id and the discovered peer set) come
-// from ring, computed from the Kubernetes node watch. When the ring is active,
-// this node's id is injected, discovered peers are merged with any peers
-// declared in the YAML (discovered peers win on id collision), and the
-// listen_addr is overridden with the node's own routable bind. When the ring is
-// inactive (no node watch, no ring membership, or no fixed fabric port) the YAML
-// is rendered as-is, including any hand-declared p2p/peers.
+// The per-node sections (neighborhood local_node_id and discovered peer sets)
+// come from ring, computed from the Kubernetes node watch. When the ring is
+// active, this node's id is injected into every declared neighborhood,
+// discovered peers are merged with any neighborhood peers declared in the YAML
+// (discovered peers win on id collision), and startup.fabric.tcp.addr is
+// overridden with the node's own routable bind. When the ring is inactive (no
+// node watch, no ring membership, or no fixed fabric port) the YAML is rendered
+// as-is, including any hand-declared neighborhoods/peers.
 func RenderConfig(sourceDir string, ring ringState) ([]byte, error) {
 	cfg, err := loadSourceConfig(sourceDir)
 	if err != nil {
@@ -90,19 +91,28 @@ func loadSourceConfig(sourceDir string) (*storageconfig.Config, error) {
 }
 
 // applyRing overlays the per-node ring state onto a Config parsed from the
-// ConfigMap YAML. It injects this node's local id, merges the discovered peer
-// set with any peers declared in the YAML, and rebinds the fabric listen_addr
-// to the node's own routable address.
+// ConfigMap YAML. It injects this node's local id into declared neighborhoods,
+// merges the discovered peer set with each neighborhood's declared peers, and
+// rebinds the TCP fabric address to the node's own routable address.
 func applyRing(cfg *storageconfig.Config, ring ringState) {
-	// Preserve YAML-declared p2p scalars (fingers_per_node, local_labels,
-	// routing_plan); only stamp in the locally computed node id.
-	if cfg.P2P == nil {
-		cfg.P2P = &storageconfig.P2PCfg{}
+	injected := false
+
+	for _, neighborhood := range cfg.Neighborhoods {
+		if neighborhood == nil {
+			continue
+		}
+
+		injected = true
+
+		// Preserve YAML-declared neighborhood scalars (fingers_per_node,
+		// local_tags, routing_plan); only stamp in the locally computed node id.
+		neighborhood.LocalNodeId = proto.Uint64(ring.localNodeID)
+		neighborhood.Peers = mergePeers(neighborhood.Peers, ring.peers, ring.localNodeID)
 	}
 
-	cfg.P2P.LocalNodeId = proto.Uint64(ring.localNodeID)
-
-	cfg.Peers = mergePeers(cfg.Peers, ring.peers, ring.localNodeID)
+	if !injected {
+		slog.Warn("ring discovery active but config declares no neighborhoods; discovered storage peers were not injected")
+	}
 
 	if ring.selfListenAddr != "" {
 		if cfg.Startup == nil {
@@ -113,7 +123,9 @@ func applyRing(cfg *storageconfig.Config, ring ringState) {
 			cfg.Startup.Fabric = &storageconfig.FabricCfg{}
 		}
 
-		cfg.Startup.Fabric.ListenAddr = ring.selfListenAddr
+		cfg.Startup.Fabric.Binds = &storageconfig.FabricCfg_Tcp{
+			Tcp: &storageconfig.TcpFabricBinds{Addr: ring.selfListenAddr},
+		}
 	}
 }
 

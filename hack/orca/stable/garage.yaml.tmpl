@@ -1,0 +1,163 @@
+---
+# Integration-cluster Garage: a single-node Garage cluster used ONLY as
+# Orca's cachestore (s3 driver) on the unbounded-stable integration
+# cluster. Unlike the dev manifest (deploy/orca/dev/01-garage.yaml.tmpl)
+# this does NOT double as an origin emulator: on unbounded-stable the
+# origin is real Azure Blob storage, so the only bucket created here is
+# the cachestore bucket (orca-cache).
+#
+# This lives under hack/ on purpose: Garage is a test/integration
+# dependency, not a component we ship to customers, so it must not live
+# under deploy/.
+#
+# Bootstrap (layout assign/apply, key import, bucket create/allow) is
+# driven by hack/orca/bootstrap-garage.sh via `kubectl exec ... /garage
+# ...` after the Deployment is Ready, NOT by an in-pod hook: the Garage
+# image is a near-scratch image with only the /garage binary (no shell,
+# no coreutils). With the persistent PVC the layout/key/bucket survive
+# pod restarts, so bootstrap only needs to run at install time and is
+# idempotent.
+#
+# The S3 access/secret keys are NOT defined here. They are read from the
+# operator-provided orca-credentials Secret by the bootstrap script and
+# imported into Garage, so the Secret remains the single source of truth
+# shared by Garage and Orca.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-config
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: garage
+    app.kubernetes.io/part-of: orca-stable
+data:
+  garage.toml: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    db_engine = "sqlite"
+    replication_factor = 1
+
+    rpc_bind_addr = "[::]:3901"
+    rpc_public_addr = "127.0.0.1:3901"
+    # Single-node RPC shared secret. Garage requires it to be set, but
+    # with replication_factor=1 there is no peer RPC, so this is not a
+    # credential to anything reachable from outside the pod.
+    rpc_secret = "{{ default "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" .GarageRPCSecret }}"
+
+    [s3_api]
+    s3_region = "{{ default "us-east-1" .CachestoreRegion }}"
+    api_bind_addr = "[::]:3900"
+    root_domain = ".s3.garage"
+
+    [admin]
+    api_bind_addr = "[::]:3903"
+    admin_token = "{{ default "orca-stable-admin-token" .GarageAdminToken }}"
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: garage-data
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: garage
+    app.kubernetes.io/part-of: orca-stable
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ default "managed-csi" .GarageStorageClass | quote }}
+  resources:
+    requests:
+      storage: {{ default "100Gi" .GarageStorage | quote }}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: garage
+    app.kubernetes.io/part-of: orca-stable
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: garage
+  ports:
+    - name: s3
+      port: 3900
+      targetPort: 3900
+      protocol: TCP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: garage
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: garage
+    app.kubernetes.io/part-of: orca-stable
+spec:
+  replicas: 1
+  # Recreate: the data PVC is ReadWriteOnce, so the old pod must release
+  # it before the new one mounts it. Prevents a rolling update from
+  # deadlocking on the volume.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: garage
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: garage
+        app.kubernetes.io/part-of: orca-stable
+    spec:
+      containers:
+        - name: garage
+          image: {{ default "dxflrs/garage:v1.0.1" .GarageImage | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3900
+              name: s3
+              protocol: TCP
+            - containerPort: 3901
+              name: rpc
+              protocol: TCP
+            - containerPort: 3903
+              name: admin
+              protocol: TCP
+          resources:
+            requests:
+              cpu: {{ default "200m" .GarageCPURequest | quote }}
+              memory: {{ default "256Mi" .GarageMemoryRequest | quote }}
+            limits:
+              cpu: {{ default "2" .GarageCPULimit | quote }}
+              memory: {{ default "2Gi" .GarageMemoryLimit | quote }}
+          readinessProbe:
+            tcpSocket:
+              port: 3900
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: 3900
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/garage
+            - name: config
+              mountPath: /etc/garage.toml
+              subPath: garage.toml
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: garage-data
+        - name: config
+          configMap:
+            name: garage-config

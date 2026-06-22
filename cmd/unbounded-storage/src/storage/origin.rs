@@ -145,13 +145,28 @@ impl OriginRef {
 pub struct StripeReq {
     key: StripeKey,
     origin: Option<OriginRef>,
+    cache_id: Option<String>,
+    neighborhood_id: Option<String>,
+    /// Local-only bridge flag. Never serialized: a bypass request is
+    /// served straight from the origin on this node and never crosses
+    /// the fabric, so a request decoded from a peer is by definition
+    /// not a bypass. `#[serde(skip)]` keeps the wire format unchanged
+    /// and defaults the field to `false` on decode.
+    #[serde(skip)]
+    bypass: bool,
 }
 
 impl StripeReq {
     /// Construct a request that carries only the routing key, with no
     /// origin mapping attached.
     pub fn new(key: StripeKey) -> Self {
-        Self { key, origin: None }
+        Self {
+            key,
+            origin: None,
+            cache_id: None,
+            neighborhood_id: None,
+            bypass: false,
+        }
     }
 
     /// Attach the origin mapping the HTTP backend uses to resolve a
@@ -161,16 +176,67 @@ impl StripeReq {
         self
     }
 
+    /// Attach the cache namespace this request should read from and
+    /// write to. `None` means the request has no local cache tier and
+    /// store lookups should behave like misses.
+    pub fn with_cache_id(mut self, cache_id: Option<String>) -> Self {
+        self.cache_id = cache_id;
+        self
+    }
+
+    /// Attach the p2p neighborhood this request should route through.
+    /// `None` means the request resolves directly against its origin
+    /// backend after any local cache miss.
+    pub fn with_neighborhood_id(mut self, neighborhood_id: Option<String>) -> Self {
+        self.neighborhood_id = neighborhood_id;
+        self
+    }
+
+    /// Attach both runtime chain selectors in one step.
+    pub fn with_chain(mut self, cache_id: Option<String>, neighborhood_id: Option<String>) -> Self {
+        self.cache_id = cache_id;
+        self.neighborhood_id = neighborhood_id;
+        self
+    }
+
+    /// Mark the request to bypass the p2p cache layer (disk cache,
+    /// peer routing, and cross-shard fanout), bridging straight to the
+    /// origin backend. See [`Req::bypass`].
+    pub fn with_bypass(mut self, bypass: bool) -> Self {
+        self.bypass = bypass;
+        self
+    }
+
     /// The origin mapping, if one was attached. `None` for requests
     /// that never reach the origin tier.
     pub fn origin(&self) -> Option<&OriginRef> {
         self.origin.as_ref()
+    }
+
+    pub fn cache_id(&self) -> Option<&str> {
+        self.cache_id.as_deref()
+    }
+
+    pub fn neighborhood_id(&self) -> Option<&str> {
+        self.neighborhood_id.as_deref()
     }
 }
 
 impl Req for StripeReq {
     fn key(&self) -> StripeKey {
         self.key
+    }
+
+    fn bypass(&self) -> bool {
+        self.bypass
+    }
+
+    fn cache_id(&self) -> Option<&String> {
+        self.cache_id.as_ref()
+    }
+
+    fn neighborhood_id(&self) -> Option<&String> {
+        self.neighborhood_id.as_ref()
     }
 }
 
@@ -342,6 +408,59 @@ mod tests {
         let req = StripeReq::new(k).with_origin(origin.clone());
         assert_eq!(req.key(), k);
         assert_eq!(req.origin(), Some(&origin));
+    }
+
+    #[test]
+    fn stripe_req_bypass_defaults_false_and_is_settable() {
+        let k = OriginRef::new("primary-s3", "models/llama.bin", 12).stripe_key();
+        // New requests do not bypass the cache.
+        assert!(!StripeReq::new(k).bypass());
+        // The builder flips the flag on and preserves the key/origin.
+        let origin = OriginRef::new("primary-s3", "models/llama.bin", 12);
+        let req = StripeReq::new(k)
+            .with_origin(origin.clone())
+            .with_bypass(true);
+        assert!(req.bypass());
+        assert_eq!(req.key(), k);
+        assert_eq!(req.origin(), Some(&origin));
+        // And can be cleared again.
+        assert!(
+            !StripeReq::new(k)
+                .with_bypass(true)
+                .with_bypass(false)
+                .bypass()
+        );
+    }
+
+    #[test]
+    fn stripe_req_bypass_is_not_serialized() {
+        // `bypass` is `#[serde(skip)]`: it never crosses the fabric, so
+        // a request decoded from the wire is always non-bypass even if
+        // the local request carried the flag.
+        let origin = OriginRef::new("primary-s3", "models/llama.bin", 7);
+        let req = StripeReq::new(origin.stripe_key())
+            .with_origin(origin)
+            .with_bypass(true);
+        let bytes = bincode::serialize(&req).unwrap();
+        let back: StripeReq = bincode::deserialize(&bytes).unwrap();
+        assert!(!back.bypass());
+    }
+
+    #[test]
+    fn stripe_req_chain_context_round_trips_through_bincode() {
+        let origin = OriginRef::new("primary-s3", "models/llama.bin", 7);
+        let req = StripeReq::new(origin.stripe_key())
+            .with_origin(origin.clone())
+            .with_chain(Some("cache-a".to_string()), Some("site-a".to_string()))
+            .with_bypass(true);
+
+        let bytes = bincode::serialize(&req).unwrap();
+        let back: StripeReq = bincode::deserialize(&bytes).unwrap();
+
+        assert_eq!(back.origin(), Some(&origin));
+        assert_eq!(back.cache_id(), Some("cache-a"));
+        assert_eq!(back.neighborhood_id(), Some("site-a"));
+        assert!(!back.bypass());
     }
 
     #[test]

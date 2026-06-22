@@ -5,7 +5,7 @@
 //!
 //! `ShardLoop` owns the set of futures that run on a single shard's
 //! pinned OS thread and drives them cooperatively, mirroring the
-//! cooperative loop discipline used by `bin/bench.rs` and the disk
+//! cooperative loop discipline used by the daemon and the disk
 //! supervisor's `run_disk_thread`. The crate is runtime agnostic by
 //! design, so this does not pull in tokio or any other executor.
 //!

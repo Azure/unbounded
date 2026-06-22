@@ -37,15 +37,15 @@ const nodeInformerResync = 30 * time.Second
 // (RenderConfig): the watcher produces it, the renderer consumes it.
 type ringState struct {
 	// active is true when this node participates in a ring and the resulting
-	// peers/listen_addr should be injected into the rendered config. When
-	// false the renderer leaves the per-node sections untouched and passes the
-	// ConfigMap's listen_addr through verbatim.
+	// peers/fabric addr should be injected into the rendered config. When false
+	// the renderer leaves the per-node sections untouched and passes the
+	// ConfigMap's fabric addr through verbatim.
 	active bool
 	// localNodeID is this node's stable id (hash of its node name), written to
-	// p2p.local_node_id.
+	// neighborhoods[].local_node_id.
 	localNodeID uint64
 	// selfListenAddr is this node's own routable fabric bind, "<internalIP>:
-	// <port>", overriding the ConfigMap's listen_addr so the tcp provider
+	// <port>", overriding the ConfigMap's fabric addr so the tcp provider
 	// binds an address peers can actually dial.
 	selfListenAddr string
 	// peers is the other ring members as daemon PeerSpecs, sorted by id.
@@ -162,11 +162,11 @@ func (w *peerWatcher) signal() {
 
 // snapshot computes the current ring from the informer's node store and the
 // fabric port. A zero or unparseable port yields an inactive ring: without a
-// fixed port the daemon's listen_addr stays ephemeral and peer addresses are
+// fixed port the daemon's fabric addr stays ephemeral and peer addresses are
 // unreachable, so emitting peers would be misleading.
 func (w *peerWatcher) snapshot(port int, portOK bool) ringState {
 	if !portOK || port == 0 {
-		slog.Warn("storage ring inactive: no fixed fabric port set in startup.fabric.listen_addr; "+
+		slog.Warn("storage ring inactive: no fixed fabric port set in startup.fabric.tcp.addr; "+
 			"set a non-zero port (e.g. 0.0.0.0:9000) to enable peering", "node", w.selfName)
 
 		return ringState{}
@@ -263,8 +263,8 @@ func computeRing(nodes []*corev1.Node, selfName, ringLabel string, port int) rin
 
 		ring.peers = append(ring.peers, &storageconfig.PeerSpec{
 			Id: id,
-			Address: &storageconfig.FabricAddress{
-				Socket: net.JoinHostPort(ip, strconv.Itoa(port)),
+			Config: &storageconfig.PeerSpec_Tcp{
+				Tcp: &storageconfig.TcpPeerConfig{Addr: net.JoinHostPort(ip, strconv.Itoa(port))},
 			},
 		})
 	}
@@ -305,15 +305,15 @@ func internalIP(node *corev1.Node) string {
 	return ""
 }
 
-// parseFabricPort extracts the port from a "host:port" listen address. It
+// parseFabricPort extracts the port from a "host:port" fabric address. It
 // returns ok=false when the address is empty, malformed, or has no numeric
 // port, which the caller treats as "no fixed port" (ring inactive).
-func parseFabricPort(listenAddr string) (int, bool) {
-	if listenAddr == "" {
+func parseFabricPort(addr string) (int, bool) {
+	if addr == "" {
 		return 0, false
 	}
 
-	_, portStr, err := net.SplitHostPort(listenAddr)
+	_, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		return 0, false
 	}
