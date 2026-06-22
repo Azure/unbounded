@@ -34,6 +34,8 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
+const defaultSweepInterval = time.Minute
+
 // Options configures the cooldown ladder. Zero values pick the
 // defaults; callers should still pass an explicit value to make tests
 // deterministic.
@@ -48,6 +50,10 @@ type Options struct {
 	// Now is the clock used for cooldown comparisons. Tests override to
 	// inject a deterministic time source. Defaults to time.Now.
 	Now func() time.Time
+	// SweepInterval controls how often ordinary cache operations do a full
+	// expired-entry sweep. Zero picks the default; negative disables full
+	// opportunistic sweeps (Lookup still evicts the requested key).
+	SweepInterval time.Duration
 	// OnEnter and OnHit are optional metric callbacks. nil-safe.
 	OnEnter func(class ifaces.FailureClass)
 	OnHit   func(class ifaces.FailureClass)
@@ -67,9 +73,10 @@ type Entry struct {
 
 // Cache is the per-puller the design doc negative cache. Safe for concurrent use.
 type Cache struct {
-	opts Options
-	mu   sync.Mutex
-	m    map[digest.Digest]Entry
+	opts      Options
+	mu        sync.Mutex
+	m         map[digest.Digest]Entry
+	nextSweep time.Time
 }
 
 // New returns an empty Cache. Required options that are zero get the
@@ -91,6 +98,10 @@ func New(opts Options) *Cache {
 		opts.Now = time.Now
 	}
 
+	if opts.SweepInterval == 0 {
+		opts.SweepInterval = defaultSweepInterval
+	}
+
 	return &Cache{
 		opts: opts,
 		m:    make(map[digest.Digest]Entry),
@@ -107,6 +118,8 @@ func (c *Cache) RecordFailure(d digest.Digest, class ifaces.FailureClass) Entry 
 	defer c.mu.Unlock()
 
 	now := c.opts.Now()
+	c.sweepExpiredLocked(now)
+
 	prev := c.m[d]
 	prev.FailureCount++
 	prev.LastFailure = now
@@ -132,6 +145,8 @@ func (c *Cache) RecordSuccess(d digest.Digest) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.sweepExpiredLocked(c.opts.Now())
+
 	if _, ok := c.m[d]; !ok {
 		return
 	}
@@ -149,12 +164,15 @@ func (c *Cache) Lookup(d digest.Digest) (Entry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	now := c.opts.Now()
+	c.sweepExpiredLocked(now)
+
 	e, ok := c.m[d]
 	if !ok {
 		return Entry{}, false
 	}
 
-	if c.opts.Now().After(e.CooldownUntil) {
+	if now.After(e.CooldownUntil) {
 		// Cooldown elapsed; drop the entry so the next attempt is
 		// single-shot per the design doc "Self-healing".
 		delete(c.m, d)
@@ -173,13 +191,44 @@ func (c *Cache) Lookup(d digest.Digest) (Entry, bool) {
 	return e, true
 }
 
-// Len returns the current entry count. Used by a GaugeFunc for
-// `p2p_negative_cache_entries`. Cheap (single mutex acquisition).
+// Len returns the current entry count. Cheap (single mutex acquisition)
+// and side-effect-free: opportunistic eviction happens on the mutation
+// and lookup paths, not here, so Len stays a pure read for gauges/tests.
 func (c *Cache) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	return len(c.m)
+}
+
+func (c *Cache) sweepExpiredLocked(now time.Time) {
+	if c.opts.SweepInterval < 0 {
+		return
+	}
+
+	if !c.nextSweep.IsZero() && now.Before(c.nextSweep) {
+		return
+	}
+
+	if c.opts.SweepInterval > 0 {
+		c.nextSweep = now.Add(c.opts.SweepInterval)
+	}
+
+	removed := false
+
+	for d, e := range c.m {
+		if !now.After(e.CooldownUntil) {
+			continue
+		}
+
+		delete(c.m, d)
+
+		removed = true
+	}
+
+	if removed && c.opts.OnSize != nil {
+		c.opts.OnSize(len(c.m))
+	}
 }
 
 // cooldownFor returns the cooldown duration for the n-th consecutive
