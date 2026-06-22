@@ -206,7 +206,7 @@ REACT_DEV ?= false
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
-.PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
+.PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests unbounded-storage-supervisor-smoke-kind image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
 
 ##@ General
 
@@ -259,6 +259,7 @@ help: ## Show this help
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
 	@echo "  UNBOUNDED_STORAGE_PROFILING=1     Set on any build/push to compile in the SIGUSR1 CPU profiler"
 	@echo "  unbounded-storage-smoke          Run the end-to-end smoke test (uses sudo)"
+	@echo "  unbounded-storage-supervisor-smoke-kind  Run the storage supervisor kind smoke test"
 	@echo "  unbounded-storage-tarball        Package unbounded-storage + libfabric into a release tarball"
 	@echo "  unbounded-storage-push           Push the unbounded-storage release tarball to Azure blob storage"
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
@@ -580,6 +581,11 @@ unbounded-storage-supervisor-manifests: ## Render unbounded-storage-supervisor m
 		--set Namespace=$(UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE) \
 		--set Image=$(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE)
 	@echo "Rendered unbounded-storage-supervisor manifests into $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE))"
+
+unbounded-storage-supervisor-smoke-kind: unbounded-storage-supervisor-build unbounded-storage-tarball ## Run storage supervisor cache-miss smoke test on a dedicated kind cluster
+	SMOKE_STORAGE_SUPERVISOR_BINARY=$(CURDIR)/$(UNBOUNDED_STORAGE_SUPERVISOR_BIN) \
+	SMOKE_STORAGE_TARBALL=$(CURDIR)/$(STORAGE_TARBALL) \
+		python3 hack/smoke-storage-supervisor-kind.py
 
 ##@ Rust Binaries
 

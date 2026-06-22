@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,10 +33,13 @@ const (
 	benchmarkDiskSizeBytesAnnotation   = "unbounded-cloud.io/storage-benchmark.disk-size-bytes"
 	benchmarkWarmupOpsAnnotation       = "unbounded-cloud.io/storage-benchmark.warmup-operations"
 	benchmarkRdmaAddrAnnotation        = "unbounded-cloud.io/storage-rdma.addr"
+	benchmarkTCPAddrAnnotation         = "unbounded-cloud.io/storage-tcp.addr"
 
 	rdmaLoadgenScenario   = "rdma-loadgen"
 	rdmaCacheMissScenario = "rdma-cache-miss"
 	rdmaScenarioAlias     = "rdma"
+	tcpLoadgenScenario    = "tcp-loadgen"
+	tcpCacheMissScenario  = "tcp-cache-miss"
 
 	benchmarkComponentPrefix = "__unbounded_benchmark_"
 )
@@ -57,6 +61,7 @@ type rdmaLoadgenBenchmark struct {
 	localNodeID uint64
 	peerNodeID  uint64
 	peerAddr    string
+	peerTCP     bool
 	cacheMiss   bool
 
 	workers     *uint32
@@ -74,7 +79,7 @@ type rdmaLoadgenBenchmark struct {
 
 // computeBenchmarks turns Node annotations into benchmark overlays relevant to
 // selfName. A source node carries the scenario and target annotations; both the
-// source and target nodes carry their RDMA fabric address annotation.
+// source and target nodes carry matching fabric address annotations.
 func computeBenchmarks(nodes []*corev1.Node, selfName string) benchmarkState {
 	if selfName == "" {
 		return benchmarkState{}
@@ -156,18 +161,25 @@ func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Nod
 		return rdmaLoadgenBenchmark{}, false
 	}
 
-	sourceAddr, ok := rdmaAddr(source)
+	sourceAddr, sourceTCP, ok := benchmarkAddr(source)
 	if !ok {
-		slog.Warn("skipping RDMA storage benchmark because source node has no valid RDMA address",
-			"node", source.Name, "annotation", benchmarkRdmaAddrAnnotation)
+		slog.Warn("skipping storage benchmark because source node has no valid fabric address",
+			"node", source.Name, "rdma_annotation", benchmarkRdmaAddrAnnotation, "tcp_annotation", benchmarkTCPAddrAnnotation)
 
 		return rdmaLoadgenBenchmark{}, false
 	}
 
-	targetAddr, ok := rdmaAddr(target)
+	targetAddr, targetTCP, ok := benchmarkAddr(target)
 	if !ok {
-		slog.Warn("skipping RDMA storage benchmark because target node has no valid RDMA address",
-			"node", source.Name, "target", targetName, "annotation", benchmarkRdmaAddrAnnotation)
+		slog.Warn("skipping storage benchmark because target node has no valid fabric address",
+			"node", source.Name, "target", targetName, "rdma_annotation", benchmarkRdmaAddrAnnotation, "tcp_annotation", benchmarkTCPAddrAnnotation)
+
+		return rdmaLoadgenBenchmark{}, false
+	}
+
+	if sourceTCP != targetTCP {
+		slog.Warn("skipping storage benchmark because source and target use different fabric address annotations",
+			"node", source.Name, "target", targetName, "tcp_annotation", benchmarkTCPAddrAnnotation, "rdma_annotation", benchmarkRdmaAddrAnnotation)
 
 		return rdmaLoadgenBenchmark{}, false
 	}
@@ -249,6 +261,7 @@ func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Nod
 		localNodeID:     sourceID,
 		peerNodeID:      targetID,
 		peerAddr:        targetAddr,
+		peerTCP:         targetTCP,
 		cacheMiss:       cacheMiss,
 		workers:         workers,
 		seed:            seed,
@@ -266,6 +279,7 @@ func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Nod
 		bench.localNodeID = targetID
 		bench.peerNodeID = sourceID
 		bench.peerAddr = sourceAddr
+		bench.peerTCP = sourceTCP
 	}
 
 	return bench, true
@@ -311,7 +325,7 @@ func applyRDMALoadgenBenchmark(cfg *storageconfig.Config, bench rdmaLoadgenBench
 		return
 	}
 
-	peer := rdmaPeer(bench.peerNodeID, bench.peerAddr)
+	peer := benchmarkPeer(bench.peerNodeID, bench.peerAddr, bench.peerTCP)
 	if !peerCompatible(cfg, peer) {
 		slog.Warn("skipping RDMA storage benchmark: peer id is already declared with different peer data",
 			"benchmark", bench.name, "peer_id", bench.peerNodeID)
@@ -407,7 +421,7 @@ func benchmarkScenario(node *corev1.Node) string {
 
 func isRDMALoadgenScenario(scenario string) bool {
 	switch strings.ToLower(strings.TrimSpace(scenario)) {
-	case rdmaLoadgenScenario, rdmaScenarioAlias:
+	case rdmaLoadgenScenario, rdmaScenarioAlias, tcpLoadgenScenario:
 		return true
 	default:
 		return false
@@ -415,7 +429,12 @@ func isRDMALoadgenScenario(scenario string) bool {
 }
 
 func isRDMACacheMissScenario(scenario string) bool {
-	return strings.ToLower(strings.TrimSpace(scenario)) == rdmaCacheMissScenario
+	switch strings.ToLower(strings.TrimSpace(scenario)) {
+	case rdmaCacheMissScenario, tcpCacheMissScenario:
+		return true
+	default:
+		return false
+	}
 }
 
 func rdmaAddr(node *corev1.Node) (string, bool) {
@@ -438,6 +457,40 @@ func rdmaAddr(node *corev1.Node) (string, bool) {
 	}
 
 	return "hex:" + strings.ToLower(payload), true
+}
+
+func benchmarkAddr(node *corev1.Node) (string, bool, bool) {
+	if addr, ok := tcpAddr(node); ok {
+		return addr, true, true
+	}
+
+	if addr, ok := rdmaAddr(node); ok {
+		return addr, false, true
+	}
+
+	return "", false, false
+}
+
+func tcpAddr(node *corev1.Node) (string, bool) {
+	if node == nil || node.Annotations == nil {
+		return "", false
+	}
+
+	addr := strings.TrimSpace(node.Annotations[benchmarkTCPAddrAnnotation])
+	if addr == "" {
+		return "", false
+	}
+
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || strings.TrimSpace(host) == "" || strings.TrimSpace(port) == "" {
+		return "", false
+	}
+
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+		return "", false
+	}
+
+	return net.JoinHostPort(host, port), true
 }
 
 func parseUint32Annotation(node *corev1.Node, key string) (*uint32, bool) {
@@ -578,13 +631,21 @@ func (b rdmaLoadgenBenchmark) effectiveWarmupOperations() uint64 {
 	return 1_000_000
 }
 
-func rdmaPeer(id uint64, addr string) *storageconfig.PeerSpec {
-	return &storageconfig.PeerSpec{
-		Id: id,
-		Config: &storageconfig.PeerSpec_Rdma{
-			Rdma: &storageconfig.RdmaPeerConfig{Addr: addr},
-		},
+func benchmarkPeer(id uint64, addr string, tcp bool) *storageconfig.PeerSpec {
+	peer := &storageconfig.PeerSpec{Id: id}
+	if tcp {
+		peer.Config = &storageconfig.PeerSpec_Tcp{
+			Tcp: &storageconfig.TcpPeerConfig{Addr: addr},
+		}
+
+		return peer
 	}
+
+	peer.Config = &storageconfig.PeerSpec_Rdma{
+		Rdma: &storageconfig.RdmaPeerConfig{Addr: addr},
+	}
+
+	return peer
 }
 
 func componentNameExists(cfg *storageconfig.Config, name string) bool {

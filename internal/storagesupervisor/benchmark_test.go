@@ -58,6 +58,7 @@ func TestComputeBenchmarksSourceNode(t *testing.T) {
 	assert.Equal(t, nodeID("source-a"), bench.localNodeID)
 	assert.Equal(t, nodeID("target-b"), bench.peerNodeID)
 	assert.Equal(t, "hex:0a0b", bench.peerAddr)
+	assert.False(t, bench.peerTCP)
 	assert.False(t, bench.cacheMiss)
 	require.NotNil(t, bench.workers)
 	assert.Equal(t, uint32(4), *bench.workers)
@@ -97,6 +98,7 @@ func TestComputeBenchmarksCacheMissSourceNode(t *testing.T) {
 	assert.Equal(t, nodeID("source-a"), bench.localNodeID)
 	assert.Equal(t, nodeID("target-b"), bench.peerNodeID)
 	assert.Equal(t, "hex:0a0b", bench.peerAddr)
+	assert.False(t, bench.peerTCP)
 	require.NotNil(t, bench.readBytes)
 	assert.Equal(t, uint64(4096), *bench.readBytes)
 	require.NotNil(t, bench.objectSizeBytes)
@@ -126,8 +128,46 @@ func TestComputeBenchmarksTargetNode(t *testing.T) {
 	assert.Equal(t, nodeID("target-b"), bench.localNodeID)
 	assert.Equal(t, nodeID("source-a"), bench.peerNodeID)
 	assert.Equal(t, "hex:0102", bench.peerAddr)
+	assert.False(t, bench.peerTCP)
 	require.NotNil(t, bench.workers)
 	assert.Equal(t, uint32(2), *bench.workers)
+}
+
+func TestComputeBenchmarksTCPSourceNode(t *testing.T) {
+	source := benchmarkNode("source-a", map[string]string{
+		benchmarkScenarioAnnotation:        tcpCacheMissScenario,
+		benchmarkTargetNodeAnnotation:      "target-b",
+		benchmarkTCPAddrAnnotation:         "10.0.0.1:19001",
+		benchmarkReadBytesAnnotation:       "4096",
+		benchmarkObjectSizeBytesAnnotation: "16384",
+		benchmarkDiskPathAnnotation:        "/var/lib/unbounded/bench-cache.bin",
+		benchmarkDiskSizeBytesAnnotation:   "104857600",
+	})
+	target := benchmarkNode("target-b", map[string]string{benchmarkTCPAddrAnnotation: "10.0.0.2:19001"})
+
+	state := computeBenchmarks([]*corev1.Node{target, source}, "source-a")
+
+	require.Len(t, state.rdmaLoadgens, 1)
+	bench := state.rdmaLoadgens[0]
+	assert.True(t, bench.runLoadgen)
+	assert.True(t, bench.cacheMiss)
+	assert.Equal(t, nodeID("source-a"), bench.localNodeID)
+	assert.Equal(t, nodeID("target-b"), bench.peerNodeID)
+	assert.Equal(t, "10.0.0.2:19001", bench.peerAddr)
+	assert.True(t, bench.peerTCP)
+}
+
+func TestComputeBenchmarksTCPSourceAndRDMATargetSkipped(t *testing.T) {
+	source := benchmarkNode("source-a", map[string]string{
+		benchmarkScenarioAnnotation:   tcpLoadgenScenario,
+		benchmarkTargetNodeAnnotation: "target-b",
+		benchmarkTCPAddrAnnotation:    "10.0.0.1:19001",
+	})
+	target := benchmarkNode("target-b", map[string]string{benchmarkRdmaAddrAnnotation: "hex:0304"})
+
+	state := computeBenchmarks([]*corev1.Node{target, source}, "source-a")
+
+	assert.Empty(t, state.rdmaLoadgens)
 }
 
 func TestComputeBenchmarksSkipsInvalidAnnotations(t *testing.T) {
@@ -162,6 +202,16 @@ func TestComputeBenchmarksSkipsInvalidAnnotations(t *testing.T) {
 				benchmarkRdmaAddrAnnotation:   "hex:010",
 			},
 			target:      map[string]string{benchmarkRdmaAddrAnnotation: "hex:0304"},
+			includePeer: true,
+		},
+		{
+			name: "bad tcp addr",
+			source: map[string]string{
+				benchmarkScenarioAnnotation:   rdmaLoadgenScenario,
+				benchmarkTargetNodeAnnotation: "target-b",
+				benchmarkTCPAddrAnnotation:    "10.0.0.1",
+			},
+			target:      map[string]string{benchmarkTCPAddrAnnotation: "10.0.0.2:19001"},
 			includePeer: true,
 		},
 		{
@@ -308,6 +358,27 @@ func TestRenderConfigAppliesRDMABenchmarkOnTargetWithoutLoadgen(t *testing.T) {
 	assert.Empty(t, cfg.GetCaches())
 	assert.Empty(t, cfg.GetFrontends())
 	assert.Equal(t, uint64(20), cfg.GetNeighborhoods()[0].GetLocalNodeId())
+}
+
+func TestRenderConfigAppliesTCPBenchmarkPeer(t *testing.T) {
+	dir := writeSource(t, "startup:\n  fabric:\n    tcp:\n      addr: \"0.0.0.0:19001\"\n")
+	bench := rdmaLoadgenBenchmark{
+		name:        "rdma_source_to_target",
+		runLoadgen:  true,
+		localNodeID: 10,
+		peerNodeID:  20,
+		peerAddr:    "10.0.0.2:19001",
+		peerTCP:     true,
+	}
+
+	cfg := decodeWithBenchmarks(t, dir, benchmarkState{rdmaLoadgens: []rdmaLoadgenBenchmark{bench}})
+
+	require.Len(t, cfg.GetNeighborhoods(), 1)
+	peers := cfg.GetNeighborhoods()[0].GetPeers()
+	require.Len(t, peers, 1)
+	assert.Equal(t, uint64(20), peers[0].GetId())
+	assert.Equal(t, "10.0.0.2:19001", peers[0].GetTcp().GetAddr())
+	assert.Nil(t, peers[0].GetRdma())
 }
 
 func TestRenderConfigAppliesRDMACacheMissBenchmarkOnSource(t *testing.T) {

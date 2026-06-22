@@ -26,22 +26,26 @@ metadata:
 # supervisor will not invent one because each neighborhood needs an explicit
 # source backend.
 #
-# Storage benchmarks are also supervisor-injected from Node annotations. Both
-# supported RDMA scenarios run between a source node and a target node. Both
-# nodes must be visible to this supervisor's node watch, so they must carry the
-# storage-ring label key even if the TCP ring itself is not active. The source
-# node carries:
-#   unbounded-cloud.io/storage-benchmark.scenario: rdma-loadgen | rdma-cache-miss
+# Storage benchmarks are also supervisor-injected from Node annotations. They
+# run between a source node and a target node. Both nodes must be visible to
+# this supervisor's node watch, so they must carry the storage-ring label key
+# even if the TCP ring itself is not active. The source node carries:
+#   unbounded-cloud.io/storage-benchmark.scenario: rdma-loadgen | rdma-cache-miss | tcp-loadgen | tcp-cache-miss
 #   unbounded-cloud.io/storage-benchmark.target-node: <target-node-name>
-# Both source and target nodes carry their provider-native RDMA endpoint:
+# Both source and target nodes carry either their provider-native RDMA endpoint:
 #   unbounded-cloud.io/storage-rdma.addr: hex:<fi_getname-bytes>
+# or their libfabric TCP socket endpoint:
+#   unbounded-cloud.io/storage-tcp.addr: <host>:<port>
+# The two nodes in one benchmark must use the same address annotation. Use
+# storage-tcp.addr with startup.fabric.tcp and startup.topology.disable_rdma for
+# benchmark runs over the libfabric TCP provider.
 # Optional source-node knobs map directly to the daemon's loadgen/fake backend
 # settings: storage-benchmark.workers, seed, object-count, read-bytes, verify,
-# stripe-size-bytes, and object-size-bytes. The rdma-loadgen scenario renders a
-# fake backend, RDMA neighborhood, and source loadgen frontend.
+# stripe-size-bytes, and object-size-bytes. The loadgen scenarios render a fake
+# backend, fabric neighborhood, and source loadgen frontend.
 #
-# The rdma-cache-miss scenario measures source cache misses served over RDMA
-# from the target node's disk. It renders a same-named cache on both nodes; the
+# The cache-miss scenarios measure source cache misses served over fabric from
+# the target node's disk. They render a same-named cache on both nodes; the
 # source cache has no disks, so it cannot create local cache hits or write pages
 # to local disk. The target cache uses a file disk declared by required
 # source-node annotations:
@@ -54,8 +58,7 @@ metadata:
 #   unbounded-cloud.io/storage-benchmark.warmup-operations: <operations-per-worker>
 # Removing annotations removes the benchmark on the next render. Benchmark
 # results are exposed through the daemon's normal Prometheus metrics, so set
-# startup.metrics.addr before daemon start if metrics should be scraped. Use an
-# RDMA fabric startup config (rdma or auto_rdma) for RDMA benchmarks.
+# startup.metrics.addr before daemon start if metrics should be scraped.
 data:
   config.yaml: |
     # Operator-assigned config version (opaque counter; 0 means unversioned).
