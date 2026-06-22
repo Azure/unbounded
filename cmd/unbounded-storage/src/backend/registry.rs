@@ -34,11 +34,11 @@ use crate::config::{BackendSpec, backend_spec};
 use crate::storage::StripeReq;
 use crate::tls::{TlsConfig, TlsContext};
 
+use super::url::parse_endpoint;
 use super::{
     AzureBackend, Backend, FakeBackend, HttpBackend, OriginBackend, OriginRing, OriginStream,
     S3Backend,
 };
-use super::url::parse_endpoint;
 
 /// The build context a registry needs to (re)construct an
 /// [`OriginBackend`] from a [`BackendSpec`]. Captured once per registry
@@ -132,11 +132,8 @@ impl BuildCtx {
     fn build(&self, spec: &BackendSpec) -> io::Result<OriginBackend> {
         match spec.config.as_ref() {
             Some(backend_spec::Config::Http(cfg)) => {
-                let endpoint = build_origin_endpoint(
-                    &cfg.url,
-                    &cfg.ca_cert_path,
-                    cfg.insecure_skip_verify,
-                )?;
+                let endpoint =
+                    build_origin_endpoint(&cfg.url, &cfg.ca_cert_path, cfg.insecure_skip_verify)?;
                 let origin = HttpBackend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::Http(HttpBackend::new(
                     self.ring.clone(),
@@ -152,11 +149,8 @@ impl BuildCtx {
                 )))
             }
             Some(backend_spec::Config::S3(cfg)) => {
-                let endpoint = build_origin_endpoint(
-                    &cfg.url,
-                    &cfg.ca_cert_path,
-                    cfg.insecure_skip_verify,
-                )?;
+                let endpoint =
+                    build_origin_endpoint(&cfg.url, &cfg.ca_cert_path, cfg.insecure_skip_verify)?;
                 let origin = S3Backend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::S3(S3Backend::new(
                     self.ring.clone(),
@@ -172,11 +166,8 @@ impl BuildCtx {
                 )))
             }
             Some(backend_spec::Config::Azure(cfg)) => {
-                let endpoint = build_origin_endpoint(
-                    &cfg.url,
-                    &cfg.ca_cert_path,
-                    cfg.insecure_skip_verify,
-                )?;
+                let endpoint =
+                    build_origin_endpoint(&cfg.url, &cfg.ca_cert_path, cfg.insecure_skip_verify)?;
                 let origin = AzureBackend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::Azure(AzureBackend::new(
                     self.ring.clone(),

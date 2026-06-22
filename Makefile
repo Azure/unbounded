@@ -639,7 +639,7 @@ unbounded-storage-smoke: unbounded-storage-build ## Run the end-to-end smoke tes
 		"LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib:$(OPENSSL_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
 		python3 hack/smoke-storage.py
 
-unbounded-storage-tarball: unbounded-storage-build ## Package unbounded-storage + libfabric into a release tarball ($(STORAGE_TARBALL))
+unbounded-storage-tarball: unbounded-storage-build ## Package unbounded-storage + libfabric/OpenSSL into a release tarball ($(STORAGE_TARBALL))
 	@echo "Assembling $(STORAGE_TARBALL)"
 	@rm -rf $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)
 	@mkdir -p $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/bin $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib

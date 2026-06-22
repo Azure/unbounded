@@ -97,7 +97,7 @@ jobs:
             cmd/unbounded-storage/target
           # Key on lockfile + manifest plus the native build inputs, since
           # changes to either invalidate compiled artifacts under target/.
-          key: cargo-unbounded-storage-${{ runner.os }}-fabric-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c', 'cmd/unbounded-storage/src/backend/tls_shim.c') }}
+          key: cargo-unbounded-storage-${{ runner.os }}-fabric-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c', 'cmd/unbounded-storage/src/tls/shim.c') }}
           restore-keys: |
             cargo-unbounded-storage-${{ runner.os }}-fabric-
             cargo-unbounded-storage-${{ runner.os }}-

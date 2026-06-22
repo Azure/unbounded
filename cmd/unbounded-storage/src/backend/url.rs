@@ -100,7 +100,10 @@ impl fmt::Display for UrlError {
                 write!(f, "backend url must be of the form scheme://host[:port]")
             }
             UrlError::UnsupportedScheme(s) => {
-                write!(f, "unsupported backend url scheme {s:?} (expected http or https)")
+                write!(
+                    f,
+                    "unsupported backend url scheme {s:?} (expected http or https)"
+                )
             }
             UrlError::EmptyHost => write!(f, "backend url host must not be empty"),
             UrlError::InvalidPort(p) => write!(f, "invalid backend url port {p:?}"),

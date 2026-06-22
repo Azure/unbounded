@@ -409,11 +409,12 @@ fn validate_backend_url(
     if url.is_empty() {
         return Err(ConfigError::EmptyBackendUrl(backend_name.to_string()));
     }
-    let parsed = crate::backend::url::parse_endpoint(url).map_err(|e| ConfigError::InvalidBackendUrl {
-        backend_name: backend_name.to_string(),
-        url: url.to_string(),
-        reason: e.to_string(),
-    })?;
+    let parsed =
+        crate::backend::url::parse_endpoint(url).map_err(|e| ConfigError::InvalidBackendUrl {
+            backend_name: backend_name.to_string(),
+            url: url.to_string(),
+            reason: e.to_string(),
+        })?;
     if ca_cert_path.is_some() && insecure_skip_verify {
         return Err(ConfigError::ConflictingTlsConfig(backend_name.to_string()));
     }
