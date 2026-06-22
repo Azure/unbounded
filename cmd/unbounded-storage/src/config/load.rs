@@ -651,11 +651,7 @@ path = "/dev/nvme1n1"
 
 [[frontends]]
 name = "f"
-
-[[frontends.mounts]]
-public_prefix = "/"
 source = "c"
-key_prefix = "/"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -1090,11 +1086,7 @@ origin_prefix = "/"
 
 [[frontends]]
 name = "workload-http"
-
-[[frontends.mounts]]
-public_prefix = "/"
 source = "models"
-key_prefix = "/"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -1146,22 +1138,14 @@ origin_prefix = "/"
 
 [[frontends]]
 name = "dup"
-
-[[frontends.mounts]]
-public_prefix = "/one"
 source = "ks"
-key_prefix = "/one"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
 
 [[frontends]]
 name = "dup"
-
-[[frontends.mounts]]
-public_prefix = "/two"
 source = "ks"
-key_prefix = "/two"
 
 [frontends.config.http]
 addr = "0.0.0.0:9001"
@@ -1184,11 +1168,7 @@ url = "https://e"
 
 [[frontends]]
 name = "f"
-
-[[frontends.mounts]]
-public_prefix = "/"
 source = "ghost"
-key_prefix = "/"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -1289,11 +1269,7 @@ origin_prefix = "/"
 
 [[frontends]]
 name = "f"
-
-[[frontends.mounts]]
-public_prefix = "/"
 source = "ks"
-key_prefix = "/"
 
 [frontends.config.http]
 addr = "not-an-addr"
@@ -1325,11 +1301,7 @@ origin_prefix = "/"
 
 [[frontends]]
 name = "f"
-
-[[frontends.mounts]]
-public_prefix = "/"
 source = "ks"
-key_prefix = "/"
 
 [frontends.config.http]
 addr = "example.com:9000"
@@ -1383,22 +1355,14 @@ origin_prefix = "/"
 
 [[frontends]]
 name = "f1"
-
-[[frontends.mounts]]
-public_prefix = "/one"
 source = "ks"
-key_prefix = "/one"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
 
 [[frontends]]
 name = "f2"
-
-[[frontends.mounts]]
-public_prefix = "/two"
 source = "ks"
-key_prefix = "/two"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -1431,11 +1395,7 @@ origin_prefix = "/"
 
 [[frontends]]
 name = "lg"
-
-[[frontends.mounts]]
-public_prefix = "/"
 source = "ks"
-key_prefix = "/"
 
 [frontends.config.loadgen]
 workers = 4
@@ -1465,31 +1425,19 @@ origin_prefix = "/"
 
 [[frontends]]
 name = "lg1"
-
-[[frontends.mounts]]
-public_prefix = "/lg1"
 source = "ks"
-key_prefix = "/lg1"
 
 [frontends.config.loadgen]
 
 [[frontends]]
 name = "lg2"
-
-[[frontends.mounts]]
-public_prefix = "/lg2"
 source = "ks"
-key_prefix = "/lg2"
 
 [frontends.config.loadgen]
 
 [[frontends]]
 name = "http"
-
-[[frontends.mounts]]
-public_prefix = "/http"
 source = "ks"
-key_prefix = "/http"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -1626,11 +1574,7 @@ path = "/dev/nvme0n1"
 
 [[frontends]]
 name = "f"
-
-[[frontends.mounts]]
-public_prefix = "/"
 source = "c"
-key_prefix = "/"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"

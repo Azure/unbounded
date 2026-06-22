@@ -327,11 +327,7 @@ size = $DISK_SIZE
 
 [[frontends]]
 name = "fe"
-
-[[frontends.mounts]]
-public_prefix = "/"
 source = "cache"
-key_prefix = "/"
 
 [frontends.config.http]
 addr = "0.0.0.0:$OPT_FRONTEND_PORT"

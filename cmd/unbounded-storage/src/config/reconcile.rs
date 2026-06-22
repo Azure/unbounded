@@ -624,8 +624,8 @@ pub fn reconcile_backends_and_frontends(
 mod tests {
     use super::*;
     use crate::config::schema::{
-        FrontendMount, HttpBackendConfig, HttpFrontendConfig, TcpPeerConfig, backend_spec,
-        frontend_spec, peer_spec,
+        HttpBackendConfig, HttpFrontendConfig, TcpPeerConfig, backend_spec, frontend_spec,
+        peer_spec,
     };
     use std::cell::RefCell;
 
@@ -1047,11 +1047,7 @@ mod tests {
     fn frontend(id: &str, backend_id: &str) -> FrontendSpec {
         FrontendSpec {
             name: id.to_string(),
-            mounts: vec![FrontendMount {
-                public_prefix: "/".to_string(),
-                source: backend_id.to_string(),
-                key_prefix: "/".to_string(),
-            }],
+            source: backend_id.to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: "0.0.0.0:9000".to_string(),
             })),
@@ -1061,7 +1057,7 @@ mod tests {
     fn frontend_backends(frontends: &[FrontendSpec]) -> HashMap<String, Vec<String>> {
         frontends
             .iter()
-            .map(|f| (f.name.clone(), vec![f.mounts[0].source.clone()]))
+            .map(|f| (f.name.clone(), vec![f.source.clone()]))
             .collect()
     }
 
@@ -1177,7 +1173,7 @@ mod tests {
             *t2.ops.borrow(),
             vec![SpecOp::Remove("f1".into()), SpecOp::Add("f1".into())]
         );
-        assert_eq!(r2.applied["f1"].mounts[0].source, "b2");
+        assert_eq!(r2.applied["f1"].source, "b2");
 
         // Remove: no longer desired.
         let t3 = SpecMock::new(&["f1"]);

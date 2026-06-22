@@ -384,13 +384,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
     // the plain HTTP frontend, a length-read failure is never a silently
     // dropped connection.
-    let len = match read_object_length_s3(
-        pool,
-        &resolved_object,
-        page_size,
-    )
-    .await
-    {
+    let len = match read_object_length_s3(pool, &resolved_object, page_size).await {
         LenResult::Len(l) => l,
         LenResult::NotFound => {
             let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
@@ -688,20 +682,13 @@ fn next_request_id() -> String {
 mod tests {
     use super::*;
     use crate::bufferpool::{PipelinedRead, ReadStream, WindowedRead};
-    use crate::config::{
-        FrontendMount, HttpFrontendConfig, ResolvedFrontendMount, ResolvedKeyspaceRoute,
-        S3FrontendConfig,
-    };
+    use crate::config::{HttpFrontendConfig, ResolvedKeyspaceRoute, S3FrontendConfig};
     use std::cell::RefCell;
 
     fn spec(id: &str, addr: &str) -> FrontendSpec {
         FrontendSpec {
             name: id.to_string(),
-            mounts: vec![FrontendMount {
-                public_prefix: "/".to_string(),
-                source: "models-cache".to_string(),
-                key_prefix: "/".to_string(),
-            }],
+            source: "models-cache".to_string(),
             config: Some(frontend_spec::Config::S3(S3FrontendConfig {
                 addr: addr.to_string(),
             })),
@@ -711,19 +698,16 @@ mod tests {
     fn binding() -> ResolvedFrontendBinding {
         ResolvedFrontendBinding {
             frontend_id: "primary".to_string(),
-            mounts: vec![ResolvedFrontendMount {
-                public_prefix: "/".to_string(),
-                keyspace_id: "models".to_string(),
+            keyspace_id: Some("models".to_string()),
+            backend_id: None,
+            cache_id: Some("cache-a".to_string()),
+            neighborhood_id: Some("site-a".to_string()),
+            bypass_cache: false,
+            routes: vec![ResolvedKeyspaceRoute {
                 key_prefix: "/".to_string(),
-                cache_id: Some("cache-a".to_string()),
-                neighborhood_id: Some("site-a".to_string()),
-                bypass_cache: false,
-                routes: vec![ResolvedKeyspaceRoute {
-                    key_prefix: "/".to_string(),
-                    backend_id: "primary".to_string(),
-                    origin_prefix: "/origin/".to_string(),
-                    stripe_size: 4 * 1024 * 1024,
-                }],
+                backend_id: "primary".to_string(),
+                origin_prefix: "/origin/".to_string(),
+                stripe_size: 4 * 1024 * 1024,
             }],
         }
     }

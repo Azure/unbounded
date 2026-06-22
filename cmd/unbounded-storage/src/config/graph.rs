@@ -5,9 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::schema::{
-    Config, DiskSpec, FrontendMount, KeyspaceRoute, PeerSpec, RoutingPlan,
-};
+use super::schema::{Config, DiskSpec, KeyspaceRoute, PeerSpec, RoutingPlan};
 use crate::fabric::PeerId;
 use crate::p2p::NodeId;
 
@@ -20,20 +18,14 @@ pub struct ResolvedKeyspaceRoute {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedFrontendMount {
-    pub public_prefix: String,
-    pub keyspace_id: String,
-    pub key_prefix: String,
+pub struct ResolvedFrontendBinding {
+    pub frontend_id: String,
+    pub keyspace_id: Option<String>,
+    pub backend_id: Option<String>,
     pub cache_id: Option<String>,
     pub neighborhood_id: Option<String>,
     pub bypass_cache: bool,
     pub routes: Vec<ResolvedKeyspaceRoute>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedFrontendBinding {
-    pub frontend_id: String,
-    pub mounts: Vec<ResolvedFrontendMount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,26 +42,33 @@ pub struct ResolvedObject {
 
 impl ResolvedFrontendBinding {
     pub fn resolve_path(&self, path: &str) -> Option<ResolvedObject> {
-        let mount = self
-            .mounts
-            .iter()
-            .find(|mount| prefix_suffix(path, &mount.public_prefix).is_some())?;
-        let public_suffix = prefix_suffix(path, &mount.public_prefix)?;
-        let key_object_id = join_prefix_suffix(&mount.key_prefix, public_suffix);
-        let route = mount
+        if let Some(backend_id) = &self.backend_id {
+            return Some(ResolvedObject {
+                keyspace_id: backend_id.clone(),
+                key_object_id: path.to_string(),
+                backend_id: backend_id.clone(),
+                origin_object_id: path.to_string(),
+                cache_id: self.cache_id.clone(),
+                neighborhood_id: self.neighborhood_id.clone(),
+                stripe_size: self.routes.first()?.stripe_size,
+                bypass_cache: self.bypass_cache,
+            });
+        }
+
+        let route = self
             .routes
             .iter()
-            .find(|route| prefix_suffix(&key_object_id, &route.key_prefix).is_some())?;
-        let key_suffix = prefix_suffix(&key_object_id, &route.key_prefix)?.to_string();
+            .find(|route| prefix_suffix(path, &route.key_prefix).is_some())?;
+        let key_suffix = prefix_suffix(path, &route.key_prefix)?.to_string();
         Some(ResolvedObject {
-            keyspace_id: mount.keyspace_id.clone(),
-            key_object_id,
+            keyspace_id: self.keyspace_id.clone()?,
+            key_object_id: path.to_string(),
             backend_id: route.backend_id.clone(),
             origin_object_id: join_prefix_suffix(&route.origin_prefix, &key_suffix),
-            cache_id: mount.cache_id.clone(),
-            neighborhood_id: mount.neighborhood_id.clone(),
+            cache_id: self.cache_id.clone(),
+            neighborhood_id: self.neighborhood_id.clone(),
             stripe_size: route.stripe_size,
-            bypass_cache: mount.bypass_cache,
+            bypass_cache: self.bypass_cache,
         })
     }
 }
@@ -129,7 +128,7 @@ pub fn validate_binding_graph(config: &Config) -> Result<(), String> {
     }
     for f in &config.frontends {
         insert_id(&mut ids, "frontend", &f.name)?;
-        validate_frontend_mounts(&f.name, &f.mounts)?;
+        require_source("frontend", &f.name, &f.source)?;
     }
 
     let backends = by_id(&config.backends, |b| b.name.as_str());
@@ -175,16 +174,15 @@ pub fn validate_binding_graph(config: &Config) -> Result<(), String> {
     }
     validate_fabric_peer_ids(config)?;
     for f in &config.frontends {
-        for mount in &f.mounts {
-            if !keyspaces.contains_key(mount.source.as_str())
-                && !caches.contains_key(mount.source.as_str())
-                && !neighborhoods.contains_key(mount.source.as_str())
-            {
-                return Err(format!(
-                    "frontend {:?} mount {:?} source {:?}, which is not a keyspace, cache, or neighborhood",
-                    f.name, mount.public_prefix, mount.source
-                ));
-            }
+        if !backends.contains_key(f.source.as_str())
+            && !keyspaces.contains_key(f.source.as_str())
+            && !caches.contains_key(f.source.as_str())
+            && !neighborhoods.contains_key(f.source.as_str())
+        {
+            return Err(format!(
+                "frontend {:?} source {:?}, which is not a backend, keyspace, cache, or neighborhood",
+                f.name, f.source
+            ));
         }
     }
 
@@ -195,37 +193,12 @@ fn validate_keyspace_routes(keyspace: &str, routes: &[KeyspaceRoute]) -> Result<
     let mut prefixes = HashSet::new();
     for route in routes {
         validate_prefix("keyspace", keyspace, "key_prefix", &route.key_prefix)?;
-        validate_prefix(
-            "keyspace",
-            keyspace,
-            "origin_prefix",
-            &route.origin_prefix,
-        )?;
+        validate_prefix("keyspace", keyspace, "origin_prefix", &route.origin_prefix)?;
         require_source("keyspace route", &route.key_prefix, &route.backend)?;
         if !prefixes.insert(route.key_prefix.as_str()) {
             return Err(format!(
                 "keyspace {keyspace:?}: duplicate route key_prefix {:?}",
                 route.key_prefix
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_frontend_mounts(frontend: &str, mounts: &[FrontendMount]) -> Result<(), String> {
-    if mounts.is_empty() {
-        return Err(format!("frontend {frontend:?}: at least one mount is required"));
-    }
-
-    let mut prefixes = HashSet::new();
-    for mount in mounts {
-        validate_prefix("frontend", frontend, "public_prefix", &mount.public_prefix)?;
-        validate_prefix("frontend", frontend, "key_prefix", &mount.key_prefix)?;
-        require_source("frontend mount", &mount.public_prefix, &mount.source)?;
-        if !prefixes.insert(mount.public_prefix.as_str()) {
-            return Err(format!(
-                "frontend {frontend:?}: duplicate mount public_prefix {:?}",
-                mount.public_prefix
             ));
         }
     }
@@ -318,44 +291,24 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
     let mut bindings = HashMap::new();
 
     for frontend in &config.frontends {
-        let mut mounts = Vec::with_capacity(frontend.mounts.len());
-        for mount in &frontend.mounts {
-            let chain = resolve_mount_chain(mount, &keyspaces, &caches, &neighborhoods)?;
-            let keyspace = keyspaces
-                .get(chain.keyspace_id.as_str())
-                .expect("binding graph validation checked keyspace target");
-            let mut routes = keyspace
-                .routes
-                .iter()
-                .map(|route| {
-                    let backend = backends
-                        .get(route.backend.as_str())
-                        .expect("binding graph validation checked route backend");
-                    ResolvedKeyspaceRoute {
-                        key_prefix: route.key_prefix.clone(),
-                        backend_id: route.backend.clone(),
-                        origin_prefix: route.origin_prefix.clone(),
-                        stripe_size: backend.stripe_size_bytes(),
-                    }
-                })
-                .collect::<Vec<_>>();
-            sort_by_longest_prefix(&mut routes, |route| route.key_prefix.as_str());
-            mounts.push(ResolvedFrontendMount {
-                public_prefix: mount.public_prefix.clone(),
-                keyspace_id: chain.keyspace_id,
-                key_prefix: mount.key_prefix.clone(),
-                cache_id: chain.cache_id,
-                neighborhood_id: chain.neighborhood_id,
-                bypass_cache: chain.bypass_cache,
-                routes,
-            });
-        }
-        sort_by_longest_prefix(&mut mounts, |mount| mount.public_prefix.as_str());
+        let chain = resolve_source_chain(
+            &frontend.source,
+            &backends,
+            &keyspaces,
+            &caches,
+            &neighborhoods,
+        )?;
+        let routes = resolve_routes(&chain, &backends, &keyspaces);
         bindings.insert(
             frontend.name.clone(),
             ResolvedFrontendBinding {
                 frontend_id: frontend.name.clone(),
-                mounts,
+                keyspace_id: chain.keyspace_id,
+                backend_id: chain.backend_id,
+                cache_id: chain.cache_id,
+                neighborhood_id: chain.neighborhood_id,
+                bypass_cache: chain.bypass_cache,
+                routes,
             },
         );
     }
@@ -435,9 +388,9 @@ pub fn frontend_backend_map(
         .iter()
         .map(|(id, binding)| {
             let mut backends = binding
-                .mounts
+                .routes
                 .iter()
-                .flat_map(|mount| mount.routes.iter().map(|route| route.backend_id.clone()))
+                .map(|route| route.backend_id.clone())
                 .collect::<Vec<_>>();
             backends.sort();
             backends.dedup();
@@ -447,38 +400,62 @@ pub fn frontend_backend_map(
 }
 
 struct ResolvedChain {
-    keyspace_id: String,
+    keyspace_id: Option<String>,
+    backend_id: Option<String>,
     cache_id: Option<String>,
     neighborhood_id: Option<String>,
     bypass_cache: bool,
 }
 
-fn resolve_mount_chain(
-    mount: &FrontendMount,
+fn resolve_source_chain(
+    source: &str,
+    backends: &HashMap<&str, &super::schema::BackendSpec>,
     keyspaces: &HashMap<&str, &super::schema::KeyspaceSpec>,
     caches: &HashMap<&str, &super::schema::CacheSpec>,
     neighborhoods: &HashMap<&str, &super::schema::NeighborhoodSpec>,
 ) -> Result<ResolvedChain, String> {
-    if keyspaces.contains_key(mount.source.as_str()) {
+    if backends.contains_key(source) {
         return Ok(ResolvedChain {
-            keyspace_id: mount.source.clone(),
+            keyspace_id: None,
+            backend_id: Some(source.to_string()),
             cache_id: None,
             neighborhood_id: None,
             bypass_cache: true,
         });
     }
 
-    if let Some(cache) = caches.get(mount.source.as_str()) {
+    if keyspaces.contains_key(source) {
+        return Ok(ResolvedChain {
+            keyspace_id: Some(source.to_string()),
+            backend_id: None,
+            cache_id: None,
+            neighborhood_id: None,
+            bypass_cache: true,
+        });
+    }
+
+    if let Some(cache) = caches.get(source) {
         if let Some(neighborhood) = neighborhoods.get(cache.source.as_str()) {
             return Ok(ResolvedChain {
-                keyspace_id: neighborhood.source.clone(),
+                keyspace_id: Some(neighborhood.source.clone()),
+                backend_id: None,
                 cache_id: Some(cache.name.clone()),
                 neighborhood_id: Some(neighborhood.name.clone()),
                 bypass_cache: false,
             });
         }
+        if keyspaces.contains_key(cache.source.as_str()) {
+            return Ok(ResolvedChain {
+                keyspace_id: Some(cache.source.clone()),
+                backend_id: None,
+                cache_id: Some(cache.name.clone()),
+                neighborhood_id: None,
+                bypass_cache: false,
+            });
+        }
         return Ok(ResolvedChain {
-            keyspace_id: cache.source.clone(),
+            keyspace_id: None,
+            backend_id: Some(cache.source.clone()),
             cache_id: Some(cache.name.clone()),
             neighborhood_id: None,
             bypass_cache: false,
@@ -486,14 +463,58 @@ fn resolve_mount_chain(
     }
 
     let neighborhood = neighborhoods
-        .get(mount.source.as_str())
-        .ok_or_else(|| format!("frontend mount source {:?} is unresolved", mount.source))?;
+        .get(source)
+        .ok_or_else(|| format!("frontend source {source:?} is unresolved"))?;
     Ok(ResolvedChain {
-        keyspace_id: neighborhood.source.clone(),
+        keyspace_id: Some(neighborhood.source.clone()),
+        backend_id: None,
         cache_id: None,
         neighborhood_id: Some(neighborhood.name.clone()),
         bypass_cache: false,
     })
+}
+
+fn resolve_routes(
+    chain: &ResolvedChain,
+    backends: &HashMap<&str, &super::schema::BackendSpec>,
+    keyspaces: &HashMap<&str, &super::schema::KeyspaceSpec>,
+) -> Vec<ResolvedKeyspaceRoute> {
+    if let Some(backend_id) = &chain.backend_id {
+        let backend = backends
+            .get(backend_id.as_str())
+            .expect("binding graph validation checked backend target");
+        return vec![ResolvedKeyspaceRoute {
+            key_prefix: "/".to_string(),
+            backend_id: backend_id.clone(),
+            origin_prefix: "/".to_string(),
+            stripe_size: backend.stripe_size_bytes(),
+        }];
+    }
+
+    let keyspace_id = chain
+        .keyspace_id
+        .as_deref()
+        .expect("resolved chain has keyspace or backend");
+    let keyspace = keyspaces
+        .get(keyspace_id)
+        .expect("binding graph validation checked keyspace target");
+    let mut routes = keyspace
+        .routes
+        .iter()
+        .map(|route| {
+            let backend = backends
+                .get(route.backend.as_str())
+                .expect("binding graph validation checked route backend");
+            ResolvedKeyspaceRoute {
+                key_prefix: route.key_prefix.clone(),
+                backend_id: route.backend.clone(),
+                origin_prefix: route.origin_prefix.clone(),
+                stripe_size: backend.stripe_size_bytes(),
+            }
+        })
+        .collect::<Vec<_>>();
+    sort_by_longest_prefix(&mut routes, |route| route.key_prefix.as_str());
+    routes
 }
 
 fn sort_by_longest_prefix<T>(items: &mut [T], prefix: impl Fn(&T) -> &str) {
@@ -554,9 +575,9 @@ fn by_id<'a, T>(items: &'a [T], id: impl Fn(&'a T) -> &'a str) -> HashMap<&'a st
 #[cfg(test)]
 mod tests {
     use super::super::schema::{
-        BackendSpec, CacheSpec, FrontendMount, FrontendSpec, HttpBackendConfig,
-        HttpFrontendConfig, KeyspaceRoute, KeyspaceSpec, NeighborhoodSpec, PeerSpec,
-        RdmaPeerConfig, TcpPeerConfig, backend_spec, frontend_spec, peer_spec,
+        BackendSpec, CacheSpec, FrontendSpec, HttpBackendConfig, HttpFrontendConfig, KeyspaceRoute,
+        KeyspaceSpec, NeighborhoodSpec, PeerSpec, RdmaPeerConfig, TcpPeerConfig, backend_spec,
+        frontend_spec, peer_spec,
     };
     use super::*;
 
@@ -619,28 +640,7 @@ mod tests {
     fn frontend(id: &str, source: &str) -> FrontendSpec {
         FrontendSpec {
             name: id.to_string(),
-            mounts: vec![FrontendMount {
-                public_prefix: "/".to_string(),
-                source: source.to_string(),
-                key_prefix: "/".to_string(),
-            }],
-            config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
-                addr: format!("127.0.0.1:{}", 9000 + id.len()),
-            })),
-        }
-    }
-
-    fn frontend_with_mounts(id: &str, mounts: &[(&str, &str, &str)]) -> FrontendSpec {
-        FrontendSpec {
-            name: id.to_string(),
-            mounts: mounts
-                .iter()
-                .map(|(public_prefix, source, key_prefix)| FrontendMount {
-                    public_prefix: (*public_prefix).to_string(),
-                    source: (*source).to_string(),
-                    key_prefix: (*key_prefix).to_string(),
-                })
-                .collect(),
+            source: source.to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: format!("127.0.0.1:{}", 9000 + id.len()),
             })),
@@ -676,19 +676,38 @@ mod tests {
         cfg.neighborhoods.push(neighborhood("n", "ks"));
         cfg.caches.push(cache("c-neighborhood", "n"));
         cfg.frontends.push(frontend("direct", "ks"));
+        cfg.frontends.push(frontend("backend", "b"));
         cfg.frontends.push(frontend("cache", "c-keyspace"));
         cfg.frontends.push(frontend("neighborhood", "n"));
         cfg.frontends.push(frontend("full", "c-neighborhood"));
 
         let graph = runtime_projection(&cfg).unwrap();
 
-        assert_binding(&graph, "direct", "ks", None, None, true);
-        assert_binding(&graph, "cache", "ks", Some("c-keyspace"), None, false);
-        assert_binding(&graph, "neighborhood", "ks", None, Some("n"), false);
+        assert_binding(&graph, "direct", Some("ks"), None, None, None, true);
+        assert_binding(&graph, "backend", None, Some("b"), None, None, true);
+        assert_binding(
+            &graph,
+            "cache",
+            Some("ks"),
+            None,
+            Some("c-keyspace"),
+            None,
+            false,
+        );
+        assert_binding(
+            &graph,
+            "neighborhood",
+            Some("ks"),
+            None,
+            None,
+            Some("n"),
+            false,
+        );
         assert_binding(
             &graph,
             "full",
-            "ks",
+            Some("ks"),
+            None,
             Some("c-neighborhood"),
             Some("n"),
             false,
@@ -712,47 +731,49 @@ mod tests {
         cfg.frontends.push(frontend("f", "models"));
 
         let graph = runtime_projection(&cfg).unwrap();
-        let mount = &graph.frontends["f"].mounts[0];
+        let binding = &graph.frontends["f"];
 
-        assert_eq!(mount.routes.len(), 2);
-        assert_eq!(mount.routes[0].backend_id, "west");
-        assert_eq!(mount.routes[0].stripe_size, 2048);
-        assert_eq!(mount.routes[1].backend_id, "east");
-        assert_eq!(frontend_backend_map(&graph.frontends)["f"], vec!["east", "west"]);
+        assert_eq!(binding.routes.len(), 2);
+        assert_eq!(binding.routes[0].backend_id, "west");
+        assert_eq!(binding.routes[0].stripe_size, 2048);
+        assert_eq!(binding.routes[1].backend_id, "east");
+        assert_eq!(
+            frontend_backend_map(&graph.frontends)["f"],
+            vec!["east", "west"]
+        );
     }
 
     #[test]
-    fn runtime_projection_sorts_mounts_by_longest_prefix() {
+    fn runtime_projection_sorts_keyspace_routes_by_longest_prefix() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
-        cfg.keyspaces.push(keyspace("ks", &[("/", "b", "/")]));
-        cfg.frontends.push(frontend_with_mounts(
-            "f",
-            &[("/", "ks", "/"), ("/private/", "ks", "/tenant/private/")],
+        cfg.keyspaces.push(keyspace(
+            "ks",
+            &[("/", "b", "/"), ("/private/", "b", "/tenant/private/")],
         ));
+        cfg.frontends.push(frontend("f", "ks"));
 
         let graph = runtime_projection(&cfg).unwrap();
-        let mounts = &graph.frontends["f"].mounts;
+        let routes = &graph.frontends["f"].routes;
 
-        assert_eq!(mounts[0].public_prefix, "/private/");
-        assert_eq!(mounts[1].public_prefix, "/");
+        assert_eq!(routes[0].key_prefix, "/private/");
+        assert_eq!(routes[1].key_prefix, "/");
     }
 
     #[test]
-    fn resolved_binding_maps_public_path_to_keyspace_and_origin() {
+    fn resolved_binding_maps_keyspace_path_to_origin() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
         cfg.keyspaces.push(keyspace(
             "ks",
             &[("/tenant/private/", "b", "/bucket/private/")],
         ));
-        cfg.frontends.push(frontend_with_mounts(
-            "f",
-            &[("/private/", "ks", "/tenant/private/")],
-        ));
+        cfg.frontends.push(frontend("f", "ks"));
 
         let graph = runtime_projection(&cfg).unwrap();
-        let resolved = graph.frontends["f"].resolve_path("/private/a/b.bin").unwrap();
+        let resolved = graph.frontends["f"]
+            .resolve_path("/tenant/private/a/b.bin")
+            .unwrap();
 
         assert_eq!(resolved.keyspace_id, "ks");
         assert_eq!(resolved.key_object_id, "/tenant/private/a/b.bin");
@@ -764,40 +785,32 @@ mod tests {
     fn resolved_binding_prefixes_match_path_boundaries() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
-        cfg.keyspaces.push(keyspace("ks", &[("/foo", "b", "/origin/foo")]));
-        cfg.frontends.push(frontend_with_mounts("f", &[("/public", "ks", "/foo")]));
+        cfg.keyspaces
+            .push(keyspace("ks", &[("/foo", "b", "/origin/foo")]));
+        cfg.frontends.push(frontend("f", "ks"));
 
         let graph = runtime_projection(&cfg).unwrap();
         let binding = &graph.frontends["f"];
 
-        assert!(binding.resolve_path("/public/a").is_some());
-        assert!(binding.resolve_path("/public").is_some());
-        assert!(binding.resolve_path("/publicity/a").is_none());
-        assert!(binding.resolve_path("/publicabar").is_none());
+        assert!(binding.resolve_path("/foo/a").is_some());
+        assert!(binding.resolve_path("/foo").is_some());
+        assert!(binding.resolve_path("/foobar/a").is_none());
+        assert!(binding.resolve_path("/fooish").is_none());
     }
 
     #[test]
-    fn runtime_projection_rejects_backend_sources() {
+    fn runtime_projection_accepts_backend_sources() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
         cfg.frontends.push(frontend("f", "b"));
 
-        let err = runtime_projection(&cfg).unwrap_err();
+        let graph = runtime_projection(&cfg).unwrap();
+        let resolved = graph.frontends["f"].resolve_path("/obj").unwrap();
 
-        assert!(err.contains("not a keyspace, cache, or neighborhood"), "{err}");
-    }
-
-    #[test]
-    fn runtime_projection_rejects_duplicate_mount_prefix() {
-        let mut cfg = Config::default();
-        cfg.backends.push(backend("b"));
-        cfg.keyspaces.push(keyspace("ks", &[("/", "b", "/")]));
-        cfg.frontends
-            .push(frontend_with_mounts("f", &[("/", "ks", "/"), ("/", "ks", "/x/")]));
-
-        let err = runtime_projection(&cfg).unwrap_err();
-
-        assert!(err.contains("duplicate mount public_prefix"), "{err}");
+        assert_eq!(resolved.keyspace_id, "b");
+        assert_eq!(resolved.key_object_id, "/obj");
+        assert_eq!(resolved.backend_id, "b");
+        assert_eq!(resolved.origin_object_id, "/obj");
     }
 
     #[test]
@@ -955,16 +968,17 @@ mod tests {
     fn assert_binding(
         graph: &RuntimeGraph,
         frontend_id: &str,
-        keyspace_id: &str,
+        keyspace_id: Option<&str>,
+        backend_id: Option<&str>,
         cache_id: Option<&str>,
         neighborhood_id: Option<&str>,
         bypass_cache: bool,
     ) {
         let binding = graph.frontends.get(frontend_id).unwrap();
-        let mount = &binding.mounts[0];
-        assert_eq!(mount.keyspace_id, keyspace_id);
-        assert_eq!(mount.cache_id.as_deref(), cache_id);
-        assert_eq!(mount.neighborhood_id.as_deref(), neighborhood_id);
-        assert_eq!(mount.bypass_cache, bypass_cache);
+        assert_eq!(binding.keyspace_id.as_deref(), keyspace_id);
+        assert_eq!(binding.backend_id.as_deref(), backend_id);
+        assert_eq!(binding.cache_id.as_deref(), cache_id);
+        assert_eq!(binding.neighborhood_id.as_deref(), neighborhood_id);
+        assert_eq!(binding.bypass_cache, bypass_cache);
     }
 }

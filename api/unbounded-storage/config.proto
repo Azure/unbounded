@@ -289,24 +289,15 @@ message FakeBackendConfig {
 
 message FrontendSpec {
   string name = 1;
-  repeated FrontendMount mounts = 2;
+
+  // Backend, keyspace, cache, or neighborhood component name exposed by this frontend.
+  string source = 2;
 
   oneof config {
     HttpFrontendConfig http = 3;
     S3FrontendConfig s3 = 4;
     LoadgenFrontendConfig loadgen = 5;
   }
-}
-
-message FrontendMount {
-  // Request path prefix exposed by this frontend.
-  string public_prefix = 1;
-
-  // Keyspace, cache, or neighborhood component name.
-  string source = 2;
-
-  // Logical key prefix within the selected keyspace.
-  string key_prefix = 3;
 }
 
 message HttpFrontendConfig {

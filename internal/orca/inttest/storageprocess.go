@@ -169,11 +169,7 @@ size = %d
 
 [[frontends]]
 name = "fe"
-
-[[frontends.mounts]]
-public_prefix = "/"
 source = "cache"
-key_prefix = "/"
 
 [frontends.config.s3]
 addr = "%s"

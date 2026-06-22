@@ -207,10 +207,7 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
         origin_ref,
         resolved,
     );
-    let mut rs: ReadStream = pool
-        .read(&req, 0, page_size as u64)
-        .await
-        .map_err(|_| ())?;
+    let mut rs: ReadStream = pool.read(&req, 0, page_size as u64).await.map_err(|_| ())?;
     let page = rs.next_page().await.ok_or(())?.map_err(|_| ())?;
     let meta = ObjectMetadata::decode(page.as_slice()).map_err(|_| ())?;
     Ok(meta.length)
@@ -285,19 +282,12 @@ fn object_id(
 mod tests {
     use super::*;
     use crate::bufferpool::Req;
-    use crate::config::{
-        FrontendMount, HttpFrontendConfig, LoadgenFrontendConfig, ResolvedFrontendMount,
-        ResolvedKeyspaceRoute,
-    };
+    use crate::config::{HttpFrontendConfig, LoadgenFrontendConfig, ResolvedKeyspaceRoute};
 
     fn loadgen_spec() -> FrontendSpec {
         FrontendSpec {
             name: "lg".to_string(),
-            mounts: vec![FrontendMount {
-                public_prefix: "/".to_string(),
-                source: "cache".to_string(),
-                key_prefix: "/".to_string(),
-            }],
+            source: "cache".to_string(),
             config: Some(frontend_spec::Config::Loadgen(
                 LoadgenFrontendConfig::default(),
             )),
@@ -307,19 +297,16 @@ mod tests {
     fn binding(bypass_cache: bool) -> ResolvedFrontendBinding {
         ResolvedFrontendBinding {
             frontend_id: "lg".to_string(),
-            mounts: vec![ResolvedFrontendMount {
-                public_prefix: "/".to_string(),
-                keyspace_id: "loadgen".to_string(),
+            keyspace_id: Some("loadgen".to_string()),
+            backend_id: None,
+            cache_id: Some("cache".to_string()),
+            neighborhood_id: Some("n".to_string()),
+            bypass_cache,
+            routes: vec![ResolvedKeyspaceRoute {
                 key_prefix: "/".to_string(),
-                cache_id: Some("cache".to_string()),
-                neighborhood_id: Some("n".to_string()),
-                bypass_cache,
-                routes: vec![ResolvedKeyspaceRoute {
-                    key_prefix: "/".to_string(),
-                    backend_id: "fake".to_string(),
-                    origin_prefix: "/".to_string(),
-                    stripe_size: 4096,
-                }],
+                backend_id: "fake".to_string(),
+                origin_prefix: "/".to_string(),
+                stripe_size: 4096,
             }],
         }
     }

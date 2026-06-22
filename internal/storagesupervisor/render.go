@@ -191,22 +191,13 @@ func validateConfigGraph(cfg *storageconfig.Config) error {
 			continue
 		}
 
-		if len(frontend.GetMounts()) == 0 {
-			return fmt.Errorf("frontend %q: at least one mount is required", frontend.GetName())
-		}
+		_, backend := backends[frontend.GetSource()]
+		_, keyspace := keyspaces[frontend.GetSource()]
+		_, cache := caches[frontend.GetSource()]
+		_, neighborhood := neighborhoods[frontend.GetSource()]
 
-		for _, mount := range frontend.GetMounts() {
-			if mount == nil {
-				continue
-			}
-
-			_, keyspace := keyspaces[mount.GetSource()]
-			_, cache := caches[mount.GetSource()]
-			_, neighborhood := neighborhoods[mount.GetSource()]
-
-			if !keyspace && !cache && !neighborhood {
-				return fmt.Errorf("frontend %q mount %q source %q, which is not a keyspace, cache, or neighborhood", frontend.GetName(), mount.GetPublicPrefix(), mount.GetSource())
-			}
+		if !backend && !keyspace && !cache && !neighborhood {
+			return fmt.Errorf("frontend %q source %q, which is not a backend, keyspace, cache, or neighborhood", frontend.GetName(), frontend.GetSource())
 		}
 	}
 

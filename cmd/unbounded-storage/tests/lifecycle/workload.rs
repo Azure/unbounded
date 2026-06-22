@@ -17,9 +17,9 @@ use proptest::prelude::*;
 use unbounded_storage::bufferpool::{Error, StripeKey};
 use unbounded_storage::config::{
     ApplyError, BackendSpec, CacheSpec, Config, ConfigApplyTarget, ConfigController, ConfigDiff,
-    DiskSpec, FileDiskConfig, FrontendMount, FrontendSpec, HttpBackendConfig,
-    HttpFrontendConfig, KeyspaceRoute, KeyspaceSpec, NeighborhoodSpec, PeerSpec, TcpPeerConfig,
-    backend_spec, disk_spec, frontend_spec, peer_spec, runtime_disks, runtime_projection,
+    DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig, KeyspaceRoute,
+    KeyspaceSpec, NeighborhoodSpec, PeerSpec, TcpPeerConfig, backend_spec, disk_spec,
+    frontend_spec, peer_spec, runtime_disks, runtime_projection,
 };
 use unbounded_storage::runtime::ShardLoop;
 use unbounded_storage::storage::blockdev::MockDeviceConfig;
@@ -251,11 +251,7 @@ struct SimApplyTarget {
 }
 
 impl ConfigApplyTarget for SimApplyTarget {
-    fn apply_in_place(
-        &mut self,
-        new: &Arc<Config>,
-        diff: &ConfigDiff,
-    ) -> Result<(), ApplyError> {
+    fn apply_in_place(&mut self, new: &Arc<Config>, diff: &ConfigDiff) -> Result<(), ApplyError> {
         let projection = runtime_projection(new)
             .map_err(|e| ApplyError::Target(format!("config projection failed: {e}")))?;
 
@@ -932,11 +928,7 @@ fn frontend_specs(generation: usize, count: u8) -> Vec<FrontendSpec> {
     (0..count.max(1))
         .map(|i| FrontendSpec {
             name: format!("frontend-{generation}-{i}"),
-            mounts: vec![FrontendMount {
-                public_prefix: "/".to_string(),
-                source: "cache-0".to_string(),
-                key_prefix: "/".to_string(),
-            }],
+            source: "cache-0".to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: format!("127.0.0.1:{}", 10_000 + generation as u16 * 16 + i as u16),
             })),

@@ -95,9 +95,9 @@ impl ConfigDiff {
 mod tests {
     use super::*;
     use crate::config::schema::{
-        BackendSpec, BlockDiskConfig, CacheSpec, DiskSpec, FrontendMount, FrontendSpec,
-        HttpBackendConfig, HttpFrontendConfig, NeighborhoodSpec, PeerSpec, TcpPeerConfig,
-        backend_spec, disk_spec, frontend_spec, peer_spec,
+        BackendSpec, BlockDiskConfig, CacheSpec, DiskSpec, FrontendSpec, HttpBackendConfig,
+        HttpFrontendConfig, NeighborhoodSpec, PeerSpec, TcpPeerConfig, backend_spec, disk_spec,
+        frontend_spec, peer_spec,
     };
 
     fn base() -> Config {
@@ -204,11 +204,7 @@ mod tests {
         let mut b = base();
         b.frontends.push(FrontendSpec {
             name: "f".to_string(),
-            mounts: vec![FrontendMount {
-                public_prefix: "/".to_string(),
-                source: "b".to_string(),
-                key_prefix: "/".to_string(),
-            }],
+            source: "b".to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: "0.0.0.0:9000".to_string(),
             })),

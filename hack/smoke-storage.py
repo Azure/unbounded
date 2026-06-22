@@ -625,11 +625,7 @@ size = {DISK_SIZE}
 
 [[frontends]]
 name = "fe"
-
-[[frontends.mounts]]
-public_prefix = "/"
 source = "cache"
-key_prefix = "/"
 
 [frontends.config.{kind}]
 addr = "{frontend_addr}"

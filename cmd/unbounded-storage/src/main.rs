@@ -1240,9 +1240,9 @@ fn frontend_rebuild_ids(
 
 fn binding_backends(binding: &ResolvedFrontendBinding) -> Vec<String> {
     let mut backends: Vec<String> = binding
-        .mounts
+        .routes
         .iter()
-        .flat_map(|mount| mount.routes.iter().map(|route| route.backend_id.clone()))
+        .map(|route| route.backend_id.clone())
         .collect();
     backends.sort();
     backends.dedup();
@@ -1913,19 +1913,16 @@ mod tests {
     fn binding(frontend_id: &str, backend_id: &str) -> ResolvedFrontendBinding {
         ResolvedFrontendBinding {
             frontend_id: frontend_id.to_string(),
-            mounts: vec![config::ResolvedFrontendMount {
-                public_prefix: "/".to_string(),
-                keyspace_id: "ks".to_string(),
+            keyspace_id: Some("ks".to_string()),
+            backend_id: None,
+            cache_id: None,
+            neighborhood_id: None,
+            bypass_cache: true,
+            routes: vec![config::ResolvedKeyspaceRoute {
                 key_prefix: "/".to_string(),
-                cache_id: None,
-                neighborhood_id: None,
-                bypass_cache: true,
-                routes: vec![config::ResolvedKeyspaceRoute {
-                    key_prefix: "/".to_string(),
-                    backend_id: backend_id.to_string(),
-                    origin_prefix: "/".to_string(),
-                    stripe_size: 4 * 1024 * 1024,
-                }],
+                backend_id: backend_id.to_string(),
+                origin_prefix: "/".to_string(),
+                stripe_size: 4 * 1024 * 1024,
             }],
         }
     }

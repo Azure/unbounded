@@ -505,8 +505,8 @@ mod tests {
 
         // With an origin mapping.
         let origin = OriginRef::new("primary-s3", "models/llama.bin", 7);
-        let req2 = StripeReq::new(stripe_key("models", "/llama.bin", 7))
-            .with_origin(origin.clone());
+        let req2 =
+            StripeReq::new(stripe_key("models", "/llama.bin", 7)).with_origin(origin.clone());
         let bytes2 = bincode::serialize(&req2).unwrap();
         let back2: StripeReq = bincode::deserialize(&bytes2).unwrap();
         assert_eq!(req2, back2);

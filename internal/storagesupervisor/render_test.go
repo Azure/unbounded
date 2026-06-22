@@ -471,10 +471,7 @@ caches:
     source: edge
 frontends:
   - name: http
-    mounts:
-      - public_prefix: /
-        source: cache
-        key_prefix: /
+    source: cache
     http:
       addr: 127.0.0.1:0
 `)
@@ -483,8 +480,24 @@ frontends:
 	require.Len(t, cfg.GetKeyspaces(), 1)
 	assert.Equal(t, "objects", cfg.GetKeyspaces()[0].GetName())
 	require.Len(t, cfg.GetFrontends(), 1)
-	require.Len(t, cfg.GetFrontends()[0].GetMounts(), 1)
-	assert.Equal(t, "cache", cfg.GetFrontends()[0].GetMounts()[0].GetSource())
+	assert.Equal(t, "cache", cfg.GetFrontends()[0].GetSource())
+}
+
+func TestRenderConfigAcceptsBackendFrontendSource(t *testing.T) {
+	dir := writeSource(t, `
+backends:
+  - name: origin
+    fake: {}
+frontends:
+  - name: http
+    source: origin
+    http:
+      addr: 127.0.0.1:0
+`)
+
+	cfg := decode(t, dir)
+	require.Len(t, cfg.GetFrontends(), 1)
+	assert.Equal(t, "origin", cfg.GetFrontends()[0].GetSource())
 }
 
 func TestWriteConfigAtomic(t *testing.T) {

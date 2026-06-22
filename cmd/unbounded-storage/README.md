@@ -157,11 +157,7 @@ numa        = 0                  # optional u16; biases the open onto a CPU on t
 
 [[frontends]]
 name = "http"
-
-[[frontends.mounts]]
-public_prefix = "/"             # public path prefix accepted by this frontend.
-source = "cache"                # keyspace, cache, or neighborhood component name.
-key_prefix = "/"                # logical keyspace prefix exposed at public_prefix.
+source = "cache"                # backend, keyspace, cache, or neighborhood component name.
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"

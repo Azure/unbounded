@@ -92,7 +92,6 @@ fn generate_config_schema() {
         "AzureBackendConfig",
         "FakeBackendConfig",
         "FrontendSpec",
-        "FrontendMount",
         "HttpFrontendConfig",
         "S3FrontendConfig",
         "LoadgenFrontendConfig",

@@ -363,13 +363,9 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     // metadata entry through the pool. The HTTP backend fills it from
     // an origin HEAD on a miss; local-disk and peer hits skip the
     // origin entirely.
-    let len = read_object_length(
-        pool,
-        &resolved_object,
-        page_size,
-    )
-    .await
-    .map_err(|_| ())?;
+    let len = read_object_length(pool, &resolved_object, page_size)
+        .await
+        .map_err(|_| ())?;
 
     // 6. Resolve the requested range against the length.
     let resolved = match range {
@@ -455,10 +451,7 @@ enum Ticket {
 }
 
 /// Build the content-addressed key and pool request for one stripe slice.
-fn stripe_request(
-    resolved: &ResolvedObject,
-    slice: StripeSlice,
-) -> (StripeKey, StripeReq) {
+fn stripe_request(resolved: &ResolvedObject, slice: StripeSlice) -> (StripeKey, StripeReq) {
     let origin_ref = OriginRef {
         backend_id: resolved.backend_id.clone(),
         origin_object_id: resolved.origin_object_id.clone(),
@@ -791,9 +784,7 @@ fn status_line_response(status: u16) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::bufferpool::{Error, PipelinedRead, ReadStream, WindowedRead};
-    use crate::config::{
-        FrontendMount, HttpFrontendConfig, ResolvedFrontendMount, ResolvedKeyspaceRoute,
-    };
+    use crate::config::{HttpFrontendConfig, ResolvedKeyspaceRoute};
     use crate::fanout::NumaShardTable;
     use crate::frontend::range::StripeSlice;
     use crate::storage::disks::CacheDirectorySet;
@@ -802,11 +793,7 @@ mod tests {
     fn spec(id: &str, addr: &str) -> FrontendSpec {
         FrontendSpec {
             name: id.to_string(),
-            mounts: vec![FrontendMount {
-                public_prefix: "/".to_string(),
-                source: "models-cache".to_string(),
-                key_prefix: "/".to_string(),
-            }],
+            source: "models-cache".to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: addr.to_string(),
             })),
@@ -829,19 +816,16 @@ mod tests {
     fn binding() -> ResolvedFrontendBinding {
         ResolvedFrontendBinding {
             frontend_id: "primary".to_string(),
-            mounts: vec![ResolvedFrontendMount {
-                public_prefix: "/".to_string(),
-                keyspace_id: "models".to_string(),
+            keyspace_id: Some("models".to_string()),
+            backend_id: None,
+            cache_id: Some("cache-a".to_string()),
+            neighborhood_id: Some("site-a".to_string()),
+            bypass_cache: false,
+            routes: vec![ResolvedKeyspaceRoute {
                 key_prefix: "/".to_string(),
-                cache_id: Some("cache-a".to_string()),
-                neighborhood_id: Some("site-a".to_string()),
-                bypass_cache: false,
-                routes: vec![ResolvedKeyspaceRoute {
-                    key_prefix: "/".to_string(),
-                    backend_id: "primary".to_string(),
-                    origin_prefix: "/origin/".to_string(),
-                    stripe_size: 4 * 1024 * 1024,
-                }],
+                backend_id: "primary".to_string(),
+                origin_prefix: "/origin/".to_string(),
+                stripe_size: 4 * 1024 * 1024,
             }],
         }
     }
