@@ -79,7 +79,7 @@ func AppliedConfigPath(machineName string) string {
 
 const (
 	ContainerdVersion = "2.1.8"
-	RunCVersion       = "1.1.12"
+	RunCVersion       = "1.5.0"
 	CNIPluginVersion  = "1.5.1"
 
 	ContainerdMetricsAddress = "0.0.0.0:10257"

@@ -176,7 +176,7 @@ type ContainerdConfig struct {
 
 // RuncConfig holds runc-specific overrides.
 type RuncConfig struct {
-	// Version overrides the default runc version (e.g. "1.1.12").
+	// Version overrides the default runc version (e.g. "1.5.0").
 	Version string `json:"Version,omitempty"`
 }
 
