@@ -1,0 +1,666 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: nightly
+
+# ---------------------------------------------------------------------------
+# Builds a snapshot of `main` from source every morning and deploys it to the
+# integration cluster (unbounded-nightly) so the tip of the tree gets the same
+# soak treatment that releases get on unbounded-stable.
+#
+# Relationship to release-upgrade.yaml
+# ------------------------------------
+# This is the nightly sibling of .github/workflows/release-upgrade.yaml. That
+# workflow deploys a PUBLISHED, signed release (downloaded as a manifests
+# tarball from a GitHub Release) to unbounded-stable. This one has no release
+# and no tag: it builds the current main HEAD from source, pushes images
+# tagged `nightly-<shortsha>`, renders manifests against those tags, and
+# deploys them to unbounded-nightly. There is deliberately no cosign signing,
+# SBOM, or Trivy gating here: the nightly cluster is a throwaway soak target,
+# not a customer artifact. The full supply chain stays on the release path.
+#
+# Schedule
+# --------
+# Runs at 06:00 UTC daily. GitHub Actions cron is UTC-only and does not follow
+# US daylight saving, so this lands at 01:00 ET (EST) / 02:00 ET (EDT). We run
+# early on purpose: a from-source build of every component plus a deploy and
+# smoke pass needs to finish well before the US working day, so 06:00 UTC is
+# chosen over a literal 4am-ET cron to leave that headroom.
+#
+# Target cluster
+# --------------
+# The target cluster is configured via the `unbounded-nightly` GitHub
+# Environment, which provides:
+#   - secret KUBECONFIG                 (raw kubeconfig file contents)
+#   - vars   SITE_NAME, CLUSTER_NODE_CIDR, CLUSTER_POD_CIDR,
+#            SITE_NODE_CIDR, SITE_POD_CIDR, MANAGE_CNI_PLUGIN,
+#            ORCA_AZURE_ACCOUNT, ORCA_AZURE_CONTAINER, ORCA_AZURE_ENDPOINT
+#   - cluster Secret unbounded-kube/orca-credentials for confidential Orca
+#     values (Azure account key and Garage S3 credentials)
+#
+# First-time setup (run once, out of band):
+#   1. Provision the AKS cluster and configure the Environment:
+#        hack/scripts/setup-deploy-environment.sh \
+#          --env-name unbounded-nightly --site-name nightly \
+#          --kubeconfig <path> --cluster-node-cidr ... --cluster-pod-cidr ... \
+#          --site-node-cidr ... --site-pod-cidr ... \
+#          --orca-azure-account ... --orca-azure-container ...
+#      Use CIDRs distinct from unbounded-stable.
+#   2. Pre-create the orca-credentials Secret:
+#        hack/orca/create-credentials-secret.sh ... (against the nightly cluster)
+#   3. Label at least one gateway node:
+#        kubectl label node <n> unbounded-cloud.io/unbounded-net-gateway=true --overwrite
+#   4. Bootstrap once (or let the first scheduled run auto-init, since the
+#      Site CRD is absent on a fresh cluster):
+#        gh workflow run nightly.yaml -f force_init=true
+#
+# Customization points (search for "CUSTOMIZE:" in this file)
+# ------------------------------------------------------------
+#   - Add a smoke test       -> drop a script in hack/release/smoke/
+#                               (shared with release-upgrade.yaml)
+#   - Change the schedule    -> edit the cron below
+#   - Change target cluster  -> change `environment:` on the relevant jobs
+# ---------------------------------------------------------------------------
+
+on:
+  schedule:
+    # 06:00 UTC daily. See the "Schedule" note in the header above.
+    - cron: "0 6 * * *"
+
+  # Manual trigger for re-deploys, first bootstrap, and testing a specific ref.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to snapshot (default: the default branch)"
+        required: false
+        type: string
+      force_init:
+        description: "Run 'site init' instead of upgrade-apply (use for first-ever bootstrap)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+# Only the freshest snapshot matters. If a new nightly starts while an old one
+# is still running, cancel the old one.
+concurrency:
+  group: deploy-nightly
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+  CNI_PLUGINS_VERSION: v1.9.1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the commit to snapshot and derive the nightly image tag.
+  #
+  # The downstream build and deploy jobs all pin to `resolve.outputs.sha` so a
+  # branch advance mid-run cannot split the snapshot across two commits.
+  # ---------------------------------------------------------------------------
+  resolve:
+    if: github.repository == 'Azure/unbounded'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.ref || github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Resolve snapshot commit and tag
+        id: resolve
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          SHORT="$(git rev-parse --short HEAD)"
+          TAG="nightly-${SHORT}"
+          {
+            echo "sha=${SHA}"
+            echo "tag=${TAG}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Snapshot commit: ${SHA}"
+          echo "Nightly tag:     ${TAG}"
+
+  # ---------------------------------------------------------------------------
+  # Build and push the net controller/node images for the snapshot (amd64).
+  #
+  # Mirrors release.yaml's net-images job minus the multi-arch matrix, Trivy
+  # gating, cosign signing, and SBOM attestation. The frontend is built inline
+  # (release.yaml shares it across a per-arch matrix via an artifact; we have a
+  # single amd64 build, so inline is simpler) and staged into the embed dir.
+  # ---------------------------------------------------------------------------
+  net-images:
+    needs: resolve
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Normalize container registry to lowercase
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend and stage into the net embed dir
+        run: |
+          set -euo pipefail
+          npm ci --prefer-offline --no-audit
+          npm run build
+          # internal/net/html/pages.go embeds internal/net/html/dist via
+          # go:embed; the Containerfile copies the whole context, so the Go
+          # build picks up exactly this snapshot's UI.
+          rm -rf ../internal/net/html/dist
+          mkdir -p ../internal/net/html/dist
+          cp -R dist/. ../internal/net/html/dist/
+        working-directory: frontend
+
+      - name: Cache CNI plugins
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: resources
+          key: cni-plugins-amd64-${{ env.CNI_PLUGINS_VERSION }}
+
+      - name: Download CNI plugins
+        run: |
+          set -euo pipefail
+          mkdir -p resources
+          file="resources/cni-plugins-linux-amd64-${CNI_PLUGINS_VERSION}.tgz"
+          if [ ! -s "$file" ]; then
+            curl -fsSL \
+              "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-amd64-${CNI_PLUGINS_VERSION}.tgz" \
+              -o "$file"
+          fi
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute Go version for Docker
+        id: goversion
+        run: echo "go_version=$(awk '/^go /{split($2,v,"."); print v[1]"."v[2]}' go.mod)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push controller image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: images/net/Containerfile
+          target: controller
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            GO_VERSION=${{ steps.goversion.outputs.go_version }}
+            VERSION=${{ env.TAG }}
+            GIT_COMMIT=${{ env.SHA }}
+            CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+          tags: ${{ env.REGISTRY }}/unbounded-net-controller:${{ env.TAG }}
+          cache-from: type=gha,scope=nightly-net-controller
+          cache-to: type=gha,scope=nightly-net-controller,mode=max
+
+      - name: Build and push node image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: images/net/Containerfile
+          target: node
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            GO_VERSION=${{ steps.goversion.outputs.go_version }}
+            VERSION=${{ env.TAG }}
+            GIT_COMMIT=${{ env.SHA }}
+            CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+          tags: ${{ env.REGISTRY }}/unbounded-net-node:${{ env.TAG }}
+          cache-from: type=gha,scope=nightly-net-node
+          cache-to: type=gha,scope=nightly-net-node,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Build and push the remaining images the deploy needs (amd64).
+  #   - machina  : applied as part of the core deploy
+  #   - orca      : deployed separately by the deploy-orca job
+  # machine-ops-controller is intentionally omitted: like release-upgrade.yaml,
+  # the deploy applies only net/ and machina/, so machine-ops is never rolled
+  # out here and would be dead weight to build.
+  # ---------------------------------------------------------------------------
+  component-images:
+    needs: resolve
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component:
+          - name: machina
+            file: images/machina/Containerfile
+          - name: orca
+            file: images/orca/Containerfile
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Normalize container registry to lowercase
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.component.name }} image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ${{ matrix.component.file }}
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            VERSION=${{ env.TAG }}
+            GIT_COMMIT=${{ env.SHA }}
+          tags: ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ env.TAG }}
+          cache-from: type=gha,scope=nightly-${{ matrix.component.name }}
+          cache-to: type=gha,scope=nightly-${{ matrix.component.name }},mode=max
+
+  # ---------------------------------------------------------------------------
+  # Deploy the snapshot to unbounded-nightly.
+  #
+  #   MODE=init     -> 'kubectl unbounded site init' using manifests embedded
+  #                    into a plugin built from this snapshot (stamped with the
+  #                    nightly image tags). Used for the first bootstrap.
+  #   MODE=upgrade  -> render the machina + net manifests for the nightly tags
+  #                    and server-side apply them.
+  #
+  # Unlike release-upgrade.yaml the manifests are rendered here from the
+  # snapshot checkout (no tarball download, no cosign verify): there is no
+  # release artifact for a nightly.
+  # ---------------------------------------------------------------------------
+  deploy:
+    needs: [resolve, net-images, component-images]
+    if: github.repository == 'Azure/unbounded'
+    runs-on: ubuntu-latest
+    environment: unbounded-nightly
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SITE_NAME: ${{ vars.SITE_NAME }}
+      CLUSTER_NODE_CIDR: ${{ vars.CLUSTER_NODE_CIDR }}
+      CLUSTER_POD_CIDR: ${{ vars.CLUSTER_POD_CIDR }}
+      SITE_NODE_CIDR: ${{ vars.SITE_NODE_CIDR }}
+      SITE_POD_CIDR: ${{ vars.SITE_POD_CIDR }}
+      MANAGE_CNI_PLUGIN: ${{ vars.MANAGE_CNI_PLUGIN }}
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - name: Validate environment configuration
+        run: |
+          set -euo pipefail
+          missing=()
+          for v in SITE_NAME CLUSTER_NODE_CIDR CLUSTER_POD_CIDR SITE_NODE_CIDR SITE_POD_CIDR MANAGE_CNI_PLUGIN; do
+            if [[ -z "${!v}" ]]; then
+              missing+=("$v")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing required Environment variables: ${missing[*]}"
+            echo "::error::Configure with hack/scripts/setup-deploy-environment.sh"
+            exit 1
+          fi
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
+
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KUBECONFIG_CONTENT}" ]]; then
+            echo "::error::Environment secret KUBECONFIG is empty"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KUBECONFIG_CONTENT" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Verify cluster connectivity
+        run: |
+          set -euo pipefail
+          kubectl version
+          kubectl cluster-info
+
+      - name: Determine deploy mode
+        id: mode
+        run: |
+          set -euo pipefail
+          MODE=upgrade
+          if [[ "${{ inputs.force_init }}" == "true" ]]; then
+            MODE=init
+            echo "force_init=true; selecting init mode"
+          elif ! kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1; then
+            MODE=init
+            echo "Site CRD not present; selecting init mode"
+          elif ! kubectl get site.net.unbounded-cloud.io "${SITE_NAME}" >/dev/null 2>&1; then
+            MODE=init
+            echo "Site '${SITE_NAME}' not present; selecting init mode"
+          else
+            echo "Site '${SITE_NAME}' exists; selecting upgrade mode"
+          fi
+          echo "MODE=${MODE}" >> "$GITHUB_ENV"
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+
+      - name: Build kubectl-unbounded plugin (init)
+        if: env.MODE == 'init'
+        # Building the plugin re-renders the embedded net + machina manifests
+        # stamped with this snapshot's nightly tags, so 'site init' installs
+        # manifests that reference the images built above.
+        run: |
+          set -euo pipefail
+          make kubectl-unbounded-build VERSION="${TAG}" CONTAINER_REGISTRY="${REGISTRY,,}"
+
+      - name: Run site init (first install)
+        if: env.MODE == 'init'
+        run: |
+          set -euo pipefail
+          ./bin/kubectl-unbounded site init \
+            --name "${SITE_NAME}" \
+            --cluster-node-cidr "${CLUSTER_NODE_CIDR}" \
+            --cluster-pod-cidr  "${CLUSTER_POD_CIDR}" \
+            --node-cidr         "${SITE_NODE_CIDR}" \
+            --pod-cidr          "${SITE_POD_CIDR}" \
+            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}"
+
+      - name: Render manifests (upgrade)
+        if: env.MODE == 'upgrade'
+        run: |
+          set -euo pipefail
+          make machina-manifests net-manifests \
+            VERSION="${TAG}" \
+            CONTAINER_REGISTRY="${REGISTRY,,}"
+
+      - name: Apply CRDs (upgrade)
+        if: env.MODE == 'upgrade'
+        run: |
+          set -euo pipefail
+          kubectl apply --server-side --force-conflicts -f deploy/net/rendered/crd/
+          kubectl apply --server-side --force-conflicts -f deploy/machina/rendered/crd/
+          kubectl wait --for=condition=Established crd --all --timeout=120s
+
+      - name: Workaround for #235 - merge bundled machina-config with live ConfigMap
+        if: env.MODE == 'upgrade'
+        # Same #235 workaround as release-upgrade.yaml: preserve the live
+        # per-cluster apiServerEndpoint (only set by 'site init') when applying
+        # the freshly rendered machina-config. The merge script lives in-tree
+        # on the snapshot, so no default-branch sparse-checkout is needed.
+        #
+        # REMOVE once https://github.com/Azure/unbounded/issues/235 lands.
+        env:
+          BUNDLE_FILE: deploy/machina/rendered/03-config.yaml
+          MERGE_SCRIPT: hack/release/merge-machina-config.py
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$BUNDLE_FILE" ]]; then
+            echo "::warning::Workaround for #235 expected ${BUNDLE_FILE} but it was not present; the workaround may no longer be needed"
+            exit 0
+          fi
+
+          LIVE_INNER=$(kubectl -n unbounded-kube get cm machina-config \
+            -o jsonpath='{.data.config\.yaml}' --ignore-not-found)
+          export LIVE_INNER
+
+          python3 "$MERGE_SCRIPT"
+
+      - name: Apply manifests (upgrade)
+        if: env.MODE == 'upgrade'
+        run: |
+          set -euo pipefail
+          kubectl apply --server-side --force-conflicts -R -f deploy/net/rendered/
+          kubectl apply --server-side --force-conflicts -R -f deploy/machina/rendered/
+
+      - name: Wait for rollouts
+        run: |
+          set -euo pipefail
+          kubectl -n unbounded-net  rollout status deploy/unbounded-net-controller --timeout=5m
+          kubectl -n unbounded-net  rollout status ds/unbounded-net-node           --timeout=5m
+          kubectl -n unbounded-kube rollout status deploy/machina-controller       --timeout=5m
+
+      - name: Summarize deploy
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Nightly deploy"
+            echo ""
+            echo "- Tag: \`${TAG}\`"
+            echo "- Mode: \`${MODE:-unknown}\`"
+            echo "- Environment: \`unbounded-nightly\`"
+            echo "- Site: \`${SITE_NAME}\`"
+            echo ""
+            echo "### Workload images"
+            echo ""
+            echo '```'
+            kubectl -n unbounded-net  get deploy unbounded-net-controller -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-net  get ds     unbounded-net-node       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-kube get deploy machina-controller       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Deploy Orca (origin cache) to unbounded-nightly. Reuses the shared,
+  # deployment-neutral hack/orca/deploy-integration.sh (same script the stable
+  # deploy uses); it targets whatever cluster KUBECONFIG points at.
+  # ---------------------------------------------------------------------------
+  deploy-orca:
+    needs: [resolve, deploy]
+    if: github.repository == 'Azure/unbounded'
+    runs-on: ubuntu-latest
+    environment: unbounded-nightly
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      ORCA_AZURE_ACCOUNT: ${{ vars.ORCA_AZURE_ACCOUNT }}
+      ORCA_AZURE_CONTAINER: ${{ vars.ORCA_AZURE_CONTAINER }}
+      ORCA_AZURE_ENDPOINT: ${{ vars.ORCA_AZURE_ENDPOINT }}
+    steps:
+      - name: Validate Orca environment configuration
+        run: |
+          set -euo pipefail
+          missing=()
+          for v in ORCA_AZURE_ACCOUNT ORCA_AZURE_CONTAINER; do
+            if [[ -z "${!v}" ]]; then
+              missing+=("$v")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing required Environment variables: ${missing[*]}"
+            echo "::error::Configure with hack/scripts/setup-deploy-environment.sh"
+            exit 1
+          fi
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
+
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KUBECONFIG_CONTENT}" ]]; then
+            echo "::error::Environment secret KUBECONFIG is empty"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KUBECONFIG_CONTENT" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Verify cluster connectivity
+        run: |
+          set -euo pipefail
+          kubectl version
+          kubectl cluster-info
+
+      - name: Verify orca-credentials Secret exists
+        run: |
+          set -euo pipefail
+          if ! kubectl -n unbounded-kube get secret orca-credentials >/dev/null 2>&1; then
+            echo "::error::Secret orca-credentials not found in unbounded-kube; pre-create it with ORCA_AZUREBLOB_ACCOUNT_KEY, ORCA_CACHESTORE_S3_ACCESS_KEY, ORCA_CACHESTORE_S3_SECRET_KEY"
+            exit 1
+          fi
+
+      - name: Deploy Orca
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY,,}/orca:${TAG}"
+          echo "Deploying Orca image: ${IMAGE}"
+          ./hack/orca/deploy-integration.sh \
+            --image "${IMAGE}" \
+            --azure-account "${ORCA_AZURE_ACCOUNT}" \
+            --azure-container "${ORCA_AZURE_CONTAINER}" \
+            --azure-endpoint "${ORCA_AZURE_ENDPOINT}"
+
+      - name: Summarize Orca deploy
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Orca deploy"
+            echo ""
+            echo "- Tag: \`${TAG}\`"
+            echo "- Image: \`${REGISTRY,,}/orca:${TAG}\`"
+            echo "- Environment: \`unbounded-nightly\`"
+            echo ""
+            echo '```'
+            kubectl -n unbounded-kube get deploy orca   -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-kube get deploy garage -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Discover smoke tests (shared with release-upgrade.yaml: hack/release/smoke).
+  # Runs from the snapshot checkout. Emits a JSON matrix; skips cleanly if the
+  # directory is absent or empty (GitHub errors on an empty matrix).
+  # ---------------------------------------------------------------------------
+  smoke-discover:
+    needs: [resolve, deploy]
+    runs-on: ubuntu-latest
+    outputs:
+      tasks: ${{ steps.list.outputs.tasks }}
+      has_tasks: ${{ steps.list.outputs.has_tasks }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Discover smoke tasks
+        id: list
+        run: |
+          set -euo pipefail
+          if [[ ! -d hack/release/smoke ]]; then
+            echo "has_tasks=false" >> "$GITHUB_OUTPUT"
+            echo "tasks=[]" >> "$GITHUB_OUTPUT"
+            echo "hack/release/smoke does not exist at this ref; skipping smoke tests"
+            exit 0
+          fi
+          tasks=$(
+            find hack/release/smoke -maxdepth 1 -type f -name '*.sh' \
+              | sort \
+              | jq -R -s -c 'split("\n") | map(select(length>0)) |
+                  map({name: (. | sub(".*/"; "") | sub(".sh$"; "")), script: .})'
+          )
+          if [[ -z "$tasks" || "$tasks" == "[]" ]]; then
+            echo "has_tasks=false" >> "$GITHUB_OUTPUT"
+            echo "tasks=[]" >> "$GITHUB_OUTPUT"
+            echo "No smoke tasks found in hack/release/smoke/"
+          else
+            echo "has_tasks=true" >> "$GITHUB_OUTPUT"
+            echo "tasks=${tasks}" >> "$GITHUB_OUTPUT"
+            echo "Discovered smoke tasks:"
+            echo "${tasks}" | jq .
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Smoke tests. Runs once per deploy, after core + Orca deploys complete. Each
+  # task gets TAG, KUBECONFIG, and SITE_NAME exported. See the CUSTOMIZE block
+  # in release-upgrade.yaml for the smoke-script contract (it is shared).
+  # ---------------------------------------------------------------------------
+  smoke-tests:
+    needs: [resolve, deploy, deploy-orca, smoke-discover]
+    if: needs.smoke-discover.outputs.has_tasks == 'true'
+    runs-on: ubuntu-latest
+    environment: unbounded-nightly
+    strategy:
+      fail-fast: false
+      matrix:
+        task: ${{ fromJSON(needs.smoke-discover.outputs.tasks) }}
+    name: smoke (${{ matrix.task.name }})
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SITE_NAME: ${{ vars.SITE_NAME }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
+
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KUBECONFIG_CONTENT}" ]]; then
+            echo "::error::Environment secret KUBECONFIG is empty"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KUBECONFIG_CONTENT" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Run smoke task ${{ matrix.task.name }}
+        timeout-minutes: 15
+        env:
+          SMOKE_SCRIPT: ${{ matrix.task.script }}
+        run: |
+          set -euo pipefail
+          chmod +x "$SMOKE_SCRIPT"
+          "$SMOKE_SCRIPT"
