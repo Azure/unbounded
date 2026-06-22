@@ -570,9 +570,17 @@ mod tests {
                 },
             )),
         });
+        c.keyspaces.push(crate::config::KeyspaceSpec {
+            name: "ks".to_string(),
+            routes: vec![crate::config::KeyspaceRoute {
+                key_prefix: "/".to_string(),
+                backend: "b".to_string(),
+                origin_prefix: "/".to_string(),
+            }],
+        });
         c.neighborhoods.push(crate::config::NeighborhoodSpec {
             name: "n".to_string(),
-            source: "b".to_string(),
+            source: "ks".to_string(),
             fingers_per_node: Some(100),
             local_node_id: Some(0),
             local_tags: Vec::new(),

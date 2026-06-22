@@ -231,9 +231,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "n"
-source = "b"
+source = "ks"
 fingers_per_node = 1234
 "#;
 
@@ -243,9 +251,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "n"
-source = "b"
+source = "ks"
 fingers_per_node = 5678
 "#;
 
@@ -257,9 +273,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "n"
-source = "b"
+source = "ks"
 fingers_per_node = {fingers_per_node}
 "#,
         )

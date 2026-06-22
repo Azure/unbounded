@@ -36,7 +36,7 @@ pub use admission::{AdmissionFilter, AdmitDecision, StripeAdmission};
 pub use engine::{EngineConfig, StorageEngine};
 pub use local::{LocalStorage, ShardLocalStore, disk_for};
 pub use metadata::ObjectMetadata;
-pub use origin::{METADATA_STRIPE_IDX, OriginRef, StripeReq, stripe_key};
+pub use origin::{KeyRef, METADATA_STRIPE_IDX, OriginRef, StripeReq, stripe_key};
 pub use page_channel::{PageChannel, PageChannelReceiver, PageCommand, PageService, ReplySlot};
 pub use traits::PageChecksum;
 pub use types::{Checksum, DiskId, Error, Lba, PageKey};

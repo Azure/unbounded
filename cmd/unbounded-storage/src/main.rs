@@ -47,12 +47,6 @@ mod shard_layer;
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
-/// Stripe granularity used to build an inert origin backend on shards
-/// that have no configured backend. Such a backend is never exercised
-/// (no frontend drives reads against the pool), so the value is
-/// immaterial; it only has to make the `ShardPool` type check.
-const DEFAULT_STRIPE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
-
 /// Process-wide shutdown flag. Set by the signal handler (which
 /// is restricted to async-signal-safe operations) and polled by
 /// the main thread plus every shard thread.
@@ -624,19 +618,6 @@ fn run_shard(
     // joins anyone) would leave a peer ring pointing at unmapped memory.
     let backing_keepalive = backing.keepalive();
 
-    // Stripe geometry per backend name, shared (behind an `Rc`) with the
-    // frontend registry and the control-drain hook so a live backend
-    // add/replace keeps every frontend's stripe size in sync. A frontend
-    // references a backend by name; load-time validation guarantees the
-    // referent exists, but the registry falls back to the default stripe
-    // size if a lookup races an as-yet-unapplied backend add.
-    let geometry: Rc<RefCell<HashMap<String, u64>>> = Rc::new(RefCell::new(
-        backend_specs
-            .iter()
-            .map(|b| (b.name.clone(), b.stripe_size_bytes()))
-            .collect(),
-    ));
-
     // Build the shard's origin-backend registry: every configured
     // backend, keyed by name, behind an `ArcSwap` so a live config apply
     // can add/remove/replace a tier without tearing down the shard.
@@ -850,13 +831,12 @@ fn run_shard(
     // below) drives whichever drivers are live, and the control-drain
     // hook adds/removes drivers on a config apply; the `ShardLoop` has no
     // hook-removal API, so the registry (not the hook set) is the unit of
-    // liveness. Each frontend stamps its backend id into every request,
-    // so per-frontend origin routing falls out of the backend registry.
+    // liveness. Each frontend binding resolves request paths into a
+    // logical keyspace key plus the origin backend/object for cache misses.
     let frontend_ctx = FrontendBuildCtx {
         pool: pool.clone(),
         handle: NetHandle::new(socket.clone()),
         fanout: fanout.clone(),
-        geometry: geometry.clone(),
         bindings: Rc::new(RefCell::new((*frontend_bindings).clone())),
         page_size,
         worker_idx: widx.0,
@@ -874,8 +854,7 @@ fn run_shard(
     // thread-local. Each `ShardCommand::ApplyConfig` republishes the
     // routing surface through this shard's `RoutingHandle` (observed
     // atomically by its transport; the fabric RPC handlers are reloaded
-    // separately by the `FabricGroup`), refreshes the stripe geometry,
-    // reconciles the transport origin-backend registry and the frontend
+    // separately by the `FabricGroup`), reconciles the transport origin-backend registry and the frontend
     // registry toward the new config, and then acknowledges
     // so the coordinator's blocking apply can complete. Everything is
     // driven from this one thread so the `ArcSwap` publishes are ordered
@@ -885,7 +864,6 @@ fn run_shard(
         let routes = routes.clone();
         let transport_registry = transport_registry.clone();
         let frontend_registry = frontend_registry.clone();
-        let geometry = geometry.clone();
         let bindings = frontend_registry.ctx.bindings.clone();
         let mut last_backends: HashMap<String, BackendSpec> = backend_specs
             .iter()
@@ -920,17 +898,6 @@ fn run_shard(
                         let desired_frontends = apply.config.frontends.as_slice();
                         let desired_frontend_backends =
                             config::frontend_backend_map(&projection.frontends);
-
-                        // Refresh stripe geometry before building any
-                        // frontend so a co-applied backend stripe change
-                        // is visible to a frontend add in the same pass.
-                        {
-                            let mut g = geometry.borrow_mut();
-                            g.clear();
-                            for b in desired_backends {
-                                g.insert(b.name.clone(), b.stripe_size_bytes());
-                            }
-                        }
 
                         let frontends_to_rebuild = frontend_rebuild_ids(
                             &last_bindings,
@@ -1238,28 +1205,9 @@ struct FrontendBuildCtx {
     /// locally). Shared behind an `Rc` so cloning the context stays
     /// cheap.
     fanout: Rc<FanoutTable>,
-    /// Backend name -> stripe size, shared (and live-updated) with the
-    /// control-drain hook so a frontend brought up after a backend
-    /// stripe change sees the new geometry. A frontend's stripe size is
-    /// that of the backend it serves.
-    geometry: Rc<RefCell<HashMap<String, u64>>>,
     bindings: Rc<RefCell<HashMap<String, ResolvedFrontendBinding>>>,
     page_size: usize,
     worker_idx: u16,
-}
-
-/// Resolve the stripe size a frontend should serve from the shard's
-/// live backend geometry. A frontend inherits the stripe size of the
-/// backend it references; if that backend is not yet present in the
-/// geometry (for example a frontend whose backend add is still
-/// deferred), fall back to [`DEFAULT_STRIPE_SIZE_BYTES`] so the driver
-/// can still be built and will pick up the real value when the geometry
-/// is refreshed on a later apply.
-fn frontend_stripe_size(geometry: &HashMap<String, u64>, backend_id: &str) -> u64 {
-    geometry
-        .get(backend_id)
-        .copied()
-        .unwrap_or(DEFAULT_STRIPE_SIZE_BYTES)
 }
 
 fn frontend_rebuild_ids(
@@ -1280,7 +1228,9 @@ fn frontend_rebuild_ids(
         .iter()
         .filter_map(|(id, binding)| {
             (last_bindings.get(id) != Some(binding)
-                || changed_backend_geometry.contains(&binding.backend_id))
+                || binding_backends(binding)
+                    .iter()
+                    .any(|backend_id| changed_backend_geometry.contains(backend_id)))
             .then(|| id.clone())
         })
         .collect();
@@ -1288,13 +1238,22 @@ fn frontend_rebuild_ids(
     rebuild
 }
 
+fn binding_backends(binding: &ResolvedFrontendBinding) -> Vec<String> {
+    let mut backends: Vec<String> = binding
+        .mounts
+        .iter()
+        .flat_map(|mount| mount.routes.iter().map(|route| route.backend_id.clone()))
+        .collect();
+    backends.sort();
+    backends.dedup();
+    backends
+}
+
 impl FrontendBuildCtx {
     /// Turn one [`FrontendSpec`] into a bound, ready-to-drive
     /// [`ShardFrontendDriver`]. Validates the spec, binds the shard's
-    /// `SO_REUSEPORT` listener, and selects the stripe size from the
-    /// referenced backend's geometry (falling back to the default if the
-    /// backend is not yet known). Returns a human-readable error string
-    /// so it slots into the reconcile traits' `Result<_, String>`.
+    /// `SO_REUSEPORT` listener. Returns a human-readable error string so
+    /// it slots into the reconcile traits' `Result<_, String>`.
     fn build(&self, spec: &FrontendSpec) -> Result<ShardFrontendDriver, String> {
         let binding = self
             .bindings
@@ -1302,7 +1261,6 @@ impl FrontendBuildCtx {
             .get(&spec.name)
             .cloned()
             .ok_or_else(|| format!("frontend {} has no resolved binding", spec.name))?;
-        let stripe_size = frontend_stripe_size(&self.geometry.borrow(), &binding.backend_id);
         match spec.config.as_ref() {
             Some(frontend_spec::Config::Http(_)) => {
                 let frontend = HttpFrontend::from_spec(spec)
@@ -1315,13 +1273,9 @@ impl FrontendBuildCtx {
                     self.handle.clone(),
                     listen_fd,
                     Rc::from(spec.name.as_str()),
-                    binding.backend_id.clone(),
-                    binding.cache_id.clone(),
-                    binding.neighborhood_id.clone(),
-                    stripe_size,
+                    binding,
                     self.page_size,
                     self.fanout.clone(),
-                    binding.bypass_cache,
                 )))
             }
             Some(frontend_spec::Config::S3(_)) => {
@@ -1335,12 +1289,8 @@ impl FrontendBuildCtx {
                     self.handle.clone(),
                     listen_fd,
                     Rc::from(spec.name.as_str()),
-                    binding.backend_id.clone(),
-                    binding.cache_id.clone(),
-                    binding.neighborhood_id.clone(),
-                    stripe_size,
+                    binding,
                     self.page_size,
-                    binding.bypass_cache,
                 )))
             }
             Some(frontend_spec::Config::Loadgen(_)) => {
@@ -1349,12 +1299,8 @@ impl FrontendBuildCtx {
                 Ok(ShardFrontendDriver::Loadgen(LoadgenDriver::new(
                     frontend,
                     self.pool.clone(),
-                    binding.backend_id.clone(),
-                    binding.cache_id.clone(),
-                    binding.neighborhood_id.clone(),
-                    stripe_size,
+                    binding,
                     self.page_size,
-                    binding.bypass_cache,
                     self.worker_idx,
                 )))
             }
@@ -1967,32 +1913,21 @@ mod tests {
     fn binding(frontend_id: &str, backend_id: &str) -> ResolvedFrontendBinding {
         ResolvedFrontendBinding {
             frontend_id: frontend_id.to_string(),
-            backend_id: backend_id.to_string(),
-            cache_id: None,
-            neighborhood_id: None,
-            bypass_cache: true,
+            mounts: vec![config::ResolvedFrontendMount {
+                public_prefix: "/".to_string(),
+                keyspace_id: "ks".to_string(),
+                key_prefix: "/".to_string(),
+                cache_id: None,
+                neighborhood_id: None,
+                bypass_cache: true,
+                routes: vec![config::ResolvedKeyspaceRoute {
+                    key_prefix: "/".to_string(),
+                    backend_id: backend_id.to_string(),
+                    origin_prefix: "/".to_string(),
+                    stripe_size: 4 * 1024 * 1024,
+                }],
+            }],
         }
-    }
-
-    #[test]
-    fn frontend_stripe_size_uses_backend_geometry() {
-        // A frontend inherits the stripe size of the backend it
-        // references when that backend is present in the geometry.
-        let mut geometry = HashMap::new();
-        geometry.insert("b".to_string(), 8 * 1024 * 1024);
-        assert_eq!(frontend_stripe_size(&geometry, "b"), 8 * 1024 * 1024);
-    }
-
-    #[test]
-    fn frontend_stripe_size_falls_back_when_backend_absent() {
-        // A frontend whose backend is not yet known (e.g. a deferred
-        // backend add) builds against the default stripe size and picks
-        // up the real value when the geometry is refreshed.
-        let geometry = HashMap::new();
-        assert_eq!(
-            frontend_stripe_size(&geometry, "missing"),
-            DEFAULT_STRIPE_SIZE_BYTES,
-        );
     }
 
     #[test]

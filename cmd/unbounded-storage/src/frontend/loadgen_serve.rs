@@ -16,12 +16,12 @@ use std::task::{Context, Waker};
 use std::time::Instant;
 
 use crate::bufferpool::{BufferPool, ReadStream, StripePlan};
-use crate::config::{FrontendSpec, frontend_spec};
+use crate::config::{FrontendSpec, ResolvedFrontendBinding, ResolvedObject, frontend_spec};
 use crate::frontend::FrontendError;
 use crate::frontend::range::{ResolvedRange, stripe_set};
 use crate::metrics;
 use crate::runtime::noop_waker;
-use crate::storage::{ObjectMetadata, OriginRef, StripeReq};
+use crate::storage::{KeyRef, ObjectMetadata, OriginRef, StripeReq};
 
 const DEFAULT_WORKERS: u32 = 1;
 const DEFAULT_SEED: u64 = 0xBE_DE_CA_FE;
@@ -72,27 +72,18 @@ pub struct LoadgenDriver<P: BufferPool<Req = StripeReq> + 'static> {
 }
 
 impl<P: BufferPool<Req = StripeReq> + 'static> LoadgenDriver<P> {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         frontend: LoadgenFrontend,
         pool: Rc<P>,
-        backend_id: String,
-        cache_id: Option<String>,
-        neighborhood_id: Option<String>,
-        stripe_size: u64,
+        binding: ResolvedFrontendBinding,
         page_size: usize,
-        bypass: bool,
         shard_idx: u16,
     ) -> Self {
         let worker_count = frontend.workers as usize;
         let cfg = Rc::new(LoadgenRun {
             frontend_id: frontend.id,
-            backend_id,
-            cache_id,
-            neighborhood_id,
-            stripe_size,
+            binding,
             page_size,
-            bypass,
             shard_idx,
             seed: frontend.seed,
             object_count: frontend.object_count,
@@ -145,12 +136,8 @@ struct LoadgenWorker {
 
 struct LoadgenRun {
     frontend_id: String,
-    backend_id: String,
-    cache_id: Option<String>,
-    neighborhood_id: Option<String>,
-    stripe_size: u64,
+    binding: ResolvedFrontendBinding,
     page_size: usize,
-    bypass: bool,
     shard_idx: u16,
     seed: u64,
     object_count: u64,
@@ -195,7 +182,8 @@ async fn read_generated_object<P: BufferPool<Req = StripeReq>>(
         cfg.object_count,
         seq,
     );
-    let object_len = read_object_length(pool, cfg, &object_id).await?;
+    let resolved = cfg.binding.resolve_path(&object_id).ok_or(())?;
+    let object_len = read_object_length(pool, &resolved, cfg.page_size).await?;
     let read_len = if cfg.read_bytes == 0 {
         object_len
     } else {
@@ -205,18 +193,22 @@ async fn read_generated_object<P: BufferPool<Req = StripeReq>>(
         start: 0,
         end: read_len,
     };
-    read_body(pool, cfg, &object_id, range).await
+    read_body(pool, cfg, &resolved, range).await
 }
 
 async fn read_object_length<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
-    cfg: &LoadgenRun,
-    object_id: &str,
+    resolved: &ResolvedObject,
+    page_size: usize,
 ) -> Result<u64, ()> {
-    let origin_ref = OriginRef::metadata_entry(&cfg.backend_id, object_id);
-    let req = request_from_origin(origin_ref, cfg);
+    let origin_ref = OriginRef::metadata_entry(&resolved.backend_id, &resolved.origin_object_id);
+    let req = request_from_origin(
+        KeyRef::metadata_entry(&resolved.keyspace_id, &resolved.key_object_id),
+        origin_ref,
+        resolved,
+    );
     let mut rs: ReadStream = pool
-        .read(&req, 0, cfg.page_size as u64)
+        .read(&req, 0, page_size as u64)
         .await
         .map_err(|_| ())?;
     let page = rs.next_page().await.ok_or(())?.map_err(|_| ())?;
@@ -227,15 +219,27 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
 async fn read_body<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     cfg: &LoadgenRun,
-    object_id: &str,
+    resolved: &ResolvedObject,
     range: ResolvedRange,
 ) -> Result<u64, ()> {
-    let plans: Vec<StripePlan<StripeReq>> = stripe_set(range, cfg.stripe_size)
+    let plans: Vec<StripePlan<StripeReq>> = stripe_set(range, resolved.stripe_size)
         .into_iter()
         .map(|slice| {
-            let origin_ref = OriginRef::new(&cfg.backend_id, object_id, slice.stripe_idx);
+            let origin_ref = OriginRef::new(
+                &resolved.backend_id,
+                &resolved.origin_object_id,
+                slice.stripe_idx,
+            );
             StripePlan {
-                req: request_from_origin(origin_ref, cfg),
+                req: request_from_origin(
+                    KeyRef::new(
+                        &resolved.keyspace_id,
+                        &resolved.key_object_id,
+                        slice.stripe_idx,
+                    ),
+                    origin_ref,
+                    resolved,
+                ),
                 intra_offset: slice.intra_offset,
                 intra_len: slice.intra_len,
             }
@@ -254,11 +258,15 @@ async fn read_body<P: BufferPool<Req = StripeReq>>(
     Ok(bytes)
 }
 
-fn request_from_origin(origin_ref: OriginRef, cfg: &LoadgenRun) -> StripeReq {
-    StripeReq::new(origin_ref.stripe_key())
+fn request_from_origin(
+    key_ref: KeyRef,
+    origin_ref: OriginRef,
+    resolved: &ResolvedObject,
+) -> StripeReq {
+    StripeReq::new(key_ref.stripe_key())
         .with_origin(origin_ref)
-        .with_chain(cfg.cache_id.clone(), cfg.neighborhood_id.clone())
-        .with_bypass(cfg.bypass)
+        .with_chain(resolved.cache_id.clone(), resolved.neighborhood_id.clone())
+        .with_bypass(resolved.bypass_cache)
 }
 
 fn object_id(
@@ -277,27 +285,54 @@ fn object_id(
 mod tests {
     use super::*;
     use crate::bufferpool::Req;
-    use crate::config::{HttpFrontendConfig, LoadgenFrontendConfig};
+    use crate::config::{
+        FrontendMount, HttpFrontendConfig, LoadgenFrontendConfig, ResolvedFrontendMount,
+        ResolvedKeyspaceRoute,
+    };
 
     fn loadgen_spec() -> FrontendSpec {
         FrontendSpec {
             name: "lg".to_string(),
-            source: "cache".to_string(),
+            mounts: vec![FrontendMount {
+                public_prefix: "/".to_string(),
+                source: "cache".to_string(),
+                key_prefix: "/".to_string(),
+            }],
             config: Some(frontend_spec::Config::Loadgen(
                 LoadgenFrontendConfig::default(),
             )),
         }
     }
 
+    fn binding(bypass_cache: bool) -> ResolvedFrontendBinding {
+        ResolvedFrontendBinding {
+            frontend_id: "lg".to_string(),
+            mounts: vec![ResolvedFrontendMount {
+                public_prefix: "/".to_string(),
+                keyspace_id: "loadgen".to_string(),
+                key_prefix: "/".to_string(),
+                cache_id: Some("cache".to_string()),
+                neighborhood_id: Some("n".to_string()),
+                bypass_cache,
+                routes: vec![ResolvedKeyspaceRoute {
+                    key_prefix: "/".to_string(),
+                    backend_id: "fake".to_string(),
+                    origin_prefix: "/".to_string(),
+                    stripe_size: 4096,
+                }],
+            }],
+        }
+    }
+
+    fn resolved_object(bypass_cache: bool) -> ResolvedObject {
+        binding(bypass_cache).resolve_path("/obj").unwrap()
+    }
+
     fn run_cfg() -> LoadgenRun {
         LoadgenRun {
             frontend_id: "lg".to_string(),
-            backend_id: "fake".to_string(),
-            cache_id: Some("cache".to_string()),
-            neighborhood_id: Some("n".to_string()),
-            stripe_size: 4096,
+            binding: binding(false),
             page_size: 4096,
-            bypass: false,
             shard_idx: 2,
             seed: 7,
             object_count: 5,
@@ -343,11 +378,10 @@ mod tests {
 
     #[test]
     fn request_carries_origin_chain_and_bypass() {
-        let mut cfg = run_cfg();
-        cfg.bypass = true;
+        let resolved = resolved_object(true);
         let origin = OriginRef::new("fake", "obj", 3);
-        let key = origin.stripe_key();
-        let req = request_from_origin(origin, &cfg);
+        let key = KeyRef::new("loadgen", "/obj", 3).stripe_key();
+        let req = request_from_origin(KeyRef::new("loadgen", "/obj", 3), origin, &resolved);
         assert_eq!(req.key(), key);
         assert_eq!(req.origin().unwrap().backend_id, "fake");
         assert_eq!(req.cache_id(), Some("cache"));

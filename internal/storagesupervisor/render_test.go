@@ -205,9 +205,15 @@ startup:
 backends:
   - name: origin
     fake: {}
+keyspaces:
+  - name: objects
+    routes:
+      - key_prefix: /
+        backend: origin
+        origin_prefix: /
 neighborhoods:
   - name: edge
-    source: origin
+    source: objects
 `)
 
 	ring := ringState{
@@ -256,9 +262,15 @@ startup:
 backends:
   - name: origin
     fake: {}
+keyspaces:
+  - name: objects
+    routes:
+      - key_prefix: /
+        backend: origin
+        origin_prefix: /
 neighborhoods:
   - name: edge
-    source: origin
+    source: objects
     fingers_per_node: 5
     local_tags: ["rack-a"]
     peers:
@@ -348,9 +360,15 @@ func TestRenderConfigMergeDropsCollisionsAndSelf(t *testing.T) {
 backends:
   - name: origin
     fake: {}
+keyspaces:
+  - name: objects
+    routes:
+      - key_prefix: /
+        backend: origin
+        origin_prefix: /
 neighborhoods:
   - name: edge
-    source: origin
+    source: objects
     peers:
       - id: 7
         tcp:
@@ -395,9 +413,15 @@ startup:
 backends:
   - name: origin
     fake: {}
+keyspaces:
+  - name: objects
+    routes:
+      - key_prefix: /
+        backend: origin
+        origin_prefix: /
 neighborhoods:
   - name: edge
-    source: origin
+    source: objects
     peers:
       - id: 100
         tcp:
@@ -411,6 +435,56 @@ neighborhoods:
 	require.Len(t, cfg.GetNeighborhoods()[0].GetPeers(), 1)
 	assert.Equal(t, uint64(100), cfg.GetNeighborhoods()[0].GetPeers()[0].GetId())
 	assert.Equal(t, "0.0.0.0:0", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
+}
+
+func TestRenderConfigRejectsInvalidNeighborhoodSource(t *testing.T) {
+	dir := writeSource(t, `
+backends:
+  - name: origin
+    fake: {}
+neighborhoods:
+  - name: edge
+    source: origin
+`)
+
+	_, err := RenderConfig(dir, ringState{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `neighborhood "edge" source "origin", which is not a keyspace`)
+}
+
+func TestRenderConfigAcceptsKeyspaceGraph(t *testing.T) {
+	dir := writeSource(t, `
+backends:
+  - name: origin
+    fake: {}
+keyspaces:
+  - name: objects
+    routes:
+      - key_prefix: /
+        backend: origin
+        origin_prefix: /
+neighborhoods:
+  - name: edge
+    source: objects
+caches:
+  - name: cache
+    source: edge
+frontends:
+  - name: http
+    mounts:
+      - public_prefix: /
+        source: cache
+        key_prefix: /
+    http:
+      addr: 127.0.0.1:0
+`)
+
+	cfg := decode(t, dir)
+	require.Len(t, cfg.GetKeyspaces(), 1)
+	assert.Equal(t, "objects", cfg.GetKeyspaces()[0].GetName())
+	require.Len(t, cfg.GetFrontends(), 1)
+	require.Len(t, cfg.GetFrontends()[0].GetMounts(), 1)
+	assert.Equal(t, "cache", cfg.GetFrontends()[0].GetMounts()[0].GetSource())
 }
 
 func TestWriteConfigAtomic(t *testing.T) {

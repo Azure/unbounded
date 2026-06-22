@@ -512,7 +512,7 @@ mod tests {
                     (*id).to_string(),
                     config::RuntimeNeighborhood {
                         id: (*id).to_string(),
-                        backend_id: "backend".to_string(),
+                        keyspace_id: "keyspace".to_string(),
                         p2p: config::RuntimeP2p {
                             fingers_per_node: 100,
                             local_node_id: *local_node_id,

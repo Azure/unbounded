@@ -18,6 +18,7 @@ message Config {
   repeated BackendSpec backends = 4;
   repeated CacheSpec caches = 5;
   repeated NeighborhoodSpec neighborhoods = 6;
+  repeated KeyspaceSpec keyspaces = 7;
 }
 
 message StartupCfg {
@@ -132,6 +133,22 @@ message NeighborhoodSpec {
   // fabric peer ids; repeating an id across neighborhoods requires the same
   // peer data.
   repeated PeerSpec peers = 7;
+}
+
+message KeyspaceSpec {
+  string name = 1;
+  repeated KeyspaceRoute routes = 2;
+}
+
+message KeyspaceRoute {
+  // Logical key prefix within this keyspace.
+  string key_prefix = 1;
+
+  // Backend component that serves objects under this route.
+  string backend = 2;
+
+  // Origin object prefix mapped from the logical key suffix.
+  string origin_prefix = 3;
 }
 
 // A precomputed routing table for a single node, produced by a
@@ -272,13 +289,24 @@ message FakeBackendConfig {
 
 message FrontendSpec {
   string name = 1;
-  string source = 2;
+  repeated FrontendMount mounts = 2;
 
   oneof config {
     HttpFrontendConfig http = 3;
     S3FrontendConfig s3 = 4;
     LoadgenFrontendConfig loadgen = 5;
   }
+}
+
+message FrontendMount {
+  // Request path prefix exposed by this frontend.
+  string public_prefix = 1;
+
+  // Keyspace, cache, or neighborhood component name.
+  string source = 2;
+
+  // Logical key prefix within the selected keyspace.
+  string key_prefix = 3;
 }
 
 message HttpFrontendConfig {

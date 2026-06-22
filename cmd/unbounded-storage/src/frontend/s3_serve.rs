@@ -34,7 +34,7 @@ use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, C
 use ::http::{Response, StatusCode};
 
 use crate::bufferpool::{BufferPool, Error, StripePlan};
-use crate::config::{FrontendSpec, frontend_spec};
+use crate::config::{FrontendSpec, ResolvedFrontendBinding, ResolvedObject, frontend_spec};
 use crate::frontend::FrontendError;
 use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, stripe_set};
 use crate::frontend::s3_xml::{S3ErrorCode, error_xml};
@@ -45,7 +45,7 @@ use crate::http::{
 };
 use crate::ring::NetHandle;
 use crate::runtime::noop_waker;
-use crate::storage::{ObjectMetadata, OriginRef, StripeReq};
+use crate::storage::{KeyRef, ObjectMetadata, OriginRef, StripeReq};
 
 /// The `x-amz-request-id` response header name. Present on every
 /// response (success and error) so clients and proxies can correlate.
@@ -127,12 +127,8 @@ pub struct S3Driver<P: BufferPool<Req = StripeReq> + 'static> {
     handle: NetHandle,
     listen_fd: RawFd,
     frontend_id: Rc<str>,
-    backend_id: String,
-    cache_id: Option<String>,
-    neighborhood_id: Option<String>,
-    stripe_size: u64,
+    binding: ResolvedFrontendBinding,
     page_size: usize,
-    bypass: bool,
     accept_fut: Pin<Box<dyn Future<Output = std::io::Result<RawFd>>>>,
     conns: Vec<Pin<Box<dyn Future<Output = ()>>>>,
     waker: Waker,
@@ -141,20 +137,15 @@ pub struct S3Driver<P: BufferPool<Req = StripeReq> + 'static> {
 impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
     /// Build a serving engine over a bound `listen_fd`.
     ///
-    /// `stripe_size` and `page_size` come from the shard's pool
-    /// geometry. When `bypass` is set, the frontend bridges straight to
-    /// its backend, skipping the disk cache and peer routing.
+    /// `binding` resolves public paths to logical keyspace keys and
+    /// origins. `page_size` comes from the shard's pool geometry.
     pub fn new(
         pool: Rc<P>,
         handle: NetHandle,
         listen_fd: RawFd,
         frontend_id: Rc<str>,
-        backend_id: String,
-        cache_id: Option<String>,
-        neighborhood_id: Option<String>,
-        stripe_size: u64,
+        binding: ResolvedFrontendBinding,
         page_size: usize,
-        bypass: bool,
     ) -> Self {
         let accept_fut = Box::pin(handle.accept(listen_fd));
         Self {
@@ -162,12 +153,8 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
             handle,
             listen_fd,
             frontend_id,
-            backend_id,
-            cache_id,
-            neighborhood_id,
-            stripe_size,
+            binding,
             page_size,
-            bypass,
             accept_fut,
             conns: Vec::new(),
             waker: noop_waker(),
@@ -208,12 +195,8 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
                             self.handle.clone(),
                             fd,
                             Rc::clone(&self.frontend_id),
-                            self.backend_id.clone(),
-                            self.cache_id.clone(),
-                            self.neighborhood_id.clone(),
-                            self.stripe_size,
+                            self.binding.clone(),
                             self.page_size,
-                            self.bypass,
                         );
                         self.conns.push(Box::pin(serve));
                     }
@@ -267,12 +250,8 @@ async fn serve_connection_s3<P: BufferPool<Req = StripeReq>>(
     handle: NetHandle,
     conn_fd: RawFd,
     frontend_id: Rc<str>,
-    backend_id: String,
-    cache_id: Option<String>,
-    neighborhood_id: Option<String>,
-    stripe_size: u64,
+    binding: ResolvedFrontendBinding,
     page_size: usize,
-    bypass: bool,
 ) {
     let _fd = FdGuard(conn_fd);
     let _conn = ConnGuard::new();
@@ -283,12 +262,8 @@ async fn serve_connection_s3<P: BufferPool<Req = StripeReq>>(
         &pool,
         &handle,
         conn_fd,
-        &backend_id,
-        cache_id.as_deref(),
-        neighborhood_id.as_deref(),
-        stripe_size,
+        &binding,
         page_size,
-        bypass,
         &mut log,
         &mut outcome,
     )
@@ -308,12 +283,8 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     handle: &NetHandle,
     conn_fd: RawFd,
-    backend_id: &str,
-    cache_id: Option<&str>,
-    neighborhood_id: Option<&str>,
-    stripe_size: u64,
+    binding: &ResolvedFrontendBinding,
     page_size: usize,
-    bypass: bool,
     log: &mut crate::obs::ReqLog,
     outcome: &mut ReqOutcome,
 ) -> Result<(), ()> {
@@ -376,6 +347,17 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     outcome.method = if is_head { "HEAD" } else { "GET" };
     log.str_field("method", if is_head { "HEAD" } else { "GET" });
 
+    let resolved_object = match binding.resolve_path(&path) {
+        Some(resolved) => resolved,
+        None => {
+            let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
+            let _ = send_all(handle, conn_fd, bytes).await;
+            log.field("status", 404);
+            outcome.status = 404;
+            return Ok(());
+        }
+    };
+
     // 4. Optional Range header. A malformed Range is a 400; an
     // unsatisfiable one is handled at resolve time as a 416.
     let range = match req.header("range") {
@@ -404,12 +386,8 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // dropped connection.
     let len = match read_object_length_s3(
         pool,
-        backend_id,
-        cache_id,
-        neighborhood_id,
-        &path,
+        &resolved_object,
         page_size,
-        bypass,
     )
     .await
     {
@@ -511,22 +489,28 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // `read_pipelined` clamps it to the pool's configured
     // `max_inflight_pages` budget, so prefetch depth is governed by
     // that single knob.
-    let plans: Vec<StripePlan<StripeReq>> = stripe_set(resolved, stripe_size)
+    let plans: Vec<StripePlan<StripeReq>> = stripe_set(resolved, resolved_object.stripe_size)
         .into_iter()
         .map(|slice| {
             let origin_ref = OriginRef {
-                backend_id: backend_id.to_string(),
-                origin_object_id: path.clone(),
+                backend_id: resolved_object.backend_id.clone(),
+                origin_object_id: resolved_object.origin_object_id.clone(),
                 stripe_idx: slice.stripe_idx,
             };
+            let key = KeyRef::new(
+                resolved_object.keyspace_id.clone(),
+                resolved_object.key_object_id.clone(),
+                slice.stripe_idx,
+            )
+            .stripe_key();
             StripePlan {
-                req: StripeReq::new(origin_ref.stripe_key())
+                req: StripeReq::new(key)
                     .with_origin(origin_ref)
                     .with_chain(
-                        cache_id.map(ToOwned::to_owned),
-                        neighborhood_id.map(ToOwned::to_owned),
+                        resolved_object.cache_id.clone(),
+                        resolved_object.neighborhood_id.clone(),
                     )
-                    .with_bypass(bypass),
+                    .with_bypass(resolved_object.bypass_cache),
                 intra_offset: slice.intra_offset,
                 intra_len: slice.intra_len,
             }
@@ -589,21 +573,15 @@ enum LenResult {
 /// from a 500.
 async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
-    backend_id: &str,
-    cache_id: Option<&str>,
-    neighborhood_id: Option<&str>,
-    path: &str,
+    resolved: &ResolvedObject,
     page_size: usize,
-    bypass: bool,
 ) -> LenResult {
-    let origin_ref = OriginRef::metadata_entry(backend_id, path);
-    let req = StripeReq::new(origin_ref.stripe_key())
+    let origin_ref = OriginRef::metadata_entry(&resolved.backend_id, &resolved.origin_object_id);
+    let key = KeyRef::metadata_entry(&resolved.keyspace_id, &resolved.key_object_id).stripe_key();
+    let req = StripeReq::new(key)
         .with_origin(origin_ref)
-        .with_chain(
-            cache_id.map(ToOwned::to_owned),
-            neighborhood_id.map(ToOwned::to_owned),
-        )
-        .with_bypass(bypass);
+        .with_chain(resolved.cache_id.clone(), resolved.neighborhood_id.clone())
+        .with_bypass(resolved.bypass_cache);
     let mut rs = match pool.read(&req, 0, page_size as u64).await {
         Ok(rs) => rs,
         Err(Error::OriginNotFound) => return LenResult::NotFound,
@@ -710,16 +688,43 @@ fn next_request_id() -> String {
 mod tests {
     use super::*;
     use crate::bufferpool::{PipelinedRead, ReadStream, WindowedRead};
-    use crate::config::{HttpFrontendConfig, S3FrontendConfig};
+    use crate::config::{
+        FrontendMount, HttpFrontendConfig, ResolvedFrontendMount, ResolvedKeyspaceRoute,
+        S3FrontendConfig,
+    };
     use std::cell::RefCell;
 
     fn spec(id: &str, addr: &str) -> FrontendSpec {
         FrontendSpec {
             name: id.to_string(),
-            source: "primary".to_string(),
+            mounts: vec![FrontendMount {
+                public_prefix: "/".to_string(),
+                source: "models-cache".to_string(),
+                key_prefix: "/".to_string(),
+            }],
             config: Some(frontend_spec::Config::S3(S3FrontendConfig {
                 addr: addr.to_string(),
             })),
+        }
+    }
+
+    fn binding() -> ResolvedFrontendBinding {
+        ResolvedFrontendBinding {
+            frontend_id: "primary".to_string(),
+            mounts: vec![ResolvedFrontendMount {
+                public_prefix: "/".to_string(),
+                keyspace_id: "models".to_string(),
+                key_prefix: "/".to_string(),
+                cache_id: Some("cache-a".to_string()),
+                neighborhood_id: Some("site-a".to_string()),
+                bypass_cache: false,
+                routes: vec![ResolvedKeyspaceRoute {
+                    key_prefix: "/".to_string(),
+                    backend_id: "primary".to_string(),
+                    origin_prefix: "/origin/".to_string(),
+                    stripe_size: 4 * 1024 * 1024,
+                }],
+            }],
         }
     }
 
@@ -893,12 +898,8 @@ mod tests {
             handle,
             listen_fd,
             Rc::from("primary"),
-            "primary".to_string(),
-            None,
-            None,
-            4 * 1024 * 1024,
+            binding(),
             2 * 1024 * 1024,
-            false,
         );
         // No client has connected: accept is pending, no conns, so the
         // engine reports no work and stays idle.

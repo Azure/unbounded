@@ -282,9 +282,17 @@ name = "origin"
 url = "$OPT_ORIGIN"
 stripe_size_bytes = $STRIPE_SIZE
 
+[[keyspaces]]
+name = "objects"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "origin"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "p2p"
-source = "origin"
+source = "objects"
 local_node_id = $LOCAL_ID
 EOF
 
@@ -319,7 +327,11 @@ size = $DISK_SIZE
 
 [[frontends]]
 name = "fe"
+
+[[frontends.mounts]]
+public_prefix = "/"
 source = "cache"
+key_prefix = "/"
 
 [frontends.config.http]
 addr = "0.0.0.0:$OPT_FRONTEND_PORT"

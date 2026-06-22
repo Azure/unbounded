@@ -511,7 +511,11 @@ http_concurrency = 32
 
 [[frontends]]
 name = "workload-http"
-source = "primary-http"
+
+[[frontends.mounts]]
+public_prefix = "/"
+source = "models"
+key_prefix = "/"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -534,7 +538,9 @@ addr = "0.0.0.0:9000"
         let f = &c.frontends[0];
         assert_eq!(f.name, "workload-http");
         assert_eq!(f.addr(), Some("0.0.0.0:9000"));
-        assert_eq!(f.source, "primary-http");
+        assert_eq!(f.mounts[0].source, "models");
+        assert_eq!(f.mounts[0].public_prefix, "/");
+        assert_eq!(f.mounts[0].key_prefix, "/");
     }
 
     #[test]
@@ -546,7 +552,11 @@ source = "n"
 
 [[frontends]]
 name = "cached-http"
+
+[[frontends.mounts]]
+public_prefix = "/"
 source = "cache"
+key_prefix = "/"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -554,7 +564,7 @@ addr = "0.0.0.0:9000"
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(c.caches[0].name, "cache");
-        assert_eq!(c.frontends[0].source, "cache");
+        assert_eq!(c.frontends[0].mounts[0].source, "cache");
     }
 
     #[test]
@@ -597,7 +607,11 @@ url = "s3.us-east-1.amazonaws.com:443"
         let s = r#"
 [[frontends]]
 name = "workload-s3"
-source = "b"
+
+[[frontends.mounts]]
+public_prefix = "/"
+source = "ks"
+key_prefix = "/"
 
 [frontends.config.s3]
 addr = "0.0.0.0:9000"
@@ -613,7 +627,11 @@ addr = "0.0.0.0:9000"
         let s = r#"
 [[frontends]]
 name = "synthetic"
+
+[[frontends.mounts]]
+public_prefix = "/"
 source = "cache"
+key_prefix = "/"
 
 [frontends.config.loadgen]
 workers = 8
@@ -628,7 +646,7 @@ verify = true
         let f = &c.frontends[0];
         assert_eq!(f.kind_name(), "loadgen");
         assert_eq!(f.addr(), None);
-        assert_eq!(f.source, "cache");
+        assert_eq!(f.mounts[0].source, "cache");
 
         let loadgen = match f.config.as_ref().expect("loadgen config set") {
             frontend_spec::Config::Loadgen(cfg) => cfg,
@@ -646,7 +664,11 @@ verify = true
         let s = r#"
 [[frontends]]
 name = "synthetic"
+
+[[frontends.mounts]]
+public_prefix = "/"
 source = "cache"
+key_prefix = "/"
 
 [frontends.config.loadgen]
 workerz = 8

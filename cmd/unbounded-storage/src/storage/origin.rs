@@ -16,15 +16,13 @@
 //! [`StripeReq`]) from the frontend all the way to the origin tier, so
 //! the backend reconstructs the byte range directly without any lookup.
 //!
-//! This module defines the canonical contract both the future S3
-//! backend and S3 frontend bind to:
+//! This module defines the canonical contract the frontends and
+//! backends bind to:
 //!
+//! - [`KeyRef`] names the logical keyspace object a stripe belongs to
+//!   and derives the cache/routing [`StripeKey`].
 //! - [`OriginRef`] names the origin object a stripe belongs to and the
 //!   stripe index within that object.
-//! - [`OriginRef::stripe_key`] derives the content-addressed
-//!   [`StripeKey`] from an [`OriginRef`] deterministically, so the
-//!   frontend (which knows the origin) and any peer (which only knows
-//!   the key) agree on routing without coordination.
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +44,59 @@ use crate::bufferpool::{Req, StripeKey};
 /// a `HEAD` against the origin to learn its length, rather than doing a
 /// ranged `GET` for object bytes.
 pub const METADATA_STRIPE_IDX: u64 = u64::MAX;
+
+/// Identifies the logical keyspace object a stripe belongs to.
+///
+/// `keyspace_id` is the cache identity contract selected through the
+/// frontend mount graph. `key_object_id` is the logical object name
+/// inside that keyspace. `stripe_idx` is the stripe index within that
+/// logical object.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct KeyRef {
+    pub keyspace_id: String,
+    pub key_object_id: String,
+    pub stripe_idx: u64,
+}
+
+impl KeyRef {
+    pub fn new(
+        keyspace_id: impl Into<String>,
+        key_object_id: impl Into<String>,
+        stripe_idx: u64,
+    ) -> Self {
+        Self {
+            keyspace_id: keyspace_id.into(),
+            key_object_id: key_object_id.into(),
+            stripe_idx,
+        }
+    }
+
+    /// Construct a [`KeyRef`] naming the logical object's metadata
+    /// entry, identified by the reserved sentinel
+    /// [`METADATA_STRIPE_IDX`].
+    pub fn metadata_entry(
+        keyspace_id: impl Into<String>,
+        key_object_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            keyspace_id: keyspace_id.into(),
+            key_object_id: key_object_id.into(),
+            stripe_idx: METADATA_STRIPE_IDX,
+        }
+    }
+
+    /// Derive the canonical content-addressed [`StripeKey`] for this
+    /// logical stripe.
+    pub fn stripe_key(&self) -> StripeKey {
+        stripe_key(&self.keyspace_id, &self.key_object_id, self.stripe_idx)
+    }
+
+    /// Whether this reference names an object's metadata entry rather
+    /// than a data stripe.
+    pub fn is_metadata_entry(&self) -> bool {
+        self.stripe_idx == METADATA_STRIPE_IDX
+    }
+}
 
 /// Identifies the origin object a stripe belongs to.
 ///
@@ -89,35 +140,6 @@ impl OriginRef {
             origin_object_id: origin_object_id.into(),
             stripe_idx: METADATA_STRIPE_IDX,
         }
-    }
-
-    /// Derive the canonical content-addressed [`StripeKey`] for this
-    /// origin stripe.
-    ///
-    /// The key is `blake3(...)` over the following exact byte layout,
-    /// fed to a single streaming hasher in this order. Each
-    /// variable-length string field is length-prefixed with its byte
-    /// length as a little-endian `u64`, so distinct `(backend_id,
-    /// origin_object_id)` splits can never alias:
-    ///
-    /// 1. `backend_id.len()` as 8 little-endian bytes
-    ///    (`u64::to_le_bytes`).
-    /// 2. `backend_id` as raw UTF-8 bytes.
-    /// 3. `origin_object_id.len()` as 8 little-endian bytes.
-    /// 4. `origin_object_id` as raw UTF-8 bytes.
-    /// 5. `stripe_idx` as 8 little-endian bytes (`u64::to_le_bytes`).
-    ///
-    /// The 32-byte blake3 digest is the [`StripeKey`]. blake3's output
-    /// is already 32 bytes, so no truncation or expansion is needed.
-    ///
-    /// The length prefix on each variable-length field makes the
-    /// encoding unambiguous: `("ab", "c")` and `("a", "bc")` frame to
-    /// different byte streams and therefore different keys, so the
-    /// split between `backend_id` and `origin_object_id` need not be
-    /// pinned out-of-band for correctness. The 8-byte little-endian
-    /// `stripe_idx` suffix is fixed width.
-    pub fn stripe_key(&self) -> StripeKey {
-        stripe_key(&self.backend_id, &self.origin_object_id, self.stripe_idx)
     }
 
     /// Whether this reference names an object's metadata entry rather
@@ -240,15 +262,26 @@ impl Req for StripeReq {
     }
 }
 
-/// Free-function form of [`OriginRef::stripe_key`], for callers that
-/// have the parts in hand without an `OriginRef` value. See
-/// [`OriginRef::stripe_key`] for the exact byte layout.
-pub fn stripe_key(backend_id: &str, origin_object_id: &str, stripe_idx: u64) -> StripeKey {
+/// Derive the canonical cache/routing [`StripeKey`] for a logical
+/// keyspace object stripe.
+///
+/// The key is `blake3(...)` over the following exact byte layout, fed to
+/// a single streaming hasher in this order. Each variable-length string
+/// field is length-prefixed with its byte length as a little-endian
+/// `u64`, so distinct `(keyspace_id, key_object_id)` splits can never
+/// alias:
+///
+/// 1. `keyspace_id.len()` as 8 little-endian bytes.
+/// 2. `keyspace_id` as raw UTF-8 bytes.
+/// 3. `key_object_id.len()` as 8 little-endian bytes.
+/// 4. `key_object_id` as raw UTF-8 bytes.
+/// 5. `stripe_idx` as 8 little-endian bytes.
+pub fn stripe_key(keyspace_id: &str, key_object_id: &str, stripe_idx: u64) -> StripeKey {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&(backend_id.len() as u64).to_le_bytes());
-    hasher.update(backend_id.as_bytes());
-    hasher.update(&(origin_object_id.len() as u64).to_le_bytes());
-    hasher.update(origin_object_id.as_bytes());
+    hasher.update(&(keyspace_id.len() as u64).to_le_bytes());
+    hasher.update(keyspace_id.as_bytes());
+    hasher.update(&(key_object_id.len() as u64).to_le_bytes());
+    hasher.update(key_object_id.as_bytes());
     hasher.update(&stripe_idx.to_le_bytes());
     StripeKey(*hasher.finalize().as_bytes())
 }
@@ -259,25 +292,22 @@ mod tests {
 
     #[test]
     fn stripe_key_is_deterministic() {
-        let a = OriginRef::new("primary-s3", "models/llama.bin", 12);
-        let b = OriginRef::new("primary-s3", "models/llama.bin", 12);
+        let a = KeyRef::new("models", "/llama.bin", 12);
+        let b = KeyRef::new("models", "/llama.bin", 12);
         assert_eq!(a.stripe_key(), b.stripe_key());
         // Free function agrees with the method.
-        assert_eq!(
-            a.stripe_key(),
-            stripe_key("primary-s3", "models/llama.bin", 12)
-        );
+        assert_eq!(a.stripe_key(), stripe_key("models", "/llama.bin", 12));
     }
 
     #[test]
     fn stripe_key_differs_on_any_field() {
-        let base = OriginRef::new("primary-s3", "models/llama.bin", 12);
-        let diff_backend = OriginRef::new("secondary-s3", "models/llama.bin", 12);
-        let diff_object = OriginRef::new("primary-s3", "models/other.bin", 12);
-        let diff_idx = OriginRef::new("primary-s3", "models/llama.bin", 13);
+        let base = KeyRef::new("models", "/llama.bin", 12);
+        let diff_keyspace = KeyRef::new("archive", "/llama.bin", 12);
+        let diff_object = KeyRef::new("models", "/other.bin", 12);
+        let diff_idx = KeyRef::new("models", "/llama.bin", 13);
 
         let k = base.stripe_key();
-        assert_ne!(k, diff_backend.stripe_key());
+        assert_ne!(k, diff_keyspace.stripe_key());
         assert_ne!(k, diff_object.stripe_key());
         assert_ne!(k, diff_idx.stripe_key());
     }
@@ -285,27 +315,27 @@ mod tests {
     #[test]
     fn stripe_key_matches_documented_byte_layout() {
         // Reconstruct the digest by hand from the documented layout:
-        // backend_len_le || backend_id bytes || object_len_le ||
-        // origin_object_id bytes || idx_le.
-        let backend = "b";
+        // keyspace_len_le || keyspace_id bytes || object_len_le ||
+        // key_object_id bytes || idx_le.
+        let keyspace = "ks";
         let object = "obj";
         let idx: u64 = 0x0102_0304_0506_0708;
 
         let mut expected_input = Vec::new();
-        expected_input.extend_from_slice(&(backend.len() as u64).to_le_bytes());
-        expected_input.extend_from_slice(backend.as_bytes());
+        expected_input.extend_from_slice(&(keyspace.len() as u64).to_le_bytes());
+        expected_input.extend_from_slice(keyspace.as_bytes());
         expected_input.extend_from_slice(&(object.len() as u64).to_le_bytes());
         expected_input.extend_from_slice(object.as_bytes());
         expected_input.extend_from_slice(&idx.to_le_bytes());
         let expected = StripeKey(*blake3::hash(&expected_input).as_bytes());
 
-        assert_eq!(stripe_key(backend, object, idx), expected);
+        assert_eq!(stripe_key(keyspace, object, idx), expected);
     }
 
     #[test]
     fn stripe_key_field_lengths_prevent_collision() {
         // The length prefix on each variable-length field must make
-        // distinct (backend_id, origin_object_id) splits unambiguous:
+        // distinct (keyspace_id, key_object_id) splits unambiguous:
         // without it, "ab"+"c" and "a"+"bc" hash the same bytes.
         assert_ne!(stripe_key("ab", "c", 0), stripe_key("a", "bc", 0));
 
@@ -349,12 +379,12 @@ mod tests {
     fn stripe_key_handles_edge_inputs() {
         // Empty object id and max stripe index must still produce a
         // stable, distinct key with no panic.
-        let empty = OriginRef::new("", "", 0);
-        let max_idx = OriginRef::new("backend", "object", u64::MAX);
-        assert_eq!(empty.stripe_key(), OriginRef::new("", "", 0).stripe_key());
+        let empty = KeyRef::new("", "", 0);
+        let max_idx = KeyRef::new("keyspace", "object", u64::MAX);
+        assert_eq!(empty.stripe_key(), KeyRef::new("", "", 0).stripe_key());
         assert_eq!(
             max_idx.stripe_key(),
-            OriginRef::new("backend", "object", u64::MAX).stripe_key()
+            KeyRef::new("keyspace", "object", u64::MAX).stripe_key()
         );
         assert_ne!(empty.stripe_key(), max_idx.stripe_key());
     }
@@ -369,19 +399,19 @@ mod tests {
 
     #[test]
     fn metadata_entry_key_is_deterministic() {
-        let a = OriginRef::metadata_entry("b", "obj");
-        let b = OriginRef::metadata_entry("b", "obj");
+        let a = KeyRef::metadata_entry("ks", "/obj");
+        let b = KeyRef::metadata_entry("ks", "/obj");
         assert_eq!(a.stripe_key(), b.stripe_key());
         // The metadata entry rides the same keying machinery as a data
         // stripe at the sentinel index.
-        assert_eq!(a.stripe_key(), stripe_key("b", "obj", u64::MAX));
+        assert_eq!(a.stripe_key(), stripe_key("ks", "/obj", u64::MAX));
     }
 
     #[test]
     fn metadata_entry_key_distinct_from_data_stripes() {
-        let me = OriginRef::metadata_entry("b", "obj").stripe_key();
+        let me = KeyRef::metadata_entry("ks", "/obj").stripe_key();
         for idx in [0u64, 1, 2, 1000] {
-            assert_ne!(me, OriginRef::new("b", "obj", idx).stripe_key());
+            assert_ne!(me, KeyRef::new("ks", "/obj", idx).stripe_key());
         }
     }
 
@@ -395,7 +425,7 @@ mod tests {
 
     #[test]
     fn stripe_req_new_has_key_and_no_origin() {
-        let k = OriginRef::new("primary-s3", "models/llama.bin", 12).stripe_key();
+        let k = stripe_key("models", "/llama.bin", 12);
         let req = StripeReq::new(k);
         assert_eq!(req.key(), k);
         assert!(req.origin().is_none());
@@ -404,7 +434,7 @@ mod tests {
     #[test]
     fn stripe_req_with_origin_sets_origin_and_preserves_key() {
         let origin = OriginRef::new("primary-s3", "models/llama.bin", 12);
-        let k = origin.stripe_key();
+        let k = stripe_key("models", "/llama.bin", 12);
         let req = StripeReq::new(k).with_origin(origin.clone());
         assert_eq!(req.key(), k);
         assert_eq!(req.origin(), Some(&origin));
@@ -412,7 +442,7 @@ mod tests {
 
     #[test]
     fn stripe_req_bypass_defaults_false_and_is_settable() {
-        let k = OriginRef::new("primary-s3", "models/llama.bin", 12).stripe_key();
+        let k = stripe_key("models", "/llama.bin", 12);
         // New requests do not bypass the cache.
         assert!(!StripeReq::new(k).bypass());
         // The builder flips the flag on and preserves the key/origin.
@@ -438,7 +468,7 @@ mod tests {
         // a request decoded from the wire is always non-bypass even if
         // the local request carried the flag.
         let origin = OriginRef::new("primary-s3", "models/llama.bin", 7);
-        let req = StripeReq::new(origin.stripe_key())
+        let req = StripeReq::new(stripe_key("models", "/llama.bin", 7))
             .with_origin(origin)
             .with_bypass(true);
         let bytes = bincode::serialize(&req).unwrap();
@@ -449,7 +479,7 @@ mod tests {
     #[test]
     fn stripe_req_chain_context_round_trips_through_bincode() {
         let origin = OriginRef::new("primary-s3", "models/llama.bin", 7);
-        let req = StripeReq::new(origin.stripe_key())
+        let req = StripeReq::new(stripe_key("models", "/llama.bin", 7))
             .with_origin(origin.clone())
             .with_chain(Some("cache-a".to_string()), Some("site-a".to_string()))
             .with_bypass(true);
@@ -466,7 +496,7 @@ mod tests {
     #[test]
     fn stripe_req_round_trips_through_bincode() {
         // Without an origin mapping.
-        let k = OriginRef::new("primary-s3", "models/llama.bin", 7).stripe_key();
+        let k = stripe_key("models", "/llama.bin", 7);
         let req = StripeReq::new(k);
         let bytes = bincode::serialize(&req).unwrap();
         let back: StripeReq = bincode::deserialize(&bytes).unwrap();
@@ -475,7 +505,8 @@ mod tests {
 
         // With an origin mapping.
         let origin = OriginRef::new("primary-s3", "models/llama.bin", 7);
-        let req2 = StripeReq::new(origin.stripe_key()).with_origin(origin.clone());
+        let req2 = StripeReq::new(stripe_key("models", "/llama.bin", 7))
+            .with_origin(origin.clone());
         let bytes2 = bincode::serialize(&req2).unwrap();
         let back2: StripeReq = bincode::deserialize(&bytes2).unwrap();
         assert_eq!(req2, back2);

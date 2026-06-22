@@ -136,9 +136,17 @@ name = "origin"
 url = "%s"
 stripe_size_bytes = %d
 
+[[keyspaces]]
+name = "objects"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "origin"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "p2p"
-source = "origin"
+source = "objects"
 local_node_id = %d
 
 [[neighborhoods.peers]]
@@ -161,7 +169,11 @@ size = %d
 
 [[frontends]]
 name = "fe"
+
+[[frontends.mounts]]
+public_prefix = "/"
 source = "cache"
+key_prefix = "/"
 
 [frontends.config.s3]
 addr = "%s"

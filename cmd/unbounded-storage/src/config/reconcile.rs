@@ -529,11 +529,12 @@ pub struct ResourceReconcileReport {
 /// ordering and referential guarantee that neither single-resource
 /// pass can provide on its own.
 ///
-/// Load-time validation guarantees every frontend references a defined
-/// backend within one snapshot, but the two resource sets are applied
-/// to independent runtime registries; without ordering a frontend
-/// could be registered pointing at a backend that is not yet present
-/// (or already gone). This driver interleaves the four half-passes so
+/// Load-time validation guarantees every frontend can resolve to the
+/// backend set reachable through its mounted keyspaces within one
+/// snapshot, but the two resource sets are applied to independent
+/// runtime registries. Without ordering a frontend could be registered
+/// pointing at a backend that is not yet present (or already gone). This
+/// driver interleaves the four half-passes so
 /// that:
 ///
 /// 1. frontend removals run first (a frontend never references an
@@ -542,10 +543,10 @@ pub struct ResourceReconcileReport {
 /// 3. backend additions run before any frontend addition (so a
 ///    referenced backend is present first), and
 /// 4. frontend additions run last and are *gated*: a frontend whose
-///    referenced backend is not present after steps 2-3 (never defined,
-///    removed, or whose `add` failed) is deferred - recorded in
+///    referenced backends are not present after steps 2-3 (never
+///    defined, removed, or whose `add` failed) is deferred - recorded in
 ///    `frontends.deferred` and left unregistered - rather than added
-///    dangling. The next pass re-adds it once the backend is present.
+///    dangling. The next pass re-adds it once the backends are present.
 ///
 /// Each half preserves the exact drift/counter/carry-forward semantics
 /// of [`reconcile_backends`] / [`reconcile_frontends`].
@@ -554,7 +555,7 @@ pub fn reconcile_backends_and_frontends(
     frontend_target: &dyn FrontendReconcileTarget,
     desired_backends: &[BackendSpec],
     desired_frontends: &[FrontendSpec],
-    frontend_backends: &HashMap<String, String>,
+    frontend_backends: &HashMap<String, Vec<String>>,
     last_backends: Option<&HashMap<String, BackendSpec>>,
     last_frontends: Option<&HashMap<String, FrontendSpec>>,
 ) -> ResourceReconcileReport {
@@ -597,17 +598,19 @@ pub fn reconcile_backends_and_frontends(
         frontend_state,
         |spec| frontend_target.add(spec),
         |id, _spec: &FrontendSpec| {
-            let Some(backend_id) = frontend_backends.get(id) else {
-                return Err("deferred: frontend has no resolved backend".to_string());
+            let Some(backend_ids) = frontend_backends.get(id) else {
+                return Err("deferred: frontend has no resolved backends".to_string());
             };
-            if present_backends.contains(backend_id) {
-                Ok(())
-            } else {
-                Err(format!(
+            if let Some(missing) = backend_ids
+                .iter()
+                .find(|backend_id| !present_backends.contains(*backend_id))
+            {
+                return Err(format!(
                     "deferred: referenced backend {:?} not present",
-                    backend_id
-                ))
+                    missing
+                ));
             }
+            Ok(())
         },
     );
 
@@ -621,8 +624,8 @@ pub fn reconcile_backends_and_frontends(
 mod tests {
     use super::*;
     use crate::config::schema::{
-        HttpBackendConfig, HttpFrontendConfig, TcpPeerConfig, backend_spec, frontend_spec,
-        peer_spec,
+        FrontendMount, HttpBackendConfig, HttpFrontendConfig, TcpPeerConfig, backend_spec,
+        frontend_spec, peer_spec,
     };
     use std::cell::RefCell;
 
@@ -1044,17 +1047,21 @@ mod tests {
     fn frontend(id: &str, backend_id: &str) -> FrontendSpec {
         FrontendSpec {
             name: id.to_string(),
-            source: backend_id.to_string(),
+            mounts: vec![FrontendMount {
+                public_prefix: "/".to_string(),
+                source: backend_id.to_string(),
+                key_prefix: "/".to_string(),
+            }],
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: "0.0.0.0:9000".to_string(),
             })),
         }
     }
 
-    fn frontend_backends(frontends: &[FrontendSpec]) -> HashMap<String, String> {
+    fn frontend_backends(frontends: &[FrontendSpec]) -> HashMap<String, Vec<String>> {
         frontends
             .iter()
-            .map(|f| (f.name.clone(), f.source.clone()))
+            .map(|f| (f.name.clone(), vec![f.mounts[0].source.clone()]))
             .collect()
     }
 
@@ -1170,7 +1177,7 @@ mod tests {
             *t2.ops.borrow(),
             vec![SpecOp::Remove("f1".into()), SpecOp::Add("f1".into())]
         );
-        assert_eq!(r2.applied["f1"].source, "b2");
+        assert_eq!(r2.applied["f1"].mounts[0].source, "b2");
 
         // Remove: no longer desired.
         let t3 = SpecMock::new(&["f1"]);

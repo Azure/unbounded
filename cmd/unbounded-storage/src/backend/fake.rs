@@ -265,7 +265,7 @@ mod tests {
         let backend = FakeBackend::new("fake".into(), 8192, PAGE_SIZE, buf.as_mut_ptr());
 
         let origin = OriginRef::new("fake", "obj", 0);
-        let req = StripeReq::new(origin.stripe_key()).with_origin(origin);
+        let req = StripeReq::new(origin_key()).with_origin(origin);
         let src = BulkRef {
             stripe: origin_key(),
             offset: 0,
@@ -287,7 +287,7 @@ mod tests {
         let backend = FakeBackend::new("fake".into(), object_size, PAGE_SIZE, buf.as_mut_ptr());
 
         let origin = OriginRef::metadata_entry("fake", "obj");
-        let req = StripeReq::new(origin.stripe_key()).with_origin(origin);
+        let req = StripeReq::new(origin_key()).with_origin(origin);
         let src = BulkRef {
             stripe: origin_key(),
             offset: 0,
@@ -318,6 +318,6 @@ mod tests {
     }
 
     fn origin_key() -> StripeKey {
-        OriginRef::new("fake", "obj", 0).stripe_key()
+        crate::storage::stripe_key("fake-keyspace", "/obj", 0)
     }
 }

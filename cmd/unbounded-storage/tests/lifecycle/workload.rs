@@ -17,9 +17,9 @@ use proptest::prelude::*;
 use unbounded_storage::bufferpool::{Error, StripeKey};
 use unbounded_storage::config::{
     ApplyError, BackendSpec, CacheSpec, Config, ConfigApplyTarget, ConfigController, ConfigDiff,
-    DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig,
-    NeighborhoodSpec, PeerSpec, TcpPeerConfig, backend_spec, disk_spec, frontend_spec, peer_spec,
-    runtime_disks, runtime_projection,
+    DiskSpec, FileDiskConfig, FrontendMount, FrontendSpec, HttpBackendConfig,
+    HttpFrontendConfig, KeyspaceRoute, KeyspaceSpec, NeighborhoodSpec, PeerSpec, TcpPeerConfig,
+    backend_spec, disk_spec, frontend_spec, peer_spec, runtime_disks, runtime_projection,
 };
 use unbounded_storage::runtime::ShardLoop;
 use unbounded_storage::storage::blockdev::MockDeviceConfig;
@@ -859,9 +859,17 @@ fn config_for_generation(version: u64, disks: Vec<DiskSpec>) -> Config {
     cfg.apply_defaults();
     cfg.version = version;
     cfg.backends = backend_specs(0, 1);
+    cfg.keyspaces = vec![KeyspaceSpec {
+        name: "keyspace-0".to_string(),
+        routes: vec![KeyspaceRoute {
+            key_prefix: "/".to_string(),
+            backend: "backend-0".to_string(),
+            origin_prefix: "/".to_string(),
+        }],
+    }];
     cfg.neighborhoods = vec![NeighborhoodSpec {
         name: "neighborhood-0".to_string(),
-        source: "backend-0".to_string(),
+        source: "keyspace-0".to_string(),
         fingers_per_node: Some(100),
         local_node_id: Some(1),
         local_tags: Vec::new(),
@@ -924,7 +932,11 @@ fn frontend_specs(generation: usize, count: u8) -> Vec<FrontendSpec> {
     (0..count.max(1))
         .map(|i| FrontendSpec {
             name: format!("frontend-{generation}-{i}"),
-            source: "cache-0".to_string(),
+            mounts: vec![FrontendMount {
+                public_prefix: "/".to_string(),
+                source: "cache-0".to_string(),
+                key_prefix: "/".to_string(),
+            }],
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: format!("127.0.0.1:{}", 10_000 + generation as u16 * 16 + i as u16),
             })),

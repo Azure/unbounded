@@ -46,12 +46,171 @@ func RenderConfig(sourceDir string, ring ringState) ([]byte, error) {
 		applyRing(cfg, ring)
 	}
 
+	if err := validateConfigGraph(cfg); err != nil {
+		return nil, fmt.Errorf("invalid config graph: %w", err)
+	}
+
 	out, err := proto.Marshal(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("marshal config protobuf: %w", err)
 	}
 
 	return out, nil
+}
+
+// validateConfigGraph mirrors the daemon's binding-graph validation for source
+// relationships that can be expressed by the ConfigMap renderer. This catches
+// stale keyspace graph configs before the supervisor publishes them.
+func validateConfigGraph(cfg *storageconfig.Config) error {
+	ids := map[string]string{}
+	addID := func(kind, name string) error {
+		if name == "" {
+			return nil
+		}
+
+		if existing, ok := ids[name]; ok {
+			return fmt.Errorf("%s %q duplicates %s", kind, name, existing)
+		}
+
+		ids[name] = kind
+
+		return nil
+	}
+
+	backends := map[string]struct{}{}
+
+	for _, backend := range cfg.GetBackends() {
+		if backend == nil {
+			continue
+		}
+
+		if err := addID("backend", backend.GetName()); err != nil {
+			return err
+		}
+
+		backends[backend.GetName()] = struct{}{}
+	}
+
+	keyspaces := map[string]struct{}{}
+
+	for _, keyspace := range cfg.GetKeyspaces() {
+		if keyspace == nil {
+			continue
+		}
+
+		if err := addID("keyspace", keyspace.GetName()); err != nil {
+			return err
+		}
+
+		keyspaces[keyspace.GetName()] = struct{}{}
+	}
+
+	caches := map[string]struct{}{}
+
+	for _, cache := range cfg.GetCaches() {
+		if cache == nil {
+			continue
+		}
+
+		if err := addID("cache", cache.GetName()); err != nil {
+			return err
+		}
+
+		caches[cache.GetName()] = struct{}{}
+	}
+
+	neighborhoods := map[string]struct{}{}
+
+	for _, neighborhood := range cfg.GetNeighborhoods() {
+		if neighborhood == nil {
+			continue
+		}
+
+		if err := addID("neighborhood", neighborhood.GetName()); err != nil {
+			return err
+		}
+
+		neighborhoods[neighborhood.GetName()] = struct{}{}
+	}
+
+	for _, frontend := range cfg.GetFrontends() {
+		if frontend == nil {
+			continue
+		}
+
+		if err := addID("frontend", frontend.GetName()); err != nil {
+			return err
+		}
+	}
+
+	for _, keyspace := range cfg.GetKeyspaces() {
+		if keyspace == nil {
+			continue
+		}
+
+		if len(keyspace.GetRoutes()) == 0 {
+			return fmt.Errorf("keyspace %q: at least one route is required", keyspace.GetName())
+		}
+
+		for _, route := range keyspace.GetRoutes() {
+			if route == nil {
+				continue
+			}
+
+			if _, ok := backends[route.GetBackend()]; !ok {
+				return fmt.Errorf("keyspace %q route %q backend %q, which is not a backend", keyspace.GetName(), route.GetKeyPrefix(), route.GetBackend())
+			}
+		}
+	}
+
+	for _, cache := range cfg.GetCaches() {
+		if cache == nil {
+			continue
+		}
+
+		_, keyspace := keyspaces[cache.GetSource()]
+		_, neighborhood := neighborhoods[cache.GetSource()]
+
+		if !keyspace && !neighborhood {
+			return fmt.Errorf("cache %q source %q, which is not a keyspace or neighborhood", cache.GetName(), cache.GetSource())
+		}
+	}
+
+	for _, neighborhood := range cfg.GetNeighborhoods() {
+		if neighborhood == nil {
+			continue
+		}
+
+		if _, ok := keyspaces[neighborhood.GetSource()]; !ok {
+			return fmt.Errorf("neighborhood %q source %q, which is not a keyspace", neighborhood.GetName(), neighborhood.GetSource())
+		}
+	}
+
+	for _, frontend := range cfg.GetFrontends() {
+		if frontend == nil {
+			continue
+		}
+
+		if len(frontend.GetMounts()) == 0 {
+			return fmt.Errorf("frontend %q: at least one mount is required", frontend.GetName())
+		}
+
+		for _, mount := range frontend.GetMounts() {
+			if mount == nil {
+				continue
+			}
+
+			_, keyspace := keyspaces[mount.GetSource()]
+			_, cache := caches[mount.GetSource()]
+			_, neighborhood := neighborhoods[mount.GetSource()]
+
+			if !keyspace && !cache && !neighborhood {
+				return fmt.Errorf("frontend %q mount %q source %q, which is not a keyspace, cache, or neighborhood", frontend.GetName(), mount.GetPublicPrefix(), mount.GetSource())
+			}
+		}
+	}
+
+	return nil
 }
 
 // loadSourceConfig reads the YAML Config document projected from the ConfigMap

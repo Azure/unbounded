@@ -99,9 +99,17 @@ name = "origin"
 url = "origin.example.com:80"    # host:port resolved for origin fetches.
 stripe_size_bytes = 4194304      # optional; must be a power of two.
 
+[[keyspaces]]
+name = "objects"                # logical cache-key namespace.
+
+[[keyspaces.routes]]
+key_prefix = "/"                # logical key prefix in this keyspace.
+backend = "origin"              # origin backend for matching keys.
+origin_prefix = "/"             # origin object prefix for the same suffix.
+
 [[neighborhoods]]
 name = "p2p"
-source = "origin"               # backend component name.
+source = "objects"              # keyspace component name.
 local_node_id = 1                # u64; daemon/fabric id, shared across neighborhoods.
 local_tags = ["region-a", "rack-1"]
 fingers_per_node = 100           # routing finger-table fanout per node.
@@ -132,7 +140,7 @@ addr      = "10.0.0.1:9000"      # parsed as SocketAddr.
 
 [[caches]]
 name = "cache"
-source = "p2p"                  # backend or neighborhood component name.
+source = "p2p"                  # keyspace or neighborhood component name.
 
 [[caches.disks]]                 # repeat per local device; paths must be unique.
 queue_depth = 32                 # optional u32; per-disk io_uring depth.
@@ -149,7 +157,11 @@ numa        = 0                  # optional u16; biases the open onto a CPU on t
 
 [[frontends]]
 name = "http"
-source = "cache"                # backend, cache, or neighborhood component name.
+
+[[frontends.mounts]]
+public_prefix = "/"             # public path prefix accepted by this frontend.
+source = "cache"                # keyspace, cache, or neighborhood component name.
+key_prefix = "/"                # logical keyspace prefix exposed at public_prefix.
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"

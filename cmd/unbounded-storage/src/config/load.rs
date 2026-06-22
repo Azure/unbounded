@@ -559,9 +559,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "n"
-source = "b"
+source = "ks"
 local_node_id = 99
 "#
     }
@@ -573,9 +581,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[caches]]
 name = "c"
-source = "b"
+source = "ks"
 "#
     }
 
@@ -595,9 +611,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "n"
-source = "b"
+source = "ks"
 local_node_id = 99
 
 [[neighborhoods.peers]]
@@ -627,7 +651,11 @@ path = "/dev/nvme1n1"
 
 [[frontends]]
 name = "f"
+
+[[frontends.mounts]]
+public_prefix = "/"
 source = "c"
+key_prefix = "/"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -638,8 +666,10 @@ addr = "0.0.0.0:9000"
         assert_eq!(cfg.caches[0].disks.len(), 2);
         assert_eq!(cfg.neighborhoods[0].local_node_id, Some(99));
         let projection = runtime_projection(&cfg).unwrap();
-        assert!(!projection.frontends["f"].bypass_cache);
-        assert_eq!(projection.frontends["f"].backend_id, "b");
+        let resolved = projection.frontends["f"].resolve_path("/obj").unwrap();
+        assert!(!resolved.bypass_cache);
+        assert_eq!(resolved.backend_id, "b");
+        assert_eq!(resolved.keyspace_id, "ks");
     }
 
     #[test]
@@ -650,9 +680,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "n"
-source = "b"
+source = "ks"
 local_node_id = 99
 
 [[neighborhoods.peers]]
@@ -705,9 +743,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[caches]]
 name = "c1"
-source = "b"
+source = "ks"
 
 [[caches.disks]]
 [caches.disks.config.block]
@@ -715,7 +761,7 @@ path = "/dev/nvme0n1"
 
 [[caches]]
 name = "c2"
-source = "b"
+source = "ks"
 
 [[caches.disks]]
 [caches.disks.config.block]
@@ -933,9 +979,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "n"
-source = "b"
+source = "ks"
 
 [[neighborhoods.peers]]
 id = 1
@@ -958,9 +1012,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "n"
-source = "b"
+source = "ks"
 local_node_id = 7
 
 [[neighborhoods.peers]]
@@ -983,9 +1045,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "n"
-source = "b"
+source = "ks"
 local_node_id = 1
 
 [[neighborhoods.peers]]
@@ -1010,9 +1080,21 @@ name = "primary-http"
 [backends.config.http]
 url = "https://origin.example.com"
 
+[[keyspaces]]
+name = "models"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "primary-http"
+origin_prefix = "/"
+
 [[frontends]]
 name = "workload-http"
-source = "primary-http"
+
+[[frontends.mounts]]
+public_prefix = "/"
+source = "models"
+key_prefix = "/"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -1054,16 +1136,32 @@ name = "b"
 [backends.config.http]
 url = "https://e"
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[frontends]]
 name = "dup"
-source = "b"
+
+[[frontends.mounts]]
+public_prefix = "/one"
+source = "ks"
+key_prefix = "/one"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
 
 [[frontends]]
 name = "dup"
-source = "b"
+
+[[frontends.mounts]]
+public_prefix = "/two"
+source = "ks"
+key_prefix = "/two"
 
 [frontends.config.http]
 addr = "0.0.0.0:9001"
@@ -1086,7 +1184,11 @@ url = "https://e"
 
 [[frontends]]
 name = "f"
+
+[[frontends.mounts]]
+public_prefix = "/"
 source = "ghost"
+key_prefix = "/"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -1177,9 +1279,21 @@ name = "b"
 [backends.config.http]
 url = "https://e"
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[frontends]]
 name = "f"
-source = "b"
+
+[[frontends.mounts]]
+public_prefix = "/"
+source = "ks"
+key_prefix = "/"
 
 [frontends.config.http]
 addr = "not-an-addr"
@@ -1201,9 +1315,21 @@ name = "b"
 [backends.config.http]
 url = "https://e"
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[frontends]]
 name = "f"
-source = "b"
+
+[[frontends.mounts]]
+public_prefix = "/"
+source = "ks"
+key_prefix = "/"
 
 [frontends.config.http]
 addr = "example.com:9000"
@@ -1247,16 +1373,32 @@ name = "b"
 [backends.config.http]
 url = "https://e"
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[frontends]]
 name = "f1"
-source = "b"
+
+[[frontends.mounts]]
+public_prefix = "/one"
+source = "ks"
+key_prefix = "/one"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
 
 [[frontends]]
 name = "f2"
-source = "b"
+
+[[frontends.mounts]]
+public_prefix = "/two"
+source = "ks"
+key_prefix = "/two"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -1279,9 +1421,21 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[frontends]]
 name = "lg"
-source = "b"
+
+[[frontends.mounts]]
+public_prefix = "/"
+source = "ks"
+key_prefix = "/"
 
 [frontends.config.loadgen]
 workers = 4
@@ -1301,21 +1455,41 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[frontends]]
 name = "lg1"
-source = "b"
+
+[[frontends.mounts]]
+public_prefix = "/lg1"
+source = "ks"
+key_prefix = "/lg1"
 
 [frontends.config.loadgen]
 
 [[frontends]]
 name = "lg2"
-source = "b"
+
+[[frontends.mounts]]
+public_prefix = "/lg2"
+source = "ks"
+key_prefix = "/lg2"
 
 [frontends.config.loadgen]
 
 [[frontends]]
 name = "http"
-source = "b"
+
+[[frontends.mounts]]
+public_prefix = "/http"
+source = "ks"
+key_prefix = "/http"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -1375,9 +1549,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "n"
-source = "b"
+source = "ks"
 local_node_id = 99
 
 [[neighborhoods.peers]]
@@ -1415,9 +1597,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "n"
-source = "b"
+source = "ks"
 local_node_id = 99
 
 [[neighborhoods.peers]]
@@ -1436,7 +1626,11 @@ path = "/dev/nvme0n1"
 
 [[frontends]]
 name = "f"
+
+[[frontends.mounts]]
+public_prefix = "/"
 source = "c"
+key_prefix = "/"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
@@ -1473,9 +1667,17 @@ name = "b"
 
 [backends.config.fake]
 
+[[keyspaces]]
+name = "ks"
+
+[[keyspaces.routes]]
+key_prefix = "/"
+backend = "b"
+origin_prefix = "/"
+
 [[neighborhoods]]
 name = "n"
-source = "b"
+source = "ks"
 local_node_id = 99
 
 [[neighborhoods.peers]]

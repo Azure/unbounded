@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn origin_defaults_none_and_round_trips_via_builder() {
         let origin = OriginRef::new("primary-s3", "models/llama.bin", 5);
-        let key = origin.stripe_key();
+        let key = crate::storage::stripe_key("models", "/llama.bin", 5);
         let req = P2pReq::new(key, Instant::now(), TraceCtx::default());
         assert_eq!(req.origin(), None);
 
