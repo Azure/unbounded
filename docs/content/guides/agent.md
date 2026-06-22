@@ -88,6 +88,39 @@ kubectl unbounded machine manual-bootstrap my-node --site mysite > bootstrap.sh
 ```
 {{< /callout >}}
 
+### Reusable bootstrap payloads (VMSS / Auto Scaling)
+
+The `NAME` argument is optional. When you omit it, the generated payload leaves
+the machine name unset and the `unbounded-agent` resolves it on the host at
+startup. This lets a single payload be reused across many instances, such as an
+Azure VMSS or an AWS Auto Scaling group, where each instance derives its own
+name.
+
+```bash
+# Generate a reusable cloud-init document with no hard-coded machine name:
+kubectl unbounded machine manual-bootstrap --site mysite --variant cloud-init > user-data.yaml
+```
+
+At startup the agent resolves the machine name in this order:
+
+1. The `AGENT_MACHINE_NAME` environment variable, if set on the host.
+2. The host hostname.
+
+The resolved value is lowercased and validated as a Kubernetes node name (it
+becomes the `Machine` CR name), and the agent logs which source it used:
+
+```bash
+journalctl -u unbounded-agent | grep "resolved unbounded MachineName"
+```
+
+To pin a specific name on a host without editing the payload, export the
+environment variable before the agent runs, for example via cloud-init:
+
+```yaml
+runcmd:
+  - export AGENT_MACHINE_NAME=my-custom-node
+```
+
 ### Customizing the agent download
 
 By default the bootstrap script downloads the latest published

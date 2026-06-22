@@ -331,8 +331,8 @@ type KubernetesSpec struct {
 	// kube-system. The secret must be of type
 	// bootstrap.kubernetes.io/token with the well-known keys
 	// "token-id" and "token-secret".
-	// +kubebuilder:validation:Required
-	BootstrapTokenRef LocalObjectReference `json:"bootstrapTokenRef"`
+	// +optional
+	BootstrapTokenRef *LocalObjectReference `json:"bootstrapTokenRef,omitempty"`
 }
 
 // AgentSpec defines settings for the unbounded node agent.

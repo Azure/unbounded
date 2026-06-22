@@ -127,7 +127,7 @@ func (c *DefaultReachabilityChecker) checkReachableViaBastion(ctx context.Contex
 		bastionUsername = "azureuser"
 	}
 
-	// Resolve bastion key — fall back to machine's key if not specified.
+	// Resolve bastion key - fall back to machine's key if not specified.
 	var bastionKeyRef *unboundedv1alpha3.SecretKeySelector
 	if bastion.PrivateKeyRef != nil {
 		bastionKeyRef = bastion.PrivateKeyRef
@@ -287,7 +287,7 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	// Machine has kubernetes config — determine if provisioning is needed.
+	// Machine has kubernetes config - determine if provisioning is needed.
 	return r.reconcileProvisioning(ctx, &machine)
 }
 
@@ -337,7 +337,13 @@ func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *
 	}
 
 	// Get bootstrap token.
-	bootstrapToken, err := r.getBootstrapToken(ctx, machine.Spec.Kubernetes.BootstrapTokenRef.Name)
+	bootstrapTokenRef := machine.Spec.Kubernetes.BootstrapTokenRef
+	if bootstrapTokenRef == nil {
+		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseFailed,
+			"Failed to get bootstrap token: machine spec.kubernetes.bootstrapTokenRef.name is required")
+	}
+
+	bootstrapToken, err := r.getBootstrapToken(ctx, bootstrapTokenRef.Name)
 	if err != nil {
 		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseFailed,
 			fmt.Sprintf("Failed to get bootstrap token: %v", err))
@@ -651,7 +657,7 @@ func (r *MachineReconciler) dialViaBastion(
 		bastionUsername = "azureuser"
 	}
 
-	// Get bastion key — fall back to machine's key if not specified.
+	// Get bastion key - fall back to machine's key if not specified.
 	var bastionKeyRef *unboundedv1alpha3.SecretKeySelector
 	if bastion.PrivateKeyRef != nil {
 		bastionKeyRef = bastion.PrivateKeyRef
@@ -821,7 +827,7 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 			return ctrl.Result{RequeueAfter: RequeueAfterJoining}, nil
 		}
 
-		// Node found — transition to Ready.
+		// Node found - transition to Ready.
 		node := &nodeList.Items[0]
 
 		logger.Info("Node found for Machine, transitioning to Ready",
@@ -842,11 +848,11 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 
 	case unboundedv1alpha3.MachinePhaseReady:
 		if len(nodeList.Items) > 0 {
-			// Node still exists — stay Ready.
+			// Node still exists - stay Ready.
 			return ctrl.Result{RequeueAfter: RequeueAfterReady}, nil
 		}
 
-		// Node disappeared — transition back to Joining so we wait for
+		// Node disappeared - transition back to Joining so we wait for
 		// it to come back (or re-provision on the next cycle).
 		logger.Info("Node disappeared for Machine, transitioning to Joining",
 			"machine", machine.Name)

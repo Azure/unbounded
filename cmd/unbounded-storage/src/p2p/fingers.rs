@@ -67,7 +67,7 @@ impl FingerTable {
             let arc = arc_index(local.ring, cand.ring, arc_span, k);
             let current = &fingers[arc as usize];
             let challenger_is_self = current.node == local.node;
-            if challenger_is_self || better(local.ring, &local.labels, cand, current, arc) {
+            if challenger_is_self || better(local.ring, &local.tags, cand, current, arc) {
                 fingers[arc as usize] = cand.clone();
             }
 
@@ -83,6 +83,35 @@ impl FingerTable {
             }
         }
 
+        Self {
+            local,
+            fingers,
+            successor,
+            predecessor,
+        }
+    }
+
+    /// Build the table from an explicit, precomputed neighbor set
+    /// rather than deriving it from the full peer list. This is the
+    /// "disjoint discovery" counterpart to [`Self::build`]: a
+    /// global-view planner runs the same selection [`Self::build`]
+    /// would and ships each node only the neighbors it selected, so
+    /// the node never needs global knowledge yet reconstructs an
+    /// identical table (and therefore identical routing paths).
+    ///
+    /// `fingers` are the chosen finger peers (the local node must
+    /// not be included; order is irrelevant since [`Self::next_hop`]
+    /// scans them all). `successor`/`predecessor` are the immediate
+    /// ring neighbors, `None` only for a single-node cluster. Unlike
+    /// [`Self::build`], empty arcs are not materialized as self
+    /// clones: only real fingers are stored, which the lookup path
+    /// already handles.
+    pub fn from_explicit(
+        local: PeerEntry,
+        fingers: Vec<PeerEntry>,
+        successor: Option<PeerEntry>,
+        predecessor: Option<PeerEntry>,
+    ) -> Self {
         Self {
             local,
             fingers,
@@ -202,13 +231,13 @@ fn arc_index(local: RingId, candidate: RingId, arc_span: u64, k: u32) -> u32 {
 
 fn better(
     local_ring: RingId,
-    local_labels: &crate::p2p::types::TopologyLabels,
+    local_tags: &crate::p2p::types::TopologyTags,
     challenger: &PeerEntry,
     incumbent: &PeerEntry,
     arc: u32,
 ) -> bool {
-    let c_topo = topology_distance(local_labels, &challenger.labels);
-    let i_topo = topology_distance(local_labels, &incumbent.labels);
+    let c_topo = topology_distance(local_tags, &challenger.tags);
+    let i_topo = topology_distance(local_tags, &incumbent.tags);
     if c_topo != i_topo {
         return c_topo < i_topo;
     }
@@ -223,13 +252,13 @@ fn better(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::p2p::types::{NodeId, TopologyLabels};
+    use crate::p2p::types::{NodeId, TopologyTags};
 
     fn peer(node: u64, ring: u64, parts: &[&str]) -> PeerEntry {
         PeerEntry {
             node: NodeId(node),
             ring: RingId(ring),
-            labels: TopologyLabels(parts.iter().map(|s| s.to_string()).collect()),
+            tags: TopologyTags(parts.iter().map(|s| s.to_string()).collect()),
         }
     }
 
@@ -396,7 +425,7 @@ mod tests {
             for (i, (a, b)) in base.fingers().iter().zip(other.fingers()).enumerate() {
                 assert_eq!(a.node, b.node, "seed={seed} arc={i}");
                 assert_eq!(a.ring, b.ring, "seed={seed} arc={i}");
-                assert_eq!(a.labels.0, b.labels.0, "seed={seed} arc={i}");
+                assert_eq!(a.tags.0, b.tags.0, "seed={seed} arc={i}");
             }
             assert_eq!(
                 base.successor().map(|p| p.node),
@@ -423,6 +452,105 @@ mod tests {
         for t in [0u64, 1, 12345, 22345, 99999, u64::MAX] {
             if let Some(p) = ft.next_hop(RingId(t)) {
                 assert_ne!(p.node, me.node, "self loop at target={t}");
+            }
+        }
+    }
+
+    // Collect a built table's selected neighbors the way a global-view
+    // planner would: the distinct non-self finger peers, plus the
+    // successor and predecessor. Feeding these back into
+    // `from_explicit` must reproduce the table's routing exactly.
+    fn explicit_from_built(ft: &FingerTable) -> FingerTable {
+        let mut fingers: Vec<PeerEntry> = Vec::new();
+        for f in ft.fingers() {
+            if f.node == ft.local().node {
+                continue;
+            }
+            if !fingers.iter().any(|e| e.node == f.node) {
+                fingers.push(f.clone());
+            }
+        }
+        FingerTable::from_explicit(
+            ft.local().clone(),
+            fingers,
+            ft.successor().cloned(),
+            ft.predecessor().cloned(),
+        )
+    }
+
+    #[test]
+    fn from_explicit_reproduces_built_routing() {
+        // A node configured with only its selected neighbors must
+        // route every target identically to the globally-built table.
+        let me = peer(0, 1 << 40, &["us", "z1", "r1", "k1"]);
+        let topo_groups: &[&[&str]] = &[
+            &["us", "z1", "r1", "k1"],
+            &["us", "z1", "r2", "k3"],
+            &["us", "z2", "r1", "k1"],
+            &["eu", "z1", "r1", "k1"],
+            &["ap", "z3", "r2", "k4"],
+        ];
+        let mut peers: Vec<PeerEntry> = Vec::new();
+        for i in 1u64..=40 {
+            let labels = topo_groups[(i as usize) % topo_groups.len()];
+            let ring = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            peers.push(peer(i, ring, labels));
+        }
+
+        let built = FingerTable::build(me.clone(), &peers, FingerTableConfig { k: 16 });
+        let explicit = explicit_from_built(&built);
+
+        assert_eq!(
+            built.successor().map(|p| p.node),
+            explicit.successor().map(|p| p.node)
+        );
+        assert_eq!(
+            built.predecessor().map(|p| p.node),
+            explicit.predecessor().map(|p| p.node)
+        );
+
+        for t in 0u64..2000 {
+            let target = RingId(t.wrapping_mul(0x1234_5678_9ABC_DEF1));
+            assert_eq!(
+                built.next_hop(target).map(|p| p.node),
+                explicit.next_hop(target).map(|p| p.node),
+                "next_hop diverged at target={}",
+                target.0
+            );
+        }
+    }
+
+    #[test]
+    fn from_explicit_single_node_owns_everything() {
+        let me = peer(7, 999, &["r"]);
+        let ft = FingerTable::from_explicit(me.clone(), Vec::new(), None, None);
+        assert!(ft.successor().is_none());
+        assert!(ft.predecessor().is_none());
+        for t in [0u64, 1, 999, u64::MAX / 3, u64::MAX] {
+            assert!(ft.next_hop(RingId(t)).is_none());
+        }
+    }
+
+    #[test]
+    fn from_explicit_forwards_to_configured_neighbors() {
+        // Two-node ring expressed purely through an explicit plan.
+        let me = peer(1, 0, &["r"]);
+        let other = peer(2, u64::MAX / 2, &["r"]);
+        let ft = FingerTable::from_explicit(
+            me.clone(),
+            vec![other.clone()],
+            Some(other.clone()),
+            Some(other.clone()),
+        );
+        // We own our own ring id.
+        assert!(ft.next_hop(me.ring).is_none());
+        // A forward target routes to the configured successor.
+        let hop = ft.next_hop(RingId(u64::MAX / 4)).expect("forward to other");
+        assert_eq!(hop.node, other.node);
+        // next_hop only ever returns a configured neighbor.
+        for t in [1u64, 100, u64::MAX / 2, u64::MAX - 1] {
+            if let Some(p) = ft.next_hop(RingId(t)) {
+                assert_eq!(p.node, other.node);
             }
         }
     }

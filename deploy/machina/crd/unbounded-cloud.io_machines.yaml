@@ -288,8 +288,6 @@ spec:
                       When omitted the controller falls back to the cluster's
                       Kubernetes version.
                     type: string
-                required:
-                - bootstrapTokenRef
                 type: object
               operations:
                 description: Operations contains counter-based operation triggers.

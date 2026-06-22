@@ -30,16 +30,14 @@
 //!
 //! Like [`crate::fabric::PoolHandler`], this handler owns a dedicated
 //! scratch [`Backing`] registered as its own fabric MR and as a
-//! [`BlockStore`] extra buffer. A `Mutex`-guarded free list hands out
-//! one scratch page per in-flight request; the page is reclaimed when
-//! the response stream drops, after the RPC layer has finished
-//! `fi_write`ing it to the peer. The free list helper is duplicated
-//! here (rather than shared with `pool_handler.rs`) to keep the two
-//! handlers decoupled.
+//! [`BlockStore`] extra buffer. A shared scratch allocator hands out
+//! one zeroed scratch page per in-flight request; the page is reclaimed
+//! when the response stream drops, after the RPC layer has finished
+//! `fi_write`ing it to the peer.
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use serde::Serialize;
@@ -48,9 +46,12 @@ use serde::de::DeserializeOwned;
 use crate::backend::Backend;
 use crate::bufferpool::{BlockStore, BulkRef, PageRef, PageStream, Req, StripeKey};
 use crate::fabric::Result as FabResult;
+use crate::fabric::scratch::ScratchBacking;
 use crate::fabric::{Fabric, FabricTransport, Handler, HandlerStream, MrHandle, PeerId};
 use crate::memory::Backing;
-use crate::p2p::{FingerRouter, FingerTable, NodeId, RingId, stripe_to_ring};
+use crate::p2p::{
+    ChainFingerRouter, FingerTable, NodeId, RingId, RouteTableHandle, RoutingHandle, stripe_to_ring,
+};
 use crate::runtime::{block_on_cooperative, noop_waker};
 
 /// Error surfaced by [`RecursiveHandler`]'s response stream.
@@ -106,13 +107,8 @@ where
 {
     store: Arc<S>,
     scratch: Arc<ScratchBacking>,
-    fingers: Arc<FingerTable>,
-    /// Canonical record of the routing surface, co-located with
-    /// `fingers`. The active resolution happens inside `forward`'s
-    /// `FingerRouter` clone; this copy mirrors `RoutedTransport`.
-    #[allow(dead_code)]
-    node_to_peer: Arc<HashMap<NodeId, PeerId>>,
-    forward: FabricTransport<B::Req, FingerRouter>,
+    routes: RouteTableHandle,
+    forward: FabricTransport<B::Req, ChainFingerRouter>,
     backend: B,
 }
 
@@ -122,7 +118,7 @@ where
     B: Backend + 'static,
     B::Req: Req + Serialize + DeserializeOwned + 'static,
 {
-    /// Build a recursive handler.
+    /// Build a recursive handler over a freshly-seeded routing surface.
     ///
     /// `scratch` is the dedicated backing whose pages are filled and
     /// yielded; `scratch_mr` MUST be the same backing registered as
@@ -135,7 +131,8 @@ where
     /// the page geometry separately because the backing (CPU view) and
     /// the MR handle (NIC view) are distinct objects the embedder
     /// registers out-of-band, mirroring `PoolHandler::new` plus
-    /// `FabricTransport::new`.
+    /// `FabricTransport::new`. Use [`Self::with_routing`] to share a
+    /// [`RoutingHandle`] with other consumers for live reload.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<S>,
@@ -148,19 +145,81 @@ where
         page_size: usize,
         backend: B,
     ) -> FabResult<Self> {
-        let usable = scratch_pages.min(scratch.page_count as u32);
-        let free: Vec<u32> = (0..usable).collect();
-        let scratch = Arc::new(ScratchBacking {
-            backing: scratch,
-            free: Mutex::new(free),
-        });
-        let router = FingerRouter::new(fingers.clone(), node_to_peer.clone());
+        let mut routes = HashMap::new();
+        routes.insert(
+            RouteTableHandle::LEGACY_ROUTE_ID.to_string(),
+            crate::p2p::RoutingSnapshot {
+                fingers,
+                node_to_peer,
+            },
+        );
+        Self::with_routes(
+            store,
+            scratch,
+            scratch_pages,
+            RouteTableHandle::new(routes),
+            fabric,
+            scratch_mr,
+            page_size,
+            backend,
+        )
+    }
+
+    /// Build a recursive handler that shares `routing` with other
+    /// consumers. The forwarding `FabricTransport` is built with a
+    /// `FingerRouter` over a clone of the same handle, so a republish
+    /// through any clone reloads this handler's classify and forward
+    /// paths together.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_routing(
+        store: Arc<S>,
+        scratch: Backing,
+        scratch_pages: u32,
+        routing: RoutingHandle,
+        fabric: Arc<Fabric>,
+        scratch_mr: MrHandle,
+        page_size: usize,
+        backend: B,
+    ) -> FabResult<Self> {
+        let snap = routing.snapshot();
+        let mut routes = HashMap::new();
+        routes.insert(
+            RouteTableHandle::LEGACY_ROUTE_ID.to_string(),
+            crate::p2p::RoutingSnapshot {
+                fingers: snap.fingers.clone(),
+                node_to_peer: snap.node_to_peer.clone(),
+            },
+        );
+        Self::with_routes(
+            store,
+            scratch,
+            scratch_pages,
+            RouteTableHandle::new(routes),
+            fabric,
+            scratch_mr,
+            page_size,
+            backend,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_routes(
+        store: Arc<S>,
+        scratch: Backing,
+        scratch_pages: u32,
+        routes: RouteTableHandle,
+        fabric: Arc<Fabric>,
+        scratch_mr: MrHandle,
+        page_size: usize,
+        backend: B,
+    ) -> FabResult<Self> {
+        let scratch = Arc::new(ScratchBacking::new(scratch, scratch_pages));
+        let router = ChainFingerRouter::new(routes.clone());
         let forward = FabricTransport::new(fabric, scratch_mr, router, page_size)?;
         Ok(Self {
             store,
             scratch,
-            fingers,
-            node_to_peer,
+            routes,
             forward,
             backend,
         })
@@ -184,7 +243,7 @@ where
         RecursiveHandlerStream {
             store: self.store.clone(),
             scratch: self.scratch.clone(),
-            fingers: self.fingers.clone(),
+            fingers: self.routes.route_for_req(req).map(|route| route.fingers),
             forward: &self.forward,
             backend: &self.backend,
             req,
@@ -194,51 +253,6 @@ where
             state: StreamState::Pending,
             page_idx: None,
         }
-    }
-}
-
-/// Scratch backing plus its free list of available page indices.
-/// Reads and writes to the underlying pages only ever happen from
-/// RPC worker threads; the free list is the only shared mutable
-/// state, guarded by a `Mutex`. The `backing` field is read directly
-/// to derive page base pointers when a checked-out slot must be
-/// zeroed before it is filled.
-struct ScratchBacking {
-    backing: Backing,
-    free: Mutex<Vec<u32>>,
-}
-
-impl ScratchBacking {
-    /// Pop a free page index, zeroing the full extent of that scratch
-    /// slot before returning it. Every data-bearing request path must
-    /// check out through this method so a recycled page can never
-    /// carry residual bytes from a prior request into a new response;
-    /// the relayed length is derived from remote-supplied input and a
-    /// short fill would otherwise expose stale in-page bytes.
-    fn take_zeroed(&self) -> Option<u32> {
-        let idx = self.take()?;
-        let page_size = self.backing.page_size;
-        // SAFETY: `idx` came off the free list, so this request owns
-        // the slot exclusively until the matching `give`. The region
-        // `[base + idx*page_size, +page_size)` lies within the
-        // registered backing because `idx < page_count` (the free list
-        // is seeded with indices `0..usable <= page_count`).
-        unsafe {
-            let slot = self.backing.base.add(idx as usize * page_size);
-            std::ptr::write_bytes(slot, 0, page_size);
-        }
-        Some(idx)
-    }
-
-    fn take(&self) -> Option<u32> {
-        self.free.lock().expect("scratch free list poisoned").pop()
-    }
-
-    fn give(&self, idx: u32) {
-        self.free
-            .lock()
-            .expect("scratch free list poisoned")
-            .push(idx);
     }
 }
 
@@ -276,7 +290,7 @@ fn classify(fingers: &FingerTable, target: RingId, hops_remaining: u32) -> Route
 
 /// Response stream for one request. Resolves on first poll, yields
 /// exactly one page on success then ends, or yields the error then
-/// ends. The scratch page (if reserved) is returned to the free list
+/// ends. The scratch page (if reserved) is returned to the allocator
 /// on drop, which happens after the RPC layer has finished
 /// `fi_write`ing it to the peer.
 pub struct RecursiveHandlerStream<'a, R, S, B>
@@ -286,8 +300,8 @@ where
 {
     store: Arc<S>,
     scratch: Arc<ScratchBacking>,
-    fingers: Arc<FingerTable>,
-    forward: &'a FabricTransport<R, FingerRouter>,
+    fingers: Option<Arc<FingerTable>>,
+    forward: &'a FabricTransport<R, ChainFingerRouter>,
     backend: &'a B,
     req: &'a R,
     key: StripeKey,
@@ -340,23 +354,33 @@ where
     /// work (`read_page`, the backend stream, the forward stream) is
     /// driven to completion within this call so the stream holds no
     /// future and is trivially `Send`; blocking here is acceptable
-    /// because each request has its own RPC worker thread.
+    /// because RPC worker threads are separate from shard threads.
     fn serve(&mut self) -> Result<PageRef, RecursiveHandlerError> {
-        let page_size = self.scratch.backing.page_size;
+        let page_size = self.scratch.page_size();
         let target = stripe_to_ring(self.key);
-        match classify(&self.fingers, target, self.hops_remaining) {
-            Route::HopLimit => Err(RecursiveHandlerError::HopLimitExceeded),
+        let route = self
+            .fingers
+            .as_deref()
+            .map(|fingers| classify(fingers, target, self.hops_remaining))
+            .unwrap_or(Route::Owner);
+        match route {
+            Route::HopLimit => {
+                crate::metrics::p2p_hop_limit_exceeded();
+                Err(RecursiveHandlerError::HopLimitExceeded)
+            }
             Route::Owner => {
+                crate::metrics::p2p_request(crate::metrics::Disposition::Local);
                 let idx = self
                     .scratch
                     .take_zeroed()
                     .ok_or(RecursiveHandlerError::NoScratchPage)?;
                 self.page_idx = Some(idx);
                 let dst = scratch_page(idx, page_size);
-                serve_owned(&self.store, self.backend, self.req, self.key, self.src, dst)?;
+                serve_owned(&self.store, self.backend, self.req, self.src, dst)?;
                 Ok(self.clamped_page(idx, page_size))
             }
             Route::Forward => {
+                crate::metrics::p2p_request(crate::metrics::Disposition::Forward);
                 let idx = self
                     .scratch
                     .take_zeroed()
@@ -420,7 +444,6 @@ fn serve_owned<R, S, B>(
     store: &Arc<S>,
     backend: &B,
     req: &R,
-    key: StripeKey,
     src: BulkRef,
     dst: PageRef,
 ) -> Result<(), RecursiveHandlerError>
@@ -429,7 +452,7 @@ where
     S: BlockStore + Send + Sync + 'static,
     B: Backend<Req = R>,
 {
-    let hit = block_on_local(store.read_page(key, src.offset, dst))
+    let hit = block_on_local(store.read_page(req, src.offset, dst))
         .map_err(RecursiveHandlerError::BlockStore)?;
     if hit {
         return Ok(());
@@ -449,7 +472,7 @@ where
 /// would land the page in slot 0 and the relay would ship stale bytes
 /// from slot `dst_idx`.
 fn serve_forward<R>(
-    forward: &FabricTransport<R, FingerRouter>,
+    forward: &FabricTransport<R, ChainFingerRouter>,
     req: &R,
     src: BulkRef,
     ttl: u32,
@@ -498,7 +521,7 @@ mod tests {
     use super::*;
     use crate::backend::NullBackend;
     use crate::bufferpool::Error;
-    use crate::p2p::{FingerTableConfig, PeerEntry, TopologyLabels, node_to_ring};
+    use crate::p2p::{FingerTableConfig, PeerEntry, TopologyTags, node_to_ring};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const PAGE: usize = 4096;
@@ -535,12 +558,13 @@ mod tests {
             Ok(())
         }
 
-        async fn read_page(
+        async fn read_page<R: Req + ?Sized>(
             &self,
-            key: StripeKey,
+            req: &R,
             _stripe_off: u64,
             dst: PageRef,
         ) -> Result<bool, Error> {
+            let key = req.key();
             self.reads.fetch_add(1, Ordering::Relaxed);
             if self.poison.contains(&key.0) {
                 return Err(Error::Io(libc::EIO));
@@ -559,9 +583,9 @@ mod tests {
             }
         }
 
-        async fn write_page(
+        async fn write_page<R: Req + ?Sized>(
             &self,
-            _key: StripeKey,
+            _req: &R,
             _stripe_off: u64,
             _page: PageRef,
         ) -> Result<(), Error> {
@@ -624,7 +648,7 @@ mod tests {
             base,
             page_size: PAGE,
             page_count: SCRATCH_PAGES,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         (backing, base)
     }
@@ -648,7 +672,7 @@ mod tests {
         PeerEntry {
             node: NodeId(node),
             ring: node_to_ring(NodeId(node)),
-            labels: TopologyLabels(vec!["r".to_string()]),
+            tags: TopologyTags(vec!["r".to_string()]),
         }
     }
 
@@ -719,8 +743,7 @@ mod tests {
         let req = TestReq(key);
         let dst = scratch_page(0, PAGE);
 
-        serve_owned(&store, &backend, &req, key, src_for(key), dst)
-            .expect("resident read must succeed");
+        serve_owned(&store, &backend, &req, src_for(key), dst).expect("resident read must succeed");
         assert_eq!(page_byte(base, 0), 0xAB, "store did not fill the page");
         assert_eq!(store.reads.load(Ordering::Relaxed), 1);
     }
@@ -739,7 +762,7 @@ mod tests {
         let req = TestReq(key);
         let dst = scratch_page(1, PAGE);
 
-        serve_owned(&store, &backend, &req, key, src_for(key), dst)
+        serve_owned(&store, &backend, &req, src_for(key), dst)
             .expect("backend fallback must succeed");
         assert_eq!(page_byte(base, 1), 0xCD, "backend did not fill the page");
     }
@@ -753,7 +776,7 @@ mod tests {
         let req = TestReq(key);
         let dst = scratch_page(0, PAGE);
 
-        match serve_owned(&store, &backend, &req, key, src_for(key), dst) {
+        match serve_owned(&store, &backend, &req, src_for(key), dst) {
             Err(RecursiveHandlerError::Backend(_)) => {}
             other => panic!("expected Backend error, got {other:?}"),
         }
@@ -768,7 +791,7 @@ mod tests {
         let req = TestReq(key);
         let dst = scratch_page(0, PAGE);
 
-        match serve_owned(&store, &backend, &req, key, src_for(key), dst) {
+        match serve_owned(&store, &backend, &req, src_for(key), dst) {
             Err(RecursiveHandlerError::BlockStore(_)) => {}
             other => panic!("expected BlockStore error, got {other:?}"),
         }
@@ -783,6 +806,10 @@ mod tests {
         }
     }
 
+    fn dirty_scratch_slot(base: *mut u8, idx: u32, byte: u8) {
+        fill_page(base, idx, byte);
+    }
+
     fn page_all(base: *mut u8, idx: u32) -> Vec<u8> {
         // SAFETY: idx is within the test backing.
         unsafe { std::slice::from_raw_parts(base.add(idx as usize * PAGE), PAGE).to_vec() }
@@ -791,15 +818,12 @@ mod tests {
     #[test]
     fn recycled_scratch_page_is_zeroed_on_checkout() {
         let (backing, base) = scratch_backing();
-        let scratch = ScratchBacking {
-            backing,
-            free: Mutex::new(vec![0]),
-        };
+        let scratch = ScratchBacking::new(backing, 1);
 
         // A prior request leaves a recognizable non-zero pattern across
-        // the full extent of the slot, then returns it to the free list.
-        let idx = scratch.take().expect("slot available");
-        fill_page(base, idx, 0xEE);
+        // the full extent of the slot, then returns it to the allocator.
+        let idx = scratch.take_zeroed().expect("slot available");
+        dirty_scratch_slot(base, idx, 0xEE);
         scratch.give(idx);
 
         // Re-acquiring through the zeroing checkout must hand back a
@@ -819,14 +843,11 @@ mod tests {
         // restrict to the page head, and assert the tail is zero rather
         // than the prior pattern.
         let (backing, base) = scratch_backing();
-        let scratch = ScratchBacking {
-            backing,
-            free: Mutex::new(vec![0]),
-        };
+        let scratch = ScratchBacking::new(backing, 1);
 
         // Prior request dirties the entire slot.
-        let idx = scratch.take().expect("slot available");
-        fill_page(base, idx, 0xEE);
+        let idx = scratch.take_zeroed().expect("slot available");
+        dirty_scratch_slot(base, idx, 0xEE);
         scratch.give(idx);
 
         // New checkout zeroes the slot; a short fill (head only) leaves

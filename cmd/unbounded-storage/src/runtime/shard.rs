@@ -5,7 +5,7 @@
 //!
 //! `ShardLoop` owns the set of futures that run on a single shard's
 //! pinned OS thread and drives them cooperatively, mirroring the
-//! cooperative loop discipline used by `bin/bench.rs` and the disk
+//! cooperative loop discipline used by the daemon and the disk
 //! supervisor's `run_disk_thread`. The crate is runtime agnostic by
 //! design, so this does not pull in tokio or any other executor.
 //!
@@ -95,6 +95,19 @@ impl ShardLoop {
     /// per-shard socket ring's `progress()`.
     pub fn add_tick_hook<F: FnMut() -> bool + 'static>(&mut self, hook: F) {
         self.tick_hooks.push(Box::new(hook));
+    }
+
+    /// A clone of the shard's flag-flipping waker (see [`flag_waker`]).
+    ///
+    /// Tick hooks that poll their own futures (rather than spawning them
+    /// onto the loop) should poll with this waker instead of a noop one
+    /// so a cross-thread completion (a disk reply or fabric event landing
+    /// on another core) sets the shard's `wake_flag` and suppresses the
+    /// next idle park. Without it such a hook would have to report itself
+    /// perpetually busy to force re-polling, which busy-spins the shard
+    /// thread and starves co-located threads on a CPU-constrained host.
+    pub fn waker(&self) -> Waker {
+        self.waker.clone()
     }
 
     /// Run every tick hook then poll every live future once, dropping

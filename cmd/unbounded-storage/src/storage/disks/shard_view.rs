@@ -22,14 +22,15 @@
 //! N" always means the recorded set was registered against the
 //! snapshot published as gen N.
 //!
-//! When the directory has no channels published (empty `[[disks]]`)
+//! When the directory has no channels published (no projected cache disks)
 //! reads and writes return [`Error::Transport`] - the data path is
 //! offline by definition.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::bufferpool::{BlockStore, Error, PageRef, StripeKey};
+use crate::bufferpool::{BlockStore, Error, PageRef, Req};
 use crate::storage::PageChannel;
 use crate::storage::disk_for;
 
@@ -41,6 +42,27 @@ use super::channels::DiskChannelDirectory;
 pub struct LiveShardLocalStore {
     directory: Arc<DiskChannelDirectory>,
     state: Mutex<ReplayState>,
+}
+
+/// Hot-swappable set of cache directories keyed by cache id.
+pub struct CacheDirectorySet {
+    directories: Mutex<HashMap<String, Arc<DiskChannelDirectory>>>,
+}
+
+/// Chain-aware `BlockStore` dispatcher. Requests without a cache id
+/// always miss and drop writeback; requests with a cache id use that
+/// cache's own [`DiskChannelDirectory`] and replay state.
+pub struct ChainLocalStore {
+    directories: Arc<CacheDirectorySet>,
+    stores: Mutex<HashMap<String, Arc<LiveShardLocalStore>>>,
+    registered: Mutex<Vec<RegisteredBacking>>,
+}
+
+struct RegisteredBacking {
+    base: *mut u8,
+    page_size: usize,
+    page_count: usize,
+    keepalive: Arc<dyn Send + Sync>,
 }
 
 /// Registered backings plus the directory generation we last replayed
@@ -66,6 +88,94 @@ struct ShardBacking {
 // that registered it.
 unsafe impl Send for LiveShardLocalStore {}
 unsafe impl Sync for LiveShardLocalStore {}
+
+unsafe impl Send for ChainLocalStore {}
+unsafe impl Sync for ChainLocalStore {}
+
+impl CacheDirectorySet {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            directories: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn reconcile<I>(&self, cache_ids: I)
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        let desired: HashSet<String> = cache_ids.into_iter().map(Into::into).collect();
+        let mut guard = self.directories.lock().unwrap();
+        for directory in guard
+            .iter()
+            .filter_map(|(id, directory)| (!desired.contains(id)).then_some(directory))
+        {
+            directory.apply_channels(Vec::new());
+        }
+        guard.retain(|id, _| desired.contains(id));
+        for id in desired {
+            guard.entry(id).or_insert_with(DiskChannelDirectory::new);
+        }
+    }
+
+    pub fn get(&self, cache_id: &str) -> Option<Arc<DiskChannelDirectory>> {
+        self.directories.lock().unwrap().get(cache_id).cloned()
+    }
+
+    pub fn get_or_create(&self, cache_id: &str) -> Arc<DiskChannelDirectory> {
+        self.directories
+            .lock()
+            .unwrap()
+            .entry(cache_id.to_string())
+            .or_insert_with(DiskChannelDirectory::new)
+            .clone()
+    }
+
+    pub fn apply_channels(
+        &self,
+        cache_id: &str,
+        channels: Vec<(std::path::PathBuf, crate::storage::PageChannel, Option<u16>)>,
+    ) {
+        self.get_or_create(cache_id).apply_channels(channels);
+    }
+
+    pub fn drive_numa(&self, cache_id: Option<&str>) -> Arc<Vec<Option<u16>>> {
+        cache_id
+            .and_then(|id| self.get(id))
+            .map(|directory| directory.drive_numa())
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+}
+
+impl ChainLocalStore {
+    pub fn new(directories: Arc<CacheDirectorySet>) -> Arc<Self> {
+        Arc::new(Self {
+            directories,
+            stores: Mutex::new(HashMap::new()),
+            registered: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn store_for(&self, cache_id: &str) -> Arc<LiveShardLocalStore> {
+        let mut guard = self.stores.lock().unwrap();
+        if let Some(store) = guard.get(cache_id) {
+            return store.clone();
+        }
+        let directory = self.directories.get_or_create(cache_id);
+        let store = Arc::new(LiveShardLocalStore::new(directory));
+        for backing in self.registered.lock().unwrap().iter() {
+            let backing = crate::memory::Backing {
+                base: backing.base,
+                page_size: backing.page_size,
+                page_count: backing.page_count,
+                keepalive: backing.keepalive.clone(),
+            };
+            let _ = store.register_pages(&backing);
+        }
+        guard.insert(cache_id.to_string(), store.clone());
+        store
+    }
+}
 
 impl LiveShardLocalStore {
     /// Build a per-shard view over `directory`. No backings are
@@ -196,12 +306,13 @@ impl BlockStore for LiveShardLocalStore {
         self.register_backing(backing)
     }
 
-    async fn read_page(
+    async fn read_page<R: Req + ?Sized>(
         &self,
-        key: StripeKey,
+        req: &R,
         stripe_off: u64,
         dst: PageRef,
     ) -> Result<bool, Error> {
+        let key = req.key();
         let Some(channels) = self.current_or_replay() else {
             return Err(Error::from("no disks open"));
         };
@@ -221,12 +332,13 @@ impl BlockStore for LiveShardLocalStore {
         channels[idx].read_page(key, stripe_off, slice).await
     }
 
-    async fn write_page(
+    async fn write_page<R: Req + ?Sized>(
         &self,
-        key: StripeKey,
+        req: &R,
         stripe_off: u64,
         page: PageRef,
     ) -> Result<(), Error> {
+        let key = req.key();
         let Some(channels) = self.current_or_replay() else {
             return Err(Error::from("no disks open"));
         };
@@ -242,9 +354,66 @@ impl BlockStore for LiveShardLocalStore {
     }
 }
 
+impl BlockStore for ChainLocalStore {
+    fn register_pages(&self, backing: &crate::memory::Backing) -> Result<(), Error> {
+        self.registered.lock().unwrap().push(RegisteredBacking {
+            base: backing.base,
+            page_size: backing.page_size,
+            page_count: backing.page_count,
+            keepalive: backing.keepalive.clone(),
+        });
+        for store in self.stores.lock().unwrap().values() {
+            store.register_pages(backing)?;
+        }
+        Ok(())
+    }
+
+    async fn read_page<R: Req + ?Sized>(
+        &self,
+        req: &R,
+        stripe_off: u64,
+        dst: PageRef,
+    ) -> Result<bool, Error> {
+        let Some(cache_id) = req.cache_id() else {
+            return Ok(false);
+        };
+        let Some(directory) = self.directories.get(cache_id) else {
+            return Ok(false);
+        };
+        if directory.current().is_none() {
+            return Ok(false);
+        }
+        self.store_for(cache_id)
+            .read_page(req, stripe_off, dst)
+            .await
+    }
+
+    async fn write_page<R: Req + ?Sized>(
+        &self,
+        req: &R,
+        stripe_off: u64,
+        page: PageRef,
+    ) -> Result<(), Error> {
+        let Some(cache_id) = req.cache_id() else {
+            return Ok(());
+        };
+        let Some(directory) = self.directories.get(cache_id) else {
+            return Ok(());
+        };
+        if directory.current().is_none() {
+            return Ok(());
+        }
+        self.store_for(cache_id)
+            .write_page(req, stripe_off, page)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::bufferpool::StripeKey;
     use crate::runtime::noop_waker;
     use crate::storage::PageService;
     use crate::storage::blockdev::{BlockDevice, MockDevice, MockDeviceConfig};
@@ -392,7 +561,7 @@ mod tests {
             base,
             page_size: 4096,
             page_count: pages,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         (buf, backing)
     }
@@ -401,7 +570,7 @@ mod tests {
     fn replays_registration_after_directory_swap() {
         let t = DiskChannelDirectory::new();
         let core1 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/a"), core1.channel.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/a"), core1.channel.clone(), None)]);
 
         let view = LiveShardLocalStore::new(t.clone());
         let (_buf, backing) = make_backing(8);
@@ -410,7 +579,7 @@ mod tests {
         assert_eq!(view.state.lock().unwrap().last_seen_generation, Some(gen1));
 
         let core2 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/b"), core2.channel.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/b"), core2.channel.clone(), None)]);
         let gen2 = t.generation();
         assert_ne!(gen1, gen2);
         let _ = view.current_or_replay();
@@ -428,14 +597,14 @@ mod tests {
         // `CountingDevice`'s register counter.
         let t = DiskChannelDirectory::new();
         let core1 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/a"), core1.channel.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/a"), core1.channel.clone(), None)]);
 
         let view = LiveShardLocalStore::new(t.clone());
         let (_buf_a, backing_a) = make_backing(4);
         view.register_backing(&backing_a).unwrap();
 
         let core2 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/b"), core2.channel.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/b"), core2.channel.clone(), None)]);
 
         let (_buf_b, backing_b) = make_backing(4);
         view.register_backing(&backing_b).unwrap();
@@ -444,7 +613,7 @@ mod tests {
         // may itself register buffers, so snapshot the counter right
         // after the swap and measure the replay delta.
         let core3 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/c"), core3.channel.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/c"), core3.channel.clone(), None)]);
         let baseline = core3.registers.load(Ordering::Relaxed);
         let _ = view.current_or_replay();
         // `register_buffer` is synchronous and round-trips through the
@@ -474,7 +643,7 @@ mod tests {
             offset: 0,
             len: 4096,
         };
-        let err = block_on(view.read_page(StripeKey([0; 32]), 0, dst));
+        let err = block_on(view.read_page(&StripeKey([0; 32]), 0, dst));
         assert!(matches!(err, Err(Error::Transport(_))));
     }
 
@@ -486,8 +655,8 @@ mod tests {
         let core0 = Core::spawn();
         let core1 = Core::spawn();
         t.apply_channels(vec![
-            (PathBuf::from("/a"), core0.channel.clone()),
-            (PathBuf::from("/b"), core1.channel.clone()),
+            (PathBuf::from("/a"), core0.channel.clone(), None),
+            (PathBuf::from("/b"), core1.channel.clone(), None),
         ]);
 
         let view = LiveShardLocalStore::new(t.clone());
@@ -504,15 +673,15 @@ mod tests {
             len: 4096,
         };
         // First write rejected by admission; second admits.
-        block_on(view.write_page(key, 0, src)).unwrap();
-        block_on(view.write_page(key, 0, src)).unwrap();
+        block_on(view.write_page(&key, 0, src)).unwrap();
+        block_on(view.write_page(&key, 0, src)).unwrap();
 
         let dst = PageRef {
             page_idx: 1,
             offset: 0,
             len: 4096,
         };
-        let hit = block_on(view.read_page(key, 0, dst)).unwrap();
+        let hit = block_on(view.read_page(&key, 0, dst)).unwrap();
         assert!(hit, "expected cache hit through the channel view");
         for i in 0..4096usize {
             assert_eq!(buf[4096 + i], ((i * 13) & 0xff) as u8, "byte {i} mismatch");
@@ -530,7 +699,7 @@ mod tests {
         // gracefully with `ENXIO` rather than panic the storage core.
         let t = DiskChannelDirectory::new();
         let core = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/a"), core.channel.clone())]);
+        t.apply_channels(vec![(PathBuf::from("/a"), core.channel.clone(), None)]);
 
         let view = LiveShardLocalStore::new(t.clone());
         let dst = PageRef {
@@ -538,7 +707,7 @@ mod tests {
             offset: 0,
             len: 4096,
         };
-        let rerr = block_on(view.read_page(StripeKey([0; 32]), 0, dst));
+        let rerr = block_on(view.read_page(&StripeKey([0; 32]), 0, dst));
         assert!(matches!(rerr, Err(Error::Io(e)) if e == libc::ENXIO));
 
         let src = PageRef {
@@ -546,7 +715,7 @@ mod tests {
             offset: 0,
             len: 4096,
         };
-        let werr = block_on(view.write_page(StripeKey([0; 32]), 0, src));
+        let werr = block_on(view.write_page(&StripeKey([0; 32]), 0, src));
         assert!(matches!(werr, Err(Error::Io(e)) if e == libc::ENXIO));
 
         core.shutdown();

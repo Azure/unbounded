@@ -1,0 +1,46 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# ServiceAccount + RBAC for the unbounded-storage supervisor's run container.
+# The run supervisor watches cluster Nodes carrying the
+# unbounded-cloud.io/storage-ring label to discover storage-ring peers, so it
+# needs cluster-wide list/watch on nodes. The install initContainer does not
+# use the API and so does not need these grants.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: unbounded-storage-supervisor
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-storage-supervisor
+    app.kubernetes.io/component: storage
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-storage-supervisor
+  labels:
+    app.kubernetes.io/name: unbounded-storage-supervisor
+    app.kubernetes.io/component: storage
+rules:
+  # Nodes - list/watch to discover storage-ring peers by label.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: unbounded-storage-supervisor
+  labels:
+    app.kubernetes.io/name: unbounded-storage-supervisor
+    app.kubernetes.io/component: storage
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-storage-supervisor
+subjects:
+  - kind: ServiceAccount
+    name: unbounded-storage-supervisor
+    namespace: {{ default "unbounded-kube" .Namespace }}

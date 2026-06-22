@@ -10,9 +10,7 @@ use std::rc::Rc;
 use proptest::collection::vec;
 use proptest::prelude::*;
 use unbounded_storage::bufferpool::StripeKey;
-use unbounded_storage::p2p::{
-    NodeId, PeerEntry, RingId, TopologyLabels, splitmix64, stripe_to_ring,
-};
+use unbounded_storage::p2p::{NodeId, PeerEntry, RingId, TopologyTags, splitmix64, stripe_to_ring};
 
 use crate::framework::executor::{Executor, RunError};
 use crate::p2p::mocks::{P2pSimCfg, SimCluster};
@@ -25,7 +23,7 @@ use crate::p2p::mocks::{P2pSimCfg, SimCluster};
 pub struct Workload {
     pub peer_count: usize,
     pub topology_groups: usize,
-    pub label_depth: usize,
+    pub tag_depth: usize,
     pub k: u32,
     pub max_hop_delay: u32,
     pub hop_fault_rate: u32,
@@ -87,7 +85,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
         2 => 49usize..=64usize,
     ];
     let topology_groups = 1usize..=4usize;
-    let label_depth = 1usize..=4usize;
+    let tag_depth = 1usize..=4usize;
     // Narrow `k` toward the small end so the per-node arc count is
     // low and the closest-preceding-finger chain has to take real
     // forward steps. Drop the k=32 outlier: with the new peer_count
@@ -108,7 +106,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
     (
         peer_count,
         topology_groups,
-        label_depth,
+        tag_depth,
         k,
         max_hop_delay,
         hop_fault_rate,
@@ -119,7 +117,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
             |(
                 peer_count,
                 topology_groups,
-                label_depth,
+                tag_depth,
                 k,
                 max_hop_delay,
                 hop_fault_rate,
@@ -128,7 +126,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
             )| Workload {
                 peer_count,
                 topology_groups,
-                label_depth,
+                tag_depth,
                 k,
                 max_hop_delay,
                 hop_fault_rate,
@@ -155,7 +153,7 @@ fn client_strategy() -> impl Strategy<Value = ClientSpec> {
 /// math instead of trivial linear walks.
 pub fn build_peers(w: &Workload) -> Vec<PeerEntry> {
     let groups = w.topology_groups.max(1);
-    let depth = w.label_depth.max(1);
+    let depth = w.tag_depth.max(1);
     let mut out = Vec::with_capacity(w.peer_count);
     for i in 0..w.peer_count {
         let ring = splitmix64(i as u64);
@@ -171,7 +169,7 @@ pub fn build_peers(w: &Workload) -> Vec<PeerEntry> {
         out.push(PeerEntry {
             node: NodeId(i as u64),
             ring: RingId(ring),
-            labels: TopologyLabels(parts),
+            tags: TopologyTags(parts),
         });
     }
     out

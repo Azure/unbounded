@@ -35,7 +35,7 @@ command, or authored by hand.
 
 | Field | Description |
 |---|---|
-| `MachineName` | Name of the nspawn machine and the Kubernetes node. |
+| `MachineName` | *(optional)* Name of the Kubernetes `Machine` and node. When omitted, the agent resolves it at startup from the `AGENT_MACHINE_NAME` environment variable, falling back to the host hostname. |
 | `Cluster.CaCertBase64` | Base64-encoded cluster CA certificate. |
 | `Cluster.ClusterDNS` | ClusterIP of the kube-dns Service. |
 | `Cluster.Version` | Kubernetes version to install (e.g. `1.33.1`). |

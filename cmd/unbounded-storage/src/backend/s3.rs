@@ -32,6 +32,7 @@ use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
 
 use super::Backend;
+use super::limiter::FetchLimiter;
 use super::origin_ring::OriginRing;
 
 /// Origin backend that fetches stripe byte ranges from an
@@ -54,6 +55,7 @@ pub struct S3Backend {
     stripe_size: u64,
     page_size: usize,
     backing_base: *mut u8,
+    limiter: FetchLimiter,
 }
 
 // SAFETY: mirrors `HttpBackend`'s justification. `S3Backend` is
@@ -77,6 +79,7 @@ impl S3Backend {
         stripe_size: u64,
         page_size: usize,
         backing_base: *mut u8,
+        http_concurrency: usize,
     ) -> Self {
         Self {
             ring,
@@ -86,6 +89,7 @@ impl S3Backend {
             stripe_size,
             page_size,
             backing_base,
+            limiter: FetchLimiter::new(http_concurrency),
         }
     }
 
@@ -95,13 +99,103 @@ impl S3Backend {
         &self.backend_id
     }
 
-    /// Resolve a `host:port` endpoint to a single IPv4 [`SockAddr`].
+    /// Resolve a `host:port` URL value to a single IPv4 [`SockAddr`].
     /// Delegates to [`HttpBackend::resolve_origin`](super::HttpBackend::resolve_origin),
     /// which takes the first IPv4 `ToSocketAddrs` yields and errors on
     /// IPv6-only origins (v1 dials IPv4 only). The hostname for the
     /// `Host:` header is passed separately to [`S3Backend::new`].
-    pub fn resolve_origin(endpoint: &str) -> std::io::Result<SockAddr> {
-        super::HttpBackend::resolve_origin(endpoint)
+    pub fn resolve_origin(url: &str) -> std::io::Result<SockAddr> {
+        super::HttpBackend::resolve_origin(url)
+    }
+}
+
+impl S3Backend {
+    /// Owned-stream variant of [`Backend::bulk_get`]. Mirrors
+    /// [`super::HttpBackend::fetch_stream`]: the returned stream borrows
+    /// nothing from `self`, so it is `'static` and can be handed out by
+    /// a [`super::registry::BackendRegistry`] holding the backend behind
+    /// an `Arc`/`ArcSwap`.
+    pub fn fetch_stream(
+        &self,
+        req: &StripeReq,
+        src: BulkRef,
+        dsts: &[PageRef],
+    ) -> S3FetchStream<'static> {
+        let Some(origin) = req.origin() else {
+            return S3FetchStream::immediate_error("s3 backend: request missing origin");
+        };
+        let path = origin.origin_object_id.clone();
+
+        let dsts_owned = dsts.to_vec();
+        let handle = match self.ring.handle() {
+            Ok(h) => h,
+            Err(e) => return S3FetchStream::immediate_err(io_to_err(e)),
+        };
+        let origin_addr = self.origin;
+        let backing_base = self.backing_base;
+        let page_size = self.page_size;
+        let host = self.host.clone();
+
+        // A metadata entry is not a byte range of the object; it is a
+        // synthetic one-page cache entry whose payload is the object's
+        // metadata. The sentinel `stripe_idx` would overflow
+        // `absolute_range`, so this must branch before that is computed.
+        if origin.is_metadata_entry() {
+            let mut log = crate::obs::ReqLog::new("backend.s3");
+            log.str_field("op", "HEAD")
+                .str_field("backend", self.backend_id())
+                .str_field("path", &path)
+                .field("pages", dsts_owned.len());
+            let fut = Box::pin(crate::obs::instrument(
+                log,
+                crate::metrics::instrument_backend(
+                    self.backend_id().to_string(),
+                    page_size as u64,
+                    fetch_metadata(
+                        handle,
+                        origin_addr,
+                        host,
+                        path,
+                        dsts_owned.clone(),
+                        backing_base,
+                        page_size,
+                        self.limiter.clone(),
+                    ),
+                ),
+            ));
+            return S3FetchStream::pending(fut, dsts_owned);
+        }
+
+        debug_assert!(!origin.is_metadata_entry());
+        let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
+
+        let mut log = crate::obs::ReqLog::new("backend.s3");
+        log.str_field("op", "GET")
+            .str_field("backend", self.backend_id())
+            .str_field("path", &path)
+            .field("off", start)
+            .field("len", len)
+            .field("pages", dsts_owned.len());
+        let fut = Box::pin(crate::obs::instrument(
+            log,
+            crate::metrics::instrument_backend(
+                self.backend_id().to_string(),
+                len,
+                fetch(
+                    handle,
+                    origin_addr,
+                    host,
+                    path,
+                    start,
+                    len,
+                    dsts_owned.clone(),
+                    backing_base,
+                    page_size,
+                    self.limiter.clone(),
+                ),
+            ),
+        ));
+        S3FetchStream::pending(fut, dsts_owned)
     }
 }
 
@@ -115,53 +209,7 @@ impl Backend for S3Backend {
         src: BulkRef,
         dsts: &'a [PageRef],
     ) -> Self::Stream<'a> {
-        let Some(origin) = req.origin() else {
-            return S3FetchStream::immediate_error("s3 backend: request missing origin");
-        };
-        let path = origin.origin_object_id.clone();
-
-        let dsts_owned = dsts.to_vec();
-        let handle = match self.ring.handle() {
-            Ok(h) => h,
-            Err(e) => return S3FetchStream::immediate_err(io_to_err(e)),
-        };
-        let origin_addr = &self.origin;
-        let backing_base = self.backing_base;
-        let page_size = self.page_size;
-        let host = self.host.clone();
-
-        // A metadata entry is not a byte range of the object; it is a
-        // synthetic one-page cache entry whose payload is the object's
-        // metadata. The sentinel `stripe_idx` would overflow
-        // `absolute_range`, so this must branch before that is computed.
-        if origin.is_metadata_entry() {
-            let fut = Box::pin(fetch_metadata(
-                handle,
-                origin_addr,
-                host,
-                path,
-                dsts_owned.clone(),
-                backing_base,
-                page_size,
-            ));
-            return S3FetchStream::pending(fut, dsts_owned);
-        }
-
-        debug_assert!(!origin.is_metadata_entry());
-        let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
-
-        let fut = Box::pin(fetch(
-            handle,
-            origin_addr,
-            host,
-            path,
-            start,
-            len,
-            dsts_owned.clone(),
-            backing_base,
-            page_size,
-        ));
-        S3FetchStream::pending(fut, dsts_owned)
+        self.fetch_stream(req, src, dsts)
     }
 }
 
@@ -254,7 +302,7 @@ impl PageStream for S3FetchStream<'_> {
 #[allow(clippy::too_many_arguments)]
 async fn fetch(
     handle: NetHandle,
-    origin: &SockAddr,
+    origin: SockAddr,
     host: String,
     path: String,
     start: u64,
@@ -262,6 +310,7 @@ async fn fetch(
     dsts: Vec<PageRef>,
     backing_base: *mut u8,
     page_size: usize,
+    limiter: FetchLimiter,
 ) -> Result<(), Error> {
     let total: u64 = dsts.iter().map(|p| p.len as u64).sum();
     if total != len {
@@ -276,14 +325,14 @@ async fn fetch(
         return Err(Error::from("s3 backend: zero-length fetch requested"));
     }
 
+    // Bound concurrent origin dials to `http_concurrency`. The permit is
+    // held for the whole fetch and returned to the pool on drop.
+    let _permit = limiter.acquire().await;
     let conn = TcpConn::open()?;
     // See `HttpBackend::fetch` for why driving the ring on the current
     // thread is sound (the op futures self-pump on their own thread's
     // ring).
-    handle
-        .connect(conn.fd, clone_sockaddr(origin))
-        .await
-        .map_err(io_to_err)?;
+    handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
     let request = format_get_request(&path, &host, start, start + len - 1)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
@@ -406,21 +455,28 @@ async fn fetch(
 #[allow(clippy::too_many_arguments)]
 async fn fetch_metadata(
     handle: NetHandle,
-    origin: &SockAddr,
+    origin: SockAddr,
     host: String,
     path: String,
     dsts: Vec<PageRef>,
     backing_base: *mut u8,
     page_size: usize,
+    limiter: FetchLimiter,
 ) -> Result<(), Error> {
+    let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
+    if capacity < 8 {
+        return Err(Error::from(
+            "s3 backend: length entry destination smaller than 8 bytes",
+        ));
+    }
+
+    // Bound concurrent origin dials to `http_concurrency` (see `fetch`).
+    let _permit = limiter.acquire().await;
     let conn = TcpConn::open()?;
     // See `S3Backend::fetch` for why driving the ring on the current
     // thread is sound (the op futures self-pump on their own thread's
     // ring).
-    handle
-        .connect(conn.fd, clone_sockaddr(origin))
-        .await
-        .map_err(io_to_err)?;
+    handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
     let request = format_head_request(&path, &host)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
@@ -703,35 +759,6 @@ fn format_head_request(path: &str, host: &str) -> Result<Vec<u8>, Error> {
         .body(())
         .map_err(|_| Error::from("s3 backend: failed to build origin HEAD request"))?;
     Ok(serialize_request(&req))
-}
-
-/// Clone a [`SockAddr`] by round-tripping through its IPv4 parts, so a
-/// fresh owned copy can be handed to the ring per `connect`.
-fn clone_sockaddr(addr: &SockAddr) -> SockAddr {
-    match addr.as_ipv4() {
-        Some((ip, port)) => {
-            let sin = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: port.to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from(ip).to_be(),
-                },
-                sin_zero: [0; 8],
-            };
-            SockAddr::from_sockaddr_in(sin)
-        }
-        None => {
-            // Non-IPv4 origins are rejected at resolve_origin; fall back
-            // to an all-zero IPv4 address, which connect will reject.
-            let sin = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: 0,
-                sin_addr: libc::in_addr { s_addr: 0 },
-                sin_zero: [0; 8],
-            };
-            SockAddr::from_sockaddr_in(sin)
-        }
-    }
 }
 
 fn io_to_err(e: std::io::Error) -> Error {

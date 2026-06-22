@@ -1,0 +1,30 @@
+# kind cluster topology for the gantry e2e suite.
+#
+# One control-plane + two workers - enough to exercise inter-pod
+# coord paths (HRW top-K=3 means the requester picks a peer that's
+# not itself, which requires ≥2 peers in the membership view).
+#
+# No extraMounts are declared. Each kind node runs its own
+# containerd inside the node container, listening on
+# /run/containerd/containerd.sock; the DaemonSet bind-mounts that
+# in-container socket (not the host's containerd) so the gantry
+# cdsub source can subscribe to image events on the same containerd
+# that pulled the image. If the socket's effective ownership / SELinux
+# label inside the node container does not match the gantry pod's
+# runAsUser the cdsub source falls back to NoOpSource (no event
+# stream) and the rest of the agent keeps working.
+#
+# Smoke-test scope: e2e/smoke_e2e_test.go validates DaemonSet
+# rollout and per-pod /readyz convergence ONLY. It does NOT exercise
+# the mirror/transfer HTTP paths or the cdsub event stream, so a
+# cdsub fallback to NoOpSource is invisible to this suite. Real
+# containerd pull-through coverage (hosts.toml + a workload pod that
+# actually pulls through the mirror) is a separate, larger e2e
+# investment.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: gantry-e2e
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker

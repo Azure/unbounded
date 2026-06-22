@@ -40,6 +40,13 @@ use super::core::{OpFut, OpResource, RecvQuarantine, RingCore, RingSetup, Slot, 
 /// Thin owned wrapper around a `libc::sockaddr` plus its length, so
 /// `connect` can hand a stable pointer to the kernel for the op's
 /// duration.
+///
+/// `Clone`/`Copy` because the stored `sockaddr_storage` is plain bytes:
+/// an origin backend clones the resolved origin address into each
+/// self-owned fetch future so the produced page stream borrows nothing
+/// from the backend, which lets the backend live behind a hot-swappable
+/// registry (see [`crate::backend::BackendRegistry`]).
+#[derive(Clone, Copy)]
 pub struct SockAddr {
     storage: libc::sockaddr_storage,
     len: libc::socklen_t,
@@ -153,13 +160,29 @@ impl NetworkRing {
     /// callers that hold the region as a bare pointer (e.g. a worker's
     /// thread-local scratch backing whose `Backing` Drop carrier cannot
     /// be re-synthesized from raw parts).
+    ///
+    /// The local shard's own backing must be registered first so it
+    /// lands at index 0 (the index `recv_fixed` and the local serving
+    /// path assume).
     pub fn register_region(&self, base: *mut u8, len: usize) -> io::Result<()> {
+        let idx = self.register_region_indexed(base, len)?;
+        debug_assert_eq!(idx, 0, "first region must be fixed buffer index 0");
+        Ok(())
+    }
+
+    /// Register a raw `(base, len)` region as the next fixed buffer and
+    /// return its assigned index. Used to register **peer shards'**
+    /// backings (index 1..N) on this shard's socket ring so the
+    /// coordinator can SEND_ZC zero-copy directly from an owner shard's
+    /// page (cross-shard fan-out). All such regions must be registered
+    /// before any I/O is in flight: `RingCore::register_buffer`
+    /// unregisters and re-registers the whole fixed-buffer table on each
+    /// call, which is only safe while the ring is quiescent.
+    pub fn register_region_indexed(&self, base: *mut u8, len: usize) -> io::Result<u16> {
         if base.is_null() || len == 0 {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
-        let idx = self.core.register_buffer(base, len)?;
-        debug_assert_eq!(idx, 0, "region must be the first registered buffer");
-        Ok(())
+        self.core.register_buffer(base, len)
     }
 
     /// Install the sink that defers reuse of a cancelled fixed-buffer
@@ -320,12 +343,11 @@ impl NetworkRing {
         }
     }
 
-    /// Resolve a `(buf_index, offset)` pair to a raw pointer inside the
-    /// registered backing. Only `buf_index == 0` is registered.
+    /// Resolve a `(buf_index, offset)` pair to a raw pointer inside a
+    /// registered region. `buf_index` 0 is this shard's own backing;
+    /// indices 1..N are peer shards' backings registered via
+    /// [`Self::register_region_indexed`] for cross-shard zero-copy send.
     fn fixed_ptr(&self, buf_index: u16, page_byte_offset: usize) -> io::Result<*const u8> {
-        if buf_index != 0 {
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        }
         match self.core.registered_base(buf_index) {
             Some(base) => Ok(unsafe { base.as_ptr().add(page_byte_offset) as *const u8 }),
             None => Err(io::Error::from_raw_os_error(libc::EINVAL)),
@@ -360,6 +382,15 @@ impl NetHandle {
     /// Wrap a shared network ring.
     pub fn new(ring: Rc<RefCell<NetworkRing>>) -> Self {
         Self { ring }
+    }
+
+    /// Register a peer shard's backing region on this handle's ring and
+    /// return its fixed-buffer index, so this shard can SEND_ZC
+    /// zero-copy from the peer's pages (cross-shard fan-out). Must be
+    /// called during bring-up before any I/O is in flight (see
+    /// [`NetworkRing::register_region_indexed`]).
+    pub fn register_peer_region(&self, base: *mut u8, len: usize) -> io::Result<u16> {
+        self.ring.borrow().register_region_indexed(base, len)
     }
 
     /// True when both handles drive the very same ring allocation
@@ -801,7 +832,7 @@ mod tests {
             base: store.as_mut_ptr(),
             page_size: PAGE,
             page_count: 2,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         if let Err(e) = ring.register_backing(&backing) {
             eprintln!("send_zc_recv_fixed: register_backing failed: {e}; skipping");
@@ -916,7 +947,7 @@ mod tests {
             base: store.as_mut_ptr(),
             page_size: PAGE,
             page_count: 2,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         if let Err(e) = ring.register_backing(&backing) {
             eprintln!("handle_recv_fixed: register_backing failed: {e}; skipping");
@@ -993,7 +1024,7 @@ mod tests {
             base: store.as_mut_ptr(),
             page_size: PAGE,
             page_count: 2,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         if let Err(e) = ring.register_backing(&backing) {
             eprintln!("drop_in_flight_recv_fixed: register_backing failed: {e}; skipping");
@@ -1084,7 +1115,7 @@ mod tests {
             base: store.as_mut_ptr(),
             page_size: PAGE,
             page_count: 2,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         if let Err(e) = ring.register_backing(&backing) {
             eprintln!("quarantine_until_reaped: register_backing failed: {e}; skipping");

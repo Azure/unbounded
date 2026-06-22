@@ -122,6 +122,46 @@ impl SimCluster {
         }
     }
 
+    /// Disjoint-discovery counterpart to [`Self::new`]: instead of
+    /// giving every node the full peer set, each node's table is
+    /// rebuilt via [`FingerTable::from_explicit`] from only the
+    /// neighbors the global build would have selected (its distinct
+    /// non-self fingers plus successor and predecessor). This mirrors
+    /// exactly what `build_routing` does when a `[p2p.routing_plan]`
+    /// is supplied. A cluster built this way must route every target
+    /// identically to one built with [`Self::new`]; the proptest
+    /// `disjoint_routing_matches_global` pins that equivalence.
+    pub fn new_disjoint(peers: Vec<PeerEntry>, k: u32, cfg: Rc<P2pSimCfg>) -> Self {
+        let mut tables = HashMap::with_capacity(peers.len());
+        let mut ring_to_node = BTreeMap::new();
+        for local in &peers {
+            let built = FingerTable::build(local.clone(), &peers, FingerTableConfig { k });
+            let mut fingers: Vec<PeerEntry> = Vec::new();
+            for f in built.fingers() {
+                if f.node == local.node {
+                    continue;
+                }
+                if !fingers.iter().any(|e| e.node == f.node) {
+                    fingers.push(f.clone());
+                }
+            }
+            let table = FingerTable::from_explicit(
+                local.clone(),
+                fingers,
+                built.successor().cloned(),
+                built.predecessor().cloned(),
+            );
+            tables.insert(local.node, table);
+            ring_to_node.insert(local.ring.0, local.node);
+        }
+        Self {
+            tables,
+            ring_to_node,
+            cfg,
+            records: RefCell::new(Vec::new()),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn cfg(&self) -> &Rc<P2pSimCfg> {
         &self.cfg
@@ -245,13 +285,13 @@ impl SimCluster {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unbounded_storage::p2p::TopologyLabels;
+    use unbounded_storage::p2p::TopologyTags;
 
     fn peer(node: u64, ring: u64) -> PeerEntry {
         PeerEntry {
             node: NodeId(node),
             ring: RingId(ring),
-            labels: TopologyLabels(vec!["g0".to_string()]),
+            tags: TopologyTags(vec!["g0".to_string()]),
         }
     }
 

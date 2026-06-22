@@ -35,6 +35,15 @@ CLUSTER_POD_CIDR=""
 SITE_NODE_CIDR=""
 SITE_POD_CIDR=""
 
+# Optional Orca integration-deploy config. When account + container are
+# provided, the deploy-orca job in release-upgrade.yaml deploys Orca with
+# a real Azure Blob origin. These are non-confidential; the Azure account
+# KEY and Garage S3 keys live in the cluster's pre-created
+# orca-credentials Secret, not here.
+ORCA_AZURE_ACCOUNT=""
+ORCA_AZURE_CONTAINER=""
+ORCA_AZURE_ENDPOINT=""
+
 usage() {
     cat <<'EOF'
 Configure a GitHub Environment for release-upgrade deploys.
@@ -50,6 +59,9 @@ Required:
 
 Optional:
   --manage-cni-plugin BOOL   Whether unbounded manages the CNI (true|false). Default: true
+  --orca-azure-account NAME  Azure storage account for the Orca origin (enables Orca deploy)
+  --orca-azure-container NAME Azure blob container for the Orca origin
+  --orca-azure-endpoint URL  Azure blob endpoint (optional; blank => *.blob.core.windows.net)
   --repo OWNER/NAME          Target repository. Default: Azure/unbounded
   --yes                      Skip the confirmation prompt
   --help                     Show this help
@@ -84,6 +96,9 @@ while [[ $# -gt 0 ]]; do
         --site-node-cidr)      require_value "$1" "${2:-}"; SITE_NODE_CIDR="$2"; shift 2 ;;
         --site-pod-cidr)       require_value "$1" "${2:-}"; SITE_POD_CIDR="$2"; shift 2 ;;
         --manage-cni-plugin)   require_value "$1" "${2:-}"; MANAGE_CNI_PLUGIN="$2"; shift 2 ;;
+        --orca-azure-account)  require_value "$1" "${2:-}"; ORCA_AZURE_ACCOUNT="$2"; shift 2 ;;
+        --orca-azure-container) require_value "$1" "${2:-}"; ORCA_AZURE_CONTAINER="$2"; shift 2 ;;
+        --orca-azure-endpoint) require_value "$1" "${2:-}"; ORCA_AZURE_ENDPOINT="$2"; shift 2 ;;
         --repo)                require_value "$1" "${2:-}"; REPO="$2"; shift 2 ;;
         --yes)                 ASSUME_YES="true"; shift ;;
         --help|-h)             usage; exit 0 ;;
@@ -120,6 +135,15 @@ case "$MANAGE_CNI_PLUGIN" in
     *) die "--manage-cni-plugin must be 'true' or 'false', got '$MANAGE_CNI_PLUGIN'" ;;
 esac
 
+# Validate Orca config: account and container go together (endpoint is
+# optional). If neither is set, the Orca deploy job is left unconfigured.
+if [[ -n "$ORCA_AZURE_ACCOUNT" && -z "$ORCA_AZURE_CONTAINER" ]]; then
+    die "--orca-azure-account requires --orca-azure-container"
+fi
+if [[ -z "$ORCA_AZURE_ACCOUNT" && -n "$ORCA_AZURE_CONTAINER" ]]; then
+    die "--orca-azure-container requires --orca-azure-account"
+fi
+
 # Validate kubeconfig file.
 [[ -f "$KUBECONFIG_PATH" ]] || die "kubeconfig file '$KUBECONFIG_PATH' does not exist"
 [[ -r "$KUBECONFIG_PATH" ]] || die "kubeconfig file '$KUBECONFIG_PATH' is not readable"
@@ -153,6 +177,9 @@ About to configure GitHub Environment:
     SITE_NODE_CIDR      $SITE_NODE_CIDR
     SITE_POD_CIDR       $SITE_POD_CIDR
     MANAGE_CNI_PLUGIN   $MANAGE_CNI_PLUGIN
+    ORCA_AZURE_ACCOUNT  ${ORCA_AZURE_ACCOUNT:-(unset; Orca deploy disabled)}
+    ORCA_AZURE_CONTAINER ${ORCA_AZURE_CONTAINER:-(unset)}
+    ORCA_AZURE_ENDPOINT ${ORCA_AZURE_ENDPOINT:-(unset; uses *.blob.core.windows.net)}
 
   Secret:
     KUBECONFIG          (contents of $KUBECONFIG_PATH)
@@ -216,6 +243,14 @@ set_var CLUSTER_POD_CIDR   "$CLUSTER_POD_CIDR"
 set_var SITE_NODE_CIDR     "$SITE_NODE_CIDR"
 set_var SITE_POD_CIDR      "$SITE_POD_CIDR"
 set_var MANAGE_CNI_PLUGIN  "$MANAGE_CNI_PLUGIN"
+
+# Orca deploy vars (only when configured). The deploy-orca job is gated
+# on ORCA_AZURE_ACCOUNT / ORCA_AZURE_CONTAINER being present.
+if [[ -n "$ORCA_AZURE_ACCOUNT" ]]; then
+    set_var ORCA_AZURE_ACCOUNT   "$ORCA_AZURE_ACCOUNT"
+    set_var ORCA_AZURE_CONTAINER "$ORCA_AZURE_CONTAINER"
+    set_var ORCA_AZURE_ENDPOINT  "$ORCA_AZURE_ENDPOINT"
+fi
 
 # Verify and summarize.
 echo

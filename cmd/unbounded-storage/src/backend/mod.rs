@@ -9,13 +9,25 @@ mod null;
 mod http;
 
 #[cfg(target_os = "linux")]
+mod limiter;
+
+#[cfg(target_os = "linux")]
 mod origin;
 
 #[cfg(target_os = "linux")]
 mod origin_ring;
 
 #[cfg(target_os = "linux")]
+mod registry;
+
+#[cfg(target_os = "linux")]
 mod s3;
+
+#[cfg(target_os = "linux")]
+mod azure;
+
+#[cfg(target_os = "linux")]
+mod fake;
 
 use std::sync::Arc;
 
@@ -27,13 +39,25 @@ pub use null::NullBackend;
 pub use http::HttpBackend;
 
 #[cfg(target_os = "linux")]
+pub use limiter::{Acquire, FetchLimiter, FetchPermit};
+
+#[cfg(target_os = "linux")]
 pub use origin::{OriginBackend, OriginStream};
 
 #[cfg(target_os = "linux")]
 pub use origin_ring::{FixedRegion, OriginRing};
 
 #[cfg(target_os = "linux")]
+pub use registry::{BackendRegistry, RegistryFetchStream};
+
+#[cfg(target_os = "linux")]
 pub use s3::S3Backend;
+
+#[cfg(target_os = "linux")]
+pub use azure::AzureBackend;
+
+#[cfg(target_os = "linux")]
+pub use fake::{FakeBackend, FakeFetchStream};
 
 /// Origin fetch surface, sibling to `bufferpool::Transport`. A
 /// `Backend` resolves a `BulkRef` from an authoritative origin (as

@@ -4,26 +4,79 @@
 name: release upgrade
 
 # ---------------------------------------------------------------------------
-# Auto-deploys a published Unbounded release to a target Kubernetes cluster.
+# Deploys an Unbounded release to the integration cluster (unbounded-stable)
+# so it can soak before being published to end users.
 #
-# Triggers:
-#   release (released)  - fires on full releases (excludes pre-releases) and
-#                          deploys the released tag to the target cluster.
-#   workflow_dispatch    - manual run; required for the very first install
-#                          (set force_init=true) and for re-deploys.
+# Lifecycle this workflow is part of:
 #
+#   1. Cut a release. Push a tag (or use the `unbounded release` workflow's
+#      workflow_dispatch). That workflow (release.yaml) builds binaries,
+#      container images, the manifests tarball, signs everything, and
+#      creates a DRAFT GitHub Release with all assets attached.
+#
+#   2. Auto-deploy to integration. As soon as `unbounded release` finishes
+#      successfully, THIS workflow fires via `workflow_run` and deploys
+#      the release onto the `unbounded-stable` cluster.
+#
+#   3. Smoke + soak. Immediately after deploy, the `smoke-tests` job runs
+#      an extensible matrix of fast post-deploy validation tasks against
+#      the freshly deployed cluster (see hack/release/smoke/). The release
+#      then soaks as a DRAFT in unbounded-stable - invisible to end users
+#      and to krew - while real workloads exercise it for a few days.
+#      Ongoing soak observation relies on the cluster's existing
+#      monitoring/alerts and is not this workflow's responsibility.
+#
+#   4. Publish. When the operator is satisfied with the soak, they flip
+#      the draft to non-draft (GitHub UI, or `gh release edit <tag>
+#      --draft=false`). The `released` event fires but nothing listens to
+#      it, so publish is purely the user-visibility / advertise-to-krew
+#      gate and not a deploy gate.
+#
+# Why workflow_run and not `release: [released]`?
+#   The previous trigger fired on draft -> published, which made the
+#   deploy race the asset uploads in release.yaml. If the operator
+#   published the draft before release.yaml's `finalize` job attached the
+#   manifests, the deploy would fail with "no assets to download". Every
+#   release from v0.1.3 onward failed that way. workflow_run fires only
+#   after release.yaml has uploaded everything to the draft, which by
+#   construction means assets are present.
+#
+# Target cluster
+# --------------
 # The target cluster is configured via the `unbounded-stable` GitHub
 # Environment, which provides:
-#   - secret KUBECONFIG          (raw kubeconfig file contents)
+#   - secret KUBECONFIG                 (raw kubeconfig file contents)
 #   - vars   SITE_NAME, CLUSTER_NODE_CIDR, CLUSTER_POD_CIDR,
-#            SITE_NODE_CIDR, SITE_POD_CIDR, MANAGE_CNI_PLUGIN
+#            SITE_NODE_CIDR, SITE_POD_CIDR, MANAGE_CNI_PLUGIN,
+#            ORCA_AZURE_ACCOUNT, ORCA_AZURE_CONTAINER,
+#            ORCA_AZURE_ENDPOINT
+#   - cluster Secret unbounded-kube/orca-credentials for confidential
+#     Orca values (Azure account key and Garage S3 credentials)
 #
-# See hack/scripts/setup-deploy-environment.sh.
+# To redirect this workflow at a different cluster: create a new
+# Environment (e.g. `unbounded-canary`), set its secrets/vars, change
+# `environment:` on the deploy and smoke-tests jobs, and update the
+# concurrency group key if you want the new cluster to deploy in parallel
+# with stable. See hack/scripts/setup-deploy-environment.sh.
+#
+# Customization points (search for "CUSTOMIZE:" in this file)
+# ------------------------------------------------------------
+#   - Add a smoke test       -> drop a script in hack/release/smoke/
+#                               (see the smoke-tests job for the contract)
+#   - Change target cluster  -> change `environment:` on the relevant jobs
+#   - Add Teams/Slack notify -> see commented-out notify job at the bottom
+#   - Exclude prereleases    -> tighten the resolve job's tag regex
 # ---------------------------------------------------------------------------
 
 on:
-  release:
-    types: [released]
+  # PRIMARY trigger. The upstream workflow name must match release.yaml's
+  # top-level `name:` field exactly. If release.yaml is ever renamed,
+  # update the string below.
+  workflow_run:
+    workflows: ["unbounded release"]
+    types: [completed]
+
+  # Manual trigger for re-deploys, backfills, and the first-ever bootstrap.
   workflow_dispatch:
     inputs:
       tag:
@@ -34,33 +87,80 @@ on:
         type: boolean
         default: false
 
+# workflow_run-triggered workflows default to read-only. We only need read
+# access for checkout and `gh release download`. Made explicit so future
+# additions don't accidentally inherit broader scopes.
 permissions:
   contents: read
 
+# Prevent two deploys for the same tag from racing. We key on the upstream
+# workflow_run's head_branch (the tag name for tag-push triggers) or the
+# manual input. Different tags can deploy concurrently; the same tag
+# serializes.
 concurrency:
-  group: deploy-stable-${{ github.event.release.tag_name || inputs.tag }}
+  group: deploy-stable-${{ github.event.workflow_run.head_branch || inputs.tag }}
   cancel-in-progress: false
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Resolve the release tag we are deploying. For release events we use the
-  # event payload; for manual runs we use the user-supplied input.
+  # Resolve the release tag we are deploying.
+  #
+  #   workflow_run triggers: read the tag from the upstream run's
+  #     head_branch. For tag pushes, GitHub puts the bare tag name there
+  #     (no refs/tags/ prefix). We filter to:
+  #       - this repo (safety on forks)
+  #       - successful upstream runs
+  #       - upstream runs triggered by tag push (excludes workflow_dispatch
+  #         and dry_run runs of release.yaml, whose head_branch is a branch
+  #         name)
+  #       - tags starting with `v` (cheap pre-filter; full semver regex
+  #         below)
+  #
+  #   workflow_dispatch: read the tag from the user's input.
+  #
+  # The full semver regex allows prerelease suffixes (e.g. v1.2.3-rc1).
+  # Prerelease tags ARE deployed to unbounded-stable by design - the
+  # integration cluster is where we exercise prereleases.
+  #
+  # CUSTOMIZE: to exclude prereleases, drop the `(-[0-9A-Za-z.-]+)?`
+  # group from the regex below.
   # ---------------------------------------------------------------------------
   resolve:
-    if: github.repository == 'Azure/unbounded'
+    if: |
+      github.repository == 'Azure/unbounded' && (
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'workflow_run'
+         && github.event.workflow_run.conclusion == 'success'
+         && github.event.workflow_run.event == 'push'
+         && startsWith(github.event.workflow_run.head_branch, 'v'))
+      )
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
     steps:
       - name: Resolve tag
         id: resolve
+        # Bind workflow-context values to env vars so they enter the
+        # shell script as data, not as code. Inline `${{ ... }}` in a
+        # `run:` block is template-expanded BEFORE bash parses the
+        # script, so any shell metacharacter in the source value would
+        # become script syntax. workflow_run runs in the privileged
+        # default-branch context and can poison the Actions cache or
+        # exfiltrate environment secrets, so this matters even though
+        # the source values here are constrained to authenticated
+        # repo-writers.
+        # See CodeQL rule actions/cache-poisoning/code-injection.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          UPSTREAM_TAG: ${{ github.event.workflow_run.head_branch }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            TAG="${{ github.event.release.tag_name }}"
-          else
-            TAG="${{ inputs.tag }}"
-          fi
+          case "$EVENT_NAME" in
+            workflow_run)      TAG="$UPSTREAM_TAG" ;;
+            workflow_dispatch) TAG="$INPUT_TAG" ;;
+            *)                 echo "::error::unexpected event $EVENT_NAME"; exit 1 ;;
+          esac
 
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Tag must be in vX.Y.Z[-suffix] format, got: ${TAG}"
@@ -76,8 +176,12 @@ jobs:
   #   MODE=init     -> 'kubectl unbounded site init' using the embedded
   #                    manifests bundled into the released plugin binary.
   #                    Used for the very first bootstrap of a cluster.
-  #   MODE=upgrade  -> server-side 'kubectl apply' of the rendered manifests
-  #                    that were attached to the GitHub Release.
+  #   MODE=upgrade  -> server-side 'kubectl apply' of the rendered
+  #                    manifests that were attached to the GitHub Release.
+  #
+  # Note: `gh release download` works on DRAFT releases as long as the
+  # token has `contents: read`. That's intentional - this workflow deploys
+  # the release before it's published to end users.
   # ---------------------------------------------------------------------------
   deploy:
     needs: resolve
@@ -92,6 +196,8 @@ jobs:
       SITE_NODE_CIDR: ${{ vars.SITE_NODE_CIDR }}
       SITE_POD_CIDR: ${{ vars.SITE_POD_CIDR }}
       MANAGE_CNI_PLUGIN: ${{ vars.MANAGE_CNI_PLUGIN }}
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
     steps:
       - name: Validate environment configuration
         run: |
@@ -110,6 +216,10 @@ jobs:
 
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          # Check out the deployed tag, not the default branch. The deploy
+          # steps below use tag-pinned content (manifests tarball, cosign
+          # cert identity, etc.). The workflow definition itself always
+          # comes from the default branch - that's a workflow_run quirk.
           ref: ${{ needs.resolve.outputs.tag }}
 
       - name: Install kubectl
@@ -185,6 +295,7 @@ jobs:
           "$RUNNER_TEMP/bin/kubectl-unbounded" --help >/dev/null
 
       - name: Determine deploy mode
+        id: mode
         run: |
           set -euo pipefail
           MODE=upgrade
@@ -201,6 +312,7 @@ jobs:
             echo "Site '${SITE_NAME}' exists; selecting upgrade mode"
           fi
           echo "MODE=${MODE}" >> "$GITHUB_ENV"
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
 
       - name: Run site init (first install)
         if: env.MODE == 'init'
@@ -237,6 +349,74 @@ jobs:
             exit 1
           fi
 
+      - name: Fetch release tooling from default branch (workaround for #235)
+        if: env.MODE == 'upgrade'
+        # The deploy job's primary checkout is pinned to the deployed tag,
+        # but the merge script for the #235 workaround lives under
+        # hack/release/ on the default branch and may not exist at older
+        # tags (e.g. when backfilling a release that predates the script).
+        # Pull just hack/release/ from the default branch into a tools
+        # subdirectory so the next step can invoke it regardless of the
+        # deployed tag.
+        #
+        # Mirrors the pattern used by smoke-discover and smoke-tests for
+        # hack/release/smoke/.
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: _release-tools
+          sparse-checkout: hack/release
+          sparse-checkout-cone-mode: true
+
+      - name: Workaround for #235 - merge bundled machina-config with live ConfigMap
+        if: env.MODE == 'upgrade'
+        # WORKAROUND for https://github.com/Azure/unbounded/issues/235.
+        #
+        # The shipped 03-config.yaml ships a machina-config ConfigMap whose
+        # inner config.yaml lacks the per-cluster `apiServerEndpoint` field
+        # required by machina-controller v0.1.5+. Only
+        # `kubectl unbounded site init` ever populates that field on the
+        # live ConfigMap. If we let the bundled template apply unmodified,
+        # it silently overwrites the live value and the controller starts
+        # crashing on the next pod restart.
+        #
+        # Instead of skipping the file outright (which would also drop any
+        # new keys the bundle introduces), we MERGE: load the live
+        # ConfigMap's inner config.yaml, load the bundle's inner
+        # config.yaml, take the union with LIVE WINNING on conflicts
+        # (policy A), and rewrite the bundle file in place. The subsequent
+        # `kubectl apply` then pushes a manifest that preserves all
+        # operator state while adding any new keys this release
+        # introduces.
+        #
+        # The merge logic lives in hack/release/merge-machina-config.py
+        # and is fetched from the default branch by the step above so
+        # backfills of older tags still get the latest version.
+        #
+        # REMOVE this step (along with the sparse checkout above and the
+        # merge script under hack/release/) once issue #235 lands upstream
+        # (e.g. controller falls back to in-cluster discovery, or the
+        # release tarball stops shipping 03-config.yaml).
+        env:
+          BUNDLE_FILE: ${{ env.MANIFESTS_DIR }}/machina/03-config.yaml
+          MERGE_SCRIPT: _release-tools/hack/release/merge-machina-config.py
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$BUNDLE_FILE" ]]; then
+            echo "::warning::Workaround for #235 expected ${BUNDLE_FILE} but it was not present; the workaround may no longer be needed"
+            exit 0
+          fi
+
+          # Fetch the live inner config (empty if the ConfigMap does not exist yet).
+          LIVE_INNER=$(kubectl -n unbounded-kube get cm machina-config \
+            -o jsonpath='{.data.config\.yaml}' --ignore-not-found)
+          export LIVE_INNER
+
+          python3 "$MERGE_SCRIPT"
+
+          echo "Merged config.yaml that will be applied to the cluster:"
+          python3 -c "import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))['data']['config.yaml'])" "$BUNDLE_FILE"
+
       - name: Apply manifests (upgrade)
         if: env.MODE == 'upgrade'
         run: |
@@ -271,3 +451,314 @@ jobs:
             kubectl -n unbounded-kube get deploy machina-controller       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Deploy Orca (the origin cache) to the integration cluster.
+  #
+  # Orca is deployed separately from the core net/machina manifests: on
+  # unbounded-stable it is a long-running integration-test workload, not
+  # part of the shippable release tarball. release.yaml DOES build and
+  # push the Orca image (<registry>/orca:<tag>), but its manifests plus
+  # the test-only Garage cachestore are deployed here from hack/orca via
+  # hack/orca/deploy-stable.sh.
+  #
+  # Origin is real Azure Blob storage; cachestore is an in-cluster
+  # single-node Garage backed by a PVC. Confidential values (Azure
+  # account key, Garage S3 keys) come from a pre-created orca-credentials
+  # Secret that this workflow never creates or overwrites; the
+  # non-confidential Azure account details come from Environment vars.
+  #
+  # Unlike the #235 machina-config workaround, this job reads its tooling
+  # from the deployed TAG checkout (no sparse-checkout of the default
+  # branch). Re-deploying Orca onto a tag that predates this tooling is
+  # not supported - acceptable for a forward-looking integration cluster.
+  # ---------------------------------------------------------------------------
+  deploy-orca:
+    needs: [resolve, deploy]
+    if: github.repository == 'Azure/unbounded'
+    runs-on: ubuntu-latest
+    environment: unbounded-stable
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      REGISTRY: ghcr.io/${{ github.repository_owner }}
+      ORCA_AZURE_ACCOUNT: ${{ vars.ORCA_AZURE_ACCOUNT }}
+      ORCA_AZURE_CONTAINER: ${{ vars.ORCA_AZURE_CONTAINER }}
+      ORCA_AZURE_ENDPOINT: ${{ vars.ORCA_AZURE_ENDPOINT }}
+    steps:
+      - name: Validate Orca environment configuration
+        run: |
+          set -euo pipefail
+          missing=()
+          for v in ORCA_AZURE_ACCOUNT ORCA_AZURE_CONTAINER; do
+            if [[ -z "${!v}" ]]; then
+              missing+=("$v")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing required Environment variables: ${missing[*]}"
+            echo "::error::Configure with hack/scripts/setup-deploy-environment.sh"
+            exit 1
+          fi
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Orca deploy tooling (hack/orca/) is read from the deployed
+          # tag, not the default branch. It is present in every release
+          # cut after this tooling landed.
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
+
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KUBECONFIG_CONTENT}" ]]; then
+            echo "::error::Environment secret KUBECONFIG is empty"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KUBECONFIG_CONTENT" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Verify cluster connectivity
+        run: |
+          set -euo pipefail
+          kubectl version
+          kubectl cluster-info
+
+      - name: Verify orca-credentials Secret exists
+        run: |
+          set -euo pipefail
+          if ! kubectl -n unbounded-kube get secret orca-credentials >/dev/null 2>&1; then
+            echo "::error::Secret orca-credentials not found in unbounded-kube; pre-create it with ORCA_AZUREBLOB_ACCOUNT_KEY, ORCA_CACHESTORE_S3_ACCESS_KEY, ORCA_CACHESTORE_S3_SECRET_KEY"
+            exit 1
+          fi
+
+      - name: Deploy Orca
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY,,}/orca:${TAG}"
+          echo "Deploying Orca image: ${IMAGE}"
+          ./hack/orca/deploy-stable.sh \
+            --image "${IMAGE}" \
+            --azure-account "${ORCA_AZURE_ACCOUNT}" \
+            --azure-container "${ORCA_AZURE_CONTAINER}" \
+            --azure-endpoint "${ORCA_AZURE_ENDPOINT}"
+
+      - name: Summarize Orca deploy
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Orca deploy"
+            echo ""
+            echo "- Tag: \`${TAG}\`"
+            echo "- Image: \`${REGISTRY,,}/orca:${TAG}\`"
+            echo "- Environment: \`unbounded-stable\`"
+            echo ""
+            echo '```'
+            kubectl -n unbounded-kube get deploy orca -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-kube get deploy garage -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Discover smoke tests to run after deploy. Lists hack/release/smoke/*.sh
+  # and emits a JSON matrix. If the directory is absent or has no scripts,
+  # has_tasks is false and the smoke-tests job is skipped (GitHub Actions
+  # errors on an empty matrix, so we have to gate it explicitly).
+  #
+  # Why check out the default branch instead of the deployed tag?
+  #   Smoke tests are validation of the *deployed cluster*, not of the
+  #   release artifacts. They are intentionally version-agnostic (they
+  #   check generic cluster health), and we want backfill deploys of older
+  #   tags to still benefit from the latest smoke checks. Without this,
+  #   backfilling a tag that predates hack/release/smoke/ would skip
+  #   smoke entirely; new smoke tests added on main would also never run
+  #   against old releases. If a smoke test ever needs to be tied to a
+  #   specific release, that's a signal it should live with the release
+  #   artifacts (e.g. as an integration test in CI), not here.
+  # ---------------------------------------------------------------------------
+  smoke-discover:
+    needs: [resolve, deploy]
+    runs-on: ubuntu-latest
+    outputs:
+      tasks: ${{ steps.list.outputs.tasks }}
+      has_tasks: ${{ steps.list.outputs.has_tasks }}
+      smoke_sha: ${{ steps.pin.outputs.sha }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Use the default branch's hack/release/smoke/, not the deployed
+          # tag's. See the rationale above the job.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Pin smoke ref
+        id: pin
+        run: |
+          set -euo pipefail
+          # Record the exact commit the default branch points at right now.
+          # smoke-tests checks out this SHA rather than re-resolving the
+          # default branch, so it runs precisely the scripts this job
+          # enumerated even if the branch advances between jobs.
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Discover smoke tasks
+        id: list
+        run: |
+          set -euo pipefail
+          # Bail out cleanly if the smoke directory does not exist (older
+          # checkouts, accidentally removed directory). `find` exits
+          # non-zero on a missing path even with stderr suppressed, which
+          # would abort under `set -e`.
+          if [[ ! -d hack/release/smoke ]]; then
+            echo "has_tasks=false" >> "$GITHUB_OUTPUT"
+            echo "tasks=[]" >> "$GITHUB_OUTPUT"
+            echo "hack/release/smoke does not exist at this ref; skipping smoke tests"
+            exit 0
+          fi
+          tasks=$(
+            find hack/release/smoke -maxdepth 1 -type f -name '*.sh' \
+              | sort \
+              | jq -R -s -c 'split("\n") | map(select(length>0)) |
+                  map({name: (. | sub(".*/"; "") | sub(".sh$"; "")), script: .})'
+          )
+          if [[ -z "$tasks" || "$tasks" == "[]" ]]; then
+            echo "has_tasks=false" >> "$GITHUB_OUTPUT"
+            echo "tasks=[]" >> "$GITHUB_OUTPUT"
+            echo "No smoke tasks found in hack/release/smoke/"
+          else
+            echo "has_tasks=true" >> "$GITHUB_OUTPUT"
+            echo "tasks=${tasks}" >> "$GITHUB_OUTPUT"
+            echo "Discovered smoke tasks:"
+            echo "${tasks}" | jq .
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Smoke tests. Runs ONCE per deploy, after the core release deploy and
+  # Orca integration deploy have both completed. Each task must complete
+  # within the per-task timeout (15 minutes by default below). Long-running
+  # validation is NOT this job's responsibility - rely on the cluster's
+  # monitoring for that.
+  #
+  # Not to be confused with hack/smoke-metalman.py / hack/smoke-storage.py,
+  # which are component-level smoke tests used by CI workflows. Those run
+  # against ephemeral test environments; this runs against the deployed
+  # unbounded-stable cluster.
+  #
+  # CUSTOMIZE: ADD A SMOKE TEST
+  #   1. Drop an executable script in hack/release/smoke/ named
+  #      hack/release/smoke/<name>.sh. The basename (minus .sh) becomes
+  #      the matrix task name and shows up as its own job in the Actions
+  #      UI.
+  #   2. The script must complete within 15 minutes (see timeout-minutes
+  #      below).
+  #   3. The script runs from the repo root at the commit the default
+  #      branch pointed to when smoke-discover ran (NOT the deployed tag -
+  #      see smoke-discover's rationale) with the following env exported:
+  #        TAG          - the deployed tag (e.g. v0.1.12)
+  #        KUBECONFIG   - path to the cluster's kubeconfig
+  #        SITE_NAME    - the configured site name on this cluster
+  #      Anything from the `unbounded-stable` environment is also in scope.
+  #   4. Exit 0 for pass, non-zero for fail. Failures do NOT roll back the
+  #      deploy - rollback during soak is a human decision (re-run this
+  #      workflow's workflow_dispatch with the previous tag).
+  #
+  # See hack/release/smoke/core-namespaces-ready.sh as a template.
+  # ---------------------------------------------------------------------------
+  smoke-tests:
+    needs: [resolve, deploy, deploy-orca, smoke-discover]
+    if: needs.smoke-discover.outputs.has_tasks == 'true'
+    runs-on: ubuntu-latest
+    environment: unbounded-stable
+    strategy:
+      # Run every smoke task even if one fails so we get full signal.
+      fail-fast: false
+      matrix:
+        task: ${{ fromJSON(needs.smoke-discover.outputs.tasks) }}
+    name: smoke (${{ matrix.task.name }})
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SITE_NAME: ${{ vars.SITE_NAME }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Check out the exact commit smoke-discover enumerated, not a
+          # fresh resolve of the default branch (which may have advanced
+          # since). This guarantees we run precisely the scripts that
+          # populated the matrix. See the comment block on smoke-discover
+          # for why the smoke scripts come from the default branch at all.
+          ref: ${{ needs.smoke-discover.outputs.smoke_sha }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
+
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KUBECONFIG_CONTENT}" ]]; then
+            echo "::error::Environment secret KUBECONFIG is empty"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KUBECONFIG_CONTENT" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Run smoke task ${{ matrix.task.name }}
+        timeout-minutes: 15
+        # SMOKE_SCRIPT comes from a matrix entry that smoke-discover
+        # built from `find hack/release/smoke/*.sh` output. The values
+        # are committed repo paths today, but we still bind via `env:`
+        # rather than inline `${{ matrix.task.script }}` so that any
+        # future change to how the matrix is populated cannot silently
+        # introduce a code-injection sink. The `name:` above is workflow
+        # metadata, not a shell context, so inlining is fine there.
+        env:
+          SMOKE_SCRIPT: ${{ matrix.task.script }}
+        run: |
+          set -euo pipefail
+          chmod +x "$SMOKE_SCRIPT"
+          "$SMOKE_SCRIPT"
+
+  # ---------------------------------------------------------------------------
+  # CUSTOMIZE: Teams notification (NOT YET ENABLED)
+  #
+  # When we want Teams notifications:
+  #   1. Provision an Incoming Webhook (Workflows / Power Automate) on the
+  #      target channel; capture the URL.
+  #   2. Add it as a secret on the `unbounded-stable` environment named
+  #      TEAMS_WEBHOOK_URL.
+  #   3. Uncomment the notify job below.
+  #
+  # notify:
+  #   needs: [resolve, deploy, smoke-tests]
+  #   if: always() && needs.resolve.result == 'success'
+  #   runs-on: ubuntu-latest
+  #   environment: unbounded-stable
+  #   steps:
+  #     - name: Post to Teams
+  #       env:
+  #         WEBHOOK: ${{ secrets.TEAMS_WEBHOOK_URL }}
+  #         TAG: ${{ needs.resolve.outputs.tag }}
+  #         DEPLOY_STATUS: ${{ needs.deploy.result }}
+  #         SMOKE_STATUS: ${{ needs.smoke-tests.result }}
+  #         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  #       run: |
+  #         # Adaptive Card payload; see https://adaptivecards.io
+  #         jq -n --arg tag "$TAG" \
+  #               --arg deploy "$DEPLOY_STATUS" \
+  #               --arg smoke "$SMOKE_STATUS" \
+  #               --arg url "$RUN_URL" \
+  #           '{ ... }' \
+  #           | curl -sS -H 'Content-Type: application/json' -d @- "$WEBHOOK"
+  # ---------------------------------------------------------------------------
