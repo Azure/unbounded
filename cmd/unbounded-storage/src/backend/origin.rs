@@ -20,16 +20,18 @@ use std::task::{Context, Poll};
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::storage::StripeReq;
 
-use super::{AzureBackend, Backend, HttpBackend, S3Backend};
+use super::{AzureBackend, Backend, FakeBackend, HttpBackend, S3Backend};
 
 /// One configured origin tier: a plaintext HTTP origin, an
-/// S3-compatible origin, or an Azure Blob origin. Implements [`Backend`]
-/// by delegating to the inner backend and wrapping its stream in
+/// S3-compatible origin, an Azure Blob origin, or a synthetic
+/// [`FakeBackend`] for benchmarking. Implements [`Backend`] by
+/// delegating to the inner backend and wrapping its stream in
 /// [`OriginStream`].
 pub enum OriginBackend {
     Http(HttpBackend),
     S3(S3Backend),
     Azure(AzureBackend),
+    Fake(FakeBackend),
 }
 
 impl OriginBackend {
@@ -49,6 +51,7 @@ impl OriginBackend {
             OriginBackend::Http(b) => OriginStream::Http(b.fetch_stream(req, src, dsts)),
             OriginBackend::S3(b) => OriginStream::S3(b.fetch_stream(req, src, dsts)),
             OriginBackend::Azure(b) => OriginStream::Azure(b.fetch_stream(req, src, dsts)),
+            OriginBackend::Fake(b) => OriginStream::Fake(b.fetch_stream(req, src, dsts)),
         }
     }
 }
@@ -72,6 +75,7 @@ impl Backend for OriginBackend {
             OriginBackend::Http(b) => OriginStream::Http(b.bulk_get(req, src, dsts)),
             OriginBackend::S3(b) => OriginStream::S3(b.bulk_get(req, src, dsts)),
             OriginBackend::Azure(b) => OriginStream::Azure(b.bulk_get(req, src, dsts)),
+            OriginBackend::Fake(b) => OriginStream::Fake(b.bulk_get(req, src, dsts)),
         }
     }
 }
@@ -83,6 +87,7 @@ pub enum OriginStream<'a> {
     Http(<HttpBackend as Backend>::Stream<'a>),
     S3(<S3Backend as Backend>::Stream<'a>),
     Azure(<AzureBackend as Backend>::Stream<'a>),
+    Fake(<FakeBackend as Backend>::Stream<'a>),
 }
 
 impl PageStream for OriginStream<'_> {
@@ -97,6 +102,7 @@ impl PageStream for OriginStream<'_> {
             OriginStream::Http(s) => Pin::new(s).poll_next(cx),
             OriginStream::S3(s) => Pin::new(s).poll_next(cx),
             OriginStream::Azure(s) => Pin::new(s).poll_next(cx),
+            OriginStream::Fake(s) => Pin::new(s).poll_next(cx),
         }
     }
 }

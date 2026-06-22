@@ -41,7 +41,7 @@ const MAX_HEAD_BYTES: usize = 8 * 1024;
 /// Reasons the exporter could not be started.
 #[derive(Debug)]
 pub enum ExporterError {
-    /// The configured bind address could not be parsed.
+    /// The configured address could not be parsed.
     BadBind(String),
     /// Binding or listening on the address failed.
     Bind(std::io::Error),
@@ -50,7 +50,7 @@ pub enum ExporterError {
 impl std::fmt::Display for ExporterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExporterError::BadBind(b) => write!(f, "invalid metrics bind address: {b}"),
+            ExporterError::BadBind(b) => write!(f, "invalid metrics addr: {b}"),
             ExporterError::Bind(e) => write!(f, "failed to bind metrics listener: {e}"),
         }
     }

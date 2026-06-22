@@ -568,51 +568,59 @@ def write_config(
     peer_addr: str,
     disk_path: Path,
     origin_addr: str,
-    frontend_bind: str,
-    fabric_listen: str,
-    metrics_bind: str,
+    frontend_addr: str,
+    fabric_addr: str,
+    metrics_addr: str,
 ) -> None:
-    # The config schema is proto3-native: enum fields are plain integer
-    # discriminants and byte sizes are plain integer byte counts (see
-    # cmd/unbounded-storage/proto/config.proto). Map the human-friendly
-    # `kind` string to the BackendKind/FrontendKind discriminant.
+    # The config schema is proto3-native: byte sizes are plain integer
+    # byte counts (see api/unbounded-storage/config.proto).
+    # Backend and frontend implementations are selected by the oneof
+    # config table name.
     #
     # Startup-fixed knobs live in the `[startup]` section of the config:
-    # the fabric listen address, the per-shard hugepage backing size
+    # the fabric bind address, the per-shard hugepage backing size
     # (memory_total_bytes, leaving the daemon's hugepage default in place), and
     # forcing the libfabric tcp provider (disable_rdma) even on hosts that
     # expose an unusable RDMA HCA in sysfs. They only take effect at process
     # start and are intentionally not part of the dynamic reload path.
-    kind_int = {"http": 0, "s3": 1}[kind]
     path.write_text(
         f"""\
-[p2p]
-local_node_id = {local_id}
-
-[[peers]]
-id = {peer_id}
-address = {{ socket = "{peer_addr}" }}
-
-[[disks]]
-path = "{disk_path}"
-# kind: 0 = nvme, 1 = block, 2 = file.
-kind = 2
-size = {DISK_SIZE}
-page_size_bytes = 4096
-bypass_admission = true
-skip_recovery_scan_if_no_meta = true
-
 [[backends]]
-id = "origin"
-kind = {kind_int}
-endpoint = "{origin_addr}"
+name = "origin"
+
+[backends.config.{kind}]
+url = "{origin_addr}"
 stripe_size_bytes = {STRIPE_SIZE}
 
+[[neighborhoods]]
+name = "p2p"
+source = "origin"
+local_node_id = {local_id}
+
+[[neighborhoods.peers]]
+id = {peer_id}
+
+[neighborhoods.peers.config.tcp]
+addr = "{peer_addr}"
+
+[[caches]]
+name = "cache"
+source = "p2p"
+
+[[caches.disks]]
+page_size_bytes = 4096
+skip_recovery_scan = true
+
+[caches.disks.config.file]
+path = "{disk_path}"
+size = {DISK_SIZE}
+
 [[frontends]]
-id = "fe"
-kind = {kind_int}
-bind = "{frontend_bind}"
-backend = "origin"
+name = "fe"
+source = "cache"
+
+[frontends.config.{kind}]
+addr = "{frontend_addr}"
 
 [startup.memory]
 # Back shards with 2 MiB hugepages (the daemon default, so no_hugepages is
@@ -621,19 +629,19 @@ backend = "origin"
 # reservation.
 memory_total_bytes = {MEMORY_TOTAL_BYTES}
 
-[startup.fabric]
-listen_addr = "{fabric_listen}"
+[startup.fabric.binds.tcp]
+addr = "{fabric_addr}"
 
 [startup.metrics]
 # Expose the Prometheus exporter on a dedicated control-plane port so the
 # smoke test can scrape /metrics and assert request counters advanced.
-bind = "{metrics_bind}"
+addr = "{metrics_addr}"
 
 [startup.topology]
 disable_rdma = true
 # Cap the smoke test at two serving shards so it exercises the shared
 # per-node endpoint with more than one shard. A node advertises one static
-# address (its `listen_addr`) to its peers, so it binds exactly one inbound
+# fabric address to its peers, so it binds exactly one inbound
 # fabric endpoint on that fixed port; `plan_fabric_units` maps every serving
 # shard onto that single shared endpoint (per-node for tcp, per-HCA for
 # verbs). Binding one endpoint per shard instead would make every shard past
@@ -791,9 +799,9 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
         peer_addr=f"127.0.0.1:{fab_b}",
         disk_path=TMPDIR / f"{kind}-node1.disk",
         origin_addr=origin_addr,
-        frontend_bind=f"127.0.0.1:{fe_a}",
-        fabric_listen=f"127.0.0.1:{fab_a}",
-        metrics_bind=f"127.0.0.1:{met_a}",
+        frontend_addr=f"127.0.0.1:{fe_a}",
+        fabric_addr=f"127.0.0.1:{fab_a}",
+        metrics_addr=f"127.0.0.1:{met_a}",
     )
     write_config(
         cfg2,
@@ -803,9 +811,9 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
         peer_addr=f"127.0.0.1:{fab_a}",
         disk_path=TMPDIR / f"{kind}-node2.disk",
         origin_addr=origin_addr,
-        frontend_bind=f"127.0.0.1:{fe_b}",
-        fabric_listen=f"127.0.0.1:{fab_b}",
-        metrics_bind=f"127.0.0.1:{met_b}",
+        frontend_addr=f"127.0.0.1:{fe_b}",
+        fabric_addr=f"127.0.0.1:{fab_b}",
+        metrics_addr=f"127.0.0.1:{met_b}",
     )
 
     try:

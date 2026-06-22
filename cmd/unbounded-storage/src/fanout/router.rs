@@ -32,7 +32,7 @@ use std::sync::Arc;
 use crate::bufferpool::StripeKey;
 use crate::fanout::FetchChannel;
 use crate::storage::disk_for;
-use crate::storage::disks::DiskChannelDirectory;
+use crate::storage::disks::CacheDirectorySet;
 
 /// Hash a [`StripeKey`] into a shard index in `0..shard_count`.
 ///
@@ -219,7 +219,7 @@ pub struct FanoutTable {
     /// NUMA node -> serving shards, for NUMA-local placement.
     numa_shards: NumaShardTable,
     /// Live drive -> NUMA table source, shared with the local store.
-    disk_channels: Arc<DiskChannelDirectory>,
+    disk_channels: Arc<CacheDirectorySet>,
 }
 
 impl FanoutTable {
@@ -232,7 +232,7 @@ impl FanoutTable {
         own_shard_index: usize,
         peers: Vec<Option<FanoutPeer>>,
         numa_shards: NumaShardTable,
-        disk_channels: Arc<DiskChannelDirectory>,
+        disk_channels: Arc<CacheDirectorySet>,
     ) -> Self {
         debug_assert!(own_shard_index < peers.len(), "own shard index in range");
         debug_assert!(
@@ -270,7 +270,16 @@ impl FanoutTable {
     /// backing drive the local store would read, so the serving shard
     /// lands on that drive's NUMA node.
     pub fn owner_of(&self, key: &StripeKey, stripe_off: u64) -> Owner<'_> {
-        let drive_numa = self.disk_channels.drive_numa();
+        self.owner_of_cache(key, None, stripe_off)
+    }
+
+    pub fn owner_of_cache(
+        &self,
+        key: &StripeKey,
+        cache_id: Option<&str>,
+        stripe_off: u64,
+    ) -> Owner<'_> {
+        let drive_numa = self.disk_channels.drive_numa(cache_id);
         let pick = numa_local_shard(key, stripe_off, &drive_numa, &self.numa_shards);
 
         if pick.cross_numa {
@@ -438,7 +447,7 @@ mod tests {
     #[test]
     fn fanout_table_single_shard_is_always_local() {
         let table = NumaShardTable::from_shards([(0, None)]);
-        let fanout = FanoutTable::new(0, vec![None], table, DiskChannelDirectory::new());
+        let fanout = FanoutTable::new(0, vec![None], table, CacheDirectorySet::new());
         let key = key_with(123, 456);
         assert!(matches!(fanout.owner_of(&key, 0), Owner::Local));
         assert_eq!(fanout.shard_count(), 1);
