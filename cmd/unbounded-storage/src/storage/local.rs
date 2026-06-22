@@ -200,24 +200,26 @@ impl<B: BlockDevice + 'static> bufferpool::BlockStore for LocalStorage<B> {
         Ok(())
     }
 
-    async fn read_page(
+    async fn read_page<R: bufferpool::Req + ?Sized>(
         &self,
-        key: StripeKey,
+        req: &R,
         stripe_off: u64,
         dst: PageRef,
     ) -> Result<bool, Error> {
+        let key = req.key();
         let idx = self.disk_for(key, stripe_off);
-        self.engines[idx].read_page(key, stripe_off, dst).await
+        self.engines[idx].read_page(req, stripe_off, dst).await
     }
 
-    async fn write_page(
+    async fn write_page<R: bufferpool::Req + ?Sized>(
         &self,
-        key: StripeKey,
+        req: &R,
         stripe_off: u64,
         page: PageRef,
     ) -> Result<(), Error> {
+        let key = req.key();
         let idx = self.disk_for(key, stripe_off);
-        self.engines[idx].write_page(key, stripe_off, page).await
+        self.engines[idx].write_page(req, stripe_off, page).await
     }
 }
 
@@ -297,9 +299,9 @@ impl<B: BlockDevice + 'static> bufferpool::BlockStore for ShardLocalStore<B> {
             .register_extra_buffer(backing.base, backing.page_size * backing.page_count)
     }
 
-    async fn read_page(
+    async fn read_page<R: bufferpool::Req + ?Sized>(
         &self,
-        key: StripeKey,
+        req: &R,
         stripe_off: u64,
         dst: PageRef,
     ) -> Result<bool, Error> {
@@ -308,19 +310,27 @@ impl<B: BlockDevice + 'static> bufferpool::BlockStore for ShardLocalStore<B> {
         // SAFETY: `resolve` produced an in-bounds pointer into the
         // shard's pinned backing; the pool guarantees the page is
         // not aliased for the duration of this future.
-        unsafe { self.inner.read_page_into(key, stripe_off, slice).await }
+        unsafe {
+            self.inner
+                .read_page_into(req.key(), stripe_off, slice)
+                .await
+        }
     }
 
-    async fn write_page(
+    async fn write_page<R: bufferpool::Req + ?Sized>(
         &self,
-        key: StripeKey,
+        req: &R,
         stripe_off: u64,
         page: PageRef,
     ) -> Result<(), Error> {
         let (p, len) = self.resolve(page);
         let slice = std::ptr::slice_from_raw_parts(p as *const u8, len);
         // SAFETY: see `read_page` above.
-        unsafe { self.inner.write_page_from(key, stripe_off, slice).await }
+        unsafe {
+            self.inner
+                .write_page_from(req.key(), stripe_off, slice)
+                .await
+        }
     }
 }
 
@@ -494,15 +504,15 @@ mod tests {
         let body = async move {
             // First write is rejected by the admission filter on
             // first touch; the second admits.
-            store_a_clone.write_page(key, 0, src).await.unwrap();
-            store_a_clone.write_page(key, 0, src).await.unwrap();
+            store_a_clone.write_page(&key, 0, src).await.unwrap();
+            store_a_clone.write_page(&key, 0, src).await.unwrap();
 
             let dst = PageRef {
                 page_idx: 7,
                 offset: 0,
                 len: 4096,
             };
-            let hit = store_b_clone.read_page(key, 0, dst).await.unwrap();
+            let hit = store_b_clone.read_page(&key, 0, dst).await.unwrap();
             assert!(hit, "expected cache hit across shards");
             e0_body.close_mutator();
             e1_body.close_mutator();
@@ -544,6 +554,6 @@ mod tests {
             len: 4096,
         };
         // Triggers resolve() with no backing installed.
-        let _ = block_on(store.read_page(StripeKey([0; 32]), 0, dst));
+        let _ = block_on(store.read_page(&StripeKey([0; 32]), 0, dst));
     }
 }
