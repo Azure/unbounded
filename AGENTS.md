@@ -88,3 +88,9 @@ unbounded-kube is organized into several directories:
     - Use destructive git operations unless explicitly requested.
     - Go outside the project boundary, for example, DO NOT edit files in user's home directories, add or edit files 
       in /tmp or anywhere else on the host filesystem.
+
+## Miscellaneous
+
+- **DO NOT** give time or effort estimates for work in this project. For example, do not say "this is a half day 
+  project" or "this will take a week". You are a computer. You are not a person with a concept of human scheduling and 
+  time.
