@@ -28,10 +28,14 @@ const (
 	benchmarkVerifyAnnotation          = "unbounded-cloud.io/storage-benchmark.verify"
 	benchmarkStripeSizeBytesAnnotation = "unbounded-cloud.io/storage-benchmark.stripe-size-bytes"
 	benchmarkObjectSizeBytesAnnotation = "unbounded-cloud.io/storage-benchmark.object-size-bytes"
+	benchmarkDiskPathAnnotation        = "unbounded-cloud.io/storage-benchmark.disk-path"
+	benchmarkDiskSizeBytesAnnotation   = "unbounded-cloud.io/storage-benchmark.disk-size-bytes"
+	benchmarkWarmupOpsAnnotation       = "unbounded-cloud.io/storage-benchmark.warmup-operations"
 	benchmarkRdmaAddrAnnotation        = "unbounded-cloud.io/storage-rdma.addr"
 
-	rdmaLoadgenScenario = "rdma-loadgen"
-	rdmaScenarioAlias   = "rdma"
+	rdmaLoadgenScenario   = "rdma-loadgen"
+	rdmaCacheMissScenario = "rdma-cache-miss"
+	rdmaScenarioAlias     = "rdma"
 
 	benchmarkComponentPrefix = "__unbounded_benchmark_"
 )
@@ -53,15 +57,19 @@ type rdmaLoadgenBenchmark struct {
 	localNodeID uint64
 	peerNodeID  uint64
 	peerAddr    string
+	cacheMiss   bool
 
 	workers     *uint32
 	seed        *uint64
 	objectCount *uint64
 	readBytes   *uint64
 	verify      bool
+	warmupOps   *uint64
 
 	stripeSizeBytes *uint64
 	objectSizeBytes *uint64
+	diskPath        string
+	diskSizeBytes   uint64
 }
 
 // computeBenchmarks turns Node annotations into benchmark overlays relevant to
@@ -99,14 +107,14 @@ func computeBenchmarks(nodes []*corev1.Node, selfName string) benchmarkState {
 			continue
 		}
 
-		if !isRDMALoadgenScenario(scenario) {
+		if !isRDMALoadgenScenario(scenario) && !isRDMACacheMissScenario(scenario) {
 			slog.Warn("skipping storage benchmark with unsupported scenario",
 				"node", sourceName, "scenario", scenario)
 
 			continue
 		}
 
-		bench, ok := parseRDMALoadgenBenchmark(source, byName, selfName)
+		bench, ok := parseRDMALoadgenBenchmark(source, byName, selfName, isRDMACacheMissScenario(scenario))
 		if !ok {
 			continue
 		}
@@ -121,7 +129,7 @@ func computeBenchmarks(nodes []*corev1.Node, selfName string) benchmarkState {
 	return state
 }
 
-func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Node, selfName string) (rdmaLoadgenBenchmark, bool) {
+func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Node, selfName string, cacheMiss bool) (rdmaLoadgenBenchmark, bool) {
 	targetName := strings.TrimSpace(source.Annotations[benchmarkTargetNodeAnnotation])
 	if targetName == "" {
 		slog.Warn("skipping RDMA storage benchmark without target node annotation",
@@ -209,6 +217,30 @@ func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Nod
 		return rdmaLoadgenBenchmark{}, false
 	}
 
+	warmupOps, ok := parseUint64Annotation(source, benchmarkWarmupOpsAnnotation)
+	if !ok {
+		return rdmaLoadgenBenchmark{}, false
+	}
+
+	diskPath := ""
+	diskSizeBytes := uint64(0)
+	if cacheMiss {
+		diskPath = strings.TrimSpace(source.Annotations[benchmarkDiskPathAnnotation])
+		if diskPath == "" {
+			slog.Warn("skipping RDMA cache-miss storage benchmark without disk path annotation",
+				"node", source.Name, "annotation", benchmarkDiskPathAnnotation)
+
+			return rdmaLoadgenBenchmark{}, false
+		}
+
+		parsedDiskSizeBytes, ok := parseRequiredUint64Annotation(source, benchmarkDiskSizeBytesAnnotation)
+		if !ok {
+			return rdmaLoadgenBenchmark{}, false
+		}
+
+		diskSizeBytes = parsedDiskSizeBytes
+	}
+
 	bench := rdmaLoadgenBenchmark{
 		name:            benchmarkName(source.Name, targetName),
 		sourceNode:      source.Name,
@@ -217,13 +249,17 @@ func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Nod
 		localNodeID:     sourceID,
 		peerNodeID:      targetID,
 		peerAddr:        targetAddr,
+		cacheMiss:       cacheMiss,
 		workers:         workers,
 		seed:            seed,
 		objectCount:     objectCount,
 		readBytes:       readBytes,
 		verify:          verify,
+		warmupOps:       warmupOps,
 		stripeSizeBytes: stripeSizeBytes,
 		objectSizeBytes: objectSizeBytes,
+		diskPath:        diskPath,
+		diskSizeBytes:   diskSizeBytes,
 	}
 
 	if selfName == targetName {
@@ -244,9 +280,15 @@ func applyBenchmarks(cfg *storageconfig.Config, benchmarks benchmarkState) {
 func applyRDMALoadgenBenchmark(cfg *storageconfig.Config, bench rdmaLoadgenBenchmark) {
 	backendName := bench.backendName()
 	neighborhoodName := bench.neighborhoodName()
+	cacheName := bench.cacheName()
 	frontendName := bench.frontendName()
 
-	for _, name := range []string{backendName, neighborhoodName} {
+	reservedNames := []string{backendName, neighborhoodName}
+	if bench.cacheMiss {
+		reservedNames = append(reservedNames, cacheName)
+	}
+
+	for _, name := range reservedNames {
 		if componentNameExists(cfg, name) {
 			slog.Warn("skipping RDMA storage benchmark: reserved component name already exists",
 				"benchmark", bench.name, "component", name)
@@ -294,21 +336,61 @@ func applyRDMALoadgenBenchmark(cfg *storageconfig.Config, bench rdmaLoadgenBench
 		Peers:       []*storageconfig.PeerSpec{peer},
 	})
 
+	if bench.cacheMiss {
+		cfg.Caches = append(cfg.Caches, benchmarkCache(bench, cacheName, neighborhoodName))
+	}
+
 	if bench.runLoadgen {
+		frontendSource := neighborhoodName
+		if bench.cacheMiss {
+			frontendSource = cacheName
+		}
+
 		cfg.Frontends = append(cfg.Frontends, &storageconfig.FrontendSpec{
 			Name:   frontendName,
-			Source: neighborhoodName,
+			Source: frontendSource,
 			Config: &storageconfig.FrontendSpec_Loadgen{
-				Loadgen: &storageconfig.LoadgenFrontendConfig{
-					Workers:     bench.workers,
-					Seed:        bench.seed,
-					ObjectCount: bench.objectCount,
-					ReadBytes:   bench.readBytes,
-					Verify:      bench.verify,
-				},
+				Loadgen: benchmarkLoadgenConfig(bench),
 			},
 		})
 	}
+}
+
+func benchmarkLoadgenConfig(bench rdmaLoadgenBenchmark) *storageconfig.LoadgenFrontendConfig {
+	cfg := &storageconfig.LoadgenFrontendConfig{
+		Workers:     bench.workers,
+		Seed:        bench.seed,
+		ObjectCount: bench.objectCount,
+		ReadBytes:   bench.readBytes,
+		Verify:      bench.verify,
+	}
+
+	if bench.cacheMiss {
+		cfg.FixedObjectSizeBytes = proto.Uint64(bench.effectiveObjectSizeBytes())
+		cfg.RequireRemotePeer = proto.Bool(true)
+		cfg.WarmupOperations = proto.Uint64(bench.effectiveWarmupOperations())
+	}
+
+	return cfg
+}
+
+func benchmarkCache(bench rdmaLoadgenBenchmark, cacheName, neighborhoodName string) *storageconfig.CacheSpec {
+	cache := &storageconfig.CacheSpec{Name: cacheName, Source: neighborhoodName}
+	if !bench.runLoadgen {
+		cache.Disks = []*storageconfig.DiskSpec{
+			{
+				SkipRecoveryScan: true,
+				Config: &storageconfig.DiskSpec_File{
+					File: &storageconfig.FileDiskConfig{
+						Path: bench.diskPath,
+						Size: proto.Uint64(bench.diskSizeBytes),
+					},
+				},
+			},
+		}
+	}
+
+	return cache
 }
 
 func benchmarkScenario(node *corev1.Node) string {
@@ -330,6 +412,10 @@ func isRDMALoadgenScenario(scenario string) bool {
 	default:
 		return false
 	}
+}
+
+func isRDMACacheMissScenario(scenario string) bool {
+	return strings.ToLower(strings.TrimSpace(scenario)) == rdmaCacheMissScenario
 }
 
 func rdmaAddr(node *corev1.Node) (string, bool) {
@@ -390,6 +476,26 @@ func parseUint64Annotation(node *corev1.Node, key string) (*uint64, bool) {
 	return &v, true
 }
 
+func parseRequiredUint64Annotation(node *corev1.Node, key string) (uint64, bool) {
+	raw := strings.TrimSpace(node.Annotations[key])
+	if raw == "" {
+		slog.Warn("skipping RDMA storage benchmark: missing required uint64 annotation",
+			"node", node.Name, "annotation", key)
+
+		return 0, false
+	}
+
+	v, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		slog.Warn("skipping RDMA storage benchmark: annotation must be a uint64",
+			"node", node.Name, "annotation", key, "value", raw)
+
+		return 0, false
+	}
+
+	return v, true
+}
+
 func parseBoolAnnotation(node *corev1.Node, key string) (bool, bool) {
 	raw := strings.TrimSpace(node.Annotations[key])
 	if raw == "" {
@@ -444,8 +550,32 @@ func (b rdmaLoadgenBenchmark) neighborhoodName() string {
 	return fmt.Sprintf("%s%s_neighborhood", benchmarkComponentPrefix, b.name)
 }
 
+func (b rdmaLoadgenBenchmark) cacheName() string {
+	return fmt.Sprintf("%s%s_cache", benchmarkComponentPrefix, b.name)
+}
+
 func (b rdmaLoadgenBenchmark) frontendName() string {
 	return fmt.Sprintf("%s%s_loadgen", benchmarkComponentPrefix, b.name)
+}
+
+func (b rdmaLoadgenBenchmark) effectiveObjectSizeBytes() uint64 {
+	if b.objectSizeBytes != nil {
+		return *b.objectSizeBytes
+	}
+
+	return 1024 * 1024
+}
+
+func (b rdmaLoadgenBenchmark) effectiveWarmupOperations() uint64 {
+	if b.warmupOps != nil {
+		return *b.warmupOps
+	}
+
+	if b.objectCount != nil {
+		return *b.objectCount
+	}
+
+	return 1_000_000
 }
 
 func rdmaPeer(id uint64, addr string) *storageconfig.PeerSpec {

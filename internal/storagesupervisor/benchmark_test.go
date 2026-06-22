@@ -58,6 +58,7 @@ func TestComputeBenchmarksSourceNode(t *testing.T) {
 	assert.Equal(t, nodeID("source-a"), bench.localNodeID)
 	assert.Equal(t, nodeID("target-b"), bench.peerNodeID)
 	assert.Equal(t, "hex:0a0b", bench.peerAddr)
+	assert.False(t, bench.cacheMiss)
 	require.NotNil(t, bench.workers)
 	assert.Equal(t, uint32(4), *bench.workers)
 	require.NotNil(t, bench.seed)
@@ -71,6 +72,39 @@ func TestComputeBenchmarksSourceNode(t *testing.T) {
 	assert.Equal(t, uint64(8192), *bench.stripeSizeBytes)
 	require.NotNil(t, bench.objectSizeBytes)
 	assert.Equal(t, uint64(16384), *bench.objectSizeBytes)
+}
+
+func TestComputeBenchmarksCacheMissSourceNode(t *testing.T) {
+	source := benchmarkNode("source-a", map[string]string{
+		benchmarkScenarioAnnotation:        rdmaCacheMissScenario,
+		benchmarkTargetNodeAnnotation:      "target-b",
+		benchmarkRdmaAddrAnnotation:        "hex:01020304",
+		benchmarkReadBytesAnnotation:       "4096",
+		benchmarkObjectSizeBytesAnnotation: "16384",
+		benchmarkDiskPathAnnotation:        "/var/lib/unbounded/bench-cache.bin",
+		benchmarkDiskSizeBytesAnnotation:   "104857600",
+		benchmarkWarmupOpsAnnotation:       "25",
+	})
+	target := benchmarkNode("target-b", map[string]string{benchmarkRdmaAddrAnnotation: "hex:0a0b"})
+
+	state := computeBenchmarks([]*corev1.Node{target, source}, "source-a")
+
+	require.Len(t, state.rdmaLoadgens, 1)
+	bench := state.rdmaLoadgens[0]
+	assert.Equal(t, "rdma_source-a_to_target-b", bench.name)
+	assert.True(t, bench.runLoadgen)
+	assert.True(t, bench.cacheMiss)
+	assert.Equal(t, nodeID("source-a"), bench.localNodeID)
+	assert.Equal(t, nodeID("target-b"), bench.peerNodeID)
+	assert.Equal(t, "hex:0a0b", bench.peerAddr)
+	require.NotNil(t, bench.readBytes)
+	assert.Equal(t, uint64(4096), *bench.readBytes)
+	require.NotNil(t, bench.objectSizeBytes)
+	assert.Equal(t, uint64(16384), *bench.objectSizeBytes)
+	require.NotNil(t, bench.warmupOps)
+	assert.Equal(t, uint64(25), *bench.warmupOps)
+	assert.Equal(t, "/var/lib/unbounded/bench-cache.bin", bench.diskPath)
+	assert.Equal(t, uint64(104857600), bench.diskSizeBytes)
 }
 
 func TestComputeBenchmarksTargetNode(t *testing.T) {
@@ -141,6 +175,40 @@ func TestComputeBenchmarksSkipsInvalidAnnotations(t *testing.T) {
 			target:      map[string]string{benchmarkRdmaAddrAnnotation: "hex:0304"},
 			includePeer: true,
 		},
+		{
+			name: "cache miss missing disk path",
+			source: map[string]string{
+				benchmarkScenarioAnnotation:      rdmaCacheMissScenario,
+				benchmarkTargetNodeAnnotation:    "target-b",
+				benchmarkRdmaAddrAnnotation:      "hex:0102",
+				benchmarkDiskSizeBytesAnnotation: "1048576",
+			},
+			target:      map[string]string{benchmarkRdmaAddrAnnotation: "hex:0304"},
+			includePeer: true,
+		},
+		{
+			name: "cache miss missing disk size",
+			source: map[string]string{
+				benchmarkScenarioAnnotation:   rdmaCacheMissScenario,
+				benchmarkTargetNodeAnnotation: "target-b",
+				benchmarkRdmaAddrAnnotation:   "hex:0102",
+				benchmarkDiskPathAnnotation:   "/var/lib/unbounded/bench-cache.bin",
+			},
+			target:      map[string]string{benchmarkRdmaAddrAnnotation: "hex:0304"},
+			includePeer: true,
+		},
+		{
+			name: "cache miss bad disk size",
+			source: map[string]string{
+				benchmarkScenarioAnnotation:      rdmaCacheMissScenario,
+				benchmarkTargetNodeAnnotation:    "target-b",
+				benchmarkRdmaAddrAnnotation:      "hex:0102",
+				benchmarkDiskPathAnnotation:      "/var/lib/unbounded/bench-cache.bin",
+				benchmarkDiskSizeBytesAnnotation: "not-a-number",
+			},
+			target:      map[string]string{benchmarkRdmaAddrAnnotation: "hex:0304"},
+			includePeer: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -192,6 +260,7 @@ startup:
 	assert.Equal(t, uint64(1), cfg.GetVersion())
 	assert.NotNil(t, cfg.GetStartup().GetFabric().GetAutoRdma())
 	assert.Equal(t, "0.0.0.0:9100", cfg.GetStartup().GetMetrics().GetAddr())
+	assert.Empty(t, cfg.GetCaches())
 
 	require.Len(t, cfg.GetBackends(), 1)
 	backend := cfg.GetBackends()[0]
@@ -219,6 +288,7 @@ startup:
 	assert.Equal(t, uint64(101), loadgen.GetObjectCount())
 	assert.Equal(t, uint64(4096), loadgen.GetReadBytes())
 	assert.True(t, loadgen.GetVerify())
+	assert.False(t, loadgen.GetRequireRemotePeer())
 }
 
 func TestRenderConfigAppliesRDMABenchmarkOnTargetWithoutLoadgen(t *testing.T) {
@@ -235,8 +305,117 @@ func TestRenderConfigAppliesRDMABenchmarkOnTargetWithoutLoadgen(t *testing.T) {
 
 	require.Len(t, cfg.GetBackends(), 1)
 	require.Len(t, cfg.GetNeighborhoods(), 1)
+	assert.Empty(t, cfg.GetCaches())
 	assert.Empty(t, cfg.GetFrontends())
 	assert.Equal(t, uint64(20), cfg.GetNeighborhoods()[0].GetLocalNodeId())
+}
+
+func TestRenderConfigAppliesRDMACacheMissBenchmarkOnSource(t *testing.T) {
+	dir := writeSource(t, "startup:\n  fabric:\n    auto_rdma: {}\n")
+	warmupOps := uint64(25)
+	objectSize := uint64(16384)
+	readBytes := uint64(4096)
+	bench := rdmaLoadgenBenchmark{
+		name:            "rdma_source_to_target",
+		runLoadgen:      true,
+		localNodeID:     10,
+		peerNodeID:      20,
+		peerAddr:        "hex:0102",
+		cacheMiss:       true,
+		readBytes:       &readBytes,
+		warmupOps:       &warmupOps,
+		objectSizeBytes: &objectSize,
+		diskPath:        "/var/lib/unbounded/bench-cache.bin",
+		diskSizeBytes:   104857600,
+	}
+
+	cfg := decodeWithBenchmarks(t, dir, benchmarkState{rdmaLoadgens: []rdmaLoadgenBenchmark{bench}})
+
+	require.Len(t, cfg.GetBackends(), 1)
+	require.Len(t, cfg.GetNeighborhoods(), 1)
+	require.Len(t, cfg.GetCaches(), 1)
+	cache := cfg.GetCaches()[0]
+	assert.Equal(t, bench.cacheName(), cache.GetName())
+	assert.Equal(t, bench.neighborhoodName(), cache.GetSource())
+	assert.Empty(t, cache.GetDisks())
+
+	require.Len(t, cfg.GetFrontends(), 1)
+	frontend := cfg.GetFrontends()[0]
+	assert.Equal(t, bench.frontendName(), frontend.GetName())
+	assert.Equal(t, bench.cacheName(), frontend.GetSource())
+	loadgen := frontend.GetLoadgen()
+	require.NotNil(t, loadgen)
+	assert.Equal(t, uint64(16384), loadgen.GetFixedObjectSizeBytes())
+	assert.True(t, loadgen.GetRequireRemotePeer())
+	assert.Equal(t, uint64(25), loadgen.GetWarmupOperations())
+	assert.Equal(t, uint64(4096), loadgen.GetReadBytes())
+}
+
+func TestRenderConfigDefaultsRDMACacheMissWarmupToObjectCount(t *testing.T) {
+	dir := writeSource(t, "startup:\n  fabric:\n    auto_rdma: {}\n")
+	objectCount := uint64(42)
+	bench := rdmaLoadgenBenchmark{
+		name:        "rdma_source_to_target",
+		runLoadgen:  true,
+		localNodeID: 10,
+		peerNodeID:  20,
+		peerAddr:    "hex:0102",
+		cacheMiss:   true,
+		objectCount: &objectCount,
+	}
+
+	cfg := decodeWithBenchmarks(t, dir, benchmarkState{rdmaLoadgens: []rdmaLoadgenBenchmark{bench}})
+
+	require.Len(t, cfg.GetFrontends(), 1)
+	assert.Equal(t, uint64(42), cfg.GetFrontends()[0].GetLoadgen().GetWarmupOperations())
+}
+
+func TestRenderConfigDefaultsRDMACacheMissObjectAndWarmup(t *testing.T) {
+	dir := writeSource(t, "startup:\n  fabric:\n    auto_rdma: {}\n")
+	bench := rdmaLoadgenBenchmark{
+		name:        "rdma_source_to_target",
+		runLoadgen:  true,
+		localNodeID: 10,
+		peerNodeID:  20,
+		peerAddr:    "hex:0102",
+		cacheMiss:   true,
+	}
+
+	cfg := decodeWithBenchmarks(t, dir, benchmarkState{rdmaLoadgens: []rdmaLoadgenBenchmark{bench}})
+
+	require.Len(t, cfg.GetFrontends(), 1)
+	loadgen := cfg.GetFrontends()[0].GetLoadgen()
+	assert.Equal(t, uint64(1024*1024), loadgen.GetFixedObjectSizeBytes())
+	assert.Equal(t, uint64(1_000_000), loadgen.GetWarmupOperations())
+}
+
+func TestRenderConfigAppliesRDMACacheMissBenchmarkOnTarget(t *testing.T) {
+	dir := writeSource(t, "startup:\n  fabric:\n    auto_rdma: {}\n")
+	bench := rdmaLoadgenBenchmark{
+		name:          "rdma_source_to_target",
+		runLoadgen:    false,
+		localNodeID:   20,
+		peerNodeID:    10,
+		peerAddr:      "hex:0102",
+		cacheMiss:     true,
+		diskPath:      "/var/lib/unbounded/bench-cache.bin",
+		diskSizeBytes: 104857600,
+	}
+
+	cfg := decodeWithBenchmarks(t, dir, benchmarkState{rdmaLoadgens: []rdmaLoadgenBenchmark{bench}})
+
+	require.Len(t, cfg.GetBackends(), 1)
+	require.Len(t, cfg.GetNeighborhoods(), 1)
+	require.Len(t, cfg.GetCaches(), 1)
+	cache := cfg.GetCaches()[0]
+	assert.Equal(t, bench.cacheName(), cache.GetName())
+	assert.Equal(t, bench.neighborhoodName(), cache.GetSource())
+	require.Len(t, cache.GetDisks(), 1)
+	disk := cache.GetDisks()[0]
+	assert.True(t, disk.GetSkipRecoveryScan())
+	assert.Equal(t, "/var/lib/unbounded/bench-cache.bin", disk.GetFile().GetPath())
+	assert.Equal(t, uint64(104857600), disk.GetFile().GetSize())
+	assert.Empty(t, cfg.GetFrontends())
 }
 
 func TestRenderConfigSkipsRDMABenchmarkOnReservedNameCollision(t *testing.T) {
@@ -256,6 +435,29 @@ backends:
 	cfg := decodeWithBenchmarks(t, dir, benchmarkState{rdmaLoadgens: []rdmaLoadgenBenchmark{bench}})
 
 	require.Len(t, cfg.GetBackends(), 1)
+	assert.Empty(t, cfg.GetNeighborhoods())
+	assert.Empty(t, cfg.GetFrontends())
+}
+
+func TestRenderConfigSkipsRDMACacheMissBenchmarkOnCacheNameCollision(t *testing.T) {
+	bench := rdmaLoadgenBenchmark{
+		name:        "rdma_source_to_target",
+		runLoadgen:  true,
+		localNodeID: 10,
+		peerNodeID:  20,
+		peerAddr:    "hex:0102",
+		cacheMiss:   true,
+	}
+	dir := writeSource(t, `
+caches:
+  - name: __unbounded_benchmark_rdma_source_to_target_cache
+    source: origin
+`)
+
+	cfg := decodeWithBenchmarks(t, dir, benchmarkState{rdmaLoadgens: []rdmaLoadgenBenchmark{bench}})
+
+	require.Len(t, cfg.GetCaches(), 1)
+	assert.Empty(t, cfg.GetBackends())
 	assert.Empty(t, cfg.GetNeighborhoods())
 	assert.Empty(t, cfg.GetFrontends())
 }

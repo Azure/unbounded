@@ -330,4 +330,17 @@ message LoadgenFrontendConfig {
 
   // Verify every returned body byte is zero. Intended for fake backends.
   bool verify = 5;
+
+  // Synthetic object length to use without reading the metadata entry first.
+  // When unset, the frontend reads object metadata normally.
+  optional uint64 fixed_object_size_bytes = 6;
+
+  // Only issue reads whose generated data stripes route to a peer rather than
+  // being owned locally. Requires fixed_object_size_bytes and a frontend source
+  // that resolves through a neighborhood.
+  optional bool require_remote_peer = 7;
+
+  // Suppress frontend_request metrics for this many successful operations per
+  // worker before reporting benchmark traffic. Useful for cache warmup.
+  optional uint64 warmup_operations = 8;
 }

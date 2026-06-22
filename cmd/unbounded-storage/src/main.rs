@@ -855,6 +855,7 @@ fn run_shard(
     let frontend_ctx = FrontendBuildCtx {
         pool: pool.clone(),
         handle: NetHandle::new(socket.clone()),
+        routes: routes.clone(),
         fanout: fanout.clone(),
         geometry: geometry.clone(),
         bindings: Rc::new(RefCell::new((*frontend_bindings).clone())),
@@ -1233,6 +1234,7 @@ impl ShardFrontendDriver {
 struct FrontendBuildCtx {
     pool: Rc<ShardPool>,
     handle: NetHandle,
+    routes: RouteTableHandle,
     /// Per-shard cross-shard routing surface. The HTTP serve path
     /// consults it to fan each stripe out to its owner shard (or serve
     /// locally). Shared behind an `Rc` so cloning the context stays
@@ -1357,6 +1359,7 @@ impl FrontendBuildCtx {
                     self.page_size,
                     binding.bypass_cache,
                     self.worker_idx,
+                    self.routes.clone(),
                 )))
             }
             None => Err(format!("frontend {} missing config", spec.name)),

@@ -467,7 +467,12 @@ where
         return Ok(());
     }
     let stream = backend.bulk_get(req, src, std::slice::from_ref(&dst));
-    drive_page_stream(stream).map_err(RecursiveHandlerError::Backend)
+    drive_page_stream(stream).map_err(RecursiveHandlerError::Backend)?;
+    if !req.bypass() {
+        let _ = block_on_local(store.write_page(req, src.offset, dst));
+    }
+
+    Ok(())
 }
 
 /// Forward path: hand the request to the next hop with TTL `ttl`,
@@ -531,16 +536,24 @@ mod tests {
     use crate::backend::NullBackend;
     use crate::bufferpool::Error;
     use crate::p2p::{FingerTableConfig, PeerEntry, TopologyTags, node_to_ring};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const PAGE: usize = 4096;
     const SCRATCH_PAGES: usize = 2;
 
-    struct TestReq(StripeKey);
+    struct TestReq {
+        key: StripeKey,
+        bypass: bool,
+    }
 
     impl Req for TestReq {
         fn key(&self) -> StripeKey {
-            self.0
+            self.key
+        }
+
+        fn bypass(&self) -> bool {
+            self.bypass
         }
     }
 
@@ -551,9 +564,10 @@ mod tests {
     struct MemStore {
         base: *mut u8,
         page_size: usize,
-        present: std::collections::HashMap<[u8; 32], u8>,
+        present: Mutex<std::collections::HashMap<[u8; 32], u8>>,
         poison: std::collections::HashSet<[u8; 32]>,
         reads: AtomicUsize,
+        writes: AtomicUsize,
     }
 
     // SAFETY: the test drives the mock from a single thread; the raw
@@ -578,7 +592,7 @@ mod tests {
             if self.poison.contains(&key.0) {
                 return Err(Error::Io(libc::EIO));
             }
-            match self.present.get(&key.0) {
+            match self.present.lock().unwrap().get(&key.0) {
                 Some(&fill) => {
                     // SAFETY: dst.page_idx is within the backing the
                     // test allocated.
@@ -594,10 +608,15 @@ mod tests {
 
         async fn write_page<R: Req + ?Sized>(
             &self,
-            _req: &R,
+            req: &R,
             _stripe_off: u64,
-            _page: PageRef,
+            page: PageRef,
         ) -> Result<(), Error> {
+            let key = req.key();
+            let fill = page_byte(self.base, page.page_idx);
+            self.present.lock().unwrap().insert(key.0, fill);
+            self.writes.fetch_add(1, Ordering::Relaxed);
+
             Ok(())
         }
     }
@@ -666,9 +685,10 @@ mod tests {
         Arc::new(MemStore {
             base,
             page_size: PAGE,
-            present: present.iter().copied().collect(),
+            present: Mutex::new(present.iter().copied().collect()),
             poison: poison.iter().copied().collect(),
             reads: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
         })
     }
 
@@ -697,6 +717,10 @@ mod tests {
             offset: 0,
             len: PAGE as u32,
         }
+    }
+
+    fn req_for(key: StripeKey) -> TestReq {
+        TestReq { key, bypass: false }
     }
 
     // --- classify (routing decision, no fabric) ---
@@ -749,12 +773,13 @@ mod tests {
         let key = key_for_ring(42);
         let store = mem_store(base, &[(key.0, 0xAB)], &[]);
         let backend = NullBackend::<TestReq>::new();
-        let req = TestReq(key);
+        let req = req_for(key);
         let dst = scratch_page(0, PAGE);
 
         serve_owned(&store, &backend, &req, src_for(key), dst).expect("resident read must succeed");
         assert_eq!(page_byte(base, 0), 0xAB, "store did not fill the page");
         assert_eq!(store.reads.load(Ordering::Relaxed), 1);
+        assert_eq!(store.writes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -768,12 +793,34 @@ mod tests {
             page_size: PAGE,
             fill: 0xCD,
         };
-        let req = TestReq(key);
+        let req = req_for(key);
         let dst = scratch_page(1, PAGE);
 
         serve_owned(&store, &backend, &req, src_for(key), dst)
             .expect("backend fallback must succeed");
         assert_eq!(page_byte(base, 1), 0xCD, "backend did not fill the page");
+        assert_eq!(store.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(store.present.lock().unwrap().get(&key.0), Some(&0xCD));
+    }
+
+    #[test]
+    fn owner_miss_bypass_does_not_write_back() {
+        let (_backing, base) = scratch_backing();
+        let key = key_for_ring(7);
+        let store = mem_store(base, &[], &[]);
+        let backend = FillBackend {
+            base,
+            page_size: PAGE,
+            fill: 0xCD,
+        };
+        let req = TestReq { key, bypass: true };
+        let dst = scratch_page(1, PAGE);
+
+        serve_owned(&store, &backend, &req, src_for(key), dst)
+            .expect("backend fallback must succeed");
+        assert_eq!(page_byte(base, 1), 0xCD, "backend did not fill the page");
+        assert_eq!(store.writes.load(Ordering::Relaxed), 0);
+        assert!(!store.present.lock().unwrap().contains_key(&key.0));
     }
 
     #[test]
@@ -782,7 +829,7 @@ mod tests {
         let key = key_for_ring(9);
         let store = mem_store(base, &[], &[]);
         let backend = NullBackend::<TestReq>::new();
-        let req = TestReq(key);
+        let req = req_for(key);
         let dst = scratch_page(0, PAGE);
 
         match serve_owned(&store, &backend, &req, src_for(key), dst) {
@@ -797,7 +844,7 @@ mod tests {
         let key = key_for_ring(3);
         let store = mem_store(base, &[], &[key.0]);
         let backend = NullBackend::<TestReq>::new();
-        let req = TestReq(key);
+        let req = req_for(key);
         let dst = scratch_page(0, PAGE);
 
         match serve_owned(&store, &backend, &req, src_for(key), dst) {

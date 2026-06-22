@@ -140,6 +140,20 @@ impl FingerTable {
         self.predecessor.as_ref()
     }
 
+    pub fn owns(&self, target: RingId) -> bool {
+        if target == self.local.ring {
+            return true;
+        }
+        if let Some(pred) = &self.predecessor {
+            let span = ring_distance(pred.ring, self.local.ring);
+            let off = ring_distance(pred.ring, target);
+
+            return off != 0 && off <= span;
+        }
+
+        true
+    }
+
     /// Closest-preceding-finger lookup, following the spirit of
     /// Chord with one deliberate deviation: the bound on a
     /// finger's forward distance is inclusive (`d <= limit`)
@@ -190,17 +204,7 @@ impl FingerTable {
     /// every call returns `None`: we are the only owner.
     pub fn next_hop(&self, target: RingId) -> Option<PeerEntry> {
         // Owner check: target in (predecessor, self].
-        if target == self.local.ring {
-            return None;
-        }
-        if let Some(pred) = &self.predecessor {
-            let span = ring_distance(pred.ring, self.local.ring);
-            let off = ring_distance(pred.ring, target);
-            if off != 0 && off <= span {
-                return None;
-            }
-        } else {
-            // Single-node cluster: we own everything.
+        if self.owns(target) {
             return None;
         }
 

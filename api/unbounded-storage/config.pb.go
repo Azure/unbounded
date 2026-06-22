@@ -1985,9 +1985,19 @@ type LoadgenFrontendConfig struct {
 	// Bytes to read from the start of each object. When unset, reads the full resolved object length.
 	ReadBytes *uint64 `protobuf:"varint,4,opt,name=read_bytes,json=readBytes,proto3,oneof" json:"read_bytes,omitempty"`
 	// Verify every returned body byte is zero. Intended for fake backends.
-	Verify        bool `protobuf:"varint,5,opt,name=verify,proto3" json:"verify,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Verify bool `protobuf:"varint,5,opt,name=verify,proto3" json:"verify,omitempty"`
+	// Synthetic object length to use without reading the metadata entry first.
+	// When unset, the frontend reads object metadata normally.
+	FixedObjectSizeBytes *uint64 `protobuf:"varint,6,opt,name=fixed_object_size_bytes,json=fixedObjectSizeBytes,proto3,oneof" json:"fixed_object_size_bytes,omitempty"`
+	// Only issue reads whose generated data stripes route to a peer rather than
+	// being owned locally. Requires fixed_object_size_bytes and a frontend source
+	// that resolves through a neighborhood.
+	RequireRemotePeer *bool `protobuf:"varint,7,opt,name=require_remote_peer,json=requireRemotePeer,proto3,oneof" json:"require_remote_peer,omitempty"`
+	// Suppress frontend_request metrics for this many successful operations per
+	// worker before reporting benchmark traffic. Useful for cache warmup.
+	WarmupOperations *uint64 `protobuf:"varint,8,opt,name=warmup_operations,json=warmupOperations,proto3,oneof" json:"warmup_operations,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *LoadgenFrontendConfig) Reset() {
@@ -2053,6 +2063,27 @@ func (x *LoadgenFrontendConfig) GetVerify() bool {
 		return x.Verify
 	}
 	return false
+}
+
+func (x *LoadgenFrontendConfig) GetFixedObjectSizeBytes() uint64 {
+	if x != nil && x.FixedObjectSizeBytes != nil {
+		return *x.FixedObjectSizeBytes
+	}
+	return 0
+}
+
+func (x *LoadgenFrontendConfig) GetRequireRemotePeer() bool {
+	if x != nil && x.RequireRemotePeer != nil {
+		return *x.RequireRemotePeer
+	}
+	return false
+}
+
+func (x *LoadgenFrontendConfig) GetWarmupOperations() uint64 {
+	if x != nil && x.WarmupOperations != nil {
+		return *x.WarmupOperations
+	}
+	return 0
 }
 
 var File_config_proto protoreflect.FileDescriptor
@@ -2218,19 +2249,25 @@ const file_config_proto_rawDesc = "" +
 	"\x1bmax_requests_per_connection\x18\x02 \x01(\rH\x00R\x18maxRequestsPerConnection\x88\x01\x01B\x1e\n" +
 	"\x1c_max_requests_per_connection\"&\n" +
 	"\x10S3FrontendConfig\x12\x12\n" +
-	"\x04addr\x18\x01 \x01(\tR\x04addr\"\xe8\x01\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"\xd5\x03\n" +
 	"\x15LoadgenFrontendConfig\x12\x1d\n" +
 	"\aworkers\x18\x01 \x01(\rH\x00R\aworkers\x88\x01\x01\x12\x17\n" +
 	"\x04seed\x18\x02 \x01(\x04H\x01R\x04seed\x88\x01\x01\x12&\n" +
 	"\fobject_count\x18\x03 \x01(\x04H\x02R\vobjectCount\x88\x01\x01\x12\"\n" +
 	"\n" +
 	"read_bytes\x18\x04 \x01(\x04H\x03R\treadBytes\x88\x01\x01\x12\x16\n" +
-	"\x06verify\x18\x05 \x01(\bR\x06verifyB\n" +
+	"\x06verify\x18\x05 \x01(\bR\x06verify\x12:\n" +
+	"\x17fixed_object_size_bytes\x18\x06 \x01(\x04H\x04R\x14fixedObjectSizeBytes\x88\x01\x01\x123\n" +
+	"\x13require_remote_peer\x18\a \x01(\bH\x05R\x11requireRemotePeer\x88\x01\x01\x120\n" +
+	"\x11warmup_operations\x18\b \x01(\x04H\x06R\x10warmupOperations\x88\x01\x01B\n" +
 	"\n" +
 	"\b_workersB\a\n" +
 	"\x05_seedB\x0f\n" +
 	"\r_object_countB\r\n" +
-	"\v_read_bytesB@Z>github.com/Azure/unbounded/api/unbounded-storage;storageconfigb\x06proto3"
+	"\v_read_bytesB\x1a\n" +
+	"\x18_fixed_object_size_bytesB\x16\n" +
+	"\x14_require_remote_peerB\x14\n" +
+	"\x12_warmup_operationsB@Z>github.com/Azure/unbounded/api/unbounded-storage;storageconfigb\x06proto3"
 
 var (
 	file_config_proto_rawDescOnce sync.Once
