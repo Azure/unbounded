@@ -153,13 +153,13 @@ func watchLoop(ctx context.Context, cfg Config, fsWatcher *fsnotify.Watcher, pee
 	}
 }
 
-// reconcile renders the current ConfigMap source plus the latest peer set into
-// the daemon config file. peers may be nil (peer discovery disabled), in which
-// case only startup settings are rendered.
+// reconcile renders the current ConfigMap source plus the latest node-derived
+// overlays into the daemon config file. peers may be nil (node discovery
+// disabled), in which case only the source config is rendered.
 func reconcile(cfg Config, peers *peerWatcher) error {
-	ring := ringSnapshot(cfg, peers)
+	snapshot := snapshotNodes(cfg, peers)
 
-	data, err := RenderConfig(cfg.SourceDir, ring)
+	data, err := RenderConfigWithBenchmarks(cfg.SourceDir, snapshot.ring, snapshot.benchmarks)
 	if err != nil {
 		return err
 	}
@@ -171,14 +171,14 @@ func reconcile(cfg Config, peers *peerWatcher) error {
 	return nil
 }
 
-// ringSnapshot resolves the current ring state from the node watch, reading
-// the shared fabric port from the ConfigMap's TCP fabric bind. It returns the
-// inactive zero value when peer discovery is disabled. A source that cannot be
-// loaded yields an inactive ring; the subsequent RenderConfig surfaces the same
-// error in reconcile, which keeps the previously rendered config in place.
-func ringSnapshot(cfg Config, peers *peerWatcher) ringState {
+// snapshotNodes resolves current node-derived overlays from the node watch,
+// reading the shared TCP fabric port from the ConfigMap. It returns zero-value
+// overlays when peer discovery is disabled. A source that cannot be loaded
+// yields an inactive ring; the subsequent render surfaces the same error in
+// reconcile, which keeps the previously rendered config in place.
+func snapshotNodes(cfg Config, peers *peerWatcher) nodeSnapshot {
 	if peers == nil {
-		return ringState{}
+		return nodeSnapshot{}
 	}
 
 	sc, err := loadSourceConfig(cfg.SourceDir)

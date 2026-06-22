@@ -25,6 +25,24 @@ metadata:
 # neighborhoods here when this deployment should participate in a P2P ring; the
 # supervisor will not invent one because each neighborhood needs an explicit
 # source backend.
+#
+# Storage benchmarks are also supervisor-injected from Node annotations. The
+# first supported scenario is an RDMA load generator between a source node and a
+# target node. Both nodes must be visible to this supervisor's node watch, so
+# they must carry the storage-ring label key even if the TCP ring itself is not
+# active. The source node carries:
+#   unbounded-cloud.io/storage-benchmark.scenario: rdma-loadgen
+#   unbounded-cloud.io/storage-benchmark.target-node: <target-node-name>
+# Both source and target nodes carry their provider-native RDMA endpoint:
+#   unbounded-cloud.io/storage-rdma.addr: hex:<fi_getname-bytes>
+# Optional source-node knobs map directly to the daemon's loadgen/fake backend
+# settings: storage-benchmark.workers, seed, object-count, read-bytes, verify,
+# stripe-size-bytes, and object-size-bytes. The supervisor renders only existing
+# daemon config sections (fake backend, RDMA neighborhood, and source loadgen
+# frontend); removing the annotations removes the benchmark on the next render.
+# Benchmark results are exposed through the daemon's normal Prometheus metrics,
+# so set startup.metrics.addr before daemon start if metrics should be scraped.
+# Use an RDMA fabric startup config (rdma or auto_rdma) for RDMA benchmarks.
 data:
   config.yaml: |
     # Operator-assigned config version (opaque counter; 0 means unversioned).

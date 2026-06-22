@@ -194,8 +194,8 @@ func TestPeerWatcherSnapshotInactiveWithoutPort(t *testing.T) {
 
 	require.NoError(t, w.Start(ctx))
 
-	// portOK=false -> inactive regardless of membership.
-	assert.False(t, w.snapshot(0, false).active)
+	// portOK=false -> ring inactive regardless of membership.
+	assert.False(t, w.snapshot(0, false).ring.active)
 }
 
 func TestPeerWatcherSnapshotFromInformer(t *testing.T) {
@@ -219,11 +219,47 @@ func TestPeerWatcherSnapshotFromInformer(t *testing.T) {
 
 	require.NoError(t, w.Start(ctx))
 
-	ring := w.snapshot(9000, true)
+	snapshot := w.snapshot(9000, true)
+	ring := snapshot.ring
 
 	require.True(t, ring.active)
 	assert.Equal(t, "10.0.0.1:9000", ring.selfListenAddr)
 	require.Len(t, ring.peers, 1)
 	assert.Equal(t, nodeID("peer-a"), ring.peers[0].GetId())
 	assert.Equal(t, "10.0.0.2:9000", ring.peers[0].GetTcp().GetAddr())
+}
+
+func TestPeerWatcherSnapshotIncludesBenchmarksWithoutTCPPort(t *testing.T) {
+	source := node("self", "red", "10.0.0.1")
+	source.Annotations = map[string]string{
+		benchmarkScenarioAnnotation:   rdmaLoadgenScenario,
+		benchmarkTargetNodeAnnotation: "peer-a",
+		benchmarkRdmaAddrAnnotation:   "hex:0102",
+	}
+
+	target := node("peer-a", "red", "10.0.0.2")
+	target.Annotations = map[string]string{benchmarkRdmaAddrAnnotation: "hex:0304"}
+
+	cs := fake.NewSimpleClientset(source, target)
+
+	w, err := newPeerWatcher(Config{
+		NodeName:         "self",
+		StorageRingLabel: testRingLabel,
+	}, cs)
+	require.NoError(t, err)
+	require.NotNil(t, w)
+
+	defer w.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, w.Start(ctx))
+
+	snapshot := w.snapshot(0, false)
+
+	assert.False(t, snapshot.ring.active)
+	require.Len(t, snapshot.benchmarks.rdmaLoadgens, 1)
+	assert.True(t, snapshot.benchmarks.rdmaLoadgens[0].runLoadgen)
+	assert.Equal(t, nodeID("peer-a"), snapshot.benchmarks.rdmaLoadgens[0].peerNodeID)
 }

@@ -37,6 +37,13 @@ import (
 // node watch, no ring membership, or no fixed fabric port) the YAML is rendered
 // as-is, including any hand-declared neighborhoods/peers.
 func RenderConfig(sourceDir string, ring ringState) ([]byte, error) {
+	return RenderConfigWithBenchmarks(sourceDir, ring, benchmarkState{})
+}
+
+// RenderConfigWithBenchmarks renders the source ConfigMap with both the normal
+// storage-ring overlay and supervisor-owned benchmark overlays. Benchmarks are
+// expressed entirely in the daemon's existing config schema.
+func RenderConfigWithBenchmarks(sourceDir string, ring ringState, benchmarks benchmarkState) ([]byte, error) {
 	cfg, err := loadSourceConfig(sourceDir)
 	if err != nil {
 		return nil, err
@@ -45,6 +52,8 @@ func RenderConfig(sourceDir string, ring ringState) ([]byte, error) {
 	if ring.active {
 		applyRing(cfg, ring)
 	}
+
+	applyBenchmarks(cfg, benchmarks)
 
 	out, err := proto.Marshal(cfg)
 	if err != nil {

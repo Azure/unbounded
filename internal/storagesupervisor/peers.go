@@ -52,9 +52,16 @@ type ringState struct {
 	peers []*storageconfig.PeerSpec
 }
 
+// nodeSnapshot is the node-derived supervisor overlay. The TCP storage ring
+// needs a fixed port from source config; benchmark annotations do not.
+type nodeSnapshot struct {
+	ring       ringState
+	benchmarks benchmarkState
+}
+
 // peerWatcher watches cluster Nodes carrying the storage-ring label and turns
-// the membership view into a ringState on demand. It signals the run loop on
-// every membership change so the config is re-rendered.
+// the membership view into node-derived config overlays on demand. It signals
+// the run loop on every membership change so the config is re-rendered.
 type peerWatcher struct {
 	selfName  string
 	ringLabel string
@@ -160,18 +167,11 @@ func (w *peerWatcher) signal() {
 	}
 }
 
-// snapshot computes the current ring from the informer's node store and the
-// fabric port. A zero or unparseable port yields an inactive ring: without a
-// fixed port the daemon's fabric addr stays ephemeral and peer addresses are
-// unreachable, so emitting peers would be misleading.
-func (w *peerWatcher) snapshot(port int, portOK bool) ringState {
-	if !portOK || port == 0 {
-		slog.Warn("storage ring inactive: no fixed fabric port set in startup.fabric.tcp.addr; "+
-			"set a non-zero port (e.g. 0.0.0.0:9000) to enable peering", "node", w.selfName)
-
-		return ringState{}
-	}
-
+// snapshot computes the current node-derived overlay from the informer's node
+// store and the TCP fabric port. A zero or unparseable port yields an inactive
+// TCP ring, but benchmark annotations are still evaluated because RDMA
+// benchmarks use RDMA peer addresses carried in Node annotations.
+func (w *peerWatcher) snapshot(port int, portOK bool) nodeSnapshot {
 	objs := w.informer.GetStore().List()
 
 	nodes := make([]*corev1.Node, 0, len(objs))
@@ -182,7 +182,17 @@ func (w *peerWatcher) snapshot(port int, portOK bool) ringState {
 		}
 	}
 
-	return computeRing(nodes, w.selfName, w.ringLabel, port)
+	snapshot := nodeSnapshot{benchmarks: computeBenchmarks(nodes, w.selfName)}
+	if !portOK || port == 0 {
+		slog.Warn("storage ring inactive: no fixed fabric port set in startup.fabric.tcp.addr; "+
+			"set a non-zero port (e.g. 0.0.0.0:9000) to enable peering", "node", w.selfName)
+
+		return snapshot
+	}
+
+	snapshot.ring = computeRing(nodes, w.selfName, w.ringLabel, port)
+
+	return snapshot
 }
 
 // computeRing is the pure core of peer discovery: given the ring-labelled
