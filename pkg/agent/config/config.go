@@ -170,7 +170,7 @@ type CRIConfig struct {
 
 // ContainerdConfig holds containerd-specific overrides.
 type ContainerdConfig struct {
-	// Version overrides the default containerd version (e.g. "2.0.4").
+	// Version overrides the default containerd version (e.g. "2.1.8").
 	Version string `json:"Version,omitempty"`
 }
 
