@@ -243,6 +243,12 @@ type Config struct {
 	// one of these once more than one is configured.
 	UpstreamRegistries []UpstreamRegistry `yaml:"upstream_registries"`
 
+	// CacheOrigins lists cache backends to try before the OCI registry on
+	// every cold fetch (containerd miss). Entries are tried in order; any
+	// miss or error falls through to the next entry, then to the OCI
+	// registry. An empty list disables the feature entirely.
+	CacheOrigins []CacheOriginSpec `yaml:"cache_origins"`
+
 	// ---------- HRW / coordination ----------
 
 	// HRWK is the top-K size for HRW probe (the step 3 default 3; the design doc
@@ -367,6 +373,17 @@ type LegacyDeprecatedConfig struct {
 	CacheBudgetBytes               int64  `yaml:"cache_budget_bytes,omitempty"`
 	CacheForcedEvictionHeadroomPct int    `yaml:"cache_forced_eviction_headroom_pct,omitempty"`
 	EvictionProviderCountThreshold int    `yaml:"eviction_provider_count_threshold,omitempty"`
+}
+
+// CacheOriginSpec configures one cache origin in the priority chain.
+// Gantry tries cache origins in the order they appear in the list before
+// falling through to the OCI registry. An empty list disables the feature.
+type CacheOriginSpec struct {
+	// Type identifies the backend implementation. "unbounded-storage" is
+	// the only supported value; future types are added here.
+	Type     string        `yaml:"type"`
+	Endpoint string        `yaml:"endpoint"` // e.g. "http://127.0.0.1:8080"
+	Timeout  time.Duration `yaml:"timeout"`  // per-request; 0 uses 30s default
 }
 
 // NewDefault returns a Config populated with the design-doc defaults.
@@ -731,6 +748,21 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: required", i))
 		} else if !strings.HasPrefix(ur.Endpoint, "http://") && !strings.HasPrefix(ur.Endpoint, "https://") {
 			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint %q: must start with http:// or https://", i, ur.Endpoint))
+		}
+	}
+
+	// Validate cache_origins entries.
+	knownCacheOriginTypes := map[string]bool{
+		"unbounded-storage": true,
+	}
+
+	for i, co := range c.CacheOrigins {
+		if !knownCacheOriginTypes[co.Type] {
+			errs = append(errs, fmt.Errorf("cache_origins[%d].type %q: unknown type (known: unbounded-storage)", i, co.Type))
+		}
+
+		if !strings.HasPrefix(co.Endpoint, "http://") && !strings.HasPrefix(co.Endpoint, "https://") {
+			errs = append(errs, fmt.Errorf("cache_origins[%d].endpoint %q: must start with http:// or https://", i, co.Endpoint))
 		}
 	}
 

@@ -444,3 +444,47 @@ func TestValidate_ContainerdModeRequiresSocket(t *testing.T) {
 		t.Fatalf("want containerd_socket error, got %v", err)
 	}
 }
+
+func TestValidate_CacheOrigins_UnknownType(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.CacheOrigins = []CacheOriginSpec{{Type: "unknown-backend", Endpoint: "http://127.0.0.1:8080"}}
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "cache_origins") {
+		t.Fatalf("want cache_origins error for unknown type, got %v", err)
+	}
+}
+
+func TestValidate_CacheOrigins_MissingScheme(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.CacheOrigins = []CacheOriginSpec{{Type: "unbounded-storage", Endpoint: "127.0.0.1:8080"}}
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "cache_origins") {
+		t.Fatalf("want cache_origins endpoint error, got %v", err)
+	}
+}
+
+func TestValidate_CacheOrigins_Empty(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.CacheOrigins = nil
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("empty cache_origins should be valid, got %v", err)
+	}
+}
+
+func TestValidate_CacheOrigins_Valid(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.CacheOrigins = []CacheOriginSpec{
+		{Type: "unbounded-storage", Endpoint: "http://127.0.0.1:8080"},
+	}
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("valid cache_origins should pass, got %v", err)
+	}
+}
