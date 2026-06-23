@@ -110,25 +110,44 @@ For `Head`, the same chain applies with HTTP HEAD and the same fallback logic.
 
 #### `internal/gantry/unstore/`
 
-A new package. No dependency on `origin/`. Implements `ifaces.OriginPuller`
-backed by a local unbounded-storage HTTP frontend.
+A new package. No dependency on `origin/`. It is a **protocol shim**: it owns
+all unbounded-storage wire behavior and translates it into the clean
+`ifaces.OriginPuller` contract. Nothing outside this package knows anything
+about unbounded-storage's HTTP protocol quirks.
+
+**Wire behavior the shim hides:**
+
+| unbounded-storage wire behavior | `ifaces.OriginPuller` translation |
+|---|---|
+| `200 OK` + body | `(ReadCloser, Content-Length, nil)` |
+| Connection closed before any response (cache miss or internal error) | `*OriginError{Class: FailureNotFound}` |
+| Connection refused / timeout | `*OriginError{Class: FailureTransient}` |
+| Non-200 HTTP status (400, 405, etc.) | `*OriginError{Class: FailureTransient}` |
+
+The connection-close-before-response is how unbounded-storage signals a cache
+miss (it does not return a 404). The shim normalises this to `FailureNotFound`
+so `PriorityChain` treats it as a clean miss and advances to the next entry.
+If unbounded-storage later adds a proper 404 or changes protocol, only this
+package changes - gantry's interfaces and chain logic are untouched.
 
 - `client.go` - `Client struct`:
   - `New(endpoint string, timeout time.Duration, opts ...Option) *Client`
   - `Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error)`
-    - URL: `<endpoint>/v2/<repository>/blobs/<digest>` for `KindBlob`/`KindConfig`;
-      `<endpoint>/v2/<repository>/manifests/<digest>` for `KindManifest`.
-    - 200: returns body and `Content-Length`.
-    - 404: returns `*ifaces.OriginError{Class: FailureNotFound}`.
-    - Any other error (connection refused, timeout, non-404/2xx): returns
-      `*ifaces.OriginError{Class: FailureTransient}`.
+    - Sends `GET <endpoint>/<digest>` to the local unbounded-storage HTTP frontend.
+    - `200`: returns body and `Content-Length`.
+    - Connection closed before response headers: `*OriginError{Class: FailureNotFound}`.
+    - Connection refused, timeout, or non-200 status: `*OriginError{Class: FailureTransient}`.
   - `Head(ctx context.Context, ref ifaces.OriginRef) (int64, string, error)`
-    - Same URL construction. Returns `(size, Content-Type, nil)` on 200.
-    - 404 and errors: same classification as `Pull`.
+    - Sends `HEAD <endpoint>/<digest>`. Returns `(size, Content-Type, nil)` on 200.
+    - Same miss/error classification as `Pull`.
   - Optional functional options: `WithLogger`, `WithMetrics(backend string)`.
     The `backend` string is set to the `Type` from config and becomes the label
     value on the shared metric counters.
   - Compile-time check: `var _ ifaces.OriginPuller = (*Client)(nil)`.
+
+**URL path:** the digest string (e.g. `sha256:abcdef...`) is used as the path.
+This must match the key scheme under which content was stored in unbounded-storage;
+that is a deployment/operator concern outside this package.
 
 #### `internal/gantry/origin/chain.go`
 
@@ -256,15 +275,17 @@ availability.
 
 ### `internal/gantry/unstore/client_test.go`
 
-Table-driven tests against `httptest.NewServer`:
+Table-driven tests against `httptest.NewServer` and a deliberately closed
+listener (to simulate connection-close-before-response):
 
 - `Pull` on 200: returns body and correct content-length.
-- `Pull` on 404: returns `*ifaces.OriginError{Class: FailureNotFound}`.
-- `Pull` on connection refused: returns `*ifaces.OriginError{Class: FailureTransient}`.
-- `Pull` URL construction: `KindBlob`/`KindConfig` use `/blobs/`, `KindManifest`
-  uses `/manifests/`.
+- `Pull` when server closes connection before sending response headers
+  (the unbounded-storage miss signal): returns `*OriginError{Class: FailureNotFound}`.
+- `Pull` on connection refused: returns `*OriginError{Class: FailureTransient}`.
+- `Pull` on non-200 status (e.g. 400): returns `*OriginError{Class: FailureTransient}`.
 - `Head` on 200: returns size and Content-Type.
-- `Head` on 404 and connection refused: same error classification as `Pull`.
+- `Head` on connection closed before response: `FailureNotFound`.
+- `Head` on connection refused: `FailureTransient`.
 - Timeout: a server that hangs respects the configured `Timeout`.
 
 ### `internal/gantry/origin/chain_test.go`
