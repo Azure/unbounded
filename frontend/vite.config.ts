@@ -26,10 +26,12 @@ export default defineConfig(({ mode }) => {
       reportCompressedSize: false,
       rollupOptions: {
         output: {
-          manualChunks: {
-            tanstack: ['@tanstack/react-table', '@tanstack/table-core'],
-            reagraph: ['reagraph'],
-            three: ['three']
+          advancedChunks: {
+            groups: [
+              { name: 'tanstack', test: /node_modules[\\/]@tanstack[\\/](react-table|table-core)[\\/]/ },
+              { name: 'reagraph', test: /node_modules[\\/]reagraph[\\/]/ },
+              { name: 'three', test: /node_modules[\\/]three[\\/]/ }
+            ]
           }
         }
       }
