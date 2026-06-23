@@ -419,6 +419,7 @@ configure_environment() {
     --site-node-cidr "${SITE_NODE_CIDR}"
     --site-pod-cidr "${SITE_POD_CIDR}"
     --manage-cni-plugin "${MANAGE_CNI_PLUGIN}"
+    --channel nightly
     --orca-azure-account "${ORIGIN_ACCOUNT}"
     --orca-azure-container "${ORIGIN_CONTAINER}"
     --repo "${REPO}"
