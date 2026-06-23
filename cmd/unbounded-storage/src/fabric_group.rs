@@ -399,13 +399,14 @@ fn build_unit(
         .map_err(|e| format!("worker={worker}: self_address: {e}"))?;
     println!(
         "fabric unit up: worker={worker} dev={} provider={:?} numa={} shards={:?} \
-         self_addr_bytes={}",
+         self_addr={} self_addr_bytes={}",
         spec.device_name,
         spec.provider,
         spec.numa
             .map(|n| n.to_string())
             .unwrap_or_else(|| "none".into()),
         spec.shards_assigned,
+        self_addr,
         self_addr.len(),
     );
 
