@@ -751,7 +751,7 @@ fn getname_string(fid: *mut ffi::fid) -> Result<String> {
     check("fi_getname", rc)?;
     addr.truncate(len);
 
-    let mut out = [0i8; 128];
+    let mut out: [std::ffi::c_char; 128] = [0; 128];
     let written = unsafe {
         ffi::ub_fi_format_sockaddr(
             addr.as_ptr() as *const std::ffi::c_void,
@@ -895,7 +895,7 @@ mod tests {
     #[test]
     fn format_sockaddr_rejects_short_buffer() {
         let addr = [0u8];
-        let mut out = [0i8; 8];
+        let mut out: [std::ffi::c_char; 8] = [0; 8];
         let rc = unsafe {
             ffi::ub_fi_format_sockaddr(
                 addr.as_ptr() as *const std::ffi::c_void,
