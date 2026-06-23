@@ -5,10 +5,16 @@ package v1alpha3
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 func init() {
-	SchemeBuilder.Register(&MachineOperationCredential{}, &MachineOperationCredentialList{})
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(GroupVersion, &MachineOperationCredential{}, &MachineOperationCredentialList{})
+		metav1.AddToGroupVersion(s, GroupVersion)
+
+		return nil
+	})
 }
 
 // MachineOperationCredentialAuthMode identifies the credential source used by a
