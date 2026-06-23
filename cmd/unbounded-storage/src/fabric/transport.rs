@@ -58,7 +58,7 @@ use super::dispatch::{AckSink, InboundDispatch};
 use super::error::{FabricError, Result as FabResult};
 use super::fabric::Fabric;
 use super::ffi;
-use super::rpc::{ErrorAck, PageAck, RequestHeader};
+use super::rpc::{ErrorAck, ErrorAckCode, PageAck, RequestHeader};
 use super::wire::{MsgHeader, MsgKind};
 
 /// Selects a peer for a given request. Returns `Option` so the
@@ -499,13 +499,14 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                     return Poll::Ready(None);
                                 }
                                 *emitted_error = true;
-                                let msg = bincode::deserialize::<ErrorAck>(&payload)
-                                    .map(|e| e.message)
-                                    .unwrap_or_else(|_| "server error (undecodable)".into());
+                                let ack = bincode::deserialize::<ErrorAck>(&payload)
+                                    .unwrap_or_else(|_| {
+                                        ErrorAck::generic("server error (undecodable)")
+                                    });
                                 if let Some(mut l) = log.take() {
-                                    l.finish_err(&msg);
+                                    l.finish_err(&ack.message);
                                 }
-                                return Poll::Ready(Some(Err(error_ack_to_pool_error(msg))));
+                                return Poll::Ready(Some(Err(error_ack_to_pool_error(ack))));
                             }
                             // A REQUEST is never routed to a client ack
                             // sink; ignore any stray delivery.
@@ -570,11 +571,11 @@ impl std::fmt::Display for ServerError {
 
 impl std::error::Error for ServerError {}
 
-fn error_ack_to_pool_error(message: String) -> PoolError {
-    if message.ends_with("origin object not found") {
-        return PoolError::OriginNotFound;
+fn error_ack_to_pool_error(ack: ErrorAck) -> PoolError {
+    match ack.code {
+        ErrorAckCode::Generic => PoolError::transport(ServerError(ack.message)),
+        ErrorAckCode::OriginNotFound => PoolError::OriginNotFound,
     }
-    PoolError::transport(ServerError(message))
 }
 
 /// Register the ack sink and submit the framed request. Returns the
@@ -776,11 +777,12 @@ mod tests {
         });
     }
 
-    fn push_error_ack(stream: &mut FabricBulkStream<'_, ()>, message: &str) {
+    fn push_error_ack(stream: &mut FabricBulkStream<'_, ()>, code: ErrorAckCode, message: &str) {
         let StreamState::Active { shared, .. } = &stream.state else {
             panic!("expected active stream");
         };
         let payload = bincode::serialize(&ErrorAck {
+            code,
             message: message.to_string(),
         })
         .expect("serialize error ack");
@@ -906,7 +908,7 @@ mod tests {
             len: 4096,
         }];
         let mut stream = active_stream(&dsts, vec![false]);
-        push_error_ack(&mut stream, "origin backend: origin object not found");
+        push_error_ack(&mut stream, ErrorAckCode::OriginNotFound, "origin missing");
 
         assert!(matches!(
             poll_once(&mut stream),
@@ -916,19 +918,28 @@ mod tests {
     }
 
     #[test]
-    fn error_ack_forwarded_origin_not_found_preserves_pool_error() {
+    fn error_ack_generic_origin_not_found_suffix_remains_transport_error() {
         let dsts = [PageRef {
             page_idx: 0,
             offset: 0,
             len: 4096,
         }];
         let mut stream = active_stream(&dsts, vec![false]);
-        push_error_ack(&mut stream, "forward to next hop: origin object not found");
+        push_error_ack(
+            &mut stream,
+            ErrorAckCode::Generic,
+            "unrelated failure: origin object not found",
+        );
 
-        assert!(matches!(
-            poll_once(&mut stream),
-            Poll::Ready(Some(Err(PoolError::OriginNotFound)))
-        ));
+        match poll_once(&mut stream) {
+            Poll::Ready(Some(Err(PoolError::Transport(err)))) => {
+                assert!(
+                    err.to_string().contains("unrelated failure"),
+                    "unexpected error: {err}",
+                );
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
         assert!(matches!(poll_once(&mut stream), Poll::Ready(None)));
     }
 
@@ -940,7 +951,7 @@ mod tests {
             len: 4096,
         }];
         let mut stream = active_stream(&dsts, vec![false]);
-        push_error_ack(&mut stream, "backend exploded");
+        push_error_ack(&mut stream, ErrorAckCode::Generic, "backend exploded");
 
         match poll_once(&mut stream) {
             Poll::Ready(Some(Err(PoolError::Transport(err)))) => {

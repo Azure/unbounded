@@ -251,11 +251,7 @@ struct SimApplyTarget {
 }
 
 impl ConfigApplyTarget for SimApplyTarget {
-    fn apply_in_place(
-        &mut self,
-        new: &Arc<Config>,
-        diff: &ConfigDiff,
-    ) -> Result<(), ApplyError> {
+    fn apply_in_place(&mut self, new: &Arc<Config>, diff: &ConfigDiff) -> Result<(), ApplyError> {
         let projection = runtime_projection(new)
             .map_err(|e| ApplyError::Target(format!("config projection failed: {e}")))?;
 
