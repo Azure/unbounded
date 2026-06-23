@@ -21,15 +21,17 @@ export default defineConfig(({ mode }) => {
       // Production sourcemaps add build overhead and are not required here.
       sourcemap: false,
       // Keep minification on the fastest available path.
-      minify: 'esbuild',
+      minify: 'oxc',
       // Skip compressed size computation during build for faster completion.
       reportCompressedSize: false,
-      rollupOptions: {
+      rolldownOptions: {
         output: {
-          manualChunks: {
-            tanstack: ['@tanstack/react-table', '@tanstack/table-core'],
-            reagraph: ['reagraph'],
-            three: ['three']
+          codeSplitting: {
+            groups: [
+              { name: 'tanstack', test: /node_modules[\\/]@tanstack[\\/](react-table|table-core)[\\/]/ },
+              { name: 'reagraph', test: /node_modules[\\/]reagraph[\\/]/ },
+              { name: 'three', test: /node_modules[\\/]three[\\/]/ }
+            ]
           }
         }
       }
