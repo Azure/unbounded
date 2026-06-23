@@ -408,8 +408,7 @@ jobs:
             "${{ env.REGISTRY }}/unbounded-net-node@${{ steps.push_node.outputs.digest }}"
 
   # ---------------------------------------------------------------------------
-  # Stitch per-arch net image tags into multi-arch manifests for :TAG and
-  # :latest.
+  # Stitch per-arch net image tags into multi-arch manifests for :TAG.
   # ---------------------------------------------------------------------------
   net-images-manifest:
     needs: [version, net-images]
@@ -432,13 +431,11 @@ jobs:
           TAG="${{ needs.version.outputs.tag }}"
           for image in controller node; do
             SRC="${{ env.REGISTRY }}/unbounded-net-${image}"
-            for release_tag in "${TAG}" "latest"; do
-              echo "Creating manifest ${SRC}:${release_tag}..."
-              docker buildx imagetools create \
-                --tag "${SRC}:${release_tag}" \
-                "${SRC}:${TAG}-amd64" \
-                "${SRC}:${TAG}-arm64"
-            done
+            echo "Creating manifest ${SRC}:${TAG}..."
+            docker buildx imagetools create \
+              --tag "${SRC}:${TAG}" \
+              "${SRC}:${TAG}-amd64" \
+              "${SRC}:${TAG}-arm64"
           done
 
   # ---------------------------------------------------------------------------
@@ -528,9 +525,7 @@ jobs:
           build-args: |
             VERSION=${{ needs.version.outputs.tag }}
             GIT_COMMIT=${{ github.sha }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ matrix.component.name }}:latest
+          tags: ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
           cache-from: type=gha,scope=${{ matrix.component.name }}
           cache-to: type=gha,scope=${{ matrix.component.name }},mode=max
 
