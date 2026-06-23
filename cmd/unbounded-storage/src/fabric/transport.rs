@@ -505,9 +505,7 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                 if let Some(mut l) = log.take() {
                                     l.finish_err(&msg);
                                 }
-                                return Poll::Ready(Some(Err(PoolError::transport(ServerError(
-                                    msg,
-                                )))));
+                                return Poll::Ready(Some(Err(error_ack_to_pool_error(msg))));
                             }
                             // A REQUEST is never routed to a client ack
                             // sink; ignore any stray delivery.
@@ -571,6 +569,13 @@ impl std::fmt::Display for ServerError {
 }
 
 impl std::error::Error for ServerError {}
+
+fn error_ack_to_pool_error(message: String) -> PoolError {
+    if message.ends_with("origin object not found") {
+        return PoolError::OriginNotFound;
+    }
+    PoolError::transport(ServerError(message))
+}
 
 /// Register the ack sink and submit the framed request. Returns the
 /// shared state the stream drains. On any failure the dispatch entry is
@@ -771,6 +776,20 @@ mod tests {
         });
     }
 
+    fn push_error_ack(stream: &mut FabricBulkStream<'_, ()>, message: &str) {
+        let StreamState::Active { shared, .. } = &stream.state else {
+            panic!("expected active stream");
+        };
+        let payload = bincode::serialize(&ErrorAck {
+            message: message.to_string(),
+        })
+        .expect("serialize error ack");
+        shared.push(RecvCompletion {
+            kind: MsgKind::ErrorAck,
+            payload,
+        });
+    }
+
     fn push_page_landed(stream: &mut FabricBulkStream<'_, ()>, ordinal: u32) {
         let StreamState::Active { shared, .. } = &stream.state else {
             panic!("expected active stream");
@@ -877,6 +896,62 @@ mod tests {
             stream.as_mut().poll_next(&mut cx),
             Poll::Ready(None)
         ));
+    }
+
+    #[test]
+    fn error_ack_origin_not_found_preserves_pool_error() {
+        let dsts = [PageRef {
+            page_idx: 0,
+            offset: 0,
+            len: 4096,
+        }];
+        let mut stream = active_stream(&dsts, vec![false]);
+        push_error_ack(&mut stream, "origin backend: origin object not found");
+
+        assert!(matches!(
+            poll_once(&mut stream),
+            Poll::Ready(Some(Err(PoolError::OriginNotFound)))
+        ));
+        assert!(matches!(poll_once(&mut stream), Poll::Ready(None)));
+    }
+
+    #[test]
+    fn error_ack_forwarded_origin_not_found_preserves_pool_error() {
+        let dsts = [PageRef {
+            page_idx: 0,
+            offset: 0,
+            len: 4096,
+        }];
+        let mut stream = active_stream(&dsts, vec![false]);
+        push_error_ack(&mut stream, "forward to next hop: origin object not found");
+
+        assert!(matches!(
+            poll_once(&mut stream),
+            Poll::Ready(Some(Err(PoolError::OriginNotFound)))
+        ));
+        assert!(matches!(poll_once(&mut stream), Poll::Ready(None)));
+    }
+
+    #[test]
+    fn error_ack_other_message_remains_transport_error() {
+        let dsts = [PageRef {
+            page_idx: 0,
+            offset: 0,
+            len: 4096,
+        }];
+        let mut stream = active_stream(&dsts, vec![false]);
+        push_error_ack(&mut stream, "backend exploded");
+
+        match poll_once(&mut stream) {
+            Poll::Ready(Some(Err(PoolError::Transport(err)))) => {
+                assert!(
+                    err.to_string().contains("backend exploded"),
+                    "unexpected error: {err}",
+                );
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
+        assert!(matches!(poll_once(&mut stream), Poll::Ready(None)));
     }
 
     #[test]

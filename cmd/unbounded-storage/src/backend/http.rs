@@ -409,9 +409,6 @@ async fn fetch(
         buf.extend_from_slice(&chunk);
     };
 
-    if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
-        return Err(Error::from("http backend: origin returned non-2xx status"));
-    }
     check_origin_status(status, start)?;
 
     // An origin that answers a different slice than we asked for would
@@ -563,6 +560,9 @@ async fn fetch_metadata(
         buf.extend_from_slice(&chunk);
     };
 
+    if status == StatusCode::NOT_FOUND {
+        return Err(Error::OriginNotFound);
+    }
     if status != StatusCode::OK {
         return Err(Error::from(
             "http backend: metadata HEAD returned non-200 status",
@@ -607,12 +607,20 @@ fn expected_body_len(
 
 /// Validate the origin's response status against the requested offset.
 ///
-/// `206` (Partial Content) is always fine. A `200` means the origin
-/// ignored our `Range` and is streaming the whole object from byte 0;
-/// that is only usable when we asked from offset 0, otherwise the body
+/// `404` maps to [`Error::OriginNotFound`] so frontends can return a
+/// not-found response instead of treating it as an opaque transport
+/// failure. `206` (Partial Content) is always fine. A `200` means the
+/// origin ignored our `Range` and is streaming the whole object from byte
+/// 0; that is only usable when we asked from offset 0, otherwise the body
 /// would not begin at `start` and copying it would silently corrupt the
-/// stripe. Non-2xx is rejected by the caller before this is reached.
+/// stripe. Other statuses are rejected as origin protocol failures.
 fn check_origin_status(status: StatusCode, start: u64) -> Result<(), Error> {
+    if status == StatusCode::NOT_FOUND {
+        return Err(Error::OriginNotFound);
+    }
+    if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
+        return Err(Error::from("http backend: origin returned non-2xx status"));
+    }
     if status == StatusCode::OK && start != 0 {
         return Err(Error::from(
             "http backend: origin ignored Range (200) for a non-zero offset",
@@ -906,6 +914,18 @@ mod tests {
 
     #[test]
     fn check_origin_status_rules() {
+        assert!(matches!(
+            check_origin_status(StatusCode::NOT_FOUND, 0),
+            Err(Error::OriginNotFound)
+        ));
+        assert!(matches!(
+            check_origin_status(StatusCode::NOT_FOUND, 4096),
+            Err(Error::OriginNotFound)
+        ));
+        assert!(matches!(
+            check_origin_status(StatusCode::INTERNAL_SERVER_ERROR, 0),
+            Err(Error::Transport(_))
+        ));
         // 206 is always acceptable, at any offset.
         assert!(check_origin_status(StatusCode::PARTIAL_CONTENT, 0).is_ok());
         assert!(check_origin_status(StatusCode::PARTIAL_CONTENT, 4096).is_ok());

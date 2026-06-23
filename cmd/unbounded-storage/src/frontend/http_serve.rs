@@ -40,7 +40,7 @@ use std::task::{Context, Poll, Waker};
 use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE};
 use ::http::{Response, StatusCode};
 
-use crate::bufferpool::{BufferPool, ReadStream, StripeKey, StripePlan};
+use crate::bufferpool::{BufferPool, Error as PoolError, ReadStream, StripeKey, StripePlan};
 use crate::config::{FrontendSpec, frontend_spec};
 use crate::fanout::{FanoutTable, FetchChannel, FetchReply, Owner};
 use crate::frontend::FrontendError;
@@ -382,7 +382,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     // metadata entry through the pool. The HTTP backend fills it from
     // an origin HEAD on a miss; local-disk and peer hits skip the
     // origin entirely.
-    let len = read_object_length(
+    let len = match read_object_length(
         pool,
         backend_id,
         cache_id,
@@ -392,7 +392,16 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         bypass,
     )
     .await
-    .map_err(|_| ())?;
+    {
+        LenResult::Len(len) => len,
+        LenResult::NotFound => {
+            let _ = send_all(handle, conn_fd, status_line_response(404)).await;
+            log.field("status", 404);
+            outcome.status = 404;
+            return Ok(());
+        }
+        LenResult::Other => return Err(()),
+    };
 
     // 6. Resolve the requested range against the length.
     let resolved = match range {
@@ -795,7 +804,7 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
     path: &str,
     page_size: usize,
     bypass: bool,
-) -> Result<u64, ()> {
+) -> LenResult {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
     let req = StripeReq::new(origin_ref.stripe_key())
         .with_origin(origin_ref)
@@ -804,10 +813,33 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
             neighborhood_id.map(ToOwned::to_owned),
         )
         .with_bypass(bypass);
-    let mut rs: ReadStream = pool.read(&req, 0, page_size as u64).await.map_err(|_| ())?;
-    let page = rs.next_page().await.ok_or(())?.map_err(|_| ())?;
-    let meta = ObjectMetadata::decode(page.as_slice()).map_err(|_| ())?;
-    Ok(meta.length)
+    let mut rs: ReadStream = match pool.read(&req, 0, page_size as u64).await {
+        Ok(rs) => rs,
+        Err(e) => return classify_len_error(e),
+    };
+    let page = match rs.next_page().await {
+        Some(Ok(page)) => page,
+        Some(Err(e)) => return classify_len_error(e),
+        None => return LenResult::Other,
+    };
+    match ObjectMetadata::decode(page.as_slice()) {
+        Ok(meta) => LenResult::Len(meta.length),
+        Err(e) => classify_len_error(e),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LenResult {
+    Len(u64),
+    NotFound,
+    Other,
+}
+
+fn classify_len_error(err: PoolError) -> LenResult {
+    match err {
+        PoolError::OriginNotFound => LenResult::NotFound,
+        _ => LenResult::Other,
+    }
 }
 
 /// Format the `200 OK` head for serving a whole object.
@@ -975,6 +1007,19 @@ mod tests {
     }
 
     #[test]
+    fn status_404_exact_bytes() {
+        let r404 = status_line_response(404);
+        let s404 = std::str::from_utf8(&r404).unwrap();
+        assert!(
+            s404.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "got: {s404}"
+        );
+        assert!(s404.contains("content-length: 0\r\n"), "got: {s404}");
+        assert!(s404.contains("connection: close\r\n"), "got: {s404}");
+        assert!(s404.ends_with("\r\n\r\n"), "got: {s404}");
+    }
+
+    #[test]
     fn range_to_stripe_set_wiring_no_range() {
         // No Range header -> full object over the stripe set. A 10-byte
         // object at stripe 4 covers stripes 0,1,2.
@@ -1077,7 +1122,9 @@ mod tests {
     /// constructor is crate-internal to bufferpool): it always errors.
     /// Sufficient to wire an [`HttpDriver`] for accept-loop tests, where
     /// the serve path is not exercised against a real pool.
-    struct MockPool;
+    struct MockPool {
+        err: Error,
+    }
 
     impl BufferPool for MockPool {
         type Req = StripeReq;
@@ -1088,7 +1135,7 @@ mod tests {
             _offset: u64,
             _len: u64,
         ) -> Result<ReadStream<'p>, Error> {
-            Err(Error::from("mock pool has no data"))
+            Err(self.err.clone())
         }
 
         fn read_windowed<'p>(
@@ -1098,7 +1145,7 @@ mod tests {
             _len: u64,
             _window: usize,
         ) -> Result<WindowedRead<'p>, Error> {
-            Err(Error::from("mock pool has no data"))
+            Err(self.err.clone())
         }
 
         fn read_pipelined<'p>(
@@ -1106,8 +1153,47 @@ mod tests {
             _stripes: Vec<StripePlan<StripeReq>>,
             _window: usize,
         ) -> Result<PipelinedRead<'p>, Error> {
-            Err(Error::from("mock pool has no data"))
+            Err(self.err.clone())
         }
+    }
+
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(fut);
+        for _ in 0..1_000_000 {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+        panic!("future did not complete");
+    }
+
+    #[test]
+    fn read_object_length_maps_origin_not_found_to_len_result() {
+        let pool = Rc::new(MockPool {
+            err: Error::OriginNotFound,
+        });
+
+        let result = block_on(read_object_length(
+            &pool, "primary", None, None, "/missing", 4096, false,
+        ));
+
+        assert_eq!(result, LenResult::NotFound);
+    }
+
+    #[test]
+    fn read_object_length_maps_other_errors_to_other() {
+        let pool = Rc::new(MockPool {
+            err: Error::from("mock pool has no data"),
+        });
+
+        let result = block_on(read_object_length(
+            &pool, "primary", None, None, "/broken", 4096, false,
+        ));
+
+        assert_eq!(result, LenResult::Other);
     }
 
     #[test]
@@ -1129,7 +1215,9 @@ mod tests {
             }
         };
         let mut driver = HttpDriver::new(
-            Rc::new(MockPool),
+            Rc::new(MockPool {
+                err: Error::from("mock pool has no data"),
+            }),
             handle,
             listen_fd,
             Rc::from("primary"),
