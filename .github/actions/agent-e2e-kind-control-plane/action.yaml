@@ -40,6 +40,23 @@ runs:
         cluster_name: ${{ inputs['cluster-name'] }}
         version: v0.29.0
 
+    - name: Create QEMU VM
+      if: ${{ inputs['create-vm'] == 'true' }}
+      shell: bash
+      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-vm
+
+    - name: Create VM bridge
+      if: ${{ inputs['create-vm'] != 'true' }}
+      shell: bash
+      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-vm-bridge
+
+    - name: Attach Kind container to VM bridge
+      shell: bash
+      env:
+        KIND_CLUSTER_NAME: ${{ inputs['cluster-name'] }}
+        VM_SUBNET: ${{ inputs['vm-subnet'] }}
+      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose ensure-kind-bridge
+
     - name: Configure Kind cluster networking for VM
       shell: bash
       env:
@@ -83,33 +100,3 @@ runs:
 
         echo "[INFO] Waiting for kindnet rollout..."
         kubectl -n kube-system rollout status daemonset/kindnet --timeout=60s
-
-    - name: Create QEMU VM
-      if: ${{ inputs['create-vm'] == 'true' }}
-      shell: bash
-      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-vm
-
-    - name: Create VM bridge
-      if: ${{ inputs['create-vm'] != 'true' }}
-      shell: bash
-      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose create-vm-bridge
-
-    - name: Attach Kind container to VM bridge
-      shell: bash
-      env:
-        KIND_CLUSTER_NAME: ${{ inputs['cluster-name'] }}
-        VM_SUBNET: ${{ inputs['vm-subnet'] }}
-      run: |
-        set -euo pipefail
-        KIND_CONTAINER="${KIND_CLUSTER_NAME}-control-plane"
-        BRIDGE="virbr-e2e"
-
-        echo "[INFO] Attaching Kind container to ${BRIDGE} bridge..."
-        KIND_PID=$(docker inspect "${KIND_CONTAINER}" --format '{{.State.Pid}}')
-        sudo ip link delete veth-kind-e2e 2>/dev/null || true
-        sudo ip link add veth-kind-e2e type veth peer name eth-e2e
-        sudo ip link set veth-kind-e2e master "${BRIDGE}"
-        sudo ip link set veth-kind-e2e up
-        sudo ip link set eth-e2e netns "${KIND_PID}"
-        sudo nsenter -t "${KIND_PID}" -n ip addr add "${VM_SUBNET}.2/24" dev eth-e2e
-        sudo nsenter -t "${KIND_PID}" -n ip link set eth-e2e up

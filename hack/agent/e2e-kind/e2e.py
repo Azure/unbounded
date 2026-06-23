@@ -234,6 +234,68 @@ def kind_api_server_url() -> str:
     return f"https://{kind_ip}:6443"
 
 
+def kind_control_plane_bridge_ip() -> str:
+    """Return the Kind control-plane IP on the VM bridge."""
+
+    return f"{VM_SUBNET}.2"
+
+
+def _kind_control_plane_internal_ips() -> list[str]:
+    result = subprocess.run(
+        [KUBECTL, "get", "node", KIND_CONTAINER, "-o", "json"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return []
+
+    node = json.loads(result.stdout)
+    return [
+        address.get("address", "")
+        for address in node.get("status", {}).get("addresses", [])
+        if address.get("type") == "InternalIP"
+    ]
+
+
+def configure_kind_control_plane_node_ip() -> None:
+    """Make the Kind control-plane Node advertise its VM-bridge IP."""
+
+    node_ip = kind_control_plane_bridge_ip()
+    current_ips = _kind_control_plane_internal_ips()
+    if current_ips == [node_ip]:
+        log(f"  Kind control-plane Node already advertises InternalIP {node_ip}")
+        return
+
+    log(f"Configuring {KIND_CONTAINER} kubelet node IP as {node_ip}...")
+    script = textwrap.dedent(f"""\
+        set -eu
+        . /var/lib/kubelet/kubeadm-flags.env
+        set -- $KUBELET_KUBEADM_ARGS
+        new_args=""
+        for arg do
+          case "$arg" in
+            --node-ip=*) ;;
+            *) new_args="$new_args $arg" ;;
+          esac
+        done
+        new_args="${{new_args# }}"
+        printf 'KUBELET_KUBEADM_ARGS="%s --node-ip={node_ip}"\n' "$new_args" >/var/lib/kubelet/kubeadm-flags.env
+        systemctl restart kubelet
+    """)
+    run(["docker", "exec", KIND_CONTAINER, "sh", "-c", script])
+
+    for elapsed in range(120):
+        internal_ips = _kind_control_plane_internal_ips()
+        if internal_ips == [node_ip]:
+            log(f"  Kind control-plane Node advertises InternalIP {node_ip}")
+            return
+        if elapsed > 0 and elapsed % 15 == 0:
+            log(f"    ({elapsed}s) InternalIP addresses: {internal_ips}")
+        time.sleep(1)
+
+    die(f"Timed out waiting for Node '{KIND_CONTAINER}' to advertise only InternalIP {node_ip}")
+
+
 def image_context_name(image: str) -> str:
     """Return a filesystem-safe name for an e2e image build context."""
 
@@ -1449,6 +1511,7 @@ def ensure_kind_bridge() -> None:
 
     if not needs_repair:
         log("  Bridge attachment is healthy - no action needed")
+        configure_kind_control_plane_node_ip()
         return
 
     # 3. Repair: delete any stale veth and recreate the pair.
@@ -1476,6 +1539,7 @@ def ensure_kind_bridge() -> None:
     _nm_unmanage(VETH_HOST)
 
     log(f"  Repaired: {VETH_HOST} -> {BRIDGE_NAME} -> {VETH_KIND} in Kind container")
+    configure_kind_control_plane_node_ip()
 
 
 # ---------------------------------------------------------------------------

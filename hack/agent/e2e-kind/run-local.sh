@@ -210,22 +210,9 @@ kubectl -n kube-system rollout status daemonset/kindnet --timeout=60s
 # ---------------------------------------------------------------------------
 python3 "$E2E" "${E2E_ARGS[@]}" create-vm
 
-# Attach Kind container to VM bridge via a veth pair so that the VM
-# subnet is directly reachable at L2.
-info "Attaching Kind container to ${BRIDGE} bridge..."
-KIND_PID=$(docker inspect "${KIND_CONTAINER}" --format '{{.State.Pid}}')
-sudo ip link delete veth-kind-e2e 2>/dev/null || true
-sudo ip link add veth-kind-e2e type veth peer name eth-e2e
-sudo ip link set veth-kind-e2e master "${BRIDGE}"
-sudo ip link set veth-kind-e2e up
-sudo ip link set eth-e2e netns "${KIND_PID}"
-sudo nsenter -t "${KIND_PID}" -n ip addr add "${VM_SUBNET}.2/24" dev eth-e2e
-sudo nsenter -t "${KIND_PID}" -n ip link set eth-e2e up
-
-# Prevent NetworkManager from detaching the veth from the bridge.
-if command -v nmcli &>/dev/null; then
-    sudo nmcli device set veth-kind-e2e managed no 2>/dev/null || true
-fi
+# Attach Kind container to VM bridge and make the control-plane Node advertise
+# the bridge IP so kindnet can install direct pod-CIDR routes from VM nodes.
+python3 "$E2E" "${E2E_ARGS[@]}" ensure-kind-bridge
 
 # ---------------------------------------------------------------------------
 # Install Machine CRD
