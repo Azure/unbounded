@@ -36,30 +36,6 @@ impl PinnedRuntime {
         Arc::new(Self { workers })
     }
 
-    /// Build a runtime from a topology [`Plan`](crate::topology::Plan),
-    /// keeping only workers for which `filter` returns true, in the
-    /// plan's iteration order. Each retained worker maps to a
-    /// [`WorkerSpec`] over its CPU and NUMA node, so `WorkerIdx(i)`
-    /// addresses the i-th retained worker. Because the order is
-    /// preserved, callers that independently filter `plan.workers`
-    /// with the *same* predicate get a matching index space.
-    pub fn from_plan(
-        plan: &crate::topology::Plan,
-        filter: impl Fn(&crate::topology::Worker) -> bool,
-    ) -> Arc<Self> {
-        let workers = plan
-            .workers
-            .iter()
-            .filter(|w| filter(w))
-            .map(|w| WorkerSpec::new(w.cpu, w.numa))
-            .collect::<Vec<_>>();
-        assert!(
-            !workers.is_empty(),
-            "PinnedRuntime::from_plan: no workers matched the filter"
-        );
-        Self::new(workers)
-    }
-
     /// Spawn a named OS thread and, when `spec` is `Some`, pin it
     /// (CPU affinity + NUMA mempolicy) inside the new thread before
     /// running `f`. `None` spawns an unpinned thread. This is the one
@@ -153,7 +129,13 @@ fn set_affinity(cpu: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-fn set_preferred_node(node: u16) -> std::io::Result<()> {
+/// Set the calling thread's NUMA memory policy to `MPOL_PREFERRED` for
+/// `node`, so subsequent first-touch allocations on this thread fault in
+/// on `node` when capacity allows. Non-strict: the kernel may spill to
+/// remote memory under pressure. Used both by worker-thread pinning and
+/// by setup code that allocates per-HCA buffers it wants placed NUMA-local
+/// to the HCA that will DMA them.
+pub fn set_preferred_node(node: u16) -> std::io::Result<()> {
     // MPOL_PREFERRED: allocate from `node` if possible, fall back
     // otherwise. Strict binding is too aggressive for a cache that
     // can spill onto remote memory when local is full.

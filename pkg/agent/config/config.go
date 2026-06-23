@@ -170,13 +170,13 @@ type CRIConfig struct {
 
 // ContainerdConfig holds containerd-specific overrides.
 type ContainerdConfig struct {
-	// Version overrides the default containerd version (e.g. "2.0.4").
+	// Version overrides the default containerd version (e.g. "2.1.8").
 	Version string `json:"Version,omitempty"`
 }
 
 // RuncConfig holds runc-specific overrides.
 type RuncConfig struct {
-	// Version overrides the default runc version (e.g. "1.1.12").
+	// Version overrides the default runc version (e.g. "1.5.0").
 	Version string `json:"Version,omitempty"`
 }
 

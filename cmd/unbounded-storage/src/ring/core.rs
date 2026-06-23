@@ -685,6 +685,7 @@ impl Future for SubmitSlot<'_> {
             return Poll::Ready(());
         }
         core.submit_waiters.borrow_mut().push(cx.waker().clone());
+        crate::metrics::ring_backpressure();
         Poll::Pending
     }
 }

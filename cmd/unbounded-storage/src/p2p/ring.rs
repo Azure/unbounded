@@ -7,13 +7,13 @@
 
 use crate::bufferpool::StripeKey;
 
-use crate::p2p::types::{NodeId, RingId, TopologyLabels};
+use crate::p2p::types::{NodeId, RingId, TopologyTags};
 use crate::storage::types::GOLDEN_RATIO_64;
 
-/// Sentinel used when comparing topology label vectors of unequal
-/// length. A wildcard never compares equal to a real label or to
+/// Sentinel used when comparing topology tag vectors of unequal
+/// length. A wildcard never compares equal to a real tag or to
 /// another wildcard, so unknown slots are treated as "farther".
-pub const WILDCARD_LABEL: &str = "*";
+pub const WILDCARD_TAG: &str = "*";
 
 /// Standard splitmix64 finalizer. Bijective on `u64`, used as a
 /// cheap, well-mixed hash where we need determinism but not a
@@ -48,25 +48,25 @@ pub fn ring_distance(from: RingId, to: RingId) -> u64 {
     to.0.wrapping_sub(from.0)
 }
 
-/// Topology distance between two label vectors, mirroring the
+/// Topology distance between two tag vectors, mirroring the
 /// simulator: right-pad both to the longer length with
-/// [`WILDCARD_LABEL`], scan left-to-right to find the longest
+/// [`WILDCARD_TAG`], scan left-to-right to find the longest
 /// prefix of equal, non-wildcard slots, and return
 /// `len - prefix_len`.
 ///
 /// Concretely on a `[region, zone, row, rack]` vector: identical is
 /// 0, same row but different rack is 1, only the region matches is
 /// 3, entirely disjoint is 4.
-pub fn topology_distance(local: &TopologyLabels, peer: &TopologyLabels) -> u32 {
+pub fn topology_distance(local: &TopologyTags, peer: &TopologyTags) -> u32 {
     let n = local.0.len().max(peer.0.len());
     if n == 0 {
         return 0;
     }
     let mut prefix = 0usize;
     for i in 0..n {
-        let l = local.0.get(i).map(String::as_str).unwrap_or(WILDCARD_LABEL);
-        let p = peer.0.get(i).map(String::as_str).unwrap_or(WILDCARD_LABEL);
-        if l == WILDCARD_LABEL || p == WILDCARD_LABEL || l != p {
+        let l = local.0.get(i).map(String::as_str).unwrap_or(WILDCARD_TAG);
+        let p = peer.0.get(i).map(String::as_str).unwrap_or(WILDCARD_TAG);
+        if l == WILDCARD_TAG || p == WILDCARD_TAG || l != p {
             break;
         }
         prefix += 1;
@@ -127,34 +127,34 @@ mod tests {
         assert_eq!(a, node_to_ring(NodeId(0)));
     }
 
-    fn labels(parts: &[&str]) -> TopologyLabels {
-        TopologyLabels(parts.iter().map(|s| s.to_string()).collect())
+    fn tags(parts: &[&str]) -> TopologyTags {
+        TopologyTags(parts.iter().map(|s| s.to_string()).collect())
     }
 
     #[test]
     fn topology_distance_identical_is_zero() {
-        let a = labels(&["us", "zone1", "row3", "rack9"]);
+        let a = tags(&["us", "zone1", "row3", "rack9"]);
         assert_eq!(topology_distance(&a, &a), 0);
     }
 
     #[test]
     fn topology_distance_same_row_different_rack_is_one() {
-        let a = labels(&["us", "zone1", "row3", "rack9"]);
-        let b = labels(&["us", "zone1", "row3", "rack8"]);
+        let a = tags(&["us", "zone1", "row3", "rack9"]);
+        let b = tags(&["us", "zone1", "row3", "rack8"]);
         assert_eq!(topology_distance(&a, &b), 1);
     }
 
     #[test]
     fn topology_distance_only_region_matches_is_three() {
-        let a = labels(&["us", "zone1", "row3", "rack9"]);
-        let b = labels(&["us", "zone2", "rowX", "rackY"]);
+        let a = tags(&["us", "zone1", "row3", "rack9"]);
+        let b = tags(&["us", "zone2", "rowX", "rackY"]);
         assert_eq!(topology_distance(&a, &b), 3);
     }
 
     #[test]
     fn topology_distance_disjoint_is_full_length() {
-        let a = labels(&["us", "zone1", "row3", "rack9"]);
-        let b = labels(&["eu", "zone1", "row3", "rack9"]);
+        let a = tags(&["us", "zone1", "row3", "rack9"]);
+        let b = tags(&["eu", "zone1", "row3", "rack9"]);
         assert_eq!(topology_distance(&a, &b), 4);
     }
 
@@ -163,15 +163,15 @@ mod tests {
         // Shorter peer right-pads with wildcards; wildcard never
         // equals a real label, so the prefix only counts the
         // explicitly-matching slots.
-        let a = labels(&["us", "zone1", "row3", "rack9"]);
-        let b = labels(&["us", "zone1"]);
+        let a = tags(&["us", "zone1", "row3", "rack9"]);
+        let b = tags(&["us", "zone1"]);
         // Prefix matches 2 slots; padded length is 4; distance = 2.
         assert_eq!(topology_distance(&a, &b), 2);
     }
 
     #[test]
     fn topology_distance_empty_vectors_is_zero() {
-        let e = TopologyLabels::default();
+        let e = TopologyTags::default();
         assert_eq!(topology_distance(&e, &e), 0);
     }
 
@@ -180,11 +180,11 @@ mod tests {
         // An empty vector right-pads to the other's length entirely
         // with wildcards, so no slot matches and the distance equals
         // the nonempty vector's length.
-        let e = TopologyLabels::default();
-        let a = labels(&["a"]);
+        let e = TopologyTags::default();
+        let a = tags(&["a"]);
         assert_eq!(topology_distance(&e, &a), 1);
         assert_eq!(topology_distance(&a, &e), 1);
-        let three = labels(&["a", "b", "c"]);
+        let three = tags(&["a", "b", "c"]);
         assert_eq!(topology_distance(&e, &three), 3);
         assert_eq!(topology_distance(&three, &e), 3);
     }

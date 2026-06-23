@@ -11,8 +11,8 @@
 //! `Error` enum.
 //!
 //! `#[cfg(test)]` blocks at the bottom of this file provide a small
-//! collection of canned handlers (`NoopHandler`, `NPagesHandler`,
-//! `ErrorHandler`, `CancelObservingHandler`) used by `tests.rs`.
+//! collection of canned handlers (`NPagesHandler`, `ErrorHandler`,
+//! `CancelObservingHandler`) used by `tests.rs`.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -57,38 +57,6 @@ mod test_handlers {
     use crate::bufferpool::{BulkRef, PageRef, Req};
 
     use super::{Handler, HandlerStream};
-
-    /// Handler that always yields an empty stream.
-    pub struct NoopHandler;
-
-    pub struct NoopStream;
-
-    impl HandlerStream for NoopStream {
-        type Error = Infallible;
-        fn poll_next(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<PageRef, Infallible>>> {
-            Poll::Ready(None)
-        }
-    }
-
-    impl<R: Req> Handler<R> for NoopHandler {
-        type Error = Infallible;
-        type Stream<'a>
-            = NoopStream
-        where
-            Self: 'a,
-            R: 'a;
-        fn handle<'a>(
-            &'a self,
-            _req: &'a R,
-            _src: BulkRef,
-            _hops_remaining: u32,
-        ) -> Self::Stream<'a> {
-            NoopStream
-        }
-    }
 
     /// Handler that yields the configured pages in order, then ends.
     pub struct NPagesHandler {

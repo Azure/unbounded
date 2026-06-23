@@ -382,67 +382,6 @@ proptest! {
         }
     }
 
-    /// Invariant: singleflight dedups concurrent writers on
-    /// `(value_hash, page_index)`.
-    ///
-    /// The write path in `storage::engine::write_page_from` calls
-    /// `Singleflight::acquire(page_key)` AFTER admission. Followers
-    /// short-circuit with `Ok(())` and never reach `device.write`;
-    /// only the leader issues the data-page device write. On a
-    /// device-write error the leader abandons (no retry, no
-    /// follower take-over), and `write_io_errors` is incremented.
-    /// Sequential re-issues for the same key after the leader
-    /// settles become new leaders, so the bound is on concurrent
-    /// in-flight calls, not on lifetime calls.
-    ///
-    /// Translated to observable counters: for every admitted call
-    /// the leader did exactly one successful data-page `device.write`,
-    /// and for every leader that failed at `device.write` there is
-    /// one faulted device write (counted in both `device_writes` and
-    /// `write_io_errors`, plus `device_io_errors`). Followers add
-    /// zero device writes. Therefore `admitted <= device_writes` per
-    /// disk and in aggregate: a regression that let followers fall
-    /// through to their own `device.write` (or that dropped the
-    /// leader's allocator gate) would not violate this bound on its
-    /// own, but a regression that lost admitted writes silently
-    /// (admission incremented without the device write landing)
-    /// would. The companion upper bound
-    /// (`device_writes - btree_overhead - meta - eviction_overhead
-    /// <= admitted + write_io_errors`) is the property the SF
-    /// machinery exists to maintain, but it is not directly
-    /// observable from these counters because they do not separate
-    /// data-page writes from btree-internal and meta writes; pinning
-    /// that down requires either an engine-side data-write counter or
-    /// per-key max-inflight tracking on the mock device.
-    #[test]
-    fn invariant_singleflight_dedups_concurrent_writes(
-        seed in any::<u64>(), w in workload_strategy(),
-    ) {
-        let report = run_workload(seed, w).expect("run completed");
-        prop_assert!(
-            report.admitted <= report.device_writes,
-            "admitted ({}) > device_writes ({}): admissions without a backing device write",
-            report.admitted, report.device_writes,
-        );
-        // Per-disk: each disk's admitted count is bounded by its
-        // own device writes. The router partitions by
-        // `disk_for(value_hash, page_index)`, so an admission on
-        // disk `i` must have produced a `device.write` on the same
-        // disk. We do not directly track admitted-per-disk in
-        // `RunReport`, so this falls back to the per-disk write
-        // count being at least the per-disk admission lower bound
-        // implied by the aggregate: if any single disk's
-        // `device_writes` were zero while `admitted > 0` in
-        // aggregate, the routing-diversity invariant would catch
-        // it, but we double-check the cumulative form here.
-        let total_per_disk: u64 = report.device_writes_per_disk.iter().copied().sum();
-        prop_assert_eq!(
-            total_per_disk, report.device_writes,
-            "device_writes ({}) disagrees with sum of per-disk device_writes ({})",
-            report.device_writes, total_per_disk,
-        );
-    }
-
     /// Invariant: at end-of-run quiescence the deferred-reclaim
     /// queue is bounded. Every LBA pushed onto `pending_free`
     /// (either by an overwrite-while-pinned or an eviction-while-

@@ -398,8 +398,11 @@ pub fn pipelined_workload_strategy() -> impl Strategy<Value = Workload> {
 }
 
 fn plan_slice_strategy() -> impl Strategy<Value = PlanSliceSpec> {
-    (0u8..=255u8, 0u64..=4096, 1u64..=4096)
-        .prop_map(|(key_idx, offset, len)| PlanSliceSpec { key_idx, offset, len })
+    (0u8..=255u8, 0u64..=4096, 1u64..=4096).prop_map(|(key_idx, offset, len)| PlanSliceSpec {
+        key_idx,
+        offset,
+        len,
+    })
 }
 
 fn pipeline_strategy() -> impl Strategy<Value = PipelineSpec> {
@@ -411,8 +414,12 @@ fn pipeline_strategy() -> impl Strategy<Value = PipelineSpec> {
         7 => Just(None),
         3 => (0u32..=16).prop_map(Some),
     ];
-    (cancel_after, vec(plan_slice_strategy(), 1..=4))
-        .prop_map(|(cancel_after, slices)| PipelineSpec { cancel_after, slices })
+    (cancel_after, vec(plan_slice_strategy(), 1..=4)).prop_map(|(cancel_after, slices)| {
+        PipelineSpec {
+            cancel_after,
+            slices,
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -710,6 +717,6 @@ fn heap_backing(page_size: usize, page_count: usize) -> Backing {
         base: owner.ptr,
         page_size,
         page_count,
-        _own: Box::new(owner),
+        keepalive: std::sync::Arc::new(owner),
     }
 }

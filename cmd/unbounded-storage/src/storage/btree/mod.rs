@@ -227,7 +227,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
             // Meta said something but the tree underneath is
             // gone; fall through to rebuild.
         } else if skip_recovery_scan_if_no_meta {
-            // Fresh disk path used by the bench: skip the
+            // Fresh disk path used by storage tooling: skip the
             // full-capacity LBA-order leaf scan and treat the
             // device as empty. The scan is the design's degraded
             // recovery path for the case where the meta slots are

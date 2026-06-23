@@ -243,7 +243,13 @@ func TestBuildPeerURL(t *testing.T) {
 			name: "missing-repo",
 			addr: "10.0.0.1:5001",
 			ref:  ifaces.OriginRef{Digest: d},
-			want: "http://10.0.0.1:5001/v2/_/blobs/" + d.String(),
+			want: "http://10.0.0.1:5001/v2/gantry/blobs/" + d.String(),
+		},
+		{
+			name: "invalid-repo",
+			addr: "10.0.0.1:5001",
+			ref:  ifaces.OriginRef{Repository: "../../etc", Digest: d},
+			err:  true,
 		},
 	}
 	for _, tc := range cases {

@@ -61,12 +61,20 @@ func TestManualBootstrapHandler_Validate(t *testing.T) {
 			expectErr: "site name is required",
 		},
 		{
-			name: "missing machine name",
+			name: "missing machine name is allowed (resolved at runtime)",
 			handler: manualBootstrapHandler{
 				siteName:       "dc1",
 				kubeconfigPath: kubeconfigPath,
 			},
-			expectErr: "machine name is required",
+		},
+		{
+			name: "invalid machine name",
+			handler: manualBootstrapHandler{
+				siteName:       "dc1",
+				machineName:    "Bad_Name",
+				kubeconfigPath: kubeconfigPath,
+			},
+			expectErr: "invalid machine name",
 		},
 		{
 			name: "kubeconfig not readable",
@@ -532,6 +540,131 @@ func TestManualBootstrapHandler_RenderCloudInit(t *testing.T) {
 		require.Contains(t, output, `"OCIImage": "ghcr.io/azure/agent:latest"`)
 		require.NotContains(t, output, "AGENT_OCI_IMAGE")
 	})
+}
+
+// ---------------------------------------------------------------------------
+// empty machine name (resolved at runtime) tests
+// ---------------------------------------------------------------------------
+
+func TestManualBootstrapHandler_BuildAgentConfig_EmptyMachineName(t *testing.T) {
+	t.Parallel()
+
+	kubeCli := newFakeCluster(t, "dc1")
+
+	h := &manualBootstrapHandler{
+		siteName:   "dc1",
+		kubeCli:    kubeCli,
+		kubeConfig: &rest.Config{Host: "https://my-api-server:6443"},
+		logger:     discardLogger(),
+	}
+
+	cfg, err := h.buildAgentConfig(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, cfg.MachineName)
+
+	// The agent resolves the name on the host at startup; the marshalled
+	// config carries an empty MachineName.
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(data, &parsed))
+	require.Equal(t, "", parsed["MachineName"])
+}
+
+func TestManualBootstrapHandler_RenderScript_EmptyMachineName(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{
+		logger: discardLogger(),
+	}
+
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+			},
+		},
+	}
+
+	script, err := h.renderScript(cfg)
+	require.NoError(t, err)
+
+	// Header indicates runtime resolution and the JSON carries an empty name.
+	require.Contains(t, script, "Machine:      (resolved at runtime)")
+	require.Contains(t, script, `"MachineName": ""`)
+	requireValidBashSyntax(t, script)
+}
+
+func TestManualBootstrapHandler_RenderCloudInit_EmptyMachineName(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{
+		logger: discardLogger(),
+	}
+
+	cfg := &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "dGVzdA==",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "v1.30.0",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: "https://api-server:6443",
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.0123456789abcdef",
+				},
+			},
+		},
+	}
+
+	output, err := h.renderCloudInit(cfg)
+	require.NoError(t, err)
+
+	require.True(t, strings.HasPrefix(output, "#cloud-config\n"))
+	require.Contains(t, output, "Machine:      (resolved at runtime)")
+	require.Contains(t, output, `"MachineName": ""`)
+}
+
+func TestManualBootstrapHandler_Execute_EmptyMachineName(t *testing.T) {
+	t.Parallel()
+
+	kubeCli := newFakeCluster(t, "dc1")
+
+	var buf bytes.Buffer
+
+	kubeconfigPath := writeTempKubeconfig(t)
+
+	h := &manualBootstrapHandler{
+		out:            &buf,
+		kubeCli:        kubeCli,
+		kubeConfig:     &rest.Config{Host: "https://my-api-server:6443"},
+		kubeconfigPath: kubeconfigPath,
+		logger:         discardLogger(),
+	}
+
+	cmd := newMachineManualBootstrapCommand(h)
+	cmd.SetArgs([]string{
+		"--site", "dc1",
+		"--kubeconfig", kubeconfigPath,
+	})
+
+	err := cmd.ExecuteContext(context.Background())
+	require.NoError(t, err)
+
+	script := buf.String()
+	require.Contains(t, script, "#!/bin/bash")
+	require.Contains(t, script, "Machine:      (resolved at runtime)")
+	require.Contains(t, script, `"MachineName": ""`)
 }
 
 // ---------------------------------------------------------------------------

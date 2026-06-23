@@ -19,6 +19,7 @@ The test follows a single linear sequence:
 Options:
     --verbose                          Enable diagnostic output (network diags).
     --node-config PATH                 JSON file with node config variant settings.
+    AGENT_OCI_IMAGE                    Optional OCI rootfs image for the agent node.
 
 Subcommands (called as individual workflow steps):
     create-vm                          Create bridge networking and launch a QEMU VM.
@@ -30,8 +31,10 @@ Subcommands (called as individual workflow steps):
     validate-workload                  Deploy test pods on the agent node.
     validate-kube-proxy                Verify kube-proxy is Running on all nodes.
     install-machine-crd                Install Machine CRD and bootstrapper RBAC.
-    start-machina-controller           Run the machina controller against Kind.
+    deploy-unbounded-net-controller    Deploy unbounded-net controller into Kind.
+    start-machina-controller           Deploy the machina controller into Kind.
     validate-machina-controller        Verify machina creates an MCV.
+    validate-controllers-healthy       Verify controllers are not crashing or repeating errors.
     delete-machine-cr                  Delete the Machine CR.
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
     validate-node-reboot-operation     Verify NodeReboot MachineOperation restarts the node.
@@ -79,12 +82,17 @@ VM_SUBNET = os.environ.get("VM_SUBNET", "192.168.100")
 VM_IP = os.environ.get("VM_IP", f"{VM_SUBNET}.10")
 VM_GATEWAY = f"{VM_SUBNET}.1"
 VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
+HOST_BASE_OS = os.environ.get("HOST_BASE_OS", "ubuntu2404")
+HOST_IMAGE_URL = os.environ.get("HOST_IMAGE_URL", "")
+NSPAWN_OCI_IMAGE = os.environ.get("NSPAWN_OCI_IMAGE", "")
+VM_SSH_USER = os.environ.get("VM_SSH_USER", "ubuntu")
 NODE_CONFIG_DIR = REPO_ROOT / "hack" / "agent" / "e2e-kind" / "node-configs"
 
 KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
 KIND_CONTAINER = f"{KIND_CLUSTER_NAME}-control-plane"
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
+AGENT_OCI_IMAGE = os.environ.get("AGENT_OCI_IMAGE", "")
 
 # Site name used when generating the bootstrap script via kubectl-unbounded.
 E2E_SITE_NAME = os.environ.get("E2E_SITE_NAME", "e2e")
@@ -108,16 +116,18 @@ SSH_OPTS = [
     "-o", "ConnectTimeout=10",
     "-i", str(SSH_KEY),
 ]
-SSH_TARGET = f"ubuntu@{VM_IP}"
+SSH_TARGET = f"{VM_SSH_USER}@{VM_IP}"
 
 KUBECTL = "kubectl"
 KUBECTL_UNBOUNDED = str(REPO_ROOT / "bin" / "kubectl-unbounded")
-MACHINA = str(REPO_ROOT / "bin" / "machina")
+CONTAINER_ENGINE = os.environ.get("CONTAINER_ENGINE", "docker")
+MACHINA_E2E_IMAGE = os.environ.get("MACHINA_E2E_IMAGE", "machina:agent-e2e")
+NET_CONTROLLER_E2E_IMAGE = os.environ.get(
+    "NET_CONTROLLER_E2E_IMAGE",
+    "unbounded-net-controller:agent-e2e",
+)
 
 TEST_NS = "e2e-workload-test"
-MACHINA_PID_FILE = VM_DIR / "machina-controller.pid"
-MACHINA_LOG_FILE = VM_DIR / "machina-controller.log"
-MACHINA_CONFIG_FILE = VM_DIR / "machina-config.yaml"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
 DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
 DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
@@ -211,6 +221,212 @@ def kubectl_capture(args: list[str]) -> str:
     return capture([KUBECTL, *args])
 
 
+def kind_api_server_url() -> str:
+    """Return the Kind API server URL reachable from the VM bridge."""
+
+    kind_ip = capture([
+        "docker", "inspect", KIND_CONTAINER,
+        "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+    ])
+    if not kind_ip:
+        die("Could not determine Kind control-plane container IP")
+
+    return f"https://{kind_ip}:6443"
+
+
+def image_context_name(image: str) -> str:
+    """Return a filesystem-safe name for an e2e image build context."""
+
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", image).strip("-") or "image"
+
+
+def build_e2e_controller_image(image: str, binary_path: Path, entrypoint: str) -> None:
+    """Build a small local controller image from an already-built binary."""
+
+    if shutil.which(CONTAINER_ENGINE) is None:
+        die(f"{CONTAINER_ENGINE} is required but not found in PATH")
+
+    if not binary_path.exists():
+        die(f"Controller binary not found: {binary_path}")
+
+    context_dir = VM_DIR / "images" / image_context_name(image)
+    context_dir.mkdir(parents=True, exist_ok=True)
+    image_binary = context_dir / entrypoint
+    dockerfile = context_dir / "Containerfile"
+    shutil.copy2(binary_path, image_binary)
+    dockerfile.write_text(textwrap.dedent(f"""\
+        FROM ubuntu:24.04
+        COPY {entrypoint} /usr/local/bin/{entrypoint}
+        ENTRYPOINT ["/usr/local/bin/{entrypoint}"]
+    """))
+
+    log(f"Building local e2e image {image}...")
+    run([CONTAINER_ENGINE, "build", "-t", image, "-f", str(dockerfile), str(context_dir)])
+
+
+def load_image_into_kind(image: str) -> None:
+    """Load a locally-built image into the Kind cluster."""
+
+    if shutil.which("kind") is None:
+        die("kind is required but not found in PATH")
+
+    log(f"Loading image {image} into Kind cluster '{KIND_CLUSTER_NAME}'...")
+    if CONTAINER_ENGINE == "docker":
+        run(["kind", "load", "docker-image", image, "--name", KIND_CLUSTER_NAME])
+        return
+
+    archive = VM_DIR / f"{image_context_name(image)}.tar"
+    run([CONTAINER_ENGINE, "save", "-o", str(archive), image])
+    run(["kind", "load", "image-archive", str(archive), "--name", KIND_CLUSTER_NAME])
+
+
+def apply_manifest(path: Path) -> None:
+    """Apply a manifest file, failing with a clear message when missing."""
+
+    if not path.exists():
+        die(f"Manifest not found: {path}")
+
+    kubectl(["apply", "-f", str(path)])
+
+
+def set_manifest_image_pull_policy(path: Path, policy: str) -> None:
+    """Set the single imagePullPolicy in a rendered manifest."""
+
+    if not path.exists():
+        die(f"Manifest not found: {path}")
+
+    old = "imagePullPolicy: Always"
+    new = f"imagePullPolicy: {policy}"
+    contents = path.read_text()
+    if contents.count(old) != 1:
+        die(f"Expected exactly one '{old}' entry in {path}")
+
+    path.write_text(contents.replace(old, new, 1))
+
+
+def wait_for_rollout(namespace: str, resource: str, timeout: str = "180s") -> None:
+    """Wait for a Kubernetes workload rollout."""
+
+    kubectl(["-n", namespace, "rollout", "status", resource, f"--timeout={timeout}"])
+
+
+def print_controller_logs(namespace: str, label: str) -> None:
+    """Print current and previous logs for matching controller pods."""
+
+    subprocess.run(
+        [KUBECTL, "logs", "-n", namespace, "--all-containers", "--prefix", "-l", label],
+        check=False,
+    )
+    subprocess.run(
+        [
+            KUBECTL, "logs", "-n", namespace, "--all-containers", "--prefix",
+            "--previous", "-l", label,
+        ],
+        check=False,
+    )
+
+
+def _normalize_controller_error_line(line: str) -> str:
+    """Normalize volatile fields in controller log lines before comparing."""
+
+    line = line.strip()
+    if not line:
+        return ""
+
+    parts = line.split(maxsplit=1)
+    if len(parts) == 2 and "/" in parts[0]:
+        line = parts[1]
+
+    line = re.sub(r"\b\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z?\b", "<ts>", line)
+    line = re.sub(r"\b[0-9a-f]{8,}\b", "<hex>", line)
+    return re.sub(r"\s+", " ", line)
+
+
+def _controller_logs(namespace: str, label: str, previous: bool = False) -> str:
+    args = [
+        KUBECTL, "logs", "-n", namespace, "--all-containers", "--prefix",
+        "-l", label,
+    ]
+    if previous:
+        args.insert(-2, "--previous")
+
+    result = subprocess.run(args, capture_output=True, text=True, check=False)
+    if result.returncode != 0 and not previous:
+        raise subprocess.CalledProcessError(result.returncode, args, result.stdout, result.stderr)
+
+    return result.stdout
+
+
+def _validate_controller_health(name: str, namespace: str, label: str) -> None:
+    log(f"Checking {name} controller pod health...")
+    pod_list = json.loads(kubectl_capture([
+        "get", "pods", "-n", namespace, "-l", label, "-o", "json",
+    ]))
+    pods = pod_list.get("items", [])
+    if not pods:
+        die(f"{name} controller has no pods matching {label}")
+
+    unhealthy: list[str] = []
+    for pod in pods:
+        pod_name = pod["metadata"]["name"]
+        phase = pod.get("status", {}).get("phase", "")
+        if phase != "Running":
+            unhealthy.append(f"{pod_name}: phase={phase}")
+
+        for status in pod.get("status", {}).get("containerStatuses", []):
+            container = status.get("name", "<unknown>")
+            restart_count = int(status.get("restartCount", 0))
+            if restart_count != 0:
+                unhealthy.append(f"{pod_name}/{container}: restartCount={restart_count}")
+
+            state = status.get("state", {})
+            waiting = state.get("waiting")
+            if waiting:
+                reason = waiting.get("reason", "")
+                if reason in {"CrashLoopBackOff", "Error"}:
+                    unhealthy.append(f"{pod_name}/{container}: waiting={reason}")
+
+            terminated = state.get("terminated")
+            if terminated and int(terminated.get("exitCode", 0)) != 0:
+                unhealthy.append(
+                    f"{pod_name}/{container}: terminated={terminated.get('reason', '')}"
+                )
+
+    if unhealthy:
+        print_controller_logs(namespace, label)
+        die(f"{name} controller unhealthy: {'; '.join(unhealthy)}")
+
+    log(f"Checking {name} controller logs for repeated errors...")
+    repeated_errors: dict[str, int] = {}
+    for line in _controller_logs(namespace, label).splitlines():
+        if not re.search(r"\b(error|fatal|panic)\b|level=error|\"level\":\"error\"", line, re.I):
+            continue
+
+        normalized = _normalize_controller_error_line(line)
+        if not normalized:
+            continue
+
+        repeated_errors[normalized] = repeated_errors.get(normalized, 0) + 1
+
+    repeated_errors = {
+        line: count for line, count in repeated_errors.items()
+        if count >= 3
+    }
+    if repeated_errors:
+        print_controller_logs(namespace, label)
+        details = "; ".join(
+            f"{count}x {line}" for line, count in sorted(repeated_errors.items())
+        )
+        die(f"{name} controller has repeating error logs: {details}")
+
+    previous_logs = _controller_logs(namespace, label, previous=True).strip()
+    if previous_logs:
+        print(previous_logs, flush=True)
+        die(f"{name} controller has previous container logs")
+
+    log(f"{name} controller is healthy")
+
+
 def active_nspawn_machine() -> str:
     for machine in NSPAWN_MACHINE_NAMES:
         result = ssh_capture_quiet(f"sudo machinectl show {machine}")
@@ -243,16 +459,6 @@ def assert_bpffs_sentinel_absent(machine: str) -> None:
     result = machine_shell_quiet(machine, f"test ! -e /sys/fs/bpf/{BPFFS_SENTINEL}")
     if result.returncode != 0:
         die(f"bpffs sentinel from previous machine is visible in '{machine}'")
-
-
-def install_bpftool(machine: str) -> None:
-    log(f"Installing bpftool in nspawn machine '{machine}'...")
-    # TODO: remove this once agent-ubuntu2404 and agent-ubuntu2404-nvidia
-    # images containing bpftool have been published and are used by e2e.
-    machine_shell(machine, textwrap.dedent("""\
-        apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y linux-tools-common
-    """))
 
 
 def _b64(val: str) -> str:
@@ -352,6 +558,8 @@ def expected_node_taints(node_config: NodeConfig) -> list[dict[str, str]]:
 def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
     """Return manual-bootstrap flags for the active node config variant."""
     args: list[str] = []
+    if NSPAWN_OCI_IMAGE:
+        args.extend(["--oci-image", NSPAWN_OCI_IMAGE])
     if node_config.node_ip:
         args.extend(["--node-ip", expected_node_ip(node_config)])
     for key, value in sorted(expected_node_labels(node_config).items()):
@@ -367,6 +575,7 @@ def log_active_node_config(node_config: NodeConfig) -> None:
     taints = expected_node_taint_strings(node_config)
     log(f"Agent e2e node config variant: {node_config.name}")
     log(f"  node ip: {expected_node_ip(node_config) if node_config.node_ip else '<default>'}")
+    log(f"  nspawn oci image: {NSPAWN_OCI_IMAGE or '<default>'}")
     log(f"  node labels: {', '.join(labels) if labels else '<none>'}")
     log(f"  register-with-taints: {', '.join(taints) if taints else '<none>'}")
 
@@ -883,47 +1092,55 @@ def _stop_qemu() -> None:
     _stop_qemu_by_pid_file(VM_DIR / f"{VM_NAME}.pid", VM_NAME)
 
 
-def _launch_vm(ssh_pub_key: str) -> None:
-    """Create a fresh VM disk, cloud-init ISO, launch QEMU, and wait for SSH.
+@dataclass(frozen=True)
+class HostImage:
+    url: str
+    file_name: str
+    backing_format: str
+    sudo_group: str
+    packages: list[str]
+    write_files: str = ""
+    pre_marker_commands: list[str] | None = None
 
-    Assumes VM_DIR, the base cloud image, and the SSH key pair already exist.
-    Networking (bridge, TAP, NAT) must already be configured.
-    """
 
-    image_file = VM_DIR / "ubuntu-cloud-amd64.img"
-    if not image_file.exists():
-        die(f"Base cloud image not found: {image_file}. Run create-vm first.")
+def host_image() -> HostImage:
+    if HOST_BASE_OS == "ubuntu2404":
+        return HostImage(
+            url=HOST_IMAGE_URL
+            or "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img",
+            file_name="ubuntu-cloud-amd64.img",
+            backing_format="qcow2",
+            sudo_group="sudo",
+            packages=["curl", "jq", "apt-transport-https", "ca-certificates", "net-tools"],
+            write_files=ubuntu_netplan_write_files(),
+            pre_marker_commands=["netplan apply"],
+        )
+    if HOST_BASE_OS == "ubuntu2604":
+        return HostImage(
+            url=HOST_IMAGE_URL
+            or "https://cloud-images.ubuntu.com/minimal/releases/resolute/release/ubuntu-26.04-minimal-cloudimg-amd64.img",
+            file_name="ubuntu-26.04-minimal-cloudimg-amd64.img",
+            backing_format="qcow2",
+            sudo_group="sudo",
+            packages=["curl", "jq", "apt-transport-https", "ca-certificates", "net-tools"],
+            write_files=ubuntu_netplan_write_files(),
+            pre_marker_commands=["netplan apply"],
+        )
+    if HOST_BASE_OS == "fedora":
+        return HostImage(
+            url=HOST_IMAGE_URL
+            or "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2",
+            file_name="fedora-cloud-amd64.qcow2",
+            backing_format="qcow2",
+            sudo_group="wheel",
+            packages=["curl", "jq", "ca-certificates", "net-tools"],
+        )
 
-    # Create VM disk
-    vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
-    log(f"Creating snapshot disk: {vm_disk}")
-    run(["qemu-img", "create", "-f", "qcow2", "-b", str(image_file),
-         "-F", "qcow2", str(vm_disk), VM_DISK_SIZE])
+    die(f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; expected ubuntu2404, ubuntu2604, or fedora")
 
-    # cloud-init configuration
-    log("Generating cloud-init configuration...")
 
-    user_data = VM_DIR / "user-data"
-    user_data.write_text(textwrap.dedent(f"""\
-        #cloud-config
-        users:
-          - name: ubuntu
-            sudo: ALL=(ALL) NOPASSWD:ALL
-            shell: /bin/bash
-            groups: [sudo]
-            lock_passwd: false
-            ssh_authorized_keys:
-              - {ssh_pub_key}
-
-        package_update: true
-        package_upgrade: false
-        packages:
-          - curl
-          - jq
-          - apt-transport-https
-          - ca-certificates
-          - net-tools
-
+def ubuntu_netplan_write_files() -> str:
+    return textwrap.dedent(f"""\
         write_files:
           - path: /etc/netplan/99-static.yaml
             content: |
@@ -941,16 +1158,71 @@ def _launch_vm(ssh_pub_key: str) -> None:
                         - 8.8.8.8
                         - 8.8.4.4
             permissions: "0600"
+    """)
 
-        runcmd:
-          - netplan apply
-          - mkdir -p /etc/agent
-          - |
-            cat > /etc/agent/provisioned <<'MARKER'
-            provisioned=true
-            MARKER
-          - 'echo "cloud-init: done"'
-    """))
+
+def yaml_list(items: list[str], indent: str) -> str:
+    return "\n".join(f"{indent}- {item}" for item in items)
+
+
+def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
+    packages = yaml_list(image.packages, "  ")
+    commands = [*(image.pre_marker_commands or []), "mkdir -p /etc/agent"]
+    runcmd = yaml_list(commands, "  ")
+    write_files = image.write_files.rstrip()
+    write_files_block = f"\n{write_files}\n" if write_files else ""
+
+    return (
+        f"#cloud-config\n"
+        f"users:\n"
+        f"  - name: {VM_SSH_USER}\n"
+        f"    sudo: ALL=(ALL) NOPASSWD:ALL\n"
+        f"    shell: /bin/bash\n"
+        f"    groups: [{image.sudo_group}]\n"
+        f"    lock_passwd: false\n"
+        f"    ssh_authorized_keys:\n"
+        f"      - {ssh_pub_key}\n"
+        f"\n"
+        f"package_update: true\n"
+        f"package_upgrade: false\n"
+        f"packages:\n"
+        f"{packages}\n"
+        f"{write_files_block}"
+        f"runcmd:\n"
+        f"{runcmd}\n"
+        f"  - |\n"
+        f"    cat > /etc/agent/provisioned <<'MARKER'\n"
+        f"    provisioned=true\n"
+        f"    MARKER\n"
+        f"  - 'echo \"cloud-init: done\"'\n"
+    )
+
+
+
+def _launch_vm(ssh_pub_key: str) -> None:
+    """Create a fresh VM disk, cloud-init ISO, launch QEMU, and wait for SSH.
+
+    Assumes VM_DIR, the base cloud image, and the SSH key pair already exist.
+    Networking (bridge, TAP, NAT) must already be configured.
+    """
+
+    image = host_image()
+    image_file = VM_DIR / image.file_name
+    if not image_file.exists():
+        die(f"Base cloud image not found: {image_file}. Run create-vm first.")
+
+    # Create VM disk
+    vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
+    log(f"Creating snapshot disk: {vm_disk}")
+    run(["qemu-img", "create", "-f", "qcow2", "-b", str(image_file),
+         "-F", image.backing_format, str(vm_disk), VM_DISK_SIZE])
+
+    # cloud-init configuration
+    log("Generating cloud-init configuration...")
+    mac_address = qemu_mac_address()
+
+    user_data = VM_DIR / "user-data"
+    user_data.write_text(_cloud_init_user_data(image, ssh_pub_key))
 
     meta_data = VM_DIR / "meta-data"
     # Use a unique instance-id so cloud-init treats this as a new instance
@@ -985,10 +1257,9 @@ def _launch_vm(ssh_pub_key: str) -> None:
     # Launch QEMU VM
     pid_file = VM_DIR / f"{VM_NAME}.pid"
     qemu_log = VM_DIR / f"{VM_NAME}.log"
-    mac_address = qemu_mac_address()
-
     log("============================================")
     log(f"  Launching VM: {VM_NAME}")
+    log(f"  Host OS:      {HOST_BASE_OS}")
     log(f"  Memory:       {VM_MEMORY} MB")
     log(f"  CPUs:         {VM_CPUS}")
     log(f"  Disk:         {vm_disk}")
@@ -998,7 +1269,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     log(f"  Log:          {qemu_log}")
     log("============================================")
 
-    run([
+    qemu_args = [
         "qemu-system-x86_64",
         "-cpu", "host", "-accel", "kvm",
         "-m", VM_MEMORY, "-smp", VM_CPUS,
@@ -1009,7 +1280,8 @@ def _launch_vm(ssh_pub_key: str) -> None:
         "-daemonize", "-pidfile", str(pid_file),
         "-serial", f"file:{qemu_log}",
         "-display", "none",
-    ])
+    ]
+    run(qemu_args)
 
     qemu_pid = pid_file.read_text().strip()
     log(f"VM started in background (PID: {qemu_pid})")
@@ -1098,14 +1370,14 @@ def launch_vm() -> None:
     run(["sudo", "ip", "link", "set", TAP_NAME, "up"])
     _nm_unmanage(TAP_NAME)
 
-    # Download Ubuntu cloud image
-    image_url = "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img"
-    image_file = VM_DIR / "ubuntu-cloud-amd64.img"
+    image = host_image()
+    image_file = VM_DIR / image.file_name
     if not image_file.exists():
-        log("Downloading Ubuntu 24.04 cloud image...")
-        run(["curl", "-fsSL", "-o", str(image_file), image_url])
+        log(f"Downloading {HOST_BASE_OS} cloud image...")
+        run(["curl", "-fsSL", "-o", str(image_file), image.url])
     else:
         log(f"Using existing image: {image_file}")
+    run(["qemu-img", "info", "-f", image.backing_format, str(image_file)])
 
     _launch_vm(ssh_pub_key)
 
@@ -1287,13 +1559,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     # Determine the Kind control-plane IP so connectivity checks have the
     # correct address even when the local kubeconfig uses 127.0.0.1.
     log(f"Resolving Kind control-plane IP for '{KIND_CLUSTER_NAME}'...")
-    kind_ip = capture([
-        "docker", "inspect", KIND_CONTAINER,
-        "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-    ])
-    if not kind_ip:
-        die("Could not determine Kind control-plane container IP")
-    api_server = f"https://{kind_ip}:6443"
+    api_server = kind_api_server_url()
     log(f"API server: {api_server}")
 
     # Create bootstrap token.
@@ -1354,6 +1620,9 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         "--site", E2E_SITE_NAME,
         *node_config_bootstrap_args(node_config),
     ]
+    if AGENT_OCI_IMAGE:
+        log(f"Using OCI rootfs image: {AGENT_OCI_IMAGE}")
+        bootstrap_args.extend(["--oci-image", AGENT_OCI_IMAGE])
     bootstrap_script = capture(bootstrap_args)
 
     # The kubeconfig uses a localhost address that is not reachable from the VM.
@@ -1402,7 +1671,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
 def wait_for_node() -> None:
     """Wait for the agent node to appear and become Ready."""
 
-    node_timeout = int(os.environ.get("NODE_TIMEOUT", "180"))
+    node_timeout = int(os.environ.get("NODE_TIMEOUT", "300"))
     ready_timeout = int(os.environ.get("READY_TIMEOUT", "720"))
 
     # Wait for node to appear
@@ -2017,61 +2286,101 @@ def install_machine_crd() -> None:
 
 
 # ---------------------------------------------------------------------------
+# deploy-unbounded-net-controller
+# ---------------------------------------------------------------------------
+def deploy_unbounded_net_controller() -> None:
+    """Build and deploy the unbounded-net controller into the Kind cluster."""
+
+    log("Building unbounded-net controller...")
+    run(["make", "unbounded-net-controller-build"], cwd=str(REPO_ROOT))
+    build_e2e_controller_image(
+        NET_CONTROLLER_E2E_IMAGE,
+        REPO_ROOT / "bin" / "unbounded-net-controller",
+        "unbounded-net-controller",
+    )
+    load_image_into_kind(NET_CONTROLLER_E2E_IMAGE)
+
+    api_server = kind_api_server_url()
+    log("Rendering unbounded-net manifests...")
+    run([
+        "make", "net-manifests",
+        f"NET_CONTROLLER_IMAGE={NET_CONTROLLER_E2E_IMAGE}",
+        "NET_NODE_IMAGE=unbounded-net-node:agent-e2e-unused",
+        f"NET_APISERVER_URL={api_server}",
+    ], cwd=str(REPO_ROOT))
+
+    rendered = REPO_ROOT / "deploy" / "net" / "rendered"
+    controller = rendered / "controller"
+    set_manifest_image_pull_policy(controller / "03-deployment.yaml", "IfNotPresent")
+    log("Installing unbounded-net CRDs and controller manifests...")
+    for crd_path in sorted((rendered / "crd").glob("*.yaml")):
+        apply_manifest(crd_path)
+    for manifest_path in sorted(rendered.glob("*.yaml")) + sorted(controller.glob("*.yaml")):
+        apply_manifest(manifest_path)
+
+    try:
+        wait_for_rollout("unbounded-net", "deployment/unbounded-net-controller")
+    except subprocess.CalledProcessError:
+        print_controller_logs("unbounded-net", "app.kubernetes.io/name=unbounded-net-controller")
+        die("unbounded-net controller rollout failed")
+
+    log("unbounded-net controller deployed")
+
+
+# ---------------------------------------------------------------------------
 # start-machina-controller
 # ---------------------------------------------------------------------------
 def start_machina_controller() -> None:
-    """Build and run the machina controller locally against the Kind cluster."""
+    """Build and deploy the machina controller into the Kind cluster."""
 
     log("Building machina controller...")
     run(["make", "machina-build"], cwd=str(REPO_ROOT))
+    build_e2e_controller_image(MACHINA_E2E_IMAGE, REPO_ROOT / "bin" / "machina", "machina")
+    load_image_into_kind(MACHINA_E2E_IMAGE)
 
-    api_server = kubectl_capture([
-        "config", "view", "--minify", "--raw",
-        "-o", "jsonpath={.clusters[0].cluster.server}",
-    ])
-    if not api_server:
-        die("Could not determine API server URL from kubeconfig")
+    api_server = kind_api_server_url()
+    log("Rendering machina manifests...")
+    run([
+        "make", "machina-manifests",
+        f"MACHINA_IMAGE={MACHINA_E2E_IMAGE}",
+        f"MACHINA_API_SERVER_ENDPOINT={api_server}",
+    ], cwd=str(REPO_ROOT))
 
-    VM_DIR.mkdir(parents=True, exist_ok=True)
-    MACHINA_CONFIG_FILE.write_text(textwrap.dedent(f"""\
-        apiServerEndpoint: {api_server}
-        metricsAddr: "0"
-        probeAddr: "0"
-        enableLeaderElection: false
-        maxConcurrentReconciles: 10
-    """))
+    rendered = REPO_ROOT / "deploy" / "machina" / "rendered"
+    set_manifest_image_pull_policy(rendered / "04-deployment.yaml", "IfNotPresent")
+    log("Installing machina controller manifests...")
+    for manifest_path in [
+        rendered / "01-namespace.yaml",
+        rendered / "03-config.yaml",
+        rendered / "02-rbac.yaml",
+        rendered / "05-service.yaml",
+        rendered / "04-deployment.yaml",
+    ]:
+        apply_manifest(manifest_path)
 
-    if MACHINA_PID_FILE.exists():
-        old_pid = MACHINA_PID_FILE.read_text().strip()
-        if old_pid:
-            run_quiet(["kill", old_pid], check=False)
+    try:
+        wait_for_rollout("unbounded-kube", "deployment/machina-controller")
+    except subprocess.CalledProcessError:
+        print_controller_logs("unbounded-kube", "app=machina-controller")
+        die("machina controller rollout failed")
 
-    log("Starting machina controller in background...")
-    log(f"Machina logs: {MACHINA_LOG_FILE}")
-    log_file = MACHINA_LOG_FILE.open("w")
-    env = os.environ.copy()
-    # GitHub Actions uses RUNNER_TRACKING_ID to clean up processes it started.
-    # Clear it so the controller survives across later workflow steps.
-    env["RUNNER_TRACKING_ID"] = ""
-    proc = subprocess.Popen(
-        [MACHINA, "controller", f"--config={MACHINA_CONFIG_FILE}"],
-        cwd=str(REPO_ROOT),
-        env=env,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        text=True,
+    log("Machina controller deployed")
+
+
+# ---------------------------------------------------------------------------
+# validate-controllers-healthy
+# ---------------------------------------------------------------------------
+def validate_controllers_healthy() -> None:
+    """Verify e2e controllers are not crashing or repeating error logs."""
+
+    _validate_controller_health(
+        "unbounded-net",
+        "unbounded-net",
+        "app.kubernetes.io/name=unbounded-net-controller",
     )
-    log_file.close()
-    MACHINA_PID_FILE.write_text(str(proc.pid))
+    _validate_controller_health("machina", "unbounded-kube", "app=machina-controller")
 
-    time.sleep(3)
-    if proc.poll() is not None:
-        if MACHINA_LOG_FILE.exists():
-            print(MACHINA_LOG_FILE.read_text(), flush=True)
-        die(f"machina controller exited early with code {proc.returncode}")
-
-    log(f"Machina controller started (pid={proc.pid})")
+    log("Controllers are healthy")
 
 
 # ---------------------------------------------------------------------------
@@ -2121,8 +2430,7 @@ def validate_machina_controller() -> None:
             time.sleep(5)
             elapsed += 5
 
-        if MACHINA_LOG_FILE.exists():
-            print(MACHINA_LOG_FILE.read_text(), flush=True)
+        print_controller_logs("unbounded-kube", "app=machina-controller")
         die(f"MachineConfigurationVersion '{mcv_name}' was not ready after {timeout_secs}s")
 
     log(f"Validating machina controller with MachineConfiguration '{name}'...")
@@ -2507,15 +2815,13 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
         time.sleep(5)
         elapsed += 5
     else:
-        if MACHINA_LOG_FILE.exists():
-            print(MACHINA_LOG_FILE.read_text(), flush=True)
+        print_controller_logs("unbounded-kube", "app=machina-controller")
         die(f"No MachineConfigurationVersion reached Kubernetes {target_kubelet_version} after {timeout_secs}s")
 
     if target_version_number == 0 or not target_mcv:
         die("Resolved target MachineConfigurationVersion was empty")
 
     old_nspawn = active_nspawn_machine()
-    install_bpftool(old_nspawn)
     create_bpffs_sentinel(old_nspawn)
 
     log(f"Assigning Machine '{AGENT_MACHINE_NAME}' to {target_mcv}...")
@@ -2553,7 +2859,6 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     kubectl(["get", "machine", AGENT_MACHINE_NAME, "-o", "wide"])
     kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
 
-
 # ---------------------------------------------------------------------------
 # collect-logs
 # ---------------------------------------------------------------------------
@@ -2574,7 +2879,7 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
         "-o", "ConnectTimeout=5",
         "-i", str(vm_dir / "ssh" / "id_ed25519"),
     ]
-    ssh_target = f"ubuntu@{vm_ip}"
+    ssh_target = f"{VM_SSH_USER}@{vm_ip}"
 
     def ssh_log(name: str, command: str) -> None:
         _write_command_log(logs_dir / f"{prefix}{name}", ["ssh", *ssh_opts, ssh_target, command])
@@ -2582,12 +2887,19 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
     ssh_log("vm-journal.log", "sudo journalctl --no-pager -l")
     ssh_log("vm-unbounded-agent.log", "sudo journalctl -u unbounded-agent --no-pager -l")
     ssh_log("vm-unbounded-agent-daemon.log", "sudo journalctl -u unbounded-agent-daemon --no-pager -l")
+    ssh_log("vm-systemd-machined.log", "sudo journalctl -u systemd-machined --no-pager -l")
     ssh_log("vm-machines.txt", "sudo machinectl list --no-pager")
+    ssh_log("vm-nspawn-locks.txt", "sudo ls -la /run/systemd/nspawn/locks 2>&1 || true")
+    ssh_log("vm-lslocks.txt", "sudo lslocks || true")
+    ssh_log("vm-selinux-avc.txt", "sudo ausearch -m AVC,USER_AVC -ts recent 2>&1 || true")
     for machine in NSPAWN_MACHINE_NAMES:
         ssh_log(f"nspawn-{machine}-journal.log", f"sudo journalctl -M {machine} --no-pager -l")
         ssh_log(f"nspawn-{machine}-kubelet.log", f"sudo journalctl -M {machine} -u kubelet --no-pager -l")
         ssh_log(f"nspawn-{machine}-containerd.log", f"sudo journalctl -M {machine} -u containerd --no-pager -l")
         ssh_log(f"vm-machine-{machine}-status.txt", f"sudo machinectl status {machine} --no-pager")
+        ssh_log(f"vm-machine-{machine}-service-status.txt", f"sudo systemctl status systemd-nspawn@{machine}.service --no-pager")
+        ssh_log(f"vm-machine-{machine}-mounts.txt", f"sudo findmnt -R /var/lib/machines/{machine} 2>&1 || true")
+        ssh_log(f"vm-machine-{machine}-rootfs.txt", f"sudo ls -la /var/lib/machines/{machine} 2>&1 || true")
         ssh_log(
             f"nspawn-{machine}-units.txt",
             f"sudo machinectl shell {machine} /usr/bin/systemctl list-units --no-pager",
@@ -2613,13 +2925,14 @@ def collect_logs() -> None:
     else:
         _collect_one_vm_logs(logs_dir, VM_NAME, VM_IP, VM_DIR, "")
 
-    if MACHINA_LOG_FILE.exists():
-        shutil.copyfile(MACHINA_LOG_FILE, logs_dir / "machina-controller.log")
-
     _write_command_log(logs_dir / "nodes.txt", [KUBECTL, "get", "nodes", "-o", "wide"])
     _write_command_log(logs_dir / "nodes-describe.txt", [KUBECTL, "describe", "nodes"])
     _write_command_log(logs_dir / "pods.txt", [KUBECTL, "get", "pods", "-A", "-o", "wide"])
     _write_command_log(logs_dir / "events.txt", [KUBECTL, "get", "events", "-A", "--sort-by=.lastTimestamp"])
+    _write_command_log(logs_dir / "machina-controller.log", [KUBECTL, "logs", "-n", "unbounded-kube", "--all-containers", "--prefix", "-l", "app=machina-controller"])
+    _write_command_log(logs_dir / "machina-controller-previous.log", [KUBECTL, "logs", "-n", "unbounded-kube", "--all-containers", "--prefix", "--previous", "-l", "app=machina-controller"])
+    _write_command_log(logs_dir / "unbounded-net-controller.log", [KUBECTL, "logs", "-n", "unbounded-net", "--all-containers", "--prefix", "-l", "app.kubernetes.io/name=unbounded-net-controller"])
+    _write_command_log(logs_dir / "unbounded-net-controller-previous.log", [KUBECTL, "logs", "-n", "unbounded-net", "--all-containers", "--prefix", "--previous", "-l", "app.kubernetes.io/name=unbounded-net-controller"])
     _write_command_log(logs_dir / "kindnet.log", [KUBECTL, "logs", "-n", "kube-system", "--all-containers", "--prefix", "-l", "app=kindnet"])
     _write_command_log(logs_dir / "kindnet-previous.log", [KUBECTL, "logs", "-n", "kube-system", "--all-containers", "--prefix", "--previous", "-l", "app=kindnet"])
     _write_command_log(logs_dir / "machines.txt", [KUBECTL, "get", "machines", "-o", "wide"])
@@ -2660,14 +2973,6 @@ def collect_logs() -> None:
 # ---------------------------------------------------------------------------
 def cleanup() -> None:
     """Tear down VM, networking, and Kind cluster."""
-
-    # Stop locally running machina controller if this e2e started one.
-    if MACHINA_PID_FILE.exists():
-        pid = MACHINA_PID_FILE.read_text().strip()
-        if pid:
-            log(f"Stopping machina controller pid {pid}...")
-            run_quiet(["kill", pid], check=False)
-        MACHINA_PID_FILE.unlink(missing_ok=True)
 
     # Stop QEMU VM
     _stop_qemu()
@@ -2755,8 +3060,10 @@ COMMANDS: dict[str, Command] = {
     "validate-kube-proxy": _without_node_config(validate_kube_proxy),
     "validate-workload": _without_node_config(validate_workload),
     "install-machine-crd": _without_node_config(install_machine_crd),
+    "deploy-unbounded-net-controller": _without_node_config(deploy_unbounded_net_controller),
     "start-machina-controller": _without_node_config(start_machina_controller),
     "validate-machina-controller": _without_node_config(validate_machina_controller),
+    "validate-controllers-healthy": _without_node_config(validate_controllers_healthy),
     "delete-machine-cr": _without_node_config(delete_machine_cr),
     "validate-machine-cr-created": validate_machine_cr_created,
     "validate-node-reboot-operation": _without_node_config(validate_node_reboot_operation),
