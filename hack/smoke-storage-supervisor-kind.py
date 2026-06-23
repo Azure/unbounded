@@ -76,6 +76,12 @@ class Pod:
     ip: str
 
 
+@dataclass(frozen=True)
+class Node:
+    name: str
+    ip: str
+
+
 class PortForward:
     def __init__(self, pod: str, remote_port: int) -> None:
         self.local_port = free_port()
@@ -454,6 +460,33 @@ def deploy() -> None:
     )
 
 
+def cluster_nodes() -> list[Node]:
+    proc = kubectl(["get", "nodes", "-o", "json"], capture=True)
+    obj = json.loads(proc.stdout)
+    out: list[Node] = []
+    for item in obj.get("items", []):
+        name = item.get("metadata", {}).get("name", "")
+        addresses = item.get("status", {}).get("addresses", [])
+        ip = ""
+        for address in addresses:
+            if address.get("type") == "InternalIP":
+                ip = address.get("address", "")
+                break
+        if name and ip:
+            out.append(Node(name=name, ip=ip))
+    return sorted(out, key=lambda n: n.name)
+
+
+def benchmark_nodes() -> tuple[Node, Node]:
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        ready = cluster_nodes()
+        if len(ready) >= 2:
+            return ready[0], ready[1]
+        time.sleep(2)
+    die("timed out waiting for two kind nodes")
+
+
 def pods() -> list[Pod]:
     proc = kubectl(
         [
@@ -493,13 +526,21 @@ def wait_for_pods() -> tuple[Pod, Pod]:
     die("timed out waiting for two running supervisor pods")
 
 
-def annotate_nodes(source: Pod, target: Pod) -> None:
+def pod_on_node(ready: tuple[Pod, Pod], node: Node) -> Pod:
+    for pod in ready:
+        if pod.node == node.name:
+            return pod
+    die(f"missing supervisor pod on source node {node.name}")
+    raise RuntimeError("unreachable")
+
+
+def annotate_nodes(source: Node, target: Node) -> None:
     kubectl(
         [
             "label",
             "node",
-            source.node,
-            target.node,
+            source.name,
+            target.name,
             "unbounded-cloud.io/storage-ring=e2e",
             "--overwrite",
         ]
@@ -508,7 +549,7 @@ def annotate_nodes(source: Pod, target: Pod) -> None:
         [
             "annotate",
             "node",
-            target.node,
+            target.name,
             f"unbounded-cloud.io/storage-tcp.addr={target.ip}:{FABRIC_PORT}",
             "--overwrite",
         ]
@@ -517,9 +558,9 @@ def annotate_nodes(source: Pod, target: Pod) -> None:
         [
             "annotate",
             "node",
-            source.node,
+            source.name,
             "unbounded-cloud.io/storage-benchmark.scenario=tcp-cache-miss",
-            f"unbounded-cloud.io/storage-benchmark.target-node={target.node}",
+            f"unbounded-cloud.io/storage-benchmark.target-node={target.name}",
             f"unbounded-cloud.io/storage-tcp.addr={source.ip}:{FABRIC_PORT}",
             "unbounded-cloud.io/storage-benchmark.workers=1",
             "unbounded-cloud.io/storage-benchmark.object-count=8",
@@ -642,11 +683,14 @@ def main() -> int:
     try:
         ensure_cluster()
         prepare_image()
+        source_node, target_node = benchmark_nodes()
+        log(f"source node {source_node.name} at {source_node.ip}")
+        log(f"target node {target_node.name} at {target_node.ip}")
+        annotate_nodes(source_node, target_node)
         deploy()
-        source, target = wait_for_pods()
+        ready = wait_for_pods()
+        source = pod_on_node(ready, source_node)
         log(f"source pod {source.name} on {source.node} at {source.ip}")
-        log(f"target pod {target.name} on {target.node} at {target.ip}")
-        annotate_nodes(source, target)
         wait_for_benchmark(source)
         return 0
     except Exception as exc:
