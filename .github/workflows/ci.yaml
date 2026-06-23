@@ -7,15 +7,9 @@ on:
   push:
     branches:
       - main
-    paths-ignore:
-      - "docs/**"
-      - "designs/**"
   pull_request:
     branches:
       - main
-    paths-ignore:
-      - "docs/**"
-      - "designs/**"
   workflow_dispatch:
 
 # Cancel in-progress runs for the same branch/PR to avoid wasted runner time.
