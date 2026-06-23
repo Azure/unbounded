@@ -15,7 +15,6 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/phases/rootfs/debootstrap"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs/oci"
 )
 
@@ -31,8 +30,8 @@ type ensureNSpawnWorkspace struct {
 	goalState *goalstates.RootFS
 }
 
-// EnsureNSpawnWorkspace returns a task that bootstraps an Ubuntu rootfs into
-// the machine directory (if it is empty or missing) and writes the
+// EnsureNSpawnWorkspace returns a task that bootstraps an OCI rootfs into the
+// machine directory (if it is empty or missing) and writes the
 // systemd-nspawn configuration files needed to run a Kubernetes node inside a
 // nspawn container.
 func EnsureNSpawnWorkspace(log *slog.Logger, goalState *goalstates.RootFS) phases.Task {
@@ -54,14 +53,7 @@ func (e *ensureNSpawnWorkspace) Do(ctx context.Context) error {
 }
 
 func (e *ensureNSpawnWorkspace) bootstrapWorkspace(ctx context.Context) error {
-	var bootstrapTask phases.Task
-
-	if image := e.goalState.OCIImage; image != "" {
-		bootstrapTask = oci.DownloadRootFS(e.log, e.goalState.MachineDir, e.goalState.HostArch, image)
-	} else {
-		bootstrapTask = debootstrap.Ubuntu(e.log, e.goalState.MachineDir)
-	}
-
+	bootstrapTask := oci.DownloadRootFS(e.log, e.goalState.MachineDir, e.goalState.HostArch, e.goalState.OCIImage)
 	return phases.ExecuteTask(ctx, e.log, bootstrapTask)
 }
 
