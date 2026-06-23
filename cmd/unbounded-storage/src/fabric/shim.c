@@ -69,6 +69,45 @@ int ub_fi_endpoint(struct fid_domain *domain, struct fi_info *info,
     return fi_endpoint(domain, info, ep, context);
 }
 
+struct fi_info *ub_fi_dupinfo_with_dest(const struct fi_info *base,
+                                        const void *dest_addr,
+                                        size_t dest_addrlen) {
+    if (!base || !dest_addr || dest_addrlen == 0) {
+        return NULL;
+    }
+
+    struct fi_info *copy = fi_dupinfo(base);
+    if (!copy) {
+        return NULL;
+    }
+
+    void *dest = malloc(dest_addrlen);
+    if (!dest) {
+        fi_freeinfo(copy);
+        return NULL;
+    }
+    memcpy(dest, dest_addr, dest_addrlen);
+
+    free(copy->dest_addr);
+    copy->dest_addr = dest;
+    copy->dest_addrlen = dest_addrlen;
+
+    const struct sockaddr *sa = (const struct sockaddr *)dest_addr;
+    switch (sa->sa_family) {
+    case AF_INET:
+        copy->addr_format = FI_SOCKADDR_IN;
+        break;
+    case AF_INET6:
+        copy->addr_format = FI_SOCKADDR_IN6;
+        break;
+    default:
+        copy->addr_format = FI_SOCKADDR_IB;
+        break;
+    }
+
+    return copy;
+}
+
 int ub_fi_domain(struct fid_fabric *fabric, struct fi_info *info,
                  struct fid_domain **domain, void *context) {
     return fi_domain(fabric, info, domain, context);
@@ -727,6 +766,11 @@ ssize_t ub_fi_parse_sockaddr(const char *s, uint8_t *out, size_t out_cap) {    i
 ssize_t ub_fi_format_sockaddr(const void *addr, size_t addrlen, char *out,
                               size_t cap) {
     if (!addr || !out || cap == 0) {
+        return -FI_EINVAL;
+    }
+    sa_family_t family = ((const struct sockaddr *)addr)->sa_family;
+    if (family != AF_INET && family != AF_INET6) {
+        out[0] = '\0';
         return -FI_EINVAL;
     }
     char host[NI_MAXHOST];

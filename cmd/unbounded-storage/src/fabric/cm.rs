@@ -467,6 +467,8 @@ pub(crate) fn connect(
     let qps = qps.max(1);
 
     let dest_addr = encode_connect_addr(dest)?;
+    let active_info = active_info_for_dest(info, dest, &dest_addr)?;
+    let info = active_info.as_ref().map(|g| g.0).unwrap_or(info);
 
     let eq = open_eq(fabric)?;
     let eq_guard = FidGuard(ffi::as_fid_eq(eq));
@@ -531,6 +533,24 @@ fn encode_connect_addr(dest: &FabricAddress) -> Result<Vec<u8>> {
         FabricAddress::Socket(addr) => encode_socket_addr(addr),
         FabricAddress::Native(addr) => decode_native_addr(addr),
     }
+}
+
+fn active_info_for_dest(
+    info: *mut ffi::fi_info,
+    _dest: &FabricAddress,
+    dest_addr: &[u8],
+) -> Result<Option<FreeInfoGuard>> {
+    let active = unsafe {
+        ffi::ub_fi_dupinfo_with_dest(
+            info,
+            dest_addr.as_ptr() as *const std::ffi::c_void,
+            dest_addr.len(),
+        )
+    };
+    if active.is_null() {
+        return Err(FabricError::Pkg("ub_fi_dupinfo_with_dest", 0));
+    }
+    Ok(Some(FreeInfoGuard(active)))
 }
 
 fn encode_socket_addr(dest: &str) -> Result<Vec<u8>> {

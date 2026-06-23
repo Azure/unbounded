@@ -330,6 +330,11 @@ unsafe extern "C" {
         ep: *mut *mut fid_ep,
         context: *mut c_void,
     ) -> c_int;
+    pub fn ub_fi_dupinfo_with_dest(
+        base: *mut fi_info,
+        dest_addr: *const c_void,
+        dest_addrlen: usize,
+    ) -> *mut fi_info;
     pub fn ub_fi_enable(ep: *mut fid_ep) -> c_int;
     pub fn ub_fi_av_open(
         domain: *mut fid_domain,
