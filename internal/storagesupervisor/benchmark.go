@@ -236,6 +236,7 @@ func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Nod
 
 	diskPath := ""
 	diskSizeBytes := uint64(0)
+
 	if cacheMiss {
 		diskPath = strings.TrimSpace(source.Annotations[benchmarkDiskPathAnnotation])
 		if diskPath == "" {

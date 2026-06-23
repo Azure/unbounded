@@ -180,6 +180,7 @@ def container_engine() -> str:
         if shutil.which(candidate):
             return candidate
     die("required container engine not found in PATH: docker or podman")
+    raise RuntimeError("unreachable")
 
 
 def storage_tarball() -> Path:
