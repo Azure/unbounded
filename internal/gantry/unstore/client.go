@@ -43,7 +43,7 @@ type clientMetrics struct {
 	onPull        func(kind string)
 	onHit         func(kind string)
 	onMiss        func(kind string)
-	onUnavailable func()
+	onUnavailable func(kind string)
 }
 
 // Option configures a Client.
@@ -68,7 +68,7 @@ func WithMetrics(
 	pull func(kind string),
 	hit func(kind string),
 	miss func(kind string),
-	unavailable func(),
+	unavailable func(kind string),
 ) Option {
 	return func(c *Client) {
 		c.metrics = clientMetrics{
@@ -130,12 +130,17 @@ func (c *Client) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser,
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
+		if err := resp.Body.Close(); err != nil {
+			c.logger.Warn("unstore: closing non-OK response body", slog.Any("err", err))
+		}
 
 		return nil, 0, c.transient(ref, fmt.Errorf("HTTP %d", resp.StatusCode))
 	}
 
-	size, _ := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+	size, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+	if err != nil {
+		size = -1
+	}
 
 	if c.metrics.onHit != nil {
 		c.metrics.onHit(kind)
@@ -158,13 +163,20 @@ func (c *Client) Head(ctx context.Context, ref ifaces.OriginRef) (int64, string,
 		return 0, "", c.classifyNetErr(ref, err)
 	}
 
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			c.logger.Warn("unstore: closing HEAD response body", slog.Any("err", err))
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return 0, "", c.transient(ref, fmt.Errorf("HTTP %d", resp.StatusCode))
 	}
 
-	size, _ := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+	size, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+	if err != nil {
+		size = -1
+	}
 
 	return size, resp.Header.Get("Content-Type"), nil
 }
@@ -215,7 +227,8 @@ func (c *Client) classifyNetErr(ref ifaces.OriginRef, err error) *ifaces.OriginE
 }
 
 func (c *Client) miss(ref ifaces.OriginRef, kind string, err error) *ifaces.OriginError {
-	c.logger.Warn("unstore: cache miss (connection closed before response)",
+	c.logger.Warn(
+		"unstore: cache miss (connection closed before response)",
 		slog.String("digest", ref.Digest.String()),
 	)
 
@@ -227,13 +240,14 @@ func (c *Client) miss(ref ifaces.OriginRef, kind string, err error) *ifaces.Orig
 }
 
 func (c *Client) transient(ref ifaces.OriginRef, err error) *ifaces.OriginError {
-	c.logger.Warn("unstore: transient error",
+	c.logger.Warn(
+		"unstore: transient error",
 		slog.String("digest", ref.Digest.String()),
 		slog.Any("err", err),
 	)
 
 	if c.metrics.onUnavailable != nil {
-		c.metrics.onUnavailable()
+		c.metrics.onUnavailable(ref.Kind.MetricLabel())
 	}
 
 	return &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: err}

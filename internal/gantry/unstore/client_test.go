@@ -29,6 +29,7 @@ func ref(repo, dgst string, kind ifaces.OriginRefKind) ifaces.OriginRef {
 
 func TestPull_Hit(t *testing.T) {
 	body := "hello blob"
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/library/nginx/blobs/sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" {
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -41,6 +42,7 @@ func TestPull_Hit(t *testing.T) {
 	defer srv.Close()
 
 	c := unstore.New(srv.URL, 0)
+
 	rc, size, err := c.Pull(context.Background(), ref("library/nginx", "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", ifaces.KindBlob))
 	if err != nil {
 		t.Fatalf("Pull: %v", err)
@@ -71,6 +73,7 @@ func TestPull_ManifestPath(t *testing.T) {
 	defer srv.Close()
 
 	c := unstore.New(srv.URL, 0)
+
 	rc, _, err := c.Pull(context.Background(), ref("library/nginx", "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", ifaces.KindManifest))
 	if err != nil {
 		t.Fatalf("Pull manifest: %v", err)
@@ -151,6 +154,7 @@ func TestPull_Timeout(t *testing.T) {
 	defer srv.Close()
 
 	c := unstore.New(srv.URL, 100*time.Millisecond)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -179,6 +183,7 @@ func TestHead_Hit(t *testing.T) {
 	defer srv.Close()
 
 	c := unstore.New(srv.URL, 0)
+
 	size, ct, err := c.Head(context.Background(), ref("library/nginx", "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", ifaces.KindBlob))
 	if err != nil {
 		t.Fatalf("Head: %v", err)

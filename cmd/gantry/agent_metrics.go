@@ -23,12 +23,16 @@ import (
 
 // phase1Metrics groups the metric subset that emits.
 type phase1Metrics struct {
-	cacheHit           prometheus.Counter
-	cacheMiss          prometheus.Counter
-	originPullTotal    *prometheus.CounterVec
-	originPullSuccess  *prometheus.CounterVec
-	originPullFailure  *prometheus.CounterVec
-	originFailureTotal *prometheus.CounterVec
+	cacheHit               prometheus.Counter
+	cacheMiss              prometheus.Counter
+	originPullTotal        *prometheus.CounterVec
+	originPullSuccess      *prometheus.CounterVec
+	originPullFailure      *prometheus.CounterVec
+	originFailureTotal     *prometheus.CounterVec
+	cacheOriginPull        *prometheus.CounterVec
+	cacheOriginHit         *prometheus.CounterVec
+	cacheOriginMiss        *prometheus.CounterVec
+	cacheOriginUnavailable *prometheus.CounterVec
 }
 
 func newPhase1Metrics(reg *metrics.Registry) *phase1Metrics {
@@ -57,6 +61,22 @@ func newPhase1Metrics(reg *metrics.Registry) *phase1Metrics {
 			Name: "p2p_origin_failure_total",
 			Help: "Origin failures observed by the mirror, by class.",
 		}, []string{"class"}),
+		cacheOriginPull: reg.NewCounterVec("origin", prometheus.CounterOpts{
+			Name: "p2p_cache_origin_pull_total",
+			Help: "Pulls attempted against a cache origin entry (unbounded-storage), labeled by kind.",
+		}, []string{"kind"}),
+		cacheOriginHit: reg.NewCounterVec("origin", prometheus.CounterOpts{
+			Name: "p2p_cache_origin_hit_total",
+			Help: "Cache origin pulls that returned data (200 OK), labeled by kind.",
+		}, []string{"kind"}),
+		cacheOriginMiss: reg.NewCounterVec("origin", prometheus.CounterOpts{
+			Name: "p2p_cache_origin_miss_total",
+			Help: "Cache origin pulls that returned FailureNotFound (TCP close before response), labeled by kind.",
+		}, []string{"kind"}),
+		cacheOriginUnavailable: reg.NewCounterVec("origin", prometheus.CounterOpts{
+			Name: "p2p_cache_origin_unavailable_total",
+			Help: "Cache origin pulls that returned FailureTransient (connection refused, timeout, non-200), labeled by kind.",
+		}, []string{"kind"}),
 	}
 }
 

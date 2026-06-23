@@ -10,6 +10,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/origin"
+	"github.com/Azure/unbounded/internal/gantry/unstore"
 )
 
 // buildOriginClients constructs the two origin.Client instances the
@@ -24,6 +25,10 @@ import (
 // requesting containerd; live mirror traffic uses
 // gantry_origin_stream_* + gantry_containerd_commit_{observed,
 // missing_after_stream}_total instead.
+//
+// When CacheOrigins are configured, both puller and mirror are wrapped in a
+// PriorityChain that consults each cache entry before falling back to the OCI
+// registry client.
 //
 // The returned bgSuccess and bgDownstreamFailure closures are wired
 // into the puller pump (see newPullerPump in main.go) so the puller
@@ -66,7 +71,8 @@ func buildOriginClients(
 		inst.originPullFailure.WithLabelValues(kind, class).Inc()
 	}
 
-	puller, err = origin.New(c,
+	ociPuller, err := origin.New(
+		c,
 		origin.WithLogger(logger),
 		origin.WithMetrics(
 			func(kind string) { inst.originPullTotal.WithLabelValues(kind).Inc() },
@@ -100,10 +106,42 @@ func buildOriginClients(
 		return nil, nil, nil, nil, fmt.Errorf("origin: %w", err)
 	}
 
-	mirror, err = origin.New(c, origin.WithLogger(logger))
+	ociMirror, err := origin.New(c, origin.WithLogger(logger))
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("mirror origin: %w", err)
 	}
 
+	cacheEntries := buildCacheOriginEntries(c, inst, logger)
+
+	puller = origin.NewPriorityChain(cacheEntries, ociPuller, logger)
+	mirror = origin.NewPriorityChain(cacheEntries, ociMirror, logger)
+
 	return puller, mirror, bgSuccess, bgDownstreamFailure, nil
+}
+
+// buildCacheOriginEntries builds the ordered list of cache OriginPullers from
+// the CacheOrigins config. Returns nil (empty chain) if none are configured.
+func buildCacheOriginEntries(c *config.Config, inst *phase1Metrics, logger *slog.Logger) []ifaces.OriginPuller {
+	if len(c.CacheOrigins) == 0 {
+		return nil
+	}
+
+	entries := make([]ifaces.OriginPuller, 0, len(c.CacheOrigins))
+
+	for _, spec := range c.CacheOrigins {
+		client := unstore.New(
+			spec.Endpoint,
+			0, // use default 30s timeout
+			unstore.WithLogger(logger),
+			unstore.WithMetrics(
+				func(kind string) { inst.cacheOriginPull.WithLabelValues(kind).Inc() },
+				func(kind string) { inst.cacheOriginHit.WithLabelValues(kind).Inc() },
+				func(kind string) { inst.cacheOriginMiss.WithLabelValues(kind).Inc() },
+				func(kind string) { inst.cacheOriginUnavailable.WithLabelValues(kind).Inc() },
+			),
+		)
+		entries = append(entries, client)
+	}
+
+	return entries
 }
