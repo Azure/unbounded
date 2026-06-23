@@ -8,6 +8,9 @@ data:
   config.yaml: |
     # Machina Controller Configuration
 
+    # Kubernetes API server endpoint advertised to provisioned machines.
+    apiServerEndpoint: "{{ default "" .APIServerEndpoint }}"
+
     # Address to bind metrics endpoint
     metricsAddr: ":8080"
 

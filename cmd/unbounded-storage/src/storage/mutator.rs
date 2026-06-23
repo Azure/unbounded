@@ -328,9 +328,15 @@ impl Future for YieldOnce {
 mod tests {
     use super::*;
     use crate::runtime::noop_waker;
+    use crate::storage::btree::LeafEntry;
+    use crate::storage::types::{Checksum, Lba};
+    use proptest::collection::vec;
+    use proptest::prelude::*;
     use std::future::Future;
     use std::pin::pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
+    use std::task::{Wake, Waker};
 
     fn block_on<F: Future>(f: F) -> F::Output {
         let w = noop_waker();
@@ -462,5 +468,206 @@ mod tests {
         let (batch, pendings) = drive_drain(&q, 8, 8, || panic!("closed queue must not yield"));
         assert_eq!(pendings, 0);
         assert_eq!(batch.len(), 2);
+    }
+
+    struct CountWaker {
+        count: Arc<AtomicUsize>,
+    }
+
+    impl Wake for CountWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct ProducerState {
+        wait: Option<Pin<Box<ReplyWait>>>,
+        wake_count: Arc<AtomicUsize>,
+        accepted: bool,
+        completed: bool,
+    }
+
+    struct ConsumerState {
+        wait: Pin<Box<WaitNonEmpty>>,
+        wake_count: Arc<AtomicUsize>,
+        pending_before_wake: Option<usize>,
+        exited: bool,
+    }
+
+    impl ConsumerState {
+        fn new(queue: &Arc<MutatorQueue>) -> Self {
+            Self {
+                wait: Box::pin(queue.wait_nonempty()),
+                wake_count: Arc::new(AtomicUsize::new(0)),
+                pending_before_wake: None,
+                exited: false,
+            }
+        }
+    }
+
+    fn count_waker(count: Arc<AtomicUsize>) -> Waker {
+        Arc::new(CountWaker { count }).into()
+    }
+
+    fn page_key(i: u32) -> PageKey {
+        PageKey::new([i as u8; 32], i)
+    }
+
+    fn leaf_entry(i: u64) -> LeafEntry {
+        LeafEntry {
+            lba: Lba(i),
+            data_checksum: Checksum(0),
+            byte_len: 4096,
+        }
+    }
+
+    fn poll_reply(producer: &mut ProducerState) {
+        let Some(wait) = producer.wait.as_mut() else {
+            return;
+        };
+        let waker = count_waker(producer.wake_count.clone());
+        let mut cx = Context::from_waker(&waker);
+        match wait.as_mut().poll(&mut cx) {
+            Poll::Ready(_) => {
+                producer.completed = true;
+                producer.wait = None;
+            }
+            Poll::Pending => {}
+        }
+    }
+
+    fn push_request(
+        queue: &Arc<MutatorQueue>,
+        producer: &mut ProducerState,
+        idx: usize,
+        variant: u8,
+    ) -> bool {
+        if producer.wait.is_some() || producer.completed {
+            return false;
+        }
+
+        let reply = MutatorReply::new();
+        let req = if variant % 2 == 0 {
+            MutatorReq::Insert {
+                key: page_key(idx as u32),
+                entry: leaf_entry(idx as u64 + 10),
+                done: reply.clone(),
+            }
+        } else {
+            MutatorReq::Delete {
+                keys: vec![page_key(idx as u32)],
+                done: reply.clone(),
+            }
+        };
+        queue.push(req);
+        producer.accepted = !queue.is_closed();
+        producer.wait = Some(Box::pin(reply.wait()));
+        true
+    }
+
+    fn poll_consumer(queue: &Arc<MutatorQueue>, consumer: &mut ConsumerState) {
+        if consumer.exited {
+            return;
+        }
+
+        let waker = count_waker(consumer.wake_count.clone());
+        let mut cx = Context::from_waker(&waker);
+        match consumer.wait.as_mut().poll(&mut cx) {
+            Poll::Pending => {
+                consumer.pending_before_wake = Some(consumer.wake_count.load(Ordering::SeqCst));
+            }
+            Poll::Ready(true) => {
+                if let Some(before) = consumer.pending_before_wake.take() {
+                    assert!(
+                        consumer.wake_count.load(Ordering::SeqCst) > before,
+                        "producer push did not wake parked mutator consumer",
+                    );
+                }
+
+                let batch = queue.try_drain_up_to(4);
+                assert!(!batch.is_empty(), "ready consumer drained no requests");
+                for req in batch {
+                    match req {
+                        MutatorReq::Insert { done, .. } => {
+                            done.set(MutatorOutcome::InsertCommitted { prior: None })
+                        }
+                        MutatorReq::Delete { done, .. } => {
+                            done.set(MutatorOutcome::DeleteCommitted)
+                        }
+                    }
+                }
+                consumer.wait = Box::pin(queue.wait_nonempty());
+            }
+            Poll::Ready(false) => {
+                assert!(queue.is_closed_and_empty());
+                consumer.exited = true;
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn randomized_queue_wakeup_close_and_reply_interleavings(
+            ops in vec((0usize..8, 0u8..5), 1..200),
+        ) {
+            let queue = Arc::new(MutatorQueue::new());
+            let mut producers: Vec<ProducerState> = (0..8).map(|_| ProducerState::default()).collect();
+            let mut consumer = ConsumerState::new(&queue);
+            let mut closed = false;
+
+            for (actor, op) in ops {
+                match op {
+                    0 | 1 => {
+                        let pushed = push_request(&queue, &mut producers[actor], actor, op);
+                        if closed && pushed {
+                            poll_reply(&mut producers[actor]);
+                            prop_assert!(
+                                producers[actor].completed,
+                                "push after close did not fail reply inline",
+                            );
+                        }
+                    }
+                    2 => poll_reply(&mut producers[actor]),
+                    3 => poll_consumer(&queue, &mut consumer),
+                    4 => {
+                        queue.close();
+                        closed = true;
+                        poll_consumer(&queue, &mut consumer);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            queue.close();
+            for _ in 0..64 {
+                poll_consumer(&queue, &mut consumer);
+                for producer in &mut producers {
+                    poll_reply(producer);
+                }
+                if consumer.exited {
+                    break;
+                }
+            }
+
+            prop_assert!(consumer.exited, "consumer did not observe closed-empty queue");
+            prop_assert_eq!(queue.pending_len(), 0, "mutator queue leaked pending requests");
+            for (idx, producer) in producers.iter().enumerate() {
+                prop_assert!(
+                    producer.completed || !producer.accepted,
+                    "accepted producer {} did not receive exactly one reply",
+                    idx,
+                );
+            }
+        }
     }
 }

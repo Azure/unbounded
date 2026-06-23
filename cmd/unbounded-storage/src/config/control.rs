@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvError, Sender};
 
 use crate::config::{Config, ConfigDiff};
-use crate::p2p::RoutingSnapshot;
+use crate::p2p::RouteTableSnapshot;
 use crate::runtime::WorkerIdx;
 
 /// A command delivered to a single shard's control channel. The shard
@@ -53,10 +53,9 @@ pub enum ShardCommand {
 pub struct ShardApply {
     /// The new, defaults-applied, validated configuration.
     pub config: Arc<Config>,
-    /// The routing table rebuilt from `config`. Published into the
-    /// shard's [`RoutingHandle`] so the transport and recursive handler
-    /// observe it atomically.
-    pub routing: RoutingSnapshot,
+    /// The route table rebuilt from `config`. Published into the shard's
+    /// route-table handle so transports observe it atomically.
+    pub routes: RouteTableSnapshot,
     /// Channel the shard sends its [`ShardAck`] on once the apply has
     /// completed on the shard thread.
     pub ack: Sender<ShardAck>,
@@ -80,6 +79,9 @@ pub enum ApplyError {
     AckDisconnected { expected: usize, received: usize },
     /// One or more shards reported a failure while applying.
     ShardApply(Vec<(WorkerIdx, String)>),
+    /// The process-level apply target rejected the config before shard
+    /// broadcast.
+    Target(String),
 }
 
 impl fmt::Display for ApplyError {
@@ -99,6 +101,7 @@ impl fmt::Display for ApplyError {
                 }
                 Ok(())
             }
+            ApplyError::Target(e) => write!(f, "apply target rejected config: {e}"),
         }
     }
 }
@@ -350,7 +353,7 @@ impl ShardControlGroup {
         self.senders.is_empty()
     }
 
-    /// Send `config` + `routing` to every shard and block until all of
+    /// Send `config` + `routes` to every shard and block until all of
     /// them acknowledge.
     ///
     /// Returns `Ok(())` only when every shard reports success. If a
@@ -362,7 +365,7 @@ impl ShardControlGroup {
     pub fn broadcast_apply(
         &self,
         config: Arc<Config>,
-        routing: RoutingSnapshot,
+        routes: RouteTableSnapshot,
     ) -> Result<(), ApplyError> {
         let expected = self.senders.len();
         if expected == 0 {
@@ -374,7 +377,7 @@ impl ShardControlGroup {
         for (worker, sender) in &self.senders {
             let cmd = ShardCommand::ApplyConfig(ShardApply {
                 config: config.clone(),
-                routing: routing.clone(),
+                routes: routes.clone(),
                 ack: ack_tx.clone(),
             });
             sender
@@ -415,25 +418,15 @@ impl ShardControlGroup {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::thread;
 
     use super::*;
-    use crate::p2p::{FingerTable, FingerTableConfig, PeerEntry, RoutingSnapshot, node_to_ring};
+    use crate::p2p::RouteTableSnapshot;
 
-    fn empty_routing() -> RoutingSnapshot {
-        let local = PeerEntry {
-            node: crate::p2p::NodeId(0),
-            ring: node_to_ring(crate::p2p::NodeId(0)),
-            labels: crate::p2p::TopologyLabels(Vec::new()),
-        };
-        let fingers = FingerTable::build(local, &[], FingerTableConfig { k: 1 });
-        RoutingSnapshot {
-            fingers: Arc::new(fingers),
-            node_to_peer: Arc::new(HashMap::new()),
-        }
+    fn empty_routes() -> RouteTableSnapshot {
+        RouteTableSnapshot::default()
     }
 
     /// Spawn `n` mock shard threads that drain a control channel and ack
@@ -475,7 +468,7 @@ mod tests {
         let (senders, joins) = spawn_mock_shards(vec![Ok(()), Ok(()), Ok(())]);
         let group = ShardControlGroup::new(senders);
 
-        let out = group.broadcast_apply(Arc::new(Config::default()), empty_routing());
+        let out = group.broadcast_apply(Arc::new(Config::default()), empty_routes());
         assert!(out.is_ok(), "expected success, got {out:?}");
 
         // Closing the group drops the senders so the mock shard threads
@@ -492,7 +485,7 @@ mod tests {
         let group = ShardControlGroup::new(senders);
 
         let err = group
-            .broadcast_apply(Arc::new(Config::default()), empty_routing())
+            .broadcast_apply(Arc::new(Config::default()), empty_routes())
             .expect_err("a failing shard must surface as an error");
         match err {
             ApplyError::ShardApply(failures) => {
@@ -515,7 +508,7 @@ mod tests {
         assert!(group.is_empty());
         assert!(
             group
-                .broadcast_apply(Arc::new(Config::default()), empty_routing())
+                .broadcast_apply(Arc::new(Config::default()), empty_routes())
                 .is_ok()
         );
     }
@@ -530,7 +523,7 @@ mod tests {
         let group = ShardControlGroup::new(senders);
 
         let err = group
-            .broadcast_apply(Arc::new(Config::default()), empty_routing())
+            .broadcast_apply(Arc::new(Config::default()), empty_routes())
             .expect_err("closed channel must error");
         assert!(matches!(err, ApplyError::ShardSend(WorkerIdx(99))));
 
@@ -568,15 +561,37 @@ mod tests {
         let mut c = Config::default();
         c.apply_defaults();
         c.version = version;
-        c.p2p.as_mut().unwrap().local_node_id = Some(0);
-        c.peers.push(crate::config::PeerSpec {
-            id: 1,
-            transport: 0,
-            address: "127.0.0.1:9999".to_string(),
-            hca_numa: None,
-            labels: Vec::new(),
+        c.backends.push(crate::config::BackendSpec {
+            name: "b".to_string(),
+            config: Some(crate::config::backend_spec::Config::Fake(
+                crate::config::FakeBackendConfig {
+                    stripe_size_bytes: Some(4 * 1024 * 1024),
+                    object_size_bytes: Some(1024 * 1024),
+                },
+            )),
+        });
+        c.neighborhoods.push(crate::config::NeighborhoodSpec {
+            name: "n".to_string(),
+            source: "b".to_string(),
+            fingers_per_node: Some(100),
+            local_node_id: Some(0),
+            local_tags: Vec::new(),
+            routing_plan: None,
+            peers: vec![tcp_peer(1, "127.0.0.1:9999")],
         });
         c
+    }
+
+    fn tcp_peer(id: u64, addr: &str) -> crate::config::PeerSpec {
+        crate::config::PeerSpec {
+            id,
+            tags: Vec::new(),
+            config: Some(crate::config::peer_spec::Config::Tcp(
+                crate::config::TcpPeerConfig {
+                    addr: addr.to_string(),
+                },
+            )),
+        }
     }
 
     #[test]
@@ -613,13 +628,9 @@ mod tests {
         let mut ctrl = ConfigController::new(RecordingTarget::default(), base.clone());
 
         let mut next = config_with_peer(2);
-        next.peers.push(crate::config::PeerSpec {
-            id: 2,
-            transport: 0,
-            address: "127.0.0.1:9998".to_string(),
-            hca_numa: None,
-            labels: Vec::new(),
-        });
+        next.neighborhoods[0]
+            .peers
+            .push(tcp_peer(2, "127.0.0.1:9998"));
 
         let out = ctrl.apply(Arc::new(next)).unwrap();
         assert_eq!(out.tier, ApplyTier::InPlace);
@@ -640,12 +651,14 @@ mod tests {
 
         let mut next = config_with_peer(3);
         next.backends.push(crate::config::schema::BackendSpec {
-            id: "b".to_string(),
-            kind: 0,
-            endpoint: "https://example.com".to_string(),
-            stripe_size_bytes: 4 * 1024 * 1024,
-            http_concurrency: 64,
-            bucket: None,
+            name: "b".to_string(),
+            config: Some(crate::config::backend_spec::Config::Http(
+                crate::config::HttpBackendConfig {
+                    url: "https://example.com".to_string(),
+                    stripe_size_bytes: Some(4 * 1024 * 1024),
+                    http_concurrency: Some(64),
+                },
+            )),
         });
 
         // A backend change is now reconciled in place on the live shard
@@ -668,19 +681,18 @@ mod tests {
         let mut ctrl = ConfigController::new(target, base.clone());
 
         let mut next = config_with_peer(5);
-        next.peers.push(crate::config::PeerSpec {
-            id: 2,
-            transport: 0,
-            address: "127.0.0.1:9998".to_string(),
-            hca_numa: None,
-            labels: Vec::new(),
-        });
+        next.neighborhoods[0]
+            .peers
+            .push(tcp_peer(2, "127.0.0.1:9998"));
         let next = Arc::new(next);
 
         assert!(ctrl.apply(next.clone()).is_err());
         // Current must still be the original so a retry re-derives the
         // same diff.
-        assert_eq!(ctrl.current().peers.len(), base.peers.len());
+        assert_eq!(
+            ctrl.current().neighborhoods[0].peers.len(),
+            base.neighborhoods[0].peers.len()
+        );
         // A failed apply records the version as known (we loaded it) but
         // must NOT advance the applied version: the process did not
         // converge on the submitted config.
@@ -706,13 +718,9 @@ mod tests {
         );
 
         let mut next = config_with_peer(11);
-        next.peers.push(crate::config::PeerSpec {
-            id: 2,
-            transport: 0,
-            address: "127.0.0.1:9998".to_string(),
-            hca_numa: None,
-            labels: Vec::new(),
-        });
+        next.neighborhoods[0]
+            .peers
+            .push(tcp_peer(2, "127.0.0.1:9998"));
         ctrl.apply(Arc::new(next)).unwrap();
 
         assert_eq!(versions.known(), 11);
@@ -739,13 +747,9 @@ mod tests {
 
         // A failed apply advances known but neither applied nor startup.
         let mut failing = config_with_peer(7);
-        failing.peers.push(crate::config::PeerSpec {
-            id: 2,
-            transport: 0,
-            address: "127.0.0.1:9998".to_string(),
-            hca_numa: None,
-            labels: Vec::new(),
-        });
+        failing.neighborhoods[0]
+            .peers
+            .push(tcp_peer(2, "127.0.0.1:9998"));
         assert!(ctrl.apply(Arc::new(failing)).is_err());
         assert_eq!(ctrl.config_versions().known(), 7);
         assert_eq!(ctrl.config_versions().applied(), 1);
@@ -755,13 +759,9 @@ mod tests {
         // still leaves startup pinned to the config realized at start.
         ctrl.target_mut().fail_in_place = false;
         let mut next = config_with_peer(8);
-        next.peers.push(crate::config::PeerSpec {
-            id: 3,
-            transport: 0,
-            address: "127.0.0.1:9997".to_string(),
-            hca_numa: None,
-            labels: Vec::new(),
-        });
+        next.neighborhoods[0]
+            .peers
+            .push(tcp_peer(3, "127.0.0.1:9997"));
         ctrl.apply(Arc::new(next)).unwrap();
         assert_eq!(ctrl.config_versions().applied(), 8);
         assert_eq!(ctrl.config_versions().startup(), 1);

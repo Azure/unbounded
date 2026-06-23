@@ -103,16 +103,16 @@ impl HttpBackend {
         &self.backend_id
     }
 
-    /// Resolve a `host:port` endpoint to a single IPv4 [`SockAddr`].
+    /// Resolve a `host:port` URL value to a single IPv4 [`SockAddr`].
     ///
     /// Takes the first IPv4 address `ToSocketAddrs` yields. DNS at
     /// startup is acceptable for the origin tier. If only IPv6
     /// addresses resolve, this returns an error: v1 dials IPv4 only.
-    pub fn resolve_origin(endpoint: &str) -> std::io::Result<SockAddr> {
+    pub fn resolve_origin(url: &str) -> std::io::Result<SockAddr> {
         use std::net::{SocketAddr, ToSocketAddrs};
 
         let mut last_v6 = false;
-        for addr in endpoint.to_socket_addrs()? {
+        for addr in url.to_socket_addrs()? {
             match addr {
                 SocketAddr::V4(v4) => {
                     let sin = libc::sockaddr_in {
@@ -184,15 +184,19 @@ impl HttpBackend {
                 .field("pages", dsts_owned.len());
             let fut = Box::pin(crate::obs::instrument(
                 log,
-                fetch_metadata(
-                    handle,
-                    origin_addr,
-                    host,
-                    path,
-                    dsts_owned.clone(),
-                    backing_base,
-                    page_size,
-                    self.limiter.clone(),
+                crate::metrics::instrument_backend(
+                    self.backend_id().to_string(),
+                    page_size as u64,
+                    fetch_metadata(
+                        handle,
+                        origin_addr,
+                        host,
+                        path,
+                        dsts_owned.clone(),
+                        backing_base,
+                        page_size,
+                        self.limiter.clone(),
+                    ),
                 ),
             ));
             return HttpFetchStream::pending(fut, dsts_owned);
@@ -210,17 +214,21 @@ impl HttpBackend {
             .field("pages", dsts_owned.len());
         let fut = Box::pin(crate::obs::instrument(
             log,
-            fetch(
-                handle,
-                origin_addr,
-                host,
-                path,
-                start,
+            crate::metrics::instrument_backend(
+                self.backend_id().to_string(),
                 len,
-                dsts_owned.clone(),
-                backing_base,
-                page_size,
-                self.limiter.clone(),
+                fetch(
+                    handle,
+                    origin_addr,
+                    host,
+                    path,
+                    start,
+                    len,
+                    dsts_owned.clone(),
+                    backing_base,
+                    page_size,
+                    self.limiter.clone(),
+                ),
             ),
         ));
         HttpFetchStream::pending(fut, dsts_owned)
@@ -624,7 +632,7 @@ fn check_origin_status(status: StatusCode, start: u64) -> Result<(), Error> {
 /// every served read to the object length, so that padding is never
 /// returned to a client. A `body` larger than the pages can hold is a
 /// protocol error.
-fn copy_body_into_pages(
+pub(super) fn copy_body_into_pages(
     body: &[u8],
     dsts: &[PageRef],
     backing_base: *mut u8,

@@ -13,11 +13,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
@@ -33,6 +35,17 @@ func digestOf(b []byte) digest.Digest {
 	}
 
 	return d
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", raw, err)
+	}
+
+	return u
 }
 
 func newClient(t *testing.T, ur config.UpstreamRegistry) *Client {
@@ -180,17 +193,79 @@ func TestPull_UnknownRegistry(t *testing.T) {
 	}
 }
 
+func TestPull_InvalidRepositoryRejectedBeforeRequest(t *testing.T) {
+	var hits int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var failures int32
+
+	c, err := New(&config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg", Endpoint: srv.URL}}}, WithMetrics(nil, func(_, _ string) {
+		atomic.AddInt32(&failures, 1)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := digestOf([]byte("x"))
+
+	_, _, err = c.Pull(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "../../etc", Digest: d})
+	if err == nil {
+		t.Fatal("Pull: expected invalid repository error")
+	}
+
+	var oe *ifaces.OriginError
+	if !errors.As(err, &oe) || oe.Class != ifaces.FailureNotFound {
+		t.Fatalf("err = %v, want OriginError{Class=not_found}", err)
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Fatalf("origin requests = %d, want 0", got)
+	}
+
+	if got := atomic.LoadInt32(&failures); got != 1 {
+		t.Fatalf("failure callbacks = %d, want 1", got)
+	}
+}
+
+func TestHead_InvalidRepositoryRejectedBeforeRequest(t *testing.T) {
+	var hits int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
+	d := digestOf([]byte("x"))
+
+	_, _, err := c.Head(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "foo?bar", Digest: d})
+	if err == nil {
+		t.Fatal("Head: expected invalid repository error")
+	}
+
+	var oe *ifaces.OriginError
+	if !errors.As(err, &oe) || oe.Class != ifaces.FailureNotFound {
+		t.Fatalf("err = %v, want OriginError{Class=not_found}", err)
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Fatalf("origin requests = %d, want 0", got)
+	}
+}
+
 func TestPull_BearerTokenFlow(t *testing.T) {
 	body := []byte("token-protected")
 	d := digestOf(body)
 
 	var authReqs, tokenReqs, dataReqs int32
 
-	// Set up the token endpoint first so we know its URL.
 	tokenMux := http.NewServeMux()
-
-	tokenSrv := httptest.NewServer(tokenMux)
-	defer tokenSrv.Close()
 
 	tokenMux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&tokenReqs, 1)
@@ -203,11 +278,18 @@ func TestPull_BearerTokenFlow(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"token": "deadbeef"}) //nolint:errcheck // best-effort
 	})
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var srv *httptest.Server
+
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			tokenMux.ServeHTTP(w, r)
+			return
+		}
+
 		if r.Header.Get("Authorization") != "Bearer deadbeef" {
 			atomic.AddInt32(&authReqs, 1)
 			w.Header().Set("WWW-Authenticate",
-				`Bearer realm="`+tokenSrv.URL+`/token",service="reg",scope="repository:library/nginx:pull"`)
+				`Bearer realm="`+srv.URL+`/token",service="reg",scope="repository:library/nginx:pull"`)
 			w.WriteHeader(401)
 
 			return
@@ -227,6 +309,7 @@ func TestPull_BearerTokenFlow(t *testing.T) {
 	}
 
 	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
+	c.registries["reg"].hc = srv.Client()
 
 	rc, _, err := c.Pull(context.Background(), ifaces.OriginRef{
 		Registry: "reg", Repository: "library/nginx", Digest: d,
@@ -259,6 +342,319 @@ func TestPull_BearerTokenFlow(t *testing.T) {
 
 	if atomic.LoadInt32(&tokenReqs) != 1 {
 		t.Errorf("tokenReqs after 2nd pull = %d, want 1 (cached)", tokenReqs)
+	}
+}
+
+func TestFetchBearerTokenRejectsHTTPRealm(t *testing.T) {
+	var tokenReqs int32
+
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&tokenReqs, 1)
+
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "deadbeef"}) //nolint:errcheck // best-effort
+	}))
+	defer tokenSrv.Close()
+
+	r := &registry{
+		base:     mustParseURL(t, "https://reg.example.com"),
+		username: "alice",
+		password: "secret",
+		hc:       tokenSrv.Client(),
+	}
+
+	_, _, err := r.fetchBearerToken(context.Background(), `Bearer realm="`+tokenSrv.URL+`/token",service="reg"`)
+	if err == nil {
+		t.Fatal("expected non-https token realm to be rejected")
+	}
+
+	if !strings.Contains(err.Error(), "absolute https URL") {
+		t.Fatalf("error = %v, want https URL rejection", err)
+	}
+
+	if got := atomic.LoadInt32(&tokenReqs); got != 0 {
+		t.Fatalf("token endpoint was called %d times; want 0", got)
+	}
+}
+
+func TestFetchBearerTokenAllowsCrossHostHTTPSRealm(t *testing.T) {
+	var tokenReqs int32
+
+	tokenSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&tokenReqs, 1)
+
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "alice" || pass != "secret" {
+			t.Errorf("token auth missing/wrong: ok=%v user=%q", ok, user)
+		}
+
+		if r.URL.Query().Get("service") != "reg" {
+			t.Errorf("service query = %q", r.URL.Query().Get("service"))
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "deadbeef"}) //nolint:errcheck // best-effort
+	}))
+	defer tokenSrv.Close()
+
+	r := &registry{
+		base:     mustParseURL(t, "https://reg.example.com"),
+		username: "alice",
+		password: "secret",
+		hc:       tokenSrv.Client(),
+	}
+
+	tok, _, err := r.fetchBearerToken(context.Background(), `Bearer realm="`+tokenSrv.URL+`/token",service="reg"`)
+	if err != nil {
+		t.Fatalf("fetchBearerToken: %v", err)
+	}
+
+	if tok != "deadbeef" {
+		t.Fatalf("token = %q, want deadbeef", tok)
+	}
+
+	if got := atomic.LoadInt32(&tokenReqs); got != 1 {
+		t.Fatalf("token endpoint calls = %d, want 1", got)
+	}
+}
+
+func TestHTTPRegistryDoesNotSendBasicToTokenEndpoint(t *testing.T) {
+	body := []byte("token-protected")
+	d := digestOf(body)
+
+	var tokenReqs int32
+
+	tokenSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&tokenReqs, 1)
+
+		if user, _, ok := r.BasicAuth(); ok {
+			t.Errorf("token request unexpectedly included Basic auth for user %q", user)
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "deadbeef"}) //nolint:errcheck // best-effort
+	}))
+	defer tokenSrv.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer deadbeef" {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="`+tokenSrv.URL+`/token",service="reg"`)
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		_, _ = w.Write(body) //nolint:errcheck // best-effort write
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+
+	credsPath := filepath.Join(dir, "creds")
+	if err := os.WriteFile(credsPath, []byte("alice:secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
+	c.registries["reg"].hc = tokenSrv.Client()
+
+	rc, _, err := c.Pull(context.Background(), ifaces.OriginRef{
+		Registry: "reg", Repository: "library/nginx", Digest: d,
+	})
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+
+	if string(got) != string(body) {
+		t.Errorf("body = %q", got)
+	}
+
+	if got := atomic.LoadInt32(&tokenReqs); got != 1 {
+		t.Fatalf("token endpoint calls = %d, want 1", got)
+	}
+}
+
+func TestHTTPRegistryRepeatWithoutTokenDoesNotSendBasic(t *testing.T) {
+	var reqs, sawBasic int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqs, 1)
+
+		if _, _, ok := r.BasicAuth(); ok {
+			atomic.StoreInt32(&sawBasic, 1)
+		}
+
+		w.Header().Set("WWW-Authenticate", `Basic realm="reg"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+
+	credsPath := filepath.Join(dir, "creds")
+	if err := os.WriteFile(credsPath, []byte("alice:secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
+	d := digestOf([]byte("x"))
+
+	_, _, err := c.Pull(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "library/nginx", Digest: d})
+	if err == nil {
+		t.Fatal("expected Pull to fail")
+	}
+
+	if got := atomic.LoadInt32(&reqs); got != 2 {
+		t.Fatalf("requests = %d, want 2 (initial + repeatWithoutToken)", got)
+	}
+
+	if atomic.LoadInt32(&sawBasic) != 0 {
+		t.Fatal("Basic auth was sent to an http:// registry endpoint")
+	}
+}
+
+// TestPullStripsAuthOnHTTPSDowngradeRedirect proves the registry's HTTP client
+// refuses to carry an Authorization header onto a plaintext hop when an HTTPS
+// endpoint redirects to HTTP on the same hostname. net/http copies the header
+// across same-hostname redirects (it only compares hostnames, not schemes), so
+// without the scheme-aware CheckRedirect wired up by newRegistry the bearer
+// token would arrive at the HTTP target in clear text.
+func TestPullStripsAuthOnHTTPSDowngradeRedirect(t *testing.T) {
+	body := []byte("downgrade-protected")
+	d := digestOf(body)
+
+	var leaked int32
+
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			atomic.StoreInt32(&leaked, 1)
+		}
+
+		_, _ = w.Write(body) //nolint:errcheck // best-effort write
+	}))
+	defer httpSrv.Close()
+
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, httpSrv.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer tlsSrv.Close()
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: tlsSrv.URL})
+	reg := c.registries["reg"]
+
+	// Trust the test TLS cert but keep the production redirect policy so the
+	// credential-stripping behavior wired up by newRegistry is exercised. If
+	// newRegistry stopped setting CheckRedirect this copies nil and the test
+	// fails when net/http leaks the header to the plaintext target.
+	tlsClient := tlsSrv.Client()
+	tlsClient.CheckRedirect = reg.hc.CheckRedirect
+	reg.hc = tlsClient
+
+	// Seed a cached bearer token so do() attaches an Authorization header to
+	// the first request against the HTTPS endpoint.
+	reg.setToken("deadbeef", time.Hour)
+
+	rc, _, err := c.Pull(context.Background(), ifaces.OriginRef{
+		Registry: "reg", Repository: "library/nginx", Digest: d,
+	})
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+
+	if string(got) != string(body) {
+		t.Errorf("body = %q", got)
+	}
+
+	if atomic.LoadInt32(&leaked) != 0 {
+		t.Fatal("Authorization header leaked onto plain-HTTP redirect target")
+	}
+}
+
+func TestCheckRedirect(t *testing.T) {
+	t.Run("strips Authorization on http downgrade", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "http://reg.example.com/v2/", nil)
+		req.Header.Set("Authorization", "Bearer secret")
+
+		if err := checkRedirect(req, nil); err != nil {
+			t.Fatalf("checkRedirect: %v", err)
+		}
+
+		if got := req.Header.Get("Authorization"); got != "" {
+			t.Fatalf("Authorization preserved on http downgrade: %q", got)
+		}
+	})
+
+	t.Run("keeps Authorization on https redirect", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "https://reg.example.com/v2/", nil)
+		req.Header.Set("Authorization", "Bearer secret")
+
+		if err := checkRedirect(req, nil); err != nil {
+			t.Fatalf("checkRedirect: %v", err)
+		}
+
+		if got := req.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Fatalf("Authorization stripped on https redirect: %q", got)
+		}
+	})
+
+	t.Run("stops after 10 redirects", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "https://reg.example.com/v2/", nil)
+
+		if err := checkRedirect(req, make([]*http.Request, 10)); err == nil {
+			t.Fatal("expected error after 10 redirects")
+		}
+	})
+}
+
+// TestFetchBearerTokenPreservesRealmQueryAndFragment verifies the token URL is
+// assembled from the parsed realm: a pre-existing realm query survives, the
+// service/scope params are added, and a realm fragment does not swallow them.
+// Raw string concatenation would have appended "&service=...&scope=..." after
+// the "#frag", which url.Parse folds into the fragment so those params never
+// reach the wire.
+func TestFetchBearerTokenPreservesRealmQueryAndFragment(t *testing.T) {
+	var gotService, gotScope, gotExtra string
+
+	tokenSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		gotService = q.Get("service")
+		gotScope = q.Get("scope")
+		gotExtra = q.Get("extra")
+
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "deadbeef"}) //nolint:errcheck // best-effort
+	}))
+	defer tokenSrv.Close()
+
+	r := &registry{
+		base: mustParseURL(t, "https://reg.example.com"),
+		hc:   tokenSrv.Client(),
+	}
+
+	realm := tokenSrv.URL + "/token?extra=keep#frag"
+	challenge := `Bearer realm="` + realm + `",service="reg",scope="repository:library/nginx:pull"`
+
+	tok, _, err := r.fetchBearerToken(context.Background(), challenge)
+	if err != nil {
+		t.Fatalf("fetchBearerToken: %v", err)
+	}
+
+	if tok != "deadbeef" {
+		t.Fatalf("token = %q, want deadbeef", tok)
+	}
+
+	if gotService != "reg" {
+		t.Errorf("service = %q, want reg", gotService)
+	}
+
+	if gotScope != "repository:library/nginx:pull" {
+		t.Errorf("scope = %q, want repository:library/nginx:pull", gotScope)
+	}
+
+	if gotExtra != "keep" {
+		t.Errorf("extra = %q, want keep (pre-existing realm query dropped)", gotExtra)
 	}
 }
 

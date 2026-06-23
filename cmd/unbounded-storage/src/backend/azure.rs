@@ -105,13 +105,13 @@ impl AzureBackend {
         &self.backend_id
     }
 
-    /// Resolve a `host:port` endpoint to a single IPv4 [`SockAddr`].
+    /// Resolve a `host:port` URL value to a single IPv4 [`SockAddr`].
     /// Delegates to [`HttpBackend::resolve_origin`](super::HttpBackend::resolve_origin),
     /// which takes the first IPv4 `ToSocketAddrs` yields and errors on
     /// IPv6-only origins (v1 dials IPv4 only). The hostname for the
     /// `Host:` header is passed separately to [`AzureBackend::new`].
-    pub fn resolve_origin(endpoint: &str) -> std::io::Result<SockAddr> {
-        super::HttpBackend::resolve_origin(endpoint)
+    pub fn resolve_origin(url: &str) -> std::io::Result<SockAddr> {
+        super::HttpBackend::resolve_origin(url)
     }
 }
 
@@ -147,15 +147,19 @@ impl AzureBackend {
         // metadata. The sentinel `stripe_idx` would overflow
         // `absolute_range`, so this must branch before that is computed.
         if origin.is_metadata_entry() {
-            let fut = Box::pin(fetch_metadata(
-                handle,
-                origin_addr,
-                host,
-                path,
-                dsts_owned.clone(),
-                backing_base,
-                page_size,
-                self.limiter.clone(),
+            let fut = Box::pin(crate::metrics::instrument_backend(
+                self.backend_id().to_string(),
+                page_size as u64,
+                fetch_metadata(
+                    handle,
+                    origin_addr,
+                    host,
+                    path,
+                    dsts_owned.clone(),
+                    backing_base,
+                    page_size,
+                    self.limiter.clone(),
+                ),
             ));
             return AzureFetchStream::pending(fut, dsts_owned);
         }
@@ -163,17 +167,21 @@ impl AzureBackend {
         debug_assert!(!origin.is_metadata_entry());
         let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
 
-        let fut = Box::pin(fetch(
-            handle,
-            origin_addr,
-            host,
-            path,
-            start,
+        let fut = Box::pin(crate::metrics::instrument_backend(
+            self.backend_id().to_string(),
             len,
-            dsts_owned.clone(),
-            backing_base,
-            page_size,
-            self.limiter.clone(),
+            fetch(
+                handle,
+                origin_addr,
+                host,
+                path,
+                start,
+                len,
+                dsts_owned.clone(),
+                backing_base,
+                page_size,
+                self.limiter.clone(),
+            ),
         ));
         AzureFetchStream::pending(fut, dsts_owned)
     }
@@ -816,11 +824,14 @@ mod tests {
 
     #[test]
     fn get_request_has_expected_headers() {
-        let req = format_get_request("/container/key", "acct.blob.core.windows.net", 0, 4095)
-            .unwrap();
+        let req =
+            format_get_request("/container/key", "acct.blob.core.windows.net", 0, 4095).unwrap();
         let s = std::str::from_utf8(&req).unwrap();
         assert!(s.starts_with("GET /container/key HTTP/1.1\r\n"), "got: {s}");
-        assert!(s.contains("host: acct.blob.core.windows.net\r\n"), "got: {s}");
+        assert!(
+            s.contains("host: acct.blob.core.windows.net\r\n"),
+            "got: {s}"
+        );
         assert!(s.contains("range: bytes=0-4095\r\n"), "got: {s}");
         assert!(s.contains("x-ms-version: 2021-08-06\r\n"), "got: {s}");
         assert!(s.contains("connection: close\r\n"), "got: {s}");
@@ -833,8 +844,14 @@ mod tests {
     fn head_request_omits_range_keeps_version() {
         let req = format_head_request("/container/key", "acct.blob.core.windows.net").unwrap();
         let s = std::str::from_utf8(&req).unwrap();
-        assert!(s.starts_with("HEAD /container/key HTTP/1.1\r\n"), "got: {s}");
-        assert!(s.contains("host: acct.blob.core.windows.net\r\n"), "got: {s}");
+        assert!(
+            s.starts_with("HEAD /container/key HTTP/1.1\r\n"),
+            "got: {s}"
+        );
+        assert!(
+            s.contains("host: acct.blob.core.windows.net\r\n"),
+            "got: {s}"
+        );
         assert!(s.contains("x-ms-version: 2021-08-06\r\n"), "got: {s}");
         assert!(!s.contains("range:"), "got: {s}");
         assert!(!s.contains("authorization"), "got: {s}");

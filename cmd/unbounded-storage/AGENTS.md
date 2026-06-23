@@ -290,17 +290,16 @@ and the lazy-connect retry paths.
 How to run it:
 
 ```
-make unbounded-storage-build      # builds libfabric + the release binary
-sudo -E env "PATH=$PATH" \
-  "LD_LIBRARY_PATH=$PWD/tmp/libfabric/<version>/lib" \
-  python3 hack/smoke-storage.py
+make unbounded-storage-smoke
 ```
 
+- The target depends on `unbounded-storage-build`, so it builds
+  libfabric and the release binary first, then runs the harness.
 - `sudo` is required because the processes pin io_uring buffers and the
-  harness raises `RLIMIT_MEMLOCK` (needs `CAP_SYS_RESOURCE`). `sudo`
-  strips `LD_*` even with `-E`, so the libfabric runtime path must be
-  re-applied explicitly via `env` as shown.
-- Substitute the pinned `LIBFABRIC_VERSION` for `<version>`.
+  harness raises `RLIMIT_MEMLOCK` (needs `CAP_SYS_RESOURCE`). The target
+  runs the harness under `sudo` and re-applies the libfabric runtime
+  path (`LD_LIBRARY_PATH`) explicitly, because `sudo` strips `LD_*` even
+  with `-E`.
 
 When to run it:
 

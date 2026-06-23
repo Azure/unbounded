@@ -72,10 +72,29 @@ GANTRY_CMD=./cmd/gantry
 GANTRY_IMAGE ?= $(CONTAINER_REGISTRY)/gantry:$(VERSION)
 GANTRY_NAMESPACE ?= gantry
 
+# unbounded-storage-supervisor (Go binary; distinct from the Rust crate below)
+UNBOUNDED_STORAGE_SUPERVISOR_BIN=bin/unbounded-storage-supervisor
+UNBOUNDED_STORAGE_SUPERVISOR_CMD=./cmd/unbounded-storage-supervisor
+UNBOUNDED_STORAGE_SUPERVISOR_TAG ?= latest
+UNBOUNDED_STORAGE_SUPERVISOR_IMAGE=$(CONTAINER_REGISTRY)/unbounded-storage-supervisor:$(UNBOUNDED_STORAGE_SUPERVISOR_TAG)
+UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE ?= unbounded-kube
+UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-storage-supervisor
+UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-storage-supervisor/rendered
+
 # Rust binaries
 UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
 UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
 CARGO ?= cargo
+
+# Optional cargo features for unbounded-storage release builds. Set
+# UNBOUNDED_STORAGE_PROFILING=1 to compile in the SIGUSR1 CPU profiler
+# (see cmd/unbounded-storage/src/profiling.rs); this threads through
+# unbounded-storage-build and therefore the tarball/push dev workflow.
+ifeq ($(UNBOUNDED_STORAGE_PROFILING),1)
+UNBOUNDED_STORAGE_CARGO_FEATURES := --features profiling
+else
+UNBOUNDED_STORAGE_CARGO_FEATURES :=
+endif
 
 # libfabric is built from source because distro packages predate the
 # merge of the experimental `net` provider into `tcp` (libfabric 2.0),
@@ -172,7 +191,8 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric
+.PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric
+.PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
 
 ##@ General
 
@@ -219,13 +239,14 @@ help: ## Show this help
 	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
+	@echo "  unbounded-storage-supervisor | unbounded-storage-supervisor-build  Build the storage supervisor (with/without lint/test)"
 	@echo ""
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
+	@echo "  UNBOUNDED_STORAGE_PROFILING=1     Set on any build/push to compile in the SIGUSR1 CPU profiler"
 	@echo "  unbounded-storage-smoke          Run the end-to-end smoke test (uses sudo)"
 	@echo "  unbounded-storage-tarball        Package unbounded-storage + libfabric into a release tarball"
 	@echo "  unbounded-storage-push           Push the unbounded-storage release tarball to Azure blob storage"
-	@echo "  bench                            Build the bench tool (excluded from images)"
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
 	@echo "  unbounded-storage-model-check    Run TLC on all unbounded-storage TLA+ models"
@@ -241,6 +262,8 @@ help: ## Show this help
 	@echo "  image-inventory-inspector-push   Build and push the inventory-inspector container image"
 	@echo "  image-inventory-viewer-local     Build a local inventory-viewer container image"
 	@echo "  image-inventory-viewer-push      Build and push the inventory-viewer container image"
+	@echo "  image-unbounded-storage-supervisor-local Build a local unbounded-storage-supervisor container image"
+	@echo "  image-unbounded-storage-supervisor-push  Build and push the unbounded-storage-supervisor container image"
 	@echo "  image-machina-local              Build machina image with \$$(CONTAINER_ENGINE)"
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-metalman-local             Build metalman image"
@@ -271,6 +294,7 @@ help: ## Show this help
 	@echo "  machine-ops-manifests            Render machine-ops manifests into deploy/machine-ops/rendered"
 	@echo "  net-manifests                    Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
 	@echo "  orca-manifests                   Render orca manifests into deploy/orca/rendered"
+	@echo "  unbounded-storage-supervisor-manifests  Render storage supervisor manifests into deploy/unbounded-storage-supervisor/rendered"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
 	@echo "  See \`make -C hack/net help\` for cluster deploy/undeploy targets."
@@ -527,6 +551,21 @@ gantry-build: ## Build the gantry binary (no lint/test)
 
 gantry: test gantry-build ## Build gantry (implies test)
 
+unbounded-storage-supervisor-build: ## Build the unbounded-storage-supervisor binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_STORAGE_SUPERVISOR_BIN) $(UNBOUNDED_STORAGE_SUPERVISOR_CMD)
+
+unbounded-storage-supervisor: test unbounded-storage-supervisor-build ## Build the unbounded-storage-supervisor (implies test)
+
+unbounded-storage-supervisor-manifests: ## Render unbounded-storage-supervisor manifests into deploy/unbounded-storage-supervisor/rendered
+	@mkdir -p $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR)
+	@find $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE) \
+		--set Image=$(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE)
+	@echo "Rendered unbounded-storage-supervisor manifests into $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE))"
+
 ##@ Rust Binaries
 
 # Build and install the pinned libfabric from source (once). The stamp
@@ -538,7 +577,7 @@ $(LIBFABRIC_STAMP):
 	@mkdir -p $(CURDIR)/tmp/libfabric/src
 	@curl -fsSL $(LIBFABRIC_URL) | tar -xj -C $(CURDIR)/tmp/libfabric/src --strip-components=1
 	cd $(CURDIR)/tmp/libfabric/src && ./configure --prefix=$(LIBFABRIC_PREFIX) \
-		--enable-tcp=yes --with-uring=yes --disable-verbs --disable-rxm \
+		--enable-tcp=yes --with-uring=yes --enable-verbs=yes --enable-rxm=yes \
 		--disable-sockets --disable-psm3 --disable-efa --disable-shm
 	$(MAKE) -C $(CURDIR)/tmp/libfabric/src -j$$(nproc)
 	$(MAKE) -C $(CURDIR)/tmp/libfabric/src install
@@ -550,11 +589,11 @@ libfabric: $(LIBFABRIC_STAMP) ## Build/install the pinned libfabric ($(LIBFABRIC
 unbounded-storage-check: $(LIBFABRIC_STAMP) ## Run cargo check for unbounded-storage
 	$(CARGO_FABRIC_ENV) $(CARGO) check --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
 
-unbounded-storage-test: $(LIBFABRIC_STAMP) ## Run cargo tests for unbounded-storage
-	$(CARGO_FABRIC_ENV) $(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets
+unbounded-storage-test: $(LIBFABRIC_STAMP) ## Run cargo tests for unbounded-storage (includes the profiling feature so it always compiles)
+	$(CARGO_FABRIC_ENV) $(CARGO) test --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --locked --all-targets --features profiling
 
-unbounded-storage-build: $(LIBFABRIC_STAMP) ## Build the unbounded-storage binary (no test)
-	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked
+unbounded-storage-build: $(LIBFABRIC_STAMP) ## Build the unbounded-storage binary (no test; UNBOUNDED_STORAGE_PROFILING=1 adds the CPU profiler)
+	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked $(UNBOUNDED_STORAGE_CARGO_FEATURES)
 	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
 	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/unbounded-storage $(UNBOUNDED_STORAGE_BIN)
 
@@ -639,14 +678,18 @@ unbounded-storage-push: unbounded-storage-tarball ## Push the unbounded-storage 
 		--account-name $(STORAGE_BLOB_ACCOUNT) \
 		--account-key $(AZURE_STORAGE_KEY) \
 		--overwrite
+	@az storage blob upload \
+		--file hack/scripts/gen-storage-mesh-config.sh \
+		--container-name $(STORAGE_BLOB_CONTAINER) \
+		--name $(VERSION)/gen-config.sh \
+		--account-name $(STORAGE_BLOB_ACCOUNT) \
+		--account-key $(AZURE_STORAGE_KEY) \
+		--overwrite
 	@echo "Uploaded $(STORAGE_TARBALL_STEM).tar.gz to https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
 	@echo "Install with:"
 	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/install.sh | bash -s -- https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/$(STORAGE_TARBALL_STEM).tar.gz"
-
-bench: $(LIBFABRIC_STAMP) ## Build the bench tool (excluded from images)
-	$(CARGO_FABRIC_ENV) $(CARGO) build --manifest-path $(UNBOUNDED_STORAGE_CRATE)/Cargo.toml --release --locked --bin bench
-	@mkdir -p $(dir $(UNBOUNDED_STORAGE_BIN))
-	cp $(UNBOUNDED_STORAGE_CRATE)/target/release/bench bin/bench
+	@echo "Generate a mesh config with:"
+	@echo "  curl https://$(STORAGE_BLOB_ACCOUNT).blob.core.windows.net/$(STORAGE_BLOB_CONTAINER)/$(VERSION)/gen-config.sh | bash"
 
 # TLA+ tooling for the unbounded-storage models.
 # tla2tools.jar is fetched on demand into tmp/ (gitignored).  Override
@@ -787,6 +830,20 @@ image-inventory-viewer-local: ## Build the inventory-viewer container image
 image-inventory-viewer-push: image-inventory-viewer-local ## Build and push the inventory-viewer container image
 	$(CONTAINER_ENGINE) push $(INVENTORY_VIEWER_IMAGE)
 
+.PHONY: image-unbounded-storage-supervisor-local
+image-unbounded-storage-supervisor-local: ## Build the unbounded-storage-supervisor container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t unbounded-storage-supervisor:$(UNBOUNDED_STORAGE_SUPERVISOR_TAG) -t $(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE) \
+		-f ./images/unbounded-storage-supervisor/Containerfile .
+	$(call trivy-maybe,$(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE))
+
+.PHONY: image-unbounded-storage-supervisor-push
+image-unbounded-storage-supervisor-push: image-unbounded-storage-supervisor-local ## Build and push the unbounded-storage-supervisor container image
+	$(CONTAINER_ENGINE) push $(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE)
+
 image-machina-local: ## Build the machina container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
 		--build-arg VERSION=$(VERSION) \
@@ -817,6 +874,7 @@ machine-ops-controller-oci-push: machine-ops-controller-oci ## Build and push th
 	$(CONTAINER_ENGINE) push $(MACHINE_OPS_CONTROLLER_IMAGE)
 
 MACHINA_NAMESPACE ?= unbounded-kube
+MACHINA_API_SERVER_ENDPOINT ?=
 MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
 MACHINE_OPS_NAMESPACE ?= unbounded-kube
@@ -832,7 +890,8 @@ machina-manifests: ## Render machina deployment manifests into deploy/machina/re
 		--templates-dir $(MACHINA_MANIFEST_TEMPLATES_DIR) \
 		--output-dir $(MACHINA_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(MACHINA_NAMESPACE) \
-		--set ControllerImage=$(MACHINA_IMAGE)
+		--set ControllerImage=$(MACHINA_IMAGE) \
+		--set APIServerEndpoint=$(MACHINA_API_SERVER_ENDPOINT)
 	@cp $(MACHINA_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(MACHINA_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered machina manifests into $(MACHINA_MANIFEST_RENDERED_DIR) (image: $(MACHINA_IMAGE))"
 

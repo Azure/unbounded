@@ -366,6 +366,7 @@ func runAgent(args []string) error {
 
 	coordClient := coord.NewClient(disco.LibP2P(),
 		coord.WithClientLogger(logger),
+		coord.WithClientMaxDigestsPerPleasePull(c.CoordMaxDigestsPerRequest),
 		// Resolve NodeID -> peer.ID via the live membership snapshot:
 		// each peer publishes its libp2p peer.ID into a pod
 		// annotation (the design doc) which Members reads in Snapshot. This
@@ -376,10 +377,10 @@ func runAgent(args []string) error {
 	// pullerPump bridges inbound please_pull RPCs to the local origin
 	// puller (the step 7). The pump itself MUST NOT block the coord
 	// stream handler; the actual origin fetch + cache write + advertiser
-	// mark-present happen in a detached goroutine. pullerPumpWG tracks
+	// mark-present happen in a detached goroutine. pullerPumpGate tracks
 	// outstanding goroutines so graceful shutdown can let the final
-	// advertise path flush before disco.Close fires .
-	var pullerPumpWG sync.WaitGroup
+	// advertise path flush before disco.Close fires.
+	pullerPumpGate := newPullerPumpGate()
 
 	leaseHooks := leaseMetricHooks{
 		onCreated:  func() { p9.containerdLeaseCreated.Inc() },
@@ -404,7 +405,7 @@ func runAgent(args []string) error {
 
 		p9.containerdIngestFailure.Inc()
 	}
-	pullerPump := newPullerPump(inflightMap, pullOriginClient, cstore, negCache, logger, &pullerPumpWG, func(ctx context.Context, d digest.Digest) bool {
+	pullerPump := newPullerPump(inflightMap, pullOriginClient, cstore, negCache, logger, pullerPumpGate, c.CoordMaxConcurrentPulls, func(ctx context.Context, d digest.Digest) bool {
 		return adv.Notify(ctx, d, true)
 	}, originSuccessWithIngest, downstreamFailureWithIngest, leaseHooks)
 	coordOpts := []coord.Option{
@@ -414,10 +415,14 @@ func runAgent(args []string) error {
 			OnPullIntentStorageUnavailable: func() { p3.coordPullIntentStorageUnavailable.Inc() },
 			OnPleasePullServed:             func() { p3.coordPleasePullServed.Inc() },
 			OnPleasePullStarted:            func() { p3.coordPleasePullStarted.Inc() },
+			OnPleasePullDeclined:           func() { p3.coordPleasePullDeclined.Inc() },
 			OnStreamError:                  func() { p3.coordStreamError.Inc() },
+			OnUnauthorizedPeer:             func(reason string) { p3.coordUnauthorizedPeer.WithLabelValues(reason).Inc() },
 		}),
 		coord.WithNegativeCache(negCacheAdapter{c: negCache}),
 		coord.WithPullerPump(pullerPump),
+		coord.WithPeerAuthz(c.CoordPeerAuthzEnforce),
+		coord.WithMaxDigestsPerPleasePull(c.CoordMaxDigestsPerRequest),
 	}
 	coordServer := coord.NewServer(cstore, memberView, inflightMap, coordOpts...)
 	coordServer.Bind(disco.LibP2P())
@@ -491,6 +496,7 @@ func runAgent(args []string) error {
 		nf5Ctrl = mirror.NewDirectOriginFallback(mirror.DirectOriginFallbackOptions{
 			Logger:           logger,
 			JitterBase:       c.NF5JitterBase,
+			JitterCap:        c.NF5JitterCap,
 			PerNodeRateLimit: c.NF5PerNodeRateLimit,
 			// Use bootstrapPeerCount (Running pods with published
 			// p2p-addrs annotations, irrespective of Ready). direct-origin-fallback
@@ -573,6 +579,7 @@ func runAgent(args []string) error {
 		}),
 		mirror.WithDiscovery(disco, peerClient),
 		mirror.WithSelfNodeID(memberView.Self()),
+		mirror.WithSelfPeerID(ifaces.NodeID(disco.PeerID().String())),
 		mirror.WithPeerMetrics(
 			func(outcome string) { p2.peerFetch.WithLabelValues(outcome).Inc() },
 			func(success bool) {
@@ -933,7 +940,8 @@ func runAgent(args []string) error {
 		mirrorStop:     mirrorStop,
 		cdsubSrc:       cdsubSrc,
 		cdsubDone:      cdsubDone,
-		pullerPumpWG:   &pullerPumpWG,
+		coordStop:      func() { coordServer.Unbind(disco.LibP2P()) },
+		pullerPumpGate: pullerPumpGate,
 		metricsHTTP:    metricsHTTP,
 		shutdownBudget: 10 * time.Second,
 	})
@@ -1085,7 +1093,12 @@ func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, 
 	// dev mode warns and falls back to the single-self stub.
 	mgr.Start()
 
-	syncCtx, syncCancel := context.WithTimeout(ctx, memberSyncTimeout)
+	syncTimeout := memberSyncDefaultTimeout
+	if c.MembersSyncTimeout > 0 {
+		syncTimeout = c.MembersSyncTimeout
+	}
+
+	syncCtx, syncCancel := context.WithTimeout(ctx, syncTimeout)
 	syncErr := mgr.WaitForSync(syncCtx)
 
 	syncCancel()
@@ -1093,11 +1106,11 @@ func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, 
 	if syncErr != nil {
 		if prodMode {
 			mgr.Stop()
-			return nil, nil, fmt.Errorf("members initial sync (timeout=%s): %w", memberSyncTimeout, syncErr)
+			return nil, nil, fmt.Errorf("members initial sync (timeout=%s): %w", syncTimeout, syncErr)
 		}
 
 		logger.Warn("members initial sync failed; falling back to single-self stub (dev mode)",
-			slog.Duration("timeout", memberSyncTimeout),
+			slog.Duration("timeout", syncTimeout),
 			slog.Any("err", syncErr),
 		)
 		mgr.Stop()
@@ -1113,14 +1126,18 @@ func buildMembers(ctx context.Context, c *config.Config, disco *discovery.Host, 
 	return mgr, mgr.Stop, nil
 }
 
-// memberSyncTimeout caps how long buildMembers waits for the initial
-// list+watch on the pod and node informers before failing (prod) or
-// degrading to the single-self stub (dev). 10s is generous for a
-// healthy apiserver - a real timeout almost always means RBAC, API
-// egress, or service-account permissions are broken; failing fast
-// surfaces that as an immediate deploy-time signal rather than a
-// silent "why isn't dedup working?" mystery.
-const memberSyncTimeout = 10 * time.Second
+// memberSyncDefaultTimeout is the built-in default for how long buildMembers
+// waits for the initial list+watch on the pod and node informers before
+// failing (prod) or degrading to the single-self stub (dev). Operators on
+// clusters with a slow API server or large-scale simultaneous DaemonSet
+// rollouts can override this via config.MembersSyncTimeout /
+// GANTRY_MEMBERS_SYNC_TIMEOUT / --members-sync-timeout.
+//
+// 30s is generous for a healthy apiserver - a real timeout almost always
+// means RBAC, API egress, or service-account permissions are broken; failing
+// fast surfaces that as an immediate deploy-time signal rather than a silent
+// "why isn't dedup working?" mystery.
+const memberSyncDefaultTimeout = 30 * time.Second
 
 // singleSelfMembers returns a single-entry Members view for dev/test
 // runs that have no Kubernetes cluster behind them.
@@ -1917,18 +1934,78 @@ type preIngestLeaseStore interface {
 	CreateLease(ctx context.Context, d digest.Digest, registry, repository string) (*containerdstore.LeaseGuard, error)
 }
 
-func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, logger *slog.Logger, wg *sync.WaitGroup, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks) coord.PullerPump {
+type pullerPumpGate struct {
+	mu        sync.Mutex
+	accepting bool
+	wg        sync.WaitGroup
+}
+
+func newPullerPumpGate() *pullerPumpGate {
+	return &pullerPumpGate{accepting: true}
+}
+
+func (g *pullerPumpGate) TryAdd() bool {
+	if g == nil {
+		return true
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if !g.accepting {
+		return false
+	}
+
+	g.wg.Add(1)
+
+	return true
+}
+
+func (g *pullerPumpGate) Done() {
+	if g == nil {
+		return
+	}
+
+	g.wg.Done()
+}
+
+func (g *pullerPumpGate) StopAccepting() {
+	if g == nil {
+		return
+	}
+
+	g.mu.Lock()
+	g.accepting = false
+	g.mu.Unlock()
+}
+
+func (g *pullerPumpGate) Wait() {
+	if g == nil {
+		return
+	}
+
+	g.wg.Wait()
+}
+
+func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, logger *slog.Logger, gate *pullerPumpGate, maxConcurrentPulls int, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks) coord.PullerPump {
 	lg := logger.With(slog.String("subsystem", "puller-pump"))
 
-	return func(_ context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) (time.Time, bool, *coord.NegativeEntry) {
+	if maxConcurrentPulls < 1 {
+		maxConcurrentPulls = 1
+	}
+
+	pullSem := make(chan struct{}, maxConcurrentPulls)
+
+	return func(pumpCtx context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) coord.PumpResult {
 		// the design doc short-circuit: if we're inside a cooldown window, refuse
 		// to start a new origin pull and surface the existing entry so
 		// the requester gets recently_failed without round-tripping.
 		if neg != nil {
 			if e, ok := neg.Lookup(d); ok {
-				return time.Time{}, false, &coord.NegativeEntry{
+				return coord.PumpResult{
+					Status:        coord.PumpRecentlyFailed,
 					CooldownUntil: e.CooldownUntil,
-					Class:         e.Class,
+					FailureClass:  e.Class,
 				}
 			}
 		}
@@ -1944,7 +2021,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 		// caller's cold-start cascade polls DHT once and finds us as a
 		// provider, same flow as the in-flight case below.
 		if cstore != nil {
-			ctxHas, cancelHas := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			ctxHas, cancelHas := context.WithTimeout(pumpCtx, 100*time.Millisecond)
 			has, hasErr := cstore.Has(ctxHas, d)
 
 			cancelHas()
@@ -1965,36 +2042,78 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 			}
 
 			if has {
-				return time.Now(), true, nil
+				return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: time.Now()}
 			}
 		}
-		// Dedupe at this node: if a pull is already running, the
-		// stream handler must report ALREADY_PULLING with the existing
-		// start time so the requester can run the stall check.
+
+		if err := pumpCtx.Err(); err != nil {
+			return coord.PumpResult{Status: coord.PumpDeclined}
+		}
+
+		// Dedupe at this node BEFORE reserving a fanout slot: if a pull is
+		// already running, report ALREADY_PULLING with the existing start
+		// time so the requester can run the stall check. A piggybacking
+		// request starts no new work, so it must NOT be gated by the
+		// concurrent-pull ceiling - otherwise a saturated node would wrongly
+		// decline same-digest requests that should ride the in-flight pull.
+		// This is a peek (no claim), so it leaves no entry behind.
+		if existing, inflightNow := infl.LookupForIntent(d); inflightNow {
+			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: existing.StartedAt}
+		}
+
+		// Reserve the right to start a NEW pull before claiming the inflight
+		// entry. Claiming first and then declining (gate closed or fanout
+		// saturated) would insert a transient entry and cancel it via
+		// h.Done(); a concurrent please_pull for the same digest could observe
+		// that entry as ALREADY_PULLING and then wait on a pull that never
+		// actually starts.
+		//
+		// Refuse new work once graceful shutdown has closed the gate. The gate
+		// also tracks outstanding pulls so shutdown can wait for the advertise
+		// flush at the end of runOriginPull before closing the libp2p host
+		// (graceful-shutdown contract).
+		if !gate.TryAdd() {
+			return coord.PumpResult{Status: coord.PumpDeclined}
+		}
+
+		// Bound please-pull fanout: if we're already at the concurrent-pull
+		// ceiling, release the gate slot we just took and decline so the
+		// requester falls through to another provider instead of queueing
+		// unbounded origin fetches on this node.
+		select {
+		case pullSem <- struct{}{}:
+		default:
+			gate.Done()
+
+			return coord.PumpResult{Status: coord.PumpDeclined}
+		}
+
+		// Atomically claim the inflight entry. LookupForIntent above was only
+		// a peek, so a concurrent request for the same digest may have claimed
+		// it in between; Start is the authoritative check. If we lost that
+		// race, release the gate and fanout slots we reserved (the winner owns
+		// the real pull) and report its in-flight entry.
 		h, existing, already := infl.Start(d, kind, 0)
 		if already {
-			return existing.StartedAt, true, nil
+			<-pullSem
+			gate.Done()
+
+			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: existing.StartedAt}
 		}
-		// Detach the actual fetch from the stream handler. The pump
-		// returns immediately; the goroutine owns the inflight handle.
-		// wg lets graceful shutdown wait for the advertise flush at
-		// the end of runOriginPull before closing the libp2p host
-		// (graceful-shutdown contract).
+
 		startedAt := existing.StartedAt
 
-		if wg != nil {
-			wg.Add(1)
-		}
-
+		// Detach the actual fetch from the stream handler. The pump returns
+		// immediately; the goroutine owns the inflight handle, the gate slot,
+		// and the fanout semaphore slot, releasing all three on exit.
 		go func() {
-			if wg != nil {
-				defer wg.Done()
-			}
+			defer gate.Done()
+			defer func() { <-pullSem }()
 
 			runOriginPull(originClient, cstore, neg, lg, h, registry, repository, d, kind, markPresent, onOriginSuccess, onDownstreamFailure, leaseHooks)
 		}()
 
-		return startedAt, false, nil
+		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: startedAt}
 	}
 }
 

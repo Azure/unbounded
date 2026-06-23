@@ -137,6 +137,11 @@ impl PageChannel {
     /// paths already block their thread, so a brief alive-aware
     /// spin on the reply slot is acceptable.
     pub fn register_buffer(&self, base: *mut u8, len: usize) -> Result<(), Error> {
+        let reply = self.send_register_buffer(base, len)?;
+        spin_block_on_with_alive(reply.wait(), &self.service_alive)
+    }
+
+    fn send_register_buffer(&self, base: *mut u8, len: usize) -> Result<Arc<ReplySlot<()>>, Error> {
         let ptr = NonNull::new(base).ok_or(Error::Io(libc::EINVAL))?;
         let reply = ReplySlot::new();
         self.cmd_tx
@@ -146,7 +151,7 @@ impl PageChannel {
                 reply: reply.clone(),
             })
             .map_err(|_| Error::Io(libc::EPIPE))?;
-        spin_block_on_with_alive(reply.wait(), &self.service_alive)
+        Ok(reply)
     }
 
     /// Stable identity of the storage-core service this channel
@@ -745,6 +750,43 @@ mod tests {
         drop(channel);
         stop.store(true, Ordering::Release);
         service.join().expect("service thread");
+    }
+
+    #[test]
+    fn register_buffer_returns_eio_when_service_dies_after_send() {
+        let (channel, rx) = PageChannel::new();
+        let (sent_tx, sent_rx) = std_channel::<()>();
+        let caller = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 4096];
+            let reply = channel.send_register_buffer(buf.as_mut_ptr(), buf.len())?;
+            sent_tx.send(()).expect("notify register sent");
+            spin_block_on_with_alive(reply.wait(), &channel.service_alive)
+        });
+
+        sent_rx.recv().expect("register command sent");
+
+        // Convert the receiver into a service and then kill it without
+        // polling. This leaves the already-sent RegisterBuffer command
+        // unanswered, so the synchronous alive-aware spin must observe
+        // the liveness flip and return EIO instead of spinning forever.
+        let device = Arc::new(MockDevice::new(MockDeviceConfig {
+            page_size: 4096,
+            capacity_pages: 256,
+            ..Default::default()
+        }));
+        let mut cfg = EngineConfig::default();
+        cfg.page_size_bytes = 4096;
+        cfg.btree_page_bytes = 4096;
+        let engine = Arc::new(block_on(StorageEngine::open(device, cfg)).unwrap());
+        let service = PageService::new(engine, rx);
+        service.mark_dead();
+        drop(service);
+
+        let result = caller.join().expect("register caller");
+        assert!(
+            matches!(result, Err(Error::Io(n)) if n == libc::EIO),
+            "expected EIO when service died after send, got {result:?}",
+        );
     }
 
     /// Dropping every channel disconnects the service, which must

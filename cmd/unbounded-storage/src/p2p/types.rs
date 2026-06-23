@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 //! Shared value types for the stripe DHT: ring positions, topology
-//! labels, peer entries, and the recursive-routing request.
+//! tags, peer entries, and the recursive-routing request.
 
 use std::time::Instant;
 
@@ -31,14 +31,14 @@ pub struct NodeId(pub u64);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RingId(pub u64);
 
-/// Topology label vector in coarsest-to-finest order
-/// (e.g. region, zone, row, rack). Distance between two label
+/// Topology tag vector in coarsest-to-finest order
+/// (e.g. region, zone, row, rack). Distance between two tag
 /// vectors is the number of trailing slots that differ: same rack
 /// is 0, same row but different rack is 1, and entirely disjoint
 /// vectors are at distance `len`. Shorter vectors are right-padded
 /// with a wildcard sentinel that never matches.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct TopologyLabels(pub Vec<String>);
+pub struct TopologyTags(pub Vec<String>);
 
 /// A peer participating in the DHT. `ring` is the peer's hashed
 /// identity on the 64-bit ring; `node` is the local fabric
@@ -47,7 +47,7 @@ pub struct TopologyLabels(pub Vec<String>);
 pub struct PeerEntry {
     pub node: NodeId,
     pub ring: RingId,
-    pub labels: TopologyLabels,
+    pub tags: TopologyTags,
 }
 
 /// Recursive-routing request. Unlike the old source-routed

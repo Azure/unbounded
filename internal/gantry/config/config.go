@@ -165,6 +165,15 @@ type Config struct {
 	// means in-cluster service-account discovery (the production path).
 	MembersKubeconfig string `yaml:"members_kubeconfig"`
 
+	// MembersSyncTimeout is how long the agent waits for the initial
+	// pod and node informer list-and-watch to complete at startup.
+	// In production mode a timeout is fatal (it surfaces broken RBAC /
+	// API egress early rather than silently degrading). Raise this on
+	// clusters with a slow API server or during large-scale simultaneous
+	// DaemonSet rollouts where the apiserver is under elevated load.
+	// Zero means "use the built-in default of 30s".
+	MembersSyncTimeout time.Duration `yaml:"members_sync_timeout"`
+
 	// ---------- Storage backend ----------
 
 	// StorageMode selects which backend the agent uses as the read/write
@@ -249,11 +258,38 @@ type Config struct {
 	// `topology.kubernetes.io/zone` (the design doc).
 	ZoneLabelKey string `yaml:"zone_label_key"`
 
+	// CoordPeerAuthzEnforce flips coord peer authorization from
+	// observe-only (record the unauthorized-peer metric, still serve) to
+	// enforce (reject inbound coord requests whose libp2p peer ID is not
+	// in the membership view). Default false: ship observe-only first,
+	// verify peer-id annotations are visible for every ready Gantry pod,
+	// size p2p_coord_unauthorized_peer_total across a full rollout, then
+	// flip to true once it stays at zero.
+	CoordPeerAuthzEnforce bool `yaml:"coord_peer_authz_enforce"`
+
+	// CoordMaxDigestsPerRequest caps a single please_pull batch. The default
+	// 256 is intentionally far above normal manifest child counts while staying
+	// well below the 1 MiB coord envelope budget.
+	CoordMaxDigestsPerRequest int `yaml:"coord_max_digests_per_request"`
+
+	// CoordMaxConcurrentPulls caps background origin pulls started by inbound
+	// please_pull. Each pull holds an HTTP response body, a containerd writer,
+	// goroutine state, and a lease, so this protects the node from fan-out.
+	CoordMaxConcurrentPulls int `yaml:"coord_max_concurrent_pulls"`
+
 	// ---------- DHT / direct-origin-fallback ----------
 
 	// NF5JitterBase is the base delay in the direct-origin-fallback jitter window
 	// `[0, base * ln(N))` (the design doc default 3 s).
 	NF5JitterBase time.Duration `yaml:"nf5_jitter_base"`
+
+	// NF5JitterCap is a hard ceiling on the computed jitter window.
+	// Zero means no cap (original behaviour). Set this to bound worst-case
+	// cold-start latency on large clusters: at N=300 the uncapped window is
+	// ~17s; a cap of 10s limits the maximum additional delay imposed by NF5
+	// regardless of cluster size. The configured NF5JitterBase still
+	// controls the shape of the distribution up to the cap.
+	NF5JitterCap time.Duration `yaml:"nf5_jitter_cap"`
 
 	// NF5PerNodeRateLimit is the per-node direct-origin fallback rate
 	// (token bucket, fallbacks/minute; the design doc default 2).
@@ -349,6 +385,7 @@ func NewDefault() *Config {
 		MembersNamespace:     "",
 		MembersLabelSelector: "app.kubernetes.io/name=gantry",
 		MembersKubeconfig:    "",
+		MembersSyncTimeout:   0, // zero means use built-in default of 30s
 
 		StorageMode: StorageModeContainerd,
 
@@ -363,7 +400,12 @@ func NewDefault() *Config {
 		HRWTopologyScope: "cluster",
 		ZoneLabelKey:     "topology.kubernetes.io/zone",
 
+		CoordPeerAuthzEnforce:     false,
+		CoordMaxDigestsPerRequest: 256,
+		CoordMaxConcurrentPulls:   16,
+
 		NF5JitterBase:               3 * time.Second,
+		NF5JitterCap:                0, // no cap by default (original behaviour)
 		NF5PerNodeRateLimit:         2,
 		BootstrapWindow:             30 * time.Second,
 		BootstrapRoutingTablePct:    25,
@@ -451,6 +493,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setStr("MEMBERS_NAMESPACE", &c.MembersNamespace)
 	setStr("MEMBERS_LABEL_SELECTOR", &c.MembersLabelSelector)
 	setStr("MEMBERS_KUBECONFIG", &c.MembersKubeconfig)
+	setDur("MEMBERS_SYNC_TIMEOUT", &c.MembersSyncTimeout)
 
 	// Deprecated env vars (GANTRY_CACHE_DIR, GANTRY_CACHE_BUDGET_BYTES,
 	// GANTRY_CACHE_FORCED_EVICTION_HEADROOM_PCT,
@@ -469,8 +512,12 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("HRW_K", &c.HRWK)
 	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
 	setStr("ZONE_LABEL_KEY", &c.ZoneLabelKey)
+	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
+	setInt("COORD_MAX_DIGESTS_PER_REQUEST", &c.CoordMaxDigestsPerRequest)
+	setInt("COORD_MAX_CONCURRENT_PULLS", &c.CoordMaxConcurrentPulls)
 
 	setDur("NF5_JITTER_BASE", &c.NF5JitterBase)
+	setDur("NF5_JITTER_CAP", &c.NF5JitterCap)
 	setInt("NF5_PER_NODE_RATE_LIMIT", &c.NF5PerNodeRateLimit)
 	setDur("BOOTSTRAP_WINDOW", &c.BootstrapWindow)
 	setInt("BOOTSTRAP_ROUTING_TABLE_PCT", &c.BootstrapRoutingTablePct)
@@ -502,6 +549,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.MembersNamespace, "members-namespace", c.MembersNamespace, "namespace to scope the pod informer (REQUIRED when node_name+pod_name are set - AnnounceSelf needs it to self-patch; empty is dev-only)")
 	fs.StringVar(&c.MembersLabelSelector, "members-label-selector", c.MembersLabelSelector, "label selector identifying Gantry DaemonSet pods")
 	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional path to a kubeconfig file (empty = in-cluster)")
+	fs.DurationVar(&c.MembersSyncTimeout, "members-sync-timeout", c.MembersSyncTimeout, "how long to wait for the pod/node informer initial sync at startup (0 = use built-in default of 30s)")
 
 	// Deprecated cache flags (--cache-dir, --cache-budget-bytes,
 	// --cache-forced-eviction-headroom-pct,
@@ -520,8 +568,12 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "HRW top-K size")
 	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, `HRW scope: "cluster" or "zone"`)
 	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "Kubernetes node label identifying the zone (used when hrw-topology-scope=zone)")
+	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "reject inbound coord requests from peers not in the membership view (default false = observe-only)")
+	fs.IntVar(&c.CoordMaxDigestsPerRequest, "coord-max-digests-per-request", c.CoordMaxDigestsPerRequest, "maximum digests accepted in one please_pull batch")
+	fs.IntVar(&c.CoordMaxConcurrentPulls, "coord-max-concurrent-pulls", c.CoordMaxConcurrentPulls, "maximum background origin pulls started by inbound please_pull")
 
 	fs.DurationVar(&c.NF5JitterBase, "nf5-jitter-base", c.NF5JitterBase, "base delay for the NF5 jitter window")
+	fs.DurationVar(&c.NF5JitterCap, "nf5-jitter-cap", c.NF5JitterCap, "hard ceiling on the NF5 jitter window (0 = no cap)")
 	fs.IntVar(&c.NF5PerNodeRateLimit, "nf5-per-node-rate-limit", c.NF5PerNodeRateLimit, "per-node direct-origin fallback rate (per minute)")
 	fs.DurationVar(&c.BootstrapWindow, "bootstrap-window", c.BootstrapWindow, "time after startup during which DHT-empty is not trusted as cold-start")
 	fs.IntVar(&c.BootstrapRoutingTablePct, "bootstrap-routing-table-pct", c.BootstrapRoutingTablePct, "routing-table-size percent that ends the bootstrap window")
@@ -692,8 +744,24 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("hrw_topology_scope %q: must be \"cluster\" or \"zone\"", c.HRWTopologyScope))
 	}
 
+	if c.CoordMaxDigestsPerRequest < 1 {
+		errs = append(errs, fmt.Errorf("coord_max_digests_per_request: must be >= 1, got %d", c.CoordMaxDigestsPerRequest))
+	}
+
+	if c.CoordMaxConcurrentPulls < 1 {
+		errs = append(errs, fmt.Errorf("coord_max_concurrent_pulls: must be >= 1, got %d", c.CoordMaxConcurrentPulls))
+	}
+
 	if c.NF5JitterBase <= 0 {
 		errs = append(errs, fmt.Errorf("nf5_jitter_base: must be > 0, got %v", c.NF5JitterBase))
+	}
+
+	if c.NF5JitterCap < 0 {
+		errs = append(errs, fmt.Errorf("nf5_jitter_cap: must be >= 0, got %v", c.NF5JitterCap))
+	}
+
+	if c.NF5JitterCap > 0 && c.NF5JitterBase > 0 && c.NF5JitterCap < c.NF5JitterBase {
+		errs = append(errs, fmt.Errorf("nf5_jitter_cap (%v) must be >= nf5_jitter_base (%v) when set", c.NF5JitterCap, c.NF5JitterBase))
 	}
 
 	if c.NF5PerNodeRateLimit < 1 {

@@ -44,22 +44,8 @@ const (
 	// must be a multiple of the page size and large enough to hold every
 	// stripe of the largest object on one node. The proto3-native config
 	// schema takes byte sizes as plain integers (see
-	// cmd/unbounded-storage/proto/config.proto), so this is 2 GiB.
+	// api/unbounded-storage/config.proto), so this is 2 GiB.
 	storageDiskSize = 2 * 1024 * 1024 * 1024
-
-	// storageBackendKindS3 and storageFrontendKindS3 are the proto3
-	// BackendKind/FrontendKind discriminants for the native S3 surface
-	// (BACKEND_KIND_S3 / FRONTEND_KIND_S3 == 1).
-	storageBackendKindS3  = 1
-	storageFrontendKindS3 = 1
-
-	// storagePeerTransportTCP is the proto3 PeerTransport discriminant
-	// for the libfabric tcp provider (PEER_TRANSPORT_TCP == 0).
-	storagePeerTransportTCP = 0
-
-	// storageDiskKindFile is the proto3 DiskKind discriminant for a
-	// file-backed disk (DISK_KIND_FILE == 2).
-	storageDiskKindFile = 2
 )
 
 // storageBinary returns the path to the built unbounded-storage binary.
@@ -136,54 +122,64 @@ func freeLoopbackPort(t *testing.T) int {
 // writeStorageConfig writes a single unbounded-storage node TOML whose
 // S3 backend points at orcaEdge ("host:port"). The shape mirrors the
 // config produced by hack/smoke-storage.py write_config: the schema is
-// proto3-native, so enum fields are plain integer discriminants, byte
-// sizes are plain integer byte counts, and the startup-fixed knobs
-// (heap backing, fabric listen address, forcing the tcp provider) live
-// in the `[startup.*]` sections.
+// proto3-native, so byte sizes are plain integer byte counts and
+// backend/frontend/peer/disk implementations are selected by oneof
+// config table names. The startup-fixed knobs (heap backing, fabric
+// bind address, forcing the tcp provider) live in the `[startup.*]` sections.
 func writeStorageConfig(t *testing.T, path, fabricAddr string, localID, peerID int, peerAddr, diskPath, orcaEdge, frontendBind string) {
 	t.Helper()
 
-	cfg := fmt.Sprintf(`[p2p]
-local_node_id = %d
+	cfg := fmt.Sprintf(`[[backends]]
+name = "origin"
 
-[[peers]]
-id = %d
-transport = %d
-address = "%s"
-
-[[disks]]
-path = "%s"
-kind = %d
-size = %d
-page_size_bytes = %d
-bypass_admission = true
-skip_recovery_scan_if_no_meta = true
-
-[[backends]]
-id = "origin"
-kind = %d
-endpoint = "%s"
+[backends.config.s3]
+url = "%s"
 stripe_size_bytes = %d
 
+[[neighborhoods]]
+name = "p2p"
+source = "origin"
+local_node_id = %d
+
+[[neighborhoods.peers]]
+id = %d
+
+[neighborhoods.peers.config.tcp]
+addr = "%s"
+
+[[caches]]
+name = "cache"
+source = "p2p"
+
+[[caches.disks]]
+page_size_bytes = %d
+skip_recovery_scan = true
+
+[caches.disks.config.file]
+path = "%s"
+size = %d
+
 [[frontends]]
-id = "fe"
-kind = %d
-bind = "%s"
-backend = "origin"
+name = "fe"
+source = "cache"
+
+[frontends.config.s3]
+addr = "%s"
 
 [startup.memory]
 no_hugepages = true
 
-[startup.fabric]
-listen_addr = "%s"
+[startup.fabric.binds.tcp]
+addr = "%s"
 
 [startup.topology]
 disable_rdma = true
-`, localID,
-		peerID, storagePeerTransportTCP, peerAddr,
-		diskPath, storageDiskKindFile, storageDiskSize, storagePageSize,
-		storageBackendKindS3, orcaEdge, storageStripeSize,
-		storageFrontendKindS3, frontendBind,
+serving_cores = 2
+`, orcaEdge, storageStripeSize,
+		localID,
+		peerID, peerAddr,
+		storagePageSize, diskPath, storageDiskSize,
+		frontendBind,
 		fabricAddr)
 
 	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {

@@ -677,7 +677,7 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Resolve libfabric version from Makefile
         run: |
@@ -699,7 +699,9 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates curl liburing-dev
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config ca-certificates curl liburing-dev \
+            libibverbs-dev librdmacm-dev
 
       # The distro libfabric (1.x) predates the merge of the experimental
       # `net` provider into `tcp`, so it lacks a native FI_EP_RDM `tcp`

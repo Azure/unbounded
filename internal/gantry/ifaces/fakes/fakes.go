@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/errdefs"
+
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
@@ -97,7 +99,11 @@ func (w *contentWriter) Commit(_ context.Context) error {
 
 	got := hex.EncodeToString(w.h.Sum(nil))
 	if got != w.want.Hex() {
-		return fmt.Errorf("digest mismatch: got sha256:%s, want %s", got, w.want.String())
+		// Wrap errdefs.ErrFailedPrecondition so callers classify this the
+		// same way they classify a real containerd content-store Commit
+		// digest/size mismatch (which wraps the same sentinel), rather
+		// than relying on the human-readable message text.
+		return fmt.Errorf("digest mismatch: got sha256:%s, want %s: %w", got, w.want.String(), errdefs.ErrFailedPrecondition)
 	}
 
 	w.cache.mu.Lock()

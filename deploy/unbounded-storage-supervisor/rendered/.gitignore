@@ -1,0 +1,4 @@
+# Keep this directory present in the repo. `make unbounded-storage-supervisor-manifests`
+# writes the rendered manifests here; none of that output is tracked.
+*
+!.gitignore

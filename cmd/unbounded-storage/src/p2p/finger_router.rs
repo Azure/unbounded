@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::bufferpool::Req;
 use crate::fabric::{PeerId, PeerRouter};
-use crate::p2p::{FingerTable, NodeId, RoutingHandle, stripe_to_ring};
+use crate::p2p::{FingerTable, NodeId, RouteTableHandle, RoutingHandle, stripe_to_ring};
 
 /// `PeerRouter` backed by a finger table. Maps a request's stripe to
 /// the owning peer's `PeerId` via the Chord `next_hop` lookup, then
@@ -25,6 +25,10 @@ use crate::p2p::{FingerTable, NodeId, RoutingHandle, stripe_to_ring};
 /// handle is observed here without rebuilding the router.
 pub struct FingerRouter {
     routing: RoutingHandle,
+}
+
+pub struct ChainFingerRouter {
+    routes: RouteTableHandle,
 }
 
 impl FingerRouter {
@@ -45,12 +49,27 @@ impl FingerRouter {
     }
 }
 
+impl ChainFingerRouter {
+    pub fn new(routes: RouteTableHandle) -> Self {
+        Self { routes }
+    }
+}
+
 impl<R: Req> PeerRouter<R> for FingerRouter {
     fn route(&self, req: &R) -> Option<PeerId> {
         let target = stripe_to_ring(req.key());
         let snap = self.routing.snapshot();
         snap.fingers
             .next_hop(target)
+            .and_then(|pe| snap.node_to_peer.get(&pe.node).copied())
+    }
+}
+
+impl<R: Req> PeerRouter<R> for ChainFingerRouter {
+    fn route(&self, req: &R) -> Option<PeerId> {
+        let snap = self.routes.route_for_req(req)?;
+        snap.fingers
+            .next_hop(stripe_to_ring(req.key()))
             .and_then(|pe| snap.node_to_peer.get(&pe.node).copied())
     }
 }
@@ -63,7 +82,7 @@ mod tests {
     use crate::bufferpool::{Req, StripeKey};
     use crate::fabric::{PeerId, PeerRouter};
     use crate::p2p::{
-        FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyLabels, node_to_ring,
+        FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyTags, node_to_ring,
         stripe_to_ring,
     };
 
@@ -81,7 +100,7 @@ mod tests {
         PeerEntry {
             node: NodeId(node),
             ring: node_to_ring(NodeId(node)),
-            labels: TopologyLabels(vec!["r".to_string()]),
+            tags: TopologyTags(vec!["r".to_string()]),
         }
     }
 

@@ -5,48 +5,50 @@
 //! stream, RMA-write pages to the client's destination MR, and
 //! ack each page.
 //!
-//! Wire framing (mirror of `transport.rs`):
+//! Wire framing (mirror of `transport.rs`, see [`super::wire`]):
 //!
-//! * Reserved tag bases ([`REQUEST_TAG_BASE`], [`PAGE_ACK_TAG_BASE`],
-//!   [`RESPONSE_END_TAG_BASE`], [`ERROR_ACK_TAG_BASE`]). The low 32
-//!   bits of every tag carry the `request_id`.
-//! * On the wire: client `fi_tsend`s a bincode-encoded
+//! * Every message carries an 8-byte [`MsgHeader`] prefix naming its
+//!   [`MsgKind`] and `request_id`. There is no tagged demux under
+//!   `FI_EP_MSG`; the per-connection receive pool parses the header and
+//!   the [`InboundDispatch`](super::dispatch) routes it.
+//! * Client -> server: a [`MsgKind::Request`] framing a bincode-encoded
 //!   [`RequestHeader`] followed by the bincode-encoded `R` body.
-//!   bincode(PageAck))` per RMA-written page. A full success (all
-//!   `dest_pages` written) sends no terminator: the client knows
-//!   `dest_pages` up front and treats "all pages acked" as
-//!   end-of-stream. A `fi_tsend(RESPONSE_END_TAG_BASE | rid)` (zero
-//!   payload) is sent only for a short success that wrote fewer than
-//!   `dest_pages` pages (including the zero-page case); an error at any
-//!   point sends `fi_tsend(ERROR_ACK_TAG_BASE | rid, bincode(ErrorAck))`.
+//! * Server -> client: one [`MsgKind::PageAck`] per RMA-written page. A
+//!   full success (all `dest_pages` written) sends no terminator: the
+//!   client knows `dest_pages` up front and treats "all pages acked" as
+//!   end-of-stream. A [`MsgKind::ResponseEnd`] (zero payload) is sent
+//!   only for a short success that wrote fewer than `dest_pages` pages
+//!   (including the zero-page case); an error at any point sends a
+//!   [`MsgKind::ErrorAck`].
 //!
-//!   The terminator is omitted on full success to avoid racing the
-//!   client's stream teardown: the client `fi_cancel`s its posted
-//!   terminator recv as soon as it has all pages, and a `RESPONSE_END`
-//!   that lost that race was stranded as an unexpected message,
-//!   accumulating until the `tcp` provider's receive buffering was
-//!   exhausted and the data path wedged.
+//! All server replies (acks and RMA writes) go back out the same
+//! connected endpoint the request arrived on, named by the
+//! [`ReplyCtx`] the dispatch hands to [`RequestSink::submit`]. Because
+//! the endpoint is connected, every send and write uses
+//! `dest_addr = FI_ADDR_UNSPEC`.
 //!
 //! **Worker model**: a fixed pool of `rpc_worker_threads` long-lived
 //! OS threads is spawned at `start_rpc_server`, each pinned to the
-//! shard's `worker_idx`. The recv-completion handler runs on the
-//! progress thread; it re-posts a fresh recv and enqueues the decoded
-//! request onto a bounded [`JobQueue`](super::rpc_queue::JobQueue)
-//! rather than spawning a thread per request. A pool worker pulls the
-//! job, drives the handler stream to completion, RMA-writes pages, and
-//! blocks on each libfabric completion with a *real* waker that unparks
-//! the worker (see [`park`](super::park)); the progress-thread
-//! completion path resolves the wait immediately. Queue depth is capped
-//! at `max_inflight` (back-pressure); excess requests get a fast
-//! "server overloaded" `ERROR_ACK`. `RpcServerHandle::drop` sets a
-//! shutdown flag, closes the queue, and joins every worker.
+//! shard's `worker_idx`. Inbound requests are demultiplexed on the
+//! progress thread by the connection's receive pool, handed to the
+//! installed [`RequestSink`], decoded, and enqueued onto a bounded
+//! [`JobQueue`](super::rpc_queue::JobQueue) rather than spawning a
+//! thread per request. A pool worker pulls the job, drives the handler
+//! stream to completion, RMA-writes pages, and blocks on each libfabric
+//! completion with a *real* waker that unparks the worker; the
+//! progress-thread completion path resolves the wait immediately. Queue
+//! depth is capped at `max_inflight` (back-pressure); excess requests
+//! get a fast "server overloaded" `ERROR_ACK`. `RpcServerHandle::drop`
+//! uninstalls the request sink, sets a shutdown flag, closes the queue,
+//! and joins every worker.
 //!
-//! **MR strategy** (per Phase 5a spec, option (a)): we allocate
-//! request-recv buffers per outstanding recv and free them in the
-//! recv completion handler. No bounce-buffer MR is registered for
-//! ack sends - the tcp / verbs providers' FI_MR_LOCAL requirement is
-//! satisfied with `desc=NULL` in practice, mirroring `ping.rs`.
+//! **MR strategy**: ack/terminator sends use `desc = NULL` (the
+//! providers' `FI_MR_LOCAL` requirement is satisfied for these small
+//! framed control messages without a registered bounce buffer). The
+//! `fi_write` source uses the registered local backing MR's descriptor.
 
+use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -60,21 +62,13 @@ use crate::runtime::{JoinHandle, park_block_on_until, thread_waker};
 
 use super::backing::MrHandle;
 use super::completion::{CompletionFuture, CompletionInfo, CompletionSlot};
+use super::dispatch::{EpPtr, ReplyCtx, RequestSink};
 use super::error::{FabricError, Result as FabResult};
 use super::fabric::{Fabric, FabricInner};
 use super::ffi;
 use super::handler::{Handler, HandlerStream};
 use super::rpc_queue::{Job, JobQueue};
-
-// Reserved tag bases for the RPC protocol. The low 32 bits carry the
-// request id; the high 32 bits select the message class.
-pub const REQUEST_TAG_BASE: u64 = 0xFFFF_FFFC_0000_0000;
-pub const PAGE_ACK_TAG_BASE: u64 = 0xFFFF_FFFA_0000_0000;
-pub const RESPONSE_END_TAG_BASE: u64 = 0xFFFF_FFF8_0000_0000;
-pub const ERROR_ACK_TAG_BASE: u64 = 0xFFFF_FFF6_0000_0000;
-
-const REQ_TAG_IGNORE: u64 = 0x0000_0000_FFFF_FFFF;
-const REQUEST_RECV_BUF_LEN: usize = 64 * 1024;
+use super::wire::{MsgHeader, MsgKind};
 
 /// How long a worker parks in a single slice while blocked on a
 /// libfabric completion before re-checking the server shutdown flag.
@@ -97,6 +91,11 @@ pub const MAX_HOPS: u32 = 64;
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RequestHeader {
     pub request_id: u32,
+    /// Recycled 16-bit handle identifying the client stream that should
+    /// receive page-landed signals. The server echoes it in the high 16
+    /// bits of each write-with-immediate (the low 16 bits carry the page
+    /// ordinal), so the client can demux landed pages back to the request.
+    pub page_handle: u16,
     pub dest_mr_base: u64,
     pub dest_mr_key: u64,
     pub dest_pages: u32,
@@ -115,6 +114,7 @@ impl RequestHeader {
     #[doc(hidden)]
     pub fn new(
         request_id: u32,
+        page_handle: u16,
         dest_mr: &MrHandle,
         dest_pages: u32,
         src: BulkRef,
@@ -122,6 +122,7 @@ impl RequestHeader {
     ) -> Self {
         Self {
             request_id,
+            page_handle,
             dest_mr_base: dest_mr.remote_base,
             dest_mr_key: dest_mr.remote_key,
             dest_pages,
@@ -143,6 +144,7 @@ impl RequestHeader {
 
     fn encoded_len() -> Option<usize> {
         bincode::serialized_size(&Self::new(
+            0,
             0,
             &MrHandle {
                 mr: ptr::null_mut(),
@@ -186,23 +188,87 @@ struct ServerShared {
     /// [`Fabric::start_rpc_server`] to match the bufferpool's actual
     /// page size.
     page_size: usize,
-    /// Bounded queue feeding the persistent worker pool. The recv
-    /// handler (progress thread) pushes decoded requests; workers pop
+    /// Bounded queue feeding the persistent worker pool. The request
+    /// sink (progress thread) pushes decoded requests; workers pop
     /// and serve them. Closed on shutdown so workers drain and exit.
     queue: Arc<JobQueue>,
     /// Set on shutdown. Workers check it between handler-stream polls
     /// to abandon an in-flight stream with a fast `ERROR_ACK`.
     shutdown: AtomicBool,
     /// Number of requests currently queued or being served. Bounded by
-    /// `max_inflight` as the server-side back-pressure limit: a recv
+    /// `max_inflight` as the server-side back-pressure limit: a request
     /// that would exceed it is rejected with a "server overloaded"
     /// `ERROR_ACK` instead of being enqueued.
     inflight: AtomicU64,
 }
 
-/// Handle returned from `Fabric::start_rpc_server`. Drop signals
-/// shutdown to the worker pool, closes the job queue, and joins every
-/// worker thread before returning, so no worker outlives the handle.
+/// Inbound-request sink installed on the dispatch table. Decodes each
+/// `REQUEST` frame, applies back-pressure, and enqueues a job onto the
+/// worker pool. Erased to `Arc<dyn RequestSink>` when installed.
+struct ServerSink<R, H> {
+    shared: Arc<ServerShared>,
+    handler: Arc<H>,
+    _marker: PhantomData<fn() -> R>,
+}
+
+impl<R, H> RequestSink for ServerSink<R, H>
+where
+    R: Req + DeserializeOwned + Send + 'static,
+    H: Handler<R> + Send + Sync + 'static,
+{
+    fn submit(&self, reply: ReplyCtx, request_id: u32, body: Vec<u8>) {
+        // bincode encodes RequestHeader as a fixed-width prefix because
+        // every field is a fixed-width integer; ask bincode for that
+        // prefix length and split the framed body.
+        let header_len = RequestHeader::encoded_len().unwrap_or(0);
+        if body.len() < header_len {
+            return;
+        }
+        let header: RequestHeader = match bincode::deserialize(&body[..header_len]) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let req: R = match bincode::deserialize(&body[header_len..]) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let shared = &self.shared;
+        // Back-pressure: bound the number of requests queued or being
+        // served to `max_inflight`. A request over the cap is shed with
+        // a fast "server overloaded" ack instead of being enqueued. This
+        // runs on the progress thread, so the rejection ack is
+        // fire-and-forget (see `reject_overloaded`).
+        let max_inflight = shared.fabric.cfg.max_inflight as u64;
+        let prev = shared.inflight.fetch_add(1, Ordering::AcqRel);
+        if prev >= max_inflight {
+            shared.inflight.fetch_sub(1, Ordering::AcqRel);
+            crate::metrics::fabric_rpc_served(crate::metrics::Outcome::Err);
+            let _ = reject_overloaded(shared, reply.ep, request_id);
+            return;
+        }
+        crate::metrics::fabric_inflight_delta(1);
+
+        let shared_for_job = shared.clone();
+        let handler_for_job = self.handler.clone();
+        let job: Job = Box::new(move || {
+            run_worker::<R, H>(shared_for_job.clone(), handler_for_job, header, req, reply);
+            shared_for_job.inflight.fetch_sub(1, Ordering::AcqRel);
+            crate::metrics::fabric_inflight_delta(-1);
+        });
+        if shared.queue.push(job).is_err() {
+            // Queue closed (server shutting down): the job never runs, so
+            // release the in-flight reservation it would have decremented.
+            shared.inflight.fetch_sub(1, Ordering::AcqRel);
+            crate::metrics::fabric_inflight_delta(-1);
+        }
+    }
+}
+
+/// Handle returned from `Fabric::start_rpc_server`. Drop uninstalls the
+/// request sink, signals shutdown to the worker pool, closes the job
+/// queue, and joins every worker thread before returning, so no worker
+/// outlives the handle.
 pub struct RpcServerHandle {
     shared: Arc<ServerShared>,
     /// Join handles for the persistent worker pool. Owned here (not in
@@ -212,14 +278,16 @@ pub struct RpcServerHandle {
 
 impl Drop for RpcServerHandle {
     fn drop(&mut self) {
-        // Signal in-flight handlers to bail out, then close the queue so
-        // idle workers wake and any still-queued jobs drain (each sees
-        // the shutdown flag and finishes fast). Unpark every worker so
-        // one blocked inside a completion wait (a fixed `fi_write`/ack to
-        // a slow or dead peer) re-polls, observes the shutdown flag, and
-        // abandons the wait instead of parking out its 10s deadline.
-        // Joining then guarantees every worker has stopped touching the
-        // fabric before it is torn down.
+        // Uninstall the sink first so no new request is decoded or
+        // enqueued, and so the `InboundDispatch -> ServerSink ->
+        // ServerShared -> FabricInner` ownership cycle is broken (the
+        // fabric can never drop while the sink is installed). Then
+        // signal in-flight handlers to bail out, close the queue so idle
+        // workers wake and any still-queued jobs drain, unpark every
+        // worker so one blocked inside a completion wait re-polls and
+        // observes the shutdown flag, and finally join so every worker
+        // has stopped touching the fabric before it is torn down.
+        self.shared.fabric.dispatch.uninstall_server();
         self.shared.shutdown.store(true, Ordering::Release);
         self.shared.queue.close();
         for worker in &self.workers {
@@ -244,7 +312,7 @@ impl Fabric {
     ) -> FabResult<RpcServerHandle>
     where
         R: Req + Serialize + DeserializeOwned + Send + 'static,
-        H: Handler<R> + 'static,
+        H: Handler<R> + Send + Sync + 'static,
     {
         let shared = Arc::new(ServerShared {
             fabric: self.inner_arc(),
@@ -255,10 +323,10 @@ impl Fabric {
             inflight: AtomicU64::new(0),
         });
 
-        // Spawn the persistent worker pool before posting recvs so a
-        // request that lands immediately has a consumer waiting. Pin to
-        // this shard's worker index (Phase 2: not the hardcoded
-        // `WorkerIdx(0)`) so handler scratch/MR access stays NUMA-local.
+        // Spawn the persistent worker pool before installing the request
+        // sink so a request that lands immediately has a consumer
+        // waiting. Pin to this shard's worker index so handler
+        // scratch/MR access stays NUMA-local.
         let runtime = shared.fabric.cfg.runtime.clone();
         let worker_idx = shared.fabric.cfg.worker_idx;
         let pool_size = shared.fabric.cfg.rpc_worker_threads.max(1);
@@ -272,11 +340,16 @@ impl Fabric {
             ));
         }
 
-        let max_inflight = shared.fabric.cfg.max_inflight;
-        let posted = posted_request_recvs(shared.fabric.cfg.rpc_posted_recvs, max_inflight);
-        for _ in 0..posted {
-            post_request_recv::<R, H>(&shared, &handler)?;
-        }
+        // Install the inbound-request sink. From here on, requests
+        // demultiplexed by any connection's receive pool are decoded and
+        // enqueued by `ServerSink::submit`.
+        let sink: Arc<dyn RequestSink> = Arc::new(ServerSink::<R, H> {
+            shared: shared.clone(),
+            handler,
+            _marker: PhantomData,
+        });
+        self.dispatch().install_server(sink);
+
         Ok(RpcServerHandle { shared, workers })
     }
 }
@@ -289,141 +362,22 @@ fn worker_loop(queue: &JobQueue) {
     }
 }
 
-/// How many request receive buffers to keep posted.
-///
-/// Server-side download concurrency for a single object is bounded by
-/// how many page requests can be outstanding at once, so this should be
-/// large enough to cover a downloading client's prefetch window. It is
-/// clamped to at least 1 and to at most half the completion registry
-/// capacity (`max_inflight`) so the write and ack completions issued
-/// while serving those requests always have free registry slots.
-fn posted_request_recvs(rpc_posted_recvs: usize, max_inflight: usize) -> usize {
-    rpc_posted_recvs.clamp(1, (max_inflight / 2).max(1))
-}
-
-fn post_request_recv<R, H>(shared: &Arc<ServerShared>, handler: &Arc<H>) -> FabResult<()>
-where
-    R: Req + Serialize + DeserializeOwned + Send + 'static,
-    H: Handler<R> + 'static,
-{
-    let inner = &shared.fabric;
-    let buf: Box<[u8; REQUEST_RECV_BUF_LEN]> = Box::new([0u8; REQUEST_RECV_BUF_LEN]);
-    let buf_ptr = Box::into_raw(buf);
-    let (slot, _fut) = inner.completions.allocate()?;
-
-    let shared_for_handler = shared.clone();
-    let handler_for_handler = handler.clone();
-    let buf_addr = buf_ptr as usize;
-    slot.set_handler(move |result| {
-        // SAFETY: buf_addr just produced by Box::into_raw; handler is
-        // invoked exactly once by the progress thread.
-        let recv_buf: Box<[u8; REQUEST_RECV_BUF_LEN]> =
-            unsafe { Box::from_raw(buf_addr as *mut [u8; REQUEST_RECV_BUF_LEN]) };
-        let info = match result {
-            Ok(i) => i.clone(),
-            Err(_) => return,
-        };
-        let bytes = &recv_buf[..info.bytes.min(recv_buf.len())];
-
-        // bincode encodes RequestHeader as a fixed-width prefix
-        // because every field is a fixed-width integer; ask bincode
-        // for that prefix length and split the buffer.
-        let header_len = RequestHeader::encoded_len().unwrap_or(0);
-        if bytes.len() < header_len {
-            let _ = post_request_recv::<R, H>(&shared_for_handler, &handler_for_handler);
-            return;
-        }
-        let header: RequestHeader = match bincode::deserialize(&bytes[..header_len]) {
-            Ok(h) => h,
-            Err(_) => {
-                let _ = post_request_recv::<R, H>(&shared_for_handler, &handler_for_handler);
-                return;
-            }
-        };
-        let req: R = match bincode::deserialize(&bytes[header_len..]) {
-            Ok(r) => r,
-            Err(_) => {
-                let _ = post_request_recv::<R, H>(&shared_for_handler, &handler_for_handler);
-                return;
-            }
-        };
-
-        let _ = post_request_recv::<R, H>(&shared_for_handler, &handler_for_handler);
-
-        let src_addr = info.src_addr;
-        // Back-pressure: bound the number of requests queued or being
-        // served to `max_inflight`. A request over the cap is shed with
-        // a fast "server overloaded" ack instead of being enqueued, so
-        // an overloaded server stops the queue from growing unboundedly.
-        // This runs on the progress thread, so the rejection ack is
-        // fire-and-forget (see `reject_overloaded`).
-        let max_inflight = shared_for_handler.fabric.cfg.max_inflight as u64;
-        let prev = shared_for_handler.inflight.fetch_add(1, Ordering::AcqRel);
-        if prev >= max_inflight {
-            shared_for_handler.inflight.fetch_sub(1, Ordering::AcqRel);
-            let _ = reject_overloaded(&shared_for_handler, src_addr, header.request_id);
-            return;
-        }
-
-        let shared_for_job = shared_for_handler.clone();
-        let handler_for_job = handler_for_handler.clone();
-        let job: Job = Box::new(move || {
-            run_worker::<R, H>(
-                shared_for_job.clone(),
-                handler_for_job,
-                header,
-                req,
-                src_addr,
-            );
-            shared_for_job.inflight.fetch_sub(1, Ordering::AcqRel);
-        });
-        if shared_for_handler.queue.push(job).is_err() {
-            // Queue closed (server shutting down): the job never runs, so
-            // release the in-flight reservation it would have decremented.
-            shared_for_handler.inflight.fetch_sub(1, Ordering::AcqRel);
-        }
-    });
-    let ctx = slot.into_raw();
-    // SAFETY: ep, buf_ptr, ctx all live for the call.
-    let rc = unsafe {
-        ffi::ub_fi_trecv(
-            inner.ep(),
-            buf_ptr as *mut std::ffi::c_void,
-            REQUEST_RECV_BUF_LEN,
-            ptr::null_mut(),
-            ffi::FI_ADDR_UNSPEC,
-            REQUEST_TAG_BASE,
-            REQ_TAG_IGNORE,
-            ctx,
-        )
-    };
-    if rc < 0 {
-        // SAFETY: just produced from into_raw.
-        let _ = unsafe { CompletionSlot::from_raw(ctx) };
-        // SAFETY: just produced from Box::into_raw.
-        let _ = unsafe { Box::from_raw(buf_ptr) };
-        return Err(FabricError::Pkg("fi_trecv (request)", rc as i32));
-    }
-    Ok(())
-}
-
 fn run_worker<R, H>(
     shared: Arc<ServerShared>,
     handler: Arc<H>,
     header: RequestHeader,
     req: R,
-    src_addr: u64,
+    reply: ReplyCtx,
 ) where
     R: Req,
     H: Handler<R>,
 {
-    if src_addr == ffi::FI_ADDR_UNSPEC {
-        return;
-    }
+    let ep = reply.ep;
+    let started = std::time::Instant::now();
 
     let mut log = Some({
         let mut l = crate::obs::ReqLog::new("fabric.serve");
-        l.field("peer", src_addr)
+        l.field("peer", reply.peer.0)
             .field("req_id", header.request_id)
             .hexkey("stripe", &header.src_stripe)
             .field("off", header.src_offset)
@@ -435,21 +389,17 @@ fn run_worker<R, H>(
     // The hop budget (`ttl`) is NOT rejected here. The RPC layer is
     // generic over the handler and does not run the Chord routing, so
     // it cannot tell an owner-serve from a forward. A node that owns
-    // the requested stripe must serve locally even at `ttl == 0` (this
-    // is reachable when a chain is exactly `MAX_HOPS` long: the last
-    // forwarder, with `hops_remaining == 1`, forwards with `ttl - 1 ==
-    // 0` to the owner). Enforcing the hop limit unconditionally here
-    // silently shrank the budget by one and turned a valid owner-serve
-    // into a hard error. The decision belongs to the handler: it is
-    // handed `header.ttl` as `hops_remaining` below and rejects only
-    // when it would actually have to forward with no budget left
-    // (surfaced as a handler error that becomes an `ERROR_ACK`).
+    // the requested stripe must serve locally even at `ttl == 0`. The
+    // decision belongs to the handler: it is handed `header.ttl` as
+    // `hops_remaining` below and rejects only when it would actually
+    // have to forward with no budget left (surfaced as a handler error
+    // that becomes an `ERROR_ACK`).
     let local_mr = match shared.local_mr {
         Some(m) => m,
         None => {
             let _ = send_error_ack(
                 &shared,
-                src_addr,
+                ep,
                 header.request_id,
                 "local backing not registered",
             );
@@ -458,14 +408,116 @@ fn run_worker<R, H>(
                 l.finish_err("local backing not registered");
             }
 
+            crate::metrics::fabric_rpc_served(crate::metrics::Outcome::Err);
+            crate::metrics::fabric_rpc_duration(started.elapsed().as_secs_f64());
             return;
         }
     };
 
+    let outcome = serve_stream(&shared, &local_mr, ep, &header, &handler, &req);
+
+    if let Some(mut l) = log.take() {
+        l.field("written", outcome.written);
+        match &outcome.result {
+            Ok(()) => {
+                l.finish_ok();
+            }
+            Err(msg) => {
+                l.finish_err(msg.clone());
+            }
+        }
+    }
+
+    match outcome.result {
+        Ok(()) => {
+            let pages = outcome.written as u64;
+            crate::metrics::fabric_written(pages, pages * shared.page_size as u64);
+            crate::metrics::fabric_rpc_served(crate::metrics::Outcome::Ok);
+        }
+        Err(_) => {
+            crate::metrics::fabric_rpc_served(crate::metrics::Outcome::Err);
+        }
+    }
+
+    crate::metrics::fabric_rpc_duration(started.elapsed().as_secs_f64());
+}
+
+/// Outcome of draining one request's handler stream to the requester.
+/// `written` is the number of pages successfully posted (used for the
+/// success terminator decision and metrics); `result` carries the
+/// already-sent error message for logging on the failure paths.
+struct ServeOutcome {
+    written: u32,
+    result: Result<(), String>,
+}
+
+/// One page write posted on the reverse RMA path but not yet completed.
+/// Carries everything needed to re-post the write if its completion
+/// comes back with a transient `ENOTCONN` while the path back to the
+/// requester is still being established. The source bytes live in the
+/// server's long-lived registered backing (`local_mr`), so no page
+/// ownership needs to be held here; correctness instead relies on
+/// `serve_stream` draining every outstanding write before the handler
+/// stream is dropped.
+struct Inflight {
+    fut: CompletionFuture,
+    src_ptr: *const std::ffi::c_void,
+    len: usize,
+    dest_addr: u64,
+    dest_key: u64,
+    data: u64,
+}
+
+/// Drive one handler stream to completion, signalling each landed page
+/// to the requester. Dispatches to the provider-appropriate strategy:
+/// `verbs` carries the page-ack in the immediate of a single
+/// `fi_writedata` (the fast path being optimized), while the native
+/// `tcp` provider does not deliver write immediates to the target and so
+/// falls back to an `fi_write` plus a framed `PageAck` send per page.
+fn serve_stream<R, H>(
+    shared: &Arc<ServerShared>,
+    local_mr: &MrHandle,
+    ep: EpPtr,
+    header: &RequestHeader,
+    handler: &Arc<H>,
+    req: &R,
+) -> ServeOutcome
+where
+    R: Req,
+    H: Handler<R>,
+{
+    if shared.fabric.cfg.provider.supports_write_with_imm() {
+        serve_stream_writedata(shared, local_mr, ep, header, handler, req)
+    } else {
+        serve_stream_framed(shared, local_mr, ep, header, handler, req)
+    }
+}
+
+/// `verbs` fast path. Drive one handler stream to completion,
+/// RMA-writing each yielded page straight into the requester's
+/// destination MR and pipelining up to `write_pipeline_depth` writes
+/// before parking on the oldest completion. Each page is a single
+/// `fi_writedata`: the 32-bit immediate lands the page-ack on the client
+/// (no separate tagged ack send), so the per-page cost on the wire is
+/// one RMA write instead of a write plus a framed ack. Sends the
+/// protocol terminator (none on full success, `RESPONSE_END` on a short
+/// response, `ERROR_ACK` on failure) before returning.
+fn serve_stream_writedata<R, H>(
+    shared: &Arc<ServerShared>,
+    local_mr: &MrHandle,
+    ep: EpPtr,
+    header: &RequestHeader,
+    handler: &Arc<H>,
+    req: &R,
+) -> ServeOutcome
+where
+    R: Req,
+    H: Handler<R>,
+{
     let src = header.source();
-    let mut stream = handler.handle(&req, src, header.ttl);
-    // SAFETY: stream is owned by this stack frame and pinned for
-    // the duration of run_worker; we never move it.
+    let mut stream = handler.handle(req, src, header.ttl);
+    // SAFETY: stream is owned by this stack frame and pinned for the
+    // duration of serve_stream; we never move it.
     let mut stream = unsafe { std::pin::Pin::new_unchecked(&mut stream) };
 
     // A real parking waker, created once for this request. Production
@@ -475,69 +527,330 @@ fn run_worker<R, H>(
     // wake it, the worker would unpark promptly instead.
     let waker = thread_waker();
     let mut task_cx = std::task::Context::from_waker(&waker);
+
+    let depth = shared.fabric.cfg.write_pipeline_depth.max(1);
+    // SAFETY: local_mr.mr is owned by the live fabric for the duration of
+    // this request (the server handle joins workers before releasing the
+    // MR), so the descriptor stays valid across every posted write.
+    let desc = unsafe { ffi::ub_fi_mr_desc(local_mr.mr) };
+    // Connection-establishment retry budget shared across the request:
+    // the reverse-direction writes can transiently fail with -FI_EAGAIN
+    // on submit or complete with prov_errno=ENOTCONN while the path back
+    // to the requester is still being set up. Both clear once the
+    // progress thread finishes the handshake.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
     let mut next_idx: u32 = 0;
+    let mut inflight: VecDeque<Inflight> = VecDeque::new();
+    let mut stream_done = false;
+
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
-            let _ = send_error_ack(&shared, src_addr, header.request_id, "server shutting down");
-
-            if let Some(mut l) = log.take() {
-                l.finish_err("server shutting down");
-            }
-
-            return;
+            drain_inflight(shared, &mut inflight);
+            let _ = send_error_ack(shared, ep, header.request_id, "server shutting down");
+            return ServeOutcome {
+                written: next_idx,
+                result: Err("server shutting down".to_string()),
+            };
         }
-        match stream.as_mut().poll_next(&mut task_cx) {
-            std::task::Poll::Ready(Some(Ok(page))) => {
-                match write_page(&shared, &local_mr, src_addr, &header, next_idx, page) {
-                    Ok(()) => {
-                        next_idx = next_idx.saturating_add(1);
-                    }
-                    Err(e) => {
-                        // A write failure during shutdown is expected
-                        // (the wait was interrupted); skip the ack so we
-                        // do not chain another blocking send while the
-                        // server is tearing down, and just stop.
-                        if !shared.shutdown.load(Ordering::Acquire) {
-                            let _ = send_error_ack(
-                                &shared,
-                                src_addr,
-                                header.request_id,
-                                &format!("write_page: {e}"),
-                            );
-                        }
 
-                        if let Some(mut l) = log.take() {
-                            l.field("written", next_idx)
-                                .finish_err(format!("write_page: {e}"));
+        // Fill the pipeline: keep up to `depth` page writes outstanding.
+        while !stream_done && inflight.len() < depth {
+            match stream.as_mut().poll_next(&mut task_cx) {
+                std::task::Poll::Ready(Some(Ok(page))) => {
+                    match post_page(shared, local_mr, desc, ep, header, next_idx, page, deadline) {
+                        Ok(inf) => {
+                            inflight.push_back(inf);
+                            next_idx = next_idx.saturating_add(1);
                         }
-
-                        return;
+                        Err(e) => {
+                            drain_inflight(shared, &mut inflight);
+                            let msg = format!("write_page: {e}");
+                            if !shared.shutdown.load(Ordering::Acquire) {
+                                let _ = send_error_ack(shared, ep, header.request_id, &msg);
+                            }
+                            return ServeOutcome {
+                                written: next_idx,
+                                result: Err(msg),
+                            };
+                        }
                     }
                 }
-            }
-            std::task::Poll::Ready(Some(Err(e))) => {
-                let _ = send_error_ack(&shared, src_addr, header.request_id, &format!("{e}"));
-
-                if let Some(mut l) = log.take() {
-                    l.field("written", next_idx).finish_err(e);
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    // Drain outstanding writes before surfacing the error
+                    // so the NIC is no longer reading backing memory when
+                    // the handler stream (and any scratch page) is dropped.
+                    drain_inflight(shared, &mut inflight);
+                    let _ = send_error_ack(shared, ep, header.request_id, &format!("{e}"));
+                    return ServeOutcome {
+                        written: next_idx,
+                        result: Err(format!("{e}")),
+                    };
                 }
-
-                return;
+                std::task::Poll::Ready(None) => {
+                    stream_done = true;
+                }
+                std::task::Poll::Pending => break,
             }
-            std::task::Poll::Ready(None) => {
+        }
+
+        if inflight.is_empty() {
+            if stream_done {
                 // Full success sends no terminator (the client ends on
-                // "all pages acked"); only a short/zero-page response
+                // "all pages landed"); only a short/zero-page response
                 // needs an explicit RESPONSE_END. See module docs.
                 let terminated_by_last_ack = header.dest_pages > 0 && next_idx == header.dest_pages;
                 if !terminated_by_last_ack {
-                    let _ = send_response_end(&shared, src_addr, header.request_id);
+                    let _ = send_response_end(shared, ep, header.request_id);
                 }
+                return ServeOutcome {
+                    written: next_idx,
+                    result: Ok(()),
+                };
+            }
+            // Handler has no page ready yet and nothing is outstanding:
+            // park briefly and re-poll (the safety-net wait; production
+            // handlers drive synchronously).
+            std::thread::park_timeout(Duration::from_millis(5));
+            continue;
+        }
 
-                if let Some(mut l) = log.take() {
-                    l.field("written", next_idx).finish_ok();
+        // Pipeline is full or the stream is drained: wait for the oldest
+        // outstanding write to complete, then loop to refill.
+        if let Err(e) = await_oldest(shared, &mut inflight, desc, ep, deadline) {
+            drain_inflight(shared, &mut inflight);
+            let msg = format!("write_page: {e}");
+            if !shared.shutdown.load(Ordering::Acquire) {
+                let _ = send_error_ack(shared, ep, header.request_id, &msg);
+            }
+            return ServeOutcome {
+                written: next_idx,
+                result: Err(msg),
+            };
+        }
+    }
+}
+
+/// Plan and submit one page write as a single `fi_writedata`. The 32-bit
+/// immediate the client receives is `(page_handle << 16) | page_ordinal`:
+/// the high half echoes the request's recycled stream handle so the
+/// client can demux, the low half is the destination page ordinal.
+#[allow(clippy::too_many_arguments)]
+fn post_page(
+    shared: &Arc<ServerShared>,
+    local_mr: &MrHandle,
+    desc: *mut std::ffi::c_void,
+    ep: EpPtr,
+    header: &RequestHeader,
+    dest_idx: u32,
+    page: crate::bufferpool::PageRef,
+    deadline: std::time::Instant,
+) -> FabResult<Inflight> {
+    let plan = plan_page_write(
+        local_mr,
+        &RequestPlan::from(header),
+        dest_idx,
+        page,
+        shared.page_size,
+    )?;
+    if plan.ack_page_idx > u16::MAX as u32 {
+        return Err(FabricError::BadConfig(
+            "page ordinal exceeds 16-bit immediate",
+        ));
+    }
+    let src_ptr = plan.src_addr as *const std::ffi::c_void;
+    let data = ((header.page_handle as u64) << 16) | (plan.ack_page_idx as u64);
+    let fut = post_writedata(
+        shared,
+        desc,
+        ep,
+        src_ptr,
+        plan.len,
+        data,
+        plan.dest_addr,
+        header.dest_mr_key,
+        deadline,
+    )?;
+    Ok(Inflight {
+        fut,
+        src_ptr,
+        len: plan.len,
+        dest_addr: plan.dest_addr,
+        dest_key: header.dest_mr_key,
+        data,
+    })
+}
+
+/// Submit a single `fi_writedata`, retrying `-FI_EAGAIN` submit failures
+/// (transmit queue momentarily full, or the reverse connection still
+/// establishing) with a short backoff until `deadline`. Returns the
+/// completion future without awaiting it so the caller can pipeline.
+#[allow(clippy::too_many_arguments)]
+fn post_writedata(
+    shared: &Arc<ServerShared>,
+    desc: *mut std::ffi::c_void,
+    ep: EpPtr,
+    src_ptr: *const std::ffi::c_void,
+    len: usize,
+    data: u64,
+    dest_addr: u64,
+    dest_key: u64,
+    deadline: std::time::Instant,
+) -> FabResult<CompletionFuture> {
+    loop {
+        let (slot, fut) = shared.fabric.completions.allocate()?;
+        let ctx = slot.into_raw();
+        // SAFETY: ep and desc are owned by the live fabric; ctx is a
+        // freshly boxed slot handed to libfabric, reclaimed by the
+        // progress thread on completion or by us on a synchronous failure.
+        let rc = unsafe {
+            ffi::ub_fi_writedata(
+                ep.0,
+                src_ptr,
+                len,
+                desc,
+                data,
+                ffi::FI_ADDR_UNSPEC,
+                dest_addr,
+                dest_key,
+                ctx,
+            )
+        };
+        if rc < 0 {
+            // SAFETY: just produced by into_raw and not yet completed.
+            let _ = unsafe { CompletionSlot::from_raw(ctx) };
+            if rc as i32 == -ffi::FI_EAGAIN && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            return Err(FabricError::Pkg("fi_writedata", rc as i32));
+        }
+        return Ok(fut);
+    }
+}
+
+/// Wait for the oldest outstanding page write to complete. A completion
+/// carrying `prov_errno=ENOTCONN` means the connection back to the
+/// requester is still being established; re-post the same write and keep
+/// it at the head until it lands or the request `deadline` passes.
+fn await_oldest(
+    shared: &Arc<ServerShared>,
+    inflight: &mut VecDeque<Inflight>,
+    desc: *mut std::ffi::c_void,
+    ep: EpPtr,
+    deadline: std::time::Instant,
+) -> FabResult<()> {
+    let inf = match inflight.pop_front() {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+    match block_on(inf.fut, Duration::from_secs(10), &shared.shutdown) {
+        Ok(_) => Ok(()),
+        Err(FabricError::Cq { prov_errno, err })
+            if prov_errno == ffi::ENOTCONN && std::time::Instant::now() < deadline =>
+        {
+            let _ = err;
+            std::thread::sleep(Duration::from_millis(1));
+            let fut = post_writedata(
+                shared,
+                desc,
+                ep,
+                inf.src_ptr,
+                inf.len,
+                inf.data,
+                inf.dest_addr,
+                inf.dest_key,
+                deadline,
+            )?;
+            inflight.push_front(Inflight { fut, ..inf });
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Wait for every still-outstanding page write to finish (success or
+/// error) so the NIC is no longer reading the server's backing memory
+/// before the handler stream - and with it any scratch page - is
+/// dropped. Errors are swallowed: this only runs on teardown paths where
+/// the request outcome has already been decided. Bounded by the server
+/// shutdown flag and per-op timeout inside `block_on`.
+fn drain_inflight(shared: &Arc<ServerShared>, inflight: &mut VecDeque<Inflight>) {
+    while let Some(inf) = inflight.pop_front() {
+        let _ = block_on(inf.fut, Duration::from_secs(10), &shared.shutdown);
+    }
+}
+
+/// `tcp` fallback path. The native tcp provider performs an
+/// `fi_writedata` RMA write but never delivers the immediate to the
+/// target, so the client would never see a page land. Here each page is
+/// instead an `fi_write` (plain RMA) followed by a framed `MsgKind::PageAck`
+/// send the client's receive pool routes back to the waiting stream.
+/// Runs at queue depth 1 (write, await completion, send the ack) since
+/// this path is only used by the loopback/smoke tests and is not the
+/// throughput target. Terminator semantics match the writedata path.
+fn serve_stream_framed<R, H>(
+    shared: &Arc<ServerShared>,
+    local_mr: &MrHandle,
+    ep: EpPtr,
+    header: &RequestHeader,
+    handler: &Arc<H>,
+    req: &R,
+) -> ServeOutcome
+where
+    R: Req,
+    H: Handler<R>,
+{
+    let src = header.source();
+    let mut stream = handler.handle(req, src, header.ttl);
+    // SAFETY: stream is owned by this stack frame and pinned for the
+    // duration of serve_stream_framed; we never move it.
+    let mut stream = unsafe { std::pin::Pin::new_unchecked(&mut stream) };
+
+    let waker = thread_waker();
+    let mut task_cx = std::task::Context::from_waker(&waker);
+
+    let mut next_idx: u32 = 0;
+
+    loop {
+        if shared.shutdown.load(Ordering::Acquire) {
+            let _ = send_error_ack(shared, ep, header.request_id, "server shutting down");
+            return ServeOutcome {
+                written: next_idx,
+                result: Err("server shutting down".to_string()),
+            };
+        }
+
+        match stream.as_mut().poll_next(&mut task_cx) {
+            std::task::Poll::Ready(Some(Ok(page))) => {
+                if let Err(e) = write_page(shared, local_mr, ep, header, next_idx, page) {
+                    let msg = format!("write_page: {e}");
+                    if !shared.shutdown.load(Ordering::Acquire) {
+                        let _ = send_error_ack(shared, ep, header.request_id, &msg);
+                    }
+                    return ServeOutcome {
+                        written: next_idx,
+                        result: Err(msg),
+                    };
                 }
-
-                return;
+                next_idx = next_idx.saturating_add(1);
+            }
+            std::task::Poll::Ready(Some(Err(e))) => {
+                let _ = send_error_ack(shared, ep, header.request_id, &format!("{e}"));
+                return ServeOutcome {
+                    written: next_idx,
+                    result: Err(format!("{e}")),
+                };
+            }
+            std::task::Poll::Ready(None) => {
+                let terminated_by_last_ack = header.dest_pages > 0 && next_idx == header.dest_pages;
+                if !terminated_by_last_ack {
+                    let _ = send_response_end(shared, ep, header.request_id);
+                }
+                return ServeOutcome {
+                    written: next_idx,
+                    result: Ok(()),
+                };
             }
             std::task::Poll::Pending => {
                 std::thread::park_timeout(Duration::from_millis(5));
@@ -546,10 +859,14 @@ fn run_worker<R, H>(
     }
 }
 
+/// Write one page with a plain `fi_write`, block on its completion, then
+/// send a framed `PageAck`. Retries `-FI_EAGAIN` submit failures and
+/// transient `ENOTCONN` completions (reverse connection still
+/// establishing) with a short backoff until a 10s deadline.
 fn write_page(
     shared: &Arc<ServerShared>,
     local_mr: &MrHandle,
-    dest_fi_addr: u64,
+    ep: EpPtr,
     header: &RequestHeader,
     dest_idx: u32,
     page: crate::bufferpool::PageRef,
@@ -562,34 +879,31 @@ fn write_page(
         shared.page_size,
     )?;
     let src_ptr = plan.src_addr as *const std::ffi::c_void;
-
-    let inner = &shared.fabric;
-    // SAFETY: local_mr.mr is owned by the live fabric.
+    // SAFETY: local_mr.mr is owned by the live fabric for the duration of
+    // this request, so the descriptor stays valid across the write.
     let desc = unsafe { ffi::ub_fi_mr_desc(local_mr.mr) };
-    // The reverse-direction `fi_write` can fail transiently while the
-    // `tcp` RDM connection back to the requester is still being
-    // established: the submit can return `-FI_EAGAIN`, and an accepted
-    // write can complete with a CQ error carrying `prov_errno=ENOTCONN`.
-    // Both clear once the progress thread finishes the handshake, so we
-    // retry the whole op until it succeeds or a deadline elapses.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
     loop {
-        let (slot, fut) = inner.completions.allocate()?;
+        let (slot, fut) = shared.fabric.completions.allocate()?;
         let ctx = slot.into_raw();
+        // SAFETY: ep and desc are owned by the live fabric; ctx is a
+        // freshly boxed slot handed to libfabric, reclaimed by the
+        // progress thread on completion or by us on a synchronous failure.
         let rc = unsafe {
             ffi::ub_fi_write(
-                inner.ep(),
+                ep.0,
                 src_ptr,
                 plan.len,
                 desc,
-                dest_fi_addr,
+                ffi::FI_ADDR_UNSPEC,
                 plan.dest_addr,
                 header.dest_mr_key,
                 ctx,
             )
         };
         if rc < 0 {
-            // SAFETY: just produced.
+            // SAFETY: just produced by into_raw and not yet completed.
             let _ = unsafe { CompletionSlot::from_raw(ctx) };
             if rc as i32 == -ffi::FI_EAGAIN && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
@@ -610,16 +924,20 @@ fn write_page(
         }
     }
 
-    let payload = bincode::serialize(&PageAck {
-        page_idx: plan.ack_page_idx,
-    })
-    .map_err(|_| FabricError::Pkg("bincode(PageAck)", 0))?;
-    submit_small_send(
-        shared,
-        dest_fi_addr,
-        PAGE_ACK_TAG_BASE | (header.request_id as u64),
-        &payload,
-    )
+    send_page_ack(shared, ep, header.request_id, plan.ack_page_idx)
+}
+
+/// Frame and send a `MsgKind::PageAck` naming the landed destination
+/// page ordinal, awaiting the send completion.
+fn send_page_ack(
+    shared: &Arc<ServerShared>,
+    ep: EpPtr,
+    request_id: u32,
+    page_idx: u32,
+) -> FabResult<()> {
+    let payload = bincode::serialize(&PageAck { page_idx })
+        .map_err(|_| FabricError::Pkg("bincode(PageAck)", 0))?;
+    submit_small_send(shared, ep, MsgKind::PageAck, request_id, &payload)
 }
 
 /// Deterministic request destination metadata used by page planning.
@@ -715,18 +1033,13 @@ impl From<&RequestHeader> for RequestPlan {
     }
 }
 
-fn send_response_end(shared: &Arc<ServerShared>, dest: u64, request_id: u32) -> FabResult<()> {
-    submit_small_send(
-        shared,
-        dest,
-        RESPONSE_END_TAG_BASE | (request_id as u64),
-        &[],
-    )
+fn send_response_end(shared: &Arc<ServerShared>, ep: EpPtr, request_id: u32) -> FabResult<()> {
+    submit_small_send(shared, ep, MsgKind::ResponseEnd, request_id, &[])
 }
 
 fn send_error_ack(
     shared: &Arc<ServerShared>,
-    dest: u64,
+    ep: EpPtr,
     request_id: u32,
     msg: &str,
 ) -> FabResult<()> {
@@ -734,109 +1047,68 @@ fn send_error_ack(
         message: msg.to_string(),
     })
     .map_err(|_| FabricError::Pkg("bincode(ErrorAck)", 0))?;
-    submit_small_send(
-        shared,
-        dest,
-        ERROR_ACK_TAG_BASE | (request_id as u64),
-        &payload,
-    )
+    submit_small_send(shared, ep, MsgKind::ErrorAck, request_id, &payload)
 }
 
 fn submit_small_send(
     shared: &Arc<ServerShared>,
-    dest: u64,
-    tag: u64,
+    ep: EpPtr,
+    kind: MsgKind,
+    request_id: u32,
     payload: &[u8],
 ) -> FabResult<()> {
-    let fut = enqueue_small_send(shared, dest, tag, payload, Duration::from_secs(10))?;
+    let fut = enqueue_small_send(
+        shared,
+        ep,
+        kind,
+        request_id,
+        payload,
+        Duration::from_secs(10),
+    )?;
     wait_for_small_send(fut, Duration::from_secs(10), &shared.shutdown)
 }
 
-/// Submit a small tagged send and return its completion future without
-/// waiting. The send buffer is freed by the slot handler when the send
-/// completes, so dropping the returned future is safe: the completion
-/// still fires on the progress thread and reclaims the buffer.
+/// Frame and submit a small control message and return its completion
+/// future without waiting. The framed send buffer is freed by the slot
+/// handler when the send completes, so dropping the returned future is
+/// safe: the completion still fires on the progress thread and reclaims
+/// the buffer.
 ///
 /// `submit_backoff` bounds the `-FI_EAGAIN` submit retry. Worker
-/// threads pass a generous budget so a send survives the `tcp` RDM
-/// connection still establishing; the progress thread (overload
-/// rejection) passes `Duration::ZERO` for a single non-blocking attempt
-/// so it never stalls completion progress.
+/// threads pass a generous budget so a send survives the connection
+/// still establishing; the progress thread (overload rejection) passes
+/// `Duration::ZERO` for a single non-blocking attempt so it never
+/// stalls completion progress.
 fn enqueue_small_send(
     shared: &Arc<ServerShared>,
-    dest: u64,
-    tag: u64,
+    ep: EpPtr,
+    kind: MsgKind,
+    request_id: u32,
     payload: &[u8],
     submit_backoff: Duration,
 ) -> FabResult<CompletionFuture> {
     let inner = &shared.fabric;
-    let buf: Box<[u8]> = payload.to_vec().into_boxed_slice();
-    let buf_len = buf.len();
-    let buf_ptr = Box::into_raw(buf);
-    let (slot, fut) = inner.completions.allocate()?;
-    let buf_addr = buf_ptr as *mut u8 as usize;
-    let buf_len_for_drop = buf_len;
-    slot.set_handler(move |_| {
-        // SAFETY: just produced from Box::into_raw on Box<[u8]>.
-        let _ = unsafe {
-            Box::from_raw(
-                std::slice::from_raw_parts_mut(buf_addr as *mut u8, buf_len_for_drop)
-                    as *mut [u8],
-            )
-        };
-    });
-    let ctx = slot.into_raw();
-    // Retry on `-FI_EAGAIN` while the `tcp` RDM connection back to the
-    // requester finishes establishing or the transmit queue drains.
-    // EAGAIN neither consumes the buffer nor produces a completion, so
-    // the same ctx/buffer are reused across attempts. This is a submit
-    // wait, not a completion wait (nothing would wake a parked thread
-    // here), so it stays a bounded sleep-backoff.
-    let rc = {
-        let deadline = std::time::Instant::now() + submit_backoff;
-        loop {
-            let rc = unsafe {
-                ffi::ub_fi_tsend(
-                    inner.ep(),
-                    buf_ptr as *const std::ffi::c_void,
-                    buf_len,
-                    ptr::null_mut(),
-                    dest,
-                    tag,
-                    ctx,
-                )
-            };
-            if rc as i32 != -ffi::FI_EAGAIN || std::time::Instant::now() >= deadline {
-                break rc;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    };
-    if rc < 0 {
-        // SAFETY: just produced.
-        let _ = unsafe { CompletionSlot::from_raw(ctx) };
-        let _ = unsafe {
-            Box::from_raw(std::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len) as *mut [u8])
-        };
-        return Err(FabricError::Pkg("fi_tsend (small)", rc as i32));
-    }
-    Ok(fut)
+    let framed = MsgHeader::frame(kind, request_id, payload);
+    inner
+        .send_pool()
+        .send_framed(ep.0, framed, "fi_send (small)", submit_backoff)
 }
 
 /// Shed a request the server is too busy to admit. Runs on the progress
-/// thread (in the recv handler), so it must not block: the ErrorAck is
+/// thread (in the request sink), so it must not block: the ErrorAck is
 /// submitted with a single non-blocking attempt and its completion is
 /// not awaited. Dropping the future is safe (the slot handler frees the
 /// send buffer when the completion is reaped).
-fn reject_overloaded(shared: &Arc<ServerShared>, dest: u64, request_id: u32) -> FabResult<()> {
+fn reject_overloaded(shared: &Arc<ServerShared>, ep: EpPtr, request_id: u32) -> FabResult<()> {
     let payload = bincode::serialize(&ErrorAck {
         message: "server overloaded".to_string(),
     })
     .map_err(|_| FabricError::Pkg("bincode(ErrorAck)", 0))?;
     let _fut = enqueue_small_send(
         shared,
-        dest,
-        ERROR_ACK_TAG_BASE | (request_id as u64),
+        ep,
+        MsgKind::ErrorAck,
+        request_id,
         &payload,
         Duration::ZERO,
     )?;
@@ -876,23 +1148,6 @@ mod tests {
     use super::*;
     use crate::runtime::noop_waker;
 
-    #[test]
-    fn posted_request_recvs_clamps_lower_bound_to_one() {
-        assert_eq!(posted_request_recvs(0, 4096), 1);
-    }
-
-    #[test]
-    fn posted_request_recvs_caps_at_half_max_inflight() {
-        assert_eq!(posted_request_recvs(4096, 100), 50);
-        // Tiny registries still keep at least one posted recv.
-        assert_eq!(posted_request_recvs(256, 1), 1);
-    }
-
-    #[test]
-    fn posted_request_recvs_passes_through_when_in_range() {
-        assert_eq!(posted_request_recvs(256, 4096), 256);
-    }
-
     fn mr(base: usize, len: usize) -> MrHandle {
         MrHandle {
             mr: ptr::null_mut(),
@@ -906,6 +1161,7 @@ mod tests {
     fn header(dest_base: u64, dest_pages: u32) -> RequestHeader {
         RequestHeader::new(
             7,
+            0,
             &mr(
                 dest_base as usize,
                 dest_pages as usize * crate::memory::HUGEPAGE_2MB,
@@ -938,9 +1194,10 @@ mod tests {
         CompletionInfo {
             flags: 0,
             bytes: 0,
-            tag: PAGE_ACK_TAG_BASE,
+            tag: 0,
             src_addr: 0,
             op_context: 0,
+            data: 0,
         }
     }
 
@@ -1003,9 +1260,10 @@ mod tests {
             len: 0x99AA_BBCC,
         };
 
-        let header = RequestHeader::new(7, &dest_mr, 3, src, 13);
+        let header = RequestHeader::new(7, 5, &dest_mr, 3, src, 13);
 
         assert_eq!(header.request_id, 7);
+        assert_eq!(header.page_handle, 5);
         assert_eq!(header.dest_mr_base, 0x1000);
         assert_eq!(header.dest_mr_key, 0xAABB_CCDD);
         assert_eq!(header.dest_pages, 3);
@@ -1021,7 +1279,7 @@ mod tests {
             len: 0x0BAD_F00D,
         };
 
-        let header = RequestHeader::new(9, &dest_mr, 5, src, 42);
+        let header = RequestHeader::new(9, 0, &dest_mr, 5, src, 42);
         assert_eq!(header.ttl, 42);
 
         let bytes = bincode::serialize(&header).expect("serialize header");
@@ -1119,11 +1377,10 @@ mod tests {
     //
     // `run_worker` is generic over the handler and hands it
     // `header.ttl` as `hops_remaining`. These tests pin down the
-    // contract `run_worker` relies on after the unconditional
-    // `ttl == 0` short-circuit was removed: the *handler* decides the
-    // hop limit. An owner-serve must yield a page even at `ttl == 0`;
-    // a forward with no budget must surface an error (which
-    // `run_worker` turns into an `ERROR_ACK`).
+    // contract `run_worker` relies on: the *handler* decides the hop
+    // limit. An owner-serve must yield a page even at `ttl == 0`; a
+    // forward with no budget must surface an error (which `run_worker`
+    // turns into an `ERROR_ACK`).
 
     /// What the first item of a handler's stream tells `run_worker` to
     /// do: serve a page, reject with an error ack, or end the response.

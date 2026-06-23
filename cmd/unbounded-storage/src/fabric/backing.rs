@@ -11,7 +11,10 @@
 //! before its domain). Dropping an `MrHandle` does *not* close the
 //! MR.
 
+use std::ffi::c_void;
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::memory::Backing;
 
@@ -107,6 +110,129 @@ impl Fabric {
             },
             len,
         })
+    }
+}
+
+/// A transient local-access memory region covering a single control
+/// message buffer. Providers that negotiate `FI_MR_LOCAL` (verbs)
+/// require every send/recv buffer to carry a `desc` from a registered
+/// region; this owns that registration for one in-flight buffer and
+/// closes it on `Drop`. The completion handler that frees the buffer
+/// also drops the `LocalMr`, so the region lives exactly as long as the
+/// buffer is posted. Unlike `register_backing`, the `fid_mr` is *not*
+/// retained in the `Fabric`: a per-message control MR is closed as soon
+/// as its operation completes rather than at fabric teardown.
+pub(crate) struct LocalMr {
+    mr: *mut ffi::fid_mr,
+}
+
+// SAFETY: the `fid_mr` is internally synchronized by libfabric and is
+// closed exactly once in `Drop`. It is created on the posting thread and
+// dropped on the progress thread (from the completion handler), so it
+// must move across threads.
+unsafe impl Send for LocalMr {}
+unsafe impl Sync for LocalMr {}
+
+impl LocalMr {
+    /// The local descriptor libfabric requires alongside the buffer.
+    pub(crate) fn desc(&self) -> *mut c_void {
+        // SAFETY: `mr` was produced by `fi_mr_reg` and is live until Drop.
+        unsafe { ffi::ub_fi_mr_desc(self.mr) }
+    }
+}
+
+impl Drop for LocalMr {
+    fn drop(&mut self) {
+        if !self.mr.is_null() {
+            // SAFETY: `mr` was produced by `fi_mr_reg`; closed once here.
+            unsafe {
+                let _ = ffi::ub_fi_close(ffi::as_fid_mr(self.mr));
+            }
+        }
+    }
+}
+
+/// Context for registering transient local-access MRs for control
+/// buffers. On providers that negotiate `FI_MR_LOCAL` (verbs) every
+/// posted send/recv buffer must carry a `desc`; on providers without it
+/// (tcp) `desc = NULL` is accepted and `register` is a no-op. Cloned
+/// into the accept loop, the dialer, and each recv pool so every posting
+/// site can register without reaching back into the `Fabric`.
+#[derive(Clone)]
+pub(crate) struct LocalMrCtx {
+    domain: *mut ffi::fid_domain,
+    needs: bool,
+    next_key: Arc<AtomicU64>,
+}
+
+// SAFETY: the domain handle is owned by `FabricInner`, internally
+// synchronized by libfabric for `fi_mr_reg`, and outlives every clone of
+// this context (the accept/reconnect threads that hold one are joined in
+// `FabricInner::Drop` before the domain is closed).
+unsafe impl Send for LocalMrCtx {}
+unsafe impl Sync for LocalMrCtx {}
+
+impl LocalMrCtx {
+    pub(crate) fn new(domain: *mut ffi::fid_domain, needs: bool, next_key: Arc<AtomicU64>) -> Self {
+        Self {
+            domain,
+            needs,
+            next_key,
+        }
+    }
+
+    /// A context that never registers, for providers without
+    /// `FI_MR_LOCAL` and for tests that post on `tcp`/loopback.
+    #[cfg(test)]
+    pub(crate) fn none() -> Self {
+        Self {
+            domain: ptr::null_mut(),
+            needs: false,
+            next_key: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Register `ptr[..len]` for local `access` (`FI_RECV` for a recv
+    /// buffer, `FI_TRANSMIT` for a send buffer). Returns `Ok(None)` when
+    /// the provider does not require a local MR. The returned `LocalMr`
+    /// must outlive the posted operation: capture it in the completion
+    /// handler so it is closed when the buffer is freed.
+    pub(crate) fn register(
+        &self,
+        ptr: *mut c_void,
+        len: usize,
+        access: u64,
+    ) -> Result<Option<LocalMr>> {
+        if !self.needs {
+            return Ok(None);
+        }
+        if ptr.is_null() || len == 0 {
+            return Err(FabricError::BadConfig("local MR ptr/len invalid"));
+        }
+        // A distinct key per registration keeps providers without
+        // `FI_MR_PROV_KEY` from rejecting a reuse; providers that assign
+        // their own keys ignore it. Shared with `register_backing` so the
+        // remote and local registrations never collide in the domain.
+        let requested_key = self.next_key.fetch_add(1, Ordering::Relaxed);
+        let mut mr_p: *mut ffi::fid_mr = ptr::null_mut();
+        // SAFETY: `domain` is live for the lifetime of this context; the
+        // buffer outlives the registration (the MR is closed from the
+        // completion handler that frees the buffer).
+        let rc = unsafe {
+            ffi::ub_fi_mr_reg(
+                self.domain,
+                ptr as *const c_void,
+                len,
+                access,
+                0,
+                requested_key,
+                0,
+                &mut mr_p,
+                ptr::null_mut(),
+            )
+        };
+        check("fi_mr_reg(local)", rc)?;
+        Ok(Some(LocalMr { mr: mr_p }))
     }
 }
 

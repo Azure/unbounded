@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 //! Module integration tests for the fabric module. Covers connection
-//! CRUD, MR registration, and ping/pong round-trip over a loopback
+//! CRUD, MR registration, and the streaming RPC path over a loopback
 //! tcp fabric. Each test skips during setup if explicitly requested or
 //! if the tcp provider is not installed in the libfabric build
 //! available to the test binary.
@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::fabric::PeerId;
-use crate::fabric::{ConnectionSpec, Fabric, FabricConfig, FabricError, Provider, defaults_for};
+use crate::fabric::{
+    ConnectionSpec, Fabric, FabricAddress, FabricConfig, FabricError, Provider, defaults_for,
+};
 use crate::runtime::{DefaultRuntime, Threading, WorkerIdx};
 
 use super::ffi;
@@ -84,105 +86,74 @@ fn new_tcp_fabric() -> Fabric {
         .expect("Fabric::new tcp failed after provider availability gate")
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
+/// Build a loopback fabric with an explicit `self_peer`. Establishment
+/// is single-dialer (the lower-id node dials), so paired fabrics must
+/// carry globally-consistent, distinct ids for exactly one side to dial.
+fn new_tcp_fabric_with_peer(self_peer: PeerId) -> Fabric {
+    let mut cfg = tcp_loopback_cfg();
+    cfg.self_peer = self_peer;
+    Fabric::new(cfg).expect("Fabric::new tcp failed after provider availability gate")
 }
 
-/// Derive a `wire_addr` for `peer_fabric` understood by this build's
-/// provider. For tcp the self-address is a sockaddr blob; we
-/// stringify it as "ip:port" using inet_ntop / ntohs to match the
-/// shim's getaddrinfo parser.
-fn wire_addr_of(peer_fabric: &Fabric) -> String {
-    let raw = peer_fabric.self_address().expect("self_address");
-    let addr = decode_sockaddr_to_string(&raw);
-    assert!(
-        !addr.is_empty(),
-        "could not stringify tcp self-address: {}",
-        hex_encode(&raw),
-    );
+/// Derive a socket address for `peer_fabric` understood by this build's
+/// provider. Under FI_EP_MSG `self_address` already returns the
+/// listener's "ip:port" string, which is exactly the dial target.
+fn socket_addr_of(peer_fabric: &Fabric) -> String {
+    let addr = peer_fabric.self_address().expect("self_address");
+    assert!(!addr.is_empty(), "empty self-address");
     addr
 }
 
-fn decode_sockaddr_to_string(raw: &[u8]) -> String {
-    // raw begins with sa_family (u16 little-endian on Linux).
-    if raw.len() < 2 {
-        return String::new();
-    }
-    let family = u16::from_ne_bytes([raw[0], raw[1]]);
-    const AF_INET: u16 = libc::AF_INET as u16;
-    const AF_INET6: u16 = libc::AF_INET6 as u16;
-    if family == AF_INET && raw.len() >= 8 {
-        // sockaddr_in: family (2) + port (2 BE) + addr (4) + ...
-        let port = u16::from_be_bytes([raw[2], raw[3]]);
-        let ip = format!("{}.{}.{}.{}", raw[4], raw[5], raw[6], raw[7]);
-        format!("{ip}:{port}")
-    } else if family == AF_INET6 && raw.len() >= 28 {
-        // sockaddr_in6: family (2) + port (2 BE) + flowinfo (4) +
-        // addr (16) + scope (4).
-        let port = u16::from_be_bytes([raw[2], raw[3]]);
-        let mut groups = [0u16; 8];
-        for i in 0..8 {
-            groups[i] = u16::from_be_bytes([raw[8 + 2 * i], raw[8 + 2 * i + 1]]);
+fn wait_for_connection(fabric: &Fabric, peer: PeerId, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if fabric.list_connections().contains(&peer) {
+            return true;
         }
-        let ip = format!(
-            "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
-            groups[0], groups[1], groups[2], groups[3], groups[4], groups[5], groups[6], groups[7],
-        );
-        format!("[{ip}]:{port}")
-    } else {
-        String::new()
+        std::thread::sleep(Duration::from_millis(100));
     }
+    false
 }
 
 #[test]
-fn tcp_loopback_ping_roundtrip() {
+fn tcp_loopback_connection_roundtrip() {
     if skip_ffi() {
         return;
     }
-    let a = new_tcp_fabric();
-    let b = new_tcp_fabric();
+    let a = new_tcp_fabric_with_peer(PeerId(1));
+    let b = new_tcp_fabric_with_peer(PeerId(2));
 
-    let a_addr = wire_addr_of(&a);
-    let b_addr = wire_addr_of(&b);
+    let a_addr = socket_addr_of(&a);
+    let b_addr = socket_addr_of(&b);
 
     let a_to_b = ConnectionSpec {
         peer: PeerId(2),
-        wire_addr: b_addr,
+        address: FabricAddress::socket(b_addr),
         hca_numa: None,
-        labels: Vec::new(),
+        tags: Vec::new(),
     };
     let b_to_a = ConnectionSpec {
         peer: PeerId(1),
-        wire_addr: a_addr,
+        address: FabricAddress::socket(a_addr),
         hca_numa: None,
-        labels: Vec::new(),
+        tags: Vec::new(),
     };
     a.add_connection(a_to_b)
         .expect("add_connection a->b failed after provider availability gate");
     b.add_connection(b_to_a)
         .expect("add_connection b->a failed after provider availability gate");
 
-    match a.ping(PeerId(2), Duration::from_secs(2)) {
-        Ok(latency) => {
-            assert!(
-                latency < Duration::from_secs(1),
-                "ping latency too high: {latency:?}"
-            );
-        }
-        Err(e) => {
-            panic!("ping returned {e}");
-        }
-    }
+    assert!(
+        wait_for_connection(&a, PeerId(2), Duration::from_secs(10)),
+        "dialer did not publish loopback connection"
+    );
+    assert!(
+        wait_for_connection(&b, PeerId(1), Duration::from_secs(10)),
+        "acceptor did not publish loopback connection"
+    );
     drop(a);
     drop(b);
 }
-
 #[test]
 fn add_remove_add_cycle() {
     if skip_ffi() {
@@ -190,12 +161,12 @@ fn add_remove_add_cycle() {
     }
     let f = new_tcp_fabric();
     let peer = new_tcp_fabric();
-    let addr = wire_addr_of(&peer);
+    let addr = socket_addr_of(&peer);
     let spec = ConnectionSpec {
         peer: PeerId(42),
-        wire_addr: addr.clone(),
+        address: FabricAddress::socket(addr.clone()),
         hca_numa: None,
-        labels: Vec::new(),
+        tags: Vec::new(),
     };
     f.add_connection(spec.clone()).expect("add 1");
     assert!(f.list_connections().contains(&PeerId(42)));
@@ -203,6 +174,42 @@ fn add_remove_add_cycle() {
     assert!(!f.list_connections().contains(&PeerId(42)));
     f.add_connection(spec).expect("add 2");
     assert!(f.list_connections().contains(&PeerId(42)));
+}
+
+/// The background reconnect thread must dial a peer that was only ever
+/// recorded as desired (never dialed via `add_connection`). This is the
+/// startup-race gap: if both directed dials fail, the pair still
+/// converges once a listener is reachable. We seed the desired set
+/// directly with `set_desired_peers` (bypassing the immediate dial in
+/// `add_connection`) and assert the reconnect loop establishes the
+/// connection on its own within a few intervals.
+#[test]
+fn background_reconnect_dials_desired_peer() {
+    if skip_ffi() {
+        return;
+    }
+    let f = new_tcp_fabric();
+    let peer = new_tcp_fabric();
+    let spec = ConnectionSpec {
+        peer: PeerId(99),
+        address: FabricAddress::socket(socket_addr_of(&peer)),
+        hca_numa: None,
+        tags: Vec::new(),
+    };
+    // Record intent without dialing; only the background thread can
+    // establish this connection.
+    f.set_desired_peers(vec![spec]);
+    assert!(
+        !f.list_connections().contains(&PeerId(99)),
+        "connection must not exist before the reconnect thread runs"
+    );
+
+    // RECONNECT_INTERVAL_MS is 1s; allow several intervals before
+    // giving up so a slow CI box does not flake.
+    assert!(
+        wait_for_connection(&f, PeerId(99), Duration::from_secs(10)),
+        "background reconnect thread never established the desired connection"
+    );
 }
 
 #[test]
@@ -215,9 +222,9 @@ fn numa_mismatch_rejects() {
     let f = Fabric::new(cfg).expect("Fabric::new failed after provider availability gate");
     let spec = ConnectionSpec {
         peer: PeerId(7),
-        wire_addr: "127.0.0.1:1".to_string(),
+        address: FabricAddress::socket("127.0.0.1:1".to_string()),
         hca_numa: Some(1),
-        labels: Vec::new(),
+        tags: Vec::new(),
     };
     match f.add_connection(spec) {
         Err(FabricError::NumaMismatch { expected, got }) => {
@@ -248,18 +255,6 @@ fn register_backing_numa_mismatch() {
             assert_eq!(got, 1);
         }
         other => panic!("expected NumaMismatch, got {other:?}"),
-    }
-}
-
-#[test]
-fn ping_unknown_peer_errors() {
-    if skip_ffi() {
-        return;
-    }
-    let f = new_tcp_fabric();
-    match f.ping(PeerId(999), Duration::from_millis(50)) {
-        Err(FabricError::NotFound(_)) => {}
-        other => panic!("expected NotFound, got {other:?}"),
     }
 }
 
@@ -343,8 +338,10 @@ impl<R: Req> Handler<R> for RecordingHandler {
 /// loopback. Returns (server, client, server_local_mr,
 /// client_local_mr, n_pages, page_size).
 fn paired_fabrics(n_pages: usize) -> (Arc<Fabric>, Arc<Fabric>, MrHandle, MrHandle, usize, usize) {
-    let server = Arc::new(new_tcp_fabric());
-    let client = Arc::new(new_tcp_fabric());
+    // server is node 2, client is node 1: single-dialer means the
+    // client (lower id) dials the server, which accepts.
+    let server = Arc::new(new_tcp_fabric_with_peer(PeerId(2)));
+    let client = Arc::new(new_tcp_fabric_with_peer(PeerId(1)));
 
     let page_size = crate::memory::HUGEPAGE_2MB;
     let bytes = page_size * n_pages;
@@ -382,22 +379,22 @@ fn paired_fabrics(n_pages: usize) -> (Arc<Fabric>, Arc<Fabric>, MrHandle, MrHand
         .register_backing(&client_backing, None)
         .expect("client MR registration failed after provider availability gate");
 
-    let server_addr = wire_addr_of(&server);
-    let client_addr = wire_addr_of(&client);
+    let server_addr = socket_addr_of(&server);
+    let client_addr = socket_addr_of(&client);
     server
         .add_connection(ConnectionSpec {
             peer: PeerId(1), // client peer-id in server's table
-            wire_addr: client_addr,
+            address: FabricAddress::socket(client_addr),
             hca_numa: None,
-            labels: Vec::new(),
+            tags: Vec::new(),
         })
         .expect("server.add_connection failed after provider availability gate");
     client
         .add_connection(ConnectionSpec {
             peer: PeerId(2), // server peer-id in client's table
-            wire_addr: server_addr,
+            address: FabricAddress::socket(server_addr),
             hca_numa: None,
-            labels: Vec::new(),
+            tags: Vec::new(),
         })
         .expect("client.add_connection failed after provider availability gate");
 
@@ -744,12 +741,13 @@ impl BlockStore for MemBlockStore {
         Ok(())
     }
 
-    async fn read_page(
+    async fn read_page<R: Req + ?Sized>(
         &self,
-        key: StripeKey,
+        req: &R,
         _stripe_off: u64,
         dst: PageRef,
     ) -> Result<bool, PoolError> {
+        let key = req.key();
         match self.present.get(&key.0) {
             Some(&fill) => {
                 // SAFETY: dst.page_idx indexes into the scratch
@@ -764,9 +762,9 @@ impl BlockStore for MemBlockStore {
         }
     }
 
-    async fn write_page(
+    async fn write_page<R: Req + ?Sized>(
         &self,
-        _key: StripeKey,
+        _req: &R,
         _stripe_off: u64,
         _page: PageRef,
     ) -> Result<(), PoolError> {
@@ -789,8 +787,8 @@ fn paired_with_pool_handler(
     MrHandle,
     Arc<Fabric>,
 ) {
-    let server = Arc::new(new_tcp_fabric());
-    let client = Arc::new(new_tcp_fabric());
+    let server = Arc::new(new_tcp_fabric_with_peer(PeerId(2)));
+    let client = Arc::new(new_tcp_fabric_with_peer(PeerId(1)));
 
     let page_size = crate::memory::HUGEPAGE_2MB;
     let scratch_pages = 4usize;
@@ -819,22 +817,22 @@ fn paired_with_pool_handler(
         .register_backing(&client_backing, None)
         .expect("client MR");
 
-    let server_addr = wire_addr_of(&server);
-    let client_addr = wire_addr_of(&client);
+    let server_addr = socket_addr_of(&server);
+    let client_addr = socket_addr_of(&client);
     server
         .add_connection(ConnectionSpec {
             peer: PeerId(1),
-            wire_addr: client_addr,
+            address: FabricAddress::socket(client_addr),
             hca_numa: None,
-            labels: Vec::new(),
+            tags: Vec::new(),
         })
         .expect("server.add_connection");
     client
         .add_connection(ConnectionSpec {
             peer: PeerId(2),
-            wire_addr: server_addr,
+            address: FabricAddress::socket(server_addr),
             hca_numa: None,
-            labels: Vec::new(),
+            tags: Vec::new(),
         })
         .expect("client.add_connection");
 
@@ -980,7 +978,7 @@ use std::collections::HashMap;
 
 use crate::backend::{Backend, NullBackend};
 use crate::p2p::{
-    FingerTable, FingerTableConfig, NodeId, PeerEntry, RecursiveHandler, RingId, TopologyLabels,
+    FingerTable, FingerTableConfig, NodeId, PeerEntry, RecursiveHandler, RingId, TopologyTags,
 };
 
 /// Ring position the relay (B) forwards for and the owner (C) serves.
@@ -1065,7 +1063,7 @@ fn ring_peer(node: u64, ring: u64) -> PeerEntry {
     PeerEntry {
         node: NodeId(node),
         ring: RingId(ring),
-        labels: TopologyLabels(vec!["r".to_string()]),
+        tags: TopologyTags(vec!["r".to_string()]),
     }
 }
 
@@ -1137,9 +1135,9 @@ fn recursive_chain(
     Arc<Fabric>,
     Arc<Fabric>,
 ) {
-    let a = Arc::new(new_tcp_fabric());
-    let b = Arc::new(new_tcp_fabric());
-    let c = Arc::new(new_tcp_fabric());
+    let a = Arc::new(new_tcp_fabric_with_peer(PeerId(1)));
+    let b = Arc::new(new_tcp_fabric_with_peer(PeerId(2)));
+    let c = Arc::new(new_tcp_fabric_with_peer(PeerId(3)));
     let page_size = crate::memory::HUGEPAGE_2MB;
 
     let alloc = |bytes| {
@@ -1169,35 +1167,35 @@ fn recursive_chain(
         .expect("client MR");
 
     // Global peer-id scheme: A=1, B=2, C=3 in every fabric's table.
-    let a_addr = wire_addr_of(&a);
-    let b_addr = wire_addr_of(&b);
-    let c_addr = wire_addr_of(&c);
+    let a_addr = socket_addr_of(&a);
+    let b_addr = socket_addr_of(&b);
+    let c_addr = socket_addr_of(&c);
     a.add_connection(ConnectionSpec {
         peer: PeerId(2),
-        wire_addr: b_addr.clone(),
+        address: FabricAddress::socket(b_addr.clone()),
         hca_numa: None,
-        labels: Vec::new(),
+        tags: Vec::new(),
     })
     .expect("a -> b connection");
     b.add_connection(ConnectionSpec {
         peer: PeerId(1),
-        wire_addr: a_addr,
+        address: FabricAddress::socket(a_addr),
         hca_numa: None,
-        labels: Vec::new(),
+        tags: Vec::new(),
     })
     .expect("b -> a connection");
     b.add_connection(ConnectionSpec {
         peer: PeerId(3),
-        wire_addr: c_addr,
+        address: FabricAddress::socket(c_addr),
         hca_numa: None,
-        labels: Vec::new(),
+        tags: Vec::new(),
     })
     .expect("b -> c connection");
     c.add_connection(ConnectionSpec {
         peer: PeerId(2),
-        wire_addr: b_addr,
+        address: FabricAddress::socket(b_addr),
         hca_numa: None,
-        labels: Vec::new(),
+        tags: Vec::new(),
     })
     .expect("c -> b connection");
 

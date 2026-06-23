@@ -98,6 +98,7 @@ const (
 	OperationStageWaitingOn       OperationStage = "WaitingOn"
 	OperationStageRepaveRequested OperationStage = "RepaveRequested"
 	OperationStageWaitingRepave   OperationStage = "WaitingRepave"
+	OperationStageWaitingNode     OperationStage = "WaitingNode"
 )
 
 // MachineOperationSpec defines the desired state of a MachineOperation.

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::runtime::{Threading, WorkerIdx};
 
 use super::error::{FabricError, Result};
+use super::types::PeerId;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum Provider {
@@ -27,6 +28,17 @@ impl Provider {
             Provider::Tcp
         }
     }
+
+    /// Whether `fi_writedata` delivers a remote CQ-data completion to
+    /// the target (RDMA Write With Immediate). `verbs` maps it to a
+    /// Write-With-Immediate that consumes a target recv and surfaces the
+    /// 32-bit immediate, so the server can land a page-ack with a single
+    /// RMA op. The native `tcp` provider performs the RMA write but never
+    /// delivers the immediate to the target, so the server must fall back
+    /// to a framed `PageAck` send on that provider.
+    pub fn supports_write_with_imm(self) -> bool {
+        matches!(self, Provider::Verbs)
+    }
 }
 
 #[derive(Clone)]
@@ -36,22 +48,46 @@ pub struct FabricConfig {
     pub listen: bool,
     pub listen_addr: Option<String>,
     pub max_inflight: usize,
-    /// Number of request receive buffers the RPC server keeps posted at
-    /// all times. This bounds how many distinct page requests can be in
-    /// flight to one server concurrently, which is the only axis of
-    /// server-side download concurrency (the production handler serves
-    /// exactly one page per request). It must be large enough to cover a
-    /// downloading client's prefetch window so the fabric NIC stays
-    /// saturated; the effective value is clamped to half of
-    /// `max_inflight` so write and ack completions always have registry
-    /// slots.
+    /// Per-connection receive window: the number of receive buffers each
+    /// connection's `RecvPool` keeps posted at all times. Under FI_EP_MSG
+    /// every connection (inbound accepted and outbound dialed) self-arms
+    /// this many recvs into the shared completion registry, so this is a
+    /// modest per-connection sliding window, NOT a server-wide total. It
+    /// bounds how many inbound messages one peer can have in flight before
+    /// the progress thread re-arms. The shared registry is sized to
+    /// `max_inflight * write_pipeline_depth + max_connections * rpc_posted_recvs`
+    /// so outbound sends/RMA always have slots regardless of how many peers connect.
     pub rpc_posted_recvs: usize,
+    /// Upper bound on the number of concurrent connections (inbound
+    /// accepted plus outbound dialed) the completion registry budgets
+    /// receive slots for. The registry is fixed-capacity at `Fabric::new`
+    /// while connections are added dynamically, so this caps the recv-pool
+    /// slot reservation. Must be `>= 1`.
+    pub max_connections: usize,
     /// Number of long-lived worker threads the RPC server spawns to
     /// serve inbound requests. Each request is enqueued by the progress
     /// thread and picked up by one of these workers; the pool size
     /// bounds concurrent server-side request handling (and thus the
     /// thread count) regardless of arrival rate. Must be `>= 1`.
     pub rpc_worker_threads: usize,
+    /// Number of libfabric endpoints (QPs) established per logical peer
+    /// connection. All `qps_per_connection` endpoints are bundled inside a
+    /// single `cm::Connection` (the connection table stays one entry per
+    /// `PeerId`); outbound requests round-robin across them so a single
+    /// peer's RMA writes spread over multiple QPs instead of serializing on
+    /// one. The server side is automatic: each accepted endpoint gets its
+    /// own `RecvPool` and replies on the endpoint the request arrived on.
+    /// Must be `>= 1`; `1` reproduces the single-QP behavior exactly.
+    pub qps_per_connection: usize,
+    /// Maximum number of page writes the server keeps outstanding on the
+    /// reverse RMA path before blocking for a completion. Each served
+    /// page is posted as a single `fi_writedata` (RMA write carrying a
+    /// 32-bit immediate that lands the page-ack on the client) and the
+    /// worker pipelines up to this many before parking on the oldest
+    /// completion. Deeper pipelines hide completion latency and lift the
+    /// per-HCA serve throughput; `1` reproduces the original depth-1
+    /// post-then-wait behavior exactly. Must be `>= 1`.
+    pub write_pipeline_depth: usize,
     pub progress_threads: u8,
     /// Microseconds the progress thread sleeps when the CQ is empty,
     /// to bound idle CPU. Default is 10.
@@ -59,6 +95,11 @@ pub struct FabricConfig {
     pub runtime: Arc<dyn Threading>,
     pub worker_idx: WorkerIdx,
     pub numa: Option<u16>,
+    /// This node's own fabric identity, sent as the connection-manager
+    /// private data on every outbound dial so the accepting peer learns
+    /// who connected. The daemon assigns the real value; in-process
+    /// tests and single-node setups can leave it at the default.
+    pub self_peer: PeerId,
 }
 
 impl FabricConfig {
@@ -72,8 +113,17 @@ impl FabricConfig {
         if self.rpc_posted_recvs == 0 {
             return Err(FabricError::BadConfig("rpc_posted_recvs must be >= 1"));
         }
+        if self.max_connections == 0 {
+            return Err(FabricError::BadConfig("max_connections must be >= 1"));
+        }
         if self.rpc_worker_threads == 0 {
             return Err(FabricError::BadConfig("rpc_worker_threads must be >= 1"));
+        }
+        if self.qps_per_connection == 0 {
+            return Err(FabricError::BadConfig("qps_per_connection must be >= 1"));
+        }
+        if self.write_pipeline_depth == 0 {
+            return Err(FabricError::BadConfig("write_pipeline_depth must be >= 1"));
         }
         if self.listen && self.listen_addr.is_none() {
             return Err(FabricError::BadConfig(
@@ -141,13 +191,17 @@ pub fn defaults_for(
         listen: false,
         listen_addr: None,
         max_inflight: 4096,
-        rpc_posted_recvs: 256,
+        rpc_posted_recvs: 32,
+        max_connections: 256,
         rpc_worker_threads: 4,
+        qps_per_connection: 1,
+        write_pipeline_depth: 1,
         progress_threads: 2,
         progress_poll_us: 10,
         runtime,
         worker_idx,
         numa: None,
+        self_peer: PeerId(0),
     }
 }
 
@@ -192,6 +246,12 @@ mod tests {
     }
 
     #[test]
+    fn only_verbs_supports_write_with_imm() {
+        assert!(Provider::Verbs.supports_write_with_imm());
+        assert!(!Provider::Tcp.supports_write_with_imm());
+    }
+
+    #[test]
     fn validate_rejects_zero_progress_threads() {
         let mut c = defaults_for("eth0", rt(), WorkerIdx(0));
         c.progress_threads = 0;
@@ -225,6 +285,26 @@ mod tests {
     fn validate_rejects_zero_rpc_worker_threads() {
         let mut c = defaults_for("eth0", rt(), WorkerIdx(0));
         c.rpc_worker_threads = 0;
+        match c.validate() {
+            Err(FabricError::BadConfig(_)) => {}
+            other => panic!("expected BadConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_qps_per_connection() {
+        let mut c = defaults_for("eth0", rt(), WorkerIdx(0));
+        c.qps_per_connection = 0;
+        match c.validate() {
+            Err(FabricError::BadConfig(_)) => {}
+            other => panic!("expected BadConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_write_pipeline_depth() {
+        let mut c = defaults_for("eth0", rt(), WorkerIdx(0));
+        c.write_pipeline_depth = 0;
         match c.validate() {
             Err(FabricError::BadConfig(_)) => {}
             other => panic!("expected BadConfig, got {other:?}"),

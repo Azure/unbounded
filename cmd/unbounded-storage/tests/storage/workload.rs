@@ -406,7 +406,7 @@ async fn open_local(
 ) -> Result<LocalRc, String> {
     let mut engines = Vec::with_capacity(devices.len());
     for dev in devices {
-        let eng = StorageEngine::open(dev.clone(), cfg)
+        let eng = StorageEngine::open(dev.clone(), cfg.clone())
             .await
             .map_err(|e| format!("open: {e}"))?;
         engines.push(Arc::new(eng));
@@ -423,7 +423,7 @@ async fn open_local(
             base: pool_base,
             page_size,
             page_count: pool_pages,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         })
         .map_err(|e| format!("register: {e}"))?;
     Ok(Rc::new(local))
@@ -562,6 +562,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         let configured_faults = w.io_fault_rate;
         let configured_corrupt = w.read_corrupt_rate;
         let page_size = w.page_size;
+        let engine_cfg = engine_cfg.clone();
         exec.spawn(async move {
             sim_cfg.max_io_delay.set(0);
             sim_cfg.io_fault_rate.set(0);
@@ -699,7 +700,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                             len: byte_len as u32,
                         };
                         oracle.record_write(key, offset, bytes);
-                        match local.write_page(key, offset, page).await {
+                        match local.write_page(&key, offset, page).await {
                             Ok(()) => outcomes.borrow_mut().push(Outcome::WriteOk),
                             Err(e) => outcomes
                                 .borrow_mut()
@@ -722,7 +723,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                             offset: 0,
                             len: byte_len as u32,
                         };
-                        match local.read_page(key, offset, page).await {
+                        match local.read_page(&key, offset, page).await {
                             Ok(true) => {
                                 let bytes = unsafe {
                                     let p = (pool_base_v as *const u8).add(pool_slot * page_size);
@@ -849,7 +850,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         exec2.spawn(async move {
             let local = match open_local(
                 &devices2,
-                engine_cfg,
+                engine_cfg.clone(),
                 pool_base_v as *mut u8,
                 w2.page_size,
                 pool_pages,
@@ -886,7 +887,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                         offset: 0,
                         len: byte_len as u32,
                     };
-                    match local.read_page(key, offset, page).await {
+                    match local.read_page(&key, offset, page).await {
                         Ok(true) => {
                             let bytes = unsafe {
                                 let p = (pool_base_v as *const u8).add(pool_slot * w2.page_size);

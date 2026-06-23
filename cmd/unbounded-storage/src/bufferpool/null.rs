@@ -10,8 +10,8 @@
 //! before a production blockstore lands. Replace with a real
 //! io_uring or NVMe-backed impl as soon as one is available.
 
-use crate::bufferpool::traits::BlockStore;
-use crate::bufferpool::types::{Error, PageRef, StripeKey};
+use crate::bufferpool::traits::{BlockStore, Req};
+use crate::bufferpool::types::{Error, PageRef};
 use crate::memory::Backing;
 
 #[derive(Default)]
@@ -28,9 +28,9 @@ impl BlockStore for NullBlockStore {
         Ok(())
     }
 
-    async fn read_page(
+    async fn read_page<R: Req + ?Sized>(
         &self,
-        _key: StripeKey,
+        _req: &R,
         _stripe_off: u64,
         _dst: PageRef,
     ) -> Result<bool, Error> {
@@ -38,9 +38,9 @@ impl BlockStore for NullBlockStore {
         Ok(false)
     }
 
-    async fn write_page(
+    async fn write_page<R: Req + ?Sized>(
         &self,
-        _key: StripeKey,
+        _req: &R,
         _stripe_off: u64,
         _page: PageRef,
     ) -> Result<(), Error> {
@@ -72,14 +72,14 @@ mod tests {
     #[test]
     fn read_always_misses_write_is_noop() {
         let s = NullBlockStore::new();
-        let key = StripeKey([0; 32]);
+        let req = crate::storage::StripeReq::new(crate::bufferpool::StripeKey([0; 32]));
         let dst = PageRef {
             page_idx: 0,
             offset: 0,
             len: 0,
         };
-        assert!(matches!(block_on(s.read_page(key, 0, dst)), Ok(false)));
-        assert!(block_on(s.write_page(key, 0, dst)).is_ok());
+        assert!(matches!(block_on(s.read_page(&req, 0, dst)), Ok(false)));
+        assert!(block_on(s.write_page(&req, 0, dst)).is_ok());
     }
 
     #[test]
@@ -89,7 +89,7 @@ mod tests {
             base: std::ptr::null_mut(),
             page_size: 4096,
             page_count: 0,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         assert!(s.register_pages(&backing).is_ok());
     }

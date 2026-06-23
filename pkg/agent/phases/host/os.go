@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"fmt"
 	"log/slog"
+	"os/exec"
 	"strings"
 
 	"github.com/Azure/unbounded/internal/executil"
@@ -15,13 +16,13 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
-// requiredPackages lists the OS packages that must be installed on the host.
+// debianRequiredPackages lists the OS packages that must be installed on a Debian host.
 // - systemd-container: provides systemd-nspawn for running containers.
 // - debootstrap: used to bootstrap a Debian rootfs.
 // - curl: used for downloading resources.
 // - nftables: provides nft, used by nftables-flush.service to reset firewall rules.
 // - util-linux: provides mountpoint for private bpffs cleanup.
-var requiredPackages = []string{
+var debianRequiredPackages = []string{
 	"systemd-container",
 	"debootstrap",
 	"curl",
@@ -29,13 +30,29 @@ var requiredPackages = []string{
 	"util-linux",
 }
 
+// rpmRequiredPackages lists the OS packages that must be installed on an RPM-based host.
+// RPM-based hosts are supported for OCI-image rootfs provisioning, so debootstrap is not required.
+var rpmRequiredPackages = []string{
+	"systemd-container",
+	"curl",
+	"nftables",
+	"util-linux",
+}
+
+type hostPackageManager struct {
+	name             string
+	requiredPackages []string
+	command          func(context.Context) *exec.Cmd
+	refreshArgs      []string
+	installArgs      []string
+	installed        func(context.Context, *slog.Logger, string) bool
+}
+
 type installPackages struct {
 	log *slog.Logger
 }
 
 // InstallPackages returns a task that installs the required OS packages on the host.
-//
-// TODO: support package managers beyond apt (e.g. dnf, zypper) for non-Debian distros.
 func InstallPackages(log *slog.Logger) phases.Task {
 	return &installPackages{log: log}
 }
@@ -43,12 +60,15 @@ func InstallPackages(log *slog.Logger) phases.Task {
 func (ip *installPackages) Name() string { return "install-packages" }
 
 func (ip *installPackages) Do(ctx context.Context) error {
-	aptGet := executil.AptGet()
+	pm, err := detectHostPackageManager(exec.LookPath)
+	if err != nil {
+		return err
+	}
 
 	var missing []string
 
-	for _, pkg := range requiredPackages {
-		if !isDebianPackageInstalled(ctx, ip.log, pkg) {
+	for _, pkg := range pm.requiredPackages {
+		if !pm.installed(ctx, ip.log, pkg) {
 			missing = append(missing, pkg)
 		}
 	}
@@ -57,19 +77,59 @@ func (ip *installPackages) Do(ctx context.Context) error {
 		return nil
 	}
 
-	// Refresh the package index before installing.
-	if err := executil.RunCmd(ctx, ip.log, aptGet, "update", "-y"); err != nil {
-		return fmt.Errorf("apt-get update: %w", err)
+	if len(pm.refreshArgs) > 0 {
+		if err := executil.RunCmd(ctx, ip.log, pm.command, pm.refreshArgs...); err != nil {
+			return fmt.Errorf("%s %s: %w", pm.name, strings.Join(pm.refreshArgs, " "), err)
+		}
 	}
 
 	// Install all missing packages in a single invocation.
-	args := append([]string{"install", "-y", "--no-install-recommends"}, missing...)
+	args := make([]string, 0, len(pm.installArgs)+len(missing))
+	args = append(args, pm.installArgs...)
+	args = append(args, missing...)
 
-	if err := executil.RunCmd(ctx, ip.log, aptGet, args...); err != nil {
-		return fmt.Errorf("apt-get install %s: %w", strings.Join(missing, " "), err)
+	if err := executil.RunCmd(ctx, ip.log, pm.command, args...); err != nil {
+		return fmt.Errorf("%s install %s: %w", pm.name, strings.Join(missing, " "), err)
 	}
 
 	return nil
+}
+
+func detectHostPackageManager(lookupPath func(string) (string, error)) (*hostPackageManager, error) {
+	if _, err := lookupPath("apt-get"); err == nil {
+		return &hostPackageManager{
+			name:             "apt-get",
+			requiredPackages: debianRequiredPackages,
+			command:          executil.AptGet(),
+			refreshArgs:      []string{"update", "-y"},
+			installArgs:      []string{"install", "-y", "--no-install-recommends"},
+			installed:        isDebianPackageInstalled,
+		}, nil
+	}
+
+	if _, err := lookupPath("tdnf"); err == nil {
+		return &hostPackageManager{
+			name:             "tdnf",
+			requiredPackages: rpmRequiredPackages,
+			command:          executil.Tdnf(),
+			refreshArgs:      []string{"makecache"},
+			installArgs:      []string{"install", "-y"},
+			installed:        isRPMPackageInstalled,
+		}, nil
+	}
+
+	if _, err := lookupPath("dnf"); err == nil {
+		return &hostPackageManager{
+			name:             "dnf",
+			requiredPackages: rpmRequiredPackages,
+			command:          executil.Dnf(),
+			refreshArgs:      []string{"makecache"},
+			installArgs:      []string{"install", "-y"},
+			installed:        isRPMPackageInstalled,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("unsupported host package manager: apt-get, tdnf, or dnf is required")
 }
 
 // isDebianPackageInstalled checks whether a package is fully installed using dpkg-query.
@@ -83,6 +143,13 @@ func isDebianPackageInstalled(ctx context.Context, log *slog.Logger, pkg string)
 	}
 
 	return strings.TrimSpace(output) == "installed"
+}
+
+// isRPMPackageInstalled checks whether an RPM package is installed.
+func isRPMPackageInstalled(ctx context.Context, log *slog.Logger, pkg string) bool {
+	_, err := executil.OutputCmdAt(ctx, log, slog.LevelDebug, "rpm", "-q", "--quiet", pkg)
+
+	return err == nil
 }
 
 // Kubernetes sysctl settings. Inside systemd-nspawn, /proc/sys is a read-only
