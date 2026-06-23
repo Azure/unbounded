@@ -151,3 +151,56 @@ jobs:
 
       - name: Run TLC
         run: make unbounded-storage-model-check
+
+  arm64-build:
+    name: Arm64 build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      # Source of truth for the libfabric version is the Makefile default
+      # (LIBFABRIC_VERSION). It is pinned here too so the cache key stays in
+      # sync; the value is passed to make so the two never diverge.
+      LIBFABRIC_VERSION: "2.5.1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config ca-certificates curl liburing-dev \
+            libibverbs-dev librdmacm-dev
+
+      # The distro libfabric (1.x) predates the merge of the experimental
+      # `net` provider into `tcp`, so it lacks a native FI_EP_RDM `tcp`
+      # provider. `make libfabric` builds a pinned release from source and
+      # installs it under tmp/libfabric (cached below to skip the rebuild).
+      - name: Cache libfabric
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: tmp/libfabric
+          key: libfabric-${{ env.LIBFABRIC_VERSION }}-arm64-${{ runner.os }}-${{ hashFiles('Makefile') }}
+
+      - name: Build libfabric
+        run: make libfabric LIBFABRIC_VERSION="$LIBFABRIC_VERSION"
+
+      - name: Set up Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cmd/unbounded-storage/target
+          key: cargo-unbounded-storage-arm64-${{ runner.os }}-fabric-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c') }}
+          restore-keys: |
+            cargo-unbounded-storage-arm64-${{ runner.os }}-fabric-
+            cargo-unbounded-storage-arm64-${{ runner.os }}-
+
+      - name: Build release binary
+        run: make unbounded-storage-build LIBFABRIC_VERSION="$LIBFABRIC_VERSION"
