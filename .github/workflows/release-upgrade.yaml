@@ -214,7 +214,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # Check out the deployed tag, not the default branch. The deploy
           # steps below use tag-pinned content (manifests tarball, cosign
@@ -361,7 +361,7 @@ jobs:
         #
         # Mirrors the pattern used by smoke-discover and smoke-tests for
         # hack/release/smoke/.
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           path: _release-tools
@@ -500,7 +500,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # Orca deploy tooling (hack/orca/) is read from the deployed
           # tag, not the default branch. It is present in every release
@@ -595,7 +595,7 @@ jobs:
       has_tasks: ${{ steps.list.outputs.has_tasks }}
       smoke_sha: ${{ steps.pin.outputs.sha }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # Use the default branch's hack/release/smoke/, not the deployed
           # tag's. See the rationale above the job.
@@ -689,7 +689,7 @@ jobs:
       TAG: ${{ needs.resolve.outputs.tag }}
       SITE_NAME: ${{ vars.SITE_NAME }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # Check out the exact commit smoke-discover enumerated, not a
           # fresh resolve of the default branch (which may have advanced
