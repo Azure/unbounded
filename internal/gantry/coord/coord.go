@@ -51,11 +51,18 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
+	"github.com/Azure/unbounded/internal/gantry/oci"
 	coordv1 "github.com/Azure/unbounded/internal/gantry/proto/coord/v1"
 )
 
 // ProtocolID is the libp2p stream protocol the coord handler binds.
 const ProtocolID protocol.ID = "/gantry/coord/1.0.0"
+
+// errUnauthorizedPeer is the sentinel returned by dispatch when peer
+// authorization is in enforce mode and the dialing peer is not a recognised
+// member. handleStream skips the stream-error metric for it because the
+// rejection is already counted, by reason, in p2p_coord_unauthorized_peer_total.
+var errUnauthorizedPeer = errors.New("coord: unauthorized peer")
 
 // MaxMessageBytes caps a single inbound Envelope. PullIntentRequest is
 // tiny; PleasePullRequest grows linearly with batch size. 1 MiB is
@@ -84,6 +91,11 @@ const DefaultStreamHandshakeTimeout = 5 * time.Second
 // local gate.
 const DefaultMaxConcurrentStreams = 512
 
+// DefaultMaxDigestsPerPleasePull caps a single inbound please_pull batch. It
+// is well above normal OCI manifest child counts while preventing a 1 MiB
+// coord envelope from expanding into thousands of pump calls.
+const DefaultMaxDigestsPerPleasePull = 256
+
 // MetricsHooks lets callers wire Prometheus counters/gauges without
 // importing the metrics package. All fields may be nil.
 type MetricsHooks struct {
@@ -105,8 +117,31 @@ type MetricsHooks struct {
 	// OnPleasePullStarted is called once per digest the server
 	// transitions into in_flight from a please_pull batch.
 	OnPleasePullStarted func()
-	// OnStreamError fires for any malformed or oversized stream.
+	// OnPleasePullDeclined fires once per digest the server declines to
+	// start (PumpDeclined): the puller-pump refused the work because the
+	// node is at its concurrent-pull ceiling or is shutting down. The
+	// digest is reported to the requester as OUTCOME_UNSPECIFIED. This is
+	// the load-shedding signal operators watch during large rollouts; a
+	// sustained nonzero rate means designated pullers are saturated and
+	// requesters are falling through to direct-origin fallback (NF5).
+	OnPleasePullDeclined func()
+	// OnStreamError fires once per inbound stream that is dropped without a
+	// normal reply: a malformed or oversized envelope, read/decode/deadline
+	// failures, the concurrent-stream limit, dispatch and serve errors, and
+	// response marshal/write failures. Enforce-mode authz rejections are
+	// deliberately NOT counted here (they are a policy decision, recorded by
+	// reason in OnUnauthorizedPeer), so enabling peer authz does not inflate
+	// the protocol-error signal.
 	OnStreamError func()
+	// OnUnauthorizedPeer fires once per inbound request whose remote
+	// libp2p peer ID is not present in the current membership view. The
+	// reason label distinguishes "unrecognized" (members have published
+	// peer IDs but none match remote) from "unevaluable" (no member has
+	// published a peer ID yet, so authorization cannot be evaluated - only
+	// reported in enforce mode). It fires in both observe-only and enforce
+	// mode so operators can size the false-positive rate before flipping
+	// enforcement on.
+	OnUnauthorizedPeer func(reason string)
 }
 
 // Server handles inbound coord streams: pull_intent_query and
@@ -133,6 +168,15 @@ type Server struct {
 	streamHandshakeTimeout time.Duration
 	// streamSem bounds concurrent inbound stream handlers.
 	streamSem chan struct{}
+	// authzEnforce flips peer authorization from observe-only (record
+	// the metric, still serve) to enforce (reject before dispatch).
+	authzEnforce bool
+	// authzWarn rate-limits unauthorized-peer warnings so a flood of
+	// unrecognized peers cannot swamp the log; the metric carries exact
+	// counts. nil disables throttling (every occurrence logs).
+	authzWarn *logThrottle
+	// maxDigestsPerPleasePull bounds a single inbound please_pull batch.
+	maxDigestsPerPleasePull int
 }
 
 // NegativeCache is the read interface coord needs from the
@@ -154,9 +198,28 @@ type NegativeEntry struct {
 // until pump returns. Long-running work (the actual origin pull) MUST
 // be moved to a goroutine inside the pump's implementation.
 //
-// The returned (started_at, alreadyPulling) tuple drives the wire-
-// level OUTCOME_STARTED vs OUTCOME_ALREADY_PULLING decision.
-type PullerPump func(ctx context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) (startedAt time.Time, alreadyPulling bool, fail *NegativeEntry)
+// PullerPump returns a PumpResult describing whether the digest started,
+// piggy-backed on existing work, short-circuited on a recent failure, or was
+// declined before background work was started.
+type PullerPump func(ctx context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) PumpResult
+
+// PumpStatus is the in-process status returned by PullerPump.
+type PumpStatus int
+
+const (
+	PumpStarted PumpStatus = iota
+	PumpAlreadyPulling
+	PumpRecentlyFailed
+	PumpDeclined
+)
+
+// PumpResult is the in-process result returned by PullerPump.
+type PumpResult struct {
+	Status        PumpStatus
+	StartedAt     time.Time
+	CooldownUntil time.Time
+	FailureClass  ifaces.FailureClass
+}
 
 // Option configures a Server.
 type Option func(*Server)
@@ -208,16 +271,40 @@ func WithMaxConcurrentStreams(n int) Option {
 	}
 }
 
+// WithPeerAuthz configures peer authorization for inbound coord requests.
+//
+// Authorization compares the dialing peer's libp2p peer ID against the
+// PeerID values published in the current membership view. When enforce is
+// false (the default) an unrecognised peer is recorded via
+// MetricsHooks.OnUnauthorizedPeer and still served, so operators can size
+// the false-positive rate before flipping enforcement on. When enforce is
+// true an unrecognised peer is rejected before its request is dispatched.
+func WithPeerAuthz(enforce bool) Option {
+	return func(s *Server) { s.authzEnforce = enforce }
+}
+
+// WithMaxDigestsPerPleasePull overrides DefaultMaxDigestsPerPleasePull.
+// Non-positive values are ignored.
+func WithMaxDigestsPerPleasePull(n int) Option {
+	return func(s *Server) {
+		if n > 0 {
+			s.maxDigestsPerPleasePull = n
+		}
+	}
+}
+
 // NewServer constructs a coord server. The store + members + inflight
 // dependencies are required (everything else is optional via Option).
 func NewServer(store ifaces.LocalContentStore, members ifaces.Members, inflight *inflight.Map, opts ...Option) *Server {
 	s := &Server{
-		logger:                 slog.Default().With(slog.String("subsystem", "coord")),
-		store:                  store,
-		members:                members,
-		inflight:               inflight,
-		streamHandshakeTimeout: DefaultStreamHandshakeTimeout,
-		streamSem:              make(chan struct{}, DefaultMaxConcurrentStreams),
+		logger:                  slog.Default().With(slog.String("subsystem", "coord")),
+		store:                   store,
+		members:                 members,
+		inflight:                inflight,
+		streamHandshakeTimeout:  DefaultStreamHandshakeTimeout,
+		streamSem:               make(chan struct{}, DefaultMaxConcurrentStreams),
+		authzWarn:               &logThrottle{interval: 30 * time.Second},
+		maxDigestsPerPleasePull: DefaultMaxDigestsPerPleasePull,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -230,6 +317,13 @@ func NewServer(store ifaces.LocalContentStore, members ifaces.Members, inflight 
 // dialing ProtocolID will be served by s.
 func (s *Server) Bind(h host.Host) {
 	h.SetStreamHandler(ProtocolID, s.handleStream)
+}
+
+// Unbind removes the stream handler registered by Bind. Shutdown calls this
+// before waiting on puller-pump goroutines so no new inbound coord stream can
+// start another background origin pull while the pump gate is draining.
+func (s *Server) Unbind(h host.Host) {
+	h.RemoveStreamHandler(ProtocolID)
 }
 
 // handleStream is invoked by libp2p for each inbound stream. The
@@ -288,7 +382,14 @@ func (s *Server) handleStream(str network.Stream) {
 
 	out, err := s.dispatch(ctx, str.Conn().RemotePeer(), in)
 	if err != nil {
-		s.bumpStreamErr()
+		// An enforce-mode authz rejection is a policy decision, not a
+		// protocol error: it is already counted (by reason) in
+		// p2p_coord_unauthorized_peer_total, so don't also inflate the
+		// stream-error metric when peer authz is enabled.
+		if !errors.Is(err, errUnauthorizedPeer) {
+			s.bumpStreamErr()
+		}
+
 		s.logger.Debug("coord: dispatch", slog.Any("err", err))
 
 		return
@@ -315,9 +416,23 @@ func (s *Server) handleStream(str network.Stream) {
 }
 
 func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envelope) (*coordv1.Envelope, error) {
+	// Snapshot membership once per request and thread it through both
+	// authorization and pull-intent HRW ranking, instead of each taking its
+	// own O(N) copy.
+	nodes := s.snapshotMembers()
+
+	// authorizePeer is always evaluated (it records the observe-only metric);
+	// the boolean only gates the request under enforce mode. The rejection
+	// wraps errUnauthorizedPeer so handleStream can skip the stream-error
+	// metric (the rejection is already counted in p2p_coord_unauthorized_peer_total).
+	authorized := s.authorizePeer(remote, nodes)
+	if s.authzEnforce && !authorized {
+		return nil, fmt.Errorf("%w %s", errUnauthorizedPeer, remote)
+	}
+
 	switch m := in.GetMsg().(type) {
 	case *coordv1.Envelope_PullIntentRequest:
-		resp, err := s.servePullIntent(ctx, m.PullIntentRequest)
+		resp, err := s.servePullIntent(ctx, m.PullIntentRequest, nodes)
 		if err != nil {
 			return nil, err
 		}
@@ -345,13 +460,122 @@ func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envel
 	}
 }
 
-func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentRequest) (*coordv1.PullIntentResponse, error) {
+// authorizePeer reports whether remote is a recognised cluster member.
+//
+// It compares remote's libp2p peer ID against the PeerID values published
+// in the supplied membership snapshot. Membership is treated as telemetry
+// input, not an authoritative security oracle:
+//
+//   - A node that has not yet published its gantry.io/peer-id annotation
+//     has an empty PeerID; empty PeerIDs are ignored so they never match.
+//   - When NO member has published a peer ID yet (cold boot, informer lag,
+//     a single-self dev membership), authorization cannot be evaluated. In
+//     observe-only mode authorizePeer returns true and stays quiet so bootstrap
+//     traffic does not generate unauthorized-peer noise. In enforce mode the
+//     same state is rejected because the operator explicitly requested a hard
+//     gate and should not get a silent fail-open.
+//
+// On a genuine miss (the membership view has published peer IDs but none
+// match) the OnUnauthorizedPeer metric fires and a rate-limited warning is
+// logged in both observe-only and enforce mode; the boolean return then
+// drives the enforce-mode rejection in dispatch.
+func (s *Server) authorizePeer(remote peer.ID, nodes []ifaces.Node) bool {
+	if s.members == nil {
+		return true
+	}
+
+	want := remote.String()
+
+	known := 0
+
+	for _, n := range nodes {
+		if n.PeerID == "" {
+			continue
+		}
+
+		known++
+
+		if n.PeerID == want {
+			return true
+		}
+	}
+
+	if known == 0 {
+		// Authorization is unevaluable. Observe-only fails open quietly;
+		// enforce mode rejects (and records it as a distinct reason) because
+		// the operator asked for a hard gate.
+		if !s.authzEnforce {
+			return true
+		}
+
+		s.recordUnauthorized(want, "unevaluable")
+
+		return false
+	}
+
+	s.recordUnauthorized(want, "unrecognized")
+
+	return false
+}
+
+// snapshotMembers returns the current membership view, or nil when no
+// membership is wired. The returned slice is owned by the caller.
+func (s *Server) snapshotMembers() []ifaces.Node {
+	if s.members == nil {
+		return nil
+	}
+
+	return s.members.Snapshot()
+}
+
+// recordUnauthorized fires the unauthorized-peer metric (labelled by reason)
+// for every occurrence and emits a rate-limited warning. The metric carries
+// exact counts; the log is only a human-facing heads-up, so a flood of
+// unrecognized peers (rolling upgrade, annotation lag, or a hostile peer)
+// cannot swamp the log pipeline.
+func (s *Server) recordUnauthorized(peerStr, reason string) {
+	if s.hooks.OnUnauthorizedPeer != nil {
+		s.hooks.OnUnauthorizedPeer(reason)
+	}
+
+	if s.authzWarn == nil || s.authzWarn.allow(time.Now()) {
+		s.logger.Warn("coord: unauthorized peer",
+			slog.String("peer", peerStr),
+			slog.String("reason", reason),
+			slog.Bool("enforce", s.authzEnforce),
+		)
+	}
+}
+
+// logThrottle bounds how often a repeated log line is emitted, regardless of
+// how many events arrive. The first event always logs; subsequent events
+// within interval are suppressed (the associated metric still counts them).
+type logThrottle struct {
+	mu       sync.Mutex
+	interval time.Duration
+	last     time.Time
+}
+
+func (t *logThrottle) allow(now time.Time) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if !t.last.IsZero() && now.Sub(t.last) < t.interval {
+		return false
+	}
+
+	t.last = now
+
+	return true
+}
+
+func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentRequest, nodes []ifaces.Node) (*coordv1.PullIntentResponse, error) {
 	d, err := digest.Parse(req.GetDigest())
 	if err != nil {
 		return nil, fmt.Errorf("pull_intent: %w", err)
 	}
 
-	intent := s.computeLocalIntent(ctx, d)
+	intent := s.computeLocalIntent(ctx, d, nodes)
 
 	resp := &coordv1.PullIntentResponse{
 		HasCached:      intent.HasCached,
@@ -377,7 +601,7 @@ func (s *Server) servePullIntent(ctx context.Context, req *coordv1.PullIntentReq
 // cold-start orchestrator uses it to include self as a first-class
 // participant in the rule cascade.
 func (s *Server) LocalPullIntent(ctx context.Context, d digest.Digest) ifaces.PullIntent {
-	return s.computeLocalIntent(ctx, d)
+	return s.computeLocalIntent(ctx, d, s.snapshotMembers())
 }
 
 // computeLocalIntent is the shared implementation behind
@@ -386,7 +610,11 @@ func (s *Server) LocalPullIntent(ctx context.Context, d digest.Digest) ifaces.Pu
 // that the cold-start cascade's HRW-rank-0-on-self decision matches
 // what every peer would compute for us. See the step 4 and the
 // LocalIntentProvider interface doc.
-func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest) ifaces.PullIntent {
+//
+// nodes is the membership snapshot to rank against; callers pass the
+// snapshot they already took (dispatch shares one per request) so this
+// does not take a second O(N) copy.
+func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest, nodes []ifaces.Node) ifaces.PullIntent {
 	intent := ifaces.PullIntent{RecipientRank: -1}
 
 	// has_cached. The local content store is the single source of
@@ -427,7 +655,6 @@ func (s *Server) computeLocalIntent(ctx context.Context, d digest.Digest) ifaces
 
 	// hrw_rank - own rank in own membership view.
 	if s.members != nil {
-		nodes := s.members.Snapshot()
 		intent.RecipientRank = hrw.RankOf(nodes, s.members.Self(), d)
 	}
 
@@ -458,29 +685,72 @@ func (s *Server) StartLocalPull(ctx context.Context, registry, repository string
 		return nil, errors.New("start_local_pull: missing registry/repository")
 	}
 
+	if err := oci.ValidateRepositoryName(repository); err != nil {
+		return nil, fmt.Errorf("start_local_pull: %w", err)
+	}
+
+	if s.maxDigestsPerPleasePull > 0 && len(digests) > s.maxDigestsPerPleasePull {
+		out := make([]ifaces.PleasePullOutcome, 0, len(digests))
+		for start := 0; start < len(digests); start += s.maxDigestsPerPleasePull {
+			end := start + s.maxDigestsPerPleasePull
+			if end > len(digests) {
+				end = len(digests)
+			}
+
+			chunkOut, err := s.StartLocalPull(ctx, registry, repository, kind, digests[start:end])
+			if err != nil {
+				// Return the outcomes accumulated so far alongside the error.
+				// The only error source here is ctx cancellation, and the
+				// cold-start caller is per-digest, so partial progress lets
+				// already-started digests be observed rather than discarded.
+				return out, err
+			}
+
+			out = append(out, chunkOut...)
+		}
+
+		return out, nil
+	}
+
 	out := make([]ifaces.PleasePullOutcome, 0, len(digests))
 	for _, d := range digests {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+
 		oc := ifaces.PleasePullOutcome{Digest: d}
 		if s.pullerPump == nil {
 			out = append(out, oc)
 			continue
 		}
 
-		startedAt, already, fail := s.pullerPump(ctx, registry, repository, d, kind)
-		switch {
-		case fail != nil:
+		res := s.pullerPump(ctx, registry, repository, d, kind)
+		switch res.Status {
+		case PumpRecentlyFailed:
 			oc.Outcome = ifaces.PleasePullRecentlyFailed
-			oc.CooldownUntil = fail.CooldownUntil
-			oc.FailureClass = fail.Class
-		case already:
+			oc.CooldownUntil = res.CooldownUntil
+			oc.FailureClass = res.FailureClass
+		case PumpAlreadyPulling:
 			oc.Outcome = ifaces.PleasePullAlreadyPulling
-			oc.StartedAt = startedAt
-		default:
+			oc.StartedAt = res.StartedAt
+		case PumpStarted:
 			oc.Outcome = ifaces.PleasePullStarted
-			oc.StartedAt = startedAt
+			oc.StartedAt = res.StartedAt
 
 			if s.hooks.OnPleasePullStarted != nil {
 				s.hooks.OnPleasePullStarted()
+			}
+		case PumpDeclined:
+			// Load-shed: the pump refused (at the concurrent-pull ceiling or
+			// shutting down). OUTCOME_UNSPECIFIED is overloaded here - it also
+			// means "no pump wired" - but the cold-start resolver treats both
+			// the same way (give up on this puller for this digest), so the
+			// transient-vs-permanent distinction is observable only via the
+			// declined counter, not the wire outcome.
+			oc.Outcome = ifaces.PleasePullUnspecified
+
+			if s.hooks.OnPleasePullDeclined != nil {
+				s.hooks.OnPleasePullDeclined()
 			}
 		}
 
@@ -496,12 +766,31 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 		return nil, errors.New("please_pull: missing registry/repository")
 	}
 
+	if err := oci.ValidateRepositoryName(req.GetRepository()); err != nil {
+		s.bumpStreamErr()
+		return nil, fmt.Errorf("please_pull: %w", err)
+	}
+
 	if len(req.GetDigests()) == 0 {
 		return &coordv1.PleasePullResponse{}, nil
 	}
 
+	if s.maxDigestsPerPleasePull > 0 && len(req.GetDigests()) > s.maxDigestsPerPleasePull {
+		// Wire path rejects rather than chunks: a well-behaved client (see
+		// Client.PleasePull) already splits into <= max batches, so an
+		// oversized request on the wire is either a misconfiguration or a
+		// client whose max exceeds ours (version skew). Reject loudly instead
+		// of silently fanning out work the operator did not size for.
+		s.bumpStreamErr()
+		return nil, fmt.Errorf("please_pull: too many digests: got %d, max %d", len(req.GetDigests()), s.maxDigestsPerPleasePull)
+	}
+
 	results := make([]*coordv1.PleasePullResponse_Result, 0, len(req.GetDigests()))
 	for _, raw := range req.GetDigests() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		d, err := digest.Parse(raw)
 		if err != nil {
 			s.bumpStreamErr()
@@ -521,21 +810,33 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 			continue
 		}
 
-		startedAt, already, fail := s.pullerPump(ctx, req.GetUpstreamRegistry(), req.GetRepository(), d, pleasePullKindFromProto(req.GetKind()))
-		switch {
-		case fail != nil:
+		res := s.pullerPump(ctx, req.GetUpstreamRegistry(), req.GetRepository(), d, pleasePullKindFromProto(req.GetKind()))
+		switch res.Status {
+		case PumpRecentlyFailed:
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_RECENTLY_FAILED
-			r.CooldownUntil = timestamppb.New(fail.CooldownUntil)
-			r.FailureClass = failureClassToProto(fail.Class)
-		case already:
+			r.CooldownUntil = timestamppb.New(res.CooldownUntil)
+			r.FailureClass = failureClassToProto(res.FailureClass)
+		case PumpAlreadyPulling:
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_ALREADY_PULLING
-			r.StartedAt = timestamppb.New(startedAt)
-		default:
+			r.StartedAt = timestamppb.New(res.StartedAt)
+		case PumpStarted:
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_STARTED
-			r.StartedAt = timestamppb.New(startedAt)
+			r.StartedAt = timestamppb.New(res.StartedAt)
 
 			if s.hooks.OnPleasePullStarted != nil {
 				s.hooks.OnPleasePullStarted()
+			}
+		case PumpDeclined:
+			// Load-shed: the pump refused (at the concurrent-pull ceiling or
+			// shutting down). OUTCOME_UNSPECIFIED is overloaded here - it also
+			// means "no pump wired" - but the cold-start resolver treats both
+			// the same way (give up on this puller for this digest), so the
+			// transient-vs-permanent distinction is observable only via the
+			// declined counter, not the wire outcome.
+			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_UNSPECIFIED
+
+			if s.hooks.OnPleasePullDeclined != nil {
+				s.hooks.OnPleasePullDeclined()
 			}
 		}
 
@@ -563,12 +864,13 @@ func (s *Server) bumpStreamErr() {
 // owned by `internal/members` and surfaces through a richer Node type
 // in +.
 type Client struct {
-	h            host.Host
-	dialTimeout  time.Duration
-	rpcTimeout   time.Duration
-	logger       *slog.Logger
-	resolveMu    sync.RWMutex
-	resolveCache map[ifaces.NodeID]peer.ID
+	h                       host.Host
+	dialTimeout             time.Duration
+	rpcTimeout              time.Duration
+	maxDigestsPerPleasePull int
+	logger                  *slog.Logger
+	resolveMu               sync.RWMutex
+	resolveCache            map[ifaces.NodeID]peer.ID
 	// resolveFn is consulted before the static cache. It lets higher
 	// layers (members) supply a live NodeID -> peer.ID mapping derived
 	// from pod-annotation announcements without polling. Returns
@@ -594,6 +896,16 @@ func WithRPCTimeout(d time.Duration) ClientOption {
 	return func(c *Client) {
 		if d > 0 {
 			c.rpcTimeout = d
+		}
+	}
+}
+
+// WithClientMaxDigestsPerPleasePull overrides the client-side chunk size used
+// for PleasePull. Non-positive values are ignored.
+func WithClientMaxDigestsPerPleasePull(n int) ClientOption {
+	return func(c *Client) {
+		if n > 0 {
+			c.maxDigestsPerPleasePull = n
 		}
 	}
 }
@@ -625,11 +937,12 @@ func WithPeerIDResolver(fn func(ifaces.NodeID) (peer.ID, bool)) ClientOption {
 // host already participating in the coord protocol's transports.
 func NewClient(h host.Host, opts ...ClientOption) *Client {
 	c := &Client{
-		h:            h,
-		dialTimeout:  2 * time.Second,
-		rpcTimeout:   2 * time.Second,
-		logger:       slog.Default().With(slog.String("subsystem", "coord-client")),
-		resolveCache: map[ifaces.NodeID]peer.ID{},
+		h:                       h,
+		dialTimeout:             2 * time.Second,
+		rpcTimeout:              2 * time.Second,
+		maxDigestsPerPleasePull: DefaultMaxDigestsPerPleasePull,
+		logger:                  slog.Default().With(slog.String("subsystem", "coord-client")),
+		resolveCache:            map[ifaces.NodeID]peer.ID{},
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -667,6 +980,34 @@ func (c *Client) PullIntentQuery(ctx context.Context, target ifaces.NodeID, d di
 
 // PleasePull implements ifaces.Coordinator.
 func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+	maxDigests := c.maxDigestsPerPleasePull
+	if maxDigests <= 0 {
+		maxDigests = DefaultMaxDigestsPerPleasePull
+	}
+
+	if len(digests) > maxDigests {
+		outs := make([]ifaces.PleasePullOutcome, 0, len(digests))
+		for start := 0; start < len(digests); start += maxDigests {
+			end := start + maxDigests
+			if end > len(digests) {
+				end = len(digests)
+			}
+
+			chunkOut, err := c.PleasePull(ctx, target, registry, repository, kind, digests[start:end])
+			if err != nil {
+				// Unlike the local StartLocalPull path, a failed chunk here is
+				// an RPC-level failure (a partial response from one chunk is
+				// not trustworthy), so discard partial results and surface the
+				// error; the caller retries the whole request.
+				return nil, err
+			}
+
+			outs = append(outs, chunkOut...)
+		}
+
+		return outs, nil
+	}
+
 	raws := make([]string, len(digests))
 	for i, d := range digests {
 		raws[i] = d.String()

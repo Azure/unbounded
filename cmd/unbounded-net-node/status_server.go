@@ -2199,13 +2199,6 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 		NodeErrors: filterExpiredNodeErrors(s.state.nodeErrors, time.Now(), time.Minute),
 	}
 
-	// Append link stats warnings as node errors if any interfaces have incrementing counters.
-	if s.state.linkStatsMonitor != nil {
-		for _, w := range s.state.linkStatsMonitor.GetWarnings() {
-			status.NodeErrors = append(status.NodeErrors, NodeError{Type: "link-stats", Message: w})
-		}
-	}
-
 	// Append kube-proxy health warning if the health check is failing.
 	if s.state.kubeProxyMonitor != nil {
 		if w := s.state.kubeProxyMonitor.GetWarning(); w != "" {
@@ -2592,6 +2585,12 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 		status.RoutingTable.ManagedRouteCount = len(installed)
 	}
 
+	// Append link stats warnings as node errors after peers are known so
+	// benign WireGuard receive errors on healthy peers do not mark the node unhealthy.
+	if s.state.linkStatsMonitor != nil {
+		status.NodeErrors = append(status.NodeErrors, linkStatsWarningsAsNodeErrors(s.state.linkStatsMonitor.GetWarnings(), status.Peers, time.Now())...)
+	}
+
 	// Collect BPF trie entries.
 	status.BpfEntries = s.collectBpfEntries()
 
@@ -2607,6 +2606,94 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 	}
 
 	return status
+}
+
+func linkStatsWarningsAsNodeErrors(warnings []string, peers []WireGuardPeerStatus, now time.Time) []NodeError {
+	if len(warnings) == 0 {
+		return nil
+	}
+
+	result := make([]NodeError, 0, len(warnings))
+	for _, warning := range warnings {
+		if suppressHealthyWireGuardRxErrors(warning, peers, now) {
+			continue
+		}
+
+		result = append(result, NodeError{Type: "link-stats", Message: warning})
+	}
+
+	return result
+}
+
+func suppressHealthyWireGuardRxErrors(warning string, peers []WireGuardPeerStatus, now time.Time) bool {
+	iface, deltas, ok := parseLinkStatsWarning(warning)
+	if !ok || len(deltas) != 1 || !strings.HasPrefix(deltas[0], "rx_errors +") {
+		return false
+	}
+
+	matched := false
+
+	for _, peer := range peers {
+		if peer.Tunnel.Interface != iface {
+			continue
+		}
+
+		matched = true
+
+		if !peerStatusHealthy(peer, now) {
+			return false
+		}
+	}
+
+	return matched
+}
+
+func parseLinkStatsWarning(warning string) (string, []string, bool) {
+	const prefix = "interface "
+
+	warning = strings.TrimSpace(warning)
+	if !strings.HasPrefix(warning, prefix) {
+		return "", nil, false
+	}
+
+	rest := strings.TrimPrefix(warning, prefix)
+
+	idx := strings.Index(rest, ":")
+	if idx < 0 {
+		return "", nil, false
+	}
+
+	iface := strings.TrimPrefix(strings.TrimSpace(rest[:idx]), "/")
+	if iface == "" {
+		return "", nil, false
+	}
+
+	rawDeltas := strings.Split(rest[idx+1:], ",")
+
+	deltas := make([]string, 0, len(rawDeltas))
+	for _, delta := range rawDeltas {
+		trimmed := strings.TrimSpace(delta)
+		if trimmed != "" {
+			deltas = append(deltas, trimmed)
+		}
+	}
+
+	return iface, deltas, len(deltas) > 0
+}
+
+func peerStatusHealthy(peer WireGuardPeerStatus, now time.Time) bool {
+	if peer.HealthCheck != nil {
+		status := strings.TrimSpace(peer.HealthCheck.Status)
+		if peer.HealthCheck.Enabled || status != "" {
+			return strings.EqualFold(status, "up")
+		}
+	}
+
+	if peer.Tunnel.LastHandshake.IsZero() || peer.Tunnel.LastHandshake.Unix() <= 0 {
+		return false
+	}
+
+	return now.Sub(peer.Tunnel.LastHandshake) < 3*time.Minute
 }
 
 // collectRoutingTableFromKernel reads routes from the kernel via netlink.

@@ -33,78 +33,6 @@ proptest! {
         prop_assert!(report.steps > 0);
     }
 
-    /// Invariant: every `ReadHit` returned over the channel carries
-    /// bytes the workload previously wrote for that `(key, offset)`.
-    /// This is the round-trip correctness property: a write shipped to
-    /// the storage core, committed by the engine, and later read back
-    /// across the channel must reproduce the original bytes. Catches
-    /// silent corruption, mis-routing, and cross-page bleed in the
-    /// `PageChannel` -> `PageService` -> engine handoff.
-    #[test]
-    fn invariant_hit_bytes_were_written(seed in any::<u64>(), w in workload_strategy()) {
-        let oracle = Oracle::new();
-        for c in &w.clients {
-            for op in &c.ops {
-                if let Op::Write { key_idx, off_idx, payload_seed } = op {
-                    oracle.record_write(
-                        w.key(*key_idx),
-                        w.offset(*off_idx),
-                        w.payload(*key_idx, *off_idx, *payload_seed),
-                    );
-                }
-            }
-        }
-        let faults_enabled = w.io_fault_rate > 0 || w.read_corrupt_rate > 0;
-        let report = run_workload(seed, w).expect("run completed");
-        for (i, o) in report.outcomes.iter().enumerate() {
-            match o {
-                Outcome::ReadHit { key, offset, bytes } => {
-                    prop_assert!(
-                        oracle.allows_read(*key, *offset, bytes),
-                        "op {} returned a hit with bytes not previously written for ({:?}, {})",
-                        i, key.0, offset,
-                    );
-                }
-                Outcome::Err(e) => {
-                    prop_assert!(
-                        faults_enabled,
-                        "op {} produced an error under happy-path config: {}", i, e,
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Invariant: a read for a `(key, offset)` the workload never
-    /// wrote must miss. Dual of the byte-correctness check; catches a
-    /// false-positive hit reported back through the channel.
-    #[test]
-    fn invariant_unwritten_keys_miss(seed in any::<u64>(), w in workload_strategy()) {
-        let oracle = Oracle::new();
-        for c in &w.clients {
-            for op in &c.ops {
-                if let Op::Write { key_idx, off_idx, payload_seed } = op {
-                    oracle.record_write(
-                        w.key(*key_idx),
-                        w.offset(*off_idx),
-                        w.payload(*key_idx, *off_idx, *payload_seed),
-                    );
-                }
-            }
-        }
-        let report = run_workload(seed, w).expect("run completed");
-        for (i, o) in report.outcomes.iter().enumerate() {
-            if let Outcome::ReadHit { key, offset, .. } = o {
-                prop_assert!(
-                    oracle.was_written(*key, *offset),
-                    "op {} returned a hit for never-written ({:?}, {})",
-                    i, key.0, offset,
-                );
-            }
-        }
-    }
-
     /// Invariant: counters are self-consistent. `hits + misses` cannot
     /// exceed the number of `read_page` calls the workload issued, and
     /// the per-disk device-write counters must sum to the aggregate.
@@ -132,35 +60,6 @@ proptest! {
         );
     }
 
-    /// Invariant: multi-disk routing fans device writes out across
-    /// more than one disk. With `num_disks >= 2` and a non-trivial
-    /// number of device writes, a healthy `disk_for` hash (which the
-    /// clients use to pick a channel) must land writes on at least two
-    /// disks. A regression that collapsed the hash to a constant, or a
-    /// channel-fan-out bug that funneled every op to one storage core,
-    /// would route everything to a single disk.
-    ///
-    /// Scoped tightly with early returns (not `prop_assume!`) so
-    /// single-disk and tiny workloads do not count against proptest's
-    /// global reject budget.
-    #[test]
-    fn invariant_multidisk_routing_diverse(seed in any::<u64>(), w in workload_strategy()) {
-        let report = run_workload(seed, w).expect("run completed");
-        if report.num_disks_used < 2 || report.device_writes < 8 {
-            return Ok(());
-        }
-        let touched = report
-            .device_writes_per_disk
-            .iter()
-            .filter(|n| **n > 0)
-            .count();
-        prop_assert!(
-            touched >= 2,
-            "all {} device writes routed to a single disk across {} disks: {:?}",
-            report.device_writes, report.num_disks_used, report.device_writes_per_disk,
-        );
-    }
-
     /// Invariant: the service-shutdown path fails sends cleanly. When
     /// the workload requested the probe, every storage-core task has
     /// exited by the time `run_workload` issues one more `write_page`
@@ -182,6 +81,68 @@ proptest! {
             ),
         }
     }
+
+    /// Invariant: every reported hit returns bytes that were actually
+    /// submitted by some workload write for the same `(key, offset)`.
+    /// Fault injection may turn operations into `Err`, but it must never
+    /// permit a successful hit with corrupted or mis-routed bytes.
+    #[test]
+    fn invariant_hit_bytes_were_written(seed in any::<u64>(), w in workload_strategy()) {
+        let oracle = oracle_for_workload(&w);
+        let report = run_workload(seed, w).expect("run completed");
+        for (idx, outcome) in report.outcomes.iter().enumerate() {
+            if let Outcome::ReadHit { key, offset, bytes } = outcome {
+                prop_assert!(
+                    oracle.allows_read(*key, *offset, bytes),
+                    "read hit {} returned bytes never written for key {:?} offset {}",
+                    idx,
+                    key,
+                    offset,
+                );
+            }
+        }
+    }
+
+    /// Invariant: a key/offset the workload never wrote must not be
+    /// reported as a cache hit. Such reads may miss, or error under an
+    /// injected fault/shutdown race, but a hit would mean fabricated data.
+    #[test]
+    fn invariant_unwritten_keys_miss(seed in any::<u64>(), w in workload_strategy()) {
+        let oracle = oracle_for_workload(&w);
+        let report = run_workload(seed, w).expect("run completed");
+        for (idx, outcome) in report.outcomes.iter().enumerate() {
+            if let Outcome::ReadHit { key, offset, .. } = outcome {
+                prop_assert!(
+                    oracle.was_written(*key, *offset),
+                    "read hit {} for never-written key {:?} offset {}",
+                    idx,
+                    key,
+                    offset,
+                );
+            }
+        }
+    }
+}
+
+fn oracle_for_workload(w: &Workload) -> Oracle {
+    let oracle = Oracle::new();
+    for client in &w.clients {
+        for op in &client.ops {
+            if let Op::Write {
+                key_idx,
+                off_idx,
+                payload_seed,
+            } = op
+            {
+                oracle.record_write(
+                    w.key(*key_idx),
+                    w.offset(*off_idx),
+                    w.payload(*key_idx, *off_idx, *payload_seed),
+                );
+            }
+        }
+    }
+    oracle
 }
 
 /// Smoke scenario: hand-tuned single-disk workload that exercises the

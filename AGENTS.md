@@ -11,6 +11,7 @@ unbounded-kube is organized into several directories:
 - `api/` - where API definitions for custom resources are located.
   - `machina/v1alpha3/` - Machine CRD types (unbounded-cloud.io group).
   - `net/v1alpha1/` - Net CRD types (net.unbounded-cloud.io group): Site, GatewayPool, SitePeering, etc.
+  - `unbounded-storage/` - shared protobuf schema (config.proto) for the unbounded-storage daemon config, the source of truth for both the daemon's Rust (prost) bindings and the supervisor's Go bindings.
 - `bin/` - where generated binary artifacts should be placed.
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
 - `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
@@ -87,3 +88,9 @@ unbounded-kube is organized into several directories:
     - Use destructive git operations unless explicitly requested.
     - Go outside the project boundary, for example, DO NOT edit files in user's home directories, add or edit files 
       in /tmp or anywhere else on the host filesystem.
+
+## Miscellaneous
+
+- **DO NOT** give time or effort estimates for work in this project. For example, do not say "this is a half day 
+  project" or "this will take a week". You are a computer. You are not a person with a concept of human scheduling and 
+  time.

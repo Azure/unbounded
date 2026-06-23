@@ -59,6 +59,8 @@ var (
 	ErrExhausted = errors.New("coldstart: cascade exhausted")
 )
 
+const defaultHonorSweepInterval = time.Minute
+
 // Discovery is the subset of the libp2p discovery host that the
 // orchestrator needs. Kept narrow for ease of mocking.
 type Discovery interface {
@@ -150,6 +152,7 @@ type Options struct {
 	PollManifest         time.Duration // default 200ms -
 	PollLayer            time.Duration // default 1s -
 	TransientCooldownCap time.Duration // default 30s - rule 4
+	HonorSweepInterval   time.Duration // default 1m, negative disables full sweeps
 
 	// TopKExpansionFactor is the multiplier applied to HrwK on the
 	// expansion pass under rule 5 / rule 6 (the step 5; the design doc
@@ -176,8 +179,9 @@ type Resolver struct {
 	// in fact the whole probe pass) for `min(cooldown_until - now,
 	// TransientCooldownCap)`. Evicted on access once the deadline
 	// passes; see suppressedByHonorWindow.
-	honorMu    sync.Mutex
-	honorUntil map[digest.Digest]time.Time
+	honorMu        sync.Mutex
+	honorUntil     map[digest.Digest]time.Time
+	nextHonorSweep time.Time
 }
 
 // New builds a Resolver. Required fields: Members, Discovery, Coord,
@@ -227,6 +231,10 @@ func New(opts Options) *Resolver {
 
 	if opts.TransientCooldownCap <= 0 {
 		opts.TransientCooldownCap = 30 * time.Second
+	}
+
+	if opts.HonorSweepInterval == 0 {
+		opts.HonorSweepInterval = defaultHonorSweepInterval
 	}
 
 	if opts.TopKExpansionFactor < 2 {
@@ -951,12 +959,14 @@ func (r *Resolver) suppressedByHonorWindow(d digest.Digest) bool {
 	r.honorMu.Lock()
 	defer r.honorMu.Unlock()
 
+	now := r.opts.Now()
+	r.sweepHonorWindowsLocked(now)
+
 	until, ok := r.honorUntil[d]
 	if !ok {
 		return false
 	}
 
-	now := r.opts.Now()
 	if !now.Before(until) {
 		delete(r.honorUntil, d)
 		return false
@@ -988,8 +998,31 @@ func (r *Resolver) recordHonorWindow(d digest.Digest, cooldownUntil time.Time) {
 	}
 
 	r.honorMu.Lock()
+	r.sweepHonorWindowsLocked(now)
 	r.honorUntil[d] = now.Add(remaining)
 	r.honorMu.Unlock()
+}
+
+func (r *Resolver) sweepHonorWindowsLocked(now time.Time) {
+	if r.opts.HonorSweepInterval < 0 {
+		return
+	}
+
+	if !r.nextHonorSweep.IsZero() && now.Before(r.nextHonorSweep) {
+		return
+	}
+
+	if r.opts.HonorSweepInterval > 0 {
+		r.nextHonorSweep = now.Add(r.opts.HonorSweepInterval)
+	}
+
+	for d, until := range r.honorUntil {
+		if now.Before(until) {
+			continue
+		}
+
+		delete(r.honorUntil, d)
+	}
 }
 
 func kindLabel(k ifaces.OriginRefKind) string {

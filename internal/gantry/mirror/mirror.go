@@ -42,12 +42,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containerd/errdefs"
+
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/digestpipe"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 )
+
+const providerFailureSweepInterval = time.Minute
 
 // Server is the mirror HTTP handler.
 type Server struct {
@@ -87,14 +91,16 @@ type Server struct {
 	peerFetchBudget  time.Duration
 	maxPeerAttempts  int
 	selfNodeID       ifaces.NodeID
+	selfPeerID       ifaces.NodeID
 
-	staleProviderTTL     time.Duration
-	unavailablePeerTTL   time.Duration
-	suspiciousPeerTTL    time.Duration
-	providerFailureMu    sync.Mutex
-	staleProviders       map[providerDigestKey]time.Time
-	suspiciousProviders  map[providerDigestKey]time.Time
-	unavailableProviders map[string]time.Time
+	staleProviderTTL         time.Duration
+	unavailablePeerTTL       time.Duration
+	suspiciousPeerTTL        time.Duration
+	providerFailureMu        sync.Mutex
+	staleProviders           map[providerDigestKey]time.Time
+	suspiciousProviders      map[providerDigestKey]time.Time
+	unavailableProviders     map[string]time.Time
+	nextProviderFailureSweep time.Time
 
 	// defaultUpstream is the upstream to use when exactly one is
 	// configured and ?ns= is absent.
@@ -479,10 +485,18 @@ func WithPeerBudgets(lookup, fetch time.Duration, maxAttempts int) Option {
 	}
 }
 
-// WithSelfNodeID configures the local node identity used to filter stale self
-// provider records from DHT lookup results after a local cache miss.
+// WithSelfNodeID configures the local Kubernetes node identity used to filter
+// stale self provider records after a local cache miss. Membership/cold-start
+// providers use Kubernetes node names as NodeID values.
 func WithSelfNodeID(id ifaces.NodeID) Option {
 	return func(s *Server) { s.selfNodeID = id }
+}
+
+// WithSelfPeerID configures the local libp2p peer identity used to filter stale
+// self provider records from DHT lookup results after a local cache miss. DHT
+// providers use libp2p peer IDs as NodeID values.
+func WithSelfPeerID(id ifaces.NodeID) Option {
+	return func(s *Server) { s.selfPeerID = id }
 }
 
 // WithProviderFailureCacheTTL configures TTLs used to suppress immediate
@@ -1576,12 +1590,14 @@ func (s *Server) resolveViaColdStart(ctx context.Context, d digest.Digest, kind 
 
 func (s *Server) filterProvidersForDigest(d digest.Digest, providers []ifaces.Provider) ([]ifaces.Provider, peerAttemptSummary) {
 	now := time.Now()
+	s.sweepProviderFailures(now)
+
 	filtered := make([]ifaces.Provider, 0, len(providers))
 
 	var summary peerAttemptSummary
 
 	for _, p := range providers {
-		if s.selfNodeID != "" && p.NodeID == s.selfNodeID {
+		if s.isSelfProvider(p) {
 			summary.selfFiltered++
 			continue
 		}
@@ -1606,6 +1622,11 @@ func (s *Server) filterProvidersForDigest(d digest.Digest, providers []ifaces.Pr
 	}
 
 	return filtered, summary
+}
+
+func (s *Server) isSelfProvider(p ifaces.Provider) bool {
+	return (s.selfNodeID != "" && p.NodeID == s.selfNodeID) ||
+		(s.selfPeerID != "" && p.NodeID == s.selfPeerID)
 }
 
 func updatePeerSummary(summary peerAttemptSummary, outcome peerFetchOutcomeKind) peerAttemptSummary {
@@ -1671,9 +1692,24 @@ func isDialUnavailable(err error) bool {
 	return strings.Contains(errText, "connection refused") || strings.Contains(errText, "no route to host")
 }
 
+// isDigestMismatchErr reports whether err signals that a peer served
+// bytes that failed content verification. Two typed sources are
+// recognized, one per fetch path:
+//
+//   - digestpipe.ErrDigestMismatch from the live stream-through verifier
+//     (streamDigestToClient).
+//   - errdefs.ErrFailedPrecondition from a containerd content-store
+//     Commit, which wraps it for both "unexpected commit digest" and
+//     "unexpected commit size" - either way the peer's bytes did not
+//     match what we asked for.
+//
+// Substring matching on the message is deliberately avoided: the real
+// containerd commit error says "unexpected commit digest", not "digest
+// mismatch", so the old text match silently misclassified a corrupt
+// peer as a generic local error and never quarantined it.
 func isDigestMismatchErr(err error) bool {
-	errText := strings.ToLower(err.Error())
-	return strings.Contains(errText, "digest mismatch")
+	return errors.Is(err, digestpipe.ErrDigestMismatch) ||
+		errors.Is(err, errdefs.ErrFailedPrecondition)
 }
 
 func (s *Server) markProviderStale(d digest.Digest, p ifaces.Provider) {
@@ -1684,7 +1720,9 @@ func (s *Server) markProviderStale(d digest.Digest, p ifaces.Provider) {
 	s.providerFailureMu.Lock()
 	defer s.providerFailureMu.Unlock()
 
-	s.staleProviders[providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}] = time.Now().Add(s.staleProviderTTL)
+	now := time.Now()
+	s.sweepProviderFailuresLocked(now)
+	s.staleProviders[providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}] = now.Add(s.staleProviderTTL)
 }
 
 func (s *Server) markProviderSuspicious(d digest.Digest, p ifaces.Provider) {
@@ -1695,7 +1733,9 @@ func (s *Server) markProviderSuspicious(d digest.Digest, p ifaces.Provider) {
 	s.providerFailureMu.Lock()
 	defer s.providerFailureMu.Unlock()
 
-	s.suspiciousProviders[providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}] = time.Now().Add(s.suspiciousPeerTTL)
+	now := time.Now()
+	s.sweepProviderFailuresLocked(now)
+	s.suspiciousProviders[providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}] = now.Add(s.suspiciousPeerTTL)
 }
 
 func (s *Server) markProviderUnavailable(p ifaces.Provider) {
@@ -1706,7 +1746,44 @@ func (s *Server) markProviderUnavailable(p ifaces.Provider) {
 	s.providerFailureMu.Lock()
 	defer s.providerFailureMu.Unlock()
 
-	s.unavailableProviders[p.Addr] = time.Now().Add(s.unavailablePeerTTL)
+	now := time.Now()
+	s.sweepProviderFailuresLocked(now)
+	s.unavailableProviders[p.Addr] = now.Add(s.unavailablePeerTTL)
+}
+
+func (s *Server) sweepProviderFailures(now time.Time) {
+	s.providerFailureMu.Lock()
+	defer s.providerFailureMu.Unlock()
+
+	s.sweepProviderFailuresLocked(now)
+}
+
+func (s *Server) sweepProviderFailuresLocked(now time.Time) {
+	if !s.nextProviderFailureSweep.IsZero() && now.Before(s.nextProviderFailureSweep) {
+		return
+	}
+
+	s.nextProviderFailureSweep = now.Add(providerFailureSweepInterval)
+	s.sweepProviderDigestMapLocked(s.staleProviders, now)
+	s.sweepProviderDigestMapLocked(s.suspiciousProviders, now)
+
+	for addr, until := range s.unavailableProviders {
+		if !now.After(until) {
+			continue
+		}
+
+		delete(s.unavailableProviders, addr)
+	}
+}
+
+func (s *Server) sweepProviderDigestMapLocked(m map[providerDigestKey]time.Time, now time.Time) {
+	for key, until := range m {
+		if !now.After(until) {
+			continue
+		}
+
+		delete(m, key)
+	}
 }
 
 func (s *Server) isProviderInWindow(m map[providerDigestKey]time.Time, key providerDigestKey, now time.Time) bool {

@@ -332,7 +332,7 @@ type KubernetesSpec struct {
 	// bootstrap.kubernetes.io/token with the well-known keys
 	// "token-id" and "token-secret".
 	// +optional
-	BootstrapTokenRef LocalObjectReference `json:"bootstrapTokenRef,omitempty"`
+	BootstrapTokenRef *LocalObjectReference `json:"bootstrapTokenRef,omitempty"`
 }
 
 // AgentSpec defines settings for the unbounded node agent.

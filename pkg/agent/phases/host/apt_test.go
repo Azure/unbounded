@@ -28,6 +28,7 @@ func TestHardenAPT_WritesBothDropIns(t *testing.T) {
 		log:                   discardLogger(),
 		aptDropInPath:         aptPath,
 		needrestartDropInPath: nrPath,
+		lookupPath:            existingPathLookup("apt-get"),
 	}
 
 	require.NoError(t, task.Do(context.Background()))
@@ -66,6 +67,7 @@ func TestHardenAPT_Idempotent(t *testing.T) {
 		log:                   discardLogger(),
 		aptDropInPath:         aptPath,
 		needrestartDropInPath: nrPath,
+		lookupPath:            existingPathLookup("apt-get"),
 	}
 
 	require.NoError(t, task.Do(context.Background()))
@@ -79,4 +81,23 @@ func TestHardenAPT_Idempotent(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, first, second, "second run must not alter file contents")
+}
+
+func TestHardenAPT_SkipsWhenAPTUnavailable(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	aptPath := filepath.Join(dir, "apt.conf")
+	nrPath := filepath.Join(dir, "nr.conf")
+
+	task := &hardenAPT{
+		log:                   discardLogger(),
+		aptDropInPath:         aptPath,
+		needrestartDropInPath: nrPath,
+		lookupPath:            missingPathLookup,
+	}
+
+	require.NoError(t, task.Do(context.Background()))
+	require.NoFileExists(t, aptPath)
+	require.NoFileExists(t, nrPath)
 }

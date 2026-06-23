@@ -105,13 +105,13 @@ impl AzureBackend {
         &self.backend_id
     }
 
-    /// Resolve a `host:port` endpoint to a single IPv4 [`SockAddr`].
+    /// Resolve a `host:port` URL value to a single IPv4 [`SockAddr`].
     /// Delegates to [`HttpBackend::resolve_origin`](super::HttpBackend::resolve_origin),
     /// which takes the first IPv4 `ToSocketAddrs` yields and errors on
     /// IPv6-only origins (v1 dials IPv4 only). The hostname for the
     /// `Host:` header is passed separately to [`AzureBackend::new`].
-    pub fn resolve_origin(endpoint: &str) -> std::io::Result<SockAddr> {
-        super::HttpBackend::resolve_origin(endpoint)
+    pub fn resolve_origin(url: &str) -> std::io::Result<SockAddr> {
+        super::HttpBackend::resolve_origin(url)
     }
 }
 

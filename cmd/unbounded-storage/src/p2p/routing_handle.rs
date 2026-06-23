@@ -5,7 +5,7 @@
 //! consumers.
 //!
 //! The finger table and the `node -> peer` map are derived together
-//! from the `[[peers]]` / `[p2p]` config sections. Three independent
+//! from the active neighborhood projected by the config graph. Three independent
 //! consumers read them on the hot path:
 //!
 //! * [`crate::p2p::FingerRouter`] (the first-hop lookup wrapped by
@@ -46,6 +46,11 @@ pub struct RoutingSnapshot {
     pub node_to_peer: Arc<HashMap<NodeId, PeerId>>,
 }
 
+#[derive(Clone, Default)]
+pub struct RouteTableSnapshot {
+    pub routes: HashMap<String, RoutingSnapshot>,
+}
+
 /// Shared, live-reloadable handle to a [`RoutingSnapshot`].
 ///
 /// Cloning is cheap (an `Arc` bump) and every clone observes stores
@@ -53,6 +58,9 @@ pub struct RoutingSnapshot {
 /// which a shard republishes routing after a peer-set change.
 #[derive(Clone)]
 pub struct RoutingHandle(Arc<ArcSwap<RoutingSnapshot>>);
+
+#[derive(Clone)]
+pub struct RouteTableHandle(Arc<ArcSwap<RouteTableSnapshot>>);
 
 impl RoutingHandle {
     /// Build a handle seeded with the initial routing surface.
@@ -79,16 +87,60 @@ impl RoutingHandle {
     }
 }
 
+impl RouteTableHandle {
+    pub const LEGACY_ROUTE_ID: &'static str = "";
+
+    pub fn new(routes: HashMap<String, RoutingSnapshot>) -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(RouteTableSnapshot {
+            routes,
+        })))
+    }
+
+    pub fn from_snapshot(snapshot: RouteTableSnapshot) -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(snapshot)))
+    }
+
+    pub fn empty() -> Self {
+        Self::new(HashMap::new())
+    }
+
+    pub fn store(&self, routes: HashMap<String, RoutingSnapshot>) {
+        self.0.store(Arc::new(RouteTableSnapshot { routes }));
+    }
+
+    pub fn store_snapshot(&self, snapshot: RouteTableSnapshot) {
+        self.0.store(Arc::new(snapshot));
+    }
+
+    pub fn snapshot(&self) -> Arc<RouteTableSnapshot> {
+        self.0.load_full()
+    }
+
+    pub fn route(&self, neighborhood_id: &str) -> Option<RoutingSnapshot> {
+        self.snapshot().routes.get(neighborhood_id).cloned()
+    }
+
+    pub fn route_for_req<R: crate::bufferpool::Req + ?Sized>(
+        &self,
+        req: &R,
+    ) -> Option<RoutingSnapshot> {
+        let route_id = req
+            .neighborhood_id()
+            .map_or(Self::LEGACY_ROUTE_ID, String::as_str);
+        self.route(route_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::p2p::{FingerTableConfig, PeerEntry, TopologyLabels, node_to_ring};
+    use crate::p2p::{FingerTableConfig, PeerEntry, TopologyTags, node_to_ring};
 
     fn peer(node: u64) -> PeerEntry {
         PeerEntry {
             node: NodeId(node),
             ring: node_to_ring(NodeId(node)),
-            labels: TopologyLabels(vec!["r".to_string()]),
+            tags: TopologyTags(vec!["r".to_string()]),
         }
     }
 

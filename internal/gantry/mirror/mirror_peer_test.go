@@ -331,6 +331,7 @@ func TestMirror_PeerFallback_FiltersSelfProviderAfterLocalMiss(t *testing.T) {
 	dht := fakes.NewDHT()
 	dht.Inject(d,
 		ifaces.Provider{NodeID: "self-node", Addr: "127.0.0.1:1"},
+		ifaces.Provider{NodeID: "self-peer-id", Addr: "127.0.0.1:2"},
 		ifaces.Provider{NodeID: "peer-good", Addr: peerAddr},
 	)
 
@@ -339,6 +340,7 @@ func TestMirror_PeerFallback_FiltersSelfProviderAfterLocalMiss(t *testing.T) {
 	m := mirror.New(cfg, c, oc,
 		mirror.WithDiscovery(dht, transfer.NewClient()),
 		mirror.WithSelfNodeID("self-node"),
+		mirror.WithSelfPeerID("self-peer-id"),
 		mirror.WithPeerBudgets(time.Second, 2*time.Second, 1),
 		mirror.WithPeerMetrics(func(outcome string) {
 			if outcome == "hit" {
@@ -435,3 +437,121 @@ func TestMirror_PeerFallback_DialFailureExhaustsWarmPath(t *testing.T) {
 
 // nolint:unused // referenced by helpers below
 var errCantHappen = errors.New("test scaffolding error")
+
+// peerServingPoison stands up a peer transfer server that returns bytes
+// which do NOT hash to the requested digest, so the mirror's verifier
+// must classify the result as a digest mismatch and quarantine the peer.
+func peerServingPoison(t *testing.T, d digest.Digest, poison []byte) string {
+	t.Helper()
+
+	peerCache := fakes.NewCache()
+	peerCache.Put(d, poison) // content-addressed store serves these bytes verbatim for d
+
+	return startPeerTransfer(t, peerCache)
+}
+
+func newMirrorOriginNotFound(t *testing.T) (*config.Config, ifaces.OriginPuller) {
+	t.Helper()
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(up.Close)
+
+	cfg := &config.Config{
+		UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: up.URL}},
+	}
+
+	oc, err := origin.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return cfg, oc
+}
+
+// TestMirror_PeerFallback_LiveStreamDigestMismatchQuarantines asserts the
+// live stream-through path classifies a corrupt peer (digestpipe mismatch)
+// as digest_mismatch, which is the branch that quarantines the provider.
+func TestMirror_PeerFallback_LiveStreamDigestMismatchQuarantines(t *testing.T) {
+	d := digestOf([]byte("the-bytes-this-digest-stands-for"))
+	poison := []byte("poison-bytes-that-do-not-match-the-digest")
+
+	peerAddr := peerServingPoison(t, d, poison)
+	cfg, oc := newMirrorOriginNotFound(t)
+
+	dht := fakes.NewDHT()
+	dht.Inject(d, ifaces.Provider{NodeID: "poison-peer", Addr: peerAddr})
+
+	var digestMismatches int32
+
+	m := mirror.New(cfg, fakes.NewCache(), oc,
+		mirror.WithLiveStreamThrough(),
+		mirror.WithDiscovery(dht, transfer.NewClient()),
+		mirror.WithPeerBudgets(time.Second, 2*time.Second, 1),
+		mirror.WithPeerMetrics(func(outcome string) {
+			if outcome == "digest_mismatch" {
+				atomic.AddInt32(&digestMismatches, 1)
+			}
+		}, nil),
+	)
+	ts := httptest.NewServer(m.Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/v2/r/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _ = io.Copy(io.Discard, resp.Body) //nolint:errcheck // best-effort drain for server-side Verify
+	_ = resp.Body.Close()                 //nolint:errcheck // best-effort body close
+
+	if got := atomic.LoadInt32(&digestMismatches); got != 1 {
+		t.Fatalf("digest_mismatch outcomes (live path) = %d, want 1", got)
+	}
+}
+
+// TestMirror_PeerFallback_NonLiveCommitDigestMismatchQuarantines asserts the
+// non-live (write-then-commit) path classifies a corrupt peer via the
+// containerd-style commit failure (wrapped errdefs.ErrFailedPrecondition) as
+// digest_mismatch, the provider-quarantine branch. This is the path the old
+// substring match silently misclassified.
+func TestMirror_PeerFallback_NonLiveCommitDigestMismatchQuarantines(t *testing.T) {
+	d := digestOf([]byte("other-bytes-this-digest-stands-for"))
+	poison := []byte("different-poison-bytes-that-do-not-match")
+
+	peerAddr := peerServingPoison(t, d, poison)
+	cfg, oc := newMirrorOriginNotFound(t)
+
+	dht := fakes.NewDHT()
+	dht.Inject(d, ifaces.Provider{NodeID: "poison-peer", Addr: peerAddr})
+
+	var digestMismatches int32
+
+	// No WithLiveStreamThrough: the mirror writes to its content store and
+	// commits, so the fake store's Commit returns a wrapped
+	// errdefs.ErrFailedPrecondition exactly like real containerd.
+	m := mirror.New(cfg, fakes.NewCache(), oc,
+		mirror.WithDiscovery(dht, transfer.NewClient()),
+		mirror.WithPeerBudgets(time.Second, 2*time.Second, 1),
+		mirror.WithPeerMetrics(func(outcome string) {
+			if outcome == "digest_mismatch" {
+				atomic.AddInt32(&digestMismatches, 1)
+			}
+		}, nil),
+	)
+	ts := httptest.NewServer(m.Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/v2/r/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _ = io.Copy(io.Discard, resp.Body) //nolint:errcheck // best-effort drain
+	_ = resp.Body.Close()                 //nolint:errcheck // best-effort body close
+
+	if got := atomic.LoadInt32(&digestMismatches); got != 1 {
+		t.Fatalf("digest_mismatch outcomes (non-live path) = %d, want 1", got)
+	}
+}

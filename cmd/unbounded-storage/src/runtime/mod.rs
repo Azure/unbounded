@@ -28,15 +28,6 @@ pub use shard::ShardLoop;
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct WorkerIdx(pub u16);
 
-/// Locality hint for the future io_uring submission API
-/// (PLAN.md Phase 3.2). Declared here, not yet consumed.
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum NumaHint {
-    Any,
-    Worker(WorkerIdx),
-    Numa(u16),
-}
-
 /// Handle to a thread spawned via [`Threading::spawn_pinned`].
 /// A type alias because no runtime impl needs to hide the underlying
 /// thread; callers just want to join.

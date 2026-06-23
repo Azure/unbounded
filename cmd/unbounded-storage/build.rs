@@ -41,14 +41,16 @@ fn main() {
     generate_config_schema();
 
     println!("cargo:rerun-if-changed=src/fabric/shim.c");
-    println!("cargo:rerun-if-changed=proto/config.proto");
+    println!("cargo:rerun-if-changed=../../api/unbounded-storage/config.proto");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LIBFABRIC_PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
 }
 
 /// Generates the prost types for the daemon's config schema from
-/// `proto/config.proto`. The generated code is `include!`d by
+/// `../../api/unbounded-storage/config.proto`. That proto is the shared
+/// schema source of truth (the supervisor's Go bindings are generated from
+/// the same file). The generated code is `include!`d by
 /// `src/config/schema.rs`.
 ///
 /// Every message derives serde `Deserialize` with a container-level
@@ -56,8 +58,9 @@ fn main() {
 /// partial TOML file: any omitted key falls back to the proto3 zero value,
 /// which `Config::apply_defaults` then promotes to the documented default.
 /// `deny_unknown_fields` makes the TOML loader reject typo'd keys loudly at
-/// parse time. Enums deserialize as their integer discriminant (range-checked
-/// later by `config::load::validate`) and byte sizes as plain integers.
+/// parse time; this is the serde/TOML path only - decoding a protobuf wire
+/// message keeps protobuf's forward-compatible unknown-field semantics.
+/// Oneofs deserialize as tagged TOML tables, and byte sizes as plain integers.
 fn generate_config_schema() {
     // Use the vendored protoc so no system protoc install is required.
     let protoc =
@@ -72,16 +75,31 @@ fn generate_config_schema() {
 
     for msg in [
         "Config",
-        "P2pCfg",
         "RoutingPlan",
-        "FabricAddress",
         "PeerSpec",
+        "TcpPeerConfig",
+        "RdmaPeerConfig",
         "DiskSpec",
+        "BlockDiskConfig",
+        "FileDiskConfig",
+        "CacheSpec",
+        "NeighborhoodSpec",
         "BackendSpec",
+        "HttpBackendConfig",
+        "S3BackendConfig",
+        "AzureBackendConfig",
+        "FakeBackendConfig",
         "FrontendSpec",
+        "HttpFrontendConfig",
+        "S3FrontendConfig",
+        "LoadgenFrontendConfig",
         "StartupCfg",
         "MemoryCfg",
         "FabricCfg",
+        "TcpFabricBinds",
+        "RdmaFabricBinds",
+        "AutoRdmaFabricBinds",
+        "RdmaFabricBind",
         "TopologyCfg",
         "MetricsCfg",
     ] {
@@ -89,7 +107,21 @@ fn generate_config_schema() {
         prost.type_attribute(msg, "#[serde(default, deny_unknown_fields)]");
     }
 
+    for oneof in [
+        "PeerSpec.config",
+        "FabricCfg.binds",
+        "DiskSpec.config",
+        "BackendSpec.config",
+        "FrontendSpec.config",
+    ] {
+        prost.type_attribute(oneof, "#[derive(::serde::Deserialize)]");
+        prost.type_attribute(oneof, "#[serde(rename_all = \"snake_case\")]");
+    }
+
     prost
-        .compile_protos(&["proto/config.proto"], &["proto"])
-        .expect("prost-build failed to compile proto/config.proto");
+        .compile_protos(
+            &["../../api/unbounded-storage/config.proto"],
+            &["../../api/unbounded-storage"],
+        )
+        .expect("prost-build failed to compile api/unbounded-storage/config.proto");
 }

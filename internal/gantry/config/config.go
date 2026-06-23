@@ -258,6 +258,25 @@ type Config struct {
 	// `topology.kubernetes.io/zone` (the design doc).
 	ZoneLabelKey string `yaml:"zone_label_key"`
 
+	// CoordPeerAuthzEnforce flips coord peer authorization from
+	// observe-only (record the unauthorized-peer metric, still serve) to
+	// enforce (reject inbound coord requests whose libp2p peer ID is not
+	// in the membership view). Default false: ship observe-only first,
+	// verify peer-id annotations are visible for every ready Gantry pod,
+	// size p2p_coord_unauthorized_peer_total across a full rollout, then
+	// flip to true once it stays at zero.
+	CoordPeerAuthzEnforce bool `yaml:"coord_peer_authz_enforce"`
+
+	// CoordMaxDigestsPerRequest caps a single please_pull batch. The default
+	// 256 is intentionally far above normal manifest child counts while staying
+	// well below the 1 MiB coord envelope budget.
+	CoordMaxDigestsPerRequest int `yaml:"coord_max_digests_per_request"`
+
+	// CoordMaxConcurrentPulls caps background origin pulls started by inbound
+	// please_pull. Each pull holds an HTTP response body, a containerd writer,
+	// goroutine state, and a lease, so this protects the node from fan-out.
+	CoordMaxConcurrentPulls int `yaml:"coord_max_concurrent_pulls"`
+
 	// ---------- DHT / direct-origin-fallback ----------
 
 	// NF5JitterBase is the base delay in the direct-origin-fallback jitter window
@@ -381,6 +400,10 @@ func NewDefault() *Config {
 		HRWTopologyScope: "cluster",
 		ZoneLabelKey:     "topology.kubernetes.io/zone",
 
+		CoordPeerAuthzEnforce:     false,
+		CoordMaxDigestsPerRequest: 256,
+		CoordMaxConcurrentPulls:   16,
+
 		NF5JitterBase:               3 * time.Second,
 		NF5JitterCap:                0, // no cap by default (original behaviour)
 		NF5PerNodeRateLimit:         2,
@@ -489,6 +512,9 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("HRW_K", &c.HRWK)
 	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
 	setStr("ZONE_LABEL_KEY", &c.ZoneLabelKey)
+	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
+	setInt("COORD_MAX_DIGESTS_PER_REQUEST", &c.CoordMaxDigestsPerRequest)
+	setInt("COORD_MAX_CONCURRENT_PULLS", &c.CoordMaxConcurrentPulls)
 
 	setDur("NF5_JITTER_BASE", &c.NF5JitterBase)
 	setDur("NF5_JITTER_CAP", &c.NF5JitterCap)
@@ -542,6 +568,9 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "HRW top-K size")
 	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, `HRW scope: "cluster" or "zone"`)
 	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "Kubernetes node label identifying the zone (used when hrw-topology-scope=zone)")
+	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "reject inbound coord requests from peers not in the membership view (default false = observe-only)")
+	fs.IntVar(&c.CoordMaxDigestsPerRequest, "coord-max-digests-per-request", c.CoordMaxDigestsPerRequest, "maximum digests accepted in one please_pull batch")
+	fs.IntVar(&c.CoordMaxConcurrentPulls, "coord-max-concurrent-pulls", c.CoordMaxConcurrentPulls, "maximum background origin pulls started by inbound please_pull")
 
 	fs.DurationVar(&c.NF5JitterBase, "nf5-jitter-base", c.NF5JitterBase, "base delay for the NF5 jitter window")
 	fs.DurationVar(&c.NF5JitterCap, "nf5-jitter-cap", c.NF5JitterCap, "hard ceiling on the NF5 jitter window (0 = no cap)")
@@ -713,6 +742,14 @@ func (c *Config) Validate() error {
 	case "cluster", "zone":
 	default:
 		errs = append(errs, fmt.Errorf("hrw_topology_scope %q: must be \"cluster\" or \"zone\"", c.HRWTopologyScope))
+	}
+
+	if c.CoordMaxDigestsPerRequest < 1 {
+		errs = append(errs, fmt.Errorf("coord_max_digests_per_request: must be >= 1, got %d", c.CoordMaxDigestsPerRequest))
+	}
+
+	if c.CoordMaxConcurrentPulls < 1 {
+		errs = append(errs, fmt.Errorf("coord_max_concurrent_pulls: must be >= 1, got %d", c.CoordMaxConcurrentPulls))
 	}
 
 	if c.NF5JitterBase <= 0 {
