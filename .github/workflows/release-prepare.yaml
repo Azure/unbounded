@@ -1,0 +1,112 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: unbounded release prepare
+
+# ---------------------------------------------------------------------------
+# Phase 1 of the two-phase release. This workflow ONLY computes the next
+# version and pushes the git tag. It does not build, sign, or publish
+# anything.
+#
+# Why split it out: the build/sign workflow (release.yaml) must run in the
+# context of the version tag so that keyless cosign signatures carry the
+# identity `release.yaml@refs/tags/vX.Y.Z`. That identity is what the deploy
+# workflow verifies. A tag created mid-run by a workflow dispatched on a
+# branch would instead sign as `@refs/heads/main` and fail verification.
+#
+# The tag is pushed using an SSH deploy key (RELEASE_TAG_DEPLOY_KEY) rather
+# than the default GITHUB_TOKEN. GitHub deliberately suppresses workflow
+# triggers for tags pushed with GITHUB_TOKEN (loop prevention); a deploy-key
+# push is exempt, so it triggers release.yaml's `on: push: tags` in the
+# correct tag context.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump level"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+      pre:
+        description: "Optional prerelease suffix (e.g. rc.1); leave blank for a normal release"
+        required: false
+        type: string
+        default: ""
+
+# The tag push authenticates via the SSH deploy key, not GITHUB_TOKEN, so no
+# contents:write is needed here.
+permissions:
+  contents: read
+
+# Serialize prepares so two dispatches cannot race to mint tags.
+concurrency:
+  group: release-prepare
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          # Wires git to push over SSH with the deploy key so the resulting
+          # tag push triggers release.yaml.
+          ssh-key: ${{ secrets.RELEASE_TAG_DEPLOY_KEY }}
+
+      - name: Compute and push tag
+        # Bind inputs to env vars so they enter the shell as data, not as
+        # code. `pre` is free-form user input; inlining `${{ ... }}` in a
+        # run block is template-expanded before bash parses it, so any shell
+        # metacharacter would become script syntax.
+        env:
+          BUMP: ${{ inputs.bump }}
+          PRE: ${{ inputs.pre }}
+        run: |
+          set -euo pipefail
+
+          LATEST=$(git tag --list 'v*' --sort=-version:refname | head -n1)
+          if [[ -z "$LATEST" ]]; then
+            LATEST="v0.0.0"
+          fi
+
+          # Strip any prerelease suffix from the base before bumping.
+          BASE="${LATEST%%-*}"
+          SEMVER="${BASE#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$SEMVER"
+
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+            *) echo "::error::unexpected bump level: ${BUMP}"; exit 1 ;;
+          esac
+
+          TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          if [[ -n "$PRE" ]]; then
+            TAG="${TAG}-${PRE}"
+          fi
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag must be in vX.Y.Z[-suffix] format, got: ${TAG}"
+            exit 1
+          fi
+
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists"
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+          echo "Pushed ${TAG}; release.yaml will build and sign it in tag context."
+          echo "### Prepared release ${TAG}" >> "$GITHUB_STEP_SUMMARY"
