@@ -12,7 +12,7 @@ use std::future::Future;
 use std::pin::pin;
 use std::task::{Context, Poll};
 
-use crate::p2p::{FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyLabels};
+use crate::p2p::{FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyTags};
 use crate::runtime::noop_waker;
 
 // ---------------------------------------------------------------------------
@@ -40,12 +40,12 @@ fn block_on<F: Future>(future: F) -> F::Output {
 // Synthetic ring builder.
 // ---------------------------------------------------------------------------
 
-fn labels(parts: &[&str]) -> TopologyLabels {
-    TopologyLabels(parts.iter().map(|s| s.to_string()).collect())
+fn tags(parts: &[&str]) -> TopologyTags {
+    TopologyTags(parts.iter().map(|s| s.to_string()).collect())
 }
 
 /// Build N peers spread evenly around the ring with identical
-/// topology labels so finger selection is driven purely by ring
+/// topology tags so finger selection is driven purely by ring
 /// distance; the `topology_preference_beats_random_tiebreak` unit
 /// test in `fingers.rs` covers the topology tiebreak.
 fn synthetic_ring(n: u64) -> Vec<PeerEntry> {
@@ -54,7 +54,7 @@ fn synthetic_ring(n: u64) -> Vec<PeerEntry> {
         .map(|i| PeerEntry {
             node: NodeId(i),
             ring: RingId(i.wrapping_mul(step)),
-            labels: labels(&["us", "z1", "row1", "rack1"]),
+            tags: tags(&["us", "z1", "row1", "rack1"]),
         })
         .collect()
 }

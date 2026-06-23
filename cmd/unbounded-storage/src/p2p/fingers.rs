@@ -67,7 +67,7 @@ impl FingerTable {
             let arc = arc_index(local.ring, cand.ring, arc_span, k);
             let current = &fingers[arc as usize];
             let challenger_is_self = current.node == local.node;
-            if challenger_is_self || better(local.ring, &local.labels, cand, current, arc) {
+            if challenger_is_self || better(local.ring, &local.tags, cand, current, arc) {
                 fingers[arc as usize] = cand.clone();
             }
 
@@ -231,13 +231,13 @@ fn arc_index(local: RingId, candidate: RingId, arc_span: u64, k: u32) -> u32 {
 
 fn better(
     local_ring: RingId,
-    local_labels: &crate::p2p::types::TopologyLabels,
+    local_tags: &crate::p2p::types::TopologyTags,
     challenger: &PeerEntry,
     incumbent: &PeerEntry,
     arc: u32,
 ) -> bool {
-    let c_topo = topology_distance(local_labels, &challenger.labels);
-    let i_topo = topology_distance(local_labels, &incumbent.labels);
+    let c_topo = topology_distance(local_tags, &challenger.tags);
+    let i_topo = topology_distance(local_tags, &incumbent.tags);
     if c_topo != i_topo {
         return c_topo < i_topo;
     }
@@ -252,13 +252,13 @@ fn better(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::p2p::types::{NodeId, TopologyLabels};
+    use crate::p2p::types::{NodeId, TopologyTags};
 
     fn peer(node: u64, ring: u64, parts: &[&str]) -> PeerEntry {
         PeerEntry {
             node: NodeId(node),
             ring: RingId(ring),
-            labels: TopologyLabels(parts.iter().map(|s| s.to_string()).collect()),
+            tags: TopologyTags(parts.iter().map(|s| s.to_string()).collect()),
         }
     }
 
@@ -425,7 +425,7 @@ mod tests {
             for (i, (a, b)) in base.fingers().iter().zip(other.fingers()).enumerate() {
                 assert_eq!(a.node, b.node, "seed={seed} arc={i}");
                 assert_eq!(a.ring, b.ring, "seed={seed} arc={i}");
-                assert_eq!(a.labels.0, b.labels.0, "seed={seed} arc={i}");
+                assert_eq!(a.tags.0, b.tags.0, "seed={seed} arc={i}");
             }
             assert_eq!(
                 base.successor().map(|p| p.node),

@@ -5,21 +5,24 @@ name: unbounded metalman smoke test
 
 on:
   pull_request:
-  push:
-    branches: [main]
     paths:
+      - cmd/agent/**
       - cmd/metalman/**
       - internal/metalman/**
       - api/machina/v1alpha3/**
-      - deploy/machina/**
-      - deploy/net/**
-      - hack/smoke-metalman.py
-      - hack/kind-smoke-config.yaml
-      - images/host-ubuntu2404/**
+      - deploy/machina/crd/**
       - images/agent-ubuntu2404/**
-      - go.mod
-      - go.sum
-      - .github/workflows/smoke-metalman.yaml
+  push:
+    branches: [main]
+    paths:
+      - cmd/agent/**
+      - cmd/metalman/**
+      - internal/metalman/**
+      - api/machina/v1alpha3/**
+      - deploy/machina/crd/**
+      - images/agent-ubuntu2404/**
+  schedule:
+    - cron: "0 7 * * *"
   workflow_dispatch:
 
 permissions:
@@ -43,7 +46,7 @@ jobs:
           wait
           df -h /
 
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Enable KVM
         run: |

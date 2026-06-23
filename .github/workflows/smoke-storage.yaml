@@ -41,13 +41,14 @@ jobs:
       LIBFABRIC_VERSION: "2.5.1"
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install native build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config ca-certificates curl liburing-dev
+            build-essential pkg-config ca-certificates curl liburing-dev \
+            libibverbs-dev librdmacm-dev
 
       # The distro libfabric (1.x) predates the merge of the experimental
       # `net` provider into `tcp`, so it lacks a native FI_EP_RDM `tcp`

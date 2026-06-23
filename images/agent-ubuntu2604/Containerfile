@@ -1,0 +1,22 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# TODO: switch to debootstrap-based base image once we have the container registry set up
+FROM docker.io/library/ubuntu:26.04@sha256:f3d28607ddd78734bb7f71f117f3c6706c666b8b76cbff7c9ff6e5718d46ff64
+
+# Retry loop: Ubuntu mirrors occasionally rate-limit with HTTP 429.
+RUN apt-get update && \
+    ok=false && \
+    for attempt in 1 2 3 4 5; do \
+      if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+           systemd systemd-sysv dbus curl ca-certificates \
+           iproute2 nftables iptables kmod udev procps wireguard-tools linux-tools-common; then \
+        ok=true; break; \
+      fi; \
+      echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
+      sleep 30; \
+      apt-get update; \
+    done && $ok && \
+    rm -rf /var/lib/apt/lists/*
+
+# TODO: pre-install containerd / runc / kubernetes binaries

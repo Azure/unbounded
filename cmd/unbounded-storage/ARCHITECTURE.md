@@ -64,15 +64,21 @@ Build only through the top-level `Makefile`, never raw `cargo`:
 
 All cargo invocations use `--locked`.
 
-The crate produces two binaries:
+The crate produces one binary:
 
 - `unbounded-storage` (`src/main.rs`) - the daemon.
-- `bench` (`src/bin/bench.rs`) - a benchmarking harness.
+
+Synthetic benchmark traffic is generated in-process by configuring a
+`loadgen` frontend. Results are exposed through the daemon's normal
+Prometheus metrics, alongside the storage, backend, bufferpool, and fabric
+metrics from the service path being exercised.
 
 ### libfabric
 
-The fabric layer links the native libfabric `tcp` RDM provider (requires
-libfabric 2.0+; the experimental `net` provider has been merged into `tcp`).
+The fabric layer links libfabric and uses connection-managed MSG endpoints
+for both `verbs` and `tcp` providers. The pinned libfabric build provides the
+native `tcp` provider (requires libfabric 2.0+; the experimental `net`
+provider has been merged into `tcp`).
 `make libfabric` installs the pinned `LIBFABRIC_VERSION` under
 `tmp/libfabric/<version>/`, and the Makefile exports
 `LIBFABRIC_PKG_CONFIG_PATH` and `LD_LIBRARY_PATH`. The build compiles a small C
@@ -98,38 +104,42 @@ selection) live in the config's `[startup]` section. They are read once
 at process start and cannot change without a restart, so they are
 excluded from the live-reload diff.
 
-- `[startup.memory]` - `no_hugepages` (allocate per-shard backing from
-  the heap instead of 2 MiB hugepages) and `bytes_per_shard` (u64 bytes,
-  no suffix; `0` -> 128 MiB).
-- `[startup.fabric]` - `listen_addr` (default `0.0.0.0:0`),
-  `progress_threads` (2), `progress_poll_us` (10),
-  `rpc_worker_threads` (4), `max_inflight` (1024) - the per-shard fabric
-  endpoint, thread pools, and in-flight cap.
-- `[startup.topology]` - `rdma_progress_per_hca` (1),
-  `rdma_handlers_per_hca` (4), `tcp_fallback_threads` (1), and the
-  toggles `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
-  `allow_inactive_port`, `disable_rdma` - feed `startup_to_plan_config`,
-  which builds the `topology::PlanConfig` consumed by `Plan::for_host`.
-  The toggles default off; the three "negative" plan fields
-  (`respect_isolated`, `exclude_node_cpu0`, `require_active_port`) are
-  inverted from the corresponding config field so the historical "on"
-  behavior is the default.
+- `[startup.memory]` - `no_hugepages` (allocate shard backings from
+  the heap instead of 2 MiB hugepages) and `memory_total_bytes` (u64
+  bytes, no suffix; unset/null defaults to 128 MiB) - the total backing
+  pool, split evenly across the serving shards so the host footprint stays
+  fixed regardless of the auto-scaled shard count.
+- `[startup.fabric]` - one `binds` table (`tcp`, `rdma`, or `auto_rdma`),
+  `progress_threads` (2), `progress_poll_us` (10), `rpc_worker_threads` (4),
+  `max_inflight` (1024) - the fabric endpoint, thread pools, and in-flight
+  cap. `auto_rdma.hcas_per_numa_node` caps automatically selected HCAs per
+  NUMA node and defaults to 1 when `auto_rdma` is configured.
+- `[startup.topology]` - `serving_cores` (unset/null = auto-fill every usable
+  CPU), `nic_workers` (fabric CPUs per active HCA, unset/null defaults to 4),
+  and the toggles `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
+  `allow_inactive_port`, `disable_rdma` - feed
+  `startup_to_core_plan_config`, which builds the `topology::CorePlanConfig`
+  consumed by `CorePlan::for_host`. The toggles default off; the three
+  "negative" plan fields (`respect_isolated`, `exclude_node_cpu0`,
+  `require_active_port`) are inverted from the corresponding config field
+  so the historical "on" behavior is the default.
 
 ### Startup sequence
 
 1. Load and validate config; build `StartupSettings` from the config's
    `[startup]` section.
 2. `Host::discover()` reads hardware from sysfs.
-3. `Plan::for_host(&host, &settings.plan_config)` computes the CPU/
-   role assignment. `RoleCounts::from_plan` tallies roles (RDMA progress and
-   RDMA handler roles are counted; `NvmeIoUring`/`NetworkShard` are currently
-   vestigial).
-4. `progress: Vec<Worker>` is filtered to `Role::RdmaProgress` workers. **One
-   shard thread is spawned per RDMA-progress worker.** If empty, the daemon
-   exits with failure.
-5. A `PinnedRuntime::from_plan` is built over the retained workers;
-   `WorkerIdx(i)` indexes the i-th retained worker (the filter and the index
-   must stay in sync).
+3. `CorePlan::for_host(&host, &settings.core_plan_config)` partitions the
+   host's usable CPUs into three disjoint, NUMA-local classes: one
+   `StorageCore` per NVMe drive, `nic_workers` `NicWorker`s per active HCA,
+   and a `ServingShard` on every remaining CPU (optionally capped by
+   `serving_cores`).
+4. **One shard thread is spawned per `ServingShard`.** If the host yields no
+   serving shards, the daemon exits with failure. With no usable HCA the
+   NIC-worker class is simply empty and the shards serve over the
+   loopback/TCP path.
+5. A `PinnedRuntime` is built over the planned CPUs so `WorkerIdx(i)` pins the
+   i-th worker thread to its assigned core and NUMA node.
 6. A `DiskChannelDirectory` (Arc) is created before shards as the hot-swap
    publication surface for disk channels.
 7. Read-only shared state (`Arc<Vec<FrontendSpec>>`, `Arc<Vec<BackendSpec>>`;
@@ -176,7 +186,7 @@ per-shard `!Send` object graph:
    pinned thread** (mempolicy keeps pages local; the hugepage variant `mbind`s).
    Register it with the fabric as a memory region (MR), and register it with the
    socket ring as a fixed buffer for zero-copy send/recv.
-3. **Origin backend.** Resolve the origin endpoint and build an `HttpBackend`
+3. **Origin backend.** Resolve the origin URL and build an `HttpBackend`
    over the shard socket, carving origin-fetch pages from the backing.
 4. **Transport + blockstore + pool.** Build a `RoutedTransport` (Chord routing +
    fabric transport + origin backend), a `LiveShardLocalStore` over the disk
@@ -187,7 +197,7 @@ per-shard `!Send` object graph:
    `PageRef` resolves through exactly one backing's geometry, so scratch needs a
    distinct store). Build a `RecursiveHandler` and start the fabric RPC server.
 6. **Frontends.** A shard hosts a `FrontendRegistry` of any number of
-   frontends keyed by id. Each spec binds its listener with `SO_REUSEPORT` and
+   frontends keyed by component name. Each spec binds its listener with `SO_REUSEPORT` and
    builds an `HttpDriver`/`S3Driver`; the registry can add and remove frontends
    in place on a live config apply (a removed driver's `Drop` closes its
    listener fd).
@@ -205,7 +215,9 @@ scratch MR, and tears libfabric down).
 ## 6. Module Map (`src/lib.rs`)
 
 All subsystems are `pub mod`: `backend`, `bufferpool`, `config`, `fabric`,
-`frontend`, `http`, `memory`, `p2p`, `ring`, `runtime`, `storage`, `topology`.
+`fanout`, `frontend`, `http`, `io`, `memory`, `metrics`, `obs`, `p2p`,
+`ring`, `runtime`, `storage`, and `topology`. The `profiling` module is
+exported when the `profiling` feature is enabled.
 
 Each subsystem follows the same layout convention: `src/<area>/mod.rs` declares
 private submodules and re-exports a curated public surface via `pub use`. Files
@@ -259,28 +271,29 @@ it a simple loop to drive work without an async runtime.
   `PinnedRuntime` is the Linux implementation.
 - `ShardLoop` is the cooperative driver: `add_tick_hook(FnMut() -> bool)` and
   `run_until_with(stop, idle_sleep)`. Tick hooks return `true` to stay hot.
-- `NumaHint { Any, Worker, Numa }` is declared for future use.
 
 ### 7.2 `topology/` - hardware discovery and planning
 
 - `Host::discover()` reads CPUs, NUMA nodes, HCAs (`Hca`), NICs (`Nic`), and
   NVMe drives (`Nvme`) from sysfs.
-- `Plan::for_host(&host, &PlanConfig)` allocates disjoint, NUMA-local CPUs to
-  roles, scheduling the most constrained roles first (NVMe io_uring), then RDMA
-  progress, then RDMA handlers; an exhausted pool spills into a per-node
-  oversubscription pool.
-- `Role` variants: `RdmaProgress{hca}`, `RdmaHandler{hca}`, `NvmeIoUring{nvme}`,
-  `NetworkShard{nic}`. A `Worker` carries `{ cpu, numa, role }`.
-- `PlanConfig` knobs (defaults): `rdma_progress_per_hca` (1),
-  `rdma_handlers_per_hca` (4), `nvme_threads_per_drive` (2),
-  `network_shards_per_nic` (0), `use_smt_siblings` (false),
-  `respect_isolated` (true), `exclude_node_cpu0` (true),
+- `CorePlan::for_host(&host, &CorePlanConfig)` partitions the host's usable
+  CPUs into three disjoint, NUMA-local classes, scheduled most-constrained
+  first: a `StorageCore` per NVMe drive, then `nic_workers` `NicWorker`s per
+  active HCA (grouped into a `NicWorkerGroup` per HCA), then a `ServingShard`
+  on every remaining CPU. Each CPU is handed out at most once; an exhausted
+  pool oversubscribes rather than panicking. The shared CPU/HCA filtering
+  engine (SMT collapse, isolcpus, cpu0 exclusion, active-port gating) lives in
+  `topology/filters.rs`.
+- `CorePlanConfig` knobs (defaults): `nic_workers` (4 per active HCA),
+  `serving_cores` (`None` = claim every remaining CPU), `use_smt_siblings`
+  (false), `respect_isolated` (true), `exclude_node_cpu0` (true),
   `require_node_type_ca` (true, currently a no-op), `require_active_port`
-  (true), `tcp_fallback_threads` (1), and `disable_rdma` (force TCP even when
-  HCAs exist - an escape hatch for unusable verbs).
-- Key accessors consumed by main: `plan.rdma_progress()` and
-  `plan.disk_cpu_slots()`.
-
+  (true), and `disable_rdma` (drop every HCA so no NIC-worker group is placed
+  and serving shards serve over loopback/TCP - the escape hatch for unusable
+  verbs).
+- Key fields consumed by main: `plan.serving_shards` (one shard thread each),
+  `plan.nic_workers` (the fabric worker groups), and `plan.storage_cores`,
+  which main maps to one `DiskCpuSlot` per NVMe drive.
 ### 7.3 `memory/` - NUMA-local backings
 
 - `Backing` is a pinned, NUMA-local memory region carved into fixed-size pages
@@ -368,8 +381,8 @@ between them, and the origin `Backend` is the final fallback.
     the handler yields it, and the RPC server relays it upstream.
   - `Some` with no hops remaining -> `HopLimitExceeded`.
   It owns a dedicated scratch `Backing` (its own fabric MR and an extra
-  `BlockStore` buffer); a `Mutex` free list hands out one scratch page per
-  in-flight request, reclaimed when the response stream drops.
+  `BlockStore` buffer); the shared scratch allocator hands out one zeroed
+  scratch page per in-flight request, reclaimed when the response stream drops.
 - Ring math lives in `ring.rs`: `node_to_ring`, `stripe_to_ring`, `splitmix64`.
 
 ### 7.7 `fabric/` - the libfabric RDMA transport
@@ -390,16 +403,18 @@ streaming RPC server plus client `Transport`.
 - The completion machinery (`CompletionFuture`, `CompletionInfo`,
   `CompletionRegistry`, `CompletionSlot`) bridges libfabric CQ entries to
   futures.
-- **RPC server model** (`rpc.rs`): per in-flight request a **dedicated OS
-  thread** drives the `Handler` stream synchronously with a noop waker, submits
-  libfabric ops, and spin-polls `CompletionFuture`s. Wire framing uses reserved
-  tag bases (`REQUEST_TAG_BASE = 0xFFFF_FFFC_0000_0000`, `PAGE_ACK_TAG_BASE`,
-  `RESPONSE_END_TAG_BASE`, `ERROR_ACK_TAG_BASE`); the low 32 bits carry the
-  request id. The client `fi_tsend`s a bincode `RequestHeader` plus the bincode
-  request body; the server `fi_write`s each page into the client's destination
-  MR and `fi_tsend`s one `PageAck` per page, then a `RESPONSE_END` (success) or
-  `ERROR_ACK`. `RpcServerHandle::drop` sets a shutdown flag the workers poll
-  between handler-stream polls.
+- **RPC server model** (`rpc.rs`): `start_rpc_server` spawns a fixed pool of
+  `rpc_worker_threads` long-lived OS threads pinned to the shard's worker slot.
+  The connection receive path decodes framed requests and enqueues jobs onto a
+  bounded `JobQueue` capped by `max_inflight`; excess requests receive an
+  overload `ERROR_ACK`. A worker pulls a job, drives the `Handler` stream,
+  submits libfabric writes/sends, and parks on completion futures with a real
+  thread waker. Wire framing uses an 8-byte `MsgHeader` prefix with a message
+  kind and request id. The client sends a bincode `RequestHeader` plus request
+  body; the server `fi_write`s each page into the client's destination MR and
+  sends one `PageAck` per page. A short success sends `RESPONSE_END`; any error
+  sends `ERROR_ACK`. `RpcServerHandle::drop` uninstalls the request sink, closes
+  the queue, signals shutdown, and joins the workers.
 - `Handler`/`HandlerStream` is the server-side resolution trait;
   `PoolHandler`/`PoolHandlerStream` serve locally-resident pages.
 - The client side (`transport`) provides `FabricTransport`, the `PeerRouter`
@@ -467,8 +482,9 @@ touches the kernel device) -> `alloc` + `refcount` (pure LBA tables) -> `btree`
 `eviction_watermark` 0.9, `probationary_fraction` 0.1,
 `admission_sketch_multiplier` 2, `singleflight_shards` 64,
 `restart_scan_queue_depth` 256, `bypass_admission` false (bench/tooling only),
-and `skip_recovery_scan_if_no_meta` false (production keeps it false so partial
-recovery runs).
+and `skip_recovery_scan_if_no_meta` false (set from the public
+`skip_recovery_scan` config flag; production keeps it false so partial recovery
+runs).
 
 **CoW B+tree** (`btree/`): not `Sync`. Commits flow through a single mutator
 task holding only a `RefCell` borrow on `MutatorState`; lookups are wait-free
@@ -503,10 +519,11 @@ bufferpool `Backing`.
 
 **Disk lifecycle** (`disks/`): `trait DiskTarget { open(spec, pin) ->
 (Handle, PageChannel) }`, with `UringDiskTarget` in production (runs the disk on
-a pinned storage core) and a mock for tests. `DiskRegistry<T>` is seeded with the
-plan's disjoint NVMe `DiskCpuSlot`s and `reconcile(desired)` closes missing
-paths, opens new ones, and treats any spec drift (kind/numa/size/queue_depth/
-page_size/bypass_admission/skip_recovery_scan) as a remove + add.
+a pinned storage core) and a mock for tests. `DiskRegistrySet<T>` is seeded with
+the plan's disjoint NVMe `DiskCpuSlot`s, keeps those slots globally disjoint
+across per-cache registries, and `reconcile(desired)` closes missing paths, opens
+new ones, and treats any spec drift (kind/numa/size/queue_depth/page_size/
+skip_recovery_scan) as a remove + add.
 `assign_disk_cpus` keeps survivors on their physical pin (preserving the
 disjoint-CPU invariant and idempotence under churn) and assigns new disks
 NUMA-local-first, then any free slot, then unpinned. `channels_snapshot()` is
@@ -523,14 +540,14 @@ encoded into its page, rather than object data.
 
 ### 7.11 `config/` - typed, validated, hot-reloadable schema
 
-The schema is defined by `proto/config.proto` (prost-generated, with
+The schema is defined by `api/unbounded-storage/config.proto` (prost-generated, with
 serde `Deserialize` derived on each message so a TOML file still loads)
-and is proto3-native: enum fields are plain integers, byte sizes are
-plain integer byte counts, and any field left at its proto3 zero value is
-promoted to the documented default by `Config::apply_defaults`. The TOML
-loader is strict (`deny_unknown_fields`), so a typo'd key fails loudly at
-parse time, and `validate` rejects enum integers outside their defined
-values. Protobuf is used here purely as the schema IDL (the prost-generated
+and is proto3-native: byte sizes are plain integer byte counts, and scalar
+fields with documented defaults use proto3 `optional` presence. `Config::apply_defaults`
+promotes absent/null values to documented defaults while preserving an
+explicit numeric zero. The TOML loader is strict (`deny_unknown_fields`), so a
+typo'd key fails loudly at parse time.
+Protobuf is used here purely as the schema IDL (the prost-generated
 structs replace hand-written ones); the on-disk config format and the only
 load path are TOML, and the config file is the sole configuration interface
 for the foreseeable future. The top-level `version` field is an opaque,
@@ -552,33 +569,44 @@ section), not reloadable config fields.
 Sections (all optional, each falling back to defaults):
 
 - `version` - top-level opaque `u64` config version (0 = unversioned).
-- `[p2p]` - `local_node_id`, `local_labels`, `fingers_per_node` (100),
-  and an optional `[p2p.routing_plan]` (`fingers`, `successor`,
-  `predecessor`). When `routing_plan` is present the node skips the
-  global finger-table build and uses exactly the listed neighbor ids
-  (each must be a `[[peers]]` id, none may be `local_node_id`). This is
-  "disjoint discovery": a node is told only its direct routing neighbors
-  rather than the full cluster, yet routes identically to the global
-  build (see `designs/storage-disjoint-routing-parity.md`).
+- `[[backends]]` - `name` and one `config` table: `http`, `s3`, or `azure`
+  with a required `url`, or `fake` for synthetic objects. Backend stripe size
+  must be a power of two.
+- `[[neighborhoods]]` - `name`, `source` (a backend component name),
+  `local_node_id`, `local_tags`, `fingers_per_node` (100), and an optional
+  `[neighborhoods.routing_plan]` (`fingers`, `successor`, `predecessor`). When
+  `routing_plan` is present the node skips the global finger-table build and
+  uses exactly the listed neighbor ids (each must be a
+  `[[neighborhoods.peers]]` id, none may be `local_node_id`). This is "disjoint
+  discovery": a node is told only its direct routing neighbors rather than the
+  full cluster, yet routes identically to the global build (see
+  `designs/storage-disjoint-routing-parity.md`). If multiple neighborhoods set
+  `local_node_id`, they must set the same value because the fabric connection
+  layer has one process-wide self peer id.
 - `[startup]` - startup-fixed knobs, read once at process start and
   excluded from the live-reload diff: `[startup.memory]`
-  (`no_hugepages`, `bytes_per_shard`), `[startup.fabric]` (`listen_addr`,
+  (`no_hugepages`, `memory_total_bytes`), `[startup.fabric]` (`binds`,
   `progress_threads`, `progress_poll_us`, `rpc_worker_threads`,
-  `max_inflight`), and `[startup.topology]` (`rdma_progress_per_hca`,
-  `rdma_handlers_per_hca`, `tcp_fallback_threads`, `use_smt_siblings`,
-  `ignore_isolated`, `include_node_cpu0`, `allow_inactive_port`,
-  `disable_rdma`). `startup_to_plan_config` inverts the negative plan
-  fields so the historical defaults hold. See the CLI section for the
-  per-field defaults.
-- `[[peers]]` - `id` (unique `u64`, doubles as both `NodeId` and `PeerId`),
-  `transport` (`0` = tcp | `1` = rdma), `address` (a `host:port`
-  `SocketAddr` for tcp, or a lowercase even-length hex raw libfabric
-  address for rdma), `hca_numa` (optional), and `labels`.
-- `[[disks]]` - `path` (unique), `kind` (`0` = nvme default | `1` = block |
-  `2` = file), `numa` (optional), `queue_depth` (optional), plus `size`,
-  `page_size_bytes`, `bypass_admission`, and `skip_recovery_scan_if_no_meta`
-  (the same four extra fields that disk reconcile treats as drift, see 7.10).
-- frontends/backends specs.
+  `max_inflight`), and `[startup.topology]` (`serving_cores`, `nic_workers`,
+  `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
+  `allow_inactive_port`, `disable_rdma`).
+  `startup_to_core_plan_config` inverts the negative plan fields so the
+  historical defaults hold. See the CLI section for the per-field
+  defaults.
+- `[[neighborhoods.peers]]` - `id` (process-wide fabric peer id, also used as
+  the node's ring position within this neighborhood), `tags` for
+  placement-aware routing, and one transport table (`tcp` with a `SocketAddr`,
+  or `rdma` with a provider-native address encoded as
+  `hex:<fi_getname-bytes>`). The same peer id may appear in multiple
+  neighborhoods only with identical peer data.
+- `[[caches]]` - `name`, `source` (a backend or neighborhood component name),
+  and `[[caches.disks]]`. Each disk has one `config` table (`block` with
+  `path` and optional `numa`, or `file` with `path` and required `size`),
+  `queue_depth` (optional), `page_size_bytes`, and `skip_recovery_scan` (fields
+  that disk reconcile treats as drift, see 7.10). Disk paths must be unique
+  across all caches.
+- `[[frontends]]` - `name`, `source` (a backend, cache, or neighborhood
+  component name), and one `config` table (`http`, `s3`, or `loadgen`).
 
 The watcher (`notify`-based) emits `ConfigUpdate`s; main's
 `wait_for_shutdown_with_updates` reconciles peers (remove + add on address/numa
@@ -591,10 +619,10 @@ routing snapshot. It republishes the channel snapshot each update, logs
 
 | Layer | Threading | Notes |
 |-------|-----------|-------|
-| Shard | One pinned OS thread per `RdmaProgress` worker | Owns `!Send` pool, transport, frontend, RPC handler |
+| Shard | One pinned OS thread per `ServingShard` | Owns `!Send` pool, transport, frontend, RPC handler |
 | Shard loop | Cooperative tick hooks, noop waker | Busy-poll active, sleep 100us idle |
 | Fabric progress | One pinned thread per CQ | Self-driving |
-| Fabric RPC serve | One dedicated OS thread per in-flight request | Synchronous noop-waker drive |
+| Fabric RPC serve | Fixed worker pool per shard | Bounded job queue, real-waker completion waits |
 | Storage engine | One pinned storage core per disk | Reached only via `PageChannel` mpsc |
 | Config watcher | `notify` thread + main loop | Reconciles peers/disks live |
 

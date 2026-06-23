@@ -19,6 +19,7 @@ on:
       - deploy/net/*.yaml.tmpl
       - deploy/net/controller/*.yaml.tmpl
       - deploy/net/node/*.yaml.tmpl
+      - images/agent-azlinux3/**
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -38,6 +39,7 @@ on:
       - deploy/net/*.yaml.tmpl
       - deploy/net/controller/*.yaml.tmpl
       - deploy/net/node/*.yaml.tmpl
+      - images/agent-azlinux3/**
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
@@ -48,17 +50,36 @@ permissions:
 
 jobs:
   agent-e2e:
+    name: agent e2e (host ${{ matrix.host-base-os }}, nspawn ${{ matrix.nspawn-base-os }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host-base-os: ubuntu2404
+            nspawn-base-os: ubuntu2404
+            nspawn-oci-image: ""
+          # Fedora covers the RPM host path for Azure Linux nspawn testing.
+          # Azure Linux 3 does not currently publish a QEMU-ready VHD that this
+          # e2e can boot directly as the host VM.
+          - host-base-os: fedora
+            nspawn-base-os: azlinux3
+            nspawn-oci-image: ghcr.io/azure/agent-azlinux3:74b229eb99792fb46b3d5757e17df1a39225f091
+          - host-base-os: ubuntu2604
+            nspawn-base-os: ubuntu2604
+            nspawn-oci-image: ghcr.io/azure/agent-ubuntu2604:16840beaa438c76540b1b819f7a0265deac5ef5a
     env:
-      KIND_CLUSTER_NAME: kind
-      VM_NAME: agent-e2e
+      KIND_CLUSTER_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
+      VM_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
       VM_SUBNET: "192.168.100"
       VM_IP: "192.168.100.10"
-      AGENT_MACHINE_NAME: agent-e2e
+      AGENT_MACHINE_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
+      HOST_BASE_OS: ${{ matrix.host-base-os }}
+      NSPAWN_OCI_IMAGE: ${{ matrix.nspawn-oci-image }}
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up test control plane
         uses: ./.github/actions/agent-e2e-kind-control-plane
@@ -75,6 +96,9 @@ jobs:
 
       - name: Wait for node to become Ready
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+
+      - name: Validate controller health after join
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-controllers-healthy
 
       - name: Dump persisted agent config
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose dump-persisted-agent-config
@@ -113,6 +137,9 @@ jobs:
       - name: Wait for node to become Ready (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
 
+      - name: Validate controller health after rejoin
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-controllers-healthy
+
       - name: Dump persisted agent config (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose dump-persisted-agent-config
 
@@ -135,7 +162,7 @@ jobs:
         if: always()
         uses: ./.github/actions/agent-e2e-kind-logs
         with:
-          artifact-name: agent-e2e-kind-logs
+          artifact-name: agent-e2e-kind-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}-logs
 
       - name: Cleanup
         if: always()
@@ -153,7 +180,7 @@ jobs:
       AGENT_MACHINE_NAME: agent-config-e2e
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up test control plane
         uses: ./.github/actions/agent-e2e-kind-control-plane

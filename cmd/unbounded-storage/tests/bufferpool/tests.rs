@@ -4,8 +4,8 @@
 use proptest::prelude::*;
 
 use crate::bufferpool::workload::{
-    ClientOutcome, ClientSpec, PipelineSpec, PlanSliceSpec, RunReport, Workload, run_workload,
-    pipelined_workload_strategy, workload_strategy,
+    ClientOutcome, ClientSpec, PipelineSpec, PlanSliceSpec, RunReport, Workload,
+    pipelined_workload_strategy, run_workload, workload_strategy,
 };
 
 proptest! {
@@ -370,7 +370,6 @@ proptest! {
         prop_assert!(!report.outcomes.is_empty());
     }
 }
-
 
 /// Scenario test: with `max_concurrent_streams=1` and four
 /// concurrent clients on the same stripe, at least one `read()`

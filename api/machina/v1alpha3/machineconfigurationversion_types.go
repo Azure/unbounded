@@ -7,10 +7,16 @@ import (
 	"fmt"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 func init() {
-	SchemeBuilder.Register(&MachineConfigurationVersion{}, &MachineConfigurationVersionList{})
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(GroupVersion, &MachineConfigurationVersion{}, &MachineConfigurationVersionList{})
+		metav1.AddToGroupVersion(s, GroupVersion)
+
+		return nil
+	})
 }
 
 // Label keys set on MachineConfigurationVersion objects.

@@ -30,6 +30,7 @@ pub struct NumaNode {
 pub struct Hca {
     pub dev_name: String,
     pub pci_bdf: Option<String>,
+    pub pcie_root: Option<String>,
     pub numa: Option<u16>,
     pub ports_active: bool,
 }
@@ -38,6 +39,7 @@ pub struct Hca {
 pub struct Nvme {
     pub dev_name: String,
     pub pci_bdf: Option<String>,
+    pub pcie_root: Option<String>,
     pub numa: Option<u16>,
 }
 
@@ -45,10 +47,27 @@ pub struct Nvme {
 pub struct Nic {
     pub dev_name: String,
     pub pci_bdf: Option<String>,
+    pub pcie_root: Option<String>,
     pub numa: Option<u16>,
     pub rx_queues: usize,
     pub msi_irqs: Vec<u32>,
     pub operstate_up: bool,
+}
+
+/// A `(numa, pcie_root)` locality domain: the HCAs, NVMes, and NICs
+/// that share a NUMA node and PCIe root port, plus the CPUs resident
+/// on that NUMA node. Devices whose root port is unknown collapse into
+/// a NUMA-only domain (`pcie_root = None`). Planning uses this to pair
+/// NICs with NVMes on the same PCIe complex and to pin device workers
+/// to complex-local CPUs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalityGroup {
+    pub numa: Option<u16>,
+    pub pcie_root: Option<String>,
+    pub cpus: Vec<u32>,
+    pub hcas: Vec<String>,
+    pub nvmes: Vec<String>,
+    pub nics: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -118,6 +137,48 @@ impl Host {
                 .unwrap_or_default(),
         }
     }
+
+    /// Group HCAs, NVMes, and NICs into `(numa, pcie_root)` locality
+    /// domains, attaching the CPUs resident on each domain's NUMA node.
+    /// Groups are ordered by `(numa, pcie_root)`; device names within a
+    /// group keep host discovery order (PCI-BDF sorted).
+    pub fn locality_groups(&self) -> Vec<LocalityGroup> {
+        let mut groups: BTreeMap<(Option<u16>, Option<String>), LocalityGroup> = BTreeMap::new();
+        for h in &self.hcas {
+            self.locality_entry(&mut groups, h.numa, &h.pcie_root)
+                .hcas
+                .push(h.dev_name.clone());
+        }
+        for n in &self.nvmes {
+            self.locality_entry(&mut groups, n.numa, &n.pcie_root)
+                .nvmes
+                .push(n.dev_name.clone());
+        }
+        for n in &self.nics {
+            self.locality_entry(&mut groups, n.numa, &n.pcie_root)
+                .nics
+                .push(n.dev_name.clone());
+        }
+        groups.into_values().collect()
+    }
+
+    fn locality_entry<'g>(
+        &self,
+        groups: &'g mut BTreeMap<(Option<u16>, Option<String>), LocalityGroup>,
+        numa: Option<u16>,
+        pcie_root: &Option<String>,
+    ) -> &'g mut LocalityGroup {
+        groups
+            .entry((numa, pcie_root.clone()))
+            .or_insert_with(|| LocalityGroup {
+                numa,
+                pcie_root: pcie_root.clone(),
+                cpus: self.cpus_on(numa),
+                hcas: Vec::new(),
+                nvmes: Vec::new(),
+                nics: Vec::new(),
+            })
+    }
 }
 
 fn discover_numa_nodes(sys_root: &Path) -> Vec<NumaNode> {
@@ -161,10 +222,14 @@ fn discover_hcas(sys_root: &Path) -> Vec<Hca> {
             read_numa_node(&sys_root.join(format!("class/infiniband/{dev}/device/numa_node")));
         let pci_bdf =
             sysfs::read_pci_bdf(&sys_root.join(format!("class/infiniband/{dev}/device/uevent")));
+        let pcie_root = pci_bdf
+            .as_deref()
+            .and_then(|bdf| sysfs::pcie_root_port(sys_root, bdf));
         let ports_active = has_active_port(sys_root, &dev);
         out.push(Hca {
             dev_name: dev,
             pci_bdf,
+            pcie_root,
             numa,
             ports_active,
         });
@@ -190,9 +255,13 @@ fn discover_nvmes(sys_root: &Path) -> Vec<Nvme> {
         let numa = read_numa_node(&sys_root.join(format!("class/nvme/{dev}/device/numa_node")));
         let pci_bdf =
             sysfs::read_pci_bdf(&sys_root.join(format!("class/nvme/{dev}/device/uevent")));
+        let pcie_root = pci_bdf
+            .as_deref()
+            .and_then(|bdf| sysfs::pcie_root_port(sys_root, bdf));
         out.push(Nvme {
             dev_name: dev,
             pci_bdf,
+            pcie_root,
             numa,
         });
     }
@@ -220,12 +289,16 @@ fn discover_nics(sys_root: &Path) -> Vec<Nic> {
         }
         let numa = read_numa_node(&sys_root.join(format!("class/net/{dev}/device/numa_node")));
         let pci_bdf = sysfs::read_pci_bdf(&sys_root.join(format!("class/net/{dev}/device/uevent")));
+        let pcie_root = pci_bdf
+            .as_deref()
+            .and_then(|bdf| sysfs::pcie_root_port(sys_root, bdf));
         let rx_queues = count_rx_queues(&sys_root.join(format!("class/net/{dev}/queues")));
         let msi_irqs = read_msi_irqs(&sys_root.join(format!("class/net/{dev}/device/msi_irqs")));
         let operstate_up = read_operstate_up(&sys_root.join(format!("class/net/{dev}/operstate")));
         out.push(Nic {
             dev_name: dev,
             pci_bdf,
+            pcie_root,
             numa,
             rx_queues,
             msi_irqs,
@@ -433,6 +506,16 @@ mod tests {
             self.touch_dir(&format!("class/net/{dev}"));
             self.write(&format!("class/net/{dev}/operstate"), "up\n");
         }
+
+        /// Stage the `bus/pci/devices/<bdf>` symlink so `pcie_root`
+        /// discovery resolves `bdf` to the given root port beneath a
+        /// host bridge. The target need not exist on disk.
+        fn link_pcie(&self, bdf: &str, root_port: &str) {
+            let link = self.root.join("bus/pci/devices").join(bdf);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            let target = format!("../../devices/pci0000:00/{root_port}/{bdf}");
+            std::os::unix::fs::symlink(target, &link).unwrap();
+        }
     }
 
     impl Drop for FakeSys {
@@ -634,5 +717,93 @@ mod tests {
         assert_eq!(h.numa_nodes.len(), 2);
         assert_eq!(h.numa_nodes[0].id, 0);
         assert_eq!(h.numa_nodes[1].id, 1);
+    }
+
+    #[test]
+    fn pcie_root_recorded_for_devices_with_links() {
+        let s = FakeSys::new();
+        s.add_hca("mlx5_0", "0000:af:00.0", 0, true);
+        s.link_pcie("0000:af:00.0", "0000:ae:01.0");
+        s.add_nvme("nvme0", "0000:c1:00.0", 1);
+        s.link_pcie("0000:c1:00.0", "0000:c0:02.0");
+        s.add_nic("eth0", Some("0000:01:00.0"), 0, 1, &[], "up");
+        s.link_pcie("0000:01:00.0", "0000:00:01.0");
+        let h = Host::discover_with(&s.root);
+        assert_eq!(h.hcas[0].pcie_root.as_deref(), Some("0000:ae:01.0"));
+        assert_eq!(h.nvmes[0].pcie_root.as_deref(), Some("0000:c0:02.0"));
+        assert_eq!(h.nics[0].pcie_root.as_deref(), Some("0000:00:01.0"));
+    }
+
+    #[test]
+    fn pcie_root_none_when_bdf_or_link_missing() {
+        let s = FakeSys::new();
+        // HCA has a BDF but no pci symlink -> degrade to NUMA-only.
+        s.add_hca("mlx5_0", "0000:af:00.0", 0, true);
+        // NIC has no BDF at all.
+        s.add_nic("eth0", None, 0, 1, &[], "up");
+        let h = Host::discover_with(&s.root);
+        assert_eq!(h.hcas[0].pcie_root, None);
+        assert_eq!(h.nics[0].pci_bdf, None);
+        assert_eq!(h.nics[0].pcie_root, None);
+    }
+
+    #[test]
+    fn locality_groups_split_by_pcie_root_within_numa() {
+        let s = FakeSys::new();
+        s.add_online("0-7");
+        for cpu in 0u32..8 {
+            s.add_cpu(cpu, 0, None);
+        }
+        s.add_node_cpulist(0, "0-7");
+        // Two devices on the same NUMA node but different root ports
+        // form two distinct complexes; a NIC shares the NVMe's root
+        // port and so pairs with it.
+        s.add_hca("mlx5_0", "0000:af:00.0", 0, true);
+        s.link_pcie("0000:af:00.0", "0000:ae:01.0");
+        s.add_nvme("nvme0", "0000:c1:00.0", 0);
+        s.link_pcie("0000:c1:00.0", "0000:c0:02.0");
+        s.add_nic("eth0", Some("0000:c2:00.0"), 0, 1, &[], "up");
+        s.link_pcie("0000:c2:00.0", "0000:c0:02.0");
+        let h = Host::discover_with(&s.root);
+        let groups = h.locality_groups();
+        assert_eq!(groups.len(), 2);
+
+        let hca_grp = groups
+            .iter()
+            .find(|g| g.pcie_root.as_deref() == Some("0000:ae:01.0"))
+            .unwrap();
+        assert_eq!(hca_grp.numa, Some(0));
+        assert_eq!(hca_grp.hcas, vec!["mlx5_0".to_string()]);
+        assert!(hca_grp.nvmes.is_empty());
+        assert!(hca_grp.nics.is_empty());
+        assert_eq!(hca_grp.cpus, (0u32..8).collect::<Vec<_>>());
+
+        let storage_grp = groups
+            .iter()
+            .find(|g| g.pcie_root.as_deref() == Some("0000:c0:02.0"))
+            .unwrap();
+        assert_eq!(storage_grp.nvmes, vec!["nvme0".to_string()]);
+        assert_eq!(storage_grp.nics, vec!["eth0".to_string()]);
+        assert!(storage_grp.hcas.is_empty());
+    }
+
+    #[test]
+    fn locality_groups_degrade_to_numa_only_without_links() {
+        let s = FakeSys::new();
+        s.add_online("0-3");
+        for cpu in 0u32..4 {
+            s.add_cpu(cpu, 0, None);
+        }
+        s.add_node_cpulist(0, "0-3");
+        // No pci symlinks: both devices fall into the NUMA-only domain.
+        s.add_hca("mlx5_0", "0000:af:00.0", 0, true);
+        s.add_nvme("nvme0", "0000:c1:00.0", 0);
+        let h = Host::discover_with(&s.root);
+        let groups = h.locality_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].numa, Some(0));
+        assert_eq!(groups[0].pcie_root, None);
+        assert_eq!(groups[0].hcas, vec!["mlx5_0".to_string()]);
+        assert_eq!(groups[0].nvmes, vec!["nvme0".to_string()]);
     }
 }
