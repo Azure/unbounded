@@ -228,10 +228,13 @@ set_var() {
     local name="$1"
     local value="$2"
     echo "==> Setting variable $name"
-    if ! gh variable set "$name" \
+    # Pipe the value via stdin instead of --body: `gh variable set --body ""`
+    # treats an empty value as "no value" on a TTY and prompts interactively
+    # ("Paste your variable"), which would hang non-interactive callers. Stdin
+    # is never a TTY here, so an empty value is stored without prompting.
+    if ! printf '%s' "$value" | gh variable set "$name" \
             --repo "$REPO" \
-            --env  "$ENV_NAME" \
-            --body "$value"; then
+            --env  "$ENV_NAME"; then
         echo "error: failed to set variable $name" >&2
         exit 3
     fi
