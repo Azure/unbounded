@@ -331,7 +331,7 @@ GOFUMPT_VERSION ?= v0.8.0
 GOLANGCI_LINT_VERSION ?= v2.11.4
 PROTOC_GEN_GO_VERSION ?= v1.36.11
 PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.1
-CONTROLLER_GEN_VERSION ?= v0.20.1
+CONTROLLER_GEN_VERSION ?= v0.21.0
 
 # Pinned protoc for deterministic .pb.go output across environments.
 # Downloaded from the upstream protobuf GitHub releases.
