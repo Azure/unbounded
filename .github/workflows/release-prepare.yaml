@@ -19,13 +19,38 @@ name: unbounded release prepare
 # triggers for tags pushed with GITHUB_TOKEN (loop prevention); a deploy-key
 # push is exempt, so it triggers release.yaml's `on: push: tags` in the
 # correct tag context.
+#
+# Modes (the `mode` input):
+#   release     Bump the latest FINAL tag by `bump` and cut vX.Y.Z.
+#   prerelease  Bump the latest FINAL tag by `bump` and cut vX.Y.Z-<pre>
+#               (e.g. pre=rc.1). Iterate a train by re-running with the same
+#               `bump` and an incremented `pre` (rc.1 -> rc.2 -> ...).
+#   promote     Finalize an in-flight prerelease to its release version, with
+#               NO bump. By default this promotes the highest prerelease
+#               train; set `version` (e.g. v0.2.0) to promote a specific one.
+#
+# Recovery: if a tag is pushed but no release.yaml run is triggered (for
+# example a misconfigured deploy key or disabled Actions), delete the tag
+# (`git push origin :refs/tags/<tag>`) and re-run this workflow. There is
+# deliberately NO workflow_dispatch fallback on release.yaml: a dispatched
+# run would sign as `@refs/heads/main` and fail deploy verification, which is
+# the exact problem this two-phase split exists to avoid.
 # ---------------------------------------------------------------------------
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "release: cut vX.Y.Z | prerelease: cut vX.Y.Z-<pre> | promote: finalize a prerelease"
+        required: true
+        type: choice
+        options:
+          - release
+          - prerelease
+          - promote
+        default: release
       bump:
-        description: "Version bump level"
+        description: "Version bump level (release/prerelease)"
         required: true
         type: choice
         options:
@@ -34,7 +59,12 @@ on:
           - major
         default: patch
       pre:
-        description: "Optional prerelease suffix (e.g. rc.1); leave blank for a normal release"
+        description: "Prerelease suffix for prerelease mode (e.g. rc.1)"
+        required: false
+        type: string
+        default: ""
+      version:
+        description: "promote only: explicit final version to cut (e.g. v0.2.0); blank = highest in-flight prerelease"
         required: false
         type: string
         default: ""
@@ -53,45 +83,122 @@ jobs:
   tag:
     runs-on: ubuntu-latest
     steps:
+      # Always cut releases from the default branch, regardless of which ref
+      # the manual dispatch selected.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: main
           fetch-depth: 0
           # Wires git to push over SSH with the deploy key so the resulting
           # tag push triggers release.yaml.
           ssh-key: ${{ secrets.RELEASE_TAG_DEPLOY_KEY }}
 
-      - name: Compute and push tag
-        # Bind inputs to env vars so they enter the shell as data, not as
-        # code. `pre` is free-form user input; inlining `${{ ... }}` in a
-        # run block is template-expanded before bash parses it, so any shell
-        # metacharacter would become script syntax.
+      - name: Preflight deploy key
+        # Fail fast before any tag is created if the deploy key is missing or
+        # cannot authenticate, so we never leave a pushed tag without a build.
         env:
-          BUMP: ${{ inputs.bump }}
-          PRE: ${{ inputs.pre }}
+          HAS_KEY: ${{ secrets.RELEASE_TAG_DEPLOY_KEY != '' }}
         run: |
           set -euo pipefail
 
-          LATEST=$(git tag --list 'v*' --sort=-version:refname | head -n1)
-          if [[ -z "$LATEST" ]]; then
-            LATEST="v0.0.0"
+          if [[ "$HAS_KEY" != "true" ]]; then
+            echo "::error::RELEASE_TAG_DEPLOY_KEY secret is not set; cannot push the tag"
+            exit 1
           fi
 
-          # Strip any prerelease suffix from the base before bumping.
-          BASE="${LATEST%%-*}"
-          SEMVER="${BASE#v}"
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$SEMVER"
+          if ! git ls-remote origin >/dev/null 2>&1; then
+            echo "::error::cannot authenticate to origin with the deploy key (git ls-remote failed)"
+            exit 1
+          fi
 
-          case "$BUMP" in
-            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH + 1)) ;;
-            *) echo "::error::unexpected bump level: ${BUMP}"; exit 1 ;;
+          echo "Deploy key authenticates to origin."
+
+      - name: Compute and push tag
+        # Bind inputs to env vars so they enter the shell as data, not as
+        # code. `pre` and `version` are free-form user input; inlining
+        # `${{ ... }}` in a run block is template-expanded before bash parses
+        # it, so any shell metacharacter would become script syntax.
+        env:
+          MODE: ${{ inputs.mode }}
+          BUMP: ${{ inputs.bump }}
+          PRE: ${{ inputs.pre }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          # The `version` override only applies to promote.
+          if [[ -n "$VERSION" && "$MODE" != "promote" ]]; then
+            echo "::error::version is only valid with mode=promote (got mode=${MODE})"
+            exit 1
+          fi
+
+          # Latest FINAL (non-prerelease) tag, used as the bump base. Excluding
+          # prerelease tags avoids git's version sort ranking e.g. v0.2.0-rc.1
+          # above v0.2.0.
+          latest_final() {
+            git tag --list 'v*' --sort=-version:refname | grep -v -- '-' | head -n1
+          }
+
+          bump_version() {
+            local base="$1" level="$2"
+            local semver="${base#v}"
+            local major minor patch
+            IFS='.' read -r major minor patch <<< "$semver"
+            case "$level" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+              *) echo "::error::unexpected bump level: ${level}"; exit 1 ;;
+            esac
+            echo "v${major}.${minor}.${patch}"
+          }
+
+          case "$MODE" in
+            release)
+              FINAL="$(latest_final)"
+              [[ -z "$FINAL" ]] && FINAL="v0.0.0"
+              TAG="$(bump_version "$FINAL" "$BUMP")"
+              ;;
+
+            prerelease)
+              if [[ -z "$PRE" ]]; then
+                echo "::error::mode=prerelease requires a non-empty pre suffix"
+                exit 1
+              fi
+              FINAL="$(latest_final)"
+              [[ -z "$FINAL" ]] && FINAL="v0.0.0"
+              CORE="$(bump_version "$FINAL" "$BUMP")"
+              TAG="${CORE}-${PRE}"
+              ;;
+
+            promote)
+              if [[ -n "$VERSION" ]]; then
+                # Normalize a leading v and reject any prerelease suffix.
+                NORM="v${VERSION#v}"
+                if [[ ! "$NORM" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  echo "::error::version must be a final vX.Y.Z (no suffix), got: ${VERSION}"
+                  exit 1
+                fi
+                if [[ -z "$(git tag --list "${NORM}-*")" ]]; then
+                  echo "::error::no prerelease train found for ${NORM} (no ${NORM}-* tags); use mode=release to cut it directly"
+                  exit 1
+                fi
+                TAG="$NORM"
+              else
+                PRELATEST="$(git tag --list 'v*-*' --sort=-version:refname | head -n1)"
+                if [[ -z "$PRELATEST" ]]; then
+                  echo "::error::mode=promote found no prerelease tags to finalize"
+                  exit 1
+                fi
+                TAG="${PRELATEST%%-*}"
+              fi
+              ;;
+
+            *)
+              echo "::error::unexpected mode: ${MODE}"
+              exit 1
+              ;;
           esac
-
-          TAG="v${MAJOR}.${MINOR}.${PATCH}"
-          if [[ -n "$PRE" ]]; then
-            TAG="${TAG}-${PRE}"
-          fi
 
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Tag must be in vX.Y.Z[-suffix] format, got: ${TAG}"
@@ -108,5 +215,5 @@ jobs:
           git tag "$TAG"
           git push origin "$TAG"
 
-          echo "Pushed ${TAG}; release.yaml will build and sign it in tag context."
+          echo "Pushed ${TAG} (mode=${MODE}); release.yaml will build and sign it in tag context."
           echo "### Prepared release ${TAG}" >> "$GITHUB_STEP_SUMMARY"
