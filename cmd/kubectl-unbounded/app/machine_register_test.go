@@ -903,6 +903,7 @@ func TestMachineRegisterHandler_Execute_WithDownloadOverrides(t *testing.T) {
 		kubernetesBaseURL: "https://mirror.example.com/k8s",
 		containerdVersion: "2.0.5",
 		crictlBaseURL:     "https://mirror.example.com/cri-tools/releases/download",
+		aptMirrorURL:      "http://mirror.example.com/ubuntu",
 		kubeCli:           kubeCli,
 		kubeResourcesCli:  kubeResourcesCli,
 		logger:            discardLogger(),
@@ -918,4 +919,6 @@ func TestMachineRegisterHandler_Execute_WithDownloadOverrides(t *testing.T) {
 	require.Contains(t, s, "baseURL: https://mirror.example.com/k8s")
 	require.Contains(t, s, "version: 2.0.5")
 	require.Contains(t, s, "baseURL: https://mirror.example.com/cri-tools/releases/download")
+	require.Contains(t, s, "packageSources:")
+	require.Contains(t, s, "mirrorURL: http://mirror.example.com/ubuntu")
 }

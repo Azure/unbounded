@@ -23,6 +23,10 @@ type RootFS struct {
 	// runc, CNI plugins, crictl). Nil means upstream defaults apply.
 	Downloads *DownloadOverrides
 
+	// PackageSources optionally overrides OS package repositories used
+	// while bootstrapping the nspawn rootfs. Nil means defaults apply.
+	PackageSources *PackageSources
+
 	// OCIImage is the fully-qualified OCI image reference (e.g.
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
 	// The image must use OCI media types and include a platform manifest

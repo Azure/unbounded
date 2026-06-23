@@ -85,6 +85,9 @@ type machineRegisterHandler struct {
 	cniBaseURL, cniURL, cniVersion                              string
 	crictlBaseURL, crictlURL, crictlVersion                     string
 
+	// Package repository overrides for rootfs bootstrap.
+	aptMirrorURL string
+
 	// kubeCli is the kubernetes client interface.
 	kubeCli kubernetes.Interface
 
@@ -280,11 +283,28 @@ func (h *machineRegisterHandler) buildAgentSpec() *v1alpha3.AgentSpec {
 		agent.Downloads = downloads
 	}
 
-	if agent.Version == "" && agent.BaseURL == "" && agent.URL == "" && agent.Image == "" && agent.Downloads == nil {
+	packageSources := h.buildPackageSourcesSpec()
+	if packageSources != nil {
+		agent.PackageSources = packageSources
+	}
+
+	if agent.Version == "" && agent.BaseURL == "" && agent.URL == "" && agent.Image == "" && agent.Downloads == nil && agent.PackageSources == nil {
 		return nil
 	}
 
 	return agent
+}
+
+// buildPackageSourcesSpec returns a non-nil AgentPackageSourcesSpec when any
+// package repository override flag has been set.
+func (h *machineRegisterHandler) buildPackageSourcesSpec() *v1alpha3.AgentPackageSourcesSpec {
+	if h.aptMirrorURL == "" {
+		return nil
+	}
+
+	return &v1alpha3.AgentPackageSourcesSpec{
+		APT: &v1alpha3.APTPackageSource{MirrorURL: h.aptMirrorURL},
+	}
 }
 
 // buildDownloadsSpec returns a non-nil AgentDownloadsSpec when any rootfs
@@ -490,6 +510,8 @@ func machineRegisterCommand() *cobra.Command {
 		"Full URL template for crictl downloads (fmt placeholders: version, version, os, arch)")
 	cmd.Flags().StringVar(&handler.crictlVersion, "crictl-version", "",
 		"Override the cri-tools/crictl version installed in the rootfs (defaults to the cluster Kubernetes minor, patch 0)")
+	cmd.Flags().StringVar(&handler.aptMirrorURL, "apt-mirror-url", "",
+		"APT mirror URL for Ubuntu rootfs debootstrap and sources.list (default: built-in Ubuntu mirrors)")
 
 	if err := cmd.MarkFlagRequired("site"); err != nil {
 		panic(err)

@@ -41,6 +41,11 @@ type UnboundedAgentConfig struct {
 	// runc, CNI plugins, crictl). When unset the agent downloads each
 	// artifact from its upstream default host.
 	Downloads *AgentDownloads `json:"Downloads,omitempty"`
+
+	// PackageSources optionally overrides OS package repository endpoints
+	// used while bootstrapping the nspawn rootfs. When unset the agent
+	// uses its built-in package repositories.
+	PackageSources *AgentPackageSources `json:"PackageSources,omitempty"`
 }
 
 // AgentAttestConfig holds configuration for TPM-based attestation against
@@ -73,6 +78,18 @@ type AgentDownloadSource struct {
 	BaseURL string `json:"BaseURL,omitempty"`
 	URL     string `json:"URL,omitempty"`
 	Version string `json:"Version,omitempty"`
+}
+
+// AgentPackageSources optionally overrides OS package repository endpoints
+// used while bootstrapping the nspawn rootfs.
+type AgentPackageSources struct {
+	APT *AgentAPTPackageSource `json:"APT,omitempty"`
+}
+
+// AgentAPTPackageSource configures the apt/debootstrap mirror used for the
+// Ubuntu nspawn rootfs.
+type AgentAPTPackageSource struct {
+	MirrorURL string `json:"MirrorURL,omitempty"`
 }
 
 // ClusterEndpoint holds the cluster-level connection parameters needed to
@@ -172,9 +189,17 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 	}
 
 	// Resolve download overrides from the Machine spec.
-	var downloads *AgentDownloads
+	var (
+		downloads      *AgentDownloads
+		packageSources *AgentPackageSources
+	)
+
 	if machine.Spec.Agent != nil && machine.Spec.Agent.Downloads != nil {
 		downloads = agentDownloadsFromSpec(machine.Spec.Agent.Downloads)
+	}
+
+	if machine.Spec.Agent != nil && machine.Spec.Agent.PackageSources != nil {
+		packageSources = agentPackageSourcesFromSpec(machine.Spec.Agent.PackageSources)
 	}
 
 	cfg := UnboundedAgentConfig{
@@ -196,7 +221,8 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 			},
 			OCIImage: ociImage,
 		},
-		Downloads: downloads,
+		Downloads:      downloads,
+		PackageSources: packageSources,
 	}
 
 	if params.AttestURL != "" {
@@ -245,6 +271,36 @@ func downloadSourceFromSpec(s *v1alpha3.DownloadSource) *AgentDownloadSource {
 	}
 }
 
+// agentPackageSourcesFromSpec converts the Machine API package source spec
+// into the agent-facing package source config. Returns nil when empty.
+func agentPackageSourcesFromSpec(spec *v1alpha3.AgentPackageSourcesSpec) *AgentPackageSources {
+	if spec == nil {
+		return nil
+	}
+
+	out := &AgentPackageSources{
+		APT: aptPackageSourceFromSpec(spec.APT),
+	}
+
+	if out.APT == nil {
+		return nil
+	}
+
+	return out
+}
+
+func aptPackageSourceFromSpec(s *v1alpha3.APTPackageSource) *AgentAPTPackageSource {
+	if s == nil {
+		return nil
+	}
+
+	if s.MirrorURL == "" {
+		return nil
+	}
+
+	return &AgentAPTPackageSource{MirrorURL: s.MirrorURL}
+}
+
 // ResolveDownloadOverrides converts the provision AgentDownloads (from the
 // agent config JSON) into the goalstates.DownloadOverrides shape that
 // rootfs phase tasks consume. Returns nil when no overrides are set.
@@ -282,4 +338,24 @@ func ResolveDownloadOverrides(d *AgentDownloads) *goalstates.DownloadOverrides {
 	}
 
 	return out
+}
+
+// ResolvePackageSources converts the provision AgentPackageSources (from the
+// agent config JSON) into the goalstates.PackageSources shape that rootfs
+// phase tasks consume. Returns nil when no overrides are set.
+func ResolvePackageSources(s *AgentPackageSources) *goalstates.PackageSources {
+	if s == nil {
+		return nil
+	}
+
+	var apt *goalstates.APTPackageSource
+	if s.APT != nil && s.APT.MirrorURL != "" {
+		apt = &goalstates.APTPackageSource{MirrorURL: s.APT.MirrorURL}
+	}
+
+	if apt == nil {
+		return nil
+	}
+
+	return &goalstates.PackageSources{APT: apt}
 }

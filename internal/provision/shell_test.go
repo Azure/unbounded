@@ -139,3 +139,75 @@ func TestBuildAgentConfig_Downloads(t *testing.T) {
 		require.Nil(t, cfg.Downloads, "empty download source should yield nil Downloads")
 	})
 }
+
+func TestBuildAgentConfig_PackageSources(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no overrides leaves PackageSources nil", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := BuildAgentConfig(BuildAgentConfigParams{
+			Machine: &v1alpha3.Machine{},
+			Cluster: ClusterEndpoint{KubeVersion: "v1.34.0"},
+		})
+		require.Nil(t, cfg.PackageSources)
+	})
+
+	t.Run("threads apt mirror override from AgentSpec.PackageSources", func(t *testing.T) {
+		t.Parallel()
+
+		machine := &v1alpha3.Machine{
+			Spec: v1alpha3.MachineSpec{
+				Agent: &v1alpha3.AgentSpec{
+					PackageSources: &v1alpha3.AgentPackageSourcesSpec{
+						APT: &v1alpha3.APTPackageSource{MirrorURL: "http://mirror.internal/ubuntu"},
+					},
+				},
+			},
+		}
+
+		cfg := BuildAgentConfig(BuildAgentConfigParams{
+			Machine: machine,
+			Cluster: ClusterEndpoint{KubeVersion: "v1.34.0"},
+		})
+
+		require.NotNil(t, cfg.PackageSources)
+		require.NotNil(t, cfg.PackageSources.APT)
+		require.Equal(t, "http://mirror.internal/ubuntu", cfg.PackageSources.APT.MirrorURL)
+	})
+
+	t.Run("empty apt mirror results in nil", func(t *testing.T) {
+		t.Parallel()
+
+		machine := &v1alpha3.Machine{
+			Spec: v1alpha3.MachineSpec{
+				Agent: &v1alpha3.AgentSpec{
+					PackageSources: &v1alpha3.AgentPackageSourcesSpec{
+						APT: &v1alpha3.APTPackageSource{},
+					},
+				},
+			},
+		}
+
+		cfg := BuildAgentConfig(BuildAgentConfigParams{
+			Machine: machine,
+			Cluster: ClusterEndpoint{KubeVersion: "v1.34.0"},
+		})
+
+		require.Nil(t, cfg.PackageSources)
+	})
+}
+
+func TestResolvePackageSources(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, ResolvePackageSources(nil))
+	require.Nil(t, ResolvePackageSources(&AgentPackageSources{APT: &AgentAPTPackageSource{}}))
+
+	got := ResolvePackageSources(&AgentPackageSources{
+		APT: &AgentAPTPackageSource{MirrorURL: "http://mirror.internal/ubuntu"},
+	})
+	require.NotNil(t, got)
+	require.NotNil(t, got.APT)
+	require.Equal(t, "http://mirror.internal/ubuntu", got.APT.MirrorURL)
+}

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -19,14 +20,15 @@ import (
 type ubuntu struct {
 	log        *slog.Logger
 	machineDir string
+	apt        *goalstates.APTPackageSource
 }
 
 // Ubuntu returns a task that bootstraps an Ubuntu rootfs into the machine
 // directory using debootstrap.
 //
 // NOTE: This currently uses debootstrap with the "noble" suite and is Ubuntu-only.
-func Ubuntu(log *slog.Logger, machineDir string) phases.Task {
-	return &ubuntu{log: log, machineDir: machineDir}
+func Ubuntu(log *slog.Logger, machineDir string, apt *goalstates.APTPackageSource) phases.Task {
+	return &ubuntu{log: log, machineDir: machineDir, apt: apt}
 }
 
 func (b *ubuntu) Name() string { return "debootstrap-ubuntu-noble" }
@@ -68,12 +70,17 @@ func (b *ubuntu) Do(ctx context.Context) error {
 	// debootstrap writes informational progress lines (e.g. "I: Extracting
 	// fonts...", "I: Base system installed successfully.") to stderr during a
 	// normal install. Use Info level so these don't appear as errors.
-	if err := executil.RunCmdAt(ctx, b.log, slog.LevelInfo, debootstrapCmd,
-		"--include="+strings.Join(packages, ","),
-		"--cache-dir="+cacheDir,
+	args := []string{
+		"--include=" + strings.Join(packages, ","),
+		"--cache-dir=" + cacheDir,
 		"noble",
 		b.machineDir,
-	); err != nil {
+	}
+	if b.apt != nil && b.apt.MirrorURL != "" {
+		args = append(args, strings.TrimRight(b.apt.MirrorURL, "/"))
+	}
+
+	if err := executil.RunCmdAt(ctx, b.log, slog.LevelInfo, debootstrapCmd, args...); err != nil {
 		return fmt.Errorf("debootstrap into %s: %w", b.machineDir, err)
 	}
 

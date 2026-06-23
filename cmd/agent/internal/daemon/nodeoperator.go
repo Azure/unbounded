@@ -164,7 +164,7 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 }
 
 func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
-	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
+	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil, nil)
 	if err != nil {
 		return fmt.Errorf("resolve machine goal state: %w", err)
 	}
@@ -210,7 +210,7 @@ func (nspawnNodeOperator) RepaveNode(
 	)
 
 	// Resolve goal states for the new machine.
-	gs, err := goalstates.ResolveMachine(log, &newCfg.AgentConfig, newMachine, provision.ResolveDownloadOverrides(newCfg.Downloads))
+	gs, err := goalstates.ResolveMachine(log, &newCfg.AgentConfig, newMachine, provision.ResolveDownloadOverrides(newCfg.Downloads), provision.ResolvePackageSources(newCfg.PackageSources))
 	if err != nil {
 		return fmt.Errorf("resolve machine goal state: %w", err)
 	}

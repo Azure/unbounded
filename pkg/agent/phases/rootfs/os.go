@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
@@ -66,10 +67,9 @@ func ConfigureOS(goalState *goalstates.RootFS) phases.Task {
 func (c *configureOS) Name() string { return "configure-os" }
 
 func (c *configureOS) Do(_ context.Context) error {
-	// Select the sources.list content for the host architecture.
-	sources, ok := archSources[c.goalState.HostArch]
-	if !ok {
-		return fmt.Errorf("unsupported architecture %q: no apt sources available", c.goalState.HostArch)
+	sources, err := c.aptSources()
+	if err != nil {
+		return err
 	}
 
 	configs := []osConfigFile{
@@ -89,4 +89,27 @@ func (c *configureOS) Do(_ context.Context) error {
 	}
 
 	return nil
+}
+
+func (c *configureOS) aptSources() ([]byte, error) {
+	if c.goalState.PackageSources != nil && c.goalState.PackageSources.APT != nil && c.goalState.PackageSources.APT.MirrorURL != "" {
+		return []byte(ubuntuNobleSourcesList(c.goalState.PackageSources.APT.MirrorURL)), nil
+	}
+
+	sources, ok := archSources[c.goalState.HostArch]
+	if !ok {
+		return nil, fmt.Errorf("unsupported architecture %q: no apt sources available", c.goalState.HostArch)
+	}
+
+	return sources, nil
+}
+
+func ubuntuNobleSourcesList(mirrorURL string) string {
+	mirror := strings.TrimRight(mirrorURL, "/")
+
+	return fmt.Sprintf(`deb %s noble main restricted universe multiverse
+deb %s noble-updates main restricted universe multiverse
+deb %s noble-backports main restricted universe multiverse
+deb %s noble-security main restricted universe multiverse
+`, mirror, mirror, mirror, mirror)
 }

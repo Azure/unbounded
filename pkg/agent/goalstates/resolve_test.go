@@ -234,7 +234,7 @@ func TestResolveMachine_UsesConfigNodeName(t *testing.T) {
 		},
 	}
 
-	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil, nil)
 	require.NoError(t, err)
 	hostname, err := os.Hostname()
 	require.NoError(t, err)

@@ -43,7 +43,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 			log := cmdCtx.Logger
 
-			gs, err := goalstates.ResolveMachine(log, &cfg.AgentConfig, goalstates.NSpawnMachineKube1, provision.ResolveDownloadOverrides(cfg.Downloads))
+			gs, err := goalstates.ResolveMachine(log, &cfg.AgentConfig, goalstates.NSpawnMachineKube1, provision.ResolveDownloadOverrides(cfg.Downloads), provision.ResolvePackageSources(cfg.PackageSources))
 			if err != nil {
 				return err
 			}

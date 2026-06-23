@@ -840,6 +840,9 @@ func TestManualBootstrapHandler_RenderScript_DownloadOverrides(t *testing.T) {
 				Labels: map[string]string{"env": "prod"},
 			},
 		},
+		PackageSources: &provision.AgentPackageSources{
+			APT: &provision.AgentAPTPackageSource{MirrorURL: "http://mirror.example.com/ubuntu"},
+		},
 	}
 
 	h := &manualBootstrapHandler{
@@ -855,6 +858,8 @@ func TestManualBootstrapHandler_RenderScript_DownloadOverrides(t *testing.T) {
 	// install script heredoc.
 	require.Contains(t, script, "export AGENT_VERSION='v0.0.10'")
 	require.Contains(t, script, "export AGENT_BASE_URL='https://mirror.example.com/releases'")
+	require.Contains(t, script, `"PackageSources": {`)
+	require.Contains(t, script, `"MirrorURL": "http://mirror.example.com/ubuntu"`)
 
 	// The exports must appear before the embedded install script heredoc.
 	exportIdx := strings.Index(script, "export AGENT_VERSION=")

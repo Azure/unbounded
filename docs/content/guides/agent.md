@@ -238,7 +238,8 @@ kubectl unbounded machine register \
     --containerd-base-url https://mirror.internal/containerd/releases/download \
     --runc-base-url       https://mirror.internal/runc/releases/download \
     --cni-base-url        https://mirror.internal/plugins/releases/download \
-    --crictl-base-url     https://mirror.internal/cri-tools/releases/download
+    --crictl-base-url     https://mirror.internal/cri-tools/releases/download \
+    --apt-mirror-url      http://mirror.internal/ubuntu
 ```
 
 The resulting `Machine` persists the overrides under
@@ -264,6 +265,9 @@ spec:
         baseURL: https://mirror.internal/plugins/releases/download
       crictl:
         baseURL: https://mirror.internal/cri-tools/releases/download
+    packageSources:
+      apt:
+        mirrorURL: http://mirror.internal/ubuntu
   ssh:
     host: 10.0.0.5
     # ...
@@ -272,6 +276,32 @@ spec:
 Leaving any artifact unset preserves the upstream default, so you can
 mirror a subset of the artifacts and let the rest fall back to the
 public CDN.
+
+For a fully isolated bootstrap, mirror these inputs before provisioning:
+
+1. Publish the `unbounded-agent` release tarball under the GitHub release
+   asset layout and pass `--agent-base-url` (or pass `--agent-url`).
+2. Publish the rootfs OCI image to a reachable registry and pass
+   `--oci-image`, or use `--apt-mirror-url` when explicitly falling back
+   to debootstrap.
+3. Mirror the five rootfs binary release locations and pass the matching
+   `--*-base-url` flags shown above.
+
+Verify the rendered payload before running it by checking that the explicit
+exports and agent config point at the mirrors. The embedded install script
+still contains fallback defaults, but these values take precedence:
+
+```bash
+kubectl unbounded machine manual-bootstrap my-node --site mysite \
+    --agent-base-url https://mirror.internal/unbounded \
+    --oci-image registry.internal/unbounded/agent-ubuntu2404:v20260427 \
+    --kubernetes-base-url https://mirror.internal/k8s \
+    --containerd-base-url https://mirror.internal/containerd/releases/download \
+    --runc-base-url https://mirror.internal/runc/releases/download \
+    --cni-base-url https://mirror.internal/plugins/releases/download \
+    --crictl-base-url https://mirror.internal/cri-tools/releases/download \
+  | grep -E '"OCIImage"|BaseURL|URL|MirrorURL|export AGENT_'
+```
 
 A successful run looks like this (timestamps shortened for readability):
 

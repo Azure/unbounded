@@ -111,6 +111,9 @@ type manualBootstrapHandler struct {
 	cniBaseURL, cniURL, cniVersion                            string
 	crictlBaseURL, crictlURL, crictlVersion                   string
 
+	// Package repository overrides for rootfs bootstrap.
+	aptMirrorURL string
+
 	// variant controls the output format. Defaults to "script".
 	variant string
 
@@ -301,6 +304,14 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		machine.Spec.Agent.Downloads = downloads
 	}
 
+	if packageSources := h.buildPackageSourcesSpec(); packageSources != nil {
+		if machine.Spec.Agent == nil {
+			machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{}
+		}
+
+		machine.Spec.Agent.PackageSources = packageSources
+	}
+
 	cfg := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
 		Machine: machine,
 		Cluster: provision.ClusterEndpoint{
@@ -315,6 +326,18 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 	cfg.Kubelet.NodeIP = strings.TrimSpace(h.nodeIP)
 
 	return &cfg, nil
+}
+
+// buildPackageSourcesSpec returns a non-nil AgentPackageSourcesSpec when any
+// package repository override flag has been set; otherwise nil.
+func (h *manualBootstrapHandler) buildPackageSourcesSpec() *unboundedv1alpha3.AgentPackageSourcesSpec {
+	if h.aptMirrorURL == "" {
+		return nil
+	}
+
+	return &unboundedv1alpha3.AgentPackageSourcesSpec{
+		APT: &unboundedv1alpha3.APTPackageSource{MirrorURL: h.aptMirrorURL},
+	}
 }
 
 // manualBootstrapTemplateData holds the values injected into the
@@ -551,6 +574,8 @@ Examples:
 		"Full URL template for crictl downloads (fmt placeholders: version, version, os, arch)")
 	cmd.Flags().StringVar(&handler.crictlVersion, "crictl-version", "",
 		"Override the cri-tools/crictl version installed in the rootfs (defaults to the cluster Kubernetes minor, patch 0)")
+	cmd.Flags().StringVar(&handler.aptMirrorURL, "apt-mirror-url", "",
+		"APT mirror URL for Ubuntu rootfs debootstrap and sources.list (default: built-in Ubuntu mirrors)")
 
 	if err := cmd.MarkFlagRequired("site"); err != nil {
 		panic(err)

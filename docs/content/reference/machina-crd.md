@@ -319,6 +319,38 @@ spec:
     name: azure-workers
 ```
 
+**Offline bootstrap mirrors:**
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
+metadata:
+  name: worker-offline
+spec:
+  agent:
+    image: registry.internal/unbounded/agent-ubuntu2404:v20260427
+    baseURL: https://mirror.internal/unbounded
+    downloads:
+      kubernetes:
+        baseURL: https://mirror.internal/k8s
+      containerd:
+        baseURL: https://mirror.internal/containerd/releases/download
+      runc:
+        baseURL: https://mirror.internal/runc/releases/download
+      cni:
+        baseURL: https://mirror.internal/plugins/releases/download
+      crictl:
+        baseURL: https://mirror.internal/cri-tools/releases/download
+    packageSources:
+      apt:
+        mirrorURL: http://mirror.internal/ubuntu
+  ssh:
+    host: "10.0.0.50"
+    privateKeyRef:
+      name: ssh-key
+      namespace: unbounded-kube
+```
+
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
 kind: MachineOperation

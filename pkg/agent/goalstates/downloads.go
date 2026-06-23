@@ -30,3 +30,15 @@ type DownloadSource struct {
 	URL     string
 	Version string
 }
+
+// PackageSources optionally overrides OS package repositories used while
+// bootstrapping the nspawn rootfs.
+type PackageSources struct {
+	// APT overrides apt/debootstrap repositories for the Ubuntu rootfs.
+	APT *APTPackageSource
+}
+
+// APTPackageSource configures an Ubuntu apt package mirror.
+type APTPackageSource struct {
+	MirrorURL string
+}

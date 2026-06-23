@@ -368,6 +368,12 @@ type AgentSpec struct {
 	// artifact from its upstream default host.
 	// +optional
 	Downloads *AgentDownloadsSpec `json:"downloads,omitempty"`
+
+	// PackageSources overrides OS package repository endpoints used while
+	// bootstrapping the nspawn rootfs. When unset the agent uses its
+	// built-in Ubuntu package repositories.
+	// +optional
+	PackageSources *AgentPackageSourcesSpec `json:"packageSources,omitempty"`
 }
 
 // AgentDownloadsSpec overrides the download sources for the artifacts the
@@ -423,6 +429,26 @@ type DownloadSource struct {
 	// agent's compiled-in defaults.
 	// +optional
 	Version string `json:"version,omitempty"`
+}
+
+// AgentPackageSourcesSpec overrides OS package repository endpoints used by
+// the agent while bootstrapping the nspawn rootfs.
+type AgentPackageSourcesSpec struct {
+	// APT configures apt/debootstrap package repository endpoints for the
+	// Ubuntu nspawn rootfs.
+	// +optional
+	APT *APTPackageSource `json:"apt,omitempty"`
+}
+
+// APTPackageSource configures the apt package repository for Ubuntu rootfs
+// bootstrap and the sources.list written into the resulting rootfs.
+type APTPackageSource struct {
+	// MirrorURL replaces the Ubuntu archive URL used by debootstrap and
+	// the rootfs apt sources.list (e.g. "http://mirror.internal/ubuntu").
+	// The mirror must serve noble, noble-updates, noble-backports, and
+	// noble-security suites.
+	// +optional
+	MirrorURL string `json:"mirrorURL,omitempty"`
 }
 
 // OperationsSpec defines counter-based operation triggers.

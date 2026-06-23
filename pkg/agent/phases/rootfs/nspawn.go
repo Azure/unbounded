@@ -59,7 +59,12 @@ func (e *ensureNSpawnWorkspace) bootstrapWorkspace(ctx context.Context) error {
 	if image := e.goalState.OCIImage; image != "" {
 		bootstrapTask = oci.DownloadRootFS(e.log, e.goalState.MachineDir, e.goalState.HostArch, image)
 	} else {
-		bootstrapTask = debootstrap.Ubuntu(e.log, e.goalState.MachineDir)
+		var apt *goalstates.APTPackageSource
+		if e.goalState.PackageSources != nil {
+			apt = e.goalState.PackageSources.APT
+		}
+
+		bootstrapTask = debootstrap.Ubuntu(e.log, e.goalState.MachineDir, apt)
 	}
 
 	return phases.ExecuteTask(ctx, e.log, bootstrapTask)

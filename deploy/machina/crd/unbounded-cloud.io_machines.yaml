@@ -206,6 +206,26 @@ spec:
                       nspawn machine (e.g. "ghcr.io/org/repo:tag"). When empty the
                       agent falls back to its built-in default image.
                     type: string
+                  packageSources:
+                    description: |-
+                      PackageSources overrides OS package repository endpoints used while
+                      bootstrapping the nspawn rootfs. When unset the agent uses its
+                      built-in Ubuntu package repositories.
+                    properties:
+                      apt:
+                        description: |-
+                          APT configures apt/debootstrap package repository endpoints for the
+                          Ubuntu nspawn rootfs.
+                        properties:
+                          mirrorURL:
+                            description: |-
+                              MirrorURL replaces the Ubuntu archive URL used by debootstrap and
+                              the rootfs apt sources.list (e.g. "http://mirror.internal/ubuntu").
+                              The mirror must serve noble, noble-updates, noble-backports, and
+                              noble-security suites.
+                            type: string
+                        type: object
+                    type: object
                   url:
                     description: |-
                       URL is a fully qualified download URL for the unbounded-agent

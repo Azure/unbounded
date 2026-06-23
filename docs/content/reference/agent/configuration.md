@@ -44,4 +44,6 @@ command, or authored by hand.
 | `Kubelet.Labels` | Key-value labels applied to the Node on registration. |
 | `Kubelet.RegisterWithTaints` | Taints applied to the Node on registration (`key=value:effect`). |
 | `OCIImage` | *(optional)* OCI image reference for the rootfs. Falls back to debootstrap when empty. |
+| `Downloads` | *(optional)* Rootfs binary download overrides for Kubernetes binaries, containerd, runc, CNI plugins, and crictl. |
+| `PackageSources.APT.MirrorURL` | *(optional)* Ubuntu apt mirror URL used by debootstrap fallback and the rootfs `sources.list`. |
 | `Attest.URL` | *(optional)* Base URL of a metalman serve-pxe instance for TPM attestation. |
