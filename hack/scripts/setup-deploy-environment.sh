@@ -227,14 +227,19 @@ fi
 set_var() {
     local name="$1"
     local value="$2"
+    # GitHub Actions variables cannot be empty (the API returns HTTP 422 on a
+    # missing value). An unset variable already resolves to "" in the workflow,
+    # which is the intended behavior (e.g. a blank ORCA_AZURE_ENDPOINT => the
+    # Orca driver uses the default *.blob.core.windows.net). So skip empties.
+    if [[ -z "$value" ]]; then
+        echo "==> Skipping empty variable $name"
+        return 0
+    fi
     echo "==> Setting variable $name"
-    # Pipe the value via stdin instead of --body: `gh variable set --body ""`
-    # treats an empty value as "no value" on a TTY and prompts interactively
-    # ("Paste your variable"), which would hang non-interactive callers. Stdin
-    # is never a TTY here, so an empty value is stored without prompting.
-    if ! printf '%s' "$value" | gh variable set "$name" \
+    if ! gh variable set "$name" \
             --repo "$REPO" \
-            --env  "$ENV_NAME"; then
+            --env  "$ENV_NAME" \
+            --body "$value"; then
         echo "error: failed to set variable $name" >&2
         exit 3
     fi
