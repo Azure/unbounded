@@ -39,20 +39,19 @@ name: nightly
 #     values (Azure account key and Garage S3 credentials)
 #
 # First-time setup (run once, out of band):
-#   1. Provision the AKS cluster and configure the Environment:
-#        hack/scripts/setup-deploy-environment.sh \
-#          --env-name unbounded-nightly --site-name nightly \
-#          --kubeconfig <path> --cluster-node-cidr ... --cluster-pod-cidr ... \
-#          --site-node-cidr ... --site-pod-cidr ... \
-#          --orca-azure-account ... --orca-azure-container ...
-#      Use CIDRs distinct from unbounded-stable.
-#   2. Pre-create the orca-credentials Secret:
-#        hack/orca/create-credentials-secret.sh ... (against the nightly cluster)
-#   3. Label at least one gateway node:
-#        kubectl label node <n> unbounded-cloud.io/unbounded-net-gateway=true --overwrite
-#   4. Bootstrap once (or let the first scheduled run auto-init, since the
-#      Site CRD is absent on a fresh cluster):
-#        gh workflow run nightly.yaml -f force_init=true
+#   Run the one-shot provisioner, which creates the AKS cluster with forge,
+#   creates the Orca origin, configures this Environment, pre-creates the
+#   orca-credentials Secret, and triggers the first (force_init) deploy:
+#
+#     hack/scripts/setup-nightly-cluster.sh \
+#       --subscription <sub-id> [--location <loc>]
+#
+#   forge provisions the gateway node pool already labeled
+#   unbounded-cloud.io/unbounded-net-gateway=true, so no manual node
+#   labeling is needed. The cluster node/pod CIDRs are auto-detected from
+#   AKS; the site CIDRs default to constants. See the script's --help for
+#   all flags. This workflow must already be on the default branch for the
+#   trigger step to work.
 #
 # Customization points (search for "CUSTOMIZE:" in this file)
 # ------------------------------------------------------------
