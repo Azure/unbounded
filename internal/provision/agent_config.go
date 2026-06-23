@@ -14,14 +14,15 @@ import (
 )
 
 type (
-	AgentConfig        = config.AgentConfig
-	AgentClusterConfig = config.AgentClusterConfig
-	AgentKubeletConfig = config.AgentKubeletConfig
-	KubeletAuthInfo    = config.KubeletAuthInfo
-	CRIConfig          = config.CRIConfig
-	ContainerdConfig   = config.ContainerdConfig
-	RuncConfig         = config.RuncConfig
-	CNIConfig          = config.CNIConfig
+	AgentConfig              = config.AgentConfig
+	AgentClusterConfig       = config.AgentClusterConfig
+	AgentKubeletConfig       = config.AgentKubeletConfig
+	KubeletAuthInfo          = config.KubeletAuthInfo
+	CRIConfig                = config.CRIConfig
+	ContainerdConfig         = config.ContainerdConfig
+	ContainerdRegistryMirror = config.ContainerdRegistryMirror
+	RuncConfig               = config.RuncConfig
+	CNIConfig                = config.CNIConfig
 )
 
 // UnboundedAgentConfig extends the shared AgentConfig with unbounded-specific
@@ -177,6 +178,12 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 		downloads = agentDownloadsFromSpec(machine.Spec.Agent.Downloads)
 	}
 
+	// Resolve containerd registry mirrors from the Machine spec.
+	var registryMirrors []ContainerdRegistryMirror
+	if machine.Spec.Agent != nil {
+		registryMirrors = registryMirrorsFromSpec(machine.Spec.Agent.RegistryMirrors)
+	}
+
 	cfg := UnboundedAgentConfig{
 		AgentConfig: config.AgentConfig{
 			MachineName: machine.Name,
@@ -193,6 +200,11 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 				},
 				Labels:             labels,
 				RegisterWithTaints: taints,
+			},
+			CRI: CRIConfig{
+				Containerd: ContainerdConfig{
+					RegistryMirrors: registryMirrors,
+				},
 			},
 			OCIImage: ociImage,
 		},
@@ -227,6 +239,27 @@ func agentDownloadsFromSpec(spec *v1alpha3.AgentDownloadsSpec) *AgentDownloads {
 	}
 
 	return out
+}
+
+// registryMirrorsFromSpec converts the Machine API RegistryMirrorSpec entries
+// into the agent-facing ContainerdRegistryMirror config. Returns nil when no
+// mirrors are configured so the resulting JSON config remains minimal.
+func registryMirrorsFromSpec(specs []v1alpha3.RegistryMirrorSpec) []ContainerdRegistryMirror {
+	if len(specs) == 0 {
+		return nil
+	}
+
+	mirrors := make([]ContainerdRegistryMirror, 0, len(specs))
+	for i := range specs {
+		mirrors = append(mirrors, ContainerdRegistryMirror{
+			Host:       specs[i].Host,
+			Server:     specs[i].Server,
+			Mirror:     specs[i].Mirror,
+			SkipVerify: specs[i].SkipVerify,
+		})
+	}
+
+	return mirrors
 }
 
 func downloadSourceFromSpec(s *v1alpha3.DownloadSource) *AgentDownloadSource {

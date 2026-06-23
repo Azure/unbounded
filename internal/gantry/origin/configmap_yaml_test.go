@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/origin"
 )
@@ -48,7 +49,18 @@ func TestDefaultConfigMap_StartsCleanWithoutSecret(t *testing.T) {
 		t.Fatalf("repo root: %v", err)
 	}
 
-	yamlPath := filepath.Join(repoRoot, "deploy", "gantry", "configmap.yaml")
+	// deploy/gantry/configmap.yaml.tmpl is a template (parameterized
+	// namespace/image), so render it with default values into a temp
+	// directory before parsing. With no --set values the sprig `default`
+	// fallbacks reproduce the shipped defaults (namespace gantry-system).
+	templatesDir := filepath.Join(repoRoot, "deploy", "gantry")
+
+	renderDir := t.TempDir()
+	if err := render.Render(templatesDir, renderDir, map[string]string{}); err != nil {
+		t.Fatalf("render gantry manifests: %v", err)
+	}
+
+	yamlPath := filepath.Join(renderDir, "configmap.yaml")
 
 	raw, err := os.ReadFile(yamlPath)
 	if err != nil {

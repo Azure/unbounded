@@ -1,6 +1,6 @@
 # ConfigMap carrying the agent's runtime config.yaml.
 #
-# Field reference: internal/config/config.go. The values below are
+# Field reference: internal/gantry/config/config.go. The values below are
 # the defaults from config.NewDefault() with operator-friendly
 # placeholders for the registry list.
 #
@@ -10,7 +10,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: gantry-config
-  namespace: gantry-system
+  namespace: {{ default "gantry-system" .Namespace }}
   labels:
     app.kubernetes.io/name: gantry
 data:

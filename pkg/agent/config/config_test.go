@@ -226,3 +226,166 @@ func TestAgentConfig_BackfillNodeName_UsesHostHostname(t *testing.T) {
 
 	assert.Equal(t, want, cfg.NodeName)
 }
+
+func TestContainerdRegistryMirror_Validate(t *testing.T) {
+	t.Parallel()
+
+	valid := ContainerdRegistryMirror{
+		Host:   "registry.k8s.io",
+		Server: "https://registry.k8s.io",
+		Mirror: "http://127.0.0.1:5000",
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(m *ContainerdRegistryMirror)
+		wantErr string
+	}{
+		{
+			name:   "valid",
+			mutate: func(*ContainerdRegistryMirror) {},
+		},
+		{
+			name:   "host with port",
+			mutate: func(m *ContainerdRegistryMirror) { m.Host = "registry.k8s.io:5000" },
+		},
+		{
+			name:    "empty host",
+			mutate:  func(m *ContainerdRegistryMirror) { m.Host = "" },
+			wantErr: "Host",
+		},
+		{
+			name:    "host with scheme",
+			mutate:  func(m *ContainerdRegistryMirror) { m.Host = "https://registry.k8s.io" },
+			wantErr: "scheme or path",
+		},
+		{
+			name:    "host with path",
+			mutate:  func(m *ContainerdRegistryMirror) { m.Host = "registry.k8s.io/foo" },
+			wantErr: "scheme or path",
+		},
+		{
+			name:    "empty server",
+			mutate:  func(m *ContainerdRegistryMirror) { m.Server = "" },
+			wantErr: "Server",
+		},
+		{
+			name:    "server wrong scheme",
+			mutate:  func(m *ContainerdRegistryMirror) { m.Server = "ftp://registry.k8s.io" },
+			wantErr: "http or https",
+		},
+		{
+			name:    "server missing host",
+			mutate:  func(m *ContainerdRegistryMirror) { m.Server = "https://" },
+			wantErr: "must include a host",
+		},
+		{
+			name:    "mirror missing scheme",
+			mutate:  func(m *ContainerdRegistryMirror) { m.Mirror = "127.0.0.1:5000" },
+			wantErr: "Mirror",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := valid
+			tt.mutate(&m)
+
+			err := m.Validate()
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateRegistryMirrors_DuplicateHost(t *testing.T) {
+	t.Parallel()
+
+	mirrors := []ContainerdRegistryMirror{
+		{Host: "registry.k8s.io", Server: "https://registry.k8s.io", Mirror: "http://127.0.0.1:5000"},
+		{Host: "registry.k8s.io", Server: "https://registry.k8s.io", Mirror: "http://127.0.0.1:5000"},
+	}
+
+	err := ValidateRegistryMirrors(mirrors)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "duplicate Host")
+}
+
+func TestValidateRegistryMirrors_Empty(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, ValidateRegistryMirrors(nil))
+}
+
+func TestRegistryMirrors_JSONRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	cfg := AgentConfig{
+		MachineName: "test",
+		CRI: CRIConfig{
+			Containerd: ContainerdConfig{
+				RegistryMirrors: []ContainerdRegistryMirror{
+					{
+						Host:       "registry.k8s.io",
+						Server:     "https://registry.k8s.io",
+						Mirror:     "http://127.0.0.1:5000",
+						SkipVerify: true,
+					},
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	var decoded AgentConfig
+	require.NoError(t, json.Unmarshal(data, &decoded))
+
+	require.Len(t, decoded.CRI.Containerd.RegistryMirrors, 1)
+	assert.Equal(t, cfg.CRI.Containerd.RegistryMirrors[0], decoded.CRI.Containerd.RegistryMirrors[0])
+}
+
+func TestRegistryMirrors_OmittedWhenEmpty(t *testing.T) {
+	t.Parallel()
+
+	cfg := AgentConfig{MachineName: "test"}
+
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(data, &parsed))
+
+	cri := parsed["CRI"].(map[string]any)
+	containerd := cri["Containerd"].(map[string]any)
+	assert.NotContains(t, containerd, "RegistryMirrors")
+}
+
+func TestAgentConfig_DeepCopyClonesRegistryMirrors(t *testing.T) {
+	t.Parallel()
+
+	original := &AgentConfig{
+		MachineName: "machine-a",
+		CRI: CRIConfig{
+			Containerd: ContainerdConfig{
+				RegistryMirrors: []ContainerdRegistryMirror{
+					{Host: "registry.k8s.io", Server: "https://registry.k8s.io", Mirror: "http://127.0.0.1:5000"},
+				},
+			},
+		},
+	}
+
+	clone := original.DeepCopy()
+	require.Equal(t, original, clone)
+
+	clone.CRI.Containerd.RegistryMirrors[0].Host = "docker.io"
+
+	assert.Equal(t, "registry.k8s.io", original.CRI.Containerd.RegistryMirrors[0].Host)
+}

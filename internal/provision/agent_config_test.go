@@ -253,6 +253,35 @@ func TestBuildAgentConfig(t *testing.T) {
 			},
 		},
 		{
+			name: "registry mirrors from agent spec",
+			params: BuildAgentConfigParams{
+				Machine: &v1alpha3.Machine{
+					ObjectMeta: metav1.ObjectMeta{Name: "mirror-machine"},
+					Spec: v1alpha3.MachineSpec{
+						Agent: &v1alpha3.AgentSpec{
+							RegistryMirrors: []v1alpha3.RegistryMirrorSpec{
+								{
+									Host:       "registry.k8s.io",
+									Server:     "https://registry.k8s.io",
+									Mirror:     "http://127.0.0.1:5000",
+									SkipVerify: true,
+								},
+							},
+						},
+					},
+				},
+			},
+			assert: func(t *testing.T, cfg UnboundedAgentConfig) {
+				require.Len(t, cfg.CRI.Containerd.RegistryMirrors, 1)
+
+				m := cfg.CRI.Containerd.RegistryMirrors[0]
+				require.Equal(t, "registry.k8s.io", m.Host)
+				require.Equal(t, "https://registry.k8s.io", m.Server)
+				require.Equal(t, "http://127.0.0.1:5000", m.Mirror)
+				require.True(t, m.SkipVerify)
+			},
+		},
+		{
 			name: "node name override",
 			params: BuildAgentConfigParams{
 				Machine: &v1alpha3.Machine{
@@ -284,6 +313,7 @@ func TestBuildAgentConfig(t *testing.T) {
 				require.Empty(t, cfg.Kubelet.Labels)
 				require.Nil(t, cfg.Kubelet.RegisterWithTaints)
 				require.Empty(t, cfg.OCIImage)
+				require.Nil(t, cfg.CRI.Containerd.RegistryMirrors)
 			},
 		},
 		{

@@ -66,7 +66,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: gantry
-  namespace: gantry-system
+  namespace: {{ default "gantry-system" .Namespace }}
   labels:
     app.kubernetes.io/name: gantry
     app.kubernetes.io/component: agent
@@ -147,7 +147,7 @@ spec:
               mountPath: /var/lib/gantry/libp2p
       containers:
         - name: gantry
-          image: ghcr.io/vpatelsj/gantry:latest   # override via make image-gantry-local/push (GANTRY_IMAGE)
+          image: {{ default "ghcr.io/azure/gantry:latest" .Image }}
           imagePullPolicy: IfNotPresent
           args:
             - agent

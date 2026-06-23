@@ -112,6 +112,29 @@ func Test_hasDrift_TaintsChange(t *testing.T) {
 	assert.True(t, hasDrift(applied, desired))
 }
 
+func Test_hasDrift_RegistryMirrorsChange(t *testing.T) {
+	applied := baseConfig()
+	desired := baseConfig()
+	desired.CRI.Containerd.RegistryMirrors = []provision.ContainerdRegistryMirror{
+		{Host: "registry.k8s.io", Server: "https://registry.k8s.io", Mirror: "http://127.0.0.1:5000"},
+	}
+	assert.True(t, hasDrift(applied, desired))
+}
+
+func Test_hasDrift_RegistryMirrorsNoChange(t *testing.T) {
+	applied := baseConfig()
+	applied.CRI.Containerd.RegistryMirrors = []provision.ContainerdRegistryMirror{
+		{Host: "registry.k8s.io", Server: "https://registry.k8s.io", Mirror: "http://127.0.0.1:5000"},
+	}
+
+	desired := baseConfig()
+	desired.CRI.Containerd.RegistryMirrors = []provision.ContainerdRegistryMirror{
+		{Host: "registry.k8s.io", Server: "https://registry.k8s.io", Mirror: "http://127.0.0.1:5000"},
+	}
+
+	assert.False(t, hasDrift(applied, desired))
+}
+
 // ---------------------------------------------------------------------------
 // Active machine config serialization
 // ---------------------------------------------------------------------------

@@ -206,6 +206,45 @@ spec:
                       nspawn machine (e.g. "ghcr.io/org/repo:tag"). When empty the
                       agent falls back to its built-in default image.
                     type: string
+                  registryMirrors:
+                    description: |-
+                      RegistryMirrors configures containerd registry mirrors on the
+                      worker node. For each entry the agent writes a hosts.toml file
+                      under /etc/containerd/certs.d/<host>/ pointing the registry at the
+                      mirror endpoint (for example a node-local Gantry pull-through
+                      cache). When empty no mirror files are written.
+                    items:
+                      description: |-
+                        RegistryMirrorSpec configures a single containerd registry mirror written
+                        into the worker node rootfs as /etc/containerd/certs.d/<host>/hosts.toml.
+                      properties:
+                        host:
+                          description: |-
+                            Host is the canonical registry hostname used as the certs.d
+                            directory name (e.g. "registry.k8s.io", "index.docker.io"). It must
+                            be a bare host or host:port with no scheme or path.
+                          type: string
+                        mirror:
+                          description: |-
+                            Mirror is the mirror endpoint containerd tries first (e.g.
+                            "http://127.0.0.1:5000" for a node-local Gantry pod).
+                          type: string
+                        server:
+                          description: |-
+                            Server is the upstream registry URL containerd falls back to when
+                            the mirror cannot serve a request (e.g. "https://registry.k8s.io").
+                          type: string
+                        skipVerify:
+                          description: |-
+                            SkipVerify disables TLS verification for the mirror endpoint. This
+                            is typically set for a loopback http mirror.
+                          type: boolean
+                      required:
+                      - host
+                      - mirror
+                      - server
+                      type: object
+                    type: array
                   url:
                     description: |-
                       URL is a fully qualified download URL for the unbounded-agent

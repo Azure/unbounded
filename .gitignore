@@ -110,3 +110,4 @@ hack/net/templates/*.json
 
 public/
 .hugo_build.lock
+.understand-anything

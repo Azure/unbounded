@@ -160,6 +160,10 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 		return true
 	}
 
+	if !reflect.DeepEqual(applied.CRI.Containerd.RegistryMirrors, desired.CRI.Containerd.RegistryMirrors) {
+		return true
+	}
+
 	return false
 }
 

@@ -5,35 +5,52 @@ the gantry agent as a Kubernetes DaemonSet.
 
 ## Files
 
+The DaemonSet, ServiceAccount/RBAC, and ConfigMap are Go templates
+(`*.yaml.tmpl`) parameterized by namespace and image, rendered the same way
+as the other unbounded components (machina, net). `make gantry-manifests`
+writes the rendered, directly-applyable YAML into `rendered/` (gitignored),
+which is also embedded into the `kubectl-unbounded` binary via `embed.go`.
+
 | File | Purpose |
 | --- | --- |
-| `daemonset.yaml` | One-pod-per-node DaemonSet. |
-| `serviceaccount.yaml` | ServiceAccount + ClusterRole + Role + PriorityClass. |
-| `configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
-| `registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
+| `daemonset.yaml.tmpl` | One-pod-per-node DaemonSet. |
+| `serviceaccount.yaml.tmpl` | Namespace + ServiceAccount + ClusterRole + Role + PriorityClass. |
+| `configmap.yaml.tmpl` | Default `config.yaml` (mirrors `config.NewDefault()`); edit `upstream_registries` per deployment. |
+| `examples/registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
 | `examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
 | `hosts.toml.template` | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
 
 The container image is built from `images/gantry/Containerfile` via
 `make image-gantry-local` (or `make image-gantry-push` to push).
 
-## Apply order
+## Install
+
+The simplest path is to let `kubectl unbounded` install gantry as a bundled
+site component (uses the manifests embedded in the binary):
 
 ```sh
-kubectl apply -f deploy/serviceaccount.yaml
-kubectl apply -f deploy/configmap.yaml
+kubectl unbounded site init --with-gantry ...   # add to an existing site init
+```
+
+To apply the manifests directly, render them first (the `*.yaml.tmpl` files
+are not valid YAML on their own), then apply the output:
+
+```sh
+make gantry-manifests          # writes deploy/gantry/rendered/*.yaml
+kubectl apply -f deploy/gantry/rendered/serviceaccount.yaml
+kubectl apply -f deploy/gantry/rendered/configmap.yaml
 # Operator: for any PRIVATE upstream registry, edit
-# registry-secret.example.yaml (rename it, fill in real
+# examples/registry-secret.example.yaml (rename it, fill in real
 # username:password values keyed by registry `name:`) and apply,
 # AND uncomment the matching `credentials_path:` line in
-# configmap.yaml. The default ConfigMap ships credentials-free so
+# configmap.yaml.tmpl. The default ConfigMap ships credentials-free so
 # the agent starts cleanly against public registries without any
 # Secret being applied - origin.New eagerly reads every
 # credentials_path at startup, so an unmatched path would
 # crashloop the pod.
-kubectl apply -f deploy/registry-secret.example.yaml   # private registries only
-kubectl apply -f deploy/daemonset.yaml
-# deploy/examples/networkpolicy.yaml is a hardening overlay; do NOT
+kubectl apply -f examples/registry-secret.example.yaml   # private registries only
+kubectl apply -f deploy/gantry/rendered/daemonset.yaml
+# examples/networkpolicy.yaml is a hardening overlay; do NOT
 # apply it as part of the initial install. See "Hardening overlays"
 # below for the workflow.
 ```

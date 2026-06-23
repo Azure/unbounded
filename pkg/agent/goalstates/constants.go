@@ -119,6 +119,12 @@ const (
 	ContainerdConfigPath    = "/etc/containerd/config.toml"
 	ContainerdConfDropInDir = "/etc/containerd/conf.d"
 
+	// ContainerdCertsDir is the containerd registry config_path directory.
+	// The agent writes one <host>/hosts.toml per configured registry mirror
+	// under this path in the worker rootfs. It matches the config_path set
+	// in assets/containerd.toml.
+	ContainerdCertsDir = "/etc/containerd/certs.d"
+
 	SystemdUnitKubelet             = "kubelet.service"
 	KubeletKubeconfigPath          = "/var/lib/kubelet/kubeconfig"
 	KubeletBootstrapKubeconfigPath = "/var/lib/kubelet/bootstrap-kubeconfig"

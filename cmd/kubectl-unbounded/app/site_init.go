@@ -73,6 +73,16 @@ type siteInitHandler struct {
 	// machina controller until we have public downloadable releases coming from that repository.
 	machinaManifests string
 
+	// withGantry controls whether the optional gantry peer-to-peer OCI
+	// distribution agent is installed as part of site bootstrap. Defaults
+	// to false; gantry is only installed when explicitly requested.
+	withGantry bool
+
+	// gantryManifests is a path or https URL to gantry manifests to apply.
+	// When empty the manifests embedded in the binary from deploy/gantry/
+	// are used.
+	gantryManifests string
+
 	// manageCniPlugin controls whether unbounded-net manages the CNI plugin
 	// for the site. When false, the Site is configured with manageCniPlugin: false
 	// so that an existing CNI (e.g. Cilium, Calico) handles intra-site networking.
@@ -96,6 +106,8 @@ type siteInitHandler struct {
 	installUnboundedCNI *installUnboundedCNI
 
 	installMachina *installMachina
+
+	installGantry *installGantry
 
 	logger *slog.Logger
 }
@@ -125,6 +137,11 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 
 	h.kubeResourcesCli = kubeResourcesCli
 
+	// Providing an explicit gantry manifest source implies installing gantry.
+	if h.gantryManifests != "" {
+		h.withGantry = true
+	}
+
 	if h.installUnboundedCNI == nil {
 		h.installUnboundedCNI = newInstallUnboundedCNI(
 			h.cniManifests,
@@ -137,6 +154,10 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 
 	if h.installMachina == nil {
 		h.installMachina = newInstallMachina(h.machinaManifests, nil, h.logger, h.kubeResourcesCli, h.kubeCli)
+	}
+
+	if h.withGantry && h.installGantry == nil {
+		h.installGantry = newInstallGantry(h.gantryManifests, nil, h.logger, h.kubeResourcesCli, h.kubeCli)
 	}
 
 	if err := h.ensureUnboundedCNI(ctx); err != nil {
@@ -176,6 +197,12 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 
 	if err := h.ensureMachinaIsRunning(ctx); err != nil {
 		return fmt.Errorf("installing machina controller for site %s: %w", h.name, err)
+	}
+
+	if h.withGantry {
+		if err := h.ensureGantry(ctx); err != nil {
+			return fmt.Errorf("installing gantry for site %s: %w", h.name, err)
+		}
 	}
 
 	return nil
@@ -325,6 +352,29 @@ func (h *siteInitHandler) ensureMachinaIsRunning(ctx context.Context) error {
 	return h.installMachina.run(ctx)
 }
 
+// ensureGantry installs the optional gantry DaemonSet. The gantry bundle ships
+// its own ConfigMap (operator-edited upstream_registries) and Namespace, so
+// unlike machina there is no generated config to apply first. The namespace is
+// pre-applied because the manifest apply order is lexical and the namespaced
+// ConfigMap would otherwise be applied before the Namespace object that lives
+// in the RBAC manifest.
+func (h *siteInitHandler) ensureGantry(ctx context.Context) error {
+	ao := metav1.ApplyOptions{
+		FieldManager: fieldManagerID,
+	}
+
+	nsApply := v1.Namespace(gantryNamespace)
+	if _, err := h.kubeCli.CoreV1().Namespaces().Apply(ctx, nsApply, ao); err != nil {
+		return fmt.Errorf("ensuring namespace %s: %w", gantryNamespace, err)
+	}
+
+	if h.gantryManifests == "" {
+		h.logger.Info("Using embedded gantry manifests")
+	}
+
+	return h.installGantry.run(ctx)
+}
+
 // ensureUnboundedSite sets up the main gateway and the cluster site that encompasses any nodes attached to the
 // main cluster. For each manifest file name in cfg.Manifests it looks up the file from the
 // assets/unbounded-net-site embed.FS, renders it as a Go template with cfg as the data, and applies
@@ -401,6 +451,8 @@ func siteInitCommand() *cobra.Command {
 
 	cmd.Flags().StringVar(&handler.cniManifests, "cni-manifests", "", "Path or https URL to CNI plugin manifests (uses embedded manifests if omitted)")
 	cmd.Flags().StringVar(&handler.machinaManifests, "machina-manifests", "", "Path or https URL to Machina manifests (uses embedded manifests if omitted)")
+	cmd.Flags().BoolVar(&handler.withGantry, "with-gantry", false, "Install the optional gantry peer-to-peer OCI distribution agent")
+	cmd.Flags().StringVar(&handler.gantryManifests, "gantry-manifests", "", "Path or https URL to gantry manifests (uses embedded manifests if omitted; implies --with-gantry)")
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.name, "name", "", "The name of the site")
 	cmd.Flags().StringVar(&handler.clusterNodeCIDR, "cluster-node-cidr", "", "The cluster node cidr")

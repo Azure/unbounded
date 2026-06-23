@@ -368,6 +368,39 @@ type AgentSpec struct {
 	// artifact from its upstream default host.
 	// +optional
 	Downloads *AgentDownloadsSpec `json:"downloads,omitempty"`
+
+	// RegistryMirrors configures containerd registry mirrors on the
+	// worker node. For each entry the agent writes a hosts.toml file
+	// under /etc/containerd/certs.d/<host>/ pointing the registry at the
+	// mirror endpoint (for example a node-local Gantry pull-through
+	// cache). When empty no mirror files are written.
+	// +optional
+	RegistryMirrors []RegistryMirrorSpec `json:"registryMirrors,omitempty"`
+}
+
+// RegistryMirrorSpec configures a single containerd registry mirror written
+// into the worker node rootfs as /etc/containerd/certs.d/<host>/hosts.toml.
+type RegistryMirrorSpec struct {
+	// Host is the canonical registry hostname used as the certs.d
+	// directory name (e.g. "registry.k8s.io", "index.docker.io"). It must
+	// be a bare host or host:port with no scheme or path.
+	// +required
+	Host string `json:"host"`
+
+	// Server is the upstream registry URL containerd falls back to when
+	// the mirror cannot serve a request (e.g. "https://registry.k8s.io").
+	// +required
+	Server string `json:"server"`
+
+	// Mirror is the mirror endpoint containerd tries first (e.g.
+	// "http://127.0.0.1:5000" for a node-local Gantry pod).
+	// +required
+	Mirror string `json:"mirror"`
+
+	// SkipVerify disables TLS verification for the mirror endpoint. This
+	// is typically set for a loopback http mirror.
+	// +optional
+	SkipVerify bool `json:"skipVerify,omitempty"`
 }
 
 // AgentDownloadsSpec overrides the download sources for the artifacts the

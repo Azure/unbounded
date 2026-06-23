@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
@@ -108,6 +109,8 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
 
+	out.CRI.Containerd.RegistryMirrors = slices.Clone(a.CRI.Containerd.RegistryMirrors)
+
 	return &out
 }
 
@@ -172,6 +175,121 @@ type CRIConfig struct {
 type ContainerdConfig struct {
 	// Version overrides the default containerd version (e.g. "2.1.8").
 	Version string `json:"Version,omitempty"`
+
+	// RegistryMirrors configures containerd registry mirror hosts. For
+	// each entry the agent writes a hosts.toml file under
+	// /etc/containerd/certs.d/<Host>/ in the worker rootfs, pointing the
+	// registry at the configured Mirror endpoint. This is the containerd
+	// mechanism a local pull-through cache such as Gantry plugs into.
+	RegistryMirrors []ContainerdRegistryMirror `json:"RegistryMirrors,omitempty"`
+}
+
+// ContainerdRegistryMirror describes a single containerd registry mirror.
+// It maps to a /etc/containerd/certs.d/<Host>/hosts.toml file in the worker
+// node rootfs.
+type ContainerdRegistryMirror struct {
+	// Host is the canonical registry hostname used as the certs.d
+	// directory name (e.g. "registry.k8s.io", "index.docker.io"). It must
+	// be a bare host or host:port with no scheme or path.
+	Host string `json:"Host"`
+
+	// Server is the upstream registry URL containerd falls back to when
+	// the mirror cannot serve a request (e.g. "https://registry.k8s.io").
+	Server string `json:"Server"`
+
+	// Mirror is the mirror endpoint containerd tries first (e.g.
+	// "http://127.0.0.1:5000" for a node-local Gantry pod).
+	Mirror string `json:"Mirror"`
+
+	// SkipVerify disables TLS verification for the mirror endpoint. This
+	// is typically set for a loopback http mirror.
+	SkipVerify bool `json:"SkipVerify,omitempty"`
+}
+
+// Validate checks that a registry mirror has a well-formed host, server URL,
+// and mirror URL. It rejects malformed inputs rather than letting them flow
+// into a certs.d directory path.
+func (m *ContainerdRegistryMirror) Validate() error {
+	if err := validateRegistryHost(m.Host); err != nil {
+		return fmt.Errorf("invalid Host %q: %w", m.Host, err)
+	}
+
+	if err := validateAbsoluteHTTPURL(m.Server); err != nil {
+		return fmt.Errorf("invalid Server %q: %w", m.Server, err)
+	}
+
+	if err := validateAbsoluteHTTPURL(m.Mirror); err != nil {
+		return fmt.Errorf("invalid Mirror %q: %w", m.Mirror, err)
+	}
+
+	return nil
+}
+
+// ValidateRegistryMirrors validates every mirror and rejects duplicate hosts.
+func ValidateRegistryMirrors(mirrors []ContainerdRegistryMirror) error {
+	seen := make(map[string]struct{}, len(mirrors))
+
+	for i := range mirrors {
+		if err := mirrors[i].Validate(); err != nil {
+			return fmt.Errorf("registry mirror %d: %w", i, err)
+		}
+
+		host := mirrors[i].Host
+		if _, dup := seen[host]; dup {
+			return fmt.Errorf("registry mirror %d: duplicate Host %q", i, host)
+		}
+
+		seen[host] = struct{}{}
+	}
+
+	return nil
+}
+
+// validateRegistryHost ensures host is a bare hostname or host:port with no
+// scheme or path component, so it is safe to use as a certs.d directory name.
+func validateRegistryHost(host string) error {
+	if host == "" {
+		return errors.New("must not be empty")
+	}
+
+	if strings.Contains(host, "://") || strings.Contains(host, "/") {
+		return errors.New("must be a bare host or host:port with no scheme or path")
+	}
+
+	// Parse as a network-path reference so an optional :port is handled.
+	u, err := url.Parse("//" + host)
+	if err != nil {
+		return fmt.Errorf("invalid host: %w", err)
+	}
+
+	if u.Host != host || u.Path != "" {
+		return errors.New("must be a bare host or host:port with no scheme or path")
+	}
+
+	return nil
+}
+
+// validateAbsoluteHTTPURL ensures raw is an absolute http or https URL with a
+// host component.
+func validateAbsoluteHTTPURL(raw string) error {
+	if raw == "" {
+		return errors.New("must not be empty")
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("must be an http or https URL")
+	}
+
+	if u.Host == "" {
+		return errors.New("must include a host")
+	}
+
+	return nil
 }
 
 // RuncConfig holds runc-specific overrides.
