@@ -251,37 +251,6 @@ the same download, decompression, verification, or registry code paths as
 bootstrap. Temporary state must be cleaned up before the check returns and must
 not change durable host state.
 
-### Relationship to phases.Task
-
-The existing bootstrap executor is built around `phases.Task`:
-
-```go
-type Task interface {
-    Name() string
-    Do(ctx context.Context) error
-}
-```
-
-The current task model is a good execution model for bootstrap phases, but it is
-not the right interface to run preflight checks directly:
-
-- `Do` returns only one fatal error, while preflight needs warnings and errors.
-- `phases.Serial` stops on the first error, while preflight should collect all
-  applicable findings before returning.
-- `phases.Parallel` cancels remaining tasks on the first error, which is useful
-  for bootstrap but loses diagnostic information for preflight.
-- Existing phase tasks are intentionally mutating. For example,
-  `host.InstallPackages` installs packages, `host.ConfigureOS` writes sysctl
-  config and runs `sysctl --system`, `host.ConfigureNFTables` writes and starts
-  a systemd unit, `host.DisableSwap` runs `swapoff`, rootfs tasks download and
-  install binaries, and nodestart tasks start the nspawn machine and services.
-- The preflight command must be non-mutating.
-
-Preflight should therefore define its own checker interface and runner. It can
-still reuse the same ideas as `phases.Task`: stable names, serial/parallel
-composition, elapsed-time logging when useful, and small units with explicit
-dependencies.
-
 ### Phase-aligned organization
 
 Preflight checks should be grouped around the same conceptual phases and task
