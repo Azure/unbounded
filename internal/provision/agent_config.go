@@ -4,6 +4,7 @@
 package provision
 
 import (
+	"fmt"
 	"maps"
 	"strings"
 
@@ -216,6 +217,22 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 	}
 
 	return cfg
+}
+
+// ValidateAgentConfig verifies the agent config fields that are produced from
+// external Machine inputs before they are serialized for the agent runtime.
+func ValidateAgentConfig(cfg UnboundedAgentConfig) error {
+	if cfg.Kubelet.Auth.BootstrapToken != "" || cfg.Kubelet.Auth.ExecCredential != nil {
+		if err := cfg.Kubelet.Auth.Validate(); err != nil {
+			return fmt.Errorf("kubelet auth: %w", err)
+		}
+	}
+
+	if err := config.ValidateRegistryMirrors(cfg.CRI.Containerd.RegistryMirrors); err != nil {
+		return fmt.Errorf("containerd registry mirrors: %w", err)
+	}
+
+	return nil
 }
 
 // agentDownloadsFromSpec converts the Machine API AgentDownloadsSpec into

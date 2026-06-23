@@ -112,7 +112,7 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		return provision.UnboundedAgentConfig{}, err
 	}
 
-	return provision.BuildAgentConfig(provision.BuildAgentConfigParams{
+	agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
 		Machine: machine,
 		Cluster: provision.ClusterEndpoint{
 			APIServer:    clusterInfo.APIServer,
@@ -123,7 +123,13 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		ProviderLabels: clusterInfo.ProviderLabels,
 		BootstrapToken: bootstrapToken,
 		NodeName:       machine.Name,
-	}), nil
+	})
+
+	if err := provision.ValidateAgentConfig(agentConfig); err != nil {
+		return provision.UnboundedAgentConfig{}, fmt.Errorf("validate agent config: %w", err)
+	}
+
+	return agentConfig, nil
 }
 
 func (r *MachineOperationReconciler) clusterInfo(ctx context.Context) (*ClusterInfo, error) {

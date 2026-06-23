@@ -129,6 +129,9 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 				ProviderLabels: f.ProviderLabels,
 				AttestURL:      f.ServeURL,
 			})
+			if err := provision.ValidateAgentConfig(agentConfig); err != nil {
+				return nil, fmt.Errorf("validate agent config: %w", err)
+			}
 
 			// The MarshalIndent prefix "    " (4 spaces) must match the
 			// indentation level of the {{ .AgentConfigJSON }} placeholder

@@ -385,16 +385,19 @@ type RegistryMirrorSpec struct {
 	// directory name (e.g. "registry.k8s.io", "index.docker.io"). It must
 	// be a bare host or host:port with no scheme or path.
 	// +required
+	// +kubebuilder:validation:MinLength=1
 	Host string `json:"host"`
 
 	// Server is the upstream registry URL containerd falls back to when
 	// the mirror cannot serve a request (e.g. "https://registry.k8s.io").
 	// +required
+	// +kubebuilder:validation:MinLength=1
 	Server string `json:"server"`
 
 	// Mirror is the mirror endpoint containerd tries first (e.g.
 	// "http://127.0.0.1:5000" for a node-local Gantry pod).
 	// +required
+	// +kubebuilder:validation:MinLength=1
 	Mirror string `json:"mirror"`
 
 	// SkipVerify disables TLS verification for the mirror endpoint. This

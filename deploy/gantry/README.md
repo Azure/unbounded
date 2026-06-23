@@ -8,7 +8,7 @@ the gantry agent as a Kubernetes DaemonSet.
 The DaemonSet, ServiceAccount/RBAC, and ConfigMap are Go templates
 (`*.yaml.tmpl`) parameterized by namespace and image, rendered the same way
 as the other unbounded components (machina, net). `make gantry-manifests`
-writes the rendered, directly-applyable YAML into `rendered/` (gitignored),
+writes the rendered, directly-applicable YAML into `rendered/` (gitignored),
 which is also embedded into the `kubectl-unbounded` binary via `embed.go`.
 
 | File | Purpose |

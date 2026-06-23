@@ -252,6 +252,10 @@ func validateRegistryHost(host string) error {
 		return errors.New("must not be empty")
 	}
 
+	if host == "." || host == ".." {
+		return errors.New("must be a safe certs.d path segment")
+	}
+
 	if strings.Contains(host, "://") || strings.Contains(host, "/") {
 		return errors.New("must be a bare host or host:port with no scheme or path")
 	}

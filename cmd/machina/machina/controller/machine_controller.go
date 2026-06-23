@@ -349,6 +349,11 @@ func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *
 			fmt.Sprintf("Failed to get bootstrap token: %v", err))
 	}
 
+	if err := provision.ValidateAgentConfig(r.buildAgentConfig(machine, bootstrapToken)); err != nil {
+		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseFailed,
+			fmt.Sprintf("Invalid agent config: %v", err))
+	}
+
 	// Set phase to Provisioning and record when provisioning started.
 	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
 		Type:    unboundedv1alpha3.MachineConditionProvisioning,
@@ -557,37 +562,10 @@ func (r *MachineReconciler) provisionMachine(
 	}()
 
 	// Step 3: Build the agent config and upload it as JSON.
-	k8sVersion := ""
-	if r.ClusterInfo != nil {
-		k8sVersion = r.ClusterInfo.KubeVersion
+	agentConfig := r.buildAgentConfig(machine, bootstrapToken)
+	if err := provision.ValidateAgentConfig(agentConfig); err != nil {
+		return fmt.Errorf("validate agent config: %w", err)
 	}
-
-	apiServer := ""
-	caCertBase64 := ""
-	clusterDNS := ""
-
-	if r.ClusterInfo != nil {
-		apiServer = r.ClusterInfo.APIServer
-		caCertBase64 = r.ClusterInfo.CACertBase64
-		clusterDNS = r.ClusterInfo.ClusterDNS
-	}
-
-	var providerLabels map[string]string
-	if r.ClusterInfo != nil && r.ClusterInfo.Provider != nil {
-		providerLabels = r.ClusterInfo.Provider.DefaultLabels()
-	}
-
-	agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
-		Machine: machine,
-		Cluster: provision.ClusterEndpoint{
-			APIServer:    apiServer,
-			CACertBase64: caCertBase64,
-			ClusterDNS:   clusterDNS,
-			KubeVersion:  k8sVersion,
-		},
-		ProviderLabels: providerLabels,
-		BootstrapToken: bootstrapToken,
-	})
 
 	configJSON, err := json.Marshal(agentConfig)
 	if err != nil {
@@ -639,6 +617,38 @@ func (r *MachineReconciler) provisionMachine(
 	logger.Info("Agent install script completed", "machine", machine.Name, "stdout", stdout.String(), "stderr", stderr.String())
 
 	return nil
+}
+
+func (r *MachineReconciler) buildAgentConfig(machine *unboundedv1alpha3.Machine, bootstrapToken string) provision.UnboundedAgentConfig {
+	k8sVersion := ""
+	apiServer := ""
+	caCertBase64 := ""
+	clusterDNS := ""
+
+	var providerLabels map[string]string
+
+	if r.ClusterInfo != nil {
+		k8sVersion = r.ClusterInfo.KubeVersion
+		apiServer = r.ClusterInfo.APIServer
+		caCertBase64 = r.ClusterInfo.CACertBase64
+		clusterDNS = r.ClusterInfo.ClusterDNS
+
+		if r.ClusterInfo.Provider != nil {
+			providerLabels = r.ClusterInfo.Provider.DefaultLabels()
+		}
+	}
+
+	return provision.BuildAgentConfig(provision.BuildAgentConfigParams{
+		Machine: machine,
+		Cluster: provision.ClusterEndpoint{
+			APIServer:    apiServer,
+			CACertBase64: caCertBase64,
+			ClusterDNS:   clusterDNS,
+			KubeVersion:  k8sVersion,
+		},
+		ProviderLabels: providerLabels,
+		BootstrapToken: bootstrapToken,
+	})
 }
 
 // dialViaBastion establishes an SSH connection through a bastion host.

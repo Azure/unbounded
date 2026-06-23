@@ -255,6 +255,16 @@ func TestContainerdRegistryMirror_Validate(t *testing.T) {
 			wantErr: "Host",
 		},
 		{
+			name:    "host current directory",
+			mutate:  func(m *ContainerdRegistryMirror) { m.Host = "." },
+			wantErr: "safe certs.d path segment",
+		},
+		{
+			name:    "host parent directory",
+			mutate:  func(m *ContainerdRegistryMirror) { m.Host = ".." },
+			wantErr: "safe certs.d path segment",
+		},
+		{
 			name:    "host with scheme",
 			mutate:  func(m *ContainerdRegistryMirror) { m.Host = "https://registry.k8s.io" },
 			wantErr: "scheme or path",

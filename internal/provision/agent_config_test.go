@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
@@ -420,6 +421,83 @@ func TestBuildAgentConfig(t *testing.T) {
 
 			cfg := BuildAgentConfig(tt.params)
 			tt.assert(t, cfg)
+		})
+	}
+}
+
+func TestValidateAgentConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		cfg     UnboundedAgentConfig
+		wantErr string
+	}{
+		{
+			name: "bootstrap auth and valid mirror",
+			cfg: UnboundedAgentConfig{
+				AgentConfig: AgentConfig{
+					Kubelet: AgentKubeletConfig{
+						Auth: KubeletAuthInfo{BootstrapToken: "abc123.secret456"},
+					},
+					CRI: CRIConfig{
+						Containerd: ContainerdConfig{
+							RegistryMirrors: []ContainerdRegistryMirror{
+								{Host: "registry.k8s.io", Server: "https://registry.k8s.io", Mirror: "http://127.0.0.1:5000"},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "attestation config can defer kubelet auth",
+			cfg: UnboundedAgentConfig{
+				Attest: &AgentAttestConfig{URL: "http://10.0.0.1:8880"},
+			},
+		},
+		{
+			name: "invalid kubelet auth",
+			cfg: UnboundedAgentConfig{
+				AgentConfig: AgentConfig{
+					Kubelet: AgentKubeletConfig{
+						Auth: KubeletAuthInfo{
+							BootstrapToken: "abc123.secret456",
+							ExecCredential: &clientcmdapi.ExecConfig{},
+						},
+					},
+				},
+			},
+			wantErr: "mutually exclusive",
+		},
+		{
+			name: "invalid registry mirror",
+			cfg: UnboundedAgentConfig{
+				AgentConfig: AgentConfig{
+					CRI: CRIConfig{
+						Containerd: ContainerdConfig{
+							RegistryMirrors: []ContainerdRegistryMirror{
+								{Host: "..", Server: "https://registry.k8s.io", Mirror: "http://127.0.0.1:5000"},
+							},
+						},
+					},
+				},
+			},
+			wantErr: "safe certs.d path segment",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := ValidateAgentConfig(tt.cfg)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }

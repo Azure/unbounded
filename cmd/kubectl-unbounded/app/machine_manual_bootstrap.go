@@ -312,7 +312,11 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		ProviderLabels: providerLabels,
 		BootstrapToken: bootstrapToken,
 	})
+
 	cfg.Kubelet.NodeIP = strings.TrimSpace(h.nodeIP)
+	if err := provision.ValidateAgentConfig(cfg); err != nil {
+		return nil, fmt.Errorf("validate agent config: %w", err)
+	}
 
 	return &cfg, nil
 }

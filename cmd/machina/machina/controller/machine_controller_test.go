@@ -469,6 +469,52 @@ func TestMachineReconciler_Provisioning_ProvisionerFails(t *testing.T) {
 	require.Equal(t, "Failed", provingCond.Reason)
 }
 
+func TestMachineReconciler_Provisioning_InvalidRegistryMirrorFailsBeforeProvisioner(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	machine := newTestMachine("test-machine", "10.0.0.1:22", "testuser", defaultKubernetes())
+	machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{
+		RegistryMirrors: []unboundedv1alpha3.RegistryMirrorSpec{
+			{Host: "..", Server: "https://registry.k8s.io", Mirror: "http://127.0.0.1:5000"},
+		},
+	}
+
+	sshSecret := newSSHKeySecret(t, "ssh-key-secret")
+	bootstrapSecret := newBootstrapTokenSecret("bootstrap-token-abc123")
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine, sshSecret, bootstrapSecret).
+		WithStatusSubresource(machine).
+		Build()
+
+	provisioner := &mockProvisioner{}
+	reconciler := &MachineReconciler{
+		Client:              fakeClient,
+		Scheme:              s,
+		ReachabilityChecker: &mockReachabilityChecker{},
+		Provisioner:         provisioner,
+		ClusterInfo:         &ClusterInfo{},
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-machine"}}
+
+	result, err := reconciler.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, RequeueAfterFailed, result.RequeueAfter)
+	require.False(t, provisioner.called, "provisioner should not be called with invalid agent config")
+
+	var updated unboundedv1alpha3.Machine
+
+	err = fakeClient.Get(context.Background(), req.NamespacedName, &updated)
+	require.NoError(t, err)
+	require.Equal(t, unboundedv1alpha3.MachinePhaseFailed, updated.Status.Phase)
+	require.Contains(t, updated.Status.Message, "Invalid agent config")
+	require.Contains(t, updated.Status.Message, "safe certs.d path segment")
+}
+
 func TestMachineReconciler_Provisioning_JoiningSkipsReProvision(t *testing.T) {
 	t.Parallel()
 
