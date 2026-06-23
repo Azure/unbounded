@@ -117,37 +117,60 @@ about unbounded-storage's HTTP protocol quirks.
 
 **Wire behavior the shim hides:**
 
-| unbounded-storage wire behavior | `ifaces.OriginPuller` translation |
-|---|---|
-| `200 OK` + body | `(ReadCloser, Content-Length, nil)` |
-| Connection closed before any response (cache miss or internal error) | `*OriginError{Class: FailureNotFound}` |
-| Connection refused / timeout | `*OriginError{Class: FailureTransient}` |
-| Non-200 HTTP status (400, 405, etc.) | `*OriginError{Class: FailureTransient}` |
+| unbounded-storage wire behavior | Go error seen by `http.Client` | `ifaces.OriginPuller` translation |
+|---|---|---|
+| `200 OK` + body | `nil` | `(ReadCloser, Content-Length, nil)` |
+| Connection closed before any response bytes (cache miss) | `io.ErrUnexpectedEOF` or `io.EOF` on response read | `*OriginError{Class: FailureNotFound}` |
+| Connection refused | `*net.OpError` with `syscall.ECONNREFUSED` | `*OriginError{Class: FailureTransient}` |
+| Timeout (context or `Timeout`) | `context.DeadlineExceeded` or `*url.Error` with `Timeout() == true` | `*OriginError{Class: FailureTransient}` |
+| Non-200 HTTP status (400, 405, etc.) | `nil` (status on response) | `*OriginError{Class: FailureTransient}` |
 
 The connection-close-before-response is how unbounded-storage signals a cache
-miss (it does not return a 404). The shim normalises this to `FailureNotFound`
+miss. Its HTTP frontend (`cmd/unbounded-storage/src/frontend/http_serve.rs`)
+calls `read_object_length()` before writing any response bytes; on a miss this
+returns `Err(())` and the connection handler closes the socket without sending
+HTTP headers. The Go `http.Client` surfaces this as `io.ErrUnexpectedEOF` (or
+`io.EOF` when the server closes cleanly). The shim maps both to `FailureNotFound`
 so `PriorityChain` treats it as a clean miss and advances to the next entry.
-If unbounded-storage later adds a proper 404 or changes protocol, only this
-package changes - gantry's interfaces and chain logic are untouched.
+If unbounded-storage later adds a proper 404, only this package changes - gantry's
+interfaces and chain logic are untouched.
 
 - `client.go` - `Client struct`:
   - `New(endpoint string, timeout time.Duration, opts ...Option) *Client`
   - `Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error)`
-    - Sends `GET <endpoint>/<digest>` to the local unbounded-storage HTTP frontend.
+    - Constructs the OCI Distribution Spec path from `ref` (see URL path table
+      below) and sends `GET <endpoint><path>` to the local unbounded-storage
+      HTTP frontend.
     - `200`: returns body and `Content-Length`.
-    - Connection closed before response headers: `*OriginError{Class: FailureNotFound}`.
+    - Connection closed before response headers (Go client receives
+      `io.ErrUnexpectedEOF` or `io.EOF` when reading the response):
+      `*OriginError{Class: FailureNotFound}`.
     - Connection refused, timeout, or non-200 status: `*OriginError{Class: FailureTransient}`.
   - `Head(ctx context.Context, ref ifaces.OriginRef) (int64, string, error)`
-    - Sends `HEAD <endpoint>/<digest>`. Returns `(size, Content-Type, nil)` on 200.
+    - Same path construction; sends HEAD. Returns `(size, Content-Type, nil)` on 200.
     - Same miss/error classification as `Pull`.
   - Optional functional options: `WithLogger`, `WithMetrics(backend string)`.
     The `backend` string is set to the `Type` from config and becomes the label
     value on the shared metric counters.
   - Compile-time check: `var _ ifaces.OriginPuller = (*Client)(nil)`.
 
-**URL path:** the digest string (e.g. `sha256:abcdef...`) is used as the path.
-This must match the key scheme under which content was stored in unbounded-storage;
-that is a deployment/operator concern outside this package.
+**URL path construction:** the shim builds the OCI Distribution Spec path from
+`OriginRef` - identical to the path an OCI registry client would request:
+
+| `ref.Kind`                   | Path                                            |
+|------------------------------|-------------------------------------------------|
+| `KindBlob`, `KindConfig` (0) | `/v2/<ref.Repository>/blobs/<ref.Digest>`       |
+| `KindManifest` (1)           | `/v2/<ref.Repository>/manifests/<ref.Digest>`   |
+
+Full URL example: `http://127.0.0.1:8080/v2/library/nginx/blobs/sha256:abc...`
+
+This path is also what unbounded-storage uses as `origin_object_id` when it fetches
+from its upstream registry backend on a miss (`<backend_url><path>`), so the path
+gantry sends must be the full OCI blob/manifest URL - not just the digest.
+
+`ref.Registry` is NOT included in the URL path. It identifies which upstream registry
+gantry is targeting; unbounded-storage's backend binding is a deployment/operator
+concern outside this package.
 
 #### `internal/gantry/origin/chain.go`
 
@@ -278,9 +301,14 @@ availability.
 Table-driven tests against `httptest.NewServer` and a deliberately closed
 listener (to simulate connection-close-before-response):
 
-- `Pull` on 200: returns body and correct content-length.
-- `Pull` when server closes connection before sending response headers
-  (the unbounded-storage miss signal): returns `*OriginError{Class: FailureNotFound}`.
+- `Pull` on 200: returns body and correct content-length; URL path is the full
+  OCI path (`/v2/<repo>/blobs/<digest>` for blobs, `/v2/<repo>/manifests/<digest>`
+  for manifests).
+- `Pull` when server closes connection before sending any response headers
+  (the unbounded-storage miss signal, Go sees `io.ErrUnexpectedEOF`):
+  returns `*OriginError{Class: FailureNotFound}`.
+- `Pull` when server closes cleanly before response (Go sees `io.EOF`):
+  returns `*OriginError{Class: FailureNotFound}`.
 - `Pull` on connection refused: returns `*OriginError{Class: FailureTransient}`.
 - `Pull` on non-200 status (e.g. 400): returns `*OriginError{Class: FailureTransient}`.
 - `Head` on 200: returns size and Content-Type.
