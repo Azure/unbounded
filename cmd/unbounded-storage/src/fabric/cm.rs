@@ -537,18 +537,20 @@ fn encode_connect_addr(dest: &FabricAddress) -> Result<Vec<u8>> {
 
 fn active_info_for_dest(
     info: *mut ffi::fi_info,
-    _dest: &FabricAddress,
+    dest: &FabricAddress,
     dest_addr: &[u8],
 ) -> Result<Option<FreeInfoGuard>> {
-    let active = unsafe {
-        ffi::ub_fi_dupinfo_with_dest(
-            info,
-            dest_addr.as_ptr() as *const std::ffi::c_void,
-            dest_addr.len(),
-        )
+    let addr = dest_addr.as_ptr() as *const std::ffi::c_void;
+    let active = match dest {
+        FabricAddress::Socket(_) => unsafe {
+            ffi::ub_fi_dupinfo_with_sockaddr(info, addr, dest_addr.len())
+        },
+        FabricAddress::Native(_) => unsafe {
+            ffi::ub_fi_dupinfo_with_native_addr(info, addr, dest_addr.len())
+        },
     };
     if active.is_null() {
-        return Err(FabricError::Pkg("ub_fi_dupinfo_with_dest", 0));
+        return Err(FabricError::Pkg("ub_fi_dupinfo_with_dest_addr", 0));
     }
     Ok(Some(FreeInfoGuard(active)))
 }
@@ -888,6 +890,50 @@ mod tests {
         assert_eq!(rc, 0, "fi_domain failed");
 
         (info, fabric, domain)
+    }
+
+    #[test]
+    fn format_sockaddr_rejects_short_buffer() {
+        let addr = [0u8];
+        let mut out = [0i8; 8];
+        let rc = unsafe {
+            ffi::ub_fi_format_sockaddr(
+                addr.as_ptr() as *const std::ffi::c_void,
+                addr.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert!(rc < 0, "short sockaddr buffer must be rejected");
+    }
+
+    #[test]
+    fn native_dest_addr_rejects_short_buffer() {
+        if std::env::var_os("FABRIC_SKIP_FFI").is_some() {
+            eprintln!("FABRIC_SKIP_FFI set; skipping native dest addr test");
+            return;
+        }
+        if !tcp_msg_available() {
+            eprintln!("libfabric tcp MSG provider unavailable; skipping native dest addr test");
+            return;
+        }
+
+        let (info, fabric, domain) = getinfo_tcp_msg(None, None, false);
+        let addr = [0u8];
+        let copy = unsafe {
+            ffi::ub_fi_dupinfo_with_native_addr(
+                info,
+                addr.as_ptr() as *const std::ffi::c_void,
+                addr.len(),
+            )
+        };
+        assert!(copy.is_null(), "short native address must be rejected");
+
+        unsafe {
+            let _ = ffi::ub_fi_close(ffi::as_fid_domain(domain));
+            let _ = ffi::ub_fi_close(ffi::as_fid_fabric(fabric));
+            ffi::fi_freeinfo(info);
+        }
     }
 
     #[test]

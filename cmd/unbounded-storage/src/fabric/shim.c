@@ -69,9 +69,9 @@ int ub_fi_endpoint(struct fid_domain *domain, struct fi_info *info,
     return fi_endpoint(domain, info, ep, context);
 }
 
-struct fi_info *ub_fi_dupinfo_with_dest(const struct fi_info *base,
-                                        const void *dest_addr,
-                                        size_t dest_addrlen) {
+static struct fi_info *ub_fi_dupinfo_with_dest_format(
+    const struct fi_info *base, const void *dest_addr, size_t dest_addrlen,
+    uint32_t addr_format) {
     if (!base || !dest_addr || dest_addrlen == 0) {
         return NULL;
     }
@@ -91,21 +91,45 @@ struct fi_info *ub_fi_dupinfo_with_dest(const struct fi_info *base,
     free(copy->dest_addr);
     copy->dest_addr = dest;
     copy->dest_addrlen = dest_addrlen;
+    copy->addr_format = addr_format;
+
+    return copy;
+}
+
+struct fi_info *ub_fi_dupinfo_with_sockaddr(const struct fi_info *base,
+                                            const void *dest_addr,
+                                            size_t dest_addrlen) {
+    if (!dest_addr || dest_addrlen < sizeof(sa_family_t)) {
+        return NULL;
+    }
 
     const struct sockaddr *sa = (const struct sockaddr *)dest_addr;
     switch (sa->sa_family) {
     case AF_INET:
-        copy->addr_format = FI_SOCKADDR_IN;
-        break;
+        if (dest_addrlen < sizeof(struct sockaddr_in)) {
+            return NULL;
+        }
+        return ub_fi_dupinfo_with_dest_format(base, dest_addr, dest_addrlen,
+                                              FI_SOCKADDR_IN);
     case AF_INET6:
-        copy->addr_format = FI_SOCKADDR_IN6;
-        break;
+        if (dest_addrlen < sizeof(struct sockaddr_in6)) {
+            return NULL;
+        }
+        return ub_fi_dupinfo_with_dest_format(base, dest_addr, dest_addrlen,
+                                              FI_SOCKADDR_IN6);
     default:
-        copy->addr_format = FI_SOCKADDR_IB;
-        break;
+        return NULL;
     }
+}
 
-    return copy;
+struct fi_info *ub_fi_dupinfo_with_native_addr(const struct fi_info *base,
+                                               const void *dest_addr,
+                                               size_t dest_addrlen) {
+    if (!dest_addr || dest_addrlen < sizeof(sa_family_t)) {
+        return NULL;
+    }
+    return ub_fi_dupinfo_with_dest_format(base, dest_addr, dest_addrlen,
+                                          FI_SOCKADDR_IB);
 }
 
 int ub_fi_domain(struct fid_fabric *fabric, struct fi_info *info,
@@ -768,8 +792,14 @@ ssize_t ub_fi_format_sockaddr(const void *addr, size_t addrlen, char *out,
     if (!addr || !out || cap == 0) {
         return -FI_EINVAL;
     }
+    if (addrlen < sizeof(sa_family_t)) {
+        out[0] = '\0';
+        return -FI_EINVAL;
+    }
     sa_family_t family = ((const struct sockaddr *)addr)->sa_family;
-    if (family != AF_INET && family != AF_INET6) {
+    if ((family == AF_INET && addrlen < sizeof(struct sockaddr_in)) ||
+        (family == AF_INET6 && addrlen < sizeof(struct sockaddr_in6)) ||
+        (family != AF_INET && family != AF_INET6)) {
         out[0] = '\0';
         return -FI_EINVAL;
     }
