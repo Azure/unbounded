@@ -23,6 +23,11 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# This script is meant to run non-interactively (it is also invoked by
+# setup-nightly-cluster.sh). Disable gh's pager so the secret/variable list
+# summaries below never drop the caller into an interactive pager.
+export GH_PAGER=cat
+
 REPO="Azure/unbounded"
 MANAGE_CNI_PLUGIN="true"
 ASSUME_YES="false"
