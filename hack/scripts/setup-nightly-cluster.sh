@@ -84,6 +84,7 @@ ORCA_AZURE_ENDPOINT=""
 
 ASSUME_YES="false"
 WATCH="true"
+TRIGGER="true"
 
 # Populated by ensure_cluster.
 RESOURCE_GROUP=""
@@ -135,6 +136,10 @@ Flags:
   --gateway-pool-node-sku SKU forge gateway pool VM SKU
 
   --no-watch                 Trigger the deploy run but do not wait for it
+  --no-trigger               Provision only; do not trigger the deploy run.
+                             Use this to test the workflow from a branch before
+                             it is on the default branch: provision, then push
+                             the branch to fire its push-triggered run.
   --yes                      Skip confirmation prompts
   --help                     Show this help
 EOF
@@ -209,6 +214,7 @@ while [[ $# -gt 0 ]]; do
     --system-pool-node-sku)    require_value "$1" "${2:-}"; SYSTEM_POOL_NODE_SKU="$2"; shift 2 ;;
     --gateway-pool-node-sku)   require_value "$1" "${2:-}"; GATEWAY_POOL_NODE_SKU="$2"; shift 2 ;;
     --no-watch)                WATCH="false"; shift ;;
+    --no-trigger)              TRIGGER="false"; shift ;;
     --yes)                     ASSUME_YES="true"; shift ;;
     --help|-h)                 usage 0 ;;
     *)                         die "unknown argument: $1 (try --help)" ;;
@@ -242,9 +248,13 @@ preflight() {
   [[ "${ORIGIN_ACCOUNT}" =~ ^[a-z0-9]{3,24}$ ]] \
     || die "origin account '${ORIGIN_ACCOUNT}' must be 3-24 lowercase alphanumeric chars (override with --origin-account)"
 
-  # The nightly workflow must exist on the default branch to be triggerable.
-  if ! gh workflow view nightly.yaml --repo "${REPO}" >/dev/null 2>&1; then
-    die "workflow 'nightly.yaml' not found on ${REPO}'s default branch; merge the PR that adds it before running this script"
+  # The nightly workflow must exist on the default branch to be triggerable
+  # via workflow_dispatch. Skipped when --no-trigger (e.g. pre-merge testing,
+  # where the run is fired by pushing the branch instead).
+  if [[ "${TRIGGER}" == "true" ]]; then
+    if ! gh workflow view nightly.yaml --repo "${REPO}" >/dev/null 2>&1; then
+      die "workflow 'nightly.yaml' not found on ${REPO}'s default branch; merge the PR that adds it, or pass --no-trigger to provision and test from a branch"
+    fi
   fi
 
   info "subscription: ${SUBSCRIPTION}"
@@ -432,8 +442,23 @@ ensure_secret() {
 
 # ---------------------------------------------------------------------------
 # Trigger the nightly workflow (force_init) and optionally watch it.
+#
+# With --no-trigger we provision only and tell the operator how to fire the
+# run by pushing the branch (used to test the workflow before it is on the
+# default branch, where workflow_dispatch is not available).
 # ---------------------------------------------------------------------------
 trigger_deploy() {
+  if [[ "${TRIGGER}" != "true" ]]; then
+    local branch
+    branch="$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '<branch>')"
+    log "Skipping deploy trigger (--no-trigger)"
+    info "Provisioning is complete. To run the workflow from this branch, push it:"
+    info "    git push origin ${branch}"
+    info "The push-triggered run does the build, init deploy, Orca deploy, and smoke."
+    info "Watch it: gh run watch \$(gh run list --repo ${REPO} --workflow nightly.yaml --limit 1 --json databaseId --jq '.[0].databaseId') --repo ${REPO}"
+    return 0
+  fi
+
   log "Triggering nightly workflow (force_init=true)"
 
   # Record the newest run id before dispatch so we can identify the new one.
@@ -492,10 +517,18 @@ main() {
   configure_environment
   ensure_secret
   trigger_deploy
-  verify
 
-  log "Done. unbounded-nightly is provisioned and the first deploy was triggered."
-  info "Subsequent runs deploy automatically every morning at 06:00 UTC."
+  # Cluster state is only meaningful once a deploy has actually completed.
+  if [[ "${TRIGGER}" == "true" && "${WATCH}" == "true" ]]; then
+    verify
+  fi
+
+  if [[ "${TRIGGER}" == "true" ]]; then
+    log "Done. unbounded-nightly is provisioned and the first deploy was triggered."
+    info "Subsequent runs deploy automatically every morning at 06:00 UTC."
+  else
+    log "Done. unbounded-nightly is provisioned (deploy not triggered)."
+  fi
 }
 
 main "$@"

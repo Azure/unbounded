@@ -66,6 +66,15 @@ on:
     # 06:00 UTC daily. See the "Schedule" note in the header above.
     - cron: "0 6 * * *"
 
+  # TEMPORARY (remove before merge): allows this workflow to be tested from
+  # the nightly-deploy branch. workflow_dispatch and schedule only run from
+  # the default branch, so a push trigger is the only way to exercise a
+  # branch's own workflow file before it is merged. Pushing nightly-deploy
+  # runs the full build -> deploy -> smoke against the unbounded-nightly
+  # cluster (init mode is auto-selected while the Site CRD is absent).
+  push:
+    branches: [nightly-deploy]
+
   # Manual trigger for re-deploys, first bootstrap, and testing a specific ref.
   workflow_dispatch:
     inputs:
@@ -108,7 +117,10 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ inputs.ref || github.event.repository.default_branch }}
+          # Snapshot the commit this run is for: the pushed commit on a push
+          # event, or the default-branch head on schedule/dispatch. inputs.ref
+          # overrides for a manual snapshot of a specific ref.
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
 
       - name: Resolve snapshot commit and tag
