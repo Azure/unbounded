@@ -6,10 +6,16 @@ package v1alpha3
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 func init() {
-	SchemeBuilder.Register(&MachineConfiguration{}, &MachineConfigurationList{})
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(GroupVersion, &MachineConfiguration{}, &MachineConfigurationList{})
+		metav1.AddToGroupVersion(s, GroupVersion)
+
+		return nil
+	})
 }
 
 // +kubebuilder:object:root=true

@@ -521,6 +521,88 @@ func TestGetNodeStatusIncludesNodeErrors(t *testing.T) {
 	}
 }
 
+func TestLinkStatsWarningsSuppressHealthyWireGuardRxErrors(t *testing.T) {
+	warnings := []string{"interface /wg51820: rx_errors +24"}
+	peers := []WireGuardPeerStatus{
+		{
+			Name: "healthy-peer",
+			Tunnel: PeerTunnelStatus{
+				Interface:     "wg51820",
+				LastHandshake: testStatusTime.Add(-30 * time.Second),
+			},
+			HealthCheck: &HealthCheckPeerStatus{Enabled: true, Status: "up"},
+		},
+	}
+
+	got := linkStatsWarningsAsNodeErrors(warnings, peers, testStatusTime)
+	if len(got) != 0 {
+		t.Fatalf("expected healthy WireGuard rx_errors warning to be suppressed, got %#v", got)
+	}
+}
+
+func TestLinkStatsWarningsKeepWireGuardRxErrorsWhenPeerUnhealthy(t *testing.T) {
+	warnings := []string{"interface /wg51820: rx_errors +24"}
+	peers := []WireGuardPeerStatus{
+		{
+			Name: "down-peer",
+			Tunnel: PeerTunnelStatus{
+				Interface: "wg51820",
+			},
+			HealthCheck: &HealthCheckPeerStatus{Enabled: true, Status: "down"},
+		},
+	}
+
+	got := linkStatsWarningsAsNodeErrors(warnings, peers, testStatusTime)
+	if len(got) != 1 {
+		t.Fatalf("expected unhealthy WireGuard rx_errors warning to remain, got %#v", got)
+	}
+
+	if got[0].Type != "link-stats" || !strings.Contains(got[0].Message, "rx_errors") {
+		t.Fatalf("unexpected node error: %#v", got[0])
+	}
+}
+
+func TestLinkStatsWarningsKeepWireGuardTxAndDropErrors(t *testing.T) {
+	warnings := []string{
+		"interface /wg51820: tx_errors +12, tx_dropped +120",
+		"interface /wg51820: rx_dropped +20",
+	}
+	peers := []WireGuardPeerStatus{
+		{
+			Name: "healthy-peer",
+			Tunnel: PeerTunnelStatus{
+				Interface:     "wg51820",
+				LastHandshake: testStatusTime.Add(-30 * time.Second),
+			},
+			HealthCheck: &HealthCheckPeerStatus{Enabled: true, Status: "up"},
+		},
+	}
+
+	got := linkStatsWarningsAsNodeErrors(warnings, peers, testStatusTime)
+	if len(got) != 2 {
+		t.Fatalf("expected tx/drop warnings to remain, got %#v", got)
+	}
+}
+
+func TestLinkStatsWarningsKeepRxErrorsWithNoMatchingPeer(t *testing.T) {
+	warnings := []string{"interface /wg51820: rx_errors +24"}
+	peers := []WireGuardPeerStatus{
+		{
+			Name: "other-peer",
+			Tunnel: PeerTunnelStatus{
+				Interface:     "wg51821",
+				LastHandshake: testStatusTime.Add(-30 * time.Second),
+			},
+			HealthCheck: &HealthCheckPeerStatus{Enabled: true, Status: "up"},
+		},
+	}
+
+	got := linkStatsWarningsAsNodeErrors(warnings, peers, testStatusTime)
+	if len(got) != 1 {
+		t.Fatalf("expected warning with no matching peer to remain, got %#v", got)
+	}
+}
+
 // TestTryDirectRecoveryProbeClearsNodeErrors tests TryDirectRecoveryProbeClearsNodeErrors.
 func TestTryDirectRecoveryProbeClearsNodeErrors(t *testing.T) {
 	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
