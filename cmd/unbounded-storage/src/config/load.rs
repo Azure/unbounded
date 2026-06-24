@@ -92,6 +92,7 @@ pub enum ConfigError {
         frontend_name: String,
         addr: String,
     },
+    ZeroFrontendMaxRequestsPerConnection(String),
     MissingPeerConfig(u64),
     MissingDiskConfig,
     InvalidMetricsAddr {
@@ -221,6 +222,10 @@ impl fmt::Display for ConfigError {
                     "frontend {frontend_name:?}: duplicate addr address {addr:?}"
                 )
             }
+            ConfigError::ZeroFrontendMaxRequestsPerConnection(frontend_name) => write!(
+                f,
+                "frontend {frontend_name:?}: max_requests_per_connection must be greater than zero"
+            ),
             ConfigError::MissingPeerConfig(peer_id) => {
                 write!(f, "peer {peer_id}: config must set one peer transport")
             }
@@ -377,6 +382,11 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         match fr.config.as_ref() {
             Some(frontend_spec::Config::Http(cfg)) => {
                 validate_frontend_addr(&fr.name, &cfg.addr, &mut seen_addrs)?;
+                if cfg.max_requests_per_connection == Some(0) {
+                    return Err(ConfigError::ZeroFrontendMaxRequestsPerConnection(
+                        fr.name.clone(),
+                    ));
+                }
             }
             Some(frontend_spec::Config::S3(cfg)) => {
                 validate_frontend_addr(&fr.name, &cfg.addr, &mut seen_addrs)?;
@@ -1292,6 +1302,31 @@ addr = "not-an-addr"
             Err(ConfigError::InvalidFrontendAddr { frontend_name, .. }) if frontend_name == "f" => {
             }
             other => panic!("expected InvalidFrontendAddr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_zero_frontend_request_cap() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "https://e"
+
+[[frontends]]
+name = "f"
+source = "b"
+
+[frontends.config.http]
+addr = "127.0.0.1:9000"
+max_requests_per_connection = 0
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::ZeroFrontendMaxRequestsPerConnection(frontend_name))
+                if frontend_name == "f" => {}
+            other => panic!("expected ZeroFrontendMaxRequestsPerConnection, got {other:?}"),
         }
     }
 

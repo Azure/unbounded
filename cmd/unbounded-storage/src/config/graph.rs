@@ -373,6 +373,7 @@ mod tests {
             source: source.to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: format!("127.0.0.1:{}", 9000 + id.len()),
+                max_requests_per_connection: None,
             })),
         }
     }

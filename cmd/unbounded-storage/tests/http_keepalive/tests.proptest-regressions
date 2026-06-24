@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc efa553ff1cce3f2946ce84c8ca814529499f7a933b9b9763a810b21898a00c6b # shrinks to seed = 0, w = Workload { requests: [RequestSpec { method: Get, version: Http11, connection: None, body: None }, RequestSpec { method: Get, version: Http11, connection: None, body: None }, RequestSpec { method: Get, version: Http11, connection: None, body: None }], chunk_sizes: [1], max_send_delay: 0, max_requests_per_connection: 1 }

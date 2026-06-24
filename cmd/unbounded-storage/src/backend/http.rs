@@ -10,11 +10,10 @@
 //! zero-copy in the destination pages (the kernel decrypts in place).
 //! The record-aware recv path lives in [`crate::tls`].
 //!
-//! This is the cold path, so it is deliberately simple: one TCP
-//! connection per fetch (`Connection: close`, no pooling), and one heap
-//! copy of the received body into the registered backing. The hot
-//! serving path is zero-copy elsewhere; here correctness and legibility
-//! win over avoiding the ingest copy.
+//! Origin connections are kept alive when the response has a known,
+//! fully-consumed body and the peer did not ask to close the stream. Idle
+//! sockets stay ring-local so the shard ring and worker-local RPC rings
+//! never share fds.
 //!
 //! ## Address resolution and the `Host` header
 //!
@@ -27,28 +26,28 @@
 //!
 //! ## Future optimizations (not in v1)
 //!
-//! - Connection pooling / keep-alive bounded by `http_concurrency` to
-//!   amortize the TCP+`connect` handshake across fetches.
 //! - Conditional revalidation via ETag. Per the content-addressed
 //!   design the ETag should fold into the stripe key's identity (a new
 //!   ETag yields a new key), rather than being tracked as separate
 //!   per-stripe metadata.
 
 use std::future::Future;
-use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use ::http::header::{CONNECTION, HOST, RANGE};
+use ::http::header::{HOST, RANGE};
 
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
-use crate::http::{Method, ResponseHead, StatusCode, serialize_request};
+use crate::http::{Method, StatusCode, response_closes_after_body, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
 use crate::tls::TlsContext;
 
 use super::Backend;
+use super::conn::{
+    OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
+};
 use super::limiter::FetchLimiter;
 use super::origin_ring::OriginRing;
 
@@ -79,6 +78,7 @@ pub struct HttpBackend {
     page_size: usize,
     backing_base: *mut u8,
     limiter: FetchLimiter,
+    conns: OriginConnPool,
 }
 
 // SAFETY: mirrors `crate::memory::Backing`. `HttpBackend` is
@@ -116,6 +116,7 @@ impl HttpBackend {
             page_size,
             backing_base,
             limiter: FetchLimiter::new(http_concurrency),
+            conns: OriginConnPool::new(http_concurrency),
         }
     }
 
@@ -191,6 +192,7 @@ impl HttpBackend {
         let origin_addr = self.origin;
         let backing_base = self.backing_base;
         let page_size = self.page_size;
+        let conns = self.conns.clone();
 
         // A metadata entry is not a byte range of the object; it is a
         // synthetic one-page cache entry whose payload is the object's
@@ -218,6 +220,7 @@ impl HttpBackend {
                         backing_base,
                         page_size,
                         self.limiter.clone(),
+                        conns,
                     ),
                 ),
             ));
@@ -241,6 +244,7 @@ impl HttpBackend {
                 len,
                 fetch(
                     handle,
+                    conns,
                     origin_addr,
                     host,
                     sni_host,
@@ -371,6 +375,7 @@ impl PageStream for HttpFetchStream<'_> {
 #[allow(clippy::too_many_arguments)]
 async fn fetch(
     handle: NetHandle,
+    conns: OriginConnPool,
     origin: SockAddr,
     host: String,
     sni_host: String,
@@ -396,53 +401,33 @@ async fn fetch(
         return Err(Error::from("http backend: zero-length fetch requested"));
     }
 
-    // Bound concurrent origin dials to `http_concurrency`. The permit is
+    // Bound concurrent origin work to `http_concurrency`. The permit is
     // held for the whole fetch and returned to the pool on drop.
     let _permit = limiter.acquire().await;
-    let conn = TcpConn::open()?;
-    // The ring's op futures self-pump (each polls its own ring's
-    // `progress()`), so this fetch drives the ring entirely on the
-    // current thread. For the RPC-handler backend that is an
-    // `fabric-rpc-worker` thread with its OWN worker-local ring, so it
-    // never races the shard thread's ring. SAFETY: SockAddr is owned by
-    // the backend for the fetch's lifetime; the ring copies it into its
-    // own slot.
-    handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
-
-    // Drive the TLS handshake (and enable kTLS) before any request bytes
-    // when this is an `https://` backend. `is_tls` then switches the
-    // record-aware recv path on for every read on this socket.
-    let is_tls = crate::tls::maybe_handshake(&tls, &handle, conn.fd, &sni_host).await?;
-
     let request = format_get_request(&path, &host, start, start + len - 1)?;
-    handle.send(conn.fd, request).await.map_err(io_to_err)?;
+    let (conn, head) = send_request_read_head(
+        &conns,
+        &handle,
+        origin,
+        &tls,
+        &sni_host,
+        request,
+        None,
+        "http backend: malformed origin response head",
+        "http backend: connection closed before response headers complete",
+        "http backend: response head exceeds limit",
+    )
+    .await?;
+    let fd = conn.fd();
+    let is_tls = conn.is_tls();
+    let status = head.status;
+    let version_minor = head.version_minor;
+    let header_end = head.header_end;
+    let content_length = head.content_length;
+    let content_range_start = head.content_range_start;
+    let connection = head.connection;
+    let buf = head.buf;
 
-    // Accumulate until the full header block has arrived. The origin
-    // sends headers then body on the same stream.
-    let mut buf: Vec<u8> = Vec::new();
-    let (status, header_end, content_length, content_range_start) = loop {
-        if let Some(h) = ResponseHead::parse(&buf)
-            .map_err(|_| Error::from("http backend: malformed origin response head"))?
-        {
-            break (
-                h.status,
-                h.header_end,
-                h.content_length(),
-                h.content_range_start(),
-            );
-        }
-        let chunk = crate::tls::recv_chunk(&handle, conn.fd, is_tls).await?;
-        if chunk.is_empty() {
-            return Err(Error::from(
-                "http backend: connection closed before response headers complete",
-            ));
-        }
-        buf.extend_from_slice(&chunk);
-    };
-
-    if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
-        return Err(Error::from("http backend: origin returned non-2xx status"));
-    }
     check_origin_status(status, start)?;
 
     // An origin that answers a different slice than we asked for would
@@ -463,7 +448,13 @@ async fn fetch(
     // length, so the padding is never handed to a client. A connection
     // that closes before the advertised length is a genuine truncation.
     let body_start = header_end;
-    let body_len_mode = expected_body_len(status, content_length, len)?;
+    let body_len_mode = expected_body_len(
+        status,
+        version_minor,
+        connection.as_deref(),
+        content_length,
+        len,
+    )?;
 
     // `body_cap` is the most body bytes we will accept into the pages.
     // For a known Content-Length it is that length (already validated by
@@ -511,8 +502,7 @@ async fn fetch(
         // Pool reserves for this fetch across every await here; the
         // backend is shard-pinned so no other thread touches it. The
         // destination stays reserved until this future resolves.
-        let n_recv =
-            crate::tls::recv_fixed(&handle, conn.fd, is_tls, page_byte_off, recv_len).await?;
+        let n_recv = crate::tls::recv_fixed(&handle, fd, is_tls, page_byte_off, recv_len).await?;
         if n_recv == 0 {
             // EOF. With a known length this is a truncation; for the
             // close-delimited case it is the normal end of the body.
@@ -529,6 +519,16 @@ async fn fetch(
     // served reads to the object length, so this padding is never
     // returned to a client.
     zero_fill_pages_from(&dsts, filled, backing_base, page_size)?;
+    if body_response_reusable(
+        version_minor,
+        connection.as_deref(),
+        content_length,
+        body_cap,
+        leading.len(),
+        filled,
+    ) {
+        conns.put(&handle, conn);
+    }
     Ok(())
 }
 
@@ -552,6 +552,7 @@ async fn fetch_metadata(
     backing_base: *mut u8,
     page_size: usize,
     limiter: FetchLimiter,
+    conns: OriginConnPool,
 ) -> Result<(), Error> {
     let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
     if capacity < 8 {
@@ -560,44 +561,33 @@ async fn fetch_metadata(
         ));
     }
 
-    // Bound concurrent origin dials to `http_concurrency` (see `fetch`).
+    // Bound concurrent origin work to `http_concurrency` (see `fetch`).
     let _permit = limiter.acquire().await;
-    let conn = TcpConn::open()?;
-    // See `fetch` for why driving the ring on the current thread is
-    // sound (the op futures self-pump on their own thread's ring).
-    handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
-
-    // See `fetch`: handshake (and kTLS enable) before the request, then
-    // `is_tls` switches the record-aware recv path on.
-    let is_tls = crate::tls::maybe_handshake(&tls, &handle, conn.fd, &sni_host).await?;
-
     let request = format_head_request(&path, &host)?;
-    handle.send(conn.fd, request).await.map_err(io_to_err)?;
-
-    // Accumulate until the full header block has arrived, capping the
-    // header buffer so a pathological origin cannot grow it unbounded.
     const MAX_HEAD: usize = 64 * 1024;
-    let mut buf: Vec<u8> = Vec::new();
-    let (status, content_length) = loop {
-        if let Some(h) = ResponseHead::parse(&buf)
-            .map_err(|_| Error::from("http backend: malformed origin response head"))?
-        {
-            break (h.status, h.content_length());
-        }
-        if buf.len() >= MAX_HEAD {
-            return Err(Error::from(
-                "http backend: metadata HEAD response head exceeds 64 KiB",
-            ));
-        }
-        let chunk = crate::tls::recv_chunk(&handle, conn.fd, is_tls).await?;
-        if chunk.is_empty() {
-            return Err(Error::from(
-                "http backend: connection closed before metadata HEAD headers complete",
-            ));
-        }
-        buf.extend_from_slice(&chunk);
-    };
+    let (conn, head) = send_request_read_head(
+        &conns,
+        &handle,
+        origin,
+        &tls,
+        &sni_host,
+        request,
+        Some(MAX_HEAD),
+        "http backend: malformed origin response head",
+        "http backend: connection closed before metadata HEAD headers complete",
+        "http backend: metadata HEAD response head exceeds 64 KiB",
+    )
+    .await?;
+    let status = head.status;
+    let version_minor = head.version_minor;
+    let header_end = head.header_end;
+    let content_length = head.content_length;
+    let connection = head.connection;
+    let buf = head.buf;
 
+    if status == StatusCode::NOT_FOUND {
+        return Err(Error::OriginNotFound);
+    }
     if status != StatusCode::OK {
         return Err(Error::from(
             "http backend: metadata HEAD returned non-200 status",
@@ -608,12 +598,15 @@ async fn fetch_metadata(
 
     let body = ObjectMetadata::new(length).encode()?;
     copy_body_into_pages(&body, &dsts, backing_base, page_size)?;
+    if head_response_reusable(version_minor, connection.as_deref(), header_end, buf.len()) {
+        conns.put(&handle, conn);
+    }
     Ok(())
 }
 
 /// Determine how many body bytes to read for this response, or `None`
-/// when the origin advertised no `Content-Length` and the caller must
-/// read until the `Connection: close` stream ends.
+/// when the origin advertised no `Content-Length` but its connection
+/// semantics still guarantee EOF will delimit the body.
 ///
 /// A `206` returns at most the bytes we asked for, so a `Content-Length`
 /// exceeding `len` is a protocol violation. A `200` (accepted only at
@@ -621,10 +614,17 @@ async fn fetch_metadata(
 /// page; we only want the first `len` bytes of it.
 fn expected_body_len(
     status: StatusCode,
+    version_minor: u8,
+    connection: Option<&str>,
     content_length: Option<u64>,
     len: u64,
 ) -> Result<Option<u64>, Error> {
     let Some(cl) = content_length else {
+        if !response_closes_after_body(version_minor, connection) {
+            return Err(Error::from(
+                "http backend: origin response missing Content-Length on keep-alive connection",
+            ));
+        }
         return Ok(None);
     };
     let n = if status == StatusCode::PARTIAL_CONTENT {
@@ -642,12 +642,20 @@ fn expected_body_len(
 
 /// Validate the origin's response status against the requested offset.
 ///
-/// `206` (Partial Content) is always fine. A `200` means the origin
-/// ignored our `Range` and is streaming the whole object from byte 0;
-/// that is only usable when we asked from offset 0, otherwise the body
+/// `404` maps to [`Error::OriginNotFound`] so frontends can return a
+/// not-found response instead of treating it as an opaque transport
+/// failure. `206` (Partial Content) is always fine. A `200` means the
+/// origin ignored our `Range` and is streaming the whole object from byte
+/// 0; that is only usable when we asked from offset 0, otherwise the body
 /// would not begin at `start` and copying it would silently corrupt the
-/// stripe. Non-2xx is rejected by the caller before this is reached.
+/// stripe. Other statuses are rejected as origin protocol failures.
 fn check_origin_status(status: StatusCode, start: u64) -> Result<(), Error> {
+    if status == StatusCode::NOT_FOUND {
+        return Err(Error::OriginNotFound);
+    }
+    if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
+        return Err(Error::from("http backend: origin returned non-2xx status"));
+    }
     if status == StatusCode::OK && start != 0 {
         return Err(Error::from(
             "http backend: origin ignored Range (200) for a non-zero offset",
@@ -826,15 +834,13 @@ fn absolute_range(stripe_idx: u64, stripe_size: u64, src_offset: u64, src_len: u
 }
 
 /// Format a ranged HTTP/1.1 GET request. `start`/`end` are inclusive
-/// byte offsets for the `Range` header. `Connection: close` keeps v1
-/// simple (one connection per fetch).
+/// byte offsets for the `Range` header.
 fn format_get_request(path: &str, host: &str, start: u64, end: u64) -> Result<Vec<u8>, Error> {
     let req = ::http::Request::builder()
         .method(Method::GET)
         .uri(path)
         .header(HOST, host)
         .header(RANGE, format!("bytes={start}-{end}"))
-        .header(CONNECTION, "close")
         .body(())
         .map_err(|_| Error::from("http backend: failed to build origin GET request"))?;
     Ok(serialize_request(&req))
@@ -849,7 +855,6 @@ fn format_head_request(path: &str, host: &str) -> Result<Vec<u8>, Error> {
         .method(Method::HEAD)
         .uri(path)
         .header(HOST, host)
-        .header(CONNECTION, "close")
         .body(())
         .map_err(|_| Error::from("http backend: failed to build origin HEAD request"))?;
     Ok(serialize_request(&req))
@@ -859,34 +864,6 @@ fn io_to_err(e: std::io::Error) -> Error {
     match e.raw_os_error() {
         Some(code) => Error::Io(code),
         None => Error::transport(e),
-    }
-}
-
-/// RAII wrapper around a libc TCP socket fd. The ring never creates
-/// fds; the backend opens the socket with `libc::socket` and closes it
-/// on drop (one connection per fetch in v1).
-struct TcpConn {
-    fd: RawFd,
-}
-
-impl TcpConn {
-    fn open() -> Result<Self, Error> {
-        // SAFETY: socket() with valid AF/type/protocol constants.
-        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        if fd < 0 {
-            return Err(io_to_err(std::io::Error::last_os_error()));
-        }
-        Ok(Self { fd })
-    }
-}
-
-impl Drop for TcpConn {
-    fn drop(&mut self) {
-        // SAFETY: fd was returned by socket() and is not used after
-        // this; closing it releases the kernel resource.
-        unsafe {
-            libc::close(self.fd);
-        }
     }
 }
 
@@ -919,7 +896,7 @@ mod tests {
         );
         assert!(s.contains("host: 10.0.0.1:8080\r\n"), "got: {s}");
         assert!(s.contains("range: bytes=0-4095\r\n"), "got: {s}");
-        assert!(s.contains("connection: close\r\n"), "got: {s}");
+        assert!(!s.contains("connection:"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
     }
 
@@ -933,6 +910,18 @@ mod tests {
 
     #[test]
     fn check_origin_status_rules() {
+        assert!(matches!(
+            check_origin_status(StatusCode::NOT_FOUND, 0),
+            Err(Error::OriginNotFound)
+        ));
+        assert!(matches!(
+            check_origin_status(StatusCode::NOT_FOUND, 4096),
+            Err(Error::OriginNotFound)
+        ));
+        assert!(matches!(
+            check_origin_status(StatusCode::INTERNAL_SERVER_ERROR, 0),
+            Err(Error::Transport(_))
+        ));
         // 206 is always acceptable, at any offset.
         assert!(check_origin_status(StatusCode::PARTIAL_CONTENT, 0).is_ok());
         assert!(check_origin_status(StatusCode::PARTIAL_CONTENT, 4096).is_ok());
@@ -948,7 +937,7 @@ mod tests {
     fn expected_body_len_206_uses_content_length() {
         // Short tail: origin had fewer bytes than the page we asked for.
         assert_eq!(
-            expected_body_len(StatusCode::PARTIAL_CONTENT, Some(1000), 4096).unwrap(),
+            expected_body_len(StatusCode::PARTIAL_CONTENT, 1, None, Some(1000), 4096).unwrap(),
             Some(1000)
         );
     }
@@ -956,14 +945,14 @@ mod tests {
     #[test]
     fn expected_body_len_206_rejects_overlong_content_length() {
         // A 206 must not return more than we asked for.
-        assert!(expected_body_len(StatusCode::PARTIAL_CONTENT, Some(5000), 4096).is_err());
+        assert!(expected_body_len(StatusCode::PARTIAL_CONTENT, 1, None, Some(5000), 4096).is_err());
     }
 
     #[test]
     fn expected_body_len_200_caps_at_requested_len() {
         // Whole-object 200 stream: we only want the first page.
         assert_eq!(
-            expected_body_len(StatusCode::OK, Some(1_000_000), 4096).unwrap(),
+            expected_body_len(StatusCode::OK, 1, None, Some(1_000_000), 4096).unwrap(),
             Some(4096)
         );
     }
@@ -972,14 +961,27 @@ mod tests {
     fn expected_body_len_200_short_object() {
         // Object shorter than a page: read the 500 bytes, zero-fill rest.
         assert_eq!(
-            expected_body_len(StatusCode::OK, Some(500), 4096).unwrap(),
+            expected_body_len(StatusCode::OK, 1, None, Some(500), 4096).unwrap(),
             Some(500)
         );
     }
 
     #[test]
     fn expected_body_len_absent_content_length_reads_to_close() {
-        assert_eq!(expected_body_len(StatusCode::OK, None, 4096).unwrap(), None);
+        assert_eq!(
+            expected_body_len(StatusCode::OK, 1, Some("close"), None, 4096).unwrap(),
+            None
+        );
+        assert_eq!(
+            expected_body_len(StatusCode::OK, 0, None, None, 4096).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn expected_body_len_absent_content_length_rejects_keep_alive() {
+        assert!(expected_body_len(StatusCode::OK, 1, None, None, 4096).is_err());
+        assert!(expected_body_len(StatusCode::OK, 0, Some("keep-alive"), None, 4096).is_err());
     }
 
     #[test]
@@ -1084,7 +1086,7 @@ mod tests {
         let s = std::str::from_utf8(&req).unwrap();
         assert!(s.starts_with("HEAD /o HTTP/1.1\r\n"), "got: {s}");
         assert!(s.contains("host: h:1\r\n"), "got: {s}");
-        assert!(s.contains("connection: close\r\n"), "got: {s}");
+        assert!(!s.contains("connection:"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
         assert!(!s.contains("range:"), "got: {s}");
     }

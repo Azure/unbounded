@@ -1878,9 +1878,11 @@ func (*FrontendSpec_Loadgen) isFrontendSpec_Config() {}
 type HttpFrontendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Socket address for HTTP listeners; each serving shard binds it with SO_REUSEPORT.
-	Addr          string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Addr string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	// Maximum requests served on one client connection. Defaults to 1024 when unset.
+	MaxRequestsPerConnection *uint32 `protobuf:"varint,2,opt,name=max_requests_per_connection,json=maxRequestsPerConnection,proto3,oneof" json:"max_requests_per_connection,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *HttpFrontendConfig) Reset() {
@@ -1918,6 +1920,13 @@ func (x *HttpFrontendConfig) GetAddr() string {
 		return x.Addr
 	}
 	return ""
+}
+
+func (x *HttpFrontendConfig) GetMaxRequestsPerConnection() uint32 {
+	if x != nil && x.MaxRequestsPerConnection != nil {
+		return *x.MaxRequestsPerConnection
+	}
+	return 0
 }
 
 type S3FrontendConfig struct {
@@ -2203,9 +2212,11 @@ const file_config_proto_rawDesc = "" +
 	"\x04http\x18\x03 \x01(\v2,.unbounded.storage.config.HttpFrontendConfigH\x00R\x04http\x12<\n" +
 	"\x02s3\x18\x04 \x01(\v2*.unbounded.storage.config.S3FrontendConfigH\x00R\x02s3\x12K\n" +
 	"\aloadgen\x18\x05 \x01(\v2/.unbounded.storage.config.LoadgenFrontendConfigH\x00R\aloadgenB\b\n" +
-	"\x06config\"(\n" +
+	"\x06config\"\x8c\x01\n" +
 	"\x12HttpFrontendConfig\x12\x12\n" +
-	"\x04addr\x18\x01 \x01(\tR\x04addr\"&\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\x12B\n" +
+	"\x1bmax_requests_per_connection\x18\x02 \x01(\rH\x00R\x18maxRequestsPerConnection\x88\x01\x01B\x1e\n" +
+	"\x1c_max_requests_per_connection\"&\n" +
 	"\x10S3FrontendConfig\x12\x12\n" +
 	"\x04addr\x18\x01 \x01(\tR\x04addr\"\xe8\x01\n" +
 	"\x15LoadgenFrontendConfig\x12\x1d\n" +
@@ -2339,6 +2350,7 @@ func file_config_proto_init() {
 		(*FrontendSpec_S3)(nil),
 		(*FrontendSpec_Loadgen)(nil),
 	}
+	file_config_proto_msgTypes[25].OneofWrappers = []any{}
 	file_config_proto_msgTypes[27].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

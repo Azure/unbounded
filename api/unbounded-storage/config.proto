@@ -305,6 +305,9 @@ message FrontendSpec {
 message HttpFrontendConfig {
   // Socket address for HTTP listeners; each serving shard binds it with SO_REUSEPORT.
   string addr = 1;
+
+  // Maximum requests served on one client connection. Defaults to 1024 when unset.
+  optional uint32 max_requests_per_connection = 2;
 }
 
 message S3FrontendConfig {

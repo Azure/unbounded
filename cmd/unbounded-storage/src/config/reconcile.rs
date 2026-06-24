@@ -1049,6 +1049,7 @@ mod tests {
             source: backend_id.to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: "0.0.0.0:9000".to_string(),
+                max_requests_per_connection: None,
             })),
         }
     }

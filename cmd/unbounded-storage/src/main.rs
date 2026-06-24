@@ -1322,6 +1322,7 @@ impl FrontendBuildCtx {
                     self.page_size,
                     self.fanout.clone(),
                     binding.bypass_cache,
+                    frontend.max_requests_per_connection(),
                 )))
             }
             Some(frontend_spec::Config::S3(_)) => {
