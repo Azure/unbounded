@@ -821,6 +821,7 @@ mod tests {
             handler_registry: DropToken::new("handler_registry", &log),
             routes: DropToken::new("routes", &log),
             fabric: DropToken::new("fabric", &log),
+            unit_idx: 0,
             hca_numa: None,
             applied_peers: HashMap::new(),
             last_backends: HashMap::new(),
