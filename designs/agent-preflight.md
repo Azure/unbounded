@@ -172,9 +172,12 @@ Severity should follow a simple policy:
 - Return a warning when bootstrap can safely remediate the condition without
   external input. For example, active swap can be a warning when bootstrap will
   disable it.
+- Return a warning when bootstrap can remediate the condition by installing or
+  reconfiguring host state. For example, missing required host packages can be a
+  warning when package source access is allowed.
 - Return an error when bootstrap cannot proceed or remediation requires external
-  input. For example, missing host packages with unreachable package sources is
-  an error.
+  input. For example, missing required host packages should become an error in
+  offline mode.
 - Return an error when continuing would risk joining the node with incorrect
   identity, credentials, rootfs, runtime, or GPU behavior.
 
@@ -260,7 +263,7 @@ check points at the bootstrap step that would fail later.
 For example:
 
 ```text
-[ERROR host-packages]: missing required packages and package sources are unreachable
+[WARNING host-packages]: required host packages are missing and may be installed by bootstrap: systemd-container, curl
 [WARNING swap-active]: swap is active and bootstrap will disable it
 [ERROR oci-image-reachable]: failed to resolve rootfs image manifest (target: rootfs image)
 ```
@@ -277,7 +280,6 @@ Examples:
 ```text
 agent-config
 host-packages
-host-package-sources
 swap-active
 oci-image-reachable
 kubernetes-artifacts
@@ -303,10 +305,9 @@ Default output should be kubeadm-like:
 ```text
 [preflight] Running unbounded-agent pre-flight checks
     [WARNING swap-active]: swap is enabled and will be disabled during bootstrap
-    [ERROR host-packages]: missing required packages and package sources are unreachable
+    [WARNING host-packages]: required host packages are missing and may be installed by bootstrap: systemd-container, curl
     [ERROR oci-image-reachable]: failed to resolve rootfs image manifest (target: rootfs image)
 [preflight] Some fatal errors occurred:
-    [ERROR host-packages]: missing required packages and package sources are unreachable
     [ERROR oci-image-reachable]: failed to resolve rootfs image manifest (target: rootfs image)
 [preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`
 ```
@@ -343,8 +344,8 @@ warnings, ignored errors, and fatal errors:
     },
     {
       "name": "host-packages",
-      "severity": "error",
-      "message": "missing required packages and package sources are unreachable",
+      "severity": "warning",
+      "message": "required host packages are missing and may be installed by bootstrap: systemd-container, curl",
       "target": "host packages",
       "ignored": false
     },
@@ -394,30 +395,25 @@ Host phase checks:
 | Check | Purpose |
 |---|---|
 | `is-privileged-user` | Ensure the command is running as root. |
-| `host-packages` | Validate a supported package manager exists and required host packages are installed. If packages are missing, validate whether they appear installable without mutating package-manager state. In offline or blocked-network environments this should fail when required packages are missing and cannot be installed. |
-| `host-package-sources` | Validate package source reachability with non-mutating probes when package installation would be required. Skip or pass when all required packages are already installed. |
+| `host-packages` | Validate a supported package manager exists and required host packages are installed. Missing packages are reported by name as warnings when bootstrap can install them. They should become errors in offline mode. |
 | `host-os-configuration` | Validate host OS configuration can be applied: sysctl config path writable, relevant kernel parameters acceptable or settable, and systemd unit paths writable. |
-| `nspawn-runtime` | Validate the host systemd environment can manage nspawn machines using installed host capabilities. |
+| `nspawn-runtime` | Validate the host systemd environment can manage nspawn machines using installed host capabilities. Missing tools are warnings when bootstrap can install them. They should become errors in offline mode. |
 | `docker-active` | Warn if Docker is active and bootstrap will disable or avoid it. |
 | `swap-active` | Warn when swap is enabled if bootstrap will disable it. |
 | `disk-space` | Validate enough space exists for rootfs and component downloads. |
 | `cgroups` | Validate cgroup support expected by kubelet/containerd. |
 | `api-server-reachable` | Validate the configured Kubernetes API server is reachable from the host. |
 | `cluster-credentials` | Validate the cluster CA data and configured bootstrap credential are present and parseable for kubelet registration. |
-| `node-identity` | Validate node name resolution using the same order as agent config normalization: explicit `NodeName`, host hostname, then `MachineName`. The resolved value must be compatible with kubelet registration. |
 
 Rootfs provisioning checks:
 
 | Check | Purpose |
 |---|---|
-| `machine-dir` | Validate the target machine directory state is compatible with bootstrap. |
-| `oci-image-reference` | Validate the rootfs image reference parses. |
 | `oci-image-reachable` | Validate the configured rootfs image manifest can be resolved without pulling layers. |
-| `rootfs-provisioning` | Validate rootfs provisioning prerequisites are available from installed host packages and host-side nspawn config paths are writable. |
+| `nspawn-machine-provisioning` | Validate the target nspawn machine directory state, rootfs parent directory writability, and host-side nspawn config path writability. |
 | `kubernetes-artifacts` | Validate kubelet/kubectl/kube-proxy artifacts and checksums using the same download and verification calls used by rootfs provisioning, without installing files. |
 | `cri-artifacts` | Validate containerd, runc, and crictl artifacts using the same download/decompression or download calls used by rootfs provisioning, without installing files. |
 | `cni-artifacts` | Validate CNI plugin artifacts using the same download/decompression calls used by rootfs provisioning, without installing files. |
-| `rootfs-parent-writable` | Validate the parent directory for rootfs creation can be created or written. |
 
 GPU checks:
 
