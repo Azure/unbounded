@@ -13,9 +13,8 @@
 //! lives in [`crate::tls`]. The `Host:` header and SNI/cert hostname are
 //! carried as owned strings parsed from the configured endpoint URL.
 //!
-//! It mirrors the HTTP backend's fetch/length structure and shares its
-//! cold-path simplicity (one TCP connection per fetch, one heap copy of
-//! the body into the registered backing). It diverges in two ways:
+//! It mirrors the HTTP backend's fetch/length structure and connection
+//! reuse rules. It diverges in two ways:
 //!
 //! - It carries the origin **hostname** (not just a resolved IPv4) so the
 //!   `Host:` header uses the real virtual-host name the bucket policy
@@ -27,20 +26,22 @@
 //!   missing object from a transport failure.
 
 use std::future::Future;
-use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use ::http::header::{CONNECTION, HOST, RANGE};
+use ::http::header::{HOST, RANGE};
 
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
-use crate::http::{Method, ResponseHead, StatusCode, serialize_request};
+use crate::http::{Method, StatusCode, response_closes_after_body, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
 use crate::tls::TlsContext;
 
 use super::Backend;
+use super::conn::{
+    OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
+};
 use super::limiter::FetchLimiter;
 use super::origin_ring::OriginRing;
 
@@ -73,6 +74,7 @@ pub struct S3Backend {
     page_size: usize,
     backing_base: *mut u8,
     limiter: FetchLimiter,
+    conns: OriginConnPool,
 }
 
 // SAFETY: mirrors `HttpBackend`'s justification. `S3Backend` is
@@ -111,6 +113,7 @@ impl S3Backend {
             page_size,
             backing_base,
             limiter: FetchLimiter::new(http_concurrency),
+            conns: OriginConnPool::new(http_concurrency),
         }
     }
 
@@ -158,6 +161,7 @@ impl S3Backend {
         let host = self.host.clone();
         let sni_host = self.sni_host.clone();
         let tls = self.tls.clone();
+        let conns = self.conns.clone();
 
         // A metadata entry is not a byte range of the object; it is a
         // synthetic one-page cache entry whose payload is the object's
@@ -185,6 +189,7 @@ impl S3Backend {
                         backing_base,
                         page_size,
                         self.limiter.clone(),
+                        conns,
                     ),
                 ),
             ));
@@ -208,6 +213,7 @@ impl S3Backend {
                 len,
                 fetch(
                     handle,
+                    conns,
                     origin_addr,
                     host,
                     sni_host,
@@ -329,6 +335,7 @@ impl PageStream for S3FetchStream<'_> {
 #[allow(clippy::too_many_arguments)]
 async fn fetch(
     handle: NetHandle,
+    conns: OriginConnPool,
     origin: SockAddr,
     host: String,
     sni_host: String,
@@ -354,40 +361,32 @@ async fn fetch(
         return Err(Error::from("s3 backend: zero-length fetch requested"));
     }
 
-    // Bound concurrent origin dials to `http_concurrency`. The permit is
+    // Bound concurrent origin work to `http_concurrency`. The permit is
     // held for the whole fetch and returned to the pool on drop.
     let _permit = limiter.acquire().await;
-    let conn = TcpConn::open()?;
-    // See `HttpBackend::fetch` for why driving the ring on the current
-    // thread is sound (the op futures self-pump on their own thread's
-    // ring).
-    handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
-
-    let is_tls = crate::tls::maybe_handshake(&tls, &handle, conn.fd, &sni_host).await?;
-
     let request = format_get_request(&path, &host, start, start + len - 1)?;
-    handle.send(conn.fd, request).await.map_err(io_to_err)?;
-
-    let mut buf: Vec<u8> = Vec::new();
-    let (status, header_end, content_length, content_range_start) = loop {
-        if let Some(h) = ResponseHead::parse(&buf)
-            .map_err(|_| Error::from("s3 backend: malformed origin response head"))?
-        {
-            break (
-                h.status,
-                h.header_end,
-                h.content_length(),
-                h.content_range_start(),
-            );
-        }
-        let chunk = crate::tls::recv_chunk(&handle, conn.fd, is_tls).await?;
-        if chunk.is_empty() {
-            return Err(Error::from(
-                "s3 backend: connection closed before response headers complete",
-            ));
-        }
-        buf.extend_from_slice(&chunk);
-    };
+    let (conn, head) = send_request_read_head(
+        &conns,
+        &handle,
+        origin,
+        &tls,
+        &sni_host,
+        request,
+        None,
+        "s3 backend: malformed origin response head",
+        "s3 backend: connection closed before response headers complete",
+        "s3 backend: response head exceeds limit",
+    )
+    .await?;
+    let fd = conn.fd();
+    let is_tls = conn.is_tls();
+    let status = head.status;
+    let version_minor = head.version_minor;
+    let header_end = head.header_end;
+    let content_length = head.content_length;
+    let content_range_start = head.content_range_start;
+    let connection = head.connection;
+    let buf = head.buf;
 
     check_origin_status(status, start)?;
 
@@ -409,7 +408,13 @@ async fn fetch(
     // length, so the padding is never handed to a client. A connection
     // that closes before the advertised length is a genuine truncation.
     let body_start = header_end;
-    let body_len_mode = expected_body_len(status, content_length, len)?;
+    let body_len_mode = expected_body_len(
+        status,
+        version_minor,
+        connection.as_deref(),
+        content_length,
+        len,
+    )?;
 
     // `body_cap` is the most body bytes we will accept into the pages.
     // For a known Content-Length it is that length (already validated by
@@ -457,8 +462,7 @@ async fn fetch(
         // Pool reserves for this fetch across every await here; the
         // backend is shard-pinned so no other thread touches it. The
         // destination stays reserved until this future resolves.
-        let n_recv =
-            crate::tls::recv_fixed(&handle, conn.fd, is_tls, page_byte_off, recv_len).await?;
+        let n_recv = crate::tls::recv_fixed(&handle, fd, is_tls, page_byte_off, recv_len).await?;
         if n_recv == 0 {
             // EOF. With a known length this is a truncation; for the
             // close-delimited case it is the normal end of the body.
@@ -475,6 +479,16 @@ async fn fetch(
     // served reads to the object length, so this padding is never
     // returned to a client.
     zero_fill_pages_from(&dsts, filled, backing_base, page_size)?;
+    if body_response_reusable(
+        version_minor,
+        connection.as_deref(),
+        content_length,
+        body_cap,
+        leading.len(),
+        filled,
+    ) {
+        conns.put(&handle, conn);
+    }
     Ok(())
 }
 
@@ -493,6 +507,7 @@ async fn fetch_metadata(
     backing_base: *mut u8,
     page_size: usize,
     limiter: FetchLimiter,
+    conns: OriginConnPool,
 ) -> Result<(), Error> {
     let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
     if capacity < 8 {
@@ -501,40 +516,29 @@ async fn fetch_metadata(
         ));
     }
 
-    // Bound concurrent origin dials to `http_concurrency` (see `fetch`).
+    // Bound concurrent origin work to `http_concurrency` (see `fetch`).
     let _permit = limiter.acquire().await;
-    let conn = TcpConn::open()?;
-    // See `S3Backend::fetch` for why driving the ring on the current
-    // thread is sound (the op futures self-pump on their own thread's
-    // ring).
-    handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
-
-    let is_tls = crate::tls::maybe_handshake(&tls, &handle, conn.fd, &sni_host).await?;
-
     let request = format_head_request(&path, &host)?;
-    handle.send(conn.fd, request).await.map_err(io_to_err)?;
-
     const MAX_HEAD: usize = 64 * 1024;
-    let mut buf: Vec<u8> = Vec::new();
-    let (status, content_length) = loop {
-        if let Some(h) = ResponseHead::parse(&buf)
-            .map_err(|_| Error::from("s3 backend: malformed origin response head"))?
-        {
-            break (h.status, h.content_length());
-        }
-        if buf.len() >= MAX_HEAD {
-            return Err(Error::from(
-                "s3 backend: metadata HEAD response head exceeds 64 KiB",
-            ));
-        }
-        let chunk = crate::tls::recv_chunk(&handle, conn.fd, is_tls).await?;
-        if chunk.is_empty() {
-            return Err(Error::from(
-                "s3 backend: connection closed before metadata HEAD headers complete",
-            ));
-        }
-        buf.extend_from_slice(&chunk);
-    };
+    let (conn, head) = send_request_read_head(
+        &conns,
+        &handle,
+        origin,
+        &tls,
+        &sni_host,
+        request,
+        Some(MAX_HEAD),
+        "s3 backend: malformed origin response head",
+        "s3 backend: connection closed before metadata HEAD headers complete",
+        "s3 backend: metadata HEAD response head exceeds 64 KiB",
+    )
+    .await?;
+    let status = head.status;
+    let version_minor = head.version_minor;
+    let header_end = head.header_end;
+    let content_length = head.content_length;
+    let connection = head.connection;
+    let buf = head.buf;
 
     if status == StatusCode::NOT_FOUND {
         return Err(Error::OriginNotFound);
@@ -549,18 +553,28 @@ async fn fetch_metadata(
 
     let body = ObjectMetadata::new(length).encode()?;
     copy_body_into_pages(&body, &dsts, backing_base, page_size)?;
+    if head_response_reusable(version_minor, connection.as_deref(), header_end, buf.len()) {
+        conns.put(&handle, conn);
+    }
     Ok(())
 }
 
 /// Determine how many body bytes to read for this response, or `None`
-/// when the origin advertised no `Content-Length` and the caller must
-/// read until the `Connection: close` stream ends.
+/// when the origin advertised no `Content-Length` but its connection
+/// semantics still guarantee EOF will delimit the body.
 fn expected_body_len(
     status: StatusCode,
+    version_minor: u8,
+    connection: Option<&str>,
     content_length: Option<u64>,
     len: u64,
 ) -> Result<Option<u64>, Error> {
     let Some(cl) = content_length else {
+        if !response_closes_after_body(version_minor, connection) {
+            return Err(Error::from(
+                "s3 backend: origin response missing Content-Length on keep-alive connection",
+            ));
+        }
         return Ok(None);
     };
     let n = if status == StatusCode::PARTIAL_CONTENT {
@@ -767,7 +781,6 @@ fn format_get_request(path: &str, host: &str, start: u64, end: u64) -> Result<Ve
         .uri(path)
         .header(HOST, host)
         .header(RANGE, format!("bytes={start}-{end}"))
-        .header(CONNECTION, "close")
         .body(())
         .map_err(|_| Error::from("s3 backend: failed to build origin GET request"))?;
     Ok(serialize_request(&req))
@@ -780,7 +793,6 @@ fn format_head_request(path: &str, host: &str) -> Result<Vec<u8>, Error> {
         .method(Method::HEAD)
         .uri(path)
         .header(HOST, host)
-        .header(CONNECTION, "close")
         .body(())
         .map_err(|_| Error::from("s3 backend: failed to build origin HEAD request"))?;
     Ok(serialize_request(&req))
@@ -790,34 +802,6 @@ fn io_to_err(e: std::io::Error) -> Error {
     match e.raw_os_error() {
         Some(code) => Error::Io(code),
         None => Error::transport(e),
-    }
-}
-
-/// RAII wrapper around a libc TCP socket fd. The ring never creates
-/// fds; the backend opens the socket with `libc::socket` and closes it
-/// on drop (one connection per fetch in v1).
-struct TcpConn {
-    fd: RawFd,
-}
-
-impl TcpConn {
-    fn open() -> Result<Self, Error> {
-        // SAFETY: socket() with valid AF/type/protocol constants.
-        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        if fd < 0 {
-            return Err(io_to_err(std::io::Error::last_os_error()));
-        }
-        Ok(Self { fd })
-    }
-}
-
-impl Drop for TcpConn {
-    fn drop(&mut self) {
-        // SAFETY: fd was returned by socket() and is not used after
-        // this; closing it releases the kernel resource.
-        unsafe {
-            libc::close(self.fd);
-        }
     }
 }
 
@@ -862,7 +846,7 @@ mod tests {
         assert!(s.starts_with("GET /bucket/key HTTP/1.1\r\n"), "got: {s}");
         assert!(s.contains("host: s3.example.com\r\n"), "got: {s}");
         assert!(s.contains("range: bytes=0-4095\r\n"), "got: {s}");
-        assert!(s.contains("connection: close\r\n"), "got: {s}");
+        assert!(!s.contains("connection:"), "got: {s}");
         assert!(!s.contains("x-amz-date"), "got: {s}");
         assert!(!s.contains("authorization"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
@@ -877,6 +861,20 @@ mod tests {
         assert!(!s.contains("range:"), "got: {s}");
         assert!(!s.contains("x-amz-date"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
+    }
+
+    #[test]
+    fn expected_body_len_absent_content_length_requires_close() {
+        assert_eq!(
+            expected_body_len(StatusCode::OK, 1, Some("close"), None, 4096).unwrap(),
+            None
+        );
+        assert_eq!(
+            expected_body_len(StatusCode::OK, 0, None, None, 4096).unwrap(),
+            None
+        );
+        assert!(expected_body_len(StatusCode::OK, 1, None, None, 4096).is_err());
+        assert!(expected_body_len(StatusCode::OK, 0, Some("keep-alive"), None, 4096).is_err());
     }
 
     #[test]

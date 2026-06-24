@@ -447,6 +447,12 @@ impl NetHandle {
         Rc::as_ptr(&self.ring) as usize
     }
 
+    /// Address identity of the underlying ring allocation for components
+    /// that must keep resources ring-local across reused handles.
+    pub(crate) fn ring_key(&self) -> usize {
+        Rc::as_ptr(&self.ring) as usize
+    }
+
     /// `'static` counterpart of [`NetworkRing::accept`].
     pub fn accept(&self, listen_fd: RawFd) -> impl Future<Output = io::Result<RawFd>> + 'static {
         let ring = Rc::clone(&self.ring);

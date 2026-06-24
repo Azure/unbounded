@@ -925,6 +925,7 @@ fn frontend_specs(generation: usize, count: u8) -> Vec<FrontendSpec> {
             source: "cache-0".to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: format!("127.0.0.1:{}", 10_000 + generation as u16 * 16 + i as u16),
+                max_requests_per_connection: None,
             })),
         })
         .collect()
