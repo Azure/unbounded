@@ -562,8 +562,12 @@ jobs:
           set -euo pipefail
           IMAGE="${REGISTRY,,}/orca:${TAG}"
           echo "Deploying Orca image: ${IMAGE}"
+          # Single replica: unbounded-nightly is a soak target, not HA, and
+          # the default forge cluster (2-node system pool) cannot fit Orca's
+          # default 3 replicas alongside Garage + net/machina.
           ./hack/orca/deploy-integration.sh \
             --image "${IMAGE}" \
+            --replicas 1 \
             --azure-account "${ORCA_AZURE_ACCOUNT}" \
             --azure-container "${ORCA_AZURE_CONTAINER}" \
             --azure-endpoint "${ORCA_AZURE_ENDPOINT}"
