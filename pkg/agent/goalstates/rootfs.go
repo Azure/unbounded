@@ -34,8 +34,9 @@ type RootFS struct {
 	// container. Empty on non-GPU hosts.
 	Nvidia NvidiaHost
 
-	// HostDevicePaths lists host device node paths to be bind-mounted into
-	// the nspawn container (e.g. ["/dev/kvm"]). Device nodes are discovered
-	// at agent startup. Empty on hosts without any supported devices.
-	HostDevicePaths []string
+	// HostDevices holds host device nodes to be bind-mounted into the
+	// nspawn container, grouped by category (KVM, block storage, InfiniBand
+	// HCA). Device nodes are discovered at agent startup. Empty on hosts
+	// without any supported devices.
+	HostDevices HostDevices
 }
