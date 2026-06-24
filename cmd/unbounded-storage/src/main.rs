@@ -90,6 +90,7 @@ pub struct FabricStartup {
     pub progress_poll_us: u32,
     pub rpc_worker_threads: u32,
     pub max_inflight: u32,
+    pub write_pipeline_depth: u32,
 }
 
 impl FabricStartup {
@@ -292,6 +293,9 @@ fn main() -> ExitCode {
                 .rpc_worker_threads
                 .expect("rpc_worker_threads defaulted"),
             max_inflight: fabric_cfg.max_inflight.expect("max_inflight defaulted"),
+            write_pipeline_depth: fabric_cfg
+                .write_pipeline_depth
+                .expect("write_pipeline_depth defaulted"),
         },
         memory_total_bytes,
         backing_kind,

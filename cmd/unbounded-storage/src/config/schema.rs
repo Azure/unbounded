@@ -68,6 +68,7 @@ impl Config {
         fabric.progress_poll_us.get_or_insert(10);
         fabric.rpc_worker_threads.get_or_insert(4);
         fabric.max_inflight.get_or_insert(1024);
+        fabric.write_pipeline_depth.get_or_insert(8);
 
         let topology = startup.topology.get_or_insert_with(TopologyCfg::default);
         topology.nic_workers.get_or_insert(4);
@@ -714,6 +715,7 @@ workerz = 8
         assert_eq!(s.fabric().progress_poll_us, Some(10));
         assert_eq!(s.fabric().rpc_worker_threads, Some(4));
         assert_eq!(s.fabric().max_inflight, Some(1024));
+        assert_eq!(s.fabric().write_pipeline_depth, Some(8));
         assert_eq!(s.topology().nic_workers, Some(4));
         // `serving_cores` stays absent, which means auto-fill.
         assert_eq!(s.topology().serving_cores, None);
@@ -739,6 +741,7 @@ progress_threads = 3
 progress_poll_us = 25
 rpc_worker_threads = 8
 max_inflight = 2048
+write_pipeline_depth = 8
 
 [startup.fabric.binds.auto_rdma]
 hcas_per_numa_node = 2
@@ -763,6 +766,7 @@ nic_workers = 6
         assert_eq!(st.fabric().progress_poll_us, Some(25));
         assert_eq!(st.fabric().rpc_worker_threads, Some(8));
         assert_eq!(st.fabric().max_inflight, Some(2048));
+        assert_eq!(st.fabric().write_pipeline_depth, Some(8));
         assert!(st.topology().use_smt_siblings);
         assert!(st.topology().ignore_isolated);
         assert!(st.topology().include_node_cpu0);

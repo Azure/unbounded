@@ -240,31 +240,20 @@ impl StreamShared {
 
 impl AckSink for StreamShared {
     fn deliver(&self, kind: MsgKind, body: &[u8]) {
-        self.push(RecvCompletion {
+        self.push(RecvCompletion::Framed {
             kind,
             payload: body.to_vec(),
         });
     }
 
     fn deliver_page(&self, ordinal: u32) {
-        // A page-landed write-with-immediate carries no framed body.
-        // Re-encode it as the internal `PAGE_ACK` event so the poll
-        // loop's existing ack bookkeeping (bounds, dedup, end-of-stream)
-        // handles it verbatim. A serialize failure is impossible for a
-        // fixed-size struct; fall back to an empty body, which the poll
-        // loop rejects as a malformed ack rather than panicking on the
-        // progress thread.
-        let payload = bincode::serialize(&PageAck { page_idx: ordinal }).unwrap_or_default();
-        self.push(RecvCompletion {
-            kind: MsgKind::PageAck,
-            payload,
-        });
+        self.push(RecvCompletion::PageLanded { ordinal });
     }
 }
 
-struct RecvCompletion {
-    kind: MsgKind,
-    payload: Vec<u8>,
+enum RecvCompletion {
+    Framed { kind: MsgKind, payload: Vec<u8> },
+    PageLanded { ordinal: u32 },
 }
 
 /// Stream returned by `FabricTransport::bulk_get`. On first poll it
@@ -441,7 +430,10 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                     let item = shared.queue.lock().ok().and_then(|mut q| q.pop_front());
                     match item {
                         None => return Poll::Pending,
-                        Some(RecvCompletion { kind, payload }) => match kind {
+                        Some(RecvCompletion::PageLanded { ordinal }) => {
+                            return handle_page_ack(dsts, acked, ended, log, ordinal as usize);
+                        }
+                        Some(RecvCompletion::Framed { kind, payload }) => match kind {
                             MsgKind::PageAck => {
                                 let ack: PageAck = match bincode::deserialize(&payload) {
                                     Ok(v) => v,
@@ -455,35 +447,13 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                         ))));
                                     }
                                 };
-                                let idx = ack.page_idx as usize;
-                                if idx >= dsts.len() {
-                                    *ended = true;
-                                    if let Some(mut l) = log.take() {
-                                        l.finish_err("PAGE_ACK index out of range");
-                                    }
-                                    return Poll::Ready(Some(Err(PoolError::transport(
-                                        FabricError::BadConfig("PAGE_ACK index out of range"),
-                                    ))));
-                                }
-                                if acked[idx] {
-                                    *ended = true;
-                                    if let Some(mut l) = log.take() {
-                                        l.finish_err("duplicate PAGE_ACK index");
-                                    }
-                                    return Poll::Ready(Some(Err(PoolError::transport(
-                                        FabricError::BadConfig("duplicate PAGE_ACK index"),
-                                    ))));
-                                }
-                                acked[idx] = true;
-                                // Full success carries no RESPONSE_END;
-                                // the last in-order ack ends the stream.
-                                if acked.iter().all(|a| *a) {
-                                    *ended = true;
-                                    if let Some(mut l) = log.take() {
-                                        l.field("acked", acked.len()).finish_ok();
-                                    }
-                                }
-                                return Poll::Ready(Some(Ok(dsts[idx])));
+                                return handle_page_ack(
+                                    dsts,
+                                    acked,
+                                    ended,
+                                    log,
+                                    ack.page_idx as usize,
+                                );
                             }
                             MsgKind::ResponseEnd => {
                                 *ended = true;
@@ -517,6 +487,43 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
             }
         }
     }
+}
+
+fn handle_page_ack(
+    dsts: &[PageRef],
+    acked: &mut [bool],
+    ended: &mut bool,
+    log: &mut Option<crate::obs::ReqLog>,
+    idx: usize,
+) -> Poll<Option<Result<PageRef, PoolError>>> {
+    if idx >= dsts.len() {
+        *ended = true;
+        if let Some(mut l) = log.take() {
+            l.finish_err("PAGE_ACK index out of range");
+        }
+        return Poll::Ready(Some(Err(PoolError::transport(FabricError::BadConfig(
+            "PAGE_ACK index out of range",
+        )))));
+    }
+    if acked[idx] {
+        *ended = true;
+        if let Some(mut l) = log.take() {
+            l.finish_err("duplicate PAGE_ACK index");
+        }
+        return Poll::Ready(Some(Err(PoolError::transport(FabricError::BadConfig(
+            "duplicate PAGE_ACK index",
+        )))));
+    }
+    acked[idx] = true;
+    let page = dsts[idx];
+    // Full success carries no RESPONSE_END; the last in-order ack ends the stream.
+    if acked.iter().all(|a| *a) {
+        *ended = true;
+        if let Some(mut l) = log.take() {
+            l.field("acked", acked.len()).finish_ok();
+        }
+    }
+    Poll::Ready(Some(Ok(page)))
 }
 
 fn route_and_serialize<R, P>(router: &P, req: &R) -> FabResult<(PeerId, Vec<u8>)>
@@ -761,7 +768,7 @@ mod tests {
             panic!("expected active stream");
         };
         let payload = bincode::serialize(&PageAck { page_idx }).expect("serialize page ack");
-        shared.push(RecvCompletion {
+        shared.push(RecvCompletion::Framed {
             kind: MsgKind::PageAck,
             payload,
         });
@@ -771,7 +778,7 @@ mod tests {
         let StreamState::Active { shared, .. } = &stream.state else {
             panic!("expected active stream");
         };
-        shared.push(RecvCompletion {
+        shared.push(RecvCompletion::Framed {
             kind: MsgKind::ResponseEnd,
             payload: Vec::new(),
         });

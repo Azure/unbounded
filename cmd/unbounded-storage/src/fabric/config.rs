@@ -94,12 +94,28 @@ pub struct FabricConfig {
     pub progress_poll_us: u32,
     pub runtime: Arc<dyn Threading>,
     pub worker_idx: WorkerIdx,
+    /// Optional CPU placement set for progress threads. When empty,
+    /// progress threads pin to `worker_idx` for the original one-CPU
+    /// behavior. Verbs fabric units set this to the NIC-worker CPUs for
+    /// the HCA so connection CQs can be split across the local progress
+    /// cores.
+    pub progress_worker_indices: Vec<WorkerIdx>,
+    /// Optional CPU placement set for RPC workers. When empty, workers
+    /// pin to `worker_idx` for the original one-CPU behavior. Verbs
+    /// fabric units set this to the serving shards assigned to the HCA so
+    /// RPC page serving scales across the CPUs already local to that unit.
+    pub rpc_worker_indices: Vec<WorkerIdx>,
     pub numa: Option<u16>,
     /// This node's own fabric identity, sent as the connection-manager
     /// private data on every outbound dial so the accepting peer learns
     /// who connected. The daemon assigns the real value; in-process
     /// tests and single-node setups can leave it at the default.
     pub self_peer: PeerId,
+    /// If a routed peer is not directly connected on this fabric unit,
+    /// resolve through the unit's sole connected peer. This is used by
+    /// unit-scoped RDMA layouts where each HCA has one representative
+    /// connection but the p2p ring can still select any configured peer.
+    pub resolve_any_connected: bool,
 }
 
 impl FabricConfig {
@@ -195,13 +211,16 @@ pub fn defaults_for(
         max_connections: 256,
         rpc_worker_threads: 4,
         qps_per_connection: 1,
-        write_pipeline_depth: 1,
+        write_pipeline_depth: 8,
         progress_threads: 2,
         progress_poll_us: 10,
         runtime,
         worker_idx,
+        progress_worker_indices: Vec::new(),
+        rpc_worker_indices: Vec::new(),
         numa: None,
         self_peer: PeerId(0),
+        resolve_any_connected: false,
     }
 }
 

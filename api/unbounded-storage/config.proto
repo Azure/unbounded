@@ -58,6 +58,9 @@ message FabricCfg {
 
   // Progress-thread busy-poll budget in microseconds. Defaults to 10 when unset.
   optional uint32 progress_poll_us = 7;
+
+  // Outstanding reverse-RMA page writes per served request. Defaults to 8 when unset.
+  optional uint32 write_pipeline_depth = 8;
 }
 
 message TcpFabricBinds {

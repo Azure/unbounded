@@ -21,7 +21,13 @@ pub fn peer_spec_to_connection(p: &PeerSpec) -> ConnectionSpec {
 fn peer_address(p: &PeerSpec) -> FabricAddress {
     match p.config.as_ref() {
         Some(peer_spec::Config::Tcp(cfg)) => FabricAddress::socket(cfg.addr.clone()),
-        Some(peer_spec::Config::Rdma(cfg)) => FabricAddress::native(cfg.addr.clone()),
+        Some(peer_spec::Config::Rdma(cfg)) => {
+            if cfg.addr.starts_with("hex:") {
+                FabricAddress::native(cfg.addr.clone())
+            } else {
+                FabricAddress::socket(cfg.addr.clone())
+            }
+        }
         None => FabricAddress::native(""),
     }
 }
@@ -62,5 +68,19 @@ mod tests {
         assert_eq!(c.address, FabricAddress::native("hex:01020304"));
         assert_eq!(c.hca_numa, None);
         assert_eq!(c.tags, p.tags);
+    }
+
+    #[test]
+    fn rdma_peer_socket_addr_maps_to_socket_fabric_address() {
+        let p = PeerSpec {
+            id: 42,
+            tags: Vec::new(),
+            config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
+                addr: "10.0.0.5:47778".into(),
+            })),
+        };
+        let c = peer_spec_to_connection(&p);
+        assert_eq!(c.peer, PeerId(42));
+        assert_eq!(c.address, FabricAddress::socket("10.0.0.5:47778"));
     }
 }

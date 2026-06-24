@@ -110,6 +110,13 @@ impl ConnectionTable {
         self.inner.read().ok().and_then(|m| m.get(&peer).cloned())
     }
 
+    pub(crate) fn lookup_any(&self) -> Option<Arc<cm::Connection>> {
+        self.inner
+            .read()
+            .ok()
+            .and_then(|m| m.values().next().cloned())
+    }
+
     /// Remove and return the connection for `peer`, if present.
     pub(crate) fn remove(&self, peer: PeerId) -> Option<Arc<cm::Connection>> {
         self.inner.write().ok().and_then(|mut m| m.remove(&peer))
@@ -404,11 +411,15 @@ impl Fabric {
     /// remote, so the address is always `FI_ADDR_UNSPEC`. Used by the
     /// RPC submission and reply paths.
     pub(crate) fn resolve_peer(&self, peer: PeerId) -> Result<(*mut ffi::fid_ep, ffi::fi_addr_t)> {
-        let conn = self
-            .inner()
-            .connections
-            .lookup(peer)
-            .ok_or(FabricError::NotFound("peer"))?;
+        let conn = match self.inner().connections.lookup(peer) {
+            Some(conn) => conn,
+            None if self.inner().cfg.resolve_any_connected => self
+                .inner()
+                .connections
+                .lookup_any()
+                .ok_or(FabricError::NotFound("peer"))?,
+            None => return Err(FabricError::NotFound("peer")),
+        };
         Ok((conn.next_ep(), ffi::FI_ADDR_UNSPEC))
     }
 }

@@ -293,8 +293,10 @@ type FabricCfg struct {
 	RpcWorkerThreads *uint32 `protobuf:"varint,6,opt,name=rpc_worker_threads,json=rpcWorkerThreads,proto3,oneof" json:"rpc_worker_threads,omitempty"`
 	// Progress-thread busy-poll budget in microseconds. Defaults to 10 when unset.
 	ProgressPollUs *uint32 `protobuf:"varint,7,opt,name=progress_poll_us,json=progressPollUs,proto3,oneof" json:"progress_poll_us,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Outstanding reverse-RMA page writes per served request. Defaults to 8 when unset.
+	WritePipelineDepth *uint32 `protobuf:"varint,8,opt,name=write_pipeline_depth,json=writePipelineDepth,proto3,oneof" json:"write_pipeline_depth,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *FabricCfg) Reset() {
@@ -385,6 +387,13 @@ func (x *FabricCfg) GetRpcWorkerThreads() uint32 {
 func (x *FabricCfg) GetProgressPollUs() uint32 {
 	if x != nil && x.ProgressPollUs != nil {
 		return *x.ProgressPollUs
+	}
+	return 0
+}
+
+func (x *FabricCfg) GetWritePipelineDepth() uint32 {
+	if x != nil && x.WritePipelineDepth != nil {
+		return *x.WritePipelineDepth
 	}
 	return 0
 }
@@ -2110,7 +2119,7 @@ const file_config_proto_rawDesc = "" +
 	"\tMemoryCfg\x12!\n" +
 	"\fno_hugepages\x18\x01 \x01(\bR\vnoHugepages\x121\n" +
 	"\x12memory_total_bytes\x18\x02 \x01(\x04H\x00R\x10memoryTotalBytes\x88\x01\x01B\x15\n" +
-	"\x13_memory_total_bytes\"\xed\x03\n" +
+	"\x13_memory_total_bytes\"\xbd\x04\n" +
 	"\tFabricCfg\x12<\n" +
 	"\x03tcp\x18\x01 \x01(\v2(.unbounded.storage.config.TcpFabricBindsH\x00R\x03tcp\x12?\n" +
 	"\x04rdma\x18\x02 \x01(\v2).unbounded.storage.config.RdmaFabricBindsH\x00R\x04rdma\x12L\n" +
@@ -2118,12 +2127,14 @@ const file_config_proto_rawDesc = "" +
 	"\fmax_inflight\x18\x04 \x01(\rH\x01R\vmaxInflight\x88\x01\x01\x12.\n" +
 	"\x10progress_threads\x18\x05 \x01(\rH\x02R\x0fprogressThreads\x88\x01\x01\x121\n" +
 	"\x12rpc_worker_threads\x18\x06 \x01(\rH\x03R\x10rpcWorkerThreads\x88\x01\x01\x12-\n" +
-	"\x10progress_poll_us\x18\a \x01(\rH\x04R\x0eprogressPollUs\x88\x01\x01B\a\n" +
+	"\x10progress_poll_us\x18\a \x01(\rH\x04R\x0eprogressPollUs\x88\x01\x01\x125\n" +
+	"\x14write_pipeline_depth\x18\b \x01(\rH\x05R\x12writePipelineDepth\x88\x01\x01B\a\n" +
 	"\x05bindsB\x0f\n" +
 	"\r_max_inflightB\x13\n" +
 	"\x11_progress_threadsB\x15\n" +
 	"\x13_rpc_worker_threadsB\x13\n" +
-	"\x11_progress_poll_us\"$\n" +
+	"\x11_progress_poll_usB\x17\n" +
+	"\x15_write_pipeline_depth\"$\n" +
 	"\x0eTcpFabricBinds\x12\x12\n" +
 	"\x04addr\x18\x01 \x01(\tR\x04addr\"Q\n" +
 	"\x0fRdmaFabricBinds\x12>\n" +

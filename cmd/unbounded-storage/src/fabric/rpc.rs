@@ -363,14 +363,20 @@ impl Fabric {
 
         // Spawn the persistent worker pool before installing the request
         // sink so a request that lands immediately has a consumer
-        // waiting. Pin to this shard's worker index so handler
-        // scratch/MR access stays NUMA-local.
+        // waiting. Pin to the fabric unit's configured worker set so
+        // handler scratch/MR access stays NUMA-local while verbs endpoints
+        // can use every serving CPU assigned to the HCA.
         let runtime = shared.fabric.cfg.runtime.clone();
-        let worker_idx = shared.fabric.cfg.worker_idx;
+        let worker_indices = if shared.fabric.cfg.rpc_worker_indices.is_empty() {
+            vec![shared.fabric.cfg.worker_idx]
+        } else {
+            shared.fabric.cfg.rpc_worker_indices.clone()
+        };
         let pool_size = shared.fabric.cfg.rpc_worker_threads.max(1);
         let mut workers = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
+        for i in 0..pool_size {
             let queue = shared.queue.clone();
+            let worker_idx = worker_indices[i % worker_indices.len()];
             workers.push(runtime.spawn_pinned(
                 worker_idx,
                 "fabric-rpc-worker",

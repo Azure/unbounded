@@ -195,13 +195,27 @@ pub struct CompletionFuture {
 impl Future for CompletionFuture {
     type Output = Result<CompletionInfo>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(r) = self.take_result() {
+            return Poll::Ready(r);
+        }
+
         self.inner.waker.register(cx.waker());
-        let mut result = self.inner.result.lock().expect("completion slot mutex");
-        if let Some(r) = result.take() {
+
+        if let Some(r) = self.take_result() {
             Poll::Ready(r)
         } else {
             Poll::Pending
         }
+    }
+}
+
+impl CompletionFuture {
+    fn take_result(&self) -> Option<Result<CompletionInfo>> {
+        self.inner
+            .result
+            .lock()
+            .expect("completion slot mutex")
+            .take()
     }
 }
 

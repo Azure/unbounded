@@ -323,7 +323,8 @@ fn remote_filtered_object_id(cfg: &LoadgenRun, worker_idx: usize, seq: u64) -> S
 
     let mut ordinal = cfg.seed.wrapping_add(seq);
     loop {
-        let object_id = object_id_with_ordinal(&cfg.frontend_id, cfg.shard_idx, worker_idx, ordinal);
+        let object_id =
+            object_id_with_ordinal(&cfg.frontend_id, cfg.shard_idx, worker_idx, ordinal);
         if stripes.iter().all(|slice| {
             let origin_ref = OriginRef::new(&cfg.backend_id, &object_id, slice.stripe_idx);
             let stripe_ring = stripe_to_ring(origin_ref.stripe_key());

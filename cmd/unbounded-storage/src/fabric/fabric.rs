@@ -180,6 +180,11 @@ impl Fabric {
                             return Err(FabricError::Pkg("ub_fi_hints_set_src_addr", rc));
                         }
                         (None, None)
+                    } else if matches!(cfg.provider, Provider::Verbs) && addr == "0.0.0.0:0" {
+                        // Let verbs pick its native AF_IB source address. Passing an
+                        // IPv4 wildcard here makes fi_getname report an unroutable
+                        // 0.0.0.0 sockaddr on InfiniBand-only Azure RDMA HCAs.
+                        (None, None)
                     } else {
                         let (host, port) = addr.rsplit_once(':').ok_or(FabricError::BadConfig(
                             "listen_addr must be host:port or hex:<bytes>",
@@ -414,6 +419,13 @@ impl Fabric {
     pub fn self_address(&self) -> Result<String> {
         match self.inner.listener.as_ref() {
             Some(l) => l.local_addr(),
+            None => Err(FabricError::BadConfig("fabric is not listening")),
+        }
+    }
+
+    pub fn self_address_native(&self) -> Result<String> {
+        match self.inner.listener.as_ref() {
+            Some(l) => l.local_addr_native(),
             None => Err(FabricError::BadConfig("fabric is not listening")),
         }
     }

@@ -144,7 +144,8 @@ impl fmt::Display for ConfigError {
             ConfigError::RoutingPlanUnknownPeer { id, role } => write!(
                 f,
                 "neighborhood routing_plan {role} {id} does not reference any peer id: every \
-                 routing-plan neighbor must have a matching peer so a fabric connection exists"
+                 routing-plan finger and successor must have a matching peer so a fabric connection \
+                 exists"
             ),
             ConfigError::RoutingPlanSelfReference { id, role } => write!(
                 f,
@@ -505,7 +506,6 @@ fn validate_neighborhood(
             .iter()
             .map(|id| (*id, "finger"))
             .chain(plan.successor.map(|id| (id, "successor")))
-            .chain(plan.predecessor.map(|id| (id, "predecessor")))
         {
             if neighborhood.local_node_id == Some(id) {
                 return Err(ConfigError::RoutingPlanSelfReference { id, role });
@@ -513,6 +513,14 @@ fn validate_neighborhood(
             if !peer_ids.contains(&id) {
                 return Err(ConfigError::RoutingPlanUnknownPeer { id, role });
             }
+        }
+        if let Some(id) = plan.predecessor
+            && neighborhood.local_node_id == Some(id)
+        {
+            return Err(ConfigError::RoutingPlanSelfReference {
+                id,
+                role: "predecessor",
+            });
         }
     }
 
@@ -568,10 +576,11 @@ fn validated_disk_path(disk: &super::schema::DiskSpec) -> Result<&str, ConfigErr
 }
 
 fn is_valid_native_address(addr: &str) -> bool {
-    let Some(hex) = addr.strip_prefix("hex:") else {
-        return false;
-    };
-    is_valid_even_hex(hex)
+    if let Some(hex) = addr.strip_prefix("hex:") {
+        return is_valid_even_hex(hex);
+    }
+
+    addr.parse::<SocketAddr>().is_ok()
 }
 
 fn is_valid_even_hex(s: &str) -> bool {
@@ -830,21 +839,23 @@ addr = "example.com:9000"
 
     #[test]
     fn accepts_native_peer_addr() {
-        let s = format!(
-            r#"{}
+        for addr in ["hex:01020304", "10.0.0.5:47778"] {
+            let s = format!(
+                r#"{}
 [[neighborhoods.peers]]
 id = 9
 
 [neighborhoods.peers.config.rdma]
-addr = "hex:01020304"
+addr = "{addr}"
 "#,
-            neighborhood_toml()
-        );
-        let f = write_cfg(&s);
-        let cfg = load(f.path()).expect("load should succeed");
-        match cfg.neighborhoods[0].peers[0].config.as_ref().unwrap() {
-            peer_spec::Config::Rdma(cfg) => assert_eq!(cfg.addr, "hex:01020304"),
-            other => panic!("expected rdma config, got {other:?}"),
+                neighborhood_toml()
+            );
+            let f = write_cfg(&s);
+            let cfg = load(f.path()).expect("load should succeed");
+            match cfg.neighborhoods[0].peers[0].config.as_ref().unwrap() {
+                peer_spec::Config::Rdma(cfg) => assert_eq!(cfg.addr, addr),
+                other => panic!("expected rdma config, got {other:?}"),
+            }
         }
     }
 
@@ -1525,6 +1536,141 @@ id = 1
         match load(f.path()) {
             Err(ConfigError::MissingPeerConfig(1)) => {}
             other => panic!("expected MissingPeerConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_routing_plan_predecessor_marker_without_peer() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+name = "n"
+source = "b"
+local_node_id = 99
+
+[neighborhoods.routing_plan]
+fingers = [1]
+successor = 1
+predecessor = 2
+
+[[neighborhoods.peers]]
+id = 1
+
+[neighborhoods.peers.config.tcp]
+addr = "10.0.0.1:9000"
+"#;
+        let f = write_cfg(s);
+        let cfg = load(f.path()).expect("predecessor marker should not require a peer");
+        let plan = cfg.neighborhoods[0]
+            .routing_plan
+            .as_ref()
+            .expect("routing plan loaded");
+        assert_eq!(plan.predecessor, Some(2));
+    }
+
+    #[test]
+    fn rejects_routing_plan_unknown_finger() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+name = "n"
+source = "b"
+local_node_id = 99
+
+[neighborhoods.routing_plan]
+fingers = [2]
+successor = 1
+predecessor = 1
+
+[[neighborhoods.peers]]
+id = 1
+
+[neighborhoods.peers.config.tcp]
+addr = "10.0.0.1:9000"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::RoutingPlanUnknownPeer {
+                id: 2,
+                role: "finger",
+            }) => {}
+            other => panic!("expected unknown finger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_routing_plan_unknown_successor() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+name = "n"
+source = "b"
+local_node_id = 99
+
+[neighborhoods.routing_plan]
+fingers = [1]
+successor = 2
+predecessor = 1
+
+[[neighborhoods.peers]]
+id = 1
+
+[neighborhoods.peers.config.tcp]
+addr = "10.0.0.1:9000"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::RoutingPlanUnknownPeer {
+                id: 2,
+                role: "successor",
+            }) => {}
+            other => panic!("expected unknown successor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_routing_plan_predecessor_self_reference() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.fake]
+
+[[neighborhoods]]
+name = "n"
+source = "b"
+local_node_id = 99
+
+[neighborhoods.routing_plan]
+fingers = [1]
+successor = 1
+predecessor = 99
+
+[[neighborhoods.peers]]
+id = 1
+
+[neighborhoods.peers.config.tcp]
+addr = "10.0.0.1:9000"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::RoutingPlanSelfReference {
+                id: 99,
+                role: "predecessor",
+            }) => {}
+            other => panic!("expected predecessor self-reference, got {other:?}"),
         }
     }
 

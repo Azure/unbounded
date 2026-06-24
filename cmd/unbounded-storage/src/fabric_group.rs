@@ -37,7 +37,8 @@ use crate::FabricStartup;
 /// server. The RPC handler resolves cross-node cache misses into these
 /// pages, so the bound is set by RPC concurrency, not shard count: it is
 /// the same for a 1:1 tcp unit and an N:1 verbs unit.
-const RPC_SCRATCH_PAGES: u32 = 8;
+const RPC_SCRATCH_PAGES: u32 = 64;
+const UNIT_SCOPED_PEER_STRIDE: u64 = 10;
 
 /// One libfabric endpoint to bring up, plus the serving shards that will
 /// register their data backings against it. Produced by
@@ -49,6 +50,8 @@ pub struct FabricUnitSpec {
     pub provider: Provider,
     /// Worker the fabric's progress and RPC threads pin to.
     pub worker_idx: WorkerIdx,
+    /// Worker set the fabric's progress threads may spread across.
+    pub progress_worker_indices: Vec<WorkerIdx>,
     pub numa: Option<u16>,
     /// Serving-shard indices that share this endpoint.
     pub shards_assigned: Vec<usize>,
@@ -112,6 +115,7 @@ fn plan_tcp_units(serving_shards: &[ServingShard]) -> FabricPlan {
         device_name: "lo".to_string(),
         provider: Provider::Tcp,
         worker_idx: WorkerIdx(0),
+        progress_worker_indices: vec![WorkerIdx(0)],
         numa: None,
         shards_assigned,
         // One data backing per assigned shard plus the one shared scratch.
@@ -145,13 +149,14 @@ fn plan_verbs_units(
         let device = dev.clone().unwrap_or_else(|| "lo".to_string());
         let unit_idx = *device_to_unit.entry(device.clone()).or_insert_with(|| {
             let idx = units.len();
-            let (worker_idx, numa) =
-                verbs_worker_for_device(&device, serving_count, nic_workers, hca_dev_names);
+            let (worker_idx, progress_worker_indices, numa) =
+                verbs_workers_for_device(&device, serving_count, nic_workers, hca_dev_names);
             units.push(FabricUnitSpec {
                 unit_idx: idx,
                 device_name: device.clone(),
                 provider: Provider::from_device_name(&device),
                 worker_idx,
+                progress_worker_indices,
                 numa,
                 shards_assigned: Vec::new(),
                 expected_mr: 0,
@@ -177,12 +182,12 @@ fn plan_verbs_units(
 /// runtime lays serving shards out at `0..serving_count` and the
 /// nic-worker groups after them, flattened in order, so a group's base
 /// is `serving_count` plus the worker counts of all earlier groups.
-fn verbs_worker_for_device(
+fn verbs_workers_for_device(
     device: &str,
     serving_count: usize,
     nic_workers: &[NicWorkerGroup],
     hca_dev_names: &[String],
-) -> (WorkerIdx, Option<u16>) {
+) -> (WorkerIdx, Vec<WorkerIdx>, Option<u16>) {
     let mut flat_base = 0usize;
 
     for group in nic_workers {
@@ -190,7 +195,10 @@ fn verbs_worker_for_device(
             .get(group.hca)
             .is_some_and(|name| name == device);
         if matches && !group.workers.is_empty() {
-            return (WorkerIdx((serving_count + flat_base) as u16), group.numa);
+            let workers: Vec<WorkerIdx> = (0..group.workers.len())
+                .map(|i| WorkerIdx((serving_count + flat_base + i) as u16))
+                .collect();
+            return (workers[0], workers, group.numa);
         }
         flat_base += group.workers.len();
     }
@@ -198,7 +206,7 @@ fn verbs_worker_for_device(
     // No matching nic-worker group. Unreachable when `shard_devices`
     // came from `assign_shard_devices` over these same `nic_workers`;
     // fall back to worker 0 so the unit still pins somewhere valid.
-    (WorkerIdx(0), None)
+    (WorkerIdx(0), vec![WorkerIdx(0)], None)
 }
 
 /// A live fabric endpoint plus its shared RPC server and the
@@ -228,6 +236,7 @@ struct FabricUnit<S = RpcServerHandle, Rg = BackendRegistry, Rt = RouteTableHand
     handler_registry: Rg,
     routes: Rt,
     fabric: F,
+    unit_idx: usize,
     hca_numa: Option<u16>,
     applied_peers: HashMap<PeerId, ConnectionSpec>,
     last_backends: HashMap<String, BackendSpec>,
@@ -318,7 +327,7 @@ impl FabricGroup {
     /// once per endpoint rather than once per shard.
     pub fn reconcile_peers(&mut self, peers: &[RuntimePeer]) {
         for unit in &mut self.units {
-            let desired = runtime_peer_connections(peers);
+            let desired = runtime_peer_connections_for_unit(peers, unit.unit_idx);
             let report = config::reconcile::reconcile_connections(
                 &unit.fabric,
                 &desired,
@@ -383,31 +392,45 @@ fn build_unit(
     );
     cfg.max_inflight = fabric_startup.max_inflight as usize;
     cfg.rpc_worker_threads = fabric_startup.rpc_worker_threads as usize;
+    cfg.write_pipeline_depth = fabric_startup.write_pipeline_depth as usize;
     cfg.progress_threads = fabric_startup.progress_threads as u8;
     cfg.progress_poll_us = fabric_startup.progress_poll_us;
+    cfg.progress_worker_indices = spec.progress_worker_indices.clone();
+    cfg.rpc_worker_indices = spec
+        .shards_assigned
+        .iter()
+        .map(|&idx| WorkerIdx(idx as u16))
+        .collect();
+    cfg.resolve_any_connected = peers_have_unit_tags(peers);
     cfg.numa = spec.numa;
     // The local peer identity is the connection-manager private data this
     // node sends on every outbound dial; the accepting side keys the
     // inbound connection by it. `defaults_for` leaves it PeerId(0), so it
     // must be set here from the node's configured local id or accepted
     // connections are mis-keyed and `resolve_peer` cannot find the peer.
-    cfg.self_peer = self_peer;
+    let fabric_peer = fabric_unit_peer_id(self_peer, spec.unit_idx, peers_have_unit_tags(peers))?;
+    cfg.self_peer = fabric_peer;
 
     let fabric = Arc::new(Fabric::new(cfg).map_err(|e| format!("worker={worker}: fabric: {e}"))?);
     let self_addr = fabric
         .self_address()
         .map_err(|e| format!("worker={worker}: self_address: {e}"))?;
+    let self_addr_native = fabric
+        .self_address_native()
+        .map_err(|e| format!("worker={worker}: self_address_native: {e}"))?;
     println!(
         "fabric unit up: worker={worker} dev={} provider={:?} numa={} shards={:?} \
-         self_addr={} self_addr_bytes={}",
+         fabric_peer={} self_addr={} self_addr_bytes={} self_addr_native={}",
         spec.device_name,
         spec.provider,
         spec.numa
             .map(|n| n.to_string())
             .unwrap_or_else(|| "none".into()),
         spec.shards_assigned,
+        fabric_peer.0,
         self_addr,
         self_addr.len(),
+        self_addr_native,
     );
 
     // Shared RPC scratch: `RPC_SCRATCH_PAGES` 2 MiB pages. `allocate`
@@ -476,7 +499,7 @@ fn build_unit(
 
     fabric.check_shared_domain_capacity(spec.expected_mr);
 
-    let desired_peers = runtime_peer_connections(peers);
+    let desired_peers = runtime_peer_connections_for_unit(peers, spec.unit_idx);
     let applied_peers =
         config::reconcile::reconcile_connections(&fabric, &desired_peers, None).applied;
     // Seed the desired-peer set so the background reconnect thread can
@@ -492,15 +515,70 @@ fn build_unit(
         handler_registry,
         routes,
         fabric,
+        unit_idx: spec.unit_idx,
         hca_numa: spec.numa,
         applied_peers,
         last_backends,
     })
 }
 
+fn fabric_unit_peer_id(
+    base: PeerId,
+    unit_idx: usize,
+    scoped_peers: bool,
+) -> Result<PeerId, String> {
+    let stride = match std::env::var_os("UNBOUNDED_STORAGE_FABRIC_UNIT_PEER_STRIDE") {
+        Some(raw_stride) => raw_stride
+            .to_string_lossy()
+            .parse::<u64>()
+            .map_err(|e| format!("UNBOUNDED_STORAGE_FABRIC_UNIT_PEER_STRIDE: {e}"))?,
+        None if scoped_peers => UNIT_SCOPED_PEER_STRIDE,
+        None => return Ok(base),
+    };
+    if stride == 0 {
+        return Ok(base);
+    }
+    let offset = stride
+        .checked_mul(unit_idx as u64)
+        .ok_or_else(|| "UNBOUNDED_STORAGE_FABRIC_UNIT_PEER_STRIDE overflow".to_string())?;
+    let peer = base
+        .0
+        .checked_add(offset)
+        .ok_or_else(|| "fabric unit peer id overflow".to_string())?;
+    Ok(PeerId(peer))
+}
+
 fn runtime_peer_connections(peers: &[RuntimePeer]) -> Vec<ConnectionSpec> {
+    runtime_peer_connections_filtered(peers, None)
+}
+
+fn runtime_peer_connections_for_unit(
+    peers: &[RuntimePeer],
+    unit_idx: usize,
+) -> Vec<ConnectionSpec> {
+    if peers_have_unit_tags(peers) {
+        runtime_peer_connections_filtered(peers, Some(unit_idx))
+    } else {
+        runtime_peer_connections(peers)
+    }
+}
+
+fn peers_have_unit_tags(peers: &[RuntimePeer]) -> bool {
     peers
         .iter()
+        .any(|peer| peer_unit_tag(&peer.spec.tags).is_some())
+}
+
+fn runtime_peer_connections_filtered(
+    peers: &[RuntimePeer],
+    unit_idx: Option<usize>,
+) -> Vec<ConnectionSpec> {
+    peers
+        .iter()
+        .filter(|peer| match unit_idx {
+            Some(unit) => peer_unit_tag(&peer.spec.tags) == Some(unit),
+            None => true,
+        })
         .map(|peer| ConnectionSpec {
             peer: peer.fabric_peer_id,
             address: runtime_peer_address(&peer.spec),
@@ -510,13 +588,22 @@ fn runtime_peer_connections(peers: &[RuntimePeer]) -> Vec<ConnectionSpec> {
         .collect()
 }
 
+fn peer_unit_tag(tags: &[String]) -> Option<usize> {
+    tags.iter()
+        .find_map(|tag| tag.strip_prefix("unit=")?.parse::<usize>().ok())
+}
+
 fn runtime_peer_address(peer: &config::PeerSpec) -> fabric::FabricAddress {
     match peer.config.as_ref() {
         Some(config::peer_spec::Config::Tcp(cfg)) => {
             fabric::FabricAddress::socket(cfg.addr.clone())
         }
         Some(config::peer_spec::Config::Rdma(cfg)) => {
-            fabric::FabricAddress::native(cfg.addr.clone())
+            if cfg.addr.starts_with("hex:") {
+                fabric::FabricAddress::native(cfg.addr.clone())
+            } else {
+                fabric::FabricAddress::socket(cfg.addr.clone())
+            }
         }
         None => fabric::FabricAddress::native(""),
     }
@@ -562,6 +649,12 @@ mod tests {
                 })),
             },
         }
+    }
+
+    fn runtime_peer_with_tags(id: u64, addr: &str, tags: &[&str]) -> RuntimePeer {
+        let mut peer = runtime_peer(id, addr);
+        peer.spec.tags = tags.iter().map(|tag| tag.to_string()).collect();
+        peer
     }
 
     #[test]
@@ -669,6 +762,23 @@ mod tests {
             fabric::FabricAddress::native("hex:ff")
         );
         assert_eq!(connections[1].hca_numa, None);
+    }
+
+    #[test]
+    fn unit_tags_scope_peer_connections_to_matching_fabric_unit() {
+        let peers = [
+            runtime_peer_with_tags(1, "hex:00", &["unit=0"]),
+            runtime_peer_with_tags(2, "hex:11", &["unit=1"]),
+            runtime_peer_with_tags(3, "hex:22", &["role=unscoped"]),
+        ];
+
+        let unit0 = runtime_peer_connections_for_unit(&peers, 0);
+        let unit1 = runtime_peer_connections_for_unit(&peers, 1);
+
+        assert_eq!(unit0.len(), 1);
+        assert_eq!(unit0[0].peer, PeerId(1));
+        assert_eq!(unit1.len(), 1);
+        assert_eq!(unit1[0].peer, PeerId(2));
     }
 
     /// Drop-logging stand-in for a `FabricUnit` resource: records its

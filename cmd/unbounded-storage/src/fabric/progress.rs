@@ -131,13 +131,16 @@ unsafe impl Sync for ProgressGroup {}
 
 impl ProgressGroup {
     /// Spawn the progress pool. Creates `cfg.progress_threads` (at least
-    /// one) threads pinned to `cfg.worker_idx`, each labeled with the
-    /// fabric's NUMA node (`cfg.numa`, defaulting to 0). In a daemon
-    /// that runs one fabric per NUMA node this yields one progress
-    /// thread per NUMA across the process.
+    /// one) threads pinned round-robin over `cfg.progress_worker_indices`
+    /// when set, otherwise to `cfg.worker_idx` for the original layout.
     pub(crate) fn new(cfg: &FabricConfig) -> Result<Self> {
         let count = (cfg.progress_threads as usize).max(1);
         let numa = cfg.numa.unwrap_or(0);
+        let worker_indices = if cfg.progress_worker_indices.is_empty() {
+            vec![cfg.worker_idx]
+        } else {
+            cfg.progress_worker_indices.clone()
+        };
         let mut threads = Vec::with_capacity(count);
 
         for i in 0..count {
@@ -152,9 +155,10 @@ impl ProgressGroup {
             let loop_epoch = Arc::clone(&epoch);
             let poll_us = cfg.progress_poll_us;
             let name = format!("fabric-progress-{numa}-{i}");
+            let worker_idx = worker_indices[i % worker_indices.len()];
 
             let handle = cfg.runtime.spawn_pinned(
-                cfg.worker_idx,
+                worker_idx,
                 &name,
                 Box::new(move || {
                     progress_loop(
@@ -236,8 +240,15 @@ impl ProgressGroup {
 
     fn pick_thread(&self, numa: Option<u16>) -> usize {
         if let Some(n) = numa {
-            if let Some(i) = self.threads.iter().position(|t| t.numa == n) {
-                return i;
+            let matching: Vec<usize> = self
+                .threads
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| (t.numa == n).then_some(i))
+                .collect();
+            if !matching.is_empty() {
+                let offset = self.next.fetch_add(1, Ordering::Relaxed) % matching.len();
+                return matching[offset];
             }
         }
         self.next.fetch_add(1, Ordering::Relaxed) % self.threads.len()
@@ -271,7 +282,9 @@ fn progress_loop(
         epoch.fetch_add(1, Ordering::Release);
         let cqs = registry.snapshot();
         if cqs.is_empty() {
-            std::thread::sleep(idle);
+            if !idle.is_zero() {
+                std::thread::sleep(idle);
+            }
             continue;
         }
 
@@ -306,7 +319,9 @@ fn progress_loop(
         }
 
         if !any {
-            std::thread::sleep(idle);
+            if !idle.is_zero() {
+                std::thread::sleep(idle);
+            }
         }
     }
 }

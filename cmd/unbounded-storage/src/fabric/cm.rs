@@ -145,6 +145,10 @@ impl Listener {
         getname_string(ffi::as_fid_pep(self.pep))
     }
 
+    pub(crate) fn local_addr_native(&self) -> Result<String> {
+        getname_native_string(ffi::as_fid_pep(self.pep))
+    }
+
     /// Block until one peer's full multi-QP connection is established on
     /// `domain` and return it. The returned connection borrows this
     /// listener's EQ, so it must be dropped before the listener.
@@ -740,6 +744,29 @@ fn connect_private(local: PeerId, qp_index: u16, qp_total: u16) -> [u8; CONNECT_
 /// `fi_getname` on `fid`, formatted as numeric "ip:port" when it is a
 /// socket address, otherwise as `hex:<fi_getname-bytes>`.
 fn getname_string(fid: *mut ffi::fid) -> Result<String> {
+    let addr = getname_bytes(fid)?;
+
+    let mut out = [0i8; 128];
+    let written = unsafe {
+        ffi::ub_fi_format_sockaddr(
+            addr.as_ptr() as *const std::ffi::c_void,
+            addr.len(),
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    };
+    if written < 0 {
+        return Ok(encode_native_addr(&addr));
+    }
+    let bytes: Vec<u8> = out[..written as usize].iter().map(|&b| b as u8).collect();
+    String::from_utf8(bytes).map_err(|_| FabricError::NotFound("sockaddr not utf8"))
+}
+
+fn getname_native_string(fid: *mut ffi::fid) -> Result<String> {
+    getname_bytes(fid).map(|addr| encode_native_addr(&addr))
+}
+
+fn getname_bytes(fid: *mut ffi::fid) -> Result<Vec<u8>> {
     let mut len: usize = 0;
     let rc = unsafe { ffi::ub_fi_getname(fid, ptr::null_mut(), &mut len) };
     if rc != 0 && len == 0 {
@@ -750,21 +777,7 @@ fn getname_string(fid: *mut ffi::fid) -> Result<String> {
         unsafe { ffi::ub_fi_getname(fid, addr.as_mut_ptr() as *mut std::ffi::c_void, &mut len) };
     check("fi_getname", rc)?;
     addr.truncate(len);
-
-    let mut out: [std::ffi::c_char; 128] = [0; 128];
-    let written = unsafe {
-        ffi::ub_fi_format_sockaddr(
-            addr.as_ptr() as *const std::ffi::c_void,
-            len,
-            out.as_mut_ptr(),
-            out.len(),
-        )
-    };
-    if written < 0 {
-        return Ok(encode_native_addr(&addr));
-    }
-    let bytes: Vec<u8> = out[..written as usize].iter().map(|&b| b as u8).collect();
-    String::from_utf8(bytes).map_err(|_| FabricError::NotFound("sockaddr not utf8"))
+    Ok(addr)
 }
 
 fn encode_native_addr(addr: &[u8]) -> String {
