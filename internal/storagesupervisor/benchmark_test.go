@@ -19,6 +19,13 @@ func benchmarkNode(name string, annotations map[string]string) *corev1.Node {
 	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: annotations}}
 }
 
+func benchmarkNodeWithIP(name string, annotations map[string]string, ip string) *corev1.Node {
+	node := benchmarkNode(name, annotations)
+	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: ip}}
+
+	return node
+}
+
 func decodeWithBenchmarks(t *testing.T, dir string, benchmarks benchmarkState) *storageconfig.Config {
 	t.Helper()
 
@@ -47,7 +54,7 @@ func TestComputeBenchmarksSourceNode(t *testing.T) {
 	})
 	target := benchmarkNode("target-b", map[string]string{benchmarkRdmaAddrAnnotation: "hex:0a0b"})
 
-	state := computeBenchmarks([]*corev1.Node{target, source}, "source-a")
+	state := computeBenchmarks([]*corev1.Node{target, source}, "source-a", 0)
 
 	require.Len(t, state.rdmaLoadgens, 1)
 	bench := state.rdmaLoadgens[0]
@@ -88,7 +95,7 @@ func TestComputeBenchmarksCacheMissSourceNode(t *testing.T) {
 	})
 	target := benchmarkNode("target-b", map[string]string{benchmarkRdmaAddrAnnotation: "hex:0a0b"})
 
-	state := computeBenchmarks([]*corev1.Node{target, source}, "source-a")
+	state := computeBenchmarks([]*corev1.Node{target, source}, "source-a", 0)
 
 	require.Len(t, state.rdmaLoadgens, 1)
 	bench := state.rdmaLoadgens[0]
@@ -120,7 +127,7 @@ func TestComputeBenchmarksTargetNode(t *testing.T) {
 	})
 	target := benchmarkNode("target-b", map[string]string{benchmarkRdmaAddrAnnotation: "hex:0304"})
 
-	state := computeBenchmarks([]*corev1.Node{source, target}, "target-b")
+	state := computeBenchmarks([]*corev1.Node{source, target}, "target-b", 0)
 
 	require.Len(t, state.rdmaLoadgens, 1)
 	bench := state.rdmaLoadgens[0]
@@ -134,18 +141,17 @@ func TestComputeBenchmarksTargetNode(t *testing.T) {
 }
 
 func TestComputeBenchmarksTCPSourceNode(t *testing.T) {
-	source := benchmarkNode("source-a", map[string]string{
+	source := benchmarkNodeWithIP("source-a", map[string]string{
 		benchmarkScenarioAnnotation:        tcpCacheMissScenario,
 		benchmarkTargetNodeAnnotation:      "target-b",
-		benchmarkTCPAddrAnnotation:         "10.0.0.1:19001",
 		benchmarkReadBytesAnnotation:       "4096",
 		benchmarkObjectSizeBytesAnnotation: "16384",
 		benchmarkDiskPathAnnotation:        "/var/lib/unbounded/bench-cache.bin",
 		benchmarkDiskSizeBytesAnnotation:   "104857600",
-	})
-	target := benchmarkNode("target-b", map[string]string{benchmarkTCPAddrAnnotation: "10.0.0.2:19001"})
+	}, "10.0.0.1")
+	target := benchmarkNodeWithIP("target-b", nil, "10.0.0.2")
 
-	state := computeBenchmarks([]*corev1.Node{target, source}, "source-a")
+	state := computeBenchmarks([]*corev1.Node{target, source}, "source-a", 19001)
 
 	require.Len(t, state.rdmaLoadgens, 1)
 	bench := state.rdmaLoadgens[0]
@@ -157,17 +163,30 @@ func TestComputeBenchmarksTCPSourceNode(t *testing.T) {
 	assert.True(t, bench.peerTCP)
 }
 
-func TestComputeBenchmarksTCPSourceAndRDMATargetSkipped(t *testing.T) {
-	source := benchmarkNode("source-a", map[string]string{
+func TestComputeBenchmarksTCPMissingTargetInternalIPSkipped(t *testing.T) {
+	source := benchmarkNodeWithIP("source-a", map[string]string{
 		benchmarkScenarioAnnotation:   tcpLoadgenScenario,
 		benchmarkTargetNodeAnnotation: "target-b",
-		benchmarkTCPAddrAnnotation:    "10.0.0.1:19001",
-	})
+	}, "10.0.0.1")
 	target := benchmarkNode("target-b", map[string]string{benchmarkRdmaAddrAnnotation: "hex:0304"})
 
-	state := computeBenchmarks([]*corev1.Node{target, source}, "source-a")
+	state := computeBenchmarks([]*corev1.Node{target, source}, "source-a", 19001)
 
 	assert.Empty(t, state.rdmaLoadgens)
+}
+
+func TestComputeBenchmarksTCPPortAnnotationOverridesDefault(t *testing.T) {
+	source := benchmarkNodeWithIP("source-a", map[string]string{
+		benchmarkScenarioAnnotation:   tcpLoadgenScenario,
+		benchmarkTargetNodeAnnotation: "target-b",
+		benchmarkTCPPortAnnotation:    "19002",
+	}, "10.0.0.1")
+	target := benchmarkNodeWithIP("target-b", map[string]string{benchmarkTCPPortAnnotation: "19003"}, "10.0.0.2")
+
+	state := computeBenchmarks([]*corev1.Node{target, source}, "source-a", 19001)
+
+	require.Len(t, state.rdmaLoadgens, 1)
+	assert.Equal(t, "10.0.0.2:19003", state.rdmaLoadgens[0].peerAddr)
 }
 
 func TestComputeBenchmarksSkipsInvalidAnnotations(t *testing.T) {
@@ -205,13 +224,12 @@ func TestComputeBenchmarksSkipsInvalidAnnotations(t *testing.T) {
 			includePeer: true,
 		},
 		{
-			name: "bad tcp addr",
+			name: "tcp target missing internal ip",
 			source: map[string]string{
-				benchmarkScenarioAnnotation:   rdmaLoadgenScenario,
+				benchmarkScenarioAnnotation:   tcpLoadgenScenario,
 				benchmarkTargetNodeAnnotation: "target-b",
-				benchmarkTCPAddrAnnotation:    "10.0.0.1",
 			},
-			target:      map[string]string{benchmarkTCPAddrAnnotation: "10.0.0.2:19001"},
+			target:      map[string]string{},
 			includePeer: true,
 		},
 		{
@@ -268,7 +286,7 @@ func TestComputeBenchmarksSkipsInvalidAnnotations(t *testing.T) {
 				nodes = append(nodes, benchmarkNode("target-b", tt.target))
 			}
 
-			state := computeBenchmarks(nodes, "source-a")
+			state := computeBenchmarks(nodes, "source-a", 19001)
 			assert.Empty(t, state.rdmaLoadgens)
 		})
 	}

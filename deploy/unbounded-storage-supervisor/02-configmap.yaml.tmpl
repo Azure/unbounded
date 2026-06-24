@@ -34,11 +34,11 @@ metadata:
 #   unbounded-cloud.io/storage-benchmark.target-node: <target-node-name>
 # Both source and target nodes carry either their provider-native RDMA endpoint:
 #   unbounded-cloud.io/storage-rdma.addr: hex:<fi_getname-bytes>
-# or their libfabric TCP socket endpoint:
-#   unbounded-cloud.io/storage-tcp.addr: <host>:<port>
-# The two nodes in one benchmark must use the same address annotation. Use
-# storage-tcp.addr with startup.fabric.tcp and startup.topology.disable_rdma for
-# benchmark runs over the libfabric TCP provider.
+# or use the Node InternalIP plus the startup.fabric.tcp.addr port for libfabric
+# TCP. Override the per-node TCP port only when needed with:
+#   unbounded-cloud.io/storage-tcp.port: <port>
+# Use startup.fabric.tcp and startup.topology.disable_rdma for benchmark runs
+# over the libfabric TCP provider.
 # Optional source-node knobs map directly to the daemon's loadgen/fake backend
 # settings: storage-benchmark.workers, seed, object-count, read-bytes, verify,
 # stripe-size-bytes, and object-size-bytes. The loadgen scenarios render a fake

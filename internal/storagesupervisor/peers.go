@@ -53,7 +53,8 @@ type ringState struct {
 }
 
 // nodeSnapshot is the node-derived supervisor overlay. The TCP storage ring
-// needs a fixed port from source config; benchmark annotations do not.
+// needs a fixed port from source config; TCP benchmark annotations reuse it as
+// their default port.
 type nodeSnapshot struct {
 	ring       ringState
 	benchmarks benchmarkState
@@ -182,7 +183,7 @@ func (w *peerWatcher) snapshot(port int, portOK bool) nodeSnapshot {
 		}
 	}
 
-	snapshot := nodeSnapshot{benchmarks: computeBenchmarks(nodes, w.selfName)}
+	snapshot := nodeSnapshot{benchmarks: computeBenchmarks(nodes, w.selfName, port)}
 	if !portOK || port == 0 {
 		slog.Warn("storage ring inactive: no fixed fabric port set in startup.fabric.tcp.addr; "+
 			"set a non-zero port (e.g. 0.0.0.0:9000) to enable peering", "node", w.selfName)

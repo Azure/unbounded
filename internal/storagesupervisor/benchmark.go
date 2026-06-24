@@ -33,7 +33,7 @@ const (
 	benchmarkDiskSizeBytesAnnotation   = "unbounded-cloud.io/storage-benchmark.disk-size-bytes"
 	benchmarkWarmupOpsAnnotation       = "unbounded-cloud.io/storage-benchmark.warmup-operations"
 	benchmarkRdmaAddrAnnotation        = "unbounded-cloud.io/storage-rdma.addr"
-	benchmarkTCPAddrAnnotation         = "unbounded-cloud.io/storage-tcp.addr"
+	benchmarkTCPPortAnnotation         = "unbounded-cloud.io/storage-tcp.port"
 
 	rdmaLoadgenScenario   = "rdma-loadgen"
 	rdmaCacheMissScenario = "rdma-cache-miss"
@@ -80,7 +80,7 @@ type rdmaLoadgenBenchmark struct {
 // computeBenchmarks turns Node annotations into benchmark overlays relevant to
 // selfName. A source node carries the scenario and target annotations; both the
 // source and target nodes carry matching fabric address annotations.
-func computeBenchmarks(nodes []*corev1.Node, selfName string) benchmarkState {
+func computeBenchmarks(nodes []*corev1.Node, selfName string, defaultTCPPort int) benchmarkState {
 	if selfName == "" {
 		return benchmarkState{}
 	}
@@ -119,7 +119,7 @@ func computeBenchmarks(nodes []*corev1.Node, selfName string) benchmarkState {
 			continue
 		}
 
-		bench, ok := parseRDMALoadgenBenchmark(source, byName, selfName, isRDMACacheMissScenario(scenario))
+		bench, ok := parseRDMALoadgenBenchmark(source, byName, selfName, isRDMACacheMissScenario(scenario), isTCPScenario(scenario), defaultTCPPort)
 		if !ok {
 			continue
 		}
@@ -134,7 +134,7 @@ func computeBenchmarks(nodes []*corev1.Node, selfName string) benchmarkState {
 	return state
 }
 
-func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Node, selfName string, cacheMiss bool) (rdmaLoadgenBenchmark, bool) {
+func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Node, selfName string, cacheMiss, tcp bool, defaultTCPPort int) (rdmaLoadgenBenchmark, bool) {
 	targetName := strings.TrimSpace(source.Annotations[benchmarkTargetNodeAnnotation])
 	if targetName == "" {
 		slog.Warn("skipping RDMA storage benchmark without target node annotation",
@@ -161,25 +161,18 @@ func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Nod
 		return rdmaLoadgenBenchmark{}, false
 	}
 
-	sourceAddr, sourceTCP, ok := benchmarkAddr(source)
+	sourceAddr, ok := benchmarkAddr(source, tcp, defaultTCPPort)
 	if !ok {
 		slog.Warn("skipping storage benchmark because source node has no valid fabric address",
-			"node", source.Name, "rdma_annotation", benchmarkRdmaAddrAnnotation, "tcp_annotation", benchmarkTCPAddrAnnotation)
+			"node", source.Name, "rdma_annotation", benchmarkRdmaAddrAnnotation, "tcp_port_annotation", benchmarkTCPPortAnnotation)
 
 		return rdmaLoadgenBenchmark{}, false
 	}
 
-	targetAddr, targetTCP, ok := benchmarkAddr(target)
+	targetAddr, ok := benchmarkAddr(target, tcp, defaultTCPPort)
 	if !ok {
 		slog.Warn("skipping storage benchmark because target node has no valid fabric address",
-			"node", source.Name, "target", targetName, "rdma_annotation", benchmarkRdmaAddrAnnotation, "tcp_annotation", benchmarkTCPAddrAnnotation)
-
-		return rdmaLoadgenBenchmark{}, false
-	}
-
-	if sourceTCP != targetTCP {
-		slog.Warn("skipping storage benchmark because source and target use different fabric address annotations",
-			"node", source.Name, "target", targetName, "tcp_annotation", benchmarkTCPAddrAnnotation, "rdma_annotation", benchmarkRdmaAddrAnnotation)
+			"node", source.Name, "target", targetName, "rdma_annotation", benchmarkRdmaAddrAnnotation, "tcp_port_annotation", benchmarkTCPPortAnnotation)
 
 		return rdmaLoadgenBenchmark{}, false
 	}
@@ -262,7 +255,7 @@ func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Nod
 		localNodeID:     sourceID,
 		peerNodeID:      targetID,
 		peerAddr:        targetAddr,
-		peerTCP:         targetTCP,
+		peerTCP:         tcp,
 		cacheMiss:       cacheMiss,
 		workers:         workers,
 		seed:            seed,
@@ -280,7 +273,7 @@ func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Nod
 		bench.localNodeID = targetID
 		bench.peerNodeID = sourceID
 		bench.peerAddr = sourceAddr
-		bench.peerTCP = sourceTCP
+		bench.peerTCP = tcp
 	}
 
 	return bench, true
@@ -438,6 +431,15 @@ func isRDMACacheMissScenario(scenario string) bool {
 	}
 }
 
+func isTCPScenario(scenario string) bool {
+	switch strings.ToLower(strings.TrimSpace(scenario)) {
+	case tcpLoadgenScenario, tcpCacheMissScenario:
+		return true
+	default:
+		return false
+	}
+}
+
 func rdmaAddr(node *corev1.Node) (string, bool) {
 	if node == nil || node.Annotations == nil {
 		return "", false
@@ -460,38 +462,43 @@ func rdmaAddr(node *corev1.Node) (string, bool) {
 	return "hex:" + strings.ToLower(payload), true
 }
 
-func benchmarkAddr(node *corev1.Node) (string, bool, bool) {
-	if addr, ok := tcpAddr(node); ok {
-		return addr, true, true
+func benchmarkAddr(node *corev1.Node, tcp bool, defaultTCPPort int) (string, bool) {
+	if tcp {
+		return tcpAddr(node, defaultTCPPort)
 	}
 
-	if addr, ok := rdmaAddr(node); ok {
-		return addr, false, true
-	}
-
-	return "", false, false
+	return rdmaAddr(node)
 }
 
-func tcpAddr(node *corev1.Node) (string, bool) {
-	if node == nil || node.Annotations == nil {
+func tcpAddr(node *corev1.Node, defaultPort int) (string, bool) {
+	if node == nil {
 		return "", false
 	}
 
-	addr := strings.TrimSpace(node.Annotations[benchmarkTCPAddrAnnotation])
-	if addr == "" {
+	host := internalIP(node)
+	if host == "" {
 		return "", false
 	}
 
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil || strings.TrimSpace(host) == "" || strings.TrimSpace(port) == "" {
+	port := defaultPort
+
+	if node.Annotations != nil {
+		raw := strings.TrimSpace(node.Annotations[benchmarkTCPPortAnnotation])
+		if raw != "" {
+			parsed, err := strconv.ParseUint(raw, 10, 16)
+			if err != nil || parsed == 0 {
+				return "", false
+			}
+
+			port = int(parsed)
+		}
+	}
+
+	if port == 0 {
 		return "", false
 	}
 
-	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
-		return "", false
-	}
-
-	return net.JoinHostPort(host, port), true
+	return net.JoinHostPort(host, strconv.Itoa(port)), true
 }
 
 func parseUint32Annotation(node *corev1.Node, key string) (*uint32, bool) {
