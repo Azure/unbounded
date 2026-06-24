@@ -422,11 +422,15 @@ impl<B: BlockDevice> BTreeIndex<B> {
     /// Look up `key` by using the current snapshot's internal-node
     /// cache, then reading the terminal leaf from disk.
     pub async fn lookup(&self, key: &PageKey) -> Result<Option<LeafEntry>, Error> {
-        let (root_lba, internal_cache) = {
-            let snap = self.root.load();
-            (snap.root_lba, snap.internal_cache.clone())
-        };
-        cow::lookup(&*self.device, &self.scratch, root_lba, &internal_cache, key).await
+        let snap = self.root.load();
+        cow::lookup(
+            &*self.device,
+            &self.scratch,
+            snap.root_lba,
+            &snap.internal_cache,
+            key,
+        )
+        .await
     }
 
     /// Apply a batch of mutations atomically. Must be called by
