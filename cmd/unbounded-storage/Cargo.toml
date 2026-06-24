@@ -29,7 +29,7 @@ toml = "0.8"
 notify = "6"
 prometheus = { version = "0.13", default-features = false }
 prost = "0.13"
-pprof = { version = "0.14", default-features = false, features = ["protobuf-codec"], optional = true }
+pprof = { version = "0.15", default-features = false, features = ["protobuf-codec"], optional = true }
 
 [features]
 # CPU sampling profiler. Off by default so standard builds stay
