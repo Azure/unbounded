@@ -35,6 +35,13 @@ func node(name, ring, ip string) *corev1.Node {
 	return n
 }
 
+func nodeWithAnnotations(name, ring, ip string, annotations map[string]string) *corev1.Node {
+	n := node(name, ring, ip)
+	n.Annotations = annotations
+
+	return n
+}
+
 func TestNodeIDStableAndNonZero(t *testing.T) {
 	// Deterministic across calls and distinct for distinct names.
 	assert.Equal(t, nodeID("node-a"), nodeID("node-a"))
@@ -195,7 +202,7 @@ func TestPeerWatcherSnapshotInactiveWithoutPort(t *testing.T) {
 	require.NoError(t, w.Start(ctx))
 
 	// portOK=false -> inactive regardless of membership.
-	assert.False(t, w.snapshot(0, false).active)
+	assert.False(t, w.snapshot(0, false).ring.active)
 }
 
 func TestPeerWatcherSnapshotFromInformer(t *testing.T) {
@@ -219,11 +226,44 @@ func TestPeerWatcherSnapshotFromInformer(t *testing.T) {
 
 	require.NoError(t, w.Start(ctx))
 
-	ring := w.snapshot(9000, true)
+	state := w.snapshot(9000, true)
+	ring := state.ring
 
 	require.True(t, ring.active)
 	assert.Equal(t, "10.0.0.1:9000", ring.selfListenAddr)
 	require.Len(t, ring.peers, 1)
 	assert.Equal(t, nodeID("peer-a"), ring.peers[0].GetId())
 	assert.Equal(t, "10.0.0.2:9000", ring.peers[0].GetTcp().GetAddr())
+}
+
+func TestPeerWatcherSnapshotIncludesSelfAnnotations(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		nodeWithAnnotations("self", "", "10.0.0.1", map[string]string{
+			storageDisksAnnotation:    "/dev/nvme1n1",
+			storageFileSizeAnnotation: "4294967296",
+		}),
+		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
+			storageDisksAnnotation: "/dev/nvme2n1",
+		}),
+	)
+
+	w, err := newPeerWatcher(Config{
+		NodeName:         "self",
+		StorageRingLabel: testRingLabel,
+	}, cs)
+	require.NoError(t, err)
+	require.NotNil(t, w)
+
+	defer w.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, w.Start(ctx))
+
+	state := w.snapshot(0, false)
+
+	assert.False(t, state.ring.active)
+	assert.Equal(t, "/dev/nvme1n1", state.annotations[storageDisksAnnotation])
+	assert.Equal(t, "4294967296", state.annotations[storageFileSizeAnnotation])
 }

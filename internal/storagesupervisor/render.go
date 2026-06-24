@@ -18,9 +18,14 @@ import (
 	storageconfig "github.com/Azure/unbounded/api/unbounded-storage"
 )
 
+type renderState struct {
+	ring        ringState
+	annotations map[string]string
+}
+
 // RenderConfig reads the daemon Config expressed as YAML from the projected
 // ConfigMap (a single sourceConfigFile under sourceDir), unmarshals it into the
-// protobuf Config message, overlays the per-node ring state, and returns the
+// protobuf Config message, overlays the per-node render state, and returns the
 // daemon's binary protobuf config wire format.
 //
 // The YAML is the full Config schema (api/unbounded-storage/config.proto) with
@@ -29,21 +34,25 @@ import (
 // proto3 zero value, which the daemon promotes to the documented default.
 //
 // The per-node sections (neighborhood local_node_id and discovered peer sets)
-// come from ring, computed from the Kubernetes node watch. When the ring is
+// come from state, computed from the Kubernetes node watch. When the ring is
 // active, this node's id is injected into every declared neighborhood,
 // discovered peers are merged with any neighborhood peers declared in the YAML
 // (discovered peers win on id collision), and startup.fabric.tcp.addr is
-// overridden with the node's own routable bind. When the ring is inactive (no
-// node watch, no ring membership, or no fixed fabric port) the YAML is rendered
-// as-is, including any hand-declared neighborhoods/peers.
-func RenderConfig(sourceDir string, ring ringState) ([]byte, error) {
+// overridden with the node's own routable bind. Diskless caches are populated
+// from the self node's storage disk annotations, or from a default file-backed
+// disk when no valid annotation disks are present.
+func RenderConfig(sourceDir string, state renderState) ([]byte, error) {
 	cfg, err := loadSourceConfig(sourceDir)
 	if err != nil {
 		return nil, err
 	}
 
-	if ring.active {
-		applyRing(cfg, ring)
+	if state.ring.active {
+		applyRing(cfg, state.ring)
+	}
+
+	if err := applyDiskOverlay(cfg, state.annotations); err != nil {
+		return nil, err
 	}
 
 	out, err := proto.Marshal(cfg)

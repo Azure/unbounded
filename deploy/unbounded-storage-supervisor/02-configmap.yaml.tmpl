@@ -25,6 +25,14 @@ metadata:
 # neighborhoods here when this deployment should participate in a P2P ring; the
 # supervisor will not invent one because each neighborhood needs an explicit
 # source backend.
+#
+# Cache disks may be declared explicitly in caches[].disks. If exactly one cache
+# omits disks, the supervisor fills it from this node's annotations:
+# unbounded-cloud.io/storage-disks is a comma-separated list of block disks such
+# as /dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0. When that
+# annotation is absent or has no valid disks, the supervisor uses one
+# file-backed disk at /var/lib/unbounded-storage/cache.disk sized by
+# unbounded-cloud.io/storage-file-size-bytes, defaulting to 2 GiB.
 data:
   config.yaml: |
     # Operator-assigned config version (opaque counter; 0 means unversioned).
