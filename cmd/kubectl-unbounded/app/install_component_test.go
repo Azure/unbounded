@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	machinadeploy "github.com/Azure/unbounded/deploy/machina"
+	machineopsdeploy "github.com/Azure/unbounded/deploy/machine-ops"
 )
 
 // discardLogger returns a logger that discards all output.
@@ -751,6 +752,41 @@ func TestNewInstallMachina_EmbeddedFallback(t *testing.T) {
 	require.NotNil(t, im.embeddedFS, "embeddedFS should be set when fileOrURL is empty")
 }
 
+func TestNewInstallMachineOps(t *testing.T) {
+	logger := discardLogger()
+	kubeResourcesCli := fakeclient.NewClientBuilder().Build()
+	kubeCli := fake.NewClientset()
+	httpCli := &http.Client{Timeout: 30 * time.Second}
+
+	im := newInstallMachineOps("https://example.com/machine-ops.tar.gz", httpCli, logger, kubeResourcesCli, kubeCli)
+
+	require.NotNil(t, im)
+	require.NotNil(t, im.kubeComponentInstaller)
+	require.Equal(t, "https://example.com/machine-ops.tar.gz", im.fileOrURL)
+	require.Equal(t, httpCli, im.httpClient)
+	require.Equal(t, logger, im.logger)
+	require.Equal(t, kubeResourcesCli, im.kubeResourcesCli)
+	require.Equal(t, kubeCli, im.kubeCli)
+	require.Equal(t, machineOpsNamespace, im.namespace)
+	require.Equal(t, machineOpsControllerName, im.controllerName)
+	require.Equal(t, "machine-ops", im.tempPrefix)
+	require.Equal(t, 5*time.Minute, im.waitTimeout)
+	require.Equal(t, 5*time.Second, im.pollInterval)
+	require.Nil(t, im.embeddedFS, "embeddedFS should be nil when fileOrURL is provided")
+}
+
+func TestNewInstallMachineOps_EmbeddedFallback(t *testing.T) {
+	logger := discardLogger()
+	kubeResourcesCli := fakeclient.NewClientBuilder().Build()
+	kubeCli := fake.NewClientset()
+
+	im := newInstallMachineOps("", nil, logger, kubeResourcesCli, kubeCli)
+
+	require.NotNil(t, im)
+	require.Equal(t, "", im.fileOrURL)
+	require.NotNil(t, im.embeddedFS, "embeddedFS should be set when fileOrURL is empty")
+}
+
 func TestNewInstallUnboundedCNI(t *testing.T) {
 	logger := discardLogger()
 	kubeResourcesCli := fakeclient.NewClientBuilder().Build()
@@ -771,6 +807,37 @@ func TestNewInstallUnboundedCNI(t *testing.T) {
 	require.Equal(t, "unbounded-net", iu.tempPrefix)
 	require.Equal(t, 5*time.Minute, iu.waitTimeout)
 	require.Equal(t, 5*time.Second, iu.pollInterval)
+}
+
+func TestMaterializeEmbeddedMachineOpsFS(t *testing.T) {
+	inst := &kubeComponentInstaller{
+		embeddedFS: machineopsdeploy.Manifests,
+		tempPrefix: "test-materialize-machine-ops",
+	}
+
+	dir, err := inst.materializeEmbeddedFS()
+	require.NoError(t, err)
+
+	defer func() {
+		require.NoError(t, os.RemoveAll(dir))
+	}()
+
+	for _, name := range []string{
+		"00-namespace.yaml",
+		"01-serviceaccount.yaml",
+		"02-rbac.yaml",
+		"03-deployment.yaml",
+	} {
+		info, err := os.Stat(filepath.Join(dir, name))
+		require.NoError(t, err, "expected %s to exist", name)
+		require.False(t, info.IsDir())
+		require.Greater(t, info.Size(), int64(0), "%s should not be empty", name)
+	}
+
+	rbac, err := os.ReadFile(filepath.Join(dir, "02-rbac.yaml"))
+	require.NoError(t, err)
+	require.NotContains(t, string(rbac), "cluster-info")
+	require.Contains(t, string(rbac), "aks-cluster-metadata")
 }
 
 // ---------------------------------------------------------------------------

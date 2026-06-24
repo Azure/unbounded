@@ -58,7 +58,8 @@ Initialize a new Unbounded site. This command:
    uses local manifests).
 4. Creates unbounded-net Site and GatewayPool resources.
 5. Creates a bootstrap token for the site.
-6. Installs the machina controller in the `unbounded-kube` namespace.
+6. Installs the machina and machine-ops controllers in the `unbounded-kube`
+   namespace.
 
 #### Required Flags
 
@@ -76,14 +77,16 @@ Initialize a new Unbounded site. This command:
 |------|------|---------|-------------|
 | `--cni-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for CNI manifests |
 | `--machina-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for machina manifests |
+| `--machine-ops-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for machine-ops manifests |
 | `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
 
 #### Validation
 
 - All CIDR values must be valid IPv4 CIDR notation.
-- `--cni-manifests`, when provided, must be either a valid HTTPS URL or an
-  existing local file/directory path. If omitted, the manifests embedded in
-  the kubectl plugin are used.
+- `--cni-manifests`, `--machina-manifests`, and `--machine-ops-manifests`,
+  when provided, must be either valid HTTPS URLs or existing local
+  file/directory paths. If omitted, the manifests embedded in the kubectl
+  plugin are used.
 - `kubectl` must be available on `PATH`.
 
 #### Example

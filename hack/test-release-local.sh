@@ -17,8 +17,9 @@
 #   6. goreleaser snapshot - build kube binaries and stamped manifest archive
 #                            (skips publish, sign, sbom, docker)
 #   7. test-goreleaser-hook - assert manifests + binaries are stamped with TAG
-#   8. images          - docker buildx build machina, metalman, host (qemu),
-#                        net-controller, net-node (native arch only)
+#   8. images          - docker buildx build machina, machine-ops-controller,
+#                        metalman, host (qemu), net-controller, net-node
+#                        (native arch only)
 #
 # Default behavior:
 #   - TAG=v0.0.0-localtest unless overridden via $TAG
@@ -218,6 +219,12 @@ if [[ "$SKIP_NET" != "1" || "$INCLUDE_HOST" == "1" || -n "${FORCE_IMAGES:-}" ]];
     docker buildx build "${common_args[@]}" \
         -f images/metalman/Containerfile \
         -t "ghcr.io/azure/metalman:${TAG}" .
+
+    echo ""
+    echo "--- machine-ops-controller ---"
+    docker buildx build "${common_args[@]}" \
+        -f images/machine-ops-controller/Containerfile \
+        -t "ghcr.io/azure/machine-ops-controller:${TAG}" .
 
     if [[ "$INCLUDE_HOST" == "1" ]]; then
         echo ""

@@ -69,6 +69,7 @@ jobs:
           ACR_NAME=${acr_name}
           ACR_LOGIN_SERVER=${acr_name}.azurecr.io
           MACHINA_IMAGE=${acr_name}.azurecr.io/machina:${suffix}
+          MACHINE_OPS_CONTROLLER_IMAGE=${acr_name}.azurecr.io/machine-ops-controller:${suffix}
           UNBOUNDED_NET_CONTROLLER_IMAGE=${acr_name}.azurecr.io/unbounded-net-controller:${suffix}
           UNBOUNDED_NET_NODE_IMAGE=${acr_name}.azurecr.io/unbounded-net-node:${suffix}
           SITE_NAME=remote
@@ -138,11 +139,13 @@ jobs:
           CONTAINER_ENGINE=docker \
           CONTAINER_REGISTRY="$ACR_LOGIN_SERVER" \
           MACHINA_IMAGE="$MACHINA_IMAGE" \
+          MACHINE_OPS_CONTROLLER_IMAGE="$MACHINE_OPS_CONTROLLER_IMAGE" \
           NET_CONTROLLER_IMAGE="$UNBOUNDED_NET_CONTROLLER_IMAGE" \
           NET_NODE_IMAGE="$UNBOUNDED_NET_NODE_IMAGE" \
-          make image-machina-local image-net-controller-local image-net-node-local
+          make image-machina-local image-machine-ops-controller-local image-net-controller-local image-net-node-local
 
           docker push "$MACHINA_IMAGE"
+          docker push "$MACHINE_OPS_CONTROLLER_IMAGE"
           docker push "$UNBOUNDED_NET_CONTROLLER_IMAGE"
           docker push "$UNBOUNDED_NET_NODE_IMAGE"
 
@@ -152,6 +155,7 @@ jobs:
           VERSION="$GITHUB_SHA" \
           CONTAINER_REGISTRY="$ACR_LOGIN_SERVER" \
           MACHINA_IMAGE="$MACHINA_IMAGE" \
+          MACHINE_OPS_CONTROLLER_IMAGE="$MACHINE_OPS_CONTROLLER_IMAGE" \
           NET_CONTROLLER_IMAGE="$UNBOUNDED_NET_CONTROLLER_IMAGE" \
           NET_NODE_IMAGE="$UNBOUNDED_NET_NODE_IMAGE" \
           make kubectl-unbounded-build

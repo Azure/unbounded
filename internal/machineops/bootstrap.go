@@ -30,11 +30,10 @@ type ClusterInfo struct {
 
 // ResolveClusterInfo resolves cluster bootstrap details for HostReplace.
 func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kubernetes.Interface) (*ClusterInfo, error) {
-	if strings.TrimSpace(apiServerEndpoint) == "" {
+	apiServerEndpoint = strings.TrimSpace(apiServerEndpoint)
+	if apiServerEndpoint == "" {
 		return nil, fmt.Errorf("API server endpoint is required")
 	}
-
-	apiServerEndpoint = strings.TrimPrefix(apiServerEndpoint, "https://")
 
 	cm, err := k.CoreV1().ConfigMaps(metav1.NamespacePublic).Get(ctx, "kube-root-ca.crt", metav1.GetOptions{})
 	if err != nil {
@@ -45,6 +44,8 @@ func ResolveClusterInfo(ctx context.Context, apiServerEndpoint string, k kuberne
 	if !ok {
 		return nil, fmt.Errorf("ca.crt key not found in kube-root-ca.crt ConfigMap")
 	}
+
+	apiServerEndpoint = strings.TrimPrefix(apiServerEndpoint, "https://")
 
 	svc, err := k.CoreV1().Services(metav1.NamespaceSystem).Get(ctx, "kube-dns", metav1.GetOptions{})
 	if err != nil {

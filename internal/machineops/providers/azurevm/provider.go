@@ -364,6 +364,10 @@ func prepareReplacementVM(vm armcompute.VirtualMachine, userData string, diskNam
 			vm.Properties.StorageProfile.OSDisk.CreateOption = to.Ptr(armcompute.DiskCreateOptionTypesFromImage)
 			vm.Properties.StorageProfile.OSDisk.Vhd = nil
 
+			if vm.Properties.StorageProfile.OSDisk.ManagedDisk != nil {
+				vm.Properties.StorageProfile.OSDisk.ManagedDisk.ID = nil
+			}
+
 			vm.Properties.StorageProfile.OSDisk.Name = to.Ptr(fmt.Sprintf("%s-osdisk-%d", vmName, diskNameSuffix))
 			for _, disk := range vm.Properties.StorageProfile.DataDisks {
 				disk.DiskIOPSReadWrite = nil

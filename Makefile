@@ -416,18 +416,18 @@ lint: ## Run golangci-lint (matches CI; run `make fmt` to auto-fix)
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-test: machina-manifests net-manifests ## Run all tests with race detector
+test: machina-manifests machine-ops-manifests net-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
-test: lint machina-manifests net-manifests ## Run all tests (implies lint)
+test: lint machina-manifests machine-ops-manifests net-manifests ## Run all tests (implies lint)
 	$(GOTEST) ./...
 
 endif
 
-build: machina-manifests net-manifests ## Build all Go packages
+build: machina-manifests machine-ops-manifests net-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
@@ -469,7 +469,7 @@ notice-check: ## Verify NOTICE is in sync with go.mod and frontend/package.json
 
 ##@ Build
 
-kubectl-unbounded-build: machina-manifests net-manifests ## Build the kubectl-unbounded binary (no lint/test)
+kubectl-unbounded-build: machina-manifests machine-ops-manifests net-manifests ## Build the kubectl-unbounded binary (no lint/test)
 	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
 
 kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded plugin (implies test)

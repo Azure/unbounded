@@ -29,7 +29,7 @@ You'll label gateway nodes, initialize a site, and join remote machines.
 {{< callout type="info" >}}
 **Clusters with an existing CNI** (e.g. Cilium, Calico, Azure CNI): Unbounded works alongside your existing CNI. Pass `--manage-cni-plugin=false` when running `site init`, or set `manageCniPlugin: false` on the Site resource after creation. See the [manageCniPlugin reference]({{< relref "reference/networking/custom-resources#managecniplugin-behavior" >}}) for details.
 
-**Clusters without a CNI** (created with `--network-plugin none`): No extra configuration is needed — unbounded-net will serve as the CNI.
+**Clusters without a CNI** (created with `--network-plugin none`): No extra configuration is needed -- unbounded-net will serve as the CNI.
 {{< /callout >}}
 
 Install the kubectl-unbounded plugin:
@@ -77,7 +77,7 @@ kubectl label node <node-name> "unbounded-cloud.io/unbounded-net-gateway=true"
 
 A **Site** represents a remote location where machines will run. The `site init`
 command installs unbounded-net, creates site resources, generates a bootstrap
-token, and deploys the machina controller -- all in one step.
+token, and deploys the machina and machine-ops controllers -- all in one step.
 
 ```bash
 kubectl unbounded site init \
@@ -104,6 +104,7 @@ kubectl unbounded site init \
 | `--kubeconfig` | Path to kubeconfig file |
 | `--cni-manifests` | Path or URL to CNI manifests (uses embedded manifests if omitted) |
 | `--machina-manifests` | Path or URL to machina manifests (uses embedded manifests if omitted) |
+| `--machine-ops-manifests` | Path or URL to machine-ops manifests (uses embedded manifests if omitted) |
 | `--manage-cni-plugin` | Set to `false` when the cluster already has a CNI (default: `true`) |
 
 </details>

@@ -77,7 +77,7 @@ chmod +x aks-quickstart.sh
 
 > **This takes about 8 minutes.** The script creates an AKS cluster, adds a
 > gateway node pool, and runs `kubectl unbounded site init` to install the
-> networking stack.
+> networking stack and controllers.
 
 | Flag | Description |
 |------|-------------|
@@ -233,12 +233,13 @@ If your remote site already has private L3 connectivity to the cluster (e.g. Azu
   for your remote site
 - **SiteGatewayPoolAssignment** -- links each site to the gateway pool
 
-### Machina Controller and Bootstrap Token
+### Machina, Machine Ops, and Bootstrap Token
 
 [Machina]({{< relref "reference/machina-crd" >}}) handles SSH-based node
-provisioning. A bootstrap token in `kube-system` lets new nodes authenticate
-during the join process. The `manual-bootstrap` command embeds this token into
-the install script.
+provisioning. `machine-ops-controller` handles provider-backed host operations
+for Machines with an external provider such as `AzureVM`. A bootstrap token in
+`kube-system` lets new nodes authenticate during the join process. The
+`manual-bootstrap` command embeds this token into the install script.
 
 If you already have provisioned hosts with SSH access (e.g. GPU nodes from a
 third-party provider), machina can provision them automatically -- see the

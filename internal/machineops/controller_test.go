@@ -512,7 +512,7 @@ func TestMachineOperationReconciler_DoesNotResolveAuthForSkippedInProgressOperat
 	require.Nil(t, updated.Status.CompletedAt)
 }
 
-func TestMachineOperationReconciler_ReexecutesInProgressHostReplace(t *testing.T) {
+func TestMachineOperationReconciler_DoesNotReexecuteInProgressHostReplace(t *testing.T) {
 	t.Parallel()
 
 	s := newOperationTestScheme(t)
@@ -539,11 +539,13 @@ func TestMachineOperationReconciler_ReexecutesInProgressHostReplace(t *testing.T
 	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
 	require.NoError(t, err)
 	require.Equal(t, ctrl.Result{}, result)
-	require.Len(t, provider.calls, 1)
+	require.Empty(t, provider.calls)
+	require.Empty(t, provider.replaceUserData)
 
 	var updated unboundedv1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
-	require.Equal(t, unboundedv1alpha3.OperationPhaseComplete, updated.Status.Phase)
+	require.Equal(t, unboundedv1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+	require.Nil(t, updated.Status.CompletedAt)
 }
 
 func TestMachineOperationReconciler_PatchesReplacementProviderIDBeforeCleanup(t *testing.T) {

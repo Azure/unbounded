@@ -283,8 +283,8 @@ jobs:
           mkdir -p dist/manifests
           tar -xzf "dist/unbounded-manifests-${TAG}.tar.gz" -C dist/manifests
           MANIFESTS_DIR="dist/manifests/unbounded-manifests-${TAG}"
-          if [[ ! -d "${MANIFESTS_DIR}/net" || ! -d "${MANIFESTS_DIR}/machina" ]]; then
-            echo "::error::Tarball is missing expected net/ or machina/ subdir"
+          if [[ ! -d "${MANIFESTS_DIR}/net" || ! -d "${MANIFESTS_DIR}/machina" || ! -d "${MANIFESTS_DIR}/machine-ops" ]]; then
+            echo "::error::Tarball is missing expected net/, machina/, or machine-ops/ subdir"
             ls -la "${MANIFESTS_DIR}" || true
             exit 1
           fi
@@ -428,6 +428,7 @@ jobs:
           set -euo pipefail
           kubectl apply --server-side --force-conflicts -R -f "${MANIFESTS_DIR}/net/"
           kubectl apply --server-side --force-conflicts -R -f "${MANIFESTS_DIR}/machina/"
+          kubectl apply --server-side --force-conflicts -R -f "${MANIFESTS_DIR}/machine-ops/"
 
       - name: Wait for rollouts
         run: |
@@ -435,6 +436,7 @@ jobs:
           kubectl -n unbounded-net  rollout status deploy/unbounded-net-controller --timeout=5m
           kubectl -n unbounded-net  rollout status ds/unbounded-net-node           --timeout=5m
           kubectl -n unbounded-kube rollout status deploy/machina-controller       --timeout=5m
+          kubectl -n unbounded-kube rollout status deploy/machine-ops-controller   --timeout=5m
 
       - name: Summarize deploy
         if: always()
@@ -454,6 +456,7 @@ jobs:
             kubectl -n unbounded-net  get deploy unbounded-net-controller -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-net  get ds     unbounded-net-node       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-kube get deploy machina-controller       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-kube get deploy machine-ops-controller   -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

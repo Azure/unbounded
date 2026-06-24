@@ -5,6 +5,9 @@ package app
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"text/template"
@@ -12,6 +15,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -72,6 +77,68 @@ func TestSiteInitCommand_DefaultCNIManifests(t *testing.T) {
 	f := cmd.Flags().Lookup("cni-manifests")
 	require.NotNil(t, f)
 	require.Equal(t, "", f.DefValue)
+}
+
+func TestSiteInitCommand_DefaultMachineOpsManifests(t *testing.T) {
+	cmd := siteInitCommand()
+	f := cmd.Flags().Lookup("machine-ops-manifests")
+	require.NotNil(t, f)
+	require.Equal(t, "", f.DefValue)
+}
+
+func TestSiteInitHandlerValidate_ManifestSources(t *testing.T) {
+	dir := t.TempDir()
+	kubeconfig := filepath.Join(dir, "kubeconfig")
+	require.NoError(t, os.WriteFile(kubeconfig, []byte("apiVersion: v1\nkind: Config\n"), 0o600))
+
+	base := func() *siteInitHandler {
+		return &siteInitHandler{
+			name:            "remote",
+			clusterNodeCIDR: "10.0.0.0/16",
+			clusterPodCIDR:  "10.244.0.0/16",
+			nodeCIDR:        "192.168.99.0/24",
+			podCIDR:         "10.245.0.0/16",
+			kubeconfigPath:  kubeconfig,
+		}
+	}
+
+	t.Setenv("KUBECONFIG", kubeconfig)
+
+	for _, tc := range []struct {
+		name string
+		mut  func(*siteInitHandler)
+		want string
+	}{
+		{
+			name: "cni",
+			mut: func(h *siteInitHandler) {
+				h.cniManifests = filepath.Join(dir, "missing-cni")
+			},
+			want: "CNI manifests path is invalid",
+		},
+		{
+			name: "machina",
+			mut: func(h *siteInitHandler) {
+				h.machinaManifests = filepath.Join(dir, "missing-machina")
+			},
+			want: "machina manifests path is invalid",
+		},
+		{
+			name: "machine-ops",
+			mut: func(h *siteInitHandler) {
+				h.machineOpsManifests = filepath.Join(dir, "missing-machine-ops")
+			},
+			want: "machine-ops manifests path is invalid",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := base()
+			tc.mut(h)
+
+			err := h.validate()
+			require.EqualError(t, err, tc.want)
+		})
+	}
 }
 
 func TestSiteInitCommand_ManageCniPluginFlag(t *testing.T) {
@@ -159,4 +226,66 @@ func TestEnsureUnboundedSite_ManageCniPluginTrue(t *testing.T) {
 	rendered := buf.String()
 	assert.NotContains(t, rendered, "manageCniPlugin")
 	assert.Contains(t, rendered, "name: test-site")
+}
+
+func TestEnsureControllersAreRunningInstallsMachinaThenMachineOps(t *testing.T) {
+	t.Parallel()
+
+	var calls []string
+
+	machina := &recordingComponentInstaller{name: "machina", calls: &calls}
+	machineOps := &recordingComponentInstaller{name: "machine-ops", calls: &calls}
+	h := newControllerInstallTestHandler(machina, machineOps)
+
+	err := h.ensureControllersAreRunning(context.Background())
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"machina", "machine-ops"}, calls)
+	require.Equal(t, []string{"03-config.yaml"}, machina.skipPaths)
+}
+
+func TestEnsureControllersAreRunningWrapsMachineOpsFailure(t *testing.T) {
+	t.Parallel()
+
+	var calls []string
+
+	machineOpsErr := errors.New("machine-ops failed")
+	machina := &recordingComponentInstaller{name: "machina", calls: &calls}
+	machineOps := &recordingComponentInstaller{name: "machine-ops", calls: &calls, err: machineOpsErr}
+	h := newControllerInstallTestHandler(machina, machineOps)
+
+	err := h.ensureControllersAreRunning(context.Background())
+
+	require.ErrorIs(t, err, machineOpsErr)
+	require.ErrorContains(t, err, "installing machine-ops controller for site site-a")
+	require.Equal(t, []string{"machina", "machine-ops"}, calls)
+}
+
+func newControllerInstallTestHandler(machina, machineOps componentInstaller) *siteInitHandler {
+	return &siteInitHandler{
+		name:              "site-a",
+		kubeCli:           fake.NewClientset(),
+		kubeConfig:        &rest.Config{Host: "https://api.example.com"},
+		kubeResourcesCli:  fakeclient.NewClientBuilder().Build(),
+		installMachina:    machina,
+		installMachineOps: machineOps,
+		logger:            discardLogger(),
+	}
+}
+
+type recordingComponentInstaller struct {
+	name      string
+	calls     *[]string
+	skipPaths []string
+	err       error
+}
+
+func (i *recordingComponentInstaller) run(context.Context) error {
+	*i.calls = append(*i.calls, i.name)
+
+	return i.err
+}
+
+func (i *recordingComponentInstaller) setSkipPaths(paths []string) {
+	i.skipPaths = append([]string(nil), paths...)
 }
