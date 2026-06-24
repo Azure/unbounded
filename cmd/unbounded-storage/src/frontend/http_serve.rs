@@ -42,6 +42,7 @@ use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE};
 use ::http::{Response, StatusCode};
 
 use crate::bufferpool::{BufferPool, Error as PoolError, ReadStream, StripeKey, StripePlan};
+use crate::config::schema::DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION;
 use crate::config::{FrontendSpec, frontend_spec};
 use crate::fanout::{FanoutTable, FetchChannel, FetchReply, Owner};
 use crate::frontend::FrontendError;
@@ -68,6 +69,7 @@ use crate::storage::{ObjectMetadata, OriginRef, StripeReq};
 pub struct HttpFrontend {
     id: String,
     addr: SocketAddr,
+    max_requests_per_connection: usize,
 }
 
 const MAX_FRONTEND_CONNS: usize = 4096;
@@ -85,9 +87,18 @@ impl HttpFrontend {
             .addr
             .parse::<SocketAddr>()
             .map_err(|_| FrontendError::BadBind(cfg.addr.clone()))?;
+        let max_requests_per_connection = cfg
+            .max_requests_per_connection
+            .unwrap_or(DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION);
+        if max_requests_per_connection == 0 {
+            return Err(FrontendError::BadConfig(
+                "max_requests_per_connection must be greater than zero",
+            ));
+        }
         Ok(Self {
             id: spec.name.clone(),
             addr,
+            max_requests_per_connection: max_requests_per_connection as usize,
         })
     }
 
@@ -99,6 +110,12 @@ impl HttpFrontend {
     /// The configured listen address.
     pub fn bind(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Maximum requests served before the frontend closes a keep-alive
+    /// connection and lets the client reconnect through `SO_REUSEPORT`.
+    pub fn max_requests_per_connection(&self) -> usize {
+        self.max_requests_per_connection
     }
 
     /// Create, bind, and listen the per-shard accept socket with
@@ -135,6 +152,7 @@ pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
     page_size: usize,
     fanout: Rc<FanoutTable>,
     bypass: bool,
+    max_requests_per_connection: usize,
     accept_fut: Pin<Box<dyn Future<Output = std::io::Result<RawFd>>>>,
     conns: Vec<Pin<Box<dyn Future<Output = ()>>>>,
     waker: Waker,
@@ -160,6 +178,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
         page_size: usize,
         fanout: Rc<FanoutTable>,
         bypass: bool,
+        max_requests_per_connection: usize,
     ) -> Self {
         let accept_fut = Box::pin(handle.accept(listen_fd));
         Self {
@@ -174,6 +193,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
             page_size,
             fanout,
             bypass,
+            max_requests_per_connection,
             accept_fut,
             conns: Vec::new(),
             waker: noop_waker(),
@@ -229,6 +249,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
                             self.page_size,
                             Rc::clone(&self.fanout),
                             self.bypass,
+                            self.max_requests_per_connection,
                         );
                         self.conns.push(Box::pin(serve));
                     }
@@ -288,11 +309,13 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
     page_size: usize,
     fanout: Rc<FanoutTable>,
     bypass: bool,
+    max_requests_per_connection: usize,
 ) {
     let _fd = FdGuard(conn_fd);
     let _conn = ConnGuard::new();
     let mut buf: Vec<u8> = Vec::new();
     let mut deadline = None;
+    let mut requests_served = 0usize;
     loop {
         let mut log = crate::obs::ReqLog::new("frontend.http");
         let start = std::time::Instant::now();
@@ -310,6 +333,7 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
             bypass,
             &mut buf,
             deadline,
+            requests_served.saturating_add(1) < max_requests_per_connection,
             &mut log,
             &mut outcome,
         )
@@ -322,6 +346,7 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
                 break;
             }
             Ok(ServeStep::KeepAlive) => {
+                requests_served = requests_served.saturating_add(1);
                 outcome.record(&frontend_id, start.elapsed().as_secs_f64());
                 log.finish_ok();
                 deadline = Some(Instant::now() + KEEP_ALIVE_IDLE_TIMEOUT);
@@ -358,6 +383,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     bypass: bool,
     buf: &mut Vec<u8>,
     idle_deadline: Option<Instant>,
+    allow_keep_alive_after_response: bool,
     log: &mut crate::obs::ReqLog,
     outcome: &mut ReqOutcome,
 ) -> Result<ServeStep, ()> {
@@ -393,7 +419,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     if req.header_end > MAX_HEADER_BYTES {
         return Err(());
     }
-    let keep_alive = request_allows_keep_alive(&req);
+    let keep_alive = request_allows_keep_alive(&req) && allow_keep_alive_after_response;
     let header_end = req.header_end;
 
     // 2. Only GET and HEAD are served. HEAD resolves length and builds
@@ -1014,6 +1040,7 @@ mod tests {
             source: "primary".to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: addr.to_string(),
+                max_requests_per_connection: None,
             })),
         }
     }
@@ -1026,6 +1053,32 @@ mod tests {
 
         let bad = HttpFrontend::from_spec(&spec("f", "not-an-addr"));
         assert!(matches!(bad, Err(FrontendError::BadBind(_))));
+    }
+
+    #[test]
+    fn from_spec_defaults_and_validates_request_cap() {
+        let f = HttpFrontend::from_spec(&spec("workload", "0.0.0.0:9000")).unwrap();
+        assert_eq!(
+            f.max_requests_per_connection(),
+            DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION as usize
+        );
+
+        let mut capped = spec("workload", "0.0.0.0:9000");
+        let Some(frontend_spec::Config::Http(cfg)) = capped.config.as_mut() else {
+            panic!("expected http config");
+        };
+        cfg.max_requests_per_connection = Some(7);
+        let f = HttpFrontend::from_spec(&capped).unwrap();
+        assert_eq!(f.max_requests_per_connection(), 7);
+
+        let Some(frontend_spec::Config::Http(cfg)) = capped.config.as_mut() else {
+            panic!("expected http config");
+        };
+        cfg.max_requests_per_connection = Some(0);
+        assert!(matches!(
+            HttpFrontend::from_spec(&capped),
+            Err(FrontendError::BadConfig(_))
+        ));
     }
 
     #[test]
@@ -1382,6 +1435,7 @@ mod tests {
                 CacheDirectorySet::new(),
             )),
             false,
+            DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION as usize,
         );
         // No client has connected: accept is pending, no conns, so the
         // engine reports no work and stays idle.

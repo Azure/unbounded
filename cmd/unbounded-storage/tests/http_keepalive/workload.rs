@@ -29,6 +29,7 @@ pub struct Workload {
     pub requests: Vec<RequestSpec>,
     pub chunk_sizes: Vec<u8>,
     pub max_send_delay: u32,
+    pub max_requests_per_connection: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -97,12 +98,16 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
         vec(request_strategy(), 1..=8),
         vec(1u8..=48, 1..=24),
         prop_oneof![1 => Just(0u32), 9 => 1u32..=4],
+        1usize..=8,
     )
-        .prop_map(|(requests, chunk_sizes, max_send_delay)| Workload {
-            requests,
-            chunk_sizes,
-            max_send_delay,
-        })
+        .prop_map(
+            |(requests, chunk_sizes, max_send_delay, max_requests_per_connection)| Workload {
+                requests,
+                chunk_sizes,
+                max_send_delay,
+                max_requests_per_connection,
+            },
+        )
 }
 
 fn request_strategy() -> impl Strategy<Value = RequestSpec> {
@@ -151,6 +156,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         client_done,
         report.clone(),
         w.requests.len(),
+        w.max_requests_per_connection,
     );
 
     let step_budget = 512 + w.requests.len() as u64 * 256 + w.chunk_sizes.len() as u64 * 16;
@@ -166,7 +172,8 @@ pub fn expected_keep_alive_prefix(w: &Workload) -> Vec<bool> {
     for req in &w.requests {
         let bytes = req.to_bytes();
         let parsed = HttpRequest::parse(&bytes).expect("generated request parses");
-        let keep_alive = request_allows_keep_alive(&parsed);
+        let keep_alive = request_allows_keep_alive(&parsed)
+            && out.len().saturating_add(1) < w.max_requests_per_connection;
         out.push(keep_alive);
         if !keep_alive {
             break;
@@ -214,6 +221,7 @@ fn spawn_server(
     client_done: Rc<Cell<bool>>,
     report: Rc<RefCell<Option<RunReport>>>,
     request_count: usize,
+    max_requests_per_connection: usize,
 ) {
     exec.spawn(async move {
         let mut buf = Vec::new();
@@ -230,7 +238,8 @@ fn spawn_server(
                     let request_index = served.len();
                     let wants_keep_alive = request_wants_keep_alive(&req);
                     let bodyless = request_is_bodyless(&req);
-                    let keep_alive = request_allows_keep_alive(&req);
+                    let keep_alive = request_allows_keep_alive(&req)
+                        && served.len().saturating_add(1) < max_requests_per_connection;
                     let header_end = req.header_end;
                     let response_connection = response_connection_value(keep_alive);
 
