@@ -87,9 +87,11 @@ on:
         type: boolean
         default: false
 
-# workflow_run-triggered workflows default to read-only. We only need read
-# access for checkout and `gh release download`. Made explicit so future
-# additions don't accidentally inherit broader scopes.
+# workflow_run-triggered workflows default to read-only. Most jobs only need
+# read access for checkout. The `deploy` job overrides this with
+# `contents: write` because it downloads assets from the DRAFT release, and
+# draft releases are only visible to tokens with push (write) access. Made
+# explicit so future additions don't accidentally inherit broader scopes.
 permissions:
   contents: read
 
@@ -179,13 +181,16 @@ jobs:
   #   MODE=upgrade  -> server-side 'kubectl apply' of the rendered
   #                    manifests that were attached to the GitHub Release.
   #
-  # Note: `gh release download` works on DRAFT releases as long as the
-  # token has `contents: read`. That's intentional - this workflow deploys
-  # the release before it's published to end users.
+  # Note: this job downloads assets from the DRAFT GitHub Release (the
+  # release soaks as a draft before it is published to end users). Draft
+  # releases are only visible to tokens with push access, so this job
+  # overrides the workflow's read-only default with `contents: write`.
   # ---------------------------------------------------------------------------
   deploy:
     needs: resolve
     if: github.repository == 'Azure/unbounded'
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     environment: unbounded-stable
     env:
