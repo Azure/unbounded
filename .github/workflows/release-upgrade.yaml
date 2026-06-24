@@ -18,19 +18,19 @@ name: release upgrade
 #      successfully, THIS workflow fires via `workflow_run` and deploys
 #      the release onto the `unbounded-stable` cluster.
 #
-#   3. Smoke + soak. Immediately after deploy, the `smoke-tests` job runs
-#      an extensible matrix of fast post-deploy validation tasks against
-#      the freshly deployed cluster (see hack/release/smoke/). The release
-#      then soaks as a DRAFT in unbounded-stable - invisible to end users
-#      and to krew - while real workloads exercise it for a few days.
-#      Ongoing soak observation relies on the cluster's existing
-#      monitoring/alerts and is not this workflow's responsibility.
+#   3. Smoke. Immediately after deploy, the `smoke-tests` job runs an
+#      extensible matrix of fast post-deploy validation tasks against the
+#      freshly deployed cluster (see hack/release/smoke/).
 #
-#   4. Publish. When the operator is satisfied with the soak, they flip
-#      the draft to non-draft (GitHub UI, or `gh release edit <tag>
-#      --draft=false`). The `released` event fires but nothing listens to
-#      it, so publish is purely the user-visibility / advertise-to-krew
-#      gate and not a deploy gate.
+#   4. Publish. Once deploy (core + Orca) and smoke succeed, the `publish`
+#      job flips the GitHub Release from draft to published automatically -
+#      a clean deploy plus green smoke is the soak gate. Prereleases are
+#      published too but keep their prerelease flag, so they are never
+#      marked "Latest". An operator can still publish or unpublish manually
+#      (`gh release edit <tag> --draft=false` / `--draft=true`). The
+#      `released` event fires but nothing listens to it. Ongoing soak
+#      observation relies on the cluster's existing monitoring/alerts and
+#      is not this workflow's responsibility.
 #
 # Why workflow_run and not `release: [released]`?
 #   The previous trigger fired on draft -> published, which made the
@@ -88,10 +88,10 @@ on:
         default: false
 
 # workflow_run-triggered workflows default to read-only. Most jobs only need
-# read access for checkout. The `deploy` job overrides this with
-# `contents: write` because it downloads assets from the DRAFT release, and
-# draft releases are only visible to tokens with push (write) access. Made
-# explicit so future additions don't accidentally inherit broader scopes.
+# read access for checkout. Two jobs override this with `contents: write`:
+# `deploy` downloads assets from the DRAFT release (drafts are only visible
+# to tokens with push access), and `publish` flips the draft to published.
+# Made explicit so future additions don't accidentally inherit broader scopes.
 permissions:
   contents: read
 
@@ -734,6 +734,42 @@ jobs:
           set -euo pipefail
           chmod +x "$SMOKE_SCRIPT"
           "$SMOKE_SCRIPT"
+
+  # ---------------------------------------------------------------------------
+  # Publish the GitHub Release once the soak succeeds. Releases are built as
+  # drafts and soak on unbounded-stable; a clean deploy (core + Orca) plus
+  # green smoke tests is the gate that flips the draft to published. This
+  # applies to prereleases too: they keep their `--prerelease` flag, so they
+  # become visible but are never marked "Latest" nor returned by
+  # /releases/latest. If deploy or smoke fails, the job does not run and the
+  # release stays a draft.
+  #
+  # `gh release edit --draft=false` is idempotent, so re-deploys of an
+  # already-published tag are a no-op.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [resolve, deploy, deploy-orca, smoke-discover, smoke-tests]
+    # always() so the job still evaluates when smoke-tests is SKIPPED (no
+    # smoke scripts at this ref); the explicit result checks enforce the gate.
+    if: >
+      always() &&
+      github.repository == 'Azure/unbounded' &&
+      needs.deploy.result == 'success' &&
+      needs.deploy-orca.result == 'success' &&
+      (needs.smoke-tests.result == 'success' || needs.smoke-tests.result == 'skipped')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Published ${TAG}."
+          echo "### Published ${TAG}" >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # CUSTOMIZE: Teams notification (NOT YET ENABLED)
