@@ -103,6 +103,32 @@ const (
 	// For OnDelete updates this remains True until the operator deletes
 	// the Node and the agent repaves with the desired version.
 	MachineConditionRepavePending = "RepavePending"
+
+	// MachineConditionPXEImageReady indicates whether the OCI image used
+	// for PXE boot has been resolved, pulled, unpacked, and cached locally
+	// by metalman.
+	MachineConditionPXEImageReady = "PXEImageReady"
+
+	// MachineConditionPXEBoot indicates the observed PXE artifact serving
+	// lifecycle for the Machine, including image-cache waits and file
+	// resolution failures.
+	MachineConditionPXEBoot = "PXEBoot"
+
+	// MachineConditionAttestationReady indicates whether metalman TPM
+	// attestation has issued an encrypted bootstrap token to the Machine.
+	MachineConditionAttestationReady = "AttestationReady"
+
+	// MachineConditionKubeletReady indicates whether the Kubernetes Node
+	// for this Machine exists and reports NodeReady=True.
+	MachineConditionKubeletReady = "KubeletReady"
+
+	// MachineConditionRedfishReady indicates whether metalman can interact
+	// with the Machine's Redfish BMC.
+	MachineConditionRedfishReady = "RedfishReady"
+
+	// MachineConditionDaemonCredentialReady indicates whether the agent
+	// daemon controller certificate CSR was approved for this Machine.
+	MachineConditionDaemonCredentialReady = "DaemonCredentialReady"
 )
 
 // Annotation keys.

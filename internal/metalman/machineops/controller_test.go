@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -77,7 +78,7 @@ func TestReconcilerDoesNotCompletePowerOnForTransientState(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[0].Phase)
-	require.Equal(t, "waiting for power on", updated.Status.Targets[0].Message)
+	require.Equal(t, "waiting for power on (attempt 1/3)", updated.Status.Targets[0].Message)
 	require.Empty(t, power.calls)
 }
 
@@ -108,7 +109,7 @@ func TestReconcilerDoesNotCompleteRebootPowerOnForTransientState(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[0].Phase)
-	require.Equal(t, "waiting for power on", updated.Status.Targets[0].Message)
+	require.Equal(t, "waiting for power on (attempt 2/3)", updated.Status.Targets[0].Message)
 	require.Empty(t, power.calls)
 }
 
@@ -362,6 +363,10 @@ func TestReconcilerWaitsForOlderOperation(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: newer.Name}, &updated))
 	require.Equal(t, v1alpha3.OperationPhasePending, updated.Status.Phase)
 	require.Contains(t, updated.Status.Message, "waiting for older host operation op-a")
+	cond := meta.FindStatusCondition(updated.Status.Conditions, "Completed")
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionFalse, cond.Status)
+	require.Equal(t, "WaitingForOlderOperation", cond.Reason)
 }
 
 func testReconciler(c client.Client, power PowerClientFactory, site string) *Reconciler {

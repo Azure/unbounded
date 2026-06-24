@@ -5,15 +5,19 @@ package lifecycle
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/machinestatus"
 )
 
 const (
@@ -23,7 +27,8 @@ const (
 )
 
 type Reconciler struct {
-	Client client.Client
+	Client   client.Client
+	Recorder events.EventRecorder
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -47,6 +52,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	if retryCloudInitTimeout(&node) {
 		log.Info("cloud-init timed out after repave, triggering retry")
+		machinestatus.Event(r.Recorder, &node, corev1.EventTypeWarning, "CloudInitRetry", node.Status.Message)
 
 		return ctrl.Result{}, r.Client.Status().Update(ctx, &node)
 	}
@@ -68,6 +74,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	log.Info("repave timed out, triggering retry", "elapsed", elapsed)
 	retryRepaveBoot(&node)
+	machinestatus.Event(r.Recorder, &node, corev1.EventTypeWarning, "RepaveRetry", node.Status.Message)
 
 	return ctrl.Result{}, r.Client.Status().Update(ctx, &node)
 }
@@ -87,8 +94,21 @@ func retryCloudInitTimeout(node *v1alpha3.Machine) bool {
 		return false
 	}
 
+	detail := cloudInitCond.Message
+	if detail == "" {
+		detail = cloudInitCond.Reason
+	}
+
+	message := fmt.Sprintf("retrying repave after cloud-init timeout: %s", detail)
+	node.Status.Message = machinestatus.TruncateMessage(message)
+	meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
+		Type:               v1alpha3.MachineConditionCloudInitDone,
+		Status:             metav1.ConditionUnknown,
+		Reason:             "Retrying",
+		Message:            node.Status.Message,
+		ObservedGeneration: node.Generation,
+	})
 	meta.RemoveStatusCondition(&node.Status.Conditions, v1alpha3.MachineConditionRepaved)
-	meta.RemoveStatusCondition(&node.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
 	node.Status.Operations.RebootCounter = node.Spec.Operations.RebootCounter - 1
 	node.Status.Operations.RepaveCounter = node.Spec.Operations.RepaveCounter - 1
 
@@ -96,6 +116,14 @@ func retryCloudInitTimeout(node *v1alpha3.Machine) bool {
 }
 
 func retryRepaveBoot(node *v1alpha3.Machine) {
+	repavedCond := meta.FindStatusCondition(node.Status.Conditions, v1alpha3.MachineConditionRepaved)
+
+	message := "retrying repave after timeout"
+	if repavedCond != nil && repavedCond.Message != "" {
+		message = fmt.Sprintf("retrying repave after timeout: %s", repavedCond.Message)
+	}
+
+	node.Status.Message = machinestatus.TruncateMessage(message)
 	meta.RemoveStatusCondition(&node.Status.Conditions, v1alpha3.MachineConditionRepaved)
 
 	if node.Status.Operations.RebootCounter > 0 {

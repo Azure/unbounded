@@ -20,6 +20,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -101,10 +102,12 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(node).
+		WithStatusSubresource(node).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
 	srv := &HTTPServer{
+		Client: fc,
 		FileResolver: FileResolver{
 			Cache:  cache,
 			Reader: fc,
@@ -156,6 +159,16 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 
 	if string(body) != string(vmlinuzData) {
 		t.Errorf("vmlinuz body mismatch: got %q", body)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+
+	pxeBootCond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionPXEBoot)
+	if pxeBootCond == nil || pxeBootCond.Status != metav1.ConditionTrue || pxeBootCond.Reason != "Served" {
+		t.Fatalf("expected PXEBoot=True/Served, got %+v", pxeBootCond)
 	}
 
 	// Test 404 for unknown file
@@ -665,7 +678,7 @@ func TestResolveFileByPath_UserDataFallsBackToDefault(t *testing.T) {
 		"vmlinuz": []byte("kernel"),
 	})
 
-	// Node without cloudInit configured — should return the built-in default.
+	// Node without cloudInit configured should return the built-in default.
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-no-cm"},
 		Spec: v1alpha3.MachineSpec{
@@ -771,7 +784,7 @@ func TestResolveFileByPath_UserDataConfigMapMissing(t *testing.T) {
 		"vmlinuz": []byte("kernel"),
 	})
 
-	// ConfigMap doesn't exist — should fall back to default cloud-init.
+	// ConfigMap doesn't exist, so this should fall back to default cloud-init.
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-missing"},
 		Spec: v1alpha3.MachineSpec{
@@ -978,7 +991,7 @@ func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
 		"vmlinuz": []byte("kernel"),
 	})
 
-	// Node references a ConfigMap that doesn't exist — should fall back to default cloud-init.
+	// Node references a ConfigMap that doesn't exist, so this should fall back to default cloud-init.
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-http-cm-miss"},
 		Spec: v1alpha3.MachineSpec{
@@ -1567,10 +1580,12 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(node).
+		WithStatusSubresource(node).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
 	srv := &HTTPServer{
+		Client:       fc,
 		FileResolver: FileResolver{Cache: cache, Reader: fc},
 	}
 
@@ -1597,6 +1612,110 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 
 	if ra := resp.Header.Get("Retry-After"); ra != "5" {
 		t.Errorf("expected Retry-After: 5, got %q", ra)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+
+	pxeBootCond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionPXEBoot)
+	if pxeBootCond == nil || pxeBootCond.Status != metav1.ConditionFalse || pxeBootCond.Reason != "WaitingForImage" {
+		t.Fatalf("expected PXEBoot=False/WaitingForImage, got %+v", pxeBootCond)
+	}
+}
+
+func TestOCIReconcilerResolveFailureSetsPXEImageCondition(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "bad-image-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{Image: "not a valid image ref"},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &OCIReconciler{Client: fc, Cache: NewOCICache(t.TempDir())}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: node.Spec.PXE.Image}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+
+	cond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionPXEImageReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "ResolveFailed" {
+		t.Fatalf("expected PXEImageReady=False/ResolveFailed, got %+v", cond)
+	}
+}
+
+func TestOCIReconcilerCachedImageDoesNotResetConditionToResolving(t *testing.T) {
+	imageRef := "not a valid image ref"
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "cached-image-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{Image: imageRef},
+		},
+		Status: v1alpha3.MachineStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:    v1alpha3.MachineConditionPXEImageReady,
+					Status:  metav1.ConditionTrue,
+					Reason:  "Cached",
+					Message: "cached OCI image " + imageRef + "@sha256:testdigest123",
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	var reasons []string
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(node).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if machine, ok := obj.(*v1alpha3.Machine); ok {
+					cond := findCondition(machine.Status.Conditions, v1alpha3.MachineConditionPXEImageReady)
+					if cond != nil {
+						reasons = append(reasons, cond.Reason)
+					}
+				}
+
+				return c.Status().Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	reconciler := &OCIReconciler{Client: fc, Cache: NewOCICache(t.TempDir())}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: imageRef}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+
+	cond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionPXEImageReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "ResolveFailed" {
+		t.Fatalf("expected PXEImageReady=False/ResolveFailed with no Resolving flip, got %+v", cond)
+	}
+
+	if len(reasons) != 1 || reasons[0] != "ResolveFailed" {
+		t.Fatalf("expected only ResolveFailed status update, got reasons %v", reasons)
 	}
 }
 
@@ -1685,8 +1804,13 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 		t.Fatalf("expected Repaved=True/Succeeded, got %+v", repavedCond)
 	}
 
-	if repavedCond.Message != "image=ghcr.io/test/image:v1" {
-		t.Fatalf("expected Repaved message 'image=ghcr.io/test/image:v1', got %q", repavedCond.Message)
+	if repavedCond.Message != "PXE disabled for image=ghcr.io/test/image:v1" {
+		t.Fatalf("expected Repaved message 'PXE disabled for image=ghcr.io/test/image:v1', got %q", repavedCond.Message)
+	}
+
+	pxeBootCond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionPXEBoot)
+	if pxeBootCond == nil || pxeBootCond.Status != metav1.ConditionTrue || pxeBootCond.Reason != "BootDisabled" {
+		t.Fatalf("expected PXEBoot=True/BootDisabled, got %+v", pxeBootCond)
 	}
 
 	// Second call should be idempotent (still 200)
@@ -1702,6 +1826,257 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("idempotent call: expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestHTTPServer_DisablePXE_StaleLookupDoesNotLowerCounter(t *testing.T) {
+	staleNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "pxe-node-stale"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:21", IPv4: "10.0.6.11", SubnetMask: "255.255.255.0"}},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{
+			Operations: &v1alpha3.OperationsStatus{RepaveCounter: 0},
+		},
+	}
+	latestNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "pxe-node-stale"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v2",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:21", IPv4: "10.0.6.11", SubnetMask: "255.255.255.0"}},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 2},
+		},
+		Status: v1alpha3.MachineStatus{
+			Operations: &v1alpha3.OperationsStatus{RepaveCounter: 2},
+			Conditions: []metav1.Condition{
+				{
+					Type:    v1alpha3.MachineConditionRepaved,
+					Status:  metav1.ConditionTrue,
+					Reason:  "Succeeded",
+					Message: "PXE disabled for image=ghcr.io/test/image:v2",
+				},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	staleReader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(staleNode).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(latestNode).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		Build()
+
+	srv := &HTTPServer{
+		Client: fc,
+		FileResolver: FileResolver{
+			Cache:  NewOCICache(t.TempDir()),
+			Reader: staleReader,
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /pxe/disable", srv.handleDisablePXE)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/pxe/disable", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.6.11")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /pxe/disable: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(latestNode), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+
+	if updated.Status.Operations == nil || updated.Status.Operations.RepaveCounter != 2 {
+		t.Fatalf("expected status repaveCounter to remain 2, got %+v", updated.Status.Operations)
+	}
+
+	repavedCond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionRepaved)
+	if repavedCond == nil || repavedCond.Message != "PXE disabled for image=ghcr.io/test/image:v2" {
+		t.Fatalf("expected existing v2 Repaved condition to remain, got %+v", repavedCond)
+	}
+}
+
+func TestHTTPServer_DisablePXE_StaleLookupDoesNotCompleteNewerPendingRepave(t *testing.T) {
+	staleNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "pxe-node-newer-pending"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:22", IPv4: "10.0.6.12", SubnetMask: "255.255.255.0"}},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+	}
+	latestNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "pxe-node-newer-pending"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v2",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:22", IPv4: "10.0.6.12", SubnetMask: "255.255.255.0"}},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 2},
+		},
+		Status: v1alpha3.MachineStatus{
+			Operations: &v1alpha3.OperationsStatus{RepaveCounter: 1},
+		},
+	}
+
+	scheme := newScheme(t)
+	staleReader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(staleNode).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(latestNode).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		Build()
+
+	srv := &HTTPServer{
+		Client: fc,
+		FileResolver: FileResolver{
+			Cache:  NewOCICache(t.TempDir()),
+			Reader: staleReader,
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /pxe/disable", srv.handleDisablePXE)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/pxe/disable", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.6.12")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /pxe/disable: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(latestNode), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+
+	if updated.Status.Operations == nil || updated.Status.Operations.RepaveCounter != 1 {
+		t.Fatalf("expected pending repaveCounter to remain 1, got %+v", updated.Status.Operations)
+	}
+
+	repavedCond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionRepaved)
+	if repavedCond != nil {
+		t.Fatalf("expected stale disable not to complete newer repave, got %+v", repavedCond)
+	}
+}
+
+func TestHTTPServer_DisablePXE_StaleLookupDoesNotCompleteWhenIPMoved(t *testing.T) {
+	staleNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "pxe-node-ip-moved"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:23", IPv4: "10.0.6.13", SubnetMask: "255.255.255.0"}},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+	}
+	latestNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "pxe-node-ip-moved"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:23", IPv4: "10.0.6.99", SubnetMask: "255.255.255.0"}},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{
+			Operations: &v1alpha3.OperationsStatus{RepaveCounter: 0},
+		},
+	}
+
+	scheme := newScheme(t)
+	staleReader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(staleNode).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(latestNode).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		Build()
+
+	srv := &HTTPServer{
+		Client: fc,
+		FileResolver: FileResolver{
+			Cache:  NewOCICache(t.TempDir()),
+			Reader: staleReader,
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /pxe/disable", srv.handleDisablePXE)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/pxe/disable", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.6.13")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /pxe/disable: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(latestNode), &updated); err != nil {
+		t.Fatalf("getting updated node: %v", err)
+	}
+
+	if updated.Status.Operations == nil || updated.Status.Operations.RepaveCounter != 0 {
+		t.Fatalf("expected repaveCounter to remain 0, got %+v", updated.Status.Operations)
+	}
+
+	repavedCond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionRepaved)
+	if repavedCond != nil {
+		t.Fatalf("expected stale disable from moved IP not to complete repave, got %+v", repavedCond)
 	}
 }
 

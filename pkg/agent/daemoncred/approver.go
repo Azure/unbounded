@@ -90,6 +90,10 @@ type CSRDecision struct {
 
 	// Message is written to the CSR approval or denial condition.
 	Message string
+
+	// NodeName is the requested node name parsed from the CSR subject when
+	// the CSR shape is valid enough to identify one.
+	NodeName string
 }
 
 func NewCSRApprover(opts CSRApproverOptions) (*CSRApprover, error) {
@@ -155,7 +159,10 @@ func (a *CSRApprover) Evaluate(ctx context.Context, csr *certificatesv1.Certific
 		return decision, err
 	}
 
-	return a.evaluateRequester(ctx, csr, nodeName)
+	decision, err = a.evaluateRequester(ctx, csr, nodeName)
+	decision.NodeName = nodeName
+
+	return decision, err
 }
 
 func (a *CSRApprover) validateCSRShape(

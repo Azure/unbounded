@@ -7,11 +7,15 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/umoci"
 	"github.com/opencontainers/umoci/oci/layer"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
 	"oras.land/oras-go/v2/registry/remote"
@@ -22,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/machinestatus"
 	"github.com/Azure/unbounded/internal/ociutil"
 )
 
@@ -37,8 +42,9 @@ const imageResyncInterval = 5 * time.Minute
 // Work items are deduplicated by image reference so that multiple machines
 // sharing the same image only trigger a single download.
 type OCIReconciler struct {
-	Client client.Client
-	Cache  *OCICache
+	Client   client.Client
+	Cache    *OCICache
+	Recorder events.EventRecorder
 }
 
 func (r *OCIReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -76,26 +82,85 @@ func (r *OCIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	remoteDigest, repo, err := r.resolveRemoteDigest(ctx, imageRef)
 	if err != nil {
 		logger.Error(err, "resolving OCI image digest", "image", imageRef)
+		r.setImageCondition(ctx, imageRef, metav1.ConditionFalse, "ResolveFailed", fmt.Sprintf("failed to resolve OCI image %s: %v", imageRef, err), corev1.EventTypeWarning)
+
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	// Check if we already have this exact digest cached.
 	existingDigest := r.Cache.DigestFor(imageRef)
 	if existingDigest == remoteDigest && r.Cache.IsCached(remoteDigest) {
+		r.setImageCondition(ctx, imageRef, metav1.ConditionTrue, "Cached", fmt.Sprintf("cached OCI image %s@%s", imageRef, remoteDigest), corev1.EventTypeNormal)
 		return ctrl.Result{RequeueAfter: imageResyncInterval}, nil
 	}
 
 	logger.Info("pulling OCI image", "image", imageRef, "digest", remoteDigest)
+	r.setImageCondition(ctx, imageRef, metav1.ConditionFalse, "Pulling", fmt.Sprintf("pulling OCI image %s@%s", imageRef, remoteDigest), corev1.EventTypeNormal)
 
 	if err := r.pullAndUnpack(ctx, imageRef, remoteDigest, repo); err != nil {
 		logger.Error(err, "pulling OCI image", "image", imageRef)
+
+		reason := "PullFailed"
+		if strings.Contains(err.Error(), "missing /disk directory") {
+			reason = "MissingDiskDirectory"
+		}
+
+		r.setImageCondition(ctx, imageRef, metav1.ConditionFalse, reason, fmt.Sprintf("failed to pull/unpack OCI image %s@%s: %v", imageRef, remoteDigest, err), corev1.EventTypeWarning)
+
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	r.Cache.SetDigest(imageRef, remoteDigest)
 	logger.Info("OCI image cached", "image", imageRef, "digest", remoteDigest)
+	r.setImageCondition(ctx, imageRef, metav1.ConditionTrue, "Cached", fmt.Sprintf("cached OCI image %s@%s", imageRef, remoteDigest), corev1.EventTypeNormal)
 
 	return ctrl.Result{RequeueAfter: imageResyncInterval}, nil
+}
+
+func (r *OCIReconciler) setImageCondition(ctx context.Context, imageRef string, status metav1.ConditionStatus, reason, message, eventType string) {
+	if r.Client == nil {
+		return
+	}
+
+	logger := log.FromContext(ctx)
+
+	var list v1alpha3.MachineList
+	if err := r.Client.List(ctx, &list); err != nil {
+		logger.Error(err, "listing Machines for OCI image status", "image", imageRef)
+		return
+	}
+
+	for _, machine := range list.Items {
+		if machine.Spec.PXE == nil || machine.Spec.PXE.Image != imageRef {
+			continue
+		}
+
+		key := client.ObjectKey{Name: machine.Name}
+		changed := false
+
+		if err := machinestatus.Update(ctx, r.Client, key, func(latest *v1alpha3.Machine) bool {
+			if latest.Spec.PXE == nil || latest.Spec.PXE.Image != imageRef {
+				return false
+			}
+
+			changed = machinestatus.SetConditionIfChanged(latest, machinestatus.Condition(
+				v1alpha3.MachineConditionPXEImageReady,
+				status,
+				reason,
+				message,
+				latest.Generation,
+			))
+
+			return changed
+		}); err != nil {
+			logger.Error(err, "updating Machine PXE image condition", "machine", machine.Name, "image", imageRef)
+			continue
+		}
+
+		if changed {
+			machinestatus.Event(r.Recorder, &machine, eventType, "PXEImage"+reason, message)
+		}
+	}
 }
 
 // newRepository creates a remote.Repository for the given image reference,

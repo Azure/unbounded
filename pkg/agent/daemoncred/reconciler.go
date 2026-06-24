@@ -38,6 +38,10 @@ type CSRApproverReconciler struct {
 	// EventFilter optionally customizes which CSR events enqueue reconcile work.
 	// When nil, create, update, and generic events are processed and deletes are ignored.
 	EventFilter predicate.Predicate
+
+	// OnDecision is called after an approval or denial has been written to
+	// the CSR. It is best effort and should not mutate the CSR itself.
+	OnDecision func(context.Context, *certificatesv1.CertificateSigningRequest, CSRDecision) error
 }
 
 func NewCSRApproverReconciler(
@@ -100,6 +104,12 @@ func (r *CSRApproverReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	if _, err := r.KubeClient.CertificatesV1().CertificateSigningRequests().UpdateApproval(ctx, updated.Name, updated, metav1.UpdateOptions{}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("update CSR approval %s: %w", updated.Name, err)
+	}
+
+	if r.OnDecision != nil {
+		if err := r.OnDecision(ctx, updated, decision); err != nil {
+			return ctrl.Result{}, fmt.Errorf("record CSR decision %s: %w", updated.Name, err)
+		}
 	}
 
 	return ctrl.Result{}, nil

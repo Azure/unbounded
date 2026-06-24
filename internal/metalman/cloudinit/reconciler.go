@@ -9,12 +9,15 @@ import (
 	"log/slog"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/machinestatus"
 )
 
 const (
@@ -25,7 +28,8 @@ const (
 )
 
 type Reconciler struct {
-	Client client.Client
+	Client   client.Client
+	Recorder events.EventRecorder
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -71,13 +75,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	log.Info("cloud-init timed out, marking condition Unknown",
 		"reason", cond.Reason, "elapsed", elapsed)
 
+	message := fmt.Sprintf("cloud-init did not complete within %s", cloudInitTimeout)
+	if cond.Reason != "" || cond.Message != "" {
+		message = fmt.Sprintf("%s; last observed %s: %s", message, cond.Reason, cond.Message)
+	}
+
 	meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
 		Type:               v1alpha3.MachineConditionCloudInitDone,
 		Status:             metav1.ConditionUnknown,
 		Reason:             "TimedOut",
-		Message:            fmt.Sprintf("cloud-init did not complete within %s", cloudInitTimeout),
+		Message:            machinestatus.TruncateMessage(message),
 		ObservedGeneration: machine.Generation,
 	})
+	machinestatus.Event(r.Recorder, &machine, corev1.EventTypeWarning, "CloudInitTimedOut", message)
 
 	return ctrl.Result{}, r.Client.Status().Update(ctx, &machine)
 }

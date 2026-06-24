@@ -15,12 +15,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/machinestatus"
 )
 
 const (
@@ -40,8 +42,10 @@ const (
 )
 
 type Reconciler struct {
-	Client client.Client
-	Pool   *Pool
+	Client    client.Client
+	APIReader client.Reader
+	Pool      *Pool
+	Recorder  events.EventRecorder
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -96,8 +100,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	if fingerprint == "" {
+		if pending, err := r.redfishFingerprintPending(ctx, client.ObjectKeyFromObject(&machine), rf); err != nil {
+			return ctrl.Result{}, fmt.Errorf("checking latest Redfish endpoint before fingerprint capture: %w", err)
+		} else if !pending {
+			return ctrl.Result{}, nil
+		}
+
 		fp, err := CaptureFingerprint(ctx, rf.URL)
 		if err != nil {
+			r.setRedfishReady(ctx, &machine, metav1.ConditionFalse, "FingerprintFailed", fmt.Sprintf("failed to capture Redfish TLS fingerprint from %s: %v", rf.URL, err), corev1.EventTypeWarning)
 			return ctrl.Result{}, fmt.Errorf("capturing TLS cert fingerprint: %w", err)
 		}
 
@@ -108,7 +119,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		machine.Status.Redfish.CertFingerprint = fp
 		log.Info("TOFU: captured TLS cert fingerprint", "fingerprint", fp)
 
-		return ctrl.Result{}, r.Client.Status().Update(ctx, &machine)
+		return ctrl.Result{}, r.updateMachineStatus(ctx, client.ObjectKeyFromObject(&machine), func(latest *v1alpha3.Machine) bool {
+			if !sameRedfishSpec(latest, rf) {
+				return false
+			}
+
+			if latest.Status.Redfish == nil {
+				latest.Status.Redfish = &v1alpha3.RedfishStatus{}
+			}
+
+			if latest.Status.Redfish.CertFingerprint != "" {
+				return false
+			}
+
+			latest.Status.Redfish.CertFingerprint = fp
+
+			return true
+		})
 	}
 
 	// Retrieve Redfish password from Secret.
@@ -117,22 +144,41 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		Name:      rf.PasswordRef.Name,
 		Namespace: rf.PasswordRef.Namespace,
 	}, &secret); err != nil {
+		r.setRedfishReady(ctx, &machine, metav1.ConditionFalse, "SecretGetFailed", fmt.Sprintf("failed to get Redfish password secret %s/%s: %v", rf.PasswordRef.Namespace, rf.PasswordRef.Name, err), corev1.EventTypeWarning)
 		return ctrl.Result{}, fmt.Errorf("getting Redfish password secret: %w", err)
 	}
 
-	password := string(secret.Data[rf.PasswordRef.Key])
+	passwordBytes, ok := secret.Data[rf.PasswordRef.Key]
+	if !ok {
+		message := fmt.Sprintf("Redfish password secret %s/%s missing key %q", rf.PasswordRef.Namespace, rf.PasswordRef.Name, rf.PasswordRef.Key)
+		r.setRedfishReady(ctx, &machine, metav1.ConditionFalse, "SecretKeyMissing", message, corev1.EventTypeWarning)
+
+		return ctrl.Result{}, fmt.Errorf("%s", message)
+	}
+
+	password := string(passwordBytes)
 
 	// Acquire Redfish client.
 	c, err := r.Pool.Get(ctx, rf.URL, fingerprint, rf.Username, password, rf.DeviceID)
 	if err != nil {
+		r.setRedfishReady(ctx, &machine, metav1.ConditionFalse, "ClientFailed", fmt.Sprintf("failed to create Redfish client for %s: %v", rf.URL, err), corev1.EventTypeWarning)
 		return ctrl.Result{}, fmt.Errorf("getting Redfish client: %w", err)
 	}
 
-	// Boot order configuration (skip if known unsupported).
-	pendingRepave := machine.Spec.Operations.RepaveCounter > machine.Status.Operations.RepaveCounter
+	r.setRedfishReady(ctx, &machine, metav1.ConditionTrue, "Connected", fmt.Sprintf("connected to Redfish endpoint %s", rf.URL), corev1.EventTypeNormal)
 
+	// Boot order configuration (skip if known unsupported).
 	bootCond := meta.FindStatusCondition(machine.Status.Conditions, condBootSupported)
 	if bootCond == nil || bootCond.Status != metav1.ConditionFalse {
+		pendingRepave, ok, err := r.latestBootOverrideTarget(ctx, client.ObjectKeyFromObject(&machine), rf)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("checking latest boot override target: %w", err)
+		}
+
+		if !ok {
+			return ctrl.Result{}, nil
+		}
+
 		if err := r.reconcileBootOrder(ctx, log, &machine, c, pendingRepave); err != nil {
 			if errors.Is(err, ErrUnsupported) {
 				// BMCs commonly reject boot order changes during POST.
@@ -142,6 +188,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				// the system is still in POST where rejections are expected.
 				state, psErr := c.PowerState(ctx)
 				if psErr != nil {
+					r.setRedfishReady(ctx, &machine, metav1.ConditionFalse, "PowerStateFailed", fmt.Sprintf("failed to read Redfish power state after boot override rejection: %v", psErr), corev1.EventTypeWarning)
 					return ctrl.Result{}, fmt.Errorf("getting power state: %w", psErr)
 				}
 
@@ -157,11 +204,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 					Type:               condBootSupported,
 					Status:             metav1.ConditionFalse,
 					Reason:             reasonNotSupported,
+					Message:            fmt.Sprintf("Redfish boot override is not supported: %v", err),
 					ObservedGeneration: machine.Generation,
 				})
 
-				return ctrl.Result{}, r.Client.Status().Update(ctx, &machine)
+				return ctrl.Result{}, r.updateMachineStatus(ctx, client.ObjectKeyFromObject(&machine), func(latest *v1alpha3.Machine) bool {
+					return machinestatus.SetConditionIfChanged(latest, machinestatus.Condition(
+						condBootSupported,
+						metav1.ConditionFalse,
+						reasonNotSupported,
+						fmt.Sprintf("Redfish boot override is not supported: %v", err),
+						latest.Generation,
+					))
+				})
 			}
+
+			r.setRedfishReady(ctx, &machine, metav1.ConditionFalse, "BootOverrideFailed", fmt.Sprintf("failed to configure Redfish boot override: %v", err), corev1.EventTypeWarning)
 
 			return ctrl.Result{}, fmt.Errorf("configuring boot order: %w", err)
 		}
@@ -177,7 +235,40 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return r.reconcilePowerOff(ctx, log, &machine, c)
 	}
 
-	return r.reconcilePowerOn(ctx, log, &machine, c, pendingRepave)
+	return r.reconcilePowerOn(ctx, log, &machine, c)
+}
+
+func (r *Reconciler) setRedfishReady(ctx context.Context, machine *v1alpha3.Machine, status metav1.ConditionStatus, reason, message, eventType string) {
+	if machine == nil || r.Client == nil {
+		return
+	}
+
+	changed := false
+
+	if err := r.updateMachineStatus(ctx, client.ObjectKeyFromObject(machine), func(latest *v1alpha3.Machine) bool {
+		changed = machinestatus.SetConditionIfChanged(latest, machinestatus.Condition(
+			v1alpha3.MachineConditionRedfishReady,
+			status,
+			reason,
+			message,
+			latest.Generation,
+		))
+
+		return changed
+	}); err != nil {
+		slog.Error("updating RedfishReady condition", "node", machine.Name, "err", err)
+		return
+	}
+
+	if !changed {
+		return
+	}
+
+	machinestatus.Event(r.Recorder, machine, eventType, "Redfish"+reason, message)
+}
+
+func (r *Reconciler) updateMachineStatus(ctx context.Context, key client.ObjectKey, mutate func(*v1alpha3.Machine) bool) error {
+	return machinestatus.Update(ctx, r.Client, key, mutate)
 }
 
 // reconcileBootOrder ensures the boot source override matches the desired state.
@@ -213,20 +304,35 @@ func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, m
 func (r *Reconciler) reconcilePowerOff(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine, c *Client) (ctrl.Result, error) {
 	state, err := c.PowerState(ctx)
 	if err != nil {
+		r.setRedfishReady(ctx, machine, metav1.ConditionFalse, "PowerStateFailed", fmt.Sprintf("failed to read Redfish power state: %v", err), corev1.EventTypeWarning)
 		return ctrl.Result{}, fmt.Errorf("getting power state: %w", err)
 	}
 
+	targetReboot := specRebootCounter(machine)
+	targetRepave := specRepaveCounter(machine)
+	targetImage := pxeImage(machine)
+	targetRedfish := redfishSpec(machine)
+
 	if state == PowerOff {
 		log.Info("machine confirmed powered off, setting condition")
-		meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-			Type:               condPoweredOff,
-			Status:             metav1.ConditionTrue,
-			Reason:             reasonForceOff,
-			Message:            fmt.Sprintf("target reboots: %d", machine.Spec.Operations.RebootCounter),
-			ObservedGeneration: machine.Generation,
-		})
 
-		return ctrl.Result{}, r.Client.Status().Update(ctx, machine)
+		return ctrl.Result{}, r.updateMachineStatus(ctx, client.ObjectKeyFromObject(machine), func(latest *v1alpha3.Machine) bool {
+			if !sameOperationTarget(latest, targetReboot, targetRepave, targetImage, targetRedfish) {
+				return false
+			}
+
+			if statusRebootCounter(latest) >= targetReboot {
+				return false
+			}
+
+			return machinestatus.SetConditionIfChanged(latest, machinestatus.Condition(
+				condPoweredOff,
+				metav1.ConditionTrue,
+				reasonForceOff,
+				fmt.Sprintf("target reboots: %d", targetReboot),
+				latest.Generation,
+			))
+		})
 	}
 
 	// Machine is still on. Check if ForceOff was already sent.
@@ -240,50 +346,92 @@ func (r *Reconciler) reconcilePowerOff(ctx context.Context, log *slog.Logger, ma
 	}
 
 	log.Info("sending ForceOff", "currentState", state)
+	if pending, err := r.operationTargetPending(ctx, client.ObjectKeyFromObject(machine), targetReboot, targetRepave, targetImage, targetRedfish); err != nil {
+		return ctrl.Result{}, fmt.Errorf("checking latest reboot target before ForceOff: %w", err)
+	} else if !pending {
+		return ctrl.Result{}, nil
+	}
 
 	if err := c.Reset(ctx, ResetForceOff); err != nil {
+		r.setRedfishReady(ctx, machine, metav1.ConditionFalse, "ResetFailed", fmt.Sprintf("failed to send Redfish ForceOff: %v", err), corev1.EventTypeWarning)
 		return ctrl.Result{}, fmt.Errorf("sending ForceOff: %w", err)
 	}
 
-	// Remove before set so LastTransitionTime is reset on retries.
-	meta.RemoveStatusCondition(&machine.Status.Conditions, condPoweredOff)
-	meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-		Type:               condPoweredOff,
-		Status:             metav1.ConditionFalse,
-		Reason:             reasonPoweringOff,
-		Message:            fmt.Sprintf("target reboots: %d", machine.Spec.Operations.RebootCounter),
-		ObservedGeneration: machine.Generation,
-	})
+	return ctrl.Result{}, r.updateMachineStatus(ctx, client.ObjectKeyFromObject(machine), func(latest *v1alpha3.Machine) bool {
+		if !sameOperationTarget(latest, targetReboot, targetRepave, targetImage, targetRedfish) {
+			return false
+		}
 
-	return ctrl.Result{}, r.Client.Status().Update(ctx, machine)
+		if statusRebootCounter(latest) >= targetReboot {
+			return false
+		}
+
+		// Remove before set so LastTransitionTime is reset on retries.
+		meta.RemoveStatusCondition(&latest.Status.Conditions, condPoweredOff)
+		meta.SetStatusCondition(&latest.Status.Conditions, machinestatus.Condition(
+			condPoweredOff,
+			metav1.ConditionFalse,
+			reasonPoweringOff,
+			fmt.Sprintf("target reboots: %d", targetReboot),
+			latest.Generation,
+		))
+
+		return true
+	})
 }
 
 // reconcilePowerOn drives the machine from Off to On and completes the
 // reboot cycle.
-func (r *Reconciler) reconcilePowerOn(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine, c *Client, pendingRepave bool) (ctrl.Result, error) {
+func (r *Reconciler) reconcilePowerOn(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine, c *Client) (ctrl.Result, error) {
 	state, err := c.PowerState(ctx)
 	if err != nil {
+		r.setRedfishReady(ctx, machine, metav1.ConditionFalse, "PowerStateFailed", fmt.Sprintf("failed to read Redfish power state: %v", err), corev1.EventTypeWarning)
 		return ctrl.Result{}, fmt.Errorf("getting power state: %w", err)
 	}
+
+	targetReboot := specRebootCounter(machine)
+	targetRepave := specRepaveCounter(machine)
+	targetImage := pxeImage(machine)
+	targetRedfish := redfishSpec(machine)
 
 	if state != PowerOff {
 		// Machine is on - complete the reboot cycle.
 		log.Info("machine confirmed powered on, completing reboot cycle")
-		meta.RemoveStatusCondition(&machine.Status.Conditions, condPoweredOff)
 
-		if pendingRepave {
-			meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-				Type:               condRepaved,
-				Status:             metav1.ConditionFalse,
-				Reason:             reasonPending,
-				Message:            "image=" + machine.Spec.PXE.Image,
-				ObservedGeneration: machine.Generation,
-			})
-		}
+		return ctrl.Result{}, r.updateMachineStatus(ctx, client.ObjectKeyFromObject(machine), func(latest *v1alpha3.Machine) bool {
+			if !sameOperationTarget(latest, targetReboot, targetRepave, targetImage, targetRedfish) {
+				return false
+			}
 
-		machine.Status.Operations.RebootCounter = machine.Spec.Operations.RebootCounter
+			if statusRebootCounter(latest) >= targetReboot {
+				return false
+			}
 
-		return ctrl.Result{}, r.Client.Status().Update(ctx, machine)
+			meta.RemoveStatusCondition(&latest.Status.Conditions, condPoweredOff)
+
+			if pendingRepaveFor(latest) {
+				image := ""
+				if latest.Spec.PXE != nil {
+					image = latest.Spec.PXE.Image
+				}
+
+				meta.SetStatusCondition(&latest.Status.Conditions, machinestatus.Condition(
+					condRepaved,
+					metav1.ConditionFalse,
+					reasonPending,
+					"image="+image,
+					latest.Generation,
+				))
+			}
+
+			if latest.Status.Operations == nil {
+				latest.Status.Operations = &v1alpha3.OperationsStatus{}
+			}
+
+			latest.Status.Operations.RebootCounter = targetReboot
+
+			return true
+		})
 	}
 
 	// Machine is still off. Check if On was already sent.
@@ -297,20 +445,155 @@ func (r *Reconciler) reconcilePowerOn(ctx context.Context, log *slog.Logger, mac
 	}
 
 	log.Info("sending On")
+	if pending, err := r.operationTargetPending(ctx, client.ObjectKeyFromObject(machine), targetReboot, targetRepave, targetImage, targetRedfish); err != nil {
+		return ctrl.Result{}, fmt.Errorf("checking latest reboot target before On: %w", err)
+	} else if !pending {
+		return ctrl.Result{}, nil
+	}
 
 	if err := c.Reset(ctx, ResetOn); err != nil {
+		r.setRedfishReady(ctx, machine, metav1.ConditionFalse, "ResetFailed", fmt.Sprintf("failed to send Redfish On: %v", err), corev1.EventTypeWarning)
 		return ctrl.Result{}, fmt.Errorf("sending On: %w", err)
 	}
 
-	// Remove before set so LastTransitionTime is reset on retries.
-	meta.RemoveStatusCondition(&machine.Status.Conditions, condPoweredOff)
-	meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-		Type:               condPoweredOff,
-		Status:             metav1.ConditionTrue,
-		Reason:             reasonPoweringOn,
-		Message:            fmt.Sprintf("target reboots: %d", machine.Spec.Operations.RebootCounter),
-		ObservedGeneration: machine.Generation,
-	})
+	return ctrl.Result{}, r.updateMachineStatus(ctx, client.ObjectKeyFromObject(machine), func(latest *v1alpha3.Machine) bool {
+		if !sameOperationTarget(latest, targetReboot, targetRepave, targetImage, targetRedfish) {
+			return false
+		}
 
-	return ctrl.Result{}, r.Client.Status().Update(ctx, machine)
+		if statusRebootCounter(latest) >= targetReboot {
+			return false
+		}
+
+		// Remove before set so LastTransitionTime is reset on retries.
+		meta.RemoveStatusCondition(&latest.Status.Conditions, condPoweredOff)
+		meta.SetStatusCondition(&latest.Status.Conditions, machinestatus.Condition(
+			condPoweredOff,
+			metav1.ConditionTrue,
+			reasonPoweringOn,
+			fmt.Sprintf("target reboots: %d", targetReboot),
+			latest.Generation,
+		))
+
+		return true
+	})
+}
+
+func specRebootCounter(machine *v1alpha3.Machine) int64 {
+	if machine.Spec.Operations == nil {
+		return 0
+	}
+
+	return machine.Spec.Operations.RebootCounter
+}
+
+func specRepaveCounter(machine *v1alpha3.Machine) int64 {
+	if machine.Spec.Operations == nil {
+		return 0
+	}
+
+	return machine.Spec.Operations.RepaveCounter
+}
+
+func pxeImage(machine *v1alpha3.Machine) string {
+	if machine.Spec.PXE == nil {
+		return ""
+	}
+
+	return machine.Spec.PXE.Image
+}
+
+func redfishSpec(machine *v1alpha3.Machine) *v1alpha3.RedfishSpec {
+	if machine.Spec.PXE == nil {
+		return nil
+	}
+
+	return machine.Spec.PXE.Redfish
+}
+
+func sameRedfishSpec(machine *v1alpha3.Machine, rf *v1alpha3.RedfishSpec) bool {
+	latestRF := redfishSpec(machine)
+	if latestRF == nil || rf == nil {
+		return latestRF == nil && rf == nil
+	}
+
+	return latestRF.URL == rf.URL &&
+		latestRF.Username == rf.Username &&
+		latestRF.DeviceID == rf.DeviceID &&
+		latestRF.PasswordRef == rf.PasswordRef
+}
+
+func sameOperationTarget(machine *v1alpha3.Machine, rebootCounter, repaveCounter int64, image string, rf *v1alpha3.RedfishSpec) bool {
+	return specRebootCounter(machine) == rebootCounter && specRepaveCounter(machine) == repaveCounter && pxeImage(machine) == image && sameRedfishSpec(machine, rf)
+}
+
+func statusRebootCounter(machine *v1alpha3.Machine) int64 {
+	if machine.Status.Operations == nil {
+		return 0
+	}
+
+	return machine.Status.Operations.RebootCounter
+}
+
+func (r *Reconciler) latestBootOverrideTarget(ctx context.Context, key client.ObjectKey, rf *v1alpha3.RedfishSpec) (bool, bool, error) {
+	reader := r.latestReader()
+
+	var latest v1alpha3.Machine
+	if err := reader.Get(ctx, key, &latest); err != nil {
+		return false, false, err
+	}
+
+	if !sameRedfishSpec(&latest, rf) {
+		return false, false, nil
+	}
+
+	return pendingRepaveFor(&latest), true, nil
+}
+
+func (r *Reconciler) redfishFingerprintPending(ctx context.Context, key client.ObjectKey, rf *v1alpha3.RedfishSpec) (bool, error) {
+	reader := r.latestReader()
+
+	var latest v1alpha3.Machine
+	if err := reader.Get(ctx, key, &latest); err != nil {
+		return false, err
+	}
+
+	if !sameRedfishSpec(&latest, rf) {
+		return false, nil
+	}
+
+	return latest.Status.Redfish == nil || latest.Status.Redfish.CertFingerprint == "", nil
+}
+
+func (r *Reconciler) operationTargetPending(ctx context.Context, key client.ObjectKey, rebootCounter, repaveCounter int64, image string, rf *v1alpha3.RedfishSpec) (bool, error) {
+	reader := r.latestReader()
+
+	var latest v1alpha3.Machine
+	if err := reader.Get(ctx, key, &latest); err != nil {
+		return false, err
+	}
+
+	return sameOperationTarget(&latest, rebootCounter, repaveCounter, image, rf) && statusRebootCounter(&latest) < rebootCounter, nil
+}
+
+func (r *Reconciler) latestReader() client.Reader {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	return reader
+}
+
+func pendingRepaveFor(machine *v1alpha3.Machine) bool {
+	if machine.Spec.Operations == nil {
+		return false
+	}
+
+	var statusRepave int64
+	if machine.Status.Operations != nil {
+		statusRepave = machine.Status.Operations.RepaveCounter
+	}
+
+	return machine.Spec.Operations.RepaveCounter > statusRepave
 }

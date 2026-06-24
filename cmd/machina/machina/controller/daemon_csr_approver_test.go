@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -122,10 +123,35 @@ func TestDaemonCSRNodeHasMachineBindingRequiresExplicitNodeRef(t *testing.T) {
 	require.False(t, allowed)
 }
 
+func TestDaemonCSRRecordDecisionSetsMachineCondition(t *testing.T) {
+	machine := machineForToken("machine-a", "node-a", "abc123", "site-a")
+	checker := testDaemonCSRClaimChecker(machine)
+	decision := daemoncred.CSRDecision{
+		Approve:  true,
+		NodeName: "node-a",
+		Message:  "daemon credential approved",
+	}
+
+	err := checker.recordDecision(context.Background(), csrForBinding("system:node:node-a"), decision)
+	require.NoError(t, err)
+
+	var updated unboundedv1alpha3.Machine
+
+	err = checker.Get(context.Background(), client.ObjectKey{Name: "machine-a"}, &updated)
+	require.NoError(t, err)
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, unboundedv1alpha3.MachineConditionDaemonCredentialReady)
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionTrue, cond.Status)
+	require.Equal(t, "Approved", cond.Reason)
+	require.Equal(t, "daemon credential approved", cond.Message)
+}
+
 func testDaemonCSRClaimChecker(objs ...client.Object) *daemonCSRClaimChecker {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(objs...).
+		WithStatusSubresource(&unboundedv1alpha3.Machine{}).
 		WithIndex(&unboundedv1alpha3.Machine{}, machineNodeRefNameField, func(obj client.Object) []string {
 			machine := obj.(*unboundedv1alpha3.Machine)
 			if machine.Spec.Kubernetes == nil || machine.Spec.Kubernetes.NodeRef == nil || machine.Spec.Kubernetes.NodeRef.Name == "" {

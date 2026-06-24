@@ -999,12 +999,8 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
 	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 
-	// Create a Node with name matching the machine (convention).
-	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "m1",
-		},
-	}
+	// Create a Ready Node with name matching the machine (convention).
+	node := newReadyNode("m1")
 	require.NoError(t, fakeClient.Create(ctx, node))
 
 	// Reconcile 3: Joining + Node found -> Ready, nodeRef set.
@@ -1028,11 +1024,7 @@ func TestIntegration_JoiningToReadyToJoining(t *testing.T) {
 	require.Equal(t, RequeueAfterJoining, result.RequeueAfter)
 
 	// Recreate the Node.
-	node = &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "m1",
-		},
-	}
+	node = newReadyNode("m1")
 	require.NoError(t, fakeClient.Create(ctx, node))
 
 	// Reconcile 6: Joining + Node found -> Ready again.
@@ -1102,12 +1094,8 @@ func TestIntegration_ReadyMachineBecomesUnreachable(t *testing.T) {
 	_, m := reconcileHelper(t, reconciler, "m1")
 	require.Equal(t, unboundedv1alpha3.MachinePhaseJoining, m.Status.Phase)
 
-	// Create Node with name matching machine and reconcile to Ready.
-	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "m1",
-		},
-	}
+	// Create Ready Node with name matching machine and reconcile to Ready.
+	node := newReadyNode("m1")
 	require.NoError(t, fakeClient.Create(ctx, node))
 
 	_, m = reconcileHelper(t, reconciler, "m1")

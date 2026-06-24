@@ -181,10 +181,18 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			ociCache := netboot.NewOCICache(cacheDir)
+			ociRecorder := mgr.GetEventRecorder("metalman-oci-image")
+			redfishRecorder := mgr.GetEventRecorder("metalman-redfish")
+			operationRecorder := mgr.GetEventRecorder("metalman-machineoperation")
+			lifecycleRecorder := mgr.GetEventRecorder("metalman-lifecycle")
+			cloudInitRecorder := mgr.GetEventRecorder("metalman-cloudinit")
+			attestationRecorder := mgr.GetEventRecorder("metalman-attestation")
+			httpRecorder := mgr.GetEventRecorder("metalman-http")
 
 			if err := (&netboot.OCIReconciler{
-				Client: mgr.GetClient(),
-				Cache:  ociCache,
+				Client:   mgr.GetClient(),
+				Cache:    ociCache,
+				Recorder: ociRecorder,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up OCI reconciler: %w", err)
 			}
@@ -192,7 +200,7 @@ func ServePXECmd() *cobra.Command {
 			redfishPool := redfish.NewPool()
 			defer redfishPool.Close()
 
-			if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool}).SetupWithManager(mgr); err != nil {
+			if err := (&redfish.Reconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Pool: redfishPool, Recorder: redfishRecorder}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up Redfish reconciler: %w", err)
 			}
 
@@ -204,15 +212,16 @@ func ServePXECmd() *cobra.Command {
 				MaxConcurrentMachines: operationMaxConcurrentMachines,
 				MaxAttempts:           operationMaxAttempts,
 				PollInterval:          operationPollInterval,
+				Recorder:              operationRecorder,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up MachineOperation reconciler: %w", err)
 			}
 
-			if err := (&lifecycle.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+			if err := (&lifecycle.Reconciler{Client: mgr.GetClient(), Recorder: lifecycleRecorder}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up Lifecycle reconciler: %w", err)
 			}
 
-			if err := (&cloudinit.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+			if err := (&cloudinit.Reconciler{Client: mgr.GetClient(), Recorder: cloudInitRecorder}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up CloudInit reconciler: %w", err)
 			}
 
@@ -274,6 +283,7 @@ func ServePXECmd() *cobra.Command {
 				ClusterCA:      clusterCA,
 				LookupNodeByIP: resolver.LookupNodeByIP,
 				StatusUpdater:  &StatusUpdater{Client: mgr.GetClient()},
+				Recorder:       attestationRecorder,
 			}
 
 			httpMux := http.NewServeMux()
@@ -284,6 +294,7 @@ func ServePXECmd() *cobra.Command {
 				Port:         httpPort,
 				Client:       mgr.GetClient(),
 				Mux:          httpMux,
+				Recorder:     httpRecorder,
 				FileResolver: resolver,
 			}
 			if err := mgr.Add(httpServer); err != nil {

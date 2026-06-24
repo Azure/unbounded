@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	stderrs "errors"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/machinestatus"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
@@ -775,22 +777,32 @@ func (r *MachineReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// findMachineForNode maps a Node event to the Machine that owns it (if any)
-// by looking up a Machine whose name matches the Node name.
+// findMachineForNode maps a Node event to Machines that own it by explicit
+// nodeRef, falling back to the Machine-name convention.
 func (r *MachineReconciler) findMachineForNode(ctx context.Context, obj client.Object) []ctrl.Request {
 	node, ok := obj.(*corev1.Node)
 	if !ok {
 		return nil
 	}
 
-	var machine unboundedv1alpha3.Machine
-	if err := r.Get(ctx, client.ObjectKey{Name: node.Name}, &machine); err != nil {
-		return nil
+	var requests []ctrl.Request
+
+	var machines unboundedv1alpha3.MachineList
+	if err := r.List(ctx, &machines, client.MatchingFields{machineNodeRefNameField: node.Name}); err == nil {
+		for _, machine := range machines.Items {
+			requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKey{Name: machine.Name}})
+		}
 	}
 
-	return []ctrl.Request{
-		{NamespacedName: client.ObjectKey{Name: machine.Name}},
+	var machine unboundedv1alpha3.Machine
+	if err := r.Get(ctx, client.ObjectKey{Name: node.Name}, &machine); err == nil {
+		request := ctrl.Request{NamespacedName: client.ObjectKey{Name: machine.Name}}
+		if !slices.Contains(requests, request) {
+			requests = append(requests, request)
+		}
 	}
+
+	return requests
 }
 
 // reconcileNodeJoin handles the Node lifecycle for a provisioned Machine.
@@ -807,32 +819,43 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 		nodeName = machine.Spec.Kubernetes.NodeRef.Name
 	}
 
-	var nodeList corev1.NodeList
-
 	var node corev1.Node
 	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
 		if !errors.IsNotFound(err) {
 			logger.Error(err, "Failed to get Node for Machine", "machine", machine.Name)
+			apimeta.SetStatusCondition(&machine.Status.Conditions, machinestatus.Condition(
+				unboundedv1alpha3.MachineConditionKubeletReady,
+				metav1.ConditionFalse,
+				"NodeGetFailed",
+				fmt.Sprintf("failed to get Node %s: %v", nodeName, err),
+				machine.Generation,
+			))
+
+			if _, updateErr := r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseJoining, fmt.Sprintf("Failed to get Node %s: %v", nodeName, err)); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+
 			return ctrl.Result{}, err
 		}
-		// Node doesn't exist yet; nodeList stays empty.
-	} else {
-		nodeList.Items = append(nodeList.Items, node)
+
+		apimeta.SetStatusCondition(&machine.Status.Conditions, machinestatus.Condition(
+			unboundedv1alpha3.MachineConditionKubeletReady,
+			metav1.ConditionFalse,
+			"WaitingForNode",
+			fmt.Sprintf("waiting for Node %s to be created", nodeName),
+			machine.Generation,
+		))
+
+		message := fmt.Sprintf("Waiting for Node %s to be created", nodeName)
+		if machine.Status.Phase == unboundedv1alpha3.MachinePhaseReady {
+			message = fmt.Sprintf("Node disappeared, waiting for Node %s to rejoin", nodeName)
+		}
+
+		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseJoining, message)
 	}
 
 	switch machine.Status.Phase {
 	case unboundedv1alpha3.MachinePhaseJoining:
-		if len(nodeList.Items) == 0 {
-			// Still waiting for Node to appear.
-			return ctrl.Result{RequeueAfter: RequeueAfterJoining}, nil
-		}
-
-		// Node found - transition to Ready.
-		node := &nodeList.Items[0]
-
-		logger.Info("Node found for Machine, transitioning to Ready",
-			"machine", machine.Name, "node", node.Name)
-
 		// Update nodeRef in the kubernetes spec if not already set.
 		if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef == nil {
 			machine.Spec.Kubernetes.NodeRef = &unboundedv1alpha3.LocalObjectReference{Name: node.Name}
@@ -843,27 +866,85 @@ func (r *MachineReconciler) reconcileNodeJoin(ctx context.Context, machine *unbo
 			}
 		}
 
-		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseReady,
-			fmt.Sprintf("Node %s joined", node.Name))
+		if ready, reason, message := nodeReadyStatus(&node); !ready {
+			apimeta.SetStatusCondition(&machine.Status.Conditions, machinestatus.Condition(
+				unboundedv1alpha3.MachineConditionKubeletReady,
+				metav1.ConditionFalse,
+				reason,
+				message,
+				machine.Generation,
+			))
 
-	case unboundedv1alpha3.MachinePhaseReady:
-		if len(nodeList.Items) > 0 {
-			// Node still exists - stay Ready.
-			return ctrl.Result{RequeueAfter: RequeueAfterReady}, nil
+			return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseJoining, message)
 		}
 
-		// Node disappeared - transition back to Joining so we wait for
-		// it to come back (or re-provision on the next cycle).
-		logger.Info("Node disappeared for Machine, transitioning to Joining",
-			"machine", machine.Name)
+		logger.Info("Node ready for Machine, transitioning to Ready",
+			"machine", machine.Name, "node", node.Name)
 
-		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseJoining,
-			"Node disappeared, waiting for Node to rejoin")
+		apimeta.SetStatusCondition(&machine.Status.Conditions, machinestatus.Condition(
+			unboundedv1alpha3.MachineConditionKubeletReady,
+			metav1.ConditionTrue,
+			"Ready",
+			fmt.Sprintf("Node %s reports Ready=True", node.Name),
+			machine.Generation,
+		))
+
+		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseReady,
+			fmt.Sprintf("Node %s joined and is Ready", node.Name))
+
+	case unboundedv1alpha3.MachinePhaseReady:
+		if ready, reason, message := nodeReadyStatus(&node); ready {
+			apimeta.SetStatusCondition(&machine.Status.Conditions, machinestatus.Condition(
+				unboundedv1alpha3.MachineConditionKubeletReady,
+				metav1.ConditionTrue,
+				"Ready",
+				fmt.Sprintf("Node %s reports Ready=True", node.Name),
+				machine.Generation,
+			))
+
+			return ctrl.Result{RequeueAfter: RequeueAfterReady}, nil
+		} else {
+			apimeta.SetStatusCondition(&machine.Status.Conditions, machinestatus.Condition(
+				unboundedv1alpha3.MachineConditionKubeletReady,
+				metav1.ConditionFalse,
+				reason,
+				message,
+				machine.Generation,
+			))
+
+			return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseJoining, message)
+		}
 
 	default:
 		// Should not be called for other phases, but handle gracefully.
 		return ctrl.Result{}, nil
 	}
+}
+
+func nodeReadyStatus(node *corev1.Node) (bool, string, string) {
+	for _, cond := range node.Status.Conditions {
+		if cond.Type != corev1.NodeReady {
+			continue
+		}
+
+		if cond.Status == corev1.ConditionTrue {
+			return true, "Ready", fmt.Sprintf("Node %s reports Ready=True", node.Name)
+		}
+
+		reason := cond.Reason
+		if reason == "" {
+			reason = "NodeNotReady"
+		}
+
+		message := fmt.Sprintf("Node %s exists but Ready=%s", node.Name, cond.Status)
+		if cond.Message != "" {
+			message = fmt.Sprintf("%s: %s", message, cond.Message)
+		}
+
+		return false, reason, message
+	}
+
+	return false, "NodeNotReady", fmt.Sprintf("Node %s exists but has no Ready condition", node.Name)
 }
 
 // wasProvisioned returns true if the machine has a Provisioned condition set to True.

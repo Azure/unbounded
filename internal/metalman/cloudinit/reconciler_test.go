@@ -77,6 +77,11 @@ func TestTimeoutRunningCondition(t *testing.T) {
 	if cond.Reason != "TimedOut" {
 		t.Fatalf("expected reason TimedOut, got %s", cond.Reason)
 	}
+
+	expectedMessage := "cloud-init did not complete within 5m0s; last observed Running: stage \"modules-config\" started"
+	if cond.Message != expectedMessage {
+		t.Fatalf("expected timeout message %q, got %q", expectedMessage, cond.Message)
+	}
 }
 
 func TestTimeoutExactBoundary(t *testing.T) {

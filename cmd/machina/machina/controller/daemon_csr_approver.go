@@ -10,11 +10,14 @@ import (
 
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/machinestatus"
 	"github.com/Azure/unbounded/pkg/agent/daemoncred"
 )
 
@@ -47,7 +50,76 @@ func NewDaemonCSRApprover(
 		return nil, err
 	}
 
-	return daemoncred.NewCSRApproverReconciler(c, kubeClient, approver)
+	reconciler, err := daemoncred.NewCSRApproverReconciler(c, kubeClient, approver)
+	if err != nil {
+		return nil, err
+	}
+
+	reconciler.OnDecision = claims.recordDecision
+
+	return reconciler, nil
+}
+
+func (c *daemonCSRClaimChecker) recordDecision(
+	ctx context.Context,
+	_ *certificatesv1.CertificateSigningRequest,
+	decision daemoncred.CSRDecision,
+) error {
+	if decision.NodeName == "" {
+		return nil
+	}
+
+	machineName, ok, err := c.machineNameForNode(ctx, decision.NodeName)
+	if err != nil || !ok {
+		return err
+	}
+
+	status := metav1.ConditionTrue
+	reason := "Approved"
+
+	if !decision.Approve {
+		status = metav1.ConditionFalse
+		reason = "Denied"
+	}
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var machine unboundedv1alpha3.Machine
+		if err := c.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+
+		meta.SetStatusCondition(&machine.Status.Conditions, machinestatus.Condition(
+			unboundedv1alpha3.MachineConditionDaemonCredentialReady,
+			status,
+			reason,
+			decision.Message,
+			machine.Generation,
+		))
+
+		return c.Status().Update(ctx, &machine)
+	})
+}
+
+func (c *daemonCSRClaimChecker) machineNameForNode(ctx context.Context, nodeName string) (string, bool, error) {
+	var machines unboundedv1alpha3.MachineList
+	if err := c.List(ctx, &machines, client.MatchingFields{machineNodeRefNameField: nodeName}); err != nil {
+		return "", false, fmt.Errorf("list Machines by node ref for CSR decision: %w", err)
+	}
+
+	if len(machines.Items) > 0 {
+		return machines.Items[0].Name, true, nil
+	}
+
+	var machine unboundedv1alpha3.Machine
+	if err := c.Get(ctx, client.ObjectKey{Name: nodeName}, &machine); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			return "", false, nil
+		}
+
+		return "", false, err
+	}
+
+	return machine.Name, true, nil
 }
 
 func (c *daemonCSRClaimChecker) bootstrapTokenMayClaimNode(

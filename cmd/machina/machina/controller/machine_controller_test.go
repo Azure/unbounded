@@ -42,6 +42,16 @@ type mockProvisioner struct {
 	bootstrapToken string
 }
 
+func newReadyNode(name string) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+			Type:   corev1.NodeReady,
+			Status: corev1.ConditionTrue,
+		}}},
+	}
+}
+
 func (m *mockProvisioner) ProvisionMachine(
 	_ context.Context,
 	machine *unboundedv1alpha3.Machine,
@@ -1247,11 +1257,7 @@ func TestReconcileNodeJoin_Joining_NodeFound(t *testing.T) {
 	}
 
 	// Node name matches machine name (convention).
-	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-machine",
-		},
-	}
+	node := newReadyNode("test-machine")
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(s).
@@ -1294,11 +1300,7 @@ func TestReconcileNodeJoin_Ready_NodeStillExists(t *testing.T) {
 		},
 	}
 
-	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "worker-1",
-		},
-	}
+	node := newReadyNode("worker-1")
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(s).
@@ -1373,11 +1375,7 @@ func TestReconcileNodeJoin_Joining_NodeReappears(t *testing.T) {
 	}
 
 	// Node name matches machine name (convention).
-	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-machine",
-		},
-	}
+	node := newReadyNode("test-machine")
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(s).

@@ -26,6 +26,7 @@ import (
 	"github.com/google/go-tpm/tpm2"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -125,6 +126,19 @@ type testStatusUpdater struct {
 
 func (u *testStatusUpdater) Update(ctx context.Context, node *v1alpha3.Machine) error {
 	return u.client.Status().Update(ctx, node)
+}
+
+func (u *testStatusUpdater) UpdateStatus(ctx context.Context, key client.ObjectKey, mutate func(*v1alpha3.Machine) bool) error {
+	var node v1alpha3.Machine
+	if err := u.client.Get(ctx, key, &node); err != nil {
+		return err
+	}
+
+	if !mutate(&node) {
+		return nil
+	}
+
+	return u.client.Status().Update(ctx, &node)
 }
 
 // testLookupByIP returns a LookupNodeByIP function that iterates Machines
@@ -329,6 +343,11 @@ func TestAttestTOFUStoresKey(t *testing.T) {
 		t.Fatal("expected EKPublicKey to be stored after TOFU")
 	}
 
+	cond := meta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineConditionAttestationReady)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Issued" {
+		t.Fatalf("expected AttestationReady=True/Issued, got %+v", cond)
+	}
+
 	block, _ := pem.Decode([]byte(updated.Status.TPM.EKPublicKey))
 	if block == nil || block.Type != "PUBLIC KEY" {
 		t.Fatal("stored EKPub is not valid PEM PUBLIC KEY")
@@ -375,6 +394,16 @@ func TestAttestTOFURejectsNewKey(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
 	}
+
+	updated, err := handler.LookupNodeByIP(t.Context(), "10.0.1.11")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineConditionAttestationReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "EKMismatch" {
+		t.Fatalf("expected AttestationReady=False/EKMismatch, got %+v", cond)
+	}
 }
 
 func TestAttestEKMismatch(t *testing.T) {
@@ -419,6 +448,16 @@ func TestAttestEKMismatch(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+
+	updated, err := handler.LookupNodeByIP(t.Context(), "10.0.1.12")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineConditionAttestationReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "EKMismatch" {
+		t.Fatalf("expected AttestationReady=False/EKMismatch, got %+v", cond)
 	}
 }
 

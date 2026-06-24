@@ -4,6 +4,7 @@
 package redfish
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -23,7 +24,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
@@ -663,6 +666,66 @@ func TestRedfishTOFUCertCapture(t *testing.T) {
 	}
 }
 
+func TestRedfishTOFUDoesNotOverwriteLatestFingerprint(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	staleNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-tofu-race", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image: "ghcr.io/test/test-image:v1",
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+		},
+	}
+	latestNode := staleNode.DeepCopy()
+	latestNode.Status.Redfish = &v1alpha3.RedfishStatus{CertFingerprint: "existing:fingerprint"}
+
+	scheme := testScheme(t)
+	returnedStale := false
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(latestNode).
+		WithStatusSubresource(latestNode).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if machine, ok := obj.(*v1alpha3.Machine); ok && key.Name == staleNode.Name && !returnedStale {
+					returnedStale = true
+					*machine = *staleNode.DeepCopy()
+
+					return nil
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: staleNode.Name, Namespace: staleNode.Namespace}}
+
+	_, err := reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	if updated.Status.Redfish == nil || updated.Status.Redfish.CertFingerprint != "existing:fingerprint" {
+		t.Fatalf("expected existing fingerprint to remain, got %+v", updated.Status.Redfish)
+	}
+}
+
 func TestRedfishExactlyOnceSemantics(t *testing.T) {
 	var resetCalls atomic.Int64
 
@@ -742,6 +805,517 @@ func TestRedfishExactlyOnceSemantics(t *testing.T) {
 
 	if resetCalls.Load() != 0 {
 		t.Fatalf("expected 0 reset calls when reboots == observedReboots, got %d", resetCalls.Load())
+	}
+}
+
+func TestRedfishPowerOnDoesNotCompleteNewerReboot(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{{"@odata.id": "/redfish/v1/Chassis/1"}},
+				},
+			})
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+	staleNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-reboot-race", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image: "ghcr.io/test/test-image:v1",
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RebootCounter: 1, RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish:    &v1alpha3.RedfishStatus{CertFingerprint: fp},
+			Operations: &v1alpha3.OperationsStatus{RebootCounter: 0, RepaveCounter: 0},
+			Conditions: []metav1.Condition{{Type: condPoweredOff, Status: metav1.ConditionTrue, Reason: reasonPoweringOn}},
+		},
+	}
+	latestNode := staleNode.DeepCopy()
+	latestNode.Spec.Operations.RebootCounter = 2
+
+	scheme := testScheme(t)
+	returnedStale := false
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(latestNode, secret).
+		WithStatusSubresource(latestNode).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if machine, ok := obj.(*v1alpha3.Machine); ok && key.Name == staleNode.Name && !returnedStale {
+					returnedStale = true
+					*machine = *staleNode.DeepCopy()
+
+					return nil
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: staleNode.Name, Namespace: staleNode.Namespace}}
+
+	_, err := reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	if updated.Status.Operations == nil || updated.Status.Operations.RebootCounter != 0 {
+		t.Fatalf("expected stale observation not to complete reboot, got %+v", updated.Status.Operations)
+	}
+
+	if !meta.IsStatusConditionTrue(updated.Status.Conditions, condPoweredOff) {
+		t.Fatalf("expected PoweredOff condition to remain, got %+v", updated.Status.Conditions)
+	}
+}
+
+func TestRedfishForceOffDoesNotMarkNewerRebootPoweringOff(t *testing.T) {
+	var forceOffCalls atomic.Int64
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{{"@odata.id": "/redfish/v1/Chassis/1"}},
+				},
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
+			forceOffCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+	staleNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-forceoff-race", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image: "ghcr.io/test/test-image:v1",
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RebootCounter: 1, RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish:    &v1alpha3.RedfishStatus{CertFingerprint: fp},
+			Operations: &v1alpha3.OperationsStatus{RebootCounter: 0, RepaveCounter: 0},
+		},
+	}
+	latestNode := staleNode.DeepCopy()
+	latestNode.Spec.Operations.RebootCounter = 2
+
+	scheme := testScheme(t)
+	returnedStale := false
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(latestNode, secret).
+		WithStatusSubresource(latestNode).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if machine, ok := obj.(*v1alpha3.Machine); ok && key.Name == staleNode.Name && !returnedStale {
+					returnedStale = true
+					*machine = *staleNode.DeepCopy()
+
+					return nil
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: staleNode.Name, Namespace: staleNode.Namespace}}
+
+	_, err := reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if forceOffCalls.Load() != 0 {
+		t.Fatalf("expected stale reconcile not to send ForceOff, got %d", forceOffCalls.Load())
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, condPoweredOff)
+	if cond != nil {
+		t.Fatalf("expected stale ForceOff not to mark newer reboot PoweringOff, got %+v", cond)
+	}
+}
+
+func TestRedfishOnDoesNotMarkNewerRebootPoweringOn(t *testing.T) {
+	var onCalls atomic.Int64
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "Off",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{{"@odata.id": "/redfish/v1/Chassis/1"}},
+				},
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
+			onCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+	staleNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-on-race", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image: "ghcr.io/test/test-image:v1",
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RebootCounter: 1, RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish:    &v1alpha3.RedfishStatus{CertFingerprint: fp},
+			Operations: &v1alpha3.OperationsStatus{RebootCounter: 0, RepaveCounter: 0},
+			Conditions: []metav1.Condition{{Type: condPoweredOff, Status: metav1.ConditionTrue, Reason: reasonForceOff}},
+		},
+	}
+	latestNode := staleNode.DeepCopy()
+	latestNode.Spec.Operations.RebootCounter = 2
+
+	scheme := testScheme(t)
+	returnedStale := false
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(latestNode, secret).
+		WithStatusSubresource(latestNode).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if machine, ok := obj.(*v1alpha3.Machine); ok && key.Name == staleNode.Name && !returnedStale {
+					returnedStale = true
+					*machine = *staleNode.DeepCopy()
+
+					return nil
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: staleNode.Name, Namespace: staleNode.Namespace}}
+
+	_, err := reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if onCalls.Load() != 0 {
+		t.Fatalf("expected stale reconcile not to send On, got %d", onCalls.Load())
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, condPoweredOff)
+	if cond == nil || cond.Reason != reasonForceOff {
+		t.Fatalf("expected stale On not to mark newer reboot PoweringOn, got %+v", cond)
+	}
+}
+
+func TestRedfishBootOverrideUsesLatestRepaveTarget(t *testing.T) {
+	var patchCalls atomic.Int64
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{{"@odata.id": "/redfish/v1/Chassis/1"}},
+				},
+			})
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+	staleNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-stale-repave", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image: "ghcr.io/test/test-image:v1",
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish:    &v1alpha3.RedfishStatus{CertFingerprint: fp},
+			Operations: &v1alpha3.OperationsStatus{RepaveCounter: 1},
+		},
+	}
+	latestNode := staleNode.DeepCopy()
+	latestNode.Spec.Operations.RepaveCounter = 2
+
+	scheme := testScheme(t)
+	cachedClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(staleNode, secret).
+		WithStatusSubresource(staleNode).
+		Build()
+	apiReader := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(latestNode).
+		WithStatusSubresource(latestNode).
+		Build()
+	reconciler := &Reconciler{Client: cachedClient, APIReader: apiReader, Pool: NewPool()}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: staleNode.Name, Namespace: staleNode.Namespace}}
+
+	_, err := reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if patchCalls.Load() != 0 {
+		t.Fatalf("expected stale boot override not to patch BMC, got %d", patchCalls.Load())
+	}
+}
+
+func TestRedfishResetDoesNotUseStaleEndpoint(t *testing.T) {
+	var oldResetCalls atomic.Int64
+	oldSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{{"@odata.id": "/redfish/v1/Chassis/1"}},
+				},
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
+			oldResetCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer oldSrv.Close()
+
+	newSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer newSrv.Close()
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+	staleNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-reset-stale-endpoint", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image: "ghcr.io/test/test-image:v1",
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         oldSrv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RebootCounter: 1, RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish:    &v1alpha3.RedfishStatus{CertFingerprint: tlsServerFingerprint(oldSrv)},
+			Operations: &v1alpha3.OperationsStatus{RebootCounter: 0, RepaveCounter: 0},
+		},
+	}
+	latestNode := staleNode.DeepCopy()
+	latestNode.Spec.PXE.Redfish.URL = newSrv.URL
+
+	scheme := testScheme(t)
+	cachedClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(staleNode, secret).
+		WithStatusSubresource(staleNode).
+		Build()
+	apiReader := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(latestNode).
+		WithStatusSubresource(latestNode).
+		Build()
+	reconciler := &Reconciler{Client: cachedClient, APIReader: apiReader, Pool: NewPool()}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: staleNode.Name, Namespace: staleNode.Namespace}}
+
+	_, err := reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if oldResetCalls.Load() != 0 {
+		t.Fatalf("expected stale endpoint not to receive reset, got %d", oldResetCalls.Load())
+	}
+}
+
+func TestRedfishTOFUDoesNotPinStaleEndpoint(t *testing.T) {
+	oldSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer oldSrv.Close()
+
+	newSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer newSrv.Close()
+
+	staleNode := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-tofu-stale-endpoint", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image: "ghcr.io/test/test-image:v1",
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         oldSrv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+		},
+	}
+	latestNode := staleNode.DeepCopy()
+	latestNode.Spec.PXE.Redfish.URL = newSrv.URL
+
+	scheme := testScheme(t)
+	cachedClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(staleNode).
+		WithStatusSubresource(staleNode).
+		Build()
+	apiReader := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(latestNode).
+		WithStatusSubresource(latestNode).
+		Build()
+	reconciler := &Reconciler{Client: cachedClient, APIReader: apiReader, Pool: NewPool()}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: staleNode.Name, Namespace: staleNode.Namespace}}
+
+	_, err := reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var updated v1alpha3.Machine
+	if err := cachedClient.Get(t.Context(), req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	if updated.Status.Redfish != nil && updated.Status.Redfish.CertFingerprint != "" {
+		t.Fatalf("expected stale endpoint not to pin fingerprint, got %+v", updated.Status.Redfish)
 	}
 }
 

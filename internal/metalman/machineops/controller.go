@@ -15,6 +15,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -66,6 +67,7 @@ type Reconciler struct {
 	PollInterval          time.Duration
 	PowerActionTimeout    time.Duration
 	Now                   func() metav1.Time
+	Recorder              events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete
@@ -129,6 +131,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{RequeueAfter: r.pollInterval()}, r.updateOperationStatus(ctx, op.Name, func(latest *v1alpha3.MachineOperation) {
 			latest.Status.Phase = v1alpha3.OperationPhasePending
 			latest.Status.Message = message
+			setCompletedCondition(latest, metav1.ConditionFalse, reasonWaitingForOlderOperation, message)
 		})
 	}
 
@@ -394,13 +397,13 @@ func (r *Reconciler) advancePowerOff(ctx context.Context, machine *v1alpha3.Mach
 	}
 
 	if err := pc.Reset(ctx, redfish.ResetForceOff); err != nil {
-		return retryTarget(target, err, now, r.maxAttempts())
+		return retryTarget(target, fmt.Errorf("send Redfish ForceOff: %w", err), now, r.maxAttempts())
 	}
 
 	target.Stage = v1alpha3.OperationStageWaitingOff
 	target.Attempts++
 	target.LastAttemptAt = &now
-	target.Message = "sent ForceOff"
+	target.Message = fmt.Sprintf("sent Redfish ForceOff (attempt %d/%d)", target.Attempts, r.maxAttempts())
 
 	return targetChange{target: target}
 }
@@ -412,7 +415,7 @@ func (r *Reconciler) advancePowerOn(ctx context.Context, machine *v1alpha3.Machi
 	}
 
 	if err := pc.DisableBootOverride(ctx); err != nil {
-		return retryTarget(target, err, now, r.maxAttempts())
+		return retryTarget(target, fmt.Errorf("disable Redfish boot override: %w", err), now, r.maxAttempts())
 	}
 
 	state, err := pc.PowerState(ctx)
@@ -429,13 +432,13 @@ func (r *Reconciler) advancePowerOn(ctx context.Context, machine *v1alpha3.Machi
 	}
 
 	if err := pc.Reset(ctx, redfish.ResetOn); err != nil {
-		return retryTarget(target, err, now, r.maxAttempts())
+		return retryTarget(target, fmt.Errorf("send Redfish On: %w", err), now, r.maxAttempts())
 	}
 
 	target.Stage = v1alpha3.OperationStageWaitingOn
 	target.Attempts++
 	target.LastAttemptAt = &now
-	target.Message = "sent On"
+	target.Message = fmt.Sprintf("sent Redfish On (attempt %d/%d)", target.Attempts, r.maxAttempts())
 
 	return targetChange{target: target}
 }
@@ -447,7 +450,7 @@ func (r *Reconciler) advanceReboot(ctx context.Context, machine *v1alpha3.Machin
 	}
 
 	if err := pc.DisableBootOverride(ctx); err != nil {
-		return retryTarget(target, err, now, r.maxAttempts())
+		return retryTarget(target, fmt.Errorf("disable Redfish boot override: %w", err), now, r.maxAttempts())
 	}
 
 	state, err := pc.PowerState(ctx)
@@ -467,13 +470,13 @@ func (r *Reconciler) advanceReboot(ctx context.Context, machine *v1alpha3.Machin
 		}
 
 		if err := pc.Reset(ctx, redfish.ResetForceOff); err != nil {
-			return retryTarget(target, err, now, r.maxAttempts())
+			return retryTarget(target, fmt.Errorf("send Redfish ForceOff for reboot: %w", err), now, r.maxAttempts())
 		}
 
 		target.Stage = v1alpha3.OperationStageWaitingOff
 		target.Attempts++
 		target.LastAttemptAt = &now
-		target.Message = "sent ForceOff"
+		target.Message = fmt.Sprintf("sent Redfish ForceOff for reboot (attempt %d/%d)", target.Attempts, r.maxAttempts())
 
 		return targetChange{target: target}
 
@@ -487,13 +490,13 @@ func (r *Reconciler) advanceReboot(ctx context.Context, machine *v1alpha3.Machin
 		}
 
 		if err := pc.Reset(ctx, redfish.ResetOn); err != nil {
-			return retryTarget(target, err, now, r.maxAttempts())
+			return retryTarget(target, fmt.Errorf("send Redfish On for reboot: %w", err), now, r.maxAttempts())
 		}
 
 		target.Stage = v1alpha3.OperationStageWaitingOn
 		target.Attempts++
 		target.LastAttemptAt = &now
-		target.Message = "sent On"
+		target.Message = fmt.Sprintf("sent Redfish On for reboot (attempt %d/%d)", target.Attempts, r.maxAttempts())
 
 		return targetChange{target: target}
 
@@ -508,7 +511,7 @@ func (r *Reconciler) waitForPowerAction(target v1alpha3.MachineOperationTargetSt
 	}
 
 	if now.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
-		target.Message = waitingMessage
+		target.Message = fmt.Sprintf("%s (attempt %d/%d)", waitingMessage, target.Attempts, r.maxAttempts())
 		return targetChange{target: target}, true
 	}
 
@@ -535,7 +538,7 @@ func (r *Reconciler) advanceReplace(ctx context.Context, machine *v1alpha3.Machi
 		target.Message = "requesting PXE repave"
 
 		if err := r.patchMachineOperations(ctx, machine.Name, target.TargetOperations); err != nil {
-			return targetChange{target: target, err: err}
+			return retryTarget(target, fmt.Errorf("request PXE repave on Machine %s: %w", machine.Name, err), now, r.maxAttempts())
 		}
 
 		return targetChange{target: target}
@@ -556,7 +559,7 @@ func (r *Reconciler) advanceReplace(ctx context.Context, machine *v1alpha3.Machi
 				return targetChange{target: target}
 			}
 
-			return targetChange{target: target, err: fmt.Errorf("get Node %s: %w", nodeName, err)}
+			return retryTarget(target, fmt.Errorf("get Node %s after PXE repave: %w", nodeName, err), now, r.maxAttempts())
 		}
 
 		return completeTarget(target, "HostReplace completed", now)
@@ -645,7 +648,10 @@ func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
 		return
 	}
 
-	var complete, failed, inProgress, pending int
+	var (
+		complete, failed, inProgress, pending int
+		firstFailed                           *v1alpha3.MachineOperationTargetStatus
+	)
 
 	for _, target := range op.Status.Targets {
 		switch target.Phase {
@@ -653,6 +659,11 @@ func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
 			complete++
 		case v1alpha3.OperationPhaseFailed:
 			failed++
+
+			if firstFailed == nil {
+				t := target
+				firstFailed = &t
+			}
 		case v1alpha3.OperationPhaseInProgress:
 			inProgress++
 		default:
@@ -661,6 +672,10 @@ func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
 	}
 
 	message := fmt.Sprintf("targets complete=%d failed=%d inProgress=%d pending=%d", complete, failed, inProgress, pending)
+	if firstFailed != nil {
+		message = fmt.Sprintf("%s; first failed target %s: %s", message, firstFailed.MachineRef, firstFailed.Message)
+	}
+
 	op.Status.Message = message
 
 	if complete+failed == len(op.Status.Targets) {
@@ -670,18 +685,28 @@ func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
 		if failed > 0 {
 			op.Status.Phase = v1alpha3.OperationPhaseFailed
 			setCompletedCondition(op, metav1.ConditionFalse, "TargetFailed", message)
+			r.event(op, corev1.EventTypeWarning, "MachineOperationFailed", message)
 
 			return
 		}
 
 		op.Status.Phase = v1alpha3.OperationPhaseComplete
 		setCompletedCondition(op, metav1.ConditionTrue, reasonSucceeded, message)
+		r.event(op, corev1.EventTypeNormal, "MachineOperationComplete", message)
 
 		return
 	}
 
 	op.Status.Phase = v1alpha3.OperationPhaseInProgress
 	setCompletedCondition(op, metav1.ConditionFalse, "InProgress", message)
+}
+
+func (r *Reconciler) event(op *v1alpha3.MachineOperation, eventType, reason, message string) {
+	if r.Recorder == nil || op == nil {
+		return
+	}
+
+	r.Recorder.Eventf(op, nil, eventType, reason, reason, "%s", message)
 }
 
 func (r *Reconciler) olderActiveOperation(ctx context.Context, op *v1alpha3.MachineOperation) (string, error) {
@@ -852,12 +877,12 @@ func failTarget(target v1alpha3.MachineOperationTargetStatus, reason, message st
 
 func retryTarget(target v1alpha3.MachineOperationTargetStatus, err error, now metav1.Time, maxAttempts int32) targetChange {
 	if target.Attempts >= maxAttempts {
-		return failTarget(target, reasonExecutionFailed, err.Error(), now)
+		return failTarget(target, reasonExecutionFailed, fmt.Sprintf("%s after %d/%d attempts", err.Error(), target.Attempts, maxAttempts), now)
 	}
 
 	target.Attempts++
 	target.LastAttemptAt = &now
-	target.Message = err.Error()
+	target.Message = fmt.Sprintf("%s (attempt %d/%d)", err.Error(), target.Attempts, maxAttempts)
 
 	return targetChange{target: target}
 }

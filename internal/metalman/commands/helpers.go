@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/machinestatus"
 )
 
 const siteLabel = "unbounded-cloud.io/site"
@@ -42,6 +43,10 @@ type StatusUpdater struct {
 
 func (u *StatusUpdater) Update(ctx context.Context, node *v1alpha3.Machine) error {
 	return u.Client.Status().Update(ctx, node)
+}
+
+func (u *StatusUpdater) UpdateStatus(ctx context.Context, key client.ObjectKey, mutate func(*v1alpha3.Machine) bool) error {
+	return machinestatus.Update(ctx, u.Client, key, mutate)
 }
 
 func BuildScheme() *runtime.Scheme {

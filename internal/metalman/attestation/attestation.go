@@ -25,12 +25,16 @@ import (
 
 	"github.com/google/go-tpm/tpm2"
 	authenticationv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/machinestatus"
 )
 
 const (
@@ -46,11 +50,13 @@ type Handler struct {
 	ClusterCA      []byte // PEM-encoded cluster CA certificate
 	LookupNodeByIP func(ctx context.Context, ip string) (*v1alpha3.Machine, error)
 	StatusUpdater  StatusUpdater
+	Recorder       events.EventRecorder
 }
 
 // StatusUpdater updates the status subresource of a Machine.
 type StatusUpdater interface {
 	Update(ctx context.Context, node *v1alpha3.Machine) error
+	UpdateStatus(ctx context.Context, key client.ObjectKey, mutate func(*v1alpha3.Machine) bool) error
 }
 
 type AttestRequest struct {
@@ -128,6 +134,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	ekTPM2B, err := tpm2.Unmarshal[tpm2.TPM2BPublic, *tpm2.TPM2BPublic](req.EKPub)
 	if err != nil {
 		log.Error("attest: decoding EK TPM2B_PUBLIC", "err", err)
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "EKDecodeFailed", fmt.Sprintf("failed to decode EK public key: %v", err), corev1.EventTypeWarning)
 		http.Error(w, "invalid EK public key", http.StatusBadRequest)
 
 		return
@@ -136,6 +143,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	ekTPMPub, err := ekTPM2B.Contents()
 	if err != nil {
 		log.Error("attest: extracting EK TPMT_PUBLIC", "err", err)
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "EKDecodeFailed", fmt.Sprintf("failed to extract EK public key: %v", err), corev1.EventTypeWarning)
 		http.Error(w, "invalid EK public key", http.StatusBadRequest)
 
 		return
@@ -144,40 +152,36 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	ekKey, err := tpm2.Pub(*ekTPMPub)
 	if err != nil {
 		log.Error("attest: extracting EK crypto key", "err", err)
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "EKDecodeFailed", fmt.Sprintf("failed to extract EK crypto key: %v", err), corev1.EventTypeWarning)
 		http.Error(w, "invalid EK public key", http.StatusBadRequest)
 
 		return
 	}
 
 	// TOFU: store or verify the EK public key.
-	if node.Status.TPM == nil || node.Status.TPM.EKPublicKey == "" {
-		der, err := x509.MarshalPKIXPublicKey(ekKey)
+	storedEKPublicKey := ""
+	if node.Status.TPM != nil {
+		storedEKPublicKey = node.Status.TPM.EKPublicKey
+	}
+
+	if storedEKPublicKey == "" {
+		storedEKPublicKey, err = h.storeEKPublicKey(ctx, node, ekKey)
 		if err != nil {
-			log.Error("attest: marshaling EK public key", "err", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-
-			return
-		}
-
-		ekPubPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
-
-		if node.Status.TPM == nil {
-			node.Status.TPM = &v1alpha3.TPMStatus{}
-		}
-
-		node.Status.TPM.EKPublicKey = ekPubPEM
-		if err := h.StatusUpdater.Update(ctx, node); err != nil {
 			log.Error("attest: storing EK public key", "err", err)
+			h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "StatusUpdateFailed", fmt.Sprintf("failed to store EK public key: %v", err), corev1.EventTypeWarning)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 
 			return
 		}
 
 		log.Info("TOFU: stored EK public key")
-	} else {
-		block, _ := pem.Decode([]byte(node.Status.TPM.EKPublicKey))
+	}
+
+	if storedEKPublicKey != "" {
+		block, _ := pem.Decode([]byte(storedEKPublicKey))
 		if block == nil {
 			log.Error("attest: invalid stored EK public key PEM")
+			h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "StoredEKInvalid", "stored EK public key is not valid PEM", corev1.EventTypeWarning)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 
 			return
@@ -186,6 +190,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 		storedKey, err := x509.ParsePKIXPublicKey(block.Bytes)
 		if err != nil {
 			log.Error("attest: parsing stored EK public key", "err", err)
+			h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "StoredEKInvalid", fmt.Sprintf("stored EK public key could not be parsed: %v", err), corev1.EventTypeWarning)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 
 			return
@@ -193,6 +198,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 
 		if !publicKeysEqual(ekKey, storedKey) {
 			log.Warn("attest: EK public key does not match stored key")
+			h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "EKMismatch", "EK public key does not match the stored Machine TPM identity", corev1.EventTypeWarning)
 			http.Error(w, "EK public key does not match stored key", http.StatusForbidden)
 
 			return
@@ -203,6 +209,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	srkTPM2B, err := tpm2.Unmarshal[tpm2.TPM2BPublic, *tpm2.TPM2BPublic](req.SRKPub)
 	if err != nil {
 		log.Error("attest: decoding SRK TPM2B_PUBLIC", "err", err)
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "SRKDecodeFailed", fmt.Sprintf("failed to decode SRK public key: %v", err), corev1.EventTypeWarning)
 		http.Error(w, "invalid SRK public key", http.StatusBadRequest)
 
 		return
@@ -211,6 +218,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	srkTPMPub, err := srkTPM2B.Contents()
 	if err != nil {
 		log.Error("attest: extracting SRK TPMT_PUBLIC", "err", err)
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "SRKDecodeFailed", fmt.Sprintf("failed to extract SRK public key: %v", err), corev1.EventTypeWarning)
 		http.Error(w, "invalid SRK public key", http.StatusBadRequest)
 
 		return
@@ -219,6 +227,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	srkName, err := tpm2.ObjectName(srkTPMPub)
 	if err != nil {
 		log.Error("attest: computing SRK Name", "err", err)
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "SRKDecodeFailed", fmt.Sprintf("failed to compute SRK name: %v", err), corev1.EventTypeWarning)
 		http.Error(w, "invalid SRK public key", http.StatusBadRequest)
 
 		return
@@ -228,6 +237,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	ekEncKey, err := tpm2.ImportEncapsulationKey(ekTPMPub)
 	if err != nil {
 		log.Error("attest: importing EK encapsulation key", "err", err)
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "EKDecodeFailed", fmt.Sprintf("failed to import EK encapsulation key: %v", err), corev1.EventTypeWarning)
 		http.Error(w, "invalid EK public key", http.StatusBadRequest)
 
 		return
@@ -238,6 +248,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	aesKey := make([]byte, 32)
 	if _, err := rand.Read(aesKey); err != nil {
 		log.Error("attest: generating AES key", "err", err)
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "CredentialFailed", fmt.Sprintf("failed to generate attestation secret: %v", err), corev1.EventTypeWarning)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 
 		return
@@ -246,6 +257,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	idObject, encSecret, err := tpm2.CreateCredential(rand.Reader, ekEncKey, srkName.Buffer, aesKey)
 	if err != nil {
 		log.Error("attest: CreateCredential", "err", err)
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "CredentialFailed", fmt.Sprintf("failed to create TPM credential: %v", err), corev1.EventTypeWarning)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 
 		return
@@ -274,6 +286,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		log.Error("attest: creating SA token", "err", err)
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "TokenRequestFailed", fmt.Sprintf("failed to request bootstrap token for %s/%s: %v", BootstrapSANamespace, BootstrapSAName, err), corev1.EventTypeWarning)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 
 		return
@@ -283,6 +296,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	block, err := aes.NewCipher(aesKey)
 	if err != nil {
 		log.Error("attest: creating AES cipher", "err", err)
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "CredentialFailed", fmt.Sprintf("failed to create bootstrap token cipher: %v", err), corev1.EventTypeWarning)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 
 		return
@@ -291,6 +305,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		log.Error("attest: creating GCM", "err", err)
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "CredentialFailed", fmt.Sprintf("failed to create bootstrap token encryption: %v", err), corev1.EventTypeWarning)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 
 		return
@@ -299,6 +314,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	gcmNonce := make([]byte, gcm.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, gcmNonce); err != nil {
 		log.Error("attest: generating GCM nonce", "err", err)
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "CredentialFailed", fmt.Sprintf("failed to generate bootstrap token nonce: %v", err), corev1.EventTypeWarning)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 
 		return
@@ -308,6 +324,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 
 	tokenHash := sha256.Sum256([]byte(tokenResp.Status.Token))
 	log.Info("attest: issued encrypted bootstrap token", "tokenID", fmt.Sprintf("%x", tokenHash[:8]))
+	h.setAttestationCondition(ctx, node, metav1.ConditionTrue, "Issued", fmt.Sprintf("issued encrypted bootstrap token for service account %s/%s", BootstrapSANamespace, BootstrapSAName), corev1.EventTypeNormal)
 
 	resp := AttestResponse{
 		CredentialBlob:  credentialBlob,
@@ -322,6 +339,66 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Error("attest: writing response", "err", err)
 	}
+}
+
+func (h *Handler) setAttestationCondition(ctx context.Context, node *v1alpha3.Machine, status metav1.ConditionStatus, reason, message, eventType string) {
+	if node == nil || h.StatusUpdater == nil {
+		return
+	}
+
+	changed := false
+
+	if err := h.StatusUpdater.UpdateStatus(ctx, client.ObjectKeyFromObject(node), func(latest *v1alpha3.Machine) bool {
+		changed = machinestatus.SetConditionIfChanged(latest, machinestatus.Condition(
+			v1alpha3.MachineConditionAttestationReady,
+			status,
+			reason,
+			message,
+			latest.Generation,
+		))
+
+		return changed
+	}); err != nil {
+		slog.Error("attest: updating attestation condition", "node", node.Name, "err", err)
+		return
+	}
+
+	if !changed {
+		return
+	}
+
+	machinestatus.Event(h.Recorder, node, eventType, "Attestation"+reason, message)
+}
+
+func (h *Handler) storeEKPublicKey(ctx context.Context, node *v1alpha3.Machine, ekKey crypto.PublicKey) (string, error) {
+	der, err := x509.MarshalPKIXPublicKey(ekKey)
+	if err != nil {
+		h.setAttestationCondition(ctx, node, metav1.ConditionFalse, "EKMarshalFailed", fmt.Sprintf("failed to store EK public key: %v", err), corev1.EventTypeWarning)
+
+		return "", err
+	}
+
+	ekPubPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+
+	if err := h.StatusUpdater.UpdateStatus(ctx, client.ObjectKeyFromObject(node), func(latest *v1alpha3.Machine) bool {
+		if latest.Status.TPM != nil && latest.Status.TPM.EKPublicKey != "" {
+			ekPubPEM = latest.Status.TPM.EKPublicKey
+
+			return false
+		}
+
+		if latest.Status.TPM == nil {
+			latest.Status.TPM = &v1alpha3.TPMStatus{}
+		}
+
+		latest.Status.TPM.EKPublicKey = ekPubPEM
+
+		return true
+	}); err != nil {
+		return "", err
+	}
+
+	return ekPubPEM, nil
 }
 
 // publicKeysEqual compares two crypto.PublicKey values structurally.

@@ -234,8 +234,12 @@ func TestCloudInitTimeoutRetriesCompletedRepave(t *testing.T) {
 	}
 
 	cloudInitCond := meta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
-	if cloudInitCond != nil {
-		t.Fatalf("expected CloudInitDone condition to be removed, got %+v", cloudInitCond)
+	if cloudInitCond == nil || cloudInitCond.Status != metav1.ConditionUnknown || cloudInitCond.Reason != "Retrying" {
+		t.Fatalf("expected CloudInitDone=Unknown/Retrying, got %+v", cloudInitCond)
+	}
+
+	if updated.Status.Message != "retrying repave after cloud-init timeout: TimedOut" {
+		t.Fatalf("expected retry message, got %q", updated.Status.Message)
 	}
 }
 
