@@ -341,6 +341,8 @@ mod tests {
                 url: "https://example.com".to_string(),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
+                ca_cert_path: None,
+                insecure_skip_verify: false,
             })),
         }
     }
