@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
@@ -43,7 +44,12 @@ func newCmdPreflight(cmdCtx *CommandContext) *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&handler.configPath, "config", "", "Path to agent config file")
-	cmd.Flags().StringSliceVar(&handler.ignorePreflightErrors, "ignore-preflight-errors", nil, "Comma-separated preflight check names whose errors should be reported as warnings")
+	cmd.Flags().StringSliceVar(
+		&handler.ignorePreflightErrors,
+		"ignore-preflight-errors",
+		nil,
+		"Comma-separated preflight check names whose errors should be reported as warnings",
+	)
 	cmd.Flags().BoolVar(&handler.failOnWarnings, "fail-on-warnings", false, "Fail when any preflight warning is returned")
 	cmd.Flags().StringVar(&handler.output, "output", "text", "Output format: text or json")
 
@@ -72,6 +78,19 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		caCertData = nil
 	}
 
+	goalState, goalStateErr := goalstates.ResolveMachine(
+		h.cmdCtx.Logger,
+		&cfg.AgentConfig,
+		goalstates.NSpawnMachineKube1,
+		provision.ResolveDownloadOverrides(cfg.Downloads),
+	)
+
+	var rootFSGoalState *goalstates.RootFS
+
+	if goalState != nil {
+		rootFSGoalState = goalState.RootFS
+	}
+
 	checks := []preflight.Checker{
 		host.CheckIsPrivilegedUser(h.cmdCtx.Logger),
 		host.CheckAgentConfig(h.cmdCtx.Logger, &cfg.AgentConfig),
@@ -84,7 +103,8 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		host.CheckDiskSpace(h.cmdCtx.Logger),
 		host.CheckCgroups(h.cmdCtx.Logger),
 		nodestart.CheckAPIServerReachable(h.cmdCtx.Logger, cfg.Kubelet.ApiServer, caCertData),
-		rootfs.CheckGoalState(h.cmdCtx.Logger, &cfg.AgentConfig, provision.ResolveDownloadOverrides(cfg.Downloads)),
+		rootfs.CheckGoalState(h.cmdCtx.Logger, goalStateErr, rootFSGoalState),
+		rootfs.CheckNSpawnMachineProvisioning(h.cmdCtx.Logger, rootFSGoalState),
 	}
 
 	opts := preflight.Options{
@@ -158,7 +178,10 @@ func writePreflightText(w io.Writer, report preflight.Report) error {
 		}
 	}
 
-	_, err := fmt.Fprintln(w, "[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`")
+	_, err := fmt.Fprintln(
+		w,
+		"[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`",
+	)
 
 	return err
 }

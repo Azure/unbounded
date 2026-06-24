@@ -409,14 +409,11 @@ Rootfs provisioning checks:
 
 | Check | Purpose |
 |---|---|
-| `machine-dir` | Validate the target machine directory state is compatible with bootstrap. |
-| `oci-image-reference` | Validate the rootfs image reference parses. |
 | `oci-image-reachable` | Validate the configured rootfs image manifest can be resolved without pulling layers. |
-| `rootfs-provisioning` | Validate rootfs provisioning prerequisites are available from installed host packages and host-side nspawn config paths are writable. |
+| `nspawn-machine-provisioning` | Validate the target nspawn machine directory state, rootfs parent directory writability, and host-side nspawn config path writability. |
 | `kubernetes-artifacts` | Validate kubelet/kubectl/kube-proxy artifacts and checksums using the same download and verification calls used by rootfs provisioning, without installing files. |
 | `cri-artifacts` | Validate containerd, runc, and crictl artifacts using the same download/decompression or download calls used by rootfs provisioning, without installing files. |
 | `cni-artifacts` | Validate CNI plugin artifacts using the same download/decompression calls used by rootfs provisioning, without installing files. |
-| `rootfs-parent-writable` | Validate the parent directory for rootfs creation can be created or written. |
 
 GPU checks:
 

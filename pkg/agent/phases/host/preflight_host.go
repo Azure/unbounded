@@ -17,6 +17,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -50,7 +51,7 @@ func defaultHostCheckDeps() hostCheckDeps {
 		statfs:     syscall.Statfs,
 		readFile:   os.ReadFile,
 		stat:       os.Stat,
-		writeProbe: probeWritableDir,
+		writeProbe: utilio.ProbeWritableDir,
 		outputCmd:  executil.OutputCmd,
 	}
 }
@@ -93,10 +94,18 @@ func checkHostPackages(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 		if err != nil {
 			log.Debug("host package manager detection failed")
 
-			return preflight.ResultsError(checkHostPackagesName, "host packages", "supported host package manager is required: apt-get, tdnf, or dnf")
+			return preflight.ResultsError(
+				checkHostPackagesName,
+				"host packages",
+				"supported host package manager is required: apt-get, tdnf, or dnf",
+			)
 		}
 
-		log.Debug("detected host package manager", "packageManager", pm.name, "requiredPackages", strings.Join(pm.requiredPackages, ","))
+		log.Debug(
+			"detected host package manager",
+			"packageManager", pm.name,
+			"requiredPackages", strings.Join(pm.requiredPackages, ","),
+		)
 
 		var missing []string
 
@@ -115,7 +124,11 @@ func checkHostPackages(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 			// TODO: when offline mode is configured, missing required host
 			// packages should be reported as an error because bootstrap cannot
 			// rely on package source access to remediate them.
-			return preflight.ResultsWarning(checkHostPackagesName, "host packages", "required host packages are missing and may be installed by bootstrap: "+strings.Join(missing, ", "))
+			return preflight.ResultsWarning(
+				checkHostPackagesName,
+				"host packages",
+				"required host packages are missing and may be installed by bootstrap: "+strings.Join(missing, ", "),
+			)
 		}
 
 		log.Debug("required host packages are installed")
@@ -135,16 +148,28 @@ func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Ch
 		log.Debug("checking host OS configuration path", "path", sysctlDir)
 
 		if err := deps.writeProbe(sysctlDir); err != nil {
-			return preflight.ResultsError(checkHostOSConfigurationName, "host OS configuration", "host OS configuration path is not writable: "+sysctlDir)
+			return preflight.ResultsError(
+				checkHostOSConfigurationName,
+				"host OS configuration",
+				"host OS configuration path is not writable: "+sysctlDir,
+			)
 		}
 
 		log.Debug("checking systemd unit directory", "path", goalstates.SystemdSystemDir)
 
 		if err := deps.writeProbe(goalstates.SystemdSystemDir); err != nil {
-			return preflight.ResultsError(checkHostOSConfigurationName, "host OS configuration", "systemd unit directory is not writable: "+goalstates.SystemdSystemDir)
+			return preflight.ResultsError(
+				checkHostOSConfigurationName,
+				"host OS configuration",
+				"systemd unit directory is not writable: "+goalstates.SystemdSystemDir,
+			)
 		}
 
-		return preflight.ResultsOK(checkHostOSConfigurationName, "host OS configuration", "host OS configuration can be applied")
+		return preflight.ResultsOK(
+			checkHostOSConfigurationName,
+			"host OS configuration",
+			"host OS configuration can be applied",
+		)
 	}}
 }
 
@@ -162,7 +187,11 @@ func checkNSpawnRuntime(log *slog.Logger, deps hostCheckDeps) preflight.Checker 
 				// TODO: when offline mode is configured, missing nspawn runtime
 				// tools should be reported as an error because bootstrap cannot rely
 				// on package installation to remediate them.
-				return preflight.ResultsWarning(checkNSpawnRuntimeName, "nspawn runtime", "nspawn runtime tool is missing and may be installed by bootstrap: "+binary)
+				return preflight.ResultsWarning(
+					checkNSpawnRuntimeName,
+					"nspawn runtime",
+					"nspawn runtime tool is missing and may be installed by bootstrap: "+binary,
+				)
 			}
 		}
 
@@ -170,7 +199,11 @@ func checkNSpawnRuntime(log *slog.Logger, deps hostCheckDeps) preflight.Checker 
 		log.Debug("checking systemd runtime path", "path", systemdRuntimePath)
 
 		if _, err := deps.stat(systemdRuntimePath); err != nil {
-			return preflight.ResultsWarning(checkNSpawnRuntimeName, "nspawn runtime", "systemd runtime path is not currently available: "+systemdRuntimePath)
+			return preflight.ResultsWarning(
+				checkNSpawnRuntimeName,
+				"nspawn runtime",
+				"systemd runtime path is not currently available: "+systemdRuntimePath,
+			)
 		}
 
 		return preflight.ResultsOK(checkNSpawnRuntimeName, "nspawn runtime", "nspawn runtime is available")
@@ -185,10 +218,19 @@ func CheckDockerActive(log *slog.Logger) preflight.Checker {
 func checkDockerActive(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkDockerActiveName, check: func(ctx context.Context) []preflight.Result {
 		out, err := deps.outputCmd(ctx, log, "systemctl", "is-active", dockerServiceUnit)
-		log.Debug("checked Docker unit state", "unit", dockerServiceUnit, "state", strings.TrimSpace(out), "error", err != nil)
+		log.Debug(
+			"checked Docker unit state",
+			"unit", dockerServiceUnit,
+			"state", strings.TrimSpace(out),
+			"error", err != nil,
+		)
 
 		if err == nil && strings.TrimSpace(out) == "active" {
-			return preflight.ResultsWarning(checkDockerActiveName, "docker service", "Docker is active and bootstrap will disable it")
+			return preflight.ResultsWarning(
+				checkDockerActiveName,
+				"docker service",
+				"Docker is active and bootstrap will disable it",
+			)
 		}
 
 		return preflight.ResultsOK(checkDockerActiveName, "docker service", "Docker is not active")
@@ -206,7 +248,11 @@ func checkSwapActive(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 		log.Debug("checked host swap state", "active", active, "error", err != nil)
 
 		if err != nil {
-			return preflight.ResultsWarning(checkSwapActiveName, "host swap", "swap state could not be determined from /proc/swaps")
+			return preflight.ResultsWarning(
+				checkSwapActiveName,
+				"host swap",
+				"swap state could not be determined from /proc/swaps",
+			)
 		}
 
 		if active {
@@ -230,14 +276,32 @@ func checkDiskSpace(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 		if err := deps.statfs(diskPath, &stat); err != nil {
 			log.Debug("failed to check disk space", "path", diskPath)
 
-			return preflight.ResultsError(checkDiskSpaceName, "host disk", "available disk space could not be determined for "+diskPath)
+			return preflight.ResultsError(
+				checkDiskSpaceName,
+				"host disk",
+				"available disk space could not be determined for "+diskPath,
+			)
 		}
 
 		free := stat.Bavail * uint64(stat.Bsize)
-		log.Debug("checked disk space", "path", diskPath, "freeGiB", gib(free), "requiredGiB", gib(minFreeDiskBytes))
+		log.Debug(
+			"checked disk space",
+			"path", diskPath,
+			"freeGiB", gib(free),
+			"requiredGiB", gib(minFreeDiskBytes),
+		)
 
 		if free < minFreeDiskBytes {
-			return preflight.ResultsError(checkDiskSpaceName, "host disk", fmt.Sprintf("available disk space is below the minimum for %s: current %.1f GiB, required %.1f GiB", diskPath, gib(free), gib(minFreeDiskBytes)))
+			return preflight.ResultsError(
+				checkDiskSpaceName,
+				"host disk",
+				fmt.Sprintf(
+					"available disk space is below the minimum for %s: current %.1f GiB, required %.1f GiB",
+					diskPath,
+					gib(free),
+					gib(minFreeDiskBytes),
+				),
+			)
 		}
 
 		return preflight.ResultsOK(checkDiskSpaceName, "host disk", "sufficient disk space is available")
@@ -264,21 +328,6 @@ func checkCgroups(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 
 func gib(bytes uint64) float64 {
 	return float64(bytes) / (1024 * 1024 * 1024)
-}
-
-func probeWritableDir(dir string) error {
-	f, err := os.CreateTemp(dir, ".unbounded-preflight-*")
-	if err != nil {
-		return err
-	}
-
-	name := f.Name()
-	if err := f.Close(); err != nil {
-		os.Remove(name) //nolint:errcheck // best effort cleanup after close failure.
-		return err
-	}
-
-	return os.Remove(name)
 }
 
 func swapActive(readFile func(string) ([]byte, error)) (bool, error) {
