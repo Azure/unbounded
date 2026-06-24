@@ -76,13 +76,13 @@ jobs:
             ~/.cargo/git
             cmd/unbounded-storage/target
           # Key on lockfile + manifest plus the native build inputs. The
-          # `-nightly-` tier lets the soak job share a key space with the PR
-          # job's restore keys while keeping a dedicated primary key for
+          # `-nightly-dst-soak-` lets the soak job share a key space with the
+          # PR job's restore keys while keeping a dedicated primary key for
           # release-mode artifacts.
-          key: cargo-unbounded-storage-nightly-${{ runner.os }}-fabric-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c') }}
+          key: cargo-unbounded-storage-nightly-dst-soak-${{ runner.os }}-fabric-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c') }}
           restore-keys: |
-            cargo-unbounded-storage-nightly-${{ runner.os }}-fabric-
-            cargo-unbounded-storage-nightly-${{ runner.os }}-
+            cargo-unbounded-storage-nightly-dst-soak-${{ runner.os }}-fabric-
+            cargo-unbounded-storage-nightly-dst-soak-${{ runner.os }}-
             cargo-unbounded-storage-${{ runner.os }}-fabric-
             cargo-unbounded-storage-${{ runner.os }}-
 
