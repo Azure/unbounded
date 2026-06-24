@@ -133,17 +133,21 @@ addr      = "10.0.0.1:9000"      # parsed as SocketAddr.
 [[caches]]
 name = "cache"
 source = "p2p"                  # backend or neighborhood component name.
+disk_pool = "default"           # named disk pool used by this cache.
 
-[[caches.disks]]                 # repeat per local device; paths must be unique.
+[[disk_pools]]
+name = "default"
+
+[[disk_pools.disks]]             # repeat per local device; paths must be unique.
 queue_depth = 32                 # optional u32; per-disk io_uring depth.
 skip_recovery_scan = false       # only for fresh or benchmark disks.
 
-[caches.disks.config.block]
+[disk_pools.disks.config.block]
 path        = "/dev/nvme0n1"     # required for block disks.
 numa        = 0                  # optional u16; biases the open onto a CPU on this node.
 
 # Or, for file-backed disks:
-# [caches.disks.config.file]
+# [disk_pools.disks.config.file]
 # path = "/var/lib/unbounded-storage/disk0.img"
 # size = 1073741824              # required bytes for file-backed disks.
 

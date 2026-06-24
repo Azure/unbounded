@@ -38,9 +38,9 @@ type renderState struct {
 // active, this node's id is injected into every declared neighborhood,
 // discovered peers are merged with any neighborhood peers declared in the YAML
 // (discovered peers win on id collision), and startup.fabric.tcp.addr is
-// overridden with the node's own routable bind. Diskless caches are populated
-// from the self node's storage disk annotations, or from a default file-backed
-// disk when no valid annotation disks are present.
+// overridden with the node's own routable bind. The default disk pool is
+// populated from the self node's storage disk annotations, or from a default
+// file-backed disk when no valid annotation disks are present.
 func RenderConfig(sourceDir string, state renderState) ([]byte, error) {
 	cfg, err := loadSourceConfig(sourceDir)
 	if err != nil {

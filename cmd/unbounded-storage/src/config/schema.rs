@@ -384,17 +384,21 @@ addr = "192.168.253.1:49151"
 [[caches]]
 name = "cache"
 source = "n"
+disk_pool = "pool"
 
-[[caches.disks]]
-[caches.disks.config.block]
+[[disk_pools]]
+name = "pool"
+
+[[disk_pools.disks]]
+[disk_pools.disks.config.block]
 path = "/dev/nvme0n1"
 numa = 1
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.caches[0].disks[0].kind_name(), "block");
-        assert_eq!(c.caches[0].disks[0].path(), Some("/dev/nvme0n1"));
-        assert_eq!(c.caches[0].disks[0].numa(), Some(1));
+        assert_eq!(c.disk_pools[0].disks[0].kind_name(), "block");
+        assert_eq!(c.disk_pools[0].disks[0].path(), Some("/dev/nvme0n1"));
+        assert_eq!(c.disk_pools[0].disks[0].numa(), Some(1));
     }
 
     #[test]
@@ -403,15 +407,19 @@ numa = 1
 [[caches]]
 name = "cache"
 source = "n"
+disk_pool = "pool"
 
-[[caches.disks]]
-[caches.disks.config.block]
+[[disk_pools]]
+name = "pool"
+
+[[disk_pools.disks]]
+[disk_pools.disks.config.block]
 path = "/dev/nvme0n1"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.caches[0].disks[0].page_size_bytes, None);
-        assert!(!c.caches[0].disks[0].skip_recovery_scan);
+        assert_eq!(c.disk_pools[0].disks[0].page_size_bytes, None);
+        assert!(!c.disk_pools[0].disks[0].skip_recovery_scan);
     }
 
     #[test]
@@ -420,18 +428,22 @@ path = "/dev/nvme0n1"
 [[caches]]
 name = "cache"
 source = "n"
+disk_pool = "pool"
 
-[[caches.disks]]
+[[disk_pools]]
+name = "pool"
+
+[[disk_pools.disks]]
 page_size_bytes = 4096
 skip_recovery_scan = true
 
-[caches.disks.config.block]
+[disk_pools.disks.config.block]
 path = "/dev/nvme0n1"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.caches[0].disks[0].page_size_bytes, Some(4096));
-        assert!(c.caches[0].disks[0].skip_recovery_scan);
+        assert_eq!(c.disk_pools[0].disks[0].page_size_bytes, Some(4096));
+        assert!(c.disk_pools[0].disks[0].skip_recovery_scan);
     }
 
     #[test]
@@ -568,6 +580,10 @@ max_requests_per_connection = 256
 [[caches]]
 name = "cache"
 source = "n"
+disk_pool = "pool"
+
+[[disk_pools]]
+name = "pool"
 
 [[frontends]]
 name = "cached-http"
@@ -579,6 +595,8 @@ addr = "0.0.0.0:9000"
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(c.caches[0].name, "cache");
+        assert_eq!(c.caches[0].disk_pool, "pool");
+        assert_eq!(c.disk_pools[0].name, "pool");
         assert_eq!(c.frontends[0].source, "cache");
     }
 

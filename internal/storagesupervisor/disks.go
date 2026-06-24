@@ -4,7 +4,6 @@
 package storagesupervisor
 
 import (
-	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -17,6 +16,7 @@ import (
 const (
 	storageDisksAnnotation     = "unbounded-cloud.io/storage-disks"
 	storageFileSizeAnnotation  = "unbounded-cloud.io/storage-file-size-bytes"
+	defaultStorageDiskPoolName = "default"
 	defaultStorageFileDiskPath = "/var/lib/unbounded-storage/cache.disk"
 	defaultStorageFileDiskDir  = "/var/lib/unbounded-storage"
 	defaultStorageFileDiskSize = uint64(2 * 1024 * 1024 * 1024)
@@ -27,24 +27,16 @@ const (
 	diskOptionNuma             = "numa"
 )
 
-// applyDiskOverlay injects per-node storage disks into a single diskless cache.
-// Explicit disks in the ConfigMap are authoritative and preserved as-is.
+// applyDiskOverlay injects per-node storage disks into the default disk pool.
+// Explicit disks in the default pool are authoritative and preserved as-is.
 func applyDiskOverlay(cfg *storageconfig.Config, annotations map[string]string) error {
-	var target *storageconfig.CacheSpec
-
-	for _, cache := range cfg.GetCaches() {
-		if cache == nil || len(cache.GetDisks()) > 0 {
-			continue
-		}
-
-		if target != nil {
-			return fmt.Errorf("multiple diskless caches declared; configure caches[].disks explicitly when more than one cache is present")
-		}
-
-		target = cache
+	target := defaultDiskPool(cfg)
+	if target == nil {
+		target = &storageconfig.DiskPoolSpec{Name: defaultStorageDiskPoolName}
+		cfg.DiskPools = append(cfg.DiskPools, target)
 	}
 
-	if target == nil {
+	if len(target.GetDisks()) > 0 {
 		return nil
 	}
 
@@ -65,6 +57,25 @@ func applyDiskOverlay(cfg *storageconfig.Config, annotations map[string]string) 
 	target.Disks = disks
 
 	return nil
+}
+
+func defaultDiskPool(cfg *storageconfig.Config) *storageconfig.DiskPoolSpec {
+	var target *storageconfig.DiskPoolSpec
+	for _, pool := range cfg.GetDiskPools() {
+		if pool == nil || pool.GetName() != defaultStorageDiskPoolName {
+			continue
+		}
+
+		if target != nil {
+			slog.Warn("multiple default storage disk pools declared; using the first")
+
+			continue
+		}
+
+		target = pool
+	}
+
+	return target
 }
 
 func annotationBlockDisks(raw string, existingPaths map[string]struct{}) []*storageconfig.DiskSpec {
@@ -280,8 +291,8 @@ func fallbackFileDisk(rawSize string) *storageconfig.DiskSpec {
 
 func declaredDiskPaths(cfg *storageconfig.Config) map[string]struct{} {
 	paths := map[string]struct{}{}
-	for _, cache := range cfg.GetCaches() {
-		for _, disk := range cache.GetDisks() {
+	for _, pool := range cfg.GetDiskPools() {
+		for _, disk := range pool.GetDisks() {
 			path := diskPath(disk)
 			if path != "" {
 				paths[path] = struct{}{}

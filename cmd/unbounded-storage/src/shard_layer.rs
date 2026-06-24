@@ -450,8 +450,9 @@ impl ConfigApplyTarget for ProcessApplyTarget {
         // The shards must see a new config whenever their routing surface,
         // graph projection, or per-shard backend/frontend registries need
         // to change. Pure projected-disk changes are absorbed by
-        // `reconcile_disks` below, but cache graph changes can also alter
-        // frontend backend/bypass resolution, so they are broadcast.
+        // `reconcile_disks` below. Cache graph changes can also alter frontend
+        // backend/bypass resolution, so they are broadcast; disk-pool-only
+        // changes are not.
         let needs_broadcast = diff.requires_routing_reload()
             || diff.caches_changed
             || diff.backends_changed
@@ -490,7 +491,7 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             layer.control.broadcast_apply(new.clone(), routes)?;
         }
 
-        if diff.caches_changed {
+        if diff.caches_changed || diff.disk_pools_changed {
             self.reconcile_disks(&projection);
         }
 

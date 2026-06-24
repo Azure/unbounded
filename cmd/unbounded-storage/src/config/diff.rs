@@ -12,9 +12,9 @@
 //!
 //! * **`[[neighborhoods]]`.** Rebuilds the projected routing surface,
 //!   republishes it to every shard, and reconciles fabric connections.
-//! * **`[[caches]]`.** Reconciled in place against the disk registry;
-//!   cache bindings also participate in route selection, so cache
-//!   changes reload the projected routing surface.
+//! * **`[[caches]]`.** Cache bindings participate in route selection, so cache
+//!   changes reload the projected routing surface and reconcile disks.
+//! * **`[[disk_pools]]`.** Reconciled in place against the disk registry.
 //! * **`[[backends]]` / `[[frontends]]`.** Broadcast to every shard,
 //!   which reconciles its own origin-backend and frontend registries on
 //!   its own thread (binding/closing listeners and rebuilding backends
@@ -45,6 +45,8 @@ pub struct ConfigDiff {
     /// `[[caches]]` changed. Reconciled in place against the disk registry;
     /// may also alter which neighborhood a cache routes through.
     pub caches_changed: bool,
+    /// `[[disk_pools]]` changed. Reconciled in place against the disk registry.
+    pub disk_pools_changed: bool,
     /// `[[neighborhoods]]` changed. Reconciles fabric connections and
     /// rebuilds the routing surface.
     pub neighborhoods_changed: bool,
@@ -65,6 +67,7 @@ impl ConfigDiff {
     pub fn between(old: &Config, new: &Config) -> Self {
         Self {
             caches_changed: old.caches != new.caches,
+            disk_pools_changed: old.disk_pools != new.disk_pools,
             neighborhoods_changed: old.neighborhoods != new.neighborhoods,
             backends_changed: old.backends != new.backends,
             frontends_changed: old.frontends != new.frontends,
@@ -75,6 +78,7 @@ impl ConfigDiff {
     /// acknowledged immediately without touching the shards.
     pub fn any(&self) -> bool {
         self.caches_changed
+            || self.disk_pools_changed
             || self.neighborhoods_changed
             || self.backends_changed
             || self.frontends_changed
@@ -95,9 +99,9 @@ impl ConfigDiff {
 mod tests {
     use super::*;
     use crate::config::schema::{
-        BackendSpec, BlockDiskConfig, CacheSpec, DiskSpec, FrontendSpec, HttpBackendConfig,
-        HttpFrontendConfig, NeighborhoodSpec, PeerSpec, TcpPeerConfig, backend_spec, disk_spec,
-        frontend_spec, peer_spec,
+        BackendSpec, BlockDiskConfig, CacheSpec, DiskPoolSpec, DiskSpec, FrontendSpec,
+        HttpBackendConfig, HttpFrontendConfig, NeighborhoodSpec, PeerSpec, TcpPeerConfig,
+        backend_spec, disk_spec, frontend_spec, peer_spec,
     };
 
     fn base() -> Config {
@@ -164,6 +168,20 @@ mod tests {
         b.caches.push(CacheSpec {
             name: "c".to_string(),
             source: "n".to_string(),
+            disk_pool: "pool".to_string(),
+        });
+        let d = ConfigDiff::between(&a, &b);
+        assert!(d.caches_changed);
+        assert!(d.any());
+        assert!(d.requires_routing_reload());
+    }
+
+    #[test]
+    fn disk_pool_change_is_detected_without_routing_reload() {
+        let a = base();
+        let mut b = base();
+        b.disk_pools.push(DiskPoolSpec {
+            name: "pool".to_string(),
             disks: vec![DiskSpec {
                 queue_depth: None,
                 page_size_bytes: None,
@@ -175,9 +193,9 @@ mod tests {
             }],
         });
         let d = ConfigDiff::between(&a, &b);
-        assert!(d.caches_changed);
+        assert!(d.disk_pools_changed);
         assert!(d.any());
-        assert!(d.requires_routing_reload());
+        assert!(!d.requires_routing_reload());
     }
 
     #[test]

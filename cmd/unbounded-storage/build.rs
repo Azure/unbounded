@@ -102,6 +102,7 @@ fn generate_config_schema() {
         "BlockDiskConfig",
         "FileDiskConfig",
         "CacheSpec",
+        "DiskPoolSpec",
         "NeighborhoodSpec",
         "BackendSpec",
         "HttpBackendConfig",
