@@ -793,7 +793,7 @@ mod tests {
             message: message.to_string(),
         })
         .expect("serialize error ack");
-        shared.push(RecvCompletion {
+        shared.push(RecvCompletion::Framed {
             kind: MsgKind::ErrorAck,
             payload,
         });
