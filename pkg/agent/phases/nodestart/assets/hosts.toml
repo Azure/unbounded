@@ -3,6 +3,5 @@ server = "{{ .Server }}"
 
 [host."{{ .Mirror }}"]
   capabilities = ["pull", "resolve"]
-{{- if .SkipVerify }}
-  skip_verify = true
-{{- end }}
+{{ if .SkipVerify }}  skip_verify = true
+{{ end -}}

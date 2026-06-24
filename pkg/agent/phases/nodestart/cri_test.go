@@ -48,7 +48,7 @@ func TestEnsureRegistryMirrorsWritesHostsFiles(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(data), `server = "https://registry.k8s.io"`)
 	require.Contains(t, string(data), `[host."http://127.0.0.1:5000"]`)
-	require.Contains(t, string(data), "skip_verify = true")
+	require.Contains(t, string(data), "  capabilities = [\"pull\", \"resolve\"]\n  skip_verify = true\n")
 	require.Contains(t, string(data), registryMirrorMarker)
 
 	data, err = os.ReadFile(hostsTomlPath(machineDir, "index.docker.io"))
