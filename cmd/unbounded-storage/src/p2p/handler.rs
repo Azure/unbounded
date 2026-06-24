@@ -90,7 +90,16 @@ impl std::fmt::Display for RecursiveHandlerError {
     }
 }
 
-impl std::error::Error for RecursiveHandlerError {}
+impl std::error::Error for RecursiveHandlerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RecursiveHandlerError::BlockStore(e)
+            | RecursiveHandlerError::Backend(e)
+            | RecursiveHandlerError::Forward(e) => Some(e),
+            RecursiveHandlerError::NoScratchPage | RecursiveHandlerError::HopLimitExceeded => None,
+        }
+    }
+}
 
 /// Recursive handler resolving stripe reads by routing through the
 /// finger table.

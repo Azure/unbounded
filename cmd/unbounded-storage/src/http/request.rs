@@ -27,6 +27,9 @@ pub struct HttpRequest<'a> {
     pub target: &'a str,
     /// Minor version: `1` for `HTTP/1.1`, `0` for `HTTP/1.0`.
     pub version_minor: u8,
+    /// Byte offset just past the terminating `\r\n\r\n`, i.e. where a
+    /// request body or the next pipelined request begins.
+    pub header_end: usize,
     /// Headers are kept as borrowed, zero-copy slices into the source
     /// buffer rather than an owned [`http::HeaderMap`]. This is a
     /// deliberate choice: the frontend parses one request per buffer on
@@ -49,11 +52,11 @@ impl<'a> HttpRequest<'a> {
         let mut header_storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
         let mut req = httparse::Request::new(&mut header_storage);
 
-        match req.parse(buf) {
-            Ok(httparse::Status::Complete(_)) => {}
+        let header_end = match req.parse(buf) {
+            Ok(httparse::Status::Complete(n)) => n,
             Ok(httparse::Status::Partial) => return Err(ParseError::Incomplete),
             Err(e) => return Err(headers::map_httparse_error(e)),
-        }
+        };
 
         let method = Method::from_bytes(req.method.unwrap().as_bytes())
             .map_err(|_| ParseError::BadRequestLine)?;
@@ -66,6 +69,7 @@ impl<'a> HttpRequest<'a> {
             method,
             target,
             version_minor,
+            header_end,
             headers,
         })
     }
@@ -119,6 +123,10 @@ mod tests {
         assert_eq!(r.method, Method::GET);
         assert_eq!(r.target, "/bucket/key");
         assert_eq!(r.version_minor, 1);
+        assert_eq!(
+            r.header_end,
+            "GET /bucket/key HTTP/1.1\r\nHost: example.com\r\nRange: bytes=0-10\r\n\r\n".len()
+        );
         assert_eq!(r.header("host"), Some("example.com"));
         assert_eq!(r.header("range"), Some("bytes=0-10"));
     }
@@ -209,6 +217,10 @@ mod tests {
         // A body after the header block is not consumed by the parser.
         let r = req("GET / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello").unwrap();
         assert_eq!(r.header("content-length"), Some("5"));
+        assert_eq!(
+            r.header_end,
+            "GET / HTTP/1.1\r\nContent-Length: 5\r\n\r\n".len()
+        );
         assert_eq!(r.headers.len(), 1);
     }
 

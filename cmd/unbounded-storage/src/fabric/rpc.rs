@@ -171,9 +171,47 @@ pub(crate) struct PageAck {
     pub page_idx: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ErrorAckCode {
+    Generic,
+    OriginNotFound,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct ErrorAck {
+    pub code: ErrorAckCode,
     pub message: String,
+}
+
+impl ErrorAck {
+    pub(crate) fn generic(message: impl Into<String>) -> Self {
+        Self {
+            code: ErrorAckCode::Generic,
+            message: message.into(),
+        }
+    }
+
+    fn for_handler_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        Self {
+            code: classify_handler_error(error),
+            message: error.to_string(),
+        }
+    }
+}
+
+fn classify_handler_error(error: &(dyn std::error::Error + 'static)) -> ErrorAckCode {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if matches!(
+            err.downcast_ref::<crate::bufferpool::Error>(),
+            Some(crate::bufferpool::Error::OriginNotFound)
+        ) {
+            return ErrorAckCode::OriginNotFound;
+        }
+        current = err.source();
+    }
+
+    ErrorAckCode::Generic
 }
 
 /// Per-server shared state held by the responder and each worker.
@@ -401,7 +439,7 @@ fn run_worker<R, H>(
                 &shared,
                 ep,
                 header.request_id,
-                "local backing not registered",
+                ErrorAck::generic("local backing not registered"),
             );
 
             if let Some(mut l) = log.take() {
@@ -547,7 +585,12 @@ where
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
             drain_inflight(shared, &mut inflight);
-            let _ = send_error_ack(shared, ep, header.request_id, "server shutting down");
+            let _ = send_error_ack(
+                shared,
+                ep,
+                header.request_id,
+                ErrorAck::generic("server shutting down"),
+            );
             return ServeOutcome {
                 written: next_idx,
                 result: Err("server shutting down".to_string()),
@@ -567,7 +610,12 @@ where
                             drain_inflight(shared, &mut inflight);
                             let msg = format!("write_page: {e}");
                             if !shared.shutdown.load(Ordering::Acquire) {
-                                let _ = send_error_ack(shared, ep, header.request_id, &msg);
+                                let _ = send_error_ack(
+                                    shared,
+                                    ep,
+                                    header.request_id,
+                                    ErrorAck::generic(msg.clone()),
+                                );
                             }
                             return ServeOutcome {
                                 written: next_idx,
@@ -581,10 +629,16 @@ where
                     // so the NIC is no longer reading backing memory when
                     // the handler stream (and any scratch page) is dropped.
                     drain_inflight(shared, &mut inflight);
-                    let _ = send_error_ack(shared, ep, header.request_id, &format!("{e}"));
+                    let msg = format!("{e}");
+                    let _ = send_error_ack(
+                        shared,
+                        ep,
+                        header.request_id,
+                        ErrorAck::for_handler_error(&e),
+                    );
                     return ServeOutcome {
                         written: next_idx,
-                        result: Err(format!("{e}")),
+                        result: Err(msg),
                     };
                 }
                 std::task::Poll::Ready(None) => {
@@ -621,7 +675,12 @@ where
             drain_inflight(shared, &mut inflight);
             let msg = format!("write_page: {e}");
             if !shared.shutdown.load(Ordering::Acquire) {
-                let _ = send_error_ack(shared, ep, header.request_id, &msg);
+                let _ = send_error_ack(
+                    shared,
+                    ep,
+                    header.request_id,
+                    ErrorAck::generic(msg.clone()),
+                );
             }
             return ServeOutcome {
                 written: next_idx,
@@ -814,7 +873,12 @@ where
 
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
-            let _ = send_error_ack(shared, ep, header.request_id, "server shutting down");
+            let _ = send_error_ack(
+                shared,
+                ep,
+                header.request_id,
+                ErrorAck::generic("server shutting down"),
+            );
             return ServeOutcome {
                 written: next_idx,
                 result: Err("server shutting down".to_string()),
@@ -826,7 +890,12 @@ where
                 if let Err(e) = write_page(shared, local_mr, ep, header, next_idx, page) {
                     let msg = format!("write_page: {e}");
                     if !shared.shutdown.load(Ordering::Acquire) {
-                        let _ = send_error_ack(shared, ep, header.request_id, &msg);
+                        let _ = send_error_ack(
+                            shared,
+                            ep,
+                            header.request_id,
+                            ErrorAck::generic(msg.clone()),
+                        );
                     }
                     return ServeOutcome {
                         written: next_idx,
@@ -836,10 +905,16 @@ where
                 next_idx = next_idx.saturating_add(1);
             }
             std::task::Poll::Ready(Some(Err(e))) => {
-                let _ = send_error_ack(shared, ep, header.request_id, &format!("{e}"));
+                let msg = format!("{e}");
+                let _ = send_error_ack(
+                    shared,
+                    ep,
+                    header.request_id,
+                    ErrorAck::for_handler_error(&e),
+                );
                 return ServeOutcome {
                     written: next_idx,
-                    result: Err(format!("{e}")),
+                    result: Err(msg),
                 };
             }
             std::task::Poll::Ready(None) => {
@@ -1041,12 +1116,9 @@ fn send_error_ack(
     shared: &Arc<ServerShared>,
     ep: EpPtr,
     request_id: u32,
-    msg: &str,
+    ack: ErrorAck,
 ) -> FabResult<()> {
-    let payload = bincode::serialize(&ErrorAck {
-        message: msg.to_string(),
-    })
-    .map_err(|_| FabricError::Pkg("bincode(ErrorAck)", 0))?;
+    let payload = bincode::serialize(&ack).map_err(|_| FabricError::Pkg("bincode(ErrorAck)", 0))?;
     submit_small_send(shared, ep, MsgKind::ErrorAck, request_id, &payload)
 }
 
@@ -1100,10 +1172,8 @@ fn enqueue_small_send(
 /// not awaited. Dropping the future is safe (the slot handler frees the
 /// send buffer when the completion is reaped).
 fn reject_overloaded(shared: &Arc<ServerShared>, ep: EpPtr, request_id: u32) -> FabResult<()> {
-    let payload = bincode::serialize(&ErrorAck {
-        message: "server overloaded".to_string(),
-    })
-    .map_err(|_| FabricError::Pkg("bincode(ErrorAck)", 0))?;
+    let payload = bincode::serialize(&ErrorAck::generic("server overloaded"))
+        .map_err(|_| FabricError::Pkg("bincode(ErrorAck)", 0))?;
     let _fut = enqueue_small_send(
         shared,
         ep,
