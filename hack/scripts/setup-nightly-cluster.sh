@@ -437,6 +437,15 @@ ensure_secret() {
   log "Ensuring unbounded-kube namespace and orca-credentials Secret"
   KCTL get namespace unbounded-kube >/dev/null 2>&1 || KCTL create namespace unbounded-kube
 
+  # Leave an existing Secret untouched. create-credentials-secret.sh generates
+  # fresh Garage S3 keys on every invocation; regenerating them on a re-run
+  # after Garage already granted the bucket to the previous key strands Orca's
+  # key (Garage 403). To rotate keys, delete the Secret first.
+  if KCTL -n unbounded-kube get secret orca-credentials >/dev/null 2>&1; then
+    info "orca-credentials Secret already exists; leaving its keys unchanged"
+    return 0
+  fi
+
   KUBECONFIG="${KUBECONFIG_PATH}" "${REPO_ROOT}/hack/orca/create-credentials-secret.sh" \
     --azure-account-key "${ORIGIN_KEY}"
 }
