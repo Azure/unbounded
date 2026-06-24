@@ -5,6 +5,8 @@ package app
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -127,4 +129,34 @@ func TestWaitForDaemonSetRollout_MissingDaemonSet(t *testing.T) {
 
 	err := inst.waitForDaemonSetRollout(context.Background())
 	require.Error(t, err)
+}
+
+func TestValidateGantryManifestsAcceptsDefaultNamespace(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "daemonset.yaml"), []byte(gantryManifestDaemonSet(gantryNamespace)), 0o644))
+
+	require.NoError(t, validateGantryManifests(dir))
+}
+
+func TestValidateGantryManifestsRejectsNonDefaultNamespace(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "daemonset.yaml"), []byte(gantryManifestDaemonSet("custom-gantry")), 0o644))
+
+	err := validateGantryManifests(dir)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), gantryNamespace)
+	require.Contains(t, err.Error(), "custom-gantry")
+}
+
+func gantryManifestDaemonSet(namespace string) string {
+	return `apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gantry
+  namespace: ` + namespace + `
+`
 }

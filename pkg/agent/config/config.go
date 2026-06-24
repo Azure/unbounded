@@ -22,6 +22,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"unicode"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -280,6 +281,10 @@ func validateAbsoluteHTTPURL(raw string) error {
 		return errors.New("must not be empty")
 	}
 
+	if err := validateTOMLStringSafe(raw); err != nil {
+		return err
+	}
+
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
@@ -291,6 +296,16 @@ func validateAbsoluteHTTPURL(raw string) error {
 
 	if u.Host == "" {
 		return errors.New("must include a host")
+	}
+
+	return nil
+}
+
+func validateTOMLStringSafe(raw string) error {
+	for _, r := range raw {
+		if r == '"' || r == '\\' || unicode.IsSpace(r) || unicode.IsControl(r) {
+			return errors.New("must not contain quotes, backslashes, whitespace, or control characters")
+		}
 	}
 
 	return nil

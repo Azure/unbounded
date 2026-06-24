@@ -40,7 +40,7 @@ make gantry-manifests          # writes deploy/gantry/rendered/*.yaml
 kubectl apply -f deploy/gantry/rendered/serviceaccount.yaml
 kubectl apply -f deploy/gantry/rendered/configmap.yaml
 # Operator: for any PRIVATE upstream registry, edit
-# examples/registry-secret.example.yaml (rename it, fill in real
+# deploy/gantry/examples/registry-secret.example.yaml (rename it, fill in real
 # username:password values keyed by registry `name:`) and apply,
 # AND uncomment the matching `credentials_path:` line in
 # configmap.yaml.tmpl. The default ConfigMap ships credentials-free so
@@ -48,9 +48,9 @@ kubectl apply -f deploy/gantry/rendered/configmap.yaml
 # Secret being applied - origin.New eagerly reads every
 # credentials_path at startup, so an unmatched path would
 # crashloop the pod.
-kubectl apply -f examples/registry-secret.example.yaml   # private registries only
+kubectl apply -f deploy/gantry/examples/registry-secret.example.yaml   # private registries only
 kubectl apply -f deploy/gantry/rendered/daemonset.yaml
-# examples/networkpolicy.yaml is a hardening overlay; do NOT
+# deploy/gantry/examples/networkpolicy.yaml is a hardening overlay; do NOT
 # apply it as part of the initial install. See "Hardening overlays"
 # below for the workflow.
 ```
@@ -99,7 +99,7 @@ See `docs/detailed-design.md` §7.6 for the full metric catalogue.
 
 ## Hardening overlays
 
-`deploy/examples/` carries optional hardening manifests that are
+`deploy/gantry/examples/` carries optional hardening manifests that are
 intentionally **not** part of the default `kubectl apply` workflow.
 Every overlay there contains at least one site-specific value (CIDR,
 endpoint, label) that no shipped manifest can guess correctly across

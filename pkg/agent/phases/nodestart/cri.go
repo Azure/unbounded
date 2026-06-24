@@ -31,8 +31,7 @@ const (
 
 	// registryMirrorMarker is written as the first line of every
 	// agent-managed certs.d/<host>/hosts.toml. The prune step only removes
-	// directories whose hosts.toml carries this marker, so hand-authored
-	// registry mirror entries are never clobbered.
+	// stale directories whose hosts.toml carries this marker.
 	registryMirrorMarker = "# managed-by: unbounded-agent"
 )
 

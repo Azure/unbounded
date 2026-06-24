@@ -4,15 +4,21 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -75,12 +81,65 @@ func (i *installGantry) run(ctx context.Context) error {
 		}
 	}()
 
+	if err := validateGantryManifests(manifestDir); err != nil {
+		return fmt.Errorf("validating manifests: %w", err)
+	}
+
 	if err := kube.ApplyManifestsInDirectory(ctx, i.logger, i.kubeResourcesCli, fieldManagerID, manifestDir, i.skipPaths); err != nil {
 		return fmt.Errorf("applying manifests: %w", err)
 	}
 
 	if err := i.waitForDaemonSetRollout(ctx); err != nil {
 		return fmt.Errorf("waiting for %s daemonset rollout: %w", i.daemonSetName, err)
+	}
+
+	return nil
+}
+
+func validateGantryManifests(manifestDir string) error {
+	if err := filepath.WalkDir(manifestDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if d.IsDir() {
+			return nil
+		}
+
+		ext := strings.ToLower(filepath.Ext(path))
+		if ext != ".yaml" && ext != ".yml" {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("reading %s: %w", path, err)
+		}
+
+		decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+
+		for {
+			obj := &unstructured.Unstructured{}
+			if err := decoder.Decode(obj); err != nil {
+				if err == io.EOF {
+					break
+				}
+
+				return fmt.Errorf("decoding %s: %w", path, err)
+			}
+
+			if obj.Object == nil || obj.GetKind() != "DaemonSet" || obj.GetName() != gantryDaemonSetName {
+				continue
+			}
+
+			if obj.GetNamespace() != gantryNamespace {
+				return fmt.Errorf("gantry DaemonSet %q must be in namespace %q, got %q", gantryDaemonSetName, gantryNamespace, obj.GetNamespace())
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	return nil

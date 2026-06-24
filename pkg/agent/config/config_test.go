@@ -290,9 +290,24 @@ func TestContainerdRegistryMirror_Validate(t *testing.T) {
 			wantErr: "must include a host",
 		},
 		{
+			name:    "server with quote",
+			mutate:  func(m *ContainerdRegistryMirror) { m.Server = "https://registry.k8s.io/\"" },
+			wantErr: "quotes",
+		},
+		{
+			name:    "server with newline",
+			mutate:  func(m *ContainerdRegistryMirror) { m.Server = "https://registry.k8s.io/\nmalicious = true" },
+			wantErr: "whitespace",
+		},
+		{
 			name:    "mirror missing scheme",
 			mutate:  func(m *ContainerdRegistryMirror) { m.Mirror = "127.0.0.1:5000" },
 			wantErr: "Mirror",
+		},
+		{
+			name:    "mirror with backslash",
+			mutate:  func(m *ContainerdRegistryMirror) { m.Mirror = "http://127.0.0.1:5000\\mirror" },
+			wantErr: "backslashes",
 		},
 	}
 
