@@ -48,7 +48,7 @@ func TestPreflightJSONOutput(t *testing.T) {
 	h := &preflightHandler{
 		cmdCtx:                &CommandContext{LogFormat: "text"},
 		configPath:            path,
-		ignorePreflightErrors: []string{"api-server-reachable"},
+		ignorePreflightErrors: []string{"all"},
 		output:                "json",
 		writer:                &out,
 	}

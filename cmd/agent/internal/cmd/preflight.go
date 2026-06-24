@@ -73,8 +73,18 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 	}
 
 	checks := []preflight.Checker{
+		host.CheckIsPrivilegedUser(),
 		host.CheckAgentConfig(&cfg.AgentConfig),
 		host.CheckClusterCredentials(&cfg.AgentConfig, cfg.Attest != nil),
+		host.CheckHostPackages(h.cmdCtx.Logger),
+		host.CheckHostPackageSources(h.cmdCtx.Logger),
+		host.CheckHostOSConfiguration(),
+		host.CheckNSpawnRuntime(),
+		host.CheckDockerActive(h.cmdCtx.Logger),
+		host.CheckSwapActive(),
+		host.CheckDiskSpace(),
+		host.CheckCgroups(),
+		host.CheckNodeIdentity(&cfg.AgentConfig),
 		nodestart.CheckAPIServerReachable(cfg.Kubelet.ApiServer, caCertData),
 		rootfs.CheckGoalState(h.cmdCtx.Logger, &cfg.AgentConfig, provision.ResolveDownloadOverrides(cfg.Downloads)),
 	}
