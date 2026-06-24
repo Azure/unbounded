@@ -722,12 +722,16 @@ addr = "{peer_addr}"
 [[caches]]
 name = "cache"
 source = "p2p"
+disk_pool = "default"
 
-[[caches.disks]]
+[[disk_pools]]
+name = "default"
+
+[[disk_pools.disks]]
 page_size_bytes = 4096
 skip_recovery_scan = true
 
-[caches.disks.config.file]
+[disk_pools.disks.config.file]
 path = "{disk_path}"
 size = {DISK_SIZE}
 

@@ -41,9 +41,11 @@ func applyDiskOverlay(cfg *storageconfig.Config, annotations map[string]string) 
 	}
 
 	existingPaths := declaredDiskPaths(cfg)
+
 	disks := annotationBlockDisks(annotations[storageDisksAnnotation], existingPaths)
 	if len(disks) == 0 {
 		fallback := fallbackFileDisk(annotations[storageFileSizeAnnotation])
+
 		path := fallback.GetFile().GetPath()
 		if _, exists := existingPaths[path]; exists {
 			slog.Warn("skipping fallback storage file disk because path is already declared", "path", path)
@@ -61,6 +63,7 @@ func applyDiskOverlay(cfg *storageconfig.Config, annotations map[string]string) 
 
 func defaultDiskPool(cfg *storageconfig.Config) *storageconfig.DiskPoolSpec {
 	var target *storageconfig.DiskPoolSpec
+
 	for _, pool := range cfg.GetDiskPools() {
 		if pool == nil || pool.GetName() != defaultStorageDiskPoolName {
 			continue
@@ -103,6 +106,7 @@ func annotationBlockDisks(raw string, existingPaths map[string]struct{}) []*stor
 		}
 
 		seenPaths[path] = struct{}{}
+
 		disks = append(disks, disk)
 	}
 
@@ -116,12 +120,14 @@ func annotationBlockDisk(raw string) *storageconfig.DiskSpec {
 	}
 
 	parts := strings.Split(raw, ";")
+
 	path := strings.TrimSpace(parts[0])
 	if path == "" {
 		slog.Warn("skipping annotated storage disk with empty path", "value", raw)
 
 		return nil
 	}
+
 	if !strings.HasPrefix(path, "/") {
 		slog.Warn("skipping annotated storage disk with non-absolute path", "path", path)
 
@@ -157,6 +163,7 @@ func applyDiskOption(disk *storageconfig.DiskSpec, raw string, seen map[string]s
 	}
 
 	key = strings.TrimSpace(key)
+
 	value = strings.TrimSpace(value)
 	if key == "" || value == "" {
 		slog.Warn("ignoring storage disk option with empty key or value", "path", path, "option", raw)
@@ -269,6 +276,7 @@ func parsePositiveUint64Option(path, key, raw string) (uint64, bool) {
 
 func fallbackFileDisk(rawSize string) *storageconfig.DiskSpec {
 	size := defaultStorageFileDiskSize
+
 	if strings.TrimSpace(rawSize) != "" {
 		parsed, err := strconv.ParseUint(strings.TrimSpace(rawSize), 10, 64)
 		if err != nil || parsed == 0 || parsed%defaultStorageDiskPageSize != 0 {
@@ -291,6 +299,7 @@ func fallbackFileDisk(rawSize string) *storageconfig.DiskSpec {
 
 func declaredDiskPaths(cfg *storageconfig.Config) map[string]struct{} {
 	paths := map[string]struct{}{}
+
 	for _, pool := range cfg.GetDiskPools() {
 		for _, disk := range pool.GetDisks() {
 			path := diskPath(disk)
