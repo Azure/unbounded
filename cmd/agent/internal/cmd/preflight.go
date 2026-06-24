@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -66,10 +67,15 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return err
 	}
 
+	caCertData, err := base64.StdEncoding.DecodeString(cfg.Cluster.CaCertBase64)
+	if err != nil {
+		caCertData = nil
+	}
+
 	checks := []preflight.Checker{
 		host.CheckAgentConfig(&cfg.AgentConfig),
 		host.CheckClusterCredentials(&cfg.AgentConfig, cfg.Attest != nil),
-		nodestart.CheckAPIServerReachable(cfg.Kubelet.ApiServer),
+		nodestart.CheckAPIServerReachable(cfg.Kubelet.ApiServer, caCertData),
 		rootfs.CheckGoalState(h.cmdCtx.Logger, &cfg.AgentConfig, provision.ResolveDownloadOverrides(cfg.Downloads)),
 	}
 

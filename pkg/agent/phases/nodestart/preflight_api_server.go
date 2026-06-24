@@ -5,6 +5,8 @@ package nodestart
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -19,14 +21,15 @@ const CheckAPIServerReachableName = "api-server-reachable"
 
 type apiServerReachableChecker struct {
 	url        string
+	caCertData []byte
 	httpClient *http.Client
 }
 
 // CheckAPIServerReachable returns a non-mutating checker that validates the
 // configured Kubernetes API server can be reached from the host. The checker
 // redacts the configured endpoint from result messages.
-func CheckAPIServerReachable(apiServer string) preflight.Checker {
-	return apiServerReachableChecker{url: apiServer}
+func CheckAPIServerReachable(apiServer string, caCertData []byte) preflight.Checker {
+	return apiServerReachableChecker{url: apiServer, caCertData: caCertData}
 }
 
 func (c apiServerReachableChecker) Name() string { return CheckAPIServerReachableName }
@@ -43,7 +46,7 @@ func (c apiServerReachableChecker) Check(ctx context.Context) []preflight.Result
 
 	client := c.httpClient
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = c.httpClientWithCA()
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.url, "/")+"/readyz", http.NoBody)
@@ -62,4 +65,23 @@ func (c apiServerReachableChecker) Check(ctx context.Context) []preflight.Result
 	}
 
 	return preflight.ResultsOK(CheckAPIServerReachableName, "cluster API server", "API server is reachable")
+}
+
+func (c apiServerReachableChecker) httpClientWithCA() *http.Client {
+	transport := &http.Transport{}
+	if defaultTransport, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = defaultTransport.Clone()
+	}
+
+	if len(c.caCertData) > 0 {
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			pool = x509.NewCertPool()
+		}
+
+		pool.AppendCertsFromPEM(c.caCertData)
+		transport.TLSClientConfig = &tls.Config{RootCAs: pool} //nolint:gosec // uses configured root CAs.
+	}
+
+	return &http.Client{Timeout: 10 * time.Second, Transport: transport}
 }

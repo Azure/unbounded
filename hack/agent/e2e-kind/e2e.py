@@ -2895,6 +2895,15 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
     serial_log = vm_dir / f"{vm_name}.log"
     if serial_log.exists():
         shutil.copyfile(serial_log, logs_dir / f"{prefix}vm-serial.log")
+
+    ssh_opts = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=5",
+        "-i", str(vm_dir / "ssh" / "id_ed25519"),
+    ]
+    ssh_target = f"{VM_SSH_USER}@{vm_ip}"
+
     for name in ("unbounded-agent-preflight.txt", "unbounded-agent-preflight.json"):
         src = vm_dir / name
         if src.exists():
@@ -2909,14 +2918,6 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
         )
         if result.returncode == 0:
             diag(f"Collected {name} from VM")
-
-    ssh_opts = [
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ConnectTimeout=5",
-        "-i", str(vm_dir / "ssh" / "id_ed25519"),
-    ]
-    ssh_target = f"{VM_SSH_USER}@{vm_ip}"
 
     def ssh_log(name: str, command: str) -> None:
         _write_command_log(logs_dir / f"{prefix}{name}", ["ssh", *ssh_opts, ssh_target, command])

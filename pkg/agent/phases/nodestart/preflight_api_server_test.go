@@ -21,13 +21,13 @@ func TestCheckAPIServerReachableOK(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	results := CheckAPIServerReachable(srv.URL).Check(context.Background())
+	results := CheckAPIServerReachable(srv.URL, nil).Check(context.Background())
 
 	assert.Equal(t, preflight.ResultsOK(CheckAPIServerReachableName, "cluster API server", "API server is reachable"), results)
 }
 
 func TestCheckAPIServerReachableInvalidEndpoint(t *testing.T) {
-	results := CheckAPIServerReachable("://bad").Check(context.Background())
+	results := CheckAPIServerReachable("://bad", nil).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Equal(t, CheckAPIServerReachableName, results[0].Name)
@@ -38,7 +38,7 @@ func TestCheckAPIServerReachableInvalidEndpoint(t *testing.T) {
 func TestCheckAPIServerReachableRequestFailureIsRedacted(t *testing.T) {
 	const endpoint = "https://127.0.0.1:1"
 
-	results := CheckAPIServerReachable(endpoint).Check(context.Background())
+	results := CheckAPIServerReachable(endpoint, nil).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Equal(t, "API server is not reachable", results[0].Message)
@@ -51,7 +51,7 @@ func TestCheckAPIServerReachableServerError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	results := CheckAPIServerReachable(srv.URL).Check(context.Background())
+	results := CheckAPIServerReachable(srv.URL, nil).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Equal(t, "API server returned status 500", results[0].Message)
