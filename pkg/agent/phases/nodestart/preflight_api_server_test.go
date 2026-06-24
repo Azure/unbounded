@@ -5,6 +5,7 @@ package nodestart
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -21,16 +22,16 @@ func TestCheckAPIServerReachableOK(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	results := CheckAPIServerReachable(srv.URL, nil).Check(context.Background())
+	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), srv.URL, nil).Check(context.Background())
 
-	assert.Equal(t, preflight.ResultsOK(CheckAPIServerReachableName, "cluster API server", "API server is reachable"), results)
+	assert.Equal(t, preflight.ResultsOK(checkAPIServerReachableName, "cluster API server", "API server is reachable"), results)
 }
 
 func TestCheckAPIServerReachableInvalidEndpoint(t *testing.T) {
-	results := CheckAPIServerReachable("://bad", nil).Check(context.Background())
+	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), "://bad", nil).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
-	assert.Equal(t, CheckAPIServerReachableName, results[0].Name)
+	assert.Equal(t, checkAPIServerReachableName, results[0].Name)
 	assert.Equal(t, "cluster API server", results[0].Target)
 	assert.Equal(t, "API server endpoint is invalid", results[0].Message)
 }
@@ -38,7 +39,7 @@ func TestCheckAPIServerReachableInvalidEndpoint(t *testing.T) {
 func TestCheckAPIServerReachableRequestFailureIsRedacted(t *testing.T) {
 	const endpoint = "https://127.0.0.1:1"
 
-	results := CheckAPIServerReachable(endpoint, nil).Check(context.Background())
+	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), endpoint, nil).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Equal(t, "API server is not reachable", results[0].Message)
@@ -51,7 +52,7 @@ func TestCheckAPIServerReachableServerError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	results := CheckAPIServerReachable(srv.URL, nil).Check(context.Background())
+	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), srv.URL, nil).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Equal(t, "API server returned status 500", results[0].Message)

@@ -6,6 +6,7 @@ package host
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -15,22 +16,19 @@ import (
 	"syscall"
 
 	"github.com/Azure/unbounded/internal/executil"
-	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
 const (
-	CheckIsPrivilegedUserName    = "is-privileged-user"
-	CheckHostPackagesName        = "host-packages"
-	CheckHostPackageSourcesName  = "host-package-sources"
-	CheckHostOSConfigurationName = "host-os-configuration"
-	CheckNSpawnRuntimeName       = "nspawn-runtime"
-	CheckDockerActiveName        = "docker-active"
-	CheckSwapActiveName          = "swap-active"
-	CheckDiskSpaceName           = "disk-space"
-	CheckCgroupsName             = "cgroups"
-	CheckNodeIdentityName        = "node-identity"
+	checkIsPrivilegedUserName    = "is-privileged-user"
+	checkHostPackagesName        = "host-packages"
+	checkHostOSConfigurationName = "host-os-configuration"
+	checkNSpawnRuntimeName       = "nspawn-runtime"
+	checkDockerActiveName        = "docker-active"
+	checkSwapActiveName          = "swap-active"
+	checkDiskSpaceName           = "disk-space"
+	checkCgroupsName             = "cgroups"
 
 	minFreeDiskBytes = 8 * 1024 * 1024 * 1024
 )
@@ -66,182 +64,206 @@ func (c simpleHostChecker) Name() string { return c.name }
 
 func (c simpleHostChecker) Check(ctx context.Context) []preflight.Result { return c.check(ctx) }
 
-func CheckIsPrivilegedUser() preflight.Checker {
-	return checkIsPrivilegedUser(defaultHostCheckDeps())
+// CheckIsPrivilegedUser verifies preflight is running as root.
+func CheckIsPrivilegedUser(log *slog.Logger) preflight.Checker {
+	return checkIsPrivilegedUser(log, defaultHostCheckDeps())
 }
 
-func checkIsPrivilegedUser(deps hostCheckDeps) preflight.Checker {
-	return simpleHostChecker{name: CheckIsPrivilegedUserName, check: func(context.Context) []preflight.Result {
-		if deps.uid() != 0 {
-			return preflight.ResultsError(CheckIsPrivilegedUserName, "host user", "preflight must run as root")
+func checkIsPrivilegedUser(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+	return simpleHostChecker{name: checkIsPrivilegedUserName, check: func(context.Context) []preflight.Result {
+		uid := deps.uid()
+		log.Debug("checking effective user", "uid", uid)
+
+		if uid != 0 {
+			return preflight.ResultsError(checkIsPrivilegedUserName, "host user", "preflight must run as root")
 		}
 
-		return preflight.ResultsOK(CheckIsPrivilegedUserName, "host user", "preflight is running as root")
+		return preflight.ResultsOK(checkIsPrivilegedUserName, "host user", "preflight is running as root")
 	}}
 }
 
+// CheckHostPackages verifies all required host packages are already installed.
 func CheckHostPackages(log *slog.Logger) preflight.Checker {
 	return checkHostPackages(log, defaultHostCheckDeps())
 }
 
 func checkHostPackages(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
-	return simpleHostChecker{name: CheckHostPackagesName, check: func(ctx context.Context) []preflight.Result {
+	return simpleHostChecker{name: checkHostPackagesName, check: func(ctx context.Context) []preflight.Result {
 		pm, err := detectHostPackageManager(deps.lookupPath)
 		if err != nil {
-			return preflight.ResultsError(CheckHostPackagesName, "host packages", "supported host package manager is required")
+			log.Debug("host package manager detection failed")
+
+			return preflight.ResultsError(checkHostPackagesName, "host packages", "supported host package manager is required: apt-get, tdnf, or dnf")
 		}
+
+		log.Debug("detected host package manager", "packageManager", pm.name, "requiredPackages", strings.Join(pm.requiredPackages, ","))
 
 		var missing []string
 
 		for _, pkg := range pm.requiredPackages {
 			if !pm.installed(ctx, log, pkg) {
+				// TODO: when offline mode is configured, missing required host
+				// packages should be reported as an error because bootstrap cannot
+				// rely on package source access to remediate them.
 				missing = append(missing, pkg)
 			}
 		}
 
 		if len(missing) > 0 {
-			return preflight.ResultsError(CheckHostPackagesName, "host packages", "required host packages are missing")
+			log.Debug("required host packages are missing", "packages", strings.Join(missing, ","))
+
+			// TODO: when offline mode is configured, missing required host
+			// packages should be reported as an error because bootstrap cannot
+			// rely on package source access to remediate them.
+			return preflight.ResultsWarning(checkHostPackagesName, "host packages", "required host packages are missing and may be installed by bootstrap: "+strings.Join(missing, ", "))
 		}
 
-		return preflight.ResultsOK(CheckHostPackagesName, "host packages", "required host packages are installed")
+		log.Debug("required host packages are installed")
+
+		return preflight.ResultsOK(checkHostPackagesName, "host packages", "required host packages are installed")
 	}}
 }
 
-func CheckHostPackageSources(log *slog.Logger) preflight.Checker {
-	return checkHostPackageSources(log, defaultHostCheckDeps())
+// CheckHostOSConfiguration verifies host OS configuration paths are writable.
+func CheckHostOSConfiguration(log *slog.Logger) preflight.Checker {
+	return checkHostOSConfiguration(log, defaultHostCheckDeps())
 }
 
-func checkHostPackageSources(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
-	return simpleHostChecker{name: CheckHostPackageSourcesName, check: func(ctx context.Context) []preflight.Result {
-		pm, err := detectHostPackageManager(deps.lookupPath)
-		if err != nil {
-			return preflight.ResultsError(CheckHostPackageSourcesName, "host package sources", "supported host package manager is required")
+func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+	return simpleHostChecker{name: checkHostOSConfigurationName, check: func(context.Context) []preflight.Result {
+		sysctlDir := filepath.Dir(hostSysctlPath)
+		log.Debug("checking host OS configuration path", "path", sysctlDir)
+
+		if err := deps.writeProbe(sysctlDir); err != nil {
+			return preflight.ResultsError(checkHostOSConfigurationName, "host OS configuration", "host OS configuration path is not writable: "+sysctlDir)
 		}
 
-		for _, pkg := range pm.requiredPackages {
-			if !pm.installed(ctx, log, pkg) {
-				return preflight.ResultsWarning(CheckHostPackageSourcesName, "host package sources", "package sources may be required for missing host packages")
-			}
-		}
-
-		return preflight.ResultsOK(CheckHostPackageSourcesName, "host package sources", "package source access is not required")
-	}}
-}
-
-func CheckHostOSConfiguration() preflight.Checker {
-	return checkHostOSConfiguration(defaultHostCheckDeps())
-}
-
-func checkHostOSConfiguration(deps hostCheckDeps) preflight.Checker {
-	return simpleHostChecker{name: CheckHostOSConfigurationName, check: func(context.Context) []preflight.Result {
-		if err := deps.writeProbe(filepath.Dir(hostSysctlPath)); err != nil {
-			return preflight.ResultsError(CheckHostOSConfigurationName, "host OS configuration", "host OS configuration paths are not writable")
-		}
+		log.Debug("checking systemd unit directory", "path", goalstates.SystemdSystemDir)
 
 		if err := deps.writeProbe(goalstates.SystemdSystemDir); err != nil {
-			return preflight.ResultsError(CheckHostOSConfigurationName, "host OS configuration", "systemd unit directory is not writable")
+			return preflight.ResultsError(checkHostOSConfigurationName, "host OS configuration", "systemd unit directory is not writable: "+goalstates.SystemdSystemDir)
 		}
 
-		return preflight.ResultsOK(CheckHostOSConfigurationName, "host OS configuration", "host OS configuration can be applied")
+		return preflight.ResultsOK(checkHostOSConfigurationName, "host OS configuration", "host OS configuration can be applied")
 	}}
 }
 
-func CheckNSpawnRuntime() preflight.Checker {
-	return checkNSpawnRuntime(defaultHostCheckDeps())
+// CheckNSpawnRuntime verifies systemd-nspawn runtime tools are available.
+func CheckNSpawnRuntime(log *slog.Logger) preflight.Checker {
+	return checkNSpawnRuntime(log, defaultHostCheckDeps())
 }
 
-func checkNSpawnRuntime(deps hostCheckDeps) preflight.Checker {
-	return simpleHostChecker{name: CheckNSpawnRuntimeName, check: func(context.Context) []preflight.Result {
+func checkNSpawnRuntime(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+	return simpleHostChecker{name: checkNSpawnRuntimeName, check: func(context.Context) []preflight.Result {
 		for _, binary := range []string{"systemctl", "machinectl", "systemd-nspawn"} {
+			log.Debug("checking nspawn runtime tool", "binary", binary)
+
 			if _, err := deps.lookupPath(binary); err != nil {
-				return preflight.ResultsError(CheckNSpawnRuntimeName, "nspawn runtime", "nspawn runtime tools are required")
+				// TODO: when offline mode is configured, missing nspawn runtime
+				// tools should be reported as an error because bootstrap cannot rely
+				// on package installation to remediate them.
+				return preflight.ResultsWarning(checkNSpawnRuntimeName, "nspawn runtime", "nspawn runtime tool is missing and may be installed by bootstrap: "+binary)
 			}
 		}
 
-		if _, err := deps.stat("/run/systemd/system"); err != nil {
-			return preflight.ResultsError(CheckNSpawnRuntimeName, "nspawn runtime", "systemd runtime is required")
+		systemdRuntimePath := "/run/systemd/system"
+		log.Debug("checking systemd runtime path", "path", systemdRuntimePath)
+
+		if _, err := deps.stat(systemdRuntimePath); err != nil {
+			return preflight.ResultsWarning(checkNSpawnRuntimeName, "nspawn runtime", "systemd runtime path is not currently available: "+systemdRuntimePath)
 		}
 
-		return preflight.ResultsOK(CheckNSpawnRuntimeName, "nspawn runtime", "nspawn runtime is available")
+		return preflight.ResultsOK(checkNSpawnRuntimeName, "nspawn runtime", "nspawn runtime is available")
 	}}
 }
 
+// CheckDockerActive warns when Docker is active.
 func CheckDockerActive(log *slog.Logger) preflight.Checker {
 	return checkDockerActive(log, defaultHostCheckDeps())
 }
 
 func checkDockerActive(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
-	return simpleHostChecker{name: CheckDockerActiveName, check: func(ctx context.Context) []preflight.Result {
+	return simpleHostChecker{name: checkDockerActiveName, check: func(ctx context.Context) []preflight.Result {
 		out, err := deps.outputCmd(ctx, log, "systemctl", "is-active", dockerServiceUnit)
+		log.Debug("checked Docker unit state", "unit", dockerServiceUnit, "state", strings.TrimSpace(out), "error", err != nil)
+
 		if err == nil && strings.TrimSpace(out) == "active" {
-			return preflight.ResultsWarning(CheckDockerActiveName, "docker service", "Docker is active and bootstrap will disable it")
+			return preflight.ResultsWarning(checkDockerActiveName, "docker service", "Docker is active and bootstrap will disable it")
 		}
 
-		return preflight.ResultsOK(CheckDockerActiveName, "docker service", "Docker is not active")
+		return preflight.ResultsOK(checkDockerActiveName, "docker service", "Docker is not active")
 	}}
 }
 
-func CheckSwapActive() preflight.Checker {
-	return checkSwapActive(defaultHostCheckDeps())
+// CheckSwapActive warns when host swap is active.
+func CheckSwapActive(log *slog.Logger) preflight.Checker {
+	return checkSwapActive(log, defaultHostCheckDeps())
 }
 
-func checkSwapActive(deps hostCheckDeps) preflight.Checker {
-	return simpleHostChecker{name: CheckSwapActiveName, check: func(context.Context) []preflight.Result {
+func checkSwapActive(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+	return simpleHostChecker{name: checkSwapActiveName, check: func(context.Context) []preflight.Result {
 		active, err := swapActive(deps.readFile)
+		log.Debug("checked host swap state", "active", active, "error", err != nil)
+
 		if err != nil {
-			return preflight.ResultsWarning(CheckSwapActiveName, "host swap", "swap state could not be determined")
+			return preflight.ResultsWarning(checkSwapActiveName, "host swap", "swap state could not be determined from /proc/swaps")
 		}
 
 		if active {
-			return preflight.ResultsWarning(CheckSwapActiveName, "host swap", "swap is enabled and bootstrap will disable it")
+			return preflight.ResultsWarning(checkSwapActiveName, "host swap", "swap is enabled and bootstrap will disable it")
 		}
 
-		return preflight.ResultsOK(CheckSwapActiveName, "host swap", "swap is not active")
+		return preflight.ResultsOK(checkSwapActiveName, "host swap", "swap is not active")
 	}}
 }
 
-func CheckDiskSpace() preflight.Checker {
-	return checkDiskSpace(defaultHostCheckDeps())
+// CheckDiskSpace verifies enough free disk is available for bootstrap.
+func CheckDiskSpace(log *slog.Logger) preflight.Checker {
+	return checkDiskSpace(log, defaultHostCheckDeps())
 }
 
-func checkDiskSpace(deps hostCheckDeps) preflight.Checker {
-	return simpleHostChecker{name: CheckDiskSpaceName, check: func(context.Context) []preflight.Result {
+func checkDiskSpace(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+	return simpleHostChecker{name: checkDiskSpaceName, check: func(context.Context) []preflight.Result {
 		var stat syscall.Statfs_t
-		if err := deps.statfs("/var/lib", &stat); err != nil {
-			return preflight.ResultsError(CheckDiskSpaceName, "host disk", "available disk space could not be determined")
+
+		diskPath := "/var/lib"
+		if err := deps.statfs(diskPath, &stat); err != nil {
+			log.Debug("failed to check disk space", "path", diskPath)
+
+			return preflight.ResultsError(checkDiskSpaceName, "host disk", "available disk space could not be determined for "+diskPath)
 		}
 
 		free := stat.Bavail * uint64(stat.Bsize)
+		log.Debug("checked disk space", "path", diskPath, "freeGiB", gib(free), "requiredGiB", gib(minFreeDiskBytes))
+
 		if free < minFreeDiskBytes {
-			return preflight.ResultsError(CheckDiskSpaceName, "host disk", "available disk space is below the minimum")
+			return preflight.ResultsError(checkDiskSpaceName, "host disk", fmt.Sprintf("available disk space is below the minimum for %s: current %.1f GiB, required %.1f GiB", diskPath, gib(free), gib(minFreeDiskBytes)))
 		}
 
-		return preflight.ResultsOK(CheckDiskSpaceName, "host disk", "sufficient disk space is available")
+		return preflight.ResultsOK(checkDiskSpaceName, "host disk", "sufficient disk space is available")
 	}}
 }
 
-func CheckCgroups() preflight.Checker {
-	return checkCgroups(defaultHostCheckDeps())
+// CheckCgroups verifies the host cgroup filesystem is available.
+func CheckCgroups(log *slog.Logger) preflight.Checker {
+	return checkCgroups(log, defaultHostCheckDeps())
 }
 
-func checkCgroups(deps hostCheckDeps) preflight.Checker {
-	return simpleHostChecker{name: CheckCgroupsName, check: func(context.Context) []preflight.Result {
-		if _, err := deps.stat("/sys/fs/cgroup"); err != nil {
-			return preflight.ResultsError(CheckCgroupsName, "host cgroups", "cgroup filesystem is required")
+func checkCgroups(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+	return simpleHostChecker{name: checkCgroupsName, check: func(context.Context) []preflight.Result {
+		cgroupPath := "/sys/fs/cgroup"
+		log.Debug("checking cgroup filesystem", "path", cgroupPath)
+
+		if _, err := deps.stat(cgroupPath); err != nil {
+			return preflight.ResultsError(checkCgroupsName, "host cgroups", "cgroup filesystem is required at "+cgroupPath)
 		}
 
-		return preflight.ResultsOK(CheckCgroupsName, "host cgroups", "cgroup filesystem is available")
+		return preflight.ResultsOK(checkCgroupsName, "host cgroups", "cgroup filesystem is available")
 	}}
 }
 
-func CheckNodeIdentity(cfg *config.AgentConfig) preflight.Checker {
-	return simpleHostChecker{name: CheckNodeIdentityName, check: func(context.Context) []preflight.Result {
-		if cfg == nil || strings.TrimSpace(cfg.NodeName) == "" {
-			return preflight.ResultsError(CheckNodeIdentityName, "node identity", "node name could not be resolved")
-		}
-
-		return preflight.ResultsOK(CheckNodeIdentityName, "node identity", "node name is resolved")
-	}}
+func gib(bytes uint64) float64 {
+	return float64(bytes) / (1024 * 1024 * 1024)
 }
 
 func probeWritableDir(dir string) error {

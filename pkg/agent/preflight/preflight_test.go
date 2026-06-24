@@ -6,6 +6,7 @@ package preflight
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -58,4 +59,54 @@ func TestRunIgnoreAll(t *testing.T) {
 
 	assert.Equal(t, "ok", report.Status)
 	assert.True(t, report.Checks[0].Ignored)
+}
+
+func TestRunPreservesInputOrderWhileRunningConcurrently(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan string, 2)
+
+	report := make(chan Report, 1)
+
+	go func() {
+		report <- Run(context.Background(), []Checker{
+			blockingChecker{name: "first", started: started, release: release},
+			blockingChecker{name: "second", started: started, release: release},
+		}, Options{})
+	}()
+
+	seen := map[string]bool{}
+
+	for range 2 {
+		select {
+		case name := <-started:
+			seen[name] = true
+		case <-time.After(time.Second):
+			t.Fatal("checks did not start concurrently")
+		}
+	}
+
+	assert.True(t, seen["first"])
+	assert.True(t, seen["second"])
+
+	close(release)
+
+	got := <-report
+	assert.Equal(t, "first", got.Checks[0].Name)
+	assert.Equal(t, "second", got.Checks[1].Name)
+}
+
+type blockingChecker struct {
+	name    string
+	started chan<- string
+	release <-chan struct{}
+}
+
+func (b blockingChecker) Name() string { return b.name }
+
+func (b blockingChecker) Check(context.Context) []Result {
+	b.started <- b.name
+
+	<-b.release
+
+	return ResultsOK(b.name, b.name, b.name)
 }

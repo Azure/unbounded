@@ -73,19 +73,17 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 	}
 
 	checks := []preflight.Checker{
-		host.CheckIsPrivilegedUser(),
-		host.CheckAgentConfig(&cfg.AgentConfig),
-		host.CheckClusterCredentials(&cfg.AgentConfig, cfg.Attest != nil),
+		host.CheckIsPrivilegedUser(h.cmdCtx.Logger),
+		host.CheckAgentConfig(h.cmdCtx.Logger, &cfg.AgentConfig),
+		host.CheckClusterCredentials(h.cmdCtx.Logger, &cfg.AgentConfig, cfg.Attest != nil),
 		host.CheckHostPackages(h.cmdCtx.Logger),
-		host.CheckHostPackageSources(h.cmdCtx.Logger),
-		host.CheckHostOSConfiguration(),
-		host.CheckNSpawnRuntime(),
+		host.CheckHostOSConfiguration(h.cmdCtx.Logger),
+		host.CheckNSpawnRuntime(h.cmdCtx.Logger),
 		host.CheckDockerActive(h.cmdCtx.Logger),
-		host.CheckSwapActive(),
-		host.CheckDiskSpace(),
-		host.CheckCgroups(),
-		host.CheckNodeIdentity(&cfg.AgentConfig),
-		nodestart.CheckAPIServerReachable(cfg.Kubelet.ApiServer, caCertData),
+		host.CheckSwapActive(h.cmdCtx.Logger),
+		host.CheckDiskSpace(h.cmdCtx.Logger),
+		host.CheckCgroups(h.cmdCtx.Logger),
+		nodestart.CheckAPIServerReachable(h.cmdCtx.Logger, cfg.Kubelet.ApiServer, caCertData),
 		rootfs.CheckGoalState(h.cmdCtx.Logger, &cfg.AgentConfig, provision.ResolveDownloadOverrides(cfg.Downloads)),
 	}
 
@@ -123,20 +121,14 @@ func writePreflightText(w io.Writer, report preflight.Report) error {
 
 	for _, result := range report.Checks {
 		switch result.Severity {
+		case preflight.SeverityOK:
+			if err := writePreflightResult(w, "OK", result); err != nil {
+				return err
+			}
 		case preflight.SeverityError:
 			errors = append(errors, result)
 		case preflight.SeverityWarning:
-			if _, err := fmt.Fprintf(w, "\t[WARNING %s]: %s", result.Name, result.Message); err != nil {
-				return err
-			}
-
-			if result.Target != "" {
-				if _, err := fmt.Fprintf(w, " (target: %s)", result.Target); err != nil {
-					return err
-				}
-			}
-
-			if _, err := fmt.Fprintln(w); err != nil {
+			if err := writePreflightResult(w, "WARNING", result); err != nil {
 				return err
 			}
 		}
@@ -167,6 +159,22 @@ func writePreflightText(w io.Writer, report preflight.Report) error {
 	}
 
 	_, err := fmt.Fprintln(w, "[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`")
+
+	return err
+}
+
+func writePreflightResult(w io.Writer, status string, result preflight.Result) error {
+	if _, err := fmt.Fprintf(w, "\t[%s %s]: %s", status, result.Name, result.Message); err != nil {
+		return err
+	}
+
+	if result.Target != "" {
+		if _, err := fmt.Fprintf(w, " (target: %s)", result.Target); err != nil {
+			return err
+		}
+	}
+
+	_, err := fmt.Fprintln(w)
 
 	return err
 }

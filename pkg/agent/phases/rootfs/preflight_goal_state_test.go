@@ -36,7 +36,7 @@ func validGoalStateConfig() *config.AgentConfig {
 func TestCheckGoalStateOK(t *testing.T) {
 	results := CheckGoalState(slog.New(slog.DiscardHandler), validGoalStateConfig(), nil).Check(context.Background())
 
-	assert.Equal(t, []preflight.Result{preflight.OK(CheckGoalStateName, "goal state", "goal state resolved")}, results)
+	assert.Equal(t, []preflight.Result{preflight.OK(checkGoalStateName, "goal state", "goal state resolved")}, results)
 }
 
 func TestCheckGoalStateResolveError(t *testing.T) {
@@ -46,6 +46,6 @@ func TestCheckGoalStateResolveError(t *testing.T) {
 	results := CheckGoalState(slog.New(slog.DiscardHandler), cfg, nil).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
-	assert.Equal(t, CheckGoalStateName, results[0].Name)
+	assert.Equal(t, checkGoalStateName, results[0].Name)
 	assert.Equal(t, "goal state could not be resolved", results[0].Message)
 }

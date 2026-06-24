@@ -14,15 +14,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
 func TestCheckIsPrivilegedUser(t *testing.T) {
-	results := checkIsPrivilegedUser(hostCheckDeps{uid: func() int { return 0 }}).Check(context.Background())
+	results := checkIsPrivilegedUser(slog.New(slog.DiscardHandler), hostCheckDeps{uid: func() int { return 0 }}).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 
-	results = checkIsPrivilegedUser(hostCheckDeps{uid: func() int { return 1000 }}).Check(context.Background())
+	results = checkIsPrivilegedUser(slog.New(slog.DiscardHandler), hostCheckDeps{uid: func() int { return 1000 }}).Check(context.Background())
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 }
 
@@ -33,18 +32,30 @@ func TestCheckHostPackagesMissingPackageManager(t *testing.T) {
 	results := checkHostPackages(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, "apt-get")
+}
+
+func TestCheckHostPackagesListsMissingPackages(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	deps.lookupPath = lookupPathWith(map[string]bool{"apt-get": true})
+
+	results := checkHostPackages(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+
+	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
+	assert.Contains(t, results[0].Message, "systemd-container")
 }
 
 func TestCheckHostOSConfiguration(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.writeProbe = func(string) error { return nil }
 
-	results := checkHostOSConfiguration(deps).Check(context.Background())
+	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 
 	deps.writeProbe = func(string) error { return errors.New("denied") }
-	results = checkHostOSConfiguration(deps).Check(context.Background())
+	results = checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, "/etc/sysctl.d")
 }
 
 func TestCheckNSpawnRuntime(t *testing.T) {
@@ -56,12 +67,13 @@ func TestCheckNSpawnRuntime(t *testing.T) {
 	})
 	deps.stat = func(string) (fs.FileInfo, error) { return nil, nil }
 
-	results := checkNSpawnRuntime(deps).Check(context.Background())
+	results := checkNSpawnRuntime(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 
 	deps.lookupPath = lookupPathWith(map[string]bool{"systemctl": true})
-	results = checkNSpawnRuntime(deps).Check(context.Background())
-	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	results = checkNSpawnRuntime(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
+	assert.Contains(t, results[0].Message, "machinectl")
 }
 
 func TestCheckDockerActive(t *testing.T) {
@@ -80,44 +92,44 @@ func TestCheckSwapActive(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.readFile = readFileString("Filename\tType\tSize\tUsed\tPriority\n", nil)
 
-	results := checkSwapActive(deps).Check(context.Background())
+	results := checkSwapActive(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 
 	deps.readFile = readFileString("Filename\tType\tSize\tUsed\tPriority\n/swapfile file 1024 0 -2\n", nil)
-	results = checkSwapActive(deps).Check(context.Background())
+	results = checkSwapActive(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
+
+	deps.readFile = readFileString("", errors.New("missing"))
+	results = checkSwapActive(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	assert.Contains(t, results[0].Message, "/proc/swaps")
 }
 
 func TestCheckDiskSpace(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.statfs = statfsWithFreeBytes(minFreeDiskBytes)
 
-	results := checkDiskSpace(deps).Check(context.Background())
+	results := checkDiskSpace(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 
 	deps.statfs = statfsWithFreeBytes(1)
-	results = checkDiskSpace(deps).Check(context.Background())
+	results = checkDiskSpace(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, "/var/lib")
+	assert.Contains(t, results[0].Message, "current 0.0 GiB")
+	assert.Contains(t, results[0].Message, "required 8.0 GiB")
 }
 
 func TestCheckCgroups(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.stat = statExists()
 
-	results := checkCgroups(deps).Check(context.Background())
+	results := checkCgroups(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 
 	deps.stat = statMissing()
-	results = checkCgroups(deps).Check(context.Background())
+	results = checkCgroups(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
-}
-
-func TestCheckNodeIdentity(t *testing.T) {
-	results := CheckNodeIdentity(&config.AgentConfig{NodeName: "node-1"}).Check(context.Background())
-	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
-
-	results = CheckNodeIdentity(&config.AgentConfig{}).Check(context.Background())
-	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, "/sys/fs/cgroup")
 }
 
 func statfsWithFreeBytes(bytes uint64) func(string, *syscall.Statfs_t) error {

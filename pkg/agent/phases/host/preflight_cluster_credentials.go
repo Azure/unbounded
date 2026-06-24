@@ -6,16 +6,17 @@ package host
 import (
 	"context"
 	"encoding/base64"
+	"log/slog"
 	"strings"
 
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
-// CheckClusterCredentialsName is the stable name for cluster credential validation.
-const CheckClusterCredentialsName = "cluster-credentials"
+const checkClusterCredentialsName = "cluster-credentials"
 
 type clusterCredentialsChecker struct {
+	log                   *slog.Logger
 	config                *config.AgentConfig
 	attestationConfigured bool
 }
@@ -23,17 +24,19 @@ type clusterCredentialsChecker struct {
 // CheckClusterCredentials returns a checker that validates cluster CA data and
 // the bootstrap credential. When attestationConfigured is true, missing kubelet
 // auth is allowed because attestation can provide the credential later.
-func CheckClusterCredentials(cfg *config.AgentConfig, attestationConfigured bool) preflight.Checker {
-	return clusterCredentialsChecker{config: cfg, attestationConfigured: attestationConfigured}
+func CheckClusterCredentials(log *slog.Logger, cfg *config.AgentConfig, attestationConfigured bool) preflight.Checker {
+	return clusterCredentialsChecker{log: log, config: cfg, attestationConfigured: attestationConfigured}
 }
 
 // Name returns the stable check name used in reports and ignore rules.
-func (c clusterCredentialsChecker) Name() string { return CheckClusterCredentialsName }
+func (c clusterCredentialsChecker) Name() string { return checkClusterCredentialsName }
 
 // Check validates cluster credential inputs without printing credential values.
 func (c clusterCredentialsChecker) Check(context.Context) []preflight.Result {
+	c.log.Debug("checking cluster credentials", "attestationConfigured", c.attestationConfigured)
+
 	if c.config == nil {
-		return preflight.ResultsError(CheckClusterCredentialsName, "cluster credentials", "agent config is missing")
+		return preflight.ResultsError(checkClusterCredentialsName, "cluster credentials", "agent config is missing")
 	}
 
 	var errs []string
@@ -49,8 +52,12 @@ func (c clusterCredentialsChecker) Check(context.Context) []preflight.Result {
 	}
 
 	if len(errs) > 0 {
-		return preflight.ResultsError(CheckClusterCredentialsName, "cluster credentials", strings.Join(errs, "; "))
+		c.log.Debug("cluster credential validation failed", "errors", len(errs))
+
+		return preflight.ResultsError(checkClusterCredentialsName, "cluster credentials", strings.Join(errs, "; "))
 	}
 
-	return preflight.ResultsOK(CheckClusterCredentialsName, "cluster credentials", "cluster credentials are valid")
+	c.log.Debug("cluster credential validation passed")
+
+	return preflight.ResultsOK(checkClusterCredentialsName, "cluster credentials", "cluster credentials are valid")
 }

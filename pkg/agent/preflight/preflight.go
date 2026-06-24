@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 )
 
 type Severity string
@@ -65,10 +66,21 @@ type Summary struct {
 // Run executes all checks, applies ignore rules, and returns a complete report.
 func Run(ctx context.Context, checks []Checker, opts Options) Report {
 	ignored := ignoreSet(opts.IgnoreErrors)
-	results := make([]Result, 0, len(checks))
+	checkResults := make([][]Result, len(checks))
 
-	for _, check := range checks {
-		for _, result := range check.Check(ctx) {
+	var wg sync.WaitGroup
+
+	for i, check := range checks {
+		wg.Go(func() {
+			checkResults[i] = check.Check(ctx)
+		})
+	}
+
+	wg.Wait()
+
+	results := make([]Result, 0, len(checks))
+	for i, check := range checks {
+		for _, result := range checkResults[i] {
 			if result.Name == "" {
 				result.Name = check.Name()
 			}

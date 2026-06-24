@@ -5,6 +5,7 @@ package host
 
 import (
 	"context"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -32,19 +33,19 @@ func validPreflightConfig() *config.AgentConfig {
 }
 
 func TestCheckAgentConfigValid(t *testing.T) {
-	results := CheckAgentConfig(validPreflightConfig()).Check(context.Background())
+	results := CheckAgentConfig(slog.New(slog.DiscardHandler), validPreflightConfig()).Check(context.Background())
 
-	assert.Equal(t, preflight.ResultsOK(CheckAgentConfigName, "agent config", "agent config is valid"), results)
+	assert.Equal(t, preflight.ResultsOK(checkAgentConfigName, "agent config", "agent config is valid"), results)
 }
 
 func TestCheckAgentConfigInvalid(t *testing.T) {
 	cfg := validPreflightConfig()
 	cfg.MachineName = ""
 
-	results := CheckAgentConfig(cfg).Check(context.Background())
+	results := CheckAgentConfig(slog.New(slog.DiscardHandler), cfg).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
-	assert.Equal(t, CheckAgentConfigName, results[0].Name)
+	assert.Equal(t, checkAgentConfigName, results[0].Name)
 	assert.Equal(t, "agent config", results[0].Target)
 	assert.Equal(t, "agent config is invalid", results[0].Message)
 }

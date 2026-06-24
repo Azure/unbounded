@@ -5,33 +5,40 @@ package host
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
-// CheckAgentConfigName is the stable name for the agent config validation check.
-const CheckAgentConfigName = "agent-config"
+const checkAgentConfigName = "agent-config"
 
 type agentConfigChecker struct {
+	log    *slog.Logger
 	config *config.AgentConfig
 }
 
-// CheckAgentConfig returns a checker that validates the shared agent config
-// shape. Product-specific credential requirements are validated by separate
-// checks.
-func CheckAgentConfig(cfg *config.AgentConfig) preflight.Checker {
-	return agentConfigChecker{config: cfg}
+// CheckAgentConfig verifies the shared agent config has been normalized and is
+// internally consistent. Product-specific credential requirements are validated
+// by separate checks.
+func CheckAgentConfig(log *slog.Logger, cfg *config.AgentConfig) preflight.Checker {
+	return agentConfigChecker{log: log, config: cfg}
 }
 
 // Name returns the stable check name used in reports and ignore rules.
-func (c agentConfigChecker) Name() string { return CheckAgentConfigName }
+func (c agentConfigChecker) Name() string { return checkAgentConfigName }
 
 // Check validates the shared agent config without mutating it.
 func (c agentConfigChecker) Check(context.Context) []preflight.Result {
+	c.log.Debug("checking agent config")
+
 	if err := c.config.Validate(); err != nil {
-		return preflight.ResultsError(CheckAgentConfigName, "agent config", "agent config is invalid")
+		c.log.Debug("agent config validation failed")
+
+		return preflight.ResultsError(checkAgentConfigName, "agent config", "agent config is invalid")
 	}
 
-	return preflight.ResultsOK(CheckAgentConfigName, "agent config", "agent config is valid")
+	c.log.Debug("agent config validation passed")
+
+	return preflight.ResultsOK(checkAgentConfigName, "agent config", "agent config is valid")
 }

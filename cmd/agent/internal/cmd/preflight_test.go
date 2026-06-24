@@ -84,3 +84,25 @@ func TestPreflightTextOutputError(t *testing.T) {
 	assert.Contains(t, out.String(), "[ERROR api-server-reachable]")
 	assert.NotContains(t, out.String(), "127.0.0.1")
 }
+
+func TestPreflightTextOutputIncludesOK(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	path := writeConfigFile(t, preflightConfig(srv.URL))
+
+	var out bytes.Buffer
+
+	h := &preflightHandler{
+		cmdCtx:                &CommandContext{LogFormat: "text"},
+		configPath:            path,
+		ignorePreflightErrors: []string{"all"},
+		output:                "text",
+		writer:                &out,
+	}
+
+	require.NoError(t, h.execute(context.Background()))
+	assert.Contains(t, out.String(), "[OK agent-config]")
+}

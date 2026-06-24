@@ -13,10 +13,8 @@ import (
 )
 
 const (
-	// CheckGoalStateName is the stable name for machine goal-state resolution.
-	CheckGoalStateName = "goal-state"
-	// CheckOCIImageReachableName is the stable name for rootfs image validation.
-	CheckOCIImageReachableName = "oci-image-reachable"
+	checkGoalStateName         = "goal-state"
+	checkOCIImageReachableName = "oci-image-reachable"
 )
 
 type goalStateChecker struct {
@@ -31,20 +29,20 @@ func CheckGoalState(log *slog.Logger, cfg *config.AgentConfig, downloads *goalst
 	return goalStateChecker{log: log, config: cfg, downloads: downloads}
 }
 
-func (c goalStateChecker) Name() string { return CheckGoalStateName }
+func (c goalStateChecker) Name() string { return checkGoalStateName }
 
 func (c goalStateChecker) Check(context.Context) []preflight.Result {
 	gs, err := goalstates.ResolveMachine(c.log, c.config, goalstates.NSpawnMachineKube1, c.downloads)
 	if err != nil {
-		return preflight.ResultsError(CheckGoalStateName, "goal state", "goal state could not be resolved")
+		return preflight.ResultsError(checkGoalStateName, "goal state", "goal state could not be resolved")
 	}
 
 	if gs.RootFS.OCIImage == "" {
 		// TODO: replace this with an OCI manifest reachability check that uses
 		// the same registry parsing and plain-HTTP handling as OCI rootfs
 		// provisioning, without pulling image layers.
-		return preflight.ResultsError(CheckOCIImageReachableName, "rootfs image", "OCI rootfs image is required")
+		return preflight.ResultsError(checkOCIImageReachableName, "rootfs image", "OCI rootfs image is required but no image was selected")
 	}
 
-	return preflight.ResultsOK(CheckGoalStateName, "goal state", "goal state resolved")
+	return preflight.ResultsOK(checkGoalStateName, "goal state", "goal state resolved")
 }
