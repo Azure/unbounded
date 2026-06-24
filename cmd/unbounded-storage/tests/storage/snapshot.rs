@@ -10,7 +10,7 @@ use std::sync::Arc;
 use unbounded_storage::bufferpool::{BlockStore, PageRef, StripeKey};
 use unbounded_storage::memory::Backing;
 use unbounded_storage::storage::blockdev::{BlockDevice, MockDeviceConfig};
-use unbounded_storage::storage::types::{Checksum, Lba, PageKey};
+use unbounded_storage::storage::types::{Lba, PageKey};
 use unbounded_storage::storage::{EngineConfig, StorageEngine};
 
 use crate::framework::executor::{Executor, yield_once};
@@ -268,24 +268,24 @@ fn lookup_pins_snapshot_until_leaf_read_finishes() {
             while phase.get() < 2 {
                 yield_once().await;
             }
-            eng.seed_metadata_for_bench(&[(
+            admit_one(
+                &eng,
+                pool_base as *mut u8,
+                WRITE_SLOT,
                 stripe(REWRITE),
                 0,
-                Lba(400),
-                Checksum::ZERO,
-                PAGE_SIZE as u32,
-            )])
-            .await
-            .unwrap();
-            eng.seed_metadata_for_bench(&[(
+                &payload(REWRITE, 0, 20),
+            )
+            .await;
+            admit_one(
+                &eng,
+                pool_base as *mut u8,
+                WRITE_SLOT,
                 stripe(OTHER_LEAF),
                 0,
-                Lba(401),
-                Checksum::ZERO,
-                PAGE_SIZE as u32,
-            )])
-            .await
-            .unwrap();
+                &payload(OTHER_LEAF, 0, 30),
+            )
+            .await;
             writer_done.set(true);
         }));
     }
