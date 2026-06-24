@@ -20,9 +20,16 @@ exercised without reimplementing the stripe-key hashing here.
 This whole two-node scenario is run once per protocol pairing so both
 frontend/backend implementations are covered against the real fabric:
 
-  - `http`: the plain HTTP frontend backed by the HTTP origin backend.
+  - `http`: the plain HTTP frontend backed by the HTTP origin backend
+            over a plaintext `http://` origin.
   - `s3`:   the native S3 frontend backed by the S3 origin backend
             (unsigned/public-bucket mode, path-style `/bucket/key`).
+  - `https`: the HTTP frontend backed by the HTTP origin backend over a
+            TLS 1.3 `https://` origin. The backend drives an OpenSSL
+            handshake and offloads the connection to kernel TLS (kTLS) so
+            record payloads land zero-copy in the page cache; the origin's
+            self-signed cert is pinned via the backend's `ca_cert_path`,
+            exercising custom-CA verification end to end.
 
 A single `unbounded-storage` process serves exactly one frontend (the
 first configured spec wins), so the two kinds cannot share a ring; each
@@ -50,6 +57,7 @@ import resource
 import shutil
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -75,6 +83,48 @@ USE_SYSTEMD = os.environ.get("SMOKE_STORAGE_SYSTEMD", "0") == "1"
 INSTALL_SCRIPT = REPO_ROOT / "hack" / "scripts" / "install-unbounded-storage.sh"
 STORAGE_PREFIX = os.environ.get("SMOKE_STORAGE_PREFIX", "/opt/unbounded-storage")
 STORAGE_TARBALL = os.environ.get("SMOKE_STORAGE_TARBALL", "")
+
+
+def _openssl_bin() -> tuple[str, dict[str, str]]:
+    """Locate the openssl(1) CLI to use for cert generation.
+
+    Prefer the bundled OpenSSL (tmp/openssl/<ver>/bin/openssl) so it matches the
+    libcrypto/libssl this test runs against. The system CLI is built against a
+    different ABI and SEGFAULTs if it loads our bundled libs via
+    LD_LIBRARY_PATH, so it must not be used here. Falls back to PATH `openssl`.
+
+    Returns the binary path plus the environment it must run with. The bundled
+    CLI is dynamically linked against the bundled libssl/libcrypto (>=3.5); the
+    runner's system libs (3.0.x) lack the required symbol versions, so the
+    bundled `lib` dir must be put ahead of the system libs via LD_LIBRARY_PATH
+    or the binary fails to load. The system CLI needs no such override.
+    """
+    candidates = sorted(REPO_ROOT.glob("tmp/openssl/*/bin/openssl"), reverse=True)
+    for c in candidates:
+        if c.is_file():
+            env = dict(os.environ)
+            libdir = c.parent.parent / "lib"
+            existing = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = (
+                f"{libdir}:{existing}" if existing else str(libdir)
+            )
+            return str(c), env
+
+    return "openssl", dict(os.environ)
+
+
+OPENSSL_BIN, OPENSSL_ENV = _openssl_bin()
+
+# Self-signed cert/key for the HTTPS origin, generated once at startup.
+# The cert carries `subjectAltName=DNS:localhost` (and IP:127.0.0.1) so the
+# backend, which connects to `https://localhost:<port>`, can verify the
+# presented leaf against the same file pinned as its `ca_cert_path`.
+TLS_CERT = TMPDIR / "origin-cert.pem"
+TLS_KEY = TMPDIR / "origin-key.pem"
+# The hostname the backend uses for the TLS origin endpoint. Must match a
+# SAN in TLS_CERT and resolve to loopback (via /etc/hosts) so the IPv4-only
+# origin resolver lands on the HTTPS stub.
+TLS_ORIGIN_HOST = "localhost"
 
 # The objects served by the stub origin and requested through the
 # frontends, one per scenario. The S3 path is path-style (`/bucket/key`)
@@ -554,6 +604,61 @@ def start_origin(port: int) -> http.server.ThreadingHTTPServer:
     return srv
 
 
+def generate_tls_cert() -> None:
+    """Generate a self-signed cert/key for the HTTPS origin via openssl(1).
+
+    The cert is its own trust anchor (CA:TRUE) and carries SANs for both
+    `localhost` and `127.0.0.1`, so the storage backend can both verify the
+    presented leaf against this file (pinned as `ca_cert_path`) and match
+    the `https://localhost:<port>` endpoint hostname.
+    """
+    log("Generating self-signed TLS cert for HTTPS origin")
+    cmd = [
+        OPENSSL_BIN,
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-keyout",
+        str(TLS_KEY),
+        "-out",
+        str(TLS_CERT),
+        "-days",
+        "1",
+        "-nodes",
+        "-subj",
+        "/CN=localhost",
+        "-addext",
+        "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=False, env=OPENSSL_ENV
+    )
+    if result.returncode != 0:
+        die(f"openssl cert generation failed: {result.stderr}")
+
+
+def start_origin_tls(port: int) -> http.server.ThreadingHTTPServer:
+    """Start an HTTPS stub origin (TLS 1.2+) using the generated cert.
+
+    Identical to `start_origin` but the listening socket is wrapped in a
+    server-side TLS context. The server itself uses ordinary userspace TLS;
+    only the storage backend offloads its side to kTLS. The origin offers
+    TLS 1.3 (the default ceiling); the backend's bundled OpenSSL (>=3.5)
+    engages kernel TLS for both directions on TLS 1.3.
+    """
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), _OriginHandler)
+    srv.requests = []  # type: ignore[attr-defined]
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=str(TLS_CERT), keyfile=str(TLS_KEY))
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
 # ============================================================================
 # CONFIG GENERATION
 # ============================================================================
@@ -571,6 +676,8 @@ def write_config(
     frontend_addr: str,
     fabric_addr: str,
     metrics_addr: str,
+    ca_cert_path: Path | None = None,
+    insecure_skip_verify: bool = False,
 ) -> None:
     # The config schema is proto3-native: byte sizes are plain integer
     # byte counts (see api/unbounded-storage/config.proto).
@@ -583,6 +690,14 @@ def write_config(
     # forcing the libfabric tcp provider (disable_rdma) even on hosts that
     # expose an unusable RDMA HCA in sysfs. They only take effect at process
     # start and are intentionally not part of the dynamic reload path.
+    # Optional TLS knobs for the origin backend. Only emitted when set so
+    # plaintext scenarios keep validating as plaintext (the daemon rejects
+    # TLS knobs on an http:// endpoint).
+    tls_lines = ""
+    if ca_cert_path is not None:
+        tls_lines += f'ca_cert_path = "{ca_cert_path}"\n'
+    if insecure_skip_verify:
+        tls_lines += "insecure_skip_verify = true\n"
     path.write_text(
         f"""\
 [[backends]]
@@ -591,6 +706,7 @@ name = "origin"
 [backends.config.{kind}]
 url = "{origin_addr}"
 stripe_size_bytes = {STRIPE_SIZE}
+{tls_lines}
 
 [[neighborhoods]]
 name = "p2p"
@@ -770,17 +886,29 @@ def _report_corruption(corrupt: dict[str, set[int]]) -> None:
         log(f"  stripes corrupt only via B: {len(only_b)} -> {sorted(only_b)[:16]}")
 
 
-def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> None:
+def run_scenario(
+    name: str,
+    kind: str,
+    origin_addr: str,
+    object_path: str,
+    origin: Any,
+    *,
+    ca_cert_path: Path | None = None,
+    insecure_skip_verify: bool = False,
+) -> None:
     """Bring up a fresh two-node ring of frontend/backend *kind* and fetch.
 
     Spawns its own two `unbounded-storage` processes on new ports, fetches
     *object_path* through both frontends (asserting body and a cross-node
     origin GET), then tears the ring down. *origin* is the shared stub
     origin; its recorded requests are reset so the GET assertion is scoped
-    to this scenario.
+    to this scenario. *name* labels the scenario and namespaces its temp
+    files (so two scenarios of the same *kind*, e.g. plaintext vs TLS http,
+    do not collide). *ca_cert_path*/*insecure_skip_verify* configure the
+    origin backend's TLS verification for `https://` endpoints.
     """
     log("")
-    log(f"=== Scenario: {kind} frontend + {kind} backend ===")
+    log(f"=== Scenario: {name} ({kind} frontend + {kind} backend) ===")
 
     nodes: list[_Node] = []
     fab_a, fab_b = free_port(), free_port()
@@ -789,19 +917,21 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
     log(f"Ports: fabric=({fab_a},{fab_b}) frontends=({fe_a},{fe_b}) metrics=({met_a},{met_b})")
 
     log("Writing node configs")
-    cfg1 = TMPDIR / f"{kind}-node1.toml"
-    cfg2 = TMPDIR / f"{kind}-node2.toml"
+    cfg1 = TMPDIR / f"{name}-node1.toml"
+    cfg2 = TMPDIR / f"{name}-node2.toml"
     write_config(
         cfg1,
         kind=kind,
         local_id=1,
         peer_id=2,
         peer_addr=f"127.0.0.1:{fab_b}",
-        disk_path=TMPDIR / f"{kind}-node1.disk",
+        disk_path=TMPDIR / f"{name}-node1.disk",
         origin_addr=origin_addr,
         frontend_addr=f"127.0.0.1:{fe_a}",
         fabric_addr=f"127.0.0.1:{fab_a}",
         metrics_addr=f"127.0.0.1:{met_a}",
+        ca_cert_path=ca_cert_path,
+        insecure_skip_verify=insecure_skip_verify,
     )
     write_config(
         cfg2,
@@ -809,17 +939,19 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
         local_id=2,
         peer_id=1,
         peer_addr=f"127.0.0.1:{fab_a}",
-        disk_path=TMPDIR / f"{kind}-node2.disk",
+        disk_path=TMPDIR / f"{name}-node2.disk",
         origin_addr=origin_addr,
         frontend_addr=f"127.0.0.1:{fe_b}",
         fabric_addr=f"127.0.0.1:{fab_b}",
         metrics_addr=f"127.0.0.1:{met_b}",
+        ca_cert_path=ca_cert_path,
+        insecure_skip_verify=insecure_skip_verify,
     )
 
     try:
         log("Bringing up two unbounded-storage nodes")
-        nodes.append(start_node(kind, 1, cfg1, TMPDIR / f"{kind}-node1.log"))
-        nodes.append(start_node(kind, 2, cfg2, TMPDIR / f"{kind}-node2.log"))
+        nodes.append(start_node(name, 1, cfg1, TMPDIR / f"{name}-node1.log"))
+        nodes.append(start_node(name, 2, cfg2, TMPDIR / f"{name}-node2.log"))
 
         wait_port("127.0.0.1", fe_a)
         wait_port("127.0.0.1", fe_b)
@@ -875,9 +1007,9 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
                 )
             log(f"  node {label} reports {metric}={count}")
 
-        log(f"  {kind} scenario PASSED")
+        log(f"  {name} scenario PASSED")
     finally:
-        log(f"  Tearing down {kind} ring")
+        log(f"  Tearing down {name} ring")
         terminate(nodes)
 
 
@@ -914,19 +1046,37 @@ def main() -> None:
     reserve_hugepages()
 
     origin_port = free_port()
-    origin_addr = f"127.0.0.1:{origin_port}"
+    origin_addr = f"http://127.0.0.1:{origin_port}"
 
     log(f"Working directory: {TMPDIR}")
-    log(f"Stub origin on {origin_addr}")
+    log(f"Plaintext stub origin on {origin_addr}")
     log("Starting stub origin HTTP server")
     origin = start_origin(origin_port)
+
+    # Second stub origin, TLS-wrapped, for the kTLS scenario. The backend
+    # reaches it as `https://localhost:<port>`; `localhost` resolves to the
+    # loopback the server binds and matches the cert SAN.
+    generate_tls_cert()
+    tls_origin_port = free_port()
+    tls_origin_addr = f"https://{TLS_ORIGIN_HOST}:{tls_origin_port}"
+    log(f"TLS stub origin on https://127.0.0.1:{tls_origin_port}")
+    log("Starting stub origin HTTPS server")
+    tls_origin = start_origin_tls(tls_origin_port)
 
     # Run the full two-node ring once per protocol pairing. Each scenario
     # brings up and tears down its own ring on fresh ports, so the two
     # frontend/backend kinds never share a process (only the first
     # configured frontend is served per process).
-    run_scenario("http", origin_addr, HTTP_OBJECT_PATH, origin)
-    run_scenario("s3", origin_addr, S3_OBJECT_PATH, origin)
+    run_scenario("http", "http", origin_addr, HTTP_OBJECT_PATH, origin)
+    run_scenario("s3", "s3", origin_addr, S3_OBJECT_PATH, origin)
+    run_scenario(
+        "https",
+        "http",
+        tls_origin_addr,
+        HTTP_OBJECT_PATH,
+        tls_origin,
+        ca_cert_path=TLS_CERT,
+    )
 
     log("")
     log("Smoke test PASSED")
