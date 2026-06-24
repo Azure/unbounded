@@ -3,14 +3,18 @@
 
 //! Azure Blob Storage origin backend. [`AzureBackend`] is the Azure
 //! sibling of [`S3Backend`](super::S3Backend): it fetches a stripe's
-//! byte range (or an object's length) from an Azure Blob origin over
-//! plaintext HTTP/1.1 and fills the destination bufferpool pages.
+//! byte range (or an object's length) from an Azure Blob origin and
+//! fills the destination bufferpool pages. An `http://` endpoint uses
+//! plaintext HTTP/1.1; an `https://` endpoint uses TLS 1.3 driven by
+//! OpenSSL with kernel TLS (kTLS) so the body still lands zero-copy in
+//! the registered backing, with record-aware recv in [`crate::tls`].
 //!
 //! It mirrors the S3 backend's fetch/length structure and shares its
 //! cold-path simplicity (one TCP connection per fetch, one heap copy of
 //! the body into the registered backing). Like the S3 backend it carries
-//! the origin **hostname** for the `Host:` header (the TCP connect still
-//! dials the resolved IPv4 [`SockAddr`]) and maps a `404 Not Found` to
+//! the origin **host** for the `Host:` header and a separate **SNI**
+//! hostname for TLS (the TCP connect still dials the resolved IPv4
+//! [`SockAddr`]) and maps a `404 Not Found` to
 //! [`Error::OriginNotFound`](crate::bufferpool::Error::OriginNotFound).
 //!
 //! It diverges from the S3 backend in one wire-level way: every GET/HEAD
@@ -22,6 +26,7 @@
 use std::future::Future;
 use std::os::fd::RawFd;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use ::http::header::{CONNECTION, HOST, RANGE};
@@ -30,6 +35,7 @@ use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::http::{Method, ResponseHead, StatusCode, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
+use crate::tls::TlsContext;
 
 use super::Backend;
 use super::limiter::FetchLimiter;
@@ -53,10 +59,15 @@ const AZURE_MS_VERSION: &str = "2021-08-06";
 pub struct AzureBackend {
     ring: OriginRing,
     origin: SockAddr,
-    /// The origin hostname used for the `Host:` header. The TCP connect
+    /// The origin host used for the `Host:` header. The TCP connect
     /// uses `origin` (the resolved IPv4), but the storage account's
     /// virtual-host name must travel in `Host:`.
     host: String,
+    /// The hostname (no port) used for TLS SNI and certificate
+    /// verification. Empty for plaintext (`http://`) origins.
+    sni_host: String,
+    /// TLS context for `https://` origins; `None` for plaintext.
+    tls: Option<Rc<TlsContext>>,
     backend_id: String,
     stripe_size: u64,
     page_size: usize,
@@ -81,6 +92,8 @@ impl AzureBackend {
         ring: OriginRing,
         origin: SockAddr,
         host: String,
+        sni_host: String,
+        tls: Option<Rc<TlsContext>>,
         backend_id: String,
         stripe_size: u64,
         page_size: usize,
@@ -91,6 +104,8 @@ impl AzureBackend {
             ring,
             origin,
             host,
+            sni_host,
+            tls,
             backend_id,
             stripe_size,
             page_size,
@@ -141,6 +156,8 @@ impl AzureBackend {
         let backing_base = self.backing_base;
         let page_size = self.page_size;
         let host = self.host.clone();
+        let sni_host = self.sni_host.clone();
+        let tls = self.tls.clone();
 
         // A metadata entry is not a byte range of the object; it is a
         // synthetic one-page cache entry whose payload is the object's
@@ -154,6 +171,8 @@ impl AzureBackend {
                     handle,
                     origin_addr,
                     host,
+                    sni_host,
+                    tls,
                     path,
                     dsts_owned.clone(),
                     backing_base,
@@ -174,6 +193,8 @@ impl AzureBackend {
                 handle,
                 origin_addr,
                 host,
+                sni_host,
+                tls,
                 path,
                 start,
                 len,
@@ -292,6 +313,8 @@ async fn fetch(
     handle: NetHandle,
     origin: SockAddr,
     host: String,
+    sni_host: String,
+    tls: Option<Rc<TlsContext>>,
     path: String,
     start: u64,
     len: u64,
@@ -322,6 +345,8 @@ async fn fetch(
     // ring).
     handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
+    let is_tls = crate::tls::maybe_handshake(&tls, &handle, conn.fd, &sni_host).await?;
+
     let request = format_get_request(&path, &host, start, start + len - 1)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
 
@@ -337,7 +362,7 @@ async fn fetch(
                 h.content_range_start(),
             );
         }
-        let chunk = recv_chunk(&handle, conn.fd).await?;
+        let chunk = crate::tls::recv_chunk(&handle, conn.fd, is_tls).await?;
         if chunk.is_empty() {
             return Err(Error::from(
                 "azure backend: connection closed before response headers complete",
@@ -414,10 +439,8 @@ async fn fetch(
         // Pool reserves for this fetch across every await here; the
         // backend is shard-pinned so no other thread touches it. The
         // destination stays reserved until this future resolves.
-        let n_recv = handle
-            .recv_fixed(conn.fd, 0, page_byte_off, recv_len)
-            .await
-            .map_err(io_to_err)?;
+        let n_recv =
+            crate::tls::recv_fixed(&handle, conn.fd, is_tls, page_byte_off, recv_len).await?;
         if n_recv == 0 {
             // EOF. With a known length this is a truncation; for the
             // close-delimited case it is the normal end of the body.
@@ -445,6 +468,8 @@ async fn fetch_metadata(
     handle: NetHandle,
     origin: SockAddr,
     host: String,
+    sni_host: String,
+    tls: Option<Rc<TlsContext>>,
     path: String,
     dsts: Vec<PageRef>,
     backing_base: *mut u8,
@@ -466,6 +491,8 @@ async fn fetch_metadata(
     // ring).
     handle.connect(conn.fd, origin).await.map_err(io_to_err)?;
 
+    let is_tls = crate::tls::maybe_handshake(&tls, &handle, conn.fd, &sni_host).await?;
+
     let request = format_head_request(&path, &host)?;
     handle.send(conn.fd, request).await.map_err(io_to_err)?;
 
@@ -482,7 +509,7 @@ async fn fetch_metadata(
                 "azure backend: metadata HEAD response head exceeds 64 KiB",
             ));
         }
-        let chunk = recv_chunk(&handle, conn.fd).await?;
+        let chunk = crate::tls::recv_chunk(&handle, conn.fd, is_tls).await?;
         if chunk.is_empty() {
             return Err(Error::from(
                 "azure backend: connection closed before metadata HEAD headers complete",
@@ -702,14 +729,6 @@ fn zero_fill_pages_from(
         page_start = page_end;
     }
     Ok(())
-}
-
-/// Receive one chunk from `fd` through the origin ring. The
-/// [`NetHandle`] recv future self-pumps its own ring's progress hook
-/// while awaiting.
-async fn recv_chunk(handle: &NetHandle, fd: RawFd) -> Result<Vec<u8>, Error> {
-    const RECV_CHUNK: usize = 64 * 1024;
-    handle.recv(fd, RECV_CHUNK).await.map_err(io_to_err)
 }
 
 /// Compute the absolute origin byte range for a stripe sub-range. The

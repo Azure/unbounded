@@ -526,6 +526,8 @@ addr = "0.0.0.0:9000"
                 assert_eq!(cfg.url, "https://origin.example.com");
                 assert_eq!(cfg.stripe_size_bytes, Some(8 * 1024 * 1024));
                 assert_eq!(cfg.http_concurrency, Some(32));
+                assert_eq!(cfg.ca_cert_path, None);
+                assert!(!cfg.insecure_skip_verify);
             }
             other => panic!("expected http backend config, got {other:?}"),
         }
@@ -572,6 +574,8 @@ url = "https://example.com"
             backend_spec::Config::Http(cfg) => {
                 assert_eq!(cfg.stripe_size_bytes, Some(4 * 1024 * 1024));
                 assert_eq!(cfg.http_concurrency, Some(64));
+                assert_eq!(cfg.ca_cert_path, None);
+                assert!(!cfg.insecure_skip_verify);
             }
             other => panic!("expected http backend config, got {other:?}"),
         }
@@ -584,12 +588,15 @@ url = "https://example.com"
 name = "primary-s3"
 
 [backends.config.s3]
-url = "s3.us-east-1.amazonaws.com:443"
+url = "https://s3.us-east-1.amazonaws.com:443"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(c.backends[0].kind_name(), "s3");
-        assert_eq!(c.backends[0].url(), Some("s3.us-east-1.amazonaws.com:443"));
+        assert_eq!(
+            c.backends[0].url(),
+            Some("https://s3.us-east-1.amazonaws.com:443")
+        );
     }
 
     #[test]
