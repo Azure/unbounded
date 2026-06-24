@@ -231,6 +231,7 @@ pub struct EngineSnapshot {
     pub checksum_misses: u64,
     pub resident_pages: usize,
     pub btree_entries: usize,
+    pub btree_lookup_cache_bytes: usize,
     /// Length of the deferred-reclaim queue: LBAs that were
     /// displaced (overwrite or eviction) while their old page
     /// was still pinned and that have not yet been returned to
@@ -317,6 +318,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             checksum_misses: m.checksum_misses,
             resident_pages: self.lru.len(),
             btree_entries: self.btree.live_entries(),
+            btree_lookup_cache_bytes: self.btree.lookup_cache_bytes(),
             pending_free_len: self.pending_free.lock().unwrap().len(),
         }
     }
@@ -618,6 +620,45 @@ impl<B: BlockDevice> StorageEngine<B> {
         self.metric(|m| m.hits += 1);
         crate::metrics::storage_lookup(crate::metrics::Lookup::Hit);
         Ok(true)
+    }
+
+    /// Benchmark/tooling hook: populate the B-tree metadata without
+    /// writing payload pages. The entries become valid for metadata
+    /// lookup benchmarks only; callers must not read the payload LBAs
+    /// unless they wrote matching data separately.
+    pub async fn seed_metadata_for_bench(
+        &self,
+        entries: &[(StripeKey, u64, Lba, crate::storage::types::Checksum, u32)],
+    ) -> Result<(), crate::storage::types::Error> {
+        let mut mutations = Vec::with_capacity(entries.len());
+        for &(stripe, stripe_off, lba, data_checksum, byte_len) in entries {
+            let n_pages = self.n_pages(byte_len);
+            let _ = self.allocator.mark_range_in_use(lba, n_pages);
+            mutations.push(Mutation::Insert {
+                key: Self::page_key(&stripe, stripe_off, self.cfg.page_size_bytes),
+                value: LeafEntry {
+                    lba,
+                    data_checksum,
+                    byte_len,
+                },
+            });
+        }
+
+        self.btree.apply_batch(mutations).await?;
+        self.publish_usage_gauges();
+        Ok(())
+    }
+
+    /// Benchmark/tooling hook: perform only the B-tree metadata lookup
+    /// for `(key, stripe_off)`, without reading or checksumming the
+    /// payload page.
+    pub async fn lookup_metadata_for_bench(
+        &self,
+        key: StripeKey,
+        stripe_off: u64,
+    ) -> Result<bool, crate::storage::types::Error> {
+        let pk = Self::page_key(&key, stripe_off, self.cfg.page_size_bytes);
+        Ok(self.btree.lookup(&pk).await?.is_some())
     }
 
     /// Write the contents of `src` to `(key, stripe_off)`. The
