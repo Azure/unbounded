@@ -30,6 +30,16 @@ func TestCheckNSpawnMachineProvisioningMissingMachineDir(t *testing.T) {
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 }
 
+func TestCheckNSpawnMachineProvisioningMissingParentDir(t *testing.T) {
+	base := t.TempDir()
+	gs := validRootFSGoalState(t)
+	gs.MachineDir = filepath.Join(base, "var", "lib", "machines", "kube1")
+
+	results := CheckNSpawnMachineProvisioning(slog.New(slog.DiscardHandler), gs).Check(context.Background())
+
+	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+}
+
 func TestCheckNSpawnMachineProvisioningNonEmptyMachineDir(t *testing.T) {
 	gs := validRootFSGoalState(t)
 	require.NoError(t, os.WriteFile(filepath.Join(gs.MachineDir, "file"), []byte("x"), 0o600))

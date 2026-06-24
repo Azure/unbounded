@@ -68,7 +68,7 @@ func (c nspawnMachineProvisioningChecker) Check(context.Context) []preflight.Res
 		return result
 	}
 
-	if result := c.checkWritableDir(filepath.Dir(c.gs.MachineDir), "rootfs parent directory"); result != nil {
+	if result := c.checkCreatableDir(filepath.Dir(c.gs.MachineDir), "rootfs parent directory"); result != nil {
 		return result
 	}
 
@@ -76,7 +76,7 @@ func (c nspawnMachineProvisioningChecker) Check(context.Context) []preflight.Res
 		filepath.Dir(c.gs.NSpawnConfigFile),
 		filepath.Dir(c.gs.ServiceOverrideFile),
 	} {
-		if result := c.checkWritableDir(path, "nspawn provisioning path"); result != nil {
+		if result := c.checkCreatableDir(path, "nspawn provisioning path"); result != nil {
 			return result
 		}
 	}
@@ -131,18 +131,34 @@ func (c nspawnMachineProvisioningChecker) checkMachineDir() []preflight.Result {
 	return nil
 }
 
-func (c nspawnMachineProvisioningChecker) checkWritableDir(path, label string) []preflight.Result {
+func (c nspawnMachineProvisioningChecker) checkCreatableDir(path, label string) []preflight.Result {
 	c.log.Debug("checking "+label, "path", path)
+	existing := nearestExistingParent(c.deps.stat, path)
 
-	if err := c.deps.writeProbe(path); err != nil {
+	if err := c.deps.writeProbe(existing); err != nil {
 		return preflight.ResultsError(
 			checkNSpawnMachineProvisioningName,
 			"nspawn machine provisioning",
-			label+" is not writable: "+path,
+			label+" cannot be created under: "+existing,
 		)
 	}
 
 	return nil
+}
+
+func nearestExistingParent(stat func(string) (fs.FileInfo, error), path string) string {
+	for {
+		if info, err := stat(path); err == nil && info.IsDir() {
+			return path
+		}
+
+		parent := filepath.Dir(path)
+		if parent == path {
+			return path
+		}
+
+		path = parent
+	}
 }
 
 func isDirEmpty(open func(string) (*os.File, error), dir string) (bool, error) {
