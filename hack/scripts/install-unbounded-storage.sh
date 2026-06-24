@@ -14,11 +14,14 @@ NO_ENABLE="${NO_ENABLE:-0}"
 LOCAL_TARBALL="${LOCAL_TARBALL:-}"
 HUGEPAGES="${HUGEPAGES:-}"
 # Buffer-pool size (bytes) the hugepage reservation is sized for. Matches the
-# daemon's default 128 MiB per-shard backing so a fresh install reserves enough
-# 2MiB hugepages for the buffer pool. Override with POOL_BYTES=<bytes> (keep it
-# in sync with bytes_per_shard in the daemon config). Ignored when HUGEPAGES is
+# daemon's default 128 MiB host backing so a fresh install reserves enough 2MiB
+# hugepages for the buffer pool. Override with POOL_BYTES=<bytes> (keep it in
+# sync with memory_total_bytes in the daemon config). Ignored when HUGEPAGES is
 # set to an explicit count.
 POOL_BYTES="${POOL_BYTES:-134217728}"
+# Number of 2MiB pages reserved by each fabric unit for RPC scratch. This must
+# track RPC_SCRATCH_PAGES in cmd/unbounded-storage/src/fabric_group.rs.
+RPC_SCRATCH_PAGES="${RPC_SCRATCH_PAGES:-64}"
 
 # Optional first positional argument selects where the release-layout tarball
 # comes from:
@@ -93,6 +96,11 @@ fi
 
 if [[ ! "${POOL_BYTES}" =~ ^[0-9]+$ || "${POOL_BYTES}" -le 0 ]]; then
 	err "POOL_BYTES must be a positive integer (bytes), got '${POOL_BYTES}'."
+	exit 1
+fi
+
+if [[ ! "${RPC_SCRATCH_PAGES}" =~ ^[0-9]+$ ]]; then
+	err "RPC_SCRATCH_PAGES must be a non-negative integer, got '${RPC_SCRATCH_PAGES}'."
 	exit 1
 fi
 
@@ -229,7 +237,7 @@ log "Linked ${PREFIX}/current -> ${release_dir}"
 unit_path="/etc/systemd/system/${SERVICE_NAME}.service"
 log "Writing systemd unit ${unit_path} ..."
 
-reserve_cmd='hp=/sys/kernel/mm/hugepages/hugepages-2048kB; [ -d "$hp" ] || { echo "unbounded-storage: kernel exposes no 2MiB hugepage pool; hugepages are required" >&2; exit 1; }; want='"${HUGEPAGES:-0}"'; if [ "$want" -le 0 ]; then pool=$(( ('"${POOL_BYTES}"' + 2097151) / 2097152 )); n=$(nproc 2>/dev/null || echo 1); [ "$n" -gt 8 ] && n=8; need=$(( pool + 8 * n )); want=$(( need + need / 2 )); else need=$want; fi; cur=$(cat "$hp/nr_hugepages" 2>/dev/null || echo 0); [ "$cur" -lt "$want" ] && echo "$want" > "$hp/nr_hugepages" 2>/dev/null || true; free=$(cat "$hp/free_hugepages" 2>/dev/null || echo 0); if [ "$free" -lt "$need" ] && [ -w /proc/sys/vm/compact_memory ]; then echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true; [ "$cur" -lt "$want" ] && echo "$want" > "$hp/nr_hugepages" 2>/dev/null || true; free=$(cat "$hp/free_hugepages" 2>/dev/null || echo 0); fi; nr=$(cat "$hp/nr_hugepages" 2>/dev/null || echo 0); echo "unbounded-storage: 2MiB hugepages nr=$nr free=$free (need $need target $want)" >&2; [ "$free" -ge "$need" ] || { echo "unbounded-storage: could not reserve $need free 2MiB hugepages (have $free); free host memory or reserve hugepages at boot" >&2; exit 1; }'
+reserve_cmd='hp=/sys/kernel/mm/hugepages/hugepages-2048kB; [ -d "$hp" ] || { echo "unbounded-storage: kernel exposes no 2MiB hugepage pool; hugepages are required" >&2; exit 1; }; want='"${HUGEPAGES:-0}"'; if [ "$want" -le 0 ]; then pool=$(( ('"${POOL_BYTES}"' + 2097151) / 2097152 )); need=$(( pool + '"${RPC_SCRATCH_PAGES}"' )); want=$(( need + need / 2 )); else need=$want; fi; cur=$(cat "$hp/nr_hugepages" 2>/dev/null || echo 0); [ "$cur" -lt "$want" ] && echo "$want" > "$hp/nr_hugepages" 2>/dev/null || true; free=$(cat "$hp/free_hugepages" 2>/dev/null || echo 0); if [ "$free" -lt "$need" ] && [ -w /proc/sys/vm/compact_memory ]; then echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true; [ "$cur" -lt "$want" ] && echo "$want" > "$hp/nr_hugepages" 2>/dev/null || true; free=$(cat "$hp/free_hugepages" 2>/dev/null || echo 0); fi; nr=$(cat "$hp/nr_hugepages" 2>/dev/null || echo 0); echo "unbounded-storage: 2MiB hugepages nr=$nr free=$free (need $need target $want)" >&2; [ "$free" -ge "$need" ] || { echo "unbounded-storage: could not reserve $need free 2MiB hugepages (have $free); free host memory or reserve hugepages at boot" >&2; exit 1; }'
 HUGEPAGE_PRE="ExecStartPre=+/bin/sh -c '${reserve_cmd}'"
 
 config_ensure_cmd='d=$(dirname "'"${CONFIG_PATH}"'"); mkdir -p "$d"; [ -f "'"${CONFIG_PATH}"'" ] || : > "'"${CONFIG_PATH}"'"'

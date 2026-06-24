@@ -162,15 +162,15 @@ DISK_SIZE = 2 * 1024 * 1024 * 1024
 # heap). `memory_total_bytes` is pinned so the reservation below is exact.
 HUGEPAGE_SIZE = 2 * 1024 * 1024  # 2 MiB; matches memory::HUGEPAGE_2MB
 MEMORY_TOTAL_BYTES = 128 * 1024 * 1024  # matches StorageCfg default; pinned for exactness
-RPC_SCRATCH_PAGES = 8  # matches main.rs RPC_SCRATCH_PAGES
+RPC_SCRATCH_PAGES = 64  # matches fabric_group.rs RPC_SCRATCH_PAGES
 NODES_PER_SCENARIO = 2
 
-# Hugepages the per-node pool backing needs: the whole memory_total_bytes
-# pool (split across the node's serving shards) plus scratch, each rounded up.
-_HP_PER_SHARD = (MEMORY_TOTAL_BYTES + HUGEPAGE_SIZE - 1) // HUGEPAGE_SIZE + RPC_SCRATCH_PAGES
+# Hugepages the per-node backing needs: the whole memory_total_bytes pool
+# (split across the node's serving shards) plus the shared RPC scratch region.
+_HP_PER_NODE = (MEMORY_TOTAL_BYTES + HUGEPAGE_SIZE - 1) // HUGEPAGE_SIZE + RPC_SCRATCH_PAGES
 # Total for a scenario's two concurrent nodes, plus 50% headroom for any
 # allocator rounding / transient double-counting during teardown overlap.
-HUGEPAGES_NEEDED = _HP_PER_SHARD * NODES_PER_SCENARIO
+HUGEPAGES_NEEDED = _HP_PER_NODE * NODES_PER_SCENARIO
 HUGEPAGES_RESERVE = HUGEPAGES_NEEDED + HUGEPAGES_NEEDED // 2
 
 NR_HUGEPAGES_PATH = Path("/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages")
