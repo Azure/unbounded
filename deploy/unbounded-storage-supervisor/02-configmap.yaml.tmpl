@@ -47,10 +47,14 @@ metadata:
 # The cache-miss scenarios measure source cache misses served over fabric from
 # the target node's disk. They render a same-named cache on both nodes; the
 # source cache has no disks, so it cannot create local cache hits or write pages
-# to local disk. The target cache uses a file disk declared by required
-# source-node annotations:
-#   unbounded-cloud.io/storage-benchmark.disk-path: <target-node-file-path>
+# to local disk. Declare node-local file disks globally on the nodes that should
+# provide cache storage:
+#   unbounded-cloud.io/storage-benchmark.disk-path: <node-local-file-path>
 #   unbounded-cloud.io/storage-benchmark.disk-size-bytes: <bytes>
+# The supervisor attaches the annotated disk to a diskless cache on that node,
+# including a cache created by a cache-miss benchmark. For cache-miss benchmark
+# runs, annotate the target node and leave the source node without disk
+# annotations if source reads must stay remote.
 # The load generator first runs an unreported warmup over the same object stream
 # to seed the target cache through origin fallback, then reports measured reads.
 # Warmup defaults to storage-benchmark.object-count, or the loadgen default when

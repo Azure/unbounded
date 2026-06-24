@@ -89,8 +89,6 @@ func TestComputeBenchmarksCacheMissSourceNode(t *testing.T) {
 		benchmarkRdmaAddrAnnotation:        "hex:01020304",
 		benchmarkReadBytesAnnotation:       "4096",
 		benchmarkObjectSizeBytesAnnotation: "16384",
-		benchmarkDiskPathAnnotation:        "/var/lib/unbounded/bench-cache.bin",
-		benchmarkDiskSizeBytesAnnotation:   "104857600",
 		benchmarkWarmupOpsAnnotation:       "25",
 	})
 	target := benchmarkNode("target-b", map[string]string{benchmarkRdmaAddrAnnotation: "hex:0a0b"})
@@ -112,8 +110,6 @@ func TestComputeBenchmarksCacheMissSourceNode(t *testing.T) {
 	assert.Equal(t, uint64(16384), *bench.objectSizeBytes)
 	require.NotNil(t, bench.warmupOps)
 	assert.Equal(t, uint64(25), *bench.warmupOps)
-	assert.Equal(t, "/var/lib/unbounded/bench-cache.bin", bench.diskPath)
-	assert.Equal(t, uint64(104857600), bench.diskSizeBytes)
 }
 
 func TestComputeBenchmarksTargetNode(t *testing.T) {
@@ -146,8 +142,6 @@ func TestComputeBenchmarksTCPSourceNode(t *testing.T) {
 		benchmarkTargetNodeAnnotation:      "target-b",
 		benchmarkReadBytesAnnotation:       "4096",
 		benchmarkObjectSizeBytesAnnotation: "16384",
-		benchmarkDiskPathAnnotation:        "/var/lib/unbounded/bench-cache.bin",
-		benchmarkDiskSizeBytesAnnotation:   "104857600",
 	}, "10.0.0.1")
 	target := benchmarkNodeWithIP("target-b", nil, "10.0.0.2")
 
@@ -187,6 +181,27 @@ func TestComputeBenchmarksTCPPortAnnotationOverridesDefault(t *testing.T) {
 
 	require.Len(t, state.rdmaLoadgens, 1)
 	assert.Equal(t, "10.0.0.2:19003", state.rdmaLoadgens[0].peerAddr)
+}
+
+func TestComputeBenchmarksAnnotatedDiskOnSelf(t *testing.T) {
+	source := benchmarkNode("source-a", map[string]string{
+		benchmarkScenarioAnnotation:   rdmaCacheMissScenario,
+		benchmarkTargetNodeAnnotation: "target-b",
+		benchmarkRdmaAddrAnnotation:   "hex:0102",
+	})
+	target := benchmarkNode("target-b", map[string]string{
+		benchmarkRdmaAddrAnnotation:      "hex:0304",
+		benchmarkDiskPathAnnotation:      "/var/lib/unbounded/bench-cache.bin",
+		benchmarkDiskSizeBytesAnnotation: "104857600",
+	})
+
+	state := computeBenchmarks([]*corev1.Node{source, target}, "target-b", 0)
+
+	require.Len(t, state.disks, 1)
+	disk := state.disks[0]
+	assert.True(t, disk.GetSkipRecoveryScan())
+	assert.Equal(t, "/var/lib/unbounded/bench-cache.bin", disk.GetFile().GetPath())
+	assert.Equal(t, uint64(104857600), disk.GetFile().GetSize())
 }
 
 func TestComputeBenchmarksSkipsInvalidAnnotations(t *testing.T) {
@@ -239,40 +254,6 @@ func TestComputeBenchmarksSkipsInvalidAnnotations(t *testing.T) {
 				benchmarkTargetNodeAnnotation: "target-b",
 				benchmarkRdmaAddrAnnotation:   "hex:0102",
 				benchmarkWorkersAnnotation:    "-1",
-			},
-			target:      map[string]string{benchmarkRdmaAddrAnnotation: "hex:0304"},
-			includePeer: true,
-		},
-		{
-			name: "cache miss missing disk path",
-			source: map[string]string{
-				benchmarkScenarioAnnotation:      rdmaCacheMissScenario,
-				benchmarkTargetNodeAnnotation:    "target-b",
-				benchmarkRdmaAddrAnnotation:      "hex:0102",
-				benchmarkDiskSizeBytesAnnotation: "1048576",
-			},
-			target:      map[string]string{benchmarkRdmaAddrAnnotation: "hex:0304"},
-			includePeer: true,
-		},
-		{
-			name: "cache miss missing disk size",
-			source: map[string]string{
-				benchmarkScenarioAnnotation:   rdmaCacheMissScenario,
-				benchmarkTargetNodeAnnotation: "target-b",
-				benchmarkRdmaAddrAnnotation:   "hex:0102",
-				benchmarkDiskPathAnnotation:   "/var/lib/unbounded/bench-cache.bin",
-			},
-			target:      map[string]string{benchmarkRdmaAddrAnnotation: "hex:0304"},
-			includePeer: true,
-		},
-		{
-			name: "cache miss bad disk size",
-			source: map[string]string{
-				benchmarkScenarioAnnotation:      rdmaCacheMissScenario,
-				benchmarkTargetNodeAnnotation:    "target-b",
-				benchmarkRdmaAddrAnnotation:      "hex:0102",
-				benchmarkDiskPathAnnotation:      "/var/lib/unbounded/bench-cache.bin",
-				benchmarkDiskSizeBytesAnnotation: "not-a-number",
 			},
 			target:      map[string]string{benchmarkRdmaAddrAnnotation: "hex:0304"},
 			includePeer: true,
@@ -414,8 +395,6 @@ func TestRenderConfigAppliesRDMACacheMissBenchmarkOnSource(t *testing.T) {
 		readBytes:       &readBytes,
 		warmupOps:       &warmupOps,
 		objectSizeBytes: &objectSize,
-		diskPath:        "/var/lib/unbounded/bench-cache.bin",
-		diskSizeBytes:   104857600,
 	}
 
 	cfg := decodeWithBenchmarks(t, dir, benchmarkState{rdmaLoadgens: []rdmaLoadgenBenchmark{bench}})
@@ -481,17 +460,28 @@ func TestRenderConfigDefaultsRDMACacheMissObjectAndWarmup(t *testing.T) {
 func TestRenderConfigAppliesRDMACacheMissBenchmarkOnTarget(t *testing.T) {
 	dir := writeSource(t, "startup:\n  fabric:\n    auto_rdma: {}\n")
 	bench := rdmaLoadgenBenchmark{
-		name:          "rdma_source_to_target",
-		runLoadgen:    false,
-		localNodeID:   20,
-		peerNodeID:    10,
-		peerAddr:      "hex:0102",
-		cacheMiss:     true,
-		diskPath:      "/var/lib/unbounded/bench-cache.bin",
-		diskSizeBytes: 104857600,
+		name:        "rdma_source_to_target",
+		runLoadgen:  false,
+		localNodeID: 20,
+		peerNodeID:  10,
+		peerAddr:    "hex:0102",
+		cacheMiss:   true,
 	}
 
-	cfg := decodeWithBenchmarks(t, dir, benchmarkState{rdmaLoadgens: []rdmaLoadgenBenchmark{bench}})
+	disk := &storageconfig.DiskSpec{
+		SkipRecoveryScan: true,
+		Config: &storageconfig.DiskSpec_File{
+			File: &storageconfig.FileDiskConfig{
+				Path: "/var/lib/unbounded/bench-cache.bin",
+				Size: proto.Uint64(104857600),
+			},
+		},
+	}
+
+	cfg := decodeWithBenchmarks(t, dir, benchmarkState{
+		rdmaLoadgens: []rdmaLoadgenBenchmark{bench},
+		disks:        []*storageconfig.DiskSpec{disk},
+	})
 
 	require.Len(t, cfg.GetBackends(), 1)
 	require.Len(t, cfg.GetNeighborhoods(), 1)
@@ -500,11 +490,58 @@ func TestRenderConfigAppliesRDMACacheMissBenchmarkOnTarget(t *testing.T) {
 	assert.Equal(t, bench.cacheName(), cache.GetName())
 	assert.Equal(t, bench.neighborhoodName(), cache.GetSource())
 	require.Len(t, cache.GetDisks(), 1)
-	disk := cache.GetDisks()[0]
-	assert.True(t, disk.GetSkipRecoveryScan())
-	assert.Equal(t, "/var/lib/unbounded/bench-cache.bin", disk.GetFile().GetPath())
-	assert.Equal(t, uint64(104857600), disk.GetFile().GetSize())
+	renderedDisk := cache.GetDisks()[0]
+	assert.True(t, renderedDisk.GetSkipRecoveryScan())
+	assert.Equal(t, "/var/lib/unbounded/bench-cache.bin", renderedDisk.GetFile().GetPath())
+	assert.Equal(t, uint64(104857600), renderedDisk.GetFile().GetSize())
 	assert.Empty(t, cfg.GetFrontends())
+}
+
+func TestRenderConfigAppliesAnnotatedDiskToDeclaredDisklessCache(t *testing.T) {
+	dir := writeSource(t, `
+caches:
+  - name: edge-cache
+    source: origin
+`)
+	disk := &storageconfig.DiskSpec{
+		SkipRecoveryScan: true,
+		Config: &storageconfig.DiskSpec_File{
+			File: &storageconfig.FileDiskConfig{
+				Path: "/var/lib/unbounded/cache.bin",
+				Size: proto.Uint64(104857600),
+			},
+		},
+	}
+
+	cfg := decodeWithBenchmarks(t, dir, benchmarkState{disks: []*storageconfig.DiskSpec{disk}})
+
+	require.Len(t, cfg.GetCaches(), 1)
+	require.Len(t, cfg.GetCaches()[0].GetDisks(), 1)
+	assert.Equal(t, "/var/lib/unbounded/cache.bin", cfg.GetCaches()[0].GetDisks()[0].GetFile().GetPath())
+}
+
+func TestRenderConfigDoesNotDuplicateAnnotatedDiskAcrossCaches(t *testing.T) {
+	dir := writeSource(t, `
+caches:
+  - name: edge-cache-a
+    source: origin
+  - name: edge-cache-b
+    source: origin
+`)
+	disk := &storageconfig.DiskSpec{
+		Config: &storageconfig.DiskSpec_File{
+			File: &storageconfig.FileDiskConfig{
+				Path: "/var/lib/unbounded/cache.bin",
+				Size: proto.Uint64(104857600),
+			},
+		},
+	}
+
+	cfg := decodeWithBenchmarks(t, dir, benchmarkState{disks: []*storageconfig.DiskSpec{disk}})
+
+	require.Len(t, cfg.GetCaches(), 2)
+	assert.Empty(t, cfg.GetCaches()[0].GetDisks())
+	assert.Empty(t, cfg.GetCaches()[1].GetDisks())
 }
 
 func TestRenderConfigSkipsRDMABenchmarkOnReservedNameCollision(t *testing.T) {

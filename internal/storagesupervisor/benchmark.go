@@ -49,6 +49,7 @@ const (
 // added for benchmark control.
 type benchmarkState struct {
 	rdmaLoadgens []rdmaLoadgenBenchmark
+	disks        []*storageconfig.DiskSpec
 }
 
 type rdmaLoadgenBenchmark struct {
@@ -73,8 +74,6 @@ type rdmaLoadgenBenchmark struct {
 
 	stripeSizeBytes *uint64
 	objectSizeBytes *uint64
-	diskPath        string
-	diskSizeBytes   uint64
 }
 
 // computeBenchmarks turns Node annotations into benchmark overlays relevant to
@@ -103,6 +102,10 @@ func computeBenchmarks(nodes []*corev1.Node, selfName string, defaultTCPPort int
 	sort.Strings(names)
 
 	state := benchmarkState{}
+
+	if disk, ok := annotatedDisk(byName[selfName]); ok {
+		state.disks = []*storageconfig.DiskSpec{disk}
+	}
 
 	for _, sourceName := range names {
 		source := byName[sourceName]
@@ -227,26 +230,6 @@ func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Nod
 		return rdmaLoadgenBenchmark{}, false
 	}
 
-	diskPath := ""
-	diskSizeBytes := uint64(0)
-
-	if cacheMiss {
-		diskPath = strings.TrimSpace(source.Annotations[benchmarkDiskPathAnnotation])
-		if diskPath == "" {
-			slog.Warn("skipping RDMA cache-miss storage benchmark without disk path annotation",
-				"node", source.Name, "annotation", benchmarkDiskPathAnnotation)
-
-			return rdmaLoadgenBenchmark{}, false
-		}
-
-		parsedDiskSizeBytes, ok := parseRequiredUint64Annotation(source, benchmarkDiskSizeBytesAnnotation)
-		if !ok {
-			return rdmaLoadgenBenchmark{}, false
-		}
-
-		diskSizeBytes = parsedDiskSizeBytes
-	}
-
 	bench := rdmaLoadgenBenchmark{
 		name:            benchmarkName(source.Name, targetName),
 		sourceNode:      source.Name,
@@ -265,8 +248,6 @@ func parseRDMALoadgenBenchmark(source *corev1.Node, nodes map[string]*corev1.Nod
 		warmupOps:       warmupOps,
 		stripeSizeBytes: stripeSizeBytes,
 		objectSizeBytes: objectSizeBytes,
-		diskPath:        diskPath,
-		diskSizeBytes:   diskSizeBytes,
 	}
 
 	if selfName == targetName {
@@ -283,6 +264,8 @@ func applyBenchmarks(cfg *storageconfig.Config, benchmarks benchmarkState) {
 	for _, bench := range benchmarks.rdmaLoadgens {
 		applyRDMALoadgenBenchmark(cfg, bench)
 	}
+
+	applyAnnotatedDisks(cfg, benchmarks.disks)
 }
 
 func applyRDMALoadgenBenchmark(cfg *storageconfig.Config, bench rdmaLoadgenBenchmark) {
@@ -383,22 +366,96 @@ func benchmarkLoadgenConfig(bench rdmaLoadgenBenchmark) *storageconfig.LoadgenFr
 }
 
 func benchmarkCache(bench rdmaLoadgenBenchmark, cacheName, neighborhoodName string) *storageconfig.CacheSpec {
-	cache := &storageconfig.CacheSpec{Name: cacheName, Source: neighborhoodName}
-	if !bench.runLoadgen {
-		cache.Disks = []*storageconfig.DiskSpec{
-			{
-				SkipRecoveryScan: true,
-				Config: &storageconfig.DiskSpec_File{
-					File: &storageconfig.FileDiskConfig{
-						Path: bench.diskPath,
-						Size: proto.Uint64(bench.diskSizeBytes),
-					},
-				},
-			},
-		}
+	return &storageconfig.CacheSpec{Name: cacheName, Source: neighborhoodName}
+}
+
+func annotatedDisk(node *corev1.Node) (*storageconfig.DiskSpec, bool) {
+	if node == nil || node.Annotations == nil {
+		return nil, false
 	}
 
-	return cache
+	path := strings.TrimSpace(node.Annotations[benchmarkDiskPathAnnotation])
+
+	sizeRaw := strings.TrimSpace(node.Annotations[benchmarkDiskSizeBytesAnnotation])
+	if path == "" && sizeRaw == "" {
+		return nil, false
+	}
+
+	if path == "" {
+		slog.Warn("skipping storage disk annotation without disk path",
+			"node", node.Name, "annotation", benchmarkDiskPathAnnotation)
+
+		return nil, false
+	}
+
+	if sizeRaw == "" {
+		slog.Warn("skipping storage disk annotation without disk size",
+			"node", node.Name, "annotation", benchmarkDiskSizeBytesAnnotation)
+
+		return nil, false
+	}
+
+	size, err := strconv.ParseUint(sizeRaw, 10, 64)
+	if err != nil {
+		slog.Warn("skipping storage disk annotation: disk size must be a uint64",
+			"node", node.Name, "annotation", benchmarkDiskSizeBytesAnnotation, "value", sizeRaw)
+
+		return nil, false
+	}
+
+	return &storageconfig.DiskSpec{
+		SkipRecoveryScan: true,
+		Config: &storageconfig.DiskSpec_File{
+			File: &storageconfig.FileDiskConfig{Path: path, Size: proto.Uint64(size)},
+		},
+	}, true
+}
+
+func applyAnnotatedDisks(cfg *storageconfig.Config, disks []*storageconfig.DiskSpec) {
+	if len(disks) == 0 {
+		return
+	}
+
+	var target *storageconfig.CacheSpec
+
+	for _, cache := range cfg.GetCaches() {
+		if cache == nil || len(cache.GetDisks()) > 0 {
+			continue
+		}
+
+		if target != nil {
+			slog.Warn("skipping storage disk annotations: multiple diskless caches need explicit disk configuration")
+
+			return
+		}
+
+		target = cache
+	}
+
+	if target == nil {
+		return
+	}
+
+	target.Disks = cloneDiskSpecs(disks)
+}
+
+func cloneDiskSpecs(disks []*storageconfig.DiskSpec) []*storageconfig.DiskSpec {
+	cloned := make([]*storageconfig.DiskSpec, 0, len(disks))
+
+	for _, disk := range disks {
+		if disk == nil {
+			continue
+		}
+
+		clonedDisk, ok := proto.Clone(disk).(*storageconfig.DiskSpec)
+		if !ok {
+			continue
+		}
+
+		cloned = append(cloned, clonedDisk)
+	}
+
+	return cloned
 }
 
 func benchmarkScenario(node *corev1.Node) string {
@@ -535,26 +592,6 @@ func parseUint64Annotation(node *corev1.Node, key string) (*uint64, bool) {
 	}
 
 	return &v, true
-}
-
-func parseRequiredUint64Annotation(node *corev1.Node, key string) (uint64, bool) {
-	raw := strings.TrimSpace(node.Annotations[key])
-	if raw == "" {
-		slog.Warn("skipping RDMA storage benchmark: missing required uint64 annotation",
-			"node", node.Name, "annotation", key)
-
-		return 0, false
-	}
-
-	v, err := strconv.ParseUint(raw, 10, 64)
-	if err != nil {
-		slog.Warn("skipping RDMA storage benchmark: annotation must be a uint64",
-			"node", node.Name, "annotation", key, "value", raw)
-
-		return 0, false
-	}
-
-	return v, true
 }
 
 func parseBoolAnnotation(node *corev1.Node, key string) (bool, bool) {
