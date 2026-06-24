@@ -29,7 +29,8 @@ name: unbounded release
 #
 # All artifacts land on a single GitHub release that is left as a draft.
 # Prerelease status is derived from the tag (a `-` suffix, e.g. v1.2.3-rc1).
-# Publishing is a manual step (GitHub UI or `gh release edit --draft=false`).
+# The release-upgrade workflow publishes the draft after a successful soak
+# (deploy + smoke) on unbounded-stable; manual publish is still possible.
 # ---------------------------------------------------------------------------
 
 on:
@@ -714,8 +715,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Attach the manifests tarball + krew manifest to the draft release that
-  # GoReleaser created, set release notes, and optionally flip from draft
-  # to published.
+  # GoReleaser created and set release notes. The release stays a draft here;
+  # the release-upgrade workflow publishes it after a successful soak.
   # ---------------------------------------------------------------------------
   finalize:
     needs:
@@ -792,6 +793,7 @@ jobs:
             gh release edit "${TAG}" --prerelease
           fi
 
-          # The release is always left as a draft. Publishing is a deliberate
-          # manual step once the release has soaked.
-          echo "Release ${TAG} left as draft. Publish via the GitHub UI or 'gh release edit ${TAG} --draft=false'."
+          # The release is left as a draft here. The release-upgrade workflow
+          # publishes it automatically after a successful soak (deploy +
+          # smoke) on unbounded-stable; an operator can also publish manually.
+          echo "Release ${TAG} left as draft; release-upgrade will publish it after a successful soak (or publish manually with 'gh release edit ${TAG} --draft=false')."

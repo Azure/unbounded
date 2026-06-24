@@ -61,6 +61,33 @@ func TestServiceOverride_HostDevicesDeviceAllow(t *testing.T) {
 	require.Less(t, strings.Index(out, "[Service]"), strings.Index(out, "DeviceAllow=/dev/kvm rwm"))
 }
 
+func TestServiceOverride_MultipleHostDevices(t *testing.T) {
+	t.Parallel()
+
+	devices := []string{"/dev/kvm", "/dev/sda", "/dev/infiniband/uverbs0"}
+
+	var nspawnBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
+		BPFFSMountPath:  goalstates.BPFFSMountPath("kube1"),
+		HostDevicePaths: devices,
+	}))
+
+	var overrideBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", nspawnTemplateData{
+		MachineName:     "kube1",
+		BPFFSMountPath:  goalstates.BPFFSMountPath("kube1"),
+		HostDevicePaths: devices,
+	}))
+
+	// Every host device must get both a bind mount in the .nspawn config and a
+	// matching cgroup DeviceAllow in the service drop-in; otherwise the node is
+	// either invisible or blocked inside the container.
+	for _, dev := range devices {
+		require.Contains(t, nspawnBuf.String(), "Bind="+dev)
+		require.Contains(t, overrideBuf.String(), "DeviceAllow="+dev+" rwm")
+	}
+}
+
 func TestServiceOverride_NoHostDevicesNoDeviceAllow(t *testing.T) {
 	t.Parallel()
 

@@ -360,6 +360,7 @@ mod tests {
         let mut spec = loadgen_spec();
         spec.config = Some(frontend_spec::Config::Http(HttpFrontendConfig {
             addr: "127.0.0.1:9000".to_string(),
+            max_requests_per_connection: None,
         }));
         assert!(LoadgenFrontend::from_spec(&spec).is_err());
     }

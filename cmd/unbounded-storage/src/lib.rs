@@ -18,4 +18,6 @@ pub mod profiling;
 pub mod ring;
 pub mod runtime;
 pub mod storage;
+#[cfg(target_os = "linux")]
+pub mod tls;
 pub mod topology;

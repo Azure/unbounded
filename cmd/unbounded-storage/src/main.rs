@@ -864,7 +864,7 @@ fn run_shard(
     let frontend_registry = match FrontendRegistry::new(&frontend_specs, frontend_ctx) {
         Ok(r) => r,
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!("worker={}: {e}", widx.0)));
+            phaseb_guard.report_failed(format!("worker={}: {e}", widx.0));
             return;
         }
     };
@@ -1322,6 +1322,7 @@ impl FrontendBuildCtx {
                     self.page_size,
                     self.fanout.clone(),
                     binding.bypass_cache,
+                    frontend.max_requests_per_connection(),
                 )))
             }
             Some(frontend_spec::Config::S3(_)) => {
@@ -1959,6 +1960,8 @@ mod tests {
                     url: "https://example.com".to_string(),
                     stripe_size_bytes: Some(4 * 1024 * 1024),
                     http_concurrency: Some(64),
+                    ca_cert_path: None,
+                    insecure_skip_verify: false,
                 },
             )),
         }
