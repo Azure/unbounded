@@ -48,18 +48,18 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::config::schema::DiskSpec;
-use crate::ring::{StorageRingConfig, clear_current_storage_ring, set_current_storage_ring};
-use crate::runtime::{PinnedRuntime, WorkerSpec, noop_waker};
+use crate::ring::{clear_current_storage_ring, set_current_storage_ring, StorageRingConfig};
+use crate::runtime::{noop_waker, PinnedRuntime, WorkerSpec};
 use crate::storage::blockdev::{
-    BlockDevice, CoreLocalDevice, OpenDisk, UringDevice, provision_file,
+    provision_file, BlockDevice, CoreLocalDevice, OpenDisk, UringDevice,
 };
 use crate::storage::types::Error;
 use crate::storage::{EngineConfig, PageChannel, PageService, StorageEngine};
@@ -403,15 +403,38 @@ fn disk_open_mode(spec: &DiskSpec) -> DiskOpenMode {
     }
 
     if spec.is_file() {
-        ring_cfg.iopoll = false;
-        ring_cfg.single_issuer = false;
-        ring_cfg.defer_taskrun = false;
+        disable_polled_ring(&mut ring_cfg);
+    } else if let Some(path) = spec.path() {
+        disable_iopoll_if_unsupported(&mut ring_cfg, Path::new(path), Path::new("/sys/block"));
     }
 
     DiskOpenMode {
         ring_cfg,
         o_direct: true,
     }
+}
+
+fn disable_iopoll_if_unsupported(ring_cfg: &mut StorageRingConfig, path: &Path, sys_block: &Path) {
+    if matches!(block_queue_iopoll(path, sys_block), Some(false)) {
+        disable_polled_ring(ring_cfg);
+    }
+}
+
+fn block_queue_iopoll(path: &Path, sys_block: &Path) -> Option<bool> {
+    let name = path.file_name()?.to_str()?;
+    let value = std::fs::read_to_string(sys_block.join(name).join("queue/io_poll")).ok()?;
+
+    match value.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+fn disable_polled_ring(ring_cfg: &mut StorageRingConfig) {
+    ring_cfg.iopoll = false;
+    ring_cfg.single_issuer = false;
+    ring_cfg.defer_taskrun = false;
 }
 
 /// Build an [`EngineConfig`] from a [`DiskSpec`]. Production defaults
@@ -447,6 +470,7 @@ mod tests {
     use crate::bufferpool::{Error as BpError, StripeKey};
     use crate::storage::blockdev::{MockDevice, MockDeviceConfig};
     use std::cell::{Cell, RefCell};
+    use std::fs;
 
     /// Spin a future to completion on the same noop-waker pattern the
     /// storage core uses. Bounded so a stuck future fails loudly.
@@ -718,7 +742,7 @@ mod tests {
             config: Some(crate::config::schema::disk_spec::Config::Block(
                 crate::config::schema::BlockDiskConfig {
                     numa: None,
-                    path: "/dev/nvme0n1".to_string(),
+                    path: "/dev/unbounded-test-block".to_string(),
                 },
             )),
         };
@@ -730,6 +754,62 @@ mod tests {
         assert!(mode.ring_cfg.single_issuer);
         assert!(mode.ring_cfg.defer_taskrun);
         assert_eq!(mode.ring_cfg.queue_depth, 64);
+    }
+
+    #[test]
+    fn block_iopoll_probe_reads_sysfs_queue_flag() {
+        let dir = tempfile::tempdir().expect("create temp sysfs");
+        let queue = dir.path().join("nvme0n1/queue");
+        fs::create_dir_all(&queue).expect("create queue dir");
+
+        fs::write(queue.join("io_poll"), "0\n").expect("write io_poll");
+        assert_eq!(
+            block_queue_iopoll(Path::new("/dev/nvme0n1"), dir.path()),
+            Some(false)
+        );
+
+        fs::write(queue.join("io_poll"), "1\n").expect("write io_poll");
+        assert_eq!(
+            block_queue_iopoll(Path::new("/dev/nvme0n1"), dir.path()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn block_iopoll_probe_is_unknown_when_sysfs_missing() {
+        let dir = tempfile::tempdir().expect("create temp sysfs");
+
+        assert_eq!(
+            block_queue_iopoll(Path::new("/dev/nvme0n1"), dir.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn block_disks_disable_iopoll_when_queue_does_not_support_it() {
+        let dir = tempfile::tempdir().expect("create temp sysfs");
+        let queue = dir.path().join("nvme0n1/queue");
+        fs::create_dir_all(&queue).expect("create queue dir");
+        fs::write(queue.join("io_poll"), "0\n").expect("write io_poll");
+
+        let mut ring_cfg = StorageRingConfig::default();
+        disable_iopoll_if_unsupported(&mut ring_cfg, Path::new("/dev/nvme0n1"), dir.path());
+
+        assert!(!ring_cfg.iopoll);
+        assert!(!ring_cfg.single_issuer);
+        assert!(!ring_cfg.defer_taskrun);
+    }
+
+    #[test]
+    fn block_disks_keep_iopoll_when_queue_support_is_unknown() {
+        let dir = tempfile::tempdir().expect("create temp sysfs");
+
+        let mut ring_cfg = StorageRingConfig::default();
+        disable_iopoll_if_unsupported(&mut ring_cfg, Path::new("/dev/nvme0n1"), dir.path());
+
+        assert!(ring_cfg.iopoll);
+        assert!(ring_cfg.single_issuer);
+        assert!(ring_cfg.defer_taskrun);
     }
 
     /// Regression for BUG 2: a `ring.progress()` error in STEADY STATE
