@@ -97,6 +97,7 @@ func TestServiceOverride_AMDGPUDevices(t *testing.T) {
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
 		BPFFSMountPath:    goalstates.BPFFSMountPath("kube1"),
 		AMDGPUDevicePaths: devices,
+		AMDSysFSPaths:     []string{"/sys/module/amdgpu", "/sys/class/kfd"},
 	}))
 
 	var overrideBuf bytes.Buffer
@@ -113,6 +114,8 @@ func TestServiceOverride_AMDGPUDevices(t *testing.T) {
 
 	require.Contains(t, nspawnBuf.String(), "AMD GPU support")
 	require.Contains(t, overrideBuf.String(), "AMD GPU support")
+	require.Contains(t, nspawnBuf.String(), "BindReadOnly=/sys/module/amdgpu")
+	require.Contains(t, nspawnBuf.String(), "BindReadOnly=/sys/class/kfd")
 }
 
 func TestPathsExcluding(t *testing.T) {

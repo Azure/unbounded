@@ -76,6 +76,7 @@ type nspawnTemplateData struct {
 	HostDevicePaths      []string
 	NvidiaGPUDevicePaths []string
 	AMDGPUDevicePaths    []string
+	AMDSysFSPaths        []string
 	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
 }
 
@@ -94,6 +95,7 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		HostDevicePaths:      hostDevicePaths,
 		NvidiaGPUDevicePaths: e.goalState.Nvidia.GPUDevicePaths,
 		AMDGPUDevicePaths:    amdGPUDevicePaths,
+		AMDSysFSPaths:        e.goalState.AMD.SysFSPaths,
 		NvidiaLibDirMounts:   e.goalState.Nvidia.LibDirMounts,
 	}
 

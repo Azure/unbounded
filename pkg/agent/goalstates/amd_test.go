@@ -52,3 +52,14 @@ func TestDiscoverAMDDevices_NoKFD(t *testing.T) {
 
 	require.Nil(t, discoverAMDDevicesAt(filepath.Join(devDir, "kfd"), driDir))
 }
+
+func TestDiscoverAMDSysFSPaths(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	existing := filepath.Join(dir, "module", "amdgpu")
+	missing := filepath.Join(dir, "class", "kfd")
+	require.NoError(t, os.MkdirAll(existing, 0o755))
+
+	require.Equal(t, []string{existing}, discoverAMDSysFSPaths([]string{existing, missing}))
+}

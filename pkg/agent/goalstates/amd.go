@@ -12,6 +12,13 @@ import (
 
 const amdKFDDevicePath = "/dev/kfd"
 
+var amdSysFSPaths = []string{
+	"/sys/module/amdgpu",
+	"/sys/class/kfd",
+	"/sys/class/drm",
+	"/sys/devices",
+}
+
 // AMDHost aggregates AMD GPU host state discovered at agent startup.
 type AMDHost struct {
 	// GPUDevicePaths lists AMD GPU device paths discovered on the host
@@ -19,12 +26,24 @@ type AMDHost struct {
 	// nspawn configuration will bind-mount these devices and grant cgroup access
 	// so the AMD Kubernetes device plugin can detect GPUs inside the machine.
 	GPUDevicePaths []string
+
+	// SysFSPaths lists host sysfs paths the AMD Kubernetes device plugin reads
+	// to discover AMD GPUs and KFD topology inside the nspawn machine.
+	SysFSPaths []string
 }
 
 // ResolveAMDHost probes the host for AMD GPU device nodes. Returns an empty
 // struct when the host does not have AMD GPUs or the driver is not loaded.
 func ResolveAMDHost() AMDHost {
-	return AMDHost{GPUDevicePaths: discoverAMDDevices()}
+	devices := discoverAMDDevices()
+	if len(devices) == 0 {
+		return AMDHost{}
+	}
+
+	return AMDHost{
+		GPUDevicePaths: devices,
+		SysFSPaths:     discoverAMDSysFSPaths(amdSysFSPaths),
+	}
 }
 
 // discoverAMDDevices scans for AMD GPU device nodes and returns them as a
@@ -58,4 +77,18 @@ func discoverAMDDevicesAt(kfdPath, driPath string) []string {
 	slices.Sort(devices)
 
 	return devices
+}
+
+func discoverAMDSysFSPaths(paths []string) []string {
+	var existing []string
+
+	for _, path := range paths {
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+
+		existing = append(existing, path)
+	}
+
+	return existing
 }
