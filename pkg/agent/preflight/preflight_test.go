@@ -61,6 +61,13 @@ func TestRunIgnoreAll(t *testing.T) {
 	assert.True(t, report.Checks[0].Ignored)
 }
 
+func TestFormattedWarningAndErrorMessages(t *testing.T) {
+	assert.Equal(t, "mode 700 is too restrictive", Warning("machine-dir", "machine directory", "mode %o is too restrictive", 0o700).Message)
+	assert.Equal(t, "status 500", Error("api-server", "cluster API server", "status %d", 500).Message)
+	assert.Equal(t, "path /var/lib/machines/kube1", ResultsWarning("machine-dir", "machine directory", "path %s", "/var/lib/machines/kube1")[0].Message)
+	assert.Equal(t, "path /var/lib/machines/kube1", ResultsError("machine-dir", "machine directory", "path %s", "/var/lib/machines/kube1")[0].Message)
+}
+
 func TestRunPreservesInputOrderWhileRunningConcurrently(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan string, 2)

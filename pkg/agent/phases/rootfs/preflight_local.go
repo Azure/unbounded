@@ -64,12 +64,10 @@ func (c nspawnMachineProvisioningChecker) Check(context.Context) []preflight.Res
 		)
 	}
 
-	if result := c.checkMachineDir(); result != nil {
-		return result
-	}
+	results := c.checkMachineDir()
 
 	if result := c.checkCreatableDir(filepath.Dir(c.gs.MachineDir), "rootfs parent directory"); result != nil {
-		return result
+		results = append(results, result...)
 	}
 
 	for _, path := range []string{
@@ -77,8 +75,12 @@ func (c nspawnMachineProvisioningChecker) Check(context.Context) []preflight.Res
 		filepath.Dir(c.gs.ServiceOverrideFile),
 	} {
 		if result := c.checkCreatableDir(path, "nspawn provisioning path"); result != nil {
-			return result
+			results = append(results, result...)
 		}
+	}
+
+	if len(results) > 0 {
+		return results
 	}
 
 	return preflight.ResultsOK(
@@ -90,6 +92,7 @@ func (c nspawnMachineProvisioningChecker) Check(context.Context) []preflight.Res
 
 func (c nspawnMachineProvisioningChecker) checkMachineDir() []preflight.Result {
 	c.log.Debug("checking machine directory", "path", c.gs.MachineDir)
+	var results []preflight.Result
 
 	info, err := c.deps.stat(c.gs.MachineDir)
 	switch {
@@ -100,23 +103,37 @@ func (c nspawnMachineProvisioningChecker) checkMachineDir() []preflight.Result {
 		return preflight.ResultsError(
 			checkNSpawnMachineProvisioningName,
 			"nspawn machine provisioning",
-			"machine directory cannot be inspected: "+c.gs.MachineDir,
+			"machine directory cannot be inspected: %s",
+			c.gs.MachineDir,
 		)
 	case !info.IsDir():
 		return preflight.ResultsError(
 			checkNSpawnMachineProvisioningName,
 			"nspawn machine provisioning",
-			"machine directory path is not a directory: "+c.gs.MachineDir,
+			"machine directory path is not a directory: %s",
+			c.gs.MachineDir,
 		)
+	}
+
+	// The nspawn machine root needs traversal permissions so dbus inside the
+	// container can operate correctly when reusing an existing rootfs.
+	if info.Mode().Perm()&0o055 != 0o055 {
+		results = append(results, preflight.Warning(
+			checkNSpawnMachineProvisioningName,
+			"nspawn machine provisioning",
+			"machine directory permissions are too restrictive: %s",
+			c.gs.MachineDir,
+		))
 	}
 
 	empty, err := isDirEmpty(c.deps.open, c.gs.MachineDir)
 	if err != nil {
-		return preflight.ResultsError(
+		return append(results, preflight.Error(
 			checkNSpawnMachineProvisioningName,
 			"nspawn machine provisioning",
-			"machine directory cannot be read: "+c.gs.MachineDir,
-		)
+			"machine directory cannot be read: %s",
+			c.gs.MachineDir,
+		))
 	}
 
 	if !empty {
@@ -128,7 +145,7 @@ func (c nspawnMachineProvisioningChecker) checkMachineDir() []preflight.Result {
 		c.log.Debug("machine directory exists and is empty", "path", c.gs.MachineDir)
 	}
 
-	return nil
+	return results
 }
 
 func (c nspawnMachineProvisioningChecker) checkCreatableDir(path, label string) []preflight.Result {
@@ -139,7 +156,9 @@ func (c nspawnMachineProvisioningChecker) checkCreatableDir(path, label string) 
 		return preflight.ResultsError(
 			checkNSpawnMachineProvisioningName,
 			"nspawn machine provisioning",
-			label+" cannot be created under: "+existing,
+			"%s cannot be created under: %s",
+			label,
+			existing,
 		)
 	}
 

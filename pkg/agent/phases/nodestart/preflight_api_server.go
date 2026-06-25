@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -62,7 +61,7 @@ func (c apiServerReachableChecker) Check(ctx context.Context) []preflight.Result
 	defer resp.Body.Close() //nolint:errcheck // best effort close
 
 	if resp.StatusCode >= http.StatusInternalServerError {
-		return preflight.ResultsError(checkAPIServerReachableName, "cluster API server", fmt.Sprintf("API server returned status %d", resp.StatusCode))
+		return preflight.ResultsError(checkAPIServerReachableName, "cluster API server", "API server returned status %d", resp.StatusCode)
 	}
 
 	return preflight.ResultsOK(checkAPIServerReachableName, "cluster API server", "API server is reachable")

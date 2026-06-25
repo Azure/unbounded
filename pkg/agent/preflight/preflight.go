@@ -110,14 +110,16 @@ func OK(name, target, message string) Result {
 	return Result{Name: name, Target: target, Severity: SeverityOK, Message: message}
 }
 
-// Warning returns a warning check result.
-func Warning(name, target, message string) Result {
-	return Result{Name: name, Target: target, Severity: SeverityWarning, Message: message}
+// Warning returns a warning check result. When args are provided, message is
+// formatted with fmt.Sprintf.
+func Warning(name, target, message string, args ...any) Result {
+	return Result{Name: name, Target: target, Severity: SeverityWarning, Message: formatMessage(message, args...)}
 }
 
-// Error returns a fatal check result.
-func Error(name, target, message string) Result {
-	return Result{Name: name, Target: target, Severity: SeverityError, Message: message}
+// Error returns a fatal check result. When args are provided, message is
+// formatted with fmt.Sprintf.
+func Error(name, target, message string, args ...any) Result {
+	return Result{Name: name, Target: target, Severity: SeverityError, Message: formatMessage(message, args...)}
 }
 
 // Results returns a result slice for concise checker returns and test fixtures.
@@ -130,14 +132,24 @@ func ResultsOK(name, target, message string) []Result {
 	return Results(OK(name, target, message))
 }
 
-// ResultsWarning returns a single warning check result as a slice.
-func ResultsWarning(name, target, message string) []Result {
-	return Results(Warning(name, target, message))
+// ResultsWarning returns a single warning check result as a slice. When args
+// are provided, message is formatted with fmt.Sprintf.
+func ResultsWarning(name, target, message string, args ...any) []Result {
+	return Results(Warning(name, target, message, args...))
 }
 
-// ResultsError returns a single fatal check result as a slice.
-func ResultsError(name, target, message string) []Result {
-	return Results(Error(name, target, message))
+// ResultsError returns a single fatal check result as a slice. When args are
+// provided, message is formatted with fmt.Sprintf.
+func ResultsError(name, target, message string, args ...any) []Result {
+	return Results(Error(name, target, message, args...))
+}
+
+func formatMessage(message string, args ...any) string {
+	if len(args) == 0 {
+		return message
+	}
+
+	return fmt.Sprintf(message, args...)
 }
 
 // HasErrors reports whether any fatal errors remain after ignore handling.
