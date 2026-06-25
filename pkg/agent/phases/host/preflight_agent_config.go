@@ -30,15 +30,9 @@ func (c agentConfigChecker) Name() string { return checkAgentConfigName }
 
 // Check validates the shared agent config without mutating it.
 func (c agentConfigChecker) Check(context.Context) []preflight.Result {
-	c.log.Debug("checking agent config")
-
 	if err := c.config.Validate(); err != nil {
-		c.log.Debug("agent config validation failed")
-
 		return preflight.ResultsError(checkAgentConfigName, "agent config", "agent config is invalid")
 	}
-
-	c.log.Debug("agent config validation passed")
 
 	return preflight.ResultsOK(checkAgentConfigName, "agent config", "agent config is valid")
 }

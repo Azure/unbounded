@@ -33,8 +33,6 @@ func (c clusterCredentialsChecker) Name() string { return checkClusterCredential
 
 // Check validates cluster credential inputs without printing credential values.
 func (c clusterCredentialsChecker) Check(context.Context) []preflight.Result {
-	c.log.Debug("checking cluster credentials", "attestationConfigured", c.attestationConfigured)
-
 	if c.config == nil {
 		return preflight.ResultsError(checkClusterCredentialsName, "cluster credentials", "agent config is missing")
 	}
@@ -52,12 +50,8 @@ func (c clusterCredentialsChecker) Check(context.Context) []preflight.Result {
 	}
 
 	if len(errs) > 0 {
-		c.log.Debug("cluster credential validation failed", "errors", len(errs))
-
 		return preflight.ResultsError(checkClusterCredentialsName, "cluster credentials", strings.Join(errs, "; "))
 	}
-
-	c.log.Debug("cluster credential validation passed")
 
 	return preflight.ResultsOK(checkClusterCredentialsName, "cluster credentials", "cluster credentials are valid")
 }

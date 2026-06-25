@@ -36,8 +36,6 @@ func CheckAPIServerReachable(log *slog.Logger, apiServer string, caCertData []by
 func (c apiServerReachableChecker) Name() string { return checkAPIServerReachableName }
 
 func (c apiServerReachableChecker) Check(ctx context.Context) []preflight.Result {
-	c.log.Debug("checking API server reachability", "target", "cluster API server", "caConfigured", len(c.caCertData) > 0)
-
 	if strings.TrimSpace(c.url) == "" {
 		return preflight.ResultsError(checkAPIServerReachableName, "cluster API server", "API server is required")
 	}
@@ -59,19 +57,13 @@ func (c apiServerReachableChecker) Check(ctx context.Context) []preflight.Result
 
 	resp, err := client.Do(req)
 	if err != nil {
-		c.log.Debug("API server reachability check failed", "target", "cluster API server")
-
 		return preflight.ResultsError(checkAPIServerReachableName, "cluster API server", "API server is not reachable")
 	}
 	defer resp.Body.Close() //nolint:errcheck // best effort close
 
 	if resp.StatusCode >= http.StatusInternalServerError {
-		c.log.Debug("API server reachability check returned server error", "target", "cluster API server", "status", resp.StatusCode)
-
 		return preflight.ResultsError(checkAPIServerReachableName, "cluster API server", fmt.Sprintf("API server returned status %d", resp.StatusCode))
 	}
-
-	c.log.Debug("API server reachability check passed", "target", "cluster API server", "status", resp.StatusCode)
 
 	return preflight.ResultsOK(checkAPIServerReachableName, "cluster API server", "API server is reachable")
 }

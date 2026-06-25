@@ -30,8 +30,6 @@ func CheckGoalState(log *slog.Logger, err error, rootFS *goalstates.RootFS) pref
 func (c goalStateChecker) Name() string { return checkGoalStateName }
 
 func (c goalStateChecker) Check(context.Context) []preflight.Result {
-	c.log.Debug("checking goal state resolution")
-
 	if c.err != nil || c.rootFS == nil {
 		return preflight.ResultsError(checkGoalStateName, "goal state", "goal state could not be resolved")
 	}
