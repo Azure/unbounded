@@ -213,6 +213,10 @@ def scp_cmd(src: str, dst: str) -> subprocess.CompletedProcess[str]:
     return run(["scp", *SSH_OPTS, src, dst])
 
 
+def scp_from_vm(src: str, dst: Path) -> subprocess.CompletedProcess[str]:
+    return run(["scp", *SSH_OPTS, f"{SSH_TARGET}:{src}", str(dst)])
+
+
 def kubectl(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
     return run([KUBECTL, *args], **kw)
 
@@ -1639,6 +1643,21 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     bootstrap_script_path.chmod(0o600)
     log(f"Bootstrap script written to {bootstrap_script_path}")
 
+    bootstrap_preflight_script = bootstrap_script.replace(
+        'echo "Running unbounded-agent start..."\n"${AGENT_BIN}" start ${_START_ARGS}',
+        textwrap.dedent("""\
+        echo "Running unbounded-agent preflight..."
+        "${AGENT_BIN}" preflight ${_START_ARGS} --output text | tee /tmp/unbounded-agent-preflight.txt
+        "${AGENT_BIN}" preflight ${_START_ARGS} --output json > /tmp/unbounded-agent-preflight.json
+        echo "Running unbounded-agent start..."
+        "${AGENT_BIN}" start ${_START_ARGS}"""),
+    )
+    if bootstrap_preflight_script == bootstrap_script:
+        die("failed to inject unbounded-agent preflight into bootstrap script")
+
+    bootstrap_script = bootstrap_preflight_script
+    bootstrap_script_path.write_text(bootstrap_script)
+
     # Wait for cloud-init and verify connectivity
     log("Waiting for cloud-init to complete on VM...")
     subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, "sudo cloud-init status --wait"],
@@ -1663,6 +1682,10 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         "ssh", *SSH_OPTS, "-o", "ServerAliveInterval=30", SSH_TARGET,
         f"sudo {env_prefix} /tmp/bootstrap.sh",
     ])
+
+    log("Copying preflight reports from VM...")
+    scp_from_vm("/tmp/unbounded-agent-preflight.txt", VM_DIR / "unbounded-agent-preflight.txt")
+    scp_from_vm("/tmp/unbounded-agent-preflight.json", VM_DIR / "unbounded-agent-preflight.json")
 
 
 # ---------------------------------------------------------------------------
@@ -2880,6 +2903,21 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
         "-i", str(vm_dir / "ssh" / "id_ed25519"),
     ]
     ssh_target = f"{VM_SSH_USER}@{vm_ip}"
+
+    for name in ("unbounded-agent-preflight.txt", "unbounded-agent-preflight.json"):
+        src = vm_dir / name
+        if src.exists():
+            shutil.copyfile(src, logs_dir / f"{prefix}{name}")
+
+    for name in ("unbounded-agent-preflight.txt", "unbounded-agent-preflight.json"):
+        result = subprocess.run(
+            ["scp", *ssh_opts, f"{ssh_target}:/tmp/{name}", str(logs_dir / f"{prefix}{name}")],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode == 0:
+            diag(f"Collected {name} from VM")
 
     def ssh_log(name: str, command: str) -> None:
         _write_command_log(logs_dir / f"{prefix}{name}", ["ssh", *ssh_opts, ssh_target, command])
