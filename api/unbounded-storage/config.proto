@@ -8,8 +8,8 @@ package unbounded.storage.config;
 option go_package = "github.com/Azure/unbounded/api/unbounded-storage;storageconfig";
 
 message Config {
-  reserved 6;
-  reserved "neighborhoods";
+  reserved 6, 10;
+  reserved "neighborhoods", "local_tags";
 
   // Operator-assigned opaque version tracked so operators can confirm which config has been applied. 0 means unversioned.
   uint64 version = 1;
@@ -25,12 +25,10 @@ message Config {
   // Number of deterministic finger-table entries to derive per peer. Defaults to 100 when unset.
   optional uint32 fingers_per_node = 8;
 
-  // Local node id on the P2P ring and process-wide fabric peer id; required when
-  // peers or a routing plan are configured, and must not match any peer id.
-  optional uint64 local_node_id = 9;
-
-  // Local tags used by placement-aware planning.
-  repeated string local_tags = 10;
+  // Name of this process in the `peers` roster. Required when peers or a
+  // routing plan are configured. The internal ring and fabric ids are derived
+  // from this peer name and are startup-fixed.
+  string self = 9;
 
   // Precomputed routing table for this process. When set, `peers` can be
   // sparse, containing only this process's routing neighbors.
@@ -41,24 +39,25 @@ message Config {
 }
 
 // A precomputed routing table for a single node, produced by a
-// global-view planner. All ids reference `PeerSpec.id` values in the
-// `peers` list (each must be present so a fabric connection exists).
-// Ring positions are derived from ids, and tags do not affect runtime
-// routing, so only ids are carried here.
+// global-view planner. All names reference `PeerSpec.name` values in the
+// `peers` list (each must be present so a fabric connection exists). Ring
+// positions are derived from names, and tags do not affect runtime routing, so
+// only names are carried here.
 message RoutingPlan {
-  // Peer ids selected for this routing plan.
-  repeated uint64 fingers = 1;
+  // Peer names selected for this routing plan.
+  repeated string fingers = 1;
 
-  // Peer id of the nearest-forward neighbor on the ring.
-  optional uint64 successor = 2;
+  // Peer name of the nearest-forward neighbor on the ring.
+  optional string successor = 2;
 
-  // Peer id of the nearest-backward neighbor on the ring.
-  optional uint64 predecessor = 3;
+  // Peer name of the nearest-backward neighbor on the ring.
+  optional string predecessor = 3;
 }
 
 message PeerSpec {
-  // Process-wide fabric peer id, also used for ring position and route references.
-  uint64 id = 1;
+  // Stable peer name. The process-wide fabric peer id, ring position, and route
+  // references are derived from this name.
+  string name = 1;
 
   // Peer tags used by placement-aware planning.
   repeated string tags = 2;

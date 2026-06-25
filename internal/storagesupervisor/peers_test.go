@@ -42,15 +42,6 @@ func nodeWithAnnotations(name, ring, ip string, annotations map[string]string) *
 	return n
 }
 
-func TestNodeIDStableAndNonZero(t *testing.T) {
-	// Deterministic across calls and distinct for distinct names.
-	assert.Equal(t, nodeID("node-a"), nodeID("node-a"))
-	assert.NotEqual(t, nodeID("node-a"), nodeID("node-b"))
-	// Never zero (zero is the daemon's peerless sentinel).
-	assert.NotZero(t, nodeID(""))
-	assert.NotZero(t, nodeID("node-a"))
-}
-
 func TestParseFabricPort(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -89,23 +80,23 @@ func TestComputeRingMembership(t *testing.T) {
 	ring := computeRing(nodes, "self", testRingLabel, 9000)
 
 	require.True(t, ring.active)
-	assert.Equal(t, nodeID("self"), ring.localNodeID)
+	assert.Equal(t, "self", ring.selfName)
 	assert.Equal(t, "10.0.0.1:9000", ring.selfListenAddr)
 
-	require.Len(t, ring.peers, 2)
-	// Peers are sorted by id; verify both red peers are present with their
-	// hashed ids and InternalIP:port sockets, and self is excluded.
-	got := map[uint64]string{}
+	require.Len(t, ring.peers, 3)
+	// Peers are sorted by name; verify all red peers are present with their
+	// InternalIP:port sockets, including self.
+	got := map[string]string{}
 	for _, p := range ring.peers {
-		got[p.GetId()] = p.GetTcp().GetAddr()
+		got[p.GetName()] = p.GetTcp().GetAddr()
 	}
 
-	assert.Equal(t, "10.0.0.2:9000", got[nodeID("peer-a")])
-	assert.Equal(t, "10.0.0.3:9000", got[nodeID("peer-b")])
-	assert.NotContains(t, got, ring.localNodeID)
+	assert.Equal(t, "10.0.0.1:9000", got["self"])
+	assert.Equal(t, "10.0.0.2:9000", got["peer-a"])
+	assert.Equal(t, "10.0.0.3:9000", got["peer-b"])
 }
 
-func TestComputeRingPeersSortedByID(t *testing.T) {
+func TestComputeRingPeersSortedByName(t *testing.T) {
 	nodes := []*corev1.Node{
 		node("self", "red", "10.0.0.1"),
 		node("zeta", "red", "10.0.0.2"),
@@ -114,8 +105,10 @@ func TestComputeRingPeersSortedByID(t *testing.T) {
 
 	ring := computeRing(nodes, "self", testRingLabel, 9000)
 
-	require.Len(t, ring.peers, 2)
-	assert.Less(t, ring.peers[0].GetId(), ring.peers[1].GetId())
+	require.Len(t, ring.peers, 3)
+	assert.Equal(t, "alpha", ring.peers[0].GetName())
+	assert.Equal(t, "self", ring.peers[1].GetName())
+	assert.Equal(t, "zeta", ring.peers[2].GetName())
 }
 
 func TestComputeRingSelfNotLabelled(t *testing.T) {
@@ -160,20 +153,22 @@ func TestComputeRingSkipsPeerWithoutInternalIP(t *testing.T) {
 	ring := computeRing(nodes, "self", testRingLabel, 9000)
 
 	require.True(t, ring.active)
-	require.Len(t, ring.peers, 1)
-	assert.Equal(t, nodeID("peer-a"), ring.peers[0].GetId())
+	require.Len(t, ring.peers, 2)
+	assert.Equal(t, "peer-a", ring.peers[0].GetName())
+	assert.Equal(t, "self", ring.peers[1].GetName())
 }
 
 func TestComputeRingSingleMember(t *testing.T) {
 	// A lone ring member still activates so its fabric addr is made routable,
-	// with an empty peer set.
+	// with self in the peer roster.
 	nodes := []*corev1.Node{node("self", "red", "10.0.0.1")}
 
 	ring := computeRing(nodes, "self", testRingLabel, 9000)
 
 	require.True(t, ring.active)
 	assert.Equal(t, "10.0.0.1:9000", ring.selfListenAddr)
-	assert.Empty(t, ring.peers)
+	require.Len(t, ring.peers, 1)
+	assert.Equal(t, "self", ring.peers[0].GetName())
 }
 
 func TestComputeRDMARingMembership(t *testing.T) {
@@ -201,28 +196,32 @@ func TestComputeRDMARingMembership(t *testing.T) {
 	ring := computeRDMARing(nodes, "self", testRingLabel)
 
 	require.True(t, ring.active)
-	assert.Equal(t, nodeID("self"), ring.localNodeID)
+	assert.Equal(t, "self", ring.selfName)
 	assert.Empty(t, ring.selfListenAddr)
-	require.Len(t, ring.peers, 2)
+	require.Len(t, ring.peers, 3)
 
-	got := map[uint64]string{}
+	got := map[string]string{}
 	for _, p := range ring.peers {
-		got[p.GetId()] = p.GetRdma().GetAddr()
+		got[p.GetName()] = p.GetRdma().GetAddr()
 	}
 
-	assert.Equal(t, "hex:a", got[nodeID("peer-a")])
-	assert.Equal(t, "hex:b1", got[nodeID("peer-b")])
-	assert.NotContains(t, got, ring.localNodeID)
+	assert.Equal(t, "hex:self", got["self"])
+	assert.Equal(t, "hex:a", got["peer-a"])
+	assert.Equal(t, "hex:b1", got["peer-b"])
 }
 
 func TestComputeRDMARingSingleMember(t *testing.T) {
-	nodes := []*corev1.Node{node("self", "red", "")}
+	nodes := []*corev1.Node{nodeWithAnnotations("self", "red", "", map[string]string{
+		storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:self"]}]}`,
+	})}
 
 	ring := computeRDMARing(nodes, "self", testRingLabel)
 
 	require.True(t, ring.active)
-	assert.Equal(t, nodeID("self"), ring.localNodeID)
-	assert.Empty(t, ring.peers)
+	assert.Equal(t, "self", ring.selfName)
+	require.Len(t, ring.peers, 1)
+	assert.Equal(t, "self", ring.peers[0].GetName())
+	assert.Equal(t, "hex:self", ring.peers[0].GetRdma().GetAddr())
 }
 
 func TestNewPeerWatcherDisabledWithoutNodeName(t *testing.T) {
@@ -280,9 +279,11 @@ func TestPeerWatcherSnapshotFromInformer(t *testing.T) {
 
 	require.True(t, ring.active)
 	assert.Equal(t, "10.0.0.1:9000", ring.selfListenAddr)
-	require.Len(t, ring.peers, 1)
-	assert.Equal(t, nodeID("peer-a"), ring.peers[0].GetId())
+	require.Len(t, ring.peers, 2)
+	assert.Equal(t, "peer-a", ring.peers[0].GetName())
 	assert.Equal(t, "10.0.0.2:9000", ring.peers[0].GetTcp().GetAddr())
+	assert.Equal(t, "self", ring.peers[1].GetName())
+	assert.Equal(t, "10.0.0.1:9000", ring.peers[1].GetTcp().GetAddr())
 }
 
 func TestPeerWatcherSnapshotRdmaFromInformer(t *testing.T) {
@@ -311,8 +312,11 @@ func TestPeerWatcherSnapshotRdmaFromInformer(t *testing.T) {
 
 	state := w.snapshotRdma()
 	require.True(t, state.ring.active)
-	require.Len(t, state.ring.peers, 1)
+	require.Len(t, state.ring.peers, 2)
+	assert.Equal(t, "peer-a", state.ring.peers[0].GetName())
 	assert.Equal(t, "hex:a", state.ring.peers[0].GetRdma().GetAddr())
+	assert.Equal(t, "self", state.ring.peers[1].GetName())
+	assert.Equal(t, "hex:self", state.ring.peers[1].GetRdma().GetAddr())
 }
 
 func TestPeerWatcherSnapshotIncludesSelfAnnotations(t *testing.T) {

@@ -34,7 +34,7 @@ use unbounded_storage::config::{
     self, ApplyError, Config, ConfigApplyTarget, ConfigDiff, ShardControlGroup,
 };
 use unbounded_storage::fabric::PeerId;
-use unbounded_storage::p2p::RouteTableHandle;
+use unbounded_storage::p2p::{NodeId, RouteTableHandle};
 use unbounded_storage::runtime::{JoinHandle, Threading, WorkerIdx};
 use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{CacheDirectorySet, DiskRegistrySet, UringDiskTarget};
@@ -347,11 +347,7 @@ pub fn spawn_shard_layer(
 }
 
 fn local_self_peer(projection: &config::RuntimeGraph) -> Result<PeerId, String> {
-    Ok(projection
-        .mesh
-        .local_node_id
-        .map(PeerId)
-        .unwrap_or(PeerId(0)))
+    Ok(projection.mesh.self_peer_id)
 }
 
 /// Retire a shard layer: signal its shards to exit, then join every
@@ -431,6 +427,12 @@ impl ProcessApplyTarget {
 
 impl ConfigApplyTarget for ProcessApplyTarget {
     fn apply_in_place(&mut self, new: &Arc<Config>, diff: &ConfigDiff) -> Result<(), ApplyError> {
+        if diff.requires_restart() {
+            return Err(ApplyError::Target(
+                "self peer identity changed; restart required".to_string(),
+            ));
+        }
+
         let projection = config::runtime_projection(new)
             .map_err(|e| ApplyError::Target(format!("config projection failed: {e}")))?;
 
@@ -494,14 +496,16 @@ mod tests {
 
     use super::*;
 
-    fn graph_with_local_id(local_node_id: Option<u64>) -> config::RuntimeGraph {
+    fn graph_with_self_peer(self_peer_id: PeerId) -> config::RuntimeGraph {
         config::RuntimeGraph {
             disks: Vec::new(),
             caches: HashMap::new(),
             mesh: config::RuntimeMesh {
                 fingers_per_node: 100,
-                local_node_id,
-                local_tags: Vec::new(),
+                self_name: None,
+                self_node_id: NodeId(self_peer_id.0),
+                self_peer_id,
+                self_tags: Vec::new(),
                 routing_plan: None,
                 peers: Vec::new(),
             },
@@ -510,15 +514,8 @@ mod tests {
     }
 
     #[test]
-    fn local_self_peer_is_zero_without_local_node_id() {
-        let graph = graph_with_local_id(None);
-
-        assert_eq!(local_self_peer(&graph).unwrap(), PeerId(0));
-    }
-
-    #[test]
-    fn local_self_peer_uses_raw_node_id() {
-        let graph = graph_with_local_id(Some(7));
+    fn local_self_peer_uses_projection_identity() {
+        let graph = graph_with_self_peer(PeerId(7));
 
         assert_eq!(local_self_peer(&graph).unwrap(), PeerId(7));
     }

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::schema::{Config, DiskSpec, PeerSpec, RoutingPlan};
 use crate::fabric::PeerId;
-use crate::p2p::NodeId;
+use crate::p2p::{NodeId, node_id_from_name};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFrontendBinding {
@@ -20,8 +20,10 @@ pub struct ResolvedFrontendBinding {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeMesh {
     pub fingers_per_node: u32,
-    pub local_node_id: Option<u64>,
-    pub local_tags: Vec<String>,
+    pub self_name: Option<String>,
+    pub self_node_id: NodeId,
+    pub self_peer_id: PeerId,
+    pub self_tags: Vec<String>,
     pub routing_plan: Option<RoutingPlan>,
     pub peers: Vec<RuntimePeer>,
 }
@@ -34,6 +36,7 @@ pub struct RuntimeCache {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimePeer {
+    pub name: String,
     pub node_id: NodeId,
     pub fabric_peer_id: PeerId,
     pub spec: PeerSpec,
@@ -72,7 +75,7 @@ pub fn validate_binding_graph(config: &Config) -> Result<(), String> {
             ));
         }
     }
-    validate_peer_ids(config)?;
+    validate_peer_names(config)?;
     for f in &config.frontends {
         if !backends.contains_key(f.source.as_str()) && !caches.contains_key(f.source.as_str()) {
             return Err(format!(
@@ -85,19 +88,31 @@ pub fn validate_binding_graph(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_peer_ids(config: &Config) -> Result<(), String> {
-    let mut seen = HashSet::new();
+fn validate_peer_names(config: &Config) -> Result<(), String> {
+    let mut names = HashSet::new();
+    let mut derived_ids = HashMap::new();
+    let mut self_seen = config.self_.is_empty();
 
     for peer in &config.peers {
-        if !seen.insert(peer.id) {
-            return Err(format!("peer {} is duplicated", peer.id));
+        if peer.name.is_empty() {
+            return Err("peer name must not be empty".to_string());
         }
-        if Some(peer.id) == config.local_node_id {
+        if !names.insert(peer.name.as_str()) {
+            return Err(format!("peer {:?} is duplicated", peer.name));
+        }
+        if peer.name == config.self_ {
+            self_seen = true;
+        }
+        let node_id = node_id_from_name(&peer.name);
+        if let Some(prev) = derived_ids.insert(node_id, peer.name.as_str()) {
             return Err(format!(
-                "peer {} collides with process local_node_id {}",
-                peer.id, peer.id
+                "peer names {prev:?} and {:?} derive the same node id {}",
+                peer.name, node_id.0
             ));
         }
+    }
+    if !self_seen {
+        return Err(format!("self peer {:?} is not present in peers", config.self_));
     }
 
     Ok(())
@@ -146,13 +161,31 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
         })
         .collect();
 
+    let self_peer = config
+        .peers
+        .iter()
+        .find(|peer| !config.self_.is_empty() && peer.name == config.self_);
+    let self_node_id = self_peer
+        .map(|peer| node_id_from_name(&peer.name))
+        .unwrap_or(NodeId(0));
+    let self_peer_id = PeerId(self_node_id.0);
+    let self_tags = self_peer
+        .map(|peer| peer.tags.clone())
+        .unwrap_or_default();
+    let self_name = (!config.self_.is_empty()).then(|| config.self_.clone());
+
     let peers = config
         .peers
         .iter()
-        .map(|peer| RuntimePeer {
-            node_id: NodeId(peer.id),
-            fabric_peer_id: PeerId(peer.id),
-            spec: peer.clone(),
+        .filter(|peer| Some(peer.name.as_str()) != self_name.as_deref())
+        .map(|peer| {
+            let node_id = node_id_from_name(&peer.name);
+            RuntimePeer {
+                name: peer.name.clone(),
+                node_id,
+                fabric_peer_id: PeerId(node_id.0),
+                spec: peer.clone(),
+            }
         })
         .collect();
 
@@ -161,8 +194,10 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
         caches,
         mesh: RuntimeMesh {
             fingers_per_node: config.fingers_per_node.unwrap_or(100).max(1),
-            local_node_id: config.local_node_id,
-            local_tags: config.local_tags.clone(),
+            self_name,
+            self_node_id,
+            self_peer_id,
+            self_tags,
             routing_plan: config.routing_plan.clone(),
             peers,
         },
@@ -249,9 +284,9 @@ mod tests {
         }
     }
 
-    fn tcp_peer(id: u64, addr: &str) -> PeerSpec {
+    fn tcp_peer(name: &str, addr: &str) -> PeerSpec {
         PeerSpec {
-            id,
+            name: name.to_string(),
             tags: Vec::new(),
             config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
                 addr: addr.to_string(),
@@ -259,9 +294,9 @@ mod tests {
         }
     }
 
-    fn rdma_peer(id: u64, addr: &str) -> PeerSpec {
+    fn rdma_peer(name: &str, addr: &str) -> PeerSpec {
         PeerSpec {
-            id,
+            name: name.to_string(),
             tags: Vec::new(),
             config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
                 addr: addr.to_string(),
@@ -285,54 +320,57 @@ mod tests {
     }
 
     #[test]
-    fn runtime_projection_accepts_unique_rdma_peer_ids() {
+    fn runtime_projection_accepts_unique_rdma_peer_names() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
-        cfg.peers.push(rdma_peer(7, "hex:00"));
-        cfg.peers.push(rdma_peer(8, "hex:01"));
+        cfg.self_ = "node-a".to_string();
+        cfg.peers.push(rdma_peer("node-a", "hex:00"));
+        cfg.peers.push(rdma_peer("node-b", "hex:01"));
 
         let graph = runtime_projection(&cfg).unwrap();
         let peers = &graph.mesh.peers;
 
-        assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].node_id, NodeId(7));
-        assert_eq!(peers[1].node_id, NodeId(8));
-        assert_eq!(peers[0].fabric_peer_id, PeerId(7));
-        assert_eq!(peers[1].fabric_peer_id, PeerId(8));
+        assert_eq!(graph.mesh.self_name.as_deref(), Some("node-a"));
+        assert_eq!(graph.mesh.self_node_id, node_id_from_name("node-a"));
+        assert_eq!(graph.mesh.self_peer_id, PeerId(node_id_from_name("node-a").0));
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "node-b");
+        assert_eq!(peers[0].node_id, node_id_from_name("node-b"));
+        assert_eq!(peers[0].fabric_peer_id, PeerId(node_id_from_name("node-b").0));
     }
 
     #[test]
-    fn runtime_projection_rejects_peer_colliding_with_process_local_node_id() {
+    fn runtime_projection_rejects_missing_self_peer() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
-        cfg.local_node_id = Some(7);
-        cfg.peers.push(tcp_peer(7, "127.0.0.1:7"));
+        cfg.self_ = "node-a".to_string();
+        cfg.peers.push(tcp_peer("node-b", "127.0.0.1:7"));
 
         let err = runtime_projection(&cfg).unwrap_err();
 
-        assert!(err.contains("collides with process local_node_id"), "{err}");
+        assert!(err.contains("self peer"), "{err}");
     }
 
     #[test]
-    fn runtime_projection_rejects_duplicate_peer_ids() {
+    fn runtime_projection_rejects_duplicate_peer_names() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
-        cfg.peers.push(tcp_peer(7, "127.0.0.1:1"));
-        cfg.peers.push(tcp_peer(7, "127.0.0.1:2"));
+        cfg.peers.push(tcp_peer("node-a", "127.0.0.1:1"));
+        cfg.peers.push(tcp_peer("node-a", "127.0.0.1:2"));
 
         let err = runtime_projection(&cfg).unwrap_err();
-        assert!(err.contains("peer 7 is duplicated"), "{err}");
+        assert!(err.contains("peer \"node-a\" is duplicated"), "{err}");
     }
 
     #[test]
-    fn runtime_projection_rejects_duplicate_rdma_peer_ids() {
+    fn runtime_projection_rejects_duplicate_rdma_peer_names() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
-        cfg.peers.push(rdma_peer(7, "hex:00"));
-        cfg.peers.push(rdma_peer(7, "hex:01"));
+        cfg.peers.push(rdma_peer("node-a", "hex:00"));
+        cfg.peers.push(rdma_peer("node-a", "hex:01"));
 
         let err = runtime_projection(&cfg).unwrap_err();
-        assert!(err.contains("peer 7 is duplicated"), "{err}");
+        assert!(err.contains("peer \"node-a\" is duplicated"), "{err}");
     }
 
     fn assert_binding(

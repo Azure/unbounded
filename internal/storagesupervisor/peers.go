@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 	"net"
 	"sort"
@@ -40,14 +39,13 @@ type ringState struct {
 	// the renderer leaves the per-node sections untouched and passes the
 	// ConfigMap's fabric addr through verbatim.
 	active bool
-	// localNodeID is this node's stable id (hash of its node name), written to
-	// neighborhoods[].local_node_id.
-	localNodeID uint64
+	// selfName is this node's stable peer name, written to self.
+	selfName string
 	// selfListenAddr is this node's own routable fabric bind, "<internalIP>:
 	// <port>", overriding the ConfigMap's fabric addr so the tcp provider
 	// binds an address peers can actually dial.
 	selfListenAddr string
-	// peers is the other ring members as daemon PeerSpecs, sorted by id.
+	// peers is the ring roster as daemon PeerSpecs, including self, sorted by name.
 	peers []*storageconfig.PeerSpec
 }
 
@@ -177,8 +175,8 @@ func (w *peerWatcher) snapshot(port int, portOK bool) renderState {
 
 // snapshotRdma computes render state for RDMA fabrics. Local bind addresses are
 // owned by the daemon's auto-RDMA/explicit-RDMA startup config, so unlike TCP
-// this does not override startup.fabric; it only injects local_node_id and peer
-// RDMA addresses published by other supervisors.
+// this does not override startup.fabric; it only injects self and peer RDMA
+// addresses published by other supervisors.
 func (w *peerWatcher) snapshotRdma() renderState {
 	objs := w.informer.GetStore().List()
 	nodes := nodesFromInformerObjects(objs)
@@ -207,10 +205,8 @@ func nodesFromInformerObjects(objs []any) []*corev1.Node {
 // informer plumbing so the membership logic is unit-testable.
 //
 // Membership is by equal label value: every node whose ring label matches this
-// node's becomes a peer, this node excluded. Ids are a stable hash of the node
-// name so a node keeps the same id across membership churn. A peer with no
-// usable InternalIP, or whose id collides with this node or an already-emitted
-// peer, is skipped and logged rather than corrupting the set.
+// node's becomes a named peer, including this node. A peer with no usable
+// InternalIP is skipped and logged rather than corrupting the set.
 func computeRing(nodes []*corev1.Node, selfName, ringLabel string, port int) ringState {
 	var self *corev1.Node
 
@@ -241,22 +237,19 @@ func computeRing(nodes []*corev1.Node, selfName, ringLabel string, port int) rin
 		return ringState{}
 	}
 
-	localID := nodeID(selfName)
-
 	ring := ringState{
 		active:         true,
-		localNodeID:    localID,
+		selfName:       selfName,
 		selfListenAddr: net.JoinHostPort(selfIP, strconv.Itoa(port)),
 	}
 
-	seen := map[uint64]string{localID: selfName}
+	seen := map[string]struct{}{}
 
 	for _, n := range nodes {
-		if n.Name == selfName {
+		if n.Labels[ringLabel] != ringValue {
 			continue
 		}
-
-		if n.Labels[ringLabel] != ringValue {
+		if _, dup := seen[n.Name]; dup {
 			continue
 		}
 
@@ -267,33 +260,25 @@ func computeRing(nodes []*corev1.Node, selfName, ringLabel string, port int) rin
 			continue
 		}
 
-		id := nodeID(n.Name)
-		if other, dup := seen[id]; dup {
-			slog.Warn("skipping storage ring peer: node id collision",
-				"peer", n.Name, "collides_with", other, "id", id)
-
-			continue
-		}
-
-		seen[id] = n.Name
+		seen[n.Name] = struct{}{}
 
 		ring.peers = append(ring.peers, &storageconfig.PeerSpec{
-			Id: id,
+			Name: n.Name,
 			Config: &storageconfig.PeerSpec_Tcp{
 				Tcp: &storageconfig.TcpPeerConfig{Addr: net.JoinHostPort(ip, strconv.Itoa(port))},
 			},
 		})
 	}
 
-	sort.Slice(ring.peers, func(i, j int) bool { return ring.peers[i].Id < ring.peers[j].Id })
+	sort.Slice(ring.peers, func(i, j int) bool { return ring.peers[i].Name < ring.peers[j].Name })
 
 	return ring
 }
 
-// computeRDMARing mirrors computeRing's label-membership and stable-id rules,
-// but peers are dialed through their published RDMA HCA inventory annotation.
-// The daemon config currently models one RDMA address per peer id, so discovery
-// chooses the first address from each peer's full HCA inventory.
+// computeRDMARing mirrors computeRing's label-membership rules, but peers are
+// dialed through their published RDMA HCA inventory annotation. The daemon
+// config currently models one RDMA address per peer name, so discovery chooses
+// the first address from each peer's full HCA inventory.
 func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState {
 	var self *corev1.Node
 
@@ -316,19 +301,29 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 		return ringState{}
 	}
 
-	localID := nodeID(selfName)
-	ring := ringState{
-		active:      true,
-		localNodeID: localID,
+	selfAddr, err := firstRdmaInventoryAddr(self.Annotations[storageRdmaHcasAnnotation])
+	if err != nil {
+		slog.Warn("storage ring inactive: this node has invalid rdma inventory", "node", selfName, "ring", ringValue, "error", err)
+
+		return ringState{}
 	}
-	seen := map[uint64]string{localID: selfName}
+	if selfAddr == "" {
+		slog.Warn("storage ring inactive: this node has no rdma address", "node", selfName, "ring", ringValue)
+
+		return ringState{}
+	}
+
+	ring := ringState{
+		active:   true,
+		selfName: selfName,
+	}
+	seen := map[string]struct{}{}
 
 	for _, n := range nodes {
-		if n.Name == selfName {
+		if n.Labels[ringLabel] != ringValue {
 			continue
 		}
-
-		if n.Labels[ringLabel] != ringValue {
+		if _, dup := seen[n.Name]; dup {
 			continue
 		}
 
@@ -345,24 +340,16 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 			continue
 		}
 
-		id := nodeID(n.Name)
-		if other, dup := seen[id]; dup {
-			slog.Warn("skipping storage ring peer: node id collision",
-				"peer", n.Name, "collides_with", other, "id", id)
-
-			continue
-		}
-
-		seen[id] = n.Name
+		seen[n.Name] = struct{}{}
 		ring.peers = append(ring.peers, &storageconfig.PeerSpec{
-			Id: id,
+			Name: n.Name,
 			Config: &storageconfig.PeerSpec_Rdma{
 				Rdma: &storageconfig.RdmaPeerConfig{Addr: addr},
 			},
 		})
 	}
 
-	sort.Slice(ring.peers, func(i, j int) bool { return ring.peers[i].Id < ring.peers[j].Id })
+	sort.Slice(ring.peers, func(i, j int) bool { return ring.peers[i].Name < ring.peers[j].Name })
 
 	return ring
 }
@@ -386,24 +373,6 @@ func selfAnnotations(nodes []*corev1.Node, selfName string) map[string]string {
 	}
 
 	return nil
-}
-
-// nodeID derives a node's stable storage id from its name via 64-bit FNV-1a.
-// The id doubles as the daemon's NodeId and PeerId, so it must be stable
-// across membership changes (a hash of the immutable node name is) and
-// non-zero (zero is the daemon's "no local id / single peerless node"
-// sentinel), which the +1 guard ensures without weakening uniqueness in
-// practice.
-func nodeID(name string) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(name)) //nolint:errcheck // hash.Write never errors.
-
-	id := h.Sum64()
-	if id == 0 {
-		id = 1
-	}
-
-	return id
 }
 
 // internalIP returns the node's first InternalIP address, or "" when none is

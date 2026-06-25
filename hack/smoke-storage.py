@@ -668,8 +668,8 @@ def write_config(
     path: Path,
     *,
     kind: str,
-    local_id: int,
-    peer_id: int,
+    self_name: str,
+    peer_name: str,
     peer_addr: str,
     disk_path: Path,
     origin_addr: str,
@@ -700,7 +700,7 @@ def write_config(
         tls_lines += "insecure_skip_verify = true\n"
     path.write_text(
         f"""\
-local_node_id = {local_id}
+self = "{self_name}"
 
 [[backends]]
 name = "origin"
@@ -711,7 +711,13 @@ stripe_size_bytes = {STRIPE_SIZE}
 {tls_lines}
 
 [[peers]]
-id = {peer_id}
+name = "{self_name}"
+
+[peers.config.tcp]
+addr = "{fabric_addr}"
+
+[[peers]]
+name = "{peer_name}"
 
 [peers.config.tcp]
 addr = "{peer_addr}"
@@ -919,8 +925,8 @@ def run_scenario(
     write_config(
         cfg1,
         kind=kind,
-        local_id=1,
-        peer_id=2,
+        self_name="node-a",
+        peer_name="node-b",
         peer_addr=f"127.0.0.1:{fab_b}",
         disk_path=TMPDIR / f"{name}-node1.disk",
         origin_addr=origin_addr,
@@ -933,8 +939,8 @@ def run_scenario(
     write_config(
         cfg2,
         kind=kind,
-        local_id=2,
-        peer_id=1,
+        self_name="node-b",
+        peer_name="node-a",
         peer_addr=f"127.0.0.1:{fab_a}",
         disk_path=TMPDIR / f"{name}-node2.disk",
         origin_addr=origin_addr,

@@ -36,11 +36,10 @@ type Config struct {
 	Disks     []*DiskSpec     `protobuf:"bytes,7,rep,name=disks,proto3" json:"disks,omitempty"`
 	// Number of deterministic finger-table entries to derive per peer. Defaults to 100 when unset.
 	FingersPerNode *uint32 `protobuf:"varint,8,opt,name=fingers_per_node,json=fingersPerNode,proto3,oneof" json:"fingers_per_node,omitempty"`
-	// Local node id on the P2P ring and process-wide fabric peer id; required when
-	// peers or a routing plan are configured, and must not match any peer id.
-	LocalNodeId *uint64 `protobuf:"varint,9,opt,name=local_node_id,json=localNodeId,proto3,oneof" json:"local_node_id,omitempty"`
-	// Local tags used by placement-aware planning.
-	LocalTags []string `protobuf:"bytes,10,rep,name=local_tags,json=localTags,proto3" json:"local_tags,omitempty"`
+	// Name of this process in the `peers` roster. Required when peers or a
+	// routing plan are configured. The internal ring and fabric ids are derived
+	// from this peer name and are startup-fixed.
+	Self string `protobuf:"bytes,9,opt,name=self,proto3" json:"self,omitempty"`
 	// Precomputed routing table for this process. When set, `peers` can be
 	// sparse, containing only this process's routing neighbors.
 	RoutingPlan *RoutingPlan `protobuf:"bytes,11,opt,name=routing_plan,json=routingPlan,proto3,oneof" json:"routing_plan,omitempty"`
@@ -129,18 +128,11 @@ func (x *Config) GetFingersPerNode() uint32 {
 	return 0
 }
 
-func (x *Config) GetLocalNodeId() uint64 {
-	if x != nil && x.LocalNodeId != nil {
-		return *x.LocalNodeId
-	}
-	return 0
-}
-
-func (x *Config) GetLocalTags() []string {
+func (x *Config) GetSelf() string {
 	if x != nil {
-		return x.LocalTags
+		return x.Self
 	}
-	return nil
+	return ""
 }
 
 func (x *Config) GetRoutingPlan() *RoutingPlan {
@@ -158,18 +150,18 @@ func (x *Config) GetPeers() []*PeerSpec {
 }
 
 // A precomputed routing table for a single node, produced by a
-// global-view planner. All ids reference `PeerSpec.id` values in the
-// `peers` list (each must be present so a fabric connection exists).
-// Ring positions are derived from ids, and tags do not affect runtime
-// routing, so only ids are carried here.
+// global-view planner. All names reference `PeerSpec.name` values in the
+// `peers` list (each must be present so a fabric connection exists). Ring
+// positions are derived from names, and tags do not affect runtime routing, so
+// only names are carried here.
 type RoutingPlan struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Peer ids selected for this routing plan.
-	Fingers []uint64 `protobuf:"varint,1,rep,packed,name=fingers,proto3" json:"fingers,omitempty"`
-	// Peer id of the nearest-forward neighbor on the ring.
-	Successor *uint64 `protobuf:"varint,2,opt,name=successor,proto3,oneof" json:"successor,omitempty"`
-	// Peer id of the nearest-backward neighbor on the ring.
-	Predecessor   *uint64 `protobuf:"varint,3,opt,name=predecessor,proto3,oneof" json:"predecessor,omitempty"`
+	// Peer names selected for this routing plan.
+	Fingers []string `protobuf:"bytes,1,rep,name=fingers,proto3" json:"fingers,omitempty"`
+	// Peer name of the nearest-forward neighbor on the ring.
+	Successor *string `protobuf:"bytes,2,opt,name=successor,proto3,oneof" json:"successor,omitempty"`
+	// Peer name of the nearest-backward neighbor on the ring.
+	Predecessor   *string `protobuf:"bytes,3,opt,name=predecessor,proto3,oneof" json:"predecessor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -204,31 +196,32 @@ func (*RoutingPlan) Descriptor() ([]byte, []int) {
 	return file_config_proto_rawDescGZIP(), []int{1}
 }
 
-func (x *RoutingPlan) GetFingers() []uint64 {
+func (x *RoutingPlan) GetFingers() []string {
 	if x != nil {
 		return x.Fingers
 	}
 	return nil
 }
 
-func (x *RoutingPlan) GetSuccessor() uint64 {
+func (x *RoutingPlan) GetSuccessor() string {
 	if x != nil && x.Successor != nil {
 		return *x.Successor
 	}
-	return 0
+	return ""
 }
 
-func (x *RoutingPlan) GetPredecessor() uint64 {
+func (x *RoutingPlan) GetPredecessor() string {
 	if x != nil && x.Predecessor != nil {
 		return *x.Predecessor
 	}
-	return 0
+	return ""
 }
 
 type PeerSpec struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Process-wide fabric peer id, also used for ring position and route references.
-	Id uint64 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Stable peer name. The process-wide fabric peer id, ring position, and route
+	// references are derived from this name.
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// Peer tags used by placement-aware planning.
 	Tags []string `protobuf:"bytes,2,rep,name=tags,proto3" json:"tags,omitempty"`
 	// Types that are valid to be assigned to Config:
@@ -270,11 +263,11 @@ func (*PeerSpec) Descriptor() ([]byte, []int) {
 	return file_config_proto_rawDescGZIP(), []int{2}
 }
 
-func (x *PeerSpec) GetId() uint64 {
+func (x *PeerSpec) GetName() string {
 	if x != nil {
-		return x.Id
+		return x.Name
 	}
-	return 0
+	return ""
 }
 
 func (x *PeerSpec) GetTags() []string {
@@ -1995,7 +1988,7 @@ var File_config_proto protoreflect.FileDescriptor
 
 const file_config_proto_rawDesc = "" +
 	"\n" +
-	"\fconfig.proto\x12\x18unbounded.storage.config\"\xaf\x05\n" +
+	"\fconfig.proto\x12\x18unbounded.storage.config\"\xfb\x04\n" +
 	"\x06Config\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\x04R\aversion\x12>\n" +
 	"\astartup\x18\x02 \x01(\v2$.unbounded.storage.config.StartupCfgR\astartup\x12D\n" +
@@ -2003,25 +1996,23 @@ const file_config_proto_rawDesc = "" +
 	"\bbackends\x18\x04 \x03(\v2%.unbounded.storage.config.BackendSpecR\bbackends\x12;\n" +
 	"\x06caches\x18\x05 \x03(\v2#.unbounded.storage.config.CacheSpecR\x06caches\x128\n" +
 	"\x05disks\x18\a \x03(\v2\".unbounded.storage.config.DiskSpecR\x05disks\x12-\n" +
-	"\x10fingers_per_node\x18\b \x01(\rH\x00R\x0efingersPerNode\x88\x01\x01\x12'\n" +
-	"\rlocal_node_id\x18\t \x01(\x04H\x01R\vlocalNodeId\x88\x01\x01\x12\x1d\n" +
-	"\n" +
-	"local_tags\x18\n" +
-	" \x03(\tR\tlocalTags\x12M\n" +
-	"\frouting_plan\x18\v \x01(\v2%.unbounded.storage.config.RoutingPlanH\x02R\vroutingPlan\x88\x01\x01\x128\n" +
+	"\x10fingers_per_node\x18\b \x01(\rH\x00R\x0efingersPerNode\x88\x01\x01\x12\x12\n" +
+	"\x04self\x18\t \x01(\tR\x04self\x12M\n" +
+	"\frouting_plan\x18\v \x01(\v2%.unbounded.storage.config.RoutingPlanH\x01R\vroutingPlan\x88\x01\x01\x128\n" +
 	"\x05peers\x18\f \x03(\v2\".unbounded.storage.config.PeerSpecR\x05peersB\x13\n" +
-	"\x11_fingers_per_nodeB\x10\n" +
-	"\x0e_local_node_idB\x0f\n" +
-	"\r_routing_planJ\x04\b\x06\x10\aR\rneighborhoods\"\x8f\x01\n" +
+	"\x11_fingers_per_nodeB\x0f\n" +
+	"\r_routing_planJ\x04\b\x06\x10\aJ\x04\b\n" +
+	"\x10\vR\rneighborhoodsR\n" +
+	"local_tags\"\x8f\x01\n" +
 	"\vRoutingPlan\x12\x18\n" +
-	"\afingers\x18\x01 \x03(\x04R\afingers\x12!\n" +
-	"\tsuccessor\x18\x02 \x01(\x04H\x00R\tsuccessor\x88\x01\x01\x12%\n" +
-	"\vpredecessor\x18\x03 \x01(\x04H\x01R\vpredecessor\x88\x01\x01B\f\n" +
+	"\afingers\x18\x01 \x03(\tR\afingers\x12!\n" +
+	"\tsuccessor\x18\x02 \x01(\tH\x00R\tsuccessor\x88\x01\x01\x12%\n" +
+	"\vpredecessor\x18\x03 \x01(\tH\x01R\vpredecessor\x88\x01\x01B\f\n" +
 	"\n" +
 	"_successorB\x0e\n" +
-	"\f_predecessor\"\xb5\x01\n" +
-	"\bPeerSpec\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\x04R\x02id\x12\x12\n" +
+	"\f_predecessor\"\xb9\x01\n" +
+	"\bPeerSpec\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04tags\x18\x02 \x03(\tR\x04tags\x12;\n" +
 	"\x03tcp\x18\x03 \x01(\v2'.unbounded.storage.config.TcpPeerConfigH\x00R\x03tcp\x12>\n" +
 	"\x04rdma\x18\x04 \x01(\v2(.unbounded.storage.config.RdmaPeerConfigH\x00R\x04rdmaB\b\n" +

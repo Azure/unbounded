@@ -42,25 +42,27 @@ pub enum ConfigError {
         page_size: u64,
     },
     InvalidTcpAddr {
-        peer_id: u64,
+        peer_name: String,
         addr: String,
     },
     InvalidNativePeerAddr {
-        peer_id: u64,
+        peer_name: String,
         addr: String,
     },
     EmptyDiskPath,
-    MissingLocalNodeId,
-    LocalNodeIdCollidesWithPeer(u64),
+    MissingSelfPeer,
+    SelfPeerNotFound(String),
+    EmptyPeerName,
+    DuplicatePeerName(String),
     RoutingPlanUnknownPeer {
-        id: u64,
+        name: String,
         role: &'static str,
     },
     RoutingPlanSelfReference {
-        id: u64,
+        name: String,
         role: &'static str,
     },
-    RoutingPlanDuplicateFinger(u64),
+    RoutingPlanDuplicateFinger(String),
     DuplicateBackendName(String),
     DuplicateFrontendName(String),
     DuplicateCacheName(String),
@@ -91,7 +93,7 @@ pub enum ConfigError {
         addr: String,
     },
     ZeroFrontendMaxRequestsPerConnection(String),
-    MissingPeerConfig(u64),
+    MissingPeerConfig(String),
     MissingDiskConfig,
     InvalidMetricsAddr {
         addr: String,
@@ -122,35 +124,37 @@ impl fmt::Display for ConfigError {
                 f,
                 "disk {path}: file size {size} must be a positive multiple of the page size {page_size}"
             ),
-            ConfigError::InvalidTcpAddr { peer_id, addr } => {
-                write!(f, "peer {peer_id}: invalid tcp socket address {addr:?}")
+            ConfigError::InvalidTcpAddr { peer_name, addr } => {
+                write!(f, "peer {peer_name:?}: invalid tcp socket address {addr:?}")
             }
-            ConfigError::InvalidNativePeerAddr { peer_id, addr } => {
-                write!(f, "peer {peer_id}: invalid native fabric address {addr:?}")
+            ConfigError::InvalidNativePeerAddr { peer_name, addr } => {
+                write!(f, "peer {peer_name:?}: invalid native fabric address {addr:?}")
             }
             ConfigError::EmptyDiskPath => write!(f, "disk path must not be empty"),
-            ConfigError::MissingLocalNodeId => write!(
+            ConfigError::MissingSelfPeer => write!(
                 f,
-                "local_node_id must be set when peers or routing_plan are configured: a multi-node \
-                 deployment requires a stable local node id to avoid silent NodeId(0) collisions"
+                "self must be set when peers or routing_plan are configured: a multi-node \
+                 deployment requires a stable local peer name"
             ),
-            ConfigError::LocalNodeIdCollidesWithPeer(id) => write!(
+            ConfigError::SelfPeerNotFound(name) => write!(
                 f,
-                "local_node_id {id} collides with a peer id: the local node and a peer \
-                 cannot share a node id, or the p2p finger table will silently drop that peer"
+                "self peer {name:?} is not present in peers: the local process must be listed \
+                 in the peer roster"
             ),
-            ConfigError::RoutingPlanUnknownPeer { id, role } => write!(
+            ConfigError::EmptyPeerName => write!(f, "peer name must not be empty"),
+            ConfigError::DuplicatePeerName(name) => write!(f, "duplicate peer name: {name:?}"),
+            ConfigError::RoutingPlanUnknownPeer { name, role } => write!(
                 f,
-                "routing_plan {role} {id} does not reference any peer id: every \
+                "routing_plan {role} {name:?} does not reference any peer name: every \
                  routing-plan neighbor must have a matching peer so a fabric connection exists"
             ),
-            ConfigError::RoutingPlanSelfReference { id, role } => write!(
+            ConfigError::RoutingPlanSelfReference { name, role } => write!(
                 f,
-                "routing_plan {role} {id} equals local_node_id: a node cannot list \
+                "routing_plan {role} {name:?} equals self: a node cannot list \
                  itself as a routing neighbor"
             ),
-            ConfigError::RoutingPlanDuplicateFinger(id) => {
-                write!(f, "routing_plan.fingers contains duplicate id {id}")
+            ConfigError::RoutingPlanDuplicateFinger(name) => {
+                write!(f, "routing_plan.fingers contains duplicate peer {name:?}")
             }
             ConfigError::DuplicateBackendName(name) => {
                 write!(f, "duplicate backend name: {name:?}")
@@ -217,8 +221,8 @@ impl fmt::Display for ConfigError {
                 f,
                 "frontend {frontend_name:?}: max_requests_per_connection must be greater than zero"
             ),
-            ConfigError::MissingPeerConfig(peer_id) => {
-                write!(f, "peer {peer_id}: config must set one peer transport")
+            ConfigError::MissingPeerConfig(peer_name) => {
+                write!(f, "peer {peer_name:?}: config must set one peer transport")
             }
             ConfigError::MissingDiskConfig => write!(f, "disk config must set one disk type"),
             ConfigError::InvalidMetricsAddr { addr } => {
@@ -441,21 +445,27 @@ fn validate_frontend_addr<'a>(
 }
 
 fn validate_mesh(cfg: &Config) -> Result<(), ConfigError> {
-    if (!cfg.peers.is_empty() || cfg.routing_plan.is_some()) && cfg.local_node_id.is_none() {
-        return Err(ConfigError::MissingLocalNodeId);
+    if (!cfg.peers.is_empty() || cfg.routing_plan.is_some()) && cfg.self_.is_empty() {
+        return Err(ConfigError::MissingSelfPeer);
     }
 
-    let mut peer_ids: HashSet<u64> = HashSet::new();
+    let mut peer_names: HashSet<&str> = HashSet::new();
+    let mut self_seen = cfg.self_.is_empty();
     for p in &cfg.peers {
-        peer_ids.insert(p.id);
-        if cfg.local_node_id == Some(p.id) {
-            return Err(ConfigError::LocalNodeIdCollidesWithPeer(p.id));
+        if p.name.is_empty() {
+            return Err(ConfigError::EmptyPeerName);
+        }
+        if !peer_names.insert(p.name.as_str()) {
+            return Err(ConfigError::DuplicatePeerName(p.name.clone()));
+        }
+        if p.name == cfg.self_ {
+            self_seen = true;
         }
         match p.config.as_ref() {
             Some(peer_spec::Config::Tcp(cfg)) => {
                 if cfg.addr.parse::<SocketAddr>().is_err() {
                     return Err(ConfigError::InvalidTcpAddr {
-                        peer_id: p.id,
+                        peer_name: p.name.clone(),
                         addr: cfg.addr.clone(),
                     });
                 }
@@ -463,34 +473,43 @@ fn validate_mesh(cfg: &Config) -> Result<(), ConfigError> {
             Some(peer_spec::Config::Rdma(cfg)) => {
                 if !is_valid_native_address(&cfg.addr) {
                     return Err(ConfigError::InvalidNativePeerAddr {
-                        peer_id: p.id,
+                        peer_name: p.name.clone(),
                         addr: cfg.addr.clone(),
                     });
                 }
             }
-            None => return Err(ConfigError::MissingPeerConfig(p.id)),
+            None => return Err(ConfigError::MissingPeerConfig(p.name.clone())),
         }
+    }
+    if !self_seen {
+        return Err(ConfigError::SelfPeerNotFound(cfg.self_.clone()));
     }
 
     if let Some(plan) = &cfg.routing_plan {
-        let mut seen_fingers: HashSet<u64> = HashSet::new();
-        for &id in &plan.fingers {
-            if !seen_fingers.insert(id) {
-                return Err(ConfigError::RoutingPlanDuplicateFinger(id));
+        let mut seen_fingers: HashSet<&str> = HashSet::new();
+        for name in &plan.fingers {
+            if !seen_fingers.insert(name.as_str()) {
+                return Err(ConfigError::RoutingPlanDuplicateFinger(name.clone()));
             }
         }
-        for (id, role) in plan
+        for (name, role) in plan
             .fingers
             .iter()
-            .map(|id| (*id, "finger"))
-            .chain(plan.successor.map(|id| (id, "successor")))
-            .chain(plan.predecessor.map(|id| (id, "predecessor")))
+            .map(|name| (name.as_str(), "finger"))
+            .chain(plan.successor.as_deref().map(|name| (name, "successor")))
+            .chain(plan.predecessor.as_deref().map(|name| (name, "predecessor")))
         {
-            if cfg.local_node_id == Some(id) {
-                return Err(ConfigError::RoutingPlanSelfReference { id, role });
+            if name == cfg.self_ {
+                return Err(ConfigError::RoutingPlanSelfReference {
+                    name: name.to_string(),
+                    role,
+                });
             }
-            if !peer_ids.contains(&id) {
-                return Err(ConfigError::RoutingPlanUnknownPeer { id, role });
+            if !peer_names.contains(name) {
+                return Err(ConfigError::RoutingPlanUnknownPeer {
+                    name: name.to_string(),
+                    role,
+                });
             }
         }
     }
@@ -595,12 +614,18 @@ name = "b"
 
     fn mesh_toml() -> &'static str {
         r#"
-local_node_id = 99
+self = "node-a"
 
 [[backends]]
 name = "b"
 
 [backends.config.fake]
+
+[[peers]]
+name = "node-a"
+
+[peers.config.tcp]
+addr = "10.0.0.99:9000"
 "#
     }
 
@@ -628,7 +653,7 @@ source = "b"
     #[test]
     fn loads_full_happy_path() {
         let s = r#"
-local_node_id = 99
+self = "node-a"
 
 [[backends]]
 name = "b"
@@ -636,13 +661,13 @@ name = "b"
 [backends.config.fake]
 
 [[peers]]
-id = 1
+name = "node-a"
 
 [peers.config.tcp]
 addr = "10.0.0.1:9000"
 
 [[peers]]
-id = 2
+name = "node-b"
 
 [peers.config.rdma]
 addr = "hex:deadbeef"
@@ -671,16 +696,16 @@ addr = "0.0.0.0:9000"
         let cfg = load(f.path()).unwrap();
         assert_eq!(cfg.peers.len(), 2);
         assert_eq!(cfg.disks.len(), 2);
-        assert_eq!(cfg.local_node_id, Some(99));
+        assert_eq!(cfg.self_, "node-a");
         let projection = runtime_projection(&cfg).unwrap();
         assert!(!projection.frontends["f"].bypass_cache);
         assert_eq!(projection.frontends["f"].backend_id, "b");
     }
 
     #[test]
-    fn rejects_duplicate_peer_ids() {
+    fn rejects_duplicate_peer_names() {
         let s = r#"
-local_node_id = 99
+self = "node-a"
 
 [[backends]]
 name = "b"
@@ -688,22 +713,20 @@ name = "b"
 [backends.config.fake]
 
 [[peers]]
-id = 1
+name = "node-a"
 
 [peers.config.tcp]
 addr = "10.0.0.1:9000"
 
 [[peers]]
-id = 1
+name = "node-a"
 
 [peers.config.tcp]
 addr = "10.0.0.2:9000"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
-            Err(ConfigError::InvalidBindingGraph(err)) => {
-                assert!(err.contains("peer 1 is duplicated"), "{err}");
-            }
+            Err(ConfigError::DuplicatePeerName(name)) if name == "node-a" => {}
             other => panic!("expected duplicate peer error, got {other:?}"),
         }
     }
@@ -734,7 +757,7 @@ path = "/dev/nvme0n1"
         let s = format!(
             r#"{}
 [[peers]]
-id = 7
+name = "node-b"
 
 [peers.config.tcp]
 addr = "not-an-addr"
@@ -743,7 +766,7 @@ addr = "not-an-addr"
         );
         let f = write_cfg(&s);
         match load(f.path()) {
-            Err(ConfigError::InvalidTcpAddr { peer_id: 7, .. }) => {}
+            Err(ConfigError::InvalidTcpAddr { peer_name, .. }) if peer_name == "node-b" => {}
             other => panic!("expected InvalidTcpAddr, got {other:?}"),
         }
     }
@@ -753,7 +776,7 @@ addr = "not-an-addr"
         let s = format!(
             r#"{}
 [[peers]]
-id = 8
+name = "node-b"
 
 [peers.config.tcp]
 addr = "example.com:9000"
@@ -763,7 +786,7 @@ addr = "example.com:9000"
         let f = write_cfg(&s);
         assert!(matches!(
             load(f.path()),
-            Err(ConfigError::InvalidTcpAddr { peer_id: 8, .. })
+            Err(ConfigError::InvalidTcpAddr { peer_name, .. }) if peer_name == "node-b"
         ));
     }
 
@@ -772,7 +795,7 @@ addr = "example.com:9000"
         let s = format!(
             r#"{}
 [[peers]]
-id = 9
+name = "node-rdma"
 
 [peers.config.rdma]
 addr = "hex:01020304"
@@ -781,7 +804,8 @@ addr = "hex:01020304"
         );
         let f = write_cfg(&s);
         let cfg = load(f.path()).expect("load should succeed");
-        match cfg.peers[0].config.as_ref().unwrap() {
+        let peer = cfg.peers.iter().find(|peer| peer.name == "node-rdma").unwrap();
+        match peer.config.as_ref().unwrap() {
             peer_spec::Config::Rdma(cfg) => assert_eq!(cfg.addr, "hex:01020304"),
             other => panic!("expected rdma config, got {other:?}"),
         }
@@ -793,7 +817,7 @@ addr = "hex:01020304"
             let s = format!(
                 r#"{}
 [[peers]]
-id = 9
+name = "node-rdma"
 
 [peers.config.rdma]
 addr = "{bad}"
@@ -804,7 +828,7 @@ addr = "{bad}"
             assert!(
                 matches!(
                     load(f.path()),
-                    Err(ConfigError::InvalidNativePeerAddr { peer_id: 9, .. })
+                    Err(ConfigError::InvalidNativePeerAddr { peer_name, .. }) if peer_name == "node-rdma"
                 ),
                 "expected InvalidNativePeerAddr for {bad:?}"
             );
@@ -927,7 +951,7 @@ path = "/dev/nvme0n1"
     }
 
     #[test]
-    fn rejects_peers_without_local_node_id() {
+    fn rejects_peers_without_self() {
         let s = r#"
 [[backends]]
 name = "b"
@@ -935,22 +959,22 @@ name = "b"
 [backends.config.fake]
 
 [[peers]]
-id = 1
+name = "node-a"
 
 [peers.config.tcp]
 addr = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
-            Err(ConfigError::MissingLocalNodeId) => {}
-            other => panic!("expected MissingLocalNodeId, got {other:?}"),
+            Err(ConfigError::MissingSelfPeer) => {}
+            other => panic!("expected MissingSelfPeer, got {other:?}"),
         }
     }
 
     #[test]
-    fn accepts_peers_with_local_node_id() {
+    fn accepts_peers_with_self() {
         let s = r#"
-local_node_id = 7
+self = "node-a"
 
 [[backends]]
 name = "b"
@@ -958,21 +982,21 @@ name = "b"
 [backends.config.fake]
 
 [[peers]]
-id = 1
+name = "node-a"
 
 [peers.config.tcp]
 addr = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.local_node_id, Some(7));
+        assert_eq!(cfg.self_, "node-a");
         assert_eq!(cfg.peers.len(), 1);
     }
 
     #[test]
-    fn rejects_local_node_id_colliding_with_peer() {
+    fn rejects_self_not_in_peer_roster() {
         let s = r#"
-local_node_id = 1
+self = "node-a"
 
 [[backends]]
 name = "b"
@@ -980,15 +1004,15 @@ name = "b"
 [backends.config.fake]
 
 [[peers]]
-id = 1
+name = "node-b"
 
 [peers.config.tcp]
 addr = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
-            Err(ConfigError::LocalNodeIdCollidesWithPeer(1)) => {}
-            other => panic!("expected LocalNodeIdCollidesWithPeer(1), got {other:?}"),
+            Err(ConfigError::SelfPeerNotFound(name)) if name == "node-a" => {}
+            other => panic!("expected SelfPeerNotFound(node-a), got {other:?}"),
         }
     }
 
@@ -1435,7 +1459,7 @@ fingers_per_nod = 128
     #[test]
     fn rejects_missing_peer_config() {
         let s = r#"
-local_node_id = 99
+self = "node-a"
 
 [[backends]]
 name = "b"
@@ -1443,11 +1467,11 @@ name = "b"
 [backends.config.fake]
 
 [[peers]]
-id = 1
+name = "node-a"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
-            Err(ConfigError::MissingPeerConfig(1)) => {}
+            Err(ConfigError::MissingPeerConfig(name)) if name == "node-a" => {}
             other => panic!("expected MissingPeerConfig, got {other:?}"),
         }
     }
@@ -1472,7 +1496,7 @@ id = 1
         // A `.binpb` file is decoded from the protobuf wire format that
         // the TOML loader's `Config` round-trips to.
         let toml = r#"
-local_node_id = 99
+self = "node-a"
 
 [[backends]]
 name = "b"
@@ -1480,7 +1504,7 @@ name = "b"
 [backends.config.fake]
 
 [[peers]]
-id = 1
+name = "node-a"
 
 [peers.config.tcp]
 addr = "10.0.0.1:9000"
@@ -1504,9 +1528,9 @@ addr = "0.0.0.0:9000"
         let f = write_binpb(&encode_config(&cfg));
         let loaded = load(f.path()).unwrap();
         assert_eq!(loaded.peers.len(), 1);
-        assert_eq!(loaded.peers[0].id, 1);
+        assert_eq!(loaded.peers[0].name, "node-a");
         assert_eq!(loaded.disks.len(), 1);
-        assert_eq!(loaded.local_node_id, Some(99));
+        assert_eq!(loaded.self_, "node-a");
     }
 
     #[test]
@@ -1527,7 +1551,7 @@ addr = "0.0.0.0:9000"
         // endpoints are rejected even when they arrive over the protobuf wire
         // path.
         let toml = r#"
-local_node_id = 99
+self = "node-a"
 
 [[backends]]
 name = "b"
@@ -1535,24 +1559,22 @@ name = "b"
 [backends.config.fake]
 
 [[peers]]
-id = 1
+name = "node-a"
 
 [peers.config.tcp]
 addr = "10.0.0.1:9000"
 
 [[peers]]
-id = 2
+name = "node-b"
 
 [peers.config.tcp]
 addr = "10.0.0.2:9000"
 "#;
         let mut cfg: Config = toml::from_str(toml).unwrap();
-        cfg.peers[1].id = 1;
+        cfg.peers[1].name = "node-a".to_string();
         let f = write_binpb(&encode_config(&cfg));
         match load(f.path()) {
-            Err(ConfigError::InvalidBindingGraph(err)) => {
-                assert!(err.contains("peer 1 is duplicated"), "{err}");
-            }
+            Err(ConfigError::DuplicatePeerName(name)) if name == "node-a" => {}
             other => panic!("expected duplicate peer error, got {other:?}"),
         }
     }

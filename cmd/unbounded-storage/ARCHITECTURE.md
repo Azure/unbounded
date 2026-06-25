@@ -562,9 +562,10 @@ reloadable sections are
 reconciled in place on the live shard layer **without a restart**: the
 peer/disk/routing surfaces and each shard's backend and frontend
 registries are all updated without tearing the shard layer down. Backing
-memory, the topology plan, and the fabric max in-flight knob are fixed at
-startup (sourced from the config `[startup]` section, see the CLI
-section), not reloadable config fields.
+memory, the topology plan, the fabric max in-flight knob, and the local
+`self` peer identity are fixed at startup (mostly sourced from the
+config `[startup]` section, see the CLI section), not reloadable config
+fields.
 
 Sections (all optional, each falling back to defaults):
 
@@ -572,14 +573,15 @@ Sections (all optional, each falling back to defaults):
 - `[[backends]]` - `name` and one `config` table: `http`, `s3`, or `azure`
   with a required `url`, or `fake` for synthetic objects. Backend stripe size
   must be a power of two.
-- `local_node_id`, `local_tags`, `fingers_per_node` (100), and optional
-  `[routing_plan]` (`fingers`, `successor`, `predecessor`) define the
-  process-wide transport mesh. When `routing_plan` is present the node skips
-  the global finger-table build and uses exactly the listed neighbor ids (each
-  must be a `[[peers]]` id, none may be `local_node_id`). This is "disjoint
-  discovery": a node is told only its direct routing neighbors rather than the
-  full cluster, yet routes identically to the global build (see
-  `designs/storage-disjoint-routing-parity.md`).
+- `self`, `fingers_per_node` (100), optional `[routing_plan]` (`fingers`,
+  `successor`, `predecessor`), and `[[peers]]` define the process-wide
+  transport mesh. `self` selects the local peer by name; internal fabric peer
+  id and ring position are derived from that name and are startup-fixed. When
+  `routing_plan` is present the node skips the global finger-table build and
+  uses exactly the listed neighbor names (each must be a `[[peers]]` name, none
+  may equal `self`). This is "disjoint discovery": a node is told only its
+  direct routing neighbors rather than the full cluster, yet routes identically
+  to the global build (see `designs/storage-disjoint-routing-parity.md`).
 - `[startup]` - startup-fixed knobs, read once at process start and
   excluded from the live-reload diff: `[startup.memory]`
   (`no_hugepages`, `memory_total_bytes`), `[startup.fabric]` (`binds`,
@@ -590,10 +592,12 @@ Sections (all optional, each falling back to defaults):
   `startup_to_core_plan_config` inverts the negative plan fields so the
   historical defaults hold. See the CLI section for the per-field
   defaults.
-- `[[peers]]` - `id` (process-wide fabric peer id, also used as the node's
-  ring position), `tags` for placement-aware routing, and one transport table
-  (`tcp` with a `SocketAddr`, or `rdma` with a provider-native address encoded
-  as `hex:<fi_getname-bytes>`).
+- `[[peers]]` - `name` (stable peer identity used to derive the internal fabric
+  peer id and ring position), `tags` for placement-aware routing, and one
+  transport table (`tcp` with a `SocketAddr`, or `rdma` with a provider-native
+  address encoded as `hex:<fi_getname-bytes>`). The roster includes the local
+  peer named by `self`; fabric reconciliation excludes that local entry from
+  outbound dials.
 - `[[caches]]` - `name` and `source` (a backend component name used for miss
   fills). The cache name is the only logical keyspace prefix: cached stripe
   keys are derived from cache id, logical object id, and stripe index, not from

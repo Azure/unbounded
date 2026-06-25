@@ -425,45 +425,43 @@ path = "/dev/nvme0n1"
     fn mesh_round_trips() {
         let s = r#"
 fingers_per_node = 128
-local_node_id = 42
-local_tags = ["us-west", "az1", "row3", "rack7"]
+self = "node-a"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(c.fingers_per_node, Some(128));
-        assert_eq!(c.local_node_id, Some(42));
-        assert_eq!(
-            c.local_tags,
-            vec![
-                "us-west".to_string(),
-                "az1".to_string(),
-                "row3".to_string(),
-                "rack7".to_string(),
-            ]
-        );
+        assert_eq!(c.self_, "node-a");
     }
 
     #[test]
     fn routing_plan_round_trips() {
         let s = r#"
-local_node_id = 1
+self = "node-a"
 
 [routing_plan]
-fingers = [2, 5, 9, 17]
-successor = 2
-predecessor = 64
+fingers = ["node-b", "node-c", "node-d", "node-e"]
+successor = "node-b"
+predecessor = "node-z"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         let plan = c.routing_plan.as_ref().expect("routing_plan set");
-        assert_eq!(plan.fingers, vec![2, 5, 9, 17]);
-        assert_eq!(plan.successor, Some(2));
-        assert_eq!(plan.predecessor, Some(64));
+        assert_eq!(
+            plan.fingers,
+            vec![
+                "node-b".to_string(),
+                "node-c".to_string(),
+                "node-d".to_string(),
+                "node-e".to_string(),
+            ]
+        );
+        assert_eq!(plan.successor.as_deref(), Some("node-b"));
+        assert_eq!(plan.predecessor.as_deref(), Some("node-z"));
     }
 
     #[test]
     fn routing_plan_absent_by_default() {
-        let mut c: Config = toml::from_str("local_node_id = 1\n").unwrap();
+        let mut c: Config = toml::from_str("self = \"node-a\"\n").unwrap();
         c.apply_defaults();
         assert!(c.routing_plan.is_none());
     }
@@ -472,7 +470,7 @@ predecessor = 64
     fn peer_tags_round_trip() {
         let s = r#"
 [[peers]]
-id = 1
+name = "node-a"
 tags = ["us-west", "az1", "row3", "rack7"]
 
 [peers.config.tcp]

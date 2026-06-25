@@ -855,8 +855,9 @@ fn config_for_generation(version: u64, disks: Vec<DiskSpec>) -> Config {
     cfg.apply_defaults();
     cfg.version = version;
     cfg.backends = backend_specs(0, 1);
-    cfg.local_node_id = Some(1);
+    cfg.self_ = "node-self".to_string();
     cfg.fingers_per_node = Some(100);
+    cfg.peers = vec![self_peer_spec()];
     cfg.caches = vec![CacheSpec {
         name: "cache-0".to_string(),
         source: "backend-0".to_string(),
@@ -871,7 +872,9 @@ fn mutate_config(cfg: &mut Config, apply: &ApplySpec, generation: usize) {
         ApplyKind::Noop => {}
         ApplyKind::Peers { count } => {
             cfg.fingers_per_node = Some(count.max(1) as u32);
-            cfg.peers = (0..count.max(1)).map(peer_spec_for).collect();
+            cfg.peers = std::iter::once(self_peer_spec())
+                .chain((0..count.max(1)).map(peer_spec_for))
+                .collect();
         }
         ApplyKind::Backends { count } => {
             cfg.backends = backend_specs(generation, count.max(1));
@@ -919,10 +922,20 @@ fn frontend_specs(generation: usize, count: u8) -> Vec<FrontendSpec> {
 
 fn peer_spec_for(idx: u8) -> PeerSpec {
     PeerSpec {
-        id: idx as u64 + 2,
+        name: format!("node-{idx}"),
         tags: vec![format!("rack-{}", idx % 2)],
         config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
             addr: format!("127.0.0.1:{}", 9000 + idx as u16),
+        })),
+    }
+}
+
+fn self_peer_spec() -> PeerSpec {
+    PeerSpec {
+        name: "node-self".to_string(),
+        tags: vec!["rack-self".to_string()],
+        config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
+            addr: "127.0.0.1:8999".to_string(),
         })),
     }
 }

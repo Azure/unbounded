@@ -33,11 +33,10 @@ type renderState struct {
 // loudly rather than silently dropping a setting. Any field left unset keeps its
 // proto3 zero value, which the daemon promotes to the documented default.
 //
-// The per-node sections (neighborhood local_node_id and discovered peer sets)
-// come from state, computed from the Kubernetes node watch. When the ring is
-// active, this node's id is injected into every declared neighborhood, and
-// discovered peers are merged with any neighborhood peers declared in the YAML
-// (discovered peers win on id collision). TCP rings also override
+// The per-node mesh fields (self and discovered peer set) come from state,
+// computed from the Kubernetes node watch. When the ring is active, this node's
+// peer name is injected and discovered peers are merged with any peers declared
+// in the YAML (discovered peers win on name collision). TCP rings also override
 // startup.fabric.tcp.addr with the node's own routable bind. The default disk
 // pool is populated from the self node's storage disk annotations, or from a
 // default file-backed disk when no valid annotation disks are present.
@@ -100,29 +99,14 @@ func loadSourceConfig(sourceDir string) (*storageconfig.Config, error) {
 }
 
 // applyRing overlays the per-node ring state onto a Config parsed from the
-// ConfigMap YAML. It injects this node's local id into declared neighborhoods,
-// merges the discovered peer set with each neighborhood's declared peers, and
-// rebinds the TCP fabric address to the node's own routable address when the
-// ring includes a TCP selfListenAddr.
+// ConfigMap YAML. It injects this node's self peer name, merges the discovered
+// peer set with any declared peers, and rebinds the TCP fabric address to the
+// node's own routable address when the ring includes a TCP selfListenAddr.
 func applyRing(cfg *storageconfig.Config, ring ringState) {
-	injected := false
-
-	for _, neighborhood := range cfg.Neighborhoods {
-		if neighborhood == nil {
-			continue
-		}
-
-		injected = true
-
-		// Preserve YAML-declared neighborhood scalars (fingers_per_node,
-		// local_tags, routing_plan); only stamp in the locally computed node id.
-		neighborhood.LocalNodeId = proto.Uint64(ring.localNodeID)
-		neighborhood.Peers = mergePeers(neighborhood.Peers, ring.peers, ring.localNodeID)
-	}
-
-	if !injected {
-		slog.Warn("ring discovery active but config declares no neighborhoods; discovered storage peers were not injected")
-	}
+	// Preserve YAML-declared routing knobs (fingers_per_node, routing_plan);
+	// only stamp in the locally computed self name and peer roster.
+	cfg.Self = ring.selfName
+	cfg.Peers = mergePeers(cfg.Peers, ring.peers)
 
 	if ring.selfListenAddr != "" {
 		if cfg.Startup == nil {
@@ -140,14 +124,12 @@ func applyRing(cfg *storageconfig.Config, ring ringState) {
 }
 
 // mergePeers combines the label-discovered peer set with any peers declared in
-// the ConfigMap YAML, deduplicated by peer id. Discovered peers are
-// authoritative: a YAML peer whose id collides with a discovered peer is
-// dropped. Any peer whose id equals the local node id is dropped (the daemon's
-// validate() rejects a self-peer, and discovery already excludes self). The
-// result is sorted by id so an unchanged input renders byte-for-byte
-// identically and never triggers a spurious config swap.
-func mergePeers(declared, discovered []*storageconfig.PeerSpec, localNodeID uint64) []*storageconfig.PeerSpec {
-	byID := make(map[uint64]*storageconfig.PeerSpec, len(declared)+len(discovered))
+// the ConfigMap YAML, deduplicated by peer name. Discovered peers are
+// authoritative: a YAML peer whose name collides with a discovered peer is
+// dropped. The result is sorted by name so an unchanged input renders
+// byte-for-byte identically and never triggers a spurious config swap.
+func mergePeers(declared, discovered []*storageconfig.PeerSpec) []*storageconfig.PeerSpec {
+	byName := make(map[string]*storageconfig.PeerSpec, len(declared)+len(discovered))
 
 	add := func(peers []*storageconfig.PeerSpec, fromYAML bool) {
 		for _, p := range peers {
@@ -155,34 +137,35 @@ func mergePeers(declared, discovered []*storageconfig.PeerSpec, localNodeID uint
 				continue
 			}
 
-			if p.GetId() == localNodeID {
-				slog.Warn("dropping peer whose id equals local node id", "id", p.GetId())
+			name := p.GetName()
+			if name == "" {
+				slog.Warn("dropping storage peer with empty name")
 
 				continue
 			}
 
-			if _, ok := byID[p.GetId()]; ok {
+			if _, ok := byName[name]; ok {
 				if fromYAML {
-					slog.Warn("dropping declared peer; id already discovered", "id", p.GetId())
+					slog.Warn("dropping declared peer; name already discovered", "name", name)
 				}
 
 				continue
 			}
 
-			byID[p.GetId()] = p
+			byName[name] = p
 		}
 	}
 
-	// Discovered first so they win id collisions against declared peers.
+	// Discovered first so they win name collisions against declared peers.
 	add(discovered, false)
 	add(declared, true)
 
-	merged := make([]*storageconfig.PeerSpec, 0, len(byID))
-	for _, p := range byID {
+	merged := make([]*storageconfig.PeerSpec, 0, len(byName))
+	for _, p := range byName {
 		merged = append(merged, p)
 	}
 
-	sort.Slice(merged, func(i, j int) bool { return merged[i].GetId() < merged[j].GetId() })
+	sort.Slice(merged, func(i, j int) bool { return merged[i].GetName() < merged[j].GetName() })
 
 	return merged
 }

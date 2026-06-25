@@ -10,11 +10,13 @@
 //! [`ConfigApplyTarget`](crate::config::ConfigApplyTarget) can skip
 //! untouched work:
 //!
-//! * **process mesh (`local_node_id`, `local_tags`, `fingers_per_node`,
-//!   `routing_plan`).** Rebuilds the projected routing surface and republishes
-//!   it to every shard.
+//! * **process identity (`self`).** Startup-fixed because it determines the
+//!   process-wide fabric peer id. A change requires a restart.
+//! * **process routing (`fingers_per_node`, `routing_plan`).** Rebuilds the
+//!   projected routing surface and republishes it to every shard.
 //! * **`[[peers]]`.** Reconciles fabric connections and rebuilds the projected
-//!   routing surface.
+//!   routing surface. The peer named by `self` is used as the local topology
+//!   entry and is not dialed.
 //! * **`[[caches]]`.** Cache names are route ids, so cache changes reload the
 //!   projected routing surface and reconcile disks.
 //! * **`[[disks]]`.** Reconciled in place against the disk registry.
@@ -50,6 +52,8 @@ pub struct ConfigDiff {
     pub caches_changed: bool,
     /// `[[disks]]` changed. Reconciled in place against the disk registry.
     pub disks_changed: bool,
+    /// `self` changed. This controls the fabric identity and requires restart.
+    pub identity_changed: bool,
     /// Process-wide routing knobs changed. Rebuilds the routing surface.
     pub routing_changed: bool,
     /// `[[peers]]` changed. Reconciles fabric connections and rebuilds the
@@ -73,9 +77,8 @@ impl ConfigDiff {
         Self {
             caches_changed: old.caches != new.caches,
             disks_changed: old.disks != new.disks,
-            routing_changed: old.local_node_id != new.local_node_id
-                || old.local_tags != new.local_tags
-                || old.fingers_per_node != new.fingers_per_node
+            identity_changed: old.self_ != new.self_,
+            routing_changed: old.fingers_per_node != new.fingers_per_node
                 || old.routing_plan != new.routing_plan,
             peers_changed: old.peers != new.peers,
             backends_changed: old.backends != new.backends,
@@ -88,6 +91,7 @@ impl ConfigDiff {
     pub fn any(&self) -> bool {
         self.caches_changed
             || self.disks_changed
+            || self.identity_changed
             || self.routing_changed
             || self.peers_changed
             || self.backends_changed
@@ -101,6 +105,11 @@ impl ConfigDiff {
     /// section reloads the projected routing surface for now.
     pub fn requires_routing_reload(&self) -> bool {
         self.routing_changed || self.peers_changed || self.caches_changed
+    }
+
+    /// Whether the process must restart before the new config can be applied.
+    pub fn requires_restart(&self) -> bool {
+        self.identity_changed
     }
 
     /// Whether fabric peer connections must be reconciled.
@@ -138,7 +147,7 @@ mod tests {
         let a = base();
         let mut b = base();
         b.peers.push(PeerSpec {
-            id: 2,
+            name: "node-a".to_string(),
             tags: vec![],
             config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
                 addr: "127.0.0.1:9000".to_string(),
@@ -156,14 +165,26 @@ mod tests {
         let mut b = base();
         b.fingers_per_node = Some(64);
         b.routing_plan = Some(RoutingPlan {
-            fingers: vec![2],
-            successor: Some(2),
+            fingers: vec!["node-b".to_string()],
+            successor: Some("node-b".to_string()),
             predecessor: None,
         });
         let d = ConfigDiff::between(&a, &b);
         assert!(d.routing_changed);
         assert!(d.requires_routing_reload());
         assert!(!d.requires_peer_reconcile());
+    }
+
+    #[test]
+    fn self_change_requires_restart_not_routing_reload() {
+        let a = base();
+        let mut b = base();
+        b.self_ = "node-a".to_string();
+        let d = ConfigDiff::between(&a, &b);
+        assert!(d.identity_changed);
+        assert!(d.any());
+        assert!(d.requires_restart());
+        assert!(!d.requires_routing_reload());
     }
 
     #[test]

@@ -1095,11 +1095,10 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
     }
 
     let mesh = &projection.mesh;
-    let local_id = mesh.local_node_id.unwrap_or(0);
     let local = PeerEntry {
-        node: NodeId(local_id),
-        ring: node_to_ring(NodeId(local_id)),
-        tags: TopologyTags(mesh.local_tags.clone()),
+        node: mesh.self_node_id,
+        ring: node_to_ring(mesh.self_node_id),
+        tags: TopologyTags(mesh.self_tags.clone()),
     };
     let node_to_peer: HashMap<NodeId, unbounded_storage::fabric::PeerId> = mesh
         .peers
@@ -1108,26 +1107,26 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
         .collect();
     let node_to_peer = Arc::new(node_to_peer);
     let fingers = if let Some(plan) = &mesh.routing_plan {
-        let tags_of = |node: NodeId| -> TopologyTags {
-            mesh.peers
-                .iter()
-                .find(|peer| peer.node_id == node)
-                .map(|peer| TopologyTags(peer.spec.tags.clone()))
-                .unwrap_or_default()
-        };
-        let entry_of = |raw: u64| {
-            let node = NodeId(raw);
+        let peer_by_name: HashMap<&str, &config::RuntimePeer> = mesh
+            .peers
+            .iter()
+            .map(|peer| (peer.name.as_str(), peer))
+            .collect();
+        let entry_of = |name: &str| {
+            let peer = peer_by_name
+                .get(name)
+                .expect("validated routing_plan names reference peers");
             PeerEntry {
-                node,
-                ring: node_to_ring(node),
-                tags: tags_of(node),
+                node: peer.node_id,
+                ring: node_to_ring(peer.node_id),
+                tags: TopologyTags(peer.spec.tags.clone()),
             }
         };
         Arc::new(FingerTable::from_explicit(
             local,
-            plan.fingers.iter().map(|id| entry_of(*id)).collect(),
-            plan.successor.map(entry_of),
-            plan.predecessor.map(entry_of),
+            plan.fingers.iter().map(|name| entry_of(name)).collect(),
+            plan.successor.as_deref().map(entry_of),
+            plan.predecessor.as_deref().map(entry_of),
         ))
     } else {
         let peers: Vec<PeerEntry> = mesh

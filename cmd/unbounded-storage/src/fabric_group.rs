@@ -559,7 +559,7 @@ mod tests {
     use super::*;
 
     use unbounded_storage::config::{PeerSpec, RdmaPeerConfig, peer_spec};
-    use unbounded_storage::p2p::NodeId;
+    use unbounded_storage::p2p::node_id_from_name;
 
     fn shard(cpu: u32, numa: Option<u16>) -> ServingShard {
         ServingShard { cpu, numa }
@@ -579,11 +579,14 @@ mod tests {
     }
 
     fn runtime_peer(id: u64, addr: &str) -> RuntimePeer {
+        let name = format!("node-{id}");
+        let node_id = node_id_from_name(&name);
         RuntimePeer {
-            node_id: NodeId(id),
-            fabric_peer_id: PeerId(id),
+            name: name.clone(),
+            node_id,
+            fabric_peer_id: PeerId(node_id.0),
             spec: PeerSpec {
-                id,
+                name,
                 tags: Vec::new(),
                 config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
                     addr: addr.to_string(),
