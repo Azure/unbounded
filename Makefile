@@ -47,6 +47,14 @@ MACHINE_OPS_SITE ?=
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
 
+UNBOUNDED_OPERATOR_BIN=bin/unbounded-operator
+UNBOUNDED_OPERATOR_CMD=./cmd/unbounded-operator
+UNBOUNDED_OPERATOR_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-operator:$(VERSION)
+UNBOUNDED_OPERATOR_NAMESPACE ?= unbounded-kube
+UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
+UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
+UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-operator/rendered
+
 KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
 KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
 
@@ -166,8 +174,7 @@ ORCA_DEV_IMAGE ?= ghcr.io/azure/orca:dev
 # the default in hack/orca/kind-up.sh.
 ORCA_KIND_CLUSTER ?= orca-dev
 
-# kubectl-unbounded also stamps the metalman image reference.
-KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
+KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS)
 
 # --- Net (unbounded-net) configuration -------------------------------------
 # Container images for the net controller and node agent.
@@ -201,16 +208,16 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
-.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
+.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
 
 ##@ General
 
-all: kubectl-unbounded forge machina machine-ops-controller unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded forge machina machine-ops-controller unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -248,6 +255,7 @@ help: ## Show this help
 	@echo "  machina | machina-build          Build machina controller (with/without lint/test)"
 	@echo "  machine-ops-controller           Build machine-ops-controller"
 	@echo "  metalman | metalman-build        Build metalman controller (with/without lint/test)"
+	@echo "  unbounded-operator | unbounded-operator-build  Build the top-level Site operator"
 	@echo "  unbounded-net-controller         Build net controller"
 	@echo "  unbounded-net-node               Build net node agent"
 	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
@@ -282,6 +290,8 @@ help: ## Show this help
 	@echo "  image-machina-local              Build machina image with \$$(CONTAINER_ENGINE)"
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-metalman-local             Build metalman image"
+	@echo "  image-unbounded-operator-local   Build unbounded-operator image"
+	@echo "  image-unbounded-operator-push    Build and push unbounded-operator image"
 	@echo "  image-net-controller-local       Build unbounded-net-controller image"
 	@echo "  image-net-controller-push        Build and push unbounded-net-controller image"
 	@echo "  image-net-node-local             Build unbounded-net-node image"
@@ -309,6 +319,7 @@ help: ## Show this help
 	@echo "  machine-ops-manifests            Render machine-ops manifests into deploy/machine-ops/rendered"
 	@echo "  net-manifests                    Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
 	@echo "  orca-manifests                   Render orca manifests into deploy/orca/rendered"
+	@echo "  unbounded-operator-manifests     Render unbounded-operator manifests into deploy/unbounded-operator/rendered"
 	@echo "  unbounded-storage-supervisor-manifests  Render storage supervisor manifests into deploy/unbounded-storage-supervisor/rendered"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
@@ -416,24 +427,24 @@ lint: ## Run golangci-lint (matches CI; run `make fmt` to auto-fix)
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-test: machina-manifests net-manifests ## Run all tests with race detector
+test: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
-test: lint machina-manifests net-manifests ## Run all tests (implies lint)
+test: lint machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Run all tests (implies lint)
 	$(GOTEST) ./...
 
 endif
 
-build: machina-manifests net-manifests ## Build all Go packages
+build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate ./...
 
-vulncheck: machina-manifests net-manifests ## Run govulncheck for known vulnerabilities
+vulncheck: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Run govulncheck for known vulnerabilities
 	@# GO-2024-3218 (libp2p/go-libp2p-kad-dht): all versions affected, no fix
 	@# available. Theoretical DHT content-censorship attack, not exploitable in
 	@# gantry's private-cluster deployment model. Tracked upstream at
@@ -469,7 +480,7 @@ notice-check: ## Verify NOTICE is in sync with go.mod and frontend/package.json
 
 ##@ Build
 
-kubectl-unbounded-build: machina-manifests net-manifests ## Build the kubectl-unbounded binary (no lint/test)
+kubectl-unbounded-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build the kubectl-unbounded binary (no lint/test)
 	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
 
 kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded plugin (implies test)
@@ -533,6 +544,11 @@ metalman-build: ## Build the metalman binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
 
 metalman: test metalman-build ## Build the metalman controller (implies test)
+
+unbounded-operator-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build the unbounded-operator binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)/main.go
+
+unbounded-operator: test unbounded-operator-build ## Build the unbounded-operator (implies test)
 
 ##@ Net Binaries
 
@@ -947,6 +963,23 @@ machina-manifests: ## Render machina deployment manifests into deploy/machina/re
 	@cp $(MACHINA_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(MACHINA_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered machina manifests into $(MACHINA_MANIFEST_RENDERED_DIR) (image: $(MACHINA_IMAGE))"
 
+unbounded-operator-manifests: ## Render unbounded-operator manifests into deploy/unbounded-operator/rendered
+	@mkdir -p $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)
+	@find $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(UNBOUNDED_OPERATOR_NAMESPACE) \
+		--set NetNamespace=$(NET_NAMESPACE) \
+		--set OperatorImage=$(UNBOUNDED_OPERATOR_IMAGE) \
+		--set NetControllerImage=$(NET_CONTROLLER_IMAGE) \
+		--set NetNodeImage=$(NET_NODE_IMAGE) \
+		--set MachinaImage=$(MACHINA_IMAGE) \
+		--set MetalmanImage=$(METALMAN_IMAGE) \
+		--set StorageSupervisorImage=$(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE) \
+		--set APIServerEndpoint=$(UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT)
+	@echo "Rendered unbounded-operator manifests into $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_OPERATOR_IMAGE))"
+
 machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/machine-ops/rendered
 	@mkdir -p $(MACHINE_OPS_MANIFEST_RENDERED_DIR)
 	@find $(MACHINE_OPS_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
@@ -979,6 +1012,18 @@ metalman-oci: image-metalman-local ## Alias for image-metalman-local
 
 metalman-oci-push: metalman-oci ## Build and push the metalman container image
 	$(CONTAINER_ENGINE) push $(METALMAN_IMAGE)
+
+image-unbounded-operator-local: ## Build the unbounded-operator container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t unbounded-operator:$(VERSION) -t $(UNBOUNDED_OPERATOR_IMAGE) \
+		-f ./images/unbounded-operator/Containerfile .
+	$(call trivy-maybe,$(UNBOUNDED_OPERATOR_IMAGE))
+
+image-unbounded-operator-push: image-unbounded-operator-local ## Build and push the unbounded-operator image
+	$(CONTAINER_ENGINE) push $(UNBOUNDED_OPERATOR_IMAGE)
 
 image-gantry-local: ## Build the gantry container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
@@ -1142,7 +1187,7 @@ images-net-all: image-net-controller-local image-net-node-local ## Build all unb
 
 images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
-images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local ## Build all container images locally
+images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-net-controller-local image-net-node-local ## Build all container images locally
 
 ##@ Net Frontend
 
@@ -1213,14 +1258,18 @@ net-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 RELEASE_MANIFESTS_STAGE_DIR := build/release-manifests
 RELEASE_MANIFESTS_NAME      := unbounded-manifests-$(VERSION)
 
-release-manifests: machina-manifests machine-ops-manifests net-manifests ## Build stamped combined manifest tarball under build/
+release-manifests: machina-manifests machine-ops-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build stamped combined manifest tarball under build/
 	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net
+	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor
+	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator
 	@cp -R $(MACHINA_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina/
 	@cp -R $(MACHINE_OPS_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops/
 	@cp -R $(NET_MANIFEST_RENDERED_DIR)/.     $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net/
+	@cp -R $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor/
+	@cp -R $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator/
 	@echo "$(VERSION)" > $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/VERSION
 	@mkdir -p build
 	tar czf "build/$(RELEASE_MANIFESTS_NAME).tar.gz" -C $(RELEASE_MANIFESTS_STAGE_DIR) $(RELEASE_MANIFESTS_NAME)

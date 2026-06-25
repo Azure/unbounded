@@ -4,5 +4,6 @@
 package app
 
 const (
-	fieldManagerID = "kubectl-unbounded"
+	fieldManagerID   = "kubectl-unbounded"
+	machinaNamespace = "unbounded-kube"
 )

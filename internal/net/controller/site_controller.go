@@ -37,6 +37,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/net/allocator"
 )
@@ -65,8 +66,8 @@ const (
 )
 
 var siteGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-cloud.io",
-	Version:  "v1alpha1",
+	Group:    unboundedv1alpha3.GroupVersion.Group,
+	Version:  unboundedv1alpha3.GroupVersion.Version,
 	Resource: "sites",
 }
 
@@ -111,7 +112,7 @@ type SiteController struct {
 	workqueue workqueue.TypedRateLimitingInterface[string]
 
 	// Cache of sites for faster lookups
-	sitesCache     []unboundednetv1alpha1.Site
+	sitesCache     []unboundedv1alpha3.Site
 	sitesCacheLock sync.RWMutex
 
 	// Cache of gateway pools for filtering gateway nodes
@@ -388,7 +389,7 @@ func (sc *SiteController) enqueueSiteChange() {
 // updateSitesCache updates the cached list of sites from the informer
 func (sc *SiteController) updateSitesCache() {
 	items := sc.siteInformer.GetStore().List()
-	sites := make([]unboundednetv1alpha1.Site, 0, len(items))
+	sites := make([]unboundedv1alpha3.Site, 0, len(items))
 
 	for _, item := range items {
 		unstr, ok := item.(*unstructured.Unstructured)
@@ -396,7 +397,7 @@ func (sc *SiteController) updateSitesCache() {
 			continue
 		}
 
-		site := unboundednetv1alpha1.Site{}
+		site := unboundedv1alpha3.Site{}
 
 		data, err := unstr.MarshalJSON()
 		if err != nil {
@@ -461,7 +462,7 @@ func (sc *SiteController) updateGatewayPoolsCache() {
 }
 
 type assignmentRef struct {
-	site       unboundednetv1alpha1.Site
+	site       unboundedv1alpha3.Site
 	index      int
 	assignment unboundednetv1alpha1.PodCidrAssignment
 }
@@ -494,7 +495,7 @@ func assignmentMatchConfigEqual(a, b unboundednetv1alpha1.PodCidrAssignment) boo
 	return assignmentPriority(a.Priority) == assignmentPriority(b.Priority)
 }
 
-func (sc *SiteController) collectEnabledAssignments(sites []unboundednetv1alpha1.Site) []assignmentRef {
+func (sc *SiteController) collectEnabledAssignments(sites []unboundedv1alpha3.Site) []assignmentRef {
 	enabled := make([]assignmentRef, 0)
 
 	for _, site := range sites {
@@ -510,7 +511,7 @@ func (sc *SiteController) collectEnabledAssignments(sites []unboundednetv1alpha1
 	return enabled
 }
 
-func (sc *SiteController) updateAssignmentAllocators(sites []unboundednetv1alpha1.Site) {
+func (sc *SiteController) updateAssignmentAllocators(sites []unboundedv1alpha3.Site) {
 	enabledAssignments := sc.collectEnabledAssignments(sites)
 
 	desired := make(map[string]assignmentRef, len(enabledAssignments))
@@ -1016,7 +1017,7 @@ func (sc *SiteController) updateAllSiteSlices(ctx context.Context) {
 }
 
 // updateSiteSlices creates/updates/deletes SiteNodeSlice objects for a site
-func (sc *SiteController) updateSiteSlices(ctx context.Context, site unboundednetv1alpha1.Site, nodesInfo []unboundednetv1alpha1.NodeInfo) {
+func (sc *SiteController) updateSiteSlices(ctx context.Context, site unboundedv1alpha3.Site, nodesInfo []unboundednetv1alpha1.NodeInfo) {
 	// Calculate how many slices we need
 	numSlices := (len(nodesInfo) + unboundednetv1alpha1.MaxNodesPerSlice - 1) / unboundednetv1alpha1.MaxNodesPerSlice
 	if numSlices == 0 {
@@ -1096,7 +1097,7 @@ func (sc *SiteController) getExistingSlices(siteName string) []unboundednetv1alp
 }
 
 // createOrUpdateSlice creates or updates a SiteNodeSlice with retry logic for conflicts
-func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unboundednetv1alpha1.Site, sliceIndex int, nodes []unboundednetv1alpha1.NodeInfo) {
+func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unboundedv1alpha3.Site, sliceIndex int, nodes []unboundednetv1alpha1.NodeInfo) {
 	sliceName := fmt.Sprintf("%s-%d", site.Name, sliceIndex)
 
 	// Convert nodes to unstructured format
@@ -1193,7 +1194,7 @@ func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unbounde
 }
 
 // buildSliceObject constructs the unstructured SiteNodeSlice object
-func (sc *SiteController) buildSliceObject(site unboundednetv1alpha1.Site, sliceName string, sliceIndex int, nodesData []interface{}) *unstructured.Unstructured {
+func (sc *SiteController) buildSliceObject(site unboundedv1alpha3.Site, sliceName string, sliceIndex int, nodesData []interface{}) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "net.unbounded-cloud.io/v1alpha1",
@@ -1313,7 +1314,7 @@ func (sc *SiteController) buildNodeInfo(node *corev1.Node) unboundednetv1alpha1.
 }
 
 // updateSiteStatusIfChanged updates the status of a site only if it has changed
-func (sc *SiteController) updateSiteStatusIfChanged(ctx context.Context, site unboundednetv1alpha1.Site, nodeCount, sliceCount int) {
+func (sc *SiteController) updateSiteStatusIfChanged(ctx context.Context, site unboundedv1alpha3.Site, nodeCount, sliceCount int) {
 	// Always update gauges so they reflect the latest state.
 	SiteNodesGauge.WithLabelValues(site.Name).Set(float64(nodeCount))
 	SiteNodeSlicesGauge.WithLabelValues(site.Name).Set(float64(sliceCount))
@@ -1436,8 +1437,8 @@ func (sc *SiteController) getAssignmentAllocator(siteName string, assignmentInde
 	return state
 }
 
-func (sc *SiteController) selectAssignmentForNode(site unboundednetv1alpha1.Site, nodeName string) *assignmentAllocator {
-	enabledAssignments := sc.collectEnabledAssignments([]unboundednetv1alpha1.Site{site})
+func (sc *SiteController) selectAssignmentForNode(site unboundedv1alpha3.Site, nodeName string) *assignmentAllocator {
+	enabledAssignments := sc.collectEnabledAssignments([]unboundedv1alpha3.Site{site})
 
 	var (
 		selected         *assignmentAllocator
@@ -1466,7 +1467,7 @@ func (sc *SiteController) selectAssignmentForNode(site unboundednetv1alpha1.Site
 	return selected
 }
 
-func (sc *SiteController) assignPodCIDRsForNode(ctx context.Context, node *corev1.Node, sites []unboundednetv1alpha1.Site, siteName string) error {
+func (sc *SiteController) assignPodCIDRsForNode(ctx context.Context, node *corev1.Node, sites []unboundedv1alpha3.Site, siteName string) error {
 	if !sc.hasSynced.Load() {
 		return fmt.Errorf("informer caches not synced; refusing pod CIDR assignment for node %s", node.Name)
 	}
@@ -1479,7 +1480,7 @@ func (sc *SiteController) assignPodCIDRsForNode(ctx context.Context, node *corev
 		return nil
 	}
 
-	var site *unboundednetv1alpha1.Site
+	var site *unboundedv1alpha3.Site
 
 	for i := range sites {
 		if sites[i].Name == siteName {
@@ -1745,7 +1746,7 @@ func (sc *SiteController) patchNodeLabelAndCIDRs(ctx context.Context, nodeName, 
 
 // assignPodCIDRsForNodeWithLabel combines site labeling and pod CIDR assignment
 // into a single API call for new nodes that need both.
-func (sc *SiteController) assignPodCIDRsForNodeWithLabel(ctx context.Context, node *corev1.Node, sites []unboundednetv1alpha1.Site, siteName string) error {
+func (sc *SiteController) assignPodCIDRsForNodeWithLabel(ctx context.Context, node *corev1.Node, sites []unboundedv1alpha3.Site, siteName string) error {
 	if !sc.hasSynced.Load() {
 		return fmt.Errorf("informer caches not synced; refusing pod CIDR assignment for node %s", node.Name)
 	}
@@ -1758,7 +1759,7 @@ func (sc *SiteController) assignPodCIDRsForNodeWithLabel(ctx context.Context, no
 		return nil
 	}
 
-	var site *unboundednetv1alpha1.Site
+	var site *unboundedv1alpha3.Site
 
 	for i := range sites {
 		if sites[i].Name == siteName {
@@ -1817,8 +1818,8 @@ func (sc *SiteController) markSlicesDirty() {
 // markNodeCIDRsAllocated ensures a node's existing pod CIDRs are marked in the
 // allocator so they are never handed out to another node. Called for nodes that
 // already have CIDRs assigned (e.g., gateway and system nodes).
-func (sc *SiteController) markNodeCIDRsAllocated(node *corev1.Node, sites []unboundednetv1alpha1.Site, siteName string) {
-	var site *unboundednetv1alpha1.Site
+func (sc *SiteController) markNodeCIDRsAllocated(node *corev1.Node, sites []unboundedv1alpha3.Site, siteName string) {
+	var site *unboundedv1alpha3.Site
 
 	for i := range sites {
 		if sites[i].Name == siteName {
@@ -1851,7 +1852,7 @@ func (sc *SiteController) releaseNodeCIDRs(node *corev1.Node) {
 		return
 	}
 
-	var site *unboundednetv1alpha1.Site
+	var site *unboundedv1alpha3.Site
 
 	for i := range sites {
 		if sites[i].Name == siteName {
@@ -1909,7 +1910,7 @@ func (sc *SiteController) releaseNodeCIDRs(node *corev1.Node) {
 
 // findSiteForNode returns the name of the site that contains the node's internal IP.
 // Returns empty string if no site matches.
-func (sc *SiteController) findSiteForNode(node *corev1.Node, sites []unboundednetv1alpha1.Site) string {
+func (sc *SiteController) findSiteForNode(node *corev1.Node, sites []unboundedv1alpha3.Site) string {
 	// Get node's internal IPs
 	var internalIPs []net.IP
 
@@ -2026,7 +2027,7 @@ func escapeJSONPointer(s string) string {
 
 // validateSiteCIDRsNoOverlap checks that no two sites have overlapping CIDRs.
 // This prevents routing conflicts where the same CIDR would be routed to multiple sites.
-func validateSiteCIDRsNoOverlap(sites []unboundednetv1alpha1.Site) error {
+func validateSiteCIDRsNoOverlap(sites []unboundedv1alpha3.Site) error {
 	// Build a map of all CIDRs to the site that owns them
 	type cidrOwner struct {
 		siteName string
@@ -2144,7 +2145,7 @@ func (sc *SiteController) TryAllocateForNode(nodeName string, internalIPs []stri
 		return "", nil, "", false
 	}
 
-	var site *unboundednetv1alpha1.Site
+	var site *unboundedv1alpha3.Site
 
 	for i := range sites {
 		if sites[i].Name == siteName {

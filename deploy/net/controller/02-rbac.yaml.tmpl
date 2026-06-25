@@ -27,17 +27,24 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
-  # Sites and GatewayPools: read access and finalizer management for controllers
+  # Sites: read access, finalizer management, and status updates for controllers.
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["sites"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["sites/status"]
+    verbs: ["get", "patch", "update"]
+  # GatewayPools: read access and finalizer management for controllers
   - apiGroups: ["net.unbounded-cloud.io"]
-    resources: ["sites", "gatewaypools"]
+    resources: ["gatewaypools"]
     verbs: ["get", "list", "watch", "update", "patch"]
   # Peering and assignment resources: read access for controllers and status aggregation
   - apiGroups: ["net.unbounded-cloud.io"]
     resources: ["sitepeerings", "sitegatewaypoolassignments", "gatewaypoolpeerings"]
     verbs: ["get", "list", "watch"]
-  # Status subresources: update observed state for sites, site peerings, gateway pools, and gateway pool nodes
+  # Status subresources: update observed state for site peerings, gateway pools, and gateway pool nodes
   - apiGroups: ["net.unbounded-cloud.io"]
-    resources: ["sites/status", "sitepeerings/status", "gatewaypools/status", "gatewaypoolnodes/status"]
+    resources: ["sitepeerings/status", "gatewaypools/status", "gatewaypoolnodes/status"]
     verbs: ["get", "patch", "update"]
   # SiteNodeSlices: full access to manage node slices
   - apiGroups: ["net.unbounded-cloud.io"]

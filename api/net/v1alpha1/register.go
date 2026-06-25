@@ -35,7 +35,6 @@ func Resource(resource string) schema.GroupResource {
 func init() {
 	SchemeBuilder.Register(func(s *runtime.Scheme) error {
 		s.AddKnownTypes(GroupVersion,
-			&Site{}, &SiteList{},
 			&SiteNodeSlice{}, &SiteNodeSliceList{},
 			&GatewayPool{}, &GatewayPoolList{},
 			&GatewayPoolNode{}, &GatewayPoolNodeList{},

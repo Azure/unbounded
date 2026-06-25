@@ -47,18 +47,49 @@ below.
 
 ---
 
+### `kubectl unbounded install`
+
+Bootstrap a cluster with the Unbounded CRDs and `unbounded-operator`. This
+command applies the machina CRDs, the net CRDs, and the operator manifests. It
+does not deploy component workloads directly; the operator reconciles those from
+`Site.spec.components` after Sites are created or updated.
+
+```bash
+kubectl unbounded install
+```
+
+Optional flags:
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
+| `--namespace` | `string` | `unbounded-kube` | Namespace for the operator and default components |
+| `--net-namespace` | `string` | `unbounded-net` | Namespace for unbounded-net components |
+| `--skip-crds` | `bool` | `false` | Skip applying CRDs |
+| `--wait` | `bool` | `true` | Wait for the operator rollout |
+| `--timeout` | `duration` | `5m0s` | Timeout for rollout waits |
+| `--api-server-endpoint` | `string` | kubeconfig server | API server endpoint advertised to provisioned machines |
+
+The image flags (`--operator-image`, `--net-controller-image`,
+`--net-node-image`, `--machina-image`, `--metalman-image`, and
+`--storage-supervisor-image`) override the images embedded in the release
+manifests.
+
+---
+
 ### `kubectl unbounded site init`
 
 Initialize a new Unbounded site. This command:
 
-1. Validates inputs and checks that `kubectl` is on your PATH.
-2. Verifies that at least one node is labeled as a gateway
-   (`unbounded-cloud.io/unbounded-net-gateway=true`).
-3. Installs the unbounded-net CNI plugin (downloads from the release URL or
-   uses local manifests).
-4. Creates unbounded-net Site and GatewayPool resources.
-5. Creates a bootstrap token for the site.
-6. Installs the machina controller in the `unbounded-kube` namespace.
+1. Validates inputs and kubeconfig access.
+2. Bootstraps CRDs and `unbounded-operator` unless `--skip-install` is set.
+3. Creates a cluster `Site`, a remote `Site`, and related net `GatewayPool` resources.
+4. Records component choices in `Site.spec.components` for `unbounded-operator`.
+5. Creates a bootstrap token for the remote site.
+
+Global components (`unbounded-net`, `machina`, and `unbounded-storage`) are
+enabled on the cluster Site. `metalman` is per-site and is enabled on the remote
+Site when `--enable-metalman` is set.
 
 #### Required Flags
 
@@ -74,17 +105,19 @@ Initialize a new Unbounded site. This command:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--cni-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for CNI manifests |
-| `--machina-manifests` | `string` | *(embedded manifests)* | Path to a local file/directory or HTTPS URL for machina manifests |
 | `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
+| `--manage-cni-plugin` | `bool` | `true` | Whether unbounded-net manages the CNI plugin |
+| `--enable-net` | `bool` | `true` | Enable unbounded-net in `Site.spec.components` |
+| `--enable-machina` | `bool` | `true` | Enable machina in `Site.spec.components` |
+| `--enable-metalman` | `bool` | `false` | Enable metalman in `Site.spec.components` |
+| `--enable-unbounded-storage` | `bool` | `false` | Enable unbounded-storage in `Site.spec.components` |
+| `--skip-install` | `bool` | `false` | Skip bootstrapping CRDs and `unbounded-operator` |
+| `--install-timeout` | `duration` | `5m0s` | Timeout while waiting for operator bootstrap |
 
 #### Validation
 
 - All CIDR values must be valid IPv4 CIDR notation.
-- `--cni-manifests`, when provided, must be either a valid HTTPS URL or an
-  existing local file/directory path. If omitted, the manifests embedded in
-  the kubectl plugin are used.
-- `kubectl` must be available on `PATH`.
+- The kubeconfig must be readable.
 
 #### Example
 
@@ -97,7 +130,7 @@ kubectl unbounded site init \
   --pod-cidr 10.101.0.0/24
 ```
 
-With local manifests:
+With optional components:
 
 ```bash
 kubectl unbounded site init \
@@ -106,7 +139,8 @@ kubectl unbounded site init \
   --cluster-pod-cidr 10.244.0.0/16 \
   --node-cidr 10.200.0.0/24 \
   --pod-cidr 10.201.0.0/24 \
-  --cni-manifests ./my-cni-manifests/ \
+  --enable-metalman \
+  --enable-unbounded-storage \
   --kubeconfig ~/.kube/config
 ```
 

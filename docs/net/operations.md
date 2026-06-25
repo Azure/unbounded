@@ -32,23 +32,22 @@ wg --version
 
 ```mermaid
 flowchart TD
-    A[1. Deploy CRDs] --> B[2. Deploy Controller]
-    B --> C[3. Deploy Node Agent]
-    C --> D[4. Create Sites]
-    D --> E[5. Create GatewayPools]
-    E --> F[6. Label Gateway Nodes]
-    F --> G[7. Verify Connectivity]
+    A[1. Bootstrap CRDs and Operator] --> B[2. Create Sites]
+    B --> C[3. Create GatewayPools]
+    C --> D[4. Label Gateway Nodes]
+    D --> E[5. Verify Connectivity]
 ```
 
-#### Step 1: Deploy CRDs
+#### Step 1: Bootstrap CRDs and Operator
 
 ```bash
-kubectl apply -f deploy/net/crd/
+kubectl unbounded install
 ```
 
-Verify CRDs are installed:
+Verify CRDs and the operator are installed:
 ```bash
 kubectl get crd | grep unbounded
+kubectl -n unbounded-kube get deploy unbounded-operator
 ```
 
 Expected output:
@@ -59,7 +58,7 @@ gatewaypools.net.unbounded-cloud.io                   2024-01-15T10:00:00Z
 sitegatewaypoolassignments.net.unbounded-cloud.io     2024-01-15T10:00:00Z
 sitenodeslices.net.unbounded-cloud.io                 2024-01-15T10:00:00Z
 sitepeerings.net.unbounded-cloud.io                   2024-01-15T10:00:00Z
-sites.net.unbounded-cloud.io                          2024-01-15T10:00:00Z
+sites.unbounded-cloud.io                              2024-01-15T10:00:00Z
 ```
 
 #### Container Registry
@@ -71,57 +70,28 @@ Production images are published to `unboundednettme.azurecr.io`:
 | `unboundednettme.azurecr.io/unbounded-net-controller` | Controller |
 | `unboundednettme.azurecr.io/unbounded-net-node` | Node agent (includes `unroute` diagnostic tool) |
 
-Both images include the `unroute` BPF diagnostic tool. Deploy manifests use template
-placeholders (`{{ .ControllerImage }}`, `{{ .NodeImage }}`), so the registry is injected
-at render time.
+Both images include the `unroute` BPF diagnostic tool. Deploy manifests use
+template placeholders (`{{ .ControllerImage }}`, `{{ .NodeImage }}`), so the
+registry is injected at render time. The `unbounded-operator` applies these
+manifests when a Site enables the net component.
 
-#### Step 2: Deploy Controller
+#### Step 2: Create Sites
 
-```bash
-kubectl apply -f deploy/controller/
-```
-
-On startup, the controller registers aggregated status endpoints through `APIService` `v1alpha1.status.net.unbounded-cloud.io`, served over HTTPS via `unbounded-net-controller:9999` with an explicit `caBundle`.
-
-Verify aggregated API registration:
-```bash
-kubectl get apiservice v1alpha1.status.net.unbounded-cloud.io
-```
-
-The controller registers the validating admission webhook on startup and stores
-its TLS certificates in the `unbounded-net-serving-cert` secret (kube-system).
-The webhook Service is `unbounded-net-controller` (port 9999). The webhook uses
-`failurePolicy: Ignore` so that CRD operations are not blocked if the webhook
-is unavailable. Most validation constraints are enforced by CRD OpenAPI schema
-rules. A single webhook entry covers all CRD types for CREATE and UPDATE
-operations. DELETE protection uses the `net.unbounded-cloud.io/protection`
-finalizer on Sites and GatewayPools.
-
-Verify controller is running:
-```bash
-kubectl -n kube-system get pods -l app=unbounded-net-controller
-```
-
-#### Step 3: Deploy Node Agent
-
-```bash
-kubectl apply -f deploy/node/
-```
-
-Verify agents are running on all nodes:
-```bash
-kubectl -n kube-system get pods -l app=unbounded-net-node -o wide
-```
-
-#### Step 4: Create Sites
+When the net component is enabled, the operator deploys the controller and node
+agent. On startup, the controller registers aggregated status endpoints through
+`APIService` `v1alpha1.status.net.unbounded-cloud.io`, served over HTTPS via
+`unbounded-net-controller:9999` with an explicit `caBundle`.
 
 ```bash
 kubectl apply -f - <<EOF
-apiVersion: net.unbounded-cloud.io/v1alpha1
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Site
 metadata:
   name: site-east
 spec:
+  components:
+    net:
+      enabled: true
   nodeCidrs:
     - "10.0.0.0/16"
   podCidrAssignments:
@@ -132,7 +102,7 @@ spec:
         ipv4: 24
       priority: 100
 ---
-apiVersion: net.unbounded-cloud.io/v1alpha1
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Site
 metadata:
   name: site-west
@@ -149,7 +119,29 @@ spec:
 EOF
 ```
 
-#### Step 5: Assign Sites to Gateway Pools
+Verify the operator reconciled the net component:
+
+```bash
+kubectl -n unbounded-net get pods -l app.kubernetes.io/name=unbounded-net-controller
+kubectl -n unbounded-net get pods -l app.kubernetes.io/name=unbounded-net-node -o wide
+```
+
+Verify aggregated API registration:
+
+```bash
+kubectl get apiservice v1alpha1.status.net.unbounded-cloud.io
+```
+
+The controller registers the validating admission webhook on startup and stores
+its TLS certificates in the `unbounded-net-serving-cert` secret. The webhook
+Service is `unbounded-net-controller` (port 9999). The webhook uses
+`failurePolicy: Ignore` so that CRD operations are not blocked if the webhook
+is unavailable. Most validation constraints are enforced by CRD OpenAPI schema
+rules. A single webhook entry covers all CRD types for CREATE and UPDATE
+operations. DELETE protection uses the `net.unbounded-cloud.io/protection`
+finalizer on Sites and GatewayPools.
+
+#### Step 3: Assign Sites to Gateway Pools
 
 ```bash
 kubectl apply -f - <<EOF
@@ -166,7 +158,7 @@ spec:
 EOF
 ```
 
-#### Step 5: Create GatewayPool
+#### Step 4: Create GatewayPool
 
 ```bash
 kubectl apply -f - <<EOF
@@ -180,7 +172,7 @@ spec:
 EOF
 ```
 
-#### Step 6: Label Gateway Nodes
+#### Step 5: Label Gateway Nodes
 
 ```bash
 # Label nodes that should be gateways
@@ -188,7 +180,7 @@ kubectl label node gateway-east-1 net.unbounded-cloud.io/gateway=true
 kubectl label node gateway-west-1 net.unbounded-cloud.io/gateway=true
 ```
 
-#### Step 7: Verify Connectivity
+#### Step 6: Verify Connectivity
 
 ```bash
 # Check site membership
@@ -485,7 +477,7 @@ filter protocol all pref 49152 bpf chain 0 handle 0x1 unbounded_encap direct-act
 
 If no filter is shown, the eBPF program failed to load or attach. Check node agent logs:
 ```bash
-kubectl -n kube-system logs <node-agent-pod> | grep -i "bpf\|ebpf\|attach"
+kubectl -n unbounded-net logs <node-agent-pod> | grep -i "bpf\|ebpf\|attach"
 ```
 
 #### Verifying BPF Maps
@@ -512,17 +504,17 @@ the controller status API:
 
 ```bash
 # Dump all BPF entries from inside a node agent pod
-kubectl -n kube-system exec <node-agent-pod> -- unroute
+kubectl -n unbounded-net exec <node-agent-pod> -- unroute
 
 # Look up a specific IP
-kubectl -n kube-system exec <node-agent-pod> -- unroute <ip-address>
+kubectl -n unbounded-net exec <node-agent-pod> -- unroute <ip-address>
 
 # Show only IPv4 entries, or only IPv6 entries
-kubectl -n kube-system exec <node-agent-pod> -- unroute -4
-kubectl -n kube-system exec <node-agent-pod> -- unroute -6
+kubectl -n unbounded-net exec <node-agent-pod> -- unroute -4
+kubectl -n unbounded-net exec <node-agent-pod> -- unroute -6
 
 # Dump raw map entries as <key hex> -> <value hex>
-kubectl -n kube-system exec <node-agent-pod> -- unroute --raw
+kubectl -n unbounded-net exec <node-agent-pod> -- unroute --raw
 ```
 
 #### BPF Status via kubectl Plugin
@@ -662,7 +654,7 @@ overlay to verify end-to-end tunnel connectivity between peers:
 ss -ulnp | grep 9997
 
 # Use the unping tool to send a manual probe (from inside a node agent pod)
-kubectl -n kube-system exec <node-agent-pod> -- unping -t <peer-overlay-ip> -p 9997
+kubectl -n unbounded-net exec <node-agent-pod> -- unping -t <peer-overlay-ip> -p 9997
 ```
 
 #### Status Reporting Chain
@@ -747,7 +739,7 @@ each reconciliation cycle.
 **Diagnosis:**
 ```bash
 # Check controller logs
-kubectl -n kube-system logs -l app=unbounded-net-controller
+kubectl -n unbounded-net logs -l app.kubernetes.io/name=unbounded-net-controller
 
 # Check Site matching for node internal IPs
 kubectl get sites -o yaml
@@ -756,7 +748,7 @@ kubectl get sites -o yaml
 kubectl get node <node-name> -L net.unbounded-cloud.io/site
 
 # Check allocator status (in logs)
-kubectl -n kube-system logs -l app=unbounded-net-controller | grep -i alloc
+kubectl -n unbounded-net logs -l app.kubernetes.io/name=unbounded-net-controller | grep -i alloc
 ```
 
 **Common Causes:**
@@ -790,7 +782,7 @@ ip link show wg51820
 wg show wg51820
 
 # Check for errors in node agent logs
-kubectl -n kube-system logs <node-agent-pod> | grep -i error
+kubectl -n unbounded-net logs <node-agent-pod> | grep -i error
 
 # Verify node annotation
 kubectl get node <node-name> -o jsonpath='{.metadata.annotations.net\.unbounded-kube\.io/wg-pubkey}'
@@ -849,7 +841,7 @@ kubectl get nodes -l net.unbounded-cloud.io/gateway=true \
 curl -v http://<gateway-health-ip>:9998/healthz
 
 # Check node agent logs for health check failures
-kubectl -n kube-system logs <node-agent-pod> | grep -i gateway
+kubectl -n unbounded-net logs <node-agent-pod> | grep -i gateway
 ```
 
 #### 4. Gateway Health Check Failures
@@ -870,7 +862,7 @@ ping <gateway-external-ip>
 kubectl get node <gateway-node> -o jsonpath='{.spec.taints}'
 
 # Check gateway's node agent logs
-kubectl -n kube-system logs <gateway-node-agent-pod>
+kubectl -n unbounded-net logs <gateway-node-agent-pod>
 ```
 
 **Common Causes:**
@@ -881,7 +873,7 @@ kubectl -n kube-system logs <gateway-node-agent-pod>
 **Resolution:**
 ```bash
 # Restart gateway node agent
-kubectl -n kube-system delete pod <gateway-node-agent-pod>
+kubectl -n unbounded-net delete pod <gateway-node-agent-pod>
 
 # Check health server binding
 netstat -tlnp | grep 9998
@@ -896,13 +888,13 @@ netstat -tlnp | grep 9998
 **Diagnosis:**
 ```bash
 # Check controller service endpoints (should be a single EndpointSlice)
-kubectl -n kube-system get endpointslices -l kubernetes.io/service-name=unbounded-net-controller
+kubectl -n unbounded-net get endpointslices -l kubernetes.io/service-name=unbounded-net-controller
 
 # Verify no stale v1/Endpoints resource exists
-kubectl -n kube-system get endpoints unbounded-net-controller 2>&1
+kubectl -n unbounded-net get endpoints unbounded-net-controller 2>&1
 
 # Check push connectivity from a node agent pod
-kubectl -n kube-system exec <node-agent-pod> -- wget -q -O - http://<controller-service-ip>:80/healthz
+kubectl -n unbounded-net exec <node-agent-pod> -- wget -q -O - http://<controller-service-ip>:80/healthz
 ```
 
 **Common Causes:**
@@ -913,10 +905,10 @@ kubectl -n kube-system exec <node-agent-pod> -- wget -q -O - http://<controller-
 **Resolution:**
 ```bash
 # Delete stale endpoints if present (controller does this automatically on startup)
-kubectl -n kube-system delete endpoints unbounded-net-controller 2>/dev/null
+kubectl -n unbounded-net delete endpoints unbounded-net-controller 2>/dev/null
 
 # Restart the controller to trigger leader election and endpoint cleanup
-kubectl -n kube-system rollout restart deployment/unbounded-net-controller
+kubectl -n unbounded-net rollout restart deployment/unbounded-net-controller
 ```
 
 > **Note:** The controller Service has **no selector**. The leader pod manages its own `EndpointSlice` directly, ensuring only the leader receives push requests. This is by design -- do not add a selector to the service.
@@ -946,7 +938,7 @@ tc filter show dev unbounded0 egress
 bpftool map list | grep unbounded
 
 # BPF entry dump (from node agent pod)
-# kubectl -n kube-system exec <node-agent-pod> -- unroute
+# kubectl -n unbounded-net exec <node-agent-pod> -- unroute
 
 # Interfaces (eBPF mode)
 ip link show unbounded0
@@ -972,14 +964,14 @@ ls -la /etc/wireguard/
 
 # === Controller Diagnostics ===
 # Leader status
-kubectl -n kube-system get lease unbounded-net-controller -o yaml
+kubectl -n unbounded-net get lease unbounded-net-controller -o yaml
 
 # Recent logs
-kubectl -n kube-system logs -l app=unbounded-net-controller --tail=100
+kubectl -n unbounded-net logs -l app.kubernetes.io/name=unbounded-net-controller --tail=100
 
 # === Node Agent Diagnostics ===
 # Recent logs
-kubectl -n kube-system logs -l app=unbounded-net-node --tail=100
+kubectl -n unbounded-net logs -l app.kubernetes.io/name=unbounded-net-node --tail=100
 
 # === kubectl Plugin ===
 # Node list with status summary
@@ -1037,7 +1029,7 @@ flowchart TD
 ```bash
 # 1. Create the site
 kubectl apply -f - <<EOF
-apiVersion: net.unbounded-cloud.io/v1alpha1
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Site
 metadata:
   name: site-new
@@ -1122,8 +1114,8 @@ kubectl edit site <site-name>
 ### Rolling Restart of Node Agents
 
 ```bash
-kubectl -n kube-system rollout restart daemonset/unbounded-net-node
-kubectl -n kube-system rollout status daemonset/unbounded-net-node
+kubectl -n unbounded-net rollout restart daemonset/unbounded-net-node
+kubectl -n unbounded-net rollout status daemonset/unbounded-net-node
 ```
 
 ---
@@ -1150,14 +1142,14 @@ kubectl -n kube-system rollout status daemonset/unbounded-net-node
 
 3. **Controller Configuration:**
    ```bash
-   kubectl -n kube-system get deploy unbounded-net-controller -o yaml > controller-backup.yaml
+   kubectl -n unbounded-net get deploy unbounded-net-controller -o yaml > controller-backup.yaml
    ```
 
 ### Recovery Procedure
 
 ```bash
 # 1. Restore CRDs (if cluster recreated)
-kubectl apply -f deploy/net/crd/
+kubectl unbounded install
 
 # 2. Restore Sites, GatewayPools, and peering resources
 kubectl apply -f sites-backup.yaml
@@ -1166,14 +1158,10 @@ kubectl apply -f sitepeerings-backup.yaml
 kubectl apply -f sgpa-backup.yaml
 kubectl apply -f gatewaypoolpeerings-backup.yaml
 
-# 3. Restore controller
-kubectl apply -f deploy/controller/
+# 3. Restore controller configuration
 kubectl apply -f controller-backup.yaml
 
-# 4. Deploy node agents
-kubectl apply -f deploy/node/
-
-# 5. Re-apply gateway labels
+# 4. Re-apply gateway labels
 kubectl label node <gateway> net.unbounded-cloud.io/gateway=true
 ```
 
@@ -1238,7 +1226,7 @@ Token lifetimes are configurable:
 The controller manages its own self-signed CA and uses it to issue a serving
 certificate for the unified HTTPS server on port 9999. The private key and
 serving certificate are stored in the `unbounded-net-serving-cert` secret
-(kube-system). The CA public certificate is published to the
+in the `unbounded-net` namespace. The CA public certificate is published to the
 `unbounded-net-serving-ca` ConfigMap so that node agents can verify the
 controller's identity.
 
@@ -1265,11 +1253,11 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: allow-unbounded-net
-  namespace: kube-system
+  namespace: unbounded-net
 spec:
   podSelector:
     matchLabels:
-      app: unbounded-net-node
+      app.kubernetes.io/name: unbounded-net-node
   policyTypes:
     - Ingress
     - Egress
@@ -1292,7 +1280,7 @@ WireGuard keys are generated once per node. To rotate:
 rm /etc/wireguard/server.priv /etc/wireguard/server.pub
 
 # Restart node agent
-kubectl -n kube-system delete pod <node-agent-pod>
+kubectl -n unbounded-net delete pod <node-agent-pod>
 ```
 
 Note: This will briefly disrupt connectivity to/from that node.
@@ -1308,5 +1296,7 @@ rules:
   - level: Metadata
     resources:
       - group: "net.unbounded-cloud.io"
-        resources: ["sites", "sitenodeslices", "gatewaypools", "gatewaypoolnodes", "sitepeerings", "sitegatewaypoolassignments", "gatewaypoolpeerings"]
+        resources: ["sitenodeslices", "gatewaypools", "gatewaypoolnodes", "sitepeerings", "sitegatewaypoolassignments", "gatewaypoolpeerings"]
+      - group: "unbounded-cloud.io"
+        resources: ["sites"]
 ```

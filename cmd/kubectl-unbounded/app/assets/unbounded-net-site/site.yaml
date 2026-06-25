@@ -1,11 +1,20 @@
 ---
-apiVersion: net.unbounded-cloud.io/v1alpha1
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Site
 metadata:
   name: {{ .SiteName }}
   labels:
     unbounded-cloud.io/site: "{{ .SiteName }}"
 spec:
+  components:
+    net:
+      enabled: {{ .EnableNet }}
+    machina:
+      enabled: {{ .EnableMachina }}
+    metalman:
+      enabled: {{ .EnableMetalman }}
+    unboundedStorage:
+      enabled: {{ .EnableUnboundedStorage }}
   {{- if not .ManageCniPlugin }}
   manageCniPlugin: false
   {{- end }}

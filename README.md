@@ -98,8 +98,9 @@ chmod +x aks-quickstart.sh
     --remote-pod-cidr 10.245.0.0/16
 ```
 
-> This takes about 8 minutes. The script creates an AKS cluster, adds a gateway
-> node pool, and runs `kubectl unbounded site init` to install the networking stack.
+> The script creates an AKS cluster, adds a gateway node pool, and runs
+> `kubectl unbounded site init` to bootstrap the operator and request the
+> networking stack through the cluster Site.
 
 ### 3. Add a remote node
 

@@ -40,11 +40,15 @@ func TestEnsureUnboundedSite_DefaultTemplates(t *testing.T) {
 	//
 	// Since the fake Apply doesn't give us raw bytes, we render manually.
 	cfg := unboundedSiteConfig{
-		SiteName:        "test-site",
-		NodeCIDRs:       []string{"10.0.0.0/24"},
-		PodCIDRs:        []string{"10.1.0.0/24"},
-		ManageCniPlugin: true,
-		Manifests:       []string{"site.yaml"},
+		SiteName:               "test-site",
+		NodeCIDRs:              []string{"10.0.0.0/24"},
+		PodCIDRs:               []string{"10.1.0.0/24"},
+		ManageCniPlugin:        true,
+		EnableNet:              true,
+		EnableMachina:          true,
+		EnableMetalman:         true,
+		EnableUnboundedStorage: true,
+		Manifests:              []string{"site.yaml"},
 	}
 
 	h := &siteInitHandler{
@@ -55,23 +59,45 @@ func TestEnsureUnboundedSite_DefaultTemplates(t *testing.T) {
 	err := h.ensureUnboundedSite(context.Background(), cfg)
 	require.NoError(t, err)
 
-	// Verify default mode uses net.unbounded-cloud.io apiVersion by
+	// Verify site init renders the promoted global Site API by
 	// rendering the template directly.
 	content, err := siteTemplates.ReadFile("assets/unbounded-net-site/site.yaml")
 	require.NoError(t, err)
 
 	appliedYAML = content
-	require.Contains(t, string(appliedYAML), "net.unbounded-cloud.io/v1alpha1")
-	require.NotContains(t, string(appliedYAML), "unbounded.aks.azure.com/v1alpha1")
+	require.Contains(t, string(appliedYAML), "unbounded-cloud.io/v1alpha3")
+	require.NotContains(t, string(appliedYAML), "net.unbounded-cloud.io/v1alpha1")
 }
 
-// TestSiteInitCommand_DefaultCNIManifests verifies the default --cni-manifests
-// value is empty so the embedded manifests are used.
-func TestSiteInitCommand_DefaultCNIManifests(t *testing.T) {
+func TestSiteInitCommand_ComponentFlags(t *testing.T) {
 	cmd := siteInitCommand()
-	f := cmd.Flags().Lookup("cni-manifests")
-	require.NotNil(t, f)
-	require.Equal(t, "", f.DefValue)
+
+	require.Nil(t, cmd.Flags().Lookup("cni-manifests"))
+	require.Nil(t, cmd.Flags().Lookup("machina-manifests"))
+
+	flag := cmd.Flags().Lookup("enable-net")
+	require.NotNil(t, flag)
+	require.Equal(t, "true", flag.DefValue)
+
+	flag = cmd.Flags().Lookup("enable-machina")
+	require.NotNil(t, flag)
+	require.Equal(t, "true", flag.DefValue)
+
+	flag = cmd.Flags().Lookup("enable-metalman")
+	require.NotNil(t, flag)
+	require.Equal(t, "false", flag.DefValue)
+
+	flag = cmd.Flags().Lookup("enable-unbounded-storage")
+	require.NotNil(t, flag)
+	require.Equal(t, "false", flag.DefValue)
+
+	flag = cmd.Flags().Lookup("skip-install")
+	require.NotNil(t, flag)
+	require.Equal(t, "false", flag.DefValue)
+
+	flag = cmd.Flags().Lookup("install-timeout")
+	require.NotNil(t, flag)
+	require.Equal(t, defaultInstallTimeout.String(), flag.DefValue)
 }
 
 func TestSiteInitCommand_ManageCniPluginFlag(t *testing.T) {
@@ -95,6 +121,8 @@ func TestEnsureUnboundedSite_ManageCniPluginFalse(t *testing.T) {
 		NodeCIDRs:       []string{"10.0.0.0/24"},
 		PodCIDRs:        []string{"10.1.0.0/24"},
 		ManageCniPlugin: false,
+		EnableNet:       true,
+		EnableMachina:   true,
 		Manifests:       []string{"site.yaml"},
 	}
 
@@ -135,6 +163,8 @@ func TestEnsureUnboundedSite_ManageCniPluginTrue(t *testing.T) {
 		NodeCIDRs:       []string{"10.0.0.0/24"},
 		PodCIDRs:        []string{"10.1.0.0/24"},
 		ManageCniPlugin: true,
+		EnableNet:       true,
+		EnableMachina:   true,
 		Manifests:       []string{"site.yaml"},
 	}
 
@@ -159,4 +189,60 @@ func TestEnsureUnboundedSite_ManageCniPluginTrue(t *testing.T) {
 	rendered := buf.String()
 	assert.NotContains(t, rendered, "manageCniPlugin")
 	assert.Contains(t, rendered, "name: test-site")
+}
+
+func TestEnsureUnboundedSite_ComponentConfig(t *testing.T) {
+	cfg := unboundedSiteConfig{
+		SiteName:               "test-site",
+		NodeCIDRs:              []string{"10.0.0.0/24"},
+		PodCIDRs:               []string{"10.1.0.0/24"},
+		ManageCniPlugin:        true,
+		EnableNet:              true,
+		EnableMachina:          true,
+		EnableMetalman:         true,
+		EnableUnboundedStorage: true,
+	}
+
+	content, err := siteTemplates.ReadFile("assets/unbounded-net-site/site.yaml")
+	require.NoError(t, err)
+
+	tmpl, err := template.New("site.yaml").Parse(string(content))
+	require.NoError(t, err)
+
+	var buf strings.Builder
+	require.NoError(t, tmpl.Execute(&buf, cfg))
+
+	rendered := buf.String()
+	assert.Contains(t, rendered, "apiVersion: unbounded-cloud.io/v1alpha3")
+	assert.Contains(t, rendered, "net:\n      enabled: true")
+	assert.Contains(t, rendered, "machina:\n      enabled: true")
+	assert.Contains(t, rendered, "metalman:\n      enabled: true")
+	assert.Contains(t, rendered, "unboundedStorage:\n      enabled: true")
+}
+
+func TestSiteInitComponentOwnership(t *testing.T) {
+	h := &siteInitHandler{
+		name:                   "edge",
+		clusterNodeCIDR:        "10.0.0.0/24",
+		clusterPodCIDR:         "10.1.0.0/24",
+		nodeCIDR:               "10.2.0.0/24",
+		podCIDR:                "10.3.0.0/24",
+		manageCniPlugin:        true,
+		enableNet:              true,
+		enableMachina:          true,
+		enableMetalman:         true,
+		enableUnboundedStorage: true,
+	}
+
+	cluster := h.clusterSiteConfig()
+	assert.True(t, cluster.EnableNet)
+	assert.True(t, cluster.EnableMachina)
+	assert.True(t, cluster.EnableUnboundedStorage)
+	assert.False(t, cluster.EnableMetalman)
+
+	remote := h.remoteSiteConfig()
+	assert.False(t, remote.EnableNet)
+	assert.False(t, remote.EnableMachina)
+	assert.False(t, remote.EnableUnboundedStorage)
+	assert.True(t, remote.EnableMetalman)
 }

@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
@@ -515,10 +516,10 @@ func TestBuildGatewayNodeRoutesForAssignedSitesStatus_IncludesRemoteAssignedSite
 		},
 	}
 
-	siteMap := map[string]*unboundednetv1alpha1.Site{
+	siteMap := map[string]*unboundedv1alpha3.Site{
 		"pal3-dc1": {
 			ObjectMeta: metav1.ObjectMeta{Name: "pal3-dc1"},
-			Spec: unboundednetv1alpha1.SiteSpec{
+			Spec: unboundedv1alpha3.SiteSpec{
 				NodeCidrs: []string{"100.65.0.0/16"},
 				PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{
 					{CidrBlocks: []string{"100.125.0.0/16"}},
@@ -568,10 +569,10 @@ func TestBuildGatewayNodeRoutesForAssignedSitesStatus_SkipsDisabledAssignments(t
 		},
 	}
 
-	siteMap := map[string]*unboundednetv1alpha1.Site{
+	siteMap := map[string]*unboundedv1alpha3.Site{
 		"pal3-dc1": {
 			ObjectMeta: metav1.ObjectMeta{Name: "pal3-dc1"},
-			Spec: unboundednetv1alpha1.SiteSpec{
+			Spec: unboundedv1alpha3.SiteSpec{
 				NodeCidrs: []string{"100.65.0.0/16"},
 			},
 		},

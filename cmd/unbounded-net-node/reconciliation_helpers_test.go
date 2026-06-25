@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/net/healthcheck"
 )
@@ -79,9 +80,9 @@ func TestHealthCheckProfileSettingsHelpers(t *testing.T) {
 		t.Fatalf("unexpected profile %#v, want %#v", profile, want)
 	}
 
-	siteMap := map[string]*unboundednetv1alpha1.Site{
+	siteMap := map[string]*unboundedv1alpha3.Site{
 		"site-a": {
-			Spec: unboundednetv1alpha1.SiteSpec{
+			Spec: unboundedv1alpha3.SiteSpec{
 				HealthCheckSettings: &unboundednetv1alpha1.HealthCheckSettings{
 					Enabled:          ptrBool(true),
 					DetectMultiplier: ptrInt32(7),
