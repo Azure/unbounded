@@ -7,12 +7,14 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -20,26 +22,30 @@ const checkAPIServerReachableName = "api-server-reachable"
 
 type apiServerReachableChecker struct {
 	log        *slog.Logger
-	url        string
-	caCertData []byte
+	config     *config.AgentConfig
 	httpClient *http.Client
 }
 
 // CheckAPIServerReachable returns a non-mutating checker that validates the
 // configured Kubernetes API server can be reached from the host. The checker
 // redacts the configured endpoint from result messages.
-func CheckAPIServerReachable(log *slog.Logger, apiServer string, caCertData []byte) preflight.Checker {
-	return apiServerReachableChecker{log: log, url: apiServer, caCertData: caCertData}
+func CheckAPIServerReachable(log *slog.Logger, cfg *config.AgentConfig) preflight.Checker {
+	return apiServerReachableChecker{log: log, config: cfg}
 }
 
 func (c apiServerReachableChecker) Name() string { return checkAPIServerReachableName }
 
 func (c apiServerReachableChecker) Check(ctx context.Context) []preflight.Result {
-	if strings.TrimSpace(c.url) == "" {
+	if c.config == nil {
+		return preflight.ResultsError(checkAPIServerReachableName, "cluster API server", "agent config is missing")
+	}
+
+	apiServer := c.config.Kubelet.ApiServer
+	if strings.TrimSpace(apiServer) == "" {
 		return preflight.ResultsError(checkAPIServerReachableName, "cluster API server", "API server is required")
 	}
 
-	parsed, err := url.Parse(c.url)
+	parsed, err := url.Parse(apiServer)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return preflight.ResultsError(checkAPIServerReachableName, "cluster API server", "API server endpoint is invalid")
 	}
@@ -49,7 +55,7 @@ func (c apiServerReachableChecker) Check(ctx context.Context) []preflight.Result
 		client = c.httpClientWithCA()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.url, "/")+"/readyz", http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(apiServer, "/")+"/readyz", http.NoBody)
 	if err != nil {
 		return preflight.ResultsError(checkAPIServerReachableName, "cluster API server", "API server request could not be created")
 	}
@@ -73,13 +79,14 @@ func (c apiServerReachableChecker) httpClientWithCA() *http.Client {
 		transport = defaultTransport.Clone()
 	}
 
-	if len(c.caCertData) > 0 {
+	caCertData, err := base64.StdEncoding.DecodeString(c.config.Cluster.CaCertBase64)
+	if err == nil && len(caCertData) > 0 {
 		pool, err := x509.SystemCertPool()
 		if err != nil {
 			pool = x509.NewCertPool()
 		}
 
-		pool.AppendCertsFromPEM(c.caCertData)
+		pool.AppendCertsFromPEM(caCertData)
 		transport.TLSClientConfig = &tls.Config{RootCAs: pool} //nolint:gosec // uses configured root CAs.
 	}
 

@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -22,13 +23,13 @@ func TestCheckAPIServerReachableOK(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), srv.URL, nil).Check(context.Background())
+	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), apiServerPreflightConfig(srv.URL)).Check(context.Background())
 
 	assert.Equal(t, preflight.ResultsOK(checkAPIServerReachableName, "cluster API server", "API server is reachable"), results)
 }
 
 func TestCheckAPIServerReachableInvalidEndpoint(t *testing.T) {
-	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), "://bad", nil).Check(context.Background())
+	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), apiServerPreflightConfig("://bad")).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Equal(t, checkAPIServerReachableName, results[0].Name)
@@ -39,7 +40,7 @@ func TestCheckAPIServerReachableInvalidEndpoint(t *testing.T) {
 func TestCheckAPIServerReachableRequestFailureIsRedacted(t *testing.T) {
 	const endpoint = "https://127.0.0.1:1"
 
-	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), endpoint, nil).Check(context.Background())
+	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), apiServerPreflightConfig(endpoint)).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Equal(t, "API server is not reachable", results[0].Message)
@@ -52,8 +53,19 @@ func TestCheckAPIServerReachableServerError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), srv.URL, nil).Check(context.Background())
+	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), apiServerPreflightConfig(srv.URL)).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Equal(t, "API server returned status 500", results[0].Message)
+}
+
+func apiServerPreflightConfig(apiServer string) *config.AgentConfig {
+	return &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2E=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: apiServer,
+		},
+	}
 }

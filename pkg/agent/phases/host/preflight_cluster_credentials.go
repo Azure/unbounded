@@ -9,23 +9,22 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
 const checkClusterCredentialsName = "cluster-credentials"
 
 type clusterCredentialsChecker struct {
-	log                   *slog.Logger
-	config                *config.AgentConfig
-	attestationConfigured bool
+	log    *slog.Logger
+	config *provision.UnboundedAgentConfig
 }
 
 // CheckClusterCredentials returns a checker that validates cluster CA data and
-// the bootstrap credential. When attestationConfigured is true, missing kubelet
-// auth is allowed because attestation can provide the credential later.
-func CheckClusterCredentials(log *slog.Logger, cfg *config.AgentConfig, attestationConfigured bool) preflight.Checker {
-	return clusterCredentialsChecker{log: log, config: cfg, attestationConfigured: attestationConfigured}
+// the bootstrap credential. When attestation is configured, missing kubelet auth
+// is allowed because attestation can provide the credential later.
+func CheckClusterCredentials(log *slog.Logger, cfg *provision.UnboundedAgentConfig) preflight.Checker {
+	return clusterCredentialsChecker{log: log, config: cfg}
 }
 
 // Name returns the stable check name used in reports and ignore rules.
@@ -42,8 +41,8 @@ func (c clusterCredentialsChecker) Check(context.Context) []preflight.Result {
 		errs = append(errs, "cluster CA data is invalid")
 	}
 
-	auth := c.config.Kubelet.Auth
-	if !c.attestationConfigured {
+	if c.config.Attest == nil {
+		auth := c.config.Kubelet.Auth
 		if err := auth.Validate(); err != nil {
 			errs = append(errs, "bootstrap credential is invalid")
 		}

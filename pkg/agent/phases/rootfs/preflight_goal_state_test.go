@@ -5,7 +5,6 @@ package rootfs
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"testing"
 
@@ -29,13 +28,13 @@ func validRootFSGoalState(t *testing.T) *goalstates.RootFS {
 }
 
 func TestCheckGoalStateOK(t *testing.T) {
-	results := CheckGoalState(slog.New(slog.DiscardHandler), nil, validRootFSGoalState(t)).Check(context.Background())
+	results := CheckGoalState(slog.New(slog.DiscardHandler), validRootFSGoalState(t)).Check(context.Background())
 
 	assert.Equal(t, []preflight.Result{preflight.OK(checkGoalStateName, "goal state", "goal state resolved")}, results)
 }
 
 func TestCheckGoalStateResolveError(t *testing.T) {
-	results := CheckGoalState(slog.New(slog.DiscardHandler), errors.New("boom"), nil).Check(context.Background())
+	results := CheckGoalState(slog.New(slog.DiscardHandler), nil).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Equal(t, checkGoalStateName, results[0].Name)

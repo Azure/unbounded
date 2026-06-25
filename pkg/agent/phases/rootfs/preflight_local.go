@@ -93,9 +93,10 @@ func (c nspawnMachineProvisioningChecker) Check(context.Context) []preflight.Res
 func (c nspawnMachineProvisioningChecker) checkMachineDir() []preflight.Result {
 	var results []preflight.Result
 
-	c.log.Debug("checking machine directory", "path", c.gs.MachineDir)
+	machineDir := c.gs.MachineDir
+	c.log.Debug("checking machine directory", "path", machineDir)
 
-	info, err := c.deps.stat(c.gs.MachineDir)
+	info, err := c.deps.stat(machineDir)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		// Missing machine directory is fine if the parent/provisioning paths are writable.
@@ -105,14 +106,14 @@ func (c nspawnMachineProvisioningChecker) checkMachineDir() []preflight.Result {
 			checkNSpawnMachineProvisioningName,
 			"nspawn machine provisioning",
 			"machine directory cannot be inspected: %s",
-			c.gs.MachineDir,
+			machineDir,
 		)
 	case !info.IsDir():
 		return preflight.ResultsError(
 			checkNSpawnMachineProvisioningName,
 			"nspawn machine provisioning",
 			"machine directory path is not a directory: %s",
-			c.gs.MachineDir,
+			machineDir,
 		)
 	}
 
@@ -123,17 +124,17 @@ func (c nspawnMachineProvisioningChecker) checkMachineDir() []preflight.Result {
 			checkNSpawnMachineProvisioningName,
 			"nspawn machine provisioning",
 			"machine directory permissions are too restrictive: %s",
-			c.gs.MachineDir,
+			machineDir,
 		))
 	}
 
-	empty, err := isDirEmpty(c.deps.open, c.gs.MachineDir)
+	empty, err := isDirEmpty(c.deps.open, machineDir)
 	if err != nil {
 		return append(results, preflight.Error(
 			checkNSpawnMachineProvisioningName,
 			"nspawn machine provisioning",
 			"machine directory cannot be read: %s",
-			c.gs.MachineDir,
+			machineDir,
 		))
 	}
 
@@ -141,9 +142,9 @@ func (c nspawnMachineProvisioningChecker) checkMachineDir() []preflight.Result {
 		// A populated machine directory is expected during rejoin or reuse of an
 		// existing kube1/kube2 rootfs. Rootfs provisioning will skip bootstrap
 		// rather than overwrite it.
-		c.log.Debug("machine directory exists and is not empty", "path", c.gs.MachineDir)
+		c.log.Debug("machine directory exists and is not empty", "path", machineDir)
 	} else {
-		c.log.Debug("machine directory exists and is empty", "path", c.gs.MachineDir)
+		c.log.Debug("machine directory exists and is empty", "path", machineDir)
 	}
 
 	return results

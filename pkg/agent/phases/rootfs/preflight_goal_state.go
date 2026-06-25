@@ -18,19 +18,18 @@ const (
 
 type goalStateChecker struct {
 	log    *slog.Logger
-	err    error
 	rootFS *goalstates.RootFS
 }
 
 // CheckGoalState validates the agent config resolved into a machine goal state.
-func CheckGoalState(log *slog.Logger, err error, rootFS *goalstates.RootFS) preflight.Checker {
-	return goalStateChecker{log: log, err: err, rootFS: rootFS}
+func CheckGoalState(log *slog.Logger, rootFS *goalstates.RootFS) preflight.Checker {
+	return goalStateChecker{log: log, rootFS: rootFS}
 }
 
 func (c goalStateChecker) Name() string { return checkGoalStateName }
 
 func (c goalStateChecker) Check(context.Context) []preflight.Result {
-	if c.err != nil || c.rootFS == nil {
+	if c.rootFS == nil {
 		return preflight.ResultsError(checkGoalStateName, "goal state", "goal state could not be resolved")
 	}
 

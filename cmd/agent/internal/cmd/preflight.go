@@ -5,7 +5,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -58,6 +57,7 @@ func newCmdPreflight(cmdCtx *CommandContext) *cobra.Command {
 
 func (h *preflightHandler) execute(ctx context.Context) error {
 	h.cmdCtx.Setup()
+	logger := h.cmdCtx.Logger
 
 	if h.configPath != "" {
 		oldConfigPath := os.Getenv(configFileEnv)
@@ -68,43 +68,35 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		}
 	}
 
-	cfg, err := loadConfig(h.cmdCtx.Logger)
+	cfg, err := loadConfig(logger)
 	if err != nil {
 		return err
 	}
 
-	caCertData, err := base64.StdEncoding.DecodeString(cfg.Cluster.CaCertBase64)
-	if err != nil {
-		caCertData = nil
-	}
-
-	goalState, goalStateErr := goalstates.ResolveMachine(
-		h.cmdCtx.Logger,
+	goalState, err := goalstates.ResolveMachine(
+		logger,
 		&cfg.AgentConfig,
 		goalstates.NSpawnMachineKube1,
 		provision.ResolveDownloadOverrides(cfg.Downloads),
 	)
-
-	var rootFSGoalState *goalstates.RootFS
-
-	if goalState != nil {
-		rootFSGoalState = goalState.RootFS
+	if err != nil {
+		return fmt.Errorf("resolve goal state: %w", err)
 	}
 
 	checks := []preflight.Checker{
-		host.CheckIsPrivilegedUser(h.cmdCtx.Logger),
-		host.CheckAgentConfig(h.cmdCtx.Logger, &cfg.AgentConfig),
-		host.CheckClusterCredentials(h.cmdCtx.Logger, &cfg.AgentConfig, cfg.Attest != nil),
-		host.CheckHostPackages(h.cmdCtx.Logger),
-		host.CheckHostOSConfiguration(h.cmdCtx.Logger),
-		host.CheckNSpawnRuntime(h.cmdCtx.Logger),
-		host.CheckDockerActive(h.cmdCtx.Logger),
-		host.CheckSwapActive(h.cmdCtx.Logger),
-		host.CheckDiskSpace(h.cmdCtx.Logger),
-		host.CheckCgroups(h.cmdCtx.Logger),
-		nodestart.CheckAPIServerReachable(h.cmdCtx.Logger, cfg.Kubelet.ApiServer, caCertData),
-		rootfs.CheckGoalState(h.cmdCtx.Logger, goalStateErr, rootFSGoalState),
-		rootfs.CheckNSpawnMachineProvisioning(h.cmdCtx.Logger, rootFSGoalState),
+		host.CheckIsPrivilegedUser(logger),
+		host.CheckAgentConfig(logger, &cfg.AgentConfig),
+		host.CheckClusterCredentials(logger, cfg),
+		host.CheckHostPackages(logger),
+		host.CheckHostOSConfiguration(logger),
+		host.CheckNSpawnRuntime(logger),
+		host.CheckDockerActive(logger),
+		host.CheckSwapActive(logger),
+		host.CheckDiskSpace(logger),
+		host.CheckCgroups(logger),
+		nodestart.CheckAPIServerReachable(logger, &cfg.AgentConfig),
+		rootfs.CheckGoalState(logger, goalState.RootFS),
+		rootfs.CheckNSpawnMachineProvisioning(logger, goalState.RootFS),
 	}
 
 	opts := preflight.Options{
