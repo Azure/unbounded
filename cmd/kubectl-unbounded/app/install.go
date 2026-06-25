@@ -102,9 +102,11 @@ func (h *installHandler) execute(ctx context.Context) error {
 	if h.namespace == "" {
 		h.namespace = machinaNamespace
 	}
+
 	if h.netNamespace == "" {
 		h.netNamespace = netNamespace
 	}
+
 	if h.timeout == 0 {
 		h.timeout = defaultInstallTimeout
 	}
@@ -181,16 +183,28 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 	setNamespace(obj, h.namespace)
 
 	if obj.GetKind() == "Deployment" && obj.GetName() == "unbounded-operator" {
-		setContainerImage(obj, "controller", h.operatorImage)
-		replaceContainerArg(obj, "controller", "--leader-elect-namespace=", h.namespace)
-		replaceContainerArg(obj, "controller", "--default-namespace=", h.namespace)
-		replaceContainerArg(obj, "controller", "--net-namespace=", h.netNamespace)
-		replaceContainerArg(obj, "controller", "--net-controller-image=", h.netControllerImage)
-		replaceContainerArg(obj, "controller", "--net-node-image=", h.netNodeImage)
-		replaceContainerArg(obj, "controller", "--machina-image=", h.machinaImage)
-		replaceContainerArg(obj, "controller", "--metalman-image=", h.metalmanImage)
-		replaceContainerArg(obj, "controller", "--storage-supervisor-image=", h.storageSupervisorImage)
-		replaceContainerArg(obj, "controller", "--api-server-endpoint=", h.apiServerEndpoint)
+		if err := setContainerImage(obj, "controller", h.operatorImage); err != nil {
+			return err
+		}
+
+		for _, replacement := range []struct {
+			prefix string
+			value  string
+		}{
+			{prefix: "--leader-elect-namespace=", value: h.namespace},
+			{prefix: "--default-namespace=", value: h.namespace},
+			{prefix: "--net-namespace=", value: h.netNamespace},
+			{prefix: "--net-controller-image=", value: h.netControllerImage},
+			{prefix: "--net-node-image=", value: h.netNodeImage},
+			{prefix: "--machina-image=", value: h.machinaImage},
+			{prefix: "--metalman-image=", value: h.metalmanImage},
+			{prefix: "--storage-supervisor-image=", value: h.storageSupervisorImage},
+			{prefix: "--api-server-endpoint=", value: h.apiServerEndpoint},
+		} {
+			if err := replaceContainerArg(obj, "controller", replacement.prefix, replacement.value); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
@@ -201,6 +215,7 @@ func (h *installHandler) waitForOperator(ctx context.Context) error {
 	defer cancel()
 
 	deploy := &appsv1.Deployment{}
+
 	key := client.ObjectKey{Namespace: h.namespace, Name: "unbounded-operator"}
 	for {
 		if err := h.kubeResourcesCli.Get(deadlineCtx, key, deploy); err != nil {
@@ -235,16 +250,19 @@ func (h *installHandler) waitForCRDs(ctx context.Context) error {
 
 	for {
 		ready := true
+
 		for _, name := range crds {
 			obj := &unstructured.Unstructured{}
 			obj.SetAPIVersion("apiextensions.k8s.io/v1")
 			obj.SetKind("CustomResourceDefinition")
+
 			if err := h.kubeResourcesCli.Get(deadlineCtx, client.ObjectKey{Name: name}, obj); err != nil {
 				if !apierrors.IsNotFound(err) {
 					return fmt.Errorf("get customresourcedefinition %s: %w", name, err)
 				}
 
 				ready = false
+
 				break
 			}
 
@@ -267,8 +285,8 @@ func (h *installHandler) waitForCRDs(ctx context.Context) error {
 }
 
 func crdEstablished(obj *unstructured.Unstructured) bool {
-	conditions, ok, _ := unstructured.NestedSlice(obj.Object, "status", "conditions")
-	if !ok {
+	conditions, ok, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	if err != nil || !ok {
 		return false
 	}
 
@@ -355,10 +373,12 @@ func applyManifestData(ctx context.Context, logger *slog.Logger, k8sClient clien
 
 func yamlFiles(fsys fs.FS) ([]string, error) {
 	var files []string
+
 	if err := fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
+
 		if d.IsDir() {
 			return nil
 		}
@@ -390,10 +410,12 @@ func setNamespace(obj *unstructured.Unstructured, namespace string) {
 	if namespace == "" {
 		return
 	}
+
 	if obj.GetKind() == "Namespace" {
 		obj.SetName(namespace)
 		return
 	}
+
 	if obj.GetNamespace() == "" {
 		return
 	}
@@ -432,14 +454,18 @@ func rewriteStringValues(value any, oldValue, newValue string) {
 	}
 }
 
-func setContainerImage(obj *unstructured.Unstructured, containerName, image string) {
+func setContainerImage(obj *unstructured.Unstructured, containerName, image string) error {
 	if image == "" {
-		return
+		return nil
 	}
 
-	containers, ok, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+	containers, ok, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+	if err != nil {
+		return fmt.Errorf("get deployment containers: %w", err)
+	}
+
 	if !ok {
-		return
+		return nil
 	}
 
 	for i, container := range containers {
@@ -449,20 +475,30 @@ func setContainerImage(obj *unstructured.Unstructured, containerName, image stri
 		}
 
 		containerMap["image"] = image
+
 		containers[i] = containerMap
-		_ = unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
-		return
+		if err := unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers"); err != nil {
+			return fmt.Errorf("set deployment containers: %w", err)
+		}
+
+		return nil
 	}
+
+	return nil
 }
 
-func replaceContainerArg(obj *unstructured.Unstructured, containerName, prefix, value string) {
+func replaceContainerArg(obj *unstructured.Unstructured, containerName, prefix, value string) error {
 	if value == "" {
-		return
+		return nil
 	}
 
-	containers, ok, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+	containers, ok, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+	if err != nil {
+		return fmt.Errorf("get deployment containers: %w", err)
+	}
+
 	if !ok {
-		return
+		return nil
 	}
 
 	for i, container := range containers {
@@ -473,7 +509,7 @@ func replaceContainerArg(obj *unstructured.Unstructured, containerName, prefix, 
 
 		args, ok := containerMap["args"].([]any)
 		if !ok {
-			return
+			return nil
 		}
 
 		for j, arg := range args {
@@ -484,9 +520,15 @@ func replaceContainerArg(obj *unstructured.Unstructured, containerName, prefix, 
 
 			args[j] = prefix + value
 			containerMap["args"] = args
+
 			containers[i] = containerMap
-			_ = unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
-			return
+			if err := unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers"); err != nil {
+				return fmt.Errorf("set deployment containers: %w", err)
+			}
+
+			return nil
 		}
 	}
+
+	return nil
 }

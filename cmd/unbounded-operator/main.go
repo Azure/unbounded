@@ -86,6 +86,7 @@ func run(ctx context.Context, cfg config) error {
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 
 	scheme := runtimeScheme()
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                        scheme,
 		Metrics:                       metricsserver.Options{BindAddress: cfg.metricsAddr},
@@ -119,11 +120,13 @@ func run(ctx context.Context, cfg config) error {
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		return fmt.Errorf("add healthz check: %w", err)
 	}
+
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		return fmt.Errorf("add readyz check: %w", err)
 	}
 
 	ctrl.Log.Info("starting unbounded-operator")
+
 	if err := mgr.Start(ctx); err != nil {
 		return fmt.Errorf("start manager: %w", err)
 	}

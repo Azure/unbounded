@@ -52,6 +52,7 @@ func TestInstallHandlerApplyBootstrapManifests(t *testing.T) {
 				named, ok := obj.(interface{ GetName() string })
 				if ok {
 					mu.Lock()
+
 					applied = append(applied, named.GetName())
 					mu.Unlock()
 				}
