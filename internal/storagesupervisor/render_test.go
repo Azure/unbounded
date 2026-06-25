@@ -206,6 +206,72 @@ func TestRenderConfigInvalidValues(t *testing.T) {
 	}
 }
 
+func TestRenderConfigRejectsDanglingRenderedBindings(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name: "frontend source",
+			yaml: `
+frontends:
+  - name: f
+    source: ghost
+    loadgen: {}
+`,
+			wantErr: `frontend "f" references unknown source "ghost"`,
+		},
+		{
+			name: "cache source",
+			yaml: `
+caches:
+  - name: c
+    source: ghost
+`,
+			wantErr: `cache "c" references unknown backend source "ghost"`,
+		},
+		{
+			name: "duplicate backend cache component name",
+			yaml: `
+backends:
+  - name: same
+    fake: {}
+caches:
+  - name: same
+    source: same
+`,
+			wantErr: `duplicate component name "same" while adding cache`,
+		},
+		{
+			name: "duplicate cache frontend component name",
+			yaml: `
+backends:
+  - name: origin
+    fake: {}
+caches:
+  - name: same
+    source: origin
+frontends:
+  - name: same
+    source: same
+    loadgen: {}
+`,
+			wantErr: `duplicate component name "same" while adding frontend`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := writeSource(t, tt.yaml)
+
+			_, err := RenderConfig(dir, renderState{})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
 func TestRenderConfigActiveRingOverlay(t *testing.T) {
 	// An active ring injects self + peers and overrides the
 	// ConfigMap's fabric addr with this node's own routable bind, while the
@@ -637,6 +703,9 @@ disks:
 
 func TestRenderConfigCachesUntouched(t *testing.T) {
 	dir := writeSource(t, `
+backends:
+  - name: origin
+    fake: {}
 caches:
   - name: cache-a
     source: origin
@@ -663,6 +732,112 @@ version: 1
 
 	require.Len(t, cfg.GetDisks(), 1)
 	assert.Equal(t, "/dev/nvme1n1", cfg.GetDisks()[0].GetBlock().GetPath())
+}
+
+func TestRenderConfigInjectsAnnotatedLoadgenFrontends(t *testing.T) {
+	dir := writeSource(t, `
+backends:
+  - name: origin
+    fake: {}
+caches:
+  - name: cache
+    source: origin
+frontends:
+  - name: http
+    source: cache
+    http:
+      addr: "0.0.0.0:8080"
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{
+			storageLoadgenAnnotation: "lg;source=cache;workers=32;seed=1234;keyspace_objects=1000000;object_size_bytes=4194304;read_bytes=262144;zipf_exponent=1.1;verify=true,lg2;source=origin",
+		},
+	})
+
+	require.Len(t, cfg.GetFrontends(), 3)
+	assert.Equal(t, "http", cfg.GetFrontends()[0].GetName())
+
+	frontend := cfg.GetFrontends()[1]
+	assert.Equal(t, "lg", frontend.GetName())
+	assert.Equal(t, "cache", frontend.GetSource())
+	loadgen := frontend.GetLoadgen()
+	require.NotNil(t, loadgen)
+	assert.NotNil(t, loadgen.Workers)
+	assert.Equal(t, uint32(32), loadgen.GetWorkers())
+	assert.NotNil(t, loadgen.Seed)
+	assert.Equal(t, uint64(1234), loadgen.GetSeed())
+	assert.NotNil(t, loadgen.KeyspaceObjects)
+	assert.Equal(t, uint64(1000000), loadgen.GetKeyspaceObjects())
+	assert.NotNil(t, loadgen.ObjectSizeBytes)
+	assert.Equal(t, uint64(4194304), loadgen.GetObjectSizeBytes())
+	assert.NotNil(t, loadgen.ReadBytes)
+	assert.Equal(t, uint64(262144), loadgen.GetReadBytes())
+	assert.NotNil(t, loadgen.ZipfExponent)
+	assert.Equal(t, 1.1, loadgen.GetZipfExponent())
+	assert.True(t, loadgen.GetVerify())
+
+	assert.Equal(t, "lg2", cfg.GetFrontends()[2].GetName())
+	assert.Equal(t, "origin", cfg.GetFrontends()[2].GetSource())
+}
+
+func TestRenderConfigSkipsInvalidAnnotatedLoadgenFrontends(t *testing.T) {
+	dir := writeSource(t, `
+backends:
+  - name: origin
+    fake: {}
+caches:
+  - name: cache
+    source: origin
+frontends:
+  - name: existing
+    source: cache
+    http:
+      addr: "0.0.0.0:8080"
+`)
+
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{
+			storageLoadgenAnnotation: "existing;source=cache,missing-source;workers=1,valid;source=cache;workers=bad;workers=2;zipf_exponent=NaN;zipf_exponent=1.3;verify=maybe;verify=true,valid;source=origin",
+		},
+	})
+
+	require.Len(t, cfg.GetFrontends(), 2)
+	assert.Equal(t, "existing", cfg.GetFrontends()[0].GetName())
+	assert.Equal(t, "valid", cfg.GetFrontends()[1].GetName())
+	loadgen := cfg.GetFrontends()[1].GetLoadgen()
+	require.NotNil(t, loadgen)
+	assert.Equal(t, uint32(2), loadgen.GetWorkers())
+	assert.Equal(t, 1.3, loadgen.GetZipfExponent())
+	assert.True(t, loadgen.GetVerify())
+	assert.Contains(t, logs.String(), "frontend name is already declared")
+	assert.Contains(t, logs.String(), "without source")
+	assert.Contains(t, logs.String(), "invalid storage loadgen uint32 option")
+	assert.Contains(t, logs.String(), "invalid storage loadgen float option")
+	assert.Contains(t, logs.String(), "invalid storage loadgen bool option")
+	assert.Contains(t, logs.String(), "duplicate annotated storage loadgen frontend")
+}
+
+func TestRenderConfigRejectsAnnotatedLoadgenWithUnknownSource(t *testing.T) {
+	dir := writeSource(t, `
+backends:
+  - name: origin
+    fake: {}
+`)
+
+	_, err := RenderConfig(dir, renderState{
+		annotations: map[string]string{
+			storageLoadgenAnnotation: "lg;source=ghost",
+		},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `frontend "lg" references unknown source "ghost"`)
 }
 
 func TestWriteConfigAtomic(t *testing.T) {

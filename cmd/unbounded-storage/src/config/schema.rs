@@ -636,8 +636,10 @@ source = "cache"
 [frontends.config.loadgen]
 workers = 8
 seed = 1234
-object_count = 4096
+keyspace_objects = 4096
+object_size_bytes = 1048576
 read_bytes = 131072
+zipf_exponent = 1.2
 verify = true
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
@@ -654,8 +656,10 @@ verify = true
         };
         assert_eq!(loadgen.workers, Some(8));
         assert_eq!(loadgen.seed, Some(1234));
-        assert_eq!(loadgen.object_count, Some(4096));
+        assert_eq!(loadgen.keyspace_objects, Some(4096));
+        assert_eq!(loadgen.object_size_bytes, Some(1024 * 1024));
         assert_eq!(loadgen.read_bytes, Some(128 * 1024));
+        assert_eq!(loadgen.zipf_exponent, Some(1.2));
         assert!(loadgen.verify);
     }
 

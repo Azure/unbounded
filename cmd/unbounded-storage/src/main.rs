@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::task::Waker;
 use std::thread;
 use std::time::Duration;
 
@@ -872,6 +873,7 @@ fn run_shard(
         bindings: Rc::new(RefCell::new((*frontend_bindings).clone())),
         page_size,
         worker_idx: widx.0,
+        waker: shard_loop.waker(),
     };
     let frontend_registry = match FrontendRegistry::new(&frontend_specs, frontend_ctx) {
         Ok(r) => r,
@@ -1265,6 +1267,7 @@ struct FrontendBuildCtx {
     bindings: Rc<RefCell<HashMap<String, ResolvedFrontendBinding>>>,
     page_size: usize,
     worker_idx: u16,
+    waker: Waker,
 }
 
 /// Resolve the stripe size a frontend should serve from the shard's
@@ -1373,6 +1376,7 @@ impl FrontendBuildCtx {
                     self.page_size,
                     binding.bypass_cache,
                     self.worker_idx,
+                    self.waker.clone(),
                 )))
             }
             None => Err(format!("frontend {} missing config", spec.name)),

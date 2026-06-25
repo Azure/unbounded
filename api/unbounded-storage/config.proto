@@ -278,7 +278,7 @@ message FakeBackendConfig {
   // Must be a power of two.
   optional uint64 stripe_size_bytes = 1;
 
-  // Size of each synthetic zero-filled object in bytes. Defaults to 1 MiB when unset.
+  // Size of each deterministic synthetic object in bytes. Defaults to 1 MiB when unset.
   optional uint64 object_size_bytes = 2;
 }
 
@@ -310,15 +310,21 @@ message LoadgenFrontendConfig {
   // Synthetic read workers per serving shard. Defaults to 1 when unset.
   optional uint32 workers = 1;
 
-  // Deterministic object stream seed. Defaults to the loadgen frontend seed when unset.
+  // Deterministic synthetic keyspace and request stream seed.
   optional uint64 seed = 2;
 
-  // Number of distinct synthetic object ids to cycle over. Defaults to 1,000,000 when unset.
-  optional uint64 object_count = 3;
+  // Number of distinct synthetic object ids to sample. Defaults to 1,000,000 when unset.
+  optional uint64 keyspace_objects = 3;
 
-  // Bytes to read from the start of each object. When unset, reads the full resolved object length.
+  // Bytes to read from the start of each object. When unset or zero, reads the full resolved object length.
   optional uint64 read_bytes = 4;
 
-  // Verify every returned body byte is zero. Intended for fake backends.
+  // Verify returned metadata and body bytes against the deterministic synthetic dataset.
   bool verify = 5;
+
+  // Optional expected synthetic object size. When set with verify=true, rejects mismatched metadata.
+  optional uint64 object_size_bytes = 6;
+
+  // Zipf exponent for synthetic object rank sampling. Defaults to 1.1 when unset.
+  optional double zipf_exponent = 7;
 }

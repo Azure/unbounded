@@ -30,6 +30,7 @@ mod origin;
 mod page_channel;
 mod refcount;
 mod singleflight;
+mod synthetic;
 mod traits;
 
 pub use admission::{AdmissionFilter, AdmitDecision, StripeAdmission};
@@ -38,5 +39,10 @@ pub use local::{LocalStorage, ShardLocalStore, disk_for};
 pub use metadata::ObjectMetadata;
 pub use origin::{METADATA_STRIPE_IDX, OriginRef, StripeReq, stripe_key};
 pub use page_channel::{PageChannel, PageChannelReceiver, PageCommand, PageService, ReplySlot};
+pub use synthetic::{
+    SyntheticObjectId, byte_at, fill_pages as fill_synthetic_pages,
+    matches_bytes as synthetic_matches_bytes, object_hash, object_id as synthetic_object_id,
+    parse_object_id as parse_synthetic_object_id, splitmix64,
+};
 pub use traits::PageChecksum;
 pub use types::{Checksum, DiskId, Error, Lba, PageKey};

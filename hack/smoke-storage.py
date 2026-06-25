@@ -30,6 +30,9 @@ frontend/backend implementations are covered against the real fabric:
             record payloads land zero-copy in the page cache; the origin's
             self-signed cert is pinned via the backend's `ca_cert_path`,
             exercising custom-CA verification end to end.
+  - `loadgen`: the in-process load generator frontend backed by the
+            synthetic fake backend, with results verified through the
+            daemon's Prometheus metrics endpoint.
 
 A single `unbounded-storage` process serves exactly one frontend (the
 first configured spec wins), so the two kinds cannot share a ring; each
@@ -772,6 +775,82 @@ serving_cores = 2
     )
 
 
+def write_loadgen_config(
+    path: Path,
+    *,
+    local_id: int,
+    peer_id: int,
+    peer_addr: str,
+    disk_path: Path,
+    fabric_addr: str,
+    metrics_addr: str,
+) -> None:
+    self_name = f"node-{local_id}"
+    peer_name = f"node-{peer_id}"
+    path.write_text(
+        f"""\
+self = "{self_name}"
+
+[[backends]]
+name = "fake"
+
+[backends.config.fake]
+stripe_size_bytes = {STRIPE_SIZE}
+object_size_bytes = {STRIPE_SIZE}
+
+[[peers]]
+name = "{self_name}"
+
+[peers.config.tcp]
+addr = "{fabric_addr}"
+
+[[peers]]
+name = "{peer_name}"
+
+[peers.config.tcp]
+addr = "{peer_addr}"
+
+[[caches]]
+name = "cache"
+source = "fake"
+
+[[disks]]
+page_size_bytes = 4096
+skip_recovery_scan = true
+
+[disks.config.file]
+path = "{disk_path}"
+size = {DISK_SIZE}
+
+[[frontends]]
+name = "loadgen"
+source = "cache"
+
+[frontends.config.loadgen]
+workers = 1
+seed = 1234
+keyspace_objects = 16
+object_size_bytes = {STRIPE_SIZE}
+read_bytes = {STRIPE_SIZE // 16}
+zipf_exponent = 1.1
+verify = true
+
+[startup.memory]
+memory_total_bytes = {MEMORY_TOTAL_BYTES}
+
+[startup.fabric.binds.tcp]
+addr = "{fabric_addr}"
+
+[startup.metrics]
+addr = "{metrics_addr}"
+
+[startup.topology]
+disable_rdma = true
+serving_cores = 2
+"""
+    )
+
+
 # ============================================================================
 # READINESS & CLIENT
 # ============================================================================
@@ -813,13 +892,16 @@ def fetch(url: str, timeout: int = 30) -> tuple[int, bytes]:
     raise AssertionError("unreachable")
 
 
-def scrape_metric_sum(url: str, name: str, timeout: int = 30) -> float:
+def scrape_metric_sum(
+    url: str, name: str, timeout: int = 30, labels: dict[str, str] | None = None
+) -> float:
     """Scrape Prometheus text from *url* and sum all samples of *name*.
 
     Sums across every label-set series whose metric name matches *name*
     (ignoring comment/HELP/TYPE lines), so a counter split across labels
     like `frontend_requests_total{frontend="fe",method="GET",status="200"}`
-    is totaled. Dies if the endpoint never responds.
+    is totaled. When *labels* is set, only series carrying every requested
+    `key="value"` label are included. Dies if the endpoint never responds.
     """
     status, body = fetch(url, timeout)
     if status != 200:
@@ -832,13 +914,43 @@ def scrape_metric_sum(url: str, name: str, timeout: int = 30) -> float:
             continue
         # "<name>{labels} <value>" or "<name> <value>"
         head, _, value = line.rpartition(" ")
-        metric = head.split("{", 1)[0]
+        metric, label_text = metric_name_and_labels(head)
         if metric == name:
+            if labels is not None and not all(
+                f'{k}="{v}"' in label_text for k, v in labels.items()
+            ):
+                continue
             try:
                 total += float(value)
             except ValueError:
                 continue
     return total
+
+
+def metric_name_and_labels(head: str) -> tuple[str, str]:
+    metric, sep, rest = head.partition("{")
+    if not sep:
+        return metric, ""
+    return metric, rest.rsplit("}", 1)[0]
+
+
+def wait_metric_at_least(
+    url: str,
+    name: str,
+    threshold: float,
+    *,
+    labels: dict[str, str] | None = None,
+    timeout: int = 60,
+) -> float:
+    deadline = time.monotonic() + timeout
+    last = 0.0
+    while time.monotonic() < deadline:
+        last = scrape_metric_sum(url, name, timeout=5, labels=labels)
+        if last >= threshold:
+            return last
+        time.sleep(1)
+    die(f"metric {name} at {url} reached {last}, expected >= {threshold}")
+    raise AssertionError("unreachable")
 
 
 # ============================================================================
@@ -1016,6 +1128,95 @@ def run_scenario(
         terminate(nodes)
 
 
+def run_loadgen_scenario() -> None:
+    """Bring up a fake-backend/loadgen ring and assert it makes progress."""
+    log("")
+    log("=== Scenario: loadgen (loadgen frontend + fake backend) ===")
+
+    nodes: list[_Node] = []
+    fab_a, fab_b = free_port(), free_port()
+    met_a, met_b = free_port(), free_port()
+    log(f"Ports: fabric=({fab_a},{fab_b}) metrics=({met_a},{met_b})")
+
+    log("Writing loadgen node configs")
+    cfg1 = TMPDIR / "loadgen-node1.toml"
+    cfg2 = TMPDIR / "loadgen-node2.toml"
+    write_loadgen_config(
+        cfg1,
+        local_id=1,
+        peer_id=2,
+        peer_addr=f"127.0.0.1:{fab_b}",
+        disk_path=TMPDIR / "loadgen-node1.disk",
+        fabric_addr=f"127.0.0.1:{fab_a}",
+        metrics_addr=f"127.0.0.1:{met_a}",
+    )
+    write_loadgen_config(
+        cfg2,
+        local_id=2,
+        peer_id=1,
+        peer_addr=f"127.0.0.1:{fab_a}",
+        disk_path=TMPDIR / "loadgen-node2.disk",
+        fabric_addr=f"127.0.0.1:{fab_b}",
+        metrics_addr=f"127.0.0.1:{met_b}",
+    )
+
+    try:
+        log("Bringing up two loadgen storage nodes")
+        nodes.append(start_node("loadgen", 1, cfg1, TMPDIR / "loadgen-node1.log"))
+        nodes.append(start_node("loadgen", 2, cfg2, TMPDIR / "loadgen-node2.log"))
+
+        wait_port("127.0.0.1", met_a)
+        wait_port("127.0.0.1", met_b)
+        log("  Letting fabric peers establish...")
+        time.sleep(3)
+
+        request_metric = "unbounded_storage_frontend_requests_total"
+        bytes_metric = "unbounded_storage_frontend_response_bytes_total"
+        request_labels = {
+            "frontend": "loadgen",
+            "method": "GET",
+            "status": "200",
+        }
+        bytes_labels = {"frontend": "loadgen"}
+        for label, met_port in (("A", met_a), ("B", met_b)):
+            url = f"http://127.0.0.1:{met_port}/metrics"
+            log(f"Waiting for loadgen metrics from node {label} ({url})")
+            count = wait_metric_at_least(
+                url,
+                request_metric,
+                1,
+                labels=request_labels,
+            )
+            bytes_total = wait_metric_at_least(
+                url,
+                bytes_metric,
+                STRIPE_SIZE // 16,
+                labels=bytes_labels,
+            )
+            # Loadgen starts with the daemon, so peer-dial warmup can leave
+            # early status=500 samples in lifetime counters before the ring is
+            # ready. Successful verified reads and response bytes are the
+            # smoke-test signal here.
+            failures = scrape_metric_sum(
+                url,
+                request_metric,
+                labels={
+                    "frontend": "loadgen",
+                    "method": "GET",
+                    "status": "500",
+                },
+            )
+            log(
+                f"  node {label} reports loadgen requests={count} "
+                f"response_bytes={bytes_total} startup_failures={failures}"
+            )
+
+        log("  loadgen scenario PASSED")
+    finally:
+        log("  Tearing down loadgen ring")
+        terminate(nodes)
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -1080,6 +1281,7 @@ def main() -> None:
         tls_origin,
         ca_cert_path=TLS_CERT,
     )
+    run_loadgen_scenario()
 
     log("")
     log("Smoke test PASSED")

@@ -1640,7 +1640,7 @@ type FakeBackendConfig struct {
 	// Stripe granularity in bytes for synthetic origin references. Defaults to 4 MiB when unset.
 	// Must be a power of two.
 	StripeSizeBytes *uint64 `protobuf:"varint,1,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
-	// Size of each synthetic zero-filled object in bytes. Defaults to 1 MiB when unset.
+	// Size of each deterministic synthetic object in bytes. Defaults to 1 MiB when unset.
 	ObjectSizeBytes *uint64 `protobuf:"varint,2,opt,name=object_size_bytes,json=objectSizeBytes,proto3,oneof" json:"object_size_bytes,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
@@ -1907,14 +1907,18 @@ type LoadgenFrontendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Synthetic read workers per serving shard. Defaults to 1 when unset.
 	Workers *uint32 `protobuf:"varint,1,opt,name=workers,proto3,oneof" json:"workers,omitempty"`
-	// Deterministic object stream seed. Defaults to the loadgen frontend seed when unset.
+	// Deterministic synthetic keyspace and request stream seed.
 	Seed *uint64 `protobuf:"varint,2,opt,name=seed,proto3,oneof" json:"seed,omitempty"`
-	// Number of distinct synthetic object ids to cycle over. Defaults to 1,000,000 when unset.
-	ObjectCount *uint64 `protobuf:"varint,3,opt,name=object_count,json=objectCount,proto3,oneof" json:"object_count,omitempty"`
-	// Bytes to read from the start of each object. When unset, reads the full resolved object length.
+	// Number of distinct synthetic object ids to sample. Defaults to 1,000,000 when unset.
+	KeyspaceObjects *uint64 `protobuf:"varint,3,opt,name=keyspace_objects,json=keyspaceObjects,proto3,oneof" json:"keyspace_objects,omitempty"`
+	// Bytes to read from the start of each object. When unset or zero, reads the full resolved object length.
 	ReadBytes *uint64 `protobuf:"varint,4,opt,name=read_bytes,json=readBytes,proto3,oneof" json:"read_bytes,omitempty"`
-	// Verify every returned body byte is zero. Intended for fake backends.
-	Verify        bool `protobuf:"varint,5,opt,name=verify,proto3" json:"verify,omitempty"`
+	// Verify returned metadata and body bytes against the deterministic synthetic dataset.
+	Verify bool `protobuf:"varint,5,opt,name=verify,proto3" json:"verify,omitempty"`
+	// Optional expected synthetic object size. When set with verify=true, rejects mismatched metadata.
+	ObjectSizeBytes *uint64 `protobuf:"varint,6,opt,name=object_size_bytes,json=objectSizeBytes,proto3,oneof" json:"object_size_bytes,omitempty"`
+	// Zipf exponent for synthetic object rank sampling. Defaults to 1.1 when unset.
+	ZipfExponent  *float64 `protobuf:"fixed64,7,opt,name=zipf_exponent,json=zipfExponent,proto3,oneof" json:"zipf_exponent,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1963,9 +1967,9 @@ func (x *LoadgenFrontendConfig) GetSeed() uint64 {
 	return 0
 }
 
-func (x *LoadgenFrontendConfig) GetObjectCount() uint64 {
-	if x != nil && x.ObjectCount != nil {
-		return *x.ObjectCount
+func (x *LoadgenFrontendConfig) GetKeyspaceObjects() uint64 {
+	if x != nil && x.KeyspaceObjects != nil {
+		return *x.KeyspaceObjects
 	}
 	return 0
 }
@@ -1982,6 +1986,20 @@ func (x *LoadgenFrontendConfig) GetVerify() bool {
 		return x.Verify
 	}
 	return false
+}
+
+func (x *LoadgenFrontendConfig) GetObjectSizeBytes() uint64 {
+	if x != nil && x.ObjectSizeBytes != nil {
+		return *x.ObjectSizeBytes
+	}
+	return 0
+}
+
+func (x *LoadgenFrontendConfig) GetZipfExponent() float64 {
+	if x != nil && x.ZipfExponent != nil {
+		return *x.ZipfExponent
+	}
+	return 0
 }
 
 var File_config_proto protoreflect.FileDescriptor
@@ -2142,19 +2160,23 @@ const file_config_proto_rawDesc = "" +
 	"\x1bmax_requests_per_connection\x18\x02 \x01(\rH\x00R\x18maxRequestsPerConnection\x88\x01\x01B\x1e\n" +
 	"\x1c_max_requests_per_connection\"&\n" +
 	"\x10S3FrontendConfig\x12\x12\n" +
-	"\x04addr\x18\x01 \x01(\tR\x04addr\"\xe8\x01\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"\xf7\x02\n" +
 	"\x15LoadgenFrontendConfig\x12\x1d\n" +
 	"\aworkers\x18\x01 \x01(\rH\x00R\aworkers\x88\x01\x01\x12\x17\n" +
-	"\x04seed\x18\x02 \x01(\x04H\x01R\x04seed\x88\x01\x01\x12&\n" +
-	"\fobject_count\x18\x03 \x01(\x04H\x02R\vobjectCount\x88\x01\x01\x12\"\n" +
+	"\x04seed\x18\x02 \x01(\x04H\x01R\x04seed\x88\x01\x01\x12.\n" +
+	"\x10keyspace_objects\x18\x03 \x01(\x04H\x02R\x0fkeyspaceObjects\x88\x01\x01\x12\"\n" +
 	"\n" +
 	"read_bytes\x18\x04 \x01(\x04H\x03R\treadBytes\x88\x01\x01\x12\x16\n" +
-	"\x06verify\x18\x05 \x01(\bR\x06verifyB\n" +
+	"\x06verify\x18\x05 \x01(\bR\x06verify\x12/\n" +
+	"\x11object_size_bytes\x18\x06 \x01(\x04H\x04R\x0fobjectSizeBytes\x88\x01\x01\x12(\n" +
+	"\rzipf_exponent\x18\a \x01(\x01H\x05R\fzipfExponent\x88\x01\x01B\n" +
 	"\n" +
 	"\b_workersB\a\n" +
-	"\x05_seedB\x0f\n" +
-	"\r_object_countB\r\n" +
-	"\v_read_bytesB@Z>github.com/Azure/unbounded/api/unbounded-storage;storageconfigb\x06proto3"
+	"\x05_seedB\x13\n" +
+	"\x11_keyspace_objectsB\r\n" +
+	"\v_read_bytesB\x14\n" +
+	"\x12_object_size_bytesB\x10\n" +
+	"\x0e_zipf_exponentB@Z>github.com/Azure/unbounded/api/unbounded-storage;storageconfigb\x06proto3"
 
 var (
 	file_config_proto_rawDescOnce sync.Once
