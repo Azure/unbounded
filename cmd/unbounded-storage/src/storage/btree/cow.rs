@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! CoW B+tree primitives: bulk-loading, path-copy commits, and
-//! root-anchored lookup.
+//! CoW B+tree primitives: bulk-loading, path-copy commits,
+//! internal-node caching, and root-anchored lookup.
 //!
 //! The mutator side has two write modes:
 //!
@@ -23,14 +23,15 @@
 //! them is no longer reachable from any live snapshot - see the
 //! generation-tracker documentation in `super`.
 //!
-//! The lookup side does *not* hold the in-memory map: it walks
-//! the on-disk tree starting from the
-//! [`RootSnapshot`](super::RootSnapshot) currently published via
-//! [`arc_swap::ArcSwap`]. That keeps lookups honest - they
-//! exercise the exact disk path a fresh process would.
+//! Lookups use the immutable internal-node cache attached to each
+//! published [`RootSnapshot`](super::RootSnapshot) to descend to a
+//! leaf, then read that leaf from disk. This removes upper-level
+//! metadata I/O without caching every leaf entry in memory.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::future::Future;
+use std::mem::size_of;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -56,13 +57,135 @@ type WriteFut<'f> = Pin<Box<dyn Future<Output = Result<(), Error>> + 'f>>;
 /// times fanout.
 const MAX_TRAVERSAL_NODES: u64 = 1 << 24;
 
-/// Walk the tree rooted at `root_lba` for `key`. Returns `None`
-/// for any miss, including structural corruption / checksum
-/// mismatches (the design's silent-miss policy).
+/// Immutable decoded cache of internal B+tree nodes reachable from
+/// a published root. Leaf pages are deliberately excluded so lookup
+/// memory scales with the upper levels only.
+#[derive(Default)]
+pub struct InternalNodeCache {
+    nodes: HashMap<Lba, CachedInternalNode>,
+    bytes: usize,
+}
+
+struct CachedInternalNode {
+    keys: Box<[PageKey]>,
+    children: Box<[Lba]>,
+}
+
+impl InternalNodeCache {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn get(&self, lba: Lba) -> Option<&CachedInternalNode> {
+        self.nodes.get(&lba)
+    }
+}
+
+/// Build a cache for every internal node reachable from `root_lba`.
+/// The traversal first discovers the tree height by following the
+/// leftmost spine, then reads only levels above the leaves. That keeps
+/// cache construction proportional to internal-node count, not leaf
+/// count.
+pub async fn build_internal_cache<B: BlockDevice>(
+    device: &B,
+    scratch: &Rc<ScratchPool>,
+    root_lba: Lba,
+    strict: bool,
+) -> Result<Arc<InternalNodeCache>, Error> {
+    let depth = internal_depth(device, scratch, root_lba, strict).await?;
+    if depth == 0 {
+        return Ok(Arc::new(InternalNodeCache::default()));
+    }
+
+    let mut nodes = HashMap::new();
+    let mut bytes = 0usize;
+    let mut stack = vec![(root_lba, depth)];
+    let mut buf = scratch.acquire().await;
+    let mut visited = 0u64;
+
+    while let Some((node_lba, remaining_depth)) = stack.pop() {
+        visited += 1;
+        if visited > MAX_TRAVERSAL_NODES {
+            return Err(Error::Corrupt);
+        }
+        match device.read(node_lba, buf.as_mut_slice()).await {
+            Ok(()) => {}
+            Err(e) if strict => return Err(e),
+            Err(_) => continue,
+        }
+
+        match page::decode(buf.as_slice()) {
+            Decoded::Internal { keys, children, .. } if keys.len() == children.len() => {
+                if remaining_depth > 1 {
+                    for &child in &children {
+                        stack.push((child, remaining_depth - 1));
+                    }
+                }
+                bytes += size_of::<CachedInternalNode>()
+                    + keys.len() * size_of::<PageKey>()
+                    + children.len() * size_of::<Lba>();
+                nodes.insert(
+                    node_lba,
+                    CachedInternalNode {
+                        keys: keys.into_boxed_slice(),
+                        children: children.into_boxed_slice(),
+                    },
+                );
+            }
+            Decoded::Internal { .. } | Decoded::Empty | Decoded::Meta { .. } if strict => {
+                return Err(Error::Corrupt);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Arc::new(InternalNodeCache { nodes, bytes }))
+}
+
+async fn internal_depth<B: BlockDevice>(
+    device: &B,
+    scratch: &Rc<ScratchPool>,
+    root_lba: Lba,
+    strict: bool,
+) -> Result<usize, Error> {
+    if !root_lba.is_valid() {
+        return Ok(0);
+    }
+
+    let mut cur = root_lba;
+    let mut depth = 0usize;
+    let mut buf = scratch.acquire().await;
+    for _ in 0..32 {
+        match device.read(cur, buf.as_mut_slice()).await {
+            Ok(()) => {}
+            Err(e) if strict => return Err(e),
+            Err(_) => return Ok(depth),
+        }
+        match page::decode(buf.as_slice()) {
+            Decoded::Internal { children, .. } if !children.is_empty() => {
+                depth += 1;
+                cur = children[0];
+            }
+            Decoded::Leaf { .. } => return Ok(depth),
+            Decoded::Internal { .. } | Decoded::Empty | Decoded::Meta { .. } if strict => {
+                return Err(Error::Corrupt);
+            }
+            _ => return Ok(depth),
+        }
+    }
+
+    Err(Error::Corrupt)
+}
+
+/// Walk the tree rooted at `root_lba` for `key`, using cached
+/// internal nodes when present and reading only the terminal leaf
+/// in the common case. Returns `None` for any miss, including
+/// structural corruption / checksum mismatches.
 pub async fn lookup<B: BlockDevice>(
     device: &B,
     scratch: &Rc<ScratchPool>,
     root_lba: Lba,
+    internal_cache: &InternalNodeCache,
     key: &PageKey,
 ) -> Result<Option<LeafEntry>, Error> {
     if !root_lba.is_valid() {
@@ -70,9 +193,17 @@ pub async fn lookup<B: BlockDevice>(
     }
     let mut cur = root_lba;
     let mut buf = scratch.acquire().await;
-    // Bound the descent by the worst-case depth so a cycle in
-    // corrupted-but-checksum-valid pages can't loop forever.
     for _ in 0..32 {
+        if let Some(node) = internal_cache.get(cur) {
+            let idx = match node.keys.binary_search(key) {
+                Ok(i) => i,
+                Err(0) => return Ok(None),
+                Err(i) => i - 1,
+            };
+            cur = node.children[idx];
+            continue;
+        }
+
         match device.read(cur, buf.as_mut_slice()).await {
             Ok(()) => {}
             Err(_) => return Ok(None),
@@ -80,9 +211,6 @@ pub async fn lookup<B: BlockDevice>(
         match page::decode(buf.as_slice()) {
             Decoded::Empty => return Ok(None),
             Decoded::Leaf { entries, .. } => {
-                // Linear scan; leaves are at most ~72 entries on
-                // 4 KiB pages so the binary-search win is tiny
-                // and the linear version is much easier to read.
                 for (k, v) in entries {
                     if &k == key {
                         return Ok(Some(v));
