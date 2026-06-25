@@ -64,6 +64,8 @@ pub struct OriginRef {
     pub backend_id: String,
     pub origin_object_id: String,
     pub stripe_idx: u64,
+    #[serde(default)]
+    pub data_identity: Option<String>,
 }
 
 impl OriginRef {
@@ -76,7 +78,13 @@ impl OriginRef {
             backend_id: backend_id.into(),
             origin_object_id: origin_object_id.into(),
             stripe_idx,
+            data_identity: None,
         }
+    }
+
+    pub fn with_data_identity(mut self, data_identity: impl Into<String>) -> Self {
+        self.data_identity = Some(data_identity.into());
+        self
     }
 
     /// Construct an [`OriginRef`] naming the object's metadata entry: a
@@ -92,17 +100,8 @@ impl OriginRef {
             backend_id: backend_id.into(),
             origin_object_id: origin_object_id.into(),
             stripe_idx: METADATA_STRIPE_IDX,
+            data_identity: None,
         }
-    }
-
-    /// Derive the uncached origin [`StripeKey`] for this origin stripe.
-    ///
-    /// Cached requests must use [`Self::stripe_key_for_cache`] so the
-    /// cache id is the only logical keyspace prefix. This method exists
-    /// for direct-backend and bypass requests that never populate a
-    /// cache.
-    pub fn stripe_key(&self) -> StripeKey {
-        origin_stripe_key(&self.backend_id, &self.origin_object_id, self.stripe_idx)
     }
 
     /// Derive the canonical cached [`StripeKey`] for this origin stripe
@@ -131,7 +130,31 @@ impl OriginRef {
     /// pinned out-of-band for correctness. The 8-byte little-endian
     /// `stripe_idx` suffix is fixed width.
     pub fn stripe_key_for_cache(&self, cache_id: &str) -> StripeKey {
-        stripe_key(cache_id, &self.origin_object_id, self.stripe_idx)
+        let cache_object_id = if self.is_metadata_entry() {
+            &self.origin_object_id
+        } else {
+            self.data_identity
+                .as_ref()
+                .unwrap_or(&self.origin_object_id)
+        };
+        stripe_key(cache_id, cache_object_id, self.stripe_idx)
+    }
+
+    /// Derive the uncached origin [`StripeKey`] for this origin stripe.
+    ///
+    /// Cached requests must use [`Self::stripe_key_for_cache`] so the
+    /// cache id is the only logical keyspace prefix. This method exists
+    /// for direct-backend and bypass requests that never populate a
+    /// cache.
+    pub fn stripe_key(&self) -> StripeKey {
+        let cache_object_id = if self.is_metadata_entry() {
+            &self.origin_object_id
+        } else {
+            self.data_identity
+                .as_ref()
+                .unwrap_or(&self.origin_object_id)
+        };
+        origin_stripe_key(&self.backend_id, cache_object_id, self.stripe_idx)
     }
 
     /// Whether this reference names an object's metadata entry rather
@@ -347,12 +370,26 @@ mod tests {
         let diff_cache = OriginRef::new("secondary-s3", "models/llama.bin", 12);
         let diff_object = OriginRef::new("primary-s3", "models/other.bin", 12);
         let diff_idx = OriginRef::new("primary-s3", "models/llama.bin", 13);
+        let diff_identity =
+            OriginRef::new("primary-s3", "models/llama.bin", 12).with_data_identity("etag:v2");
 
         let k = base.stripe_key_for_cache("cache-a");
         assert_eq!(k, diff_cache.stripe_key_for_cache("cache-a"));
         assert_ne!(k, base.stripe_key_for_cache("cache-b"));
         assert_ne!(k, diff_object.stripe_key_for_cache("cache-a"));
         assert_ne!(k, diff_idx.stripe_key_for_cache("cache-a"));
+        assert_ne!(k, diff_identity.stripe_key_for_cache("cache-a"));
+    }
+
+    #[test]
+    fn data_identity_changes_data_key_without_changing_origin_path() {
+        let origin = OriginRef::new("primary", "/object", 0).with_data_identity("/object\0etag:v2");
+
+        assert_eq!(origin.origin_object_id, "/object");
+        assert_eq!(
+            origin.stripe_key_for_cache("cache-a"),
+            stripe_key("cache-a", "/object\0etag:v2", 0)
+        );
     }
 
     #[test]
@@ -448,6 +485,9 @@ mod tests {
         // The metadata entry rides the same keying machinery as a data
         // stripe at the sentinel index.
         assert_eq!(a.stripe_key(), stripe_key("b", "obj", u64::MAX));
+
+        let with_identity = OriginRef::metadata_entry("b", "obj").with_data_identity("ignored");
+        assert_eq!(with_identity.stripe_key(), stripe_key("b", "obj", u64::MAX));
     }
 
     #[test]

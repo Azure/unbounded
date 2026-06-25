@@ -3,11 +3,14 @@
 
 //! Metadata TTL policy shared by HTTP-family origin backends.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bufferpool::Error;
 use crate::http::StatusCode;
 use crate::storage::ObjectMetadata;
+
+static DATA_IDENTITY_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MetadataTtlPolicy {
@@ -63,6 +66,7 @@ pub(crate) fn metadata_from_head(
     status: StatusCode,
     content_length: Option<u64>,
     cache_control: Option<&str>,
+    data_identity: Option<String>,
     policy: MetadataTtlPolicy,
     now_unix_secs: u64,
     missing_len_msg: &'static str,
@@ -79,10 +83,31 @@ pub(crate) fn metadata_from_head(
         return Err(Error::from(non_ok_msg));
     }
     let length = content_length.ok_or_else(|| Error::from(missing_len_msg))?;
-    Ok(ObjectMetadata::found(
+    let mut metadata = ObjectMetadata::found(
         length,
         policy.expires_at(MetadataTtlKind::Found, cache_control, now_unix_secs),
-    ))
+    );
+    if let Some(identity) = data_identity {
+        metadata.set_data_identity(identity);
+    }
+    Ok(metadata)
+}
+
+pub(crate) fn data_identity_from_head(
+    path: &str,
+    etag: Option<&str>,
+    version_id: Option<&str>,
+    now_unix_secs: u64,
+) -> String {
+    if let Some(version_id) = non_empty_header(version_id) {
+        return format!("{path}\0version:{version_id}");
+    }
+    if let Some(etag) = non_empty_header(etag) {
+        return format!("{path}\0etag:{etag}");
+    }
+
+    let sequence = DATA_IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{path}\0revalidated:{now_unix_secs}:{sequence}")
 }
 
 pub(crate) fn unix_now_secs() -> u64 {
@@ -116,6 +141,13 @@ fn cache_control_ttl_secs(value: &str) -> Option<u64> {
 
 fn parse_delta_seconds(value: &str) -> Option<u64> {
     value.trim_matches('"').parse::<u64>().ok()
+}
+
+fn non_empty_header(value: Option<&str>) -> Option<&str> {
+    value.and_then(|v| {
+        let v = v.trim();
+        if v.is_empty() { None } else { Some(v) }
+    })
 }
 
 #[cfg(test)]
@@ -184,6 +216,7 @@ mod tests {
             StatusCode::OK,
             Some(123),
             Some("max-age=30"),
+            Some("/o\0etag:abc".to_string()),
             policy(),
             1000,
             "missing",
@@ -192,6 +225,7 @@ mod tests {
         .unwrap();
         assert!(meta.is_found());
         assert_eq!(meta.length, 123);
+        assert_eq!(meta.data_identity.as_deref(), Some("/o\0etag:abc"));
         assert_eq!(meta.expires_at_unix_secs, Some(1030));
     }
 
@@ -201,6 +235,7 @@ mod tests {
             StatusCode::NOT_FOUND,
             None,
             Some("max-age=30"),
+            Some("ignored".to_string()),
             policy(),
             1000,
             "missing",
@@ -208,6 +243,29 @@ mod tests {
         )
         .unwrap();
         assert!(meta.is_not_found());
+        assert_eq!(meta.data_identity, None);
         assert_eq!(meta.expires_at_unix_secs, Some(1005));
+    }
+
+    #[test]
+    fn data_identity_prefers_version_then_etag() {
+        assert_eq!(
+            data_identity_from_head("/o", Some("etag"), Some("v1"), 10),
+            "/o\0version:v1"
+        );
+        assert_eq!(
+            data_identity_from_head("/o", Some("etag"), None, 10),
+            "/o\0etag:etag"
+        );
+    }
+
+    #[test]
+    fn data_identity_without_validator_changes_per_revalidation() {
+        let a = data_identity_from_head("/o", None, None, 10);
+        let b = data_identity_from_head("/o", None, None, 10);
+
+        assert_ne!(a, b);
+        assert!(a.starts_with("/o\0revalidated:10:"));
+        assert!(b.starts_with("/o\0revalidated:10:"));
     }
 }

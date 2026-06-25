@@ -36,7 +36,9 @@ use crate::storage::StripeReq;
 use crate::tls::TlsContext;
 
 use super::Backend;
-use super::cache_ttl::{MetadataTtlPolicy, metadata_from_head, unix_now_secs};
+use super::cache_ttl::{
+    MetadataTtlPolicy, data_identity_from_head, metadata_from_head, unix_now_secs,
+};
 use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
@@ -527,15 +529,24 @@ async fn fetch_metadata(
     let header_end = head.header_end;
     let content_length = head.content_length;
     let cache_control = head.cache_control;
+    let etag = head.etag;
+    let version_id = head.azure_version_id;
     let connection = head.connection;
     let buf = head.buf;
+    let now_unix_secs = unix_now_secs();
 
     let metadata = metadata_from_head(
         status,
         content_length,
         cache_control.as_deref(),
+        Some(data_identity_from_head(
+            &path,
+            etag.as_deref(),
+            version_id.as_deref(),
+            now_unix_secs,
+        )),
         metadata_ttl,
-        unix_now_secs(),
+        now_unix_secs,
         "azure backend: metadata HEAD missing Content-Length",
         "azure backend: metadata HEAD returned non-200 status",
     )?;

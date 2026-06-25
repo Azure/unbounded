@@ -86,6 +86,9 @@ pub(super) struct OriginResponseHead {
     pub(super) content_length: Option<u64>,
     pub(super) content_range_start: Option<u64>,
     pub(super) cache_control: Option<String>,
+    pub(super) etag: Option<String>,
+    pub(super) s3_version_id: Option<String>,
+    pub(super) azure_version_id: Option<String>,
     pub(super) connection: Option<String>,
     pub(super) buf: Vec<u8>,
 }
@@ -183,6 +186,9 @@ pub(super) async fn send_request_read_head(
                     content_length: h.content_length(),
                     content_range_start: h.content_range_start(),
                     cache_control: h.header("cache-control").map(ToOwned::to_owned),
+                    etag: h.header("etag").map(ToOwned::to_owned),
+                    s3_version_id: h.header("x-amz-version-id").map(ToOwned::to_owned),
+                    azure_version_id: h.header("x-ms-version-id").map(ToOwned::to_owned),
                     connection: h.header("connection").map(ToOwned::to_owned),
                     buf,
                 };

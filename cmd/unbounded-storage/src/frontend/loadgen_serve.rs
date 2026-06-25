@@ -293,36 +293,48 @@ async fn read_generated_object<P: BufferPool<Req = StripeReq>>(
     object: SyntheticObjectId,
 ) -> Result<u64, ()> {
     let object_id = synthetic_object_id(object.seed, object.ordinal);
-    let object_len = if cfg.verify || cfg.expected_object_size_bytes.is_none() {
+    let descriptor = if cfg.verify || cfg.expected_object_size_bytes.is_none() {
         let actual = read_object_length(pool, cfg, &object_id).await?;
         if cfg
             .expected_object_size_bytes
-            .is_some_and(|expected| actual != expected)
+            .is_some_and(|expected| actual.length != expected)
         {
             return Err(());
         }
         actual
     } else {
-        cfg.expected_object_size_bytes
-            .expect("object_size_bytes presence checked")
+        ObjectDescriptor {
+            length: cfg
+                .expected_object_size_bytes
+                .expect("object_size_bytes presence checked"),
+            data_identity: object_id.clone(),
+        }
     };
     let read_len = if cfg.read_bytes == 0 {
-        object_len
+        descriptor.length
     } else {
-        cfg.read_bytes.min(object_len)
+        cfg.read_bytes.min(descriptor.length)
     };
     let range = ResolvedRange {
         start: 0,
         end: read_len,
     };
-    read_body(pool, cfg, object, &object_id, range).await
+    read_body(
+        pool,
+        cfg,
+        object,
+        &object_id,
+        &descriptor.data_identity,
+        range,
+    )
+    .await
 }
 
 async fn read_object_length<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     cfg: &LoadgenRun,
     object_id: &str,
-) -> Result<u64, ()> {
+) -> Result<ObjectDescriptor, ()> {
     let origin_ref = OriginRef::metadata_entry(&cfg.backend_id, object_id);
     let req = request_from_origin(origin_ref, cfg);
     let mut rs: ReadStream = pool
@@ -334,7 +346,15 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
     if meta.is_not_found() {
         return Err(());
     }
-    Ok(meta.length)
+    Ok(ObjectDescriptor {
+        length: meta.length,
+        data_identity: meta.data_identity.unwrap_or_else(|| object_id.to_string()),
+    })
+}
+
+struct ObjectDescriptor {
+    length: u64,
+    data_identity: String,
 }
 
 async fn read_body<P: BufferPool<Req = StripeReq>>(
@@ -342,9 +362,10 @@ async fn read_body<P: BufferPool<Req = StripeReq>>(
     cfg: &LoadgenRun,
     object: SyntheticObjectId,
     object_id: &str,
+    data_identity: &str,
     range: ResolvedRange,
 ) -> Result<u64, ()> {
-    let plans = stripe_plans(range, cfg, object_id);
+    let plans = stripe_plans(range, cfg, object_id, data_identity);
     let mut bytes = 0u64;
     let mut checked_offset = range.start;
     let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
@@ -364,6 +385,7 @@ fn stripe_plans(
     range: ResolvedRange,
     cfg: &LoadgenRun,
     object_id: &str,
+    data_identity: &str,
 ) -> Vec<StripePlan<StripeReq>> {
     if cfg.stripe_size == 0 || range.is_empty() {
         return Vec::new();
@@ -376,7 +398,8 @@ fn stripe_plans(
         let stripe_start = stripe_idx * cfg.stripe_size;
         let start = range.start.max(stripe_start);
         let end = range.end.min(stripe_start + cfg.stripe_size);
-        let origin_ref = OriginRef::new(&cfg.backend_id, object_id, stripe_idx);
+        let origin_ref = OriginRef::new(&cfg.backend_id, object_id, stripe_idx)
+            .with_data_identity(data_identity.to_string());
         plans.push(StripePlan {
             req: request_from_origin(origin_ref, cfg),
             intra_offset: start - stripe_start,

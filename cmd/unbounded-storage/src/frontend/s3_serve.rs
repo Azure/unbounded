@@ -395,30 +395,32 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
     // the plain HTTP frontend, a length-read failure is never a silently
     // dropped connection.
-    let len =
-        match read_object_length_s3(pool, backend_id, cache_id, &path, page_size, bypass).await {
-            LenResult::Len(l) => l,
-            LenResult::NotFound => {
-                let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
-                let _ = send_all(handle, conn_fd, bytes).await;
-                log.field("status", 404);
-                outcome.status = 404;
-                return Ok(());
-            }
-            LenResult::Other => {
-                let bytes = error_bytes(
-                    S3ErrorCode::InternalError,
-                    &path,
-                    &request_id,
-                    is_head,
-                    None,
-                );
-                let _ = send_all(handle, conn_fd, bytes).await;
-                log.field("status", 500);
-                outcome.status = 500;
-                return Ok(());
-            }
-        };
+    let object = match read_object_length_s3(pool, backend_id, cache_id, &path, page_size, bypass)
+        .await
+    {
+        LenResult::Len(object) => object,
+        LenResult::NotFound => {
+            let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
+            let _ = send_all(handle, conn_fd, bytes).await;
+            log.field("status", 404);
+            outcome.status = 404;
+            return Ok(());
+        }
+        LenResult::Other => {
+            let bytes = error_bytes(
+                S3ErrorCode::InternalError,
+                &path,
+                &request_id,
+                is_head,
+                None,
+            );
+            let _ = send_all(handle, conn_fd, bytes).await;
+            log.field("status", 500);
+            outcome.status = 500;
+            return Ok(());
+        }
+    };
+    let len = object.length;
 
     // 6. Resolve the requested range against the length.
     let resolved = match range {
@@ -498,11 +500,8 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     let plans: Vec<StripePlan<StripeReq>> = stripe_set(resolved, stripe_size)
         .into_iter()
         .map(|slice| {
-            let origin_ref = OriginRef {
-                backend_id: backend_id.to_string(),
-                origin_object_id: path.clone(),
-                stripe_idx: slice.stripe_idx,
-            };
+            let origin_ref = OriginRef::new(backend_id, path.clone(), slice.stripe_idx)
+                .with_data_identity(object.data_identity.clone());
             let key = cache_id
                 .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id))
                 .unwrap_or_else(|| origin_ref.stripe_key());
@@ -552,14 +551,21 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
 /// Outcome of reading an object's length entry, preserving the one
 /// distinction the S3 frontend acts on: a missing origin object maps to
 /// a 404, every other failure to a 500.
+#[derive(Debug, PartialEq, Eq)]
 enum LenResult {
     /// The metadata entry resolved to this byte length.
-    Len(u64),
+    Len(ObjectDescriptor),
     /// The origin reported the object does not exist
     /// ([`Error::OriginNotFound`]).
     NotFound,
     /// Any other I/O, transport, or pool error.
     Other,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ObjectDescriptor {
+    length: u64,
+    data_identity: String,
 }
 
 /// Resolve an object's length by reading its dedicated content-addressed
@@ -598,13 +604,16 @@ async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
         Some(Err(_)) => return LenResult::Other,
         None => return LenResult::Other,
     };
-    len_result_from_metadata_page(page.as_slice())
+    len_result_from_metadata_page(page.as_slice(), path)
 }
 
-fn len_result_from_metadata_page(page: &[u8]) -> LenResult {
+fn len_result_from_metadata_page(page: &[u8], path: &str) -> LenResult {
     match ObjectMetadata::decode(page) {
         Ok(meta) if meta.is_not_found() => LenResult::NotFound,
-        Ok(meta) => LenResult::Len(meta.length),
+        Ok(meta) => LenResult::Len(ObjectDescriptor {
+            length: meta.length,
+            data_identity: meta.data_identity.unwrap_or_else(|| path.to_string()),
+        }),
         Err(_) => LenResult::Other,
     }
 }
@@ -824,20 +833,38 @@ mod tests {
 
     #[test]
     fn metadata_page_len_result_handles_positive_and_negative_metadata() {
-        let found = ObjectMetadata::found(321, 10).encode().unwrap();
+        let mut found_meta = ObjectMetadata::found(321, 10);
+        found_meta.set_data_identity("/bucket/key\0etag:v1");
+        let found = found_meta.encode().unwrap();
         let not_found = ObjectMetadata::not_found(10).encode().unwrap();
 
         assert!(matches!(
-            len_result_from_metadata_page(&found),
-            LenResult::Len(321)
+            len_result_from_metadata_page(&found, "/bucket/key"),
+            LenResult::Len(ObjectDescriptor {
+                length: 321,
+                data_identity,
+            }) if data_identity == "/bucket/key\0etag:v1"
         ));
         assert!(matches!(
-            len_result_from_metadata_page(&not_found),
+            len_result_from_metadata_page(&not_found, "/bucket/key"),
             LenResult::NotFound
         ));
         assert!(matches!(
-            len_result_from_metadata_page(&[0u8; 4]),
+            len_result_from_metadata_page(&[0u8; 4], "/bucket/key"),
             LenResult::Other
+        ));
+    }
+
+    #[test]
+    fn metadata_page_len_result_falls_back_to_path_identity() {
+        let found = ObjectMetadata::found(321, 10).encode().unwrap();
+
+        assert!(matches!(
+            len_result_from_metadata_page(&found, "/bucket/key"),
+            LenResult::Len(ObjectDescriptor {
+                length: 321,
+                data_identity,
+            }) if data_identity == "/bucket/key"
         ));
     }
 

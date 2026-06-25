@@ -62,6 +62,8 @@ pub struct ObjectMetadata {
     pub length: u64,
     pub entries: BTreeMap<String, String>,
     #[serde(default)]
+    pub data_identity: Option<String>,
+    #[serde(default)]
     pub state: ObjectState,
     #[serde(default)]
     pub expires_at_unix_secs: Option<u64>,
@@ -82,6 +84,7 @@ impl ObjectMetadata {
         Self {
             length,
             entries: BTreeMap::new(),
+            data_identity: None,
             state: ObjectState::Found,
             expires_at_unix_secs: None,
             decoded_from_legacy: false,
@@ -100,6 +103,7 @@ impl ObjectMetadata {
         Self {
             length: 0,
             entries: BTreeMap::new(),
+            data_identity: None,
             state: ObjectState::NotFound,
             expires_at_unix_secs: Some(expires_at_unix_secs),
             decoded_from_legacy: false,
@@ -110,6 +114,10 @@ impl ObjectMetadata {
     /// key if one was present.
     pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) -> Option<String> {
         self.entries.insert(key.into(), value.into())
+    }
+
+    pub fn set_data_identity(&mut self, data_identity: impl Into<String>) {
+        self.data_identity = Some(data_identity.into());
     }
 
     /// Look up the value for `key`, if present.
@@ -191,6 +199,7 @@ impl ObjectMetadata {
         Ok(ObjectMetadata {
             length: legacy.length,
             entries: legacy.entries,
+            data_identity: None,
             state: ObjectState::Found,
             expires_at_unix_secs: None,
             decoded_from_legacy: true,

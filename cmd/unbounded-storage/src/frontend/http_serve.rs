@@ -454,17 +454,19 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     // metadata entry through the pool. The HTTP backend fills it from
     // an origin HEAD on a miss; local-disk and peer hits skip the
     // origin entirely.
-    let len = match read_object_length(pool, backend_id, cache_id, &path, page_size, bypass).await {
-        LenResult::Len(len) => len,
-        LenResult::NotFound => {
-            let _ = send_all(handle, conn_fd, status_line_response(404, keep_alive)).await;
-            log.field("status", 404);
-            outcome.status = 404;
-            finish_request(buf, header_end);
-            return Ok(next_step(keep_alive));
-        }
-        LenResult::Other => return Err(()),
-    };
+    let object =
+        match read_object_length(pool, backend_id, cache_id, &path, page_size, bypass).await {
+            LenResult::Len(object) => object,
+            LenResult::NotFound => {
+                let _ = send_all(handle, conn_fd, status_line_response(404, keep_alive)).await;
+                log.field("status", 404);
+                outcome.status = 404;
+                finish_request(buf, header_end);
+                return Ok(next_step(keep_alive));
+            }
+            LenResult::Other => return Err(()),
+        };
+    let len = object.length;
 
     // 6. Resolve the requested range against the length.
     let resolved = match range {
@@ -524,6 +526,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         backend_id,
         cache_id,
         &path,
+        &object.data_identity,
         page_size,
         resolved,
         stripe_size,
@@ -558,14 +561,12 @@ fn stripe_request(
     backend_id: &str,
     cache_id: Option<&str>,
     path: &str,
+    data_identity: &str,
     slice: StripeSlice,
     bypass: bool,
 ) -> (StripeKey, StripeReq) {
-    let origin_ref = OriginRef {
-        backend_id: backend_id.to_string(),
-        origin_object_id: path.to_string(),
-        stripe_idx: slice.stripe_idx,
-    };
+    let origin_ref = OriginRef::new(backend_id, path, slice.stripe_idx)
+        .with_data_identity(data_identity.to_string());
     let key = cache_id
         .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id))
         .unwrap_or_else(|| origin_ref.stripe_key());
@@ -697,10 +698,11 @@ async fn dispatch_ticket(
     backend_id: &str,
     cache_id: Option<&str>,
     path: &str,
+    data_identity: &str,
     slice: StripeSlice,
     bypass: bool,
 ) -> Ticket {
-    let (key, req) = stripe_request(backend_id, cache_id, path, slice, bypass);
+    let (key, req) = stripe_request(backend_id, cache_id, path, data_identity, slice, bypass);
     match fanout.owner_of_cache(&key, cache_id, slice.intra_offset) {
         Owner::Local => Ticket::Local { slice },
         Owner::Peer(peer) => {
@@ -733,6 +735,7 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
     backend_id: &str,
     cache_id: Option<&str>,
     path: &str,
+    data_identity: &str,
     page_size: usize,
     resolved: ResolvedRange,
     stripe_size: u64,
@@ -747,7 +750,8 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
         let plans: Vec<StripePlan<StripeReq>> = slices
             .into_iter()
             .map(|slice| {
-                let (_key, req) = stripe_request(backend_id, cache_id, path, slice, bypass);
+                let (_key, req) =
+                    stripe_request(backend_id, cache_id, path, data_identity, slice, bypass);
                 StripePlan {
                     req,
                     intra_offset: slice.intra_offset,
@@ -770,13 +774,22 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
     let mut window: VecDeque<Ticket> = VecDeque::new();
     while next < slices.len() && window.len() < multi_shard_window() {
         window.push_back(
-            dispatch_ticket(fanout, backend_id, cache_id, path, slices[next], bypass).await,
+            dispatch_ticket(
+                fanout,
+                backend_id,
+                cache_id,
+                path,
+                data_identity,
+                slices[next],
+                bypass,
+            )
+            .await,
         );
         next += 1;
     }
 
     let local_plan = |slice: StripeSlice| {
-        let (_key, req) = stripe_request(backend_id, cache_id, path, slice, bypass);
+        let (_key, req) = stripe_request(backend_id, cache_id, path, data_identity, slice, bypass);
         StripePlan {
             req,
             intra_offset: slice.intra_offset,
@@ -822,7 +835,16 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
 
         while next < slices.len() && window.len() < multi_shard_window() {
             window.push_back(
-                dispatch_ticket(fanout, backend_id, cache_id, path, slices[next], bypass).await,
+                dispatch_ticket(
+                    fanout,
+                    backend_id,
+                    cache_id,
+                    path,
+                    data_identity,
+                    slices[next],
+                    bypass,
+                )
+                .await,
             );
             next += 1;
         }
@@ -864,20 +886,29 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
         Some(Err(e)) => return classify_len_error(e),
         None => return LenResult::Other,
     };
-    len_result_from_metadata_page(page.as_slice())
+    len_result_from_metadata_page(page.as_slice(), path)
 }
 
-fn len_result_from_metadata_page(page: &[u8]) -> LenResult {
+fn len_result_from_metadata_page(page: &[u8], path: &str) -> LenResult {
     match ObjectMetadata::decode(page) {
         Ok(meta) if meta.is_not_found() => LenResult::NotFound,
-        Ok(meta) => LenResult::Len(meta.length),
+        Ok(meta) => LenResult::Len(ObjectDescriptor {
+            length: meta.length,
+            data_identity: meta.data_identity.unwrap_or_else(|| path.to_string()),
+        }),
         Err(e) => classify_len_error(e),
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
+struct ObjectDescriptor {
+    length: u64,
+    data_identity: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum LenResult {
-    Len(u64),
+    Len(ObjectDescriptor),
     NotFound,
     Other,
 }
@@ -1244,11 +1275,18 @@ mod tests {
             intra_len: 4,
         };
         // Non-bypass requests carry the cache path (bypass == false).
-        let (_k, normal) = stripe_request("primary", Some("cache-a"), "/o", slice, false);
+        let (_k, normal) = stripe_request(
+            "primary",
+            Some("cache-a"),
+            "/o",
+            "/o\0etag:v1",
+            slice,
+            false,
+        );
         assert!(!normal.bypass());
         assert_eq!(normal.cache_id(), Some("cache-a"));
         // Bridge-mode frontends stamp bypass == true onto every request.
-        let (k, bridged) = stripe_request("primary", None, "/o", slice, true);
+        let (k, bridged) = stripe_request("primary", None, "/o", "/o\0etag:v1", slice, true);
         assert!(bridged.bypass());
         // Cache id is the only logical key prefix, so cached and uncached
         // requests for the same origin intentionally use different keys.
@@ -1262,6 +1300,25 @@ mod tests {
             multi_shard_window() > 1,
             "multi-shard streaming must overlap owner fetches",
         );
+    }
+
+    #[test]
+    fn stripe_request_keys_on_data_identity_but_preserves_origin_path() {
+        use crate::bufferpool::Req;
+
+        let slice = StripeSlice {
+            stripe_idx: 2,
+            intra_offset: 0,
+            intra_len: 4,
+        };
+
+        let (k1, req1) = stripe_request("primary", None, "/o", "/o\0etag:v1", slice, false);
+        let (k2, req2) = stripe_request("primary", None, "/o", "/o\0etag:v2", slice, false);
+
+        assert_ne!(k1, k2);
+        assert_ne!(req1.key(), req2.key());
+        assert_eq!(req1.origin().unwrap().origin_object_id, "/o");
+        assert_eq!(req2.origin().unwrap().origin_object_id, "/o");
     }
 
     #[test]
@@ -1359,15 +1416,39 @@ mod tests {
 
     #[test]
     fn metadata_page_len_result_handles_positive_and_negative_metadata() {
-        let found = ObjectMetadata::found(123, 10).encode().unwrap();
+        let mut found_meta = ObjectMetadata::found(123, 10);
+        found_meta.set_data_identity("/object\0etag:v1");
+        let found = found_meta.encode().unwrap();
         let not_found = ObjectMetadata::not_found(10).encode().unwrap();
 
-        assert_eq!(len_result_from_metadata_page(&found), LenResult::Len(123));
         assert_eq!(
-            len_result_from_metadata_page(&not_found),
+            len_result_from_metadata_page(&found, "/object"),
+            LenResult::Len(ObjectDescriptor {
+                length: 123,
+                data_identity: "/object\0etag:v1".to_string(),
+            })
+        );
+        assert_eq!(
+            len_result_from_metadata_page(&not_found, "/object"),
             LenResult::NotFound
         );
-        assert_eq!(len_result_from_metadata_page(&[0u8; 4]), LenResult::Other);
+        assert_eq!(
+            len_result_from_metadata_page(&[0u8; 4], "/object"),
+            LenResult::Other
+        );
+    }
+
+    #[test]
+    fn metadata_page_len_result_falls_back_to_path_identity() {
+        let found = ObjectMetadata::found(123, 10).encode().unwrap();
+
+        assert_eq!(
+            len_result_from_metadata_page(&found, "/object"),
+            LenResult::Len(ObjectDescriptor {
+                length: 123,
+                data_identity: "/object".to_string(),
+            })
+        );
     }
 
     #[test]
