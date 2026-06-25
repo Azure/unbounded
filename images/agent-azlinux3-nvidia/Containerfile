@@ -1,0 +1,36 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+FROM mcr.microsoft.com/azurelinux/base/core:3.0
+
+# nspawn shares the host network namespace, so image-local systemd units must
+# not manage host firewall policy or wait for container-local network devices.
+# Azure Linux enables iptables.service with default DROP policies and enables
+# systemd-networkd-wait-online.service, which blocks kubelet startup for two
+# minutes in nspawn. Keep firewall policy and network readiness owned by the
+# host bootstrap instead.
+RUN tdnf install -y \
+      systemd dbus curl ca-certificates \
+      iproute nftables iptables kmod systemd-udev procps-ng wireguard-tools bpftool \
+    && rm -f \
+      /usr/lib/systemd/system/iptables.service \
+      /usr/lib/systemd/system/ip6tables.service \
+      /usr/lib/systemd/system/nftables.service \
+      /usr/lib/systemd/system/systemd-networkd-wait-online.service \
+      /usr/lib/systemd/system/systemd-networkd-wait-online@.service \
+      /etc/systemd/scripts/iptables \
+      /etc/systemd/scripts/iptables.stop \
+      /etc/systemd/scripts/ip4save \
+      /etc/systemd/scripts/ip6save \
+    && sed -i '/systemd-networkd-wait-online/d' /usr/lib/systemd/system-preset/*.preset \
+    && tdnf clean all
+
+# Install NVIDIA Container Toolkit.
+# https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+RUN install -d /etc/yum.repos.d \
+    && curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+      > /etc/yum.repos.d/nvidia-container-toolkit.repo \
+    && tdnf install -y nvidia-container-toolkit \
+    && tdnf clean all
+
+# TODO: pre-install containerd / runc / kubernetes binaries
