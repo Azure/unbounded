@@ -75,8 +75,10 @@ func (r *SiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	statuses := map[string]unboundedv1alpha3.SiteComponentStatus{}
+
 	for _, component := range []string{ComponentNet, ComponentMachina, ComponentMetalman, ComponentUnboundedStorage} {
 		status := r.reconcileComponent(ctx, &site, component)
+
 		statuses[component] = status
 		if !status.Ready {
 			logger.Info("component not ready", "site", site.Name, "component", component, "message", status.Message)
@@ -84,6 +86,7 @@ func (r *SiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	patch := client.MergeFrom(site.DeepCopy())
+
 	site.Status.Components = statuses
 	if err := r.Status().Patch(ctx, &site, patch); err != nil {
 		return ctrl.Result{}, fmt.Errorf("patch site status: %w", err)
@@ -122,6 +125,7 @@ func (r *SiteReconciler) reconcileEnabledComponent(ctx context.Context, site *un
 		})
 	case ComponentMetalman:
 		defaults := r.defaults()
+
 		namespace := componentNamespace(&site.Spec.Components.Metalman.SiteComponentSpec, defaults.DefaultNamespace)
 		if err := r.applyObject(ctx, namespaceObject(namespace)); err != nil {
 			return err
@@ -213,15 +217,20 @@ func (r *SiteReconciler) mutateNetObject(site *unboundedv1alpha3.Site, obj *unst
 
 	setNamespace(obj, namespace)
 	rewriteNamespace(obj, DefaultNetNamespace, namespace)
+
 	switch obj.GetKind() {
 	case "Deployment":
 		if obj.GetName() == "unbounded-net-controller" {
-			setContainerImage(obj, "controller", firstNonEmpty(site.Spec.Components.Net.Image, defaults.NetControllerImage))
+			return setContainerImage(obj, "controller", firstNonEmpty(site.Spec.Components.Net.Image, defaults.NetControllerImage))
 		}
 	case "DaemonSet":
 		if obj.GetName() == "unbounded-net-node" {
-			setContainerImage(obj, "node", firstNonEmpty(site.Spec.Components.Net.Image, defaults.NetNodeImage))
-			setInitContainerImage(obj, "install-cni-plugins", firstNonEmpty(site.Spec.Components.Net.Image, defaults.NetNodeImage))
+			image := firstNonEmpty(site.Spec.Components.Net.Image, defaults.NetNodeImage)
+			if err := setContainerImage(obj, "node", image); err != nil {
+				return err
+			}
+
+			return setInitContainerImage(obj, "install-cni-plugins", image)
 		}
 	}
 
@@ -239,12 +248,23 @@ func (r *SiteReconciler) mutateMachinaObject(site *unboundedv1alpha3.Site, obj *
 
 	setNamespace(obj, namespace)
 	rewriteNamespace(obj, DefaultNamespace, namespace)
+
 	if obj.GetKind() == "Deployment" && obj.GetName() == "machina-controller" {
-		setContainerImage(obj, "machina-controller", firstNonEmpty(site.Spec.Components.Machina.Image, defaults.MachinaImage))
+		if err := setContainerImage(obj, "machina-controller", firstNonEmpty(site.Spec.Components.Machina.Image, defaults.MachinaImage)); err != nil {
+			return err
+		}
 	}
 
 	if obj.GetKind() == "ConfigMap" && obj.GetName() == "machina-config" && defaults.APIServerEndpoint != "" {
-		data, _, _ := unstructured.NestedStringMap(obj.Object, "data")
+		data, ok, err := unstructured.NestedStringMap(obj.Object, "data")
+		if err != nil {
+			return fmt.Errorf("get machina config data: %w", err)
+		}
+
+		if !ok {
+			data = map[string]string{}
+		}
+
 		data["config.yaml"] = strings.ReplaceAll(data["config.yaml"], `apiServerEndpoint: ""`, fmt.Sprintf(`apiServerEndpoint: %q`, defaults.APIServerEndpoint))
 		obj.Object["data"] = data
 	}
@@ -263,10 +283,12 @@ func (r *SiteReconciler) mutateMetalmanSupportObject(site *unboundedv1alpha3.Sit
 	}
 
 	defaults := r.defaults()
+
 	namespace := componentNamespace(&site.Spec.Components.Metalman.SiteComponentSpec, defaults.DefaultNamespace)
 	if obj.GetNamespace() == DefaultNamespace {
 		setNamespace(obj, namespace)
 	}
+
 	rewriteNamespace(obj, DefaultNamespace, namespace)
 
 	return nil
@@ -278,10 +300,16 @@ func (r *SiteReconciler) mutateStorageObject(site *unboundedv1alpha3.Site, obj *
 
 	setNamespace(obj, namespace)
 	rewriteNamespace(obj, DefaultNamespace, namespace)
+
 	if obj.GetKind() == "DaemonSet" && obj.GetName() == "unbounded-storage-supervisor" {
 		image := firstNonEmpty(site.Spec.Components.UnboundedStorage.Image, defaults.StorageImage)
-		setContainerImage(obj, "run", image)
-		setInitContainerImage(obj, "install", image)
+		if err := setContainerImage(obj, "run", image); err != nil {
+			return err
+		}
+
+		if err := setInitContainerImage(obj, "install", image); err != nil {
+			return err
+		}
 	}
 
 	if obj.GetKind() == "ConfigMap" && obj.GetName() == "unbounded-storage-config" && site.Spec.Components.UnboundedStorage.Config != "" {
@@ -319,6 +347,7 @@ func (r *SiteReconciler) defaults() Config {
 	if cfg.DefaultNamespace == "" {
 		cfg.DefaultNamespace = DefaultNamespace
 	}
+
 	if cfg.NetNamespace == "" {
 		cfg.NetNamespace = DefaultNetNamespace
 	}
@@ -353,6 +382,7 @@ func metalmanDeployment(site *unboundedv1alpha3.Site, defaults Config) *appsv1.D
 		"app.kubernetes.io/component":         "metalman",
 		unboundedv1alpha3.MachineSiteLabelKey: site.Name,
 	}
+
 	args := []string{"serve-pxe", "--site=" + site.Name}
 	if site.Spec.Components.Metalman.DHCPAutoInterface != nil && *site.Spec.Components.Metalman.DHCPAutoInterface {
 		args = append(args, "--dhcp-auto-interface")
@@ -411,10 +441,12 @@ func namespaceObject(name string) *corev1.Namespace {
 
 func yamlFiles(fsys fs.FS) ([]string, error) {
 	var files []string
+
 	if err := fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
+
 		if d.IsDir() {
 			return nil
 		}
@@ -438,10 +470,12 @@ func setNamespace(obj *unstructured.Unstructured, namespace string) {
 	if namespace == "" {
 		return
 	}
+
 	if obj.GetKind() == "Namespace" {
 		obj.SetName(namespace)
 		return
 	}
+
 	if obj.GetNamespace() == "" {
 		return
 	}
@@ -480,26 +514,30 @@ func rewriteStringValue(value any, oldValue, newValue string) {
 	}
 }
 
-func setContainerImage(obj *unstructured.Unstructured, name, image string) {
+func setContainerImage(obj *unstructured.Unstructured, name, image string) error {
 	if image == "" {
-		return
+		return nil
 	}
 
-	setPodSpecContainerImage(obj, []string{"spec", "template", "spec", "containers"}, name, image)
+	return setPodSpecContainerImage(obj, []string{"spec", "template", "spec", "containers"}, name, image)
 }
 
-func setInitContainerImage(obj *unstructured.Unstructured, name, image string) {
+func setInitContainerImage(obj *unstructured.Unstructured, name, image string) error {
 	if image == "" {
-		return
+		return nil
 	}
 
-	setPodSpecContainerImage(obj, []string{"spec", "template", "spec", "initContainers"}, name, image)
+	return setPodSpecContainerImage(obj, []string{"spec", "template", "spec", "initContainers"}, name, image)
 }
 
-func setPodSpecContainerImage(obj *unstructured.Unstructured, path []string, name, image string) {
-	containers, ok, _ := unstructured.NestedSlice(obj.Object, path...)
+func setPodSpecContainerImage(obj *unstructured.Unstructured, path []string, name, image string) error {
+	containers, ok, err := unstructured.NestedSlice(obj.Object, path...)
+	if err != nil {
+		return fmt.Errorf("get pod spec containers: %w", err)
+	}
+
 	if !ok {
-		return
+		return nil
 	}
 
 	for i := range containers {
@@ -507,14 +545,20 @@ func setPodSpecContainerImage(obj *unstructured.Unstructured, path []string, nam
 		if !ok {
 			continue
 		}
+
 		if container["name"] == name {
 			container["image"] = image
+
 			containers[i] = container
-			break
+			if err := unstructured.SetNestedSlice(obj.Object, containers, path...); err != nil {
+				return fmt.Errorf("set pod spec containers: %w", err)
+			}
+
+			return nil
 		}
 	}
 
-	_ = unstructured.SetNestedSlice(obj.Object, containers, path...)
+	return nil
 }
 
 func toUnstructured(obj client.Object) *unstructured.Unstructured {

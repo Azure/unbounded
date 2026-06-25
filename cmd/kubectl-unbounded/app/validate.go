@@ -18,20 +18,6 @@ func isValidIPv4CIDR(s string) bool {
 	return ip.To4() != nil
 }
 
-func isDirectoryOrFile(p string) bool {
-	if isEmpty(p) {
-		return false
-	}
-
-	_, err := os.Stat(p)
-
-	return err == nil
-}
-
-func isHTTPSURL(s string) bool {
-	return strings.HasPrefix(s, "https://")
-}
-
 func isReadableFile(p string) bool {
 	if isEmpty(p) {
 		return false
