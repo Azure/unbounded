@@ -117,10 +117,7 @@ impl std::fmt::Display for OpenError {
 fn open_file(path: &Path, o_direct: bool) -> Result<File, Error> {
     let cpath =
         CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error::Io(libc::EINVAL))?;
-    let mut flags = libc::O_RDWR | libc::O_CLOEXEC;
-    if o_direct {
-        flags |= libc::O_DIRECT;
-    }
+    let flags = open_flags(o_direct);
     // SAFETY: cpath is null-terminated and outlives the call.
     let fd = unsafe { libc::open(cpath.as_ptr(), flags) };
     if fd < 0 {
@@ -132,6 +129,14 @@ fn open_file(path: &Path, o_direct: bool) -> Result<File, Error> {
     }
     // SAFETY: fd is freshly opened by us and not aliased elsewhere.
     Ok(unsafe { File::from_raw_fd(fd as RawFd) })
+}
+
+fn open_flags(o_direct: bool) -> libc::c_int {
+    let mut flags = libc::O_RDWR | libc::O_CLOEXEC;
+    if o_direct {
+        flags |= libc::O_DIRECT;
+    }
+    flags
 }
 
 /// Create `path` if absent and size it to exactly `size_bytes`.
@@ -285,5 +290,11 @@ mod tests {
             std::fs::metadata(&path.0).unwrap().len(),
             (12 * PAGE) as u64
         );
+    }
+
+    #[test]
+    fn open_flags_include_o_direct_when_requested() {
+        assert_eq!(open_flags(false) & libc::O_DIRECT, 0);
+        assert_eq!(open_flags(true) & libc::O_DIRECT, libc::O_DIRECT);
     }
 }

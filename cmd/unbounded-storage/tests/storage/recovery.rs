@@ -426,7 +426,9 @@ fn torn_btree_leaf_reports_miss() {
 
                 // Now read every key back. Each read either misses or
                 // hits with the EXACT bytes we wrote; nothing else is
-                // acceptable.
+                // acceptable. The internal-node cache can route to the
+                // leaf without disk I/O, but the leaf itself remains
+                // disk-backed and must fail closed after corruption.
                 let mut results: Vec<(bool, Vec<u8>)> = Vec::new();
                 let read_base = writes_for_task.len();
                 for (i, (k, off, _)) in writes_for_task.iter().enumerate() {
