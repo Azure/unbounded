@@ -68,6 +68,12 @@ func discoverAMDDevicesAt(kfdPath, driPath string) []string {
 			}
 
 			name := e.Name()
+			// TODO: Narrow DRM discovery to AMD-owned nodes by checking
+			// /sys/class/drm/<name>/device/vendor == 0x1002. Today we expose all DRM
+			// card/render nodes when /dev/kfd exists so the AMD device plugin can
+			// discover GPUs in nspawn. That is broader than necessary on mixed-GPU
+			// hosts, but avoids accidentally missing non-standard AMD layouts until
+			// we validate sysfs filtering behavior across target hardware.
 			if strings.HasPrefix(name, "card") || strings.HasPrefix(name, "renderD") {
 				devices = append(devices, filepath.Join(driPath, name))
 			}
