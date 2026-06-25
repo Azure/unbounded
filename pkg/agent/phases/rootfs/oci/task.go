@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
+	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
 	"oras.land/oras-go/v2/registry/remote"
@@ -18,6 +20,23 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
+
+const (
+	ociPullMaxAttempts = 5
+	ociPullRetryDelay  = 2 * time.Second
+)
+
+var sleepBeforeOCIPullRetry = func(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
 type downloadRootFS struct {
 	log        *slog.Logger
@@ -95,7 +114,9 @@ func (d *downloadRootFS) pullAndUnpack(ctx context.Context, ref, tag string) err
 	ociutil.ConfigurePlainHTTP(repo)
 
 	// Copy (pull) the image from the remote repository into the local OCI layout.
-	desc, err := oras.Copy(ctx, repo, tag, store, tag, oras.DefaultCopyOptions)
+	desc, err := d.copyImageWithRetry(ctx, fmt.Sprintf("%s:%s", ref, tag), func(ctx context.Context) (ispec.Descriptor, error) {
+		return oras.Copy(ctx, repo, tag, store, tag, oras.DefaultCopyOptions)
+	})
 	if err != nil {
 		return fmt.Errorf("pull image %s:%s: %w", ref, tag, err)
 	}
@@ -117,6 +138,48 @@ func (d *downloadRootFS) pullAndUnpack(ctx context.Context, ref, tag string) err
 		slog.String("dest", d.machineDir))
 
 	return nil
+}
+
+func (d *downloadRootFS) copyImageWithRetry(
+	ctx context.Context,
+	image string,
+	copyImage func(context.Context) (ispec.Descriptor, error),
+) (ispec.Descriptor, error) {
+	delay := ociPullRetryDelay
+
+	var lastErr error
+
+	for attempt := 1; attempt <= ociPullMaxAttempts; attempt++ {
+		desc, err := copyImage(ctx)
+		if err == nil {
+			return desc, nil
+		}
+
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ispec.Descriptor{}, ctxErr
+		}
+
+		lastErr = err
+
+		if attempt == ociPullMaxAttempts {
+			break
+		}
+
+		d.log.Warn("pull OCI image failed, retrying",
+			slog.String("image", image),
+			slog.Int("attempt", attempt),
+			slog.Int("maxAttempts", ociPullMaxAttempts),
+			slog.Duration("retryDelay", delay),
+			slog.Any("error", err))
+
+		if err := sleepBeforeOCIPullRetry(ctx, delay); err != nil {
+			return ispec.Descriptor{}, err
+		}
+
+		delay *= 2
+	}
+
+	return ispec.Descriptor{}, lastErr
 }
 
 // parseImageReference splits an OCI image reference like
