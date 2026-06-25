@@ -599,12 +599,12 @@ Sections (all optional, each falling back to defaults):
   or `rdma` with a provider-native address encoded as
   `hex:<fi_getname-bytes>`). The same peer id may appear in multiple
   neighborhoods only with identical peer data.
-- `[[caches]]` - `name`, `source` (a backend or neighborhood component name),
-  and `[[caches.disks]]`. Each disk has one `config` table (`block` with
-  `path` and optional `numa`, or `file` with `path` and required `size`),
-  `queue_depth` (optional), `page_size_bytes`, and `skip_recovery_scan` (fields
-  that disk reconcile treats as drift, see 7.10). Disk paths must be unique
-  across all caches.
+- `[[caches]]` - `name` and `source` (a backend or neighborhood component name).
+- `[[disks]]` - the shared local disk set available to every cache. Each disk has one
+  `config` table (`block` with `path` and optional `numa`, or `file` with
+  `path` and required `size`), `queue_depth` (optional), `page_size_bytes`, and
+  `skip_recovery_scan` (fields that disk reconcile treats as drift, see 7.10).
+  Disk paths must be unique across the shared set.
 - `[[frontends]]` - `name`, `source` (a backend, cache, or neighborhood
   component name), and one `config` table (`http`, `s3`, or `loadgen`).
 

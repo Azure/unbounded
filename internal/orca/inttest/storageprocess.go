@@ -152,11 +152,11 @@ addr = "%s"
 name = "cache"
 source = "p2p"
 
-[[caches.disks]]
+[[disks]]
 page_size_bytes = %d
 skip_recovery_scan = true
 
-[caches.disks.config.file]
+[disks.config.file]
 path = "%s"
 size = %d
 

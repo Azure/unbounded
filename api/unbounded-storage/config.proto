@@ -18,6 +18,7 @@ message Config {
   repeated BackendSpec backends = 4;
   repeated CacheSpec caches = 5;
   repeated NeighborhoodSpec neighborhoods = 6;
+  repeated DiskSpec disks = 7;
 }
 
 message StartupCfg {
@@ -177,9 +178,6 @@ message RdmaPeerConfig {
 message CacheSpec {
   string name = 1;
   string source = 2;
-
-  // Disk definitions attached to this cache.
-  repeated DiskSpec disks = 3;
 }
 
 message DiskSpec {
@@ -202,7 +200,7 @@ message BlockDiskConfig {
   // Optional NUMA node hint used when placing storage work for this block device.
   optional uint32 numa = 1;
 
-  // Block device path; paths must be unique across all caches.
+  // Block device path; paths must be unique across all disks.
   string path = 2;
 }
 
@@ -210,7 +208,7 @@ message FileDiskConfig {
   // Required file-backed disk capacity in bytes; the file is provisioned to this size before opening.
   optional uint64 size = 1;
 
-  // Backing-file path; paths must be unique across all caches.
+  // Backing-file path; paths must be unique across all disks.
   string path = 2;
 }
 

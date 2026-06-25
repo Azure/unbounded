@@ -723,11 +723,11 @@ addr = "{peer_addr}"
 name = "cache"
 source = "p2p"
 
-[[caches.disks]]
+[[disks]]
 page_size_bytes = 4096
 skip_recovery_scan = true
 
-[caches.disks.config.file]
+[disks.config.file]
 path = "{disk_path}"
 size = {DISK_SIZE}
 

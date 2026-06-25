@@ -143,6 +143,35 @@ fn smoke_request_cap_closes_after_bound() {
     assert_eq!(report.leftover, all_bytes[first_two_len..].to_vec());
 }
 
+#[test]
+fn regression_delayed_one_byte_chunks_do_not_starve_server() {
+    let w = Workload {
+        requests: vec![
+            RequestSpec {
+                method: RequestMethod::Get,
+                version: HttpVersion::Http10,
+                connection: ConnectionSpec::KeepAlive,
+                body: BodySpec::ContentLengthZero,
+            },
+            RequestSpec {
+                method: RequestMethod::Get,
+                version: HttpVersion::Http10,
+                connection: ConnectionSpec::KeepAlive,
+                body: BodySpec::DuplicateContentLength,
+            },
+        ],
+        chunk_sizes: vec![1],
+        max_send_delay: 4,
+        max_requests_per_connection: 2,
+    };
+    let report = run_workload(1_895_560_329_144_191_809, w).expect("run completed");
+    assert_eq!(report.served.len(), 2);
+    assert!(report.served[0].keep_alive);
+    assert!(!report.served[1].keep_alive);
+    assert_eq!(report.stopped_with, StopReason::ServerClosed);
+    assert!(report.leftover.is_empty());
+}
+
 fn assert_served_prefix(report: &RunReport, expected: &[bool]) -> Result<(), TestCaseError> {
     prop_assert_eq!(report.served.len(), expected.len());
     for (idx, (served, keep_alive)) in report.served.iter().zip(expected).enumerate() {
