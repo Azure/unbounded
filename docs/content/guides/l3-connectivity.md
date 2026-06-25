@@ -337,8 +337,8 @@ kubectl get nodes -l unbounded-cloud.io/unbounded-net-gateway=true
 
 ## 6. Initialize the Site
 
-Run `kubectl unbounded site init` to install the networking stack and create
-site resources. The CIDRs must match the networks reachable over the VPN:
+Run `kubectl unbounded site init` to bootstrap the operator and create site
+resources. The CIDRs must match the networks reachable over the VPN:
 
 ```bash
 kubectl unbounded site init \
@@ -363,13 +363,13 @@ kubectl unbounded site init \
 
 This command creates:
 
-- The **unbounded-net CNI** controller and node agent
+- The **unbounded-operator**, which deploys the enabled components
 - A **cluster** Site for the AKS nodes
 - A **ubiquiti-site** Site for the remote machines
 - A **GatewayPool** (`gw-main`) selecting labeled gateway nodes
 - **SiteGatewayPoolAssignments** linking both sites to the gateway pool
 - A **bootstrap token** for the remote site
-- The **machina** controller for SSH-based provisioning
+- Component settings that enable unbounded-net and the **machina** controller
 
 ---
 

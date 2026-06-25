@@ -21,18 +21,19 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/net/routeplan"
 )
 
 // parseSite converts an unstructured object to a Site
-func parseSite(obj *unstructured.Unstructured) (*unboundednetv1alpha1.Site, error) {
+func parseSite(obj *unstructured.Unstructured) (*unboundedv1alpha3.Site, error) {
 	data, err := obj.MarshalJSON()
 	if err != nil {
 		return nil, err
 	}
 
-	var site unboundednetv1alpha1.Site
+	var site unboundedv1alpha3.Site
 	if err := json.Unmarshal(data, &site); err != nil {
 		return nil, err
 	}
@@ -102,7 +103,7 @@ func normalizeGatewayPoolType(poolType string) string {
 // reachable via a gateway pool, excluding the local site. This scopes the
 // fallback routed CIDRs to only CIDRs that are actually reachable through
 // this specific pool, preventing routes from leaking across unrelated pools.
-func poolReachableNodeCIDRs(pool *unboundednetv1alpha1.GatewayPool, siteMap map[string]*unboundednetv1alpha1.Site, mySiteName string) []string {
+func poolReachableNodeCIDRs(pool *unboundednetv1alpha1.GatewayPool, siteMap map[string]*unboundedv1alpha3.Site, mySiteName string) []string {
 	if pool == nil {
 		return nil
 	}
@@ -170,7 +171,7 @@ func resolveGatewayPoolSiteName(
 	return ""
 }
 
-func buildGatewayNodeRoutesForStatus(pool *unboundednetv1alpha1.GatewayPool, site *unboundednetv1alpha1.Site) map[string]unboundednetv1alpha1.GatewayNodeRoute {
+func buildGatewayNodeRoutesForStatus(pool *unboundednetv1alpha1.GatewayPool, site *unboundedv1alpha3.Site) map[string]unboundednetv1alpha1.GatewayNodeRoute {
 	routes := make(map[string]unboundednetv1alpha1.GatewayNodeRoute)
 
 	fullPath := make([]unboundednetv1alpha1.GatewayNodePathHop, 0, 2)
@@ -239,7 +240,7 @@ func buildGatewayNodeRoutesForAssignedSitesStatus(
 	poolName string,
 	pool *unboundednetv1alpha1.GatewayPool,
 	assignments []unboundednetv1alpha1.SiteGatewayPoolAssignment,
-	siteMap map[string]*unboundednetv1alpha1.Site,
+	siteMap map[string]*unboundedv1alpha3.Site,
 ) map[string]unboundednetv1alpha1.GatewayNodeRoute {
 	merged := buildGatewayNodeRoutesForStatus(pool, nil)
 	if poolName == "" {

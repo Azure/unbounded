@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"testing"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
@@ -25,14 +26,14 @@ func TestComputeReachable_DirectVsTransitiveSites(t *testing.T) {
 		},
 	}
 
-	sites := map[string]*unboundednetv1alpha1.Site{
+	sites := map[string]*unboundedv1alpha3.Site{
 		"site2": {
-			Spec: unboundednetv1alpha1.SiteSpec{
+			Spec: unboundedv1alpha3.SiteSpec{
 				NodeCidrs: []string{"10.2.0.0/16"},
 			},
 		},
 		"site1": {
-			Spec: unboundednetv1alpha1.SiteSpec{
+			Spec: unboundedv1alpha3.SiteSpec{
 				NodeCidrs: []string{"10.1.0.0/16"},
 			},
 		},
@@ -86,15 +87,15 @@ func TestComputeReachableRoutesAndRouteSelectionPriority(t *testing.T) {
 		"pool-a": {Spec: unboundednetv1alpha1.GatewayPoolSpec{RoutedCidrs: []string{"100.64.0.0/16"}}},
 		"pool-b": {Spec: unboundednetv1alpha1.GatewayPoolSpec{RoutedCidrs: []string{"100.65.0.0/16"}}},
 	}
-	sites := map[string]*unboundednetv1alpha1.Site{
+	sites := map[string]*unboundedv1alpha3.Site{
 		"site-a": {
-			Spec: unboundednetv1alpha1.SiteSpec{
+			Spec: unboundedv1alpha3.SiteSpec{
 				NodeCidrs:          []string{"10.1.0.0/16"},
 				PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{CidrBlocks: []string{"10.10.0.0/16"}}},
 			},
 		},
 		"site-b": {
-			Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.2.0.0/16"}},
+			Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.2.0.0/16"}},
 		},
 	}
 	connectedSites := map[string]map[string]struct{}{

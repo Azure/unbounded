@@ -33,19 +33,19 @@ wg --version
 
 ### Installation Steps
 
-1. **Deploy CRDs**: `kubectl apply -f deploy/machina/crd/`
-2. **Deploy Controller**: `kubectl apply -f deploy/controller/`
-3. **Deploy Node Agent**: `kubectl apply -f deploy/node/`
-4. **Create Sites**: Define Site resources with `nodeCidrs` and
-   `podCidrAssignments`.
-5. **Create GatewayPools**: Define pools with `nodeSelector`.
-6. **Assign Sites to Pools**: Create SiteGatewayPoolAssignment resources.
-7. **Label Gateway Nodes**:
+1. **Bootstrap CRDs and operator**: `kubectl unbounded install`
+2. **Create Sites**: Define Site resources with `nodeCidrs`,
+   `podCidrAssignments`, and `components.net.enabled: true` on the cluster
+   owner Site.
+3. **Create GatewayPools**: Define pools with `nodeSelector`.
+4. **Assign Sites to Pools**: Create SiteGatewayPoolAssignment resources.
+5. **Label Gateway Nodes**:
    `kubectl label node <name> net.unbounded-cloud.io/gateway=true`
-8. **Verify Connectivity**: Test with pod-to-pod ping across sites.
+6. **Verify Connectivity**: Test with pod-to-pod ping across sites.
 
-> **Note:** When using Unbounded, steps 1-7 are handled automatically by
-> `kubectl unbounded site init`. See the
+> **Note:** `kubectl unbounded site init` runs the bootstrap step by default,
+> creates the initial Site and gateway resources, and lets the operator deploy
+> controller and node workloads. See the
 > [Getting Started guide]({{< relref "guides/getting-started" >}}).
 
 ---
@@ -57,7 +57,7 @@ wg --version
 The controller provides a real-time web dashboard:
 
 ```bash
-kubectl -n kube-system port-forward deploy/unbounded-net-controller 9999:9999
+kubectl -n unbounded-net port-forward deploy/unbounded-net-controller 9999:9999
 # Open http://localhost:9999/status
 ```
 
@@ -137,11 +137,11 @@ bpftool map dump name unb_endpts
 
 **Using the `unroute` diagnostic tool** (included in node agent image):
 ```bash
-kubectl -n kube-system exec <node-agent-pod> -- unroute           # dump all
-kubectl -n kube-system exec <node-agent-pod> -- unroute <ip>      # lookup
-kubectl -n kube-system exec <node-agent-pod> -- unroute -4        # v4 only
-kubectl -n kube-system exec <node-agent-pod> -- unroute -6        # v6 only
-kubectl -n kube-system exec <node-agent-pod> -- unroute --raw     # raw key/value hex
+kubectl -n unbounded-net exec <node-agent-pod> -- unroute           # dump all
+kubectl -n unbounded-net exec <node-agent-pod> -- unroute <ip>      # lookup
+kubectl -n unbounded-net exec <node-agent-pod> -- unroute -4        # v4 only
+kubectl -n unbounded-net exec <node-agent-pod> -- unroute -6        # v6 only
+kubectl -n unbounded-net exec <node-agent-pod> -- unroute --raw     # raw key/value hex
 ```
 
 **Via kubectl plugin:**
@@ -229,7 +229,7 @@ ip route show dev wg51821
 ```bash
 kubectl get node <name> -L net.unbounded-cloud.io/site
 kubectl get sites -o yaml
-kubectl -n kube-system logs -l app=unbounded-net-controller | grep -i alloc
+kubectl -n unbounded-net logs -l app.kubernetes.io/name=unbounded-net-controller | grep -i alloc
 ```
 
 **Common causes:**
@@ -278,7 +278,7 @@ ip route | grep <remote-site-cidr>
 **Check:**
 ```bash
 curl -v http://<gateway-health-ip>:9998/healthz
-kubectl -n kube-system logs <gateway-node-agent-pod>
+kubectl -n unbounded-net logs <gateway-node-agent-pod>
 ```
 
 **Common causes:**
@@ -292,14 +292,14 @@ kubectl -n kube-system logs <gateway-node-agent-pod>
 
 **Check:**
 ```bash
-kubectl -n kube-system get endpointslices -l kubernetes.io/service-name=unbounded-net-controller
-kubectl -n kube-system get endpoints unbounded-net-controller 2>&1
+kubectl -n unbounded-net get endpointslices -l kubernetes.io/service-name=unbounded-net-controller
+kubectl -n unbounded-net get endpoints unbounded-net-controller 2>&1
 ```
 
 **Common causes:**
 - Stale `v1/Endpoints` from a previous controller version. The controller
   cleans these on leader election, but during upgrades it may be needed:
-  `kubectl -n kube-system delete endpoints unbounded-net-controller`
+  `kubectl -n unbounded-net delete endpoints unbounded-net-controller`
 
 > **Note:** The controller Service has **no selector**. The leader manages its
 > own EndpointSlice. Do not add a selector.
@@ -325,11 +325,11 @@ ip route show table main | grep -E 'wg|cbr|unbounded'
 cat /etc/cni/net.d/10-unbounded.conflist
 
 # Controller
-kubectl -n kube-system get lease unbounded-net-controller -o yaml
-kubectl -n kube-system logs -l app=unbounded-net-controller --tail=100
+kubectl -n unbounded-net get lease unbounded-net-controller -o yaml
+kubectl -n unbounded-net logs -l app.kubernetes.io/name=unbounded-net-controller --tail=100
 
 # Node agent
-kubectl -n kube-system logs -l app=unbounded-net-node --tail=100
+kubectl -n unbounded-net logs -l app.kubernetes.io/name=unbounded-net-node --tail=100
 ```
 
 ### Debug Logging
@@ -374,8 +374,8 @@ Edit the Site to add CIDR blocks under `podCidrAssignments[].cidrBlocks`.
 ### Rolling Restart
 
 ```bash
-kubectl -n kube-system rollout restart daemonset/unbounded-net-node
-kubectl -n kube-system rollout status daemonset/unbounded-net-node
+kubectl -n unbounded-net rollout restart daemonset/unbounded-net-node
+kubectl -n unbounded-net rollout status daemonset/unbounded-net-node
 ```
 
 ---
@@ -397,10 +397,10 @@ need backup.
 
 ### Recovery
 
-1. Restore CRDs: `kubectl apply -f deploy/machina/crd/`
+1. Bootstrap CRDs and the operator: `kubectl unbounded install`.
 2. Restore resources from backup YAMLs.
-3. Deploy controller and node agent.
-4. Re-apply gateway labels.
+3. Re-apply gateway labels.
+4. Verify the operator reconciles the controller and node agent.
 
 ---
 
@@ -413,11 +413,11 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: allow-unbounded-net
-  namespace: kube-system
+  namespace: unbounded-net
 spec:
   podSelector:
     matchLabels:
-      app: unbounded-net-node
+      app.kubernetes.io/name: unbounded-net-node
   policyTypes: [Ingress, Egress]
   ingress:
     - ports:

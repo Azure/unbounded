@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
@@ -50,7 +51,7 @@ func TestProviderKubeProxyDaemonSetsIgnoresManagedDaemonSets(t *testing.T) {
 
 func TestSiteKubeProxyClusterCIDR(t *testing.T) {
 	falseValue := false
-	site := unboundednetv1alpha1.Site{Spec: unboundednetv1alpha1.SiteSpec{PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{
+	site := unboundedv1alpha3.Site{Spec: unboundedv1alpha3.SiteSpec{PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{
 		{AssignmentEnabled: &falseValue, CidrBlocks: []string{"10.99.0.0/16"}},
 		{CidrBlocks: []string{"100.125.0.0/16", "fd00:1::/64"}},
 	}}}
@@ -63,7 +64,7 @@ func TestSiteKubeProxyClusterCIDR(t *testing.T) {
 
 func TestDaemonSetForSite(t *testing.T) {
 	c := &ManagedKubeProxyController{options: ManagedKubeProxyOptions{Namespace: "unbounded-net", Image: "kube-proxy:v1"}}
-	ds := c.daemonSetForSite(unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "test"}}, "100.125.0.0/16")
+	ds := c.daemonSetForSite(unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "test"}}, "100.125.0.0/16")
 
 	if ds.Name != "unbounded-net-kube-proxy-test" {
 		t.Fatalf("unexpected daemonset name: %s", ds.Name)

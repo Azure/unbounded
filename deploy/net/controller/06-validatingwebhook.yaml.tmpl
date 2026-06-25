@@ -24,6 +24,10 @@ webhooks:
         port: 9999
     rules:
       - operations: ["CREATE", "UPDATE"]
+        apiGroups: ["unbounded-cloud.io"]
+        apiVersions: ["v1alpha3"]
+        resources: ["sites"]
+      - operations: ["CREATE", "UPDATE"]
         apiGroups: ["net.unbounded-cloud.io"]
         apiVersions: ["v1alpha1"]
-        resources: ["sites", "gatewaypools", "sitepeerings", "sitegatewaypoolassignments", "gatewaypoolpeerings"]
+        resources: ["gatewaypools", "sitepeerings", "sitegatewaypoolassignments", "gatewaypoolpeerings"]

@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/cache"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
@@ -112,10 +113,10 @@ func TestGetManageCniPluginFromCRDs(t *testing.T) {
 	trueVal := true
 	falseVal := false
 
-	sites := []*unboundednetv1alpha1.Site{
-		{ObjectMeta: metav1.ObjectMeta{Name: "site-default"}, Spec: unboundednetv1alpha1.SiteSpec{ManageCniPlugin: nil}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "site-true"}, Spec: unboundednetv1alpha1.SiteSpec{ManageCniPlugin: &trueVal}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "site-false"}, Spec: unboundednetv1alpha1.SiteSpec{ManageCniPlugin: &falseVal}},
+	sites := []*unboundedv1alpha3.Site{
+		{ObjectMeta: metav1.ObjectMeta{Name: "site-default"}, Spec: unboundedv1alpha3.SiteSpec{ManageCniPlugin: nil}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "site-true"}, Spec: unboundedv1alpha3.SiteSpec{ManageCniPlugin: &trueVal}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "site-false"}, Spec: unboundedv1alpha3.SiteSpec{ManageCniPlugin: &falseVal}},
 	}
 	for _, s := range sites {
 		if err := siteInformer.GetStore().Add(toUnstructuredSiteWatch(t, s)); err != nil {

@@ -26,6 +26,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/net/healthcheck"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
@@ -931,9 +932,9 @@ var configureWireGuardFunc = configureWireGuard
 // Sites that are directly peered via SitePeering objects are treated as if they were the same site
 func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interface, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer cache.SharedIndexInformer, cfg *config, mySiteName, privKey, myPubKey string, manageCniPlugin bool, state *wireGuardState) error {
 	// Parse all sites
-	var allSites []unboundednetv1alpha1.Site
+	var allSites []unboundedv1alpha3.Site
 
-	siteMap := make(map[string]*unboundednetv1alpha1.Site)
+	siteMap := make(map[string]*unboundedv1alpha3.Site)
 
 	for _, item := range siteInformer.GetStore().List() {
 		unstr, ok := item.(*unstructured.Unstructured)

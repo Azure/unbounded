@@ -30,7 +30,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
-	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 const (
@@ -42,8 +42,8 @@ const (
 )
 
 var kubeProxySiteGVR = schema.GroupVersionResource{
-	Group:    unboundednetv1alpha1.GroupName,
-	Version:  "v1alpha1",
+	Group:    unboundedv1alpha3.GroupVersion.Group,
+	Version:  unboundedv1alpha3.GroupVersion.Version,
 	Resource: "sites",
 }
 
@@ -220,17 +220,17 @@ func (c *ManagedKubeProxyController) sync(ctx context.Context) error {
 	return nil
 }
 
-func (c *ManagedKubeProxyController) listSites() ([]unboundednetv1alpha1.Site, error) {
+func (c *ManagedKubeProxyController) listSites() ([]unboundedv1alpha3.Site, error) {
 	objs := c.siteInformer.GetStore().List()
 
-	sites := make([]unboundednetv1alpha1.Site, 0, len(objs))
+	sites := make([]unboundedv1alpha3.Site, 0, len(objs))
 	for _, obj := range objs {
 		u, ok := obj.(*unstructured.Unstructured)
 		if !ok {
 			continue
 		}
 
-		var site unboundednetv1alpha1.Site
+		var site unboundedv1alpha3.Site
 		if err := fromUnstructured(u, &site); err != nil {
 			return nil, fmt.Errorf("decode Site %s: %w", u.GetName(), err)
 		}
@@ -379,7 +379,7 @@ func stringInSlice(value string, values []string) bool {
 	return false
 }
 
-func (c *ManagedKubeProxyController) ensureDaemonSet(ctx context.Context, site unboundednetv1alpha1.Site) error {
+func (c *ManagedKubeProxyController) ensureDaemonSet(ctx context.Context, site unboundedv1alpha3.Site) error {
 	clusterCIDR, ok := siteKubeProxyClusterCIDR(site)
 	if !ok {
 		return nil
@@ -404,7 +404,7 @@ func (c *ManagedKubeProxyController) ensureDaemonSet(ctx context.Context, site u
 	return err
 }
 
-func siteKubeProxyClusterCIDR(site unboundednetv1alpha1.Site) (string, bool) {
+func siteKubeProxyClusterCIDR(site unboundedv1alpha3.Site) (string, bool) {
 	var ipv4, ipv6 string
 
 	for _, assignment := range site.Spec.PodCidrAssignments {
@@ -442,7 +442,7 @@ func siteKubeProxyClusterCIDR(site unboundednetv1alpha1.Site) (string, bool) {
 	return "", false
 }
 
-func (c *ManagedKubeProxyController) daemonSetForSite(site unboundednetv1alpha1.Site, clusterCIDR string) *appsv1.DaemonSet {
+func (c *ManagedKubeProxyController) daemonSetForSite(site unboundedv1alpha3.Site, clusterCIDR string) *appsv1.DaemonSet {
 	name := managedKubeProxyDaemonSetName(site.Name)
 	labels := map[string]string{
 		"app.kubernetes.io/name":      managedKubeProxyAppName,

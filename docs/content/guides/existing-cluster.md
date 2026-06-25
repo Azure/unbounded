@@ -15,7 +15,7 @@ You'll label gateway nodes, initialize a site, and join remote machines.
 
 1. **[Install the prerequisites](#1-install-the-prerequisites)** -- kubectl and the unbounded plugin
 2. **[Prepare gateway nodes](#2-prepare-gateway-nodes)** -- label and open WireGuard ports
-3. **[Initialize a site](#3-initialize-a-site)** -- install the networking stack and create site resources
+3. **[Initialize a site](#3-initialize-a-site)** -- bootstrap the operator and create site resources
 4. **[Add machines](#4-add-machines)** -- register remote hosts for SSH provisioning
 5. **[Watch progress](#5-watch-progress)** -- monitor the provisioning lifecycle
 
@@ -68,7 +68,7 @@ kubectl label node <node-name> "unbounded-cloud.io/unbounded-net-gateway=true"
 ```
 
 {{< callout type="important" >}}
-`kubectl unbounded site init` checks for the gateway label and fails if no labeled nodes are found. You must also ensure UDP ports 51820-51899 are open on the gateway node's firewall before proceeding -- the init command does not open these ports for you.
+`kubectl unbounded site init` creates a `GatewayPool` that selects this label. You must ensure UDP ports 51820-51899 are open on the gateway node's firewall; the init command does not open these ports for you.
 {{< /callout >}}
 
 ---
@@ -76,8 +76,10 @@ kubectl label node <node-name> "unbounded-cloud.io/unbounded-net-gateway=true"
 ## 3. Initialize a Site
 
 A **Site** represents a remote location where machines will run. The `site init`
-command installs unbounded-net, creates site resources, generates a bootstrap
-token, and deploys the machina controller -- all in one step.
+command bootstraps `unbounded-operator`, creates site resources, records the
+requested components in `Site.spec.components`, and generates a bootstrap token.
+The operator deploys unbounded-net, machina, and optional components from the
+Site specs.
 
 ```bash
 kubectl unbounded site init \
@@ -102,9 +104,12 @@ kubectl unbounded site init \
 | Flag | Description |
 |------|-------------|
 | `--kubeconfig` | Path to kubeconfig file |
-| `--cni-manifests` | Path or URL to CNI manifests (uses embedded manifests if omitted) |
-| `--machina-manifests` | Path or URL to machina manifests (uses embedded manifests if omitted) |
 | `--manage-cni-plugin` | Set to `false` when the cluster already has a CNI (default: `true`) |
+| `--enable-net` | Enable unbounded-net on the cluster Site (default: `true`) |
+| `--enable-machina` | Enable machina on the cluster Site (default: `true`) |
+| `--enable-metalman` | Enable the metalman component in the Site spec |
+| `--enable-unbounded-storage` | Enable the unbounded-storage component in the Site spec |
+| `--skip-install` | Skip operator bootstrap if you already ran `kubectl unbounded install` or applied the operator manifests |
 
 </details>
 
