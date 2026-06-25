@@ -91,8 +91,9 @@ func (c nspawnMachineProvisioningChecker) Check(context.Context) []preflight.Res
 }
 
 func (c nspawnMachineProvisioningChecker) checkMachineDir() []preflight.Result {
-	c.log.Debug("checking machine directory", "path", c.gs.MachineDir)
 	var results []preflight.Result
+
+	c.log.Debug("checking machine directory", "path", c.gs.MachineDir)
 
 	info, err := c.deps.stat(c.gs.MachineDir)
 	switch {
