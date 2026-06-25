@@ -71,6 +71,8 @@ pub enum FrontendError {
     UnsupportedKind(&'static str),
     /// The listener address in the spec could not be parsed/bound.
     BadBind(String),
+    /// A frontend-specific config value is invalid.
+    BadConfig(&'static str),
 }
 
 impl std::fmt::Display for FrontendError {
@@ -78,6 +80,7 @@ impl std::fmt::Display for FrontendError {
         match self {
             FrontendError::UnsupportedKind(k) => write!(f, "unsupported frontend kind: {k}"),
             FrontendError::BadBind(b) => write!(f, "bad frontend addr: {b}"),
+            FrontendError::BadConfig(msg) => write!(f, "bad frontend config: {msg}"),
         }
     }
 }

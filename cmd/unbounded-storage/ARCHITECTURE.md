@@ -216,7 +216,7 @@ scratch MR, and tears libfabric down).
 
 All subsystems are `pub mod`: `backend`, `bufferpool`, `config`, `fabric`,
 `fanout`, `frontend`, `http`, `io`, `memory`, `metrics`, `obs`, `p2p`,
-`ring`, `runtime`, `storage`, and `topology`. The `profiling` module is
+`ring`, `runtime`, `storage`, `tls`, and `topology`. The `profiling` module is
 exported when the `profiling` feature is enabled.
 
 Each subsystem follows the same layout convention: `src/<area>/mod.rs` declares
@@ -614,6 +614,23 @@ drift, via a `last_applied` cache), disks, and - by broadcasting the applied
 config to every shard - each shard's backend and frontend registries plus the
 routing snapshot. It republishes the channel snapshot each update, logs
 `config gen=N ...`, and sets `SHUTDOWN` if the watcher disconnects.
+
+### 7.12 `tls/` - the shared TLS transport
+
+A transport-level TLS utility shared by the origin backends, sibling in spirit
+to `http/` (the wire codec): it owns how the daemon speaks TLS, but no storage
+policy. It drives OpenSSL with kernel TLS (kTLS) so a negotiated `https://`
+body lands decrypted directly in the registered backing (zero copy). The module
+is Linux/OpenSSL specific. Files: `context.rs` (`TlsConfig`, `TlsContext`, the
+`SSL_CTX` lifecycle and the async non-blocking `handshake`), `ffi.rs` (the
+hand-written OpenSSL bindings), `recv.rs` (the record-aware receive helpers,
+`recv_chunk`/`recv_fixed`, that classify kTLS control records off the
+`ring`-level `TLS_RECORD_TYPE_*` ops), and `shim.c` (the only C the module
+ships, exposing OpenSSL macro-only entry points as linkable functions, compiled
+by `build.rs`). Public surface: `TlsConfig`/`TlsContext`, with
+`recv_chunk`/`recv_fixed` re-exported `pub(crate)` for the backends. See the
+OpenSSL dependency note in `AGENTS.md` for why a pinned OpenSSL >= 3.5 is
+required (kTLS receive on TLS 1.3).
 
 ## 8. Concurrency Model Summary
 

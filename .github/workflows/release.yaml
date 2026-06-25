@@ -4,12 +4,16 @@
 name: unbounded release
 
 # ---------------------------------------------------------------------------
-# Single, unified release pipeline.
+# Phase 2 of the two-phase release: build, sign, and publish.
 #
-# Triggers:
-#   workflow_dispatch  - bump latest tag by selected level (patch/minor/major)
-#                         and run the full pipeline against the new tag.
-#   push (tags v*)     - run the pipeline against the pushed tag.
+# Trigger:
+#   push (tags v*)  - run the full pipeline against the pushed tag.
+#
+# This workflow is deliberately tag-driven only. The tag is minted by
+# release-prepare.yaml (Phase 1), which pushes it with an SSH deploy key so
+# this workflow runs in the tag's context. Running in tag context is what
+# makes keyless cosign signatures carry the identity
+# `release.yaml@refs/tags/vX.Y.Z`, which the deploy workflow verifies.
 #
 # Job topology:
 #   version
@@ -21,40 +25,15 @@ name: unbounded release
 #     -> component-images  (matrix: machina, machine-ops-controller, metalman, host-ubuntu2404)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> storage-binaries  (matrix: amd64, arm64; binary + bundled libfabric)
-#     -> finalize          (attach extras + krew manifest; optional publish)
+#     -> finalize          (attach extras + krew manifest)
 #
-# All artifacts land on a single GitHub release that defaults to draft.
-# Pass `publish: true` on workflow_dispatch to publish immediately.
+# All artifacts land on a single GitHub release that is left as a draft.
+# Prerelease status is derived from the tag (a `-` suffix, e.g. v1.2.3-rc1).
+# The release-upgrade workflow publishes the draft after a successful soak
+# (deploy + smoke) on unbounded-stable; manual publish is still possible.
 # ---------------------------------------------------------------------------
 
 on:
-  workflow_dispatch:
-    inputs:
-      bump:
-        description: "Version bump level"
-        required: true
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
-        default: patch
-      prerelease:
-        description: "Mark as pre-release"
-        required: false
-        type: boolean
-        default: false
-      publish:
-        description: "Publish the release immediately (otherwise leave as draft)"
-        required: false
-        type: boolean
-        default: false
-      dry_run:
-        description: "Dry run (build everything, push and sign nothing, no release)"
-        required: false
-        type: boolean
-        default: false
-
   push:
     tags:
       - "v*"
@@ -79,16 +58,16 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Compute the release tag.
-  #
-  #   workflow_dispatch -> bump latest semver tag by the selected level
-  #   tag push          -> use the pushed tag as-is
+  # Resolve the release tag from the pushed ref (this workflow is tag-driven;
+  # the tag itself is minted by release-prepare.yaml). Also derive prerelease
+  # status from the tag: a `-` suffix (e.g. v1.2.3-rc1) marks a prerelease.
   # ---------------------------------------------------------------------------
   version:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -96,26 +75,10 @@ jobs:
 
       - name: Compute version
         id: version
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            TAG="${{ github.ref_name }}"
-          else
-            LATEST=$(git tag --list 'v*' --sort=-version:refname | head -n1)
-            if [[ -z "$LATEST" ]]; then
-              LATEST="v0.0.0"
-            fi
-
-            SEMVER="${LATEST#v}"
-            IFS='.' read -r MAJOR MINOR PATCH <<< "$SEMVER"
-
-            case "${{ inputs.bump }}" in
-              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-              patch) PATCH=$((PATCH + 1)) ;;
-            esac
-
-            TAG="v${MAJOR}.${MINOR}.${PATCH}"
-          fi
+          set -euo pipefail
 
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Tag must be in vX.Y.Z[-suffix] format, got: ${TAG}"
@@ -123,9 +86,16 @@ jobs:
           fi
 
           VERSION="${TAG#v}"
+          if [[ "$TAG" == *-* ]]; then
+            IS_PRERELEASE=true
+          else
+            IS_PRERELEASE=false
+          fi
+
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Release: ${TAG} (version: ${VERSION})"
+          echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "Release: ${TAG} (version: ${VERSION}, prerelease: ${IS_PRERELEASE})"
 
       - name: Normalize container registry to lowercase
         run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
@@ -192,7 +162,7 @@ jobs:
           retention-days: 1
 
   # ---------------------------------------------------------------------------
-  # Create the git tag (workflow_dispatch only) and run GoReleaser.
+  # Run GoReleaser against the pushed tag.
   # GoReleaser produces kubectl-unbounded + unbounded-agent archives,
   # signs the checksums file, generates SBOMs, and creates a DRAFT GitHub
   # release. Subsequent jobs attach more artifacts to that draft.
@@ -209,20 +179,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Create tag (workflow_dispatch only)
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          TAG="${{ needs.version.outputs.tag }}"
-          if git rev-parse "${TAG}" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already exists, skipping creation"
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag "${TAG}"
-            git push origin "${TAG}"
-            echo "Created and pushed tag ${TAG}"
-          fi
-
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
@@ -232,7 +188,7 @@ jobs:
       - uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7.2.2
         with:
           version: "~> v2"
-          args: release --clean ${{ inputs.dry_run == true && '--skip=publish,sign,sbom' || '' }}
+          args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GORELEASER_CURRENT_TAG: ${{ needs.version.outputs.tag }}
@@ -299,7 +255,6 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Log in to ghcr.io
-        if: inputs.dry_run != true
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
@@ -384,7 +339,7 @@ jobs:
           file: images/net/Containerfile
           target: controller
           platforms: ${{ matrix.platform }}
-          push: ${{ inputs.dry_run != true }}
+          push: true
           provenance: false
           build-args: |
             GO_VERSION=${{ steps.goversion.outputs.go_version }}
@@ -403,7 +358,7 @@ jobs:
           file: images/net/Containerfile
           target: node
           platforms: ${{ matrix.platform }}
-          push: ${{ inputs.dry_run != true }}
+          push: true
           provenance: false
           build-args: |
             GO_VERSION=${{ steps.goversion.outputs.go_version }}
@@ -415,13 +370,11 @@ jobs:
           cache-to: type=gha,scope=net-node-${{ matrix.arch }},mode=max
 
       - name: Sign per-arch net images
-        if: inputs.dry_run != true
         run: |
           cosign sign --yes "${{ env.REGISTRY }}/unbounded-net-controller@${{ steps.push_controller.outputs.digest }}"
           cosign sign --yes "${{ env.REGISTRY }}/unbounded-net-node@${{ steps.push_node.outputs.digest }}"
 
       - name: Generate and attest controller SBOM
-        if: inputs.dry_run != true
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ env.REGISTRY }}/unbounded-net-controller@${{ steps.push_controller.outputs.digest }}
@@ -432,7 +385,6 @@ jobs:
           output-file: sbom-net-controller-${{ matrix.arch }}.spdx.json
 
       - name: Attest controller SBOM
-        if: inputs.dry_run != true
         run: |
           cosign attest --yes \
             --predicate sbom-net-controller-${{ matrix.arch }}.spdx.json \
@@ -440,7 +392,6 @@ jobs:
             "${{ env.REGISTRY }}/unbounded-net-controller@${{ steps.push_controller.outputs.digest }}"
 
       - name: Generate and attest node SBOM
-        if: inputs.dry_run != true
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ env.REGISTRY }}/unbounded-net-node@${{ steps.push_node.outputs.digest }}
@@ -451,7 +402,6 @@ jobs:
           output-file: sbom-net-node-${{ matrix.arch }}.spdx.json
 
       - name: Attest node SBOM
-        if: inputs.dry_run != true
         run: |
           cosign attest --yes \
             --predicate sbom-net-node-${{ matrix.arch }}.spdx.json \
@@ -459,12 +409,10 @@ jobs:
             "${{ env.REGISTRY }}/unbounded-net-node@${{ steps.push_node.outputs.digest }}"
 
   # ---------------------------------------------------------------------------
-  # Stitch per-arch net image tags into multi-arch manifests for :TAG and
-  # :latest.
+  # Stitch per-arch net image tags into multi-arch manifests for :TAG.
   # ---------------------------------------------------------------------------
   net-images-manifest:
     needs: [version, net-images]
-    if: ${{ inputs.dry_run != true }}
     runs-on: ubuntu-latest
     steps:
       - name: Normalize container registry to lowercase
@@ -484,13 +432,11 @@ jobs:
           TAG="${{ needs.version.outputs.tag }}"
           for image in controller node; do
             SRC="${{ env.REGISTRY }}/unbounded-net-${image}"
-            for release_tag in "${TAG}" "latest"; do
-              echo "Creating manifest ${SRC}:${release_tag}..."
-              docker buildx imagetools create \
-                --tag "${SRC}:${release_tag}" \
-                "${SRC}:${TAG}-amd64" \
-                "${SRC}:${TAG}-arm64"
-            done
+            echo "Creating manifest ${SRC}:${TAG}..."
+            docker buildx imagetools create \
+              --tag "${SRC}:${TAG}" \
+              "${SRC}:${TAG}-amd64" \
+              "${SRC}:${TAG}-arm64"
           done
 
   # ---------------------------------------------------------------------------
@@ -541,7 +487,6 @@ jobs:
       - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Log in to ghcr.io
-        if: inputs.dry_run != true
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
@@ -577,24 +522,20 @@ jobs:
           context: .
           file: ${{ matrix.component.file }}
           platforms: ${{ matrix.component.platforms }}
-          push: ${{ inputs.dry_run != true }}
+          push: true
           build-args: |
             VERSION=${{ needs.version.outputs.tag }}
             GIT_COMMIT=${{ github.sha }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ matrix.component.name }}:latest
+          tags: ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
           cache-from: type=gha,scope=${{ matrix.component.name }}
           cache-to: type=gha,scope=${{ matrix.component.name }},mode=max
 
       - name: Sign container image
-        if: inputs.dry_run != true
         run: |
           cosign sign --yes \
             "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
 
       - name: Generate and attach SBOM
-        if: inputs.dry_run != true
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}
@@ -605,7 +546,6 @@ jobs:
           output-file: sbom-${{ matrix.component.name }}.spdx.json
 
       - name: Attest SBOM to image
-        if: inputs.dry_run != true
         run: |
           cosign attest --yes \
             --predicate sbom-${{ matrix.component.name }}.spdx.json \
@@ -642,7 +582,6 @@ jobs:
             CONTAINER_REGISTRY="${{ env.REGISTRY }}"
 
       - name: Sign manifests tarball with cosign (keyless)
-        if: inputs.dry_run != true
         run: |
           TAG="${{ needs.version.outputs.tag }}"
           ARCHIVE="build/unbounded-manifests-${TAG}.tar.gz"
@@ -756,7 +695,6 @@ jobs:
             -o spdx-json="dist/${NAME}.tar.gz.spdx.json"
 
       - name: Sign storage tarball with cosign (keyless)
-        if: inputs.dry_run != true
         run: |
           set -euo pipefail
           ARCHIVE="dist/unbounded-storage-linux-${{ matrix.arch }}.tar.gz"
@@ -777,8 +715,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Attach the manifests tarball + krew manifest to the draft release that
-  # GoReleaser created, set release notes, and optionally flip from draft
-  # to published.
+  # GoReleaser created and set release notes. The release stays a draft here;
+  # the release-upgrade workflow publishes it after a successful soak.
   # ---------------------------------------------------------------------------
   finalize:
     needs:
@@ -789,7 +727,6 @@ jobs:
       - component-images
       - manifests-tarball
       - storage-binaries
-    if: ${{ inputs.dry_run != true }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -849,15 +786,14 @@ jobs:
             gh release edit "${TAG}" --notes "${NOTES}"
           fi
 
-          # Flag prerelease if requested.
-          if [[ "${{ inputs.prerelease }}" == "true" ]]; then
+          # Flag prerelease when the tag carries a prerelease suffix
+          # (e.g. v1.2.3-rc1). GoReleaser also sets this via `prerelease: auto`;
+          # we reassert it here in case the draft was created differently.
+          if [[ "${{ needs.version.outputs.is_prerelease }}" == "true" ]]; then
             gh release edit "${TAG}" --prerelease
           fi
 
-          # Flip from draft to published when explicitly requested.
-          if [[ "${{ inputs.publish }}" == "true" ]]; then
-            gh release edit "${TAG}" --draft=false
-            echo "Published release ${TAG}"
-          else
-            echo "Release ${TAG} left as draft. Publish via the GitHub UI or 'gh release edit ${TAG} --draft=false'."
-          fi
+          # The release is left as a draft here. The release-upgrade workflow
+          # publishes it automatically after a successful soak (deploy +
+          # smoke) on unbounded-stable; an operator can also publish manually.
+          echo "Release ${TAG} left as draft; release-upgrade will publish it after a successful soak (or publish manually with 'gh release edit ${TAG} --draft=false')."
