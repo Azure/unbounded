@@ -59,6 +59,7 @@ func TestDiscoverAMDSysFSPaths(t *testing.T) {
 	dir := t.TempDir()
 	existing := filepath.Join(dir, "module", "amdgpu")
 	missing := filepath.Join(dir, "class", "kfd")
+
 	require.NoError(t, os.MkdirAll(existing, 0o755))
 
 	require.Equal(t, []string{existing}, discoverAMDSysFSPaths([]string{existing, missing}))
