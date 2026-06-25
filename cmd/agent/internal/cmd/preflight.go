@@ -73,7 +73,7 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return err
 	}
 
-	if err := cfg.AgentConfig.Validate(); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("validate agent config: %w", err)
 	}
 
