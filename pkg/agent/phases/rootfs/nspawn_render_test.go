@@ -88,6 +88,44 @@ func TestServiceOverride_MultipleHostDevices(t *testing.T) {
 	}
 }
 
+func TestServiceOverride_AMDGPUDevices(t *testing.T) {
+	t.Parallel()
+
+	devices := []string{"/dev/dri/card0", "/dev/dri/renderD128", "/dev/kfd"}
+
+	var nspawnBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
+		BPFFSMountPath:    goalstates.BPFFSMountPath("kube1"),
+		AMDGPUDevicePaths: devices,
+	}))
+
+	var overrideBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", nspawnTemplateData{
+		MachineName:       "kube1",
+		BPFFSMountPath:    goalstates.BPFFSMountPath("kube1"),
+		AMDGPUDevicePaths: devices,
+	}))
+
+	for _, dev := range devices {
+		require.Contains(t, nspawnBuf.String(), "Bind="+dev)
+		require.Contains(t, overrideBuf.String(), "DeviceAllow="+dev+" rwm")
+	}
+
+	require.Contains(t, nspawnBuf.String(), "AMD GPU support")
+	require.Contains(t, overrideBuf.String(), "AMD GPU support")
+}
+
+func TestPathsExcluding(t *testing.T) {
+	t.Parallel()
+
+	got := pathsExcluding(
+		[]string{"/dev/dri/card0", "/dev/dri/renderD128", "/dev/kfd"},
+		[]string{"/dev/dri/card0", "/dev/dri/renderD128"},
+	)
+
+	require.Equal(t, []string{"/dev/kfd"}, got)
+}
+
 func TestServiceOverride_NoHostDevicesNoDeviceAllow(t *testing.T) {
 	t.Parallel()
 

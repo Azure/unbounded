@@ -75,6 +75,7 @@ type nspawnTemplateData struct {
 	BPFFSMountPath       string
 	HostDevicePaths      []string
 	NvidiaGPUDevicePaths []string
+	AMDGPUDevicePaths    []string
 	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
 }
 
@@ -86,11 +87,13 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	// directory.
 	machineName := filepath.Base(e.goalState.MachineDir)
 	hostDevicePaths := e.goalState.HostDevices.Paths()
+	amdGPUDevicePaths := pathsExcluding(e.goalState.AMD.GPUDevicePaths, e.goalState.Nvidia.GPUDevicePaths)
 	templateData := nspawnTemplateData{
 		MachineName:          machineName,
 		BPFFSMountPath:       goalstates.BPFFSMountPath(machineName),
 		HostDevicePaths:      hostDevicePaths,
 		NvidiaGPUDevicePaths: e.goalState.Nvidia.GPUDevicePaths,
+		AMDGPUDevicePaths:    amdGPUDevicePaths,
 		NvidiaLibDirMounts:   e.goalState.Nvidia.LibDirMounts,
 	}
 
@@ -105,6 +108,11 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	if len(e.goalState.Nvidia.GPUDevicePaths) > 0 {
 		e.log.Info("GPU devices detected, configuring nspawn bind-mounts",
 			"count", len(e.goalState.Nvidia.GPUDevicePaths))
+	}
+
+	if len(amdGPUDevicePaths) > 0 {
+		e.log.Info("AMD GPU devices detected, configuring nspawn bind-mounts",
+			"count", len(amdGPUDevicePaths))
 	}
 
 	// Render and write the .nspawn configuration file.
@@ -128,4 +136,24 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	}
 
 	return nil
+}
+
+func pathsExcluding(paths, excluded []string) []string {
+	if len(paths) == 0 || len(excluded) == 0 {
+		return paths
+	}
+
+	seen := make(map[string]bool, len(excluded))
+	for _, p := range excluded {
+		seen[p] = true
+	}
+
+	var out []string
+	for _, p := range paths {
+		if !seen[p] {
+			out = append(out, p)
+		}
+	}
+
+	return out
 }
