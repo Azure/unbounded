@@ -10,9 +10,7 @@ import (
 	"strings"
 )
 
-const (
-	amdKFDDevicePath = "/dev/kfd"
-)
+const amdKFDDevicePath = "/dev/kfd"
 
 // AMDHost aggregates AMD GPU host state discovered at agent startup.
 type AMDHost struct {
