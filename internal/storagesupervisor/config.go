@@ -107,6 +107,9 @@ type Config struct {
 	// Hugepages, when > 0, reserves an explicit number of 2 MiB hugepages
 	// instead of deriving the count from PoolBytes.
 	Hugepages int64
+	// NoHugepages skips the systemd hugepage reservation preflight. Use this
+	// when the daemon config sets startup.memory.no_hugepages.
+	NoHugepages bool
 	// NoEnable, when true, installs the unit but does not enable/start it.
 	NoEnable bool
 
@@ -159,6 +162,7 @@ func LoadConfig() (Config, error) {
 	cfg.SourceMode = classifySource(cfg.Source)
 
 	cfg.NoEnable = os.Getenv("NO_ENABLE") == "1"
+	cfg.NoHugepages = os.Getenv("NO_HUGEPAGES") == "1"
 
 	if len(cfg.Systemctl) == 0 {
 		return Config{}, fmt.Errorf("SYSTEMCTL must not be empty")
