@@ -73,6 +73,10 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return err
 	}
 
+	if err := cfg.AgentConfig.Validate(); err != nil {
+		return fmt.Errorf("validate agent config: %w", err)
+	}
+
 	goalState, err := goalstates.ResolveMachine(
 		logger,
 		&cfg.AgentConfig,
@@ -83,21 +87,11 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("resolve goal state: %w", err)
 	}
 
-	checks := []preflight.Checker{
-		host.CheckIsPrivilegedUser(logger),
-		host.CheckAgentConfig(logger, &cfg.AgentConfig),
-		host.CheckClusterCredentials(logger, cfg),
-		host.CheckHostPackages(logger),
-		host.CheckHostOSConfiguration(logger),
-		host.CheckNSpawnRuntime(logger),
-		host.CheckDockerActive(logger),
-		host.CheckSwapActive(logger),
-		host.CheckDiskSpace(logger),
-		host.CheckCgroups(logger),
-		nodestart.CheckAPIServerReachable(logger, &cfg.AgentConfig),
-		rootfs.CheckGoalState(logger, goalState.RootFS),
-		rootfs.CheckNSpawnMachineProvisioning(logger, goalState.RootFS),
-	}
+	checks := preflight.Flatten(
+		host.Preflight(logger, cfg, goalState),
+		nodestart.Preflight(logger, cfg, goalState),
+		rootfs.Preflight(logger, cfg, goalState),
+	)
 
 	opts := preflight.Options{
 		IgnoreErrors:   h.ignorePreflightErrors,

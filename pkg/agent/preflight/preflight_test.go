@@ -32,6 +32,16 @@ func TestRunIncludesAllResults(t *testing.T) {
 	assert.Len(t, report.Checks, 3)
 }
 
+func TestFlatten(t *testing.T) {
+	first := fakeChecker{name: "first"}
+	second := fakeChecker{name: "second"}
+	third := fakeChecker{name: "third"}
+
+	checks := Flatten([]Checker{first}, nil, []Checker{second, third})
+
+	assert.Equal(t, []Checker{first, second, third}, checks)
+}
+
 func TestRunDowngradesIgnoredErrors(t *testing.T) {
 	report := Run(context.Background(), []Checker{
 		fakeChecker{results: []Result{Error("host-packages", "host packages", "missing")}},

@@ -32,6 +32,21 @@ type Checker interface {
 	Check(ctx context.Context) []Result
 }
 
+// Flatten returns one checker slice from ordered checker groups.
+func Flatten(groups ...[]Checker) []Checker {
+	total := 0
+	for _, group := range groups {
+		total += len(group)
+	}
+
+	checks := make([]Checker, 0, total)
+	for _, group := range groups {
+		checks = append(checks, group...)
+	}
+
+	return checks
+}
+
 // Result describes one preflight check outcome. Message and Target must not
 // include raw configured values such as URLs, tokens, image references, or file
 // contents.

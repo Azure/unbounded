@@ -14,7 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -22,14 +23,22 @@ const checkAPIServerReachableName = "api-server-reachable"
 
 type apiServerReachableChecker struct {
 	log        *slog.Logger
-	config     *config.AgentConfig
+	config     *provision.UnboundedAgentConfig
 	httpClient *http.Client
 }
 
+// Preflight returns the standard node-start checks that can run before the
+// nspawn machine starts.
+func Preflight(log *slog.Logger, cfg *provision.UnboundedAgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
+	return []preflight.Checker{
+		CheckAPIServerReachable(log, cfg),
+	}
+}
+
 // CheckAPIServerReachable returns a non-mutating checker that validates the
-// configured Kubernetes API server can be reached from the host. The checker
-// redacts the configured endpoint from result messages.
-func CheckAPIServerReachable(log *slog.Logger, cfg *config.AgentConfig) preflight.Checker {
+// cluster credentials and configured Kubernetes API server reachability. The
+// checker redacts the configured endpoint from result messages.
+func CheckAPIServerReachable(log *slog.Logger, cfg *provision.UnboundedAgentConfig) preflight.Checker {
 	return apiServerReachableChecker{log: log, config: cfg}
 }
 
@@ -38,6 +47,10 @@ func (c apiServerReachableChecker) Name() string { return checkAPIServerReachabl
 func (c apiServerReachableChecker) Check(ctx context.Context) []preflight.Result {
 	if c.config == nil {
 		return preflight.ResultsError(checkAPIServerReachableName, "cluster API server", "agent config is missing")
+	}
+
+	if errs := c.validateClusterCredentials(); len(errs) > 0 {
+		return preflight.ResultsError(checkAPIServerReachableName, "cluster credentials", "%s", strings.Join(errs, "; "))
 	}
 
 	apiServer := c.config.Kubelet.ApiServer
@@ -71,6 +84,22 @@ func (c apiServerReachableChecker) Check(ctx context.Context) []preflight.Result
 	}
 
 	return preflight.ResultsOK(checkAPIServerReachableName, "cluster API server", "API server is reachable")
+}
+
+func (c apiServerReachableChecker) validateClusterCredentials() []string {
+	var errs []string
+	if _, err := base64.StdEncoding.DecodeString(c.config.Cluster.CaCertBase64); err != nil {
+		errs = append(errs, "cluster CA data is invalid")
+	}
+
+	if c.config.Attest == nil {
+		auth := c.config.Kubelet.Auth
+		if err := auth.Validate(); err != nil {
+			errs = append(errs, "bootstrap credential is invalid")
+		}
+	}
+
+	return errs
 }
 
 func (c apiServerReachableChecker) httpClientWithCA() *http.Client {

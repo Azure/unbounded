@@ -104,5 +104,5 @@ func TestPreflightTextOutputIncludesOK(t *testing.T) {
 	}
 
 	require.NoError(t, h.execute(context.Background()))
-	assert.Contains(t, out.String(), "[OK agent-config]")
+	assert.Contains(t, out.String(), "[OK goal-state]")
 }

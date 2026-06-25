@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
@@ -63,6 +64,21 @@ type simpleHostChecker struct {
 func (c simpleHostChecker) Name() string { return c.name }
 
 func (c simpleHostChecker) Check(ctx context.Context) []preflight.Result { return c.check(ctx) }
+
+// Preflight returns the standard host environment checks required before
+// provisioning an nspawn machine.
+func Preflight(log *slog.Logger, _ *provision.UnboundedAgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
+	return []preflight.Checker{
+		CheckIsPrivilegedUser(log),
+		CheckHostPackages(log),
+		CheckHostOSConfiguration(log),
+		CheckNSpawnRuntime(log),
+		CheckDockerActive(log),
+		CheckSwapActive(log),
+		CheckDiskSpace(log),
+		CheckCgroups(log),
+	}
+}
 
 // CheckIsPrivilegedUser verifies preflight is running as root.
 func CheckIsPrivilegedUser(log *slog.Logger) preflight.Checker {

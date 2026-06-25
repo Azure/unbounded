@@ -12,7 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -59,13 +59,55 @@ func TestCheckAPIServerReachableServerError(t *testing.T) {
 	assert.Equal(t, "API server returned status 500", results[0].Message)
 }
 
-func apiServerPreflightConfig(apiServer string) *config.AgentConfig {
-	return &config.AgentConfig{
-		Cluster: config.AgentClusterConfig{
-			CaCertBase64: "Y2E=",
-		},
-		Kubelet: config.AgentKubeletConfig{
-			ApiServer: apiServer,
+func TestCheckAPIServerReachableAllowsAttestation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := apiServerPreflightConfig(srv.URL)
+	cfg.Kubelet.Auth.BootstrapToken = ""
+	cfg.Attest = &provision.AgentAttestConfig{URL: "http://metalman.example.com:8880"}
+
+	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), cfg).Check(context.Background())
+
+	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+}
+
+func TestCheckAPIServerReachableRequiresAuthWhenNoAttestation(t *testing.T) {
+	cfg := apiServerPreflightConfig("https://api.example.com:443")
+	cfg.Kubelet.Auth.BootstrapToken = ""
+
+	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), cfg).Check(context.Background())
+
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Equal(t, checkAPIServerReachableName, results[0].Name)
+	assert.Equal(t, "cluster credentials", results[0].Target)
+	assert.Equal(t, "bootstrap credential is invalid", results[0].Message)
+}
+
+func TestCheckAPIServerReachableInvalidCA(t *testing.T) {
+	cfg := apiServerPreflightConfig("https://api.example.com:443")
+	cfg.Cluster.CaCertBase64 = "not-base64"
+
+	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), cfg).Check(context.Background())
+
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, "cluster CA data is invalid")
+}
+
+func apiServerPreflightConfig(apiServer string) *provision.UnboundedAgentConfig {
+	return &provision.UnboundedAgentConfig{
+		AgentConfig: provision.AgentConfig{
+			Cluster: provision.AgentClusterConfig{
+				CaCertBase64: "Y2E=",
+			},
+			Kubelet: provision.AgentKubeletConfig{
+				ApiServer: apiServer,
+				Auth: provision.KubeletAuthInfo{
+					BootstrapToken: "abc123.secret456",
+				},
+			},
 		},
 	}
 }
