@@ -4,8 +4,11 @@
 package oci
 
 import (
+	"context"
 	"errors"
+	"net"
 	"net/http"
+	"syscall"
 	"testing"
 	"time"
 
@@ -36,7 +39,11 @@ func TestConfigureOCIPullRetryUsesORASRetryClient(t *testing.T) {
 func TestOCIPullRetryPolicyRetriesTransportErrors(t *testing.T) {
 	policy := newOCIPullRetryPolicy()
 
-	delay, err := policy.Retry(0, nil, errors.New("lookup registry.example.test: no such host"))
+	delay, err := policy.Retry(0, nil, &net.DNSError{
+		Err:        "no such host",
+		Name:       "registry.example.test",
+		IsNotFound: true,
+	})
 	if err != nil {
 		t.Fatalf("policy.Retry returned error: %v", err)
 	}
@@ -45,13 +52,51 @@ func TestOCIPullRetryPolicyRetriesTransportErrors(t *testing.T) {
 		t.Fatalf("retry delay = %v, want %v", delay, ociPullRetryDelay)
 	}
 
-	delay, err = policy.Retry(ociPullMaxAttempts-1, nil, errors.New("lookup registry.example.test: no such host"))
+	delay, err = policy.Retry(0, nil, &net.OpError{
+		Op:  "dial",
+		Err: syscall.ECONNREFUSED,
+	})
+	if err != nil {
+		t.Fatalf("policy.Retry for connection refused returned error: %v", err)
+	}
+
+	if delay != ociPullRetryDelay {
+		t.Fatalf("retry delay for connection refused = %v, want %v", delay, ociPullRetryDelay)
+	}
+
+	delay, err = policy.Retry(ociPullMaxAttempts-1, nil, &net.DNSError{
+		Err:        "no such host",
+		Name:       "registry.example.test",
+		IsNotFound: true,
+	})
 	if err != nil {
 		t.Fatalf("policy.Retry at max attempts returned error: %v", err)
 	}
 
 	if delay >= 0 {
 		t.Fatalf("retry delay at max attempts = %v, want negative", delay)
+	}
+}
+
+func TestOCIPullRetryPolicySkipsNonNetworkTransportErrors(t *testing.T) {
+	policy := newOCIPullRetryPolicy()
+
+	delay, err := policy.Retry(0, nil, errors.New("tls: failed to verify certificate"))
+	if err != nil {
+		t.Fatalf("policy.Retry for TLS error returned error: %v", err)
+	}
+
+	if delay >= 0 {
+		t.Fatalf("retry delay for TLS error = %v, want negative", delay)
+	}
+
+	delay, err = policy.Retry(0, nil, context.Canceled)
+	if err != nil {
+		t.Fatalf("policy.Retry for context cancellation returned error: %v", err)
+	}
+
+	if delay >= 0 {
+		t.Fatalf("retry delay for context cancellation = %v, want negative", delay)
 	}
 }
 

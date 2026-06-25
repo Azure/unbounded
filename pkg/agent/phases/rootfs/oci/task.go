@@ -5,11 +5,14 @@ package oci
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"oras.land/oras-go/v2"
@@ -154,7 +157,7 @@ func newOCIPullRetryPolicy() retry.Policy {
 }
 
 func retryOCIPullFailure(resp *http.Response, err error) (bool, error) {
-	if err != nil {
+	if retryableOCIPullTransportError(err) {
 		return true, nil
 	}
 
@@ -163,6 +166,45 @@ func retryOCIPullFailure(resp *http.Response, err error) (bool, error) {
 	}
 
 	return retry.DefaultPredicate(resp, nil)
+}
+
+// ORAS's default retry policy already handles retryable HTTP statuses, but it
+// only retries transport errors that are timeouts. Agent bootstrap can also hit
+// transient DNS and connectivity failures before the registry returns an HTTP
+// response, so include those selected network errors without retrying every
+// transport failure.
+func retryableOCIPullTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	for _, target := range []error{
+		syscall.ECONNABORTED,
+		syscall.ECONNREFUSED,
+		syscall.ECONNRESET,
+		syscall.EHOSTUNREACH,
+		syscall.ENETUNREACH,
+	} {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func ociPullBackoff(attempt int, _ *http.Response) time.Duration {
