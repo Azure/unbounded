@@ -153,13 +153,14 @@ func watchLoop(ctx context.Context, cfg Config, fsWatcher *fsnotify.Watcher, pee
 	}
 }
 
-// reconcile renders the current ConfigMap source plus the latest peer set into
-// the daemon config file. peers may be nil (peer discovery disabled), in which
-// case only startup settings are rendered.
+// reconcile renders the current ConfigMap source plus the latest per-node state
+// into the daemon config file. peers may be nil (Kubernetes node watching
+// disabled), in which case only ConfigMap and default disk settings are
+// rendered.
 func reconcile(cfg Config, peers *peerWatcher) error {
-	ring := ringSnapshot(cfg, peers)
+	state := currentRenderState(cfg, peers)
 
-	data, err := RenderConfig(cfg.SourceDir, ring)
+	data, err := RenderConfig(cfg.SourceDir, state)
 	if err != nil {
 		return err
 	}
@@ -171,14 +172,15 @@ func reconcile(cfg Config, peers *peerWatcher) error {
 	return nil
 }
 
-// ringSnapshot resolves the current ring state from the node watch, reading
-// the shared fabric port from the ConfigMap's TCP fabric bind. It returns the
-// inactive zero value when peer discovery is disabled. A source that cannot be
-// loaded yields an inactive ring; the subsequent RenderConfig surfaces the same
-// error in reconcile, which keeps the previously rendered config in place.
-func ringSnapshot(cfg Config, peers *peerWatcher) ringState {
+// currentRenderState resolves the current node annotations and ring state from
+// the node watch, reading the shared fabric port from the ConfigMap's TCP fabric
+// bind. It returns the zero value when node watching is disabled. A source that
+// cannot be loaded yields an inactive ring; the subsequent RenderConfig surfaces
+// the same error in reconcile, which keeps the previously rendered config in
+// place.
+func currentRenderState(cfg Config, peers *peerWatcher) renderState {
 	if peers == nil {
-		return ringState{}
+		return renderState{}
 	}
 
 	sc, err := loadSourceConfig(cfg.SourceDir)

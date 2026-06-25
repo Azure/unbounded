@@ -309,11 +309,11 @@ cat >&3 <<EOF
 name = "cache"
 source = "p2p"
 
-[[caches.disks]]
+[[disks]]
 page_size_bytes = 4096
 skip_recovery_scan = true
 
-[caches.disks.config.file]
+[disks.config.file]
 path = "/tmp/unbounded-storage-${LOCAL_NAME}.disk"
 size = $DISK_SIZE
 

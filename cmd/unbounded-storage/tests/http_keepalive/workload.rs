@@ -11,7 +11,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
 use ::http::header::{CONNECTION, CONTENT_LENGTH};
 use proptest::collection::vec;
@@ -140,6 +143,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     let chunks = chunk_request_bytes(&w);
     let inbound = Rc::new(RefCell::new(VecDeque::<Vec<u8>>::new()));
     let client_done = Rc::new(Cell::new(false));
+    let input_waiter = Rc::new(RefCell::new(None));
     let report = Rc::new(RefCell::new(None));
 
     let mut exec = Executor::new(seed);
@@ -148,12 +152,14 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         chunks,
         inbound.clone(),
         client_done.clone(),
+        input_waiter.clone(),
         w.max_send_delay,
     );
     spawn_server(
         &mut exec,
         inbound,
         client_done,
+        input_waiter,
         report.clone(),
         w.requests.len(),
         w.max_requests_per_connection,
@@ -195,6 +201,7 @@ fn spawn_client(
     chunks: Vec<Vec<u8>>,
     inbound: Rc<RefCell<VecDeque<Vec<u8>>>>,
     client_done: Rc<Cell<bool>>,
+    input_waiter: Rc<RefCell<Option<Waker>>>,
     max_send_delay: u32,
 ) {
     exec.spawn(async move {
@@ -209,9 +216,11 @@ fn spawn_client(
             };
             yield_n(delay).await;
             inbound.borrow_mut().push_back(chunk);
+            wake_input_waiter(&input_waiter);
             yield_once().await;
         }
         client_done.set(true);
+        wake_input_waiter(&input_waiter);
     });
 }
 
@@ -219,6 +228,7 @@ fn spawn_server(
     exec: &mut Executor,
     inbound: Rc<RefCell<VecDeque<Vec<u8>>>>,
     client_done: Rc<Cell<bool>>,
+    input_waiter: Rc<RefCell<Option<Waker>>>,
     report: Rc<RefCell<Option<RunReport>>>,
     request_count: usize,
     max_requests_per_connection: usize,
@@ -265,7 +275,8 @@ fn spawn_server(
                         stop = StopReason::ClientClosed;
                         break;
                     } else {
-                        yield_once().await;
+                        wait_for_input(inbound.clone(), client_done.clone(), input_waiter.clone())
+                            .await;
                     }
                 }
                 Err(_) => {
@@ -282,6 +293,43 @@ fn spawn_server(
             steps: 0,
         });
     });
+}
+
+fn wake_input_waiter(input_waiter: &Rc<RefCell<Option<Waker>>>) {
+    if let Some(waker) = input_waiter.borrow_mut().take() {
+        waker.wake();
+    }
+}
+
+fn wait_for_input(
+    inbound: Rc<RefCell<VecDeque<Vec<u8>>>>,
+    client_done: Rc<Cell<bool>>,
+    input_waiter: Rc<RefCell<Option<Waker>>>,
+) -> InputReady {
+    InputReady {
+        inbound,
+        client_done,
+        input_waiter,
+    }
+}
+
+struct InputReady {
+    inbound: Rc<RefCell<VecDeque<Vec<u8>>>>,
+    client_done: Rc<Cell<bool>>,
+    input_waiter: Rc<RefCell<Option<Waker>>>,
+}
+
+impl Future for InputReady {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if !self.inbound.borrow().is_empty() || self.client_done.get() {
+            Poll::Ready(())
+        } else {
+            *self.input_waiter.borrow_mut() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
 }
 
 fn response_connection_value(keep_alive: bool) -> String {

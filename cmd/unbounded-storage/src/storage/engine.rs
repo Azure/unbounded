@@ -231,6 +231,7 @@ pub struct EngineSnapshot {
     pub checksum_misses: u64,
     pub resident_pages: usize,
     pub btree_entries: usize,
+    pub btree_lookup_cache_bytes: usize,
     /// Length of the deferred-reclaim queue: LBAs that were
     /// displaced (overwrite or eviction) while their old page
     /// was still pinned and that have not yet been returned to
@@ -317,6 +318,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             checksum_misses: m.checksum_misses,
             resident_pages: self.lru.len(),
             btree_entries: self.btree.live_entries(),
+            btree_lookup_cache_bytes: self.btree.lookup_cache_bytes(),
             pending_free_len: self.pending_free.lock().unwrap().len(),
         }
     }
