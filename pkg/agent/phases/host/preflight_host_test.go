@@ -54,8 +54,11 @@ func TestCheckHostOSConfiguration(t *testing.T) {
 
 	deps.writeProbe = func(string) error { return errors.New("denied") }
 	results = checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	assert.Len(t, results, 2)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Contains(t, results[0].Message, "/etc/sysctl.d")
+	assert.Equal(t, preflight.SeverityError, results[1].Severity)
+	assert.Contains(t, results[1].Message, "systemd")
 }
 
 func TestCheckNSpawnRuntime(t *testing.T) {
@@ -71,9 +74,15 @@ func TestCheckNSpawnRuntime(t *testing.T) {
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 
 	deps.lookupPath = lookupPathWith(map[string]bool{"systemctl": true})
+	deps.stat = statMissing()
 	results = checkNSpawnRuntime(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	assert.Len(t, results, 3)
 	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
 	assert.Contains(t, results[0].Message, "machinectl")
+	assert.Equal(t, preflight.SeverityWarning, results[1].Severity)
+	assert.Contains(t, results[1].Message, "systemd-nspawn")
+	assert.Equal(t, preflight.SeverityWarning, results[2].Severity)
+	assert.Contains(t, results[2].Message, "/run/systemd/system")
 }
 
 func TestCheckDockerActive(t *testing.T) {

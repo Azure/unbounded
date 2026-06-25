@@ -6,7 +6,6 @@ package host
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -127,7 +126,8 @@ func checkHostPackages(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 			return preflight.ResultsWarning(
 				checkHostPackagesName,
 				"host packages",
-				"required host packages are missing and may be installed by bootstrap: "+strings.Join(missing, ", "),
+				"required host packages are missing and may be installed by bootstrap: %s",
+				strings.Join(missing, ", "),
 			)
 		}
 
@@ -144,25 +144,33 @@ func CheckHostOSConfiguration(log *slog.Logger) preflight.Checker {
 
 func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkHostOSConfigurationName, check: func(context.Context) []preflight.Result {
+		var results []preflight.Result
+
 		sysctlDir := filepath.Dir(hostSysctlPath)
 		log.Debug("checking host OS configuration path", "path", sysctlDir)
 
 		if err := deps.writeProbe(sysctlDir); err != nil {
-			return preflight.ResultsError(
+			results = append(results, preflight.Error(
 				checkHostOSConfigurationName,
 				"host OS configuration",
-				"host OS configuration path is not writable: "+sysctlDir,
-			)
+				"host OS configuration path is not writable: %s",
+				sysctlDir,
+			))
 		}
 
 		log.Debug("checking systemd unit directory", "path", goalstates.SystemdSystemDir)
 
 		if err := deps.writeProbe(goalstates.SystemdSystemDir); err != nil {
-			return preflight.ResultsError(
+			results = append(results, preflight.Error(
 				checkHostOSConfigurationName,
 				"host OS configuration",
-				"systemd unit directory is not writable: "+goalstates.SystemdSystemDir,
-			)
+				"systemd unit directory is not writable: %s",
+				goalstates.SystemdSystemDir,
+			))
+		}
+
+		if len(results) > 0 {
+			return results
 		}
 
 		return preflight.ResultsOK(
@@ -180,6 +188,8 @@ func CheckNSpawnRuntime(log *slog.Logger) preflight.Checker {
 
 func checkNSpawnRuntime(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkNSpawnRuntimeName, check: func(context.Context) []preflight.Result {
+		var results []preflight.Result
+
 		for _, binary := range []string{"systemctl", "machinectl", "systemd-nspawn"} {
 			log.Debug("checking nspawn runtime tool", "binary", binary)
 
@@ -187,11 +197,12 @@ func checkNSpawnRuntime(log *slog.Logger, deps hostCheckDeps) preflight.Checker 
 				// TODO: when offline mode is configured, missing nspawn runtime
 				// tools should be reported as an error because bootstrap cannot rely
 				// on package installation to remediate them.
-				return preflight.ResultsWarning(
+				results = append(results, preflight.Warning(
 					checkNSpawnRuntimeName,
 					"nspawn runtime",
-					"nspawn runtime tool is missing and may be installed by bootstrap: "+binary,
-				)
+					"nspawn runtime tool is missing and may be installed by bootstrap: %s",
+					binary,
+				))
 			}
 		}
 
@@ -199,11 +210,16 @@ func checkNSpawnRuntime(log *slog.Logger, deps hostCheckDeps) preflight.Checker 
 		log.Debug("checking systemd runtime path", "path", systemdRuntimePath)
 
 		if _, err := deps.stat(systemdRuntimePath); err != nil {
-			return preflight.ResultsWarning(
+			results = append(results, preflight.Warning(
 				checkNSpawnRuntimeName,
 				"nspawn runtime",
-				"systemd runtime path is not currently available: "+systemdRuntimePath,
-			)
+				"systemd runtime path is not currently available: %s",
+				systemdRuntimePath,
+			))
+		}
+
+		if len(results) > 0 {
+			return results
 		}
 
 		return preflight.ResultsOK(checkNSpawnRuntimeName, "nspawn runtime", "nspawn runtime is available")
@@ -279,7 +295,8 @@ func checkDiskSpace(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 			return preflight.ResultsError(
 				checkDiskSpaceName,
 				"host disk",
-				"available disk space could not be determined for "+diskPath,
+				"available disk space could not be determined for %s",
+				diskPath,
 			)
 		}
 
@@ -295,12 +312,10 @@ func checkDiskSpace(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 			return preflight.ResultsError(
 				checkDiskSpaceName,
 				"host disk",
-				fmt.Sprintf(
-					"available disk space is below the minimum for %s: current %.1f GiB, required %.1f GiB",
-					diskPath,
-					gib(free),
-					gib(minFreeDiskBytes),
-				),
+				"available disk space is below the minimum for %s: current %.1f GiB, required %.1f GiB",
+				diskPath,
+				gib(free),
+				gib(minFreeDiskBytes),
 			)
 		}
 
@@ -319,7 +334,7 @@ func checkCgroups(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 		log.Debug("checking cgroup filesystem", "path", cgroupPath)
 
 		if _, err := deps.stat(cgroupPath); err != nil {
-			return preflight.ResultsError(checkCgroupsName, "host cgroups", "cgroup filesystem is required at "+cgroupPath)
+			return preflight.ResultsError(checkCgroupsName, "host cgroups", "cgroup filesystem is required at %s", cgroupPath)
 		}
 
 		return preflight.ResultsOK(checkCgroupsName, "host cgroups", "cgroup filesystem is available")

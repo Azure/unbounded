@@ -50,7 +50,7 @@ func (c clusterCredentialsChecker) Check(context.Context) []preflight.Result {
 	}
 
 	if len(errs) > 0 {
-		return preflight.ResultsError(checkClusterCredentialsName, "cluster credentials", strings.Join(errs, "; "))
+		return preflight.ResultsError(checkClusterCredentialsName, "cluster credentials", "%s", strings.Join(errs, "; "))
 	}
 
 	return preflight.ResultsOK(checkClusterCredentialsName, "cluster credentials", "cluster credentials are valid")
