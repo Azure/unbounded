@@ -27,14 +27,8 @@ pub trait Req {
     }
 
     /// Stable cache namespace selected by the frontend binding. `None` means
-    /// this request has no local cache tier.
+    /// this request has no local cache tier or mesh route.
     fn cache_id(&self) -> Option<&String> {
-        None
-    }
-
-    /// Stable P2P neighborhood selected by the frontend binding. `None` means
-    /// origin routing after a local miss.
-    fn neighborhood_id(&self) -> Option<&String> {
         None
     }
 }

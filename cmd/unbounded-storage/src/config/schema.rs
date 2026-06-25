@@ -32,9 +32,7 @@ impl Config {
     /// explicit zero, is left untouched. Run once after load (or after
     /// decoding a protobuf message) before the config is consumed.
     pub fn apply_defaults(&mut self) {
-        for n in &mut self.neighborhoods {
-            n.fingers_per_node.get_or_insert(100);
-        }
+        self.fingers_per_node.get_or_insert(100);
 
         for backend in &mut self.backends {
             backend.apply_defaults();
@@ -307,10 +305,11 @@ mod tests {
         let mut c: Config = toml::from_str("").unwrap();
         c.apply_defaults();
         assert_eq!(c.version, 0);
-        assert!(c.neighborhoods.is_empty());
+        assert!(c.peers.is_empty());
         assert!(c.caches.is_empty());
         assert!(c.backends.is_empty());
         assert!(c.frontends.is_empty());
+        assert_eq!(c.fingers_per_node, Some(100));
     }
 
     #[test]
@@ -423,21 +422,18 @@ path = "/dev/nvme0n1"
     }
 
     #[test]
-    fn neighborhood_round_trips() {
+    fn mesh_round_trips() {
         let s = r#"
-[[neighborhoods]]
-name = "n"
-source = "b"
 fingers_per_node = 128
 local_node_id = 42
 local_tags = ["us-west", "az1", "row3", "rack7"]
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.neighborhoods[0].fingers_per_node, Some(128));
-        assert_eq!(c.neighborhoods[0].local_node_id, Some(42));
+        assert_eq!(c.fingers_per_node, Some(128));
+        assert_eq!(c.local_node_id, Some(42));
         assert_eq!(
-            c.neighborhoods[0].local_tags,
+            c.local_tags,
             vec![
                 "us-west".to_string(),
                 "az1".to_string(),
@@ -448,56 +444,44 @@ local_tags = ["us-west", "az1", "row3", "rack7"]
     }
 
     #[test]
-    fn neighborhood_routing_plan_round_trips() {
+    fn routing_plan_round_trips() {
         let s = r#"
-[[neighborhoods]]
-name = "n"
-source = "b"
 local_node_id = 1
 
-[neighborhoods.routing_plan]
+[routing_plan]
 fingers = [2, 5, 9, 17]
 successor = 2
 predecessor = 64
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        let plan = c.neighborhoods[0]
-            .routing_plan
-            .as_ref()
-            .expect("routing_plan set");
+        let plan = c.routing_plan.as_ref().expect("routing_plan set");
         assert_eq!(plan.fingers, vec![2, 5, 9, 17]);
         assert_eq!(plan.successor, Some(2));
         assert_eq!(plan.predecessor, Some(64));
     }
 
     #[test]
-    fn neighborhood_routing_plan_absent_by_default() {
-        let mut c: Config =
-            toml::from_str("[[neighborhoods]]\nname = \"n\"\nsource = \"b\"\nlocal_node_id = 1\n")
-                .unwrap();
+    fn routing_plan_absent_by_default() {
+        let mut c: Config = toml::from_str("local_node_id = 1\n").unwrap();
         c.apply_defaults();
-        assert!(c.neighborhoods[0].routing_plan.is_none());
+        assert!(c.routing_plan.is_none());
     }
 
     #[test]
     fn peer_tags_round_trip() {
         let s = r#"
-[[neighborhoods]]
-name = "n"
-source = "b"
-
-[[neighborhoods.peers]]
+[[peers]]
 id = 1
 tags = ["us-west", "az1", "row3", "rack7"]
 
-[neighborhoods.peers.config.tcp]
+[peers.config.tcp]
 addr = "127.0.0.1:9000"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(
-            c.neighborhoods[0].peers[0].tags,
+            c.peers[0].tags,
             vec![
                 "us-west".to_string(),
                 "az1".to_string(),
@@ -555,7 +539,7 @@ max_requests_per_connection = 256
         let s = r#"
 [[caches]]
 name = "cache"
-source = "n"
+source = "backend"
 
 [[frontends]]
 name = "cached-http"

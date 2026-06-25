@@ -700,6 +700,8 @@ def write_config(
         tls_lines += "insecure_skip_verify = true\n"
     path.write_text(
         f"""\
+local_node_id = {local_id}
+
 [[backends]]
 name = "origin"
 
@@ -708,20 +710,15 @@ url = "{origin_addr}"
 stripe_size_bytes = {STRIPE_SIZE}
 {tls_lines}
 
-[[neighborhoods]]
-name = "p2p"
-source = "origin"
-local_node_id = {local_id}
-
-[[neighborhoods.peers]]
+[[peers]]
 id = {peer_id}
 
-[neighborhoods.peers.config.tcp]
+[peers.config.tcp]
 addr = "{peer_addr}"
 
 [[caches]]
 name = "cache"
-source = "p2p"
+source = "origin"
 
 [[disks]]
 page_size_bytes = 4096

@@ -92,6 +92,10 @@ version behind until the daemon restarts.
 ```toml
 # unbounded-storage.toml
 
+local_node_id = 1                # u64; daemon/fabric id for the process.
+local_tags = ["region-a", "rack-1"]
+fingers_per_node = 100           # routing finger-table fanout per node.
+
 [[backends]]
 name = "origin"
 
@@ -99,40 +103,32 @@ name = "origin"
 url = "origin.example.com:80"    # host:port resolved for origin fetches.
 stripe_size_bytes = 4194304      # optional; must be a power of two.
 
-[[neighborhoods]]
-name = "p2p"
-source = "origin"               # backend component name.
-local_node_id = 1                # u64; daemon/fabric id, shared across neighborhoods.
-local_tags = ["region-a", "rack-1"]
-fingers_per_node = 100           # routing finger-table fanout per node.
-
 # Optional. Disjoint discovery: configure this node with ONLY its direct
 # routing neighbors instead of the full cluster. When present, the global
 # finger-table build is bypassed and these ids are used verbatim. Every id
-# must reference a [[neighborhoods.peers]] entry below and must not be
-# local_node_id. The
+# must reference a [[peers]] entry below and must not be local_node_id. The
 # resulting routes are identical to the global build fed the same neighbors,
-# so a controller with global view can plan these per node (see
+# so a controller with global view can plan these per process (see
 # designs/storage-disjoint-routing-parity.md).
-# [neighborhoods.routing_plan]
+# [routing_plan]
 # fingers     = [2, 5, 9, 17]    # ids of this node's finger neighbors.
 # successor   = 2                # id of the nearest forward neighbor on the ring.
 # predecessor = 64               # id of the nearest backward neighbor on the ring.
 
-[[neighborhoods.peers]]          # repeat per remote peer; ids are fabric ids.
+[[peers]]                        # repeat per remote peer; ids are fabric ids.
 id        = 2                    # u64, process-wide peer id and ring position.
 tags      = ["region-a", "rack-2"]
 
-[neighborhoods.peers.config.tcp]
+[peers.config.tcp]
 addr      = "10.0.0.1:9000"      # parsed as SocketAddr.
 
 # Or, for RDMA peers:
-# [neighborhoods.peers.config.rdma]
+# [peers.config.rdma]
 # addr     = "hex:deadbeef"      # provider-native libfabric address bytes.
 
 [[caches]]
 name = "cache"
-source = "p2p"                  # backend or neighborhood component name.
+source = "origin"               # backend used for miss fills.
 
 [[disks]]                        # repeat per local device; paths must be unique.
 queue_depth = 32                 # optional u32; per-disk io_uring depth.
@@ -149,7 +145,7 @@ numa        = 0                  # optional u16; biases the open onto a CPU on t
 
 [[frontends]]
 name = "http"
-source = "cache"                # backend, cache, or neighborhood component name.
+source = "cache"                # backend or cache component name.
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"

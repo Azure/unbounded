@@ -1088,67 +1088,74 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> &str {
 
 fn build_routes(config: &Config) -> RouteTableSnapshot {
     let projection = config::runtime_projection(config).expect("loaded config projects to runtime");
-    let routes = projection
-        .neighborhoods
+    if projection.caches.is_empty() {
+        return RouteTableSnapshot {
+            routes: HashMap::new(),
+        };
+    }
+
+    let mesh = &projection.mesh;
+    let local_id = mesh.local_node_id.unwrap_or(0);
+    let local = PeerEntry {
+        node: NodeId(local_id),
+        ring: node_to_ring(NodeId(local_id)),
+        tags: TopologyTags(mesh.local_tags.clone()),
+    };
+    let node_to_peer: HashMap<NodeId, unbounded_storage::fabric::PeerId> = mesh
+        .peers
         .iter()
-        .map(|(id, neighborhood)| {
-            let local_id = neighborhood.p2p.local_node_id.unwrap_or(0);
-            let local = PeerEntry {
-                node: NodeId(local_id),
-                ring: node_to_ring(NodeId(local_id)),
-                tags: TopologyTags(neighborhood.p2p.local_tags.clone()),
-            };
-            let node_to_peer: HashMap<NodeId, unbounded_storage::fabric::PeerId> = neighborhood
-                .peers
+        .map(|peer| (peer.node_id, peer.fabric_peer_id))
+        .collect();
+    let node_to_peer = Arc::new(node_to_peer);
+    let fingers = if let Some(plan) = &mesh.routing_plan {
+        let tags_of = |node: NodeId| -> TopologyTags {
+            mesh.peers
                 .iter()
-                .map(|peer| (peer.node_id, peer.fabric_peer_id))
-                .collect();
-            let fingers = if let Some(plan) = &neighborhood.p2p.routing_plan {
-                let tags_of = |node: NodeId| -> TopologyTags {
-                    neighborhood
-                        .peers
-                        .iter()
-                        .find(|peer| peer.node_id == node)
-                        .map(|peer| TopologyTags(peer.spec.tags.clone()))
-                        .unwrap_or_default()
-                };
-                let entry_of = |raw: u64| {
-                    let node = NodeId(raw);
-                    PeerEntry {
-                        node,
-                        ring: node_to_ring(node),
-                        tags: tags_of(node),
-                    }
-                };
-                Arc::new(FingerTable::from_explicit(
-                    local,
-                    plan.fingers.iter().map(|id| entry_of(*id)).collect(),
-                    plan.successor.map(entry_of),
-                    plan.predecessor.map(entry_of),
-                ))
-            } else {
-                let peers: Vec<PeerEntry> = neighborhood
-                    .peers
-                    .iter()
-                    .map(|peer| PeerEntry {
-                        node: peer.node_id,
-                        ring: node_to_ring(peer.node_id),
-                        tags: TopologyTags(peer.spec.tags.clone()),
-                    })
-                    .collect();
-                Arc::new(FingerTable::build(
-                    local,
-                    &peers,
-                    FingerTableConfig {
-                        k: neighborhood.p2p.fingers_per_node.max(1),
-                    },
-                ))
-            };
+                .find(|peer| peer.node_id == node)
+                .map(|peer| TopologyTags(peer.spec.tags.clone()))
+                .unwrap_or_default()
+        };
+        let entry_of = |raw: u64| {
+            let node = NodeId(raw);
+            PeerEntry {
+                node,
+                ring: node_to_ring(node),
+                tags: tags_of(node),
+            }
+        };
+        Arc::new(FingerTable::from_explicit(
+            local,
+            plan.fingers.iter().map(|id| entry_of(*id)).collect(),
+            plan.successor.map(entry_of),
+            plan.predecessor.map(entry_of),
+        ))
+    } else {
+        let peers: Vec<PeerEntry> = mesh
+            .peers
+            .iter()
+            .map(|peer| PeerEntry {
+                node: peer.node_id,
+                ring: node_to_ring(peer.node_id),
+                tags: TopologyTags(peer.spec.tags.clone()),
+            })
+            .collect();
+        Arc::new(FingerTable::build(
+            local,
+            &peers,
+            FingerTableConfig {
+                k: mesh.fingers_per_node.max(1),
+            },
+        ))
+    };
+    let routes = projection
+        .caches
+        .keys()
+        .map(|id| {
             (
                 id.clone(),
                 RoutingSnapshot {
-                    fingers,
-                    node_to_peer: Arc::new(node_to_peer),
+                    fingers: fingers.clone(),
+                    node_to_peer: node_to_peer.clone(),
                 },
             )
         })
@@ -1330,7 +1337,6 @@ impl FrontendBuildCtx {
                     Rc::from(spec.name.as_str()),
                     binding.backend_id.clone(),
                     binding.cache_id.clone(),
-                    binding.neighborhood_id.clone(),
                     stripe_size,
                     self.page_size,
                     self.fanout.clone(),
@@ -1351,7 +1357,6 @@ impl FrontendBuildCtx {
                     Rc::from(spec.name.as_str()),
                     binding.backend_id.clone(),
                     binding.cache_id.clone(),
-                    binding.neighborhood_id.clone(),
                     stripe_size,
                     self.page_size,
                     binding.bypass_cache,
@@ -1365,7 +1370,6 @@ impl FrontendBuildCtx {
                     self.pool.clone(),
                     binding.backend_id.clone(),
                     binding.cache_id.clone(),
-                    binding.neighborhood_id.clone(),
                     stripe_size,
                     self.page_size,
                     binding.bypass_cache,
@@ -1549,7 +1553,7 @@ impl Drop for PhaseBGuard {
 /// Parsed command-line options for one run of the daemon.
 ///
 /// The daemon takes all of its configuration - both the dynamically
-/// reloadable cluster state (neighborhoods, caches, backends, frontends)
+/// reloadable cluster state (mesh, caches, backends, frontends)
 /// and the startup-fixed knobs (`[startup]`: memory sizing, fabric
 /// endpoint/thread pools, CPU-topology selection) - from the config
 /// file. The only command-line option is the path to that file, since
@@ -1985,7 +1989,6 @@ mod tests {
             frontend_id: frontend_id.to_string(),
             backend_id: backend_id.to_string(),
             cache_id: None,
-            neighborhood_id: None,
             bypass_cache: true,
         }
     }

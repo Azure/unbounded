@@ -347,29 +347,10 @@ pub fn spawn_shard_layer(
 }
 
 fn local_self_peer(projection: &config::RuntimeGraph) -> Result<PeerId, String> {
-    let mut local_ids: Vec<(&str, u64)> = projection
-        .neighborhoods
-        .values()
-        .filter_map(|n| n.p2p.local_node_id.map(|id| (n.id.as_str(), id)))
-        .collect();
-    local_ids.sort_by_key(|(neighborhood_id, _)| *neighborhood_id);
-
-    if let Some((_, self_peer)) = local_ids.first()
-        && local_ids.iter().any(|(_, node_id)| node_id != self_peer)
-    {
-        let configured = local_ids
-            .iter()
-            .map(|(neighborhood_id, node_id)| format!("{neighborhood_id}:{node_id}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "neighborhoods declare different local_node_id values, but the storage fabric uses one process-wide peer id ({configured})"
-        ));
-    }
-
-    Ok(local_ids
-        .first()
-        .map(|(_, node_id)| PeerId(*node_id))
+    Ok(projection
+        .mesh
+        .local_node_id
+        .map(PeerId)
         .unwrap_or(PeerId(0)))
 }
 
@@ -478,6 +459,8 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             // backend/frontend-only change leaves them untouched.
             if diff.requires_routing_reload() {
                 layer.fabric_group.reload_routes(&routes);
+            }
+            if diff.requires_peer_reconcile() {
                 let runtime_peers = config::runtime_peers(&projection);
                 layer.fabric_group.reconcile_peers(&runtime_peers);
             }
@@ -511,64 +494,32 @@ mod tests {
 
     use super::*;
 
-    fn graph_with_local_ids(ids: &[(&str, Option<u64>)]) -> config::RuntimeGraph {
-        let neighborhoods = ids
-            .iter()
-            .map(|(id, local_node_id)| {
-                (
-                    (*id).to_string(),
-                    config::RuntimeNeighborhood {
-                        id: (*id).to_string(),
-                        backend_id: "backend".to_string(),
-                        p2p: config::RuntimeP2p {
-                            fingers_per_node: 100,
-                            local_node_id: *local_node_id,
-                            local_tags: Vec::new(),
-                            routing_plan: None,
-                        },
-                        peers: Vec::new(),
-                    },
-                )
-            })
-            .collect();
-
+    fn graph_with_local_id(local_node_id: Option<u64>) -> config::RuntimeGraph {
         config::RuntimeGraph {
             disks: Vec::new(),
             caches: HashMap::new(),
-            neighborhoods,
+            mesh: config::RuntimeMesh {
+                fingers_per_node: 100,
+                local_node_id,
+                local_tags: Vec::new(),
+                routing_plan: None,
+                peers: Vec::new(),
+            },
             frontends: HashMap::new(),
         }
     }
 
     #[test]
     fn local_self_peer_is_zero_without_local_node_id() {
-        let graph = graph_with_local_ids(&[("n-a", None), ("n-b", None)]);
+        let graph = graph_with_local_id(None);
 
         assert_eq!(local_self_peer(&graph).unwrap(), PeerId(0));
     }
 
     #[test]
     fn local_self_peer_uses_raw_node_id() {
-        let graph = graph_with_local_ids(&[("n-a", None), ("n-b", Some(7))]);
+        let graph = graph_with_local_id(Some(7));
 
         assert_eq!(local_self_peer(&graph).unwrap(), PeerId(7));
-    }
-
-    #[test]
-    fn local_self_peer_accepts_repeated_local_node_id() {
-        let graph = graph_with_local_ids(&[("n-b", Some(7)), ("n-a", Some(7))]);
-
-        assert_eq!(local_self_peer(&graph).unwrap(), PeerId(7));
-    }
-
-    #[test]
-    fn local_self_peer_rejects_different_local_node_ids() {
-        let graph = graph_with_local_ids(&[("n-b", Some(2)), ("n-a", Some(1))]);
-
-        let err = local_self_peer(&graph).unwrap_err();
-
-        assert!(err.contains("different local_node_id values"), "{err}");
-        assert!(err.contains("n-a:1"), "{err}");
-        assert!(err.contains("n-b:2"), "{err}");
     }
 }

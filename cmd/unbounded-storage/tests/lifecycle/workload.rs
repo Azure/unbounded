@@ -17,9 +17,9 @@ use proptest::prelude::*;
 use unbounded_storage::bufferpool::{Error, StripeKey};
 use unbounded_storage::config::{
     ApplyError, BackendSpec, CacheSpec, Config, ConfigApplyTarget, ConfigController, ConfigDiff,
-    DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig,
-    NeighborhoodSpec, PeerSpec, TcpPeerConfig, backend_spec, disk_spec, frontend_spec, peer_spec,
-    runtime_disks, runtime_projection,
+    DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig, PeerSpec,
+    TcpPeerConfig, backend_spec, disk_spec, frontend_spec, peer_spec, runtime_disks,
+    runtime_projection,
 };
 use unbounded_storage::runtime::ShardLoop;
 use unbounded_storage::storage::blockdev::MockDeviceConfig;
@@ -855,18 +855,11 @@ fn config_for_generation(version: u64, disks: Vec<DiskSpec>) -> Config {
     cfg.apply_defaults();
     cfg.version = version;
     cfg.backends = backend_specs(0, 1);
-    cfg.neighborhoods = vec![NeighborhoodSpec {
-        name: "neighborhood-0".to_string(),
-        source: "backend-0".to_string(),
-        fingers_per_node: Some(100),
-        local_node_id: Some(1),
-        local_tags: Vec::new(),
-        routing_plan: None,
-        peers: Vec::new(),
-    }];
+    cfg.local_node_id = Some(1);
+    cfg.fingers_per_node = Some(100);
     cfg.caches = vec![CacheSpec {
         name: "cache-0".to_string(),
-        source: "neighborhood-0".to_string(),
+        source: "backend-0".to_string(),
     }];
     cfg.disks = disks;
     cfg.frontends = frontend_specs(0, 1);
@@ -877,12 +870,8 @@ fn mutate_config(cfg: &mut Config, apply: &ApplySpec, generation: usize) {
     match apply.kind {
         ApplyKind::Noop => {}
         ApplyKind::Peers { count } => {
-            let neighborhood = cfg
-                .neighborhoods
-                .first_mut()
-                .expect("lifecycle sim has a neighborhood");
-            neighborhood.fingers_per_node = Some(count.max(1) as u32);
-            neighborhood.peers = (0..count.max(1)).map(peer_spec_for).collect();
+            cfg.fingers_per_node = Some(count.max(1) as u32);
+            cfg.peers = (0..count.max(1)).map(peer_spec_for).collect();
         }
         ApplyKind::Backends { count } => {
             cfg.backends = backend_specs(generation, count.max(1));

@@ -10,10 +10,13 @@
 //! [`ConfigApplyTarget`](crate::config::ConfigApplyTarget) can skip
 //! untouched work:
 //!
-//! * **`[[neighborhoods]]`.** Rebuilds the projected routing surface,
-//!   republishes it to every shard, and reconciles fabric connections.
-//! * **`[[caches]]`.** Cache bindings participate in route selection, so cache
-//!   changes reload the projected routing surface and reconcile disks.
+//! * **process mesh (`local_node_id`, `local_tags`, `fingers_per_node`,
+//!   `routing_plan`).** Rebuilds the projected routing surface and republishes
+//!   it to every shard.
+//! * **`[[peers]]`.** Reconciles fabric connections and rebuilds the projected
+//!   routing surface.
+//! * **`[[caches]]`.** Cache names are route ids, so cache changes reload the
+//!   projected routing surface and reconcile disks.
 //! * **`[[disks]]`.** Reconciled in place against the disk registry.
 //! * **`[[backends]]` / `[[frontends]]`.** Broadcast to every shard,
 //!   which reconciles its own origin-backend and frontend registries on
@@ -43,13 +46,15 @@ use crate::config::schema::Config;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ConfigDiff {
     /// `[[caches]]` changed. Reconciled in place against the disk registry;
-    /// may also alter which neighborhood a cache routes through.
+    /// may also alter which cache route ids exist.
     pub caches_changed: bool,
     /// `[[disks]]` changed. Reconciled in place against the disk registry.
     pub disks_changed: bool,
-    /// `[[neighborhoods]]` changed. Reconciles fabric connections and
-    /// rebuilds the routing surface.
-    pub neighborhoods_changed: bool,
+    /// Process-wide routing knobs changed. Rebuilds the routing surface.
+    pub routing_changed: bool,
+    /// `[[peers]]` changed. Reconciles fabric connections and rebuilds the
+    /// routing surface.
+    pub peers_changed: bool,
     /// `[[backends]]` changed. Broadcast to every shard, which rebuilds
     /// its origin-backend registry in place (no shard restart).
     pub backends_changed: bool,
@@ -68,7 +73,11 @@ impl ConfigDiff {
         Self {
             caches_changed: old.caches != new.caches,
             disks_changed: old.disks != new.disks,
-            neighborhoods_changed: old.neighborhoods != new.neighborhoods,
+            routing_changed: old.local_node_id != new.local_node_id
+                || old.local_tags != new.local_tags
+                || old.fingers_per_node != new.fingers_per_node
+                || old.routing_plan != new.routing_plan,
+            peers_changed: old.peers != new.peers,
             backends_changed: old.backends != new.backends,
             frontends_changed: old.frontends != new.frontends,
         }
@@ -79,19 +88,24 @@ impl ConfigDiff {
     pub fn any(&self) -> bool {
         self.caches_changed
             || self.disks_changed
-            || self.neighborhoods_changed
+            || self.routing_changed
+            || self.peers_changed
             || self.backends_changed
             || self.frontends_changed
     }
 
     /// Whether the routing surface must be rebuilt and republished.
-    /// Neighborhood changes alter the projected route table directly.
+    /// Mesh and peer changes alter the projected route table directly.
     /// Cache diffs are intentionally conservative: disk-only changes do not
-    /// affect routes, but cache source changes can move request traffic
-    /// between neighborhoods and peers, so the whole cache section reloads the
-    /// projected routing surface for now.
+    /// affect routes, but cache names are route ids, so the whole cache
+    /// section reloads the projected routing surface for now.
     pub fn requires_routing_reload(&self) -> bool {
-        self.neighborhoods_changed || self.caches_changed
+        self.routing_changed || self.peers_changed || self.caches_changed
+    }
+
+    /// Whether fabric peer connections must be reconciled.
+    pub fn requires_peer_reconcile(&self) -> bool {
+        self.peers_changed
     }
 }
 
@@ -100,7 +114,7 @@ mod tests {
     use super::*;
     use crate::config::schema::{
         BackendSpec, BlockDiskConfig, CacheSpec, DiskSpec, FrontendSpec, HttpBackendConfig,
-        HttpFrontendConfig, NeighborhoodSpec, PeerSpec, TcpPeerConfig, backend_spec, disk_spec,
+        HttpFrontendConfig, PeerSpec, RoutingPlan, TcpPeerConfig, backend_spec, disk_spec,
         frontend_spec, peer_spec,
     };
 
@@ -120,45 +134,36 @@ mod tests {
     }
 
     #[test]
-    fn neighborhood_peer_change_is_routing_reload() {
+    fn peer_change_is_routing_reload_and_peer_reconcile() {
         let a = base();
         let mut b = base();
-        b.neighborhoods.push(NeighborhoodSpec {
-            name: "n".to_string(),
-            source: "b".to_string(),
-            fingers_per_node: Some(100),
-            local_node_id: Some(1),
-            local_tags: vec![],
-            routing_plan: None,
-            peers: vec![PeerSpec {
-                id: 2,
-                tags: vec![],
-                config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
-                    addr: "127.0.0.1:9000".to_string(),
-                })),
-            }],
+        b.peers.push(PeerSpec {
+            id: 2,
+            tags: vec![],
+            config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
+                addr: "127.0.0.1:9000".to_string(),
+            })),
         });
         let d = ConfigDiff::between(&a, &b);
-        assert!(d.neighborhoods_changed);
+        assert!(d.peers_changed);
         assert!(d.requires_routing_reload());
+        assert!(d.requires_peer_reconcile());
     }
 
     #[test]
-    fn neighborhood_only_change_is_routing_reload() {
+    fn routing_only_change_is_routing_reload() {
         let a = base();
         let mut b = base();
-        b.neighborhoods.push(NeighborhoodSpec {
-            name: "n".to_string(),
-            source: "b".to_string(),
-            fingers_per_node: Some(64),
-            local_node_id: None,
-            local_tags: vec![],
-            routing_plan: None,
-            peers: vec![],
+        b.fingers_per_node = Some(64);
+        b.routing_plan = Some(RoutingPlan {
+            fingers: vec![2],
+            successor: Some(2),
+            predecessor: None,
         });
         let d = ConfigDiff::between(&a, &b);
-        assert!(d.neighborhoods_changed);
+        assert!(d.routing_changed);
         assert!(d.requires_routing_reload());
+        assert!(!d.requires_peer_reconcile());
     }
 
     #[test]
@@ -173,6 +178,7 @@ mod tests {
         assert!(d.caches_changed);
         assert!(d.any());
         assert!(d.requires_routing_reload());
+        assert!(!d.requires_peer_reconcile());
     }
 
     #[test]

@@ -78,7 +78,6 @@ impl<P: BufferPool<Req = StripeReq> + 'static> LoadgenDriver<P> {
         pool: Rc<P>,
         backend_id: String,
         cache_id: Option<String>,
-        neighborhood_id: Option<String>,
         stripe_size: u64,
         page_size: usize,
         bypass: bool,
@@ -89,7 +88,6 @@ impl<P: BufferPool<Req = StripeReq> + 'static> LoadgenDriver<P> {
             frontend_id: frontend.id,
             backend_id,
             cache_id,
-            neighborhood_id,
             stripe_size,
             page_size,
             bypass,
@@ -147,7 +145,6 @@ struct LoadgenRun {
     frontend_id: String,
     backend_id: String,
     cache_id: Option<String>,
-    neighborhood_id: Option<String>,
     stripe_size: u64,
     page_size: usize,
     bypass: bool,
@@ -255,9 +252,14 @@ async fn read_body<P: BufferPool<Req = StripeReq>>(
 }
 
 fn request_from_origin(origin_ref: OriginRef, cfg: &LoadgenRun) -> StripeReq {
-    StripeReq::new(origin_ref.stripe_key())
+    let key = cfg
+        .cache_id
+        .as_deref()
+        .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id))
+        .unwrap_or_else(|| origin_ref.stripe_key());
+    StripeReq::new(key)
         .with_origin(origin_ref)
-        .with_chain(cfg.cache_id.clone(), cfg.neighborhood_id.clone())
+        .with_cache_id(cfg.cache_id.clone())
         .with_bypass(cfg.bypass)
 }
 
@@ -294,7 +296,6 @@ mod tests {
             frontend_id: "lg".to_string(),
             backend_id: "fake".to_string(),
             cache_id: Some("cache".to_string()),
-            neighborhood_id: Some("n".to_string()),
             stripe_size: 4096,
             page_size: 4096,
             bypass: false,
@@ -346,12 +347,11 @@ mod tests {
         let mut cfg = run_cfg();
         cfg.bypass = true;
         let origin = OriginRef::new("fake", "obj", 3);
-        let key = origin.stripe_key();
+        let key = origin.stripe_key_for_cache("cache");
         let req = request_from_origin(origin, &cfg);
         assert_eq!(req.key(), key);
         assert_eq!(req.origin().unwrap().backend_id, "fake");
         assert_eq!(req.cache_id(), Some("cache"));
-        assert_eq!(req.neighborhood_id(), Some("n"));
         assert!(crate::bufferpool::Req::bypass(&req));
     }
 

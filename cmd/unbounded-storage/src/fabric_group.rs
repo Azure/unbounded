@@ -83,7 +83,7 @@ pub struct FabricUnitAddress {
 /// `shard_devices` is all-`None` (tcp fallback) or all-`Some` (verbs),
 /// per `assign_shard_devices`:
 /// - tcp: a single `lo` endpoint shared by every serving shard, pinned to
-///   worker 0. Peers reach a node through one static neighborhood peer addr,
+///   worker 0. Peers reach a node through one static process peer addr,
 ///   so a node must expose exactly one inbound
 ///   fabric endpoint on that fixed port; binding one endpoint per shard
 ///   would make every shard past the first collide on the port
@@ -580,7 +580,6 @@ mod tests {
 
     fn runtime_peer(id: u64, addr: &str) -> RuntimePeer {
         RuntimePeer {
-            neighborhood_id: "n".to_string(),
             node_id: NodeId(id),
             fabric_peer_id: PeerId(id),
             spec: PeerSpec {

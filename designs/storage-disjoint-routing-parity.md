@@ -8,7 +8,7 @@ sorted roster of cluster nodes (`FingerTable::build`), which requires
 each node to know every other node.
 
 "Disjoint discovery" lets a node be configured with **only its direct
-routing neighbors** via a `[p2p.routing_plan]` block instead of the full
+routing neighbors** via a top-level `[routing_plan]` block instead of the full
 roster. The node feeds those neighbors straight into
 `FingerTable::from_explicit` and skips the global build entirely.
 
@@ -186,11 +186,11 @@ encountered wins; planners should treat a tie as a misconfiguration.
 
 The planner emits, for node `L`:
 
-- `[p2p.routing_plan].fingers` = the list of arc-winner node ids
+- `[routing_plan].fingers` = the list of arc-winner node ids
   (deduplicated, `L` excluded). Order does not matter.
-- `[p2p.routing_plan].successor` = the successor node id (omit for a
+- `[routing_plan].successor` = the successor node id (omit for a
   single-node cluster).
-- `[p2p.routing_plan].predecessor` = the predecessor node id (omit for a
+- `[routing_plan].predecessor` = the predecessor node id (omit for a
   single-node cluster).
 
 `L`'s `[[peers]]` list must contain exactly one entry per id referenced

@@ -8,6 +8,9 @@ package unbounded.storage.config;
 option go_package = "github.com/Azure/unbounded/api/unbounded-storage;storageconfig";
 
 message Config {
+  reserved 6;
+  reserved "neighborhoods";
+
   // Operator-assigned opaque version tracked so operators can confirm which config has been applied. 0 means unversioned.
   uint64 version = 1;
 
@@ -17,8 +20,69 @@ message Config {
   repeated FrontendSpec frontends = 3;
   repeated BackendSpec backends = 4;
   repeated CacheSpec caches = 5;
-  repeated NeighborhoodSpec neighborhoods = 6;
   repeated DiskSpec disks = 7;
+
+  // Number of deterministic finger-table entries to derive per peer. Defaults to 100 when unset.
+  optional uint32 fingers_per_node = 8;
+
+  // Local node id on the P2P ring and process-wide fabric peer id; required when
+  // peers or a routing plan are configured, and must not match any peer id.
+  optional uint64 local_node_id = 9;
+
+  // Local tags used by placement-aware planning.
+  repeated string local_tags = 10;
+
+  // Precomputed routing table for this process. When set, `peers` can be
+  // sparse, containing only this process's routing neighbors.
+  optional RoutingPlan routing_plan = 11;
+
+  // Process-wide peer definitions for the globally shared transport mesh.
+  repeated PeerSpec peers = 12;
+}
+
+// A precomputed routing table for a single node, produced by a
+// global-view planner. All ids reference `PeerSpec.id` values in the
+// `peers` list (each must be present so a fabric connection exists).
+// Ring positions are derived from ids, and tags do not affect runtime
+// routing, so only ids are carried here.
+message RoutingPlan {
+  // Peer ids selected for this routing plan.
+  repeated uint64 fingers = 1;
+
+  // Peer id of the nearest-forward neighbor on the ring.
+  optional uint64 successor = 2;
+
+  // Peer id of the nearest-backward neighbor on the ring.
+  optional uint64 predecessor = 3;
+}
+
+message PeerSpec {
+  // Process-wide fabric peer id, also used for ring position and route references.
+  uint64 id = 1;
+
+  // Peer tags used by placement-aware planning.
+  repeated string tags = 2;
+
+  oneof config {
+    TcpPeerConfig tcp = 3;
+    RdmaPeerConfig rdma = 4;
+  }
+}
+
+message TcpPeerConfig {
+  // TCP socket address used as this peer's fabric wire address.
+  string addr = 1;
+}
+
+message RdmaPeerConfig {
+  // Provider-native RDMA fabric address encoded as "hex:<fi_getname-bytes>".
+  string addr = 1;
+}
+
+message CacheSpec {
+  string name = 1;
+  // Backend source used for miss fills. Cache name is the only logical keyspace prefix.
+  string source = 2;
 }
 
 message StartupCfg {
@@ -108,76 +172,6 @@ message TopologyCfg {
 
   // NIC-worker CPUs to pin per active HCA. Defaults to 4 when unset.
   optional uint64 nic_workers = 7;
-}
-
-message NeighborhoodSpec {
-  string name = 1;
-  string source = 2;
-
-  // Number of deterministic finger-table entries to derive per node. Defaults to 100 when unset.
-  optional uint32 fingers_per_node = 3;
-
-  // Local node id on the P2P ring and process-wide fabric peer id; required when
-  // peers are configured, shared by every neighborhood when set, and must not
-  // match any peer id.
-  optional uint64 local_node_id = 4;
-
-  // Local tags used by placement-aware planning.
-  repeated string local_tags = 5;
-
-  // Precomputed routing table that replaces automatic finger-table derivation when set.
-  // When set, `peers` can be "sparse"; containing only this process's neighbors.
-  optional RoutingPlan routing_plan = 6;
-
-  // Peer definitions available to this neighborhood. Peer ids are process-wide
-  // fabric peer ids; repeating an id across neighborhoods requires the same
-  // peer data.
-  repeated PeerSpec peers = 7;
-}
-
-// A precomputed routing table for a single node, produced by a
-// global-view planner. All ids reference `PeerSpec.id` values in the
-// `peers` list (each must be present so a fabric connection exists).
-// Ring positions are derived from ids, and tags do not affect runtime
-// routing, so only ids are carried here.
-message RoutingPlan {
-  // Peer ids selected for this routing plan.
-  repeated uint64 fingers = 1;
-
-  // Peer id of the nearest-forward neighbor on the ring.
-  optional uint64 successor = 2;
-
-  // Peer id of the nearest-backward neighbor on the ring.
-  optional uint64 predecessor = 3;
-}
-
-message PeerSpec {
-  // Process-wide fabric peer id, also used for this neighborhood's ring
-  // position and route references.
-  uint64 id = 1;
-
-  // Peer tags used by placement-aware planning.
-  repeated string tags = 2;
-
-  oneof config {
-    TcpPeerConfig tcp = 3;
-    RdmaPeerConfig rdma = 4;
-  }
-}
-
-message TcpPeerConfig {
-  // TCP socket address used as this peer's fabric wire address.
-  string addr = 1;
-}
-
-message RdmaPeerConfig {
-  // Provider-native RDMA fabric address encoded as "hex:<fi_getname-bytes>".
-  string addr = 1;
-}
-
-message CacheSpec {
-  string name = 1;
-  string source = 2;
 }
 
 message DiskSpec {
