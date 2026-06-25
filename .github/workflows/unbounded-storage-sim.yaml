@@ -94,7 +94,7 @@ jobs:
         working-directory: cmd/unbounded-storage
         # Loop `cargo test` against the `dst` integration test until
         # the wall-clock budget expires. Each iteration uses a fresh
-        # PROPTEST_SEED so the soak keeps exploring new (seed, workload)
+        # PROPTEST_RNG_SEED so the soak keeps exploring new (seed, workload)
         # pairs rather than re-running the same cases. `timeout` exits
         # 124 when it kills the loop; treat that as success. Any
         # non-zero exit from cargo test itself fails the job.
@@ -112,9 +112,9 @@ jobs:
               i=$((i + 1))
               # Derive a per-iteration seed from /dev/urandom so each
               # cargo invocation explores fresh proptest inputs.
-              PROPTEST_SEED="$(od -An -N8 -tu8 /dev/urandom | tr -d " ")"
-              export PROPTEST_SEED
-              echo "::group::DST iteration ${i} (seed=${PROPTEST_SEED}, elapsed=$((SECONDS))s)"
+              PROPTEST_RNG_SEED="$(od -An -N8 -tu8 /dev/urandom | tr -d " ")"
+              export PROPTEST_RNG_SEED
+              echo "::group::DST iteration ${i} (seed=${PROPTEST_RNG_SEED}, elapsed=$((SECONDS))s)"
               cargo test --release --locked --test dst -- --nocapture
               echo "::endgroup::"
             done
