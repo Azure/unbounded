@@ -6,7 +6,6 @@ package goalstates
 import (
 	"log/slog"
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -192,7 +191,7 @@ func TestResolveOCIImage_DefaultForHostDistro(t *testing.T) {
 	}
 }
 
-func TestHostDistroFromOSReleaseReader(t *testing.T) {
+func TestHostDistroFromOSReleaseData(t *testing.T) {
 	tests := []struct {
 		name      string
 		osRelease string
@@ -217,6 +216,20 @@ VERSION_ID="3.0"`,
 			want: hostDistroAzureLinux3,
 		},
 		{
+			name: "fedora falls back to azure linux 3",
+			osRelease: `ID=fedora
+VERSION_ID="44"
+ID_LIKE="rhel fedora"`,
+			want: hostDistroAzureLinux3,
+		},
+		{
+			name: "rhel-like falls back to azure linux 3",
+			osRelease: `ID="my-enterprise-linux"
+VERSION_ID="9"
+ID_LIKE="rhel fedora"`,
+			want: hostDistroAzureLinux3,
+		},
+		{
 			name: "unknown distro",
 			osRelease: `ID=debian
 VERSION_ID="13"`,
@@ -233,8 +246,7 @@ VERSION_ID=24.04`,
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := hostDistroFromOSReleaseReader(strings.NewReader(tt.osRelease))
-			require.NoError(t, err)
+			got := hostDistroFromOSReleaseData([]byte(tt.osRelease))
 			assert.Equal(t, tt.want, got)
 		})
 	}

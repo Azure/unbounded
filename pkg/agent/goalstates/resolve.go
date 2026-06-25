@@ -4,11 +4,8 @@
 package goalstates
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/base64"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/netip"
 	"os"
@@ -234,15 +231,14 @@ func hostDistroFromOSRelease(path string) (string, error) {
 		return "", err
 	}
 
-	return hostDistroFromOSReleaseReader(bytes.NewReader(data))
+	return hostDistroFromOSReleaseData(data), nil
 }
 
-func hostDistroFromOSReleaseReader(r io.Reader) (string, error) {
+func hostDistroFromOSReleaseData(data []byte) string {
 	values := make(map[string]string)
 
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for _, rawLine := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(rawLine)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -255,11 +251,7 @@ func hostDistroFromOSReleaseReader(r io.Reader) (string, error) {
 		values[key] = normalizeOSReleaseValue(value)
 	}
 
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-
-	return hostDistroFromOSReleaseValues(values), nil
+	return hostDistroFromOSReleaseValues(values)
 }
 
 func hostDistroFromOSReleaseValues(values map[string]string) string {
@@ -280,7 +272,34 @@ func hostDistroFromOSReleaseValues(values map[string]string) string {
 		}
 	}
 
+	if isRPMBasedOSRelease(id, values["ID_LIKE"]) {
+		return hostDistroAzureLinux3
+	}
+
 	return ""
+}
+
+func isRPMBasedOSRelease(id, idLike string) bool {
+	if isRPMBasedOSReleaseID(id) {
+		return true
+	}
+
+	for _, token := range strings.Fields(idLike) {
+		if isRPMBasedOSReleaseID(normalizeOSReleaseID(token)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isRPMBasedOSReleaseID(id string) bool {
+	switch id {
+	case "almalinux", "amzn", "azurelinux", "centos", "fedora", "ol", "rhel", "rocky", "sles", "suse":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeOSReleaseID(value string) string {
