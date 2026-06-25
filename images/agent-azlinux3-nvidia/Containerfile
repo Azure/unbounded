@@ -30,6 +30,7 @@ RUN tdnf install -y \
 RUN install -d /etc/yum.repos.d \
     && curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
       > /etc/yum.repos.d/nvidia-container-toolkit.repo \
+    && sed -i 's/^repo_gpgcheck=1$/repo_gpgcheck=0/' /etc/yum.repos.d/nvidia-container-toolkit.repo \
     && tdnf install -y nvidia-container-toolkit \
     && tdnf clean all
 
