@@ -23,6 +23,7 @@ include!(concat!(env!("OUT_DIR"), "/unbounded.storage.config.rs"));
 
 const DEFAULT_STRIPE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_HTTP_CONCURRENCY: u32 = 64;
+pub const DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION: u32 = 1024;
 const DEFAULT_FAKE_OBJECT_SIZE_BYTES: u64 = 1024 * 1024;
 
 impl Config {
@@ -37,6 +38,10 @@ impl Config {
 
         for backend in &mut self.backends {
             backend.apply_defaults();
+        }
+
+        for frontend in &mut self.frontends {
+            frontend.apply_defaults();
         }
 
         let startup = self.startup.get_or_insert_with(StartupCfg::default);
@@ -229,6 +234,13 @@ impl DiskSpec {
 }
 
 impl FrontendSpec {
+    fn apply_defaults(&mut self) {
+        if let Some(frontend_spec::Config::Http(cfg)) = self.config.as_mut() {
+            cfg.max_requests_per_connection
+                .get_or_insert(DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION);
+        }
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match self.config {
             Some(frontend_spec::Config::Http(_)) => "http",
@@ -243,6 +255,15 @@ impl FrontendSpec {
             Some(frontend_spec::Config::Http(cfg)) => Some(cfg.addr.as_str()),
             Some(frontend_spec::Config::S3(cfg)) => Some(cfg.addr.as_str()),
             Some(frontend_spec::Config::Loadgen(_)) | None => None,
+        }
+    }
+
+    pub fn max_requests_per_connection(&self) -> Option<u32> {
+        match self.config.as_ref() {
+            Some(frontend_spec::Config::Http(cfg)) => cfg.max_requests_per_connection,
+            Some(frontend_spec::Config::S3(_)) | Some(frontend_spec::Config::Loadgen(_)) | None => {
+                None
+            }
         }
     }
 }
@@ -360,57 +381,45 @@ addr = "192.168.253.1:49151"
     #[test]
     fn block_disk_config_round_trips() {
         let s = r#"
-[[caches]]
-name = "cache"
-source = "n"
-
-[[caches.disks]]
-[caches.disks.config.block]
+[[disks]]
+[disks.config.block]
 path = "/dev/nvme0n1"
 numa = 1
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.caches[0].disks[0].kind_name(), "block");
-        assert_eq!(c.caches[0].disks[0].path(), Some("/dev/nvme0n1"));
-        assert_eq!(c.caches[0].disks[0].numa(), Some(1));
+        assert_eq!(c.disks[0].kind_name(), "block");
+        assert_eq!(c.disks[0].path(), Some("/dev/nvme0n1"));
+        assert_eq!(c.disks[0].numa(), Some(1));
     }
 
     #[test]
     fn disk_engine_fields_default_to_unset_and_off() {
         let s = r#"
-[[caches]]
-name = "cache"
-source = "n"
-
-[[caches.disks]]
-[caches.disks.config.block]
+[[disks]]
+[disks.config.block]
 path = "/dev/nvme0n1"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.caches[0].disks[0].page_size_bytes, None);
-        assert!(!c.caches[0].disks[0].skip_recovery_scan);
+        assert_eq!(c.disks[0].page_size_bytes, None);
+        assert!(!c.disks[0].skip_recovery_scan);
     }
 
     #[test]
     fn disk_engine_fields_round_trip() {
         let s = r#"
-[[caches]]
-name = "cache"
-source = "n"
-
-[[caches.disks]]
+[[disks]]
 page_size_bytes = 4096
 skip_recovery_scan = true
 
-[caches.disks.config.block]
+[disks.config.block]
 path = "/dev/nvme0n1"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.caches[0].disks[0].page_size_bytes, Some(4096));
-        assert!(c.caches[0].disks[0].skip_recovery_scan);
+        assert_eq!(c.disks[0].page_size_bytes, Some(4096));
+        assert!(c.disks[0].skip_recovery_scan);
     }
 
     #[test]
@@ -515,6 +524,7 @@ source = "primary-http"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
+max_requests_per_connection = 256
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
@@ -526,6 +536,8 @@ addr = "0.0.0.0:9000"
                 assert_eq!(cfg.url, "https://origin.example.com");
                 assert_eq!(cfg.stripe_size_bytes, Some(8 * 1024 * 1024));
                 assert_eq!(cfg.http_concurrency, Some(32));
+                assert_eq!(cfg.ca_cert_path, None);
+                assert!(!cfg.insecure_skip_verify);
             }
             other => panic!("expected http backend config, got {other:?}"),
         }
@@ -534,6 +546,7 @@ addr = "0.0.0.0:9000"
         let f = &c.frontends[0];
         assert_eq!(f.name, "workload-http");
         assert_eq!(f.addr(), Some("0.0.0.0:9000"));
+        assert_eq!(f.max_requests_per_connection(), Some(256));
         assert_eq!(f.source, "primary-http");
     }
 
@@ -572,9 +585,29 @@ url = "https://example.com"
             backend_spec::Config::Http(cfg) => {
                 assert_eq!(cfg.stripe_size_bytes, Some(4 * 1024 * 1024));
                 assert_eq!(cfg.http_concurrency, Some(64));
+                assert_eq!(cfg.ca_cert_path, None);
+                assert!(!cfg.insecure_skip_verify);
             }
             other => panic!("expected http backend config, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn http_frontend_optional_fields_default() {
+        let s = r#"
+[[frontends]]
+name = "f"
+source = "b"
+
+[frontends.config.http]
+addr = "0.0.0.0:9000"
+"#;
+        let mut c: Config = toml::from_str(s).unwrap();
+        c.apply_defaults();
+        assert_eq!(
+            c.frontends[0].max_requests_per_connection(),
+            Some(DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION)
+        );
     }
 
     #[test]
@@ -584,12 +617,15 @@ url = "https://example.com"
 name = "primary-s3"
 
 [backends.config.s3]
-url = "s3.us-east-1.amazonaws.com:443"
+url = "https://s3.us-east-1.amazonaws.com:443"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(c.backends[0].kind_name(), "s3");
-        assert_eq!(c.backends[0].url(), Some("s3.us-east-1.amazonaws.com:443"));
+        assert_eq!(
+            c.backends[0].url(),
+            Some("https://s3.us-east-1.amazonaws.com:443")
+        );
     }
 
     #[test]

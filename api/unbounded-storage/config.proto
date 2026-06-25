@@ -18,6 +18,7 @@ message Config {
   repeated BackendSpec backends = 4;
   repeated CacheSpec caches = 5;
   repeated NeighborhoodSpec neighborhoods = 6;
+  repeated DiskSpec disks = 7;
 }
 
 message StartupCfg {
@@ -177,9 +178,6 @@ message RdmaPeerConfig {
 message CacheSpec {
   string name = 1;
   string source = 2;
-
-  // Disk definitions attached to this cache.
-  repeated DiskSpec disks = 3;
 }
 
 message DiskSpec {
@@ -202,7 +200,7 @@ message BlockDiskConfig {
   // Optional NUMA node hint used when placing storage work for this block device.
   optional uint32 numa = 1;
 
-  // Block device path; paths must be unique across all caches.
+  // Block device path; paths must be unique across all disks.
   string path = 2;
 }
 
@@ -210,7 +208,7 @@ message FileDiskConfig {
   // Required file-backed disk capacity in bytes; the file is provisioned to this size before opening.
   optional uint64 size = 1;
 
-  // Backing-file path; paths must be unique across all caches.
+  // Backing-file path; paths must be unique across all disks.
   string path = 2;
 }
 
@@ -226,7 +224,8 @@ message BackendSpec {
 }
 
 message HttpBackendConfig {
-  // Origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+  // Origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses plaintext;
+  // `https://` uses TLS with kTLS receive offload.
   string url = 1;
 
   // Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
@@ -235,10 +234,17 @@ message HttpBackendConfig {
 
   // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
   optional uint32 http_concurrency = 3;
+
+  // Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+  optional string ca_cert_path = 4;
+
+  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+  bool insecure_skip_verify = 5;
 }
 
 message S3BackendConfig {
-  // S3-compatible origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+  // S3-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses
+  // plaintext; `https://` uses TLS with kTLS receive offload.
   string url = 1;
 
   // Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
@@ -247,10 +253,17 @@ message S3BackendConfig {
 
   // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
   optional uint32 http_concurrency = 3;
+
+  // Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+  optional string ca_cert_path = 4;
+
+  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+  bool insecure_skip_verify = 5;
 }
 
 message AzureBackendConfig {
-  // Azure Blob-compatible origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+  // Azure Blob-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://`
+  // uses plaintext; `https://` uses TLS with kTLS receive offload.
   string url = 1;
 
   // Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
@@ -259,6 +272,12 @@ message AzureBackendConfig {
 
   // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
   optional uint32 http_concurrency = 3;
+
+  // Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+  optional string ca_cert_path = 4;
+
+  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+  bool insecure_skip_verify = 5;
 }
 
 message FakeBackendConfig {
@@ -284,6 +303,9 @@ message FrontendSpec {
 message HttpFrontendConfig {
   // Socket address for HTTP listeners; each serving shard binds it with SO_REUSEPORT.
   string addr = 1;
+
+  // Maximum requests served on one client connection. Defaults to 1024 when unset.
+  optional uint32 max_requests_per_connection = 2;
 }
 
 message S3FrontendConfig {

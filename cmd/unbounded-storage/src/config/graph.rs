@@ -29,7 +29,6 @@ pub struct RuntimeP2p {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeCache {
     pub id: String,
-    pub disks: Vec<DiskSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +49,7 @@ pub struct RuntimeNeighborhood {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeGraph {
+    pub disks: Vec<DiskSpec>,
     pub caches: HashMap<String, RuntimeCache>,
     pub neighborhoods: HashMap<String, RuntimeNeighborhood>,
     pub frontends: HashMap<String, ResolvedFrontendBinding>,
@@ -233,7 +233,6 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
                 cache.name.clone(),
                 RuntimeCache {
                     id: cache.name.clone(),
-                    disks: cache.disks.clone(),
                 },
             )
         })
@@ -271,6 +270,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
         .collect();
 
     Ok(RuntimeGraph {
+        disks: config.disks.clone(),
         caches,
         neighborhoods,
         frontends: bindings,
@@ -278,11 +278,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
 }
 
 pub fn runtime_disks(graph: &RuntimeGraph) -> Vec<DiskSpec> {
-    let mut disks = Vec::new();
-    for cache in graph.caches.values() {
-        disks.extend(cache.disks.clone());
-    }
-    disks
+    graph.disks.clone()
 }
 
 pub fn runtime_peers(graph: &RuntimeGraph) -> Vec<RuntimePeer> {
@@ -341,6 +337,8 @@ mod tests {
                 url: "https://example.com".to_string(),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
+                ca_cert_path: None,
+                insecure_skip_verify: false,
             })),
         }
     }
@@ -349,7 +347,6 @@ mod tests {
         CacheSpec {
             name: id.to_string(),
             source: source.to_string(),
-            disks: Vec::new(),
         }
     }
 
@@ -371,6 +368,7 @@ mod tests {
             source: source.to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: format!("127.0.0.1:{}", 9000 + id.len()),
+                max_requests_per_connection: None,
             })),
         }
     }

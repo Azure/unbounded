@@ -36,11 +36,13 @@ use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE};
 use ::http::{Response, StatusCode};
 
-use crate::bufferpool::{BufferPool, ReadStream, StripeKey, StripePlan};
+use crate::bufferpool::{BufferPool, Error as PoolError, ReadStream, StripeKey, StripePlan};
+use crate::config::schema::DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION;
 use crate::config::{FrontendSpec, frontend_spec};
 use crate::fanout::{FanoutTable, FetchChannel, FetchReply, Owner};
 use crate::frontend::FrontendError;
@@ -50,7 +52,8 @@ use crate::frontend::range::{
 use crate::frontend::serve_metrics::{ConnGuard, ReqOutcome};
 use crate::http::{
     FdGuard, HttpRequest, MAX_HEADER_BYTES, Method, ParseError, RECV_CHUNK, bind_listener,
-    send_all, serialize_response_head, split_query,
+    connection_header_value, request_allows_keep_alive, send_all, serialize_response_head,
+    split_query,
 };
 use crate::ring::NetHandle;
 use crate::runtime::noop_waker;
@@ -66,7 +69,11 @@ use crate::storage::{ObjectMetadata, OriginRef, StripeReq};
 pub struct HttpFrontend {
     id: String,
     addr: SocketAddr,
+    max_requests_per_connection: usize,
 }
+
+const MAX_FRONTEND_CONNS: usize = 4096;
+const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl HttpFrontend {
     /// Construct from a [`FrontendSpec`], validating the config type and
@@ -80,9 +87,18 @@ impl HttpFrontend {
             .addr
             .parse::<SocketAddr>()
             .map_err(|_| FrontendError::BadBind(cfg.addr.clone()))?;
+        let max_requests_per_connection = cfg
+            .max_requests_per_connection
+            .unwrap_or(DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION);
+        if max_requests_per_connection == 0 {
+            return Err(FrontendError::BadConfig(
+                "max_requests_per_connection must be greater than zero",
+            ));
+        }
         Ok(Self {
             id: spec.name.clone(),
             addr,
+            max_requests_per_connection: max_requests_per_connection as usize,
         })
     }
 
@@ -94,6 +110,12 @@ impl HttpFrontend {
     /// The configured listen address.
     pub fn bind(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Maximum requests served before the frontend closes a keep-alive
+    /// connection and lets the client reconnect through `SO_REUSEPORT`.
+    pub fn max_requests_per_connection(&self) -> usize {
+        self.max_requests_per_connection
     }
 
     /// Create, bind, and listen the per-shard accept socket with
@@ -130,6 +152,7 @@ pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
     page_size: usize,
     fanout: Rc<FanoutTable>,
     bypass: bool,
+    max_requests_per_connection: usize,
     accept_fut: Pin<Box<dyn Future<Output = std::io::Result<RawFd>>>>,
     conns: Vec<Pin<Box<dyn Future<Output = ()>>>>,
     waker: Waker,
@@ -155,6 +178,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
         page_size: usize,
         fanout: Rc<FanoutTable>,
         bypass: bool,
+        max_requests_per_connection: usize,
     ) -> Self {
         let accept_fut = Box::pin(handle.accept(listen_fd));
         Self {
@@ -169,6 +193,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
             page_size,
             fanout,
             bypass,
+            max_requests_per_connection,
             accept_fut,
             conns: Vec::new(),
             waker: noop_waker(),
@@ -204,6 +229,14 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
                 Poll::Ready(res) => {
                     busy = true;
                     if let Ok(fd) = res {
+                        if self.conns.len() >= MAX_FRONTEND_CONNS {
+                            // SAFETY: this driver owns newly accepted fds.
+                            unsafe {
+                                libc::close(fd);
+                            }
+                            self.accept_fut = Box::pin(self.handle.accept(self.listen_fd));
+                            continue;
+                        }
                         let serve = serve_connection(
                             Rc::clone(&self.pool),
                             self.handle.clone(),
@@ -216,6 +249,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
                             self.page_size,
                             Rc::clone(&self.fanout),
                             self.bypass,
+                            self.max_requests_per_connection,
                         );
                         self.conns.push(Box::pin(serve));
                     }
@@ -275,37 +309,67 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
     page_size: usize,
     fanout: Rc<FanoutTable>,
     bypass: bool,
+    max_requests_per_connection: usize,
 ) {
     let _fd = FdGuard(conn_fd);
     let _conn = ConnGuard::new();
-    let mut log = crate::obs::ReqLog::new("frontend.http");
-    let start = std::time::Instant::now();
-    let mut outcome = ReqOutcome::default();
-    let result = serve_request(
-        &pool,
-        &handle,
-        conn_fd,
-        &backend_id,
-        cache_id.as_deref(),
-        neighborhood_id.as_deref(),
-        stripe_size,
-        page_size,
-        &fanout,
-        bypass,
-        &mut log,
-        &mut outcome,
-    )
-    .await;
-    outcome.record(&frontend_id, start.elapsed().as_secs_f64());
-    match result {
-        Ok(()) => log.finish_ok(),
-        Err(()) => log.finish_err("connection error"),
+    let mut buf: Vec<u8> = Vec::new();
+    let mut deadline = None;
+    let mut requests_served = 0usize;
+    loop {
+        let mut log = crate::obs::ReqLog::new("frontend.http");
+        let start = std::time::Instant::now();
+        let mut outcome = ReqOutcome::default();
+        let result = serve_request(
+            &pool,
+            &handle,
+            conn_fd,
+            &backend_id,
+            cache_id.as_deref(),
+            neighborhood_id.as_deref(),
+            stripe_size,
+            page_size,
+            &fanout,
+            bypass,
+            &mut buf,
+            deadline,
+            requests_served.saturating_add(1) < max_requests_per_connection,
+            &mut log,
+            &mut outcome,
+        )
+        .await;
+        match result {
+            Ok(ServeStep::Closed) => break,
+            Ok(ServeStep::Close) => {
+                outcome.record(&frontend_id, start.elapsed().as_secs_f64());
+                log.finish_ok();
+                break;
+            }
+            Ok(ServeStep::KeepAlive) => {
+                requests_served = requests_served.saturating_add(1);
+                outcome.record(&frontend_id, start.elapsed().as_secs_f64());
+                log.finish_ok();
+                deadline = Some(Instant::now() + KEEP_ALIVE_IDLE_TIMEOUT);
+            }
+            Err(()) => {
+                outcome.record(&frontend_id, start.elapsed().as_secs_f64());
+                log.finish_err("connection error");
+                break;
+            }
+        }
     }
+}
+
+enum ServeStep {
+    KeepAlive,
+    Close,
+    Closed,
 }
 
 /// The fallible serve body. Returns `Err(())` on any I/O, parse, or
 /// pool error; the caller closes the fd regardless. Error responses
-/// (400/405/416) are best-effort sends followed by `Ok(())`.
+/// (400/405/416) are best-effort sends followed by a close/keep-alive
+/// step based on the parsed request.
 async fn serve_request<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     handle: &NetHandle,
@@ -317,33 +381,46 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     page_size: usize,
     fanout: &Rc<FanoutTable>,
     bypass: bool,
+    buf: &mut Vec<u8>,
+    idle_deadline: Option<Instant>,
+    allow_keep_alive_after_response: bool,
     log: &mut crate::obs::ReqLog,
     outcome: &mut ReqOutcome,
-) -> Result<(), ()> {
+) -> Result<ServeStep, ()> {
     // 1. Read until the request head is complete (or the cap is hit).
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
+    let req = loop {
         match HttpRequest::parse(&buf) {
-            Ok(_) => break,
+            Ok(req) => break req,
             Err(ParseError::Incomplete) => {
-                if buf.len() > MAX_HEADER_BYTES {
+                if buf.len() >= MAX_HEADER_BYTES {
                     return Err(());
                 }
-                let chunk = handle.recv(conn_fd, RECV_CHUNK).await.map_err(|_| ())?;
+                let chunk = recv_with_deadline(handle, conn_fd, RECV_CHUNK, idle_deadline)
+                    .await
+                    .map_err(|_| ())?;
                 if chunk.is_empty() {
-                    return Err(());
+                    return if buf.is_empty() {
+                        Ok(ServeStep::Closed)
+                    } else {
+                        Err(())
+                    };
                 }
                 buf.extend_from_slice(&chunk);
             }
             Err(_) => {
-                let _ = send_all(handle, conn_fd, status_line_response(400)).await;
+                send_all(handle, conn_fd, status_line_response(400, false)).await?;
                 log.field("status", 400);
                 outcome.status = 400;
-                return Ok(());
+                buf.clear();
+                return Ok(ServeStep::Close);
             }
         }
+    };
+    if req.header_end > MAX_HEADER_BYTES {
+        return Err(());
     }
-    let req = HttpRequest::parse(&buf).map_err(|_| ())?;
+    let keep_alive = request_allows_keep_alive(&req) && allow_keep_alive_after_response;
+    let header_end = req.header_end;
 
     // 2. Only GET and HEAD are served. HEAD resolves length and builds
     // the same head as GET but never streams a body.
@@ -351,10 +428,11 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         Method::GET => false,
         Method::HEAD => true,
         _ => {
-            let _ = send_all(handle, conn_fd, status_line_response(405)).await;
+            send_all(handle, conn_fd, status_line_response(405, keep_alive)).await?;
             log.field("status", 405);
             outcome.status = 405;
-            return Ok(());
+            finish_request(buf, header_end);
+            return Ok(next_step(keep_alive));
         }
     };
     outcome.method = if is_head { "HEAD" } else { "GET" };
@@ -369,10 +447,11 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         Some(v) => match ByteRange::parse(v) {
             Ok(r) => Some(r),
             Err(_) => {
-                let _ = send_all(handle, conn_fd, status_line_response(400)).await;
+                send_all(handle, conn_fd, status_line_response(400, keep_alive)).await?;
                 log.field("status", 400);
                 outcome.status = 400;
-                return Ok(());
+                finish_request(buf, header_end);
+                return Ok(next_step(keep_alive));
             }
         },
         None => None,
@@ -382,7 +461,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     // metadata entry through the pool. The HTTP backend fills it from
     // an origin HEAD on a miss; local-disk and peer hits skip the
     // origin entirely.
-    let len = read_object_length(
+    let len = match read_object_length(
         pool,
         backend_id,
         cache_id,
@@ -392,7 +471,17 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         bypass,
     )
     .await
-    .map_err(|_| ())?;
+    {
+        LenResult::Len(len) => len,
+        LenResult::NotFound => {
+            let _ = send_all(handle, conn_fd, status_line_response(404, keep_alive)).await;
+            log.field("status", 404);
+            outcome.status = 404;
+            finish_request(buf, header_end);
+            return Ok(next_step(keep_alive));
+        }
+        LenResult::Other => return Err(()),
+    };
 
     // 6. Resolve the requested range against the length.
     let resolved = match range {
@@ -400,25 +489,32 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         Some(br) => match br.resolve(len) {
             Ok(r) => r,
             Err(RangeError::Unsatisfiable { object_len }) => {
-                let _ = send_all(handle, conn_fd, unsatisfiable_response(object_len)).await;
+                send_all(
+                    handle,
+                    conn_fd,
+                    unsatisfiable_response(object_len, keep_alive),
+                )
+                .await?;
                 log.field("status", 416);
                 outcome.status = 416;
-                return Ok(());
+                finish_request(buf, header_end);
+                return Ok(next_step(keep_alive));
             }
             Err(_) => {
-                let _ = send_all(handle, conn_fd, status_line_response(400)).await;
+                send_all(handle, conn_fd, status_line_response(400, keep_alive)).await?;
                 log.field("status", 400);
                 outcome.status = 400;
-                return Ok(());
+                finish_request(buf, header_end);
+                return Ok(next_step(keep_alive));
             }
         },
     };
 
     // 7. Response head: 206 if the client sent a Range, else 200.
     let head = if range.is_some() {
-        partial_head(resolved, len)
+        partial_head(resolved, len, keep_alive)
     } else {
-        full_head(len)
+        full_head(len, keep_alive)
     };
     outcome.status = if range.is_some() { 206 } else { 200 };
     // HEAD carries no body, so no body bytes are streamed to the client;
@@ -431,7 +527,8 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     // 7b. HEAD carries no body: the head (with Content-Length /
     // Content-Range) is the entire response.
     if is_head {
-        return Ok(());
+        finish_request(buf, header_end);
+        return Ok(next_step(keep_alive));
     }
 
     // 8. Stream the body, fanning each stripe out to its content-address
@@ -450,7 +547,9 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         stripe_size,
         bypass,
     )
-    .await
+    .await?;
+    finish_request(buf, header_end);
+    Ok(next_step(keep_alive))
 }
 
 /// Type-erased cross-shard fetch future. Holds the channel round-trip to
@@ -795,7 +894,7 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
     path: &str,
     page_size: usize,
     bypass: bool,
-) -> Result<u64, ()> {
+) -> LenResult {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
     let req = StripeReq::new(origin_ref.stripe_key())
         .with_origin(origin_ref)
@@ -804,19 +903,78 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
             neighborhood_id.map(ToOwned::to_owned),
         )
         .with_bypass(bypass);
-    let mut rs: ReadStream = pool.read(&req, 0, page_size as u64).await.map_err(|_| ())?;
-    let page = rs.next_page().await.ok_or(())?.map_err(|_| ())?;
-    let meta = ObjectMetadata::decode(page.as_slice()).map_err(|_| ())?;
-    Ok(meta.length)
+    let mut rs: ReadStream = match pool.read(&req, 0, page_size as u64).await {
+        Ok(rs) => rs,
+        Err(e) => return classify_len_error(e),
+    };
+    let page = match rs.next_page().await {
+        Some(Ok(page)) => page,
+        Some(Err(e)) => return classify_len_error(e),
+        None => return LenResult::Other,
+    };
+    match ObjectMetadata::decode(page.as_slice()) {
+        Ok(meta) => LenResult::Len(meta.length),
+        Err(e) => classify_len_error(e),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LenResult {
+    Len(u64),
+    NotFound,
+    Other,
+}
+
+fn classify_len_error(err: PoolError) -> LenResult {
+    match err {
+        PoolError::OriginNotFound => LenResult::NotFound,
+        _ => LenResult::Other,
+    }
+}
+
+async fn recv_with_deadline(
+    handle: &NetHandle,
+    conn_fd: RawFd,
+    max_len: usize,
+    deadline: Option<Instant>,
+) -> Result<Vec<u8>, ()> {
+    let mut fut = Box::pin(handle.recv(conn_fd, max_len));
+    poll_fn(|cx| {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Poll::Ready(Err(()));
+        }
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(res) => Poll::Ready(res.map_err(|_| ())),
+            Poll::Pending => {
+                if deadline.is_some() {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
+fn finish_request(buf: &mut Vec<u8>, header_end: usize) {
+    buf.drain(..header_end);
+}
+
+fn next_step(keep_alive: bool) -> ServeStep {
+    if keep_alive {
+        ServeStep::KeepAlive
+    } else {
+        ServeStep::Close
+    }
 }
 
 /// Format the `200 OK` head for serving a whole object.
-fn full_head(len: u64) -> Vec<u8> {
+fn full_head(len: u64, keep_alive: bool) -> Vec<u8> {
     let resp = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_LENGTH, len.to_string())
         .header(ACCEPT_RANGES, "bytes")
-        .header(CONNECTION, "close")
+        .header(CONNECTION, connection_header_value(keep_alive))
         .body(())
         .expect("valid full-object response head");
     serialize_response_head(&resp)
@@ -824,7 +982,7 @@ fn full_head(len: u64) -> Vec<u8> {
 
 /// Format the `206 Partial Content` head for a resolved byte range.
 /// `END` in `Content-Range` is inclusive (`resolved.end - 1`).
-fn partial_head(resolved: ResolvedRange, total: u64) -> Vec<u8> {
+fn partial_head(resolved: ResolvedRange, total: u64, keep_alive: bool) -> Vec<u8> {
     let start = resolved.start;
     let end_incl = resolved.end - 1;
     let clen = resolved.len();
@@ -833,7 +991,7 @@ fn partial_head(resolved: ResolvedRange, total: u64) -> Vec<u8> {
         .header(CONTENT_RANGE, format!("bytes {start}-{end_incl}/{total}"))
         .header(CONTENT_LENGTH, clen.to_string())
         .header(ACCEPT_RANGES, "bytes")
-        .header(CONNECTION, "close")
+        .header(CONNECTION, connection_header_value(keep_alive))
         .body(())
         .expect("valid partial-content response head");
     serialize_response_head(&resp)
@@ -841,12 +999,12 @@ fn partial_head(resolved: ResolvedRange, total: u64) -> Vec<u8> {
 
 /// Format a `416 Range Not Satisfiable` head with `Content-Range: bytes
 /// */LEN`.
-fn unsatisfiable_response(total: u64) -> Vec<u8> {
+fn unsatisfiable_response(total: u64, keep_alive: bool) -> Vec<u8> {
     let resp = Response::builder()
         .status(StatusCode::RANGE_NOT_SATISFIABLE)
         .header(CONTENT_RANGE, format!("bytes */{total}"))
         .header(CONTENT_LENGTH, "0")
-        .header(CONNECTION, "close")
+        .header(CONNECTION, connection_header_value(keep_alive))
         .body(())
         .expect("valid unsatisfiable-range response head");
     serialize_response_head(&resp)
@@ -854,12 +1012,12 @@ fn unsatisfiable_response(total: u64) -> Vec<u8> {
 
 /// Format a bodyless status-line response (`Content-Length: 0`) for the
 /// simple error statuses this frontend emits.
-fn status_line_response(status: u16) -> Vec<u8> {
+fn status_line_response(status: u16, keep_alive: bool) -> Vec<u8> {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let resp = Response::builder()
         .status(status)
         .header(CONTENT_LENGTH, "0")
-        .header(CONNECTION, "close")
+        .header(CONNECTION, connection_header_value(keep_alive))
         .body(())
         .expect("valid status-line response head");
     serialize_response_head(&resp)
@@ -872,6 +1030,7 @@ mod tests {
     use crate::config::HttpFrontendConfig;
     use crate::fanout::NumaShardTable;
     use crate::frontend::range::StripeSlice;
+    use crate::http::{request_is_bodyless, request_wants_keep_alive};
     use crate::storage::disks::CacheDirectorySet;
     use std::cell::RefCell;
 
@@ -881,6 +1040,7 @@ mod tests {
             source: "primary".to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: addr.to_string(),
+                max_requests_per_connection: None,
             })),
         }
     }
@@ -896,20 +1056,46 @@ mod tests {
     }
 
     #[test]
+    fn from_spec_defaults_and_validates_request_cap() {
+        let f = HttpFrontend::from_spec(&spec("workload", "0.0.0.0:9000")).unwrap();
+        assert_eq!(
+            f.max_requests_per_connection(),
+            DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION as usize
+        );
+
+        let mut capped = spec("workload", "0.0.0.0:9000");
+        let Some(frontend_spec::Config::Http(cfg)) = capped.config.as_mut() else {
+            panic!("expected http config");
+        };
+        cfg.max_requests_per_connection = Some(7);
+        let f = HttpFrontend::from_spec(&capped).unwrap();
+        assert_eq!(f.max_requests_per_connection(), 7);
+
+        let Some(frontend_spec::Config::Http(cfg)) = capped.config.as_mut() else {
+            panic!("expected http config");
+        };
+        cfg.max_requests_per_connection = Some(0);
+        assert!(matches!(
+            HttpFrontend::from_spec(&capped),
+            Err(FrontendError::BadConfig(_))
+        ));
+    }
+
+    #[test]
     fn full_head_exact_bytes() {
-        let head = full_head(4096);
+        let head = full_head(4096, true);
         let s = std::str::from_utf8(&head).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "got: {s}");
         assert!(s.contains("content-length: 4096\r\n"), "got: {s}");
         assert!(s.contains("accept-ranges: bytes\r\n"), "got: {s}");
-        assert!(s.contains("connection: close\r\n"), "got: {s}");
+        assert!(s.contains("connection: keep-alive\r\n"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
     }
 
     #[test]
     fn partial_head_exact_bytes_inclusive_end() {
         // Resolved [0, 100) of a 1000-byte object -> bytes 0-99/1000.
-        let head = partial_head(ResolvedRange { start: 0, end: 100 }, 1000);
+        let head = partial_head(ResolvedRange { start: 0, end: 100 }, 1000, true);
         let s = std::str::from_utf8(&head).unwrap();
         assert!(
             s.starts_with("HTTP/1.1 206 Partial Content\r\n"),
@@ -918,7 +1104,7 @@ mod tests {
         assert!(s.contains("content-range: bytes 0-99/1000\r\n"), "got: {s}");
         assert!(s.contains("content-length: 100\r\n"), "got: {s}");
         assert!(s.contains("accept-ranges: bytes\r\n"), "got: {s}");
-        assert!(s.contains("connection: close\r\n"), "got: {s}");
+        assert!(s.contains("connection: keep-alive\r\n"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
     }
 
@@ -931,15 +1117,17 @@ mod tests {
                 end: 100,
             },
             100,
+            false,
         );
         let s = std::str::from_utf8(&head).unwrap();
         assert!(s.contains("content-range: bytes 70-99/100\r\n"), "got: {s}");
         assert!(s.contains("content-length: 30\r\n"), "got: {s}");
+        assert!(s.contains("connection: close\r\n"), "got: {s}");
     }
 
     #[test]
     fn unsatisfiable_response_exact_bytes() {
-        let head = unsatisfiable_response(100);
+        let head = unsatisfiable_response(100, false);
         let s = std::str::from_utf8(&head).unwrap();
         assert!(
             s.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
@@ -953,7 +1141,7 @@ mod tests {
 
     #[test]
     fn status_405_and_400_exact_bytes() {
-        let r405 = status_line_response(405);
+        let r405 = status_line_response(405, false);
         let s405 = std::str::from_utf8(&r405).unwrap();
         assert!(
             s405.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
@@ -963,7 +1151,7 @@ mod tests {
         assert!(s405.contains("connection: close\r\n"), "got: {s405}");
         assert!(s405.ends_with("\r\n\r\n"), "got: {s405}");
 
-        let r400 = status_line_response(400);
+        let r400 = status_line_response(400, false);
         let s400 = std::str::from_utf8(&r400).unwrap();
         assert!(
             s400.starts_with("HTTP/1.1 400 Bad Request\r\n"),
@@ -972,6 +1160,65 @@ mod tests {
         assert!(s400.contains("content-length: 0\r\n"), "got: {s400}");
         assert!(s400.contains("connection: close\r\n"), "got: {s400}");
         assert!(s400.ends_with("\r\n\r\n"), "got: {s400}");
+    }
+
+    #[test]
+    fn status_404_exact_bytes() {
+        let r404 = status_line_response(404, false);
+        let s404 = std::str::from_utf8(&r404).unwrap();
+        assert!(
+            s404.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "got: {s404}"
+        );
+        assert!(s404.contains("content-length: 0\r\n"), "got: {s404}");
+        assert!(s404.contains("connection: close\r\n"), "got: {s404}");
+        assert!(s404.ends_with("\r\n\r\n"), "got: {s404}");
+    }
+
+    #[test]
+    fn request_keep_alive_follows_http_connection_rules() {
+        let req = HttpRequest::parse(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        assert!(request_wants_keep_alive(&req));
+
+        let req = HttpRequest::parse(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
+        assert!(!request_wants_keep_alive(&req));
+
+        let req = HttpRequest::parse(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+        assert!(!request_wants_keep_alive(&req));
+
+        let req = HttpRequest::parse(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n").unwrap();
+        assert!(request_wants_keep_alive(&req));
+    }
+
+    #[test]
+    fn request_has_body_detects_unsupported_body_headers() {
+        let req = HttpRequest::parse(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        assert!(request_is_bodyless(&req));
+
+        let req = HttpRequest::parse(b"GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n").unwrap();
+        assert!(request_is_bodyless(&req));
+
+        let req = HttpRequest::parse(b"GET / HTTP/1.1\r\nContent-Length: 1\r\n\r\n").unwrap();
+        assert!(!request_is_bodyless(&req));
+
+        let req =
+            HttpRequest::parse(b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+        assert!(!request_is_bodyless(&req));
+    }
+
+    #[test]
+    fn duplicate_body_headers_disable_keep_alive() {
+        let req = HttpRequest::parse(
+            b"GET / HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 10\r\n\r\n",
+        )
+        .unwrap();
+        assert!(!request_is_bodyless(&req));
+
+        let req = HttpRequest::parse(
+            b"GET / HTTP/1.1\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(!request_wants_keep_alive(&req));
     }
 
     #[test]
@@ -1077,7 +1324,9 @@ mod tests {
     /// constructor is crate-internal to bufferpool): it always errors.
     /// Sufficient to wire an [`HttpDriver`] for accept-loop tests, where
     /// the serve path is not exercised against a real pool.
-    struct MockPool;
+    struct MockPool {
+        err: Error,
+    }
 
     impl BufferPool for MockPool {
         type Req = StripeReq;
@@ -1088,7 +1337,7 @@ mod tests {
             _offset: u64,
             _len: u64,
         ) -> Result<ReadStream<'p>, Error> {
-            Err(Error::from("mock pool has no data"))
+            Err(self.err.clone())
         }
 
         fn read_windowed<'p>(
@@ -1098,7 +1347,7 @@ mod tests {
             _len: u64,
             _window: usize,
         ) -> Result<WindowedRead<'p>, Error> {
-            Err(Error::from("mock pool has no data"))
+            Err(self.err.clone())
         }
 
         fn read_pipelined<'p>(
@@ -1106,8 +1355,47 @@ mod tests {
             _stripes: Vec<StripePlan<StripeReq>>,
             _window: usize,
         ) -> Result<PipelinedRead<'p>, Error> {
-            Err(Error::from("mock pool has no data"))
+            Err(self.err.clone())
         }
+    }
+
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(fut);
+        for _ in 0..1_000_000 {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+        panic!("future did not complete");
+    }
+
+    #[test]
+    fn read_object_length_maps_origin_not_found_to_len_result() {
+        let pool = Rc::new(MockPool {
+            err: Error::OriginNotFound,
+        });
+
+        let result = block_on(read_object_length(
+            &pool, "primary", None, None, "/missing", 4096, false,
+        ));
+
+        assert_eq!(result, LenResult::NotFound);
+    }
+
+    #[test]
+    fn read_object_length_maps_other_errors_to_other() {
+        let pool = Rc::new(MockPool {
+            err: Error::from("mock pool has no data"),
+        });
+
+        let result = block_on(read_object_length(
+            &pool, "primary", None, None, "/broken", 4096, false,
+        ));
+
+        assert_eq!(result, LenResult::Other);
     }
 
     #[test]
@@ -1129,7 +1417,9 @@ mod tests {
             }
         };
         let mut driver = HttpDriver::new(
-            Rc::new(MockPool),
+            Rc::new(MockPool {
+                err: Error::from("mock pool has no data"),
+            }),
             handle,
             listen_fd,
             Rc::from("primary"),
@@ -1145,6 +1435,7 @@ mod tests {
                 CacheDirectorySet::new(),
             )),
             false,
+            DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION as usize,
         );
         // No client has connected: accept is pending, no conns, so the
         // engine reports no work and stays idle.

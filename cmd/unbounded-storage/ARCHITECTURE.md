@@ -216,7 +216,7 @@ scratch MR, and tears libfabric down).
 
 All subsystems are `pub mod`: `backend`, `bufferpool`, `config`, `fabric`,
 `fanout`, `frontend`, `http`, `io`, `memory`, `metrics`, `obs`, `p2p`,
-`ring`, `runtime`, `storage`, and `topology`. The `profiling` module is
+`ring`, `runtime`, `storage`, `tls`, and `topology`. The `profiling` module is
 exported when the `profiling` feature is enabled.
 
 Each subsystem follows the same layout convention: `src/<area>/mod.rs` declares
@@ -599,12 +599,12 @@ Sections (all optional, each falling back to defaults):
   or `rdma` with a provider-native address encoded as
   `hex:<fi_getname-bytes>`). The same peer id may appear in multiple
   neighborhoods only with identical peer data.
-- `[[caches]]` - `name`, `source` (a backend or neighborhood component name),
-  and `[[caches.disks]]`. Each disk has one `config` table (`block` with
-  `path` and optional `numa`, or `file` with `path` and required `size`),
-  `queue_depth` (optional), `page_size_bytes`, and `skip_recovery_scan` (fields
-  that disk reconcile treats as drift, see 7.10). Disk paths must be unique
-  across all caches.
+- `[[caches]]` - `name` and `source` (a backend or neighborhood component name).
+- `[[disks]]` - the shared local disk set available to every cache. Each disk has one
+  `config` table (`block` with `path` and optional `numa`, or `file` with
+  `path` and required `size`), `queue_depth` (optional), `page_size_bytes`, and
+  `skip_recovery_scan` (fields that disk reconcile treats as drift, see 7.10).
+  Disk paths must be unique across the shared set.
 - `[[frontends]]` - `name`, `source` (a backend, cache, or neighborhood
   component name), and one `config` table (`http`, `s3`, or `loadgen`).
 
@@ -614,6 +614,23 @@ drift, via a `last_applied` cache), disks, and - by broadcasting the applied
 config to every shard - each shard's backend and frontend registries plus the
 routing snapshot. It republishes the channel snapshot each update, logs
 `config gen=N ...`, and sets `SHUTDOWN` if the watcher disconnects.
+
+### 7.12 `tls/` - the shared TLS transport
+
+A transport-level TLS utility shared by the origin backends, sibling in spirit
+to `http/` (the wire codec): it owns how the daemon speaks TLS, but no storage
+policy. It drives OpenSSL with kernel TLS (kTLS) so a negotiated `https://`
+body lands decrypted directly in the registered backing (zero copy). The module
+is Linux/OpenSSL specific. Files: `context.rs` (`TlsConfig`, `TlsContext`, the
+`SSL_CTX` lifecycle and the async non-blocking `handshake`), `ffi.rs` (the
+hand-written OpenSSL bindings), `recv.rs` (the record-aware receive helpers,
+`recv_chunk`/`recv_fixed`, that classify kTLS control records off the
+`ring`-level `TLS_RECORD_TYPE_*` ops), and `shim.c` (the only C the module
+ships, exposing OpenSSL macro-only entry points as linkable functions, compiled
+by `build.rs`). Public surface: `TlsConfig`/`TlsContext`, with
+`recv_chunk`/`recv_fixed` re-exported `pub(crate)` for the backends. See the
+OpenSSL dependency note in `AGENTS.md` for why a pinned OpenSSL >= 3.5 is
+required (kTLS receive on TLS 1.3).
 
 ## 8. Concurrency Model Summary
 

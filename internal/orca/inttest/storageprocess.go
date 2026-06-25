@@ -120,7 +120,8 @@ func freeLoopbackPort(t *testing.T) int {
 }
 
 // writeStorageConfig writes a single unbounded-storage node TOML whose
-// S3 backend points at orcaEdge ("host:port"). The shape mirrors the
+// S3 backend points at orcaEdge ("host:port"), rendered as a plaintext
+// "http://host:port" endpoint URL (orca's edge S3 surface). The shape mirrors the
 // config produced by hack/smoke-storage.py write_config: the schema is
 // proto3-native, so byte sizes are plain integer byte counts and
 // backend/frontend/peer/disk implementations are selected by oneof
@@ -133,7 +134,7 @@ func writeStorageConfig(t *testing.T, path, fabricAddr string, localID, peerID i
 name = "origin"
 
 [backends.config.s3]
-url = "%s"
+url = "http://%s"
 stripe_size_bytes = %d
 
 [[neighborhoods]]
@@ -151,11 +152,11 @@ addr = "%s"
 name = "cache"
 source = "p2p"
 
-[[caches.disks]]
+[[disks]]
 page_size_bytes = %d
 skip_recovery_scan = true
 
-[caches.disks.config.file]
+[disks.config.file]
 path = "%s"
 size = %d
 

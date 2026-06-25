@@ -12,9 +12,9 @@
 //!
 //! * **`[[neighborhoods]]`.** Rebuilds the projected routing surface,
 //!   republishes it to every shard, and reconciles fabric connections.
-//! * **`[[caches]]`.** Reconciled in place against the disk registry;
-//!   cache bindings also participate in route selection, so cache
-//!   changes reload the projected routing surface.
+//! * **`[[caches]]`.** Cache bindings participate in route selection, so cache
+//!   changes reload the projected routing surface and reconcile disks.
+//! * **`[[disks]]`.** Reconciled in place against the disk registry.
 //! * **`[[backends]]` / `[[frontends]]`.** Broadcast to every shard,
 //!   which reconciles its own origin-backend and frontend registries on
 //!   its own thread (binding/closing listeners and rebuilding backends
@@ -45,6 +45,8 @@ pub struct ConfigDiff {
     /// `[[caches]]` changed. Reconciled in place against the disk registry;
     /// may also alter which neighborhood a cache routes through.
     pub caches_changed: bool,
+    /// `[[disks]]` changed. Reconciled in place against the disk registry.
+    pub disks_changed: bool,
     /// `[[neighborhoods]]` changed. Reconciles fabric connections and
     /// rebuilds the routing surface.
     pub neighborhoods_changed: bool,
@@ -65,6 +67,7 @@ impl ConfigDiff {
     pub fn between(old: &Config, new: &Config) -> Self {
         Self {
             caches_changed: old.caches != new.caches,
+            disks_changed: old.disks != new.disks,
             neighborhoods_changed: old.neighborhoods != new.neighborhoods,
             backends_changed: old.backends != new.backends,
             frontends_changed: old.frontends != new.frontends,
@@ -75,6 +78,7 @@ impl ConfigDiff {
     /// acknowledged immediately without touching the shards.
     pub fn any(&self) -> bool {
         self.caches_changed
+            || self.disks_changed
             || self.neighborhoods_changed
             || self.backends_changed
             || self.frontends_changed
@@ -164,20 +168,30 @@ mod tests {
         b.caches.push(CacheSpec {
             name: "c".to_string(),
             source: "n".to_string(),
-            disks: vec![DiskSpec {
-                queue_depth: None,
-                page_size_bytes: None,
-                skip_recovery_scan: false,
-                config: Some(disk_spec::Config::Block(BlockDiskConfig {
-                    numa: None,
-                    path: "/dev/nvme0n1".to_string(),
-                })),
-            }],
         });
         let d = ConfigDiff::between(&a, &b);
         assert!(d.caches_changed);
         assert!(d.any());
         assert!(d.requires_routing_reload());
+    }
+
+    #[test]
+    fn disk_change_is_detected_without_routing_reload() {
+        let a = base();
+        let mut b = base();
+        b.disks.push(DiskSpec {
+            queue_depth: None,
+            page_size_bytes: None,
+            skip_recovery_scan: false,
+            config: Some(disk_spec::Config::Block(BlockDiskConfig {
+                numa: None,
+                path: "/dev/nvme0n1".to_string(),
+            })),
+        });
+        let d = ConfigDiff::between(&a, &b);
+        assert!(d.disks_changed);
+        assert!(d.any());
+        assert!(!d.requires_routing_reload());
     }
 
     #[test]
@@ -190,6 +204,8 @@ mod tests {
                 url: "https://example.com".to_string(),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
+                ca_cert_path: None,
+                insecure_skip_verify: false,
             })),
         });
         let d = ConfigDiff::between(&a, &b);
@@ -207,6 +223,7 @@ mod tests {
             source: "b".to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: "0.0.0.0:9000".to_string(),
+                max_requests_per_connection: None,
             })),
         });
         let d = ConfigDiff::between(&a, &b);

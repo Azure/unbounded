@@ -251,11 +251,7 @@ struct SimApplyTarget {
 }
 
 impl ConfigApplyTarget for SimApplyTarget {
-    fn apply_in_place(
-        &mut self,
-        new: &Arc<Config>,
-        diff: &ConfigDiff,
-    ) -> Result<(), ApplyError> {
+    fn apply_in_place(&mut self, new: &Arc<Config>, diff: &ConfigDiff) -> Result<(), ApplyError> {
         let projection = runtime_projection(new)
             .map_err(|e| ApplyError::Target(format!("config projection failed: {e}")))?;
 
@@ -871,8 +867,8 @@ fn config_for_generation(version: u64, disks: Vec<DiskSpec>) -> Config {
     cfg.caches = vec![CacheSpec {
         name: "cache-0".to_string(),
         source: "neighborhood-0".to_string(),
-        disks,
     }];
+    cfg.disks = disks;
     cfg.frontends = frontend_specs(0, 1);
     cfg
 }
@@ -895,10 +891,7 @@ fn mutate_config(cfg: &mut Config, apply: &ApplySpec, generation: usize) {
             cfg.frontends = frontend_specs(generation, count.max(1));
         }
         ApplyKind::DiskSwap { count } => {
-            cfg.caches
-                .first_mut()
-                .expect("lifecycle sim has a cache")
-                .disks = generation_disk_specs(generation, count.max(1) as usize);
+            cfg.disks = generation_disk_specs(generation, count.max(1) as usize);
         }
     }
 }
@@ -915,6 +908,8 @@ fn backend_specs(generation: usize, count: u8) -> Vec<BackendSpec> {
                 url: format!("https://origin-{generation}-{i}.example.com"),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
+                ca_cert_path: None,
+                insecure_skip_verify: false,
             })),
         })
         .collect()
@@ -927,6 +922,7 @@ fn frontend_specs(generation: usize, count: u8) -> Vec<FrontendSpec> {
             source: "cache-0".to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: format!("127.0.0.1:{}", 10_000 + generation as u16 * 16 + i as u16),
+                max_requests_per_connection: None,
             })),
         })
         .collect()

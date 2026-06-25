@@ -39,6 +39,11 @@ jobs:
       # runtime library path stay in sync; the value is passed to make so
       # the two never diverge.
       LIBFABRIC_VERSION: "2.5.1"
+      # Likewise for OpenSSL (OPENSSL_VERSION in the Makefile). The backend's
+      # kTLS receive path needs >= 3.5, which the runner's distro OpenSSL
+      # (3.0.x) does not provide, so a pinned build is installed under
+      # tmp/openssl and put ahead of the system libs at runtime.
+      OPENSSL_VERSION: "3.5.1"
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -64,6 +69,20 @@ jobs:
       - name: Build libfabric
         run: make libfabric LIBFABRIC_VERSION="$LIBFABRIC_VERSION"
 
+      # The distro OpenSSL (3.0.x) only wires up kTLS for the send direction
+      # on TLS 1.3; the backend's receive offload assertion needs >= 3.5.
+      # `make openssl` builds a pinned release from source and installs it
+      # under tmp/openssl (cached below to skip the rebuild).
+      - name: Cache openssl
+        id: cache-openssl
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: tmp/openssl
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}
+
+      - name: Build openssl
+        run: make openssl OPENSSL_VERSION="$OPENSSL_VERSION"
+
       - name: Set up Rust toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install stable --profile minimal
@@ -78,19 +97,19 @@ jobs:
             cmd/unbounded-storage/target
           # Key on lockfile + manifest plus the native build inputs, since
           # changes to either invalidate compiled artifacts under target/.
-          key: cargo-unbounded-storage-${{ runner.os }}-fabric-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c') }}
+          key: cargo-unbounded-storage-${{ runner.os }}-fabric-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c', 'cmd/unbounded-storage/src/tls/shim.c') }}
           restore-keys: |
             cargo-unbounded-storage-${{ runner.os }}-fabric-
             cargo-unbounded-storage-${{ runner.os }}-
 
       - name: Build release binary
-        run: make unbounded-storage-build LIBFABRIC_VERSION="$LIBFABRIC_VERSION"
+        run: make unbounded-storage-build LIBFABRIC_VERSION="$LIBFABRIC_VERSION" OPENSSL_VERSION="$OPENSSL_VERSION"
 
       - name: Assemble release tarball
         run: |
           set -euo pipefail
           arch="$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')"
-          make unbounded-storage-tarball LIBFABRIC_VERSION="$LIBFABRIC_VERSION" STORAGE_DIST_DIR=dist
+          make unbounded-storage-tarball LIBFABRIC_VERSION="$LIBFABRIC_VERSION" OPENSSL_VERSION="$OPENSSL_VERSION" STORAGE_DIST_DIR=dist
           echo "SMOKE_STORAGE_TARBALL=$PWD/dist/unbounded-storage-linux-$arch.tar.gz" >> "$GITHUB_ENV"
 
       - name: Run smoke test
