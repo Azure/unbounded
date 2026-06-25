@@ -1459,15 +1459,20 @@ func (*BackendSpec_Fake) isBackendSpec_Config() {}
 
 type HttpBackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+	// Origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses plaintext;
+	// `https://` uses TLS with kTLS receive offload.
 	Url string `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
 	// Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
 	// Must be a power of two.
 	StripeSizeBytes *uint64 `protobuf:"varint,2,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
 	// Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
 	HttpConcurrency *uint32 `protobuf:"varint,3,opt,name=http_concurrency,json=httpConcurrency,proto3,oneof" json:"http_concurrency,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+	CaCertPath *string `protobuf:"bytes,4,opt,name=ca_cert_path,json=caCertPath,proto3,oneof" json:"ca_cert_path,omitempty"`
+	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+	InsecureSkipVerify bool `protobuf:"varint,5,opt,name=insecure_skip_verify,json=insecureSkipVerify,proto3" json:"insecure_skip_verify,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *HttpBackendConfig) Reset() {
@@ -1521,17 +1526,36 @@ func (x *HttpBackendConfig) GetHttpConcurrency() uint32 {
 	return 0
 }
 
+func (x *HttpBackendConfig) GetCaCertPath() string {
+	if x != nil && x.CaCertPath != nil {
+		return *x.CaCertPath
+	}
+	return ""
+}
+
+func (x *HttpBackendConfig) GetInsecureSkipVerify() bool {
+	if x != nil {
+		return x.InsecureSkipVerify
+	}
+	return false
+}
+
 type S3BackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// S3-compatible origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+	// S3-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses
+	// plaintext; `https://` uses TLS with kTLS receive offload.
 	Url string `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
 	// Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
 	// Must be a power of two.
 	StripeSizeBytes *uint64 `protobuf:"varint,2,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
 	// Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
 	HttpConcurrency *uint32 `protobuf:"varint,3,opt,name=http_concurrency,json=httpConcurrency,proto3,oneof" json:"http_concurrency,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+	CaCertPath *string `protobuf:"bytes,4,opt,name=ca_cert_path,json=caCertPath,proto3,oneof" json:"ca_cert_path,omitempty"`
+	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+	InsecureSkipVerify bool `protobuf:"varint,5,opt,name=insecure_skip_verify,json=insecureSkipVerify,proto3" json:"insecure_skip_verify,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *S3BackendConfig) Reset() {
@@ -1585,17 +1609,36 @@ func (x *S3BackendConfig) GetHttpConcurrency() uint32 {
 	return 0
 }
 
+func (x *S3BackendConfig) GetCaCertPath() string {
+	if x != nil && x.CaCertPath != nil {
+		return *x.CaCertPath
+	}
+	return ""
+}
+
+func (x *S3BackendConfig) GetInsecureSkipVerify() bool {
+	if x != nil {
+		return x.InsecureSkipVerify
+	}
+	return false
+}
+
 type AzureBackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Azure Blob-compatible origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+	// Azure Blob-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://`
+	// uses plaintext; `https://` uses TLS with kTLS receive offload.
 	Url string `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
 	// Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
 	// Must be a power of two.
 	StripeSizeBytes *uint64 `protobuf:"varint,2,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
 	// Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
 	HttpConcurrency *uint32 `protobuf:"varint,3,opt,name=http_concurrency,json=httpConcurrency,proto3,oneof" json:"http_concurrency,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+	CaCertPath *string `protobuf:"bytes,4,opt,name=ca_cert_path,json=caCertPath,proto3,oneof" json:"ca_cert_path,omitempty"`
+	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+	InsecureSkipVerify bool `protobuf:"varint,5,opt,name=insecure_skip_verify,json=insecureSkipVerify,proto3" json:"insecure_skip_verify,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *AzureBackendConfig) Reset() {
@@ -1647,6 +1690,20 @@ func (x *AzureBackendConfig) GetHttpConcurrency() uint32 {
 		return *x.HttpConcurrency
 	}
 	return 0
+}
+
+func (x *AzureBackendConfig) GetCaCertPath() string {
+	if x != nil && x.CaCertPath != nil {
+		return *x.CaCertPath
+	}
+	return ""
+}
+
+func (x *AzureBackendConfig) GetInsecureSkipVerify() bool {
+	if x != nil {
+		return x.InsecureSkipVerify
+	}
+	return false
 }
 
 type FakeBackendConfig struct {
@@ -1821,9 +1878,11 @@ func (*FrontendSpec_Loadgen) isFrontendSpec_Config() {}
 type HttpFrontendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Socket address for HTTP listeners; each serving shard binds it with SO_REUSEPORT.
-	Addr          string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Addr string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	// Maximum requests served on one client connection. Defaults to 1024 when unset.
+	MaxRequestsPerConnection *uint32 `protobuf:"varint,2,opt,name=max_requests_per_connection,json=maxRequestsPerConnection,proto3,oneof" json:"max_requests_per_connection,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *HttpFrontendConfig) Reset() {
@@ -1861,6 +1920,13 @@ func (x *HttpFrontendConfig) GetAddr() string {
 		return x.Addr
 	}
 	return ""
+}
+
+func (x *HttpFrontendConfig) GetMaxRequestsPerConnection() uint32 {
+	if x != nil && x.MaxRequestsPerConnection != nil {
+		return *x.MaxRequestsPerConnection
+	}
+	return 0
 }
 
 type S3FrontendConfig struct {
@@ -2104,25 +2170,37 @@ const file_config_proto_rawDesc = "" +
 	"\x02s3\x18\x03 \x01(\v2).unbounded.storage.config.S3BackendConfigH\x00R\x02s3\x12D\n" +
 	"\x05azure\x18\x04 \x01(\v2,.unbounded.storage.config.AzureBackendConfigH\x00R\x05azure\x12A\n" +
 	"\x04fake\x18\x05 \x01(\v2+.unbounded.storage.config.FakeBackendConfigH\x00R\x04fakeB\b\n" +
-	"\x06config\"\xb1\x01\n" +
+	"\x06config\"\x9b\x02\n" +
 	"\x11HttpBackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
-	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01B\x14\n" +
+	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12%\n" +
+	"\fca_cert_path\x18\x04 \x01(\tH\x02R\n" +
+	"caCertPath\x88\x01\x01\x120\n" +
+	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerifyB\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
-	"\x11_http_concurrency\"\xaf\x01\n" +
+	"\x11_http_concurrencyB\x0f\n" +
+	"\r_ca_cert_path\"\x99\x02\n" +
 	"\x0fS3BackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
-	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01B\x14\n" +
+	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12%\n" +
+	"\fca_cert_path\x18\x04 \x01(\tH\x02R\n" +
+	"caCertPath\x88\x01\x01\x120\n" +
+	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerifyB\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
-	"\x11_http_concurrency\"\xb2\x01\n" +
+	"\x11_http_concurrencyB\x0f\n" +
+	"\r_ca_cert_path\"\x9c\x02\n" +
 	"\x12AzureBackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
-	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01B\x14\n" +
+	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12%\n" +
+	"\fca_cert_path\x18\x04 \x01(\tH\x02R\n" +
+	"caCertPath\x88\x01\x01\x120\n" +
+	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerifyB\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
-	"\x11_http_concurrency\"\xa1\x01\n" +
+	"\x11_http_concurrencyB\x0f\n" +
+	"\r_ca_cert_path\"\xa1\x01\n" +
 	"\x11FakeBackendConfig\x12/\n" +
 	"\x11stripe_size_bytes\x18\x01 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12/\n" +
 	"\x11object_size_bytes\x18\x02 \x01(\x04H\x01R\x0fobjectSizeBytes\x88\x01\x01B\x14\n" +
@@ -2134,9 +2212,11 @@ const file_config_proto_rawDesc = "" +
 	"\x04http\x18\x03 \x01(\v2,.unbounded.storage.config.HttpFrontendConfigH\x00R\x04http\x12<\n" +
 	"\x02s3\x18\x04 \x01(\v2*.unbounded.storage.config.S3FrontendConfigH\x00R\x02s3\x12K\n" +
 	"\aloadgen\x18\x05 \x01(\v2/.unbounded.storage.config.LoadgenFrontendConfigH\x00R\aloadgenB\b\n" +
-	"\x06config\"(\n" +
+	"\x06config\"\x8c\x01\n" +
 	"\x12HttpFrontendConfig\x12\x12\n" +
-	"\x04addr\x18\x01 \x01(\tR\x04addr\"&\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\x12B\n" +
+	"\x1bmax_requests_per_connection\x18\x02 \x01(\rH\x00R\x18maxRequestsPerConnection\x88\x01\x01B\x1e\n" +
+	"\x1c_max_requests_per_connection\"&\n" +
 	"\x10S3FrontendConfig\x12\x12\n" +
 	"\x04addr\x18\x01 \x01(\tR\x04addr\"\xe8\x01\n" +
 	"\x15LoadgenFrontendConfig\x12\x1d\n" +
@@ -2270,6 +2350,7 @@ func file_config_proto_init() {
 		(*FrontendSpec_S3)(nil),
 		(*FrontendSpec_Loadgen)(nil),
 	}
+	file_config_proto_msgTypes[25].OneofWrappers = []any{}
 	file_config_proto_msgTypes[27].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

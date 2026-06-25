@@ -5,6 +5,11 @@
 
 mod null;
 
+pub mod url;
+
+#[cfg(target_os = "linux")]
+mod conn;
+
 #[cfg(target_os = "linux")]
 mod http;
 

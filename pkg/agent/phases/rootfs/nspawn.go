@@ -85,17 +85,21 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	// "/var/lib/machines/kube1"); nspawn always names the machine after that
 	// directory.
 	machineName := filepath.Base(e.goalState.MachineDir)
+	hostDevicePaths := e.goalState.HostDevices.Paths()
 	templateData := nspawnTemplateData{
 		MachineName:          machineName,
 		BPFFSMountPath:       goalstates.BPFFSMountPath(machineName),
-		HostDevicePaths:      e.goalState.HostDevicePaths,
+		HostDevicePaths:      hostDevicePaths,
 		NvidiaGPUDevicePaths: e.goalState.Nvidia.GPUDevicePaths,
 		NvidiaLibDirMounts:   e.goalState.Nvidia.LibDirMounts,
 	}
 
-	if len(e.goalState.HostDevicePaths) > 0 {
+	if len(hostDevicePaths) > 0 {
 		e.log.Info("host devices detected, configuring nspawn bind-mounts",
-			"count", len(e.goalState.HostDevicePaths))
+			"total", len(hostDevicePaths),
+			"kvm", len(e.goalState.HostDevices.KVM),
+			"block", len(e.goalState.HostDevices.Block),
+			"infiniband", len(e.goalState.HostDevices.Infiniband))
 	}
 
 	if len(e.goalState.Nvidia.GPUDevicePaths) > 0 {

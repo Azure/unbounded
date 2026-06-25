@@ -738,6 +738,7 @@ mod tests {
         let mut s = spec("f", "127.0.0.1:9000");
         s.config = Some(frontend_spec::Config::Http(HttpFrontendConfig {
             addr: "127.0.0.1:9000".to_string(),
+            max_requests_per_connection: None,
         }));
         assert!(matches!(
             S3Frontend::from_spec(&s),
