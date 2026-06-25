@@ -103,6 +103,77 @@ func TestCRIConfig_JSONRoundTrip(t *testing.T) {
 	assert.Equal(t, "1.6.0", decoded.CNI.PluginVersion)
 }
 
+func TestAgentConfig_Validate(t *testing.T) {
+	t.Parallel()
+
+	valid := func() *AgentConfig {
+		return &AgentConfig{
+			MachineName: "machine-1",
+			NodeName:    "node-1",
+			Cluster: AgentClusterConfig{
+				CaCertBase64: "Y2E=",
+				ClusterDNS:   "10.0.0.10",
+				Version:      "1.34.0",
+			},
+			Kubelet: AgentKubeletConfig{
+				ApiServer: "https://api.example.com:443",
+				Auth: KubeletAuthInfo{
+					BootstrapToken: "abc123.secret456",
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*AgentConfig)
+		wantErr string
+	}{
+		{
+			name: "valid",
+		},
+		{
+			name: "missing machine name",
+			mutate: func(cfg *AgentConfig) {
+				cfg.MachineName = ""
+			},
+			wantErr: "MachineName",
+		},
+		{
+			name: "invalid node name",
+			mutate: func(cfg *AgentConfig) {
+				cfg.NodeName = "Invalid_Node"
+			},
+			wantErr: "NodeName",
+		},
+		{
+			name: "missing auth allowed",
+			mutate: func(cfg *AgentConfig) {
+				cfg.Kubelet.Auth = KubeletAuthInfo{}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := valid()
+			if tt.mutate != nil {
+				tt.mutate(cfg)
+			}
+
+			err := cfg.Validate()
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+		})
+	}
+}
+
 func TestCRIConfig_OmittedWhenEmpty(t *testing.T) {
 	t.Parallel()
 
