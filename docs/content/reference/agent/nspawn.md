@@ -96,11 +96,16 @@ the template runs with `--settings=override`. As a result, the generated
 network namespace. Host interfaces, host firewall and routing rules, and
 loopback listeners are therefore visible from inside the nspawn machine.
 
-When NVIDIA GPUs are detected on the host, the agent automatically bind-mounts
-the GPU device nodes (e.g. `/dev/nvidia0`, `/dev/nvidiactl`) and the host's
-driver libraries into the container, and grants the necessary cgroup device
-permissions. See [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}) for
-the full GPU pipeline.
+When GPUs are detected on the host, the agent automatically exposes the host
+paths needed by the corresponding Kubernetes device plugin:
+
+- **NVIDIA GPUs.** Bind-mounts GPU device nodes and host driver libraries,
+  grants cgroup device permissions, generates a CDI spec, and configures the
+  NVIDIA container runtime. See [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}).
+- **AMD GPUs.** Bind-mounts `/dev/kfd` and DRM device nodes, grants cgroup
+  device permissions, and exposes AMD sysfs paths read-only so the AMD
+  Kubernetes device plugin can discover GPUs inside nspawn. See
+  [AMD GPU Support]({{< relref "reference/gpu/amd" >}}).
 
 When the KVM character device (`/dev/kvm`) is present on the host, the agent
 automatically bind-mounts it into the container so that workloads inside the

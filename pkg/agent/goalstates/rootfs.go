@@ -34,6 +34,9 @@ type RootFS struct {
 	// container. Empty on non-GPU hosts.
 	Nvidia NvidiaHost
 
+	// AMD holds AMD GPU state discovered on the host. Empty on non-AMD GPU hosts.
+	AMD AMDHost
+
 	// HostDevices holds host device nodes to be bind-mounted into the
 	// nspawn container, grouped by category (KVM, block storage, InfiniBand
 	// HCA). Device nodes are discovered at agent startup. Empty on hosts
