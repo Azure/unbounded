@@ -26,16 +26,15 @@ metadata:
 # supervisor will not invent one because each neighborhood needs an explicit
 # source backend.
 #
-# Disks are declared in disk_pools[].disks, and caches reference a pool with
-# caches[].disk_pool. The supervisor manages the pool named "default": explicit
-# disks in that pool are preserved, while an absent or empty default pool is
-# filled from this node's annotations. unbounded-cloud.io/storage-disks is a
+# Disks are declared in disks[]. Explicit disks are preserved, while an absent
+# or empty disks list is filled from this node's annotations.
+# unbounded-cloud.io/storage-disks is a
 # comma-separated list of block disks such as
 # /dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0. When that annotation
 # is absent or has no valid disks, the supervisor uses one file-backed disk at
 # /var/lib/unbounded-storage/cache.disk sized by
-# unbounded-cloud.io/storage-file-size-bytes, defaulting to 2 GiB. Declare a
-# cache with disk_pool: default to use the managed pool; the supervisor does not
+# unbounded-cloud.io/storage-file-size-bytes, defaulting to 2 GiB. The shared
+# disk set is available to every cache; the supervisor does not
 # invent caches, backends, frontends, or neighborhoods.
 data:
   config.yaml: |

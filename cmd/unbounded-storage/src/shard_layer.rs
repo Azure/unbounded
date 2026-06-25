@@ -451,7 +451,7 @@ impl ConfigApplyTarget for ProcessApplyTarget {
         // graph projection, or per-shard backend/frontend registries need
         // to change. Pure projected-disk changes are absorbed by
         // `reconcile_disks` below. Cache graph changes can also alter frontend
-        // backend/bypass resolution, so they are broadcast; disk-pool-only
+        // backend/bypass resolution, so they are broadcast; disk-only
         // changes are not.
         let needs_broadcast = diff.requires_routing_reload()
             || diff.caches_changed
@@ -491,7 +491,7 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             layer.control.broadcast_apply(new.clone(), routes)?;
         }
 
-        if diff.caches_changed || diff.disk_pools_changed {
+        if diff.caches_changed || diff.disks_changed {
             self.reconcile_disks(&projection);
         }
 
@@ -527,6 +527,7 @@ mod tests {
             .collect();
 
         config::RuntimeGraph {
+            disks: Vec::new(),
             caches: HashMap::new(),
             neighborhoods,
             frontends: HashMap::new(),

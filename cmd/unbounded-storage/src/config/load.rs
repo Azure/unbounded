@@ -64,18 +64,11 @@ pub enum ConfigError {
     DuplicateBackendName(String),
     DuplicateFrontendName(String),
     DuplicateCacheName(String),
-    DuplicateDiskPoolName(String),
     DuplicateNeighborhoodName(String),
     EmptyBackendName,
     EmptyFrontendName,
     EmptyCacheName,
-    EmptyDiskPoolName,
     EmptyNeighborhoodName,
-    MissingCacheDiskPool(String),
-    UnknownCacheDiskPool {
-        cache_name: String,
-        disk_pool: String,
-    },
     MissingBackendConfig(String),
     MissingFrontendConfig(String),
     EmptyBackendUrl(String),
@@ -171,27 +164,13 @@ impl fmt::Display for ConfigError {
                 write!(f, "duplicate frontend name: {name:?}")
             }
             ConfigError::DuplicateCacheName(name) => write!(f, "duplicate cache name: {name:?}"),
-            ConfigError::DuplicateDiskPoolName(name) => {
-                write!(f, "duplicate disk pool name: {name:?}")
-            }
             ConfigError::DuplicateNeighborhoodName(name) => {
                 write!(f, "duplicate neighborhood name: {name:?}")
             }
             ConfigError::EmptyBackendName => write!(f, "backend name must not be empty"),
             ConfigError::EmptyFrontendName => write!(f, "frontend name must not be empty"),
             ConfigError::EmptyCacheName => write!(f, "cache name must not be empty"),
-            ConfigError::EmptyDiskPoolName => write!(f, "disk pool name must not be empty"),
             ConfigError::EmptyNeighborhoodName => write!(f, "neighborhood name must not be empty"),
-            ConfigError::MissingCacheDiskPool(id) => {
-                write!(f, "cache {id:?}: disk_pool must not be empty")
-            }
-            ConfigError::UnknownCacheDiskPool {
-                cache_name,
-                disk_pool,
-            } => write!(
-                f,
-                "cache {cache_name:?}: disk_pool {disk_pool:?} does not reference a declared disk pool"
-            ),
             ConfigError::MissingBackendConfig(id) => {
                 write!(f, "backend {id:?}: config must set one backend type")
             }
@@ -368,35 +347,14 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         if !seen_caches.insert(cache.name.as_str()) {
             return Err(ConfigError::DuplicateCacheName(cache.name.clone()));
         }
-        if cache.disk_pool.is_empty() {
-            return Err(ConfigError::MissingCacheDiskPool(cache.name.clone()));
-        }
     }
 
-    let mut seen_disk_pools: HashSet<&str> = HashSet::new();
     let mut seen_disk_paths: HashSet<&str> = HashSet::new();
-    for pool in &cfg.disk_pools {
-        if pool.name.is_empty() {
-            return Err(ConfigError::EmptyDiskPoolName);
-        }
-        if !seen_disk_pools.insert(pool.name.as_str()) {
-            return Err(ConfigError::DuplicateDiskPoolName(pool.name.clone()));
-        }
-        validate_disks(&pool.disks)?;
-        for disk in &pool.disks {
-            let path = validated_disk_path(disk)?;
-            if !seen_disk_paths.insert(path) {
-                return Err(ConfigError::DuplicateDiskPath(path.to_string()));
-            }
-        }
-    }
-
-    for cache in &cfg.caches {
-        if !seen_disk_pools.contains(cache.disk_pool.as_str()) {
-            return Err(ConfigError::UnknownCacheDiskPool {
-                cache_name: cache.name.clone(),
-                disk_pool: cache.disk_pool.clone(),
-            });
+    validate_disks(&cfg.disks)?;
+    for disk in &cfg.disks {
+        let path = validated_disk_path(disk)?;
+        if !seen_disk_paths.insert(path) {
+            return Err(ConfigError::DuplicateDiskPath(path.to_string()));
         }
     }
 
@@ -681,10 +639,6 @@ name = "b"
 [[caches]]
 name = "c"
 source = "b"
-disk_pool = "pool"
-
-[[disk_pools]]
-name = "pool"
 "#
     }
 
@@ -724,18 +678,14 @@ addr = "hex:deadbeef"
 [[caches]]
 name = "c"
 source = "n"
-disk_pool = "pool"
 
-[[disk_pools]]
-name = "pool"
-
-[[disk_pools.disks]]
-[disk_pools.disks.config.block]
+[[disks]]
+[disks.config.block]
 numa = 0
 path = "/dev/nvme0n1"
 
-[[disk_pools.disks]]
-[disk_pools.disks.config.block]
+[[disks]]
+[disks.config.block]
 path = "/dev/nvme1n1"
 
 [[frontends]]
@@ -748,7 +698,7 @@ addr = "0.0.0.0:9000"
         let f = write_cfg(s);
         let cfg = load(f.path()).unwrap();
         assert_eq!(cfg.neighborhoods[0].peers.len(), 2);
-        assert_eq!(cfg.disk_pools[0].disks.len(), 2);
+        assert_eq!(cfg.disks.len(), 2);
         assert_eq!(cfg.neighborhoods[0].local_node_id, Some(99));
         let projection = runtime_projection(&cfg).unwrap();
         assert!(!projection.frontends["f"].bypass_cache);
@@ -793,12 +743,12 @@ addr = "10.0.0.2:9000"
     fn rejects_duplicate_disk_paths() {
         let s = format!(
             r#"{}
-[[disk_pools.disks]]
-[disk_pools.disks.config.block]
+[[disks]]
+[disks.config.block]
 path = "/dev/nvme0n1"
 
-[[disk_pools.disks]]
-[disk_pools.disks.config.block]
+[[disks]]
+[disks.config.block]
 path = "/dev/nvme0n1"
 "#,
             cache_toml()
@@ -807,112 +757,6 @@ path = "/dev/nvme0n1"
         match load(f.path()) {
             Err(ConfigError::DuplicateDiskPath(_)) => {}
             other => panic!("expected DuplicateDiskPath, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_duplicate_disk_paths_across_disk_pools() {
-        let s = r#"
-[[backends]]
-name = "b"
-
-[backends.config.fake]
-
-[[disk_pools]]
-name = "p1"
-
-[[disk_pools.disks]]
-[disk_pools.disks.config.block]
-path = "/dev/nvme0n1"
-
-[[disk_pools]]
-name = "p2"
-
-[[disk_pools.disks]]
-[disk_pools.disks.config.block]
-path = "/dev/nvme0n1"
-"#;
-        let f = write_cfg(s);
-        match load(f.path()) {
-            Err(ConfigError::DuplicateDiskPath(_)) => {}
-            other => panic!("expected DuplicateDiskPath, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_empty_disk_pool_name() {
-        let s = r#"
-[[disk_pools]]
-name = ""
-"#;
-        let f = write_cfg(s);
-        assert!(matches!(
-            load(f.path()),
-            Err(ConfigError::EmptyDiskPoolName)
-        ));
-    }
-
-    #[test]
-    fn rejects_duplicate_disk_pool_names() {
-        let s = r#"
-[[disk_pools]]
-name = "pool"
-
-[[disk_pools]]
-name = "pool"
-"#;
-        let f = write_cfg(s);
-        match load(f.path()) {
-            Err(ConfigError::DuplicateDiskPoolName(name)) => assert_eq!(name, "pool"),
-            other => panic!("expected DuplicateDiskPoolName, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_cache_without_disk_pool() {
-        let s = r#"
-[[backends]]
-name = "b"
-
-[backends.config.fake]
-
-[[caches]]
-name = "c"
-source = "b"
-"#;
-        let f = write_cfg(s);
-        match load(f.path()) {
-            Err(ConfigError::MissingCacheDiskPool(name)) => assert_eq!(name, "c"),
-            other => panic!("expected MissingCacheDiskPool, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_cache_with_unknown_disk_pool() {
-        let s = r#"
-[[backends]]
-name = "b"
-
-[backends.config.fake]
-
-[[caches]]
-name = "c"
-source = "b"
-disk_pool = "missing"
-
-[[disk_pools]]
-name = "pool"
-"#;
-        let f = write_cfg(s);
-        match load(f.path()) {
-            Err(ConfigError::UnknownCacheDiskPool {
-                cache_name,
-                disk_pool,
-            }) => {
-                assert_eq!(cache_name, "c");
-                assert_eq!(disk_pool, "missing");
-            }
-            other => panic!("expected UnknownCacheDiskPool, got {other:?}"),
         }
     }
 
@@ -1002,8 +846,8 @@ addr = "{bad}"
     fn rejects_empty_disk_path() {
         let s = format!(
             r#"{}
-[[disk_pools.disks]]
-[disk_pools.disks.config.block]
+[[disks]]
+[disks.config.block]
 path = ""
 "#,
             cache_toml()
@@ -1016,8 +860,8 @@ path = ""
     fn loads_file_disk_with_size() {
         let s = format!(
             r#"{}
-[[disk_pools.disks]]
-[disk_pools.disks.config.file]
+[[disks]]
+[disks.config.file]
 path = "/tmp/unbounded-file-disk"
 size = 16777216
 "#,
@@ -1025,19 +869,16 @@ size = 16777216
         );
         let f = write_cfg(&s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.disk_pools[0].disks[0].kind_name(), "file");
-        assert_eq!(
-            cfg.disk_pools[0].disks[0].file_size(),
-            Some(16 * 1024 * 1024)
-        );
+        assert_eq!(cfg.disks[0].kind_name(), "file");
+        assert_eq!(cfg.disks[0].file_size(), Some(16 * 1024 * 1024));
     }
 
     #[test]
     fn rejects_file_disk_without_size() {
         let s = format!(
             r#"{}
-[[disk_pools.disks]]
-[disk_pools.disks.config.file]
+[[disks]]
+[disks.config.file]
 path = "/tmp/unbounded-file-disk"
 "#,
             cache_toml()
@@ -1053,8 +894,8 @@ path = "/tmp/unbounded-file-disk"
     fn rejects_file_disk_with_zero_size() {
         let s = format!(
             r#"{}
-[[disk_pools.disks]]
-[disk_pools.disks.config.file]
+[[disks]]
+[disks.config.file]
 path = "/tmp/unbounded-file-disk"
 size = 0
 "#,
@@ -1071,8 +912,8 @@ size = 0
     fn rejects_file_disk_size_not_page_multiple() {
         let s = format!(
             r#"{}
-[[disk_pools.disks]]
-[disk_pools.disks.config.file]
+[[disks]]
+[disks.config.file]
 path = "/tmp/unbounded-file-disk"
 size = 5000
 "#,
@@ -1089,10 +930,10 @@ size = 5000
     fn rejects_size_key_on_non_file_disk() {
         let s = format!(
             r#"{}
-[[disk_pools.disks]]
+[[disks]]
 size = 16777216
 
-[disk_pools.disks.config.block]
+[disks.config.block]
 path = "/dev/nvme0n1"
 "#,
             cache_toml()
@@ -1661,7 +1502,7 @@ id = 1
     fn rejects_missing_disk_config() {
         let s = format!(
             r#"{}
-[[disk_pools.disks]]
+[[disks]]
 "#,
             cache_toml()
         );
@@ -1696,13 +1537,9 @@ addr = "10.0.0.1:9000"
 [[caches]]
 name = "c"
 source = "n"
-disk_pool = "pool"
 
-[[disk_pools]]
-name = "pool"
-
-[[disk_pools.disks]]
-[disk_pools.disks.config.block]
+[[disks]]
+[disks.config.block]
 path = "/dev/nvme0n1"
 
 [[frontends]]
@@ -1717,7 +1554,7 @@ addr = "0.0.0.0:9000"
         let loaded = load(f.path()).unwrap();
         assert_eq!(loaded.neighborhoods[0].peers.len(), 1);
         assert_eq!(loaded.neighborhoods[0].peers[0].id, 1);
-        assert_eq!(loaded.disk_pools[0].disks.len(), 1);
+        assert_eq!(loaded.disks.len(), 1);
         assert_eq!(loaded.neighborhoods[0].local_node_id, Some(99));
     }
 

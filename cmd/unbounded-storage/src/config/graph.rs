@@ -29,7 +29,6 @@ pub struct RuntimeP2p {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeCache {
     pub id: String,
-    pub disks: Vec<DiskSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +49,7 @@ pub struct RuntimeNeighborhood {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeGraph {
+    pub disks: Vec<DiskSpec>,
     pub caches: HashMap<String, RuntimeCache>,
     pub neighborhoods: HashMap<String, RuntimeNeighborhood>,
     pub frontends: HashMap<String, ResolvedFrontendBinding>,
@@ -64,10 +64,6 @@ pub fn validate_binding_graph(config: &Config) -> Result<(), String> {
         insert_id(&mut ids, "cache", &c.name)?;
         require_source("cache", &c.name, &c.source)?;
     }
-    let mut disk_pool_ids = HashSet::new();
-    for p in &config.disk_pools {
-        insert_id(&mut disk_pool_ids, "disk pool", &p.name)?;
-    }
     for n in &config.neighborhoods {
         insert_id(&mut ids, "neighborhood", &n.name)?;
         require_source("neighborhood", &n.name, &n.source)?;
@@ -79,7 +75,6 @@ pub fn validate_binding_graph(config: &Config) -> Result<(), String> {
 
     let backends = by_id(&config.backends, |b| b.name.as_str());
     let caches = by_id(&config.caches, |c| c.name.as_str());
-    let disk_pools = by_id(&config.disk_pools, |p| p.name.as_str());
     let neighborhoods = by_id(&config.neighborhoods, |n| n.name.as_str());
 
     for c in &config.caches {
@@ -89,12 +84,6 @@ pub fn validate_binding_graph(config: &Config) -> Result<(), String> {
             return Err(format!(
                 "cache {:?} source {:?}, which is not a backend or neighborhood",
                 c.name, c.source
-            ));
-        }
-        if !disk_pools.contains_key(c.disk_pool.as_str()) {
-            return Err(format!(
-                "cache {:?} disk_pool {:?}, which is not a disk pool",
-                c.name, c.disk_pool
             ));
         }
     }
@@ -194,7 +183,6 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
 
     let backends = by_id(&config.backends, |b| b.name.as_str());
     let caches = by_id(&config.caches, |c| c.name.as_str());
-    let disk_pools = by_id(&config.disk_pools, |p| p.name.as_str());
     let neighborhoods = by_id(&config.neighborhoods, |n| n.name.as_str());
 
     let mut bindings = HashMap::new();
@@ -241,14 +229,10 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
         .caches
         .iter()
         .map(|cache| {
-            let pool = disk_pools
-                .get(cache.disk_pool.as_str())
-                .expect("binding graph validation checked cache disk pool");
             (
                 cache.name.clone(),
                 RuntimeCache {
                     id: cache.name.clone(),
-                    disks: pool.disks.clone(),
                 },
             )
         })
@@ -286,6 +270,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
         .collect();
 
     Ok(RuntimeGraph {
+        disks: config.disks.clone(),
         caches,
         neighborhoods,
         frontends: bindings,
@@ -293,11 +278,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
 }
 
 pub fn runtime_disks(graph: &RuntimeGraph) -> Vec<DiskSpec> {
-    let mut disks = Vec::new();
-    for cache in graph.caches.values() {
-        disks.extend(cache.disks.clone());
-    }
-    disks
+    graph.disks.clone()
 }
 
 pub fn runtime_peers(graph: &RuntimeGraph) -> Vec<RuntimePeer> {
@@ -343,7 +324,7 @@ fn by_id<'a, T>(items: &'a [T], id: impl Fn(&'a T) -> &'a str) -> HashMap<&'a st
 #[cfg(test)]
 mod tests {
     use super::super::schema::{
-        BackendSpec, CacheSpec, DiskPoolSpec, FrontendSpec, HttpBackendConfig, HttpFrontendConfig,
+        BackendSpec, CacheSpec, FrontendSpec, HttpBackendConfig, HttpFrontendConfig,
         NeighborhoodSpec, PeerSpec, RdmaPeerConfig, TcpPeerConfig, backend_spec, frontend_spec,
         peer_spec,
     };
@@ -366,14 +347,6 @@ mod tests {
         CacheSpec {
             name: id.to_string(),
             source: source.to_string(),
-            disk_pool: "pool".to_string(),
-        }
-    }
-
-    fn disk_pool(id: &str) -> DiskPoolSpec {
-        DiskPoolSpec {
-            name: id.to_string(),
-            disks: Vec::new(),
         }
     }
 
@@ -424,7 +397,6 @@ mod tests {
     fn runtime_projection_accepts_all_chain_shapes() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
-        cfg.disk_pools.push(disk_pool("pool"));
         cfg.caches.push(cache("c-backend", "b"));
         cfg.neighborhoods.push(neighborhood("n", "b"));
         cfg.caches.push(cache("c-neighborhood", "n"));

@@ -17,7 +17,7 @@ use proptest::prelude::*;
 use unbounded_storage::bufferpool::{Error, StripeKey};
 use unbounded_storage::config::{
     ApplyError, BackendSpec, CacheSpec, Config, ConfigApplyTarget, ConfigController, ConfigDiff,
-    DiskPoolSpec, DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig,
+    DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig,
     NeighborhoodSpec, PeerSpec, TcpPeerConfig, backend_spec, disk_spec, frontend_spec, peer_spec,
     runtime_disks, runtime_projection,
 };
@@ -867,12 +867,8 @@ fn config_for_generation(version: u64, disks: Vec<DiskSpec>) -> Config {
     cfg.caches = vec![CacheSpec {
         name: "cache-0".to_string(),
         source: "neighborhood-0".to_string(),
-        disk_pool: "pool-0".to_string(),
     }];
-    cfg.disk_pools = vec![DiskPoolSpec {
-        name: "pool-0".to_string(),
-        disks,
-    }];
+    cfg.disks = disks;
     cfg.frontends = frontend_specs(0, 1);
     cfg
 }
@@ -895,10 +891,7 @@ fn mutate_config(cfg: &mut Config, apply: &ApplySpec, generation: usize) {
             cfg.frontends = frontend_specs(generation, count.max(1));
         }
         ApplyKind::DiskSwap { count } => {
-            cfg.disk_pools
-                .first_mut()
-                .expect("lifecycle sim has a disk pool")
-                .disks = generation_disk_specs(generation, count.max(1) as usize);
+            cfg.disks = generation_disk_specs(generation, count.max(1) as usize);
         }
     }
 }

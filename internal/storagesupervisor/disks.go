@@ -16,7 +16,6 @@ import (
 const (
 	storageDisksAnnotation     = "unbounded-cloud.io/storage-disks"
 	storageFileSizeAnnotation  = "unbounded-cloud.io/storage-file-size-bytes"
-	defaultStorageDiskPoolName = "default"
 	defaultStorageFileDiskPath = "/var/lib/unbounded-storage/cache.disk"
 	defaultStorageFileDiskDir  = "/var/lib/unbounded-storage"
 	defaultStorageFileDiskSize = uint64(2 * 1024 * 1024 * 1024)
@@ -27,16 +26,10 @@ const (
 	diskOptionNuma             = "numa"
 )
 
-// applyDiskOverlay injects per-node storage disks into the default disk pool.
-// Explicit disks in the default pool are authoritative and preserved as-is.
+// applyDiskOverlay injects per-node storage disks when the config does not
+// declare disks explicitly. Explicit config disks are authoritative.
 func applyDiskOverlay(cfg *storageconfig.Config, annotations map[string]string) error {
-	target := defaultDiskPool(cfg)
-	if target == nil {
-		target = &storageconfig.DiskPoolSpec{Name: defaultStorageDiskPoolName}
-		cfg.DiskPools = append(cfg.DiskPools, target)
-	}
-
-	if len(target.GetDisks()) > 0 {
+	if len(cfg.GetDisks()) > 0 {
 		return nil
 	}
 
@@ -56,29 +49,9 @@ func applyDiskOverlay(cfg *storageconfig.Config, annotations map[string]string) 
 		disks = []*storageconfig.DiskSpec{fallback}
 	}
 
-	target.Disks = disks
+	cfg.Disks = disks
 
 	return nil
-}
-
-func defaultDiskPool(cfg *storageconfig.Config) *storageconfig.DiskPoolSpec {
-	var target *storageconfig.DiskPoolSpec
-
-	for _, pool := range cfg.GetDiskPools() {
-		if pool == nil || pool.GetName() != defaultStorageDiskPoolName {
-			continue
-		}
-
-		if target != nil {
-			slog.Warn("multiple default storage disk pools declared; using the first")
-
-			continue
-		}
-
-		target = pool
-	}
-
-	return target
 }
 
 func annotationBlockDisks(raw string, existingPaths map[string]struct{}) []*storageconfig.DiskSpec {
@@ -300,12 +273,10 @@ func fallbackFileDisk(rawSize string) *storageconfig.DiskSpec {
 func declaredDiskPaths(cfg *storageconfig.Config) map[string]struct{} {
 	paths := map[string]struct{}{}
 
-	for _, pool := range cfg.GetDiskPools() {
-		for _, disk := range pool.GetDisks() {
-			path := diskPath(disk)
-			if path != "" {
-				paths[path] = struct{}{}
-			}
+	for _, disk := range cfg.GetDisks() {
+		path := diskPath(disk)
+		if path != "" {
+			paths[path] = struct{}{}
 		}
 	}
 
