@@ -149,6 +149,7 @@ func pathsExcluding(paths, excluded []string) []string {
 	}
 
 	var out []string
+
 	for _, p := range paths {
 		if !seen[p] {
 			out = append(out, p)
