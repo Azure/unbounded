@@ -34,6 +34,7 @@ use crate::config::{BackendSpec, backend_spec};
 use crate::storage::StripeReq;
 use crate::tls::{TlsConfig, TlsContext};
 
+use super::cache_ttl::MetadataTtlPolicy;
 use super::url::parse_endpoint;
 use super::{
     AzureBackend, Backend, FakeBackend, HttpBackend, OriginBackend, OriginRing, OriginStream,
@@ -140,6 +141,12 @@ impl BuildCtx {
                     &cfg.client_key_path,
                 )?;
                 let origin = HttpBackend::resolve_origin(&endpoint.authority)?;
+                let metadata_ttl = metadata_ttl_policy(
+                    cfg.metadata_ttl_default_secs,
+                    cfg.metadata_ttl_max_secs,
+                    cfg.not_found_ttl_default_secs,
+                    cfg.not_found_ttl_max_secs,
+                );
                 Ok(OriginBackend::Http(HttpBackend::new(
                     self.ring.clone(),
                     origin,
@@ -151,6 +158,7 @@ impl BuildCtx {
                     self.page_size,
                     self.backing_base,
                     cfg.http_concurrency.expect("http_concurrency defaulted") as usize,
+                    metadata_ttl,
                 )))
             }
             Some(backend_spec::Config::S3(cfg)) => {
@@ -162,6 +170,12 @@ impl BuildCtx {
                     &cfg.client_key_path,
                 )?;
                 let origin = S3Backend::resolve_origin(&endpoint.authority)?;
+                let metadata_ttl = metadata_ttl_policy(
+                    cfg.metadata_ttl_default_secs,
+                    cfg.metadata_ttl_max_secs,
+                    cfg.not_found_ttl_default_secs,
+                    cfg.not_found_ttl_max_secs,
+                );
                 Ok(OriginBackend::S3(S3Backend::new(
                     self.ring.clone(),
                     origin,
@@ -173,6 +187,7 @@ impl BuildCtx {
                     self.page_size,
                     self.backing_base,
                     cfg.http_concurrency.expect("http_concurrency defaulted") as usize,
+                    metadata_ttl,
                 )))
             }
             Some(backend_spec::Config::Azure(cfg)) => {
@@ -184,6 +199,12 @@ impl BuildCtx {
                     &cfg.client_key_path,
                 )?;
                 let origin = AzureBackend::resolve_origin(&endpoint.authority)?;
+                let metadata_ttl = metadata_ttl_policy(
+                    cfg.metadata_ttl_default_secs,
+                    cfg.metadata_ttl_max_secs,
+                    cfg.not_found_ttl_default_secs,
+                    cfg.not_found_ttl_max_secs,
+                );
                 Ok(OriginBackend::Azure(AzureBackend::new(
                     self.ring.clone(),
                     origin,
@@ -195,6 +216,7 @@ impl BuildCtx {
                     self.page_size,
                     self.backing_base,
                     cfg.http_concurrency.expect("http_concurrency defaulted") as usize,
+                    metadata_ttl,
                 )))
             }
             Some(backend_spec::Config::Fake(cfg)) => Ok(OriginBackend::Fake(FakeBackend::new(
@@ -210,6 +232,20 @@ impl BuildCtx {
             )),
         }
     }
+}
+
+fn metadata_ttl_policy(
+    metadata_default_secs: Option<u64>,
+    metadata_max_secs: Option<u64>,
+    not_found_default_secs: Option<u64>,
+    not_found_max_secs: Option<u64>,
+) -> MetadataTtlPolicy {
+    MetadataTtlPolicy::new(
+        metadata_default_secs.expect("metadata_ttl_default_secs defaulted"),
+        metadata_max_secs.expect("metadata_ttl_max_secs defaulted"),
+        not_found_default_secs.expect("not_found_ttl_default_secs defaulted"),
+        not_found_max_secs.expect("not_found_ttl_max_secs defaulted"),
+    )
 }
 
 struct OriginEndpoint {
@@ -357,6 +393,10 @@ mod tests {
                 url: url.to_string(),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
+                metadata_ttl_default_secs: Some(60),
+                metadata_ttl_max_secs: Some(60),
+                not_found_ttl_default_secs: Some(5),
+                not_found_ttl_max_secs: Some(5),
                 ca_cert_path: None,
                 insecure_skip_verify: false,
                 client_cert_path: None,

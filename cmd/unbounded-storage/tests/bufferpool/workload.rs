@@ -44,6 +44,11 @@ pub struct Workload {
     /// is the miss-only regime where every fetch goes through the
     /// transport.
     pub cache_hit_rate: u32,
+    /// When set, the test request marks every cache hit invalid after
+    /// the mock has copied bytes into the destination page. This models
+    /// stale metadata pages deterministically: no wall-clock or random
+    /// decision participates in the validity check.
+    pub reject_cache_hits: bool,
     /// `PoolConfig::max_concurrent_streams`. Defaults set this high
     /// enough to never trigger; the strategy occasionally chooses a
     /// small value so `Pool::read` returns `Error::StreamLimit` and
@@ -291,6 +296,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
                 max_io_delay,
                 io_fault_rate,
                 cache_hit_rate,
+                reject_cache_hits: false,
                 max_concurrent_streams,
                 max_inflight_pages,
                 key_count,
@@ -386,6 +392,7 @@ pub fn pipelined_workload_strategy() -> impl Strategy<Value = Workload> {
                 max_io_delay,
                 io_fault_rate,
                 cache_hit_rate,
+                reject_cache_hits: false,
                 // Pinned high: pipelined admission must not be
                 // rejected, so every plan slice gets a stream.
                 max_concurrent_streams: 1024,
@@ -550,6 +557,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         let p = pool.clone();
         let outcomes = outcomes.clone();
         let key = w.key(c.key_idx);
+        let reject_cache_hits = w.reject_cache_hits;
         let expected = oracle
             .get(&key)
             .map(|s| s[c.offset as usize..(c.offset + c.len) as usize].to_vec())
@@ -561,7 +569,10 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
 
         exec.spawn(async move {
             let _ = cid;
-            let req = TestReq { key };
+            let req = TestReq {
+                key,
+                reject_cache_hits,
+            };
             // Window `None` => plain `read`; `Some(w)` => prefetching
             // `read_windowed`. Both admit through the same path and
             // surface `StreamLimit` identically.
@@ -612,12 +623,16 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         let p = pool.clone();
         let outcomes = outcomes.clone();
         let cancel_after = pspec.cancel_after;
+        let reject_cache_hits = w.reject_cache_hits;
 
         exec.spawn(async move {
             let plans: Vec<StripePlan<TestReq>> = plan_norm
                 .into_iter()
                 .map(|(key, intra_offset, intra_len)| StripePlan {
-                    req: TestReq { key },
+                    req: TestReq {
+                        key,
+                        reject_cache_hits,
+                    },
                     intra_offset,
                     intra_len,
                 })

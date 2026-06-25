@@ -325,9 +325,17 @@ impl BlockStore for LiveShardLocalStore {
         // SAFETY: `resolve` produced an in-bounds pointer into the
         // shard's pinned backing; the pool guarantees the page is not
         // aliased for the duration of this future.
-        channels.channels[idx]
+        let hit = channels.channels[idx]
             .read_page(key, stripe_off, slice)
-            .await
+            .await?;
+        if hit {
+            // SAFETY: `slice` points to the resolved page bytes filled above.
+            let page = unsafe { &*slice };
+            if !req.cached_page_valid(stripe_off, page) {
+                return Ok(false);
+            }
+        }
+        Ok(hit)
     }
 
     async fn write_page<R: Req + ?Sized>(

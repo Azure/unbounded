@@ -85,6 +85,7 @@ pub(super) struct OriginResponseHead {
     pub(super) header_end: usize,
     pub(super) content_length: Option<u64>,
     pub(super) content_range_start: Option<u64>,
+    pub(super) cache_control: Option<String>,
     pub(super) connection: Option<String>,
     pub(super) buf: Vec<u8>,
 }
@@ -181,6 +182,7 @@ pub(super) async fn send_request_read_head(
                     header_end: h.header_end,
                     content_length: h.content_length(),
                     content_range_start: h.content_range_start(),
+                    cache_control: h.header("cache-control").map(ToOwned::to_owned),
                     connection: h.header("connection").map(ToOwned::to_owned),
                     buf,
                 };

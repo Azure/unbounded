@@ -1591,8 +1591,16 @@ type HttpBackendConfig struct {
 	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
 	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
 	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Default positive metadata TTL when the origin does not provide Cache-Control max-age.
+	MetadataTtlDefaultSecs *uint64 `protobuf:"varint,8,opt,name=metadata_ttl_default_secs,json=metadataTtlDefaultSecs,proto3,oneof" json:"metadata_ttl_default_secs,omitempty"`
+	// Upper bound applied to origin-provided positive metadata TTLs.
+	MetadataTtlMaxSecs *uint64 `protobuf:"varint,9,opt,name=metadata_ttl_max_secs,json=metadataTtlMaxSecs,proto3,oneof" json:"metadata_ttl_max_secs,omitempty"`
+	// Default 404 metadata TTL when the origin does not provide Cache-Control max-age.
+	NotFoundTtlDefaultSecs *uint64 `protobuf:"varint,10,opt,name=not_found_ttl_default_secs,json=notFoundTtlDefaultSecs,proto3,oneof" json:"not_found_ttl_default_secs,omitempty"`
+	// Upper bound applied to origin-provided 404 metadata TTLs.
+	NotFoundTtlMaxSecs *uint64 `protobuf:"varint,11,opt,name=not_found_ttl_max_secs,json=notFoundTtlMaxSecs,proto3,oneof" json:"not_found_ttl_max_secs,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *HttpBackendConfig) Reset() {
@@ -1674,6 +1682,34 @@ func (x *HttpBackendConfig) GetClientKeyPath() string {
 	return ""
 }
 
+func (x *HttpBackendConfig) GetMetadataTtlDefaultSecs() uint64 {
+	if x != nil && x.MetadataTtlDefaultSecs != nil {
+		return *x.MetadataTtlDefaultSecs
+	}
+	return 0
+}
+
+func (x *HttpBackendConfig) GetMetadataTtlMaxSecs() uint64 {
+	if x != nil && x.MetadataTtlMaxSecs != nil {
+		return *x.MetadataTtlMaxSecs
+	}
+	return 0
+}
+
+func (x *HttpBackendConfig) GetNotFoundTtlDefaultSecs() uint64 {
+	if x != nil && x.NotFoundTtlDefaultSecs != nil {
+		return *x.NotFoundTtlDefaultSecs
+	}
+	return 0
+}
+
+func (x *HttpBackendConfig) GetNotFoundTtlMaxSecs() uint64 {
+	if x != nil && x.NotFoundTtlMaxSecs != nil {
+		return *x.NotFoundTtlMaxSecs
+	}
+	return 0
+}
+
 type S3BackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// S3-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses
@@ -1693,8 +1729,16 @@ type S3BackendConfig struct {
 	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
 	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
 	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Default positive metadata TTL when the origin does not provide Cache-Control max-age.
+	MetadataTtlDefaultSecs *uint64 `protobuf:"varint,8,opt,name=metadata_ttl_default_secs,json=metadataTtlDefaultSecs,proto3,oneof" json:"metadata_ttl_default_secs,omitempty"`
+	// Upper bound applied to origin-provided positive metadata TTLs.
+	MetadataTtlMaxSecs *uint64 `protobuf:"varint,9,opt,name=metadata_ttl_max_secs,json=metadataTtlMaxSecs,proto3,oneof" json:"metadata_ttl_max_secs,omitempty"`
+	// Default 404 metadata TTL when the origin does not provide Cache-Control max-age.
+	NotFoundTtlDefaultSecs *uint64 `protobuf:"varint,10,opt,name=not_found_ttl_default_secs,json=notFoundTtlDefaultSecs,proto3,oneof" json:"not_found_ttl_default_secs,omitempty"`
+	// Upper bound applied to origin-provided 404 metadata TTLs.
+	NotFoundTtlMaxSecs *uint64 `protobuf:"varint,11,opt,name=not_found_ttl_max_secs,json=notFoundTtlMaxSecs,proto3,oneof" json:"not_found_ttl_max_secs,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *S3BackendConfig) Reset() {
@@ -1776,6 +1820,34 @@ func (x *S3BackendConfig) GetClientKeyPath() string {
 	return ""
 }
 
+func (x *S3BackendConfig) GetMetadataTtlDefaultSecs() uint64 {
+	if x != nil && x.MetadataTtlDefaultSecs != nil {
+		return *x.MetadataTtlDefaultSecs
+	}
+	return 0
+}
+
+func (x *S3BackendConfig) GetMetadataTtlMaxSecs() uint64 {
+	if x != nil && x.MetadataTtlMaxSecs != nil {
+		return *x.MetadataTtlMaxSecs
+	}
+	return 0
+}
+
+func (x *S3BackendConfig) GetNotFoundTtlDefaultSecs() uint64 {
+	if x != nil && x.NotFoundTtlDefaultSecs != nil {
+		return *x.NotFoundTtlDefaultSecs
+	}
+	return 0
+}
+
+func (x *S3BackendConfig) GetNotFoundTtlMaxSecs() uint64 {
+	if x != nil && x.NotFoundTtlMaxSecs != nil {
+		return *x.NotFoundTtlMaxSecs
+	}
+	return 0
+}
+
 type AzureBackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Azure Blob-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://`
@@ -1795,8 +1867,16 @@ type AzureBackendConfig struct {
 	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
 	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
 	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Default positive metadata TTL when the origin does not provide Cache-Control max-age.
+	MetadataTtlDefaultSecs *uint64 `protobuf:"varint,8,opt,name=metadata_ttl_default_secs,json=metadataTtlDefaultSecs,proto3,oneof" json:"metadata_ttl_default_secs,omitempty"`
+	// Upper bound applied to origin-provided positive metadata TTLs.
+	MetadataTtlMaxSecs *uint64 `protobuf:"varint,9,opt,name=metadata_ttl_max_secs,json=metadataTtlMaxSecs,proto3,oneof" json:"metadata_ttl_max_secs,omitempty"`
+	// Default 404 metadata TTL when the origin does not provide Cache-Control max-age.
+	NotFoundTtlDefaultSecs *uint64 `protobuf:"varint,10,opt,name=not_found_ttl_default_secs,json=notFoundTtlDefaultSecs,proto3,oneof" json:"not_found_ttl_default_secs,omitempty"`
+	// Upper bound applied to origin-provided 404 metadata TTLs.
+	NotFoundTtlMaxSecs *uint64 `protobuf:"varint,11,opt,name=not_found_ttl_max_secs,json=notFoundTtlMaxSecs,proto3,oneof" json:"not_found_ttl_max_secs,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *AzureBackendConfig) Reset() {
@@ -1876,6 +1956,34 @@ func (x *AzureBackendConfig) GetClientKeyPath() string {
 		return *x.ClientKeyPath
 	}
 	return ""
+}
+
+func (x *AzureBackendConfig) GetMetadataTtlDefaultSecs() uint64 {
+	if x != nil && x.MetadataTtlDefaultSecs != nil {
+		return *x.MetadataTtlDefaultSecs
+	}
+	return 0
+}
+
+func (x *AzureBackendConfig) GetMetadataTtlMaxSecs() uint64 {
+	if x != nil && x.MetadataTtlMaxSecs != nil {
+		return *x.MetadataTtlMaxSecs
+	}
+	return 0
+}
+
+func (x *AzureBackendConfig) GetNotFoundTtlDefaultSecs() uint64 {
+	if x != nil && x.NotFoundTtlDefaultSecs != nil {
+		return *x.NotFoundTtlDefaultSecs
+	}
+	return 0
+}
+
+func (x *AzureBackendConfig) GetNotFoundTtlMaxSecs() uint64 {
+	if x != nil && x.NotFoundTtlMaxSecs != nil {
+		return *x.NotFoundTtlMaxSecs
+	}
+	return 0
 }
 
 type FakeBackendConfig struct {
@@ -2413,7 +2521,7 @@ const file_config_proto_rawDesc = "" +
 	"\x02s3\x18\x03 \x01(\v2).unbounded.storage.config.S3BackendConfigH\x00R\x02s3\x12D\n" +
 	"\x05azure\x18\x04 \x01(\v2,.unbounded.storage.config.AzureBackendConfigH\x00R\x05azure\x12A\n" +
 	"\x04fake\x18\x05 \x01(\v2+.unbounded.storage.config.FakeBackendConfigH\x00R\x04fakeB\b\n" +
-	"\x06config\"\xa0\x03\n" +
+	"\x06config\"\x84\x06\n" +
 	"\x11HttpBackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
@@ -2422,12 +2530,21 @@ const file_config_proto_rawDesc = "" +
 	"caCertPath\x88\x01\x01\x120\n" +
 	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
 	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
-	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
+	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01\x12>\n" +
+	"\x19metadata_ttl_default_secs\x18\b \x01(\x04H\x05R\x16metadataTtlDefaultSecs\x88\x01\x01\x126\n" +
+	"\x15metadata_ttl_max_secs\x18\t \x01(\x04H\x06R\x12metadataTtlMaxSecs\x88\x01\x01\x12?\n" +
+	"\x1anot_found_ttl_default_secs\x18\n" +
+	" \x01(\x04H\aR\x16notFoundTtlDefaultSecs\x88\x01\x01\x127\n" +
+	"\x16not_found_ttl_max_secs\x18\v \x01(\x04H\bR\x12notFoundTtlMaxSecs\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
 	"\x11_http_concurrencyB\x0f\n" +
 	"\r_ca_cert_pathB\x13\n" +
 	"\x11_client_cert_pathB\x12\n" +
-	"\x10_client_key_path\"\x9e\x03\n" +
+	"\x10_client_key_pathB\x1c\n" +
+	"\x1a_metadata_ttl_default_secsB\x18\n" +
+	"\x16_metadata_ttl_max_secsB\x1d\n" +
+	"\x1b_not_found_ttl_default_secsB\x19\n" +
+	"\x17_not_found_ttl_max_secs\"\x82\x06\n" +
 	"\x0fS3BackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
@@ -2436,12 +2553,21 @@ const file_config_proto_rawDesc = "" +
 	"caCertPath\x88\x01\x01\x120\n" +
 	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
 	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
-	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
+	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01\x12>\n" +
+	"\x19metadata_ttl_default_secs\x18\b \x01(\x04H\x05R\x16metadataTtlDefaultSecs\x88\x01\x01\x126\n" +
+	"\x15metadata_ttl_max_secs\x18\t \x01(\x04H\x06R\x12metadataTtlMaxSecs\x88\x01\x01\x12?\n" +
+	"\x1anot_found_ttl_default_secs\x18\n" +
+	" \x01(\x04H\aR\x16notFoundTtlDefaultSecs\x88\x01\x01\x127\n" +
+	"\x16not_found_ttl_max_secs\x18\v \x01(\x04H\bR\x12notFoundTtlMaxSecs\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
 	"\x11_http_concurrencyB\x0f\n" +
 	"\r_ca_cert_pathB\x13\n" +
 	"\x11_client_cert_pathB\x12\n" +
-	"\x10_client_key_path\"\xa1\x03\n" +
+	"\x10_client_key_pathB\x1c\n" +
+	"\x1a_metadata_ttl_default_secsB\x18\n" +
+	"\x16_metadata_ttl_max_secsB\x1d\n" +
+	"\x1b_not_found_ttl_default_secsB\x19\n" +
+	"\x17_not_found_ttl_max_secs\"\x85\x06\n" +
 	"\x12AzureBackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
@@ -2450,12 +2576,21 @@ const file_config_proto_rawDesc = "" +
 	"caCertPath\x88\x01\x01\x120\n" +
 	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
 	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
-	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
+	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01\x12>\n" +
+	"\x19metadata_ttl_default_secs\x18\b \x01(\x04H\x05R\x16metadataTtlDefaultSecs\x88\x01\x01\x126\n" +
+	"\x15metadata_ttl_max_secs\x18\t \x01(\x04H\x06R\x12metadataTtlMaxSecs\x88\x01\x01\x12?\n" +
+	"\x1anot_found_ttl_default_secs\x18\n" +
+	" \x01(\x04H\aR\x16notFoundTtlDefaultSecs\x88\x01\x01\x127\n" +
+	"\x16not_found_ttl_max_secs\x18\v \x01(\x04H\bR\x12notFoundTtlMaxSecs\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
 	"\x11_http_concurrencyB\x0f\n" +
 	"\r_ca_cert_pathB\x13\n" +
 	"\x11_client_cert_pathB\x12\n" +
-	"\x10_client_key_path\"\xa1\x01\n" +
+	"\x10_client_key_pathB\x1c\n" +
+	"\x1a_metadata_ttl_default_secsB\x18\n" +
+	"\x16_metadata_ttl_max_secsB\x1d\n" +
+	"\x1b_not_found_ttl_default_secsB\x19\n" +
+	"\x17_not_found_ttl_max_secs\"\xa1\x01\n" +
 	"\x11FakeBackendConfig\x12/\n" +
 	"\x11stripe_size_bytes\x18\x01 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12/\n" +
 	"\x11object_size_bytes\x18\x02 \x01(\x04H\x01R\x0fobjectSizeBytes\x88\x01\x01B\x14\n" +

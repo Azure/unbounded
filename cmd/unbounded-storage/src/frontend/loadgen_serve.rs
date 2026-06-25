@@ -331,6 +331,9 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
         .map_err(|_| ())?;
     let page = rs.next_page().await.ok_or(())?.map_err(|_| ())?;
     let meta = ObjectMetadata::decode(page.as_slice()).map_err(|_| ())?;
+    if meta.is_not_found() {
+        return Err(());
+    }
     Ok(meta.length)
 }
 

@@ -27,9 +27,12 @@
 //!   so the frontend (which knows the origin) and any peer (which only
 //!   knows the key) agree on routing without coordination.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 
 use crate::bufferpool::{Req, StripeKey};
+use crate::storage::ObjectMetadata;
 
 /// Reserved sentinel `stripe_idx` for an object's metadata entry.
 ///
@@ -267,6 +270,33 @@ impl Req for StripeReq {
     fn skip_local_disk(&self) -> bool {
         self.skip_local_disk
     }
+
+    fn cached_page_valid(&self, stripe_off: u64, page: &[u8]) -> bool {
+        self.cached_page_valid_at(stripe_off, page, unix_now_secs())
+    }
+
+    fn cached_page_valid_at(&self, stripe_off: u64, page: &[u8], now_unix_secs: u64) -> bool {
+        if stripe_off != 0 {
+            return true;
+        }
+        if !self
+            .origin
+            .as_ref()
+            .is_some_and(OriginRef::is_metadata_entry)
+        {
+            return true;
+        }
+        ObjectMetadata::decode(page)
+            .map(|meta| meta.cache_valid_at(now_unix_secs))
+            .unwrap_or(false)
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Free-function form of [`OriginRef::stripe_key_for_cache`], for callers that
@@ -557,5 +587,47 @@ mod tests {
         let back2: StripeReq = bincode::deserialize(&bytes2).unwrap();
         assert_eq!(req2, back2);
         assert_eq!(back2.origin(), Some(&origin));
+    }
+
+    #[test]
+    fn metadata_request_rejects_expired_cached_page() {
+        let origin = OriginRef::metadata_entry("primary", "/object");
+        let req = StripeReq::new(origin.stripe_key()).with_origin(origin);
+        let page = ObjectMetadata::found(12, 100).encode().unwrap();
+
+        assert!(req.cached_page_valid_at(0, &page, 99));
+        assert!(!req.cached_page_valid_at(0, &page, 100));
+        assert!(!req.cached_page_valid_at(0, &page, 101));
+    }
+
+    #[test]
+    fn metadata_request_accepts_unexpired_negative_page() {
+        let origin = OriginRef::metadata_entry("primary", "/missing");
+        let req = StripeReq::new(origin.stripe_key()).with_origin(origin);
+        let page = ObjectMetadata::not_found(10).encode().unwrap();
+
+        assert!(req.cached_page_valid_at(0, &page, 9));
+        assert!(!req.cached_page_valid_at(0, &page, 10));
+    }
+
+    #[test]
+    fn metadata_request_rejects_malformed_cached_page() {
+        let origin = OriginRef::metadata_entry("primary", "/broken");
+        let req = StripeReq::new(origin.stripe_key()).with_origin(origin);
+
+        assert!(!req.cached_page_valid_at(0, &[0u8; 4], 0));
+    }
+
+    #[test]
+    fn cache_validity_hook_only_applies_to_metadata_entry_head_page() {
+        let data_origin = OriginRef::new("primary", "/object", 0);
+        let data_req = StripeReq::new(data_origin.stripe_key()).with_origin(data_origin);
+        let metadata_origin = OriginRef::metadata_entry("primary", "/object");
+        let metadata_req =
+            StripeReq::new(metadata_origin.stripe_key()).with_origin(metadata_origin);
+        let expired = ObjectMetadata::found(12, 100).encode().unwrap();
+
+        assert!(data_req.cached_page_valid_at(0, &expired, 100));
+        assert!(metadata_req.cached_page_valid_at(4096, &expired, 100));
     }
 }

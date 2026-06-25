@@ -45,6 +45,7 @@ use crate::storage::{ObjectMetadata, StripeReq};
 use crate::tls::TlsContext;
 
 use super::Backend;
+use super::cache_ttl::{MetadataTtlPolicy, metadata_from_head, unix_now_secs};
 use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
@@ -79,6 +80,7 @@ pub struct HttpBackend {
     backing_base: *mut u8,
     limiter: FetchLimiter,
     conns: OriginConnPool,
+    metadata_ttl: MetadataTtlPolicy,
 }
 
 // SAFETY: mirrors `crate::memory::Backing`. `HttpBackend` is
@@ -93,7 +95,7 @@ unsafe impl Send for HttpBackend {}
 unsafe impl Sync for HttpBackend {}
 
 impl HttpBackend {
-    pub fn new(
+    pub(crate) fn new(
         ring: OriginRing,
         origin: SockAddr,
         host: String,
@@ -104,6 +106,7 @@ impl HttpBackend {
         page_size: usize,
         backing_base: *mut u8,
         http_concurrency: usize,
+        metadata_ttl: MetadataTtlPolicy,
     ) -> Self {
         Self {
             ring,
@@ -117,6 +120,7 @@ impl HttpBackend {
             backing_base,
             limiter: FetchLimiter::new(http_concurrency),
             conns: OriginConnPool::new(http_concurrency),
+            metadata_ttl,
         }
     }
 
@@ -193,6 +197,7 @@ impl HttpBackend {
         let backing_base = self.backing_base;
         let page_size = self.page_size;
         let conns = self.conns.clone();
+        let metadata_ttl = self.metadata_ttl;
 
         // A metadata entry is not a byte range of the object; it is a
         // synthetic one-page cache entry whose payload is the object's
@@ -221,6 +226,7 @@ impl HttpBackend {
                         page_size,
                         self.limiter.clone(),
                         conns,
+                        metadata_ttl,
                     ),
                 ),
             ));
@@ -553,6 +559,7 @@ async fn fetch_metadata(
     page_size: usize,
     limiter: FetchLimiter,
     conns: OriginConnPool,
+    metadata_ttl: MetadataTtlPolicy,
 ) -> Result<(), Error> {
     let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
     if capacity < 8 {
@@ -582,21 +589,20 @@ async fn fetch_metadata(
     let version_minor = head.version_minor;
     let header_end = head.header_end;
     let content_length = head.content_length;
+    let cache_control = head.cache_control;
     let connection = head.connection;
     let buf = head.buf;
 
-    if status == StatusCode::NOT_FOUND {
-        return Err(Error::OriginNotFound);
-    }
-    if status != StatusCode::OK {
-        return Err(Error::from(
-            "http backend: metadata HEAD returned non-200 status",
-        ));
-    }
-    let length = content_length
-        .ok_or_else(|| Error::from("http backend: metadata HEAD missing Content-Length"))?;
-
-    let body = ObjectMetadata::new(length).encode()?;
+    let metadata = metadata_from_head(
+        status,
+        content_length,
+        cache_control.as_deref(),
+        metadata_ttl,
+        unix_now_secs(),
+        "http backend: metadata HEAD missing Content-Length",
+        "http backend: metadata HEAD returned non-200 status",
+    )?;
+    let body = metadata.encode()?;
     copy_body_into_pages(&body, &dsts, backing_base, page_size)?;
     if head_response_reusable(version_minor, connection.as_deref(), header_end, buf.len()) {
         conns.put(&handle, conn);

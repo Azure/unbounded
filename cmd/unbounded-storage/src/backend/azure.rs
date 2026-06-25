@@ -32,10 +32,11 @@ use ::http::header::{HOST, RANGE};
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::http::{Method, StatusCode, response_closes_after_body, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
-use crate::storage::{ObjectMetadata, StripeReq};
+use crate::storage::StripeReq;
 use crate::tls::TlsContext;
 
 use super::Backend;
+use super::cache_ttl::{MetadataTtlPolicy, metadata_from_head, unix_now_secs};
 use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
@@ -75,6 +76,7 @@ pub struct AzureBackend {
     backing_base: *mut u8,
     limiter: FetchLimiter,
     conns: OriginConnPool,
+    metadata_ttl: MetadataTtlPolicy,
 }
 
 // SAFETY: mirrors `S3Backend`'s justification. `AzureBackend` is
@@ -90,7 +92,7 @@ unsafe impl Sync for AzureBackend {}
 
 impl AzureBackend {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         ring: OriginRing,
         origin: SockAddr,
         host: String,
@@ -101,6 +103,7 @@ impl AzureBackend {
         page_size: usize,
         backing_base: *mut u8,
         http_concurrency: usize,
+        metadata_ttl: MetadataTtlPolicy,
     ) -> Self {
         Self {
             ring,
@@ -114,6 +117,7 @@ impl AzureBackend {
             backing_base,
             limiter: FetchLimiter::new(http_concurrency),
             conns: OriginConnPool::new(http_concurrency),
+            metadata_ttl,
         }
     }
 
@@ -162,6 +166,7 @@ impl AzureBackend {
         let sni_host = self.sni_host.clone();
         let tls = self.tls.clone();
         let conns = self.conns.clone();
+        let metadata_ttl = self.metadata_ttl;
 
         // A metadata entry is not a byte range of the object; it is a
         // synthetic one-page cache entry whose payload is the object's
@@ -183,6 +188,7 @@ impl AzureBackend {
                     page_size,
                     self.limiter.clone(),
                     conns,
+                    metadata_ttl,
                 ),
             ));
             return AzureFetchStream::pending(fut, dsts_owned);
@@ -476,7 +482,7 @@ async fn fetch(
 
 /// Fill a metadata entry: HEAD the origin object, take its
 /// `Content-Length` as the object's byte length, and write the encoded
-/// [`ObjectMetadata`] into the (single) destination page.
+/// [`crate::storage::ObjectMetadata`] into the (single) destination page.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_metadata(
     handle: NetHandle,
@@ -490,6 +496,7 @@ async fn fetch_metadata(
     page_size: usize,
     limiter: FetchLimiter,
     conns: OriginConnPool,
+    metadata_ttl: MetadataTtlPolicy,
 ) -> Result<(), Error> {
     let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
     if capacity < 8 {
@@ -519,21 +526,20 @@ async fn fetch_metadata(
     let version_minor = head.version_minor;
     let header_end = head.header_end;
     let content_length = head.content_length;
+    let cache_control = head.cache_control;
     let connection = head.connection;
     let buf = head.buf;
 
-    if status == StatusCode::NOT_FOUND {
-        return Err(Error::OriginNotFound);
-    }
-    if status != StatusCode::OK {
-        return Err(Error::from(
-            "azure backend: metadata HEAD returned non-200 status",
-        ));
-    }
-    let length = content_length
-        .ok_or_else(|| Error::from("azure backend: metadata HEAD missing Content-Length"))?;
-
-    let body = ObjectMetadata::new(length).encode()?;
+    let metadata = metadata_from_head(
+        status,
+        content_length,
+        cache_control.as_deref(),
+        metadata_ttl,
+        unix_now_secs(),
+        "azure backend: metadata HEAD missing Content-Length",
+        "azure backend: metadata HEAD returned non-200 status",
+    )?;
+    let body = metadata.encode()?;
     copy_body_into_pages(&body, &dsts, backing_base, page_size)?;
     if head_response_reusable(version_minor, connection.as_deref(), header_end, buf.len()) {
         conns.put(&handle, conn);

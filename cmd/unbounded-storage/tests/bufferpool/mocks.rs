@@ -66,15 +66,22 @@ fn draw_fault(cfg: &MockSimConfig) -> bool {
     rate > 0 && with_sim(|s| s.rng.gen_ratio(rate.min(100), 100))
 }
 
-/// Test request type. The pool only inspects `req.key()`.
+/// Test request type. The pool always needs `req.key()`; some scenarios
+/// also force cache hits to be treated as stale so the mock exercises the
+/// `Req::cached_page_valid` miss fallback without using wall-clock time.
 #[derive(Clone, Debug)]
 pub struct TestReq {
     pub key: StripeKey,
+    pub reject_cache_hits: bool,
 }
 
 impl Req for TestReq {
     fn key(&self) -> StripeKey {
         self.key
+    }
+
+    fn cached_page_valid(&self, _stripe_off: u64, _page: &[u8]) -> bool {
+        !self.reject_cache_hits
     }
 }
 
@@ -350,6 +357,10 @@ impl BlockStore for DstBlockStore {
         unsafe {
             let dst_ptr = base.add(dst.page_idx as usize * page_size + dst.offset as usize);
             std::ptr::copy_nonoverlapping(bytes.as_ptr().add(start), dst_ptr, page_size);
+            let page = std::slice::from_raw_parts(dst_ptr, page_size);
+            if !req.cached_page_valid(stripe_off, page) {
+                return Ok(false);
+            }
         }
         Ok(true)
     }

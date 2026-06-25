@@ -64,6 +64,18 @@ pub trait Req {
     fn fabric_only(&self) -> bool {
         false
     }
+
+    /// Whether a just-read cached page is still valid for this request.
+    /// Request types that carry mutable metadata semantics can reject a
+    /// cache hit after inspecting the page bytes; immutable request types
+    /// keep the default and accept every hit.
+    fn cached_page_valid(&self, _stripe_off: u64, _page: &[u8]) -> bool {
+        true
+    }
+
+    fn cached_page_valid_at(&self, _stripe_off: u64, _page: &[u8], _now_unix_secs: u64) -> bool {
+        true
+    }
 }
 
 impl Req for StripeKey {

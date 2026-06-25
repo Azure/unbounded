@@ -534,7 +534,15 @@ impl<B: BlockDevice> bufferpool::BlockStore for StorageEngine<B> {
         // slice lives until we return from this future.
         let dst_buf: *mut [u8] = unsafe { self.slice_mut_from_ref(dst) };
         // SAFETY: see comment above.
-        unsafe { self.read_page_into(req.key(), stripe_off, dst_buf).await }
+        let hit = unsafe { self.read_page_into(req.key(), stripe_off, dst_buf).await? };
+        if hit {
+            // SAFETY: `dst_buf` is the same valid destination slice read above.
+            let page = unsafe { &*dst_buf };
+            if !req.cached_page_valid(stripe_off, page) {
+                return Ok(false);
+            }
+        }
+        Ok(hit)
     }
 
     async fn write_page<R: bufferpool::Req + ?Sized>(

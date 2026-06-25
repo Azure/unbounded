@@ -18,7 +18,8 @@
 //!
 //! ```text
 //! [0..8)            u64 little-endian  blob_len
-//! [8..8+blob_len)   bincode(ObjectMetadata)
+//! [8..16)           metadata payload magic for new pages
+//! [16..8+blob_len)  bincode(ObjectMetadata)
 //! [8+blob_len..)    zero padding to the end of the page
 //! ```
 //!
@@ -38,9 +39,18 @@ use crate::bufferpool::Error;
 /// Width of the little-endian `blob_len` prefix that precedes the
 /// bincode payload on the page.
 const BLOB_LEN_PREFIX: usize = 8;
+const WIRE_V2_MAGIC: &[u8; 8] = b"UBMDv2\0\0";
 
-/// An object's metadata: its byte length plus a small set of opaque
-/// key/value pairs.
+/// Whether the origin object existed when the metadata entry was fetched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObjectState {
+    #[default]
+    Found,
+    NotFound,
+}
+
+/// An object's metadata: its state, byte length when found, cache expiry,
+/// plus a small set of opaque key/value pairs.
 ///
 /// The key/value pairs are passed through unchanged between a backend
 /// and a frontend; this crate attaches no semantics to them and does
@@ -51,6 +61,18 @@ const BLOB_LEN_PREFIX: usize = 8;
 pub struct ObjectMetadata {
     pub length: u64,
     pub entries: BTreeMap<String, String>,
+    #[serde(default)]
+    pub state: ObjectState,
+    #[serde(default)]
+    pub expires_at_unix_secs: Option<u64>,
+    #[serde(skip)]
+    decoded_from_legacy: bool,
+}
+
+#[derive(Deserialize)]
+struct LegacyObjectMetadata {
+    length: u64,
+    entries: BTreeMap<String, String>,
 }
 
 impl ObjectMetadata {
@@ -60,6 +82,27 @@ impl ObjectMetadata {
         Self {
             length,
             entries: BTreeMap::new(),
+            state: ObjectState::Found,
+            expires_at_unix_secs: None,
+            decoded_from_legacy: false,
+        }
+    }
+
+    /// Construct positive metadata with an absolute expiry timestamp.
+    pub fn found(length: u64, expires_at_unix_secs: u64) -> Self {
+        let mut meta = Self::new(length);
+        meta.expires_at_unix_secs = Some(expires_at_unix_secs);
+        meta
+    }
+
+    /// Construct cacheable negative metadata for an object missing at origin.
+    pub fn not_found(expires_at_unix_secs: u64) -> Self {
+        Self {
+            length: 0,
+            entries: BTreeMap::new(),
+            state: ObjectState::NotFound,
+            expires_at_unix_secs: Some(expires_at_unix_secs),
+            decoded_from_legacy: false,
         }
     }
 
@@ -84,6 +127,27 @@ impl ObjectMetadata {
         self.entries.is_empty()
     }
 
+    pub fn is_found(&self) -> bool {
+        self.state == ObjectState::Found
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        self.state == ObjectState::NotFound
+    }
+
+    pub fn decoded_from_legacy(&self) -> bool {
+        self.decoded_from_legacy
+    }
+
+    pub fn cache_valid_at(&self, now_unix_secs: u64) -> bool {
+        if self.decoded_from_legacy {
+            return false;
+        }
+        self.expires_at_unix_secs
+            .map(|expires| expires > now_unix_secs)
+            .unwrap_or(true)
+    }
+
     /// Encode into the on-page byte layout: an 8-byte little-endian
     /// payload-length prefix followed by the bincode payload. The
     /// caller writes this into the metadata entry's page (zero-filling
@@ -92,8 +156,10 @@ impl ObjectMetadata {
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         let blob = bincode::serialize(self)
             .map_err(|_| Error::from("storage metadata: bincode serialize failed"))?;
-        let mut out = Vec::with_capacity(BLOB_LEN_PREFIX + blob.len());
-        out.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+        let blob_len = WIRE_V2_MAGIC.len() + blob.len();
+        let mut out = Vec::with_capacity(BLOB_LEN_PREFIX + blob_len);
+        out.extend_from_slice(&(blob_len as u64).to_le_bytes());
+        out.extend_from_slice(WIRE_V2_MAGIC);
         out.extend_from_slice(&blob);
         Ok(out)
     }
@@ -114,8 +180,21 @@ impl ObjectMetadata {
         if end > page.len() {
             return Err(Error::from("storage metadata: blob length exceeds page"));
         }
-        bincode::deserialize(&page[BLOB_LEN_PREFIX..end])
-            .map_err(|_| Error::from("storage metadata: malformed bincode payload"))
+        let blob = &page[BLOB_LEN_PREFIX..end];
+        if let Some(payload) = blob.strip_prefix(WIRE_V2_MAGIC) {
+            return bincode::deserialize(payload)
+                .map_err(|_| Error::from("storage metadata: malformed bincode payload"));
+        }
+
+        let legacy: LegacyObjectMetadata = bincode::deserialize(blob)
+            .map_err(|_| Error::from("storage metadata: malformed bincode payload"))?;
+        Ok(ObjectMetadata {
+            length: legacy.length,
+            entries: legacy.entries,
+            state: ObjectState::Found,
+            expires_at_unix_secs: None,
+            decoded_from_legacy: true,
+        })
     }
 }
 
@@ -154,6 +233,43 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_found_with_expiry() {
+        let mut m = ObjectMetadata::found(8192, 1234);
+        m.insert("etag", "abc");
+
+        let decoded = ObjectMetadata::decode(&m.encode().unwrap()).unwrap();
+
+        assert_eq!(decoded, m);
+        assert!(decoded.is_found());
+        assert!(!decoded.is_not_found());
+        assert_eq!(decoded.expires_at_unix_secs, Some(1234));
+        assert!(decoded.cache_valid_at(1233));
+        assert!(!decoded.cache_valid_at(1234));
+    }
+
+    #[test]
+    fn round_trips_negative_metadata() {
+        let m = ObjectMetadata::not_found(42);
+
+        let decoded = ObjectMetadata::decode(&m.encode().unwrap()).unwrap();
+
+        assert_eq!(decoded, m);
+        assert!(decoded.is_not_found());
+        assert!(!decoded.is_found());
+        assert_eq!(decoded.length, 0);
+        assert!(decoded.cache_valid_at(41));
+        assert!(!decoded.cache_valid_at(42));
+    }
+
+    #[test]
+    fn non_expiring_new_metadata_is_valid() {
+        let m = ObjectMetadata::new(1);
+
+        assert!(m.cache_valid_at(0));
+        assert!(m.cache_valid_at(u64::MAX));
+    }
+
+    #[test]
     fn encoding_is_deterministic_regardless_of_insertion_order() {
         let mut a = ObjectMetadata::new(7);
         a.insert("b", "2");
@@ -184,6 +300,38 @@ mod tests {
         page.resize(4096, 0);
         let decoded = ObjectMetadata::decode(&page).unwrap();
         assert_eq!(decoded, m);
+    }
+
+    #[test]
+    fn decode_legacy_payload_as_expired_found_metadata() {
+        #[derive(Serialize)]
+        struct LegacyWire {
+            length: u64,
+            entries: BTreeMap<String, String>,
+        }
+
+        let mut entries = BTreeMap::new();
+        entries.insert("etag".to_string(), "legacy".to_string());
+        let legacy = LegacyWire {
+            length: 77,
+            entries,
+        };
+        let blob = bincode::serialize(&legacy).unwrap();
+        let mut page = Vec::new();
+        page.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+        page.extend_from_slice(&blob);
+        page.resize(4096, 0);
+
+        let decoded = ObjectMetadata::decode(&page).unwrap();
+
+        assert_eq!(decoded.length, 77);
+        assert_eq!(decoded.get("etag"), Some("legacy"));
+        assert!(decoded.is_found());
+        assert!(!decoded.is_not_found());
+        assert!(decoded.decoded_from_legacy());
+        assert_eq!(decoded.expires_at_unix_secs, None);
+        assert!(!decoded.cache_valid_at(0));
+        assert!(!decoded.cache_valid_at(u64::MAX));
     }
 
     #[test]

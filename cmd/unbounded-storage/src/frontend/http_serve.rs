@@ -864,7 +864,12 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
         Some(Err(e)) => return classify_len_error(e),
         None => return LenResult::Other,
     };
-    match ObjectMetadata::decode(page.as_slice()) {
+    len_result_from_metadata_page(page.as_slice())
+}
+
+fn len_result_from_metadata_page(page: &[u8]) -> LenResult {
+    match ObjectMetadata::decode(page) {
+        Ok(meta) if meta.is_not_found() => LenResult::NotFound,
         Ok(meta) => LenResult::Len(meta.length),
         Err(e) => classify_len_error(e),
     }
@@ -1350,6 +1355,19 @@ mod tests {
         ));
 
         assert_eq!(result, LenResult::Other);
+    }
+
+    #[test]
+    fn metadata_page_len_result_handles_positive_and_negative_metadata() {
+        let found = ObjectMetadata::found(123, 10).encode().unwrap();
+        let not_found = ObjectMetadata::not_found(10).encode().unwrap();
+
+        assert_eq!(len_result_from_metadata_page(&found), LenResult::Len(123));
+        assert_eq!(
+            len_result_from_metadata_page(&not_found),
+            LenResult::NotFound
+        );
+        assert_eq!(len_result_from_metadata_page(&[0u8; 4]), LenResult::Other);
     }
 
     #[test]

@@ -23,6 +23,8 @@ include!(concat!(env!("OUT_DIR"), "/unbounded.storage.config.rs"));
 
 const DEFAULT_STRIPE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_HTTP_CONCURRENCY: u32 = 64;
+const DEFAULT_METADATA_TTL_SECS: u64 = 60;
+const DEFAULT_NOT_FOUND_TTL_SECS: u64 = 5;
 pub const DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION: u32 = 1024;
 const DEFAULT_FAKE_OBJECT_SIZE_BYTES: u64 = 1024 * 1024;
 
@@ -89,15 +91,30 @@ impl Config {
 impl BackendSpec {
     fn apply_defaults(&mut self) {
         match self.config.as_mut() {
-            Some(backend_spec::Config::Http(cfg)) => {
-                apply_http_backend_defaults(&mut cfg.stripe_size_bytes, &mut cfg.http_concurrency)
-            }
-            Some(backend_spec::Config::S3(cfg)) => {
-                apply_http_backend_defaults(&mut cfg.stripe_size_bytes, &mut cfg.http_concurrency)
-            }
-            Some(backend_spec::Config::Azure(cfg)) => {
-                apply_http_backend_defaults(&mut cfg.stripe_size_bytes, &mut cfg.http_concurrency)
-            }
+            Some(backend_spec::Config::Http(cfg)) => apply_http_backend_defaults(
+                &mut cfg.stripe_size_bytes,
+                &mut cfg.http_concurrency,
+                &mut cfg.metadata_ttl_default_secs,
+                &mut cfg.metadata_ttl_max_secs,
+                &mut cfg.not_found_ttl_default_secs,
+                &mut cfg.not_found_ttl_max_secs,
+            ),
+            Some(backend_spec::Config::S3(cfg)) => apply_http_backend_defaults(
+                &mut cfg.stripe_size_bytes,
+                &mut cfg.http_concurrency,
+                &mut cfg.metadata_ttl_default_secs,
+                &mut cfg.metadata_ttl_max_secs,
+                &mut cfg.not_found_ttl_default_secs,
+                &mut cfg.not_found_ttl_max_secs,
+            ),
+            Some(backend_spec::Config::Azure(cfg)) => apply_http_backend_defaults(
+                &mut cfg.stripe_size_bytes,
+                &mut cfg.http_concurrency,
+                &mut cfg.metadata_ttl_default_secs,
+                &mut cfg.metadata_ttl_max_secs,
+                &mut cfg.not_found_ttl_default_secs,
+                &mut cfg.not_found_ttl_max_secs,
+            ),
             Some(backend_spec::Config::Fake(cfg)) => {
                 cfg.stripe_size_bytes
                     .get_or_insert(DEFAULT_STRIPE_SIZE_BYTES);
@@ -269,9 +286,17 @@ impl FrontendSpec {
 fn apply_http_backend_defaults(
     stripe_size_bytes: &mut Option<u64>,
     http_concurrency: &mut Option<u32>,
+    metadata_ttl_default_secs: &mut Option<u64>,
+    metadata_ttl_max_secs: &mut Option<u64>,
+    not_found_ttl_default_secs: &mut Option<u64>,
+    not_found_ttl_max_secs: &mut Option<u64>,
 ) {
     stripe_size_bytes.get_or_insert(DEFAULT_STRIPE_SIZE_BYTES);
     http_concurrency.get_or_insert(DEFAULT_HTTP_CONCURRENCY);
+    metadata_ttl_default_secs.get_or_insert(DEFAULT_METADATA_TTL_SECS);
+    metadata_ttl_max_secs.get_or_insert(DEFAULT_METADATA_TTL_SECS);
+    not_found_ttl_default_secs.get_or_insert(DEFAULT_NOT_FOUND_TTL_SECS);
+    not_found_ttl_max_secs.get_or_insert(DEFAULT_NOT_FOUND_TTL_SECS);
 }
 
 impl StartupCfg {
@@ -562,6 +587,10 @@ http_concurrency = 32
 ca_cert_path = "/etc/unbounded-storage/origin-ca.pem"
 client_cert_path = "/etc/unbounded-storage/client.pem"
 client_key_path = "/etc/unbounded-storage/client-key.pem"
+metadata_ttl_default_secs = 45
+metadata_ttl_max_secs = 90
+not_found_ttl_default_secs = 3
+not_found_ttl_max_secs = 7
 
 [[frontends]]
 name = "workload-http"
@@ -585,6 +614,10 @@ max_requests_per_connection = 256
                     cfg.ca_cert_path.as_deref(),
                     Some("/etc/unbounded-storage/origin-ca.pem")
                 );
+                assert_eq!(cfg.metadata_ttl_default_secs, Some(45));
+                assert_eq!(cfg.metadata_ttl_max_secs, Some(90));
+                assert_eq!(cfg.not_found_ttl_default_secs, Some(3));
+                assert_eq!(cfg.not_found_ttl_max_secs, Some(7));
                 assert!(!cfg.insecure_skip_verify);
                 assert_eq!(
                     cfg.client_cert_path.as_deref(),
@@ -641,6 +674,16 @@ url = "https://example.com"
             backend_spec::Config::Http(cfg) => {
                 assert_eq!(cfg.stripe_size_bytes, Some(4 * 1024 * 1024));
                 assert_eq!(cfg.http_concurrency, Some(64));
+                assert_eq!(
+                    cfg.metadata_ttl_default_secs,
+                    Some(DEFAULT_METADATA_TTL_SECS)
+                );
+                assert_eq!(cfg.metadata_ttl_max_secs, Some(DEFAULT_METADATA_TTL_SECS));
+                assert_eq!(
+                    cfg.not_found_ttl_default_secs,
+                    Some(DEFAULT_NOT_FOUND_TTL_SECS)
+                );
+                assert_eq!(cfg.not_found_ttl_max_secs, Some(DEFAULT_NOT_FOUND_TTL_SECS));
                 assert_eq!(cfg.ca_cert_path, None);
                 assert!(!cfg.insecure_skip_verify);
                 assert_eq!(cfg.client_cert_path, None);

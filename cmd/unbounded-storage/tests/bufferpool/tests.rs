@@ -363,6 +363,7 @@ fn stream_limit_rejects_excess_concurrent_reads() {
         max_io_delay: 4,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        reject_cache_hits: false,
         max_concurrent_streams: 1,
         max_inflight_pages: 4,
         key_count: 1,
@@ -467,6 +468,7 @@ fn regression_freelist_deadlock_under_faults() {
         max_io_delay: 1,
         io_fault_rate: 3,
         cache_hit_rate: 0,
+        reject_cache_hits: false,
         max_concurrent_streams: 1024,
         max_inflight_pages: 4,
         key_count: 2,
@@ -523,6 +525,7 @@ fn smoke() {
         max_io_delay: 2,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        reject_cache_hits: false,
         max_concurrent_streams: 1024,
         max_inflight_pages: 4,
         key_count: 2,
@@ -575,6 +578,7 @@ fn all_cache_hits_skip_bulk_get_and_tee() {
         max_io_delay: 2,
         io_fault_rate: 0,
         cache_hit_rate: 100,
+        reject_cache_hits: false,
         max_concurrent_streams: 1024,
         max_inflight_pages: 4,
         key_count: 2,
@@ -677,6 +681,7 @@ fn cached_pages_do_not_deadlock_contended_heads() {
             exec.spawn(async move {
                 let req = TestReq {
                     key: StripeKey([idx; 32]),
+                    reject_cache_hits: false,
                 };
                 let mut stream = p.read(&req, 0, PAGE_SIZE as u64).await.unwrap();
                 let got = stream
@@ -708,6 +713,7 @@ fn cached_pages_do_not_deadlock_contended_heads() {
             exec.spawn(async move {
                 let req = TestReq {
                     key: StripeKey([idx; 32]),
+                    reject_cache_hits: false,
                 };
                 let mut stream = p.read(&req, 0, PAGE_SIZE as u64).await.unwrap();
                 let guard = stream.next_page().await.unwrap().unwrap();
@@ -798,6 +804,7 @@ fn prefetch_evicts_idle_cached_pages() {
             exec.spawn(async move {
                 let req = TestReq {
                     key: StripeKey([idx; 32]),
+                    reject_cache_hits: false,
                 };
                 let mut stream = p.read(&req, 0, PAGE_SIZE as u64).await.unwrap();
                 let _ = stream.next_page().await.unwrap().unwrap();
@@ -814,6 +821,7 @@ fn prefetch_evicts_idle_cached_pages() {
         exec.spawn(async move {
             let req = TestReq {
                 key: StripeKey([3; 32]),
+                reject_cache_hits: false,
             };
             let mut read = p
                 .read_windowed(&req, 0, (PAGE_SIZE * 2) as u64, 2)
@@ -853,6 +861,77 @@ fn prefetch_evicts_idle_cached_pages() {
     }
 }
 
+/// Scenario test: a cache hit whose request-level validity check fails
+/// must behave like a miss. This pins the bounded-staleness path used by
+/// metadata expiry: multiple concurrent readers may all see the stale hit,
+/// but the pool must still single-flight the replacement fetch and drain
+/// cleanly.
+#[test]
+fn rejected_cache_hits_refetch_without_deadlock() {
+    let w = Workload {
+        page_size: 128,
+        page_count: 3,
+        max_io_delay: 3,
+        io_fault_rate: 0,
+        cache_hit_rate: 100,
+        reject_cache_hits: true,
+        max_concurrent_streams: 1024,
+        max_inflight_pages: 3,
+        key_count: 1,
+        clients: vec![
+            ClientSpec {
+                key_idx: 0,
+                offset: 0,
+                len: 384,
+                cancel_after: None,
+                window: None,
+            },
+            ClientSpec {
+                key_idx: 0,
+                offset: 0,
+                len: 384,
+                cancel_after: None,
+                window: Some(2),
+            },
+            ClientSpec {
+                key_idx: 0,
+                offset: 0,
+                len: 128,
+                cancel_after: None,
+                window: None,
+            },
+        ],
+        pipelines: Vec::new(),
+    };
+
+    for seed in [0u64, 1, 7, 42, 1234] {
+        let report = run_workload(seed, w.clone()).expect("must not deadlock");
+        assert!(
+            report.bulk_get_calls > 0,
+            "stale hits must fall through to transport at seed {seed}"
+        );
+        for o in &report.outcomes {
+            match o {
+                ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
+                other => panic!("unexpected outcome at seed {seed}: {other:?}"),
+            }
+        }
+        for ((key, page), max) in &report.bulk_get_max_inflight {
+            assert!(
+                *max <= 1,
+                "key {:?} page {page} had {max} concurrent replacement fetches at seed {seed}",
+                key.0,
+            );
+        }
+        assert_quiescent_accounting(&report, 3)
+            .expect("quiescent accounting after rejected cache hits");
+        assert_eq!(
+            report.prefetch_inflight_at_end, 0,
+            "prefetch budget leak at seed {seed}"
+        );
+    }
+}
+
 /// Scenario test: a mix of clients where some drop their
 /// `ReadStream` mid-iteration. Asserts that cancellation drains
 /// cleanly even when the cancelling client never observes EOF.
@@ -867,6 +946,7 @@ fn cancellation_drains_to_clean_state() {
         max_io_delay: 2,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        reject_cache_hits: false,
         max_concurrent_streams: 1024,
         max_inflight_pages: 4,
         key_count: 2,
@@ -940,6 +1020,7 @@ fn windowed_read_in_order_and_drains() {
         max_io_delay: 3,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        reject_cache_hits: false,
         max_concurrent_streams: 1024,
         max_inflight_pages: 4,
         key_count: 1,
@@ -990,6 +1071,7 @@ fn regression_windowed_cancel_under_pressure() {
         max_io_delay: 3,
         io_fault_rate: 0,
         cache_hit_rate: 10,
+        reject_cache_hits: false,
         max_concurrent_streams: 1024,
         max_inflight_pages: 1,
         key_count: 2,
@@ -1053,6 +1135,7 @@ fn windowed_under_free_list_pressure_drains() {
         max_io_delay: 3,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        reject_cache_hits: false,
         max_concurrent_streams: 1024,
         max_inflight_pages: 3,
         key_count: 2,
@@ -1127,6 +1210,7 @@ fn regression_windowed_speculation_starves_head() {
         max_io_delay: 2,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        reject_cache_hits: false,
         max_concurrent_streams: 1024,
         max_inflight_pages: 5,
         key_count: 2,
@@ -1181,6 +1265,7 @@ fn pipelined_multi_stripe_in_order_and_drains() {
         max_io_delay: 3,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        reject_cache_hits: false,
         max_concurrent_streams: 1024,
         max_inflight_pages: 6,
         key_count: 3,
@@ -1242,6 +1327,7 @@ fn pipelined_under_free_list_pressure_drains() {
         max_io_delay: 3,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        reject_cache_hits: false,
         max_concurrent_streams: 1024,
         max_inflight_pages: 4,
         key_count: 3,
