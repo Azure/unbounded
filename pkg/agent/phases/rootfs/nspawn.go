@@ -75,9 +75,9 @@ type nspawnTemplateData struct {
 	BPFFSMountPath       string
 	HostDevicePaths      []string
 	NvidiaGPUDevicePaths []string
+	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
 	AMDGPUDevicePaths    []string
 	AMDSysFSPaths        []string
-	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
 }
 
 // writeNSpawnConfigs renders the nspawn and service-override templates with
@@ -94,9 +94,9 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		BPFFSMountPath:       goalstates.BPFFSMountPath(machineName),
 		HostDevicePaths:      hostDevicePaths,
 		NvidiaGPUDevicePaths: e.goalState.Nvidia.GPUDevicePaths,
+		NvidiaLibDirMounts:   e.goalState.Nvidia.LibDirMounts,
 		AMDGPUDevicePaths:    amdGPUDevicePaths,
 		AMDSysFSPaths:        e.goalState.AMD.SysFSPaths,
-		NvidiaLibDirMounts:   e.goalState.Nvidia.LibDirMounts,
 	}
 
 	if len(hostDevicePaths) > 0 {
