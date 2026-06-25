@@ -7,14 +7,16 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
-	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
 	"oras.land/oras-go/v2/registry/remote"
+	"oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/retry"
 
 	"github.com/Azure/unbounded/internal/ociutil"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
@@ -25,18 +27,6 @@ const (
 	ociPullMaxAttempts = 5
 	ociPullRetryDelay  = 2 * time.Second
 )
-
-var sleepBeforeOCIPullRetry = func(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
 
 type downloadRootFS struct {
 	log        *slog.Logger
@@ -112,11 +102,10 @@ func (d *downloadRootFS) pullAndUnpack(ctx context.Context, ref, tag string) err
 
 	// Use plain HTTP for loopback and private-network registries.
 	ociutil.ConfigurePlainHTTP(repo)
+	configureOCIPullRetry(repo)
 
 	// Copy (pull) the image from the remote repository into the local OCI layout.
-	desc, err := d.copyImageWithRetry(ctx, fmt.Sprintf("%s:%s", ref, tag), func(ctx context.Context) (ispec.Descriptor, error) {
-		return oras.Copy(ctx, repo, tag, store, tag, oras.DefaultCopyOptions)
-	})
+	desc, err := oras.Copy(ctx, repo, tag, store, tag, oras.DefaultCopyOptions)
 	if err != nil {
 		return fmt.Errorf("pull image %s:%s: %w", ref, tag, err)
 	}
@@ -140,46 +129,58 @@ func (d *downloadRootFS) pullAndUnpack(ctx context.Context, ref, tag string) err
 	return nil
 }
 
-func (d *downloadRootFS) copyImageWithRetry(
-	ctx context.Context,
-	image string,
-	copyImage func(context.Context) (ispec.Descriptor, error),
-) (ispec.Descriptor, error) {
+func configureOCIPullRetry(repo *remote.Repository) {
+	repo.Client = &auth.Client{
+		Client: &http.Client{
+			Transport: &retry.Transport{
+				Policy: func() retry.Policy {
+					return newOCIPullRetryPolicy()
+				},
+			},
+		},
+		Header: auth.DefaultClient.Header.Clone(),
+		Cache:  auth.DefaultCache,
+	}
+}
+
+func newOCIPullRetryPolicy() retry.Policy {
+	return &retry.GenericPolicy{
+		Retryable: retryOCIPullFailure,
+		Backoff:   ociPullBackoff,
+		MinWait:   ociPullRetryDelay,
+		MaxWait:   maxOCIPullRetryDelay(),
+		MaxRetry:  ociPullMaxAttempts - 1,
+	}
+}
+
+func retryOCIPullFailure(resp *http.Response, err error) (bool, error) {
+	if err != nil {
+		return true, nil
+	}
+
+	if resp == nil {
+		return false, nil
+	}
+
+	return retry.DefaultPredicate(resp, nil)
+}
+
+func ociPullBackoff(attempt int, _ *http.Response) time.Duration {
 	delay := ociPullRetryDelay
-
-	var lastErr error
-
-	for attempt := 1; attempt <= ociPullMaxAttempts; attempt++ {
-		desc, err := copyImage(ctx)
-		if err == nil {
-			return desc, nil
-		}
-
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ispec.Descriptor{}, ctxErr
-		}
-
-		lastErr = err
-
-		if attempt == ociPullMaxAttempts {
-			break
-		}
-
-		d.log.Warn("pull OCI image failed, retrying",
-			slog.String("image", image),
-			slog.Int("attempt", attempt),
-			slog.Int("maxAttempts", ociPullMaxAttempts),
-			slog.Duration("retryDelay", delay),
-			slog.Any("error", err))
-
-		if err := sleepBeforeOCIPullRetry(ctx, delay); err != nil {
-			return ispec.Descriptor{}, err
-		}
-
+	for range attempt {
 		delay *= 2
 	}
 
-	return ispec.Descriptor{}, lastErr
+	return delay
+}
+
+func maxOCIPullRetryDelay() time.Duration {
+	delay := ociPullRetryDelay
+	for range ociPullMaxAttempts - 2 {
+		delay *= 2
+	}
+
+	return delay
 }
 
 // parseImageReference splits an OCI image reference like

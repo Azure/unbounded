@@ -4,132 +4,81 @@
 package oci
 
 import (
-	"context"
 	"errors"
-	"io"
-	"log/slog"
+	"net/http"
 	"testing"
 	"time"
 
-	ispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"oras.land/oras-go/v2/registry/remote"
+	"oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/retry"
 )
 
-func TestCopyImageWithRetrySucceedsAfterTemporaryFailures(t *testing.T) {
-	origSleep := sleepBeforeOCIPullRetry
+func TestConfigureOCIPullRetryUsesORASRetryClient(t *testing.T) {
+	repo := &remote.Repository{}
+	configureOCIPullRetry(repo)
 
-	t.Cleanup(func() {
-		sleepBeforeOCIPullRetry = origSleep
-	})
-
-	var delays []time.Duration
-
-	sleepBeforeOCIPullRetry = func(_ context.Context, delay time.Duration) error {
-		delays = append(delays, delay)
-		return nil
+	authClient, ok := repo.Client.(*auth.Client)
+	if !ok {
+		t.Fatalf("repo.Client = %T, want *auth.Client", repo.Client)
 	}
 
-	task := &downloadRootFS{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	want := ispec.Descriptor{MediaType: "application/vnd.oci.image.manifest.v1+json"}
+	transport, ok := authClient.Client.Transport.(*retry.Transport)
+	if !ok {
+		t.Fatalf("auth client transport = %T, want *retry.Transport", authClient.Client.Transport)
+	}
 
-	attempts := 0
+	if transport.Policy == nil {
+		t.Fatal("retry transport policy is nil")
+	}
+}
 
-	desc, err := task.copyImageWithRetry(context.Background(), "example.test/rootfs:latest", func(context.Context) (ispec.Descriptor, error) {
-		attempts++
-		if attempts < 3 {
-			return ispec.Descriptor{}, errors.New("temporary DNS failure")
-		}
+func TestOCIPullRetryPolicyRetriesTransportErrors(t *testing.T) {
+	policy := newOCIPullRetryPolicy()
 
-		return want, nil
-	})
+	delay, err := policy.Retry(0, nil, errors.New("lookup registry.example.test: no such host"))
 	if err != nil {
-		t.Fatalf("copyImageWithRetry returned error: %v", err)
+		t.Fatalf("policy.Retry returned error: %v", err)
 	}
 
-	if desc.MediaType != want.MediaType {
-		t.Fatalf("copyImageWithRetry descriptor = %#v, want %#v", desc, want)
+	if delay != ociPullRetryDelay {
+		t.Fatalf("retry delay = %v, want %v", delay, ociPullRetryDelay)
 	}
 
-	if attempts != 3 {
-		t.Fatalf("copyImageWithRetry attempts = %d, want 3", attempts)
+	delay, err = policy.Retry(ociPullMaxAttempts-1, nil, errors.New("lookup registry.example.test: no such host"))
+	if err != nil {
+		t.Fatalf("policy.Retry at max attempts returned error: %v", err)
 	}
 
-	wantDelays := []time.Duration{2 * time.Second, 4 * time.Second}
-	if !equalDurations(delays, wantDelays) {
-		t.Fatalf("retry delays = %v, want %v", delays, wantDelays)
-	}
-}
-
-func TestCopyImageWithRetryReturnsLastError(t *testing.T) {
-	origSleep := sleepBeforeOCIPullRetry
-
-	t.Cleanup(func() {
-		sleepBeforeOCIPullRetry = origSleep
-	})
-
-	sleepBeforeOCIPullRetry = func(context.Context, time.Duration) error {
-		return nil
-	}
-
-	task := &downloadRootFS{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	wantErr := errors.New("manifest not found")
-
-	attempts := 0
-	_, err := task.copyImageWithRetry(context.Background(), "example.test/rootfs:missing", func(context.Context) (ispec.Descriptor, error) {
-		attempts++
-		return ispec.Descriptor{}, wantErr
-	})
-
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("copyImageWithRetry error = %v, want %v", err, wantErr)
-	}
-
-	if attempts != ociPullMaxAttempts {
-		t.Fatalf("copyImageWithRetry attempts = %d, want %d", attempts, ociPullMaxAttempts)
+	if delay >= 0 {
+		t.Fatalf("retry delay at max attempts = %v, want negative", delay)
 	}
 }
 
-func TestCopyImageWithRetryHonorsContextCancellation(t *testing.T) {
-	origSleep := sleepBeforeOCIPullRetry
+func TestOCIPullRetryPolicyUsesORASStatusPredicate(t *testing.T) {
+	policy := newOCIPullRetryPolicy()
 
-	t.Cleanup(func() {
-		sleepBeforeOCIPullRetry = origSleep
-	})
-
-	sleepBeforeOCIPullRetry = func(ctx context.Context, _ time.Duration) error {
-		return ctx.Err()
+	delay, err := policy.Retry(0, &http.Response{StatusCode: http.StatusServiceUnavailable}, nil)
+	if err != nil {
+		t.Fatalf("policy.Retry for 503 returned error: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	task := &downloadRootFS{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-
-	attempts := 0
-	_, err := task.copyImageWithRetry(ctx, "example.test/rootfs:latest", func(context.Context) (ispec.Descriptor, error) {
-		attempts++
-
-		cancel()
-
-		return ispec.Descriptor{}, errors.New("temporary DNS failure")
-	})
-
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("copyImageWithRetry error = %v, want %v", err, context.Canceled)
+	if delay != ociPullRetryDelay {
+		t.Fatalf("retry delay for 503 = %v, want %v", delay, ociPullRetryDelay)
 	}
 
-	if attempts != 1 {
-		t.Fatalf("copyImageWithRetry attempts = %d, want 1", attempts)
+	delay, err = policy.Retry(0, &http.Response{StatusCode: http.StatusNotFound}, nil)
+	if err != nil {
+		t.Fatalf("policy.Retry for 404 returned error: %v", err)
+	}
+
+	if delay >= 0 {
+		t.Fatalf("retry delay for 404 = %v, want negative", delay)
 	}
 }
 
-func equalDurations(got, want []time.Duration) bool {
-	if len(got) != len(want) {
-		return false
+func TestMaxOCIPullRetryDelay(t *testing.T) {
+	if got, want := maxOCIPullRetryDelay(), 16*time.Second; got != want {
+		t.Fatalf("maxOCIPullRetryDelay() = %v, want %v", got, want)
 	}
-
-	for i := range got {
-		if got[i] != want[i] {
-			return false
-		}
-	}
-
-	return true
 }
