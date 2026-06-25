@@ -42,6 +42,7 @@ use unbounded_storage::memory::{BackingKind, BackingRequest, allocate};
 use unbounded_storage::metrics;
 
 mod fabric_group;
+mod rdma_inventory;
 mod shard_layer;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
@@ -418,6 +419,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let rdma_inventory = metrics::RdmaInventoryStatus::new();
+    rdma_inventory.set_json(rdma_inventory::to_json(
+        &host,
+        &layer.fabric_unit_addresses(),
+    ));
 
     // Reconcile the startup disk set now that the shards are up, then
     // publish the channel set so shards can reach their disks.
@@ -448,7 +454,12 @@ fn main() -> ExitCode {
     let metrics_exporter = if metrics_bind.is_empty() {
         None
     } else {
-        match metrics::spawn(&metrics_bind, controller.config_versions(), &SHUTDOWN) {
+        match metrics::spawn(
+            &metrics_bind,
+            controller.config_versions(),
+            rdma_inventory,
+            &SHUTDOWN,
+        ) {
             Ok(handle) => {
                 eprintln!("metrics: exporter listening on {metrics_bind}");
                 Some(handle)

@@ -35,12 +35,12 @@ type renderState struct {
 //
 // The per-node sections (neighborhood local_node_id and discovered peer sets)
 // come from state, computed from the Kubernetes node watch. When the ring is
-// active, this node's id is injected into every declared neighborhood,
+// active, this node's id is injected into every declared neighborhood, and
 // discovered peers are merged with any neighborhood peers declared in the YAML
-// (discovered peers win on id collision), and startup.fabric.tcp.addr is
-// overridden with the node's own routable bind. The default disk pool is
-// populated from the self node's storage disk annotations, or from a default
-// file-backed disk when no valid annotation disks are present.
+// (discovered peers win on id collision). TCP rings also override
+// startup.fabric.tcp.addr with the node's own routable bind. The default disk
+// pool is populated from the self node's storage disk annotations, or from a
+// default file-backed disk when no valid annotation disks are present.
 func RenderConfig(sourceDir string, state renderState) ([]byte, error) {
 	cfg, err := loadSourceConfig(sourceDir)
 	if err != nil {
@@ -102,7 +102,8 @@ func loadSourceConfig(sourceDir string) (*storageconfig.Config, error) {
 // applyRing overlays the per-node ring state onto a Config parsed from the
 // ConfigMap YAML. It injects this node's local id into declared neighborhoods,
 // merges the discovered peer set with each neighborhood's declared peers, and
-// rebinds the TCP fabric address to the node's own routable address.
+// rebinds the TCP fabric address to the node's own routable address when the
+// ring includes a TCP selfListenAddr.
 func applyRing(cfg *storageconfig.Config, ring ringState) {
 	injected := false
 

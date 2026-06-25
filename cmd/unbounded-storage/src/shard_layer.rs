@@ -41,7 +41,7 @@ use unbounded_storage::storage::disks::{CacheDirectorySet, DiskRegistrySet, Urin
 use unbounded_storage::topology::ServingShard;
 
 use crate::StartupSettings;
-use crate::fabric_group::{FabricGroup, FabricPlan};
+use crate::fabric_group::{FabricGroup, FabricPlan, FabricUnitAddress};
 
 /// Inputs that are constant across the life of the process and used to
 /// spawn the shard layer. Cloned cheaply into every shard thread.
@@ -94,6 +94,12 @@ pub struct ShardLayer {
     /// strictly after all joins, so no ring ever references unmapped
     /// memory.
     _backing_keepalives: Vec<Arc<dyn Send + Sync>>,
+}
+
+impl ShardLayer {
+    pub fn fabric_unit_addresses(&self) -> Vec<FabricUnitAddress> {
+        self.fabric_group.unit_addresses()
+    }
 }
 
 /// Bring up a shard layer from `config` on the runtime in `deps`,

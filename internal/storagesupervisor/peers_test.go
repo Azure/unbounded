@@ -176,6 +176,55 @@ func TestComputeRingSingleMember(t *testing.T) {
 	assert.Empty(t, ring.peers)
 }
 
+func TestComputeRDMARingMembership(t *testing.T) {
+	nodes := []*corev1.Node{
+		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:self"]}]}`,
+		}),
+		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:a"]}]}`,
+		}),
+		nodeWithAnnotations("peer-b", "red", "10.0.0.3", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_1","addrs":["hex:b1","hex:b2"]}]}`,
+		}),
+		nodeWithAnnotations("no-rdma", "red", "10.0.0.4", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[]}`,
+		}),
+		nodeWithAnnotations("invalid", "red", "10.0.0.5", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":2,"hcas":[]}`,
+		}),
+		nodeWithAnnotations("other", "blue", "10.0.0.6", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:other"]}]}`,
+		}),
+	}
+
+	ring := computeRDMARing(nodes, "self", testRingLabel)
+
+	require.True(t, ring.active)
+	assert.Equal(t, nodeID("self"), ring.localNodeID)
+	assert.Empty(t, ring.selfListenAddr)
+	require.Len(t, ring.peers, 2)
+
+	got := map[uint64]string{}
+	for _, p := range ring.peers {
+		got[p.GetId()] = p.GetRdma().GetAddr()
+	}
+
+	assert.Equal(t, "hex:a", got[nodeID("peer-a")])
+	assert.Equal(t, "hex:b1", got[nodeID("peer-b")])
+	assert.NotContains(t, got, ring.localNodeID)
+}
+
+func TestComputeRDMARingSingleMember(t *testing.T) {
+	nodes := []*corev1.Node{node("self", "red", "")}
+
+	ring := computeRDMARing(nodes, "self", testRingLabel)
+
+	require.True(t, ring.active)
+	assert.Equal(t, nodeID("self"), ring.localNodeID)
+	assert.Empty(t, ring.peers)
+}
+
 func TestNewPeerWatcherDisabledWithoutNodeName(t *testing.T) {
 	// No NodeName means peer discovery is disabled; the run loop falls back to
 	// startup-only rendering.
@@ -234,6 +283,36 @@ func TestPeerWatcherSnapshotFromInformer(t *testing.T) {
 	require.Len(t, ring.peers, 1)
 	assert.Equal(t, nodeID("peer-a"), ring.peers[0].GetId())
 	assert.Equal(t, "10.0.0.2:9000", ring.peers[0].GetTcp().GetAddr())
+}
+
+func TestPeerWatcherSnapshotRdmaFromInformer(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:self"]}]}`,
+		}),
+		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:a"]}]}`,
+		}),
+	)
+
+	w, err := newPeerWatcher(Config{
+		NodeName:         "self",
+		StorageRingLabel: testRingLabel,
+	}, cs)
+	require.NoError(t, err)
+	require.NotNil(t, w)
+
+	defer w.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, w.Start(ctx))
+
+	state := w.snapshotRdma()
+	require.True(t, state.ring.active)
+	require.Len(t, state.ring.peers, 1)
+	assert.Equal(t, "hex:a", state.ring.peers[0].GetRdma().GetAddr())
 }
 
 func TestPeerWatcherSnapshotIncludesSelfAnnotations(t *testing.T) {

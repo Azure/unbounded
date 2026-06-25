@@ -59,6 +59,15 @@ func tcpPeer(id uint64, addr string) *storageconfig.PeerSpec {
 	}
 }
 
+func rdmaPeer(id uint64, addr string) *storageconfig.PeerSpec {
+	return &storageconfig.PeerSpec{
+		Id: id,
+		Config: &storageconfig.PeerSpec_Rdma{
+			Rdma: &storageconfig.RdmaPeerConfig{Addr: addr},
+		},
+	}
+}
+
 func TestRenderConfigFullSchema(t *testing.T) {
 	dir := writeSource(t, `
 version: 7
@@ -305,6 +314,40 @@ neighborhoods:
 	assert.Equal(t, uint64(9), neighborhood.GetPeers()[1].GetId())
 	assert.Equal(t, uint64(100), neighborhood.GetPeers()[2].GetId())
 	assert.Equal(t, "10.0.0.100:9000", neighborhood.GetPeers()[2].GetTcp().GetAddr())
+}
+
+func TestRenderConfigActiveRDMARingPreservesStartupFabric(t *testing.T) {
+	dir := writeSource(t, `
+startup:
+  fabric:
+    auto_rdma:
+      hcas_per_numa_node: 2
+    max_inflight: 2048
+backends:
+  - name: origin
+    fake: {}
+neighborhoods:
+  - name: edge
+    source: origin
+`)
+
+	ring := ringState{
+		active:      true,
+		localNodeID: 42,
+		peers: []*storageconfig.PeerSpec{
+			rdmaPeer(7, "hex:peer"),
+		},
+	}
+
+	cfg := decodeWithState(t, dir, renderState{ring: ring})
+
+	assert.NotNil(t, cfg.GetStartup().GetFabric().GetAutoRdma())
+	assert.Equal(t, uint64(2), cfg.GetStartup().GetFabric().GetAutoRdma().GetHcasPerNumaNode())
+	assert.Nil(t, cfg.GetStartup().GetFabric().GetTcp())
+	require.Len(t, cfg.GetNeighborhoods(), 1)
+	assert.Equal(t, uint64(42), cfg.GetNeighborhoods()[0].GetLocalNodeId())
+	require.Len(t, cfg.GetNeighborhoods()[0].GetPeers(), 1)
+	assert.Equal(t, "hex:peer", cfg.GetNeighborhoods()[0].GetPeers()[0].GetRdma().GetAddr())
 }
 
 func TestRenderConfigActiveRingWarnsWithoutNeighborhoods(t *testing.T) {

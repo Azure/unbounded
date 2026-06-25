@@ -160,14 +160,7 @@ func (w *peerWatcher) signal() {
 // returned when the ring is inactive.
 func (w *peerWatcher) snapshot(port int, portOK bool) renderState {
 	objs := w.informer.GetStore().List()
-
-	nodes := make([]*corev1.Node, 0, len(objs))
-
-	for _, obj := range objs {
-		if n, ok := obj.(*corev1.Node); ok {
-			nodes = append(nodes, n)
-		}
-	}
+	nodes := nodesFromInformerObjects(objs)
 
 	state := renderState{annotations: selfAnnotations(nodes, w.selfName)}
 	if !portOK || port == 0 {
@@ -180,6 +173,32 @@ func (w *peerWatcher) snapshot(port int, portOK bool) renderState {
 	state.ring = computeRing(nodes, w.selfName, w.ringLabel, port)
 
 	return state
+}
+
+// snapshotRdma computes render state for RDMA fabrics. Local bind addresses are
+// owned by the daemon's auto-RDMA/explicit-RDMA startup config, so unlike TCP
+// this does not override startup.fabric; it only injects local_node_id and peer
+// RDMA addresses published by other supervisors.
+func (w *peerWatcher) snapshotRdma() renderState {
+	objs := w.informer.GetStore().List()
+	nodes := nodesFromInformerObjects(objs)
+
+	return renderState{
+		annotations: selfAnnotations(nodes, w.selfName),
+		ring:        computeRDMARing(nodes, w.selfName, w.ringLabel),
+	}
+}
+
+func nodesFromInformerObjects(objs []any) []*corev1.Node {
+	nodes := make([]*corev1.Node, 0, len(objs))
+
+	for _, obj := range objs {
+		if n, ok := obj.(*corev1.Node); ok {
+			nodes = append(nodes, n)
+		}
+	}
+
+	return nodes
 }
 
 // computeRing is the pure core of peer discovery: given the ring-labelled
@@ -262,6 +281,83 @@ func computeRing(nodes []*corev1.Node, selfName, ringLabel string, port int) rin
 			Id: id,
 			Config: &storageconfig.PeerSpec_Tcp{
 				Tcp: &storageconfig.TcpPeerConfig{Addr: net.JoinHostPort(ip, strconv.Itoa(port))},
+			},
+		})
+	}
+
+	sort.Slice(ring.peers, func(i, j int) bool { return ring.peers[i].Id < ring.peers[j].Id })
+
+	return ring
+}
+
+// computeRDMARing mirrors computeRing's label-membership and stable-id rules,
+// but peers are dialed through their published RDMA HCA inventory annotation.
+// The daemon config currently models one RDMA address per peer id, so discovery
+// chooses the first address from each peer's full HCA inventory.
+func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState {
+	var self *corev1.Node
+
+	for _, n := range nodes {
+		if n.Name == selfName {
+			self = n
+
+			break
+		}
+	}
+
+	if self == nil {
+		slog.Warn("storage ring inactive: this node not found among watched nodes", "node", selfName)
+
+		return ringState{}
+	}
+
+	ringValue, ok := self.Labels[ringLabel]
+	if !ok || ringValue == "" {
+		return ringState{}
+	}
+
+	localID := nodeID(selfName)
+	ring := ringState{
+		active:      true,
+		localNodeID: localID,
+	}
+	seen := map[uint64]string{localID: selfName}
+
+	for _, n := range nodes {
+		if n.Name == selfName {
+			continue
+		}
+
+		if n.Labels[ringLabel] != ringValue {
+			continue
+		}
+
+		addr, err := firstRdmaInventoryAddr(n.Annotations[storageRdmaHcasAnnotation])
+		if err != nil {
+			slog.Warn("skipping storage ring peer with invalid rdma inventory", "peer", n.Name, "ring", ringValue, "error", err)
+
+			continue
+		}
+
+		if addr == "" {
+			slog.Warn("skipping storage ring peer with no rdma address", "peer", n.Name, "ring", ringValue)
+
+			continue
+		}
+
+		id := nodeID(n.Name)
+		if other, dup := seen[id]; dup {
+			slog.Warn("skipping storage ring peer: node id collision",
+				"peer", n.Name, "collides_with", other, "id", id)
+
+			continue
+		}
+
+		seen[id] = n.Name
+		ring.peers = append(ring.peers, &storageconfig.PeerSpec{
+			Id: id,
+			Config: &storageconfig.PeerSpec_Rdma{
+				Rdma: &storageconfig.RdmaPeerConfig{Addr: addr},
 			},
 		})
 	}

@@ -66,6 +66,17 @@ pub struct FabricPlan {
     pub shard_to_unit: Vec<usize>,
 }
 
+/// Fabric address published by a live unit after libfabric bind/listen
+/// completed. These are the addresses peers must dial; configured bind
+/// strings are not sufficient for verbs because libfabric owns the native
+/// address encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FabricUnitAddress {
+    pub device_name: String,
+    pub rdma: bool,
+    pub addr: String,
+}
+
 /// Decide how serving shards map onto fabric endpoints. This function is
 /// THE tcp/verbs seam (see the module docs).
 ///
@@ -228,6 +239,9 @@ struct FabricUnit<S = RpcServerHandle, Rg = BackendRegistry, Rt = RouteTableHand
     handler_registry: Rg,
     routes: Rt,
     fabric: F,
+    device_name: String,
+    rdma: bool,
+    self_addr: String,
     hca_numa: Option<u16>,
     applied_peers: HashMap<PeerId, ConnectionSpec>,
     last_backends: HashMap<String, BackendSpec>,
@@ -302,6 +316,18 @@ impl FabricGroup {
     pub fn fabric_for_shard(&self, shard: usize) -> Arc<Fabric> {
         let unit = self.shard_to_unit[shard];
         self.units[unit].fabric.clone()
+    }
+
+    /// Live local addresses for every fabric unit in deterministic unit order.
+    pub fn unit_addresses(&self) -> Vec<FabricUnitAddress> {
+        self.units
+            .iter()
+            .map(|unit| FabricUnitAddress {
+                device_name: unit.device_name.clone(),
+                rdma: unit.rdma,
+                addr: unit.self_addr.clone(),
+            })
+            .collect()
     }
 
     /// Reload every endpoint's RPC-handler routing from a new snapshot.
@@ -492,6 +518,9 @@ fn build_unit(
         handler_registry,
         routes,
         fabric,
+        device_name: spec.device_name.clone(),
+        rdma: spec.provider == Provider::Verbs,
+        self_addr,
         hca_numa: spec.numa,
         applied_peers,
         last_backends,
@@ -711,6 +740,9 @@ mod tests {
             handler_registry: DropToken::new("handler_registry", &log),
             routes: DropToken::new("routes", &log),
             fabric: DropToken::new("fabric", &log),
+            device_name: "mlx5_0".to_string(),
+            rdma: true,
+            self_addr: "hex:01".to_string(),
             hca_numa: None,
             applied_peers: HashMap::new(),
             last_backends: HashMap::new(),
