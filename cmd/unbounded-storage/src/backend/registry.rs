@@ -132,8 +132,13 @@ impl BuildCtx {
     fn build(&self, spec: &BackendSpec) -> io::Result<OriginBackend> {
         match spec.config.as_ref() {
             Some(backend_spec::Config::Http(cfg)) => {
-                let endpoint =
-                    build_origin_endpoint(&cfg.url, &cfg.ca_cert_path, cfg.insecure_skip_verify)?;
+                let endpoint = build_origin_endpoint(
+                    &cfg.url,
+                    &cfg.ca_cert_path,
+                    cfg.insecure_skip_verify,
+                    &cfg.client_cert_path,
+                    &cfg.client_key_path,
+                )?;
                 let origin = HttpBackend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::Http(HttpBackend::new(
                     self.ring.clone(),
@@ -149,8 +154,13 @@ impl BuildCtx {
                 )))
             }
             Some(backend_spec::Config::S3(cfg)) => {
-                let endpoint =
-                    build_origin_endpoint(&cfg.url, &cfg.ca_cert_path, cfg.insecure_skip_verify)?;
+                let endpoint = build_origin_endpoint(
+                    &cfg.url,
+                    &cfg.ca_cert_path,
+                    cfg.insecure_skip_verify,
+                    &cfg.client_cert_path,
+                    &cfg.client_key_path,
+                )?;
                 let origin = S3Backend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::S3(S3Backend::new(
                     self.ring.clone(),
@@ -166,8 +176,13 @@ impl BuildCtx {
                 )))
             }
             Some(backend_spec::Config::Azure(cfg)) => {
-                let endpoint =
-                    build_origin_endpoint(&cfg.url, &cfg.ca_cert_path, cfg.insecure_skip_verify)?;
+                let endpoint = build_origin_endpoint(
+                    &cfg.url,
+                    &cfg.ca_cert_path,
+                    cfg.insecure_skip_verify,
+                    &cfg.client_cert_path,
+                    &cfg.client_key_path,
+                )?;
                 let origin = AzureBackend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::Azure(AzureBackend::new(
                     self.ring.clone(),
@@ -208,6 +223,8 @@ fn build_origin_endpoint(
     url: &str,
     ca_cert_path: &Option<String>,
     insecure_skip_verify: bool,
+    client_cert_path: &Option<String>,
+    client_key_path: &Option<String>,
 ) -> io::Result<OriginEndpoint> {
     let url = parse_endpoint(url)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
@@ -216,6 +233,8 @@ fn build_origin_endpoint(
         let cfg = TlsConfig {
             ca_cert_path: ca_cert_path.clone(),
             insecure_skip_verify,
+            client_cert_path: client_cert_path.clone(),
+            client_key_path: client_key_path.clone(),
         };
         let ctx = TlsContext::new(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
         Some(Rc::new(ctx))
@@ -340,6 +359,8 @@ mod tests {
                 http_concurrency: Some(64),
                 ca_cert_path: None,
                 insecure_skip_verify: false,
+                client_cert_path: None,
+                client_key_path: None,
             })),
         }
     }

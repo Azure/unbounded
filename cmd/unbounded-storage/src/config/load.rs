@@ -78,6 +78,7 @@ pub enum ConfigError {
         reason: String,
     },
     ConflictingTlsConfig(String),
+    IncompleteTlsClientAuth(String),
     PlaintextTlsConfig(String),
     EmptyFrontendAddr(String),
     StripeSizeNotPowerOfTwo {
@@ -184,10 +185,13 @@ impl fmt::Display for ConfigError {
                 f,
                 "backend {name:?}: ca_cert_path and insecure_skip_verify are mutually exclusive"
             ),
-            ConfigError::PlaintextTlsConfig(name) => write!(
+            ConfigError::IncompleteTlsClientAuth(name) => write!(
                 f,
-                "backend {name:?}: ca_cert_path and insecure_skip_verify require an https url"
+                "backend {name:?}: client_cert_path and client_key_path must be set together"
             ),
+            ConfigError::PlaintextTlsConfig(name) => {
+                write!(f, "backend {name:?}: TLS settings require an https url")
+            }
             ConfigError::EmptyFrontendAddr(id) => {
                 write!(f, "frontend {id:?}: addr must not be empty")
             }
@@ -302,6 +306,8 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
                     &cfg.url,
                     &cfg.ca_cert_path,
                     cfg.insecure_skip_verify,
+                    &cfg.client_cert_path,
+                    &cfg.client_key_path,
                 )?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
@@ -311,6 +317,8 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
                     &cfg.url,
                     &cfg.ca_cert_path,
                     cfg.insecure_skip_verify,
+                    &cfg.client_cert_path,
+                    &cfg.client_key_path,
                 )?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
@@ -320,6 +328,8 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
                     &cfg.url,
                     &cfg.ca_cert_path,
                     cfg.insecure_skip_verify,
+                    &cfg.client_cert_path,
+                    &cfg.client_key_path,
                 )?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
@@ -400,6 +410,8 @@ fn validate_backend_url(
     url: &str,
     ca_cert_path: &Option<String>,
     insecure_skip_verify: bool,
+    client_cert_path: &Option<String>,
+    client_key_path: &Option<String>,
 ) -> Result<(), ConfigError> {
     if url.is_empty() {
         return Err(ConfigError::EmptyBackendUrl(backend_name.to_string()));
@@ -413,7 +425,17 @@ fn validate_backend_url(
     if ca_cert_path.is_some() && insecure_skip_verify {
         return Err(ConfigError::ConflictingTlsConfig(backend_name.to_string()));
     }
-    if !parsed.scheme.is_tls() && (ca_cert_path.is_some() || insecure_skip_verify) {
+    if client_cert_path.is_some() != client_key_path.is_some() {
+        return Err(ConfigError::IncompleteTlsClientAuth(
+            backend_name.to_string(),
+        ));
+    }
+    if !parsed.scheme.is_tls()
+        && (ca_cert_path.is_some()
+            || insecure_skip_verify
+            || client_cert_path.is_some()
+            || client_key_path.is_some())
+    {
         return Err(ConfigError::PlaintextTlsConfig(backend_name.to_string()));
     }
 
@@ -1295,6 +1317,58 @@ name = "b"
 [backends.config.http]
 url = "http://e"
 insecure_skip_verify = true
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::PlaintextTlsConfig(name)) if name == "b" => {}
+            other => panic!("expected PlaintextTlsConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_client_cert_without_client_key() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "https://e"
+client_cert_path = "/etc/client.pem"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::IncompleteTlsClientAuth(name)) if name == "b" => {}
+            other => panic!("expected IncompleteTlsClientAuth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_client_key_without_client_cert() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "https://e"
+client_key_path = "/etc/client-key.pem"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::IncompleteTlsClientAuth(name)) if name == "b" => {}
+            other => panic!("expected IncompleteTlsClientAuth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_client_auth_on_plaintext_url() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "http://e"
+client_cert_path = "/etc/client.pem"
+client_key_path = "/etc/client-key.pem"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {

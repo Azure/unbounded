@@ -195,6 +195,9 @@ struct Metrics {
 
 static METRICS: OnceLock<Metrics> = OnceLock::new();
 
+#[cfg(test)]
+static RENDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Build, register, and install the process-global metric registry.
 /// Idempotent: a second call is a no-op so tests that touch the metrics
 /// surface can call it freely. Records the immutable `build_info` series.
@@ -864,15 +867,9 @@ fn status_str(status: u16) -> &'static str {
 mod tests {
     use super::*;
 
-    // The metric registry is a process-global singleton, so tests that
-    // render and assert on exact gauge values must not run concurrently
-    // with one another (a parallel render mutating the same config_version
-    // gauge would race). This lock serializes those tests.
-    static RENDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn init_is_idempotent_and_render_contains_build_info() {
-        let _guard = RENDER_LOCK.lock().unwrap();
+        let _guard = super::RENDER_LOCK.lock().unwrap();
         init();
         init();
         let versions = ConfigVersionStatus::new(7);
@@ -885,7 +882,7 @@ mod tests {
 
     #[test]
     fn helpers_move_their_series() {
-        let _guard = RENDER_LOCK.lock().unwrap();
+        let _guard = super::RENDER_LOCK.lock().unwrap();
         init();
         frontend_request("fe", "GET", 200, 4096, 0.001);
         bufferpool_request(Lookup::Hit);
@@ -908,7 +905,7 @@ mod tests {
 
     #[test]
     fn config_version_series_track_the_handle() {
-        let _guard = RENDER_LOCK.lock().unwrap();
+        let _guard = super::RENDER_LOCK.lock().unwrap();
         init();
         let versions = ConfigVersionStatus::new(3);
         let text = String::from_utf8(render(&versions)).unwrap();

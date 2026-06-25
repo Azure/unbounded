@@ -1457,8 +1457,13 @@ type HttpBackendConfig struct {
 	CaCertPath *string `protobuf:"bytes,4,opt,name=ca_cert_path,json=caCertPath,proto3,oneof" json:"ca_cert_path,omitempty"`
 	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
 	InsecureSkipVerify bool `protobuf:"varint,5,opt,name=insecure_skip_verify,json=insecureSkipVerify,proto3" json:"insecure_skip_verify,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Optional PEM client certificate presented for TLS client authentication on `https://` origins.
+	// Must be set together with client_key_path.
+	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
+	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
+	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HttpBackendConfig) Reset() {
@@ -1526,6 +1531,20 @@ func (x *HttpBackendConfig) GetInsecureSkipVerify() bool {
 	return false
 }
 
+func (x *HttpBackendConfig) GetClientCertPath() string {
+	if x != nil && x.ClientCertPath != nil {
+		return *x.ClientCertPath
+	}
+	return ""
+}
+
+func (x *HttpBackendConfig) GetClientKeyPath() string {
+	if x != nil && x.ClientKeyPath != nil {
+		return *x.ClientKeyPath
+	}
+	return ""
+}
+
 type S3BackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// S3-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses
@@ -1540,8 +1559,13 @@ type S3BackendConfig struct {
 	CaCertPath *string `protobuf:"bytes,4,opt,name=ca_cert_path,json=caCertPath,proto3,oneof" json:"ca_cert_path,omitempty"`
 	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
 	InsecureSkipVerify bool `protobuf:"varint,5,opt,name=insecure_skip_verify,json=insecureSkipVerify,proto3" json:"insecure_skip_verify,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Optional PEM client certificate presented for TLS client authentication on `https://` origins.
+	// Must be set together with client_key_path.
+	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
+	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
+	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *S3BackendConfig) Reset() {
@@ -1609,6 +1633,20 @@ func (x *S3BackendConfig) GetInsecureSkipVerify() bool {
 	return false
 }
 
+func (x *S3BackendConfig) GetClientCertPath() string {
+	if x != nil && x.ClientCertPath != nil {
+		return *x.ClientCertPath
+	}
+	return ""
+}
+
+func (x *S3BackendConfig) GetClientKeyPath() string {
+	if x != nil && x.ClientKeyPath != nil {
+		return *x.ClientKeyPath
+	}
+	return ""
+}
+
 type AzureBackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Azure Blob-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://`
@@ -1623,8 +1661,13 @@ type AzureBackendConfig struct {
 	CaCertPath *string `protobuf:"bytes,4,opt,name=ca_cert_path,json=caCertPath,proto3,oneof" json:"ca_cert_path,omitempty"`
 	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
 	InsecureSkipVerify bool `protobuf:"varint,5,opt,name=insecure_skip_verify,json=insecureSkipVerify,proto3" json:"insecure_skip_verify,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Optional PEM client certificate presented for TLS client authentication on `https://` origins.
+	// Must be set together with client_key_path.
+	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
+	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
+	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AzureBackendConfig) Reset() {
@@ -1690,6 +1733,20 @@ func (x *AzureBackendConfig) GetInsecureSkipVerify() bool {
 		return x.InsecureSkipVerify
 	}
 	return false
+}
+
+func (x *AzureBackendConfig) GetClientCertPath() string {
+	if x != nil && x.ClientCertPath != nil {
+		return *x.ClientCertPath
+	}
+	return ""
+}
+
+func (x *AzureBackendConfig) GetClientKeyPath() string {
+	if x != nil && x.ClientKeyPath != nil {
+		return *x.ClientKeyPath
+	}
+	return ""
 }
 
 type FakeBackendConfig struct {
@@ -2218,37 +2275,49 @@ const file_config_proto_rawDesc = "" +
 	"\x02s3\x18\x03 \x01(\v2).unbounded.storage.config.S3BackendConfigH\x00R\x02s3\x12D\n" +
 	"\x05azure\x18\x04 \x01(\v2,.unbounded.storage.config.AzureBackendConfigH\x00R\x05azure\x12A\n" +
 	"\x04fake\x18\x05 \x01(\v2+.unbounded.storage.config.FakeBackendConfigH\x00R\x04fakeB\b\n" +
-	"\x06config\"\x9b\x02\n" +
+	"\x06config\"\xa0\x03\n" +
 	"\x11HttpBackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
 	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12%\n" +
 	"\fca_cert_path\x18\x04 \x01(\tH\x02R\n" +
 	"caCertPath\x88\x01\x01\x120\n" +
-	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerifyB\x14\n" +
+	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
+	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
+	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
 	"\x11_http_concurrencyB\x0f\n" +
-	"\r_ca_cert_path\"\x99\x02\n" +
+	"\r_ca_cert_pathB\x13\n" +
+	"\x11_client_cert_pathB\x12\n" +
+	"\x10_client_key_path\"\x9e\x03\n" +
 	"\x0fS3BackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
 	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12%\n" +
 	"\fca_cert_path\x18\x04 \x01(\tH\x02R\n" +
 	"caCertPath\x88\x01\x01\x120\n" +
-	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerifyB\x14\n" +
+	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
+	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
+	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
 	"\x11_http_concurrencyB\x0f\n" +
-	"\r_ca_cert_path\"\x9c\x02\n" +
+	"\r_ca_cert_pathB\x13\n" +
+	"\x11_client_cert_pathB\x12\n" +
+	"\x10_client_key_path\"\xa1\x03\n" +
 	"\x12AzureBackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
 	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12%\n" +
 	"\fca_cert_path\x18\x04 \x01(\tH\x02R\n" +
 	"caCertPath\x88\x01\x01\x120\n" +
-	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerifyB\x14\n" +
+	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
+	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
+	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
 	"\x11_http_concurrencyB\x0f\n" +
-	"\r_ca_cert_path\"\xa1\x01\n" +
+	"\r_ca_cert_pathB\x13\n" +
+	"\x11_client_cert_pathB\x12\n" +
+	"\x10_client_key_path\"\xa1\x01\n" +
 	"\x11FakeBackendConfig\x12/\n" +
 	"\x11stripe_size_bytes\x18\x01 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12/\n" +
 	"\x11object_size_bytes\x18\x02 \x01(\x04H\x01R\x0fobjectSizeBytes\x88\x01\x01B\x14\n" +

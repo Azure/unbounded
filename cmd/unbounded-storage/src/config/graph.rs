@@ -263,6 +263,8 @@ mod tests {
                 http_concurrency: Some(64),
                 ca_cert_path: None,
                 insecure_skip_verify: false,
+                client_cert_path: None,
+                client_key_path: None,
             })),
         }
     }
