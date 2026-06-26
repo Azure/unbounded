@@ -215,10 +215,23 @@ impl<B: BlockDevice> BTreeIndex<B> {
         scratch: Rc<ScratchPool>,
         btree_page_bytes: usize,
         skip_recovery_scan_if_no_meta: bool,
+        force_format: bool,
     ) -> Result<Self, Error> {
         // Reserve the meta slots regardless of disk state.
         let _ = allocator.mark_in_use(page::META_SLOT_A);
         let _ = allocator.mark_in_use(page::META_SLOT_B);
+
+        if force_format {
+            return Self::bootstrap_from_entries(
+                device,
+                allocator,
+                scratch,
+                btree_page_bytes,
+                1,
+                BTreeMap::new(),
+            )
+            .await;
+        }
 
         let loaded = meta::load_meta(&*device, &scratch).await?;
         if let Some(state) = loaded {
@@ -431,6 +444,13 @@ impl<B: BlockDevice> BTreeIndex<B> {
             key,
         )
         .await
+    }
+
+    /// Benchmark-only lookup path backed by the committed in-memory
+    /// mirror. This skips the terminal leaf read, so it must not be used
+    /// for production recovery/corruption semantics.
+    pub fn lookup_committed_mirror(&self, key: &PageKey) -> Option<LeafEntry> {
+        self.mutator.borrow().entries.get(key).copied()
     }
 
     /// Apply a batch of mutations atomically. Must be called by

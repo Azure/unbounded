@@ -815,7 +815,7 @@ where
                     // A bypass request bridges straight to the origin:
                     // skip the local-disk lookup so the miss path always
                     // drives the transport (which forces the origin too).
-                    let hit = if req.as_ref().bypass() {
+                    let hit = if req.as_ref().bypass() || req.as_ref().skip_local_disk() {
                         false
                     } else {
                         inner
@@ -878,7 +878,7 @@ where
                 // across the tee via `tee_pending` plus the
                 // leader's `ConsumerHold`.
                 // A bypass request never admits to the disk cache.
-                let need_tee = !hit && !req.as_ref().bypass();
+                let need_tee = !hit && !req.as_ref().bypass() && !req.as_ref().skip_local_disk();
                 if need_tee {
                     slot.tee_pending.set(true);
                 }

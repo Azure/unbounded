@@ -22,9 +22,10 @@ Before the agent can expose GPUs, the **host VM** must have:
 4. **Persistence mode enabled.** `nvidia-smi -pm 1` keeps the driver loaded
    between GPU process invocations and avoids cold-start latency.
 
-The GPU OCI images (`agent-ubuntu2404-nvidia`, `agent-ubuntu2604-nvidia`)
-include the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`)
-but **not** the kernel driver or userspace libraries. Those come from the host.
+The GPU OCI images (`agent-ubuntu2404-nvidia`, `agent-ubuntu2604-nvidia`,
+`agent-azlinux3-nvidia`) include the NVIDIA Container Toolkit (`nvidia-ctk`,
+`nvidia-container-runtime`) but **not** the kernel driver or userspace
+libraries. Those come from the host.
 
 ## How It Works
 
@@ -66,8 +67,9 @@ select the correct multiarch library path and `ldconfig` filter:
 
 ## GPU OCI Image
 
-The GPU rootfs images (`images/agent-ubuntu2404-nvidia/Containerfile` and
-`images/agent-ubuntu2604-nvidia/Containerfile`) extend the standard Ubuntu base
+The GPU rootfs images (`images/agent-ubuntu2404-nvidia/Containerfile`,
+`images/agent-ubuntu2604-nvidia/Containerfile`, and
+`images/agent-azlinux3-nvidia/Containerfile`) extend the standard agent base
 images with the NVIDIA Container Toolkit:
 
 - `nvidia-container-runtime`: OCI runtime wrapper that injects GPU devices.

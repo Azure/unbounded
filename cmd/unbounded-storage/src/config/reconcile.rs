@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use crate::fabric::PeerId;
 use crate::fabric::{ConnectionSpec, Fabric, FabricError};
-
 use super::apply::peer_spec_to_connection;
 use super::schema::{BackendSpec, FrontendSpec, PeerSpec};
 
@@ -43,7 +42,7 @@ impl PeerReconcileTarget for Arc<Fabric> {
 #[derive(Debug, Default)]
 pub struct ApplyReport {
     pub applied: usize,
-    pub failures: Vec<(u64, String)>,
+    pub failures: Vec<(PeerId, String)>,
 }
 
 /// Outcome of one [`reconcile_peers`] pass. `applied` is the map the
@@ -62,9 +61,10 @@ pub struct ReconcileReport {
 pub fn apply_peers_startup(target: &dyn PeerReconcileTarget, peers: &[PeerSpec]) -> ApplyReport {
     let mut report = ApplyReport::default();
     for p in peers {
-        match target.add(peer_spec_to_connection(p)) {
+        let spec = peer_spec_to_connection(p);
+        match target.add(spec.clone()) {
             Ok(()) => report.applied += 1,
-            Err(e) => report.failures.push((p.id, e.to_string())),
+            Err(e) => report.failures.push((spec.peer, e.to_string())),
         }
     }
     report
@@ -624,12 +624,35 @@ mod tests {
         HttpBackendConfig, HttpFrontendConfig, TcpPeerConfig, backend_spec, frontend_spec,
         peer_spec,
     };
+    use crate::p2p::node_id_from_name;
     use std::cell::RefCell;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Op {
         Add(u64),
         Remove(u64),
+    }
+
+    fn peer_id(id: u64) -> u64 {
+        node_id_from_name(&format!("node-{id}")).0
+    }
+
+    fn peer_key(id: u64) -> PeerId {
+        PeerId(peer_id(id))
+    }
+
+    fn add(id: u64) -> Op {
+        Op::Add(peer_id(id))
+    }
+
+    fn added(ids: &[u64]) -> Vec<Op> {
+        let mut ids: Vec<u64> = ids.iter().map(|id| peer_id(*id)).collect();
+        ids.sort_unstable();
+        ids.into_iter().map(Op::Add).collect()
+    }
+
+    fn remove(id: u64) -> Op {
+        Op::Remove(peer_id(id))
     }
 
     struct MockTarget {
@@ -643,19 +666,19 @@ mod tests {
         fn new(initial: &[u64]) -> Self {
             Self {
                 ops: RefCell::new(Vec::new()),
-                present: RefCell::new(initial.iter().map(|i| PeerId(*i)).collect()),
+                present: RefCell::new(initial.iter().map(|i| peer_key(*i)).collect()),
                 fail_add_on: None,
                 fail_remove_on: None,
             }
         }
 
         fn with_add_failure(mut self, id: u64) -> Self {
-            self.fail_add_on = Some(id);
+            self.fail_add_on = Some(peer_id(id));
             self
         }
 
         fn with_remove_failure(mut self, id: u64) -> Self {
-            self.fail_remove_on = Some(id);
+            self.fail_remove_on = Some(peer_id(id));
             self
         }
     }
@@ -686,7 +709,7 @@ mod tests {
 
     fn peer(id: u64) -> PeerSpec {
         PeerSpec {
-            id,
+            name: format!("node-{id}"),
             tags: Vec::new(),
             config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
                 addr: format!("10.0.0.{id}:9000"),
@@ -696,7 +719,7 @@ mod tests {
 
     fn peer_addr(id: u64, addr: &str) -> PeerSpec {
         PeerSpec {
-            id,
+            name: format!("node-{id}"),
             tags: Vec::new(),
             config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
                 addr: addr.to_string(),
@@ -706,7 +729,7 @@ mod tests {
 
     fn peer_tags(id: u64, tags: &[&str]) -> PeerSpec {
         PeerSpec {
-            id,
+            name: format!("node-{id}"),
             tags: tags.iter().map(|s| s.to_string()).collect(),
             config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
                 addr: format!("10.0.0.{id}:9000"),
@@ -721,7 +744,7 @@ mod tests {
         let r = apply_peers_startup(&t, &peers);
         assert_eq!(r.applied, 3);
         assert!(r.failures.is_empty());
-        assert_eq!(*t.ops.borrow(), vec![Op::Add(1), Op::Add(2), Op::Add(3)]);
+        assert_eq!(*t.ops.borrow(), vec![add(1), add(2), add(3)]);
     }
 
     #[test]
@@ -731,8 +754,8 @@ mod tests {
         let r = apply_peers_startup(&t, &peers);
         assert_eq!(r.applied, 2);
         assert_eq!(r.failures.len(), 1);
-        assert_eq!(r.failures[0].0, 2);
-        assert_eq!(*t.ops.borrow(), vec![Op::Add(1), Op::Add(2), Op::Add(3)]);
+        assert_eq!(r.failures[0].0, peer_key(2));
+        assert_eq!(*t.ops.borrow(), vec![add(1), add(2), add(3)]);
     }
 
     #[test]
@@ -754,7 +777,7 @@ mod tests {
         assert_eq!(r.updated, 0);
         assert!(r.failures.is_empty());
         assert_eq!(r.applied.len(), 3);
-        assert_eq!(*t.ops.borrow(), vec![Op::Add(1), Op::Add(2), Op::Add(3)]);
+        assert_eq!(*t.ops.borrow(), added(&[1, 2, 3]));
     }
 
     #[test]
@@ -766,15 +789,15 @@ mod tests {
         assert_eq!(r.removed, 1);
         assert_eq!(r.updated, 0);
         assert!(r.failures.is_empty());
-        assert_eq!(*t.ops.borrow(), vec![Op::Remove(1), Op::Add(4)]);
+        assert_eq!(*t.ops.borrow(), vec![remove(1), add(4)]);
     }
 
     #[test]
     fn reconcile_steady_state_is_noop() {
         let t = MockTarget::new(&[1, 2]);
         let mut prev = HashMap::new();
-        prev.insert(PeerId(1), peer_spec_to_connection(&peer(1)));
-        prev.insert(PeerId(2), peer_spec_to_connection(&peer(2)));
+        prev.insert(peer_key(1), peer_spec_to_connection(&peer(1)));
+        prev.insert(peer_key(2), peer_spec_to_connection(&peer(2)));
         let peers = vec![peer(1), peer(2)];
         let r = reconcile_peers(&t, &peers, Some(&prev));
         assert_eq!(r.added, 0);
@@ -789,16 +812,16 @@ mod tests {
     fn reconcile_detects_address_drift_as_update() {
         let t = MockTarget::new(&[1]);
         let mut prev = HashMap::new();
-        prev.insert(PeerId(1), peer_spec_to_connection(&peer_addr(1, "a:1")));
+        prev.insert(peer_key(1), peer_spec_to_connection(&peer_addr(1, "a:1")));
         let peers = vec![peer_addr(1, "b:2")];
         let r = reconcile_peers(&t, &peers, Some(&prev));
         assert_eq!(r.added, 0);
         assert_eq!(r.removed, 0);
         assert_eq!(r.updated, 1);
         assert!(r.failures.is_empty());
-        assert_eq!(*t.ops.borrow(), vec![Op::Remove(1), Op::Add(1)]);
+        assert_eq!(*t.ops.borrow(), vec![remove(1), add(1)]);
         assert_eq!(
-            r.applied[&PeerId(1)].address,
+            r.applied[&peer_key(1)].address,
             crate::fabric::FabricAddress::socket("b:2")
         );
     }
@@ -811,7 +834,7 @@ mod tests {
         let t = MockTarget::new(&[1]);
         let mut prev = HashMap::new();
         prev.insert(
-            PeerId(1),
+            peer_key(1),
             peer_spec_to_connection(&peer_tags(1, &["us-west"])),
         );
         let peers = vec![peer_tags(1, &["us-east", "rack9"])];
@@ -821,18 +844,18 @@ mod tests {
         assert_eq!(r.updated, 1);
         assert!(r.failures.is_empty());
         // The connection was churned via remove-then-add.
-        assert_eq!(*t.ops.borrow(), vec![Op::Remove(1), Op::Add(1)]);
+        assert_eq!(*t.ops.borrow(), vec![remove(1), add(1)]);
         // Applied state carries the freshest desired tags.
         assert_eq!(
-            r.applied[&PeerId(1)].tags,
+            r.applied[&peer_key(1)].tags,
             vec!["us-east".to_string(), "rack9".to_string()]
         );
         // Address/HCA are unchanged.
         assert_eq!(
-            r.applied[&PeerId(1)].address,
+            r.applied[&peer_key(1)].address,
             crate::fabric::FabricAddress::socket("10.0.0.1:9000")
         );
-        assert_eq!(r.applied[&PeerId(1)].hca_numa, None);
+        assert_eq!(r.applied[&peer_key(1)].hca_numa, None);
     }
 
     #[test]
@@ -842,11 +865,11 @@ mod tests {
         let r = reconcile_peers(&t, &peers, None);
         assert_eq!(r.added, 2);
         assert_eq!(r.failures.len(), 1);
-        assert_eq!(r.failures[0].0, PeerId(2));
+        assert_eq!(r.failures[0].0, peer_key(2));
         assert!(r.failures[0].1.starts_with("add: "));
-        assert!(r.applied.contains_key(&PeerId(1)));
-        assert!(!r.applied.contains_key(&PeerId(2)));
-        assert!(r.applied.contains_key(&PeerId(3)));
+        assert!(r.applied.contains_key(&peer_key(1)));
+        assert!(!r.applied.contains_key(&peer_key(2)));
+        assert!(r.applied.contains_key(&peer_key(3)));
     }
 
     #[test]
@@ -856,20 +879,20 @@ mod tests {
         // next pass re-detects the drift.
         let t = MockTarget::new(&[1]).with_remove_failure(1);
         let mut prev = HashMap::new();
-        prev.insert(PeerId(1), peer_spec_to_connection(&peer_addr(1, "a:1")));
+        prev.insert(peer_key(1), peer_spec_to_connection(&peer_addr(1, "a:1")));
         let peers = vec![peer_addr(1, "b:2")];
         let r = reconcile_peers(&t, &peers, Some(&prev));
         assert_eq!(r.updated, 0);
         assert_eq!(r.added, 0);
         assert_eq!(r.removed, 0);
         assert_eq!(r.failures.len(), 1);
-        assert_eq!(r.failures[0].0, PeerId(1));
+        assert_eq!(r.failures[0].0, peer_key(1));
         assert!(r.failures[0].1.starts_with("update-remove:"));
         assert_eq!(
-            r.applied[&PeerId(1)].address,
+            r.applied[&peer_key(1)].address,
             crate::fabric::FabricAddress::socket("a:1")
         );
-        assert_eq!(*t.ops.borrow(), vec![Op::Remove(1)]);
+        assert_eq!(*t.ops.borrow(), vec![remove(1)]);
 
         // Second pass: with the recovered remove, drift detection
         // must fire again using the carried-forward old spec.
@@ -879,10 +902,10 @@ mod tests {
         assert_eq!(r2.updated, 1);
         assert!(r2.failures.is_empty());
         assert_eq!(
-            r2.applied[&PeerId(1)].address,
+            r2.applied[&peer_key(1)].address,
             crate::fabric::FabricAddress::socket("b:2")
         );
-        assert_eq!(*t2.ops.borrow(), vec![Op::Remove(1), Op::Add(1)]);
+        assert_eq!(*t2.ops.borrow(), vec![remove(1), add(1)]);
     }
 
     #[test]
@@ -892,16 +915,16 @@ mod tests {
         // be carried forward; the id simply drops out of `applied`.
         let t = MockTarget::new(&[1]).with_add_failure(1);
         let mut prev = HashMap::new();
-        prev.insert(PeerId(1), peer_spec_to_connection(&peer_addr(1, "a:1")));
+        prev.insert(peer_key(1), peer_spec_to_connection(&peer_addr(1, "a:1")));
         let peers = vec![peer_addr(1, "b:2")];
         let r = reconcile_peers(&t, &peers, Some(&prev));
         assert_eq!(r.updated, 0);
         assert_eq!(r.added, 0);
         assert_eq!(r.failures.len(), 1);
-        assert_eq!(r.failures[0].0, PeerId(1));
+        assert_eq!(r.failures[0].0, peer_key(1));
         assert!(r.failures[0].1.starts_with("update-add:"));
-        assert!(!r.applied.contains_key(&PeerId(1)));
-        assert_eq!(*t.ops.borrow(), vec![Op::Remove(1), Op::Add(1)]);
+        assert!(!r.applied.contains_key(&peer_key(1)));
+        assert_eq!(*t.ops.borrow(), vec![remove(1), add(1)]);
 
         // Second pass: the id is in `desired` but not in
         // `target.list()` (fabric is empty post-remove), so the
@@ -913,10 +936,10 @@ mod tests {
         assert_eq!(r2.updated, 0);
         assert!(r2.failures.is_empty());
         assert_eq!(
-            r2.applied[&PeerId(1)].address,
+            r2.applied[&peer_key(1)].address,
             crate::fabric::FabricAddress::socket("b:2")
         );
-        assert_eq!(*t2.ops.borrow(), vec![Op::Add(1)]);
+        assert_eq!(*t2.ops.borrow(), vec![add(1)]);
     }
 
     #[test]
@@ -928,20 +951,20 @@ mod tests {
         // `desired_map`, driving the same remove path).
         let t = MockTarget::new(&[1]).with_remove_failure(1);
         let mut prev = HashMap::new();
-        prev.insert(PeerId(1), peer_spec_to_connection(&peer_addr(1, "a:1")));
+        prev.insert(peer_key(1), peer_spec_to_connection(&peer_addr(1, "a:1")));
         let peers: Vec<PeerSpec> = vec![];
         let r = reconcile_peers(&t, &peers, Some(&prev));
         assert_eq!(r.removed, 0);
         assert_eq!(r.added, 0);
         assert_eq!(r.updated, 0);
         assert_eq!(r.failures.len(), 1);
-        assert_eq!(r.failures[0].0, PeerId(1));
+        assert_eq!(r.failures[0].0, peer_key(1));
         assert!(r.failures[0].1.starts_with("remove:"));
         assert_eq!(
-            r.applied[&PeerId(1)].address,
+            r.applied[&peer_key(1)].address,
             crate::fabric::FabricAddress::socket("a:1")
         );
-        assert_eq!(*t.ops.borrow(), vec![Op::Remove(1)]);
+        assert_eq!(*t.ops.borrow(), vec![remove(1)]);
     }
 
     // ---- backend / frontend reconcile ----
