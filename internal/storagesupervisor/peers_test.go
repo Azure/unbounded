@@ -260,6 +260,40 @@ func TestComputeRDMARingKeepsNativeAndRoutableSocketAddresses(t *testing.T) {
 	assert.Equal(t, "10.0.0.9:50000", got["peer-a"])
 }
 
+func TestComputeRDMARingUsesSelfPlaceholderUntilInventoryPublishes(t *testing.T) {
+	nodes := []*corev1.Node{
+		nodeWithAnnotations("self", "red", "10.0.0.1", nil),
+		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:a"]}]}`,
+		}),
+	}
+
+	ring := computeRDMARing(nodes, "self", testRingLabel)
+
+	require.True(t, ring.active)
+	assert.Equal(t, "self", ring.selfName)
+	require.Len(t, ring.peers, 2)
+	got := map[string]string{}
+	for _, p := range ring.peers {
+		got[p.GetName()] = p.GetRdma().GetAddr()
+	}
+
+	assert.Equal(t, placeholderRdmaSelfAddr, got["self"])
+	assert.Equal(t, "hex:a", got["peer-a"])
+}
+
+func TestComputeRDMARingInactiveWhenSelfInvalidInventory(t *testing.T) {
+	nodes := []*corev1.Node{
+		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":2,"hcas":[]}`,
+		}),
+	}
+
+	ring := computeRDMARing(nodes, "self", testRingLabel)
+
+	assert.False(t, ring.active)
+}
+
 func TestComputeRDMARingSingleMember(t *testing.T) {
 	nodes := []*corev1.Node{nodeWithAnnotations("self", "red", "", map[string]string{
 		storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:self"]}]}`,

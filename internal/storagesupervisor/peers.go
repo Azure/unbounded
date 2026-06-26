@@ -29,6 +29,14 @@ import (
 // leaving the peer set stale.
 const nodeInformerResync = 30 * time.Second
 
+// placeholderRdmaSelfAddr is only used before a node's daemon has published
+// live RDMA inventory. Config validation requires each peer to carry a valid
+// address, while the daemon needs self set on the first render because peer
+// identity is startup-fixed. This native address is never dialed: runtime
+// projection removes the self peer from the remote peer set, and a later render
+// replaces it with the daemon's real inventory address.
+const placeholderRdmaSelfAddr = "hex:00"
+
 // ringState is a pure snapshot of the storage ring this node belongs to,
 // computed from the watched Node set and the fabric port. It is the seam
 // between the Kubernetes node watch (peerWatcher) and the pure renderer
@@ -301,24 +309,6 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 		return ringState{}
 	}
 
-	selfAddr, err := firstRdmaInventoryAddr(self.Annotations[storageRdmaHcasAnnotation])
-	if err != nil {
-		slog.Warn("storage ring inactive: this node has invalid rdma inventory", "node", selfName, "ring", ringValue, "error", err)
-
-		return ringState{}
-	}
-	selfAddr, ok = rdmaPeerDialAddr(selfAddr, self)
-	if !ok {
-		slog.Warn("storage ring inactive: this node has wildcard rdma address but no InternalIP", "node", selfName, "ring", ringValue)
-
-		return ringState{}
-	}
-	if selfAddr == "" {
-		slog.Warn("storage ring inactive: this node has no rdma address", "node", selfName, "ring", ringValue)
-
-		return ringState{}
-	}
-
 	ring := ringState{
 		active:   true,
 		selfName: selfName,
@@ -335,18 +325,38 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 
 		addr, err := firstRdmaInventoryAddr(n.Annotations[storageRdmaHcasAnnotation])
 		if err != nil {
+			if n.Name == selfName {
+				slog.Warn("storage ring inactive: this node has invalid rdma inventory", "node", selfName, "ring", ringValue, "error", err)
+
+				return ringState{}
+			}
+
 			slog.Warn("skipping storage ring peer with invalid rdma inventory", "peer", n.Name, "ring", ringValue, "error", err)
 
 			continue
 		}
 
 		if addr == "" {
-			slog.Warn("skipping storage ring peer with no rdma address", "peer", n.Name, "ring", ringValue)
+			if n.Name != selfName {
+				slog.Warn("skipping storage ring peer with no rdma address", "peer", n.Name, "ring", ringValue)
 
-			continue
+				continue
+			}
+
+			// The daemon's local peer identity is startup-fixed, but RDMA
+			// inventory is only available after the daemon has started. Emit a
+			// valid placeholder for self so the first render locks in the peer
+			// name; later renders replace it with the daemon-published address.
+			addr = placeholderRdmaSelfAddr
 		}
 		addr, ok = rdmaPeerDialAddr(addr, n)
 		if !ok {
+			if n.Name == selfName {
+				slog.Warn("storage ring inactive: this node has wildcard rdma address but no InternalIP", "node", selfName, "ring", ringValue)
+
+				return ringState{}
+			}
+
 			slog.Warn("skipping storage ring peer with wildcard rdma address but no InternalIP", "peer", n.Name, "ring", ringValue)
 
 			continue
