@@ -172,7 +172,7 @@ impl<B: BlockDevice + 'static> LocalStorage<B> {
     }
 
     /// Route a raw-slice read to the disk that owns the page and
-    /// promote any resident hit to at least `priority` for eviction.
+    /// classify any resident hit at `priority` for eviction.
     ///
     /// SAFETY: see [`StorageEngine::read_page_into`].
     pub async unsafe fn read_page_into_with_priority(

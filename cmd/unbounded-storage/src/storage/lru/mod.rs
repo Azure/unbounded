@@ -97,15 +97,12 @@ impl SieveLru {
     }
 
     pub fn touch_with_priority(&self, lba: Lba, priority: i32) {
-        self.promote(lba, priority);
+        self.reclassify(lba, priority);
         self.touch(lba);
     }
 
-    /// Raise `lba` to `priority` if it is currently resident in a
-    /// lower-priority bucket. Priority is monotonic for a resident page:
-    /// a low-priority cache read must not undo protection established by
-    /// an earlier high-priority cache access to the same content.
-    pub fn promote(&self, lba: Lba, priority: i32) {
+    /// Move `lba` to the current access priority if it is resident.
+    pub fn reclassify(&self, lba: Lba, priority: i32) {
         let mut inner = self.inner.lock().unwrap();
         let Some((current, pos)) = inner.buckets.iter().find_map(|(&priority, q)| {
             q.iter()
@@ -114,7 +111,7 @@ impl SieveLru {
         }) else {
             return;
         };
-        if current >= priority {
+        if current == priority {
             return;
         }
         if let Some(q) = inner.buckets.get_mut(&current) {
@@ -308,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn higher_priority_touch_promotes_resident_page() {
+    fn higher_priority_touch_reclassifies_resident_page() {
         let l = lru(16);
         l.admit(Lba(2), -10);
         l.admit(Lba(3), 0);
@@ -326,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn lower_priority_touch_does_not_demote_resident_page() {
+    fn lower_priority_touch_reclassifies_resident_page() {
         let l = lru(16);
         l.admit(Lba(2), 10);
         l.admit(Lba(3), 0);
@@ -339,7 +336,7 @@ mod tests {
             v.iter()
                 .map(|candidate| candidate.priority)
                 .collect::<Vec<_>>(),
-            vec![0, 10]
+            vec![0, -10]
         );
     }
 

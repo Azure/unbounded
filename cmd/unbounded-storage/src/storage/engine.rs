@@ -605,8 +605,8 @@ impl<B: BlockDevice> StorageEngine<B> {
         }
     }
 
-    /// Read `(key, stripe_off)` into `dst` and promote any resident
-    /// hit to at least `priority` for eviction ordering.
+    /// Read `(key, stripe_off)` into `dst` and classify any resident
+    /// hit at `priority` for eviction ordering.
     ///
     /// SAFETY: same contract as [`Self::read_page_into`].
     pub async unsafe fn read_page_into_with_priority(
@@ -1243,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn priority_read_promotes_resident_page() {
+    fn priority_read_reclassifies_resident_page() {
         let (eng, _buf) = engine(64);
         let eng_body = eng.clone();
         let mutator = eng.clone().run_mutator();
@@ -1288,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn lower_priority_read_does_not_demote_resident_page() {
+    fn lower_priority_read_reclassifies_resident_page() {
         let (eng, _buf) = engine(64);
         let eng_body = eng.clone();
         let mutator = eng.clone().run_mutator();
@@ -1325,7 +1325,7 @@ mod tests {
 
             let entries = eng_body.lru_entries_for_test();
             assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].priority, 10);
+            assert_eq!(entries[0].priority, -10);
             eng_body.close_mutator();
         };
         block_on_pair(body, mutator.as_mut());

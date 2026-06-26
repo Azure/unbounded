@@ -95,8 +95,8 @@ impl PageChannel {
         self.read_page_with_priority(key, stripe_off, dst, 0).await
     }
 
-    /// Read `(key, stripe_off)` into `dst` and promote any resident
-    /// hit to at least `priority` for eviction ordering.
+    /// Read `(key, stripe_off)` into `dst` and classify any resident
+    /// hit at `priority` for eviction ordering.
     ///
     /// SAFETY: `dst` must point to a writable region that lives
     /// until the returned future resolves and is pinned for DMA.
