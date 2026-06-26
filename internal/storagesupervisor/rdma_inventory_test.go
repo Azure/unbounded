@@ -65,8 +65,10 @@ func TestPatchNodeAnnotationIfChanged(t *testing.T) {
 func TestRdmaInventoryPublisherPublishesMinifiedJSON(t *testing.T) {
 	ctx := context.Background()
 	cs := fake.NewSimpleClientset(node("self", "red", "10.0.0.1"))
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/inventory/rdma", r.URL.Path)
+
 		_, _ = w.Write([]byte(`{"schemaVersion": 1, "hcas": []}`))
 	}))
 	defer server.Close()

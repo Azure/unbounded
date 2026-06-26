@@ -201,6 +201,7 @@ func rdmaInventoryAddrs(value string) ([]string, error) {
 	}
 
 	var addrs []string
+
 	for _, hca := range inv.HCAs {
 		for _, addr := range hca.Addrs {
 			if addr != "" {

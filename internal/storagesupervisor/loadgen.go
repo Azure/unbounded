@@ -65,6 +65,7 @@ func annotationLoadgenFrontends(raw string, existingNames map[string]struct{}) [
 		}
 
 		seenNames[name] = struct{}{}
+
 		frontends = append(frontends, frontend)
 	}
 
@@ -78,6 +79,7 @@ func annotationLoadgenFrontend(raw string) *storageconfig.FrontendSpec {
 	}
 
 	parts := strings.Split(raw, ";")
+
 	name := strings.TrimSpace(parts[0])
 	if name == "" {
 		slog.Warn("skipping annotated storage loadgen with empty name", "value", raw)
@@ -121,6 +123,7 @@ func applyLoadgenOption(frontend *storageconfig.FrontendSpec, raw string, seen m
 	}
 
 	key = strings.TrimSpace(key)
+
 	value = strings.TrimSpace(value)
 	if key == "" || value == "" {
 		slog.Warn("ignoring storage loadgen option with empty key or value", "name", name, "option", raw)

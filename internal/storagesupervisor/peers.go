@@ -320,6 +320,7 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 		if n.Labels[ringLabel] != ringValue {
 			continue
 		}
+
 		if _, dup := seen[n.Name]; dup {
 			continue
 		}
@@ -341,6 +342,7 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 		if len(addrs) > 0 {
 			addr = addrs[0]
 		}
+
 		if addr == "" {
 			if n.Name != selfName {
 				slog.Warn("skipping storage ring peer with no rdma address", "peer", n.Name, "ring", ringValue)
@@ -354,6 +356,7 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 			// name; later renders replace it with the daemon-published address.
 			addr = placeholderRdmaSelfAddr
 		}
+
 		addr, ok = rdmaPeerDialAddr(addr, n)
 		if !ok {
 			if n.Name == selfName {
@@ -366,6 +369,7 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 
 			continue
 		}
+
 		if len(addrs) == 0 {
 			addrs = []string{addr}
 		} else {

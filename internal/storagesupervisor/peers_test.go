@@ -202,6 +202,7 @@ func TestComputeRDMARingMembership(t *testing.T) {
 
 	got := map[string]string{}
 	gotAll := map[string][]string{}
+
 	for _, p := range ring.peers {
 		got[p.GetName()] = p.GetRdma().GetAddr()
 		gotAll[p.GetName()] = p.GetRdma().GetAddrs()
@@ -230,8 +231,10 @@ func TestComputeRDMARingRewritesWildcardSocketAddresses(t *testing.T) {
 
 	require.True(t, ring.active)
 	require.Len(t, ring.peers, 3)
+
 	got := map[string]string{}
 	gotAll := map[string][]string{}
+
 	for _, p := range ring.peers {
 		got[p.GetName()] = p.GetRdma().GetAddr()
 		gotAll[p.GetName()] = p.GetRdma().GetAddrs()
@@ -259,7 +262,9 @@ func TestComputeRDMARingPreservesAllPeerAddresses(t *testing.T) {
 
 	require.True(t, ring.active)
 	require.Len(t, ring.peers, 2)
+
 	got := map[string][]string{}
+
 	for _, p := range ring.peers {
 		got[p.GetName()] = p.GetRdma().GetAddrs()
 	}
@@ -282,7 +287,9 @@ func TestComputeRDMARingKeepsNativeAndRoutableSocketAddresses(t *testing.T) {
 
 	require.True(t, ring.active)
 	require.Len(t, ring.peers, 2)
+
 	got := map[string]string{}
+
 	for _, p := range ring.peers {
 		got[p.GetName()] = p.GetRdma().GetAddr()
 	}
@@ -304,7 +311,9 @@ func TestComputeRDMARingUsesSelfPlaceholderUntilInventoryPublishes(t *testing.T)
 	require.True(t, ring.active)
 	assert.Equal(t, "self", ring.selfName)
 	require.Len(t, ring.peers, 2)
+
 	got := map[string]string{}
+
 	for _, p := range ring.peers {
 		got[p.GetName()] = p.GetRdma().GetAddr()
 	}

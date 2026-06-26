@@ -809,7 +809,9 @@ frontends:
 `)
 
 	var logs bytes.Buffer
+
 	previousLogger := slog.Default()
+
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 
