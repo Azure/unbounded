@@ -3,8 +3,8 @@
 # Licensed under the MIT License.
 
 # gen-storage-mesh-config.sh -- Generate a test unbounded-storage TOML config
-# for one node of the current Kubernetes cluster, wiring every other node in as
-# a TCP peer (a full peer mesh) using each node's InternalIP.
+# for one node of the current Kubernetes cluster, wiring every selected node in
+# as a named TCP peer using each node's InternalIP.
 #
 # Usage:
 #   hack/scripts/gen-storage-mesh-config.sh [options]
@@ -195,7 +195,7 @@ NODE_LINES=$(kubectl "${KUBECTL_CFG_ARGS[@]}" "${KUBECTL_CTX_ARGS[@]}" get nodes
 
 [[ -z "$NODE_LINES" ]] && die "no nodes found in the current cluster."
 
-# Parse into parallel arrays of names and IPs, assigning ids 1..N by sort order.
+# Parse into parallel arrays of names and IPs in sorted order.
 NAMES=()
 IPS=()
 while IFS=' ' read -r name ip; do
@@ -228,7 +228,6 @@ done
 
 LOCAL_NAME="${NAMES[$LOCAL_IDX]}"
 LOCAL_IP="${IPS[$LOCAL_IDX]}"
-LOCAL_ID=$((LOCAL_IDX + 1))
 
 # ── resolve the s3 origin endpoint ────────────────────────────────────────────
 
@@ -269,11 +268,14 @@ cat >&3 <<EOF
 #
 #   name:        $LOCAL_NAME
 #   internal ip: $LOCAL_IP
-#   node id:     $LOCAL_ID  (of $NODE_COUNT nodes; ids assigned by sorted name)
+#   peer roster: $NODE_COUNT node(s) selected by name
 #
-# Every other node in the cluster is wired into the p2p neighborhood below as a
-# TCP peer. Regenerate the peer config for a different node with --local-node
-# <name>.
+# Every selected node in the cluster is wired into the peer roster below. The
+# local process identity is selected by self; internal ring and fabric ids are
+# derived from peer names. Regenerate the peer config for a different node with
+# --local-node <name>.
+
+self = "$LOCAL_NAME"
 
 [[backends]]
 name = "origin"
@@ -281,24 +283,16 @@ name = "origin"
 [backends.config.s3]
 url = "$OPT_ORIGIN"
 stripe_size_bytes = $STRIPE_SIZE
-
-[[neighborhoods]]
-name = "p2p"
-source = "origin"
-local_node_id = $LOCAL_ID
 EOF
 
-# Peers: every node except the local one.
+# Peers: every selected node, including self. Fabric reconcile excludes self.
 for i in "${!NAMES[@]}"; do
-	[[ "$i" -eq "$LOCAL_IDX" ]] && continue
-	peer_id=$((i + 1))
 	cat >&3 <<EOF
 
-[[neighborhoods.peers]]
-# peer node: ${NAMES[$i]}
-id = $peer_id
+[[peers]]
+name = "${NAMES[$i]}"
 
-[neighborhoods.peers.config.tcp]
+[peers.config.tcp]
 addr = "${IPS[$i]}:$OPT_PORT"
 EOF
 done
@@ -307,7 +301,7 @@ cat >&3 <<EOF
 
 [[caches]]
 name = "cache"
-source = "p2p"
+source = "origin"
 
 [[disks]]
 page_size_bytes = 4096
@@ -326,8 +320,8 @@ addr = "0.0.0.0:$OPT_FRONTEND_PORT"
 
 [startup.fabric.binds.tcp]
 # Bind the node's own routable IP, not 0.0.0.0. This must be the exact
-# address peers use to reach this node (their [[neighborhoods.peers]] TCP addr
-# points here); the libfabric tcp provider uses it both to bind and as its
+# address peers use to reach this node (their [[peers]] TCP addr points here);
+# the libfabric tcp provider uses it both to bind and as its
 # connection-manager identity and does not come up on an INADDR_ANY bind.
 addr = "$LOCAL_IP:$OPT_PORT"
 

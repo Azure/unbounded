@@ -8,7 +8,7 @@ sorted roster of cluster nodes (`FingerTable::build`), which requires
 each node to know every other node.
 
 "Disjoint discovery" lets a node be configured with **only its direct
-routing neighbors** via a `[p2p.routing_plan]` block instead of the full
+routing neighbors** via a top-level `[routing_plan]` block instead of the full
 roster. The node feeds those neighbors straight into
 `FingerTable::from_explicit` and skips the global build entirely.
 
@@ -38,7 +38,8 @@ re-implementation must match this same algorithm.
 For a target node `L` being planned, the planner needs the global roster:
 the set of all nodes, each with:
 
-- `id`: the `u64` node id (the `[[peers]].id` / `local_node_id`).
+- `name`: the stable peer name. `unbounded-storage` derives the internal
+  `u64` node id from this name.
 - `labels`: the ordered topology label vector (coarsest to finest, e.g.
   `[region, zone, row, rack]`). Empty if unset.
 
@@ -62,15 +63,16 @@ splitmix64(x):
 
 All arithmetic is unsigned 64-bit with wraparound.
 
-### Ring position of a node
+### Node id and ring position
 
 ```
-node_to_ring(id) = splitmix64(id)
+node_id_from_name(name) = first_u64_le(blake3(name))
+node_to_ring(node_id) = splitmix64(node_id)
 ```
 
-So every node's ring position is `splitmix64(node_id)`. (Stripe keys map
-to the ring via the leading 8 bytes little-endian of their SHA-256
-digest, but the planner does not need that for neighbor selection.)
+So every node's ring position is `splitmix64(node_id_from_name(name))`.
+Stripe keys map to the ring via the leading 8 bytes little-endian of their
+SHA-256 digest, but the planner does not need that for neighbor selection.
 
 ### Forward ring distance
 
@@ -119,9 +121,9 @@ rendezvous_hash(local_ring, candidate_ring, arc) =
 
 Compute `L`'s neighbors exactly as `FingerTable::build` does.
 
-Let `local_ring = node_to_ring(L.id)`, `k = max(fingers_per_node, 1)`,
-and `arc_span = floor((2^64 - 1) / k)` (integer division of `u64::MAX`
-by `k`).
+Let `local_id = node_id_from_name(L.name)`,
+`local_ring = node_to_ring(local_id)`, `k = max(fingers_per_node, 1)`, and
+`arc_span = floor((2^64 - 1) / k)` (integer division of `u64::MAX` by `k`).
 
 ### Arc index
 
@@ -139,10 +141,11 @@ arc_index(local_ring, cand_ring, arc_span, k):
 ### Fingers
 
 Initialize one slot per arc as empty. For every candidate node `c` where
-`c.id != L.id`:
+`c.name != L.name`:
 
-1. `a = arc_index(local_ring, node_to_ring(c.id), arc_span, k)`.
-2. If arc `a` is empty, place `c` there. Otherwise replace the incumbent
+1. `c_id = node_id_from_name(c.name)`.
+2. `a = arc_index(local_ring, node_to_ring(c_id), arc_span, k)`.
+3. If arc `a` is empty, place `c` there. Otherwise replace the incumbent
    `inc` with `c` iff `better(c, inc, a)` (below).
 
 ```
@@ -150,10 +153,10 @@ better(c, inc, arc):                   # is challenger c better than incumbent i
     ct = topology_distance(L.labels, c.labels)
     it = topology_distance(L.labels, inc.labels)
     if ct != it: return ct < it
-    cr = rendezvous_hash(local_ring, node_to_ring(c.id), arc)
-    ir = rendezvous_hash(local_ring, node_to_ring(inc.id), arc)
+    cr = rendezvous_hash(local_ring, node_to_ring(node_id_from_name(c.name)), arc)
+    ir = rendezvous_hash(local_ring, node_to_ring(node_id_from_name(inc.name)), arc)
     if cr != ir: return cr < ir
-    return node_to_ring(c.id) < node_to_ring(inc.id)   # raw u64 ring position
+    return node_to_ring(node_id_from_name(c.name)) < node_to_ring(node_id_from_name(inc.name))
 ```
 
 That is: prefer the topologically nearer candidate; break ties by lower
@@ -168,41 +171,42 @@ and the lookup path ignores them either way.)
 
 ### Successor and predecessor
 
-Over the same candidates (`c.id != L.id`):
+Over the same candidates (`c.name != L.name`):
 
 - `successor` = the candidate minimizing `ring_distance(local_ring,
-  node_to_ring(c.id))` among nonzero distances (the nearest node
+  node_to_ring(node_id_from_name(c.name)))` among nonzero distances (the nearest node
   *forward* on the ring).
 - `predecessor` = the candidate minimizing `ring_distance(node_to_ring(
-  c.id), local_ring)` among nonzero distances (the nearest node
-  *backward* on the ring).
+  node_id_from_name(c.name)), local_ring)` among nonzero distances (the
+  nearest node *backward* on the ring).
 
 Both are absent only for a single-node cluster. If two candidates tie on
-distance (only possible with colliding ring positions, which
-`splitmix64` makes vanishingly unlikely for distinct ids), the first
+distance (only possible with colliding ring positions, which the name hash and
+`splitmix64` make vanishingly unlikely for distinct names), the first
 encountered wins; planners should treat a tie as a misconfiguration.
 
 ## Output mapping
 
 The planner emits, for node `L`:
 
-- `[p2p.routing_plan].fingers` = the list of arc-winner node ids
+- `[routing_plan].fingers` = the list of arc-winner peer names
   (deduplicated, `L` excluded). Order does not matter.
-- `[p2p.routing_plan].successor` = the successor node id (omit for a
+- `[routing_plan].successor` = the successor peer name (omit for a
   single-node cluster).
-- `[p2p.routing_plan].predecessor` = the predecessor node id (omit for a
+- `[routing_plan].predecessor` = the predecessor peer name (omit for a
   single-node cluster).
 
-`L`'s `[[peers]]` list must contain exactly one entry per id referenced
-by the routing plan (fingers, successor, predecessor), carrying that
-peer's transport/address so `L` opens connections only to its routing
-neighbors. `unbounded-storage` validates this at config load:
+`L`'s `[[peers]]` list must contain one entry for `L` itself and exactly one
+entry per name referenced by the routing plan (fingers, successor,
+predecessor), carrying that peer's transport/address so `L` opens connections
+only to its routing neighbors. `unbounded-storage` validates this at config
+load:
 
-- every routing-plan id must be a known `[[peers]].id`
+- every routing-plan name must be a known `[[peers]].name`
   (`RoutingPlanUnknownPeer`),
-- no routing-plan id may equal `local_node_id`
+- no routing-plan name may equal `self`
   (`RoutingPlanSelfReference`),
-- finger ids must be unique (`RoutingPlanDuplicateFinger`).
+- finger names must be unique (`RoutingPlanDuplicateFinger`).
 
 Labels for finger peers are looked up from their `[[peers]]` entry (or
 empty if unset); labels do not affect runtime routing, only the
