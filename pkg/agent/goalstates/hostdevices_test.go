@@ -115,7 +115,7 @@ func TestDiscoverInfinibandDevicePaths(t *testing.T) {
 	// A subdirectory must be skipped.
 	require.NoError(t, os.Mkdir(filepath.Join(ibDir, "subdir"), 0o755))
 
-	got := discoverInfinibandDevicePaths(ibDir)
+	got := discoverInfinibandDevicePaths(ibDir, filepath.Join(t.TempDir(), "missing"), false)
 
 	want := []string{
 		filepath.Join(ibDir, "rdma_cm"),
@@ -128,7 +128,71 @@ func TestDiscoverInfinibandDevicePaths(t *testing.T) {
 func TestDiscoverInfinibandDevicePaths_MissingDir(t *testing.T) {
 	t.Parallel()
 
-	require.Nil(t, discoverInfinibandDevicePaths("/nonexistent/dev/infiniband"))
+	require.Nil(t, discoverInfinibandDevicePaths("/nonexistent/dev/infiniband", filepath.Join(t.TempDir(), "missing"), false))
+}
+
+func TestRDMACMDeviceNumber(t *testing.T) {
+	t.Parallel()
+
+	devFile := filepath.Join(t.TempDir(), "dev")
+	require.NoError(t, os.WriteFile(devFile, []byte("10:263\n"), 0o644))
+
+	major, minor, ok := rdmaCMDeviceNumber(devFile)
+	require.True(t, ok)
+	require.Equal(t, uint32(10), major)
+	require.Equal(t, uint32(263), minor)
+}
+
+func TestRDMACMDeviceNumberInvalid(t *testing.T) {
+	t.Parallel()
+
+	devFile := filepath.Join(t.TempDir(), "dev")
+	require.NoError(t, os.WriteFile(devFile, []byte("not-a-device\n"), 0o644))
+
+	_, _, ok := rdmaCMDeviceNumber(devFile)
+	require.False(t, ok)
+}
+
+func TestRDMACMDeviceNumberRejectsOverflow(t *testing.T) {
+	t.Parallel()
+
+	devFile := filepath.Join(t.TempDir(), "dev")
+	require.NoError(t, os.WriteFile(devFile, []byte("4294967296:0\n"), 0o644))
+
+	_, _, ok := rdmaCMDeviceNumber(devFile)
+	require.False(t, ok)
+}
+
+func TestCreateRDMACMDeviceNode(t *testing.T) {
+	t.Parallel()
+
+	ibDir := filepath.Join(t.TempDir(), "infiniband")
+
+	got := createRDMACMDeviceNode(ibDir, 10, 263, func(path string, mode uint32, dev int) error {
+		require.Equal(t, filepath.Join(ibDir, "rdma_cm"), path)
+		require.NotZero(t, mode&0o666)
+		require.NotZero(t, dev)
+
+		f, err := os.Create(path)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+
+		return nil
+	})
+
+	require.Equal(t, filepath.Join(ibDir, "rdma_cm"), got)
+}
+
+func TestEnsureRDMACMDeviceExisting(t *testing.T) {
+	t.Parallel()
+
+	ibDir := t.TempDir()
+	path := filepath.Join(ibDir, "rdma_cm")
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	require.Equal(t, path, ensureRDMACMDevice(ibDir, filepath.Join(t.TempDir(), "missing")))
 }
 
 func TestHostDevices_Paths_MergesDedupesSorts(t *testing.T) {
