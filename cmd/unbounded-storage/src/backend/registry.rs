@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -31,7 +32,9 @@ use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::config::reconcile::BackendReconcileTarget;
 use crate::config::{BackendSpec, backend_spec};
 use crate::storage::StripeReq;
+use crate::tls::{TlsConfig, TlsContext};
 
+use super::url::parse_endpoint;
 use super::{
     AzureBackend, Backend, FakeBackend, HttpBackend, OriginBackend, OriginRing, OriginStream,
     S3Backend,
@@ -119,17 +122,25 @@ impl BackendRegistry {
 
 impl BuildCtx {
     /// Build one [`OriginBackend`] from `spec`, selecting the concrete
-    /// origin implementation by [`BackendSpec::config`]. For an `s3`
-    /// backend the origin IP is resolved from the URL the same way
-    /// as for HTTP (IPv4-only, v1), but the host authority is extracted
-    /// separately for the `Host:` header.
+    /// origin implementation by [`BackendSpec::config`]. Real origin URLs
+    /// are parsed as `scheme://host[:port]` values. The authority
+    /// (`host:port`, port defaulted from the scheme) is resolved to an origin
+    /// address. The `Host:` header carries the host with any non-default port;
+    /// the bare host is used for TLS SNI/certificate verification. For an
+    /// `https` URL a shared [`TlsContext`] is built from the backend's TLS knobs
+    /// and handed to the backend; `http` URLs pass `None` and stay plaintext.
     fn build(&self, spec: &BackendSpec) -> io::Result<OriginBackend> {
         match spec.config.as_ref() {
             Some(backend_spec::Config::Http(cfg)) => {
-                let origin = HttpBackend::resolve_origin(&cfg.url)?;
+                let endpoint =
+                    build_origin_endpoint(&cfg.url, &cfg.ca_cert_path, cfg.insecure_skip_verify)?;
+                let origin = HttpBackend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::Http(HttpBackend::new(
                     self.ring.clone(),
                     origin,
+                    endpoint.host,
+                    endpoint.sni_host,
+                    endpoint.tls,
                     spec.name.clone(),
                     cfg.stripe_size_bytes.expect("stripe_size_bytes defaulted"),
                     self.page_size,
@@ -138,12 +149,15 @@ impl BuildCtx {
                 )))
             }
             Some(backend_spec::Config::S3(cfg)) => {
-                let origin = S3Backend::resolve_origin(&cfg.url)?;
-                let host = extract_host_authority(&cfg.url);
+                let endpoint =
+                    build_origin_endpoint(&cfg.url, &cfg.ca_cert_path, cfg.insecure_skip_verify)?;
+                let origin = S3Backend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::S3(S3Backend::new(
                     self.ring.clone(),
                     origin,
-                    host,
+                    endpoint.host,
+                    endpoint.sni_host,
+                    endpoint.tls,
                     spec.name.clone(),
                     cfg.stripe_size_bytes.expect("stripe_size_bytes defaulted"),
                     self.page_size,
@@ -152,12 +166,15 @@ impl BuildCtx {
                 )))
             }
             Some(backend_spec::Config::Azure(cfg)) => {
-                let origin = AzureBackend::resolve_origin(&cfg.url)?;
-                let host = extract_host_authority(&cfg.url);
+                let endpoint =
+                    build_origin_endpoint(&cfg.url, &cfg.ca_cert_path, cfg.insecure_skip_verify)?;
+                let origin = AzureBackend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::Azure(AzureBackend::new(
                     self.ring.clone(),
                     origin,
-                    host,
+                    endpoint.host,
+                    endpoint.sni_host,
+                    endpoint.tls,
                     spec.name.clone(),
                     cfg.stripe_size_bytes.expect("stripe_size_bytes defaulted"),
                     self.page_size,
@@ -167,6 +184,7 @@ impl BuildCtx {
             }
             Some(backend_spec::Config::Fake(cfg)) => Ok(OriginBackend::Fake(FakeBackend::new(
                 spec.name.clone(),
+                cfg.stripe_size_bytes.expect("stripe_size_bytes defaulted"),
                 cfg.object_size_bytes.expect("object_size_bytes defaulted"),
                 self.page_size,
                 self.backing_base,
@@ -179,9 +197,43 @@ impl BuildCtx {
     }
 }
 
+struct OriginEndpoint {
+    authority: String,
+    host: String,
+    sni_host: String,
+    tls: Option<Rc<TlsContext>>,
+}
+
+fn build_origin_endpoint(
+    url: &str,
+    ca_cert_path: &Option<String>,
+    insecure_skip_verify: bool,
+) -> io::Result<OriginEndpoint> {
+    let url = parse_endpoint(url)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let authority = url.authority();
+    let tls = if url.scheme.is_tls() {
+        let cfg = TlsConfig {
+            ca_cert_path: ca_cert_path.clone(),
+            insecure_skip_verify,
+        };
+        let ctx = TlsContext::new(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
+        Some(Rc::new(ctx))
+    } else {
+        None
+    };
+
+    Ok(OriginEndpoint {
+        authority,
+        host: url.host_header(),
+        sni_host: url.host,
+        tls,
+    })
+}
+
 impl Backend for BackendRegistry {
     type Req = StripeReq;
-    type Stream<'a> = RegistryFetchStream;
+    type Stream<'a> = RegistryFetchStream<'a>;
 
     fn bulk_get<'a>(
         &'a self,
@@ -195,10 +247,12 @@ impl Backend for BackendRegistry {
         };
         let map = self.backends.load();
         match map.get(backend_id) {
-            // `fetch_stream` returns a fully owned `'static` stream that
-            // borrows nothing from the backend, so the `Arc` guard can
-            // be dropped the moment the call returns.
-            Some(backend) => RegistryFetchStream::Origin(backend.fetch_stream(req, src, dsts)),
+            Some(backend) => RegistryFetchStream::Origin(OriginBackend::fetch_stream(
+                Arc::clone(backend),
+                req,
+                src,
+                dsts,
+            )),
             None => RegistryFetchStream::unknown(backend_id),
         }
     }
@@ -238,12 +292,12 @@ impl BackendReconcileTarget for BackendRegistry {
 /// guarantees every frontend's backend exists), but a request can race
 /// a `remove`, so it is surfaced as a transport error rather than a
 /// panic.
-pub enum RegistryFetchStream {
-    Origin(OriginStream<'static>),
+pub enum RegistryFetchStream<'a> {
+    Origin(OriginStream<'a>),
     Unknown(Option<Error>),
 }
 
-impl RegistryFetchStream {
+impl RegistryFetchStream<'_> {
     fn unknown(backend_id: &str) -> Self {
         let msg = format!("unknown backend id: {backend_id:?}");
         let err = Error::transport(io::Error::new(io::ErrorKind::NotFound, msg));
@@ -251,7 +305,7 @@ impl RegistryFetchStream {
     }
 }
 
-impl PageStream for RegistryFetchStream {
+impl PageStream for RegistryFetchStream<'_> {
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -266,24 +320,6 @@ impl PageStream for RegistryFetchStream {
             },
         }
     }
-}
-
-/// Extract the `host[:port]` authority from a backend `url` for
-/// use as the S3 `Host:` header.
-///
-/// Strips an optional `scheme://` prefix and any `/path` or `?query`
-/// suffix, but preserves the port so the `Host:` header stays
-/// RFC 7230 conformant for custom-port origins (e.g. MinIO on `:9000`).
-fn extract_host_authority(url: &str) -> String {
-    let after_scheme = match url.split_once("://") {
-        Some((_, rest)) => rest,
-        None => url,
-    };
-    after_scheme
-        .split(['/', '?'])
-        .next()
-        .unwrap_or(after_scheme)
-        .to_string()
 }
 
 #[cfg(test)]
@@ -302,6 +338,8 @@ mod tests {
                 url: url.to_string(),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
+                ca_cert_path: None,
+                insecure_skip_verify: false,
             })),
         }
     }
@@ -346,7 +384,10 @@ mod tests {
 
     #[test]
     fn seeds_and_lists_configured_backends() {
-        let reg = registry(&[http_spec("a", "127.0.0.1:1"), http_spec("b", "127.0.0.1:2")]);
+        let reg = registry(&[
+            http_spec("a", "http://127.0.0.1:1"),
+            http_spec("b", "http://127.0.0.1:2"),
+        ]);
         assert_eq!(reg.len(), 2);
         assert!(reg.contains("a"));
         assert!(reg.contains("b"));
@@ -360,12 +401,14 @@ mod tests {
         let reg = registry(&[]);
         assert_eq!(reg.len(), 0);
 
-        reg.add(&http_spec("a", "127.0.0.1:1")).expect("add a");
+        reg.add(&http_spec("a", "http://127.0.0.1:1"))
+            .expect("add a");
         assert!(reg.contains("a"));
         assert_eq!(reg.len(), 1);
 
         // Re-adding the same id replaces in place rather than growing.
-        reg.add(&http_spec("a", "127.0.0.1:9")).expect("replace a");
+        reg.add(&http_spec("a", "http://127.0.0.1:9"))
+            .expect("replace a");
         assert_eq!(reg.len(), 1);
 
         reg.remove("a").expect("remove a");
@@ -375,7 +418,7 @@ mod tests {
 
     #[test]
     fn add_with_unresolvable_url_leaves_map_untouched() {
-        let reg = registry(&[http_spec("a", "127.0.0.1:1")]);
+        let reg = registry(&[http_spec("a", "http://127.0.0.1:1")]);
         let err = reg
             .add(&http_spec("b", "this is not a valid url"))
             .expect_err("bad url should fail to build");
@@ -411,23 +454,5 @@ mod tests {
         let reg = registry(&[fake_spec("synthetic", 1024 * 1024)]);
         assert_eq!(reg.len(), 1);
         assert!(reg.contains("synthetic"));
-    }
-
-    #[test]
-    fn extract_host_authority_preserves_port_strips_scheme_and_path() {
-        assert_eq!(
-            extract_host_authority("s3.example.com:443"),
-            "s3.example.com:443"
-        );
-        assert_eq!(
-            extract_host_authority("https://s3.us-east-1.amazonaws.com:443"),
-            "s3.us-east-1.amazonaws.com:443"
-        );
-        assert_eq!(extract_host_authority("http://origin/path"), "origin");
-        assert_eq!(
-            extract_host_authority("origin.example.com"),
-            "origin.example.com"
-        );
-        assert_eq!(extract_host_authority("127.0.0.1:9000"), "127.0.0.1:9000");
     }
 }

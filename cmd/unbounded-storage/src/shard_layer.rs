@@ -34,14 +34,14 @@ use unbounded_storage::config::{
     self, ApplyError, Config, ConfigApplyTarget, ConfigDiff, ShardControlGroup,
 };
 use unbounded_storage::fabric::PeerId;
-use unbounded_storage::p2p::RouteTableHandle;
+use unbounded_storage::p2p::{NodeId, RouteTableHandle};
 use unbounded_storage::runtime::{JoinHandle, Threading, WorkerIdx};
 use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{CacheDirectorySet, DiskRegistrySet, UringDiskTarget};
 use unbounded_storage::topology::ServingShard;
 
 use crate::StartupSettings;
-use crate::fabric_group::{FabricGroup, FabricPlan};
+use crate::fabric_group::{FabricGroup, FabricPlan, FabricUnitAddress};
 
 /// Inputs that are constant across the life of the process and used to
 /// spawn the shard layer. Cloned cheaply into every shard thread.
@@ -94,6 +94,12 @@ pub struct ShardLayer {
     /// strictly after all joins, so no ring ever references unmapped
     /// memory.
     _backing_keepalives: Vec<Arc<dyn Send + Sync>>,
+}
+
+impl ShardLayer {
+    pub fn fabric_unit_addresses(&self) -> Vec<FabricUnitAddress> {
+        self.fabric_group.unit_addresses()
+    }
 }
 
 /// Bring up a shard layer from `config` on the runtime in `deps`,
@@ -341,30 +347,7 @@ pub fn spawn_shard_layer(
 }
 
 fn local_self_peer(projection: &config::RuntimeGraph) -> Result<PeerId, String> {
-    let mut local_ids: Vec<(&str, u64)> = projection
-        .neighborhoods
-        .values()
-        .filter_map(|n| n.p2p.local_node_id.map(|id| (n.id.as_str(), id)))
-        .collect();
-    local_ids.sort_by_key(|(neighborhood_id, _)| *neighborhood_id);
-
-    if let Some((_, self_peer)) = local_ids.first()
-        && local_ids.iter().any(|(_, node_id)| node_id != self_peer)
-    {
-        let configured = local_ids
-            .iter()
-            .map(|(neighborhood_id, node_id)| format!("{neighborhood_id}:{node_id}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "neighborhoods declare different local_node_id values, but the storage fabric uses one process-wide peer id ({configured})"
-        ));
-    }
-
-    Ok(local_ids
-        .first()
-        .map(|(_, node_id)| PeerId(*node_id))
-        .unwrap_or(PeerId(0)))
+    Ok(projection.mesh.self_peer_id)
 }
 
 /// Retire a shard layer: signal its shards to exit, then join every
@@ -444,14 +427,21 @@ impl ProcessApplyTarget {
 
 impl ConfigApplyTarget for ProcessApplyTarget {
     fn apply_in_place(&mut self, new: &Arc<Config>, diff: &ConfigDiff) -> Result<(), ApplyError> {
+        if diff.requires_restart() {
+            return Err(ApplyError::Target(
+                "self peer identity changed; restart required".to_string(),
+            ));
+        }
+
         let projection = config::runtime_projection(new)
             .map_err(|e| ApplyError::Target(format!("config projection failed: {e}")))?;
 
         // The shards must see a new config whenever their routing surface,
         // graph projection, or per-shard backend/frontend registries need
         // to change. Pure projected-disk changes are absorbed by
-        // `reconcile_disks` below, but cache graph changes can also alter
-        // frontend backend/bypass resolution, so they are broadcast.
+        // `reconcile_disks` below. Cache graph changes can also alter frontend
+        // backend/bypass resolution, so they are broadcast; disk-only
+        // changes are not.
         let needs_broadcast = diff.requires_routing_reload()
             || diff.caches_changed
             || diff.backends_changed
@@ -471,6 +461,8 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             // backend/frontend-only change leaves them untouched.
             if diff.requires_routing_reload() {
                 layer.fabric_group.reload_routes(&routes);
+            }
+            if diff.requires_peer_reconcile() {
                 let runtime_peers = config::runtime_peers(&projection);
                 layer.fabric_group.reconcile_peers(&runtime_peers);
             }
@@ -490,7 +482,7 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             layer.control.broadcast_apply(new.clone(), routes)?;
         }
 
-        if diff.caches_changed {
+        if diff.caches_changed || diff.disks_changed {
             self.reconcile_disks(&projection);
         }
 
@@ -504,63 +496,27 @@ mod tests {
 
     use super::*;
 
-    fn graph_with_local_ids(ids: &[(&str, Option<u64>)]) -> config::RuntimeGraph {
-        let neighborhoods = ids
-            .iter()
-            .map(|(id, local_node_id)| {
-                (
-                    (*id).to_string(),
-                    config::RuntimeNeighborhood {
-                        id: (*id).to_string(),
-                        backend_id: "backend".to_string(),
-                        p2p: config::RuntimeP2p {
-                            fingers_per_node: 100,
-                            local_node_id: *local_node_id,
-                            local_tags: Vec::new(),
-                            routing_plan: None,
-                        },
-                        peers: Vec::new(),
-                    },
-                )
-            })
-            .collect();
-
+    fn graph_with_self_peer(self_peer_id: PeerId) -> config::RuntimeGraph {
         config::RuntimeGraph {
+            disks: Vec::new(),
             caches: HashMap::new(),
-            neighborhoods,
+            mesh: config::RuntimeMesh {
+                fingers_per_node: 100,
+                self_name: None,
+                self_node_id: NodeId(self_peer_id.0),
+                self_peer_id,
+                self_tags: Vec::new(),
+                routing_plan: None,
+                peers: Vec::new(),
+            },
             frontends: HashMap::new(),
         }
     }
 
     #[test]
-    fn local_self_peer_is_zero_without_local_node_id() {
-        let graph = graph_with_local_ids(&[("n-a", None), ("n-b", None)]);
-
-        assert_eq!(local_self_peer(&graph).unwrap(), PeerId(0));
-    }
-
-    #[test]
-    fn local_self_peer_uses_raw_node_id() {
-        let graph = graph_with_local_ids(&[("n-a", None), ("n-b", Some(7))]);
+    fn local_self_peer_uses_projection_identity() {
+        let graph = graph_with_self_peer(PeerId(7));
 
         assert_eq!(local_self_peer(&graph).unwrap(), PeerId(7));
-    }
-
-    #[test]
-    fn local_self_peer_accepts_repeated_local_node_id() {
-        let graph = graph_with_local_ids(&[("n-b", Some(7)), ("n-a", Some(7))]);
-
-        assert_eq!(local_self_peer(&graph).unwrap(), PeerId(7));
-    }
-
-    #[test]
-    fn local_self_peer_rejects_different_local_node_ids() {
-        let graph = graph_with_local_ids(&[("n-b", Some(2)), ("n-a", Some(1))]);
-
-        let err = local_self_peer(&graph).unwrap_err();
-
-        assert!(err.contains("different local_node_id values"), "{err}");
-        assert!(err.contains("n-a:1"), "{err}");
-        assert!(err.contains("n-b:2"), "{err}");
     }
 }

@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::task::Waker;
 use std::thread;
 use std::time::Duration;
 
@@ -42,10 +43,12 @@ use unbounded_storage::memory::{BackingKind, BackingRequest, allocate};
 use unbounded_storage::metrics;
 
 mod fabric_group;
+mod rdma_inventory;
 mod shard_layer;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+const SHARED_DISK_REGISTRY_ID: &str = "shared";
 
 /// Stripe granularity used to build an inert origin backend on shards
 /// that have no configured backend. Such a backend is never exercised
@@ -417,6 +420,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let rdma_inventory = metrics::RdmaInventoryStatus::new();
+    rdma_inventory.set_json(rdma_inventory::to_json(
+        &host,
+        &layer.fabric_unit_addresses(),
+    ));
 
     // Reconcile the startup disk set now that the shards are up, then
     // publish the channel set so shards can reach their disks.
@@ -447,7 +455,12 @@ fn main() -> ExitCode {
     let metrics_exporter = if metrics_bind.is_empty() {
         None
     } else {
-        match metrics::spawn(&metrics_bind, controller.config_versions(), &SHUTDOWN) {
+        match metrics::spawn(
+            &metrics_bind,
+            controller.config_versions(),
+            rdma_inventory,
+            &SHUTDOWN,
+        ) {
             Ok(handle) => {
                 eprintln!("metrics: exporter listening on {metrics_bind}");
                 Some(handle)
@@ -857,14 +870,16 @@ fn run_shard(
         handle: NetHandle::new(socket.clone()),
         fanout: fanout.clone(),
         geometry: geometry.clone(),
+        routes: routes.clone(),
         bindings: Rc::new(RefCell::new((*frontend_bindings).clone())),
         page_size,
         worker_idx: widx.0,
+        waker: shard_loop.waker(),
     };
     let frontend_registry = match FrontendRegistry::new(&frontend_specs, frontend_ctx) {
         Ok(r) => r,
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!("worker={}: {e}", widx.0)));
+            phaseb_guard.report_failed(format!("worker={}: {e}", widx.0));
             return;
         }
     };
@@ -1076,67 +1091,73 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> &str {
 
 fn build_routes(config: &Config) -> RouteTableSnapshot {
     let projection = config::runtime_projection(config).expect("loaded config projects to runtime");
-    let routes = projection
-        .neighborhoods
+    if projection.caches.is_empty() {
+        return RouteTableSnapshot {
+            routes: HashMap::new(),
+        };
+    }
+
+    let mesh = &projection.mesh;
+    let local = PeerEntry {
+        node: mesh.self_node_id,
+        ring: node_to_ring(mesh.self_node_id),
+        tags: TopologyTags(mesh.self_tags.clone()),
+    };
+    let node_to_peer: HashMap<NodeId, unbounded_storage::fabric::PeerId> = mesh
+        .peers
         .iter()
-        .map(|(id, neighborhood)| {
-            let local_id = neighborhood.p2p.local_node_id.unwrap_or(0);
-            let local = PeerEntry {
-                node: NodeId(local_id),
-                ring: node_to_ring(NodeId(local_id)),
-                tags: TopologyTags(neighborhood.p2p.local_tags.clone()),
-            };
-            let node_to_peer: HashMap<NodeId, unbounded_storage::fabric::PeerId> = neighborhood
-                .peers
-                .iter()
-                .map(|peer| (peer.node_id, peer.fabric_peer_id))
-                .collect();
-            let fingers = if let Some(plan) = &neighborhood.p2p.routing_plan {
-                let tags_of = |node: NodeId| -> TopologyTags {
-                    neighborhood
-                        .peers
-                        .iter()
-                        .find(|peer| peer.node_id == node)
-                        .map(|peer| TopologyTags(peer.spec.tags.clone()))
-                        .unwrap_or_default()
-                };
-                let entry_of = |raw: u64| {
-                    let node = NodeId(raw);
-                    PeerEntry {
-                        node,
-                        ring: node_to_ring(node),
-                        tags: tags_of(node),
-                    }
-                };
-                Arc::new(FingerTable::from_explicit(
-                    local,
-                    plan.fingers.iter().map(|id| entry_of(*id)).collect(),
-                    plan.successor.map(entry_of),
-                    plan.predecessor.map(entry_of),
-                ))
-            } else {
-                let peers: Vec<PeerEntry> = neighborhood
-                    .peers
-                    .iter()
-                    .map(|peer| PeerEntry {
-                        node: peer.node_id,
-                        ring: node_to_ring(peer.node_id),
-                        tags: TopologyTags(peer.spec.tags.clone()),
-                    })
-                    .collect();
-                Arc::new(FingerTable::build(
-                    local,
-                    &peers,
-                    FingerTableConfig {
-                        k: neighborhood.p2p.fingers_per_node.max(1),
-                    },
-                ))
-            };
+        .map(|peer| (peer.node_id, peer.fabric_peer_id))
+        .collect();
+    let node_to_peer = Arc::new(node_to_peer);
+    let fingers = if let Some(plan) = &mesh.routing_plan {
+        let peer_by_name: HashMap<&str, &config::RuntimePeer> = mesh
+            .peers
+            .iter()
+            .map(|peer| (peer.name.as_str(), peer))
+            .collect();
+        let entry_of = |name: &str| {
+            let peer = peer_by_name
+                .get(name)
+                .expect("validated routing_plan names reference peers");
+            PeerEntry {
+                node: peer.node_id,
+                ring: node_to_ring(peer.node_id),
+                tags: TopologyTags(peer.spec.tags.clone()),
+            }
+        };
+        Arc::new(FingerTable::from_explicit(
+            local,
+            plan.fingers.iter().map(|name| entry_of(name)).collect(),
+            plan.successor.as_deref().map(entry_of),
+            plan.predecessor.as_deref().map(entry_of),
+        ))
+    } else {
+        let peers: Vec<PeerEntry> = mesh
+            .peers
+            .iter()
+            .map(|peer| PeerEntry {
+                node: peer.node_id,
+                ring: node_to_ring(peer.node_id),
+                tags: TopologyTags(peer.spec.tags.clone()),
+            })
+            .collect();
+        Arc::new(FingerTable::build(
+            local,
+            &peers,
+            FingerTableConfig {
+                k: mesh.fingers_per_node.max(1),
+            },
+        ))
+    };
+    let routes = projection
+        .caches
+        .keys()
+        .map(|id| {
             (
                 id.clone(),
                 RoutingSnapshot {
-                    fingers,
-                    node_to_peer: Arc::new(node_to_peer),
+                    fingers: fingers.clone(),
+                    node_to_peer: node_to_peer.clone(),
                 },
             )
         })
@@ -1151,23 +1172,24 @@ fn reconcile_cache_disks(
 ) {
     let mut cache_ids: Vec<String> = projection.caches.keys().cloned().collect();
     cache_ids.sort();
-    disk_registry.reconcile_ids(cache_ids.clone());
+    disk_registry.reconcile_ids([SHARED_DISK_REGISTRY_ID.to_string()]);
     cache_directories.reconcile(cache_ids.iter().cloned());
 
+    let disks = config::runtime_disks(projection);
+    let report = disk_registry.reconcile_cache(SHARED_DISK_REGISTRY_ID, &disks);
+    eprintln!(
+        "config: shared disks: added={} removed={} failures={}",
+        report.added,
+        report.removed,
+        report.failures.len(),
+    );
+    for (path, msg) in &report.failures {
+        eprintln!("disk {}: open failed: {msg}", path.display());
+    }
+
+    let channels = disk_registry.channels_snapshot(SHARED_DISK_REGISTRY_ID);
     for cache_id in cache_ids {
-        let cache = &projection.caches[&cache_id];
-        let report = disk_registry.reconcile_cache(&cache_id, &cache.disks);
-        eprintln!(
-            "config: cache={} disks: added={} removed={} failures={}",
-            cache_id,
-            report.added,
-            report.removed,
-            report.failures.len(),
-        );
-        for (path, msg) in &report.failures {
-            eprintln!("disk {}: open failed: {msg}", path.display());
-        }
-        cache_directories.apply_channels(&cache_id, disk_registry.channels_snapshot(&cache_id));
+        cache_directories.apply_channels(&cache_id, channels.clone());
     }
 }
 
@@ -1243,9 +1265,13 @@ struct FrontendBuildCtx {
     /// stripe change sees the new geometry. A frontend's stripe size is
     /// that of the backend it serves.
     geometry: Rc<RefCell<HashMap<String, u64>>>,
+    /// Per-cache peer routing table. Loadgen can optionally use it for
+    /// remote-only key selection while issuing normal cache reads.
+    routes: RouteTableHandle,
     bindings: Rc<RefCell<HashMap<String, ResolvedFrontendBinding>>>,
     page_size: usize,
     worker_idx: u16,
+    waker: Waker,
 }
 
 /// Resolve the stripe size a frontend should serve from the shard's
@@ -1317,11 +1343,11 @@ impl FrontendBuildCtx {
                     Rc::from(spec.name.as_str()),
                     binding.backend_id.clone(),
                     binding.cache_id.clone(),
-                    binding.neighborhood_id.clone(),
                     stripe_size,
                     self.page_size,
                     self.fanout.clone(),
                     binding.bypass_cache,
+                    frontend.max_requests_per_connection(),
                 )))
             }
             Some(frontend_spec::Config::S3(_)) => {
@@ -1337,7 +1363,6 @@ impl FrontendBuildCtx {
                     Rc::from(spec.name.as_str()),
                     binding.backend_id.clone(),
                     binding.cache_id.clone(),
-                    binding.neighborhood_id.clone(),
                     stripe_size,
                     self.page_size,
                     binding.bypass_cache,
@@ -1351,11 +1376,12 @@ impl FrontendBuildCtx {
                     self.pool.clone(),
                     binding.backend_id.clone(),
                     binding.cache_id.clone(),
-                    binding.neighborhood_id.clone(),
                     stripe_size,
                     self.page_size,
+                    self.routes.clone(),
                     binding.bypass_cache,
                     self.worker_idx,
+                    self.waker.clone(),
                 )))
             }
             None => Err(format!("frontend {} missing config", spec.name)),
@@ -1535,7 +1561,7 @@ impl Drop for PhaseBGuard {
 /// Parsed command-line options for one run of the daemon.
 ///
 /// The daemon takes all of its configuration - both the dynamically
-/// reloadable cluster state (neighborhoods, caches, backends, frontends)
+/// reloadable cluster state (mesh, caches, backends, frontends)
 /// and the startup-fixed knobs (`[startup]`: memory sizing, fabric
 /// endpoint/thread pools, CPU-topology selection) - from the config
 /// file. The only command-line option is the path to that file, since
@@ -1959,6 +1985,8 @@ mod tests {
                     url: "https://example.com".to_string(),
                     stripe_size_bytes: Some(4 * 1024 * 1024),
                     http_concurrency: Some(64),
+                    ca_cert_path: None,
+                    insecure_skip_verify: false,
                 },
             )),
         }
@@ -1969,7 +1997,6 @@ mod tests {
             frontend_id: frontend_id.to_string(),
             backend_id: backend_id.to_string(),
             cache_id: None,
-            neighborhood_id: None,
             bypass_cache: true,
         }
     }

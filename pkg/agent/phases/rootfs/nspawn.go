@@ -68,6 +68,8 @@ type nspawnTemplateData struct {
 	HostDevicePaths      []string
 	NvidiaGPUDevicePaths []string
 	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
+	AMDGPUDevicePaths    []string
+	AMDSysFSPaths        []string
 }
 
 // writeNSpawnConfigs renders the nspawn and service-override templates with
@@ -77,22 +79,34 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	// "/var/lib/machines/kube1"); nspawn always names the machine after that
 	// directory.
 	machineName := filepath.Base(e.goalState.MachineDir)
+	hostDevicePaths := e.goalState.HostDevices.Paths()
+	amdGPUDevicePaths := pathsExcluding(e.goalState.AMD.GPUDevicePaths, e.goalState.Nvidia.GPUDevicePaths)
 	templateData := nspawnTemplateData{
 		MachineName:          machineName,
 		BPFFSMountPath:       goalstates.BPFFSMountPath(machineName),
-		HostDevicePaths:      e.goalState.HostDevicePaths,
+		HostDevicePaths:      hostDevicePaths,
 		NvidiaGPUDevicePaths: e.goalState.Nvidia.GPUDevicePaths,
 		NvidiaLibDirMounts:   e.goalState.Nvidia.LibDirMounts,
+		AMDGPUDevicePaths:    amdGPUDevicePaths,
+		AMDSysFSPaths:        e.goalState.AMD.SysFSPaths,
 	}
 
-	if len(e.goalState.HostDevicePaths) > 0 {
+	if len(hostDevicePaths) > 0 {
 		e.log.Info("host devices detected, configuring nspawn bind-mounts",
-			"count", len(e.goalState.HostDevicePaths))
+			"total", len(hostDevicePaths),
+			"kvm", len(e.goalState.HostDevices.KVM),
+			"block", len(e.goalState.HostDevices.Block),
+			"infiniband", len(e.goalState.HostDevices.Infiniband))
 	}
 
 	if len(e.goalState.Nvidia.GPUDevicePaths) > 0 {
 		e.log.Info("GPU devices detected, configuring nspawn bind-mounts",
 			"count", len(e.goalState.Nvidia.GPUDevicePaths))
+	}
+
+	if len(amdGPUDevicePaths) > 0 {
+		e.log.Info("AMD GPU devices detected, configuring nspawn bind-mounts",
+			"count", len(amdGPUDevicePaths))
 	}
 
 	// Render and write the .nspawn configuration file.
@@ -116,4 +130,25 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	}
 
 	return nil
+}
+
+func pathsExcluding(paths, excluded []string) []string {
+	if len(paths) == 0 || len(excluded) == 0 {
+		return paths
+	}
+
+	seen := make(map[string]bool, len(excluded))
+	for _, p := range excluded {
+		seen[p] = true
+	}
+
+	var out []string
+
+	for _, p := range paths {
+		if !seen[p] {
+			out = append(out, p)
+		}
+	}
+
+	return out
 }

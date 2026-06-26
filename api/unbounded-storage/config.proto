@@ -17,7 +17,75 @@ message Config {
   repeated FrontendSpec frontends = 3;
   repeated BackendSpec backends = 4;
   repeated CacheSpec caches = 5;
-  repeated NeighborhoodSpec neighborhoods = 6;
+  repeated DiskSpec disks = 6;
+
+  // Number of deterministic finger-table entries to derive per peer. Defaults to 100 when unset.
+  optional uint32 fingers_per_node = 7;
+
+  // Name of this process in the `peers` roster. Required when peers or a
+  // routing plan are configured. The internal ring and fabric ids are derived
+  // from this peer name and are startup-fixed.
+  string self = 8;
+
+  // Precomputed routing table for this process. When set, `peers` can be
+  // sparse, containing only this process's routing neighbors.
+  optional RoutingPlan routing_plan = 9;
+
+  // Process-wide peer definitions for the globally shared transport mesh.
+  repeated PeerSpec peers = 10;
+}
+
+// A precomputed routing table for a single node, produced by a
+// global-view planner. All names reference `PeerSpec.name` values in the
+// `peers` list (each must be present so a fabric connection exists). Ring
+// positions are derived from names, and tags do not affect runtime routing, so
+// only names are carried here.
+message RoutingPlan {
+  // Peer names selected for this routing plan.
+  repeated string fingers = 1;
+
+  // Peer name of the nearest-forward neighbor on the ring.
+  optional string successor = 2;
+
+  // Peer name of the nearest-backward neighbor on the ring.
+  optional string predecessor = 3;
+}
+
+message PeerSpec {
+  // Stable peer name. The process-wide fabric peer id, ring position, and route
+  // references are derived from this name.
+  string name = 1;
+
+  // Peer tags used by placement-aware planning.
+  repeated string tags = 2;
+
+  oneof config {
+    TcpPeerConfig tcp = 3;
+    RdmaPeerConfig rdma = 4;
+  }
+}
+
+message TcpPeerConfig {
+  // TCP socket address used as this peer's fabric wire address.
+  string addr = 1;
+}
+
+message RdmaPeerConfig {
+  // Default RDMA fabric address. Provider-native addresses are encoded as
+  // "hex:<fi_getname-bytes>"; RDMA-CM socket addresses are accepted when the
+  // provider reports them.
+  string addr = 1;
+
+  // Ordered RDMA fabric addresses for peers that expose multiple fabric units,
+  // such as one endpoint per HCA. The daemon dials the address whose index
+  // matches the local fabric unit index, falling back to addr when absent.
+  repeated string addrs = 2;
+}
+
+message CacheSpec {
+  string name = 1;
+  // Backend source used for miss fills. Cache name is the only logical keyspace prefix.
+  string source = 2;
 }
 
 message StartupCfg {
@@ -109,79 +177,6 @@ message TopologyCfg {
   optional uint64 nic_workers = 7;
 }
 
-message NeighborhoodSpec {
-  string name = 1;
-  string source = 2;
-
-  // Number of deterministic finger-table entries to derive per node. Defaults to 100 when unset.
-  optional uint32 fingers_per_node = 3;
-
-  // Local node id on the P2P ring and process-wide fabric peer id; required when
-  // peers are configured, shared by every neighborhood when set, and must not
-  // match any peer id.
-  optional uint64 local_node_id = 4;
-
-  // Local tags used by placement-aware planning.
-  repeated string local_tags = 5;
-
-  // Precomputed routing table that replaces automatic finger-table derivation when set.
-  // When set, `peers` can be "sparse"; containing only this process's neighbors.
-  optional RoutingPlan routing_plan = 6;
-
-  // Peer definitions available to this neighborhood. Peer ids are process-wide
-  // fabric peer ids; repeating an id across neighborhoods requires the same
-  // peer data.
-  repeated PeerSpec peers = 7;
-}
-
-// A precomputed routing table for a single node, produced by a
-// global-view planner. All ids reference `PeerSpec.id` values in the
-// `peers` list (each must be present so a fabric connection exists).
-// Ring positions are derived from ids, and tags do not affect runtime
-// routing, so only ids are carried here.
-message RoutingPlan {
-  // Peer ids selected for this routing plan.
-  repeated uint64 fingers = 1;
-
-  // Peer id of the nearest-forward neighbor on the ring.
-  optional uint64 successor = 2;
-
-  // Peer id of the nearest-backward neighbor on the ring.
-  optional uint64 predecessor = 3;
-}
-
-message PeerSpec {
-  // Process-wide fabric peer id, also used for this neighborhood's ring
-  // position and route references.
-  uint64 id = 1;
-
-  // Peer tags used by placement-aware planning.
-  repeated string tags = 2;
-
-  oneof config {
-    TcpPeerConfig tcp = 3;
-    RdmaPeerConfig rdma = 4;
-  }
-}
-
-message TcpPeerConfig {
-  // TCP socket address used as this peer's fabric wire address.
-  string addr = 1;
-}
-
-message RdmaPeerConfig {
-  // Provider-native RDMA fabric address encoded as "hex:<fi_getname-bytes>".
-  string addr = 1;
-}
-
-message CacheSpec {
-  string name = 1;
-  string source = 2;
-
-  // Disk definitions attached to this cache.
-  repeated DiskSpec disks = 3;
-}
-
 message DiskSpec {
   // Optional io_uring queue depth override for this disk.
   optional uint32 queue_depth = 1;
@@ -192,9 +187,29 @@ message DiskSpec {
   // Skips the recovery scan when no metadata page is valid; intended only for fresh or benchmark disks.
   bool skip_recovery_scan = 3;
 
+  // Destructively resets the cache index on open, ignoring any existing on-disk metadata.
+  // Intended only for benchmark cache devices that are safe to reformat between runs.
+  bool force_format = 4;
+
+  // Admit every write into the cache index instead of requiring the default
+  // second touch. Intended for benchmark warmups that must prefill NVMe devices
+  // with a cold synthetic keyspace.
+  bool bypass_admission = 5;
+
+  // Serve reads from the committed in-memory index mirror instead of reading
+  // the terminal btree leaf from disk. Intended only for benchmark devices
+  // where recovery/corruption validation has been deliberately traded for
+  // measuring the data-page path.
+  bool bypass_index_read = 6;
+
+  // Skip data checksum validation on reads. Intended only for benchmark
+  // devices where cache contents were just populated by the same daemon and
+  // the target is measuring the NVMe data path rather than CPU checksum cost.
+  bool bypass_checksum = 7;
+
   oneof config {
-    BlockDiskConfig block = 4;
-    FileDiskConfig file = 5;
+    BlockDiskConfig block = 8;
+    FileDiskConfig file = 9;
   }
 }
 
@@ -202,7 +217,7 @@ message BlockDiskConfig {
   // Optional NUMA node hint used when placing storage work for this block device.
   optional uint32 numa = 1;
 
-  // Block device path; paths must be unique across all caches.
+  // Block device path; paths must be unique across all disks.
   string path = 2;
 }
 
@@ -210,7 +225,7 @@ message FileDiskConfig {
   // Required file-backed disk capacity in bytes; the file is provisioned to this size before opening.
   optional uint64 size = 1;
 
-  // Backing-file path; paths must be unique across all caches.
+  // Backing-file path; paths must be unique across all disks.
   string path = 2;
 }
 
@@ -226,7 +241,8 @@ message BackendSpec {
 }
 
 message HttpBackendConfig {
-  // Origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+  // Origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses plaintext;
+  // `https://` uses TLS with kTLS receive offload.
   string url = 1;
 
   // Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
@@ -235,10 +251,17 @@ message HttpBackendConfig {
 
   // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
   optional uint32 http_concurrency = 3;
+
+  // Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+  optional string ca_cert_path = 4;
+
+  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+  bool insecure_skip_verify = 5;
 }
 
 message S3BackendConfig {
-  // S3-compatible origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+  // S3-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses
+  // plaintext; `https://` uses TLS with kTLS receive offload.
   string url = 1;
 
   // Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
@@ -247,10 +270,17 @@ message S3BackendConfig {
 
   // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
   optional uint32 http_concurrency = 3;
+
+  // Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+  optional string ca_cert_path = 4;
+
+  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+  bool insecure_skip_verify = 5;
 }
 
 message AzureBackendConfig {
-  // Azure Blob-compatible origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+  // Azure Blob-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://`
+  // uses plaintext; `https://` uses TLS with kTLS receive offload.
   string url = 1;
 
   // Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
@@ -259,6 +289,12 @@ message AzureBackendConfig {
 
   // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
   optional uint32 http_concurrency = 3;
+
+  // Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+  optional string ca_cert_path = 4;
+
+  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+  bool insecure_skip_verify = 5;
 }
 
 message FakeBackendConfig {
@@ -266,7 +302,7 @@ message FakeBackendConfig {
   // Must be a power of two.
   optional uint64 stripe_size_bytes = 1;
 
-  // Size of each synthetic zero-filled object in bytes. Defaults to 1 MiB when unset.
+  // Size of each deterministic synthetic object in bytes. Defaults to 1 MiB when unset.
   optional uint64 object_size_bytes = 2;
 }
 
@@ -284,6 +320,9 @@ message FrontendSpec {
 message HttpFrontendConfig {
   // Socket address for HTTP listeners; each serving shard binds it with SO_REUSEPORT.
   string addr = 1;
+
+  // Maximum requests served on one client connection. Defaults to 1024 when unset.
+  optional uint32 max_requests_per_connection = 2;
 }
 
 message S3FrontendConfig {
@@ -295,15 +334,42 @@ message LoadgenFrontendConfig {
   // Synthetic read workers per serving shard. Defaults to 1 when unset.
   optional uint32 workers = 1;
 
-  // Deterministic object stream seed. Defaults to the loadgen frontend seed when unset.
+  // Deterministic synthetic keyspace and request stream seed.
   optional uint64 seed = 2;
 
-  // Number of distinct synthetic object ids to cycle over. Defaults to 1,000,000 when unset.
-  optional uint64 object_count = 3;
+  // Number of distinct synthetic object ids to sample. Defaults to 1,000,000 when unset.
+  optional uint64 keyspace_objects = 3;
 
-  // Bytes to read from the start of each object. When unset, reads the full resolved object length.
+  // Bytes to read from the start of each object. When unset or zero, reads the full resolved object length.
   optional uint64 read_bytes = 4;
 
-  // Verify every returned body byte is zero. Intended for fake backends.
+  // Verify returned metadata and body bytes against the deterministic synthetic dataset.
   bool verify = 5;
+
+  // Optional expected synthetic object size. When set with verify=true, rejects mismatched metadata.
+  optional uint64 object_size_bytes = 6;
+
+  // Zipf exponent for synthetic object rank sampling. Defaults to 1.1 when unset.
+  optional double zipf_exponent = 7;
+
+  // When true, workers keep sampling until the first requested stripe routes to
+  // a peer instead of local ownership. This is intended for fabric saturation
+  // benchmarks; the request still uses the normal cache/p2p/storage/origin path.
+  bool remote_only = 8;
+
+  // When true, loadgen stamps requests so peer handlers synthesize zero-filled
+  // response pages directly from their RPC scratch buffers. This bypasses disk
+  // and origin work while keeping normal peer routing, fabric RPC framing, and
+  // RDMA writes in the benchmark path.
+  bool fabric_only = 9;
+
+  // When true, workers keep sampling until the first requested stripe is owned
+  // by the local node. This is intended for benchmark warmup phases that prefill
+  // each node's own NVMe-backed cache before a remote-only measurement phase.
+  bool local_only = 10;
+
+  // When true, the initiating bufferpool skips local disk lookup and writeback.
+  // Peer handlers still use their local NVMe-backed cache, so this keeps the
+  // measured path focused on remote NVMe + RDMA instead of requester-side reuse.
+  bool skip_local_disk = 11;
 }

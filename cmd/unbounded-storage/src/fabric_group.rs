@@ -18,17 +18,18 @@
 //! the (hardware-only) verbs path uses.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use unbounded_storage::backend::{BackendRegistry, FixedRegion, OriginRing};
 use unbounded_storage::bufferpool::BlockStore;
 use unbounded_storage::config::{self, BackendSpec, RuntimePeer};
 use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, PeerId, Provider, RpcServerHandle};
-use unbounded_storage::memory::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
+use unbounded_storage::memory::{allocate, BackingKind, BackingRequest, HUGEPAGE_2MB};
 use unbounded_storage::p2p::{RecursiveHandler, RouteTableHandle, RouteTableSnapshot};
 use unbounded_storage::runtime::{Threading, WorkerIdx};
-use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{CacheDirectorySet, ChainLocalStore};
+use unbounded_storage::storage::StripeReq;
 use unbounded_storage::topology::{NicWorkerGroup, ServingShard};
 
 use crate::FabricStartup;
@@ -66,13 +67,24 @@ pub struct FabricPlan {
     pub shard_to_unit: Vec<usize>,
 }
 
+/// Fabric address published by a live unit after libfabric bind/listen
+/// completed. These are the addresses peers must dial; configured bind
+/// strings are not sufficient for verbs because libfabric owns the native
+/// address encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FabricUnitAddress {
+    pub device_name: String,
+    pub rdma: bool,
+    pub addr: String,
+}
+
 /// Decide how serving shards map onto fabric endpoints. This function is
 /// THE tcp/verbs seam (see the module docs).
 ///
 /// `shard_devices` is all-`None` (tcp fallback) or all-`Some` (verbs),
 /// per `assign_shard_devices`:
 /// - tcp: a single `lo` endpoint shared by every serving shard, pinned to
-///   worker 0. Peers reach a node through one static neighborhood peer addr,
+///   worker 0. Peers reach a node through one static process peer addr,
 ///   so a node must expose exactly one inbound
 ///   fabric endpoint on that fixed port; binding one endpoint per shard
 ///   would make every shard past the first collide on the port
@@ -228,6 +240,9 @@ struct FabricUnit<S = RpcServerHandle, Rg = BackendRegistry, Rt = RouteTableHand
     handler_registry: Rg,
     routes: Rt,
     fabric: F,
+    device_name: String,
+    rdma: bool,
+    self_addr: String,
     hca_numa: Option<u16>,
     applied_peers: HashMap<PeerId, ConnectionSpec>,
     last_backends: HashMap<String, BackendSpec>,
@@ -304,6 +319,18 @@ impl FabricGroup {
         self.units[unit].fabric.clone()
     }
 
+    /// Live local addresses for every fabric unit in deterministic unit order.
+    pub fn unit_addresses(&self) -> Vec<FabricUnitAddress> {
+        self.units
+            .iter()
+            .map(|unit| FabricUnitAddress {
+                device_name: unit.device_name.clone(),
+                rdma: unit.rdma,
+                addr: unit.self_addr.clone(),
+            })
+            .collect()
+    }
+
     /// Reload every endpoint's RPC-handler routing from a new snapshot.
     /// Driven in lockstep with the per-shard transport reload so the
     /// classify and forward paths move together.
@@ -317,8 +344,8 @@ impl FabricGroup {
     /// Connections live at the fabric/address-vector level, so this runs
     /// once per endpoint rather than once per shard.
     pub fn reconcile_peers(&mut self, peers: &[RuntimePeer]) {
-        for unit in &mut self.units {
-            let desired = runtime_peer_connections(peers);
+        for (unit_idx, unit) in self.units.iter_mut().enumerate() {
+            let desired = runtime_peer_connections_for_unit(peers, unit_idx);
             let report = config::reconcile::reconcile_connections(
                 &unit.fabric,
                 &desired,
@@ -399,13 +426,14 @@ fn build_unit(
         .map_err(|e| format!("worker={worker}: self_address: {e}"))?;
     println!(
         "fabric unit up: worker={worker} dev={} provider={:?} numa={} shards={:?} \
-         self_addr_bytes={}",
+         self_addr={} self_addr_bytes={}",
         spec.device_name,
         spec.provider,
         spec.numa
             .map(|n| n.to_string())
             .unwrap_or_else(|| "none".into()),
         spec.shards_assigned,
+        self_addr,
         self_addr.len(),
     );
 
@@ -475,7 +503,7 @@ fn build_unit(
 
     fabric.check_shared_domain_capacity(spec.expected_mr);
 
-    let desired_peers = runtime_peer_connections(peers);
+    let desired_peers = runtime_peer_connections_for_unit(peers, spec.unit_idx);
     let applied_peers =
         config::reconcile::reconcile_connections(&fabric, &desired_peers, None).applied;
     // Seed the desired-peer set so the background reconnect thread can
@@ -491,6 +519,9 @@ fn build_unit(
         handler_registry,
         routes,
         fabric,
+        device_name: spec.device_name.clone(),
+        rdma: spec.provider == Provider::Verbs,
+        self_addr,
         hca_numa: spec.numa,
         applied_peers,
         last_backends,
@@ -498,26 +529,44 @@ fn build_unit(
 }
 
 fn runtime_peer_connections(peers: &[RuntimePeer]) -> Vec<ConnectionSpec> {
+    runtime_peer_connections_for_unit(peers, 0)
+}
+
+fn runtime_peer_connections_for_unit(
+    peers: &[RuntimePeer],
+    unit_idx: usize,
+) -> Vec<ConnectionSpec> {
     peers
         .iter()
         .map(|peer| ConnectionSpec {
             peer: peer.fabric_peer_id,
-            address: runtime_peer_address(&peer.spec),
+            address: runtime_peer_address_for_unit(&peer.spec, unit_idx),
             hca_numa: None,
             tags: peer.spec.tags.clone(),
         })
         .collect()
 }
 
-fn runtime_peer_address(peer: &config::PeerSpec) -> fabric::FabricAddress {
+fn runtime_peer_address_for_unit(
+    peer: &config::PeerSpec,
+    unit_idx: usize,
+) -> fabric::FabricAddress {
     match peer.config.as_ref() {
         Some(config::peer_spec::Config::Tcp(cfg)) => {
             fabric::FabricAddress::socket(cfg.addr.clone())
         }
         Some(config::peer_spec::Config::Rdma(cfg)) => {
-            fabric::FabricAddress::native(cfg.addr.clone())
+            rdma_fabric_address(cfg.addrs.get(unit_idx).unwrap_or(&cfg.addr))
         }
         None => fabric::FabricAddress::native(""),
+    }
+}
+
+fn rdma_fabric_address(addr: &str) -> fabric::FabricAddress {
+    if addr.parse::<SocketAddr>().is_ok() {
+        fabric::FabricAddress::socket(addr.to_string())
+    } else {
+        fabric::FabricAddress::native(addr.to_string())
     }
 }
 
@@ -528,8 +577,8 @@ mod tests {
 
     use super::*;
 
-    use unbounded_storage::config::{PeerSpec, RdmaPeerConfig, peer_spec};
-    use unbounded_storage::p2p::NodeId;
+    use unbounded_storage::config::{peer_spec, PeerSpec, RdmaPeerConfig};
+    use unbounded_storage::p2p::node_id_from_name;
 
     fn shard(cpu: u32, numa: Option<u16>) -> ServingShard {
         ServingShard { cpu, numa }
@@ -549,15 +598,36 @@ mod tests {
     }
 
     fn runtime_peer(id: u64, addr: &str) -> RuntimePeer {
+        let name = format!("node-{id}");
+        let node_id = node_id_from_name(&name);
         RuntimePeer {
-            neighborhood_id: "n".to_string(),
-            node_id: NodeId(id),
-            fabric_peer_id: PeerId(id),
+            name: name.clone(),
+            node_id,
+            fabric_peer_id: PeerId(node_id.0),
             spec: PeerSpec {
-                id,
+                name,
                 tags: Vec::new(),
                 config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
                     addr: addr.to_string(),
+                    addrs: Vec::new(),
+                })),
+            },
+        }
+    }
+
+    fn runtime_peer_with_addrs(id: u64, addr: &str, addrs: Vec<&str>) -> RuntimePeer {
+        let name = format!("node-{id}");
+        let node_id = node_id_from_name(&name);
+        RuntimePeer {
+            name: name.clone(),
+            node_id,
+            fabric_peer_id: PeerId(node_id.0),
+            spec: PeerSpec {
+                name,
+                tags: Vec::new(),
+                config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
+                    addr: addr.to_string(),
+                    addrs: addrs.into_iter().map(str::to_string).collect(),
                 })),
             },
         }
@@ -670,6 +740,40 @@ mod tests {
         assert_eq!(connections[1].hca_numa, None);
     }
 
+    #[test]
+    fn rdma_socket_peer_connections_use_socket_addresses() {
+        let peers = [runtime_peer(1, "10.0.0.1:9000")];
+
+        let connections = runtime_peer_connections(&peers);
+
+        assert_eq!(connections.len(), 1);
+        assert_eq!(
+            connections[0].address,
+            fabric::FabricAddress::socket("10.0.0.1:9000")
+        );
+        assert_eq!(connections[0].hca_numa, None);
+    }
+
+    #[test]
+    fn rdma_peer_connections_select_unit_index_address() {
+        let peers = [runtime_peer_with_addrs(
+            1,
+            "hex:fallback",
+            vec!["hex:unit0", "hex:unit1"],
+        )];
+
+        let unit0 = runtime_peer_connections_for_unit(&peers, 0);
+        let unit1 = runtime_peer_connections_for_unit(&peers, 1);
+        let unit2 = runtime_peer_connections_for_unit(&peers, 2);
+
+        assert_eq!(unit0[0].address, fabric::FabricAddress::native("hex:unit0"));
+        assert_eq!(unit1[0].address, fabric::FabricAddress::native("hex:unit1"));
+        assert_eq!(
+            unit2[0].address,
+            fabric::FabricAddress::native("hex:fallback")
+        );
+    }
+
     /// Drop-logging stand-in for a `FabricUnit` resource: records its
     /// label when dropped so a test can observe field teardown order.
     struct DropToken {
@@ -710,6 +814,9 @@ mod tests {
             handler_registry: DropToken::new("handler_registry", &log),
             routes: DropToken::new("routes", &log),
             fabric: DropToken::new("fabric", &log),
+            device_name: "mlx5_0".to_string(),
+            rdma: true,
+            self_addr: "hex:01".to_string(),
             hca_numa: None,
             applied_peers: HashMap::new(),
             last_backends: HashMap::new(),
