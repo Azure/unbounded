@@ -105,6 +105,11 @@ func renderUnit(cfg Config) string {
 		execStart += " " + cfg.StorageArgs
 	}
 
+	hugepagePreStart := fmt.Sprintf("ExecStartPre=+/bin/sh -c '%s'\n", hugepageReserveCmd(cfg))
+	if cfg.NoHugepages {
+		hugepagePreStart = ""
+	}
+
 	return fmt.Sprintf(`[Unit]
 Description=unbounded-storage daemon
 Documentation=https://github.com/%[1]s
@@ -116,8 +121,7 @@ Type=simple
 User=root
 Group=root
 Environment=LD_LIBRARY_PATH=%[2]s/current/lib
-ExecStartPre=+/bin/sh -c '%[3]s'
-ExecStartPre=+/bin/sh -c '%[4]s'
+%[3]sExecStartPre=+/bin/sh -c '%[4]s'
 ExecStart=%[5]s
 Restart=always
 RestartSec=2s
@@ -135,7 +139,7 @@ TasksMax=infinity
 
 [Install]
 WantedBy=multi-user.target
-`, cfg.Repo, cfg.Prefix, hugepageReserveCmd(cfg), configEnsureCmd(cfg), execStart)
+`, cfg.Repo, cfg.Prefix, hugepagePreStart, configEnsureCmd(cfg), execStart)
 }
 
 // hugepageReserveCmd builds the shell one-liner used as an ExecStartPre to
