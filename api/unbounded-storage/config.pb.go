@@ -365,8 +365,14 @@ func (x *TcpPeerConfig) GetAddr() string {
 
 type RdmaPeerConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Provider-native RDMA fabric address encoded as "hex:<fi_getname-bytes>".
-	Addr          string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	// Default RDMA fabric address. Provider-native addresses are encoded as
+	// "hex:<fi_getname-bytes>"; RDMA-CM socket addresses are accepted when the
+	// provider reports them. Kept for single-endpoint peers and older writers.
+	Addr string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	// Ordered RDMA fabric addresses for peers that expose multiple fabric units,
+	// such as one endpoint per HCA. The daemon dials the address whose index
+	// matches the local fabric unit index, falling back to addr when absent.
+	Addrs         []string `protobuf:"bytes,2,rep,name=addrs,proto3" json:"addrs,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -406,6 +412,13 @@ func (x *RdmaPeerConfig) GetAddr() string {
 		return x.Addr
 	}
 	return ""
+}
+
+func (x *RdmaPeerConfig) GetAddrs() []string {
+	if x != nil {
+		return x.Addrs
+	}
+	return nil
 }
 
 type CacheSpec struct {
@@ -2036,9 +2049,10 @@ const file_config_proto_rawDesc = "" +
 	"\x04rdma\x18\x04 \x01(\v2(.unbounded.storage.config.RdmaPeerConfigH\x00R\x04rdmaB\b\n" +
 	"\x06config\"#\n" +
 	"\rTcpPeerConfig\x12\x12\n" +
-	"\x04addr\x18\x01 \x01(\tR\x04addr\"$\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\":\n" +
 	"\x0eRdmaPeerConfig\x12\x12\n" +
-	"\x04addr\x18\x01 \x01(\tR\x04addr\"7\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\x12\x14\n" +
+	"\x05addrs\x18\x02 \x03(\tR\x05addrs\"7\n" +
 	"\tCacheSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06source\x18\x02 \x01(\tR\x06source\"\x89\x02\n" +

@@ -477,6 +477,14 @@ fn validate_mesh(cfg: &Config) -> Result<(), ConfigError> {
                         addr: cfg.addr.clone(),
                     });
                 }
+                for addr in &cfg.addrs {
+                    if !is_valid_rdma_peer_address(addr) {
+                        return Err(ConfigError::InvalidNativePeerAddr {
+                            peer_name: p.name.clone(),
+                            addr: addr.clone(),
+                        });
+                    }
+                }
             }
             None => return Err(ConfigError::MissingPeerConfig(p.name.clone())),
         }
@@ -849,6 +857,35 @@ addr = "10.0.0.2:5000"
     }
 
     #[test]
+    fn accepts_rdma_peer_addr_list() {
+        let s = format!(
+            r#"{}
+[[peers]]
+name = "node-rdma"
+
+[peers.config.rdma]
+addr = "hex:01020304"
+addrs = ["hex:01020304", "10.0.0.2:5000"]
+"#,
+            mesh_toml()
+        );
+        let f = write_cfg(&s);
+        let cfg = load(f.path()).expect("load should succeed");
+        let peer = cfg
+            .peers
+            .iter()
+            .find(|peer| peer.name == "node-rdma")
+            .unwrap();
+        match peer.config.as_ref().unwrap() {
+            peer_spec::Config::Rdma(cfg) => {
+                assert_eq!(cfg.addr, "hex:01020304");
+                assert_eq!(cfg.addrs, ["hex:01020304", "10.0.0.2:5000"]);
+            }
+            other => panic!("expected rdma config, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_invalid_native_peer_addr() {
         for bad in [
             "gid:bad",
@@ -876,6 +913,28 @@ addr = "{bad}"
                 "expected InvalidNativePeerAddr for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_invalid_rdma_peer_addr_list_entry() {
+        let s = format!(
+            r#"{}
+[[peers]]
+name = "node-rdma"
+
+[peers.config.rdma]
+addr = "hex:01020304"
+addrs = ["hex:01020304", "example.com:5000"]
+"#,
+            mesh_toml()
+        );
+        let f = write_cfg(&s);
+
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::InvalidNativePeerAddr { peer_name, addr })
+                if peer_name == "node-rdma" && addr == "example.com:5000"
+        ));
     }
 
     #[test]

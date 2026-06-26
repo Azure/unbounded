@@ -323,7 +323,7 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 			continue
 		}
 
-		addr, err := firstRdmaInventoryAddr(n.Annotations[storageRdmaHcasAnnotation])
+		addrs, err := rdmaInventoryAddrs(n.Annotations[storageRdmaHcasAnnotation])
 		if err != nil {
 			if n.Name == selfName {
 				slog.Warn("storage ring inactive: this node has invalid rdma inventory", "node", selfName, "ring", ringValue, "error", err)
@@ -336,6 +336,10 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 			continue
 		}
 
+		addr := ""
+		if len(addrs) > 0 {
+			addr = addrs[0]
+		}
 		if addr == "" {
 			if n.Name != selfName {
 				slog.Warn("skipping storage ring peer with no rdma address", "peer", n.Name, "ring", ringValue)
@@ -361,12 +365,18 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 
 			continue
 		}
+		if len(addrs) == 0 {
+			addrs = []string{addr}
+		} else {
+			addrs = rewriteRdmaPeerDialAddrs(addrs, n)
+			addrs[0] = addr
+		}
 
 		seen[n.Name] = struct{}{}
 		ring.peers = append(ring.peers, &storageconfig.PeerSpec{
 			Name: n.Name,
 			Config: &storageconfig.PeerSpec_Rdma{
-				Rdma: &storageconfig.RdmaPeerConfig{Addr: addr},
+				Rdma: &storageconfig.RdmaPeerConfig{Addr: addr, Addrs: addrs},
 			},
 		})
 	}
@@ -374,6 +384,21 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 	sort.Slice(ring.peers, func(i, j int) bool { return ring.peers[i].Name < ring.peers[j].Name })
 
 	return ring
+}
+
+func rewriteRdmaPeerDialAddrs(addrs []string, node *corev1.Node) []string {
+	rewritten := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		if addr == "" {
+			continue
+		}
+
+		if dialAddr, ok := rdmaPeerDialAddr(addr, node); ok {
+			rewritten = append(rewritten, dialAddr)
+		}
+	}
+
+	return rewritten
 }
 
 func rdmaPeerDialAddr(addr string, node *corev1.Node) (string, bool) {

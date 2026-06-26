@@ -25,11 +25,16 @@ pub fn peer_spec_to_connection(p: &PeerSpec) -> ConnectionSpec {
 fn peer_address(p: &PeerSpec) -> FabricAddress {
     match p.config.as_ref() {
         Some(peer_spec::Config::Tcp(cfg)) => FabricAddress::socket(cfg.addr.clone()),
-        Some(peer_spec::Config::Rdma(cfg)) if cfg.addr.parse::<SocketAddr>().is_ok() => {
-            FabricAddress::socket(cfg.addr.clone())
-        }
-        Some(peer_spec::Config::Rdma(cfg)) => FabricAddress::native(cfg.addr.clone()),
+        Some(peer_spec::Config::Rdma(cfg)) => rdma_address(&cfg.addr),
         None => FabricAddress::native(""),
+    }
+}
+
+fn rdma_address(addr: &str) -> FabricAddress {
+    if addr.parse::<SocketAddr>().is_ok() {
+        FabricAddress::socket(addr.to_string())
+    } else {
+        FabricAddress::native(addr.to_string())
     }
 }
 
@@ -62,6 +67,7 @@ mod tests {
             tags: vec!["us-west".to_string(), "rack7".to_string()],
             config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
                 addr: "hex:01020304".into(),
+                addrs: Vec::new(),
             })),
         };
         let c = peer_spec_to_connection(&p);
@@ -78,6 +84,7 @@ mod tests {
             tags: vec!["us-west".to_string(), "rack7".to_string()],
             config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
                 addr: "10.0.0.1:9000".into(),
+                addrs: Vec::new(),
             })),
         };
         let c = peer_spec_to_connection(&p);

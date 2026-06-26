@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::schema::{Config, DiskSpec, PeerSpec, RoutingPlan};
 use crate::fabric::PeerId;
-use crate::p2p::{NodeId, node_id_from_name};
+use crate::p2p::{node_id_from_name, NodeId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFrontendBinding {
@@ -112,7 +112,10 @@ fn validate_peer_names(config: &Config) -> Result<(), String> {
         }
     }
     if !self_seen {
-        return Err(format!("self peer {:?} is not present in peers", config.self_));
+        return Err(format!(
+            "self peer {:?} is not present in peers",
+            config.self_
+        ));
     }
 
     Ok(())
@@ -169,9 +172,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
         .map(|peer| node_id_from_name(&peer.name))
         .unwrap_or(NodeId(0));
     let self_peer_id = PeerId(self_node_id.0);
-    let self_tags = self_peer
-        .map(|peer| peer.tags.clone())
-        .unwrap_or_default();
+    let self_tags = self_peer.map(|peer| peer.tags.clone()).unwrap_or_default();
     let self_name = (!config.self_.is_empty()).then(|| config.self_.clone());
 
     let peers = config
@@ -248,8 +249,8 @@ fn by_id<'a, T>(items: &'a [T], id: impl Fn(&'a T) -> &'a str) -> HashMap<&'a st
 #[cfg(test)]
 mod tests {
     use super::super::schema::{
-        BackendSpec, CacheSpec, FrontendSpec, HttpBackendConfig, HttpFrontendConfig, PeerSpec,
-        RdmaPeerConfig, TcpPeerConfig, backend_spec, frontend_spec, peer_spec,
+        backend_spec, frontend_spec, peer_spec, BackendSpec, CacheSpec, FrontendSpec,
+        HttpBackendConfig, HttpFrontendConfig, PeerSpec, RdmaPeerConfig, TcpPeerConfig,
     };
     use super::*;
 
@@ -300,6 +301,7 @@ mod tests {
             tags: Vec::new(),
             config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
                 addr: addr.to_string(),
+                addrs: Vec::new(),
             })),
         }
     }
@@ -332,11 +334,17 @@ mod tests {
 
         assert_eq!(graph.mesh.self_name.as_deref(), Some("node-a"));
         assert_eq!(graph.mesh.self_node_id, node_id_from_name("node-a"));
-        assert_eq!(graph.mesh.self_peer_id, PeerId(node_id_from_name("node-a").0));
+        assert_eq!(
+            graph.mesh.self_peer_id,
+            PeerId(node_id_from_name("node-a").0)
+        );
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].name, "node-b");
         assert_eq!(peers[0].node_id, node_id_from_name("node-b"));
-        assert_eq!(peers[0].fabric_peer_id, PeerId(node_id_from_name("node-b").0));
+        assert_eq!(
+            peers[0].fabric_peer_id,
+            PeerId(node_id_from_name("node-b").0)
+        );
     }
 
     #[test]

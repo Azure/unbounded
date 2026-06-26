@@ -182,22 +182,32 @@ func normalizeRdmaInventoryJSON(raw []byte) (string, *rdmaInventory, error) {
 }
 
 func firstRdmaInventoryAddr(value string) (string, error) {
+	addrs, err := rdmaInventoryAddrs(value)
+	if err != nil || len(addrs) == 0 {
+		return "", err
+	}
+
+	return addrs[0], nil
+}
+
+func rdmaInventoryAddrs(value string) ([]string, error) {
 	if value == "" {
-		return "", nil
+		return nil, nil
 	}
 
 	_, inv, err := normalizeRdmaInventoryJSON([]byte(value))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
+	var addrs []string
 	for _, hca := range inv.HCAs {
 		for _, addr := range hca.Addrs {
 			if addr != "" {
-				return addr, nil
+				addrs = append(addrs, addr)
 			}
 		}
 	}
 
-	return "", nil
+	return addrs, nil
 }

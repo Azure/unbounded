@@ -201,13 +201,16 @@ func TestComputeRDMARingMembership(t *testing.T) {
 	require.Len(t, ring.peers, 3)
 
 	got := map[string]string{}
+	gotAll := map[string][]string{}
 	for _, p := range ring.peers {
 		got[p.GetName()] = p.GetRdma().GetAddr()
+		gotAll[p.GetName()] = p.GetRdma().GetAddrs()
 	}
 
 	assert.Equal(t, "hex:self", got["self"])
 	assert.Equal(t, "hex:a", got["peer-a"])
 	assert.Equal(t, "hex:b1", got["peer-b"])
+	assert.Equal(t, []string{"hex:b1", "hex:b2"}, gotAll["peer-b"])
 }
 
 func TestComputeRDMARingRewritesWildcardSocketAddresses(t *testing.T) {
@@ -228,13 +231,41 @@ func TestComputeRDMARingRewritesWildcardSocketAddresses(t *testing.T) {
 	require.True(t, ring.active)
 	require.Len(t, ring.peers, 3)
 	got := map[string]string{}
+	gotAll := map[string][]string{}
 	for _, p := range ring.peers {
 		got[p.GetName()] = p.GetRdma().GetAddr()
+		gotAll[p.GetName()] = p.GetRdma().GetAddrs()
 	}
 
 	assert.Equal(t, "10.0.0.1:40000", got["self"])
 	assert.Equal(t, "10.0.0.2:50000", got["peer-a"])
 	assert.Equal(t, "[fd00::3]:60000", got["peer-b"])
+	assert.Equal(t, []string{"10.0.0.1:40000"}, gotAll["self"])
+	assert.Equal(t, []string{"10.0.0.2:50000"}, gotAll["peer-a"])
+	assert.Equal(t, []string{"[fd00::3]:60000"}, gotAll["peer-b"])
+}
+
+func TestComputeRDMARingPreservesAllPeerAddresses(t *testing.T) {
+	nodes := []*corev1.Node{
+		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:self0"]},{"name":"mlx5_1","addrs":["hex:self1"]}]}`,
+		}),
+		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:a0"]},{"name":"mlx5_1","addrs":["hex:a1"]}]}`,
+		}),
+	}
+
+	ring := computeRDMARing(nodes, "self", testRingLabel)
+
+	require.True(t, ring.active)
+	require.Len(t, ring.peers, 2)
+	got := map[string][]string{}
+	for _, p := range ring.peers {
+		got[p.GetName()] = p.GetRdma().GetAddrs()
+	}
+
+	assert.Equal(t, []string{"hex:self0", "hex:self1"}, got["self"])
+	assert.Equal(t, []string{"hex:a0", "hex:a1"}, got["peer-a"])
 }
 
 func TestComputeRDMARingKeepsNativeAndRoutableSocketAddresses(t *testing.T) {

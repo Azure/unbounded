@@ -344,8 +344,8 @@ impl FabricGroup {
     /// Connections live at the fabric/address-vector level, so this runs
     /// once per endpoint rather than once per shard.
     pub fn reconcile_peers(&mut self, peers: &[RuntimePeer]) {
-        for unit in &mut self.units {
-            let desired = runtime_peer_connections(peers);
+        for (unit_idx, unit) in self.units.iter_mut().enumerate() {
+            let desired = runtime_peer_connections_for_unit(peers, unit_idx);
             let report = config::reconcile::reconcile_connections(
                 &unit.fabric,
                 &desired,
@@ -503,7 +503,7 @@ fn build_unit(
 
     fabric.check_shared_domain_capacity(spec.expected_mr);
 
-    let desired_peers = runtime_peer_connections(peers);
+    let desired_peers = runtime_peer_connections_for_unit(peers, spec.unit_idx);
     let applied_peers =
         config::reconcile::reconcile_connections(&fabric, &desired_peers, None).applied;
     // Seed the desired-peer set so the background reconnect thread can
@@ -529,29 +529,44 @@ fn build_unit(
 }
 
 fn runtime_peer_connections(peers: &[RuntimePeer]) -> Vec<ConnectionSpec> {
+    runtime_peer_connections_for_unit(peers, 0)
+}
+
+fn runtime_peer_connections_for_unit(
+    peers: &[RuntimePeer],
+    unit_idx: usize,
+) -> Vec<ConnectionSpec> {
     peers
         .iter()
         .map(|peer| ConnectionSpec {
             peer: peer.fabric_peer_id,
-            address: runtime_peer_address(&peer.spec),
+            address: runtime_peer_address_for_unit(&peer.spec, unit_idx),
             hca_numa: None,
             tags: peer.spec.tags.clone(),
         })
         .collect()
 }
 
-fn runtime_peer_address(peer: &config::PeerSpec) -> fabric::FabricAddress {
+fn runtime_peer_address_for_unit(
+    peer: &config::PeerSpec,
+    unit_idx: usize,
+) -> fabric::FabricAddress {
     match peer.config.as_ref() {
         Some(config::peer_spec::Config::Tcp(cfg)) => {
             fabric::FabricAddress::socket(cfg.addr.clone())
         }
-        Some(config::peer_spec::Config::Rdma(cfg)) if cfg.addr.parse::<SocketAddr>().is_ok() => {
-            fabric::FabricAddress::socket(cfg.addr.clone())
-        }
         Some(config::peer_spec::Config::Rdma(cfg)) => {
-            fabric::FabricAddress::native(cfg.addr.clone())
+            rdma_fabric_address(cfg.addrs.get(unit_idx).unwrap_or(&cfg.addr))
         }
         None => fabric::FabricAddress::native(""),
+    }
+}
+
+fn rdma_fabric_address(addr: &str) -> fabric::FabricAddress {
+    if addr.parse::<SocketAddr>().is_ok() {
+        fabric::FabricAddress::socket(addr.to_string())
+    } else {
+        fabric::FabricAddress::native(addr.to_string())
     }
 }
 
@@ -594,6 +609,25 @@ mod tests {
                 tags: Vec::new(),
                 config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
                     addr: addr.to_string(),
+                    addrs: Vec::new(),
+                })),
+            },
+        }
+    }
+
+    fn runtime_peer_with_addrs(id: u64, addr: &str, addrs: Vec<&str>) -> RuntimePeer {
+        let name = format!("node-{id}");
+        let node_id = node_id_from_name(&name);
+        RuntimePeer {
+            name: name.clone(),
+            node_id,
+            fabric_peer_id: PeerId(node_id.0),
+            spec: PeerSpec {
+                name,
+                tags: Vec::new(),
+                config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
+                    addr: addr.to_string(),
+                    addrs: addrs.into_iter().map(str::to_string).collect(),
                 })),
             },
         }
@@ -718,6 +752,26 @@ mod tests {
             fabric::FabricAddress::socket("10.0.0.1:9000")
         );
         assert_eq!(connections[0].hca_numa, None);
+    }
+
+    #[test]
+    fn rdma_peer_connections_select_unit_index_address() {
+        let peers = [runtime_peer_with_addrs(
+            1,
+            "hex:fallback",
+            vec!["hex:unit0", "hex:unit1"],
+        )];
+
+        let unit0 = runtime_peer_connections_for_unit(&peers, 0);
+        let unit1 = runtime_peer_connections_for_unit(&peers, 1);
+        let unit2 = runtime_peer_connections_for_unit(&peers, 2);
+
+        assert_eq!(unit0[0].address, fabric::FabricAddress::native("hex:unit0"));
+        assert_eq!(unit1[0].address, fabric::FabricAddress::native("hex:unit1"));
+        assert_eq!(
+            unit2[0].address,
+            fabric::FabricAddress::native("hex:fallback")
+        );
     }
 
     /// Drop-logging stand-in for a `FabricUnit` resource: records its

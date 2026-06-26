@@ -74,8 +74,15 @@ message TcpPeerConfig {
 }
 
 message RdmaPeerConfig {
-  // Provider-native RDMA fabric address encoded as "hex:<fi_getname-bytes>".
+  // Default RDMA fabric address. Provider-native addresses are encoded as
+  // "hex:<fi_getname-bytes>"; RDMA-CM socket addresses are accepted when the
+  // provider reports them. Kept for single-endpoint peers and older writers.
   string addr = 1;
+
+  // Ordered RDMA fabric addresses for peers that expose multiple fabric units,
+  // such as one endpoint per HCA. The daemon dials the address whose index
+  // matches the local fabric unit index, falling back to addr when absent.
+  repeated string addrs = 2;
 }
 
 message CacheSpec {
