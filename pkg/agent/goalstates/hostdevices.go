@@ -221,7 +221,7 @@ func loadRDMACMModules() {
 	}
 }
 
-func rdmaCMDeviceNumber(path string) (int, int, bool) {
+func rdmaCMDeviceNumber(path string) (uint32, uint32, bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, 0, false
@@ -232,29 +232,29 @@ func rdmaCMDeviceNumber(path string) (int, int, bool) {
 		return 0, 0, false
 	}
 
-	major, err := strconv.Atoi(parts[0])
+	major, err := strconv.ParseUint(parts[0], 10, 32)
 	if err != nil {
 		return 0, 0, false
 	}
 
-	minor, err := strconv.Atoi(parts[1])
+	minor, err := strconv.ParseUint(parts[1], 10, 32)
 	if err != nil {
 		return 0, 0, false
 	}
 
-	return major, minor, true
+	return uint32(major), uint32(minor), true
 }
 
 type mknodFunc func(path string, mode uint32, dev int) error
 
-func createRDMACMDeviceNode(infinibandDir string, major, minor int, mknod mknodFunc) string {
+func createRDMACMDeviceNode(infinibandDir string, major, minor uint32, mknod mknodFunc) string {
 	if err := os.MkdirAll(infinibandDir, 0o755); err != nil {
 		return ""
 	}
 
 	nodePath := filepath.Join(infinibandDir, "rdma_cm")
 
-	dev := int(unix.Mkdev(uint32(major), uint32(minor)))
+	dev := int(unix.Mkdev(major, minor))
 	if err := mknod(nodePath, unix.S_IFCHR|0o666, dev); err != nil && !os.IsExist(err) {
 		return ""
 	}

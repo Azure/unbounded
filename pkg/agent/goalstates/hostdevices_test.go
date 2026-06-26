@@ -139,8 +139,8 @@ func TestRDMACMDeviceNumber(t *testing.T) {
 
 	major, minor, ok := rdmaCMDeviceNumber(devFile)
 	require.True(t, ok)
-	require.Equal(t, 10, major)
-	require.Equal(t, 263, minor)
+	require.Equal(t, uint32(10), major)
+	require.Equal(t, uint32(263), minor)
 }
 
 func TestRDMACMDeviceNumberInvalid(t *testing.T) {
@@ -148,6 +148,16 @@ func TestRDMACMDeviceNumberInvalid(t *testing.T) {
 
 	devFile := filepath.Join(t.TempDir(), "dev")
 	require.NoError(t, os.WriteFile(devFile, []byte("not-a-device\n"), 0o644))
+
+	_, _, ok := rdmaCMDeviceNumber(devFile)
+	require.False(t, ok)
+}
+
+func TestRDMACMDeviceNumberRejectsOverflow(t *testing.T) {
+	t.Parallel()
+
+	devFile := filepath.Join(t.TempDir(), "dev")
+	require.NoError(t, os.WriteFile(devFile, []byte("4294967296:0\n"), 0o644))
 
 	_, _, ok := rdmaCMDeviceNumber(devFile)
 	require.False(t, ok)
