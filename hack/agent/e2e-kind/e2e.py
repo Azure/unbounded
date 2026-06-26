@@ -446,6 +446,15 @@ def machine_shell_quiet(machine: str, command: str) -> subprocess.CompletedProce
     return ssh_capture_quiet(f"sudo machinectl shell {machine} /bin/sh -lc {quoted}")
 
 
+def nspawn_os_release(machine: str) -> str:
+    result = ssh_capture_quiet(f"sudo cat /var/lib/machines/{machine}/etc/os-release")
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout
+
+    diag(f"Could not read /var/lib/machines/{machine}/etc/os-release directly; trying machinectl shell")
+    return machine_shell(machine, "cat /etc/os-release")
+
+
 def parse_os_release(content: str) -> dict[str, str]:
     values: dict[str, str] = {}
     for raw_line in content.splitlines():
@@ -513,7 +522,7 @@ def validate_host_nspawn_distro() -> None:
             f"VERSION_ID={host_release.get('VERSION_ID', '')!r}")
 
     machine = active_nspawn_machine()
-    nspawn_release = parse_os_release(machine_shell(machine, "cat /etc/os-release"))
+    nspawn_release = parse_os_release(nspawn_os_release(machine))
     nspawn_distro = distro_from_os_release(nspawn_release)
     expected = expected_nspawn_distro_for_host(host_distro)
     if nspawn_distro != expected:
