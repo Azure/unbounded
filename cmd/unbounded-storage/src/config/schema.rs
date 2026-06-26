@@ -403,6 +403,7 @@ path = "/dev/nvme0n1"
         c.apply_defaults();
         assert_eq!(c.disks[0].page_size_bytes, None);
         assert!(!c.disks[0].skip_recovery_scan);
+        assert!(!c.disks[0].force_format);
     }
 
     #[test]
@@ -411,6 +412,7 @@ path = "/dev/nvme0n1"
 [[disks]]
 page_size_bytes = 4096
 skip_recovery_scan = true
+force_format = true
 
 [disks.config.block]
 path = "/dev/nvme0n1"
@@ -419,6 +421,7 @@ path = "/dev/nvme0n1"
         c.apply_defaults();
         assert_eq!(c.disks[0].page_size_bytes, Some(4096));
         assert!(c.disks[0].skip_recovery_scan);
+        assert!(c.disks[0].force_format);
     }
 
     #[test]

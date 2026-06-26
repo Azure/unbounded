@@ -1068,6 +1068,9 @@ type DiskSpec struct {
 	PageSizeBytes *uint64 `protobuf:"varint,2,opt,name=page_size_bytes,json=pageSizeBytes,proto3,oneof" json:"page_size_bytes,omitempty"`
 	// Skips the recovery scan when no metadata page is valid; intended only for fresh or benchmark disks.
 	SkipRecoveryScan bool `protobuf:"varint,3,opt,name=skip_recovery_scan,json=skipRecoveryScan,proto3" json:"skip_recovery_scan,omitempty"`
+	// Destructively resets the cache index on open, ignoring any existing on-disk metadata.
+	// Intended only for benchmark cache devices that are safe to reformat between runs.
+	ForceFormat bool `protobuf:"varint,6,opt,name=force_format,json=forceFormat,proto3" json:"force_format,omitempty"`
 	// Types that are valid to be assigned to Config:
 	//
 	//	*DiskSpec_Block
@@ -1124,6 +1127,13 @@ func (x *DiskSpec) GetPageSizeBytes() uint64 {
 func (x *DiskSpec) GetSkipRecoveryScan() bool {
 	if x != nil {
 		return x.SkipRecoveryScan
+	}
+	return false
+}
+
+func (x *DiskSpec) GetForceFormat() bool {
+	if x != nil {
+		return x.ForceFormat
 	}
 	return false
 }
@@ -2124,12 +2134,13 @@ const file_config_proto_rawDesc = "" +
 	"\vnic_workers\x18\a \x01(\x04H\x01R\n" +
 	"nicWorkers\x88\x01\x01B\x10\n" +
 	"\x0e_serving_coresB\x0e\n" +
-	"\f_nic_workers\"\xbc\x02\n" +
+	"\f_nic_workers\"\xdf\x02\n" +
 	"\bDiskSpec\x12$\n" +
 	"\vqueue_depth\x18\x01 \x01(\rH\x01R\n" +
 	"queueDepth\x88\x01\x01\x12+\n" +
 	"\x0fpage_size_bytes\x18\x02 \x01(\x04H\x02R\rpageSizeBytes\x88\x01\x01\x12,\n" +
-	"\x12skip_recovery_scan\x18\x03 \x01(\bR\x10skipRecoveryScan\x12A\n" +
+	"\x12skip_recovery_scan\x18\x03 \x01(\bR\x10skipRecoveryScan\x12!\n" +
+	"\fforce_format\x18\x06 \x01(\bR\vforceFormat\x12A\n" +
 	"\x05block\x18\x04 \x01(\v2).unbounded.storage.config.BlockDiskConfigH\x00R\x05block\x12>\n" +
 	"\x04file\x18\x05 \x01(\v2(.unbounded.storage.config.FileDiskConfigH\x00R\x04fileB\b\n" +
 	"\x06configB\x0e\n" +

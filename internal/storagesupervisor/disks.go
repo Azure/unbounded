@@ -23,6 +23,7 @@ const (
 	diskOptionQueueDepth       = "queue_depth"
 	diskOptionPageSizeBytes    = "page_size_bytes"
 	diskOptionSkipRecoveryScan = "skip_recovery_scan"
+	diskOptionForceFormat      = "force_format"
 	diskOptionNuma             = "numa"
 )
 
@@ -178,6 +179,20 @@ func applyDiskOption(disk *storageconfig.DiskSpec, raw string, seen map[string]s
 		}
 
 		disk.SkipRecoveryScan = v
+		seen[key] = struct{}{}
+	case diskOptionForceFormat:
+		if isDuplicateDiskOption(seen, path, key) {
+			return
+		}
+
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			slog.Warn("ignoring invalid storage disk bool option", "path", path, "key", key, "value", value)
+
+			return
+		}
+
+		disk.ForceFormat = v
 		seen[key] = struct{}{}
 	case diskOptionNuma:
 		if isDuplicateDiskOption(seen, path, key) {

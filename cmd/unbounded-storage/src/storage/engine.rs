@@ -103,6 +103,11 @@ pub struct EngineConfig {
     /// per terabyte. Production should leave this false so partial
     /// recovery still runs when the meta slots are corrupted.
     pub skip_recovery_scan_if_no_meta: bool,
+    /// When true, ignore any existing on-disk btree metadata and
+    /// bootstrap an empty cache index. This is destructive: old cache
+    /// entries become unreachable and may be overwritten. Intended for
+    /// benchmark devices that are explicitly reset between runs.
+    pub force_format: bool,
     /// Stable identifier for this disk, used as the `disk` label on
     /// the engine's Prometheus metrics. Empty when unset (e.g. in
     /// tests and benchmarks); production wiring sets it from the
@@ -126,6 +131,7 @@ impl Default for EngineConfig {
             btree_scratch_pages: 64,
             bypass_admission: false,
             skip_recovery_scan_if_no_meta: false,
+            force_format: false,
             disk_id: String::new(),
         }
     }
@@ -266,6 +272,7 @@ impl<B: BlockDevice> StorageEngine<B> {
                 scratch.clone(),
                 cfg.btree_page_bytes,
                 cfg.skip_recovery_scan_if_no_meta,
+                cfg.force_format,
             )
             .await?,
         );

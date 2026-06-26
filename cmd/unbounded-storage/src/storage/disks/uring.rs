@@ -48,18 +48,18 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::config::schema::DiskSpec;
-use crate::ring::{clear_current_storage_ring, set_current_storage_ring, StorageRingConfig};
-use crate::runtime::{noop_waker, PinnedRuntime, WorkerSpec};
+use crate::ring::{StorageRingConfig, clear_current_storage_ring, set_current_storage_ring};
+use crate::runtime::{PinnedRuntime, WorkerSpec, noop_waker};
 use crate::storage::blockdev::{
-    provision_file, BlockDevice, CoreLocalDevice, OpenDisk, UringDevice,
+    BlockDevice, CoreLocalDevice, OpenDisk, UringDevice, provision_file,
 };
 use crate::storage::types::Error;
 use crate::storage::{EngineConfig, PageChannel, PageService, StorageEngine};
@@ -439,14 +439,15 @@ fn disable_polled_ring(ring_cfg: &mut StorageRingConfig) {
 
 /// Build an [`EngineConfig`] from a [`DiskSpec`]. Production defaults
 /// come from [`EngineConfig::default`]; the spec only overrides what
-/// the operator chose to expose: `page_size_bytes` and
-/// `skip_recovery_scan`.
+/// the operator chose to expose: `page_size_bytes`, recovery-scan
+/// behavior, and benchmark-only destructive reset.
 fn engine_config_from(spec: &DiskSpec) -> EngineConfig {
     let mut cfg = EngineConfig::default();
     if let Some(p) = spec.page_size_bytes {
         cfg.page_size_bytes = p as usize;
     }
     cfg.skip_recovery_scan_if_no_meta = spec.skip_recovery_scan;
+    cfg.force_format = spec.force_format;
     cfg.disk_id = spec
         .path()
         .expect("disk path is validated at config load")
@@ -716,6 +717,7 @@ mod tests {
             queue_depth: Some(32),
             page_size_bytes: None,
             skip_recovery_scan: false,
+            force_format: false,
             config: Some(crate::config::schema::disk_spec::Config::File(
                 crate::config::schema::FileDiskConfig {
                     path: "/tmp/unbounded-storage-test-disk".to_string(),
@@ -739,6 +741,7 @@ mod tests {
             queue_depth: Some(64),
             page_size_bytes: None,
             skip_recovery_scan: false,
+            force_format: false,
             config: Some(crate::config::schema::disk_spec::Config::Block(
                 crate::config::schema::BlockDiskConfig {
                     numa: None,

@@ -523,7 +523,7 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation: "/dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0;skip_recovery_scan=true",
+			storageDisksAnnotation: "/dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0;skip_recovery_scan=true;force_format=true",
 		},
 	})
 
@@ -538,6 +538,7 @@ version: 1
 	assert.NotNil(t, disk.GetBlock().Numa)
 	assert.Equal(t, uint32(0), disk.GetBlock().GetNuma())
 	assert.True(t, disk.GetSkipRecoveryScan())
+	assert.True(t, disk.GetForceFormat())
 }
 
 func TestRenderConfigInjectsMultipleAnnotatedBlockDisks(t *testing.T) {
@@ -572,7 +573,7 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation: "/dev/nvme1n1;unknown=x;queue_depth=0;queue_depth=512;queue_depth=1024;page_size_bytes=bad;skip_recovery_scan=maybe;numa=bad;empty=;=value;missing",
+			storageDisksAnnotation: "/dev/nvme1n1;unknown=x;queue_depth=0;queue_depth=512;queue_depth=1024;page_size_bytes=bad;skip_recovery_scan=maybe;force_format=maybe;numa=bad;empty=;=value;missing",
 		},
 	})
 
@@ -584,6 +585,7 @@ version: 1
 	assert.Nil(t, disk.PageSizeBytes)
 	assert.Nil(t, disk.GetBlock().Numa)
 	assert.False(t, disk.GetSkipRecoveryScan())
+	assert.False(t, disk.GetForceFormat())
 	assert.Contains(t, logs.String(), "ignoring unknown storage disk option")
 	assert.Contains(t, logs.String(), "ignoring duplicate storage disk option")
 }

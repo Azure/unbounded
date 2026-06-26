@@ -190,6 +190,10 @@ message DiskSpec {
   // Skips the recovery scan when no metadata page is valid; intended only for fresh or benchmark disks.
   bool skip_recovery_scan = 3;
 
+  // Destructively resets the cache index on open, ignoring any existing on-disk metadata.
+  // Intended only for benchmark cache devices that are safe to reformat between runs.
+  bool force_format = 6;
+
   oneof config {
     BlockDiskConfig block = 4;
     FileDiskConfig file = 5;
