@@ -83,6 +83,7 @@ pub struct RootSnapshot {
     tracker: Rc<RefCell<AliveTracker>>,
     pending: Rc<RefCell<PendingFree>>,
     allocator: Arc<Allocator>,
+    internal_cache: Arc<cow::InternalNodeCache>,
 }
 
 impl RootSnapshot {
@@ -92,6 +93,7 @@ impl RootSnapshot {
         tracker: Rc<RefCell<AliveTracker>>,
         pending: Rc<RefCell<PendingFree>>,
         allocator: Arc<Allocator>,
+        internal_cache: Arc<cow::InternalNodeCache>,
     ) -> Arc<Self> {
         Arc::new(Self {
             root_lba,
@@ -99,7 +101,12 @@ impl RootSnapshot {
             tracker,
             pending,
             allocator,
+            internal_cache,
         })
+    }
+
+    fn lookup_cache_bytes(&self) -> usize {
+        self.internal_cache.bytes()
     }
 }
 
@@ -208,10 +215,23 @@ impl<B: BlockDevice> BTreeIndex<B> {
         scratch: Rc<ScratchPool>,
         btree_page_bytes: usize,
         skip_recovery_scan_if_no_meta: bool,
+        force_format: bool,
     ) -> Result<Self, Error> {
         // Reserve the meta slots regardless of disk state.
         let _ = allocator.mark_in_use(page::META_SLOT_A);
         let _ = allocator.mark_in_use(page::META_SLOT_B);
+
+        if force_format {
+            return Self::bootstrap_from_entries(
+                device,
+                allocator,
+                scratch,
+                btree_page_bytes,
+                1,
+                BTreeMap::new(),
+            )
+            .await;
+        }
 
         let loaded = meta::load_meta(&*device, &scratch).await?;
         if let Some(state) = loaded {
@@ -316,12 +336,16 @@ impl<B: BlockDevice> BTreeIndex<B> {
         let pending = Rc::new(RefCell::new(PendingFree::default()));
         alive.borrow_mut().alive.insert(state.txn_id);
 
+        let internal_cache =
+            cow::build_internal_cache(&**device, scratch, state.root_lba, false).await?;
+
         let snapshot = RootSnapshot::new(
             state.root_lba,
             state.txn_id,
             alive.clone(),
             pending.clone(),
             allocator.clone(),
+            internal_cache,
         );
 
         Ok(Some(Self {
@@ -382,12 +406,15 @@ impl<B: BlockDevice> BTreeIndex<B> {
         let pending = Rc::new(RefCell::new(PendingFree::default()));
         alive.borrow_mut().alive.insert(txn_id);
 
+        let internal_cache = cow::build_internal_cache(&*device, &scratch, root_lba, true).await?;
+
         let snapshot = RootSnapshot::new(
             root_lba,
             txn_id,
             alive.clone(),
             pending.clone(),
             allocator.clone(),
+            internal_cache,
         );
 
         Ok(Self {
@@ -405,11 +432,25 @@ impl<B: BlockDevice> BTreeIndex<B> {
         })
     }
 
-    /// Look up `key`. Disk errors and structural corruption
-    /// surface as `Ok(None)` per the design's silent-miss policy.
+    /// Look up `key` by using the current snapshot's internal-node
+    /// cache, then reading the terminal leaf from disk.
     pub async fn lookup(&self, key: &PageKey) -> Result<Option<LeafEntry>, Error> {
         let snap = self.root.load();
-        cow::lookup(&*self.device, &self.scratch, snap.root_lba, key).await
+        cow::lookup(
+            &*self.device,
+            &self.scratch,
+            snap.root_lba,
+            &snap.internal_cache,
+            key,
+        )
+        .await
+    }
+
+    /// Benchmark-only lookup path backed by the committed in-memory
+    /// mirror. This skips the terminal leaf read, so it must not be used
+    /// for production recovery/corruption semantics.
+    pub fn lookup_committed_mirror(&self, key: &PageKey) -> Option<LeafEntry> {
+        self.mutator.borrow().entries.get(key).copied()
     }
 
     /// Apply a batch of mutations atomically. Must be called by
@@ -459,6 +500,17 @@ impl<B: BlockDevice> BTreeIndex<B> {
             sorted_ops,
         )
         .await?;
+
+        let internal_cache =
+            match cow::build_internal_cache(&*self.device, &self.scratch, result.new_root, true)
+                .await
+            {
+                Ok(cache) => cache,
+                Err(e) => {
+                    cow::free_all(&self.allocator, &result.new_pages);
+                    return Err(e);
+                }
+            };
 
         let active = self.active_meta.get();
         // apply_path_copy above has already marked the new pages
@@ -512,6 +564,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
             self.alive.clone(),
             self.pending.clone(),
             self.allocator.clone(),
+            internal_cache,
         );
         self.root.store(snapshot);
         Ok(())
@@ -532,10 +585,16 @@ impl<B: BlockDevice> BTreeIndex<B> {
         }
     }
 
-    /// Number of live entries in the in-memory mirror. Exposed
-    /// for diagnostics and tests; lookups never use this.
+    /// Number of live entries in the in-memory mirror. Exposed for
+    /// diagnostics and tests.
     pub fn live_entries(&self) -> usize {
         self.mutator.borrow().entries.len()
+    }
+
+    /// Heap footprint of the immutable lookup cache owned by the
+    /// currently published snapshot.
+    pub fn lookup_cache_bytes(&self) -> usize {
+        self.root.load().lookup_cache_bytes()
     }
 
     /// Largest LBA ever allocated on the underlying allocator. Exposed for diagnostics and tests.

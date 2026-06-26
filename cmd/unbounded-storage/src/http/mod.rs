@@ -24,11 +24,16 @@
 //! borrowed header views (zero-copy on the hot path); the serializers
 //! build an owned `Vec<u8>` from an [`http::Request`]/[`http::Response`].
 
+mod connection;
 mod headers;
 mod request;
 mod response;
 mod server;
 
+pub use connection::{
+    connection_header_value, request_allows_keep_alive, request_is_bodyless,
+    request_wants_keep_alive, response_closes_after_body, response_keep_alive,
+};
 pub use headers::{Header, ParseError};
 pub use request::{HttpRequest, serialize_request};
 pub use response::{ResponseHead, serialize_response_head};

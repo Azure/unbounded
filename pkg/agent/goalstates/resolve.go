@@ -44,6 +44,8 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		return nil, fmt.Errorf("resolve nvidia host: %w", err)
 	}
 
+	amd := ResolveAMDHost()
+
 	ociImage := ResolveOCIImage(log, cfg.OCIImage, len(nvidia.GPUDevicePaths) > 0)
 
 	kubelet, err := resolveKubelet(cfg)
@@ -87,7 +89,8 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		Downloads:         downloads,
 		OCIImage:          ociImage,
 		Nvidia:            nvidia,
-		HostDevicePaths:   DiscoverHostDevicePaths(),
+		AMD:               amd,
+		HostDevices:       DiscoverHostDevices(),
 	}
 
 	nodeStart := &NodeStart{

@@ -90,7 +90,16 @@ impl std::fmt::Display for RecursiveHandlerError {
     }
 }
 
-impl std::error::Error for RecursiveHandlerError {}
+impl std::error::Error for RecursiveHandlerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RecursiveHandlerError::BlockStore(e)
+            | RecursiveHandlerError::Backend(e)
+            | RecursiveHandlerError::Forward(e) => Some(e),
+            RecursiveHandlerError::NoScratchPage | RecursiveHandlerError::HopLimitExceeded => None,
+        }
+    }
+}
 
 /// Recursive handler resolving stripe reads by routing through the
 /// finger table.
@@ -357,6 +366,15 @@ where
     /// because RPC worker threads are separate from shard threads.
     fn serve(&mut self) -> Result<PageRef, RecursiveHandlerError> {
         let page_size = self.scratch.page_size();
+        if self.req.fabric_only() {
+            crate::metrics::p2p_request(crate::metrics::Disposition::Local);
+
+            let (idx, page) = serve_synthetic_page(&self.scratch, self.src, page_size)?;
+            self.page_idx = Some(idx);
+
+            return Ok(page);
+        }
+
         let target = stripe_to_ring(self.key);
         let route = self
             .fingers
@@ -434,6 +452,29 @@ fn scratch_page(idx: u32, page_size: usize) -> PageRef {
         offset: 0,
         len: page_size as u32,
     }
+}
+
+/// Synthetic fabric benchmark path: reserve one zeroed scratch page and
+/// return it as if it were a resolved stripe. The RPC layer still sends
+/// the response by RDMA-writing this page to the requester.
+fn serve_synthetic_page(
+    scratch: &ScratchBacking,
+    src: BulkRef,
+    page_size: usize,
+) -> Result<(u32, PageRef), RecursiveHandlerError> {
+    let idx = scratch
+        .take_zeroed()
+        .ok_or(RecursiveHandlerError::NoScratchPage)?;
+    let len = (src.len as usize).min(page_size) as u32;
+
+    Ok((
+        idx,
+        PageRef {
+            page_idx: idx,
+            offset: 0,
+            len,
+        },
+    ))
 }
 
 /// Owner path: read the page from the local store, falling back to the
@@ -795,6 +836,22 @@ mod tests {
             Err(RecursiveHandlerError::BlockStore(_)) => {}
             other => panic!("expected BlockStore error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fabric_only_request_yields_zeroed_scratch_without_store_or_backend() {
+        let (backing, base) = scratch_backing();
+        let key = key_for_ring(11);
+        let scratch = ScratchBacking::new(backing, SCRATCH_PAGES as u32);
+
+        let (_idx, page) = match serve_synthetic_page(&scratch, src_for(key), PAGE) {
+            Ok(page) => page,
+            Err(e) => panic!("fabric-only request failed: {e}"),
+        };
+
+        assert_eq!(page.page_idx, 0);
+        assert_eq!(page.len, PAGE as u32);
+        assert!(page_all(base, page.page_idx).iter().all(|&b| b == 0));
     }
 
     // --- scratch recycling (cross-request leak guard) ---
