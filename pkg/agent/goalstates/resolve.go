@@ -206,6 +206,10 @@ func defaultOCIImageForHostDistro(hostDistro string, nvidiaGPUAvailable bool) st
 
 		return DefaultUbuntu2604OCIImage
 	case hostDistroAzureLinux3:
+		if nvidiaGPUAvailable {
+			return DefaultAzureLinux3NvidiaOCIImage
+		}
+
 		return DefaultAzureLinux3OCIImage
 	default:
 		if nvidiaGPUAvailable {

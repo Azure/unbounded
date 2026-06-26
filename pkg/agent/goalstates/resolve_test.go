@@ -162,10 +162,10 @@ func TestResolveOCIImage_DefaultForHostDistro(t *testing.T) {
 			want:   DefaultAzureLinux3OCIImage,
 		},
 		{
-			name:      "azure linux 3 nvidia falls back to supported distro image",
+			name:      "azure linux 3 nvidia",
 			distro:    hostDistroAzureLinux3,
 			nvidiaGPU: true,
-			want:      DefaultAzureLinux3OCIImage,
+			want:      DefaultAzureLinux3NvidiaOCIImage,
 		},
 		{
 			name:   "unknown falls back to ubuntu 2404",
