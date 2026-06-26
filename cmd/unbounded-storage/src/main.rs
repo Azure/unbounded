@@ -870,6 +870,7 @@ fn run_shard(
         handle: NetHandle::new(socket.clone()),
         fanout: fanout.clone(),
         geometry: geometry.clone(),
+        routes: routes.clone(),
         bindings: Rc::new(RefCell::new((*frontend_bindings).clone())),
         page_size,
         worker_idx: widx.0,
@@ -1264,6 +1265,9 @@ struct FrontendBuildCtx {
     /// stripe change sees the new geometry. A frontend's stripe size is
     /// that of the backend it serves.
     geometry: Rc<RefCell<HashMap<String, u64>>>,
+    /// Per-cache peer routing table. Loadgen can optionally use it for
+    /// remote-only key selection while issuing normal cache reads.
+    routes: RouteTableHandle,
     bindings: Rc<RefCell<HashMap<String, ResolvedFrontendBinding>>>,
     page_size: usize,
     worker_idx: u16,
@@ -1374,6 +1378,7 @@ impl FrontendBuildCtx {
                     binding.cache_id.clone(),
                     stripe_size,
                     self.page_size,
+                    self.routes.clone(),
                     binding.bypass_cache,
                     self.worker_idx,
                     self.waker.clone(),

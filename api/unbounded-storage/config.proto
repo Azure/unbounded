@@ -334,4 +334,9 @@ message LoadgenFrontendConfig {
 
   // Zipf exponent for synthetic object rank sampling. Defaults to 1.1 when unset.
   optional double zipf_exponent = 7;
+
+  // When true, workers keep sampling until the first requested stripe routes to
+  // a peer instead of local ownership. This is intended for fabric saturation
+  // benchmarks; the request still uses the normal cache/p2p/storage/origin path.
+  bool remote_only = 8;
 }

@@ -20,11 +20,12 @@ use std::time::Instant;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-use crate::bufferpool::{BufferPool, ReadStream, StripePlan};
+use crate::bufferpool::{BufferPool, ReadStream, Req, StripePlan};
 use crate::config::{FrontendSpec, frontend_spec};
 use crate::frontend::FrontendError;
 use crate::frontend::range::ResolvedRange;
 use crate::metrics;
+use crate::p2p::{RouteTableHandle, stripe_to_ring};
 use crate::storage::{
     ObjectMetadata, OriginRef, StripeReq, SyntheticObjectId, object_hash, splitmix64,
     synthetic_matches_bytes, synthetic_object_id,
@@ -46,6 +47,7 @@ pub struct LoadgenFrontend {
     read_bytes: u64,
     zipf_exponent: f64,
     verify: bool,
+    remote_only: bool,
 }
 
 impl LoadgenFrontend {
@@ -74,6 +76,7 @@ impl LoadgenFrontend {
             read_bytes: loadgen.read_bytes.unwrap_or(0),
             zipf_exponent,
             verify: loadgen.verify,
+            remote_only: loadgen.remote_only,
         })
     }
 
@@ -98,6 +101,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> LoadgenDriver<P> {
         cache_id: Option<String>,
         stripe_size: u64,
         page_size: usize,
+        routes: RouteTableHandle,
         bypass: bool,
         shard_idx: u16,
         waker: Waker,
@@ -116,6 +120,8 @@ impl<P: BufferPool<Req = StripeReq> + 'static> LoadgenDriver<P> {
             read_bytes: frontend.read_bytes,
             sampler: ZipfSampler::new(frontend.keyspace_objects, frontend.zipf_exponent),
             verify: frontend.verify,
+            routes,
+            remote_only: frontend.remote_only,
         });
         let workers = (0..worker_count)
             .map(|worker_idx| {
@@ -172,6 +178,8 @@ struct LoadgenRun {
     read_bytes: u64,
     sampler: ZipfSampler,
     verify: bool,
+    routes: RouteTableHandle,
+    remote_only: bool,
 }
 
 fn loadgen_worker_loop<P: BufferPool<Req = StripeReq> + 'static>(
@@ -182,7 +190,7 @@ fn loadgen_worker_loop<P: BufferPool<Req = StripeReq> + 'static>(
 ) -> Pin<Box<dyn Future<Output = ()>>> {
     Box::pin(async move {
         loop {
-            let object = cfg.sampler.sample(cfg.seed, &mut rng);
+            let object = sample_object(&cfg, &mut rng);
             let start = Instant::now();
             let result = read_generated_object(&pool, &cfg, object).await;
             let (status, bytes) = match result {
@@ -200,6 +208,37 @@ fn loadgen_worker_loop<P: BufferPool<Req = StripeReq> + 'static>(
             YieldOnce::new().await;
         }
     })
+}
+
+fn sample_object(cfg: &LoadgenRun, rng: &mut WorkerRng) -> SyntheticObjectId {
+    const MAX_REMOTE_SAMPLE_ATTEMPTS: usize = 1024;
+
+    let mut fallback = None;
+    for _ in 0..MAX_REMOTE_SAMPLE_ATTEMPTS {
+        let object = cfg.sampler.sample(cfg.seed, rng);
+        if fallback.is_none() {
+            fallback = Some(object);
+        }
+        if !cfg.remote_only || first_stripe_routes_remote(cfg, object) {
+            return object;
+        }
+    }
+
+    fallback.expect("sampler loop always records first sample")
+}
+
+fn first_stripe_routes_remote(cfg: &LoadgenRun, object: SyntheticObjectId) -> bool {
+    if cfg.bypass || cfg.cache_id.is_none() {
+        return false;
+    }
+
+    let object_id = synthetic_object_id(object.seed, object.ordinal);
+    let req = request_from_origin(OriginRef::new(&cfg.backend_id, &object_id, 0), cfg);
+    let Some(route) = cfg.routes.route_for_req(&req) else {
+        return false;
+    };
+
+    route.fingers.next_hop(stripe_to_ring(req.key())).is_some()
 }
 
 struct YieldOnce {
@@ -423,6 +462,7 @@ mod tests {
 
     use crate::bufferpool::{PageRef, Req};
     use crate::config::{HttpFrontendConfig, LoadgenFrontendConfig};
+    use crate::p2p::{FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyTags};
 
     fn noop_waker() -> Waker {
         fn no_op(_: *const ()) {}
@@ -471,7 +511,56 @@ mod tests {
             read_bytes: 0,
             sampler: ZipfSampler::new(5, DEFAULT_ZIPF_EXPONENT),
             verify: false,
+            routes: RouteTableHandle::empty(),
+            remote_only: false,
         }
+    }
+
+    fn route_handle(local_ring: u64, peer_ring: u64) -> RouteTableHandle {
+        let local = PeerEntry {
+            node: NodeId(1),
+            ring: RingId(local_ring),
+            tags: TopologyTags(Vec::new()),
+        };
+        let peer = PeerEntry {
+            node: NodeId(2),
+            ring: RingId(peer_ring),
+            tags: TopologyTags(Vec::new()),
+        };
+        let fingers = std::sync::Arc::new(FingerTable::build(
+            local,
+            &[peer],
+            FingerTableConfig { k: 4 },
+        ));
+        let node_to_peer = std::sync::Arc::new(std::collections::HashMap::from([(
+            NodeId(2),
+            crate::fabric::PeerId(2),
+        )]));
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "cache".to_string(),
+            crate::p2p::RoutingSnapshot {
+                fingers,
+                node_to_peer,
+            },
+        );
+
+        RouteTableHandle::new(routes)
+    }
+
+    fn find_object_with_remote_route(cfg: &LoadgenRun, want_remote: bool) -> SyntheticObjectId {
+        for ordinal in 0..100_000 {
+            let object = SyntheticObjectId {
+                seed: cfg.seed,
+                ordinal,
+                hash: object_hash(cfg.seed, ordinal),
+            };
+            if first_stripe_routes_remote(cfg, object) == want_remote {
+                return object;
+            }
+        }
+
+        panic!("could not find object with desired route");
     }
 
     struct MetadataProbePool {
@@ -535,6 +624,7 @@ mod tests {
         assert_eq!(frontend.read_bytes, 0);
         assert_eq!(frontend.zipf_exponent, DEFAULT_ZIPF_EXPONENT);
         assert!(!frontend.verify);
+        assert!(!frontend.remote_only);
     }
 
     #[test]
@@ -548,6 +638,7 @@ mod tests {
             read_bytes: Some(0),
             zipf_exponent: Some(1.0),
             verify: false,
+            remote_only: false,
         }));
         let frontend = LoadgenFrontend::from_spec(&spec).unwrap();
         assert_eq!(frontend.workers, 0);
@@ -555,6 +646,18 @@ mod tests {
         assert_eq!(frontend.keyspace_objects, 0);
         assert_eq!(frontend.expected_object_size_bytes, Some(0));
         assert_eq!(frontend.read_bytes, 0);
+    }
+
+    #[test]
+    fn remote_only_flag_loads_from_spec() {
+        let mut spec = loadgen_spec();
+        spec.config = Some(frontend_spec::Config::Loadgen(LoadgenFrontendConfig {
+            remote_only: true,
+            ..LoadgenFrontendConfig::default()
+        }));
+
+        let frontend = LoadgenFrontend::from_spec(&spec).unwrap();
+        assert!(frontend.remote_only);
     }
 
     #[test]
@@ -629,6 +732,32 @@ mod tests {
         assert_eq!(req.origin().unwrap().backend_id, "fake");
         assert_eq!(req.cache_id(), Some("cache"));
         assert!(crate::bufferpool::Req::bypass(&req));
+    }
+
+    #[test]
+    fn remote_route_predicate_uses_route_table() {
+        let mut cfg = run_cfg();
+        cfg.routes = route_handle(100, u64::MAX / 2);
+
+        let remote = find_object_with_remote_route(&cfg, true);
+        let local = find_object_with_remote_route(&cfg, false);
+
+        assert!(first_stripe_routes_remote(&cfg, remote));
+        assert!(!first_stripe_routes_remote(&cfg, local));
+    }
+
+    #[test]
+    fn remote_route_predicate_is_false_for_bypass_or_missing_cache() {
+        let mut cfg = run_cfg();
+        cfg.routes = route_handle(100, u64::MAX / 2);
+        let remote = find_object_with_remote_route(&cfg, true);
+
+        cfg.bypass = true;
+        assert!(!first_stripe_routes_remote(&cfg, remote));
+
+        cfg.bypass = false;
+        cfg.cache_id = None;
+        assert!(!first_stripe_routes_remote(&cfg, remote));
     }
 
     #[test]

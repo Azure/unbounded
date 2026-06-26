@@ -1931,7 +1931,11 @@ type LoadgenFrontendConfig struct {
 	// Optional expected synthetic object size. When set with verify=true, rejects mismatched metadata.
 	ObjectSizeBytes *uint64 `protobuf:"varint,6,opt,name=object_size_bytes,json=objectSizeBytes,proto3,oneof" json:"object_size_bytes,omitempty"`
 	// Zipf exponent for synthetic object rank sampling. Defaults to 1.1 when unset.
-	ZipfExponent  *float64 `protobuf:"fixed64,7,opt,name=zipf_exponent,json=zipfExponent,proto3,oneof" json:"zipf_exponent,omitempty"`
+	ZipfExponent *float64 `protobuf:"fixed64,7,opt,name=zipf_exponent,json=zipfExponent,proto3,oneof" json:"zipf_exponent,omitempty"`
+	// When true, workers keep sampling until the first requested stripe routes to
+	// a peer instead of local ownership. This is intended for fabric saturation
+	// benchmarks; the request still uses the normal cache/p2p/storage/origin path.
+	RemoteOnly    bool `protobuf:"varint,8,opt,name=remote_only,json=remoteOnly,proto3" json:"remote_only,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2013,6 +2017,13 @@ func (x *LoadgenFrontendConfig) GetZipfExponent() float64 {
 		return *x.ZipfExponent
 	}
 	return 0
+}
+
+func (x *LoadgenFrontendConfig) GetRemoteOnly() bool {
+	if x != nil {
+		return x.RemoteOnly
+	}
+	return false
 }
 
 var File_config_proto protoreflect.FileDescriptor
@@ -2174,7 +2185,7 @@ const file_config_proto_rawDesc = "" +
 	"\x1bmax_requests_per_connection\x18\x02 \x01(\rH\x00R\x18maxRequestsPerConnection\x88\x01\x01B\x1e\n" +
 	"\x1c_max_requests_per_connection\"&\n" +
 	"\x10S3FrontendConfig\x12\x12\n" +
-	"\x04addr\x18\x01 \x01(\tR\x04addr\"\xf7\x02\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"\x98\x03\n" +
 	"\x15LoadgenFrontendConfig\x12\x1d\n" +
 	"\aworkers\x18\x01 \x01(\rH\x00R\aworkers\x88\x01\x01\x12\x17\n" +
 	"\x04seed\x18\x02 \x01(\x04H\x01R\x04seed\x88\x01\x01\x12.\n" +
@@ -2183,7 +2194,9 @@ const file_config_proto_rawDesc = "" +
 	"read_bytes\x18\x04 \x01(\x04H\x03R\treadBytes\x88\x01\x01\x12\x16\n" +
 	"\x06verify\x18\x05 \x01(\bR\x06verify\x12/\n" +
 	"\x11object_size_bytes\x18\x06 \x01(\x04H\x04R\x0fobjectSizeBytes\x88\x01\x01\x12(\n" +
-	"\rzipf_exponent\x18\a \x01(\x01H\x05R\fzipfExponent\x88\x01\x01B\n" +
+	"\rzipf_exponent\x18\a \x01(\x01H\x05R\fzipfExponent\x88\x01\x01\x12\x1f\n" +
+	"\vremote_only\x18\b \x01(\bR\n" +
+	"remoteOnlyB\n" +
 	"\n" +
 	"\b_workersB\a\n" +
 	"\x05_seedB\x13\n" +
