@@ -26,7 +26,7 @@ use std::path::Path;
 use prost::Message;
 
 use super::graph::runtime_projection;
-use super::schema::{Config, backend_spec, disk_spec, frontend_spec, peer_spec};
+use super::schema::{backend_spec, disk_spec, frontend_spec, peer_spec, Config};
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -128,7 +128,7 @@ impl fmt::Display for ConfigError {
                 write!(f, "peer {peer_name:?}: invalid tcp socket address {addr:?}")
             }
             ConfigError::InvalidNativePeerAddr { peer_name, addr } => {
-                write!(f, "peer {peer_name:?}: invalid native fabric address {addr:?}")
+                write!(f, "peer {peer_name:?}: invalid rdma fabric address {addr:?}")
             }
             ConfigError::EmptyDiskPath => write!(f, "disk path must not be empty"),
             ConfigError::MissingSelfPeer => write!(
@@ -471,7 +471,7 @@ fn validate_mesh(cfg: &Config) -> Result<(), ConfigError> {
                 }
             }
             Some(peer_spec::Config::Rdma(cfg)) => {
-                if !is_valid_native_address(&cfg.addr) {
+                if !is_valid_rdma_peer_address(&cfg.addr) {
                     return Err(ConfigError::InvalidNativePeerAddr {
                         peer_name: p.name.clone(),
                         addr: cfg.addr.clone(),
@@ -497,7 +497,11 @@ fn validate_mesh(cfg: &Config) -> Result<(), ConfigError> {
             .iter()
             .map(|name| (name.as_str(), "finger"))
             .chain(plan.successor.as_deref().map(|name| (name, "successor")))
-            .chain(plan.predecessor.as_deref().map(|name| (name, "predecessor")))
+            .chain(
+                plan.predecessor
+                    .as_deref()
+                    .map(|name| (name, "predecessor")),
+            )
         {
             if name == cfg.self_ {
                 return Err(ConfigError::RoutingPlanSelfReference {
@@ -570,6 +574,10 @@ fn is_valid_native_address(addr: &str) -> bool {
         return false;
     };
     is_valid_even_hex(hex)
+}
+
+fn is_valid_rdma_peer_address(addr: &str) -> bool {
+    is_valid_native_address(addr) || addr.parse::<SocketAddr>().is_ok()
 }
 
 fn is_valid_even_hex(s: &str) -> bool {
@@ -804,7 +812,11 @@ addr = "hex:01020304"
         );
         let f = write_cfg(&s);
         let cfg = load(f.path()).expect("load should succeed");
-        let peer = cfg.peers.iter().find(|peer| peer.name == "node-rdma").unwrap();
+        let peer = cfg
+            .peers
+            .iter()
+            .find(|peer| peer.name == "node-rdma")
+            .unwrap();
         match peer.config.as_ref().unwrap() {
             peer_spec::Config::Rdma(cfg) => assert_eq!(cfg.addr, "hex:01020304"),
             other => panic!("expected rdma config, got {other:?}"),
@@ -812,8 +824,39 @@ addr = "hex:01020304"
     }
 
     #[test]
+    fn accepts_rdma_socket_peer_addr() {
+        let s = format!(
+            r#"{}
+[[peers]]
+name = "node-rdma"
+
+[peers.config.rdma]
+addr = "10.0.0.2:5000"
+"#,
+            mesh_toml()
+        );
+        let f = write_cfg(&s);
+        let cfg = load(f.path()).expect("load should succeed");
+        let peer = cfg
+            .peers
+            .iter()
+            .find(|peer| peer.name == "node-rdma")
+            .unwrap();
+        match peer.config.as_ref().unwrap() {
+            peer_spec::Config::Rdma(cfg) => assert_eq!(cfg.addr, "10.0.0.2:5000"),
+            other => panic!("expected rdma config, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_invalid_native_peer_addr() {
-        for bad in ["gid:bad", "hex:", "hex:abc", "hex:deadbeefg0"] {
+        for bad in [
+            "gid:bad",
+            "hex:",
+            "hex:abc",
+            "hex:deadbeefg0",
+            "example.com:9000",
+        ] {
             let s = format!(
                 r#"{}
 [[peers]]

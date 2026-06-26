@@ -307,6 +307,12 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 
 		return ringState{}
 	}
+	selfAddr, ok = rdmaPeerDialAddr(selfAddr, self)
+	if !ok {
+		slog.Warn("storage ring inactive: this node has wildcard rdma address but no InternalIP", "node", selfName, "ring", ringValue)
+
+		return ringState{}
+	}
 	if selfAddr == "" {
 		slog.Warn("storage ring inactive: this node has no rdma address", "node", selfName, "ring", ringValue)
 
@@ -339,6 +345,12 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 
 			continue
 		}
+		addr, ok = rdmaPeerDialAddr(addr, n)
+		if !ok {
+			slog.Warn("skipping storage ring peer with wildcard rdma address but no InternalIP", "peer", n.Name, "ring", ringValue)
+
+			continue
+		}
 
 		seen[n.Name] = struct{}{}
 		ring.peers = append(ring.peers, &storageconfig.PeerSpec{
@@ -352,6 +364,25 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 	sort.Slice(ring.peers, func(i, j int) bool { return ring.peers[i].Name < ring.peers[j].Name })
 
 	return ring
+}
+
+func rdmaPeerDialAddr(addr string, node *corev1.Node) (string, bool) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, true
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsUnspecified() {
+		return addr, true
+	}
+
+	internal := internalIP(node)
+	if internal == "" {
+		return "", false
+	}
+
+	return net.JoinHostPort(internal, port), true
 }
 
 func selfAnnotations(nodes []*corev1.Node, selfName string) map[string]string {

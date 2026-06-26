@@ -210,6 +210,56 @@ func TestComputeRDMARingMembership(t *testing.T) {
 	assert.Equal(t, "hex:b1", got["peer-b"])
 }
 
+func TestComputeRDMARingRewritesWildcardSocketAddresses(t *testing.T) {
+	nodes := []*corev1.Node{
+		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["0.0.0.0:40000"]}]}`,
+		}),
+		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["0.0.0.0:50000"]}]}`,
+		}),
+		nodeWithAnnotations("peer-b", "red", "fd00::3", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["[::]:60000"]}]}`,
+		}),
+	}
+
+	ring := computeRDMARing(nodes, "self", testRingLabel)
+
+	require.True(t, ring.active)
+	require.Len(t, ring.peers, 3)
+	got := map[string]string{}
+	for _, p := range ring.peers {
+		got[p.GetName()] = p.GetRdma().GetAddr()
+	}
+
+	assert.Equal(t, "10.0.0.1:40000", got["self"])
+	assert.Equal(t, "10.0.0.2:50000", got["peer-a"])
+	assert.Equal(t, "[fd00::3]:60000", got["peer-b"])
+}
+
+func TestComputeRDMARingKeepsNativeAndRoutableSocketAddresses(t *testing.T) {
+	nodes := []*corev1.Node{
+		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:self"]}]}`,
+		}),
+		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
+			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["10.0.0.9:50000"]}]}`,
+		}),
+	}
+
+	ring := computeRDMARing(nodes, "self", testRingLabel)
+
+	require.True(t, ring.active)
+	require.Len(t, ring.peers, 2)
+	got := map[string]string{}
+	for _, p := range ring.peers {
+		got[p.GetName()] = p.GetRdma().GetAddr()
+	}
+
+	assert.Equal(t, "hex:self", got["self"])
+	assert.Equal(t, "10.0.0.9:50000", got["peer-a"])
+}
+
 func TestComputeRDMARingSingleMember(t *testing.T) {
 	nodes := []*corev1.Node{nodeWithAnnotations("self", "red", "", map[string]string{
 		storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:self"]}]}`,

@@ -5,9 +5,13 @@ package goalstates
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -19,6 +23,10 @@ const (
 	// infinibandDir holds InfiniBand/RDMA HCA character devices
 	// (e.g. uverbs0, umad0, issm0, rdma_cm).
 	infinibandDir = "/dev/infiniband"
+	// rdmaCMMiscDevPath is the kernel-published major:minor for the RDMA-CM
+	// misc device. systemd-nspawn needs the corresponding /dev/infiniband/rdma_cm
+	// node bind-mounted for libfabric's verbs/RDMA-CM path.
+	rdmaCMMiscDevPath = "/sys/class/misc/rdma_cm/dev"
 )
 
 // excludedBlockDevicePrefixes lists /sys/class/block entry name prefixes that
@@ -83,7 +91,7 @@ func DiscoverHostDevices() HostDevices {
 	}
 
 	devices.Block = discoverBlockDevicePaths(sysClassBlockDir, devDir)
-	devices.Infiniband = discoverInfinibandDevicePaths(infinibandDir)
+	devices.Infiniband = discoverInfinibandDevicePaths(infinibandDir, rdmaCMMiscDevPath, true)
 
 	return devices
 }
@@ -154,7 +162,11 @@ func isExcludedBlockDevice(name string) bool {
 // devices under infinibandDir and returns their device node paths in sorted
 // order. Returns nil (not an error) when the directory is absent, which is the
 // common case on hosts without RDMA hardware.
-func discoverInfinibandDevicePaths(infinibandDir string) []string {
+func discoverInfinibandDevicePaths(infinibandDir, rdmaCMMiscDevPath string, loadRDMACM bool) []string {
+	if loadRDMACM {
+		ensureRDMACMDevice(infinibandDir, rdmaCMMiscDevPath)
+	}
+
 	entries, err := os.ReadDir(infinibandDir)
 	if err != nil {
 		return nil
@@ -173,4 +185,80 @@ func discoverInfinibandDevicePaths(infinibandDir string) []string {
 	sort.Strings(paths)
 
 	return paths
+}
+
+func ensureRDMACMDevice(infinibandDir, miscDevPath string) string {
+	nodePath := filepath.Join(infinibandDir, "rdma_cm")
+	if _, err := os.Stat(nodePath); err == nil {
+		return nodePath
+	}
+
+	major, minor, ok := rdmaCMDeviceNumber(miscDevPath)
+	if !ok {
+		loadRDMACMModules()
+
+		major, minor, ok = rdmaCMDeviceNumber(miscDevPath)
+		if !ok {
+			return ""
+		}
+	}
+
+	return createRDMACMDeviceNode(infinibandDir, major, minor, unix.Mknod)
+}
+
+func loadRDMACMModules() {
+	modprobe, err := exec.LookPath("modprobe")
+	if err != nil {
+		return
+	}
+
+	if err := exec.Command(modprobe, "rdma_ucm").Run(); err == nil {
+		return
+	}
+
+	_ = exec.Command(modprobe, "rdma_cm").Run()
+}
+
+func rdmaCMDeviceNumber(path string) (int, int, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, false
+	}
+
+	parts := strings.Split(strings.TrimSpace(string(data)), ":")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, false
+	}
+
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, false
+	}
+
+	return major, minor, true
+}
+
+type mknodFunc func(path string, mode uint32, dev int) error
+
+func createRDMACMDeviceNode(infinibandDir string, major, minor int, mknod mknodFunc) string {
+	if err := os.MkdirAll(infinibandDir, 0o755); err != nil {
+		return ""
+	}
+
+	nodePath := filepath.Join(infinibandDir, "rdma_cm")
+	dev := int(unix.Mkdev(uint32(major), uint32(minor)))
+	if err := mknod(nodePath, unix.S_IFCHR|0o666, dev); err != nil && !os.IsExist(err) {
+		return ""
+	}
+
+	if _, err := os.Stat(nodePath); err != nil {
+		return ""
+	}
+
+	return nodePath
 }
