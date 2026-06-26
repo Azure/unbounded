@@ -172,6 +172,7 @@ func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, act
 	log.Info("restarting active node", "machine", active.Name)
 
 	err = phases.Serial(log,
+		rootfs.EnsureNSpawnWorkspace(log, gs.RootFS),
 		nodestop.StopNode(log, active.Name),
 		nodestart.StartNode(log, gs.NodeStart),
 		nodestart.WaitForKubelet(log, active.Name),
