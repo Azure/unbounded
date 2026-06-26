@@ -5,16 +5,15 @@
 //!
 //! The node configures exactly one origin tier per `backend_id`, but
 //! that tier may be a plaintext HTTP origin ([`HttpBackend`]), an
-//! S3-compatible origin ([`S3Backend`]), or an Azure Blob origin
-//! ([`AzureBackend`]). Rather than box the backend
-//! behind `dyn Backend` (which the [`Backend`] trait's generic
-//! associated `Stream<'a>` type forbids without erasing the stream),
-//! [`OriginBackend`] is a static enum the embedder selects at
-//! construction time. Its [`Backend::Stream`] is [`OriginStream`], an
-//! enum that wraps whichever concrete stream the chosen backend
-//! produces and delegates [`PageStream::poll_next`] to it.
+//! S3-compatible origin ([`S3Backend`]), an Azure Blob origin
+//! ([`AzureBackend`]), or a synthetic [`FakeBackend`] for benchmarking.
+//! Rather than box the backend behind `dyn Backend` (which the
+//! [`Backend`] trait's generic associated `Stream<'a>` type forbids
+//! without erasing the stream), [`OriginBackend`] is a static enum the
+//! embedder selects at construction time.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
@@ -24,9 +23,7 @@ use super::{AzureBackend, Backend, FakeBackend, HttpBackend, S3Backend};
 
 /// One configured origin tier: a plaintext HTTP origin, an
 /// S3-compatible origin, an Azure Blob origin, or a synthetic
-/// [`FakeBackend`] for benchmarking. Implements [`Backend`] by
-/// delegating to the inner backend and wrapping its stream in
-/// [`OriginStream`].
+/// [`FakeBackend`] for benchmarking.
 pub enum OriginBackend {
     Http(HttpBackend),
     S3(S3Backend),
@@ -35,30 +32,41 @@ pub enum OriginBackend {
 }
 
 impl OriginBackend {
-    /// Owned-stream variant of [`Backend::bulk_get`]. Delegates to the
-    /// inner backend's `fetch_stream`, which borrows nothing from the
-    /// backend, so the returned [`OriginStream`] is `'static`. This is
-    /// what lets a [`super::registry::BackendRegistry`] serve a fetch
-    /// from a backend it holds behind an `Arc`/`ArcSwap` without the
-    /// temporary `Arc` guard having to outlive the stream.
-    pub fn fetch_stream(
-        &self,
+    /// Owned-stream variant used by [`super::registry::BackendRegistry`].
+    /// The registry gives the stream an `Arc` guard so a backend can be
+    /// borrowed safely without forcing every concrete backend to copy its
+    /// destination-page slice.
+    pub fn fetch_stream<'a>(
+        backend: Arc<Self>,
         req: &StripeReq,
         src: BulkRef,
-        dsts: &[PageRef],
-    ) -> OriginStream<'static> {
-        match self {
+        dsts: &'a [PageRef],
+    ) -> OriginStream<'a> {
+        match backend.as_ref() {
             OriginBackend::Http(b) => OriginStream::Http(b.fetch_stream(req, src, dsts)),
             OriginBackend::S3(b) => OriginStream::S3(b.fetch_stream(req, src, dsts)),
             OriginBackend::Azure(b) => OriginStream::Azure(b.fetch_stream(req, src, dsts)),
-            OriginBackend::Fake(b) => OriginStream::Fake(b.fetch_stream(req, src, dsts)),
+            OriginBackend::Fake(b) => match b.fill(req, src, dsts) {
+                Ok(()) => OriginStream::Fake {
+                    backend,
+                    delivered: dsts,
+                    state: FakeOwnedState::Delivering,
+                    next: 0,
+                },
+                Err(e) => OriginStream::Fake {
+                    backend,
+                    delivered: &[],
+                    state: FakeOwnedState::Failed(Some(e)),
+                    next: 0,
+                },
+            },
         }
     }
 }
 
 impl Backend for OriginBackend {
     type Req = StripeReq;
-    type Stream<'a> = OriginStream<'a>;
+    type Stream<'a> = OriginBorrowedStream<'a>;
 
     fn bulk_get<'a>(
         &'a self,
@@ -66,28 +74,32 @@ impl Backend for OriginBackend {
         src: BulkRef,
         dsts: &'a [PageRef],
     ) -> Self::Stream<'a> {
-        // NB: this cannot delegate to the inherent `fetch_stream`, which
-        // returns `OriginStream<'static>`: `OriginStream<'a>` projects
-        // each inner backend's associated `Stream<'a>` and so is
-        // invariant in `'a`, which blocks the `'static -> 'a` coercion.
-        // The inner `bulk_get`s build the correctly-lifetimed stream.
         match self {
-            OriginBackend::Http(b) => OriginStream::Http(b.bulk_get(req, src, dsts)),
-            OriginBackend::S3(b) => OriginStream::S3(b.bulk_get(req, src, dsts)),
-            OriginBackend::Azure(b) => OriginStream::Azure(b.bulk_get(req, src, dsts)),
-            OriginBackend::Fake(b) => OriginStream::Fake(b.bulk_get(req, src, dsts)),
+            OriginBackend::Http(b) => OriginBorrowedStream::Http(b.bulk_get(req, src, dsts)),
+            OriginBackend::S3(b) => OriginBorrowedStream::S3(b.bulk_get(req, src, dsts)),
+            OriginBackend::Azure(b) => OriginBorrowedStream::Azure(b.bulk_get(req, src, dsts)),
+            OriginBackend::Fake(b) => OriginBorrowedStream::Fake(b.bulk_get(req, src, dsts)),
         }
     }
 }
 
-/// Stream produced by [`OriginBackend::bulk_get`]: whichever concrete
-/// page stream the selected inner backend yields. [`PageStream`] is
-/// delegated to the active variant.
+/// Stream produced by [`OriginBackend::fetch_stream`] for registry use.
 pub enum OriginStream<'a> {
-    Http(<HttpBackend as Backend>::Stream<'a>),
-    S3(<S3Backend as Backend>::Stream<'a>),
-    Azure(<AzureBackend as Backend>::Stream<'a>),
-    Fake(<FakeBackend as Backend>::Stream<'a>),
+    Http(<HttpBackend as Backend>::Stream<'static>),
+    S3(<S3Backend as Backend>::Stream<'static>),
+    Azure(<AzureBackend as Backend>::Stream<'static>),
+    Fake {
+        backend: Arc<OriginBackend>,
+        delivered: &'a [PageRef],
+        state: FakeOwnedState,
+        next: usize,
+    },
+}
+
+enum FakeOwnedState {
+    Delivering,
+    Failed(Option<Error>),
+    Done,
 }
 
 impl PageStream for OriginStream<'_> {
@@ -95,14 +107,60 @@ impl PageStream for OriginStream<'_> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<PageRef, Error>>> {
-        // Both inner streams are `Unpin` (their only pinned state is a
-        // `Pin<Box<dyn Future>>`, which is itself `Unpin`), so the enum
-        // is `Unpin` and the inner streams can be re-pinned in place.
         match self.get_mut() {
             OriginStream::Http(s) => Pin::new(s).poll_next(cx),
             OriginStream::S3(s) => Pin::new(s).poll_next(cx),
             OriginStream::Azure(s) => Pin::new(s).poll_next(cx),
-            OriginStream::Fake(s) => Pin::new(s).poll_next(cx),
+            OriginStream::Fake {
+                backend,
+                delivered,
+                state,
+                next,
+            } => {
+                let _keepalive = backend;
+                loop {
+                    match state {
+                        FakeOwnedState::Delivering => {
+                            if *next >= delivered.len() {
+                                *state = FakeOwnedState::Done;
+                                return Poll::Ready(None);
+                            }
+
+                            let page = delivered[*next];
+                            *next += 1;
+                            return Poll::Ready(Some(Ok(page)));
+                        }
+                        FakeOwnedState::Failed(slot) => {
+                            let e = slot.take();
+                            *state = FakeOwnedState::Done;
+                            return Poll::Ready(e.map(Err));
+                        }
+                        FakeOwnedState::Done => return Poll::Ready(None),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Stream produced by direct [`OriginBackend::bulk_get`] calls.
+pub enum OriginBorrowedStream<'a> {
+    Http(<HttpBackend as Backend>::Stream<'a>),
+    S3(<S3Backend as Backend>::Stream<'a>),
+    Azure(<AzureBackend as Backend>::Stream<'a>),
+    Fake(<FakeBackend as Backend>::Stream<'a>),
+}
+
+impl PageStream for OriginBorrowedStream<'_> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<PageRef, Error>>> {
+        match self.get_mut() {
+            OriginBorrowedStream::Http(s) => Pin::new(s).poll_next(cx),
+            OriginBorrowedStream::S3(s) => Pin::new(s).poll_next(cx),
+            OriginBorrowedStream::Azure(s) => Pin::new(s).poll_next(cx),
+            OriginBorrowedStream::Fake(s) => Pin::new(s).poll_next(cx),
         }
     }
 }
