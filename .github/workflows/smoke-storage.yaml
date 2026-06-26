@@ -61,7 +61,7 @@ jobs:
       # installs it under tmp/libfabric (cached below to skip the rebuild).
       - name: Cache libfabric
         id: cache-libfabric
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: tmp/libfabric
           key: libfabric-${{ env.LIBFABRIC_VERSION }}-${{ runner.os }}-${{ hashFiles('Makefile') }}
@@ -75,7 +75,7 @@ jobs:
       # under tmp/openssl (cached below to skip the rebuild).
       - name: Cache openssl
         id: cache-openssl
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: tmp/openssl
           key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}
@@ -89,7 +89,7 @@ jobs:
           rustup default stable
 
       - name: Cache cargo registry and target
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: |
             ~/.cargo/registry
