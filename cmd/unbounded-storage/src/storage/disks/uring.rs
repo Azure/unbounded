@@ -392,7 +392,15 @@ fn run_core_loop<B, R>(
         if mutator_done && close_signaled && !service.has_inflight() && ring.in_flight() == 0 {
             break;
         }
-        idle();
+        // Keep the steady-state storage core hot while page I/O is
+        // outstanding. During teardown, still yield through the idle hook so
+        // late arrivals and ring-drain progress can be observed instead of
+        // spinning forever with a nonzero test/fake in-flight count.
+        let steady_state_busy =
+            !close_signaled && (service.has_inflight() || ring.in_flight() != 0);
+        if !steady_state_busy {
+            idle();
+        }
     }
 }
 
