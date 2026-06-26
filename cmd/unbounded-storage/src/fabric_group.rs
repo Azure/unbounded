@@ -18,17 +18,18 @@
 //! the (hardware-only) verbs path uses.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use unbounded_storage::backend::{BackendRegistry, FixedRegion, OriginRing};
 use unbounded_storage::bufferpool::BlockStore;
 use unbounded_storage::config::{self, BackendSpec, RuntimePeer};
 use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, PeerId, Provider, RpcServerHandle};
-use unbounded_storage::memory::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
+use unbounded_storage::memory::{allocate, BackingKind, BackingRequest, HUGEPAGE_2MB};
 use unbounded_storage::p2p::{RecursiveHandler, RouteTableHandle, RouteTableSnapshot};
 use unbounded_storage::runtime::{Threading, WorkerIdx};
-use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{CacheDirectorySet, ChainLocalStore};
+use unbounded_storage::storage::StripeReq;
 use unbounded_storage::topology::{NicWorkerGroup, ServingShard};
 
 use crate::FabricStartup;
@@ -544,6 +545,9 @@ fn runtime_peer_address(peer: &config::PeerSpec) -> fabric::FabricAddress {
         Some(config::peer_spec::Config::Tcp(cfg)) => {
             fabric::FabricAddress::socket(cfg.addr.clone())
         }
+        Some(config::peer_spec::Config::Rdma(cfg)) if cfg.addr.parse::<SocketAddr>().is_ok() => {
+            fabric::FabricAddress::socket(cfg.addr.clone())
+        }
         Some(config::peer_spec::Config::Rdma(cfg)) => {
             fabric::FabricAddress::native(cfg.addr.clone())
         }
@@ -558,7 +562,7 @@ mod tests {
 
     use super::*;
 
-    use unbounded_storage::config::{PeerSpec, RdmaPeerConfig, peer_spec};
+    use unbounded_storage::config::{peer_spec, PeerSpec, RdmaPeerConfig};
     use unbounded_storage::p2p::node_id_from_name;
 
     fn shard(cpu: u32, numa: Option<u16>) -> ServingShard {
@@ -700,6 +704,20 @@ mod tests {
             fabric::FabricAddress::native("hex:ff")
         );
         assert_eq!(connections[1].hca_numa, None);
+    }
+
+    #[test]
+    fn rdma_socket_peer_connections_use_socket_addresses() {
+        let peers = [runtime_peer(1, "10.0.0.1:9000")];
+
+        let connections = runtime_peer_connections(&peers);
+
+        assert_eq!(connections.len(), 1);
+        assert_eq!(
+            connections[0].address,
+            fabric::FabricAddress::socket("10.0.0.1:9000")
+        );
+        assert_eq!(connections[0].hca_numa, None);
     }
 
     /// Drop-logging stand-in for a `FabricUnit` resource: records its
