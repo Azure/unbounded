@@ -96,6 +96,14 @@ pub struct EngineConfig {
     /// and always proceeds. Intended for benchmarking/tooling;
     /// production should leave this false.
     pub bypass_admission: bool,
+    /// When true, reads use the committed in-memory index mirror instead
+    /// of reading the terminal btree leaf from disk. This is benchmark
+    /// only: production reads must hit the on-disk leaf so corruption and
+    /// snapshot semantics are preserved.
+    pub bypass_index_read: bool,
+    /// When true, reads skip data checksum validation. This is benchmark
+    /// only: production reads must verify cached bytes before returning a hit.
+    pub bypass_checksum: bool,
     /// When true, [`BTreeIndex::open`] skips the LBA-order leaf
     /// scan on disks that have no valid meta page. Intended for
     /// benchmarking and bring-up against freshly wiped devices
@@ -103,6 +111,11 @@ pub struct EngineConfig {
     /// per terabyte. Production should leave this false so partial
     /// recovery still runs when the meta slots are corrupted.
     pub skip_recovery_scan_if_no_meta: bool,
+    /// When true, ignore any existing on-disk btree metadata and
+    /// bootstrap an empty cache index. This is destructive: old cache
+    /// entries become unreachable and may be overwritten. Intended for
+    /// benchmark devices that are explicitly reset between runs.
+    pub force_format: bool,
     /// Stable identifier for this disk, used as the `disk` label on
     /// the engine's Prometheus metrics. Empty when unset (e.g. in
     /// tests and benchmarks); production wiring sets it from the
@@ -125,7 +138,10 @@ impl Default for EngineConfig {
             restart_scan_queue_depth: 256,
             btree_scratch_pages: 64,
             bypass_admission: false,
+            bypass_index_read: false,
+            bypass_checksum: false,
             skip_recovery_scan_if_no_meta: false,
+            force_format: false,
             disk_id: String::new(),
         }
     }
@@ -231,6 +247,7 @@ pub struct EngineSnapshot {
     pub checksum_misses: u64,
     pub resident_pages: usize,
     pub btree_entries: usize,
+    pub btree_lookup_cache_bytes: usize,
     /// Length of the deferred-reclaim queue: LBAs that were
     /// displaced (overwrite or eviction) while their old page
     /// was still pinned and that have not yet been returned to
@@ -265,6 +282,7 @@ impl<B: BlockDevice> StorageEngine<B> {
                 scratch.clone(),
                 cfg.btree_page_bytes,
                 cfg.skip_recovery_scan_if_no_meta,
+                cfg.force_format,
             )
             .await?,
         );
@@ -317,6 +335,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             checksum_misses: m.checksum_misses,
             resident_pages: self.lru.len(),
             btree_entries: self.btree.live_entries(),
+            btree_lookup_cache_bytes: self.btree.lookup_cache_bytes(),
             pending_free_len: self.pending_free.lock().unwrap().len(),
         }
     }
@@ -563,9 +582,9 @@ impl<B: BlockDevice> StorageEngine<B> {
     ) -> Result<bool, bufferpool::Error> {
         let pk = Self::page_key(&key, stripe_off, self.cfg.page_size_bytes);
 
-        let entry = match self.btree.lookup(&pk).await {
-            Ok(Some(e)) => e,
-            Ok(None) | Err(_) => {
+        let entry = match self.lookup_entry(&pk).await {
+            Some(e) => e,
+            None => {
                 self.metric(|m| m.misses += 1);
                 crate::metrics::storage_lookup(crate::metrics::Lookup::Miss);
                 return Ok(false);
@@ -603,8 +622,9 @@ impl<B: BlockDevice> StorageEngine<B> {
             crate::metrics::Outcome::Ok,
         );
 
-        let cs = Xxh3Checksum::checksum_of(dst_buf);
-        if cs.0 != entry.data_checksum.0 {
+        if !self.cfg.bypass_checksum
+            && Xxh3Checksum::checksum_of(dst_buf).0 != entry.data_checksum.0
+        {
             self.metric(|m| {
                 m.misses += 1;
                 m.checksum_misses += 1;
@@ -618,6 +638,17 @@ impl<B: BlockDevice> StorageEngine<B> {
         self.metric(|m| m.hits += 1);
         crate::metrics::storage_lookup(crate::metrics::Lookup::Hit);
         Ok(true)
+    }
+
+    async fn lookup_entry(&self, pk: &PageKey) -> Option<LeafEntry> {
+        if self.cfg.bypass_index_read {
+            return self.btree.lookup_committed_mirror(pk);
+        }
+
+        match self.btree.lookup(pk).await {
+            Ok(Some(e)) => Some(e),
+            Ok(None) | Err(_) => None,
+        }
     }
 
     /// Write the contents of `src` to `(key, stripe_off)`. The

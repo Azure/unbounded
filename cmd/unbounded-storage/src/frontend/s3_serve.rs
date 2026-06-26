@@ -129,7 +129,6 @@ pub struct S3Driver<P: BufferPool<Req = StripeReq> + 'static> {
     frontend_id: Rc<str>,
     backend_id: String,
     cache_id: Option<String>,
-    neighborhood_id: Option<String>,
     stripe_size: u64,
     page_size: usize,
     bypass: bool,
@@ -151,7 +150,6 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
         frontend_id: Rc<str>,
         backend_id: String,
         cache_id: Option<String>,
-        neighborhood_id: Option<String>,
         stripe_size: u64,
         page_size: usize,
         bypass: bool,
@@ -164,7 +162,6 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
             frontend_id,
             backend_id,
             cache_id,
-            neighborhood_id,
             stripe_size,
             page_size,
             bypass,
@@ -210,7 +207,6 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
                             Rc::clone(&self.frontend_id),
                             self.backend_id.clone(),
                             self.cache_id.clone(),
-                            self.neighborhood_id.clone(),
                             self.stripe_size,
                             self.page_size,
                             self.bypass,
@@ -269,7 +265,6 @@ async fn serve_connection_s3<P: BufferPool<Req = StripeReq>>(
     frontend_id: Rc<str>,
     backend_id: String,
     cache_id: Option<String>,
-    neighborhood_id: Option<String>,
     stripe_size: u64,
     page_size: usize,
     bypass: bool,
@@ -285,7 +280,6 @@ async fn serve_connection_s3<P: BufferPool<Req = StripeReq>>(
         conn_fd,
         &backend_id,
         cache_id.as_deref(),
-        neighborhood_id.as_deref(),
         stripe_size,
         page_size,
         bypass,
@@ -310,7 +304,6 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     conn_fd: RawFd,
     backend_id: &str,
     cache_id: Option<&str>,
-    neighborhood_id: Option<&str>,
     stripe_size: u64,
     page_size: usize,
     bypass: bool,
@@ -402,39 +395,30 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
     // the plain HTTP frontend, a length-read failure is never a silently
     // dropped connection.
-    let len = match read_object_length_s3(
-        pool,
-        backend_id,
-        cache_id,
-        neighborhood_id,
-        &path,
-        page_size,
-        bypass,
-    )
-    .await
-    {
-        LenResult::Len(l) => l,
-        LenResult::NotFound => {
-            let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
-            let _ = send_all(handle, conn_fd, bytes).await;
-            log.field("status", 404);
-            outcome.status = 404;
-            return Ok(());
-        }
-        LenResult::Other => {
-            let bytes = error_bytes(
-                S3ErrorCode::InternalError,
-                &path,
-                &request_id,
-                is_head,
-                None,
-            );
-            let _ = send_all(handle, conn_fd, bytes).await;
-            log.field("status", 500);
-            outcome.status = 500;
-            return Ok(());
-        }
-    };
+    let len =
+        match read_object_length_s3(pool, backend_id, cache_id, &path, page_size, bypass).await {
+            LenResult::Len(l) => l,
+            LenResult::NotFound => {
+                let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
+                let _ = send_all(handle, conn_fd, bytes).await;
+                log.field("status", 404);
+                outcome.status = 404;
+                return Ok(());
+            }
+            LenResult::Other => {
+                let bytes = error_bytes(
+                    S3ErrorCode::InternalError,
+                    &path,
+                    &request_id,
+                    is_head,
+                    None,
+                );
+                let _ = send_all(handle, conn_fd, bytes).await;
+                log.field("status", 500);
+                outcome.status = 500;
+                return Ok(());
+            }
+        };
 
     // 6. Resolve the requested range against the length.
     let resolved = match range {
@@ -519,13 +503,13 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 origin_object_id: path.clone(),
                 stripe_idx: slice.stripe_idx,
             };
+            let key = cache_id
+                .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id))
+                .unwrap_or_else(|| origin_ref.stripe_key());
             StripePlan {
-                req: StripeReq::new(origin_ref.stripe_key())
+                req: StripeReq::new(key)
                     .with_origin(origin_ref)
-                    .with_chain(
-                        cache_id.map(ToOwned::to_owned),
-                        neighborhood_id.map(ToOwned::to_owned),
-                    )
+                    .with_cache_id(cache_id.map(ToOwned::to_owned))
                     .with_bypass(bypass),
                 intra_offset: slice.intra_offset,
                 intra_len: slice.intra_len,
@@ -591,18 +575,17 @@ async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     backend_id: &str,
     cache_id: Option<&str>,
-    neighborhood_id: Option<&str>,
     path: &str,
     page_size: usize,
     bypass: bool,
 ) -> LenResult {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
-    let req = StripeReq::new(origin_ref.stripe_key())
+    let key = cache_id
+        .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id))
+        .unwrap_or_else(|| origin_ref.stripe_key());
+    let req = StripeReq::new(key)
         .with_origin(origin_ref)
-        .with_chain(
-            cache_id.map(ToOwned::to_owned),
-            neighborhood_id.map(ToOwned::to_owned),
-        )
+        .with_cache_id(cache_id.map(ToOwned::to_owned))
         .with_bypass(bypass);
     let mut rs = match pool.read(&req, 0, page_size as u64).await {
         Ok(rs) => rs,
@@ -738,6 +721,7 @@ mod tests {
         let mut s = spec("f", "127.0.0.1:9000");
         s.config = Some(frontend_spec::Config::Http(HttpFrontendConfig {
             addr: "127.0.0.1:9000".to_string(),
+            max_requests_per_connection: None,
         }));
         assert!(matches!(
             S3Frontend::from_spec(&s),
@@ -894,7 +878,6 @@ mod tests {
             listen_fd,
             Rc::from("primary"),
             "primary".to_string(),
-            None,
             None,
             4 * 1024 * 1024,
             2 * 1024 * 1024,

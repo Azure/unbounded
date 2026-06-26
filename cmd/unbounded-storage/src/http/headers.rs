@@ -66,6 +66,30 @@ pub(crate) fn header<'a>(headers: &[Header<'a>], name: &str) -> Option<&'a str> 
         .map(|h| h.value)
 }
 
+/// Count headers matching `name` case-insensitively.
+pub(crate) fn header_count(headers: &[Header<'_>], name: &str) -> usize {
+    headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case(name))
+        .count()
+}
+
+/// True when any matching header value contains `token`.
+pub(crate) fn any_header_value_has_token(headers: &[Header<'_>], name: &str, token: &str) -> bool {
+    headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case(name))
+        .any(|h| header_value_has_token(h.value, token))
+}
+
+/// Return whether a comma-separated header value contains `token`, using
+/// HTTP's case-insensitive token matching rules.
+pub(crate) fn header_value_has_token(value: &str, token: &str) -> bool {
+    value
+        .split(',')
+        .any(|part| part.trim().eq_ignore_ascii_case(token))
+}
+
 /// Parse a `Content-Length` header value (case-insensitive name) into a
 /// byte count, or `None` if absent or unparseable.
 pub(crate) fn content_length(headers: &[Header]) -> Option<u64> {
@@ -125,6 +149,14 @@ mod tests {
         );
         assert_eq!(content_length(&headers(&[("content-length", "x")])), None);
         assert_eq!(content_length(&headers(&[("Content-Type", "x")])), None);
+    }
+
+    #[test]
+    fn header_value_token_matching_is_case_insensitive() {
+        assert!(header_value_has_token("keep-alive, Close", "close"));
+        assert!(header_value_has_token(" keep-alive ", "KEEP-ALIVE"));
+        assert!(!header_value_has_token("keep-alive", "close"));
+        assert!(!header_value_has_token("upgrade", "up"));
     }
 
     #[test]

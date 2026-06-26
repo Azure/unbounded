@@ -59,8 +59,8 @@ becomes `/etc/containerd/config.toml` inside the container).
 
 The default rootfs images are based on Ubuntu 24.04 (Noble). The correct default
 image is selected automatically based on whether NVIDIA GPUs are detected on the
-host. Ubuntu 26.04 images are also available for explicit `OCIImage`
-configuration.
+host. Ubuntu 26.04 and Azure Linux 3.0 images are also available for explicit
+`OCIImage` configuration.
 
 | Image | Default repository | Description |
 |---|---|---|
@@ -69,6 +69,7 @@ configuration.
 | [`agent-ubuntu2604`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2604) | `ghcr.io/azure/agent-ubuntu2604` | Ubuntu 26.04 base image with systemd, dbus, curl, iproute2, nftables, kmod, wireguard-tools, and bpftool. ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2604/Containerfile)) |
 | [`agent-ubuntu2604-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2604-nvidia) | `ghcr.io/azure/agent-ubuntu2604-nvidia` | Ubuntu 26.04 image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2604-nvidia/Containerfile)) |
 | [`agent-azlinux3`](https://github.com/Azure/unbounded/pkgs/container/agent-azlinux3) | `ghcr.io/azure/agent-azlinux3` | Azure Linux 3.0 base image with systemd, dbus, curl, iproute, nftables, kmod, wireguard-tools, and bpftool. ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-azlinux3/Containerfile)) |
+| [`agent-azlinux3-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-azlinux3-nvidia) | `ghcr.io/azure/agent-azlinux3-nvidia` | Azure Linux 3.0 image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-azlinux3-nvidia/Containerfile)) |
 
 The agent pins a specific image tag by default at build time. The `OCIImage`
 field in the agent config can override the full image reference for custom or
@@ -96,15 +97,37 @@ the template runs with `--settings=override`. As a result, the generated
 network namespace. Host interfaces, host firewall and routing rules, and
 loopback listeners are therefore visible from inside the nspawn machine.
 
-When NVIDIA GPUs are detected on the host, the agent automatically bind-mounts
-the GPU device nodes (e.g. `/dev/nvidia0`, `/dev/nvidiactl`) and the host's
-driver libraries into the container, and grants the necessary cgroup device
-permissions. See [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}) for
-the full GPU pipeline.
+When GPUs are detected on the host, the agent automatically exposes the host
+paths needed by the corresponding Kubernetes device plugin:
+
+- **NVIDIA GPUs.** Bind-mounts GPU device nodes and host driver libraries,
+  grants cgroup device permissions, generates a CDI spec, and configures the
+  NVIDIA container runtime. See [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}).
+- **AMD GPUs.** Bind-mounts `/dev/kfd` and DRM device nodes, grants cgroup
+  device permissions, and exposes AMD sysfs paths read-only so the AMD
+  Kubernetes device plugin can discover GPUs inside nspawn. See
+  [AMD GPU Support]({{< relref "reference/gpu/amd" >}}).
 
 When the KVM character device (`/dev/kvm`) is present on the host, the agent
 automatically bind-mounts it into the container so that workloads inside the
 container can use hardware virtualisation (e.g. QEMU/KVM virtual machines).
+
+The agent also auto-mounts host storage and InfiniBand hardware:
+
+- **Block (storage) devices.** Every entry under `/sys/class/block` is
+  bind-mounted by its device node (e.g. `/dev/sda`, `/dev/sda1`,
+  `/dev/nvme0n1`, `/dev/nvme0n1p1`), including whole disks and their
+  partitions as well as device-mapper (`/dev/dm-*`) and software RAID
+  (`/dev/md*`) nodes. Pseudo and virtual devices are excluded: `loop*`,
+  `ram*`, `zram*`, `fd*`, and `sr*` (optical).
+- **InfiniBand HCA devices.** Every character device under
+  `/dev/infiniband` (e.g. `uverbs0`, `umad0`, `issm0`, `rdma_cm`) is
+  bind-mounted so that RDMA workloads inside the container can reach the
+  host's HCAs.
+
+Device discovery runs once when the machine is provisioned. Disks or HCAs
+hot-plugged after the machine has started are not picked up until the machine
+is re-provisioned or soft-rebooted.
 
 The configuration is written to two files on the host before the machine boots:
 
@@ -126,8 +149,10 @@ The configuration is written to two files on the host before the machine boots:
 | `SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1` | Service override | Forces cgroups v2 inside the container. |
 | `SYSTEMD_NSPAWN_API_VFS_WRITABLE=network` | Service override | Makes `/proc/sys/net` writable for CNI and kube-proxy. |
 | `Bind=/dev/kvm` | nspawn config | KVM device bind-mount (auto-generated when `/dev/kvm` is present). |
+| `Bind=<block device>` | nspawn config | Storage block device bind-mount (auto-generated for non-virtual `/sys/class/block` entries, including partitions, `dm-*`, and `md*`). |
+| `Bind=/dev/infiniband/*` | nspawn config | InfiniBand HCA device bind-mount (auto-generated when `/dev/infiniband` devices are present). |
 | `Bind=` / `BindReadOnly=` | nspawn config | GPU device and library bind-mounts (auto-generated when GPUs are present). |
-| `DeviceAllow=` | Service override | Cgroup device permissions for GPU nodes (auto-generated when GPUs are present). |
+| `DeviceAllow=` | Service override | Cgroup device permissions for all bind-mounted host device nodes (KVM, block, InfiniBand, GPU). |
 
 #### System call filter
 

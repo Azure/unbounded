@@ -127,7 +127,7 @@ impl SimCluster {
     /// rebuilt via [`FingerTable::from_explicit`] from only the
     /// neighbors the global build would have selected (its distinct
     /// non-self fingers plus successor and predecessor). This mirrors
-    /// exactly what `build_routing` does when a `[p2p.routing_plan]`
+    /// exactly what the process route builder does when a `[routing_plan]`
     /// is supplied. A cluster built this way must route every target
     /// identically to one built with [`Self::new`]; the proptest
     /// `disjoint_routing_matches_global` pins that equivalence.

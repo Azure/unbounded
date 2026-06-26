@@ -160,7 +160,8 @@ func hugepageReserveCmd(cfg Config) string {
 }
 
 // configEnsureCmd builds the shell one-liner used as an ExecStartPre to ensure
-// the config directory and an (at least empty) config file exist on the host.
+// the config directory, default file-backed disk directory, and an (at least
+// empty) config file exist on the host.
 func configEnsureCmd(cfg Config) string {
-	return fmt.Sprintf(`d=$(dirname "%[1]s"); mkdir -p "$d"; [ -f "%[1]s" ] || : > "%[1]s"`, cfg.ConfigPath)
+	return fmt.Sprintf(`d=$(dirname "%[1]s"); mkdir -p "$d" "%[2]s"; [ -f "%[1]s" ] || : > "%[1]s"`, cfg.ConfigPath, defaultStorageFileDiskDir)
 }

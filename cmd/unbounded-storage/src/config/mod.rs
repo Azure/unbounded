@@ -20,9 +20,8 @@ pub use control::{
 };
 pub use diff::ConfigDiff;
 pub use graph::{
-    ResolvedFrontendBinding, RuntimeCache, RuntimeGraph, RuntimeNeighborhood, RuntimeP2p,
-    RuntimePeer, frontend_backend_map, runtime_disks, runtime_peers, runtime_projection,
-    validate_binding_graph,
+    ResolvedFrontendBinding, RuntimeCache, RuntimeGraph, RuntimeMesh, RuntimePeer,
+    frontend_backend_map, runtime_disks, runtime_peers, runtime_projection, validate_binding_graph,
 };
 pub use load::ConfigError;
 pub use reconcile::{
@@ -33,8 +32,8 @@ pub use reconcile::{
 pub use schema::{
     AutoRdmaFabricBinds, AzureBackendConfig, BackendSpec, BlockDiskConfig, CacheSpec, Config,
     DiskSpec, FabricCfg, FakeBackendConfig, FileDiskConfig, FrontendSpec, HttpBackendConfig,
-    HttpFrontendConfig, LoadgenFrontendConfig, MemoryCfg, NeighborhoodSpec, PeerSpec,
-    RdmaPeerConfig, RoutingPlan, S3BackendConfig, S3FrontendConfig, StartupCfg, TcpFabricBinds,
-    TcpPeerConfig, TopologyCfg, backend_spec, disk_spec, fabric_cfg, frontend_spec, peer_spec,
+    HttpFrontendConfig, LoadgenFrontendConfig, MemoryCfg, PeerSpec, RdmaPeerConfig, RoutingPlan,
+    S3BackendConfig, S3FrontendConfig, StartupCfg, TcpFabricBinds, TcpPeerConfig, TopologyCfg,
+    backend_spec, disk_spec, fabric_cfg, frontend_spec, peer_spec,
 };
 pub use watch::{ConfigUpdate, ConfigWatcher, WatchError};

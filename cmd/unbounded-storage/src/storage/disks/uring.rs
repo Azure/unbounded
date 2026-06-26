@@ -75,6 +75,11 @@ pub struct UringDiskTarget {
     runtime: std::sync::Arc<PinnedRuntime>,
 }
 
+struct DiskOpenMode {
+    ring_cfg: StorageRingConfig,
+    o_direct: bool,
+}
+
 impl UringDiskTarget {
     pub fn new(runtime: std::sync::Arc<PinnedRuntime>) -> Self {
         Self { runtime }
@@ -117,22 +122,15 @@ impl DiskTarget for UringDiskTarget {
         // against a 4 KiB btree page): using the cache page size here makes
         // every 4 KiB btree/meta I/O fail EINVAL and skews all byte offsets.
         let page_size = device_page_size(&engine_cfg);
-        let mut ring_cfg = StorageRingConfig::default();
-        if let Some(qd) = spec.queue_depth {
-            ring_cfg.queue_depth = qd;
-        }
+        let open_mode = disk_open_mode(spec);
 
-        // A file-backed disk runs buffered I/O on a regular file, so the
-        // hardware-only ring flags (IOPOLL, and the O_DIRECT it implies,
-        // plus SINGLE_ISSUER/DEFER_TASKRUN) must be stripped; this mirrors
-        // StorageRingConfig::test_local. The backing file is created and
+        // A file-backed disk still uses O_DIRECT so the daemon bypasses
+        // the host page cache, but regular files do not support the
+        // polled block-device ring mode. The backing file is created and
         // sized here, on the supervisor thread, before the storage core
-        // opens it (capacity comes from the file length). Size validity is
-        // guaranteed by config validation.
+        // opens it (capacity comes from the file length). Size validity
+        // is guaranteed by config validation.
         if spec.is_file() {
-            ring_cfg.iopoll = false;
-            ring_cfg.single_issuer = false;
-            ring_cfg.defer_taskrun = false;
             let size = spec
                 .file_size()
                 .expect("file disk size is validated at config load");
@@ -151,7 +149,7 @@ impl DiskTarget for UringDiskTarget {
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<PageChannel, String>>(1);
 
         let body = move || {
-            run_storage_core(path, ring_cfg, page_size, engine_cfg, stop_thr, ready_tx);
+            run_storage_core(path, open_mode, page_size, engine_cfg, stop_thr, ready_tx);
         };
 
         // Route thread spawning + pinning through the shared runtime.
@@ -188,7 +186,7 @@ impl DiskTarget for UringDiskTarget {
 /// [`PageService`], and `ring.progress()` interleaved until shutdown.
 fn run_storage_core(
     path: PathBuf,
-    ring_cfg: StorageRingConfig,
+    open_mode: DiskOpenMode,
     page_size: usize,
     engine_cfg: EngineConfig,
     stop: Arc<AtomicBool>,
@@ -205,7 +203,7 @@ fn run_storage_core(
         // Held for the storage core's lifetime: the ring addresses this
         // fd by its registered Fixed index, so it must outlive the ring.
         file: _disk_file,
-    } = match UringDevice::open(&path, ring_cfg, ring_cfg.iopoll, page_size) {
+    } = match UringDevice::open(&path, open_mode.ring_cfg, open_mode.o_direct, page_size) {
         Ok(d) => d,
         Err(e) => {
             let _ = ready_tx.send(Err(e.to_string()));
@@ -394,20 +392,73 @@ fn run_core_loop<B, R>(
         if mutator_done && close_signaled && !service.has_inflight() && ring.in_flight() == 0 {
             break;
         }
-        idle();
+        // Keep the steady-state storage core hot while page I/O is
+        // outstanding. During teardown, still yield through the idle hook so
+        // late arrivals and ring-drain progress can be observed instead of
+        // spinning forever with a nonzero test/fake in-flight count.
+        let steady_state_busy =
+            !close_signaled && (service.has_inflight() || ring.in_flight() != 0);
+        if !steady_state_busy {
+            idle();
+        }
     }
+}
+
+fn disk_open_mode(spec: &DiskSpec) -> DiskOpenMode {
+    let mut ring_cfg = StorageRingConfig::default();
+    if let Some(qd) = spec.queue_depth {
+        ring_cfg.queue_depth = qd;
+    }
+
+    if spec.is_file() {
+        disable_polled_ring(&mut ring_cfg);
+    } else if let Some(path) = spec.path() {
+        disable_iopoll_if_unsupported(&mut ring_cfg, Path::new(path), Path::new("/sys/block"));
+    }
+
+    DiskOpenMode {
+        ring_cfg,
+        o_direct: true,
+    }
+}
+
+fn disable_iopoll_if_unsupported(ring_cfg: &mut StorageRingConfig, path: &Path, sys_block: &Path) {
+    if matches!(block_queue_iopoll(path, sys_block), Some(false)) {
+        disable_polled_ring(ring_cfg);
+    }
+}
+
+fn block_queue_iopoll(path: &Path, sys_block: &Path) -> Option<bool> {
+    let name = path.file_name()?.to_str()?;
+    let value = std::fs::read_to_string(sys_block.join(name).join("queue/io_poll")).ok()?;
+
+    match value.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+fn disable_polled_ring(ring_cfg: &mut StorageRingConfig) {
+    ring_cfg.iopoll = false;
+    ring_cfg.single_issuer = false;
+    ring_cfg.defer_taskrun = false;
 }
 
 /// Build an [`EngineConfig`] from a [`DiskSpec`]. Production defaults
 /// come from [`EngineConfig::default`]; the spec only overrides what
-/// the operator chose to expose: `page_size_bytes` and
-/// `skip_recovery_scan`.
+/// the operator chose to expose: `page_size_bytes`, recovery-scan
+/// behavior, and benchmark-only cache reset/admission controls.
 fn engine_config_from(spec: &DiskSpec) -> EngineConfig {
     let mut cfg = EngineConfig::default();
     if let Some(p) = spec.page_size_bytes {
         cfg.page_size_bytes = p as usize;
     }
     cfg.skip_recovery_scan_if_no_meta = spec.skip_recovery_scan;
+    cfg.force_format = spec.force_format;
+    cfg.bypass_admission = spec.bypass_admission;
+    cfg.bypass_index_read = spec.bypass_index_read;
+    cfg.bypass_checksum = spec.bypass_checksum;
     cfg.disk_id = spec
         .path()
         .expect("disk path is validated at config load")
@@ -431,6 +482,7 @@ mod tests {
     use crate::bufferpool::{Error as BpError, StripeKey};
     use crate::storage::blockdev::{MockDevice, MockDeviceConfig};
     use std::cell::{Cell, RefCell};
+    use std::fs;
 
     /// Spin a future to completion on the same noop-waker pattern the
     /// storage core uses. Bounded so a stuck future fails loudly.
@@ -668,6 +720,116 @@ mod tests {
         spec_cfg.page_size_bytes = 8 * 1024 * 1024;
         spec_cfg.btree_page_bytes = 4096;
         assert_eq!(device_page_size(&spec_cfg), 4096);
+    }
+
+    #[test]
+    fn file_disks_use_direct_io_without_iopoll() {
+        let spec = DiskSpec {
+            queue_depth: Some(32),
+            page_size_bytes: None,
+            skip_recovery_scan: false,
+            force_format: false,
+            bypass_admission: false,
+            bypass_index_read: false,
+            bypass_checksum: false,
+            config: Some(crate::config::schema::disk_spec::Config::File(
+                crate::config::schema::FileDiskConfig {
+                    path: "/tmp/unbounded-storage-test-disk".to_string(),
+                    size: Some(64 * 4096),
+                },
+            )),
+        };
+
+        let mode = disk_open_mode(&spec);
+
+        assert!(mode.o_direct, "file disks must bypass the host page cache");
+        assert!(!mode.ring_cfg.iopoll, "regular files cannot use IOPOLL");
+        assert!(!mode.ring_cfg.single_issuer);
+        assert!(!mode.ring_cfg.defer_taskrun);
+        assert_eq!(mode.ring_cfg.queue_depth, 32);
+    }
+
+    #[test]
+    fn block_disks_keep_default_direct_iopoll_mode() {
+        let spec = DiskSpec {
+            queue_depth: Some(64),
+            page_size_bytes: None,
+            skip_recovery_scan: false,
+            force_format: false,
+            bypass_admission: false,
+            bypass_index_read: false,
+            bypass_checksum: false,
+            config: Some(crate::config::schema::disk_spec::Config::Block(
+                crate::config::schema::BlockDiskConfig {
+                    numa: None,
+                    path: "/dev/unbounded-test-block".to_string(),
+                },
+            )),
+        };
+
+        let mode = disk_open_mode(&spec);
+
+        assert!(mode.o_direct);
+        assert!(mode.ring_cfg.iopoll);
+        assert!(mode.ring_cfg.single_issuer);
+        assert!(mode.ring_cfg.defer_taskrun);
+        assert_eq!(mode.ring_cfg.queue_depth, 64);
+    }
+
+    #[test]
+    fn block_iopoll_probe_reads_sysfs_queue_flag() {
+        let dir = tempfile::tempdir().expect("create temp sysfs");
+        let queue = dir.path().join("nvme0n1/queue");
+        fs::create_dir_all(&queue).expect("create queue dir");
+
+        fs::write(queue.join("io_poll"), "0\n").expect("write io_poll");
+        assert_eq!(
+            block_queue_iopoll(Path::new("/dev/nvme0n1"), dir.path()),
+            Some(false)
+        );
+
+        fs::write(queue.join("io_poll"), "1\n").expect("write io_poll");
+        assert_eq!(
+            block_queue_iopoll(Path::new("/dev/nvme0n1"), dir.path()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn block_iopoll_probe_is_unknown_when_sysfs_missing() {
+        let dir = tempfile::tempdir().expect("create temp sysfs");
+
+        assert_eq!(
+            block_queue_iopoll(Path::new("/dev/nvme0n1"), dir.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn block_disks_disable_iopoll_when_queue_does_not_support_it() {
+        let dir = tempfile::tempdir().expect("create temp sysfs");
+        let queue = dir.path().join("nvme0n1/queue");
+        fs::create_dir_all(&queue).expect("create queue dir");
+        fs::write(queue.join("io_poll"), "0\n").expect("write io_poll");
+
+        let mut ring_cfg = StorageRingConfig::default();
+        disable_iopoll_if_unsupported(&mut ring_cfg, Path::new("/dev/nvme0n1"), dir.path());
+
+        assert!(!ring_cfg.iopoll);
+        assert!(!ring_cfg.single_issuer);
+        assert!(!ring_cfg.defer_taskrun);
+    }
+
+    #[test]
+    fn block_disks_keep_iopoll_when_queue_support_is_unknown() {
+        let dir = tempfile::tempdir().expect("create temp sysfs");
+
+        let mut ring_cfg = StorageRingConfig::default();
+        disable_iopoll_if_unsupported(&mut ring_cfg, Path::new("/dev/nvme0n1"), dir.path());
+
+        assert!(ring_cfg.iopoll);
+        assert!(ring_cfg.single_issuer);
+        assert!(ring_cfg.defer_taskrun);
     }
 
     /// Regression for BUG 2: a `ring.progress()` error in STEADY STATE

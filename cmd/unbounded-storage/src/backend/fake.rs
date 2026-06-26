@@ -2,31 +2,31 @@
 // Licensed under the MIT License.
 
 //! Synthetic origin backend for benchmarking. [`FakeBackend`] serves
-//! zero-filled objects of a single fixed size without any network I/O,
-//! so the cache and frontend read path can be load-tested in production
-//! without standing up a real origin.
+//! deterministic loadgen objects of a single fixed size without any
+//! network I/O, so the cache and frontend read path can be load-tested
+//! in production without standing up a real origin.
 //!
 //! It mirrors [`HttpBackend`](super::http::HttpBackend)'s
 //! `Backend`/`PageStream` shape but collapses the whole fetch to a
 //! synchronous page fill: there is no ring, no socket, and no future to
-//! drive. A data request zero-fills the destination pages directly; a
-//! metadata request writes the object's [`ObjectMetadata`] (carrying the
-//! fixed `object_size`) so the frontend learns the object's length and
-//! clamps served reads to it. Because the fill is synchronous and
-//! borrows nothing, the produced [`FakeFetchStream`] is fully owned and
-//! the backend can be served from behind an `Arc`/`ArcSwap` just like
-//! the real origin backends.
+//! drive. A data request fills destination pages from the shared
+//! deterministic synthetic object contract; a metadata request writes
+//! the object's [`ObjectMetadata`] (carrying the fixed `object_size`) so
+//! the frontend learns the object's length and clamps served reads to it.
+//! Because the fill is synchronous, the produced [`FakeFetchStream`]
+//! only needs to borrow the destination-page slice long enough to yield
+//! those copied page refs back to the pool.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
-use crate::storage::{ObjectMetadata, StripeReq};
+use crate::storage::{ObjectMetadata, StripeReq, fill_synthetic_pages, parse_synthetic_object_id};
 
 use super::Backend;
 use super::http::copy_body_into_pages;
 
-/// Origin backend that synthesizes zero-filled objects of a fixed size.
+/// Origin backend that synthesizes deterministic objects of a fixed size.
 ///
 /// Shard-pinned for the same reason as
 /// [`HttpBackend`](super::http::HttpBackend): the raw `backing_base`
@@ -35,7 +35,8 @@ use super::http::copy_body_into_pages;
 /// cross-thread concern is the backing pointer.
 pub struct FakeBackend {
     backend_id: String,
-    object_size: u64,
+    stripe_size: u64,
+    metadata_body: Box<[u8]>,
     page_size: usize,
     backing_base: *mut u8,
 }
@@ -52,13 +53,20 @@ unsafe impl Sync for FakeBackend {}
 impl FakeBackend {
     pub fn new(
         backend_id: String,
+        stripe_size: u64,
         object_size: u64,
         page_size: usize,
         backing_base: *mut u8,
     ) -> Self {
+        let metadata_body = ObjectMetadata::new(object_size)
+            .encode()
+            .expect("fake backend metadata encoding should not fail")
+            .into_boxed_slice();
+
         Self {
             backend_id,
-            object_size,
+            stripe_size,
+            metadata_body,
             page_size,
             backing_base,
         }
@@ -70,56 +78,69 @@ impl FakeBackend {
         &self.backend_id
     }
 
-    /// Owned-stream variant of [`Backend::bulk_get`].
-    ///
     /// Fills the destination pages synchronously, then returns a stream
-    /// that yields each filled [`PageRef`] in order. The returned stream
-    /// borrows nothing from `self`, so it is `'static` (see the module
-    /// docs and [`super::registry::BackendRegistry`]).
-    pub fn fetch_stream(
+    /// that yields each filled [`PageRef`] in order.
+    pub fn fetch_stream<'a>(
         &self,
         req: &StripeReq,
-        _src: BulkRef,
-        dsts: &[PageRef],
-    ) -> FakeFetchStream {
-        let Some(origin) = req.origin() else {
-            return FakeFetchStream::immediate_error("fake backend: request missing origin");
-        };
-
-        let dsts_owned = dsts.to_vec();
-        // A metadata entry reports the object's length; a data request is
-        // a byte range whose synthetic content is all zeros. Both reduce
-        // to a page fill via `copy_body_into_pages` (an empty body
-        // zero-fills every destination byte).
-        let fill = if origin.is_metadata_entry() {
-            self.fill_metadata(&dsts_owned)
-        } else {
-            copy_body_into_pages(&[], &dsts_owned, self.backing_base, self.page_size)
-        };
-
-        match fill {
-            Ok(()) => FakeFetchStream::ready(dsts_owned),
+        src: BulkRef,
+        dsts: &'a [PageRef],
+    ) -> FakeFetchStream<'a> {
+        match self.fill(req, src, dsts) {
+            Ok(()) => FakeFetchStream::ready(dsts),
             Err(e) => FakeFetchStream::immediate_err(e),
+        }
+    }
+
+    pub(super) fn fill(
+        &self,
+        req: &StripeReq,
+        src: BulkRef,
+        dsts: &[PageRef],
+    ) -> Result<(), Error> {
+        let Some(origin) = req.origin() else {
+            return Err(Error::from("fake backend: request missing origin"));
+        };
+        let Some(object) = parse_synthetic_object_id(&origin.origin_object_id) else {
+            return Err(Error::from("fake backend: invalid synthetic object id"));
+        };
+
+        if origin.is_metadata_entry() {
+            self.fill_metadata(dsts)
+        } else {
+            let Some(start_offset) = origin
+                .stripe_idx
+                .checked_mul(self.stripe_size)
+                .and_then(|base| base.checked_add(src.offset))
+            else {
+                return Err(Error::from("fake backend: synthetic offset overflow"));
+            };
+            fill_synthetic_pages(
+                object,
+                start_offset,
+                dsts,
+                self.backing_base,
+                self.page_size,
+            )
         }
     }
 
     /// Encode the object's [`ObjectMetadata`] and write it into the
     /// metadata entry's destination page(s).
     fn fill_metadata(&self, dsts: &[PageRef]) -> Result<(), Error> {
-        let body = ObjectMetadata::new(self.object_size).encode()?;
         let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
-        if body.len() > capacity {
+        if self.metadata_body.len() > capacity {
             return Err(Error::from(
                 "fake backend: metadata entry destination too small",
             ));
         }
-        copy_body_into_pages(&body, dsts, self.backing_base, self.page_size)
+        copy_body_into_pages(&self.metadata_body, dsts, self.backing_base, self.page_size)
     }
 }
 
 impl Backend for FakeBackend {
     type Req = StripeReq;
-    type Stream<'a> = FakeFetchStream;
+    type Stream<'a> = FakeFetchStream<'a>;
 
     fn bulk_get<'a>(
         &'a self,
@@ -135,10 +156,9 @@ impl Backend for FakeBackend {
 /// filled by the time it is constructed, so it simply yields each
 /// destination [`PageRef`] in order followed by `None`. On a fill error
 /// it yields that error once then `None`.
-pub struct FakeFetchStream {
+pub struct FakeFetchStream<'a> {
+    delivered: &'a [PageRef],
     state: FillState,
-    /// The destination pages to yield, in order.
-    delivered: Vec<PageRef>,
     next: usize,
 }
 
@@ -151,33 +171,25 @@ enum FillState {
     Done,
 }
 
-impl FakeFetchStream {
-    fn ready(delivered: Vec<PageRef>) -> Self {
+impl<'a> FakeFetchStream<'a> {
+    fn ready(delivered: &'a [PageRef]) -> Self {
         Self {
-            state: FillState::Delivering,
             delivered,
-            next: 0,
-        }
-    }
-
-    fn immediate_error(msg: &'static str) -> Self {
-        Self {
-            state: FillState::Failed(Some(Error::from(msg))),
-            delivered: Vec::new(),
+            state: FillState::Delivering,
             next: 0,
         }
     }
 
     fn immediate_err(err: Error) -> Self {
         Self {
+            delivered: &[],
             state: FillState::Failed(Some(err)),
-            delivered: Vec::new(),
             next: 0,
         }
     }
 }
 
-impl PageStream for FakeFetchStream {
+impl PageStream for FakeFetchStream<'_> {
     fn poll_next(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -230,8 +242,7 @@ mod tests {
 
     /// A backing buffer of `pages` contiguous pages plus the `PageRef`s
     /// that address them. The buffer is pre-filled with `0xAA` so a test
-    /// can prove the backend actually wrote zeros (rather than the page
-    /// having been zero to begin with).
+    /// can prove the backend actually wrote synthetic content.
     fn backing(pages: usize) -> (Vec<u8>, Vec<PageRef>) {
         let buf = vec![0xAAu8; pages * PAGE_SIZE];
         let dsts = (0..pages)
@@ -242,6 +253,16 @@ mod tests {
             })
             .collect();
         (buf, dsts)
+    }
+
+    fn fake_backend<'a>(buf: &'a mut [u8], object_size: u64) -> FakeBackend {
+        FakeBackend::new(
+            "fake".into(),
+            PAGE_SIZE as u64,
+            object_size,
+            PAGE_SIZE,
+            buf.as_mut_ptr(),
+        )
     }
 
     /// Drive a stream to completion, returning the yielded pages.
@@ -260,11 +281,13 @@ mod tests {
     }
 
     #[test]
-    fn data_request_zero_fills_every_page() {
+    fn data_request_fills_deterministic_bytes() {
         let (mut buf, dsts) = backing(2);
-        let backend = FakeBackend::new("fake".into(), 8192, PAGE_SIZE, buf.as_mut_ptr());
+        let backend = fake_backend(&mut buf, 8192);
 
-        let origin = OriginRef::new("fake", "obj", 0);
+        let object_id = crate::storage::synthetic_object_id(7, 11);
+        let object = crate::storage::parse_synthetic_object_id(&object_id).unwrap();
+        let origin = OriginRef::new("fake", object_id, 0);
         let req = StripeReq::new(origin.stripe_key()).with_origin(origin);
         let src = BulkRef {
             stripe: origin_key(),
@@ -274,19 +297,33 @@ mod tests {
 
         let pages = drain(backend.fetch_stream(&req, src, &dsts)).expect("fill");
         assert_eq!(pages.len(), 2, "every destination page must be yielded");
-        assert!(
-            buf.iter().all(|&b| b == 0),
-            "data pages must be fully zero-filled",
-        );
+        assert!(crate::storage::synthetic_matches_bytes(object, 0, &buf));
+    }
+
+    #[test]
+    fn invalid_synthetic_object_id_errors() {
+        let (mut buf, dsts) = backing(1);
+        let backend = fake_backend(&mut buf, 4096);
+
+        let origin = OriginRef::new("fake", "obj", 0);
+        let req = StripeReq::new(origin.stripe_key()).with_origin(origin);
+        let src = BulkRef {
+            stripe: origin_key(),
+            offset: 0,
+            len: PAGE_SIZE as u32,
+        };
+
+        drain(backend.fetch_stream(&req, src, &dsts))
+            .expect_err("invalid synthetic object id must error");
     }
 
     #[test]
     fn metadata_request_reports_configured_object_size() {
         let object_size = 7 * 1024 * 1024;
         let (mut buf, dsts) = backing(1);
-        let backend = FakeBackend::new("fake".into(), object_size, PAGE_SIZE, buf.as_mut_ptr());
+        let backend = fake_backend(&mut buf, object_size);
 
-        let origin = OriginRef::metadata_entry("fake", "obj");
+        let origin = OriginRef::metadata_entry("fake", crate::storage::synthetic_object_id(7, 11));
         let req = StripeReq::new(origin.stripe_key()).with_origin(origin);
         let src = BulkRef {
             stripe: origin_key(),
@@ -303,7 +340,13 @@ mod tests {
 
     #[test]
     fn missing_origin_yields_one_error_then_ends() {
-        let backend = FakeBackend::new("fake".into(), 4096, PAGE_SIZE, ptr::null_mut());
+        let backend = FakeBackend::new(
+            "fake".into(),
+            PAGE_SIZE as u64,
+            4096,
+            PAGE_SIZE,
+            ptr::null_mut(),
+        );
         let req = StripeReq::new(origin_key());
         let dsts: Vec<PageRef> = Vec::new();
         let src = BulkRef {
@@ -318,6 +361,6 @@ mod tests {
     }
 
     fn origin_key() -> StripeKey {
-        OriginRef::new("fake", "obj", 0).stripe_key()
+        OriginRef::new("fake", crate::storage::synthetic_object_id(7, 11), 0).stripe_key()
     }
 }
