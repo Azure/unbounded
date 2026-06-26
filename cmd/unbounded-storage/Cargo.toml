@@ -8,10 +8,6 @@ publish = false
 name = "unbounded-storage"
 path = "src/main.rs"
 
-[[bin]]
-name = "bench"
-path = "src/bin/bench.rs"
-
 [lib]
 name = "unbounded_storage"
 path = "src/lib.rs"
@@ -26,15 +22,27 @@ sha2 = "0.10"
 hmac = "0.12"
 arc-swap = "1.7"
 twox-hash = { version = "1.6", default-features = false }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 rand = "0.8"
 rand_chacha = "0.3"
 toml = "0.8"
 notify = "6"
+prometheus = { version = "0.13", default-features = false }
+prost = "0.13"
+pprof = { version = "0.15", default-features = false, features = ["protobuf-codec"], optional = true }
+
+[features]
+# CPU sampling profiler. Off by default so standard builds stay
+# dependency-free; enable with `--features profiling`. When enabled the
+# daemon listens for SIGUSR1 and writes a pprof protobuf file. See
+# src/profiling.rs.
+profiling = ["dep:pprof"]
 
 [build-dependencies]
 cc = "1"
 pkg-config = "0.3"
+prost-build = "0.13"
+protoc-bin-vendored = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -43,4 +51,3 @@ io-uring = "0.6"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
-

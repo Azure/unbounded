@@ -225,7 +225,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 			Kubernetes: &v1alpha3.KubernetesSpec{
 				Version:    sv.GitVersion,
 				NodeLabels: nodeLabels,
-				BootstrapTokenRef: v1alpha3.LocalObjectReference{
+				BootstrapTokenRef: &v1alpha3.LocalObjectReference{
 					Name: fmt.Sprintf("bootstrap-token-%s", bootstrapToken.ID),
 				},
 			},
@@ -364,7 +364,7 @@ func (h *machineRegisterHandler) validate() error {
 
 	// Validate host format: must be a valid IP or host, optionally with port.
 	if host, _, err := net.SplitHostPort(h.host); err == nil {
-		// Had a port — check the host part is non-empty.
+		// Had a port - check the host part is non-empty.
 		if isEmpty(host) {
 			return errors.New("host address is empty in host:port value")
 		}

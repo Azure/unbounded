@@ -37,9 +37,44 @@ use io_uring::{opcode, types};
 
 use super::core::{OpFut, OpResource, RecvQuarantine, RingCore, RingSetup, Slot, check_res};
 
+/// TLS `application_data` record type (RFC 8446). Plaintext bytes the
+/// kernel hands back as ordinary payload also default to this.
+pub const TLS_RECORD_TYPE_APPLICATION_DATA: u8 = 23;
+/// TLS `alert` record type (RFC 8446). A `close_notify` alert arrives as
+/// one of these and signals orderly stream end.
+pub const TLS_RECORD_TYPE_ALERT: u8 = 21;
+/// TLS `handshake` record type (RFC 8446). Post-handshake messages
+/// (`NewSessionTicket`, `KeyUpdate`) surface as these on a kTLS RX
+/// socket and must be skipped by the application.
+pub const TLS_RECORD_TYPE_HANDSHAKE: u8 = 22;
+
+/// Outcome of a [`NetHandle::recv_fixed_msg`]: how many bytes landed in
+/// the registered destination and the TLS record type the kernel
+/// reported for them (defaulting to `application_data` on a plaintext
+/// socket).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecvRecord {
+    /// Bytes written into the registered destination page.
+    pub len: usize,
+    /// TLS content type of the record (`application_data` on plaintext).
+    pub record_type: u8,
+    /// For an `alert` record, the alert description byte (the second of
+    /// the alert's two payload bytes), so a caller can tell a graceful
+    /// `close_notify` from a fatal alert that truncated the stream.
+    /// `None` for non-alert records or a malformed (sub-2-byte) alert.
+    pub alert_desc: Option<u8>,
+}
+
 /// Thin owned wrapper around a `libc::sockaddr` plus its length, so
 /// `connect` can hand a stable pointer to the kernel for the op's
 /// duration.
+///
+/// `Clone`/`Copy` because the stored `sockaddr_storage` is plain bytes:
+/// an origin backend clones the resolved origin address into each
+/// self-owned fetch future so the produced page stream borrows nothing
+/// from the backend, which lets the backend live behind a hot-swappable
+/// registry (see [`crate::backend::BackendRegistry`]).
+#[derive(Clone, Copy)]
 pub struct SockAddr {
     storage: libc::sockaddr_storage,
     len: libc::socklen_t,
@@ -117,7 +152,7 @@ impl SockAddr {
 /// One io_uring ring dedicated to socket I/O, pinned to the shard
 /// thread. See the module docs for the completion / SEND_ZC model.
 pub struct NetworkRing {
-    core: RingCore,
+    pub(crate) core: RingCore,
 }
 
 impl NetworkRing {
@@ -153,13 +188,29 @@ impl NetworkRing {
     /// callers that hold the region as a bare pointer (e.g. a worker's
     /// thread-local scratch backing whose `Backing` Drop carrier cannot
     /// be re-synthesized from raw parts).
+    ///
+    /// The local shard's own backing must be registered first so it
+    /// lands at index 0 (the index `recv_fixed` and the local serving
+    /// path assume).
     pub fn register_region(&self, base: *mut u8, len: usize) -> io::Result<()> {
+        let idx = self.register_region_indexed(base, len)?;
+        debug_assert_eq!(idx, 0, "first region must be fixed buffer index 0");
+        Ok(())
+    }
+
+    /// Register a raw `(base, len)` region as the next fixed buffer and
+    /// return its assigned index. Used to register **peer shards'**
+    /// backings (index 1..N) on this shard's socket ring so the
+    /// coordinator can SEND_ZC zero-copy directly from an owner shard's
+    /// page (cross-shard fan-out). All such regions must be registered
+    /// before any I/O is in flight: `RingCore::register_buffer`
+    /// unregisters and re-registers the whole fixed-buffer table on each
+    /// call, which is only safe while the ring is quiescent.
+    pub fn register_region_indexed(&self, base: *mut u8, len: usize) -> io::Result<u16> {
         if base.is_null() || len == 0 {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
-        let idx = self.core.register_buffer(base, len)?;
-        debug_assert_eq!(idx, 0, "region must be the first registered buffer");
-        Ok(())
+        self.core.register_buffer(base, len)
     }
 
     /// Install the sink that defers reuse of a cancelled fixed-buffer
@@ -320,12 +371,15 @@ impl NetworkRing {
         }
     }
 
-    /// Resolve a `(buf_index, offset)` pair to a raw pointer inside the
-    /// registered backing. Only `buf_index == 0` is registered.
-    fn fixed_ptr(&self, buf_index: u16, page_byte_offset: usize) -> io::Result<*const u8> {
-        if buf_index != 0 {
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        }
+    /// Resolve a `(buf_index, offset)` pair to a raw pointer inside a
+    /// registered region. `buf_index` 0 is this shard's own backing;
+    /// indices 1..N are peer shards' backings registered via
+    /// [`Self::register_region_indexed`] for cross-shard zero-copy send.
+    pub(crate) fn fixed_ptr(
+        &self,
+        buf_index: u16,
+        page_byte_offset: usize,
+    ) -> io::Result<*const u8> {
         match self.core.registered_base(buf_index) {
             Some(base) => Ok(unsafe { base.as_ptr().add(page_byte_offset) as *const u8 }),
             None => Err(io::Error::from_raw_os_error(libc::EINVAL)),
@@ -362,6 +416,21 @@ impl NetHandle {
         Self { ring }
     }
 
+    /// Register a peer shard's backing region on this handle's ring and
+    /// return its fixed-buffer index, so this shard can SEND_ZC
+    /// zero-copy from the peer's pages (cross-shard fan-out). Must be
+    /// called during bring-up before any I/O is in flight (see
+    /// [`NetworkRing::register_region_indexed`]).
+    pub fn register_peer_region(&self, base: *mut u8, len: usize) -> io::Result<u16> {
+        self.ring.borrow().register_region_indexed(base, len)
+    }
+
+    /// Shared access to the underlying ring cell, for sibling-module ops
+    /// (see `tls_recv`) that submit on this handle's ring.
+    pub(crate) fn ring_cell(&self) -> &Rc<RefCell<NetworkRing>> {
+        &self.ring
+    }
+
     /// True when both handles drive the very same ring allocation
     /// (their `Rc`s share one `NetworkRing`). Used to assert ring
     /// sharing/isolation across threads.
@@ -375,6 +444,12 @@ impl NetHandle {
     /// rings return distinct ones.
     #[cfg(test)]
     pub fn ring_addr(&self) -> usize {
+        Rc::as_ptr(&self.ring) as usize
+    }
+
+    /// Address identity of the underlying ring allocation for components
+    /// that must keep resources ring-local across reused handles.
+    pub(crate) fn ring_key(&self) -> usize {
         Rc::as_ptr(&self.ring) as usize
     }
 
@@ -556,7 +631,7 @@ impl NetHandle {
 /// can be stored across shard-loop ticks. The owned slot carries the
 /// completion state; the ring borrow is taken transiently in `poll` (to
 /// pump `progress`) and `drop` (to best-effort cancel).
-struct OwnedNetFut {
+pub(crate) struct OwnedNetFut {
     ring: Rc<RefCell<NetworkRing>>,
     user_data: u64,
     slot: Rc<Slot>,
@@ -571,7 +646,7 @@ struct OwnedNetFut {
 }
 
 impl OwnedNetFut {
-    fn new(ring: Rc<RefCell<NetworkRing>>, user_data: u64, slot: Rc<Slot>) -> Self {
+    pub(crate) fn new(ring: Rc<RefCell<NetworkRing>>, user_data: u64, slot: Rc<Slot>) -> Self {
         Self {
             ring,
             user_data,
@@ -583,7 +658,7 @@ impl OwnedNetFut {
     /// Mark this future as a fixed-buffer RECV writing into the backing
     /// at byte `page_byte_offset`, so dropping it before completion
     /// makes that destination page safe to reuse (see the field docs).
-    fn fixed_recv(mut self, page_byte_offset: usize) -> Self {
+    pub(crate) fn fixed_recv(mut self, page_byte_offset: usize) -> Self {
         self.fixed_recv_offset = Some(page_byte_offset);
         self
     }
@@ -801,7 +876,7 @@ mod tests {
             base: store.as_mut_ptr(),
             page_size: PAGE,
             page_count: 2,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         if let Err(e) = ring.register_backing(&backing) {
             eprintln!("send_zc_recv_fixed: register_backing failed: {e}; skipping");
@@ -916,7 +991,7 @@ mod tests {
             base: store.as_mut_ptr(),
             page_size: PAGE,
             page_count: 2,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         if let Err(e) = ring.register_backing(&backing) {
             eprintln!("handle_recv_fixed: register_backing failed: {e}; skipping");
@@ -993,7 +1068,7 @@ mod tests {
             base: store.as_mut_ptr(),
             page_size: PAGE,
             page_count: 2,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         if let Err(e) = ring.register_backing(&backing) {
             eprintln!("drop_in_flight_recv_fixed: register_backing failed: {e}; skipping");
@@ -1084,7 +1159,7 @@ mod tests {
             base: store.as_mut_ptr(),
             page_size: PAGE,
             page_count: 2,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         };
         if let Err(e) = ring.register_backing(&backing) {
             eprintln!("quarantine_until_reaped: register_backing failed: {e}; skipping");
@@ -1252,5 +1327,167 @@ mod tests {
             dup.as_ipv4(),
             Some((std::net::Ipv4Addr::new(127, 0, 0, 1), 8080))
         );
+    }
+
+    /// `recv_fixed_msg` lands the body in the registered backing exactly
+    /// like `recv_fixed`, and on a plaintext socket (no TLS control
+    /// message) reports the default `application_data` record type.
+    #[test]
+    fn handle_recv_fixed_msg_lands_and_defaults_record_type() {
+        let ring = match NetworkRing::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("recv_fixed_msg: ring unavailable: {e}; skipping");
+                return;
+            }
+        };
+
+        const PAGE: usize = 4096;
+        let mut store = vec![0u8; PAGE * 2];
+        let payload: &[u8] = b"nethandle recv_fixed_msg bytes";
+        let backing = crate::memory::Backing {
+            base: store.as_mut_ptr(),
+            page_size: PAGE,
+            page_count: 2,
+            keepalive: std::sync::Arc::new(()),
+        };
+        if let Err(e) = ring.register_backing(&backing) {
+            eprintln!("recv_fixed_msg: register_backing failed: {e}; skipping");
+            return;
+        }
+
+        let ring = Rc::new(RefCell::new(ring));
+        let handle = NetHandle::new(Rc::clone(&ring));
+
+        let Some((a, b)) = tcp_loopback_pair() else {
+            eprintln!("recv_fixed_msg: tcp loopback pair failed; skipping");
+            return;
+        };
+
+        let wrote =
+            unsafe { libc::write(a, payload.as_ptr() as *const libc::c_void, payload.len()) };
+        assert_eq!(wrote as usize, payload.len());
+
+        let rec = {
+            let fut = handle.recv_fixed_msg(b, PAGE, payload.len());
+            let mut fut = Box::pin(fut);
+            match block_on_handle(fut.as_mut()) {
+                Ok(r) => r,
+                Err(e) if is_unsupported(&e) => {
+                    eprintln!("recv_fixed_msg: RECVMSG unsupported; skipping");
+                    unsafe {
+                        libc::close(a);
+                        libc::close(b);
+                    }
+                    return;
+                }
+                Err(e) => panic!("recv_fixed_msg failed: {e}"),
+            }
+        };
+
+        assert_eq!(rec.len, payload.len());
+        assert_eq!(rec.record_type, TLS_RECORD_TYPE_APPLICATION_DATA);
+        assert_eq!(rec.alert_desc, None);
+        assert_eq!(&store[PAGE..PAGE + payload.len()], payload);
+
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
+    }
+
+    /// `poll_ready` resolves with a writable socket reporting `POLLOUT`
+    /// in its `revents`, without consuming any stream bytes.
+    #[test]
+    fn handle_poll_ready_reports_writable() {
+        let ring = match NetworkRing::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("poll_ready: ring unavailable: {e}; skipping");
+                return;
+            }
+        };
+        let ring = Rc::new(RefCell::new(ring));
+        let handle = NetHandle::new(Rc::clone(&ring));
+
+        let Some((a, b)) = tcp_loopback_pair() else {
+            eprintln!("poll_ready: tcp loopback pair failed; skipping");
+            return;
+        };
+
+        let revents = {
+            let fut = handle.poll_ready(b, libc::POLLOUT as u32);
+            let mut fut = Box::pin(fut);
+            match block_on_handle(fut.as_mut()) {
+                Ok(r) => r,
+                Err(e) if is_unsupported(&e) => {
+                    eprintln!("poll_ready: POLL_ADD unsupported; skipping");
+                    unsafe {
+                        libc::close(a);
+                        libc::close(b);
+                    }
+                    return;
+                }
+                Err(e) => panic!("poll_ready failed: {e}"),
+            }
+        };
+
+        assert_ne!(revents & libc::POLLOUT as u32, 0);
+
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
+    }
+
+    /// `recv_msg` returns the received bytes in a fresh heap buffer and,
+    /// on a plaintext socket (no TLS control message), reports the
+    /// default `application_data` record type.
+    #[test]
+    fn handle_recv_msg_returns_heap_bytes_and_default_record_type() {
+        let ring = match NetworkRing::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("recv_msg: ring unavailable: {e}; skipping");
+                return;
+            }
+        };
+        let ring = Rc::new(RefCell::new(ring));
+        let handle = NetHandle::new(Rc::clone(&ring));
+
+        let Some((a, b)) = tcp_loopback_pair() else {
+            eprintln!("recv_msg: tcp loopback pair failed; skipping");
+            return;
+        };
+
+        let payload: &[u8] = b"nethandle recv_msg header bytes";
+        let wrote =
+            unsafe { libc::write(a, payload.as_ptr() as *const libc::c_void, payload.len()) };
+        assert_eq!(wrote as usize, payload.len());
+
+        let (data, record_type) = {
+            let fut = handle.recv_msg(b, 64 * 1024);
+            let mut fut = Box::pin(fut);
+            match block_on_handle(fut.as_mut()) {
+                Ok(r) => r,
+                Err(e) if is_unsupported(&e) => {
+                    eprintln!("recv_msg: RECVMSG unsupported; skipping");
+                    unsafe {
+                        libc::close(a);
+                        libc::close(b);
+                    }
+                    return;
+                }
+                Err(e) => panic!("recv_msg failed: {e}"),
+            }
+        };
+
+        assert_eq!(data, payload);
+        assert_eq!(record_type, TLS_RECORD_TYPE_APPLICATION_DATA);
+
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 }

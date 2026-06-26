@@ -1,0 +1,79 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-storage-config
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-storage-supervisor
+    app.kubernetes.io/component: storage
+# Cluster-wide daemon configuration. The single config.yaml key is the full
+# unbounded-storage Config schema expressed as YAML (see
+# api/unbounded-storage/config.proto and src/config/schema.rs); field names use
+# the proto snake_case paths. The run supervisor unmarshals it into protobuf
+# and renders the host config (binary protobuf at config.binpb). Unknown fields
+# are rejected, so a typo fails the render loudly. Any field left unset keeps
+# its proto3 zero value, which the daemon promotes to the documented default.
+#
+# Per-node sections are supervisor-injected when a storage ring is active:
+# startup.fabric.binds.tcp.addr is overridden per node, and every declared
+# neighborhood gets its local_node_id plus label-discovered peers merged into
+# neighborhoods[].peers (discovered peers win id collisions). Declare
+# neighborhoods here when this deployment should participate in a P2P ring; the
+# supervisor will not invent one because each neighborhood needs an explicit
+# source backend.
+#
+# Disks are declared in disks[]. Explicit disks are preserved, while an absent
+# or empty disks list is filled from this node's annotations.
+# unbounded-cloud.io/storage-disks is a
+# comma-separated list of block disks such as
+# /dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0. When that annotation
+# is absent or has no valid disks, the supervisor uses one file-backed disk at
+# /var/lib/unbounded-storage/cache.disk sized by
+# unbounded-cloud.io/storage-file-size-bytes, defaulting to 2 GiB. The shared
+# disk set is available to every cache; the supervisor does not
+# invent caches, backends, frontends, or neighborhoods.
+data:
+  config.yaml: |
+    # Operator-assigned config version (opaque counter; 0 means unversioned).
+    version: 0
+
+    startup:
+      memory:
+        # Allocate per-shard backing from the heap instead of 2 MiB hugepages.
+        no_hugepages: false
+        # Total backing pool across all serving shards in bytes (128 MiB).
+        memory_total_bytes: 134217728
+      fabric:
+        tcp:
+          # Per-shard TCP fabric listen address (":0" picks a free port).
+          addr: "0.0.0.0:0"
+        # libfabric progress threads per shard.
+        progress_threads: 2
+        # Progress-thread busy-poll budget in microseconds.
+        progress_poll_us: 10
+        # Fabric RPC worker threads per shard.
+        rpc_worker_threads: 4
+        # Max in-flight fabric operations per shard (back-pressure limit).
+        max_inflight: 1024
+      topology:
+        # Place shards on SMT sibling CPUs as well as physical cores.
+        use_smt_siblings: false
+        # Schedule shards onto isolcpus-isolated CPUs too.
+        ignore_isolated: false
+        # Allow placing a shard on each NUMA node's CPU 0.
+        include_node_cpu0: false
+        # Use HCA ports that are not in the active state.
+        allow_inactive_port: false
+        # Disable RDMA and force the libfabric tcp provider.
+        disable_rdma: false
+        # Cap on serving-shard CPUs to pin. Omit to claim every usable core.
+        # serving_cores: 12
+        # NIC-worker CPUs to pin per active HCA.
+        nic_workers: 4
+      metrics:
+        # Prometheus exporter listen address ("" disables the exporter).
+        addr: ""

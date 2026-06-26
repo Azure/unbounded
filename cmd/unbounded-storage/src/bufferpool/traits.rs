@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::bufferpool::pipeline::{PipelinedRead, StripePlan};
 use crate::bufferpool::stream::ReadStream;
 use crate::bufferpool::types::{BulkRef, Error, PageRef, StripeKey};
 use crate::bufferpool::window::WindowedRead;
@@ -15,6 +16,33 @@ use crate::memory::Backing;
 
 pub trait Req {
     fn key(&self) -> StripeKey;
+
+    /// When `true`, the request bypasses the p2p cache layer: the
+    /// pool skips the local-disk read and writeback tee, and the
+    /// transport routes straight to the origin backend instead of a
+    /// peer. Defaults to `false` so existing request types are
+    /// unaffected.
+    fn bypass(&self) -> bool {
+        false
+    }
+
+    /// Stable cache namespace selected by the frontend binding. `None` means
+    /// this request has no local cache tier.
+    fn cache_id(&self) -> Option<&String> {
+        None
+    }
+
+    /// Stable P2P neighborhood selected by the frontend binding. `None` means
+    /// origin routing after a local miss.
+    fn neighborhood_id(&self) -> Option<&String> {
+        None
+    }
+}
+
+impl Req for StripeKey {
+    fn key(&self) -> StripeKey {
+        *self
+    }
 }
 
 /// `Stream`-like surface for a transport's bulk-get response. We
@@ -126,13 +154,21 @@ pub trait BlockStore {
     /// Local-disk lookup. `Ok(true)` if `dst` was filled from disk;
     /// `Ok(false)` if the key is not present (pool then falls back
     /// to `Transport::bulk_get`).
-    async fn read_page(&self, key: StripeKey, stripe_off: u64, dst: PageRef)
-    -> Result<bool, Error>;
+    async fn read_page<R: Req + ?Sized>(
+        &self,
+        req: &R,
+        stripe_off: u64,
+        dst: PageRef,
+    ) -> Result<bool, Error>;
 
-    /// Persist `page` for `(key, stripe_off)`. Used as the tee on a
-    /// miss after the peer fetch lands.
-    async fn write_page(&self, key: StripeKey, stripe_off: u64, page: PageRef)
-    -> Result<(), Error>;
+    /// Persist `page` for the request key and cache namespace. Used as
+    /// the tee on a miss after the peer fetch lands.
+    async fn write_page<R: Req + ?Sized>(
+        &self,
+        req: &R,
+        stripe_off: u64,
+        page: PageRef,
+    ) -> Result<(), Error>;
 }
 
 /// Blanket impl so a `LocalStorage` (or any other `BlockStore`)
@@ -145,22 +181,22 @@ impl<T: BlockStore + ?Sized> BlockStore for Arc<T> {
         (**self).register_pages(backing)
     }
 
-    async fn read_page(
+    async fn read_page<R: Req + ?Sized>(
         &self,
-        key: StripeKey,
+        req: &R,
         stripe_off: u64,
         dst: PageRef,
     ) -> Result<bool, Error> {
-        (**self).read_page(key, stripe_off, dst).await
+        (**self).read_page(req, stripe_off, dst).await
     }
 
-    async fn write_page(
+    async fn write_page<R: Req + ?Sized>(
         &self,
-        key: StripeKey,
+        req: &R,
         stripe_off: u64,
         page: PageRef,
     ) -> Result<(), Error> {
-        (**self).write_page(key, stripe_off, page).await
+        (**self).write_page(req, stripe_off, page).await
     }
 }
 
@@ -191,4 +227,23 @@ pub trait BufferPool {
         len: u64,
         window: usize,
     ) -> Result<WindowedRead<'p>, Error>;
+
+    /// Cross-stripe counterpart to [`BufferPool::read_windowed`].
+    /// Takes the ordered list of per-stripe slices that make up a
+    /// byte range and returns a [`PipelinedRead`] that keeps up to
+    /// `window` `fetch_page` futures outstanding ahead of the
+    /// consumer cursor *across stripe boundaries*, while still
+    /// delivering pages strictly in order, one at a time. This is the
+    /// throughput path for multi-stripe reads: it overlaps origin and
+    /// peer fetches of pages many stripes ahead with the in-order
+    /// consumption (and slow client send) of the current page, so a
+    /// single large GET keeps the whole `max_inflight_pages` budget
+    /// saturated instead of collapsing to one stripe's depth. `window`
+    /// is clamped by the implementation to the pool's configured
+    /// prefetch budget.
+    fn read_pipelined<'p>(
+        &'p self,
+        stripes: Vec<StripePlan<Self::Req>>,
+        window: usize,
+    ) -> Result<PipelinedRead<'p>, Error>;
 }

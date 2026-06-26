@@ -40,6 +40,110 @@ func TestNSpawnConfig_RenderedSnapshot(t *testing.T) {
 	})
 }
 
+func TestServiceOverride_HostDevicesDeviceAllow(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", nspawnTemplateData{
+		MachineName:     "kube1",
+		BPFFSMountPath:  goalstates.BPFFSMountPath("kube1"),
+		HostDevicePaths: []string{"/dev/kvm"},
+	}))
+
+	out := buf.String()
+
+	// Binding a device in the .nspawn [Files] section is not enough: the
+	// cgroup device controller blocks it unless the service drop-in also
+	// grants access. Assert the DeviceAllow line is emitted for host devices.
+	require.Contains(t, out, "DeviceAllow=/dev/kvm rwm")
+
+	// DeviceAllow must live in the [Service] section.
+	require.Less(t, strings.Index(out, "[Service]"), strings.Index(out, "DeviceAllow=/dev/kvm rwm"))
+}
+
+func TestServiceOverride_MultipleHostDevices(t *testing.T) {
+	t.Parallel()
+
+	devices := []string{"/dev/kvm", "/dev/sda", "/dev/infiniband/uverbs0"}
+
+	var nspawnBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
+		BPFFSMountPath:  goalstates.BPFFSMountPath("kube1"),
+		HostDevicePaths: devices,
+	}))
+
+	var overrideBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", nspawnTemplateData{
+		MachineName:     "kube1",
+		BPFFSMountPath:  goalstates.BPFFSMountPath("kube1"),
+		HostDevicePaths: devices,
+	}))
+
+	// Every host device must get both a bind mount in the .nspawn config and a
+	// matching cgroup DeviceAllow in the service drop-in; otherwise the node is
+	// either invisible or blocked inside the container.
+	for _, dev := range devices {
+		require.Contains(t, nspawnBuf.String(), "Bind="+dev)
+		require.Contains(t, overrideBuf.String(), "DeviceAllow="+dev+" rwm")
+	}
+}
+
+func TestServiceOverride_AMDGPUDevices(t *testing.T) {
+	t.Parallel()
+
+	devices := []string{"/dev/dri/card0", "/dev/dri/renderD128", "/dev/kfd"}
+
+	var nspawnBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
+		BPFFSMountPath:    goalstates.BPFFSMountPath("kube1"),
+		AMDGPUDevicePaths: devices,
+		AMDSysFSPaths:     []string{"/sys/module/amdgpu", "/sys/class/kfd"},
+	}))
+
+	var overrideBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", nspawnTemplateData{
+		MachineName:       "kube1",
+		BPFFSMountPath:    goalstates.BPFFSMountPath("kube1"),
+		AMDGPUDevicePaths: devices,
+	}))
+
+	for _, dev := range devices {
+		require.Contains(t, nspawnBuf.String(), "Bind="+dev)
+		require.Contains(t, overrideBuf.String(), "DeviceAllow="+dev+" rwm")
+	}
+
+	require.Contains(t, nspawnBuf.String(), "AMD GPU support")
+	require.Contains(t, overrideBuf.String(), "AMD GPU support")
+	require.Contains(t, nspawnBuf.String(), "BindReadOnly=/sys/module/amdgpu")
+	require.Contains(t, nspawnBuf.String(), "BindReadOnly=/sys/class/kfd")
+}
+
+func TestPathsExcluding(t *testing.T) {
+	t.Parallel()
+
+	got := pathsExcluding(
+		[]string{"/dev/dri/card0", "/dev/dri/renderD128", "/dev/kfd"},
+		[]string{"/dev/dri/card0", "/dev/dri/renderD128"},
+	)
+
+	require.Equal(t, []string{"/dev/kfd"}, got)
+}
+
+func TestServiceOverride_NoHostDevicesNoDeviceAllow(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", nspawnTemplateData{
+		MachineName:    "kube1",
+		BPFFSMountPath: goalstates.BPFFSMountPath("kube1"),
+		// No HostDevicePaths and no GPU devices.
+	}))
+
+	// With no devices the drop-in must not contain any DeviceAllow lines,
+	// which is what keeps the existing golden snapshots unchanged.
+	require.NotContains(t, buf.String(), "DeviceAllow=")
+}
+
 func requireRenderedSnapshot(t *testing.T, goldenFile, templateName string, data nspawnTemplateData) string {
 	t.Helper()
 

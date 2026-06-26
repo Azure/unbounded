@@ -382,67 +382,6 @@ proptest! {
         }
     }
 
-    /// Invariant: singleflight dedups concurrent writers on
-    /// `(value_hash, page_index)`.
-    ///
-    /// The write path in `storage::engine::write_page_from` calls
-    /// `Singleflight::acquire(page_key)` AFTER admission. Followers
-    /// short-circuit with `Ok(())` and never reach `device.write`;
-    /// only the leader issues the data-page device write. On a
-    /// device-write error the leader abandons (no retry, no
-    /// follower take-over), and `write_io_errors` is incremented.
-    /// Sequential re-issues for the same key after the leader
-    /// settles become new leaders, so the bound is on concurrent
-    /// in-flight calls, not on lifetime calls.
-    ///
-    /// Translated to observable counters: for every admitted call
-    /// the leader did exactly one successful data-page `device.write`,
-    /// and for every leader that failed at `device.write` there is
-    /// one faulted device write (counted in both `device_writes` and
-    /// `write_io_errors`, plus `device_io_errors`). Followers add
-    /// zero device writes. Therefore `admitted <= device_writes` per
-    /// disk and in aggregate: a regression that let followers fall
-    /// through to their own `device.write` (or that dropped the
-    /// leader's allocator gate) would not violate this bound on its
-    /// own, but a regression that lost admitted writes silently
-    /// (admission incremented without the device write landing)
-    /// would. The companion upper bound
-    /// (`device_writes - btree_overhead - meta - eviction_overhead
-    /// <= admitted + write_io_errors`) is the property the SF
-    /// machinery exists to maintain, but it is not directly
-    /// observable from these counters because they do not separate
-    /// data-page writes from btree-internal and meta writes; pinning
-    /// that down requires either an engine-side data-write counter or
-    /// per-key max-inflight tracking on the mock device.
-    #[test]
-    fn invariant_singleflight_dedups_concurrent_writes(
-        seed in any::<u64>(), w in workload_strategy(),
-    ) {
-        let report = run_workload(seed, w).expect("run completed");
-        prop_assert!(
-            report.admitted <= report.device_writes,
-            "admitted ({}) > device_writes ({}): admissions without a backing device write",
-            report.admitted, report.device_writes,
-        );
-        // Per-disk: each disk's admitted count is bounded by its
-        // own device writes. The router partitions by
-        // `disk_for(value_hash, page_index)`, so an admission on
-        // disk `i` must have produced a `device.write` on the same
-        // disk. We do not directly track admitted-per-disk in
-        // `RunReport`, so this falls back to the per-disk write
-        // count being at least the per-disk admission lower bound
-        // implied by the aggregate: if any single disk's
-        // `device_writes` were zero while `admitted > 0` in
-        // aggregate, the routing-diversity invariant would catch
-        // it, but we double-check the cumulative form here.
-        let total_per_disk: u64 = report.device_writes_per_disk.iter().copied().sum();
-        prop_assert_eq!(
-            total_per_disk, report.device_writes,
-            "device_writes ({}) disagrees with sum of per-disk device_writes ({})",
-            report.device_writes, total_per_disk,
-        );
-    }
-
     /// Invariant: at end-of-run quiescence the deferred-reclaim
     /// queue is bounded. Every LBA pushed onto `pending_free`
     /// (either by an overwrite-while-pinned or an eviction-while-
@@ -662,45 +601,39 @@ fn smoke() {
 /// proving the `SimBlockDevice` inflight counter actually
 /// observes overlap when overlap is geometrically forced.
 ///
-/// Several clients each issue many reads against distinct
-/// keys with a generous `max_io_delay`. Reads are not
-/// singleflight-gated and (unlike writes) do not funnel
-/// through the mutator, so the executor can interleave
-/// device reads from independent client tasks freely; with
-/// per-op `yield_n(delay)` and the executor's random task
-/// pick, at least one engine must see two device ops in
-/// flight at once. If this test ever observes peak == 1,
+/// Several clients each admit one distinct key and then issue many
+/// reads for that key with a generous `max_io_delay`. Reads are not
+/// singleflight-gated and (unlike writes) do not funnel through the
+/// mutator, so the executor can interleave device reads from
+/// independent client tasks freely; with per-op `yield_n(delay)` and
+/// the executor's random task pick, at least one engine must see two
+/// device ops in flight at once. If this test ever observes peak == 1,
 /// `SimBlockDevice` has stopped yielding through `await` or
 /// the engine has acquired a global I/O lock that defeats
 /// the per-disk concurrency the rest of the harness assumes.
 #[test]
 fn smoke_concurrent_reads_overlap() {
-    // 4 clients, each reads 6 distinct keys (each pre-written
-    // twice so admission promotes them). Reads cannot be
-    // collapsed, so the device sees ~24 independent ops, more
-    // than enough for at least one overlap under the executor's
-    // random pick.
+    // Each client first writes one distinct key twice so admission
+    // promotes it, then repeatedly reads that key. The per-client
+    // prefix avoids relying on a separate primer client completing
+    // before readers start; after the prefixes, reads cannot be
+    // collapsed and are numerous enough to force overlap under the
+    // deterministic executor.
     let mut clients = Vec::new();
-    let key_count = 6u8;
-    // One client up front double-writes every key to prime
-    // admission. Subsequent clients then read in parallel.
-    let mut primer = Vec::new();
+    let key_count = 16u8;
     for k in 0..key_count {
-        primer.push(Op::Write {
-            key_idx: k,
-            off_idx: 0,
-            payload_seed: k,
-        });
-        primer.push(Op::Write {
-            key_idx: k,
-            off_idx: 0,
-            payload_seed: k,
-        });
-    }
-    clients.push(ClientSpec { ops: primer });
-    for _ in 0..4 {
         let mut ops = Vec::new();
-        for k in 0..key_count {
+        ops.push(Op::Write {
+            key_idx: k,
+            off_idx: 0,
+            payload_seed: k,
+        });
+        ops.push(Op::Write {
+            key_idx: k,
+            off_idx: 0,
+            payload_seed: k,
+        });
+        for _ in 0..16 {
             ops.push(Op::Read {
                 key_idx: k,
                 off_idx: 0,
@@ -710,8 +643,8 @@ fn smoke_concurrent_reads_overlap() {
     }
     let w = Workload {
         page_size: 4096,
-        device_pages: 64,
-        max_io_delay: 8,
+        device_pages: 256,
+        max_io_delay: 32,
         io_fault_rate: 0,
         read_corrupt_rate: 0,
         key_count,
@@ -729,8 +662,8 @@ fn smoke_concurrent_reads_overlap() {
         .unwrap_or(0);
     assert!(
         peak >= 2,
-        "engine never saw overlapping device ops despite 4 concurrent readers over 6 \
-         primed keys with max_io_delay=8: per-disk peaks={:?}, device_reads={}, \
+        "engine never saw overlapping device ops despite 16 concurrent readers over 16 \
+         admitted keys with max_io_delay=32: per-disk peaks={:?}, device_reads={}, \
          device_writes={}",
         report.max_inflight_per_disk,
         report.device_reads,

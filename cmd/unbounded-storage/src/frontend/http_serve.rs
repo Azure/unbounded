@@ -8,9 +8,10 @@
 //! 1. **The factory** ([`HttpFrontend`]): validates a
 //!    [`FrontendSpec`](crate::config::FrontendSpec) and binds a
 //!    `SO_REUSEPORT` listening socket via `libc` so every shard can
-//!    accept on the same port. It does not implement the `Frontend`
-//!    trait: the concrete bufferpool type is only nameable in the
-//!    binary (Phase E), so the binary calls this directly.
+//!    accept on the same port. It exposes plain inherent methods
+//!    (`from_spec`, `bind_listener`) rather than a trait: the concrete
+//!    bufferpool type is only nameable in the binary, so the binary
+//!    builds and drives it directly.
 //! 2. **The serving engine** ([`HttpDriver`]): a per-shard,
 //!    cooperatively-driven engine generic over the bufferpool `P`. It
 //!    owns an internal future set (one persistent accept future plus
@@ -28,23 +29,31 @@
 //! Linux-gated because serving depends on the io_uring
 //! [`NetHandle`](crate::ring::NetHandle).
 
-use std::future::Future;
+use std::collections::VecDeque;
+use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use ::http::header::{ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE};
 use ::http::{Response, StatusCode};
 
-use crate::bufferpool::{BufferPool, ReadStream};
-use crate::config::{FrontendKind, FrontendSpec};
+use crate::bufferpool::{BufferPool, Error as PoolError, ReadStream, StripeKey, StripePlan};
+use crate::config::schema::DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION;
+use crate::config::{FrontendSpec, frontend_spec};
+use crate::fanout::{FanoutTable, FetchChannel, FetchReply, Owner};
 use crate::frontend::FrontendError;
-use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, stripe_set};
+use crate::frontend::range::{
+    ByteRange, RangeError, ResolvedRange, StripeSlice, full_object, stripe_set,
+};
+use crate::frontend::serve_metrics::{ConnGuard, ReqOutcome};
 use crate::http::{
     FdGuard, HttpRequest, MAX_HEADER_BYTES, Method, ParseError, RECV_CHUNK, bind_listener,
-    send_all, serialize_response_head, split_query,
+    connection_header_value, request_allows_keep_alive, send_all, serialize_response_head,
+    split_query,
 };
 use crate::ring::NetHandle;
 use crate::runtime::noop_waker;
@@ -53,49 +62,60 @@ use crate::storage::{ObjectMetadata, OriginRef, StripeReq};
 /// HTTP serving frontend factory. Built once per [`FrontendSpec`];
 /// holds only the immutable configuration distilled from the spec.
 ///
-/// Unlike the old S3 stub this does not implement the `Frontend` trait:
-/// the per-shard [`HttpDriver`] is generic over the concrete bufferpool
-/// type, which is only nameable in the binary, so Phase E binds the
+/// The per-shard [`HttpDriver`] is generic over the concrete bufferpool
+/// type, which is only nameable in the binary, so the binary binds the
 /// listener via [`HttpFrontend::bind_listener`] and constructs the
 /// driver directly.
 pub struct HttpFrontend {
     id: String,
-    bind: SocketAddr,
-    backend_id: String,
+    addr: SocketAddr,
+    max_requests_per_connection: usize,
 }
 
+const MAX_FRONTEND_CONNS: usize = 4096;
+const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl HttpFrontend {
-    /// Construct from a [`FrontendSpec`], validating the kind and
-    /// parsing the bind address.
+    /// Construct from a [`FrontendSpec`], validating the config type and
+    /// parsing the listen address.
     pub fn from_spec(spec: &FrontendSpec) -> Result<Self, FrontendError> {
-        if spec.kind != FrontendKind::Http {
-            return Err(FrontendError::UnsupportedKind("non-http frontend kind"));
-        }
-        let bind = spec
-            .bind
+        let cfg = match spec.config.as_ref() {
+            Some(frontend_spec::Config::Http(cfg)) => cfg,
+            _ => return Err(FrontendError::UnsupportedKind("non-http frontend config")),
+        };
+        let addr = cfg
+            .addr
             .parse::<SocketAddr>()
-            .map_err(|_| FrontendError::BadBind(spec.bind.clone()))?;
+            .map_err(|_| FrontendError::BadBind(cfg.addr.clone()))?;
+        let max_requests_per_connection = cfg
+            .max_requests_per_connection
+            .unwrap_or(DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION);
+        if max_requests_per_connection == 0 {
+            return Err(FrontendError::BadConfig(
+                "max_requests_per_connection must be greater than zero",
+            ));
+        }
         Ok(Self {
-            id: spec.id.clone(),
-            bind,
-            backend_id: spec.backend.clone(),
+            id: spec.name.clone(),
+            addr,
+            max_requests_per_connection: max_requests_per_connection as usize,
         })
     }
 
-    /// Stable identifier, matching [`FrontendSpec::id`].
+    /// Stable identifier, matching [`FrontendSpec::name`].
     pub fn id(&self) -> &str {
         &self.id
     }
 
-    /// The backend id this frontend resolves origin metadata and stripe
-    /// fetches against.
-    pub fn backend_id(&self) -> &str {
-        &self.backend_id
-    }
-
     /// The configured listen address.
     pub fn bind(&self) -> SocketAddr {
-        self.bind
+        self.addr
+    }
+
+    /// Maximum requests served before the frontend closes a keep-alive
+    /// connection and lets the client reconnect through `SO_REUSEPORT`.
+    pub fn max_requests_per_connection(&self) -> usize {
+        self.max_requests_per_connection
     }
 
     /// Create, bind, and listen the per-shard accept socket with
@@ -105,7 +125,7 @@ impl HttpFrontend {
     /// The caller owns the returned fd and is responsible for closing
     /// it; [`HttpDriver`] only reads it for `accept`.
     pub fn bind_listener(&self) -> Result<RawFd, FrontendError> {
-        bind_listener(self.bind).map_err(|_| FrontendError::BadBind(self.bind.to_string()))
+        bind_listener(self.addr).map_err(|_| FrontendError::BadBind(self.addr.to_string()))
     }
 }
 
@@ -124,9 +144,15 @@ pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
     pool: Rc<P>,
     handle: NetHandle,
     listen_fd: RawFd,
+    frontend_id: Rc<str>,
     backend_id: String,
+    cache_id: Option<String>,
+    neighborhood_id: Option<String>,
     stripe_size: u64,
     page_size: usize,
+    fanout: Rc<FanoutTable>,
+    bypass: bool,
+    max_requests_per_connection: usize,
     accept_fut: Pin<Box<dyn Future<Output = std::io::Result<RawFd>>>>,
     conns: Vec<Pin<Box<dyn Future<Output = ()>>>>,
     waker: Waker,
@@ -136,23 +162,38 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
     /// Build a serving engine over a bound `listen_fd`.
     ///
     /// `stripe_size` and `page_size` come from the shard's pool
-    /// geometry.
+    /// geometry. `fanout` is this shard's view of the stripe-ownership
+    /// ring; for single-shard deployments it routes every stripe to the
+    /// local pool. When `bypass` is set, the frontend bridges straight
+    /// to its backend: cache, peer routing, and fanout are all skipped.
     pub fn new(
         pool: Rc<P>,
         handle: NetHandle,
         listen_fd: RawFd,
+        frontend_id: Rc<str>,
         backend_id: String,
+        cache_id: Option<String>,
+        neighborhood_id: Option<String>,
         stripe_size: u64,
         page_size: usize,
+        fanout: Rc<FanoutTable>,
+        bypass: bool,
+        max_requests_per_connection: usize,
     ) -> Self {
         let accept_fut = Box::pin(handle.accept(listen_fd));
         Self {
             pool,
             handle,
             listen_fd,
+            frontend_id,
             backend_id,
+            cache_id,
+            neighborhood_id,
             stripe_size,
             page_size,
+            fanout,
+            bypass,
+            max_requests_per_connection,
             accept_fut,
             conns: Vec::new(),
             waker: noop_waker(),
@@ -188,13 +229,27 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
                 Poll::Ready(res) => {
                     busy = true;
                     if let Ok(fd) = res {
+                        if self.conns.len() >= MAX_FRONTEND_CONNS {
+                            // SAFETY: this driver owns newly accepted fds.
+                            unsafe {
+                                libc::close(fd);
+                            }
+                            self.accept_fut = Box::pin(self.handle.accept(self.listen_fd));
+                            continue;
+                        }
                         let serve = serve_connection(
                             Rc::clone(&self.pool),
                             self.handle.clone(),
                             fd,
+                            Rc::clone(&self.frontend_id),
                             self.backend_id.clone(),
+                            self.cache_id.clone(),
+                            self.neighborhood_id.clone(),
                             self.stripe_size,
                             self.page_size,
+                            Rc::clone(&self.fanout),
+                            self.bypass,
+                            self.max_requests_per_connection,
                         );
                         self.conns.push(Box::pin(serve));
                     }
@@ -220,7 +275,24 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
     }
 }
 
-/// Serve one accepted connection end-to-end, then close its fd.
+impl<P: BufferPool<Req = StripeReq> + 'static> Drop for HttpDriver<P> {
+    /// Close the listen fd the driver owns. The driver is the sole owner
+    /// of this `SO_REUSEPORT` listener (the embedder hands it the fd from
+    /// `bind_listener` and never touches it again), so dropping the
+    /// driver (on shard shutdown or a live frontend removal) must close
+    /// it or the fd leaks. The accept future borrows only the fd number,
+    /// not ownership, so closing here is sound once the driver is gone.
+    fn drop(&mut self) {
+        if self.listen_fd >= 0 {
+            // SAFETY: `listen_fd` was returned by `bind_listener` and is
+            // owned exclusively by this driver; it is closed exactly once.
+            unsafe {
+                libc::close(self.listen_fd);
+            }
+        }
+    }
+}
+
 ///
 /// Owns everything it needs so the future is `'static` and can live in
 /// the driver's future set across ticks. All paths close `conn_fd` via
@@ -229,47 +301,126 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
     pool: Rc<P>,
     handle: NetHandle,
     conn_fd: RawFd,
+    frontend_id: Rc<str>,
     backend_id: String,
+    cache_id: Option<String>,
+    neighborhood_id: Option<String>,
     stripe_size: u64,
     page_size: usize,
+    fanout: Rc<FanoutTable>,
+    bypass: bool,
+    max_requests_per_connection: usize,
 ) {
     let _fd = FdGuard(conn_fd);
-    let _ = serve_request(&pool, &handle, conn_fd, &backend_id, stripe_size, page_size).await;
+    let _conn = ConnGuard::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut deadline = None;
+    let mut requests_served = 0usize;
+    loop {
+        let mut log = crate::obs::ReqLog::new("frontend.http");
+        let start = std::time::Instant::now();
+        let mut outcome = ReqOutcome::default();
+        let result = serve_request(
+            &pool,
+            &handle,
+            conn_fd,
+            &backend_id,
+            cache_id.as_deref(),
+            neighborhood_id.as_deref(),
+            stripe_size,
+            page_size,
+            &fanout,
+            bypass,
+            &mut buf,
+            deadline,
+            requests_served.saturating_add(1) < max_requests_per_connection,
+            &mut log,
+            &mut outcome,
+        )
+        .await;
+        match result {
+            Ok(ServeStep::Closed) => break,
+            Ok(ServeStep::Close) => {
+                outcome.record(&frontend_id, start.elapsed().as_secs_f64());
+                log.finish_ok();
+                break;
+            }
+            Ok(ServeStep::KeepAlive) => {
+                requests_served = requests_served.saturating_add(1);
+                outcome.record(&frontend_id, start.elapsed().as_secs_f64());
+                log.finish_ok();
+                deadline = Some(Instant::now() + KEEP_ALIVE_IDLE_TIMEOUT);
+            }
+            Err(()) => {
+                outcome.record(&frontend_id, start.elapsed().as_secs_f64());
+                log.finish_err("connection error");
+                break;
+            }
+        }
+    }
+}
+
+enum ServeStep {
+    KeepAlive,
+    Close,
+    Closed,
 }
 
 /// The fallible serve body. Returns `Err(())` on any I/O, parse, or
 /// pool error; the caller closes the fd regardless. Error responses
-/// (400/405/416) are best-effort sends followed by `Ok(())`.
+/// (400/405/416) are best-effort sends followed by a close/keep-alive
+/// step based on the parsed request.
 async fn serve_request<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     handle: &NetHandle,
     conn_fd: RawFd,
     backend_id: &str,
+    cache_id: Option<&str>,
+    neighborhood_id: Option<&str>,
     stripe_size: u64,
     page_size: usize,
-) -> Result<(), ()> {
+    fanout: &Rc<FanoutTable>,
+    bypass: bool,
+    buf: &mut Vec<u8>,
+    idle_deadline: Option<Instant>,
+    allow_keep_alive_after_response: bool,
+    log: &mut crate::obs::ReqLog,
+    outcome: &mut ReqOutcome,
+) -> Result<ServeStep, ()> {
     // 1. Read until the request head is complete (or the cap is hit).
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
+    let req = loop {
         match HttpRequest::parse(&buf) {
-            Ok(_) => break,
+            Ok(req) => break req,
             Err(ParseError::Incomplete) => {
-                if buf.len() > MAX_HEADER_BYTES {
+                if buf.len() >= MAX_HEADER_BYTES {
                     return Err(());
                 }
-                let chunk = handle.recv(conn_fd, RECV_CHUNK).await.map_err(|_| ())?;
+                let chunk = recv_with_deadline(handle, conn_fd, RECV_CHUNK, idle_deadline)
+                    .await
+                    .map_err(|_| ())?;
                 if chunk.is_empty() {
-                    return Err(());
+                    return if buf.is_empty() {
+                        Ok(ServeStep::Closed)
+                    } else {
+                        Err(())
+                    };
                 }
                 buf.extend_from_slice(&chunk);
             }
             Err(_) => {
-                let _ = send_all(handle, conn_fd, status_line_response(400)).await;
-                return Ok(());
+                send_all(handle, conn_fd, status_line_response(400, false)).await?;
+                log.field("status", 400);
+                outcome.status = 400;
+                buf.clear();
+                return Ok(ServeStep::Close);
             }
         }
+    };
+    if req.header_end > MAX_HEADER_BYTES {
+        return Err(());
     }
-    let req = HttpRequest::parse(&buf).map_err(|_| ())?;
+    let keep_alive = request_allows_keep_alive(&req) && allow_keep_alive_after_response;
+    let header_end = req.header_end;
 
     // 2. Only GET and HEAD are served. HEAD resolves length and builds
     // the same head as GET but never streams a body.
@@ -277,21 +428,30 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         Method::GET => false,
         Method::HEAD => true,
         _ => {
-            let _ = send_all(handle, conn_fd, status_line_response(405)).await;
-            return Ok(());
+            send_all(handle, conn_fd, status_line_response(405, keep_alive)).await?;
+            log.field("status", 405);
+            outcome.status = 405;
+            finish_request(buf, header_end);
+            return Ok(next_step(keep_alive));
         }
     };
+    outcome.method = if is_head { "HEAD" } else { "GET" };
+    log.str_field("method", if is_head { "HEAD" } else { "GET" });
 
     // 3. Path is the request target with any query stripped.
     let path = split_query(req.target).0.to_string();
+    log.str_field("path", &path);
 
     // 4. Optional Range header.
     let range = match req.header("range") {
         Some(v) => match ByteRange::parse(v) {
             Ok(r) => Some(r),
             Err(_) => {
-                let _ = send_all(handle, conn_fd, status_line_response(400)).await;
-                return Ok(());
+                send_all(handle, conn_fd, status_line_response(400, keep_alive)).await?;
+                log.field("status", 400);
+                outcome.status = 400;
+                finish_request(buf, header_end);
+                return Ok(next_step(keep_alive));
             }
         },
         None => None,
@@ -301,9 +461,27 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     // metadata entry through the pool. The HTTP backend fills it from
     // an origin HEAD on a miss; local-disk and peer hits skip the
     // origin entirely.
-    let len = read_object_length(pool, backend_id, &path, page_size)
-        .await
-        .map_err(|_| ())?;
+    let len = match read_object_length(
+        pool,
+        backend_id,
+        cache_id,
+        neighborhood_id,
+        &path,
+        page_size,
+        bypass,
+    )
+    .await
+    {
+        LenResult::Len(len) => len,
+        LenResult::NotFound => {
+            let _ = send_all(handle, conn_fd, status_line_response(404, keep_alive)).await;
+            log.field("status", 404);
+            outcome.status = 404;
+            finish_request(buf, header_end);
+            return Ok(next_step(keep_alive));
+        }
+        LenResult::Other => return Err(()),
+    };
 
     // 6. Resolve the requested range against the length.
     let resolved = match range {
@@ -311,80 +489,393 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         Some(br) => match br.resolve(len) {
             Ok(r) => r,
             Err(RangeError::Unsatisfiable { object_len }) => {
-                let _ = send_all(handle, conn_fd, unsatisfiable_response(object_len)).await;
-                return Ok(());
+                send_all(
+                    handle,
+                    conn_fd,
+                    unsatisfiable_response(object_len, keep_alive),
+                )
+                .await?;
+                log.field("status", 416);
+                outcome.status = 416;
+                finish_request(buf, header_end);
+                return Ok(next_step(keep_alive));
             }
             Err(_) => {
-                let _ = send_all(handle, conn_fd, status_line_response(400)).await;
-                return Ok(());
+                send_all(handle, conn_fd, status_line_response(400, keep_alive)).await?;
+                log.field("status", 400);
+                outcome.status = 400;
+                finish_request(buf, header_end);
+                return Ok(next_step(keep_alive));
             }
         },
     };
 
     // 7. Response head: 206 if the client sent a Range, else 200.
     let head = if range.is_some() {
-        partial_head(resolved, len)
+        partial_head(resolved, len, keep_alive)
     } else {
-        full_head(len)
+        full_head(len, keep_alive)
     };
+    outcome.status = if range.is_some() { 206 } else { 200 };
+    // HEAD carries no body, so no body bytes are streamed to the client;
+    // only count the body length for requests that actually send one.
+    outcome.bytes = if is_head { 0 } else { resolved.len() };
+    log.field("status", if range.is_some() { 206 } else { 200 })
+        .field("bytes", resolved.len());
     send_all(handle, conn_fd, head).await?;
 
     // 7b. HEAD carries no body: the head (with Content-Length /
     // Content-Range) is the entire response.
     if is_head {
-        return Ok(());
+        finish_request(buf, header_end);
+        return Ok(next_step(keep_alive));
     }
 
-    // 8. Stream the body stripe-by-stripe out of the bufferpool.
-    //
-    // Within each stripe we use the windowed read path so the pool
-    // keeps many page fetches in flight ahead of the byte we are
-    // currently sending. The client send (`send_zc_fixed`) is
-    // strictly in order on the single TCP stream, but the fabric
-    // fetches of pages ahead of the cursor overlap with it, which is
-    // what lets a single large object saturate the RDMA fabric NIC.
-    // `usize::MAX` requests the full window: `read_windowed` clamps
-    // it to the pool's configured `max_inflight_pages` budget, so the
-    // prefetch depth is governed by that single knob.
-    for slice in stripe_set(resolved, stripe_size) {
-        let origin_ref = OriginRef {
-            backend_id: backend_id.to_string(),
-            origin_object_id: path.clone(),
-            stripe_idx: slice.stripe_idx,
-        };
-        let pool_req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-        let mut rs = pool
-            .read_windowed(&pool_req, slice.intra_offset, slice.intra_len, usize::MAX)
+    // 8. Stream the body, fanning each stripe out to its content-address
+    // owner shard (or the local pool when this shard owns it).
+    stream_body(
+        pool,
+        handle,
+        fanout,
+        conn_fd,
+        backend_id,
+        cache_id,
+        neighborhood_id,
+        &path,
+        page_size,
+        resolved,
+        stripe_size,
+        bypass,
+    )
+    .await?;
+    finish_request(buf, header_end);
+    Ok(next_step(keep_alive))
+}
+
+/// Type-erased cross-shard fetch future. Holds the channel round-trip to
+/// a peer shard's [`FetchService`](crate::fanout::FetchService) and
+/// resolves to the owner-side page locations (or a pool error).
+type FetchFut = Pin<Box<dyn Future<Output = Result<FetchReply, crate::bufferpool::Error>>>>;
+
+/// One stripe's place in the in-order send window. The window is drained
+/// strictly front-to-back so bytes go onto the single TCP stream in
+/// object order, while later stripes' fetches overlap with the head's
+/// send.
+enum Ticket {
+    /// This shard owns the stripe; stream it from the local pool at the
+    /// head of the window (deferred so local NVMe reads do not block the
+    /// remote kicks behind them).
+    Local { slice: StripeSlice },
+    /// A peer shard owns the stripe. `fut` is already kicked (its fetch
+    /// command is in flight to the owner); `buf_index` is the owner's
+    /// registered backing region and `channel` releases the owner's pin
+    /// once the bytes are on the wire. `slice` is retained so a
+    /// transient [`Error::Busy`](crate::bufferpool::Error::Busy) reply
+    /// (the owner pool was momentarily out of free pages) can be
+    /// re-dispatched without losing the stripe's place in object order.
+    Remote {
+        fut: FetchFut,
+        buf_index: u16,
+        channel: FetchChannel,
+        slice: StripeSlice,
+    },
+}
+
+/// Build the content-addressed key and pool request for one stripe slice.
+fn stripe_request(
+    backend_id: &str,
+    cache_id: Option<&str>,
+    neighborhood_id: Option<&str>,
+    path: &str,
+    slice: StripeSlice,
+    bypass: bool,
+) -> (StripeKey, StripeReq) {
+    let origin_ref = OriginRef {
+        backend_id: backend_id.to_string(),
+        origin_object_id: path.to_string(),
+        stripe_idx: slice.stripe_idx,
+    };
+    let key = origin_ref.stripe_key();
+    let req = StripeReq::new(key)
+        .with_origin(origin_ref)
+        .with_chain(
+            cache_id.map(ToOwned::to_owned),
+            neighborhood_id.map(ToOwned::to_owned),
+        )
+        .with_bypass(bypass);
+    (key, req)
+}
+
+/// Cooperatively yield once, returning control to the shard loop so
+/// other futures (and other shards' progress) can advance before this
+/// one is re-polled. Used to space out retries of a transiently busy
+/// remote fetch instead of hot-spinning.
+async fn yield_now() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            // Wake so executors that only re-poll woken tasks (the DST
+            // scheduler) reschedule us; the production shard loop
+            // re-polls every tick regardless.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+/// Send `len` bytes from registered fixed buffer `buf_index` starting at
+/// `offset`, looping over short `SEND_ZC` completions. `Err(())` on a
+/// zero-length completion (peer closed) or ring error.
+async fn send_region(
+    handle: &NetHandle,
+    conn_fd: RawFd,
+    buf_index: u16,
+    offset: usize,
+    len: usize,
+) -> Result<(), ()> {
+    let mut sent_offset = offset;
+    let mut remaining = len;
+    while remaining > 0 {
+        let sent = handle
+            .send_zc_fixed(conn_fd, buf_index, sent_offset, remaining)
+            .await
             .map_err(|_| ())?;
+        if sent == 0 {
+            return Err(());
+        }
+        sent_offset += sent;
+        remaining -= sent;
+    }
+    Ok(())
+}
+
+/// Route one stripe to its owner and, for remote owners, kick the fetch
+/// so its command reaches the owner shard before we start sending the
+/// stripes ahead of it. A single poll is enough: `FetchChannel::fetch`
+/// enqueues the command on its first poll, and the shard loop re-polls
+/// this serve future every tick thereafter, so the owner progresses
+/// concurrently on its own core.
+async fn dispatch_ticket(
+    fanout: &Rc<FanoutTable>,
+    backend_id: &str,
+    cache_id: Option<&str>,
+    neighborhood_id: Option<&str>,
+    path: &str,
+    slice: StripeSlice,
+    bypass: bool,
+) -> Ticket {
+    let (key, req) = stripe_request(backend_id, cache_id, neighborhood_id, path, slice, bypass);
+    match fanout.owner_of_cache(&key, cache_id, slice.intra_offset) {
+        Owner::Local => Ticket::Local { slice },
+        Owner::Peer(peer) => {
+            let buf_index = peer.buf_index;
+            let channel = peer.channel.clone();
+            let fetch_channel = channel.clone();
+            let intra_offset = slice.intra_offset;
+            let intra_len = slice.intra_len;
+            let mut fut: FetchFut =
+                Box::pin(async move { fetch_channel.fetch(req, intra_offset, intra_len).await });
+            poll_fn(|cx| {
+                let _ = fut.as_mut().poll(cx);
+                Poll::Ready(())
+            })
+            .await;
+            Ticket::Remote {
+                fut,
+                buf_index,
+                channel,
+                slice,
+            }
+        }
+    }
+}
+
+/// Stream the resolved byte range to the client, in object order, with
+/// per-stripe ownership fan-out.
+///
+/// Single-shard deployments keep the original behavior: one pipelined
+/// local read across every stripe so the pool prefetches across stripe
+/// boundaries. Multi-shard deployments dispatch a bounded window of
+/// stripes ahead of the send cursor; remote stripes are kicked to their
+/// owner shards (which fetch and pin pages on their own cores) while the
+/// head stripe is being sent, so a single TCP connection drives all
+/// shards' NICs.
+#[allow(clippy::too_many_arguments)]
+async fn stream_body<P: BufferPool<Req = StripeReq>>(
+    pool: &Rc<P>,
+    handle: &NetHandle,
+    fanout: &Rc<FanoutTable>,
+    conn_fd: RawFd,
+    backend_id: &str,
+    cache_id: Option<&str>,
+    neighborhood_id: Option<&str>,
+    path: &str,
+    page_size: usize,
+    resolved: ResolvedRange,
+    stripe_size: u64,
+    bypass: bool,
+) -> Result<(), ()> {
+    let slices = stripe_set(resolved, stripe_size);
+
+    // A bypass frontend never fans out across shards: every stripe is
+    // served from the local pool (which bridges straight to the origin),
+    // so take the single pipelined-read path regardless of shard count.
+    if bypass || fanout.shard_count() <= 1 {
+        let plans: Vec<StripePlan<StripeReq>> = slices
+            .into_iter()
+            .map(|slice| {
+                let (_key, req) =
+                    stripe_request(backend_id, cache_id, neighborhood_id, path, slice, bypass);
+                StripePlan {
+                    req,
+                    intra_offset: slice.intra_offset,
+                    intra_len: slice.intra_len,
+                }
+            })
+            .collect();
+        let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
         while let Some(page) = rs.next_page().await {
             let page = page.map_err(|_| ())?;
             let pr = page.page_ref();
-            let page_byte_offset = pr.page_idx as usize * page_size + pr.offset as usize;
-            let n = pr.len as usize;
-            // The PageGuard must stay alive until the SEND_ZC
-            // notification (when the kernel is done with the source
-            // page); awaiting here holds it across every partial send,
-            // then we drop it before the next `next_page` as the stream
-            // contract requires.
-            //
-            // SEND_ZC's CQE `res` is the count the kernel accepted,
-            // which can be short under socket-send-buffer pressure, so
-            // we loop advancing the byte offset until the whole page is
-            // on the wire. A zero count means the peer closed.
-            let mut sent_offset = page_byte_offset;
-            let mut remaining = n;
-            while remaining > 0 {
-                let sent = handle
-                    .send_zc_fixed(conn_fd, 0, sent_offset, remaining)
-                    .await
-                    .map_err(|_| ())?;
-                if sent == 0 {
-                    return Err(());
-                }
-                sent_offset += sent;
-                remaining -= sent;
-            }
+            let offset = pr.page_idx as usize * page_size + pr.offset as usize;
+            send_region(handle, conn_fd, 0, offset, pr.len as usize).await?;
             drop(page);
+        }
+        return Ok(());
+    }
+
+    const WINDOW: usize = 8;
+    let mut next = 0usize;
+    let mut window: VecDeque<Ticket> = VecDeque::new();
+    while next < slices.len() && window.len() < WINDOW {
+        window.push_back(
+            dispatch_ticket(
+                fanout,
+                backend_id,
+                cache_id,
+                neighborhood_id,
+                path,
+                slices[next],
+                bypass,
+            )
+            .await,
+        );
+        next += 1;
+    }
+
+    let local_plan = |slice: StripeSlice| {
+        let (_key, req) =
+            stripe_request(backend_id, cache_id, neighborhood_id, path, slice, bypass);
+        StripePlan {
+            req,
+            intra_offset: slice.intra_offset,
+            intra_len: slice.intra_len,
+        }
+    };
+
+    while let Some(ticket) = window.pop_front() {
+        match ticket {
+            Ticket::Local { slice } => {
+                // Coalesce a maximal run of contiguous local stripes into
+                // one pipelined read so the pool prefetches across their
+                // boundaries, matching the single-shard pipeline depth
+                // instead of stalling one stripe at a time. Remote
+                // tickets between locals break the run because their
+                // bytes must go on the wire in object order.
+                let mut plans = vec![local_plan(slice)];
+                while matches!(window.front(), Some(Ticket::Local { .. })) {
+                    if let Some(Ticket::Local { slice }) = window.pop_front() {
+                        plans.push(local_plan(slice));
+                    }
+                }
+                let mut rs = pool.read_pipelined(plans, usize::MAX).map_err(|_| ())?;
+                while let Some(page) = rs.next_page().await {
+                    let page = page.map_err(|_| ())?;
+                    let pr = page.page_ref();
+                    let offset = pr.page_idx as usize * page_size + pr.offset as usize;
+                    send_region(handle, conn_fd, 0, offset, pr.len as usize).await?;
+                    drop(page);
+                }
+            }
+            Ticket::Remote {
+                fut,
+                buf_index,
+                channel,
+                slice,
+            } => {
+                let reply = match fut.await {
+                    Ok(reply) => reply,
+                    // Transient owner-side page pressure: the owner pool
+                    // refused a non-blocking head allocation rather than
+                    // parking (which could deadlock across shards). Yield
+                    // so we do not hot-spin while the owner drains other
+                    // coordinators' pins, then re-dispatch this same
+                    // stripe at the head of the window so object order is
+                    // preserved. Forward progress holds because every
+                    // owner always replies in bounded time and releases
+                    // its pins, so retries eventually succeed.
+                    Err(crate::bufferpool::Error::Busy) => {
+                        yield_now().await;
+                        let retry = dispatch_ticket(
+                            fanout,
+                            backend_id,
+                            cache_id,
+                            neighborhood_id,
+                            path,
+                            slice,
+                            bypass,
+                        )
+                        .await;
+                        window.push_front(retry);
+                        continue;
+                    }
+                    Err(_) => return Err(()),
+                };
+                // Send every page in stripe order from the owner's
+                // backing, then release the owner's pin. The pin must
+                // outlive the final SEND_ZC notification (each
+                // `send_region` resolves on its notification CQE), so we
+                // release only after the loop. Release even on a send
+                // error so a dropped client does not leak the owner pin.
+                let mut result = Ok(());
+                for ploc in &reply.pages {
+                    if send_region(
+                        handle,
+                        conn_fd,
+                        buf_index,
+                        ploc.page_byte_offset as usize,
+                        ploc.len as usize,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        result = Err(());
+                        break;
+                    }
+                }
+                channel.release(reply.pin_token);
+                result?;
+            }
+        }
+
+        while next < slices.len() && window.len() < WINDOW {
+            window.push_back(
+                dispatch_ticket(
+                    fanout,
+                    backend_id,
+                    cache_id,
+                    neighborhood_id,
+                    path,
+                    slices[next],
+                    bypass,
+                )
+                .await,
+            );
+            next += 1;
         }
     }
     Ok(())
@@ -398,24 +889,92 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
 async fn read_object_length<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     backend_id: &str,
+    cache_id: Option<&str>,
+    neighborhood_id: Option<&str>,
     path: &str,
     page_size: usize,
-) -> Result<u64, ()> {
+    bypass: bool,
+) -> LenResult {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
-    let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
-    let mut rs: ReadStream = pool.read(&req, 0, page_size as u64).await.map_err(|_| ())?;
-    let page = rs.next_page().await.ok_or(())?.map_err(|_| ())?;
-    let meta = ObjectMetadata::decode(page.as_slice()).map_err(|_| ())?;
-    Ok(meta.length)
+    let req = StripeReq::new(origin_ref.stripe_key())
+        .with_origin(origin_ref)
+        .with_chain(
+            cache_id.map(ToOwned::to_owned),
+            neighborhood_id.map(ToOwned::to_owned),
+        )
+        .with_bypass(bypass);
+    let mut rs: ReadStream = match pool.read(&req, 0, page_size as u64).await {
+        Ok(rs) => rs,
+        Err(e) => return classify_len_error(e),
+    };
+    let page = match rs.next_page().await {
+        Some(Ok(page)) => page,
+        Some(Err(e)) => return classify_len_error(e),
+        None => return LenResult::Other,
+    };
+    match ObjectMetadata::decode(page.as_slice()) {
+        Ok(meta) => LenResult::Len(meta.length),
+        Err(e) => classify_len_error(e),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LenResult {
+    Len(u64),
+    NotFound,
+    Other,
+}
+
+fn classify_len_error(err: PoolError) -> LenResult {
+    match err {
+        PoolError::OriginNotFound => LenResult::NotFound,
+        _ => LenResult::Other,
+    }
+}
+
+async fn recv_with_deadline(
+    handle: &NetHandle,
+    conn_fd: RawFd,
+    max_len: usize,
+    deadline: Option<Instant>,
+) -> Result<Vec<u8>, ()> {
+    let mut fut = Box::pin(handle.recv(conn_fd, max_len));
+    poll_fn(|cx| {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Poll::Ready(Err(()));
+        }
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(res) => Poll::Ready(res.map_err(|_| ())),
+            Poll::Pending => {
+                if deadline.is_some() {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
+fn finish_request(buf: &mut Vec<u8>, header_end: usize) {
+    buf.drain(..header_end);
+}
+
+fn next_step(keep_alive: bool) -> ServeStep {
+    if keep_alive {
+        ServeStep::KeepAlive
+    } else {
+        ServeStep::Close
+    }
 }
 
 /// Format the `200 OK` head for serving a whole object.
-fn full_head(len: u64) -> Vec<u8> {
+fn full_head(len: u64, keep_alive: bool) -> Vec<u8> {
     let resp = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_LENGTH, len.to_string())
         .header(ACCEPT_RANGES, "bytes")
-        .header(CONNECTION, "close")
+        .header(CONNECTION, connection_header_value(keep_alive))
         .body(())
         .expect("valid full-object response head");
     serialize_response_head(&resp)
@@ -423,7 +982,7 @@ fn full_head(len: u64) -> Vec<u8> {
 
 /// Format the `206 Partial Content` head for a resolved byte range.
 /// `END` in `Content-Range` is inclusive (`resolved.end - 1`).
-fn partial_head(resolved: ResolvedRange, total: u64) -> Vec<u8> {
+fn partial_head(resolved: ResolvedRange, total: u64, keep_alive: bool) -> Vec<u8> {
     let start = resolved.start;
     let end_incl = resolved.end - 1;
     let clen = resolved.len();
@@ -432,7 +991,7 @@ fn partial_head(resolved: ResolvedRange, total: u64) -> Vec<u8> {
         .header(CONTENT_RANGE, format!("bytes {start}-{end_incl}/{total}"))
         .header(CONTENT_LENGTH, clen.to_string())
         .header(ACCEPT_RANGES, "bytes")
-        .header(CONNECTION, "close")
+        .header(CONNECTION, connection_header_value(keep_alive))
         .body(())
         .expect("valid partial-content response head");
     serialize_response_head(&resp)
@@ -440,12 +999,12 @@ fn partial_head(resolved: ResolvedRange, total: u64) -> Vec<u8> {
 
 /// Format a `416 Range Not Satisfiable` head with `Content-Range: bytes
 /// */LEN`.
-fn unsatisfiable_response(total: u64) -> Vec<u8> {
+fn unsatisfiable_response(total: u64, keep_alive: bool) -> Vec<u8> {
     let resp = Response::builder()
         .status(StatusCode::RANGE_NOT_SATISFIABLE)
         .header(CONTENT_RANGE, format!("bytes */{total}"))
         .header(CONTENT_LENGTH, "0")
-        .header(CONNECTION, "close")
+        .header(CONNECTION, connection_header_value(keep_alive))
         .body(())
         .expect("valid unsatisfiable-range response head");
     serialize_response_head(&resp)
@@ -453,12 +1012,12 @@ fn unsatisfiable_response(total: u64) -> Vec<u8> {
 
 /// Format a bodyless status-line response (`Content-Length: 0`) for the
 /// simple error statuses this frontend emits.
-fn status_line_response(status: u16) -> Vec<u8> {
+fn status_line_response(status: u16, keep_alive: bool) -> Vec<u8> {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let resp = Response::builder()
         .status(status)
         .header(CONTENT_LENGTH, "0")
-        .header(CONNECTION, "close")
+        .header(CONNECTION, connection_header_value(keep_alive))
         .body(())
         .expect("valid status-line response head");
     serialize_response_head(&resp)
@@ -467,16 +1026,22 @@ fn status_line_response(status: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bufferpool::{Error, ReadStream, WindowedRead};
+    use crate::bufferpool::{Error, PipelinedRead, ReadStream, WindowedRead};
+    use crate::config::HttpFrontendConfig;
+    use crate::fanout::NumaShardTable;
     use crate::frontend::range::StripeSlice;
+    use crate::http::{request_is_bodyless, request_wants_keep_alive};
+    use crate::storage::disks::CacheDirectorySet;
     use std::cell::RefCell;
 
-    fn spec(id: &str, bind: &str) -> FrontendSpec {
+    fn spec(id: &str, addr: &str) -> FrontendSpec {
         FrontendSpec {
-            id: id.to_string(),
-            kind: FrontendKind::Http,
-            bind: bind.to_string(),
-            backend: "primary".to_string(),
+            name: id.to_string(),
+            source: "primary".to_string(),
+            config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
+                addr: addr.to_string(),
+                max_requests_per_connection: None,
+            })),
         }
     }
 
@@ -484,7 +1049,6 @@ mod tests {
     fn from_spec_validates_kind_and_bind() {
         let f = HttpFrontend::from_spec(&spec("workload", "0.0.0.0:9000")).unwrap();
         assert_eq!(f.id(), "workload");
-        assert_eq!(f.backend_id(), "primary");
         assert_eq!(f.bind(), "0.0.0.0:9000".parse().unwrap());
 
         let bad = HttpFrontend::from_spec(&spec("f", "not-an-addr"));
@@ -492,20 +1056,46 @@ mod tests {
     }
 
     #[test]
+    fn from_spec_defaults_and_validates_request_cap() {
+        let f = HttpFrontend::from_spec(&spec("workload", "0.0.0.0:9000")).unwrap();
+        assert_eq!(
+            f.max_requests_per_connection(),
+            DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION as usize
+        );
+
+        let mut capped = spec("workload", "0.0.0.0:9000");
+        let Some(frontend_spec::Config::Http(cfg)) = capped.config.as_mut() else {
+            panic!("expected http config");
+        };
+        cfg.max_requests_per_connection = Some(7);
+        let f = HttpFrontend::from_spec(&capped).unwrap();
+        assert_eq!(f.max_requests_per_connection(), 7);
+
+        let Some(frontend_spec::Config::Http(cfg)) = capped.config.as_mut() else {
+            panic!("expected http config");
+        };
+        cfg.max_requests_per_connection = Some(0);
+        assert!(matches!(
+            HttpFrontend::from_spec(&capped),
+            Err(FrontendError::BadConfig(_))
+        ));
+    }
+
+    #[test]
     fn full_head_exact_bytes() {
-        let head = full_head(4096);
+        let head = full_head(4096, true);
         let s = std::str::from_utf8(&head).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "got: {s}");
         assert!(s.contains("content-length: 4096\r\n"), "got: {s}");
         assert!(s.contains("accept-ranges: bytes\r\n"), "got: {s}");
-        assert!(s.contains("connection: close\r\n"), "got: {s}");
+        assert!(s.contains("connection: keep-alive\r\n"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
     }
 
     #[test]
     fn partial_head_exact_bytes_inclusive_end() {
         // Resolved [0, 100) of a 1000-byte object -> bytes 0-99/1000.
-        let head = partial_head(ResolvedRange { start: 0, end: 100 }, 1000);
+        let head = partial_head(ResolvedRange { start: 0, end: 100 }, 1000, true);
         let s = std::str::from_utf8(&head).unwrap();
         assert!(
             s.starts_with("HTTP/1.1 206 Partial Content\r\n"),
@@ -514,7 +1104,7 @@ mod tests {
         assert!(s.contains("content-range: bytes 0-99/1000\r\n"), "got: {s}");
         assert!(s.contains("content-length: 100\r\n"), "got: {s}");
         assert!(s.contains("accept-ranges: bytes\r\n"), "got: {s}");
-        assert!(s.contains("connection: close\r\n"), "got: {s}");
+        assert!(s.contains("connection: keep-alive\r\n"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
     }
 
@@ -527,15 +1117,17 @@ mod tests {
                 end: 100,
             },
             100,
+            false,
         );
         let s = std::str::from_utf8(&head).unwrap();
         assert!(s.contains("content-range: bytes 70-99/100\r\n"), "got: {s}");
         assert!(s.contains("content-length: 30\r\n"), "got: {s}");
+        assert!(s.contains("connection: close\r\n"), "got: {s}");
     }
 
     #[test]
     fn unsatisfiable_response_exact_bytes() {
-        let head = unsatisfiable_response(100);
+        let head = unsatisfiable_response(100, false);
         let s = std::str::from_utf8(&head).unwrap();
         assert!(
             s.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
@@ -549,7 +1141,7 @@ mod tests {
 
     #[test]
     fn status_405_and_400_exact_bytes() {
-        let r405 = status_line_response(405);
+        let r405 = status_line_response(405, false);
         let s405 = std::str::from_utf8(&r405).unwrap();
         assert!(
             s405.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
@@ -559,7 +1151,7 @@ mod tests {
         assert!(s405.contains("connection: close\r\n"), "got: {s405}");
         assert!(s405.ends_with("\r\n\r\n"), "got: {s405}");
 
-        let r400 = status_line_response(400);
+        let r400 = status_line_response(400, false);
         let s400 = std::str::from_utf8(&r400).unwrap();
         assert!(
             s400.starts_with("HTTP/1.1 400 Bad Request\r\n"),
@@ -568,6 +1160,65 @@ mod tests {
         assert!(s400.contains("content-length: 0\r\n"), "got: {s400}");
         assert!(s400.contains("connection: close\r\n"), "got: {s400}");
         assert!(s400.ends_with("\r\n\r\n"), "got: {s400}");
+    }
+
+    #[test]
+    fn status_404_exact_bytes() {
+        let r404 = status_line_response(404, false);
+        let s404 = std::str::from_utf8(&r404).unwrap();
+        assert!(
+            s404.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "got: {s404}"
+        );
+        assert!(s404.contains("content-length: 0\r\n"), "got: {s404}");
+        assert!(s404.contains("connection: close\r\n"), "got: {s404}");
+        assert!(s404.ends_with("\r\n\r\n"), "got: {s404}");
+    }
+
+    #[test]
+    fn request_keep_alive_follows_http_connection_rules() {
+        let req = HttpRequest::parse(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        assert!(request_wants_keep_alive(&req));
+
+        let req = HttpRequest::parse(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
+        assert!(!request_wants_keep_alive(&req));
+
+        let req = HttpRequest::parse(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+        assert!(!request_wants_keep_alive(&req));
+
+        let req = HttpRequest::parse(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n").unwrap();
+        assert!(request_wants_keep_alive(&req));
+    }
+
+    #[test]
+    fn request_has_body_detects_unsupported_body_headers() {
+        let req = HttpRequest::parse(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        assert!(request_is_bodyless(&req));
+
+        let req = HttpRequest::parse(b"GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n").unwrap();
+        assert!(request_is_bodyless(&req));
+
+        let req = HttpRequest::parse(b"GET / HTTP/1.1\r\nContent-Length: 1\r\n\r\n").unwrap();
+        assert!(!request_is_bodyless(&req));
+
+        let req =
+            HttpRequest::parse(b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+        assert!(!request_is_bodyless(&req));
+    }
+
+    #[test]
+    fn duplicate_body_headers_disable_keep_alive() {
+        let req = HttpRequest::parse(
+            b"GET / HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 10\r\n\r\n",
+        )
+        .unwrap();
+        assert!(!request_is_bodyless(&req));
+
+        let req = HttpRequest::parse(
+            b"GET / HTTP/1.1\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(!request_wants_keep_alive(&req));
     }
 
     #[test]
@@ -627,6 +1278,35 @@ mod tests {
     }
 
     #[test]
+    fn stripe_request_stamps_bypass_flag() {
+        use crate::bufferpool::Req;
+
+        let slice = StripeSlice {
+            stripe_idx: 2,
+            intra_offset: 0,
+            intra_len: 4,
+        };
+        // Non-bypass requests carry the cache path (bypass == false).
+        let (_k, normal) = stripe_request(
+            "primary",
+            Some("cache-a"),
+            Some("site-a"),
+            "/o",
+            slice,
+            false,
+        );
+        assert!(!normal.bypass());
+        assert_eq!(normal.cache_id(), Some("cache-a"));
+        assert_eq!(normal.neighborhood_id(), Some("site-a"));
+        // Bridge-mode frontends stamp bypass == true onto every request.
+        let (k, bridged) = stripe_request("primary", None, None, "/o", slice, true);
+        assert!(bridged.bypass());
+        // The flag does not perturb the routing key or origin mapping.
+        assert_eq!(normal.key(), k);
+        assert_eq!(bridged.origin(), normal.origin());
+    }
+
+    #[test]
     fn metadata_entry_request_is_well_formed() {
         use crate::bufferpool::Req;
         use crate::storage::{METADATA_STRIPE_IDX, stripe_key};
@@ -644,7 +1324,9 @@ mod tests {
     /// constructor is crate-internal to bufferpool): it always errors.
     /// Sufficient to wire an [`HttpDriver`] for accept-loop tests, where
     /// the serve path is not exercised against a real pool.
-    struct MockPool;
+    struct MockPool {
+        err: Error,
+    }
 
     impl BufferPool for MockPool {
         type Req = StripeReq;
@@ -655,7 +1337,7 @@ mod tests {
             _offset: u64,
             _len: u64,
         ) -> Result<ReadStream<'p>, Error> {
-            Err(Error::from("mock pool has no data"))
+            Err(self.err.clone())
         }
 
         fn read_windowed<'p>(
@@ -665,8 +1347,55 @@ mod tests {
             _len: u64,
             _window: usize,
         ) -> Result<WindowedRead<'p>, Error> {
-            Err(Error::from("mock pool has no data"))
+            Err(self.err.clone())
         }
+
+        fn read_pipelined<'p>(
+            &'p self,
+            _stripes: Vec<StripePlan<StripeReq>>,
+            _window: usize,
+        ) -> Result<PipelinedRead<'p>, Error> {
+            Err(self.err.clone())
+        }
+    }
+
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(fut);
+        for _ in 0..1_000_000 {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+        panic!("future did not complete");
+    }
+
+    #[test]
+    fn read_object_length_maps_origin_not_found_to_len_result() {
+        let pool = Rc::new(MockPool {
+            err: Error::OriginNotFound,
+        });
+
+        let result = block_on(read_object_length(
+            &pool, "primary", None, None, "/missing", 4096, false,
+        ));
+
+        assert_eq!(result, LenResult::NotFound);
+    }
+
+    #[test]
+    fn read_object_length_maps_other_errors_to_other() {
+        let pool = Rc::new(MockPool {
+            err: Error::from("mock pool has no data"),
+        });
+
+        let result = block_on(read_object_length(
+            &pool, "primary", None, None, "/broken", 4096, false,
+        ));
+
+        assert_eq!(result, LenResult::Other);
     }
 
     #[test]
@@ -688,21 +1417,30 @@ mod tests {
             }
         };
         let mut driver = HttpDriver::new(
-            Rc::new(MockPool),
+            Rc::new(MockPool {
+                err: Error::from("mock pool has no data"),
+            }),
             handle,
             listen_fd,
+            Rc::from("primary"),
             "primary".to_string(),
+            None,
+            None,
             4 * 1024 * 1024,
             2 * 1024 * 1024,
+            Rc::new(FanoutTable::new(
+                0,
+                vec![None],
+                NumaShardTable::from_shards([(0, None)]),
+                CacheDirectorySet::new(),
+            )),
+            false,
+            DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION as usize,
         );
         // No client has connected: accept is pending, no conns, so the
         // engine reports no work and stays idle.
         assert!(!driver.progress());
         assert_eq!(driver.conn_count(), 0);
         assert!(driver.is_idle());
-
-        unsafe {
-            libc::close(listen_fd);
-        }
     }
 }

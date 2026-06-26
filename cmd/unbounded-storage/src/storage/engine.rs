@@ -29,7 +29,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use crate::bufferpool::{self, BulkRef, PageRef, StripeKey};
+use crate::bufferpool::{self, PageRef, StripeKey};
 use crate::storage::admission::AdmissionFilter;
 use crate::storage::alloc::Allocator;
 use crate::storage::blockdev::{BlockDevice, ScratchPool};
@@ -41,7 +41,7 @@ use crate::storage::singleflight::{Acquire, Singleflight};
 use crate::storage::traits::{PageChecksum, Xxh3Checksum};
 use crate::storage::types::{Lba, PageKey};
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct EngineConfig {
     /// Cache page size, in bytes. Default 2 MiB. Must be a
     /// multiple of [`Self::btree_page_bytes`].
@@ -78,6 +78,20 @@ pub struct EngineConfig {
     pub admission_sketch_multiplier: usize,
     pub singleflight_shards: usize,
     pub restart_scan_queue_depth: u32,
+    /// Number of 4 KiB registered scratch buffers reserved for
+    /// btree / meta I/O. This is the hard ceiling on how many
+    /// btree page writes a single path-copy commit can keep in
+    /// flight at once: the CoW commit path submits every
+    /// independent spine-page write concurrently and joins them,
+    /// so a larger pool lets a commit overlap more of its 4 KiB
+    /// writes (trading registered-buffer memory for commit
+    /// latency). At `btree_page_bytes` = 4 KiB the default 64
+    /// costs 256 KiB of pinned memory per shard and sits well
+    /// under the io_uring queue depth; commits that need more
+    /// buffers than this simply drain in waves via backpressure
+    /// on the pool. Must be at least a few to cover meta load
+    /// plus an in-flight lookup; values below 4 are clamped up.
+    pub btree_scratch_pages: usize,
     /// When true, `write_page` skips AdmissionFilter::should_admit
     /// and always proceeds. Intended for benchmarking/tooling;
     /// production should leave this false.
@@ -89,6 +103,11 @@ pub struct EngineConfig {
     /// per terabyte. Production should leave this false so partial
     /// recovery still runs when the meta slots are corrupted.
     pub skip_recovery_scan_if_no_meta: bool,
+    /// Stable identifier for this disk, used as the `disk` label on
+    /// the engine's Prometheus metrics. Empty when unset (e.g. in
+    /// tests and benchmarks); production wiring sets it from the
+    /// `DiskSpec` id.
+    pub disk_id: String,
 }
 
 impl Default for EngineConfig {
@@ -104,8 +123,10 @@ impl Default for EngineConfig {
             admission_sketch_multiplier: 2,
             singleflight_shards: 64,
             restart_scan_queue_depth: 256,
+            btree_scratch_pages: 64,
             bypass_admission: false,
             skip_recovery_scan_if_no_meta: false,
+            disk_id: String::new(),
         }
     }
 }
@@ -116,12 +137,14 @@ struct BufferpoolBinding {
     page_count: usize,
 }
 
-/// Number of scratch pages allocated for btree / meta I/O. Sized
-/// to comfortably cover the worst-case concurrent demand from a
-/// single shard: two pages for [`crate::storage::btree::meta`]
-/// load, one for an in-flight lookup, one for a parallel
-/// `build_tree` write, and a small buffer beyond that.
-const BTREE_SCRATCH_PAGES: usize = 8;
+/// Floor on the btree / meta scratch-pool size, independent of
+/// [`EngineConfig::btree_scratch_pages`]. Covers the worst-case
+/// concurrent demand that is not commit-write parallelism: two
+/// pages for [`crate::storage::btree::meta`] load, one for an
+/// in-flight lookup, one for a `build_tree` write, plus a little
+/// slack. The configured value is clamped up to this floor so a
+/// small or zero setting cannot starve those paths.
+const MIN_BTREE_SCRATCH_PAGES: usize = 8;
 
 pub struct StorageEngine<B: BlockDevice> {
     device: Arc<B>,
@@ -208,6 +231,7 @@ pub struct EngineSnapshot {
     pub checksum_misses: u64,
     pub resident_pages: usize,
     pub btree_entries: usize,
+    pub btree_lookup_cache_bytes: usize,
     /// Length of the deferred-reclaim queue: LBAs that were
     /// displaced (overwrite or eviction) while their old page
     /// was still pinned and that have not yet been returned to
@@ -230,7 +254,11 @@ impl<B: BlockDevice> StorageEngine<B> {
         // backing is registered later (via `register_pages`);
         // this small dedicated region covers the structural I/O
         // BTreeIndex::open issues before any user-data I/O.
-        let scratch = ScratchPool::new(&*device, cfg.btree_page_bytes, BTREE_SCRATCH_PAGES)?;
+        let scratch = ScratchPool::new(
+            &*device,
+            cfg.btree_page_bytes,
+            cfg.btree_scratch_pages.max(MIN_BTREE_SCRATCH_PAGES),
+        )?;
         let btree = Arc::new(
             BTreeIndex::open(
                 device.clone(),
@@ -247,7 +275,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             cfg.admission_sketch_multiplier.max(1) as u32,
         ));
         let singleflight = Arc::new(Singleflight::new(cfg.singleflight_shards.max(1)));
-        Ok(Self {
+        let engine = Self {
             device,
             allocator,
             refcount,
@@ -265,7 +293,9 @@ impl<B: BlockDevice> StorageEngine<B> {
             pending_free: Mutex::new(Vec::new()),
             mutator_queue: Arc::new(MutatorQueue::new()),
             metrics: EngineMetrics::new(),
-        })
+        };
+        engine.publish_usage_gauges();
+        Ok(engine)
     }
 
     /// Borrow the underlying block device. Used by `LocalStorage`
@@ -288,6 +318,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             checksum_misses: m.checksum_misses,
             resident_pages: self.lru.len(),
             btree_entries: self.btree.live_entries(),
+            btree_lookup_cache_bytes: self.btree.lookup_cache_bytes(),
             pending_free_len: self.pending_free.lock().unwrap().len(),
         }
     }
@@ -319,6 +350,11 @@ impl<B: BlockDevice> StorageEngine<B> {
 
     fn metric<F: FnOnce(&mut EngineMetricsInner)>(&self, f: F) {
         f(&mut self.metrics.inner.lock().unwrap())
+    }
+
+    /// The `disk` label for this engine's Prometheus metrics.
+    fn disk(&self) -> &str {
+        &self.cfg.disk_id
     }
 
     fn n_pages(&self, byte_len: u32) -> u64 {
@@ -448,6 +484,9 @@ impl<B: BlockDevice> StorageEngine<B> {
                 let _ = self.refcount.reset(lba.0);
             }
             self.metric(|m| m.evictions += victim_runs.len() as u64);
+            for _ in &victim_runs {
+                crate::metrics::storage_eviction(self.disk());
+            }
         })
     }
 }
@@ -468,9 +507,9 @@ impl<B: BlockDevice> bufferpool::BlockStore for StorageEngine<B> {
         Ok(())
     }
 
-    async fn read_page(
+    async fn read_page<R: bufferpool::Req + ?Sized>(
         &self,
-        key: StripeKey,
+        req: &R,
         stripe_off: u64,
         dst: PageRef,
     ) -> Result<bool, bufferpool::Error> {
@@ -478,19 +517,19 @@ impl<B: BlockDevice> bufferpool::BlockStore for StorageEngine<B> {
         // slice lives until we return from this future.
         let dst_buf: *mut [u8] = unsafe { self.slice_mut_from_ref(dst) };
         // SAFETY: see comment above.
-        unsafe { self.read_page_into(key, stripe_off, dst_buf).await }
+        unsafe { self.read_page_into(req.key(), stripe_off, dst_buf).await }
     }
 
-    async fn write_page(
+    async fn write_page<R: bufferpool::Req + ?Sized>(
         &self,
-        key: StripeKey,
+        req: &R,
         stripe_off: u64,
         page: PageRef,
     ) -> Result<(), bufferpool::Error> {
         // SAFETY: see register_pages contract.
         let src_buf: *const [u8] = unsafe { self.slice_from_ref(page) };
         // SAFETY: see comment above.
-        unsafe { self.write_page_from(key, stripe_off, src_buf).await }
+        unsafe { self.write_page_from(req.key(), stripe_off, src_buf).await }
     }
 }
 
@@ -530,6 +569,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             Ok(Some(e)) => e,
             Ok(None) | Err(_) => {
                 self.metric(|m| m.misses += 1);
+                crate::metrics::storage_lookup(crate::metrics::Lookup::Miss);
                 return Ok(false);
             }
         };
@@ -538,6 +578,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             Ok(g) => g,
             Err(_) => {
                 self.metric(|m| m.misses += 1);
+                crate::metrics::storage_lookup(crate::metrics::Lookup::Miss);
                 return Ok(false);
             }
         };
@@ -550,8 +591,19 @@ impl<B: BlockDevice> StorageEngine<B> {
                 m.misses += 1;
                 m.read_io_errors += 1;
             });
+            crate::metrics::storage_disk_op(
+                self.disk(),
+                crate::metrics::DiskOp::Read,
+                crate::metrics::Outcome::Err,
+            );
+            crate::metrics::storage_lookup(crate::metrics::Lookup::Miss);
             return Ok(false);
         }
+        crate::metrics::storage_disk_op(
+            self.disk(),
+            crate::metrics::DiskOp::Read,
+            crate::metrics::Outcome::Ok,
+        );
 
         let cs = Xxh3Checksum::checksum_of(dst_buf);
         if cs.0 != entry.data_checksum.0 {
@@ -559,12 +611,14 @@ impl<B: BlockDevice> StorageEngine<B> {
                 m.misses += 1;
                 m.checksum_misses += 1;
             });
+            crate::metrics::storage_lookup(crate::metrics::Lookup::Miss);
             return Ok(false);
         }
 
         self.lru.touch(entry.lba);
         self.admission.record_frequency(&pk);
         self.metric(|m| m.hits += 1);
+        crate::metrics::storage_lookup(crate::metrics::Lookup::Hit);
         Ok(true)
     }
 
@@ -585,6 +639,7 @@ impl<B: BlockDevice> StorageEngine<B> {
 
         if !self.cfg.bypass_admission && !self.admission.should_admit(&pk) {
             self.metric(|m| m.rejected_by_filter += 1);
+            crate::metrics::storage_admission_rejected(self.disk());
             return Ok(());
         }
 
@@ -636,10 +691,20 @@ impl<B: BlockDevice> StorageEngine<B> {
             // still records the IO error in metrics for the
             // operator-facing snapshot.
             self.metric(|m| m.write_io_errors += 1);
+            crate::metrics::storage_disk_op(
+                self.disk(),
+                crate::metrics::DiskOp::Write,
+                crate::metrics::Outcome::Err,
+            );
             let _ = self.allocator.free_range(lba, n_pages);
             leader.abandon();
             return Err(bufferpool::Error::Io(io_errno(&e)));
         }
+        crate::metrics::storage_disk_op(
+            self.disk(),
+            crate::metrics::DiskOp::Write,
+            crate::metrics::Outcome::Ok,
+        );
 
         let cs = Xxh3Checksum::checksum_of(src_buf);
         let entry = LeafEntry {
@@ -793,7 +858,10 @@ impl<B: BlockDevice> StorageEngine<B> {
         let ok = if mutations.is_empty() {
             true
         } else {
-            self.btree.apply_batch(mutations).await.is_ok()
+            let started = std::time::Instant::now();
+            let res = self.btree.apply_batch(mutations).await.is_ok();
+            crate::metrics::storage_btree_commit_duration(started.elapsed().as_secs_f64());
+            res
         };
 
         for (i, req) in batch.into_iter().enumerate() {
@@ -812,15 +880,23 @@ impl<B: BlockDevice> StorageEngine<B> {
             };
             done.set(outcome);
         }
-    }
-}
 
-// The BulkRef parameter on BlockStore impls is unused but
-// referenced by the bufferpool crate's import statement; pull it
-// in here so the symbol is reachable from the module tree.
-#[allow(dead_code)]
-fn _unused_bulkref() -> Option<BulkRef> {
-    None
+        self.publish_usage_gauges();
+    }
+
+    /// Publishes the per-disk capacity/used byte gauges from the
+    /// allocator's current page accounting. Cheap; called after each
+    /// commit batch and once at open so the gauges reflect on-disk
+    /// occupancy without a render-time pull (the engine is per-shard
+    /// `!Send`, so a global pull gauge cannot reach it).
+    fn publish_usage_gauges(&self) {
+        // The allocator works in device LBAs sized `btree_page_bytes`,
+        // not cache pages (`page_size_bytes`), so the byte conversion
+        // must use the LBA size to avoid overstating occupancy.
+        let lba = self.cfg.btree_page_bytes as i64;
+        crate::metrics::storage_capacity_bytes(self.disk(), self.allocator.capacity() as i64 * lba);
+        crate::metrics::storage_used_bytes(self.disk(), self.allocator.used_pages() as i64 * lba);
+    }
 }
 
 /// Best-effort `errno` extraction for surfacing a device-layer
@@ -849,7 +925,7 @@ mod tests {
             base,
             page_size,
             page_count,
-            _own: Box::new(()),
+            keepalive: std::sync::Arc::new(()),
         }
     }
     use std::future::Future;
@@ -940,10 +1016,10 @@ mod tests {
                 }
             }
             // First write: admission filter rejects (first touch).
-            eng_body.write_page(stripe(1), 0, src_page).await.unwrap();
+            eng_body.write_page(&stripe(1), 0, src_page).await.unwrap();
             assert_eq!(eng_body.snapshot().rejected_by_filter, 1);
             // Second write: admitted.
-            eng_body.write_page(stripe(1), 0, src_page).await.unwrap();
+            eng_body.write_page(&stripe(1), 0, src_page).await.unwrap();
             assert_eq!(eng_body.snapshot().admitted, 1);
 
             let dst_page = PageRef {
@@ -951,7 +1027,7 @@ mod tests {
                 offset: 0,
                 len: 4096,
             };
-            let hit = eng_body.read_page(stripe(1), 0, dst_page).await.unwrap();
+            let hit = eng_body.read_page(&stripe(1), 0, dst_page).await.unwrap();
             assert!(hit, "expected cache hit");
             unsafe {
                 let p = buf.as_ptr().add(4096);
@@ -978,7 +1054,7 @@ mod tests {
             offset: 0,
             len: 4096,
         };
-        let hit = block_on(eng.read_page(stripe(7), 0, dst)).unwrap();
+        let hit = block_on(eng.read_page(&stripe(7), 0, dst)).unwrap();
         assert!(!hit);
         assert_eq!(eng.snapshot().misses, 1);
     }
@@ -993,7 +1069,7 @@ mod tests {
             offset: 0,
             len: 4096,
         };
-        block_on(eng.write_page(stripe(9), 0, src)).unwrap();
+        block_on(eng.write_page(&stripe(9), 0, src)).unwrap();
         let s = eng.snapshot();
         assert_eq!(s.rejected_by_filter, 1);
         assert_eq!(s.admitted, 0);
@@ -1029,7 +1105,7 @@ mod tests {
                 offset: 0,
                 len: 4096,
             };
-            eng_body.write_page(stripe(11), 0, src).await.unwrap();
+            eng_body.write_page(&stripe(11), 0, src).await.unwrap();
             let s = eng_body.snapshot();
             assert_eq!(s.admitted, 1);
             assert_eq!(s.rejected_by_filter, 0);
@@ -1050,8 +1126,8 @@ mod tests {
                 offset: 0,
                 len: 4096,
             };
-            eng_body.write_page(stripe(3), 0, src).await.unwrap();
-            eng_body.write_page(stripe(3), 0, src).await.unwrap();
+            eng_body.write_page(&stripe(3), 0, src).await.unwrap();
+            eng_body.write_page(&stripe(3), 0, src).await.unwrap();
             assert_eq!(eng_body.snapshot().admitted, 1);
             let device: &MockDevice = &eng_body.device;
             let mut bytes = [0u8; 4096];
@@ -1073,7 +1149,7 @@ mod tests {
                 offset: 0,
                 len: 4096,
             };
-            let hit = eng_body.read_page(stripe(3), 0, dst).await.unwrap();
+            let hit = eng_body.read_page(&stripe(3), 0, dst).await.unwrap();
             assert!(!hit);
             assert!(eng_body.snapshot().checksum_misses >= 1);
             eng_body.close_mutator();
@@ -1082,11 +1158,11 @@ mod tests {
         block_on_pair(body, mutator.as_mut());
     }
 
-    /// Stand-in for the `bench storage block` executor + workload when
-    /// hugepages are not available on the host: drive ~64 writes
-    /// followed by ~64 reads through a `bypass_admission` engine
-    /// over `MockDevice` and assert the bench's success criteria
-    /// (ops produced, no errors, every read is a cache hit).
+    /// Stand-in storage workload when hugepages are not available on
+    /// the host: drive ~64 writes followed by ~64 reads through a
+    /// `bypass_admission` engine over `MockDevice` and assert the
+    /// success criteria (ops produced, no errors, every read is a
+    /// cache hit).
     #[test]
     fn bench_mock_write_then_read_roundtrip() {
         const PAGES: usize = 64;
@@ -1118,7 +1194,7 @@ mod tests {
             };
             // Phase 1: 64 writes against distinct keys.
             for i in 0..PAGES as u8 {
-                eng_body.write_page(stripe(i), 0, src).await.unwrap();
+                eng_body.write_page(&stripe(i), 0, src).await.unwrap();
             }
             let s = eng_body.snapshot();
             assert_eq!(s.admitted, PAGES as u64);
@@ -1131,7 +1207,7 @@ mod tests {
                 len: PAGE as u32,
             };
             for i in 0..PAGES as u8 {
-                let hit = eng_body.read_page(stripe(i), 0, dst).await.unwrap();
+                let hit = eng_body.read_page(&stripe(i), 0, dst).await.unwrap();
                 assert!(hit, "miss on key {i}");
             }
             let s = eng_body.snapshot();
@@ -1146,8 +1222,8 @@ mod tests {
     /// A device-level write failure MUST propagate to the caller
     /// as an `Err` so benchmarks and any other "I observed a
     /// successful write" code path cannot treat the page as
-    /// durable. Before this contract was enforced, `bench storage
-    /// block` happily reported gigabytes per second while every
+    /// durable. Before this contract was enforced, the storage-layer
+    /// workload happily reported gigabytes per second while every
     /// `write_page_from` call silently swallowed the underlying
     /// device error and returned `Ok(())`, leaving the btree with
     /// no entry for the key.
@@ -1190,7 +1266,7 @@ mod tests {
                 len: PAGE as u32,
             };
             let err = eng_body
-                .write_page(stripe(17), 0, src)
+                .write_page(&stripe(17), 0, src)
                 .await
                 .expect_err("device WriteIo fault must propagate as Err");
             match err {
@@ -1212,7 +1288,7 @@ mod tests {
                 offset: 0,
                 len: PAGE as u32,
             };
-            let hit = eng_body.read_page(stripe(17), 0, dst).await.unwrap();
+            let hit = eng_body.read_page(&stripe(17), 0, dst).await.unwrap();
             assert!(!hit, "key with failed write must not appear as a cache hit");
             eng_body.close_mutator();
         };

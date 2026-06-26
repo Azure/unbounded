@@ -45,7 +45,7 @@
 //! [`PageService`]: crate::storage::PageService
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -55,7 +55,7 @@ use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::config::schema::{DiskKind, DiskSpec};
+use crate::config::schema::DiskSpec;
 use crate::ring::{StorageRingConfig, clear_current_storage_ring, set_current_storage_ring};
 use crate::runtime::{PinnedRuntime, WorkerSpec, noop_waker};
 use crate::storage::blockdev::{
@@ -73,6 +73,11 @@ use super::{DiskError, DiskTarget};
 /// owns all placement; there is no per-disk throwaway runtime.
 pub struct UringDiskTarget {
     runtime: std::sync::Arc<PinnedRuntime>,
+}
+
+struct DiskOpenMode {
+    ring_cfg: StorageRingConfig,
+    o_direct: bool,
 }
 
 impl UringDiskTarget {
@@ -106,6 +111,7 @@ impl DiskTarget for UringDiskTarget {
         spec: &DiskSpec,
         pin: Option<DiskCpuSlot>,
     ) -> Result<(UringDiskHandle, PageChannel), DiskError> {
+        let disk_path = spec.path().expect("disk path is validated at config load");
         let engine_cfg = engine_config_from(spec);
         // The device page size must equal the engine's LBA unit. The
         // allocator counts btree pages (`alloc_contig` LBAs are btree-page
@@ -116,42 +122,34 @@ impl DiskTarget for UringDiskTarget {
         // against a 4 KiB btree page): using the cache page size here makes
         // every 4 KiB btree/meta I/O fail EINVAL and skews all byte offsets.
         let page_size = device_page_size(&engine_cfg);
-        let mut ring_cfg = StorageRingConfig::default();
-        if let Some(qd) = spec.queue_depth {
-            ring_cfg.queue_depth = qd;
-        }
+        let open_mode = disk_open_mode(spec);
 
-        // A file-backed disk runs buffered I/O on a regular file, so the
-        // hardware-only ring flags (IOPOLL, and the O_DIRECT it implies,
-        // plus SINGLE_ISSUER/DEFER_TASKRUN) must be stripped; this mirrors
-        // StorageRingConfig::test_local. The backing file is created and
+        // A file-backed disk still uses O_DIRECT so the daemon bypasses
+        // the host page cache, but regular files do not support the
+        // polled block-device ring mode. The backing file is created and
         // sized here, on the supervisor thread, before the storage core
-        // opens it (capacity comes from the file length). Size validity is
-        // guaranteed by config validation.
-        if spec.kind == DiskKind::File {
-            ring_cfg.iopoll = false;
-            ring_cfg.single_issuer = false;
-            ring_cfg.defer_taskrun = false;
+        // opens it (capacity comes from the file length). Size validity
+        // is guaranteed by config validation.
+        if spec.is_file() {
             let size = spec
-                .size
-                .expect("file disk size is validated at config load")
-                .bytes() as u64;
-            if let Err(e) = provision_file(&spec.path, size) {
+                .file_size()
+                .expect("file disk size is validated at config load");
+            if let Err(e) = provision_file(Path::new(disk_path), size) {
                 return Err(DiskError::Open(format!(
                     "provision file {}: {e}",
-                    spec.path.display()
+                    disk_path
                 )));
             }
         }
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thr = stop.clone();
-        let path = spec.path.clone();
+        let path = PathBuf::from(disk_path);
         let name = format!("ub-disk-{}", path.display());
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<PageChannel, String>>(1);
 
         let body = move || {
-            run_storage_core(path, ring_cfg, page_size, engine_cfg, stop_thr, ready_tx);
+            run_storage_core(path, open_mode, page_size, engine_cfg, stop_thr, ready_tx);
         };
 
         // Route thread spawning + pinning through the shared runtime.
@@ -188,7 +186,7 @@ impl DiskTarget for UringDiskTarget {
 /// [`PageService`], and `ring.progress()` interleaved until shutdown.
 fn run_storage_core(
     path: PathBuf,
-    ring_cfg: StorageRingConfig,
+    open_mode: DiskOpenMode,
     page_size: usize,
     engine_cfg: EngineConfig,
     stop: Arc<AtomicBool>,
@@ -205,7 +203,7 @@ fn run_storage_core(
         // Held for the storage core's lifetime: the ring addresses this
         // fd by its registered Fixed index, so it must outlive the ring.
         file: _disk_file,
-    } = match UringDevice::open(&path, ring_cfg, ring_cfg.iopoll, page_size) {
+    } = match UringDevice::open(&path, open_mode.ring_cfg, open_mode.o_direct, page_size) {
         Ok(d) => d,
         Err(e) => {
             let _ = ready_tx.send(Err(e.to_string()));
@@ -398,17 +396,38 @@ fn run_core_loop<B, R>(
     }
 }
 
+fn disk_open_mode(spec: &DiskSpec) -> DiskOpenMode {
+    let mut ring_cfg = StorageRingConfig::default();
+    if let Some(qd) = spec.queue_depth {
+        ring_cfg.queue_depth = qd;
+    }
+
+    if spec.is_file() {
+        ring_cfg.iopoll = false;
+        ring_cfg.single_issuer = false;
+        ring_cfg.defer_taskrun = false;
+    }
+
+    DiskOpenMode {
+        ring_cfg,
+        o_direct: true,
+    }
+}
+
 /// Build an [`EngineConfig`] from a [`DiskSpec`]. Production defaults
 /// come from [`EngineConfig::default`]; the spec only overrides what
-/// the operator chose to expose: `page_size_bytes`, `bypass_admission`,
-/// and `skip_recovery_scan_if_no_meta`.
+/// the operator chose to expose: `page_size_bytes` and
+/// `skip_recovery_scan`.
 fn engine_config_from(spec: &DiskSpec) -> EngineConfig {
     let mut cfg = EngineConfig::default();
     if let Some(p) = spec.page_size_bytes {
-        cfg.page_size_bytes = p;
+        cfg.page_size_bytes = p as usize;
     }
-    cfg.bypass_admission = spec.bypass_admission;
-    cfg.skip_recovery_scan_if_no_meta = spec.skip_recovery_scan_if_no_meta;
+    cfg.skip_recovery_scan_if_no_meta = spec.skip_recovery_scan;
+    cfg.disk_id = spec
+        .path()
+        .expect("disk path is validated at config load")
+        .to_string();
     cfg
 }
 
@@ -665,6 +684,52 @@ mod tests {
         spec_cfg.page_size_bytes = 8 * 1024 * 1024;
         spec_cfg.btree_page_bytes = 4096;
         assert_eq!(device_page_size(&spec_cfg), 4096);
+    }
+
+    #[test]
+    fn file_disks_use_direct_io_without_iopoll() {
+        let spec = DiskSpec {
+            queue_depth: Some(32),
+            page_size_bytes: None,
+            skip_recovery_scan: false,
+            config: Some(crate::config::schema::disk_spec::Config::File(
+                crate::config::schema::FileDiskConfig {
+                    path: "/tmp/unbounded-storage-test-disk".to_string(),
+                    size: Some(64 * 4096),
+                },
+            )),
+        };
+
+        let mode = disk_open_mode(&spec);
+
+        assert!(mode.o_direct, "file disks must bypass the host page cache");
+        assert!(!mode.ring_cfg.iopoll, "regular files cannot use IOPOLL");
+        assert!(!mode.ring_cfg.single_issuer);
+        assert!(!mode.ring_cfg.defer_taskrun);
+        assert_eq!(mode.ring_cfg.queue_depth, 32);
+    }
+
+    #[test]
+    fn block_disks_keep_default_direct_iopoll_mode() {
+        let spec = DiskSpec {
+            queue_depth: Some(64),
+            page_size_bytes: None,
+            skip_recovery_scan: false,
+            config: Some(crate::config::schema::disk_spec::Config::Block(
+                crate::config::schema::BlockDiskConfig {
+                    numa: None,
+                    path: "/dev/nvme0n1".to_string(),
+                },
+            )),
+        };
+
+        let mode = disk_open_mode(&spec);
+
+        assert!(mode.o_direct);
+        assert!(mode.ring_cfg.iopoll);
+        assert!(mode.ring_cfg.single_issuer);
+        assert!(mode.ring_cfg.defer_taskrun);
+        assert_eq!(mode.ring_cfg.queue_depth, 64);
     }
 
     /// Regression for BUG 2: a `ring.progress()` error in STEADY STATE

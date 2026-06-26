@@ -1,0 +1,331 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+syntax = "proto3";
+
+package unbounded.storage.config;
+
+option go_package = "github.com/Azure/unbounded/api/unbounded-storage;storageconfig";
+
+message Config {
+  // Operator-assigned opaque version tracked so operators can confirm which config has been applied. 0 means unversioned.
+  uint64 version = 1;
+
+  // Startup options are only read once during initialization.
+  StartupCfg startup = 2;
+
+  repeated FrontendSpec frontends = 3;
+  repeated BackendSpec backends = 4;
+  repeated CacheSpec caches = 5;
+  repeated NeighborhoodSpec neighborhoods = 6;
+  repeated DiskSpec disks = 7;
+}
+
+message StartupCfg {
+  MemoryCfg memory = 1;
+  FabricCfg fabric = 2;
+  TopologyCfg topology = 3;
+  MetricsCfg metrics = 4;
+}
+
+message MetricsCfg {
+  // Prometheus metrics listen address, such as "0.0.0.0:9100". Empty disables the exporter.
+  string addr = 1;
+}
+
+message MemoryCfg {
+  // Allocates per-shard backing from the heap instead of 2 MiB hugepages.
+  bool no_hugepages = 1;
+
+  // Total backing pool across serving shards, in bytes. Defaults to 128 MiB when unset.
+  optional uint64 memory_total_bytes = 2;
+}
+
+message FabricCfg {
+  oneof binds {
+    TcpFabricBinds tcp = 1;
+    RdmaFabricBinds rdma = 2;
+    AutoRdmaFabricBinds auto_rdma = 3;
+  }
+
+  // Maximum in-flight fabric operations per shard. Defaults to 1024 when unset.
+  optional uint32 max_inflight = 4;
+
+  // libfabric progress threads per shard. Defaults to 2 when unset.
+  optional uint32 progress_threads = 5;
+
+  // Fabric RPC worker threads per shard. Defaults to 4 when unset.
+  optional uint32 rpc_worker_threads = 6;
+
+  // Progress-thread busy-poll budget in microseconds. Defaults to 10 when unset.
+  optional uint32 progress_poll_us = 7;
+}
+
+message TcpFabricBinds {
+  string addr = 1;
+}
+
+message RdmaFabricBinds {
+  repeated RdmaFabricBind binds = 1;
+}
+
+message AutoRdmaFabricBinds {
+  // Maximum number of HCAs to bind per NUMA node. Defaults to 1 when unset.
+  // Raise this to use additional HCAs on a NUMA node. HCAs whose NUMA node is
+  // unknown are never capped.
+  optional uint64 hcas_per_numa_node = 1;
+}
+
+message RdmaFabricBind {
+  // Provider-native RDMA fabric address encoded as "hex:<fi_getname-bytes>".
+  string addr = 1;
+}
+
+message TopologyCfg {
+  // Place shards on SMT sibling CPUs as well as physical cores. Defaults to false,
+  // so one serving shard is placed per physical core unless explicitly enabled.
+  bool use_smt_siblings = 1;
+
+  // Schedule shards onto isolcpus-isolated CPUs too. Defaults to false, so CPUs
+  // isolated by the kernel are reserved for other workloads unless explicitly included.
+  bool ignore_isolated = 2;
+
+  // Allow placing a shard on each NUMA node's CPU 0. Defaults to false, reserving
+  // those CPUs for kernel and housekeeping work unless explicitly included.
+  bool include_node_cpu0 = 3;
+
+  // Use HCA ports that are not in the active state.
+  bool allow_inactive_port = 4;
+
+  // Disable RDMA and force the libfabric tcp provider. Defaults to false. This is
+  // an operator escape hatch for hosts where discovered RDMA devices are present
+  // but should not be used by this daemon.
+  bool disable_rdma = 5;
+
+  // Cap on the number of serving-shard CPUs to pin. When unset, claims every
+  // usable core left after storage and NIC-worker reservations.
+  optional uint64 serving_cores = 6;
+
+  // NIC-worker CPUs to pin per active HCA. Defaults to 4 when unset.
+  optional uint64 nic_workers = 7;
+}
+
+message NeighborhoodSpec {
+  string name = 1;
+  string source = 2;
+
+  // Number of deterministic finger-table entries to derive per node. Defaults to 100 when unset.
+  optional uint32 fingers_per_node = 3;
+
+  // Local node id on the P2P ring and process-wide fabric peer id; required when
+  // peers are configured, shared by every neighborhood when set, and must not
+  // match any peer id.
+  optional uint64 local_node_id = 4;
+
+  // Local tags used by placement-aware planning.
+  repeated string local_tags = 5;
+
+  // Precomputed routing table that replaces automatic finger-table derivation when set.
+  // When set, `peers` can be "sparse"; containing only this process's neighbors.
+  optional RoutingPlan routing_plan = 6;
+
+  // Peer definitions available to this neighborhood. Peer ids are process-wide
+  // fabric peer ids; repeating an id across neighborhoods requires the same
+  // peer data.
+  repeated PeerSpec peers = 7;
+}
+
+// A precomputed routing table for a single node, produced by a
+// global-view planner. All ids reference `PeerSpec.id` values in the
+// `peers` list (each must be present so a fabric connection exists).
+// Ring positions are derived from ids, and tags do not affect runtime
+// routing, so only ids are carried here.
+message RoutingPlan {
+  // Peer ids selected for this routing plan.
+  repeated uint64 fingers = 1;
+
+  // Peer id of the nearest-forward neighbor on the ring.
+  optional uint64 successor = 2;
+
+  // Peer id of the nearest-backward neighbor on the ring.
+  optional uint64 predecessor = 3;
+}
+
+message PeerSpec {
+  // Process-wide fabric peer id, also used for this neighborhood's ring
+  // position and route references.
+  uint64 id = 1;
+
+  // Peer tags used by placement-aware planning.
+  repeated string tags = 2;
+
+  oneof config {
+    TcpPeerConfig tcp = 3;
+    RdmaPeerConfig rdma = 4;
+  }
+}
+
+message TcpPeerConfig {
+  // TCP socket address used as this peer's fabric wire address.
+  string addr = 1;
+}
+
+message RdmaPeerConfig {
+  // Provider-native RDMA fabric address encoded as "hex:<fi_getname-bytes>".
+  string addr = 1;
+}
+
+message CacheSpec {
+  string name = 1;
+  string source = 2;
+}
+
+message DiskSpec {
+  // Optional io_uring queue depth override for this disk.
+  optional uint32 queue_depth = 1;
+
+  // Optional cache page size override in bytes; defaults to the storage engine page size.
+  optional uint64 page_size_bytes = 2;
+
+  // Skips the recovery scan when no metadata page is valid; intended only for fresh or benchmark disks.
+  bool skip_recovery_scan = 3;
+
+  oneof config {
+    BlockDiskConfig block = 4;
+    FileDiskConfig file = 5;
+  }
+}
+
+message BlockDiskConfig {
+  // Optional NUMA node hint used when placing storage work for this block device.
+  optional uint32 numa = 1;
+
+  // Block device path; paths must be unique across all disks.
+  string path = 2;
+}
+
+message FileDiskConfig {
+  // Required file-backed disk capacity in bytes; the file is provisioned to this size before opening.
+  optional uint64 size = 1;
+
+  // Backing-file path; paths must be unique across all disks.
+  string path = 2;
+}
+
+message BackendSpec {
+  string name = 1;
+
+  oneof config {
+    HttpBackendConfig http = 2;
+    S3BackendConfig s3 = 3;
+    AzureBackendConfig azure = 4;
+    FakeBackendConfig fake = 5;
+  }
+}
+
+message HttpBackendConfig {
+  // Origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses plaintext;
+  // `https://` uses TLS with kTLS receive offload.
+  string url = 1;
+
+  // Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
+  // Must be a power of two.
+  optional uint64 stripe_size_bytes = 2;
+
+  // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
+  optional uint32 http_concurrency = 3;
+
+  // Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+  optional string ca_cert_path = 4;
+
+  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+  bool insecure_skip_verify = 5;
+}
+
+message S3BackendConfig {
+  // S3-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses
+  // plaintext; `https://` uses TLS with kTLS receive offload.
+  string url = 1;
+
+  // Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
+  // Must be a power of two.
+  optional uint64 stripe_size_bytes = 2;
+
+  // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
+  optional uint32 http_concurrency = 3;
+
+  // Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+  optional string ca_cert_path = 4;
+
+  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+  bool insecure_skip_verify = 5;
+}
+
+message AzureBackendConfig {
+  // Azure Blob-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://`
+  // uses plaintext; `https://` uses TLS with kTLS receive offload.
+  string url = 1;
+
+  // Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
+  // Must be a power of two.
+  optional uint64 stripe_size_bytes = 2;
+
+  // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
+  optional uint32 http_concurrency = 3;
+
+  // Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+  optional string ca_cert_path = 4;
+
+  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+  bool insecure_skip_verify = 5;
+}
+
+message FakeBackendConfig {
+  // Stripe granularity in bytes for synthetic origin references. Defaults to 4 MiB when unset.
+  // Must be a power of two.
+  optional uint64 stripe_size_bytes = 1;
+
+  // Size of each synthetic zero-filled object in bytes. Defaults to 1 MiB when unset.
+  optional uint64 object_size_bytes = 2;
+}
+
+message FrontendSpec {
+  string name = 1;
+  string source = 2;
+
+  oneof config {
+    HttpFrontendConfig http = 3;
+    S3FrontendConfig s3 = 4;
+    LoadgenFrontendConfig loadgen = 5;
+  }
+}
+
+message HttpFrontendConfig {
+  // Socket address for HTTP listeners; each serving shard binds it with SO_REUSEPORT.
+  string addr = 1;
+
+  // Maximum requests served on one client connection. Defaults to 1024 when unset.
+  optional uint32 max_requests_per_connection = 2;
+}
+
+message S3FrontendConfig {
+  // Socket address for S3-compatible listeners; each serving shard binds it with SO_REUSEPORT.
+  string addr = 1;
+}
+
+message LoadgenFrontendConfig {
+  // Synthetic read workers per serving shard. Defaults to 1 when unset.
+  optional uint32 workers = 1;
+
+  // Deterministic object stream seed. Defaults to the loadgen frontend seed when unset.
+  optional uint64 seed = 2;
+
+  // Number of distinct synthetic object ids to cycle over. Defaults to 1,000,000 when unset.
+  optional uint64 object_count = 3;
+
+  // Bytes to read from the start of each object. When unset, reads the full resolved object length.
+  optional uint64 read_bytes = 4;
+
+  // Verify every returned body byte is zero. Intended for fake backends.
+  bool verify = 5;
+}

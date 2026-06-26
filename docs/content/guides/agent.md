@@ -20,7 +20,7 @@ in sequence:
    kernel parameters for Kubernetes networking, and disables services that
    conflict with kubelet (Docker, swap).
 2. **Rootfs preparation** (`rootfs`) -- detects host settings such as CPU
-   architecture and NVIDIA GPU devices, creates a
+   architecture and GPU devices, creates a
    [systemd-nspawn]({{< relref "reference/agent/nspawn" >}}) machine rootfs
    (from an OCI image), and downloads containerd, runc, CNI
    plugins, and Kubernetes binaries.
@@ -87,6 +87,39 @@ To inspect the script before running it, save it to a file first:
 kubectl unbounded machine manual-bootstrap my-node --site mysite > bootstrap.sh
 ```
 {{< /callout >}}
+
+### Reusable bootstrap payloads (VMSS / Auto Scaling)
+
+The `NAME` argument is optional. When you omit it, the generated payload leaves
+the machine name unset and the `unbounded-agent` resolves it on the host at
+startup. This lets a single payload be reused across many instances, such as an
+Azure VMSS or an AWS Auto Scaling group, where each instance derives its own
+name.
+
+```bash
+# Generate a reusable cloud-init document with no hard-coded machine name:
+kubectl unbounded machine manual-bootstrap --site mysite --variant cloud-init > user-data.yaml
+```
+
+At startup the agent resolves the machine name in this order:
+
+1. The `AGENT_MACHINE_NAME` environment variable, if set on the host.
+2. The host hostname.
+
+The resolved value is lowercased and validated as a Kubernetes node name (it
+becomes the `Machine` CR name), and the agent logs which source it used:
+
+```bash
+journalctl -u unbounded-agent | grep "resolved unbounded MachineName"
+```
+
+To pin a specific name on a host without editing the payload, export the
+environment variable before the agent runs, for example via cloud-init:
+
+```yaml
+runcmd:
+  - export AGENT_MACHINE_NAME=my-custom-node
+```
 
 ### Customizing the agent download
 
@@ -301,15 +334,19 @@ my-node    Ready    <none>   20s   v1.33.1   192.168.100.10   <none>        Ubun
 
 ## GPU Support
 
-When NVIDIA GPUs are detected on the host, the agent automatically:
+When GPUs are detected on the host, the agent automatically exposes the host
+paths needed by Kubernetes device plugins:
 
-- Bind-mounts GPU devices and driver libraries into the nspawn machine.
-- Generates a CDI spec and registers the NVIDIA container runtime with
+- For NVIDIA GPUs, bind-mounts GPU devices and driver libraries into the nspawn
+  machine, generates a CDI spec, and registers the NVIDIA container runtime with
   containerd.
+- For AMD GPUs, bind-mounts `/dev/kfd` and DRM device nodes and exposes AMD
+  sysfs paths read-only so the AMD Kubernetes device plugin can detect GPUs
+  inside nspawn.
 
-No additional configuration is required. Both `amd64` and `arm64`
-architectures are supported. See the
-[GPU reference]({{< relref "reference/gpu" >}}) for details.
+The agent does not deploy GPU device plugins. Install the vendor device plugin
+for Kubernetes resource advertisement. See the [GPU reference]({{< relref "reference/gpu" >}})
+for details.
 
 ## Troubleshooting
 
@@ -324,8 +361,9 @@ kubelet logs inside the nspawn machine:
 machinectl shell <machine-name> /bin/journalctl -u kubelet
 ```
 
-**GPU not detected** -- Confirm that the NVIDIA driver is installed on the host
-and that GPU devices are visible under `/dev/nvidia*`.
+**GPU not detected** -- Confirm that the vendor driver is installed and loaded
+on the host. For NVIDIA, check `/dev/nvidia*`. For AMD, check `/dev/kfd`,
+`/dev/dri/card*`, and `/dev/dri/renderD*`.
 
 ## See Also
 

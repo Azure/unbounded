@@ -16,32 +16,61 @@ use std::sync::Arc;
 
 use crate::bufferpool::Req;
 use crate::fabric::{PeerId, PeerRouter};
-use crate::p2p::{FingerTable, NodeId, stripe_to_ring};
+use crate::p2p::{FingerTable, NodeId, RouteTableHandle, RoutingHandle, stripe_to_ring};
 
 /// `PeerRouter` backed by a finger table. Maps a request's stripe to
 /// the owning peer's `PeerId` via the Chord `next_hop` lookup, then
-/// the `node -> peer` map. `Arc<FingerTable>` and `Arc<HashMap>` are
-/// both `Send + Sync`, satisfying `PeerRouter`'s bounds.
+/// the `node -> peer` map. The routing surface lives behind a shared
+/// [`RoutingHandle`] so a peer-set change republished through that
+/// handle is observed here without rebuilding the router.
 pub struct FingerRouter {
-    fingers: Arc<FingerTable>,
-    node_to_peer: Arc<HashMap<NodeId, PeerId>>,
+    routing: RoutingHandle,
+}
+
+pub struct ChainFingerRouter {
+    routes: RouteTableHandle,
 }
 
 impl FingerRouter {
+    /// Build a router over a freshly-seeded [`RoutingHandle`]. Retained
+    /// for callers (and tests) that hold the two maps directly; the
+    /// resulting router owns its own handle and is not live-reloadable
+    /// from elsewhere.
     pub fn new(fingers: Arc<FingerTable>, node_to_peer: Arc<HashMap<NodeId, PeerId>>) -> Self {
-        Self {
-            fingers,
-            node_to_peer,
-        }
+        Self::from_handle(RoutingHandle::new(fingers, node_to_peer))
+    }
+
+    /// Build a router that shares an existing [`RoutingHandle`]. A
+    /// `store` on any clone of `routing` is observed by this router's
+    /// next `route` call, which is how a shard fans a peer-set reload
+    /// out to every consumer at once.
+    pub fn from_handle(routing: RoutingHandle) -> Self {
+        Self { routing }
+    }
+}
+
+impl ChainFingerRouter {
+    pub fn new(routes: RouteTableHandle) -> Self {
+        Self { routes }
     }
 }
 
 impl<R: Req> PeerRouter<R> for FingerRouter {
     fn route(&self, req: &R) -> Option<PeerId> {
         let target = stripe_to_ring(req.key());
-        self.fingers
+        let snap = self.routing.snapshot();
+        snap.fingers
             .next_hop(target)
-            .and_then(|pe| self.node_to_peer.get(&pe.node).copied())
+            .and_then(|pe| snap.node_to_peer.get(&pe.node).copied())
+    }
+}
+
+impl<R: Req> PeerRouter<R> for ChainFingerRouter {
+    fn route(&self, req: &R) -> Option<PeerId> {
+        let snap = self.routes.route_for_req(req)?;
+        snap.fingers
+            .next_hop(stripe_to_ring(req.key()))
+            .and_then(|pe| snap.node_to_peer.get(&pe.node).copied())
     }
 }
 
@@ -53,7 +82,7 @@ mod tests {
     use crate::bufferpool::{Req, StripeKey};
     use crate::fabric::{PeerId, PeerRouter};
     use crate::p2p::{
-        FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyLabels, node_to_ring,
+        FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyTags, node_to_ring,
         stripe_to_ring,
     };
 
@@ -71,7 +100,7 @@ mod tests {
         PeerEntry {
             node: NodeId(node),
             ring: node_to_ring(NodeId(node)),
-            labels: TopologyLabels(vec!["r".to_string()]),
+            tags: TopologyTags(vec!["r".to_string()]),
         }
     }
 

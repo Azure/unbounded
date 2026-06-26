@@ -49,7 +49,7 @@ fn backing(base: *mut u8, page_size: usize, page_count: usize) -> Backing {
         base,
         page_size,
         page_count,
-        _own: Box::new(()),
+        keepalive: std::sync::Arc::new(()),
     }
 }
 const PAGE_TYPE_META: u8 = 3;
@@ -268,8 +268,8 @@ async fn admit_one<B>(
         offset: 0,
         len: PAGE_SIZE as u32,
     };
-    eng.write_page(key, offset, page).await.unwrap();
-    eng.write_page(key, offset, page).await.unwrap();
+    eng.write_page(&key, offset, page).await.unwrap();
+    eng.write_page(&key, offset, page).await.unwrap();
 }
 
 /// Linear scan of the device looking for the LBA at which `expected`
@@ -363,7 +363,7 @@ fn torn_data_page_reports_miss() {
                     offset: 0,
                     len: PAGE_SIZE as u32,
                 };
-                let hit = eng.read_page(stripe(1), 0, dst).await.unwrap();
+                let hit = eng.read_page(&stripe(1), 0, dst).await.unwrap();
                 let snap = eng.snapshot();
                 *slot.borrow_mut() = Some((hit, snap.checksum_misses));
             })
@@ -426,7 +426,9 @@ fn torn_btree_leaf_reports_miss() {
 
                 // Now read every key back. Each read either misses or
                 // hits with the EXACT bytes we wrote; nothing else is
-                // acceptable.
+                // acceptable. The internal-node cache can route to the
+                // leaf without disk I/O, but the leaf itself remains
+                // disk-backed and must fail closed after corruption.
                 let mut results: Vec<(bool, Vec<u8>)> = Vec::new();
                 let read_base = writes_for_task.len();
                 for (i, (k, off, _)) in writes_for_task.iter().enumerate() {
@@ -441,7 +443,7 @@ fn torn_btree_leaf_reports_miss() {
                         offset: 0,
                         len: PAGE_SIZE as u32,
                     };
-                    let hit = eng.read_page(*k, *off, dst).await.unwrap();
+                    let hit = eng.read_page(k, *off, dst).await.unwrap();
                     let bytes_back = if hit {
                         let p = unsafe { (pool_base as *const u8).add(slot_idx * PAGE_SIZE) };
                         unsafe { std::slice::from_raw_parts(p, PAGE_SIZE) }.to_vec()
@@ -564,7 +566,7 @@ fn torn_newer_meta_slot_falls_back_to_older() {
                         offset: 0,
                         len: PAGE_SIZE as u32,
                     };
-                    let hit = eng.read_page(*k, *off, dst).await.unwrap();
+                    let hit = eng.read_page(k, *off, dst).await.unwrap();
                     let bytes_back = if hit {
                         let p = unsafe { (pool_base2 as *const u8).add(slot_idx * PAGE_SIZE) };
                         unsafe { std::slice::from_raw_parts(p, PAGE_SIZE) }.to_vec()
@@ -671,7 +673,7 @@ fn torn_both_meta_slots_open_either_succeeds_via_rebuild_or_errors() {
                         offset: 0,
                         len: PAGE_SIZE as u32,
                     };
-                    let hit = eng.read_page(*k, *off, dst).await.unwrap();
+                    let hit = eng.read_page(k, *off, dst).await.unwrap();
                     let bytes_back = if hit {
                         let p = unsafe { (pool_base as *const u8).add(slot_idx * PAGE_SIZE) };
                         unsafe { std::slice::from_raw_parts(p, PAGE_SIZE) }.to_vec()
@@ -854,8 +856,8 @@ fn concurrent_writes_same_key_collapse_to_one_entry() {
                 offset: 0,
                 len: PAGE_SIZE as u32,
             };
-            let _ = eng.write_page(stripe(7), 0, page).await;
-            let _ = eng.write_page(stripe(7), 0, page).await;
+            let _ = eng.write_page(&stripe(7), 0, page).await;
+            let _ = eng.write_page(&stripe(7), 0, page).await;
             pending.set(pending.get() - 1);
         }));
     }
@@ -886,7 +888,7 @@ fn concurrent_writes_same_key_collapse_to_one_entry() {
                 offset: 0,
                 len: PAGE_SIZE as u32,
             };
-            let hit = eng.read_page(stripe(7), 0, dst).await.unwrap();
+            let hit = eng.read_page(&stripe(7), 0, dst).await.unwrap();
             let bytes = if hit {
                 let p = unsafe { (pool_base as *const u8).add(read_slot * PAGE_SIZE) };
                 unsafe { std::slice::from_raw_parts(p, PAGE_SIZE) }.to_vec()
@@ -1107,7 +1109,7 @@ fn recovery_bounded_scan_ignores_garbage_above_hwm() {
                         offset: 0,
                         len: PAGE_SIZE as u32,
                     };
-                    let hit = eng.read_page(*k, *off, dst).await.unwrap();
+                    let hit = eng.read_page(k, *off, dst).await.unwrap();
                     let bytes_back = if hit {
                         let p = unsafe { (pool_base as *const u8).add(slot_idx * PAGE_SIZE) };
                         unsafe { std::slice::from_raw_parts(p, PAGE_SIZE) }.to_vec()
@@ -1233,7 +1235,7 @@ fn recovery_legacy_zero_hwm_falls_back_to_full_scan() {
                         offset: 0,
                         len: PAGE_SIZE as u32,
                     };
-                    let hit = eng.read_page(*k, *off, dst).await.unwrap();
+                    let hit = eng.read_page(k, *off, dst).await.unwrap();
                     let bytes_back = if hit {
                         let p = unsafe { (pool_base as *const u8).add(slot_idx * PAGE_SIZE) };
                         unsafe { std::slice::from_raw_parts(p, PAGE_SIZE) }.to_vec()

@@ -13,7 +13,7 @@ mod shard;
 mod context;
 
 #[cfg(target_os = "linux")]
-pub use pinned::{PinnedRuntime, WorkerSpec};
+pub use pinned::{PinnedRuntime, WorkerSpec, set_preferred_node};
 
 #[cfg(target_os = "linux")]
 pub use context::ShardContext;
@@ -27,15 +27,6 @@ pub use shard::ShardLoop;
 /// worker. All three pin against the same `WorkerIdx`.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct WorkerIdx(pub u16);
-
-/// Locality hint for the future io_uring submission API
-/// (PLAN.md Phase 3.2). Declared here, not yet consumed.
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum NumaHint {
-    Any,
-    Worker(WorkerIdx),
-    Numa(u16),
-}
 
 /// Handle to a thread spawned via [`Threading::spawn_pinned`].
 /// A type alias because no runtime impl needs to hide the underlying

@@ -4,7 +4,8 @@
 use proptest::prelude::*;
 
 use crate::bufferpool::workload::{
-    ClientOutcome, ClientSpec, RunReport, Workload, run_workload, workload_strategy,
+    ClientOutcome, ClientSpec, PipelineSpec, PlanSliceSpec, RunReport, Workload,
+    pipelined_workload_strategy, run_workload, workload_strategy,
 };
 
 proptest! {
@@ -244,6 +245,132 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 256,
+        ..ProptestConfig::default()
+    })]
+
+    /// Invariant: pipelined byte correctness with in-order delivery.
+    /// `read_pipelined` admits one stream per active plan slice and
+    /// pipelines page fetches across stripe boundaries, yet must
+    /// still deliver pages strictly in global plan order. For every
+    /// pipeline that finishes via `Ok`, the concatenated
+    /// `PageGuard` bytes must equal the oracle bytes for the plan's
+    /// ordered `(key, offset, len)` slices. Cancelled pipelines must
+    /// yield a prefix of the expected bytes (in-order truncation).
+    /// `FetchErr` is tolerated only under fault injection; `ReadErr`
+    /// only when it is `StreamLimit` (the pinned-high limit makes
+    /// this effectively unreachable, but we tolerate it rather than
+    /// assert a stronger property the harness does not guarantee).
+    #[test]
+    fn pipelined_invariant_byte_correctness(
+        seed in any::<u64>(),
+        w in pipelined_workload_strategy(),
+    ) {
+        let faults_enabled = w.io_fault_rate > 0;
+        let report = run_workload(seed, w).expect("run completed");
+        for (i, o) in report.outcomes.iter().enumerate() {
+            match o {
+                ClientOutcome::Ok { got, expected } => {
+                    prop_assert_eq!(got, expected, "pipeline {} bytes mismatch", i);
+                }
+                ClientOutcome::Cancelled { got, expected, .. } => {
+                    prop_assert!(
+                        got.len() <= expected.len(),
+                        "pipeline {} cancelled with got.len()={} > expected.len()={}",
+                        i, got.len(), expected.len(),
+                    );
+                    prop_assert_eq!(
+                        &got[..], &expected[..got.len()],
+                        "pipeline {} cancelled-prefix bytes mismatch", i,
+                    );
+                }
+                ClientOutcome::ReadErr(e) => {
+                    prop_assert!(
+                        is_stream_limit(e),
+                        "pipeline {} unexpected read error: {}", i, e,
+                    );
+                }
+                ClientOutcome::FetchErr(e) => {
+                    prop_assert!(
+                        faults_enabled,
+                        "pipeline {} got FetchErr ({}) with io_fault_rate=0",
+                        i, e,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Invariant: pipelined page accounting at quiescence.
+    /// The cross-stripe reader admits and releases one stream per
+    /// slice as the global cursor advances (`release_passed_slices`)
+    /// and shares the global prefetch budget. Once every pipeline
+    /// has dropped its `PipelinedRead`, all pages must be back on
+    /// the free list, the inflight map empty, and the prefetch
+    /// budget fully released. Catches leaks in `release_guard`,
+    /// `release_prefetch`, and the per-slice `decrement_stream`.
+    /// Must hold under faults and mid-stream cancellation too.
+    #[test]
+    fn pipelined_invariant_page_accounting(
+        seed in any::<u64>(),
+        w in pipelined_workload_strategy(),
+    ) {
+        let page_count = w.page_count;
+        let report = run_workload(seed, w).expect("run completed");
+        prop_assert_eq!(
+            report.free_pages_at_end, page_count,
+            "free_pages={} expected {}", report.free_pages_at_end, page_count,
+        );
+        prop_assert_eq!(
+            report.inflight_entries_at_end, 0,
+            "inflight not drained: {} entries", report.inflight_entries_at_end,
+        );
+        prop_assert_eq!(
+            report.prefetch_inflight_at_end, 0,
+            "prefetch budget not released: {} pages still reserved",
+            report.prefetch_inflight_at_end,
+        );
+    }
+
+    /// Invariant: single-flight coalescing survives pipelining.
+    /// Even though the pipelined reader may have many pages in
+    /// flight across stripes (and the same stripe can appear in
+    /// more than one plan slice), no `(key, page_no)` may have more
+    /// than one concurrent `bulk_get`. Sequential re-issues remain
+    /// allowed.
+    #[test]
+    fn pipelined_invariant_single_flight(
+        seed in any::<u64>(),
+        w in pipelined_workload_strategy(),
+    ) {
+        let report = run_workload(seed, w).expect("run completed");
+        for (k, n) in &report.bulk_get_max_inflight {
+            prop_assert!(
+                *n <= 1,
+                "(key {:?}, page {}) had {} concurrent bulk_get calls; expected single-flight",
+                k.0, k.1, n,
+            );
+        }
+    }
+
+    /// Invariant: pipelined bounded termination.
+    /// `run_workload` returning `Ok` already implies no deadlock or
+    /// budget exhaustion; re-assert it explicitly and confirm every
+    /// spawned pipeline produced an outcome. This is the deadlock
+    /// guard for the cross-stripe driver under page pressure.
+    #[test]
+    fn pipelined_invariant_bounded_termination(
+        seed in any::<u64>(),
+        w in pipelined_workload_strategy(),
+    ) {
+        let report = run_workload(seed, w)
+            .expect("run completed without deadlock or budget exhaustion");
+        prop_assert!(!report.outcomes.is_empty());
+    }
+}
+
 /// Scenario test: with `max_concurrent_streams=1` and four
 /// concurrent clients on the same stripe, at least one `read()`
 /// must be rejected with `StreamLimit` (the leader holds the slot
@@ -299,6 +426,7 @@ fn stream_limit_rejects_excess_concurrent_reads() {
                 window: None,
             },
         ],
+        pipelines: Vec::new(),
     };
     let report = run_workload(0xBADBED, w).expect("scenario run");
     let oks = report
@@ -391,6 +519,7 @@ fn regression_freelist_deadlock_under_faults() {
                 window: None,
             },
         ],
+        pipelines: Vec::new(),
     };
     let report = run_workload(16283855356151283598u64, w).expect("must not deadlock");
     assert_eq!(report.free_pages_at_end, 2);
@@ -433,6 +562,7 @@ fn smoke() {
                 window: Some(2),
             },
         ],
+        pipelines: Vec::new(),
     };
     let report: RunReport = run_workload(0xC0FFEE, w).expect("smoke run");
     assert_eq!(report.free_pages_at_end, 4);
@@ -485,6 +615,7 @@ fn all_cache_hits_skip_bulk_get_and_tee() {
                 window: None,
             },
         ],
+        pipelines: Vec::new(),
     };
     let report = run_workload(0xFADE, w).expect("scenario run");
     assert_eq!(
@@ -558,6 +689,7 @@ fn cancellation_drains_to_clean_state() {
                 window: None,
             },
         ],
+        pipelines: Vec::new(),
     };
     let report = run_workload(0xD1A1ED, w).expect("scenario run");
     assert_eq!(
@@ -621,6 +753,7 @@ fn windowed_read_in_order_and_drains() {
                 window: Some(2),
             },
         ],
+        pipelines: Vec::new(),
     };
     let report = run_workload(0x5EED, w).expect("scenario run");
     for o in &report.outcomes {
@@ -688,6 +821,7 @@ fn regression_windowed_cancel_under_pressure() {
                 window: None,
             },
         ],
+        pipelines: Vec::new(),
     };
     let report = run_workload(12581658376333696978, w).expect("must not deadlock");
     let _ = report;
@@ -743,6 +877,7 @@ fn windowed_under_free_list_pressure_drains() {
                 window: Some(2),
             },
         ],
+        pipelines: Vec::new(),
     };
     // Sweep a handful of seeds so several interleavings of the
     // free-list races are covered by this one deterministic test.
@@ -819,7 +954,156 @@ fn regression_windowed_speculation_starves_head() {
                 window: Some(2),
             },
         ],
+        pipelines: Vec::new(),
     };
     let report = run_workload(345758264357940050, w).expect("must not deadlock");
     let _ = report;
+}
+
+/// Scenario test: a single pipelined reader spanning several stripes
+/// (distinct keys) delivers every page in global order and drains to
+/// a clean state. With `max_inflight_pages` larger than one stripe's
+/// worth of pages, the reader pipelines fetches across stripe
+/// boundaries (proven separately by the module-integration overlap
+/// test); here we pin the end-to-end correctness and accounting under
+/// the deterministic executor across several seeds.
+#[test]
+fn pipelined_multi_stripe_in_order_and_drains() {
+    let w = Workload {
+        page_size: 64,
+        page_count: 8,
+        max_io_delay: 3,
+        io_fault_rate: 0,
+        cache_hit_rate: 0,
+        max_concurrent_streams: 1024,
+        max_inflight_pages: 6,
+        key_count: 3,
+        clients: Vec::new(),
+        pipelines: vec![PipelineSpec {
+            cancel_after: None,
+            slices: vec![
+                PlanSliceSpec {
+                    key_idx: 0,
+                    offset: 0,
+                    len: 128,
+                },
+                PlanSliceSpec {
+                    key_idx: 1,
+                    offset: 0,
+                    len: 128,
+                },
+                PlanSliceSpec {
+                    key_idx: 2,
+                    offset: 32,
+                    len: 96,
+                },
+            ],
+        }],
+    };
+    for seed in [0u64, 1, 7, 42, 1234, 99999] {
+        let report = run_workload(seed, w.clone()).expect("must not deadlock");
+        for o in &report.outcomes {
+            match o {
+                ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
+                other => panic!("unexpected outcome at seed {seed}: {other:?}"),
+            }
+        }
+        assert_eq!(report.free_pages_at_end, 8, "leak at seed {seed}");
+        assert_eq!(
+            report.inflight_entries_at_end, 0,
+            "inflight leak at seed {seed}"
+        );
+        assert_eq!(
+            report.prefetch_inflight_at_end, 0,
+            "prefetch budget leak at seed {seed}"
+        );
+    }
+}
+
+/// Scenario test: pipelined readers under free-list pressure must not
+/// deadlock and must drain cleanly. `page_count` is far smaller than
+/// the aggregate page demand of the concurrent multi-stripe plans, so
+/// each plan's in-order head competes with the others (and with its
+/// own speculation) for the few free pages. The same head-of-line
+/// guarantee that protects windowed reads protects the pipelined
+/// reader: the global head is launched non-speculatively and polled
+/// first, and `release_passed_slices` frees streams as the cursor
+/// advances. A regression surfaces as `RunError::Deadlock` or budget
+/// exhaustion. Mid-stream cancellation exercises the pipelined `Drop`
+/// cleanup path.
+#[test]
+fn pipelined_under_free_list_pressure_drains() {
+    let w = Workload {
+        page_size: 64,
+        page_count: 2,
+        max_io_delay: 3,
+        io_fault_rate: 0,
+        cache_hit_rate: 0,
+        max_concurrent_streams: 1024,
+        max_inflight_pages: 4,
+        key_count: 3,
+        clients: Vec::new(),
+        pipelines: vec![
+            PipelineSpec {
+                cancel_after: None,
+                slices: vec![
+                    PlanSliceSpec {
+                        key_idx: 0,
+                        offset: 0,
+                        len: 128,
+                    },
+                    PlanSliceSpec {
+                        key_idx: 1,
+                        offset: 0,
+                        len: 128,
+                    },
+                ],
+            },
+            PipelineSpec {
+                cancel_after: Some(1),
+                slices: vec![
+                    PlanSliceSpec {
+                        key_idx: 2,
+                        offset: 0,
+                        len: 128,
+                    },
+                    PlanSliceSpec {
+                        key_idx: 0,
+                        offset: 64,
+                        len: 64,
+                    },
+                ],
+            },
+            PipelineSpec {
+                cancel_after: None,
+                slices: vec![PlanSliceSpec {
+                    key_idx: 1,
+                    offset: 32,
+                    len: 96,
+                }],
+            },
+        ],
+    };
+    for seed in [0u64, 1, 7, 42, 1234, 99999] {
+        let report = run_workload(seed, w.clone()).expect("must not deadlock");
+        for o in &report.outcomes {
+            match o {
+                ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
+                ClientOutcome::Cancelled { got, expected, .. } => {
+                    assert!(got.len() <= expected.len());
+                    assert_eq!(&got[..], &expected[..got.len()]);
+                }
+                other => panic!("unexpected outcome at seed {seed}: {other:?}"),
+            }
+        }
+        assert_eq!(report.free_pages_at_end, 2, "leak at seed {seed}");
+        assert_eq!(
+            report.inflight_entries_at_end, 0,
+            "inflight leak at seed {seed}"
+        );
+        assert_eq!(
+            report.prefetch_inflight_at_end, 0,
+            "prefetch budget leak at seed {seed}"
+        );
+    }
 }

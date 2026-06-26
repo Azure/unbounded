@@ -199,6 +199,129 @@ pub(crate) enum OpResource {
     /// the op resolves while the slot keeps the allocation alive for the
     /// kernel until the CQE is reaped (even if the future drops first).
     RecvBuf(Rc<RefCell<Vec<u8>>>),
+    /// Owned `msghdr`/iovec/control-buffer trio for a `recvmsg` whose
+    /// data lands in a registered region (the iovec base points into the
+    /// backing, not into `RecvMsgState`). Shared with the awaiting future
+    /// via `Rc` so it can read back the kernel-filled control buffer (the
+    /// TLS record type) once the op resolves, while the slot keeps the
+    /// allocation alive for the kernel until the CQE is reaped.
+    RecvMsg(Rc<RefCell<RecvMsgState>>),
+}
+
+/// `SOL_TLS` socket option level. Absent from `libc`; see
+/// `include/uapi/linux/tls.h`.
+const SOL_TLS: libc::c_int = 282;
+/// TLS control-message type carrying the one-byte record type. Absent
+/// from `libc`; see `include/uapi/net/tls.h` (`TLS_GET_RECORD_TYPE`).
+const TLS_GET_RECORD_TYPE: libc::c_int = 2;
+/// Default record type assumed when a `recvmsg` carries no TLS control
+/// message (a plaintext socket, or kTLS application_data). Matches the
+/// TLS `application_data` content type (23).
+const TLS_DEFAULT_RECORD_TYPE: u8 = 23;
+
+/// Heap-stable backing for a single in-flight `recvmsg`. The `msghdr`
+/// references `iov` and `control` by raw pointer, so this struct must
+/// never move once those pointers are set; it lives behind an `Rc` whose
+/// allocation address is stable for that reason. The iovec base points
+/// into a registered backing region (the recv destination), not into
+/// this struct.
+pub(crate) struct RecvMsgState {
+    iov: libc::iovec,
+    control: Vec<u8>,
+    msghdr: libc::msghdr,
+    /// Owned destination buffer when the recvmsg lands in the heap (the
+    /// record-aware header read). `None` when the iovec points into a
+    /// registered region instead (the zero-copy body read).
+    data: Option<Vec<u8>>,
+}
+
+impl RecvMsgState {
+    /// Build a recvmsg state whose single iovec receives `len` bytes at
+    /// `base` (inside a registered region) and whose control buffer can
+    /// hold one TLS record-type control message. The self-referential
+    /// `msghdr` pointers are wired after allocation, when the `Rc` has
+    /// pinned a stable address.
+    pub(crate) fn new(base: *mut u8, len: usize) -> Rc<RefCell<Self>> {
+        Self::build(base, len, None)
+    }
+
+    /// Build a recvmsg state that receives up to `max_len` bytes into an
+    /// owned heap buffer (used for the record-aware header path, where
+    /// the destination is not a registered region). The buffer is read
+    /// back via [`Self::take_data`] once the CQE is reaped.
+    pub(crate) fn new_heap(max_len: usize) -> Rc<RefCell<Self>> {
+        let mut data = vec![0u8; max_len];
+        let base = data.as_mut_ptr();
+        Self::build(base, max_len, Some(data))
+    }
+
+    fn build(base: *mut u8, len: usize, data: Option<Vec<u8>>) -> Rc<RefCell<Self>> {
+        // Generous, fixed control buffer: a single one-byte cmsg.
+        let control_len = unsafe { libc::CMSG_SPACE(1) as usize };
+        let state = Rc::new(RefCell::new(Self {
+            iov: libc::iovec {
+                iov_base: base as *mut c_void,
+                iov_len: len,
+            },
+            control: vec![0u8; control_len],
+            // Zeroed; fields wired below.
+            msghdr: unsafe { std::mem::zeroed() },
+            data,
+        }));
+        {
+            let mut s = state.borrow_mut();
+            // Re-point the iovec at the heap buffer now that it lives
+            // inside the `Rc` (its address is stable from here on). For
+            // the registered-region path `data` is `None` and `base`
+            // already points at the backing.
+            if let Some(buf) = s.data.as_mut() {
+                s.iov.iov_base = buf.as_mut_ptr() as *mut c_void;
+            }
+            let iov_ptr = &mut s.iov as *mut libc::iovec;
+            let control_ptr = s.control.as_mut_ptr() as *mut c_void;
+            let control_len = s.control.len();
+            s.msghdr.msg_iov = iov_ptr;
+            s.msghdr.msg_iovlen = 1;
+            s.msghdr.msg_control = control_ptr;
+            s.msghdr.msg_controllen = control_len as _;
+        }
+        state
+    }
+
+    /// Copy out the first `n` received bytes from the owned heap buffer.
+    /// Only valid for states built with [`Self::new_heap`].
+    pub(crate) fn take_data(&self, n: usize) -> Vec<u8> {
+        match self.data.as_ref() {
+            Some(buf) => buf[..n.min(buf.len())].to_vec(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Raw pointer to the owned `msghdr` for the SQE. Valid for as long
+    /// as the owning `Rc` is alive (held by the slot until the CQE is
+    /// reaped).
+    pub(crate) fn msghdr_ptr(&self) -> *mut libc::msghdr {
+        &self.msghdr as *const libc::msghdr as *mut libc::msghdr
+    }
+
+    /// TLS record type the kernel reported via the control buffer, or
+    /// [`TLS_DEFAULT_RECORD_TYPE`] when none is present. Read only after
+    /// the recvmsg CQE is reaped (the kernel updates `msg_controllen`).
+    pub(crate) fn record_type(&self) -> u8 {
+        // SAFETY: `msghdr.msg_control` addresses `control` (length
+        // `msg_controllen`, set by the kernel); the cmsg walk stays
+        // within that buffer.
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(&self.msghdr);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == SOL_TLS && (*cmsg).cmsg_type == TLS_GET_RECORD_TYPE {
+                    return *libc::CMSG_DATA(cmsg);
+                }
+                cmsg = libc::CMSG_NXTHDR(&self.msghdr, cmsg);
+            }
+        }
+        TLS_DEFAULT_RECORD_TYPE
+    }
 }
 
 impl RingCore {
@@ -685,6 +808,7 @@ impl Future for SubmitSlot<'_> {
             return Poll::Ready(());
         }
         core.submit_waiters.borrow_mut().push(cx.waker().clone());
+        crate::metrics::ring_backpressure();
         Poll::Pending
     }
 }

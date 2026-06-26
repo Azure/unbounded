@@ -145,3 +145,21 @@ func TestUpdateSymlink(t *testing.T) {
 		t.Fatalf("second target = %q, want %q", target, secondTarget)
 	}
 }
+
+func TestProbeWritableDir(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	if err := ProbeWritableDir(dir); err != nil {
+		t.Fatalf("probe writable dir: %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read temp dir: %v", err)
+	}
+
+	if len(entries) != 0 {
+		t.Fatalf("probe left entries behind: %v", entries)
+	}
+}

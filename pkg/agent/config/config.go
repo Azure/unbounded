@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
@@ -111,6 +112,45 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	return &out
 }
 
+// Validate checks that required agent configuration fields are present and
+// internally consistent. Kubelet auth is validated when present; callers that
+// require a bootstrap credential should enforce that separately because some
+// flows fill the credential later through attestation.
+func (a *AgentConfig) Validate() error {
+	if a == nil {
+		return fmt.Errorf("agent config is nil")
+	}
+
+	var errs []error
+	if strings.TrimSpace(a.MachineName) == "" {
+		errs = append(errs, fmt.Errorf("MachineName is required"))
+	}
+
+	if nodeName := strings.TrimSpace(a.NodeName); nodeName == "" {
+		errs = append(errs, fmt.Errorf("NodeName is required"))
+	} else if !isValidNodeName(nodeName) {
+		errs = append(errs, fmt.Errorf("NodeName is not a valid Kubernetes node name"))
+	}
+
+	if strings.TrimSpace(a.Cluster.ClusterDNS) == "" {
+		errs = append(errs, fmt.Errorf("Cluster.ClusterDNS is required"))
+	}
+
+	apiServer := strings.TrimSpace(a.Kubelet.ApiServer)
+	if apiServer == "" {
+		errs = append(errs, fmt.Errorf("Kubelet.ApiServer is required"))
+	} else if u, err := url.Parse(apiServer); err != nil || u.Scheme == "" || u.Host == "" {
+		errs = append(errs, fmt.Errorf("Kubelet.ApiServer is invalid"))
+	}
+
+	// Kubelet auth is intentionally not validated here. Some consumers provide
+	// credentials later through product-specific flows such as attestation, and
+	// that context is outside the shared AgentConfig. Callers that require a
+	// static bootstrap credential should validate Kubelet.Auth separately.
+
+	return errors.Join(errs...)
+}
+
 // AgentClusterConfig holds the cluster-level values the agent needs to
 // join the Kubernetes control plane.
 type AgentClusterConfig struct {
@@ -170,13 +210,13 @@ type CRIConfig struct {
 
 // ContainerdConfig holds containerd-specific overrides.
 type ContainerdConfig struct {
-	// Version overrides the default containerd version (e.g. "2.0.4").
+	// Version overrides the default containerd version (e.g. "2.1.8").
 	Version string `json:"Version,omitempty"`
 }
 
 // RuncConfig holds runc-specific overrides.
 type RuncConfig struct {
-	// Version overrides the default runc version (e.g. "1.1.12").
+	// Version overrides the default runc version (e.g. "1.5.0").
 	Version string `json:"Version,omitempty"`
 }
 

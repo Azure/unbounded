@@ -186,7 +186,7 @@ func machineForToken(machineName, nodeName, tokenID, site string) *unboundedv1al
 		Spec: unboundedv1alpha3.MachineSpec{
 			Kubernetes: &unboundedv1alpha3.KubernetesSpec{
 				NodeRef: &unboundedv1alpha3.LocalObjectReference{Name: nodeName},
-				BootstrapTokenRef: unboundedv1alpha3.LocalObjectReference{
+				BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{
 					Name: "bootstrap-token-" + tokenID,
 				},
 			},

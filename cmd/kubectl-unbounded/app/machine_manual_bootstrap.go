@@ -19,6 +19,7 @@ import (
 
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -181,8 +182,15 @@ func (h *manualBootstrapHandler) validate() error {
 		return errors.New("site name is required")
 	}
 
-	if isEmpty(h.machineName) {
-		return errors.New("machine name is required")
+	// The machine name is optional. When omitted, the unbounded-agent resolves
+	// it at startup from the AGENT_MACHINE_NAME environment variable or the host
+	// hostname, which lets a single bootstrap payload be reused across many
+	// instances (e.g. Azure VMSS or AWS Auto Scaling). When supplied, it must be
+	// a valid Kubernetes node name because it becomes the Machine CR name.
+	if !isEmpty(h.machineName) {
+		if errs := validation.IsDNS1123Subdomain(h.machineName); len(errs) > 0 {
+			return fmt.Errorf("invalid machine name %q: %s", h.machineName, strings.Join(errs, "; "))
+		}
 	}
 
 	if _, err := parseNodeLabels(h.nodeLabels); err != nil {
@@ -315,6 +323,11 @@ type manualBootstrapTemplateData struct {
 	// MachineName is the name assigned to the node.
 	MachineName string
 
+	// MachineNameDisplay is the value shown in the rendered comment header.
+	// It is the configured machine name, or "(resolved at runtime)" when the
+	// name is left empty and resolved on the host by the unbounded-agent.
+	MachineNameDisplay string
+
 	// AgentConfigJSON is the indented JSON representation of the agent config.
 	AgentConfigJSON string
 
@@ -357,6 +370,17 @@ func (h *manualBootstrapHandler) installEnv() []string {
 	})
 }
 
+// machineNameDisplay returns the value rendered into the comment header of the
+// generated payload. When the machine name is empty it indicates that the name
+// is resolved on the host at runtime by the unbounded-agent.
+func machineNameDisplay(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return "(resolved at runtime)"
+	}
+
+	return name
+}
+
 // renderScript produces a self-contained bash script that writes the agent
 // config JSON to a temporary file and then executes the standard install
 // script. It uses the embedded node-bootstrap/script.sh template.
@@ -367,10 +391,11 @@ func (h *manualBootstrapHandler) renderScript(cfg *provision.UnboundedAgentConfi
 	}
 
 	data := manualBootstrapTemplateData{
-		MachineName:     cfg.MachineName,
-		AgentConfigJSON: string(configJSON),
-		InstallScript:   provision.UnboundedAgentInstallScript(),
-		InstallEnv:      h.installEnv(),
+		MachineName:        cfg.MachineName,
+		MachineNameDisplay: machineNameDisplay(cfg.MachineName),
+		AgentConfigJSON:    string(configJSON),
+		InstallScript:      provision.UnboundedAgentInstallScript(),
+		InstallEnv:         h.installEnv(),
 	}
 
 	t, err := template.New("node-bootstrap").Parse(manualBootstrapTemplate)
@@ -395,10 +420,11 @@ func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.UnboundedAgentCo
 	}
 
 	data := manualBootstrapTemplateData{
-		MachineName:     cfg.MachineName,
-		AgentConfigJSON: string(configJSON),
-		InstallScript:   provision.UnboundedAgentInstallScript(),
-		InstallEnv:      h.installEnv(),
+		MachineName:        cfg.MachineName,
+		MachineNameDisplay: machineNameDisplay(cfg.MachineName),
+		AgentConfigJSON:    string(configJSON),
+		InstallScript:      provision.UnboundedAgentInstallScript(),
+		InstallEnv:         h.installEnv(),
 	}
 
 	funcMap := template.FuncMap{
@@ -431,11 +457,18 @@ func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.UnboundedAgentCo
 
 func newMachineManualBootstrapCommand(handler *manualBootstrapHandler) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "manual-bootstrap NAME",
+		Use:   "manual-bootstrap [NAME]",
 		Short: "Generate a bootstrap script or cloud-init config for provisioning a machine",
 		Long: `Generate a self-contained bootstrap payload that provisions a bare-metal or VM
 host as an unbounded worker node. The payload embeds the agent JSON
 configuration inline and the install script for the target architecture.
+
+NAME is optional. When omitted, the unbounded-agent resolves the machine name
+on the host at startup from the AGENT_MACHINE_NAME environment variable, falling
+back to the host hostname. This lets a single payload be reused across many
+instances, for example an Azure VMSS or AWS Auto Scaling group, where each
+instance derives its own name. The resolved name is logged by the agent and can
+be inspected with 'journalctl -u unbounded-agent'.
 
 Use --variant to choose the output format:
 
@@ -453,6 +486,10 @@ Examples:
   # Generate cloud-init user-data for a cloud provider API:
   kubectl unbounded machine manual-bootstrap my-node --site my-site --variant cloud-init > user-data.yaml
 
+  # Generate a reusable cloud-init payload for an autoscaling group (no NAME):
+  # each instance resolves its own machine name from its hostname at boot.
+  kubectl unbounded machine manual-bootstrap --site my-site --variant cloud-init > user-data.yaml
+
   # Pin the agent to a specific release instead of tracking "latest":
   kubectl unbounded machine manual-bootstrap my-node --site my-site --agent-version v0.0.10
 
@@ -460,9 +497,12 @@ Examples:
   # GitHub releases under the base URL):
   kubectl unbounded machine manual-bootstrap my-node --site my-site \
     --agent-base-url https://releases.example.com/unbounded`,
-		Args: cobra.ExactArgs(1),
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			handler.machineName = args[0]
+			if len(args) == 1 {
+				handler.machineName = args[0]
+			}
+
 			return handler.execute(cmd.Context())
 		},
 	}

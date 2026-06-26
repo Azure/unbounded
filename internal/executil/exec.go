@@ -165,6 +165,20 @@ func AptGet() func(context.Context) *exec.Cmd {
 	}
 }
 
+// Tdnf returns a command factory for tdnf.
+func Tdnf() func(context.Context) *exec.Cmd {
+	return func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "tdnf")
+	}
+}
+
+// Dnf returns a command factory for dnf.
+func Dnf() func(context.Context) *exec.Cmd {
+	return func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "dnf")
+	}
+}
+
 // Ip returns a command factory for the ip networking utility.
 func Ip() func(context.Context) *exec.Cmd {
 	return func(ctx context.Context) *exec.Cmd {
