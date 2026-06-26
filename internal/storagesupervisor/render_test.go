@@ -59,6 +59,15 @@ func tcpPeer(name, addr string) *storageconfig.PeerSpec {
 	}
 }
 
+func rdmaPeer(name, addr string) *storageconfig.PeerSpec {
+	return &storageconfig.PeerSpec{
+		Name: name,
+		Config: &storageconfig.PeerSpec_Rdma{
+			Rdma: &storageconfig.RdmaPeerConfig{Addr: addr},
+		},
+	}
+}
+
 func TestRenderConfigFullSchema(t *testing.T) {
 	dir := writeSource(t, `
 version: 7
@@ -197,10 +206,76 @@ func TestRenderConfigInvalidValues(t *testing.T) {
 	}
 }
 
+func TestRenderConfigRejectsDanglingRenderedBindings(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name: "frontend source",
+			yaml: `
+frontends:
+  - name: f
+    source: ghost
+    loadgen: {}
+`,
+			wantErr: `frontend "f" references unknown source "ghost"`,
+		},
+		{
+			name: "cache source",
+			yaml: `
+caches:
+  - name: c
+    source: ghost
+`,
+			wantErr: `cache "c" references unknown backend source "ghost"`,
+		},
+		{
+			name: "duplicate backend cache component name",
+			yaml: `
+backends:
+  - name: same
+    fake: {}
+caches:
+  - name: same
+    source: same
+`,
+			wantErr: `duplicate component name "same" while adding cache`,
+		},
+		{
+			name: "duplicate cache frontend component name",
+			yaml: `
+backends:
+  - name: origin
+    fake: {}
+caches:
+  - name: same
+    source: origin
+frontends:
+  - name: same
+    source: same
+    loadgen: {}
+`,
+			wantErr: `duplicate component name "same" while adding frontend`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := writeSource(t, tt.yaml)
+
+			_, err := RenderConfig(dir, renderState{})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
 func TestRenderConfigActiveRingOverlay(t *testing.T) {
-	// An active ring injects self + peers and overrides the ConfigMap's fabric
-	// addr with this node's own routable bind, while the rest of the startup
-	// settings still come from the source.
+	// An active ring injects self + peers and overrides the
+	// ConfigMap's fabric addr with this node's own routable bind, while the
+	// rest of the startup settings still come from the source.
 	dir := writeSource(t, `
 version: 3
 startup:
@@ -211,19 +286,16 @@ startup:
 backends:
   - name: origin
     fake: {}
-caches:
-  - name: edge
-    source: origin
 `)
 
 	ring := ringState{
 		active:         true,
-		selfName:       "self",
+		selfName:       "node-a",
 		selfListenAddr: "10.0.0.5:9000",
 		peers: []*storageconfig.PeerSpec{
-			tcpPeer("peer-a", "10.0.0.6:9000"),
-			tcpPeer("peer-b", "10.0.0.7:9000"),
-			tcpPeer("self", "10.0.0.5:9000"),
+			tcpPeer("node-a", "10.0.0.5:9000"),
+			tcpPeer("node-b", "10.0.0.6:9000"),
+			tcpPeer("node-c", "10.0.0.7:9000"),
 		},
 	}
 
@@ -240,21 +312,22 @@ caches:
 	// addr is overridden with the node's own routable address.
 	assert.Equal(t, "10.0.0.5:9000", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
 
-	assert.Equal(t, "self", cfg.GetSelf())
+	assert.Equal(t, "node-a", cfg.GetSelf())
+
 	require.Len(t, cfg.GetPeers(), 3)
-	assert.Equal(t, "peer-a", cfg.GetPeers()[0].GetName())
-	assert.Equal(t, "10.0.0.6:9000", cfg.GetPeers()[0].GetTcp().GetAddr())
-	assert.Equal(t, "peer-b", cfg.GetPeers()[1].GetName())
-	assert.Equal(t, "10.0.0.7:9000", cfg.GetPeers()[1].GetTcp().GetAddr())
-	assert.Equal(t, "self", cfg.GetPeers()[2].GetName())
-	assert.Equal(t, "10.0.0.5:9000", cfg.GetPeers()[2].GetTcp().GetAddr())
+	assert.Equal(t, "node-a", cfg.GetPeers()[0].GetName())
+	assert.Equal(t, "10.0.0.5:9000", cfg.GetPeers()[0].GetTcp().GetAddr())
+	assert.Equal(t, "node-b", cfg.GetPeers()[1].GetName())
+	assert.Equal(t, "10.0.0.6:9000", cfg.GetPeers()[1].GetTcp().GetAddr())
+	assert.Equal(t, "node-c", cfg.GetPeers()[2].GetName())
+	assert.Equal(t, "10.0.0.7:9000", cfg.GetPeers()[2].GetTcp().GetAddr())
 }
 
 func TestRenderConfigActiveRingMergesPeers(t *testing.T) {
 	// Peers declared in the YAML are merged with discovered peers, and
-	// YAML-declared routing scalars (fingers_per_node, routing_plan) are
-	// preserved while self is stamped in.
+	// YAML-declared routing knobs are preserved while self is stamped in.
 	dir := writeSource(t, `
+fingers_per_node: 5
 startup:
   fabric:
     tcp:
@@ -262,23 +335,20 @@ startup:
 backends:
   - name: origin
     fake: {}
-fingers_per_node: 5
-routing_plan:
-  fingers: ["declared"]
 peers:
-  - name: declared
+  - name: node-z
     tcp:
       addr: "10.0.0.100:9000"
 `)
 
 	ring := ringState{
 		active:         true,
-		selfName:       "self",
+		selfName:       "node-a",
 		selfListenAddr: "10.0.0.5:9000",
 		peers: []*storageconfig.PeerSpec{
-			tcpPeer("peer-b", "10.0.0.7:9000"),
-			tcpPeer("peer-a", "10.0.0.6:9000"),
-			tcpPeer("self", "10.0.0.5:9000"),
+			tcpPeer("node-c", "10.0.0.7:9000"),
+			tcpPeer("node-a", "10.0.0.5:9000"),
+			tcpPeer("node-b", "10.0.0.6:9000"),
 		},
 	}
 
@@ -289,22 +359,53 @@ peers:
 
 	require.NoError(t, proto.Unmarshal(data, &cfg))
 
-	// YAML routing scalars preserved; self injected.
-	assert.Equal(t, "self", cfg.GetSelf())
+	// YAML routing knobs preserved; self injected.
+	assert.Equal(t, "node-a", cfg.GetSelf())
 	assert.NotNil(t, cfg.FingersPerNode)
 	assert.Equal(t, uint32(5), cfg.GetFingersPerNode())
-	assert.Equal(t, []string{"declared"}, cfg.GetRoutingPlan().GetFingers())
 
-	// Discovered peers merged with declared peers, sorted by name.
+	// Discovered peers merge with declared node-z and are sorted by name.
 	require.Len(t, cfg.GetPeers(), 4)
-	assert.Equal(t, "declared", cfg.GetPeers()[0].GetName())
-	assert.Equal(t, "10.0.0.100:9000", cfg.GetPeers()[0].GetTcp().GetAddr())
-	assert.Equal(t, "peer-a", cfg.GetPeers()[1].GetName())
-	assert.Equal(t, "peer-b", cfg.GetPeers()[2].GetName())
-	assert.Equal(t, "self", cfg.GetPeers()[3].GetName())
+	assert.Equal(t, "node-a", cfg.GetPeers()[0].GetName())
+	assert.Equal(t, "node-b", cfg.GetPeers()[1].GetName())
+	assert.Equal(t, "node-c", cfg.GetPeers()[2].GetName())
+	assert.Equal(t, "node-z", cfg.GetPeers()[3].GetName())
+	assert.Equal(t, "10.0.0.100:9000", cfg.GetPeers()[3].GetTcp().GetAddr())
 }
 
-func TestRenderConfigActiveRingWorksWithoutDeclaredPeers(t *testing.T) {
+func TestRenderConfigActiveRDMARingPreservesStartupFabric(t *testing.T) {
+	dir := writeSource(t, `
+startup:
+  fabric:
+    auto_rdma:
+      hcas_per_numa_node: 2
+    max_inflight: 2048
+backends:
+  - name: origin
+    fake: {}
+`)
+
+	ring := ringState{
+		active:   true,
+		selfName: "node-a",
+		peers: []*storageconfig.PeerSpec{
+			rdmaPeer("node-a", "hex:self"),
+			rdmaPeer("node-b", "hex:peer"),
+		},
+	}
+
+	cfg := decodeWithState(t, dir, renderState{ring: ring})
+
+	assert.NotNil(t, cfg.GetStartup().GetFabric().GetAutoRdma())
+	assert.Equal(t, uint64(2), cfg.GetStartup().GetFabric().GetAutoRdma().GetHcasPerNumaNode())
+	assert.Nil(t, cfg.GetStartup().GetFabric().GetTcp())
+	assert.Equal(t, "node-a", cfg.GetSelf())
+	require.Len(t, cfg.GetPeers(), 2)
+	assert.Equal(t, "hex:self", cfg.GetPeers()[0].GetRdma().GetAddr())
+	assert.Equal(t, "hex:peer", cfg.GetPeers()[1].GetRdma().GetAddr())
+}
+
+func TestRenderConfigActiveRingInjectsMeshWithoutDeclaredPeers(t *testing.T) {
 	dir := writeSource(t, `
 startup:
   fabric:
@@ -315,12 +416,20 @@ backends:
     fake: {}
 `)
 
+	var logs bytes.Buffer
+
+	previousLogger := slog.Default()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
 	ring := ringState{
 		active:         true,
-		selfName:       "self",
+		selfName:       "node-a",
 		selfListenAddr: "10.0.0.5:9000",
 		peers: []*storageconfig.PeerSpec{
-			tcpPeer("peer-a", "10.0.0.6:9000"),
+			tcpPeer("node-a", "10.0.0.5:9000"),
+			tcpPeer("node-b", "10.0.0.6:9000"),
 		},
 	}
 
@@ -331,33 +440,37 @@ backends:
 
 	require.NoError(t, proto.Unmarshal(data, &cfg))
 
-	assert.Equal(t, "self", cfg.GetSelf())
-	require.Len(t, cfg.GetPeers(), 1)
-	assert.Equal(t, "peer-a", cfg.GetPeers()[0].GetName())
+	assert.Equal(t, "node-a", cfg.GetSelf())
+	require.Len(t, cfg.GetPeers(), 2)
+	assert.Equal(t, "node-a", cfg.GetPeers()[0].GetName())
+	assert.Equal(t, "node-b", cfg.GetPeers()[1].GetName())
 	assert.Equal(t, "10.0.0.5:9000", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
+	assert.NotContains(t, logs.String(), "discovered storage peers were not injected")
 }
 
 func TestRenderConfigMergeDropsNameCollisions(t *testing.T) {
 	// A declared peer whose name collides with a discovered peer is dropped in
-	// favor of the discovered one.
+	// favor of the discovered one. Self remains in the roster because the daemon
+	// uses it to derive the local fabric/ring identity.
 	dir := writeSource(t, `
 backends:
   - name: origin
     fake: {}
 peers:
-  - name: peer-a
+  - name: node-b
     tcp:
       addr: "10.9.9.9:9000"
-  - name: declared
+  - name: node-z
     tcp:
       addr: "10.9.9.42:9000"
 `)
 
 	ring := ringState{
 		active:   true,
-		selfName: "self",
+		selfName: "node-a",
 		peers: []*storageconfig.PeerSpec{
-			tcpPeer("peer-a", "10.0.0.6:9000"),
+			tcpPeer("node-a", "10.0.0.5:9000"),
+			tcpPeer("node-b", "10.0.0.6:9000"),
 		},
 	}
 
@@ -368,20 +481,20 @@ peers:
 
 	require.NoError(t, proto.Unmarshal(data, &cfg))
 
-	// The discovered peer-a address wins the collision; unrelated declared peers
-	// are preserved.
+	// Discovered node-b wins the collision and declared node-z is preserved.
 	peers := cfg.GetPeers()
-	require.Len(t, peers, 2)
-	assert.Equal(t, "declared", peers[0].GetName())
-	assert.Equal(t, "10.9.9.42:9000", peers[0].GetTcp().GetAddr())
-	assert.Equal(t, "peer-a", peers[1].GetName())
+	require.Len(t, peers, 3)
+	assert.Equal(t, "node-a", peers[0].GetName())
+	assert.Equal(t, "node-b", peers[1].GetName())
 	assert.Equal(t, "10.0.0.6:9000", peers[1].GetTcp().GetAddr())
+	assert.Equal(t, "node-z", peers[2].GetName())
 }
 
 func TestRenderConfigInactiveRingPassesThrough(t *testing.T) {
-	// An inactive ring leaves the YAML-declared per-node sections untouched and
+	// An inactive ring leaves the YAML-declared mesh fields untouched and
 	// the ConfigMap's fabric addr unchanged.
 	dir := writeSource(t, `
+self: manual
 startup:
   fabric:
     tcp:
@@ -390,16 +503,16 @@ backends:
   - name: origin
     fake: {}
 peers:
-  - name: declared
+  - name: manual
     tcp:
       addr: "10.0.0.100:9000"
 `)
 
 	cfg := decode(t, dir)
 
-	assert.Empty(t, cfg.GetSelf())
+	assert.Equal(t, "manual", cfg.GetSelf())
 	require.Len(t, cfg.GetPeers(), 1)
-	assert.Equal(t, "declared", cfg.GetPeers()[0].GetName())
+	assert.Equal(t, "manual", cfg.GetPeers()[0].GetName())
 	assert.Equal(t, "0.0.0.0:0", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
 }
 
@@ -410,7 +523,7 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation: "/dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0;skip_recovery_scan=true",
+			storageDisksAnnotation: "/dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0;skip_recovery_scan=true;force_format=true;bypass_admission=true;bypass_index_read=true;bypass_checksum=true",
 		},
 	})
 
@@ -425,6 +538,10 @@ version: 1
 	assert.NotNil(t, disk.GetBlock().Numa)
 	assert.Equal(t, uint32(0), disk.GetBlock().GetNuma())
 	assert.True(t, disk.GetSkipRecoveryScan())
+	assert.True(t, disk.GetForceFormat())
+	assert.True(t, disk.GetBypassAdmission())
+	assert.True(t, disk.GetBypassIndexRead())
+	assert.True(t, disk.GetBypassChecksum())
 }
 
 func TestRenderConfigInjectsMultipleAnnotatedBlockDisks(t *testing.T) {
@@ -459,7 +576,7 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation: "/dev/nvme1n1;unknown=x;queue_depth=0;queue_depth=512;queue_depth=1024;page_size_bytes=bad;skip_recovery_scan=maybe;numa=bad;empty=;=value;missing",
+			storageDisksAnnotation: "/dev/nvme1n1;unknown=x;queue_depth=0;queue_depth=512;queue_depth=1024;page_size_bytes=bad;skip_recovery_scan=maybe;force_format=maybe;bypass_admission=maybe;bypass_index_read=maybe;bypass_checksum=maybe;numa=bad;empty=;=value;missing",
 		},
 	})
 
@@ -471,6 +588,10 @@ version: 1
 	assert.Nil(t, disk.PageSizeBytes)
 	assert.Nil(t, disk.GetBlock().Numa)
 	assert.False(t, disk.GetSkipRecoveryScan())
+	assert.False(t, disk.GetForceFormat())
+	assert.False(t, disk.GetBypassAdmission())
+	assert.False(t, disk.GetBypassIndexRead())
+	assert.False(t, disk.GetBypassChecksum())
 	assert.Contains(t, logs.String(), "ignoring unknown storage disk option")
 	assert.Contains(t, logs.String(), "ignoring duplicate storage disk option")
 }
@@ -590,11 +711,14 @@ disks:
 
 func TestRenderConfigCachesUntouched(t *testing.T) {
 	dir := writeSource(t, `
+backends:
+  - name: origin
+    fake: {}
 caches:
   - name: cache-a
-    source: p2p
+    source: origin
   - name: cache-b
-    source: p2p
+    source: origin
 `)
 
 	cfg := decode(t, dir)
@@ -616,6 +740,122 @@ version: 1
 
 	require.Len(t, cfg.GetDisks(), 1)
 	assert.Equal(t, "/dev/nvme1n1", cfg.GetDisks()[0].GetBlock().GetPath())
+}
+
+func TestRenderConfigInjectsAnnotatedLoadgenFrontends(t *testing.T) {
+	dir := writeSource(t, `
+backends:
+  - name: origin
+    fake: {}
+caches:
+  - name: cache
+    source: origin
+frontends:
+  - name: http
+    source: cache
+    http:
+      addr: "0.0.0.0:8080"
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{
+			storageLoadgenAnnotation: "lg;source=cache;workers=32;seed=1234;keyspace_objects=1000000;object_size_bytes=4194304;read_bytes=262144;zipf_exponent=1.1;verify=true;remote_only=true;fabric_only=true;local_only=true;skip_local_disk=true,lg2;source=origin",
+		},
+	})
+
+	require.Len(t, cfg.GetFrontends(), 3)
+	assert.Equal(t, "http", cfg.GetFrontends()[0].GetName())
+
+	frontend := cfg.GetFrontends()[1]
+	assert.Equal(t, "lg", frontend.GetName())
+	assert.Equal(t, "cache", frontend.GetSource())
+	loadgen := frontend.GetLoadgen()
+	require.NotNil(t, loadgen)
+	assert.NotNil(t, loadgen.Workers)
+	assert.Equal(t, uint32(32), loadgen.GetWorkers())
+	assert.NotNil(t, loadgen.Seed)
+	assert.Equal(t, uint64(1234), loadgen.GetSeed())
+	assert.NotNil(t, loadgen.KeyspaceObjects)
+	assert.Equal(t, uint64(1000000), loadgen.GetKeyspaceObjects())
+	assert.NotNil(t, loadgen.ObjectSizeBytes)
+	assert.Equal(t, uint64(4194304), loadgen.GetObjectSizeBytes())
+	assert.NotNil(t, loadgen.ReadBytes)
+	assert.Equal(t, uint64(262144), loadgen.GetReadBytes())
+	assert.NotNil(t, loadgen.ZipfExponent)
+	assert.Equal(t, 1.1, loadgen.GetZipfExponent())
+	assert.True(t, loadgen.GetVerify())
+	assert.True(t, loadgen.GetRemoteOnly())
+	assert.True(t, loadgen.GetFabricOnly())
+	assert.True(t, loadgen.GetLocalOnly())
+	assert.True(t, loadgen.GetSkipLocalDisk())
+
+	assert.Equal(t, "lg2", cfg.GetFrontends()[2].GetName())
+	assert.Equal(t, "origin", cfg.GetFrontends()[2].GetSource())
+}
+
+func TestRenderConfigSkipsInvalidAnnotatedLoadgenFrontends(t *testing.T) {
+	dir := writeSource(t, `
+backends:
+  - name: origin
+    fake: {}
+caches:
+  - name: cache
+    source: origin
+frontends:
+  - name: existing
+    source: cache
+    http:
+      addr: "0.0.0.0:8080"
+`)
+
+	var logs bytes.Buffer
+
+	previousLogger := slog.Default()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{
+			storageLoadgenAnnotation: "existing;source=cache,missing-source;workers=1,valid;source=cache;workers=bad;workers=2;zipf_exponent=NaN;zipf_exponent=1.3;verify=maybe;verify=true;remote_only=maybe;remote_only=true;fabric_only=maybe;fabric_only=true;local_only=maybe;local_only=true;skip_local_disk=maybe;skip_local_disk=true,valid;source=origin",
+		},
+	})
+
+	require.Len(t, cfg.GetFrontends(), 2)
+	assert.Equal(t, "existing", cfg.GetFrontends()[0].GetName())
+	assert.Equal(t, "valid", cfg.GetFrontends()[1].GetName())
+	loadgen := cfg.GetFrontends()[1].GetLoadgen()
+	require.NotNil(t, loadgen)
+	assert.Equal(t, uint32(2), loadgen.GetWorkers())
+	assert.Equal(t, 1.3, loadgen.GetZipfExponent())
+	assert.True(t, loadgen.GetVerify())
+	assert.True(t, loadgen.GetRemoteOnly())
+	assert.True(t, loadgen.GetFabricOnly())
+	assert.True(t, loadgen.GetLocalOnly())
+	assert.True(t, loadgen.GetSkipLocalDisk())
+	assert.Contains(t, logs.String(), "frontend name is already declared")
+	assert.Contains(t, logs.String(), "without source")
+	assert.Contains(t, logs.String(), "invalid storage loadgen uint32 option")
+	assert.Contains(t, logs.String(), "invalid storage loadgen float option")
+	assert.Contains(t, logs.String(), "invalid storage loadgen bool option")
+	assert.Contains(t, logs.String(), "duplicate annotated storage loadgen frontend")
+}
+
+func TestRenderConfigRejectsAnnotatedLoadgenWithUnknownSource(t *testing.T) {
+	dir := writeSource(t, `
+backends:
+  - name: origin
+    fake: {}
+`)
+
+	_, err := RenderConfig(dir, renderState{
+		annotations: map[string]string{
+			storageLoadgenAnnotation: "lg;source=ghost",
+		},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `frontend "lg" references unknown source "ghost"`)
 }
 
 func TestWriteConfigAtomic(t *testing.T) {
