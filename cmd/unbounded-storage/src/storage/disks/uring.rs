@@ -450,6 +450,7 @@ fn engine_config_from(spec: &DiskSpec) -> EngineConfig {
     cfg.force_format = spec.force_format;
     cfg.bypass_admission = spec.bypass_admission;
     cfg.bypass_index_read = spec.bypass_index_read;
+    cfg.bypass_checksum = spec.bypass_checksum;
     cfg.disk_id = spec
         .path()
         .expect("disk path is validated at config load")
@@ -722,6 +723,7 @@ mod tests {
             force_format: false,
             bypass_admission: false,
             bypass_index_read: false,
+            bypass_checksum: false,
             config: Some(crate::config::schema::disk_spec::Config::File(
                 crate::config::schema::FileDiskConfig {
                     path: "/tmp/unbounded-storage-test-disk".to_string(),
@@ -748,6 +750,7 @@ mod tests {
             force_format: false,
             bypass_admission: false,
             bypass_index_read: false,
+            bypass_checksum: false,
             config: Some(crate::config::schema::disk_spec::Config::Block(
                 crate::config::schema::BlockDiskConfig {
                     numa: None,

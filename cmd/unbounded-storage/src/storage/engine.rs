@@ -101,6 +101,9 @@ pub struct EngineConfig {
     /// only: production reads must hit the on-disk leaf so corruption and
     /// snapshot semantics are preserved.
     pub bypass_index_read: bool,
+    /// When true, reads skip data checksum validation. This is benchmark
+    /// only: production reads must verify cached bytes before returning a hit.
+    pub bypass_checksum: bool,
     /// When true, [`BTreeIndex::open`] skips the LBA-order leaf
     /// scan on disks that have no valid meta page. Intended for
     /// benchmarking and bring-up against freshly wiped devices
@@ -136,6 +139,7 @@ impl Default for EngineConfig {
             btree_scratch_pages: 64,
             bypass_admission: false,
             bypass_index_read: false,
+            bypass_checksum: false,
             skip_recovery_scan_if_no_meta: false,
             force_format: false,
             disk_id: String::new(),
@@ -618,8 +622,9 @@ impl<B: BlockDevice> StorageEngine<B> {
             crate::metrics::Outcome::Ok,
         );
 
-        let cs = Xxh3Checksum::checksum_of(dst_buf);
-        if cs.0 != entry.data_checksum.0 {
+        if !self.cfg.bypass_checksum
+            && Xxh3Checksum::checksum_of(dst_buf).0 != entry.data_checksum.0
+        {
             self.metric(|m| {
                 m.misses += 1;
                 m.checksum_misses += 1;

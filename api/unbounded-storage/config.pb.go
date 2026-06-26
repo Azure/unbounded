@@ -1080,6 +1080,10 @@ type DiskSpec struct {
 	// where recovery/corruption validation has been deliberately traded for
 	// measuring the data-page path.
 	BypassIndexRead bool `protobuf:"varint,8,opt,name=bypass_index_read,json=bypassIndexRead,proto3" json:"bypass_index_read,omitempty"`
+	// Skip data checksum validation on reads. Intended only for benchmark
+	// devices where cache contents were just populated by the same daemon and
+	// the target is measuring the NVMe data path rather than CPU checksum cost.
+	BypassChecksum bool `protobuf:"varint,9,opt,name=bypass_checksum,json=bypassChecksum,proto3" json:"bypass_checksum,omitempty"`
 	// Types that are valid to be assigned to Config:
 	//
 	//	*DiskSpec_Block
@@ -1157,6 +1161,13 @@ func (x *DiskSpec) GetBypassAdmission() bool {
 func (x *DiskSpec) GetBypassIndexRead() bool {
 	if x != nil {
 		return x.BypassIndexRead
+	}
+	return false
+}
+
+func (x *DiskSpec) GetBypassChecksum() bool {
+	if x != nil {
+		return x.BypassChecksum
 	}
 	return false
 }
@@ -2179,7 +2190,7 @@ const file_config_proto_rawDesc = "" +
 	"\vnic_workers\x18\a \x01(\x04H\x01R\n" +
 	"nicWorkers\x88\x01\x01B\x10\n" +
 	"\x0e_serving_coresB\x0e\n" +
-	"\f_nic_workers\"\xb6\x03\n" +
+	"\f_nic_workers\"\xdf\x03\n" +
 	"\bDiskSpec\x12$\n" +
 	"\vqueue_depth\x18\x01 \x01(\rH\x01R\n" +
 	"queueDepth\x88\x01\x01\x12+\n" +
@@ -2187,7 +2198,8 @@ const file_config_proto_rawDesc = "" +
 	"\x12skip_recovery_scan\x18\x03 \x01(\bR\x10skipRecoveryScan\x12!\n" +
 	"\fforce_format\x18\x06 \x01(\bR\vforceFormat\x12)\n" +
 	"\x10bypass_admission\x18\a \x01(\bR\x0fbypassAdmission\x12*\n" +
-	"\x11bypass_index_read\x18\b \x01(\bR\x0fbypassIndexRead\x12A\n" +
+	"\x11bypass_index_read\x18\b \x01(\bR\x0fbypassIndexRead\x12'\n" +
+	"\x0fbypass_checksum\x18\t \x01(\bR\x0ebypassChecksum\x12A\n" +
 	"\x05block\x18\x04 \x01(\v2).unbounded.storage.config.BlockDiskConfigH\x00R\x05block\x12>\n" +
 	"\x04file\x18\x05 \x01(\v2(.unbounded.storage.config.FileDiskConfigH\x00R\x04fileB\b\n" +
 	"\x06configB\x0e\n" +

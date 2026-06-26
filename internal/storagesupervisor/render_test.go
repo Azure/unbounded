@@ -523,7 +523,7 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation: "/dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0;skip_recovery_scan=true;force_format=true;bypass_admission=true;bypass_index_read=true",
+			storageDisksAnnotation: "/dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0;skip_recovery_scan=true;force_format=true;bypass_admission=true;bypass_index_read=true;bypass_checksum=true",
 		},
 	})
 
@@ -541,6 +541,7 @@ version: 1
 	assert.True(t, disk.GetForceFormat())
 	assert.True(t, disk.GetBypassAdmission())
 	assert.True(t, disk.GetBypassIndexRead())
+	assert.True(t, disk.GetBypassChecksum())
 }
 
 func TestRenderConfigInjectsMultipleAnnotatedBlockDisks(t *testing.T) {
@@ -575,7 +576,7 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation: "/dev/nvme1n1;unknown=x;queue_depth=0;queue_depth=512;queue_depth=1024;page_size_bytes=bad;skip_recovery_scan=maybe;force_format=maybe;bypass_admission=maybe;bypass_index_read=maybe;numa=bad;empty=;=value;missing",
+			storageDisksAnnotation: "/dev/nvme1n1;unknown=x;queue_depth=0;queue_depth=512;queue_depth=1024;page_size_bytes=bad;skip_recovery_scan=maybe;force_format=maybe;bypass_admission=maybe;bypass_index_read=maybe;bypass_checksum=maybe;numa=bad;empty=;=value;missing",
 		},
 	})
 
@@ -590,6 +591,7 @@ version: 1
 	assert.False(t, disk.GetForceFormat())
 	assert.False(t, disk.GetBypassAdmission())
 	assert.False(t, disk.GetBypassIndexRead())
+	assert.False(t, disk.GetBypassChecksum())
 	assert.Contains(t, logs.String(), "ignoring unknown storage disk option")
 	assert.Contains(t, logs.String(), "ignoring duplicate storage disk option")
 }

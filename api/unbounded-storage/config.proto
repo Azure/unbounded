@@ -205,6 +205,11 @@ message DiskSpec {
   // measuring the data-page path.
   bool bypass_index_read = 8;
 
+  // Skip data checksum validation on reads. Intended only for benchmark
+  // devices where cache contents were just populated by the same daemon and
+  // the target is measuring the NVMe data path rather than CPU checksum cost.
+  bool bypass_checksum = 9;
+
   oneof config {
     BlockDiskConfig block = 4;
     FileDiskConfig file = 5;

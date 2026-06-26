@@ -213,6 +213,7 @@ mod tests {
             force_format: false,
             bypass_admission: false,
             bypass_index_read: false,
+            bypass_checksum: false,
             config: Some(disk_spec::Config::Block(BlockDiskConfig {
                 numa: None,
                 path: "/dev/nvme0n1".to_string(),

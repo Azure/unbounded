@@ -26,6 +26,7 @@ const (
 	diskOptionForceFormat      = "force_format"
 	diskOptionBypassAdmission  = "bypass_admission"
 	diskOptionBypassIndexRead  = "bypass_index_read"
+	diskOptionBypassChecksum   = "bypass_checksum"
 	diskOptionNuma             = "numa"
 )
 
@@ -223,6 +224,20 @@ func applyDiskOption(disk *storageconfig.DiskSpec, raw string, seen map[string]s
 		}
 
 		disk.BypassIndexRead = v
+		seen[key] = struct{}{}
+	case diskOptionBypassChecksum:
+		if isDuplicateDiskOption(seen, path, key) {
+			return
+		}
+
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			slog.Warn("ignoring invalid storage disk bool option", "path", path, "key", key, "value", value)
+
+			return
+		}
+
+		disk.BypassChecksum = v
 		seen[key] = struct{}{}
 	case diskOptionNuma:
 		if isDuplicateDiskOption(seen, path, key) {
