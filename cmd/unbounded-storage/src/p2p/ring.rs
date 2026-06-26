@@ -42,6 +42,14 @@ pub fn node_to_ring(node: NodeId) -> RingId {
     RingId(splitmix64(node.0))
 }
 
+/// Derive a stable internal node id from an operator-facing peer name.
+pub fn node_id_from_name(name: &str) -> NodeId {
+    let digest = blake3::hash(name.as_bytes());
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&digest.as_bytes()[..8]);
+    NodeId(u64::from_le_bytes(buf))
+}
+
 /// Forward distance on the ring from `from` to `to`. Returns 0 only
 /// when `from == to`; wraps modulo `2^64` otherwise.
 pub fn ring_distance(from: RingId, to: RingId) -> u64 {
@@ -125,6 +133,14 @@ mod tests {
         let b = node_to_ring(NodeId(1));
         assert_ne!(a, b);
         assert_eq!(a, node_to_ring(NodeId(0)));
+    }
+
+    #[test]
+    fn node_id_from_name_is_stable_and_distinguishes_names() {
+        let a = node_id_from_name("node-a");
+        let b = node_id_from_name("node-b");
+        assert_eq!(a, node_id_from_name("node-a"));
+        assert_ne!(a, b);
     }
 
     fn tags(parts: &[&str]) -> TopologyTags {
