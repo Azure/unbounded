@@ -39,7 +39,8 @@ type renderState struct {
 // in the YAML (discovered peers win on name collision). TCP rings also override
 // startup.fabric.tcp.addr with the node's own routable bind. The default disk
 // set is populated from the self node's storage disk annotations, or from a
-// default file-backed disk when no valid annotation disks are present.
+// default file-backed disk when no valid annotation disks are present. Loadgen
+// annotations append synthetic frontends for this node.
 func RenderConfig(sourceDir string, state renderState) ([]byte, error) {
 	cfg, err := loadSourceConfig(sourceDir)
 	if err != nil {
@@ -51,6 +52,12 @@ func RenderConfig(sourceDir string, state renderState) ([]byte, error) {
 	}
 
 	if err := applyDiskOverlay(cfg, state.annotations); err != nil {
+		return nil, err
+	}
+
+	applyLoadgenOverlay(cfg, state.annotations)
+
+	if err := validateRenderedConfig(cfg); err != nil {
 		return nil, err
 	}
 
@@ -98,10 +105,74 @@ func loadSourceConfig(sourceDir string) (*storageconfig.Config, error) {
 	return cfg, nil
 }
 
+func validateRenderedConfig(cfg *storageconfig.Config) error {
+	components := make(map[string]string)
+
+	backends, err := collectComponentNames(components, "backend", cfg.GetBackends(), func(spec *storageconfig.BackendSpec) string {
+		return spec.GetName()
+	})
+	if err != nil {
+		return err
+	}
+
+	caches, err := collectComponentNames(components, "cache", cfg.GetCaches(), func(spec *storageconfig.CacheSpec) string {
+		return spec.GetName()
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = collectComponentNames(components, "frontend", cfg.GetFrontends(), func(spec *storageconfig.FrontendSpec) string {
+		return spec.GetName()
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, cache := range cfg.GetCaches() {
+		if _, ok := backends[cache.GetSource()]; !ok {
+			return fmt.Errorf("validate rendered config: cache %q references unknown backend source %q", cache.GetName(), cache.GetSource())
+		}
+	}
+
+	for _, frontend := range cfg.GetFrontends() {
+		if _, ok := backends[frontend.GetSource()]; ok {
+			continue
+		}
+
+		if _, ok := caches[frontend.GetSource()]; ok {
+			continue
+		}
+
+		return fmt.Errorf("validate rendered config: frontend %q references unknown source %q", frontend.GetName(), frontend.GetSource())
+	}
+
+	return nil
+}
+
+func collectComponentNames[T any](components map[string]string, kind string, specs []T, nameOf func(T) string) (map[string]struct{}, error) {
+	names := make(map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		name := nameOf(spec)
+		if name == "" {
+			return nil, fmt.Errorf("validate rendered config: %s name must not be empty", kind)
+		}
+
+		if existingKind, exists := components[name]; exists {
+			return nil, fmt.Errorf("validate rendered config: duplicate component name %q while adding %s; already used by %s", name, kind, existingKind)
+		}
+
+		components[name] = kind
+		names[name] = struct{}{}
+	}
+
+	return names, nil
+}
+
 // applyRing overlays the per-node ring state onto a Config parsed from the
 // ConfigMap YAML. It injects this node's self peer name, merges the discovered
 // peer set with any declared peers, and rebinds the TCP fabric address to the
-// node's own routable address.
+// node's own routable address when the ring includes a TCP selfListenAddr.
 func applyRing(cfg *storageconfig.Config, ring ringState) {
 	// Preserve YAML-declared routing knobs (fingers_per_node, routing_plan);
 	// only stamp in the locally computed self name and peer roster.
