@@ -545,7 +545,9 @@ type CacheSpec struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// Backend source used for miss fills. Cache name is the only logical keyspace prefix.
-	Source        string `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
+	Source string `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
+	// Higher priority cache pages are evicted after lower priority pages. Defaults to 0.
+	Priority      int32 `protobuf:"varint,3,opt,name=priority,proto3" json:"priority,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -592,6 +594,13 @@ func (x *CacheSpec) GetSource() string {
 		return x.Source
 	}
 	return ""
+}
+
+func (x *CacheSpec) GetPriority() int32 {
+	if x != nil {
+		return x.Priority
+	}
+	return 0
 }
 
 type StartupCfg struct {
@@ -2333,10 +2342,11 @@ const file_config_proto_rawDesc = "" +
 	"\x04addr\x18\x01 \x01(\tR\x04addr\":\n" +
 	"\x0eRdmaPeerConfig\x12\x12\n" +
 	"\x04addr\x18\x01 \x01(\tR\x04addr\x12\x14\n" +
-	"\x05addrs\x18\x02 \x03(\tR\x05addrs\"7\n" +
+	"\x05addrs\x18\x02 \x03(\tR\x05addrs\"S\n" +
 	"\tCacheSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
-	"\x06source\x18\x02 \x01(\tR\x06source\"\x89\x02\n" +
+	"\x06source\x18\x02 \x01(\tR\x06source\x12\x1a\n" +
+	"\bpriority\x18\x03 \x01(\x05R\bpriority\"\x89\x02\n" +
 	"\n" +
 	"StartupCfg\x12;\n" +
 	"\x06memory\x18\x01 \x01(\v2#.unbounded.storage.config.MemoryCfgR\x06memory\x12;\n" +

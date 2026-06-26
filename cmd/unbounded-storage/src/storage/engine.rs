@@ -440,11 +440,11 @@ impl<B: BlockDevice> StorageEngine<B> {
             // references them. Re-admit so they remain tracked
             // and are reconsidered on a later sweep.
             let mut victims: Vec<Lba> = Vec::with_capacity(candidates.len());
-            for lba in candidates {
-                if self.refcount.pin_count(lba.0).unwrap_or(0) == 0 {
-                    victims.push(lba);
+            for candidate in candidates {
+                if self.refcount.pin_count(candidate.lba.0).unwrap_or(0) == 0 {
+                    victims.push(candidate.lba);
                 } else {
-                    self.lru.admit(lba);
+                    self.lru.admit(candidate.lba, candidate.priority);
                 }
             }
             if victims.is_empty() {
@@ -546,7 +546,10 @@ impl<B: BlockDevice> bufferpool::BlockStore for StorageEngine<B> {
         // SAFETY: see register_pages contract.
         let src_buf: *const [u8] = unsafe { self.slice_from_ref(page) };
         // SAFETY: see comment above.
-        unsafe { self.write_page_from(req.key(), stripe_off, src_buf).await }
+        unsafe {
+            self.write_page_from_with_priority(req.key(), stripe_off, src_buf, 0)
+                .await
+        }
     }
 }
 
@@ -664,6 +667,23 @@ impl<B: BlockDevice> StorageEngine<B> {
         stripe_off: u64,
         src: *const [u8],
     ) -> Result<(), bufferpool::Error> {
+        unsafe {
+            self.write_page_from_with_priority(key, stripe_off, src, 0)
+                .await
+        }
+    }
+
+    /// Write the contents of `src` to `(key, stripe_off)` and record
+    /// the page's cache priority for eviction ordering.
+    ///
+    /// SAFETY: same contract as [`Self::write_page_from`].
+    pub async unsafe fn write_page_from_with_priority(
+        &self,
+        key: StripeKey,
+        stripe_off: u64,
+        src: *const [u8],
+        priority: i32,
+    ) -> Result<(), bufferpool::Error> {
         let pk = Self::page_key(&key, stripe_off, self.cfg.page_size_bytes);
 
         if !self.cfg.bypass_admission && !self.admission.should_admit(&pk) {
@@ -779,7 +799,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             let mut rev = self.reverse.lock().unwrap();
             rev.insert(lba.0, (pk, src_buf.len() as u32));
         }
-        self.lru.admit(lba);
+        self.lru.admit(lba, priority);
         self.metric(|m| m.admitted += 1);
         leader.publish(entry);
 

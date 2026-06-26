@@ -114,6 +114,8 @@ message CacheSpec {
   string name = 1;
   // Backend source used for miss fills. Cache name is the only logical keyspace prefix.
   string source = 2;
+  // Higher priority cache pages are evicted after lower priority pages. Defaults to 0.
+  int32 priority = 3;
 }
 
 message StartupCfg {

@@ -71,6 +71,10 @@ pub struct Workload {
     /// must convert this into a miss; we never want a `ReadHit`
     /// that returns corrupted bytes.
     pub read_corrupt_rate: u32,
+    /// Cache priorities assigned to writes. Priorities only affect
+    /// eviction order; they should not change admission, allocation,
+    /// or read correctness.
+    pub priorities: Vec<i32>,
     /// Distinct stripe keys the workload may reference.
     pub key_count: u8,
     /// Distinct page offsets within each stripe.
@@ -101,6 +105,7 @@ pub enum Op {
         key_idx: u8,
         off_idx: u8,
         payload_seed: u8,
+        priority_idx: u8,
     },
     Read {
         key_idx: u8,
@@ -132,6 +137,14 @@ impl Workload {
         }
         out
     }
+
+    pub fn priority(&self, idx: u8) -> i32 {
+        if self.priorities.is_empty() {
+            0
+        } else {
+            self.priorities[idx as usize % self.priorities.len()]
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +171,10 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
         9 => Just(0u32),
         1 => 1u32..=20,
     ];
+    let priorities = prop_oneof![
+        3 => Just(vec![0]),
+        2 => vec(-3i32..=3, 1..=4),
+    ];
     let key_count = 1u8..=3;
     let offset_count = 1u8..=3;
     // Two clients is the minimum that can produce in-flight
@@ -183,6 +200,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
         max_io_delay,
         io_fault_rate,
         read_corrupt_rate,
+        priorities,
         key_count,
         offset_count,
         clients,
@@ -195,6 +213,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
                 max_io_delay,
                 io_fault_rate,
                 read_corrupt_rate,
+                priorities,
                 key_count,
                 offset_count,
                 clients,
@@ -208,6 +227,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
                     max_io_delay,
                     io_fault_rate,
                     read_corrupt_rate,
+                    priorities,
                     key_count,
                     offset_count,
                     clients,
@@ -259,8 +279,14 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     // requires a second touch before anything lands; a read-heavy
     // mix would barely exercise the data path.
     prop_oneof![
-        6 => (any::<u8>(), any::<u8>(), any::<u8>())
-            .prop_map(|(k, o, s)| Op::Write { key_idx: k, off_idx: o, payload_seed: s }),
+        6 => (any::<u8>(), any::<u8>(), any::<u8>(), any::<u8>()).prop_map(|(k, o, s, p)| {
+            Op::Write {
+                key_idx: k,
+                off_idx: o,
+                payload_seed: s,
+                priority_idx: p,
+            }
+        }),
         4 => (any::<u8>(), any::<u8>())
             .prop_map(|(k, o)| Op::Read { key_idx: k, off_idx: o }),
     ]
@@ -675,11 +701,13 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                         key_idx,
                         off_idx,
                         payload_seed,
+                        priority_idx,
                     } => {
                         let key = w.key(*key_idx);
                         let offset = w.offset(*off_idx);
                         let bytes = w.payload(*key_idx, *off_idx, *payload_seed);
                         let byte_len = bytes.len();
+                        let priority = w.priority(*priority_idx);
                         // SAFETY: each op owns a unique pool slot,
                         // so no other task writes here concurrently.
                         // We always wipe the full slot first so any
@@ -694,13 +722,18 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                             std::ptr::write_bytes(p, 0, page_size);
                             std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, byte_len);
                         }
-                        let page = PageRef {
-                            page_idx: pool_slot as u32,
-                            offset: 0,
-                            len: byte_len as u32,
-                        };
                         oracle.record_write(key, offset, bytes);
-                        match local.write_page(&key, offset, page).await {
+                        let slice = std::ptr::slice_from_raw_parts(
+                            (pool_base_v as *const u8).wrapping_add(pool_slot * page_size),
+                            byte_len,
+                        );
+                        // SAFETY: each write op owns a unique initialized pool slot for the
+                        // duration of this await, and `slice` covers exactly `byte_len` bytes.
+                        match unsafe {
+                            local
+                                .write_page_from_with_priority(key, offset, slice, priority)
+                                .await
+                        } {
                             Ok(()) => outcomes.borrow_mut().push(Outcome::WriteOk),
                             Err(e) => outcomes
                                 .borrow_mut()

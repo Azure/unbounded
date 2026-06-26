@@ -623,7 +623,27 @@ addr = "0.0.0.0:9000"
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(c.caches[0].name, "cache");
+        assert_eq!(c.caches[0].priority, 0);
         assert_eq!(c.frontends[0].source, "cache");
+    }
+
+    #[test]
+    fn cache_priority_round_trips() {
+        let s = r#"
+[[caches]]
+name = "high"
+source = "origin"
+priority = 7
+
+[[caches]]
+name = "low"
+source = "origin"
+priority = -3
+"#;
+        let mut c: Config = toml::from_str(s).unwrap();
+        c.apply_defaults();
+        assert_eq!(c.caches[0].priority, 7);
+        assert_eq!(c.caches[1].priority, -3);
     }
 
     #[test]

@@ -117,6 +117,21 @@ impl PageChannel {
         stripe_off: u64,
         src: *const [u8],
     ) -> Result<(), Error> {
+        self.write_page_with_priority(key, stripe_off, src, 0).await
+    }
+
+    /// Write `src` to `(key, stripe_off)` and attach the cache
+    /// priority used by eviction.
+    ///
+    /// SAFETY: `src` must point to a readable region that lives
+    /// until the returned future resolves and is pinned for DMA.
+    pub async fn write_page_with_priority(
+        &self,
+        key: StripeKey,
+        stripe_off: u64,
+        src: *const [u8],
+        priority: i32,
+    ) -> Result<(), Error> {
         let len = src.len();
         let ptr = NonNull::new(src.cast::<u8>().cast_mut()).ok_or(Error::Io(libc::EINVAL))?;
         let reply = ReplySlot::new();
@@ -126,6 +141,7 @@ impl PageChannel {
                 stripe_off,
                 src: SendPtr(ptr),
                 len,
+                priority,
                 reply: reply.clone(),
             })
             .map_err(|_| Error::Io(libc::EPIPE))?;
@@ -198,6 +214,7 @@ pub enum PageCommand {
         stripe_off: u64,
         src: SendPtr,
         len: usize,
+        priority: i32,
         reply: Arc<ReplySlot<()>>,
     },
     RegisterBuffer {
@@ -276,6 +293,7 @@ impl<B: BlockDevice + 'static> PageService<B> {
                     stripe_off,
                     src,
                     len,
+                    priority,
                     reply,
                 }) => {
                     let engine = self.engine.clone();
@@ -285,7 +303,11 @@ impl<B: BlockDevice + 'static> PageService<B> {
                             // service treats this region as immutable.
                             let slice =
                                 std::ptr::slice_from_raw_parts(src.0.as_ptr().cast_const(), len);
-                            unsafe { engine.write_page_from(key, stripe_off, slice).await }
+                            unsafe {
+                                engine
+                                    .write_page_from_with_priority(key, stripe_off, slice, priority)
+                                    .await
+                            }
                         });
                     self.in_flight.push(Inflight::Write { fut, reply });
                 }

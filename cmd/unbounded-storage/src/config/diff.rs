@@ -211,6 +211,7 @@ mod tests {
         b.caches.push(CacheSpec {
             name: "c".to_string(),
             source: "n".to_string(),
+            priority: 0,
         });
         let d = ConfigDiff::between(&a, &b);
         assert!(d.caches_changed);

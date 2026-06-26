@@ -3,11 +3,12 @@
 
 //! SIEVE eviction policy.
 //!
-//! Per-disk cache pages are tracked in a single FIFO queue. Each
-//! page's "referenced" bit lives on the shared
+//! Per-disk cache pages are tracked in FIFO queues bucketed by cache
+//! priority. Each page's "referenced" bit lives on the shared
 //! [`RefcountTable`](crate::storage::refcount::RefcountTable),
 //! colocated with its pin count. On every access the engine
-//! sets the bit; the SIEVE hand sweeps from the tail and:
+//! sets the bit; the SIEVE hand sweeps from lower-priority buckets
+//! first and from each bucket's tail:
 //!
 //! - if the page is pinned, skip it without touching the bit
 //!   (it's in flight; future eviction passes will revisit);
@@ -16,10 +17,12 @@
 //! - otherwise evict the page.
 //!
 //! Compared to a textbook clock, SIEVE only rotates entries
-//! that the hand visits, which keeps the queue's tail
-//! biased toward genuinely cold pages.
+//! that the hand visits, which keeps each bucket's tail
+//! biased toward genuinely cold pages. Priority does not add an LBA
+//! index on the write/allocation path; it is recorded only with the
+//! resident LRU entry and consulted during eviction.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::storage::refcount::RefcountTable;
@@ -27,15 +30,27 @@ use crate::storage::types::Lba;
 
 pub struct SieveLru {
     capacity: u64,
-    queue: Mutex<VecDeque<Lba>>,
+    inner: Mutex<Inner>,
     refcount: Arc<RefcountTable>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvictionCandidate {
+    pub lba: Lba,
+    pub priority: i32,
+}
+
+#[derive(Default)]
+struct Inner {
+    buckets: BTreeMap<i32, VecDeque<Lba>>,
+    len: usize,
 }
 
 impl SieveLru {
     pub fn new(capacity: u64, refcount: Arc<RefcountTable>) -> Self {
         Self {
             capacity,
-            queue: Mutex::new(VecDeque::new()),
+            inner: Mutex::new(Inner::default()),
             refcount,
         }
     }
@@ -45,7 +60,7 @@ impl SieveLru {
     }
 
     pub fn len(&self) -> usize {
-        self.queue.lock().unwrap().len()
+        self.inner.lock().unwrap().len
     }
 
     pub fn is_empty(&self) -> bool {
@@ -61,8 +76,10 @@ impl SieveLru {
         len / cap >= fraction
     }
 
-    pub fn admit(&self, lba: Lba) {
-        self.queue.lock().unwrap().push_front(lba);
+    pub fn admit(&self, lba: Lba, priority: i32) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.buckets.entry(priority).or_default().push_front(lba);
+        inner.len += 1;
     }
 
     pub fn touch(&self, lba: Lba) {
@@ -70,29 +87,54 @@ impl SieveLru {
     }
 
     /// Sweep the hand looking for up to `target` evictable
-    /// pages. Pinned pages are skipped (left in place); pages
-    /// whose referenced bit is set get demoted (bit cleared,
-    /// rotated to the head); cold pages are returned as
-    /// victims. The sweep gives up after seeing twice the
-    /// queue's length to avoid an unbounded loop when every
-    /// resident page is pinned.
-    pub fn sweep(&self, target: usize) -> Vec<Lba> {
+    /// pages. Lower-priority buckets are searched before higher-
+    /// priority buckets. Pinned pages are skipped (left in place);
+    /// pages whose referenced bit is set get demoted (bit cleared,
+    /// rotated to the head); cold pages are returned as victims.
+    /// The sweep gives up after seeing twice the resident length to
+    /// avoid an unbounded loop when every resident page is pinned.
+    pub fn sweep(&self, target: usize) -> Vec<EvictionCandidate> {
         let mut victims = Vec::with_capacity(target.min(64));
-        let mut q = self.queue.lock().unwrap();
-        let mut budget = q.len() * 2;
-        while victims.len() < target && budget > 0 {
-            budget -= 1;
-            let Some(lba) = q.pop_back() else { break };
-            if self.refcount.is_pinned(lba.0).unwrap_or(false) {
-                q.push_front(lba);
-                continue;
+        let mut inner = self.inner.lock().unwrap();
+        let mut budget = inner.len * 2;
+        while victims.len() < target && budget > 0 && inner.len > 0 {
+            let priorities: Vec<i32> = inner.buckets.keys().copied().collect();
+            let mut made_progress = false;
+            for priority in priorities {
+                if victims.len() >= target || budget == 0 {
+                    break;
+                }
+                let bucket_len = inner.buckets.get(&priority).map_or(0, VecDeque::len);
+                for _ in 0..bucket_len {
+                    if victims.len() >= target || budget == 0 {
+                        break;
+                    }
+                    let Some(lba) = inner
+                        .buckets
+                        .get_mut(&priority)
+                        .and_then(VecDeque::pop_back)
+                    else {
+                        break;
+                    };
+                    budget -= 1;
+                    made_progress = true;
+                    if self.refcount.is_pinned(lba.0).unwrap_or(false) {
+                        inner.buckets.entry(priority).or_default().push_front(lba);
+                    } else if self.refcount.is_referenced(lba.0).unwrap_or(false) {
+                        let _ = self.refcount.clear_referenced(lba.0);
+                        inner.buckets.entry(priority).or_default().push_front(lba);
+                    } else {
+                        inner.len -= 1;
+                        victims.push(EvictionCandidate { lba, priority });
+                    }
+                    if inner.buckets.get(&priority).is_some_and(VecDeque::is_empty) {
+                        inner.buckets.remove(&priority);
+                    }
+                }
             }
-            if self.refcount.is_referenced(lba.0).unwrap_or(false) {
-                let _ = self.refcount.clear_referenced(lba.0);
-                q.push_front(lba);
-                continue;
+            if !made_progress {
+                break;
             }
-            victims.push(lba);
         }
         victims
     }
@@ -101,9 +143,26 @@ impl SieveLru {
     /// external invalidation removes a page (e.g., the engine
     /// observed bitrot).
     pub fn forget(&self, lba: Lba) {
-        let mut q = self.queue.lock().unwrap();
-        if let Some(pos) = q.iter().position(|&x| x == lba) {
-            q.remove(pos);
+        let mut inner = self.inner.lock().unwrap();
+        let priorities: Vec<i32> = inner.buckets.keys().copied().collect();
+        for priority in priorities {
+            let removed = if let Some(q) = inner.buckets.get_mut(&priority) {
+                if let Some(pos) = q.iter().position(|&x| x == lba) {
+                    q.remove(pos);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if removed {
+                inner.len -= 1;
+                if inner.buckets.get(&priority).is_some_and(VecDeque::is_empty) {
+                    inner.buckets.remove(&priority);
+                }
+                break;
+            }
         }
     }
 }
@@ -121,10 +180,10 @@ mod tests {
     fn admit_then_sweep_returns_cold_pages_in_lru_order() {
         let l = lru(16);
         for i in 2..6 {
-            l.admit(Lba(i));
+            l.admit(Lba(i), 0);
         }
         let v = l.sweep(2);
-        assert_eq!(v, vec![Lba(2), Lba(3)]);
+        assert_eq!(lbas(&v), vec![Lba(2), Lba(3)]);
         assert_eq!(l.len(), 2);
     }
 
@@ -132,15 +191,15 @@ mod tests {
     fn touched_pages_survive_first_sweep() {
         let l = lru(16);
         for i in 2..6 {
-            l.admit(Lba(i));
+            l.admit(Lba(i), 0);
         }
         l.touch(Lba(2));
         // Hand reaches Lba(2) first; bit set => clear+rotate.
         let v = l.sweep(1);
-        assert_eq!(v, vec![Lba(3)]);
+        assert_eq!(lbas(&v), vec![Lba(3)]);
         // Sweep again: now Lba(2) has bit cleared and gets evicted next.
         let v = l.sweep(1);
-        assert_eq!(v, vec![Lba(4)]);
+        assert_eq!(lbas(&v), vec![Lba(4)]);
     }
 
     #[test]
@@ -148,11 +207,11 @@ mod tests {
         let l = lru(16);
         let rc = l.refcount.clone();
         for i in 2..6 {
-            l.admit(Lba(i));
+            l.admit(Lba(i), 0);
         }
         let _g = rc.pin(2).unwrap();
         let v = l.sweep(3);
-        assert_eq!(v, vec![Lba(3), Lba(4), Lba(5)]);
+        assert_eq!(lbas(&v), vec![Lba(3), Lba(4), Lba(5)]);
         // Lba(2) is still in the queue (skipped, re-enqueued).
         assert_eq!(l.len(), 1);
     }
@@ -162,7 +221,7 @@ mod tests {
         let l = lru(10);
         assert!(!l.watermark_exceeded(0.9));
         for i in 2..11 {
-            l.admit(Lba(i));
+            l.admit(Lba(i), 0);
         }
         assert!(l.watermark_exceeded(0.9));
     }
@@ -170,10 +229,45 @@ mod tests {
     #[test]
     fn forget_removes_lba() {
         let l = lru(8);
-        l.admit(Lba(2));
-        l.admit(Lba(3));
+        l.admit(Lba(2), 0);
+        l.admit(Lba(3), 0);
         l.forget(Lba(2));
         assert_eq!(l.len(), 1);
-        assert_eq!(l.sweep(2), vec![Lba(3)]);
+        assert_eq!(lbas(&l.sweep(2)), vec![Lba(3)]);
+    }
+
+    #[test]
+    fn higher_priority_pages_are_evicted_last() {
+        let l = lru(16);
+        l.admit(Lba(2), 10);
+        l.admit(Lba(3), -1);
+        l.admit(Lba(4), 0);
+        l.admit(Lba(5), -1);
+
+        let v = l.sweep(3);
+        assert_eq!(lbas(&v), vec![Lba(3), Lba(5), Lba(4)]);
+        assert_eq!(
+            v.iter().map(|c| c.priority).collect::<Vec<_>>(),
+            vec![-1, -1, 0]
+        );
+        assert_eq!(l.len(), 1);
+        assert_eq!(lbas(&l.sweep(1)), vec![Lba(2)]);
+    }
+
+    #[test]
+    fn sweep_falls_through_when_lower_priority_pages_are_not_cold() {
+        let l = lru(16);
+        let rc = l.refcount.clone();
+        l.admit(Lba(2), -10);
+        l.admit(Lba(3), 5);
+        let _g = rc.pin(2).unwrap();
+
+        let v = l.sweep(1);
+        assert_eq!(lbas(&v), vec![Lba(3)]);
+        assert_eq!(l.len(), 1);
+    }
+
+    fn lbas(victims: &[EvictionCandidate]) -> Vec<Lba> {
+        victims.iter().map(|candidate| candidate.lba).collect()
     }
 }

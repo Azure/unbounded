@@ -1199,10 +1199,14 @@ fn reconcile_cache_disks(
     cache_directories: &CacheDirectorySet,
     projection: &config::RuntimeGraph,
 ) {
-    let mut cache_ids: Vec<String> = projection.caches.keys().cloned().collect();
-    cache_ids.sort();
+    let mut caches: Vec<(String, i32)> = projection
+        .caches
+        .values()
+        .map(|cache| (cache.id.clone(), cache.priority))
+        .collect();
+    caches.sort_by(|a, b| a.0.cmp(&b.0));
     disk_registry.reconcile_ids([SHARED_DISK_REGISTRY_ID.to_string()]);
-    cache_directories.reconcile(cache_ids.iter().cloned());
+    cache_directories.reconcile(caches.iter().cloned());
 
     let disks = config::runtime_disks(projection);
     let report = disk_registry.reconcile_cache(SHARED_DISK_REGISTRY_ID, &disks);
@@ -1217,7 +1221,7 @@ fn reconcile_cache_disks(
     }
 
     let channels = disk_registry.channels_snapshot(SHARED_DISK_REGISTRY_ID);
-    for cache_id in cache_ids {
+    for (cache_id, _) in caches {
         cache_directories.apply_channels(&cache_id, channels.clone());
     }
 }

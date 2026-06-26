@@ -178,10 +178,27 @@ impl<B: BlockDevice + 'static> LocalStorage<B> {
         stripe_off: u64,
         src: *const [u8],
     ) -> Result<(), Error> {
+        unsafe {
+            self.write_page_from_with_priority(key, stripe_off, src, 0)
+                .await
+        }
+    }
+
+    /// Route a raw-slice write to the disk that owns the page and
+    /// record the page's cache priority for eviction ordering.
+    ///
+    /// SAFETY: see [`StorageEngine::write_page_from`].
+    pub async unsafe fn write_page_from_with_priority(
+        &self,
+        key: StripeKey,
+        stripe_off: u64,
+        src: *const [u8],
+        priority: i32,
+    ) -> Result<(), Error> {
         let idx = self.disk_for(key, stripe_off);
         unsafe {
             self.engines[idx]
-                .write_page_from(key, stripe_off, src)
+                .write_page_from_with_priority(key, stripe_off, src, priority)
                 .await
         }
     }

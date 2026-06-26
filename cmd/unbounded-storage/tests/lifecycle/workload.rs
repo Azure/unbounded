@@ -869,6 +869,7 @@ fn config_for_generation(version: u64, disks: Vec<DiskSpec>) -> Config {
     cfg.caches = vec![CacheSpec {
         name: "cache-0".to_string(),
         source: "backend-0".to_string(),
+        priority: 0,
     }];
     cfg.disks = disks;
     cfg.frontends = frontend_specs(0, 1);

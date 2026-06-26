@@ -37,7 +37,13 @@ proptest! {
         let oracle = Oracle::new();
         for c in &w.clients {
             for op in &c.ops {
-                if let Op::Write { key_idx, off_idx, payload_seed } = op {
+                if let Op::Write {
+                    key_idx,
+                    off_idx,
+                    payload_seed,
+                    ..
+                } = op
+                {
                     oracle.record_write(
                         w.key(*key_idx),
                         w.offset(*off_idx),
@@ -86,7 +92,13 @@ proptest! {
         let oracle = Oracle::new();
         for c in &w.clients {
             for op in &c.ops {
-                if let Op::Write { key_idx, off_idx, payload_seed } = op {
+                if let Op::Write {
+                    key_idx,
+                    off_idx,
+                    payload_seed,
+                    ..
+                } = op
+                {
                     oracle.record_write(
                         w.key(*key_idx),
                         w.offset(*off_idx),
@@ -115,7 +127,13 @@ proptest! {
         let oracle = Oracle::new();
         for c in &w.clients {
             for op in &c.ops {
-                if let Op::Write { key_idx, off_idx, payload_seed } = op {
+                if let Op::Write {
+                    key_idx,
+                    off_idx,
+                    payload_seed,
+                    ..
+                } = op
+                {
                     oracle.record_write(
                         w.key(*key_idx),
                         w.offset(*off_idx),
@@ -264,7 +282,13 @@ proptest! {
         let oracle = Oracle::new();
         for c in &w.clients {
             for op in &c.ops {
-                if let Op::Write { key_idx, off_idx, payload_seed } = op {
+                if let Op::Write {
+                    key_idx,
+                    off_idx,
+                    payload_seed,
+                    ..
+                } = op
+                {
                     oracle.record_write(
                         w.key(*key_idx),
                         w.offset(*off_idx),
@@ -538,6 +562,7 @@ fn smoke() {
         max_io_delay: 2,
         io_fault_rate: 0,
         read_corrupt_rate: 0,
+        priorities: vec![0],
         key_count: 2,
         offset_count: 2,
         clients: vec![
@@ -547,11 +572,13 @@ fn smoke() {
                         key_idx: 0,
                         off_idx: 0,
                         payload_seed: 1,
+                        priority_idx: 0,
                     },
                     Op::Write {
                         key_idx: 0,
                         off_idx: 0,
                         payload_seed: 1,
+                        priority_idx: 0,
                     },
                     Op::Read {
                         key_idx: 0,
@@ -565,11 +592,13 @@ fn smoke() {
                         key_idx: 1,
                         off_idx: 1,
                         payload_seed: 9,
+                        priority_idx: 0,
                     },
                     Op::Write {
                         key_idx: 1,
                         off_idx: 1,
                         payload_seed: 9,
+                        priority_idx: 0,
                     },
                     Op::Read {
                         key_idx: 1,
@@ -593,6 +622,62 @@ fn smoke() {
         hits >= 1,
         "expected at least one hit after double-write: {:?}",
         report.outcomes
+    );
+}
+
+/// Priority smoke: varied-priority writes drive eviction under
+/// concurrent clients. Completion is the liveness assertion: any
+/// priority-bucket lock inversion, unbounded sweep, or mutator
+/// contention shows up as `RunError::Deadlock` or budget exhaustion.
+#[test]
+fn smoke_priority_eviction_contention() {
+    let mut clients = Vec::new();
+    let key_count = 96u8;
+    for cid in 0..6u8 {
+        let mut ops = Vec::new();
+        for k in (cid..key_count).step_by(6) {
+            let priority_idx = k % 3;
+            ops.push(Op::Write {
+                key_idx: k,
+                off_idx: 0,
+                payload_seed: k.wrapping_mul(3),
+                priority_idx,
+            });
+            ops.push(Op::Write {
+                key_idx: k,
+                off_idx: 0,
+                payload_seed: k.wrapping_mul(3),
+                priority_idx,
+            });
+        }
+        clients.push(ClientSpec { ops });
+    }
+
+    let w = Workload {
+        page_size: 4096,
+        device_pages: 40,
+        max_io_delay: 8,
+        io_fault_rate: 0,
+        read_corrupt_rate: 0,
+        priorities: vec![-5, 0, 5],
+        key_count,
+        offset_count: 1,
+        clients,
+        restart_after: false,
+        num_disks: 1,
+    };
+    let report = run_workload(0x51EED, w).expect("priority eviction smoke run");
+    assert!(
+        report.evictions > 0,
+        "priority smoke did not exercise eviction: admitted={}, resident_pages={}, device_pages={}",
+        report.admitted,
+        report.resident_pages,
+        report.device_pages,
+    );
+    assert_eq!(
+        report.mutator_pending_per_disk,
+        vec![0],
+        "mutator backlog remained after priority eviction smoke"
     );
 }
 
@@ -627,11 +712,13 @@ fn smoke_concurrent_reads_overlap() {
             key_idx: k,
             off_idx: 0,
             payload_seed: k,
+            priority_idx: 0,
         });
         ops.push(Op::Write {
             key_idx: k,
             off_idx: 0,
             payload_seed: k,
+            priority_idx: 0,
         });
         for _ in 0..16 {
             ops.push(Op::Read {
@@ -647,6 +734,7 @@ fn smoke_concurrent_reads_overlap() {
         max_io_delay: 32,
         io_fault_rate: 0,
         read_corrupt_rate: 0,
+        priorities: vec![0],
         key_count,
         offset_count: 1,
         clients,

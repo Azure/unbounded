@@ -33,6 +33,7 @@ pub struct RuntimeMesh {
 pub struct RuntimeCache {
     pub id: String,
     pub backend_id: String,
+    pub priority: i32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -160,6 +161,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
                 RuntimeCache {
                     id: cache.name.clone(),
                     backend_id: cache.source.clone(),
+                    priority: cache.priority,
                 },
             )
         })
@@ -276,6 +278,7 @@ mod tests {
         CacheSpec {
             name: id.to_string(),
             source: source.to_string(),
+            priority: 0,
         }
     }
 
@@ -324,6 +327,21 @@ mod tests {
         assert_binding(&graph, "direct", "b", None, true);
         assert_binding(&graph, "cache", "b", Some("c-backend"), false);
         assert_eq!(graph.caches.len(), 1);
+        assert_eq!(graph.caches["c-backend"].priority, 0);
+    }
+
+    #[test]
+    fn runtime_projection_carries_cache_priority() {
+        let mut cfg = Config::default();
+        cfg.backends.push(backend("b"));
+        let mut c = cache("c", "b");
+        c.priority = 42;
+        cfg.caches.push(c);
+
+        let graph = runtime_projection(&cfg).unwrap();
+
+        assert_eq!(graph.caches["c"].backend_id, "b");
+        assert_eq!(graph.caches["c"].priority, 42);
     }
 
     #[test]

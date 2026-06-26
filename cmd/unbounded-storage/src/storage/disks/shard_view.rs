@@ -26,7 +26,7 @@
 //! reads and writes return [`Error::Transport`] - the data path is
 //! offline by definition.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -46,7 +46,13 @@ pub struct LiveShardLocalStore {
 
 /// Hot-swappable set of cache directories keyed by cache id.
 pub struct CacheDirectorySet {
-    directories: Mutex<HashMap<String, Arc<DiskChannelDirectory>>>,
+    directories: Mutex<HashMap<String, CacheDirectoryEntry>>,
+}
+
+#[derive(Clone)]
+struct CacheDirectoryEntry {
+    directory: Arc<DiskChannelDirectory>,
+    priority: i32,
 }
 
 /// Chain-aware `BlockStore` dispatcher. Requests without a cache id
@@ -104,27 +110,52 @@ impl CacheDirectorySet {
         })
     }
 
-    pub fn reconcile<I>(&self, cache_ids: I)
+    pub fn reconcile<I, S>(&self, caches: I)
     where
         I: IntoIterator,
-        I::Item: Into<String>,
+        I::Item: Into<(S, i32)>,
+        S: Into<String>,
     {
-        let desired: HashSet<String> = cache_ids.into_iter().map(Into::into).collect();
+        let desired: HashMap<String, i32> = caches
+            .into_iter()
+            .map(|cache| {
+                let (id, priority) = cache.into();
+                (id.into(), priority)
+            })
+            .collect();
         let mut guard = self.directories.lock().unwrap();
-        for directory in guard
+        for entry in guard
             .iter()
-            .filter_map(|(id, directory)| (!desired.contains(id)).then_some(directory))
+            .filter_map(|(id, entry)| (!desired.contains_key(id)).then_some(entry))
         {
-            directory.apply_channels(Vec::new());
+            entry.directory.apply_channels(Vec::new());
         }
-        guard.retain(|id, _| desired.contains(id));
-        for id in desired {
-            guard.entry(id).or_insert_with(DiskChannelDirectory::new);
+        guard.retain(|id, _| desired.contains_key(id));
+        for (id, priority) in desired {
+            guard
+                .entry(id)
+                .and_modify(|entry| entry.priority = priority)
+                .or_insert_with(|| CacheDirectoryEntry {
+                    directory: DiskChannelDirectory::new(),
+                    priority,
+                });
         }
     }
 
     pub fn get(&self, cache_id: &str) -> Option<Arc<DiskChannelDirectory>> {
-        self.directories.lock().unwrap().get(cache_id).cloned()
+        self.directories
+            .lock()
+            .unwrap()
+            .get(cache_id)
+            .map(|entry| entry.directory.clone())
+    }
+
+    pub fn priority(&self, cache_id: &str) -> Option<i32> {
+        self.directories
+            .lock()
+            .unwrap()
+            .get(cache_id)
+            .map(|entry| entry.priority)
     }
 
     pub fn get_or_create(&self, cache_id: &str) -> Arc<DiskChannelDirectory> {
@@ -132,7 +163,11 @@ impl CacheDirectorySet {
             .lock()
             .unwrap()
             .entry(cache_id.to_string())
-            .or_insert_with(DiskChannelDirectory::new)
+            .or_insert_with(|| CacheDirectoryEntry {
+                directory: DiskChannelDirectory::new(),
+                priority: 0,
+            })
+            .directory
             .clone()
     }
 
@@ -295,6 +330,30 @@ impl LiveShardLocalStore {
         };
         Ok((p, page.len as usize))
     }
+
+    async fn write_page_with_priority<R: Req + ?Sized>(
+        &self,
+        req: &R,
+        stripe_off: u64,
+        page: PageRef,
+        priority: i32,
+    ) -> Result<(), Error> {
+        let key = req.key();
+        let Some(channels) = self.current_or_replay() else {
+            return Err(Error::from("no disks open"));
+        };
+        let (p, len) = self.resolve(page)?;
+        // NOTE: see `read_page`. `disk_for`'s `channels.len()` divisor
+        // means changing the set of open disks repartitions placement;
+        // stripes written under a different open-disk count become
+        // unreachable. Changing the open-disk set is NOT data-preserving.
+        let idx = disk_for(&key, stripe_off, channels.len());
+        let slice = std::ptr::slice_from_raw_parts(p.cast_const(), len);
+        // SAFETY: see `read_page` above.
+        channels[idx]
+            .write_page_with_priority(key, stripe_off, slice, priority)
+            .await
+    }
 }
 
 impl BlockStore for LiveShardLocalStore {
@@ -336,20 +395,7 @@ impl BlockStore for LiveShardLocalStore {
         stripe_off: u64,
         page: PageRef,
     ) -> Result<(), Error> {
-        let key = req.key();
-        let Some(channels) = self.current_or_replay() else {
-            return Err(Error::from("no disks open"));
-        };
-        let (p, len) = self.resolve(page)?;
-        // NOTE: see `read_page`. `disk_for`'s `channels.len()` divisor
-        // means changing the set of open disks repartitions placement;
-        // stripes written under a different open-disk count become
-        // unreachable. Changing the open-disk set is NOT data-preserving.
-        let idx = disk_for(&key, stripe_off, channels.channels.len());
-        let slice = std::ptr::slice_from_raw_parts(p.cast_const(), len);
-        // SAFETY: see `read_page` above.
-        channels.channels[idx]
-            .write_page(key, stripe_off, slice)
+        self.write_page_with_priority(req, stripe_off, page, 0)
             .await
     }
 }
@@ -434,8 +480,9 @@ impl BlockStore for ChainLocalStore {
         if directory.current().is_none() {
             return Ok(());
         }
+        let priority = self.directories.priority(cache_id).unwrap_or(0);
         self.store_for(cache_id)
-            .write_page(req, stripe_off, page)
+            .write_page_with_priority(req, stripe_off, page, priority)
             .await
     }
 }
