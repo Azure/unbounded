@@ -50,6 +50,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		slog.Info("watching nodes for storage ring peers", "node", cfg.NodeName, "label", cfg.StorageRingLabel)
+		startRdmaInventoryPublisher(ctx, cfg, watcher.clientset, watcher.signal)
 	}
 
 	slog.Info("rendering initial config", "source", cfg.SourceDir, "dest", cfg.ConfigPath)
@@ -173,11 +174,11 @@ func reconcile(cfg Config, peers *peerWatcher) error {
 }
 
 // currentRenderState resolves the current node annotations and ring state from
-// the node watch, reading the shared fabric port from the ConfigMap's TCP fabric
-// bind. It returns the zero value when node watching is disabled. A source that
-// cannot be loaded yields an inactive ring; the subsequent RenderConfig surfaces
-// the same error in reconcile, which keeps the previously rendered config in
-// place.
+// the node watch. TCP configs use the fixed ConfigMap fabric port; RDMA configs
+// use peer-published HCA inventory annotations. It returns the zero value when
+// node watching is disabled. A source that cannot be loaded yields an inactive
+// ring; the subsequent RenderConfig surfaces the same error in reconcile, which
+// keeps the previously rendered config in place.
 func currentRenderState(cfg Config, peers *peerWatcher) renderState {
 	if peers == nil {
 		return renderState{}
@@ -188,7 +189,12 @@ func currentRenderState(cfg Config, peers *peerWatcher) renderState {
 		return peers.snapshot(0, false)
 	}
 
-	port, ok := parseFabricPort(sc.GetStartup().GetFabric().GetTcp().GetAddr())
+	fabric := sc.GetStartup().GetFabric()
+	if fabric.GetRdma() != nil || fabric.GetAutoRdma() != nil {
+		return peers.snapshotRdma()
+	}
+
+	port, ok := parseFabricPort(fabric.GetTcp().GetAddr())
 
 	return peers.snapshot(port, ok)
 }
