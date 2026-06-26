@@ -381,57 +381,45 @@ addr = "192.168.253.1:49151"
     #[test]
     fn block_disk_config_round_trips() {
         let s = r#"
-[[caches]]
-name = "cache"
-source = "n"
-
-[[caches.disks]]
-[caches.disks.config.block]
+[[disks]]
+[disks.config.block]
 path = "/dev/nvme0n1"
 numa = 1
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.caches[0].disks[0].kind_name(), "block");
-        assert_eq!(c.caches[0].disks[0].path(), Some("/dev/nvme0n1"));
-        assert_eq!(c.caches[0].disks[0].numa(), Some(1));
+        assert_eq!(c.disks[0].kind_name(), "block");
+        assert_eq!(c.disks[0].path(), Some("/dev/nvme0n1"));
+        assert_eq!(c.disks[0].numa(), Some(1));
     }
 
     #[test]
     fn disk_engine_fields_default_to_unset_and_off() {
         let s = r#"
-[[caches]]
-name = "cache"
-source = "n"
-
-[[caches.disks]]
-[caches.disks.config.block]
+[[disks]]
+[disks.config.block]
 path = "/dev/nvme0n1"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.caches[0].disks[0].page_size_bytes, None);
-        assert!(!c.caches[0].disks[0].skip_recovery_scan);
+        assert_eq!(c.disks[0].page_size_bytes, None);
+        assert!(!c.disks[0].skip_recovery_scan);
     }
 
     #[test]
     fn disk_engine_fields_round_trip() {
         let s = r#"
-[[caches]]
-name = "cache"
-source = "n"
-
-[[caches.disks]]
+[[disks]]
 page_size_bytes = 4096
 skip_recovery_scan = true
 
-[caches.disks.config.block]
+[disks.config.block]
 path = "/dev/nvme0n1"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.caches[0].disks[0].page_size_bytes, Some(4096));
-        assert!(c.caches[0].disks[0].skip_recovery_scan);
+        assert_eq!(c.disks[0].page_size_bytes, Some(4096));
+        assert!(c.disks[0].skip_recovery_scan);
     }
 
     #[test]

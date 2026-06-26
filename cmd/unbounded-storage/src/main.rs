@@ -46,6 +46,7 @@ mod shard_layer;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+const SHARED_DISK_REGISTRY_ID: &str = "shared";
 
 /// Stripe granularity used to build an inert origin backend on shards
 /// that have no configured backend. Such a backend is never exercised
@@ -1151,23 +1152,24 @@ fn reconcile_cache_disks(
 ) {
     let mut cache_ids: Vec<String> = projection.caches.keys().cloned().collect();
     cache_ids.sort();
-    disk_registry.reconcile_ids(cache_ids.clone());
+    disk_registry.reconcile_ids([SHARED_DISK_REGISTRY_ID.to_string()]);
     cache_directories.reconcile(cache_ids.iter().cloned());
 
+    let disks = config::runtime_disks(projection);
+    let report = disk_registry.reconcile_cache(SHARED_DISK_REGISTRY_ID, &disks);
+    eprintln!(
+        "config: shared disks: added={} removed={} failures={}",
+        report.added,
+        report.removed,
+        report.failures.len(),
+    );
+    for (path, msg) in &report.failures {
+        eprintln!("disk {}: open failed: {msg}", path.display());
+    }
+
+    let channels = disk_registry.channels_snapshot(SHARED_DISK_REGISTRY_ID);
     for cache_id in cache_ids {
-        let cache = &projection.caches[&cache_id];
-        let report = disk_registry.reconcile_cache(&cache_id, &cache.disks);
-        eprintln!(
-            "config: cache={} disks: added={} removed={} failures={}",
-            cache_id,
-            report.added,
-            report.removed,
-            report.failures.len(),
-        );
-        for (path, msg) in &report.failures {
-            eprintln!("disk {}: open failed: {msg}", path.display());
-        }
-        cache_directories.apply_channels(&cache_id, disk_registry.channels_snapshot(&cache_id));
+        cache_directories.apply_channels(&cache_id, channels.clone());
     }
 }
 

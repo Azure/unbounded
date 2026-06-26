@@ -867,8 +867,8 @@ fn config_for_generation(version: u64, disks: Vec<DiskSpec>) -> Config {
     cfg.caches = vec![CacheSpec {
         name: "cache-0".to_string(),
         source: "neighborhood-0".to_string(),
-        disks,
     }];
+    cfg.disks = disks;
     cfg.frontends = frontend_specs(0, 1);
     cfg
 }
@@ -891,10 +891,7 @@ fn mutate_config(cfg: &mut Config, apply: &ApplySpec, generation: usize) {
             cfg.frontends = frontend_specs(generation, count.max(1));
         }
         ApplyKind::DiskSwap { count } => {
-            cfg.caches
-                .first_mut()
-                .expect("lifecycle sim has a cache")
-                .disks = generation_disk_specs(generation, count.max(1) as usize);
+            cfg.disks = generation_disk_specs(generation, count.max(1) as usize);
         }
     }
 }

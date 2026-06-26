@@ -98,6 +98,7 @@ func TestRenderUnit(t *testing.T) {
 	assert.Contains(t, unit, "LimitMEMLOCK=infinity")
 	assert.Contains(t, unit, "Restart=always")
 	assert.Contains(t, unit, "WantedBy=multi-user.target")
+	assert.Contains(t, unit, `mkdir -p "$d" "/var/lib/unbounded-storage"`)
 	// No extra storage args appended.
 	assert.NotContains(t, unit, "config.binpb --")
 }
