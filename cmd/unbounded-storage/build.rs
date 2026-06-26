@@ -102,7 +102,6 @@ fn generate_config_schema() {
         "BlockDiskConfig",
         "FileDiskConfig",
         "CacheSpec",
-        "NeighborhoodSpec",
         "BackendSpec",
         "HttpBackendConfig",
         "S3BackendConfig",
@@ -125,6 +124,7 @@ fn generate_config_schema() {
         prost.type_attribute(msg, "#[derive(::serde::Deserialize)]");
         prost.type_attribute(msg, "#[serde(default, deny_unknown_fields)]");
     }
+    prost.field_attribute("Config.self", "#[serde(rename = \"self\")]");
 
     for oneof in [
         "PeerSpec.config",

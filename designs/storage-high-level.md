@@ -63,7 +63,7 @@ the name to the same ID without fetching the full object.
   bounded subset of peers, not a full mesh, so NIC queue-pair (QP)
   usage stays well under hardware limits.
 - **Disjoint discovery.** A node can be configured with only its
-  direct routing neighbors (a `routing_plan`) instead of the full
+  direct routing neighbors (the top-level `routing_plan`) instead of the full
   cluster roster. Because the recursive routing math only ever
   consults a node's own fingers/successor/predecessor, a planner with
   global view can compute each node's neighbor set offline and the
