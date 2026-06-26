@@ -211,6 +211,7 @@ mod tests {
             page_size_bytes: None,
             skip_recovery_scan: false,
             force_format: false,
+            bypass_admission: false,
             config: Some(disk_spec::Config::Block(BlockDiskConfig {
                 numa: None,
                 path: "/dev/nvme0n1".to_string(),

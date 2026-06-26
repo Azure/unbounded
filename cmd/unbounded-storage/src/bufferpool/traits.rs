@@ -26,6 +26,14 @@ pub trait Req {
         false
     }
 
+    /// Benchmark-only local-disk bypass. Unlike [`Req::bypass`], this
+    /// leaves peer routing enabled but skips the initiator's local disk
+    /// lookup/writeback. Peer handlers still consult their own local
+    /// store, so remote NVMe reads remain in the path.
+    fn skip_local_disk(&self) -> bool {
+        false
+    }
+
     /// Stable cache namespace selected by the frontend binding. `None` means
     /// this request has no local cache tier or mesh route.
     fn cache_id(&self) -> Option<&String> {

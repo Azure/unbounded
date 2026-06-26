@@ -169,6 +169,14 @@ pub struct StripeReq {
     /// loadgen run can measure fabric RPC/RMA capacity without disk or
     /// origin work in the server path.
     fabric_only: bool,
+    /// Local-only benchmark flag. Never serialized: the initiating
+    /// bufferpool skips its own disk lookup/writeback when this is set,
+    /// but peer handlers still use their local NVMe-backed cache after
+    /// decoding the request from the fabric. This keeps measurements
+    /// focused on remote NVMe + RDMA without short-circuiting on the
+    /// requester's disk.
+    #[serde(skip)]
+    skip_local_disk: bool,
 }
 
 impl StripeReq {
@@ -181,6 +189,7 @@ impl StripeReq {
             cache_id: None,
             bypass: false,
             fabric_only: false,
+            skip_local_disk: false,
         }
     }
 
@@ -213,6 +222,12 @@ impl StripeReq {
         self
     }
 
+    /// Mark the request to skip the initiator's local disk cache.
+    pub fn with_skip_local_disk(mut self, skip_local_disk: bool) -> Self {
+        self.skip_local_disk = skip_local_disk;
+        self
+    }
+
     /// The origin mapping, if one was attached. `None` for requests
     /// that never reach the origin tier.
     pub fn origin(&self) -> Option<&OriginRef> {
@@ -225,6 +240,10 @@ impl StripeReq {
 
     pub fn fabric_only(&self) -> bool {
         self.fabric_only
+    }
+
+    pub fn skip_local_disk(&self) -> bool {
+        self.skip_local_disk
     }
 }
 
@@ -243,6 +262,10 @@ impl Req for StripeReq {
 
     fn fabric_only(&self) -> bool {
         self.fabric_only
+    }
+
+    fn skip_local_disk(&self) -> bool {
+        self.skip_local_disk
     }
 }
 
@@ -471,6 +494,7 @@ mod tests {
         let k = OriginRef::new("primary-s3", "models/llama.bin", 12).stripe_key();
 
         assert!(!StripeReq::new(k).fabric_only());
+        assert!(!StripeReq::new(k).skip_local_disk());
     }
 
     #[test]
@@ -485,6 +509,19 @@ mod tests {
         let bytes = bincode::serialize(&req).unwrap();
         let back: StripeReq = bincode::deserialize(&bytes).unwrap();
         assert!(!back.bypass());
+    }
+
+    #[test]
+    fn stripe_req_skip_local_disk_is_not_serialized() {
+        // `skip_local_disk` is local to the requester: peer handlers must
+        // still read from their own NVMe cache after decoding the request.
+        let origin = OriginRef::new("primary-s3", "models/llama.bin", 7);
+        let req = StripeReq::new(origin.stripe_key())
+            .with_origin(origin)
+            .with_skip_local_disk(true);
+        let bytes = bincode::serialize(&req).unwrap();
+        let back: StripeReq = bincode::deserialize(&bytes).unwrap();
+        assert!(!back.skip_local_disk());
     }
 
     #[test]

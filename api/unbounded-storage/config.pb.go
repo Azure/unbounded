@@ -1071,6 +1071,10 @@ type DiskSpec struct {
 	// Destructively resets the cache index on open, ignoring any existing on-disk metadata.
 	// Intended only for benchmark cache devices that are safe to reformat between runs.
 	ForceFormat bool `protobuf:"varint,6,opt,name=force_format,json=forceFormat,proto3" json:"force_format,omitempty"`
+	// Admit every write into the cache index instead of requiring the default
+	// second touch. Intended for benchmark warmups that must prefill NVMe devices
+	// with a cold synthetic keyspace.
+	BypassAdmission bool `protobuf:"varint,7,opt,name=bypass_admission,json=bypassAdmission,proto3" json:"bypass_admission,omitempty"`
 	// Types that are valid to be assigned to Config:
 	//
 	//	*DiskSpec_Block
@@ -1134,6 +1138,13 @@ func (x *DiskSpec) GetSkipRecoveryScan() bool {
 func (x *DiskSpec) GetForceFormat() bool {
 	if x != nil {
 		return x.ForceFormat
+	}
+	return false
+}
+
+func (x *DiskSpec) GetBypassAdmission() bool {
+	if x != nil {
+		return x.BypassAdmission
 	}
 	return false
 }
@@ -1950,7 +1961,15 @@ type LoadgenFrontendConfig struct {
 	// response pages directly from their RPC scratch buffers. This bypasses disk
 	// and origin work while keeping normal peer routing, fabric RPC framing, and
 	// RDMA writes in the benchmark path.
-	FabricOnly    bool `protobuf:"varint,9,opt,name=fabric_only,json=fabricOnly,proto3" json:"fabric_only,omitempty"`
+	FabricOnly bool `protobuf:"varint,9,opt,name=fabric_only,json=fabricOnly,proto3" json:"fabric_only,omitempty"`
+	// When true, workers keep sampling until the first requested stripe is owned
+	// by the local node. This is intended for benchmark warmup phases that prefill
+	// each node's own NVMe-backed cache before a remote-only measurement phase.
+	LocalOnly bool `protobuf:"varint,10,opt,name=local_only,json=localOnly,proto3" json:"local_only,omitempty"`
+	// When true, the initiating bufferpool skips local disk lookup and writeback.
+	// Peer handlers still use their local NVMe-backed cache, so this keeps the
+	// measured path focused on remote NVMe + RDMA instead of requester-side reuse.
+	SkipLocalDisk bool `protobuf:"varint,11,opt,name=skip_local_disk,json=skipLocalDisk,proto3" json:"skip_local_disk,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2048,6 +2067,20 @@ func (x *LoadgenFrontendConfig) GetFabricOnly() bool {
 	return false
 }
 
+func (x *LoadgenFrontendConfig) GetLocalOnly() bool {
+	if x != nil {
+		return x.LocalOnly
+	}
+	return false
+}
+
+func (x *LoadgenFrontendConfig) GetSkipLocalDisk() bool {
+	if x != nil {
+		return x.SkipLocalDisk
+	}
+	return false
+}
+
 var File_config_proto protoreflect.FileDescriptor
 
 const file_config_proto_rawDesc = "" +
@@ -2134,13 +2167,14 @@ const file_config_proto_rawDesc = "" +
 	"\vnic_workers\x18\a \x01(\x04H\x01R\n" +
 	"nicWorkers\x88\x01\x01B\x10\n" +
 	"\x0e_serving_coresB\x0e\n" +
-	"\f_nic_workers\"\xdf\x02\n" +
+	"\f_nic_workers\"\x8a\x03\n" +
 	"\bDiskSpec\x12$\n" +
 	"\vqueue_depth\x18\x01 \x01(\rH\x01R\n" +
 	"queueDepth\x88\x01\x01\x12+\n" +
 	"\x0fpage_size_bytes\x18\x02 \x01(\x04H\x02R\rpageSizeBytes\x88\x01\x01\x12,\n" +
 	"\x12skip_recovery_scan\x18\x03 \x01(\bR\x10skipRecoveryScan\x12!\n" +
-	"\fforce_format\x18\x06 \x01(\bR\vforceFormat\x12A\n" +
+	"\fforce_format\x18\x06 \x01(\bR\vforceFormat\x12)\n" +
+	"\x10bypass_admission\x18\a \x01(\bR\x0fbypassAdmission\x12A\n" +
 	"\x05block\x18\x04 \x01(\v2).unbounded.storage.config.BlockDiskConfigH\x00R\x05block\x12>\n" +
 	"\x04file\x18\x05 \x01(\v2(.unbounded.storage.config.FileDiskConfigH\x00R\x04fileB\b\n" +
 	"\x06configB\x0e\n" +
@@ -2208,7 +2242,7 @@ const file_config_proto_rawDesc = "" +
 	"\x1bmax_requests_per_connection\x18\x02 \x01(\rH\x00R\x18maxRequestsPerConnection\x88\x01\x01B\x1e\n" +
 	"\x1c_max_requests_per_connection\"&\n" +
 	"\x10S3FrontendConfig\x12\x12\n" +
-	"\x04addr\x18\x01 \x01(\tR\x04addr\"\xb9\x03\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"\x80\x04\n" +
 	"\x15LoadgenFrontendConfig\x12\x1d\n" +
 	"\aworkers\x18\x01 \x01(\rH\x00R\aworkers\x88\x01\x01\x12\x17\n" +
 	"\x04seed\x18\x02 \x01(\x04H\x01R\x04seed\x88\x01\x01\x12.\n" +
@@ -2221,7 +2255,11 @@ const file_config_proto_rawDesc = "" +
 	"\vremote_only\x18\b \x01(\bR\n" +
 	"remoteOnly\x12\x1f\n" +
 	"\vfabric_only\x18\t \x01(\bR\n" +
-	"fabricOnlyB\n" +
+	"fabricOnly\x12\x1d\n" +
+	"\n" +
+	"local_only\x18\n" +
+	" \x01(\bR\tlocalOnly\x12&\n" +
+	"\x0fskip_local_disk\x18\v \x01(\bR\rskipLocalDiskB\n" +
 	"\n" +
 	"\b_workersB\a\n" +
 	"\x05_seedB\x13\n" +

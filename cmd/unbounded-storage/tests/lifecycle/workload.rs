@@ -947,6 +947,7 @@ fn generation_disk_specs(generation: usize, count: usize) -> Vec<DiskSpec> {
             page_size_bytes: Some(4096),
             skip_recovery_scan: true,
             force_format: false,
+            bypass_admission: false,
             config: Some(disk_spec::Config::File(FileDiskConfig {
                 size: Some(64 * 1024 * 1024),
                 path: format!("/dst/generation-{generation}/disk-{idx}"),

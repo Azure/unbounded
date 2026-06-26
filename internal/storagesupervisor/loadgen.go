@@ -27,6 +27,8 @@ const (
 	loadgenOptionVerify          = "verify"
 	loadgenOptionRemoteOnly      = "remote_only"
 	loadgenOptionFabricOnly      = "fabric_only"
+	loadgenOptionLocalOnly       = "local_only"
+	loadgenOptionSkipLocalDisk   = "skip_local_disk"
 )
 
 func applyLoadgenOverlay(cfg *storageconfig.Config, annotations map[string]string) {
@@ -208,6 +210,24 @@ func applyLoadgenOption(frontend *storageconfig.FrontendSpec, raw string, seen m
 		}
 
 		loadgen.FabricOnly = v
+	case loadgenOptionLocalOnly:
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			slog.Warn("ignoring invalid storage loadgen bool option", "name", name, "key", key, "value", value)
+
+			return
+		}
+
+		loadgen.LocalOnly = v
+	case loadgenOptionSkipLocalDisk:
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			slog.Warn("ignoring invalid storage loadgen bool option", "name", name, "key", key, "value", value)
+
+			return
+		}
+
+		loadgen.SkipLocalDisk = v
 	default:
 		slog.Warn("ignoring unknown storage loadgen option", "name", name, "key", key)
 

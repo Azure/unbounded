@@ -49,6 +49,8 @@ pub struct LoadgenFrontend {
     verify: bool,
     remote_only: bool,
     fabric_only: bool,
+    local_only: bool,
+    skip_local_disk: bool,
 }
 
 impl LoadgenFrontend {
@@ -79,6 +81,8 @@ impl LoadgenFrontend {
             verify: loadgen.verify,
             remote_only: loadgen.remote_only,
             fabric_only: loadgen.fabric_only,
+            local_only: loadgen.local_only,
+            skip_local_disk: loadgen.skip_local_disk,
         })
     }
 
@@ -125,6 +129,8 @@ impl<P: BufferPool<Req = StripeReq> + 'static> LoadgenDriver<P> {
             routes,
             remote_only: frontend.remote_only,
             fabric_only: frontend.fabric_only,
+            local_only: frontend.local_only,
+            skip_local_disk: frontend.skip_local_disk,
         });
         let workers = (0..worker_count)
             .map(|worker_idx| {
@@ -184,6 +190,8 @@ struct LoadgenRun {
     routes: RouteTableHandle,
     remote_only: bool,
     fabric_only: bool,
+    local_only: bool,
+    skip_local_disk: bool,
 }
 
 fn loadgen_worker_loop<P: BufferPool<Req = StripeReq> + 'static>(
@@ -223,12 +231,22 @@ fn sample_object(cfg: &LoadgenRun, rng: &mut WorkerRng) -> SyntheticObjectId {
         if fallback.is_none() {
             fallback = Some(object);
         }
-        if !cfg.remote_only || first_stripe_routes_remote(cfg, object) {
+        if sample_object_matches_route_mode(cfg, object) {
             return object;
         }
     }
 
     fallback.expect("sampler loop always records first sample")
+}
+
+fn sample_object_matches_route_mode(cfg: &LoadgenRun, object: SyntheticObjectId) -> bool {
+    let remote = first_stripe_routes_remote(cfg, object);
+    match (cfg.remote_only, cfg.local_only) {
+        (true, true) => false,
+        (true, false) => remote,
+        (false, true) => !remote,
+        (false, false) => true,
+    }
 }
 
 fn first_stripe_routes_remote(cfg: &LoadgenRun, object: SyntheticObjectId) -> bool {
@@ -376,6 +394,7 @@ fn request_from_origin(origin_ref: OriginRef, cfg: &LoadgenRun) -> StripeReq {
         .with_cache_id(cfg.cache_id.clone())
         .with_bypass(cfg.bypass)
         .with_fabric_only(cfg.fabric_only)
+        .with_skip_local_disk(cfg.skip_local_disk)
 }
 
 #[derive(Clone, Copy)]
@@ -519,6 +538,8 @@ mod tests {
             routes: RouteTableHandle::empty(),
             remote_only: false,
             fabric_only: false,
+            local_only: false,
+            skip_local_disk: false,
         }
     }
 
@@ -632,6 +653,8 @@ mod tests {
         assert!(!frontend.verify);
         assert!(!frontend.remote_only);
         assert!(!frontend.fabric_only);
+        assert!(!frontend.local_only);
+        assert!(!frontend.skip_local_disk);
     }
 
     #[test]
@@ -647,6 +670,8 @@ mod tests {
             verify: false,
             remote_only: false,
             fabric_only: false,
+            local_only: false,
+            skip_local_disk: false,
         }));
         let frontend = LoadgenFrontend::from_spec(&spec).unwrap();
         assert_eq!(frontend.workers, 0);
@@ -678,6 +703,30 @@ mod tests {
 
         let frontend = LoadgenFrontend::from_spec(&spec).unwrap();
         assert!(frontend.fabric_only);
+    }
+
+    #[test]
+    fn local_only_flag_loads_from_spec() {
+        let mut spec = loadgen_spec();
+        spec.config = Some(frontend_spec::Config::Loadgen(LoadgenFrontendConfig {
+            local_only: true,
+            ..LoadgenFrontendConfig::default()
+        }));
+
+        let frontend = LoadgenFrontend::from_spec(&spec).unwrap();
+        assert!(frontend.local_only);
+    }
+
+    #[test]
+    fn skip_local_disk_flag_loads_from_spec() {
+        let mut spec = loadgen_spec();
+        spec.config = Some(frontend_spec::Config::Loadgen(LoadgenFrontendConfig {
+            skip_local_disk: true,
+            ..LoadgenFrontendConfig::default()
+        }));
+
+        let frontend = LoadgenFrontend::from_spec(&spec).unwrap();
+        assert!(frontend.skip_local_disk);
     }
 
     #[test]
@@ -746,6 +795,7 @@ mod tests {
         let mut cfg = run_cfg();
         cfg.bypass = true;
         cfg.fabric_only = true;
+        cfg.skip_local_disk = true;
         let origin = OriginRef::new("fake", "obj", 3);
         let key = origin.stripe_key_for_cache("cache");
         let req = request_from_origin(origin, &cfg);
@@ -754,6 +804,29 @@ mod tests {
         assert_eq!(req.cache_id(), Some("cache"));
         assert!(crate::bufferpool::Req::bypass(&req));
         assert!(req.fabric_only());
+        assert!(req.skip_local_disk());
+    }
+
+    #[test]
+    fn route_mode_predicate_selects_local_or_remote() {
+        let mut cfg = run_cfg();
+        cfg.routes = route_handle(100, u64::MAX / 2);
+
+        let remote = find_object_with_remote_route(&cfg, true);
+        let local = find_object_with_remote_route(&cfg, false);
+
+        cfg.remote_only = true;
+        assert!(sample_object_matches_route_mode(&cfg, remote));
+        assert!(!sample_object_matches_route_mode(&cfg, local));
+
+        cfg.remote_only = false;
+        cfg.local_only = true;
+        assert!(!sample_object_matches_route_mode(&cfg, remote));
+        assert!(sample_object_matches_route_mode(&cfg, local));
+
+        cfg.remote_only = true;
+        assert!(!sample_object_matches_route_mode(&cfg, remote));
+        assert!(!sample_object_matches_route_mode(&cfg, local));
     }
 
     #[test]

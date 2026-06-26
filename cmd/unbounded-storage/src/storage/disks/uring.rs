@@ -440,7 +440,7 @@ fn disable_polled_ring(ring_cfg: &mut StorageRingConfig) {
 /// Build an [`EngineConfig`] from a [`DiskSpec`]. Production defaults
 /// come from [`EngineConfig::default`]; the spec only overrides what
 /// the operator chose to expose: `page_size_bytes`, recovery-scan
-/// behavior, and benchmark-only destructive reset.
+/// behavior, and benchmark-only cache reset/admission controls.
 fn engine_config_from(spec: &DiskSpec) -> EngineConfig {
     let mut cfg = EngineConfig::default();
     if let Some(p) = spec.page_size_bytes {
@@ -448,6 +448,7 @@ fn engine_config_from(spec: &DiskSpec) -> EngineConfig {
     }
     cfg.skip_recovery_scan_if_no_meta = spec.skip_recovery_scan;
     cfg.force_format = spec.force_format;
+    cfg.bypass_admission = spec.bypass_admission;
     cfg.disk_id = spec
         .path()
         .expect("disk path is validated at config load")
@@ -718,6 +719,7 @@ mod tests {
             page_size_bytes: None,
             skip_recovery_scan: false,
             force_format: false,
+            bypass_admission: false,
             config: Some(crate::config::schema::disk_spec::Config::File(
                 crate::config::schema::FileDiskConfig {
                     path: "/tmp/unbounded-storage-test-disk".to_string(),
@@ -742,6 +744,7 @@ mod tests {
             page_size_bytes: None,
             skip_recovery_scan: false,
             force_format: false,
+            bypass_admission: false,
             config: Some(crate::config::schema::disk_spec::Config::Block(
                 crate::config::schema::BlockDiskConfig {
                     numa: None,

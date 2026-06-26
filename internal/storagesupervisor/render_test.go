@@ -523,7 +523,7 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation: "/dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0;skip_recovery_scan=true;force_format=true",
+			storageDisksAnnotation: "/dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0;skip_recovery_scan=true;force_format=true;bypass_admission=true",
 		},
 	})
 
@@ -539,6 +539,7 @@ version: 1
 	assert.Equal(t, uint32(0), disk.GetBlock().GetNuma())
 	assert.True(t, disk.GetSkipRecoveryScan())
 	assert.True(t, disk.GetForceFormat())
+	assert.True(t, disk.GetBypassAdmission())
 }
 
 func TestRenderConfigInjectsMultipleAnnotatedBlockDisks(t *testing.T) {
@@ -573,7 +574,7 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation: "/dev/nvme1n1;unknown=x;queue_depth=0;queue_depth=512;queue_depth=1024;page_size_bytes=bad;skip_recovery_scan=maybe;force_format=maybe;numa=bad;empty=;=value;missing",
+			storageDisksAnnotation: "/dev/nvme1n1;unknown=x;queue_depth=0;queue_depth=512;queue_depth=1024;page_size_bytes=bad;skip_recovery_scan=maybe;force_format=maybe;bypass_admission=maybe;numa=bad;empty=;=value;missing",
 		},
 	})
 
@@ -586,6 +587,7 @@ version: 1
 	assert.Nil(t, disk.GetBlock().Numa)
 	assert.False(t, disk.GetSkipRecoveryScan())
 	assert.False(t, disk.GetForceFormat())
+	assert.False(t, disk.GetBypassAdmission())
 	assert.Contains(t, logs.String(), "ignoring unknown storage disk option")
 	assert.Contains(t, logs.String(), "ignoring duplicate storage disk option")
 }
@@ -753,7 +755,7 @@ frontends:
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageLoadgenAnnotation: "lg;source=cache;workers=32;seed=1234;keyspace_objects=1000000;object_size_bytes=4194304;read_bytes=262144;zipf_exponent=1.1;verify=true;remote_only=true;fabric_only=true,lg2;source=origin",
+			storageLoadgenAnnotation: "lg;source=cache;workers=32;seed=1234;keyspace_objects=1000000;object_size_bytes=4194304;read_bytes=262144;zipf_exponent=1.1;verify=true;remote_only=true;fabric_only=true;local_only=true;skip_local_disk=true,lg2;source=origin",
 		},
 	})
 
@@ -780,6 +782,8 @@ frontends:
 	assert.True(t, loadgen.GetVerify())
 	assert.True(t, loadgen.GetRemoteOnly())
 	assert.True(t, loadgen.GetFabricOnly())
+	assert.True(t, loadgen.GetLocalOnly())
+	assert.True(t, loadgen.GetSkipLocalDisk())
 
 	assert.Equal(t, "lg2", cfg.GetFrontends()[2].GetName())
 	assert.Equal(t, "origin", cfg.GetFrontends()[2].GetSource())
@@ -807,7 +811,7 @@ frontends:
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageLoadgenAnnotation: "existing;source=cache,missing-source;workers=1,valid;source=cache;workers=bad;workers=2;zipf_exponent=NaN;zipf_exponent=1.3;verify=maybe;verify=true;remote_only=maybe;remote_only=true;fabric_only=maybe;fabric_only=true,valid;source=origin",
+			storageLoadgenAnnotation: "existing;source=cache,missing-source;workers=1,valid;source=cache;workers=bad;workers=2;zipf_exponent=NaN;zipf_exponent=1.3;verify=maybe;verify=true;remote_only=maybe;remote_only=true;fabric_only=maybe;fabric_only=true;local_only=maybe;local_only=true;skip_local_disk=maybe;skip_local_disk=true,valid;source=origin",
 		},
 	})
 
@@ -821,6 +825,8 @@ frontends:
 	assert.True(t, loadgen.GetVerify())
 	assert.True(t, loadgen.GetRemoteOnly())
 	assert.True(t, loadgen.GetFabricOnly())
+	assert.True(t, loadgen.GetLocalOnly())
+	assert.True(t, loadgen.GetSkipLocalDisk())
 	assert.Contains(t, logs.String(), "frontend name is already declared")
 	assert.Contains(t, logs.String(), "without source")
 	assert.Contains(t, logs.String(), "invalid storage loadgen uint32 option")

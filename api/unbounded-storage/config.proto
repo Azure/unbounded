@@ -194,6 +194,11 @@ message DiskSpec {
   // Intended only for benchmark cache devices that are safe to reformat between runs.
   bool force_format = 6;
 
+  // Admit every write into the cache index instead of requiring the default
+  // second touch. Intended for benchmark warmups that must prefill NVMe devices
+  // with a cold synthetic keyspace.
+  bool bypass_admission = 7;
+
   oneof config {
     BlockDiskConfig block = 4;
     FileDiskConfig file = 5;
@@ -349,4 +354,14 @@ message LoadgenFrontendConfig {
   // and origin work while keeping normal peer routing, fabric RPC framing, and
   // RDMA writes in the benchmark path.
   bool fabric_only = 9;
+
+  // When true, workers keep sampling until the first requested stripe is owned
+  // by the local node. This is intended for benchmark warmup phases that prefill
+  // each node's own NVMe-backed cache before a remote-only measurement phase.
+  bool local_only = 10;
+
+  // When true, the initiating bufferpool skips local disk lookup and writeback.
+  // Peer handlers still use their local NVMe-backed cache, so this keeps the
+  // measured path focused on remote NVMe + RDMA instead of requester-side reuse.
+  bool skip_local_disk = 11;
 }
