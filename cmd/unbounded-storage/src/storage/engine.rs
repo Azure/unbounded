@@ -96,6 +96,11 @@ pub struct EngineConfig {
     /// and always proceeds. Intended for benchmarking/tooling;
     /// production should leave this false.
     pub bypass_admission: bool,
+    /// When true, reads use the committed in-memory index mirror instead
+    /// of reading the terminal btree leaf from disk. This is benchmark
+    /// only: production reads must hit the on-disk leaf so corruption and
+    /// snapshot semantics are preserved.
+    pub bypass_index_read: bool,
     /// When true, [`BTreeIndex::open`] skips the LBA-order leaf
     /// scan on disks that have no valid meta page. Intended for
     /// benchmarking and bring-up against freshly wiped devices
@@ -130,6 +135,7 @@ impl Default for EngineConfig {
             restart_scan_queue_depth: 256,
             btree_scratch_pages: 64,
             bypass_admission: false,
+            bypass_index_read: false,
             skip_recovery_scan_if_no_meta: false,
             force_format: false,
             disk_id: String::new(),
@@ -572,9 +578,9 @@ impl<B: BlockDevice> StorageEngine<B> {
     ) -> Result<bool, bufferpool::Error> {
         let pk = Self::page_key(&key, stripe_off, self.cfg.page_size_bytes);
 
-        let entry = match self.btree.lookup(&pk).await {
-            Ok(Some(e)) => e,
-            Ok(None) | Err(_) => {
+        let entry = match self.lookup_entry(&pk).await {
+            Some(e) => e,
+            None => {
                 self.metric(|m| m.misses += 1);
                 crate::metrics::storage_lookup(crate::metrics::Lookup::Miss);
                 return Ok(false);
@@ -627,6 +633,17 @@ impl<B: BlockDevice> StorageEngine<B> {
         self.metric(|m| m.hits += 1);
         crate::metrics::storage_lookup(crate::metrics::Lookup::Hit);
         Ok(true)
+    }
+
+    async fn lookup_entry(&self, pk: &PageKey) -> Option<LeafEntry> {
+        if self.cfg.bypass_index_read {
+            return self.btree.lookup_committed_mirror(pk);
+        }
+
+        match self.btree.lookup(pk).await {
+            Ok(Some(e)) => Some(e),
+            Ok(None) | Err(_) => None,
+        }
     }
 
     /// Write the contents of `src` to `(key, stripe_off)`. The

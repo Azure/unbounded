@@ -405,6 +405,7 @@ path = "/dev/nvme0n1"
         assert!(!c.disks[0].skip_recovery_scan);
         assert!(!c.disks[0].force_format);
         assert!(!c.disks[0].bypass_admission);
+        assert!(!c.disks[0].bypass_index_read);
     }
 
     #[test]
@@ -415,6 +416,7 @@ page_size_bytes = 4096
 skip_recovery_scan = true
 force_format = true
 bypass_admission = true
+bypass_index_read = true
 
 [disks.config.block]
 path = "/dev/nvme0n1"
@@ -425,6 +427,7 @@ path = "/dev/nvme0n1"
         assert!(c.disks[0].skip_recovery_scan);
         assert!(c.disks[0].force_format);
         assert!(c.disks[0].bypass_admission);
+        assert!(c.disks[0].bypass_index_read);
     }
 
     #[test]

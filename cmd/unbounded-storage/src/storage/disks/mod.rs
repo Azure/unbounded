@@ -150,7 +150,8 @@ impl<T: DiskTarget> DiskRegistry<T> {
     /// Paths present in `desired` but not currently open are opened.
     /// Paths whose [`DiskSpec`] drifted in any field that affects how
     /// the disk is opened (config / queue_depth / page_size_bytes /
-    /// skip_recovery_scan / force_format / bypass_admission) are treated as a remove followed by an add.
+    /// skip_recovery_scan / force_format / bypass_admission /
+    /// bypass_index_read) are treated as a remove followed by an add.
     /// Partial failures during opens are reported but do not abort the
     /// reconcile.
     pub fn reconcile(&mut self, desired: &[DiskSpec]) -> DiskReport {
@@ -428,6 +429,7 @@ fn specs_drifted(prev: Option<&DiskSpec>, next: &DiskSpec) -> bool {
                 || p.skip_recovery_scan != next.skip_recovery_scan
                 || p.force_format != next.force_format
                 || p.bypass_admission != next.bypass_admission
+                || p.bypass_index_read != next.bypass_index_read
         }
     }
 }
@@ -517,6 +519,7 @@ mod tests {
             skip_recovery_scan: false,
             force_format: false,
             bypass_admission: false,
+            bypass_index_read: false,
             config: Some(disk_spec::Config::Block(BlockDiskConfig {
                 numa: None,
                 path: path.to_string(),
@@ -862,6 +865,7 @@ mod tests {
             skip_recovery_scan: false,
             force_format: false,
             bypass_admission: false,
+            bypass_index_read: false,
             config: Some(disk_spec::Config::File(FileDiskConfig {
                 size: Some(size),
                 path: "/a".to_string(),
@@ -915,6 +919,19 @@ mod tests {
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
         assert!(reg.applied[&PathBuf::from("/a")].bypass_admission);
+    }
+
+    #[test]
+    fn bypass_index_read_drift_triggers_remove_add() {
+        let (target, _state) = MockDiskTarget::new();
+        let mut reg = DiskRegistry::new(target, vec![]);
+        reg.reconcile(&[spec("/a", None)]);
+        let mut next = spec("/a", None);
+        next.bypass_index_read = true;
+        let report = reg.reconcile(&[next]);
+        assert_eq!(report.added, 1);
+        assert_eq!(report.removed, 1);
+        assert!(reg.applied[&PathBuf::from("/a")].bypass_index_read);
     }
 
     #[test]

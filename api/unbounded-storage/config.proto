@@ -199,6 +199,12 @@ message DiskSpec {
   // with a cold synthetic keyspace.
   bool bypass_admission = 7;
 
+  // Serve reads from the committed in-memory index mirror instead of reading
+  // the terminal btree leaf from disk. Intended only for benchmark devices
+  // where recovery/corruption validation has been deliberately traded for
+  // measuring the data-page path.
+  bool bypass_index_read = 8;
+
   oneof config {
     BlockDiskConfig block = 4;
     FileDiskConfig file = 5;

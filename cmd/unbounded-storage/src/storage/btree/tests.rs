@@ -192,6 +192,25 @@ fn force_format_ignores_existing_meta() {
 }
 
 #[test]
+fn lookup_uses_committed_mirror_without_leaf_io() {
+    let (dev, alloc) = fresh(128);
+    let idx = block_on(open_btree(dev.clone(), alloc)).unwrap();
+    block_on(idx.apply_batch(vec![Mutation::Insert {
+        key: key(1),
+        value: entry(11),
+    }]))
+    .unwrap();
+    let reads_after_commit = dev.reads();
+
+    assert_eq!(idx.lookup_committed_mirror(&key(1)), Some(entry(11)));
+    assert_eq!(
+        dev.reads(),
+        reads_after_commit,
+        "lookup should use the in-memory committed mirror"
+    );
+}
+
+#[test]
 fn skip_recovery_scan_does_not_ignore_existing_meta() {
     let (dev, alloc) = fresh(128);
     {

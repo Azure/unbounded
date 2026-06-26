@@ -446,6 +446,13 @@ impl<B: BlockDevice> BTreeIndex<B> {
         .await
     }
 
+    /// Benchmark-only lookup path backed by the committed in-memory
+    /// mirror. This skips the terminal leaf read, so it must not be used
+    /// for production recovery/corruption semantics.
+    pub fn lookup_committed_mirror(&self, key: &PageKey) -> Option<LeafEntry> {
+        self.mutator.borrow().entries.get(key).copied()
+    }
+
     /// Apply a batch of mutations atomically. Must be called by
     /// at most one task at a time (the engine's mutator).
     pub async fn apply_batch(&self, mutations: Vec<Mutation>) -> Result<(), Error> {
