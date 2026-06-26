@@ -230,6 +230,7 @@ func computeRing(nodes []*corev1.Node, selfName, ringLabel string, port int) rin
 		if n.Labels[ringLabel] != ringValue {
 			continue
 		}
+
 		if _, dup := seen[n.Name]; dup {
 			continue
 		}
