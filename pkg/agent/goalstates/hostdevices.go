@@ -216,7 +216,9 @@ func loadRDMACMModules() {
 		return
 	}
 
-	_ = exec.Command(modprobe, "rdma_cm").Run()
+	if err := exec.Command(modprobe, "rdma_cm").Run(); err != nil {
+		return
+	}
 }
 
 func rdmaCMDeviceNumber(path string) (int, int, bool) {
@@ -251,6 +253,7 @@ func createRDMACMDeviceNode(infinibandDir string, major, minor int, mknod mknodF
 	}
 
 	nodePath := filepath.Join(infinibandDir, "rdma_cm")
+
 	dev := int(unix.Mkdev(uint32(major), uint32(minor)))
 	if err := mknod(nodePath, unix.S_IFCHR|0o666, dev); err != nil && !os.IsExist(err) {
 		return ""
