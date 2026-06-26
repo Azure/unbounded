@@ -33,18 +33,18 @@ type Config struct {
 	Frontends []*FrontendSpec `protobuf:"bytes,3,rep,name=frontends,proto3" json:"frontends,omitempty"`
 	Backends  []*BackendSpec  `protobuf:"bytes,4,rep,name=backends,proto3" json:"backends,omitempty"`
 	Caches    []*CacheSpec    `protobuf:"bytes,5,rep,name=caches,proto3" json:"caches,omitempty"`
-	Disks     []*DiskSpec     `protobuf:"bytes,7,rep,name=disks,proto3" json:"disks,omitempty"`
+	Disks     []*DiskSpec     `protobuf:"bytes,6,rep,name=disks,proto3" json:"disks,omitempty"`
 	// Number of deterministic finger-table entries to derive per peer. Defaults to 100 when unset.
-	FingersPerNode *uint32 `protobuf:"varint,8,opt,name=fingers_per_node,json=fingersPerNode,proto3,oneof" json:"fingers_per_node,omitempty"`
+	FingersPerNode *uint32 `protobuf:"varint,7,opt,name=fingers_per_node,json=fingersPerNode,proto3,oneof" json:"fingers_per_node,omitempty"`
 	// Name of this process in the `peers` roster. Required when peers or a
 	// routing plan are configured. The internal ring and fabric ids are derived
 	// from this peer name and are startup-fixed.
-	Self string `protobuf:"bytes,9,opt,name=self,proto3" json:"self,omitempty"`
+	Self string `protobuf:"bytes,8,opt,name=self,proto3" json:"self,omitempty"`
 	// Precomputed routing table for this process. When set, `peers` can be
 	// sparse, containing only this process's routing neighbors.
-	RoutingPlan *RoutingPlan `protobuf:"bytes,11,opt,name=routing_plan,json=routingPlan,proto3,oneof" json:"routing_plan,omitempty"`
+	RoutingPlan *RoutingPlan `protobuf:"bytes,9,opt,name=routing_plan,json=routingPlan,proto3,oneof" json:"routing_plan,omitempty"`
 	// Process-wide peer definitions for the globally shared transport mesh.
-	Peers         []*PeerSpec `protobuf:"bytes,12,rep,name=peers,proto3" json:"peers,omitempty"`
+	Peers         []*PeerSpec `protobuf:"bytes,10,rep,name=peers,proto3" json:"peers,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -367,7 +367,7 @@ type RdmaPeerConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Default RDMA fabric address. Provider-native addresses are encoded as
 	// "hex:<fi_getname-bytes>"; RDMA-CM socket addresses are accepted when the
-	// provider reports them. Kept for single-endpoint peers and older writers.
+	// provider reports them.
 	Addr string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
 	// Ordered RDMA fabric addresses for peers that expose multiple fabric units,
 	// such as one endpoint per HCA. The daemon dials the address whose index
@@ -1070,20 +1070,20 @@ type DiskSpec struct {
 	SkipRecoveryScan bool `protobuf:"varint,3,opt,name=skip_recovery_scan,json=skipRecoveryScan,proto3" json:"skip_recovery_scan,omitempty"`
 	// Destructively resets the cache index on open, ignoring any existing on-disk metadata.
 	// Intended only for benchmark cache devices that are safe to reformat between runs.
-	ForceFormat bool `protobuf:"varint,6,opt,name=force_format,json=forceFormat,proto3" json:"force_format,omitempty"`
+	ForceFormat bool `protobuf:"varint,4,opt,name=force_format,json=forceFormat,proto3" json:"force_format,omitempty"`
 	// Admit every write into the cache index instead of requiring the default
 	// second touch. Intended for benchmark warmups that must prefill NVMe devices
 	// with a cold synthetic keyspace.
-	BypassAdmission bool `protobuf:"varint,7,opt,name=bypass_admission,json=bypassAdmission,proto3" json:"bypass_admission,omitempty"`
+	BypassAdmission bool `protobuf:"varint,5,opt,name=bypass_admission,json=bypassAdmission,proto3" json:"bypass_admission,omitempty"`
 	// Serve reads from the committed in-memory index mirror instead of reading
 	// the terminal btree leaf from disk. Intended only for benchmark devices
 	// where recovery/corruption validation has been deliberately traded for
 	// measuring the data-page path.
-	BypassIndexRead bool `protobuf:"varint,8,opt,name=bypass_index_read,json=bypassIndexRead,proto3" json:"bypass_index_read,omitempty"`
+	BypassIndexRead bool `protobuf:"varint,6,opt,name=bypass_index_read,json=bypassIndexRead,proto3" json:"bypass_index_read,omitempty"`
 	// Skip data checksum validation on reads. Intended only for benchmark
 	// devices where cache contents were just populated by the same daemon and
 	// the target is measuring the NVMe data path rather than CPU checksum cost.
-	BypassChecksum bool `protobuf:"varint,9,opt,name=bypass_checksum,json=bypassChecksum,proto3" json:"bypass_checksum,omitempty"`
+	BypassChecksum bool `protobuf:"varint,7,opt,name=bypass_checksum,json=bypassChecksum,proto3" json:"bypass_checksum,omitempty"`
 	// Types that are valid to be assigned to Config:
 	//
 	//	*DiskSpec_Block
@@ -1202,11 +1202,11 @@ type isDiskSpec_Config interface {
 }
 
 type DiskSpec_Block struct {
-	Block *BlockDiskConfig `protobuf:"bytes,4,opt,name=block,proto3,oneof"`
+	Block *BlockDiskConfig `protobuf:"bytes,8,opt,name=block,proto3,oneof"`
 }
 
 type DiskSpec_File struct {
-	File *FileDiskConfig `protobuf:"bytes,5,opt,name=file,proto3,oneof"`
+	File *FileDiskConfig `protobuf:"bytes,9,opt,name=file,proto3,oneof"`
 }
 
 func (*DiskSpec_Block) isDiskSpec_Config() {}
@@ -2108,22 +2108,21 @@ var File_config_proto protoreflect.FileDescriptor
 
 const file_config_proto_rawDesc = "" +
 	"\n" +
-	"\fconfig.proto\x12\x18unbounded.storage.config\"\xfb\x04\n" +
+	"\fconfig.proto\x12\x18unbounded.storage.config\"\xd4\x04\n" +
 	"\x06Config\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\x04R\aversion\x12>\n" +
 	"\astartup\x18\x02 \x01(\v2$.unbounded.storage.config.StartupCfgR\astartup\x12D\n" +
 	"\tfrontends\x18\x03 \x03(\v2&.unbounded.storage.config.FrontendSpecR\tfrontends\x12A\n" +
 	"\bbackends\x18\x04 \x03(\v2%.unbounded.storage.config.BackendSpecR\bbackends\x12;\n" +
 	"\x06caches\x18\x05 \x03(\v2#.unbounded.storage.config.CacheSpecR\x06caches\x128\n" +
-	"\x05disks\x18\a \x03(\v2\".unbounded.storage.config.DiskSpecR\x05disks\x12-\n" +
-	"\x10fingers_per_node\x18\b \x01(\rH\x00R\x0efingersPerNode\x88\x01\x01\x12\x12\n" +
-	"\x04self\x18\t \x01(\tR\x04self\x12M\n" +
-	"\frouting_plan\x18\v \x01(\v2%.unbounded.storage.config.RoutingPlanH\x01R\vroutingPlan\x88\x01\x01\x128\n" +
-	"\x05peers\x18\f \x03(\v2\".unbounded.storage.config.PeerSpecR\x05peersB\x13\n" +
+	"\x05disks\x18\x06 \x03(\v2\".unbounded.storage.config.DiskSpecR\x05disks\x12-\n" +
+	"\x10fingers_per_node\x18\a \x01(\rH\x00R\x0efingersPerNode\x88\x01\x01\x12\x12\n" +
+	"\x04self\x18\b \x01(\tR\x04self\x12M\n" +
+	"\frouting_plan\x18\t \x01(\v2%.unbounded.storage.config.RoutingPlanH\x01R\vroutingPlan\x88\x01\x01\x128\n" +
+	"\x05peers\x18\n" +
+	" \x03(\v2\".unbounded.storage.config.PeerSpecR\x05peersB\x13\n" +
 	"\x11_fingers_per_nodeB\x0f\n" +
-	"\r_routing_planJ\x04\b\x06\x10\aJ\x04\b\n" +
-	"\x10\vR\rneighborhoodsR\n" +
-	"local_tags\"\x8f\x01\n" +
+	"\r_routing_plan\"\x8f\x01\n" +
 	"\vRoutingPlan\x12\x18\n" +
 	"\afingers\x18\x01 \x03(\tR\afingers\x12!\n" +
 	"\tsuccessor\x18\x02 \x01(\tH\x00R\tsuccessor\x88\x01\x01\x12%\n" +
@@ -2196,12 +2195,12 @@ const file_config_proto_rawDesc = "" +
 	"queueDepth\x88\x01\x01\x12+\n" +
 	"\x0fpage_size_bytes\x18\x02 \x01(\x04H\x02R\rpageSizeBytes\x88\x01\x01\x12,\n" +
 	"\x12skip_recovery_scan\x18\x03 \x01(\bR\x10skipRecoveryScan\x12!\n" +
-	"\fforce_format\x18\x06 \x01(\bR\vforceFormat\x12)\n" +
-	"\x10bypass_admission\x18\a \x01(\bR\x0fbypassAdmission\x12*\n" +
-	"\x11bypass_index_read\x18\b \x01(\bR\x0fbypassIndexRead\x12'\n" +
-	"\x0fbypass_checksum\x18\t \x01(\bR\x0ebypassChecksum\x12A\n" +
-	"\x05block\x18\x04 \x01(\v2).unbounded.storage.config.BlockDiskConfigH\x00R\x05block\x12>\n" +
-	"\x04file\x18\x05 \x01(\v2(.unbounded.storage.config.FileDiskConfigH\x00R\x04fileB\b\n" +
+	"\fforce_format\x18\x04 \x01(\bR\vforceFormat\x12)\n" +
+	"\x10bypass_admission\x18\x05 \x01(\bR\x0fbypassAdmission\x12*\n" +
+	"\x11bypass_index_read\x18\x06 \x01(\bR\x0fbypassIndexRead\x12'\n" +
+	"\x0fbypass_checksum\x18\a \x01(\bR\x0ebypassChecksum\x12A\n" +
+	"\x05block\x18\b \x01(\v2).unbounded.storage.config.BlockDiskConfigH\x00R\x05block\x12>\n" +
+	"\x04file\x18\t \x01(\v2(.unbounded.storage.config.FileDiskConfigH\x00R\x04fileB\b\n" +
 	"\x06configB\x0e\n" +
 	"\f_queue_depthB\x12\n" +
 	"\x10_page_size_bytes\"G\n" +

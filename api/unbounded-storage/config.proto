@@ -8,9 +8,6 @@ package unbounded.storage.config;
 option go_package = "github.com/Azure/unbounded/api/unbounded-storage;storageconfig";
 
 message Config {
-  reserved 6, 10;
-  reserved "neighborhoods", "local_tags";
-
   // Operator-assigned opaque version tracked so operators can confirm which config has been applied. 0 means unversioned.
   uint64 version = 1;
 
@@ -20,22 +17,22 @@ message Config {
   repeated FrontendSpec frontends = 3;
   repeated BackendSpec backends = 4;
   repeated CacheSpec caches = 5;
-  repeated DiskSpec disks = 7;
+  repeated DiskSpec disks = 6;
 
   // Number of deterministic finger-table entries to derive per peer. Defaults to 100 when unset.
-  optional uint32 fingers_per_node = 8;
+  optional uint32 fingers_per_node = 7;
 
   // Name of this process in the `peers` roster. Required when peers or a
   // routing plan are configured. The internal ring and fabric ids are derived
   // from this peer name and are startup-fixed.
-  string self = 9;
+  string self = 8;
 
   // Precomputed routing table for this process. When set, `peers` can be
   // sparse, containing only this process's routing neighbors.
-  optional RoutingPlan routing_plan = 11;
+  optional RoutingPlan routing_plan = 9;
 
   // Process-wide peer definitions for the globally shared transport mesh.
-  repeated PeerSpec peers = 12;
+  repeated PeerSpec peers = 10;
 }
 
 // A precomputed routing table for a single node, produced by a
@@ -76,7 +73,7 @@ message TcpPeerConfig {
 message RdmaPeerConfig {
   // Default RDMA fabric address. Provider-native addresses are encoded as
   // "hex:<fi_getname-bytes>"; RDMA-CM socket addresses are accepted when the
-  // provider reports them. Kept for single-endpoint peers and older writers.
+  // provider reports them.
   string addr = 1;
 
   // Ordered RDMA fabric addresses for peers that expose multiple fabric units,
@@ -192,27 +189,27 @@ message DiskSpec {
 
   // Destructively resets the cache index on open, ignoring any existing on-disk metadata.
   // Intended only for benchmark cache devices that are safe to reformat between runs.
-  bool force_format = 6;
+  bool force_format = 4;
 
   // Admit every write into the cache index instead of requiring the default
   // second touch. Intended for benchmark warmups that must prefill NVMe devices
   // with a cold synthetic keyspace.
-  bool bypass_admission = 7;
+  bool bypass_admission = 5;
 
   // Serve reads from the committed in-memory index mirror instead of reading
   // the terminal btree leaf from disk. Intended only for benchmark devices
   // where recovery/corruption validation has been deliberately traded for
   // measuring the data-page path.
-  bool bypass_index_read = 8;
+  bool bypass_index_read = 6;
 
   // Skip data checksum validation on reads. Intended only for benchmark
   // devices where cache contents were just populated by the same daemon and
   // the target is measuring the NVMe data path rather than CPU checksum cost.
-  bool bypass_checksum = 9;
+  bool bypass_checksum = 7;
 
   oneof config {
-    BlockDiskConfig block = 4;
-    FileDiskConfig file = 5;
+    BlockDiskConfig block = 8;
+    FileDiskConfig file = 9;
   }
 }
 
