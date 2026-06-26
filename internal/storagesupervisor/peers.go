@@ -16,7 +16,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -52,9 +51,9 @@ type ringState struct {
 	peers []*storageconfig.PeerSpec
 }
 
-// peerWatcher watches cluster Nodes carrying the storage-ring label and turns
-// the membership view into a ringState on demand. It signals the run loop on
-// every membership change so the config is re-rendered.
+// peerWatcher watches cluster Nodes and turns the self node's annotations plus
+// storage-ring membership view into renderState on demand. It signals the run
+// loop on every node change so the config is re-rendered.
 type peerWatcher struct {
 	selfName  string
 	ringLabel string
@@ -98,13 +97,7 @@ func newPeerWatcher(cfg Config, cs kubernetes.Interface) (*peerWatcher, error) {
 		}
 	}
 
-	// Scope the node watch to nodes that carry the ring label at all (an
-	// Exists selector); membership by value is resolved in computeRing.
-	factory := informers.NewSharedInformerFactoryWithOptions(cs, nodeInformerResync,
-		informers.WithTweakListOptions(func(lo *metav1.ListOptions) {
-			lo.LabelSelector = cfg.StorageRingLabel
-		}),
-	)
+	factory := informers.NewSharedInformerFactory(cs, nodeInformerResync)
 
 	w := &peerWatcher{
 		selfName:  cfg.NodeName,
@@ -160,18 +153,12 @@ func (w *peerWatcher) signal() {
 	}
 }
 
-// snapshot computes the current ring from the informer's node store and the
-// fabric port. A zero or unparseable port yields an inactive ring: without a
+// snapshot computes the current render state from the informer's node store and
+// the fabric port. A zero or unparseable port yields an inactive ring: without a
 // fixed port the daemon's fabric addr stays ephemeral and peer addresses are
-// unreachable, so emitting peers would be misleading.
-func (w *peerWatcher) snapshot(port int, portOK bool) ringState {
-	if !portOK || port == 0 {
-		slog.Warn("storage ring inactive: no fixed fabric port set in startup.fabric.tcp.addr; "+
-			"set a non-zero port (e.g. 0.0.0.0:9000) to enable peering", "node", w.selfName)
-
-		return ringState{}
-	}
-
+// unreachable, so emitting peers would be misleading. Node annotations are still
+// returned when the ring is inactive.
+func (w *peerWatcher) snapshot(port int, portOK bool) renderState {
 	objs := w.informer.GetStore().List()
 
 	nodes := make([]*corev1.Node, 0, len(objs))
@@ -182,7 +169,17 @@ func (w *peerWatcher) snapshot(port int, portOK bool) ringState {
 		}
 	}
 
-	return computeRing(nodes, w.selfName, w.ringLabel, port)
+	state := renderState{annotations: selfAnnotations(nodes, w.selfName)}
+	if !portOK || port == 0 {
+		slog.Warn("storage ring inactive: no fixed fabric port set in startup.fabric.tcp.addr; "+
+			"set a non-zero port (e.g. 0.0.0.0:9000) to enable peering", "node", w.selfName)
+
+		return state
+	}
+
+	state.ring = computeRing(nodes, w.selfName, w.ringLabel, port)
+
+	return state
 }
 
 // computeRing is the pure core of peer discovery: given the ring-labelled
@@ -207,7 +204,7 @@ func computeRing(nodes []*corev1.Node, selfName, ringLabel string, port int) rin
 	}
 
 	if self == nil {
-		slog.Warn("storage ring inactive: this node not found among ring-labelled nodes", "node", selfName)
+		slog.Warn("storage ring inactive: this node not found among watched nodes", "node", selfName)
 
 		return ringState{}
 	}
@@ -272,6 +269,27 @@ func computeRing(nodes []*corev1.Node, selfName, ringLabel string, port int) rin
 	sort.Slice(ring.peers, func(i, j int) bool { return ring.peers[i].Id < ring.peers[j].Id })
 
 	return ring
+}
+
+func selfAnnotations(nodes []*corev1.Node, selfName string) map[string]string {
+	for _, n := range nodes {
+		if n.Name != selfName {
+			continue
+		}
+
+		if len(n.Annotations) == 0 {
+			return nil
+		}
+
+		annotations := make(map[string]string, len(n.Annotations))
+		for k, v := range n.Annotations {
+			annotations[k] = v
+		}
+
+		return annotations
+	}
+
+	return nil
 }
 
 // nodeID derives a node's stable storage id from its name via 64-bit FNV-1a.

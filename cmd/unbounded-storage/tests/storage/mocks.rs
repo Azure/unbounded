@@ -10,14 +10,14 @@
 //! (delay bound, fault rate) live on a local `MockSimConfig` held
 //! behind an `Rc`, never on the framework's [`SimState`].
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use rand::Rng;
 use unbounded_storage::storage::blockdev::{BlockDevice, MockDevice, MockDeviceConfig};
 use unbounded_storage::storage::types::{Error, Lba};
 
-use crate::framework::executor::{with_sim, yield_n};
+use crate::framework::executor::{with_sim, yield_n, yield_once};
 
 /// Storage-DST simulation knobs. Mirrors the bufferpool DST's
 /// `MockSimConfig` so the two harnesses read the same way side by
@@ -76,6 +76,7 @@ pub struct SimBlockDevice {
     corruptions_injected: Cell<u64>,
     inflight: Cell<u32>,
     max_inflight: Cell<u32>,
+    read_pause: RefCell<Option<Rc<ReadPause>>>,
 }
 
 impl SimBlockDevice {
@@ -89,6 +90,7 @@ impl SimBlockDevice {
             corruptions_injected: Cell::new(0),
             inflight: Cell::new(0),
             max_inflight: Cell::new(0),
+            read_pause: RefCell::new(None),
         }
     }
 
@@ -122,6 +124,50 @@ impl SimBlockDevice {
     pub fn poke(&self, lba: Lba, src: &[u8]) {
         self.inner.poke(lba, src);
     }
+
+    pub fn pause_next_read(&self, lba: Lba) -> Rc<ReadPause> {
+        let pause = Rc::new(ReadPause::new(lba));
+        *self.read_pause.borrow_mut() = Some(pause.clone());
+        pause
+    }
+}
+
+pub struct ReadPause {
+    lba: Lba,
+    armed: Cell<bool>,
+    paused: Cell<bool>,
+    released: Cell<bool>,
+}
+
+impl ReadPause {
+    fn new(lba: Lba) -> Self {
+        Self {
+            lba,
+            armed: Cell::new(true),
+            paused: Cell::new(false),
+            released: Cell::new(false),
+        }
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused.get()
+    }
+
+    pub fn release(&self) {
+        self.released.set(true);
+    }
+
+    fn try_pause(&self, lba: Lba) -> bool {
+        if self.lba != lba || !self.armed.replace(false) {
+            return false;
+        }
+        self.paused.set(true);
+        true
+    }
+
+    fn released(&self) -> bool {
+        self.released.get()
+    }
 }
 
 impl BlockDevice for SimBlockDevice {
@@ -146,6 +192,14 @@ impl BlockDevice for SimBlockDevice {
         let fault = draw_fault(&self.cfg);
         let _guard = InflightGuard::enter(self);
         yield_n(delay).await;
+        let pause = self.read_pause.borrow().as_ref().cloned();
+        if let Some(pause) = pause {
+            if pause.try_pause(lba) {
+                while !pause.released() {
+                    yield_once().await;
+                }
+            }
+        }
         self.reads.set(self.reads.get() + 1);
         if fault {
             self.io_errors.set(self.io_errors.get() + 1);

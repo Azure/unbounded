@@ -34,7 +34,13 @@ func writeSource(t *testing.T, configYAML string) string {
 func decode(t *testing.T, dir string) *storageconfig.Config {
 	t.Helper()
 
-	data, err := RenderConfig(dir, ringState{})
+	return decodeWithState(t, dir, renderState{})
+}
+
+func decodeWithState(t *testing.T, dir string, state renderState) *storageconfig.Config {
+	t.Helper()
+
+	data, err := RenderConfig(dir, state)
 	require.NoError(t, err)
 
 	var cfg storageconfig.Config
@@ -185,7 +191,7 @@ func TestRenderConfigInvalidValues(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := writeSource(t, tt.yaml)
 
-			_, err := RenderConfig(dir, ringState{})
+			_, err := RenderConfig(dir, renderState{})
 			require.Error(t, err)
 		})
 	}
@@ -220,7 +226,7 @@ neighborhoods:
 		},
 	}
 
-	data, err := RenderConfig(dir, ring)
+	data, err := RenderConfig(dir, renderState{ring: ring})
 	require.NoError(t, err)
 
 	var cfg storageconfig.Config
@@ -277,7 +283,7 @@ neighborhoods:
 		},
 	}
 
-	data, err := RenderConfig(dir, ring)
+	data, err := RenderConfig(dir, renderState{ring: ring})
 	require.NoError(t, err)
 
 	var cfg storageconfig.Config
@@ -328,7 +334,7 @@ backends:
 		},
 	}
 
-	data, err := RenderConfig(dir, ring)
+	data, err := RenderConfig(dir, renderState{ring: ring})
 	require.NoError(t, err)
 
 	var cfg storageconfig.Config
@@ -368,7 +374,7 @@ neighborhoods:
 		},
 	}
 
-	data, err := RenderConfig(dir, ring)
+	data, err := RenderConfig(dir, renderState{ring: ring})
 	require.NoError(t, err)
 
 	var cfg storageconfig.Config
@@ -411,6 +417,221 @@ neighborhoods:
 	require.Len(t, cfg.GetNeighborhoods()[0].GetPeers(), 1)
 	assert.Equal(t, uint64(100), cfg.GetNeighborhoods()[0].GetPeers()[0].GetId())
 	assert.Equal(t, "0.0.0.0:0", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
+}
+
+func TestRenderConfigInjectsAnnotatedBlockDisks(t *testing.T) {
+	dir := writeSource(t, `
+version: 1
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{
+			storageDisksAnnotation: "/dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0;skip_recovery_scan=true",
+		},
+	})
+
+	require.Len(t, cfg.GetDisks(), 1)
+
+	disk := cfg.GetDisks()[0]
+	assert.Equal(t, "/dev/nvme1n1", disk.GetBlock().GetPath())
+	assert.NotNil(t, disk.QueueDepth)
+	assert.Equal(t, uint32(256), disk.GetQueueDepth())
+	assert.NotNil(t, disk.PageSizeBytes)
+	assert.Equal(t, uint64(4096), disk.GetPageSizeBytes())
+	assert.NotNil(t, disk.GetBlock().Numa)
+	assert.Equal(t, uint32(0), disk.GetBlock().GetNuma())
+	assert.True(t, disk.GetSkipRecoveryScan())
+}
+
+func TestRenderConfigInjectsMultipleAnnotatedBlockDisks(t *testing.T) {
+	dir := writeSource(t, `
+version: 1
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{
+			storageDisksAnnotation: "/dev/nvme1n1;queue_depth=128,/dev/nvme2n1;numa=1",
+		},
+	})
+
+	require.Len(t, cfg.GetDisks(), 2)
+	assert.Equal(t, "/dev/nvme1n1", cfg.GetDisks()[0].GetBlock().GetPath())
+	assert.Equal(t, uint32(128), cfg.GetDisks()[0].GetQueueDepth())
+	assert.Equal(t, "/dev/nvme2n1", cfg.GetDisks()[1].GetBlock().GetPath())
+	assert.Equal(t, uint32(1), cfg.GetDisks()[1].GetBlock().GetNuma())
+}
+
+func TestRenderConfigIgnoresInvalidAnnotatedOptions(t *testing.T) {
+	dir := writeSource(t, `
+version: 1
+`)
+
+	var logs bytes.Buffer
+
+	previousLogger := slog.Default()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{
+			storageDisksAnnotation: "/dev/nvme1n1;unknown=x;queue_depth=0;queue_depth=512;queue_depth=1024;page_size_bytes=bad;skip_recovery_scan=maybe;numa=bad;empty=;=value;missing",
+		},
+	})
+
+	require.Len(t, cfg.GetDisks(), 1)
+	disk := cfg.GetDisks()[0]
+	assert.Equal(t, "/dev/nvme1n1", disk.GetBlock().GetPath())
+	assert.NotNil(t, disk.QueueDepth)
+	assert.Equal(t, uint32(512), disk.GetQueueDepth())
+	assert.Nil(t, disk.PageSizeBytes)
+	assert.Nil(t, disk.GetBlock().Numa)
+	assert.False(t, disk.GetSkipRecoveryScan())
+	assert.Contains(t, logs.String(), "ignoring unknown storage disk option")
+	assert.Contains(t, logs.String(), "ignoring duplicate storage disk option")
+}
+
+func TestRenderConfigInvalidAnnotatedDiskSpecsAreSkipped(t *testing.T) {
+	dir := writeSource(t, `
+version: 1
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{
+			storageDisksAnnotation:    " , ;queue_depth=256, /dev/nvme1n1, /dev/nvme1n1",
+			storageFileSizeAnnotation: "4294967296",
+		},
+	})
+
+	require.Len(t, cfg.GetDisks(), 1)
+	disk := cfg.GetDisks()[0]
+	require.NotNil(t, disk.GetBlock())
+	assert.Equal(t, "/dev/nvme1n1", disk.GetBlock().GetPath())
+}
+
+func TestRenderConfigAllInvalidAnnotatedDisksFallsBackToFile(t *testing.T) {
+	dir := writeSource(t, `
+version: 1
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{
+			storageDisksAnnotation:    " , relative-path;queue_depth=256, ;numa=1",
+			storageFileSizeAnnotation: "4294967296",
+		},
+	})
+
+	require.Len(t, cfg.GetDisks(), 1)
+	disk := cfg.GetDisks()[0]
+	require.NotNil(t, disk.GetFile())
+	assert.Equal(t, defaultStorageFileDiskPath, disk.GetFile().GetPath())
+	assert.Equal(t, uint64(4294967296), disk.GetFile().GetSize())
+}
+
+func TestRenderConfigBlankAnnotatedDisksFallsBackToFile(t *testing.T) {
+	dir := writeSource(t, `
+version: 1
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{
+			storageDisksAnnotation:    " , ",
+			storageFileSizeAnnotation: "4294967296",
+		},
+	})
+
+	require.Len(t, cfg.GetDisks(), 1)
+	disk := cfg.GetDisks()[0]
+	assert.Equal(t, defaultStorageFileDiskPath, disk.GetFile().GetPath())
+	assert.Equal(t, uint64(4294967296), disk.GetFile().GetSize())
+}
+
+func TestRenderConfigFallbackFileDiskDefaultSize(t *testing.T) {
+	dir := writeSource(t, `
+version: 1
+`)
+
+	cfg := decode(t, dir)
+
+	require.Len(t, cfg.GetDisks(), 1)
+	disk := cfg.GetDisks()[0]
+	assert.Equal(t, defaultStorageFileDiskPath, disk.GetFile().GetPath())
+	assert.Equal(t, defaultStorageFileDiskSize, disk.GetFile().GetSize())
+	assert.False(t, disk.GetSkipRecoveryScan())
+}
+
+func TestRenderConfigInvalidFileSizeAnnotationFallsBackToDefault(t *testing.T) {
+	tests := []struct {
+		name string
+		size string
+	}{
+		{name: "not uint", size: "big"},
+		{name: "zero", size: "0"},
+		{name: "not page aligned", size: "4097"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := writeSource(t, `
+version: 1
+`)
+
+			cfg := decodeWithState(t, dir, renderState{
+				annotations: map[string]string{storageFileSizeAnnotation: tt.size},
+			})
+
+			require.Len(t, cfg.GetDisks(), 1)
+			assert.Equal(t, defaultStorageFileDiskSize, cfg.GetDisks()[0].GetFile().GetSize())
+		})
+	}
+}
+
+func TestRenderConfigPreservesExplicitConfigMapDisks(t *testing.T) {
+	dir := writeSource(t, `
+disks:
+  - file:
+      path: /custom/cache.disk
+      size: 1073741824
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{storageDisksAnnotation: "/dev/nvme1n1"},
+	})
+
+	require.Len(t, cfg.GetDisks(), 1)
+	disk := cfg.GetDisks()[0]
+	assert.Equal(t, "/custom/cache.disk", disk.GetFile().GetPath())
+	assert.Equal(t, uint64(1073741824), disk.GetFile().GetSize())
+}
+
+func TestRenderConfigCachesUntouched(t *testing.T) {
+	dir := writeSource(t, `
+caches:
+  - name: cache-a
+    source: p2p
+  - name: cache-b
+    source: p2p
+`)
+
+	cfg := decode(t, dir)
+
+	require.Len(t, cfg.GetCaches(), 2)
+	assert.Equal(t, "cache-a", cfg.GetCaches()[0].GetName())
+	assert.Equal(t, "cache-b", cfg.GetCaches()[1].GetName())
+	require.Len(t, cfg.GetDisks(), 1)
+}
+
+func TestRenderConfigNoCachesInjectsDisks(t *testing.T) {
+	dir := writeSource(t, `
+version: 1
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{storageDisksAnnotation: "/dev/nvme1n1"},
+	})
+
+	require.Len(t, cfg.GetDisks(), 1)
+	assert.Equal(t, "/dev/nvme1n1", cfg.GetDisks()[0].GetBlock().GetPath())
 }
 
 func TestWriteConfigAtomic(t *testing.T) {

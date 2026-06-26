@@ -34,6 +34,7 @@ type Config struct {
 	Backends      []*BackendSpec      `protobuf:"bytes,4,rep,name=backends,proto3" json:"backends,omitempty"`
 	Caches        []*CacheSpec        `protobuf:"bytes,5,rep,name=caches,proto3" json:"caches,omitempty"`
 	Neighborhoods []*NeighborhoodSpec `protobuf:"bytes,6,rep,name=neighborhoods,proto3" json:"neighborhoods,omitempty"`
+	Disks         []*DiskSpec         `protobuf:"bytes,7,rep,name=disks,proto3" json:"disks,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -106,6 +107,13 @@ func (x *Config) GetCaches() []*CacheSpec {
 func (x *Config) GetNeighborhoods() []*NeighborhoodSpec {
 	if x != nil {
 		return x.Neighborhoods
+	}
+	return nil
+}
+
+func (x *Config) GetDisks() []*DiskSpec {
+	if x != nil {
+		return x.Disks
 	}
 	return nil
 }
@@ -1058,11 +1066,9 @@ func (x *RdmaPeerConfig) GetAddr() string {
 }
 
 type CacheSpec struct {
-	state  protoimpl.MessageState `protogen:"open.v1"`
-	Name   string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Source string                 `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
-	// Disk definitions attached to this cache.
-	Disks         []*DiskSpec `protobuf:"bytes,3,rep,name=disks,proto3" json:"disks,omitempty"`
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Source        string                 `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1109,13 +1115,6 @@ func (x *CacheSpec) GetSource() string {
 		return x.Source
 	}
 	return ""
-}
-
-func (x *CacheSpec) GetDisks() []*DiskSpec {
-	if x != nil {
-		return x.Disks
-	}
-	return nil
 }
 
 type DiskSpec struct {
@@ -1231,7 +1230,7 @@ type BlockDiskConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Optional NUMA node hint used when placing storage work for this block device.
 	Numa *uint32 `protobuf:"varint,1,opt,name=numa,proto3,oneof" json:"numa,omitempty"`
-	// Block device path; paths must be unique across all caches.
+	// Block device path; paths must be unique across all disks.
 	Path          string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1285,7 +1284,7 @@ type FileDiskConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Required file-backed disk capacity in bytes; the file is provisioned to this size before opening.
 	Size *uint64 `protobuf:"varint,1,opt,name=size,proto3,oneof" json:"size,omitempty"`
-	// Backing-file path; paths must be unique across all caches.
+	// Backing-file path; paths must be unique across all disks.
 	Path          string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2059,14 +2058,15 @@ var File_config_proto protoreflect.FileDescriptor
 
 const file_config_proto_rawDesc = "" +
 	"\n" +
-	"\fconfig.proto\x12\x18unbounded.storage.config\"\xfa\x02\n" +
+	"\fconfig.proto\x12\x18unbounded.storage.config\"\xb4\x03\n" +
 	"\x06Config\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\x04R\aversion\x12>\n" +
 	"\astartup\x18\x02 \x01(\v2$.unbounded.storage.config.StartupCfgR\astartup\x12D\n" +
 	"\tfrontends\x18\x03 \x03(\v2&.unbounded.storage.config.FrontendSpecR\tfrontends\x12A\n" +
 	"\bbackends\x18\x04 \x03(\v2%.unbounded.storage.config.BackendSpecR\bbackends\x12;\n" +
 	"\x06caches\x18\x05 \x03(\v2#.unbounded.storage.config.CacheSpecR\x06caches\x12P\n" +
-	"\rneighborhoods\x18\x06 \x03(\v2*.unbounded.storage.config.NeighborhoodSpecR\rneighborhoods\"\x89\x02\n" +
+	"\rneighborhoods\x18\x06 \x03(\v2*.unbounded.storage.config.NeighborhoodSpecR\rneighborhoods\x128\n" +
+	"\x05disks\x18\a \x03(\v2\".unbounded.storage.config.DiskSpecR\x05disks\"\x89\x02\n" +
 	"\n" +
 	"StartupCfg\x12;\n" +
 	"\x06memory\x18\x01 \x01(\v2#.unbounded.storage.config.MemoryCfgR\x06memory\x12;\n" +
@@ -2141,11 +2141,10 @@ const file_config_proto_rawDesc = "" +
 	"\rTcpPeerConfig\x12\x12\n" +
 	"\x04addr\x18\x01 \x01(\tR\x04addr\"$\n" +
 	"\x0eRdmaPeerConfig\x12\x12\n" +
-	"\x04addr\x18\x01 \x01(\tR\x04addr\"q\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"7\n" +
 	"\tCacheSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
-	"\x06source\x18\x02 \x01(\tR\x06source\x128\n" +
-	"\x05disks\x18\x03 \x03(\v2\".unbounded.storage.config.DiskSpecR\x05disks\"\xbc\x02\n" +
+	"\x06source\x18\x02 \x01(\tR\x06source\"\xbc\x02\n" +
 	"\bDiskSpec\x12$\n" +
 	"\vqueue_depth\x18\x01 \x01(\rH\x01R\n" +
 	"queueDepth\x88\x01\x01\x12+\n" +
@@ -2281,19 +2280,19 @@ var file_config_proto_depIdxs = []int32{
 	19, // 2: unbounded.storage.config.Config.backends:type_name -> unbounded.storage.config.BackendSpec
 	15, // 3: unbounded.storage.config.Config.caches:type_name -> unbounded.storage.config.CacheSpec
 	10, // 4: unbounded.storage.config.Config.neighborhoods:type_name -> unbounded.storage.config.NeighborhoodSpec
-	3,  // 5: unbounded.storage.config.StartupCfg.memory:type_name -> unbounded.storage.config.MemoryCfg
-	4,  // 6: unbounded.storage.config.StartupCfg.fabric:type_name -> unbounded.storage.config.FabricCfg
-	9,  // 7: unbounded.storage.config.StartupCfg.topology:type_name -> unbounded.storage.config.TopologyCfg
-	2,  // 8: unbounded.storage.config.StartupCfg.metrics:type_name -> unbounded.storage.config.MetricsCfg
-	5,  // 9: unbounded.storage.config.FabricCfg.tcp:type_name -> unbounded.storage.config.TcpFabricBinds
-	6,  // 10: unbounded.storage.config.FabricCfg.rdma:type_name -> unbounded.storage.config.RdmaFabricBinds
-	7,  // 11: unbounded.storage.config.FabricCfg.auto_rdma:type_name -> unbounded.storage.config.AutoRdmaFabricBinds
-	8,  // 12: unbounded.storage.config.RdmaFabricBinds.binds:type_name -> unbounded.storage.config.RdmaFabricBind
-	11, // 13: unbounded.storage.config.NeighborhoodSpec.routing_plan:type_name -> unbounded.storage.config.RoutingPlan
-	12, // 14: unbounded.storage.config.NeighborhoodSpec.peers:type_name -> unbounded.storage.config.PeerSpec
-	13, // 15: unbounded.storage.config.PeerSpec.tcp:type_name -> unbounded.storage.config.TcpPeerConfig
-	14, // 16: unbounded.storage.config.PeerSpec.rdma:type_name -> unbounded.storage.config.RdmaPeerConfig
-	16, // 17: unbounded.storage.config.CacheSpec.disks:type_name -> unbounded.storage.config.DiskSpec
+	16, // 5: unbounded.storage.config.Config.disks:type_name -> unbounded.storage.config.DiskSpec
+	3,  // 6: unbounded.storage.config.StartupCfg.memory:type_name -> unbounded.storage.config.MemoryCfg
+	4,  // 7: unbounded.storage.config.StartupCfg.fabric:type_name -> unbounded.storage.config.FabricCfg
+	9,  // 8: unbounded.storage.config.StartupCfg.topology:type_name -> unbounded.storage.config.TopologyCfg
+	2,  // 9: unbounded.storage.config.StartupCfg.metrics:type_name -> unbounded.storage.config.MetricsCfg
+	5,  // 10: unbounded.storage.config.FabricCfg.tcp:type_name -> unbounded.storage.config.TcpFabricBinds
+	6,  // 11: unbounded.storage.config.FabricCfg.rdma:type_name -> unbounded.storage.config.RdmaFabricBinds
+	7,  // 12: unbounded.storage.config.FabricCfg.auto_rdma:type_name -> unbounded.storage.config.AutoRdmaFabricBinds
+	8,  // 13: unbounded.storage.config.RdmaFabricBinds.binds:type_name -> unbounded.storage.config.RdmaFabricBind
+	11, // 14: unbounded.storage.config.NeighborhoodSpec.routing_plan:type_name -> unbounded.storage.config.RoutingPlan
+	12, // 15: unbounded.storage.config.NeighborhoodSpec.peers:type_name -> unbounded.storage.config.PeerSpec
+	13, // 16: unbounded.storage.config.PeerSpec.tcp:type_name -> unbounded.storage.config.TcpPeerConfig
+	14, // 17: unbounded.storage.config.PeerSpec.rdma:type_name -> unbounded.storage.config.RdmaPeerConfig
 	17, // 18: unbounded.storage.config.DiskSpec.block:type_name -> unbounded.storage.config.BlockDiskConfig
 	18, // 19: unbounded.storage.config.DiskSpec.file:type_name -> unbounded.storage.config.FileDiskConfig
 	20, // 20: unbounded.storage.config.BackendSpec.http:type_name -> unbounded.storage.config.HttpBackendConfig

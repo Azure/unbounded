@@ -81,3 +81,20 @@ func UpdateSymlink(linkPath, targetPath string) error {
 
 	return renameio.Symlink(targetPath, linkPath)
 }
+
+// ProbeWritableDir verifies that dir accepts file creation and removal without
+// leaving durable state behind.
+func ProbeWritableDir(dir string) error {
+	f, err := os.CreateTemp(dir, ".unbounded-probe-*")
+	if err != nil {
+		return err
+	}
+
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		os.Remove(name) //nolint:errcheck // best effort cleanup after close failure.
+		return err
+	}
+
+	return os.Remove(name)
+}
