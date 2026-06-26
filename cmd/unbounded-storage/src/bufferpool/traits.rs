@@ -31,6 +31,14 @@ pub trait Req {
     fn cache_id(&self) -> Option<&String> {
         None
     }
+
+    /// Benchmark-only fast response mode. Normal requests use the
+    /// production store/backend path; request types that return true let
+    /// peer handlers synthesize response pages while still using the
+    /// real fabric RPC/RMA path.
+    fn fabric_only(&self) -> bool {
+        false
+    }
 }
 
 impl Req for StripeKey {

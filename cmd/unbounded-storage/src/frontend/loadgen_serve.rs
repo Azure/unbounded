@@ -48,6 +48,7 @@ pub struct LoadgenFrontend {
     zipf_exponent: f64,
     verify: bool,
     remote_only: bool,
+    fabric_only: bool,
 }
 
 impl LoadgenFrontend {
@@ -77,6 +78,7 @@ impl LoadgenFrontend {
             zipf_exponent,
             verify: loadgen.verify,
             remote_only: loadgen.remote_only,
+            fabric_only: loadgen.fabric_only,
         })
     }
 
@@ -122,6 +124,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> LoadgenDriver<P> {
             verify: frontend.verify,
             routes,
             remote_only: frontend.remote_only,
+            fabric_only: frontend.fabric_only,
         });
         let workers = (0..worker_count)
             .map(|worker_idx| {
@@ -180,6 +183,7 @@ struct LoadgenRun {
     verify: bool,
     routes: RouteTableHandle,
     remote_only: bool,
+    fabric_only: bool,
 }
 
 fn loadgen_worker_loop<P: BufferPool<Req = StripeReq> + 'static>(
@@ -371,6 +375,7 @@ fn request_from_origin(origin_ref: OriginRef, cfg: &LoadgenRun) -> StripeReq {
         .with_origin(origin_ref)
         .with_cache_id(cfg.cache_id.clone())
         .with_bypass(cfg.bypass)
+        .with_fabric_only(cfg.fabric_only)
 }
 
 #[derive(Clone, Copy)]
@@ -513,6 +518,7 @@ mod tests {
             verify: false,
             routes: RouteTableHandle::empty(),
             remote_only: false,
+            fabric_only: false,
         }
     }
 
@@ -625,6 +631,7 @@ mod tests {
         assert_eq!(frontend.zipf_exponent, DEFAULT_ZIPF_EXPONENT);
         assert!(!frontend.verify);
         assert!(!frontend.remote_only);
+        assert!(!frontend.fabric_only);
     }
 
     #[test]
@@ -639,6 +646,7 @@ mod tests {
             zipf_exponent: Some(1.0),
             verify: false,
             remote_only: false,
+            fabric_only: false,
         }));
         let frontend = LoadgenFrontend::from_spec(&spec).unwrap();
         assert_eq!(frontend.workers, 0);
@@ -658,6 +666,18 @@ mod tests {
 
         let frontend = LoadgenFrontend::from_spec(&spec).unwrap();
         assert!(frontend.remote_only);
+    }
+
+    #[test]
+    fn fabric_only_flag_loads_from_spec() {
+        let mut spec = loadgen_spec();
+        spec.config = Some(frontend_spec::Config::Loadgen(LoadgenFrontendConfig {
+            fabric_only: true,
+            ..LoadgenFrontendConfig::default()
+        }));
+
+        let frontend = LoadgenFrontend::from_spec(&spec).unwrap();
+        assert!(frontend.fabric_only);
     }
 
     #[test]
@@ -725,6 +745,7 @@ mod tests {
     fn request_carries_origin_chain_and_bypass() {
         let mut cfg = run_cfg();
         cfg.bypass = true;
+        cfg.fabric_only = true;
         let origin = OriginRef::new("fake", "obj", 3);
         let key = origin.stripe_key_for_cache("cache");
         let req = request_from_origin(origin, &cfg);
@@ -732,6 +753,7 @@ mod tests {
         assert_eq!(req.origin().unwrap().backend_id, "fake");
         assert_eq!(req.cache_id(), Some("cache"));
         assert!(crate::bufferpool::Req::bypass(&req));
+        assert!(req.fabric_only());
     }
 
     #[test]

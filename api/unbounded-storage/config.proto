@@ -339,4 +339,10 @@ message LoadgenFrontendConfig {
   // a peer instead of local ownership. This is intended for fabric saturation
   // benchmarks; the request still uses the normal cache/p2p/storage/origin path.
   bool remote_only = 8;
+
+  // When true, loadgen stamps requests so peer handlers synthesize zero-filled
+  // response pages directly from their RPC scratch buffers. This bypasses disk
+  // and origin work while keeping normal peer routing, fabric RPC framing, and
+  // RDMA writes in the benchmark path.
+  bool fabric_only = 9;
 }

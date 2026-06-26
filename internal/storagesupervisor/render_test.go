@@ -751,7 +751,7 @@ frontends:
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageLoadgenAnnotation: "lg;source=cache;workers=32;seed=1234;keyspace_objects=1000000;object_size_bytes=4194304;read_bytes=262144;zipf_exponent=1.1;verify=true;remote_only=true,lg2;source=origin",
+			storageLoadgenAnnotation: "lg;source=cache;workers=32;seed=1234;keyspace_objects=1000000;object_size_bytes=4194304;read_bytes=262144;zipf_exponent=1.1;verify=true;remote_only=true;fabric_only=true,lg2;source=origin",
 		},
 	})
 
@@ -777,6 +777,7 @@ frontends:
 	assert.Equal(t, 1.1, loadgen.GetZipfExponent())
 	assert.True(t, loadgen.GetVerify())
 	assert.True(t, loadgen.GetRemoteOnly())
+	assert.True(t, loadgen.GetFabricOnly())
 
 	assert.Equal(t, "lg2", cfg.GetFrontends()[2].GetName())
 	assert.Equal(t, "origin", cfg.GetFrontends()[2].GetSource())
@@ -804,7 +805,7 @@ frontends:
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageLoadgenAnnotation: "existing;source=cache,missing-source;workers=1,valid;source=cache;workers=bad;workers=2;zipf_exponent=NaN;zipf_exponent=1.3;verify=maybe;verify=true;remote_only=maybe;remote_only=true,valid;source=origin",
+			storageLoadgenAnnotation: "existing;source=cache,missing-source;workers=1,valid;source=cache;workers=bad;workers=2;zipf_exponent=NaN;zipf_exponent=1.3;verify=maybe;verify=true;remote_only=maybe;remote_only=true;fabric_only=maybe;fabric_only=true,valid;source=origin",
 		},
 	})
 
@@ -817,6 +818,7 @@ frontends:
 	assert.Equal(t, 1.3, loadgen.GetZipfExponent())
 	assert.True(t, loadgen.GetVerify())
 	assert.True(t, loadgen.GetRemoteOnly())
+	assert.True(t, loadgen.GetFabricOnly())
 	assert.Contains(t, logs.String(), "frontend name is already declared")
 	assert.Contains(t, logs.String(), "without source")
 	assert.Contains(t, logs.String(), "invalid storage loadgen uint32 option")

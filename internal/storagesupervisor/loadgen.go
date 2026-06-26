@@ -26,6 +26,7 @@ const (
 	loadgenOptionZipfExponent    = "zipf_exponent"
 	loadgenOptionVerify          = "verify"
 	loadgenOptionRemoteOnly      = "remote_only"
+	loadgenOptionFabricOnly      = "fabric_only"
 )
 
 func applyLoadgenOverlay(cfg *storageconfig.Config, annotations map[string]string) {
@@ -198,6 +199,15 @@ func applyLoadgenOption(frontend *storageconfig.FrontendSpec, raw string, seen m
 		}
 
 		loadgen.RemoteOnly = v
+	case loadgenOptionFabricOnly:
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			slog.Warn("ignoring invalid storage loadgen bool option", "name", name, "key", key, "value", value)
+
+			return
+		}
+
+		loadgen.FabricOnly = v
 	default:
 		slog.Warn("ignoring unknown storage loadgen option", "name", name, "key", key)
 

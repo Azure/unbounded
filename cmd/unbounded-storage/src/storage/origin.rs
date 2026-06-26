@@ -164,6 +164,11 @@ pub struct StripeReq {
     /// and defaults the field to `false` on decode.
     #[serde(skip)]
     bypass: bool,
+    /// Benchmark-only flag carried over the fabric. Peer handlers use it
+    /// to synthesize response pages from their RPC scratch buffers so a
+    /// loadgen run can measure fabric RPC/RMA capacity without disk or
+    /// origin work in the server path.
+    fabric_only: bool,
 }
 
 impl StripeReq {
@@ -175,6 +180,7 @@ impl StripeReq {
             origin: None,
             cache_id: None,
             bypass: false,
+            fabric_only: false,
         }
     }
 
@@ -201,6 +207,12 @@ impl StripeReq {
         self
     }
 
+    /// Mark the request as a synthetic fabric benchmark request.
+    pub fn with_fabric_only(mut self, fabric_only: bool) -> Self {
+        self.fabric_only = fabric_only;
+        self
+    }
+
     /// The origin mapping, if one was attached. `None` for requests
     /// that never reach the origin tier.
     pub fn origin(&self) -> Option<&OriginRef> {
@@ -209,6 +221,10 @@ impl StripeReq {
 
     pub fn cache_id(&self) -> Option<&str> {
         self.cache_id.as_deref()
+    }
+
+    pub fn fabric_only(&self) -> bool {
+        self.fabric_only
     }
 }
 
@@ -223,6 +239,10 @@ impl Req for StripeReq {
 
     fn cache_id(&self) -> Option<&String> {
         self.cache_id.as_ref()
+    }
+
+    fn fabric_only(&self) -> bool {
+        self.fabric_only
     }
 }
 
@@ -430,6 +450,27 @@ mod tests {
                 .with_bypass(false)
                 .bypass()
         );
+    }
+
+    #[test]
+    fn stripe_req_fabric_only_round_trips_through_bincode() {
+        let origin = OriginRef::new("primary-s3", "models/llama.bin", 7);
+        let req = StripeReq::new(origin.stripe_key())
+            .with_origin(origin.clone())
+            .with_fabric_only(true);
+
+        let bytes = bincode::serialize(&req).unwrap();
+        let back: StripeReq = bincode::deserialize(&bytes).unwrap();
+
+        assert!(back.fabric_only());
+        assert_eq!(back.origin(), Some(&origin));
+    }
+
+    #[test]
+    fn stripe_req_fabric_only_defaults_false() {
+        let k = OriginRef::new("primary-s3", "models/llama.bin", 12).stripe_key();
+
+        assert!(!StripeReq::new(k).fabric_only());
     }
 
     #[test]
