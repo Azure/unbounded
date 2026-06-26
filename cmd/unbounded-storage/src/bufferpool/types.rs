@@ -23,6 +23,15 @@ pub struct PageRef {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StripeKey(pub [u8; 32]);
 
+/// Single-flight scope for an active stripe. Requests in different
+/// cache namespaces may carry different eviction policy, so they must
+/// not collapse onto the same blockstore lookup or writeback.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StripeFetchKey {
+    pub stripe: StripeKey,
+    pub cache_id: Option<String>,
+}
+
 /// A byte range within a peer-side stripe, passed to
 /// `Transport::bulk_get`. `len` is bounded by `page_size`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

@@ -14,7 +14,7 @@ use crate::bufferpool::inflight::{PageSlot, SlotState, StripeFetch};
 use crate::bufferpool::pipeline::{PipelinedRead, StripePlan};
 use crate::bufferpool::stream::{LocalBoxFuture, ReadStream, StaticBoxFuture, StreamSrc};
 use crate::bufferpool::traits::{BlockStore, BufferPool, PageCachePolicy, Req, Transport};
-use crate::bufferpool::types::{BulkRef, Error, PageRef, PoolConfig, StripeKey};
+use crate::bufferpool::types::{BulkRef, Error, PageRef, PoolConfig, StripeFetchKey, StripeKey};
 use crate::bufferpool::window::WindowedRead;
 use crate::memory::Backing;
 
@@ -41,9 +41,9 @@ where
     pub(super) backing: Backing,
     pub(super) page_size: usize,
     pub(super) free: Rc<FreeList>,
-    pub(super) inflight: RefCell<HashMap<StripeKey, Rc<RefCell<StripeFetch>>>>,
-    pub(super) cache_lru: RefCell<VecDeque<(StripeKey, u64, u64)>>,
-    pub(super) cache_lru_tokens: RefCell<HashMap<(StripeKey, u64), u64>>,
+    pub(super) inflight: RefCell<HashMap<StripeFetchKey, Rc<RefCell<StripeFetch>>>>,
+    pub(super) cache_lru: RefCell<VecDeque<(StripeFetchKey, u64, u64)>>,
+    pub(super) cache_lru_tokens: RefCell<HashMap<(StripeFetchKey, u64), u64>>,
     pub(super) next_cache_lru_token: Cell<u64>,
     pub(super) cached_pages: Cell<usize>,
     pub(super) page_cache_drain_epoch: Cell<u64>,
@@ -305,10 +305,14 @@ where
         self.inner.stream_count.set(cur + 1);
 
         let key = req.key();
+        let fetch_key = StripeFetchKey {
+            stripe: key,
+            cache_id: req.cache_id().cloned(),
+        };
         let fetch = {
             let mut inflight = self.inner.inflight.borrow_mut();
             inflight
-                .entry(key)
+                .entry(fetch_key.clone())
                 .or_insert_with(|| Rc::new(RefCell::new(StripeFetch::new())))
                 .clone()
         };
@@ -324,6 +328,7 @@ where
             self.inner.clone(),
             Rc::new(req.clone()),
             key,
+            fetch_key,
             fetch,
             Rc::new(page_cache_policy),
             self.inner.page_cache_drain_epoch.get(),
@@ -373,6 +378,7 @@ where
     /// this source.
     req: Rc<R>,
     key: StripeKey,
+    fetch_key: StripeFetchKey,
     fetch: Rc<RefCell<StripeFetch>>,
     page_cache_policy: Rc<PageCachePolicy>,
     page_cache_drain_epoch: u64,
@@ -404,6 +410,7 @@ where
         inner: Rc<PoolInner<T, S, R>>,
         req: Rc<R>,
         key: StripeKey,
+        fetch_key: StripeFetchKey,
         fetch: Rc<RefCell<StripeFetch>>,
         page_cache_policy: Rc<PageCachePolicy>,
         page_cache_drain_epoch: u64,
@@ -413,6 +420,7 @@ where
             inner,
             req,
             key,
+            fetch_key,
             fetch,
             page_cache_policy,
             page_cache_drain_epoch,
@@ -458,6 +466,7 @@ where
             self.inner.clone(),
             self.fetch.clone(),
             self.key,
+            self.fetch_key.clone(),
             self.req.clone(),
             self.page_cache_policy.clone(),
             self.page_cache_drain_epoch,
@@ -471,7 +480,7 @@ where
         try_fetch_ready_page(
             &self.inner,
             &self.fetch,
-            self.key,
+            &self.fetch_key,
             page_no,
             self.page_cache_policy.as_ref(),
             self.page_cache_drain_epoch,
@@ -479,7 +488,7 @@ where
     }
 
     fn release_guard(&self, page_no: u64) {
-        release_guard(&self.inner, self.key, &self.fetch, page_no);
+        release_guard(&self.inner, &self.fetch_key, &self.fetch, page_no);
     }
 
     fn decrement_stream(&self) {
@@ -496,7 +505,7 @@ where
     }
 
     fn decrement_owned_future_stream(&self) {
-        decrement_stream(&self.inner, self.key, &self.fetch);
+        decrement_stream(&self.inner, &self.fetch_key, &self.fetch);
     }
 
     fn try_reserve_prefetch(&self, max: usize) -> bool {
@@ -546,7 +555,7 @@ where
 
 fn release_guard<T, S, R>(
     inner: &Rc<PoolInner<T, S, R>>,
-    key: StripeKey,
+    key: &StripeFetchKey,
     fetch: &Rc<RefCell<StripeFetch>>,
     page_no: u64,
 ) where
@@ -568,7 +577,7 @@ fn release_guard<T, S, R>(
 // ---------------------------------------------------------------------------
 
 /// RAII bump of `slot.consumer_holds`. Construction increments;
-/// drop decrements and runs `recycle_if_terminal`. Used by parked
+/// drop decrements and runs `retire_recyclable_slot`. Used by parked
 /// subscribers and the leader during I/O+tee to keep the slot
 /// pinned across `.await` points. On success the hold is
 /// transferred to the caller via [`ConsumerHold::forget`] and
@@ -583,7 +592,7 @@ where
     inner: Rc<PoolInner<T, S, R>>,
     fetch: Rc<RefCell<StripeFetch>>,
     slot: Rc<PageSlot>,
-    key: StripeKey,
+    key: StripeFetchKey,
     page_no: u64,
     active: bool,
 }
@@ -598,7 +607,7 @@ where
         inner: Rc<PoolInner<T, S, R>>,
         fetch: Rc<RefCell<StripeFetch>>,
         slot: Rc<PageSlot>,
-        key: StripeKey,
+        key: StripeFetchKey,
         page_no: u64,
     ) -> Self {
         slot.consumer_holds.set(slot.consumer_holds.get() + 1);
@@ -632,7 +641,13 @@ where
         }
         let prev = self.slot.consumer_holds.get();
         self.slot.consumer_holds.set(prev.saturating_sub(1));
-        retire_recyclable_slot(&self.inner, self.key, &self.fetch, &self.slot, self.page_no);
+        retire_recyclable_slot(
+            &self.inner,
+            &self.key,
+            &self.fetch,
+            &self.slot,
+            self.page_no,
+        );
     }
 }
 
@@ -641,7 +656,7 @@ where
 /// already owed a page; errors release their backing page immediately.
 fn retire_recyclable_slot<T, S, R>(
     inner: &Rc<PoolInner<T, S, R>>,
-    key: StripeKey,
+    key: &StripeFetchKey,
     fetch: &Rc<RefCell<StripeFetch>>,
     slot: &Rc<PageSlot>,
     page_no: u64,
@@ -662,7 +677,6 @@ fn retire_recyclable_slot<T, S, R>(
             _ => RetireState::Other,
         }
     };
-
     match state {
         RetireState::Ready if slot.page_cache_enabled.get() && !inner.free.has_waiters() => {
             cache_ready_slot(inner, key, fetch, slot, page_no)
@@ -685,7 +699,7 @@ enum RetireState {
 
 fn decrement_stream<T, S, R>(
     inner: &Rc<PoolInner<T, S, R>>,
-    key: StripeKey,
+    key: &StripeFetchKey,
     fetch: &Rc<RefCell<StripeFetch>>,
 ) where
     T: Transport<R>,
@@ -731,13 +745,13 @@ fn decrement_stream<T, S, R>(
         f.stream_refcount == 0 && f.pages.is_empty()
     };
     if should_remove {
-        inner.inflight.borrow_mut().remove(&key);
+        inner.inflight.borrow_mut().remove(key);
     }
 }
 
 fn cache_ready_slot<T, S, R>(
     inner: &Rc<PoolInner<T, S, R>>,
-    key: StripeKey,
+    key: &StripeFetchKey,
     fetch: &Rc<RefCell<StripeFetch>>,
     slot: &Rc<PageSlot>,
     page_no: u64,
@@ -760,11 +774,11 @@ fn cache_ready_slot<T, S, R>(
         inner
             .cache_lru_tokens
             .borrow_mut()
-            .insert((key, page_no), token);
+            .insert((key.clone(), page_no), token);
         inner
             .cache_lru
             .borrow_mut()
-            .push_back((key, page_no, token));
+            .push_back((key.clone(), page_no, token));
         inner.cached_pages.set(inner.cached_pages.get() + 1);
         crate::metrics::bufferpool_cached_delta(1);
         compact_cache_lru_if_sparse(inner);
@@ -773,7 +787,7 @@ fn cache_ready_slot<T, S, R>(
 
 fn remove_slot_page<T, S, R>(
     inner: &Rc<PoolInner<T, S, R>>,
-    key: StripeKey,
+    key: &StripeFetchKey,
     fetch: &Rc<RefCell<StripeFetch>>,
     slot: &Rc<PageSlot>,
     page_no: u64,
@@ -795,7 +809,7 @@ where
 
 fn remove_cache_lru_entry<T, S, R>(
     inner: &Rc<PoolInner<T, S, R>>,
-    key: StripeKey,
+    key: &StripeFetchKey,
     page_no: u64,
     slot: &PageSlot,
 ) where
@@ -811,7 +825,7 @@ fn remove_cache_lru_entry<T, S, R>(
 
 fn remove_cache_accounting<T, S, R>(
     inner: &Rc<PoolInner<T, S, R>>,
-    key: StripeKey,
+    key: &StripeFetchKey,
     page_no: u64,
 ) -> bool
 where
@@ -822,7 +836,7 @@ where
     if inner
         .cache_lru_tokens
         .borrow_mut()
-        .remove(&(key, page_no))
+        .remove(&(key.clone(), page_no))
         .is_none()
     {
         return false;
@@ -847,7 +861,7 @@ where
     }
     let tokens = inner.cache_lru_tokens.borrow();
     let mut lru = inner.cache_lru.borrow_mut();
-    lru.retain(|(key, page_no, token)| tokens.get(&(*key, *page_no)) == Some(token));
+    lru.retain(|(key, page_no, token)| tokens.get(&(key.clone(), *page_no)) == Some(token));
 }
 
 fn evict_oldest_cached<T, S, R>(inner: &Rc<PoolInner<T, S, R>>) -> Option<u32>
@@ -858,18 +872,18 @@ where
 {
     loop {
         let (key, page_no, token) = inner.cache_lru.borrow_mut().pop_front()?;
-        if inner.cache_lru_tokens.borrow().get(&(key, page_no)) != Some(&token) {
+        if inner.cache_lru_tokens.borrow().get(&(key.clone(), page_no)) != Some(&token) {
             continue;
         }
         let fetch = inner.inflight.borrow().get(&key).cloned();
         let Some(fetch) = fetch else {
-            remove_cache_accounting(inner, key, page_no);
+            remove_cache_accounting(inner, &key, page_no);
             continue;
         };
         let pi = {
             let mut f = fetch.borrow_mut();
             let Some(slot) = f.pages.get(&page_no).cloned() else {
-                remove_cache_accounting(inner, key, page_no);
+                remove_cache_accounting(inner, &key, page_no);
                 continue;
             };
             if !slot.cached.get()
@@ -877,15 +891,15 @@ where
                 || !matches!(*slot.state.borrow(), SlotState::Ready)
             {
                 slot.cached.set(false);
-                remove_cache_accounting(inner, key, page_no);
+                remove_cache_accounting(inner, &key, page_no);
                 continue;
             }
             slot.cached.set(false);
-            remove_cache_accounting(inner, key, page_no);
+            remove_cache_accounting(inner, &key, page_no);
             let pi = f.pages.remove(&page_no).and_then(|s| s.page_idx.take());
             pi
         };
-        remove_empty_stripe(inner, key, &fetch);
+        remove_empty_stripe(inner, &key, &fetch);
         if pi.is_some() {
             crate::metrics::bufferpool_page_cache_evicted();
             return pi;
@@ -895,7 +909,7 @@ where
 
 fn remove_empty_stripe<T, S, R>(
     inner: &Rc<PoolInner<T, S, R>>,
-    key: StripeKey,
+    key: &StripeFetchKey,
     fetch: &Rc<RefCell<StripeFetch>>,
 ) where
     T: Transport<R>,
@@ -907,13 +921,13 @@ fn remove_empty_stripe<T, S, R>(
         f.stream_refcount == 0 && f.pages.is_empty()
     };
     if should_remove {
-        inner.inflight.borrow_mut().remove(&key);
+        inner.inflight.borrow_mut().remove(key);
     }
 }
 
 fn reset_cached_ready_slot_for_bypass<T, S, R>(
     inner: &Rc<PoolInner<T, S, R>>,
-    key: StripeKey,
+    key: &StripeFetchKey,
     page_no: u64,
     slot: &PageSlot,
 ) -> bool
@@ -936,7 +950,7 @@ where
 fn try_fetch_ready_page<T, S, R>(
     inner: &Rc<PoolInner<T, S, R>>,
     fetch: &Rc<RefCell<StripeFetch>>,
-    key: StripeKey,
+    fetch_key: &StripeFetchKey,
     page_no: u64,
     page_cache_policy: &PageCachePolicy,
     page_cache_drain_epoch: u64,
@@ -946,6 +960,7 @@ where
     S: BlockStore,
     R: Req,
 {
+    let key = fetch_key.stripe;
     let slot = fetch.borrow().pages.get(&page_no).cloned()?;
     let stripe_off = match page_no.checked_mul(inner.page_size as u64) {
         Some(off) => off,
@@ -969,7 +984,8 @@ where
 
     match action {
         Action::Ready => {
-            if !page_cache_enabled && reset_cached_ready_slot_for_bypass(inner, key, page_no, &slot)
+            if !page_cache_enabled
+                && reset_cached_ready_slot_for_bypass(inner, fetch_key, page_no, &slot)
             {
                 return None;
             }
@@ -981,8 +997,15 @@ where
                 .page_idx
                 .get()
                 .expect("page_idx must be set when slot is Ready");
-            remove_cache_lru_entry(inner, key, page_no, &slot);
-            ConsumerHold::new(inner.clone(), fetch.clone(), slot, key, page_no).forget();
+            remove_cache_lru_entry(inner, fetch_key, page_no, &slot);
+            ConsumerHold::new(
+                inner.clone(),
+                fetch.clone(),
+                slot,
+                fetch_key.clone(),
+                page_no,
+            )
+            .forget();
             Some(Ok(pi))
         }
         Action::Error(e) => Some(Err(e)),
@@ -1042,6 +1065,7 @@ async fn fetch_page<T, S, R>(
     inner: Rc<PoolInner<T, S, R>>,
     fetch: Rc<RefCell<StripeFetch>>,
     key: StripeKey,
+    fetch_key: StripeFetchKey,
     req: Rc<R>,
     page_cache_policy: Rc<PageCachePolicy>,
     page_cache_drain_epoch: u64,
@@ -1100,7 +1124,7 @@ where
         match action {
             Action::Ready => {
                 if !page_cache_enabled
-                    && reset_cached_ready_slot_for_bypass(&inner, key, page_no, &slot)
+                    && reset_cached_ready_slot_for_bypass(&inner, &fetch_key, page_no, &slot)
                 {
                     continue;
                 }
@@ -1111,12 +1135,18 @@ where
                 if page_cache_enabled && slot.cached.get() {
                     crate::metrics::bufferpool_request(crate::metrics::Lookup::Hit);
                 }
-                remove_cache_lru_entry(&inner, key, page_no, &slot);
+                remove_cache_lru_entry(&inner, &fetch_key, page_no, &slot);
                 // Bump and immediately transfer to the caller; the
                 // returned `PageGuard` balances it via
                 // `StreamSrc::release_guard`.
-                ConsumerHold::new(inner.clone(), fetch.clone(), slot.clone(), key, page_no)
-                    .forget();
+                ConsumerHold::new(
+                    inner.clone(),
+                    fetch.clone(),
+                    slot.clone(),
+                    fetch_key.clone(),
+                    page_no,
+                )
+                .forget();
                 return Ok(pi);
             }
             Action::Error(e) => return Err(e),
@@ -1126,8 +1156,13 @@ where
                 // leader's `PageGuard` drop cannot recycle the slot
                 // between wake and re-poll. The hold is transferred
                 // to us on `Ready`, dropped on `Error`/`Retry`.
-                let park =
-                    ParkOnSlot::new(inner.clone(), fetch.clone(), slot.clone(), key, page_no);
+                let park = ParkOnSlot::new(
+                    inner.clone(),
+                    fetch.clone(),
+                    slot.clone(),
+                    fetch_key.clone(),
+                    page_no,
+                );
                 match park.await {
                     ParkOutcome::Ready(hold) => {
                         let pi = slot
@@ -1147,8 +1182,13 @@ where
                 // declared first drop last, so `leader_guard` flips
                 // state and wakes parked subscribers before
                 // `leader_hold` drops and possibly recycles.
-                let leader_hold =
-                    ConsumerHold::new(inner.clone(), fetch.clone(), slot.clone(), key, page_no);
+                let leader_hold = ConsumerHold::new(
+                    inner.clone(),
+                    fetch.clone(),
+                    slot.clone(),
+                    fetch_key.clone(),
+                    page_no,
+                );
                 let mut leader_guard = LeaderGuard {
                     slot: &slot,
                     free: &inner.free,
@@ -1415,7 +1455,7 @@ where
     inner: Rc<PoolInner<T, S, R>>,
     fetch: Rc<RefCell<StripeFetch>>,
     slot: Rc<PageSlot>,
-    key: StripeKey,
+    key: StripeFetchKey,
     page_no: u64,
     /// `Some` once we have registered our waker and pre-bumped
     /// `consumer_holds`. Taken out and either transferred to the
@@ -1450,7 +1490,7 @@ where
         inner: Rc<PoolInner<T, S, R>>,
         fetch: Rc<RefCell<StripeFetch>>,
         slot: Rc<PageSlot>,
-        key: StripeKey,
+        key: StripeFetchKey,
         page_no: u64,
     ) -> Self {
         Self {
@@ -1485,7 +1525,7 @@ where
                 this.inner.clone(),
                 this.fetch.clone(),
                 this.slot.clone(),
-                this.key,
+                this.key.clone(),
                 this.page_no,
             ));
         }

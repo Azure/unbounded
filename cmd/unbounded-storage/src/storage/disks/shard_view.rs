@@ -343,19 +343,19 @@ impl LiveShardLocalStore {
             return Err(Error::from("no disks open"));
         };
         let (p, len) = self.resolve(dst)?;
-        // NOTE: `disk_for` routes by `channels.len()`. Changing the set
+        // NOTE: `disk_for` routes by `channels.channels.len()`. Changing the set
         // of open disks (add/remove via reconcile or hot-swap) changes
         // that divisor, so a stripe persisted under a different open-disk
         // count hashes to a different disk and becomes UNREACHABLE. The
         // directory generation bump only invalidates the buffer cache,
         // not on-disk placement: changing the open-disk set is NOT a
         // data-preserving operation.
-        let idx = disk_for(&key, stripe_off, channels.len());
+        let idx = disk_for(&key, stripe_off, channels.channels.len());
         let slice = std::ptr::slice_from_raw_parts_mut(p, len);
         // SAFETY: `resolve` produced an in-bounds pointer into the
         // shard's pinned backing; the pool guarantees the page is not
         // aliased for the duration of this future.
-        channels[idx]
+        channels.channels[idx]
             .read_page_with_priority(key, stripe_off, slice, priority)
             .await
     }
@@ -372,14 +372,14 @@ impl LiveShardLocalStore {
             return Err(Error::from("no disks open"));
         };
         let (p, len) = self.resolve(page)?;
-        // NOTE: see `read_page`. `disk_for`'s `channels.len()` divisor
+        // NOTE: see `read_page`. `disk_for`'s `channels.channels.len()` divisor
         // means changing the set of open disks repartitions placement;
         // stripes written under a different open-disk count become
         // unreachable. Changing the open-disk set is NOT data-preserving.
-        let idx = disk_for(&key, stripe_off, channels.len());
+        let idx = disk_for(&key, stripe_off, channels.channels.len());
         let slice = std::ptr::slice_from_raw_parts(p.cast_const(), len);
         // SAFETY: see `read_page` above.
-        channels[idx]
+        channels.channels[idx]
             .write_page_with_priority(key, stripe_off, slice, priority)
             .await
     }
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn cache_id_readd_rebinds_chain_store_to_new_directory() {
         let dirs = CacheDirectorySet::new();
-        dirs.reconcile(["cache-a"]);
+        dirs.reconcile([("cache-a", 0)]);
         let core1 = Core::spawn();
         dirs.apply_channels(
             "cache-a",
@@ -820,8 +820,8 @@ mod tests {
         view.register_pages(&backing).unwrap();
         let first = view.store_for("cache-a");
 
-        dirs.reconcile(std::iter::empty::<&str>());
-        dirs.reconcile(["cache-a"]);
+        dirs.reconcile(std::iter::empty::<(&str, i32)>());
+        dirs.reconcile([("cache-a", 0)]);
         let core2 = Core::spawn();
         dirs.apply_channels(
             "cache-a",
@@ -847,7 +847,7 @@ mod tests {
     #[test]
     fn page_cache_policy_lookup_does_not_create_live_store() {
         let dirs = CacheDirectorySet::new();
-        dirs.reconcile(["cache-a"]);
+        dirs.reconcile([("cache-a", 0)]);
         let (channel, _rx) = PageChannel::new();
         dirs.apply_channels("cache-a", vec![(PathBuf::from("/a"), channel, None, false)]);
 
@@ -864,7 +864,7 @@ mod tests {
     #[test]
     fn no_cache_id_disables_page_cache_policy() {
         let dirs = CacheDirectorySet::new();
-        dirs.reconcile(["cache-a"]);
+        dirs.reconcile([("cache-a", 0)]);
         let (channel, _rx) = PageChannel::new();
         dirs.apply_channels("cache-a", vec![(PathBuf::from("/a"), channel, None, true)]);
 
@@ -882,7 +882,13 @@ mod tests {
     fn chain_store_rejects_second_backing() {
         let t = DiskChannelDirectory::new();
         let view = ChainLocalStore::new(Arc::new(CacheDirectorySet {
-            directories: Mutex::new(HashMap::from([("cache-a".to_string(), t)])),
+            directories: Mutex::new(HashMap::from([(
+                "cache-a".to_string(),
+                CacheDirectoryEntry {
+                    directory: t,
+                    priority: 0,
+                },
+            )])),
         }));
         let (_b1, backing1) = make_backing(4);
         view.register_pages(&backing1).unwrap();

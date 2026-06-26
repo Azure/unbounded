@@ -747,13 +747,13 @@ fn disabled_leader_policy_controls_coalesced_retention() {
     store.set_page_cache_enabled_for(Some("enabled"), true);
 
     let disabled_leader = TestReq::with_cache_id(k, "disabled");
-    let enabled_coalescer = TestReq::with_cache_id(k, "enabled");
+    let enabled_reader = TestReq::with_cache_id(k, "enabled");
     let f1 = async {
         let mut s = pool.read(&disabled_leader, 0, P as u64).await.unwrap();
         s.next_page().await.unwrap().unwrap().as_slice().to_vec()
     };
     let f2 = async {
-        let mut s = pool.read(&enabled_coalescer, 0, P as u64).await.unwrap();
+        let mut s = pool.read(&enabled_reader, 0, P as u64).await.unwrap();
         s.next_page().await.unwrap().unwrap().as_slice().to_vec()
     };
 
@@ -761,9 +761,13 @@ fn disabled_leader_policy_controls_coalesced_retention() {
 
     assert_eq!(b1, stripe);
     assert_eq!(b2, stripe);
-    assert_eq!(transport.calls(), 1, "reads coalesced behind one leader");
-    assert_eq!(pool.cached_pages(), 0, "leader policy controls retention");
-    assert_quiescent(&pool, 4, "coalesced disabled leader policy");
+    assert_eq!(transport.calls(), 2, "different caches do not coalesce");
+    assert_eq!(
+        pool.cached_pages(),
+        1,
+        "enabled cache retains independently"
+    );
+    assert_quiescent(&pool, 4, "cache-scoped policy");
 }
 
 #[test]
@@ -1002,6 +1006,35 @@ fn single_flight_coalesces_concurrent_reads() {
     assert_eq!(b2, stripe);
     assert_eq!(transport.calls(), 1, "single-flight coalesced");
     assert_quiescent(&pool, 4, "single-flight");
+}
+
+#[test]
+fn single_flight_is_scoped_by_cache_id() {
+    const P: usize = 4096;
+    let (pool, transport, _store) = make_pool_v2(P, 4);
+    let k = key(0xDE);
+    let mut stripe = vec![0u8; P];
+    for (i, b) in stripe.iter_mut().enumerate() {
+        *b = (i & 0xff) as u8;
+    }
+    transport.put_stripe(k, stripe.clone());
+    transport.set_pend_polls(2);
+
+    let req1 = TestReq::with_cache_id(k, "cache-a");
+    let req2 = TestReq::with_cache_id(k, "cache-b");
+    let f1 = async {
+        let mut s = pool.read(&req1, 0, P as u64).await.unwrap();
+        s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+    };
+    let f2 = async {
+        let mut s = pool.read(&req2, 0, P as u64).await.unwrap();
+        s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+    };
+    let (b1, b2) = block_on_two(f1, f2);
+    assert_eq!(b1, stripe);
+    assert_eq!(b2, stripe);
+    assert_eq!(transport.calls(), 2, "different caches do not coalesce");
+    assert_quiescent(&pool, 4, "cache-scoped single-flight");
 }
 
 #[test]
