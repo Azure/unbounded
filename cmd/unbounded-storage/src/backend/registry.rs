@@ -184,6 +184,7 @@ impl BuildCtx {
             }
             Some(backend_spec::Config::Fake(cfg)) => Ok(OriginBackend::Fake(FakeBackend::new(
                 spec.name.clone(),
+                cfg.stripe_size_bytes.expect("stripe_size_bytes defaulted"),
                 cfg.object_size_bytes.expect("object_size_bytes defaulted"),
                 self.page_size,
                 self.backing_base,
@@ -232,7 +233,7 @@ fn build_origin_endpoint(
 
 impl Backend for BackendRegistry {
     type Req = StripeReq;
-    type Stream<'a> = RegistryFetchStream;
+    type Stream<'a> = RegistryFetchStream<'a>;
 
     fn bulk_get<'a>(
         &'a self,
@@ -246,10 +247,12 @@ impl Backend for BackendRegistry {
         };
         let map = self.backends.load();
         match map.get(backend_id) {
-            // `fetch_stream` returns a fully owned `'static` stream that
-            // borrows nothing from the backend, so the `Arc` guard can
-            // be dropped the moment the call returns.
-            Some(backend) => RegistryFetchStream::Origin(backend.fetch_stream(req, src, dsts)),
+            Some(backend) => RegistryFetchStream::Origin(OriginBackend::fetch_stream(
+                Arc::clone(backend),
+                req,
+                src,
+                dsts,
+            )),
             None => RegistryFetchStream::unknown(backend_id),
         }
     }
@@ -289,12 +292,12 @@ impl BackendReconcileTarget for BackendRegistry {
 /// guarantees every frontend's backend exists), but a request can race
 /// a `remove`, so it is surfaced as a transport error rather than a
 /// panic.
-pub enum RegistryFetchStream {
-    Origin(OriginStream<'static>),
+pub enum RegistryFetchStream<'a> {
+    Origin(OriginStream<'a>),
     Unknown(Option<Error>),
 }
 
-impl RegistryFetchStream {
+impl RegistryFetchStream<'_> {
     fn unknown(backend_id: &str) -> Self {
         let msg = format!("unknown backend id: {backend_id:?}");
         let err = Error::transport(io::Error::new(io::ErrorKind::NotFound, msg));
@@ -302,7 +305,7 @@ impl RegistryFetchStream {
     }
 }
 
-impl PageStream for RegistryFetchStream {
+impl PageStream for RegistryFetchStream<'_> {
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

@@ -127,30 +127,33 @@ func freeLoopbackPort(t *testing.T) int {
 // backend/frontend/peer/disk implementations are selected by oneof
 // config table names. The startup-fixed knobs (heap backing, fabric
 // bind address, forcing the tcp provider) live in the `[startup.*]` sections.
-func writeStorageConfig(t *testing.T, path, fabricAddr string, localID, peerID int, peerAddr, diskPath, orcaEdge, frontendBind string) {
+func writeStorageConfig(t *testing.T, path, fabricAddr, selfName, peerName, peerAddr, diskPath, orcaEdge, frontendBind string) {
 	t.Helper()
 
-	cfg := fmt.Sprintf(`[[backends]]
+	cfg := fmt.Sprintf(`self = %q
+
+[[backends]]
 name = "origin"
 
 [backends.config.s3]
 url = "http://%s"
 stripe_size_bytes = %d
 
-[[neighborhoods]]
-name = "p2p"
-source = "origin"
-local_node_id = %d
+[[peers]]
+name = %q
 
-[[neighborhoods.peers]]
-id = %d
+[peers.config.tcp]
+addr = %q
 
-[neighborhoods.peers.config.tcp]
-addr = "%s"
+[[peers]]
+name = %q
+
+[peers.config.tcp]
+addr = %q
 
 [[caches]]
 name = "cache"
-source = "p2p"
+source = "origin"
 
 [[disks]]
 page_size_bytes = %d
@@ -176,9 +179,9 @@ addr = "%s"
 [startup.topology]
 disable_rdma = true
 serving_cores = 2
-`, orcaEdge, storageStripeSize,
-		localID,
-		peerID, peerAddr,
+`, selfName, orcaEdge, storageStripeSize,
+		selfName, fabricAddr,
+		peerName, peerAddr,
 		storagePageSize, diskPath, storageDiskSize,
 		frontendBind,
 		fabricAddr)
@@ -211,10 +214,10 @@ func startStorageRing(ctx context.Context, t *testing.T, orcaEdge string) *stora
 	cfg2 := filepath.Join(dir, "node2.toml")
 
 	writeStorageConfig(t, cfg1,
-		fmt.Sprintf("127.0.0.1:%d", fabA), 1, 2, fmt.Sprintf("127.0.0.1:%d", fabB),
+		fmt.Sprintf("127.0.0.1:%d", fabA), "node-a", "node-b", fmt.Sprintf("127.0.0.1:%d", fabB),
 		filepath.Join(dir, "node1.disk"), orcaEdge, fmt.Sprintf("127.0.0.1:%d", feA))
 	writeStorageConfig(t, cfg2,
-		fmt.Sprintf("127.0.0.1:%d", fabB), 2, 1, fmt.Sprintf("127.0.0.1:%d", fabA),
+		fmt.Sprintf("127.0.0.1:%d", fabB), "node-b", "node-a", fmt.Sprintf("127.0.0.1:%d", fabA),
 		filepath.Join(dir, "node2.disk"), orcaEdge, fmt.Sprintf("127.0.0.1:%d", feB))
 
 	spawnStorageNode(ctx, t, bin, cfg1, filepath.Join(dir, "node1.log"))

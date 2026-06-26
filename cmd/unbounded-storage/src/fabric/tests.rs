@@ -978,24 +978,31 @@ use std::collections::HashMap;
 
 use crate::backend::{Backend, NullBackend};
 use crate::p2p::{
-    FingerTable, FingerTableConfig, NodeId, PeerEntry, RecursiveHandler, RingId, TopologyTags,
+    FingerTable, FingerTableConfig, NodeId, PeerEntry, RecursiveHandler, RingId, RouteTableHandle,
+    RoutingSnapshot, TopologyTags,
 };
 
 /// Ring position the relay (B) forwards for and the owner (C) serves.
 /// Chosen to sit in the open arc `(B.ring, C.ring)` so B's finger
 /// lookup forwards to C and C owns it.
 const CHAIN_TARGET_RING: u64 = 150;
+const CHAIN_CACHE_ID: &str = "cache";
 
 /// Request whose stripe key's leading 8 bytes encode a ring id, so
 /// `stripe_to_ring(req.key())` is controllable from the test.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct RingReq {
     key_bytes: [u8; 32],
+    cache_id: Option<String>,
 }
 
 impl Req for RingReq {
     fn key(&self) -> StripeKey {
         StripeKey(self.key_bytes)
+    }
+
+    fn cache_id(&self) -> Option<&String> {
+        self.cache_id.as_ref()
     }
 }
 
@@ -1099,18 +1106,27 @@ where
     B: Backend<Req = RingReq> + 'static,
 {
     let handler = Arc::new(
-        RecursiveHandler::new(
+        RecursiveHandler::with_routes(
             store,
             scratch,
             RECURSIVE_SCRATCH_PAGES as u32,
-            fingers,
-            node_to_peer,
+            RouteTableHandle::new(
+                [(
+                    CHAIN_CACHE_ID.to_string(),
+                    RoutingSnapshot {
+                        fingers,
+                        node_to_peer,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ),
             fabric.clone(),
             scratch_mr,
             page_size,
             backend,
         )
-        .expect("RecursiveHandler::new failed after provider availability gate"),
+        .expect("RecursiveHandler::with_routes failed after provider availability gate"),
     );
     Fabric::start_rpc_server::<RingReq, _>(fabric, handler, Some(scratch_mr), page_size)
         .expect("start_rpc_server failed after provider availability gate")
@@ -1292,7 +1308,10 @@ fn run_chain_request(
     timeout: Duration,
 ) -> Vec<Result<PageRef, PoolError>> {
     let key = key_for_ring(CHAIN_TARGET_RING);
-    let req = RingReq { key_bytes: key.0 };
+    let req = RingReq {
+        key_bytes: key.0,
+        cache_id: Some(CHAIN_CACHE_ID.to_string()),
+    };
     let dsts = vec![PageRef {
         page_idx: 0,
         offset: 0,
