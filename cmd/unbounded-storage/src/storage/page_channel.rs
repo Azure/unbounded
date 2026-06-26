@@ -92,6 +92,21 @@ impl PageChannel {
         stripe_off: u64,
         dst: *mut [u8],
     ) -> Result<bool, Error> {
+        self.read_page_with_priority(key, stripe_off, dst, 0).await
+    }
+
+    /// Read `(key, stripe_off)` into `dst` and promote any resident
+    /// hit to at least `priority` for eviction ordering.
+    ///
+    /// SAFETY: `dst` must point to a writable region that lives
+    /// until the returned future resolves and is pinned for DMA.
+    pub async fn read_page_with_priority(
+        &self,
+        key: StripeKey,
+        stripe_off: u64,
+        dst: *mut [u8],
+        priority: i32,
+    ) -> Result<bool, Error> {
         let len = dst.len();
         let ptr = NonNull::new(dst.cast::<u8>()).ok_or(Error::Io(libc::EINVAL))?;
         let reply = ReplySlot::new();
@@ -101,6 +116,7 @@ impl PageChannel {
                 stripe_off,
                 dst: SendPtr(ptr),
                 len,
+                priority,
                 reply: reply.clone(),
             })
             .map_err(|_| Error::Io(libc::EPIPE))?;
@@ -207,6 +223,7 @@ pub enum PageCommand {
         stripe_off: u64,
         dst: SendPtr,
         len: usize,
+        priority: i32,
         reply: Arc<ReplySlot<bool>>,
     },
     WritePage {
@@ -275,6 +292,7 @@ impl<B: BlockDevice + 'static> PageService<B> {
                     stripe_off,
                     dst,
                     len,
+                    priority,
                     reply,
                 }) => {
                     let engine = self.engine.clone();
@@ -284,7 +302,11 @@ impl<B: BlockDevice + 'static> PageService<B> {
                             // `dst` valid until `reply` is set (see
                             // module docs).
                             let slice = std::ptr::slice_from_raw_parts_mut(dst.0.as_ptr(), len);
-                            unsafe { engine.read_page_into(key, stripe_off, slice).await }
+                            unsafe {
+                                engine
+                                    .read_page_into_with_priority(key, stripe_off, slice, priority)
+                                    .await
+                            }
                         });
                     self.in_flight.push(Inflight::Read { fut, reply });
                 }

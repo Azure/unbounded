@@ -67,6 +67,16 @@ impl SieveLru {
         self.len() == 0
     }
 
+    #[cfg(test)]
+    pub(crate) fn entries_for_test(&self) -> Vec<(Lba, i32)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .buckets
+            .iter()
+            .flat_map(|(&priority, bucket)| bucket.iter().map(move |&lba| (lba, priority)))
+            .collect()
+    }
+
     /// Returns true once the populated fraction crosses the
     /// configured high watermark. Callers (the eviction worker)
     /// use this to decide when to run a sweep.
@@ -84,6 +94,36 @@ impl SieveLru {
 
     pub fn touch(&self, lba: Lba) {
         let _ = self.refcount.mark_referenced(lba.0);
+    }
+
+    pub fn touch_with_priority(&self, lba: Lba, priority: i32) {
+        self.promote(lba, priority);
+        self.touch(lba);
+    }
+
+    /// Raise `lba` to `priority` if it is currently resident in a
+    /// lower-priority bucket. Priority is monotonic for a resident page:
+    /// a low-priority cache read must not undo protection established by
+    /// an earlier high-priority cache access to the same content.
+    pub fn promote(&self, lba: Lba, priority: i32) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some((current, pos)) = inner.buckets.iter().find_map(|(&priority, q)| {
+            q.iter()
+                .position(|&candidate| candidate == lba)
+                .map(|pos| (priority, pos))
+        }) else {
+            return;
+        };
+        if current >= priority {
+            return;
+        }
+        if let Some(q) = inner.buckets.get_mut(&current) {
+            q.remove(pos);
+            if inner.buckets.get(&current).is_some_and(VecDeque::is_empty) {
+                inner.buckets.remove(&current);
+            }
+            inner.buckets.entry(priority).or_default().push_front(lba);
+        }
     }
 
     /// Sweep the hand looking for up to `target` evictable
@@ -265,6 +305,42 @@ mod tests {
         let v = l.sweep(1);
         assert_eq!(lbas(&v), vec![Lba(3)]);
         assert_eq!(l.len(), 1);
+    }
+
+    #[test]
+    fn higher_priority_touch_promotes_resident_page() {
+        let l = lru(16);
+        l.admit(Lba(2), -10);
+        l.admit(Lba(3), 0);
+
+        l.touch_with_priority(Lba(2), 10);
+        let v = l.sweep(2);
+
+        assert_eq!(lbas(&v), vec![Lba(3), Lba(2)]);
+        assert_eq!(
+            v.iter()
+                .map(|candidate| candidate.priority)
+                .collect::<Vec<_>>(),
+            vec![0, 10]
+        );
+    }
+
+    #[test]
+    fn lower_priority_touch_does_not_demote_resident_page() {
+        let l = lru(16);
+        l.admit(Lba(2), 10);
+        l.admit(Lba(3), 0);
+
+        l.touch_with_priority(Lba(2), -10);
+        let v = l.sweep(2);
+
+        assert_eq!(lbas(&v), vec![Lba(3), Lba(2)]);
+        assert_eq!(
+            v.iter()
+                .map(|candidate| candidate.priority)
+                .collect::<Vec<_>>(),
+            vec![0, 10]
+        );
     }
 
     fn lbas(victims: &[EvictionCandidate]) -> Vec<Lba> {

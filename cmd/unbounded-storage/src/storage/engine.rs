@@ -256,6 +256,13 @@ pub struct EngineSnapshot {
     pub pending_free_len: usize,
 }
 
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+struct LruEntrySnapshot {
+    lba: Lba,
+    priority: i32,
+}
+
 impl<B: BlockDevice> StorageEngine<B> {
     pub async fn open(
         device: Arc<B>,
@@ -338,6 +345,15 @@ impl<B: BlockDevice> StorageEngine<B> {
             btree_lookup_cache_bytes: self.btree.lookup_cache_bytes(),
             pending_free_len: self.pending_free.lock().unwrap().len(),
         }
+    }
+
+    #[cfg(test)]
+    fn lru_entries_for_test(&self) -> Vec<LruEntrySnapshot> {
+        self.lru
+            .entries_for_test()
+            .into_iter()
+            .map(|(lba, priority)| LruEntrySnapshot { lba, priority })
+            .collect()
     }
 
     fn page_key(stripe: &StripeKey, stripe_off: u64, page_bytes: usize) -> PageKey {
@@ -583,6 +599,23 @@ impl<B: BlockDevice> StorageEngine<B> {
         stripe_off: u64,
         dst: *mut [u8],
     ) -> Result<bool, bufferpool::Error> {
+        unsafe {
+            self.read_page_into_with_priority(key, stripe_off, dst, 0)
+                .await
+        }
+    }
+
+    /// Read `(key, stripe_off)` into `dst` and promote any resident
+    /// hit to at least `priority` for eviction ordering.
+    ///
+    /// SAFETY: same contract as [`Self::read_page_into`].
+    pub async unsafe fn read_page_into_with_priority(
+        &self,
+        key: StripeKey,
+        stripe_off: u64,
+        dst: *mut [u8],
+        priority: i32,
+    ) -> Result<bool, bufferpool::Error> {
         let pk = Self::page_key(&key, stripe_off, self.cfg.page_size_bytes);
 
         let entry = match self.lookup_entry(&pk).await {
@@ -636,7 +669,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             return Ok(false);
         }
 
-        self.lru.touch(entry.lba);
+        self.lru.touch_with_priority(entry.lba, priority);
         self.admission.record_frequency(&pk);
         self.metric(|m| m.hits += 1);
         crate::metrics::storage_lookup(crate::metrics::Lookup::Hit);
@@ -1029,9 +1062,11 @@ mod tests {
             capacity_pages: capacity,
             ..Default::default()
         }));
-        let mut cfg = EngineConfig::default();
-        cfg.page_size_bytes = 4096; // collapse cache page == device block for tests
-        cfg.btree_page_bytes = 4096;
+        let cfg = EngineConfig {
+            page_size_bytes: 4096, // collapse cache page == device block for tests
+            btree_page_bytes: 4096,
+            ..Default::default()
+        };
         let eng = Arc::new(block_on(StorageEngine::open(device, cfg)).unwrap());
         // 64 pool pages of 4 KiB each.
         let buf: Box<[u8]> = vec![0u8; 4096 * 64].into_boxed_slice();
@@ -1203,6 +1238,95 @@ mod tests {
             assert!(eng_body.snapshot().checksum_misses >= 1);
             eng_body.close_mutator();
             let _ = buf;
+        };
+        block_on_pair(body, mutator.as_mut());
+    }
+
+    #[test]
+    fn priority_read_promotes_resident_page() {
+        let (eng, _buf) = engine(64);
+        let eng_body = eng.clone();
+        let mutator = eng.clone().run_mutator();
+        let mut mutator = pin!(mutator);
+        let body = async move {
+            let src = PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: 4096,
+            };
+            let dst = PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4096,
+            };
+            unsafe {
+                let src_buf = eng_body.slice_from_ref(src);
+                eng_body
+                    .write_page_from_with_priority(stripe(7), 0, src_buf, -10)
+                    .await
+                    .unwrap();
+                eng_body
+                    .write_page_from_with_priority(stripe(7), 0, src_buf, -10)
+                    .await
+                    .unwrap();
+                assert_eq!(eng_body.lru_entries_for_test()[0].priority, -10);
+
+                let read_slice = eng_body.slice_mut_from_ref(dst);
+                let hit = eng_body
+                    .read_page_into_with_priority(stripe(7), 0, read_slice, 10)
+                    .await
+                    .unwrap();
+                assert!(hit);
+            }
+
+            let entries = eng_body.lru_entries_for_test();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].priority, 10);
+            eng_body.close_mutator();
+        };
+        block_on_pair(body, mutator.as_mut());
+    }
+
+    #[test]
+    fn lower_priority_read_does_not_demote_resident_page() {
+        let (eng, _buf) = engine(64);
+        let eng_body = eng.clone();
+        let mutator = eng.clone().run_mutator();
+        let mut mutator = pin!(mutator);
+        let body = async move {
+            let src = PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: 4096,
+            };
+            let dst = PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4096,
+            };
+            unsafe {
+                let src_buf = eng_body.slice_from_ref(src);
+                eng_body
+                    .write_page_from_with_priority(stripe(8), 0, src_buf, 10)
+                    .await
+                    .unwrap();
+                eng_body
+                    .write_page_from_with_priority(stripe(8), 0, src_buf, 10)
+                    .await
+                    .unwrap();
+
+                let read_slice = eng_body.slice_mut_from_ref(dst);
+                let hit = eng_body
+                    .read_page_into_with_priority(stripe(8), 0, read_slice, -10)
+                    .await
+                    .unwrap();
+                assert!(hit);
+            }
+
+            let entries = eng_body.lru_entries_for_test();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].priority, 10);
+            eng_body.close_mutator();
         };
         block_on_pair(body, mutator.as_mut());
     }

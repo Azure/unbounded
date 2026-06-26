@@ -165,8 +165,29 @@ impl<B: BlockDevice + 'static> LocalStorage<B> {
         stripe_off: u64,
         dst: *mut [u8],
     ) -> Result<bool, Error> {
+        unsafe {
+            self.read_page_into_with_priority(key, stripe_off, dst, 0)
+                .await
+        }
+    }
+
+    /// Route a raw-slice read to the disk that owns the page and
+    /// promote any resident hit to at least `priority` for eviction.
+    ///
+    /// SAFETY: see [`StorageEngine::read_page_into`].
+    pub async unsafe fn read_page_into_with_priority(
+        &self,
+        key: StripeKey,
+        stripe_off: u64,
+        dst: *mut [u8],
+        priority: i32,
+    ) -> Result<bool, Error> {
         let idx = self.disk_for(key, stripe_off);
-        unsafe { self.engines[idx].read_page_into(key, stripe_off, dst).await }
+        unsafe {
+            self.engines[idx]
+                .read_page_into_with_priority(key, stripe_off, dst, priority)
+                .await
+        }
     }
 
     /// Route a raw-slice write to the disk that owns the page.

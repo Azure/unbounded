@@ -331,6 +331,35 @@ impl LiveShardLocalStore {
         Ok((p, page.len as usize))
     }
 
+    async fn read_page_with_priority<R: Req + ?Sized>(
+        &self,
+        req: &R,
+        stripe_off: u64,
+        dst: PageRef,
+        priority: i32,
+    ) -> Result<bool, Error> {
+        let key = req.key();
+        let Some(channels) = self.current_or_replay() else {
+            return Err(Error::from("no disks open"));
+        };
+        let (p, len) = self.resolve(dst)?;
+        // NOTE: `disk_for` routes by `channels.len()`. Changing the set
+        // of open disks (add/remove via reconcile or hot-swap) changes
+        // that divisor, so a stripe persisted under a different open-disk
+        // count hashes to a different disk and becomes UNREACHABLE. The
+        // directory generation bump only invalidates the buffer cache,
+        // not on-disk placement: changing the open-disk set is NOT a
+        // data-preserving operation.
+        let idx = disk_for(&key, stripe_off, channels.len());
+        let slice = std::ptr::slice_from_raw_parts_mut(p, len);
+        // SAFETY: `resolve` produced an in-bounds pointer into the
+        // shard's pinned backing; the pool guarantees the page is not
+        // aliased for the duration of this future.
+        channels[idx]
+            .read_page_with_priority(key, stripe_off, slice, priority)
+            .await
+    }
+
     async fn write_page_with_priority<R: Req + ?Sized>(
         &self,
         req: &R,
@@ -367,26 +396,7 @@ impl BlockStore for LiveShardLocalStore {
         stripe_off: u64,
         dst: PageRef,
     ) -> Result<bool, Error> {
-        let key = req.key();
-        let Some(channels) = self.current_or_replay() else {
-            return Err(Error::from("no disks open"));
-        };
-        let (p, len) = self.resolve(dst)?;
-        // NOTE: `disk_for` routes by `channels.len()`. Changing the set
-        // of open disks (add/remove via reconcile or hot-swap) changes
-        // that divisor, so a stripe persisted under a different open-disk
-        // count hashes to a different disk and becomes UNREACHABLE. The
-        // directory generation bump only invalidates the buffer cache,
-        // not on-disk placement: changing the open-disk set is NOT a
-        // data-preserving operation.
-        let idx = disk_for(&key, stripe_off, channels.channels.len());
-        let slice = std::ptr::slice_from_raw_parts_mut(p, len);
-        // SAFETY: `resolve` produced an in-bounds pointer into the
-        // shard's pinned backing; the pool guarantees the page is not
-        // aliased for the duration of this future.
-        channels.channels[idx]
-            .read_page(key, stripe_off, slice)
-            .await
+        self.read_page_with_priority(req, stripe_off, dst, 0).await
     }
 
     async fn write_page<R: Req + ?Sized>(
@@ -460,8 +470,9 @@ impl BlockStore for ChainLocalStore {
         if directory.current().is_none() {
             return Ok(false);
         }
+        let priority = self.directories.priority(cache_id).unwrap_or(0);
         self.store_for(cache_id)
-            .read_page(req, stripe_off, dst)
+            .read_page_with_priority(req, stripe_off, dst, priority)
             .await
     }
 
