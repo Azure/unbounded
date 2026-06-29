@@ -44,6 +44,12 @@ pub struct Nvme {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockDevice {
+    pub dev_name: String,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Nic {
     pub dev_name: String,
     pub pci_bdf: Option<String>,
@@ -76,6 +82,7 @@ pub struct Host {
     pub numa_nodes: Vec<NumaNode>,
     pub hcas: Vec<Hca>,
     pub nvmes: Vec<Nvme>,
+    pub block_devices: Vec<BlockDevice>,
     pub nics: Vec<Nic>,
     pub isolated: BTreeSet<u32>,
 }
@@ -112,6 +119,8 @@ impl Host {
         hcas.sort_by(|a, b| a.pci_bdf.cmp(&b.pci_bdf).then(a.dev_name.cmp(&b.dev_name)));
         let mut nvmes = discover_nvmes(sys_root);
         nvmes.sort_by(|a, b| a.pci_bdf.cmp(&b.pci_bdf).then(a.dev_name.cmp(&b.dev_name)));
+        let mut block_devices = discover_block_devices(sys_root);
+        block_devices.sort_by(|a, b| a.dev_name.cmp(&b.dev_name));
         let mut nics = discover_nics(sys_root);
         nics.sort_by(|a, b| a.pci_bdf.cmp(&b.pci_bdf).then(a.dev_name.cmp(&b.dev_name)));
 
@@ -120,6 +129,7 @@ impl Host {
             numa_nodes,
             hcas,
             nvmes,
+            block_devices,
             nics,
             isolated,
         }
@@ -308,6 +318,30 @@ fn discover_nics(sys_root: &Path) -> Vec<Nic> {
     out
 }
 
+fn discover_block_devices(sys_root: &Path) -> Vec<BlockDevice> {
+    let block_root = sys_root.join("class/block");
+    let entries = match fs::read_dir(&block_root) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name_os = entry.file_name();
+        let dev = match name_os.to_str() {
+            Some(s) if !s.is_empty() => s.to_owned(),
+            _ => continue,
+        };
+        if is_ignored_block_device(&dev) || entry.path().join("partition").exists() {
+            continue;
+        }
+        out.push(BlockDevice {
+            dev_name: dev,
+            size_bytes: read_block_size_bytes(&entry.path().join("size")),
+        });
+    }
+    out
+}
+
 fn count_rx_queues(queues_dir: &Path) -> usize {
     let entries = match fs::read_dir(queues_dir) {
         Ok(e) => e,
@@ -342,6 +376,15 @@ fn read_operstate_up(path: &Path) -> bool {
         Ok(s) => s.trim() == "up",
         Err(_) => false,
     }
+}
+
+fn is_ignored_block_device(name: &str) -> bool {
+    name.starts_with("loop") || name.starts_with("ram")
+}
+
+fn read_block_size_bytes(path: &Path) -> Option<u64> {
+    let sectors = fs::read_to_string(path).ok()?.trim().parse::<u64>().ok()?;
+    sectors.checked_mul(512)
 }
 
 fn is_nvme_controller(name: &str) -> bool {
@@ -468,6 +511,18 @@ mod tests {
             );
         }
 
+        fn add_block(&self, dev: &str, sectors: Option<u64>) {
+            self.touch_dir(&format!("class/block/{dev}"));
+            if let Some(sectors) = sectors {
+                self.write(&format!("class/block/{dev}/size"), &format!("{sectors}\n"));
+            }
+        }
+
+        fn add_partition(&self, dev: &str, sectors: u64) {
+            self.add_block(dev, Some(sectors));
+            self.write(&format!("class/block/{dev}/partition"), "1\n");
+        }
+
         #[allow(clippy::too_many_arguments)]
         fn add_nic(
             &self,
@@ -532,6 +587,7 @@ mod tests {
         assert!(h.numa_nodes.is_empty());
         assert!(h.hcas.is_empty());
         assert!(h.nvmes.is_empty());
+        assert!(h.block_devices.is_empty());
         assert!(h.nics.is_empty());
         assert!(h.isolated.is_empty());
     }
@@ -602,6 +658,65 @@ mod tests {
         let h = Host::discover_with(&s.root);
         assert_eq!(h.nvmes.len(), 1);
         assert_eq!(h.nvmes[0].dev_name, "nvme0");
+    }
+
+    #[test]
+    fn whole_block_devices_recorded_with_size_bytes() {
+        let s = FakeSys::new();
+        s.add_block("sdb", Some(8));
+        s.add_block("nvme0n1", Some(16));
+        let h = Host::discover_with(&s.root);
+        assert_eq!(
+            h.block_devices,
+            vec![
+                BlockDevice {
+                    dev_name: "nvme0n1".to_string(),
+                    size_bytes: Some(8192),
+                },
+                BlockDevice {
+                    dev_name: "sdb".to_string(),
+                    size_bytes: Some(4096),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn block_device_missing_or_invalid_size_is_recorded_without_size() {
+        let s = FakeSys::new();
+        s.add_block("sdb", None);
+        s.write("class/block/sdc/size", "not-a-number\n");
+        let h = Host::discover_with(&s.root);
+        assert_eq!(
+            h.block_devices,
+            vec![
+                BlockDevice {
+                    dev_name: "sdb".to_string(),
+                    size_bytes: None,
+                },
+                BlockDevice {
+                    dev_name: "sdc".to_string(),
+                    size_bytes: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn block_partitions_loop_and_ram_devices_are_skipped() {
+        let s = FakeSys::new();
+        s.add_block("sdb", Some(8));
+        s.add_partition("sdb1", 4);
+        s.add_block("loop0", Some(8));
+        s.add_block("ram0", Some(8));
+        let h = Host::discover_with(&s.root);
+        assert_eq!(
+            h.block_devices,
+            vec![BlockDevice {
+                dev_name: "sdb".to_string(),
+                size_bytes: Some(4096),
+            }]
+        );
     }
 
     #[test]

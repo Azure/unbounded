@@ -46,7 +46,7 @@ type AgentConfig struct {
 
 	// OCIImage is the fully-qualified OCI image reference (e.g.
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
-	// When empty the agent falls back to debootstrap.
+	// When empty the agent uses the built-in default image.
 	OCIImage string `json:"OCIImage,omitempty"`
 }
 

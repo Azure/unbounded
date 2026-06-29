@@ -37,7 +37,7 @@ use prometheus::{
 
 use crate::config::ConfigVersionStatus;
 
-pub use exporter::{ExporterError, RdmaInventoryStatus, spawn};
+pub use exporter::{DeviceInventoryStatus, ExporterError, spawn};
 
 /// Content type for the Prometheus text exposition format (v0.0.4),
 /// sent in the `/metrics` response.
