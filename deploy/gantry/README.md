@@ -68,7 +68,7 @@ on its own; no restart needed.
 
 | Check | How |
 | --- | --- |
-| Agents are running | `kubectl -n gantry-system get ds gantry` |
+| Agents are running | `kubectl -n unbounded-system get ds gantry` |
 | Liveness / readiness | `/livez`, `/readyz` on 9095 per pod |
 | Metrics | `curl http://<pod-ip>:9095/metrics` or scrape from Prometheus |
 | Routing-table grew | `p2p_dht_health_score` ≥ 0.7 |
@@ -114,7 +114,7 @@ table below.
 Workflow:
 
 1. Roll out the DaemonSet without the overlay and verify
-   `kubectl -n gantry-system rollout status ds/gantry`,
+   `kubectl -n unbounded-system rollout status ds/gantry`,
    `p2p_cache_hit_total`, and a successful workload pull.
 2. Copy the overlay into your own repository (or a Kustomize /
    Helm chart), edit every ipBlock marked "OPERATOR ACTION
@@ -127,7 +127,7 @@ Workflow:
    `dht routing table empty` (no peer libp2p traffic) or as
    containerd `connection refused` on 5000 (wrong mirror source
    CIDR), not as a NetworkPolicy validation error.
-4. Roll back with `kubectl delete networkpolicy -n gantry-system
+4. Roll back with `kubectl delete networkpolicy -n unbounded-system
    gantry-agent` if anything regresses.
 
 Future hardening overlays (Pod Security Standards, dedicated

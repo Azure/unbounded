@@ -48,7 +48,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: gantry-agent
-  namespace: gantry-system
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: gantry
     app.kubernetes.io/component: agent

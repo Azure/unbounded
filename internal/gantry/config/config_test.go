@@ -163,7 +163,7 @@ func TestValidate_FullProdTripleOK(t *testing.T) {
 	c.NodeName = "ip-10-0-0-7"
 	c.PodName = "gantry-abc12"
 
-	c.MembersNamespace = "gantry-system"
+	c.MembersNamespace = "unbounded-system"
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
