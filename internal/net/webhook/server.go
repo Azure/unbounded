@@ -23,6 +23,7 @@ import (
 	"k8s.io/klog/v2"
 
 	unboundednet "github.com/Azure/unbounded/internal/net/client/unboundednet"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 const (
@@ -85,7 +86,7 @@ func NewServer(clientset kubernetes.Interface, restConfig *rest.Config, namespac
 	}
 
 	if namespace == "" {
-		namespace = "unbounded-system"
+		namespace = unbounded.SystemNamespace
 	}
 
 	mux := http.NewServeMux()

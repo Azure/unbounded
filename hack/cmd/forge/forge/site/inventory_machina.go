@@ -14,6 +14,7 @@ import (
 	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/hack/cmd/forge/forge/site/azuredev"
 	"github.com/Azure/unbounded/internal/kube"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 // machinaNameFromInventory builds a Machine CR name from the site name, LB IP,
@@ -48,7 +49,7 @@ func parseSecretKeyRef(ref string) (machinav1alpha3.SecretKeySelector, error) {
 		sel.Namespace = namespaceName[:idx]
 		sel.Name = namespaceName[idx+1:]
 	} else {
-		sel.Namespace = "unbounded-system"
+		sel.Namespace = unbounded.SystemNamespace
 		sel.Name = namespaceName
 	}
 

@@ -36,6 +36,7 @@ import (
 	"github.com/Azure/unbounded/internal/net/controller"
 	"github.com/Azure/unbounded/internal/net/metrics"
 	"github.com/Azure/unbounded/internal/net/webhook"
+	"github.com/Azure/unbounded/internal/unbounded"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -142,7 +143,7 @@ on site configuration, and maintain SiteNodeSlice and GatewayPool status.`,
 	flags.DurationVar(&cfg.LeaderElection.LeaseDuration, "leader-elect-lease-duration", 15*time.Second, "Duration that non-leader candidates will wait to force acquire leadership")
 	flags.DurationVar(&cfg.LeaderElection.RenewDeadline, "leader-elect-renew-deadline", 5*time.Second, "Duration that the acting leader will retry refreshing leadership before giving up")
 	flags.DurationVar(&cfg.LeaderElection.RetryPeriod, "leader-elect-retry-period", 10*time.Second, "Duration the LeaderElector clients should wait between tries of actions")
-	flags.StringVar(&cfg.LeaderElection.ResourceNamespace, "leader-elect-resource-namespace", "unbounded-system", "Namespace for leader election lease")
+	flags.StringVar(&cfg.LeaderElection.ResourceNamespace, "leader-elect-resource-namespace", unbounded.SystemNamespace, "Namespace for leader election lease")
 	flags.StringVar(&cfg.LeaderElection.ResourceName, "leader-elect-resource-name", "unbounded-net-controller", "Name of leader election lease")
 
 	// Group the flags for better help output
@@ -408,7 +409,7 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 
 	controllerNamespace := os.Getenv("POD_NAMESPACE")
 	if controllerNamespace == "" {
-		controllerNamespace = "unbounded-system"
+		controllerNamespace = unbounded.SystemNamespace
 	}
 
 	// Initialize the CertManager to obtain and rotate a cluster-CA-signed

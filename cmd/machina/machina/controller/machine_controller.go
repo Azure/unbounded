@@ -28,6 +28,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 const (
@@ -65,7 +66,7 @@ const (
 	// SecretNamespaceUnboundedSystem is the namespace where SSH key secrets
 	// must reside. Machine is cluster-scoped, so we use a fixed namespace
 	// for secret lookup.
-	SecretNamespaceUnboundedSystem = "unbounded-system"
+	SecretNamespaceUnboundedSystem = unbounded.SystemNamespace
 )
 
 // ReachabilityChecker checks if a machine is reachable via TCP.

@@ -32,6 +32,7 @@ import (
 	metalmachineops "github.com/Azure/unbounded/internal/metalman/machineops"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 // ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.
@@ -75,7 +76,7 @@ func ServePXECmd() *cobra.Command {
 			// falling back to the default install namespace when unset.
 			leaderElectionNamespace := os.Getenv("POD_NAMESPACE")
 			if leaderElectionNamespace == "" {
-				leaderElectionNamespace = "unbounded-system"
+				leaderElectionNamespace = unbounded.SystemNamespace
 			}
 
 			scheme := BuildScheme()

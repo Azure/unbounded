@@ -29,6 +29,7 @@ import (
 	"github.com/Azure/unbounded/internal/machineops"
 	"github.com/Azure/unbounded/internal/machineops/providers/azurevm"
 	"github.com/Azure/unbounded/internal/machineops/providers/ociinstance"
+	"github.com/Azure/unbounded/internal/unbounded"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -57,8 +58,8 @@ func main() {
 	cmd.Flags().StringVar(&cfg.metricsAddr, "metrics-bind-address", ":8080", "Address for metrics endpoint")
 	cmd.Flags().StringVar(&cfg.probeAddr, "health-probe-bind-address", ":8081", "Address for health probes")
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
-	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", "unbounded-system", "Namespace for the leader election lease")
-	cmd.Flags().StringVar(&cfg.credentialSecretNamespace, "credential-secret-namespace", "unbounded-system", "Namespace containing MachineOperationCredential referenced Secrets")
+	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace, "Namespace for the leader election lease")
+	cmd.Flags().StringVar(&cfg.credentialSecretNamespace, "credential-secret-namespace", unbounded.SystemNamespace, "Namespace containing MachineOperationCredential referenced Secrets")
 	cmd.Flags().IntVar(&cfg.maxConcurrentReconciles, "max-concurrent-reconciles", 10, "Maximum concurrent MachineOperation reconciles")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint used in host replacement bootstrap config")
 	cmd.Flags().StringVar(&cfg.siteName, "site", "", "Site name this controller should operate on")

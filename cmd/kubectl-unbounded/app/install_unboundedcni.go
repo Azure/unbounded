@@ -11,12 +11,13 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	netdeploy "github.com/Azure/unbounded/deploy/net"
+	"github.com/Azure/unbounded/internal/unbounded"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
-	unboundedCNINamespace      = "unbounded-system"
+	unboundedCNINamespace      = unbounded.SystemNamespace
 	unboundedCNIControllerName = "unbounded-net-controller"
 )
 

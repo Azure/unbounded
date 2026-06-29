@@ -31,11 +31,12 @@ import (
 	"k8s.io/utils/ptr"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 const (
 	BootstrapSAName      = "metalman-bootstrap"
-	BootstrapSANamespace = "unbounded-system"
+	BootstrapSANamespace = unbounded.SystemNamespace
 
 	// maxRequestBodySize limits attestation request bodies to 1 MiB.
 	maxRequestBodySize = 1 << 20

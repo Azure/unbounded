@@ -765,7 +765,7 @@ func TestGetSecretValue(t *testing.T) {
 		t.Parallel()
 
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: "unbounded-system"},
+			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: SecretNamespaceUnboundedSystem},
 			Data:       map[string][]byte{"custom-key": []byte("secret-value")},
 		}
 
@@ -781,7 +781,7 @@ func TestGetSecretValue(t *testing.T) {
 		t.Parallel()
 
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: "unbounded-system"},
+			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: SecretNamespaceUnboundedSystem},
 			Data:       map[string][]byte{"ssh-privatekey": []byte("my-key")},
 		}
 
@@ -808,7 +808,7 @@ func TestGetSecretValue(t *testing.T) {
 		t.Parallel()
 
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: "unbounded-system"},
+			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: SecretNamespaceUnboundedSystem},
 			Data:       map[string][]byte{"other-key": []byte("value")},
 		}
 
@@ -937,7 +937,7 @@ func TestBuildSSHConfig(t *testing.T) {
 		t.Parallel()
 
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "ssh-key-secret", Namespace: "unbounded-system"},
+			ObjectMeta: metav1.ObjectMeta{Name: "ssh-key-secret", Namespace: SecretNamespaceUnboundedSystem},
 			Data:       map[string][]byte{"ssh-privatekey": []byte("not-a-valid-key")},
 		}
 

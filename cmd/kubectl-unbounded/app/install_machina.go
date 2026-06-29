@@ -11,12 +11,13 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	machinadeploy "github.com/Azure/unbounded/deploy/machina"
+	"github.com/Azure/unbounded/internal/unbounded"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
-	machinaNamespace      = "unbounded-system"
+	machinaNamespace      = unbounded.SystemNamespace
 	machinaControllerName = "machina-controller"
 )
 

@@ -19,6 +19,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/Azure/unbounded/internal/kube"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 // MetalmanImage is the default container image for the metalman controller
@@ -30,7 +31,7 @@ import (
 var MetalmanImage = "metalman:latest"
 
 const (
-	deployPXENamespace       = "unbounded-system"
+	deployPXENamespace       = unbounded.SystemNamespace
 	deployPXEDefaultReplicas = 1
 )
 

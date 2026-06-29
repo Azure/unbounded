@@ -1153,7 +1153,7 @@ func TestDialViaBastion_Integration(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(s))
 
 	bastionKeySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: "unbounded-system"},
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: SecretNamespaceUnboundedSystem},
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
@@ -1227,7 +1227,7 @@ func TestDialViaBastion_FallsBackToMachineKey(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(s))
 
 	machineKeySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "machine-key-secret", Namespace: "unbounded-system"},
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-key-secret", Namespace: SecretNamespaceUnboundedSystem},
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
@@ -1292,7 +1292,7 @@ func TestDialViaBastion_DefaultPort(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(s))
 
 	bastionKeySecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: "unbounded-system"},
+		ObjectMeta: metav1.ObjectMeta{Name: "bastion-key-secret", Namespace: SecretNamespaceUnboundedSystem},
 		Data:       map[string][]byte{"ssh-privatekey": pemBytes},
 	}
 
