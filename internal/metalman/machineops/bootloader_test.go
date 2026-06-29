@@ -173,3 +173,133 @@ func TestBootImageWriteRecorderIgnoresTerminalOperation(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
 	require.Nil(t, apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten))
 }
+
+func TestCloudInitStatusRecorderAvoidsIntermediateChurn(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	op := testOperation("op-cloudinit", v1alpha3.OperationHostReplace)
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Conditions = []metav1.Condition{{
+		Type:               v1alpha3.MachineOperationConditionCloudInitDone,
+		Status:             metav1.ConditionUnknown,
+		Reason:             "Pending",
+		Message:            "waiting for first-boot cloud-init to start",
+		ObservedGeneration: op.Generation,
+	}}
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: "machine-1",
+		Phase:      v1alpha3.OperationPhaseInProgress,
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(op).WithStatusSubresource(op).Build()
+	recorder := &CloudInitStatusRecorder{Client: c, Now: fixedNow}
+
+	require.NoError(t, recorder.RecordCloudInitStatus(context.Background(), "machine-1", CloudInitStarted, ""))
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionFalse, cond.Status)
+	require.Equal(t, "Running", cond.Reason)
+	require.Contains(t, cond.Message, "started first-boot cloud-init")
+	wantTransition := fixedNow()
+	require.True(t, cond.LastTransitionTime.Equal(&wantTransition), "lastTransitionTime = %s, want %s", cond.LastTransitionTime, wantTransition)
+
+	recorder.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(time.Minute)) }
+	require.NoError(t, recorder.RecordCloudInitStatus(context.Background(), "machine-1", CloudInitStarted, ""))
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+
+	cond = apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionFalse, cond.Status)
+	require.Equal(t, "Running", cond.Reason)
+	require.True(t, cond.LastTransitionTime.Equal(&wantTransition), "lastTransitionTime = %s, want %s", cond.LastTransitionTime, wantTransition)
+}
+
+func TestCloudInitStatusRecorderTransitionsToTerminalStates(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	op := testOperation("op-cloudinit-terminal", v1alpha3.OperationHostReplace)
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: "machine-1",
+		Phase:      v1alpha3.OperationPhaseInProgress,
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(op).WithStatusSubresource(op).Build()
+	recorder := &CloudInitStatusRecorder{Client: c, Now: fixedNow}
+
+	require.NoError(t, recorder.RecordCloudInitStatus(context.Background(), "machine-1", CloudInitFailed, "stage \"modules-final\" failed with result \"FAIL\""))
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionFalse, cond.Status)
+	require.Equal(t, "Failed", cond.Reason)
+	require.Contains(t, cond.Message, "modules-final")
+	wantTransition := fixedNow()
+	require.True(t, cond.LastTransitionTime.Equal(&wantTransition), "lastTransitionTime = %s, want %s", cond.LastTransitionTime, wantTransition)
+
+	recorder.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(time.Minute)) }
+	require.NoError(t, recorder.RecordCloudInitStatus(context.Background(), "machine-1", CloudInitSucceeded, ""))
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+
+	cond = apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionFalse, cond.Status)
+	require.Equal(t, "Failed", cond.Reason)
+	require.True(t, cond.LastTransitionTime.Equal(&wantTransition), "lastTransitionTime = %s, want %s", cond.LastTransitionTime, wantTransition)
+}
+
+func TestCloudInitStatusRecorderRecordsSuccess(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	op := testOperation("op-cloudinit-success", v1alpha3.OperationHostReplace)
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: "machine-1",
+		Phase:      v1alpha3.OperationPhaseInProgress,
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(op).WithStatusSubresource(op).Build()
+	recorder := &CloudInitStatusRecorder{Client: c, Now: fixedNow}
+
+	require.NoError(t, recorder.RecordCloudInitStatus(context.Background(), "machine-1", CloudInitSucceeded, ""))
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+
+	cond := apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionTrue, cond.Status)
+	require.Equal(t, "Succeeded", cond.Reason)
+	require.Contains(t, cond.Message, "completed first-boot cloud-init successfully")
+}
+
+func TestCloudInitStatusRecorderIgnoresTerminalOperation(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	op := testOperation("op-cloudinit-ignored", v1alpha3.OperationHostReplace)
+	op.Status.Phase = v1alpha3.OperationPhaseComplete
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: "machine-1",
+		Phase:      v1alpha3.OperationPhaseComplete,
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(op).WithStatusSubresource(op).Build()
+	recorder := &CloudInitStatusRecorder{Client: c, Now: fixedNow}
+
+	require.NoError(t, recorder.RecordCloudInitStatus(context.Background(), "machine-1", CloudInitStarted, ""))
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Nil(t, apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone))
+}

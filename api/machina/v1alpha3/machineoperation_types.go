@@ -108,6 +108,10 @@ const (
 	// MachineOperationConditionBootImageWritten indicates that a metalman
 	// target has booted the PXE installer and written the boot image to disk.
 	MachineOperationConditionBootImageWritten = "BootImageWritten"
+
+	// MachineOperationConditionCloudInitDone indicates that a metalman PXE
+	// target has completed first-boot cloud-init after writing the boot image.
+	MachineOperationConditionCloudInitDone = "CloudInitDone"
 )
 
 // OperationStage represents the current stage of a target operation.

@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2644,6 +2645,151 @@ func TestCloudInitCondition_FullLifecycle(t *testing.T) {
 	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Succeeded" {
 		t.Fatalf("after modules-final finish: expected True/Succeeded, got %+v", cond)
 	}
+}
+
+func TestCloudInitStatusRecorderReceivesStableOperationEvents(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-operation-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:76", IPv4: "10.0.20.16", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	recorder := &recordingCloudInitStatusRecorder{}
+
+	srv := &HTTPServer{
+		Client:                  fc,
+		FileResolver:            FileResolver{Cache: cache, Reader: fc},
+		CloudInitStatusRecorder: recorder,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	postEvent := func(body string) {
+		t.Helper()
+
+		req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+		req.Header.Set("X-Forwarded-For", "10.0.20.16")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST /cloudinit/log: %v", err)
+		}
+
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
+	}
+
+	postEvent(`{"name":"init-local","description":"starting init-local","event_type":"start","origin":"cloudinit","timestamp":1.0}`)
+	postEvent(`{"name":"init-local","description":"init-local done","event_type":"finish","origin":"cloudinit","timestamp":2.0,"result":"SUCCESS"}`)
+	postEvent(`{"name":"modules-config","description":"modules-config done","event_type":"finish","origin":"cloudinit","timestamp":3.0,"result":"SUCCESS"}`)
+	postEvent(`{"name":"modules-final","description":"modules-final done","event_type":"finish","origin":"cloudinit","timestamp":4.0,"result":"SUCCESS"}`)
+
+	require.Equal(t, []recordedCloudInitStatus{
+		{machineName: node.Name, stage: CloudInitStarted},
+		{machineName: node.Name, stage: CloudInitSucceeded},
+	}, recorder.events())
+}
+
+func TestCloudInitStatusRecorderReceivesFailureSummary(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci-operation-fail-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:77", IPv4: "10.0.20.17", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	recorder := &recordingCloudInitStatusRecorder{}
+
+	srv := &HTTPServer{
+		Client:                  fc,
+		FileResolver:            FileResolver{Cache: cache, Reader: fc},
+		CloudInitStatusRecorder: recorder,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /cloudinit/log", srv.handleCloudInitLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := `{"name":"modules-final","description":"running modules-final","event_type":"finish","origin":"cloudinit","timestamp":1.0,"result":"FAIL: command [apt-get install -y badpkg] failed with exit code 100"}`
+	req, _ := http.NewRequest("POST", ts.URL+"/cloudinit/log", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "10.0.20.17")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /cloudinit/log: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	events := recorder.events()
+	require.Len(t, events, 1)
+	require.Equal(t, node.Name, events[0].machineName)
+	require.Equal(t, CloudInitFailed, events[0].stage)
+	require.Contains(t, events[0].message, `stage "modules-final" failed`)
+	require.Contains(t, events[0].message, "apt-get install -y badpkg")
+}
+
+type recordedCloudInitStatus struct {
+	machineName string
+	stage       string
+	message     string
+}
+
+type recordingCloudInitStatusRecorder struct {
+	mu       sync.Mutex
+	recorded []recordedCloudInitStatus
+}
+
+func (r *recordingCloudInitStatusRecorder) RecordCloudInitStatus(_ context.Context, machineName, stage, message string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.recorded = append(r.recorded, recordedCloudInitStatus{machineName: machineName, stage: stage, message: message})
+
+	return nil
+}
+
+func (r *recordingCloudInitStatusRecorder) events() []recordedCloudInitStatus {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]recordedCloudInitStatus(nil), r.recorded...)
 }
 
 func freePort(t *testing.T) int {

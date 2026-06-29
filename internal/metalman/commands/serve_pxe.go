@@ -281,12 +281,13 @@ func ServePXECmd() *cobra.Command {
 			httpMux.HandleFunc("POST /attest", attestHandler.Attest)
 
 			httpServer := &netboot.HTTPServer{
-				BindAddr:               bindAddress,
-				Port:                   httpPort,
-				Client:                 mgr.GetClient(),
-				Mux:                    httpMux,
-				FileResolver:           resolver,
-				BootImageWriteRecorder: &metalmachineops.BootImageWriteRecorder{Client: mgr.GetClient()},
+				BindAddr:                bindAddress,
+				Port:                    httpPort,
+				Client:                  mgr.GetClient(),
+				Mux:                     httpMux,
+				FileResolver:            resolver,
+				BootImageWriteRecorder:  &metalmachineops.BootImageWriteRecorder{Client: mgr.GetClient()},
+				CloudInitStatusRecorder: &metalmachineops.CloudInitStatusRecorder{Client: mgr.GetClient()},
 			}
 			if err := mgr.Add(httpServer); err != nil {
 				return fmt.Errorf("adding HTTP server: %w", err)

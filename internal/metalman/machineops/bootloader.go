@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -110,11 +111,77 @@ func (r *BootImageWriteRecorder) RecordBootImageWrite(ctx context.Context, machi
 	})
 }
 
+const (
+	CloudInitStarted   = "Started"
+	CloudInitSucceeded = "Succeeded"
+	CloudInitFailed    = "Failed"
+)
+
+// CloudInitStatusRecorder records stable first-boot cloud-init progress for
+// active metalman MachineOperations.
+type CloudInitStatusRecorder struct {
+	Client client.Client
+	Now    func() metav1.Time
+}
+
+func (r *CloudInitStatusRecorder) RecordCloudInitStatus(ctx context.Context, machineName, stage, message string) error {
+	if r == nil || r.Client == nil {
+		return nil
+	}
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		op, ok, err := r.activeOperationForMachine(ctx, machineName)
+		if err != nil || !ok {
+			return err
+		}
+
+		cond := apimeta.FindStatusCondition(op.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+		if cond != nil && (cond.Status == metav1.ConditionTrue || cond.Reason == "Failed") {
+			return nil
+		}
+
+		condition := metav1.Condition{
+			Type:               v1alpha3.MachineOperationConditionCloudInitDone,
+			ObservedGeneration: op.Generation,
+			LastTransitionTime: r.now(),
+		}
+
+		switch stage {
+		case CloudInitStarted:
+			if cond != nil && cond.Status == metav1.ConditionFalse {
+				return nil
+			}
+
+			condition.Status = metav1.ConditionFalse
+			condition.Reason = "Running"
+			condition.Message = fmt.Sprintf("Machine %s started first-boot cloud-init", machineName)
+		case CloudInitSucceeded:
+			condition.Status = metav1.ConditionTrue
+			condition.Reason = "Succeeded"
+			condition.Message = fmt.Sprintf("Machine %s completed first-boot cloud-init successfully", machineName)
+		case CloudInitFailed:
+			condition.Status = metav1.ConditionFalse
+			condition.Reason = "Failed"
+			condition.Message = cloudInitFailureMessage(machineName, message)
+		default:
+			return fmt.Errorf("unknown cloud-init stage %q", stage)
+		}
+
+		apimeta.SetStatusCondition(&op.Status.Conditions, condition)
+
+		return r.Client.Status().Update(ctx, op)
+	})
+}
+
 func (r *BootLoaderDownloadRecorder) activeOperationForMachine(ctx context.Context, machineName string) (*v1alpha3.MachineOperation, bool, error) {
 	return activeOperationForMachine(ctx, r.Client, machineName)
 }
 
 func (r *BootImageWriteRecorder) activeOperationForMachine(ctx context.Context, machineName string) (*v1alpha3.MachineOperation, bool, error) {
+	return activeOperationForMachine(ctx, r.Client, machineName)
+}
+
+func (r *CloudInitStatusRecorder) activeOperationForMachine(ctx context.Context, machineName string) (*v1alpha3.MachineOperation, bool, error) {
 	return activeOperationForMachine(ctx, r.Client, machineName)
 }
 
@@ -169,4 +236,28 @@ func (r *BootImageWriteRecorder) now() metav1.Time {
 	}
 
 	return metav1.Now()
+}
+
+func (r *CloudInitStatusRecorder) now() metav1.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+
+	return metav1.Now()
+}
+
+const maxCloudInitFailureMessageLen = 1024
+
+func cloudInitFailureMessage(machineName, message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "cloud-init reported failure"
+	}
+
+	result := fmt.Sprintf("Machine %s first-boot cloud-init failed: %s", machineName, message)
+	if len(result) > maxCloudInitFailureMessageLen {
+		result = result[:maxCloudInitFailureMessageLen-3] + "..."
+	}
+
+	return result
 }

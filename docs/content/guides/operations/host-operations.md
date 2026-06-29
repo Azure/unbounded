@@ -194,7 +194,10 @@ downloads the initial PXE boot loader for the operation, typically over TFTP.
 For installer visibility, `status.conditions[type=BootImageWritten]` starts as
 `Unknown`, transitions to `False` when the PXE installer starts and requests the
 disk image, and transitions to `True` when the installer finishes and sends the
-existing PXE disable signal.
+existing PXE disable signal. `status.conditions[type=CloudInitDone]` tracks the
+first boot after the image is written: it starts as `Unknown`, moves to `False`
+when cloud-init starts, and then records either final success or a summarized
+failure without updating for every cloud-init log entry.
 
 ### HostReplace vs Node Recreation
 

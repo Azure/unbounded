@@ -38,16 +38,24 @@ type HTTPServer struct {
 	Client   client.Client
 	Mux      *http.ServeMux
 	FileResolver
-	BootImageWriteRecorder BootImageWriteRecorder
+	BootImageWriteRecorder  BootImageWriteRecorder
+	CloudInitStatusRecorder CloudInitStatusRecorder
 }
 
 type BootImageWriteRecorder interface {
 	RecordBootImageWrite(ctx context.Context, machineName string, stage string) error
 }
 
+type CloudInitStatusRecorder interface {
+	RecordCloudInitStatus(ctx context.Context, machineName, stage, message string) error
+}
+
 const (
 	BootImageWriteStarted  = "Started"
 	BootImageWriteFinished = "Finished"
+	CloudInitStarted       = "Started"
+	CloudInitSucceeded     = "Succeeded"
+	CloudInitFailed        = "Failed"
 )
 
 func (h *HTTPServer) NeedLeaderElection() bool { return false }
@@ -173,7 +181,8 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 		log.Info("cloud-init event", "type", ev.EventType, "description", ev.Description)
 	}
 
-	h.updateCloudInitCondition(r.Context(), log, ip, &ev)
+	machineName := h.updateCloudInitCondition(r.Context(), log, ip, &ev)
+	h.recordCloudInitStatus(r.Context(), log, machineName, &ev)
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -185,16 +194,20 @@ const cloudInitLastStage = "modules-final"
 // updateCloudInitCondition sets the CloudInitDone condition on the Machine
 // that matches the request source IP. The condition reflects the
 // cloud-init lifecycle reported through webhook events:
-func (h *HTTPServer) updateCloudInitCondition(ctx context.Context, log *slog.Logger, ip string, ev *cloudInitEvent) {
+func (h *HTTPServer) updateCloudInitCondition(ctx context.Context, log *slog.Logger, ip string, ev *cloudInitEvent) string {
 	if h.Client == nil {
-		return
+		return ""
 	}
+
+	var machineName string
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		node, err := h.LookupNodeByIP(ctx, ip)
 		if err != nil {
 			return err
 		}
+
+		machineName = node.Name
 
 		cond := buildCloudInitCondition(ev, node.Generation)
 		if cond == nil {
@@ -209,6 +222,8 @@ func (h *HTTPServer) updateCloudInitCondition(ctx context.Context, log *slog.Log
 	if err != nil {
 		log.Error("cloud-init condition: updating Machine status", "ip", ip, "err", err)
 	}
+
+	return machineName
 }
 
 const maxConditionMessageLen = 1024
@@ -344,6 +359,52 @@ func (h *HTTPServer) recordBootImageWriteFinished(ctx context.Context, log *slog
 	if err := h.BootImageWriteRecorder.RecordBootImageWrite(ctx, machineName, BootImageWriteFinished); err != nil {
 		log.Error("recording boot image write finish", "node", machineName, "err", err)
 	}
+}
+
+func (h *HTTPServer) recordCloudInitStatus(ctx context.Context, log *slog.Logger, machineName string, ev *cloudInitEvent) {
+	if h.CloudInitStatusRecorder == nil || machineName == "" {
+		return
+	}
+
+	stage, message, ok := cloudInitOperationStatus(ev)
+	if !ok {
+		return
+	}
+
+	if err := h.CloudInitStatusRecorder.RecordCloudInitStatus(ctx, machineName, stage, message); err != nil {
+		log.Error("recording cloud-init status", "node", machineName, "err", err)
+	}
+}
+
+func cloudInitOperationStatus(ev *cloudInitEvent) (string, string, bool) {
+	switch ev.EventType {
+	case "start":
+		return CloudInitStarted, "", true
+	case "finish":
+		if !strings.EqualFold(ev.Result, "SUCCESS") {
+			return CloudInitFailed, cloudInitErrorSummary(ev), true
+		}
+
+		if ev.Name == cloudInitLastStage {
+			return CloudInitSucceeded, "", true
+		}
+	}
+
+	return "", "", false
+}
+
+func cloudInitErrorSummary(ev *cloudInitEvent) string {
+	result := strings.TrimSpace(ev.Result)
+	description := strings.TrimSpace(ev.Description)
+	if result == "" {
+		result = "failure"
+	}
+
+	if description == "" {
+		return fmt.Sprintf("stage %q failed with result %q", ev.Name, result)
+	}
+
+	return fmt.Sprintf("stage %q failed with result %q: %s", ev.Name, result, description)
 }
 
 func clientIP(r *http.Request) string {
