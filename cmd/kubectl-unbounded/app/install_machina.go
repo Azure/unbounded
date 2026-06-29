@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	machinaNamespace      = "unbounded-kube"
+	machinaNamespace      = "unbounded-system"
 	machinaControllerName = "machina-controller"
 )
 

@@ -30,7 +30,7 @@ import (
 var MetalmanImage = "metalman:latest"
 
 const (
-	deployPXENamespace       = "unbounded-kube"
+	deployPXENamespace       = "unbounded-system"
 	deployPXEDefaultReplicas = 1
 )
 
@@ -92,6 +92,14 @@ func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguratio
 						WithImage(p.Image).
 						WithImagePullPolicy(corev1.PullAlways).
 						WithArgs("serve-pxe", "--site="+p.Site, "--dhcp-auto-interface").
+						WithEnv(accorev1.EnvVar().
+							WithName("POD_NAMESPACE").
+							WithValueFrom(accorev1.EnvVarSource().
+								WithFieldRef(accorev1.ObjectFieldSelector().
+									WithFieldPath("metadata.namespace"),
+								),
+							),
+						).
 						WithPorts(
 							accorev1.ContainerPort().
 								WithContainerPort(8880).
@@ -196,7 +204,7 @@ func deployPXECommand() *cobra.Command {
 		Short: "Deploy the PXE server for a site",
 		Long: `Deploy (or update) a Kubernetes Deployment running metalman serve-pxe
 for a given site. The Deployment is server-side applied into the
-unbounded-kube namespace.`,
+unbounded-system namespace.`,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {

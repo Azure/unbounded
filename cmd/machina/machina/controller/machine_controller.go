@@ -62,10 +62,10 @@ const (
 	// uploaded on the remote machine.
 	remoteConfigPath = "/tmp/unbounded-agent.json"
 
-	// SecretNamespaceUnboundedKube is the namespace where SSH key secrets
+	// SecretNamespaceUnboundedSystem is the namespace where SSH key secrets
 	// must reside. Machine is cluster-scoped, so we use a fixed namespace
 	// for secret lookup.
-	SecretNamespaceUnboundedKube = "unbounded-kube"
+	SecretNamespaceUnboundedSystem = "unbounded-system"
 )
 
 // ReachabilityChecker checks if a machine is reachable via TCP.
@@ -451,10 +451,10 @@ func (r *MachineReconciler) buildSSHConfig(ctx context.Context, machine *unbound
 	}, nil
 }
 
-// getSecretValue retrieves a value from a secret in the unbounded-kube namespace.
+// getSecretValue retrieves a value from a secret in the unbounded-system namespace.
 func getSecretValue(ctx context.Context, reader client.Reader, ref *unboundedv1alpha3.SecretKeySelector) (string, error) {
 	var secret corev1.Secret
-	if err := reader.Get(ctx, client.ObjectKey{Namespace: SecretNamespaceUnboundedKube, Name: ref.Name}, &secret); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: SecretNamespaceUnboundedSystem, Name: ref.Name}, &secret); err != nil {
 		return "", fmt.Errorf("get secret %s: %w", ref.Name, err)
 	}
 

@@ -68,13 +68,23 @@ func ServePXECmd() *cobra.Command {
 
 			leID := LeaderElectionID(site)
 
+			// Leader-election lease lives in the namespace metalman is
+			// deployed into. Sourced from the Downward API POD_NAMESPACE
+			// env (set by the deployment) so the lease and its RBAC stay
+			// co-located even when the install namespace is overridden,
+			// falling back to the default install namespace when unset.
+			leaderElectionNamespace := os.Getenv("POD_NAMESPACE")
+			if leaderElectionNamespace == "" {
+				leaderElectionNamespace = "unbounded-system"
+			}
+
 			scheme := BuildScheme()
 
 			mgr, err := ctrl.NewManager(cfg, manager.Options{
 				Scheme:                        scheme,
 				LeaderElection:                true,
 				LeaderElectionID:              leID,
-				LeaderElectionNamespace:       "unbounded-kube",
+				LeaderElectionNamespace:       leaderElectionNamespace,
 				LeaseDuration:                 &leaseDuration,
 				RenewDeadline:                 &renewDeadline,
 				RetryPeriod:                   &retryPeriod,

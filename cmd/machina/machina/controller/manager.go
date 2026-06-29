@@ -132,7 +132,7 @@ func machinaCacheOptions() cache.Options {
 			&corev1.Secret{}: {
 				Namespaces: map[string]cache.Config{
 					metav1.NamespaceSystem:       {},
-					SecretNamespaceUnboundedKube: {},
+					SecretNamespaceUnboundedSystem: {},
 				},
 			},
 		},

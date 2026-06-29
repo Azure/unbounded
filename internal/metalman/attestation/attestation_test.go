@@ -167,12 +167,12 @@ func testHandler(t *testing.T, objects ...client.Object) *Handler {
 		Build()
 
 	ns := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{Name: "unbounded-kube"},
+		ObjectMeta: metav1.ObjectMeta{Name: "unbounded-system"},
 	}
 	sa := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "metalman-bootstrap",
-			Namespace: "unbounded-kube",
+			Namespace: "unbounded-system",
 		},
 	}
 	clientset := fake.NewClientset(ns, sa)

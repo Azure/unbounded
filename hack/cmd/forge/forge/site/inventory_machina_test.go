@@ -246,10 +246,10 @@ func TestParseSecretKeyRef(t *testing.T) {
 			},
 		},
 		{
-			name:  "no namespace defaults to unbounded-kube",
+			name:  "no namespace defaults to unbounded-system",
 			input: "machina-ssh:ssh-private-key",
 			expected: machinav1alpha3.SecretKeySelector{
-				Namespace: "unbounded-kube",
+				Namespace: "unbounded-system",
 				Name:      "machina-ssh",
 				Key:       "ssh-private-key",
 			},
@@ -266,7 +266,7 @@ func TestParseSecretKeyRef(t *testing.T) {
 			name:  "bare name only",
 			input: "machina-ssh",
 			expected: machinav1alpha3.SecretKeySelector{
-				Namespace: "unbounded-kube",
+				Namespace: "unbounded-system",
 				Name:      "machina-ssh",
 			},
 		},
