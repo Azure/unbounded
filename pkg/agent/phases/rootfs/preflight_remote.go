@@ -166,16 +166,8 @@ func ociImageSources(rootFS *goalstates.RootFS) ([]remoteArtifactSource, error) 
 }
 
 func kubernetesArtifactSources(rootFS *goalstates.RootFS) ([]remoteArtifactSource, error) {
-	version := rootFS.KubernetesVersion
-
-	var override *goalstates.DownloadSource
-	if rootFS.Downloads != nil {
-		override = rootFS.Downloads.Kubernetes
-	}
-
-	if override != nil && override.Version != "" {
-		version = override.Version
-	}
+	override := kubernetesDownloadSource(rootFS)
+	version := downloadSourceVersion(rootFS.KubernetesVersion, override)
 
 	sources := make([]remoteArtifactSource, 0, len(requiredKubeBinaries))
 	for _, binary := range requiredKubeBinaries {
@@ -186,29 +178,12 @@ func kubernetesArtifactSources(rootFS *goalstates.RootFS) ([]remoteArtifactSourc
 }
 
 func criArtifactSources(rootFS *goalstates.RootFS) ([]remoteArtifactSource, error) {
-	containerdVersion := rootFS.ContainerdVersion
-	runcVersion := rootFS.RunCVersion
-	kubernetesVersion := rootFS.KubernetesVersion
-
-	var (
-		containerdOverride *goalstates.DownloadSource
-		runcOverride       *goalstates.DownloadSource
-		crictlOverride     *goalstates.DownloadSource
-	)
-
-	if rootFS.Downloads != nil {
-		containerdOverride = rootFS.Downloads.Containerd
-		runcOverride = rootFS.Downloads.Runc
-		crictlOverride = rootFS.Downloads.Crictl
-	}
-
-	if containerdOverride != nil && containerdOverride.Version != "" {
-		containerdVersion = containerdOverride.Version
-	}
-
-	if runcOverride != nil && runcOverride.Version != "" {
-		runcVersion = runcOverride.Version
-	}
+	containerdOverride := containerdDownloadSource(rootFS)
+	runcOverride := runcDownloadSource(rootFS)
+	crictlOverride := crictlDownloadSource(rootFS)
+	kubernetesVersion := downloadSourceVersion(rootFS.KubernetesVersion, kubernetesDownloadSource(rootFS))
+	containerdVersion := downloadSourceVersion(rootFS.ContainerdVersion, containerdOverride)
+	runcVersion := downloadSourceVersion(rootFS.RunCVersion, runcOverride)
 
 	crictlVersion, err := resolveCrictlVersion(crictlOverride, kubernetesVersion)
 	if err != nil {
@@ -223,16 +198,8 @@ func criArtifactSources(rootFS *goalstates.RootFS) ([]remoteArtifactSource, erro
 }
 
 func cniArtifactSources(rootFS *goalstates.RootFS) ([]remoteArtifactSource, error) {
-	version := rootFS.CNIPluginVersion
-
-	var override *goalstates.DownloadSource
-	if rootFS.Downloads != nil {
-		override = rootFS.Downloads.CNI
-	}
-
-	if override != nil && override.Version != "" {
-		version = override.Version
-	}
+	override := cniDownloadSource(rootFS)
+	version := downloadSourceVersion(rootFS.CNIPluginVersion, override)
 
 	return []remoteArtifactSource{
 		httpArtifactSource("cni-plugins", "CNI artifacts", cniDownloadURL(override, version, rootFS.HostArch)),

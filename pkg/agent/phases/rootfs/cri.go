@@ -52,27 +52,10 @@ func (d *downloadCRIBinaries) Name() string { return "download-cri-binaries" }
 
 func (d *downloadCRIBinaries) Do(ctx context.Context) error {
 	destDir := filepath.Join(d.goalState.MachineDir, goalstates.BinDir)
-
-	containerdVersion := d.goalState.ContainerdVersion
-	runcVersion := d.goalState.RunCVersion
-
-	var (
-		containerdOverride *goalstates.DownloadSource
-		runcOverride       *goalstates.DownloadSource
-	)
-
-	if d.goalState.Downloads != nil {
-		containerdOverride = d.goalState.Downloads.Containerd
-		runcOverride = d.goalState.Downloads.Runc
-	}
-
-	if containerdOverride != nil && containerdOverride.Version != "" {
-		containerdVersion = containerdOverride.Version
-	}
-
-	if runcOverride != nil && runcOverride.Version != "" {
-		runcVersion = runcOverride.Version
-	}
+	containerdOverride := containerdDownloadSource(d.goalState)
+	runcOverride := runcDownloadSource(d.goalState)
+	containerdVersion := downloadSourceVersion(d.goalState.ContainerdVersion, containerdOverride)
+	runcVersion := downloadSourceVersion(d.goalState.RunCVersion, runcOverride)
 
 	containerdURL := containerdDownloadURL(containerdOverride, containerdVersion, d.goalState.HostArch)
 	runcURL := runcDownloadURL(runcOverride, runcVersion, d.goalState.HostArch)

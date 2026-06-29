@@ -55,21 +55,9 @@ func (d *downloadKubeBinaries) Name() string { return "download-kube-binaries" }
 
 func (d *downloadKubeBinaries) Do(ctx context.Context) error {
 	destDir := filepath.Join(d.goalState.MachineDir, goalstates.BinDir)
-	kubernetesVersion := d.goalState.KubernetesVersion
-
-	var (
-		kubeOverride   *goalstates.DownloadSource
-		crictlOverride *goalstates.DownloadSource
-	)
-
-	if d.goalState.Downloads != nil {
-		kubeOverride = d.goalState.Downloads.Kubernetes
-		crictlOverride = d.goalState.Downloads.Crictl
-	}
-
-	if kubeOverride != nil && kubeOverride.Version != "" {
-		kubernetesVersion = kubeOverride.Version
-	}
+	kubeOverride := kubernetesDownloadSource(d.goalState)
+	crictlOverride := crictlDownloadSource(d.goalState)
+	kubernetesVersion := downloadSourceVersion(d.goalState.KubernetesVersion, kubeOverride)
 
 	crictlVersion, err := resolveCrictlVersion(crictlOverride, kubernetesVersion)
 	if err != nil {
@@ -234,8 +222,8 @@ func crictlVersionMatch(ctx context.Context, log *slog.Logger, destDir, expected
 // a user-supplied override and otherwise aligning to the cluster's
 // Kubernetes minor version.
 func resolveCrictlVersion(override *goalstates.DownloadSource, kubernetesVersion string) (string, error) {
-	if override != nil && override.Version != "" {
-		return override.Version, nil
+	if version := downloadSourceVersion("", override); version != "" {
+		return version, nil
 	}
 
 	return crictlVersionForKubernetesVersion(kubernetesVersion)
