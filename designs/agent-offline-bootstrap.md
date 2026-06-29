@@ -390,6 +390,8 @@ resolved artifact source = <resolved-offline-source>#<component-prefixed-offline
 
 The component-prefixed offline artifact path becomes the OCI blob title selector, using versions from `manifest.json`. The OCI artifact must also contain a blob titled `manifest.json`.
 
+The agent should resolve and fetch the OCI artifact manifest once per resolved `OfflineArtifacts.Source` and cache its descriptor map for the provisioning run. Each binary artifact is fetched as an individual blob selected by title. The agent should not copy or download the entire OCI artifact bundle for each binary.
+
 With this config:
 
 ```json
@@ -532,6 +534,23 @@ For filesystem mode, operators export the official rootfs image as a local OCI l
   }
 }
 ```
+
+## Preflight checks
+
+Preflight should make offline bootstrap failures actionable before the agent starts mutating the host or rootfs.
+
+When `OfflineArtifacts.Source` is configured, preflight should:
+
+1. Render `OfflineArtifacts.Source` using the normalized Kubernetes version from the agent config.
+2. Load `manifest.json` from the resolved offline source.
+3. Validate that the cluster Kubernetes version matches `versions.kubernetes`.
+4. Validate that any explicit runtime versions in the agent config match the manifest versions.
+5. Resolve every required artifact path for the host architecture from the manifest versions.
+6. Verify every required artifact exists in the offline source.
+
+For filesystem mode, existence checks should verify regular files under the resolved source root. For OCI registry mode, existence checks should resolve the OCI artifact manifest once, build a title-to-descriptor map, and verify that each required artifact title exists. Preflight should not download large artifact blobs just to check availability; descriptor presence is enough. Kubernetes checksum blobs are required artifacts and must be checked just like the binaries.
+
+Preflight should also validate `OCIImage` independently because `OfflineArtifacts.Source` does not control the rootfs image. For registry image references, preflight should check that the image reference is syntactically valid and reachable. For local `oci-layout://` references, preflight should check that the OCI layout directory exists and contains the requested reference.
 
 ## Host package behavior and preflight
 
