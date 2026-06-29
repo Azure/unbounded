@@ -21,6 +21,10 @@ FORGE_CMD=./hack/cmd/forge
 INVENTORY_AGENT_BIN=bin/inventory-agent
 INVENTORY_AGENT_CMD=./cmd/inventory/inventory-agent
 
+INVENTORY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
+INVENTORY_MANIFEST_TEMPLATES_DIR := deploy/inventory
+INVENTORY_MANIFEST_RENDERED_DIR  := deploy/inventory/rendered
+
 INVENTORY_AGGREGATOR_BIN=bin/inventory-aggregator
 INVENTORY_AGGREGATOR_CMD=./cmd/inventory/inventory-aggregator
 INVENTORY_AGGREGATOR_TAG ?= latest
@@ -209,7 +213,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -582,6 +586,24 @@ gantry-manifests: ## Render gantry deployment manifests into deploy/gantry/rende
 		--output-dir $(GANTRY_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(GANTRY_NAMESPACE)
 	@echo "Rendered gantry manifests into $(GANTRY_MANIFEST_RENDERED_DIR) (namespace: $(GANTRY_NAMESPACE))"
+
+# Inventory render knobs. SSLMode/Password feed the database config and
+# secret templates; Password is base64-encoded data and defaults empty so
+# the generic target stays secret-free (hack/inventory-dev/local.sh supplies
+# a generated value).
+INVENTORY_SSL_MODE        ?= disable
+INVENTORY_PG_PASSWORD_B64 ?=
+
+inventory-manifests: ## Render inventory deployment manifests into deploy/inventory/rendered
+	@mkdir -p $(INVENTORY_MANIFEST_RENDERED_DIR)
+	@find $(INVENTORY_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(INVENTORY_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(INVENTORY_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(INVENTORY_NAMESPACE) \
+		--set SSLMode=$(INVENTORY_SSL_MODE) \
+		--set Password=$(INVENTORY_PG_PASSWORD_B64)
+	@echo "Rendered inventory manifests into $(INVENTORY_MANIFEST_RENDERED_DIR) (namespace: $(INVENTORY_NAMESPACE))"
 
 unbounded-storage-supervisor-build: ## Build the unbounded-storage-supervisor binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_STORAGE_SUPERVISOR_BIN) $(UNBOUNDED_STORAGE_SUPERVISOR_CMD)

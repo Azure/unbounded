@@ -3,10 +3,10 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: inventory-database-config
-  namespace: {{ default "unbounded-kube" .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
 data:
   POSTGRES_HOST: "postgres.inventory.svc.cluster.local"
   POSTGRES_PORT: "5432"
   POSTGRES_DB_NAME: "inventory"
   POSTGRES_USER: "postgres"
-  POSTGRES_SSL_MODE: "{{ SSL_MODE }}"
+  POSTGRES_SSL_MODE: "{{ default "disable" .SSLMode }}"
