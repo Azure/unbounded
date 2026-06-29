@@ -33,6 +33,7 @@ func TestRenderStorageSupervisorManifests(t *testing.T) {
 	require.Len(t, docs, 6)
 
 	kinds := map[string]int{}
+
 	for _, doc := range docs {
 		require.NotContains(t, doc.raw, "{{")
 		require.NotEmpty(t, doc.kind)
@@ -88,14 +89,17 @@ func parseStorageSupervisorRenderedDocs(t *testing.T, outputDir string) []storag
 		require.NoError(t, err)
 
 		dec := yaml.NewDecoder(bytes.NewReader(raw))
+
 		for {
 			var doc map[string]any
+
 			err := dec.Decode(&doc)
 			if errors.Is(err, io.EOF) {
 				break
 			}
 
 			require.NoError(t, err)
+
 			if doc == nil {
 				continue
 			}
@@ -128,6 +132,7 @@ func requireStorageSupervisorDoc(t *testing.T, docs []storageSupervisorRenderedD
 	}
 
 	t.Fatalf("missing %s/%s", kind, name)
+
 	return storageSupervisorRenderedDoc{}
 }
 
@@ -135,6 +140,7 @@ func (d storageSupervisorRenderedDoc) initContainerImage(t *testing.T, name stri
 	t.Helper()
 
 	containers := nestedSlice(t, d.doc, "spec", "template", "spec", "initContainers")
+
 	return imageForContainer(t, containers, name)
 }
 
@@ -142,6 +148,7 @@ func (d storageSupervisorRenderedDoc) containerImage(t *testing.T, name string) 
 	t.Helper()
 
 	containers := nestedSlice(t, d.doc, "spec", "template", "spec", "containers")
+
 	return imageForContainer(t, containers, name)
 }
 
@@ -155,6 +162,7 @@ func (d storageSupervisorRenderedDoc) subjectNamespace(t *testing.T) string {
 	require.True(t, ok)
 
 	namespace, _ := subject["namespace"].(string)
+
 	return namespace
 }
 
@@ -212,5 +220,6 @@ func imageForContainer(t *testing.T, containers []any, name string) string {
 	}
 
 	t.Fatalf("missing container %s", name)
+
 	return ""
 }

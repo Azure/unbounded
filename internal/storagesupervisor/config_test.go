@@ -34,6 +34,7 @@ func setDefaultReleaseDir(t *testing.T) string {
 	previous := defaultReleaseDir
 	dir := t.TempDir()
 	defaultReleaseDir = dir
+
 	t.Cleanup(func() {
 		defaultReleaseDir = previous
 	})
@@ -169,6 +170,7 @@ func TestLoadConfigLocalTarballPrecedesDefaultReleaseTarball(t *testing.T) {
 func TestLoadConfigUsesDefaultReleaseTarball(t *testing.T) {
 	clearConfigEnv(t)
 	t.Setenv("ARCH", "amd64")
+
 	path := filepath.Join(defaultReleaseDir, "unbounded-storage-linux-amd64.tar.gz")
 	require.NoError(t, os.WriteFile(path, []byte("default"), 0o644))
 

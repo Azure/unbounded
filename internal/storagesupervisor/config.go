@@ -204,6 +204,7 @@ func sourceFromEnvOrDefault(arch string) string {
 
 func defaultReleaseTarballSource(arch string) string {
 	path := defaultReleaseTarballPath(arch)
+
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
 		return ""

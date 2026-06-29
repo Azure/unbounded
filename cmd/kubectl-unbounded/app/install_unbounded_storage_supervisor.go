@@ -103,6 +103,7 @@ func (i *installUnboundedStorageSupervisor) applySiteNodeSelector(manifestDir st
 	}
 
 	patched := false
+
 	err := filepath.WalkDir(manifestDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -139,11 +140,13 @@ func setDaemonSetSiteNodeSelector(path, daemonSetName, siteName string) (bool, e
 	}
 
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
+
 	var docs []map[string]any
 	patched := false
 
 	for {
 		var doc map[string]any
+
 		err := dec.Decode(&doc)
 		if errors.Is(err, io.EOF) {
 			break
@@ -173,6 +176,7 @@ func setDaemonSetSiteNodeSelector(path, daemonSetName, siteName string) (bool, e
 	}
 
 	var buf bytes.Buffer
+
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
 
