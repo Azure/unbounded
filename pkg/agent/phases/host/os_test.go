@@ -18,7 +18,7 @@ func TestDetectHostPackageManagerUsesAPT(t *testing.T) {
 
 	require.Equal(t, "apt-get", pm.name)
 	require.Equal(t, debianRequiredPackages, pm.requiredPackages)
-	require.Contains(t, pm.requiredPackages, "debootstrap")
+	require.NotContains(t, pm.requiredPackages, "debootstrap")
 	require.Equal(t, []string{"update", "-y"}, pm.refreshArgs)
 	require.Equal(t, []string{"install", "-y", "--no-install-recommends"}, pm.installArgs)
 }

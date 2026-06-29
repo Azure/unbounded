@@ -18,20 +18,17 @@ import (
 
 // debianRequiredPackages lists the OS packages that must be installed on a Debian host.
 // - systemd-container: provides systemd-nspawn for running containers.
-// - debootstrap: used to bootstrap a Debian rootfs.
 // - curl: used for downloading resources.
 // - nftables: provides nft, used by nftables-flush.service to reset firewall rules.
 // - util-linux: provides mountpoint for private bpffs cleanup.
 var debianRequiredPackages = []string{
 	"systemd-container",
-	"debootstrap",
 	"curl",
 	"nftables",
 	"util-linux",
 }
 
 // rpmRequiredPackages lists the OS packages that must be installed on an RPM-based host.
-// RPM-based hosts are supported for OCI-image rootfs provisioning, so debootstrap is not required.
 var rpmRequiredPackages = []string{
 	"systemd-container",
 	"curl",

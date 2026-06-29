@@ -43,5 +43,5 @@ command, or authored by hand.
 | `Kubelet.BootstrapToken` | Token used for TLS bootstrapping (omit when using TPM attestation). |
 | `Kubelet.Labels` | Key-value labels applied to the Node on registration. |
 | `Kubelet.RegisterWithTaints` | Taints applied to the Node on registration (`key=value:effect`). |
-| `OCIImage` | *(optional)* OCI image reference for the rootfs. Falls back to debootstrap when empty. |
+| `OCIImage` | *(optional)* OCI image reference for the rootfs. Uses the built-in default image when empty. |
 | `Attest.URL` | *(optional)* Base URL of a metalman serve-pxe instance for TPM attestation. |

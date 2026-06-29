@@ -79,7 +79,7 @@ type manualBootstrapHandler struct {
 
 	// ociImage is an optional OCI image reference for the agent. When set,
 	// it is included in the AgentConfig JSON so the agent uses a container
-	// image to bootstrap the machine rootfs instead of debootstrap.
+	// image to bootstrap the machine rootfs.
 	ociImage string
 
 	// kubernetesVersion overrides the Kubernetes version that would otherwise
