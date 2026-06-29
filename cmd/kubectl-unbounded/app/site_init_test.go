@@ -84,12 +84,12 @@ func TestSiteInitCommand_ManageCniPluginFlag(t *testing.T) {
 func TestSiteInitCommand_UnboundedStorageFlags(t *testing.T) {
 	cmd := siteInitCommand()
 
-	withStorage := cmd.Flags().Lookup("with-unbounded-storage")
-	require.NotNil(t, withStorage, "--with-unbounded-storage flag should exist")
+	withStorage := cmd.Flags().Lookup("with-storage")
+	require.NotNil(t, withStorage, "--with-storage flag should exist")
 	require.Equal(t, "false", withStorage.DefValue)
 
-	storageManifests := cmd.Flags().Lookup("unbounded-storage-manifests")
-	require.NotNil(t, storageManifests, "--unbounded-storage-manifests flag should exist")
+	storageManifests := cmd.Flags().Lookup("storage-manifests")
+	require.NotNil(t, storageManifests, "--storage-manifests flag should exist")
 	require.Equal(t, "", storageManifests.DefValue)
 }
 

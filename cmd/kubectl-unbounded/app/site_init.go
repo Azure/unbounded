@@ -449,8 +449,8 @@ func siteInitCommand() *cobra.Command {
 
 	cmd.Flags().StringVar(&handler.cniManifests, "cni-manifests", "", "Path or https URL to CNI plugin manifests (uses embedded manifests if omitted)")
 	cmd.Flags().StringVar(&handler.machinaManifests, "machina-manifests", "", "Path or https URL to Machina manifests (uses embedded manifests if omitted)")
-	cmd.Flags().BoolVar(&handler.withUnboundedStorage, "with-unbounded-storage", false, "Install unbounded-storage on cluster nodes")
-	cmd.Flags().StringVar(&handler.unboundedStorageManifests, "unbounded-storage-manifests", "", "Path or https URL to unbounded-storage manifests (uses embedded manifests if omitted; implies --with-unbounded-storage)")
+	cmd.Flags().BoolVar(&handler.withUnboundedStorage, "with-storage", false, "Install unbounded-storage on cluster nodes")
+	cmd.Flags().StringVar(&handler.unboundedStorageManifests, "storage-manifests", "", "Path or https URL to unbounded-storage manifests (uses embedded manifests if omitted; implies --with-storage)")
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.name, "name", "", "The name of the site")
 	cmd.Flags().StringVar(&handler.clusterNodeCIDR, "cluster-node-cidr", "", "The cluster node cidr")
