@@ -191,6 +191,10 @@ requested repave and reboot counters were observed, `Repaved=True`, and the
 corresponding Kubernetes Node object exists. Metalman also latches
 `status.conditions[type=BootLoaderDownloaded]` to `True` when the machine first
 downloads the initial PXE boot loader for the operation, typically over TFTP.
+For installer visibility, `status.conditions[type=BootImageWritten]` starts as
+`Unknown`, transitions to `False` when the PXE installer starts and requests the
+disk image, and transitions to `True` when the installer finishes and sends the
+existing PXE disable signal.
 
 ### HostReplace vs Node Recreation
 

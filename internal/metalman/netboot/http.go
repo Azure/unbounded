@@ -38,7 +38,17 @@ type HTTPServer struct {
 	Client   client.Client
 	Mux      *http.ServeMux
 	FileResolver
+	BootImageWriteRecorder BootImageWriteRecorder
 }
+
+type BootImageWriteRecorder interface {
+	RecordBootImageWrite(ctx context.Context, machineName string, stage string) error
+}
+
+const (
+	BootImageWriteStarted  = "Started"
+	BootImageWriteFinished = "Finished"
+)
 
 func (h *HTTPServer) NeedLeaderElection() bool { return false }
 
@@ -118,6 +128,8 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	h.recordBootImageWriteStarted(r.Context(), log, node.Name, path)
 
 	if resolved.DiskPath != "" {
 		log.Info("serving cached file", "node", node.Name)
@@ -266,6 +278,8 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.recordBootImageWriteFinished(r.Context(), log, node.Name)
+
 	var specRepave, statusRepave int64
 	if node.Spec.Operations != nil {
 		specRepave = node.Spec.Operations.RepaveCounter
@@ -310,6 +324,26 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 
 	log.Info("repave cleared", "node", node.Name)
 	w.WriteHeader(http.StatusOK)
+}
+
+func (h *HTTPServer) recordBootImageWriteStarted(ctx context.Context, log *slog.Logger, machineName, path string) {
+	if h.BootImageWriteRecorder == nil || strings.TrimPrefix(path, "/") != "disk.img.gz" {
+		return
+	}
+
+	if err := h.BootImageWriteRecorder.RecordBootImageWrite(ctx, machineName, BootImageWriteStarted); err != nil {
+		log.Error("recording boot image write start", "node", machineName, "err", err)
+	}
+}
+
+func (h *HTTPServer) recordBootImageWriteFinished(ctx context.Context, log *slog.Logger, machineName string) {
+	if h.BootImageWriteRecorder == nil {
+		return
+	}
+
+	if err := h.BootImageWriteRecorder.RecordBootImageWrite(ctx, machineName, BootImageWriteFinished); err != nil {
+		log.Error("recording boot image write finish", "node", machineName, "err", err)
+	}
 }
 
 func clientIP(r *http.Request) string {

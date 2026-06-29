@@ -104,6 +104,10 @@ const (
 	// target has downloaded the initial PXE boot loader for the operation.
 	// Once set to True for an operation, it remains latched.
 	MachineOperationConditionBootLoaderDownloaded = "BootLoaderDownloaded"
+
+	// MachineOperationConditionBootImageWritten indicates that a metalman
+	// target has booted the PXE installer and written the boot image to disk.
+	MachineOperationConditionBootImageWritten = "BootImageWritten"
 )
 
 // OperationStage represents the current stage of a target operation.

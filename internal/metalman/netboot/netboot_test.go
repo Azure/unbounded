@@ -431,12 +431,91 @@ func TestTFTPServerRecordsOnlyInitialBootLoader(t *testing.T) {
 	require.Equal(t, []string{"machine-1:shimx64.efi"}, recorder.calls)
 }
 
+func TestHTTPServerRecordsBootImageWriteStart(t *testing.T) {
+	diskImageData := []byte("test-disk-image")
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "disk123", map[string][]byte{
+		"disk.img.gz": diskImageData,
+		"vmlinuz":     []byte("kernel"),
+	})
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-serve"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:01", IPv4: "10.0.1.50", SubnetMask: "255.255.255.0"}},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	recorder := &recordingBootImageWriteRecorder{}
+	srv := &HTTPServer{
+		FileResolver: FileResolver{
+			Cache:  cache,
+			Reader: fc,
+		},
+		BootImageWriteRecorder: recorder,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", srv.handleFile)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Empty(t, recorder.calls)
+
+	req, _ = http.NewRequest("GET", ts.URL+"/disk.img.gz", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, diskImageData, body)
+	require.Equal(t, []string{"node-serve:Started"}, recorder.calls)
+
+	req, _ = http.NewRequest("GET", ts.URL+"/missing", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.1.50")
+
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+	require.Equal(t, []string{"node-serve:Started"}, recorder.calls)
+}
+
 type recordingBootLoaderDownloadRecorder struct {
 	calls []string
 }
 
 func (r *recordingBootLoaderDownloadRecorder) RecordBootLoaderDownloaded(_ context.Context, machineName, filename string) error {
 	r.calls = append(r.calls, fmt.Sprintf("%s:%s", machineName, filename))
+
+	return nil
+}
+
+type recordingBootImageWriteRecorder struct {
+	calls []string
+}
+
+func (r *recordingBootImageWriteRecorder) RecordBootImageWrite(_ context.Context, machineName string, stage string) error {
+	r.calls = append(r.calls, fmt.Sprintf("%s:%s", machineName, stage))
 
 	return nil
 }
@@ -1667,8 +1746,9 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		Client:       fc,
-		FileResolver: FileResolver{Cache: cache, Reader: fc},
+		Client:                 fc,
+		FileResolver:           FileResolver{Cache: cache, Reader: fc},
+		BootImageWriteRecorder: &recordingBootImageWriteRecorder{},
 	}
 
 	mux := http.NewServeMux()
@@ -1691,6 +1771,11 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+
+	recorder := srv.BootImageWriteRecorder.(*recordingBootImageWriteRecorder)
+	if len(recorder.calls) != 1 || recorder.calls[0] != "pxe-node:Finished" {
+		t.Fatalf("expected boot image write finish record, got %v", recorder.calls)
 	}
 
 	// Verify the Machine status was patched

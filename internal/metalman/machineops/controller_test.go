@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -250,6 +251,10 @@ func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) 
 	require.Len(t, inProgress.Status.Targets, 1)
 	require.Equal(t, int64(4), inProgress.Status.Targets[0].TargetOperations.RebootCounter)
 	require.Equal(t, int64(5), inProgress.Status.Targets[0].TargetOperations.RepaveCounter)
+	bootImageCond := apimeta.FindStatusCondition(inProgress.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten)
+	require.NotNil(t, bootImageCond)
+	require.Equal(t, metav1.ConditionUnknown, bootImageCond.Status)
+	require.Equal(t, "Pending", bootImageCond.Reason)
 
 	patched.Status.Operations = &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5}
 	patched.Status.Conditions = []metav1.Condition{{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"}}
