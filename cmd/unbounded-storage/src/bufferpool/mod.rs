@@ -13,6 +13,8 @@ mod types;
 mod window;
 
 #[cfg(test)]
+mod owned_future_tests;
+#[cfg(test)]
 mod tests;
 
 pub use free_list::RecvQuarantineHandle;
@@ -20,7 +22,7 @@ pub use group::{PoolGroup, ShardDescriptor, ShardRouter};
 pub use null::NullBlockStore;
 pub use pipeline::{PipelinedRead, StripePlan};
 pub use pool::Pool;
-pub use stream::{PageGuard, ReadStream};
-pub use traits::{BlockStore, BufferPool, PageStream, Req, Transport};
+pub use stream::{OwnedPageFuture, PageGuard, ReadStream};
+pub use traits::{BlockStore, BufferPool, PageCachePolicy, PageStream, Req, Transport};
 pub use types::{BulkRef, Error, PageRef, PoolConfig, StripeKey, TraceCtx};
 pub use window::WindowedRead;

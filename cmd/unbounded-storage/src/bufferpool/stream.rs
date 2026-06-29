@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::pin::Pin;
 use std::rc::Rc;
 
@@ -51,8 +52,14 @@ pub(super) trait StreamSrc {
         page_no: u64,
         speculative: bool,
     ) -> StaticBoxFuture<Result<u32, Error>>;
+    /// Claim an already-ready page without initiating I/O or allocating
+    /// a backing page. Returns `None` when the page is not currently in
+    /// a terminal in-memory state.
+    fn try_fetch_ready_page_owned(&self, page_no: u64) -> Option<Result<u32, Error>>;
     fn release_guard(&self, page_no: u64);
     fn decrement_stream(&self);
+    fn increment_owned_future_stream(&self);
+    fn decrement_owned_future_stream(&self);
     /// Global speculative-prefetch budget. The pool maintains one
     /// counter shared by every windowed stream; this reserves a
     /// slot if the live count is `< max`, returning whether it did.
@@ -64,6 +71,7 @@ pub(super) trait StreamSrc {
 /// Single consumer surface; one page at a time, awaited explicitly.
 pub struct ReadStream<'pool> {
     src: Rc<dyn StreamSrc + 'pool>,
+    start: u64,
     cursor: u64,
     end: u64,
     page_size: u64,
@@ -89,6 +97,7 @@ impl<'pool> ReadStream<'pool> {
     ) -> Self {
         Self {
             src,
+            start: offset,
             cursor: offset,
             end,
             page_size: page_size as u64,
@@ -132,18 +141,47 @@ impl<'pool> ReadStream<'pool> {
             return None;
         }
 
-        let page_size = self.page_size;
-        let page_no = self.cursor / page_size;
-        let intra_off = (self.cursor - page_no * page_size) as u32;
-        let max_in_page = page_size - intra_off as u64;
-        let remaining = self.end - self.cursor;
-        let intra_len = std::cmp::min(max_in_page, remaining) as u32;
+        let page_no = self.cursor / self.page_size;
+        let (intra_off, intra_len) = self
+            .page_slice(page_no)
+            .expect("cursor page must intersect stream range");
 
         let page_idx = match self.src.fetch_page(page_no).await {
             Ok(pi) => pi,
             Err(e) => return Some(Err(e)),
         };
 
+        let (bytes, page_ref) = self.page_parts(page_idx, intra_off, intra_len);
+
+        self.cursor += intra_len as u64;
+        Some(Ok((page_no, bytes, intra_len, page_ref)))
+    }
+
+    fn page_range(&self) -> Range<u64> {
+        if self.start >= self.end {
+            let page_no = self.start / self.page_size;
+            return page_no..page_no;
+        }
+        let first = self.start / self.page_size;
+        let last = (self.end - 1) / self.page_size + 1;
+        first..last
+    }
+
+    fn page_slice(&self, page_no: u64) -> Option<(u32, u32)> {
+        let page_start = page_no.checked_mul(self.page_size)?;
+        let page_end = page_start.checked_add(self.page_size)?;
+        let slice_start = self.start.max(page_start);
+        let slice_end = self.end.min(page_end);
+        if slice_start >= slice_end {
+            return None;
+        }
+        Some((
+            (slice_start - page_start) as u32,
+            (slice_end - slice_start) as u32,
+        ))
+    }
+
+    fn page_parts(&self, page_idx: u32, intra_off: u32, intra_len: u32) -> (*const u8, PageRef) {
         let base = self.src.base();
         // SAFETY: `page_idx` was allocated out of the pool's pinned
         // backing whose lifetime exceeds the `Rc<dyn StreamSrc>`
@@ -151,15 +189,13 @@ impl<'pool> ReadStream<'pool> {
         // range is read-only for the lifetime of the guard; the
         // pool keeps the slot pinned via `consumer_holds`.
         let bytes =
-            unsafe { base.add(page_idx as usize * page_size as usize + intra_off as usize) };
+            unsafe { base.add(page_idx as usize * self.page_size as usize + intra_off as usize) };
         let page_ref = PageRef {
             page_idx,
             offset: intra_off,
             len: intra_len,
         };
-
-        self.cursor += intra_len as u64;
-        Some(Ok((page_no, bytes, intra_len, page_ref)))
+        (bytes, page_ref)
     }
 
     /// Test-only: returns the current cursor.
@@ -171,6 +207,54 @@ impl<'pool> ReadStream<'pool> {
 }
 
 impl ReadStream<'static> {
+    /// Absolute page numbers covered by this owned stream.
+    pub fn owned_page_range(&self) -> Range<u64> {
+        self.page_range()
+    }
+
+    /// Claim a specific page if it is already resident in the pool's
+    /// backing. This does not allocate or start I/O; callers use it to
+    /// pin ready cached pages without advancing the stream cursor.
+    pub fn try_ready_page_owned_at(
+        &self,
+        page_no: u64,
+    ) -> Option<Result<PageGuard<'static>, Error>> {
+        let (intra_off, intra_len) = self.page_slice(page_no)?;
+        let page_idx = match self.src.try_fetch_ready_page_owned(page_no)? {
+            Ok(pi) => pi,
+            Err(e) => return Some(Err(e)),
+        };
+        let (bytes, page_ref) = self.page_parts(page_idx, intra_off, intra_len);
+        let src_for_guard: Rc<dyn StreamSrc + 'static> = self.src.clone();
+        Some(Ok(PageGuard::new(
+            src_for_guard,
+            page_no,
+            bytes,
+            intra_len,
+            page_ref,
+        )))
+    }
+
+    /// Fetch and pin a specific page in this stream's range without
+    /// advancing the cursor.
+    pub async fn page_owned_at(&self, page_no: u64) -> Option<Result<PageGuard<'static>, Error>> {
+        Some(self.page_owned_future_at(page_no)?.await)
+    }
+
+    /// Build a storable owned fetch future for a specific page in this
+    /// stream's range. Cross-shard fanout stores these futures inside
+    /// its owner-side task so it can emit page events incrementally.
+    pub fn page_owned_future_at(&self, page_no: u64) -> Option<OwnedPageFuture> {
+        let (intra_off, intra_len) = self.page_slice(page_no)?;
+        Some(OwnedPageFuture::new(
+            self.src.clone(),
+            page_no,
+            self.page_size,
+            intra_off,
+            intra_len,
+        ))
+    }
+
     /// Owned counterpart to [`ReadStream::next_page`]: yields a
     /// `PageGuard<'static>` that does NOT borrow the stream, so the
     /// caller may hold several pages of the same stripe at once and
@@ -200,6 +284,101 @@ impl ReadStream<'static> {
             }
             Err(e) => Some(Err(e)),
         }
+    }
+}
+
+/// Storable owned-page fetch for one absolute page number.
+pub struct OwnedPageFuture {
+    src: Rc<dyn StreamSrc + 'static>,
+    page_no: u64,
+    page_size: u64,
+    intra_off: u32,
+    intra_len: u32,
+    fut: Option<StaticBoxFuture<Result<u32, Error>>>,
+    stream_ref_active: bool,
+}
+
+impl Unpin for OwnedPageFuture {}
+
+impl Future for OwnedPageFuture {
+    type Output = Result<PageGuard<'static>, Error>;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        let fut = this
+            .fut
+            .as_mut()
+            .expect("OwnedPageFuture polled after completion");
+        let page_idx = match fut.as_mut().poll(cx) {
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+            std::task::Poll::Ready(Ok(pi)) => pi,
+            std::task::Poll::Ready(Err(e)) => {
+                this.release_stream_ref();
+                return std::task::Poll::Ready(Err(e));
+            }
+        };
+        this.fut.take();
+        // SAFETY: `page_idx` was allocated from the pool backing and
+        // `intra_off + intra_len <= page_size` was checked by
+        // `page_slice` when this future was constructed.
+        let bytes = unsafe {
+            this.src
+                .base()
+                .add(page_idx as usize * this.page_size as usize + this.intra_off as usize)
+        };
+        let page_ref = PageRef {
+            page_idx,
+            offset: this.intra_off,
+            len: this.intra_len,
+        };
+        let src_for_guard: Rc<dyn StreamSrc + 'static> = this.src.clone();
+        this.release_stream_ref();
+        std::task::Poll::Ready(Ok(PageGuard::new(
+            src_for_guard,
+            this.page_no,
+            bytes,
+            this.intra_len,
+            page_ref,
+        )))
+    }
+}
+
+impl OwnedPageFuture {
+    fn new(
+        src: Rc<dyn StreamSrc + 'static>,
+        page_no: u64,
+        page_size: u64,
+        intra_off: u32,
+        intra_len: u32,
+    ) -> Self {
+        src.increment_owned_future_stream();
+        Self {
+            fut: Some(src.fetch_page_owned(page_no, false)),
+            src,
+            page_no,
+            page_size,
+            intra_off,
+            intra_len,
+            stream_ref_active: true,
+        }
+    }
+
+    fn release_stream_ref(&mut self) {
+        if !self.stream_ref_active {
+            return;
+        }
+        self.fut.take();
+        self.src.decrement_owned_future_stream();
+        self.stream_ref_active = false;
+    }
+}
+
+impl Drop for OwnedPageFuture {
+    fn drop(&mut self) {
+        self.release_stream_ref();
     }
 }
 

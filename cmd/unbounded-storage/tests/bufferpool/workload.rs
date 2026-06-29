@@ -456,7 +456,9 @@ pub enum ClientOutcome {
 pub struct RunReport {
     pub outcomes: Vec<ClientOutcome>,
     pub free_pages_at_end: usize,
+    pub cached_pages_at_end: usize,
     pub inflight_entries_at_end: usize,
+    pub active_inflight_entries_at_end: usize,
     /// Global speculative-prefetch budget still reserved at
     /// quiescence. Must be `0`: every windowed prefetch reservation
     /// is balanced on consume or drop.
@@ -658,7 +660,9 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     exec.run(step_budget)?;
 
     let free_pages_at_end = pool.free_pages();
+    let cached_pages_at_end = pool.cached_pages();
     let inflight_entries_at_end = pool.inflight_entries();
+    let active_inflight_entries_at_end = pool.active_inflight_entries();
     let prefetch_inflight_at_end = pool.prefetch_inflight();
 
     // Drain the outcomes vec; by this point all tasks have completed
@@ -673,7 +677,9 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     Ok(RunReport {
         outcomes,
         free_pages_at_end,
+        cached_pages_at_end,
         inflight_entries_at_end,
+        active_inflight_entries_at_end,
         prefetch_inflight_at_end,
         bulk_get_calls: counts.bulk_get.get(),
         bulk_get_by_page,
@@ -706,7 +712,7 @@ impl Drop for HeapOwner {
     }
 }
 
-fn heap_backing(page_size: usize, page_count: usize) -> Backing {
+pub fn heap_backing(page_size: usize, page_count: usize) -> Backing {
     let layout = std::alloc::Layout::from_size_align(page_size * page_count, page_size)
         .expect("valid layout");
     // SAFETY: layout has nonzero size and a power-of-two align.

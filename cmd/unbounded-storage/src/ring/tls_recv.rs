@@ -27,7 +27,7 @@ use std::rc::Rc;
 use io_uring::{opcode, types};
 
 use super::core::{OpResource, RecvMsgState, check_res};
-use super::network::{NetHandle, OwnedNetFut, RecvRecord, TLS_RECORD_TYPE_ALERT};
+use super::network::{NetHandle, OwnedNetFut, OwnedSubmitSlot, RecvRecord, TLS_RECORD_TYPE_ALERT};
 
 impl NetHandle {
     /// Wait for readiness on `fd` and return the reported `revents`.
@@ -42,6 +42,7 @@ impl NetHandle {
     ) -> impl Future<Output = io::Result<u32>> + 'static {
         let ring = Rc::clone(self.ring_cell());
         async move {
+            OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
                 let r = ring.borrow();
                 let ud = r.core.alloc_user_data();
@@ -69,6 +70,7 @@ impl NetHandle {
     ) -> impl Future<Output = io::Result<(Vec<u8>, u8)>> + 'static {
         let ring = Rc::clone(self.ring_cell());
         async move {
+            OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot, state) = {
                 let r = ring.borrow();
                 let state = RecvMsgState::new_heap(max_len);
@@ -111,6 +113,7 @@ impl NetHandle {
     ) -> impl Future<Output = io::Result<RecvRecord>> + 'static {
         let ring = Rc::clone(self.ring_cell());
         async move {
+            OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot, state) = {
                 let r = ring.borrow();
                 let ptr = r.fixed_ptr(0, page_byte_offset)?;

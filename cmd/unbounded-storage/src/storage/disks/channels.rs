@@ -29,7 +29,14 @@ use crate::storage::PageChannel;
 
 /// Snapshot of the currently-published channels. `None` means no
 /// disks are open and the data path is offline.
-pub type ChannelSnapshot = Option<Arc<Vec<PageChannel>>>;
+pub type ChannelSnapshot = Option<Arc<ChannelSet>>;
+
+/// Published channel metadata, aligned index-for-index by path-sorted
+/// disk order.
+pub struct ChannelSet {
+    pub channels: Vec<PageChannel>,
+    pub page_cache_enabled: Vec<bool>,
+}
 
 /// Owns the published per-disk channel set. A change-bearing
 /// [`Self::apply_channels`] bumps the generation and publishes a
@@ -54,11 +61,8 @@ struct ChannelSnapshotInner {
     /// is the signal the router uses to fall back to plain hashing.
     drive_numa: Arc<Vec<Option<u16>>>,
     /// Path-sorted `(path, service identity, numa)` of the published
-    /// set, retained so a re-apply of the identical set is recognized
-    /// as a no-op and skipped. NUMA participates in the key so a
-    /// re-pinning that moves a drive to a different node republishes
-    /// (the router keys NUMA-local ownership off this). Empty when no
-    /// channels are published.
+    /// set. Policy-only changes republish the snapshot without bumping
+    /// the registration generation.
     key: Vec<(PathBuf, usize, Option<u16>)>,
 }
 
@@ -87,11 +91,15 @@ impl DiskChannelDirectory {
     /// different storage-core service, or a drive that moved NUMA
     /// node); a re-apply of the identical set is a no-op so consumers
     /// do not needlessly reseat per-shard registrations.
-    pub fn apply_channels(&self, mut channels: Vec<(PathBuf, PageChannel, Option<u16>)>) {
+    pub fn apply_channels(&self, mut channels: Vec<(PathBuf, PageChannel, Option<u16>, bool)>) {
         channels.sort_by(|a, b| a.0.cmp(&b.0));
         let key: Vec<(PathBuf, usize, Option<u16>)> = channels
             .iter()
-            .map(|(p, c, numa)| (p.clone(), c.service_id(), *numa))
+            .map(|(p, c, numa, _)| (p.clone(), c.service_id(), *numa))
+            .collect();
+        let page_cache_enabled: Vec<bool> = channels
+            .iter()
+            .map(|(_, _, _, page_cache_enabled)| *page_cache_enabled)
             .collect();
 
         // `apply_channels` is the only writer of `current`; callers
@@ -99,25 +107,37 @@ impl DiskChannelDirectory {
         // reading the previous bundle and storing the new one is
         // race-free.
         let prev = self.current.load();
-        if prev.key == key {
+        let prev_page_cache_enabled = prev
+            .channels
+            .as_ref()
+            .map(|set| set.page_cache_enabled.as_slice())
+            .unwrap_or(&[]);
+        if prev.key == key && prev_page_cache_enabled == page_cache_enabled.as_slice() {
             // Identical publication: nothing downstream needs to
             // reseat, so skip the generation bump and the store.
             return;
         }
 
-        let drive_numa: Vec<Option<u16>> = channels.iter().map(|(_, _, numa)| *numa).collect();
-        let ordered: Vec<PageChannel> = channels.into_iter().map(|(_, c, _)| c).collect();
+        let drive_numa: Vec<Option<u16>> = channels.iter().map(|(_, _, numa, _)| *numa).collect();
+        let ordered: Vec<PageChannel> = channels.into_iter().map(|(_, c, _, _)| c).collect();
         let n = ordered.len();
         let snapshot: ChannelSnapshot = if ordered.is_empty() {
             None
         } else {
-            Some(Arc::new(ordered))
+            Some(Arc::new(ChannelSet {
+                channels: ordered,
+                page_cache_enabled,
+            }))
         };
 
         // The atomic `ArcSwap::store` is the entire publication: any
         // consumer that loads the bundle sees both fields from the
         // same generation.
-        let gen_n = prev.generation + 1;
+        let gen_n = if prev.key == key {
+            prev.generation
+        } else {
+            prev.generation + 1
+        };
         self.current.store(Arc::new(ChannelSnapshotInner {
             channels: snapshot,
             generation: gen_n,
@@ -182,10 +202,10 @@ mod tests {
     #[test]
     fn apply_bumps_generation_and_publishes_snapshot() {
         let t = DiskChannelDirectory::new();
-        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), None)]);
+        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), None, true)]);
         assert_eq!(t.generation(), 1);
         let snap = t.current().expect("snapshot present");
-        assert_eq!(snap.len(), 1);
+        assert_eq!(snap.channels.len(), 1);
     }
 
     #[test]
@@ -194,12 +214,12 @@ mod tests {
         // Supplied out of order; publication must be path-sorted so
         // `disk_for` indices stay stable.
         t.apply_channels(vec![
-            (PathBuf::from("/c"), dummy_channel(), None),
-            (PathBuf::from("/a"), dummy_channel(), None),
-            (PathBuf::from("/b"), dummy_channel(), None),
+            (PathBuf::from("/c"), dummy_channel(), None, true),
+            (PathBuf::from("/a"), dummy_channel(), None, true),
+            (PathBuf::from("/b"), dummy_channel(), None, true),
         ]);
         let snap = t.current().unwrap();
-        assert_eq!(snap.len(), 3);
+        assert_eq!(snap.channels.len(), 3);
         assert_eq!(t.generation(), 1);
     }
 
@@ -209,33 +229,45 @@ mod tests {
         // so `drive_numa[disk_for(...)]` names the node of that drive.
         let t = DiskChannelDirectory::new();
         t.apply_channels(vec![
-            (PathBuf::from("/c"), dummy_channel(), Some(2)),
-            (PathBuf::from("/a"), dummy_channel(), Some(0)),
-            (PathBuf::from("/b"), dummy_channel(), None),
+            (PathBuf::from("/c"), dummy_channel(), Some(2), true),
+            (PathBuf::from("/a"), dummy_channel(), Some(0), true),
+            (PathBuf::from("/b"), dummy_channel(), None, true),
         ]);
         let numa = t.drive_numa();
         // Path order /a,/b,/c -> NUMA 0, None, 2.
         assert_eq!(&*numa, &[Some(0), None, Some(2)]);
-        assert_eq!(numa.len(), t.current().unwrap().len());
+        assert_eq!(numa.len(), t.current().unwrap().channels.len());
+    }
+
+    #[test]
+    fn page_cache_policy_is_published_path_sorted_and_aligned() {
+        let t = DiskChannelDirectory::new();
+        t.apply_channels(vec![
+            (PathBuf::from("/c"), dummy_channel(), None, true),
+            (PathBuf::from("/a"), dummy_channel(), None, false),
+            (PathBuf::from("/b"), dummy_channel(), None, true),
+        ]);
+        let snap = t.current().expect("snapshot present");
+        assert_eq!(snap.page_cache_enabled, vec![false, true, true]);
     }
 
     #[test]
     fn removed_path_drops_channel() {
         let t = DiskChannelDirectory::new();
         t.apply_channels(vec![
-            (PathBuf::from("/a"), dummy_channel(), None),
-            (PathBuf::from("/b"), dummy_channel(), None),
+            (PathBuf::from("/a"), dummy_channel(), None, true),
+            (PathBuf::from("/b"), dummy_channel(), None, true),
         ]);
-        assert_eq!(t.current().unwrap().len(), 2);
-        t.apply_channels(vec![(PathBuf::from("/b"), dummy_channel(), None)]);
-        assert_eq!(t.current().unwrap().len(), 1);
+        assert_eq!(t.current().unwrap().channels.len(), 2);
+        t.apply_channels(vec![(PathBuf::from("/b"), dummy_channel(), None, true)]);
+        assert_eq!(t.current().unwrap().channels.len(), 1);
         assert_eq!(t.generation(), 2);
     }
 
     #[test]
     fn apply_empty_publishes_none() {
         let t = DiskChannelDirectory::new();
-        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), Some(0))]);
+        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), Some(0), true)]);
         assert!(t.current().is_some());
         assert_eq!(t.drive_numa().len(), 1);
         t.apply_channels(vec![]);
@@ -257,13 +289,13 @@ mod tests {
         assert_eq!(g0, 0);
         assert_eq!(g0, t.generation());
 
-        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), None)]);
+        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), None, true)]);
         let (c1, g1) = t.snapshot();
         assert_eq!(g1, 1);
         assert_eq!(g1, t.generation());
         let c1 = c1.expect("snapshot present after apply");
 
-        t.apply_channels(vec![(PathBuf::from("/b"), dummy_channel(), None)]);
+        t.apply_channels(vec![(PathBuf::from("/b"), dummy_channel(), None, true)]);
         let (c2, g2) = t.snapshot();
         assert_eq!(g2, 2);
         assert_eq!(g2, t.generation());
@@ -281,11 +313,11 @@ mod tests {
         // or republish, so consumers keep their seated registrations.
         let t = DiskChannelDirectory::new();
         let c = dummy_channel();
-        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(1))]);
+        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(1), true)]);
         assert_eq!(t.generation(), 1);
         let first = t.current().expect("snapshot present");
 
-        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(1))]);
+        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(1), true)]);
         assert_eq!(t.generation(), 1, "identical re-apply must not bump");
         let second = t.current().expect("snapshot still present");
         assert!(
@@ -299,9 +331,9 @@ mod tests {
         // Same path, but a distinct service identity (a fresh channel)
         // is a real change and must republish.
         let t = DiskChannelDirectory::new();
-        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), None)]);
+        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), None, true)]);
         assert_eq!(t.generation(), 1);
-        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), None)]);
+        t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), None, true)]);
         assert_eq!(t.generation(), 2);
     }
 
@@ -312,11 +344,11 @@ mod tests {
         // republish so the router sees the new node.
         let t = DiskChannelDirectory::new();
         let c = dummy_channel();
-        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(0))]);
+        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(0), true)]);
         assert_eq!(t.generation(), 1);
         assert_eq!(&*t.drive_numa(), &[Some(0)]);
 
-        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(1))]);
+        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(1), true)]);
         assert_eq!(t.generation(), 2, "NUMA move must bump");
         assert_eq!(&*t.drive_numa(), &[Some(1)]);
     }
@@ -330,14 +362,29 @@ mod tests {
         let a = dummy_channel();
         let b = dummy_channel();
         t.apply_channels(vec![
-            (PathBuf::from("/a"), a.clone(), Some(0)),
-            (PathBuf::from("/b"), b.clone(), Some(1)),
+            (PathBuf::from("/a"), a.clone(), Some(0), true),
+            (PathBuf::from("/b"), b.clone(), Some(1), true),
         ]);
         assert_eq!(t.generation(), 1);
         t.apply_channels(vec![
-            (PathBuf::from("/b"), b.clone(), Some(1)),
-            (PathBuf::from("/a"), a.clone(), Some(0)),
+            (PathBuf::from("/b"), b.clone(), Some(1), true),
+            (PathBuf::from("/a"), a.clone(), Some(0), true),
         ]);
         assert_eq!(t.generation(), 1);
+    }
+
+    #[test]
+    fn page_cache_policy_change_republishes_without_generation_bump() {
+        let t = DiskChannelDirectory::new();
+        let c = dummy_channel();
+        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(1), true)]);
+        let first = t.current().expect("snapshot present");
+
+        t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(1), false)]);
+
+        assert_eq!(t.generation(), 1);
+        let second = t.current().expect("snapshot still present");
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.page_cache_enabled, vec![false]);
     }
 }
