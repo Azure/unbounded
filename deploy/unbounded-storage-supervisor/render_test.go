@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 )
 
@@ -23,6 +24,7 @@ func TestRenderStorageSupervisorManifests(t *testing.T) {
 	data := map[string]string{
 		"Namespace": "custom-storage",
 		"Image":     "example.azurecr.io/unbounded-storage-supervisor:v1.2.3",
+		"Site":      "edge-a",
 	}
 
 	require.NoError(t, render.Render(".", outputDir, data))
@@ -61,6 +63,7 @@ func TestRenderStorageSupervisorManifests(t *testing.T) {
 	ds := requireStorageSupervisorDoc(t, docs, "DaemonSet", "unbounded-storage-supervisor")
 	require.Equal(t, "example.azurecr.io/unbounded-storage-supervisor:v1.2.3", ds.initContainerImage(t, "install"))
 	require.Equal(t, "example.azurecr.io/unbounded-storage-supervisor:v1.2.3", ds.containerImage(t, "run"))
+	require.Equal(t, "edge-a", ds.nodeSelector(t)[netv1alpha1.SiteLabelKey])
 }
 
 type storageSupervisorRenderedDoc struct {
@@ -153,6 +156,29 @@ func (d storageSupervisorRenderedDoc) subjectNamespace(t *testing.T) string {
 
 	namespace, _ := subject["namespace"].(string)
 	return namespace
+}
+
+func (d storageSupervisorRenderedDoc) nodeSelector(t *testing.T) map[string]any {
+	t.Helper()
+
+	return nestedMap(t, d.doc, "spec", "template", "spec", "nodeSelector")
+}
+
+func nestedMap(t *testing.T, doc map[string]any, path ...string) map[string]any {
+	t.Helper()
+
+	var cur any = doc
+	for _, segment := range path {
+		m, ok := cur.(map[string]any)
+		require.True(t, ok, "path segment %s should be a map", segment)
+
+		cur = m[segment]
+	}
+
+	m, ok := cur.(map[string]any)
+	require.True(t, ok, "%s should be a map", strings.Join(path, "."))
+
+	return m
 }
 
 func nestedSlice(t *testing.T, doc map[string]any, path ...string) []any {

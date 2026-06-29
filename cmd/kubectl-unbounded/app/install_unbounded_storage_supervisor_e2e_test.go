@@ -320,7 +320,7 @@ func (h *storageSupervisorE2EHarness) install(ctx context.Context, manifestDir s
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	installer := newInstallUnboundedStorageSupervisor(manifestDir, nil, logger, kubeResourcesCli, kubeCli)
+	installer := newInstallUnboundedStorageSupervisor(manifestDir, "", nil, logger, kubeResourcesCli, kubeCli)
 	installer.waitTimeout = 3 * time.Minute
 	installer.pollInterval = 2 * time.Second
 

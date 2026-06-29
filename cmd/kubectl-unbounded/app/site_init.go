@@ -153,6 +153,7 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 	if h.shouldInstallUnboundedStorage() && h.installUnboundedStorage == nil {
 		h.installUnboundedStorage = newInstallUnboundedStorageSupervisor(
 			h.unboundedStorageManifests,
+			h.name,
 			nil,
 			h.logger,
 			h.kubeResourcesCli,

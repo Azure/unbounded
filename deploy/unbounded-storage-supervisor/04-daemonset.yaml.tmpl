@@ -30,6 +30,10 @@ spec:
       # The run container watches Nodes to discover storage-ring peers; bind
       # the supervisor ServiceAccount that carries the nodes list/watch grant.
       serviceAccountName: unbounded-storage-supervisor
+{{ with .Site }}
+      nodeSelector:
+        net.unbounded-cloud.io/site: {{ . | quote }}
+{{ end }}
       # Tolerate all taints - storage must be available on every node.
       tolerations:
         - operator: Exists
