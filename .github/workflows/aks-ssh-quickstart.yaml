@@ -534,7 +534,7 @@ jobs:
           KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl get machines -o wide > logs/machines.txt 2>&1 || true
           KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl get machines -o yaml > logs/machines.yaml 2>&1 || true
           KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl describe machines > logs/machines-describe.txt 2>&1 || true
-          KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl -n unbounded-kube logs deploy/machina-controller > logs/machina.log 2>&1 || true
+          KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl -n unbounded-system logs deploy/machina-controller > logs/machina.log 2>&1 || true
 
       - name: Upload diagnostics
         if: failure()

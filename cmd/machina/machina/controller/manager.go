@@ -131,7 +131,7 @@ func machinaCacheOptions() cache.Options {
 			// Machina-managed secrets in the controller namespace.
 			&corev1.Secret{}: {
 				Namespaces: map[string]cache.Config{
-					metav1.NamespaceSystem:       {},
+					metav1.NamespaceSystem:         {},
 					SecretNamespaceUnboundedSystem: {},
 				},
 			},

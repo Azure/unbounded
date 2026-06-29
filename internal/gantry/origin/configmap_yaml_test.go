@@ -48,7 +48,11 @@ func TestDefaultConfigMap_StartsCleanWithoutSecret(t *testing.T) {
 		t.Fatalf("repo root: %v", err)
 	}
 
-	yamlPath := filepath.Join(repoRoot, "deploy", "gantry", "configmap.yaml")
+	// deploy/gantry/configmap.yaml.tmpl is the manifest template; only
+	// metadata.namespace is templated, so the inline data.config.yaml block
+	// this test extracts is unaffected and can be read directly without
+	// rendering.
+	yamlPath := filepath.Join(repoRoot, "deploy", "gantry", "configmap.yaml.tmpl")
 
 	raw, err := os.ReadFile(yamlPath)
 	if err != nil {
