@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	storageDisksAnnotation     = "unbounded-cloud.io/storage-disks"
+	allocatedDisksAnnotation   = "storage.unbounded-cloud.io/allocated-disks"
 	storageFileSizeAnnotation  = "unbounded-cloud.io/storage-file-size-bytes"
 	defaultStorageFileDiskPath = "/var/lib/unbounded-storage/cache.disk"
 	defaultStorageFileDiskDir  = "/var/lib/unbounded-storage"
@@ -39,7 +39,7 @@ func applyDiskOverlay(cfg *storageconfig.Config, annotations map[string]string) 
 
 	existingPaths := declaredDiskPaths(cfg)
 
-	disks := annotationBlockDisks(annotations[storageDisksAnnotation], existingPaths)
+	disks := annotationBlockDisks(annotations[allocatedDisksAnnotation], existingPaths)
 	if len(disks) == 0 {
 		fallback := fallbackFileDisk(annotations[storageFileSizeAnnotation])
 
@@ -59,7 +59,13 @@ func applyDiskOverlay(cfg *storageconfig.Config, annotations map[string]string) 
 }
 
 func annotationBlockDisks(raw string, existingPaths map[string]struct{}) []*storageconfig.DiskSpec {
-	entries := strings.Split(raw, ",")
+	entries, err := parseAnnotationList(raw)
+	if err != nil {
+		slog.Warn("ignoring allocated storage disks annotation with invalid format", "annotation", allocatedDisksAnnotation, "error", err)
+
+		return nil
+	}
+
 	disks := make([]*storageconfig.DiskSpec, 0, len(entries))
 	seenPaths := make(map[string]struct{}, len(entries))
 
@@ -90,17 +96,10 @@ func annotationBlockDisks(raw string, existingPaths map[string]struct{}) []*stor
 	return disks
 }
 
-func annotationBlockDisk(raw string) *storageconfig.DiskSpec {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil
-	}
-
-	parts := strings.Split(raw, ";")
-
-	path := strings.TrimSpace(parts[0])
+func annotationBlockDisk(entry annotationListEntry) *storageconfig.DiskSpec {
+	path := strings.TrimSpace(entry.Item)
 	if path == "" {
-		slog.Warn("skipping annotated storage disk with empty path", "value", raw)
+		slog.Warn("skipping annotated storage disk with empty path")
 
 		return nil
 	}
@@ -116,34 +115,31 @@ func annotationBlockDisk(raw string) *storageconfig.DiskSpec {
 			Block: &storageconfig.BlockDiskConfig{Path: path},
 		},
 	}
-	seenOptions := make(map[string]struct{}, len(parts)-1)
+	seenOptions := make(map[string]struct{}, len(entry.Values))
 
-	for _, part := range parts[1:] {
-		applyDiskOption(disk, strings.TrimSpace(part), seenOptions, path)
+	for key, values := range entry.Values {
+		applyDiskOption(disk, key, values, seenOptions, path)
 	}
 
 	return disk
 }
 
-func applyDiskOption(disk *storageconfig.DiskSpec, raw string, seen map[string]struct{}, path string) {
-	if raw == "" {
-		slog.Warn("ignoring empty storage disk option", "path", path)
-
-		return
-	}
-
-	key, value, ok := strings.Cut(raw, "=")
-	if !ok {
-		slog.Warn("ignoring storage disk option without key=value", "path", path, "option", raw)
-
-		return
-	}
-
+func applyDiskOption(disk *storageconfig.DiskSpec, key string, values []string, seen map[string]struct{}, path string) {
 	key = strings.TrimSpace(key)
+	value := ""
 
-	value = strings.TrimSpace(value)
+	if len(values) > 0 {
+		value = strings.TrimSpace(values[0])
+	}
+
 	if key == "" || value == "" {
-		slog.Warn("ignoring storage disk option with empty key or value", "path", path, "option", raw)
+		slog.Warn("ignoring storage disk option with empty key or value", "path", path, "key", key)
+
+		return
+	}
+
+	if len(values) != 1 {
+		slog.Warn("ignoring duplicate storage disk option", "path", path, "key", key)
 
 		return
 	}

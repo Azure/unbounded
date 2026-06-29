@@ -12,4 +12,4 @@ pub use cores::{
     CorePlan, CorePlanConfig, DiskCpuSlot, NicWorker, NicWorkerGroup, NumaPool, ServingShard,
     StorageCore,
 };
-pub use host::{Cpu, Hca, Host, Nic, NumaNode, Nvme};
+pub use host::{BlockDevice, Cpu, Hca, Host, Nic, NumaNode, Nvme};

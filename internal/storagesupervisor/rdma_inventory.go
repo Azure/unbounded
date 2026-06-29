@@ -4,13 +4,14 @@
 package storagesupervisor
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,48 +20,65 @@ import (
 )
 
 const (
-	storageRdmaHcasAnnotation = "storage.unbounded-cloud.io/rdma-hcas"
-	rdmaInventoryPollInterval = 30 * time.Second
-	rdmaInventoryHTTPTimeout  = 5 * time.Second
+	storageRdmaHcasAnnotation     = "storage.unbounded-cloud.io/rdma-hcas"
+	storageBlockDevicesAnnotation = "storage.unbounded-cloud.io/block-devices"
+	deviceInventoryPollInterval   = 30 * time.Second
+	deviceInventoryHTTPTimeout    = 5 * time.Second
 )
 
-type rdmaInventory struct {
-	SchemaVersion int       `json:"schemaVersion"`
-	HCAs          []rdmaHCA `json:"hcas"`
+type inventoryEndpoint struct {
+	annotation string
+	url        string
 }
 
-type rdmaHCA struct {
-	Name  string   `json:"name"`
-	Addrs []string `json:"addrs"`
-}
-
-type rdmaInventoryPublisher struct {
+type deviceInventoryPublisher struct {
 	clientset  kubernetes.Interface
 	nodeName   string
-	url        string
+	baseURL    string
+	endpoints  []inventoryEndpoint
 	interval   time.Duration
 	httpClient *http.Client
 	signal     func()
 }
 
-func startRdmaInventoryPublisher(ctx context.Context, cfg Config, cs kubernetes.Interface, signal func()) {
-	if cfg.RdmaInventoryURL == "" {
+func startDeviceInventoryPublisher(ctx context.Context, cfg Config, cs kubernetes.Interface, signal func()) {
+	if cfg.DeviceInventoryURL == "" {
 		return
 	}
 
 	if cfg.NodeName == "" {
-		slog.Warn("rdma inventory publishing disabled: NODE_NAME is not set", "url", cfg.RdmaInventoryURL)
+		slog.Warn("device inventory publishing disabled: NODE_NAME is not set", "url", cfg.DeviceInventoryURL)
 
 		return
 	}
 
-	p := &rdmaInventoryPublisher{
+	baseURL := strings.TrimRight(cfg.DeviceInventoryURL, "/")
+
+	rdmaURL, err := inventoryURLForPath(baseURL, "/rdma")
+	if err != nil {
+		slog.Warn("device inventory publishing disabled: invalid URL", "url", cfg.DeviceInventoryURL, "error", err)
+
+		return
+	}
+
+	blockURL, err := inventoryURLForPath(baseURL, "/block")
+	if err != nil {
+		slog.Warn("device inventory publishing disabled: invalid URL", "url", cfg.DeviceInventoryURL, "error", err)
+
+		return
+	}
+
+	p := &deviceInventoryPublisher{
 		clientset: cs,
 		nodeName:  cfg.NodeName,
-		url:       cfg.RdmaInventoryURL,
-		interval:  rdmaInventoryPollInterval,
+		baseURL:   baseURL,
+		endpoints: []inventoryEndpoint{
+			{annotation: storageRdmaHcasAnnotation, url: rdmaURL},
+			{annotation: storageBlockDevicesAnnotation, url: blockURL},
+		},
+		interval: deviceInventoryPollInterval,
 		httpClient: &http.Client{
-			Timeout: rdmaInventoryHTTPTimeout,
+			Timeout: deviceInventoryHTTPTimeout,
 		},
 		signal: signal,
 	}
@@ -68,7 +86,7 @@ func startRdmaInventoryPublisher(ctx context.Context, cfg Config, cs kubernetes.
 	go p.run(ctx)
 }
 
-func (p *rdmaInventoryPublisher) run(ctx context.Context) {
+func (p *deviceInventoryPublisher) run(ctx context.Context) {
 	p.poll(ctx)
 
 	ticker := time.NewTicker(p.interval)
@@ -84,10 +102,10 @@ func (p *rdmaInventoryPublisher) run(ctx context.Context) {
 	}
 }
 
-func (p *rdmaInventoryPublisher) poll(ctx context.Context) {
+func (p *deviceInventoryPublisher) poll(ctx context.Context) {
 	changed, err := p.publishOnce(ctx)
 	if err != nil {
-		slog.Warn("rdma inventory publish failed", "node", p.nodeName, "url", p.url, "error", err)
+		slog.Warn("device inventory publish failed", "node", p.nodeName, "url", p.baseURL, "error", err)
 
 		return
 	}
@@ -97,34 +115,49 @@ func (p *rdmaInventoryPublisher) poll(ctx context.Context) {
 	}
 }
 
-func (p *rdmaInventoryPublisher) publishOnce(ctx context.Context) (bool, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
+func (p *deviceInventoryPublisher) publishOnce(ctx context.Context) (bool, error) {
+	changed := false
+
+	for _, endpoint := range p.endpoints {
+		value, err := p.fetchAnnotationValue(ctx, endpoint.url)
+		if err != nil {
+			return false, fmt.Errorf("fetch %s inventory: %w", endpoint.annotation, err)
+		}
+
+		patched, err := patchNodeAnnotationIfChanged(ctx, p.clientset, p.nodeName, endpoint.annotation, value)
+		if err != nil {
+			return false, err
+		}
+
+		changed = changed || patched
+	}
+
+	return changed, nil
+}
+
+func (p *deviceInventoryPublisher) fetchAnnotationValue(ctx context.Context, inventoryURL string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, inventoryURL, nil)
 	if err != nil {
-		return false, fmt.Errorf("build inventory request: %w", err)
+		return "", fmt.Errorf("build inventory request: %w", err)
 	}
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("fetch inventory: %w", err)
+		return "", fmt.Errorf("fetch inventory: %w", err)
 	}
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("fetch inventory: status %s", resp.Status)
+		return "", fmt.Errorf("fetch inventory: status %s", resp.Status)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
 	if err != nil {
-		return false, fmt.Errorf("read inventory response: %w", err)
+		return "", fmt.Errorf("read inventory response: %w", err)
 	}
 
-	jsonValue, _, err := normalizeRdmaInventoryJSON(body)
-	if err != nil {
-		return false, fmt.Errorf("validate inventory response: %w", err)
-	}
-
-	return patchNodeAnnotationIfChanged(ctx, p.clientset, p.nodeName, storageRdmaHcasAnnotation, jsonValue)
+	return normalizeInventoryAnnotationValue(body)
 }
 
 func patchNodeAnnotationIfChanged(
@@ -159,26 +192,29 @@ func patchNodeAnnotationIfChanged(
 	return true, nil
 }
 
-func normalizeRdmaInventoryJSON(raw []byte) (string, *rdmaInventory, error) {
-	var compact bytes.Buffer
-	if err := json.Compact(&compact, bytes.TrimSpace(raw)); err != nil {
-		return "", nil, err
+func normalizeInventoryAnnotationValue(raw []byte) (string, error) {
+	value := strings.TrimSpace(string(raw))
+
+	entries, err := parseAnnotationList(value)
+	if err != nil {
+		return "", err
 	}
 
-	var inv rdmaInventory
-	if err := json.Unmarshal(compact.Bytes(), &inv); err != nil {
-		return "", nil, err
+	for _, entry := range entries {
+		for key, values := range entry.Values {
+			if strings.TrimSpace(key) == "" {
+				return "", fmt.Errorf("empty query key for %q", entry.Item)
+			}
+
+			for _, value := range values {
+				if value == "" {
+					return "", fmt.Errorf("empty query value for %q key %q", entry.Item, key)
+				}
+			}
+		}
 	}
 
-	if inv.SchemaVersion != 1 {
-		return "", nil, fmt.Errorf("unsupported schemaVersion %d", inv.SchemaVersion)
-	}
-
-	if inv.HCAs == nil {
-		return "", nil, fmt.Errorf("hcas field is required")
-	}
-
-	return compact.String(), &inv, nil
+	return value, nil
 }
 
 func firstRdmaInventoryAddr(value string) (string, error) {
@@ -195,15 +231,15 @@ func rdmaInventoryAddrs(value string) ([]string, error) {
 		return nil, nil
 	}
 
-	_, inv, err := normalizeRdmaInventoryJSON([]byte(value))
+	entries, err := parseAnnotationList(value)
 	if err != nil {
 		return nil, err
 	}
 
 	var addrs []string
 
-	for _, hca := range inv.HCAs {
-		for _, addr := range hca.Addrs {
+	for _, hca := range entries {
+		for _, addr := range hca.Values["addr"] {
 			if addr != "" {
 				addrs = append(addrs, addr)
 			}
@@ -211,4 +247,17 @@ func rdmaInventoryAddrs(value string) ([]string, error) {
 	}
 
 	return addrs, nil
+}
+
+func inventoryURLForPath(baseURL, path string) (string, error) {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + path
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+
+	return parsed.String(), nil
 }

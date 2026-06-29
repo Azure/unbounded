@@ -15,32 +15,33 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-func TestNormalizeRdmaInventoryJSON(t *testing.T) {
-	got, inv, err := normalizeRdmaInventoryJSON([]byte(`{
-		"schemaVersion": 1,
-		"hcas": [{"name": "mlx5_0", "addrs": ["hex:01"]}]
-	}`))
+func TestNormalizeInventoryAnnotationValue(t *testing.T) {
+	got, err := normalizeInventoryAnnotationValue([]byte(" mlx5_0?addr=hex%3A01,/dev/sdb?name=sdb&size_bytes=4096\n"))
 	require.NoError(t, err)
 
-	assert.Equal(t, `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:01"]}]}`, got)
-	require.Len(t, inv.HCAs, 1)
-	assert.Equal(t, "mlx5_0", inv.HCAs[0].Name)
+	assert.Equal(t, "mlx5_0?addr=hex%3A01,/dev/sdb?name=sdb&size_bytes=4096", got)
 }
 
-func TestNormalizeRdmaInventoryJSONRejectsInvalidSchema(t *testing.T) {
-	_, _, err := normalizeRdmaInventoryJSON([]byte(`{"schemaVersion":2,"hcas":[]}`))
-	require.Error(t, err)
-
-	_, _, err = normalizeRdmaInventoryJSON([]byte(`{"schemaVersion":1}`))
-	require.Error(t, err)
+func TestNormalizeInventoryAnnotationValueRejectsInvalidFormat(t *testing.T) {
+	for _, raw := range []string{
+		"?addr=hex%3A01",
+		"mlx5_0?=hex%3A01",
+		"mlx5_0?addr=",
+		"mlx5_0?addr=%zz",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			_, err := normalizeInventoryAnnotationValue([]byte(raw))
+			require.Error(t, err)
+		})
+	}
 }
 
 func TestFirstRdmaInventoryAddr(t *testing.T) {
-	addr, err := firstRdmaInventoryAddr(`{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":[]},{"name":"mlx5_1","addrs":["hex:02","hex:03"]}]}`)
+	addr, err := firstRdmaInventoryAddr("mlx5_0,mlx5_1?addr=hex%3A02&addr=hex%3A03")
 	require.NoError(t, err)
 	assert.Equal(t, "hex:02", addr)
 
-	addr, err = firstRdmaInventoryAddr(`{"schemaVersion":1,"hcas":[]}`)
+	addr, err = firstRdmaInventoryAddr("mlx5_0")
 	require.NoError(t, err)
 	assert.Empty(t, addr)
 }
@@ -48,35 +49,45 @@ func TestFirstRdmaInventoryAddr(t *testing.T) {
 func TestPatchNodeAnnotationIfChanged(t *testing.T) {
 	ctx := context.Background()
 	cs := fake.NewSimpleClientset(node("self", "red", "10.0.0.1"))
+	value := "mlx5_0?addr=hex%3A01"
 
-	changed, err := patchNodeAnnotationIfChanged(ctx, cs, "self", storageRdmaHcasAnnotation, `{"schemaVersion":1,"hcas":[]}`)
+	changed, err := patchNodeAnnotationIfChanged(ctx, cs, "self", storageRdmaHcasAnnotation, value)
 	require.NoError(t, err)
 	assert.True(t, changed)
 
 	n, err := cs.CoreV1().Nodes().Get(ctx, "self", metav1.GetOptions{})
 	require.NoError(t, err)
-	assert.Equal(t, `{"schemaVersion":1,"hcas":[]}`, n.Annotations[storageRdmaHcasAnnotation])
+	assert.Equal(t, value, n.Annotations[storageRdmaHcasAnnotation])
 
-	changed, err = patchNodeAnnotationIfChanged(ctx, cs, "self", storageRdmaHcasAnnotation, `{"schemaVersion":1,"hcas":[]}`)
+	changed, err = patchNodeAnnotationIfChanged(ctx, cs, "self", storageRdmaHcasAnnotation, value)
 	require.NoError(t, err)
 	assert.False(t, changed)
 }
 
-func TestRdmaInventoryPublisherPublishesMinifiedJSON(t *testing.T) {
+func TestDeviceInventoryPublisherPublishesAnnotations(t *testing.T) {
 	ctx := context.Background()
 	cs := fake.NewSimpleClientset(node("self", "red", "10.0.0.1"))
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/inventory/rdma", r.URL.Path)
-
-		_, _ = w.Write([]byte(`{"schemaVersion": 1, "hcas": []}`))
+		switch r.URL.Path {
+		case "/inventory/rdma":
+			_, _ = w.Write([]byte("mlx5_0?addr=hex%3A01\n"))
+		case "/inventory/block":
+			_, _ = w.Write([]byte("/dev/sdb?name=sdb&size_bytes=4096\n"))
+		default:
+			http.NotFound(w, r)
+		}
 	}))
 	defer server.Close()
 
-	p := &rdmaInventoryPublisher{
-		clientset:  cs,
-		nodeName:   "self",
-		url:        server.URL + "/inventory/rdma",
+	p := &deviceInventoryPublisher{
+		clientset: cs,
+		nodeName:  "self",
+		baseURL:   server.URL + "/inventory",
+		endpoints: []inventoryEndpoint{
+			{annotation: storageRdmaHcasAnnotation, url: server.URL + "/inventory/rdma"},
+			{annotation: storageBlockDevicesAnnotation, url: server.URL + "/inventory/block"},
+		},
 		httpClient: server.Client(),
 	}
 
@@ -86,5 +97,16 @@ func TestRdmaInventoryPublisherPublishesMinifiedJSON(t *testing.T) {
 
 	n, err := cs.CoreV1().Nodes().Get(ctx, "self", metav1.GetOptions{})
 	require.NoError(t, err)
-	assert.Equal(t, `{"schemaVersion":1,"hcas":[]}`, n.Annotations[storageRdmaHcasAnnotation])
+	assert.Equal(t, "mlx5_0?addr=hex%3A01", n.Annotations[storageRdmaHcasAnnotation])
+	assert.Equal(t, "/dev/sdb?name=sdb&size_bytes=4096", n.Annotations[storageBlockDevicesAnnotation])
+
+	changed, err = p.publishOnce(ctx)
+	require.NoError(t, err)
+	assert.False(t, changed)
+}
+
+func TestInventoryURLForPath(t *testing.T) {
+	got, err := inventoryURLForPath("http://127.0.0.1:9100/inventory?ignored=1", "/rdma")
+	require.NoError(t, err)
+	assert.Equal(t, "http://127.0.0.1:9100/inventory/rdma", got)
 }

@@ -4,7 +4,7 @@
 # ServiceAccount + RBAC for the unbounded-storage supervisor's run container.
 # The run supervisor watches cluster Nodes to read this node's storage disk
 # annotations and discover storage-ring peers by label. It also publishes this
-# node's RDMA inventory back onto its Node annotation, so it needs get/list/watch
+# node's HCA and block-device discovery annotations, so it needs get/list/watch
 # plus patch on nodes. The install initContainer does not use the API and so does
 # not need these grants.
 ---
@@ -26,7 +26,7 @@ metadata:
     app.kubernetes.io/component: storage
 rules:
   # Nodes - list/watch to read storage annotations and discover peers by label;
-  # get/patch to publish this node's RDMA HCA inventory annotation.
+  # get/patch to publish this node's HCA and block-device inventory annotations.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]

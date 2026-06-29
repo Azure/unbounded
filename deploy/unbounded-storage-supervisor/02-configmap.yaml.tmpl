@@ -25,15 +25,17 @@ metadata:
 # deployment should participate in P2P caching; the supervisor only supplies the
 # ring roster.
 #
-# Disks are declared in disks[]. Explicit disks are preserved, while an absent
-# or empty disks list is filled from this node's annotations.
-# unbounded-cloud.io/storage-disks is a
-# comma-separated list of block disks such as
-# /dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0. When that annotation
+# Disks are declared in disks[]. Explicit disks are preserved. When disks[] is
+# absent or empty, block disks are allocated only from the opt-in
+# storage.unbounded-cloud.io/allocated-disks annotation. Its value is a
+# comma-separated list of item?query entries such as
+# /dev/nvme1n1?queue_depth=256&page_size_bytes=4096&numa=0. When that annotation
 # is absent or has no valid disks, the supervisor uses one file-backed disk at
 # /var/lib/unbounded-storage/cache.disk sized by
-# unbounded-cloud.io/storage-file-size-bytes, defaulting to 2 GiB. The shared
-# disk set is available to every cache; the supervisor does not
+# unbounded-cloud.io/storage-file-size-bytes, defaulting to 2 GiB. The daemon
+# publishes discovered options to storage.unbounded-cloud.io/block-devices as
+# entries like /dev/sdb?name=sdb&size_bytes=1234; discovery does not allocate
+# disks. The shared disk set is available to every cache; the supervisor does not
 # invent caches, backends, or frontends.
 data:
   config.yaml: |
@@ -74,5 +76,5 @@ data:
         # NIC-worker CPUs to pin per active HCA.
         nic_workers: 4
       metrics:
-        # Prometheus exporter listen address ("" disables the exporter).
-        addr: ""
+        # Prometheus exporter and device inventory listen address.
+        addr: "127.0.0.1:9100"
