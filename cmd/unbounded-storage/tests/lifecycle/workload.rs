@@ -17,9 +17,9 @@ use proptest::prelude::*;
 use unbounded_storage::bufferpool::{Error, StripeKey};
 use unbounded_storage::config::{
     ApplyError, BackendSpec, CacheSpec, Config, ConfigApplyTarget, ConfigController, ConfigDiff,
-    DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig,
-    NeighborhoodSpec, PeerSpec, TcpPeerConfig, backend_spec, disk_spec, frontend_spec, peer_spec,
-    runtime_disks, runtime_projection,
+    DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig, PeerSpec,
+    TcpPeerConfig, backend_spec, disk_spec, frontend_spec, peer_spec, runtime_disks,
+    runtime_projection,
 };
 use unbounded_storage::runtime::ShardLoop;
 use unbounded_storage::storage::blockdev::MockDeviceConfig;
@@ -251,11 +251,7 @@ struct SimApplyTarget {
 }
 
 impl ConfigApplyTarget for SimApplyTarget {
-    fn apply_in_place(
-        &mut self,
-        new: &Arc<Config>,
-        diff: &ConfigDiff,
-    ) -> Result<(), ApplyError> {
+    fn apply_in_place(&mut self, new: &Arc<Config>, diff: &ConfigDiff) -> Result<(), ApplyError> {
         let projection = runtime_projection(new)
             .map_err(|e| ApplyError::Target(format!("config projection failed: {e}")))?;
 
@@ -859,20 +855,14 @@ fn config_for_generation(version: u64, disks: Vec<DiskSpec>) -> Config {
     cfg.apply_defaults();
     cfg.version = version;
     cfg.backends = backend_specs(0, 1);
-    cfg.neighborhoods = vec![NeighborhoodSpec {
-        name: "neighborhood-0".to_string(),
-        source: "backend-0".to_string(),
-        fingers_per_node: Some(100),
-        local_node_id: Some(1),
-        local_tags: Vec::new(),
-        routing_plan: None,
-        peers: Vec::new(),
-    }];
+    cfg.self_ = "node-self".to_string();
+    cfg.fingers_per_node = Some(100);
+    cfg.peers = vec![self_peer_spec()];
     cfg.caches = vec![CacheSpec {
         name: "cache-0".to_string(),
-        source: "neighborhood-0".to_string(),
-        disks,
+        source: "backend-0".to_string(),
     }];
+    cfg.disks = disks;
     cfg.frontends = frontend_specs(0, 1);
     cfg
 }
@@ -881,12 +871,10 @@ fn mutate_config(cfg: &mut Config, apply: &ApplySpec, generation: usize) {
     match apply.kind {
         ApplyKind::Noop => {}
         ApplyKind::Peers { count } => {
-            let neighborhood = cfg
-                .neighborhoods
-                .first_mut()
-                .expect("lifecycle sim has a neighborhood");
-            neighborhood.fingers_per_node = Some(count.max(1) as u32);
-            neighborhood.peers = (0..count.max(1)).map(peer_spec_for).collect();
+            cfg.fingers_per_node = Some(count.max(1) as u32);
+            cfg.peers = std::iter::once(self_peer_spec())
+                .chain((0..count.max(1)).map(peer_spec_for))
+                .collect();
         }
         ApplyKind::Backends { count } => {
             cfg.backends = backend_specs(generation, count.max(1));
@@ -895,10 +883,7 @@ fn mutate_config(cfg: &mut Config, apply: &ApplySpec, generation: usize) {
             cfg.frontends = frontend_specs(generation, count.max(1));
         }
         ApplyKind::DiskSwap { count } => {
-            cfg.caches
-                .first_mut()
-                .expect("lifecycle sim has a cache")
-                .disks = generation_disk_specs(generation, count.max(1) as usize);
+            cfg.disks = generation_disk_specs(generation, count.max(1) as usize);
         }
     }
 }
@@ -915,6 +900,10 @@ fn backend_specs(generation: usize, count: u8) -> Vec<BackendSpec> {
                 url: format!("https://origin-{generation}-{i}.example.com"),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
+                ca_cert_path: None,
+                insecure_skip_verify: false,
+                client_cert_path: None,
+                client_key_path: None,
             })),
         })
         .collect()
@@ -927,6 +916,7 @@ fn frontend_specs(generation: usize, count: u8) -> Vec<FrontendSpec> {
             source: "cache-0".to_string(),
             config: Some(frontend_spec::Config::Http(HttpFrontendConfig {
                 addr: format!("127.0.0.1:{}", 10_000 + generation as u16 * 16 + i as u16),
+                max_requests_per_connection: None,
             })),
         })
         .collect()
@@ -934,10 +924,20 @@ fn frontend_specs(generation: usize, count: u8) -> Vec<FrontendSpec> {
 
 fn peer_spec_for(idx: u8) -> PeerSpec {
     PeerSpec {
-        id: idx as u64 + 2,
+        name: format!("node-{idx}"),
         tags: vec![format!("rack-{}", idx % 2)],
         config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
             addr: format!("127.0.0.1:{}", 9000 + idx as u16),
+        })),
+    }
+}
+
+fn self_peer_spec() -> PeerSpec {
+    PeerSpec {
+        name: "node-self".to_string(),
+        tags: vec!["rack-self".to_string()],
+        config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
+            addr: "127.0.0.1:8999".to_string(),
         })),
     }
 }
@@ -948,6 +948,10 @@ fn generation_disk_specs(generation: usize, count: usize) -> Vec<DiskSpec> {
             queue_depth: Some(32),
             page_size_bytes: Some(4096),
             skip_recovery_scan: true,
+            force_format: false,
+            bypass_admission: false,
+            bypass_index_read: false,
+            bypass_checksum: false,
             config: Some(disk_spec::Config::File(FileDiskConfig {
                 size: Some(64 * 1024 * 1024),
                 path: format!("/dst/generation-{generation}/disk-{idx}"),

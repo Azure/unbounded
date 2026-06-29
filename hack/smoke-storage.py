@@ -20,9 +20,20 @@ exercised without reimplementing the stripe-key hashing here.
 This whole two-node scenario is run once per protocol pairing so both
 frontend/backend implementations are covered against the real fabric:
 
-  - `http`: the plain HTTP frontend backed by the HTTP origin backend.
+  - `http`: the plain HTTP frontend backed by the HTTP origin backend
+            over a plaintext `http://` origin.
   - `s3`:   the native S3 frontend backed by the S3 origin backend
             (unsigned/public-bucket mode, path-style `/bucket/key`).
+  - `https`: the HTTP frontend backed by the HTTP origin backend over a
+            TLS 1.3 `https://` origin that requires client certificate
+            authentication. The backend drives an OpenSSL handshake and
+            offloads the connection to kernel TLS (kTLS) so record payloads
+            land zero-copy in the page cache; the origin CA is pinned via
+            `ca_cert_path`, and the backend presents `client_cert_path` and
+            `client_key_path` for mTLS.
+  - `loadgen`: the in-process load generator frontend backed by the
+            synthetic fake backend, with results verified through the
+            daemon's Prometheus metrics endpoint.
 
 A single `unbounded-storage` process serves exactly one frontend (the
 first configured spec wins), so the two kinds cannot share a ring; each
@@ -50,6 +61,7 @@ import resource
 import shutil
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -75,6 +87,54 @@ USE_SYSTEMD = os.environ.get("SMOKE_STORAGE_SYSTEMD", "0") == "1"
 INSTALL_SCRIPT = REPO_ROOT / "hack" / "scripts" / "install-unbounded-storage.sh"
 STORAGE_PREFIX = os.environ.get("SMOKE_STORAGE_PREFIX", "/opt/unbounded-storage")
 STORAGE_TARBALL = os.environ.get("SMOKE_STORAGE_TARBALL", "")
+
+
+def _openssl_bin() -> tuple[str, dict[str, str]]:
+    """Locate the openssl(1) CLI to use for cert generation.
+
+    Prefer the bundled OpenSSL (tmp/openssl/<ver>/bin/openssl) so it matches the
+    libcrypto/libssl this test runs against. The system CLI is built against a
+    different ABI and SEGFAULTs if it loads our bundled libs via
+    LD_LIBRARY_PATH, so it must not be used here. Falls back to PATH `openssl`.
+
+    Returns the binary path plus the environment it must run with. The bundled
+    CLI is dynamically linked against the bundled libssl/libcrypto (>=3.5); the
+    runner's system libs (3.0.x) lack the required symbol versions, so the
+    bundled `lib` dir must be put ahead of the system libs via LD_LIBRARY_PATH
+    or the binary fails to load. The system CLI needs no such override.
+    """
+    candidates = sorted(REPO_ROOT.glob("tmp/openssl/*/bin/openssl"), reverse=True)
+    for c in candidates:
+        if c.is_file():
+            env = dict(os.environ)
+            libdir = c.parent.parent / "lib"
+            existing = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = (
+                f"{libdir}:{existing}" if existing else str(libdir)
+            )
+            return str(c), env
+
+    return "openssl", dict(os.environ)
+
+
+OPENSSL_BIN, OPENSSL_ENV = _openssl_bin()
+
+# CA, server cert/key, and client cert/key for the HTTPS origin, generated
+# once at startup. The server cert carries `subjectAltName=DNS:localhost`
+# (and IP:127.0.0.1) so the backend, which connects to
+# `https://localhost:<port>`, can verify the presented leaf against the CA
+# pinned as its `ca_cert_path`. The same CA signs the client cert the backend
+# presents for mTLS.
+TLS_CA_CERT = TMPDIR / "origin-ca.pem"
+TLS_CA_KEY = TMPDIR / "origin-ca-key.pem"
+TLS_CERT = TMPDIR / "origin-cert.pem"
+TLS_KEY = TMPDIR / "origin-key.pem"
+TLS_CLIENT_CERT = TMPDIR / "client-cert.pem"
+TLS_CLIENT_KEY = TMPDIR / "client-key.pem"
+# The hostname the backend uses for the TLS origin endpoint. Must match a
+# SAN in TLS_CERT and resolve to loopback (via /etc/hosts) so the IPv4-only
+# origin resolver lands on the HTTPS stub.
+TLS_ORIGIN_HOST = "localhost"
 
 # The objects served by the stub origin and requested through the
 # frontends, one per scenario. The S3 path is path-style (`/bucket/key`)
@@ -554,6 +614,136 @@ def start_origin(port: int) -> http.server.ThreadingHTTPServer:
     return srv
 
 
+def run_openssl(args: list[str], description: str) -> None:
+    result = subprocess.run(
+        [OPENSSL_BIN, *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=OPENSSL_ENV,
+    )
+    if result.returncode != 0:
+        die(f"openssl {description} failed: {result.stderr}")
+
+
+def generate_tls_certs() -> None:
+    """Generate a CA plus server/client certs for the mTLS origin."""
+    log("Generating TLS CA and mTLS certs for HTTPS origin")
+    run_openssl(
+        [
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            str(TLS_CA_KEY),
+            "-out",
+            str(TLS_CA_CERT),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=smoke-storage-ca",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        ],
+        "CA generation",
+    )
+    run_openssl(
+        [
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            str(TLS_KEY),
+            "-out",
+            str(TMPDIR / "origin.csr"),
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        ],
+        "origin CSR generation",
+    )
+    run_openssl(
+        [
+            "x509",
+            "-req",
+            "-in",
+            str(TMPDIR / "origin.csr"),
+            "-CA",
+            str(TLS_CA_CERT),
+            "-CAkey",
+            str(TLS_CA_KEY),
+            "-CAcreateserial",
+            "-out",
+            str(TLS_CERT),
+            "-days",
+            "1",
+            "-copy_extensions",
+            "copy",
+        ],
+        "origin cert signing",
+    )
+    run_openssl(
+        [
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            str(TLS_CLIENT_KEY),
+            "-out",
+            str(TMPDIR / "client.csr"),
+            "-nodes",
+            "-subj",
+            "/CN=unbounded-storage-backend",
+        ],
+        "client CSR generation",
+    )
+    run_openssl(
+        [
+            "x509",
+            "-req",
+            "-in",
+            str(TMPDIR / "client.csr"),
+            "-CA",
+            str(TLS_CA_CERT),
+            "-CAkey",
+            str(TLS_CA_KEY),
+            "-CAcreateserial",
+            "-out",
+            str(TLS_CLIENT_CERT),
+            "-days",
+            "1",
+        ],
+        "client cert signing",
+    )
+
+
+def start_origin_tls(port: int) -> http.server.ThreadingHTTPServer:
+    """Start an HTTPS stub origin (TLS 1.2+) requiring a client cert.
+
+    Identical to `start_origin` but the listening socket is wrapped in a
+    server-side TLS context. The server itself uses ordinary userspace TLS;
+    only the storage backend offloads its side to kTLS. The origin offers
+    TLS 1.3 (the default ceiling); the backend's bundled OpenSSL (>=3.5)
+    engages kernel TLS for both directions on TLS 1.3.
+    """
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), _OriginHandler)
+    srv.requests = []  # type: ignore[attr-defined]
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=str(TLS_CERT), keyfile=str(TLS_KEY))
+    ctx.load_verify_locations(cafile=str(TLS_CA_CERT))
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
 # ============================================================================
 # CONFIG GENERATION
 # ============================================================================
@@ -563,14 +753,18 @@ def write_config(
     path: Path,
     *,
     kind: str,
-    local_id: int,
-    peer_id: int,
+    self_name: str,
+    peer_name: str,
     peer_addr: str,
     disk_path: Path,
     origin_addr: str,
     frontend_addr: str,
     fabric_addr: str,
     metrics_addr: str,
+    ca_cert_path: Path | None = None,
+    insecure_skip_verify: bool = False,
+    client_cert_path: Path | None = None,
+    client_key_path: Path | None = None,
 ) -> None:
     # The config schema is proto3-native: byte sizes are plain integer
     # byte counts (see api/unbounded-storage/config.proto).
@@ -583,35 +777,51 @@ def write_config(
     # forcing the libfabric tcp provider (disable_rdma) even on hosts that
     # expose an unusable RDMA HCA in sysfs. They only take effect at process
     # start and are intentionally not part of the dynamic reload path.
+    # Optional TLS knobs for the origin backend. Only emitted when set so
+    # plaintext scenarios keep validating as plaintext (the daemon rejects
+    # TLS knobs on an http:// endpoint).
+    tls_lines = ""
+    if ca_cert_path is not None:
+        tls_lines += f'ca_cert_path = "{ca_cert_path}"\n'
+    if insecure_skip_verify:
+        tls_lines += "insecure_skip_verify = true\n"
+    if client_cert_path is not None:
+        tls_lines += f'client_cert_path = "{client_cert_path}"\n'
+    if client_key_path is not None:
+        tls_lines += f'client_key_path = "{client_key_path}"\n'
     path.write_text(
         f"""\
+self = "{self_name}"
+
 [[backends]]
 name = "origin"
 
 [backends.config.{kind}]
 url = "{origin_addr}"
 stripe_size_bytes = {STRIPE_SIZE}
+{tls_lines}
 
-[[neighborhoods]]
-name = "p2p"
-source = "origin"
-local_node_id = {local_id}
+[[peers]]
+name = "{self_name}"
 
-[[neighborhoods.peers]]
-id = {peer_id}
+[peers.config.tcp]
+addr = "{fabric_addr}"
 
-[neighborhoods.peers.config.tcp]
+[[peers]]
+name = "{peer_name}"
+
+[peers.config.tcp]
 addr = "{peer_addr}"
 
 [[caches]]
 name = "cache"
-source = "p2p"
+source = "origin"
 
-[[caches.disks]]
+[[disks]]
 page_size_bytes = 4096
 skip_recovery_scan = true
 
-[caches.disks.config.file]
+[disks.config.file]
 path = "{disk_path}"
 size = {DISK_SIZE}
 
@@ -648,6 +858,82 @@ disable_rdma = true
 # the first collide on the port (`fi_endpoint` -> EADDRINUSE). The cap is a
 # ceiling, not a floor: a runner with only one usable serving core degrades
 # to a single shard and still passes.
+serving_cores = 2
+"""
+    )
+
+
+def write_loadgen_config(
+    path: Path,
+    *,
+    local_id: int,
+    peer_id: int,
+    peer_addr: str,
+    disk_path: Path,
+    fabric_addr: str,
+    metrics_addr: str,
+) -> None:
+    self_name = f"node-{local_id}"
+    peer_name = f"node-{peer_id}"
+    path.write_text(
+        f"""\
+self = "{self_name}"
+
+[[backends]]
+name = "fake"
+
+[backends.config.fake]
+stripe_size_bytes = {STRIPE_SIZE}
+object_size_bytes = {STRIPE_SIZE}
+
+[[peers]]
+name = "{self_name}"
+
+[peers.config.tcp]
+addr = "{fabric_addr}"
+
+[[peers]]
+name = "{peer_name}"
+
+[peers.config.tcp]
+addr = "{peer_addr}"
+
+[[caches]]
+name = "cache"
+source = "fake"
+
+[[disks]]
+page_size_bytes = 4096
+skip_recovery_scan = true
+
+[disks.config.file]
+path = "{disk_path}"
+size = {DISK_SIZE}
+
+[[frontends]]
+name = "loadgen"
+source = "cache"
+
+[frontends.config.loadgen]
+workers = 1
+seed = 1234
+keyspace_objects = 16
+object_size_bytes = {STRIPE_SIZE}
+read_bytes = {STRIPE_SIZE // 16}
+zipf_exponent = 1.1
+verify = true
+
+[startup.memory]
+memory_total_bytes = {MEMORY_TOTAL_BYTES}
+
+[startup.fabric.binds.tcp]
+addr = "{fabric_addr}"
+
+[startup.metrics]
+addr = "{metrics_addr}"
+
+[startup.topology]
+disable_rdma = true
 serving_cores = 2
 """
     )
@@ -694,13 +980,16 @@ def fetch(url: str, timeout: int = 30) -> tuple[int, bytes]:
     raise AssertionError("unreachable")
 
 
-def scrape_metric_sum(url: str, name: str, timeout: int = 30) -> float:
+def scrape_metric_sum(
+    url: str, name: str, timeout: int = 30, labels: dict[str, str] | None = None
+) -> float:
     """Scrape Prometheus text from *url* and sum all samples of *name*.
 
     Sums across every label-set series whose metric name matches *name*
     (ignoring comment/HELP/TYPE lines), so a counter split across labels
     like `frontend_requests_total{frontend="fe",method="GET",status="200"}`
-    is totaled. Dies if the endpoint never responds.
+    is totaled. When *labels* is set, only series carrying every requested
+    `key="value"` label are included. Dies if the endpoint never responds.
     """
     status, body = fetch(url, timeout)
     if status != 200:
@@ -713,13 +1002,43 @@ def scrape_metric_sum(url: str, name: str, timeout: int = 30) -> float:
             continue
         # "<name>{labels} <value>" or "<name> <value>"
         head, _, value = line.rpartition(" ")
-        metric = head.split("{", 1)[0]
+        metric, label_text = metric_name_and_labels(head)
         if metric == name:
+            if labels is not None and not all(
+                f'{k}="{v}"' in label_text for k, v in labels.items()
+            ):
+                continue
             try:
                 total += float(value)
             except ValueError:
                 continue
     return total
+
+
+def metric_name_and_labels(head: str) -> tuple[str, str]:
+    metric, sep, rest = head.partition("{")
+    if not sep:
+        return metric, ""
+    return metric, rest.rsplit("}", 1)[0]
+
+
+def wait_metric_at_least(
+    url: str,
+    name: str,
+    threshold: float,
+    *,
+    labels: dict[str, str] | None = None,
+    timeout: int = 60,
+) -> float:
+    deadline = time.monotonic() + timeout
+    last = 0.0
+    while time.monotonic() < deadline:
+        last = scrape_metric_sum(url, name, timeout=5, labels=labels)
+        if last >= threshold:
+            return last
+        time.sleep(1)
+    die(f"metric {name} at {url} reached {last}, expected >= {threshold}")
+    raise AssertionError("unreachable")
 
 
 # ============================================================================
@@ -770,17 +1089,32 @@ def _report_corruption(corrupt: dict[str, set[int]]) -> None:
         log(f"  stripes corrupt only via B: {len(only_b)} -> {sorted(only_b)[:16]}")
 
 
-def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> None:
+def run_scenario(
+    name: str,
+    kind: str,
+    origin_addr: str,
+    object_path: str,
+    origin: Any,
+    *,
+    ca_cert_path: Path | None = None,
+    insecure_skip_verify: bool = False,
+    client_cert_path: Path | None = None,
+    client_key_path: Path | None = None,
+) -> None:
     """Bring up a fresh two-node ring of frontend/backend *kind* and fetch.
 
     Spawns its own two `unbounded-storage` processes on new ports, fetches
     *object_path* through both frontends (asserting body and a cross-node
     origin GET), then tears the ring down. *origin* is the shared stub
     origin; its recorded requests are reset so the GET assertion is scoped
-    to this scenario.
+    to this scenario. *name* labels the scenario and namespaces its temp
+    files (so two scenarios of the same *kind*, e.g. plaintext vs TLS http,
+    do not collide). The TLS path parameters configure the origin backend's
+    certificate verification and optional client certificate for `https://`
+    endpoints.
     """
     log("")
-    log(f"=== Scenario: {kind} frontend + {kind} backend ===")
+    log(f"=== Scenario: {name} ({kind} frontend + {kind} backend) ===")
 
     nodes: list[_Node] = []
     fab_a, fab_b = free_port(), free_port()
@@ -789,37 +1123,45 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
     log(f"Ports: fabric=({fab_a},{fab_b}) frontends=({fe_a},{fe_b}) metrics=({met_a},{met_b})")
 
     log("Writing node configs")
-    cfg1 = TMPDIR / f"{kind}-node1.toml"
-    cfg2 = TMPDIR / f"{kind}-node2.toml"
+    cfg1 = TMPDIR / f"{name}-node1.toml"
+    cfg2 = TMPDIR / f"{name}-node2.toml"
     write_config(
         cfg1,
         kind=kind,
-        local_id=1,
-        peer_id=2,
+        self_name="node-a",
+        peer_name="node-b",
         peer_addr=f"127.0.0.1:{fab_b}",
-        disk_path=TMPDIR / f"{kind}-node1.disk",
+        disk_path=TMPDIR / f"{name}-node1.disk",
         origin_addr=origin_addr,
         frontend_addr=f"127.0.0.1:{fe_a}",
         fabric_addr=f"127.0.0.1:{fab_a}",
         metrics_addr=f"127.0.0.1:{met_a}",
+        ca_cert_path=ca_cert_path,
+        insecure_skip_verify=insecure_skip_verify,
+        client_cert_path=client_cert_path,
+        client_key_path=client_key_path,
     )
     write_config(
         cfg2,
         kind=kind,
-        local_id=2,
-        peer_id=1,
+        self_name="node-b",
+        peer_name="node-a",
         peer_addr=f"127.0.0.1:{fab_a}",
-        disk_path=TMPDIR / f"{kind}-node2.disk",
+        disk_path=TMPDIR / f"{name}-node2.disk",
         origin_addr=origin_addr,
         frontend_addr=f"127.0.0.1:{fe_b}",
         fabric_addr=f"127.0.0.1:{fab_b}",
         metrics_addr=f"127.0.0.1:{met_b}",
+        ca_cert_path=ca_cert_path,
+        insecure_skip_verify=insecure_skip_verify,
+        client_cert_path=client_cert_path,
+        client_key_path=client_key_path,
     )
 
     try:
         log("Bringing up two unbounded-storage nodes")
-        nodes.append(start_node(kind, 1, cfg1, TMPDIR / f"{kind}-node1.log"))
-        nodes.append(start_node(kind, 2, cfg2, TMPDIR / f"{kind}-node2.log"))
+        nodes.append(start_node(name, 1, cfg1, TMPDIR / f"{name}-node1.log"))
+        nodes.append(start_node(name, 2, cfg2, TMPDIR / f"{name}-node2.log"))
 
         wait_port("127.0.0.1", fe_a)
         wait_port("127.0.0.1", fe_b)
@@ -875,9 +1217,98 @@ def run_scenario(kind: str, origin_addr: str, object_path: str, origin: Any) -> 
                 )
             log(f"  node {label} reports {metric}={count}")
 
-        log(f"  {kind} scenario PASSED")
+        log(f"  {name} scenario PASSED")
     finally:
-        log(f"  Tearing down {kind} ring")
+        log(f"  Tearing down {name} ring")
+        terminate(nodes)
+
+
+def run_loadgen_scenario() -> None:
+    """Bring up a fake-backend/loadgen ring and assert it makes progress."""
+    log("")
+    log("=== Scenario: loadgen (loadgen frontend + fake backend) ===")
+
+    nodes: list[_Node] = []
+    fab_a, fab_b = free_port(), free_port()
+    met_a, met_b = free_port(), free_port()
+    log(f"Ports: fabric=({fab_a},{fab_b}) metrics=({met_a},{met_b})")
+
+    log("Writing loadgen node configs")
+    cfg1 = TMPDIR / "loadgen-node1.toml"
+    cfg2 = TMPDIR / "loadgen-node2.toml"
+    write_loadgen_config(
+        cfg1,
+        local_id=1,
+        peer_id=2,
+        peer_addr=f"127.0.0.1:{fab_b}",
+        disk_path=TMPDIR / "loadgen-node1.disk",
+        fabric_addr=f"127.0.0.1:{fab_a}",
+        metrics_addr=f"127.0.0.1:{met_a}",
+    )
+    write_loadgen_config(
+        cfg2,
+        local_id=2,
+        peer_id=1,
+        peer_addr=f"127.0.0.1:{fab_a}",
+        disk_path=TMPDIR / "loadgen-node2.disk",
+        fabric_addr=f"127.0.0.1:{fab_b}",
+        metrics_addr=f"127.0.0.1:{met_b}",
+    )
+
+    try:
+        log("Bringing up two loadgen storage nodes")
+        nodes.append(start_node("loadgen", 1, cfg1, TMPDIR / "loadgen-node1.log"))
+        nodes.append(start_node("loadgen", 2, cfg2, TMPDIR / "loadgen-node2.log"))
+
+        wait_port("127.0.0.1", met_a)
+        wait_port("127.0.0.1", met_b)
+        log("  Letting fabric peers establish...")
+        time.sleep(3)
+
+        request_metric = "unbounded_storage_frontend_requests_total"
+        bytes_metric = "unbounded_storage_frontend_response_bytes_total"
+        request_labels = {
+            "frontend": "loadgen",
+            "method": "GET",
+            "status": "200",
+        }
+        bytes_labels = {"frontend": "loadgen"}
+        for label, met_port in (("A", met_a), ("B", met_b)):
+            url = f"http://127.0.0.1:{met_port}/metrics"
+            log(f"Waiting for loadgen metrics from node {label} ({url})")
+            count = wait_metric_at_least(
+                url,
+                request_metric,
+                1,
+                labels=request_labels,
+            )
+            bytes_total = wait_metric_at_least(
+                url,
+                bytes_metric,
+                STRIPE_SIZE // 16,
+                labels=bytes_labels,
+            )
+            # Loadgen starts with the daemon, so peer-dial warmup can leave
+            # early status=500 samples in lifetime counters before the ring is
+            # ready. Successful verified reads and response bytes are the
+            # smoke-test signal here.
+            failures = scrape_metric_sum(
+                url,
+                request_metric,
+                labels={
+                    "frontend": "loadgen",
+                    "method": "GET",
+                    "status": "500",
+                },
+            )
+            log(
+                f"  node {label} reports loadgen requests={count} "
+                f"response_bytes={bytes_total} startup_failures={failures}"
+            )
+
+        log("  loadgen scenario PASSED")
+    finally:
+        log("  Tearing down loadgen ring")
         terminate(nodes)
 
 
@@ -914,19 +1345,40 @@ def main() -> None:
     reserve_hugepages()
 
     origin_port = free_port()
-    origin_addr = f"127.0.0.1:{origin_port}"
+    origin_addr = f"http://127.0.0.1:{origin_port}"
 
     log(f"Working directory: {TMPDIR}")
-    log(f"Stub origin on {origin_addr}")
+    log(f"Plaintext stub origin on {origin_addr}")
     log("Starting stub origin HTTP server")
     origin = start_origin(origin_port)
+
+    # Second stub origin, TLS-wrapped, for the kTLS scenario. The backend
+    # reaches it as `https://localhost:<port>`; `localhost` resolves to the
+    # loopback the server binds and matches the cert SAN.
+    generate_tls_certs()
+    tls_origin_port = free_port()
+    tls_origin_addr = f"https://{TLS_ORIGIN_HOST}:{tls_origin_port}"
+    log(f"TLS stub origin on https://127.0.0.1:{tls_origin_port}")
+    log("Starting stub origin HTTPS server")
+    tls_origin = start_origin_tls(tls_origin_port)
 
     # Run the full two-node ring once per protocol pairing. Each scenario
     # brings up and tears down its own ring on fresh ports, so the two
     # frontend/backend kinds never share a process (only the first
     # configured frontend is served per process).
-    run_scenario("http", origin_addr, HTTP_OBJECT_PATH, origin)
-    run_scenario("s3", origin_addr, S3_OBJECT_PATH, origin)
+    run_scenario("http", "http", origin_addr, HTTP_OBJECT_PATH, origin)
+    run_scenario("s3", "s3", origin_addr, S3_OBJECT_PATH, origin)
+    run_scenario(
+        "https",
+        "http",
+        tls_origin_addr,
+        HTTP_OBJECT_PATH,
+        tls_origin,
+        ca_cert_path=TLS_CA_CERT,
+        client_cert_path=TLS_CLIENT_CERT,
+        client_key_path=TLS_CLIENT_KEY,
+    )
+    run_loadgen_scenario()
 
     log("")
     log("Smoke test PASSED")

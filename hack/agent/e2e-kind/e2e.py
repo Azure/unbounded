@@ -19,13 +19,12 @@ The test follows a single linear sequence:
 Options:
     --verbose                          Enable diagnostic output (network diags).
     --node-config PATH                 JSON file with node config variant settings.
-    AGENT_OCI_IMAGE                    Optional OCI rootfs image for the agent node.
-
 Subcommands (called as individual workflow steps):
     create-vm                          Create bridge networking and launch a QEMU VM.
     ensure-kind-bridge                 Verify/repair veth pair connecting Kind to VM bridge.
     run-agent                          Build agent, generate bootstrap script, run on VM.
     wait-for-node                      Wait for the node to appear and become Ready.
+    validate-host-nspawn-distro        Verify the nspawn machine distro matches the host.
     validate-node-config               Verify configured labels and taints reached the Node.
     dump-persisted-agent-config        Print persisted agent config files from the VM.
     validate-workload                  Deploy test pods on the agent node.
@@ -84,7 +83,6 @@ VM_GATEWAY = f"{VM_SUBNET}.1"
 VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
 HOST_BASE_OS = os.environ.get("HOST_BASE_OS", "ubuntu2404")
 HOST_IMAGE_URL = os.environ.get("HOST_IMAGE_URL", "")
-NSPAWN_OCI_IMAGE = os.environ.get("NSPAWN_OCI_IMAGE", "")
 VM_SSH_USER = os.environ.get("VM_SSH_USER", "ubuntu")
 NODE_CONFIG_DIR = REPO_ROOT / "hack" / "agent" / "e2e-kind" / "node-configs"
 
@@ -92,7 +90,6 @@ KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
 KIND_CONTAINER = f"{KIND_CLUSTER_NAME}-control-plane"
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
-AGENT_OCI_IMAGE = os.environ.get("AGENT_OCI_IMAGE", "")
 
 # Site name used when generating the bootstrap script via kubectl-unbounded.
 E2E_SITE_NAME = os.environ.get("E2E_SITE_NAME", "e2e")
@@ -211,6 +208,10 @@ def ssh_capture_quiet(command: str) -> subprocess.CompletedProcess[str]:
 
 def scp_cmd(src: str, dst: str) -> subprocess.CompletedProcess[str]:
     return run(["scp", *SSH_OPTS, src, dst])
+
+
+def scp_from_vm(src: str, dst: Path) -> subprocess.CompletedProcess[str]:
+    return run(["scp", *SSH_OPTS, f"{SSH_TARGET}:{src}", str(dst)])
 
 
 def kubectl(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
@@ -445,6 +446,93 @@ def machine_shell_quiet(machine: str, command: str) -> subprocess.CompletedProce
     return ssh_capture_quiet(f"sudo machinectl shell {machine} /bin/sh -lc {quoted}")
 
 
+def nspawn_os_release(machine: str) -> str:
+    result = ssh_capture_quiet(f"sudo cat /var/lib/machines/{machine}/etc/os-release")
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout
+
+    diag(f"Could not read /var/lib/machines/{machine}/etc/os-release directly; trying machinectl shell")
+    return machine_shell(machine, "cat /etc/os-release")
+
+
+def parse_os_release(content: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip("\"'")
+    return values
+
+
+def normalize_os_release_id(value: str) -> str:
+    return "".join(ch for ch in value.lower() if ch.isalnum())
+
+
+def is_rpm_based_os_release_id(value: str) -> bool:
+    return normalize_os_release_id(value) in {
+        "almalinux",
+        "amzn",
+        "azurelinux",
+        "centos",
+        "fedora",
+        "ol",
+        "rhel",
+        "rocky",
+        "sles",
+        "suse",
+    }
+
+
+def is_rpm_based_os_release(values: dict[str, str]) -> bool:
+    if is_rpm_based_os_release_id(values.get("ID", "")):
+        return True
+    return any(is_rpm_based_os_release_id(token) for token in values.get("ID_LIKE", "").split())
+
+
+def distro_from_os_release(values: dict[str, str]) -> str:
+    distro_id = normalize_os_release_id(values.get("ID", ""))
+    version_id = values.get("VERSION_ID", "")
+    if distro_id == "ubuntu":
+        if version_id.startswith("24.04"):
+            return "ubuntu2404"
+        if version_id.startswith("26.04"):
+            return "ubuntu2604"
+    if distro_id in {"azurelinux", "azlinux"} and version_id.startswith("3"):
+        return "azlinux3"
+    if is_rpm_based_os_release(values):
+        return "rpm"
+    return ""
+
+
+def expected_nspawn_distro_for_host(host_distro: str) -> str:
+    if host_distro in {"ubuntu2404", "ubuntu2604"}:
+        return host_distro
+    if host_distro in {"azlinux3", "rpm"}:
+        return "azlinux3"
+    return "ubuntu2404"
+
+
+def validate_host_nspawn_distro() -> None:
+    host_release = parse_os_release(ssh_capture("cat /etc/os-release"))
+    host_distro = distro_from_os_release(host_release)
+    if not host_distro:
+        die(f"unsupported host distro from /etc/os-release: ID={host_release.get('ID', '')!r} "
+            f"VERSION_ID={host_release.get('VERSION_ID', '')!r}")
+
+    machine = active_nspawn_machine()
+    nspawn_release = parse_os_release(nspawn_os_release(machine))
+    nspawn_distro = distro_from_os_release(nspawn_release)
+    expected = expected_nspawn_distro_for_host(host_distro)
+    if nspawn_distro != expected:
+        die(f"host/nspawn distro mismatch: host={host_distro}, "
+            f"nspawn={nspawn_distro or '<unknown>'}, expected nspawn={expected}")
+
+    log(f"Host/nspawn distro pair is valid: host={host_distro}, "
+        f"nspawn={nspawn_distro}, machine={machine}")
+
+
 def create_bpffs_sentinel(machine: str) -> None:
     log(f"Creating bpffs sentinel in nspawn machine '{machine}'...")
     machine_shell(machine, textwrap.dedent(f"""\
@@ -558,8 +646,6 @@ def expected_node_taints(node_config: NodeConfig) -> list[dict[str, str]]:
 def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
     """Return manual-bootstrap flags for the active node config variant."""
     args: list[str] = []
-    if NSPAWN_OCI_IMAGE:
-        args.extend(["--oci-image", NSPAWN_OCI_IMAGE])
     if node_config.node_ip:
         args.extend(["--node-ip", expected_node_ip(node_config)])
     for key, value in sorted(expected_node_labels(node_config).items()):
@@ -575,7 +661,6 @@ def log_active_node_config(node_config: NodeConfig) -> None:
     taints = expected_node_taint_strings(node_config)
     log(f"Agent e2e node config variant: {node_config.name}")
     log(f"  node ip: {expected_node_ip(node_config) if node_config.node_ip else '<default>'}")
-    log(f"  nspawn oci image: {NSPAWN_OCI_IMAGE or '<default>'}")
     log(f"  node labels: {', '.join(labels) if labels else '<none>'}")
     log(f"  register-with-taints: {', '.join(taints) if taints else '<none>'}")
 
@@ -1620,9 +1705,6 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         "--site", E2E_SITE_NAME,
         *node_config_bootstrap_args(node_config),
     ]
-    if AGENT_OCI_IMAGE:
-        log(f"Using OCI rootfs image: {AGENT_OCI_IMAGE}")
-        bootstrap_args.extend(["--oci-image", AGENT_OCI_IMAGE])
     bootstrap_script = capture(bootstrap_args)
 
     # The kubeconfig uses a localhost address that is not reachable from the VM.
@@ -1638,6 +1720,21 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     bootstrap_script_path.write_text(bootstrap_script)
     bootstrap_script_path.chmod(0o600)
     log(f"Bootstrap script written to {bootstrap_script_path}")
+
+    bootstrap_preflight_script = bootstrap_script.replace(
+        'echo "Running unbounded-agent start..."\n"${AGENT_BIN}" start ${_START_ARGS}',
+        textwrap.dedent("""\
+        echo "Running unbounded-agent preflight..."
+        "${AGENT_BIN}" preflight ${_START_ARGS} --output text | tee /tmp/unbounded-agent-preflight.txt
+        "${AGENT_BIN}" preflight ${_START_ARGS} --output json > /tmp/unbounded-agent-preflight.json
+        echo "Running unbounded-agent start..."
+        "${AGENT_BIN}" start ${_START_ARGS}"""),
+    )
+    if bootstrap_preflight_script == bootstrap_script:
+        die("failed to inject unbounded-agent preflight into bootstrap script")
+
+    bootstrap_script = bootstrap_preflight_script
+    bootstrap_script_path.write_text(bootstrap_script)
 
     # Wait for cloud-init and verify connectivity
     log("Waiting for cloud-init to complete on VM...")
@@ -1663,6 +1760,10 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         "ssh", *SSH_OPTS, "-o", "ServerAliveInterval=30", SSH_TARGET,
         f"sudo {env_prefix} /tmp/bootstrap.sh",
     ])
+
+    log("Copying preflight reports from VM...")
+    scp_from_vm("/tmp/unbounded-agent-preflight.txt", VM_DIR / "unbounded-agent-preflight.txt")
+    scp_from_vm("/tmp/unbounded-agent-preflight.json", VM_DIR / "unbounded-agent-preflight.json")
 
 
 # ---------------------------------------------------------------------------
@@ -2881,6 +2982,21 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
     ]
     ssh_target = f"{VM_SSH_USER}@{vm_ip}"
 
+    for name in ("unbounded-agent-preflight.txt", "unbounded-agent-preflight.json"):
+        src = vm_dir / name
+        if src.exists():
+            shutil.copyfile(src, logs_dir / f"{prefix}{name}")
+
+    for name in ("unbounded-agent-preflight.txt", "unbounded-agent-preflight.json"):
+        result = subprocess.run(
+            ["scp", *ssh_opts, f"{ssh_target}:/tmp/{name}", str(logs_dir / f"{prefix}{name}")],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode == 0:
+            diag(f"Collected {name} from VM")
+
     def ssh_log(name: str, command: str) -> None:
         _write_command_log(logs_dir / f"{prefix}{name}", ["ssh", *ssh_opts, ssh_target, command])
 
@@ -3056,6 +3172,7 @@ COMMANDS: dict[str, Command] = {
     "launch-vm": _without_node_config(launch_vm),
     "run-agent": run_agent,
     "wait-for-node": _without_node_config(wait_for_node),
+    "validate-host-nspawn-distro": _without_node_config(validate_host_nspawn_distro),
     "validate-node-config": validate_node_config,
     "validate-kube-proxy": _without_node_config(validate_kube_proxy),
     "validate-workload": _without_node_config(validate_workload),

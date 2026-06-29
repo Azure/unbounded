@@ -3,13 +3,14 @@
 
 //! Stripe-to-origin mapping.
 //!
-//! The P2P cache is content-addressed: a stripe is identified solely
-//! by its 32-byte [`StripeKey`](crate::bufferpool::StripeKey). That is
-//! sufficient for peer routing and dedup, but it carries no
-//! information about *where the bytes came from*. When a read misses
-//! all the way through to the origin tier, the backend needs to map a
-//! [`StripeKey`] back to a concrete origin object and byte range so it
-//! can issue (for example) an S3 `GET` with the right `Range` header.
+//! The P2P cache is keyspace-addressed: a cached stripe is identified
+//! by its cache id, logical object id, and stripe index. That key is
+//! sufficient for peer routing and dedup inside one cache, but it
+//! carries no information about *where the bytes came from*. When a
+//! read misses all the way through to the origin tier, the backend
+//! needs to map a [`StripeKey`] back to a concrete origin object and
+//! byte range so it can issue (for example) an S3 `GET` with the right
+//! `Range` header.
 //!
 //! Rather than maintain a reverse sidecar from key back to origin, the
 //! origin coordinates ride on the request itself ([`OriginRef`] on
@@ -21,10 +22,10 @@
 //!
 //! - [`OriginRef`] names the origin object a stripe belongs to and the
 //!   stripe index within that object.
-//! - [`OriginRef::stripe_key`] derives the content-addressed
-//!   [`StripeKey`] from an [`OriginRef`] deterministically, so the
-//!   frontend (which knows the origin) and any peer (which only knows
-//!   the key) agree on routing without coordination.
+//! - [`OriginRef::stripe_key_for_cache`] derives the cached
+//!   [`StripeKey`] from a cache id and an [`OriginRef`] deterministically,
+//!   so the frontend (which knows the origin) and any peer (which only
+//!   knows the key) agree on routing without coordination.
 
 use serde::{Deserialize, Serialize};
 
@@ -91,18 +92,28 @@ impl OriginRef {
         }
     }
 
-    /// Derive the canonical content-addressed [`StripeKey`] for this
-    /// origin stripe.
+    /// Derive the uncached origin [`StripeKey`] for this origin stripe.
+    ///
+    /// Cached requests must use [`Self::stripe_key_for_cache`] so the
+    /// cache id is the only logical keyspace prefix. This method exists
+    /// for direct-backend and bypass requests that never populate a
+    /// cache.
+    pub fn stripe_key(&self) -> StripeKey {
+        origin_stripe_key(&self.backend_id, &self.origin_object_id, self.stripe_idx)
+    }
+
+    /// Derive the canonical cached [`StripeKey`] for this origin stripe
+    /// within `cache_id`.
     ///
     /// The key is `blake3(...)` over the following exact byte layout,
     /// fed to a single streaming hasher in this order. Each
     /// variable-length string field is length-prefixed with its byte
-    /// length as a little-endian `u64`, so distinct `(backend_id,
+    /// length as a little-endian `u64`, so distinct `(cache_id,
     /// origin_object_id)` splits can never alias:
     ///
-    /// 1. `backend_id.len()` as 8 little-endian bytes
+    /// 1. `cache_id.len()` as 8 little-endian bytes
     ///    (`u64::to_le_bytes`).
-    /// 2. `backend_id` as raw UTF-8 bytes.
+    /// 2. `cache_id` as raw UTF-8 bytes.
     /// 3. `origin_object_id.len()` as 8 little-endian bytes.
     /// 4. `origin_object_id` as raw UTF-8 bytes.
     /// 5. `stripe_idx` as 8 little-endian bytes (`u64::to_le_bytes`).
@@ -113,11 +124,11 @@ impl OriginRef {
     /// The length prefix on each variable-length field makes the
     /// encoding unambiguous: `("ab", "c")` and `("a", "bc")` frame to
     /// different byte streams and therefore different keys, so the
-    /// split between `backend_id` and `origin_object_id` need not be
+    /// split between `cache_id` and `origin_object_id` need not be
     /// pinned out-of-band for correctness. The 8-byte little-endian
     /// `stripe_idx` suffix is fixed width.
-    pub fn stripe_key(&self) -> StripeKey {
-        stripe_key(&self.backend_id, &self.origin_object_id, self.stripe_idx)
+    pub fn stripe_key_for_cache(&self, cache_id: &str) -> StripeKey {
+        stripe_key(cache_id, &self.origin_object_id, self.stripe_idx)
     }
 
     /// Whether this reference names an object's metadata entry rather
@@ -146,7 +157,6 @@ pub struct StripeReq {
     key: StripeKey,
     origin: Option<OriginRef>,
     cache_id: Option<String>,
-    neighborhood_id: Option<String>,
     /// Local-only bridge flag. Never serialized: a bypass request is
     /// served straight from the origin on this node and never crosses
     /// the fabric, so a request decoded from a peer is by definition
@@ -154,6 +164,19 @@ pub struct StripeReq {
     /// and defaults the field to `false` on decode.
     #[serde(skip)]
     bypass: bool,
+    /// Benchmark-only flag carried over the fabric. Peer handlers use it
+    /// to synthesize response pages from their RPC scratch buffers so a
+    /// loadgen run can measure fabric RPC/RMA capacity without disk or
+    /// origin work in the server path.
+    fabric_only: bool,
+    /// Local-only benchmark flag. Never serialized: the initiating
+    /// bufferpool skips its own disk lookup/writeback when this is set,
+    /// but peer handlers still use their local NVMe-backed cache after
+    /// decoding the request from the fabric. This keeps measurements
+    /// focused on remote NVMe + RDMA without short-circuiting on the
+    /// requester's disk.
+    #[serde(skip)]
+    skip_local_disk: bool,
 }
 
 impl StripeReq {
@@ -164,8 +187,9 @@ impl StripeReq {
             key,
             origin: None,
             cache_id: None,
-            neighborhood_id: None,
             bypass: false,
+            fabric_only: false,
+            skip_local_disk: false,
         }
     }
 
@@ -184,26 +208,23 @@ impl StripeReq {
         self
     }
 
-    /// Attach the p2p neighborhood this request should route through.
-    /// `None` means the request resolves directly against its origin
-    /// backend after any local cache miss.
-    pub fn with_neighborhood_id(mut self, neighborhood_id: Option<String>) -> Self {
-        self.neighborhood_id = neighborhood_id;
-        self
-    }
-
-    /// Attach both runtime chain selectors in one step.
-    pub fn with_chain(mut self, cache_id: Option<String>, neighborhood_id: Option<String>) -> Self {
-        self.cache_id = cache_id;
-        self.neighborhood_id = neighborhood_id;
-        self
-    }
-
     /// Mark the request to bypass the p2p cache layer (disk cache,
     /// peer routing, and cross-shard fanout), bridging straight to the
     /// origin backend. See [`Req::bypass`].
     pub fn with_bypass(mut self, bypass: bool) -> Self {
         self.bypass = bypass;
+        self
+    }
+
+    /// Mark the request as a synthetic fabric benchmark request.
+    pub fn with_fabric_only(mut self, fabric_only: bool) -> Self {
+        self.fabric_only = fabric_only;
+        self
+    }
+
+    /// Mark the request to skip the initiator's local disk cache.
+    pub fn with_skip_local_disk(mut self, skip_local_disk: bool) -> Self {
+        self.skip_local_disk = skip_local_disk;
         self
     }
 
@@ -217,8 +238,12 @@ impl StripeReq {
         self.cache_id.as_deref()
     }
 
-    pub fn neighborhood_id(&self) -> Option<&str> {
-        self.neighborhood_id.as_deref()
+    pub fn fabric_only(&self) -> bool {
+        self.fabric_only
+    }
+
+    pub fn skip_local_disk(&self) -> bool {
+        self.skip_local_disk
     }
 }
 
@@ -235,15 +260,29 @@ impl Req for StripeReq {
         self.cache_id.as_ref()
     }
 
-    fn neighborhood_id(&self) -> Option<&String> {
-        self.neighborhood_id.as_ref()
+    fn fabric_only(&self) -> bool {
+        self.fabric_only
+    }
+
+    fn skip_local_disk(&self) -> bool {
+        self.skip_local_disk
     }
 }
 
-/// Free-function form of [`OriginRef::stripe_key`], for callers that
+/// Free-function form of [`OriginRef::stripe_key_for_cache`], for callers that
 /// have the parts in hand without an `OriginRef` value. See
-/// [`OriginRef::stripe_key`] for the exact byte layout.
-pub fn stripe_key(backend_id: &str, origin_object_id: &str, stripe_idx: u64) -> StripeKey {
+/// [`OriginRef::stripe_key_for_cache`] for the exact byte layout.
+pub fn stripe_key(cache_id: &str, origin_object_id: &str, stripe_idx: u64) -> StripeKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(cache_id.len() as u64).to_le_bytes());
+    hasher.update(cache_id.as_bytes());
+    hasher.update(&(origin_object_id.len() as u64).to_le_bytes());
+    hasher.update(origin_object_id.as_bytes());
+    hasher.update(&stripe_idx.to_le_bytes());
+    StripeKey(*hasher.finalize().as_bytes())
+}
+
+fn origin_stripe_key(backend_id: &str, origin_object_id: &str, stripe_idx: u64) -> StripeKey {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&(backend_id.len() as u64).to_le_bytes());
     hasher.update(backend_id.as_bytes());
@@ -260,52 +299,56 @@ mod tests {
     #[test]
     fn stripe_key_is_deterministic() {
         let a = OriginRef::new("primary-s3", "models/llama.bin", 12);
-        let b = OriginRef::new("primary-s3", "models/llama.bin", 12);
-        assert_eq!(a.stripe_key(), b.stripe_key());
+        let b = OriginRef::new("secondary-s3", "models/llama.bin", 12);
+        assert_eq!(
+            a.stripe_key_for_cache("cache-a"),
+            b.stripe_key_for_cache("cache-a")
+        );
         // Free function agrees with the method.
         assert_eq!(
-            a.stripe_key(),
-            stripe_key("primary-s3", "models/llama.bin", 12)
+            a.stripe_key_for_cache("cache-a"),
+            stripe_key("cache-a", "models/llama.bin", 12)
         );
     }
 
     #[test]
     fn stripe_key_differs_on_any_field() {
         let base = OriginRef::new("primary-s3", "models/llama.bin", 12);
-        let diff_backend = OriginRef::new("secondary-s3", "models/llama.bin", 12);
+        let diff_cache = OriginRef::new("secondary-s3", "models/llama.bin", 12);
         let diff_object = OriginRef::new("primary-s3", "models/other.bin", 12);
         let diff_idx = OriginRef::new("primary-s3", "models/llama.bin", 13);
 
-        let k = base.stripe_key();
-        assert_ne!(k, diff_backend.stripe_key());
-        assert_ne!(k, diff_object.stripe_key());
-        assert_ne!(k, diff_idx.stripe_key());
+        let k = base.stripe_key_for_cache("cache-a");
+        assert_eq!(k, diff_cache.stripe_key_for_cache("cache-a"));
+        assert_ne!(k, base.stripe_key_for_cache("cache-b"));
+        assert_ne!(k, diff_object.stripe_key_for_cache("cache-a"));
+        assert_ne!(k, diff_idx.stripe_key_for_cache("cache-a"));
     }
 
     #[test]
     fn stripe_key_matches_documented_byte_layout() {
         // Reconstruct the digest by hand from the documented layout:
-        // backend_len_le || backend_id bytes || object_len_le ||
+        // cache_len_le || cache_id bytes || object_len_le ||
         // origin_object_id bytes || idx_le.
-        let backend = "b";
+        let cache = "c";
         let object = "obj";
         let idx: u64 = 0x0102_0304_0506_0708;
 
         let mut expected_input = Vec::new();
-        expected_input.extend_from_slice(&(backend.len() as u64).to_le_bytes());
-        expected_input.extend_from_slice(backend.as_bytes());
+        expected_input.extend_from_slice(&(cache.len() as u64).to_le_bytes());
+        expected_input.extend_from_slice(cache.as_bytes());
         expected_input.extend_from_slice(&(object.len() as u64).to_le_bytes());
         expected_input.extend_from_slice(object.as_bytes());
         expected_input.extend_from_slice(&idx.to_le_bytes());
         let expected = StripeKey(*blake3::hash(&expected_input).as_bytes());
 
-        assert_eq!(stripe_key(backend, object, idx), expected);
+        assert_eq!(stripe_key(cache, object, idx), expected);
     }
 
     #[test]
     fn stripe_key_field_lengths_prevent_collision() {
         // The length prefix on each variable-length field must make
-        // distinct (backend_id, origin_object_id) splits unambiguous:
+        // distinct (cache_id, origin_object_id) splits unambiguous:
         // without it, "ab"+"c" and "a"+"bc" hash the same bytes.
         assert_ne!(stripe_key("ab", "c", 0), stripe_key("a", "bc", 0));
 
@@ -433,6 +476,28 @@ mod tests {
     }
 
     #[test]
+    fn stripe_req_fabric_only_round_trips_through_bincode() {
+        let origin = OriginRef::new("primary-s3", "models/llama.bin", 7);
+        let req = StripeReq::new(origin.stripe_key())
+            .with_origin(origin.clone())
+            .with_fabric_only(true);
+
+        let bytes = bincode::serialize(&req).unwrap();
+        let back: StripeReq = bincode::deserialize(&bytes).unwrap();
+
+        assert!(back.fabric_only());
+        assert_eq!(back.origin(), Some(&origin));
+    }
+
+    #[test]
+    fn stripe_req_fabric_only_defaults_false() {
+        let k = OriginRef::new("primary-s3", "models/llama.bin", 12).stripe_key();
+
+        assert!(!StripeReq::new(k).fabric_only());
+        assert!(!StripeReq::new(k).skip_local_disk());
+    }
+
+    #[test]
     fn stripe_req_bypass_is_not_serialized() {
         // `bypass` is `#[serde(skip)]`: it never crosses the fabric, so
         // a request decoded from the wire is always non-bypass even if
@@ -447,11 +512,24 @@ mod tests {
     }
 
     #[test]
-    fn stripe_req_chain_context_round_trips_through_bincode() {
+    fn stripe_req_skip_local_disk_is_not_serialized() {
+        // `skip_local_disk` is local to the requester: peer handlers must
+        // still read from their own NVMe cache after decoding the request.
+        let origin = OriginRef::new("primary-s3", "models/llama.bin", 7);
+        let req = StripeReq::new(origin.stripe_key())
+            .with_origin(origin)
+            .with_skip_local_disk(true);
+        let bytes = bincode::serialize(&req).unwrap();
+        let back: StripeReq = bincode::deserialize(&bytes).unwrap();
+        assert!(!back.skip_local_disk());
+    }
+
+    #[test]
+    fn stripe_req_cache_context_round_trips_through_bincode() {
         let origin = OriginRef::new("primary-s3", "models/llama.bin", 7);
         let req = StripeReq::new(origin.stripe_key())
             .with_origin(origin.clone())
-            .with_chain(Some("cache-a".to_string()), Some("site-a".to_string()))
+            .with_cache_id(Some("cache-a".to_string()))
             .with_bypass(true);
 
         let bytes = bincode::serialize(&req).unwrap();
@@ -459,7 +537,6 @@ mod tests {
 
         assert_eq!(back.origin(), Some(&origin));
         assert_eq!(back.cache_id(), Some("cache-a"));
-        assert_eq!(back.neighborhood_id(), Some("site-a"));
         assert!(!back.bypass());
     }
 

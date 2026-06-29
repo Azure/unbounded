@@ -5,7 +5,7 @@
 //! consumers.
 //!
 //! The finger table and the `node -> peer` map are derived together
-//! from the active neighborhood projected by the config graph. Three independent
+//! from the active cache keyspace projected by the config graph. Three independent
 //! consumers read them on the hot path:
 //!
 //! * [`crate::p2p::FingerRouter`] (the first-hop lookup wrapped by
@@ -116,18 +116,15 @@ impl RouteTableHandle {
         self.0.load_full()
     }
 
-    pub fn route(&self, neighborhood_id: &str) -> Option<RoutingSnapshot> {
-        self.snapshot().routes.get(neighborhood_id).cloned()
+    pub fn route(&self, route_id: &str) -> Option<RoutingSnapshot> {
+        self.snapshot().routes.get(route_id).cloned()
     }
 
     pub fn route_for_req<R: crate::bufferpool::Req + ?Sized>(
         &self,
         req: &R,
     ) -> Option<RoutingSnapshot> {
-        let route_id = req
-            .neighborhood_id()
-            .map_or(Self::LEGACY_ROUTE_ID, String::as_str);
-        self.route(route_id)
+        self.route(req.cache_id()?.as_str())
     }
 }
 

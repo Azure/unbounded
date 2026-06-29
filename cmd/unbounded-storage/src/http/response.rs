@@ -22,6 +22,8 @@ pub use ::http::StatusCode;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResponseHead<'a> {
     pub status: StatusCode,
+    /// Minor version: `1` for `HTTP/1.1`, `0` for `HTTP/1.0`.
+    pub version_minor: u8,
     /// Byte offset just past the terminating `\r\n\r\n`, i.e. where the
     /// body begins in the source buffer.
     pub header_end: usize,
@@ -44,6 +46,7 @@ impl<'a> ResponseHead<'a> {
                 let headers = headers::collect_headers(resp.headers)?;
                 Ok(Some(ResponseHead {
                     status,
+                    version_minor: resp.version.ok_or(ParseError::BadStatusLine)?,
                     header_end: n,
                     headers,
                 }))
@@ -103,6 +106,7 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\nContent-Type: x\r\n\r\nBODY";
         let head = ResponseHead::parse(raw).unwrap().expect("complete head");
         assert_eq!(head.status, StatusCode::OK);
+        assert_eq!(head.version_minor, 1);
         assert_eq!(head.content_length(), Some(1024));
         assert_eq!(&raw[head.header_end..], b"BODY");
     }

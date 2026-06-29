@@ -95,6 +95,9 @@ type Config struct {
 	// means in-cluster service-account discovery. This is the developer/test
 	// path; in production the run container relies on the in-cluster config.
 	Kubeconfig string
+	// DeviceInventoryURL, when set, is the daemon inventory base URL whose
+	// /rdma and /block paths are published onto this Node for discovery.
+	DeviceInventoryURL string
 	// StorageArgs are extra arguments appended to the daemon ExecStart line.
 	StorageArgs string
 	// Arch is the normalized target architecture ("amd64" or "arm64").
@@ -104,6 +107,9 @@ type Config struct {
 	// Hugepages, when > 0, reserves an explicit number of 2 MiB hugepages
 	// instead of deriving the count from PoolBytes.
 	Hugepages int64
+	// NoHugepages skips the systemd hugepage reservation preflight. Use this
+	// when the daemon config sets startup.memory.no_hugepages.
+	NoHugepages bool
 	// NoEnable, when true, installs the unit but does not enable/start it.
 	NoEnable bool
 
@@ -144,6 +150,7 @@ func LoadConfig() (Config, error) {
 	cfg.NodeName = os.Getenv("NODE_NAME")
 	cfg.StorageRingLabel = envOr("STORAGE_RING_LABEL", defaultStorageRingLabel)
 	cfg.Kubeconfig = os.Getenv("KUBECONFIG")
+	cfg.DeviceInventoryURL = os.Getenv("STORAGE_DEVICE_INVENTORY_URL")
 
 	// SOURCE takes precedence; LOCAL_TARBALL is honored for backward
 	// compatibility with the shell installer when SOURCE is unset.
@@ -155,6 +162,7 @@ func LoadConfig() (Config, error) {
 	cfg.SourceMode = classifySource(cfg.Source)
 
 	cfg.NoEnable = os.Getenv("NO_ENABLE") == "1"
+	cfg.NoHugepages = os.Getenv("NO_HUGEPAGES") == "1"
 
 	if len(cfg.Systemctl) == 0 {
 		return Config{}, fmt.Errorf("SYSTEMCTL must not be empty")

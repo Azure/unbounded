@@ -23,6 +23,7 @@ include!(concat!(env!("OUT_DIR"), "/unbounded.storage.config.rs"));
 
 const DEFAULT_STRIPE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_HTTP_CONCURRENCY: u32 = 64;
+pub const DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION: u32 = 1024;
 const DEFAULT_FAKE_OBJECT_SIZE_BYTES: u64 = 1024 * 1024;
 
 impl Config {
@@ -31,12 +32,14 @@ impl Config {
     /// explicit zero, is left untouched. Run once after load (or after
     /// decoding a protobuf message) before the config is consumed.
     pub fn apply_defaults(&mut self) {
-        for n in &mut self.neighborhoods {
-            n.fingers_per_node.get_or_insert(100);
-        }
+        self.fingers_per_node.get_or_insert(100);
 
         for backend in &mut self.backends {
             backend.apply_defaults();
+        }
+
+        for frontend in &mut self.frontends {
+            frontend.apply_defaults();
         }
 
         let startup = self.startup.get_or_insert_with(StartupCfg::default);
@@ -229,6 +232,13 @@ impl DiskSpec {
 }
 
 impl FrontendSpec {
+    fn apply_defaults(&mut self) {
+        if let Some(frontend_spec::Config::Http(cfg)) = self.config.as_mut() {
+            cfg.max_requests_per_connection
+                .get_or_insert(DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION);
+        }
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match self.config {
             Some(frontend_spec::Config::Http(_)) => "http",
@@ -243,6 +253,15 @@ impl FrontendSpec {
             Some(frontend_spec::Config::Http(cfg)) => Some(cfg.addr.as_str()),
             Some(frontend_spec::Config::S3(cfg)) => Some(cfg.addr.as_str()),
             Some(frontend_spec::Config::Loadgen(_)) | None => None,
+        }
+    }
+
+    pub fn max_requests_per_connection(&self) -> Option<u32> {
+        match self.config.as_ref() {
+            Some(frontend_spec::Config::Http(cfg)) => cfg.max_requests_per_connection,
+            Some(frontend_spec::Config::S3(_)) | Some(frontend_spec::Config::Loadgen(_)) | None => {
+                None
+            }
         }
     }
 }
@@ -286,10 +305,11 @@ mod tests {
         let mut c: Config = toml::from_str("").unwrap();
         c.apply_defaults();
         assert_eq!(c.version, 0);
-        assert!(c.neighborhoods.is_empty());
+        assert!(c.peers.is_empty());
         assert!(c.caches.is_empty());
         assert!(c.backends.is_empty());
         assert!(c.frontends.is_empty());
+        assert_eq!(c.fingers_per_node, Some(100));
     }
 
     #[test]
@@ -360,135 +380,118 @@ addr = "192.168.253.1:49151"
     #[test]
     fn block_disk_config_round_trips() {
         let s = r#"
-[[caches]]
-name = "cache"
-source = "n"
-
-[[caches.disks]]
-[caches.disks.config.block]
+[[disks]]
+[disks.config.block]
 path = "/dev/nvme0n1"
 numa = 1
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.caches[0].disks[0].kind_name(), "block");
-        assert_eq!(c.caches[0].disks[0].path(), Some("/dev/nvme0n1"));
-        assert_eq!(c.caches[0].disks[0].numa(), Some(1));
+        assert_eq!(c.disks[0].kind_name(), "block");
+        assert_eq!(c.disks[0].path(), Some("/dev/nvme0n1"));
+        assert_eq!(c.disks[0].numa(), Some(1));
     }
 
     #[test]
     fn disk_engine_fields_default_to_unset_and_off() {
         let s = r#"
-[[caches]]
-name = "cache"
-source = "n"
-
-[[caches.disks]]
-[caches.disks.config.block]
+[[disks]]
+[disks.config.block]
 path = "/dev/nvme0n1"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.caches[0].disks[0].page_size_bytes, None);
-        assert!(!c.caches[0].disks[0].skip_recovery_scan);
+        assert_eq!(c.disks[0].page_size_bytes, None);
+        assert!(!c.disks[0].skip_recovery_scan);
+        assert!(!c.disks[0].force_format);
+        assert!(!c.disks[0].bypass_admission);
+        assert!(!c.disks[0].bypass_index_read);
+        assert!(!c.disks[0].bypass_checksum);
     }
 
     #[test]
     fn disk_engine_fields_round_trip() {
         let s = r#"
-[[caches]]
-name = "cache"
-source = "n"
-
-[[caches.disks]]
+[[disks]]
 page_size_bytes = 4096
 skip_recovery_scan = true
+force_format = true
+bypass_admission = true
+bypass_index_read = true
+bypass_checksum = true
 
-[caches.disks.config.block]
+[disks.config.block]
 path = "/dev/nvme0n1"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.caches[0].disks[0].page_size_bytes, Some(4096));
-        assert!(c.caches[0].disks[0].skip_recovery_scan);
+        assert_eq!(c.disks[0].page_size_bytes, Some(4096));
+        assert!(c.disks[0].skip_recovery_scan);
+        assert!(c.disks[0].force_format);
+        assert!(c.disks[0].bypass_admission);
+        assert!(c.disks[0].bypass_index_read);
+        assert!(c.disks[0].bypass_checksum);
     }
 
     #[test]
-    fn neighborhood_round_trips() {
+    fn mesh_round_trips() {
         let s = r#"
-[[neighborhoods]]
-name = "n"
-source = "b"
 fingers_per_node = 128
-local_node_id = 42
-local_tags = ["us-west", "az1", "row3", "rack7"]
+self = "node-a"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
-        assert_eq!(c.neighborhoods[0].fingers_per_node, Some(128));
-        assert_eq!(c.neighborhoods[0].local_node_id, Some(42));
+        assert_eq!(c.fingers_per_node, Some(128));
+        assert_eq!(c.self_, "node-a");
+    }
+
+    #[test]
+    fn routing_plan_round_trips() {
+        let s = r#"
+self = "node-a"
+
+[routing_plan]
+fingers = ["node-b", "node-c", "node-d", "node-e"]
+successor = "node-b"
+predecessor = "node-z"
+"#;
+        let mut c: Config = toml::from_str(s).unwrap();
+        c.apply_defaults();
+        let plan = c.routing_plan.as_ref().expect("routing_plan set");
         assert_eq!(
-            c.neighborhoods[0].local_tags,
+            plan.fingers,
             vec![
-                "us-west".to_string(),
-                "az1".to_string(),
-                "row3".to_string(),
-                "rack7".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string(),
+                "node-d".to_string(),
+                "node-e".to_string(),
             ]
         );
+        assert_eq!(plan.successor.as_deref(), Some("node-b"));
+        assert_eq!(plan.predecessor.as_deref(), Some("node-z"));
     }
 
     #[test]
-    fn neighborhood_routing_plan_round_trips() {
-        let s = r#"
-[[neighborhoods]]
-name = "n"
-source = "b"
-local_node_id = 1
-
-[neighborhoods.routing_plan]
-fingers = [2, 5, 9, 17]
-successor = 2
-predecessor = 64
-"#;
-        let mut c: Config = toml::from_str(s).unwrap();
+    fn routing_plan_absent_by_default() {
+        let mut c: Config = toml::from_str("self = \"node-a\"\n").unwrap();
         c.apply_defaults();
-        let plan = c.neighborhoods[0]
-            .routing_plan
-            .as_ref()
-            .expect("routing_plan set");
-        assert_eq!(plan.fingers, vec![2, 5, 9, 17]);
-        assert_eq!(plan.successor, Some(2));
-        assert_eq!(plan.predecessor, Some(64));
-    }
-
-    #[test]
-    fn neighborhood_routing_plan_absent_by_default() {
-        let mut c: Config =
-            toml::from_str("[[neighborhoods]]\nname = \"n\"\nsource = \"b\"\nlocal_node_id = 1\n")
-                .unwrap();
-        c.apply_defaults();
-        assert!(c.neighborhoods[0].routing_plan.is_none());
+        assert!(c.routing_plan.is_none());
     }
 
     #[test]
     fn peer_tags_round_trip() {
         let s = r#"
-[[neighborhoods]]
-name = "n"
-source = "b"
-
-[[neighborhoods.peers]]
-id = 1
+[[peers]]
+name = "node-a"
 tags = ["us-west", "az1", "row3", "rack7"]
 
-[neighborhoods.peers.config.tcp]
+[peers.config.tcp]
 addr = "127.0.0.1:9000"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(
-            c.neighborhoods[0].peers[0].tags,
+            c.peers[0].tags,
             vec![
                 "us-west".to_string(),
                 "az1".to_string(),
@@ -508,6 +511,9 @@ name = "primary-http"
 url = "https://origin.example.com"
 stripe_size_bytes = 8388608
 http_concurrency = 32
+ca_cert_path = "/etc/unbounded-storage/origin-ca.pem"
+client_cert_path = "/etc/unbounded-storage/client.pem"
+client_key_path = "/etc/unbounded-storage/client-key.pem"
 
 [[frontends]]
 name = "workload-http"
@@ -515,6 +521,7 @@ source = "primary-http"
 
 [frontends.config.http]
 addr = "0.0.0.0:9000"
+max_requests_per_connection = 256
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
@@ -526,6 +533,19 @@ addr = "0.0.0.0:9000"
                 assert_eq!(cfg.url, "https://origin.example.com");
                 assert_eq!(cfg.stripe_size_bytes, Some(8 * 1024 * 1024));
                 assert_eq!(cfg.http_concurrency, Some(32));
+                assert_eq!(
+                    cfg.ca_cert_path.as_deref(),
+                    Some("/etc/unbounded-storage/origin-ca.pem")
+                );
+                assert!(!cfg.insecure_skip_verify);
+                assert_eq!(
+                    cfg.client_cert_path.as_deref(),
+                    Some("/etc/unbounded-storage/client.pem")
+                );
+                assert_eq!(
+                    cfg.client_key_path.as_deref(),
+                    Some("/etc/unbounded-storage/client-key.pem")
+                );
             }
             other => panic!("expected http backend config, got {other:?}"),
         }
@@ -534,6 +554,7 @@ addr = "0.0.0.0:9000"
         let f = &c.frontends[0];
         assert_eq!(f.name, "workload-http");
         assert_eq!(f.addr(), Some("0.0.0.0:9000"));
+        assert_eq!(f.max_requests_per_connection(), Some(256));
         assert_eq!(f.source, "primary-http");
     }
 
@@ -542,7 +563,7 @@ addr = "0.0.0.0:9000"
         let s = r#"
 [[caches]]
 name = "cache"
-source = "n"
+source = "backend"
 
 [[frontends]]
 name = "cached-http"
@@ -572,9 +593,31 @@ url = "https://example.com"
             backend_spec::Config::Http(cfg) => {
                 assert_eq!(cfg.stripe_size_bytes, Some(4 * 1024 * 1024));
                 assert_eq!(cfg.http_concurrency, Some(64));
+                assert_eq!(cfg.ca_cert_path, None);
+                assert!(!cfg.insecure_skip_verify);
+                assert_eq!(cfg.client_cert_path, None);
+                assert_eq!(cfg.client_key_path, None);
             }
             other => panic!("expected http backend config, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn http_frontend_optional_fields_default() {
+        let s = r#"
+[[frontends]]
+name = "f"
+source = "b"
+
+[frontends.config.http]
+addr = "0.0.0.0:9000"
+"#;
+        let mut c: Config = toml::from_str(s).unwrap();
+        c.apply_defaults();
+        assert_eq!(
+            c.frontends[0].max_requests_per_connection(),
+            Some(DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION)
+        );
     }
 
     #[test]
@@ -584,12 +627,15 @@ url = "https://example.com"
 name = "primary-s3"
 
 [backends.config.s3]
-url = "s3.us-east-1.amazonaws.com:443"
+url = "https://s3.us-east-1.amazonaws.com:443"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
         assert_eq!(c.backends[0].kind_name(), "s3");
-        assert_eq!(c.backends[0].url(), Some("s3.us-east-1.amazonaws.com:443"));
+        assert_eq!(
+            c.backends[0].url(),
+            Some("https://s3.us-east-1.amazonaws.com:443")
+        );
     }
 
     #[test]
@@ -618,8 +664,10 @@ source = "cache"
 [frontends.config.loadgen]
 workers = 8
 seed = 1234
-object_count = 4096
+keyspace_objects = 4096
+object_size_bytes = 1048576
 read_bytes = 131072
+zipf_exponent = 1.2
 verify = true
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
@@ -636,8 +684,10 @@ verify = true
         };
         assert_eq!(loadgen.workers, Some(8));
         assert_eq!(loadgen.seed, Some(1234));
-        assert_eq!(loadgen.object_count, Some(4096));
+        assert_eq!(loadgen.keyspace_objects, Some(4096));
+        assert_eq!(loadgen.object_size_bytes, Some(1024 * 1024));
         assert_eq!(loadgen.read_bytes, Some(128 * 1024));
+        assert_eq!(loadgen.zipf_exponent, Some(1.2));
         assert!(loadgen.verify);
     }
 

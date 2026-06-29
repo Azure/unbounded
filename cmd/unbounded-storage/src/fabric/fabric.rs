@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
+use std::net::SocketAddr;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -25,9 +26,9 @@ use super::backing::LocalMrCtx;
 use super::cm;
 use super::completion::CompletionRegistry;
 use super::config::{FabricConfig, Provider};
-use super::connection::{ConnectionTable, Dialer, install_connection};
+use super::connection::{install_connection, ConnectionTable, Dialer};
 use super::dispatch::InboundDispatch;
-use super::error::{FabricError, Result, check};
+use super::error::{check, FabricError, Result};
 use super::ffi;
 use super::progress::ProgressGroup;
 use super::sendpool::SendPool;
@@ -179,6 +180,14 @@ impl Fabric {
                         if rc != 0 {
                             return Err(FabricError::Pkg("ub_fi_hints_set_src_addr", rc));
                         }
+                        (None, None)
+                    } else if matches!(cfg.provider, Provider::Verbs)
+                        && is_unspecified_ephemeral_socket(addr)
+                    {
+                        // Auto-RDMA on InfiniBand HCAs has no netdev-backed
+                        // IP address to bind. Passing NULL node/service lets
+                        // verbs pick a native AF_IB source address, which is
+                        // what peers can dial through RDMA-CM.
                         (None, None)
                     } else {
                         let (host, port) = addr.rsplit_once(':').ok_or(FabricError::BadConfig(
@@ -655,6 +664,11 @@ impl FabricInner {
     }
 }
 
+fn is_unspecified_ephemeral_socket(addr: &str) -> bool {
+    addr.parse::<SocketAddr>()
+        .is_ok_and(|addr| addr.ip().is_unspecified() && addr.port() == 0)
+}
+
 impl Drop for FabricInner {
     fn drop(&mut self) {
         // Stop accepting first so no new connection/CQ appears mid-teardown.
@@ -793,6 +807,15 @@ mod tests {
     #[test]
     fn thread_safe_value_is_fi_thread_safe() {
         assert_eq!(unsafe { ffi::ub_fi_thread_safe_value() }, 1);
+    }
+
+    #[test]
+    fn unspecified_ephemeral_socket_detects_auto_rdma_bind() {
+        assert!(is_unspecified_ephemeral_socket("0.0.0.0:0"));
+        assert!(is_unspecified_ephemeral_socket("[::]:0"));
+        assert!(!is_unspecified_ephemeral_socket("0.0.0.0:1"));
+        assert!(!is_unspecified_ephemeral_socket("127.0.0.1:0"));
+        assert!(!is_unspecified_ephemeral_socket("hex:001122"));
     }
 
     #[test]

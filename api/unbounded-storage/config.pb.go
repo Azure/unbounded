@@ -29,11 +29,22 @@ type Config struct {
 	// Operator-assigned opaque version tracked so operators can confirm which config has been applied. 0 means unversioned.
 	Version uint64 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
 	// Startup options are only read once during initialization.
-	Startup       *StartupCfg         `protobuf:"bytes,2,opt,name=startup,proto3" json:"startup,omitempty"`
-	Frontends     []*FrontendSpec     `protobuf:"bytes,3,rep,name=frontends,proto3" json:"frontends,omitempty"`
-	Backends      []*BackendSpec      `protobuf:"bytes,4,rep,name=backends,proto3" json:"backends,omitempty"`
-	Caches        []*CacheSpec        `protobuf:"bytes,5,rep,name=caches,proto3" json:"caches,omitempty"`
-	Neighborhoods []*NeighborhoodSpec `protobuf:"bytes,6,rep,name=neighborhoods,proto3" json:"neighborhoods,omitempty"`
+	Startup   *StartupCfg     `protobuf:"bytes,2,opt,name=startup,proto3" json:"startup,omitempty"`
+	Frontends []*FrontendSpec `protobuf:"bytes,3,rep,name=frontends,proto3" json:"frontends,omitempty"`
+	Backends  []*BackendSpec  `protobuf:"bytes,4,rep,name=backends,proto3" json:"backends,omitempty"`
+	Caches    []*CacheSpec    `protobuf:"bytes,5,rep,name=caches,proto3" json:"caches,omitempty"`
+	Disks     []*DiskSpec     `protobuf:"bytes,6,rep,name=disks,proto3" json:"disks,omitempty"`
+	// Number of deterministic finger-table entries to derive per peer. Defaults to 100 when unset.
+	FingersPerNode *uint32 `protobuf:"varint,7,opt,name=fingers_per_node,json=fingersPerNode,proto3,oneof" json:"fingers_per_node,omitempty"`
+	// Name of this process in the `peers` roster. Required when peers or a
+	// routing plan are configured. The internal ring and fabric ids are derived
+	// from this peer name and are startup-fixed.
+	Self string `protobuf:"bytes,8,opt,name=self,proto3" json:"self,omitempty"`
+	// Precomputed routing table for this process. When set, `peers` can be
+	// sparse, containing only this process's routing neighbors.
+	RoutingPlan *RoutingPlan `protobuf:"bytes,9,opt,name=routing_plan,json=routingPlan,proto3,oneof" json:"routing_plan,omitempty"`
+	// Process-wide peer definitions for the globally shared transport mesh.
+	Peers         []*PeerSpec `protobuf:"bytes,10,rep,name=peers,proto3" json:"peers,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -103,11 +114,364 @@ func (x *Config) GetCaches() []*CacheSpec {
 	return nil
 }
 
-func (x *Config) GetNeighborhoods() []*NeighborhoodSpec {
+func (x *Config) GetDisks() []*DiskSpec {
 	if x != nil {
-		return x.Neighborhoods
+		return x.Disks
 	}
 	return nil
+}
+
+func (x *Config) GetFingersPerNode() uint32 {
+	if x != nil && x.FingersPerNode != nil {
+		return *x.FingersPerNode
+	}
+	return 0
+}
+
+func (x *Config) GetSelf() string {
+	if x != nil {
+		return x.Self
+	}
+	return ""
+}
+
+func (x *Config) GetRoutingPlan() *RoutingPlan {
+	if x != nil {
+		return x.RoutingPlan
+	}
+	return nil
+}
+
+func (x *Config) GetPeers() []*PeerSpec {
+	if x != nil {
+		return x.Peers
+	}
+	return nil
+}
+
+// A precomputed routing table for a single node, produced by a
+// global-view planner. All names reference `PeerSpec.name` values in the
+// `peers` list (each must be present so a fabric connection exists). Ring
+// positions are derived from names, and tags do not affect runtime routing, so
+// only names are carried here.
+type RoutingPlan struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Peer names selected for this routing plan.
+	Fingers []string `protobuf:"bytes,1,rep,name=fingers,proto3" json:"fingers,omitempty"`
+	// Peer name of the nearest-forward neighbor on the ring.
+	Successor *string `protobuf:"bytes,2,opt,name=successor,proto3,oneof" json:"successor,omitempty"`
+	// Peer name of the nearest-backward neighbor on the ring.
+	Predecessor   *string `protobuf:"bytes,3,opt,name=predecessor,proto3,oneof" json:"predecessor,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RoutingPlan) Reset() {
+	*x = RoutingPlan{}
+	mi := &file_config_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RoutingPlan) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RoutingPlan) ProtoMessage() {}
+
+func (x *RoutingPlan) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RoutingPlan.ProtoReflect.Descriptor instead.
+func (*RoutingPlan) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *RoutingPlan) GetFingers() []string {
+	if x != nil {
+		return x.Fingers
+	}
+	return nil
+}
+
+func (x *RoutingPlan) GetSuccessor() string {
+	if x != nil && x.Successor != nil {
+		return *x.Successor
+	}
+	return ""
+}
+
+func (x *RoutingPlan) GetPredecessor() string {
+	if x != nil && x.Predecessor != nil {
+		return *x.Predecessor
+	}
+	return ""
+}
+
+type PeerSpec struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Stable peer name. The process-wide fabric peer id, ring position, and route
+	// references are derived from this name.
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Peer tags used by placement-aware planning.
+	Tags []string `protobuf:"bytes,2,rep,name=tags,proto3" json:"tags,omitempty"`
+	// Types that are valid to be assigned to Config:
+	//
+	//	*PeerSpec_Tcp
+	//	*PeerSpec_Rdma
+	Config        isPeerSpec_Config `protobuf_oneof:"config"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PeerSpec) Reset() {
+	*x = PeerSpec{}
+	mi := &file_config_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PeerSpec) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PeerSpec) ProtoMessage() {}
+
+func (x *PeerSpec) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PeerSpec.ProtoReflect.Descriptor instead.
+func (*PeerSpec) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *PeerSpec) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *PeerSpec) GetTags() []string {
+	if x != nil {
+		return x.Tags
+	}
+	return nil
+}
+
+func (x *PeerSpec) GetConfig() isPeerSpec_Config {
+	if x != nil {
+		return x.Config
+	}
+	return nil
+}
+
+func (x *PeerSpec) GetTcp() *TcpPeerConfig {
+	if x != nil {
+		if x, ok := x.Config.(*PeerSpec_Tcp); ok {
+			return x.Tcp
+		}
+	}
+	return nil
+}
+
+func (x *PeerSpec) GetRdma() *RdmaPeerConfig {
+	if x != nil {
+		if x, ok := x.Config.(*PeerSpec_Rdma); ok {
+			return x.Rdma
+		}
+	}
+	return nil
+}
+
+type isPeerSpec_Config interface {
+	isPeerSpec_Config()
+}
+
+type PeerSpec_Tcp struct {
+	Tcp *TcpPeerConfig `protobuf:"bytes,3,opt,name=tcp,proto3,oneof"`
+}
+
+type PeerSpec_Rdma struct {
+	Rdma *RdmaPeerConfig `protobuf:"bytes,4,opt,name=rdma,proto3,oneof"`
+}
+
+func (*PeerSpec_Tcp) isPeerSpec_Config() {}
+
+func (*PeerSpec_Rdma) isPeerSpec_Config() {}
+
+type TcpPeerConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// TCP socket address used as this peer's fabric wire address.
+	Addr          string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TcpPeerConfig) Reset() {
+	*x = TcpPeerConfig{}
+	mi := &file_config_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TcpPeerConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TcpPeerConfig) ProtoMessage() {}
+
+func (x *TcpPeerConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TcpPeerConfig.ProtoReflect.Descriptor instead.
+func (*TcpPeerConfig) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *TcpPeerConfig) GetAddr() string {
+	if x != nil {
+		return x.Addr
+	}
+	return ""
+}
+
+type RdmaPeerConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Default RDMA fabric address. Provider-native addresses are encoded as
+	// "hex:<fi_getname-bytes>"; RDMA-CM socket addresses are accepted when the
+	// provider reports them.
+	Addr string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	// Ordered RDMA fabric addresses for peers that expose multiple fabric units,
+	// such as one endpoint per HCA. The daemon dials the address whose index
+	// matches the local fabric unit index, falling back to addr when absent.
+	Addrs         []string `protobuf:"bytes,2,rep,name=addrs,proto3" json:"addrs,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RdmaPeerConfig) Reset() {
+	*x = RdmaPeerConfig{}
+	mi := &file_config_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RdmaPeerConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RdmaPeerConfig) ProtoMessage() {}
+
+func (x *RdmaPeerConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RdmaPeerConfig.ProtoReflect.Descriptor instead.
+func (*RdmaPeerConfig) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *RdmaPeerConfig) GetAddr() string {
+	if x != nil {
+		return x.Addr
+	}
+	return ""
+}
+
+func (x *RdmaPeerConfig) GetAddrs() []string {
+	if x != nil {
+		return x.Addrs
+	}
+	return nil
+}
+
+type CacheSpec struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Backend source used for miss fills. Cache name is the only logical keyspace prefix.
+	Source        string `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CacheSpec) Reset() {
+	*x = CacheSpec{}
+	mi := &file_config_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CacheSpec) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CacheSpec) ProtoMessage() {}
+
+func (x *CacheSpec) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CacheSpec.ProtoReflect.Descriptor instead.
+func (*CacheSpec) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *CacheSpec) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *CacheSpec) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
 }
 
 type StartupCfg struct {
@@ -122,7 +486,7 @@ type StartupCfg struct {
 
 func (x *StartupCfg) Reset() {
 	*x = StartupCfg{}
-	mi := &file_config_proto_msgTypes[1]
+	mi := &file_config_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -134,7 +498,7 @@ func (x *StartupCfg) String() string {
 func (*StartupCfg) ProtoMessage() {}
 
 func (x *StartupCfg) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[1]
+	mi := &file_config_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -147,7 +511,7 @@ func (x *StartupCfg) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartupCfg.ProtoReflect.Descriptor instead.
 func (*StartupCfg) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{1}
+	return file_config_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *StartupCfg) GetMemory() *MemoryCfg {
@@ -188,7 +552,7 @@ type MetricsCfg struct {
 
 func (x *MetricsCfg) Reset() {
 	*x = MetricsCfg{}
-	mi := &file_config_proto_msgTypes[2]
+	mi := &file_config_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -200,7 +564,7 @@ func (x *MetricsCfg) String() string {
 func (*MetricsCfg) ProtoMessage() {}
 
 func (x *MetricsCfg) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[2]
+	mi := &file_config_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -213,7 +577,7 @@ func (x *MetricsCfg) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetricsCfg.ProtoReflect.Descriptor instead.
 func (*MetricsCfg) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{2}
+	return file_config_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *MetricsCfg) GetAddr() string {
@@ -235,7 +599,7 @@ type MemoryCfg struct {
 
 func (x *MemoryCfg) Reset() {
 	*x = MemoryCfg{}
-	mi := &file_config_proto_msgTypes[3]
+	mi := &file_config_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -247,7 +611,7 @@ func (x *MemoryCfg) String() string {
 func (*MemoryCfg) ProtoMessage() {}
 
 func (x *MemoryCfg) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[3]
+	mi := &file_config_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -260,7 +624,7 @@ func (x *MemoryCfg) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MemoryCfg.ProtoReflect.Descriptor instead.
 func (*MemoryCfg) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{3}
+	return file_config_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *MemoryCfg) GetNoHugepages() bool {
@@ -299,7 +663,7 @@ type FabricCfg struct {
 
 func (x *FabricCfg) Reset() {
 	*x = FabricCfg{}
-	mi := &file_config_proto_msgTypes[4]
+	mi := &file_config_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -311,7 +675,7 @@ func (x *FabricCfg) String() string {
 func (*FabricCfg) ProtoMessage() {}
 
 func (x *FabricCfg) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[4]
+	mi := &file_config_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -324,7 +688,7 @@ func (x *FabricCfg) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FabricCfg.ProtoReflect.Descriptor instead.
 func (*FabricCfg) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{4}
+	return file_config_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *FabricCfg) GetBinds() isFabricCfg_Binds {
@@ -420,7 +784,7 @@ type TcpFabricBinds struct {
 
 func (x *TcpFabricBinds) Reset() {
 	*x = TcpFabricBinds{}
-	mi := &file_config_proto_msgTypes[5]
+	mi := &file_config_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -432,7 +796,7 @@ func (x *TcpFabricBinds) String() string {
 func (*TcpFabricBinds) ProtoMessage() {}
 
 func (x *TcpFabricBinds) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[5]
+	mi := &file_config_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -445,7 +809,7 @@ func (x *TcpFabricBinds) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TcpFabricBinds.ProtoReflect.Descriptor instead.
 func (*TcpFabricBinds) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{5}
+	return file_config_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *TcpFabricBinds) GetAddr() string {
@@ -464,7 +828,7 @@ type RdmaFabricBinds struct {
 
 func (x *RdmaFabricBinds) Reset() {
 	*x = RdmaFabricBinds{}
-	mi := &file_config_proto_msgTypes[6]
+	mi := &file_config_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -476,7 +840,7 @@ func (x *RdmaFabricBinds) String() string {
 func (*RdmaFabricBinds) ProtoMessage() {}
 
 func (x *RdmaFabricBinds) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[6]
+	mi := &file_config_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -489,7 +853,7 @@ func (x *RdmaFabricBinds) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RdmaFabricBinds.ProtoReflect.Descriptor instead.
 func (*RdmaFabricBinds) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{6}
+	return file_config_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *RdmaFabricBinds) GetBinds() []*RdmaFabricBind {
@@ -511,7 +875,7 @@ type AutoRdmaFabricBinds struct {
 
 func (x *AutoRdmaFabricBinds) Reset() {
 	*x = AutoRdmaFabricBinds{}
-	mi := &file_config_proto_msgTypes[7]
+	mi := &file_config_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -523,7 +887,7 @@ func (x *AutoRdmaFabricBinds) String() string {
 func (*AutoRdmaFabricBinds) ProtoMessage() {}
 
 func (x *AutoRdmaFabricBinds) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[7]
+	mi := &file_config_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -536,7 +900,7 @@ func (x *AutoRdmaFabricBinds) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AutoRdmaFabricBinds.ProtoReflect.Descriptor instead.
 func (*AutoRdmaFabricBinds) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{7}
+	return file_config_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *AutoRdmaFabricBinds) GetHcasPerNumaNode() uint64 {
@@ -556,7 +920,7 @@ type RdmaFabricBind struct {
 
 func (x *RdmaFabricBind) Reset() {
 	*x = RdmaFabricBind{}
-	mi := &file_config_proto_msgTypes[8]
+	mi := &file_config_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -568,7 +932,7 @@ func (x *RdmaFabricBind) String() string {
 func (*RdmaFabricBind) ProtoMessage() {}
 
 func (x *RdmaFabricBind) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[8]
+	mi := &file_config_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -581,7 +945,7 @@ func (x *RdmaFabricBind) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RdmaFabricBind.ProtoReflect.Descriptor instead.
 func (*RdmaFabricBind) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{8}
+	return file_config_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *RdmaFabricBind) GetAddr() string {
@@ -619,7 +983,7 @@ type TopologyCfg struct {
 
 func (x *TopologyCfg) Reset() {
 	*x = TopologyCfg{}
-	mi := &file_config_proto_msgTypes[9]
+	mi := &file_config_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -631,7 +995,7 @@ func (x *TopologyCfg) String() string {
 func (*TopologyCfg) ProtoMessage() {}
 
 func (x *TopologyCfg) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[9]
+	mi := &file_config_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -644,7 +1008,7 @@ func (x *TopologyCfg) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TopologyCfg.ProtoReflect.Descriptor instead.
 func (*TopologyCfg) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{9}
+	return file_config_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *TopologyCfg) GetUseSmtSiblings() bool {
@@ -696,428 +1060,6 @@ func (x *TopologyCfg) GetNicWorkers() uint64 {
 	return 0
 }
 
-type NeighborhoodSpec struct {
-	state  protoimpl.MessageState `protogen:"open.v1"`
-	Name   string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Source string                 `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
-	// Number of deterministic finger-table entries to derive per node. Defaults to 100 when unset.
-	FingersPerNode *uint32 `protobuf:"varint,3,opt,name=fingers_per_node,json=fingersPerNode,proto3,oneof" json:"fingers_per_node,omitempty"`
-	// Local node id on the P2P ring and process-wide fabric peer id; required when
-	// peers are configured, shared by every neighborhood when set, and must not
-	// match any peer id.
-	LocalNodeId *uint64 `protobuf:"varint,4,opt,name=local_node_id,json=localNodeId,proto3,oneof" json:"local_node_id,omitempty"`
-	// Local tags used by placement-aware planning.
-	LocalTags []string `protobuf:"bytes,5,rep,name=local_tags,json=localTags,proto3" json:"local_tags,omitempty"`
-	// Precomputed routing table that replaces automatic finger-table derivation when set.
-	// When set, `peers` can be "sparse"; containing only this process's neighbors.
-	RoutingPlan *RoutingPlan `protobuf:"bytes,6,opt,name=routing_plan,json=routingPlan,proto3,oneof" json:"routing_plan,omitempty"`
-	// Peer definitions available to this neighborhood. Peer ids are process-wide
-	// fabric peer ids; repeating an id across neighborhoods requires the same
-	// peer data.
-	Peers         []*PeerSpec `protobuf:"bytes,7,rep,name=peers,proto3" json:"peers,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *NeighborhoodSpec) Reset() {
-	*x = NeighborhoodSpec{}
-	mi := &file_config_proto_msgTypes[10]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *NeighborhoodSpec) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*NeighborhoodSpec) ProtoMessage() {}
-
-func (x *NeighborhoodSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[10]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use NeighborhoodSpec.ProtoReflect.Descriptor instead.
-func (*NeighborhoodSpec) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{10}
-}
-
-func (x *NeighborhoodSpec) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
-func (x *NeighborhoodSpec) GetSource() string {
-	if x != nil {
-		return x.Source
-	}
-	return ""
-}
-
-func (x *NeighborhoodSpec) GetFingersPerNode() uint32 {
-	if x != nil && x.FingersPerNode != nil {
-		return *x.FingersPerNode
-	}
-	return 0
-}
-
-func (x *NeighborhoodSpec) GetLocalNodeId() uint64 {
-	if x != nil && x.LocalNodeId != nil {
-		return *x.LocalNodeId
-	}
-	return 0
-}
-
-func (x *NeighborhoodSpec) GetLocalTags() []string {
-	if x != nil {
-		return x.LocalTags
-	}
-	return nil
-}
-
-func (x *NeighborhoodSpec) GetRoutingPlan() *RoutingPlan {
-	if x != nil {
-		return x.RoutingPlan
-	}
-	return nil
-}
-
-func (x *NeighborhoodSpec) GetPeers() []*PeerSpec {
-	if x != nil {
-		return x.Peers
-	}
-	return nil
-}
-
-// A precomputed routing table for a single node, produced by a
-// global-view planner. All ids reference `PeerSpec.id` values in the
-// `peers` list (each must be present so a fabric connection exists).
-// Ring positions are derived from ids, and tags do not affect runtime
-// routing, so only ids are carried here.
-type RoutingPlan struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Peer ids selected for this routing plan.
-	Fingers []uint64 `protobuf:"varint,1,rep,packed,name=fingers,proto3" json:"fingers,omitempty"`
-	// Peer id of the nearest-forward neighbor on the ring.
-	Successor *uint64 `protobuf:"varint,2,opt,name=successor,proto3,oneof" json:"successor,omitempty"`
-	// Peer id of the nearest-backward neighbor on the ring.
-	Predecessor   *uint64 `protobuf:"varint,3,opt,name=predecessor,proto3,oneof" json:"predecessor,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *RoutingPlan) Reset() {
-	*x = RoutingPlan{}
-	mi := &file_config_proto_msgTypes[11]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *RoutingPlan) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*RoutingPlan) ProtoMessage() {}
-
-func (x *RoutingPlan) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[11]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use RoutingPlan.ProtoReflect.Descriptor instead.
-func (*RoutingPlan) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{11}
-}
-
-func (x *RoutingPlan) GetFingers() []uint64 {
-	if x != nil {
-		return x.Fingers
-	}
-	return nil
-}
-
-func (x *RoutingPlan) GetSuccessor() uint64 {
-	if x != nil && x.Successor != nil {
-		return *x.Successor
-	}
-	return 0
-}
-
-func (x *RoutingPlan) GetPredecessor() uint64 {
-	if x != nil && x.Predecessor != nil {
-		return *x.Predecessor
-	}
-	return 0
-}
-
-type PeerSpec struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Process-wide fabric peer id, also used for this neighborhood's ring
-	// position and route references.
-	Id uint64 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
-	// Peer tags used by placement-aware planning.
-	Tags []string `protobuf:"bytes,2,rep,name=tags,proto3" json:"tags,omitempty"`
-	// Types that are valid to be assigned to Config:
-	//
-	//	*PeerSpec_Tcp
-	//	*PeerSpec_Rdma
-	Config        isPeerSpec_Config `protobuf_oneof:"config"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *PeerSpec) Reset() {
-	*x = PeerSpec{}
-	mi := &file_config_proto_msgTypes[12]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *PeerSpec) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*PeerSpec) ProtoMessage() {}
-
-func (x *PeerSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[12]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use PeerSpec.ProtoReflect.Descriptor instead.
-func (*PeerSpec) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{12}
-}
-
-func (x *PeerSpec) GetId() uint64 {
-	if x != nil {
-		return x.Id
-	}
-	return 0
-}
-
-func (x *PeerSpec) GetTags() []string {
-	if x != nil {
-		return x.Tags
-	}
-	return nil
-}
-
-func (x *PeerSpec) GetConfig() isPeerSpec_Config {
-	if x != nil {
-		return x.Config
-	}
-	return nil
-}
-
-func (x *PeerSpec) GetTcp() *TcpPeerConfig {
-	if x != nil {
-		if x, ok := x.Config.(*PeerSpec_Tcp); ok {
-			return x.Tcp
-		}
-	}
-	return nil
-}
-
-func (x *PeerSpec) GetRdma() *RdmaPeerConfig {
-	if x != nil {
-		if x, ok := x.Config.(*PeerSpec_Rdma); ok {
-			return x.Rdma
-		}
-	}
-	return nil
-}
-
-type isPeerSpec_Config interface {
-	isPeerSpec_Config()
-}
-
-type PeerSpec_Tcp struct {
-	Tcp *TcpPeerConfig `protobuf:"bytes,3,opt,name=tcp,proto3,oneof"`
-}
-
-type PeerSpec_Rdma struct {
-	Rdma *RdmaPeerConfig `protobuf:"bytes,4,opt,name=rdma,proto3,oneof"`
-}
-
-func (*PeerSpec_Tcp) isPeerSpec_Config() {}
-
-func (*PeerSpec_Rdma) isPeerSpec_Config() {}
-
-type TcpPeerConfig struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// TCP socket address used as this peer's fabric wire address.
-	Addr          string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *TcpPeerConfig) Reset() {
-	*x = TcpPeerConfig{}
-	mi := &file_config_proto_msgTypes[13]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *TcpPeerConfig) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*TcpPeerConfig) ProtoMessage() {}
-
-func (x *TcpPeerConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[13]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use TcpPeerConfig.ProtoReflect.Descriptor instead.
-func (*TcpPeerConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{13}
-}
-
-func (x *TcpPeerConfig) GetAddr() string {
-	if x != nil {
-		return x.Addr
-	}
-	return ""
-}
-
-type RdmaPeerConfig struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Provider-native RDMA fabric address encoded as "hex:<fi_getname-bytes>".
-	Addr          string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *RdmaPeerConfig) Reset() {
-	*x = RdmaPeerConfig{}
-	mi := &file_config_proto_msgTypes[14]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *RdmaPeerConfig) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*RdmaPeerConfig) ProtoMessage() {}
-
-func (x *RdmaPeerConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[14]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use RdmaPeerConfig.ProtoReflect.Descriptor instead.
-func (*RdmaPeerConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{14}
-}
-
-func (x *RdmaPeerConfig) GetAddr() string {
-	if x != nil {
-		return x.Addr
-	}
-	return ""
-}
-
-type CacheSpec struct {
-	state  protoimpl.MessageState `protogen:"open.v1"`
-	Name   string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Source string                 `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
-	// Disk definitions attached to this cache.
-	Disks         []*DiskSpec `protobuf:"bytes,3,rep,name=disks,proto3" json:"disks,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *CacheSpec) Reset() {
-	*x = CacheSpec{}
-	mi := &file_config_proto_msgTypes[15]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *CacheSpec) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*CacheSpec) ProtoMessage() {}
-
-func (x *CacheSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[15]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use CacheSpec.ProtoReflect.Descriptor instead.
-func (*CacheSpec) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{15}
-}
-
-func (x *CacheSpec) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
-func (x *CacheSpec) GetSource() string {
-	if x != nil {
-		return x.Source
-	}
-	return ""
-}
-
-func (x *CacheSpec) GetDisks() []*DiskSpec {
-	if x != nil {
-		return x.Disks
-	}
-	return nil
-}
-
 type DiskSpec struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Optional io_uring queue depth override for this disk.
@@ -1126,6 +1068,22 @@ type DiskSpec struct {
 	PageSizeBytes *uint64 `protobuf:"varint,2,opt,name=page_size_bytes,json=pageSizeBytes,proto3,oneof" json:"page_size_bytes,omitempty"`
 	// Skips the recovery scan when no metadata page is valid; intended only for fresh or benchmark disks.
 	SkipRecoveryScan bool `protobuf:"varint,3,opt,name=skip_recovery_scan,json=skipRecoveryScan,proto3" json:"skip_recovery_scan,omitempty"`
+	// Destructively resets the cache index on open, ignoring any existing on-disk metadata.
+	// Intended only for benchmark cache devices that are safe to reformat between runs.
+	ForceFormat bool `protobuf:"varint,4,opt,name=force_format,json=forceFormat,proto3" json:"force_format,omitempty"`
+	// Admit every write into the cache index instead of requiring the default
+	// second touch. Intended for benchmark warmups that must prefill NVMe devices
+	// with a cold synthetic keyspace.
+	BypassAdmission bool `protobuf:"varint,5,opt,name=bypass_admission,json=bypassAdmission,proto3" json:"bypass_admission,omitempty"`
+	// Serve reads from the committed in-memory index mirror instead of reading
+	// the terminal btree leaf from disk. Intended only for benchmark devices
+	// where recovery/corruption validation has been deliberately traded for
+	// measuring the data-page path.
+	BypassIndexRead bool `protobuf:"varint,6,opt,name=bypass_index_read,json=bypassIndexRead,proto3" json:"bypass_index_read,omitempty"`
+	// Skip data checksum validation on reads. Intended only for benchmark
+	// devices where cache contents were just populated by the same daemon and
+	// the target is measuring the NVMe data path rather than CPU checksum cost.
+	BypassChecksum bool `protobuf:"varint,7,opt,name=bypass_checksum,json=bypassChecksum,proto3" json:"bypass_checksum,omitempty"`
 	// Types that are valid to be assigned to Config:
 	//
 	//	*DiskSpec_Block
@@ -1137,7 +1095,7 @@ type DiskSpec struct {
 
 func (x *DiskSpec) Reset() {
 	*x = DiskSpec{}
-	mi := &file_config_proto_msgTypes[16]
+	mi := &file_config_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1149,7 +1107,7 @@ func (x *DiskSpec) String() string {
 func (*DiskSpec) ProtoMessage() {}
 
 func (x *DiskSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[16]
+	mi := &file_config_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1162,7 +1120,7 @@ func (x *DiskSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiskSpec.ProtoReflect.Descriptor instead.
 func (*DiskSpec) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{16}
+	return file_config_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *DiskSpec) GetQueueDepth() uint32 {
@@ -1182,6 +1140,34 @@ func (x *DiskSpec) GetPageSizeBytes() uint64 {
 func (x *DiskSpec) GetSkipRecoveryScan() bool {
 	if x != nil {
 		return x.SkipRecoveryScan
+	}
+	return false
+}
+
+func (x *DiskSpec) GetForceFormat() bool {
+	if x != nil {
+		return x.ForceFormat
+	}
+	return false
+}
+
+func (x *DiskSpec) GetBypassAdmission() bool {
+	if x != nil {
+		return x.BypassAdmission
+	}
+	return false
+}
+
+func (x *DiskSpec) GetBypassIndexRead() bool {
+	if x != nil {
+		return x.BypassIndexRead
+	}
+	return false
+}
+
+func (x *DiskSpec) GetBypassChecksum() bool {
+	if x != nil {
+		return x.BypassChecksum
 	}
 	return false
 }
@@ -1216,11 +1202,11 @@ type isDiskSpec_Config interface {
 }
 
 type DiskSpec_Block struct {
-	Block *BlockDiskConfig `protobuf:"bytes,4,opt,name=block,proto3,oneof"`
+	Block *BlockDiskConfig `protobuf:"bytes,8,opt,name=block,proto3,oneof"`
 }
 
 type DiskSpec_File struct {
-	File *FileDiskConfig `protobuf:"bytes,5,opt,name=file,proto3,oneof"`
+	File *FileDiskConfig `protobuf:"bytes,9,opt,name=file,proto3,oneof"`
 }
 
 func (*DiskSpec_Block) isDiskSpec_Config() {}
@@ -1231,7 +1217,7 @@ type BlockDiskConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Optional NUMA node hint used when placing storage work for this block device.
 	Numa *uint32 `protobuf:"varint,1,opt,name=numa,proto3,oneof" json:"numa,omitempty"`
-	// Block device path; paths must be unique across all caches.
+	// Block device path; paths must be unique across all disks.
 	Path          string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1239,7 +1225,7 @@ type BlockDiskConfig struct {
 
 func (x *BlockDiskConfig) Reset() {
 	*x = BlockDiskConfig{}
-	mi := &file_config_proto_msgTypes[17]
+	mi := &file_config_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1251,7 +1237,7 @@ func (x *BlockDiskConfig) String() string {
 func (*BlockDiskConfig) ProtoMessage() {}
 
 func (x *BlockDiskConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[17]
+	mi := &file_config_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1264,7 +1250,7 @@ func (x *BlockDiskConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BlockDiskConfig.ProtoReflect.Descriptor instead.
 func (*BlockDiskConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{17}
+	return file_config_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *BlockDiskConfig) GetNuma() uint32 {
@@ -1285,7 +1271,7 @@ type FileDiskConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Required file-backed disk capacity in bytes; the file is provisioned to this size before opening.
 	Size *uint64 `protobuf:"varint,1,opt,name=size,proto3,oneof" json:"size,omitempty"`
-	// Backing-file path; paths must be unique across all caches.
+	// Backing-file path; paths must be unique across all disks.
 	Path          string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1293,7 +1279,7 @@ type FileDiskConfig struct {
 
 func (x *FileDiskConfig) Reset() {
 	*x = FileDiskConfig{}
-	mi := &file_config_proto_msgTypes[18]
+	mi := &file_config_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1305,7 +1291,7 @@ func (x *FileDiskConfig) String() string {
 func (*FileDiskConfig) ProtoMessage() {}
 
 func (x *FileDiskConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[18]
+	mi := &file_config_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1318,7 +1304,7 @@ func (x *FileDiskConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FileDiskConfig.ProtoReflect.Descriptor instead.
 func (*FileDiskConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{18}
+	return file_config_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *FileDiskConfig) GetSize() uint64 {
@@ -1351,7 +1337,7 @@ type BackendSpec struct {
 
 func (x *BackendSpec) Reset() {
 	*x = BackendSpec{}
-	mi := &file_config_proto_msgTypes[19]
+	mi := &file_config_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1363,7 +1349,7 @@ func (x *BackendSpec) String() string {
 func (*BackendSpec) ProtoMessage() {}
 
 func (x *BackendSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[19]
+	mi := &file_config_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1376,7 +1362,7 @@ func (x *BackendSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackendSpec.ProtoReflect.Descriptor instead.
 func (*BackendSpec) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{19}
+	return file_config_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *BackendSpec) GetName() string {
@@ -1459,20 +1445,30 @@ func (*BackendSpec_Fake) isBackendSpec_Config() {}
 
 type HttpBackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+	// Origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses plaintext;
+	// `https://` uses TLS with kTLS receive offload.
 	Url string `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
 	// Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
 	// Must be a power of two.
 	StripeSizeBytes *uint64 `protobuf:"varint,2,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
 	// Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
 	HttpConcurrency *uint32 `protobuf:"varint,3,opt,name=http_concurrency,json=httpConcurrency,proto3,oneof" json:"http_concurrency,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+	CaCertPath *string `protobuf:"bytes,4,opt,name=ca_cert_path,json=caCertPath,proto3,oneof" json:"ca_cert_path,omitempty"`
+	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+	InsecureSkipVerify bool `protobuf:"varint,5,opt,name=insecure_skip_verify,json=insecureSkipVerify,proto3" json:"insecure_skip_verify,omitempty"`
+	// Optional PEM client certificate presented for TLS client authentication on `https://` origins.
+	// Must be set together with client_key_path.
+	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
+	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
+	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HttpBackendConfig) Reset() {
 	*x = HttpBackendConfig{}
-	mi := &file_config_proto_msgTypes[20]
+	mi := &file_config_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1484,7 +1480,7 @@ func (x *HttpBackendConfig) String() string {
 func (*HttpBackendConfig) ProtoMessage() {}
 
 func (x *HttpBackendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[20]
+	mi := &file_config_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1497,7 +1493,7 @@ func (x *HttpBackendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HttpBackendConfig.ProtoReflect.Descriptor instead.
 func (*HttpBackendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{20}
+	return file_config_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *HttpBackendConfig) GetUrl() string {
@@ -1521,22 +1517,60 @@ func (x *HttpBackendConfig) GetHttpConcurrency() uint32 {
 	return 0
 }
 
+func (x *HttpBackendConfig) GetCaCertPath() string {
+	if x != nil && x.CaCertPath != nil {
+		return *x.CaCertPath
+	}
+	return ""
+}
+
+func (x *HttpBackendConfig) GetInsecureSkipVerify() bool {
+	if x != nil {
+		return x.InsecureSkipVerify
+	}
+	return false
+}
+
+func (x *HttpBackendConfig) GetClientCertPath() string {
+	if x != nil && x.ClientCertPath != nil {
+		return *x.ClientCertPath
+	}
+	return ""
+}
+
+func (x *HttpBackendConfig) GetClientKeyPath() string {
+	if x != nil && x.ClientKeyPath != nil {
+		return *x.ClientKeyPath
+	}
+	return ""
+}
+
 type S3BackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// S3-compatible origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+	// S3-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses
+	// plaintext; `https://` uses TLS with kTLS receive offload.
 	Url string `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
 	// Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
 	// Must be a power of two.
 	StripeSizeBytes *uint64 `protobuf:"varint,2,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
 	// Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
 	HttpConcurrency *uint32 `protobuf:"varint,3,opt,name=http_concurrency,json=httpConcurrency,proto3,oneof" json:"http_concurrency,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+	CaCertPath *string `protobuf:"bytes,4,opt,name=ca_cert_path,json=caCertPath,proto3,oneof" json:"ca_cert_path,omitempty"`
+	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+	InsecureSkipVerify bool `protobuf:"varint,5,opt,name=insecure_skip_verify,json=insecureSkipVerify,proto3" json:"insecure_skip_verify,omitempty"`
+	// Optional PEM client certificate presented for TLS client authentication on `https://` origins.
+	// Must be set together with client_key_path.
+	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
+	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
+	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *S3BackendConfig) Reset() {
 	*x = S3BackendConfig{}
-	mi := &file_config_proto_msgTypes[21]
+	mi := &file_config_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1548,7 +1582,7 @@ func (x *S3BackendConfig) String() string {
 func (*S3BackendConfig) ProtoMessage() {}
 
 func (x *S3BackendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[21]
+	mi := &file_config_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1561,7 +1595,7 @@ func (x *S3BackendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use S3BackendConfig.ProtoReflect.Descriptor instead.
 func (*S3BackendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{21}
+	return file_config_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *S3BackendConfig) GetUrl() string {
@@ -1585,22 +1619,60 @@ func (x *S3BackendConfig) GetHttpConcurrency() uint32 {
 	return 0
 }
 
+func (x *S3BackendConfig) GetCaCertPath() string {
+	if x != nil && x.CaCertPath != nil {
+		return *x.CaCertPath
+	}
+	return ""
+}
+
+func (x *S3BackendConfig) GetInsecureSkipVerify() bool {
+	if x != nil {
+		return x.InsecureSkipVerify
+	}
+	return false
+}
+
+func (x *S3BackendConfig) GetClientCertPath() string {
+	if x != nil && x.ClientCertPath != nil {
+		return *x.ClientCertPath
+	}
+	return ""
+}
+
+func (x *S3BackendConfig) GetClientKeyPath() string {
+	if x != nil && x.ClientKeyPath != nil {
+		return *x.ClientKeyPath
+	}
+	return ""
+}
+
 type AzureBackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Azure Blob-compatible origin host:port URL resolved to an IPv4 address for plaintext HTTP/1.1 fetches.
+	// Azure Blob-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://`
+	// uses plaintext; `https://` uses TLS with kTLS receive offload.
 	Url string `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
 	// Stripe granularity in bytes for origin references. Defaults to 4 MiB when unset.
 	// Must be a power of two.
 	StripeSizeBytes *uint64 `protobuf:"varint,2,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
 	// Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
 	HttpConcurrency *uint32 `protobuf:"varint,3,opt,name=http_concurrency,json=httpConcurrency,proto3,oneof" json:"http_concurrency,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Optional CA certificate bundle/path used for TLS verification on `https://` origins.
+	CaCertPath *string `protobuf:"bytes,4,opt,name=ca_cert_path,json=caCertPath,proto3,oneof" json:"ca_cert_path,omitempty"`
+	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+	InsecureSkipVerify bool `protobuf:"varint,5,opt,name=insecure_skip_verify,json=insecureSkipVerify,proto3" json:"insecure_skip_verify,omitempty"`
+	// Optional PEM client certificate presented for TLS client authentication on `https://` origins.
+	// Must be set together with client_key_path.
+	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
+	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
+	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AzureBackendConfig) Reset() {
 	*x = AzureBackendConfig{}
-	mi := &file_config_proto_msgTypes[22]
+	mi := &file_config_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1612,7 +1684,7 @@ func (x *AzureBackendConfig) String() string {
 func (*AzureBackendConfig) ProtoMessage() {}
 
 func (x *AzureBackendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[22]
+	mi := &file_config_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1625,7 +1697,7 @@ func (x *AzureBackendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AzureBackendConfig.ProtoReflect.Descriptor instead.
 func (*AzureBackendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{22}
+	return file_config_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *AzureBackendConfig) GetUrl() string {
@@ -1649,12 +1721,40 @@ func (x *AzureBackendConfig) GetHttpConcurrency() uint32 {
 	return 0
 }
 
+func (x *AzureBackendConfig) GetCaCertPath() string {
+	if x != nil && x.CaCertPath != nil {
+		return *x.CaCertPath
+	}
+	return ""
+}
+
+func (x *AzureBackendConfig) GetInsecureSkipVerify() bool {
+	if x != nil {
+		return x.InsecureSkipVerify
+	}
+	return false
+}
+
+func (x *AzureBackendConfig) GetClientCertPath() string {
+	if x != nil && x.ClientCertPath != nil {
+		return *x.ClientCertPath
+	}
+	return ""
+}
+
+func (x *AzureBackendConfig) GetClientKeyPath() string {
+	if x != nil && x.ClientKeyPath != nil {
+		return *x.ClientKeyPath
+	}
+	return ""
+}
+
 type FakeBackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Stripe granularity in bytes for synthetic origin references. Defaults to 4 MiB when unset.
 	// Must be a power of two.
 	StripeSizeBytes *uint64 `protobuf:"varint,1,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
-	// Size of each synthetic zero-filled object in bytes. Defaults to 1 MiB when unset.
+	// Size of each deterministic synthetic object in bytes. Defaults to 1 MiB when unset.
 	ObjectSizeBytes *uint64 `protobuf:"varint,2,opt,name=object_size_bytes,json=objectSizeBytes,proto3,oneof" json:"object_size_bytes,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
@@ -1662,7 +1762,7 @@ type FakeBackendConfig struct {
 
 func (x *FakeBackendConfig) Reset() {
 	*x = FakeBackendConfig{}
-	mi := &file_config_proto_msgTypes[23]
+	mi := &file_config_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1674,7 +1774,7 @@ func (x *FakeBackendConfig) String() string {
 func (*FakeBackendConfig) ProtoMessage() {}
 
 func (x *FakeBackendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[23]
+	mi := &file_config_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1687,7 +1787,7 @@ func (x *FakeBackendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FakeBackendConfig.ProtoReflect.Descriptor instead.
 func (*FakeBackendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{23}
+	return file_config_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *FakeBackendConfig) GetStripeSizeBytes() uint64 {
@@ -1720,7 +1820,7 @@ type FrontendSpec struct {
 
 func (x *FrontendSpec) Reset() {
 	*x = FrontendSpec{}
-	mi := &file_config_proto_msgTypes[24]
+	mi := &file_config_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1732,7 +1832,7 @@ func (x *FrontendSpec) String() string {
 func (*FrontendSpec) ProtoMessage() {}
 
 func (x *FrontendSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[24]
+	mi := &file_config_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1745,7 +1845,7 @@ func (x *FrontendSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FrontendSpec.ProtoReflect.Descriptor instead.
 func (*FrontendSpec) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{24}
+	return file_config_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *FrontendSpec) GetName() string {
@@ -1821,14 +1921,16 @@ func (*FrontendSpec_Loadgen) isFrontendSpec_Config() {}
 type HttpFrontendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Socket address for HTTP listeners; each serving shard binds it with SO_REUSEPORT.
-	Addr          string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Addr string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	// Maximum requests served on one client connection. Defaults to 1024 when unset.
+	MaxRequestsPerConnection *uint32 `protobuf:"varint,2,opt,name=max_requests_per_connection,json=maxRequestsPerConnection,proto3,oneof" json:"max_requests_per_connection,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *HttpFrontendConfig) Reset() {
 	*x = HttpFrontendConfig{}
-	mi := &file_config_proto_msgTypes[25]
+	mi := &file_config_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1840,7 +1942,7 @@ func (x *HttpFrontendConfig) String() string {
 func (*HttpFrontendConfig) ProtoMessage() {}
 
 func (x *HttpFrontendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[25]
+	mi := &file_config_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1853,7 +1955,7 @@ func (x *HttpFrontendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HttpFrontendConfig.ProtoReflect.Descriptor instead.
 func (*HttpFrontendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{25}
+	return file_config_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *HttpFrontendConfig) GetAddr() string {
@@ -1861,6 +1963,13 @@ func (x *HttpFrontendConfig) GetAddr() string {
 		return x.Addr
 	}
 	return ""
+}
+
+func (x *HttpFrontendConfig) GetMaxRequestsPerConnection() uint32 {
+	if x != nil && x.MaxRequestsPerConnection != nil {
+		return *x.MaxRequestsPerConnection
+	}
+	return 0
 }
 
 type S3FrontendConfig struct {
@@ -1873,7 +1982,7 @@ type S3FrontendConfig struct {
 
 func (x *S3FrontendConfig) Reset() {
 	*x = S3FrontendConfig{}
-	mi := &file_config_proto_msgTypes[26]
+	mi := &file_config_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1885,7 +1994,7 @@ func (x *S3FrontendConfig) String() string {
 func (*S3FrontendConfig) ProtoMessage() {}
 
 func (x *S3FrontendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[26]
+	mi := &file_config_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1898,7 +2007,7 @@ func (x *S3FrontendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use S3FrontendConfig.ProtoReflect.Descriptor instead.
 func (*S3FrontendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{26}
+	return file_config_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *S3FrontendConfig) GetAddr() string {
@@ -1912,21 +2021,42 @@ type LoadgenFrontendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Synthetic read workers per serving shard. Defaults to 1 when unset.
 	Workers *uint32 `protobuf:"varint,1,opt,name=workers,proto3,oneof" json:"workers,omitempty"`
-	// Deterministic object stream seed. Defaults to the loadgen frontend seed when unset.
+	// Deterministic synthetic keyspace and request stream seed.
 	Seed *uint64 `protobuf:"varint,2,opt,name=seed,proto3,oneof" json:"seed,omitempty"`
-	// Number of distinct synthetic object ids to cycle over. Defaults to 1,000,000 when unset.
-	ObjectCount *uint64 `protobuf:"varint,3,opt,name=object_count,json=objectCount,proto3,oneof" json:"object_count,omitempty"`
-	// Bytes to read from the start of each object. When unset, reads the full resolved object length.
+	// Number of distinct synthetic object ids to sample. Defaults to 1,000,000 when unset.
+	KeyspaceObjects *uint64 `protobuf:"varint,3,opt,name=keyspace_objects,json=keyspaceObjects,proto3,oneof" json:"keyspace_objects,omitempty"`
+	// Bytes to read from the start of each object. When unset or zero, reads the full resolved object length.
 	ReadBytes *uint64 `protobuf:"varint,4,opt,name=read_bytes,json=readBytes,proto3,oneof" json:"read_bytes,omitempty"`
-	// Verify every returned body byte is zero. Intended for fake backends.
-	Verify        bool `protobuf:"varint,5,opt,name=verify,proto3" json:"verify,omitempty"`
+	// Verify returned metadata and body bytes against the deterministic synthetic dataset.
+	Verify bool `protobuf:"varint,5,opt,name=verify,proto3" json:"verify,omitempty"`
+	// Optional expected synthetic object size. When set with verify=true, rejects mismatched metadata.
+	ObjectSizeBytes *uint64 `protobuf:"varint,6,opt,name=object_size_bytes,json=objectSizeBytes,proto3,oneof" json:"object_size_bytes,omitempty"`
+	// Zipf exponent for synthetic object rank sampling. Defaults to 1.1 when unset.
+	ZipfExponent *float64 `protobuf:"fixed64,7,opt,name=zipf_exponent,json=zipfExponent,proto3,oneof" json:"zipf_exponent,omitempty"`
+	// When true, workers keep sampling until the first requested stripe routes to
+	// a peer instead of local ownership. This is intended for fabric saturation
+	// benchmarks; the request still uses the normal cache/p2p/storage/origin path.
+	RemoteOnly bool `protobuf:"varint,8,opt,name=remote_only,json=remoteOnly,proto3" json:"remote_only,omitempty"`
+	// When true, loadgen stamps requests so peer handlers synthesize zero-filled
+	// response pages directly from their RPC scratch buffers. This bypasses disk
+	// and origin work while keeping normal peer routing, fabric RPC framing, and
+	// RDMA writes in the benchmark path.
+	FabricOnly bool `protobuf:"varint,9,opt,name=fabric_only,json=fabricOnly,proto3" json:"fabric_only,omitempty"`
+	// When true, workers keep sampling until the first requested stripe is owned
+	// by the local node. This is intended for benchmark warmup phases that prefill
+	// each node's own NVMe-backed cache before a remote-only measurement phase.
+	LocalOnly bool `protobuf:"varint,10,opt,name=local_only,json=localOnly,proto3" json:"local_only,omitempty"`
+	// When true, the initiating bufferpool skips local disk lookup and writeback.
+	// Peer handlers still use their local NVMe-backed cache, so this keeps the
+	// measured path focused on remote NVMe + RDMA instead of requester-side reuse.
+	SkipLocalDisk bool `protobuf:"varint,11,opt,name=skip_local_disk,json=skipLocalDisk,proto3" json:"skip_local_disk,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *LoadgenFrontendConfig) Reset() {
 	*x = LoadgenFrontendConfig{}
-	mi := &file_config_proto_msgTypes[27]
+	mi := &file_config_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1938,7 +2068,7 @@ func (x *LoadgenFrontendConfig) String() string {
 func (*LoadgenFrontendConfig) ProtoMessage() {}
 
 func (x *LoadgenFrontendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[27]
+	mi := &file_config_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1951,7 +2081,7 @@ func (x *LoadgenFrontendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoadgenFrontendConfig.ProtoReflect.Descriptor instead.
 func (*LoadgenFrontendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{27}
+	return file_config_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *LoadgenFrontendConfig) GetWorkers() uint32 {
@@ -1968,9 +2098,9 @@ func (x *LoadgenFrontendConfig) GetSeed() uint64 {
 	return 0
 }
 
-func (x *LoadgenFrontendConfig) GetObjectCount() uint64 {
-	if x != nil && x.ObjectCount != nil {
-		return *x.ObjectCount
+func (x *LoadgenFrontendConfig) GetKeyspaceObjects() uint64 {
+	if x != nil && x.KeyspaceObjects != nil {
+		return *x.KeyspaceObjects
 	}
 	return 0
 }
@@ -1989,18 +2119,88 @@ func (x *LoadgenFrontendConfig) GetVerify() bool {
 	return false
 }
 
+func (x *LoadgenFrontendConfig) GetObjectSizeBytes() uint64 {
+	if x != nil && x.ObjectSizeBytes != nil {
+		return *x.ObjectSizeBytes
+	}
+	return 0
+}
+
+func (x *LoadgenFrontendConfig) GetZipfExponent() float64 {
+	if x != nil && x.ZipfExponent != nil {
+		return *x.ZipfExponent
+	}
+	return 0
+}
+
+func (x *LoadgenFrontendConfig) GetRemoteOnly() bool {
+	if x != nil {
+		return x.RemoteOnly
+	}
+	return false
+}
+
+func (x *LoadgenFrontendConfig) GetFabricOnly() bool {
+	if x != nil {
+		return x.FabricOnly
+	}
+	return false
+}
+
+func (x *LoadgenFrontendConfig) GetLocalOnly() bool {
+	if x != nil {
+		return x.LocalOnly
+	}
+	return false
+}
+
+func (x *LoadgenFrontendConfig) GetSkipLocalDisk() bool {
+	if x != nil {
+		return x.SkipLocalDisk
+	}
+	return false
+}
+
 var File_config_proto protoreflect.FileDescriptor
 
 const file_config_proto_rawDesc = "" +
 	"\n" +
-	"\fconfig.proto\x12\x18unbounded.storage.config\"\xfa\x02\n" +
+	"\fconfig.proto\x12\x18unbounded.storage.config\"\xd4\x04\n" +
 	"\x06Config\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\x04R\aversion\x12>\n" +
 	"\astartup\x18\x02 \x01(\v2$.unbounded.storage.config.StartupCfgR\astartup\x12D\n" +
 	"\tfrontends\x18\x03 \x03(\v2&.unbounded.storage.config.FrontendSpecR\tfrontends\x12A\n" +
 	"\bbackends\x18\x04 \x03(\v2%.unbounded.storage.config.BackendSpecR\bbackends\x12;\n" +
-	"\x06caches\x18\x05 \x03(\v2#.unbounded.storage.config.CacheSpecR\x06caches\x12P\n" +
-	"\rneighborhoods\x18\x06 \x03(\v2*.unbounded.storage.config.NeighborhoodSpecR\rneighborhoods\"\x89\x02\n" +
+	"\x06caches\x18\x05 \x03(\v2#.unbounded.storage.config.CacheSpecR\x06caches\x128\n" +
+	"\x05disks\x18\x06 \x03(\v2\".unbounded.storage.config.DiskSpecR\x05disks\x12-\n" +
+	"\x10fingers_per_node\x18\a \x01(\rH\x00R\x0efingersPerNode\x88\x01\x01\x12\x12\n" +
+	"\x04self\x18\b \x01(\tR\x04self\x12M\n" +
+	"\frouting_plan\x18\t \x01(\v2%.unbounded.storage.config.RoutingPlanH\x01R\vroutingPlan\x88\x01\x01\x128\n" +
+	"\x05peers\x18\n" +
+	" \x03(\v2\".unbounded.storage.config.PeerSpecR\x05peersB\x13\n" +
+	"\x11_fingers_per_nodeB\x0f\n" +
+	"\r_routing_plan\"\x8f\x01\n" +
+	"\vRoutingPlan\x12\x18\n" +
+	"\afingers\x18\x01 \x03(\tR\afingers\x12!\n" +
+	"\tsuccessor\x18\x02 \x01(\tH\x00R\tsuccessor\x88\x01\x01\x12%\n" +
+	"\vpredecessor\x18\x03 \x01(\tH\x01R\vpredecessor\x88\x01\x01B\f\n" +
+	"\n" +
+	"_successorB\x0e\n" +
+	"\f_predecessor\"\xb9\x01\n" +
+	"\bPeerSpec\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
+	"\x04tags\x18\x02 \x03(\tR\x04tags\x12;\n" +
+	"\x03tcp\x18\x03 \x01(\v2'.unbounded.storage.config.TcpPeerConfigH\x00R\x03tcp\x12>\n" +
+	"\x04rdma\x18\x04 \x01(\v2(.unbounded.storage.config.RdmaPeerConfigH\x00R\x04rdmaB\b\n" +
+	"\x06config\"#\n" +
+	"\rTcpPeerConfig\x12\x12\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\":\n" +
+	"\x0eRdmaPeerConfig\x12\x12\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\x12\x14\n" +
+	"\x05addrs\x18\x02 \x03(\tR\x05addrs\"7\n" +
+	"\tCacheSpec\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
+	"\x06source\x18\x02 \x01(\tR\x06source\"\x89\x02\n" +
 	"\n" +
 	"StartupCfg\x12;\n" +
 	"\x06memory\x18\x01 \x01(\v2#.unbounded.storage.config.MemoryCfgR\x06memory\x12;\n" +
@@ -2046,47 +2246,18 @@ const file_config_proto_rawDesc = "" +
 	"\vnic_workers\x18\a \x01(\x04H\x01R\n" +
 	"nicWorkers\x88\x01\x01B\x10\n" +
 	"\x0e_serving_coresB\x0e\n" +
-	"\f_nic_workers\"\xf6\x02\n" +
-	"\x10NeighborhoodSpec\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
-	"\x06source\x18\x02 \x01(\tR\x06source\x12-\n" +
-	"\x10fingers_per_node\x18\x03 \x01(\rH\x00R\x0efingersPerNode\x88\x01\x01\x12'\n" +
-	"\rlocal_node_id\x18\x04 \x01(\x04H\x01R\vlocalNodeId\x88\x01\x01\x12\x1d\n" +
-	"\n" +
-	"local_tags\x18\x05 \x03(\tR\tlocalTags\x12M\n" +
-	"\frouting_plan\x18\x06 \x01(\v2%.unbounded.storage.config.RoutingPlanH\x02R\vroutingPlan\x88\x01\x01\x128\n" +
-	"\x05peers\x18\a \x03(\v2\".unbounded.storage.config.PeerSpecR\x05peersB\x13\n" +
-	"\x11_fingers_per_nodeB\x10\n" +
-	"\x0e_local_node_idB\x0f\n" +
-	"\r_routing_plan\"\x8f\x01\n" +
-	"\vRoutingPlan\x12\x18\n" +
-	"\afingers\x18\x01 \x03(\x04R\afingers\x12!\n" +
-	"\tsuccessor\x18\x02 \x01(\x04H\x00R\tsuccessor\x88\x01\x01\x12%\n" +
-	"\vpredecessor\x18\x03 \x01(\x04H\x01R\vpredecessor\x88\x01\x01B\f\n" +
-	"\n" +
-	"_successorB\x0e\n" +
-	"\f_predecessor\"\xb5\x01\n" +
-	"\bPeerSpec\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\x04R\x02id\x12\x12\n" +
-	"\x04tags\x18\x02 \x03(\tR\x04tags\x12;\n" +
-	"\x03tcp\x18\x03 \x01(\v2'.unbounded.storage.config.TcpPeerConfigH\x00R\x03tcp\x12>\n" +
-	"\x04rdma\x18\x04 \x01(\v2(.unbounded.storage.config.RdmaPeerConfigH\x00R\x04rdmaB\b\n" +
-	"\x06config\"#\n" +
-	"\rTcpPeerConfig\x12\x12\n" +
-	"\x04addr\x18\x01 \x01(\tR\x04addr\"$\n" +
-	"\x0eRdmaPeerConfig\x12\x12\n" +
-	"\x04addr\x18\x01 \x01(\tR\x04addr\"q\n" +
-	"\tCacheSpec\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
-	"\x06source\x18\x02 \x01(\tR\x06source\x128\n" +
-	"\x05disks\x18\x03 \x03(\v2\".unbounded.storage.config.DiskSpecR\x05disks\"\xbc\x02\n" +
+	"\f_nic_workers\"\xdf\x03\n" +
 	"\bDiskSpec\x12$\n" +
 	"\vqueue_depth\x18\x01 \x01(\rH\x01R\n" +
 	"queueDepth\x88\x01\x01\x12+\n" +
 	"\x0fpage_size_bytes\x18\x02 \x01(\x04H\x02R\rpageSizeBytes\x88\x01\x01\x12,\n" +
-	"\x12skip_recovery_scan\x18\x03 \x01(\bR\x10skipRecoveryScan\x12A\n" +
-	"\x05block\x18\x04 \x01(\v2).unbounded.storage.config.BlockDiskConfigH\x00R\x05block\x12>\n" +
-	"\x04file\x18\x05 \x01(\v2(.unbounded.storage.config.FileDiskConfigH\x00R\x04fileB\b\n" +
+	"\x12skip_recovery_scan\x18\x03 \x01(\bR\x10skipRecoveryScan\x12!\n" +
+	"\fforce_format\x18\x04 \x01(\bR\vforceFormat\x12)\n" +
+	"\x10bypass_admission\x18\x05 \x01(\bR\x0fbypassAdmission\x12*\n" +
+	"\x11bypass_index_read\x18\x06 \x01(\bR\x0fbypassIndexRead\x12'\n" +
+	"\x0fbypass_checksum\x18\a \x01(\bR\x0ebypassChecksum\x12A\n" +
+	"\x05block\x18\b \x01(\v2).unbounded.storage.config.BlockDiskConfigH\x00R\x05block\x12>\n" +
+	"\x04file\x18\t \x01(\v2(.unbounded.storage.config.FileDiskConfigH\x00R\x04fileB\b\n" +
 	"\x06configB\x0e\n" +
 	"\f_queue_depthB\x12\n" +
 	"\x10_page_size_bytes\"G\n" +
@@ -2104,25 +2275,49 @@ const file_config_proto_rawDesc = "" +
 	"\x02s3\x18\x03 \x01(\v2).unbounded.storage.config.S3BackendConfigH\x00R\x02s3\x12D\n" +
 	"\x05azure\x18\x04 \x01(\v2,.unbounded.storage.config.AzureBackendConfigH\x00R\x05azure\x12A\n" +
 	"\x04fake\x18\x05 \x01(\v2+.unbounded.storage.config.FakeBackendConfigH\x00R\x04fakeB\b\n" +
-	"\x06config\"\xb1\x01\n" +
+	"\x06config\"\xa0\x03\n" +
 	"\x11HttpBackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
-	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01B\x14\n" +
+	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12%\n" +
+	"\fca_cert_path\x18\x04 \x01(\tH\x02R\n" +
+	"caCertPath\x88\x01\x01\x120\n" +
+	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
+	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
+	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
-	"\x11_http_concurrency\"\xaf\x01\n" +
+	"\x11_http_concurrencyB\x0f\n" +
+	"\r_ca_cert_pathB\x13\n" +
+	"\x11_client_cert_pathB\x12\n" +
+	"\x10_client_key_path\"\x9e\x03\n" +
 	"\x0fS3BackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
-	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01B\x14\n" +
+	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12%\n" +
+	"\fca_cert_path\x18\x04 \x01(\tH\x02R\n" +
+	"caCertPath\x88\x01\x01\x120\n" +
+	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
+	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
+	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
-	"\x11_http_concurrency\"\xb2\x01\n" +
+	"\x11_http_concurrencyB\x0f\n" +
+	"\r_ca_cert_pathB\x13\n" +
+	"\x11_client_cert_pathB\x12\n" +
+	"\x10_client_key_path\"\xa1\x03\n" +
 	"\x12AzureBackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
-	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01B\x14\n" +
+	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12%\n" +
+	"\fca_cert_path\x18\x04 \x01(\tH\x02R\n" +
+	"caCertPath\x88\x01\x01\x120\n" +
+	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
+	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
+	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
-	"\x11_http_concurrency\"\xa1\x01\n" +
+	"\x11_http_concurrencyB\x0f\n" +
+	"\r_ca_cert_pathB\x13\n" +
+	"\x11_client_cert_pathB\x12\n" +
+	"\x10_client_key_path\"\xa1\x01\n" +
 	"\x11FakeBackendConfig\x12/\n" +
 	"\x11stripe_size_bytes\x18\x01 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12/\n" +
 	"\x11object_size_bytes\x18\x02 \x01(\x04H\x01R\x0fobjectSizeBytes\x88\x01\x01B\x14\n" +
@@ -2134,23 +2329,37 @@ const file_config_proto_rawDesc = "" +
 	"\x04http\x18\x03 \x01(\v2,.unbounded.storage.config.HttpFrontendConfigH\x00R\x04http\x12<\n" +
 	"\x02s3\x18\x04 \x01(\v2*.unbounded.storage.config.S3FrontendConfigH\x00R\x02s3\x12K\n" +
 	"\aloadgen\x18\x05 \x01(\v2/.unbounded.storage.config.LoadgenFrontendConfigH\x00R\aloadgenB\b\n" +
-	"\x06config\"(\n" +
+	"\x06config\"\x8c\x01\n" +
 	"\x12HttpFrontendConfig\x12\x12\n" +
-	"\x04addr\x18\x01 \x01(\tR\x04addr\"&\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\x12B\n" +
+	"\x1bmax_requests_per_connection\x18\x02 \x01(\rH\x00R\x18maxRequestsPerConnection\x88\x01\x01B\x1e\n" +
+	"\x1c_max_requests_per_connection\"&\n" +
 	"\x10S3FrontendConfig\x12\x12\n" +
-	"\x04addr\x18\x01 \x01(\tR\x04addr\"\xe8\x01\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\"\x80\x04\n" +
 	"\x15LoadgenFrontendConfig\x12\x1d\n" +
 	"\aworkers\x18\x01 \x01(\rH\x00R\aworkers\x88\x01\x01\x12\x17\n" +
-	"\x04seed\x18\x02 \x01(\x04H\x01R\x04seed\x88\x01\x01\x12&\n" +
-	"\fobject_count\x18\x03 \x01(\x04H\x02R\vobjectCount\x88\x01\x01\x12\"\n" +
+	"\x04seed\x18\x02 \x01(\x04H\x01R\x04seed\x88\x01\x01\x12.\n" +
+	"\x10keyspace_objects\x18\x03 \x01(\x04H\x02R\x0fkeyspaceObjects\x88\x01\x01\x12\"\n" +
 	"\n" +
 	"read_bytes\x18\x04 \x01(\x04H\x03R\treadBytes\x88\x01\x01\x12\x16\n" +
-	"\x06verify\x18\x05 \x01(\bR\x06verifyB\n" +
+	"\x06verify\x18\x05 \x01(\bR\x06verify\x12/\n" +
+	"\x11object_size_bytes\x18\x06 \x01(\x04H\x04R\x0fobjectSizeBytes\x88\x01\x01\x12(\n" +
+	"\rzipf_exponent\x18\a \x01(\x01H\x05R\fzipfExponent\x88\x01\x01\x12\x1f\n" +
+	"\vremote_only\x18\b \x01(\bR\n" +
+	"remoteOnly\x12\x1f\n" +
+	"\vfabric_only\x18\t \x01(\bR\n" +
+	"fabricOnly\x12\x1d\n" +
+	"\n" +
+	"local_only\x18\n" +
+	" \x01(\bR\tlocalOnly\x12&\n" +
+	"\x0fskip_local_disk\x18\v \x01(\bR\rskipLocalDiskB\n" +
 	"\n" +
 	"\b_workersB\a\n" +
-	"\x05_seedB\x0f\n" +
-	"\r_object_countB\r\n" +
-	"\v_read_bytesB@Z>github.com/Azure/unbounded/api/unbounded-storage;storageconfigb\x06proto3"
+	"\x05_seedB\x13\n" +
+	"\x11_keyspace_objectsB\r\n" +
+	"\v_read_bytesB\x14\n" +
+	"\x12_object_size_bytesB\x10\n" +
+	"\x0e_zipf_exponentB@Z>github.com/Azure/unbounded/api/unbounded-storage;storageconfigb\x06proto3"
 
 var (
 	file_config_proto_rawDescOnce sync.Once
@@ -2164,70 +2373,68 @@ func file_config_proto_rawDescGZIP() []byte {
 	return file_config_proto_rawDescData
 }
 
-var file_config_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
+var file_config_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
 var file_config_proto_goTypes = []any{
 	(*Config)(nil),                // 0: unbounded.storage.config.Config
-	(*StartupCfg)(nil),            // 1: unbounded.storage.config.StartupCfg
-	(*MetricsCfg)(nil),            // 2: unbounded.storage.config.MetricsCfg
-	(*MemoryCfg)(nil),             // 3: unbounded.storage.config.MemoryCfg
-	(*FabricCfg)(nil),             // 4: unbounded.storage.config.FabricCfg
-	(*TcpFabricBinds)(nil),        // 5: unbounded.storage.config.TcpFabricBinds
-	(*RdmaFabricBinds)(nil),       // 6: unbounded.storage.config.RdmaFabricBinds
-	(*AutoRdmaFabricBinds)(nil),   // 7: unbounded.storage.config.AutoRdmaFabricBinds
-	(*RdmaFabricBind)(nil),        // 8: unbounded.storage.config.RdmaFabricBind
-	(*TopologyCfg)(nil),           // 9: unbounded.storage.config.TopologyCfg
-	(*NeighborhoodSpec)(nil),      // 10: unbounded.storage.config.NeighborhoodSpec
-	(*RoutingPlan)(nil),           // 11: unbounded.storage.config.RoutingPlan
-	(*PeerSpec)(nil),              // 12: unbounded.storage.config.PeerSpec
-	(*TcpPeerConfig)(nil),         // 13: unbounded.storage.config.TcpPeerConfig
-	(*RdmaPeerConfig)(nil),        // 14: unbounded.storage.config.RdmaPeerConfig
-	(*CacheSpec)(nil),             // 15: unbounded.storage.config.CacheSpec
-	(*DiskSpec)(nil),              // 16: unbounded.storage.config.DiskSpec
-	(*BlockDiskConfig)(nil),       // 17: unbounded.storage.config.BlockDiskConfig
-	(*FileDiskConfig)(nil),        // 18: unbounded.storage.config.FileDiskConfig
-	(*BackendSpec)(nil),           // 19: unbounded.storage.config.BackendSpec
-	(*HttpBackendConfig)(nil),     // 20: unbounded.storage.config.HttpBackendConfig
-	(*S3BackendConfig)(nil),       // 21: unbounded.storage.config.S3BackendConfig
-	(*AzureBackendConfig)(nil),    // 22: unbounded.storage.config.AzureBackendConfig
-	(*FakeBackendConfig)(nil),     // 23: unbounded.storage.config.FakeBackendConfig
-	(*FrontendSpec)(nil),          // 24: unbounded.storage.config.FrontendSpec
-	(*HttpFrontendConfig)(nil),    // 25: unbounded.storage.config.HttpFrontendConfig
-	(*S3FrontendConfig)(nil),      // 26: unbounded.storage.config.S3FrontendConfig
-	(*LoadgenFrontendConfig)(nil), // 27: unbounded.storage.config.LoadgenFrontendConfig
+	(*RoutingPlan)(nil),           // 1: unbounded.storage.config.RoutingPlan
+	(*PeerSpec)(nil),              // 2: unbounded.storage.config.PeerSpec
+	(*TcpPeerConfig)(nil),         // 3: unbounded.storage.config.TcpPeerConfig
+	(*RdmaPeerConfig)(nil),        // 4: unbounded.storage.config.RdmaPeerConfig
+	(*CacheSpec)(nil),             // 5: unbounded.storage.config.CacheSpec
+	(*StartupCfg)(nil),            // 6: unbounded.storage.config.StartupCfg
+	(*MetricsCfg)(nil),            // 7: unbounded.storage.config.MetricsCfg
+	(*MemoryCfg)(nil),             // 8: unbounded.storage.config.MemoryCfg
+	(*FabricCfg)(nil),             // 9: unbounded.storage.config.FabricCfg
+	(*TcpFabricBinds)(nil),        // 10: unbounded.storage.config.TcpFabricBinds
+	(*RdmaFabricBinds)(nil),       // 11: unbounded.storage.config.RdmaFabricBinds
+	(*AutoRdmaFabricBinds)(nil),   // 12: unbounded.storage.config.AutoRdmaFabricBinds
+	(*RdmaFabricBind)(nil),        // 13: unbounded.storage.config.RdmaFabricBind
+	(*TopologyCfg)(nil),           // 14: unbounded.storage.config.TopologyCfg
+	(*DiskSpec)(nil),              // 15: unbounded.storage.config.DiskSpec
+	(*BlockDiskConfig)(nil),       // 16: unbounded.storage.config.BlockDiskConfig
+	(*FileDiskConfig)(nil),        // 17: unbounded.storage.config.FileDiskConfig
+	(*BackendSpec)(nil),           // 18: unbounded.storage.config.BackendSpec
+	(*HttpBackendConfig)(nil),     // 19: unbounded.storage.config.HttpBackendConfig
+	(*S3BackendConfig)(nil),       // 20: unbounded.storage.config.S3BackendConfig
+	(*AzureBackendConfig)(nil),    // 21: unbounded.storage.config.AzureBackendConfig
+	(*FakeBackendConfig)(nil),     // 22: unbounded.storage.config.FakeBackendConfig
+	(*FrontendSpec)(nil),          // 23: unbounded.storage.config.FrontendSpec
+	(*HttpFrontendConfig)(nil),    // 24: unbounded.storage.config.HttpFrontendConfig
+	(*S3FrontendConfig)(nil),      // 25: unbounded.storage.config.S3FrontendConfig
+	(*LoadgenFrontendConfig)(nil), // 26: unbounded.storage.config.LoadgenFrontendConfig
 }
 var file_config_proto_depIdxs = []int32{
-	1,  // 0: unbounded.storage.config.Config.startup:type_name -> unbounded.storage.config.StartupCfg
-	24, // 1: unbounded.storage.config.Config.frontends:type_name -> unbounded.storage.config.FrontendSpec
-	19, // 2: unbounded.storage.config.Config.backends:type_name -> unbounded.storage.config.BackendSpec
-	15, // 3: unbounded.storage.config.Config.caches:type_name -> unbounded.storage.config.CacheSpec
-	10, // 4: unbounded.storage.config.Config.neighborhoods:type_name -> unbounded.storage.config.NeighborhoodSpec
-	3,  // 5: unbounded.storage.config.StartupCfg.memory:type_name -> unbounded.storage.config.MemoryCfg
-	4,  // 6: unbounded.storage.config.StartupCfg.fabric:type_name -> unbounded.storage.config.FabricCfg
-	9,  // 7: unbounded.storage.config.StartupCfg.topology:type_name -> unbounded.storage.config.TopologyCfg
-	2,  // 8: unbounded.storage.config.StartupCfg.metrics:type_name -> unbounded.storage.config.MetricsCfg
-	5,  // 9: unbounded.storage.config.FabricCfg.tcp:type_name -> unbounded.storage.config.TcpFabricBinds
-	6,  // 10: unbounded.storage.config.FabricCfg.rdma:type_name -> unbounded.storage.config.RdmaFabricBinds
-	7,  // 11: unbounded.storage.config.FabricCfg.auto_rdma:type_name -> unbounded.storage.config.AutoRdmaFabricBinds
-	8,  // 12: unbounded.storage.config.RdmaFabricBinds.binds:type_name -> unbounded.storage.config.RdmaFabricBind
-	11, // 13: unbounded.storage.config.NeighborhoodSpec.routing_plan:type_name -> unbounded.storage.config.RoutingPlan
-	12, // 14: unbounded.storage.config.NeighborhoodSpec.peers:type_name -> unbounded.storage.config.PeerSpec
-	13, // 15: unbounded.storage.config.PeerSpec.tcp:type_name -> unbounded.storage.config.TcpPeerConfig
-	14, // 16: unbounded.storage.config.PeerSpec.rdma:type_name -> unbounded.storage.config.RdmaPeerConfig
-	16, // 17: unbounded.storage.config.CacheSpec.disks:type_name -> unbounded.storage.config.DiskSpec
-	17, // 18: unbounded.storage.config.DiskSpec.block:type_name -> unbounded.storage.config.BlockDiskConfig
-	18, // 19: unbounded.storage.config.DiskSpec.file:type_name -> unbounded.storage.config.FileDiskConfig
-	20, // 20: unbounded.storage.config.BackendSpec.http:type_name -> unbounded.storage.config.HttpBackendConfig
-	21, // 21: unbounded.storage.config.BackendSpec.s3:type_name -> unbounded.storage.config.S3BackendConfig
-	22, // 22: unbounded.storage.config.BackendSpec.azure:type_name -> unbounded.storage.config.AzureBackendConfig
-	23, // 23: unbounded.storage.config.BackendSpec.fake:type_name -> unbounded.storage.config.FakeBackendConfig
-	25, // 24: unbounded.storage.config.FrontendSpec.http:type_name -> unbounded.storage.config.HttpFrontendConfig
-	26, // 25: unbounded.storage.config.FrontendSpec.s3:type_name -> unbounded.storage.config.S3FrontendConfig
-	27, // 26: unbounded.storage.config.FrontendSpec.loadgen:type_name -> unbounded.storage.config.LoadgenFrontendConfig
-	27, // [27:27] is the sub-list for method output_type
-	27, // [27:27] is the sub-list for method input_type
-	27, // [27:27] is the sub-list for extension type_name
-	27, // [27:27] is the sub-list for extension extendee
-	0,  // [0:27] is the sub-list for field type_name
+	6,  // 0: unbounded.storage.config.Config.startup:type_name -> unbounded.storage.config.StartupCfg
+	23, // 1: unbounded.storage.config.Config.frontends:type_name -> unbounded.storage.config.FrontendSpec
+	18, // 2: unbounded.storage.config.Config.backends:type_name -> unbounded.storage.config.BackendSpec
+	5,  // 3: unbounded.storage.config.Config.caches:type_name -> unbounded.storage.config.CacheSpec
+	15, // 4: unbounded.storage.config.Config.disks:type_name -> unbounded.storage.config.DiskSpec
+	1,  // 5: unbounded.storage.config.Config.routing_plan:type_name -> unbounded.storage.config.RoutingPlan
+	2,  // 6: unbounded.storage.config.Config.peers:type_name -> unbounded.storage.config.PeerSpec
+	3,  // 7: unbounded.storage.config.PeerSpec.tcp:type_name -> unbounded.storage.config.TcpPeerConfig
+	4,  // 8: unbounded.storage.config.PeerSpec.rdma:type_name -> unbounded.storage.config.RdmaPeerConfig
+	8,  // 9: unbounded.storage.config.StartupCfg.memory:type_name -> unbounded.storage.config.MemoryCfg
+	9,  // 10: unbounded.storage.config.StartupCfg.fabric:type_name -> unbounded.storage.config.FabricCfg
+	14, // 11: unbounded.storage.config.StartupCfg.topology:type_name -> unbounded.storage.config.TopologyCfg
+	7,  // 12: unbounded.storage.config.StartupCfg.metrics:type_name -> unbounded.storage.config.MetricsCfg
+	10, // 13: unbounded.storage.config.FabricCfg.tcp:type_name -> unbounded.storage.config.TcpFabricBinds
+	11, // 14: unbounded.storage.config.FabricCfg.rdma:type_name -> unbounded.storage.config.RdmaFabricBinds
+	12, // 15: unbounded.storage.config.FabricCfg.auto_rdma:type_name -> unbounded.storage.config.AutoRdmaFabricBinds
+	13, // 16: unbounded.storage.config.RdmaFabricBinds.binds:type_name -> unbounded.storage.config.RdmaFabricBind
+	16, // 17: unbounded.storage.config.DiskSpec.block:type_name -> unbounded.storage.config.BlockDiskConfig
+	17, // 18: unbounded.storage.config.DiskSpec.file:type_name -> unbounded.storage.config.FileDiskConfig
+	19, // 19: unbounded.storage.config.BackendSpec.http:type_name -> unbounded.storage.config.HttpBackendConfig
+	20, // 20: unbounded.storage.config.BackendSpec.s3:type_name -> unbounded.storage.config.S3BackendConfig
+	21, // 21: unbounded.storage.config.BackendSpec.azure:type_name -> unbounded.storage.config.AzureBackendConfig
+	22, // 22: unbounded.storage.config.BackendSpec.fake:type_name -> unbounded.storage.config.FakeBackendConfig
+	24, // 23: unbounded.storage.config.FrontendSpec.http:type_name -> unbounded.storage.config.HttpFrontendConfig
+	25, // 24: unbounded.storage.config.FrontendSpec.s3:type_name -> unbounded.storage.config.S3FrontendConfig
+	26, // 25: unbounded.storage.config.FrontendSpec.loadgen:type_name -> unbounded.storage.config.LoadgenFrontendConfig
+	26, // [26:26] is the sub-list for method output_type
+	26, // [26:26] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_config_proto_init() }
@@ -2235,49 +2442,50 @@ func file_config_proto_init() {
 	if File_config_proto != nil {
 		return
 	}
-	file_config_proto_msgTypes[3].OneofWrappers = []any{}
-	file_config_proto_msgTypes[4].OneofWrappers = []any{
+	file_config_proto_msgTypes[0].OneofWrappers = []any{}
+	file_config_proto_msgTypes[1].OneofWrappers = []any{}
+	file_config_proto_msgTypes[2].OneofWrappers = []any{
+		(*PeerSpec_Tcp)(nil),
+		(*PeerSpec_Rdma)(nil),
+	}
+	file_config_proto_msgTypes[8].OneofWrappers = []any{}
+	file_config_proto_msgTypes[9].OneofWrappers = []any{
 		(*FabricCfg_Tcp)(nil),
 		(*FabricCfg_Rdma)(nil),
 		(*FabricCfg_AutoRdma)(nil),
 	}
-	file_config_proto_msgTypes[7].OneofWrappers = []any{}
-	file_config_proto_msgTypes[9].OneofWrappers = []any{}
-	file_config_proto_msgTypes[10].OneofWrappers = []any{}
-	file_config_proto_msgTypes[11].OneofWrappers = []any{}
-	file_config_proto_msgTypes[12].OneofWrappers = []any{
-		(*PeerSpec_Tcp)(nil),
-		(*PeerSpec_Rdma)(nil),
-	}
-	file_config_proto_msgTypes[16].OneofWrappers = []any{
+	file_config_proto_msgTypes[12].OneofWrappers = []any{}
+	file_config_proto_msgTypes[14].OneofWrappers = []any{}
+	file_config_proto_msgTypes[15].OneofWrappers = []any{
 		(*DiskSpec_Block)(nil),
 		(*DiskSpec_File)(nil),
 	}
+	file_config_proto_msgTypes[16].OneofWrappers = []any{}
 	file_config_proto_msgTypes[17].OneofWrappers = []any{}
-	file_config_proto_msgTypes[18].OneofWrappers = []any{}
-	file_config_proto_msgTypes[19].OneofWrappers = []any{
+	file_config_proto_msgTypes[18].OneofWrappers = []any{
 		(*BackendSpec_Http)(nil),
 		(*BackendSpec_S3)(nil),
 		(*BackendSpec_Azure)(nil),
 		(*BackendSpec_Fake)(nil),
 	}
+	file_config_proto_msgTypes[19].OneofWrappers = []any{}
 	file_config_proto_msgTypes[20].OneofWrappers = []any{}
 	file_config_proto_msgTypes[21].OneofWrappers = []any{}
 	file_config_proto_msgTypes[22].OneofWrappers = []any{}
-	file_config_proto_msgTypes[23].OneofWrappers = []any{}
-	file_config_proto_msgTypes[24].OneofWrappers = []any{
+	file_config_proto_msgTypes[23].OneofWrappers = []any{
 		(*FrontendSpec_Http)(nil),
 		(*FrontendSpec_S3)(nil),
 		(*FrontendSpec_Loadgen)(nil),
 	}
-	file_config_proto_msgTypes[27].OneofWrappers = []any{}
+	file_config_proto_msgTypes[24].OneofWrappers = []any{}
+	file_config_proto_msgTypes[26].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_config_proto_rawDesc), len(file_config_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   28,
+			NumMessages:   27,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

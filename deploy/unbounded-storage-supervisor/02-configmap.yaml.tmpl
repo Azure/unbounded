@@ -19,12 +19,24 @@ metadata:
 # its proto3 zero value, which the daemon promotes to the documented default.
 #
 # Per-node sections are supervisor-injected when a storage ring is active:
-# startup.fabric.binds.tcp.addr is overridden per node, and every declared
-# neighborhood gets its local_node_id plus label-discovered peers merged into
-# neighborhoods[].peers (discovered peers win id collisions). Declare
-# neighborhoods here when this deployment should participate in a P2P ring; the
-# supervisor will not invent one because each neighborhood needs an explicit
-# source backend.
+# startup.fabric.binds.tcp.addr is overridden per node, self is set to the local
+# Kubernetes node name, and label-discovered peers are merged into peers
+# (discovered peers win name collisions). Declare caches here when this
+# deployment should participate in P2P caching; the supervisor only supplies the
+# ring roster.
+#
+# Disks are declared in disks[]. Explicit disks are preserved. When disks[] is
+# absent or empty, block disks are allocated only from the opt-in
+# storage.unbounded-cloud.io/allocated-disks annotation. Its value is a
+# comma-separated list of item?query entries such as
+# /dev/nvme1n1?queue_depth=256&page_size_bytes=4096&numa=0. When that annotation
+# is absent or has no valid disks, the supervisor uses one file-backed disk at
+# /var/lib/unbounded-storage/cache.disk sized by
+# unbounded-cloud.io/storage-file-size-bytes, defaulting to 2 GiB. The daemon
+# publishes discovered options to storage.unbounded-cloud.io/block-devices as
+# entries like /dev/sdb?name=sdb&size_bytes=1234; discovery does not allocate
+# disks. The shared disk set is available to every cache; the supervisor does not
+# invent caches, backends, or frontends.
 data:
   config.yaml: |
     # Operator-assigned config version (opaque counter; 0 means unversioned).
@@ -64,5 +76,5 @@ data:
         # NIC-worker CPUs to pin per active HCA.
         nic_workers: 4
       metrics:
-        # Prometheus exporter listen address ("" disables the exporter).
-        addr: ""
+        # Prometheus exporter and device inventory listen address.
+        addr: "127.0.0.1:9100"

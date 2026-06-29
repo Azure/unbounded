@@ -13,9 +13,13 @@ mod core;
 mod network;
 mod registry;
 mod storage;
+mod tls_recv;
 
 pub(crate) use core::RecvQuarantine;
-pub use network::{NetHandle, NetworkRing, SockAddr};
+pub use network::{
+    NetHandle, NetworkRing, RecvRecord, SockAddr, TLS_RECORD_TYPE_ALERT,
+    TLS_RECORD_TYPE_APPLICATION_DATA, TLS_RECORD_TYPE_HANDSHAKE,
+};
 pub use registry::{
     clear_current_storage_ring, current_storage_ring, set_current_storage_ring,
     with_current_storage_ring,

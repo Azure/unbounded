@@ -561,6 +561,7 @@ mod tests {
         let mut c = Config::default();
         c.apply_defaults();
         c.version = version;
+        c.self_ = "node-a".to_string();
         c.backends.push(crate::config::BackendSpec {
             name: "b".to_string(),
             config: Some(crate::config::backend_spec::Config::Fake(
@@ -570,21 +571,13 @@ mod tests {
                 },
             )),
         });
-        c.neighborhoods.push(crate::config::NeighborhoodSpec {
-            name: "n".to_string(),
-            source: "b".to_string(),
-            fingers_per_node: Some(100),
-            local_node_id: Some(0),
-            local_tags: Vec::new(),
-            routing_plan: None,
-            peers: vec![tcp_peer(1, "127.0.0.1:9999")],
-        });
+        c.peers.push(tcp_peer("node-a", "127.0.0.1:9999"));
         c
     }
 
-    fn tcp_peer(id: u64, addr: &str) -> crate::config::PeerSpec {
+    fn tcp_peer(name: &str, addr: &str) -> crate::config::PeerSpec {
         crate::config::PeerSpec {
-            id,
+            name: name.to_string(),
             tags: Vec::new(),
             config: Some(crate::config::peer_spec::Config::Tcp(
                 crate::config::TcpPeerConfig {
@@ -628,9 +621,7 @@ mod tests {
         let mut ctrl = ConfigController::new(RecordingTarget::default(), base.clone());
 
         let mut next = config_with_peer(2);
-        next.neighborhoods[0]
-            .peers
-            .push(tcp_peer(2, "127.0.0.1:9998"));
+        next.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
 
         let out = ctrl.apply(Arc::new(next)).unwrap();
         assert_eq!(out.tier, ApplyTier::InPlace);
@@ -657,6 +648,10 @@ mod tests {
                     url: "https://example.com".to_string(),
                     stripe_size_bytes: Some(4 * 1024 * 1024),
                     http_concurrency: Some(64),
+                    ca_cert_path: None,
+                    insecure_skip_verify: false,
+                    client_cert_path: None,
+                    client_key_path: None,
                 },
             )),
         });
@@ -681,18 +676,13 @@ mod tests {
         let mut ctrl = ConfigController::new(target, base.clone());
 
         let mut next = config_with_peer(5);
-        next.neighborhoods[0]
-            .peers
-            .push(tcp_peer(2, "127.0.0.1:9998"));
+        next.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
         let next = Arc::new(next);
 
         assert!(ctrl.apply(next.clone()).is_err());
         // Current must still be the original so a retry re-derives the
         // same diff.
-        assert_eq!(
-            ctrl.current().neighborhoods[0].peers.len(),
-            base.neighborhoods[0].peers.len()
-        );
+        assert_eq!(ctrl.current().peers.len(), base.peers.len());
         // A failed apply records the version as known (we loaded it) but
         // must NOT advance the applied version: the process did not
         // converge on the submitted config.
@@ -718,9 +708,7 @@ mod tests {
         );
 
         let mut next = config_with_peer(11);
-        next.neighborhoods[0]
-            .peers
-            .push(tcp_peer(2, "127.0.0.1:9998"));
+        next.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
         ctrl.apply(Arc::new(next)).unwrap();
 
         assert_eq!(versions.known(), 11);
@@ -747,9 +735,7 @@ mod tests {
 
         // A failed apply advances known but neither applied nor startup.
         let mut failing = config_with_peer(7);
-        failing.neighborhoods[0]
-            .peers
-            .push(tcp_peer(2, "127.0.0.1:9998"));
+        failing.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
         assert!(ctrl.apply(Arc::new(failing)).is_err());
         assert_eq!(ctrl.config_versions().known(), 7);
         assert_eq!(ctrl.config_versions().applied(), 1);
@@ -759,9 +745,7 @@ mod tests {
         // still leaves startup pinned to the config realized at start.
         ctrl.target_mut().fail_in_place = false;
         let mut next = config_with_peer(8);
-        next.neighborhoods[0]
-            .peers
-            .push(tcp_peer(3, "127.0.0.1:9997"));
+        next.peers.push(tcp_peer("node-c", "127.0.0.1:9997"));
         ctrl.apply(Arc::new(next)).unwrap();
         assert_eq!(ctrl.config_versions().applied(), 8);
         assert_eq!(ctrl.config_versions().startup(), 1);
