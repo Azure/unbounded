@@ -411,11 +411,11 @@ Rootfs provisioning checks:
 
 | Check | Purpose |
 |---|---|
-| `oci-image-reachable` | Validate the configured rootfs image manifest can be resolved without pulling layers. |
+| `oci-image-reachable` | Validate the configured rootfs image by resolving the manifest descriptor only, without pulling layers; expect a successful registry manifest response such as `200 OK`. |
 | `nspawn-machine-provisioning` | Validate the target nspawn machine directory state, rootfs parent directory writability, and host-side nspawn config path writability. |
-| `kubernetes-artifacts` | Validate kubelet/kubectl/kube-proxy artifact URLs are reachable without downloading full binaries or checksum files. |
-| `cri-artifacts` | Validate containerd, runc, and crictl artifact URLs are reachable without downloading or extracting full artifacts. |
-| `cni-artifacts` | Validate the CNI plugin artifact URL is reachable without downloading or extracting the full artifact. |
+| `kubernetes-artifacts` | Validate kubelet/kubectl/kube-proxy artifact URLs are reachable without downloading full binaries or checksum files. Probe each URL with HTTP HEAD, falling back to GET with `Range: bytes=0-0`; expect `200 OK` or `206 Partial Content`. |
+| `cri-artifacts` | Validate containerd, runc, and crictl artifact URLs are reachable without downloading or extracting full artifacts. Probe each URL with HTTP HEAD, falling back to GET with `Range: bytes=0-0`; expect `200 OK` or `206 Partial Content`. |
+| `cni-artifacts` | Validate the CNI plugin artifact URL is reachable without downloading or extracting the full artifact. Probe the URL with HTTP HEAD, falling back to GET with `Range: bytes=0-0`; expect `200 OK` or `206 Partial Content`. |
 
 GPU checks:
 
