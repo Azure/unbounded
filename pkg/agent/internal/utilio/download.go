@@ -20,8 +20,14 @@ import (
 	"time"
 )
 
+const remoteHTTPProbeTimeout = 10 * time.Second
+
 var remoteHTTPClient = &http.Client{
 	Timeout: 10 * time.Minute, // FIXME: proper configuration
+}
+
+var remoteHTTPProbeClient = &http.Client{
+	Timeout: remoteHTTPProbeTimeout,
 }
 
 func downloadFromRemote(ctx context.Context, url string) (io.ReadCloser, error) {
@@ -69,7 +75,7 @@ func probeRemoteHTTPObject(ctx context.Context, method, url string) error {
 		req.Header.Set("Range", "bytes=0-0")
 	}
 
-	resp, err := remoteHTTPClient.Do(req)
+	resp, err := remoteHTTPProbeClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to perform HTTP request: %w", err)
 	}
