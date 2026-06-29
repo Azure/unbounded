@@ -4,14 +4,12 @@
 package rootfs
 
 import (
-	"context"
 	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
 func validRootFSGoalState(t *testing.T) *goalstates.RootFS {
@@ -27,16 +25,19 @@ func validRootFSGoalState(t *testing.T) *goalstates.RootFS {
 	}
 }
 
-func TestCheckGoalStateOK(t *testing.T) {
-	results := CheckGoalState(slog.New(slog.DiscardHandler), validRootFSGoalState(t)).Check(context.Background())
+func TestRootFSPreflightCheckSet(t *testing.T) {
+	checks := Preflight(slog.New(slog.DiscardHandler), nil, &goalstates.MachineGoalState{RootFS: validRootFSGoalState(t)})
 
-	assert.Equal(t, []preflight.Result{preflight.OK(checkGoalStateName, "goal state", "goal state resolved")}, results)
-}
+	names := make([]string, 0, len(checks))
+	for _, check := range checks {
+		names = append(names, check.Name())
+	}
 
-func TestCheckGoalStateResolveError(t *testing.T) {
-	results := CheckGoalState(slog.New(slog.DiscardHandler), nil).Check(context.Background())
-
-	assert.Equal(t, preflight.SeverityError, results[0].Severity)
-	assert.Equal(t, checkGoalStateName, results[0].Name)
-	assert.Equal(t, "goal state could not be resolved", results[0].Message)
+	assert.Equal(t, []string{
+		checkOCIImageReachableName,
+		checkKubernetesArtifactsName,
+		checkCRIArtifactsName,
+		checkCNIArtifactsName,
+		checkNSpawnMachineProvisioningName,
+	}, names)
 }

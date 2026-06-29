@@ -245,9 +245,11 @@ report := preflight.Run(ctx, checks, opts)
 ```
 
 Shared implementation should be factored below both the mutating task and the
-checker. For example, artifact preflight should use the same URL resolution,
-download, decompression, and verification helpers used by rootfs provisioning,
-but it should not call the mutating rootfs task itself.
+checker. For example, artifact preflight should use the same URL resolution and
+remote access helpers used by rootfs provisioning, but it should not call the
+mutating rootfs task itself. The default network access checks should validate
+reachability only. They should not download full binary artifacts, verify
+checksums, decompress archives, or inspect archive contents.
 
 Checks may use temporary files or temporary directories when they need to reuse
 the same download, decompression, verification, or registry code paths as
@@ -411,9 +413,9 @@ Rootfs provisioning checks:
 |---|---|
 | `oci-image-reachable` | Validate the configured rootfs image manifest can be resolved without pulling layers. |
 | `nspawn-machine-provisioning` | Validate the target nspawn machine directory state, rootfs parent directory writability, and host-side nspawn config path writability. |
-| `kubernetes-artifacts` | Validate kubelet/kubectl/kube-proxy artifacts and checksums using the same download and verification calls used by rootfs provisioning, without installing files. |
-| `cri-artifacts` | Validate containerd, runc, and crictl artifacts using the same download/decompression or download calls used by rootfs provisioning, without installing files. |
-| `cni-artifacts` | Validate CNI plugin artifacts using the same download/decompression calls used by rootfs provisioning, without installing files. |
+| `kubernetes-artifacts` | Validate kubelet/kubectl/kube-proxy artifact URLs are reachable without downloading full binaries or checksum files. |
+| `cri-artifacts` | Validate containerd, runc, and crictl artifact URLs are reachable without downloading or extracting full artifacts. |
+| `cni-artifacts` | Validate the CNI plugin artifact URL is reachable without downloading or extracting the full artifact. |
 
 GPU checks:
 

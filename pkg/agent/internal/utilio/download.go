@@ -43,6 +43,49 @@ func downloadFromRemote(ctx context.Context, url string) (io.ReadCloser, error) 
 	return resp.Body, nil
 }
 
+// ProbeRemoteHTTPObject checks that an HTTP artifact object is reachable
+// without downloading the full object. It first tries HEAD, then falls back to a
+// ranged GET for servers that do not support or incorrectly reject HEAD.
+func ProbeRemoteHTTPObject(ctx context.Context, url string) error {
+	if err := probeRemoteHTTPObject(ctx, http.MethodHead, url); err == nil {
+		return nil
+	}
+
+	return probeRemoteHTTPObject(ctx, http.MethodGet, url)
+}
+
+func probeRemoteHTTPObject(ctx context.Context, method, url string) error {
+	req, err := http.NewRequestWithContext(ctx, method, url, http.NoBody)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	if method == http.MethodGet {
+		// Keep the GET fallback non-mutating and lightweight. Range asks the
+		// server for the first byte only, which is enough to prove that the
+		// object is reachable when HEAD is unsupported. Go's HTTP transport does
+		// not add transparent gzip negotiation to ranged requests, so no explicit
+		// Accept-Encoding override is needed here.
+		req.Header.Set("Range", "bytes=0-0")
+	}
+
+	resp, err := remoteHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to perform HTTP request: %w", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // body close
+
+	if isReachableHTTPStatus(resp.StatusCode) {
+		return nil
+	}
+
+	return fmt.Errorf("remote object returned HTTP status %d", resp.StatusCode)
+}
+
+func isReachableHTTPStatus(status int) bool {
+	return status == http.StatusOK || status == http.StatusPartialContent
+}
+
 type TarFile struct {
 	Name string
 	Size int64
