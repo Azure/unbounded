@@ -73,6 +73,15 @@ type siteInitHandler struct {
 	// machina controller until we have public downloadable releases coming from that repository.
 	machinaManifests string
 
+	// withUnboundedStorage controls whether site init installs the optional
+	// unbounded-storage supervisor DaemonSet.
+	withUnboundedStorage bool
+
+	// unboundedStorageManifests is a path to either a directory or archive
+	// containing unbounded-storage supervisor manifests to apply to the cluster.
+	// When set, it implies withUnboundedStorage.
+	unboundedStorageManifests string
+
 	// manageCniPlugin controls whether unbounded-net manages the CNI plugin
 	// for the site. When false, the Site is configured with manageCniPlugin: false
 	// so that an existing CNI (e.g. Cilium, Calico) handles intra-site networking.
@@ -96,6 +105,8 @@ type siteInitHandler struct {
 	installUnboundedCNI *installUnboundedCNI
 
 	installMachina *installMachina
+
+	installUnboundedStorage *installUnboundedStorageSupervisor
 
 	logger *slog.Logger
 }
@@ -139,6 +150,16 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 		h.installMachina = newInstallMachina(h.machinaManifests, nil, h.logger, h.kubeResourcesCli, h.kubeCli)
 	}
 
+	if h.shouldInstallUnboundedStorage() && h.installUnboundedStorage == nil {
+		h.installUnboundedStorage = newInstallUnboundedStorageSupervisor(
+			h.unboundedStorageManifests,
+			nil,
+			h.logger,
+			h.kubeResourcesCli,
+			h.kubeCli,
+		)
+	}
+
 	if err := h.ensureUnboundedCNI(ctx); err != nil {
 		return fmt.Errorf("ensuring unbounded CNI for site %s: %w", h.name, err)
 	}
@@ -178,7 +199,17 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("installing machina controller for site %s: %w", h.name, err)
 	}
 
+	if h.shouldInstallUnboundedStorage() {
+		if err := h.ensureUnboundedStorageIsRunning(ctx); err != nil {
+			return fmt.Errorf("installing unbounded-storage for site %s: %w", h.name, err)
+		}
+	}
+
 	return nil
+}
+
+func (h *siteInitHandler) shouldInstallUnboundedStorage() bool {
+	return h.withUnboundedStorage || h.unboundedStorageManifests != ""
 }
 
 func (h *siteInitHandler) validate() error {
@@ -325,6 +356,23 @@ func (h *siteInitHandler) ensureMachinaIsRunning(ctx context.Context) error {
 	return h.installMachina.run(ctx)
 }
 
+func (h *siteInitHandler) ensureUnboundedStorageIsRunning(ctx context.Context) error {
+	ao := metav1.ApplyOptions{
+		FieldManager: fieldManagerID,
+	}
+
+	nsApply := v1.Namespace(unboundedStorageSupervisorNamespace)
+	if _, err := h.kubeCli.CoreV1().Namespaces().Apply(ctx, nsApply, ao); err != nil {
+		return fmt.Errorf("ensuring namespace %s: %w", unboundedStorageSupervisorNamespace, err)
+	}
+
+	if h.unboundedStorageManifests == "" {
+		h.logger.Info("Using embedded unbounded-storage manifests")
+	}
+
+	return h.installUnboundedStorage.run(ctx)
+}
+
 // ensureUnboundedSite sets up the main gateway and the cluster site that encompasses any nodes attached to the
 // main cluster. For each manifest file name in cfg.Manifests it looks up the file from the
 // assets/unbounded-net-site embed.FS, renders it as a Go template with cfg as the data, and applies
@@ -401,6 +449,8 @@ func siteInitCommand() *cobra.Command {
 
 	cmd.Flags().StringVar(&handler.cniManifests, "cni-manifests", "", "Path or https URL to CNI plugin manifests (uses embedded manifests if omitted)")
 	cmd.Flags().StringVar(&handler.machinaManifests, "machina-manifests", "", "Path or https URL to Machina manifests (uses embedded manifests if omitted)")
+	cmd.Flags().BoolVar(&handler.withUnboundedStorage, "with-unbounded-storage", false, "Install unbounded-storage on cluster nodes")
+	cmd.Flags().StringVar(&handler.unboundedStorageManifests, "unbounded-storage-manifests", "", "Path or https URL to unbounded-storage manifests (uses embedded manifests if omitted; implies --with-unbounded-storage)")
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.name, "name", "", "The name of the site")
 	cmd.Flags().StringVar(&handler.clusterNodeCIDR, "cluster-node-cidr", "", "The cluster node cidr")

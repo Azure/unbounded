@@ -75,8 +75,8 @@ GANTRY_NAMESPACE ?= gantry
 # unbounded-storage-supervisor (Go binary; distinct from the Rust crate below)
 UNBOUNDED_STORAGE_SUPERVISOR_BIN=bin/unbounded-storage-supervisor
 UNBOUNDED_STORAGE_SUPERVISOR_CMD=./cmd/unbounded-storage-supervisor
-UNBOUNDED_STORAGE_SUPERVISOR_TAG ?= latest
-UNBOUNDED_STORAGE_SUPERVISOR_IMAGE=$(CONTAINER_REGISTRY)/unbounded-storage-supervisor:$(UNBOUNDED_STORAGE_SUPERVISOR_TAG)
+UNBOUNDED_STORAGE_SUPERVISOR_TAG ?= $(VERSION)
+UNBOUNDED_STORAGE_SUPERVISOR_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-storage-supervisor:$(UNBOUNDED_STORAGE_SUPERVISOR_TAG)
 UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE ?= unbounded-kube
 UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-storage-supervisor
 UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-storage-supervisor/rendered
@@ -416,24 +416,24 @@ lint: ## Run golangci-lint (matches CI; run `make fmt` to auto-fix)
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-test: machina-manifests net-manifests ## Run all tests with race detector
+test: machina-manifests net-manifests unbounded-storage-supervisor-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
-test: lint machina-manifests net-manifests ## Run all tests (implies lint)
+test: lint machina-manifests net-manifests unbounded-storage-supervisor-manifests ## Run all tests (implies lint)
 	$(GOTEST) ./...
 
 endif
 
-build: machina-manifests net-manifests ## Build all Go packages
+build: machina-manifests net-manifests unbounded-storage-supervisor-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate ./...
 
-vulncheck: machina-manifests net-manifests ## Run govulncheck for known vulnerabilities
+vulncheck: machina-manifests net-manifests unbounded-storage-supervisor-manifests ## Run govulncheck for known vulnerabilities
 	@# GO-2024-3218 (libp2p/go-libp2p-kad-dht): all versions affected, no fix
 	@# available. Theoretical DHT content-censorship attack, not exploitable in
 	@# gantry's private-cluster deployment model. Tracked upstream at
@@ -469,7 +469,7 @@ notice-check: ## Verify NOTICE is in sync with go.mod and frontend/package.json
 
 ##@ Build
 
-kubectl-unbounded-build: machina-manifests net-manifests ## Build the kubectl-unbounded binary (no lint/test)
+kubectl-unbounded-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests ## Build the kubectl-unbounded binary (no lint/test)
 	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
 
 kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded plugin (implies test)
@@ -1142,7 +1142,7 @@ images-net-all: image-net-controller-local image-net-node-local ## Build all unb
 
 images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
-images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local ## Build all container images locally
+images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-unbounded-storage-supervisor-local ## Build all container images locally
 
 ##@ Net Frontend
 
@@ -1213,14 +1213,16 @@ net-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 RELEASE_MANIFESTS_STAGE_DIR := build/release-manifests
 RELEASE_MANIFESTS_NAME      := unbounded-manifests-$(VERSION)
 
-release-manifests: machina-manifests machine-ops-manifests net-manifests ## Build stamped combined manifest tarball under build/
+release-manifests: machina-manifests machine-ops-manifests net-manifests unbounded-storage-supervisor-manifests ## Build stamped combined manifest tarball under build/
 	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net
+	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor
 	@cp -R $(MACHINA_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina/
 	@cp -R $(MACHINE_OPS_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops/
 	@cp -R $(NET_MANIFEST_RENDERED_DIR)/.     $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net/
+	@cp -R $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor/
 	@echo "$(VERSION)" > $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/VERSION
 	@mkdir -p build
 	tar czf "build/$(RELEASE_MANIFESTS_NAME).tar.gz" -C $(RELEASE_MANIFESTS_STAGE_DIR) $(RELEASE_MANIFESTS_NAME)

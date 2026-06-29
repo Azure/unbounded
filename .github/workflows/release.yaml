@@ -22,7 +22,7 @@ name: unbounded release
 #     -> binaries          (GoReleaser; creates draft GitHub release)
 #     -> net-images        (matrix: amd64-native, arm64-native)
 #         -> net-images-manifest (multi-arch tag stitch + sign + SBOM attest)
-#     -> component-images  (matrix: machina, machine-ops-controller, metalman, host-ubuntu2404)
+#     -> component-images  (matrix: machina, machine-ops-controller, metalman, orca, unbounded-storage-supervisor, host-ubuntu2404)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> storage-binaries  (matrix: amd64, arm64; binary + bundled libfabric)
 #     -> finalize          (attach extras + krew manifest)
@@ -465,6 +465,10 @@ jobs:
             trivy: true
           - name: orca
             file: images/orca/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          - name: unbounded-storage-supervisor
+            file: images/unbounded-storage-supervisor/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
           - name: host-ubuntu2404

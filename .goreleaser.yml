@@ -7,6 +7,7 @@ before:
     # goreleaser fans builds out across goos/goarch concurrently.
     - make machina-manifests VERSION={{ .Tag }}
     - make net-manifests VERSION={{ .Tag }}
+    - make unbounded-storage-supervisor-manifests VERSION={{ .Tag }}
 
 builds:
   - id: kubectl-unbounded

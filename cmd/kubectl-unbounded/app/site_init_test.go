@@ -81,6 +81,50 @@ func TestSiteInitCommand_ManageCniPluginFlag(t *testing.T) {
 	require.Equal(t, "true", f.DefValue, "default should be true")
 }
 
+func TestSiteInitCommand_UnboundedStorageFlags(t *testing.T) {
+	cmd := siteInitCommand()
+
+	withStorage := cmd.Flags().Lookup("with-unbounded-storage")
+	require.NotNil(t, withStorage, "--with-unbounded-storage flag should exist")
+	require.Equal(t, "false", withStorage.DefValue)
+
+	storageManifests := cmd.Flags().Lookup("unbounded-storage-manifests")
+	require.NotNil(t, storageManifests, "--unbounded-storage-manifests flag should exist")
+	require.Equal(t, "", storageManifests.DefValue)
+}
+
+func TestShouldInstallUnboundedStorage(t *testing.T) {
+	tests := []struct {
+		name        string
+		handler     siteInitHandler
+		wantInstall bool
+	}{
+		{
+			name: "default disabled",
+		},
+		{
+			name: "explicit flag enabled",
+			handler: siteInitHandler{
+				withUnboundedStorage: true,
+			},
+			wantInstall: true,
+		},
+		{
+			name: "manifests imply enabled",
+			handler: siteInitHandler{
+				unboundedStorageManifests: "https://example.com/storage.tar.gz",
+			},
+			wantInstall: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.wantInstall, tt.handler.shouldInstallUnboundedStorage())
+		})
+	}
+}
+
 func TestEnsureUnboundedSite_ManageCniPluginFalse(t *testing.T) {
 	kubeResourcesCli := fakeclient.NewClientBuilder().
 		WithInterceptorFuncs(interceptor.Funcs{
