@@ -271,6 +271,10 @@ mod tests {
             queue_depth: None,
             page_size_bytes: None,
             skip_recovery_scan: false,
+            force_format: false,
+            bypass_admission: false,
+            bypass_index_read: false,
+            bypass_checksum: false,
             disable_page_cache: true,
             config: Some(disk_spec::Config::Block(BlockDiskConfig {
                 numa: None,
