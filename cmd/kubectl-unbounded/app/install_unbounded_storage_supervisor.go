@@ -142,6 +142,7 @@ func setDaemonSetSiteNodeSelector(path, daemonSetName, siteName string) (bool, e
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 
 	var docs []map[string]any
+
 	patched := false
 
 	for {
