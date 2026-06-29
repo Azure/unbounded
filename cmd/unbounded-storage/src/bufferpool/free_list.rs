@@ -131,6 +131,10 @@ impl FreeList {
         }
     }
 
+    pub fn has_waiters(&self) -> bool {
+        !self.inner.borrow().waiters.is_empty()
+    }
+
     /// Non-blocking allocation for speculative (prefetch) use that
     /// yields only a *spare* page.
     ///

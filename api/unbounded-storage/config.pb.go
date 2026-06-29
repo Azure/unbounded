@@ -1084,6 +1084,8 @@ type DiskSpec struct {
 	// devices where cache contents were just populated by the same daemon and
 	// the target is measuring the NVMe data path rather than CPU checksum cost.
 	BypassChecksum bool `protobuf:"varint,7,opt,name=bypass_checksum,json=bypassChecksum,proto3" json:"bypass_checksum,omitempty"`
+	// Disables the in-memory bufferpool page cache for pages routed to this disk.
+	DisablePageCache bool `protobuf:"varint,10,opt,name=disable_page_cache,json=disablePageCache,proto3" json:"disable_page_cache,omitempty"`
 	// Types that are valid to be assigned to Config:
 	//
 	//	*DiskSpec_Block
@@ -1168,6 +1170,13 @@ func (x *DiskSpec) GetBypassIndexRead() bool {
 func (x *DiskSpec) GetBypassChecksum() bool {
 	if x != nil {
 		return x.BypassChecksum
+	}
+	return false
+}
+
+func (x *DiskSpec) GetDisablePageCache() bool {
+	if x != nil {
+		return x.DisablePageCache
 	}
 	return false
 }
@@ -2189,7 +2198,7 @@ const file_config_proto_rawDesc = "" +
 	"\vnic_workers\x18\a \x01(\x04H\x01R\n" +
 	"nicWorkers\x88\x01\x01B\x10\n" +
 	"\x0e_serving_coresB\x0e\n" +
-	"\f_nic_workers\"\xdf\x03\n" +
+	"\f_nic_workers\"\x8d\x04\n" +
 	"\bDiskSpec\x12$\n" +
 	"\vqueue_depth\x18\x01 \x01(\rH\x01R\n" +
 	"queueDepth\x88\x01\x01\x12+\n" +
@@ -2198,7 +2207,9 @@ const file_config_proto_rawDesc = "" +
 	"\fforce_format\x18\x04 \x01(\bR\vforceFormat\x12)\n" +
 	"\x10bypass_admission\x18\x05 \x01(\bR\x0fbypassAdmission\x12*\n" +
 	"\x11bypass_index_read\x18\x06 \x01(\bR\x0fbypassIndexRead\x12'\n" +
-	"\x0fbypass_checksum\x18\a \x01(\bR\x0ebypassChecksum\x12A\n" +
+	"\x0fbypass_checksum\x18\a \x01(\bR\x0ebypassChecksum\x12,\n" +
+	"\x12disable_page_cache\x18\n" +
+	" \x01(\bR\x10disablePageCache\x12A\n" +
 	"\x05block\x18\b \x01(\v2).unbounded.storage.config.BlockDiskConfigH\x00R\x05block\x12>\n" +
 	"\x04file\x18\t \x01(\v2(.unbounded.storage.config.FileDiskConfigH\x00R\x04fileB\b\n" +
 	"\x06configB\x0e\n" +

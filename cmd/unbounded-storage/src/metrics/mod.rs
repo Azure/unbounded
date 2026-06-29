@@ -43,6 +43,8 @@ pub use exporter::{DeviceInventoryStatus, ExporterError, spawn};
 /// sent in the `/metrics` response.
 pub const TEXT_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
+static RENDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Latency histogram buckets in seconds: 50us, then a factor of 3 per
 /// bucket up to ~8.9s. Covers a fast local cache hit through a slow
 /// cross-node fabric or origin fetch in one shared layout.
@@ -150,10 +152,13 @@ struct Metrics {
 
     // Bufferpool.
     bufferpool_requests: IntCounterVec,
+    bufferpool_page_cache_requests: IntCounterVec,
+    bufferpool_page_cache_evictions: IntCounter,
     bufferpool_miss_source: IntCounterVec,
     bufferpool_inflight_coalesced: IntCounter,
     bufferpool_pages_total: IntGauge,
     bufferpool_pages_free: IntGauge,
+    bufferpool_pages_cached: IntGauge,
     bufferpool_prefetch_inflight_pages: IntGauge,
 
     // p2p routing.
@@ -265,6 +270,17 @@ impl Metrics {
             ),
             &["result"],
         )?;
+        let bufferpool_page_cache_requests = IntCounterVec::new(
+            Opts::new(
+                "unbounded_storage_bufferpool_page_cache_requests_total",
+                "Bufferpool in-memory page-cache lookups, by result (hit/miss).",
+            ),
+            &["result"],
+        )?;
+        let bufferpool_page_cache_evictions = IntCounter::new(
+            "unbounded_storage_bufferpool_page_cache_evictions_total",
+            "Idle in-memory bufferpool pages evicted to satisfy allocation pressure.",
+        )?;
         let bufferpool_miss_source = IntCounterVec::new(
             Opts::new(
                 "unbounded_storage_bufferpool_miss_source_total",
@@ -283,6 +299,10 @@ impl Metrics {
         let bufferpool_pages_free = IntGauge::new(
             "unbounded_storage_bufferpool_pages_free",
             "Free bufferpool pages across all shards.",
+        )?;
+        let bufferpool_pages_cached = IntGauge::new(
+            "unbounded_storage_bufferpool_pages_cached",
+            "Idle in-memory cached bufferpool pages across all shards.",
         )?;
         let bufferpool_prefetch_inflight_pages = IntGauge::new(
             "unbounded_storage_bufferpool_prefetch_inflight_pages",
@@ -438,10 +458,13 @@ impl Metrics {
             frontend_request_duration,
             frontend_active_connections,
             bufferpool_requests,
+            bufferpool_page_cache_requests,
+            bufferpool_page_cache_evictions,
             bufferpool_miss_source,
             bufferpool_inflight_coalesced,
             bufferpool_pages_total,
             bufferpool_pages_free,
+            bufferpool_pages_cached,
             bufferpool_prefetch_inflight_pages,
             p2p_requests,
             p2p_hop_limit_exceeded,
@@ -481,10 +504,13 @@ impl Metrics {
             Box::new(self.frontend_request_duration.clone()),
             Box::new(self.frontend_active_connections.clone()),
             Box::new(self.bufferpool_requests.clone()),
+            Box::new(self.bufferpool_page_cache_requests.clone()),
+            Box::new(self.bufferpool_page_cache_evictions.clone()),
             Box::new(self.bufferpool_miss_source.clone()),
             Box::new(self.bufferpool_inflight_coalesced.clone()),
             Box::new(self.bufferpool_pages_total.clone()),
             Box::new(self.bufferpool_pages_free.clone()),
+            Box::new(self.bufferpool_pages_cached.clone()),
             Box::new(self.bufferpool_prefetch_inflight_pages.clone()),
             Box::new(self.p2p_requests.clone()),
             Box::new(self.p2p_hop_limit_exceeded.clone()),
@@ -553,6 +579,29 @@ pub fn bufferpool_request(result: Lookup) {
         m.bufferpool_requests
             .with_label_values(&[result.as_str()])
             .inc();
+    }
+}
+
+/// Record an in-memory bufferpool page-cache lookup result (hit or miss).
+pub fn bufferpool_page_cache_request(result: Lookup) {
+    if let Some(m) = metrics() {
+        m.bufferpool_page_cache_requests
+            .with_label_values(&[result.as_str()])
+            .inc();
+    }
+}
+
+/// Record eviction of one idle in-memory cached page.
+pub fn bufferpool_page_cache_evicted() {
+    if let Some(m) = metrics() {
+        m.bufferpool_page_cache_evictions.inc();
+    }
+}
+
+/// Adjust the live cached-page gauge by `delta`.
+pub fn bufferpool_cached_delta(delta: i64) {
+    if let Some(m) = metrics() {
+        m.bufferpool_pages_cached.add(delta);
     }
 }
 
@@ -770,6 +819,7 @@ pub fn shards_delta(delta: i64) {
 /// format, refreshing the pull-style series (config versions and
 /// `process_*`) at scrape time. Returns an empty vector before [`init`].
 pub fn render(versions: &ConfigVersionStatus) -> Vec<u8> {
+    let _guard = RENDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let m = match metrics() {
         Some(m) => m,
         None => return Vec::new(),
@@ -864,15 +914,8 @@ fn status_str(status: u16) -> &'static str {
 mod tests {
     use super::*;
 
-    // The metric registry is a process-global singleton, so tests that
-    // render and assert on exact gauge values must not run concurrently
-    // with one another (a parallel render mutating the same config_version
-    // gauge would race). This lock serializes those tests.
-    static RENDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn init_is_idempotent_and_render_contains_build_info() {
-        let _guard = RENDER_LOCK.lock().unwrap();
         init();
         init();
         let versions = ConfigVersionStatus::new(7);
@@ -885,10 +928,12 @@ mod tests {
 
     #[test]
     fn helpers_move_their_series() {
-        let _guard = RENDER_LOCK.lock().unwrap();
         init();
         frontend_request("fe", "GET", 200, 4096, 0.001);
         bufferpool_request(Lookup::Hit);
+        bufferpool_page_cache_request(Lookup::Hit);
+        bufferpool_page_cache_evicted();
+        bufferpool_cached_delta(1);
         bufferpool_miss_source(MissSource::Disk);
         backend_fetch("b", Outcome::Ok, 100, 0.01);
         storage_disk_op("/dev/x", DiskOp::Read, Outcome::Ok);
@@ -899,6 +944,11 @@ mod tests {
         ));
         assert!(text.contains("unbounded_storage_bufferpool_requests_total{result=\"hit\"}"));
         assert!(
+            text.contains("unbounded_storage_bufferpool_page_cache_requests_total{result=\"hit\"}")
+        );
+        assert!(text.contains("unbounded_storage_bufferpool_page_cache_evictions_total"));
+        assert!(text.contains("unbounded_storage_bufferpool_pages_cached"));
+        assert!(
             text.contains("unbounded_storage_backend_fetches_total{backend=\"b\",outcome=\"ok\"}")
         );
         assert!(text.contains(
@@ -908,7 +958,6 @@ mod tests {
 
     #[test]
     fn config_version_series_track_the_handle() {
-        let _guard = RENDER_LOCK.lock().unwrap();
         init();
         let versions = ConfigVersionStatus::new(3);
         let text = String::from_utf8(render(&versions)).unwrap();

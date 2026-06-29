@@ -207,6 +207,9 @@ message DiskSpec {
   // the target is measuring the NVMe data path rather than CPU checksum cost.
   bool bypass_checksum = 7;
 
+  // Disables the in-memory bufferpool page cache for pages routed to this disk.
+  bool disable_page_cache = 10;
+
   oneof config {
     BlockDiskConfig block = 8;
     FileDiskConfig file = 9;

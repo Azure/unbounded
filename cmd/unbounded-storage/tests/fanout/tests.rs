@@ -16,7 +16,7 @@ use proptest::prelude::*;
 use unbounded_storage::bufferpool::{
     BlockStore, BulkRef, Error, PageRef, PageStream, Pool, PoolConfig, Req, StripeKey, Transport,
 };
-use unbounded_storage::fanout::{FetchChannel, FetchService};
+use unbounded_storage::fanout::{FetchChannel, FetchEvent, FetchService};
 use unbounded_storage::memory::Backing;
 use unbounded_storage::storage::StripeReq;
 
@@ -38,7 +38,6 @@ proptest! {
         assert_no_pin_leak(&report)?;
         assert_faults_only_with_injection(&report)?;
         assert_shutdown_send_errors(&report)?;
-        assert_busy_only_under_pressure(&report)?;
     }
 }
 
@@ -99,16 +98,24 @@ fn assert_pagelocs_cover(report: &RunReport) -> Result<(), TestCaseError> {
 /// Invariant: no owner pin leak at quiescence.
 ///
 /// After every client has released its pins and the service has
-/// drained, all pool pages must be back on the free list. Bufferpool DST
-/// owns the lower-level inflight stripe-fetch accounting; fanout only
-/// checks the owner pin lifetime and release contract.
+/// drained, all pool pages must be free or idle-cached with no active
+/// inflight entries. Bufferpool DST owns the lower-level stripe-fetch
+/// state transitions; fanout only checks the owner pin lifetime and
+/// release contract.
 fn assert_no_pin_leak(report: &RunReport) -> Result<(), TestCaseError> {
     prop_assert_eq!(
-        report.free_pages_at_end,
+        report.free_pages_at_end + report.cached_pages_at_end,
         report.total_pool_pages,
-        "pages leaked: free={} expected {}",
+        "pages leaked: free={} cached={} expected {}",
         report.free_pages_at_end,
+        report.cached_pages_at_end,
         report.total_pool_pages,
+    );
+    prop_assert_eq!(
+        report.active_inflight_entries_at_end,
+        0,
+        "active inflight entries leaked: {}",
+        report.active_inflight_entries_at_end,
     );
     Ok(())
 }
@@ -117,10 +124,10 @@ fn assert_no_pin_leak(report: &RunReport) -> Result<(), TestCaseError> {
 ///
 /// With `io_fault_rate == 0` the owner read path never surfaces an error
 /// to the coordinator, so every fetch must resolve `Ok`. This now also
-/// guards the page-pressure path: under `tight_pool` the owner returns
-/// `Error::Busy` when it cannot pin, but coordinators retry until they
-/// succeed, so `Busy` must never leak out as a `FetchOutcome::Err`. A
-/// happy-path run producing a `FetchOutcome::Err` is itself a bug.
+/// guards the page-pressure path: under `tight_pool` the owner handles
+/// transient `Error::Busy` internally, so `Busy` must never leak out as a
+/// `FetchOutcome::Err`. A happy-path run producing a `FetchOutcome::Err`
+/// is itself a bug.
 fn assert_faults_only_with_injection(report: &RunReport) -> Result<(), TestCaseError> {
     if report.io_fault_rate == 0 {
         for (i, o) in report.outcomes.iter().enumerate() {
@@ -145,27 +152,6 @@ fn assert_shutdown_send_errors(report: &RunReport) -> Result<(), TestCaseError> 
     Ok(())
 }
 
-/// Invariant: `Error::Busy` back-pressure only arises under page
-/// pressure.
-///
-/// The owner read path returns `Busy` (and coordinators retry) only when
-/// the pool cannot pin a fetch's head page non-blockingly. The generous
-/// pool sizing holds every distinct stripe at once, so it must never
-/// produce a retry; any `busy_retries` there would mean the fail-fast
-/// path fired when there was capacity. A positive count is expected only
-/// under `tight_pool`.
-fn assert_busy_only_under_pressure(report: &RunReport) -> Result<(), TestCaseError> {
-    if !report.tight_pool {
-        prop_assert_eq!(
-            report.busy_retries,
-            0,
-            "{} Busy retries on a generously sized pool",
-            report.busy_retries,
-        );
-    }
-    Ok(())
-}
-
 #[test]
 fn progress_polls_inflight_fetches_with_configured_waker() {
     let page_size = 64;
@@ -180,10 +166,7 @@ fn progress_polls_inflight_fetches_with_configured_waker() {
                 max_inflight_pages: 1,
             },
             backing,
-            PendingTransport {
-                base,
-                payload: payload.clone(),
-            },
+            PendingTransport::new(base, page_size, payload.clone()),
             MissBlockStore,
         )
         .expect("pool"),
@@ -197,16 +180,18 @@ fn progress_polls_inflight_fetches_with_configured_waker() {
     let mut service = FetchService::new(pool.clone(), rx, page_size, waker);
 
     let req = StripeReq::new(StripeKey([9u8; 32]));
-    let mut fetch = Box::pin(channel.fetch(req, 0, page_size as u64));
+    let mut stream = channel.fetch(req, 0, page_size as u64).expect("stream");
     let noop = unbounded_storage::runtime::noop_waker();
     let mut cx = Context::from_waker(&noop);
+    let mut event = Box::pin(stream.next_event());
 
-    assert!(fetch.as_mut().poll(&mut cx).is_pending());
+    assert!(event.as_mut().poll(&mut cx).is_pending());
+    let wakes_after_fetch = wakes.load(Ordering::SeqCst);
 
     assert!(service.progress(), "admitting the queued fetch is progress");
     assert_eq!(
         wakes.load(Ordering::SeqCst),
-        1,
+        wakes_after_fetch + 1,
         "first in-flight poll must wake the configured shard waker",
     );
 
@@ -216,21 +201,473 @@ fn progress_polls_inflight_fetches_with_configured_waker() {
     );
     assert_eq!(
         wakes.load(Ordering::SeqCst),
-        2,
+        wakes_after_fetch + 2,
         "subsequent pending poll must still use the configured shard waker",
     );
 
     assert!(service.progress(), "the final fetch completion is progress");
-    let reply = match fetch.as_mut().poll(&mut cx) {
-        Poll::Ready(Ok(reply)) => reply,
+    let page = match event.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(unbounded_storage::fanout::FetchEvent::Page(page))) => page,
         other => panic!("fetch did not resolve after completion: {other:?}"),
     };
-    assert_eq!(reply.pages.len(), 1);
-    assert_eq!(reply.pages[0].len, page_size as u32);
+    assert_eq!(page.loc.len, page_size as u32);
 
-    channel.release(reply.pin_token);
+    drop(event);
+
+    let wakes_before_release = wakes.load(Ordering::SeqCst);
+    stream.release(page.pin_token);
+    assert_eq!(
+        wakes.load(Ordering::SeqCst),
+        wakes_before_release + 1,
+        "pin release must wake the owner service promptly",
+    );
     assert!(service.progress(), "release command is progress");
-    assert_eq!(pool.free_pages(), page_count);
+    assert_eq!(pool.free_pages() + pool.cached_pages(), page_count);
+    assert_eq!(pool.active_inflight_entries(), 0);
+}
+
+#[test]
+fn cached_head_page_is_emitted_before_later_miss_completes() {
+    let page_size = 64;
+    let page_count = 2;
+    let backing = heap_backing(page_size, page_count);
+    let base = backing.base;
+    let payload: Vec<u8> = (0..page_size * page_count).map(|i| i as u8).collect();
+    let pool = Rc::new(
+        Pool::new(
+            PoolConfig {
+                max_concurrent_streams: 4,
+                max_inflight_pages: 1,
+            },
+            backing,
+            PendingTransport::new(base, page_size, payload),
+            MissBlockStore,
+        )
+        .expect("pool"),
+    );
+    let (channel, rx) = FetchChannel::new();
+    let waker = unbounded_storage::runtime::noop_waker();
+    let mut service = FetchService::new(pool.clone(), rx, page_size, waker.clone());
+    let mut cx = Context::from_waker(&waker);
+    let req = StripeReq::new(StripeKey([8u8; 32]));
+
+    let mut warm = channel
+        .fetch(req.clone(), 0, page_size as u64)
+        .expect("warm stream");
+    let warm_page = poll_page_event(&mut service, &mut warm, &mut cx);
+    warm.release(warm_page.pin_token);
+    assert!(service.progress(), "release command is progress");
+    drain_stream_done(&mut service, &mut warm, &mut cx);
+    drop(warm);
+    assert_eq!(pool.cached_pages(), 1, "warm page should be cached");
+
+    let mut stream = channel
+        .fetch(req, 0, (page_size * page_count) as u64)
+        .expect("fetch stream");
+    let mut first = Box::pin(stream.next_event());
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(service.progress(), "admission should emit cached head page");
+    let page = match first.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(FetchEvent::Page(page))) => page,
+        other => panic!("cached head page was not emitted immediately: {other:?}"),
+    };
+    assert_eq!(page.ordinal, 0);
+    let pin_token = page.pin_token;
+    drop(first);
+    stream.release(pin_token);
+
+    let mut second = Box::pin(stream.next_event());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    assert!(service.progress(), "release command is progress");
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    drop(second);
+
+    let second_page = poll_page_event(&mut service, &mut stream, &mut cx);
+    assert_eq!(second_page.ordinal, 1);
+    stream.release(second_page.pin_token);
+    assert!(service.progress(), "release command is progress");
+    drain_stream_done(&mut service, &mut stream, &mut cx);
+    assert_eq!(pool.free_pages() + pool.cached_pages(), page_count);
+    assert_eq!(pool.active_inflight_entries(), 0);
+}
+
+#[test]
+fn cached_later_page_is_emitted_before_head_miss_completes() {
+    let page_size = 64;
+    let page_count = 3;
+    let backing = heap_backing(page_size, page_count);
+    let base = backing.base;
+    let payload: Vec<u8> = (0..page_size * 2).map(|i| i as u8).collect();
+    let pool = Rc::new(
+        Pool::new(
+            PoolConfig {
+                max_concurrent_streams: 4,
+                max_inflight_pages: 1,
+            },
+            backing,
+            PendingTransport::new(base, page_size, payload),
+            MissBlockStore,
+        )
+        .expect("pool"),
+    );
+    let (channel, rx) = FetchChannel::new();
+    let waker = unbounded_storage::runtime::noop_waker();
+    let mut service = FetchService::new(pool.clone(), rx, page_size, waker.clone());
+    let mut cx = Context::from_waker(&waker);
+    let req = StripeReq::new(StripeKey([0x81; 32]));
+
+    let mut warm = channel
+        .fetch(req.clone(), page_size as u64, page_size as u64)
+        .expect("warm stream");
+    let warm_page = poll_page_event(&mut service, &mut warm, &mut cx);
+    warm.release(warm_page.pin_token);
+    assert!(service.progress(), "release command is progress");
+    drain_stream_done(&mut service, &mut warm, &mut cx);
+    drop(warm);
+    assert_eq!(pool.cached_pages(), 1, "later page should be cached");
+
+    let mut stream = channel
+        .fetch(req, 0, (page_size * 2) as u64)
+        .expect("fetch stream");
+    let mut first = Box::pin(stream.next_event());
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(service.progress(), "admission should poll the fetch");
+    let page = match first.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(FetchEvent::Page(page))) => page,
+        other => panic!("cached later page was not emitted behind pending head: {other:?}"),
+    };
+    assert_eq!(page.ordinal, 1);
+    let pin_token = page.pin_token;
+    drop(first);
+    stream.release(pin_token);
+
+    let page0 = poll_page_event(&mut service, &mut stream, &mut cx);
+    assert_eq!(page0.ordinal, 0);
+    stream.release(page0.pin_token);
+    assert!(service.progress(), "release commands are progress");
+    drain_stream_done(&mut service, &mut stream, &mut cx);
+    assert_eq!(pool.free_pages() + pool.cached_pages(), page_count);
+    assert_eq!(pool.active_inflight_entries(), 0);
+}
+
+#[test]
+fn newly_ready_later_page_is_emitted_while_head_is_pending() {
+    let page_size = 64;
+    let page_count = 4;
+    let backing = heap_backing(page_size, page_count);
+    let base = backing.base;
+    let payload: Vec<u8> = (0..page_size * 2).map(|i| i as u8).collect();
+    let transport = PendingTransport::new(base, page_size, payload)
+        .with_pending_polls(0, 8)
+        .with_pending_polls(page_size, 0);
+    let pool = Rc::new(
+        Pool::new(
+            PoolConfig {
+                max_concurrent_streams: 4,
+                max_inflight_pages: 1,
+            },
+            backing,
+            transport,
+            MissBlockStore,
+        )
+        .expect("pool"),
+    );
+    let (channel, rx) = FetchChannel::new();
+    let waker = unbounded_storage::runtime::noop_waker();
+    let mut service = FetchService::new(pool.clone(), rx, page_size, waker.clone());
+    let mut cx = Context::from_waker(&waker);
+    let req = StripeReq::new(StripeKey([0x82; 32]));
+
+    let mut waiting = channel
+        .fetch(req.clone(), 0, (page_size * 2) as u64)
+        .expect("waiting stream");
+    let mut waiting_event = Box::pin(waiting.next_event());
+    assert!(waiting_event.as_mut().poll(&mut cx).is_pending());
+    assert!(service.progress(), "admission should leave head pending");
+    assert!(waiting_event.as_mut().poll(&mut cx).is_pending());
+    drop(waiting_event);
+
+    let mut producer = channel
+        .fetch(req, page_size as u64, page_size as u64)
+        .expect("producer stream");
+    let produced = poll_page_event(&mut service, &mut producer, &mut cx);
+    producer.release(produced.pin_token);
+    assert!(service.progress(), "producer release is progress");
+    drain_stream_done(&mut service, &mut producer, &mut cx);
+
+    let mut next = Box::pin(waiting.next_event());
+    let page = match next.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(FetchEvent::Page(page))) => page,
+        Poll::Pending => {
+            assert!(
+                service.progress(),
+                "ready later page should wake waiting fetch"
+            );
+            match next.as_mut().poll(&mut cx) {
+                Poll::Ready(Ok(FetchEvent::Page(page))) => page,
+                other => {
+                    panic!("newly ready later page was not emitted behind pending head: {other:?}")
+                }
+            }
+        }
+        other => panic!("newly ready later page was not emitted behind pending head: {other:?}"),
+    };
+    assert_eq!(page.ordinal, 1);
+    let pin_token = page.pin_token;
+    drop(next);
+    waiting.release(pin_token);
+
+    let page0 = poll_page_event(&mut service, &mut waiting, &mut cx);
+    assert_eq!(page0.ordinal, 0);
+    waiting.release(page0.pin_token);
+    assert!(service.progress(), "waiting releases are progress");
+    drain_stream_done(&mut service, &mut waiting, &mut cx);
+    assert_eq!(pool.free_pages() + pool.cached_pages(), page_count);
+    assert_eq!(pool.active_inflight_entries(), 0);
+}
+
+#[test]
+fn later_page_error_keeps_already_emitted_pin_until_release() {
+    let page_size = 64;
+    let page_count = 2;
+    let backing = heap_backing(page_size, page_count);
+    let base = backing.base;
+    let payload: Vec<u8> = (0..page_size * 2).map(|i| i as u8).collect();
+    let transport = PendingTransport::new(base, page_size, payload)
+        .with_pending_polls(0, 0)
+        .with_pending_polls(page_size, 0)
+        .with_error_offset(page_size);
+    let pool = Rc::new(
+        Pool::new(
+            PoolConfig {
+                max_concurrent_streams: 4,
+                max_inflight_pages: 2,
+            },
+            backing,
+            transport,
+            MissBlockStore,
+        )
+        .expect("pool"),
+    );
+    let (channel, rx) = FetchChannel::new();
+    let waker = unbounded_storage::runtime::noop_waker();
+    let mut service = FetchService::new(pool.clone(), rx, page_size, waker.clone());
+    let mut cx = Context::from_waker(&waker);
+    let req = StripeReq::new(StripeKey([0x83; 32]));
+
+    let mut stream = channel
+        .fetch(req, 0, (page_size * 2) as u64)
+        .expect("fetch stream");
+    let page0 = poll_page_event(&mut service, &mut stream, &mut cx);
+    assert_eq!(page0.ordinal, 0);
+    assert_eq!(
+        pool.free_pages() + pool.cached_pages(),
+        page_count - 1,
+        "emitted page is pinned before the later error",
+    );
+
+    let mut event = Box::pin(stream.next_event());
+    let mut got_error = false;
+    for _ in 0..8 {
+        match event.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(_)) => {
+                got_error = true;
+                break;
+            }
+            Poll::Ready(Ok(other)) => panic!("expected error after first page, got {other:?}"),
+            Poll::Pending => {
+                service.progress();
+            }
+        }
+    }
+    assert!(got_error, "expected later page error");
+    assert_eq!(
+        pool.free_pages() + pool.cached_pages(),
+        page_count - 1,
+        "later error must not release an already emitted page pin",
+    );
+    drop(event);
+
+    stream.release(page0.pin_token);
+    assert!(service.progress(), "explicit release is progress");
+    assert_eq!(pool.free_pages() + pool.cached_pages(), page_count);
+    assert_eq!(pool.active_inflight_entries(), 0);
+}
+
+#[test]
+fn cancel_releases_emitted_pin_without_explicit_release() {
+    let page_size = 64;
+    let page_count = 1;
+    let backing = heap_backing(page_size, page_count);
+    let base = backing.base;
+    let payload: Vec<u8> = (0..page_size).map(|i| i as u8).collect();
+    let pool = Rc::new(
+        Pool::new(
+            PoolConfig {
+                max_concurrent_streams: 4,
+                max_inflight_pages: 1,
+            },
+            backing,
+            PendingTransport::new(base, page_size, payload).with_pending_polls(0, 0),
+            MissBlockStore,
+        )
+        .expect("pool"),
+    );
+    let (channel, rx) = FetchChannel::new();
+    let waker = unbounded_storage::runtime::noop_waker();
+    let mut service = FetchService::new(pool.clone(), rx, page_size, waker.clone());
+    let mut cx = Context::from_waker(&waker);
+    let req = StripeReq::new(StripeKey([0x84; 32]));
+
+    let mut stream = channel
+        .fetch(req, 0, page_size as u64)
+        .expect("fetch stream");
+    let page = poll_page_event(&mut service, &mut stream, &mut cx);
+    drop(stream);
+    assert!(service.progress(), "drop should enqueue cancel");
+    assert_eq!(
+        pool.free_pages() + pool.cached_pages(),
+        page_count,
+        "cancel must release emitted pages that were never sent",
+    );
+    assert_eq!(pool.active_inflight_entries(), 0);
+
+    channel.release(page.pin_token);
+    assert!(service.progress(), "late explicit release is a no-op");
+    assert_eq!(pool.free_pages() + pool.cached_pages(), page_count);
+}
+
+#[test]
+fn cancel_retains_pin_marked_sending_until_release() {
+    let page_size = 64;
+    let page_count = 1;
+    let backing = heap_backing(page_size, page_count);
+    let base = backing.base;
+    let payload: Vec<u8> = (0..page_size).map(|i| i as u8).collect();
+    let pool = Rc::new(
+        Pool::new(
+            PoolConfig {
+                max_concurrent_streams: 4,
+                max_inflight_pages: 1,
+            },
+            backing,
+            PendingTransport::new(base, page_size, payload).with_pending_polls(0, 0),
+            MissBlockStore,
+        )
+        .expect("pool"),
+    );
+    let (channel, rx) = FetchChannel::new();
+    let waker = unbounded_storage::runtime::noop_waker();
+    let mut service = FetchService::new(pool.clone(), rx, page_size, waker.clone());
+    let mut cx = Context::from_waker(&waker);
+    let req = StripeReq::new(StripeKey([0x86; 32]));
+
+    let mut stream = channel
+        .fetch(req, 0, page_size as u64)
+        .expect("fetch stream");
+    let page = poll_page_event(&mut service, &mut stream, &mut cx);
+    stream.sending(page.pin_token);
+    assert!(service.progress(), "sending command is progress");
+
+    drop(stream);
+    assert!(service.progress(), "drop should enqueue cancel");
+    assert_eq!(
+        pool.free_pages() + pool.cached_pages(),
+        0,
+        "cancel must not release a pin already handed to SEND_ZC",
+    );
+
+    channel.release(page.pin_token);
+    assert!(service.progress(), "completion release is progress");
+    assert_eq!(pool.free_pages() + pool.cached_pages(), page_count);
+    assert_eq!(pool.active_inflight_entries(), 0);
+}
+
+#[test]
+fn transient_busy_waits_for_pin_release_instead_of_erroring() {
+    let page_size = 64;
+    let page_count = 1;
+    let backing = heap_backing(page_size, page_count);
+    let base = backing.base;
+    let payload: Vec<u8> = (0..page_size).map(|i| i as u8).collect();
+    let pool = Rc::new(
+        Pool::new(
+            PoolConfig {
+                max_concurrent_streams: 4,
+                max_inflight_pages: 1,
+            },
+            backing,
+            PendingTransport::new(base, page_size, payload).with_pending_polls(0, 0),
+            MissBlockStore,
+        )
+        .expect("pool"),
+    );
+    let (channel, rx) = FetchChannel::new();
+    let waker = unbounded_storage::runtime::noop_waker();
+    let mut service = FetchService::new(pool.clone(), rx, page_size, waker.clone());
+    let mut cx = Context::from_waker(&waker);
+
+    let mut pinned = channel
+        .fetch(StripeReq::new(StripeKey([0x85; 32])), 0, page_size as u64)
+        .expect("pinned stream");
+    let pinned_page = poll_page_event(&mut service, &mut pinned, &mut cx);
+    assert_eq!(pool.free_pages() + pool.cached_pages(), 0);
+
+    let mut waiting = channel
+        .fetch(StripeReq::new(StripeKey([0x86; 32])), 0, page_size as u64)
+        .expect("waiting stream");
+    let mut waiting_event = Box::pin(waiting.next_event());
+    for _ in 0..8 {
+        match waiting_event.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(event)) => panic!("busy fetch unexpectedly emitted {event:?}"),
+            Poll::Ready(Err(e)) => panic!("transient Busy leaked to coordinator: {e:?}"),
+            Poll::Pending => {
+                service.progress();
+            }
+        }
+    }
+    drop(waiting_event);
+
+    pinned.release(pinned_page.pin_token);
+    assert!(service.progress(), "pin release is progress");
+
+    let waiting_page = poll_page_event(&mut service, &mut waiting, &mut cx);
+    assert_eq!(waiting_page.ordinal, 0);
+    waiting.release(waiting_page.pin_token);
+    assert!(service.progress(), "waiting release is progress");
+    drain_stream_done(&mut service, &mut waiting, &mut cx);
+    assert_eq!(pool.free_pages() + pool.cached_pages(), page_count);
+    assert_eq!(pool.active_inflight_entries(), 0);
+}
+
+fn poll_page_event(
+    service: &mut FetchService<PendingTransport, MissBlockStore>,
+    stream: &mut unbounded_storage::fanout::FetchStream,
+    cx: &mut Context<'_>,
+) -> unbounded_storage::fanout::FetchPage {
+    let mut event = Box::pin(stream.next_event());
+    for _ in 0..16 {
+        if let Poll::Ready(Ok(FetchEvent::Page(page))) = event.as_mut().poll(cx) {
+            return page;
+        }
+        service.progress();
+    }
+    panic!("page event did not arrive");
+}
+
+fn drain_stream_done(
+    service: &mut FetchService<PendingTransport, MissBlockStore>,
+    stream: &mut unbounded_storage::fanout::FetchStream,
+    cx: &mut Context<'_>,
+) {
+    let mut event = Box::pin(stream.next_event());
+    for _ in 0..16 {
+        if matches!(event.as_mut().poll(cx), Poll::Ready(Ok(FetchEvent::Done))) {
+            return;
+        }
+        service.progress();
+    }
+    panic!("done event did not arrive");
 }
 
 struct CountWaker {
@@ -249,7 +686,41 @@ impl Wake for CountWaker {
 
 struct PendingTransport {
     base: *mut u8,
+    page_size: usize,
     payload: Vec<u8>,
+    default_pending_polls: u8,
+    pending_polls: Vec<(usize, u8)>,
+    error_offsets: Vec<usize>,
+}
+
+impl PendingTransport {
+    fn new(base: *mut u8, page_size: usize, payload: Vec<u8>) -> Self {
+        Self {
+            base,
+            page_size,
+            payload,
+            default_pending_polls: 2,
+            pending_polls: Vec::new(),
+            error_offsets: Vec::new(),
+        }
+    }
+
+    fn with_pending_polls(mut self, offset: usize, polls: u8) -> Self {
+        self.pending_polls.push((offset, polls));
+        self
+    }
+
+    fn with_error_offset(mut self, offset: usize) -> Self {
+        self.error_offsets.push(offset);
+        self
+    }
+
+    fn pending_polls_for(&self, offset: usize) -> u8 {
+        self.pending_polls
+            .iter()
+            .find_map(|(off, polls)| (*off == offset).then_some(*polls))
+            .unwrap_or(self.default_pending_polls)
+    }
 }
 
 impl Transport<StripeReq> for PendingTransport {
@@ -261,13 +732,18 @@ impl Transport<StripeReq> for PendingTransport {
         src: BulkRef,
         dsts: &'a [PageRef],
     ) -> Self::Stream<'a> {
-        assert_eq!(src.offset, 0);
         assert_eq!(dsts.len(), 1);
+        let src_offset = src.offset as usize;
+        let len = src.len as usize;
+        assert!(src_offset + len <= self.payload.len());
         PendingStream {
             base: self.base,
+            page_size: self.page_size,
             payload: &self.payload,
+            src_offset,
             dst: dsts[0],
-            pending_left: 2,
+            pending_left: self.pending_polls_for(src_offset),
+            error: self.error_offsets.contains(&src_offset),
             delivered: false,
         }
     }
@@ -275,9 +751,12 @@ impl Transport<StripeReq> for PendingTransport {
 
 struct PendingStream<'a> {
     base: *mut u8,
+    page_size: usize,
     payload: &'a [u8],
+    src_offset: usize,
     dst: PageRef,
     pending_left: u8,
+    error: bool,
     delivered: bool,
 }
 
@@ -296,13 +775,18 @@ impl PageStream for PendingStream<'_> {
             return Poll::Ready(None);
         }
 
+        if self.error {
+            self.delivered = true;
+            return Poll::Ready(Some(Err(Error::from("forced fanout transport error"))));
+        }
+
         let len = self.dst.len as usize;
-        assert!(len <= self.payload.len());
+        assert!(self.src_offset + len <= self.payload.len());
         unsafe {
             let dst = self
                 .base
-                .add(self.dst.page_idx as usize * self.payload.len() + self.dst.offset as usize);
-            std::ptr::copy_nonoverlapping(self.payload.as_ptr(), dst, len);
+                .add(self.dst.page_idx as usize * self.page_size + self.dst.offset as usize);
+            std::ptr::copy_nonoverlapping(self.payload.as_ptr().add(self.src_offset), dst, len);
         }
         self.delivered = true;
         Poll::Ready(Some(Ok(self.dst)))

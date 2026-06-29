@@ -45,8 +45,19 @@ use crate::runtime::WorkerIdx;
 /// then acknowledges.
 pub enum ShardCommand {
     /// Apply a new configuration in place: republish routing and
-    /// reconcile this shard's backend and frontend registries.
+    /// reconcile this shard's backend registry, frontend registry, and
+    /// any disk-policy side effects.
     ApplyConfig(ShardApply),
+    /// Drop all retained in-memory page-cache entries after process-level
+    /// disk policy publication has landed.
+    DrainPageCache(ShardDrainPageCache),
+}
+
+/// Payload of [`ShardCommand::DrainPageCache`].
+pub struct ShardDrainPageCache {
+    /// Channel the shard sends its [`ShardAck`] on once the drain has
+    /// completed on the shard thread.
+    pub ack: Sender<ShardAck>,
 }
 
 /// Payload of [`ShardCommand::ApplyConfig`].
@@ -56,6 +67,8 @@ pub struct ShardApply {
     /// The route table rebuilt from `config`. Published into the shard's
     /// route-table handle so transports observe it atomically.
     pub routes: RouteTableSnapshot,
+    /// Section-level diff that selected this apply path.
+    pub diff: ConfigDiff,
     /// Channel the shard sends its [`ShardAck`] on once the apply has
     /// completed on the shard thread.
     pub ack: Sender<ShardAck>,
@@ -366,6 +379,7 @@ impl ShardControlGroup {
         &self,
         config: Arc<Config>,
         routes: RouteTableSnapshot,
+        diff: ConfigDiff,
     ) -> Result<(), ApplyError> {
         let expected = self.senders.len();
         if expected == 0 {
@@ -378,6 +392,7 @@ impl ShardControlGroup {
             let cmd = ShardCommand::ApplyConfig(ShardApply {
                 config: config.clone(),
                 routes: routes.clone(),
+                diff,
                 ack: ack_tx.clone(),
             });
             sender
@@ -387,6 +402,55 @@ impl ShardControlGroup {
         // Drop our own handle so the channel closes once every shard's
         // cloned sender is dropped; that is how the fan-in loop below
         // detects "no more acks coming".
+        drop(ack_tx);
+
+        let mut received = 0usize;
+        let mut failures = Vec::new();
+        loop {
+            match ack_rx.recv() {
+                Ok(ack) => {
+                    received += 1;
+                    if let Err(e) = ack.result {
+                        failures.push((ack.worker, e));
+                    }
+                    if received == expected {
+                        break;
+                    }
+                }
+                Err(RecvError) => {
+                    return Err(ApplyError::AckDisconnected { expected, received });
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ApplyError::ShardApply(failures))
+        }
+    }
+
+    /// Ask every shard to drain retained RAM page-cache entries and block
+    /// until all have acknowledged.
+    pub fn broadcast_drain_page_cache(&self) -> Result<(), ApplyError> {
+        self.broadcast_drain(|ack| ShardCommand::DrainPageCache(ShardDrainPageCache { ack }))
+    }
+
+    fn broadcast_drain<F>(&self, make_cmd: F) -> Result<(), ApplyError>
+    where
+        F: Fn(Sender<ShardAck>) -> ShardCommand,
+    {
+        let expected = self.senders.len();
+        if expected == 0 {
+            return Ok(());
+        }
+
+        let (ack_tx, ack_rx) = mpsc::channel::<ShardAck>();
+        for (worker, sender) in &self.senders {
+            sender
+                .send(make_cmd(ack_tx.clone()))
+                .map_err(|_| ApplyError::ShardSend(*worker))?;
+        }
         drop(ack_tx);
 
         let mut received = 0usize;
@@ -455,6 +519,13 @@ mod tests {
                                 result: result.clone(),
                             });
                         }
+                        ShardCommand::DrainPageCache(drain) => {
+                            applied += 1;
+                            let _ = drain.ack.send(ShardAck {
+                                worker: widx,
+                                result: result.clone(),
+                            });
+                        }
                     }
                 }
                 applied
@@ -468,7 +539,11 @@ mod tests {
         let (senders, joins) = spawn_mock_shards(vec![Ok(()), Ok(()), Ok(())]);
         let group = ShardControlGroup::new(senders);
 
-        let out = group.broadcast_apply(Arc::new(Config::default()), empty_routes());
+        let out = group.broadcast_apply(
+            Arc::new(Config::default()),
+            empty_routes(),
+            ConfigDiff::default(),
+        );
         assert!(out.is_ok(), "expected success, got {out:?}");
 
         // Closing the group drops the senders so the mock shard threads
@@ -485,7 +560,11 @@ mod tests {
         let group = ShardControlGroup::new(senders);
 
         let err = group
-            .broadcast_apply(Arc::new(Config::default()), empty_routes())
+            .broadcast_apply(
+                Arc::new(Config::default()),
+                empty_routes(),
+                ConfigDiff::default(),
+            )
             .expect_err("a failing shard must surface as an error");
         match err {
             ApplyError::ShardApply(failures) => {
@@ -508,7 +587,11 @@ mod tests {
         assert!(group.is_empty());
         assert!(
             group
-                .broadcast_apply(Arc::new(Config::default()), empty_routes())
+                .broadcast_apply(
+                    Arc::new(Config::default()),
+                    empty_routes(),
+                    ConfigDiff::default(),
+                )
                 .is_ok()
         );
     }
@@ -523,7 +606,11 @@ mod tests {
         let group = ShardControlGroup::new(senders);
 
         let err = group
-            .broadcast_apply(Arc::new(Config::default()), empty_routes())
+            .broadcast_apply(
+                Arc::new(Config::default()),
+                empty_routes(),
+                ConfigDiff::default(),
+            )
             .expect_err("closed channel must error");
         assert!(matches!(err, ApplyError::ShardSend(WorkerIdx(99))));
 

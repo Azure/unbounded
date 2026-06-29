@@ -407,6 +407,21 @@ path = "/dev/nvme0n1"
         assert!(!c.disks[0].bypass_admission);
         assert!(!c.disks[0].bypass_index_read);
         assert!(!c.disks[0].bypass_checksum);
+        assert!(!c.disks[0].disable_page_cache);
+    }
+
+    #[test]
+    fn disk_page_cache_flag_round_trips() {
+        let s = r#"
+[[disks]]
+disable_page_cache = true
+
+[disks.config.block]
+path = "/dev/nvme0n1"
+"#;
+        let mut c: Config = toml::from_str(s).unwrap();
+        c.apply_defaults();
+        assert!(c.disks[0].disable_page_cache);
     }
 
     #[test]

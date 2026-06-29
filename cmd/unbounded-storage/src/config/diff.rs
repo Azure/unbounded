@@ -24,7 +24,6 @@
 //!   which reconciles its own origin-backend and frontend registries on
 //!   its own thread (binding/closing listeners and rebuilding backends
 //!   without a shard restart).
-//!
 //! Startup-fixed knobs (the `[startup]` section: fabric listen address
 //! and thread counts, fabric max in-flight, backing allocation, CPU
 //! topology) live in the config file but are deliberately excluded from
@@ -214,6 +213,7 @@ mod tests {
             bypass_admission: false,
             bypass_index_read: false,
             bypass_checksum: false,
+            disable_page_cache: false,
             config: Some(disk_spec::Config::Block(BlockDiskConfig {
                 numa: None,
                 path: "/dev/nvme0n1".to_string(),
@@ -259,6 +259,26 @@ mod tests {
         });
         let d = ConfigDiff::between(&a, &b);
         assert!(d.frontends_changed);
+        assert!(d.any());
+        assert!(!d.requires_routing_reload());
+    }
+
+    #[test]
+    fn disk_page_cache_change_is_detected_without_routing_reload() {
+        let a = base();
+        let mut b = base();
+        b.disks.push(DiskSpec {
+            queue_depth: None,
+            page_size_bytes: None,
+            skip_recovery_scan: false,
+            disable_page_cache: true,
+            config: Some(disk_spec::Config::Block(BlockDiskConfig {
+                numa: None,
+                path: "/dev/nvme0n1".to_string(),
+            })),
+        });
+        let d = ConfigDiff::between(&a, &b);
+        assert!(d.disks_changed);
         assert!(d.any());
         assert!(!d.requires_routing_reload());
     }
