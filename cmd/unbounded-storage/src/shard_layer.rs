@@ -437,13 +437,12 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             .map_err(|e| ApplyError::Target(format!("config projection failed: {e}")))?;
 
         // The shards must see a new config whenever their routing surface,
-        // graph projection, or per-shard backend/frontend registries need
-        // to change. Pure projected-disk changes are absorbed by
-        // `reconcile_disks` below. Cache graph changes can also alter frontend
-        // backend/bypass resolution, so they are broadcast; disk-only
-        // changes are not.
+        // graph projection, per-disk page-cache policy, or per-shard
+        // backend/frontend registries need to change. Cache graph changes can
+        // also alter frontend backend/bypass resolution, so they are broadcast.
         let needs_broadcast = diff.requires_routing_reload()
             || diff.caches_changed
+            || diff.disks_changed
             || diff.backends_changed
             || diff.frontends_changed;
 
@@ -476,12 +475,24 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             }
 
             // Republish config + routing to every shard and block until
-            // each has acked, so the apply (routing surface and the
-            // per-shard backend/frontend reconcile each shard performs on
-            // receipt) has provably landed everywhere before we return.
-            layer.control.broadcast_apply(new.clone(), routes)?;
+            // each has acked, so the routing surface and per-shard
+            // backend/frontend reconcile each shard performs on receipt
+            // have provably landed.
+            layer.control.broadcast_apply(new.clone(), routes, *diff)?;
         }
 
+        if diff.disks_changed {
+            let layer = self
+                .layer
+                .as_mut()
+                .expect("shard layer present between applies");
+            layer.control.broadcast_drain_page_cache()?;
+        }
+
+        // Disk/channel changes mutate live registries and directories, so
+        // all fallible shard broadcasts must complete before this point.
+        // If a broadcast fails, ConfigController keeps the old config as
+        // current and the live disk topology remains on that same version.
         if diff.caches_changed || diff.disks_changed {
             self.reconcile_disks(&projection);
         }

@@ -313,7 +313,6 @@ mod tests {
 
     #[test]
     fn exporter_responds_over_tcp() {
-        let _guard = super::super::RENDER_LOCK.lock().unwrap();
         super::super::init();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();

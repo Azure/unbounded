@@ -21,10 +21,10 @@
 //!    stream's `AckSink` by `request_id`. The client posts no recvs of
 //!    its own.
 //! 3. For each `PageAck`, the stream yields `dsts[page_idx_from_body]`.
-//!    Once every requested page is acked the stream resolves with
-//!    `None` on the next poll, with no separate `RESPONSE_END` (the
-//!    client knows `dsts.len()` and page acks arrive in order, so the
-//!    final ack is the end of stream).
+//!    Once every requested page ordinal is acked the stream resolves
+//!    with `None` on the next poll, with no separate `RESPONSE_END`
+//!    (the client knows `dsts.len()`, so the final distinct ack is the
+//!    end of stream).
 //! 4. `RESPONSE_END` (sent only for a short success that delivered
 //!    fewer than `dsts.len()` pages, including zero) resolves the
 //!    stream with `None`; `ERROR_ACK` yields `Some(Err(_))` and then

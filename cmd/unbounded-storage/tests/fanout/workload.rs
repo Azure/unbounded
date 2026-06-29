@@ -7,13 +7,13 @@
 //! The driver models a single owner shard: one real [`Pool`] over a
 //! heap backing, driven by an owner-side [`FetchService`] that holds
 //! pages pinned across the cross-shard round-trip. Coordinator clients
-//! issue [`FetchChannel::fetch`] requests; on each reply they read the
-//! owner's backing memory at the returned [`PageLoc`] offsets (the DST
-//! stand-in for the coordinator's `SEND_ZC` source read, which cannot
-//! run under the simulator), verify the bytes against the oracle, then
-//! [`FetchChannel::release`] the pin. An optional `hold` delay between
-//! reply and read widens the window during which the owner must keep
-//! the pages pinned, stressing pin lifetime against concurrent fetches.
+//! issue [`FetchChannel::fetch`] requests; as each page event arrives
+//! they read the owner's backing memory at the returned [`PageLoc`]
+//! offsets (the DST stand-in for the coordinator's `SEND_ZC` source
+//! read, which cannot run under the simulator), verify the bytes against
+//! the oracle, then release the page pin. An optional `hold` delay before
+//! each read widens the window during which the owner must keep the page
+//! pinned, stressing pin lifetime against concurrent fetches.
 //!
 //! Tasks spawned on the seeded executor:
 //!   - one SERVICE task driving [`FetchService::poll_once`] until the
@@ -26,20 +26,18 @@
 //! [`Pool`]: unbounded_storage::bufferpool::Pool
 //! [`FetchService`]: unbounded_storage::fanout::FetchService
 //! [`FetchChannel::fetch`]: unbounded_storage::fanout::FetchChannel::fetch
-//! [`FetchChannel::release`]: unbounded_storage::fanout::FetchChannel::release
 //! [`PageLoc`]: unbounded_storage::fanout::PageLoc
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::future::{Future, poll_fn};
-use std::pin::Pin;
+use std::future::poll_fn;
 use std::rc::Rc;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::Poll;
 
 use proptest::collection::vec;
 use proptest::prelude::*;
-use unbounded_storage::bufferpool::{Error as PoolError, Pool, PoolConfig, StripeKey};
-use unbounded_storage::fanout::{FetchChannel, FetchService};
+use unbounded_storage::bufferpool::{Pool, PoolConfig, StripeKey};
+use unbounded_storage::fanout::{FetchChannel, FetchEvent, FetchPage, FetchService};
 use unbounded_storage::memory::Backing;
 use unbounded_storage::storage::StripeReq;
 
@@ -78,9 +76,9 @@ pub struct Workload {
     /// (`stripe_pages` pages) instead of the generous "hold every
     /// distinct stripe at once" sizing. This forces free-page pressure:
     /// concurrent fetches for distinct keys cannot all be pinned, so the
-    /// owner read path must return `Error::Busy` (fail-fast, never park
-    /// on the free list) and coordinators must retry until a holder
-    /// releases. Exercises the cross-shard deadlock-avoidance path.
+    /// owner read path must handle transient `Error::Busy` internally
+    /// without leaking it to coordinators. Exercises the cross-shard
+    /// deadlock-avoidance path.
     pub tight_pool: bool,
     pub clients: Vec<ClientSpec>,
     /// If true, after the run completes (the service task has dropped
@@ -235,15 +233,13 @@ pub enum FetchOutcome {
 pub struct RunReport {
     pub outcomes: Vec<FetchOutcome>,
     pub free_pages_at_end: usize,
+    pub cached_pages_at_end: usize,
+    pub active_inflight_entries_at_end: usize,
     pub total_pool_pages: usize,
     pub page_size: usize,
     pub io_fault_rate: u32,
     /// True if this run used the one-stripe `tight_pool` sizing.
     pub tight_pool: bool,
-    /// Number of `Error::Busy` re-dispatches across all coordinators.
-    /// Positive only under page pressure; proves the fail-fast + retry
-    /// path ran.
-    pub busy_retries: u64,
     pub bulk_get_calls: u32,
     pub read_page_calls: u32,
     pub read_hit_calls: u32,
@@ -273,9 +269,9 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     // sizes the pool to exactly one stripe: the minimum that still
     // guarantees any single fetch fits (a fetch pins at most one full
     // stripe), so forward progress is preserved while distinct-key
-    // concurrency is forced through the `Error::Busy` fail-fast + retry
-    // path. Sizing below one stripe would wedge a lone fetch and is
-    // therefore never generated.
+    // concurrency is forced through the `Error::Busy` fail-fast path.
+    // Sizing below one stripe would wedge a lone fetch and is therefore
+    // never generated.
     let total_pool_pages = if w.tight_pool {
         w.stripe_pages.max(1)
     } else {
@@ -340,12 +336,6 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     let outcomes: Rc<RefCell<Vec<FetchOutcome>>> = Rc::new(RefCell::new(Vec::new()));
     let pending_clients: Rc<Cell<usize>> = Rc::new(Cell::new(w.clients.len()));
     let stop: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    // Counts how many times a coordinator re-dispatched after the owner
-    // returned `Error::Busy`. Non-zero proves the page-pressure path was
-    // actually exercised; it is reported, not asserted, since a tight
-    // run with no key contention may legitimately never hit it.
-    let busy_retries: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-
     // SERVICE task: cooperatively drive the owner FetchService. The
     // loop body is a `poll_fn` so `poll_once` runs against this task's
     // own poll Context (the mocks' `yield_n` re-wakes through it). On
@@ -390,7 +380,6 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         let channel = channel.clone();
         let outcomes = outcomes.clone();
         let pending_clients = pending_clients.clone();
-        let busy_retries = busy_retries.clone();
         let w = w.clone();
         exec.spawn(async move {
             for f in &c.fetches {
@@ -403,65 +392,94 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                     stripes[offset as usize..(offset + len) as usize].to_vec()
                 };
 
-                // Retry-on-Busy loop, mirroring the coordinator's
-                // re-dispatch in `http_serve::stream_body`. `Error::Busy`
-                // is transient owner back-pressure (no free page for the
-                // non-blocking head alloc); yield so a holder can release,
-                // then re-issue. Any other error is a real fault and is
-                // recorded. A genuine stall is bounded by the executor
-                // step budget, which surfaces as `RunError`.
-                let reply = loop {
-                    let req = StripeReq::new(key);
-                    match channel.fetch(req, offset, len).await {
-                        Ok(reply) => break Some(reply),
-                        Err(PoolError::Busy) => {
-                            busy_retries.set(busy_retries.get() + 1);
-                            yield_once().await;
-                            continue;
+                let req = StripeReq::new(key);
+                let mut stream = match channel.fetch(req, offset, len) {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        outcomes
+                            .borrow_mut()
+                            .push(FetchOutcome::Err(format!("{e}")));
+                        continue;
+                    }
+                };
+                let mut got = Vec::with_capacity(len as usize);
+                let mut page_locs = Vec::new();
+                let mut pending: Vec<Option<FetchPage>> = Vec::new();
+                let mut next_ordinal = 0usize;
+                let mut done = false;
+                let mut failed = false;
+
+                loop {
+                    while next_ordinal < pending.len() {
+                        let Some(page) = pending[next_ordinal].take() else {
+                            break;
+                        };
+                        yield_n(f.hold).await;
+                        let ploc = page.loc;
+                        // SAFETY: the owner service holds this page
+                        // pinned in its backing until we release the
+                        // token below; `pool_base_v` is the live backing
+                        // base and the loc is in range.
+                        let bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                (pool_base_v as *const u8).add(ploc.page_byte_offset as usize),
+                                ploc.len as usize,
+                            )
+                        };
+                        got.extend_from_slice(bytes);
+                        page_locs.push((ploc.page_byte_offset, ploc.len));
+                        stream.release(page.pin_token);
+                        next_ordinal += 1;
+                    }
+
+                    if done {
+                        break;
+                    }
+
+                    match stream.next_event().await {
+                        Ok(FetchEvent::Page(page)) => {
+                            let ordinal = page.ordinal;
+                            if ordinal >= pending.len() {
+                                pending.resize_with(ordinal + 1, || None);
+                            }
+                            if pending[ordinal].is_some() || ordinal < next_ordinal {
+                                stream.release(page.pin_token);
+                                outcomes
+                                    .borrow_mut()
+                                    .push(FetchOutcome::Err("duplicate page event".to_string()));
+                                failed = true;
+                                break;
+                            }
+                            pending[ordinal] = Some(page);
                         }
+                        Ok(FetchEvent::Done) => done = true,
                         Err(e) => {
                             outcomes
                                 .borrow_mut()
                                 .push(FetchOutcome::Err(format!("{e}")));
-                            break None;
+                            failed = true;
+                            break;
                         }
                     }
-                };
-                let Some(reply) = reply else {
-                    continue;
-                };
-
-                // Hold the pin across a delay before reading, modeling
-                // the in-flight SEND_ZC duration. The owner must keep
-                // these pages valid until the matching release below.
-                yield_n(f.hold).await;
-                let mut got = Vec::with_capacity(len as usize);
-                let mut page_locs = Vec::with_capacity(reply.pages.len());
-                for ploc in &reply.pages {
-                    // SAFETY: the owner service holds these pages pinned
-                    // in its backing until we release the token below;
-                    // `pool_base_v` is the live backing base and the loc
-                    // is in range.
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            (pool_base_v as *const u8).add(ploc.page_byte_offset as usize),
-                            ploc.len as usize,
-                        )
-                    };
-                    got.extend_from_slice(bytes);
-                    page_locs.push((ploc.page_byte_offset, ploc.len));
                 }
-                let pin_token = reply.pin_token;
+
+                if failed {
+                    continue;
+                }
+
+                if next_ordinal != pending.len() {
+                    outcomes
+                        .borrow_mut()
+                        .push(FetchOutcome::Err("missing page event".to_string()));
+                    continue;
+                }
+
                 outcomes.borrow_mut().push(FetchOutcome::Ok {
                     got,
                     expected,
                     page_locs,
                     len,
                 });
-                // Release only after the read so the pin-lifetime
-                // assertion (bytes valid across the round-trip + hold)
-                // is meaningful.
-                channel.release(pin_token);
             }
             pending_clients.set(pending_clients.get() - 1);
         });
@@ -485,11 +503,9 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
             * (1 + w.io_fault_rate as u64 / 4)
             * (w.stripe_pages as u64)
         // Under a tight pool, distinct-key fetches serialize through the
-        // single stripe of capacity: in the worst case each fetch retries
-        // once per still-pending fetch before a holder releases, an
-        // O(total_fetches^2) term. The constant per-retry pend factor
-        // keeps this principled rather than an open-ended cap, so a
-        // genuine livelock still trips the budget.
+        // single stripe of capacity. Add a quadratic term for the
+        // fail-fast page-pressure path while still bounding genuine
+        // livelocks.
         + if w.tight_pool {
             total_fetches * total_fetches * 64
         } else {
@@ -499,6 +515,8 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     exec.run(step_budget)?;
 
     let free_pages_at_end = pool.free_pages();
+    let cached_pages_at_end = pool.cached_pages();
+    let active_inflight_entries_at_end = pool.active_inflight_entries();
 
     // Service-shutdown probe: the service task has returned and dropped
     // the receiver, so a fetch on a surviving channel clone must error
@@ -507,7 +525,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         let key = w.key(0);
         let req = StripeReq::new(key);
         let len = w.page_size.min(stripe_len as usize) as u64;
-        let res = block_on_local(channel.fetch(req, 0, len));
+        let res = channel.fetch(req, 0, len);
         Some(res.is_err())
     } else {
         None
@@ -521,11 +539,12 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     Ok(RunReport {
         outcomes,
         free_pages_at_end,
+        cached_pages_at_end,
+        active_inflight_entries_at_end,
         total_pool_pages,
         page_size: w.page_size,
         io_fault_rate: w.io_fault_rate,
         tight_pool: w.tight_pool,
-        busy_retries: busy_retries.get(),
         bulk_get_calls: counts.bulk_get.get(),
         read_page_calls: counts.read_page.get(),
         read_hit_calls: counts.read_hit.get(),
@@ -578,30 +597,4 @@ fn heap_backing(page_size: usize, page_count: usize) -> Backing {
         page_count,
         keepalive: std::sync::Arc::new(owner),
     }
-}
-
-/// Minimal noop-waker `block_on` for the post-shutdown probe, which
-/// runs after the executor returns and so cannot use the framework's
-/// scheduler. The probed fetch resolves in a single poll (the send
-/// fails immediately once the receiver is gone), so the spin budget is
-/// generous insurance, not a hot loop.
-fn block_on_local<F: Future>(fut: F) -> F::Output {
-    fn raw() -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(|_| raw(), |_| {}, |_| {}, |_| {});
-    // SAFETY: the vtable functions are no-ops or return the same
-    // vtable, so the waker can be cloned and dropped freely.
-    let waker = unsafe { Waker::from_raw(raw()) };
-    let mut cx = Context::from_waker(&waker);
-    let mut fut = fut;
-    // SAFETY: the future is owned here and never moved after pinning.
-    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
-    for _ in 0..1_000_000 {
-        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
-            return v;
-        }
-        std::thread::yield_now();
-    }
-    panic!("block_on_local: probe future did not complete within spin budget");
 }

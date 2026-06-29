@@ -732,6 +732,7 @@ mod tests {
             bypass_admission: false,
             bypass_index_read: false,
             bypass_checksum: false,
+            disable_page_cache: false,
             config: Some(crate::config::schema::disk_spec::Config::File(
                 crate::config::schema::FileDiskConfig {
                     path: "/tmp/unbounded-storage-test-disk".to_string(),
@@ -759,6 +760,7 @@ mod tests {
             bypass_admission: false,
             bypass_index_read: false,
             bypass_checksum: false,
+            disable_page_cache: false,
             config: Some(crate::config::schema::disk_spec::Config::Block(
                 crate::config::schema::BlockDiskConfig {
                     numa: None,
