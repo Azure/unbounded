@@ -188,7 +188,9 @@ selected host OS image, installs or configures the agent, and lets the agent
 create the nspawn node. The `MachineOperation` records per-machine progress in
 `status.targets[]`; each target completes after the Machine status shows the
 requested repave and reboot counters were observed, `Repaved=True`, and the
-corresponding Kubernetes Node object exists.
+corresponding Kubernetes Node object exists. Metalman also latches
+`status.conditions[type=BootLoaderDownloaded]` to `True` when the machine first
+downloads the initial PXE boot loader for the operation, typically over TFTP.
 
 ### HostReplace vs Node Recreation
 

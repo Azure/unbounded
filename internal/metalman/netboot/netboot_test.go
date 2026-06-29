@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -410,6 +412,37 @@ func TestHTTPServer_UnknownSourceIP(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("expected 404 for unknown source IP, got %d", resp.StatusCode)
 	}
+}
+
+func TestTFTPServerRecordsOnlyInitialBootLoader(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "boot123", map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
+	})
+	recorder := &recordingBootLoaderDownloadRecorder{}
+	server := &TFTPServer{
+		FileResolver:               FileResolver{Cache: cache},
+		BootLoaderDownloadRecorder: recorder,
+	}
+
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), "machine-1", "ghcr.io/test/image:v1", "grubx64.efi")
+	require.Empty(t, recorder.calls)
+
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), "machine-1", "ghcr.io/test/image:v1", "shimx64.efi")
+	require.Equal(t, []string{"machine-1:shimx64.efi"}, recorder.calls)
+}
+
+type recordingBootLoaderDownloadRecorder struct {
+	calls []string
+}
+
+func (r *recordingBootLoaderDownloadRecorder) RecordBootLoaderDownloaded(_ context.Context, machineName, filename string) error {
+	r.calls = append(r.calls, fmt.Sprintf("%s:%s", machineName, filename))
+
+	return nil
+}
+
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 func TestTemplateRendering(t *testing.T) {

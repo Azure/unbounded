@@ -262,8 +262,9 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			tftpServer := &netboot.TFTPServer{
-				BindAddr:     bindAddress,
-				FileResolver: resolver,
+				BindAddr:                   bindAddress,
+				FileResolver:               resolver,
+				BootLoaderDownloadRecorder: &metalmachineops.BootLoaderDownloadRecorder{Client: mgr.GetClient()},
 			}
 			if err := mgr.Add(tftpServer); err != nil {
 				return fmt.Errorf("adding TFTP server: %w", err)

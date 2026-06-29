@@ -30,8 +30,6 @@ import (
 const (
 	siteLabel = "unbounded-cloud.io/site"
 
-	conditionCompleted = "Completed"
-
 	reasonSucceeded                = "Succeeded"
 	reasonInvalidTargetScope       = "InvalidTargetScope"
 	reasonNoMatchingOwnedMachines  = "NoMatchingOwnedMachines"
@@ -798,7 +796,7 @@ func (r *Reconciler) finishOperation(ctx context.Context, name string, phase v1a
 
 func setCompletedCondition(op *v1alpha3.MachineOperation, status metav1.ConditionStatus, reason, message string) {
 	apimeta.SetStatusCondition(&op.Status.Conditions, metav1.Condition{
-		Type:               conditionCompleted,
+		Type:               v1alpha3.MachineOperationConditionCompleted,
 		Status:             status,
 		Reason:             reason,
 		Message:            message,

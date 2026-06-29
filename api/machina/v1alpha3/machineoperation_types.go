@@ -94,6 +94,18 @@ const (
 	OperationPhaseFailed     OperationPhase = "Failed"
 )
 
+// Condition types for MachineOperation.
+const (
+	// MachineOperationConditionCompleted indicates whether the operation has
+	// reached a terminal state.
+	MachineOperationConditionCompleted = "Completed"
+
+	// MachineOperationConditionBootLoaderDownloaded indicates that a metalman
+	// target has downloaded the initial PXE boot loader for the operation.
+	// Once set to True for an operation, it remains latched.
+	MachineOperationConditionBootLoaderDownloaded = "BootLoaderDownloaded"
+)
+
 // OperationStage represents the current stage of a target operation.
 type OperationStage string
 
