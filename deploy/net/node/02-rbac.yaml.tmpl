@@ -66,4 +66,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: unbounded-net-node
-    namespace: {{ .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}

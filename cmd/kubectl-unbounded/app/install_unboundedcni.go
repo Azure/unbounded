@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	unboundedCNINamespace      = "unbounded-net"
+	unboundedCNINamespace      = "unbounded-system"
 	unboundedCNIControllerName = "unbounded-net-controller"
 )
 

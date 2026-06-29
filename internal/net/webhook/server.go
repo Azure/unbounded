@@ -85,7 +85,7 @@ func NewServer(clientset kubernetes.Interface, restConfig *rest.Config, namespac
 	}
 
 	if namespace == "" {
-		namespace = "kube-system"
+		namespace = "unbounded-system"
 	}
 
 	mux := http.NewServeMux()

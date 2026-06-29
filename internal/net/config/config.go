@@ -90,7 +90,7 @@ func DefaultLeaderElectionConfig() LeaderElectionConfig {
 		LeaseDuration:     15 * time.Second,
 		RenewDeadline:     10 * time.Second,
 		RetryPeriod:       2 * time.Second,
-		ResourceNamespace: "kube-system",
+		ResourceNamespace: "unbounded-system",
 		ResourceName:      "unbounded-net-controller",
 	}
 }

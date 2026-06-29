@@ -27,7 +27,7 @@ spec:
         resources: ["endpointslices"]
   matchConditions:
     - name: "is-unbounded-net-controller-sa"
-      expression: "request.userInfo.username == 'system:serviceaccount:{{ .Namespace }}:unbounded-net-controller'"
+      expression: "request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-controller'"
   validations:
     # Secrets: only unbounded-net-serving-cert
     - expression: >-
@@ -83,8 +83,8 @@ spec:
   matchConditions:
     - name: "is-unbounded-net-sa"
       expression: >-
-        request.userInfo.username == 'system:serviceaccount:{{ .Namespace }}:unbounded-net-controller' ||
-        request.userInfo.username == 'system:serviceaccount:{{ .Namespace }}:unbounded-net-node'
+        request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-controller' ||
+        request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-node'
   validations:
     # Status must be unchanged.
     - expression: "object.status == oldObject.status"

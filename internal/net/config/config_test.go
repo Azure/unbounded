@@ -27,7 +27,7 @@ func TestDefaultLeaderElectionConfig(t *testing.T) {
 		t.Fatalf("unexpected retry period: %v", cfg.RetryPeriod)
 	}
 
-	if cfg.ResourceNamespace != "kube-system" {
+	if cfg.ResourceNamespace != "unbounded-system" {
 		t.Fatalf("unexpected resource namespace: %s", cfg.ResourceNamespace)
 	}
 
