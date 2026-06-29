@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-# Build stage
+# Supervisor build stage
 # Pin the builder to BUILDPLATFORM so the Go toolchain runs natively on the
 # host even when targeting a foreign TARGETPLATFORM. Without this, buildkit
 # would emulate the entire builder under QEMU when producing arm64 images on
@@ -51,8 +51,42 @@ ARG BUILD_TIME=
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     make unbounded-storage-supervisor-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
 
+# Storage release stage. This runs on TARGETPLATFORM so the tarball bundled
+# into the runtime image matches the node architecture.
+FROM --platform=$TARGETPLATFORM docker.io/library/golang:1.26.4-trixie AS storage-release
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    make \
+    gcc \
+    git \
+    ca-certificates \
+    curl \
+    bzip2 \
+    perl \
+    pkg-config \
+    liburing-dev \
+    libibverbs-dev \
+    librdmacm-dev \
+    && apt-get clean
+
+ENV GOPATH=/go
+ENV GOTOOLCHAIN=auto
+ENV PATH=/root/.cargo/bin:$PATH:/go/bin
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+
+WORKDIR /src
+COPY ../../ .
+
+ARG TARGETARCH
+ARG VERSION=dev
+RUN make unbounded-storage-tarball STORAGE_TARBALL_ARCH=${TARGETARCH} VERSION=${VERSION}
+
 # Runtime stage
 FROM ubuntu:noble
+
+ARG TARGETARCH
 
 # Install runtime dependencies. The install workflow is implemented natively in
 # Go (download, checksum, extract, systemd unit), so only ca-certificates is
@@ -61,11 +95,12 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     ca-certificates \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Create unbounded directory
-RUN mkdir -p /unbounded/bin
+# Create unbounded directories
+RUN mkdir -p /unbounded/bin /unbounded/releases
 
-# Copy the built binary from the builder stage
+# Copy the built binary and default storage release tarball from the builder stages.
 COPY --from=builder /src/bin/unbounded-storage-supervisor /unbounded/bin/unbounded-storage-supervisor
+COPY --from=storage-release /src/dist/unbounded-storage-linux-${TARGETARCH}.tar.gz /unbounded/releases/unbounded-storage-linux-${TARGETARCH}.tar.gz
 
 # Add unbounded bin to PATH
 ENV PATH="/unbounded/bin:${PATH}"

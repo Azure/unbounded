@@ -4,6 +4,8 @@
 package storagesupervisor
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -14,6 +16,7 @@ import (
 // test starts from a known state regardless of the host environment.
 func clearConfigEnv(t *testing.T) {
 	t.Helper()
+	setDefaultReleaseDir(t)
 
 	for _, name := range []string{
 		"REPO", "VERSION", "PREFIX", "SERVICE_NAME", "CONFIG_PATH",
@@ -23,6 +26,19 @@ func clearConfigEnv(t *testing.T) {
 	} {
 		t.Setenv(name, "")
 	}
+}
+
+func setDefaultReleaseDir(t *testing.T) string {
+	t.Helper()
+
+	previous := defaultReleaseDir
+	dir := t.TempDir()
+	defaultReleaseDir = dir
+	t.Cleanup(func() {
+		defaultReleaseDir = previous
+	})
+
+	return dir
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
@@ -126,6 +142,7 @@ func TestLoadConfigSourceClassification(t *testing.T) {
 func TestLoadConfigSourcePrecedence(t *testing.T) {
 	clearConfigEnv(t)
 	t.Setenv("ARCH", "amd64")
+	require.NoError(t, os.WriteFile(defaultReleaseTarballPath("amd64"), []byte("default"), 0o644))
 	t.Setenv("SOURCE", "https://example.com/a.tar.gz")
 	t.Setenv("LOCAL_TARBALL", "/tmp/ignored.tar.gz")
 
@@ -134,6 +151,32 @@ func TestLoadConfigSourcePrecedence(t *testing.T) {
 
 	assert.Equal(t, "https://example.com/a.tar.gz", cfg.Source)
 	assert.Equal(t, SourceURL, cfg.SourceMode)
+}
+
+func TestLoadConfigLocalTarballPrecedesDefaultReleaseTarball(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("ARCH", "amd64")
+	require.NoError(t, os.WriteFile(defaultReleaseTarballPath("amd64"), []byte("default"), 0o644))
+	t.Setenv("LOCAL_TARBALL", "/tmp/local.tar.gz")
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+
+	assert.Equal(t, "/tmp/local.tar.gz", cfg.Source)
+	assert.Equal(t, SourceFile, cfg.SourceMode)
+}
+
+func TestLoadConfigUsesDefaultReleaseTarball(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("ARCH", "amd64")
+	path := filepath.Join(defaultReleaseDir, "unbounded-storage-linux-amd64.tar.gz")
+	require.NoError(t, os.WriteFile(path, []byte("default"), 0o644))
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+
+	assert.Equal(t, path, cfg.Source)
+	assert.Equal(t, SourceFile, cfg.SourceMode)
 }
 
 func TestLoadConfigInvalid(t *testing.T) {

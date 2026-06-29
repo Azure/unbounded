@@ -12,6 +12,7 @@ package storagesupervisor
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -45,6 +46,8 @@ const (
 	// is sized for. Matches the daemon's default 128 MiB per-shard backing.
 	defaultPoolBytes = 134217728
 )
+
+var defaultReleaseDir = "/unbounded/releases"
 
 // SourceMode classifies where the release-layout tarball comes from.
 type SourceMode int
@@ -152,15 +155,6 @@ func LoadConfig() (Config, error) {
 	cfg.Kubeconfig = os.Getenv("KUBECONFIG")
 	cfg.DeviceInventoryURL = os.Getenv("STORAGE_DEVICE_INVENTORY_URL")
 
-	// SOURCE takes precedence; LOCAL_TARBALL is honored for backward
-	// compatibility with the shell installer when SOURCE is unset.
-	cfg.Source = os.Getenv("SOURCE")
-	if cfg.Source == "" {
-		cfg.Source = os.Getenv("LOCAL_TARBALL")
-	}
-
-	cfg.SourceMode = classifySource(cfg.Source)
-
 	cfg.NoEnable = os.Getenv("NO_ENABLE") == "1"
 	cfg.NoHugepages = os.Getenv("NO_HUGEPAGES") == "1"
 
@@ -174,6 +168,8 @@ func LoadConfig() (Config, error) {
 	}
 
 	cfg.Arch = arch
+	cfg.Source = sourceFromEnvOrDefault(cfg.Arch)
+	cfg.SourceMode = classifySource(cfg.Source)
 
 	poolBytes, err := parsePoolBytes(envOr("POOL_BYTES", strconv.Itoa(defaultPoolBytes)))
 	if err != nil {
@@ -190,6 +186,34 @@ func LoadConfig() (Config, error) {
 	cfg.Hugepages = hugepages
 
 	return cfg, nil
+}
+
+func sourceFromEnvOrDefault(arch string) string {
+	// SOURCE takes precedence; LOCAL_TARBALL is honored for compatibility
+	// with the shell installer when SOURCE is unset.
+	if source := os.Getenv("SOURCE"); source != "" {
+		return source
+	}
+
+	if source := os.Getenv("LOCAL_TARBALL"); source != "" {
+		return source
+	}
+
+	return defaultReleaseTarballSource(arch)
+}
+
+func defaultReleaseTarballSource(arch string) string {
+	path := defaultReleaseTarballPath(arch)
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return ""
+	}
+
+	return path
+}
+
+func defaultReleaseTarballPath(arch string) string {
+	return filepath.Join(defaultReleaseDir, tarballName(arch))
 }
 
 // classifySource maps a raw source selector to a SourceMode.
