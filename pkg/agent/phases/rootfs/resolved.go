@@ -21,10 +21,10 @@ type disableResolved struct {
 // DisableResolved returns a task that masks systemd-resolved inside the container
 // and writes a static resolv.conf copied from the host.
 //
-// The debootstrap rootfs includes systemd-resolved which starts on boot and
-// overwrites /etc/resolv.conf with "No DNS servers known." since it has no
-// upstream configuration inside the container. By masking the service and
-// writing a static file we avoid the conflict entirely. With
+// The rootfs includes systemd-resolved which starts on boot and overwrites
+// /etc/resolv.conf with "No DNS servers known." since it has no upstream
+// configuration inside the container. By masking the service and writing a
+// static file we avoid the conflict entirely. With
 // VirtualEthernet=no the container shares the host network namespace, so the
 // host's systemd-resolved stub at 127.0.0.53 is reachable.
 //

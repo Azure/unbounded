@@ -40,12 +40,9 @@ clean, reproducible environment:
 ## Container Rootfs
 
 The rootfs is a plain directory tree at `/var/lib/machines/<MachineName>`. It
-is created during the **rootfs** bootstrap phase by one of two methods:
-
-| Method | When used | Description |
-|---|---|---|
-| OCI image | Default | Pulls a pre-built Ubuntu 24.04 image via ORAS and unpacks it into the machine directory. A GPU variant includes the NVIDIA Container Toolkit. |
-| Debootstrap | Fallback (`AGENT_DISABLE_OCI_IMAGE=1`) | Runs `debootstrap` to create a minimal Ubuntu Noble rootfs with systemd, dbus, curl, and networking tools. **This method is deprecated and will be removed in a future release.** |
+is created during the **rootfs** bootstrap phase by pulling a pre-built OCI
+image via ORAS and unpacking it into the machine directory. A GPU variant
+includes the NVIDIA Container Toolkit.
 
 After the rootfs exists, the agent downloads Kubernetes binaries (kubelet,
 kubectl, kube-proxy), containerd, runc, and CNI plugins directly into
@@ -57,10 +54,10 @@ becomes `/etc/containerd/config.toml` inside the container).
 
 ### OCI Images
 
-The default rootfs images are based on Ubuntu 24.04 (Noble). The correct default
-image is selected automatically based on whether NVIDIA GPUs are detected on the
-host. Ubuntu 26.04 and Azure Linux 3.0 images are also available for explicit
-`OCIImage` configuration.
+The default rootfs image is selected automatically based on the host distro and
+whether NVIDIA GPUs are detected on the host. Supported automatic matches are
+Ubuntu 24.04, Ubuntu 26.04, and Azure Linux 3.0. RPM-based hosts fall back to
+Azure Linux 3.0. Other unknown host distros fall back to Ubuntu 24.04.
 
 | Image | Default repository | Description |
 |---|---|---|

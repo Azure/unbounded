@@ -1,12 +1,21 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use proptest::prelude::*;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
+use proptest::prelude::*;
+use unbounded_storage::bufferpool::{BufferPool, Pool, PoolConfig, StripeKey};
+
+use crate::bufferpool::mocks::{
+    CallCounts, DstBlockStore, DstTransport, MockSimConfig, Stripes, TestReq,
+};
 use crate::bufferpool::workload::{
-    ClientOutcome, ClientSpec, PipelineSpec, PlanSliceSpec, RunReport, Workload,
+    ClientOutcome, ClientSpec, PipelineSpec, PlanSliceSpec, RunReport, Workload, heap_backing,
     pipelined_workload_strategy, run_workload, workload_strategy,
 };
+use crate::framework::executor::{Executor, yield_n};
 
 proptest! {
     #![proptest_config(ProptestConfig {
@@ -76,11 +85,12 @@ proptest! {
 
     /// Invariant: page accounting at quiescence.
     /// Once every client has dropped its `ReadStream` and any tee
-    /// has drained, all pages must be back on the free list and
-    /// the inflight map must be empty. This catches leaks in the
-    /// recycle paths (`release_guard`, `decrement_stream`,
-    /// `TeeGuard::drop`, `LeaderGuard::drop`, and the
-    /// `ParkOutcome::Error` cleanup path).
+    /// has drained, every backing page must be either free or
+    /// retained as an idle cache entry, with no active inflight
+    /// entries. This catches leaks in the recycle/cache paths
+    /// (`release_guard`, `decrement_stream`, `TeeGuard::drop`,
+    /// `LeaderGuard::drop`, and the `ParkOutcome::Error` cleanup
+    /// path).
     ///
     /// Must hold under fault injection too: error paths are not
     /// allowed to leak pages or inflight entries.
@@ -88,14 +98,7 @@ proptest! {
     fn invariant_page_accounting_at_quiescence(seed in any::<u64>(), w in workload_strategy()) {
         let page_count = w.page_count;
         let report = run_workload(seed, w).expect("run completed");
-        prop_assert_eq!(
-            report.free_pages_at_end, page_count,
-            "free_pages={} expected {}", report.free_pages_at_end, page_count,
-        );
-        prop_assert_eq!(
-            report.inflight_entries_at_end, 0,
-            "inflight not drained: {} entries", report.inflight_entries_at_end,
-        );
+        assert_quiescent_accounting(&report, page_count)?;
         prop_assert_eq!(
             report.prefetch_inflight_at_end, 0,
             "prefetch budget not released: {} pages still reserved",
@@ -145,16 +148,7 @@ proptest! {
                 }
             }
         }
-        prop_assert_eq!(
-            report.free_pages_at_end, page_count,
-            "free_pages={} expected {} (leak on error path?)",
-            report.free_pages_at_end, page_count,
-        );
-        prop_assert_eq!(
-            report.inflight_entries_at_end, 0,
-            "inflight not drained under faults: {} entries (leak on error path?)",
-            report.inflight_entries_at_end,
-        );
+        assert_quiescent_accounting(&report, page_count)?;
     }
 
     /// Invariant: `max_concurrent_streams` enforcement.
@@ -191,16 +185,7 @@ proptest! {
             rejects <= n_clients,
             "more rejects ({}) than clients ({})", rejects, n_clients,
         );
-        prop_assert_eq!(
-            report.free_pages_at_end, page_count,
-            "free_pages={} expected {} after StreamLimit rejects",
-            report.free_pages_at_end, page_count,
-        );
-        prop_assert_eq!(
-            report.inflight_entries_at_end, 0,
-            "inflight not drained after StreamLimit rejects: {} entries",
-            report.inflight_entries_at_end,
-        );
+        assert_quiescent_accounting(&report, page_count)?;
     }
 
     /// Invariant: drain on mid-stream cancellation.
@@ -232,16 +217,7 @@ proptest! {
                 );
             }
         }
-        prop_assert_eq!(
-            report.free_pages_at_end, page_count,
-            "free_pages={} expected {} (leak on cancellation drain?)",
-            report.free_pages_at_end, page_count,
-        );
-        prop_assert_eq!(
-            report.inflight_entries_at_end, 0,
-            "inflight not drained after cancellations: {} entries",
-            report.inflight_entries_at_end,
-        );
+        assert_quiescent_accounting(&report, page_count)?;
     }
 }
 
@@ -307,10 +283,11 @@ proptest! {
     /// The cross-stripe reader admits and releases one stream per
     /// slice as the global cursor advances (`release_passed_slices`)
     /// and shares the global prefetch budget. Once every pipeline
-    /// has dropped its `PipelinedRead`, all pages must be back on
-    /// the free list, the inflight map empty, and the prefetch
-    /// budget fully released. Catches leaks in `release_guard`,
-    /// `release_prefetch`, and the per-slice `decrement_stream`.
+    /// has dropped its `PipelinedRead`, all pages must be free or
+    /// idle-cached, no active inflight entries may remain, and the
+    /// prefetch budget must be fully released. Catches leaks in
+    /// `release_guard`, `release_prefetch`, and the per-slice
+    /// `decrement_stream`.
     /// Must hold under faults and mid-stream cancellation too.
     #[test]
     fn pipelined_invariant_page_accounting(
@@ -319,14 +296,7 @@ proptest! {
     ) {
         let page_count = w.page_count;
         let report = run_workload(seed, w).expect("run completed");
-        prop_assert_eq!(
-            report.free_pages_at_end, page_count,
-            "free_pages={} expected {}", report.free_pages_at_end, page_count,
-        );
-        prop_assert_eq!(
-            report.inflight_entries_at_end, 0,
-            "inflight not drained: {} entries", report.inflight_entries_at_end,
-        );
+        assert_quiescent_accounting(&report, page_count)?;
         prop_assert_eq!(
             report.prefetch_inflight_at_end, 0,
             "prefetch budget not released: {} pages still reserved",
@@ -456,14 +426,32 @@ fn stream_limit_rejects_excess_concurrent_reads() {
             assert_eq!(got, expected, "byte mismatch on successful client");
         }
     }
-    assert_eq!(report.free_pages_at_end, 2);
-    assert_eq!(report.inflight_entries_at_end, 0);
+    assert_quiescent_accounting(&report, 2).expect("quiescent accounting");
 }
 /// `Error::StreamLimit`'s Display string from
 /// `src/bufferpool/types.rs`. We match on the message because the
 /// harness flattens errors to `String` at the framework boundary.
 fn is_stream_limit(msg: &str) -> bool {
     msg == "max_concurrent_streams reached"
+}
+
+fn assert_quiescent_accounting(report: &RunReport, page_count: usize) -> Result<(), TestCaseError> {
+    prop_assert_eq!(
+        report.free_pages_at_end + report.cached_pages_at_end,
+        page_count,
+        "free_pages={} cached_pages={} expected total {}",
+        report.free_pages_at_end,
+        report.cached_pages_at_end,
+        page_count,
+    );
+    prop_assert_eq!(
+        report.active_inflight_entries_at_end,
+        0,
+        "active inflight not drained: {} entries (raw inflight={})",
+        report.active_inflight_entries_at_end,
+        report.inflight_entries_at_end,
+    );
+    Ok(())
 }
 
 /// Regression: a 5-client / 2-page / fault-injecting workload
@@ -522,8 +510,7 @@ fn regression_freelist_deadlock_under_faults() {
         pipelines: Vec::new(),
     };
     let report = run_workload(16283855356151283598u64, w).expect("must not deadlock");
-    assert_eq!(report.free_pages_at_end, 2);
-    assert_eq!(report.inflight_entries_at_end, 0);
+    assert_quiescent_accounting(&report, 2).expect("quiescent accounting");
 }
 
 /// Smoke test that hits one fixed seed; lets `cargo test dst::smoke`
@@ -565,8 +552,7 @@ fn smoke() {
         pipelines: Vec::new(),
     };
     let report: RunReport = run_workload(0xC0FFEE, w).expect("smoke run");
-    assert_eq!(report.free_pages_at_end, 4);
-    assert_eq!(report.inflight_entries_at_end, 0);
+    assert_quiescent_accounting(&report, 4).expect("quiescent accounting");
     assert_eq!(report.prefetch_inflight_at_end, 0);
     for o in &report.outcomes {
         match o {
@@ -626,12 +612,243 @@ fn all_cache_hits_skip_bulk_get_and_tee() {
         report.bulk_get_max_inflight.is_empty(),
         "no (key, page) should have any recorded bulk_get",
     );
-    assert_eq!(report.free_pages_at_end, 4);
-    assert_eq!(report.inflight_entries_at_end, 0);
+    assert_quiescent_accounting(&report, 4).expect("quiescent accounting");
     for o in &report.outcomes {
         match o {
             ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
             other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+}
+
+/// Regression: idle cached pages must be evictable when later demand
+/// heads need backing pages. The first phase fills a two-page pool's
+/// RAM cache. The second phase starts three distinct reads; two evict
+/// cached pages for their heads and the third parks until one active
+/// guard drops. This pins both cache-pressure eviction and the
+/// waiter-priority path under the deterministic scheduler.
+#[test]
+fn cached_pages_do_not_deadlock_contended_heads() {
+    const PAGE_SIZE: usize = 128;
+    const PAGE_COUNT: usize = 2;
+
+    for seed in [0u64, 1, 7, 42, 1234, 99999] {
+        let backing = heap_backing(PAGE_SIZE, PAGE_COUNT);
+        let counts = Rc::new(CallCounts::default());
+        let mock_cfg = MockSimConfig::new();
+        mock_cfg.max_io_delay.set(2);
+        let stripes: Stripes = Rc::new(RefCell::new(HashMap::new()));
+        let mut oracle = HashMap::new();
+        for idx in 0u8..5 {
+            let key = StripeKey([idx; 32]);
+            let bytes = vec![idx.wrapping_add(0x40); PAGE_SIZE];
+            stripes.borrow_mut().insert(key, bytes.clone());
+            oracle.insert(key, bytes);
+        }
+
+        let transport = DstTransport::new(
+            stripes.clone(),
+            counts.clone(),
+            mock_cfg.clone(),
+            backing.base,
+            backing.page_size,
+        );
+        let blockstore = DstBlockStore::new(counts.clone(), stripes, mock_cfg);
+        let pool = Rc::new(
+            Pool::new(
+                PoolConfig {
+                    max_concurrent_streams: 1024,
+                    max_inflight_pages: 4,
+                },
+                backing,
+                transport,
+                blockstore,
+            )
+            .expect("pool construction must succeed"),
+        );
+
+        let mut exec = Executor::new(seed);
+        let outcomes: Rc<RefCell<Vec<ClientOutcome>>> = Rc::new(RefCell::new(Vec::new()));
+
+        for idx in 0u8..2 {
+            let p = pool.clone();
+            let outcomes = outcomes.clone();
+            let expected = oracle[&StripeKey([idx; 32])].clone();
+            exec.spawn(async move {
+                let req = TestReq {
+                    key: StripeKey([idx; 32]),
+                };
+                let mut stream = p.read(&req, 0, PAGE_SIZE as u64).await.unwrap();
+                let got = stream
+                    .next_page()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_slice()
+                    .to_vec();
+                outcomes
+                    .borrow_mut()
+                    .push(ClientOutcome::Ok { got, expected });
+            });
+        }
+
+        exec.run(1_000).expect("warmup phase must complete");
+        assert_eq!(pool.cached_pages(), PAGE_COUNT, "seed {seed}: warmup cache");
+        assert_eq!(pool.free_pages(), 0, "seed {seed}: all pages cached");
+        assert_eq!(
+            pool.active_inflight_entries(),
+            0,
+            "seed {seed}: warmup active state"
+        );
+
+        for idx in 2u8..5 {
+            let p = pool.clone();
+            let outcomes = outcomes.clone();
+            let expected = oracle[&StripeKey([idx; 32])].clone();
+            exec.spawn(async move {
+                let req = TestReq {
+                    key: StripeKey([idx; 32]),
+                };
+                let mut stream = p.read(&req, 0, PAGE_SIZE as u64).await.unwrap();
+                let guard = stream.next_page().await.unwrap().unwrap();
+                let got = guard.as_slice().to_vec();
+                yield_n(4).await;
+                drop(guard);
+                outcomes
+                    .borrow_mut()
+                    .push(ClientOutcome::Ok { got, expected });
+            });
+        }
+
+        exec.run(5_000).expect("pressure phase must not deadlock");
+        assert_eq!(
+            pool.free_pages() + pool.cached_pages(),
+            PAGE_COUNT,
+            "seed {seed}: pages must be free or cached",
+        );
+        assert_eq!(
+            pool.active_inflight_entries(),
+            0,
+            "seed {seed}: active entries must drain",
+        );
+        assert_eq!(
+            counts.bulk_get.get(),
+            5,
+            "seed {seed}: every distinct page fetched once"
+        );
+
+        let outcomes = outcomes.borrow();
+        assert_eq!(outcomes.len(), 5, "seed {seed}: all readers finished");
+        for outcome in outcomes.iter() {
+            match outcome {
+                ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
+                other => panic!("seed {seed}: unexpected outcome {other:?}"),
+            }
+        }
+    }
+}
+
+/// Regression: a warm RAM page cache should not permanently disable
+/// speculative prefetch. Cached idle pages are evictable backing, so a
+/// windowed read may use them as spare pages while still preserving the
+/// per-stream head reserve.
+#[test]
+fn prefetch_evicts_idle_cached_pages() {
+    const PAGE_SIZE: usize = 128;
+    const PAGE_COUNT: usize = 3;
+
+    for seed in [0u64, 5, 77, 9001] {
+        let backing = heap_backing(PAGE_SIZE, PAGE_COUNT);
+        let counts = Rc::new(CallCounts::default());
+        let mock_cfg = MockSimConfig::new();
+        mock_cfg.max_io_delay.set(4);
+        let stripes: Stripes = Rc::new(RefCell::new(HashMap::new()));
+        let mut oracle = HashMap::new();
+        for idx in 0u8..4 {
+            let key = StripeKey([idx; 32]);
+            let bytes = vec![idx.wrapping_add(0x20); PAGE_SIZE * PAGE_COUNT];
+            stripes.borrow_mut().insert(key, bytes.clone());
+            oracle.insert(key, bytes);
+        }
+
+        let transport = DstTransport::new(
+            stripes.clone(),
+            counts.clone(),
+            mock_cfg.clone(),
+            backing.base,
+            backing.page_size,
+        );
+        let blockstore = DstBlockStore::new(counts.clone(), stripes, mock_cfg);
+        let pool = Rc::new(
+            Pool::new(
+                PoolConfig {
+                    max_concurrent_streams: 1024,
+                    max_inflight_pages: 2,
+                },
+                backing,
+                transport,
+                blockstore,
+            )
+            .expect("pool construction must succeed"),
+        );
+
+        let mut exec = Executor::new(seed);
+        for idx in 0u8..3 {
+            let p = pool.clone();
+            exec.spawn(async move {
+                let req = TestReq {
+                    key: StripeKey([idx; 32]),
+                };
+                let mut stream = p.read(&req, 0, PAGE_SIZE as u64).await.unwrap();
+                let _ = stream.next_page().await.unwrap().unwrap();
+            });
+        }
+        exec.run(2_000).expect("warmup phase must complete");
+        assert_eq!(pool.cached_pages(), PAGE_COUNT, "seed {seed}: warm cache");
+        assert_eq!(pool.free_pages(), 0, "seed {seed}: all pages cached");
+
+        let p = pool.clone();
+        let outcomes: Rc<RefCell<Vec<ClientOutcome>>> = Rc::new(RefCell::new(Vec::new()));
+        let outcomes_task = outcomes.clone();
+        let expected = oracle[&StripeKey([3; 32])][..PAGE_SIZE * 2].to_vec();
+        exec.spawn(async move {
+            let req = TestReq {
+                key: StripeKey([3; 32]),
+            };
+            let mut read = p
+                .read_windowed(&req, 0, (PAGE_SIZE * 2) as u64, 2)
+                .expect("windowed read");
+            let mut got = Vec::new();
+            while let Some(page) = read.next_page().await {
+                got.extend_from_slice(page.unwrap().as_slice());
+            }
+            outcomes_task
+                .borrow_mut()
+                .push(ClientOutcome::Ok { got, expected });
+        });
+
+        exec.run(5_000).expect("windowed read must complete");
+        assert_eq!(
+            pool.free_pages() + pool.cached_pages(),
+            PAGE_COUNT,
+            "seed {seed}: pages must be free or cached",
+        );
+        assert_eq!(pool.prefetch_inflight(), 0, "seed {seed}: prefetch budget");
+        assert_eq!(
+            pool.active_inflight_entries(),
+            0,
+            "seed {seed}: active entries must drain",
+        );
+        assert_eq!(counts.bulk_get.get(), 5, "seed {seed}: every miss fetched");
+        assert!(
+            counts.bulk_get_max_total_inflight.get() >= 2,
+            "seed {seed}: windowed read should overlap head and prefetch",
+        );
+        let outcomes = outcomes.borrow();
+        assert_eq!(outcomes.len(), 1, "seed {seed}: windowed reader finished");
+        match &outcomes[0] {
+            ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
+            other => panic!("seed {seed}: unexpected outcome {other:?}"),
         }
     }
 }
@@ -692,14 +909,7 @@ fn cancellation_drains_to_clean_state() {
         pipelines: Vec::new(),
     };
     let report = run_workload(0xD1A1ED, w).expect("scenario run");
-    assert_eq!(
-        report.free_pages_at_end, 4,
-        "all pages must return to the free list"
-    );
-    assert_eq!(
-        report.inflight_entries_at_end, 0,
-        "all inflight entries must drain"
-    );
+    assert_quiescent_accounting(&report, 4).expect("quiescent accounting");
 
     let mut cancelled = 0;
     for o in &report.outcomes {
@@ -762,8 +972,7 @@ fn windowed_read_in_order_and_drains() {
             other => panic!("unexpected outcome: {other:?}"),
         }
     }
-    assert_eq!(report.free_pages_at_end, 6);
-    assert_eq!(report.inflight_entries_at_end, 0);
+    assert_quiescent_accounting(&report, 6).expect("quiescent accounting");
     assert_eq!(report.prefetch_inflight_at_end, 0);
 }
 
@@ -893,11 +1102,8 @@ fn windowed_under_free_list_pressure_drains() {
                 other => panic!("unexpected outcome at seed {seed}: {other:?}"),
             }
         }
-        assert_eq!(report.free_pages_at_end, 2, "leak at seed {seed}");
-        assert_eq!(
-            report.inflight_entries_at_end, 0,
-            "inflight leak at seed {seed}"
-        );
+        assert_quiescent_accounting(&report, 2)
+            .unwrap_or_else(|e| panic!("accounting leak at seed {seed}: {e}"));
         assert_eq!(
             report.prefetch_inflight_at_end, 0,
             "prefetch budget leak at seed {seed}"
@@ -1008,11 +1214,8 @@ fn pipelined_multi_stripe_in_order_and_drains() {
                 other => panic!("unexpected outcome at seed {seed}: {other:?}"),
             }
         }
-        assert_eq!(report.free_pages_at_end, 8, "leak at seed {seed}");
-        assert_eq!(
-            report.inflight_entries_at_end, 0,
-            "inflight leak at seed {seed}"
-        );
+        assert_quiescent_accounting(&report, 8)
+            .unwrap_or_else(|e| panic!("accounting leak at seed {seed}: {e}"));
         assert_eq!(
             report.prefetch_inflight_at_end, 0,
             "prefetch budget leak at seed {seed}"
@@ -1096,11 +1299,8 @@ fn pipelined_under_free_list_pressure_drains() {
                 other => panic!("unexpected outcome at seed {seed}: {other:?}"),
             }
         }
-        assert_eq!(report.free_pages_at_end, 2, "leak at seed {seed}");
-        assert_eq!(
-            report.inflight_entries_at_end, 0,
-            "inflight leak at seed {seed}"
-        );
+        assert_quiescent_accounting(&report, 2)
+            .unwrap_or_else(|e| panic!("accounting leak at seed {seed}: {e}"));
         assert_eq!(
             report.prefetch_inflight_at_end, 0,
             "prefetch budget leak at seed {seed}"

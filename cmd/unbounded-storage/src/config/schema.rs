@@ -407,6 +407,21 @@ path = "/dev/nvme0n1"
         assert!(!c.disks[0].bypass_admission);
         assert!(!c.disks[0].bypass_index_read);
         assert!(!c.disks[0].bypass_checksum);
+        assert!(!c.disks[0].disable_page_cache);
+    }
+
+    #[test]
+    fn disk_page_cache_flag_round_trips() {
+        let s = r#"
+[[disks]]
+disable_page_cache = true
+
+[disks.config.block]
+path = "/dev/nvme0n1"
+"#;
+        let mut c: Config = toml::from_str(s).unwrap();
+        c.apply_defaults();
+        assert!(c.disks[0].disable_page_cache);
     }
 
     #[test]
@@ -511,6 +526,9 @@ name = "primary-http"
 url = "https://origin.example.com"
 stripe_size_bytes = 8388608
 http_concurrency = 32
+ca_cert_path = "/etc/unbounded-storage/origin-ca.pem"
+client_cert_path = "/etc/unbounded-storage/client.pem"
+client_key_path = "/etc/unbounded-storage/client-key.pem"
 
 [[frontends]]
 name = "workload-http"
@@ -530,8 +548,19 @@ max_requests_per_connection = 256
                 assert_eq!(cfg.url, "https://origin.example.com");
                 assert_eq!(cfg.stripe_size_bytes, Some(8 * 1024 * 1024));
                 assert_eq!(cfg.http_concurrency, Some(32));
-                assert_eq!(cfg.ca_cert_path, None);
+                assert_eq!(
+                    cfg.ca_cert_path.as_deref(),
+                    Some("/etc/unbounded-storage/origin-ca.pem")
+                );
                 assert!(!cfg.insecure_skip_verify);
+                assert_eq!(
+                    cfg.client_cert_path.as_deref(),
+                    Some("/etc/unbounded-storage/client.pem")
+                );
+                assert_eq!(
+                    cfg.client_key_path.as_deref(),
+                    Some("/etc/unbounded-storage/client-key.pem")
+                );
             }
             other => panic!("expected http backend config, got {other:?}"),
         }
@@ -581,6 +610,8 @@ url = "https://example.com"
                 assert_eq!(cfg.http_concurrency, Some(64));
                 assert_eq!(cfg.ca_cert_path, None);
                 assert!(!cfg.insecure_skip_verify);
+                assert_eq!(cfg.client_cert_path, None);
+                assert_eq!(cfg.client_key_path, None);
             }
             other => panic!("expected http backend config, got {other:?}"),
         }

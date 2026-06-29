@@ -892,7 +892,7 @@ fn run_shard(
     // atomically by its transport; the fabric RPC handlers are reloaded
     // separately by the `FabricGroup`), refreshes the stripe geometry,
     // reconciles the transport origin-backend registry and the frontend
-    // registry toward the new config, and then acknowledges
+    // registry toward the new config, applies disk-policy side effects, and then acknowledges
     // so the coordinator's blocking apply can complete. Everything is
     // driven from this one thread so the `ArcSwap` publishes are ordered
     // and the build-from-spec (DNS resolve, listener bind) stays off the
@@ -901,6 +901,7 @@ fn run_shard(
         let routes = routes.clone();
         let transport_registry = transport_registry.clone();
         let frontend_registry = frontend_registry.clone();
+        let pool = pool.clone();
         let geometry = geometry.clone();
         let bindings = frontend_registry.ctx.bindings.clone();
         let mut last_backends: HashMap<String, BackendSpec> = backend_specs
@@ -936,7 +937,6 @@ fn run_shard(
                         let desired_frontends = apply.config.frontends.as_slice();
                         let desired_frontend_backends =
                             config::frontend_backend_map(&projection.frontends);
-
                         // Refresh stripe geometry before building any
                         // frontend so a co-applied backend stripe change
                         // is visible to a frontend add in the same pass.
@@ -992,6 +992,14 @@ fn run_shard(
                         let _ = apply.ack.send(config::ShardAck {
                             worker: widx,
                             result,
+                        });
+                        did_work = true;
+                    }
+                    config::ShardCommand::DrainPageCache(drain) => {
+                        pool.drain_page_cache();
+                        let _ = drain.ack.send(config::ShardAck {
+                            worker: widx,
+                            result: Ok(()),
                         });
                         did_work = true;
                     }
@@ -1988,6 +1996,8 @@ mod tests {
                     http_concurrency: Some(64),
                     ca_cert_path: None,
                     insecure_skip_verify: false,
+                    client_cert_path: None,
+                    client_key_path: None,
                 },
             )),
         }

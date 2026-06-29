@@ -43,6 +43,11 @@ pub struct TlsConfig {
     /// When true, skip certificate and hostname verification entirely.
     /// For test/private origins only.
     pub insecure_skip_verify: bool,
+    /// Optional path to a PEM client certificate presented when an origin
+    /// requires TLS client authentication.
+    pub client_cert_path: Option<String>,
+    /// Optional path to the PEM private key for `client_cert_path`.
+    pub client_key_path: Option<String>,
 }
 
 /// A configured client `SSL_CTX`, shared by every connection a caller
@@ -106,6 +111,36 @@ impl TlsContext {
                 }
             } else {
                 ffi::SSL_CTX_set_verify(ctx, ffi::SSL_VERIFY_NONE, None);
+            }
+
+            match (
+                config.client_cert_path.as_deref(),
+                config.client_key_path.as_deref(),
+            ) {
+                (Some(cert), Some(key)) => {
+                    let c_cert = CString::new(cert).map_err(|_| {
+                        Error::transport(TlsError("client_cert_path contains NUL".into()))
+                    })?;
+                    let c_key = CString::new(key).map_err(|_| {
+                        Error::transport(TlsError("client_key_path contains NUL".into()))
+                    })?;
+                    let filetype = ffi::ub_ssl_filetype_pem();
+                    if ffi::SSL_CTX_use_certificate_file(ctx, c_cert.as_ptr(), filetype) != 1 {
+                        return Err(ssl_error("SSL_CTX_use_certificate_file failed"));
+                    }
+                    if ffi::SSL_CTX_use_PrivateKey_file(ctx, c_key.as_ptr(), filetype) != 1 {
+                        return Err(ssl_error("SSL_CTX_use_PrivateKey_file failed"));
+                    }
+                    if ffi::SSL_CTX_check_private_key(ctx) != 1 {
+                        return Err(ssl_error("SSL_CTX_check_private_key failed"));
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(Error::transport(TlsError(
+                        "client_cert_path and client_key_path must be set together".into(),
+                    )));
+                }
             }
 
             guard.disarm();

@@ -207,6 +207,9 @@ message DiskSpec {
   // the target is measuring the NVMe data path rather than CPU checksum cost.
   bool bypass_checksum = 7;
 
+  // Disables the in-memory bufferpool page cache for pages routed to this disk.
+  bool disable_page_cache = 10;
+
   oneof config {
     BlockDiskConfig block = 8;
     FileDiskConfig file = 9;
@@ -257,6 +260,13 @@ message HttpBackendConfig {
 
   // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
   bool insecure_skip_verify = 5;
+
+  // Optional PEM client certificate presented for TLS client authentication on `https://` origins.
+  // Must be set together with client_key_path.
+  optional string client_cert_path = 6;
+
+  // Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
+  optional string client_key_path = 7;
 }
 
 message S3BackendConfig {
@@ -276,6 +286,13 @@ message S3BackendConfig {
 
   // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
   bool insecure_skip_verify = 5;
+
+  // Optional PEM client certificate presented for TLS client authentication on `https://` origins.
+  // Must be set together with client_key_path.
+  optional string client_cert_path = 6;
+
+  // Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
+  optional string client_key_path = 7;
 }
 
 message AzureBackendConfig {
@@ -295,6 +312,13 @@ message AzureBackendConfig {
 
   // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
   bool insecure_skip_verify = 5;
+
+  // Optional PEM client certificate presented for TLS client authentication on `https://` origins.
+  // Must be set together with client_key_path.
+  optional string client_cert_path = 6;
+
+  // Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
+  optional string client_key_path = 7;
 }
 
 message FakeBackendConfig {
