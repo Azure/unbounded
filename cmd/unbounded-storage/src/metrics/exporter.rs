@@ -18,6 +18,8 @@
 //! and replies `Connection: close`. Routes:
 //!   * `GET /metrics` -> the text exposition format
 //!   * `GET /` or `GET /health` -> `200 OK`
+//!   * `GET /inventory/rdma` -> RDMA HCA discovery annotation value
+//!   * `GET /inventory/block` -> block-device discovery annotation value
 //!   * anything else -> `404`
 //!   * non-GET -> `405`
 
@@ -60,23 +62,35 @@ impl std::fmt::Display for ExporterError {
 impl std::error::Error for ExporterError {}
 
 #[derive(Clone, Default)]
-pub struct RdmaInventoryStatus {
-    json: Arc<RwLock<Option<Vec<u8>>>>,
+pub struct DeviceInventoryStatus {
+    rdma: Arc<RwLock<Option<Vec<u8>>>>,
+    block: Arc<RwLock<Option<Vec<u8>>>>,
 }
 
-impl RdmaInventoryStatus {
+impl DeviceInventoryStatus {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn set_json(&self, json: Vec<u8>) {
-        *self.json.write().expect("rdma inventory lock poisoned") = Some(json);
+    pub fn set_rdma(&self, body: Vec<u8>) {
+        *self.rdma.write().expect("rdma inventory lock poisoned") = Some(body);
     }
 
-    fn body(&self) -> Option<Vec<u8>> {
-        self.json
+    pub fn set_block(&self, body: Vec<u8>) {
+        *self.block.write().expect("block inventory lock poisoned") = Some(body);
+    }
+
+    fn rdma_body(&self) -> Option<Vec<u8>> {
+        self.rdma
             .read()
             .expect("rdma inventory lock poisoned")
+            .clone()
+    }
+
+    fn block_body(&self) -> Option<Vec<u8>> {
+        self.block
+            .read()
+            .expect("block inventory lock poisoned")
             .clone()
     }
 }
@@ -88,7 +102,7 @@ impl RdmaInventoryStatus {
 pub fn spawn(
     bind: &str,
     versions: ConfigVersionStatus,
-    rdma_inventory: RdmaInventoryStatus,
+    device_inventory: DeviceInventoryStatus,
     shutdown: &'static AtomicBool,
 ) -> Result<JoinHandle<()>, ExporterError> {
     let addr: SocketAddr = bind
@@ -103,7 +117,7 @@ pub fn spawn(
 
     let handle = std::thread::Builder::new()
         .name("metrics-exporter".to_string())
-        .spawn(move || run(listener, versions, rdma_inventory, shutdown))
+        .spawn(move || run(listener, versions, device_inventory, shutdown))
         .map_err(ExporterError::Bind)?;
     Ok(handle)
 }
@@ -111,14 +125,14 @@ pub fn spawn(
 fn run(
     listener: TcpListener,
     versions: ConfigVersionStatus,
-    rdma_inventory: RdmaInventoryStatus,
+    device_inventory: DeviceInventoryStatus,
     shutdown: &'static AtomicBool,
 ) {
     for stream in accept_loop(&listener, shutdown) {
         if let Ok(stream) = stream {
             // One scrape at a time is plenty; handle inline so a slow
             // client cannot spawn unbounded threads.
-            handle_conn(stream, &versions, &rdma_inventory);
+            handle_conn(stream, &versions, &device_inventory);
         }
     }
 }
@@ -149,7 +163,7 @@ fn accept_loop<'a>(
 fn handle_conn(
     mut stream: TcpStream,
     versions: &ConfigVersionStatus,
-    rdma_inventory: &RdmaInventoryStatus,
+    device_inventory: &DeviceInventoryStatus,
 ) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
@@ -180,9 +194,9 @@ fn handle_conn(
             let body = super::render(versions);
             let _ = write_response(&mut stream, 200, super::TEXT_CONTENT_TYPE, &body);
         }
-        "/inventory/rdma" => match rdma_inventory.body() {
+        "/inventory/rdma" => match device_inventory.rdma_body() {
             Some(body) => {
-                let _ = write_response(&mut stream, 200, "application/json", &body);
+                let _ = write_response(&mut stream, 200, "text/plain; charset=utf-8", &body);
             }
             None => {
                 let _ = write_response(
@@ -190,6 +204,19 @@ fn handle_conn(
                     503,
                     "text/plain; charset=utf-8",
                     b"rdma inventory not ready\n",
+                );
+            }
+        },
+        "/inventory/block" => match device_inventory.block_body() {
+            Some(body) => {
+                let _ = write_response(&mut stream, 200, "text/plain; charset=utf-8", &body);
+            }
+            None => {
+                let _ = write_response(
+                    &mut stream,
+                    503,
+                    "text/plain; charset=utf-8",
+                    b"block inventory not ready\n",
                 );
             }
         },
@@ -292,8 +319,9 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let shutdown: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let versions = ConfigVersionStatus::new(9);
-        let inventory = RdmaInventoryStatus::new();
-        inventory.set_json(br#"{"schemaVersion":1,"hcas":[]}"#.to_vec());
+        let inventory = DeviceInventoryStatus::new();
+        inventory.set_rdma(b"mlx5_0?addr=hex%3A01".to_vec());
+        inventory.set_block(b"/dev/sdb?name=sdb&size_bytes=4096".to_vec());
         let inventory_for_thread = inventory.clone();
         let t = std::thread::spawn(move || run(listener, versions, inventory_for_thread, shutdown));
 
@@ -307,8 +335,13 @@ mod tests {
 
         let (head, body) = get(addr, "/inventory/rdma");
         assert!(head.contains("200 OK"));
-        assert!(head.contains("application/json"));
-        assert_eq!(body, br#"{"schemaVersion":1,"hcas":[]}"#);
+        assert!(head.contains("text/plain; charset=utf-8"));
+        assert_eq!(body, b"mlx5_0?addr=hex%3A01");
+
+        let (head, body) = get(addr, "/inventory/block");
+        assert!(head.contains("200 OK"));
+        assert!(head.contains("text/plain; charset=utf-8"));
+        assert_eq!(body, b"/dev/sdb?name=sdb&size_bytes=4096");
 
         let (head, _) = get(addr, "/nope");
         assert!(head.contains("404 Not Found"));
@@ -320,19 +353,23 @@ mod tests {
     }
 
     #[test]
-    fn rdma_inventory_reports_not_ready_until_set() {
+    fn device_inventory_reports_not_ready_until_set() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let shutdown: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let versions = ConfigVersionStatus::new(9);
         let t = std::thread::spawn(move || {
-            run(listener, versions, RdmaInventoryStatus::new(), shutdown)
+            run(listener, versions, DeviceInventoryStatus::new(), shutdown)
         });
 
         let (head, body) = get(addr, "/inventory/rdma");
         assert!(head.contains("503 Service Unavailable"), "head: {head}");
         assert_eq!(body, b"rdma inventory not ready\n");
+
+        let (head, body) = get(addr, "/inventory/block");
+        assert!(head.contains("503 Service Unavailable"), "head: {head}");
+        assert_eq!(body, b"block inventory not ready\n");
 
         shutdown.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(addr);

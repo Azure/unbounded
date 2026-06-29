@@ -61,6 +61,7 @@ pub(super) fn fake_host(
         numa_nodes,
         hcas,
         nvmes,
+        block_devices: vec![],
         nics: vec![],
         isolated,
     }
