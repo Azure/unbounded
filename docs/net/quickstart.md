@@ -26,7 +26,7 @@ template rendering and ordering) or by applying manifests manually.
 make -C hack/net deploy
 ```
 
-By default this deploys into the `unbounded-net` namespace. Override with:
+By default this deploys into the `unbounded-system` namespace. Override with:
 
 ```bash
 make -C hack/net deploy NET_NAMESPACE=kube-system
@@ -69,7 +69,7 @@ This installs the following CustomResourceDefinitions in the
 Skip this step if deploying into `kube-system`.
 
 ```bash
-kubectl create namespace unbounded-net
+kubectl create namespace unbounded-system
 ```
 
 #### 3. Deploy controller
@@ -170,10 +170,10 @@ Check that the controller and node agents are running:
 
 ```bash
 # Controller pod
-kubectl -n unbounded-net get pods -l app.kubernetes.io/name=unbounded-net-controller
+kubectl -n unbounded-system get pods -l app.kubernetes.io/name=unbounded-net-controller
 
 # Node agent pods (one per node)
-kubectl -n unbounded-net get pods -l app.kubernetes.io/name=unbounded-net-node -o wide
+kubectl -n unbounded-system get pods -l app.kubernetes.io/name=unbounded-net-node -o wide
 
 # Nodes should be labeled with their site
 kubectl get nodes -L net.unbounded-cloud.io/site
