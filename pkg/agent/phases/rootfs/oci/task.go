@@ -97,15 +97,10 @@ func (d *downloadRootFS) pullAndUnpack(ctx context.Context, ref, tag string) err
 		return fmt.Errorf("create OCI layout store: %w", err)
 	}
 
-	// Connect to the remote repository. We assume public access (no auth).
-	repo, err := remote.NewRepository(ref)
+	repo, err := newRemoteRepository(ref)
 	if err != nil {
 		return fmt.Errorf("connect to remote repository %q: %w", ref, err)
 	}
-
-	// Use plain HTTP for loopback and private-network registries.
-	ociutil.ConfigurePlainHTTP(repo)
-	configureOCIPullRetry(repo)
 
 	// Copy (pull) the image from the remote repository into the local OCI layout.
 	desc, err := oras.Copy(ctx, repo, tag, store, tag, oras.DefaultCopyOptions)
@@ -130,6 +125,20 @@ func (d *downloadRootFS) pullAndUnpack(ctx context.Context, ref, tag string) err
 		slog.String("dest", d.machineDir))
 
 	return nil
+}
+
+func newRemoteRepository(ref string) (*remote.Repository, error) {
+	// Connect to the remote repository. We assume public access (no auth).
+	repo, err := remote.NewRepository(ref)
+	if err != nil {
+		return nil, err
+	}
+
+	// Use plain HTTP for loopback and private-network registries.
+	ociutil.ConfigurePlainHTTP(repo)
+	configureOCIPullRetry(repo)
+
+	return repo, nil
 }
 
 func configureOCIPullRetry(repo *remote.Repository) {
@@ -223,6 +232,26 @@ func maxOCIPullRetryDelay() time.Duration {
 	}
 
 	return delay
+}
+
+// CheckImageReachable validates that an OCI image manifest can be resolved
+// without pulling layers or writing durable state.
+func CheckImageReachable(ctx context.Context, image string) error {
+	ref, tag, err := parseImageReference(image)
+	if err != nil {
+		return fmt.Errorf("parse image reference: %w", err)
+	}
+
+	repo, err := newRemoteRepository(ref)
+	if err != nil {
+		return fmt.Errorf("connect to remote repository: %w", err)
+	}
+
+	if _, err := repo.Resolve(ctx, tag); err != nil {
+		return fmt.Errorf("resolve image manifest: %w", err)
+	}
+
+	return nil
 }
 
 // parseImageReference splits an OCI image reference like
