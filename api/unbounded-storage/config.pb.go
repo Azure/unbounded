@@ -1453,6 +1453,8 @@ func (x *FileDiskConfig) GetPath() string {
 type BackendSpec struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Optional cache metadata TTL policy shared by backend implementations.
+	CachingPolicy *CachingPolicy `protobuf:"bytes,6,opt,name=caching_policy,json=cachingPolicy,proto3" json:"caching_policy,omitempty"`
 	// Types that are valid to be assigned to Config:
 	//
 	//	*BackendSpec_Http
@@ -1499,6 +1501,13 @@ func (x *BackendSpec) GetName() string {
 		return x.Name
 	}
 	return ""
+}
+
+func (x *BackendSpec) GetCachingPolicy() *CachingPolicy {
+	if x != nil {
+		return x.CachingPolicy
+	}
+	return nil
 }
 
 func (x *BackendSpec) GetConfig() isBackendSpec_Config {
@@ -1572,6 +1581,78 @@ func (*BackendSpec_Azure) isBackendSpec_Config() {}
 
 func (*BackendSpec_Fake) isBackendSpec_Config() {}
 
+type CachingPolicy struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Default positive metadata TTL when the origin does not provide Cache-Control max-age.
+	MetadataTtlDefaultSecs *uint64 `protobuf:"varint,1,opt,name=metadata_ttl_default_secs,json=metadataTtlDefaultSecs,proto3,oneof" json:"metadata_ttl_default_secs,omitempty"`
+	// Upper bound applied to origin-provided positive metadata TTLs.
+	MetadataTtlMaxSecs *uint64 `protobuf:"varint,2,opt,name=metadata_ttl_max_secs,json=metadataTtlMaxSecs,proto3,oneof" json:"metadata_ttl_max_secs,omitempty"`
+	// Default 404 metadata TTL when the origin does not provide Cache-Control max-age.
+	NotFoundTtlDefaultSecs *uint64 `protobuf:"varint,3,opt,name=not_found_ttl_default_secs,json=notFoundTtlDefaultSecs,proto3,oneof" json:"not_found_ttl_default_secs,omitempty"`
+	// Upper bound applied to origin-provided 404 metadata TTLs.
+	NotFoundTtlMaxSecs *uint64 `protobuf:"varint,4,opt,name=not_found_ttl_max_secs,json=notFoundTtlMaxSecs,proto3,oneof" json:"not_found_ttl_max_secs,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *CachingPolicy) Reset() {
+	*x = CachingPolicy{}
+	mi := &file_config_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CachingPolicy) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CachingPolicy) ProtoMessage() {}
+
+func (x *CachingPolicy) ProtoReflect() protoreflect.Message {
+	mi := &file_config_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CachingPolicy.ProtoReflect.Descriptor instead.
+func (*CachingPolicy) Descriptor() ([]byte, []int) {
+	return file_config_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *CachingPolicy) GetMetadataTtlDefaultSecs() uint64 {
+	if x != nil && x.MetadataTtlDefaultSecs != nil {
+		return *x.MetadataTtlDefaultSecs
+	}
+	return 0
+}
+
+func (x *CachingPolicy) GetMetadataTtlMaxSecs() uint64 {
+	if x != nil && x.MetadataTtlMaxSecs != nil {
+		return *x.MetadataTtlMaxSecs
+	}
+	return 0
+}
+
+func (x *CachingPolicy) GetNotFoundTtlDefaultSecs() uint64 {
+	if x != nil && x.NotFoundTtlDefaultSecs != nil {
+		return *x.NotFoundTtlDefaultSecs
+	}
+	return 0
+}
+
+func (x *CachingPolicy) GetNotFoundTtlMaxSecs() uint64 {
+	if x != nil && x.NotFoundTtlMaxSecs != nil {
+		return *x.NotFoundTtlMaxSecs
+	}
+	return 0
+}
+
 type HttpBackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses plaintext;
@@ -1591,21 +1672,13 @@ type HttpBackendConfig struct {
 	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
 	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
 	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
-	// Default positive metadata TTL when the origin does not provide Cache-Control max-age.
-	MetadataTtlDefaultSecs *uint64 `protobuf:"varint,8,opt,name=metadata_ttl_default_secs,json=metadataTtlDefaultSecs,proto3,oneof" json:"metadata_ttl_default_secs,omitempty"`
-	// Upper bound applied to origin-provided positive metadata TTLs.
-	MetadataTtlMaxSecs *uint64 `protobuf:"varint,9,opt,name=metadata_ttl_max_secs,json=metadataTtlMaxSecs,proto3,oneof" json:"metadata_ttl_max_secs,omitempty"`
-	// Default 404 metadata TTL when the origin does not provide Cache-Control max-age.
-	NotFoundTtlDefaultSecs *uint64 `protobuf:"varint,10,opt,name=not_found_ttl_default_secs,json=notFoundTtlDefaultSecs,proto3,oneof" json:"not_found_ttl_default_secs,omitempty"`
-	// Upper bound applied to origin-provided 404 metadata TTLs.
-	NotFoundTtlMaxSecs *uint64 `protobuf:"varint,11,opt,name=not_found_ttl_max_secs,json=notFoundTtlMaxSecs,proto3,oneof" json:"not_found_ttl_max_secs,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HttpBackendConfig) Reset() {
 	*x = HttpBackendConfig{}
-	mi := &file_config_proto_msgTypes[21]
+	mi := &file_config_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1617,7 +1690,7 @@ func (x *HttpBackendConfig) String() string {
 func (*HttpBackendConfig) ProtoMessage() {}
 
 func (x *HttpBackendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[21]
+	mi := &file_config_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1630,7 +1703,7 @@ func (x *HttpBackendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HttpBackendConfig.ProtoReflect.Descriptor instead.
 func (*HttpBackendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{21}
+	return file_config_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *HttpBackendConfig) GetUrl() string {
@@ -1682,34 +1755,6 @@ func (x *HttpBackendConfig) GetClientKeyPath() string {
 	return ""
 }
 
-func (x *HttpBackendConfig) GetMetadataTtlDefaultSecs() uint64 {
-	if x != nil && x.MetadataTtlDefaultSecs != nil {
-		return *x.MetadataTtlDefaultSecs
-	}
-	return 0
-}
-
-func (x *HttpBackendConfig) GetMetadataTtlMaxSecs() uint64 {
-	if x != nil && x.MetadataTtlMaxSecs != nil {
-		return *x.MetadataTtlMaxSecs
-	}
-	return 0
-}
-
-func (x *HttpBackendConfig) GetNotFoundTtlDefaultSecs() uint64 {
-	if x != nil && x.NotFoundTtlDefaultSecs != nil {
-		return *x.NotFoundTtlDefaultSecs
-	}
-	return 0
-}
-
-func (x *HttpBackendConfig) GetNotFoundTtlMaxSecs() uint64 {
-	if x != nil && x.NotFoundTtlMaxSecs != nil {
-		return *x.NotFoundTtlMaxSecs
-	}
-	return 0
-}
-
 type S3BackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// S3-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://` uses
@@ -1729,21 +1774,13 @@ type S3BackendConfig struct {
 	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
 	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
 	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
-	// Default positive metadata TTL when the origin does not provide Cache-Control max-age.
-	MetadataTtlDefaultSecs *uint64 `protobuf:"varint,8,opt,name=metadata_ttl_default_secs,json=metadataTtlDefaultSecs,proto3,oneof" json:"metadata_ttl_default_secs,omitempty"`
-	// Upper bound applied to origin-provided positive metadata TTLs.
-	MetadataTtlMaxSecs *uint64 `protobuf:"varint,9,opt,name=metadata_ttl_max_secs,json=metadataTtlMaxSecs,proto3,oneof" json:"metadata_ttl_max_secs,omitempty"`
-	// Default 404 metadata TTL when the origin does not provide Cache-Control max-age.
-	NotFoundTtlDefaultSecs *uint64 `protobuf:"varint,10,opt,name=not_found_ttl_default_secs,json=notFoundTtlDefaultSecs,proto3,oneof" json:"not_found_ttl_default_secs,omitempty"`
-	// Upper bound applied to origin-provided 404 metadata TTLs.
-	NotFoundTtlMaxSecs *uint64 `protobuf:"varint,11,opt,name=not_found_ttl_max_secs,json=notFoundTtlMaxSecs,proto3,oneof" json:"not_found_ttl_max_secs,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *S3BackendConfig) Reset() {
 	*x = S3BackendConfig{}
-	mi := &file_config_proto_msgTypes[22]
+	mi := &file_config_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1755,7 +1792,7 @@ func (x *S3BackendConfig) String() string {
 func (*S3BackendConfig) ProtoMessage() {}
 
 func (x *S3BackendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[22]
+	mi := &file_config_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1768,7 +1805,7 @@ func (x *S3BackendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use S3BackendConfig.ProtoReflect.Descriptor instead.
 func (*S3BackendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{22}
+	return file_config_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *S3BackendConfig) GetUrl() string {
@@ -1820,34 +1857,6 @@ func (x *S3BackendConfig) GetClientKeyPath() string {
 	return ""
 }
 
-func (x *S3BackendConfig) GetMetadataTtlDefaultSecs() uint64 {
-	if x != nil && x.MetadataTtlDefaultSecs != nil {
-		return *x.MetadataTtlDefaultSecs
-	}
-	return 0
-}
-
-func (x *S3BackendConfig) GetMetadataTtlMaxSecs() uint64 {
-	if x != nil && x.MetadataTtlMaxSecs != nil {
-		return *x.MetadataTtlMaxSecs
-	}
-	return 0
-}
-
-func (x *S3BackendConfig) GetNotFoundTtlDefaultSecs() uint64 {
-	if x != nil && x.NotFoundTtlDefaultSecs != nil {
-		return *x.NotFoundTtlDefaultSecs
-	}
-	return 0
-}
-
-func (x *S3BackendConfig) GetNotFoundTtlMaxSecs() uint64 {
-	if x != nil && x.NotFoundTtlMaxSecs != nil {
-		return *x.NotFoundTtlMaxSecs
-	}
-	return 0
-}
-
 type AzureBackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Azure Blob-compatible origin URL resolved to an IPv4 address for HTTP/1.1 fetches. `http://`
@@ -1867,21 +1876,13 @@ type AzureBackendConfig struct {
 	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
 	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
 	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
-	// Default positive metadata TTL when the origin does not provide Cache-Control max-age.
-	MetadataTtlDefaultSecs *uint64 `protobuf:"varint,8,opt,name=metadata_ttl_default_secs,json=metadataTtlDefaultSecs,proto3,oneof" json:"metadata_ttl_default_secs,omitempty"`
-	// Upper bound applied to origin-provided positive metadata TTLs.
-	MetadataTtlMaxSecs *uint64 `protobuf:"varint,9,opt,name=metadata_ttl_max_secs,json=metadataTtlMaxSecs,proto3,oneof" json:"metadata_ttl_max_secs,omitempty"`
-	// Default 404 metadata TTL when the origin does not provide Cache-Control max-age.
-	NotFoundTtlDefaultSecs *uint64 `protobuf:"varint,10,opt,name=not_found_ttl_default_secs,json=notFoundTtlDefaultSecs,proto3,oneof" json:"not_found_ttl_default_secs,omitempty"`
-	// Upper bound applied to origin-provided 404 metadata TTLs.
-	NotFoundTtlMaxSecs *uint64 `protobuf:"varint,11,opt,name=not_found_ttl_max_secs,json=notFoundTtlMaxSecs,proto3,oneof" json:"not_found_ttl_max_secs,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AzureBackendConfig) Reset() {
 	*x = AzureBackendConfig{}
-	mi := &file_config_proto_msgTypes[23]
+	mi := &file_config_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1893,7 +1894,7 @@ func (x *AzureBackendConfig) String() string {
 func (*AzureBackendConfig) ProtoMessage() {}
 
 func (x *AzureBackendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[23]
+	mi := &file_config_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1906,7 +1907,7 @@ func (x *AzureBackendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AzureBackendConfig.ProtoReflect.Descriptor instead.
 func (*AzureBackendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{23}
+	return file_config_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *AzureBackendConfig) GetUrl() string {
@@ -1958,34 +1959,6 @@ func (x *AzureBackendConfig) GetClientKeyPath() string {
 	return ""
 }
 
-func (x *AzureBackendConfig) GetMetadataTtlDefaultSecs() uint64 {
-	if x != nil && x.MetadataTtlDefaultSecs != nil {
-		return *x.MetadataTtlDefaultSecs
-	}
-	return 0
-}
-
-func (x *AzureBackendConfig) GetMetadataTtlMaxSecs() uint64 {
-	if x != nil && x.MetadataTtlMaxSecs != nil {
-		return *x.MetadataTtlMaxSecs
-	}
-	return 0
-}
-
-func (x *AzureBackendConfig) GetNotFoundTtlDefaultSecs() uint64 {
-	if x != nil && x.NotFoundTtlDefaultSecs != nil {
-		return *x.NotFoundTtlDefaultSecs
-	}
-	return 0
-}
-
-func (x *AzureBackendConfig) GetNotFoundTtlMaxSecs() uint64 {
-	if x != nil && x.NotFoundTtlMaxSecs != nil {
-		return *x.NotFoundTtlMaxSecs
-	}
-	return 0
-}
-
 type FakeBackendConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Stripe granularity in bytes for synthetic origin references. Defaults to 4 MiB when unset.
@@ -1999,7 +1972,7 @@ type FakeBackendConfig struct {
 
 func (x *FakeBackendConfig) Reset() {
 	*x = FakeBackendConfig{}
-	mi := &file_config_proto_msgTypes[24]
+	mi := &file_config_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2011,7 +1984,7 @@ func (x *FakeBackendConfig) String() string {
 func (*FakeBackendConfig) ProtoMessage() {}
 
 func (x *FakeBackendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[24]
+	mi := &file_config_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2024,7 +1997,7 @@ func (x *FakeBackendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FakeBackendConfig.ProtoReflect.Descriptor instead.
 func (*FakeBackendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{24}
+	return file_config_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *FakeBackendConfig) GetStripeSizeBytes() uint64 {
@@ -2057,7 +2030,7 @@ type FrontendSpec struct {
 
 func (x *FrontendSpec) Reset() {
 	*x = FrontendSpec{}
-	mi := &file_config_proto_msgTypes[25]
+	mi := &file_config_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2069,7 +2042,7 @@ func (x *FrontendSpec) String() string {
 func (*FrontendSpec) ProtoMessage() {}
 
 func (x *FrontendSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[25]
+	mi := &file_config_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2082,7 +2055,7 @@ func (x *FrontendSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FrontendSpec.ProtoReflect.Descriptor instead.
 func (*FrontendSpec) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{25}
+	return file_config_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *FrontendSpec) GetName() string {
@@ -2167,7 +2140,7 @@ type HttpFrontendConfig struct {
 
 func (x *HttpFrontendConfig) Reset() {
 	*x = HttpFrontendConfig{}
-	mi := &file_config_proto_msgTypes[26]
+	mi := &file_config_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2179,7 +2152,7 @@ func (x *HttpFrontendConfig) String() string {
 func (*HttpFrontendConfig) ProtoMessage() {}
 
 func (x *HttpFrontendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[26]
+	mi := &file_config_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2192,7 +2165,7 @@ func (x *HttpFrontendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HttpFrontendConfig.ProtoReflect.Descriptor instead.
 func (*HttpFrontendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{26}
+	return file_config_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *HttpFrontendConfig) GetAddr() string {
@@ -2219,7 +2192,7 @@ type S3FrontendConfig struct {
 
 func (x *S3FrontendConfig) Reset() {
 	*x = S3FrontendConfig{}
-	mi := &file_config_proto_msgTypes[27]
+	mi := &file_config_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2231,7 +2204,7 @@ func (x *S3FrontendConfig) String() string {
 func (*S3FrontendConfig) ProtoMessage() {}
 
 func (x *S3FrontendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[27]
+	mi := &file_config_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2244,7 +2217,7 @@ func (x *S3FrontendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use S3FrontendConfig.ProtoReflect.Descriptor instead.
 func (*S3FrontendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{27}
+	return file_config_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *S3FrontendConfig) GetAddr() string {
@@ -2293,7 +2266,7 @@ type LoadgenFrontendConfig struct {
 
 func (x *LoadgenFrontendConfig) Reset() {
 	*x = LoadgenFrontendConfig{}
-	mi := &file_config_proto_msgTypes[28]
+	mi := &file_config_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2305,7 +2278,7 @@ func (x *LoadgenFrontendConfig) String() string {
 func (*LoadgenFrontendConfig) ProtoMessage() {}
 
 func (x *LoadgenFrontendConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_config_proto_msgTypes[28]
+	mi := &file_config_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2318,7 +2291,7 @@ func (x *LoadgenFrontendConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoadgenFrontendConfig.ProtoReflect.Descriptor instead.
 func (*LoadgenFrontendConfig) Descriptor() ([]byte, []int) {
-	return file_config_proto_rawDescGZIP(), []int{28}
+	return file_config_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *LoadgenFrontendConfig) GetWorkers() uint32 {
@@ -2514,14 +2487,24 @@ const file_config_proto_rawDesc = "" +
 	"\x0eFileDiskConfig\x12\x17\n" +
 	"\x04size\x18\x01 \x01(\x04H\x00R\x04size\x88\x01\x01\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04pathB\a\n" +
-	"\x05_size\"\xb4\x02\n" +
+	"\x05_size\"\x84\x03\n" +
 	"\vBackendSpec\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12A\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12N\n" +
+	"\x0ecaching_policy\x18\x06 \x01(\v2'.unbounded.storage.config.CachingPolicyR\rcachingPolicy\x12A\n" +
 	"\x04http\x18\x02 \x01(\v2+.unbounded.storage.config.HttpBackendConfigH\x00R\x04http\x12;\n" +
 	"\x02s3\x18\x03 \x01(\v2).unbounded.storage.config.S3BackendConfigH\x00R\x02s3\x12D\n" +
 	"\x05azure\x18\x04 \x01(\v2,.unbounded.storage.config.AzureBackendConfigH\x00R\x05azure\x12A\n" +
 	"\x04fake\x18\x05 \x01(\v2+.unbounded.storage.config.FakeBackendConfigH\x00R\x04fakeB\b\n" +
-	"\x06config\"\x84\x06\n" +
+	"\x06config\"\xf3\x02\n" +
+	"\rCachingPolicy\x12>\n" +
+	"\x19metadata_ttl_default_secs\x18\x01 \x01(\x04H\x00R\x16metadataTtlDefaultSecs\x88\x01\x01\x126\n" +
+	"\x15metadata_ttl_max_secs\x18\x02 \x01(\x04H\x01R\x12metadataTtlMaxSecs\x88\x01\x01\x12?\n" +
+	"\x1anot_found_ttl_default_secs\x18\x03 \x01(\x04H\x02R\x16notFoundTtlDefaultSecs\x88\x01\x01\x127\n" +
+	"\x16not_found_ttl_max_secs\x18\x04 \x01(\x04H\x03R\x12notFoundTtlMaxSecs\x88\x01\x01B\x1c\n" +
+	"\x1a_metadata_ttl_default_secsB\x18\n" +
+	"\x16_metadata_ttl_max_secsB\x1d\n" +
+	"\x1b_not_found_ttl_default_secsB\x19\n" +
+	"\x17_not_found_ttl_max_secs\"\xa0\x03\n" +
 	"\x11HttpBackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
@@ -2530,21 +2513,12 @@ const file_config_proto_rawDesc = "" +
 	"caCertPath\x88\x01\x01\x120\n" +
 	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
 	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
-	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01\x12>\n" +
-	"\x19metadata_ttl_default_secs\x18\b \x01(\x04H\x05R\x16metadataTtlDefaultSecs\x88\x01\x01\x126\n" +
-	"\x15metadata_ttl_max_secs\x18\t \x01(\x04H\x06R\x12metadataTtlMaxSecs\x88\x01\x01\x12?\n" +
-	"\x1anot_found_ttl_default_secs\x18\n" +
-	" \x01(\x04H\aR\x16notFoundTtlDefaultSecs\x88\x01\x01\x127\n" +
-	"\x16not_found_ttl_max_secs\x18\v \x01(\x04H\bR\x12notFoundTtlMaxSecs\x88\x01\x01B\x14\n" +
+	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
 	"\x11_http_concurrencyB\x0f\n" +
 	"\r_ca_cert_pathB\x13\n" +
 	"\x11_client_cert_pathB\x12\n" +
-	"\x10_client_key_pathB\x1c\n" +
-	"\x1a_metadata_ttl_default_secsB\x18\n" +
-	"\x16_metadata_ttl_max_secsB\x1d\n" +
-	"\x1b_not_found_ttl_default_secsB\x19\n" +
-	"\x17_not_found_ttl_max_secs\"\x82\x06\n" +
+	"\x10_client_key_path\"\x9e\x03\n" +
 	"\x0fS3BackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
@@ -2553,21 +2527,12 @@ const file_config_proto_rawDesc = "" +
 	"caCertPath\x88\x01\x01\x120\n" +
 	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
 	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
-	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01\x12>\n" +
-	"\x19metadata_ttl_default_secs\x18\b \x01(\x04H\x05R\x16metadataTtlDefaultSecs\x88\x01\x01\x126\n" +
-	"\x15metadata_ttl_max_secs\x18\t \x01(\x04H\x06R\x12metadataTtlMaxSecs\x88\x01\x01\x12?\n" +
-	"\x1anot_found_ttl_default_secs\x18\n" +
-	" \x01(\x04H\aR\x16notFoundTtlDefaultSecs\x88\x01\x01\x127\n" +
-	"\x16not_found_ttl_max_secs\x18\v \x01(\x04H\bR\x12notFoundTtlMaxSecs\x88\x01\x01B\x14\n" +
+	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
 	"\x11_http_concurrencyB\x0f\n" +
 	"\r_ca_cert_pathB\x13\n" +
 	"\x11_client_cert_pathB\x12\n" +
-	"\x10_client_key_pathB\x1c\n" +
-	"\x1a_metadata_ttl_default_secsB\x18\n" +
-	"\x16_metadata_ttl_max_secsB\x1d\n" +
-	"\x1b_not_found_ttl_default_secsB\x19\n" +
-	"\x17_not_found_ttl_max_secs\"\x85\x06\n" +
+	"\x10_client_key_path\"\xa1\x03\n" +
 	"\x12AzureBackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
@@ -2576,21 +2541,12 @@ const file_config_proto_rawDesc = "" +
 	"caCertPath\x88\x01\x01\x120\n" +
 	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
 	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
-	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01\x12>\n" +
-	"\x19metadata_ttl_default_secs\x18\b \x01(\x04H\x05R\x16metadataTtlDefaultSecs\x88\x01\x01\x126\n" +
-	"\x15metadata_ttl_max_secs\x18\t \x01(\x04H\x06R\x12metadataTtlMaxSecs\x88\x01\x01\x12?\n" +
-	"\x1anot_found_ttl_default_secs\x18\n" +
-	" \x01(\x04H\aR\x16notFoundTtlDefaultSecs\x88\x01\x01\x127\n" +
-	"\x16not_found_ttl_max_secs\x18\v \x01(\x04H\bR\x12notFoundTtlMaxSecs\x88\x01\x01B\x14\n" +
+	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
 	"\x11_http_concurrencyB\x0f\n" +
 	"\r_ca_cert_pathB\x13\n" +
 	"\x11_client_cert_pathB\x12\n" +
-	"\x10_client_key_pathB\x1c\n" +
-	"\x1a_metadata_ttl_default_secsB\x18\n" +
-	"\x16_metadata_ttl_max_secsB\x1d\n" +
-	"\x1b_not_found_ttl_default_secsB\x19\n" +
-	"\x17_not_found_ttl_max_secs\"\xa1\x01\n" +
+	"\x10_client_key_path\"\xa1\x01\n" +
 	"\x11FakeBackendConfig\x12/\n" +
 	"\x11stripe_size_bytes\x18\x01 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12/\n" +
 	"\x11object_size_bytes\x18\x02 \x01(\x04H\x01R\x0fobjectSizeBytes\x88\x01\x01B\x14\n" +
@@ -2646,7 +2602,7 @@ func file_config_proto_rawDescGZIP() []byte {
 	return file_config_proto_rawDescData
 }
 
-var file_config_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
+var file_config_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
 var file_config_proto_goTypes = []any{
 	(*Config)(nil),                // 0: unbounded.storage.config.Config
 	(*RoutingPlan)(nil),           // 1: unbounded.storage.config.RoutingPlan
@@ -2669,18 +2625,19 @@ var file_config_proto_goTypes = []any{
 	(*BlockDiskConfig)(nil),       // 18: unbounded.storage.config.BlockDiskConfig
 	(*FileDiskConfig)(nil),        // 19: unbounded.storage.config.FileDiskConfig
 	(*BackendSpec)(nil),           // 20: unbounded.storage.config.BackendSpec
-	(*HttpBackendConfig)(nil),     // 21: unbounded.storage.config.HttpBackendConfig
-	(*S3BackendConfig)(nil),       // 22: unbounded.storage.config.S3BackendConfig
-	(*AzureBackendConfig)(nil),    // 23: unbounded.storage.config.AzureBackendConfig
-	(*FakeBackendConfig)(nil),     // 24: unbounded.storage.config.FakeBackendConfig
-	(*FrontendSpec)(nil),          // 25: unbounded.storage.config.FrontendSpec
-	(*HttpFrontendConfig)(nil),    // 26: unbounded.storage.config.HttpFrontendConfig
-	(*S3FrontendConfig)(nil),      // 27: unbounded.storage.config.S3FrontendConfig
-	(*LoadgenFrontendConfig)(nil), // 28: unbounded.storage.config.LoadgenFrontendConfig
+	(*CachingPolicy)(nil),         // 21: unbounded.storage.config.CachingPolicy
+	(*HttpBackendConfig)(nil),     // 22: unbounded.storage.config.HttpBackendConfig
+	(*S3BackendConfig)(nil),       // 23: unbounded.storage.config.S3BackendConfig
+	(*AzureBackendConfig)(nil),    // 24: unbounded.storage.config.AzureBackendConfig
+	(*FakeBackendConfig)(nil),     // 25: unbounded.storage.config.FakeBackendConfig
+	(*FrontendSpec)(nil),          // 26: unbounded.storage.config.FrontendSpec
+	(*HttpFrontendConfig)(nil),    // 27: unbounded.storage.config.HttpFrontendConfig
+	(*S3FrontendConfig)(nil),      // 28: unbounded.storage.config.S3FrontendConfig
+	(*LoadgenFrontendConfig)(nil), // 29: unbounded.storage.config.LoadgenFrontendConfig
 }
 var file_config_proto_depIdxs = []int32{
 	8,  // 0: unbounded.storage.config.Config.startup:type_name -> unbounded.storage.config.StartupCfg
-	25, // 1: unbounded.storage.config.Config.frontends:type_name -> unbounded.storage.config.FrontendSpec
+	26, // 1: unbounded.storage.config.Config.frontends:type_name -> unbounded.storage.config.FrontendSpec
 	20, // 2: unbounded.storage.config.Config.backends:type_name -> unbounded.storage.config.BackendSpec
 	7,  // 3: unbounded.storage.config.Config.caches:type_name -> unbounded.storage.config.CacheSpec
 	17, // 4: unbounded.storage.config.Config.disks:type_name -> unbounded.storage.config.DiskSpec
@@ -2700,18 +2657,19 @@ var file_config_proto_depIdxs = []int32{
 	15, // 18: unbounded.storage.config.RdmaFabricBinds.binds:type_name -> unbounded.storage.config.RdmaFabricBind
 	18, // 19: unbounded.storage.config.DiskSpec.block:type_name -> unbounded.storage.config.BlockDiskConfig
 	19, // 20: unbounded.storage.config.DiskSpec.file:type_name -> unbounded.storage.config.FileDiskConfig
-	21, // 21: unbounded.storage.config.BackendSpec.http:type_name -> unbounded.storage.config.HttpBackendConfig
-	22, // 22: unbounded.storage.config.BackendSpec.s3:type_name -> unbounded.storage.config.S3BackendConfig
-	23, // 23: unbounded.storage.config.BackendSpec.azure:type_name -> unbounded.storage.config.AzureBackendConfig
-	24, // 24: unbounded.storage.config.BackendSpec.fake:type_name -> unbounded.storage.config.FakeBackendConfig
-	26, // 25: unbounded.storage.config.FrontendSpec.http:type_name -> unbounded.storage.config.HttpFrontendConfig
-	27, // 26: unbounded.storage.config.FrontendSpec.s3:type_name -> unbounded.storage.config.S3FrontendConfig
-	28, // 27: unbounded.storage.config.FrontendSpec.loadgen:type_name -> unbounded.storage.config.LoadgenFrontendConfig
-	28, // [28:28] is the sub-list for method output_type
-	28, // [28:28] is the sub-list for method input_type
-	28, // [28:28] is the sub-list for extension type_name
-	28, // [28:28] is the sub-list for extension extendee
-	0,  // [0:28] is the sub-list for field type_name
+	21, // 21: unbounded.storage.config.BackendSpec.caching_policy:type_name -> unbounded.storage.config.CachingPolicy
+	22, // 22: unbounded.storage.config.BackendSpec.http:type_name -> unbounded.storage.config.HttpBackendConfig
+	23, // 23: unbounded.storage.config.BackendSpec.s3:type_name -> unbounded.storage.config.S3BackendConfig
+	24, // 24: unbounded.storage.config.BackendSpec.azure:type_name -> unbounded.storage.config.AzureBackendConfig
+	25, // 25: unbounded.storage.config.BackendSpec.fake:type_name -> unbounded.storage.config.FakeBackendConfig
+	27, // 26: unbounded.storage.config.FrontendSpec.http:type_name -> unbounded.storage.config.HttpFrontendConfig
+	28, // 27: unbounded.storage.config.FrontendSpec.s3:type_name -> unbounded.storage.config.S3FrontendConfig
+	29, // 28: unbounded.storage.config.FrontendSpec.loadgen:type_name -> unbounded.storage.config.LoadgenFrontendConfig
+	29, // [29:29] is the sub-list for method output_type
+	29, // [29:29] is the sub-list for method input_type
+	29, // [29:29] is the sub-list for extension type_name
+	29, // [29:29] is the sub-list for extension extendee
+	0,  // [0:29] is the sub-list for field type_name
 }
 
 func init() { file_config_proto_init() }
@@ -2749,20 +2707,21 @@ func file_config_proto_init() {
 	file_config_proto_msgTypes[22].OneofWrappers = []any{}
 	file_config_proto_msgTypes[23].OneofWrappers = []any{}
 	file_config_proto_msgTypes[24].OneofWrappers = []any{}
-	file_config_proto_msgTypes[25].OneofWrappers = []any{
+	file_config_proto_msgTypes[25].OneofWrappers = []any{}
+	file_config_proto_msgTypes[26].OneofWrappers = []any{
 		(*FrontendSpec_Http)(nil),
 		(*FrontendSpec_S3)(nil),
 		(*FrontendSpec_Loadgen)(nil),
 	}
-	file_config_proto_msgTypes[26].OneofWrappers = []any{}
-	file_config_proto_msgTypes[28].OneofWrappers = []any{}
+	file_config_proto_msgTypes[27].OneofWrappers = []any{}
+	file_config_proto_msgTypes[29].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_config_proto_rawDesc), len(file_config_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   29,
+			NumMessages:   30,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -904,14 +904,11 @@ fn backend_specs(generation: usize, count: u8) -> Vec<BackendSpec> {
             } else {
                 format!("backend-{generation}-{i}")
             },
+            caching_policy: None,
             config: Some(backend_spec::Config::Http(HttpBackendConfig {
                 url: format!("https://origin-{generation}-{i}.example.com"),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
-                metadata_ttl_default_secs: Some(60),
-                metadata_ttl_max_secs: Some(60),
-                not_found_ttl_default_secs: Some(5),
-                not_found_ttl_max_secs: Some(5),
                 ca_cert_path: None,
                 insecure_skip_verify: false,
                 client_cert_path: None,

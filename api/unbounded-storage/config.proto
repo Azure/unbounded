@@ -263,12 +263,29 @@ message FileDiskConfig {
 message BackendSpec {
   string name = 1;
 
+  // Optional cache metadata TTL policy shared by backend implementations.
+  CachingPolicy caching_policy = 6;
+
   oneof config {
     HttpBackendConfig http = 2;
     S3BackendConfig s3 = 3;
     AzureBackendConfig azure = 4;
     FakeBackendConfig fake = 5;
   }
+}
+
+message CachingPolicy {
+  // Default positive metadata TTL when the origin does not provide Cache-Control max-age.
+  optional uint64 metadata_ttl_default_secs = 1;
+
+  // Upper bound applied to origin-provided positive metadata TTLs.
+  optional uint64 metadata_ttl_max_secs = 2;
+
+  // Default 404 metadata TTL when the origin does not provide Cache-Control max-age.
+  optional uint64 not_found_ttl_default_secs = 3;
+
+  // Upper bound applied to origin-provided 404 metadata TTLs.
+  optional uint64 not_found_ttl_max_secs = 4;
 }
 
 message HttpBackendConfig {
@@ -295,18 +312,6 @@ message HttpBackendConfig {
 
   // Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
   optional string client_key_path = 7;
-
-  // Default positive metadata TTL when the origin does not provide Cache-Control max-age.
-  optional uint64 metadata_ttl_default_secs = 8;
-
-  // Upper bound applied to origin-provided positive metadata TTLs.
-  optional uint64 metadata_ttl_max_secs = 9;
-
-  // Default 404 metadata TTL when the origin does not provide Cache-Control max-age.
-  optional uint64 not_found_ttl_default_secs = 10;
-
-  // Upper bound applied to origin-provided 404 metadata TTLs.
-  optional uint64 not_found_ttl_max_secs = 11;
 }
 
 message S3BackendConfig {
@@ -333,18 +338,6 @@ message S3BackendConfig {
 
   // Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
   optional string client_key_path = 7;
-
-  // Default positive metadata TTL when the origin does not provide Cache-Control max-age.
-  optional uint64 metadata_ttl_default_secs = 8;
-
-  // Upper bound applied to origin-provided positive metadata TTLs.
-  optional uint64 metadata_ttl_max_secs = 9;
-
-  // Default 404 metadata TTL when the origin does not provide Cache-Control max-age.
-  optional uint64 not_found_ttl_default_secs = 10;
-
-  // Upper bound applied to origin-provided 404 metadata TTLs.
-  optional uint64 not_found_ttl_max_secs = 11;
 }
 
 message AzureBackendConfig {
@@ -371,18 +364,6 @@ message AzureBackendConfig {
 
   // Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
   optional string client_key_path = 7;
-
-  // Default positive metadata TTL when the origin does not provide Cache-Control max-age.
-  optional uint64 metadata_ttl_default_secs = 8;
-
-  // Upper bound applied to origin-provided positive metadata TTLs.
-  optional uint64 metadata_ttl_max_secs = 9;
-
-  // Default 404 metadata TTL when the origin does not provide Cache-Control max-age.
-  optional uint64 not_found_ttl_default_secs = 10;
-
-  // Upper bound applied to origin-provided 404 metadata TTLs.
-  optional uint64 not_found_ttl_max_secs = 11;
 }
 
 message FakeBackendConfig {

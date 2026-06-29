@@ -2009,15 +2009,12 @@ mod tests {
     fn backend_spec(id: &str) -> BackendSpec {
         BackendSpec {
             name: id.to_string(),
+            caching_policy: None,
             config: Some(config::backend_spec::Config::Http(
                 config::HttpBackendConfig {
                     url: "https://example.com".to_string(),
                     stripe_size_bytes: Some(4 * 1024 * 1024),
                     http_concurrency: Some(64),
-                    metadata_ttl_default_secs: Some(60),
-                    metadata_ttl_max_secs: Some(60),
-                    not_found_ttl_default_secs: Some(5),
-                    not_found_ttl_max_secs: Some(5),
                     ca_cert_path: None,
                     insecure_skip_verify: false,
                     client_cert_path: None,

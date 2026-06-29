@@ -30,7 +30,7 @@ use arc_swap::ArcSwap;
 
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::config::reconcile::BackendReconcileTarget;
-use crate::config::{BackendSpec, backend_spec};
+use crate::config::{BackendSpec, CachingPolicy, backend_spec};
 use crate::storage::StripeReq;
 use crate::tls::{TlsConfig, TlsContext};
 
@@ -141,12 +141,7 @@ impl BuildCtx {
                     &cfg.client_key_path,
                 )?;
                 let origin = HttpBackend::resolve_origin(&endpoint.authority)?;
-                let metadata_ttl = metadata_ttl_policy(
-                    cfg.metadata_ttl_default_secs,
-                    cfg.metadata_ttl_max_secs,
-                    cfg.not_found_ttl_default_secs,
-                    cfg.not_found_ttl_max_secs,
-                );
+                let metadata_ttl = metadata_ttl_policy(spec.caching_policy());
                 Ok(OriginBackend::Http(HttpBackend::new(
                     self.ring.clone(),
                     origin,
@@ -170,12 +165,7 @@ impl BuildCtx {
                     &cfg.client_key_path,
                 )?;
                 let origin = S3Backend::resolve_origin(&endpoint.authority)?;
-                let metadata_ttl = metadata_ttl_policy(
-                    cfg.metadata_ttl_default_secs,
-                    cfg.metadata_ttl_max_secs,
-                    cfg.not_found_ttl_default_secs,
-                    cfg.not_found_ttl_max_secs,
-                );
+                let metadata_ttl = metadata_ttl_policy(spec.caching_policy());
                 Ok(OriginBackend::S3(S3Backend::new(
                     self.ring.clone(),
                     origin,
@@ -199,12 +189,7 @@ impl BuildCtx {
                     &cfg.client_key_path,
                 )?;
                 let origin = AzureBackend::resolve_origin(&endpoint.authority)?;
-                let metadata_ttl = metadata_ttl_policy(
-                    cfg.metadata_ttl_default_secs,
-                    cfg.metadata_ttl_max_secs,
-                    cfg.not_found_ttl_default_secs,
-                    cfg.not_found_ttl_max_secs,
-                );
+                let metadata_ttl = metadata_ttl_policy(spec.caching_policy());
                 Ok(OriginBackend::Azure(AzureBackend::new(
                     self.ring.clone(),
                     origin,
@@ -234,17 +219,20 @@ impl BuildCtx {
     }
 }
 
-fn metadata_ttl_policy(
-    metadata_default_secs: Option<u64>,
-    metadata_max_secs: Option<u64>,
-    not_found_default_secs: Option<u64>,
-    not_found_max_secs: Option<u64>,
-) -> MetadataTtlPolicy {
+fn metadata_ttl_policy(policy: &CachingPolicy) -> MetadataTtlPolicy {
     MetadataTtlPolicy::new(
-        metadata_default_secs.expect("metadata_ttl_default_secs defaulted"),
-        metadata_max_secs.expect("metadata_ttl_max_secs defaulted"),
-        not_found_default_secs.expect("not_found_ttl_default_secs defaulted"),
-        not_found_max_secs.expect("not_found_ttl_max_secs defaulted"),
+        policy
+            .metadata_ttl_default_secs
+            .expect("metadata_ttl_default_secs defaulted"),
+        policy
+            .metadata_ttl_max_secs
+            .expect("metadata_ttl_max_secs defaulted"),
+        policy
+            .not_found_ttl_default_secs
+            .expect("not_found_ttl_default_secs defaulted"),
+        policy
+            .not_found_ttl_max_secs
+            .expect("not_found_ttl_max_secs defaulted"),
     )
 }
 
@@ -389,14 +377,16 @@ mod tests {
     fn http_spec(id: &str, url: &str) -> BackendSpec {
         BackendSpec {
             name: id.to_string(),
-            config: Some(backend_spec::Config::Http(HttpBackendConfig {
-                url: url.to_string(),
-                stripe_size_bytes: Some(4 * 1024 * 1024),
-                http_concurrency: Some(64),
+            caching_policy: Some(CachingPolicy {
                 metadata_ttl_default_secs: Some(60),
                 metadata_ttl_max_secs: Some(60),
                 not_found_ttl_default_secs: Some(5),
                 not_found_ttl_max_secs: Some(5),
+            }),
+            config: Some(backend_spec::Config::Http(HttpBackendConfig {
+                url: url.to_string(),
+                stripe_size_bytes: Some(4 * 1024 * 1024),
+                http_concurrency: Some(64),
                 ca_cert_path: None,
                 insecure_skip_verify: false,
                 client_cert_path: None,
@@ -408,6 +398,7 @@ mod tests {
     fn fake_spec(id: &str, object_size: u64) -> BackendSpec {
         BackendSpec {
             name: id.to_string(),
+            caching_policy: None,
             config: Some(backend_spec::Config::Fake(FakeBackendConfig {
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 object_size_bytes: Some(object_size),

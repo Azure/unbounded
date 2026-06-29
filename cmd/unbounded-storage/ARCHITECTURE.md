@@ -570,7 +570,8 @@ fields.
 Sections (all optional, each falling back to defaults):
 
 - `version` - top-level opaque `u64` config version (0 = unversioned).
-- `[[backends]]` - `name` and one `config` table: `http`, `s3`, or `azure`
+- `[[backends]]` - `name`, an optional `caching_policy` table shared by all
+  backend implementations, and one `config` table: `http`, `s3`, or `azure`
   with a required `url`, or `fake` for synthetic objects. Backend stripe size
   must be a power of two.
 - `self`, `fingers_per_node` (100), optional `[routing_plan]` (`fingers`,

@@ -105,6 +105,7 @@ fn generate_config_schema() {
         "FileDiskConfig",
         "CacheSpec",
         "BackendSpec",
+        "CachingPolicy",
         "HttpBackendConfig",
         "S3BackendConfig",
         "AzureBackendConfig",

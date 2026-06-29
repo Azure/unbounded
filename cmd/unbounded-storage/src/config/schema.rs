@@ -90,31 +90,27 @@ impl Config {
 
 impl BackendSpec {
     fn apply_defaults(&mut self) {
+        if matches!(
+            self.config.as_ref(),
+            Some(backend_spec::Config::Http(_))
+                | Some(backend_spec::Config::S3(_))
+                | Some(backend_spec::Config::Azure(_))
+        ) {
+            self.caching_policy
+                .get_or_insert_with(CachingPolicy::default)
+                .apply_defaults();
+        }
+
         match self.config.as_mut() {
-            Some(backend_spec::Config::Http(cfg)) => apply_http_backend_defaults(
-                &mut cfg.stripe_size_bytes,
-                &mut cfg.http_concurrency,
-                &mut cfg.metadata_ttl_default_secs,
-                &mut cfg.metadata_ttl_max_secs,
-                &mut cfg.not_found_ttl_default_secs,
-                &mut cfg.not_found_ttl_max_secs,
-            ),
-            Some(backend_spec::Config::S3(cfg)) => apply_http_backend_defaults(
-                &mut cfg.stripe_size_bytes,
-                &mut cfg.http_concurrency,
-                &mut cfg.metadata_ttl_default_secs,
-                &mut cfg.metadata_ttl_max_secs,
-                &mut cfg.not_found_ttl_default_secs,
-                &mut cfg.not_found_ttl_max_secs,
-            ),
-            Some(backend_spec::Config::Azure(cfg)) => apply_http_backend_defaults(
-                &mut cfg.stripe_size_bytes,
-                &mut cfg.http_concurrency,
-                &mut cfg.metadata_ttl_default_secs,
-                &mut cfg.metadata_ttl_max_secs,
-                &mut cfg.not_found_ttl_default_secs,
-                &mut cfg.not_found_ttl_max_secs,
-            ),
+            Some(backend_spec::Config::Http(cfg)) => {
+                apply_http_backend_defaults(&mut cfg.stripe_size_bytes, &mut cfg.http_concurrency)
+            }
+            Some(backend_spec::Config::S3(cfg)) => {
+                apply_http_backend_defaults(&mut cfg.stripe_size_bytes, &mut cfg.http_concurrency)
+            }
+            Some(backend_spec::Config::Azure(cfg)) => {
+                apply_http_backend_defaults(&mut cfg.stripe_size_bytes, &mut cfg.http_concurrency)
+            }
             Some(backend_spec::Config::Fake(cfg)) => {
                 cfg.stripe_size_bytes
                     .get_or_insert(DEFAULT_STRIPE_SIZE_BYTES);
@@ -161,6 +157,25 @@ impl BackendSpec {
             Some(backend_spec::Config::Azure(cfg)) => cfg.http_concurrency,
             Some(backend_spec::Config::Fake(_)) | None => None,
         }
+    }
+
+    pub fn caching_policy(&self) -> &CachingPolicy {
+        self.caching_policy
+            .as_ref()
+            .expect("caching_policy defaulted")
+    }
+}
+
+impl CachingPolicy {
+    fn apply_defaults(&mut self) {
+        self.metadata_ttl_default_secs
+            .get_or_insert(DEFAULT_METADATA_TTL_SECS);
+        self.metadata_ttl_max_secs
+            .get_or_insert(DEFAULT_METADATA_TTL_SECS);
+        self.not_found_ttl_default_secs
+            .get_or_insert(DEFAULT_NOT_FOUND_TTL_SECS);
+        self.not_found_ttl_max_secs
+            .get_or_insert(DEFAULT_NOT_FOUND_TTL_SECS);
     }
 }
 
@@ -286,17 +301,9 @@ impl FrontendSpec {
 fn apply_http_backend_defaults(
     stripe_size_bytes: &mut Option<u64>,
     http_concurrency: &mut Option<u32>,
-    metadata_ttl_default_secs: &mut Option<u64>,
-    metadata_ttl_max_secs: &mut Option<u64>,
-    not_found_ttl_default_secs: &mut Option<u64>,
-    not_found_ttl_max_secs: &mut Option<u64>,
 ) {
     stripe_size_bytes.get_or_insert(DEFAULT_STRIPE_SIZE_BYTES);
     http_concurrency.get_or_insert(DEFAULT_HTTP_CONCURRENCY);
-    metadata_ttl_default_secs.get_or_insert(DEFAULT_METADATA_TTL_SECS);
-    metadata_ttl_max_secs.get_or_insert(DEFAULT_METADATA_TTL_SECS);
-    not_found_ttl_default_secs.get_or_insert(DEFAULT_NOT_FOUND_TTL_SECS);
-    not_found_ttl_max_secs.get_or_insert(DEFAULT_NOT_FOUND_TTL_SECS);
 }
 
 impl StartupCfg {
@@ -587,6 +594,8 @@ http_concurrency = 32
 ca_cert_path = "/etc/unbounded-storage/origin-ca.pem"
 client_cert_path = "/etc/unbounded-storage/client.pem"
 client_key_path = "/etc/unbounded-storage/client-key.pem"
+
+[backends.caching_policy]
 metadata_ttl_default_secs = 45
 metadata_ttl_max_secs = 90
 not_found_ttl_default_secs = 3
@@ -614,10 +623,6 @@ max_requests_per_connection = 256
                     cfg.ca_cert_path.as_deref(),
                     Some("/etc/unbounded-storage/origin-ca.pem")
                 );
-                assert_eq!(cfg.metadata_ttl_default_secs, Some(45));
-                assert_eq!(cfg.metadata_ttl_max_secs, Some(90));
-                assert_eq!(cfg.not_found_ttl_default_secs, Some(3));
-                assert_eq!(cfg.not_found_ttl_max_secs, Some(7));
                 assert!(!cfg.insecure_skip_verify);
                 assert_eq!(
                     cfg.client_cert_path.as_deref(),
@@ -630,6 +635,11 @@ max_requests_per_connection = 256
             }
             other => panic!("expected http backend config, got {other:?}"),
         }
+        let policy = b.caching_policy();
+        assert_eq!(policy.metadata_ttl_default_secs, Some(45));
+        assert_eq!(policy.metadata_ttl_max_secs, Some(90));
+        assert_eq!(policy.not_found_ttl_default_secs, Some(3));
+        assert_eq!(policy.not_found_ttl_max_secs, Some(7));
 
         assert_eq!(c.frontends.len(), 1);
         let f = &c.frontends[0];
@@ -674,16 +684,6 @@ url = "https://example.com"
             backend_spec::Config::Http(cfg) => {
                 assert_eq!(cfg.stripe_size_bytes, Some(4 * 1024 * 1024));
                 assert_eq!(cfg.http_concurrency, Some(64));
-                assert_eq!(
-                    cfg.metadata_ttl_default_secs,
-                    Some(DEFAULT_METADATA_TTL_SECS)
-                );
-                assert_eq!(cfg.metadata_ttl_max_secs, Some(DEFAULT_METADATA_TTL_SECS));
-                assert_eq!(
-                    cfg.not_found_ttl_default_secs,
-                    Some(DEFAULT_NOT_FOUND_TTL_SECS)
-                );
-                assert_eq!(cfg.not_found_ttl_max_secs, Some(DEFAULT_NOT_FOUND_TTL_SECS));
                 assert_eq!(cfg.ca_cert_path, None);
                 assert!(!cfg.insecure_skip_verify);
                 assert_eq!(cfg.client_cert_path, None);
@@ -691,6 +691,23 @@ url = "https://example.com"
             }
             other => panic!("expected http backend config, got {other:?}"),
         }
+        let policy = c.backends[0].caching_policy();
+        assert_eq!(
+            policy.metadata_ttl_default_secs,
+            Some(DEFAULT_METADATA_TTL_SECS)
+        );
+        assert_eq!(
+            policy.metadata_ttl_max_secs,
+            Some(DEFAULT_METADATA_TTL_SECS)
+        );
+        assert_eq!(
+            policy.not_found_ttl_default_secs,
+            Some(DEFAULT_NOT_FOUND_TTL_SECS)
+        );
+        assert_eq!(
+            policy.not_found_ttl_max_secs,
+            Some(DEFAULT_NOT_FOUND_TTL_SECS)
+        );
     }
 
     #[test]

@@ -104,6 +104,14 @@ name = "origin"
 url = "origin.example.com:80"    # host:port resolved for origin fetches.
 stripe_size_bytes = 4194304      # optional; must be a power of two.
 
+# Optional cache metadata TTL policy. Defaults: positive metadata 60s,
+# 404 metadata 5s; max values clamp origin Cache-Control max-age.
+# [backends.caching_policy]
+# metadata_ttl_default_secs = 60
+# metadata_ttl_max_secs = 60
+# not_found_ttl_default_secs = 5
+# not_found_ttl_max_secs = 5
+
 # Optional. Disjoint discovery: configure this node with ONLY its direct
 # routing neighbors instead of the full cluster. When present, the global
 # finger-table build is bypassed and these peer names are used verbatim. Every
