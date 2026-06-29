@@ -54,10 +54,10 @@ becomes `/etc/containerd/config.toml` inside the container).
 
 ### OCI Images
 
-The default rootfs images are based on Ubuntu 24.04 (Noble). The correct default
-image is selected automatically based on whether NVIDIA GPUs are detected on the
-host. Ubuntu 26.04 and Azure Linux 3.0 images are also available for explicit
-`OCIImage` configuration.
+The default rootfs image is selected automatically based on the host distro and
+whether NVIDIA GPUs are detected on the host. Supported automatic matches are
+Ubuntu 24.04, Ubuntu 26.04, and Azure Linux 3.0. RPM-based hosts fall back to
+Azure Linux 3.0. Other unknown host distros fall back to Ubuntu 24.04.
 
 | Image | Default repository | Description |
 |---|---|---|

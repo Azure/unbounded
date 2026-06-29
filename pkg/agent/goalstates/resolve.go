@@ -11,9 +11,17 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/Azure/unbounded/pkg/agent/config"
+)
+
+const (
+	hostDistroUbuntu2404  = "ubuntu2404"
+	hostDistroUbuntu2604  = "ubuntu2604"
+	hostDistroAzureLinux3 = "azlinux3"
+	hostOSReleasePath     = "/etc/os-release"
 )
 
 // MachineGoalState holds the fully resolved goal state for provisioning and
@@ -161,25 +169,155 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 //
 // Priority (highest to lowest):
 //  1. configImage from the agent config
-//  2. AGENT_OCI_IMAGE env var
-//  3. Built-in default selected by GPU presence
+//  2. AGENT_DISABLE_OCI_IMAGE env var (truthy value disables OCI, returns "")
+//  3. AGENT_OCI_IMAGE env var
+//  4. Built-in default selected by host distro and GPU presence
 func ResolveOCIImage(log *slog.Logger, configImage string, nvidiaGPUAvailable bool) string {
+	return resolveOCIImage(log, configImage, nvidiaGPUAvailable, detectHostDistro())
+}
+
+func resolveOCIImage(log *slog.Logger, configImage string, nvidiaGPUAvailable bool, hostDistro string) string {
 	if configImage != "" {
 		return configImage
+	}
+
+	if disabled, err := strconv.ParseBool(os.Getenv("AGENT_DISABLE_OCI_IMAGE")); err == nil && disabled {
+		log.Info("OCI image usage disabled via AGENT_DISABLE_OCI_IMAGE, falling back to debootstrap")
+		return ""
 	}
 
 	if v := strings.TrimSpace(os.Getenv("AGENT_OCI_IMAGE")); v != "" {
 		return v
 	}
 
-	var image string
-	if nvidiaGPUAvailable {
-		image = DefaultNvidiaOCImage
-	} else {
-		image = DefaultOCIImage
-	}
+	image := defaultOCIImageForHostDistro(hostDistro, nvidiaGPUAvailable)
 
-	log.Info("no OCI image configured, using default", "image", image)
+	log.Info("no OCI image configured, using default", "image", image, "hostDistro", hostDistro)
 
 	return image
+}
+
+func defaultOCIImageForHostDistro(hostDistro string, nvidiaGPUAvailable bool) string {
+	switch hostDistro {
+	case hostDistroUbuntu2604:
+		if nvidiaGPUAvailable {
+			return DefaultUbuntu2604NvidiaOCIImage
+		}
+
+		return DefaultUbuntu2604OCIImage
+	case hostDistroAzureLinux3:
+		if nvidiaGPUAvailable {
+			return DefaultAzureLinux3NvidiaOCIImage
+		}
+
+		return DefaultAzureLinux3OCIImage
+	default:
+		if nvidiaGPUAvailable {
+			return DefaultNvidiaOCImage
+		}
+
+		return DefaultOCIImage
+	}
+}
+
+func detectHostDistro() string {
+	hostDistro, err := hostDistroFromOSRelease(hostOSReleasePath)
+	if err != nil {
+		return ""
+	}
+
+	return hostDistro
+}
+
+func hostDistroFromOSRelease(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	return hostDistroFromOSReleaseData(data), nil
+}
+
+func hostDistroFromOSReleaseData(data []byte) string {
+	values := make(map[string]string)
+
+	for _, rawLine := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+
+		values[key] = normalizeOSReleaseValue(value)
+	}
+
+	return hostDistroFromOSReleaseValues(values)
+}
+
+func hostDistroFromOSReleaseValues(values map[string]string) string {
+	id := normalizeOSReleaseID(values["ID"])
+	versionID := values["VERSION_ID"]
+
+	switch id {
+	case "ubuntu":
+		switch {
+		case strings.HasPrefix(versionID, "24.04"):
+			return hostDistroUbuntu2404
+		case strings.HasPrefix(versionID, "26.04"):
+			return hostDistroUbuntu2604
+		}
+	case "azurelinux", "azlinux":
+		if strings.HasPrefix(versionID, "3") {
+			return hostDistroAzureLinux3
+		}
+	}
+
+	if isRPMBasedOSRelease(id, values["ID_LIKE"]) {
+		return hostDistroAzureLinux3
+	}
+
+	return ""
+}
+
+func isRPMBasedOSRelease(id, idLike string) bool {
+	if isRPMBasedOSReleaseID(id) {
+		return true
+	}
+
+	for _, token := range strings.Fields(idLike) {
+		if isRPMBasedOSReleaseID(normalizeOSReleaseID(token)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isRPMBasedOSReleaseID(id string) bool {
+	switch id {
+	case "almalinux", "amzn", "azurelinux", "centos", "fedora", "ol", "rhel", "rocky", "sles", "suse":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeOSReleaseID(value string) string {
+	var b strings.Builder
+
+	for _, r := range strings.ToLower(value) {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+
+	return b.String()
+}
+
+func normalizeOSReleaseValue(value string) string {
+	return strings.Trim(strings.TrimSpace(value), `"'`)
 }

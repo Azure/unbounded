@@ -21,64 +21,235 @@ func discardLogger() *slog.Logger {
 }
 
 func TestResolveOCIImage_ConfigImageTakesPrecedence(t *testing.T) {
+	// Even when env vars and GPU are present, configImage wins.
 	t.Setenv("AGENT_OCI_IMAGE", "env-image:latest")
+	t.Setenv("AGENT_DISABLE_OCI_IMAGE", "true")
 
-	got := ResolveOCIImage(discardLogger(), "config-image:v1", true)
+	got := resolveOCIImage(discardLogger(), "config-image:v1", true, hostDistroUbuntu2404)
 	assert.Equal(t, "config-image:v1", got)
 }
 
+func TestResolveOCIImage_DisableEnvVar(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"true", "true", ""},
+		{"1", "1", ""},
+		{"TRUE", "TRUE", ""},
+		// Falsy or unrecognised values should NOT disable; expect the default image.
+		{"false", "false", DefaultOCIImage},
+		{"0", "0", DefaultOCIImage},
+		{"empty", "", DefaultOCIImage},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AGENT_DISABLE_OCI_IMAGE", tt.value)
+			t.Setenv("AGENT_OCI_IMAGE", "")
+
+			got := resolveOCIImage(discardLogger(), "", false, hostDistroUbuntu2404)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestResolveOCIImage_DisableDoesNotOverrideConfig(t *testing.T) {
+	t.Setenv("AGENT_DISABLE_OCI_IMAGE", "true")
+
+	got := resolveOCIImage(discardLogger(), "config-image:v2", false, hostDistroUbuntu2404)
+	assert.Equal(t, "config-image:v2", got)
+}
+
 func TestResolveOCIImage_EnvVarFallback(t *testing.T) {
+	t.Setenv("AGENT_DISABLE_OCI_IMAGE", "")
 	t.Setenv("AGENT_OCI_IMAGE", "env-image:v3")
 
-	got := ResolveOCIImage(discardLogger(), "", false)
+	got := resolveOCIImage(discardLogger(), "", false, hostDistroUbuntu2404)
 	assert.Equal(t, "env-image:v3", got)
 }
 
 func TestResolveOCIImage_EnvVarTrimmed(t *testing.T) {
+	t.Setenv("AGENT_DISABLE_OCI_IMAGE", "")
 	t.Setenv("AGENT_OCI_IMAGE", "  env-image:v4  ")
 
-	got := ResolveOCIImage(discardLogger(), "", false)
+	got := resolveOCIImage(discardLogger(), "", false, hostDistroUbuntu2404)
 	assert.Equal(t, "env-image:v4", got)
 }
 
 func TestResolveOCIImage_EnvVarWhitespaceOnly(t *testing.T) {
+	t.Setenv("AGENT_DISABLE_OCI_IMAGE", "")
 	t.Setenv("AGENT_OCI_IMAGE", "   ")
 
-	got := ResolveOCIImage(discardLogger(), "", false)
+	got := resolveOCIImage(discardLogger(), "", false, hostDistroUbuntu2404)
 	assert.Equal(t, DefaultOCIImage, got)
 }
 
 func TestResolveOCIImage_DefaultNoGPU(t *testing.T) {
+	t.Setenv("AGENT_DISABLE_OCI_IMAGE", "")
 	t.Setenv("AGENT_OCI_IMAGE", "")
 
-	got := ResolveOCIImage(discardLogger(), "", false)
+	got := resolveOCIImage(discardLogger(), "", false, hostDistroUbuntu2404)
 	assert.Equal(t, DefaultOCIImage, got)
 }
 
 func TestResolveOCIImage_DefaultWithGPU(t *testing.T) {
+	t.Setenv("AGENT_DISABLE_OCI_IMAGE", "")
 	t.Setenv("AGENT_OCI_IMAGE", "")
 
-	got := ResolveOCIImage(discardLogger(), "", true)
+	got := resolveOCIImage(discardLogger(), "", true, hostDistroUbuntu2404)
 	assert.Equal(t, DefaultNvidiaOCImage, got)
 }
 
 func TestResolveOCIImage_Priority(t *testing.T) {
-	// Verify the full priority chain: config > env var > default.
+	// Verify the full priority chain: config > disable > env var > default.
 	log := discardLogger()
 
 	// 1. Config set - everything else ignored.
 	t.Setenv("AGENT_OCI_IMAGE", "env")
+	t.Setenv("AGENT_DISABLE_OCI_IMAGE", "1")
 
-	assert.Equal(t, "config", ResolveOCIImage(log, "config", true))
+	assert.Equal(t, "config", resolveOCIImage(log, "config", true, hostDistroUbuntu2404))
 
-	// 2. No config, env var set.
-	assert.Equal(t, "env", ResolveOCIImage(log, "", true))
+	// 2. No config, disable set - returns empty despite env var being set.
+	assert.Equal(t, "", resolveOCIImage(log, "", true, hostDistroUbuntu2404))
 
-	// 3. No config, no env var - GPU default.
+	// 3. No config, disable off, env var set.
+	t.Setenv("AGENT_DISABLE_OCI_IMAGE", "0")
+
+	assert.Equal(t, "env", resolveOCIImage(log, "", true, hostDistroUbuntu2404))
+
+	// 4. No config, disable off, no env var - GPU default.
 	t.Setenv("AGENT_OCI_IMAGE", "")
 
-	assert.Equal(t, DefaultNvidiaOCImage, ResolveOCIImage(log, "", true))
-	assert.Equal(t, DefaultOCIImage, ResolveOCIImage(log, "", false))
+	assert.Equal(t, DefaultNvidiaOCImage, resolveOCIImage(log, "", true, hostDistroUbuntu2404))
+	assert.Equal(t, DefaultOCIImage, resolveOCIImage(log, "", false, hostDistroUbuntu2404))
+}
+
+func TestResolveOCIImage_DefaultForHostDistro(t *testing.T) {
+	tests := []struct {
+		name      string
+		distro    string
+		nvidiaGPU bool
+		want      string
+	}{
+		{
+			name:   "ubuntu 2404",
+			distro: hostDistroUbuntu2404,
+			want:   DefaultOCIImage,
+		},
+		{
+			name:      "ubuntu 2404 nvidia",
+			distro:    hostDistroUbuntu2404,
+			nvidiaGPU: true,
+			want:      DefaultNvidiaOCImage,
+		},
+		{
+			name:   "ubuntu 2604",
+			distro: hostDistroUbuntu2604,
+			want:   DefaultUbuntu2604OCIImage,
+		},
+		{
+			name:      "ubuntu 2604 nvidia",
+			distro:    hostDistroUbuntu2604,
+			nvidiaGPU: true,
+			want:      DefaultUbuntu2604NvidiaOCIImage,
+		},
+		{
+			name:   "azure linux 3",
+			distro: hostDistroAzureLinux3,
+			want:   DefaultAzureLinux3OCIImage,
+		},
+		{
+			name:      "azure linux 3 nvidia",
+			distro:    hostDistroAzureLinux3,
+			nvidiaGPU: true,
+			want:      DefaultAzureLinux3NvidiaOCIImage,
+		},
+		{
+			name:   "unknown falls back to ubuntu 2404",
+			distro: "",
+			want:   DefaultOCIImage,
+		},
+		{
+			name:      "unknown with nvidia falls back to ubuntu 2404 nvidia",
+			distro:    "",
+			nvidiaGPU: true,
+			want:      DefaultNvidiaOCImage,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AGENT_DISABLE_OCI_IMAGE", "")
+			t.Setenv("AGENT_OCI_IMAGE", "")
+
+			got := resolveOCIImage(discardLogger(), "", tt.nvidiaGPU, tt.distro)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestHostDistroFromOSReleaseData(t *testing.T) {
+	tests := []struct {
+		name      string
+		osRelease string
+		want      string
+	}{
+		{
+			name: "ubuntu 2404",
+			osRelease: `ID=ubuntu
+VERSION_ID="24.04"`,
+			want: hostDistroUbuntu2404,
+		},
+		{
+			name: "ubuntu 2604",
+			osRelease: `ID=ubuntu
+VERSION_ID="26.04"`,
+			want: hostDistroUbuntu2604,
+		},
+		{
+			name: "azure linux 3",
+			osRelease: `ID="azurelinux"
+VERSION_ID="3.0"`,
+			want: hostDistroAzureLinux3,
+		},
+		{
+			name: "fedora falls back to azure linux 3",
+			osRelease: `ID=fedora
+VERSION_ID="44"
+ID_LIKE="rhel fedora"`,
+			want: hostDistroAzureLinux3,
+		},
+		{
+			name: "rhel-like falls back to azure linux 3",
+			osRelease: `ID="my-enterprise-linux"
+VERSION_ID="9"
+ID_LIKE="rhel fedora"`,
+			want: hostDistroAzureLinux3,
+		},
+		{
+			name: "unknown distro",
+			osRelease: `ID=debian
+VERSION_ID="13"`,
+		},
+		{
+			name: "malformed lines ignored",
+			osRelease: `# comment
+ID = ubuntu
+ID=ubuntu
+VERSION_ID=24.04`,
+			want: hostDistroUbuntu2404,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hostDistroFromOSReleaseData([]byte(tt.osRelease))
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 // TestResolveKubelet_EmptyAuthAllowed verifies that resolveKubelet does
