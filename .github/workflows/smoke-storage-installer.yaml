@@ -1,0 +1,70 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: unbounded-storage installer smoke test
+
+on:
+  pull_request:
+    paths:
+      - api/unbounded-storage/**
+      - cmd/kubectl-unbounded/**
+      - cmd/unbounded-storage-supervisor/**
+      - deploy/unbounded-storage-supervisor/**
+      - images/unbounded-storage-supervisor/**
+      - internal/kube/**
+      - internal/storagesupervisor/**
+      - hack/cmd/render-manifests/**
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/smoke-storage-installer.yaml
+  push:
+    branches: [main]
+    paths:
+      - api/unbounded-storage/**
+      - cmd/kubectl-unbounded/**
+      - cmd/unbounded-storage-supervisor/**
+      - deploy/unbounded-storage-supervisor/**
+      - images/unbounded-storage-supervisor/**
+      - internal/kube/**
+      - internal/storagesupervisor/**
+      - hack/cmd/render-manifests/**
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/smoke-storage-installer.yaml
+  workflow_dispatch:
+
+concurrency:
+  group: smoke-storage-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          driver-opts: network=host
+
+      - name: Set up kind
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          cluster_name: storage-installer-e2e
+
+      - name: Run smoke test
+        run: make unbounded-storage-supervisor-kind-smoke
