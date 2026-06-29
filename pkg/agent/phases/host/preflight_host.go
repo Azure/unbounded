@@ -77,6 +77,7 @@ func Preflight(log *slog.Logger, _ *provision.UnboundedAgentConfig, _ *goalstate
 		CheckSwapActive(log),
 		CheckDiskSpace(log),
 		CheckCgroups(log),
+		CheckNvidiaDriver(log),
 	}
 }
 
