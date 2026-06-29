@@ -177,7 +177,7 @@ origin:
     # or any non-default endpoint; leave blank for real Azure.
     # Type:    string (URL).
     # Default: ""
-    # Example: "http://azurite.unbounded-kube.svc.cluster.local:10000/devstoreaccount1/"
+    # Example: "http://azurite.unbounded-system.svc.cluster.local:10000/devstoreaccount1/"
     #          for the in-cluster Azurite from the dev harness.
     endpoint: ""
 
@@ -186,7 +186,7 @@ origin:
     # S3 endpoint override. Empty targets real AWS S3 (auto-region).
     # Type:    string (URL).
     # Default: "".
-    endpoint: "http://garage.unbounded-kube.svc.cluster.local:3900"
+    endpoint: "http://garage.unbounded-system.svc.cluster.local:3900"
 
     # S3 region.
     # Type:    string.
@@ -228,7 +228,7 @@ cachestore:
     # Required: yes.
     # Example:  the in-DC S3-compatible store URL (VAST etc.) in
     #           production; the in-cluster Garage URL below.
-    endpoint: "http://garage.unbounded-kube.svc.cluster.local:3900"
+    endpoint: "http://garage.unbounded-system.svc.cluster.local:3900"
 
     # Cachestore bucket. Required.
     # NOTE: at boot the s3 driver calls GetBucketVersioning and
@@ -265,7 +265,7 @@ cluster:
   # IPs. Polled every membership_refresh.
   # Type:     string (DNS name).
   # Required: yes.
-  service: "orca-peers.unbounded-kube.svc.cluster.local"
+  service: "orca-peers.unbounded-system.svc.cluster.local"
 
   # DNS poll interval for peer discovery.
   # Type:    duration.
@@ -299,7 +299,7 @@ cluster:
     # SNI / cert validation host name.
     # Type:    string.
     # Default: "orca.<ns>.svc".
-    server_name: "orca.unbounded-kube.svc"
+    server_name: "orca.unbounded-system.svc"
 
   # Number of replicas in the Deployment. Used to size the per-replica
   # origin concurrency cap as floor(origin.target_global / target_replicas).

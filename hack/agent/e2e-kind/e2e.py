@@ -125,6 +125,10 @@ NET_CONTROLLER_E2E_IMAGE = os.environ.get(
 )
 
 TEST_NS = "e2e-workload-test"
+# Unified install namespace for unbounded components (machina, net, ...).
+# Matches the Makefile UNBOUNDED_NAMESPACE default that the rendered
+# manifests deploy into.
+UNBOUNDED_NS = "unbounded-system"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
 DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
 DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
@@ -2420,9 +2424,9 @@ def deploy_unbounded_net_controller() -> None:
         apply_manifest(manifest_path)
 
     try:
-        wait_for_rollout("unbounded-net", "deployment/unbounded-net-controller")
+        wait_for_rollout(UNBOUNDED_NS, "deployment/unbounded-net-controller")
     except subprocess.CalledProcessError:
-        print_controller_logs("unbounded-net", "app.kubernetes.io/name=unbounded-net-controller")
+        print_controller_logs(UNBOUNDED_NS, "app.kubernetes.io/name=unbounded-net-controller")
         die("unbounded-net controller rollout failed")
 
     log("unbounded-net controller deployed")
@@ -2460,9 +2464,9 @@ def start_machina_controller() -> None:
         apply_manifest(manifest_path)
 
     try:
-        wait_for_rollout("unbounded-kube", "deployment/machina-controller")
+        wait_for_rollout(UNBOUNDED_NS, "deployment/machina-controller")
     except subprocess.CalledProcessError:
-        print_controller_logs("unbounded-kube", "app=machina-controller")
+        print_controller_logs(UNBOUNDED_NS, "app=machina-controller")
         die("machina controller rollout failed")
 
     log("Machina controller deployed")
@@ -2476,10 +2480,10 @@ def validate_controllers_healthy() -> None:
 
     _validate_controller_health(
         "unbounded-net",
-        "unbounded-net",
+        UNBOUNDED_NS,
         "app.kubernetes.io/name=unbounded-net-controller",
     )
-    _validate_controller_health("machina", "unbounded-kube", "app=machina-controller")
+    _validate_controller_health("machina", UNBOUNDED_NS, "app=machina-controller")
 
     log("Controllers are healthy")
 
@@ -2531,7 +2535,7 @@ def validate_machina_controller() -> None:
             time.sleep(5)
             elapsed += 5
 
-        print_controller_logs("unbounded-kube", "app=machina-controller")
+        print_controller_logs(UNBOUNDED_NS, "app=machina-controller")
         die(f"MachineConfigurationVersion '{mcv_name}' was not ready after {timeout_secs}s")
 
     log(f"Validating machina controller with MachineConfiguration '{name}'...")
@@ -2916,7 +2920,7 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
         time.sleep(5)
         elapsed += 5
     else:
-        print_controller_logs("unbounded-kube", "app=machina-controller")
+        print_controller_logs(UNBOUNDED_NS, "app=machina-controller")
         die(f"No MachineConfigurationVersion reached Kubernetes {target_kubelet_version} after {timeout_secs}s")
 
     if target_version_number == 0 or not target_mcv:
@@ -3045,10 +3049,10 @@ def collect_logs() -> None:
     _write_command_log(logs_dir / "nodes-describe.txt", [KUBECTL, "describe", "nodes"])
     _write_command_log(logs_dir / "pods.txt", [KUBECTL, "get", "pods", "-A", "-o", "wide"])
     _write_command_log(logs_dir / "events.txt", [KUBECTL, "get", "events", "-A", "--sort-by=.lastTimestamp"])
-    _write_command_log(logs_dir / "machina-controller.log", [KUBECTL, "logs", "-n", "unbounded-kube", "--all-containers", "--prefix", "-l", "app=machina-controller"])
-    _write_command_log(logs_dir / "machina-controller-previous.log", [KUBECTL, "logs", "-n", "unbounded-kube", "--all-containers", "--prefix", "--previous", "-l", "app=machina-controller"])
-    _write_command_log(logs_dir / "unbounded-net-controller.log", [KUBECTL, "logs", "-n", "unbounded-net", "--all-containers", "--prefix", "-l", "app.kubernetes.io/name=unbounded-net-controller"])
-    _write_command_log(logs_dir / "unbounded-net-controller-previous.log", [KUBECTL, "logs", "-n", "unbounded-net", "--all-containers", "--prefix", "--previous", "-l", "app.kubernetes.io/name=unbounded-net-controller"])
+    _write_command_log(logs_dir / "machina-controller.log", [KUBECTL, "logs", "-n", UNBOUNDED_NS, "--all-containers", "--prefix", "-l", "app=machina-controller"])
+    _write_command_log(logs_dir / "machina-controller-previous.log", [KUBECTL, "logs", "-n", UNBOUNDED_NS, "--all-containers", "--prefix", "--previous", "-l", "app=machina-controller"])
+    _write_command_log(logs_dir / "unbounded-net-controller.log", [KUBECTL, "logs", "-n", UNBOUNDED_NS, "--all-containers", "--prefix", "-l", "app.kubernetes.io/name=unbounded-net-controller"])
+    _write_command_log(logs_dir / "unbounded-net-controller-previous.log", [KUBECTL, "logs", "-n", UNBOUNDED_NS, "--all-containers", "--prefix", "--previous", "-l", "app.kubernetes.io/name=unbounded-net-controller"])
     _write_command_log(logs_dir / "kindnet.log", [KUBECTL, "logs", "-n", "kube-system", "--all-containers", "--prefix", "-l", "app=kindnet"])
     _write_command_log(logs_dir / "kindnet-previous.log", [KUBECTL, "logs", "-n", "kube-system", "--all-containers", "--prefix", "--previous", "-l", "app=kindnet"])
     _write_command_log(logs_dir / "machines.txt", [KUBECTL, "get", "machines", "-o", "wide"])

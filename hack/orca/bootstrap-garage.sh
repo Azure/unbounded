@@ -23,7 +23,7 @@
 # Usage: bootstrap-garage.sh [flags]
 #
 #   --context CTX        kubectl context to target (default: current)
-#   --namespace NS       namespace Garage is deployed in (default: unbounded-kube)
+#   --namespace NS       namespace Garage is deployed in (default: unbounded-system)
 #   --secret-name NAME   Secret holding the cachestore S3 keys (default: orca-credentials)
 #   --bucket NAME        cachestore bucket to create (default: orca-cache)
 #   --key-name NAME      Garage key name to import under (default: orca)
@@ -34,7 +34,7 @@
 set -euo pipefail
 
 CONTEXT=""
-NAMESPACE="unbounded-kube"
+NAMESPACE="unbounded-system"
 SECRET_NAME="orca-credentials"
 BUCKET="orca-cache"
 KEY_NAME="orca"
