@@ -66,7 +66,7 @@ use super::dispatch::{EpPtr, ReplyCtx, RequestSink};
 use super::error::{FabricError, Result as FabResult};
 use super::fabric::{Fabric, FabricInner};
 use super::ffi;
-use super::handler::{Handler, HandlerStream};
+use super::handler::{FabricPage, Handler, HandlerStream, PageRelease, PageSource};
 use super::rpc_queue::{Job, JobQueue};
 use super::wire::{MsgHeader, MsgKind};
 
@@ -217,9 +217,8 @@ fn classify_handler_error(error: &(dyn std::error::Error + 'static)) -> ErrorAck
 /// Per-server shared state held by the responder and each worker.
 struct ServerShared {
     fabric: Arc<FabricInner>,
-    /// MR covering the server's local backing. Used as the source MR
-    /// for `fi_write`s; if unset every request is failed with an
-    /// `ERROR_ACK`.
+    /// Default MR covering the server's local scratch backing. Handler
+    /// pages can override this with their own registered MR.
     local_mr: Option<MrHandle>,
     /// Page size used to compute source and destination offsets for
     /// streamed page writes. Supplied by the embedder via
@@ -432,27 +431,7 @@ fn run_worker<R, H>(
     // `hops_remaining` below and rejects only when it would actually
     // have to forward with no budget left (surfaced as a handler error
     // that becomes an `ERROR_ACK`).
-    let local_mr = match shared.local_mr {
-        Some(m) => m,
-        None => {
-            let _ = send_error_ack(
-                &shared,
-                ep,
-                header.request_id,
-                ErrorAck::generic("local backing not registered"),
-            );
-
-            if let Some(mut l) = log.take() {
-                l.finish_err("local backing not registered");
-            }
-
-            crate::metrics::fabric_rpc_served(crate::metrics::Outcome::Err);
-            crate::metrics::fabric_rpc_duration(started.elapsed().as_secs_f64());
-            return;
-        }
-    };
-
-    let outcome = serve_stream(&shared, &local_mr, ep, &header, &handler, &req);
+    let outcome = serve_stream(&shared, ep, &header, &handler, &req);
 
     if let Some(mut l) = log.take() {
         l.field("written", outcome.written);
@@ -493,17 +472,18 @@ struct ServeOutcome {
 /// Carries everything needed to re-post the write if its completion
 /// comes back with a transient `ENOTCONN` while the path back to the
 /// requester is still being established. The source bytes live in the
-/// server's long-lived registered backing (`local_mr`), so no page
-/// ownership needs to be held here; correctness instead relies on
-/// `serve_stream` draining every outstanding write before the handler
-/// stream is dropped.
+/// server's long-lived registered backing. Pages that belong to a
+/// caller-managed backing can attach a drop-owned release token; the
+/// token is held here until the write completes or is drained.
 struct Inflight {
     fut: CompletionFuture,
+    desc: *mut std::ffi::c_void,
     src_ptr: *const std::ffi::c_void,
     len: usize,
     dest_addr: u64,
     dest_key: u64,
     data: u64,
+    _release: Option<PageRelease>,
 }
 
 /// Drive one handler stream to completion, signalling each landed page
@@ -514,7 +494,6 @@ struct Inflight {
 /// falls back to an `fi_write` plus a framed `PageAck` send per page.
 fn serve_stream<R, H>(
     shared: &Arc<ServerShared>,
-    local_mr: &MrHandle,
     ep: EpPtr,
     header: &RequestHeader,
     handler: &Arc<H>,
@@ -525,9 +504,9 @@ where
     H: Handler<R>,
 {
     if shared.fabric.cfg.provider.supports_write_with_imm() {
-        serve_stream_writedata(shared, local_mr, ep, header, handler, req)
+        serve_stream_writedata(shared, ep, header, handler, req)
     } else {
-        serve_stream_framed(shared, local_mr, ep, header, handler, req)
+        serve_stream_framed(shared, ep, header, handler, req)
     }
 }
 
@@ -542,7 +521,6 @@ where
 /// response, `ERROR_ACK` on failure) before returning.
 fn serve_stream_writedata<R, H>(
     shared: &Arc<ServerShared>,
-    local_mr: &MrHandle,
     ep: EpPtr,
     header: &RequestHeader,
     handler: &Arc<H>,
@@ -567,10 +545,6 @@ where
     let mut task_cx = std::task::Context::from_waker(&waker);
 
     let depth = shared.fabric.cfg.write_pipeline_depth.max(1);
-    // SAFETY: local_mr.mr is owned by the live fabric for the duration of
-    // this request (the server handle joins workers before releasing the
-    // MR), so the descriptor stays valid across every posted write.
-    let desc = unsafe { ffi::ub_fi_mr_desc(local_mr.mr) };
     // Connection-establishment retry budget shared across the request:
     // the reverse-direction writes can transiently fail with -FI_EAGAIN
     // on submit or complete with prov_errno=ENOTCONN while the path back
@@ -601,7 +575,7 @@ where
         while !stream_done && inflight.len() < depth {
             match stream.as_mut().poll_next(&mut task_cx) {
                 std::task::Poll::Ready(Some(Ok(page))) => {
-                    match post_page(shared, local_mr, desc, ep, header, next_idx, page, deadline) {
+                    match post_page(shared, ep, header, next_idx, page, deadline) {
                         Ok(inf) => {
                             inflight.push_back(inf);
                             next_idx = next_idx.saturating_add(1);
@@ -671,7 +645,7 @@ where
 
         // Pipeline is full or the stream is drained: wait for the oldest
         // outstanding write to complete, then loop to refill.
-        if let Err(e) = await_oldest(shared, &mut inflight, desc, ep, deadline) {
+        if let Err(e) = await_oldest(shared, &mut inflight, ep, deadline) {
             drain_inflight(shared, &mut inflight);
             let msg = format!("write_page: {e}");
             if !shared.shutdown.load(Ordering::Acquire) {
@@ -697,19 +671,18 @@ where
 #[allow(clippy::too_many_arguments)]
 fn post_page(
     shared: &Arc<ServerShared>,
-    local_mr: &MrHandle,
-    desc: *mut std::ffi::c_void,
     ep: EpPtr,
     header: &RequestHeader,
     dest_idx: u32,
-    page: crate::bufferpool::PageRef,
+    page: FabricPage,
     deadline: std::time::Instant,
 ) -> FabResult<Inflight> {
+    let ResolvedPageSource { mr, desc, release } = resolve_page_source(shared, page.source)?;
     let plan = plan_page_write(
-        local_mr,
+        &mr,
         &RequestPlan::from(header),
         dest_idx,
-        page,
+        page.page,
         shared.page_size,
     )?;
     if plan.ack_page_idx > u16::MAX as u32 {
@@ -732,11 +705,13 @@ fn post_page(
     )?;
     Ok(Inflight {
         fut,
+        desc,
         src_ptr,
         len: plan.len,
         dest_addr: plan.dest_addr,
         dest_key: header.dest_mr_key,
         data,
+        _release: release,
     })
 }
 
@@ -795,7 +770,6 @@ fn post_writedata(
 fn await_oldest(
     shared: &Arc<ServerShared>,
     inflight: &mut VecDeque<Inflight>,
-    desc: *mut std::ffi::c_void,
     ep: EpPtr,
     deadline: std::time::Instant,
 ) -> FabResult<()> {
@@ -812,7 +786,7 @@ fn await_oldest(
             std::thread::sleep(Duration::from_millis(1));
             let fut = post_writedata(
                 shared,
-                desc,
+                inf.desc,
                 ep,
                 inf.src_ptr,
                 inf.len,
@@ -850,7 +824,6 @@ fn drain_inflight(shared: &Arc<ServerShared>, inflight: &mut VecDeque<Inflight>)
 /// throughput target. Terminator semantics match the writedata path.
 fn serve_stream_framed<R, H>(
     shared: &Arc<ServerShared>,
-    local_mr: &MrHandle,
     ep: EpPtr,
     header: &RequestHeader,
     handler: &Arc<H>,
@@ -887,7 +860,7 @@ where
 
         match stream.as_mut().poll_next(&mut task_cx) {
             std::task::Poll::Ready(Some(Ok(page))) => {
-                if let Err(e) = write_page(shared, local_mr, ep, header, next_idx, page) {
+                if let Err(e) = write_page(shared, ep, header, next_idx, page) {
                     let msg = format!("write_page: {e}");
                     if !shared.shutdown.load(Ordering::Acquire) {
                         let _ = send_error_ack(
@@ -940,23 +913,24 @@ where
 /// establishing) with a short backoff until a 10s deadline.
 fn write_page(
     shared: &Arc<ServerShared>,
-    local_mr: &MrHandle,
     ep: EpPtr,
     header: &RequestHeader,
     dest_idx: u32,
-    page: crate::bufferpool::PageRef,
+    page: FabricPage,
 ) -> FabResult<()> {
+    let ResolvedPageSource {
+        mr,
+        desc,
+        release: _release,
+    } = resolve_page_source(shared, page.source)?;
     let plan = plan_page_write(
-        local_mr,
+        &mr,
         &RequestPlan::from(header),
         dest_idx,
-        page,
+        page.page,
         shared.page_size,
     )?;
     let src_ptr = plan.src_addr as *const std::ffi::c_void;
-    // SAFETY: local_mr.mr is owned by the live fabric for the duration of
-    // this request, so the descriptor stays valid across the write.
-    let desc = unsafe { ffi::ub_fi_mr_desc(local_mr.mr) };
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
 
     loop {
@@ -1000,6 +974,33 @@ fn write_page(
     }
 
     send_page_ack(shared, ep, header.request_id, plan.ack_page_idx)
+}
+
+struct ResolvedPageSource {
+    mr: MrHandle,
+    desc: *mut std::ffi::c_void,
+    release: Option<PageRelease>,
+}
+
+fn resolve_page_source(
+    shared: &Arc<ServerShared>,
+    source: PageSource,
+) -> FabResult<ResolvedPageSource> {
+    let (mr, release) = match source {
+        PageSource::Default => (
+            shared
+                .local_mr
+                .ok_or(FabricError::BadConfig("local backing not registered"))?,
+            None,
+        ),
+        PageSource::Registered { mr, release } => (mr, release),
+    };
+    // SAFETY: source MRs are owned by the live fabric domain and remain
+    // registered for the lifetime of this server request. Any page-level
+    // pin lifetime is carried by `release`.
+    let desc = unsafe { ffi::ub_fi_mr_desc(mr.mr) };
+
+    Ok(ResolvedPageSource { mr, desc, release })
 }
 
 /// Frame and send a `MsgKind::PageAck` naming the landed destination
@@ -1456,7 +1457,7 @@ mod tests {
     /// do: serve a page, reject with an error ack, or end the response.
     #[derive(Debug)]
     enum FirstOutcome {
-        Served(crate::bufferpool::PageRef),
+        Served(crate::fabric::FabricPage),
         Rejected(String),
         Ended,
     }
@@ -1522,7 +1523,7 @@ mod tests {
     }
 
     struct RoutingStream {
-        outcome: Option<Result<crate::bufferpool::PageRef, HopLimit>>,
+        outcome: Option<Result<FabricPage, HopLimit>>,
     }
 
     impl HandlerStream for RoutingStream {
@@ -1530,7 +1531,7 @@ mod tests {
         fn poll_next(
             mut self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Option<Result<crate::bufferpool::PageRef, HopLimit>>> {
+        ) -> std::task::Poll<Option<Result<FabricPage, HopLimit>>> {
             std::task::Poll::Ready(self.outcome.take())
         }
     }
@@ -1556,13 +1557,13 @@ mod tests {
             let outcome = if self.owns {
                 // Owner: serve from the local store regardless of the
                 // remaining hop budget.
-                Some(Ok(page))
+                Some(Ok(page.into()))
             } else if hops_remaining == 0 {
                 // Forward with no budget: the genuine hop-limit case.
                 Some(Err(HopLimit))
             } else {
                 // Forward with budget: relays a downstream page.
-                Some(Ok(page))
+                Some(Ok(page.into()))
             };
             RoutingStream { outcome }
         }
