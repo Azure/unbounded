@@ -1220,12 +1220,12 @@ fn recursive_chain(
     let b_fingers = Arc::new(FingerTable::build(
         ring_peer(2, 100),
         std::slice::from_ref(&ring_peer(3, 200)),
-        FingerTableConfig { k: 8 },
+        FingerTableConfig::with_k(8),
     ));
     let c_fingers = Arc::new(FingerTable::build(
         ring_peer(3, 200),
         std::slice::from_ref(&ring_peer(2, 100)),
-        FingerTableConfig { k: 8 },
+        FingerTableConfig::with_k(8),
     ));
     let b_n2p: Arc<HashMap<NodeId, PeerId>> =
         Arc::new([(NodeId(3), PeerId(3))].into_iter().collect());

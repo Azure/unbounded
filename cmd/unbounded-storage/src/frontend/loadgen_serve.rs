@@ -557,7 +557,7 @@ mod tests {
         let fingers = std::sync::Arc::new(FingerTable::build(
             local,
             &[peer],
-            FingerTableConfig { k: 4 },
+            FingerTableConfig::with_k(4),
         ));
         let node_to_peer = std::sync::Arc::new(std::collections::HashMap::from([(
             NodeId(2),

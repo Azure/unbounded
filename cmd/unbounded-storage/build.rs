@@ -95,6 +95,8 @@ fn generate_config_schema() {
     for msg in [
         "Config",
         "RoutingPlan",
+        "TopologyWeighting",
+        "TopologyPrefixWeight",
         "PeerSpec",
         "TcpPeerConfig",
         "RdmaPeerConfig",
