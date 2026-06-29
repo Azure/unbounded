@@ -9,6 +9,12 @@ GOLINT=golangci-lint run -c .golangci.yaml
 CONTAINER_ENGINE ?= podman
 CONTAINER_REGISTRY ?= ghcr.io/azure
 
+# Unified install namespace for all unbounded components. Each component's
+# *_NAMESPACE var derives from this by default, so overriding UNBOUNDED_NAMESPACE
+# moves everything at once, while a component var can still be overridden
+# individually when needed.
+UNBOUNDED_NAMESPACE ?= unbounded-system
+
 FORGE_BIN=bin/forge
 FORGE_CMD=./hack/cmd/forge
 
@@ -70,14 +76,14 @@ UNROUTE_CMD=./cmd/unroute
 GANTRY_BIN=bin/gantry
 GANTRY_CMD=./cmd/gantry
 GANTRY_IMAGE ?= $(CONTAINER_REGISTRY)/gantry:$(VERSION)
-GANTRY_NAMESPACE ?= gantry
+GANTRY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 
 # unbounded-storage-supervisor (Go binary; distinct from the Rust crate below)
 UNBOUNDED_STORAGE_SUPERVISOR_BIN=bin/unbounded-storage-supervisor
 UNBOUNDED_STORAGE_SUPERVISOR_CMD=./cmd/unbounded-storage-supervisor
 UNBOUNDED_STORAGE_SUPERVISOR_TAG ?= latest
 UNBOUNDED_STORAGE_SUPERVISOR_IMAGE=$(CONTAINER_REGISTRY)/unbounded-storage-supervisor:$(UNBOUNDED_STORAGE_SUPERVISOR_TAG)
-UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE ?= unbounded-kube
+UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-storage-supervisor
 UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-storage-supervisor/rendered
 
@@ -150,7 +156,7 @@ METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(VERSION)
 ORCA_BIN=bin/orca
 ORCA_CMD=./cmd/orca
 ORCA_IMAGE ?= $(CONTAINER_REGISTRY)/orca:$(VERSION)
-ORCA_NAMESPACE ?= unbounded-kube
+ORCA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 ORCA_MANIFEST_TEMPLATES_DIR := deploy/orca
 ORCA_MANIFEST_RENDERED_DIR  := deploy/orca/rendered
 
@@ -183,7 +189,7 @@ CNI_PLUGINS_VERSION  ?= v1.9.1
 HOST_GOARCH := $(shell $(GOCMD) env GOARCH)
 
 # Kubernetes deploy knobs.
-NET_NAMESPACE           ?= unbounded-net
+NET_NAMESPACE           ?= $(UNBOUNDED_NAMESPACE)
 NET_FORCE_NOT_LEADER    ?= false
 NET_AZURE_TENANT_ID     ?=
 NET_APISERVER_URL       ?= $(shell kubectl config view --flatten --minify --template '{{ (index .clusters 0).cluster.server }}' 2>/dev/null)
@@ -925,11 +931,11 @@ machine-ops-controller-oci: image-machine-ops-controller-local ## Alias for imag
 machine-ops-controller-oci-push: machine-ops-controller-oci ## Build and push the machine-ops-controller image
 	$(CONTAINER_ENGINE) push $(MACHINE_OPS_CONTROLLER_IMAGE)
 
-MACHINA_NAMESPACE ?= unbounded-kube
+MACHINA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINA_API_SERVER_ENDPOINT ?=
 MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
-MACHINE_OPS_NAMESPACE ?= unbounded-kube
+MACHINE_OPS_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINE_OPS_API_SERVER_ENDPOINT ?=
 MACHINE_OPS_MANIFEST_TEMPLATES_DIR := deploy/machine-ops
 MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
@@ -962,8 +968,8 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 
 machina-run: machina ## Replace the in-cluster machina with a locally built binary
-	kubectl scale deployment/machina-controller --replicas=0 -n unbounded-kube
-	kubectl get configmap machina-config -n unbounded-kube -o jsonpath='{.data.config\.yaml}' > hack/machina-config.yaml
+	kubectl scale deployment/machina-controller --replicas=0 -n $(MACHINA_NAMESPACE)
+	kubectl get configmap machina-config -n $(MACHINA_NAMESPACE) -o jsonpath='{.data.config\.yaml}' > hack/machina-config.yaml
 	$(MACHINA_BIN) controller --config=hack/machina-config.yaml
 
 image-metalman-local: ## Build the metalman container image locally (single-arch)
