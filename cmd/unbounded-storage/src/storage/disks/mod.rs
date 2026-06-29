@@ -205,6 +205,7 @@ impl<T: DiskTarget> DiskRegistry<T> {
         for spec in desired {
             let path = disk_path(spec);
             if self.handles.contains_key(Path::new(path)) {
+                self.applied.insert(PathBuf::from(path), spec.clone());
                 continue;
             }
             let pin = assignment.get(Path::new(path)).copied().flatten();
@@ -232,8 +233,8 @@ impl<T: DiskTarget> DiskRegistry<T> {
     /// from its assigned CPU slot (the node its storage core runs on);
     /// an unpinned disk carries `None`. The router uses this to keep a
     /// stripe's serving shard on the same node as its disk.
-    pub fn channels_snapshot(&self) -> Vec<(PathBuf, PageChannel, Option<u16>)> {
-        let mut out: Vec<(PathBuf, PageChannel, Option<u16>)> = self
+    pub fn channels_snapshot(&self) -> Vec<(PathBuf, PageChannel, Option<u16>, bool)> {
+        let mut out: Vec<(PathBuf, PageChannel, Option<u16>, bool)> = self
             .channels
             .iter()
             .map(|(p, c)| {
@@ -243,7 +244,12 @@ impl<T: DiskTarget> DiskRegistry<T> {
                     .copied()
                     .flatten()
                     .and_then(|s| s.numa);
-                (p.clone(), c.clone(), numa)
+                let page_cache_enabled = self
+                    .applied
+                    .get(p)
+                    .map(|spec| !spec.disable_page_cache)
+                    .unwrap_or(true);
+                (p.clone(), c.clone(), numa, page_cache_enabled)
             })
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -299,7 +305,10 @@ impl<T: DiskTarget> DiskRegistrySet<T> {
             .reconcile_with_reserved(disks, &reserved_slots)
     }
 
-    pub fn channels_snapshot(&self, cache_id: &str) -> Vec<(PathBuf, PageChannel, Option<u16>)> {
+    pub fn channels_snapshot(
+        &self,
+        cache_id: &str,
+    ) -> Vec<(PathBuf, PageChannel, Option<u16>, bool)> {
         self.registries
             .get(cache_id)
             .map(DiskRegistry::channels_snapshot)
@@ -522,6 +531,7 @@ mod tests {
             bypass_admission: false,
             bypass_index_read: false,
             bypass_checksum: false,
+            disable_page_cache: false,
             config: Some(disk_spec::Config::Block(BlockDiskConfig {
                 numa: None,
                 path: path.to_string(),
@@ -577,6 +587,24 @@ mod tests {
         assert_eq!(report.added, 0);
         assert_eq!(report.removed, 0);
         assert_eq!(state.lock().unwrap().open_calls, calls_after_first);
+    }
+
+    #[test]
+    fn page_cache_policy_drift_updates_snapshot_without_reopen() {
+        let (target, state) = MockDiskTarget::new();
+        let mut reg = DiskRegistry::new(target, vec![]);
+        reg.reconcile(&[spec("/a", None)]);
+        let calls_after_first = state.lock().unwrap().open_calls;
+
+        let mut next = spec("/a", None);
+        next.disable_page_cache = true;
+        let report = reg.reconcile(&[next]);
+
+        assert_eq!(report.added, 0);
+        assert_eq!(report.removed, 0);
+        assert_eq!(state.lock().unwrap().open_calls, calls_after_first);
+        assert!(reg.applied[&PathBuf::from("/a")].disable_page_cache);
+        assert!(!reg.channels_snapshot()[0].3);
     }
 
     #[test]
@@ -869,6 +897,7 @@ mod tests {
             bypass_admission: false,
             bypass_index_read: false,
             bypass_checksum: false,
+            disable_page_cache: false,
             config: Some(disk_spec::Config::File(FileDiskConfig {
                 size: Some(size),
                 path: "/a".to_string(),
@@ -966,7 +995,7 @@ mod tests {
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/c", None), spec("/a", None), spec("/b", None)]);
         let snap = reg.channels_snapshot();
-        let paths: Vec<PathBuf> = snap.into_iter().map(|(p, _, _)| p).collect();
+        let paths: Vec<PathBuf> = snap.into_iter().map(|(p, _, _, _)| p).collect();
         assert_eq!(
             paths,
             vec![
@@ -994,7 +1023,7 @@ mod tests {
         let numa: Vec<(PathBuf, Option<u16>)> = reg
             .channels_snapshot()
             .into_iter()
-            .map(|(p, _, n)| (p, n))
+            .map(|(p, _, n, _)| (p, n))
             .collect();
         assert_eq!(
             numa,

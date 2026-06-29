@@ -32,7 +32,7 @@
 //! F_MORE completion.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::future::Future;
 use std::io;
@@ -58,25 +58,31 @@ pub(crate) struct RingSetup {
     pub defer_taskrun: bool,
 }
 
-/// Sink that defers reuse of a fixed-buffer RECV's destination page
-/// until the kernel is provably done writing into it.
+/// Sink that defers reuse of a fixed-buffer page until the kernel is
+/// provably done touching it.
 ///
-/// When a fixed-buffer RECV is cancelled on early drop, the kernel may
-/// still complete the RECV into the destination page after the dropping
+/// When a fixed-buffer RECV or SEND_ZC is cancelled on early drop, the
+/// kernel may still write into or read from the page after the dropping
 /// task returns. Returning that page to a free list immediately is
 /// therefore unsound. Instead the ring calls [`RecvQuarantine::quarantine`]
 /// on drop to withhold the page, and [`RecvQuarantine::reclaim`] once the
-/// RECV's CQE is reaped in [`RingCore::progress`], at which point the
+/// final CQE is reaped in [`RingCore::progress`], at which point the
 /// kernel no longer owns the page and it may be reused. Both are keyed
-/// by the destination's byte offset into the registered backing.
+/// by byte offset into the registered backing.
 ///
-/// Rings whose RECV destinations are not pool-managed leave no sink
+/// Rings whose fixed buffers are not pool-managed leave no sink
 /// installed; their drop path falls back to the blocking-but-sound
 /// [`RingCore::cancel_and_drain`].
 pub(crate) trait RecvQuarantine {
     fn quarantine(&self, page_byte_offset: usize);
     fn reclaim(&self, page_byte_offset: usize);
 }
+
+/// Marker for source-side completion resources held by fixed-buffer
+/// `SEND_ZC` slots until the final notification CQE is reaped.
+pub(crate) trait SendCompletion: 'static {}
+
+impl<T: 'static> SendCompletion for T {}
 
 /// One io_uring ring plus the shared slot / buffer / back-pressure
 /// machinery every facade in this module is built on. Pinned to the
@@ -91,7 +97,7 @@ pub(crate) struct RingCore {
     /// index is resolved by locating a pointer inside one region.
     registered: RefCell<Vec<RegisteredBuf>>,
     /// Number of live (submitted, not yet reaped) ops. Bounded by
-    /// `queue_depth` via the `submit_waiters` back-pressure queue.
+    /// `queue_depth` via the `submit_waiter` back-pressure slot.
     submitted: Cell<u32>,
     /// High-water mark of `submitted` since the core was created,
     /// recorded at increment time in [`Self::submit`]. Lets tests
@@ -100,9 +106,10 @@ pub(crate) struct RingCore {
     /// to an external sample of `submitted`, which can return to zero
     /// before it is read.
     peak_submitted: Cell<u32>,
-    /// FIFO of wakers parked because `submitted == queue_depth` at
-    /// submit time. Drained one-per-completion in [`Self::progress`].
-    submit_waiters: RefCell<Vec<Waker>>,
+    /// Waker parked because `submitted == queue_depth` at submit time.
+    /// Replaced in place on repeat polls so backpressure cannot grow an
+    /// unbounded duplicate-waker queue.
+    submit_waiter: RefCell<Option<Waker>>,
     next_user_data: Cell<u64>,
     /// Count of F_MORE (intermediate SEND_ZC) completions observed.
     /// Used only by tests to assert the two-CQE path executed.
@@ -118,6 +125,14 @@ pub(crate) struct RingCore {
     /// RECV to its destination byte offset, so [`Self::progress`] can
     /// `reclaim` the page when the RECV's CQE is finally reaped.
     pending_recv_cancel: RefCell<HashMap<u64, usize>>,
+    /// Maps the `user_data` of an abandoned fixed-source SEND_ZC to its
+    /// source byte offset, so [`Self::progress`] can `reclaim` the page
+    /// when the final SEND_ZC notification is reaped.
+    pending_send_zc_quarantine: RefCell<HashMap<u64, usize>>,
+    /// SEND_ZC ops whose caller dropped the future before the final
+    /// notification. The slot stays registered, and the completion
+    /// resource is released when progress reaps the final CQE.
+    abandoned_send_zc: RefCell<HashSet<u64>>,
     _no_send: PhantomData<*const ()>,
 }
 
@@ -206,6 +221,9 @@ pub(crate) enum OpResource {
     /// TLS record type) once the op resolves, while the slot keeps the
     /// allocation alive for the kernel until the CQE is reaped.
     RecvMsg(Rc<RefCell<RecvMsgState>>),
+    /// Completion callback for fixed-source SEND_ZC. Held by the slot
+    /// until the final SEND_ZC notification is reaped.
+    SendCompletion(Box<dyn SendCompletion>),
 }
 
 /// `SOL_TLS` socket option level. Absent from `libc`; see
@@ -360,13 +378,15 @@ impl RingCore {
             registered: RefCell::new(Vec::new()),
             submitted: Cell::new(0),
             peak_submitted: Cell::new(0),
-            submit_waiters: RefCell::new(Vec::new()),
+            submit_waiter: RefCell::new(None),
             next_user_data: Cell::new(1),
             more_completions: Cell::new(0),
             setup,
             queue_depth,
             recv_quarantine: RefCell::new(None),
             pending_recv_cancel: RefCell::new(HashMap::new()),
+            pending_send_zc_quarantine: RefCell::new(HashMap::new()),
+            abandoned_send_zc: RefCell::new(HashSet::new()),
             _no_send: PhantomData,
         })
     }
@@ -494,7 +514,7 @@ impl RingCore {
         if push_res.is_err() {
             self.slots.borrow_mut().remove(&ud);
             self.submitted.set(self.submitted.get().saturating_sub(1));
-            if let Some(w) = pop_front_waker(&mut self.submit_waiters.borrow_mut()) {
+            if let Some(w) = self.submit_waiter.borrow_mut().take() {
                 w.wake();
             }
             return Err(io::Error::from_raw_os_error(libc::ENOMEM));
@@ -578,12 +598,16 @@ impl RingCore {
                 if let Some(off) = self.pending_recv_cancel.borrow_mut().remove(&ud) {
                     to_reclaim.push(off);
                 }
+                if let Some(off) = self.pending_send_zc_quarantine.borrow_mut().remove(&ud) {
+                    to_reclaim.push(off);
+                }
+                self.abandoned_send_zc.borrow_mut().remove(&ud);
                 let n = self.submitted.get();
                 self.submitted.set(n.saturating_sub(1));
                 if let Some(w) = slot.waker.borrow_mut().take() {
                     to_wake.push(w);
                 }
-                if let Some(w) = pop_front_waker(&mut self.submit_waiters.borrow_mut()) {
+                if let Some(w) = self.submit_waiter.borrow_mut().take() {
                     to_wake.push(w);
                 }
             }
@@ -592,7 +616,7 @@ impl RingCore {
         for w in to_wake {
             w.wake();
         }
-        // Release any quarantined pages whose RECV CQE was just reaped.
+        // Release any quarantined pages whose final CQE was just reaped.
         // Done after the ring borrow is dropped: `reclaim` touches the
         // bufferpool free list, never the ring, so this cannot reenter
         // the borrow above, but deferring past it is defensive.
@@ -641,27 +665,48 @@ impl RingCore {
         }
     }
 
+    /// Abandon a fixed-source SEND_ZC future without blocking the
+    /// dropping task. The op's slot remains in the ring until the final
+    /// SEND_ZC notification is reaped, keeping any completion resource
+    /// alive until the source page is safe to release.
+    pub(crate) fn abandon_send_zc(
+        &self,
+        target_user_data: u64,
+        source_page_byte_offset: Option<usize>,
+        slot: &Slot,
+    ) {
+        if let Some(off) = source_page_byte_offset {
+            if let Some(q) = self.recv_quarantine.borrow().clone() {
+                self.pending_send_zc_quarantine
+                    .borrow_mut()
+                    .insert(target_user_data, off);
+                q.quarantine(off);
+            } else {
+                self.cancel_and_drain(target_user_data, slot);
+                return;
+            }
+        }
+        self.abandoned_send_zc.borrow_mut().insert(target_user_data);
+        self.cancel(target_user_data);
+    }
+
     /// Cancel the in-flight op named by `target_user_data` and BLOCK
     /// until its slot is reaped. Unlike [`Self::cancel`] (best-effort,
     /// may never land), this guarantees the kernel is done with the op's
     /// memory before returning.
     ///
-    /// Required by drop paths for ops that write directly into
-    /// caller-owned memory which may be reused the instant this returns
-    /// (the fixed-buffer RECV path: the destination bufferpool page is
-    /// handed back to the free list right after the fetch future drops).
-    /// A best-effort cancel is unsound there because the kernel could
-    /// still complete the RECV into the page after it has been
-    /// reassigned to a different key.
+    /// Required by drop paths for ops that touch caller-owned memory
+    /// which may be reused the instant this returns. For fixed-buffer
+    /// RECV, the kernel could still write into a recycled page. For
+    /// SEND_ZC, the kernel could still read from a recycled source page
+    /// until the notification CQE is reaped.
     ///
-    /// Bounded: `IORING_OP_ASYNC_CANCEL` aborts a pending RECV promptly
-    /// (it completes with `-ECANCELED`), so only a handful of CQEs are
-    /// drained before the slot is done. Each iteration blocks on a real
+    /// For fixed-buffer RECV, `IORING_OP_ASYNC_CANCEL` aborts a pending
+    /// op promptly. For SEND_ZC, the final notification CQE may arrive
+    /// before or after the cancel. Each iteration blocks on a real
     /// completion, so the spin guard is a safety net, not a busy-wait.
     pub(crate) fn cancel_and_drain(&self, target_user_data: u64, slot: &Slot) {
-        const MAX_DRAIN_ITERS: u32 = 4096;
         let mut cancel_submitted = false;
-        let mut iters = 0u32;
         while !slot.is_done() {
             if !cancel_submitted {
                 let entry = opcode::AsyncCancel::new(target_user_data)
@@ -682,14 +727,6 @@ impl RingCore {
                 let _ = ring.submitter().submit_and_wait(1);
             }
             let _ = self.progress();
-            iters += 1;
-            debug_assert!(
-                iters < MAX_DRAIN_ITERS,
-                "cancel_and_drain exceeded its iteration bound",
-            );
-            if iters >= MAX_DRAIN_ITERS {
-                break;
-            }
         }
     }
 
@@ -756,6 +793,11 @@ impl RingCore {
     pub(crate) fn more_completions(&self) -> u64 {
         self.more_completions.get()
     }
+
+    #[cfg(test)]
+    fn submit_waiter_registered(&self) -> bool {
+        self.submit_waiter.borrow().is_some()
+    }
 }
 
 /// io_uring admits via the [`SubmitSlot`] park: when `submitted ==
@@ -790,8 +832,8 @@ impl Drop for RingCore {
 /// Back-pressure park: yields `Pending` while `submitted ==
 /// queue_depth`, registering the caller's waker so [`RingCore::progress`]
 /// can resume it when a slot frees up.
-struct SubmitSlot<'a> {
-    core: &'a RingCore,
+pub(crate) struct SubmitSlot<'a> {
+    pub(crate) core: &'a RingCore,
 }
 
 impl Future for SubmitSlot<'_> {
@@ -807,7 +849,10 @@ impl Future for SubmitSlot<'_> {
         if core.submitted.get() < core.queue_depth {
             return Poll::Ready(());
         }
-        core.submit_waiters.borrow_mut().push(cx.waker().clone());
+        let mut waiter = core.submit_waiter.borrow_mut();
+        if !waiter.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+            *waiter = Some(cx.waker().clone());
+        }
         crate::metrics::ring_backpressure();
         Poll::Pending
     }
@@ -818,11 +863,16 @@ impl Future for SubmitSlot<'_> {
 /// the kernel already posted is reaped without an extra scheduler
 /// round-trip. If dropped before completion the slot is intentionally
 /// *not* removed (the kernel may still touch the op's memory); a
-/// best-effort cancel bounds how long the op stays outstanding.
+/// best-effort cancel bounds how long the op stays outstanding unless
+/// `abandon_send_zc` is set, in which case drop keeps the SEND_ZC slot
+/// alive and either quarantines its source page or keeps its explicit
+/// completion resource until the final notification.
 pub(crate) struct OpFut<'a> {
     core: &'a RingCore,
     user_data: u64,
     slot: Rc<Slot>,
+    abandon_send_zc: bool,
+    send_zc_source_offset: Option<usize>,
 }
 
 impl<'a> OpFut<'a> {
@@ -831,7 +881,20 @@ impl<'a> OpFut<'a> {
             core,
             user_data,
             slot,
+            abandon_send_zc: false,
+            send_zc_source_offset: None,
         }
+    }
+
+    pub(crate) fn abandon_send_zc(mut self) -> Self {
+        self.abandon_send_zc = true;
+        self
+    }
+
+    pub(crate) fn quarantine_send_zc(mut self, page_byte_offset: usize) -> Self {
+        self.abandon_send_zc = true;
+        self.send_zc_source_offset = Some(page_byte_offset);
+        self
     }
 }
 
@@ -854,7 +917,12 @@ impl Future for OpFut<'_> {
 impl Drop for OpFut<'_> {
     fn drop(&mut self) {
         if !self.slot.is_done() {
-            self.core.cancel(self.user_data);
+            if self.abandon_send_zc {
+                self.core
+                    .abandon_send_zc(self.user_data, self.send_zc_source_offset, &self.slot);
+            } else {
+                self.core.cancel(self.user_data);
+            }
         }
     }
 }
@@ -864,17 +932,6 @@ impl Drop for OpFut<'_> {
 /// notification does not.
 pub(crate) fn cqe_is_more(flags: u32) -> bool {
     cqueue::more(flags)
-}
-
-/// Pop the oldest waker from `v`, treating it as a FIFO. `Vec` is fine
-/// here because the queue is bounded by `queue_depth` and only the
-/// owning thread touches it.
-fn pop_front_waker(v: &mut Vec<Waker>) -> Option<Waker> {
-    if v.is_empty() {
-        None
-    } else {
-        Some(v.remove(0))
-    }
 }
 
 /// Map a CQE `res` into an `io::Result`: negative is `-errno`.
@@ -976,5 +1033,19 @@ mod tests {
         assert_eq!(core.available(), 8);
         assert!(core.admits());
         assert_eq!(core.policy(), BackPressurePolicy::Parking);
+    }
+
+    #[test]
+    fn submit_slot_replaces_waiter_instead_of_accumulating() {
+        let core = RingCore::new(1, RingSetup::default()).expect("core");
+        core.submitted.set(1);
+
+        let w = crate::runtime::noop_waker();
+        let mut cx = Context::from_waker(&w);
+        let mut submit = SubmitSlot { core: &core };
+        assert!(Pin::new(&mut submit).poll(&mut cx).is_pending());
+        assert!(Pin::new(&mut submit).poll(&mut cx).is_pending());
+
+        assert!(core.submit_waiter_registered());
     }
 }

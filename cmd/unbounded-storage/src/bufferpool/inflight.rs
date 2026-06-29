@@ -45,6 +45,12 @@ pub(super) struct PageSlot {
     /// the page index cannot be recycled until both this flag is
     /// false and `consumer_holds == 0`.
     pub tee_pending: Cell<bool>,
+    /// True while this ready slot is on the pool's idle-page LRU and
+    /// can be evicted to satisfy a later allocation.
+    pub cached: Cell<bool>,
+    /// Leader-owned decision for whether this page may be retained in
+    /// the in-memory page cache after consumers and tee complete.
+    pub page_cache_enabled: Cell<bool>,
 }
 
 impl PageSlot {
@@ -55,6 +61,8 @@ impl PageSlot {
             page_idx: Cell::new(None),
             consumer_holds: Cell::new(0),
             tee_pending: Cell::new(false),
+            cached: Cell::new(false),
+            page_cache_enabled: Cell::new(false),
         }
     }
 
