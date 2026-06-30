@@ -483,6 +483,50 @@ func TestTemplateRendering_AgentConfigJSONUnset(t *testing.T) {
 	}
 }
 
+func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
+	grubTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "grub.cfg.tmpl"))
+	if err != nil {
+		t.Fatalf("reading grub.cfg.tmpl: %v", err)
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-no-operations", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				DHCPLeases: []v1alpha3.DHCPLease{{
+					IPv4:       "10.0.1.20",
+					Gateway:    "10.0.1.1",
+					SubnetMask: "255.255.255.0",
+				}},
+			},
+		},
+	}
+
+	data := newTemplateData(
+		node,
+		ClusterInfo{ApiserverURL: "https://k8s.example.com"},
+		"http://10.0.1.1:8080",
+		"",
+	)
+
+	result, err := renderTemplate(string(grubTmpl), data)
+	if err != nil {
+		t.Fatalf("renderTemplate: %v", err)
+	}
+
+	body := string(result)
+	for _, want := range []string{
+		"No pending repave",
+		"unbounded.image_url=http://10.0.1.1:8080/disk.img.gz",
+		"unbounded.node_name=node-no-operations",
+		"ip=10.0.1.20::10.0.1.1:255.255.255.0::eth0:none",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in rendered grub.cfg, got:\n%s", want, body)
+		}
+	}
+}
+
 func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
 	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "vendor-data.tmpl"))
 	if err != nil {

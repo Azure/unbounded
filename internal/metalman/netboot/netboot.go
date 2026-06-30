@@ -152,12 +152,7 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 				return nil, fmt.Errorf("marshal agent config: %w", err)
 			}
 
-			data, err := renderTemplate(string(content), templateData{
-				Machine:         node,
-				ApiserverURL:    ci.ApiserverURL,
-				ServeURL:        f.ServeURL,
-				AgentConfigJSON: string(agentConfigJSON),
-			})
+			data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON)))
 			if err != nil {
 				return nil, err
 			}
@@ -209,10 +204,34 @@ func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v
 }
 
 type templateData struct {
-	Machine         *v1alpha3.Machine
-	ApiserverURL    string
-	ServeURL        string
-	AgentConfigJSON string
+	Machine             *v1alpha3.Machine
+	ApiserverURL        string
+	ServeURL            string
+	AgentConfigJSON     string
+	SpecRepaveCounter   int64
+	StatusRepaveCounter int64
+}
+
+func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON string) templateData {
+	var specRepave, statusRepave int64
+	if node != nil {
+		if node.Spec.Operations != nil {
+			specRepave = node.Spec.Operations.RepaveCounter
+		}
+
+		if node.Status.Operations != nil {
+			statusRepave = node.Status.Operations.RepaveCounter
+		}
+	}
+
+	return templateData{
+		Machine:             node,
+		ApiserverURL:        ci.ApiserverURL,
+		ServeURL:            serveURL,
+		AgentConfigJSON:     agentConfigJSON,
+		SpecRepaveCounter:   specRepave,
+		StatusRepaveCounter: statusRepave,
+	}
 }
 
 var (
