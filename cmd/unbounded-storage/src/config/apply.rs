@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use crate::fabric::{ConnectionSpec, FabricAddress, PeerId};
 use crate::p2p::node_id_from_name;
 
-use super::schema::{peer_spec, PeerSpec};
+use super::schema::{PeerSpec, peer_spec};
 
 pub fn peer_spec_to_connection(p: &PeerSpec) -> ConnectionSpec {
     let node_id = node_id_from_name(&p.name);

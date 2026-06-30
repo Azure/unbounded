@@ -42,6 +42,18 @@ data:
     # Operator-assigned config version (opaque counter; 0 means unversioned).
     version: 0
 
+    # Optional automatic P2P finger weighting. Omit topology_weighting to keep
+    # historical hard-locality selection. When set, weight 0.0 is neutral,
+    # positive values favor matching peers, and negative values penalize them.
+    # tag_index 0 is the coarsest peer tag (region or datacenter); tag_index 1
+    # is the next tag (zone or AZ). Successor and predecessor remain ring-nearest.
+    # topology_weighting:
+    #   prefix_weights:
+    #     - tag_index: 0
+    #       weight: 0.25
+    #     - tag_index: 1
+    #       weight: -0.5
+
     startup:
       memory:
         # Allocate per-shard backing from the heap instead of 2 MiB hugepages.

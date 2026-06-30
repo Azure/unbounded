@@ -33,6 +33,12 @@ message Config {
 
   // Process-wide peer definitions for the globally shared transport mesh.
   repeated PeerSpec peers = 10;
+
+  // Optional topology weighting for automatic finger selection. When unset,
+  // automatic routing uses the historical hard-locality preference. When set,
+  // finger selection uses weighted rendezvous while successor/predecessor
+  // selection remains purely ring-nearest for routing correctness.
+  optional TopologyWeighting topology_weighting = 11;
 }
 
 // A precomputed routing table for a single node, produced by a
@@ -49,6 +55,28 @@ message RoutingPlan {
 
   // Peer name of the nearest-backward neighbor on the ring.
   optional string predecessor = 3;
+}
+
+// Weights applied to automatic topology-aware finger selection. A configured
+// weighting switches finger selection from hard locality to weighted
+// rendezvous. Only the most-specific matching prefix weight applies.
+message TopologyWeighting {
+  // Per-prefix weights keyed by tag index. Tag index 0 is the first/coarsest
+  // tag, such as a region or datacenter; tag index 1 is the next tag, such as
+  // an availability zone. Weight 0 is neutral, positive values favor peers
+  // sharing that prefix, and negative values penalize them.
+  repeated TopologyPrefixWeight prefix_weights = 1;
+}
+
+message TopologyPrefixWeight {
+  // Tag slot this weight applies to when local and candidate peers share all
+  // tags through this index.
+  uint32 tag_index = 1;
+
+  // Floating-point bias for candidates sharing this prefix. Selection computes
+  // score = normalized_rendezvous_hash - weight and chooses the lowest score.
+  // Zero is neutral.
+  double weight = 2;
 }
 
 message PeerSpec {
