@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -116,6 +117,8 @@ func watchMachineOperation(ctx context.Context, c client.WithWatch, opName strin
 	defer watcher.Stop()
 
 	var lastPhase v1alpha3.OperationPhase
+	seenConditions := map[string]conditionState{}
+	seenTargets := map[string]string{}
 
 	for ev := range watcher.ResultChan() {
 		if ev.Type == watch.Error {
@@ -132,6 +135,9 @@ func watchMachineOperation(ctx context.Context, c client.WithWatch, opName strin
 		}
 
 		phase := op.Status.Phase
+		reportConditionTransitions(op.Status.Conditions, seenConditions)
+		reportTargetTransitions(op.Status.Targets, seenTargets)
+
 		if phase != lastPhase {
 			switch phase {
 			case v1alpha3.OperationPhaseInProgress:
@@ -157,4 +163,42 @@ func watchMachineOperation(ctx context.Context, c client.WithWatch, opName strin
 	}
 
 	return fmt.Errorf("watch closed before operation completed")
+}
+
+func reportTargetTransitions(targets []v1alpha3.MachineOperationTargetStatus, seen map[string]string) {
+	for _, target := range targets {
+		key := target.MachineRef
+		if key == "" {
+			continue
+		}
+
+		state := targetTransitionState(target)
+		if seen[key] == state {
+			continue
+		}
+
+		seen[key] = state
+		printStep(fmt.Sprintf("Target %s: %s", key, state))
+	}
+}
+
+func targetTransitionState(target v1alpha3.MachineOperationTargetStatus) string {
+	parts := make([]string, 0, 3)
+	if target.Phase != "" {
+		parts = append(parts, string(target.Phase))
+	}
+	if target.Stage != "" {
+		parts = append(parts, string(target.Stage))
+	}
+
+	state := strings.Join(parts, "/")
+	if state == "" {
+		state = "Pending"
+	}
+
+	if target.Message == "" {
+		return state
+	}
+
+	return fmt.Sprintf("%s - %s", state, target.Message)
 }
