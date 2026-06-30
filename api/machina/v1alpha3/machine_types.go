@@ -89,8 +89,6 @@ const (
 	// "Running" while the agent is preparing the nspawn node, False with
 	// a failure reason when nspawn startup or kubelet TLS bootstrap fails,
 	// and True with Reason "Succeeded" once the kubelet has bootstrapped.
-	// On failure the message includes host-local diagnostics so operators
-	// can diagnose the root cause without logging into the machine.
 	MachineConditionAgentBootstrapped = "AgentBootstrapped"
 
 	// MachineConditionNodeUpdated indicates the result of a node

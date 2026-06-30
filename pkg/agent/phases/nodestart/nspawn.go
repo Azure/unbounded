@@ -81,56 +81,14 @@ func (s *startNSpawnMachine) Do(ctx context.Context) error {
 	}
 
 	if err := s.startWithRecovery(ctx, name); err != nil {
-		return fmt.Errorf("%w%s", err, nspawnDiagnostics(ctx, s.log, name))
+		return err
 	}
 
 	if err := waitForMachine(ctx, s.log, name); err != nil {
-		return fmt.Errorf("wait for machine %s: %w%s", name, err, nspawnDiagnostics(ctx, s.log, name))
+		return fmt.Errorf("wait for machine %s: %w", name, err)
 	}
 
 	return nil
-}
-
-func nspawnDiagnostics(ctx context.Context, log *slog.Logger, machine string) string {
-	service := fmt.Sprintf("systemd-nspawn@%s.service", machine)
-	commands := []struct {
-		label string
-		args  []string
-	}{
-		{
-			label: "systemctl status " + service,
-			args:  []string{"systemctl", "status", "--no-pager", "--full", service},
-		},
-		{
-			label: "journalctl -u " + service,
-			args:  []string{"journalctl", "-u", service, "-n", "80", "--no-pager"},
-		},
-	}
-
-	var b strings.Builder
-
-	for _, cmd := range commands {
-		diagCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		out, err := executil.OutputCmdAt(diagCtx, log, slog.LevelDebug, cmd.args[0], cmd.args[1:]...)
-
-		cancel()
-
-		if err != nil && strings.TrimSpace(out) == "" {
-			continue
-		}
-
-		b.WriteString("\n")
-		b.WriteString(cmd.label)
-		b.WriteString(":\n")
-
-		if text := strings.TrimSpace(out); text != "" {
-			b.WriteString(text)
-		} else {
-			b.WriteString(err.Error())
-		}
-	}
-
-	return b.String()
 }
 
 // startWithRecovery runs `machinectl start` and, if it fails because the

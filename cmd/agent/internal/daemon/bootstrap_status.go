@@ -73,7 +73,7 @@ func (r *BootstrapStatusReporter) Running(ctx context.Context) {
 	r.set(ctx, metav1.ConditionFalse, "Running", "unbounded-agent bootstrap is running")
 }
 
-// Failed reports that initial bootstrap failed with diagnostics in message.
+// Failed reports that initial bootstrap failed.
 func (r *BootstrapStatusReporter) Failed(ctx context.Context, reason string, err error) {
 	if err == nil {
 		err = fmt.Errorf("bootstrap failed")

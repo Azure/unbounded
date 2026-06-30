@@ -33,7 +33,7 @@ func WaitForKubelet(log *slog.Logger, machineName string) phases.Task {
 
 // WaitForKubeletBootstrap returns a task that waits for kubelet TLS bootstrap
 // to complete by polling for the generated client kubeconfig inside the nspawn
-// machine. On failure it includes kubelet service and journal diagnostics.
+// machine.
 func WaitForKubeletBootstrap(log *slog.Logger, machineName string) phases.Task {
 	return &waitForKubeletBootstrap{log: log, machine: machineName}
 }
@@ -85,53 +85,8 @@ func (w *waitForKubeletBootstrap) Do(ctx context.Context) error {
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("kubelet did not bootstrap in %s after %s: %w%s", w.machine, timeout, ctx.Err(), kubeletDiagnostics(ctx, w.log, w.machine))
+			return fmt.Errorf("kubelet did not bootstrap in %s after %s: %w", w.machine, timeout, ctx.Err())
 		case <-time.After(pollInterval):
 		}
 	}
-}
-
-func kubeletDiagnostics(ctx context.Context, log *slog.Logger, machine string) string {
-	commands := []struct {
-		label string
-		args  []string
-	}{
-		{
-			label: "systemctl status kubelet.service",
-			args: []string{
-				"systemctl", "status", "--no-pager", "--full", goalstates.SystemdUnitKubelet,
-			},
-		},
-		{
-			label: "journalctl -u kubelet.service",
-			args: []string{
-				"journalctl", "-u", goalstates.SystemdUnitKubelet, "-n", "80", "--no-pager",
-			},
-		},
-	}
-
-	var b strings.Builder
-
-	for _, cmd := range commands {
-		diagCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		out, err := executil.MachineRun(diagCtx, log, machine, cmd.args...)
-
-		cancel()
-
-		if err != nil && strings.TrimSpace(out) == "" {
-			continue
-		}
-
-		b.WriteString("\n")
-		b.WriteString(cmd.label)
-		b.WriteString(":\n")
-
-		if text := strings.TrimSpace(out); text != "" {
-			b.WriteString(text)
-		} else {
-			b.WriteString(err.Error())
-		}
-	}
-
-	return b.String()
 }
