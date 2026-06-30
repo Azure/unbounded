@@ -63,8 +63,8 @@ Optional flags:
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
-| `--namespace` | `string` | `unbounded-kube` | Namespace for the operator and default components |
-| `--net-namespace` | `string` | `unbounded-net` | Namespace for unbounded-net components |
+| `--namespace` | `string` | `unbounded-system` | Namespace for the operator and default components |
+| `--net-namespace` | `string` | `unbounded-system` | Namespace for unbounded-net components |
 | `--skip-crds` | `bool` | `false` | Skip applying CRDs |
 | `--wait` | `bool` | `true` | Wait for the operator rollout |
 | `--timeout` | `duration` | `5m0s` | Timeout for rollout waits |
@@ -74,6 +74,36 @@ The image flags (`--operator-image`, `--net-controller-image`,
 `--net-node-image`, `--machina-image`, `--metalman-image`, and
 `--storage-supervisor-image`) override the images embedded in the release
 manifests.
+
+#### Migrating from the legacy split namespaces
+
+Earlier releases installed components across `unbounded-kube` (machina,
+metalman, storage) and `unbounded-net` (net). Everything now consolidates onto a
+single `unbounded-system` namespace.
+
+For an existing cluster, start `unbounded-operator` with
+`--reap-legacy-resources` (off by default). After the new `unbounded-system`
+workloads report healthy, the operator:
+
+1. copies non-regenerable state (user/operator Secrets and the `machina-config`
+   ConfigMap) into `unbounded-system`, skipping auto-managed and regenerable
+   secrets;
+2. rewrites the namespace embedded in cluster-scoped secret references
+   (`Machine.spec.pxe.redfish.passwordRef`, `MachineOperationCredential`
+   `spec.auth.secretRef`);
+3. deletes only the operator-owned resources left behind in the legacy
+   namespaces, reaping net last (a brief data-plane interruption is inherent to
+   the cutover).
+
+The operator **never deletes the legacy `Namespace` objects**. Once they are
+confirmed empty, remove them manually:
+
+```bash
+kubectl delete namespace unbounded-kube unbounded-net
+```
+
+For air-gapped clusters or installs not managed by the operator, the equivalent
+one-shot migration is available as `hack/scripts/migrate-namespace.sh`.
 
 ---
 

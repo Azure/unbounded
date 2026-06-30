@@ -13,6 +13,12 @@
 # secret references that enforce a namespace, and finally decommissions the old
 # namespaces.
 #
+# NOTE: For clusters managed by unbounded-operator, prefer the operator-driven
+# migration (start the operator with --reap-legacy-resources); it performs the
+# same copy/rewrite/reap steps continuously and is the supported path. This
+# script remains for air-gapped or non-operator installs. Either way, the legacy
+# Namespace objects are left for a human to delete once empty.
+#
 # Scope: machina, metalman, and net only. Cluster-scoped custom resources
 # (Site, Machine, GatewayPool, ...) and CRDs are NOT namespaced and are left
 # untouched. Gantry (`gantry-system`) and inventory (`machina-system`) are out
