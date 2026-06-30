@@ -8,6 +8,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/hack/cmd/agent-artifacts-builder/artifacts"
+	"github.com/Azure/unbounded/internal/logger"
 )
 
 const (
@@ -34,13 +36,19 @@ func main() {
 }
 
 func newRootCommand() *cobra.Command {
-	var opts artifacts.Options
+	var (
+		opts      artifacts.Options
+		debug     bool
+		logFormat string
+	)
 
 	cmd := &cobra.Command{
 		Use:          "agent-artifacts-builder",
 		Short:        "Build offline agent bootstrap artifact bundles",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			log := newLogger(debug, logFormat)
+
 			if opts.ManifestPath == "" && opts.KubernetesVersion == "" {
 				return fmt.Errorf("one of --manifest or --kubernetes-version is required")
 			}
@@ -49,9 +57,12 @@ func newRootCommand() *cobra.Command {
 				return fmt.Errorf("--manifest and --kubernetes-version are mutually exclusive")
 			}
 
-			return artifacts.Build(cmd.Context(), opts)
+			return artifacts.Build(cmd.Context(), log, opts)
 		},
 	}
+
+	cmd.PersistentFlags().BoolVar(&debug, "debug", false, "enable debug-level logging")
+	cmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "log format: text or json")
 
 	flags := cmd.Flags()
 	flags.StringVar(&opts.OutputDir, "output-dir", "", "Directory where the offline artifact filesystem layout is written")
@@ -64,6 +75,21 @@ func newRootCommand() *cobra.Command {
 	cmd.AddCommand(newResolvePublishInputsCommand())
 
 	return cmd
+}
+
+func newLogger(debug bool, format string) *slog.Logger {
+	var lvl slog.LevelVar
+	if debug {
+		lvl.Set(slog.LevelDebug)
+	}
+
+	if strings.EqualFold(format, "json") {
+		return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: &lvl}))
+	}
+
+	return slog.New(logger.NewPrettyFieldHandler(&lvl, logger.PrettyFieldHandlerOptions{
+		AttrOrder: []string{"artifact", "source", "oci_ref", "digest"},
+	}))
 }
 
 func newResolvePublishInputsCommand() *cobra.Command {

@@ -111,12 +111,21 @@ jobs:
           oci_ref="${REGISTRY}/bootstrap-artifacts:${ARTIFACT_TAG_PREFIX}-k8s-${KUBERNETES_VERSION}"
           output_dir="dist/bootstrap-artifacts/${KUBERNETES_VERSION}"
 
+          echo "Artifact source version: ${KUBERNETES_VERSION}"
+          echo "Output directory: ${output_dir}"
+          echo "OCI reference: ${oci_ref}"
+
           bin/agent-artifacts-builder \
             --output-dir "$output_dir" \
             --kubernetes-version "$KUBERNETES_VERSION" \
             --arch amd64 \
             --arch arm64 \
             --oci-ref "$oci_ref"
+
+          echo "::group::Offline artifact bundle contents"
+          find "$output_dir" -type f -printf '%P %s bytes\n' | sort
+          du -sh "$output_dir"
+          echo "::endgroup::"
 
           echo "Published $oci_ref"
 

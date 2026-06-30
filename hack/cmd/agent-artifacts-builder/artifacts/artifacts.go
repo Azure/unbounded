@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -68,7 +69,7 @@ type Plan struct {
 	Artifacts []Artifact
 }
 
-func Build(ctx context.Context, opts Options) error {
+func Build(ctx context.Context, log *slog.Logger, opts Options) error {
 	plan, err := NewPlan(opts)
 	if err != nil {
 		return err
@@ -78,12 +79,12 @@ func Build(ctx context.Context, opts Options) error {
 		return err
 	}
 
-	if err := downloadArtifacts(ctx, opts.OutputDir, plan.Artifacts, opts.SkipExisting); err != nil {
+	if err := downloadArtifacts(ctx, log, opts.OutputDir, plan.Artifacts, opts.SkipExisting); err != nil {
 		return err
 	}
 
 	if opts.OCIRef != "" {
-		if err := PushOCI(ctx, opts.OutputDir, opts.OCIRef); err != nil {
+		if err := PushOCI(ctx, log, opts.OutputDir, opts.OCIRef); err != nil {
 			return err
 		}
 	}
@@ -148,12 +149,13 @@ func NewPlan(opts Options) (Plan, error) {
 	return Plan{Manifest: manifest, Artifacts: artifacts}, nil
 }
 
-func PushOCI(ctx context.Context, rootDir, ref string) error {
+func PushOCI(ctx context.Context, log *slog.Logger, rootDir, ref string) error {
 	if rootDir == "" {
 		return errors.New("output dir is required")
 	}
 
 	ref = strings.TrimPrefix(ref, "oci://")
+	log.Info("pushing offline artifact bundle", slog.String("oci_ref", "oci://"+ref))
 
 	repo, err := remote.NewRepository(ref)
 	if err != nil {
@@ -204,9 +206,12 @@ func PushOCI(ctx context.Context, rootDir, ref string) error {
 		return fmt.Errorf("tag OCI artifact %q: %w", tag, err)
 	}
 
-	if _, err := oras.Copy(ctx, store, tag, repo, tag, oras.DefaultCopyOptions); err != nil {
+	desc, err := oras.Copy(ctx, store, tag, repo, tag, oras.DefaultCopyOptions)
+	if err != nil {
 		return fmt.Errorf("push OCI artifact %q: %w", ref, err)
 	}
+
+	log.Info("pushed offline artifact bundle", slog.String("oci_ref", "oci://"+ref), slog.String("digest", desc.Digest.String()))
 
 	return nil
 }
@@ -238,7 +243,7 @@ func writeManifest(rootDir string, manifest Manifest) error {
 	return nil
 }
 
-func downloadArtifacts(ctx context.Context, rootDir string, artifacts []Artifact, skipExisting bool) error {
+func downloadArtifacts(ctx context.Context, log *slog.Logger, rootDir string, artifacts []Artifact, skipExisting bool) error {
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.SetLimit(4)
 
@@ -246,7 +251,7 @@ func downloadArtifacts(ctx context.Context, rootDir string, artifacts []Artifact
 		artifact := artifact
 
 		eg.Go(func() error {
-			return downloadArtifact(ctx, rootDir, artifact, skipExisting)
+			return downloadArtifact(ctx, log, rootDir, artifact, skipExisting)
 		})
 	}
 
@@ -266,10 +271,11 @@ func downloadArtifacts(ctx context.Context, rootDir string, artifacts []Artifact
 	return nil
 }
 
-func downloadArtifact(ctx context.Context, rootDir string, artifact Artifact, skipExisting bool) error {
+func downloadArtifact(ctx context.Context, log *slog.Logger, rootDir string, artifact Artifact, skipExisting bool) error {
 	dest := filepath.Join(rootDir, filepath.FromSlash(artifact.Path))
 	if skipExisting {
 		if _, err := os.Stat(dest); err == nil {
+			log.Info("skipping existing artifact", slog.String("artifact", artifact.Path))
 			return nil
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("stat %q: %w", dest, err)
@@ -279,6 +285,8 @@ func downloadArtifact(ctx context.Context, rootDir string, artifact Artifact, sk
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return fmt.Errorf("create dir for %q: %w", dest, err)
 	}
+
+	log.Info("downloading artifact", slog.String("artifact", artifact.Path), slog.String("source", artifact.URL))
 
 	tmp := dest + ".tmp"
 	if err := downloadToFile(ctx, artifact.URL, tmp); err != nil {
@@ -290,6 +298,8 @@ func downloadArtifact(ctx context.Context, rootDir string, artifact Artifact, sk
 		os.Remove(tmp) //nolint:errcheck // best effort cleanup
 		return fmt.Errorf("install %q: %w", dest, err)
 	}
+
+	log.Info("downloaded artifact", slog.String("artifact", artifact.Path))
 
 	return nil
 }
