@@ -95,9 +95,9 @@ type Config struct {
 	// means in-cluster service-account discovery. This is the developer/test
 	// path; in production the run container relies on the in-cluster config.
 	Kubeconfig string
-	// RdmaInventoryURL, when set, is polled for the daemon's local RDMA HCA
-	// inventory JSON and published onto this Node for peer discovery.
-	RdmaInventoryURL string
+	// DeviceInventoryURL, when set, is the daemon inventory base URL whose
+	// /rdma and /block paths are published onto this Node for discovery.
+	DeviceInventoryURL string
 	// StorageArgs are extra arguments appended to the daemon ExecStart line.
 	StorageArgs string
 	// Arch is the normalized target architecture ("amd64" or "arm64").
@@ -150,7 +150,7 @@ func LoadConfig() (Config, error) {
 	cfg.NodeName = os.Getenv("NODE_NAME")
 	cfg.StorageRingLabel = envOr("STORAGE_RING_LABEL", defaultStorageRingLabel)
 	cfg.Kubeconfig = os.Getenv("KUBECONFIG")
-	cfg.RdmaInventoryURL = os.Getenv("STORAGE_RDMA_INVENTORY_URL")
+	cfg.DeviceInventoryURL = os.Getenv("STORAGE_DEVICE_INVENTORY_URL")
 
 	// SOURCE takes precedence; LOCAL_TARBALL is honored for backward
 	// compatibility with the shell installer when SOURCE is unset.

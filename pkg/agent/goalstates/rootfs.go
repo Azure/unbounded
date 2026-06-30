@@ -38,8 +38,8 @@ type RootFS struct {
 	AMD AMDHost
 
 	// HostDevices holds host device nodes to be bind-mounted into the
-	// nspawn container, grouped by category (KVM, block storage, InfiniBand
-	// HCA). Device nodes are discovered at agent startup. Empty on hosts
-	// without any supported devices.
+	// nspawn container, grouped by category (KVM, network virtualization,
+	// block storage, InfiniBand HCA). Device nodes are discovered at agent
+	// startup. Empty on hosts without any supported devices.
 	HostDevices HostDevices
 }

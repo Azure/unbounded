@@ -20,7 +20,7 @@ use unbounded_storage::bufferpool::{Pool, PoolConfig, ShardDescriptor, StripeKey
 use unbounded_storage::config::{
     self, BackendSpec, Config, FrontendSpec, ResolvedFrontendBinding, frontend_spec,
 };
-use unbounded_storage::fabric::{self, Fabric, Provider};
+use unbounded_storage::fabric::{self, Fabric, MrHandle, Provider};
 use unbounded_storage::fanout::{
     FanoutPeer, FanoutTable, FetchChannel, FetchService, NumaShardTable,
 };
@@ -29,7 +29,8 @@ use unbounded_storage::frontend::{
 };
 use unbounded_storage::p2p::{
     FingerTable, FingerTableConfig, NodeId, PeerEntry, RouteTableHandle, RouteTableSnapshot,
-    RoutedTransport, RoutingSnapshot, TopologyTags, node_to_ring,
+    RoutedTransport, RoutingSnapshot, TopologyPrefixWeight, TopologySelection, TopologyTags,
+    TopologyWeighting, node_to_ring,
 };
 use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
@@ -42,8 +43,8 @@ use unbounded_storage::topology::{CorePlan, CorePlanConfig, DiskCpuSlot, Host, S
 use unbounded_storage::memory::{BackingKind, BackingRequest, allocate};
 use unbounded_storage::metrics;
 
+mod device_inventory;
 mod fabric_group;
-mod rdma_inventory;
 mod shard_layer;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
@@ -420,11 +421,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let rdma_inventory = metrics::RdmaInventoryStatus::new();
-    rdma_inventory.set_json(rdma_inventory::to_json(
+    let device_inventory = metrics::DeviceInventoryStatus::new();
+    device_inventory.set_rdma(device_inventory::rdma_annotation(
         &host,
         &layer.fabric_unit_addresses(),
     ));
+    device_inventory.set_block(device_inventory::block_annotation(&host));
 
     // Reconcile the startup disk set now that the shards are up, then
     // publish the channel set so shards can reach their disks.
@@ -458,7 +460,7 @@ fn main() -> ExitCode {
         match metrics::spawn(
             &metrics_bind,
             controller.config_versions(),
-            rdma_inventory,
+            device_inventory,
             &SHUTDOWN,
         ) {
             Ok(handle) => {
@@ -553,6 +555,7 @@ fn run_shard(
     ctrl_rx: mpsc::Receiver<config::ShardCommand>,
     peer_rx: mpsc::Receiver<Arc<Vec<PeerPublish>>>,
     phaseb_tx: mpsc::Sender<PhaseBReport>,
+    serve_start_rx: mpsc::Receiver<()>,
     layer_stop: Arc<AtomicBool>,
 ) {
     // The fabric endpoint is built and owned by the `FabricGroup` in the
@@ -656,13 +659,10 @@ fn run_shard(
     // Each request names its backend through the `OriginRef` the
     // frontend stamps, so the registry resolves the tier per fetch.
     //
-    // Two independent registries are needed (the pool transport and the
-    // RPC handler each own one) because they differ in which ring a
-    // cache-miss fetch drives (`OriginRing`) and which registered region
-    // origin bytes are copied into (`backing_base`). The pool transport
-    // runs on the shard thread and reuses the shard ring over the pool
-    // backing; the RPC handler serves on an ephemeral worker thread and
-    // must use a worker-local ring writing into the scratch backing.
+    // The registry runs on the shard thread, reuses the shard ring, and
+    // writes origin bytes into the pool backing. Recursive RPC owner
+    // serves go through this same pool/fetch-service path rather than a
+    // separate RPC-worker origin registry.
     log_backend_registry(widx, &backend_specs);
 
     // Route the pool's transport through the p2p finger table: a stripe
@@ -790,6 +790,7 @@ fn run_shard(
         publish: ShardPublish {
             backing_base: backing_base as usize,
             backing_len,
+            fabric_mr: mr,
             numa: shard.numa,
             fetch_channel,
             backing_keepalive,
@@ -891,7 +892,7 @@ fn run_shard(
     // atomically by its transport; the fabric RPC handlers are reloaded
     // separately by the `FabricGroup`), refreshes the stripe geometry,
     // reconciles the transport origin-backend registry and the frontend
-    // registry toward the new config, and then acknowledges
+    // registry toward the new config, applies disk-policy side effects, and then acknowledges
     // so the coordinator's blocking apply can complete. Everything is
     // driven from this one thread so the `ArcSwap` publishes are ordered
     // and the build-from-spec (DNS resolve, listener bind) stays off the
@@ -900,6 +901,7 @@ fn run_shard(
         let routes = routes.clone();
         let transport_registry = transport_registry.clone();
         let frontend_registry = frontend_registry.clone();
+        let pool = pool.clone();
         let geometry = geometry.clone();
         let bindings = frontend_registry.ctx.bindings.clone();
         let mut last_backends: HashMap<String, BackendSpec> = backend_specs
@@ -935,7 +937,6 @@ fn run_shard(
                         let desired_frontends = apply.config.frontends.as_slice();
                         let desired_frontend_backends =
                             config::frontend_backend_map(&projection.frontends);
-
                         // Refresh stripe geometry before building any
                         // frontend so a co-applied backend stripe change
                         // is visible to a frontend add in the same pass.
@@ -994,6 +995,14 @@ fn run_shard(
                         });
                         did_work = true;
                     }
+                    config::ShardCommand::DrainPageCache(drain) => {
+                        pool.drain_page_cache();
+                        let _ = drain.ack.send(config::ShardAck {
+                            worker: widx,
+                            result: Ok(()),
+                        });
+                        did_work = true;
+                    }
                 }
             }
             did_work
@@ -1009,9 +1018,17 @@ fn run_shard(
         shard_loop.add_tick_hook(move || frontend_registry.progress());
     }
 
-    // PHASE B complete: peers registered, fan-out and frontend drivers
-    // built. Report readiness so the layer can finish bring-up.
+    // PHASE B complete: peers registered, fetch service installed, and
+    // frontend drivers built. Report readiness so the layer can start the
+    // shared recursive RPC servers, then wait until those handlers are
+    // installed before entering the shard loop. Without this barrier a
+    // loadgen/frontend tick can issue a remote read during the small
+    // window after phase-B reporting but before peer RPC handlers exist.
     phaseb_guard.report_ready();
+    match serve_start_rx.recv() {
+        Ok(()) => {}
+        Err(_) => return,
+    }
     metrics::shards_delta(1);
 
     // Drive the shard's cooperative future set until shutdown. The loop
@@ -1146,6 +1163,12 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
             &peers,
             FingerTableConfig {
                 k: mesh.fingers_per_node.max(1),
+                topology: mesh
+                    .topology_weighting
+                    .as_ref()
+                    .map(p2p_topology_weighting)
+                    .map(TopologySelection::Weighted)
+                    .unwrap_or_default(),
             },
         ))
     };
@@ -1163,6 +1186,19 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
         })
         .collect();
     RouteTableSnapshot { routes }
+}
+
+fn p2p_topology_weighting(weighting: &config::TopologyWeighting) -> TopologyWeighting {
+    TopologyWeighting {
+        prefix_weights: weighting
+            .prefix_weights
+            .iter()
+            .map(|weight| TopologyPrefixWeight {
+                tag_index: weight.tag_index,
+                weight: weight.weight,
+            })
+            .collect(),
+    }
 }
 
 fn reconcile_cache_disks(
@@ -1477,6 +1513,10 @@ enum ShardReady {
 struct ShardPublish {
     backing_base: usize,
     backing_len: usize,
+    /// Fabric memory region for this shard's pool backing. Shared RPC
+    /// workers use it to source owner responses directly from pinned
+    /// bufferpool pages.
+    fabric_mr: MrHandle,
     /// NUMA node this shard's cores and backing are pinned to (`None`
     /// when unpinned). Forwarded into [`PeerPublish`] so every shard can
     /// build its NUMA -> serving-shard table for NUMA-local fetch
@@ -1987,6 +2027,8 @@ mod tests {
                     http_concurrency: Some(64),
                     ca_cert_path: None,
                     insecure_skip_verify: false,
+                    client_cert_path: None,
+                    client_key_path: None,
                 },
             )),
         }

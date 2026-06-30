@@ -50,7 +50,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		slog.Info("watching nodes for storage ring peers", "node", cfg.NodeName, "label", cfg.StorageRingLabel)
-		startRdmaInventoryPublisher(ctx, cfg, watcher.clientset, watcher.signal)
+		startDeviceInventoryPublisher(ctx, cfg, watcher.clientset, watcher.signal)
 	}
 
 	slog.Info("rendering initial config", "source", cfg.SourceDir, "dest", cfg.ConfigPath)

@@ -174,22 +174,22 @@ func TestComputeRingSingleMember(t *testing.T) {
 func TestComputeRDMARingMembership(t *testing.T) {
 	nodes := []*corev1.Node{
 		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:self"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aself`,
 		}),
 		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:a"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aa`,
 		}),
 		nodeWithAnnotations("peer-b", "red", "10.0.0.3", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_1","addrs":["hex:b1","hex:b2"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_1?addr=hex%3Ab1&addr=hex%3Ab2`,
 		}),
 		nodeWithAnnotations("no-rdma", "red", "10.0.0.4", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[]}`,
+			storageRdmaHcasAnnotation: `mlx5_0`,
 		}),
 		nodeWithAnnotations("invalid", "red", "10.0.0.5", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":2,"hcas":[]}`,
+			storageRdmaHcasAnnotation: `?addr=hex%3Ainvalid`,
 		}),
 		nodeWithAnnotations("other", "blue", "10.0.0.6", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:other"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aother`,
 		}),
 	}
 
@@ -217,13 +217,13 @@ func TestComputeRDMARingMembership(t *testing.T) {
 func TestComputeRDMARingRewritesWildcardSocketAddresses(t *testing.T) {
 	nodes := []*corev1.Node{
 		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["0.0.0.0:40000"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_0?addr=0.0.0.0%3A40000`,
 		}),
 		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["0.0.0.0:50000"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_0?addr=0.0.0.0%3A50000`,
 		}),
 		nodeWithAnnotations("peer-b", "red", "fd00::3", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["[::]:60000"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_0?addr=%5B%3A%3A%5D%3A60000`,
 		}),
 	}
 
@@ -251,10 +251,10 @@ func TestComputeRDMARingRewritesWildcardSocketAddresses(t *testing.T) {
 func TestComputeRDMARingPreservesAllPeerAddresses(t *testing.T) {
 	nodes := []*corev1.Node{
 		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:self0"]},{"name":"mlx5_1","addrs":["hex:self1"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aself0,mlx5_1?addr=hex%3Aself1`,
 		}),
 		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:a0"]},{"name":"mlx5_1","addrs":["hex:a1"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aa0,mlx5_1?addr=hex%3Aa1`,
 		}),
 	}
 
@@ -276,10 +276,10 @@ func TestComputeRDMARingPreservesAllPeerAddresses(t *testing.T) {
 func TestComputeRDMARingKeepsNativeAndRoutableSocketAddresses(t *testing.T) {
 	nodes := []*corev1.Node{
 		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:self"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aself`,
 		}),
 		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["10.0.0.9:50000"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_0?addr=10.0.0.9%3A50000`,
 		}),
 	}
 
@@ -302,7 +302,7 @@ func TestComputeRDMARingUsesSelfPlaceholderUntilInventoryPublishes(t *testing.T)
 	nodes := []*corev1.Node{
 		nodeWithAnnotations("self", "red", "10.0.0.1", nil),
 		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:a"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aa`,
 		}),
 	}
 
@@ -325,7 +325,7 @@ func TestComputeRDMARingUsesSelfPlaceholderUntilInventoryPublishes(t *testing.T)
 func TestComputeRDMARingInactiveWhenSelfInvalidInventory(t *testing.T) {
 	nodes := []*corev1.Node{
 		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":2,"hcas":[]}`,
+			storageRdmaHcasAnnotation: `?addr=hex%3Aself`,
 		}),
 	}
 
@@ -336,7 +336,7 @@ func TestComputeRDMARingInactiveWhenSelfInvalidInventory(t *testing.T) {
 
 func TestComputeRDMARingSingleMember(t *testing.T) {
 	nodes := []*corev1.Node{nodeWithAnnotations("self", "red", "", map[string]string{
-		storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:self"]}]}`,
+		storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aself`,
 	})}
 
 	ring := computeRDMARing(nodes, "self", testRingLabel)
@@ -413,10 +413,10 @@ func TestPeerWatcherSnapshotFromInformer(t *testing.T) {
 func TestPeerWatcherSnapshotRdmaFromInformer(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:self"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aself`,
 		}),
 		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
-			storageRdmaHcasAnnotation: `{"schemaVersion":1,"hcas":[{"name":"mlx5_0","addrs":["hex:a"]}]}`,
+			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aa`,
 		}),
 	)
 
@@ -446,11 +446,11 @@ func TestPeerWatcherSnapshotRdmaFromInformer(t *testing.T) {
 func TestPeerWatcherSnapshotIncludesSelfAnnotations(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		nodeWithAnnotations("self", "", "10.0.0.1", map[string]string{
-			storageDisksAnnotation:    "/dev/nvme1n1",
+			allocatedDisksAnnotation:  "/dev/nvme1n1",
 			storageFileSizeAnnotation: "4294967296",
 		}),
 		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
-			storageDisksAnnotation: "/dev/nvme2n1",
+			allocatedDisksAnnotation: "/dev/nvme2n1",
 		}),
 	)
 
@@ -471,6 +471,6 @@ func TestPeerWatcherSnapshotIncludesSelfAnnotations(t *testing.T) {
 	state := w.snapshot(0, false)
 
 	assert.False(t, state.ring.active)
-	assert.Equal(t, "/dev/nvme1n1", state.annotations[storageDisksAnnotation])
+	assert.Equal(t, "/dev/nvme1n1", state.annotations[allocatedDisksAnnotation])
 	assert.Equal(t, "4294967296", state.annotations[storageFileSizeAnnotation])
 }

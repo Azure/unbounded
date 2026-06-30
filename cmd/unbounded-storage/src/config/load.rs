@@ -26,7 +26,7 @@ use std::path::Path;
 use prost::Message;
 
 use super::graph::runtime_projection;
-use super::schema::{backend_spec, disk_spec, frontend_spec, peer_spec, Config};
+use super::schema::{Config, backend_spec, disk_spec, frontend_spec, peer_spec};
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -63,6 +63,11 @@ pub enum ConfigError {
         role: &'static str,
     },
     RoutingPlanDuplicateFinger(String),
+    DuplicateTopologyPrefixWeight(u32),
+    InvalidTopologyPrefixWeight {
+        tag_index: u32,
+        weight: f64,
+    },
     DuplicateBackendName(String),
     DuplicateFrontendName(String),
     DuplicateCacheName(String),
@@ -78,6 +83,7 @@ pub enum ConfigError {
         reason: String,
     },
     ConflictingTlsConfig(String),
+    IncompleteTlsClientAuth(String),
     PlaintextTlsConfig(String),
     EmptyFrontendAddr(String),
     StripeSizeNotPowerOfTwo {
@@ -128,7 +134,10 @@ impl fmt::Display for ConfigError {
                 write!(f, "peer {peer_name:?}: invalid tcp socket address {addr:?}")
             }
             ConfigError::InvalidNativePeerAddr { peer_name, addr } => {
-                write!(f, "peer {peer_name:?}: invalid rdma fabric address {addr:?}")
+                write!(
+                    f,
+                    "peer {peer_name:?}: invalid rdma fabric address {addr:?}"
+                )
             }
             ConfigError::EmptyDiskPath => write!(f, "disk path must not be empty"),
             ConfigError::MissingSelfPeer => write!(
@@ -156,6 +165,14 @@ impl fmt::Display for ConfigError {
             ConfigError::RoutingPlanDuplicateFinger(name) => {
                 write!(f, "routing_plan.fingers contains duplicate peer {name:?}")
             }
+            ConfigError::DuplicateTopologyPrefixWeight(tag_index) => write!(
+                f,
+                "topology_weighting.prefix_weights contains duplicate tag_index {tag_index}"
+            ),
+            ConfigError::InvalidTopologyPrefixWeight { tag_index, weight } => write!(
+                f,
+                "topology_weighting.prefix_weights tag_index {tag_index} has invalid weight {weight}: weight must be finite and have absolute value <= 1000000.0"
+            ),
             ConfigError::DuplicateBackendName(name) => {
                 write!(f, "duplicate backend name: {name:?}")
             }
@@ -184,10 +201,13 @@ impl fmt::Display for ConfigError {
                 f,
                 "backend {name:?}: ca_cert_path and insecure_skip_verify are mutually exclusive"
             ),
-            ConfigError::PlaintextTlsConfig(name) => write!(
+            ConfigError::IncompleteTlsClientAuth(name) => write!(
                 f,
-                "backend {name:?}: ca_cert_path and insecure_skip_verify require an https url"
+                "backend {name:?}: client_cert_path and client_key_path must be set together"
             ),
+            ConfigError::PlaintextTlsConfig(name) => {
+                write!(f, "backend {name:?}: TLS settings require an https url")
+            }
             ConfigError::EmptyFrontendAddr(id) => {
                 write!(f, "frontend {id:?}: addr must not be empty")
             }
@@ -302,6 +322,8 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
                     &cfg.url,
                     &cfg.ca_cert_path,
                     cfg.insecure_skip_verify,
+                    &cfg.client_cert_path,
+                    &cfg.client_key_path,
                 )?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
@@ -311,6 +333,8 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
                     &cfg.url,
                     &cfg.ca_cert_path,
                     cfg.insecure_skip_verify,
+                    &cfg.client_cert_path,
+                    &cfg.client_key_path,
                 )?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
@@ -320,6 +344,8 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
                     &cfg.url,
                     &cfg.ca_cert_path,
                     cfg.insecure_skip_verify,
+                    &cfg.client_cert_path,
+                    &cfg.client_key_path,
                 )?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
@@ -400,6 +426,8 @@ fn validate_backend_url(
     url: &str,
     ca_cert_path: &Option<String>,
     insecure_skip_verify: bool,
+    client_cert_path: &Option<String>,
+    client_key_path: &Option<String>,
 ) -> Result<(), ConfigError> {
     if url.is_empty() {
         return Err(ConfigError::EmptyBackendUrl(backend_name.to_string()));
@@ -413,7 +441,17 @@ fn validate_backend_url(
     if ca_cert_path.is_some() && insecure_skip_verify {
         return Err(ConfigError::ConflictingTlsConfig(backend_name.to_string()));
     }
-    if !parsed.scheme.is_tls() && (ca_cert_path.is_some() || insecure_skip_verify) {
+    if client_cert_path.is_some() != client_key_path.is_some() {
+        return Err(ConfigError::IncompleteTlsClientAuth(
+            backend_name.to_string(),
+        ));
+    }
+    if !parsed.scheme.is_tls()
+        && (ca_cert_path.is_some()
+            || insecure_skip_verify
+            || client_cert_path.is_some()
+            || client_key_path.is_some())
+    {
         return Err(ConfigError::PlaintextTlsConfig(backend_name.to_string()));
     }
 
@@ -521,6 +559,21 @@ fn validate_mesh(cfg: &Config) -> Result<(), ConfigError> {
                 return Err(ConfigError::RoutingPlanUnknownPeer {
                     name: name.to_string(),
                     role,
+                });
+            }
+        }
+    }
+
+    if let Some(weighting) = &cfg.topology_weighting {
+        let mut seen_weights = HashSet::new();
+        for weight in &weighting.prefix_weights {
+            if !seen_weights.insert(weight.tag_index) {
+                return Err(ConfigError::DuplicateTopologyPrefixWeight(weight.tag_index));
+            }
+            if !weight.weight.is_finite() || weight.weight.abs() > 1_000_000.0 {
+                return Err(ConfigError::InvalidTopologyPrefixWeight {
+                    tag_index: weight.tag_index,
+                    weight: weight.weight,
                 });
             }
         }
@@ -784,6 +837,67 @@ addr = "not-an-addr"
         match load(f.path()) {
             Err(ConfigError::InvalidTcpAddr { peer_name, .. }) if peer_name == "node-b" => {}
             other => panic!("expected InvalidTcpAddr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_topology_prefix_weights() {
+        let s = format!(
+            r#"{}
+[topology_weighting]
+
+[[topology_weighting.prefix_weights]]
+tag_index = 1
+weight = 0.25
+
+[[topology_weighting.prefix_weights]]
+tag_index = 1
+weight = -0.5
+"#,
+            mesh_toml()
+        );
+        let f = write_cfg(&s);
+        match load(f.path()) {
+            Err(ConfigError::DuplicateTopologyPrefixWeight(1)) => {}
+            other => panic!("expected DuplicateTopologyPrefixWeight, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_topology_prefix_weight() {
+        let s = format!(
+            r#"{}
+[topology_weighting]
+
+[[topology_weighting.prefix_weights]]
+tag_index = 0
+weight = inf
+"#,
+            mesh_toml()
+        );
+        let f = write_cfg(&s);
+        match load(f.path()) {
+            Err(ConfigError::InvalidTopologyPrefixWeight { tag_index: 0, .. }) => {}
+            other => panic!("expected InvalidTopologyPrefixWeight, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_excessive_topology_prefix_weight() {
+        let s = format!(
+            r#"{}
+[topology_weighting]
+
+[[topology_weighting.prefix_weights]]
+tag_index = 0
+weight = 1000000.1
+"#,
+            mesh_toml()
+        );
+        let f = write_cfg(&s);
+        match load(f.path()) {
+            Err(ConfigError::InvalidTopologyPrefixWeight { tag_index: 0, .. }) => {}
+            other => panic!("expected InvalidTopologyPrefixWeight, got {other:?}"),
         }
     }
 
@@ -1295,6 +1409,58 @@ name = "b"
 [backends.config.http]
 url = "http://e"
 insecure_skip_verify = true
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::PlaintextTlsConfig(name)) if name == "b" => {}
+            other => panic!("expected PlaintextTlsConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_client_cert_without_client_key() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "https://e"
+client_cert_path = "/etc/client.pem"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::IncompleteTlsClientAuth(name)) if name == "b" => {}
+            other => panic!("expected IncompleteTlsClientAuth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_client_key_without_client_cert() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "https://e"
+client_key_path = "/etc/client-key.pem"
+"#;
+        let f = write_cfg(s);
+        match load(f.path()) {
+            Err(ConfigError::IncompleteTlsClientAuth(name)) if name == "b" => {}
+            other => panic!("expected IncompleteTlsClientAuth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_client_auth_on_plaintext_url() {
+        let s = r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "http://e"
+client_cert_path = "/etc/client.pem"
+client_key_path = "/etc/client-key.pem"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {

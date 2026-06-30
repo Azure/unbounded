@@ -44,6 +44,9 @@ pub struct Workload {
     /// is the miss-only regime where every fetch goes through the
     /// transport.
     pub cache_hit_rate: u32,
+    /// Whether pages fetched by the pool may be retained in the RAM
+    /// page cache after their consumers drop them.
+    pub page_cache_enabled: bool,
     /// `PoolConfig::max_concurrent_streams`. Defaults set this high
     /// enough to never trigger; the strategy occasionally chooses a
     /// small value so `Pool::read` returns `Error::StreamLimit` and
@@ -244,6 +247,10 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
         3 => 1u32..=80,     // mixed hits / misses
         1 => Just(100u32),  // all hits: tee never runs
     ];
+    let page_cache_enabled = prop_oneof![
+        8 => Just(true),
+        2 => Just(false),
+    ];
     // Default to a limit well above the client count so most cases
     // exercise the happy path; a meaningful minority drops it low
     // enough that some `Pool::read` calls must be rejected with
@@ -269,6 +276,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
         max_io_delay,
         io_fault_rate,
         cache_hit_rate,
+        page_cache_enabled,
         max_concurrent_streams,
         max_inflight_pages,
         key_count,
@@ -281,6 +289,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
                 max_io_delay,
                 io_fault_rate,
                 cache_hit_rate,
+                page_cache_enabled,
                 max_concurrent_streams,
                 max_inflight_pages,
                 key_count,
@@ -291,6 +300,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
                 max_io_delay,
                 io_fault_rate,
                 cache_hit_rate,
+                page_cache_enabled,
                 max_concurrent_streams,
                 max_inflight_pages,
                 key_count,
@@ -356,6 +366,10 @@ pub fn pipelined_workload_strategy() -> impl Strategy<Value = Workload> {
         3 => 1u32..=80,
         1 => Just(100u32),
     ];
+    let page_cache_enabled = prop_oneof![
+        8 => Just(true),
+        2 => Just(false),
+    ];
     let max_inflight_pages = 1usize..=8;
     let key_count = 1u8..=3;
     let pipelines = vec(pipeline_strategy(), 1..=4);
@@ -366,6 +380,7 @@ pub fn pipelined_workload_strategy() -> impl Strategy<Value = Workload> {
         max_io_delay,
         io_fault_rate,
         cache_hit_rate,
+        page_cache_enabled,
         max_inflight_pages,
         key_count,
         pipelines,
@@ -377,6 +392,7 @@ pub fn pipelined_workload_strategy() -> impl Strategy<Value = Workload> {
                 max_io_delay,
                 io_fault_rate,
                 cache_hit_rate,
+                page_cache_enabled,
                 max_inflight_pages,
                 key_count,
                 pipelines,
@@ -386,6 +402,7 @@ pub fn pipelined_workload_strategy() -> impl Strategy<Value = Workload> {
                 max_io_delay,
                 io_fault_rate,
                 cache_hit_rate,
+                page_cache_enabled,
                 // Pinned high: pipelined admission must not be
                 // rejected, so every plan slice gets a stream.
                 max_concurrent_streams: 1024,
@@ -456,7 +473,9 @@ pub enum ClientOutcome {
 pub struct RunReport {
     pub outcomes: Vec<ClientOutcome>,
     pub free_pages_at_end: usize,
+    pub cached_pages_at_end: usize,
     pub inflight_entries_at_end: usize,
+    pub active_inflight_entries_at_end: usize,
     /// Global speculative-prefetch budget still reserved at
     /// quiescence. Must be `0`: every windowed prefetch reservation
     /// is balanced on consume or drop.
@@ -525,6 +544,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     );
     let blockstore = DstBlockStore::new(counts.clone(), stripes.clone(), mock_cfg.clone());
     blockstore.set_hit_rate(w.cache_hit_rate);
+    blockstore.set_page_cache_enabled(w.page_cache_enabled);
 
     let pool = Rc::new(
         Pool::new(
@@ -658,7 +678,9 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     exec.run(step_budget)?;
 
     let free_pages_at_end = pool.free_pages();
+    let cached_pages_at_end = pool.cached_pages();
     let inflight_entries_at_end = pool.inflight_entries();
+    let active_inflight_entries_at_end = pool.active_inflight_entries();
     let prefetch_inflight_at_end = pool.prefetch_inflight();
 
     // Drain the outcomes vec; by this point all tasks have completed
@@ -673,7 +695,9 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     Ok(RunReport {
         outcomes,
         free_pages_at_end,
+        cached_pages_at_end,
         inflight_entries_at_end,
+        active_inflight_entries_at_end,
         prefetch_inflight_at_end,
         bulk_get_calls: counts.bulk_get.get(),
         bulk_get_by_page,
@@ -706,7 +730,7 @@ impl Drop for HeapOwner {
     }
 }
 
-fn heap_backing(page_size: usize, page_count: usize) -> Backing {
+pub fn heap_backing(page_size: usize, page_count: usize) -> Backing {
     let layout = std::alloc::Layout::from_size_align(page_size * page_count, page_size)
         .expect("valid layout");
     // SAFETY: layout has nonzero size and a power-of-two align.

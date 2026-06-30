@@ -5,9 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::schema::{Config, DiskSpec, PeerSpec, RoutingPlan};
+use super::schema::{Config, DiskSpec, PeerSpec, RoutingPlan, TopologyWeighting};
 use crate::fabric::PeerId;
-use crate::p2p::{node_id_from_name, NodeId};
+use crate::p2p::{NodeId, node_id_from_name};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFrontendBinding {
@@ -25,6 +25,7 @@ pub struct RuntimeMesh {
     pub self_peer_id: PeerId,
     pub self_tags: Vec<String>,
     pub routing_plan: Option<RoutingPlan>,
+    pub topology_weighting: Option<TopologyWeighting>,
     pub peers: Vec<RuntimePeer>,
 }
 
@@ -200,6 +201,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
             self_peer_id,
             self_tags,
             routing_plan: config.routing_plan.clone(),
+            topology_weighting: config.topology_weighting.clone(),
             peers,
         },
         frontends: bindings,
@@ -249,8 +251,9 @@ fn by_id<'a, T>(items: &'a [T], id: impl Fn(&'a T) -> &'a str) -> HashMap<&'a st
 #[cfg(test)]
 mod tests {
     use super::super::schema::{
-        backend_spec, frontend_spec, peer_spec, BackendSpec, CacheSpec, FrontendSpec,
-        HttpBackendConfig, HttpFrontendConfig, PeerSpec, RdmaPeerConfig, TcpPeerConfig,
+        BackendSpec, CacheSpec, FrontendSpec, HttpBackendConfig, HttpFrontendConfig, PeerSpec,
+        RdmaPeerConfig, TcpPeerConfig, TopologyPrefixWeight, TopologyWeighting, backend_spec,
+        frontend_spec, peer_spec,
     };
     use super::*;
 
@@ -263,6 +266,8 @@ mod tests {
                 http_concurrency: Some(64),
                 ca_cert_path: None,
                 insecure_skip_verify: false,
+                client_cert_path: None,
+                client_key_path: None,
             })),
         }
     }
@@ -345,6 +350,30 @@ mod tests {
             peers[0].fabric_peer_id,
             PeerId(node_id_from_name("node-b").0)
         );
+    }
+
+    #[test]
+    fn runtime_projection_carries_topology_weighting() {
+        let mut cfg = Config::default();
+        cfg.backends.push(backend("b"));
+        cfg.self_ = "node-a".to_string();
+        cfg.peers.push(tcp_peer("node-a", "127.0.0.1:1"));
+        cfg.topology_weighting = Some(TopologyWeighting {
+            prefix_weights: vec![TopologyPrefixWeight {
+                tag_index: 1,
+                weight: -0.25,
+            }],
+        });
+
+        let graph = runtime_projection(&cfg).unwrap();
+
+        let weighting = graph
+            .mesh
+            .topology_weighting
+            .as_ref()
+            .expect("topology weighting projected");
+        assert_eq!(weighting.prefix_weights[0].tag_index, 1);
+        assert_eq!(weighting.prefix_weights[0].weight, -0.25);
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub use completion::{CompletionFuture, CompletionInfo, CompletionRegistry, Compl
 pub use config::{FabricConfig, Provider, apply_tcp_env_defaults, defaults_for};
 pub use error::{FabricError, Result, check};
 pub use fabric::{Fabric, provider_available};
-pub use handler::{Handler, HandlerStream};
+pub use handler::{FabricPage, Handler, HandlerStream, PageRelease, PageSource};
 pub use pool_handler::{PoolHandler, PoolHandlerError, PoolHandlerStream};
 pub use rpc::{
     MAX_HOPS, PageWritePlan, RequestHeader, RequestPlan, RpcServer, RpcServerHandle,

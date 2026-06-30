@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 
 use rand::Rng;
 use unbounded_storage::bufferpool::{
-    BlockStore, BulkRef, Error, PageRef, PageStream, Req, StripeKey, Transport,
+    BlockStore, BulkRef, Error, PageCachePolicy, PageRef, PageStream, Req, StripeKey, Transport,
 };
 use unbounded_storage::memory::Backing;
 
@@ -31,7 +31,6 @@ use crate::framework::executor::{with_sim, yield_n};
 /// framework's [`SimState`]. Held behind an `Rc` so both mocks plus
 /// the workload driver can share a single configuration instance
 /// without leaking knowledge into the framework crate.
-#[derive(Default)]
 pub struct MockSimConfig {
     /// Maximum number of `yield_once` pends an I/O mock will emit
     /// before completing. The actual count per call is drawn from
@@ -42,6 +41,19 @@ pub struct MockSimConfig {
     /// happy-path regime); positive values exercise the
     /// leader-error / `ParkOutcome::Error` paths in `pool.rs`.
     pub io_fault_rate: Cell<u32>,
+    /// Whether fetched pages may be retained in the bufferpool's RAM
+    /// page cache once all consumers drop their guards.
+    pub page_cache_enabled: Cell<bool>,
+}
+
+impl Default for MockSimConfig {
+    fn default() -> Self {
+        Self {
+            max_io_delay: Cell::new(0),
+            io_fault_rate: Cell::new(0),
+            page_cache_enabled: Cell::new(true),
+        }
+    }
 }
 
 impl MockSimConfig {
@@ -90,6 +102,8 @@ pub struct CallCounts {
     /// `(key, page_no) -> bulk_get count` for the single-flight
     /// invariant. Keyed by intra-stripe page number, not byte offset.
     pub bulk_get_by_page: RefCell<HashMap<(StripeKey, u64), u32>>,
+    pub bulk_get_total_inflight: Cell<u32>,
+    pub bulk_get_max_total_inflight: Cell<u32>,
     /// `(key, page_no) -> max observed in-flight `bulk_get`s`. The
     /// single-flight invariant tolerates sequential re-issues
     /// (slot recycled, then refetched later) but forbids two
@@ -190,6 +204,11 @@ struct InflightGuard<'a> {
 
 impl<'a> InflightGuard<'a> {
     fn enter(counts: &'a CallCounts, key: StripeKey, page_no: u64) -> Self {
+        let total = counts.bulk_get_total_inflight.get() + 1;
+        counts.bulk_get_total_inflight.set(total);
+        if total > counts.bulk_get_max_total_inflight.get() {
+            counts.bulk_get_max_total_inflight.set(total);
+        }
         let mut inflight = counts.bulk_get_inflight.borrow_mut();
         let entry = inflight.entry((key, page_no)).or_insert(0);
         *entry += 1;
@@ -209,6 +228,9 @@ impl<'a> InflightGuard<'a> {
 
 impl<'a> Drop for InflightGuard<'a> {
     fn drop(&mut self) {
+        self.counts
+            .bulk_get_total_inflight
+            .set(self.counts.bulk_get_total_inflight.get().saturating_sub(1));
         let mut inflight = self.counts.bulk_get_inflight.borrow_mut();
         if let Some(e) = inflight.get_mut(&(self.key, self.page_no)) {
             *e = e.saturating_sub(1);
@@ -299,6 +321,10 @@ impl DstBlockStore {
     pub fn set_hit_rate(&self, pct: u32) {
         self.hit_rate.set(pct.min(100));
     }
+
+    pub fn set_page_cache_enabled(&self, enabled: bool) {
+        self.cfg.page_cache_enabled.set(enabled);
+    }
 }
 
 impl BlockStore for DstBlockStore {
@@ -306,6 +332,14 @@ impl BlockStore for DstBlockStore {
         self.base.set(Some(backing.base));
         self.page_size.set(backing.page_size);
         Ok(())
+    }
+
+    fn page_cache_policy<R: Req + ?Sized>(&self, _req: &R) -> PageCachePolicy {
+        if self.cfg.page_cache_enabled.get() {
+            PageCachePolicy::Enabled
+        } else {
+            PageCachePolicy::Disabled
+        }
     }
 
     async fn read_page<R: Req + ?Sized>(

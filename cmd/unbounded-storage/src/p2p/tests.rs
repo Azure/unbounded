@@ -62,7 +62,7 @@ fn synthetic_ring(n: u64) -> Vec<PeerEntry> {
 fn build_tables(peers: &[PeerEntry], k: u32) -> Vec<FingerTable> {
     peers
         .iter()
-        .map(|p| FingerTable::build(p.clone(), peers, FingerTableConfig { k }))
+        .map(|p| FingerTable::build(p.clone(), peers, FingerTableConfig::with_k(k)))
         .collect()
 }
 

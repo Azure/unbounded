@@ -14,8 +14,8 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use crate::bufferpool::{
-    BlockStore, BufferPool, BulkRef, Error, PageRef, PageStream, Pool, PoolConfig, Req, StripeKey,
-    StripePlan, Transport,
+    BlockStore, BufferPool, BulkRef, Error, PageCachePolicy, PageRef, PageStream, Pool, PoolConfig,
+    Req, StripeKey, StripePlan, Transport,
 };
 use crate::memory::Backing;
 use crate::runtime::noop_waker;
@@ -116,6 +116,7 @@ fn heap_backing(page_size: usize, page_count: usize) -> Backing {
 struct TestReq {
     key: StripeKey,
     bypass: bool,
+    cache_id: Option<String>,
 }
 
 impl Req for TestReq {
@@ -125,6 +126,36 @@ impl Req for TestReq {
 
     fn bypass(&self) -> bool {
         self.bypass
+    }
+
+    fn cache_id(&self) -> Option<&String> {
+        self.cache_id.as_ref()
+    }
+}
+
+impl TestReq {
+    fn new(key: StripeKey) -> Self {
+        Self {
+            key,
+            bypass: false,
+            cache_id: None,
+        }
+    }
+
+    fn bypass(key: StripeKey) -> Self {
+        Self {
+            key,
+            bypass: true,
+            cache_id: None,
+        }
+    }
+
+    fn with_cache_id(key: StripeKey, cache_id: &str) -> Self {
+        Self {
+            key,
+            bypass: false,
+            cache_id: Some(cache_id.to_string()),
+        }
     }
 }
 
@@ -304,6 +335,7 @@ struct MockBlockStore {
     writes: RefCell<u32>,
     /// `write_page` pends this many polls before completing.
     write_pend_polls: RefCell<usize>,
+    page_cache_enabled: RefCell<HashMap<Option<String>, bool>>,
     base: RefCell<Option<*mut u8>>,
     page_size: RefCell<usize>,
 }
@@ -315,6 +347,7 @@ impl MockBlockStore {
             reads: RefCell::new(0),
             writes: RefCell::new(0),
             write_pend_polls: RefCell::new(0),
+            page_cache_enabled: RefCell::new(HashMap::new()),
             base: RefCell::new(None),
             page_size: RefCell::new(0),
         }
@@ -334,6 +367,16 @@ impl MockBlockStore {
 
     fn set_write_pend_polls(&self, n: usize) {
         *self.write_pend_polls.borrow_mut() = n;
+    }
+
+    fn set_page_cache_enabled(&self, enabled: bool) {
+        self.set_page_cache_enabled_for(None, enabled);
+    }
+
+    fn set_page_cache_enabled_for(&self, cache_id: Option<&str>, enabled: bool) {
+        self.page_cache_enabled
+            .borrow_mut()
+            .insert(cache_id.map(ToString::to_string), enabled);
     }
 }
 
@@ -390,6 +433,24 @@ impl BlockStore for MockBlockStore {
         }
         self.cache.borrow_mut().insert((key, stripe_off), buf);
         Ok(())
+    }
+
+    fn page_cache_enabled<R: Req + ?Sized>(&self, _req: &R, _stripe_off: u64) -> bool {
+        unreachable!("tests use page_cache_policy snapshots")
+    }
+
+    fn page_cache_policy<R: Req + ?Sized>(&self, req: &R) -> PageCachePolicy {
+        let enabled = self
+            .page_cache_enabled
+            .borrow()
+            .get(&req.cache_id().cloned())
+            .copied()
+            .unwrap_or(true);
+        if enabled {
+            PageCachePolicy::Enabled
+        } else {
+            PageCachePolicy::Disabled
+        }
     }
 }
 
@@ -462,11 +523,29 @@ impl BlockStore for BlockStoreRc {
     ) -> Result<(), Error> {
         self.0.write_page(req, stripe_off, page).await
     }
+    fn page_cache_enabled<R: Req + ?Sized>(&self, req: &R, stripe_off: u64) -> bool {
+        self.0.page_cache_enabled(req, stripe_off)
+    }
+    fn page_cache_policy<R: Req + ?Sized>(&self, req: &R) -> PageCachePolicy {
+        self.0.page_cache_policy(req)
+    }
 }
 
 fn make_pool_v2(
     page_size: usize,
     page_count: usize,
+) -> (
+    Pool<TransportRc, BlockStoreRc, TestReq>,
+    Rc<MockTransport>,
+    Rc<MockBlockStore>,
+) {
+    make_pool_with_config(page_size, page_count, PoolConfig::default())
+}
+
+fn make_pool_with_config(
+    page_size: usize,
+    page_count: usize,
+    cfg: PoolConfig,
 ) -> (
     Pool<TransportRc, BlockStoreRc, TestReq>,
     Rc<MockTransport>,
@@ -479,13 +558,30 @@ fn make_pool_v2(
     let t = Rc::new(MockTransport::new(backing.base, backing.page_size));
     let s = Rc::new(MockBlockStore::new());
     let pool = Pool::new(
-        PoolConfig::default(),
+        cfg,
         backing,
         TransportRc(t.clone()),
         BlockStoreRc(s.clone()),
     )
     .unwrap();
     (pool, t, s)
+}
+
+fn assert_quiescent(
+    pool: &Pool<TransportRc, BlockStoreRc, TestReq>,
+    page_count: usize,
+    context: &str,
+) {
+    assert_eq!(
+        pool.free_pages() + pool.cached_pages(),
+        page_count,
+        "{context}: pages must be free or idle-cached",
+    );
+    assert_eq!(
+        pool.active_inflight_entries(),
+        0,
+        "{context}: active inflight entries must drain",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -503,10 +599,7 @@ fn disk_hit_returns_bytes_no_transport_call() {
     }
     store.preload(k, 0, data.clone());
 
-    let req = TestReq {
-        key: k,
-        bypass: false,
-    };
+    let req = TestReq::new(k);
     let bytes = block_on(async {
         let mut s = pool.read(&req, 0, P as u64).await.unwrap();
         let g = s.next_page().await.unwrap().unwrap();
@@ -519,8 +612,7 @@ fn disk_hit_returns_bytes_no_transport_call() {
     assert_eq!(transport.calls(), 0, "no transport call on disk hit");
     assert_eq!(store.reads(), 1);
     assert_eq!(store.writes(), 0);
-    assert_eq!(pool.free_pages(), 4, "all pages returned");
-    assert_eq!(pool.inflight_entries(), 0, "inflight cleaned up");
+    assert_quiescent(&pool, 4, "disk hit");
 }
 
 #[test]
@@ -534,10 +626,7 @@ fn disk_miss_peer_fetch_with_tee_writes_blockstore() {
     }
     transport.put_stripe(k, stripe.clone());
 
-    let req = TestReq {
-        key: k,
-        bypass: false,
-    };
+    let req = TestReq::new(k);
     let bytes = block_on(async {
         let mut s = pool.read(&req, 0, P as u64).await.unwrap();
         let g = s.next_page().await.unwrap().unwrap();
@@ -546,8 +635,255 @@ fn disk_miss_peer_fetch_with_tee_writes_blockstore() {
     assert_eq!(bytes, stripe[..P]);
     assert_eq!(transport.calls(), 1);
     assert_eq!(store.writes(), 1, "tee landed");
-    assert_eq!(pool.free_pages(), 4);
-    assert_eq!(pool.inflight_entries(), 0);
+    assert_quiescent(&pool, 4, "disk miss");
+}
+
+#[test]
+fn released_ready_page_hits_ram_cache_on_second_read() {
+    const P: usize = 4096;
+    crate::metrics::init();
+    let (pool, transport, store) = make_pool_v2(P, 2);
+    let k = key(0xB1);
+    let stripe: Vec<u8> = (0..P).map(|i| ((i + 11) & 0xff) as u8).collect();
+    transport.put_stripe(k, stripe.clone());
+
+    let req = TestReq::new(k);
+    for _ in 0..2 {
+        let bytes = block_on(async {
+            let mut s = pool.read(&req, 0, P as u64).await.unwrap();
+            s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+        });
+        assert_eq!(bytes, stripe);
+    }
+
+    assert_eq!(transport.calls(), 1, "second read reused RAM page");
+    assert_eq!(store.reads(), 1, "second read skipped disk too");
+    assert_eq!(pool.cached_pages(), 1);
+    assert_quiescent(&pool, 2, "ram cache hit");
+    let versions = crate::config::ConfigVersionStatus::new(0);
+    let text = String::from_utf8(crate::metrics::render(&versions)).unwrap();
+    for result in ["miss", "hit"] {
+        assert!(text.contains(&format!(
+            "unbounded_storage_bufferpool_page_cache_requests_total{{result=\"{result}\"}}"
+        )));
+    }
+}
+
+#[test]
+fn disk_page_cache_policy_drains_and_prevents_ram_hits() {
+    const P: usize = 4096;
+    let (pool, transport, store) = make_pool_v2(P, 2);
+    let k = key(0xB7);
+    let stripe: Vec<u8> = (0..P).map(|i| ((i + 17) & 0xff) as u8).collect();
+    transport.put_stripe(k, stripe.clone());
+
+    let req = TestReq::new(k);
+    let bytes = block_on(async {
+        let mut s = pool.read(&req, 0, P as u64).await.unwrap();
+        s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+    });
+    assert_eq!(bytes, stripe);
+    assert_eq!(pool.cached_pages(), 1, "normal read warmed RAM cache");
+
+    store.set_page_cache_enabled(false);
+    pool.drain_page_cache();
+    assert_eq!(pool.cached_pages(), 0, "disable drains idle cached pages");
+    assert_eq!(pool.free_pages(), 2);
+
+    let bytes = block_on(async {
+        let mut s = pool.read(&req, 0, P as u64).await.unwrap();
+        s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+    });
+
+    assert_eq!(bytes, stripe);
+    assert_eq!(transport.calls(), 1, "second read was served from disk tee");
+    assert_eq!(store.reads(), 2, "second read missed RAM and checked disk");
+    assert_eq!(
+        pool.cached_pages(),
+        0,
+        "disabled cache does not retain pages"
+    );
+    assert_quiescent(&pool, 2, "disabled page cache");
+}
+
+#[test]
+fn drain_page_cache_disables_retention_for_existing_streams() {
+    const P: usize = 4096;
+    let (pool, transport, store) = make_pool_v2(P, 4);
+    let k = key(0xB9);
+    let stripe: Vec<u8> = (0..P * 2).map(|i| ((i + 19) & 0xff) as u8).collect();
+    transport.put_stripe(k, stripe.clone());
+
+    let req = TestReq::new(k);
+    let (first, second) = block_on(async {
+        let mut s = pool.read(&req, 0, (P * 2) as u64).await.unwrap();
+        let first = s.next_page().await.unwrap().unwrap().as_slice().to_vec();
+        store.set_page_cache_enabled(false);
+        pool.drain_page_cache();
+        let second = s.next_page().await.unwrap().unwrap().as_slice().to_vec();
+        (first, second)
+    });
+
+    assert_eq!(first, stripe[..P]);
+    assert_eq!(second, stripe[P..]);
+    assert_eq!(transport.calls(), 2, "both pages fetched from transport");
+    assert_eq!(
+        pool.cached_pages(),
+        0,
+        "pre-drain stream must not refill RAM cache"
+    );
+    assert_quiescent(&pool, 4, "drained existing stream");
+}
+
+#[test]
+fn disabled_leader_policy_controls_coalesced_retention() {
+    const P: usize = 4096;
+    let (pool, transport, store) = make_pool_v2(P, 4);
+    let k = key(0xB8);
+    let stripe: Vec<u8> = (0..P).map(|i| ((i + 23) & 0xff) as u8).collect();
+    transport.put_stripe(k, stripe.clone());
+    transport.set_pend_polls(2);
+    store.set_page_cache_enabled_for(Some("disabled"), false);
+    store.set_page_cache_enabled_for(Some("enabled"), true);
+
+    let disabled_leader = TestReq::with_cache_id(k, "disabled");
+    let enabled_coalescer = TestReq::with_cache_id(k, "enabled");
+    let f1 = async {
+        let mut s = pool.read(&disabled_leader, 0, P as u64).await.unwrap();
+        s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+    };
+    let f2 = async {
+        let mut s = pool.read(&enabled_coalescer, 0, P as u64).await.unwrap();
+        s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+    };
+
+    let (b1, b2) = block_on_two(f1, f2);
+
+    assert_eq!(b1, stripe);
+    assert_eq!(b2, stripe);
+    assert_eq!(transport.calls(), 1, "reads coalesced behind one leader");
+    assert_eq!(pool.cached_pages(), 0, "leader policy controls retention");
+    assert_quiescent(&pool, 4, "coalesced disabled leader policy");
+}
+
+#[test]
+fn bypass_request_ignores_idle_ram_cached_page() {
+    const P: usize = 4096;
+    let (pool, transport, store) = make_pool_v2(P, 2);
+    let k = key(0xB6);
+    let initial = vec![0x11; P];
+    let updated = vec![0x22; P];
+    transport.put_stripe(k, initial.clone());
+
+    let normal = TestReq::new(k);
+    let bytes = block_on(async {
+        let mut s = pool.read(&normal, 0, P as u64).await.unwrap();
+        s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+    });
+    assert_eq!(bytes, initial);
+    assert_eq!(pool.cached_pages(), 1, "normal read warmed RAM cache");
+
+    transport.put_stripe(k, updated.clone());
+    let bypass = TestReq::bypass(k);
+    let bytes = block_on(async {
+        let mut s = pool.read(&bypass, 0, P as u64).await.unwrap();
+        s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+    });
+
+    assert_eq!(bytes, updated, "bypass must read origin bytes");
+    assert_eq!(transport.calls(), 2, "bypass must not hit RAM cache");
+    assert_eq!(store.reads(), 1, "bypass skips the disk cache read");
+    assert_eq!(store.writes(), 1, "bypass skips the tee writeback");
+    assert_quiescent(&pool, 2, "bypass ram cache miss");
+}
+
+#[test]
+fn owned_stream_can_claim_later_cached_page_before_head() {
+    const P: usize = 1024;
+    let (pool, transport, _store) = make_pool_v2(P, 4);
+    let k = key(0xB5);
+    let mut stripe = vec![0u8; P * 2];
+    for (i, b) in stripe.iter_mut().enumerate() {
+        *b = ((i + 19) & 0xff) as u8;
+    }
+    transport.put_stripe(k, stripe.clone());
+
+    let req = TestReq::new(k);
+    let warm = block_on(async {
+        let mut out = Vec::new();
+        let mut s = pool.read(&req, 0, (P * 2) as u64).await.unwrap();
+        while let Some(page) = s.next_page().await {
+            out.extend_from_slice(page.unwrap().as_slice());
+        }
+        out
+    });
+    assert_eq!(warm, stripe);
+    assert_eq!(transport.calls(), 2);
+    assert_eq!(pool.cached_pages(), 2);
+
+    block_on(async {
+        let stream = pool.read_owned(&req, 0, (P * 2) as u64).unwrap();
+        let page1 = stream
+            .try_ready_page_owned_at(1)
+            .expect("page 1 should already be ready")
+            .unwrap();
+        assert_eq!(page1.as_slice(), &stripe[P..]);
+        assert_eq!(pool.cached_pages(), 1, "page 1 is now active, not idle");
+
+        let page0 = stream
+            .page_owned_at(0)
+            .await
+            .expect("page 0 is in range")
+            .unwrap();
+        assert_eq!(page0.as_slice(), &stripe[..P]);
+    });
+
+    assert_eq!(transport.calls(), 2, "owned read reused cached pages");
+    assert_quiescent(&pool, 4, "out-of-order owned cache claim");
+}
+
+#[test]
+fn allocation_pressure_evicts_oldest_idle_cached_page() {
+    const P: usize = 4096;
+    let (pool, transport, store) = make_pool_v2(P, 2);
+    let keys = [key(0xB2), key(0xB3), key(0xB4)];
+    let stripes: Vec<Vec<u8>> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let bytes = vec![0x20 + i as u8; P];
+            transport.put_stripe(*k, bytes.clone());
+            bytes
+        })
+        .collect();
+
+    for (i, k) in keys.iter().enumerate() {
+        let req = TestReq::new(*k);
+        let bytes = block_on(async {
+            let mut s = pool.read(&req, 0, P as u64).await.unwrap();
+            s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+        });
+        assert_eq!(bytes, stripes[i]);
+    }
+
+    assert_eq!(transport.calls(), 3, "third distinct page evicted LRU");
+    assert_eq!(pool.cached_pages(), 2, "cache is bounded by backing pages");
+    assert_eq!(pool.free_pages(), 0);
+    assert_quiescent(&pool, 2, "after pressure eviction");
+
+    let req = TestReq::new(keys[0]);
+    let bytes = block_on(async {
+        let mut s = pool.read(&req, 0, P as u64).await.unwrap();
+        s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+    });
+    assert_eq!(bytes, stripes[0]);
+    assert_eq!(
+        transport.calls(),
+        3,
+        "evicted page was reread from disk tee, not RAM",
+    );
+    assert_eq!(store.reads(), 4, "every RAM miss consulted disk first");
+    assert_quiescent(&pool, 2, "after LRU refetch");
 }
 
 #[test]
@@ -565,10 +901,7 @@ fn bypass_request_skips_blockstore_read_and_tee() {
     }
     transport.put_stripe(k, stripe.clone());
 
-    let req = TestReq {
-        key: k,
-        bypass: true,
-    };
+    let req = TestReq::bypass(k);
     let bytes = block_on(async {
         let mut s = pool.read(&req, 0, P as u64).await.unwrap();
         let g = s.next_page().await.unwrap().unwrap();
@@ -578,8 +911,7 @@ fn bypass_request_skips_blockstore_read_and_tee() {
     assert_eq!(transport.calls(), 1, "transport drove the fetch");
     assert_eq!(store.reads(), 0, "bypass skips the disk cache read");
     assert_eq!(store.writes(), 0, "bypass skips the tee writeback");
-    assert_eq!(pool.free_pages(), 4);
-    assert_eq!(pool.inflight_entries(), 0);
+    assert_quiescent(&pool, 4, "bypass miss");
 }
 
 #[test]
@@ -601,10 +933,7 @@ fn bypass_request_ignores_disk_resident_page() {
     }
     transport.put_stripe(k, origin.clone());
 
-    let req = TestReq {
-        key: k,
-        bypass: true,
-    };
+    let req = TestReq::bypass(k);
     let bytes = block_on(async {
         let mut s = pool.read(&req, 0, P as u64).await.unwrap();
         let g = s.next_page().await.unwrap().unwrap();
@@ -631,10 +960,7 @@ fn multi_page_window_with_intra_page_offsets() {
     // on first and last.
     let off = (P / 2) as u64;
     let len = (P + P) as u64; // total 2*P bytes; spans 3 pages
-    let req = TestReq {
-        key: k,
-        bypass: false,
-    };
+    let req = TestReq::new(k);
     let bytes = block_on(async {
         let mut out = Vec::new();
         let mut s = pool.read(&req, off, len).await.unwrap();
@@ -646,7 +972,7 @@ fn multi_page_window_with_intra_page_offsets() {
     assert_eq!(bytes.len(), len as usize);
     assert_eq!(bytes, stripe[off as usize..(off + len) as usize]);
     assert_eq!(transport.calls(), 3);
-    assert_eq!(pool.free_pages(), 8);
+    assert_quiescent(&pool, 8, "multi-page window");
 }
 
 #[test]
@@ -661,14 +987,8 @@ fn single_flight_coalesces_concurrent_reads() {
     transport.put_stripe(k, stripe.clone());
     transport.set_pend_polls(2);
 
-    let req1 = TestReq {
-        key: k,
-        bypass: false,
-    };
-    let req2 = TestReq {
-        key: k,
-        bypass: false,
-    };
+    let req1 = TestReq::new(k);
+    let req2 = TestReq::new(k);
     let f1 = async {
         let mut s = pool.read(&req1, 0, P as u64).await.unwrap();
         s.next_page().await.unwrap().unwrap().as_slice().to_vec()
@@ -681,8 +1001,7 @@ fn single_flight_coalesces_concurrent_reads() {
     assert_eq!(b1, stripe);
     assert_eq!(b2, stripe);
     assert_eq!(transport.calls(), 1, "single-flight coalesced");
-    assert_eq!(pool.free_pages(), 4);
-    assert_eq!(pool.inflight_entries(), 0);
+    assert_quiescent(&pool, 4, "single-flight");
 }
 
 #[test]
@@ -691,10 +1010,7 @@ fn eof_terminates_with_none() {
     let (pool, _transport, store) = make_pool_v2(P, 4);
     let k = key(1);
     store.preload(k, 0, vec![9u8; P]);
-    let req = TestReq {
-        key: k,
-        bypass: false,
-    };
+    let req = TestReq::new(k);
     block_on(async {
         let mut s = pool.read(&req, 0, P as u64).await.unwrap();
         let g = s.next_page().await.unwrap().unwrap();
@@ -711,10 +1027,7 @@ fn transport_error_propagates_and_recycles_pages() {
     let k = key(2);
     transport.put_stripe(k, vec![0u8; P]);
     transport.set_error_mode(true);
-    let req = TestReq {
-        key: k,
-        bypass: false,
-    };
+    let req = TestReq::new(k);
     let r: Result<(), Error> = block_on(async {
         let mut s = pool.read(&req, 0, P as u64).await.unwrap();
         match s.next_page().await {
@@ -727,8 +1040,7 @@ fn transport_error_propagates_and_recycles_pages() {
         Err(Error::Transport(_)) => {}
         other => panic!("expected transport error, got {other:?}"),
     }
-    assert_eq!(pool.free_pages(), 4, "page returned after error");
-    assert_eq!(pool.inflight_entries(), 0);
+    assert_quiescent(&pool, 4, "transport error");
 }
 
 #[test]
@@ -746,10 +1058,7 @@ fn dropped_leader_promotes_new_leader() {
     transport.put_stripe(k, stripe.clone());
     transport.set_pend_polls(2);
 
-    let req = TestReq {
-        key: k,
-        bypass: false,
-    };
+    let req = TestReq::new(k);
 
     // Start reader 1; poll once so it becomes leader and parks
     // on bulk_get (pend_polls=2 -> pends twice).
@@ -785,8 +1094,7 @@ fn dropped_leader_promotes_new_leader() {
         s.next_page().await.unwrap().unwrap().as_slice().to_vec()
     });
     assert_eq!(bytes, stripe);
-    assert_eq!(pool.free_pages(), 4);
-    assert_eq!(pool.inflight_entries(), 0);
+    assert_quiescent(&pool, 4, "dropped leader");
 }
 
 #[test]
@@ -801,14 +1109,8 @@ fn free_list_parking_unblocks_on_release() {
     store.preload(k1, 0, vec![1u8; P]);
     store.preload(k2, 0, vec![2u8; P]);
 
-    let req1 = TestReq {
-        key: k1,
-        bypass: false,
-    };
-    let req2 = TestReq {
-        key: k2,
-        bypass: false,
-    };
+    let req1 = TestReq::new(k1);
+    let req2 = TestReq::new(k2);
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -847,7 +1149,7 @@ fn free_list_parking_unblocks_on_release() {
         }
     };
     assert_eq!(v2, vec![2u8; P]);
-    assert_eq!(pool.free_pages(), 1);
+    assert_quiescent(&pool, 1, "free-list parking");
 }
 
 #[test]
@@ -868,10 +1170,7 @@ fn stream_limit_enforced() {
         BlockStoreRc(s.clone()),
     )
     .unwrap();
-    let req = TestReq {
-        key: key(0),
-        bypass: false,
-    };
+    let req = TestReq::new(key(0));
     block_on(async {
         let s1 = pool.read(&req, 0, P as u64).await.unwrap();
         let r2 = pool.read(&req, 0, P as u64).await;
@@ -921,14 +1220,8 @@ fn non_leader_consumes_concurrently_with_tee() {
     transport.put_stripe(k, stripe.clone());
     store.set_write_pend_polls(8);
 
-    let req1 = TestReq {
-        key: k,
-        bypass: false,
-    };
-    let req2 = TestReq {
-        key: k,
-        bypass: false,
-    };
+    let req1 = TestReq::new(k);
+    let req2 = TestReq::new(k);
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -972,8 +1265,7 @@ fn non_leader_consumes_concurrently_with_tee() {
     assert_eq!(v1, stripe);
     assert_eq!(store.writes(), 1);
     assert_eq!(transport.calls(), 1);
-    assert_eq!(pool.free_pages(), 4);
-    assert_eq!(pool.inflight_entries(), 0);
+    assert_quiescent(&pool, 4, "concurrent tee");
 }
 
 #[test]
@@ -987,14 +1279,8 @@ fn page_pinned_across_tee_until_subscriber_drops() {
     transport.put_stripe(k, vec![0xAAu8; P]);
     store.set_write_pend_polls(4);
 
-    let req1 = TestReq {
-        key: k,
-        bypass: false,
-    };
-    let req2 = TestReq {
-        key: k,
-        bypass: false,
-    };
+    let req1 = TestReq::new(k);
+    let req2 = TestReq::new(k);
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -1045,8 +1331,7 @@ fn page_pinned_across_tee_until_subscriber_drops() {
     };
     assert_eq!(v1, vec![0xAAu8; P]);
     assert_eq!(store.writes(), 1);
-    assert_eq!(pool.free_pages(), 1);
-    assert_eq!(pool.inflight_entries(), 0);
+    assert_quiescent(&pool, 1, "tee subscriber drop");
 }
 
 #[test]
@@ -1060,10 +1345,7 @@ fn leader_drop_during_tee_releases_page() {
     transport.put_stripe(k, vec![0xCDu8; P]);
     store.set_write_pend_polls(8);
 
-    let req = TestReq {
-        key: k,
-        bypass: false,
-    };
+    let req = TestReq::new(k);
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -1083,9 +1365,7 @@ fn leader_drop_during_tee_releases_page() {
         // Drop f mid-tee.
     }
 
-    // Tee was abandoned; page must be back in the free list.
-    assert_eq!(pool.free_pages(), 1, "page recycled after leader drop");
-    assert_eq!(pool.inflight_entries(), 0);
+    assert_quiescent(&pool, 1, "leader drop during tee");
     // bulk_get completed before the drop.
     assert_eq!(transport.calls(), 1);
     // write_page never completed (best-effort tee).
@@ -1115,10 +1395,7 @@ fn pipelined_delivers_bytes_in_order_across_stripes() {
         transport.put_stripe(k, stripe.clone());
         expected.extend_from_slice(&stripe);
         plans.push(StripePlan {
-            req: TestReq {
-                key: k,
-                bypass: false,
-            },
+            req: TestReq::new(k),
             intra_offset: 0,
             intra_len: (P * 2) as u64,
         });
@@ -1135,8 +1412,7 @@ fn pipelined_delivers_bytes_in_order_across_stripes() {
 
     assert_eq!(bytes, expected, "bytes delivered in global order");
     assert_eq!(transport.calls(), 8, "one fetch per page");
-    assert_eq!(pool.free_pages(), 16, "all pages returned");
-    assert_eq!(pool.inflight_entries(), 0, "inflight cleaned up");
+    assert_quiescent(&pool, 16, "pipelined order");
 }
 
 #[test]
@@ -1155,10 +1431,7 @@ fn pipelined_prefetch_overlaps_across_stripe_boundaries() {
         transport.put_stripe(k, stripe.clone());
         expected.extend_from_slice(&stripe);
         plans.push(StripePlan {
-            req: TestReq {
-                key: k,
-                bypass: false,
-            },
+            req: TestReq::new(k),
             intra_offset: 0,
             intra_len: P as u64,
         });
@@ -1181,8 +1454,7 @@ fn pipelined_prefetch_overlaps_across_stripe_boundaries() {
         "fetches must overlap across stripe boundaries (saw {})",
         transport.max_in_flight()
     );
-    assert_eq!(pool.free_pages(), 16);
-    assert_eq!(pool.inflight_entries(), 0);
+    assert_quiescent(&pool, 16, "pipelined overlap");
 }
 
 #[test]
@@ -1202,18 +1474,12 @@ fn pipelined_partial_first_and_last_slice() {
     // (partial single page).
     let plans = vec![
         StripePlan {
-            req: TestReq {
-                key: k0,
-                bypass: false,
-            },
+            req: TestReq::new(k0),
             intra_offset: 512,
             intra_len: 1536,
         },
         StripePlan {
-            req: TestReq {
-                key: k1,
-                bypass: false,
-            },
+            req: TestReq::new(k1),
             intra_offset: 0,
             intra_len: 512,
         },
@@ -1233,8 +1499,7 @@ fn pipelined_partial_first_and_last_slice() {
     });
 
     assert_eq!(bytes, expected);
-    assert_eq!(pool.free_pages(), 16);
-    assert_eq!(pool.inflight_entries(), 0);
+    assert_quiescent(&pool, 16, "pipelined partial slices");
 }
 
 #[test]
@@ -1247,10 +1512,7 @@ fn pipelined_drop_midway_recycles_pages_and_budget() {
         let k = key(0x80 + i);
         transport.put_stripe(k, fill(P * 2, i));
         plans.push(StripePlan {
-            req: TestReq {
-                key: k,
-                bypass: false,
-            },
+            req: TestReq::new(k),
             intra_offset: 0,
             intra_len: (P * 2) as u64,
         });
@@ -1264,8 +1526,7 @@ fn pipelined_drop_midway_recycles_pages_and_budget() {
         let _ = rs.next_page().await.unwrap().unwrap();
     });
 
-    assert_eq!(pool.free_pages(), 16, "all pages recycled after drop");
-    assert_eq!(pool.inflight_entries(), 0, "no inflight left after drop");
+    assert_quiescent(&pool, 16, "pipelined drop midway");
     assert_eq!(pool.prefetch_inflight(), 0, "prefetch budget returned");
 }
 
@@ -1284,26 +1545,17 @@ fn pipelined_skips_zero_length_slices() {
     // A zero-length middle slice must be dropped entirely.
     let plans = vec![
         StripePlan {
-            req: TestReq {
-                key: k0,
-                bypass: false,
-            },
+            req: TestReq::new(k0),
             intra_offset: 0,
             intra_len: P as u64,
         },
         StripePlan {
-            req: TestReq {
-                key: key(0xFF),
-                bypass: false,
-            },
+            req: TestReq::new(key(0xFF)),
             intra_offset: 0,
             intra_len: 0,
         },
         StripePlan {
-            req: TestReq {
-                key: k1,
-                bypass: false,
-            },
+            req: TestReq::new(k1),
             intra_offset: 0,
             intra_len: P as u64,
         },
@@ -1323,5 +1575,5 @@ fn pipelined_skips_zero_length_slices() {
 
     assert_eq!(bytes, expected);
     assert_eq!(transport.calls(), 2, "zero-length slice issued no fetch");
-    assert_eq!(pool.free_pages(), 8);
+    assert_quiescent(&pool, 8, "pipelined zero-length");
 }

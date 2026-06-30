@@ -25,11 +25,12 @@ frontend/backend implementations are covered against the real fabric:
   - `s3`:   the native S3 frontend backed by the S3 origin backend
             (unsigned/public-bucket mode, path-style `/bucket/key`).
   - `https`: the HTTP frontend backed by the HTTP origin backend over a
-            TLS 1.3 `https://` origin. The backend drives an OpenSSL
-            handshake and offloads the connection to kernel TLS (kTLS) so
-            record payloads land zero-copy in the page cache; the origin's
-            self-signed cert is pinned via the backend's `ca_cert_path`,
-            exercising custom-CA verification end to end.
+            TLS 1.3 `https://` origin that requires client certificate
+            authentication. The backend drives an OpenSSL handshake and
+            offloads the connection to kernel TLS (kTLS) so record payloads
+            land zero-copy in the page cache; the origin CA is pinned via
+            `ca_cert_path`, and the backend presents `client_cert_path` and
+            `client_key_path` for mTLS.
   - `loadgen`: the in-process load generator frontend backed by the
             synthetic fake backend, with results verified through the
             daemon's Prometheus metrics endpoint.
@@ -118,12 +119,18 @@ def _openssl_bin() -> tuple[str, dict[str, str]]:
 
 OPENSSL_BIN, OPENSSL_ENV = _openssl_bin()
 
-# Self-signed cert/key for the HTTPS origin, generated once at startup.
-# The cert carries `subjectAltName=DNS:localhost` (and IP:127.0.0.1) so the
-# backend, which connects to `https://localhost:<port>`, can verify the
-# presented leaf against the same file pinned as its `ca_cert_path`.
+# CA, server cert/key, and client cert/key for the HTTPS origin, generated
+# once at startup. The server cert carries `subjectAltName=DNS:localhost`
+# (and IP:127.0.0.1) so the backend, which connects to
+# `https://localhost:<port>`, can verify the presented leaf against the CA
+# pinned as its `ca_cert_path`. The same CA signs the client cert the backend
+# presents for mTLS.
+TLS_CA_CERT = TMPDIR / "origin-ca.pem"
+TLS_CA_KEY = TMPDIR / "origin-ca-key.pem"
 TLS_CERT = TMPDIR / "origin-cert.pem"
 TLS_KEY = TMPDIR / "origin-key.pem"
+TLS_CLIENT_CERT = TMPDIR / "client-cert.pem"
+TLS_CLIENT_KEY = TMPDIR / "client-key.pem"
 # The hostname the backend uses for the TLS origin endpoint. Must match a
 # SAN in TLS_CERT and resolve to loopback (via /etc/hosts) so the IPv4-only
 # origin resolver lands on the HTTPS stub.
@@ -607,44 +614,117 @@ def start_origin(port: int) -> http.server.ThreadingHTTPServer:
     return srv
 
 
-def generate_tls_cert() -> None:
-    """Generate a self-signed cert/key for the HTTPS origin via openssl(1).
-
-    The cert is its own trust anchor (CA:TRUE) and carries SANs for both
-    `localhost` and `127.0.0.1`, so the storage backend can both verify the
-    presented leaf against this file (pinned as `ca_cert_path`) and match
-    the `https://localhost:<port>` endpoint hostname.
-    """
-    log("Generating self-signed TLS cert for HTTPS origin")
-    cmd = [
-        OPENSSL_BIN,
-        "req",
-        "-x509",
-        "-newkey",
-        "rsa:2048",
-        "-keyout",
-        str(TLS_KEY),
-        "-out",
-        str(TLS_CERT),
-        "-days",
-        "1",
-        "-nodes",
-        "-subj",
-        "/CN=localhost",
-        "-addext",
-        "subjectAltName=DNS:localhost,IP:127.0.0.1",
-        "-addext",
-        "basicConstraints=critical,CA:TRUE",
-    ]
+def run_openssl(args: list[str], description: str) -> None:
     result = subprocess.run(
-        cmd, capture_output=True, text=True, check=False, env=OPENSSL_ENV
+        [OPENSSL_BIN, *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=OPENSSL_ENV,
     )
     if result.returncode != 0:
-        die(f"openssl cert generation failed: {result.stderr}")
+        die(f"openssl {description} failed: {result.stderr}")
+
+
+def generate_tls_certs() -> None:
+    """Generate a CA plus server/client certs for the mTLS origin."""
+    log("Generating TLS CA and mTLS certs for HTTPS origin")
+    run_openssl(
+        [
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            str(TLS_CA_KEY),
+            "-out",
+            str(TLS_CA_CERT),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=smoke-storage-ca",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        ],
+        "CA generation",
+    )
+    run_openssl(
+        [
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            str(TLS_KEY),
+            "-out",
+            str(TMPDIR / "origin.csr"),
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        ],
+        "origin CSR generation",
+    )
+    run_openssl(
+        [
+            "x509",
+            "-req",
+            "-in",
+            str(TMPDIR / "origin.csr"),
+            "-CA",
+            str(TLS_CA_CERT),
+            "-CAkey",
+            str(TLS_CA_KEY),
+            "-CAcreateserial",
+            "-out",
+            str(TLS_CERT),
+            "-days",
+            "1",
+            "-copy_extensions",
+            "copy",
+        ],
+        "origin cert signing",
+    )
+    run_openssl(
+        [
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            str(TLS_CLIENT_KEY),
+            "-out",
+            str(TMPDIR / "client.csr"),
+            "-nodes",
+            "-subj",
+            "/CN=unbounded-storage-backend",
+        ],
+        "client CSR generation",
+    )
+    run_openssl(
+        [
+            "x509",
+            "-req",
+            "-in",
+            str(TMPDIR / "client.csr"),
+            "-CA",
+            str(TLS_CA_CERT),
+            "-CAkey",
+            str(TLS_CA_KEY),
+            "-CAcreateserial",
+            "-out",
+            str(TLS_CLIENT_CERT),
+            "-days",
+            "1",
+        ],
+        "client cert signing",
+    )
 
 
 def start_origin_tls(port: int) -> http.server.ThreadingHTTPServer:
-    """Start an HTTPS stub origin (TLS 1.2+) using the generated cert.
+    """Start an HTTPS stub origin (TLS 1.2+) requiring a client cert.
 
     Identical to `start_origin` but the listening socket is wrapped in a
     server-side TLS context. The server itself uses ordinary userspace TLS;
@@ -656,6 +736,8 @@ def start_origin_tls(port: int) -> http.server.ThreadingHTTPServer:
     srv.requests = []  # type: ignore[attr-defined]
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(certfile=str(TLS_CERT), keyfile=str(TLS_KEY))
+    ctx.load_verify_locations(cafile=str(TLS_CA_CERT))
+    ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -681,6 +763,8 @@ def write_config(
     metrics_addr: str,
     ca_cert_path: Path | None = None,
     insecure_skip_verify: bool = False,
+    client_cert_path: Path | None = None,
+    client_key_path: Path | None = None,
 ) -> None:
     # The config schema is proto3-native: byte sizes are plain integer
     # byte counts (see api/unbounded-storage/config.proto).
@@ -701,6 +785,10 @@ def write_config(
         tls_lines += f'ca_cert_path = "{ca_cert_path}"\n'
     if insecure_skip_verify:
         tls_lines += "insecure_skip_verify = true\n"
+    if client_cert_path is not None:
+        tls_lines += f'client_cert_path = "{client_cert_path}"\n'
+    if client_key_path is not None:
+        tls_lines += f'client_key_path = "{client_key_path}"\n'
     path.write_text(
         f"""\
 self = "{self_name}"
@@ -1010,6 +1098,8 @@ def run_scenario(
     *,
     ca_cert_path: Path | None = None,
     insecure_skip_verify: bool = False,
+    client_cert_path: Path | None = None,
+    client_key_path: Path | None = None,
 ) -> None:
     """Bring up a fresh two-node ring of frontend/backend *kind* and fetch.
 
@@ -1019,8 +1109,9 @@ def run_scenario(
     origin; its recorded requests are reset so the GET assertion is scoped
     to this scenario. *name* labels the scenario and namespaces its temp
     files (so two scenarios of the same *kind*, e.g. plaintext vs TLS http,
-    do not collide). *ca_cert_path*/*insecure_skip_verify* configure the
-    origin backend's TLS verification for `https://` endpoints.
+    do not collide). The TLS path parameters configure the origin backend's
+    certificate verification and optional client certificate for `https://`
+    endpoints.
     """
     log("")
     log(f"=== Scenario: {name} ({kind} frontend + {kind} backend) ===")
@@ -1047,6 +1138,8 @@ def run_scenario(
         metrics_addr=f"127.0.0.1:{met_a}",
         ca_cert_path=ca_cert_path,
         insecure_skip_verify=insecure_skip_verify,
+        client_cert_path=client_cert_path,
+        client_key_path=client_key_path,
     )
     write_config(
         cfg2,
@@ -1061,6 +1154,8 @@ def run_scenario(
         metrics_addr=f"127.0.0.1:{met_b}",
         ca_cert_path=ca_cert_path,
         insecure_skip_verify=insecure_skip_verify,
+        client_cert_path=client_cert_path,
+        client_key_path=client_key_path,
     )
 
     try:
@@ -1260,7 +1355,7 @@ def main() -> None:
     # Second stub origin, TLS-wrapped, for the kTLS scenario. The backend
     # reaches it as `https://localhost:<port>`; `localhost` resolves to the
     # loopback the server binds and matches the cert SAN.
-    generate_tls_cert()
+    generate_tls_certs()
     tls_origin_port = free_port()
     tls_origin_addr = f"https://{TLS_ORIGIN_HOST}:{tls_origin_port}"
     log(f"TLS stub origin on https://127.0.0.1:{tls_origin_port}")
@@ -1279,7 +1374,9 @@ def main() -> None:
         tls_origin_addr,
         HTTP_OBJECT_PATH,
         tls_origin,
-        ca_cert_path=TLS_CERT,
+        ca_cert_path=TLS_CA_CERT,
+        client_cert_path=TLS_CLIENT_CERT,
+        client_key_path=TLS_CLIENT_KEY,
     )
     run_loadgen_scenario()
 

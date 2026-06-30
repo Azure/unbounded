@@ -146,7 +146,7 @@ mod tests {
         Arc::new(FingerTable::build(
             peer(local),
             &entries,
-            FingerTableConfig { k: 8 },
+            FingerTableConfig::with_k(8),
         ))
     }
 

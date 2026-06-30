@@ -328,6 +328,12 @@ func TestRenderConfigActiveRingMergesPeers(t *testing.T) {
 	// YAML-declared routing knobs are preserved while self is stamped in.
 	dir := writeSource(t, `
 fingers_per_node: 5
+topology_weighting:
+  prefix_weights:
+    - tag_index: 0
+      weight: 0.25
+    - tag_index: 1
+      weight: -0.5
 startup:
   fabric:
     tcp:
@@ -363,6 +369,11 @@ peers:
 	assert.Equal(t, "node-a", cfg.GetSelf())
 	assert.NotNil(t, cfg.FingersPerNode)
 	assert.Equal(t, uint32(5), cfg.GetFingersPerNode())
+	require.Len(t, cfg.GetTopologyWeighting().GetPrefixWeights(), 2)
+	assert.Equal(t, uint32(0), cfg.GetTopologyWeighting().GetPrefixWeights()[0].GetTagIndex())
+	assert.Equal(t, 0.25, cfg.GetTopologyWeighting().GetPrefixWeights()[0].GetWeight())
+	assert.Equal(t, uint32(1), cfg.GetTopologyWeighting().GetPrefixWeights()[1].GetTagIndex())
+	assert.Equal(t, -0.5, cfg.GetTopologyWeighting().GetPrefixWeights()[1].GetWeight())
 
 	// Discovered peers merge with declared node-z and are sorted by name.
 	require.Len(t, cfg.GetPeers(), 4)
@@ -523,7 +534,7 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation: "/dev/nvme1n1;queue_depth=256;page_size_bytes=4096;numa=0;skip_recovery_scan=true;force_format=true;bypass_admission=true;bypass_index_read=true;bypass_checksum=true",
+			allocatedDisksAnnotation: "/dev/nvme1n1?queue_depth=256&page_size_bytes=4096&numa=0&skip_recovery_scan=true&force_format=true&bypass_admission=true&bypass_index_read=true&bypass_checksum=true",
 		},
 	})
 
@@ -551,7 +562,7 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation: "/dev/nvme1n1;queue_depth=128,/dev/nvme2n1;numa=1",
+			allocatedDisksAnnotation: "/dev/nvme1n1?queue_depth=128,/dev/nvme2n1?numa=1",
 		},
 	})
 
@@ -576,15 +587,14 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation: "/dev/nvme1n1;unknown=x;queue_depth=0;queue_depth=512;queue_depth=1024;page_size_bytes=bad;skip_recovery_scan=maybe;force_format=maybe;bypass_admission=maybe;bypass_index_read=maybe;bypass_checksum=maybe;numa=bad;empty=;=value;missing",
+			allocatedDisksAnnotation: "/dev/nvme1n1?unknown=x&queue_depth=0&queue_depth=512&queue_depth=1024&page_size_bytes=bad&skip_recovery_scan=maybe&force_format=maybe&bypass_admission=maybe&bypass_index_read=maybe&bypass_checksum=maybe&numa=bad&empty=&missing",
 		},
 	})
 
 	require.Len(t, cfg.GetDisks(), 1)
 	disk := cfg.GetDisks()[0]
 	assert.Equal(t, "/dev/nvme1n1", disk.GetBlock().GetPath())
-	assert.NotNil(t, disk.QueueDepth)
-	assert.Equal(t, uint32(512), disk.GetQueueDepth())
+	assert.Nil(t, disk.QueueDepth)
 	assert.Nil(t, disk.PageSizeBytes)
 	assert.Nil(t, disk.GetBlock().Numa)
 	assert.False(t, disk.GetSkipRecoveryScan())
@@ -603,7 +613,7 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation:    " , ;queue_depth=256, /dev/nvme1n1, /dev/nvme1n1",
+			allocatedDisksAnnotation:  " , relative-path?queue_depth=256, /dev/nvme1n1, /dev/nvme1n1",
 			storageFileSizeAnnotation: "4294967296",
 		},
 	})
@@ -621,7 +631,7 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation:    " , relative-path;queue_depth=256, ;numa=1",
+			allocatedDisksAnnotation:  " , relative-path?queue_depth=256",
 			storageFileSizeAnnotation: "4294967296",
 		},
 	})
@@ -640,7 +650,7 @@ version: 1
 
 	cfg := decodeWithState(t, dir, renderState{
 		annotations: map[string]string{
-			storageDisksAnnotation:    " , ",
+			allocatedDisksAnnotation:  " , ",
 			storageFileSizeAnnotation: "4294967296",
 		},
 	})
@@ -700,7 +710,7 @@ disks:
 `)
 
 	cfg := decodeWithState(t, dir, renderState{
-		annotations: map[string]string{storageDisksAnnotation: "/dev/nvme1n1"},
+		annotations: map[string]string{allocatedDisksAnnotation: "/dev/nvme1n1"},
 	})
 
 	require.Len(t, cfg.GetDisks(), 1)
@@ -735,7 +745,7 @@ version: 1
 `)
 
 	cfg := decodeWithState(t, dir, renderState{
-		annotations: map[string]string{storageDisksAnnotation: "/dev/nvme1n1"},
+		annotations: map[string]string{allocatedDisksAnnotation: "/dev/nvme1n1"},
 	})
 
 	require.Len(t, cfg.GetDisks(), 1)

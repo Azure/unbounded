@@ -14,6 +14,23 @@ use crate::bufferpool::types::{BulkRef, Error, PageRef, StripeKey};
 use crate::bufferpool::window::WindowedRead;
 use crate::memory::Backing;
 
+#[derive(Clone)]
+pub enum PageCachePolicy {
+    Enabled,
+    Disabled,
+    Custom(Arc<dyn Fn(StripeKey, u64) -> bool + Send + Sync>),
+}
+
+impl PageCachePolicy {
+    pub fn enabled(&self, key: StripeKey, stripe_off: u64) -> bool {
+        match self {
+            Self::Enabled => true,
+            Self::Disabled => false,
+            Self::Custom(f) => f(key, stripe_off),
+        }
+    }
+}
+
 pub trait Req {
     fn key(&self) -> StripeKey;
 
@@ -27,9 +44,10 @@ pub trait Req {
     }
 
     /// Benchmark-only local-disk bypass. Unlike [`Req::bypass`], this
-    /// leaves peer routing enabled but skips the initiator's local disk
-    /// lookup/writeback. Peer handlers still consult their own local
-    /// store, so remote NVMe reads remain in the path.
+    /// leaves peer routing enabled but every bufferpool that serves the
+    /// request skips its local disk lookup/writeback. Remote owner reads
+    /// still use the normal peer/fabric path, without a separate RPC-side
+    /// disk path.
     fn skip_local_disk(&self) -> bool {
         false
     }
@@ -161,6 +179,18 @@ pub trait BlockStore {
     /// transport and the blockstore.
     fn register_pages(&self, backing: &Backing) -> Result<(), Error>;
 
+    /// Whether the pool may retain an idle RAM page for this logical page.
+    /// Stores without per-disk policy keep the default enabled behavior.
+    fn page_cache_enabled<R: Req + ?Sized>(&self, _req: &R, _stripe_off: u64) -> bool {
+        true
+    }
+
+    /// Per-stream RAM page-cache policy snapshot. Implementations with
+    /// expensive dynamic lookup should capture a cheap immutable policy here.
+    fn page_cache_policy<R: Req + ?Sized>(&self, _req: &R) -> PageCachePolicy {
+        PageCachePolicy::Enabled
+    }
+
     /// Local-disk lookup. `Ok(true)` if `dst` was filled from disk;
     /// `Ok(false)` if the key is not present (pool then falls back
     /// to `Transport::bulk_get`).
@@ -189,6 +219,14 @@ pub trait BlockStore {
 impl<T: BlockStore + ?Sized> BlockStore for Arc<T> {
     fn register_pages(&self, backing: &Backing) -> Result<(), Error> {
         (**self).register_pages(backing)
+    }
+
+    fn page_cache_enabled<R: Req + ?Sized>(&self, req: &R, stripe_off: u64) -> bool {
+        (**self).page_cache_enabled(req, stripe_off)
+    }
+
+    fn page_cache_policy<R: Req + ?Sized>(&self, req: &R) -> PageCachePolicy {
+        (**self).page_cache_policy(req)
     }
 
     async fn read_page<R: Req + ?Sized>(

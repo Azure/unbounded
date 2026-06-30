@@ -59,16 +59,13 @@ jobs:
         include:
           - host-base-os: ubuntu2404
             nspawn-base-os: ubuntu2404
-            nspawn-oci-image: ""
           # Fedora covers the RPM host path for Azure Linux nspawn testing.
           # Azure Linux 3 does not currently publish a QEMU-ready VHD that this
           # e2e can boot directly as the host VM.
           - host-base-os: fedora
             nspawn-base-os: azlinux3
-            nspawn-oci-image: ghcr.io/azure/agent-azlinux3:v20260619
           - host-base-os: ubuntu2604
             nspawn-base-os: ubuntu2604
-            nspawn-oci-image: ghcr.io/azure/agent-ubuntu2604:v20260619
     env:
       KIND_CLUSTER_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
       VM_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
@@ -76,7 +73,6 @@ jobs:
       VM_IP: "192.168.100.10"
       AGENT_MACHINE_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
       HOST_BASE_OS: ${{ matrix.host-base-os }}
-      NSPAWN_OCI_IMAGE: ${{ matrix.nspawn-oci-image }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -96,6 +92,9 @@ jobs:
 
       - name: Wait for node to become Ready
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+
+      - name: Validate host and nspawn distro pair
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-host-nspawn-distro
 
       - name: Validate controller health after join
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-controllers-healthy
@@ -136,6 +135,9 @@ jobs:
 
       - name: Wait for node to become Ready (rejoin)
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose wait-for-node
+
+      - name: Validate host and nspawn distro pair (rejoin)
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-host-nspawn-distro
 
       - name: Validate controller health after rejoin
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-controllers-healthy

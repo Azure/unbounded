@@ -12,8 +12,9 @@
 //!
 //! * **process identity (`self`).** Startup-fixed because it determines the
 //!   process-wide fabric peer id. A change requires a restart.
-//! * **process routing (`fingers_per_node`, `routing_plan`).** Rebuilds the
-//!   projected routing surface and republishes it to every shard.
+//! * **process routing (`fingers_per_node`, `routing_plan`,
+//!   `topology_weighting`).** Rebuilds the projected routing surface and
+//!   republishes it to every shard.
 //! * **`[[peers]]`.** Reconciles fabric connections and rebuilds the projected
 //!   routing surface. The peer named by `self` is used as the local topology
 //!   entry and is not dialed.
@@ -24,7 +25,6 @@
 //!   which reconciles its own origin-backend and frontend registries on
 //!   its own thread (binding/closing listeners and rebuilding backends
 //!   without a shard restart).
-//!
 //! Startup-fixed knobs (the `[startup]` section: fabric listen address
 //! and thread counts, fabric max in-flight, backing allocation, CPU
 //! topology) live in the config file but are deliberately excluded from
@@ -79,7 +79,8 @@ impl ConfigDiff {
             disks_changed: old.disks != new.disks,
             identity_changed: old.self_ != new.self_,
             routing_changed: old.fingers_per_node != new.fingers_per_node
-                || old.routing_plan != new.routing_plan,
+                || old.routing_plan != new.routing_plan
+                || old.topology_weighting != new.topology_weighting,
             peers_changed: old.peers != new.peers,
             backends_changed: old.backends != new.backends,
             frontends_changed: old.frontends != new.frontends,
@@ -123,8 +124,8 @@ mod tests {
     use super::*;
     use crate::config::schema::{
         BackendSpec, BlockDiskConfig, CacheSpec, DiskSpec, FrontendSpec, HttpBackendConfig,
-        HttpFrontendConfig, PeerSpec, RoutingPlan, TcpPeerConfig, backend_spec, disk_spec,
-        frontend_spec, peer_spec,
+        HttpFrontendConfig, PeerSpec, RoutingPlan, TcpPeerConfig, TopologyPrefixWeight,
+        TopologyWeighting, backend_spec, disk_spec, frontend_spec, peer_spec,
     };
 
     fn base() -> Config {
@@ -176,6 +177,22 @@ mod tests {
     }
 
     #[test]
+    fn topology_weighting_change_is_routing_reload() {
+        let a = base();
+        let mut b = base();
+        b.topology_weighting = Some(TopologyWeighting {
+            prefix_weights: vec![TopologyPrefixWeight {
+                tag_index: 0,
+                weight: 0.5,
+            }],
+        });
+        let d = ConfigDiff::between(&a, &b);
+        assert!(d.routing_changed);
+        assert!(d.requires_routing_reload());
+        assert!(!d.requires_peer_reconcile());
+    }
+
+    #[test]
     fn self_change_requires_restart_not_routing_reload() {
         let a = base();
         let mut b = base();
@@ -214,6 +231,7 @@ mod tests {
             bypass_admission: false,
             bypass_index_read: false,
             bypass_checksum: false,
+            disable_page_cache: false,
             config: Some(disk_spec::Config::Block(BlockDiskConfig {
                 numa: None,
                 path: "/dev/nvme0n1".to_string(),
@@ -237,6 +255,8 @@ mod tests {
                 http_concurrency: Some(64),
                 ca_cert_path: None,
                 insecure_skip_verify: false,
+                client_cert_path: None,
+                client_key_path: None,
             })),
         });
         let d = ConfigDiff::between(&a, &b);
@@ -259,6 +279,30 @@ mod tests {
         });
         let d = ConfigDiff::between(&a, &b);
         assert!(d.frontends_changed);
+        assert!(d.any());
+        assert!(!d.requires_routing_reload());
+    }
+
+    #[test]
+    fn disk_page_cache_change_is_detected_without_routing_reload() {
+        let a = base();
+        let mut b = base();
+        b.disks.push(DiskSpec {
+            queue_depth: None,
+            page_size_bytes: None,
+            skip_recovery_scan: false,
+            force_format: false,
+            bypass_admission: false,
+            bypass_index_read: false,
+            bypass_checksum: false,
+            disable_page_cache: true,
+            config: Some(disk_spec::Config::Block(BlockDiskConfig {
+                numa: None,
+                path: "/dev/nvme0n1".to_string(),
+            })),
+        });
+        let d = ConfigDiff::between(&a, &b);
+        assert!(d.disks_changed);
         assert!(d.any());
         assert!(!d.requires_routing_reload());
     }

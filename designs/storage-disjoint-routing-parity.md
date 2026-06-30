@@ -43,8 +43,12 @@ the set of all nodes, each with:
 - `labels`: the ordered topology label vector (coarsest to finest, e.g.
   `[region, zone, row, rack]`). Empty if unset.
 
-and the cluster-wide fanout `k` = `fingers_per_node` (default 100,
-clamped to at least 1).
+and these cluster-wide routing knobs:
+
+- `k` = `fingers_per_node` (default 100, clamped to at least 1).
+- `topology_weighting`, if present. Absence means historical hard-locality
+  selection. Presence switches finger selection to weighted rendezvous while
+  keeping successor and predecessor selection ring-nearest.
 
 ## Ring math
 
@@ -117,6 +121,15 @@ rendezvous_hash(local_ring, candidate_ring, arc) =
 
 `arc * GOLDEN_RATIO_64` is a wrapping multiply.
 
+For weighted topology selection, normalize the hash by taking the high 53
+bits, so the value is exactly representable in an IEEE-754 double:
+
+```
+rendezvous_unit(hash) = double(hash >> 11) / double(2^53)
+```
+
+This yields a value in `[0, 1)`.
+
 ## Selection algorithm
 
 Compute `L`'s neighbors exactly as `FingerTable::build` does.
@@ -148,8 +161,10 @@ Initialize one slot per arc as empty. For every candidate node `c` where
 3. If arc `a` is empty, place `c` there. Otherwise replace the incumbent
    `inc` with `c` iff `better(c, inc, a)` (below).
 
+If `topology_weighting` is absent, use historical hard-locality comparison:
+
 ```
-better(c, inc, arc):                   # is challenger c better than incumbent inc?
+better_hard(c, inc, arc):              # is challenger c better than incumbent inc?
     ct = topology_distance(L.labels, c.labels)
     it = topology_distance(L.labels, inc.labels)
     if ct != it: return ct < it
@@ -163,6 +178,69 @@ That is: prefer the topologically nearer candidate; break ties by lower
 rendezvous hash; break remaining ties by lower raw ring position. The
 selection is therefore total and deterministic, independent of candidate
 iteration order.
+
+If `topology_weighting` is present, use weighted rendezvous comparison
+instead. The configured weights are keyed by tag prefix:
+
+- `tag_index = 0` applies when `L` and the candidate share `labels[0]`
+  (for example region or datacenter).
+- `tag_index = 1` applies when they share `labels[0]` and `labels[1]`
+  (for example region plus zone or AZ).
+- Higher indexes continue the same pattern.
+- Weight `0.0` is neutral. Positive weights favor matching candidates.
+  Negative weights penalize matching candidates.
+
+Duplicate `tag_index` values are invalid. Non-finite weights are invalid.
+Implementations should reject weights whose absolute value is greater than
+`1000000.0`.
+
+Weighted selection first computes the shared non-wildcard prefix length
+without right-padding:
+
+```
+shared_prefix_len(a, b):
+    n = min(len(a), len(b))
+    prefix = 0
+    for i in 0..n:
+        if a[i] == "*" or b[i] == "*" or a[i] != b[i]: break
+        prefix += 1
+    return prefix
+```
+
+Choose the most-specific configured weight whose `tag_index` is smaller
+than `shared_prefix_len`. If no configured prefix matches, the weight is
+`0.0`. Prefix weights do not accumulate.
+
+```
+matching_weight(labels, candidate_labels):
+    prefix = shared_prefix_len(labels, candidate_labels)
+    best_index = none
+    best_weight = 0.0
+    for w in topology_weighting.prefix_weights:
+        if w.tag_index < prefix and (best_index is none or w.tag_index > best_index):
+            best_index = w.tag_index
+            best_weight = w.weight
+    return best_weight
+
+weighted_score(c, arc):
+    h = rendezvous_hash(local_ring, node_to_ring(node_id_from_name(c.name)), arc)
+    return rendezvous_unit(h) - matching_weight(L.labels, c.labels)
+
+better_weighted(c, inc, arc):
+    cs = weighted_score(c, arc)
+    is = weighted_score(inc, arc)
+    if cs != is: return cs < is
+    cr = rendezvous_hash(local_ring, node_to_ring(node_id_from_name(c.name)), arc)
+    ir = rendezvous_hash(local_ring, node_to_ring(node_id_from_name(inc.name)), arc)
+    if cr != ir: return cr < ir
+    return node_to_ring(node_id_from_name(c.name)) < node_to_ring(node_id_from_name(inc.name))
+```
+
+Weighted mode is still total and deterministic when all participants use
+IEEE-754 double arithmetic and the hash normalization above. It deliberately
+does not make locality an absolute priority: topology changes the score, but
+ring entropy can still pick a farther candidate when the configured weight is
+neutral or small.
 
 The resulting `fingers` are the set of distinct arc winners, **excluding
 `L` itself**. (Empty arcs contribute nothing; `from_explicit` does not
@@ -210,7 +288,10 @@ load:
 
 Labels for finger peers are looked up from their `[[peers]]` entry (or
 empty if unset); labels do not affect runtime routing, only the
-build-time selection above, which the planner has already resolved.
+build-time selection above, which the planner has already resolved. If the
+planner uses weighted topology selection, it must use the same
+`topology_weighting` values as the daemon would have used for the global
+build.
 
 ## Why the paths match
 
@@ -231,3 +312,11 @@ recursive walk visits the same sequence of nodes and terminates at the
 same owner. Fingers only shorten the path; correctness (termination at
 the right owner) rests on the successor pointers forming a complete ring,
 which the planner must preserve for every node.
+
+Topology weighting cannot weaken that correctness guarantee when it is
+applied as specified here. It changes only which real candidate wins inside
+each finger arc. It does not change owner checks, closest-preceding bounds,
+or successor/predecessor selection. Successor and predecessor remain the
+nearest clockwise and counterclockwise ring neighbors, so routing still has
+the successor fallback that guarantees clockwise progress even if a weighting
+configuration produces poor or sparse fingers.

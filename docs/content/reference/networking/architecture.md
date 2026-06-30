@@ -99,6 +99,75 @@ It manages:
 - `wg51820` for all peers (same-site and remote). Remote peers have no
   endpoint set -- WireGuard learns their address from incoming packets.
 
+## Running with an Existing CNI
+
+unbounded-net can run alongside a CNI you already operate in the primary cluster
+(for example Cilium, Calico, or Azure CNI). In this mode the existing CNI keeps
+ownership of intra-site pod networking, and unbounded-net is responsible only for
+connecting remote sites back to the primary cluster. This is controlled per-Site
+with the `manageCniPlugin` field.
+
+### Configuring the Primary Site
+
+For the Site that maps to your existing cluster, set `manageCniPlugin: false`.
+This automatically disables pod CIDR assignment for that site regardless of the
+`assignmentEnabled` value on individual `podCidrAssignments` rules. The
+`podCidrAssignments` block is still required: it defines the CIDR ranges that the
+other sites and gateways use to route traffic back to the primary cluster's pods.
+
+```yaml
+apiVersion: net.unbounded-cloud.io/v1alpha1
+kind: Site
+metadata:
+  name: primary
+spec:
+  nodeCidrs:
+    - "10.224.0.0/16"
+  # CNI already runs in this cluster, so unbounded-net does not write CNI
+  # config or mesh same-site nodes, and pod CIDR assignment is disabled.
+  manageCniPlugin: false
+  podCidrAssignments:
+      # Pod CIDR assignment is disabled by manageCniPlugin: false, but the CIDR
+      # range is still declared so other sites can route to these pods.
+    - cidrBlocks:
+        - "10.244.0.0/16"
+```
+
+When initializing the site with the CLI, pass `--manage-cni-plugin=false` so the
+generated Site resource is configured the same way. See the
+[Bring Your Own Cluster]({{< relref "guides/existing-cluster" >}}) guide for the
+end-to-end workflow.
+
+### Division of Responsibilities
+
+| Concern | Existing CNI | unbounded-net |
+|---------|:------------:|:-------------:|
+| Pod IPAM and pod CIDR allocation in the primary cluster | ✓ | |
+| CNI configuration on primary-site nodes | ✓ | |
+| Intra-site pod-to-pod networking within the primary cluster | ✓ | |
+| Cross-site routing to and from remote sites | | ✓ |
+| Gateway WireGuard tunnels between sites | | ✓ |
+| Pod CIDR allocation and CNI config on remote sites | | ✓ |
+
+The existing CNI continues to handle everything inside the primary cluster:
+allocating pod IPs, writing its own CNI configuration, and forwarding pod-to-pod
+traffic between local nodes. unbounded-net does not write CNI config, mesh
+same-site peers, or allocate pod CIDRs for that site.
+
+unbounded-net handles only inter-site connectivity for the primary site: it
+brings up gateway WireGuard tunnels to other sites and programs the routes that
+carry traffic to and from remote pod CIDRs. Remote sites created by Unbounded are
+unaffected; on those sites unbounded-net continues to act as the CNI, allocate
+pod CIDRs, and mesh same-site nodes as usual.
+
+{{< callout type="note" >}}
+**Cilium CNI:** Remote Unbounded nodes do not run Cilium, so they have no Cilium
+identity. Cilium derives identities from pod labels for in-cluster endpoints, but
+remote pods are unknown to it. Any CiliumNetworkPolicy that needs to allow or deny
+traffic to or from remote sites must reference those pods by IP/CIDR (for example
+`toCIDR`/`fromCIDR`) rather than by identity or label selectors.
+{{< /callout >}}
+
 ## Encapsulation Types
 
 | Type | Overhead | Encrypted | Default For |
