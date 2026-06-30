@@ -54,38 +54,46 @@ type workloadRef struct {
 
 // legacyComponent describes a single component's legacy footprint: where it
 // used to run, the target workloads that must be healthy before its legacy
-// resources may be removed, and the app.kubernetes.io/name label values that
-// identify the operator-owned resources to delete.
+// resources may be removed, and the label selectors that identify the
+// operator-owned resources to delete. A resource is reaped if it matches ANY
+// selector (each selector is an AND of its labels).
 type legacyComponent struct {
 	name            string
 	legacyNamespace string
 	targets         []workloadRef
-	appNames        []string
+	selectors       []map[string]string
 }
 
 // legacyComponents is processed in order; net is intentionally last because the
 // data-plane cutover (old net-node removed, new one already Ready) is briefly
 // disruptive and should happen only after everything else has moved.
-func legacyComponentsFor(target string) []legacyComponent {
+//
+// Selectors match the labels the component manifests actually carry: machina
+// uses the bare `app` label, while net, storage, and the operator-created
+// metalman Deployment use `app.kubernetes.io/name`.
+func legacyComponentsFor(string) []legacyComponent {
 	return []legacyComponent{
 		{
 			name:            ComponentMachina,
 			legacyNamespace: "unbounded-kube",
 			targets:         []workloadRef{{kind: "Deployment", name: "machina-controller"}},
-			appNames:        []string{"machina-controller"},
+			selectors:       []map[string]string{{"app": "machina-controller"}},
 		},
 		{
 			name:            ComponentMetalman,
 			legacyNamespace: "unbounded-kube",
-			// Per-site Deployments are recreated by the Site reconcile; gate on
-			// the shared metalman ServiceAccount/RBAC being present in target.
-			appNames: []string{"metalman-controller"},
+			// Per-site Deployments are recreated by the Site reconcile. Match
+			// both the operator-created label and the legacy deploy-pxe label.
+			selectors: []map[string]string{
+				{appNameLabel: "metalman-controller"},
+				{"app": "unbounded-pxe"},
+			},
 		},
 		{
 			name:            ComponentUnboundedStorage,
 			legacyNamespace: "unbounded-kube",
 			targets:         []workloadRef{{kind: "DaemonSet", name: "unbounded-storage-supervisor"}},
-			appNames:        []string{"unbounded-storage-supervisor"},
+			selectors:       []map[string]string{{appNameLabel: "unbounded-storage-supervisor"}},
 		},
 		{
 			name:            ComponentNet,
@@ -94,7 +102,11 @@ func legacyComponentsFor(target string) []legacyComponent {
 				{kind: "Deployment", name: "unbounded-net-controller"},
 				{kind: "DaemonSet", name: "unbounded-net-node"},
 			},
-			appNames: []string{"unbounded-net-controller", "unbounded-net-node", "unbounded-net-kube-proxy"},
+			selectors: []map[string]string{
+				{appNameLabel: "unbounded-net-controller"},
+				{appNameLabel: "unbounded-net-node"},
+				{appNameLabel: "unbounded-net-kube-proxy"},
+			},
 		},
 	}
 }
@@ -154,17 +166,24 @@ type LegacyReaper struct {
 func (*LegacyReaper) NeedLeaderElection() bool { return true }
 
 // Start runs the migrate-then-reap loop until everything is drained or the
-// context is cancelled. It is safe to run repeatedly: every step is idempotent.
+// context is cancelled (manager shutdown). It is the manager.Runnable entry
+// point; context cancellation is a clean stop, not an error.
 func (r *LegacyReaper) Start(ctx context.Context) error {
+	if err := r.RunToCompletion(ctx); err != nil && ctx.Err() == nil {
+		return err
+	}
+
+	return nil
+}
+
+// RunToCompletion performs idempotent migrate-then-reap passes until every
+// legacy namespace is drained of operator-owned resources, the context is
+// cancelled, or an unexpected error occurs. It returns nil only once fully
+// reaped, making it suitable for a one-shot migration command.
+func (r *LegacyReaper) RunToCompletion(ctx context.Context) error {
 	logger := log.FromContext(ctx).WithName("legacy-reaper")
 
-	if r.Interval <= 0 {
-		r.Interval = defaultReapInterval
-	}
-
-	if len(r.LegacyNamespaces) == 0 {
-		r.LegacyNamespaces = LegacyNamespaces
-	}
+	r.applyDefaults()
 
 	for {
 		done, err := r.reapOnce(ctx, logger)
@@ -179,9 +198,19 @@ func (r *LegacyReaper) Start(ctx context.Context) error {
 
 		select {
 		case <-ctx.Done():
-			return nil
+			return ctx.Err()
 		case <-time.After(r.Interval):
 		}
+	}
+}
+
+func (r *LegacyReaper) applyDefaults() {
+	if r.Interval <= 0 {
+		r.Interval = defaultReapInterval
+	}
+
+	if len(r.LegacyNamespaces) == 0 {
+		r.LegacyNamespaces = LegacyNamespaces
 	}
 }
 
@@ -220,6 +249,18 @@ func (r *LegacyReaper) reapOnce(ctx context.Context, logger logr.Logger) (bool, 
 
 	for _, component := range legacyComponentsFor(target) {
 		if !r.namespaceExists(ctx, component.legacyNamespace) {
+			continue
+		}
+
+		// Skip components with no legacy footprint: there is nothing to reap and
+		// we must not block on a target workload that will never exist (e.g. a
+		// cluster that never installed storage).
+		footprint, err := r.componentResourcesRemain(ctx, component)
+		if err != nil {
+			return false, err
+		}
+
+		if !footprint {
 			continue
 		}
 
@@ -362,20 +403,20 @@ func (r *LegacyReaper) rewriteClusterScopedRefs(ctx context.Context, logger logr
 
 // reapComponent deletes the operator-owned resources for a component in its
 // legacy namespace. It returns remaining=true if anything matching the
-// component's app labels still exists afterwards.
+// component's selectors still exists afterwards.
 func (r *LegacyReaper) reapComponent(ctx context.Context, logger logr.Logger, component legacyComponent) (bool, error) {
-	for _, appName := range component.appNames {
-		selector := client.MatchingLabels{appNameLabel: appName}
+	for _, selector := range component.selectors {
 		inNs := client.InNamespace(component.legacyNamespace)
+		match := client.MatchingLabels(selector)
 
 		for _, obj := range reapableKinds() {
-			if err := r.DeleteAllOf(ctx, obj, inNs, selector); err != nil && !apierrors.IsNotFound(err) {
-				return true, fmt.Errorf("delete %T in %s for %s: %w", obj, component.legacyNamespace, appName, err)
+			if err := r.DeleteAllOf(ctx, obj, inNs, match); err != nil && !apierrors.IsNotFound(err) {
+				return true, fmt.Errorf("delete %T in %s for %v: %w", obj, component.legacyNamespace, selector, err)
 			}
 		}
 
 		logger.V(1).Info("reaped legacy component resources",
-			"component", component.name, "app", appName, "namespace", component.legacyNamespace)
+			"component", component.name, "selector", selector, "namespace", component.legacyNamespace)
 	}
 
 	return r.componentResourcesRemain(ctx, component)
@@ -384,9 +425,11 @@ func (r *LegacyReaper) reapComponent(ctx context.Context, logger logr.Logger, co
 // componentResourcesRemain reports whether any operator-owned workloads for the
 // component still exist in its legacy namespace.
 func (r *LegacyReaper) componentResourcesRemain(ctx context.Context, component legacyComponent) (bool, error) {
-	for _, appName := range component.appNames {
+	for _, selector := range component.selectors {
+		opts := []client.ListOption{client.InNamespace(component.legacyNamespace), client.MatchingLabels(selector)}
+
 		var deployments appsv1.DeploymentList
-		if err := r.List(ctx, &deployments, client.InNamespace(component.legacyNamespace), client.MatchingLabels{appNameLabel: appName}); err != nil {
+		if err := r.List(ctx, &deployments, opts...); err != nil {
 			return true, err
 		}
 
@@ -395,7 +438,7 @@ func (r *LegacyReaper) componentResourcesRemain(ctx context.Context, component l
 		}
 
 		var daemonsets appsv1.DaemonSetList
-		if err := r.List(ctx, &daemonsets, client.InNamespace(component.legacyNamespace), client.MatchingLabels{appNameLabel: appName}); err != nil {
+		if err := r.List(ctx, &daemonsets, opts...); err != nil {
 			return true, err
 		}
 

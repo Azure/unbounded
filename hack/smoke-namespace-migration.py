@@ -2,33 +2,40 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""End-to-end smoke test for hack/scripts/migrate-namespace.sh.
+"""End-to-end smoke test for the namespace-consolidation migration.
 
 It stands up a kind cluster, stages a simulated *legacy* install (machina +
 metalman in ``unbounded-kube``, net in ``unbounded-net``) plus operator-owned
 state (Secrets, the machina-config ConfigMap, a metalman PXE Deployment, and
-cluster-scoped CRs), runs the migration script, and asserts the cluster ends up
-consolidated on ``unbounded-system`` with all operator state preserved and the
-old namespaces gone.
+cluster-scoped CRs), exercises both migration paths, and asserts the resulting
+consolidated ``unbounded-system`` state:
+
+  * the standalone ``hack/scripts/migrate-namespace.sh`` (air-gapped / non-
+    operator path), which also deletes the old namespaces; and
+  * the operator's one-shot ``unbounded-operator migrate-legacy`` subcommand
+    (the same migrate-then-reap logic the always-on operator runs behind
+    ``--reap-legacy-resources``), which reaps operator-owned resources but
+    deliberately leaves the empty legacy Namespace objects for manual deletion.
 
 Because the real net data plane (eBPF/hostNetwork) cannot run in vanilla kind,
 the staged workloads are *neutralized* to inert ``pause`` pods. This validates
 the migration choreography (namespaces, Secrets, ConfigMap, RBAC, CR secret
 references, sequenced teardown, idempotency) at the Kubernetes-object level,
-which is exactly what the script orchestrates. Real data-plane behavior is
+which is exactly what each path orchestrates. Real data-plane behavior is
 covered elsewhere (agent e2e) and by POC validation.
 
 Scenarios:
-  * happy            - full migration; assert consolidated state; re-run asserts idempotency.
+  * happy            - full script migration; assert consolidated state; re-run asserts idempotency.
   * dry-run          - ``--dry-run`` makes no changes.
   * resume           - ``--keep-old-namespaces`` then a normal re-run completes the cutover.
   * release-download - ``--release`` fetches the manifests tarball over HTTP (served locally).
+  * operator-reap    - operator ``migrate-legacy`` copies/rewrites/reaps and leaves the namespaces; re-run asserts idempotency.
 
 Usage:
   python3 hack/smoke-namespace-migration.py
-      [--scenario happy|dry-run|resume|release-download|all] [--keep-cluster]
+      [--scenario happy|dry-run|resume|release-download|operator-reap|all] [--keep-cluster]
 
-Requires: docker, kind, kubectl, go (to render manifests). Run from anywhere.
+Requires: docker, kind, kubectl, go (to render manifests / run the operator). Run from anywhere.
 """
 
 import argparse
@@ -336,6 +343,37 @@ def run_migration(manifests: pathlib.Path, *extra) -> subprocess.CompletedProces
     return run(["bash", str(SCRIPT), "--manifests-dir", str(manifests), "--yes", *extra])
 
 
+def stage_target_install(workdir: pathlib.Path) -> None:
+    """Deploy a neutralized, Ready unbounded-system install so the operator
+    reaper's per-component health gate can pass. In production the operator
+    creates these from Sites; the e2e pre-stages them (as inert pause workloads)
+    to keep the reaper choreography deterministic in vanilla kind."""
+    manifests = build_new_manifests(workdir)
+
+    # Drop the rendered machina-config so the reaper must copy the operator's
+    # live one (carrying apiServerEndpoint) from the legacy namespace, rather
+    # than create-if-absent skipping over a pre-existing target ConfigMap.
+    rendered_config = manifests / "machina" / "03-config.yaml"
+    if rendered_config.exists():
+        rendered_config.unlink()
+
+    kubectl("apply", "-R", "-f", str(manifests / "machina"))
+    kubectl("apply", "-R", "-f", str(manifests / "net"))
+    kubectl("-n", TARGET, "rollout", "status", "deploy/machina-controller", "--timeout=120s")
+    kubectl("-n", TARGET, "rollout", "status", "deploy/unbounded-net-controller", "--timeout=120s")
+    kubectl("-n", TARGET, "rollout", "status", "ds/unbounded-net-node", "--timeout=120s")
+
+
+def run_operator_migration(*extra) -> subprocess.CompletedProcess:
+    """Invoke the operator's one-shot `migrate-legacy` subcommand against the
+    current kube context (the same migrate-then-reap logic the always-on
+    operator runs behind --reap-legacy-resources)."""
+    return run(
+        ["go", "run", "./cmd/unbounded-operator", "migrate-legacy", "--timeout=4m", *extra],
+        cwd=REPO_ROOT,
+    )
+
+
 class _QuietHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *_args):  # silence per-request logging
         pass
@@ -461,11 +499,70 @@ def scenario_release_download(workdir: pathlib.Path) -> None:
     c.finish()
 
 
+def assert_operator_consolidated(c: Checks) -> None:
+    """Operator-driven end state. Unlike the script, the operator NEVER deletes
+    the legacy Namespace objects: it reaps only the operator-owned resources and
+    leaves the (now-empty) namespaces for a human to delete."""
+    c.ok(ns_exists(OLD_MACHINA), f"{OLD_MACHINA} namespace retained (operator must not delete namespaces)")
+    c.ok(ns_exists(OLD_NET), f"{OLD_NET} namespace retained (operator must not delete namespaces)")
+    c.ok(ns_exists(TARGET), f"{TARGET} namespace present")
+
+    # Operator-owned legacy workloads are reaped from the legacy namespaces.
+    for kind, name, namespace in (
+        ("deploy", "machina-controller", OLD_MACHINA),
+        ("deploy", "metalman-controller-dc1", OLD_MACHINA),
+        ("deploy", "unbounded-net-controller", OLD_NET),
+        ("ds", "unbounded-net-node", OLD_NET),
+    ):
+        rc = kubectl("get", kind, name, "-n", namespace, check=False, capture=True).returncode
+        c.ok(rc != 0, f"legacy {kind}/{name} reaped from {namespace}")
+
+    # Non-regenerable state copied into the target; regenerable/auto skipped.
+    secrets = secret_names(TARGET)
+    for name in ("ssh-dc1", "azure-creds", "bmc-secret", "unbounded-net-acr-pull"):
+        c.ok(name in secrets, f"operator secret '{name}' copied to {TARGET}")
+    c.ok("unbounded-net-serving-cert" not in secrets, "regenerable serving-cert secret NOT copied")
+    c.ok("stale-sa-token" not in secrets, "service-account-token secret NOT copied")
+
+    cm = kubectl_json("get", "configmap", "machina-config", "-n", TARGET, "-o", "json")
+    c.ok(API_ENDPOINT in cm["data"]["config.yaml"], "machina-config apiServerEndpoint preserved")
+
+    cred = kubectl_json("get", "machineoperationcredential", "cred1", "-o", "json")
+    c.ok(cred["spec"]["auth"]["secretRef"]["namespace"] == TARGET,
+         "MachineOperationCredential secretRef.namespace rewritten")
+    machine = kubectl_json("get", "machine", "m1", "-o", "json")
+    c.ok(machine["spec"]["pxe"]["redfish"]["passwordRef"]["namespace"] == TARGET,
+         "Machine redfish passwordRef.namespace rewritten")
+
+    # The freshly-staged target workloads must be left intact.
+    for kind, name in (("deploy", "machina-controller"),
+                       ("deploy", "unbounded-net-controller"),
+                       ("ds", "unbounded-net-node")):
+        rc = kubectl("get", kind, name, "-n", TARGET, check=False, capture=True).returncode
+        c.ok(rc == 0, f"target {kind}/{name} present in {TARGET}")
+
+
+def scenario_operator_reap(workdir: pathlib.Path) -> None:
+    log("=== scenario: operator-driven migrate-then-reap (one-shot subcommand) ===")
+    stage_legacy(workdir)
+    stage_target_install(workdir)
+
+    run_operator_migration()
+    c = Checks("operator-reap")
+    assert_operator_consolidated(c)
+
+    log("re-running operator migration (idempotency: legacy already reaped)")
+    run_operator_migration()
+    assert_operator_consolidated(c)
+    c.finish()
+
+
 SCENARIOS = {
     "happy": scenario_happy,
     "dry-run": scenario_dry_run,
     "resume": scenario_resume,
     "release-download": scenario_release_download,
+    "operator-reap": scenario_operator_reap,
 }
 
 

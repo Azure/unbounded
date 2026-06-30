@@ -247,7 +247,7 @@ func TestReapComponentDeletesByLabelOnly(t *testing.T) {
 	component := legacyComponent{
 		name:            ComponentMachina,
 		legacyNamespace: "unbounded-kube",
-		appNames:        []string{"machina-controller"},
+		selectors:       []map[string]string{{appNameLabel: "machina-controller"}},
 	}
 
 	remaining, err := r.reapComponent(t.Context(), logr.Discard(), component)
@@ -327,5 +327,36 @@ func readyDaemonSet(namespace, name string) *appsv1.DaemonSet {
 	return &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
 		Status:     appsv1.DaemonSetStatus{DesiredNumberScheduled: 2, NumberReady: 2},
+	}
+}
+
+func TestReapOnceSkipsComponentsWithoutLegacyFootprint(t *testing.T) {
+	// The legacy unbounded-kube namespace exists but contains only machina (no
+	// storage). The reaper must NOT block waiting for a storage target workload
+	// that will never exist.
+	r := newReaper(t,
+		ns("unbounded-kube"),
+		ns("unbounded-system"),
+		labeledAppDeployment("unbounded-kube", "machina-controller", map[string]string{"app": "machina-controller"}),
+		readyDeployment("unbounded-system", "machina-controller"),
+	)
+
+	done, err := r.reapOnce(t.Context(), logr.Discard())
+	if err != nil {
+		t.Fatalf("reapOnce: %v", err)
+	}
+
+	if !done {
+		t.Fatalf("expected done: storage has no legacy footprint and must not gate completion")
+	}
+
+	if err := r.Get(t.Context(), client.ObjectKey{Namespace: "unbounded-kube", Name: "machina-controller"}, &appsv1.Deployment{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected machina reaped, err=%v", err)
+	}
+}
+
+func labeledAppDeployment(namespace, name string, labels map[string]string) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, Labels: labels},
 	}
 }

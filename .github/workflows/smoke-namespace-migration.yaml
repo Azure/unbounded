@@ -16,6 +16,8 @@ on:
       - hack/cmd/render-manifests/**
       - deploy/machina/**
       - deploy/net/**
+      - cmd/unbounded-operator/**
+      - internal/operator/**
   push:
     branches: [main]
     paths:
@@ -25,6 +27,8 @@ on:
       - hack/cmd/render-manifests/**
       - deploy/machina/**
       - deploy/net/**
+      - cmd/unbounded-operator/**
+      - internal/operator/**
   workflow_dispatch:
 
 permissions:

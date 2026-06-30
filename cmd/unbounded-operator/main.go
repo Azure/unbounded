@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
@@ -21,6 +22,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -62,6 +64,8 @@ func main() {
 	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", false, "Migrate operator-owned state out of the legacy unbounded-kube/unbounded-net namespaces and delete the operator-owned resources left behind (does not delete the namespaces)")
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
+
+	cmd.AddCommand(migrateLegacyCommand())
 
 	if err := cmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -161,4 +165,56 @@ func runtimeScheme() *runtime.Scheme {
 	utilruntime.Must(unboundednetv1alpha1.AddToScheme(scheme))
 
 	return scheme
+}
+
+// migrateLegacyCommand runs the legacy-namespace migrate-then-reap routine once
+// to completion and exits. It performs the same copy/rewrite/reap steps as the
+// always-on reaper but as a bounded, scriptable operation (suitable for a
+// migration Job). It never deletes the legacy Namespace objects.
+func migrateLegacyCommand() *cobra.Command {
+	var (
+		targetNamespace  string
+		legacyNamespaces []string
+		timeout          time.Duration
+	)
+
+	cmd := &cobra.Command{
+		Use:   "migrate-legacy",
+		Short: "Consolidate operator-owned state out of the legacy namespaces (one-shot)",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer cancel()
+
+			if timeout > 0 {
+				var timeoutCancel context.CancelFunc
+
+				ctx, timeoutCancel = context.WithTimeout(ctx, timeout)
+				defer timeoutCancel()
+			}
+
+			ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+
+			cli, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: runtimeScheme()})
+			if err != nil {
+				return fmt.Errorf("create client: %w", err)
+			}
+
+			reaper := &operator.LegacyReaper{
+				Client:           cli,
+				TargetNamespace:  targetNamespace,
+				LegacyNamespaces: legacyNamespaces,
+				SkipSecretNames:  map[string]struct{}{"unbounded-net-serving-cert": {}},
+				CopyConfigMaps:   []string{"machina-config"},
+				Interval:         2 * time.Second,
+			}
+
+			return reaper.RunToCompletion(ctrl.LoggerInto(ctx, ctrl.Log))
+		},
+	}
+
+	cmd.Flags().StringVar(&targetNamespace, "target-namespace", unbounded.SystemNamespace, "Namespace components are consolidated into")
+	cmd.Flags().StringSliceVar(&legacyNamespaces, "legacy-namespaces", operator.LegacyNamespaces, "Legacy namespaces to drain")
+	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "Overall timeout for the migration")
+
+	return cmd
 }
