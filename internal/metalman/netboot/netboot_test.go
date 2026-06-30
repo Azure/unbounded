@@ -44,10 +44,14 @@ func newScheme(t *testing.T) *runtime.Scheme {
 }
 
 // populateOCICache creates a fake OCI cache directory structure for testing.
-// Files are placed under {cacheDir}/oci/{digest}/disk/.
+// Files are placed under {cacheDir}/oci/{digest}/amd64/disk/.
 func populateOCICache(cacheDir, digest string, files map[string][]byte) error {
+	return populateOCICacheForArchitecture(cacheDir, digest, v1alpha3.DefaultPXEArchitecture, files)
+}
+
+func populateOCICacheForArchitecture(cacheDir, digest, architecture string, files map[string][]byte) error {
 	safe := fmt.Sprintf("sha256_%s", digest)
-	diskDir := filepath.Join(cacheDir, "oci", safe, "disk")
+	diskDir := filepath.Join(cacheDir, "oci", safe, architecture, "disk")
 
 	for path, content := range files {
 		fullPath := filepath.Join(diskDir, path)
@@ -1673,6 +1677,93 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 	}
 }
 
+func TestHTTPServer_UsesMachineArchitectureForSameImageRef(t *testing.T) {
+	cacheDir := t.TempDir()
+	cache := NewOCICache(cacheDir)
+
+	imageRef := "ghcr.io/test/netboot:v1"
+	digest := "multiarch-http"
+
+	if err := populateOCICacheForArchitecture(cacheDir, digest, v1alpha3.PXEArchitectureAMD64, map[string][]byte{
+		"vmlinuz": []byte("amd64-vmlinuz"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := populateOCICacheForArchitecture(cacheDir, digest, v1alpha3.PXEArchitectureARM64, map[string][]byte{
+		"vmlinuz": []byte("arm64-vmlinuz"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cache.SetDigestForArchitecture(imageRef, v1alpha3.PXEArchitectureAMD64, "sha256:"+digest)
+	cache.SetDigestForArchitecture(imageRef, v1alpha3.PXEArchitectureARM64, "sha256:"+digest)
+
+	amd64Node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "amd64-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:        imageRef,
+				NetbootImage: imageRef,
+				Architecture: v1alpha3.PXEArchitectureAMD64,
+				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:aa:aa:aa:aa:01", IPv4: "10.0.20.1", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+	arm64Node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "arm64-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:        imageRef,
+				NetbootImage: imageRef,
+				Architecture: v1alpha3.PXEArchitectureARM64,
+				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:aa:aa:aa:aa:02", IPv4: "10.0.20.2", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(amd64Node, arm64Node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{FileResolver: FileResolver{Cache: cache, Reader: fc}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", srv.handleFile)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	for _, tt := range []struct {
+		ip   string
+		want string
+	}{
+		{ip: "10.0.20.1", want: "amd64-vmlinuz"},
+		{ip: "10.0.20.2", want: "arm64-vmlinuz"},
+	} {
+		req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
+		req.Header.Set("X-Forwarded-For", tt.ip)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET /vmlinuz for %s: %v", tt.ip, err)
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status: got %d, want 200", tt.ip, resp.StatusCode)
+		}
+
+		if string(body) != tt.want {
+			t.Errorf("%s body: got %q, want %q", tt.ip, body, tt.want)
+		}
+	}
+}
+
 func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 	// Cache with NO digest set for the image
 	cache := NewOCICache(t.TempDir())
@@ -1958,6 +2049,61 @@ func TestOCICache_ResolvePath(t *testing.T) {
 	_, _, err = cache.ResolvePath("ghcr.io/test/image:v1", "nonexistent")
 	if err == nil {
 		t.Error("expected error for nonexistent file")
+	}
+}
+
+func TestOCICache_ResolvePathForArchitecture(t *testing.T) {
+	cacheDir := t.TempDir()
+	cache := NewOCICache(cacheDir)
+
+	digest := "multiarch123"
+	imageRef := "ghcr.io/test/multiarch:v1"
+
+	if err := populateOCICacheForArchitecture(cacheDir, digest, v1alpha3.PXEArchitectureAMD64, map[string][]byte{
+		"vmlinuz": []byte("amd64 kernel"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := populateOCICacheForArchitecture(cacheDir, digest, v1alpha3.PXEArchitectureARM64, map[string][]byte{
+		"vmlinuz": []byte("arm64 kernel"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cache.SetDigestForArchitecture(imageRef, v1alpha3.PXEArchitectureAMD64, "sha256:"+digest)
+	cache.SetDigestForArchitecture(imageRef, v1alpha3.PXEArchitectureARM64, "sha256:"+digest)
+
+	amd64Path, _, err := cache.ResolvePathForArchitecture(imageRef, v1alpha3.PXEArchitectureAMD64, "vmlinuz")
+	if err != nil {
+		t.Fatalf("ResolvePathForArchitecture amd64: %v", err)
+	}
+
+	arm64Path, _, err := cache.ResolvePathForArchitecture(imageRef, v1alpha3.PXEArchitectureARM64, "vmlinuz")
+	if err != nil {
+		t.Fatalf("ResolvePathForArchitecture arm64: %v", err)
+	}
+
+	if amd64Path == arm64Path {
+		t.Fatalf("architecture-specific paths should differ: %q", amd64Path)
+	}
+
+	amd64Data, err := os.ReadFile(amd64Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	arm64Data, err := os.ReadFile(arm64Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(amd64Data) != "amd64 kernel" {
+		t.Errorf("amd64 data = %q", amd64Data)
+	}
+
+	if string(arm64Data) != "arm64 kernel" {
+		t.Errorf("arm64 data = %q", arm64Data)
 	}
 }
 

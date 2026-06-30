@@ -272,6 +272,13 @@ type PXESpec struct {
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
 
+	// Architecture is the target CPU architecture for PXE boot artifacts and
+	// machine images.
+	// +kubebuilder:validation:Enum=amd64;arm64
+	// +kubebuilder:default=amd64
+	// +optional
+	Architecture string `json:"architecture,omitempty"`
+
 	// NetbootImage is an OCI image reference containing the PXE boot
 	// artifacts used to install Image. When omitted, metalman uses the
 	// default netboot image that corresponds to its release.
@@ -290,6 +297,24 @@ type PXESpec struct {
 	// machines.
 	// +optional
 	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
+}
+
+const (
+	// PXEArchitectureAMD64 is the x86_64 target architecture for PXE boot.
+	PXEArchitectureAMD64 = "amd64"
+	// PXEArchitectureARM64 is the aarch64 target architecture for PXE boot.
+	PXEArchitectureARM64 = "arm64"
+	// DefaultPXEArchitecture is used when spec.pxe.architecture is omitted.
+	DefaultPXEArchitecture = PXEArchitectureAMD64
+)
+
+// TargetArchitecture returns the effective PXE target architecture.
+func (p *PXESpec) TargetArchitecture() string {
+	if p == nil || p.Architecture == "" {
+		return DefaultPXEArchitecture
+	}
+
+	return p.Architecture
 }
 
 // CloudInitSpec defines cloud-init customization for PXE-booted machines.

@@ -91,6 +91,9 @@ For PXE-provisioned machines, the `Machine` resource includes:
 
 - **`spec.pxe.image`** -- OCI machine image reference containing `/disk/disk.img.gz`
   (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`).
+- **`spec.pxe.architecture`** -- Optional target CPU architecture for PXE boot
+  artifacts and machine images. Defaults to `amd64`; allowed values are `amd64`
+  and `arm64`.
 - **`spec.pxe.netbootImage`** -- Optional OCI netboot image reference containing
   PXE boot artifacts. When omitted, Metalman uses its configured default
   `netboot` image.

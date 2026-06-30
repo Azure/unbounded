@@ -193,9 +193,10 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	}
 
 	if netbootImage != "" && s.OCICache != nil {
-		meta, err := s.OCICache.MetadataForRef(netbootImage)
+		architecture := node.Spec.PXE.TargetArchitecture()
+		meta, err := s.OCICache.MetadataForRefArchitecture(netbootImage, architecture)
 		if err != nil {
-			log.Warn("OCI image metadata not available", "image", netbootImage, "err", err)
+			log.Warn("OCI image metadata not available", "image", netbootImage, "architecture", architecture, "err", err)
 		} else if meta.DHCPBootImageName != "" {
 			resp.UpdateOption(dhcpv4.OptTFTPServerName(s.ServerIP.String()))
 			resp.UpdateOption(dhcpv4.OptBootFileName(meta.DHCPBootImageName))

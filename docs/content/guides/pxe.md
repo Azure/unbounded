@@ -50,6 +50,9 @@ Metalman uses a machine image and a netboot image for each PXE repave.
 
 - `spec.pxe.image` is the machine image. It contains `/disk/disk.img.gz`, a
   gzip-compressed raw disk image written to the target disk.
+- `spec.pxe.architecture` selects the target architecture (`amd64` or `arm64`)
+  used when pulling machine and netboot image platform manifests. It defaults
+  to `amd64`.
 - `spec.pxe.netbootImage` is the reusable PXE boot environment. It contains
   bootloaders, kernel, initrd, templates, metadata, and `unbounded-agent`. If
   omitted, Metalman uses the release-matched `--default-netboot-image`.
@@ -87,6 +90,7 @@ metadata:
 spec:
   pxe:
     image: ghcr.io/azure/host-ubuntu2404:v1
+    architecture: amd64
     # Optional. Omit to use Metalman's default netboot image.
     netbootImage: ghcr.io/azure/netboot:v1
     dhcpLeases:

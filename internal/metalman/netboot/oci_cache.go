@@ -11,6 +11,8 @@ import (
 	"sync"
 
 	"gopkg.in/yaml.v3"
+
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 type ImageMetadata struct {
@@ -18,72 +20,113 @@ type ImageMetadata struct {
 }
 
 // OCICache manages unpacked OCI images on the local filesystem.
-// Images are stored under {cacheDir}/oci/{digest}/disk/...
+// Images are stored under {cacheDir}/oci/{digest}/{architecture}/disk/...
 // This follows the kubevirt containerDisk convention where image
 // contents live under /disk/ in the OCI layer.
 type OCICache struct {
 	CacheDir string
 
 	mu sync.RWMutex
-	// imageRef -> digest mapping
-	digests map[string]string
-	// digest -> metadata mapping
-	metadata map[string]*ImageMetadata
+	// image ref and architecture -> digest mapping
+	digests map[imageRefKey]string
+	// digest and architecture -> metadata mapping
+	metadata map[digestKey]*ImageMetadata
+}
+
+type imageRefKey struct {
+	imageRef     string
+	architecture string
+}
+
+type digestKey struct {
+	digest       string
+	architecture string
 }
 
 func NewOCICache(cacheDir string) *OCICache {
 	return &OCICache{
 		CacheDir: cacheDir,
-		digests:  make(map[string]string),
-		metadata: make(map[string]*ImageMetadata),
+		digests:  make(map[imageRefKey]string),
+		metadata: make(map[digestKey]*ImageMetadata),
 	}
 }
 
 func (c *OCICache) SetDigest(imageRef, digest string) {
+	c.SetDigestForArchitecture(imageRef, v1alpha3.DefaultPXEArchitecture, digest)
+}
+
+func (c *OCICache) SetDigestForArchitecture(imageRef, architecture, digest string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.digests[imageRef] = digest
+	c.digests[imageRefCacheKey(imageRef, architecture)] = digest
 }
 
 func (c *OCICache) DigestFor(imageRef string) string {
+	return c.DigestForArchitecture(imageRef, v1alpha3.DefaultPXEArchitecture)
+}
+
+func (c *OCICache) DigestForArchitecture(imageRef, architecture string) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	return c.digests[imageRef]
+	return c.digests[imageRefCacheKey(imageRef, architecture)]
 }
 
 // ImageDir returns the base directory for a cached image by digest.
 func (c *OCICache) ImageDir(digest string) string {
+	return c.ImageDirForArchitecture(digest, v1alpha3.DefaultPXEArchitecture)
+}
+
+// ImageDirForArchitecture returns the base directory for a cached image by
+// digest and target architecture.
+func (c *OCICache) ImageDirForArchitecture(digest, architecture string) string {
 	// Replace ':' with '_' for safe filesystem paths (e.g. "sha256:abc" -> "sha256_abc")
 	safe := strings.ReplaceAll(digest, ":", "_")
-	return filepath.Join(c.CacheDir, "oci", safe)
+	return filepath.Join(c.CacheDir, "oci", safe, safeArchitecture(architecture))
 }
 
 // DiskDir returns the /disk/ directory for a cached image.
 func (c *OCICache) DiskDir(digest string) string {
-	return filepath.Join(c.ImageDir(digest), "disk")
+	return c.DiskDirForArchitecture(digest, v1alpha3.DefaultPXEArchitecture)
+}
+
+// DiskDirForArchitecture returns the /disk/ directory for a cached image.
+func (c *OCICache) DiskDirForArchitecture(digest, architecture string) string {
+	return filepath.Join(c.ImageDirForArchitecture(digest, architecture), "disk")
 }
 
 // IsCached returns true if the image digest is already unpacked locally.
 func (c *OCICache) IsCached(digest string) bool {
-	_, err := os.Stat(c.DiskDir(digest))
+	return c.IsCachedForArchitecture(digest, v1alpha3.DefaultPXEArchitecture)
+}
+
+// IsCachedForArchitecture returns true if the image digest is already unpacked locally.
+func (c *OCICache) IsCachedForArchitecture(digest, architecture string) bool {
+	_, err := os.Stat(c.DiskDirForArchitecture(digest, architecture))
 	return err == nil
 }
 
 // Metadata returns the parsed metadata.yaml for a cached image,
 // reading it from disk and caching in memory on first access.
 func (c *OCICache) Metadata(digest string) (*ImageMetadata, error) {
+	return c.MetadataForArchitecture(digest, v1alpha3.DefaultPXEArchitecture)
+}
+
+// MetadataForArchitecture returns the parsed metadata.yaml for a cached image.
+func (c *OCICache) MetadataForArchitecture(digest, architecture string) (*ImageMetadata, error) {
+	key := digestCacheKey(digest, architecture)
+
 	c.mu.RLock()
 
-	if m, ok := c.metadata[digest]; ok {
+	if m, ok := c.metadata[key]; ok {
 		c.mu.RUnlock()
 		return m, nil
 	}
 
 	c.mu.RUnlock()
 
-	metaPath := filepath.Join(c.DiskDir(digest), "metadata.yaml")
+	metaPath := filepath.Join(c.DiskDirForArchitecture(digest, architecture), "metadata.yaml")
 
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
@@ -92,7 +135,7 @@ func (c *OCICache) Metadata(digest string) (*ImageMetadata, error) {
 			m := &ImageMetadata{}
 
 			c.mu.Lock()
-			c.metadata[digest] = m
+			c.metadata[key] = m
 			c.mu.Unlock()
 
 			return m, nil
@@ -107,7 +150,7 @@ func (c *OCICache) Metadata(digest string) (*ImageMetadata, error) {
 	}
 
 	c.mu.Lock()
-	c.metadata[digest] = &m
+	c.metadata[key] = &m
 	c.mu.Unlock()
 
 	return &m, nil
@@ -116,12 +159,18 @@ func (c *OCICache) Metadata(digest string) (*ImageMetadata, error) {
 // MetadataForRef returns the metadata for an image reference by resolving
 // its digest first.
 func (c *OCICache) MetadataForRef(imageRef string) (*ImageMetadata, error) {
-	digest := c.DigestFor(imageRef)
+	return c.MetadataForRefArchitecture(imageRef, v1alpha3.DefaultPXEArchitecture)
+}
+
+// MetadataForRefArchitecture returns the metadata for an image reference and
+// target architecture by resolving its digest first.
+func (c *OCICache) MetadataForRefArchitecture(imageRef, architecture string) (*ImageMetadata, error) {
+	digest := c.DigestForArchitecture(imageRef, architecture)
 	if digest == "" {
-		return nil, fmt.Errorf("image %q not yet pulled", imageRef)
+		return nil, fmt.Errorf("image %q for architecture %q not yet pulled", imageRef, normalizeArchitecture(architecture))
 	}
 
-	return c.Metadata(digest)
+	return c.MetadataForArchitecture(digest, architecture)
 }
 
 // ResolvePath looks for a file at the given path under the disk directory
@@ -132,9 +181,15 @@ func (c *OCICache) MetadataForRef(imageRef string) (*ImageMetadata, error) {
 // reqPath must be a relative path with no ".." components that escape the
 // cache directory; absolute paths and paths with volume names are rejected.
 func (c *OCICache) ResolvePath(imageRef, reqPath string) (diskPath string, isTemplate bool, err error) {
-	digest := c.DigestFor(imageRef)
+	return c.ResolvePathForArchitecture(imageRef, v1alpha3.DefaultPXEArchitecture, reqPath)
+}
+
+// ResolvePathForArchitecture looks for a file at the given path under the disk
+// directory for the given image reference and target architecture.
+func (c *OCICache) ResolvePathForArchitecture(imageRef, architecture, reqPath string) (diskPath string, isTemplate bool, err error) {
+	digest := c.DigestForArchitecture(imageRef, architecture)
 	if digest == "" {
-		return "", false, fmt.Errorf("image %q not yet pulled", imageRef)
+		return "", false, fmt.Errorf("image %q for architecture %q not yet pulled", imageRef, normalizeArchitecture(architecture))
 	}
 
 	// Reject absolute paths and Windows-style volume names.
@@ -142,7 +197,7 @@ func (c *OCICache) ResolvePath(imageRef, reqPath string) (diskPath string, isTem
 		return "", false, fmt.Errorf("invalid request path %q: must be relative", reqPath)
 	}
 
-	diskDir := c.DiskDir(digest)
+	diskDir := c.DiskDirForArchitecture(digest, architecture)
 
 	// Resolve and clean the joined path, then ensure it is still rooted under
 	// diskDir. filepath.Clean eliminates any ".." segments, so a traversal
@@ -173,8 +228,38 @@ func (c *OCICache) ResolvePath(imageRef, reqPath string) (diskPath string, isTem
 // InvalidateRef removes the digest mapping for an image reference,
 // so it will be re-pulled on next reconcile.
 func (c *OCICache) InvalidateRef(imageRef string) {
+	c.InvalidateRefForArchitecture(imageRef, v1alpha3.DefaultPXEArchitecture)
+}
+
+// InvalidateRefForArchitecture removes the digest mapping for an image
+// reference and target architecture, so it will be re-pulled on next reconcile.
+func (c *OCICache) InvalidateRefForArchitecture(imageRef, architecture string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	delete(c.digests, imageRef)
+	delete(c.digests, imageRefCacheKey(imageRef, architecture))
+}
+
+func imageRefCacheKey(imageRef, architecture string) imageRefKey {
+	return imageRefKey{imageRef: imageRef, architecture: normalizeArchitecture(architecture)}
+}
+
+func digestCacheKey(digest, architecture string) digestKey {
+	return digestKey{digest: digest, architecture: normalizeArchitecture(architecture)}
+}
+
+func normalizeArchitecture(architecture string) string {
+	if architecture == "" {
+		return v1alpha3.DefaultPXEArchitecture
+	}
+
+	return architecture
+}
+
+func safeArchitecture(architecture string) string {
+	safe := normalizeArchitecture(architecture)
+	safe = strings.ReplaceAll(safe, ":", "_")
+	safe = strings.ReplaceAll(safe, "/", "_")
+
+	return safe
 }

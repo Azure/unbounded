@@ -196,11 +196,14 @@ func TestDHCPHandlerPXEUsesDefaultNetbootImage(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-default-netboot"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
-				MAC:        "aa:bb:cc:dd:ee:f2",
-				IPv4:       "10.0.1.12",
-				SubnetMask: "255.255.255.0",
-			}}},
+			PXE: &v1alpha3.PXESpec{
+				Architecture: v1alpha3.PXEArchitectureARM64,
+				DHCPLeases: []v1alpha3.DHCPLease{{
+					MAC:        "aa:bb:cc:dd:ee:f2",
+					IPv4:       "10.0.1.12",
+					SubnetMask: "255.255.255.0",
+				}},
+			},
 		},
 	}
 
@@ -208,9 +211,9 @@ func TestDHCPHandlerPXEUsesDefaultNetbootImage(t *testing.T) {
 	ociCache := netboot.NewOCICache(cacheDir)
 
 	digest := "sha256:default1234567890"
-	ociCache.SetDigest(netbootImageRef, digest)
+	ociCache.SetDigestForArchitecture(netbootImageRef, v1alpha3.PXEArchitectureARM64, digest)
 
-	diskDir := filepath.Join(ociCache.DiskDir(digest))
+	diskDir := filepath.Join(ociCache.DiskDirForArchitecture(digest, v1alpha3.PXEArchitectureARM64))
 	if err := os.MkdirAll(diskDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

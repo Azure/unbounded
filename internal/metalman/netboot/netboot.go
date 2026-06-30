@@ -111,10 +111,15 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 		return &ResolvedFile{Data: []byte(defaultUserData), ContentType: "text/plain"}, nil
 	}
 
-	diskPath, isTemplate, err := f.Cache.ResolvePath(imageRef, path)
+	architecture := v1alpha3.DefaultPXEArchitecture
+	if node != nil && node.Spec.PXE != nil {
+		architecture = node.Spec.PXE.TargetArchitecture()
+	}
+
+	diskPath, isTemplate, err := f.Cache.ResolvePathForArchitecture(imageRef, architecture, path)
 	if err != nil {
 		// Check if the image just hasn't been pulled yet
-		digest := f.Cache.DigestFor(imageRef)
+		digest := f.Cache.DigestForArchitecture(imageRef, architecture)
 		if digest == "" {
 			return nil, ErrNotYetDownloaded
 		}

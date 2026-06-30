@@ -53,6 +53,7 @@ PXE boot configuration consumed by the metalman controller.
 |-------|------|----------|---------|-------------|
 | `pxe` | PXESpec | No | - | PXE boot configuration. |
 | `pxe.image` | string | Yes | - | OCI machine image reference containing `/disk/disk.img.gz` (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`). |
+| `pxe.architecture` | string | No | `amd64` | Target CPU architecture for PXE boot artifacts and machine images. Allowed values: `amd64`, `arm64`. |
 | `pxe.netbootImage` | string | No | Metalman default | OCI netboot image reference containing PXE boot artifacts. |
 | `pxe.dhcpLeases` | []DHCPLease | No | - | Static DHCP leases served during PXE boot. |
 | `pxe.dhcpLeases[].ipv4` | string | Yes | - | Static IPv4 address to assign. |
@@ -373,6 +374,7 @@ spec:
       namespace: unbounded-kube
   pxe:
     image: ghcr.io/azure/host-ubuntu2404:v1
+    architecture: amd64
     dhcpLeases:
     - ipv4: "10.0.0.60"
       mac: "aa:bb:cc:dd:ee:ff"
@@ -404,6 +406,8 @@ Metalman uses a machine image and a netboot image for PXE repaves. The machine
 image is referenced by `spec.pxe.image` and contains `/disk/disk.img.gz`. The
 netboot image is referenced by `spec.pxe.netbootImage`, or by Metalman's default
 when that field is omitted, and contains the reusable PXE boot environment.
+`spec.pxe.architecture` selects the OCI platform manifest to pull for both
+images and defaults to `amd64`.
 
 Both images are standard OCI container images built `FROM scratch` with artifacts
 under `/disk/`. This follows the kubevirt containerDisk convention.

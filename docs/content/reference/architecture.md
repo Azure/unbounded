@@ -107,7 +107,8 @@ Machine types.
 Metalman uses two OCI images for PXE repaves. `Machine.spec.pxe.image` references
 the machine image containing `/disk/disk.img.gz`. `Machine.spec.pxe.netbootImage`
 optionally references the reusable PXE boot environment; when omitted, Metalman
-uses its configured default `netboot` image.
+uses its configured default `netboot` image. `Machine.spec.pxe.architecture`
+selects the OCI platform manifest for both images and defaults to `amd64`.
 
 Netboot images contain all files needed for PXE booting under `/disk/`. Files
 with a `.tmpl` suffix are Go templates rendered per-machine at serve time. A

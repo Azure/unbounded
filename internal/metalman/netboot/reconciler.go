@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"runtime"
 	"strings"
 	"time"
 
@@ -75,18 +74,21 @@ func (r *OCIReconciler) mapMachineToImage(_ context.Context, obj client.Object) 
 
 	reqs := make([]reconcile.Request, 0, len(refs))
 
-	seen := make(map[string]struct{}, len(refs))
+	seen := make(map[imageRefKey]struct{}, len(refs))
+	architecture := machine.Spec.PXE.TargetArchitecture()
+
 	for _, ref := range refs {
 		if ref == "" {
 			continue
 		}
 
-		if _, ok := seen[ref]; ok {
+		key := imageRefKey{imageRef: ref, architecture: architecture}
+		if _, ok := seen[key]; ok {
 			continue
 		}
 
-		seen[ref] = struct{}{}
-		reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKey{Name: ref}})
+		seen[key] = struct{}{}
+		reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKey{Namespace: architecture, Name: ref}})
 	}
 
 	return reqs
@@ -97,6 +99,7 @@ func (r *OCIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 	// req.Name is the OCI image reference, mapped from Machine events.
 	imageRef := req.Name
+	architecture := normalizeArchitecture(req.Namespace)
 
 	// Always resolve the remote digest so we detect tag updates.
 	remoteDigest, repo, err := r.resolveRemoteDigest(ctx, imageRef)
@@ -106,20 +109,20 @@ func (r *OCIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	// Check if we already have this exact digest cached.
-	existingDigest := r.Cache.DigestFor(imageRef)
-	if existingDigest == remoteDigest && r.Cache.IsCached(remoteDigest) {
+	existingDigest := r.Cache.DigestForArchitecture(imageRef, architecture)
+	if existingDigest == remoteDigest && r.Cache.IsCachedForArchitecture(remoteDigest, architecture) {
 		return ctrl.Result{RequeueAfter: imageResyncInterval}, nil
 	}
 
-	logger.Info("pulling OCI image", "image", imageRef, "digest", remoteDigest)
+	logger.Info("pulling OCI image", "image", imageRef, "digest", remoteDigest, "architecture", architecture)
 
-	if err := r.pullAndUnpack(ctx, imageRef, remoteDigest, repo); err != nil {
-		logger.Error(err, "pulling OCI image", "image", imageRef)
+	if err := r.pullAndUnpack(ctx, imageRef, remoteDigest, repo, architecture); err != nil {
+		logger.Error(err, "pulling OCI image", "image", imageRef, "architecture", architecture)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	r.Cache.SetDigest(imageRef, remoteDigest)
-	logger.Info("OCI image cached", "image", imageRef, "digest", remoteDigest)
+	r.Cache.SetDigestForArchitecture(imageRef, architecture, remoteDigest)
+	logger.Info("OCI image cached", "image", imageRef, "digest", remoteDigest, "architecture", architecture)
 
 	return ctrl.Result{RequeueAfter: imageResyncInterval}, nil
 }
@@ -156,13 +159,13 @@ func (r *OCIReconciler) resolveRemoteDigest(ctx context.Context, imageRef string
 	return desc.Digest.String(), repo, nil
 }
 
-func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest string, repo *remote.Repository) error {
+func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest string, repo *remote.Repository, architecture string) error {
 	// Check if already cached (another reconcile may have beaten us).
-	if r.Cache.IsCached(imageDigest) {
+	if r.Cache.IsCachedForArchitecture(imageDigest, architecture) {
 		return nil
 	}
 
-	imageDir := r.Cache.ImageDir(imageDigest)
+	imageDir := r.Cache.ImageDirForArchitecture(imageDigest, architecture)
 
 	if err := os.MkdirAll(imageDir, 0o755); err != nil {
 		return fmt.Errorf("creating image dir: %w", err)
@@ -188,13 +191,13 @@ func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest
 	}
 
 	// Unpack the OCI layout into the image directory using umoci.
-	if err := unpackOCILayout(ctx, layoutDir, tagOrDigest, imageDir); err != nil {
+	if err := unpackOCILayout(ctx, layoutDir, tagOrDigest, imageDir, architecture); err != nil {
 		os.RemoveAll(imageDir) //nolint:errcheck // Clean up partial unpack.
 		return fmt.Errorf("unpack OCI image: %w", err)
 	}
 
 	// Verify /disk/ directory exists (kubevirt containerDisk convention).
-	diskDir := r.Cache.DiskDir(imageDigest)
+	diskDir := r.Cache.DiskDirForArchitecture(imageDigest, architecture)
 	if _, err := os.Stat(diskDir); err != nil {
 		os.RemoveAll(imageDir) //nolint:errcheck // Clean up partial unpack.
 		return fmt.Errorf("OCI image missing /disk directory")
@@ -205,7 +208,7 @@ func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest
 
 // unpackOCILayout opens an OCI image layout at layoutDir and unpacks the
 // image tagged with the given tag into destDir using umoci.
-func unpackOCILayout(ctx context.Context, layoutDir, tag, destDir string) error {
+func unpackOCILayout(ctx context.Context, layoutDir, tag, destDir, architecture string) error {
 	engine, err := umoci.OpenLayout(layoutDir)
 	if err != nil {
 		return fmt.Errorf("open OCI layout %q: %w", layoutDir, err)
@@ -221,7 +224,7 @@ func unpackOCILayout(ctx context.Context, layoutDir, tag, destDir string) error 
 		return fmt.Errorf("tag %q not found in OCI layout", tag)
 	}
 
-	dp, err := selectPlatformDescriptor(runtime.GOARCH, descriptorPaths)
+	dp, err := selectPlatformDescriptor(architecture, descriptorPaths)
 	if err != nil {
 		return fmt.Errorf("select platform for tag %q: %w", tag, err)
 	}
@@ -257,10 +260,11 @@ func unpackOCILayout(ctx context.Context, layoutDir, tag, destDir string) error 
 	return nil
 }
 
-func selectPlatformDescriptor(hostArch string, paths []casext.DescriptorPath) (casext.DescriptorPath, error) {
+func selectPlatformDescriptor(architecture string, paths []casext.DescriptorPath) (casext.DescriptorPath, error) {
+	architecture = normalizeArchitecture(architecture)
 	want := cplatforms.Normalize(ispec.Platform{
 		OS:           "linux",
-		Architecture: hostArch,
+		Architecture: architecture,
 	})
 	matcher := cplatforms.NewMatcher(want)
 
@@ -288,7 +292,7 @@ func selectPlatformDescriptor(hostArch string, paths []casext.DescriptorPath) (c
 
 	return casext.DescriptorPath{}, fmt.Errorf(
 		"no manifest found for platform linux/%s, available %q",
-		hostArch,
+		architecture,
 		strings.Join(checked, ","),
 	)
 }
