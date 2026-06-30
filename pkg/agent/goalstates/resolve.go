@@ -213,7 +213,7 @@ func defaultOCIImageForHostDistro(hostDistro string, nvidiaGPUAvailable bool) st
 		return DefaultAzureLinux3OCIImage
 	default:
 		if nvidiaGPUAvailable {
-			return DefaultNvidiaOCImage
+			return DefaultNvidiaOCIImage
 		}
 
 		return DefaultOCIImage

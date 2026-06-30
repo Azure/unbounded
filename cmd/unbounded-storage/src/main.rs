@@ -20,7 +20,7 @@ use unbounded_storage::bufferpool::{Pool, PoolConfig, ShardDescriptor, StripeKey
 use unbounded_storage::config::{
     self, BackendSpec, Config, FrontendSpec, ResolvedFrontendBinding, frontend_spec,
 };
-use unbounded_storage::fabric::{self, Fabric, Provider};
+use unbounded_storage::fabric::{self, Fabric, MrHandle, Provider};
 use unbounded_storage::fanout::{
     FanoutPeer, FanoutTable, FetchChannel, FetchService, NumaShardTable,
 };
@@ -555,6 +555,7 @@ fn run_shard(
     ctrl_rx: mpsc::Receiver<config::ShardCommand>,
     peer_rx: mpsc::Receiver<Arc<Vec<PeerPublish>>>,
     phaseb_tx: mpsc::Sender<PhaseBReport>,
+    serve_start_rx: mpsc::Receiver<()>,
     layer_stop: Arc<AtomicBool>,
 ) {
     // The fabric endpoint is built and owned by the `FabricGroup` in the
@@ -658,13 +659,10 @@ fn run_shard(
     // Each request names its backend through the `OriginRef` the
     // frontend stamps, so the registry resolves the tier per fetch.
     //
-    // Two independent registries are needed (the pool transport and the
-    // RPC handler each own one) because they differ in which ring a
-    // cache-miss fetch drives (`OriginRing`) and which registered region
-    // origin bytes are copied into (`backing_base`). The pool transport
-    // runs on the shard thread and reuses the shard ring over the pool
-    // backing; the RPC handler serves on an ephemeral worker thread and
-    // must use a worker-local ring writing into the scratch backing.
+    // The registry runs on the shard thread, reuses the shard ring, and
+    // writes origin bytes into the pool backing. Recursive RPC owner
+    // serves go through this same pool/fetch-service path rather than a
+    // separate RPC-worker origin registry.
     log_backend_registry(widx, &backend_specs);
 
     // Route the pool's transport through the p2p finger table: a stripe
@@ -792,6 +790,7 @@ fn run_shard(
         publish: ShardPublish {
             backing_base: backing_base as usize,
             backing_len,
+            fabric_mr: mr,
             numa: shard.numa,
             fetch_channel,
             backing_keepalive,
@@ -1019,9 +1018,17 @@ fn run_shard(
         shard_loop.add_tick_hook(move || frontend_registry.progress());
     }
 
-    // PHASE B complete: peers registered, fan-out and frontend drivers
-    // built. Report readiness so the layer can finish bring-up.
+    // PHASE B complete: peers registered, fetch service installed, and
+    // frontend drivers built. Report readiness so the layer can start the
+    // shared recursive RPC servers, then wait until those handlers are
+    // installed before entering the shard loop. Without this barrier a
+    // loadgen/frontend tick can issue a remote read during the small
+    // window after phase-B reporting but before peer RPC handlers exist.
     phaseb_guard.report_ready();
+    match serve_start_rx.recv() {
+        Ok(()) => {}
+        Err(_) => return,
+    }
     metrics::shards_delta(1);
 
     // Drive the shard's cooperative future set until shutdown. The loop
@@ -1506,6 +1513,10 @@ enum ShardReady {
 struct ShardPublish {
     backing_base: usize,
     backing_len: usize,
+    /// Fabric memory region for this shard's pool backing. Shared RPC
+    /// workers use it to source owner responses directly from pinned
+    /// bufferpool pages.
+    fabric_mr: MrHandle,
     /// NUMA node this shard's cores and backing are pinned to (`None`
     /// when unpinned). Forwarded into [`PeerPublish`] so every shard can
     /// build its NUMA -> serving-shard table for NUMA-local fetch

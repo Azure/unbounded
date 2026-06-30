@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -119,7 +120,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	if older, err := r.olderActiveOperation(ctx, &op); err != nil {
+	if older, err := r.olderConflictingOperation(ctx, &op); err != nil {
 		return ctrl.Result{}, err
 	} else if older != "" {
 		message := fmt.Sprintf("waiting for older host operation %s", older)
@@ -709,22 +710,44 @@ func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
 	setCompletedCondition(op, metav1.ConditionFalse, "InProgress", message)
 }
 
-func (r *Reconciler) olderActiveOperation(ctx context.Context, op *v1alpha3.MachineOperation) (string, error) {
+func (r *Reconciler) olderConflictingOperation(ctx context.Context, op *v1alpha3.MachineOperation) (string, error) {
+	opKeys, err := r.operationConflictKeys(ctx, op)
+	if err != nil {
+		return "", err
+	}
+
+	if len(opKeys) == 0 {
+		return "", nil
+	}
+
 	var list v1alpha3.MachineOperationList
 	if err := r.List(ctx, &list); err != nil {
 		return "", fmt.Errorf("list MachineOperations: %w", err)
 	}
+
+	candidates := make([]v1alpha3.MachineOperation, 0, len(list.Items))
 
 	for _, candidate := range list.Items {
 		if candidate.Name == op.Name || candidate.Status.IsTerminal() || !isHostOperation(candidate.Spec.OperationKind) {
 			continue
 		}
 
-		if !r.operationBelongsToSite(ctx, &candidate) {
+		if !operationBefore(&candidate, op) {
 			continue
 		}
 
-		if operationBefore(&candidate, op) {
+		candidates = append(candidates, candidate)
+	}
+
+	sort.Slice(candidates, func(i, j int) bool { return operationBefore(&candidates[i], &candidates[j]) })
+
+	for _, candidate := range candidates {
+		candidateKeys, err := r.operationConflictKeys(ctx, &candidate)
+		if err != nil {
+			return "", err
+		}
+
+		if conflictSetsOverlap(opKeys, candidateKeys) {
 			return candidate.Name, nil
 		}
 	}
@@ -732,32 +755,97 @@ func (r *Reconciler) olderActiveOperation(ctx context.Context, op *v1alpha3.Mach
 	return "", nil
 }
 
-func (r *Reconciler) operationBelongsToSite(ctx context.Context, op *v1alpha3.MachineOperation) bool {
+func (r *Reconciler) operationConflictKeys(ctx context.Context, op *v1alpha3.MachineOperation) (map[string]struct{}, error) {
+	keys := map[string]struct{}{}
+
 	if len(op.Status.Targets) > 0 {
 		for _, target := range op.Status.Targets {
-			var machine v1alpha3.Machine
-			if err := r.Get(ctx, client.ObjectKey{Name: target.MachineRef}, &machine); err == nil && r.ownsMachine(&machine) {
-				return true
+			if isTerminalTarget(target) {
+				continue
+			}
+
+			if err := r.addTargetConflictKeys(ctx, keys, target.MachineRef); err != nil {
+				return nil, err
 			}
 		}
 
-		return false
+		return keys, nil
 	}
 
-	if op.Spec.MachineRef != "" {
-		var machine v1alpha3.Machine
-		if err := r.Get(ctx, client.ObjectKey{Name: op.Spec.MachineRef}, &machine); err != nil {
-			return false
+	targets, err := r.resolveTargets(ctx, op)
+	if err != nil {
+		var opErr operationError
+		if errors.As(err, &opErr) {
+			return keys, nil
 		}
 
-		return r.ownsMachine(&machine)
+		return nil, err
 	}
 
-	if op.Spec.MachineSelector != nil && r.Site != "" {
-		return r.validateSelectorScope(op.Spec.MachineSelector) == nil
+	for i := range targets {
+		addMachineConflictKeys(keys, &targets[i])
+	}
+
+	return keys, nil
+}
+
+func (r *Reconciler) addTargetConflictKeys(ctx context.Context, keys map[string]struct{}, machineName string) error {
+	if machineName == "" {
+		return nil
+	}
+
+	keys["machine:"+machineName] = struct{}{}
+
+	var machine v1alpha3.Machine
+	if err := r.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+
+		return fmt.Errorf("get Machine %s for operation conflict detection: %w", machineName, err)
+	}
+
+	if !r.ownsMachine(&machine) {
+		delete(keys, "machine:"+machineName)
+
+		return nil
+	}
+
+	addMachineConflictKeys(keys, &machine)
+
+	return nil
+}
+
+func addMachineConflictKeys(keys map[string]struct{}, machine *v1alpha3.Machine) {
+	keys["machine:"+machine.Name] = struct{}{}
+
+	if machine.Spec.PXE == nil || machine.Spec.PXE.Redfish == nil || machine.Spec.PXE.Redfish.URL == "" {
+		return
+	}
+
+	keys["redfish:"+normalizeRedfishURL(machine.Spec.PXE.Redfish.URL)] = struct{}{}
+}
+
+func isTerminalTarget(target v1alpha3.MachineOperationTargetStatus) bool {
+	return target.Phase == v1alpha3.OperationPhaseComplete || target.Phase == v1alpha3.OperationPhaseFailed
+}
+
+func conflictSetsOverlap(a, b map[string]struct{}) bool {
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+
+	for key := range a {
+		if _, ok := b[key]; ok {
+			return true
+		}
 	}
 
 	return false
+}
+
+func normalizeRedfishURL(raw string) string {
+	return strings.TrimRight(raw, "/")
 }
 
 func operationBefore(a, b *v1alpha3.MachineOperation) bool {

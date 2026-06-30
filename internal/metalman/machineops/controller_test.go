@@ -517,6 +517,151 @@ func TestReconcilerWaitsForOlderOperation(t *testing.T) {
 	require.Contains(t, updated.Status.Message, "waiting for older host operation op-a")
 }
 
+func TestReconcilerStartsDisjointHostReplaceWhileOlderReplaceInProgress(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machineA := testBareMetalMachine("machine-a", "rack-a")
+	machineA.Spec.PXE.Redfish.URL = "https://bmc-a.example.com"
+	machineB := testBareMetalMachine("machine-b", "rack-a")
+	machineB.Spec.PXE.Redfish.URL = "https://bmc-b.example.com"
+	older := testOperation("op-a", v1alpha3.OperationHostReplace)
+	older.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
+	older.Spec.MachineRef = machineA.Name
+	older.Status.Phase = v1alpha3.OperationPhaseInProgress
+	older.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef:       machineA.Name,
+		Phase:            v1alpha3.OperationPhaseInProgress,
+		Stage:            v1alpha3.OperationStageWaitingRepave,
+		TargetOperations: &v1alpha3.OperationsStatus{RebootCounter: 1, RepaveCounter: 1},
+	}}
+	newer := testOperation("op-b", v1alpha3.OperationHostReplace)
+	newer.CreationTimestamp = fixedNow()
+	newer.Spec.MachineRef = machineB.Name
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machineA, machineB, older, newer, testRedfishSecret()).WithStatusSubresource(older, newer, machineB).Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: newer.Name}})
+	require.NoError(t, err)
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: newer.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: newer.Name}, &updated))
+	require.NotEqual(t, v1alpha3.OperationPhasePending, updated.Status.Phase)
+	require.NotContains(t, updated.Status.Message, "waiting for older host operation")
+	require.Equal(t, []string{machineB.Name}, targetNames(updated.Status.Targets))
+	require.Equal(t, v1alpha3.OperationStageRepaveRequested, updated.Status.Targets[0].Stage)
+	require.Equal(t, int64(1), updated.Status.Targets[0].TargetOperations.RebootCounter)
+	require.Equal(t, int64(1), updated.Status.Targets[0].TargetOperations.RepaveCounter)
+
+	var patched v1alpha3.Machine
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: machineB.Name}, &patched))
+	require.Equal(t, int64(1), patched.Spec.Operations.RebootCounter)
+	require.Equal(t, int64(1), patched.Spec.Operations.RepaveCounter)
+}
+
+func TestReconcilerWaitsForOlderHostReplaceSelectorOverlap(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machineA := testBareMetalMachine("machine-a", "rack-a")
+	machineA.Spec.PXE.Redfish.URL = "https://bmc-a.example.com"
+	machineB := testBareMetalMachine("machine-b", "rack-a")
+	machineB.Spec.PXE.Redfish.URL = "https://bmc-b.example.com"
+	older := testOperation("op-a", v1alpha3.OperationHostReplace)
+	older.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
+	older.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
+	older.Status.Phase = v1alpha3.OperationPhaseInProgress
+	newer := testOperation("op-b", v1alpha3.OperationHostReplace)
+	newer.CreationTimestamp = fixedNow()
+	newer.Spec.MachineRef = machineB.Name
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machineA, machineB, older, newer, testRedfishSecret()).WithStatusSubresource(older, newer).Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: newer.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: newer.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationPhasePending, updated.Status.Phase)
+	require.Contains(t, updated.Status.Message, "waiting for older host operation op-a")
+}
+
+func TestReconcilerStartsDisjointHostReplaceSelector(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machineA := testBareMetalMachine("machine-a", "rack-a")
+	machineA.Labels["pool"] = "a"
+	machineA.Spec.PXE.Redfish.URL = "https://bmc-a.example.com"
+	machineB := testBareMetalMachine("machine-b", "rack-a")
+	machineB.Labels["pool"] = "b"
+	machineB.Spec.PXE.Redfish.URL = "https://bmc-b.example.com"
+	older := testOperation("op-a", v1alpha3.OperationHostReplace)
+	older.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
+	older.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a", "pool": "a"}}
+	older.Status.Phase = v1alpha3.OperationPhaseInProgress
+	newer := testOperation("op-b", v1alpha3.OperationHostReplace)
+	newer.CreationTimestamp = fixedNow()
+	newer.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a", "pool": "b"}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machineA, machineB, older, newer, testRedfishSecret()).WithStatusSubresource(older, newer, machineB).Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: newer.Name}})
+	require.NoError(t, err)
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: newer.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: newer.Name}, &updated))
+	require.NotEqual(t, v1alpha3.OperationPhasePending, updated.Status.Phase)
+	require.NotContains(t, updated.Status.Message, "waiting for older host operation")
+	require.Equal(t, []string{machineB.Name}, targetNames(updated.Status.Targets))
+
+	var patched v1alpha3.Machine
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: machineB.Name}, &patched))
+	require.Equal(t, int64(1), patched.Spec.Operations.RebootCounter)
+	require.Equal(t, int64(1), patched.Spec.Operations.RepaveCounter)
+}
+
+func TestReconcilerWaitsForOlderHostReplaceSharedRedfishEndpoint(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machineA := testBareMetalMachine("machine-a", "rack-a")
+	machineA.Spec.PXE.Redfish.URL = "https://bmc.example.com/"
+	machineB := testBareMetalMachine("machine-b", "rack-a")
+	machineB.Spec.PXE.Redfish.URL = "https://bmc.example.com"
+	older := testOperation("op-a", v1alpha3.OperationHostReplace)
+	older.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
+	older.Spec.MachineRef = machineA.Name
+	older.Status.Phase = v1alpha3.OperationPhaseInProgress
+	older.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef:       machineA.Name,
+		Phase:            v1alpha3.OperationPhaseInProgress,
+		Stage:            v1alpha3.OperationStageWaitingRepave,
+		TargetOperations: &v1alpha3.OperationsStatus{RebootCounter: 1, RepaveCounter: 1},
+	}}
+	newer := testOperation("op-b", v1alpha3.OperationHostReplace)
+	newer.CreationTimestamp = fixedNow()
+	newer.Spec.MachineRef = machineB.Name
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machineA, machineB, older, newer, testRedfishSecret()).WithStatusSubresource(older, newer).Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: newer.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: newer.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationPhasePending, updated.Status.Phase)
+	require.Contains(t, updated.Status.Message, "waiting for older host operation op-a")
+}
+
 func testReconciler(c client.Client, power PowerClientFactory, site string) *Reconciler {
 	return &Reconciler{
 		Client:                c,

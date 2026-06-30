@@ -484,7 +484,7 @@ mod tests {
     use std::pin::Pin;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 
-    use crate::bufferpool::{PageRef, Req};
+    use crate::bufferpool::Req;
     use crate::config::{HttpFrontendConfig, LoadgenFrontendConfig};
     use crate::p2p::{FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyTags};
 
