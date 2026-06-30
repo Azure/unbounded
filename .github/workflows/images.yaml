@@ -159,5 +159,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
+            VERSION=${{ needs.resolve.outputs.tag }}
+            CONTAINER_REGISTRY=${{ env.CONTAINER_REGISTRY }}
             AZHPC_VHD_URL_AMD64=${{ needs.resolve.outputs.azhpc_vhd_url_amd64 }}
             AZHPC_VHD_URL_ARM64=${{ needs.resolve.outputs.azhpc_vhd_url_arm64 }}
