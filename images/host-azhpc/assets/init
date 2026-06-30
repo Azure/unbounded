@@ -1,0 +1,236 @@
+#!/bin/sh
+# Unbounded Metal Azure HPC installer initrd /init script.
+# Overlaid on top of the Ubuntu netboot initrd via a second cpio archive.
+# Downloads a compressed raw disk image over HTTP, writes it to disk,
+# injects cloud-init datasource configuration, and reboots.
+
+set -e
+
+mkdir -p /proc /sys /dev /tmp /run /mnt /mnt/esp
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+
+# Send output through the kernel log so it appears on all consoles.
+exec >/dev/kmsg 2>&1
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+log() { echo "unbounded-metal: $*"; }
+fatal() { log "FATAL: $*"; exec sh; }
+
+retry() {
+    local n="$1" delay="$2" desc="$3" i
+    shift 3
+    for i in $(seq 1 "$n"); do
+        if "$@"; then
+            [ "$i" -gt 1 ] && log "$desc succeeded (attempt $i/$n)"
+            return 0
+        fi
+        [ "$i" -eq "$n" ] && return 1
+        log "$desc failed (attempt $i/$n), retrying in ${delay}s"
+        sleep "$delay"
+    done
+}
+
+log "Azure HPC installer starting"
+
+KVER=$(uname -r)
+for mod in virtio_pci virtio_blk ahci sd_mod nvme xfs ext4; do
+    modprobe "$mod" 2>/dev/null || true
+done
+for mod in virtio_net e1000 e1000e igb ixgbe i40e ice mlx5_core mlx4_core bnxt_en tg3 be2net ena; do
+    modprobe "$mod" 2>/dev/null || true
+done
+for f in /lib/modules/"${KVER}"/kernel/drivers/net/ethernet/*/*.ko* \
+         /lib/modules/"${KVER}"/kernel/drivers/net/ethernet/*/*/*.ko*; do
+    [ -e "$f" ] || continue
+    mod=$(basename "$f")
+    mod=${mod%.ko*}
+    modprobe "$mod" 2>/dev/null || true
+done
+for mod in nls_cp437 nls_ascii nls_utf8 fat vfat efivarfs; do
+    modprobe "$mod" 2>/dev/null || true
+done
+
+log "waiting for network interface"
+IFACE=""
+find_iface() {
+    IFACE=$(ls /sys/class/net/ 2>/dev/null | grep -v lo | head -1)
+    [ -n "$IFACE" ]
+}
+retry 30 1 "find network interface" find_iface || fatal "no network interface found"
+
+CMDLINE=$(cat /proc/cmdline)
+get_param() {
+    for tok in $CMDLINE; do
+        case "$tok" in "$1"=*) echo "${tok#"$1"=}"; return 0 ;; esac
+    done
+    return 1
+}
+
+IMAGE_URL=$(get_param unbounded.image_url) || fatal "unbounded.image_url not set"
+SERVE_URL=$(get_param unbounded.serve_url || true)
+TARGET_DISK=$(get_param unbounded.disk || true)
+DS_URL=$(get_param unbounded.ds_url || true)
+NODE_NAME=$(get_param unbounded.node_name || true)
+NODE_NAMESPACE=$(get_param unbounded.node_namespace || true)
+APISERVER_URL=$(get_param unbounded.apiserver_url || true)
+
+mask2cidr() {
+    local cidr=0
+    for octet in $(echo "$1" | tr '.' ' '); do
+        case "$octet" in
+            255) cidr=$((cidr + 8)) ;; 254) cidr=$((cidr + 7)) ;;
+            252) cidr=$((cidr + 6)) ;; 248) cidr=$((cidr + 5)) ;;
+            240) cidr=$((cidr + 4)) ;; 224) cidr=$((cidr + 3)) ;;
+            192) cidr=$((cidr + 2)) ;; 128) cidr=$((cidr + 1)) ;;
+        esac
+    done
+    echo "$cidr"
+}
+
+IP_PARAM=$(get_param ip || true)
+if [ -n "$IP_PARAM" ]; then
+    CLIENT_IP=$(echo "$IP_PARAM" | cut -d: -f1)
+    GW=$(echo "$IP_PARAM" | cut -d: -f3)
+    MASK=$(echo "$IP_PARAM" | cut -d: -f4)
+    IFACE_PARAM=$(echo "$IP_PARAM" | cut -d: -f6)
+
+    case "$MASK" in
+        *.*.*.*) PREFIX=$(mask2cidr "$MASK") ;;
+        *) PREFIX="$MASK" ;;
+    esac
+
+    if [ -n "$IFACE_PARAM" ] && [ -e "/sys/class/net/$IFACE_PARAM" ]; then
+        IFACE="$IFACE_PARAM"
+    fi
+
+    log "configuring $IFACE with $CLIENT_IP/$PREFIX gw $GW"
+    retry 5 2 "link up $IFACE" ip link set "$IFACE" up || fatal "failed to bring up $IFACE"
+    retry 3 1 "add address" ip addr add "$CLIENT_IP/$PREFIX" dev "$IFACE" || true
+    retry 3 1 "add default route" ip route add default via "$GW" dev "$IFACE" || true
+fi
+
+if [ -z "$TARGET_DISK" ]; then
+    log "waiting for block devices"
+    find_disk() {
+        TARGET_DISK=""
+        MAX_SIZE=0
+        for disk in /sys/block/sd* /sys/block/nvme* /sys/block/vd*; do
+            [ -e "$disk" ] || continue
+            SIZE=$(cat "$disk/size" 2>/dev/null || echo 0)
+            if [ "$SIZE" -gt "$MAX_SIZE" ]; then
+                MAX_SIZE=$SIZE
+                TARGET_DISK="/dev/$(basename "$disk")"
+            fi
+        done
+        [ -n "$TARGET_DISK" ]
+    }
+    retry 30 1 "find block device" find_disk || fatal "no target disk found"
+fi
+log "target disk: $TARGET_DISK"
+
+log "downloading disk image from $IMAGE_URL"
+retry 120 5 "download disk image" wget -q -O /tmp/disk.img.gz "$IMAGE_URL" \
+    || fatal "failed to download disk image"
+
+log "writing disk image to $TARGET_DISK"
+write_image() { gunzip -c /tmp/disk.img.gz | dd of="$TARGET_DISK" bs=4194304; }
+retry 3 5 "write disk image" write_image || fatal "failed to write disk image"
+rm -f /tmp/disk.img.gz
+sync
+
+retry 5 2 "re-read partition table" blockdev --rereadpt "$TARGET_DISK" \
+    || log "WARNING: could not re-read partition table"
+sleep 2
+
+parts_for_disk() {
+    base=$(basename "$TARGET_DISK")
+    for p in /sys/block/"$base"/"$base"*; do
+        [ -e "$p" ] || continue
+        echo "/dev/$(basename "$p")"
+    done
+}
+
+find_root_part() {
+    ROOT_PART=""
+    for part in $(parts_for_disk); do
+        if mount "$part" /mnt 2>/dev/null; then
+            if [ -d /mnt/etc ] && [ -d /mnt/var ]; then
+                ROOT_PART="$part"
+                umount /mnt
+                return 0
+            fi
+            umount /mnt
+        fi
+    done
+    return 1
+}
+
+if [ -n "$DS_URL" ]; then
+    log "injecting cloud-init datasource: $DS_URL"
+    retry 20 2 "find root partition" find_root_part || fatal "no root partition found on $TARGET_DISK"
+    retry 5 2 "mount $ROOT_PART" mount "$ROOT_PART" /mnt || fatal "failed to mount $ROOT_PART"
+
+    mkdir -p /mnt/etc/cloud/cloud.cfg.d /mnt/etc/unbounded-metal
+    cat > /mnt/etc/cloud/cloud.cfg.d/99-unbounded-metal.cfg <<CLOUDINIT
+datasource_list: [NoCloud]
+datasource:
+  NoCloud:
+    seedfrom: ${DS_URL}
+CLOUDINIT
+    rm -f /mnt/etc/cloud/cloud-init.disabled
+    cat > /mnt/etc/unbounded-metal/config <<UMCONFIG
+SERVE_URL=${SERVE_URL}
+NODE_NAME=${NODE_NAME}
+NODE_NAMESPACE=${NODE_NAMESPACE}
+APISERVER_URL=${APISERVER_URL}
+UMCONFIG
+    sync
+    umount /mnt
+    log "cloud-init configured on $ROOT_PART"
+fi
+
+if [ -d /sys/firmware/efi ]; then
+    log "creating UEFI boot entry for local disk"
+    if ! mountpoint -q /sys/firmware/efi/efivars 2>/dev/null; then
+        mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null || true
+    fi
+
+    for part in $(parts_for_disk); do
+        if mount -t vfat "$part" /mnt/esp 2>/dev/null; then
+            LOADER=""
+            for candidate in \
+                /EFI/BOOT/BOOTX64.EFI \
+                /EFI/BOOT/BOOTAA64.EFI \
+                /EFI/ubuntu/shimx64.efi \
+                /EFI/ubuntu/shimaa64.efi; do
+                if [ -f "/mnt/esp${candidate}" ]; then
+                    LOADER="$(echo "$candidate" | tr '/' '\\\\')"
+                    break
+                fi
+            done
+            umount /mnt/esp
+
+            if [ -n "$LOADER" ] && command -v efibootmgr >/dev/null 2>&1; then
+                ESP_NUM=$(basename "$part" | sed "s/^$(basename "$TARGET_DISK")//; s/^p//")
+                efibootmgr --create --disk "$TARGET_DISK" --part "$ESP_NUM" \
+                    --loader "$LOADER" --label "azhpc" 2>&1 \
+                    && log "UEFI boot entry created (${LOADER} on part ${ESP_NUM})" \
+                    || log "WARNING: efibootmgr failed, PXE chainloader will be used as fallback"
+                break
+            fi
+        fi
+    done
+fi
+
+if [ -n "$SERVE_URL" ]; then
+    log "disabling PXE boot"
+    retry 5 2 "disable PXE" wget -q -O /dev/null "$SERVE_URL/pxe/disable" \
+        || log "WARNING: failed to disable PXE boot"
+fi
+
+log "installation complete, rebooting"
+sleep 2
+retry 3 2 "reboot" reboot -f || fatal "failed to reboot"

@@ -14,6 +14,14 @@ on:
         description: "Image to build (directory name under images/, e.g. \"agent-ubuntu2404\")"
         required: true
         type: string
+      azhpc-vhd-url-amd64:
+        description: "Azure HPC VHD URL for linux/amd64 host-azhpc images"
+        required: false
+        type: string
+      azhpc-vhd-url-arm64:
+        description: "Azure HPC VHD URL for linux/arm64 host-azhpc images"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -101,3 +109,6 @@ jobs:
           tags: ${{ env.CONTAINER_REGISTRY }}/${{ needs.resolve.outputs.name }}:${{ needs.resolve.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            AZHPC_VHD_URL_AMD64=${{ inputs['azhpc-vhd-url-amd64'] || (needs.resolve.outputs.name == 'host-azhpc-ubuntu2404' && vars.AZHPC_UBUNTU2404_VHD_URL_AMD64) || (needs.resolve.outputs.name == 'host-azhpc-azlinux3' && vars.AZHPC_AZLINUX3_VHD_URL_AMD64) || '' }}
+            AZHPC_VHD_URL_ARM64=${{ inputs['azhpc-vhd-url-arm64'] || (needs.resolve.outputs.name == 'host-azhpc-ubuntu2404' && vars.AZHPC_UBUNTU2404_VHD_URL_ARM64) || (needs.resolve.outputs.name == 'host-azhpc-azlinux3' && vars.AZHPC_AZLINUX3_VHD_URL_ARM64) || '' }}

@@ -1,0 +1,131 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Build the unbounded-agent binary for the target machine architecture.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.4-trixie@sha256:0dcba0d95dbfb072e9917a106b9e07d7cc298097dc83e9307056ef1889de654d AS gobuilder
+
+ARG TARGETARCH
+ARG VERSION=dev
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
+    -ldflags "-s -w \
+      -X github.com/Azure/unbounded/internal/version.Version=${VERSION} \
+      -X github.com/Azure/unbounded/internal/version.GitCommit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+    -o /unbounded-agent ./cmd/agent
+
+# Assemble Metalman netboot artifacts around an Azure HPC Azure Linux 3 VHD.
+FROM docker.io/library/ubuntu:24.04 AS build
+
+ARG TARGETARCH
+ARG AZHPC_VHD_URL
+ARG AZHPC_VHD_URL_AMD64
+ARG AZHPC_VHD_URL_ARM64
+ARG AZHPC_VHD_SHA256
+
+RUN apt-get update && \
+    ok=false && \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get install -y --no-install-recommends \
+           ca-certificates cpio curl efibootmgr kmod linux-image-generic pigz qemu-utils xz-utils; then \
+        ok=true; break; \
+      fi; \
+      echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
+      sleep 30; \
+      apt-get update; \
+    done && $ok && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /artifacts && \
+    KVER=$(ls /lib/modules | head -1) && \
+    cp "/boot/vmlinuz-${KVER}" /artifacts/vmlinuz && \
+    if [ "${TARGETARCH}" = "amd64" ]; then \
+        NETBOOT_BASE="https://releases.ubuntu.com/24.04.2/netboot/amd64"; \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /artifacts/shimx64.efi "${NETBOOT_BASE}/bootx64.efi" && \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /artifacts/grubx64.efi "${NETBOOT_BASE}/grubx64.efi" && \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /artifacts/initrd "${NETBOOT_BASE}/initrd"; \
+    elif [ "${TARGETARCH}" = "arm64" ]; then \
+        NETBOOT_URL="https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.4-netboot-arm64.tar.gz"; \
+        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+            -o /tmp/netboot.tar.gz "${NETBOOT_URL}" && \
+        tar -xzf /tmp/netboot.tar.gz -C /tmp && \
+        cp /tmp/arm64/bootaa64.efi /artifacts/shimaa64.efi && \
+        cp /tmp/arm64/grubaa64.efi /artifacts/grubaa64.efi && \
+        cp /tmp/arm64/initrd /artifacts/initrd && \
+        rm -rf /tmp/netboot.tar.gz /tmp/arm64; \
+    else \
+        echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1; \
+    fi
+
+COPY images/host-azhpc/assets/init /tmp/initrd-root/init
+RUN chmod 755 /tmp/initrd-root/init && \
+    mkdir -p /tmp/initrd-root/usr/bin /tmp/initrd-root/usr/lib && \
+    cp /usr/bin/efibootmgr /tmp/initrd-root/usr/bin/ && \
+    for lib in $(ldd /usr/bin/efibootmgr | awk '/=>/{print $3}'); do \
+        mkdir -p "/tmp/initrd-root$(dirname "$lib")" && \
+        cp "$lib" "/tmp/initrd-root${lib}"; \
+    done && \
+    INTERP=$(ldd /usr/bin/efibootmgr | awk '/ld-linux/{print $1}') && \
+    mkdir -p "/tmp/initrd-root$(dirname "$INTERP")" && \
+    cp "$INTERP" "/tmp/initrd-root${INTERP}" && \
+    KVER=$(ls /lib/modules | head -1) && \
+    KMOD="/tmp/initrd-root/lib/modules/${KVER}" && \
+    mkdir -p "${KMOD}/kernel/drivers/net" \
+             "${KMOD}/kernel/drivers/scsi" \
+             "${KMOD}/kernel/drivers/ata" \
+             "${KMOD}/kernel/drivers/nvme" \
+             "${KMOD}/kernel/drivers/virtio" \
+             "${KMOD}/kernel/drivers/block" \
+             "${KMOD}/kernel/fs" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/net/." "${KMOD}/kernel/drivers/net/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/scsi/." "${KMOD}/kernel/drivers/scsi/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/ata/." "${KMOD}/kernel/drivers/ata/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/nvme/." "${KMOD}/kernel/drivers/nvme/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/virtio/." "${KMOD}/kernel/drivers/virtio/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/block/." "${KMOD}/kernel/drivers/block/" && \
+    cp -a "/lib/modules/${KVER}/kernel/fs/." "${KMOD}/kernel/fs/" && \
+    depmod -b /tmp/initrd-root "${KVER}" && \
+    cd /tmp/initrd-root && \
+    find . -print0 | cpio --create --format=newc --quiet --null > /artifacts/init.cpio
+
+RUN mkdir -p /disk/grub /disk/cloud-init && \
+    cp /artifacts/vmlinuz /artifacts/initrd /artifacts/init.cpio /disk/ && \
+    if [ "${TARGETARCH}" = "amd64" ]; then \
+        cp /artifacts/shimx64.efi /artifacts/grubx64.efi /disk/ && \
+        echo "dhcpBootImageName: shimx64.efi" > /disk/metadata.yaml; \
+    elif [ "${TARGETARCH}" = "arm64" ]; then \
+        cp /artifacts/shimaa64.efi /artifacts/grubaa64.efi /disk/ && \
+        echo "dhcpBootImageName: shimaa64.efi" > /disk/metadata.yaml; \
+    fi
+
+COPY images/host-azhpc/assets/grub.cfg.tmpl /disk/grub/grub.cfg.tmpl
+COPY images/host-azhpc/assets/meta-data.tmpl /disk/cloud-init/meta-data.tmpl
+COPY images/host-azhpc/assets/vendor-data.tmpl /disk/cloud-init/vendor-data.tmpl
+COPY --from=gobuilder /unbounded-agent /disk/unbounded-agent
+
+RUN set -eux; \
+    vhd_url="${AZHPC_VHD_URL}"; \
+    if [ -z "$vhd_url" ] && [ "${TARGETARCH}" = "amd64" ]; then vhd_url="${AZHPC_VHD_URL_AMD64}"; fi; \
+    if [ -z "$vhd_url" ] && [ "${TARGETARCH}" = "arm64" ]; then vhd_url="${AZHPC_VHD_URL_ARM64}"; fi; \
+    if [ -z "$vhd_url" ]; then \
+        echo "AZHPC_VHD_URL, or AZHPC_VHD_URL_${TARGETARCH}, must point to an Azure HPC Azure Linux 3 VHD" >&2; \
+        exit 1; \
+    fi; \
+    curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 -o /tmp/azhpc.vhd "$vhd_url"; \
+    if [ -n "${AZHPC_VHD_SHA256}" ]; then echo "${AZHPC_VHD_SHA256}  /tmp/azhpc.vhd" | sha256sum -c -; fi; \
+    qemu-img convert -O raw /tmp/azhpc.vhd /tmp/disk.img; \
+    rm /tmp/azhpc.vhd; \
+    pigz -1 /tmp/disk.img; \
+    mv /tmp/disk.img.gz /disk/disk.img.gz
+
+FROM scratch
+LABEL org.opencontainers.image.source="https://github.com/Azure/azhpc-images" \
+      org.opencontainers.image.description="Metalman netboot image for Azure HPC Azure Linux 3 VHDs"
+COPY --from=build /disk /disk
