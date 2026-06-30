@@ -535,6 +535,26 @@ For filesystem mode, operators export the official rootfs image as a local OCI l
 }
 ```
 
+## Repave and upgrade behavior
+
+Repave and rootfs upgrade operations rebuild or reprovision the nspawn rootfs, so they need the same offline artifacts as initial bootstrap. `OfflineArtifacts` should be treated as durable agent config and used for these operations whenever it is set.
+
+For environments that need Kubernetes version upgrade support, the recommended setup is OCI registry mode with a Kubernetes-version template in `OfflineArtifacts.Source`:
+
+```json
+{
+  "OfflineArtifacts": {
+    "Source": "oci://registry.internal.example.com/unbounded/bootstrap-artifacts:v0.4.0-k8s-{{ .KubernetesVersion }}"
+  }
+}
+```
+
+With this pattern, the same agent config can resolve different offline bundles as `Cluster.Version` changes, as long as the internal registry contains a matching bundle tag for each supported Kubernetes version. Operators should keep old bundle tags available for as long as nodes may need to repave, roll back, or recover to those versions.
+
+Filesystem mode can also support upgrades, but each target host must already have the matching artifact directory for every Kubernetes version it may need. This is simpler for small fleets but harder to manage for broad upgrades.
+
+`OfflineArtifacts` does not cover the `unbounded-agent` binary itself. Agent binary upgrades still need their own offline-capable source.
+
 ## Preflight checks
 
 Preflight should make offline bootstrap failures actionable before the agent starts mutating the host or rootfs.
