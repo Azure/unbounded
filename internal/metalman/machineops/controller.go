@@ -731,6 +731,7 @@ func (r *Reconciler) olderConflictingOperation(ctx context.Context, op *v1alpha3
 
 func (r *Reconciler) operationConflictKeys(ctx context.Context, op *v1alpha3.MachineOperation) (map[string]struct{}, error) {
 	keys := map[string]struct{}{}
+
 	if len(op.Status.Targets) > 0 {
 		for _, target := range op.Status.Targets {
 			if isTerminalTarget(target) {
