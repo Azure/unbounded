@@ -3,6 +3,17 @@
 
 name: unbounded agent offline artifacts
 
+# Publishes OCI artifact bundles using the tag shape documented in
+# designs/agent-offline-bootstrap.md:
+#
+#   ghcr.io/<owner>/unbounded/bootstrap-artifacts:<tag-prefix>-k8s-<kubernetes-version>
+#
+# For example, pushing tag "agent-artifacts/v0.4.0" publishes:
+#
+#   ghcr.io/azure/unbounded/bootstrap-artifacts:v0.4.0-k8s-v1.34.2
+#
+# Manual dispatch uses the "tag" input as <tag-prefix>. If omitted, the first
+# 12 characters of the commit SHA are used.
 on:
   push:
     tags:
@@ -15,9 +26,8 @@ on:
         required: false
         type: string
       kubernetes_versions:
-        description: "Kubernetes versions to publish. Accepts comma, space, or newline separated values."
+        description: "Kubernetes versions to publish. Accepts comma, space, or newline separated values. Defaults to hack/cmd/agent-artifacts-builder/kubernetes-versions.txt."
         required: false
-        default: "v1.34.2"
         type: string
 
 permissions:
@@ -34,6 +44,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build agent artifacts builder
+        run: go build -o bin/agent-artifacts-builder ./hack/cmd/agent-artifacts-builder/main.go
+
       - name: Resolve publish inputs
         id: resolve
         env:
@@ -42,7 +61,14 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_KUBERNETES_VERSIONS: ${{ inputs.kubernetes_versions }}
           GITHUB_SHA_VALUE: ${{ github.sha }}
-        run: hack/scripts/resolve-agent-artifacts-publish-inputs.py
+        run: bin/agent-artifacts-builder resolve-publish-inputs
+
+      - name: Upload agent artifacts builder
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agent-artifacts-builder
+          path: bin/agent-artifacts-builder
+          retention-days: 1
 
   publish:
     needs: resolve
@@ -56,14 +82,14 @@ jobs:
       ARTIFACT_TAG_PREFIX: ${{ needs.resolve.outputs.tag }}
       KUBERNETES_VERSION: ${{ matrix.kubernetes_version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Set up Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - name: Download agent artifacts builder
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          name: agent-artifacts-builder
+          path: bin
+
+      - name: Prepare agent artifacts builder
+        run: chmod +x bin/agent-artifacts-builder
 
       - name: Normalize registry
         run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
@@ -75,28 +101,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build agent artifacts builder
-        run: go build -o bin/agent-artifacts-builder ./hack/cmd/agent-artifacts-builder/main.go
-
-      - name: Write artifact manifest
-        run: |
-          set -euo pipefail
-          mkdir -p dist/bootstrap-artifacts
-          crictl_version=$(python3 -c 'import os, re, sys; version = os.environ["KUBERNETES_VERSION"]; match = re.match(r"^v?(\d+)\.(\d+)", version);
-          sys.exit(f"invalid Kubernetes version: {version}") if not match else None;
-          print(f"{match.group(1)}.{match.group(2)}.0")')
-          crictl_version="$crictl_version" python3 -c 'import json, os; print(json.dumps({"schemaVersion": 1, "versions": {"kubernetes": os.environ["KUBERNETES_VERSION"], "containerd": "2.1.8", "runc": "1.5.0", "cni": "1.5.1", "crictl": os.environ["crictl_version"]}}, indent=2))' > dist/bootstrap-artifacts/manifest.json
-          cat dist/bootstrap-artifacts/manifest.json
-
       - name: Build and publish offline artifact bundle
         run: |
           set -euo pipefail
+          # Keep this tag format in sync with designs/agent-offline-bootstrap.md.
           oci_ref="${REGISTRY}/bootstrap-artifacts:${ARTIFACT_TAG_PREFIX}-k8s-${KUBERNETES_VERSION}"
           output_dir="dist/bootstrap-artifacts/${KUBERNETES_VERSION}"
 
           bin/agent-artifacts-builder \
             --output-dir "$output_dir" \
-            --manifest dist/bootstrap-artifacts/manifest.json \
+            --kubernetes-version "$KUBERNETES_VERSION" \
             --arch amd64 \
             --arch arm64 \
             --oci-ref "$oci_ref"

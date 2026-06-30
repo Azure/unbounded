@@ -54,6 +54,25 @@ func TestNewPlan(t *testing.T) {
 	)
 }
 
+func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
+	plan, err := NewPlan(Options{
+		OutputDir:         t.TempDir(),
+		KubernetesVersion: "1.34.2",
+		Architectures:     []string{"amd64"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, Manifest{
+		SchemaVersion: 1,
+		Versions: Versions{
+			Kubernetes: "v1.34.2",
+			Containerd: "2.1.8",
+			Runc:       "1.5.0",
+			CNI:        "1.5.1",
+			Crictl:     "1.34.0",
+		},
+	}, plan.Manifest)
+}
+
 func TestNewPlanLoadsManifestFile(t *testing.T) {
 	dir := t.TempDir()
 	manifestPath := filepath.Join(dir, "manifest.json")

@@ -30,6 +30,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 const (
@@ -45,10 +46,11 @@ type (
 )
 
 type Options struct {
-	OutputDir    string
-	OCIRef       string
-	ManifestPath string
-	Manifest     Manifest
+	OutputDir         string
+	OCIRef            string
+	ManifestPath      string
+	Manifest          Manifest
+	KubernetesVersion string
 
 	Architectures []string
 
@@ -342,16 +344,42 @@ func verifyKubernetesChecksum(binaryPath string) error {
 }
 
 func resolveManifest(opts Options) (Manifest, error) {
-	manifest := opts.Manifest
 	if opts.ManifestPath != "" {
-		loaded, err := loadManifest(opts.ManifestPath)
+		manifest, err := loadManifest(opts.ManifestPath)
 		if err != nil {
 			return Manifest{}, err
 		}
-		manifest = loaded
+
+		return agentartifacts.NormalizeManifest(manifest)
 	}
 
-	return agentartifacts.NormalizeManifest(manifest)
+	if opts.KubernetesVersion != "" {
+		manifest, err := defaultManifest(opts.KubernetesVersion)
+		if err != nil {
+			return Manifest{}, err
+		}
+
+		return manifest, nil
+	}
+
+	return agentartifacts.NormalizeManifest(opts.Manifest)
+}
+
+func defaultManifest(kubernetesVersion string) (Manifest, error) {
+	crictlVersion, err := agentartifacts.CrictlVersionForKubernetesVersion(kubernetesVersion)
+	if err != nil {
+		return Manifest{}, err
+	}
+
+	return agentartifacts.NormalizeManifest(Manifest{
+		Versions: Versions{
+			Kubernetes: kubernetesVersion,
+			Containerd: goalstates.ContainerdVersion,
+			Runc:       goalstates.RunCVersion,
+			CNI:        goalstates.CNIPluginVersion,
+			Crictl:     crictlVersion,
+		},
+	})
 }
 
 func loadManifest(path string) (Manifest, error) {
