@@ -44,6 +44,17 @@ unsafe extern "C" {
         ca_file: *const c_char,
         ca_path: *const c_char,
     ) -> c_int;
+    pub fn SSL_CTX_use_certificate_file(
+        ctx: *mut SSL_CTX,
+        file: *const c_char,
+        file_type: c_int,
+    ) -> c_int;
+    pub fn SSL_CTX_use_PrivateKey_file(
+        ctx: *mut SSL_CTX,
+        file: *const c_char,
+        file_type: c_int,
+    ) -> c_int;
+    pub fn SSL_CTX_check_private_key(ctx: *mut SSL_CTX) -> c_int;
     pub fn SSL_CTX_set_verify(
         ctx: *mut SSL_CTX,
         mode: c_int,
@@ -70,5 +81,6 @@ unsafe extern "C" {
     pub fn ub_ssl_ktls_send_enabled(ssl: *mut SSL) -> c_int;
     pub fn ub_ssl_ktls_recv_enabled(ssl: *mut SSL) -> c_int;
     pub fn ub_ssl_op_enable_ktls() -> c_ulong;
+    pub fn ub_ssl_filetype_pem() -> c_int;
     pub fn ub_tls1_2_version() -> c_int;
 }

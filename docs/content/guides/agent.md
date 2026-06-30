@@ -20,7 +20,7 @@ in sequence:
    kernel parameters for Kubernetes networking, and disables services that
    conflict with kubelet (Docker, swap).
 2. **Rootfs preparation** (`rootfs`) -- detects host settings such as CPU
-   architecture and NVIDIA GPU devices, creates a
+   architecture and GPU devices, creates a
    [systemd-nspawn]({{< relref "reference/agent/nspawn" >}}) machine rootfs
    (from an OCI image), and downloads containerd, runc, CNI
    plugins, and Kubernetes binaries.
@@ -334,15 +334,19 @@ my-node    Ready    <none>   20s   v1.33.1   192.168.100.10   <none>        Ubun
 
 ## GPU Support
 
-When NVIDIA GPUs are detected on the host, the agent automatically:
+When GPUs are detected on the host, the agent automatically exposes the host
+paths needed by Kubernetes device plugins:
 
-- Bind-mounts GPU devices and driver libraries into the nspawn machine.
-- Generates a CDI spec and registers the NVIDIA container runtime with
+- For NVIDIA GPUs, bind-mounts GPU devices and driver libraries into the nspawn
+  machine, generates a CDI spec, and registers the NVIDIA container runtime with
   containerd.
+- For AMD GPUs, bind-mounts `/dev/kfd` and DRM device nodes and exposes AMD
+  sysfs paths read-only so the AMD Kubernetes device plugin can detect GPUs
+  inside nspawn.
 
-No additional configuration is required. Both `amd64` and `arm64`
-architectures are supported. See the
-[GPU reference]({{< relref "reference/gpu" >}}) for details.
+The agent does not deploy GPU device plugins. Install the vendor device plugin
+for Kubernetes resource advertisement. See the [GPU reference]({{< relref "reference/gpu" >}})
+for details.
 
 ## Troubleshooting
 
@@ -357,8 +361,9 @@ kubelet logs inside the nspawn machine:
 machinectl shell <machine-name> /bin/journalctl -u kubelet
 ```
 
-**GPU not detected** -- Confirm that the NVIDIA driver is installed on the host
-and that GPU devices are visible under `/dev/nvidia*`.
+**GPU not detected** -- Confirm that the vendor driver is installed and loaded
+on the host. For NVIDIA, check `/dev/nvidia*`. For AMD, check `/dev/kfd`,
+`/dev/dri/card*`, and `/dev/dri/renderD*`.
 
 ## See Also
 

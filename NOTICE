@@ -204,7 +204,7 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/smithy-go/blob/v1.27.1/LICENSE
+        link: https://github.com/aws/smithy-go/blob/v1.27.2/LICENSE
   - dependency: github.com/bougou/go-ipmi
     ecosystem: go
     copyright:

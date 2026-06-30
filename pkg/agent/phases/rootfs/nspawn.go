@@ -15,7 +15,6 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/phases/rootfs/debootstrap"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs/oci"
 )
 
@@ -31,8 +30,8 @@ type ensureNSpawnWorkspace struct {
 	goalState *goalstates.RootFS
 }
 
-// EnsureNSpawnWorkspace returns a task that bootstraps an Ubuntu rootfs into
-// the machine directory (if it is empty or missing) and writes the
+// EnsureNSpawnWorkspace returns a task that bootstraps an OCI rootfs into the
+// machine directory (if it is empty or missing) and writes the
 // systemd-nspawn configuration files needed to run a Kubernetes node inside a
 // nspawn container.
 func EnsureNSpawnWorkspace(log *slog.Logger, goalState *goalstates.RootFS) phases.Task {
@@ -54,14 +53,7 @@ func (e *ensureNSpawnWorkspace) Do(ctx context.Context) error {
 }
 
 func (e *ensureNSpawnWorkspace) bootstrapWorkspace(ctx context.Context) error {
-	var bootstrapTask phases.Task
-
-	if image := e.goalState.OCIImage; image != "" {
-		bootstrapTask = oci.DownloadRootFS(e.log, e.goalState.MachineDir, e.goalState.HostArch, image)
-	} else {
-		bootstrapTask = debootstrap.Ubuntu(e.log, e.goalState.MachineDir)
-	}
-
+	bootstrapTask := oci.DownloadRootFS(e.log, e.goalState.MachineDir, e.goalState.HostArch, e.goalState.OCIImage)
 	return phases.ExecuteTask(ctx, e.log, bootstrapTask)
 }
 
@@ -76,6 +68,8 @@ type nspawnTemplateData struct {
 	HostDevicePaths      []string
 	NvidiaGPUDevicePaths []string
 	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
+	AMDGPUDevicePaths    []string
+	AMDSysFSPaths        []string
 }
 
 // writeNSpawnConfigs renders the nspawn and service-override templates with
@@ -86,12 +80,15 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	// directory.
 	machineName := filepath.Base(e.goalState.MachineDir)
 	hostDevicePaths := e.goalState.HostDevices.Paths()
+	amdGPUDevicePaths := pathsExcluding(e.goalState.AMD.GPUDevicePaths, e.goalState.Nvidia.GPUDevicePaths)
 	templateData := nspawnTemplateData{
 		MachineName:          machineName,
 		BPFFSMountPath:       goalstates.BPFFSMountPath(machineName),
 		HostDevicePaths:      hostDevicePaths,
 		NvidiaGPUDevicePaths: e.goalState.Nvidia.GPUDevicePaths,
 		NvidiaLibDirMounts:   e.goalState.Nvidia.LibDirMounts,
+		AMDGPUDevicePaths:    amdGPUDevicePaths,
+		AMDSysFSPaths:        e.goalState.AMD.SysFSPaths,
 	}
 
 	if len(hostDevicePaths) > 0 {
@@ -105,6 +102,11 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	if len(e.goalState.Nvidia.GPUDevicePaths) > 0 {
 		e.log.Info("GPU devices detected, configuring nspawn bind-mounts",
 			"count", len(e.goalState.Nvidia.GPUDevicePaths))
+	}
+
+	if len(amdGPUDevicePaths) > 0 {
+		e.log.Info("AMD GPU devices detected, configuring nspawn bind-mounts",
+			"count", len(amdGPUDevicePaths))
 	}
 
 	// Render and write the .nspawn configuration file.
@@ -128,4 +130,25 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	}
 
 	return nil
+}
+
+func pathsExcluding(paths, excluded []string) []string {
+	if len(paths) == 0 || len(excluded) == 0 {
+		return paths
+	}
+
+	seen := make(map[string]bool, len(excluded))
+	for _, p := range excluded {
+		seen[p] = true
+	}
+
+	var out []string
+
+	for _, p := range paths {
+		if !seen[p] {
+			out = append(out, p)
+		}
+	}
+
+	return out
 }

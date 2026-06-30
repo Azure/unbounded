@@ -98,6 +98,7 @@ func TestRenderUnit(t *testing.T) {
 	assert.Contains(t, unit, "LimitMEMLOCK=infinity")
 	assert.Contains(t, unit, "Restart=always")
 	assert.Contains(t, unit, "WantedBy=multi-user.target")
+	assert.Contains(t, unit, `mkdir -p "$d" "/var/lib/unbounded-storage"`)
 	// No extra storage args appended.
 	assert.NotContains(t, unit, "config.binpb --")
 }
@@ -126,6 +127,20 @@ func TestRenderUnitHugepageOverride(t *testing.T) {
 
 	unit := renderUnit(cfg)
 	assert.Contains(t, unit, "want=256")
+}
+
+func TestRenderUnitNoHugepages(t *testing.T) {
+	cfg := Config{
+		Repo:        "Azure/unbounded-kube",
+		Prefix:      "/opt/unbounded-storage",
+		ConfigPath:  "/etc/unbounded-storage/config.binpb",
+		NoHugepages: true,
+	}
+
+	unit := renderUnit(cfg)
+	assert.NotContains(t, unit, "hugepages-2048kB")
+	assert.Contains(t, unit, `mkdir -p "$d" "/var/lib/unbounded-storage"`)
+	assert.Contains(t, unit, "ExecStart=/opt/unbounded-storage/current/bin/unbounded-storage --config /etc/unbounded-storage/config.binpb")
 }
 
 func TestWriteUnit(t *testing.T) {

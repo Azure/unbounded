@@ -18,7 +18,8 @@ func clearConfigEnv(t *testing.T) {
 	for _, name := range []string{
 		"REPO", "VERSION", "PREFIX", "SERVICE_NAME", "CONFIG_PATH",
 		"CONFIG_SOURCE_DIR", "STORAGE_ARGS", "HOST_ROOT", "SYSTEMCTL", "SOURCE", "LOCAL_TARBALL",
-		"NO_ENABLE", "ARCH", "POOL_BYTES", "HUGEPAGES",
+		"NO_ENABLE", "NO_HUGEPAGES", "ARCH", "POOL_BYTES", "HUGEPAGES", "NODE_NAME", "STORAGE_RING_LABEL", "KUBECONFIG",
+		"STORAGE_DEVICE_INVENTORY_URL",
 	} {
 		t.Setenv(name, "")
 	}
@@ -43,6 +44,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	assert.Equal(t, int64(defaultPoolBytes), cfg.PoolBytes)
 	assert.Equal(t, int64(0), cfg.Hugepages)
 	assert.False(t, cfg.NoEnable)
+	assert.False(t, cfg.NoHugepages)
 	assert.Equal(t, SourceRelease, cfg.SourceMode)
 }
 
@@ -61,6 +63,11 @@ func TestLoadConfigOverrides(t *testing.T) {
 	t.Setenv("ARCH", "aarch64")
 	t.Setenv("POOL_BYTES", "262144000")
 	t.Setenv("HUGEPAGES", "512")
+	t.Setenv("NO_HUGEPAGES", "1")
+	t.Setenv("NODE_NAME", "node-a")
+	t.Setenv("STORAGE_RING_LABEL", "storage.example/ring")
+	t.Setenv("KUBECONFIG", "/tmp/kubeconfig")
+	t.Setenv("STORAGE_DEVICE_INVENTORY_URL", "http://127.0.0.1:9100/inventory")
 
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
@@ -78,6 +85,11 @@ func TestLoadConfigOverrides(t *testing.T) {
 	assert.Equal(t, "arm64", cfg.Arch)
 	assert.Equal(t, int64(262144000), cfg.PoolBytes)
 	assert.Equal(t, int64(512), cfg.Hugepages)
+	assert.True(t, cfg.NoHugepages)
+	assert.Equal(t, "node-a", cfg.NodeName)
+	assert.Equal(t, "storage.example/ring", cfg.StorageRingLabel)
+	assert.Equal(t, "/tmp/kubeconfig", cfg.Kubeconfig)
+	assert.Equal(t, "http://127.0.0.1:9100/inventory", cfg.DeviceInventoryURL)
 }
 
 func TestLoadConfigSourceClassification(t *testing.T) {

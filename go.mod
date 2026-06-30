@@ -31,7 +31,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.25
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.24
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.104.0
-	github.com/aws/smithy-go v1.27.1
+	github.com/aws/smithy-go v1.27.2
 	github.com/bougou/go-ipmi v0.8.3
 	github.com/cilium/ebpf v0.21.0
 	github.com/coder/websocket v1.8.15
@@ -71,7 +71,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/crypto v0.53.0
-	golang.org/x/mod v0.36.0
+	golang.org/x/mod v0.37.0
 	golang.org/x/net v0.56.0
 	golang.org/x/sync v0.21.0
 	golang.org/x/sys v0.46.0

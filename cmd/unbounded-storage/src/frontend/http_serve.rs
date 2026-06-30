@@ -147,7 +147,6 @@ pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
     frontend_id: Rc<str>,
     backend_id: String,
     cache_id: Option<String>,
-    neighborhood_id: Option<String>,
     stripe_size: u64,
     page_size: usize,
     fanout: Rc<FanoutTable>,
@@ -173,7 +172,6 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
         frontend_id: Rc<str>,
         backend_id: String,
         cache_id: Option<String>,
-        neighborhood_id: Option<String>,
         stripe_size: u64,
         page_size: usize,
         fanout: Rc<FanoutTable>,
@@ -188,7 +186,6 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
             frontend_id,
             backend_id,
             cache_id,
-            neighborhood_id,
             stripe_size,
             page_size,
             fanout,
@@ -244,7 +241,6 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
                             Rc::clone(&self.frontend_id),
                             self.backend_id.clone(),
                             self.cache_id.clone(),
-                            self.neighborhood_id.clone(),
                             self.stripe_size,
                             self.page_size,
                             Rc::clone(&self.fanout),
@@ -304,7 +300,6 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
     frontend_id: Rc<str>,
     backend_id: String,
     cache_id: Option<String>,
-    neighborhood_id: Option<String>,
     stripe_size: u64,
     page_size: usize,
     fanout: Rc<FanoutTable>,
@@ -326,7 +321,6 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
             conn_fd,
             &backend_id,
             cache_id.as_deref(),
-            neighborhood_id.as_deref(),
             stripe_size,
             page_size,
             &fanout,
@@ -376,7 +370,6 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     conn_fd: RawFd,
     backend_id: &str,
     cache_id: Option<&str>,
-    neighborhood_id: Option<&str>,
     stripe_size: u64,
     page_size: usize,
     fanout: &Rc<FanoutTable>,
@@ -461,17 +454,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     // metadata entry through the pool. The HTTP backend fills it from
     // an origin HEAD on a miss; local-disk and peer hits skip the
     // origin entirely.
-    let len = match read_object_length(
-        pool,
-        backend_id,
-        cache_id,
-        neighborhood_id,
-        &path,
-        page_size,
-        bypass,
-    )
-    .await
-    {
+    let len = match read_object_length(pool, backend_id, cache_id, &path, page_size, bypass).await {
         LenResult::Len(len) => len,
         LenResult::NotFound => {
             let _ = send_all(handle, conn_fd, status_line_response(404, keep_alive)).await;
@@ -540,7 +523,6 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         conn_fd,
         backend_id,
         cache_id,
-        neighborhood_id,
         &path,
         page_size,
         resolved,
@@ -585,7 +567,6 @@ enum Ticket {
 fn stripe_request(
     backend_id: &str,
     cache_id: Option<&str>,
-    neighborhood_id: Option<&str>,
     path: &str,
     slice: StripeSlice,
     bypass: bool,
@@ -595,13 +576,12 @@ fn stripe_request(
         origin_object_id: path.to_string(),
         stripe_idx: slice.stripe_idx,
     };
-    let key = origin_ref.stripe_key();
+    let key = cache_id
+        .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id))
+        .unwrap_or_else(|| origin_ref.stripe_key());
     let req = StripeReq::new(key)
         .with_origin(origin_ref)
-        .with_chain(
-            cache_id.map(ToOwned::to_owned),
-            neighborhood_id.map(ToOwned::to_owned),
-        )
+        .with_cache_id(cache_id.map(ToOwned::to_owned))
         .with_bypass(bypass);
     (key, req)
 }
@@ -663,12 +643,11 @@ async fn dispatch_ticket(
     fanout: &Rc<FanoutTable>,
     backend_id: &str,
     cache_id: Option<&str>,
-    neighborhood_id: Option<&str>,
     path: &str,
     slice: StripeSlice,
     bypass: bool,
 ) -> Ticket {
-    let (key, req) = stripe_request(backend_id, cache_id, neighborhood_id, path, slice, bypass);
+    let (key, req) = stripe_request(backend_id, cache_id, path, slice, bypass);
     match fanout.owner_of_cache(&key, cache_id, slice.intra_offset) {
         Owner::Local => Ticket::Local { slice },
         Owner::Peer(peer) => {
@@ -712,7 +691,6 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
     conn_fd: RawFd,
     backend_id: &str,
     cache_id: Option<&str>,
-    neighborhood_id: Option<&str>,
     path: &str,
     page_size: usize,
     resolved: ResolvedRange,
@@ -728,8 +706,7 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
         let plans: Vec<StripePlan<StripeReq>> = slices
             .into_iter()
             .map(|slice| {
-                let (_key, req) =
-                    stripe_request(backend_id, cache_id, neighborhood_id, path, slice, bypass);
+                let (_key, req) = stripe_request(backend_id, cache_id, path, slice, bypass);
                 StripePlan {
                     req,
                     intra_offset: slice.intra_offset,
@@ -753,23 +730,13 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
     let mut window: VecDeque<Ticket> = VecDeque::new();
     while next < slices.len() && window.len() < WINDOW {
         window.push_back(
-            dispatch_ticket(
-                fanout,
-                backend_id,
-                cache_id,
-                neighborhood_id,
-                path,
-                slices[next],
-                bypass,
-            )
-            .await,
+            dispatch_ticket(fanout, backend_id, cache_id, path, slices[next], bypass).await,
         );
         next += 1;
     }
 
     let local_plan = |slice: StripeSlice| {
-        let (_key, req) =
-            stripe_request(backend_id, cache_id, neighborhood_id, path, slice, bypass);
+        let (_key, req) = stripe_request(backend_id, cache_id, path, slice, bypass);
         StripePlan {
             req,
             intra_offset: slice.intra_offset,
@@ -820,16 +787,9 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
                     // its pins, so retries eventually succeed.
                     Err(crate::bufferpool::Error::Busy) => {
                         yield_now().await;
-                        let retry = dispatch_ticket(
-                            fanout,
-                            backend_id,
-                            cache_id,
-                            neighborhood_id,
-                            path,
-                            slice,
-                            bypass,
-                        )
-                        .await;
+                        let retry =
+                            dispatch_ticket(fanout, backend_id, cache_id, path, slice, bypass)
+                                .await;
                         window.push_front(retry);
                         continue;
                     }
@@ -864,16 +824,7 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
 
         while next < slices.len() && window.len() < WINDOW {
             window.push_back(
-                dispatch_ticket(
-                    fanout,
-                    backend_id,
-                    cache_id,
-                    neighborhood_id,
-                    path,
-                    slices[next],
-                    bypass,
-                )
-                .await,
+                dispatch_ticket(fanout, backend_id, cache_id, path, slices[next], bypass).await,
             );
             next += 1;
         }
@@ -890,18 +841,17 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
     pool: &Rc<P>,
     backend_id: &str,
     cache_id: Option<&str>,
-    neighborhood_id: Option<&str>,
     path: &str,
     page_size: usize,
     bypass: bool,
 ) -> LenResult {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
-    let req = StripeReq::new(origin_ref.stripe_key())
+    let key = cache_id
+        .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id))
+        .unwrap_or_else(|| origin_ref.stripe_key());
+    let req = StripeReq::new(key)
         .with_origin(origin_ref)
-        .with_chain(
-            cache_id.map(ToOwned::to_owned),
-            neighborhood_id.map(ToOwned::to_owned),
-        )
+        .with_cache_id(cache_id.map(ToOwned::to_owned))
         .with_bypass(bypass);
     let mut rs: ReadStream = match pool.read(&req, 0, page_size as u64).await {
         Ok(rs) => rs,
@@ -1287,22 +1237,15 @@ mod tests {
             intra_len: 4,
         };
         // Non-bypass requests carry the cache path (bypass == false).
-        let (_k, normal) = stripe_request(
-            "primary",
-            Some("cache-a"),
-            Some("site-a"),
-            "/o",
-            slice,
-            false,
-        );
+        let (_k, normal) = stripe_request("primary", Some("cache-a"), "/o", slice, false);
         assert!(!normal.bypass());
         assert_eq!(normal.cache_id(), Some("cache-a"));
-        assert_eq!(normal.neighborhood_id(), Some("site-a"));
         // Bridge-mode frontends stamp bypass == true onto every request.
-        let (k, bridged) = stripe_request("primary", None, None, "/o", slice, true);
+        let (k, bridged) = stripe_request("primary", None, "/o", slice, true);
         assert!(bridged.bypass());
-        // The flag does not perturb the routing key or origin mapping.
-        assert_eq!(normal.key(), k);
+        // Cache id is the only logical key prefix, so cached and uncached
+        // requests for the same origin intentionally use different keys.
+        assert_ne!(normal.key(), k);
         assert_eq!(bridged.origin(), normal.origin());
     }
 
@@ -1314,9 +1257,10 @@ mod tests {
         let origin_ref = OriginRef::metadata_entry("primary", "/o");
         assert!(origin_ref.is_metadata_entry());
 
-        let req = StripeReq::new(origin_ref.stripe_key()).with_origin(origin_ref);
+        let req =
+            StripeReq::new(origin_ref.stripe_key_for_cache("cache-a")).with_origin(origin_ref);
         assert!(req.origin().unwrap().is_metadata_entry());
-        assert_eq!(req.key(), stripe_key("primary", "/o", METADATA_STRIPE_IDX));
+        assert_eq!(req.key(), stripe_key("cache-a", "/o", METADATA_STRIPE_IDX));
         assert_eq!(METADATA_STRIPE_IDX, u64::MAX);
     }
 
@@ -1379,7 +1323,7 @@ mod tests {
         });
 
         let result = block_on(read_object_length(
-            &pool, "primary", None, None, "/missing", 4096, false,
+            &pool, "primary", None, "/missing", 4096, false,
         ));
 
         assert_eq!(result, LenResult::NotFound);
@@ -1392,7 +1336,7 @@ mod tests {
         });
 
         let result = block_on(read_object_length(
-            &pool, "primary", None, None, "/broken", 4096, false,
+            &pool, "primary", None, "/broken", 4096, false,
         ));
 
         assert_eq!(result, LenResult::Other);
@@ -1424,7 +1368,6 @@ mod tests {
             listen_fd,
             Rc::from("primary"),
             "primary".to_string(),
-            None,
             None,
             4 * 1024 * 1024,
             2 * 1024 * 1024,

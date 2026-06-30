@@ -50,6 +50,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		slog.Info("watching nodes for storage ring peers", "node", cfg.NodeName, "label", cfg.StorageRingLabel)
+		startDeviceInventoryPublisher(ctx, cfg, watcher.clientset, watcher.signal)
 	}
 
 	slog.Info("rendering initial config", "source", cfg.SourceDir, "dest", cfg.ConfigPath)
@@ -153,13 +154,14 @@ func watchLoop(ctx context.Context, cfg Config, fsWatcher *fsnotify.Watcher, pee
 	}
 }
 
-// reconcile renders the current ConfigMap source plus the latest peer set into
-// the daemon config file. peers may be nil (peer discovery disabled), in which
-// case only startup settings are rendered.
+// reconcile renders the current ConfigMap source plus the latest per-node state
+// into the daemon config file. peers may be nil (Kubernetes node watching
+// disabled), in which case only ConfigMap and default disk settings are
+// rendered.
 func reconcile(cfg Config, peers *peerWatcher) error {
-	ring := ringSnapshot(cfg, peers)
+	state := currentRenderState(cfg, peers)
 
-	data, err := RenderConfig(cfg.SourceDir, ring)
+	data, err := RenderConfig(cfg.SourceDir, state)
 	if err != nil {
 		return err
 	}
@@ -171,14 +173,15 @@ func reconcile(cfg Config, peers *peerWatcher) error {
 	return nil
 }
 
-// ringSnapshot resolves the current ring state from the node watch, reading
-// the shared fabric port from the ConfigMap's TCP fabric bind. It returns the
-// inactive zero value when peer discovery is disabled. A source that cannot be
-// loaded yields an inactive ring; the subsequent RenderConfig surfaces the same
-// error in reconcile, which keeps the previously rendered config in place.
-func ringSnapshot(cfg Config, peers *peerWatcher) ringState {
+// currentRenderState resolves the current node annotations and ring state from
+// the node watch. TCP configs use the fixed ConfigMap fabric port; RDMA configs
+// use peer-published HCA inventory annotations. It returns the zero value when
+// node watching is disabled. A source that cannot be loaded yields an inactive
+// ring; the subsequent RenderConfig surfaces the same error in reconcile, which
+// keeps the previously rendered config in place.
+func currentRenderState(cfg Config, peers *peerWatcher) renderState {
 	if peers == nil {
-		return ringState{}
+		return renderState{}
 	}
 
 	sc, err := loadSourceConfig(cfg.SourceDir)
@@ -186,7 +189,12 @@ func ringSnapshot(cfg Config, peers *peerWatcher) ringState {
 		return peers.snapshot(0, false)
 	}
 
-	port, ok := parseFabricPort(sc.GetStartup().GetFabric().GetTcp().GetAddr())
+	fabric := sc.GetStartup().GetFabric()
+	if fabric.GetRdma() != nil || fabric.GetAutoRdma() != nil {
+		return peers.snapshotRdma()
+	}
+
+	port, ok := parseFabricPort(fabric.GetTcp().GetAddr())
 
 	return peers.snapshot(port, ok)
 }

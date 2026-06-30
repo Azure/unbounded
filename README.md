@@ -45,7 +45,7 @@ For a deeper dive, see the [Project Overview](https://azure.github.io/unbounded/
 - **Cloud API provisioning** — Auto-provision instances from Nebius, CoreWeave, OCI, Azure, AWS, and others via Karpenter in response to unschedulable pods.
 - **Bare-metal PXE boot** — PXE-boot servers with integrated DHCP, TFTP, HTTP, Redfish BMC power management, and TPM 2.0 attestation.
 - **Works with any conformant Kubernetes** — AKS, EKS, GKE, kubeadm, k3s, and more. Bring your own cluster or use the quickstart script.
-- **GPU support** — Automatic detection and configuration of NVIDIA GPUs on provisioned nodes.
+- **GPU support** — Automatic detection and exposure of NVIDIA and AMD GPUs on provisioned nodes.
 
 ## Components
 
@@ -130,7 +130,7 @@ Full documentation is available at **[azure.github.io/unbounded](https://azure.g
 |---|---|
 | **Concepts** | [Project Overview](https://azure.github.io/unbounded/concepts/overview/) · [Networking](https://azure.github.io/unbounded/concepts/networking/) · [Bare Metal](https://azure.github.io/unbounded/concepts/bare-metal/) |
 | **Guides** | [Getting Started](https://azure.github.io/unbounded/guides/getting-started/) · [Existing Cluster](https://azure.github.io/unbounded/guides/existing-cluster/) · [SSH Provisioning](https://azure.github.io/unbounded/guides/ssh/) · [Cloud API](https://azure.github.io/unbounded/guides/cloud-api/) · [PXE Boot](https://azure.github.io/unbounded/guides/pxe/) · [Agent](https://azure.github.io/unbounded/guides/agent/) |
-| **Reference** | [Architecture](https://azure.github.io/unbounded/reference/architecture/) · [CLI](https://azure.github.io/unbounded/reference/cli/) · [Machine CRD](https://azure.github.io/unbounded/reference/machina-crd/) · [GPU / NVIDIA](https://azure.github.io/unbounded/reference/gpu/nvidia/) |
+| **Reference** | [Architecture](https://azure.github.io/unbounded/reference/architecture/) · [CLI](https://azure.github.io/unbounded/reference/cli/) · [Machine CRD](https://azure.github.io/unbounded/reference/machina-crd/) · [GPU / NVIDIA](https://azure.github.io/unbounded/reference/gpu/nvidia/) · [GPU / AMD](https://azure.github.io/unbounded/reference/gpu/amd/) |
 
 ## Repository Structure
 

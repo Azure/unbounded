@@ -64,7 +64,15 @@ fn open_btree(
     alloc: Arc<Allocator>,
 ) -> impl Future<Output = Result<BTreeIndex<MockDevice>, crate::storage::types::Error>> {
     let scratch = ScratchPool::new(&*dev, 4096, 8).expect("scratch pool");
-    BTreeIndex::open(dev, alloc, scratch, 4096, false)
+    BTreeIndex::open(dev, alloc, scratch, 4096, false, false)
+}
+
+fn open_btree_force_format(
+    dev: Arc<MockDevice>,
+    alloc: Arc<Allocator>,
+) -> impl Future<Output = Result<BTreeIndex<MockDevice>, crate::storage::types::Error>> {
+    let scratch = ScratchPool::new(&*dev, 4096, 8).expect("scratch pool");
+    BTreeIndex::open(dev, alloc, scratch, 4096, false, true)
 }
 
 #[test]
@@ -161,6 +169,64 @@ fn restart_from_meta_restores_entries() {
             "key {i} survived restart",
         );
     }
+}
+
+#[test]
+fn force_format_ignores_existing_meta() {
+    let (dev, alloc) = fresh(128);
+    {
+        let idx = block_on(open_btree(dev.clone(), alloc)).unwrap();
+        block_on(idx.apply_batch(vec![Mutation::Insert {
+            key: key(1),
+            value: entry(11),
+        }]))
+        .unwrap();
+    }
+
+    let alloc2 = Arc::new(Allocator::new(128));
+    let idx2 = block_on(open_btree_force_format(dev, alloc2)).unwrap();
+
+    assert!(block_on(idx2.lookup(&key(1))).unwrap().is_none());
+    assert_eq!(idx2.live_entries(), 0);
+    assert_eq!(idx2.current_txn(), 1);
+}
+
+#[test]
+fn lookup_uses_committed_mirror_without_leaf_io() {
+    let (dev, alloc) = fresh(128);
+    let idx = block_on(open_btree(dev.clone(), alloc)).unwrap();
+    block_on(idx.apply_batch(vec![Mutation::Insert {
+        key: key(1),
+        value: entry(11),
+    }]))
+    .unwrap();
+    let reads_after_commit = dev.reads();
+
+    assert_eq!(idx.lookup_committed_mirror(&key(1)), Some(entry(11)));
+    assert_eq!(
+        dev.reads(),
+        reads_after_commit,
+        "lookup should use the in-memory committed mirror"
+    );
+}
+
+#[test]
+fn skip_recovery_scan_does_not_ignore_existing_meta() {
+    let (dev, alloc) = fresh(128);
+    {
+        let idx = block_on(open_btree(dev.clone(), alloc)).unwrap();
+        block_on(idx.apply_batch(vec![Mutation::Insert {
+            key: key(1),
+            value: entry(11),
+        }]))
+        .unwrap();
+    }
+
+    let alloc2 = Arc::new(Allocator::new(128));
+    let scratch = ScratchPool::new(&*dev, 4096, 8).expect("scratch pool");
+    let idx2 = block_on(BTreeIndex::open(dev, alloc2, scratch, 4096, true, false)).unwrap();
+
+    assert_eq!(block_on(idx2.lookup(&key(1))).unwrap(), Some(entry(11)));
 }
 
 #[test]
@@ -838,7 +904,7 @@ fn open_gate_pool(
     pool_pages: usize,
 ) -> impl Future<Output = Result<BTreeIndex<GateDevice>, crate::storage::types::Error>> {
     let scratch = ScratchPool::new(&*dev, 4096, pool_pages).expect("scratch pool");
-    BTreeIndex::open(dev, alloc, scratch, 4096, false)
+    BTreeIndex::open(dev, alloc, scratch, 4096, false, false)
 }
 
 fn gate_dev(capacity_pages: u64) -> (Arc<GateDevice>, Arc<Allocator>) {

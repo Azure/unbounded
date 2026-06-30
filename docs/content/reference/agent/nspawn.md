@@ -40,12 +40,9 @@ clean, reproducible environment:
 ## Container Rootfs
 
 The rootfs is a plain directory tree at `/var/lib/machines/<MachineName>`. It
-is created during the **rootfs** bootstrap phase by one of two methods:
-
-| Method | When used | Description |
-|---|---|---|
-| OCI image | Default | Pulls a pre-built Ubuntu 24.04 image via ORAS and unpacks it into the machine directory. A GPU variant includes the NVIDIA Container Toolkit. |
-| Debootstrap | Fallback (`AGENT_DISABLE_OCI_IMAGE=1`) | Runs `debootstrap` to create a minimal Ubuntu Noble rootfs with systemd, dbus, curl, and networking tools. **This method is deprecated and will be removed in a future release.** |
+is created during the **rootfs** bootstrap phase by pulling a pre-built OCI
+image via ORAS and unpacking it into the machine directory. A GPU variant
+includes the NVIDIA Container Toolkit.
 
 After the rootfs exists, the agent downloads Kubernetes binaries (kubelet,
 kubectl, kube-proxy), containerd, runc, and CNI plugins directly into
@@ -57,10 +54,10 @@ becomes `/etc/containerd/config.toml` inside the container).
 
 ### OCI Images
 
-The default rootfs images are based on Ubuntu 24.04 (Noble). The correct default
-image is selected automatically based on whether NVIDIA GPUs are detected on the
-host. Ubuntu 26.04 images are also available for explicit `OCIImage`
-configuration.
+The default rootfs image is selected automatically based on the host distro and
+whether NVIDIA GPUs are detected on the host. Supported automatic matches are
+Ubuntu 24.04, Ubuntu 26.04, and Azure Linux 3.0. RPM-based hosts fall back to
+Azure Linux 3.0. Other unknown host distros fall back to Ubuntu 24.04.
 
 | Image | Default repository | Description |
 |---|---|---|
@@ -69,6 +66,7 @@ configuration.
 | [`agent-ubuntu2604`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2604) | `ghcr.io/azure/agent-ubuntu2604` | Ubuntu 26.04 base image with systemd, dbus, curl, iproute2, nftables, kmod, wireguard-tools, and bpftool. ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2604/Containerfile)) |
 | [`agent-ubuntu2604-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-ubuntu2604-nvidia) | `ghcr.io/azure/agent-ubuntu2604-nvidia` | Ubuntu 26.04 image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-ubuntu2604-nvidia/Containerfile)) |
 | [`agent-azlinux3`](https://github.com/Azure/unbounded/pkgs/container/agent-azlinux3) | `ghcr.io/azure/agent-azlinux3` | Azure Linux 3.0 base image with systemd, dbus, curl, iproute, nftables, kmod, wireguard-tools, and bpftool. ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-azlinux3/Containerfile)) |
+| [`agent-azlinux3-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-azlinux3-nvidia) | `ghcr.io/azure/agent-azlinux3-nvidia` | Azure Linux 3.0 image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-azlinux3-nvidia/Containerfile)) |
 
 The agent pins a specific image tag by default at build time. The `OCIImage`
 field in the agent config can override the full image reference for custom or
@@ -96,11 +94,16 @@ the template runs with `--settings=override`. As a result, the generated
 network namespace. Host interfaces, host firewall and routing rules, and
 loopback listeners are therefore visible from inside the nspawn machine.
 
-When NVIDIA GPUs are detected on the host, the agent automatically bind-mounts
-the GPU device nodes (e.g. `/dev/nvidia0`, `/dev/nvidiactl`) and the host's
-driver libraries into the container, and grants the necessary cgroup device
-permissions. See [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}) for
-the full GPU pipeline.
+When GPUs are detected on the host, the agent automatically exposes the host
+paths needed by the corresponding Kubernetes device plugin:
+
+- **NVIDIA GPUs.** Bind-mounts GPU device nodes and host driver libraries,
+  grants cgroup device permissions, generates a CDI spec, and configures the
+  NVIDIA container runtime. See [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}).
+- **AMD GPUs.** Bind-mounts `/dev/kfd` and DRM device nodes, grants cgroup
+  device permissions, and exposes AMD sysfs paths read-only so the AMD
+  Kubernetes device plugin can discover GPUs inside nspawn. See
+  [AMD GPU Support]({{< relref "reference/gpu/amd" >}}).
 
 When the KVM character device (`/dev/kvm`) is present on the host, the agent
 automatically bind-mounts it into the container so that workloads inside the

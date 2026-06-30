@@ -13,8 +13,9 @@
  * piece of C the tls module ships; everything else is Rust.
  *
  * The shim also hides a couple of OpenSSL constants
- * (`SSL_OP_ENABLE_KTLS`, `TLS1_2_VERSION`) behind plain functions so the
- * Rust side never freezes a numeric value against a moving header.
+ * (`SSL_OP_ENABLE_KTLS`, `SSL_FILETYPE_PEM`, `TLS1_2_VERSION`) behind
+ * plain functions so the Rust side never freezes a numeric value against
+ * a moving header.
  */
 
 #include <openssl/bio.h>
@@ -56,5 +57,7 @@ int ub_ssl_ktls_recv_enabled(SSL *ssl) {
 
 /* Constants that live in headers; surfaced as functions for Rust. */
 unsigned long ub_ssl_op_enable_ktls(void) { return SSL_OP_ENABLE_KTLS; }
+
+int ub_ssl_filetype_pem(void) { return SSL_FILETYPE_PEM; }
 
 int ub_tls1_2_version(void) { return TLS1_2_VERSION; }

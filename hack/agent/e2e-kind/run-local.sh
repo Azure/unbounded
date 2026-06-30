@@ -243,6 +243,7 @@ echo ""
 
 python3 "$E2E" "${E2E_ARGS[@]}" run-agent
 python3 "$E2E" "${E2E_ARGS[@]}" wait-for-node
+python3 "$E2E" "${E2E_ARGS[@]}" validate-host-nspawn-distro
 python3 "$E2E" "${E2E_ARGS[@]}" validate-node-config
 python3 "$E2E" "${E2E_ARGS[@]}" dump-persisted-agent-config
 python3 "$E2E" "${E2E_ARGS[@]}" validate-kube-proxy
@@ -264,6 +265,7 @@ python3 "$E2E" "${E2E_ARGS[@]}" delete-machine-cr
 python3 "$E2E" "${E2E_ARGS[@]}" ensure-kind-bridge
 python3 "$E2E" "${E2E_ARGS[@]}" run-agent
 python3 "$E2E" "${E2E_ARGS[@]}" wait-for-node
+python3 "$E2E" "${E2E_ARGS[@]}" validate-host-nspawn-distro
 python3 "$E2E" "${E2E_ARGS[@]}" validate-node-config
 python3 "$E2E" "${E2E_ARGS[@]}" dump-persisted-agent-config
 python3 "$E2E" "${E2E_ARGS[@]}" validate-kube-proxy
