@@ -12,7 +12,9 @@ docker buildx build \
   --platform linux/amd64,linux/arm64 \
   --build-arg AZHPC_VHD_URL_AMD64=https://example/azlinux3-x86_64.vhd \
   --build-arg AZHPC_VHD_URL_ARM64=https://example/azlinux3-aarch64.vhd \
-  -f images/host-azhpc-azlinux3/Containerfile \
+  --build-arg AZHPC_VHD_DESCRIPTION="Azure HPC Azure Linux 3 VHD" \
+  --build-arg AZHPC_IMAGE_DESCRIPTION="Metalman machine image for Azure HPC Azure Linux 3 VHDs" \
+  -f images/host-azhpc/Containerfile \
   -t host-azhpc-azlinux3:dev .
 ```
 

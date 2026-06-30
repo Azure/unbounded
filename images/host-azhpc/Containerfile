@@ -8,6 +8,7 @@ ARG AZHPC_VHD_URL
 ARG AZHPC_VHD_URL_AMD64
 ARG AZHPC_VHD_URL_ARM64
 ARG AZHPC_VHD_SHA256
+ARG AZHPC_VHD_DESCRIPTION="Azure HPC VHD"
 
 RUN apt-get update && \
     ok=false && \
@@ -28,7 +29,7 @@ RUN mkdir -p /disk && \
     if [ -z "$vhd_url" ] && [ "${TARGETARCH}" = "amd64" ]; then vhd_url="${AZHPC_VHD_URL_AMD64}"; fi; \
     if [ -z "$vhd_url" ] && [ "${TARGETARCH}" = "arm64" ]; then vhd_url="${AZHPC_VHD_URL_ARM64}"; fi; \
     if [ -z "$vhd_url" ]; then \
-        echo "AZHPC_VHD_URL, or AZHPC_VHD_URL_${TARGETARCH}, must point to an Azure HPC Azure Linux 3 VHD" >&2; \
+        echo "AZHPC_VHD_URL, or AZHPC_VHD_URL_${TARGETARCH}, must point to an ${AZHPC_VHD_DESCRIPTION}" >&2; \
         exit 1; \
     fi; \
     curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 -o /tmp/azhpc.vhd "$vhd_url"; \
@@ -39,6 +40,7 @@ RUN mkdir -p /disk && \
     mv /tmp/disk.img.gz /disk/disk.img.gz
 
 FROM scratch
+ARG AZHPC_IMAGE_DESCRIPTION="Metalman machine image for Azure HPC VHDs"
 LABEL org.opencontainers.image.source="https://github.com/Azure/azhpc-images" \
-      org.opencontainers.image.description="Metalman machine image for Azure HPC Azure Linux 3 VHDs"
+      org.opencontainers.image.description="${AZHPC_IMAGE_DESCRIPTION}"
 COPY --from=build /disk /disk

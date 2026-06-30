@@ -50,6 +50,8 @@ jobs:
       platforms: ${{ steps.resolve.outputs.platforms }}
       azhpc_vhd_url_amd64: ${{ steps.resolve.outputs.azhpc_vhd_url_amd64 }}
       azhpc_vhd_url_arm64: ${{ steps.resolve.outputs.azhpc_vhd_url_arm64 }}
+      azhpc_vhd_description: ${{ steps.resolve.outputs.azhpc_vhd_description }}
+      azhpc_image_description: ${{ steps.resolve.outputs.azhpc_image_description }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -76,24 +78,31 @@ jobs:
           fi
 
           file="images/${name}/Containerfile"
+          azhpc_vhd_url_amd64=""
+          azhpc_vhd_url_arm64=""
+          azhpc_vhd_description=""
+          azhpc_image_description=""
+          case "$name" in
+            host-azhpc-ubuntu2404)
+              file="images/host-azhpc/Containerfile"
+              azhpc_vhd_url_amd64="${INPUT_AZHPC_VHD_URL_AMD64:-$AZHPC_UBUNTU2404_VHD_URL_AMD64}"
+              azhpc_vhd_url_arm64="${INPUT_AZHPC_VHD_URL_ARM64:-$AZHPC_UBUNTU2404_VHD_URL_ARM64}"
+              azhpc_vhd_description="Azure HPC Ubuntu 24.04 VHD"
+              azhpc_image_description="Metalman machine image for Azure HPC Ubuntu 24.04 VHDs"
+              ;;
+            host-azhpc-azlinux3)
+              file="images/host-azhpc/Containerfile"
+              azhpc_vhd_url_amd64="${INPUT_AZHPC_VHD_URL_AMD64:-$AZHPC_AZLINUX3_VHD_URL_AMD64}"
+              azhpc_vhd_url_arm64="${INPUT_AZHPC_VHD_URL_ARM64:-$AZHPC_AZLINUX3_VHD_URL_ARM64}"
+              azhpc_vhd_description="Azure HPC Azure Linux 3 VHD"
+              azhpc_image_description="Metalman machine image for Azure HPC Azure Linux 3 VHDs"
+              ;;
+          esac
 
           if [[ ! -f "$file" ]]; then
             echo "::error::No Containerfile found at ${file}"
             exit 1
           fi
-
-          azhpc_vhd_url_amd64=""
-          azhpc_vhd_url_arm64=""
-          case "$name" in
-            host-azhpc-ubuntu2404)
-              azhpc_vhd_url_amd64="${INPUT_AZHPC_VHD_URL_AMD64:-$AZHPC_UBUNTU2404_VHD_URL_AMD64}"
-              azhpc_vhd_url_arm64="${INPUT_AZHPC_VHD_URL_ARM64:-$AZHPC_UBUNTU2404_VHD_URL_ARM64}"
-              ;;
-            host-azhpc-azlinux3)
-              azhpc_vhd_url_amd64="${INPUT_AZHPC_VHD_URL_AMD64:-$AZHPC_AZLINUX3_VHD_URL_AMD64}"
-              azhpc_vhd_url_arm64="${INPUT_AZHPC_VHD_URL_ARM64:-$AZHPC_AZLINUX3_VHD_URL_ARM64}"
-              ;;
-          esac
 
           if [[ -n "$INPUT_PLATFORMS" ]]; then
             platforms="$INPUT_PLATFORMS"
@@ -118,6 +127,8 @@ jobs:
           echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
           echo "azhpc_vhd_url_amd64=${azhpc_vhd_url_amd64}" >> "$GITHUB_OUTPUT"
           echo "azhpc_vhd_url_arm64=${azhpc_vhd_url_arm64}" >> "$GITHUB_OUTPUT"
+          echo "azhpc_vhd_description=${azhpc_vhd_description}" >> "$GITHUB_OUTPUT"
+          echo "azhpc_image_description=${azhpc_image_description}" >> "$GITHUB_OUTPUT"
 
           echo "Image: ${name}:${tag}"
           echo "Containerfile: ${file}"
@@ -163,3 +174,5 @@ jobs:
             CONTAINER_REGISTRY=${{ env.CONTAINER_REGISTRY }}
             AZHPC_VHD_URL_AMD64=${{ needs.resolve.outputs.azhpc_vhd_url_amd64 }}
             AZHPC_VHD_URL_ARM64=${{ needs.resolve.outputs.azhpc_vhd_url_arm64 }}
+            AZHPC_VHD_DESCRIPTION=${{ needs.resolve.outputs.azhpc_vhd_description }}
+            AZHPC_IMAGE_DESCRIPTION=${{ needs.resolve.outputs.azhpc_image_description }}

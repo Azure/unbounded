@@ -1,7 +1,8 @@
 # Container Images
 
-This directory contains container image definitions for the project. Each subdirectory with a
-`Containerfile` represents a buildable image.
+This directory contains container image definitions for the project. Most subdirectories with a
+`Containerfile` represent one buildable image. The shared `host-azhpc/Containerfile` is reused by
+the `host-azhpc-ubuntu2404` and `host-azhpc-azlinux3` image builds.
 
 ## Directory Structure
 
@@ -33,7 +34,9 @@ docker buildx build \
   --platform linux/amd64,linux/arm64 \
   --build-arg AZHPC_VHD_URL_AMD64=https://example/ubuntu2404-x86_64.vhd \
   --build-arg AZHPC_VHD_URL_ARM64=https://example/ubuntu2404-aarch64.vhd \
-  -f images/host-azhpc-ubuntu2404/Containerfile \
+  --build-arg AZHPC_VHD_DESCRIPTION="Azure HPC Ubuntu 24.04 VHD" \
+  --build-arg AZHPC_IMAGE_DESCRIPTION="Metalman machine image for Azure HPC Ubuntu 24.04 VHDs" \
+  -f images/host-azhpc/Containerfile \
   -t ghcr.io/<owner>/host-azhpc-ubuntu2404:<tag> .
 ```
 
@@ -95,5 +98,6 @@ ghcr.io/<owner>/agent-ubuntu2404:<commit-sha>
 
 1. Create a new directory under `images/` with a descriptive name.
 2. Add a `Containerfile` in that directory.
-3. The workflow discovers it automatically - no workflow changes needed.
+3. The workflow discovers it automatically - no workflow changes needed unless the image reuses a
+   shared Containerfile.
 4. Tag and push to build: `git tag images/<your-image>/v0.1.0 && git push origin images/<your-image>/v0.1.0`.
