@@ -27,10 +27,12 @@ ARG TARGETARCH
 # ~600 MB) with HTTP 429.  apt's built-in Acquire::Retries does not add a
 # delay between attempts, so a shell-level retry with sleep is needed.
 RUN apt-get update && \
+    extra_packages="" && \
+    if [ "${TARGETARCH}" = "arm64" ]; then extra_packages="qemu-efi-aarch64"; fi && \
     ok=false && \
     for attempt in 1 2 3 4 5; do \
       if apt-get install -y --no-install-recommends \
-           cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-generic pigz; then \
+           cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-generic pigz ${extra_packages}; then \
         ok=true; break; \
       fi; \
       echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
