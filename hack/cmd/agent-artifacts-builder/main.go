@@ -44,6 +44,7 @@ func newRootCommand() *cobra.Command {
 			if opts.ManifestPath == "" && opts.KubernetesVersion == "" {
 				return fmt.Errorf("one of --manifest or --kubernetes-version is required")
 			}
+
 			if opts.ManifestPath != "" && opts.KubernetesVersion != "" {
 				return fmt.Errorf("--manifest and --kubernetes-version are mutually exclusive")
 			}
@@ -89,7 +90,9 @@ func resolvePublishInputs() error {
 	)
 	if eventName == "push" {
 		tag = strings.TrimPrefix(refName, artifactTagRefPrefix)
+
 		var err error
+
 		versionsRaw, err = defaultKubernetesVersions()
 		if err != nil {
 			return err
@@ -99,9 +102,11 @@ func resolvePublishInputs() error {
 		if tag == "" {
 			tag = shortSHA(githubSHA)
 		}
+
 		versionsRaw = inputVersions
 		if versionsRaw == "" {
 			var err error
+
 			versionsRaw, err = defaultKubernetesVersions()
 			if err != nil {
 				return err
@@ -157,6 +162,7 @@ func defaultKubernetesVersions() (string, error) {
 
 func stripLineComments(raw string) string {
 	var out []string
+
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -180,9 +186,11 @@ func normalizeKubernetesVersions(raw string) []string {
 		if version == "" {
 			continue
 		}
+
 		if !strings.HasPrefix(version, "v") {
 			version = "v" + version
 		}
+
 		versions = append(versions, version)
 	}
 
@@ -203,6 +211,7 @@ func writeGitHubOutput(values map[string]string) error {
 		for key, value := range values {
 			fmt.Printf("%s=%s\n", key, value)
 		}
+
 		return nil
 	}
 

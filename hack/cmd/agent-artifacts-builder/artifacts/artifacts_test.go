@@ -4,6 +4,7 @@
 package artifacts
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -93,6 +94,24 @@ func TestNewPlanLoadsManifestFile(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, "v1.34.2", plan.Manifest.Versions.Kubernetes)
+}
+
+func TestWriteManifestOmitsV1SchemaVersion(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, writeManifest(dir, Manifest{
+		SchemaVersion: 1,
+		Versions: Versions{
+			Kubernetes: "v1.34.2",
+			Containerd: "2.1.8",
+			Runc:       "1.5.0",
+			CNI:        "1.5.1",
+			Crictl:     "1.34.0",
+		},
+	}))
+
+	data, err := os.ReadFile(filepath.Join(dir, ManifestFileName))
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "schemaVersion")
 }
 
 func TestNewPlanRequiresManifestVersions(t *testing.T) {

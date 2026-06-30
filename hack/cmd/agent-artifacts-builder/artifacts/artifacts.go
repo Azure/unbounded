@@ -105,6 +105,7 @@ func NewPlan(opts Options) (Plan, error) {
 	if len(arches) == 0 {
 		arches = []string{runtime.GOARCH}
 	}
+
 	for _, arch := range arches {
 		if strings.TrimSpace(arch) == "" {
 			return Plan{}, errors.New("architecture must not be empty")
@@ -153,6 +154,7 @@ func PushOCI(ctx context.Context, rootDir, ref string) error {
 	}
 
 	ref = strings.TrimPrefix(ref, "oci://")
+
 	repo, err := remote.NewRepository(ref)
 	if err != nil {
 		return fmt.Errorf("parse OCI reference %q: %w", ref, err)
@@ -188,6 +190,7 @@ func PushOCI(ctx context.Context, rootDir, ref string) error {
 		if err != nil {
 			return fmt.Errorf("add %q to OCI artifact: %w", p, err)
 		}
+
 		descriptors = append(descriptors, desc)
 	}
 
@@ -213,10 +216,18 @@ func writeManifest(rootDir string, manifest Manifest) error {
 		return fmt.Errorf("create output dir %q: %w", rootDir, err)
 	}
 
+	// Omit schemaVersion for v1 manifests. The agent treats a missing schema
+	// version as v1, and this keeps bundles stable until a breaking manifest
+	// schema is introduced.
+	if manifest.SchemaVersion == 1 {
+		manifest.SchemaVersion = 0
+	}
+
 	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal manifest: %w", err)
 	}
+
 	data = append(data, '\n')
 
 	path := filepath.Join(rootDir, ManifestFileName)
@@ -233,6 +244,7 @@ func downloadArtifacts(ctx context.Context, rootDir string, artifacts []Artifact
 
 	for _, artifact := range artifacts {
 		artifact := artifact
+
 		eg.Go(func() error {
 			return downloadArtifact(ctx, rootDir, artifact, skipExisting)
 		})
@@ -289,6 +301,7 @@ func downloadToFile(ctx context.Context, sourceURL, dest string) (err error) {
 	}
 
 	client := &http.Client{Timeout: 10 * time.Minute}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -303,6 +316,7 @@ func downloadToFile(ctx context.Context, sourceURL, dest string) (err error) {
 	if err != nil {
 		return err
 	}
+
 	defer func() {
 		if closeErr := out.Close(); closeErr != nil && err == nil {
 			err = closeErr
@@ -318,6 +332,7 @@ func downloadToFile(ctx context.Context, sourceURL, dest string) (err error) {
 
 func verifyKubernetesChecksum(binaryPath string) error {
 	checksumPath := binaryPath + ".sha256"
+
 	checksumBytes, err := os.ReadFile(checksumPath)
 	if err != nil {
 		return fmt.Errorf("read checksum %q: %w", checksumPath, err)
@@ -402,10 +417,12 @@ func loadManifest(path string) (Manifest, error) {
 
 func collectArtifactPaths(rootDir string) ([]string, error) {
 	var paths []string
+
 	if err := filepath.WalkDir(rootDir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
+
 		if entry.IsDir() {
 			return nil
 		}
@@ -416,11 +433,13 @@ func collectArtifactPaths(rootDir string) ([]string, error) {
 		}
 
 		paths = append(paths, filepath.ToSlash(rel))
+
 		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("collect artifact paths from %q: %w", rootDir, err)
 	}
 
 	sort.Strings(paths)
+
 	return paths, nil
 }

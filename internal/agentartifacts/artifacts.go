@@ -78,6 +78,7 @@ func ContainerdArchive(override *goalstates.DownloadSource, version, arch string
 	}
 
 	version = StripLeadingV(version)
+
 	base := ContainerdDefaultBaseURL
 	if override != nil && override.BaseURL != "" {
 		base = strings.TrimRight(override.BaseURL, "/")
@@ -94,6 +95,7 @@ func RuncBinary(override *goalstates.DownloadSource, version, arch string) strin
 	}
 
 	version = StripLeadingV(version)
+
 	base := RuncDefaultBaseURL
 	if override != nil && override.BaseURL != "" {
 		base = strings.TrimRight(override.BaseURL, "/")
@@ -110,6 +112,7 @@ func CNIPluginsArchive(override *goalstates.DownloadSource, version, arch string
 	}
 
 	version = StripLeadingV(version)
+
 	base := CNIDefaultBaseURL
 	if override != nil && override.BaseURL != "" {
 		base = strings.TrimRight(override.BaseURL, "/")
@@ -127,6 +130,7 @@ func CrictlArchive(override *goalstates.DownloadSource, version, hostOS, hostArc
 	}
 
 	version = StripLeadingV(version)
+
 	base := CrictlDefaultBaseURL
 	if override != nil && override.BaseURL != "" {
 		base = strings.TrimRight(override.BaseURL, "/")
@@ -174,6 +178,7 @@ func NormalizeManifest(manifest Manifest) (Manifest, error) {
 	if manifest.SchemaVersion == 0 {
 		manifest.SchemaVersion = 1
 	}
+
 	if manifest.SchemaVersion != 1 {
 		return Manifest{}, fmt.Errorf("unsupported manifest schemaVersion %d", manifest.SchemaVersion)
 	}
@@ -188,18 +193,23 @@ func NormalizeManifest(manifest Manifest) (Manifest, error) {
 	if manifest.Versions.Kubernetes == "v" {
 		missing = append(missing, "versions.kubernetes")
 	}
+
 	if manifest.Versions.Containerd == "" {
 		missing = append(missing, "versions.containerd")
 	}
+
 	if manifest.Versions.Runc == "" {
 		missing = append(missing, "versions.runc")
 	}
+
 	if manifest.Versions.CNI == "" {
 		missing = append(missing, "versions.cni")
 	}
+
 	if manifest.Versions.Crictl == "" {
 		missing = append(missing, "versions.crictl")
 	}
+
 	if len(missing) > 0 {
 		return Manifest{}, fmt.Errorf("manifest is missing required fields: %s", strings.Join(missing, ", "))
 	}
