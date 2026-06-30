@@ -88,6 +88,7 @@ func (r *OCIReconciler) mapMachineToImage(_ context.Context, obj client.Object) 
 		}
 
 		seen[key] = struct{}{}
+
 		reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKey{Namespace: architecture, Name: ref}})
 	}
 

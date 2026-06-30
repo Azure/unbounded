@@ -219,6 +219,7 @@ type templateData struct {
 
 func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON string) templateData {
 	var specRepave, statusRepave int64
+
 	if node != nil {
 		if node.Spec.Operations != nil {
 			specRepave = node.Spec.Operations.RepaveCounter
