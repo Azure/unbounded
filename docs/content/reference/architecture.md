@@ -91,7 +91,7 @@ Represents a host and drives its lifecycle.
 | Spec field            | Description |
 |-----------------------|-------------|
 | `spec.ssh`            | SSH connectivity (host, port, user, privateKeyRef) and optional bastion config. |
-| `spec.pxe`            | PXE config: OCI image reference, dhcpLeases, redfish settings. |
+| `spec.pxe`            | PXE config: machine image reference, optional netboot image override, dhcpLeases, redfish settings. |
 | `spec.kubernetes`     | Kubernetes version, bootstrapTokenRef, nodeRef, nodeLabels. |
 | `spec.operations`     | Reboot and repave counters. |
 
@@ -104,11 +104,14 @@ Machine types.
 
 ### Netboot OCI Images
 
-Netboot images are standard OCI container images referenced by
-`Machine.spec.pxe.image`. They contain all files needed for PXE booting under
-`/disk/`. Files with a `.tmpl` suffix are Go templates rendered per-machine at
-serve time. A `metadata.yaml` provides image-level configuration (e.g.
-`dhcpBootImageName`).
+Metalman uses two OCI images for PXE repaves. `Machine.spec.pxe.image` references
+the machine image containing `/disk/disk.img.gz`. `Machine.spec.pxe.netbootImage`
+optionally references the reusable PXE boot environment; when omitted, Metalman
+uses its configured default `netboot` image.
+
+Netboot images contain all files needed for PXE booting under `/disk/`. Files
+with a `.tmpl` suffix are Go templates rendered per-machine at serve time. A
+`metadata.yaml` provides image-level configuration such as `dhcpBootImageName`.
 
 ### Resource relationships
 

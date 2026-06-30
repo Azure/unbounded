@@ -1,7 +1,9 @@
-# Azure HPC Ubuntu 24.04 Metalman Host Image
+# Azure HPC Ubuntu 24.04 Metalman Machine Image
 
-This image is a Metalman netboot wrapper around a VHD produced by
-[Azure/azhpc-images](https://github.com/Azure/azhpc-images) for Ubuntu HPC 24.04.
+This image contains only a gzip-compressed raw disk at `/disk/disk.img.gz`, converted from a VHD
+produced by [Azure/azhpc-images](https://github.com/Azure/azhpc-images) for Ubuntu HPC 24.04.
+Metalman installs it using the reusable `netboot` image selected by the controller default or by
+`spec.pxe.netbootImage`.
 
 Build with one VHD URL per target architecture:
 

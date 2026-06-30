@@ -23,9 +23,10 @@ Images are built automatically by the **Build Container Images** GitHub Actions 
 
 ### Azure HPC Host Images
 
-The `host-azhpc-ubuntu2404` and `host-azhpc-azlinux3` images are Metalman netboot images that wrap
-VHD artifacts produced from [Azure/azhpc-images](https://github.com/Azure/azhpc-images). They do not
-rebuild or approximate Azure HPC images in Docker. The build requires one VHD URL per architecture:
+The `host-azhpc-ubuntu2404` and `host-azhpc-azlinux3` images are Metalman machine images containing
+only a gzip-compressed raw disk at `/disk/disk.img.gz`. They wrap VHD artifacts produced from
+[Azure/azhpc-images](https://github.com/Azure/azhpc-images). They do not rebuild or approximate Azure
+HPC images in Docker. The build requires one VHD URL per architecture:
 
 ```bash
 docker buildx build \
@@ -50,6 +51,15 @@ The VHDs should come from the upstream Packer workflow with `create_vhd=true` an
 `os_family`/`distro_version`: `ubuntu`/`24.04` for `host-azhpc-ubuntu2404`, and
 `azurelinux`/`3.0` for `host-azhpc-azlinux3`. If an upstream variant does not publish one of the
 architectures, omit that platform from the `docker buildx build --platform` list.
+
+Pair these machine images with Metalman's default `netboot` image, or set `spec.pxe.netbootImage` on
+a Machine to override the default PXE boot environment.
+
+### Metalman Netboot Image
+
+The `netboot` image contains the reusable PXE boot environment: bootloaders, kernel, initrd overlay,
+GRUB and cloud-init templates, metadata, and the `unbounded-agent` binary served during first boot.
+It does not contain a machine disk image.
 
 ### Tagged Release
 

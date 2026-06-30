@@ -37,8 +37,9 @@ const imageResyncInterval = 5 * time.Minute
 // Work items are deduplicated by image reference so that multiple machines
 // sharing the same image only trigger a single download.
 type OCIReconciler struct {
-	Client client.Client
-	Cache  *OCICache
+	Client            client.Client
+	Cache             *OCICache
+	DefaultNetbootRef string
 }
 
 func (r *OCIReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -57,13 +58,34 @@ func (r *OCIReconciler) mapMachineToImage(_ context.Context, obj client.Object) 
 		return nil
 	}
 
-	if machine.Spec.PXE == nil || machine.Spec.PXE.Image == "" {
+	if machine.Spec.PXE == nil {
 		return nil
 	}
 
-	return []reconcile.Request{
-		{NamespacedName: client.ObjectKey{Name: machine.Spec.PXE.Image}},
+	refs := []string{machine.Spec.PXE.Image}
+	if machine.Spec.PXE.NetbootImage != "" {
+		refs = append(refs, machine.Spec.PXE.NetbootImage)
+	} else {
+		refs = append(refs, r.DefaultNetbootRef)
 	}
+
+	reqs := make([]reconcile.Request, 0, len(refs))
+
+	seen := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		if ref == "" {
+			continue
+		}
+
+		if _, ok := seen[ref]; ok {
+			continue
+		}
+
+		seen[ref] = struct{}{}
+		reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKey{Name: ref}})
+	}
+
+	return reqs
 }
 
 func (r *OCIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

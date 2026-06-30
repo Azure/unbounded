@@ -33,7 +33,8 @@ The boot flow in detail:
 
 3. **HTTP Artifacts** -- The bootloader fetches the kernel, initramfs, and
    configuration files from metalman's HTTP server. These are sourced from
-   OCI netboot images referenced by the Machine's `spec.pxe.image` field.
+   the Machine's `spec.pxe.netbootImage`, or from Metalman's default netboot
+   image when that field is omitted.
 
 4. **Kernel Boot** -- The machine boots into the downloaded kernel and
    initramfs.
@@ -62,29 +63,37 @@ metalman supports two DHCP modes depending on your network topology:
   unicast DHCP forwarded by a DHCP relay agent. Use this when metalman and
   the machines are on different subnets.
 
-### OCI Netboot Images
+### OCI Images
 
-Netboot images are standard OCI container images built `FROM scratch` that
-contain all files needed for PXE booting a machine under `/disk/`. Files with a
-`.tmpl` suffix are Go templates rendered per-machine at serve time; other files
-are served verbatim. A `metadata.yaml` file provides image-level configuration
-(e.g. `dhcpBootImageName`).
+Metalman uses two OCI images during PXE provisioning:
+
+- The machine image, referenced by `spec.pxe.image`, contains `/disk/disk.img.gz`.
+- The netboot image, referenced by `spec.pxe.netbootImage` or by Metalman's
+  default, contains the reusable PXE boot environment.
+
+Netboot images are built `FROM scratch` and contain all files needed for PXE
+booting a machine under `/disk/`. Files with a `.tmpl` suffix are Go templates
+rendered per-machine at serve time; other files are served verbatim. A
+`metadata.yaml` file provides image-level configuration such as
+`dhcpBootImageName`.
 
 | Aspect | Description |
 |--------|-------------|
-| **Binary artifacts** | Kernel, initramfs, bootloader — served verbatim from the OCI image |
-| **Templates** | Files with `.tmpl` suffix — rendered from Go templates with per-machine context (e.g., kernel command line) |
-| **Configuration** | `metadata.yaml` — image-level settings such as the DHCP boot filename |
+| **Binary artifacts** | Kernel, initramfs, bootloader - served verbatim from the OCI image |
+| **Templates** | Files with `.tmpl` suffix - rendered from Go templates with per-machine context (e.g., kernel command line) |
+| **Configuration** | `metadata.yaml` - image-level settings such as the DHCP boot filename |
 
-OCI images are referenced by Machine resources via `spec.pxe.image` and are
-pulled and cached locally by the OCI reconciler.
+Machine and netboot images are pulled and cached locally by the OCI reconciler.
 
 ### Machine CRD (PXE Fields)
 
 For PXE-provisioned machines, the `Machine` resource includes:
 
-- **`spec.pxe.image`** -- OCI image reference containing netboot artifacts
-  (e.g. `"ghcr.io/azure/images/host-ubuntu2404:v1"`).
+- **`spec.pxe.image`** -- OCI machine image reference containing `/disk/disk.img.gz`
+  (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`).
+- **`spec.pxe.netbootImage`** -- Optional OCI netboot image reference containing
+  PXE boot artifacts. When omitted, Metalman uses its configured default
+  `netboot` image.
 - **`spec.pxe.dhcpLeases`** -- NIC specifications: MAC address and IP
   assignment for each interface.
 - **`spec.pxe.redfish`** -- Optional BMC connection details (endpoint, username,

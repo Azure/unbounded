@@ -22,7 +22,7 @@ name: unbounded release
 #     -> binaries          (GoReleaser; creates draft GitHub release)
 #     -> net-images        (matrix: amd64-native, arm64-native)
 #         -> net-images-manifest (multi-arch tag stitch + sign + SBOM attest)
-#     -> component-images  (matrix: machina, machine-ops-controller, metalman, host-ubuntu2404)
+#     -> component-images  (matrix: machina, machine-ops-controller, metalman, netboot, host-ubuntu2404)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> storage-binaries  (matrix: amd64, arm64; binary + bundled libfabric)
 #     -> finalize          (attach extras + krew manifest)
@@ -463,6 +463,10 @@ jobs:
             file: images/metalman/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
+          - name: netboot
+            file: images/netboot/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: false
           - name: orca
             file: images/orca/Containerfile
             platforms: linux/amd64,linux/arm64
@@ -504,6 +508,7 @@ jobs:
           build-args: |
             VERSION=${{ needs.version.outputs.tag }}
             GIT_COMMIT=${{ github.sha }}
+            CONTAINER_REGISTRY=${{ env.REGISTRY }}
           tags: scan/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
 
       - name: Scan with Trivy

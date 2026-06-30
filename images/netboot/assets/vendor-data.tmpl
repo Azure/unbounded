@@ -25,11 +25,9 @@ write_files:
 - path: /etc/cloud/cloud-init.disabled
   defer: true
   content: ''
-# Block unattended-upgrades from upgrading packages whose post-install
-# triggers (via needrestart) restart systemd-machined and tear down the
-# running systemd-nspawn@kube1 container. The agent re-asserts this file
-# during `unbounded-agent start`; it is also written here so the protection
-# is in place from first boot, before the agent runs.
+# Block unattended-upgrades from restarting systemd-machined and tearing down
+# the running systemd-nspawn container. The agent re-asserts this file during
+# start; cloud-init writes it first so the protection exists from first boot.
 - path: /etc/apt/apt.conf.d/99-unbounded-no-restart-systemd
   permissions: '0644'
   content: |
@@ -42,9 +40,7 @@ write_files:
         "libcap2-bin";
         "libpam-cap";
     };
-# Disable needrestart auto-restart of services after package upgrades; only
-# list the ones that would otherwise be restarted. Belt-and-braces with the
-# apt blacklist above for any path that bypasses unattended-upgrades.
+# Disable needrestart auto-restart of services after package upgrades.
 - path: /etc/needrestart/conf.d/99-unbounded.conf
   permissions: '0644'
   content: |
@@ -54,6 +50,12 @@ runcmd:
   - -c
   - |
     set -eo pipefail
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL {{ .ServeURL }}/unbounded-agent -o /usr/local/bin/unbounded-agent
+    else
+      wget -q -O /usr/local/bin/unbounded-agent {{ .ServeURL }}/unbounded-agent
+    fi
+    chmod 0755 /usr/local/bin/unbounded-agent
     export UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json
     echo "Running unbounded-agent start..."
     /usr/local/bin/unbounded-agent start

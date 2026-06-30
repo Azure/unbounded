@@ -61,7 +61,13 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		return fmt.Errorf("node %s has no PXE config", node.Name)
 	}
 
-	resolved, err := t.ResolveFileByPath(ctx, filename, node, node.Spec.PXE.Image)
+	imageRef := t.NetbootImageRef(node)
+	if imageRef == "" {
+		log.Warn("node has no netboot image", "node", node.Name)
+		return fmt.Errorf("node %s has no netboot image", node.Name)
+	}
+
+	resolved, err := t.ResolveFileByPath(ctx, filename, node, imageRef)
 	if err != nil {
 		log.Warn("resolving file", "node", node.Name, "err", err)
 		return err

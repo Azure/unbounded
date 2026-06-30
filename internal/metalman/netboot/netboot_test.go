@@ -106,8 +106,9 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:  cache,
-			Reader: fc,
+			Cache:             cache,
+			Reader:            fc,
+			DefaultNetbootRef: "ghcr.io/test/image:v1",
 		},
 	}
 
@@ -217,10 +218,11 @@ menuentry "Install" {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:    cache,
-			Reader:   fc,
-			Cluster:  &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
-			ServeURL: "http://10.0.1.1:8080",
+			Cache:             cache,
+			Reader:            fc,
+			Cluster:           &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
+			ServeURL:          "http://10.0.1.1:8080",
+			DefaultNetbootRef: "ghcr.io/test/image:v1",
 		},
 	}
 
@@ -283,8 +285,9 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:  cache,
-			Reader: fc,
+			Cache:             cache,
+			Reader:            fc,
+			DefaultNetbootRef: "ghcr.io/test/image:v1",
 		},
 	}
 
@@ -341,8 +344,9 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:  cache,
-			Reader: fc,
+			Cache:             cache,
+			Reader:            fc,
+			DefaultNetbootRef: "ghcr.io/test/image:v1",
 		},
 	}
 
@@ -480,7 +484,7 @@ func TestTemplateRendering_AgentConfigJSONUnset(t *testing.T) {
 }
 
 func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
-	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "host-ubuntu2404", "assets", "vendor-data.tmpl"))
+	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "vendor-data.tmpl"))
 	if err != nil {
 		t.Fatalf("reading vendor-data.tmpl: %v", err)
 	}
@@ -554,7 +558,7 @@ func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
 }
 
 func TestVendorDataTemplate_WithoutAgentImage(t *testing.T) {
-	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "host-ubuntu2404", "assets", "vendor-data.tmpl"))
+	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "vendor-data.tmpl"))
 	if err != nil {
 		t.Fatalf("reading vendor-data.tmpl: %v", err)
 	}
@@ -665,7 +669,7 @@ func TestResolveFileByPath_UserDataFallsBackToDefault(t *testing.T) {
 		"vmlinuz": []byte("kernel"),
 	})
 
-	// Node without cloudInit configured — should return the built-in default.
+	// Node without cloudInit configured should return the built-in default.
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-no-cm"},
 		Spec: v1alpha3.MachineSpec{
@@ -771,7 +775,7 @@ func TestResolveFileByPath_UserDataConfigMapMissing(t *testing.T) {
 		"vmlinuz": []byte("kernel"),
 	})
 
-	// ConfigMap doesn't exist — should fall back to default cloud-init.
+	// ConfigMap doesn't exist, so this should fall back to default cloud-init.
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-missing"},
 		Spec: v1alpha3.MachineSpec{
@@ -978,7 +982,7 @@ func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
 		"vmlinuz": []byte("kernel"),
 	})
 
-	// Node references a ConfigMap that doesn't exist — should fall back to default cloud-init.
+	// Node references a ConfigMap that doesn't exist, so this should fall back to default cloud-init.
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-http-cm-miss"},
 		Spec: v1alpha3.MachineSpec{
@@ -1005,10 +1009,11 @@ func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:    cache,
-			Reader:   fc,
-			Cluster:  &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
-			ServeURL: "http://10.0.9.1:8080",
+			Cache:             cache,
+			Reader:            fc,
+			Cluster:           &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
+			ServeURL:          "http://10.0.9.1:8080",
+			DefaultNetbootRef: "ghcr.io/test/image:v1",
 		},
 	}
 
@@ -1082,10 +1087,11 @@ func TestHTTPServer_UserDataFromConfigMap(t *testing.T) {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:    cache,
-			Reader:   fc,
-			Cluster:  &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
-			ServeURL: "http://10.0.9.1:8080",
+			Cache:             cache,
+			Reader:            fc,
+			Cluster:           &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
+			ServeURL:          "http://10.0.9.1:8080",
+			DefaultNetbootRef: "ghcr.io/test/image:v1",
 		},
 	}
 
@@ -1402,10 +1408,11 @@ menuentry "Install {{ .Machine.Name }}" {
 
 	httpSrv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:    cache,
-			Reader:   fc,
-			Cluster:  &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
-			ServeURL: "http://10.0.3.1:8080",
+			Cache:             cache,
+			Reader:            fc,
+			Cluster:           &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
+			ServeURL:          "http://10.0.3.1:8080",
+			DefaultNetbootRef: "ghcr.io/test/e2e:v1",
 		},
 	}
 
@@ -1463,6 +1470,78 @@ menuentry "Install {{ .Machine.Name }}" {
 	}
 }
 
+func TestHTTPServer_RoutesDiskFromMachineImageAndBootFromNetbootImage(t *testing.T) {
+	machineData := []byte("machine-disk-data")
+	netbootData := []byte("netboot-kernel-data")
+
+	cacheDir := t.TempDir()
+	cache := NewOCICache(cacheDir)
+
+	if err := populateOCICache(cacheDir, "machine123", map[string][]byte{"disk.img.gz": machineData}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := populateOCICache(cacheDir, "netboot123", map[string][]byte{"vmlinuz": netbootData}); err != nil {
+		t.Fatal(err)
+	}
+
+	cache.SetDigest("ghcr.io/test/machine:v1", "sha256:machine123")
+	cache.SetDigest("ghcr.io/test/netboot:v1", "sha256:netboot123")
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "split-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:        "ghcr.io/test/machine:v1",
+				NetbootImage: "ghcr.io/test/netboot:v1",
+				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:80", IPv4: "10.0.30.10", SubnetMask: "255.255.255.0"}},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+
+	srv := &HTTPServer{FileResolver: FileResolver{Cache: cache, Reader: fc}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", srv.handleFile)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	for _, tt := range []struct {
+		path string
+		want []byte
+	}{
+		{path: "/disk.img.gz", want: machineData},
+		{path: "/vmlinuz", want: netbootData},
+	} {
+		req, _ := http.NewRequest("GET", ts.URL+tt.path, nil)
+		req.Header.Set("X-Forwarded-For", "10.0.30.10")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", tt.path, err)
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status: got %d, want 200", tt.path, resp.StatusCode)
+		}
+
+		if string(body) != string(tt.want) {
+			t.Errorf("%s body: got %q, want %q", tt.path, body, tt.want)
+		}
+	}
+}
+
 func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 	alphaData := []byte("alpha-vmlinuz")
 	betaData := []byte("beta-vmlinuz")
@@ -1480,8 +1559,9 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "alpha-node"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/alpha:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:aa:aa:aa:aa:aa", IPv4: "10.0.10.1", SubnetMask: "255.255.255.0"}},
+				Image:        "ghcr.io/test/alpha:v1",
+				NetbootImage: "ghcr.io/test/alpha:v1",
+				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:aa:aa:aa:aa:aa", IPv4: "10.0.10.1", SubnetMask: "255.255.255.0"}},
 			},
 			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
@@ -1490,8 +1570,9 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "beta-node"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/beta:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "bb:bb:bb:bb:bb:bb", IPv4: "10.0.10.2", SubnetMask: "255.255.255.0"}},
+				Image:        "ghcr.io/test/beta:v1",
+				NetbootImage: "ghcr.io/test/beta:v1",
+				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "bb:bb:bb:bb:bb:bb", IPv4: "10.0.10.2", SubnetMask: "255.255.255.0"}},
 			},
 			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
@@ -1571,7 +1652,7 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		FileResolver: FileResolver{Cache: cache, Reader: fc},
+		FileResolver: FileResolver{Cache: cache, Reader: fc, DefaultNetbootRef: "ghcr.io/test/pending:v1"},
 	}
 
 	mux := http.NewServeMux()

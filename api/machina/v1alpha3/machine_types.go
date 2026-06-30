@@ -266,10 +266,17 @@ type RedfishSpec struct {
 
 // PXESpec defines PXE boot configuration for a Machine.
 type PXESpec struct {
-	// Image is an OCI image reference containing netboot artifacts.
-	// Example: "ghcr.io/azure/images/host-ubuntu2404:v1"
+	// Image is an OCI image reference containing the machine disk image.
+	// The image must contain /disk/disk.img.gz.
+	// Example: "ghcr.io/azure/host-ubuntu2404:v1"
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
+
+	// NetbootImage is an OCI image reference containing the PXE boot
+	// artifacts used to install Image. When omitted, metalman uses the
+	// default netboot image that corresponds to its release.
+	// +optional
+	NetbootImage string `json:"netbootImage,omitempty"`
 
 	// DHCPLeases defines static DHCP leases for PXE booting.
 	// +optional

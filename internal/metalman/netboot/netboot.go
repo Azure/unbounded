@@ -63,9 +63,22 @@ type FileResolver struct {
 	Reader            client.Reader
 	Cluster           ClusterInfoProvider
 	ServeURL          string
+	DefaultNetbootRef string
 	KubernetesVersion string
 	ClusterDNS        string
 	ProviderLabels    map[string]string
+}
+
+func (f *FileResolver) NetbootImageRef(node *v1alpha3.Machine) string {
+	if node == nil || node.Spec.PXE == nil {
+		return ""
+	}
+
+	if node.Spec.PXE.NetbootImage != "" {
+		return node.Spec.PXE.NetbootImage
+	}
+
+	return f.DefaultNetbootRef
 }
 
 func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3.Machine, error) {

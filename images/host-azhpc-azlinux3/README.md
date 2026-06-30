@@ -1,7 +1,9 @@
-# Azure HPC Azure Linux 3 Metalman Host Image
+# Azure HPC Azure Linux 3 Metalman Machine Image
 
-This image is a Metalman netboot wrapper around a VHD produced by
-[Azure/azhpc-images](https://github.com/Azure/azhpc-images) for Azure Linux HPC 3.0.
+This image contains only a gzip-compressed raw disk at `/disk/disk.img.gz`, converted from a VHD
+produced by [Azure/azhpc-images](https://github.com/Azure/azhpc-images) for Azure Linux HPC 3.0.
+Metalman installs it using the reusable `netboot` image selected by the controller default or by
+`spec.pxe.netbootImage`.
 
 Build with one VHD URL per target architecture:
 
