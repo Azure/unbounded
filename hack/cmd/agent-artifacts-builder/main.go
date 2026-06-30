@@ -387,7 +387,7 @@ func shortSHA(sha string) string {
 	return sha[:12]
 }
 
-func writeGitHubOutput(values map[string]string) error {
+func writeGitHubOutput(values map[string]string) (err error) {
 	outputPath := os.Getenv("GITHUB_OUTPUT")
 	if outputPath == "" {
 		for key, value := range values {
@@ -401,7 +401,12 @@ func writeGitHubOutput(values map[string]string) error {
 	if err != nil {
 		return fmt.Errorf("open GITHUB_OUTPUT: %w", err)
 	}
-	defer file.Close() //nolint:errcheck // best effort close
+
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("close GITHUB_OUTPUT: %w", closeErr)
+		}
+	}()
 
 	for key, value := range values {
 		if _, err := fmt.Fprintf(file, "%s=%s\n", key, value); err != nil {
