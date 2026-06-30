@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -97,8 +97,17 @@ proptest! {
     #[test]
     fn invariant_page_accounting_at_quiescence(seed in any::<u64>(), w in workload_strategy()) {
         let page_count = w.page_count;
+        let page_cache_enabled = w.page_cache_enabled;
         let report = run_workload(seed, w).expect("run completed");
         assert_quiescent_accounting(&report, page_count)?;
+        if !page_cache_enabled {
+            prop_assert_eq!(
+                report.cached_pages_at_end,
+                0,
+                "disabled page cache retained {} pages",
+                report.cached_pages_at_end,
+            );
+        }
         prop_assert_eq!(
             report.prefetch_inflight_at_end, 0,
             "prefetch budget not released: {} pages still reserved",
@@ -295,8 +304,17 @@ proptest! {
         w in pipelined_workload_strategy(),
     ) {
         let page_count = w.page_count;
+        let page_cache_enabled = w.page_cache_enabled;
         let report = run_workload(seed, w).expect("run completed");
         assert_quiescent_accounting(&report, page_count)?;
+        if !page_cache_enabled {
+            prop_assert_eq!(
+                report.cached_pages_at_end,
+                0,
+                "disabled page cache retained {} pages",
+                report.cached_pages_at_end,
+            );
+        }
         prop_assert_eq!(
             report.prefetch_inflight_at_end, 0,
             "prefetch budget not released: {} pages still reserved",
@@ -363,6 +381,7 @@ fn stream_limit_rejects_excess_concurrent_reads() {
         max_io_delay: 4,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        page_cache_enabled: true,
         max_concurrent_streams: 1,
         max_inflight_pages: 4,
         key_count: 1,
@@ -467,6 +486,7 @@ fn regression_freelist_deadlock_under_faults() {
         max_io_delay: 1,
         io_fault_rate: 3,
         cache_hit_rate: 0,
+        page_cache_enabled: true,
         max_concurrent_streams: 1024,
         max_inflight_pages: 4,
         key_count: 2,
@@ -523,6 +543,7 @@ fn smoke() {
         max_io_delay: 2,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        page_cache_enabled: true,
         max_concurrent_streams: 1024,
         max_inflight_pages: 4,
         key_count: 2,
@@ -575,6 +596,7 @@ fn all_cache_hits_skip_bulk_get_and_tee() {
         max_io_delay: 2,
         io_fault_rate: 0,
         cache_hit_rate: 100,
+        page_cache_enabled: true,
         max_concurrent_streams: 1024,
         max_inflight_pages: 4,
         key_count: 2,
@@ -617,6 +639,124 @@ fn all_cache_hits_skip_bulk_get_and_tee() {
         match o {
             ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
             other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+}
+
+/// Scenario test: a live page-cache drain invalidates the policy
+/// snapshot held by an already admitted stream. Pages fetched after the
+/// drain must still be delivered correctly but must not be retained in
+/// the RAM page cache. This pins the branch's `page_cache_drain_epoch`
+/// path under deterministic scheduler interleavings instead of only the
+/// synchronous module tests.
+#[test]
+fn drain_page_cache_during_active_stream_disables_retention() {
+    const PAGE_SIZE: usize = 128;
+    const PAGE_COUNT: usize = 4;
+
+    for seed in [0u64, 1, 7, 42, 1234, 99999] {
+        let backing = heap_backing(PAGE_SIZE, PAGE_COUNT);
+        let counts = Rc::new(CallCounts::default());
+        let mock_cfg = MockSimConfig::new();
+        mock_cfg.max_io_delay.set(3);
+        let stripes: Stripes = Rc::new(RefCell::new(HashMap::new()));
+        let key = StripeKey([0xDA; 32]);
+        let expected: Vec<u8> = (0..PAGE_SIZE * 3)
+            .map(|i| ((i + 0x31) & 0xff) as u8)
+            .collect();
+        stripes.borrow_mut().insert(key, expected.clone());
+
+        let transport = DstTransport::new(
+            stripes.clone(),
+            counts.clone(),
+            mock_cfg.clone(),
+            backing.base,
+            backing.page_size,
+        );
+        let blockstore = DstBlockStore::new(counts.clone(), stripes, mock_cfg);
+        blockstore.set_page_cache_enabled(true);
+        let pool = Rc::new(
+            Pool::new(
+                PoolConfig {
+                    max_concurrent_streams: 1024,
+                    max_inflight_pages: 3,
+                },
+                backing,
+                transport,
+                blockstore,
+            )
+            .expect("pool construction must succeed"),
+        );
+
+        let mut exec = Executor::new(seed);
+        let first_page_seen = Rc::new(Cell::new(false));
+        let drain_done = Rc::new(Cell::new(false));
+        let outcomes: Rc<RefCell<Vec<ClientOutcome>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let p = pool.clone();
+        let first_page_seen_reader = first_page_seen.clone();
+        let outcomes_reader = outcomes.clone();
+        let expected_reader = expected.clone();
+        exec.spawn(async move {
+            let req = TestReq { key };
+            let mut read = p
+                .read_windowed(&req, 0, (PAGE_SIZE * 3) as u64, 3)
+                .expect("windowed read");
+            let mut got = Vec::new();
+            let first = read.next_page().await.unwrap().unwrap();
+            got.extend_from_slice(first.as_slice());
+            first_page_seen_reader.set(true);
+            yield_n(4).await;
+            drop(first);
+            while let Some(page) = read.next_page().await {
+                got.extend_from_slice(page.unwrap().as_slice());
+            }
+            outcomes_reader.borrow_mut().push(ClientOutcome::Ok {
+                got,
+                expected: expected_reader,
+            });
+        });
+
+        let p = pool.clone();
+        let first_page_seen_drainer = first_page_seen.clone();
+        let drain_done_task = drain_done.clone();
+        exec.spawn(async move {
+            while !first_page_seen_drainer.get() {
+                yield_n(1).await;
+            }
+            p.drain_page_cache();
+            drain_done_task.set(true);
+        });
+
+        exec.run(5_000)
+            .expect("active drain scenario must complete");
+        assert!(drain_done.get(), "seed {seed}: drain task ran");
+        assert_eq!(
+            pool.cached_pages(),
+            0,
+            "seed {seed}: drained stream must not retain RAM cache pages",
+        );
+        assert_eq!(
+            pool.free_pages(),
+            PAGE_COUNT,
+            "seed {seed}: all pages returned to free list",
+        );
+        assert_eq!(
+            pool.active_inflight_entries(),
+            0,
+            "seed {seed}: active entries must drain",
+        );
+        assert_eq!(
+            counts.bulk_get.get(),
+            3,
+            "seed {seed}: every page fetched exactly once",
+        );
+
+        let outcomes = outcomes.borrow();
+        assert_eq!(outcomes.len(), 1, "seed {seed}: reader finished");
+        match &outcomes[0] {
+            ClientOutcome::Ok { got, expected } => assert_eq!(got, expected),
+            other => panic!("seed {seed}: unexpected outcome {other:?}"),
         }
     }
 }
@@ -867,6 +1007,7 @@ fn cancellation_drains_to_clean_state() {
         max_io_delay: 2,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        page_cache_enabled: true,
         max_concurrent_streams: 1024,
         max_inflight_pages: 4,
         key_count: 2,
@@ -940,6 +1081,7 @@ fn windowed_read_in_order_and_drains() {
         max_io_delay: 3,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        page_cache_enabled: true,
         max_concurrent_streams: 1024,
         max_inflight_pages: 4,
         key_count: 1,
@@ -990,6 +1132,7 @@ fn regression_windowed_cancel_under_pressure() {
         max_io_delay: 3,
         io_fault_rate: 0,
         cache_hit_rate: 10,
+        page_cache_enabled: true,
         max_concurrent_streams: 1024,
         max_inflight_pages: 1,
         key_count: 2,
@@ -1053,6 +1196,7 @@ fn windowed_under_free_list_pressure_drains() {
         max_io_delay: 3,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        page_cache_enabled: true,
         max_concurrent_streams: 1024,
         max_inflight_pages: 3,
         key_count: 2,
@@ -1127,6 +1271,7 @@ fn regression_windowed_speculation_starves_head() {
         max_io_delay: 2,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        page_cache_enabled: true,
         max_concurrent_streams: 1024,
         max_inflight_pages: 5,
         key_count: 2,
@@ -1181,6 +1326,7 @@ fn pipelined_multi_stripe_in_order_and_drains() {
         max_io_delay: 3,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        page_cache_enabled: true,
         max_concurrent_streams: 1024,
         max_inflight_pages: 6,
         key_count: 3,
@@ -1242,6 +1388,7 @@ fn pipelined_under_free_list_pressure_drains() {
         max_io_delay: 3,
         io_fault_rate: 0,
         cache_hit_rate: 0,
+        page_cache_enabled: true,
         max_concurrent_streams: 1024,
         max_inflight_pages: 4,
         key_count: 3,
