@@ -21,15 +21,18 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use unbounded_storage::backend::{BackendRegistry, FixedRegion, OriginRing};
-use unbounded_storage::bufferpool::BlockStore;
 use unbounded_storage::config::{self, BackendSpec, RuntimePeer};
-use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, PeerId, Provider, RpcServerHandle};
-use unbounded_storage::memory::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
-use unbounded_storage::p2p::{RecursiveHandler, RouteTableHandle, RouteTableSnapshot};
+use unbounded_storage::fabric::{
+    self, ConnectionSpec, Fabric, MrHandle, PeerId, Provider, RpcServerHandle,
+};
+use unbounded_storage::fanout::FetchChannel;
+use unbounded_storage::memory::{Backing, BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
+use unbounded_storage::p2p::{
+    OwnerShardSource, OwnerShardTable, RecursiveHandler, RouteTableHandle, RouteTableSnapshot,
+};
 use unbounded_storage::runtime::{Threading, WorkerIdx};
 use unbounded_storage::storage::StripeReq;
-use unbounded_storage::storage::disks::{CacheDirectorySet, ChainLocalStore};
+use unbounded_storage::storage::disks::CacheDirectorySet;
 use unbounded_storage::topology::{NicWorkerGroup, ServingShard};
 
 use crate::FabricStartup;
@@ -213,39 +216,54 @@ fn verbs_worker_for_device(
     (WorkerIdx(0), None)
 }
 
-/// A live fabric endpoint plus its shared RPC server and the
-/// reconcile-state for the shards mapped onto it.
+/// A shard phase-A publication needed by shared RPC workers.
+#[derive(Clone)]
+pub struct RpcShardPublish {
+    pub shard_index: usize,
+    pub fetch_channel: FetchChannel,
+    pub mr: MrHandle,
+    pub numa: Option<u16>,
+}
+
+/// A live fabric endpoint plus delayed RPC server state.
 ///
 /// Field order is drop order and mirrors the pre-lift per-shard teardown
 /// exactly: `rpc_server` drops first (it signals shutdown and joins its
-/// worker pool, releasing the `RecursiveHandler` it owns, which frees
-/// the scratch backing), then the registry and routing handle, then
-/// `fabric` last (closing every memory region registered against the
-/// domain: the shared scratch plus every assigned shard's data backing).
+/// worker pool), then scratch/routing, then `fabric` last (closing every
+/// memory region registered against the domain: the shared scratch plus
+/// every assigned shard's data backing).
 /// Closing the domain while a worker still touches it would be unsound,
 /// hence the order.
 ///
 /// The four teardown-ordered resources are type parameters defaulted to
 /// the production types, so the rest of the module refers to this as the
 /// plain `FabricUnit`. Bringing a real unit up needs a live libfabric
-/// domain, pinned backings, and RPC worker threads (what the smoke test
-/// covers), so the parameters exist solely so a unit test can substitute
-/// drop-logging stand-ins and lock this ordering hardware-free; see
+/// domain and pinned backings (what the smoke test covers), so the
+/// parameters exist solely so a unit test can substitute drop-logging
+/// stand-ins and lock this ordering hardware-free; see
 /// `fabric_unit_drops_resources_in_teardown_order`.
-struct FabricUnit<S = RpcServerHandle, Rg = BackendRegistry, Rt = RouteTableHandle, F = Arc<Fabric>>
-{
+struct FabricUnit<
+    S = Option<RpcServerHandle>,
+    Sc = Option<Backing>,
+    Rt = RouteTableHandle,
+    F = Arc<Fabric>,
+> {
     // Held only for its Drop: see the struct doc for the teardown order.
     #[allow(dead_code)]
     rpc_server: S,
-    handler_registry: Rg,
+    scratch: Sc,
     routes: Rt,
     fabric: F,
+    scratch_mr: MrHandle,
+    page_size: usize,
+    shards_assigned: Vec<usize>,
+    cache_directories: Arc<CacheDirectorySet>,
+    worker_idx: WorkerIdx,
     device_name: String,
     rdma: bool,
     self_addr: String,
     hca_numa: Option<u16>,
     applied_peers: HashMap<PeerId, ConnectionSpec>,
-    last_backends: HashMap<String, BackendSpec>,
 }
 
 /// The set of fabric endpoints serving a process, owning every shared
@@ -271,7 +289,7 @@ impl FabricGroup {
         plan: &FabricPlan,
         backing_kind: BackingKind,
         fabric_startup: &FabricStartup,
-        backend_specs: &[BackendSpec],
+        _backend_specs: &[BackendSpec],
         cache_directories: Arc<CacheDirectorySet>,
         routes: &RouteTableSnapshot,
         peers: &[RuntimePeer],
@@ -286,7 +304,6 @@ impl FabricGroup {
                 spec,
                 backing_kind,
                 fabric_startup,
-                backend_specs,
                 &cache_directories,
                 routes,
                 peers,
@@ -340,6 +357,69 @@ impl FabricGroup {
         }
     }
 
+    /// Start every shared RPC server after shards have published the
+    /// bufferpool MRs/fetch channels the owner path sources from.
+    pub fn start_rpc_servers(&mut self, shards: &[RpcShardPublish]) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        for unit in &mut self.units {
+            if unit.rpc_server.is_some() {
+                continue;
+            }
+
+            let worker = unit.worker_idx.0;
+            let owner_entries: Vec<OwnerShardSource> = shards
+                .iter()
+                .filter(|shard| unit.shards_assigned.contains(&shard.shard_index))
+                .map(|shard| OwnerShardSource {
+                    shard_index: shard.shard_index,
+                    channel: shard.fetch_channel.clone(),
+                    mr: shard.mr,
+                    numa: shard.numa,
+                })
+                .collect();
+            let owners = OwnerShardTable::new(
+                owner_entries,
+                unit.cache_directories.clone(),
+                unit.page_size,
+            );
+            let Some(scratch) = unit.scratch.take() else {
+                errors.push(format!("worker={worker}: rpc scratch already consumed"));
+                continue;
+            };
+            let handler = match RecursiveHandler::with_routes(
+                scratch,
+                RPC_SCRATCH_PAGES,
+                unit.routes.clone(),
+                unit.fabric.clone(),
+                unit.scratch_mr,
+                unit.page_size,
+                owners,
+            ) {
+                Ok(handler) => Arc::new(handler),
+                Err(e) => {
+                    errors.push(format!(
+                        "worker={worker}: RecursiveHandler::with_routes: {e}"
+                    ));
+                    continue;
+                }
+            };
+            match unit.fabric.start_rpc_server::<StripeReq, _>(
+                handler,
+                Some(unit.scratch_mr),
+                unit.page_size,
+            ) {
+                Ok(server) => unit.rpc_server = Some(server),
+                Err(e) => errors.push(format!("worker={worker}: start_rpc_server: {e}")),
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Re-drive every endpoint's fabric connection table toward `peers`.
     /// Connections live at the fabric/address-vector level, so this runs
     /// once per endpoint rather than once per shard.
@@ -364,22 +444,9 @@ impl FabricGroup {
         }
     }
 
-    /// Re-drive every endpoint's RPC-side backend registry toward
-    /// `backends`. The shard-side transport registries are reconciled
-    /// separately in each shard's control drain.
-    pub fn reconcile_backends(&mut self, backends: &[BackendSpec]) {
-        for unit in &mut self.units {
-            let report = config::reconcile_backends(
-                &unit.handler_registry,
-                backends,
-                Some(&unit.last_backends),
-            );
-            unit.last_backends = report.applied;
-            for (id, err) in &report.failures {
-                eprintln!("fabric backend reconcile failed: id={id} err={err}");
-            }
-        }
-    }
+    /// RPC owner reads are served through shard bufferpools, whose
+    /// backend registries are reconciled by shard control broadcasts.
+    pub fn reconcile_backends(&mut self, _backends: &[BackendSpec]) {}
 }
 
 /// Bring up one fabric endpoint from its spec. Mirrors the pre-lift
@@ -392,7 +459,6 @@ fn build_unit(
     spec: &FabricUnitSpec,
     backing_kind: BackingKind,
     fabric_startup: &FabricStartup,
-    backend_specs: &[BackendSpec],
     cache_directories: &Arc<CacheDirectorySet>,
     routes: &RouteTableSnapshot,
     peers: &[RuntimePeer],
@@ -447,59 +513,11 @@ fn build_unit(
     })
     .map_err(|e| format!("worker={worker}: rpc scratch alloc: {e}"))?;
     let page_size = scratch.page_size;
-    let scratch_base = scratch.base;
     let scratch_mr = fabric
         .register_backing(&scratch, spec.numa)
         .map_err(|e| format!("worker={worker}: register rpc scratch: {e}"))?;
 
     let routes = RouteTableHandle::from_snapshot(routes.clone());
-
-    // The handler resolves disk reads into scratch pages, so it needs a
-    // `BlockStore` whose single registered backing IS the scratch
-    // region; it shares the same disk-channel directory as the shards'
-    // data-path stores but keeps page resolution unambiguous.
-    let rpc_store = ChainLocalStore::new(cache_directories.clone());
-    rpc_store
-        .register_pages(&scratch)
-        .map_err(|e| format!("worker={worker}: rpc scratch blockstore register: {e}"))?;
-
-    // The handler runs on a persistent RPC worker thread, so its origin
-    // backend must use a worker-local ring (not a shard ring another
-    // thread progresses) and memcpy origin bytes into the scratch
-    // region.
-    let handler_registry = BackendRegistry::new(
-        backend_specs,
-        OriginRing::WorkerLocal {
-            queue_depth: 256,
-            region: Some(FixedRegion {
-                base: scratch_base,
-                len: page_size * RPC_SCRATCH_PAGES as usize,
-            }),
-        },
-        page_size,
-        scratch_base,
-    )
-    .map_err(|e| format!("worker={worker}: build rpc backend registry: {e}"))?;
-
-    // `scratch` moves into the handler here; `scratch_mr` is a `Copy`
-    // value handle shared by copy between the handler's forwarding
-    // transport and the RPC server's `local_mr`.
-    let rpc_handler = Arc::new(
-        RecursiveHandler::with_routes(
-            rpc_store,
-            scratch,
-            RPC_SCRATCH_PAGES,
-            routes.clone(),
-            fabric.clone(),
-            scratch_mr,
-            page_size,
-            handler_registry.clone(),
-        )
-        .map_err(|e| format!("worker={worker}: RecursiveHandler::with_routes: {e}"))?,
-    );
-    let rpc_server = fabric
-        .start_rpc_server::<StripeReq, _>(rpc_handler, Some(scratch_mr), page_size)
-        .map_err(|e| format!("worker={worker}: start_rpc_server: {e}"))?;
 
     fabric.check_shared_domain_capacity(spec.expected_mr);
 
@@ -509,22 +527,22 @@ fn build_unit(
     // Seed the desired-peer set so the background reconnect thread can
     // retry any peer whose initial dial lost the startup race.
     fabric.set_desired_peers(desired_peers.clone());
-    let last_backends = backend_specs
-        .iter()
-        .map(|b| (b.name.clone(), b.clone()))
-        .collect();
 
     Ok(FabricUnit {
-        rpc_server,
-        handler_registry,
+        rpc_server: None,
+        scratch: Some(scratch),
         routes,
         fabric,
+        scratch_mr,
+        page_size,
+        shards_assigned: spec.shards_assigned.clone(),
+        cache_directories: cache_directories.clone(),
+        worker_idx: spec.worker_idx,
         device_name: spec.device_name.clone(),
         rdma: spec.provider == Provider::Verbs,
         self_addr,
         hca_numa: spec.numa,
         applied_peers,
-        last_backends,
     })
 }
 
@@ -801,7 +819,7 @@ mod tests {
         // A `FabricUnit`'s field order is its drop order, and that order
         // is the teardown contract: the RPC server (and the worker
         // threads it joins) must stop touching the domain before the
-        // fabric closes it, with the registry and route handle in
+        // fabric closes it, with scratch and the route handle in
         // between. Bringing a real unit up needs a live libfabric domain
         // (covered by the smoke test), so here we substitute drop-logging
         // tokens for the four hardware-bound resources. This binds to the
@@ -811,22 +829,32 @@ mod tests {
 
         let unit: FabricUnit<DropToken, DropToken, DropToken, DropToken> = FabricUnit {
             rpc_server: DropToken::new("rpc_server", &log),
-            handler_registry: DropToken::new("handler_registry", &log),
+            scratch: DropToken::new("scratch", &log),
             routes: DropToken::new("routes", &log),
             fabric: DropToken::new("fabric", &log),
+            scratch_mr: MrHandle {
+                mr: std::ptr::null_mut(),
+                remote_key: 0,
+                base: 0,
+                remote_base: 0,
+                len: 0,
+            },
+            page_size: 4096,
+            shards_assigned: Vec::new(),
+            cache_directories: CacheDirectorySet::new(),
+            worker_idx: WorkerIdx(0),
             device_name: "mlx5_0".to_string(),
             rdma: true,
             self_addr: "hex:01".to_string(),
             hca_numa: None,
             applied_peers: HashMap::new(),
-            last_backends: HashMap::new(),
         };
 
         drop(unit);
 
         assert_eq!(
             *log.borrow(),
-            vec!["rpc_server", "handler_registry", "routes", "fabric"],
+            vec!["rpc_server", "scratch", "routes", "fabric"],
         );
     }
 }

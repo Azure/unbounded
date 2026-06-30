@@ -25,7 +25,10 @@ pub use finger_router::{ChainFingerRouter, FingerRouter};
 pub use fingers::{
     FingerTable, FingerTableConfig, TopologyPrefixWeight, TopologySelection, TopologyWeighting,
 };
-pub use handler::{RecursiveHandler, RecursiveHandlerError, RecursiveHandlerStream};
+pub use handler::{
+    OwnerShardSource, OwnerShardTable, RecursiveHandler, RecursiveHandlerError,
+    RecursiveHandlerStream,
+};
 pub use ring::{node_id_from_name, node_to_ring, splitmix64, stripe_to_ring};
 pub use routing_handle::{RouteTableHandle, RouteTableSnapshot, RoutingHandle, RoutingSnapshot};
 pub use transport::{RoutedStream, RoutedTransport};

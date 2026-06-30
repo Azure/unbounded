@@ -276,7 +276,9 @@ use std::task::{Context, Poll};
 
 use crate::bufferpool::{BulkRef, PageRef, PageStream, Req, StripeKey, Transport};
 use crate::fabric::handler::{CancelObservingHandler, ErrorHandler, NPagesHandler, TestErr};
-use crate::fabric::{FabricTransport, Handler, HandlerStream, MrHandle, PoolHandler, StaticPeer};
+use crate::fabric::{
+    FabricPage, FabricTransport, Handler, HandlerStream, MrHandle, PoolHandler, StaticPeer,
+};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct TestReq {
@@ -315,7 +317,7 @@ impl HandlerStream for EmptyStream {
     fn poll_next(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<PageRef, Self::Error>>> {
+    ) -> Poll<Option<Result<FabricPage, Self::Error>>> {
         Poll::Ready(None)
     }
 }
@@ -958,29 +960,23 @@ fn pool_handler_reports_miss_for_non_resident_stripe() {
 //
 //   A (client) --static--> B (relay) --finger--> C (owner)
 //
-// A is a plain client whose `StaticPeer` router always targets B. B
-// owns no stripe for the requested key, so its finger table forwards
-// to C, RDMA-landing C's served page directly into B's scratch before
-// B relays it upstream to A. C owns the key and serves it from its
-// local store (or, on a miss, from the origin backend). This is the
-// only place the recursive forward path is exercised against a live
-// fabric; the per-node routing math is unit-tested in `p2p`.
-//
-// The finger tables are hand-crafted per node (B knows only C, C knows
-// only B) so the chain forwards exactly once at B and terminates at C.
-// A globally-consistent three-node ring would let B route straight to
-// C in one hop; the point here is to drive a genuine relay hop.
-//
-// Every test runtime-skips when the libfabric tcp provider is absent.
+// C serves owner pages through the same `FetchChannel` shape used by
+// shard-local bufferpool fanout. The fake service below emits only a
+// registered backing location and observes release commands; it never
+// hands page bytes to the RPC worker, preserving the zero-copy contract
+// the production `FetchService` provides.
 // ---------------------------------------------------------------
 
 use std::collections::HashMap;
 
-use crate::backend::{Backend, NullBackend};
-use crate::p2p::{
-    FingerTable, FingerTableConfig, NodeId, PeerEntry, RecursiveHandler, RingId, RouteTableHandle,
-    RoutingSnapshot, TopologyTags,
+use crate::fanout::{
+    FetchChannel, FetchChannelReceiver, FetchCommand, FetchEvent, FetchPage, PageLoc,
 };
+use crate::p2p::{
+    FingerTable, FingerTableConfig, NodeId, OwnerShardSource, OwnerShardTable, PeerEntry,
+    RecursiveHandler, RingId, RouteTableHandle, RoutingSnapshot, TopologyTags,
+};
+use crate::storage::StripeReq;
 
 /// Ring position the relay (B) forwards for and the owner (C) serves.
 /// Chosen to sit in the open arc `(B.ring, C.ring)` so B's finger
@@ -988,80 +984,68 @@ use crate::p2p::{
 const CHAIN_TARGET_RING: u64 = 150;
 const CHAIN_CACHE_ID: &str = "cache";
 
-/// Request whose stripe key's leading 8 bytes encode a ring id, so
-/// `stripe_to_ring(req.key())` is controllable from the test.
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct RingReq {
-    key_bytes: [u8; 32],
-    cache_id: Option<String>,
+#[derive(Copy, Clone)]
+enum OwnerFetchResult {
+    Page(u8),
+    Error(&'static str),
 }
 
-impl Req for RingReq {
-    fn key(&self) -> StripeKey {
-        StripeKey(self.key_bytes)
-    }
-
-    fn cache_id(&self) -> Option<&String> {
-        self.cache_id.as_ref()
-    }
+struct FetchStub {
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Origin backend that fills its destination scratch page with a known
-/// byte then yields it once, standing in for an authoritative origin
-/// fetch on an owner-side store miss.
-struct FillBackend {
-    base: usize,
-    page_size: usize,
-    fill: u8,
-}
-
-// SAFETY: `base` points into a leaked scratch backing that outlives
-// the test; the page is only written from the RPC worker thread.
-unsafe impl Send for FillBackend {}
-unsafe impl Sync for FillBackend {}
-
-struct FillStream {
-    page: Option<PageRef>,
-}
-
-impl PageStream for FillStream {
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<PageRef, PoolError>>> {
-        match self.page.take() {
-            Some(p) => Poll::Ready(Some(Ok(p))),
-            None => Poll::Ready(None),
+impl Drop for FetchStub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
         }
     }
 }
 
-impl Backend for FillBackend {
-    type Req = RingReq;
-    type Stream<'a> = FillStream;
-
-    fn bulk_get<'a>(
-        &'a self,
-        _req: &'a Self::Req,
-        _src: BulkRef,
-        dsts: &'a [PageRef],
-    ) -> Self::Stream<'a> {
-        let dst = dsts[0];
-        // SAFETY: dst.page_idx indexes the scratch backing at `base`.
-        unsafe {
-            let p = (self.base as *mut u8).add(dst.page_idx as usize * self.page_size);
-            std::ptr::write_bytes(p, self.fill, self.page_size);
+fn spawn_fetch_stub(
+    rx: FetchChannelReceiver,
+    page_byte_offset: u64,
+    len: u32,
+    result: OwnerFetchResult,
+) -> FetchStub {
+    let (cmd_rx, alive, _command_waker) = rx.into_parts();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let join = std::thread::spawn(move || {
+        while !thread_stop.load(Ordering::Acquire) {
+            match cmd_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(FetchCommand::Fetch {
+                    fetch_id, events, ..
+                }) => match result {
+                    OwnerFetchResult::Page(_) => {
+                        events.push(Ok(FetchEvent::Page(FetchPage {
+                            ordinal: 0,
+                            pin_token: fetch_id + 1,
+                            loc: PageLoc {
+                                page_byte_offset,
+                                len,
+                            },
+                        })));
+                        events.push(Ok(FetchEvent::Done));
+                    }
+                    OwnerFetchResult::Error(msg) => events.push(Err(PoolError::from(msg))),
+                },
+                Ok(FetchCommand::Release { .. })
+                | Ok(FetchCommand::Sending { .. })
+                | Ok(FetchCommand::Cancel { .. }) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
-        FillStream { page: Some(dst) }
-    }
-}
+        alive.store(false, Ordering::Release);
+    });
 
-/// Which origin backend the owner (C) consults on a store miss.
-enum OwnerBackend {
-    /// Inert backend: a store miss surfaces an error up the chain.
-    Null,
-    /// Origin fetch that fills the page with the given byte.
-    Fill(u8),
+    FetchStub {
+        stop,
+        join: Some(join),
+    }
 }
 
 /// Build a `PeerEntry` at an explicit ring position. The ring is set
@@ -1089,25 +1073,18 @@ fn key_for_ring(ring: u64) -> StripeKey {
 /// while the relay reads back from `PageRef.page_idx`.
 const RECURSIVE_SCRATCH_PAGES: usize = 8;
 
-/// Start a node running the production `RecursiveHandler` over a
-/// `RECURSIVE_SCRATCH_PAGES`-page scratch backing.
 #[allow(clippy::too_many_arguments)]
-fn start_recursive_node<B>(
+fn start_recursive_node(
     fabric: &Arc<Fabric>,
     scratch: Backing,
     scratch_mr: MrHandle,
     page_size: usize,
     fingers: Arc<FingerTable>,
     node_to_peer: Arc<HashMap<NodeId, PeerId>>,
-    store: Arc<MemBlockStore>,
-    backend: B,
-) -> crate::fabric::RpcServerHandle
-where
-    B: Backend<Req = RingReq> + 'static,
-{
+    owners: OwnerShardTable,
+) -> crate::fabric::RpcServerHandle {
     let handler = Arc::new(
         RecursiveHandler::with_routes(
-            store,
             scratch,
             RECURSIVE_SCRATCH_PAGES as u32,
             RouteTableHandle::new(
@@ -1124,29 +1101,24 @@ where
             fabric.clone(),
             scratch_mr,
             page_size,
-            backend,
+            owners,
         )
         .expect("RecursiveHandler::with_routes failed after provider availability gate"),
     );
-    Fabric::start_rpc_server::<RingReq, _>(fabric, handler, Some(scratch_mr), page_size)
+    Fabric::start_rpc_server::<StripeReq, _>(fabric, handler, Some(scratch_mr), page_size)
         .expect("start_rpc_server failed after provider availability gate")
 }
 
-/// Stand up the live A -> B -> C chain. `c_present` lists `(ring, fill)`
-/// entries resident in C's store; `owner` selects C's origin backend
-/// for the store-miss case. Returns the client transport, the client
-/// MR, the page size, both server handles, and the three fabrics. The
-/// handles and fabrics must be held for the lifetime of the test.
 #[allow(clippy::type_complexity)]
 fn recursive_chain(
-    c_present: &[(u64, u8)],
-    owner: OwnerBackend,
+    owner: OwnerFetchResult,
 ) -> (
-    FabricTransport<RingReq, StaticPeer>,
+    FabricTransport<StripeReq, StaticPeer>,
     MrHandle,
     usize,
     crate::fabric::RpcServerHandle,
     crate::fabric::RpcServerHandle,
+    FetchStub,
     Arc<Fabric>,
     Arc<Fabric>,
     Arc<Fabric>,
@@ -1167,22 +1139,25 @@ fn recursive_chain(
     let b_scratch = alloc(page_size * RECURSIVE_SCRATCH_PAGES);
     let c_scratch = alloc(page_size * RECURSIVE_SCRATCH_PAGES);
     let client_backing = alloc(page_size);
-    // Zero the client page so a populated byte proves an RMA landing.
-    // SAFETY: client_backing covers `page_size`.
+    let owner_backing = alloc(page_size);
+
+    // SAFETY: both heap backings cover `page_size` bytes.
     unsafe {
         std::ptr::write_bytes(client_backing.base, 0, page_size);
+        if let OwnerFetchResult::Page(fill) = owner {
+            std::ptr::write_bytes(owner_backing.base, fill, page_size);
+        }
     }
-
-    let b_base = b_scratch.base as usize;
-    let c_base = c_scratch.base as usize;
 
     let b_mr = b.register_backing(&b_scratch, None).expect("b scratch MR");
     let c_mr = c.register_backing(&c_scratch, None).expect("c scratch MR");
+    let owner_mr = c
+        .register_backing(&owner_backing, None)
+        .expect("c owner backing MR");
     let client_mr = a
         .register_backing(&client_backing, None)
         .expect("client MR");
 
-    // Global peer-id scheme: A=1, B=2, C=3 in every fabric's table.
     let a_addr = socket_addr_of(&a);
     let b_addr = socket_addr_of(&b);
     let c_addr = socket_addr_of(&c);
@@ -1215,8 +1190,6 @@ fn recursive_chain(
     })
     .expect("c -> b connection");
 
-    // B (ring 100) forwards CHAIN_TARGET_RING (150) to its successor C
-    // (ring 200); C owns it. Each table knows only the other node.
     let b_fingers = Arc::new(FingerTable::build(
         ring_peer(2, 100),
         std::slice::from_ref(&ring_peer(3, 200)),
@@ -1229,25 +1202,27 @@ fn recursive_chain(
     ));
     let b_n2p: Arc<HashMap<NodeId, PeerId>> =
         Arc::new([(NodeId(3), PeerId(3))].into_iter().collect());
-    // C never forwards for the target; mapping is present for symmetry.
     let c_n2p: Arc<HashMap<NodeId, PeerId>> =
         Arc::new([(NodeId(2), PeerId(2))].into_iter().collect());
 
-    let b_store = Arc::new(MemBlockStore {
-        base: b_base,
+    let empty_owners = OwnerShardTable::new(
+        Vec::new(),
+        crate::storage::disks::CacheDirectorySet::new(),
         page_size,
-        present: HashMap::new(),
-    });
-    let c_store = Arc::new(MemBlockStore {
-        base: c_base,
+    );
+    let (fetch_channel, fetch_rx) = FetchChannel::new();
+    let fetch_stub = spawn_fetch_stub(fetch_rx, 0, page_size as u32, owner);
+    let c_owners = OwnerShardTable::new(
+        vec![OwnerShardSource {
+            shard_index: 0,
+            channel: fetch_channel,
+            mr: owner_mr,
+            numa: None,
+        }],
+        crate::storage::disks::CacheDirectorySet::new(),
         page_size,
-        present: c_present
-            .iter()
-            .map(|&(ring, fill)| (key_for_ring(ring).0, fill))
-            .collect(),
-    });
+    );
 
-    // B always forwards: empty store, inert backend.
     let b_handle = start_recursive_node(
         &b,
         b_scratch,
@@ -1255,38 +1230,11 @@ fn recursive_chain(
         page_size,
         b_fingers,
         b_n2p,
-        b_store,
-        NullBackend::<RingReq>::new(),
+        empty_owners,
     );
-    // C owns the key; its backend depends on the scenario.
-    let c_handle = match owner {
-        OwnerBackend::Null => start_recursive_node(
-            &c,
-            c_scratch,
-            c_mr,
-            page_size,
-            c_fingers,
-            c_n2p,
-            c_store,
-            NullBackend::<RingReq>::new(),
-        ),
-        OwnerBackend::Fill(fill) => start_recursive_node(
-            &c,
-            c_scratch,
-            c_mr,
-            page_size,
-            c_fingers,
-            c_n2p,
-            c_store,
-            FillBackend {
-                base: c_base,
-                page_size,
-                fill,
-            },
-        ),
-    };
+    let c_handle = start_recursive_node(&c, c_scratch, c_mr, page_size, c_fingers, c_n2p, c_owners);
 
-    let transport = FabricTransport::<RingReq, _>::new(
+    let transport = FabricTransport::<StripeReq, _>::new(
         a.clone(),
         client_mr,
         StaticPeer { peer: PeerId(2) },
@@ -1294,24 +1242,22 @@ fn recursive_chain(
     )
     .expect("client FabricTransport::new failed after provider availability gate");
 
-    // Leak the client backing so it outlives the transport.
+    // Leak backings that outlive their direct owner in this test harness.
     Box::leak(Box::new(client_backing));
+    Box::leak(Box::new(owner_backing));
 
-    (transport, client_mr, page_size, b_handle, c_handle, a, b, c)
+    (
+        transport, client_mr, page_size, b_handle, c_handle, fetch_stub, a, b, c,
+    )
 }
 
-/// Issue the chain request for `CHAIN_TARGET_RING` against one client
-/// page and collect the stream results.
 fn run_chain_request(
-    transport: &FabricTransport<RingReq, StaticPeer>,
+    transport: &FabricTransport<StripeReq, StaticPeer>,
     page_size: usize,
     timeout: Duration,
 ) -> Vec<Result<PageRef, PoolError>> {
     let key = key_for_ring(CHAIN_TARGET_RING);
-    let req = RingReq {
-        key_bytes: key.0,
-        cache_id: Some(CHAIN_CACHE_ID.to_string()),
-    };
+    let req = StripeReq::new(key).with_cache_id(Some(CHAIN_CACHE_ID.to_string()));
     let dsts = vec![PageRef {
         page_idx: 0,
         offset: 0,
@@ -1329,13 +1275,13 @@ fn run_chain_request(
 }
 
 #[test]
-fn recursive_two_hop_owner_serves_from_store() {
+fn recursive_two_hop_owner_serves_from_fetch_channel() {
     if skip_ffi() {
         return;
     }
     let fill = 0xC7u8;
-    let (transport, client_mr, page_size, _bh, _ch, _a, _b, _c) =
-        recursive_chain(&[(CHAIN_TARGET_RING, fill)], OwnerBackend::Null);
+    let (transport, client_mr, page_size, _bh, _ch, _fetch, _a, _b, _c) =
+        recursive_chain(OwnerFetchResult::Page(fill));
 
     let results = run_chain_request(&transport, page_size, Duration::from_secs(30));
 
@@ -1345,9 +1291,6 @@ fn recursive_two_hop_owner_serves_from_store() {
         "unexpected stream error: {:?}",
         results[0]
     );
-
-    // The client page must hold C's store fill byte, proving the page
-    // traversed C -> B scratch -> A's MR over the live forward path.
     // SAFETY: client_mr.base is the live client mapping.
     unsafe {
         let byte = *(client_mr.base as *const u8);
@@ -1356,41 +1299,12 @@ fn recursive_two_hop_owner_serves_from_store() {
 }
 
 #[test]
-fn recursive_owner_miss_falls_through_to_backend() {
+fn recursive_owner_fetch_error_propagates() {
     if skip_ffi() {
         return;
     }
-    let fill = 0x3Bu8;
-    // C's store is empty for the key, so it falls through to the origin
-    // backend, which fills the page.
-    let (transport, client_mr, page_size, _bh, _ch, _a, _b, _c) =
-        recursive_chain(&[], OwnerBackend::Fill(fill));
-
-    let results = run_chain_request(&transport, page_size, Duration::from_secs(30));
-
-    assert_eq!(results.len(), 1, "expected one relayed page");
-    assert!(
-        results[0].is_ok(),
-        "unexpected stream error: {:?}",
-        results[0]
-    );
-
-    // SAFETY: client_mr.base is the live client mapping.
-    unsafe {
-        let byte = *(client_mr.base as *const u8);
-        assert_eq!(byte, fill, "client page not populated from origin backend");
-    }
-}
-
-#[test]
-fn recursive_owner_miss_null_backend_errors() {
-    if skip_ffi() {
-        return;
-    }
-    // C's store is empty and its origin backend is inert, so the miss
-    // surfaces as an error that propagates back through B to A.
-    let (transport, _client_mr, page_size, _bh, _ch, _a, _b, _c) =
-        recursive_chain(&[], OwnerBackend::Null);
+    let (transport, _client_mr, page_size, _bh, _ch, _fetch, _a, _b, _c) =
+        recursive_chain(OwnerFetchResult::Error("owner fetch failure"));
 
     let results = run_chain_request(&transport, page_size, Duration::from_secs(30));
 
@@ -1400,8 +1314,8 @@ fn recursive_owner_miss_null_backend_errors() {
     assert!(
         err_msg
             .as_deref()
-            .is_some_and(|m| m.contains("no backend configured")),
-        "expected owner-miss error to propagate up the chain, got {err_msg:?}",
+            .is_some_and(|m| m.contains("owner fetch failure")),
+        "expected owner-fetch error to propagate up the chain, got {err_msg:?}",
     );
 }
 
