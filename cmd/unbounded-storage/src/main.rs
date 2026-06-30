@@ -29,7 +29,8 @@ use unbounded_storage::frontend::{
 };
 use unbounded_storage::p2p::{
     FingerTable, FingerTableConfig, NodeId, PeerEntry, RouteTableHandle, RouteTableSnapshot,
-    RoutedTransport, RoutingSnapshot, TopologyTags, node_to_ring,
+    RoutedTransport, RoutingSnapshot, TopologyPrefixWeight, TopologySelection, TopologyTags,
+    TopologyWeighting, node_to_ring,
 };
 use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
@@ -1155,6 +1156,12 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
             &peers,
             FingerTableConfig {
                 k: mesh.fingers_per_node.max(1),
+                topology: mesh
+                    .topology_weighting
+                    .as_ref()
+                    .map(p2p_topology_weighting)
+                    .map(TopologySelection::Weighted)
+                    .unwrap_or_default(),
             },
         ))
     };
@@ -1172,6 +1179,19 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
         })
         .collect();
     RouteTableSnapshot { routes }
+}
+
+fn p2p_topology_weighting(weighting: &config::TopologyWeighting) -> TopologyWeighting {
+    TopologyWeighting {
+        prefix_weights: weighting
+            .prefix_weights
+            .iter()
+            .map(|weight| TopologyPrefixWeight {
+                tag_index: weight.tag_index,
+                weight: weight.weight,
+            })
+            .collect(),
+    }
 }
 
 fn reconcile_cache_disks(

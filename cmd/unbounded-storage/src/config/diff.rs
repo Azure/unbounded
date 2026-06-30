@@ -12,8 +12,9 @@
 //!
 //! * **process identity (`self`).** Startup-fixed because it determines the
 //!   process-wide fabric peer id. A change requires a restart.
-//! * **process routing (`fingers_per_node`, `routing_plan`).** Rebuilds the
-//!   projected routing surface and republishes it to every shard.
+//! * **process routing (`fingers_per_node`, `routing_plan`,
+//!   `topology_weighting`).** Rebuilds the projected routing surface and
+//!   republishes it to every shard.
 //! * **`[[peers]]`.** Reconciles fabric connections and rebuilds the projected
 //!   routing surface. The peer named by `self` is used as the local topology
 //!   entry and is not dialed.
@@ -78,7 +79,8 @@ impl ConfigDiff {
             disks_changed: old.disks != new.disks,
             identity_changed: old.self_ != new.self_,
             routing_changed: old.fingers_per_node != new.fingers_per_node
-                || old.routing_plan != new.routing_plan,
+                || old.routing_plan != new.routing_plan
+                || old.topology_weighting != new.topology_weighting,
             peers_changed: old.peers != new.peers,
             backends_changed: old.backends != new.backends,
             frontends_changed: old.frontends != new.frontends,
@@ -122,8 +124,8 @@ mod tests {
     use super::*;
     use crate::config::schema::{
         BackendSpec, BlockDiskConfig, CacheSpec, DiskSpec, FrontendSpec, HttpBackendConfig,
-        HttpFrontendConfig, PeerSpec, RoutingPlan, TcpPeerConfig, backend_spec, disk_spec,
-        frontend_spec, peer_spec,
+        HttpFrontendConfig, PeerSpec, RoutingPlan, TcpPeerConfig, TopologyPrefixWeight,
+        TopologyWeighting, backend_spec, disk_spec, frontend_spec, peer_spec,
     };
 
     fn base() -> Config {
@@ -167,6 +169,22 @@ mod tests {
             fingers: vec!["node-b".to_string()],
             successor: Some("node-b".to_string()),
             predecessor: None,
+        });
+        let d = ConfigDiff::between(&a, &b);
+        assert!(d.routing_changed);
+        assert!(d.requires_routing_reload());
+        assert!(!d.requires_peer_reconcile());
+    }
+
+    #[test]
+    fn topology_weighting_change_is_routing_reload() {
+        let a = base();
+        let mut b = base();
+        b.topology_weighting = Some(TopologyWeighting {
+            prefix_weights: vec![TopologyPrefixWeight {
+                tag_index: 0,
+                weight: 0.5,
+            }],
         });
         let d = ConfigDiff::between(&a, &b);
         assert!(d.routing_changed);
