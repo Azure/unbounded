@@ -125,12 +125,14 @@ def uefi_firmware_paths() -> tuple[str, str]:
     if expected_node_arch() == "arm64":
         return (
             _first_existing([
-                "/usr/share/AAVMF/AAVMF_CODE.fd",
                 "/usr/share/AAVMF/AAVMF_CODE.ms.fd",
+                "/usr/share/AAVMF/AAVMF_CODE.secboot.fd",
+                "/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd",
+                "/usr/share/AAVMF/AAVMF_CODE.fd",
             ]),
             _first_existing([
-                "/usr/share/AAVMF/AAVMF_VARS.fd",
                 "/usr/share/AAVMF/AAVMF_VARS.ms.fd",
+                "/usr/share/AAVMF/AAVMF_VARS.fd",
             ]),
         )
 
@@ -1022,9 +1024,6 @@ def main() -> None:
     virt_type = libvirt_type()
     if virt_type == "qemu":
         log("/dev/kvm is unavailable; creating VM with QEMU TCG")
-    tpm_arg = "backend.type=emulator,backend.version=2.0"
-    if expected_node_arch() == "arm64":
-        tpm_arg = f"model=tpm-crb,{tpm_arg}"
     virt_install_args = [
         "virt-install",
         "--debug",
@@ -1035,7 +1034,7 @@ def main() -> None:
         "--disk", f"path={disk},format=qcow2,bus=virtio",
         "--network", f"network={NET_NAME},mac={MAC_ADDRESS}",
         "--boot", f"uefi,loader={uefi_code},nvram={ovmf_vars},hd,network",
-        "--tpm", tpm_arg,
+        "--tpm", "backend.type=emulator,backend.version=2.0",
         "--serial", f"unix,path={SERIAL_SOCK},mode=bind",
         "--channel", f"unix,path={QGA_SOCK},mode=bind,target.type=virtio,target.name=org.qemu.guest_agent.0",
         "--os-variant", "generic",
