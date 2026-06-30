@@ -530,6 +530,10 @@ func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
 		t.Errorf("expected unbounded-agent start in rendered vendor-data, got:\n%s", body)
 	}
 
+	if !strings.Contains(body, `AGENT_URL="http://10.0.1.1:8080/unbounded-agent"`) {
+		t.Errorf("expected unbounded-agent download URL in rendered vendor-data, got:\n%s", body)
+	}
+
 	if !strings.Contains(body, "/cloudinit/log") {
 		t.Errorf("expected webhook reporting endpoint in rendered vendor-data, got:\n%s", body)
 	}

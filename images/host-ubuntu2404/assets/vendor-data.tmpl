@@ -54,6 +54,30 @@ runcmd:
   - -c
   - |
     set -eo pipefail
+    echo "Installing unbounded-agent..."
+    install -d -m 0755 /usr/local/bin
+    export AGENT_URL="{{ .ServeURL }}/unbounded-agent"
+    for attempt in 1 2 3 4 5; do
+      if python3 - <<'PY'
+    import os
+    import shutil
+    import urllib.request
+
+    with urllib.request.urlopen(os.environ["AGENT_URL"], timeout=30) as src:
+        with open("/usr/local/bin/unbounded-agent", "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    PY
+      then
+        break
+      fi
+      if [ "$attempt" = "5" ]; then
+        echo "Failed to download unbounded-agent from ${AGENT_URL}"
+        exit 1
+      fi
+      echo "Download unbounded-agent failed (attempt ${attempt}/5), retrying..."
+      sleep 5
+    done
+    chmod 0755 /usr/local/bin/unbounded-agent
     export UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json
     echo "Running unbounded-agent start..."
     /usr/local/bin/unbounded-agent start

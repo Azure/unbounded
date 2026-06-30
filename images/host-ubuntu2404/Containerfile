@@ -27,12 +27,10 @@ ARG TARGETARCH
 # ~600 MB) with HTTP 429.  apt's built-in Acquire::Retries does not add a
 # delay between attempts, so a shell-level retry with sleep is needed.
 RUN apt-get update && \
-    extra_packages="" && \
-    if [ "${TARGETARCH}" = "arm64" ]; then extra_packages="qemu-efi-aarch64"; fi && \
     ok=false && \
     for attempt in 1 2 3 4 5; do \
       if apt-get install -y --no-install-recommends \
-           cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-generic pigz ${extra_packages}; then \
+           cpio curl ca-certificates qemu-utils linux-image-generic pigz; then \
         ok=true; break; \
       fi; \
       echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
@@ -148,24 +146,15 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
 # Cloud image URL is parameterized by architecture.
 ARG UBUNTU_CLOUDIMG_URL=https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-${TARGETARCH}.img
 
-# Copy the agent binary from the builder so we can inject it into the
-# cloud image before gzipping.  It is also placed at /disk/unbounded-agent
-# (below) so metalman can serve it to other provisioning paths.
-COPY --from=gobuilder /unbounded-agent /tmp/unbounded-agent
-
 RUN curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
         -o /tmp/cloudimg.qcow2 "${UBUNTU_CLOUDIMG_URL}" && \
     qemu-img convert -f qcow2 -O raw /tmp/cloudimg.qcow2 /tmp/disk.img && \
     rm /tmp/cloudimg.qcow2 && \
-    if [ "${TARGETARCH}" = "arm64" ]; then export LIBGUESTFS_BACKEND_SETTINGS=force_tcg; fi && \
-    LIBGUESTFS_BACKEND=direct virt-customize -a /tmp/disk.img \
-        --mkdir /usr/local/bin \
-        --copy-in /tmp/unbounded-agent:/usr/local/bin \
-        --chmod 0755:/usr/local/bin/unbounded-agent && \
     pigz -1 /tmp/disk.img && \
     mv /tmp/disk.img.gz /disk/disk.img.gz
 
 # ── Agent binary built from source ──────────────────────────────────
+# Cloud-init downloads this file from metalman during first boot.
 COPY --from=gobuilder /unbounded-agent /disk/unbounded-agent
 
 FROM scratch
