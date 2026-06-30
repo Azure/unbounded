@@ -151,9 +151,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
+	restoreHostReplaceTriggerConditions := op.Spec.OperationKind == v1alpha3.OperationHostReplace && hostReplaceTriggerConditionsMissing(&op)
+
 	changes, requeueAfter := r.advanceTargets(ctx, &op)
-	if len(changes) > 0 {
-		if err := r.applyTargetChanges(ctx, op.Name, changes); err != nil {
+	if len(changes) > 0 || restoreHostReplaceTriggerConditions {
+		if err := r.applyTargetChanges(ctx, op.Name, changes, restoreHostReplaceTriggerConditions); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -199,8 +201,7 @@ func (r *Reconciler) snapshotTargets(ctx context.Context, op *v1alpha3.MachineOp
 		setCompletedCondition(latest, metav1.ConditionFalse, "InProgress", latest.Status.Message)
 
 		if op.Spec.OperationKind == v1alpha3.OperationHostReplace {
-			setBootImageWrittenCondition(latest, metav1.ConditionUnknown, "Pending", "waiting for PXE installer to start writing the boot image")
-			setCloudInitDoneCondition(latest, metav1.ConditionUnknown, "Pending", "waiting for first-boot cloud-init to start")
+			setHostReplaceTriggerConditions(latest)
 		}
 	})
 }
@@ -638,7 +639,7 @@ func (r *Reconciler) patchMachineOperations(ctx context.Context, machineName str
 	})
 }
 
-func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, changes []targetChange) error {
+func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, changes []targetChange, restoreHostReplaceTriggerConditions bool) error {
 	for _, change := range changes {
 		if change.err != nil {
 			return change.err
@@ -660,6 +661,10 @@ func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, chan
 			if updated, ok := byName[target.MachineRef]; ok {
 				latest.Status.Targets[i] = updated
 			}
+		}
+
+		if restoreHostReplaceTriggerConditions {
+			setHostReplaceTriggerConditions(latest)
 		}
 
 		r.aggregateStatus(latest)
@@ -919,20 +924,26 @@ func setCompletedCondition(op *v1alpha3.MachineOperation, status metav1.Conditio
 	})
 }
 
-func setBootImageWrittenCondition(op *v1alpha3.MachineOperation, status metav1.ConditionStatus, reason, message string) {
-	apimeta.SetStatusCondition(&op.Status.Conditions, metav1.Condition{
-		Type:               v1alpha3.MachineOperationConditionBootImageWritten,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		ObservedGeneration: op.Generation,
-	})
+func hostReplaceTriggerConditionsMissing(op *v1alpha3.MachineOperation) bool {
+	return apimeta.FindStatusCondition(op.Status.Conditions, v1alpha3.MachineOperationConditionBootLoaderDownloaded) == nil ||
+		apimeta.FindStatusCondition(op.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten) == nil ||
+		apimeta.FindStatusCondition(op.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone) == nil
 }
 
-func setCloudInitDoneCondition(op *v1alpha3.MachineOperation, status metav1.ConditionStatus, reason, message string) {
+func setHostReplaceTriggerConditions(op *v1alpha3.MachineOperation) {
+	setConditionIfMissing(op, v1alpha3.MachineOperationConditionBootLoaderDownloaded, "Pending", "waiting for initial boot loader download")
+	setConditionIfMissing(op, v1alpha3.MachineOperationConditionBootImageWritten, "Pending", "waiting for PXE installer to finish writing the boot image")
+	setConditionIfMissing(op, v1alpha3.MachineOperationConditionCloudInitDone, "Pending", "waiting for first-boot cloud-init to complete")
+}
+
+func setConditionIfMissing(op *v1alpha3.MachineOperation, conditionType, reason, message string) {
+	if apimeta.FindStatusCondition(op.Status.Conditions, conditionType) != nil {
+		return
+	}
+
 	apimeta.SetStatusCondition(&op.Status.Conditions, metav1.Condition{
-		Type:               v1alpha3.MachineOperationConditionCloudInitDone,
-		Status:             status,
+		Type:               conditionType,
+		Status:             metav1.ConditionUnknown,
 		Reason:             reason,
 		Message:            message,
 		ObservedGeneration: op.Generation,

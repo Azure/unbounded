@@ -251,10 +251,18 @@ func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) 
 	require.Len(t, inProgress.Status.Targets, 1)
 	require.Equal(t, int64(4), inProgress.Status.Targets[0].TargetOperations.RebootCounter)
 	require.Equal(t, int64(5), inProgress.Status.Targets[0].TargetOperations.RepaveCounter)
+	bootLoaderCond := apimeta.FindStatusCondition(inProgress.Status.Conditions, v1alpha3.MachineOperationConditionBootLoaderDownloaded)
+	require.NotNil(t, bootLoaderCond)
+	require.Equal(t, metav1.ConditionUnknown, bootLoaderCond.Status)
+	require.Equal(t, "Pending", bootLoaderCond.Reason)
 	bootImageCond := apimeta.FindStatusCondition(inProgress.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten)
 	require.NotNil(t, bootImageCond)
 	require.Equal(t, metav1.ConditionUnknown, bootImageCond.Status)
 	require.Equal(t, "Pending", bootImageCond.Reason)
+	cloudInitCond := apimeta.FindStatusCondition(inProgress.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+	require.NotNil(t, cloudInitCond)
+	require.Equal(t, metav1.ConditionUnknown, cloudInitCond.Status)
+	require.Equal(t, "Pending", cloudInitCond.Reason)
 
 	patched.Status.Operations = &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5}
 	patched.Status.Conditions = []metav1.Condition{{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"}}
@@ -268,6 +276,49 @@ func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) 
 	var completed v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &completed))
 	require.Equal(t, v1alpha3.OperationPhaseComplete, completed.Status.Phase)
+}
+
+func TestReconcilerRestoresMissingHostReplaceTriggerConditions(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	op := testOperation("op-replace-conditions", v1alpha3.OperationHostReplace)
+	op.Spec.MachineRef = machine.Name
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Conditions = []metav1.Condition{{
+		Type:    v1alpha3.MachineOperationConditionBootImageWritten,
+		Status:  metav1.ConditionTrue,
+		Reason:  "Succeeded",
+		Message: "Machine machine-1 finished writing the boot image to disk",
+	}}
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef:         machine.Name,
+		Phase:              v1alpha3.OperationPhaseInProgress,
+		TargetOperations:   &v1alpha3.OperationsStatus{RebootCounter: 1, RepaveCounter: 1},
+		ObservedGeneration: machine.Generation,
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	bootLoaderCond := apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionBootLoaderDownloaded)
+	require.NotNil(t, bootLoaderCond)
+	require.Equal(t, metav1.ConditionUnknown, bootLoaderCond.Status)
+	require.Equal(t, "Pending", bootLoaderCond.Reason)
+	bootImageCond := apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten)
+	require.NotNil(t, bootImageCond)
+	require.Equal(t, metav1.ConditionTrue, bootImageCond.Status)
+	require.Equal(t, "Succeeded", bootImageCond.Reason)
+	cloudInitCond := apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+	require.NotNil(t, cloudInitCond)
+	require.Equal(t, metav1.ConditionUnknown, cloudInitCond.Status)
+	require.Equal(t, "Pending", cloudInitCond.Reason)
 }
 
 func TestReconcilerKeepsHostReplaceInProgressUntilNodeExists(t *testing.T) {
