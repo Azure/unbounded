@@ -41,6 +41,7 @@ func TestBootLoaderDownloadRecorderLatchesFirstDownload(t *testing.T) {
 	require.Equal(t, metav1.ConditionTrue, cond.Status)
 	require.Equal(t, "Downloaded", cond.Reason)
 	require.Contains(t, cond.Message, "shimx64.efi")
+
 	wantTransition := fixedNow()
 	require.True(t, cond.LastTransitionTime.Equal(&wantTransition), "lastTransitionTime = %s, want %s", cond.LastTransitionTime, wantTransition)
 
@@ -106,6 +107,7 @@ func TestBootImageWriteRecorderTransitionsStartedToFinished(t *testing.T) {
 	require.Equal(t, metav1.ConditionFalse, cond.Status)
 	require.Equal(t, "Writing", cond.Reason)
 	require.Contains(t, cond.Message, "started writing")
+
 	wantTransition := fixedNow()
 	require.True(t, cond.LastTransitionTime.Equal(&wantTransition), "lastTransitionTime = %s, want %s", cond.LastTransitionTime, wantTransition)
 
@@ -118,6 +120,7 @@ func TestBootImageWriteRecorderTransitionsStartedToFinished(t *testing.T) {
 	require.Equal(t, metav1.ConditionTrue, cond.Status)
 	require.Equal(t, "Succeeded", cond.Reason)
 	require.Contains(t, cond.Message, "finished writing")
+
 	wantTransition = metav1.NewTime(fixedNow().Add(time.Minute))
 	require.True(t, cond.LastTransitionTime.Equal(&wantTransition), "lastTransitionTime = %s, want %s", cond.LastTransitionTime, wantTransition)
 }
@@ -140,6 +143,7 @@ func TestBootImageWriteRecorderLatchesFinished(t *testing.T) {
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+
 	wantTransition := fixedNow()
 
 	recorder.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(time.Minute)) }
@@ -205,6 +209,7 @@ func TestCloudInitStatusRecorderAvoidsIntermediateChurn(t *testing.T) {
 	require.Equal(t, metav1.ConditionFalse, cond.Status)
 	require.Equal(t, "Running", cond.Reason)
 	require.Contains(t, cond.Message, "started first-boot cloud-init")
+
 	wantTransition := fixedNow()
 	require.True(t, cond.LastTransitionTime.Equal(&wantTransition), "lastTransitionTime = %s, want %s", cond.LastTransitionTime, wantTransition)
 
@@ -243,6 +248,7 @@ func TestCloudInitStatusRecorderTransitionsToTerminalStates(t *testing.T) {
 	require.Equal(t, metav1.ConditionFalse, cond.Status)
 	require.Equal(t, "Failed", cond.Reason)
 	require.Contains(t, cond.Message, "modules-final")
+
 	wantTransition := fixedNow()
 	require.True(t, cond.LastTransitionTime.Equal(&wantTransition), "lastTransitionTime = %s, want %s", cond.LastTransitionTime, wantTransition)
 

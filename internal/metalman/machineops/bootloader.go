@@ -65,7 +65,7 @@ type BootImageWriteRecorder struct {
 	Now    func() metav1.Time
 }
 
-func (r *BootImageWriteRecorder) RecordBootImageWrite(ctx context.Context, machineName string, stage string) error {
+func (r *BootImageWriteRecorder) RecordBootImageWrite(ctx context.Context, machineName, stage string) error {
 	if r == nil || r.Client == nil {
 		return nil
 	}

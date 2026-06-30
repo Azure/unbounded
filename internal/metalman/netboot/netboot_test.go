@@ -485,6 +485,7 @@ func TestHTTPServerRecordsBootImageWriteStart(t *testing.T) {
 
 	resp, err = http.DefaultClient.Do(req)
 	require.NoError(t, err)
+
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -515,7 +516,7 @@ type recordingBootImageWriteRecorder struct {
 	calls []string
 }
 
-func (r *recordingBootImageWriteRecorder) RecordBootImageWrite(_ context.Context, machineName string, stage string) error {
+func (r *recordingBootImageWriteRecorder) RecordBootImageWrite(_ context.Context, machineName, stage string) error {
 	r.calls = append(r.calls, fmt.Sprintf("%s:%s", machineName, stage))
 
 	return nil

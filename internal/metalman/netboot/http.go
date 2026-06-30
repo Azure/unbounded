@@ -43,7 +43,7 @@ type HTTPServer struct {
 }
 
 type BootImageWriteRecorder interface {
-	RecordBootImageWrite(ctx context.Context, machineName string, stage string) error
+	RecordBootImageWrite(ctx context.Context, machineName, stage string) error
 }
 
 type CloudInitStatusRecorder interface {
@@ -396,6 +396,7 @@ func cloudInitOperationStatus(ev *cloudInitEvent) (string, string, bool) {
 func cloudInitErrorSummary(ev *cloudInitEvent) string {
 	result := strings.TrimSpace(ev.Result)
 	description := strings.TrimSpace(ev.Description)
+
 	if result == "" {
 		result = "failure"
 	}

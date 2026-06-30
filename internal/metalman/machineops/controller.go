@@ -196,6 +196,7 @@ func (r *Reconciler) snapshotTargets(ctx context.Context, op *v1alpha3.MachineOp
 		latest.Status.StartedAt = &now
 		latest.Status.Targets = targetStatuses
 		setCompletedCondition(latest, metav1.ConditionFalse, "InProgress", latest.Status.Message)
+
 		if op.Spec.OperationKind == v1alpha3.OperationHostReplace {
 			setBootImageWrittenCondition(latest, metav1.ConditionUnknown, "Pending", "waiting for PXE installer to start writing the boot image")
 			setCloudInitDoneCondition(latest, metav1.ConditionUnknown, "Pending", "waiting for first-boot cloud-init to start")
