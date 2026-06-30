@@ -107,6 +107,12 @@ def libvirt_arch() -> str:
     }[expected_node_arch()]
 
 
+def libvirt_type() -> str:
+    if Path("/dev/kvm").exists():
+        return "kvm"
+    return "qemu"
+
+
 def _first_existing(paths: list[str]) -> str:
     for path in paths:
         if Path(path).exists():
@@ -996,10 +1002,14 @@ def main() -> None:
     shutil.copy2(uefi_vars_template, ovmf_vars)
     disk = str(TMPDIR / "disk.qcow2")
     run_quiet(["qemu-img", "create", "-f", "qcow2", disk, "20G"], check=True)
+    virt_type = libvirt_type()
+    if virt_type == "qemu":
+        log("/dev/kvm is unavailable; creating VM with QEMU TCG")
     run_quiet([
         "virt-install",
         "--connect", "qemu:///system",
         "--arch", libvirt_arch(),
+        "--virt-type", virt_type,
         "--name", VM_NAME, "--ram", "4096", "--vcpus", "2",
         "--disk", f"path={disk},format=qcow2,bus=virtio",
         "--network", f"network={NET_NAME},mac={MAC_ADDRESS}",

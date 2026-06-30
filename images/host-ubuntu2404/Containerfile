@@ -157,6 +157,7 @@ RUN curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
         -o /tmp/cloudimg.qcow2 "${UBUNTU_CLOUDIMG_URL}" && \
     qemu-img convert -f qcow2 -O raw /tmp/cloudimg.qcow2 /tmp/disk.img && \
     rm /tmp/cloudimg.qcow2 && \
+    if [ "${TARGETARCH}" = "arm64" ]; then export LIBGUESTFS_BACKEND_SETTINGS=force_tcg; fi && \
     LIBGUESTFS_BACKEND=direct virt-customize -a /tmp/disk.img \
         --mkdir /usr/local/bin \
         --copy-in /tmp/unbounded-agent:/usr/local/bin \

@@ -44,7 +44,7 @@ jobs:
   smoke:
     name: Smoke (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 75
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
@@ -52,11 +52,13 @@ jobs:
           - arch: amd64
             platform: linux/amd64
             runner: ubuntu-24.04
+            timeout: 75
             firmware_package: ovmf
             qemu_package: qemu-kvm
           - arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
+            timeout: 180
             firmware_package: qemu-efi-aarch64
             qemu_package: qemu-system-arm
     steps:
