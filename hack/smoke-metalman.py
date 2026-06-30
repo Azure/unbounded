@@ -819,6 +819,7 @@ def wait_process_success(proc: subprocess.Popen[Any], timeout: int) -> None:
     try:
         _procs.remove(proc)
     except ValueError:
+        # Process cleanup is best-effort because another cleanup path may have removed it.
         pass
     if rc != 0:
         die(f"Process {proc.args} exited with code {rc}")
