@@ -805,6 +805,32 @@ def create_machine_operation(
     return name
 
 
+def run_kubectl_unbounded_operation(args: list[str], log_name: str) -> subprocess.Popen[Any]:
+    proc = spawn([str(KUBECTL_UNBOUNDED), "machine", *args], TMPDIR / log_name)
+    log(f"  kubectl-unbounded {' '.join(args)} PID={proc.pid}")
+    return proc
+
+
+def wait_process_success(proc: subprocess.Popen[Any], timeout: int) -> None:
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        die(f"Process {proc.args} did not finish within {timeout}s")
+    try:
+        _procs.remove(proc)
+    except ValueError:
+        # Process cleanup is best-effort because another cleanup path may have removed it.
+        pass
+    if rc != 0:
+        die(f"Process {proc.args} exited with code {rc}")
+
+
+def assert_log_contains(path: Path, needle: str) -> None:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if needle not in text:
+        die(f"Expected {path} to contain {needle!r}")
+
+
 def run_operation_smoke_suite() -> None:
     log("Running bare-metal MachineOperation smoke suite")
 
@@ -1104,8 +1130,12 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Triggering HostReplace MachineOperation")
-    operation_name = create_machine_operation("smoke-host-replace", "HostReplace")
+    log("Triggering HostReplace through kubectl-unbounded")
+    operation_log = TMPDIR / "kubectl-host-replace.log"
+    operation_proc = run_kubectl_unbounded_operation(
+        ["replace", NODE_NAME, "--force", "--ttl=3600"],
+        operation_log.name,
+    )
 
     # Log free space so we can correlate disk exhaustion with VM failures.
     df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
@@ -1114,7 +1144,8 @@ def main() -> None:
     log("Waiting for cloud-init to complete...")
     assert_cloud_init_done(timeout=900)
 
-    wait_machine_operation_complete(operation_name, timeout=900)
+    wait_process_success(operation_proc, timeout=900)
+    assert_log_contains(operation_log, "Condition CloudInitDone: True/Succeeded")
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)

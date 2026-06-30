@@ -790,7 +790,6 @@ a:hover {
   flex: 1;
   min-width: 0;
   padding-left: 6rem;
-  padding-right: 6rem;
 }
 
 /* Strip centering/padding from inner containers inside docs-layout */

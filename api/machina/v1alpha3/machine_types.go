@@ -84,6 +84,13 @@ const (
 	// logging into the machine.
 	MachineConditionCloudInitDone = "CloudInitDone"
 
+	// MachineConditionAgentBootstrapped indicates whether the unbounded
+	// agent completed initial node bootstrap. Status is False with Reason
+	// "Running" while the agent is preparing the nspawn node, False with
+	// a failure reason when nspawn startup or kubelet TLS bootstrap fails,
+	// and True with Reason "Succeeded" once the kubelet has bootstrapped.
+	MachineConditionAgentBootstrapped = "AgentBootstrapped"
+
 	// MachineConditionNodeUpdated indicates the result of a node
 	// update performed by the agent daemon. Status is True with
 	// Reason "Succeeded" after a successful update, and False with

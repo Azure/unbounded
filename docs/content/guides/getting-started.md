@@ -142,6 +142,13 @@ kubectl unbounded machine manual-bootstrap my-node --site remote \
 > The node installs the Unbounded agent, opens a WireGuard tunnel to the
 > gateway nodes, and registers with the cluster.
 
+{{< callout type="tip" >}}
+The generated bootstrap script runs `unbounded-agent preflight` automatically
+before starting the agent. Preflight checks the loaded config, host
+prerequisites, API server reachability, artifact sources, nspawn paths, and GPU
+driver readiness. See [Agent Preflight]({{< relref "reference/agent/preflight" >}}).
+{{< /callout >}}
+
 ---
 
 ## 4. Verify Connectivity

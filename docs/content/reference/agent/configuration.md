@@ -10,6 +10,13 @@ generated from the cluster using the
 [`kubectl unbounded machine manual-bootstrap`]({{< relref "reference/cli" >}})
 command, or authored by hand.
 
+The same config is used by `unbounded-agent start` and
+`unbounded-agent preflight`. Before bootstrap, run preflight on the target host
+to validate the loaded config, host prerequisites, API server reachability,
+artifact sources, nspawn provisioning paths, and GPU driver readiness when
+applicable. See [Agent Preflight]({{< relref "reference/agent/preflight" >}})
+for command usage, exit behavior, and the current check list.
+
 ## Example
 
 ```json
