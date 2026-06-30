@@ -14,9 +14,7 @@ import (
 	"net/http"
 	"strings"
 
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -40,6 +38,7 @@ type HTTPServer struct {
 	FileResolver
 	BootImageWriteRecorder  BootImageWriteRecorder
 	CloudInitStatusRecorder CloudInitStatusRecorder
+	MachineStatusRecorder   MachineStatusRecorder
 }
 
 type BootImageWriteRecorder interface {
@@ -48,6 +47,11 @@ type BootImageWriteRecorder interface {
 
 type CloudInitStatusRecorder interface {
 	RecordCloudInitStatus(ctx context.Context, machineName, stage, message string) error
+}
+
+type MachineStatusRecorder interface {
+	RecordMachineCondition(ctx context.Context, machineName string, condition metav1.Condition) error
+	RecordPXEDisabled(ctx context.Context, machineName string, repaveCounter int64, imageName string) error
 }
 
 const (
@@ -181,7 +185,7 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 		log.Info("cloud-init event", "type", ev.EventType, "description", ev.Description)
 	}
 
-	machineName := h.updateCloudInitCondition(r.Context(), log, ip, &ev)
+	machineName := h.recordCloudInitCondition(r.Context(), log, ip, &ev)
 	h.recordCloudInitStatus(r.Context(), log, machineName, &ev)
 
 	w.WriteHeader(http.StatusOK)
@@ -191,39 +195,29 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 // finishes successfully the CloudInitDone condition transitions to True.
 const cloudInitLastStage = "modules-final"
 
-// updateCloudInitCondition sets the CloudInitDone condition on the Machine
-// that matches the request source IP. The condition reflects the
-// cloud-init lifecycle reported through webhook events:
-func (h *HTTPServer) updateCloudInitCondition(ctx context.Context, log *slog.Logger, ip string, ev *cloudInitEvent) string {
-	if h.Client == nil {
+// recordCloudInitCondition records the CloudInitDone condition for the Machine
+// that matches the request source IP. The recorder is asynchronous in the
+// serve-pxe command, so cloud-init webhooks do not wait on Kubernetes status IO.
+func (h *HTTPServer) recordCloudInitCondition(ctx context.Context, log *slog.Logger, ip string, ev *cloudInitEvent) string {
+	if h.FileResolver.Reader == nil {
 		return ""
 	}
 
-	var machineName string
-
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		node, err := h.LookupNodeByIP(ctx, ip)
-		if err != nil {
-			return err
-		}
-
-		machineName = node.Name
-
-		cond := buildCloudInitCondition(ev, node.Generation)
-		if cond == nil {
-			return nil
-		}
-
-		// TODO(jordan): Rename all `node` references in this file to `machine`
-		meta.SetStatusCondition(&node.Status.Conditions, *cond)
-
-		return h.Client.Status().Update(ctx, node)
-	})
+	node, err := h.LookupNodeByIP(ctx, ip)
 	if err != nil {
-		log.Error("cloud-init condition: updating Machine status", "ip", ip, "err", err)
+		log.Error("cloud-init condition: looking up Machine", "ip", ip, "err", err)
+
+		return ""
 	}
 
-	return machineName
+	cond := buildCloudInitCondition(ev, node.Generation)
+	if cond != nil && h.MachineStatusRecorder != nil {
+		if err := h.MachineStatusRecorder.RecordMachineCondition(ctx, node.Name, *cond); err != nil {
+			log.Error("recording cloud-init condition", "node", node.Name, "err", err)
+		}
+	}
+
+	return node.Name
 }
 
 const maxConditionMessageLen = 1024
@@ -311,33 +305,18 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if node.Status.Operations == nil {
-		node.Status.Operations = &v1alpha3.OperationsStatus{}
-	}
-
-	node.Status.Operations.RepaveCounter = specRepave
-
 	imageName := ""
 	if node.Spec.PXE != nil {
 		imageName = node.Spec.PXE.Image
 	}
 
-	meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
-		Type:               v1alpha3.MachineConditionRepaved,
-		Status:             metav1.ConditionTrue,
-		Reason:             "Succeeded",
-		Message:            "image=" + imageName,
-		ObservedGeneration: node.Generation,
-	})
-
-	if err := h.Client.Status().Update(r.Context(), node); err != nil {
-		log.Error("updating Machine status", "node", node.Name, "err", err)
-		http.Error(w, "failed to disable PXE", http.StatusInternalServerError)
-
-		return
+	if h.MachineStatusRecorder != nil {
+		if err := h.MachineStatusRecorder.RecordPXEDisabled(r.Context(), node.Name, specRepave, imageName); err != nil {
+			log.Error("recording PXE disabled", "node", node.Name, "err", err)
+		}
 	}
 
-	log.Info("repave cleared", "node", node.Name)
+	log.Info("repave clear queued", "node", node.Name)
 	w.WriteHeader(http.StatusOK)
 }
 

@@ -522,6 +522,64 @@ func (r *recordingBootImageWriteRecorder) RecordBootImageWrite(_ context.Context
 	return nil
 }
 
+type recordedMachineCondition struct {
+	machineName string
+	condition   metav1.Condition
+}
+
+type recordedPXEDisabled struct {
+	machineName   string
+	repaveCounter int64
+	imageName     string
+}
+
+type recordingMachineStatusRecorder struct {
+	mu         sync.Mutex
+	err        error
+	conditions []recordedMachineCondition
+	disabled   []recordedPXEDisabled
+}
+
+func (r *recordingMachineStatusRecorder) RecordMachineCondition(_ context.Context, machineName string, condition metav1.Condition) error {
+	if r.err != nil {
+		return r.err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.conditions = append(r.conditions, recordedMachineCondition{machineName: machineName, condition: condition})
+
+	return nil
+}
+
+func (r *recordingMachineStatusRecorder) RecordPXEDisabled(_ context.Context, machineName string, repaveCounter int64, imageName string) error {
+	if r.err != nil {
+		return r.err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.disabled = append(r.disabled, recordedPXEDisabled{machineName: machineName, repaveCounter: repaveCounter, imageName: imageName})
+
+	return nil
+}
+
+func (r *recordingMachineStatusRecorder) conditionEvents() []recordedMachineCondition {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]recordedMachineCondition(nil), r.conditions...)
+}
+
+func (r *recordingMachineStatusRecorder) pxeDisabledEvents() []recordedPXEDisabled {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]recordedPXEDisabled(nil), r.disabled...)
+}
+
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
@@ -1751,6 +1809,7 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 		Client:                 fc,
 		FileResolver:           FileResolver{Cache: cache, Reader: fc},
 		BootImageWriteRecorder: &recordingBootImageWriteRecorder{},
+		MachineStatusRecorder:  &recordingMachineStatusRecorder{},
 	}
 
 	mux := http.NewServeMux()
@@ -1780,34 +1839,9 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 		t.Fatalf("expected boot image write finish record, got %v", recorder.calls)
 	}
 
-	// Verify the Machine status was patched
-	var updated v1alpha3.Machine
-	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
-		t.Fatalf("getting updated node: %v", err)
-	}
-
-	var specRepave, statusRepave int64
-	if updated.Spec.Operations != nil {
-		specRepave = updated.Spec.Operations.RepaveCounter
-	}
-
-	if updated.Status.Operations != nil {
-		statusRepave = updated.Status.Operations.RepaveCounter
-	}
-
-	if statusRepave != specRepave {
-		t.Errorf("status.operations.repaveCounter (%d) should match spec.operations.repaveCounter (%d)",
-			statusRepave, specRepave)
-	}
-
-	repavedCond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionRepaved)
-	if repavedCond == nil || repavedCond.Status != metav1.ConditionTrue || repavedCond.Reason != "Succeeded" {
-		t.Fatalf("expected Repaved=True/Succeeded, got %+v", repavedCond)
-	}
-
-	if repavedCond.Message != "image=ghcr.io/test/image:v1" {
-		t.Fatalf("expected Repaved message 'image=ghcr.io/test/image:v1', got %q", repavedCond.Message)
-	}
+	machineRecorder := srv.MachineStatusRecorder.(*recordingMachineStatusRecorder)
+	pxeDisabled := machineRecorder.pxeDisabledEvents()
+	require.Equal(t, []recordedPXEDisabled{{machineName: "pxe-node", repaveCounter: 1, imageName: "ghcr.io/test/image:v1"}}, pxeDisabled)
 
 	// Second call should be idempotent (still 200)
 	req, _ = http.NewRequest("GET", ts.URL+"/pxe/disable", nil)
@@ -1835,8 +1869,9 @@ func TestHTTPServer_DisablePXE_UnknownIP(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		Client:       fc,
-		FileResolver: FileResolver{Cache: cache, Reader: fc},
+		Client:                fc,
+		FileResolver:          FileResolver{Cache: cache, Reader: fc},
+		MachineStatusRecorder: &recordingMachineStatusRecorder{},
 	}
 
 	mux := http.NewServeMux()
@@ -2247,8 +2282,9 @@ func TestCloudInitCondition_StageStartSetsRunning(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		Client:       fc,
-		FileResolver: FileResolver{Cache: cache, Reader: fc},
+		Client:                fc,
+		FileResolver:          FileResolver{Cache: cache, Reader: fc},
+		MachineStatusRecorder: &recordingMachineStatusRecorder{},
 	}
 
 	mux := http.NewServeMux()
@@ -2272,15 +2308,11 @@ func TestCloudInitCondition_StageStartSetsRunning(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	var updated v1alpha3.Machine
-	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
-		t.Fatalf("getting updated node: %v", err)
-	}
-
-	cond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
-	if cond == nil {
-		t.Fatal("expected CloudInitDone condition to be set")
-	}
+	recorder := srv.MachineStatusRecorder.(*recordingMachineStatusRecorder)
+	conditions := recorder.conditionEvents()
+	require.Len(t, conditions, 1)
+	require.Equal(t, node.Name, conditions[0].machineName)
+	cond := &conditions[0].condition
 
 	if cond.Status != metav1.ConditionFalse {
 		t.Errorf("status: got %q, want %q", cond.Status, metav1.ConditionFalse)
@@ -2312,8 +2344,9 @@ func TestCloudInitCondition_FinalStageSuccessSetsTrue(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		Client:       fc,
-		FileResolver: FileResolver{Cache: cache, Reader: fc},
+		Client:                fc,
+		FileResolver:          FileResolver{Cache: cache, Reader: fc},
+		MachineStatusRecorder: &recordingMachineStatusRecorder{},
 	}
 
 	mux := http.NewServeMux()
@@ -2337,15 +2370,11 @@ func TestCloudInitCondition_FinalStageSuccessSetsTrue(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	var updated v1alpha3.Machine
-	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
-		t.Fatalf("getting updated node: %v", err)
-	}
-
-	cond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
-	if cond == nil {
-		t.Fatal("expected CloudInitDone condition to be set")
-	}
+	recorder := srv.MachineStatusRecorder.(*recordingMachineStatusRecorder)
+	conditions := recorder.conditionEvents()
+	require.Len(t, conditions, 1)
+	require.Equal(t, node.Name, conditions[0].machineName)
+	cond := &conditions[0].condition
 
 	if cond.Status != metav1.ConditionTrue {
 		t.Errorf("status: got %q, want %q", cond.Status, metav1.ConditionTrue)
@@ -2381,8 +2410,9 @@ func TestCloudInitCondition_StageFailureSetsFailedWithDetails(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		Client:       fc,
-		FileResolver: FileResolver{Cache: cache, Reader: fc},
+		Client:                fc,
+		FileResolver:          FileResolver{Cache: cache, Reader: fc},
+		MachineStatusRecorder: &recordingMachineStatusRecorder{},
 	}
 
 	mux := http.NewServeMux()
@@ -2406,15 +2436,11 @@ func TestCloudInitCondition_StageFailureSetsFailedWithDetails(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	var updated v1alpha3.Machine
-	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
-		t.Fatalf("getting updated node: %v", err)
-	}
-
-	cond := findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
-	if cond == nil {
-		t.Fatal("expected CloudInitDone condition to be set")
-	}
+	recorder := srv.MachineStatusRecorder.(*recordingMachineStatusRecorder)
+	conditions := recorder.conditionEvents()
+	require.Len(t, conditions, 1)
+	require.Equal(t, node.Name, conditions[0].machineName)
+	cond := &conditions[0].condition
 
 	if cond.Status != metav1.ConditionFalse {
 		t.Errorf("status: got %q, want %q", cond.Status, metav1.ConditionFalse)
@@ -2460,7 +2486,7 @@ func TestCloudInitCondition_NoClientSkipsUpdate(t *testing.T) {
 }
 
 func TestCloudInitCondition_UnknownIPSkipsUpdate(t *testing.T) {
-	// When the IP doesn't match any Machine, updateCloudInitCondition
+	// When the IP doesn't match any Machine, recordCloudInitCondition
 	// should log a warning but the handler should still return 200.
 	cache := NewOCICache(t.TempDir())
 	scheme := newScheme(t)
@@ -2471,8 +2497,9 @@ func TestCloudInitCondition_UnknownIPSkipsUpdate(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		Client:       fc,
-		FileResolver: FileResolver{Cache: cache, Reader: fc},
+		Client:                fc,
+		FileResolver:          FileResolver{Cache: cache, Reader: fc},
+		MachineStatusRecorder: &recordingMachineStatusRecorder{},
 	}
 
 	mux := http.NewServeMux()
@@ -2519,16 +2546,13 @@ func TestCloudInitCondition_StatusUpdateError(t *testing.T) {
 		WithObjects(node).
 		WithStatusSubresource(&v1alpha3.Machine{}).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
-		WithInterceptorFuncs(interceptor.Funcs{
-			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-				return injectedErr
-			},
-		}).
 		Build()
+	recorder := &recordingMachineStatusRecorder{err: injectedErr}
 
 	srv := &HTTPServer{
-		Client:       fc,
-		FileResolver: FileResolver{Cache: cache, Reader: fc},
+		Client:                fc,
+		FileResolver:          FileResolver{Cache: cache, Reader: fc},
+		MachineStatusRecorder: recorder,
 	}
 
 	mux := http.NewServeMux()
@@ -2548,9 +2572,9 @@ func TestCloudInitCondition_StatusUpdateError(t *testing.T) {
 
 	resp.Body.Close()
 
-	// Handler must still return 200 even when status update fails.
+	// Handler must still return 200 even when the status record is rejected.
 	if resp.StatusCode != http.StatusOK {
-		t.Errorf("expected 200 despite status update failure, got %d", resp.StatusCode)
+		t.Errorf("expected 200 despite status record failure, got %d", resp.StatusCode)
 	}
 }
 
@@ -2575,9 +2599,11 @@ func TestCloudInitCondition_FullLifecycle(t *testing.T) {
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
+	recorder := &recordingMachineStatusRecorder{}
 	srv := &HTTPServer{
-		Client:       fc,
-		FileResolver: FileResolver{Cache: cache, Reader: fc},
+		Client:                fc,
+		FileResolver:          FileResolver{Cache: cache, Reader: fc},
+		MachineStatusRecorder: recorder,
 	}
 
 	mux := http.NewServeMux()
@@ -2607,12 +2633,14 @@ func TestCloudInitCondition_FullLifecycle(t *testing.T) {
 	getCondition := func() *metav1.Condition {
 		t.Helper()
 
-		var updated v1alpha3.Machine
-		if err := fc.Get(t.Context(), client.ObjectKeyFromObject(node), &updated); err != nil {
-			t.Fatalf("getting updated node: %v", err)
+		conditions := recorder.conditionEvents()
+		if len(conditions) == 0 {
+			return nil
 		}
 
-		return findCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+		condition := conditions[len(conditions)-1].condition
+
+		return &condition
 	}
 
 	// Step 1: init-local starts

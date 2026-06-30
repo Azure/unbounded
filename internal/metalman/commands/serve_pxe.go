@@ -261,10 +261,15 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("adding DHCP server: %w", err)
 			}
 
+			pxeStatusQueue := &metalmachineops.PXEStatusQueue{Client: mgr.GetClient()}
+			if err := mgr.Add(pxeStatusQueue); err != nil {
+				return fmt.Errorf("adding PXE status queue: %w", err)
+			}
+
 			tftpServer := &netboot.TFTPServer{
 				BindAddr:                   bindAddress,
 				FileResolver:               resolver,
-				BootLoaderDownloadRecorder: &metalmachineops.BootLoaderDownloadRecorder{Client: mgr.GetClient()},
+				BootLoaderDownloadRecorder: pxeStatusQueue,
 			}
 			if err := mgr.Add(tftpServer); err != nil {
 				return fmt.Errorf("adding TFTP server: %w", err)
@@ -286,8 +291,9 @@ func ServePXECmd() *cobra.Command {
 				Client:                  mgr.GetClient(),
 				Mux:                     httpMux,
 				FileResolver:            resolver,
-				BootImageWriteRecorder:  &metalmachineops.BootImageWriteRecorder{Client: mgr.GetClient()},
-				CloudInitStatusRecorder: &metalmachineops.CloudInitStatusRecorder{Client: mgr.GetClient()},
+				BootImageWriteRecorder:  pxeStatusQueue,
+				CloudInitStatusRecorder: pxeStatusQueue,
+				MachineStatusRecorder:   pxeStatusQueue,
 			}
 			if err := mgr.Add(httpServer); err != nil {
 				return fmt.Errorf("adding HTTP server: %w", err)
