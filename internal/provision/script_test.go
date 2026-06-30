@@ -38,6 +38,12 @@ func TestUnboundedAgentInstallScript(t *testing.T) {
 	// The script must not hardcode a specific release tag as a fallback
 	// default, so that "latest" is used when AGENT_VERSION is unset.
 	require.NotContains(t, script, "AGENT_VERSION:-v0.0.10")
+
+	// Bootstrap preflight runs by default and can be explicitly disabled.
+	require.Contains(t, script, "AGENT_PREFLIGHT:-true")
+	require.Contains(t, script, "Running unbounded-agent preflight")
+	require.Contains(t, script, "preflight ${_START_ARGS}")
+	require.Contains(t, script, "0|false|no|FALSE|NO|False|No")
 }
 
 func TestUnboundedAgentUninstallScript(t *testing.T) {

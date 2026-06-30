@@ -46,9 +46,9 @@ active at a time.
 
 1. Downloads the release tarball from `downloadURL`.
 2. Extracts the agent binary into the inactive slot.
-3. Runs `unbounded-agent version` against the staged binary as a preflight
-   check. If this fails, the operation is marked `Failed` and the current
-   binary is unchanged.
+3. Runs `unbounded-agent version` against the staged binary as a binary
+   validation check. If this fails, the operation is marked `Failed` and the
+   current binary is unchanged.
 
 **Switching:**
 
@@ -77,7 +77,7 @@ version crashes on startup.
 |---------|--------|
 | Invalid or missing `downloadURL` | Operation marked `Failed` immediately. |
 | Download or extraction error | Operation marked `Failed`. Current binary unchanged. |
-| Preflight (`unbounded-agent version`) fails | Operation marked `Failed`. Current binary unchanged. |
+| Binary validation (`unbounded-agent version`) fails | Operation marked `Failed`. Current binary unchanged. |
 | Upgraded daemon crashes after restart | Systemd recovery rolls back to last-good binary. Operation marked `Failed` with reason `DaemonFailed`. |
 
 ### Verifying the Upgrade
