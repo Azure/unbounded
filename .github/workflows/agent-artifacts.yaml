@@ -40,6 +40,7 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       kubernetes_versions: ${{ steps.resolve.outputs.kubernetes_versions }}
+      kubernetes_version_groups: ${{ steps.resolve.outputs.kubernetes_version_groups }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -72,6 +73,7 @@ jobs:
 
   publish:
     needs: resolve
+    name: publish (${{ matrix.group.minor }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -79,11 +81,12 @@ jobs:
       # intermittent GHCR write_package failures from concurrent blob uploads.
       max-parallel: 1
       matrix:
-        kubernetes_version: ${{ fromJson(needs.resolve.outputs.kubernetes_versions) }}
+        group: ${{ fromJson(needs.resolve.outputs.kubernetes_version_groups) }}
     env:
       REGISTRY: ghcr.io/${{ github.repository_owner }}/unbounded
       ARTIFACT_TAG_PREFIX: ${{ needs.resolve.outputs.tag }}
-      KUBERNETES_VERSION: ${{ matrix.kubernetes_version }}
+      KUBERNETES_MINOR: ${{ matrix.group.minor }}
+      KUBERNETES_VERSIONS_JSON: ${{ toJson(matrix.group.versions) }}
     steps:
       - name: Download agent artifacts builder
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -104,34 +107,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish offline artifact bundle
-        run: |
-          set -euo pipefail
-          # Keep this tag format in sync with designs/agent-offline-bootstrap.md.
-          oci_ref="${REGISTRY}/bootstrap-artifacts:${ARTIFACT_TAG_PREFIX}-k8s-${KUBERNETES_VERSION}"
-          output_dir="dist/bootstrap-artifacts/${KUBERNETES_VERSION}"
-
-          echo "Artifact source version: ${KUBERNETES_VERSION}"
-          echo "Output directory: ${output_dir}"
-          echo "OCI reference: ${oci_ref}"
-
-          bin/agent-artifacts-builder \
-            --output-dir "$output_dir" \
-            --kubernetes-version "$KUBERNETES_VERSION" \
-            --arch amd64 \
-            --arch arm64 \
-            --oci-ref "$oci_ref"
-
-          echo "::group::Offline artifact bundle contents"
-          find "$output_dir" -type f -printf '%P %s bytes\n' | sort
-          du -sh "$output_dir"
-          echo "::endgroup::"
-
-          echo "Published $oci_ref"
+      - name: Build and publish offline artifact bundles
+        run: bin/agent-artifacts-builder publish-version-group
 
       - name: Upload filesystem artifact bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bootstrap-artifacts-${{ matrix.kubernetes_version }}
-          path: dist/bootstrap-artifacts/${{ matrix.kubernetes_version }}/
+          name: bootstrap-artifacts-${{ matrix.group.minor }}
+          path: dist/bootstrap-artifacts/
           retention-days: 7

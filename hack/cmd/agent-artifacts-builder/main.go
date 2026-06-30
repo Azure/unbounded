@@ -72,7 +72,10 @@ func newRootCommand() *cobra.Command {
 	flags.StringSliceVar(&opts.Architectures, "arch", nil, "Target architecture to include. Repeat or comma separate. Defaults to the host GOARCH")
 	flags.BoolVar(&opts.SkipExisting, "skip-existing", false, "Reuse existing files in output dir instead of downloading them again")
 
-	cmd.AddCommand(newResolvePublishInputsCommand())
+	cmd.AddCommand(
+		newResolvePublishInputsCommand(),
+		newPublishVersionGroupCommand(&debug, &logFormat),
+	)
 
 	return cmd
 }
@@ -90,6 +93,108 @@ func newLogger(debug bool, format string) *slog.Logger {
 	return slog.New(logger.NewPrettyFieldHandler(&lvl, logger.PrettyFieldHandlerOptions{
 		AttrOrder: []string{"artifact", "source", "oci_ref", "digest"},
 	}))
+}
+
+func newPublishVersionGroupCommand(debug *bool, logFormat *string) *cobra.Command {
+	return &cobra.Command{
+		Use:          "publish-version-group",
+		Short:        "Build and publish a Kubernetes minor version group from GitHub Actions inputs",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return publishVersionGroup(cmd.Context(), newLogger(*debug, *logFormat))
+		},
+	}
+}
+
+func publishVersionGroup(ctx context.Context, log *slog.Logger) error {
+	registry := strings.TrimRight(strings.ToLower(strings.TrimSpace(os.Getenv("REGISTRY"))), "/")
+	if registry == "" {
+		return fmt.Errorf("REGISTRY is required")
+	}
+
+	tagPrefix := strings.TrimSpace(os.Getenv("ARTIFACT_TAG_PREFIX"))
+	if tagPrefix == "" {
+		return fmt.Errorf("ARTIFACT_TAG_PREFIX is required")
+	}
+
+	versions, err := kubernetesVersionsFromJSON(os.Getenv("KUBERNETES_VERSIONS_JSON"))
+	if err != nil {
+		return err
+	}
+
+	for _, kubernetesVersion := range versions {
+		ociRef := fmt.Sprintf("%s/bootstrap-artifacts:%s-k8s-%s", registry, tagPrefix, kubernetesVersion)
+		outputDir := filepath.Join("dist", "bootstrap-artifacts", kubernetesVersion)
+
+		log.Info("building offline artifact bundle",
+			slog.String("kubernetes_version", kubernetesVersion),
+			slog.String("output_dir", outputDir),
+			slog.String("oci_ref", ociRef),
+		)
+
+		if err := artifacts.Build(ctx, log, artifacts.Options{
+			OutputDir:         outputDir,
+			KubernetesVersion: kubernetesVersion,
+			Architectures:     []string{"amd64", "arm64"},
+			OCIRef:            ociRef,
+		}); err != nil {
+			return err
+		}
+
+		if err := logBundleContents(log, outputDir); err != nil {
+			return err
+		}
+
+		log.Info("published offline artifact bundle", slog.String("oci_ref", ociRef))
+	}
+
+	return nil
+}
+
+func kubernetesVersionsFromJSON(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("KUBERNETES_VERSIONS_JSON is required")
+	}
+
+	var versions []string
+	if err := json.Unmarshal([]byte(raw), &versions); err != nil {
+		return nil, fmt.Errorf("parse KUBERNETES_VERSIONS_JSON: %w", err)
+	}
+
+	if len(versions) == 0 {
+		return nil, fmt.Errorf("KUBERNETES_VERSIONS_JSON must contain at least one version")
+	}
+
+	return versions, nil
+}
+
+func logBundleContents(log *slog.Logger, root string) error {
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if entry.IsDir() {
+			return nil
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+
+		log.Info("offline artifact bundle file",
+			slog.String("artifact", filepath.ToSlash(rel)),
+			slog.Int64("bytes", info.Size()),
+		)
+
+		return nil
+	})
 }
 
 func newResolvePublishInputsCommand() *cobra.Command {
@@ -154,15 +259,27 @@ func resolvePublishInputs() error {
 		return fmt.Errorf("marshal Kubernetes versions: %w", err)
 	}
 
+	groups, err := groupKubernetesVersionsByMinor(versions)
+	if err != nil {
+		return err
+	}
+
+	groupsJSON, err := json.Marshal(groups)
+	if err != nil {
+		return fmt.Errorf("marshal Kubernetes version groups: %w", err)
+	}
+
 	if err := writeGitHubOutput(map[string]string{
-		"tag":                 tag,
-		"kubernetes_versions": string(versionsJSON),
+		"tag":                       tag,
+		"kubernetes_versions":       string(versionsJSON),
+		"kubernetes_version_groups": string(groupsJSON),
 	}); err != nil {
 		return err
 	}
 
 	fmt.Printf("Publishing tag prefix: %s\n", tag)
 	fmt.Printf("Kubernetes versions: %s\n", versionsJSON)
+	fmt.Printf("Kubernetes version groups: %s\n", groupsJSON)
 
 	return nil
 }
@@ -221,6 +338,45 @@ func normalizeKubernetesVersions(raw string) []string {
 	}
 
 	return versions
+}
+
+type kubernetesVersionGroup struct {
+	Minor    string   `json:"minor"`
+	Versions []string `json:"versions"`
+}
+
+func groupKubernetesVersionsByMinor(versions []string) ([]kubernetesVersionGroup, error) {
+	groups := []kubernetesVersionGroup{}
+	indexByMinor := map[string]int{}
+
+	for _, version := range versions {
+		minor, err := kubernetesMinorVersion(version)
+		if err != nil {
+			return nil, err
+		}
+
+		index, ok := indexByMinor[minor]
+		if !ok {
+			index = len(groups)
+			indexByMinor[minor] = index
+			groups = append(groups, kubernetesVersionGroup{Minor: minor})
+		}
+
+		groups[index].Versions = append(groups[index].Versions, version)
+	}
+
+	return groups, nil
+}
+
+func kubernetesMinorVersion(version string) (string, error) {
+	version = strings.TrimPrefix(version, "v")
+
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return "", fmt.Errorf("invalid Kubernetes version %q", version)
+	}
+
+	return parts[0] + "." + parts[1], nil
 }
 
 func shortSHA(sha string) string {
