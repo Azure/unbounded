@@ -85,8 +85,8 @@ author does not self-merge. Each PR must be green on `make build`, `make lint`,
 
 - [x] Create `feature/unbounded-system` from `main`                         (me)
 - [x] Add this plan doc to the integration branch                            (me)
-- [ ] PR-B: re-target #372 -> `feature/unbounded-system`                      (me opens / reviewers merge)
-- [ ] PR-A: open operator + Site redesign -> integration                     (me opens / reviewers merge)
+- [x] PR-B: re-target #372 -> `feature/unbounded-system`                      (me opens / reviewers merge)
+- [x] PR-A: open operator + Site redesign -> integration                     (me opens / reviewers merge)
 - [ ] PR-A: rebase after PR-B merges                                         (me)
 - [ ] PR-C: open operator-ns + migration -> integration (after A+B merged)   (me opens / reviewers merge)
 - [ ] Periodic `main` -> integration syncs                                   (me)
@@ -97,9 +97,9 @@ author does not self-merge. Each PR must be green on `make build`, `make lint`,
 
 | PR | Branch | Number | State |
 |----|--------|--------|-------|
-| PR-B | `unify-namespace-unbounded-system` | #372 | open (re-target pending) |
-| PR-A | `operator-site-redesign` | TBD | not opened |
-| PR-C | `operator-system-migration` | TBD | not opened |
+| PR-B | `unify-namespace-unbounded-system` | #372 | open, base = `feature/unbounded-system` (awaiting review/merge) |
+| PR-A | `operator-site-redesign` | #386 | open (awaiting review/merge; rebase on integration after PR-B merges) |
+| PR-C | `operator-system-migration` | TBD | blocked on PR-A + PR-B merging |
 
 ## Notes
 
