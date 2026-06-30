@@ -1,0 +1,130 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: unbounded agent offline artifacts
+
+on:
+  push:
+    tags:
+      - "agent-artifacts/*"
+
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "OCI tag prefix to publish, for example v0.4.0. Defaults to the commit SHA."
+        required: false
+        type: string
+      kubernetes_versions:
+        description: "Kubernetes versions to publish. Accepts comma, space, or newline separated values."
+        required: false
+        default: "v1.34.2"
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      kubernetes_versions: ${{ steps.resolve.outputs.kubernetes_versions }}
+    steps:
+      - name: Resolve publish inputs
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_KUBERNETES_VERSIONS: ${{ inputs.kubernetes_versions }}
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            # Tag is like agent-artifacts/v0.4.0.
+            tag="${REF_NAME#agent-artifacts/}"
+            versions="v1.34.2"
+          else
+            tag="${INPUT_TAG}"
+            if [[ -z "$tag" ]]; then
+              tag="${GITHUB_SHA_VALUE::12}"
+            fi
+            versions="${INPUT_KUBERNETES_VERSIONS:-v1.34.2}"
+          fi
+
+          versions_json=$(VERSIONS="$versions" python3 -c 'import json, os, re, sys; raw = os.environ["VERSIONS"]; versions = [v for v in re.split(r"[\s,]+", raw.strip()) if v];
+          sys.exit("at least one Kubernetes version is required") if not versions else None;
+          print(json.dumps([v if v.startswith("v") else "v" + v for v in versions]))')
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "kubernetes_versions=$versions_json" >> "$GITHUB_OUTPUT"
+          echo "Publishing tag prefix: $tag"
+          echo "Kubernetes versions: $versions_json"
+
+  publish:
+    needs: resolve
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kubernetes_version: ${{ fromJson(needs.resolve.outputs.kubernetes_versions) }}
+    env:
+      REGISTRY: ghcr.io/${{ github.repository_owner }}/unbounded
+      ARTIFACT_TAG_PREFIX: ${{ needs.resolve.outputs.tag }}
+      KUBERNETES_VERSION: ${{ matrix.kubernetes_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Normalize registry
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build agent artifacts builder
+        run: go build -o bin/agent-artifacts-builder ./hack/cmd/agent-artifacts-builder/main.go
+
+      - name: Write artifact manifest
+        run: |
+          set -euo pipefail
+          mkdir -p dist/bootstrap-artifacts
+          crictl_version=$(python3 -c 'import os, re, sys; version = os.environ["KUBERNETES_VERSION"]; match = re.match(r"^v?(\d+)\.(\d+)", version);
+          sys.exit(f"invalid Kubernetes version: {version}") if not match else None;
+          print(f"{match.group(1)}.{match.group(2)}.0")')
+          crictl_version="$crictl_version" python3 -c 'import json, os; print(json.dumps({"schemaVersion": 1, "versions": {"kubernetes": os.environ["KUBERNETES_VERSION"], "containerd": "2.1.8", "runc": "1.5.0", "cni": "1.5.1", "crictl": os.environ["crictl_version"]}}, indent=2))' > dist/bootstrap-artifacts/manifest.json
+          cat dist/bootstrap-artifacts/manifest.json
+
+      - name: Build and publish offline artifact bundle
+        run: |
+          set -euo pipefail
+          oci_ref="${REGISTRY}/bootstrap-artifacts:${ARTIFACT_TAG_PREFIX}-k8s-${KUBERNETES_VERSION}"
+          output_dir="dist/bootstrap-artifacts/${KUBERNETES_VERSION}"
+
+          bin/agent-artifacts-builder \
+            --output-dir "$output_dir" \
+            --manifest dist/bootstrap-artifacts/manifest.json \
+            --arch amd64 \
+            --arch arm64 \
+            --oci-ref "$oci_ref"
+
+          echo "Published $oci_ref"
+
+      - name: Upload filesystem artifact bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bootstrap-artifacts-${{ matrix.kubernetes_version }}
+          path: dist/bootstrap-artifacts/${{ matrix.kubernetes_version }}/
+          retention-days: 7

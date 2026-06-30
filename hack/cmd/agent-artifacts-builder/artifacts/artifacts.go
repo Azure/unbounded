@@ -25,6 +25,7 @@ import (
 	"oras.land/oras-go/v2/content/file"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/credentials"
 	"oras.land/oras-go/v2/registry/remote/retry"
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
@@ -156,7 +157,17 @@ func PushOCI(ctx context.Context, rootDir, ref string) error {
 	}
 
 	ociutil.ConfigurePlainHTTP(repo)
-	repo.Client = &auth.Client{Client: retry.DefaultClient, Cache: auth.DefaultCache}
+
+	credentialStore, err := credentials.NewStoreFromDocker(credentials.StoreOptions{})
+	if err != nil {
+		return fmt.Errorf("load OCI registry credentials: %w", err)
+	}
+
+	repo.Client = &auth.Client{
+		Client:     retry.DefaultClient,
+		Cache:      auth.DefaultCache,
+		Credential: credentials.Credential(credentialStore),
+	}
 
 	store, err := file.New(rootDir)
 	if err != nil {
