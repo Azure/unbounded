@@ -474,7 +474,9 @@ struct ServeOutcome {
 /// requester is still being established. The source bytes live in the
 /// server's long-lived registered backing. Pages that belong to a
 /// caller-managed backing can attach a drop-owned release token; the
-/// token is held here until the write completes or is drained.
+/// token is held here until the write completion is observed. If teardown
+/// gives up before the CQE arrives, the token is intentionally leaked so
+/// the source page cannot be recycled while the NIC may still read it.
 struct Inflight {
     fut: CompletionFuture,
     desc: *mut std::ffi::c_void,
@@ -483,7 +485,7 @@ struct Inflight {
     dest_addr: u64,
     dest_key: u64,
     data: u64,
-    _release: Option<PageRelease>,
+    release: Option<PageRelease>,
 }
 
 /// Drive one handler stream to completion, signalling each landed page
@@ -711,7 +713,7 @@ fn post_page(
         dest_addr: plan.dest_addr,
         dest_key: header.dest_mr_key,
         data,
-        _release: release,
+        release,
     })
 }
 
@@ -773,11 +775,13 @@ fn await_oldest(
     ep: EpPtr,
     deadline: std::time::Instant,
 ) -> FabResult<()> {
-    let inf = match inflight.pop_front() {
+    let mut inf = match inflight.pop_front() {
         Some(i) => i,
         None => return Ok(()),
     };
-    match block_on(inf.fut, Duration::from_secs(10), &shared.shutdown) {
+    let result = block_on(inf.fut, Duration::from_secs(10), &shared.shutdown);
+    leak_release_if_completion_unobserved(&mut inf.release, &result);
+    match result {
         Ok(_) => Ok(()),
         Err(FabricError::Cq { prov_errno, err })
             if prov_errno == ffi::ENOTCONN && std::time::Instant::now() < deadline =>
@@ -809,8 +813,9 @@ fn await_oldest(
 /// the request outcome has already been decided. Bounded by the server
 /// shutdown flag and per-op timeout inside `block_on`.
 fn drain_inflight(shared: &Arc<ServerShared>, inflight: &mut VecDeque<Inflight>) {
-    while let Some(inf) = inflight.pop_front() {
-        let _ = block_on(inf.fut, Duration::from_secs(10), &shared.shutdown);
+    while let Some(mut inf) = inflight.pop_front() {
+        let result = block_on(inf.fut, Duration::from_secs(10), &shared.shutdown);
+        leak_release_if_completion_unobserved(&mut inf.release, &result);
     }
 }
 
@@ -921,7 +926,7 @@ fn write_page(
     let ResolvedPageSource {
         mr,
         desc,
-        release: _release,
+        release: mut release,
     } = resolve_page_source(shared, page.source)?;
     let plan = plan_page_write(
         &mr,
@@ -960,7 +965,9 @@ fn write_page(
             }
             return Err(FabricError::Pkg("fi_write", rc as i32));
         }
-        match block_on(fut, Duration::from_secs(10), &shared.shutdown) {
+        let result = block_on(fut, Duration::from_secs(10), &shared.shutdown);
+        leak_release_if_completion_unobserved(&mut release, &result);
+        match result {
             Ok(_) => break,
             Err(FabricError::Cq { prov_errno, err })
                 if prov_errno == ffi::ENOTCONN && std::time::Instant::now() < deadline =>
@@ -974,6 +981,17 @@ fn write_page(
     }
 
     send_page_ack(shared, ep, header.request_id, plan.ack_page_idx)
+}
+
+fn leak_release_if_completion_unobserved(
+    release: &mut Option<PageRelease>,
+    result: &FabResult<CompletionInfo>,
+) {
+    if matches!(result, Err(FabricError::Timeout)) {
+        if let Some(release) = release.take() {
+            std::mem::forget(release);
+        }
+    }
 }
 
 struct ResolvedPageSource {
@@ -1270,6 +1288,41 @@ mod tests {
             op_context: 0,
             data: 0,
         }
+    }
+
+    fn counted_release(drops: Arc<std::sync::atomic::AtomicUsize>) -> PageRelease {
+        struct CountedRelease(Arc<std::sync::atomic::AtomicUsize>);
+
+        impl Drop for CountedRelease {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        Box::new(CountedRelease(drops))
+    }
+
+    #[test]
+    fn unobserved_completion_leaks_page_release() {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut release = Some(counted_release(drops.clone()));
+
+        leak_release_if_completion_unobserved(&mut release, &Err(FabricError::Timeout));
+
+        assert!(release.is_none());
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn observed_completion_keeps_page_release_drop_owned() {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut release = Some(counted_release(drops.clone()));
+        let result = Ok(completion_info());
+
+        leak_release_if_completion_unobserved(&mut release, &result);
+        drop(release);
+
+        assert_eq!(drops.load(Ordering::Acquire), 1);
     }
 
     #[test]
