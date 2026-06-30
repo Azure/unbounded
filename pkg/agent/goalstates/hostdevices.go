@@ -15,7 +15,9 @@ import (
 )
 
 const (
-	kvmDevicePath = "/dev/kvm"
+	kvmDevicePath      = "/dev/kvm"
+	tunDevicePath      = "/dev/net/tun"
+	vhostNetDevicePath = "/dev/vhost-net"
 	// sysClassBlockDir is the canonical kernel listing of block devices.
 	// It contains both whole disks (e.g. sda, nvme0n1) and their partitions
 	// (e.g. sda1, nvme0n1p1), which is why it is preferred over /sys/block.
@@ -47,6 +49,9 @@ var excludedBlockDevicePrefixes = []string{
 type HostDevices struct {
 	// KVM holds the KVM character device path (/dev/kvm) when present.
 	KVM []string
+	// Network holds host networking device paths used by virtualization
+	// workloads (for example /dev/net/tun and /dev/vhost-net) when present.
+	Network []string
 	// Block holds storage block device node paths derived from
 	// /sys/class/block (whole disks and partitions, excluding virtual
 	// devices such as loop/ram/zram).
@@ -64,7 +69,7 @@ func (d HostDevices) Paths() []string {
 
 	var paths []string
 
-	for _, group := range [][]string{d.KVM, d.Block, d.Infiniband} {
+	for _, group := range [][]string{d.KVM, d.Network, d.Block, d.Infiniband} {
 		for _, p := range group {
 			if seen[p] {
 				continue
@@ -90,6 +95,7 @@ func DiscoverHostDevices() HostDevices {
 		devices.KVM = append(devices.KVM, p)
 	}
 
+	devices.Network = discoverExistingDevicePaths(tunDevicePath, vhostNetDevicePath)
 	devices.Block = discoverBlockDevicePaths(sysClassBlockDir, devDir)
 	devices.Infiniband = discoverInfinibandDevicePaths(infinibandDir, rdmaCMMiscDevPath, true)
 
@@ -99,10 +105,31 @@ func DiscoverHostDevices() HostDevices {
 // discoverKVMDevicePath checks whether path exists on the filesystem and
 // returns it when accessible, or an empty string on any error.
 func discoverKVMDevicePath(path string) string {
+	return discoverExistingDevicePath(path)
+}
+
+// discoverExistingDevicePaths checks each path and returns the accessible ones
+// in the same stable order.
+func discoverExistingDevicePaths(paths ...string) []string {
+	var discovered []string
+
+	for _, path := range paths {
+		if p := discoverExistingDevicePath(path); p != "" {
+			discovered = append(discovered, p)
+		}
+	}
+
+	return discovered
+}
+
+// discoverExistingDevicePath checks whether path exists on the filesystem and
+// returns it when accessible, or an empty string on any error.
+func discoverExistingDevicePath(path string) string {
 	if _, err := os.Stat(path); err != nil {
 		// Treat any error (including permission denied) as absent; the
 		// device is not accessible to the agent, so don't expose it to the
-		// container. os.ErrNotExist is the common case on non-KVM hosts.
+		// container. os.ErrNotExist is the common case when the host lacks
+		// the corresponding hardware or kernel module.
 		return ""
 	}
 

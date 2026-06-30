@@ -105,9 +105,13 @@ paths needed by the corresponding Kubernetes device plugin:
   Kubernetes device plugin can discover GPUs inside nspawn. See
   [AMD GPU Support]({{< relref "reference/gpu/amd" >}}).
 
-When the KVM character device (`/dev/kvm`) is present on the host, the agent
-automatically bind-mounts it into the container so that workloads inside the
-container can use hardware virtualisation (e.g. QEMU/KVM virtual machines).
+When virtualization device nodes are present on the host, the agent
+automatically bind-mounts them into the container and grants cgroup device
+permissions so that workloads inside the container can run virtual machines:
+
+- `/dev/kvm` for hardware virtualization (for example QEMU/KVM).
+- `/dev/net/tun` for TAP interfaces used by VM networking.
+- `/dev/vhost-net` for accelerated VirtIO networking.
 
 The agent also auto-mounts host storage and InfiniBand hardware:
 
