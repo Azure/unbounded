@@ -110,7 +110,7 @@ impl SimCluster {
         let mut tables = HashMap::with_capacity(peers.len());
         let mut ring_to_node = BTreeMap::new();
         for local in &peers {
-            let table = FingerTable::build(local.clone(), &peers, FingerTableConfig { k });
+            let table = FingerTable::build(local.clone(), &peers, FingerTableConfig::with_k(k));
             tables.insert(local.node, table);
             ring_to_node.insert(local.ring.0, local.node);
         }
@@ -135,7 +135,7 @@ impl SimCluster {
         let mut tables = HashMap::with_capacity(peers.len());
         let mut ring_to_node = BTreeMap::new();
         for local in &peers {
-            let built = FingerTable::build(local.clone(), &peers, FingerTableConfig { k });
+            let built = FingerTable::build(local.clone(), &peers, FingerTableConfig::with_k(k));
             let mut fingers: Vec<PeerEntry> = Vec::new();
             for f in built.fingers() {
                 if f.node == local.node {

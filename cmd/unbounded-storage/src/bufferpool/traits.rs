@@ -44,9 +44,10 @@ pub trait Req {
     }
 
     /// Benchmark-only local-disk bypass. Unlike [`Req::bypass`], this
-    /// leaves peer routing enabled but skips the initiator's local disk
-    /// lookup/writeback. Peer handlers still consult their own local
-    /// store, so remote NVMe reads remain in the path.
+    /// leaves peer routing enabled but every bufferpool that serves the
+    /// request skips its local disk lookup/writeback. Remote owner reads
+    /// still use the normal peer/fabric path, without a separate RPC-side
+    /// disk path.
     fn skip_local_disk(&self) -> bool {
         false
     }

@@ -3,7 +3,7 @@
 
 //! Server-side handler trait for fabric RPCs.
 //!
-//! A handler maps a typed request `R` to a stream of `PageRef`s the
+//! A handler maps a typed request `R` to a stream of pages the
 //! server should RMA-write into the client's destination MR. The
 //! stream surface is intentionally separate from
 //! `bufferpool::PageStream` so the server side can carry its own
@@ -14,10 +14,75 @@
 //! collection of canned handlers (`NPagesHandler`, `ErrorHandler`,
 //! `CancelObservingHandler`) used by `tests.rs`.
 
+use std::fmt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::bufferpool::{BulkRef, PageRef, Req};
+
+use super::backing::MrHandle;
+
+/// Drop-owned token attached to a page write. The RPC layer holds it
+/// until the fabric write has completed or has been abandoned after a
+/// completion drain, so embedders can keep non-`Send` page guards pinned
+/// on their home shard while handing only a Send release token to fabric.
+pub type PageRelease = Box<dyn Send + 'static>;
+
+/// Registered source backing for a streamed RPC page.
+pub enum PageSource {
+    /// Use the server's default local MR passed to
+    /// [`crate::fabric::Fabric::start_rpc_server`]. This is the scratch
+    /// path used by forwarding and synthetic responses.
+    Default,
+    /// Use this registered MR for the source page and hold `release`
+    /// until the write no longer needs the bytes.
+    Registered {
+        mr: MrHandle,
+        release: Option<PageRelease>,
+    },
+}
+
+impl fmt::Debug for PageSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Default => f.write_str("Default"),
+            Self::Registered { mr, release } => f
+                .debug_struct("Registered")
+                .field("mr", mr)
+                .field("has_release", &release.is_some())
+                .finish(),
+        }
+    }
+}
+
+/// One page yielded by a server handler plus the backing it belongs to.
+#[derive(Debug)]
+pub struct FabricPage {
+    pub page: PageRef,
+    pub source: PageSource,
+}
+
+impl FabricPage {
+    pub fn default(page: PageRef) -> Self {
+        Self {
+            page,
+            source: PageSource::Default,
+        }
+    }
+
+    pub fn registered(page: PageRef, mr: MrHandle, release: Option<PageRelease>) -> Self {
+        Self {
+            page,
+            source: PageSource::Registered { mr, release },
+        }
+    }
+}
+
+impl From<PageRef> for FabricPage {
+    fn from(page: PageRef) -> Self {
+        Self::default(page)
+    }
+}
 
 /// Server-side stream produced by a `Handler`. Mirrors the
 /// `bufferpool::PageStream` shape but with a handler-defined error
@@ -27,7 +92,7 @@ pub trait HandlerStream {
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<PageRef, Self::Error>>>;
+    ) -> Poll<Option<Result<FabricPage, Self::Error>>>;
 }
 
 /// Handler for one request type `R`. Each invocation returns a fresh
@@ -56,7 +121,7 @@ mod test_handlers {
 
     use crate::bufferpool::{BulkRef, PageRef, Req};
 
-    use super::{Handler, HandlerStream};
+    use super::{FabricPage, Handler, HandlerStream};
 
     /// Handler that yields the configured pages in order, then ends.
     pub struct NPagesHandler {
@@ -73,11 +138,11 @@ mod test_handlers {
         fn poll_next(
             mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<PageRef, Infallible>>> {
+        ) -> Poll<Option<Result<FabricPage, Infallible>>> {
             if self.next < self.pages.len() {
                 let p = self.pages[self.next];
                 self.next += 1;
-                Poll::Ready(Some(Ok(p)))
+                Poll::Ready(Some(Ok(p.into())))
             } else {
                 Poll::Ready(None)
             }
@@ -136,7 +201,7 @@ mod test_handlers {
         fn poll_next(
             mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<PageRef, E>>> {
+        ) -> Poll<Option<Result<FabricPage, E>>> {
             if self.emitted {
                 Poll::Ready(None)
             } else {
@@ -197,11 +262,11 @@ mod test_handlers {
         fn poll_next(
             mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<PageRef, TestErr>>> {
+        ) -> Poll<Option<Result<FabricPage, TestErr>>> {
             if !self.yielded_first {
                 if let Some(p) = self.page {
                     self.yielded_first = true;
-                    return Poll::Ready(Some(Ok(p)));
+                    return Poll::Ready(Some(Ok(p.into())));
                 }
             }
             Poll::Pending

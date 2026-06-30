@@ -484,7 +484,7 @@ mod tests {
     use std::pin::Pin;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 
-    use crate::bufferpool::{PageRef, Req};
+    use crate::bufferpool::Req;
     use crate::config::{HttpFrontendConfig, LoadgenFrontendConfig};
     use crate::p2p::{FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyTags};
 
@@ -557,7 +557,7 @@ mod tests {
         let fingers = std::sync::Arc::new(FingerTable::build(
             local,
             &[peer],
-            FingerTableConfig { k: 4 },
+            FingerTableConfig::with_k(4),
         ));
         let node_to_peer = std::sync::Arc::new(std::collections::HashMap::from([(
             NodeId(2),

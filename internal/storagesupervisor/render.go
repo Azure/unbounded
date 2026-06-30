@@ -174,8 +174,9 @@ func collectComponentNames[T any](components map[string]string, kind string, spe
 // peer set with any declared peers, and rebinds the TCP fabric address to the
 // node's own routable address when the ring includes a TCP selfListenAddr.
 func applyRing(cfg *storageconfig.Config, ring ringState) {
-	// Preserve YAML-declared routing knobs (fingers_per_node, routing_plan);
-	// only stamp in the locally computed self name and peer roster.
+	// Preserve YAML-declared routing knobs (fingers_per_node, routing_plan,
+	// topology_weighting); only stamp in the locally computed self name and peer
+	// roster.
 	cfg.Self = ring.selfName
 	cfg.Peers = mergePeers(cfg.Peers, ring.peers)
 

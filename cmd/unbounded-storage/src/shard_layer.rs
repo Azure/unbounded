@@ -34,14 +34,14 @@ use unbounded_storage::config::{
     self, ApplyError, Config, ConfigApplyTarget, ConfigDiff, ShardControlGroup,
 };
 use unbounded_storage::fabric::PeerId;
-use unbounded_storage::p2p::{NodeId, RouteTableHandle};
+use unbounded_storage::p2p::RouteTableHandle;
 use unbounded_storage::runtime::{JoinHandle, Threading, WorkerIdx};
 use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{CacheDirectorySet, DiskRegistrySet, UringDiskTarget};
 use unbounded_storage::topology::ServingShard;
 
 use crate::StartupSettings;
-use crate::fabric_group::{FabricGroup, FabricPlan, FabricUnitAddress};
+use crate::fabric_group::{FabricGroup, FabricPlan, FabricUnitAddress, RpcShardPublish};
 
 /// Inputs that are constant across the life of the process and used to
 /// spawn the shard layer. Cloned cheaply into every shard thread.
@@ -143,9 +143,9 @@ pub fn spawn_shard_layer(
 
     // Bring up the shared fabric endpoints before spawning any shards:
     // each shard registers its data backing against the endpoint it maps
-    // onto, so the fabrics (and their RPC servers) must exist first. On
-    // failure nothing has spawned yet, so there is nothing to retire.
-    let fabric_group = FabricGroup::new(
+    // onto. RPC servers start after shards publish their pool MRs/fetch
+    // channels because owner responses source those bufferpool pages.
+    let mut fabric_group = FabricGroup::new(
         &deps.runtime,
         &deps.fabric_plan,
         settings.backing_kind,
@@ -170,6 +170,7 @@ pub fn spawn_shard_layer(
     // when bring-up fails before the broadcast.
     let mut peer_txs: Vec<mpsc::Sender<Arc<Vec<crate::PeerPublish>>>> =
         Vec::with_capacity(worker_count);
+    let mut serve_start_txs = Vec::with_capacity(worker_count);
 
     for (i, (shard, _)) in deps.workers.iter().enumerate() {
         let widx = WorkerIdx(u16::try_from(i).expect("worker index fits in u16"));
@@ -177,6 +178,8 @@ pub fn spawn_shard_layer(
         control_senders.push((widx, ctrl_tx));
         let (peer_tx, peer_rx) = mpsc::channel::<Arc<Vec<crate::PeerPublish>>>();
         peer_txs.push(peer_tx);
+        let (serve_start_tx, serve_start_rx) = mpsc::channel::<()>();
+        serve_start_txs.push(serve_start_tx);
         let phaseb_tx = phaseb_tx.clone();
 
         let shard = *shard;
@@ -211,6 +214,7 @@ pub fn spawn_shard_layer(
                         ctrl_rx,
                         peer_rx,
                         phaseb_tx,
+                        serve_start_rx,
                         layer_stop,
                     );
                 });
@@ -256,6 +260,7 @@ pub fn spawn_shard_layer(
         // Dropping the peer senders unblocks any up-shard parked on
         // `peer_rx.recv()` so it can exit and be joined.
         drop(peer_txs);
+        drop(serve_start_txs);
         layer_stop.store(true, Ordering::Relaxed);
         for h in joins.into_iter().rev() {
             let _ = h.join();
@@ -274,19 +279,34 @@ pub fn spawn_shard_layer(
     // into the broadcast `PeerPublish` set (which deliberately carries
     // only base/len, not ownership).
     let mut backing_keepalives: Vec<Arc<dyn Send + Sync>> = Vec::with_capacity(publishes.len());
+    let mut rpc_shards = Vec::with_capacity(publishes.len());
     let peer_list: Arc<Vec<crate::PeerPublish>> = Arc::new(
         publishes
             .into_iter()
             .enumerate()
             .map(|(shard_index, (worker_idx, publish))| {
-                backing_keepalives.push(publish.backing_keepalive);
+                let crate::ShardPublish {
+                    backing_base,
+                    backing_len,
+                    fabric_mr,
+                    numa,
+                    fetch_channel,
+                    backing_keepalive,
+                } = publish;
+                backing_keepalives.push(backing_keepalive);
+                rpc_shards.push(RpcShardPublish {
+                    shard_index,
+                    fetch_channel: fetch_channel.clone(),
+                    mr: fabric_mr,
+                    numa,
+                });
                 crate::PeerPublish {
                     shard_index,
                     worker_idx,
-                    backing_base: publish.backing_base,
-                    backing_len: publish.backing_len,
-                    channel: publish.fetch_channel,
-                    numa: publish.numa,
+                    backing_base,
+                    backing_len,
+                    channel: fetch_channel,
+                    numa,
                 }
             })
             .collect(),
@@ -318,10 +338,32 @@ pub fn spawn_shard_layer(
     }
     if !phaseb_errors.is_empty() {
         layer_stop.store(true, Ordering::Relaxed);
+        drop(serve_start_txs);
         for h in joins.into_iter().rev() {
             let _ = h.join();
         }
         return Err(phaseb_errors);
+    }
+
+    if let Err(mut rpc_errors) = fabric_group.start_rpc_servers(&rpc_shards) {
+        layer_stop.store(true, Ordering::Relaxed);
+        drop(serve_start_txs);
+        for h in joins.into_iter().rev() {
+            let _ = h.join();
+        }
+        phaseb_errors.append(&mut rpc_errors);
+        return Err(phaseb_errors);
+    }
+    for tx in serve_start_txs {
+        if tx.send(()).is_err() {
+            layer_stop.store(true, Ordering::Relaxed);
+            for h in joins.into_iter().rev() {
+                let _ = h.join();
+            }
+            return Err(vec![
+                "shard exited before recursive RPC servers were ready".to_string(),
+            ]);
+        }
     }
 
     descriptors.sort_by_key(|d| d.worker_idx.0);
@@ -506,6 +548,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use unbounded_storage::p2p::NodeId;
 
     fn graph_with_self_peer(self_peer_id: PeerId) -> config::RuntimeGraph {
         config::RuntimeGraph {
@@ -518,6 +561,7 @@ mod tests {
                 self_peer_id,
                 self_tags: Vec::new(),
                 routing_plan: None,
+                topology_weighting: None,
                 peers: Vec::new(),
             },
             frontends: HashMap::new(),
