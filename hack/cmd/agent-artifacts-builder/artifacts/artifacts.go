@@ -282,7 +282,7 @@ func downloadArtifact(ctx context.Context, rootDir string, artifact Artifact, sk
 	return nil
 }
 
-func downloadToFile(ctx context.Context, sourceURL, dest string) error {
+func downloadToFile(ctx context.Context, sourceURL, dest string) (err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
@@ -303,7 +303,11 @@ func downloadToFile(ctx context.Context, sourceURL, dest string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close() //nolint:errcheck // best effort close
+	defer func() {
+		if closeErr := out.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	if _, err := io.Copy(out, resp.Body); err != nil {
 		return err
