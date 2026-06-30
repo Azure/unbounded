@@ -35,6 +35,11 @@ main ─────────────────────────
    └─ feature/unbounded-system ◄─ PR-B ◄─ PR-A ◄─ PR-C  (review chunks here)
 ```
 
+A draft umbrella PR (#388) tracks the integration branch against `main`; it is
+the single merge that lands the whole change and stays a draft until every chunk
+has merged into the integration branch. Every related PR carries an
+`[unbounded-system]` title prefix so they are easy to identify together.
+
 The integration branch is periodically kept current by merging `main` into it
 (drift is resolved here, never on `main`).
 
@@ -85,18 +90,20 @@ author does not self-merge. Each PR must be green on `make build`, `make lint`,
 
 - [x] Create `feature/unbounded-system` from `main`                         (me)
 - [x] Add this plan doc to the integration branch                            (me)
+- [x] Open umbrella tracking PR #388 (`feature/unbounded-system` -> `main`)   (me opens / reviewers merge last)
 - [x] PR-B: re-target #372 -> `feature/unbounded-system`                      (me opens / reviewers merge)
 - [x] PR-A: open operator + Site redesign -> integration                     (me opens / reviewers merge)
 - [ ] PR-A: rebase after PR-B merges                                         (me)
 - [ ] PR-C: open operator-ns + migration -> integration (after A+B merged)   (me opens / reviewers merge)
 - [ ] Periodic `main` -> integration syncs                                   (me)
-- [ ] Final PR: `feature/unbounded-system` -> `main`                         (me opens / reviewers merge)
+- [ ] Mark tracking PR #388 ready once all chunks merged                      (me; reviewers merge)
 - [ ] Close monolith #383                                                    (me, on approval)
 
 ### PR tracking
 
 | PR | Branch | Number | State |
 |----|--------|--------|-------|
+| Tracking (umbrella) | `feature/unbounded-system` -> `main` | #388 | draft (merges last, after all chunks) |
 | PR-B | `unify-namespace-unbounded-system` | #372 | open, base = `feature/unbounded-system` (awaiting review/merge) |
 | PR-A | `operator-site-redesign` | #386 | open (awaiting review/merge; rebase on integration after PR-B merges) |
 | PR-C | `operator-system-migration` | TBD | blocked on PR-A + PR-B merging |
