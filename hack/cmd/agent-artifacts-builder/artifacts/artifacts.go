@@ -42,17 +42,12 @@ const (
 	fileMediaType = "application/octet-stream"
 )
 
-type (
-	Manifest = agentartifacts.Manifest
-	Versions = agentartifacts.Versions
-)
-
 type Options struct {
 	OutputDir         string
 	StagingDir        string
 	OCIRef            string
 	ManifestPath      string
-	Manifest          Manifest
+	Manifest          agentartifacts.Manifest
 	KubernetesVersion string
 
 	Architectures []string
@@ -66,7 +61,7 @@ type Artifact struct {
 }
 
 type Plan struct {
-	Manifest  Manifest
+	Manifest  agentartifacts.Manifest
 	Artifacts []Artifact
 }
 
@@ -313,7 +308,7 @@ func copyFileAtomically(source, dest string) error {
 	return nil
 }
 
-func writeManifest(rootDir string, manifest Manifest) error {
+func writeManifest(rootDir string, manifest agentartifacts.Manifest) error {
 	if err := os.MkdirAll(rootDir, 0o755); err != nil {
 		return fmt.Errorf("create output dir %q: %w", rootDir, err)
 	}
@@ -487,11 +482,11 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func resolveManifest(opts Options) (Manifest, error) {
+func resolveManifest(opts Options) (agentartifacts.Manifest, error) {
 	if opts.ManifestPath != "" {
 		manifest, err := loadManifest(opts.ManifestPath)
 		if err != nil {
-			return Manifest{}, err
+			return agentartifacts.Manifest{}, err
 		}
 
 		return agentartifacts.NormalizeManifest(manifest)
@@ -500,7 +495,7 @@ func resolveManifest(opts Options) (Manifest, error) {
 	if opts.KubernetesVersion != "" {
 		manifest, err := defaultManifest(opts.KubernetesVersion)
 		if err != nil {
-			return Manifest{}, err
+			return agentartifacts.Manifest{}, err
 		}
 
 		return manifest, nil
@@ -509,14 +504,14 @@ func resolveManifest(opts Options) (Manifest, error) {
 	return agentartifacts.NormalizeManifest(opts.Manifest)
 }
 
-func defaultManifest(kubernetesVersion string) (Manifest, error) {
+func defaultManifest(kubernetesVersion string) (agentartifacts.Manifest, error) {
 	crictlVersion, err := agentartifacts.CrictlVersionForKubernetesVersion(kubernetesVersion)
 	if err != nil {
-		return Manifest{}, err
+		return agentartifacts.Manifest{}, err
 	}
 
-	return agentartifacts.NormalizeManifest(Manifest{
-		Versions: Versions{
+	return agentartifacts.NormalizeManifest(agentartifacts.Manifest{
+		Versions: agentartifacts.Versions{
 			Kubernetes: kubernetesVersion,
 			Containerd: goalstates.ContainerdVersion,
 			Runc:       goalstates.RunCVersion,
@@ -526,15 +521,15 @@ func defaultManifest(kubernetesVersion string) (Manifest, error) {
 	})
 }
 
-func loadManifest(path string) (Manifest, error) {
+func loadManifest(path string) (agentartifacts.Manifest, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return Manifest{}, fmt.Errorf("read manifest %q: %w", path, err)
+		return agentartifacts.Manifest{}, fmt.Errorf("read manifest %q: %w", path, err)
 	}
 
-	var manifest Manifest
+	var manifest agentartifacts.Manifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return Manifest{}, fmt.Errorf("parse manifest %q: %w", path, err)
+		return agentartifacts.Manifest{}, fmt.Errorf("parse manifest %q: %w", path, err)
 	}
 
 	return manifest, nil

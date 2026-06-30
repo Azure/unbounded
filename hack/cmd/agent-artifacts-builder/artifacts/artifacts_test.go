@@ -12,13 +12,15 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/internal/agentartifacts"
 )
 
 func TestNewPlan(t *testing.T) {
 	plan, err := NewPlan(Options{
 		OutputDir: t.TempDir(),
-		Manifest: Manifest{
-			Versions: Versions{
+		Manifest: agentartifacts.Manifest{
+			Versions: agentartifacts.Versions{
 				Kubernetes: "1.34.2",
 				Containerd: "2.1.8",
 				Runc:       "1.5.0",
@@ -30,9 +32,9 @@ func TestNewPlan(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.Equal(t, Manifest{
+	require.Equal(t, agentartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: Versions{
+		Versions: agentartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -70,9 +72,9 @@ func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
 		Architectures:     []string{"amd64"},
 	})
 	require.NoError(t, err)
-	require.Equal(t, Manifest{
+	require.Equal(t, agentartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: Versions{
+		Versions: agentartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -85,8 +87,8 @@ func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
 func TestNewPlanLoadsManifestFile(t *testing.T) {
 	dir := t.TempDir()
 	manifestPath := filepath.Join(dir, "manifest.json")
-	require.NoError(t, writeManifest(dir, Manifest{
-		Versions: Versions{
+	require.NoError(t, writeManifest(dir, agentartifacts.Manifest{
+		Versions: agentartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -106,9 +108,9 @@ func TestNewPlanLoadsManifestFile(t *testing.T) {
 
 func TestWriteManifestOmitsV1SchemaVersion(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, writeManifest(dir, Manifest{
+	require.NoError(t, writeManifest(dir, agentartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: Versions{
+		Versions: agentartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -117,16 +119,16 @@ func TestWriteManifestOmitsV1SchemaVersion(t *testing.T) {
 		},
 	}))
 
-	data, err := os.ReadFile(filepath.Join(dir, ManifestFileName))
+	data, err := os.ReadFile(filepath.Join(dir, agentartifacts.ManifestFileName))
 	require.NoError(t, err)
 	require.NotContains(t, string(data), "schemaVersion")
 }
 
 func TestValidatePulledBundle(t *testing.T) {
 	dir := t.TempDir()
-	manifest := Manifest{
+	manifest := agentartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: Versions{
+		Versions: agentartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -158,9 +160,9 @@ func TestValidatePulledBundle(t *testing.T) {
 
 func TestValidatePulledBundleDetectsContentMismatch(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, writeManifest(dir, Manifest{
+	require.NoError(t, writeManifest(dir, agentartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: Versions{
+		Versions: agentartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
