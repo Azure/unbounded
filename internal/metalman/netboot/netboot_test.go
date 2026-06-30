@@ -1886,6 +1886,52 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 	}
 }
 
+func TestHTTPServer_DisablePXE_RecordFailure(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "pxe-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:21", IPv4: "10.0.6.11", SubnetMask: "255.255.255.0"}},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	recorder := &recordingStatusRecorder{err: fmt.Errorf("simulated status failure")}
+	srv := &HTTPServer{
+		Client:         fc,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		StatusRecorder: recorder,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /pxe/disable", srv.handleDisablePXE)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/pxe/disable", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.6.11")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /pxe/disable: %v", err)
+	}
+
+	resp.Body.Close()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	require.Empty(t, recorder.pxeDisabledEvents())
+}
+
 func TestHTTPServer_DisablePXE_UnknownIP(t *testing.T) {
 	cache := NewOCICache(t.TempDir())
 

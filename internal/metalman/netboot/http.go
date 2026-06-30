@@ -292,13 +292,21 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		imageName = node.Spec.PXE.Image
 	}
 
-	if h.StatusRecorder != nil {
-		if err := h.StatusRecorder.RecordPXEDisabled(r.Context(), node.Name, specRepave, imageName); err != nil {
-			log.Error("recording PXE disabled", "node", node.Name, "err", err)
-		}
+	if h.StatusRecorder == nil {
+		log.Error("recording PXE disabled", "node", node.Name, "err", "status recorder is not configured")
+		http.Error(w, "recording PXE disabled", http.StatusServiceUnavailable)
+
+		return
 	}
 
-	log.Info("repave clear queued", "node", node.Name)
+	if err := h.StatusRecorder.RecordPXEDisabled(r.Context(), node.Name, specRepave, imageName); err != nil {
+		log.Error("recording PXE disabled", "node", node.Name, "err", err)
+		http.Error(w, "recording PXE disabled", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	log.Info("repave cleared", "node", node.Name)
 	w.WriteHeader(http.StatusOK)
 }
 

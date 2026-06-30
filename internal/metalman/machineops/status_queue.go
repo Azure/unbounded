@@ -29,9 +29,9 @@ const (
 	statusUpdatePXEDisabled
 )
 
-// StatusQueue records server-observed status milestones without blocking
-// request paths on Kubernetes status writes. Updates are best effort: if the
-// queue is full or a write fails, reconciliation must converge without it.
+// StatusQueue records server-observed status milestones. Most updates are best
+// effort, but PXE-disable updates are synchronous because the installer only
+// sends that completion signal once.
 type StatusQueue struct {
 	Client   client.Client
 	Now      func() metav1.Time
@@ -90,12 +90,12 @@ func (q *StatusQueue) RecordMachineCondition(_ context.Context, machineName stri
 	return q.enqueue(statusUpdate{machineName: machineName, kind: statusUpdateMachineCondition, condition: &cond})
 }
 
-func (q *StatusQueue) RecordPXEDisabled(_ context.Context, machineName string, repaveCounter int64, imageName string) error {
-	return q.enqueue(statusUpdate{
-		machineName: machineName,
-		kind:        statusUpdatePXEDisabled,
-		repave:      &statusRepaveUpdate{counter: repaveCounter, image: imageName},
-	})
+func (q *StatusQueue) RecordPXEDisabled(ctx context.Context, machineName string, repaveCounter int64, imageName string) error {
+	if q == nil || q.Client == nil || machineName == "" {
+		return fmt.Errorf("status queue is not configured")
+	}
+
+	return q.flushPXEDisabled(ctx, machineName, &statusRepaveUpdate{counter: repaveCounter, image: imageName})
 }
 
 func (q *StatusQueue) enqueue(update statusUpdate) error {
