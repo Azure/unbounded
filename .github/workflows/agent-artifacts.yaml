@@ -31,6 +31,9 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       kubernetes_versions: ${{ steps.resolve.outputs.kubernetes_versions }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
       - name: Resolve publish inputs
         id: resolve
         env:
@@ -39,29 +42,7 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_KUBERNETES_VERSIONS: ${{ inputs.kubernetes_versions }}
           GITHUB_SHA_VALUE: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-
-          if [[ "$EVENT_NAME" == "push" ]]; then
-            # Tag is like agent-artifacts/v0.4.0.
-            tag="${REF_NAME#agent-artifacts/}"
-            versions="v1.34.2"
-          else
-            tag="${INPUT_TAG}"
-            if [[ -z "$tag" ]]; then
-              tag="${GITHUB_SHA_VALUE::12}"
-            fi
-            versions="${INPUT_KUBERNETES_VERSIONS:-v1.34.2}"
-          fi
-
-          versions_json=$(VERSIONS="$versions" python3 -c 'import json, os, re, sys; raw = os.environ["VERSIONS"]; versions = [v for v in re.split(r"[\s,]+", raw.strip()) if v];
-          sys.exit("at least one Kubernetes version is required") if not versions else None;
-          print(json.dumps([v if v.startswith("v") else "v" + v for v in versions]))')
-
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "kubernetes_versions=$versions_json" >> "$GITHUB_OUTPUT"
-          echo "Publishing tag prefix: $tag"
-          echo "Kubernetes versions: $versions_json"
+        run: hack/scripts/resolve-agent-artifacts-publish-inputs.py
 
   publish:
     needs: resolve
