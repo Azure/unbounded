@@ -531,6 +531,7 @@ jobs:
           build-args: |
             VERSION=${{ needs.version.outputs.tag }}
             GIT_COMMIT=${{ github.sha }}
+            CONTAINER_REGISTRY=${{ env.REGISTRY }}
           tags: ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
           cache-from: type=gha,scope=${{ matrix.component.name }}
           cache-to: type=gha,scope=${{ matrix.component.name }},mode=max

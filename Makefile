@@ -976,6 +976,7 @@ image-metalman-local: ## Build the metalman container image locally (single-arch
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		--build-arg CONTAINER_REGISTRY=$(CONTAINER_REGISTRY) \
 		-t metalman:$(VERSION) -t $(METALMAN_IMAGE) \
 		-f ./images/metalman/Containerfile .
 	$(call trivy-maybe,$(METALMAN_IMAGE))
