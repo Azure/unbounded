@@ -22,6 +22,10 @@ on:
         description: "Azure HPC VHD URL for linux/arm64 host-azhpc images"
         required: false
         type: string
+      platforms:
+        description: "Platforms to build, e.g. linux/amd64 or linux/amd64,linux/arm64"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -43,11 +47,22 @@ jobs:
       name: ${{ steps.resolve.outputs.name }}
       tag: ${{ steps.resolve.outputs.tag }}
       file: ${{ steps.resolve.outputs.file }}
+      platforms: ${{ steps.resolve.outputs.platforms }}
+      azhpc_vhd_url_amd64: ${{ steps.resolve.outputs.azhpc_vhd_url_amd64 }}
+      azhpc_vhd_url_arm64: ${{ steps.resolve.outputs.azhpc_vhd_url_arm64 }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Resolve image name and tag
         id: resolve
+        env:
+          INPUT_PLATFORMS: ${{ inputs.platforms || '' }}
+          INPUT_AZHPC_VHD_URL_AMD64: ${{ inputs['azhpc-vhd-url-amd64'] || '' }}
+          INPUT_AZHPC_VHD_URL_ARM64: ${{ inputs['azhpc-vhd-url-arm64'] || '' }}
+          AZHPC_UBUNTU2404_VHD_URL_AMD64: ${{ vars.AZHPC_UBUNTU2404_VHD_URL_AMD64 || '' }}
+          AZHPC_UBUNTU2404_VHD_URL_ARM64: ${{ vars.AZHPC_UBUNTU2404_VHD_URL_ARM64 || '' }}
+          AZHPC_AZLINUX3_VHD_URL_AMD64: ${{ vars.AZHPC_AZLINUX3_VHD_URL_AMD64 || '' }}
+          AZHPC_AZLINUX3_VHD_URL_ARM64: ${{ vars.AZHPC_AZLINUX3_VHD_URL_ARM64 || '' }}
         run: |
           if [[ "${{ github.event_name }}" == "push" ]]; then
             # Tag is like "images/agent-ubuntu2404/v1.0.0"
@@ -67,12 +82,46 @@ jobs:
             exit 1
           fi
 
+          azhpc_vhd_url_amd64=""
+          azhpc_vhd_url_arm64=""
+          case "$name" in
+            host-azhpc-ubuntu2404)
+              azhpc_vhd_url_amd64="${INPUT_AZHPC_VHD_URL_AMD64:-$AZHPC_UBUNTU2404_VHD_URL_AMD64}"
+              azhpc_vhd_url_arm64="${INPUT_AZHPC_VHD_URL_ARM64:-$AZHPC_UBUNTU2404_VHD_URL_ARM64}"
+              ;;
+            host-azhpc-azlinux3)
+              azhpc_vhd_url_amd64="${INPUT_AZHPC_VHD_URL_AMD64:-$AZHPC_AZLINUX3_VHD_URL_AMD64}"
+              azhpc_vhd_url_arm64="${INPUT_AZHPC_VHD_URL_ARM64:-$AZHPC_AZLINUX3_VHD_URL_ARM64}"
+              ;;
+          esac
+
+          if [[ -n "$INPUT_PLATFORMS" ]]; then
+            platforms="$INPUT_PLATFORMS"
+          elif [[ "$name" == host-azhpc-* ]]; then
+            platforms=()
+            if [[ -n "$azhpc_vhd_url_amd64" ]]; then platforms+=("linux/amd64"); fi
+            if [[ -n "$azhpc_vhd_url_arm64" ]]; then platforms+=("linux/arm64"); fi
+
+            if [[ ${#platforms[@]} -eq 0 ]]; then
+              echo "::error::No AZHPC VHD URLs configured for ${name}"
+              exit 1
+            fi
+
+            platforms=$(IFS=,; echo "${platforms[*]}")
+          else
+            platforms="linux/amd64,linux/arm64"
+          fi
+
           echo "name=${name}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "file=${file}" >> "$GITHUB_OUTPUT"
+          echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
+          echo "azhpc_vhd_url_amd64=${azhpc_vhd_url_amd64}" >> "$GITHUB_OUTPUT"
+          echo "azhpc_vhd_url_arm64=${azhpc_vhd_url_arm64}" >> "$GITHUB_OUTPUT"
 
           echo "Image: ${name}:${tag}"
           echo "Containerfile: ${file}"
+          echo "Platforms: ${platforms}"
 
   # ---------------------------------------------------------------------------
   # Build and push multi-arch container image.
@@ -104,11 +153,11 @@ jobs:
         with:
           context: .
           file: ${{ needs.resolve.outputs.file }}
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ needs.resolve.outputs.platforms }}
           push: true
           tags: ${{ env.CONTAINER_REGISTRY }}/${{ needs.resolve.outputs.name }}:${{ needs.resolve.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            AZHPC_VHD_URL_AMD64=${{ inputs['azhpc-vhd-url-amd64'] || (needs.resolve.outputs.name == 'host-azhpc-ubuntu2404' && vars.AZHPC_UBUNTU2404_VHD_URL_AMD64) || (needs.resolve.outputs.name == 'host-azhpc-azlinux3' && vars.AZHPC_AZLINUX3_VHD_URL_AMD64) || '' }}
-            AZHPC_VHD_URL_ARM64=${{ inputs['azhpc-vhd-url-arm64'] || (needs.resolve.outputs.name == 'host-azhpc-ubuntu2404' && vars.AZHPC_UBUNTU2404_VHD_URL_ARM64) || (needs.resolve.outputs.name == 'host-azhpc-azlinux3' && vars.AZHPC_AZLINUX3_VHD_URL_ARM64) || '' }}
+            AZHPC_VHD_URL_AMD64=${{ needs.resolve.outputs.azhpc_vhd_url_amd64 }}
+            AZHPC_VHD_URL_ARM64=${{ needs.resolve.outputs.azhpc_vhd_url_arm64 }}

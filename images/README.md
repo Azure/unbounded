@@ -50,7 +50,9 @@ AZHPC_AZLINUX3_VHD_URL_ARM64
 The VHDs should come from the upstream Packer workflow with `create_vhd=true` and the matching
 `os_family`/`distro_version`: `ubuntu`/`24.04` for `host-azhpc-ubuntu2404`, and
 `azurelinux`/`3.0` for `host-azhpc-azlinux3`. If an upstream variant does not publish one of the
-architectures, omit that platform from the `docker buildx build --platform` list.
+architectures, omit that platform from the `docker buildx build --platform` list. The dedicated
+GitHub Actions image workflow automatically builds only the AZHPC architectures with configured VHD
+URLs unless the `platforms` workflow input is set explicitly.
 
 Pair these machine images with Metalman's default `netboot` image, or set `spec.pxe.netbootImage` on
 a Machine to override the default PXE boot environment.
