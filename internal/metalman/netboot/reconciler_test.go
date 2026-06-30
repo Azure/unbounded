@@ -4,8 +4,12 @@
 package netboot
 
 import (
+	"strings"
 	"testing"
 
+	godigest "github.com/opencontainers/go-digest"
+	ispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/opencontainers/umoci/oci/casext"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -77,4 +81,78 @@ func TestOCIReconcilerMapMachineToImage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSelectPlatformDescriptor(t *testing.T) {
+	amd64Path := descriptorPathForPlatform("amd64")
+	arm64Path := descriptorPathForPlatform("arm64")
+	singlePath := casext.DescriptorPath{Walk: []ispec.Descriptor{{Digest: "sha256:3333333333333333333333333333333333333333333333333333333333333333"}}}
+
+	tests := []struct {
+		name        string
+		hostArch    string
+		paths       []casext.DescriptorPath
+		wantDigest  string
+		wantErrPart string
+	}{
+		{
+			name:       "selects matching platform",
+			hostArch:   "arm64",
+			paths:      []casext.DescriptorPath{amd64Path, arm64Path},
+			wantDigest: arm64Path.Descriptor().Digest.String(),
+		},
+		{
+			name:       "allows single manifest without platform metadata",
+			hostArch:   "amd64",
+			paths:      []casext.DescriptorPath{singlePath},
+			wantDigest: singlePath.Descriptor().Digest.String(),
+		},
+		{
+			name:        "errors when platform is missing",
+			hostArch:    "ppc64le",
+			paths:       []casext.DescriptorPath{amd64Path, arm64Path},
+			wantErrPart: "no manifest found for platform linux/ppc64le",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := selectPlatformDescriptor(tt.hostArch, tt.paths)
+			if tt.wantErrPart != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrPart) {
+					t.Fatalf("error = %v, want containing %q", err, tt.wantErrPart)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("selectPlatformDescriptor: %v", err)
+			}
+
+			if got.Descriptor().Digest.String() != tt.wantDigest {
+				t.Fatalf("digest = %q, want %q", got.Descriptor().Digest, tt.wantDigest)
+			}
+		})
+	}
+}
+
+func descriptorPathForPlatform(arch string) casext.DescriptorPath {
+	digests := map[string]string{
+		"amd64": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+		"arm64": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+	}
+
+	return casext.DescriptorPath{Walk: []ispec.Descriptor{
+		{
+			Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		},
+		{
+			Digest: godigest.Digest(digests[arch]),
+			Platform: &ispec.Platform{
+				OS:           "linux",
+				Architecture: arch,
+			},
+		},
+	}}
 }

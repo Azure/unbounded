@@ -7,10 +7,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
+	"strings"
 	"time"
 
+	cplatforms "github.com/containerd/platforms"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/umoci"
+	"github.com/opencontainers/umoci/oci/casext"
 	"github.com/opencontainers/umoci/oci/layer"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
@@ -200,8 +204,7 @@ func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest
 }
 
 // unpackOCILayout opens an OCI image layout at layoutDir and unpacks the
-// image tagged with the given tag into destDir using umoci. It picks the
-// first available manifest (netboot images are single-platform).
+// image tagged with the given tag into destDir using umoci.
 func unpackOCILayout(ctx context.Context, layoutDir, tag, destDir string) error {
 	engine, err := umoci.OpenLayout(layoutDir)
 	if err != nil {
@@ -218,8 +221,10 @@ func unpackOCILayout(ctx context.Context, layoutDir, tag, destDir string) error 
 		return fmt.Errorf("tag %q not found in OCI layout", tag)
 	}
 
-	// Use the first descriptor - netboot images are single-platform.
-	dp := descriptorPaths[0]
+	dp, err := selectPlatformDescriptor(runtime.GOARCH, descriptorPaths)
+	if err != nil {
+		return fmt.Errorf("select platform for tag %q: %w", tag, err)
+	}
 
 	blob, err := engine.FromDescriptor(ctx, dp.Descriptor())
 	if err != nil {
@@ -250,4 +255,40 @@ func unpackOCILayout(ctx context.Context, layoutDir, tag, destDir string) error 
 	}
 
 	return nil
+}
+
+func selectPlatformDescriptor(hostArch string, paths []casext.DescriptorPath) (casext.DescriptorPath, error) {
+	want := cplatforms.Normalize(ispec.Platform{
+		OS:           "linux",
+		Architecture: hostArch,
+	})
+	matcher := cplatforms.NewMatcher(want)
+
+	var checked []string
+
+	for _, dp := range paths {
+		for _, step := range dp.Walk {
+			if step.Platform == nil {
+				continue
+			}
+
+			if matcher.Match(*step.Platform) {
+				return dp, nil
+			}
+
+			checked = append(checked, fmt.Sprintf("%s/%s", step.Platform.OS, step.Platform.Architecture))
+		}
+	}
+
+	// Direct single-platform image references usually do not include platform
+	// metadata in the descriptor walk.
+	if len(paths) == 1 && len(checked) == 0 {
+		return paths[0], nil
+	}
+
+	return casext.DescriptorPath{}, fmt.Errorf(
+		"no manifest found for platform linux/%s, available %q",
+		hostArch,
+		strings.Join(checked, ","),
+	)
 }
