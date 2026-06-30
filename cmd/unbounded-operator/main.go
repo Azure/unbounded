@@ -59,6 +59,7 @@ func main() {
 	cmd.Flags().StringVar(&cfg.metalmanImage, "metalman-image", "", "Default metalman image")
 	cmd.Flags().StringVar(&cfg.storageImage, "storage-supervisor-image", "", "Default unbounded-storage-supervisor image")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint advertised by machina")
+	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", false, "Migrate operator-owned state out of the legacy unbounded-kube/unbounded-net namespaces and delete the operator-owned resources left behind (does not delete the namespaces)")
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
 
@@ -81,6 +82,7 @@ type config struct {
 	metalmanImage           string
 	storageImage            string
 	apiServerEndpoint       string
+	reapLegacyResources     bool
 }
 
 func run(ctx context.Context, cfg config) error {
@@ -116,6 +118,17 @@ func run(ctx context.Context, cfg config) error {
 		},
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup Site controller: %w", err)
+	}
+
+	if cfg.reapLegacyResources {
+		if err := (&operator.LegacyReaper{
+			Client:          mgr.GetClient(),
+			TargetNamespace: cfg.defaultNamespace,
+			SkipSecretNames: map[string]struct{}{"unbounded-net-serving-cert": {}},
+			CopyConfigMaps:  []string{"machina-config"},
+		}).SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("setup legacy reaper: %w", err)
+		}
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

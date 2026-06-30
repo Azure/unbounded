@@ -222,8 +222,6 @@ type unboundedSiteConfig struct {
 	ManageCniPlugin bool
 }
 
-
-
 // ensureUnboundedSite sets up the main gateway and the cluster site that encompasses any nodes attached to the
 // main cluster. For each manifest file name in cfg.Manifests it looks up the file from the
 // assets/unbounded-net-site embed.FS, renders it as a Go template with cfg as the data, and applies
