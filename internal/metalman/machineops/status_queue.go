@@ -147,17 +147,25 @@ func (q *StatusQueue) process(ctx context.Context, update statusUpdate) {
 func (q *StatusQueue) flush(ctx context.Context, update statusUpdate) error {
 	switch update.kind {
 	case statusUpdateBootLoaderDownloaded:
-		return q.flushOperationCondition(ctx, update.machineName, v1alpha3.MachineOperationConditionBootLoaderDownloaded, "Downloaded", fmt.Sprintf("Machine %s downloaded initial boot loader %s", update.machineName, update.filename))
+		return q.flushOperationCondition(ctx, update.machineName, v1alpha3.MachineOperationConditionBootLoaderDownloaded, metav1.ConditionTrue, "Downloaded", fmt.Sprintf("Machine %s downloaded initial boot loader %s", update.machineName, update.filename))
 	case statusUpdateBootImageWritten:
-		return q.flushOperationCondition(ctx, update.machineName, v1alpha3.MachineOperationConditionBootImageWritten, "Succeeded", fmt.Sprintf("Machine %s finished writing the boot image to disk", update.machineName))
+		return q.flushOperationCondition(ctx, update.machineName, v1alpha3.MachineOperationConditionBootImageWritten, metav1.ConditionTrue, "Succeeded", fmt.Sprintf("Machine %s finished writing the boot image to disk", update.machineName))
 	case statusUpdateCloudInitDone:
-		return q.flushOperationCondition(ctx, update.machineName, v1alpha3.MachineOperationConditionCloudInitDone, "Succeeded", fmt.Sprintf("Machine %s completed first-boot cloud-init successfully", update.machineName))
+		return q.flushOperationCondition(ctx, update.machineName, v1alpha3.MachineOperationConditionCloudInitDone, metav1.ConditionTrue, "Succeeded", fmt.Sprintf("Machine %s completed first-boot cloud-init successfully", update.machineName))
 	case statusUpdateMachineCondition:
 		if update.condition == nil {
 			return nil
 		}
 
-		return q.flushMachineCondition(ctx, update.machineName, *update.condition)
+		if err := q.flushMachineCondition(ctx, update.machineName, *update.condition); err != nil {
+			return err
+		}
+
+		if update.condition.Type == v1alpha3.MachineConditionCloudInitDone && update.condition.Status != metav1.ConditionTrue {
+			return q.flushOperationCondition(ctx, update.machineName, v1alpha3.MachineOperationConditionCloudInitDone, update.condition.Status, update.condition.Reason, update.condition.Message)
+		}
+
+		return nil
 	case statusUpdatePXEDisabled:
 		if update.repave == nil {
 			return nil
@@ -169,7 +177,7 @@ func (q *StatusQueue) flush(ctx context.Context, update statusUpdate) error {
 	}
 }
 
-func (q *StatusQueue) flushOperationCondition(ctx context.Context, machineName, conditionType, reason, message string) error {
+func (q *StatusQueue) flushOperationCondition(ctx context.Context, machineName, conditionType string, status metav1.ConditionStatus, reason, message string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		op, ok, err := q.activeOperationForMachine(ctx, machineName)
 		if err != nil || !ok {
@@ -182,7 +190,7 @@ func (q *StatusQueue) flushOperationCondition(ctx context.Context, machineName, 
 
 		apimeta.SetStatusCondition(&op.Status.Conditions, metav1.Condition{
 			Type:               conditionType,
-			Status:             metav1.ConditionTrue,
+			Status:             status,
 			Reason:             reason,
 			Message:            message,
 			ObservedGeneration: op.Generation,

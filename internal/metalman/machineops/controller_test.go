@@ -255,10 +255,12 @@ func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) 
 	require.NotNil(t, bootLoaderCond)
 	require.Equal(t, metav1.ConditionUnknown, bootLoaderCond.Status)
 	require.Equal(t, "Pending", bootLoaderCond.Reason)
+
 	bootImageCond := apimeta.FindStatusCondition(inProgress.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten)
 	require.NotNil(t, bootImageCond)
 	require.Equal(t, metav1.ConditionUnknown, bootImageCond.Status)
 	require.Equal(t, "Pending", bootImageCond.Reason)
+
 	cloudInitCond := apimeta.FindStatusCondition(inProgress.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
 	require.NotNil(t, cloudInitCond)
 	require.Equal(t, metav1.ConditionUnknown, cloudInitCond.Status)
@@ -311,10 +313,12 @@ func TestReconcilerRestoresMissingHostReplaceTriggerConditions(t *testing.T) {
 	require.NotNil(t, bootLoaderCond)
 	require.Equal(t, metav1.ConditionUnknown, bootLoaderCond.Status)
 	require.Equal(t, "Pending", bootLoaderCond.Reason)
+
 	bootImageCond := apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten)
 	require.NotNil(t, bootImageCond)
 	require.Equal(t, metav1.ConditionTrue, bootImageCond.Status)
 	require.Equal(t, "Succeeded", bootImageCond.Reason)
+
 	cloudInitCond := apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
 	require.NotNil(t, cloudInitCond)
 	require.Equal(t, metav1.ConditionUnknown, cloudInitCond.Status)

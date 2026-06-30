@@ -52,6 +52,7 @@ func TestStatusQueueRecordsServerMilestones(t *testing.T) {
 		Message: "cloud-init completed successfully",
 	}))
 	require.NoError(t, queue.RecordPXEDisabled(context.Background(), machine.Name, 3, "ghcr.io/test/image:v1"))
+
 	for queue.processNextUpdate(context.Background()) {
 	}
 
@@ -123,6 +124,7 @@ func TestStatusQueueLatchesTrueOperationConditions(t *testing.T) {
 	cond := apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionBootLoaderDownloaded)
 	require.NotNil(t, cond)
 	require.Contains(t, cond.Message, "shimx64.efi")
+
 	wantTransition := fixedNow()
 	require.True(t, cond.LastTransitionTime.Equal(&wantTransition), "lastTransitionTime = %s, want %s", cond.LastTransitionTime, wantTransition)
 
@@ -134,6 +136,47 @@ func TestStatusQueueLatchesTrueOperationConditions(t *testing.T) {
 	require.NotNil(t, cond)
 	require.Contains(t, cond.Message, "shimx64.efi")
 	require.True(t, cond.LastTransitionTime.Equal(&wantTransition), "lastTransitionTime = %s, want %s", cond.LastTransitionTime, wantTransition)
+}
+
+func TestStatusQueueCopiesCloudInitProgressToHostReplaceOperation(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-1", Generation: 4}}
+	op := testOperation("op-cloud-init-progress", v1alpha3.OperationHostReplace)
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: machine.Name,
+		Phase:      v1alpha3.OperationPhaseInProgress,
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(machine, op).Build()
+	queue := &StatusQueue{Client: c, Now: fixedNow}
+
+	require.NoError(t, queue.RecordMachineCondition(context.Background(), machine.Name, metav1.Condition{
+		Type:    v1alpha3.MachineConditionCloudInitDone,
+		Status:  metav1.ConditionFalse,
+		Reason:  "Running",
+		Message: "stage \"init\" started",
+	}))
+	require.True(t, queue.processNextUpdate(context.Background()))
+
+	var updatedOp v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updatedOp))
+	cloudInit := apimeta.FindStatusCondition(updatedOp.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+	require.NotNil(t, cloudInit)
+	require.Equal(t, metav1.ConditionFalse, cloudInit.Status)
+	require.Equal(t, "Running", cloudInit.Reason)
+	require.Equal(t, "stage \"init\" started", cloudInit.Message)
+
+	require.NoError(t, queue.RecordCloudInitDone(context.Background(), machine.Name))
+	require.True(t, queue.processNextUpdate(context.Background()))
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updatedOp))
+
+	cloudInit = apimeta.FindStatusCondition(updatedOp.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+	require.NotNil(t, cloudInit)
+	require.Equal(t, metav1.ConditionTrue, cloudInit.Status)
+	require.Equal(t, "Succeeded", cloudInit.Reason)
 }
 
 func TestStatusQueueIgnoresTerminalAndNonHostReplaceOperations(t *testing.T) {
@@ -158,6 +201,7 @@ func TestStatusQueueIgnoresTerminalAndNonHostReplaceOperations(t *testing.T) {
 
 	require.NoError(t, queue.RecordBootLoaderDownloaded(context.Background(), "machine-1", "shimx64.efi"))
 	require.NoError(t, queue.RecordBootImageWritten(context.Background(), "machine-2"))
+
 	for queue.processNextUpdate(context.Background()) {
 	}
 
