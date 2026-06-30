@@ -99,7 +99,7 @@ func TestResolveOCIImage_DefaultWithGPU(t *testing.T) {
 	t.Setenv("AGENT_OCI_IMAGE", "")
 
 	got := resolveOCIImage(discardLogger(), "", true, hostDistroUbuntu2404)
-	assert.Equal(t, DefaultNvidiaOCImage, got)
+	assert.Equal(t, DefaultNvidiaOCIImage, got)
 }
 
 func TestResolveOCIImage_Priority(t *testing.T) {
@@ -123,7 +123,7 @@ func TestResolveOCIImage_Priority(t *testing.T) {
 	// 4. No config, disable off, no env var - GPU default.
 	t.Setenv("AGENT_OCI_IMAGE", "")
 
-	assert.Equal(t, DefaultNvidiaOCImage, resolveOCIImage(log, "", true, hostDistroUbuntu2404))
+	assert.Equal(t, DefaultNvidiaOCIImage, resolveOCIImage(log, "", true, hostDistroUbuntu2404))
 	assert.Equal(t, DefaultOCIImage, resolveOCIImage(log, "", false, hostDistroUbuntu2404))
 }
 
@@ -143,7 +143,7 @@ func TestResolveOCIImage_DefaultForHostDistro(t *testing.T) {
 			name:      "ubuntu 2404 nvidia",
 			distro:    hostDistroUbuntu2404,
 			nvidiaGPU: true,
-			want:      DefaultNvidiaOCImage,
+			want:      DefaultNvidiaOCIImage,
 		},
 		{
 			name:   "ubuntu 2604",
@@ -176,7 +176,7 @@ func TestResolveOCIImage_DefaultForHostDistro(t *testing.T) {
 			name:      "unknown with nvidia falls back to ubuntu 2404 nvidia",
 			distro:    "",
 			nvidiaGPU: true,
-			want:      DefaultNvidiaOCImage,
+			want:      DefaultNvidiaOCIImage,
 		},
 	}
 
