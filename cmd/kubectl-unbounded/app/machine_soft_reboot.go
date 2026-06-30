@@ -117,6 +117,7 @@ func watchMachineOperation(ctx context.Context, c client.WithWatch, opName strin
 	defer watcher.Stop()
 
 	var lastPhase v1alpha3.OperationPhase
+
 	seenConditions := map[string]conditionState{}
 	seenTargets := map[string]string{}
 
@@ -184,9 +185,11 @@ func reportTargetTransitions(targets []v1alpha3.MachineOperationTargetStatus, se
 
 func targetTransitionState(target v1alpha3.MachineOperationTargetStatus) string {
 	parts := make([]string, 0, 3)
+
 	if target.Phase != "" {
 		parts = append(parts, string(target.Phase))
 	}
+
 	if target.Stage != "" {
 		parts = append(parts, string(target.Stage))
 	}

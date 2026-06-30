@@ -139,6 +139,7 @@ func watchReboot(ctx context.Context, c client.WithWatch, name string, target in
 	defer watcher.Stop()
 
 	var lastReason string
+
 	seenConditions := map[string]conditionState{}
 
 	for ev := range watcher.ResultChan() {

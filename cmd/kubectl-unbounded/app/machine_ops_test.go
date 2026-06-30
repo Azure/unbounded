@@ -68,8 +68,11 @@ func captureStdout(t *testing.T, fn func()) string {
 	require.NoError(t, err)
 
 	os.Stdout = w
+
 	fn()
+
 	require.NoError(t, w.Close())
+
 	os.Stdout = oldStdout
 
 	out, err := io.ReadAll(r)
