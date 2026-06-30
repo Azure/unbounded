@@ -1,25 +1,25 @@
 {{ if le .Machine.Spec.Operations.RepaveCounter .Machine.Status.Operations.RepaveCounter }}
-# No pending repave – chainload the locally installed bootloader.
+# No pending repave - chainload the locally installed bootloader.
 # When GRUB is PXE-booted $root is (tftp).  We need extra modules to
 # probe local disks and read their FAT-formatted ESPs.
 insmod part_gpt
 insmod fat
 insmod search_fs_file
 insmod chain
-if search --no-floppy --set=root --file /EFI/ubuntu/shimx64.efi; then
-  chainloader /EFI/ubuntu/shimx64.efi
-  boot
-fi
 if search --no-floppy --set=root --file /EFI/ubuntu/grubx64.efi; then
   chainloader /EFI/ubuntu/grubx64.efi
   boot
 fi
-if search --no-floppy --set=root --file /EFI/ubuntu/shimaa64.efi; then
-  chainloader /EFI/ubuntu/shimaa64.efi
+if search --no-floppy --set=root --file /EFI/ubuntu/shimx64.efi; then
+  chainloader /EFI/ubuntu/shimx64.efi
   boot
 fi
 if search --no-floppy --set=root --file /EFI/ubuntu/grubaa64.efi; then
   chainloader /EFI/ubuntu/grubaa64.efi
+  boot
+fi
+if search --no-floppy --set=root --file /EFI/ubuntu/shimaa64.efi; then
+  chainloader /EFI/ubuntu/shimaa64.efi
   boot
 fi
 if search --no-floppy --set=root --file /EFI/BOOT/BOOTX64.EFI; then

@@ -100,7 +100,9 @@ RUN chmod 755 /tmp/initrd-root/init && \
              "${KMOD}/kernel/drivers/ata" \
              "${KMOD}/kernel/drivers/nvme" \
              "${KMOD}/kernel/drivers/virtio" \
-             "${KMOD}/kernel/drivers/block" && \
+             "${KMOD}/kernel/drivers/block" \
+             "${KMOD}/kernel/fs/fat" \
+             "${KMOD}/kernel/fs/nls" && \
     cp -a "/lib/modules/${KVER}/kernel/drivers/net/." \
            "${KMOD}/kernel/drivers/net/" && \
     cp -a "/lib/modules/${KVER}/kernel/drivers/scsi/." \
@@ -113,6 +115,10 @@ RUN chmod 755 /tmp/initrd-root/init && \
            "${KMOD}/kernel/drivers/virtio/" && \
     cp -a "/lib/modules/${KVER}/kernel/drivers/block/." \
            "${KMOD}/kernel/drivers/block/" && \
+    cp -a "/lib/modules/${KVER}/kernel/fs/fat/." \
+           "${KMOD}/kernel/fs/fat/" && \
+    cp -a "/lib/modules/${KVER}/kernel/fs/nls/." \
+           "${KMOD}/kernel/fs/nls/" && \
     # modules.dep and map files so modprobe can resolve dependencies.
     depmod -b /tmp/initrd-root "${KVER}" && \
     cd /tmp/initrd-root && \

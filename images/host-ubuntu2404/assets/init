@@ -62,7 +62,7 @@ for f in /lib/modules/"${KVER}"/kernel/drivers/net/ethernet/*/*.ko* \
     modprobe "$mod" 2>/dev/null || true
 done
 # FAT/VFAT is needed to mount the EFI System Partition later.
-for mod in nls_cp437 nls_ascii nls_utf8 fat vfat; do
+for mod in nls_iso8859-1 nls_cp437 nls_ascii nls_utf8 fat vfat; do
     modprobe "$mod" 2>/dev/null || true
 done
 # efivarfs is needed for efibootmgr to create NVRAM entries.
