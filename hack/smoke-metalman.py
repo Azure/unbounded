@@ -113,6 +113,16 @@ def libvirt_type() -> str:
     return "qemu"
 
 
+def using_arm_tcg() -> bool:
+    return expected_node_arch() == "arm64" and libvirt_type() == "qemu"
+
+
+def smoke_timeout(seconds: int) -> int:
+    if using_arm_tcg():
+        return seconds * 4
+    return seconds
+
+
 def _first_existing(paths: list[str]) -> str:
     for path in paths:
         if Path(path).exists():
@@ -910,14 +920,14 @@ def run_operation_smoke_suite() -> None:
     boot_id = get_node_boot_id(NODE_NAME)
 
     poweroff = create_machine_operation("smoke-host-poweroff", "HostPowerOff")
-    wait_machine_operation_complete(poweroff, timeout=600)
-    wait_vm_state("shut off", timeout=180)
+    wait_machine_operation_complete(poweroff, timeout=smoke_timeout(600))
+    wait_vm_state("shut off", timeout=smoke_timeout(180))
 
     poweron = create_machine_operation("smoke-host-poweron", "HostPowerOn")
-    wait_machine_operation_complete(poweron, timeout=600)
-    wait_vm_state("running", timeout=180)
-    wait_k8s_node(NODE_NAME, timeout=300)
-    wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
+    wait_machine_operation_complete(poweron, timeout=smoke_timeout(600))
+    wait_vm_state("running", timeout=smoke_timeout(180))
+    wait_k8s_node(NODE_NAME, timeout=smoke_timeout(300))
+    wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=smoke_timeout(600))
     boot_id = get_node_boot_id(NODE_NAME)
 
     reboot = create_machine_operation(
@@ -926,10 +936,10 @@ def run_operation_smoke_suite() -> None:
         machine_ref=None,
         site_selector=SITE,
     )
-    wait_machine_operation_complete(reboot, timeout=600)
-    wait_vm_state("running", timeout=180)
-    wait_k8s_node(NODE_NAME, timeout=300)
-    wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
+    wait_machine_operation_complete(reboot, timeout=smoke_timeout(600))
+    wait_vm_state("running", timeout=smoke_timeout(180))
+    wait_k8s_node(NODE_NAME, timeout=smoke_timeout(300))
+    wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=smoke_timeout(600))
 
 
 def main() -> None:
@@ -937,6 +947,8 @@ def main() -> None:
     atexit.register(cleanup)
 
     log(f"Running metalman smoke test for {expected_node_arch()}")
+    if using_arm_tcg():
+        log("Using extended timeouts for ARM QEMU TCG")
 
     log("Cleaning up stale libvirt resources")
     clean_libvirt()
@@ -1019,11 +1031,13 @@ def main() -> None:
     log(f"  UEFI vars template: {uefi_vars_template}")
     ovmf_vars = TMPDIR / "OVMF_VARS.fd"
     shutil.copy2(uefi_vars_template, ovmf_vars)
-    disk = str(TMPDIR / "disk.qcow2")
-    run_quiet(["qemu-img", "create", "-f", "qcow2", disk, "20G"], check=True)
     virt_type = libvirt_type()
     if virt_type == "qemu":
         log("/dev/kvm is unavailable; creating VM with QEMU TCG")
+    disk_format = "raw" if expected_node_arch() == "arm64" and virt_type == "qemu" else "qcow2"
+    disk = str(TMPDIR / f"disk.{disk_format}")
+    log(f"  VM disk format: {disk_format}")
+    run_quiet(["qemu-img", "create", "-f", disk_format, disk, "20G"], check=True)
     virt_install_args = [
         "virt-install",
         "--debug",
@@ -1031,7 +1045,7 @@ def main() -> None:
         "--arch", libvirt_arch(),
         "--virt-type", virt_type,
         "--name", VM_NAME, "--ram", "4096", "--vcpus", "2",
-        "--disk", f"path={disk},format=qcow2,bus=virtio",
+        "--disk", f"path={disk},format={disk_format},bus=virtio",
         "--network", f"network={NET_NAME},mac={MAC_ADDRESS}",
         "--boot", f"uefi,loader={uefi_code},nvram={ovmf_vars},hd,network",
         "--tpm", "backend.type=emulator,backend.version=2.0",
@@ -1227,13 +1241,13 @@ def main() -> None:
     log(f"  Host disk after image builds:\n{df.stdout.strip()}")
 
     log("Waiting for cloud-init to complete...")
-    assert_cloud_init_done(timeout=900)
+    assert_cloud_init_done(timeout=smoke_timeout(900))
 
-    wait_machine_operation_complete(operation_name, timeout=900)
+    wait_machine_operation_complete(operation_name, timeout=smoke_timeout(900))
 
     log("Waiting for kubelet to join the cluster...")
-    wait_k8s_node(NODE_NAME, timeout=900)
-    assert_node_ready(NODE_NAME, timeout=720)
+    wait_k8s_node(NODE_NAME, timeout=smoke_timeout(900))
+    assert_node_ready(NODE_NAME, timeout=smoke_timeout(720))
     assert_node_arch(NODE_NAME)
     assert_node_label(NODE_NAME, NODE_LABEL_KEY, NODE_LABEL_VALUE)
 
