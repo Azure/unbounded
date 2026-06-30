@@ -118,13 +118,14 @@ const (
 type OperationStage string
 
 const (
-	OperationStagePoweringOff     OperationStage = "PoweringOff"
-	OperationStageWaitingOff      OperationStage = "WaitingOff"
-	OperationStagePoweringOn      OperationStage = "PoweringOn"
-	OperationStageWaitingOn       OperationStage = "WaitingOn"
-	OperationStageRepaveRequested OperationStage = "RepaveRequested"
-	OperationStageWaitingRepave   OperationStage = "WaitingRepave"
-	OperationStageWaitingNode     OperationStage = "WaitingNode"
+	OperationStagePoweringOff      OperationStage = "PoweringOff"
+	OperationStageWaitingOff       OperationStage = "WaitingOff"
+	OperationStagePoweringOn       OperationStage = "PoweringOn"
+	OperationStageWaitingOn        OperationStage = "WaitingOn"
+	OperationStageRepaveRequested  OperationStage = "RepaveRequested"
+	OperationStageWaitingRepave    OperationStage = "WaitingRepave"
+	OperationStageWaitingCloudInit OperationStage = "WaitingCloudInit"
+	OperationStageWaitingNode      OperationStage = "WaitingNode"
 )
 
 // MachineOperationSpec defines the desired state of a MachineOperation.

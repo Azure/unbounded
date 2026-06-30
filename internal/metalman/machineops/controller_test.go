@@ -260,6 +260,12 @@ func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) 
 	patched.Status.Conditions = []metav1.Condition{{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"}}
 	require.NoError(t, c.Status().Update(context.Background(), &patched))
 	require.NoError(t, c.Create(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}}))
+	apimeta.SetStatusCondition(&inProgress.Status.Conditions, metav1.Condition{
+		Type:   v1alpha3.MachineOperationConditionCloudInitDone,
+		Status: metav1.ConditionTrue,
+		Reason: "Succeeded",
+	})
+	require.NoError(t, c.Status().Update(context.Background(), &inProgress))
 
 	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
 	require.NoError(t, err)
@@ -288,6 +294,11 @@ func TestReconcilerKeepsHostReplaceInProgressUntilNodeExists(t *testing.T) {
 		TargetOperations:   &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5},
 		ObservedGeneration: machine.Generation,
 	}}
+	op.Status.Conditions = []metav1.Condition{{
+		Type:   v1alpha3.MachineOperationConditionCloudInitDone,
+		Status: metav1.ConditionTrue,
+		Reason: "Succeeded",
+	}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
 	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
@@ -303,6 +314,88 @@ func TestReconcilerKeepsHostReplaceInProgressUntilNodeExists(t *testing.T) {
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[0].Phase)
 	require.Equal(t, v1alpha3.OperationStageWaitingNode, updated.Status.Targets[0].Stage)
 	require.Equal(t, "waiting for Node machine-1 to exist", updated.Status.Targets[0].Message)
+}
+
+func TestReconcilerKeepsHostReplaceInProgressUntilCloudInitCompletes(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.Operations = &v1alpha3.OperationsSpec{RebootCounter: 4, RepaveCounter: 5}
+	machine.Status.Operations = &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5}
+	machine.Status.Conditions = []metav1.Condition{{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"}}
+	op := testOperation("op-replace-wait-cloudinit", v1alpha3.OperationHostReplace)
+	op.Spec.MachineRef = machine.Name
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef:         machine.Name,
+		Phase:              v1alpha3.OperationPhaseInProgress,
+		TargetOperations:   &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5},
+		ObservedGeneration: machine.Generation,
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}}).WithStatusSubresource(op, machine).Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var waiting v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &waiting))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, waiting.Status.Phase)
+	require.Nil(t, waiting.Status.CompletedAt)
+	require.Len(t, waiting.Status.Targets, 1)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, waiting.Status.Targets[0].Phase)
+	require.Equal(t, v1alpha3.OperationStageWaitingCloudInit, waiting.Status.Targets[0].Stage)
+	require.Equal(t, "waiting for first-boot cloud-init to complete", waiting.Status.Targets[0].Message)
+
+	recorder := &CloudInitStatusRecorder{Client: c, Now: fixedNow}
+	require.NoError(t, recorder.RecordCloudInitStatus(context.Background(), machine.Name, CloudInitSucceeded, ""))
+
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var completed v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &completed))
+	require.Equal(t, v1alpha3.OperationPhaseComplete, completed.Status.Phase)
+	require.Equal(t, v1alpha3.OperationPhaseComplete, completed.Status.Targets[0].Phase)
+}
+
+func TestReconcilerFailsHostReplaceWhenCloudInitFails(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.Operations = &v1alpha3.OperationsSpec{RebootCounter: 4, RepaveCounter: 5}
+	machine.Status.Operations = &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5}
+	machine.Status.Conditions = []metav1.Condition{{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"}}
+	op := testOperation("op-replace-cloudinit-failed", v1alpha3.OperationHostReplace)
+	op.Spec.MachineRef = machine.Name
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Conditions = []metav1.Condition{{
+		Type:    v1alpha3.MachineOperationConditionCloudInitDone,
+		Status:  metav1.ConditionFalse,
+		Reason:  "Failed",
+		Message: "Machine machine-1 first-boot cloud-init failed: modules-final failed",
+	}}
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef:         machine.Name,
+		Phase:              v1alpha3.OperationPhaseInProgress,
+		TargetOperations:   &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5},
+		ObservedGeneration: machine.Generation,
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}}).WithStatusSubresource(op, machine).Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Targets[0].Phase)
+	require.Contains(t, updated.Status.Targets[0].Message, "first-boot cloud-init failed")
 }
 
 func TestReconcilerUsesKubernetesNodeRefForHostReplaceCompletion(t *testing.T) {
@@ -322,6 +415,11 @@ func TestReconcilerUsesKubernetesNodeRefForHostReplaceCompletion(t *testing.T) {
 		Phase:              v1alpha3.OperationPhaseInProgress,
 		TargetOperations:   &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5},
 		ObservedGeneration: machine.Generation,
+	}}
+	op.Status.Conditions = []metav1.Condition{{
+		Type:   v1alpha3.MachineOperationConditionCloudInitDone,
+		Status: metav1.ConditionTrue,
+		Reason: "Succeeded",
 	}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()

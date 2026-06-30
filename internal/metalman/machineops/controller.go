@@ -371,7 +371,7 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 	case v1alpha3.OperationHostReboot:
 		return r.advanceReboot(ctx, &machine, target, now)
 	case v1alpha3.OperationHostReplace:
-		return r.advanceReplace(ctx, &machine, target, now)
+		return r.advanceReplace(ctx, op, &machine, target, now)
 	default:
 		return failTarget(target, reasonUnsupportedTarget, fmt.Sprintf("%s is not handled by metalman", op.Spec.OperationKind), now)
 	}
@@ -522,7 +522,7 @@ func (r *Reconciler) waitForPowerAction(target v1alpha3.MachineOperationTargetSt
 	return targetChange{}, false
 }
 
-func (r *Reconciler) advanceReplace(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
 	if target.TargetOperations == nil {
 		target.TargetOperations = computeReplaceTargets(machine)
 		target.Stage = v1alpha3.OperationStageRepaveRequested
@@ -548,6 +548,10 @@ func (r *Reconciler) advanceReplace(ctx context.Context, machine *v1alpha3.Machi
 		machine.Status.Operations.RebootCounter >= target.TargetOperations.RebootCounter &&
 		machine.Status.Operations.RepaveCounter >= target.TargetOperations.RepaveCounter &&
 		apimeta.IsStatusConditionTrue(machine.Status.Conditions, v1alpha3.MachineConditionRepaved) {
+		if change, done := cloudInitReplaceStatus(op, target, now); done {
+			return change
+		}
+
 		nodeName := nodeNameForMachine(machine)
 
 		var node corev1.Node
@@ -569,6 +573,24 @@ func (r *Reconciler) advanceReplace(ctx context.Context, machine *v1alpha3.Machi
 	target.Message = "waiting for PXE repave to complete"
 
 	return targetChange{target: target}
+}
+
+func cloudInitReplaceStatus(op *v1alpha3.MachineOperation, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) (targetChange, bool) {
+	cond := apimeta.FindStatusCondition(op.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+	if cond != nil {
+		if cond.Status == metav1.ConditionTrue {
+			return targetChange{}, false
+		}
+
+		if cond.Reason == "Failed" {
+			return failTarget(target, reasonExecutionFailed, cond.Message, now), true
+		}
+	}
+
+	target.Stage = v1alpha3.OperationStageWaitingCloudInit
+	target.Message = "waiting for first-boot cloud-init to complete"
+
+	return targetChange{target: target}, true
 }
 
 func nodeNameForMachine(machine *v1alpha3.Machine) string {
