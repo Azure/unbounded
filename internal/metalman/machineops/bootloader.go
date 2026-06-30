@@ -194,7 +194,7 @@ func activeOperationForMachine(ctx context.Context, c client.Client, machineName
 	candidates := make([]*v1alpha3.MachineOperation, 0, len(list.Items))
 	for i := range list.Items {
 		op := &list.Items[i]
-		if op.Status.IsTerminal() || !isHostOperation(op.Spec.OperationKind) || !operationTargetsMachine(op, machineName) {
+		if op.Status.IsTerminal() || op.Spec.OperationKind != v1alpha3.OperationHostReplace || !operationTargetsMachine(op, machineName) {
 			continue
 		}
 

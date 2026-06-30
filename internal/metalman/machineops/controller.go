@@ -69,7 +69,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/status,verbs=get
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -548,7 +548,7 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 		machine.Status.Operations.RebootCounter >= target.TargetOperations.RebootCounter &&
 		machine.Status.Operations.RepaveCounter >= target.TargetOperations.RepaveCounter &&
 		apimeta.IsStatusConditionTrue(machine.Status.Conditions, v1alpha3.MachineConditionRepaved) {
-		if change, done := cloudInitReplaceStatus(op, target, now); done {
+		if change, done := cloudInitReplaceStatus(machine, target, now); done {
 			return change
 		}
 
@@ -575,8 +575,8 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 	return targetChange{target: target}
 }
 
-func cloudInitReplaceStatus(op *v1alpha3.MachineOperation, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) (targetChange, bool) {
-	cond := apimeta.FindStatusCondition(op.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+func cloudInitReplaceStatus(machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) (targetChange, bool) {
+	cond := apimeta.FindStatusCondition(machine.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
 	if cond != nil {
 		if cond.Status == metav1.ConditionTrue {
 			return targetChange{}, false

@@ -309,3 +309,27 @@ func TestCloudInitStatusRecorderIgnoresTerminalOperation(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
 	require.Nil(t, apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone))
 }
+
+func TestPXEStatusRecordersIgnoreNonHostReplaceOperations(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	op := testOperation("op-poweron", v1alpha3.OperationHostPowerOn)
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: "machine-1",
+		Phase:      v1alpha3.OperationPhaseInProgress,
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(op).WithStatusSubresource(op).Build()
+
+	require.NoError(t, (&BootLoaderDownloadRecorder{Client: c, Now: fixedNow}).RecordBootLoaderDownloaded(context.Background(), "machine-1", "shimx64.efi"))
+	require.NoError(t, (&BootImageWriteRecorder{Client: c, Now: fixedNow}).RecordBootImageWrite(context.Background(), "machine-1", BootImageWriteFinished))
+	require.NoError(t, (&CloudInitStatusRecorder{Client: c, Now: fixedNow}).RecordCloudInitStatus(context.Background(), "machine-1", CloudInitSucceeded, ""))
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Nil(t, apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionBootLoaderDownloaded))
+	require.Nil(t, apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten))
+	require.Nil(t, apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone))
+}

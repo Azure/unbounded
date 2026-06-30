@@ -199,7 +199,7 @@ const cloudInitLastStage = "modules-final"
 // that matches the request source IP. The recorder is asynchronous in the
 // serve-pxe command, so cloud-init webhooks do not wait on Kubernetes status IO.
 func (h *HTTPServer) recordCloudInitCondition(ctx context.Context, log *slog.Logger, ip string, ev *cloudInitEvent) string {
-	if h.FileResolver.Reader == nil {
+	if h.Reader == nil {
 		return ""
 	}
 

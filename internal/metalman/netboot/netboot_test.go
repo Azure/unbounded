@@ -2851,13 +2851,3 @@ func waitForHTTP(t *testing.T, url string, timeout time.Duration) {
 
 	t.Fatalf("timed out waiting for %s", url)
 }
-
-func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {
-	for i := range conditions {
-		if conditions[i].Type == condType {
-			return &conditions[i]
-		}
-	}
-
-	return nil
-}

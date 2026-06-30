@@ -21,7 +21,10 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
-const defaultPXEStatusQueueDebounce = 250 * time.Millisecond
+const (
+	defaultPXEStatusQueueDebounce      = 250 * time.Millisecond
+	pxeStatusQueueShutdownFlushTimeout = 10 * time.Second
+)
 
 // PXEStatusQueue records PXE server progress without blocking request paths on
 // Kubernetes status writes. Calls merge in-memory updates per Machine and a
@@ -164,12 +167,14 @@ func (q *PXEStatusQueue) scheduleLocked(machineName string) {
 	}
 
 	var timer *time.Timer
+
 	timer = time.AfterFunc(delay, func() {
 		shouldAdd := false
 
 		q.mu.Lock()
 		if q.timers[machineName] == timer {
 			delete(q.timers, machineName)
+
 			shouldAdd = true
 		}
 		q.mu.Unlock()
@@ -194,14 +199,34 @@ func (q *PXEStatusQueue) shutdown() {
 		return
 	}
 
+	pending := q.drainPending()
+	if len(pending) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), pxeStatusQueueShutdownFlushTimeout)
+		defer cancel()
+
+		for machineName, update := range pending {
+			if err := q.flush(ctx, machineName, update); err != nil {
+				q.log().Error("flushing PXE status update during shutdown", "machine", machineName, "err", err)
+			}
+		}
+	}
+
+	q.workqueue.ShutDown()
+}
+
+func (q *PXEStatusQueue) drainPending() map[string]*pxeStatusPending {
 	q.mu.Lock()
+	defer q.mu.Unlock()
+
 	for machineName, timer := range q.timers {
 		timer.Stop()
 		delete(q.timers, machineName)
 	}
-	q.mu.Unlock()
 
-	q.workqueue.ShutDown()
+	pending := q.pending
+	q.pending = make(map[string]*pxeStatusPending)
+
+	return pending
 }
 
 func (q *PXEStatusQueue) runWorker(ctx context.Context) {

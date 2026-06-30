@@ -27,7 +27,17 @@ var remoteHTTPClient = &http.Client{
 }
 
 var remoteHTTPProbeClient = &http.Client{
-	Timeout: remoteHTTPProbeTimeout,
+	Transport: newRemoteHTTPProbeTransport(),
+	Timeout:   remoteHTTPProbeTimeout,
+}
+
+func newRemoteHTTPProbeTransport() http.RoundTripper {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Transport{}
+	}
+
+	return transport.Clone()
 }
 
 func downloadFromRemote(ctx context.Context, url string) (io.ReadCloser, error) {

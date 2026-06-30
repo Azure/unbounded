@@ -103,3 +103,45 @@ func TestPXEStatusQueueDebouncesPendingUpdates(t *testing.T) {
 	require.NotNil(t, pending)
 	require.Equal(t, BootImageWriteFinished, pending.bootImageStage)
 }
+
+func TestPXEStatusQueueShutdownFlushesPendingUpdates(t *testing.T) {
+	s := testScheme(t)
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-1", Generation: 7},
+		Spec: v1alpha3.MachineSpec{
+			PXE:        &v1alpha3.PXESpec{Image: "ghcr.io/test/image:v1"},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 3},
+		},
+	}
+	op := testOperation("op-queue-shutdown", v1alpha3.OperationHostReplace)
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: machine.Name,
+		Phase:      v1alpha3.OperationPhaseInProgress,
+	}}
+
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine, op).
+		WithStatusSubresource(machine, op).
+		Build()
+	queue := &PXEStatusQueue{Client: c, Now: fixedNow, Debounce: time.Hour}
+
+	require.NoError(t, queue.RecordMachineCondition(context.Background(), machine.Name, metav1.Condition{
+		Type:    v1alpha3.MachineConditionCloudInitDone,
+		Status:  metav1.ConditionTrue,
+		Reason:  "Succeeded",
+		Message: "cloud-init completed successfully",
+	}))
+	require.NoError(t, queue.RecordPXEDisabled(context.Background(), machine.Name, 3, "ghcr.io/test/image:v1"))
+	require.Zero(t, queue.workqueue.Len())
+
+	queue.shutdown()
+
+	var updated v1alpha3.Machine
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: machine.Name}, &updated))
+	require.NotNil(t, updated.Status.Operations)
+	require.Equal(t, int64(3), updated.Status.Operations.RepaveCounter)
+	require.Equal(t, metav1.ConditionTrue, apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineConditionCloudInitDone).Status)
+	require.Equal(t, metav1.ConditionTrue, apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineConditionRepaved).Status)
+}

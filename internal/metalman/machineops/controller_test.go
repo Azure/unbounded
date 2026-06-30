@@ -260,12 +260,7 @@ func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) 
 	patched.Status.Conditions = []metav1.Condition{{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"}}
 	require.NoError(t, c.Status().Update(context.Background(), &patched))
 	require.NoError(t, c.Create(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}}))
-	apimeta.SetStatusCondition(&inProgress.Status.Conditions, metav1.Condition{
-		Type:   v1alpha3.MachineOperationConditionCloudInitDone,
-		Status: metav1.ConditionTrue,
-		Reason: "Succeeded",
-	})
-	require.NoError(t, c.Status().Update(context.Background(), &inProgress))
+	markMachineCloudInit(t, c, machine.Name, metav1.ConditionTrue, "Succeeded", "cloud-init completed successfully")
 
 	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
 	require.NoError(t, err)
@@ -282,7 +277,10 @@ func TestReconcilerKeepsHostReplaceInProgressUntilNodeExists(t *testing.T) {
 	machine := testBareMetalMachine("machine-1", "rack-a")
 	machine.Spec.Operations = &v1alpha3.OperationsSpec{RebootCounter: 4, RepaveCounter: 5}
 	machine.Status.Operations = &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5}
-	machine.Status.Conditions = []metav1.Condition{{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"}}
+	machine.Status.Conditions = []metav1.Condition{
+		{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"},
+		{Type: v1alpha3.MachineConditionCloudInitDone, Status: metav1.ConditionTrue, Reason: "Succeeded"},
+	}
 	ttl := int32(0)
 	op := testOperation("op-replace-wait-node", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
@@ -293,11 +291,6 @@ func TestReconcilerKeepsHostReplaceInProgressUntilNodeExists(t *testing.T) {
 		Phase:              v1alpha3.OperationPhaseInProgress,
 		TargetOperations:   &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5},
 		ObservedGeneration: machine.Generation,
-	}}
-	op.Status.Conditions = []metav1.Condition{{
-		Type:   v1alpha3.MachineOperationConditionCloudInitDone,
-		Status: metav1.ConditionTrue,
-		Reason: "Succeeded",
 	}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
@@ -349,8 +342,7 @@ func TestReconcilerKeepsHostReplaceInProgressUntilCloudInitCompletes(t *testing.
 	require.Equal(t, v1alpha3.OperationStageWaitingCloudInit, waiting.Status.Targets[0].Stage)
 	require.Equal(t, "waiting for first-boot cloud-init to complete", waiting.Status.Targets[0].Message)
 
-	recorder := &CloudInitStatusRecorder{Client: c, Now: fixedNow}
-	require.NoError(t, recorder.RecordCloudInitStatus(context.Background(), machine.Name, CloudInitSucceeded, ""))
+	markMachineCloudInit(t, c, machine.Name, metav1.ConditionTrue, "Succeeded", "cloud-init completed successfully")
 
 	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
 	require.NoError(t, err)
@@ -368,16 +360,18 @@ func TestReconcilerFailsHostReplaceWhenCloudInitFails(t *testing.T) {
 	machine := testBareMetalMachine("machine-1", "rack-a")
 	machine.Spec.Operations = &v1alpha3.OperationsSpec{RebootCounter: 4, RepaveCounter: 5}
 	machine.Status.Operations = &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5}
-	machine.Status.Conditions = []metav1.Condition{{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"}}
+	machine.Status.Conditions = []metav1.Condition{
+		{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"},
+		{
+			Type:    v1alpha3.MachineConditionCloudInitDone,
+			Status:  metav1.ConditionFalse,
+			Reason:  "Failed",
+			Message: "Machine machine-1 first-boot cloud-init failed: modules-final failed",
+		},
+	}
 	op := testOperation("op-replace-cloudinit-failed", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
 	op.Status.Phase = v1alpha3.OperationPhaseInProgress
-	op.Status.Conditions = []metav1.Condition{{
-		Type:    v1alpha3.MachineOperationConditionCloudInitDone,
-		Status:  metav1.ConditionFalse,
-		Reason:  "Failed",
-		Message: "Machine machine-1 first-boot cloud-init failed: modules-final failed",
-	}}
 	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
 		MachineRef:         machine.Name,
 		Phase:              v1alpha3.OperationPhaseInProgress,
@@ -406,7 +400,10 @@ func TestReconcilerUsesKubernetesNodeRefForHostReplaceCompletion(t *testing.T) {
 	machine.Spec.Kubernetes = &v1alpha3.KubernetesSpec{NodeRef: &v1alpha3.LocalObjectReference{Name: "custom-node"}}
 	machine.Spec.Operations = &v1alpha3.OperationsSpec{RebootCounter: 4, RepaveCounter: 5}
 	machine.Status.Operations = &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5}
-	machine.Status.Conditions = []metav1.Condition{{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"}}
+	machine.Status.Conditions = []metav1.Condition{
+		{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"},
+		{Type: v1alpha3.MachineConditionCloudInitDone, Status: metav1.ConditionTrue, Reason: "Succeeded"},
+	}
 	op := testOperation("op-replace-custom-node", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
 	op.Status.Phase = v1alpha3.OperationPhaseInProgress
@@ -415,11 +412,6 @@ func TestReconcilerUsesKubernetesNodeRefForHostReplaceCompletion(t *testing.T) {
 		Phase:              v1alpha3.OperationPhaseInProgress,
 		TargetOperations:   &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5},
 		ObservedGeneration: machine.Generation,
-	}}
-	op.Status.Conditions = []metav1.Condition{{
-		Type:   v1alpha3.MachineOperationConditionCloudInitDone,
-		Status: metav1.ConditionTrue,
-		Reason: "Succeeded",
 	}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
@@ -440,6 +432,64 @@ func TestReconcilerUsesKubernetesNodeRefForHostReplaceCompletion(t *testing.T) {
 	var completed v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &completed))
 	require.Equal(t, v1alpha3.OperationPhaseComplete, completed.Status.Phase)
+}
+
+func TestReconcilerTracksHostReplaceCloudInitPerMachine(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machineA := testBareMetalMachine("machine-a", "rack-a")
+	machineA.Spec.Operations = &v1alpha3.OperationsSpec{RebootCounter: 4, RepaveCounter: 5}
+	machineA.Status.Operations = &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5}
+	machineA.Status.Conditions = []metav1.Condition{
+		{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"},
+		{Type: v1alpha3.MachineConditionCloudInitDone, Status: metav1.ConditionTrue, Reason: "Succeeded"},
+	}
+	machineB := testBareMetalMachine("machine-b", "rack-a")
+	machineB.Spec.Operations = &v1alpha3.OperationsSpec{RebootCounter: 4, RepaveCounter: 5}
+	machineB.Status.Operations = &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5}
+	machineB.Status.Conditions = []metav1.Condition{{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded"}}
+	op := testOperation("op-replace-multi", v1alpha3.OperationHostReplace)
+	op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{
+		{
+			MachineRef:       machineA.Name,
+			Phase:            v1alpha3.OperationPhaseInProgress,
+			TargetOperations: &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5},
+		},
+		{
+			MachineRef:       machineB.Name,
+			Phase:            v1alpha3.OperationPhaseInProgress,
+			TargetOperations: &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(
+			machineA,
+			machineB,
+			op,
+			testRedfishSecret(),
+			&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machineA.Name}},
+			&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machineB.Name}},
+		).
+		WithStatusSubresource(machineA, machineB, op).
+		Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+	require.Len(t, updated.Status.Targets, 2)
+	require.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Targets[0].Phase)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[1].Phase)
+	require.Equal(t, v1alpha3.OperationStageWaitingCloudInit, updated.Status.Targets[1].Stage)
+	require.Equal(t, "waiting for first-boot cloud-init to complete", updated.Status.Targets[1].Message)
 }
 
 func TestReconcilerWaitsForOlderOperation(t *testing.T) {
@@ -571,6 +621,21 @@ func testRedfishSecret() *corev1.Secret {
 		ObjectMeta: metav1.ObjectMeta{Name: "redfish", Namespace: "unbounded-kube"},
 		Data:       map[string][]byte{"password": []byte("secret")},
 	}
+}
+
+func markMachineCloudInit(t *testing.T, c client.Client, machineName string, status metav1.ConditionStatus, reason, message string) {
+	t.Helper()
+
+	var machine v1alpha3.Machine
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: machineName}, &machine))
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               v1alpha3.MachineConditionCloudInitDone,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: machine.Generation,
+	})
+	require.NoError(t, c.Status().Update(context.Background(), &machine))
 }
 
 func fixedNow() metav1.Time {
