@@ -59,6 +59,7 @@ QGA_SOCK = TMPDIR / "qga.sock"
 # The nspawn machine name used by the agent (must match the constant in
 # cmd/agent/internal/goalstates/constants.go - NSpawnMachineKube1).
 NSPAWN_MACHINE = "kube1"
+EXPECTED_NODE_ARCH = ""
 
 KUBECTL = "kubectl"
 VIRSH = ["virsh", "--connect", "qemu:///system"]
@@ -78,6 +79,65 @@ def die(msg: str) -> None:
     except Exception as e:
         log(f"  (debug log collection failed: {e})")
     sys.exit(1)
+
+
+def normalize_arch(arch: str) -> str:
+    arch = arch.lower()
+    if arch in ("amd64", "x86_64"):
+        return "amd64"
+    if arch in ("arm64", "aarch64"):
+        return "arm64"
+    die(f"Unsupported smoke test architecture {arch!r}")
+    raise AssertionError("unreachable")
+
+
+def expected_node_arch() -> str:
+    global EXPECTED_NODE_ARCH
+    if EXPECTED_NODE_ARCH == "":
+        EXPECTED_NODE_ARCH = normalize_arch(
+            os.environ.get("SMOKE_METALMAN_NODE_ARCH", os.uname().machine),
+        )
+    return EXPECTED_NODE_ARCH
+
+
+def libvirt_arch() -> str:
+    return {
+        "amd64": "x86_64",
+        "arm64": "aarch64",
+    }[expected_node_arch()]
+
+
+def _first_existing(paths: list[str]) -> str:
+    for path in paths:
+        if Path(path).exists():
+            return path
+    die(f"None of the expected files exist: {', '.join(paths)}")
+    raise AssertionError("unreachable")
+
+
+def uefi_firmware_paths() -> tuple[str, str]:
+    if expected_node_arch() == "arm64":
+        return (
+            _first_existing([
+                "/usr/share/AAVMF/AAVMF_CODE.fd",
+                "/usr/share/AAVMF/AAVMF_CODE.ms.fd",
+            ]),
+            _first_existing([
+                "/usr/share/AAVMF/AAVMF_VARS.fd",
+                "/usr/share/AAVMF/AAVMF_VARS.ms.fd",
+            ]),
+        )
+
+    return (
+        _first_existing([
+            "/usr/share/OVMF/OVMF_CODE_4M.fd",
+            "/usr/share/OVMF/OVMF_CODE.fd",
+        ]),
+        _first_existing([
+            "/usr/share/OVMF/OVMF_VARS_4M.fd",
+            "/usr/share/OVMF/OVMF_VARS.fd",
+        ]),
+    )
 
 
 def run(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
@@ -703,6 +763,22 @@ def assert_node_label(name: str, key: str, value: str) -> None:
     log(f"  Node '{name}' has label {key}={value}")
 
 
+def assert_node_arch(name: str) -> None:
+    want = expected_node_arch()
+    result = subprocess.run(
+        [KUBECTL, "get", "node", name, "-o", "jsonpath={.status.nodeInfo.architecture}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        die(f"Failed to read Node '{name}' architecture: {result.stderr.strip()}")
+
+    got = result.stdout.strip()
+    if got != want:
+        die(f"Node '{name}' architecture = {got!r}, want {want!r}")
+
+    log(f"  Node '{name}' reports architecture {got}")
+
+
 def assert_cloud_init_done(timeout: int = 900) -> None:
     """Assert the Machine's CloudInitDone condition reaches True/Succeeded.
 
@@ -837,6 +913,8 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sigint_handler)
     atexit.register(cleanup)
 
+    log(f"Running metalman smoke test for {expected_node_arch()}")
+
     log("Cleaning up stale libvirt resources")
     clean_libvirt()
 
@@ -913,17 +991,19 @@ def main() -> None:
              "--type=strategic", "-p", patch])
 
     log("Creating UEFI VM (powered off, with TPM)")
+    uefi_code, uefi_vars_template = uefi_firmware_paths()
     ovmf_vars = TMPDIR / "OVMF_VARS.fd"
-    shutil.copy2("/usr/share/OVMF/OVMF_VARS_4M.fd", ovmf_vars)
+    shutil.copy2(uefi_vars_template, ovmf_vars)
     disk = str(TMPDIR / "disk.qcow2")
     run_quiet(["qemu-img", "create", "-f", "qcow2", disk, "20G"], check=True)
     run_quiet([
         "virt-install",
         "--connect", "qemu:///system",
+        "--arch", libvirt_arch(),
         "--name", VM_NAME, "--ram", "4096", "--vcpus", "2",
         "--disk", f"path={disk},format=qcow2,bus=virtio",
         "--network", f"network={NET_NAME},mac={MAC_ADDRESS}",
-        "--boot", f"uefi,loader=/usr/share/OVMF/OVMF_CODE_4M.fd,nvram={ovmf_vars},hd,network",
+        "--boot", f"uefi,loader={uefi_code},nvram={ovmf_vars},hd,network",
         "--tpm", "backend.type=emulator,backend.version=2.0",
         "--serial", f"unix,path={SERIAL_SOCK},mode=bind",
         "--channel", f"unix,path={QGA_SOCK},mode=bind,target.type=virtio,target.name=org.qemu.guest_agent.0",
@@ -1119,6 +1199,7 @@ def main() -> None:
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
     assert_node_ready(NODE_NAME, timeout=720)
+    assert_node_arch(NODE_NAME)
     assert_node_label(NODE_NAME, NODE_LABEL_KEY, NODE_LABEL_VALUE)
 
     run_operation_smoke_suite()

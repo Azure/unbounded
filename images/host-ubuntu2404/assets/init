@@ -240,17 +240,25 @@ if [ -d /sys/firmware/efi ]; then
     done
 
     if [ -n "$ESP_PART" ] && command -v efibootmgr >/dev/null 2>&1; then
-        # Verify shimx64.efi exists on the ESP before creating the entry.
+        # Verify a known Ubuntu EFI loader exists on the ESP before creating
+        # the entry. Ubuntu uses architecture-specific shim/default names.
         mkdir -p /mnt/esp
         if mount -t vfat "$ESP_PART" /mnt/esp 2>/dev/null; then
-            if [ -f /mnt/esp/EFI/ubuntu/shimx64.efi ]; then
-                LOADER='\EFI\ubuntu\shimx64.efi'
-            elif [ -f /mnt/esp/EFI/BOOT/BOOTX64.EFI ]; then
-                LOADER='\EFI\BOOT\BOOTX64.EFI'
-            else
-                LOADER=""
-                log "WARNING: no EFI bootloader found on ESP"
-            fi
+            LOADER=""
+            for candidate in \
+                '\EFI\ubuntu\shimx64.efi' \
+                '\EFI\ubuntu\grubx64.efi' \
+                '\EFI\ubuntu\shimaa64.efi' \
+                '\EFI\ubuntu\grubaa64.efi' \
+                '\EFI\BOOT\BOOTX64.EFI' \
+                '\EFI\BOOT\BOOTAA64.EFI'; do
+                path=$(echo "$candidate" | tr '\\' '/')
+                if [ -f "/mnt/esp${path}" ]; then
+                    LOADER="$candidate"
+                    break
+                fi
+            done
+            [ -n "$LOADER" ] || log "WARNING: no EFI bootloader found on ESP"
             umount /mnt/esp
 
             if [ -n "$LOADER" ]; then

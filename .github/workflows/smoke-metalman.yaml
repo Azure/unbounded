@@ -11,7 +11,11 @@ on:
       - internal/metalman/**
       - api/machina/v1alpha3/**
       - deploy/machina/crd/**
+      - images/host-ubuntu2404/**
       - images/agent-ubuntu2404/**
+      - hack/smoke-metalman.py
+      - hack/kind-smoke-config.yaml
+      - .github/workflows/smoke-metalman.yaml
   push:
     branches: [main]
     paths:
@@ -20,7 +24,11 @@ on:
       - internal/metalman/**
       - api/machina/v1alpha3/**
       - deploy/machina/crd/**
+      - images/host-ubuntu2404/**
       - images/agent-ubuntu2404/**
+      - hack/smoke-metalman.py
+      - hack/kind-smoke-config.yaml
+      - .github/workflows/smoke-metalman.yaml
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
@@ -28,10 +36,29 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: smoke-metalman-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   smoke:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    name: Smoke (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            firmware_package: ovmf
+            qemu_package: qemu-kvm
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            firmware_package: qemu-efi-aarch64
+            qemu_package: qemu-system-arm
     steps:
       - name: Free disk space
         run: |
@@ -63,8 +90,8 @@ jobs:
         uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: /var/cache/apt/archives
-          key: apt-smoke-noble-${{ hashFiles('.github/workflows/smoke-metalman.yaml') }}
-          restore-keys: apt-smoke-noble-
+          key: apt-smoke-noble-${{ matrix.arch }}-${{ hashFiles('.github/workflows/smoke-metalman.yaml') }}
+          restore-keys: apt-smoke-noble-${{ matrix.arch }}-
 
       - name: Install system dependencies
         run: |
@@ -75,8 +102,8 @@ jobs:
           sudo pip3 install --break-system-packages --ignore-installed sushy-tools &
           PIP_PID=$!
           sudo apt-get install -y --no-install-recommends \
-            dnsmasq qemu-kvm libvirt-daemon-system libvirt-clients virtinst \
-            ovmf qemu-utils swtpm swtpm-tools \
+            dnsmasq ${{ matrix.qemu_package }} libvirt-daemon-system libvirt-clients virtinst \
+            ${{ matrix.firmware_package }} qemu-utils swtpm swtpm-tools \
             python3-pip python3-yaml cpio iptables
           sudo systemctl start libvirtd
           wait "$PIP_PID"
@@ -91,10 +118,11 @@ jobs:
         with:
           context: .
           file: images/host-ubuntu2404/Containerfile
+          platforms: ${{ matrix.platform }}
           load: true
           tags: localhost:5555/unbounded/host-ubuntu2404:smoke
-          cache-from: type=gha,scope=host-ubuntu2404
-          cache-to: type=gha,mode=max,scope=host-ubuntu2404
+          cache-from: type=gha,scope=host-ubuntu2404-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=host-ubuntu2404-${{ matrix.arch }}
           provenance: false
 
       - name: Build agent-ubuntu2404 image
@@ -102,10 +130,11 @@ jobs:
         with:
           context: images/agent-ubuntu2404
           file: images/agent-ubuntu2404/Containerfile
+          platforms: ${{ matrix.platform }}
           load: true
           tags: localhost:5555/unbounded/agent-ubuntu2404:smoke
-          cache-from: type=gha,scope=agent-ubuntu2404
-          cache-to: type=gha,mode=max,scope=agent-ubuntu2404
+          cache-from: type=gha,scope=agent-ubuntu2404-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=agent-ubuntu2404-${{ matrix.arch }}
           provenance: false
 
       - name: Create kind cluster
@@ -119,6 +148,8 @@ jobs:
           config: hack/kind-smoke-config.yaml
 
       - name: Run smoke test
+        env:
+          SMOKE_METALMAN_NODE_ARCH: ${{ matrix.arch }}
         run: |
           sudo mkdir -p /root/.kube
           sudo cp "${KUBECONFIG:-$HOME/.kube/config}" /root/.kube/config
