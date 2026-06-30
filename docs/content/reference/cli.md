@@ -81,9 +81,15 @@ Earlier releases installed components across `unbounded-kube` (machina,
 metalman, storage) and `unbounded-net` (net). Everything now consolidates onto a
 single `unbounded-system` namespace.
 
-For an existing cluster, start `unbounded-operator` with
-`--reap-legacy-resources` (off by default). After the new `unbounded-system`
-workloads report healthy, the operator:
+For an existing cluster, the operator performs the migration in one of two ways
+(both run the same copy/rewrite/reap logic):
+
+- **Always-on:** start `unbounded-operator` with `--reap-legacy-resources` (off
+  by default); it migrates continuously in the background.
+- **One-shot:** run `unbounded-operator migrate-legacy` (e.g. as a Job) to
+  migrate once and exit.
+
+After the new `unbounded-system` workloads report healthy, the operator:
 
 1. copies non-regenerable state (user/operator Secrets and the `machina-config`
    ConfigMap) into `unbounded-system`, skipping auto-managed and regenerable
