@@ -154,6 +154,21 @@ def run_quiet(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, stdout=DEVNULL, stderr=DEVNULL, **kw)
 
 
+def run_capture(args: list[str]) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if result.returncode != 0:
+        if result.stdout:
+            sys.stderr.write(result.stdout)
+        raise subprocess.CalledProcessError(result.returncode, args, output=result.stdout)
+
+    return result
+
+
 def _forward_lines(stream: Any, log_file: Any) -> None:
     """Read lines from *stream*, write to both *log_file* and stderr."""
     for line in stream:
@@ -998,6 +1013,8 @@ def main() -> None:
 
     log("Creating UEFI VM (powered off, with TPM)")
     uefi_code, uefi_vars_template = uefi_firmware_paths()
+    log(f"  UEFI loader: {uefi_code}")
+    log(f"  UEFI vars template: {uefi_vars_template}")
     ovmf_vars = TMPDIR / "OVMF_VARS.fd"
     shutil.copy2(uefi_vars_template, ovmf_vars)
     disk = str(TMPDIR / "disk.qcow2")
@@ -1005,8 +1022,12 @@ def main() -> None:
     virt_type = libvirt_type()
     if virt_type == "qemu":
         log("/dev/kvm is unavailable; creating VM with QEMU TCG")
-    run_quiet([
+    tpm_arg = "backend.type=emulator,backend.version=2.0"
+    if expected_node_arch() == "arm64":
+        tpm_arg = f"model=tpm-crb,{tpm_arg}"
+    virt_install_args = [
         "virt-install",
+        "--debug",
         "--connect", "qemu:///system",
         "--arch", libvirt_arch(),
         "--virt-type", virt_type,
@@ -1014,12 +1035,17 @@ def main() -> None:
         "--disk", f"path={disk},format=qcow2,bus=virtio",
         "--network", f"network={NET_NAME},mac={MAC_ADDRESS}",
         "--boot", f"uefi,loader={uefi_code},nvram={ovmf_vars},hd,network",
-        "--tpm", "backend.type=emulator,backend.version=2.0",
+        "--tpm", tpm_arg,
         "--serial", f"unix,path={SERIAL_SOCK},mode=bind",
         "--channel", f"unix,path={QGA_SOCK},mode=bind,target.type=virtio,target.name=org.qemu.guest_agent.0",
         "--os-variant", "generic",
         "--noautoconsole", "--noreboot", "--import",
-    ], check=True)
+    ]
+    if expected_node_arch() == "arm64":
+        virt_install_args.extend(["--machine", "virt"])
+        if virt_type == "qemu":
+            virt_install_args.extend(["--cpu", "max"])
+    run_capture(virt_install_args)
     run_quiet([*VIRSH, "destroy", VM_NAME])
 
     log("Starting serial console forwarding")
