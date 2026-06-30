@@ -518,6 +518,7 @@ mod tests {
                 self_peer_id,
                 self_tags: Vec::new(),
                 routing_plan: None,
+                topology_weighting: None,
                 peers: Vec::new(),
             },
             frontends: HashMap::new(),

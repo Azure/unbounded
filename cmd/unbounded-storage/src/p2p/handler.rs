@@ -736,7 +736,7 @@ mod tests {
     #[test]
     fn classify_single_node_owns_everything() {
         let local = peer(1);
-        let fingers = FingerTable::build(local.clone(), &[], FingerTableConfig { k: 8 });
+        let fingers = FingerTable::build(local.clone(), &[], FingerTableConfig::with_k(8));
         for target in [0u64, 1, 999, u64::MAX] {
             let r = classify(
                 &fingers,
@@ -754,7 +754,7 @@ mod tests {
         let fingers = FingerTable::build(
             local,
             std::slice::from_ref(&other),
-            FingerTableConfig { k: 8 },
+            FingerTableConfig::with_k(8),
         );
         let target = stripe_to_ring(key_for_ring(other.ring.0));
         assert_eq!(classify(&fingers, target, 5), Route::Forward);
@@ -767,7 +767,7 @@ mod tests {
         let fingers = FingerTable::build(
             local,
             std::slice::from_ref(&other),
-            FingerTableConfig { k: 8 },
+            FingerTableConfig::with_k(8),
         );
         let target = stripe_to_ring(key_for_ring(other.ring.0));
         assert_eq!(classify(&fingers, target, 0), Route::HopLimit);

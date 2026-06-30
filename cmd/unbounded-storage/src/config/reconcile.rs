@@ -14,10 +14,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::fabric::PeerId;
-use crate::fabric::{ConnectionSpec, Fabric, FabricError};
 use super::apply::peer_spec_to_connection;
 use super::schema::{BackendSpec, FrontendSpec, PeerSpec};
+use crate::fabric::PeerId;
+use crate::fabric::{ConnectionSpec, Fabric, FabricError};
 
 pub trait PeerReconcileTarget {
     fn list(&self) -> Vec<PeerId>;
