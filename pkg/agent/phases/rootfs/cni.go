@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
@@ -19,10 +20,6 @@ import (
 const (
 	// cniBinDir is the standard CNI binary directory relative to the machine root.
 	cniBinDir = "opt/cni/bin"
-
-	// cniPluginsDefaultBaseURL is the upstream base URL for CNI plugin
-	// releases. Mirrors must preserve the <base>/v<ver>/<asset> layout.
-	cniPluginsDefaultBaseURL = "https://github.com/containernetworking/plugins/releases/download"
 )
 
 // requiredCNIPlugins lists the CNI plugins that must be present for a valid installation.
@@ -83,16 +80,7 @@ func (d *downloadCNIBinaries) Do(ctx context.Context) error {
 // cniDownloadURL resolves the CNI plugins tarball URL honoring the
 // optional override. Mirrors must publish under <base>/v<ver>/<asset>.
 func cniDownloadURL(override *goalstates.DownloadSource, version, arch string) string {
-	if override != nil && override.URL != "" {
-		return fmt.Sprintf(override.URL, version, arch, version)
-	}
-
-	base := cniPluginsDefaultBaseURL
-	if override != nil && override.BaseURL != "" {
-		base = strings.TrimRight(override.BaseURL, "/")
-	}
-
-	return fmt.Sprintf("%s/v%s/cni-plugins-linux-%s-v%s.tgz", base, version, arch, version)
+	return agentartifacts.CNIPluginsArchive(override, version, arch)
 }
 
 // hasRequiredCNIPlugins checks if all required CNI plugins are installed and executable.

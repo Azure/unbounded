@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
@@ -17,16 +18,8 @@ import (
 )
 
 const (
-	// containerdDefaultBaseURL is the upstream base URL for containerd releases.
-	// Mirrors must preserve the <base>/v<ver>/<asset> layout.
-	containerdDefaultBaseURL = "https://github.com/containerd/containerd/releases/download"
-
 	// containerdTarPrefix is the path prefix for binaries within the containerd tar archive.
 	containerdTarPrefix = "bin/"
-
-	// runcDefaultBaseURL is the upstream base URL for runc releases.
-	// Mirrors must preserve the <base>/v<ver>/<asset> layout.
-	runcDefaultBaseURL = "https://github.com/opencontainers/runc/releases/download"
 )
 
 // containerdBinaries lists all binaries included in containerd releases.
@@ -97,31 +90,13 @@ func (d *downloadCRIBinaries) Do(ctx context.Context) error {
 // (containerd-<ver>-linux-<arch>.tar.gz) is preserved so mirrors must
 // publish under the same structure.
 func containerdDownloadURL(override *goalstates.DownloadSource, version, arch string) string {
-	if override != nil && override.URL != "" {
-		return fmt.Sprintf(override.URL, version, version, arch)
-	}
-
-	base := containerdDefaultBaseURL
-	if override != nil && override.BaseURL != "" {
-		base = strings.TrimRight(override.BaseURL, "/")
-	}
-
-	return fmt.Sprintf("%s/v%s/containerd-%s-linux-%s.tar.gz", base, version, version, arch)
+	return agentartifacts.ContainerdArchive(override, version, arch)
 }
 
 // runcDownloadURL resolves the runc binary URL, honoring BaseURL / URL
 // overrides. The upstream filename (runc.<arch>) is preserved.
 func runcDownloadURL(override *goalstates.DownloadSource, version, arch string) string {
-	if override != nil && override.URL != "" {
-		return fmt.Sprintf(override.URL, version, arch)
-	}
-
-	base := runcDefaultBaseURL
-	if override != nil && override.BaseURL != "" {
-		base = strings.TrimRight(override.BaseURL, "/")
-	}
-
-	return fmt.Sprintf("%s/v%s/runc.%s", base, version, arch)
+	return agentartifacts.RuncBinary(override, version, arch)
 }
 
 // downloadContainerd downloads and extracts containerd binaries from a tar.gz archive.
