@@ -64,6 +64,7 @@ RUN mkdir -p /artifacts && \
         curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
             -o /tmp/netboot.tar.gz "${NETBOOT_URL}" && \
         tar -xzf /tmp/netboot.tar.gz -C /tmp && \
+        chmod 1777 /tmp && \
         cp /tmp/arm64/bootaa64.efi   /artifacts/shimaa64.efi && \
         cp /tmp/arm64/grubaa64.efi   /artifacts/grubaa64.efi && \
         cp /tmp/arm64/initrd          /artifacts/initrd && \
