@@ -1,0 +1,51 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: unbounded namespace-migration smoke test
+
+# Validates hack/scripts/migrate-namespace.sh end-to-end on kind: stages a
+# simulated legacy (unbounded-kube / unbounded-net) install, runs the migration,
+# and asserts the cluster ends up consolidated on unbounded-system with operator
+# state preserved and the old namespaces gone. See hack/smoke-namespace-migration.py.
+on:
+  pull_request:
+    paths:
+      - hack/scripts/migrate-namespace.sh
+      - hack/smoke-namespace-migration.py
+      - .github/workflows/smoke-namespace-migration.yaml
+      - hack/cmd/render-manifests/**
+      - deploy/machina/**
+      - deploy/net/**
+  push:
+    branches: [main]
+    paths:
+      - hack/scripts/migrate-namespace.sh
+      - hack/smoke-namespace-migration.py
+      - .github/workflows/smoke-namespace-migration.yaml
+      - hack/cmd/render-manifests/**
+      - deploy/machina/**
+      - deploy/net/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        # The harness manages its own kind cluster lifecycle; we only need the
+        # binary. kubectl and docker are preinstalled on the runner image.
+        run: go install sigs.k8s.io/kind@v0.29.0
+
+      - name: Run namespace-migration smoke test
+        run: python3 hack/smoke-namespace-migration.py --scenario all
