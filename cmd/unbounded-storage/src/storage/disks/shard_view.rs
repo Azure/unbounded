@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::bufferpool::{BlockStore, Error, PageRef, Req};
+use crate::bufferpool::{BlockStore, Error, PageCachePolicy, PageRef, Req};
 use crate::storage::PageChannel;
 use crate::storage::disk_for;
 
@@ -54,8 +54,13 @@ pub struct CacheDirectorySet {
 /// cache's own [`DiskChannelDirectory`] and replay state.
 pub struct ChainLocalStore {
     directories: Arc<CacheDirectorySet>,
-    stores: Mutex<HashMap<String, Arc<LiveShardLocalStore>>>,
+    stores: Mutex<HashMap<String, StoreEntry>>,
     registered: Mutex<Vec<RegisteredBacking>>,
+}
+
+struct StoreEntry {
+    directory: Arc<DiskChannelDirectory>,
+    store: Arc<LiveShardLocalStore>,
 }
 
 struct RegisteredBacking {
@@ -134,7 +139,12 @@ impl CacheDirectorySet {
     pub fn apply_channels(
         &self,
         cache_id: &str,
-        channels: Vec<(std::path::PathBuf, crate::storage::PageChannel, Option<u16>)>,
+        channels: Vec<(
+            std::path::PathBuf,
+            crate::storage::PageChannel,
+            Option<u16>,
+            bool,
+        )>,
     ) {
         self.get_or_create(cache_id).apply_channels(channels);
     }
@@ -157,12 +167,14 @@ impl ChainLocalStore {
     }
 
     fn store_for(&self, cache_id: &str) -> Arc<LiveShardLocalStore> {
-        let mut guard = self.stores.lock().unwrap();
-        if let Some(store) = guard.get(cache_id) {
-            return store.clone();
-        }
         let directory = self.directories.get_or_create(cache_id);
-        let store = Arc::new(LiveShardLocalStore::new(directory));
+        let mut guard = self.stores.lock().unwrap();
+        if let Some(entry) = guard.get(cache_id) {
+            if Arc::ptr_eq(&entry.directory, &directory) {
+                return entry.store.clone();
+            }
+        }
+        let store = Arc::new(LiveShardLocalStore::new(directory.clone()));
         for backing in self.registered.lock().unwrap().iter() {
             let backing = crate::memory::Backing {
                 base: backing.base,
@@ -172,7 +184,13 @@ impl ChainLocalStore {
             };
             let _ = store.register_pages(&backing);
         }
-        guard.insert(cache_id.to_string(), store.clone());
+        guard.insert(
+            cache_id.to_string(),
+            StoreEntry {
+                directory,
+                store: store.clone(),
+            },
+        );
         store
     }
 }
@@ -190,10 +208,9 @@ impl LiveShardLocalStore {
         }
     }
 
-    /// Record `backing` and register the full set of recorded
-    /// backings against every channel in the currently-published set
-    /// (if any). Subsequent directory swaps replay the same set
-    /// against the new channels.
+    /// Record this shard's single backing and register it against every
+    /// channel in the currently-published set (if any). Subsequent
+    /// directory swaps replay the same backing against the new channels.
     pub fn register_backing(&self, backing: &crate::memory::Backing) -> Result<(), Error> {
         let entry = ShardBacking {
             base: backing.base,
@@ -202,21 +219,12 @@ impl LiveShardLocalStore {
         };
         {
             let mut guard = self.state.lock().unwrap();
-            // INVARIANT: every backing a shard registers must share
-            // page geometry. `resolve` addresses pages using a single
-            // backing's `page_size`/`page_count`, and a `PageRef`
-            // carries no backing identity, so a second backing with
-            // different geometry would make that pointer math wrong by
-            // construction. Reject it loudly here instead of silently
-            // shadowing the first via `.last()` on the unsafe path.
-            if let Some(existing) = guard.registered.first() {
-                if existing.page_size != entry.page_size || existing.page_count != entry.page_count
-                {
-                    return Err(Error::BadConfig(
-                        "register_backing: backing geometry differs from \
-                         the backing already registered for this shard",
-                    ));
-                }
+            // A PageRef carries no backing identity, so the live view can
+            // only resolve pages safely against one registered backing.
+            if !guard.registered.is_empty() {
+                return Err(Error::BadConfig(
+                    "register_backing: shard view already has a registered backing",
+                ));
             }
             guard.registered.push(entry);
             // Force a replay even if the generation matches what we
@@ -228,24 +236,24 @@ impl LiveShardLocalStore {
         Ok(())
     }
 
-    /// Resolve the currently-published channel set, replaying every
+    /// Resolve the currently-published channel set, replaying the
     /// registered backing against every channel if the directory
     /// generation has advanced since we last replayed. The snapshot
     /// and its publishing generation come from a single
     /// [`DiskChannelDirectory::snapshot`] load, so the pair is
     /// consistent. Returns `None` when the directory has no channels.
-    fn current_or_replay(&self) -> Option<Arc<Vec<PageChannel>>> {
-        let (channels, gen_n) = self.directory.snapshot();
-        let channels = channels?;
+    fn current_or_replay(&self) -> Option<Arc<super::channels::ChannelSet>> {
+        let (set, gen_n) = self.directory.snapshot();
+        let set = set?;
         let mut guard = self.state.lock().unwrap();
         if guard.last_seen_generation != Some(gen_n) {
-            Self::replay_locked(&channels, &guard.registered);
+            Self::replay_locked(&set.channels, &guard.registered);
             guard.last_seen_generation = Some(gen_n);
         }
-        Some(channels)
+        Some(set)
     }
 
-    /// Re-register every recorded backing against every channel.
+    /// Re-register the recorded backing against every channel.
     /// Errors are logged and swallowed: a single bad registration
     /// must not prevent the rest of the set from being seated.
     fn replay_locked(channels: &[PageChannel], backings: &[ShardBacking]) {
@@ -263,30 +271,18 @@ impl LiveShardLocalStore {
     ///
     /// INVARIANT: a shard registers exactly one backing. A `PageRef`
     /// carries no backing identity, so this pointer math is only
-    /// correct against a single backing: with more than one distinct
-    /// backing a `page_idx` would address the wrong region (silent
-    /// memory corruption). We therefore refuse to guess with `.last()`.
+    /// correct against a single backing.
     ///
     /// - Zero backings registered (channels were published before
     ///   [`Self::register_backing`] ran) is a recoverable runtime race:
     ///   fail the I/O with `ENXIO` rather than panicking the storage
     ///   core.
-    /// - More than one backing is an unenforced-invariant bug on an
-    ///   unsafe path, not a runtime condition, so we panic with a clear
-    ///   message. `register_backing` only admits additional backings
-    ///   with identical geometry, but even identical geometry does not
-    ///   make `.last()` safe here, because the base pointers differ.
     fn resolve(&self, page: PageRef) -> Result<(*mut u8, usize), Error> {
         let guard = self.state.lock().unwrap();
         let b = match guard.registered.as_slice() {
             [] => return Err(Error::Io(libc::ENXIO)),
             [only] => *only,
-            many => panic!(
-                "LiveShardLocalStore::resolve requires exactly one \
-                 registered backing, found {}; a PageRef cannot select \
-                 among multiple backings",
-                many.len()
-            ),
+            _ => return Err(Error::BadConfig("multiple registered backings")),
         };
         debug_assert!((page.page_idx as usize) < b.page_count);
         // SAFETY: `page_idx < page_count` (debug-asserted) and the
@@ -324,12 +320,14 @@ impl BlockStore for LiveShardLocalStore {
         // directory generation bump only invalidates the buffer cache,
         // not on-disk placement: changing the open-disk set is NOT a
         // data-preserving operation.
-        let idx = disk_for(&key, stripe_off, channels.len());
+        let idx = disk_for(&key, stripe_off, channels.channels.len());
         let slice = std::ptr::slice_from_raw_parts_mut(p, len);
         // SAFETY: `resolve` produced an in-bounds pointer into the
         // shard's pinned backing; the pool guarantees the page is not
         // aliased for the duration of this future.
-        channels[idx].read_page(key, stripe_off, slice).await
+        channels.channels[idx]
+            .read_page(key, stripe_off, slice)
+            .await
     }
 
     async fn write_page<R: Req + ?Sized>(
@@ -347,25 +345,58 @@ impl BlockStore for LiveShardLocalStore {
         // means changing the set of open disks repartitions placement;
         // stripes written under a different open-disk count become
         // unreachable. Changing the open-disk set is NOT data-preserving.
-        let idx = disk_for(&key, stripe_off, channels.len());
+        let idx = disk_for(&key, stripe_off, channels.channels.len());
         let slice = std::ptr::slice_from_raw_parts(p.cast_const(), len);
         // SAFETY: see `read_page` above.
-        channels[idx].write_page(key, stripe_off, slice).await
+        channels.channels[idx]
+            .write_page(key, stripe_off, slice)
+            .await
     }
 }
 
 impl BlockStore for ChainLocalStore {
     fn register_pages(&self, backing: &crate::memory::Backing) -> Result<(), Error> {
-        self.registered.lock().unwrap().push(RegisteredBacking {
+        let mut registered = self.registered.lock().unwrap();
+        if !registered.is_empty() {
+            return Err(Error::BadConfig(
+                "register_pages: chain store already has a registered backing",
+            ));
+        }
+        registered.push(RegisteredBacking {
             base: backing.base,
             page_size: backing.page_size,
             page_count: backing.page_count,
             keepalive: backing.keepalive.clone(),
         });
-        for store in self.stores.lock().unwrap().values() {
-            store.register_pages(backing)?;
+        drop(registered);
+        for entry in self.stores.lock().unwrap().values() {
+            entry.store.register_pages(backing)?;
         }
         Ok(())
+    }
+
+    fn page_cache_enabled<R: Req + ?Sized>(&self, req: &R, stripe_off: u64) -> bool {
+        self.page_cache_policy(req).enabled(req.key(), stripe_off)
+    }
+
+    fn page_cache_policy<R: Req + ?Sized>(&self, req: &R) -> PageCachePolicy {
+        let Some(cache_id) = req.cache_id() else {
+            return PageCachePolicy::Disabled;
+        };
+        let Some(directory) = self.directories.get(cache_id) else {
+            return PageCachePolicy::Disabled;
+        };
+        let Some(channels) = directory.current() else {
+            return PageCachePolicy::Disabled;
+        };
+        PageCachePolicy::Custom(Arc::new(move |key, stripe_off| {
+            let idx = disk_for(&key, stripe_off, channels.channels.len());
+            channels
+                .page_cache_enabled
+                .get(idx)
+                .copied()
+                .unwrap_or(true)
+        }))
     }
 
     async fn read_page<R: Req + ?Sized>(
@@ -418,7 +449,7 @@ mod tests {
     use crate::storage::PageService;
     use crate::storage::blockdev::{BlockDevice, MockDevice, MockDeviceConfig};
     use crate::storage::types::{Error as DevError, Lba};
-    use crate::storage::{EngineConfig, StorageEngine};
+    use crate::storage::{EngineConfig, StorageEngine, StripeReq};
     use std::future::Future;
     use std::path::PathBuf;
     use std::pin::{Pin, pin};
@@ -570,7 +601,12 @@ mod tests {
     fn replays_registration_after_directory_swap() {
         let t = DiskChannelDirectory::new();
         let core1 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/a"), core1.channel.clone(), None)]);
+        t.apply_channels(vec![(
+            PathBuf::from("/a"),
+            core1.channel.clone(),
+            None,
+            true,
+        )]);
 
         let view = LiveShardLocalStore::new(t.clone());
         let (_buf, backing) = make_backing(8);
@@ -579,7 +615,12 @@ mod tests {
         assert_eq!(view.state.lock().unwrap().last_seen_generation, Some(gen1));
 
         let core2 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/b"), core2.channel.clone(), None)]);
+        t.apply_channels(vec![(
+            PathBuf::from("/b"),
+            core2.channel.clone(),
+            None,
+            true,
+        )]);
         let gen2 = t.generation();
         assert_ne!(gen1, gen2);
         let _ = view.current_or_replay();
@@ -590,48 +631,28 @@ mod tests {
     }
 
     #[test]
-    fn replays_every_backing_against_newest_channels() {
-        // Registers two backings across two swaps, then forces a
-        // third swap and asserts that BOTH backings are re-registered
-        // against the freshest channel. Observability comes from the
-        // `CountingDevice`'s register counter.
+    fn second_backing_is_rejected() {
         let t = DiskChannelDirectory::new();
         let core1 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/a"), core1.channel.clone(), None)]);
+        t.apply_channels(vec![(
+            PathBuf::from("/a"),
+            core1.channel.clone(),
+            None,
+            true,
+        )]);
 
         let view = LiveShardLocalStore::new(t.clone());
         let (_buf_a, backing_a) = make_backing(4);
         view.register_backing(&backing_a).unwrap();
 
-        let core2 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/b"), core2.channel.clone(), None)]);
-
         let (_buf_b, backing_b) = make_backing(4);
-        view.register_backing(&backing_b).unwrap();
-
-        // Third swap with a fresh core we can inspect. The engine open
-        // may itself register buffers, so snapshot the counter right
-        // after the swap and measure the replay delta.
-        let core3 = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/c"), core3.channel.clone(), None)]);
-        let baseline = core3.registers.load(Ordering::Relaxed);
-        let _ = view.current_or_replay();
-        // `register_buffer` is synchronous and round-trips through the
-        // service before returning, so by the time `current_or_replay`
-        // returns the counter reflects both replays.
-        assert_eq!(
-            core3.registers.load(Ordering::Relaxed) - baseline,
-            2,
-            "expected both backings replayed against the newest channel"
-        );
-        assert_eq!(
-            view.state.lock().unwrap().last_seen_generation,
-            Some(t.generation())
-        );
+        assert!(matches!(
+            view.register_backing(&backing_b),
+            Err(Error::BadConfig(_))
+        ));
+        assert_eq!(view.state.lock().unwrap().registered.len(), 1);
 
         core1.shutdown();
-        core2.shutdown();
-        core3.shutdown();
     }
 
     #[test]
@@ -655,8 +676,8 @@ mod tests {
         let core0 = Core::spawn();
         let core1 = Core::spawn();
         t.apply_channels(vec![
-            (PathBuf::from("/a"), core0.channel.clone(), None),
-            (PathBuf::from("/b"), core1.channel.clone(), None),
+            (PathBuf::from("/a"), core0.channel.clone(), None, true),
+            (PathBuf::from("/b"), core1.channel.clone(), None, true),
         ]);
 
         let view = LiveShardLocalStore::new(t.clone());
@@ -699,7 +720,12 @@ mod tests {
         // gracefully with `ENXIO` rather than panic the storage core.
         let t = DiskChannelDirectory::new();
         let core = Core::spawn();
-        t.apply_channels(vec![(PathBuf::from("/a"), core.channel.clone(), None)]);
+        t.apply_channels(vec![(
+            PathBuf::from("/a"),
+            core.channel.clone(),
+            None,
+            true,
+        )]);
 
         let view = LiveShardLocalStore::new(t.clone());
         let dst = PageRef {
@@ -722,22 +748,90 @@ mod tests {
     }
 
     #[test]
-    fn second_backing_with_incompatible_geometry_is_rejected() {
-        // The single-backing invariant: a shard may only register
-        // backings of identical geometry. A second backing with a
-        // different `page_count` must be rejected so `resolve` never
-        // has to pick among incompatible regions on the unsafe path.
+    fn cache_id_readd_rebinds_chain_store_to_new_directory() {
+        let dirs = CacheDirectorySet::new();
+        dirs.reconcile(["cache-a"]);
+        let core1 = Core::spawn();
+        dirs.apply_channels(
+            "cache-a",
+            vec![(PathBuf::from("/a"), core1.channel.clone(), None, true)],
+        );
+
+        let view = ChainLocalStore::new(dirs.clone());
+        let (_buf, backing) = make_backing(2);
+        view.register_pages(&backing).unwrap();
+        let first = view.store_for("cache-a");
+
+        dirs.reconcile(std::iter::empty::<&str>());
+        dirs.reconcile(["cache-a"]);
+        let core2 = Core::spawn();
+        dirs.apply_channels(
+            "cache-a",
+            vec![(PathBuf::from("/b"), core2.channel.clone(), None, true)],
+        );
+
+        let second = view.store_for("cache-a");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "re-added cache id must get a store bound to the new directory",
+        );
+        assert_eq!(
+            second.state.lock().unwrap().registered.len(),
+            1,
+            "registered backing must be replayed into replacement store",
+        );
+        assert!(second.current_or_replay().is_some());
+
+        core1.shutdown();
+        core2.shutdown();
+    }
+
+    #[test]
+    fn page_cache_policy_lookup_does_not_create_live_store() {
+        let dirs = CacheDirectorySet::new();
+        dirs.reconcile(["cache-a"]);
+        let (channel, _rx) = PageChannel::new();
+        dirs.apply_channels("cache-a", vec![(PathBuf::from("/a"), channel, None, false)]);
+
+        let view = ChainLocalStore::new(dirs);
+        let req = StripeReq::new(StripeKey([0x99; 32])).with_cache_id(Some("cache-a".to_string()));
+
+        assert!(!view.page_cache_enabled(&req, 0));
+        assert!(
+            view.stores.lock().unwrap().is_empty(),
+            "policy lookup must not instantiate or replay a live store",
+        );
+    }
+
+    #[test]
+    fn no_cache_id_disables_page_cache_policy() {
+        let dirs = CacheDirectorySet::new();
+        dirs.reconcile(["cache-a"]);
+        let (channel, _rx) = PageChannel::new();
+        dirs.apply_channels("cache-a", vec![(PathBuf::from("/a"), channel, None, true)]);
+
+        let view = ChainLocalStore::new(dirs);
+        let req = StripeReq::new(StripeKey([0x9a; 32]));
+
+        assert!(!view.page_cache_enabled(&req, 0));
+        assert!(
+            view.stores.lock().unwrap().is_empty(),
+            "no-cache policy lookup must not instantiate a live store",
+        );
+    }
+
+    #[test]
+    fn chain_store_rejects_second_backing() {
         let t = DiskChannelDirectory::new();
-        let view = LiveShardLocalStore::new(t);
+        let view = ChainLocalStore::new(Arc::new(CacheDirectorySet {
+            directories: Mutex::new(HashMap::from([("cache-a".to_string(), t)])),
+        }));
         let (_b1, backing1) = make_backing(4);
-        view.register_backing(&backing1).unwrap();
+        view.register_pages(&backing1).unwrap();
 
-        let (_b2, backing2) = make_backing(8);
-        let err = view.register_backing(&backing2);
+        let (_b2, backing2) = make_backing(4);
+        let err = view.register_pages(&backing2);
         assert!(matches!(err, Err(Error::BadConfig(_))));
-
-        // The rejected backing was not recorded; the original remains
-        // the sole registered backing.
-        assert_eq!(view.state.lock().unwrap().registered.len(), 1);
+        assert_eq!(view.registered.lock().unwrap().len(), 1);
     }
 }

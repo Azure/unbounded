@@ -26,7 +26,7 @@ use std::path::Path;
 use prost::Message;
 
 use super::graph::runtime_projection;
-use super::schema::{backend_spec, disk_spec, frontend_spec, peer_spec, Config};
+use super::schema::{Config, backend_spec, disk_spec, frontend_spec, peer_spec};
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -63,6 +63,11 @@ pub enum ConfigError {
         role: &'static str,
     },
     RoutingPlanDuplicateFinger(String),
+    DuplicateTopologyPrefixWeight(u32),
+    InvalidTopologyPrefixWeight {
+        tag_index: u32,
+        weight: f64,
+    },
     DuplicateBackendName(String),
     DuplicateFrontendName(String),
     DuplicateCacheName(String),
@@ -129,7 +134,10 @@ impl fmt::Display for ConfigError {
                 write!(f, "peer {peer_name:?}: invalid tcp socket address {addr:?}")
             }
             ConfigError::InvalidNativePeerAddr { peer_name, addr } => {
-                write!(f, "peer {peer_name:?}: invalid rdma fabric address {addr:?}")
+                write!(
+                    f,
+                    "peer {peer_name:?}: invalid rdma fabric address {addr:?}"
+                )
             }
             ConfigError::EmptyDiskPath => write!(f, "disk path must not be empty"),
             ConfigError::MissingSelfPeer => write!(
@@ -157,6 +165,14 @@ impl fmt::Display for ConfigError {
             ConfigError::RoutingPlanDuplicateFinger(name) => {
                 write!(f, "routing_plan.fingers contains duplicate peer {name:?}")
             }
+            ConfigError::DuplicateTopologyPrefixWeight(tag_index) => write!(
+                f,
+                "topology_weighting.prefix_weights contains duplicate tag_index {tag_index}"
+            ),
+            ConfigError::InvalidTopologyPrefixWeight { tag_index, weight } => write!(
+                f,
+                "topology_weighting.prefix_weights tag_index {tag_index} has invalid weight {weight}: weight must be finite and have absolute value <= 1000000.0"
+            ),
             ConfigError::DuplicateBackendName(name) => {
                 write!(f, "duplicate backend name: {name:?}")
             }
@@ -548,6 +564,21 @@ fn validate_mesh(cfg: &Config) -> Result<(), ConfigError> {
         }
     }
 
+    if let Some(weighting) = &cfg.topology_weighting {
+        let mut seen_weights = HashSet::new();
+        for weight in &weighting.prefix_weights {
+            if !seen_weights.insert(weight.tag_index) {
+                return Err(ConfigError::DuplicateTopologyPrefixWeight(weight.tag_index));
+            }
+            if !weight.weight.is_finite() || weight.weight.abs() > 1_000_000.0 {
+                return Err(ConfigError::InvalidTopologyPrefixWeight {
+                    tag_index: weight.tag_index,
+                    weight: weight.weight,
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -806,6 +837,67 @@ addr = "not-an-addr"
         match load(f.path()) {
             Err(ConfigError::InvalidTcpAddr { peer_name, .. }) if peer_name == "node-b" => {}
             other => panic!("expected InvalidTcpAddr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_topology_prefix_weights() {
+        let s = format!(
+            r#"{}
+[topology_weighting]
+
+[[topology_weighting.prefix_weights]]
+tag_index = 1
+weight = 0.25
+
+[[topology_weighting.prefix_weights]]
+tag_index = 1
+weight = -0.5
+"#,
+            mesh_toml()
+        );
+        let f = write_cfg(&s);
+        match load(f.path()) {
+            Err(ConfigError::DuplicateTopologyPrefixWeight(1)) => {}
+            other => panic!("expected DuplicateTopologyPrefixWeight, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_topology_prefix_weight() {
+        let s = format!(
+            r#"{}
+[topology_weighting]
+
+[[topology_weighting.prefix_weights]]
+tag_index = 0
+weight = inf
+"#,
+            mesh_toml()
+        );
+        let f = write_cfg(&s);
+        match load(f.path()) {
+            Err(ConfigError::InvalidTopologyPrefixWeight { tag_index: 0, .. }) => {}
+            other => panic!("expected InvalidTopologyPrefixWeight, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_excessive_topology_prefix_weight() {
+        let s = format!(
+            r#"{}
+[topology_weighting]
+
+[[topology_weighting.prefix_weights]]
+tag_index = 0
+weight = 1000000.1
+"#,
+            mesh_toml()
+        );
+        let f = write_cfg(&s);
+        match load(f.path()) {
+            Err(ConfigError::InvalidTopologyPrefixWeight { tag_index: 0, .. }) => {}
+            other => panic!("expected InvalidTopologyPrefixWeight, got {other:?}"),
         }
     }
 

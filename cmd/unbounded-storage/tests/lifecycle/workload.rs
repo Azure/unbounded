@@ -788,8 +788,12 @@ fn spawn_clients(
                             std::ptr::copy_nonoverlapping(payload.as_ptr(), base, payload.len());
                         }
                         let src = std::ptr::slice_from_raw_parts(base as *const u8, payload.len());
-                        let disk = disk_for(&key, offset, channels.len());
-                        if channels[disk].write_page(key, offset, src).await.is_err() {
+                        let disk = disk_for(&key, offset, channels.channels.len());
+                        if channels.channels[disk]
+                            .write_page(key, offset, src)
+                            .await
+                            .is_err()
+                        {
                             channel_errors.set(channel_errors.get() + 1);
                         }
                     }
@@ -800,8 +804,12 @@ fn spawn_clients(
                             std::ptr::write_bytes(base, 0, page_size);
                         }
                         let dst = std::ptr::slice_from_raw_parts_mut(base, page_size);
-                        let disk = disk_for(&key, offset, channels.len());
-                        if channels[disk].read_page(key, offset, dst).await.is_err() {
+                        let disk = disk_for(&key, offset, channels.channels.len());
+                        if channels.channels[disk]
+                            .read_page(key, offset, dst)
+                            .await
+                            .is_err()
+                        {
                             channel_errors.set(channel_errors.get() + 1);
                         }
                     }
@@ -845,7 +853,7 @@ fn publish_generation(directory: &DiskChannelDirectory, generation: &DiskGenerat
         .cloned()
         .zip(generation.channels.iter().cloned())
         .enumerate()
-        .map(|(idx, (path, channel))| (path, channel, Some((idx % 2) as u16)))
+        .map(|(idx, (path, channel))| (path, channel, Some((idx % 2) as u16), true))
         .collect();
     directory.apply_channels(entries);
 }
@@ -952,6 +960,7 @@ fn generation_disk_specs(generation: usize, count: usize) -> Vec<DiskSpec> {
             bypass_admission: false,
             bypass_index_read: false,
             bypass_checksum: false,
+            disable_page_cache: false,
             config: Some(disk_spec::Config::File(FileDiskConfig {
                 size: Some(64 * 1024 * 1024),
                 path: format!("/dst/generation-{generation}/disk-{idx}"),

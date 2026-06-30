@@ -16,14 +16,18 @@
 //! [`NetHandle`] is the cloneable `Rc`-based serving handle: its methods
 //! return `'static` futures (they own a ring clone instead of borrowing
 //! it) so the serving frontend can store many per-connection futures
-//! across shard-loop ticks. The borrowed [`NetworkRing`] methods return
-//! `'_` futures for callers that keep the ring on the stack.
+//! across shard-loop ticks. They still park on [`RingCore`]'s submission
+//! backpressure before pushing SQEs. The borrowed [`NetworkRing`] methods
+//! return `'_` futures for callers that keep the ring on the stack.
 //!
 //! ## SEND_ZC two-CQE semantics
 //!
 //! `send_zc_fixed` submits with `expects_more = true`. The op resolves
 //! only on the SEND_ZC notification CQE (see [`RingCore`] docs), so when
-//! the future returns the kernel is done with the source page.
+//! the future returns the kernel is done with the source page. If a
+//! fixed-source send future is dropped first, the ring either quarantines
+//! the pool page until that notification is reaped, or holds an explicit
+//! completion resource for cross-shard remote pins.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -35,7 +39,10 @@ use std::task::{Context, Poll};
 
 use io_uring::{opcode, types};
 
-use super::core::{OpFut, OpResource, RecvQuarantine, RingCore, RingSetup, Slot, check_res};
+use super::core::{
+    OpFut, OpResource, RecvQuarantine, RingCore, RingSetup, SendCompletion, Slot, SubmitSlot,
+    check_res,
+};
 
 /// TLS `application_data` record type (RFC 8446). Plaintext bytes the
 /// kernel hands back as ordinary payload also default to this.
@@ -356,6 +363,9 @@ impl NetworkRing {
         len: usize,
     ) -> impl Future<Output = io::Result<usize>> + '_ {
         async move {
+            if buf_index != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
             let ptr = self.fixed_ptr(buf_index, page_byte_offset)?;
             let ud = self.core.alloc_user_data();
             let sqe = opcode::SendZc::new(types::Fd(fd), ptr, len as u32)
@@ -363,10 +373,40 @@ impl NetworkRing {
                 .build()
                 .user_data(ud);
             // SAFETY: `ptr` points inside the registered backing; the
-            // caller holds the source page until this future resolves
-            // (the SEND_ZC notification CQE).
+            // caller holds the source page until this future resolves.
+            // If the future is dropped first, the page is quarantined
+            // until the SEND_ZC notification CQE is reaped.
             let slot = self.core.submit_op(sqe, true, OpResource::None).await?;
-            let res = OpFut::new(&self.core, ud, slot).await;
+            let res = OpFut::new(&self.core, ud, slot)
+                .quarantine_send_zc(page_byte_offset)
+                .await;
+            check_res(res).map(|n| n as usize)
+        }
+    }
+
+    /// SEND_ZC variant that holds `on_complete` until the final
+    /// notification CQE is reaped, even if the awaiting future is
+    /// dropped first.
+    pub(crate) fn send_zc_fixed_with_completion(
+        &self,
+        fd: RawFd,
+        buf_index: u16,
+        page_byte_offset: usize,
+        len: usize,
+        on_complete: Box<dyn SendCompletion>,
+    ) -> impl Future<Output = io::Result<usize>> + '_ {
+        async move {
+            let ptr = self.fixed_ptr(buf_index, page_byte_offset)?;
+            let ud = self.core.alloc_user_data();
+            let sqe = opcode::SendZc::new(types::Fd(fd), ptr, len as u32)
+                .buf_index(Some(buf_index))
+                .build()
+                .user_data(ud);
+            let slot = self
+                .core
+                .submit_op(sqe, true, OpResource::SendCompletion(on_complete))
+                .await?;
+            let res = OpFut::new(&self.core, ud, slot).abandon_send_zc().await;
             check_res(res).map(|n| n as usize)
         }
     }
@@ -402,9 +442,9 @@ impl NetworkRing {
 /// multiplexes many long-lived per-connection futures the shard loop
 /// polls each tick, so it needs `'static` futures. `NetHandle` owns an
 /// `Rc<RefCell<NetworkRing>>` clone instead of borrowing the ring: each
-/// method submits synchronously inside a borrow block, then returns a
-/// future that owns its own ring clone plus the op's `Rc<Slot>` and
-/// re-borrows the ring inside `poll`/`drop`.
+/// method parks on the ring's submission backpressure before submitting,
+/// then returns a future that owns its own ring clone plus the op's
+/// `Rc<Slot>` and re-borrows the ring inside `poll`/`drop`.
 #[derive(Clone)]
 pub struct NetHandle {
     ring: Rc<RefCell<NetworkRing>>,
@@ -457,6 +497,7 @@ impl NetHandle {
     pub fn accept(&self, listen_fd: RawFd) -> impl Future<Output = io::Result<RawFd>> + 'static {
         let ring = Rc::clone(&self.ring);
         async move {
+            OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
                 let r = ring.borrow();
                 let ud = r.core.alloc_user_data();
@@ -486,6 +527,7 @@ impl NetHandle {
         let ring = Rc::clone(&self.ring);
         async move {
             let addr = Box::new(addr);
+            OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
                 let r = ring.borrow();
                 let ud = r.core.alloc_user_data();
@@ -510,6 +552,7 @@ impl NetHandle {
     ) -> impl Future<Output = io::Result<usize>> + 'static {
         let ring = Rc::clone(&self.ring);
         async move {
+            OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
                 let r = ring.borrow();
                 let ptr = buf.as_ptr();
@@ -537,6 +580,7 @@ impl NetHandle {
         let ring = Rc::clone(&self.ring);
         async move {
             let buf = Rc::new(RefCell::new(vec![0u8; max_len]));
+            OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
                 let r = ring.borrow();
                 let ptr = buf.borrow_mut().as_mut_ptr();
@@ -571,6 +615,10 @@ impl NetHandle {
     ) -> impl Future<Output = io::Result<usize>> + 'static {
         let ring = Rc::clone(&self.ring);
         async move {
+            if buf_index != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
                 let r = ring.borrow();
                 let ptr = r.fixed_ptr(buf_index, page_byte_offset)?;
@@ -580,12 +628,48 @@ impl NetHandle {
                     .build()
                     .user_data(ud);
                 // SAFETY: `ptr` points inside the registered backing; the
-                // caller holds the source page until this future resolves
-                // (the SEND_ZC notification CQE).
+                // caller holds the source page until this future resolves.
+                // If the future is dropped first, the page is quarantined
+                // until the SEND_ZC notification CQE is reaped.
                 let slot = r.core.submit_now(sqe, true, OpResource::None)?;
                 (ud, slot)
             };
-            let res = OwnedNetFut::new(Rc::clone(&ring), ud, slot).await;
+            let res = OwnedNetFut::new(Rc::clone(&ring), ud, slot)
+                .quarantine_send_zc(page_byte_offset)
+                .await;
+            check_res(res).map(|n| n as usize)
+        }
+    }
+
+    /// `'static` SEND_ZC variant that holds `on_complete` until the
+    /// final notification CQE is reaped, even if the future is dropped.
+    pub(crate) fn send_zc_fixed_with_completion(
+        &self,
+        fd: RawFd,
+        buf_index: u16,
+        page_byte_offset: usize,
+        len: usize,
+        on_complete: Box<dyn SendCompletion>,
+    ) -> impl Future<Output = io::Result<usize>> + 'static {
+        let ring = Rc::clone(&self.ring);
+        async move {
+            OwnedSubmitSlot::new(Rc::clone(&ring)).await;
+            let (ud, slot) = {
+                let r = ring.borrow();
+                let ptr = r.fixed_ptr(buf_index, page_byte_offset)?;
+                let ud = r.core.alloc_user_data();
+                let sqe = opcode::SendZc::new(types::Fd(fd), ptr, len as u32)
+                    .buf_index(Some(buf_index))
+                    .build()
+                    .user_data(ud);
+                let slot = r
+                    .core
+                    .submit_now(sqe, true, OpResource::SendCompletion(on_complete))?;
+                (ud, slot)
+            };
+            let res = OwnedNetFut::new(Rc::clone(&ring), ud, slot)
+                .abandon_send_zc()
+                .await;
             check_res(res).map(|n| n as usize)
         }
     }
@@ -600,6 +684,7 @@ impl NetHandle {
     ) -> impl Future<Output = io::Result<usize>> + 'static {
         let ring = Rc::clone(&self.ring);
         async move {
+            OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
                 let r = ring.borrow();
                 let ptr = r.fixed_ptr(buf_index, page_byte_offset)?;
@@ -641,8 +726,33 @@ pub(crate) struct OwnedNetFut {
     /// [`RingCore::cancel_fixed_recv`], which quarantines that page
     /// (non-blocking) or drains the op (blocking fallback) so the kernel
     /// never writes into a page the caller may reuse. `None` for ops
-    /// whose memory the ring owns, where a best-effort cancel suffices.
+    /// whose memory the ring owns, where a best-effort cancel suffices
+    /// unless `abandon_send_zc` is set for fixed-source SEND_ZC.
     fixed_recv_offset: Option<usize>,
+    abandon_send_zc: bool,
+    /// Source page offset for a pool-managed SEND_ZC. On early drop,
+    /// this page is quarantined until the final notification CQE.
+    send_zc_source_offset: Option<usize>,
+}
+
+pub(crate) struct OwnedSubmitSlot {
+    ring: Rc<RefCell<NetworkRing>>,
+}
+
+impl OwnedSubmitSlot {
+    pub(crate) fn new(ring: Rc<RefCell<NetworkRing>>) -> Self {
+        Self { ring }
+    }
+}
+
+impl Future for OwnedSubmitSlot {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let ring = self.ring.borrow();
+        let mut submit = SubmitSlot { core: &ring.core };
+        Pin::new(&mut submit).poll(cx)
+    }
 }
 
 impl OwnedNetFut {
@@ -652,6 +762,8 @@ impl OwnedNetFut {
             user_data,
             slot,
             fixed_recv_offset: None,
+            abandon_send_zc: false,
+            send_zc_source_offset: None,
         }
     }
 
@@ -660,6 +772,22 @@ impl OwnedNetFut {
     /// makes that destination page safe to reuse (see the field docs).
     pub(crate) fn fixed_recv(mut self, page_byte_offset: usize) -> Self {
         self.fixed_recv_offset = Some(page_byte_offset);
+        self
+    }
+
+    /// Keep the SEND_ZC slot alive after future drop until the final
+    /// notification releases the source page. Drop never blocks.
+    pub(crate) fn abandon_send_zc(mut self) -> Self {
+        self.abandon_send_zc = true;
+        self
+    }
+
+    /// Mark this future as a fixed-source SEND_ZC whose source page is
+    /// pool-managed. Dropping it before completion quarantines that page
+    /// until the final notification CQE is reaped.
+    pub(crate) fn quarantine_send_zc(mut self, page_byte_offset: usize) -> Self {
+        self.abandon_send_zc = true;
+        self.send_zc_source_offset = Some(page_byte_offset);
         self
     }
 }
@@ -687,6 +815,13 @@ impl Drop for OwnedNetFut {
                 match self.fixed_recv_offset {
                     Some(off) => {
                         ring.core.cancel_fixed_recv(self.user_data, off, &self.slot);
+                    }
+                    None if self.abandon_send_zc => {
+                        ring.core.abandon_send_zc(
+                            self.user_data,
+                            self.send_zc_source_offset,
+                            &self.slot,
+                        );
                     }
                     None => ring.core.cancel(self.user_data),
                 }
@@ -1289,6 +1424,62 @@ mod tests {
             }
         };
         assert_eq!(got.as_slice(), &payload[..]);
+
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
+    }
+
+    #[test]
+    fn handle_submission_parks_when_ring_depth_is_full() {
+        let ring = match NetworkRing::new(1) {
+            Ok(r) => Rc::new(RefCell::new(r)),
+            Err(e) => {
+                eprintln!("handle_backpressure: ring unavailable: {e}; skipping");
+                return;
+            }
+        };
+        let handle = NetHandle::new(Rc::clone(&ring));
+        let Some((a, b)) = socketpair() else {
+            eprintln!("handle_backpressure: socketpair failed; skipping");
+            return;
+        };
+
+        let mut first = Box::pin(handle.recv(b, 64));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match first.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(e)) if is_unsupported(&e) => {
+                eprintln!("handle_backpressure: RECV unsupported; skipping");
+                unsafe {
+                    libc::close(a);
+                    libc::close(b);
+                }
+                return;
+            }
+            Poll::Ready(other) => panic!("first recv unexpectedly completed: {other:?}"),
+            Poll::Pending => {}
+        }
+        assert_eq!(ring.borrow().core.in_flight(), 1);
+
+        let mut second = Box::pin(handle.recv(b, 64));
+        match second.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => panic!("second recv must park, not complete: {v:?}"),
+            Poll::Pending => {}
+        }
+        assert_eq!(
+            ring.borrow().core.in_flight(),
+            1,
+            "parked submitter must not push past ring depth",
+        );
+        drop(second);
+
+        let payload: &[u8] = b"x";
+        let wrote = unsafe { libc::write(a, payload.as_ptr() as *const libc::c_void, 1) };
+        assert_eq!(wrote, 1);
+        let got = block_on_handle(first.as_mut()).expect("first recv should complete");
+        assert_eq!(got, payload);
 
         unsafe {
             libc::close(a);

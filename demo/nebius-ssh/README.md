@@ -153,7 +153,7 @@ kubectl unbounded install
 
 Create the Site resources and bootstrap token, then generate an Ed25519 SSH key
 pair. The public key is saved locally as `unbounded_ed25519.pub` and the private
-key is stored as a Secret in the `unbounded-kube` namespace.
+key is stored as a Secret in the `unbounded-system` namespace.
 
 ```bash
 kubectl unbounded site init \

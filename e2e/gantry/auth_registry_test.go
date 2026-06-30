@@ -13,11 +13,11 @@ import (
 
 const (
 	// In-cluster auth registry test fixtures. The registry is deployed
-	// in the gantry-system namespace so it can be reached via the
+	// in the unbounded-system namespace so it can be reached via the
 	// well-known cluster-DNS name without RBAC churn.
-	authRegistryNS     = "gantry-system"
+	authRegistryNS     = "unbounded-system"
 	authRegistryName   = "auth-registry"
-	authRegistryHost   = "auth-registry.gantry-system.svc.cluster.local"
+	authRegistryHost   = "auth-registry.unbounded-system.svc.cluster.local"
 	authRegistryUser   = "testuser"
 	authRegistryPass   = "testpass"
 	authRegistryImage  = "registry:2"
@@ -34,12 +34,12 @@ const (
 	// access).
 	authRegistryDigest   = "sha256:7e8bdd271312fd25fc5ff5a8f04727be84044eb3d7d8d03611972a6752e2e11e"
 	authRegistryRef      = authRegistryHost + ":5000/agnhost@" + authRegistryDigest
-	authRegistryRefShort = "auth-registry.gantry-system.svc.cluster.local:5000"
+	authRegistryRefShort = "auth-registry.unbounded-system.svc.cluster.local:5000"
 	// authRegistryCredsKey is the Secret data key (and on-disk filename
 	// under /etc/gantry/registry/) holding the Basic-auth credentials
 	// for authRegistryRefShort. Secret keys cannot contain ':' so this
 	// is a sanitized variant of authRegistryRefShort.
-	authRegistryCredsKey = "auth-registry.gantry-system.svc.cluster.local_5000"
+	authRegistryCredsKey = "auth-registry.unbounded-system.svc.cluster.local_5000"
 )
 
 // TestE2E_PrivateAuthRegistry proves that Gantry's credentialed

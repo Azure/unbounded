@@ -26,8 +26,8 @@ Bootstrap the CRDs and operator first, then create Site resources.
 make -C hack/net deploy
 ```
 
-The operator deploys unbounded-net into the `unbounded-net` namespace by default
-when a Site enables the net component.
+The operator deploys unbounded-net into the `unbounded-system` namespace by
+default when a Site enables the net component.
 
 For direct component debugging, use:
 
@@ -140,10 +140,10 @@ node agents are running:
 kubectl -n unbounded-kube get deploy unbounded-operator
 
 # Controller pod
-kubectl -n unbounded-net get pods -l app.kubernetes.io/name=unbounded-net-controller
+kubectl -n unbounded-system get pods -l app.kubernetes.io/name=unbounded-net-controller
 
 # Node agent pods (one per node)
-kubectl -n unbounded-net get pods -l app.kubernetes.io/name=unbounded-net-node -o wide
+kubectl -n unbounded-system get pods -l app.kubernetes.io/name=unbounded-net-node -o wide
 
 # Nodes should be labeled with their site
 kubectl get nodes -L net.unbounded-cloud.io/site

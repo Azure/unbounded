@@ -36,9 +36,9 @@ SSH connection details. When `ssh` is nil, the machina controller skips the Mach
 | `ssh` | SSHSpec | No | — | SSH connection configuration. |
 | `ssh.host` | string | Yes | — | Hostname or IP, optionally with port (e.g. `1.2.3.4:2222`). Port 22 is assumed when omitted. |
 | `ssh.username` | string | No | `"azureuser"` | SSH username. |
-| `ssh.privateKeyRef` | SecretKeySelector | Yes | — | Reference to a Secret containing the SSH private key. Must reside in the `unbounded-kube` namespace. |
+| `ssh.privateKeyRef` | SecretKeySelector | Yes | — | Reference to a Secret containing the SSH private key. Must reside in the `unbounded-system` namespace. |
 | `ssh.privateKeyRef.name` | string | Yes | — | Secret name. |
-| `ssh.privateKeyRef.namespace` | string | Yes | — | Secret namespace (must be `unbounded-kube`). |
+| `ssh.privateKeyRef.namespace` | string | Yes | — | Secret namespace (must be `unbounded-system`). |
 | `ssh.privateKeyRef.key` | string | No | `"ssh-privatekey"` | Key within the Secret's `data` map. |
 | `ssh.bastion` | BastionSSHSpec | No | — | Optional jump host for the SSH connection. |
 | `ssh.bastion.host` | string | Yes | — | Bastion hostname or IP, optionally with port. |
@@ -128,7 +128,7 @@ spec:
   auth:
     mode: ExternalPlugin
     secretRef:
-      namespace: unbounded-kube
+      namespace: unbounded-system
       name: remote-oci-auth
 ```
 
@@ -274,7 +274,7 @@ spec:
     host: "10.0.0.50"
     privateKeyRef:
       name: ssh-key
-      namespace: unbounded-kube
+      namespace: unbounded-system
   kubernetes:
     version: v1.34.0
     bootstrapTokenRef:
@@ -294,7 +294,7 @@ spec:
     username: ubuntu
     privateKeyRef:
       name: ssh-key
-      namespace: unbounded-kube
+      namespace: unbounded-system
       key: id_ed25519
     bastion:
       host: "bastion.example.com"
@@ -369,7 +369,7 @@ spec:
     host: "10.0.0.60"
     privateKeyRef:
       name: ssh-key
-      namespace: unbounded-kube
+      namespace: unbounded-system
   pxe:
     image: ghcr.io/azure/images/host-ubuntu2404:v1
     dhcpLeases:
@@ -384,11 +384,11 @@ spec:
       username: admin
       passwordRef:
         name: bmc-password
-        namespace: unbounded-kube
+        namespace: unbounded-system
     cloudInit:
       userDataConfigMapRef:
         name: my-cloud-init
-        namespace: unbounded-kube
+        namespace: unbounded-system
   kubernetes:
     version: v1.34.0
     bootstrapTokenRef:
@@ -447,7 +447,7 @@ responses (option 67).
 
 ## CRD relationships
 
-![Machine CRD relationships: Machine spec fields reference OCI Image, Secrets in unbounded-kube and kube-system namespaces, with bidirectional Machine-Node link via label](../../img/machina-crd-relationships.svg)
+![Machine CRD relationships: Machine spec fields reference OCI Image, Secrets in unbounded-system and kube-system namespaces, with bidirectional Machine-Node link via label](../../img/machina-crd-relationships.svg)
 
 ## See Also
 

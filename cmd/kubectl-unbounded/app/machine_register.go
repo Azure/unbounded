@@ -46,7 +46,7 @@ type machineRegisterHandler struct {
 	hostSSHPrivateKey string
 
 	// sshSecretName is the name of the Kubernetes secret that holds SSH credentials.
-	// Defaults to "ssh-${siteName}" in the unbounded-kube namespace.
+	// Defaults to "ssh-${siteName}" in the unbounded-system namespace.
 	sshSecretName string
 
 	// bastionHost is the IP or DNS name and optionally port that Machina connects to first before jumping to host.

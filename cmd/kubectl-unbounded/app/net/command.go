@@ -20,6 +20,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/internal/unbounded"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -117,8 +118,9 @@ func (p *pluginRuntime) restConfig() (*rest.Config, error) {
 
 // namespace resolves the namespace for unbounded-net components.
 // If --namespace was explicitly provided, it is used directly.
-// Otherwise, tries the current context namespace, then "unbounded-net",
-// then "kube-system", returning the first that contains unbounded-net pods.
+// Otherwise, tries the current context namespace, then the unified install
+// namespace ("unbounded-system"), then the legacy "unbounded-net" and
+// "kube-system", returning the first that contains unbounded-net pods.
 func (p *pluginRuntime) namespace() (string, error) {
 	ns, overridden, err := p.configFlags.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
@@ -135,7 +137,7 @@ func (p *pluginRuntime) namespace() (string, error) {
 		return ns, nil
 	}
 
-	candidates := deduplicateStrings(ns, "unbounded-net", "kube-system")
+	candidates := deduplicateStrings(ns, unbounded.SystemNamespace, "unbounded-net", "kube-system")
 
 	const selector = "app.kubernetes.io/name in (unbounded-net-controller, unbounded-net-node)"
 	for _, candidate := range candidates {

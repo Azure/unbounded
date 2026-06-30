@@ -5,22 +5,61 @@
 //! 64-bit ring with one chosen peer per arc, plus the Chord
 //! closest-preceding-finger lookup used by recursive routing.
 
-use crate::p2p::ring::{rendezvous_hash, ring_distance, topology_distance};
+use crate::p2p::ring::{WILDCARD_TAG, rendezvous_hash, ring_distance, topology_distance};
 use crate::p2p::types::{PeerEntry, RingId};
 
 /// Build-time knobs for [`FingerTable`]. Targets `k` in the
 /// 100-150 range against the ~200 RDMA QP budget per node; we
 /// default to 100.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct FingerTableConfig {
     /// Arcs per node.
     pub k: u32,
+    /// How automatic finger selection treats topology tags.
+    pub topology: TopologySelection,
 }
 
 impl Default for FingerTableConfig {
     fn default() -> Self {
-        Self { k: 100 }
+        Self {
+            k: 100,
+            topology: TopologySelection::default(),
+        }
     }
+}
+
+impl FingerTableConfig {
+    pub fn with_k(k: u32) -> Self {
+        Self {
+            k,
+            ..Self::default()
+        }
+    }
+}
+
+/// Topology policy used when selecting one candidate per finger-table arc.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum TopologySelection {
+    /// Historical behavior: topology distance is a hard priority before
+    /// rendezvous hashing.
+    #[default]
+    HardLocality,
+    /// Weighted rendezvous behavior: topology adjusts candidate score but
+    /// does not dominate ring entropy.
+    Weighted(TopologyWeighting),
+}
+
+/// Weighted topology preference for automatic finger selection.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TopologyWeighting {
+    pub prefix_weights: Vec<TopologyPrefixWeight>,
+}
+
+/// Weight applied when local and candidate share the configured tag prefix.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct TopologyPrefixWeight {
+    pub tag_index: u32,
+    pub weight: f64,
 }
 
 /// Finger table for a single local node. Fully deterministic in
@@ -46,10 +85,9 @@ pub struct FingerTable {
 impl FingerTable {
     /// Build the table for `local` against the candidate peer set
     /// `peers`. `peers` may include `local`; it is filtered out
-    /// internally. Within each arc the winner is the candidate
-    /// minimizing `(topology_distance, rendezvous_hash)`, with a
-    /// final stable tie-break on the raw `ring.0` u64 so the
-    /// build is fully deterministic.
+    /// internally. Within each arc the winner is chosen by the
+    /// configured topology policy, with stable ring-position tie-breaks
+    /// so the build is fully deterministic.
     pub fn build(local: PeerEntry, peers: &[PeerEntry], cfg: FingerTableConfig) -> Self {
         let k = cfg.k.max(1);
         let arc_span = u64::MAX / k as u64;
@@ -67,7 +105,9 @@ impl FingerTable {
             let arc = arc_index(local.ring, cand.ring, arc_span, k);
             let current = &fingers[arc as usize];
             let challenger_is_self = current.node == local.node;
-            if challenger_is_self || better(local.ring, &local.tags, cand, current, arc) {
+            if challenger_is_self
+                || better(local.ring, &local.tags, cand, current, arc, &cfg.topology)
+            {
                 fingers[arc as usize] = cand.clone();
             }
 
@@ -235,6 +275,24 @@ fn better(
     challenger: &PeerEntry,
     incumbent: &PeerEntry,
     arc: u32,
+    topology: &TopologySelection,
+) -> bool {
+    match topology {
+        TopologySelection::HardLocality => {
+            hard_locality_better(local_ring, local_tags, challenger, incumbent, arc)
+        }
+        TopologySelection::Weighted(weighting) => weighted_better(
+            local_ring, local_tags, challenger, incumbent, arc, weighting,
+        ),
+    }
+}
+
+fn hard_locality_better(
+    local_ring: RingId,
+    local_tags: &crate::p2p::types::TopologyTags,
+    challenger: &PeerEntry,
+    incumbent: &PeerEntry,
+    arc: u32,
 ) -> bool {
     let c_topo = topology_distance(local_tags, &challenger.tags);
     let i_topo = topology_distance(local_tags, &incumbent.tags);
@@ -247,6 +305,83 @@ fn better(
         return c_rh < i_rh;
     }
     challenger.ring.0 < incumbent.ring.0
+}
+
+fn weighted_better(
+    local_ring: RingId,
+    local_tags: &crate::p2p::types::TopologyTags,
+    challenger: &PeerEntry,
+    incumbent: &PeerEntry,
+    arc: u32,
+    weighting: &TopologyWeighting,
+) -> bool {
+    let c = weighted_score(local_ring, local_tags, challenger, arc, weighting);
+    let i = weighted_score(local_ring, local_tags, incumbent, arc, weighting);
+    if c.score != i.score {
+        return c.score < i.score;
+    }
+    if c.hash != i.hash {
+        return c.hash < i.hash;
+    }
+    challenger.ring.0 < incumbent.ring.0
+}
+
+#[derive(Copy, Clone, Debug)]
+struct WeightedScore {
+    score: f64,
+    hash: u64,
+}
+
+fn weighted_score(
+    local_ring: RingId,
+    local_tags: &crate::p2p::types::TopologyTags,
+    peer: &PeerEntry,
+    arc: u32,
+    weighting: &TopologyWeighting,
+) -> WeightedScore {
+    let hash = rendezvous_hash(local_ring, peer.ring, arc);
+    let base = rendezvous_unit(hash);
+    let prefix_len = shared_prefix_len(local_tags, &peer.tags);
+    let weight = matching_weight(prefix_len, weighting);
+    WeightedScore {
+        score: base - weight,
+        hash,
+    }
+}
+
+fn rendezvous_unit(hash: u64) -> f64 {
+    const DENOMINATOR: f64 = (1u64 << 53) as f64;
+    ((hash >> 11) as f64) / DENOMINATOR
+}
+
+fn matching_weight(prefix_len: usize, weighting: &TopologyWeighting) -> f64 {
+    weighting
+        .prefix_weights
+        .iter()
+        .filter(|weight| (weight.tag_index as usize) < prefix_len)
+        .max_by_key(|weight| weight.tag_index)
+        .map(|weight| {
+            if weight.weight.is_finite() {
+                weight.weight
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(0.0)
+}
+
+fn shared_prefix_len(
+    local: &crate::p2p::types::TopologyTags,
+    peer: &crate::p2p::types::TopologyTags,
+) -> usize {
+    let mut prefix = 0;
+    for (l, p) in local.0.iter().zip(peer.0.iter()) {
+        if l == WILDCARD_TAG || p == WILDCARD_TAG || l != p {
+            break;
+        }
+        prefix += 1;
+    }
+    prefix
 }
 
 #[cfg(test)]
@@ -281,8 +416,9 @@ mod tests {
     fn two_node_ring_routes_to_other_node() {
         let me = peer(1, 0, &["r", "z", "row", "rack"]);
         let other = peer(2, u64::MAX / 2, &["r", "z", "row", "rack"]);
-        let ft_me = FingerTable::build(me.clone(), &[other.clone()], FingerTableConfig { k: 8 });
-        let ft_other = FingerTable::build(other.clone(), &[me.clone()], FingerTableConfig { k: 8 });
+        let ft_me = FingerTable::build(me.clone(), &[other.clone()], FingerTableConfig::with_k(8));
+        let ft_other =
+            FingerTable::build(other.clone(), &[me.clone()], FingerTableConfig::with_k(8));
 
         // Both nodes see each other as both successor and predecessor.
         assert_eq!(ft_me.successor().unwrap().node, other.node);
@@ -322,8 +458,8 @@ mod tests {
         let b = peer(2, u64::MAX / 3, &["r"]);
         let c = peer(3, (u64::MAX / 3) * 2, &["r"]);
         let peers = vec![a.clone(), b.clone(), c.clone()];
-        let ft_a = FingerTable::build(a.clone(), &peers, FingerTableConfig { k: 8 });
-        let ft_b = FingerTable::build(b.clone(), &peers, FingerTableConfig { k: 8 });
+        let ft_a = FingerTable::build(a.clone(), &peers, FingerTableConfig::with_k(8));
+        let ft_b = FingerTable::build(b.clone(), &peers, FingerTableConfig::with_k(8));
 
         // a's successor is b. Lookup for target=b.ring from a:
         // a sees target in (a, b] and forwards to b; b owns it.
@@ -339,7 +475,7 @@ mod tests {
         let b = peer(2, 200, &["r"]);
         let c = peer(3, 300, &["r"]);
         let peers = vec![a.clone(), b.clone(), c.clone()];
-        let ft_a = FingerTable::build(a.clone(), &peers, FingerTableConfig { k: 8 });
+        let ft_a = FingerTable::build(a.clone(), &peers, FingerTableConfig::with_k(8));
         assert_eq!(ft_a.successor().unwrap().node, b.node);
         let hop = ft_a.next_hop(b.ring).expect("forward to successor");
         assert_eq!(hop.node, b.node);
@@ -354,8 +490,8 @@ mod tests {
             peer(3, 400, &["us", "z2", "r1", "k1"]),
             peer(4, u64::MAX - 1000, &["eu", "z1", "r1", "k1"]),
         ];
-        let cfg = FingerTableConfig { k: 16 };
-        let a = FingerTable::build(me.clone(), &peers, cfg);
+        let cfg = FingerTableConfig::with_k(16);
+        let a = FingerTable::build(me.clone(), &peers, cfg.clone());
         let b = FingerTable::build(me.clone(), &peers, cfg);
         let a_ids: Vec<_> = a.fingers().iter().map(|p| (p.node, p.ring)).collect();
         let b_ids: Vec<_> = b.fingers().iter().map(|p| (p.node, p.ring)).collect();
@@ -376,10 +512,107 @@ mod tests {
         let ft = FingerTable::build(
             me.clone(),
             &[close_topo.clone(), far_topo.clone()],
-            FingerTableConfig { k: 4 },
+            FingerTableConfig::with_k(4),
         );
         let arc = arc_index(me.ring, close_topo.ring, span, 4);
         assert_eq!(ft.fingers()[arc as usize].node, close_topo.node);
+    }
+
+    fn weighted_cfg(k: u32, weights: &[(u32, f64)]) -> FingerTableConfig {
+        FingerTableConfig {
+            k,
+            topology: TopologySelection::Weighted(TopologyWeighting {
+                prefix_weights: weights
+                    .iter()
+                    .map(|(tag_index, weight)| TopologyPrefixWeight {
+                        tag_index: *tag_index,
+                        weight: *weight,
+                    })
+                    .collect(),
+            }),
+        }
+    }
+
+    fn same_arc_pair_with_hash_order(far_hash_wins: bool) -> (PeerEntry, PeerEntry, u32) {
+        let me = peer(0, 0, &["us", "z1"]);
+        let k = 4;
+        let span = u64::MAX / k;
+        for offset in 1..10_000u64 {
+            let close = peer(1, span + offset, &["us", "z1"]);
+            let far = peer(2, span + 10_000 + offset, &["eu", "z9"]);
+            let arc = arc_index(me.ring, close.ring, span, k as u32);
+            assert_eq!(arc, arc_index(me.ring, far.ring, span, k as u32));
+            let close_hash = rendezvous_hash(me.ring, close.ring, arc);
+            let far_hash = rendezvous_hash(me.ring, far.ring, arc);
+            if (far_hash < close_hash) == far_hash_wins {
+                return (close, far, arc);
+            }
+        }
+        panic!("could not find same-arc candidates with requested hash order");
+    }
+
+    #[test]
+    fn weighted_neutral_uses_rendezvous_hash() {
+        let me = peer(0, 0, &["us", "z1"]);
+        let (close, far, arc) = same_arc_pair_with_hash_order(true);
+        let ft = FingerTable::build(me, &[close.clone(), far.clone()], weighted_cfg(4, &[]));
+
+        assert_eq!(ft.fingers()[arc as usize].node, far.node);
+    }
+
+    #[test]
+    fn weighted_positive_prefix_weight_can_favor_local_peer() {
+        let me = peer(0, 0, &["us", "z1"]);
+        let (close, far, arc) = same_arc_pair_with_hash_order(true);
+        let ft = FingerTable::build(
+            me,
+            &[close.clone(), far.clone()],
+            weighted_cfg(4, &[(1, 1.0)]),
+        );
+
+        assert_eq!(ft.fingers()[arc as usize].node, close.node);
+    }
+
+    #[test]
+    fn weighted_negative_prefix_weight_can_penalize_local_peer() {
+        let me = peer(0, 0, &["us", "z1"]);
+        let (close, far, arc) = same_arc_pair_with_hash_order(false);
+        let ft = FingerTable::build(
+            me,
+            &[close.clone(), far.clone()],
+            weighted_cfg(4, &[(1, -1.0)]),
+        );
+
+        assert_eq!(ft.fingers()[arc as usize].node, far.node);
+    }
+
+    #[test]
+    fn most_specific_weight_wins() {
+        let me = peer(0, 0, &["us", "z1"]);
+        let same_az = peer(1, 100, &["us", "z1"]);
+        let same_region = peer(2, 200, &["us", "z2"]);
+
+        let weighting = TopologyWeighting {
+            prefix_weights: vec![
+                TopologyPrefixWeight {
+                    tag_index: 0,
+                    weight: 0.25,
+                },
+                TopologyPrefixWeight {
+                    tag_index: 1,
+                    weight: -0.5,
+                },
+            ],
+        };
+
+        assert_eq!(
+            matching_weight(shared_prefix_len(&me.tags, &same_region.tags), &weighting),
+            0.25
+        );
+        assert_eq!(
+            matching_weight(shared_prefix_len(&me.tags, &same_az.tags), &weighting),
+            -0.5
+        );
     }
 
     #[test]
@@ -410,14 +643,14 @@ mod tests {
             &["us", "z1", "r2", "k1"],
         ));
 
-        let cfg = FingerTableConfig { k: 8 };
-        let base = FingerTable::build(me.clone(), &peers, cfg);
+        let cfg = FingerTableConfig::with_k(8);
+        let base = FingerTable::build(me.clone(), &peers, cfg.clone());
 
         for seed in [1u64, 2, 17, 12345] {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
             let mut shuffled = peers.clone();
             shuffled.shuffle(&mut rng);
-            let other = FingerTable::build(me.clone(), &shuffled, cfg);
+            let other = FingerTable::build(me.clone(), &shuffled, cfg.clone());
             assert_eq!(base.k(), other.k(), "seed={seed}");
             assert_eq!(base.local().node, other.local().node, "seed={seed}");
             assert_eq!(base.local().ring, other.local().ring, "seed={seed}");
@@ -441,6 +674,53 @@ mod tests {
     }
 
     #[test]
+    fn weighted_build_is_order_invariant() {
+        use rand::SeedableRng;
+        use rand::seq::SliceRandom;
+        use rand_chacha::ChaCha8Rng;
+
+        let me = peer(0, 1 << 32, &["us", "z1", "r1", "k1"]);
+        let topo_groups: &[&[&str]] = &[
+            &["us", "z1", "r1", "k1"],
+            &["us", "z1", "r1", "k2"],
+            &["us", "z1", "r2", "k1"],
+            &["us", "z2", "r1", "k1"],
+            &["eu", "z1", "r1", "k1"],
+            &["ap", "z1", "r1", "k1"],
+        ];
+        let mut peers: Vec<PeerEntry> = Vec::new();
+        for i in 1u64..=30 {
+            let labels = topo_groups[(i as usize) % topo_groups.len()];
+            let ring = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            peers.push(peer(i, ring, labels));
+        }
+
+        let cfg = weighted_cfg(8, &[(0, 0.15), (1, -0.2), (2, 0.05)]);
+        let base = FingerTable::build(me.clone(), &peers, cfg.clone());
+
+        for seed in [1u64, 2, 17, 12345] {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let mut shuffled = peers.clone();
+            shuffled.shuffle(&mut rng);
+            let other = FingerTable::build(me.clone(), &shuffled, cfg.clone());
+            for (i, (a, b)) in base.fingers().iter().zip(other.fingers()).enumerate() {
+                assert_eq!(a.node, b.node, "seed={seed} arc={i}");
+                assert_eq!(a.ring, b.ring, "seed={seed} arc={i}");
+            }
+            assert_eq!(
+                base.successor().map(|p| p.node),
+                other.successor().map(|p| p.node),
+                "seed={seed}"
+            );
+            assert_eq!(
+                base.predecessor().map(|p| p.node),
+                other.predecessor().map(|p| p.node),
+                "seed={seed}"
+            );
+        }
+    }
+
+    #[test]
     fn no_self_loop_in_next_hop() {
         let me = peer(0, 12345, &["us", "z1", "r1", "k1"]);
         let peers = vec![
@@ -448,7 +728,7 @@ mod tests {
             peer(2, 32345, &["us", "z1", "r2", "k1"]),
             peer(3, 42345, &["us", "z2", "r1", "k1"]),
         ];
-        let ft = FingerTable::build(me.clone(), &peers, FingerTableConfig { k: 32 });
+        let ft = FingerTable::build(me.clone(), &peers, FingerTableConfig::with_k(32));
         for t in [0u64, 1, 12345, 22345, 99999, u64::MAX] {
             if let Some(p) = ft.next_hop(RingId(t)) {
                 assert_ne!(p.node, me.node, "self loop at target={t}");
@@ -497,7 +777,54 @@ mod tests {
             peers.push(peer(i, ring, labels));
         }
 
-        let built = FingerTable::build(me.clone(), &peers, FingerTableConfig { k: 16 });
+        let built = FingerTable::build(me.clone(), &peers, FingerTableConfig::with_k(16));
+        let explicit = explicit_from_built(&built);
+
+        assert_eq!(
+            built.successor().map(|p| p.node),
+            explicit.successor().map(|p| p.node)
+        );
+        assert_eq!(
+            built.predecessor().map(|p| p.node),
+            explicit.predecessor().map(|p| p.node)
+        );
+
+        for t in 0u64..2000 {
+            let target = RingId(t.wrapping_mul(0x1234_5678_9ABC_DEF1));
+            assert_eq!(
+                built.next_hop(target).map(|p| p.node),
+                explicit.next_hop(target).map(|p| p.node),
+                "next_hop diverged at target={}",
+                target.0
+            );
+        }
+    }
+
+    #[test]
+    fn from_explicit_reproduces_weighted_built_routing() {
+        // Weighted topology still only affects build-time finger selection.
+        // Once the selected neighbors are made explicit, runtime routing must
+        // be byte-for-byte equivalent to the globally-built table.
+        let me = peer(0, 1 << 40, &["us", "z1", "r1", "k1"]);
+        let topo_groups: &[&[&str]] = &[
+            &["us", "z1", "r1", "k1"],
+            &["us", "z1", "r2", "k3"],
+            &["us", "z2", "r1", "k1"],
+            &["eu", "z1", "r1", "k1"],
+            &["ap", "z3", "r2", "k4"],
+        ];
+        let mut peers: Vec<PeerEntry> = Vec::new();
+        for i in 1u64..=40 {
+            let labels = topo_groups[(i as usize) % topo_groups.len()];
+            let ring = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            peers.push(peer(i, ring, labels));
+        }
+
+        let built = FingerTable::build(
+            me.clone(),
+            &peers,
+            weighted_cfg(16, &[(0, 0.2), (1, -0.35), (2, 0.1)]),
+        );
         let explicit = explicit_from_built(&built);
 
         assert_eq!(

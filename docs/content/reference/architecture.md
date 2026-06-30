@@ -20,7 +20,7 @@ central control plane. It adds:
 
 ### machina -- SSH Provisioning Controller
 
-Binary `cmd/machina`, deployed as `machina-controller` in the `unbounded-kube`
+Binary `cmd/machina`, deployed as `machina-controller` in the `unbounded-system`
 namespace. Built on controller-runtime.
 
 **Responsibilities:**
@@ -46,7 +46,7 @@ but the shipped ConfigMap (rendered from `deploy/machina/03-config.yaml.tmpl`) s
 
 ### metalman -- Bare Metal PXE Controller
 
-Binary `cmd/metalman`, deployed as `metalman-controller` in `unbounded-kube`.
+Binary `cmd/metalman`, deployed as `metalman-controller` in `unbounded-system`.
 
 Runs three reconcilers and four network servers:
 
@@ -170,7 +170,7 @@ For a walkthrough, see the [PXE Provisioning Guide]({{< ref "guides/pxe" >}}).
 
 | Area | Mechanism |
 |------|-----------|
-| SSH keys | Ed25519, RSA, and ECDSA supported (user-provided). Stored as Secrets in `unbounded-kube`. |
+| SSH keys | Ed25519, RSA, and ECDSA supported (user-provided). Stored as Secrets in `unbounded-system`. |
 | SSH host verification | Currently disabled (`InsecureIgnoreHostKey`). The `status.ssh.fingerprint` field exists in the CRD but host key verification is not yet enforced. |
 | Bootstrap tokens | Standard kubeadm tokens (`token-id` + `token-secret`). SSH path passes as env var; PXE path encrypts via TPM. |
 | TPM attestation | TOFU EK pinning. AES-256-GCM encrypted service-account tokens with 1-hour expiry. |
@@ -180,7 +180,7 @@ For a walkthrough, see the [PXE Provisioning Guide]({{< ref "guides/pxe" >}}).
 
 ## Deployment
 
-All components deploy into the `unbounded-kube` namespace. Manifests are plain
+All components deploy into the `unbounded-system` namespace. Manifests are plain
 numbered YAML files (no Helm or Kustomize).
 
 | Directory | Contents |

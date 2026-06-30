@@ -79,7 +79,7 @@ func Run() {
 	root.PersistentFlags().StringVar(&g.orcaURL, "orca-url", g.orcaURL,
 		"Edge URL of the orca instance (default http://localhost:8443 via kubectl port-forward)")
 	root.PersistentFlags().StringVar(&g.namespace, "namespace", g.namespace,
-		"Kubernetes namespace where Orca + Azurite + Garage are deployed (default unbounded-kube)")
+		"Kubernetes namespace where Orca + Azurite + Garage are deployed (default unbounded-system)")
 
 	// Origin overrides.
 	root.PersistentFlags().StringVar(&g.originDriver, "origin-driver", g.originDriver,

@@ -95,6 +95,7 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		e.log.Info("host devices detected, configuring nspawn bind-mounts",
 			"total", len(hostDevicePaths),
 			"kvm", len(e.goalState.HostDevices.KVM),
+			"network", len(e.goalState.HostDevices.Network),
 			"block", len(e.goalState.HostDevices.Block),
 			"infiniband", len(e.goalState.HostDevices.Infiniband))
 	}

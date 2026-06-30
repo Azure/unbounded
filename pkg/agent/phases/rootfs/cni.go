@@ -47,17 +47,8 @@ func (d *downloadCNIBinaries) Name() string { return "download-cni-binaries" }
 
 func (d *downloadCNIBinaries) Do(ctx context.Context) error {
 	destDir := filepath.Join(d.goalState.MachineDir, cniBinDir)
-
-	version := d.goalState.CNIPluginVersion
-
-	var override *goalstates.DownloadSource
-	if d.goalState.Downloads != nil {
-		override = d.goalState.Downloads.CNI
-	}
-
-	if override != nil && override.Version != "" {
-		version = override.Version
-	}
+	override := cniDownloadSource(d.goalState)
+	version := downloadSourceVersion(d.goalState.CNIPluginVersion, override)
 
 	downloadURL := cniDownloadURL(override, version, d.goalState.HostArch)
 

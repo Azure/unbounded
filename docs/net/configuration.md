@@ -42,7 +42,7 @@ controller:
     leaseDuration: 15s
     renewDeadline: 5s
     retryPeriod: 10s
-    resourceNamespace: unbounded-net
+    resourceNamespace: unbounded-system
     resourceName: unbounded-net-controller
 
 node:
@@ -624,7 +624,7 @@ graph TD
 |----------|-------------|
 | `LOG_LEVEL` | Initial klog verbosity passed as `-v=$(LOG_LEVEL)`. For dynamic changes without restart, edit `common.logLevel` in the ConfigMap YAML instead. |
 | `POD_NAME` | Pod name for leader election identity. Auto-populated from downward API. |
-| `POD_NAMESPACE` | Namespace for leader election lease. Default: `unbounded-net`. |
+| `POD_NAMESPACE` | Namespace for leader election lease. Default: `unbounded-system`. |
 | `POD_IP` | Pod IP address. Used for EndpointSlice management so the leader's dashboard is accessible via the controller Service. |
 | `NODE_NAME` | Node name. Displayed in the dashboard as the leader node. |
 | `AZURE_TENANT_ID` | Optional tenant ID used only to build Azure Portal URLs in the UI. Required only when the managed VMs are in a different tenant than the admin account currently signed into Azure Portal. |

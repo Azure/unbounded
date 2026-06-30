@@ -5,14 +5,20 @@ the gantry agent as a Kubernetes DaemonSet.
 
 ## Files
 
-| File | Purpose |
-| --- | --- |
-| `daemonset.yaml` | One-pod-per-node DaemonSet. |
-| `serviceaccount.yaml` | ServiceAccount + ClusterRole + Role + PriorityClass. |
-| `configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
-| `registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
-| `examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
-| `hosts.toml.template` | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
+These are Go templates (`*.yaml.tmpl`); the only templated value is the
+install namespace, which defaults to `unbounded-system`. Render them with
+`make gantry-manifests` (override with `GANTRY_NAMESPACE=<ns>` or the unified
+`UNBOUNDED_NAMESPACE=<ns>`), which writes plain manifests into
+`deploy/gantry/rendered/`.
+
+| Template | Rendered to | Purpose |
+| --- | --- | --- |
+| `daemonset.yaml.tmpl` | `rendered/daemonset.yaml` | One-pod-per-node DaemonSet. |
+| `serviceaccount.yaml.tmpl` | `rendered/serviceaccount.yaml` | Namespace + ServiceAccount + ClusterRole + Role + PriorityClass. |
+| `configmap.yaml.tmpl` | `rendered/configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
+| `examples/registry-secret.example.yaml.tmpl` | `rendered/examples/registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
+| `examples/networkpolicy.yaml.tmpl` | `rendered/examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
+| `hosts.toml.template` | (not rendered) | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
 
 The container image is built from `images/gantry/Containerfile` via
 `make image-gantry-local` (or `make image-gantry-push` to push).
@@ -20,10 +26,14 @@ The container image is built from `images/gantry/Containerfile` via
 ## Apply order
 
 ```sh
-kubectl apply -f deploy/serviceaccount.yaml
-kubectl apply -f deploy/configmap.yaml
+# Render the templates into deploy/gantry/rendered/ first (defaults to the
+# unbounded-system namespace; override with UNBOUNDED_NAMESPACE / GANTRY_NAMESPACE).
+make gantry-manifests
+
+kubectl apply -f deploy/gantry/rendered/serviceaccount.yaml
+kubectl apply -f deploy/gantry/rendered/configmap.yaml
 # Operator: for any PRIVATE upstream registry, edit
-# registry-secret.example.yaml (rename it, fill in real
+# rendered/examples/registry-secret.example.yaml (rename it, fill in real
 # username:password values keyed by registry `name:`) and apply,
 # AND uncomment the matching `credentials_path:` line in
 # configmap.yaml. The default ConfigMap ships credentials-free so
@@ -31,9 +41,9 @@ kubectl apply -f deploy/configmap.yaml
 # Secret being applied - origin.New eagerly reads every
 # credentials_path at startup, so an unmatched path would
 # crashloop the pod.
-kubectl apply -f deploy/registry-secret.example.yaml   # private registries only
-kubectl apply -f deploy/daemonset.yaml
-# deploy/examples/networkpolicy.yaml is a hardening overlay; do NOT
+kubectl apply -f deploy/gantry/rendered/examples/registry-secret.example.yaml   # private registries only
+kubectl apply -f deploy/gantry/rendered/daemonset.yaml
+# rendered/examples/networkpolicy.yaml is a hardening overlay; do NOT
 # apply it as part of the initial install. See "Hardening overlays"
 # below for the workflow.
 ```
@@ -68,7 +78,7 @@ on its own; no restart needed.
 
 | Check | How |
 | --- | --- |
-| Agents are running | `kubectl -n gantry-system get ds gantry` |
+| Agents are running | `kubectl -n unbounded-system get ds gantry` |
 | Liveness / readiness | `/livez`, `/readyz` on 9095 per pod |
 | Metrics | `curl http://<pod-ip>:9095/metrics` or scrape from Prometheus |
 | Routing-table grew | `p2p_dht_health_score` ≥ 0.7 |
@@ -95,7 +105,7 @@ into a state that is hard to debug.
 > 127.0.0.1` binding on the DaemonSet's hostPort only restricts
 > *host-side* reach; the listener inside the pod is still
 > `0.0.0.0`. Production installs **should** adopt
-> [`examples/networkpolicy.yaml`](examples/networkpolicy.yaml) (or
+> [`examples/networkpolicy.yaml.tmpl`](examples/networkpolicy.yaml.tmpl) (or
 > an equivalent NetworkPolicy in their own overlay) to close that
 > pod-network gap. The overlay is shipped as an example rather than
 > a default because its allow-list depends on the cluster's
@@ -114,7 +124,7 @@ table below.
 Workflow:
 
 1. Roll out the DaemonSet without the overlay and verify
-   `kubectl -n gantry-system rollout status ds/gantry`,
+   `kubectl -n unbounded-system rollout status ds/gantry`,
    `p2p_cache_hit_total`, and a successful workload pull.
 2. Copy the overlay into your own repository (or a Kustomize /
    Helm chart), edit every ipBlock marked "OPERATOR ACTION
@@ -127,7 +137,7 @@ Workflow:
    `dht routing table empty` (no peer libp2p traffic) or as
    containerd `connection refused` on 5000 (wrong mirror source
    CIDR), not as a NetworkPolicy validation error.
-4. Roll back with `kubectl delete networkpolicy -n gantry-system
+4. Roll back with `kubectl delete networkpolicy -n unbounded-system
    gantry-agent` if anything regresses.
 
 Future hardening overlays (Pod Security Standards, dedicated

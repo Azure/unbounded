@@ -92,7 +92,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: unbounded-net-kube-proxy
-    namespace: {{ .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -108,14 +108,14 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: unbounded-net-controller
-    namespace: {{ .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: unbounded-net-controller
-  namespace: {{ .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: unbounded-net-controller
     app.kubernetes.io/component: controller
@@ -176,7 +176,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: unbounded-net-controller
-  namespace: {{ .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: unbounded-net-controller
     app.kubernetes.io/component: controller
@@ -187,7 +187,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: unbounded-net-controller
-    namespace: {{ .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}
 
 ---
 # Role in kube-system for reading extension-apiserver-authentication ConfigMap
@@ -220,4 +220,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: unbounded-net-controller
-    namespace: {{ .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}

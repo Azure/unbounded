@@ -34,6 +34,7 @@ pub use schema::{
     DiskSpec, FabricCfg, FakeBackendConfig, FileDiskConfig, FrontendSpec, HttpBackendConfig,
     HttpFrontendConfig, LoadgenFrontendConfig, MemoryCfg, PeerSpec, RdmaPeerConfig, RoutingPlan,
     S3BackendConfig, S3FrontendConfig, StartupCfg, TcpFabricBinds, TcpPeerConfig, TopologyCfg,
-    backend_spec, disk_spec, fabric_cfg, frontend_spec, peer_spec,
+    TopologyPrefixWeight, TopologyWeighting, backend_spec, disk_spec, fabric_cfg, frontend_spec,
+    peer_spec,
 };
 pub use watch::{ConfigUpdate, ConfigWatcher, WatchError};

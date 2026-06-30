@@ -25,11 +25,11 @@ use unbounded_storage::backend::{BackendRegistry, FixedRegion, OriginRing};
 use unbounded_storage::bufferpool::BlockStore;
 use unbounded_storage::config::{self, BackendSpec, RuntimePeer};
 use unbounded_storage::fabric::{self, ConnectionSpec, Fabric, PeerId, Provider, RpcServerHandle};
-use unbounded_storage::memory::{allocate, BackingKind, BackingRequest, HUGEPAGE_2MB};
+use unbounded_storage::memory::{BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
 use unbounded_storage::p2p::{RecursiveHandler, RouteTableHandle, RouteTableSnapshot};
 use unbounded_storage::runtime::{Threading, WorkerIdx};
-use unbounded_storage::storage::disks::{CacheDirectorySet, ChainLocalStore};
 use unbounded_storage::storage::StripeReq;
+use unbounded_storage::storage::disks::{CacheDirectorySet, ChainLocalStore};
 use unbounded_storage::topology::{NicWorkerGroup, ServingShard};
 
 use crate::FabricStartup;
@@ -577,7 +577,7 @@ mod tests {
 
     use super::*;
 
-    use unbounded_storage::config::{peer_spec, PeerSpec, RdmaPeerConfig};
+    use unbounded_storage::config::{PeerSpec, RdmaPeerConfig, peer_spec};
     use unbounded_storage::p2p::node_id_from_name;
 
     fn shard(cpu: u32, numa: Option<u16>) -> ServingShard {

@@ -90,6 +90,8 @@ pub struct CallCounts {
     /// `(key, page_no) -> bulk_get count` for the single-flight
     /// invariant. Keyed by intra-stripe page number, not byte offset.
     pub bulk_get_by_page: RefCell<HashMap<(StripeKey, u64), u32>>,
+    pub bulk_get_total_inflight: Cell<u32>,
+    pub bulk_get_max_total_inflight: Cell<u32>,
     /// `(key, page_no) -> max observed in-flight `bulk_get`s`. The
     /// single-flight invariant tolerates sequential re-issues
     /// (slot recycled, then refetched later) but forbids two
@@ -190,6 +192,11 @@ struct InflightGuard<'a> {
 
 impl<'a> InflightGuard<'a> {
     fn enter(counts: &'a CallCounts, key: StripeKey, page_no: u64) -> Self {
+        let total = counts.bulk_get_total_inflight.get() + 1;
+        counts.bulk_get_total_inflight.set(total);
+        if total > counts.bulk_get_max_total_inflight.get() {
+            counts.bulk_get_max_total_inflight.set(total);
+        }
         let mut inflight = counts.bulk_get_inflight.borrow_mut();
         let entry = inflight.entry((key, page_no)).or_insert(0);
         *entry += 1;
@@ -209,6 +216,9 @@ impl<'a> InflightGuard<'a> {
 
 impl<'a> Drop for InflightGuard<'a> {
     fn drop(&mut self) {
+        self.counts
+            .bulk_get_total_inflight
+            .set(self.counts.bulk_get_total_inflight.get().saturating_sub(1));
         let mut inflight = self.counts.bulk_get_inflight.borrow_mut();
         if let Some(e) = inflight.get_mut(&(self.key, self.page_no)) {
             *e = e.saturating_sub(1);

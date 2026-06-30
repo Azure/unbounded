@@ -29,7 +29,8 @@ use unbounded_storage::frontend::{
 };
 use unbounded_storage::p2p::{
     FingerTable, FingerTableConfig, NodeId, PeerEntry, RouteTableHandle, RouteTableSnapshot,
-    RoutedTransport, RoutingSnapshot, TopologyTags, node_to_ring,
+    RoutedTransport, RoutingSnapshot, TopologyPrefixWeight, TopologySelection, TopologyTags,
+    TopologyWeighting, node_to_ring,
 };
 use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
@@ -892,7 +893,7 @@ fn run_shard(
     // atomically by its transport; the fabric RPC handlers are reloaded
     // separately by the `FabricGroup`), refreshes the stripe geometry,
     // reconciles the transport origin-backend registry and the frontend
-    // registry toward the new config, and then acknowledges
+    // registry toward the new config, applies disk-policy side effects, and then acknowledges
     // so the coordinator's blocking apply can complete. Everything is
     // driven from this one thread so the `ArcSwap` publishes are ordered
     // and the build-from-spec (DNS resolve, listener bind) stays off the
@@ -901,6 +902,7 @@ fn run_shard(
         let routes = routes.clone();
         let transport_registry = transport_registry.clone();
         let frontend_registry = frontend_registry.clone();
+        let pool = pool.clone();
         let geometry = geometry.clone();
         let bindings = frontend_registry.ctx.bindings.clone();
         let mut last_backends: HashMap<String, BackendSpec> = backend_specs
@@ -936,7 +938,6 @@ fn run_shard(
                         let desired_frontends = apply.config.frontends.as_slice();
                         let desired_frontend_backends =
                             config::frontend_backend_map(&projection.frontends);
-
                         // Refresh stripe geometry before building any
                         // frontend so a co-applied backend stripe change
                         // is visible to a frontend add in the same pass.
@@ -992,6 +993,14 @@ fn run_shard(
                         let _ = apply.ack.send(config::ShardAck {
                             worker: widx,
                             result,
+                        });
+                        did_work = true;
+                    }
+                    config::ShardCommand::DrainPageCache(drain) => {
+                        pool.drain_page_cache();
+                        let _ = drain.ack.send(config::ShardAck {
+                            worker: widx,
+                            result: Ok(()),
                         });
                         did_work = true;
                     }
@@ -1147,6 +1156,12 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
             &peers,
             FingerTableConfig {
                 k: mesh.fingers_per_node.max(1),
+                topology: mesh
+                    .topology_weighting
+                    .as_ref()
+                    .map(p2p_topology_weighting)
+                    .map(TopologySelection::Weighted)
+                    .unwrap_or_default(),
             },
         ))
     };
@@ -1164,6 +1179,19 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
         })
         .collect();
     RouteTableSnapshot { routes }
+}
+
+fn p2p_topology_weighting(weighting: &config::TopologyWeighting) -> TopologyWeighting {
+    TopologyWeighting {
+        prefix_weights: weighting
+            .prefix_weights
+            .iter()
+            .map(|weight| TopologyPrefixWeight {
+                tag_index: weight.tag_index,
+                weight: weight.weight,
+            })
+            .collect(),
+    }
 }
 
 fn reconcile_cache_disks(

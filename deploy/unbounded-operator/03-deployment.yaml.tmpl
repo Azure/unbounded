@@ -6,7 +6,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: unbounded-operator
-  namespace: {{ default "unbounded-kube" .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: unbounded-operator
     app.kubernetes.io/component: controller
@@ -28,9 +28,9 @@ spec:
           imagePullPolicy: Always
           args:
             - --leader-elect=true
-            - --leader-elect-namespace={{ default "unbounded-kube" .Namespace }}
-            - --default-namespace={{ default "unbounded-kube" .Namespace }}
-            - --net-namespace={{ default "unbounded-net" .NetNamespace }}
+            - --leader-elect-namespace={{ default "unbounded-system" .Namespace }}
+            - --default-namespace={{ default "unbounded-system" .Namespace }}
+            - --net-namespace={{ default "unbounded-system" .NetNamespace }}
             - --net-controller-image={{ .NetControllerImage }}
             - --net-node-image={{ .NetNodeImage }}
             - --machina-image={{ .MachinaImage }}

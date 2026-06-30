@@ -137,7 +137,7 @@ and divergent install behavior between kind and non-kind clusters.
 ### Problem
 
 `setup-orca.sh --uninstall` deletes the entire namespace. On an
-existing dev cluster, the default namespace `unbounded-kube` may
+existing dev cluster, the default namespace `unbounded-system` may
 also contain other Unbounded components. This can delete unrelated
 resources.
 
@@ -165,14 +165,14 @@ resources.
 ### Tests
 
 - Add a kind smoke step that (a) creates a sentinel ConfigMap in
-  `unbounded-kube`, (b) runs `setup-orca.sh --uninstall`, (c) asserts
+  `unbounded-system`, (b) runs `setup-orca.sh --uninstall`, (c) asserts
   the sentinel still exists.
 - Run `bash -n hack/orca/setup-orca.sh` for syntax.
 
 ### Acceptance Criteria
 
 - `setup-orca.sh --uninstall` does not delete unrelated resources in
-  `unbounded-kube`.
+  `unbounded-system`.
 - `setup-orca.sh --uninstall --delete-namespace` is the only path
   that removes the namespace.
 

@@ -309,7 +309,7 @@ mod tests {
         // Single-node table: this node owns everything, so the
         // routing decision is always "Backend arm".
         let local = peer(1);
-        let fingers = FingerTable::build(local.clone(), &[], FingerTableConfig { k: 8 });
+        let fingers = FingerTable::build(local.clone(), &[], FingerTableConfig::with_k(8));
         let _ = node_to_peer_map(&[1]);
         for target in [0u64, 1, 999, u64::MAX / 2, u64::MAX] {
             assert!(
@@ -330,7 +330,7 @@ mod tests {
         let fingers = FingerTable::build(
             local.clone(),
             std::slice::from_ref(&other),
-            FingerTableConfig { k: 8 },
+            FingerTableConfig::with_k(8),
         );
         let req = TestReq(key_for_ring(other.ring.0), false);
         assert!(
@@ -352,7 +352,7 @@ mod tests {
         let fingers = FingerTable::build(
             local,
             std::slice::from_ref(&other),
-            FingerTableConfig { k: 8 },
+            FingerTableConfig::with_k(8),
         );
         let key = key_for_ring(other.ring.0);
         let owns_locally = fingers.next_hop(stripe_to_ring(key)).is_none();

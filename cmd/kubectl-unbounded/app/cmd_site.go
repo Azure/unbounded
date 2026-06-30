@@ -10,7 +10,7 @@ import (
 func siteCommandGroup() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "site",
-		Short: "Manage unbounded-kube sites",
+		Short: "Manage unbounded sites",
 	}
 
 	cmd.AddCommand(

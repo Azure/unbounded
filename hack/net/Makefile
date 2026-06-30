@@ -10,7 +10,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 SCRIPTS_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 
 # Knobs.
-NET_NAMESPACE       ?= unbounded-net
+NET_NAMESPACE       ?= unbounded-system
 NET_LOG_LEVEL       ?=
 NET_AZURE_TENANT_ID ?=
 

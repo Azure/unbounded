@@ -89,7 +89,8 @@ Initialize a new Unbounded site. This command:
 
 Global components (`unbounded-net`, `machina`, and `unbounded-storage`) are
 enabled on the cluster Site. `metalman` is per-site and is enabled on the remote
-Site when `--enable-metalman` is set.
+Site when `--enable-metalman` is set. All components are deployed into the
+`unbounded-system` namespace by default.
 
 #### Required Flags
 

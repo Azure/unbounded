@@ -236,13 +236,13 @@ jobs:
           ACR_USERNAME=$(az acr credential show --name "$ACR_NAME" --query username -o tsv)
           ACR_PASSWORD=$(az acr credential show --name "$ACR_NAME" --query 'passwords[0].value' -o tsv)
 
-          kubectl -n unbounded-net delete secret unbounded-net-acr-pull --ignore-not-found
-          kubectl -n unbounded-net create secret docker-registry unbounded-net-acr-pull \
+          kubectl -n unbounded-system delete secret unbounded-net-acr-pull --ignore-not-found
+          kubectl -n unbounded-system create secret docker-registry unbounded-net-acr-pull \
             --docker-server="$ACR_LOGIN_SERVER" \
             --docker-username="$ACR_USERNAME" \
             --docker-password="$ACR_PASSWORD"
 
-          kubectl -n unbounded-net patch serviceaccount unbounded-net-node \
+          kubectl -n unbounded-system patch serviceaccount unbounded-net-node \
             --type merge \
             -p '{"imagePullSecrets":[{"name":"unbounded-net-acr-pull"}]}'
 
@@ -534,7 +534,7 @@ jobs:
           KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl get machines -o wide > logs/machines.txt 2>&1 || true
           KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl get machines -o yaml > logs/machines.yaml 2>&1 || true
           KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl describe machines > logs/machines-describe.txt 2>&1 || true
-          KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl -n unbounded-kube logs deploy/machina-controller > logs/machina.log 2>&1 || true
+          KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl -n unbounded-system logs deploy/machina-controller > logs/machina.log 2>&1 || true
 
       - name: Upload diagnostics
         if: failure()

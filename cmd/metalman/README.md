@@ -71,7 +71,8 @@ metalman serve-pxe --site=<site> [flags]
 #### Deploying With Site Components
 
 Enable Metalman in the Site spec and let `unbounded-operator` create or update
-the per-site Deployment running `metalman serve-pxe`:
+the per-site Deployment running `metalman serve-pxe`. The Deployment is
+server-side applied into the `unbounded-system` namespace:
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
