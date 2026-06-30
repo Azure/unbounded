@@ -9,7 +9,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,9 +23,55 @@ import (
 func preflightConfig(apiServer string) provision.UnboundedAgentConfig {
 	cfg := sampleConfig()
 	cfg.Kubelet.ApiServer = apiServer
-	cfg.OCIImage = "registry.example.com/unbounded/rootfs:v1"
+
+	parsed, err := url.Parse(apiServer)
+	if err == nil && parsed.Host != "" {
+		cfg.OCIImage = parsed.Host + "/unbounded/rootfs:v1"
+	} else {
+		cfg.OCIImage = "127.0.0.1:1/unbounded/rootfs:v1"
+	}
+
+	baseURL := strings.TrimRight(apiServer, "/")
+	cfg.Downloads = &provision.AgentDownloads{
+		Kubernetes: &provision.AgentDownloadSource{URL: baseURL + "/kubernetes/%s/%s/%s"},
+		Containerd: &provision.AgentDownloadSource{URL: baseURL + "/containerd/%s/containerd-%s-linux-%s.tar.gz"},
+		Runc:       &provision.AgentDownloadSource{URL: baseURL + "/runc/%s/runc.%s"},
+		CNI:        &provision.AgentDownloadSource{URL: baseURL + "/cni/%s/%s/cni-plugins-v%s.tgz"},
+		Crictl:     &provision.AgentDownloadSource{URL: baseURL + "/crictl/%s/crictl-v%s-%s-%s.tar.gz"},
+	}
 
 	return cfg
+}
+
+func preflightTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	manifest := `{
+		"schemaVersion":2,
+		"mediaType":"application/vnd.oci.image.manifest.v1+json",
+		"config":{
+			"mediaType":"application/vnd.oci.image.config.v1+json",
+			"digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222",
+			"size":2
+		},
+		"layers":[]
+	}`
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v2/unbounded/rootfs/manifests/") {
+			w.Header().Set("Docker-Content-Digest", "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.WriteHeader(http.StatusOK)
+
+			if r.Method != http.MethodHead {
+				_, _ = w.Write([]byte(manifest))
+			}
+
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
 }
 
 func TestNewCmdPreflight(t *testing.T) {
@@ -36,9 +85,7 @@ func TestNewCmdPreflight(t *testing.T) {
 }
 
 func TestPreflightJSONOutput(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+	srv := preflightTestServer(t)
 	t.Cleanup(srv.Close)
 
 	path := writeConfigFile(t, preflightConfig(srv.URL))
@@ -79,16 +126,17 @@ func TestPreflightTextOutputError(t *testing.T) {
 		writer:     &out,
 	}
 
-	err := h.execute(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err := h.execute(ctx)
 	require.Error(t, err)
 	assert.Contains(t, out.String(), "[ERROR api-server-reachable]")
 	assert.NotContains(t, out.String(), "127.0.0.1")
 }
 
 func TestPreflightTextOutputIncludesOK(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+	srv := preflightTestServer(t)
 	t.Cleanup(srv.Close)
 
 	path := writeConfigFile(t, preflightConfig(srv.URL))
@@ -104,5 +152,5 @@ func TestPreflightTextOutputIncludesOK(t *testing.T) {
 	}
 
 	require.NoError(t, h.execute(context.Background()))
-	assert.Contains(t, out.String(), "[OK goal-state]")
+	assert.Contains(t, out.String(), "[OK kubernetes-artifacts]")
 }
