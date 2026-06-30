@@ -14,16 +14,14 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/hack/cmd/agent-artifacts-builder/artifacts"
 	"github.com/Azure/unbounded/internal/logger"
 )
 
-const (
-	defaultKubernetesVersionsFile = "hack/cmd/agent-artifacts-builder/kubernetes-versions.txt"
-	artifactTagRefPrefix          = "agent-artifacts/"
-)
+const artifactTagRefPrefix = "agent-artifacts/"
 
 //go:embed kubernetes-versions.txt
 var defaultKubernetesVersionsFS embed.FS
@@ -70,11 +68,11 @@ func newRootCommand() *cobra.Command {
 	flags.StringVar(&opts.ManifestPath, "manifest", "", "Path to offline artifact manifest.json declaring artifact versions")
 	flags.StringVar(&opts.KubernetesVersion, "kubernetes-version", "", "Kubernetes version for a default manifest using the agent's pinned runtime versions")
 	flags.StringSliceVar(&opts.Architectures, "arch", nil, "Target architecture to include. Repeat or comma separate. Defaults to the host GOARCH")
-	flags.BoolVar(&opts.SkipExisting, "skip-existing", false, "Reuse existing files in output dir instead of downloading them again")
 
 	cmd.AddCommand(
 		newResolvePublishInputsCommand(),
 		newPublishVersionGroupCommand(&debug, &logFormat),
+		newValidateOCICommand(&debug, &logFormat),
 	)
 
 	return cmd
@@ -91,10 +89,30 @@ func newLogger(debug bool, format string) *slog.Logger {
 	}
 
 	return slog.New(logger.NewPrettyFieldHandler(&lvl, logger.PrettyFieldHandlerOptions{
-		AttrOrder: []string{"artifact", "source", "oci_ref", "digest"},
+		AttrOrder: []string{"artifact", "source", "oci_ref", "digest", "staging_dir"},
 	}))
 }
 
+// GitHub Actions publishing flow:
+//
+//  1. The resolve job runs resolve-publish-inputs once. It resolves the OCI tag
+//     prefix and Kubernetes versions from either a tag push or workflow_dispatch
+//     inputs, then writes GitHub outputs consumed by the publish matrix.
+//  2. Tag pushes use the pushed ref after "agent-artifacts/" as the OCI tag
+//     prefix and always use the embedded default Kubernetes version list.
+//  3. Manual workflow_dispatch runs may pass an explicit tag prefix and a comma,
+//     space, or newline separated Kubernetes version list. Missing values default
+//     to the short commit SHA and embedded version list respectively.
+//  4. Versions are grouped by Kubernetes minor, for example 1.34 and 1.35. The
+//     workflow creates one publish job per minor group, while this binary still
+//     publishes every patch version inside that group. Each publish job creates
+//     one temporary staging directory so artifacts with the same version, such as
+//     containerd or runc, are downloaded once and materialized into each bundle.
+//  5. Each bundle is validated before push so invalid local content fails the
+//     job before publishing to the registry.
+//  6. Each published OCI tag must keep the shape documented in
+//     designs/agent-offline-bootstrap.md:
+//     ghcr.io/<owner>/unbounded/bootstrap-artifacts:<tag-prefix>-k8s-<kubernetes-version>
 func newPublishVersionGroupCommand(debug *bool, logFormat *string) *cobra.Command {
 	return &cobra.Command{
 		Use:          "publish-version-group",
@@ -122,6 +140,14 @@ func publishVersionGroup(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
+	stagingDir, cleanup, err := artifacts.NewStagingDir()
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	log.Info("using offline artifact staging directory", slog.String("staging_dir", stagingDir))
+
 	for _, kubernetesVersion := range versions {
 		ociRef := fmt.Sprintf("%s/bootstrap-artifacts:%s-k8s-%s", registry, tagPrefix, kubernetesVersion)
 		outputDir := filepath.Join("dist", "bootstrap-artifacts", kubernetesVersion)
@@ -134,6 +160,7 @@ func publishVersionGroup(ctx context.Context, log *slog.Logger) error {
 
 		if err := artifacts.Build(ctx, log, artifacts.Options{
 			OutputDir:         outputDir,
+			StagingDir:        stagingDir,
 			KubernetesVersion: kubernetesVersion,
 			Architectures:     []string{"amd64", "arm64"},
 			OCIRef:            ociRef,
@@ -195,6 +222,28 @@ func logBundleContents(log *slog.Logger, root string) error {
 
 		return nil
 	})
+}
+
+func newValidateOCICommand(debug *bool, logFormat *string) *cobra.Command {
+	var ociRef string
+
+	cmd := &cobra.Command{
+		Use:          "validate-oci",
+		Short:        "Pull and validate a pushed offline artifact OCI bundle",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if ociRef == "" {
+				return fmt.Errorf("--oci-ref is required")
+			}
+
+			return artifacts.ValidateOCI(cmd.Context(), newLogger(*debug, *logFormat), ociRef)
+		},
+	}
+
+	flags := cmd.Flags()
+	flags.StringVar(&ociRef, "oci-ref", "", "OCI artifact reference to pull and validate, with or without oci:// prefix")
+
+	return cmd
 }
 
 func newResolvePublishInputsCommand() *cobra.Command {
@@ -369,14 +418,12 @@ func groupKubernetesVersionsByMinor(versions []string) ([]kubernetesVersionGroup
 }
 
 func kubernetesMinorVersion(version string) (string, error) {
-	version = strings.TrimPrefix(version, "v")
-
-	parts := strings.Split(version, ".")
-	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
-		return "", fmt.Errorf("invalid Kubernetes version %q", version)
+	parsed, err := semver.NewVersion(strings.TrimSpace(version))
+	if err != nil {
+		return "", fmt.Errorf("parse Kubernetes version %q: %w", version, err)
 	}
 
-	return parts[0] + "." + parts[1], nil
+	return fmt.Sprintf("%d.%d", parsed.Major(), parsed.Minor()), nil
 }
 
 func shortSHA(sha string) string {

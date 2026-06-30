@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/renameio/v2"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sync/errgroup"
 	"oras.land/oras-go/v2"
@@ -48,20 +49,20 @@ type (
 
 type Options struct {
 	OutputDir         string
+	StagingDir        string
 	OCIRef            string
 	ManifestPath      string
 	Manifest          Manifest
 	KubernetesVersion string
 
 	Architectures []string
-
-	SkipExisting bool
 }
 
 type Artifact struct {
-	Name string
-	URL  string
-	Path string
+	Name             string
+	URL              string
+	Path             string
+	GenerateChecksum bool
 }
 
 type Plan struct {
@@ -75,15 +76,34 @@ func Build(ctx context.Context, log *slog.Logger, opts Options) error {
 		return err
 	}
 
+	stagingDir := opts.StagingDir
+	if stagingDir == "" {
+		var cleanup func()
+
+		stagingDir, cleanup, err = NewStagingDir()
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+	}
+
+	if err := downloadArtifacts(ctx, log, stagingDir, plan.Artifacts); err != nil {
+		return err
+	}
+
+	if err := materializeArtifacts(stagingDir, opts.OutputDir, plan.Artifacts); err != nil {
+		return err
+	}
+
 	if err := writeManifest(opts.OutputDir, plan.Manifest); err != nil {
 		return err
 	}
 
-	if err := downloadArtifacts(ctx, log, opts.OutputDir, plan.Artifacts, opts.SkipExisting); err != nil {
-		return err
-	}
-
 	if opts.OCIRef != "" {
+		if err := ValidateBundle(log, opts.OutputDir); err != nil {
+			return err
+		}
+
 		if err := PushOCI(ctx, log, opts.OutputDir, opts.OCIRef); err != nil {
 			return err
 		}
@@ -124,24 +144,28 @@ func NewPlan(opts Options) (Plan, error) {
 
 		artifacts = append(artifacts,
 			Artifact{
-				Name: "containerd",
-				URL:  agentartifacts.ContainerdArchive(nil, manifest.Versions.Containerd, arch),
-				Path: agentartifacts.ContainerdArtifactPath(manifest.Versions.Containerd, arch),
+				Name:             "containerd",
+				URL:              agentartifacts.ContainerdArchive(nil, manifest.Versions.Containerd, arch),
+				Path:             agentartifacts.ContainerdArtifactPath(manifest.Versions.Containerd, arch),
+				GenerateChecksum: true,
 			},
 			Artifact{
-				Name: "runc",
-				URL:  agentartifacts.RuncBinary(nil, manifest.Versions.Runc, arch),
-				Path: agentartifacts.RuncArtifactPath(manifest.Versions.Runc, arch),
+				Name:             "runc",
+				URL:              agentartifacts.RuncBinary(nil, manifest.Versions.Runc, arch),
+				Path:             agentartifacts.RuncArtifactPath(manifest.Versions.Runc, arch),
+				GenerateChecksum: true,
 			},
 			Artifact{
-				Name: "cni",
-				URL:  agentartifacts.CNIPluginsArchive(nil, manifest.Versions.CNI, arch),
-				Path: agentartifacts.CNIArtifactPath(manifest.Versions.CNI, arch),
+				Name:             "cni",
+				URL:              agentartifacts.CNIPluginsArchive(nil, manifest.Versions.CNI, arch),
+				Path:             agentartifacts.CNIArtifactPath(manifest.Versions.CNI, arch),
+				GenerateChecksum: true,
 			},
 			Artifact{
-				Name: "crictl",
-				URL:  agentartifacts.CrictlArchive(nil, manifest.Versions.Crictl, "linux", arch),
-				Path: agentartifacts.CrictlArtifactPath(manifest.Versions.Crictl, "linux", arch),
+				Name:             "crictl",
+				URL:              agentartifacts.CrictlArchive(nil, manifest.Versions.Crictl, "linux", arch),
+				Path:             agentartifacts.CrictlArtifactPath(manifest.Versions.Crictl, "linux", arch),
+				GenerateChecksum: true,
 			},
 		)
 	}
@@ -216,6 +240,79 @@ func PushOCI(ctx context.Context, log *slog.Logger, rootDir, ref string) error {
 	return nil
 }
 
+func NewStagingDir() (string, func(), error) {
+	base := filepath.Join("tmp", "agent-artifacts-builder-stage")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return "", nil, fmt.Errorf("create staging base dir %q: %w", base, err)
+	}
+
+	dir, err := os.MkdirTemp(base, "")
+	if err != nil {
+		return "", nil, fmt.Errorf("create staging dir: %w", err)
+	}
+
+	cleanup := func() {
+		os.RemoveAll(dir) //nolint:errcheck // best effort cleanup
+	}
+
+	return dir, cleanup, nil
+}
+
+func materializeArtifacts(stagingDir, outputDir string, artifacts []Artifact) error {
+	for _, artifact := range artifacts {
+		if err := materializeArtifact(stagingDir, outputDir, artifact.Path); err != nil {
+			return err
+		}
+
+		if artifact.GenerateChecksum {
+			if err := materializeArtifact(stagingDir, outputDir, artifact.Path+".sha256"); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func materializeArtifact(stagingDir, outputDir, path string) error {
+	source := filepath.Join(stagingDir, filepath.FromSlash(path))
+	dest := filepath.Join(outputDir, filepath.FromSlash(path))
+
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return fmt.Errorf("create dir for %q: %w", dest, err)
+	}
+
+	if err := os.Link(source, dest); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrExist) {
+		if copyErr := copyFileAtomically(source, dest); copyErr != nil {
+			return fmt.Errorf("materialize %q: link failed: %w; copy failed: %w", path, err, copyErr)
+		}
+
+		return nil
+	}
+
+	return copyFileAtomically(source, dest)
+}
+
+func copyFileAtomically(source, dest string) error {
+	info, err := os.Stat(source)
+	if err != nil {
+		return fmt.Errorf("stat %q: %w", source, err)
+	}
+
+	data, err := os.ReadFile(source)
+	if err != nil {
+		return fmt.Errorf("read %q: %w", source, err)
+	}
+
+	if err := renameio.WriteFile(dest, data, info.Mode().Perm()); err != nil {
+		return fmt.Errorf("install %q: %w", dest, err)
+	}
+
+	return nil
+}
+
 func writeManifest(rootDir string, manifest Manifest) error {
 	if err := os.MkdirAll(rootDir, 0o755); err != nil {
 		return fmt.Errorf("create output dir %q: %w", rootDir, err)
@@ -243,15 +340,13 @@ func writeManifest(rootDir string, manifest Manifest) error {
 	return nil
 }
 
-func downloadArtifacts(ctx context.Context, log *slog.Logger, rootDir string, artifacts []Artifact, skipExisting bool) error {
+func downloadArtifacts(ctx context.Context, log *slog.Logger, rootDir string, artifacts []Artifact) error {
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.SetLimit(4)
 
 	for _, artifact := range artifacts {
-		artifact := artifact
-
 		eg.Go(func() error {
-			return downloadArtifact(ctx, log, rootDir, artifact, skipExisting)
+			return downloadArtifact(ctx, log, rootDir, artifact)
 		})
 	}
 
@@ -260,9 +355,15 @@ func downloadArtifacts(ctx context.Context, log *slog.Logger, rootDir string, ar
 	}
 
 	for _, artifact := range artifacts {
+		path := filepath.Join(rootDir, filepath.FromSlash(artifact.Path))
+		if artifact.GenerateChecksum {
+			if err := writeGeneratedChecksum(path); err != nil {
+				return err
+			}
+		}
+
 		if artifact.Name == "kubelet" || artifact.Name == "kubectl" || artifact.Name == "kube-proxy" {
-			path := filepath.Join(rootDir, filepath.FromSlash(artifact.Path))
-			if err := verifyKubernetesChecksum(path); err != nil {
+			if err := verifyChecksum(path); err != nil {
 				return err
 			}
 		}
@@ -271,15 +372,13 @@ func downloadArtifacts(ctx context.Context, log *slog.Logger, rootDir string, ar
 	return nil
 }
 
-func downloadArtifact(ctx context.Context, log *slog.Logger, rootDir string, artifact Artifact, skipExisting bool) error {
+func downloadArtifact(ctx context.Context, log *slog.Logger, rootDir string, artifact Artifact) error {
 	dest := filepath.Join(rootDir, filepath.FromSlash(artifact.Path))
-	if skipExisting {
-		if _, err := os.Stat(dest); err == nil {
-			log.Info("skipping existing artifact", slog.String("artifact", artifact.Path))
-			return nil
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat %q: %w", dest, err)
-		}
+	if _, err := os.Stat(dest); err == nil {
+		log.Info("skipping existing artifact", slog.String("artifact", artifact.Path))
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat %q: %w", dest, err)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
@@ -288,15 +387,8 @@ func downloadArtifact(ctx context.Context, log *slog.Logger, rootDir string, art
 
 	log.Info("downloading artifact", slog.String("artifact", artifact.Path), slog.String("source", artifact.URL))
 
-	tmp := dest + ".tmp"
-	if err := downloadToFile(ctx, artifact.URL, tmp); err != nil {
-		os.Remove(tmp) //nolint:errcheck // best effort cleanup
+	if err := downloadToFile(ctx, artifact.URL, dest); err != nil {
 		return fmt.Errorf("download %s to %q: %w", artifact.URL, dest, err)
-	}
-
-	if err := os.Rename(tmp, dest); err != nil {
-		os.Remove(tmp) //nolint:errcheck // best effort cleanup
-		return fmt.Errorf("install %q: %w", dest, err)
 	}
 
 	log.Info("downloaded artifact", slog.String("artifact", artifact.Path))
@@ -322,25 +414,40 @@ func downloadToFile(ctx context.Context, sourceURL, dest string) (err error) {
 		return fmt.Errorf("unexpected status %s", resp.Status)
 	}
 
-	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	out, err := renameio.NewPendingFile(dest, renameio.WithPermissions(0o644))
 	if err != nil {
 		return err
 	}
-
-	defer func() {
-		if closeErr := out.Close(); closeErr != nil && err == nil {
-			err = closeErr
-		}
-	}()
+	defer out.Cleanup() //nolint:errcheck // pending file cleanup
 
 	if _, err := io.Copy(out, resp.Body); err != nil {
+		return err
+	}
+
+	if err := out.CloseAtomicallyReplace(); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func verifyKubernetesChecksum(binaryPath string) error {
+func writeGeneratedChecksum(path string) error {
+	checksum, err := sha256File(path)
+	if err != nil {
+		return err
+	}
+
+	checksumPath := path + ".sha256"
+
+	data := fmt.Sprintf("%s  %s\n", checksum, filepath.Base(path))
+	if err := renameio.WriteFile(checksumPath, []byte(data), 0o644); err != nil {
+		return fmt.Errorf("write checksum %q: %w", checksumPath, err)
+	}
+
+	return nil
+}
+
+func verifyChecksum(binaryPath string) error {
 	checksumPath := binaryPath + ".sha256"
 
 	checksumBytes, err := os.ReadFile(checksumPath)
@@ -353,23 +460,31 @@ func verifyKubernetesChecksum(binaryPath string) error {
 		return fmt.Errorf("checksum %q is empty", checksumPath)
 	}
 
-	file, err := os.Open(binaryPath)
+	got, err := sha256File(binaryPath)
 	if err != nil {
-		return fmt.Errorf("open %q: %w", binaryPath, err)
-	}
-	defer file.Close() //nolint:errcheck // best effort close
-
-	h := sha256.New()
-	if _, err := io.Copy(h, file); err != nil {
-		return fmt.Errorf("hash %q: %w", binaryPath, err)
+		return err
 	}
 
-	got := hex.EncodeToString(h.Sum(nil))
 	if !strings.EqualFold(want[0], got) {
 		return fmt.Errorf("checksum mismatch for %q: got %s, want %s", binaryPath, got, want[0])
 	}
 
 	return nil
+}
+
+func sha256File(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open %q: %w", path, err)
+	}
+	defer file.Close() //nolint:errcheck // read-only close
+
+	h := sha256.New()
+	if _, err := io.Copy(h, file); err != nil {
+		return "", fmt.Errorf("hash %q: %w", path, err)
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func resolveManifest(opts Options) (Manifest, error) {

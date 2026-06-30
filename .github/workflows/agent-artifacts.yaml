@@ -77,9 +77,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      # Pushes target the same GHCR package. Keep them serialized to avoid
-      # intermittent GHCR write_package failures from concurrent blob uploads.
-      max-parallel: 1
+      # Limit concurrent pushes to the same GHCR package to avoid intermittent
+      # write_package failures from too many simultaneous blob uploads.
+      max-parallel: 3
       matrix:
         group: ${{ fromJson(needs.resolve.outputs.kubernetes_version_groups) }}
     env:
