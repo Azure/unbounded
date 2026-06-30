@@ -28,11 +28,14 @@ import (
 	netmanifests "github.com/Azure/unbounded/deploy/net"
 	operatormanifests "github.com/Azure/unbounded/deploy/unbounded-operator"
 	"github.com/Azure/unbounded/internal/kube"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 const (
 	defaultInstallTimeout = 5 * time.Minute
-	netNamespace          = "unbounded-net"
+	// netNamespace defaults to the unified unbounded-system namespace. The
+	// --net-namespace flag is retained so net can still be split out.
+	netNamespace = unbounded.SystemNamespace
 )
 
 type installHandler struct {

@@ -28,6 +28,7 @@ import (
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator"
+	"github.com/Azure/unbounded/internal/unbounded"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -49,7 +50,7 @@ func main() {
 	cmd.Flags().StringVar(&cfg.metricsAddr, "metrics-bind-address", ":8080", "Address for metrics endpoint")
 	cmd.Flags().StringVar(&cfg.probeAddr, "health-probe-bind-address", ":8081", "Address for health probes")
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
-	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", "unbounded-kube", "Namespace for the leader election lease")
+	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace, "Namespace for the leader election lease")
 	cmd.Flags().StringVar(&cfg.defaultNamespace, "default-namespace", operator.DefaultNamespace, "Default namespace for site components")
 	cmd.Flags().StringVar(&cfg.netNamespace, "net-namespace", operator.DefaultNetNamespace, "Default namespace for unbounded-net")
 	cmd.Flags().StringVar(&cfg.netControllerImage, "net-controller-image", "", "Default unbounded-net controller image")

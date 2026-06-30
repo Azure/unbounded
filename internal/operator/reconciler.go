@@ -29,6 +29,7 @@ import (
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
 	storagemanifests "github.com/Azure/unbounded/deploy/unbounded-storage-supervisor"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 const (
@@ -39,8 +40,11 @@ const (
 	ComponentMetalman         = "metalman"
 	ComponentUnboundedStorage = "unboundedStorage"
 
-	DefaultNamespace    = "unbounded-kube"
-	DefaultNetNamespace = "unbounded-net"
+	// DefaultNamespace and DefaultNetNamespace both default to the unified
+	// unbounded-system namespace. They remain distinct knobs so net can still
+	// be split out via --net-namespace when desired.
+	DefaultNamespace    = unbounded.SystemNamespace
+	DefaultNetNamespace = unbounded.SystemNamespace
 )
 
 type Config struct {
