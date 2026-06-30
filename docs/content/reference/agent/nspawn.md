@@ -1,6 +1,6 @@
 ---
 title: "systemd-nspawn Isolation"
-weight: 2
+weight: 3
 description: "How the unbounded-agent uses systemd-nspawn to isolate Kubernetes worker node components."
 ---
 
