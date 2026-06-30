@@ -94,17 +94,38 @@ const (
 	OperationPhaseFailed     OperationPhase = "Failed"
 )
 
+// Condition types for MachineOperation.
+const (
+	// MachineOperationConditionCompleted indicates whether the operation has
+	// reached a terminal state.
+	MachineOperationConditionCompleted = "Completed"
+
+	// MachineOperationConditionBootLoaderDownloaded indicates that a metalman
+	// target has downloaded the initial PXE boot loader for the operation.
+	// Once set to True for an operation, it remains latched.
+	MachineOperationConditionBootLoaderDownloaded = "BootLoaderDownloaded"
+
+	// MachineOperationConditionBootImageWritten indicates that a metalman
+	// target has booted the PXE installer and written the boot image to disk.
+	MachineOperationConditionBootImageWritten = "BootImageWritten"
+
+	// MachineOperationConditionCloudInitDone indicates that a metalman PXE
+	// target has completed first-boot cloud-init after writing the boot image.
+	MachineOperationConditionCloudInitDone = "CloudInitDone"
+)
+
 // OperationStage represents the current stage of a target operation.
 type OperationStage string
 
 const (
-	OperationStagePoweringOff     OperationStage = "PoweringOff"
-	OperationStageWaitingOff      OperationStage = "WaitingOff"
-	OperationStagePoweringOn      OperationStage = "PoweringOn"
-	OperationStageWaitingOn       OperationStage = "WaitingOn"
-	OperationStageRepaveRequested OperationStage = "RepaveRequested"
-	OperationStageWaitingRepave   OperationStage = "WaitingRepave"
-	OperationStageWaitingNode     OperationStage = "WaitingNode"
+	OperationStagePoweringOff      OperationStage = "PoweringOff"
+	OperationStageWaitingOff       OperationStage = "WaitingOff"
+	OperationStagePoweringOn       OperationStage = "PoweringOn"
+	OperationStageWaitingOn        OperationStage = "WaitingOn"
+	OperationStageRepaveRequested  OperationStage = "RepaveRequested"
+	OperationStageWaitingRepave    OperationStage = "WaitingRepave"
+	OperationStageWaitingCloudInit OperationStage = "WaitingCloudInit"
+	OperationStageWaitingNode      OperationStage = "WaitingNode"
 )
 
 // MachineOperationSpec defines the desired state of a MachineOperation.
