@@ -363,7 +363,9 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 		return failTarget(target, reasonUnsupportedTarget, fmt.Sprintf("Machine %s is not a bare-metal Redfish target", machine.Name), now)
 	}
 
-	target.ObservedGeneration = machine.Generation
+	if op.Spec.OperationKind != v1alpha3.OperationHostReplace || target.TargetOperations == nil {
+		target.ObservedGeneration = machine.Generation
+	}
 
 	switch op.Spec.OperationKind {
 	case v1alpha3.OperationHostPowerOff:
@@ -546,6 +548,10 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 		return targetChange{target: target}
 	}
 
+	if target.ObservedGeneration == 0 || target.Stage == v1alpha3.OperationStageRepaveRequested {
+		target.ObservedGeneration = machine.Generation
+	}
+
 	if machine.Status.Operations != nil &&
 		machine.Status.Operations.RebootCounter >= target.TargetOperations.RebootCounter &&
 		machine.Status.Operations.RepaveCounter >= target.TargetOperations.RepaveCounter &&
@@ -579,7 +585,7 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 
 func cloudInitReplaceStatus(machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) (targetChange, bool) {
 	cond := apimeta.FindStatusCondition(machine.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
-	if cond != nil {
+	if cond != nil && cond.ObservedGeneration >= target.ObservedGeneration {
 		if cond.Status == metav1.ConditionTrue {
 			return targetChange{}, false
 		}

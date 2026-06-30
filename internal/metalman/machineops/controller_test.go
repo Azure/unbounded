@@ -447,6 +447,56 @@ func TestReconcilerFailsHostReplaceWhenCloudInitFails(t *testing.T) {
 	require.Contains(t, updated.Status.Targets[0].Message, "first-boot cloud-init failed")
 }
 
+func TestReconcilerIgnoresStaleHostReplaceCloudInitCondition(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		status metav1.ConditionStatus
+		reason string
+	}{
+		{name: "stale success", status: metav1.ConditionTrue, reason: "Succeeded"},
+		{name: "stale failure", status: metav1.ConditionFalse, reason: "Failed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := testScheme(t)
+			machine := testBareMetalMachine("machine-1", "rack-a")
+			machine.Generation = 2
+			machine.Spec.Operations = &v1alpha3.OperationsSpec{RebootCounter: 4, RepaveCounter: 5}
+			machine.Status.Operations = &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5}
+			machine.Status.Conditions = []metav1.Condition{
+				{Type: v1alpha3.MachineConditionRepaved, Status: metav1.ConditionTrue, Reason: "Succeeded", ObservedGeneration: 2},
+				{Type: v1alpha3.MachineConditionCloudInitDone, Status: tt.status, Reason: tt.reason, Message: "previous cloud-init result", ObservedGeneration: 1},
+			}
+			op := testOperation("op-replace-stale-cloudinit-"+tt.reason, v1alpha3.OperationHostReplace)
+			op.Spec.MachineRef = machine.Name
+			op.Status.Phase = v1alpha3.OperationPhaseInProgress
+			op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+				MachineRef:         machine.Name,
+				Phase:              v1alpha3.OperationPhaseInProgress,
+				TargetOperations:   &v1alpha3.OperationsStatus{RebootCounter: 4, RepaveCounter: 5},
+				ObservedGeneration: machine.Generation,
+			}}
+
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}}).WithStatusSubresource(op, machine).Build()
+			reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+			_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+			require.NoError(t, err)
+
+			var updated v1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+			require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+			require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[0].Phase)
+			require.Equal(t, v1alpha3.OperationStageWaitingCloudInit, updated.Status.Targets[0].Stage)
+		})
+	}
+}
+
 func TestReconcilerUsesKubernetesNodeRefForHostReplaceCompletion(t *testing.T) {
 	t.Parallel()
 
