@@ -19,10 +19,10 @@ import (
 type TFTPServer struct {
 	BindAddr string
 	FileResolver
-	BootLoaderDownloadRecorder BootLoaderDownloadRecorder
+	StatusRecorder TFTPStatusRecorder
 }
 
-type BootLoaderDownloadRecorder interface {
+type TFTPStatusRecorder interface {
 	RecordBootLoaderDownloaded(ctx context.Context, machineName, filename string) error
 }
 
@@ -105,11 +105,11 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 }
 
 func (t *TFTPServer) recordBootLoaderDownloaded(ctx context.Context, log *slog.Logger, machineName, imageRef, filename string) {
-	if t.BootLoaderDownloadRecorder == nil || !t.isInitialBootLoaderDownload(imageRef, filename) {
+	if t.StatusRecorder == nil || !t.isInitialBootLoaderDownload(imageRef, filename) {
 		return
 	}
 
-	if err := t.BootLoaderDownloadRecorder.RecordBootLoaderDownloaded(ctx, machineName, filename); err != nil {
+	if err := t.StatusRecorder.RecordBootLoaderDownloaded(ctx, machineName, filename); err != nil {
 		log.Error("recording boot loader download", "node", machineName, "err", err)
 	}
 }

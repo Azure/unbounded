@@ -1,0 +1,302 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package machineops
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sort"
+	"sync"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+)
+
+const (
+	defaultStatusQueueCapacity = 256
+
+	statusUpdateBootLoaderDownloaded statusUpdateKind = iota
+	statusUpdateBootImageWritten
+	statusUpdateCloudInitDone
+	statusUpdateMachineCondition
+	statusUpdatePXEDisabled
+)
+
+// StatusQueue records server-observed status milestones without blocking
+// request paths on Kubernetes status writes. Updates are best effort: if the
+// queue is full or a write fails, reconciliation must converge without it.
+type StatusQueue struct {
+	Client   client.Client
+	Now      func() metav1.Time
+	Log      *slog.Logger
+	Capacity int
+
+	once    sync.Once
+	updates chan statusUpdate
+}
+
+type statusUpdateKind int
+
+type statusUpdate struct {
+	machineName string
+	kind        statusUpdateKind
+	filename    string
+	condition   *metav1.Condition
+	repave      *statusRepaveUpdate
+}
+
+type statusRepaveUpdate struct {
+	counter int64
+	image   string
+}
+
+func (q *StatusQueue) NeedLeaderElection() bool { return false }
+
+func (q *StatusQueue) Start(ctx context.Context) error {
+	q.ensure()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case update := <-q.updates:
+			q.process(ctx, update)
+		}
+	}
+}
+
+func (q *StatusQueue) RecordBootLoaderDownloaded(_ context.Context, machineName, filename string) error {
+	return q.enqueue(statusUpdate{machineName: machineName, kind: statusUpdateBootLoaderDownloaded, filename: filename})
+}
+
+func (q *StatusQueue) RecordBootImageWritten(_ context.Context, machineName string) error {
+	return q.enqueue(statusUpdate{machineName: machineName, kind: statusUpdateBootImageWritten})
+}
+
+func (q *StatusQueue) RecordCloudInitDone(_ context.Context, machineName string) error {
+	return q.enqueue(statusUpdate{machineName: machineName, kind: statusUpdateCloudInitDone})
+}
+
+func (q *StatusQueue) RecordMachineCondition(_ context.Context, machineName string, condition metav1.Condition) error {
+	cond := condition
+
+	return q.enqueue(statusUpdate{machineName: machineName, kind: statusUpdateMachineCondition, condition: &cond})
+}
+
+func (q *StatusQueue) RecordPXEDisabled(_ context.Context, machineName string, repaveCounter int64, imageName string) error {
+	return q.enqueue(statusUpdate{
+		machineName: machineName,
+		kind:        statusUpdatePXEDisabled,
+		repave:      &statusRepaveUpdate{counter: repaveCounter, image: imageName},
+	})
+}
+
+func (q *StatusQueue) enqueue(update statusUpdate) error {
+	if q == nil || q.Client == nil || update.machineName == "" {
+		return nil
+	}
+
+	q.ensure()
+
+	select {
+	case q.updates <- update:
+	default:
+		q.log().Warn("dropping status update", "machine", update.machineName, "kind", update.kind)
+	}
+
+	return nil
+}
+
+func (q *StatusQueue) ensure() {
+	q.once.Do(func() {
+		capacity := q.Capacity
+		if capacity <= 0 {
+			capacity = defaultStatusQueueCapacity
+		}
+
+		q.updates = make(chan statusUpdate, capacity)
+	})
+}
+
+func (q *StatusQueue) processNextUpdate(ctx context.Context) bool {
+	q.ensure()
+
+	select {
+	case update := <-q.updates:
+		q.process(ctx, update)
+
+		return true
+	default:
+		return false
+	}
+}
+
+func (q *StatusQueue) process(ctx context.Context, update statusUpdate) {
+	if err := q.flush(ctx, update); err != nil {
+		q.log().Error("flushing status update", "machine", update.machineName, "kind", update.kind, "err", err)
+	}
+}
+
+func (q *StatusQueue) flush(ctx context.Context, update statusUpdate) error {
+	switch update.kind {
+	case statusUpdateBootLoaderDownloaded:
+		return q.flushOperationCondition(ctx, update.machineName, v1alpha3.MachineOperationConditionBootLoaderDownloaded, "Downloaded", fmt.Sprintf("Machine %s downloaded initial boot loader %s", update.machineName, update.filename))
+	case statusUpdateBootImageWritten:
+		return q.flushOperationCondition(ctx, update.machineName, v1alpha3.MachineOperationConditionBootImageWritten, "Succeeded", fmt.Sprintf("Machine %s finished writing the boot image to disk", update.machineName))
+	case statusUpdateCloudInitDone:
+		return q.flushOperationCondition(ctx, update.machineName, v1alpha3.MachineOperationConditionCloudInitDone, "Succeeded", fmt.Sprintf("Machine %s completed first-boot cloud-init successfully", update.machineName))
+	case statusUpdateMachineCondition:
+		if update.condition == nil {
+			return nil
+		}
+
+		return q.flushMachineCondition(ctx, update.machineName, *update.condition)
+	case statusUpdatePXEDisabled:
+		if update.repave == nil {
+			return nil
+		}
+
+		return q.flushPXEDisabled(ctx, update.machineName, update.repave)
+	default:
+		return fmt.Errorf("unknown status update kind %d", update.kind)
+	}
+}
+
+func (q *StatusQueue) flushOperationCondition(ctx context.Context, machineName, conditionType, reason, message string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		op, ok, err := q.activeOperationForMachine(ctx, machineName)
+		if err != nil || !ok {
+			return err
+		}
+
+		if apimeta.IsStatusConditionTrue(op.Status.Conditions, conditionType) {
+			return nil
+		}
+
+		apimeta.SetStatusCondition(&op.Status.Conditions, metav1.Condition{
+			Type:               conditionType,
+			Status:             metav1.ConditionTrue,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: op.Generation,
+			LastTransitionTime: q.now(),
+		})
+
+		return q.Client.Status().Update(ctx, op)
+	})
+}
+
+func (q *StatusQueue) flushMachineCondition(ctx context.Context, machineName string, condition metav1.Condition) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var machine v1alpha3.Machine
+		if err := q.Client.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+
+			return fmt.Errorf("get Machine: %w", err)
+		}
+
+		condition.ObservedGeneration = machine.Generation
+		apimeta.SetStatusCondition(&machine.Status.Conditions, condition)
+
+		return q.Client.Status().Update(ctx, &machine)
+	})
+}
+
+func (q *StatusQueue) flushPXEDisabled(ctx context.Context, machineName string, update *statusRepaveUpdate) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var machine v1alpha3.Machine
+		if err := q.Client.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+
+			return fmt.Errorf("get Machine: %w", err)
+		}
+
+		var statusRepave int64
+		if machine.Status.Operations != nil {
+			statusRepave = machine.Status.Operations.RepaveCounter
+		}
+
+		if update.counter <= statusRepave {
+			return nil
+		}
+
+		if machine.Status.Operations == nil {
+			machine.Status.Operations = &v1alpha3.OperationsStatus{}
+		}
+
+		machine.Status.Operations.RepaveCounter = update.counter
+		apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+			Type:               v1alpha3.MachineConditionRepaved,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Succeeded",
+			Message:            "image=" + update.image,
+			ObservedGeneration: machine.Generation,
+		})
+
+		return q.Client.Status().Update(ctx, &machine)
+	})
+}
+
+func (q *StatusQueue) activeOperationForMachine(ctx context.Context, machineName string) (*v1alpha3.MachineOperation, bool, error) {
+	var list v1alpha3.MachineOperationList
+	if err := q.Client.List(ctx, &list); err != nil {
+		return nil, false, fmt.Errorf("list MachineOperations: %w", err)
+	}
+
+	candidates := make([]*v1alpha3.MachineOperation, 0, len(list.Items))
+	for i := range list.Items {
+		op := &list.Items[i]
+		if op.Status.IsTerminal() || op.Spec.OperationKind != v1alpha3.OperationHostReplace || !operationTargetsMachine(op, machineName) {
+			continue
+		}
+
+		candidates = append(candidates, op)
+	}
+
+	if len(candidates) == 0 {
+		return nil, false, nil
+	}
+
+	sort.Slice(candidates, func(i, j int) bool { return operationBefore(candidates[i], candidates[j]) })
+
+	return candidates[0], true, nil
+}
+
+func operationTargetsMachine(op *v1alpha3.MachineOperation, machineName string) bool {
+	for _, target := range op.Status.Targets {
+		if target.MachineRef != machineName {
+			continue
+		}
+
+		return target.Phase != v1alpha3.OperationPhaseComplete && target.Phase != v1alpha3.OperationPhaseFailed
+	}
+
+	return len(op.Status.Targets) == 0 && op.Spec.MachineRef == machineName
+}
+
+func (q *StatusQueue) log() *slog.Logger {
+	if q.Log != nil {
+		return q.Log
+	}
+
+	return slog.Default()
+}
+
+func (q *StatusQueue) now() metav1.Time {
+	if q.Now != nil {
+		return q.Now()
+	}
+
+	return metav1.Now()
+}

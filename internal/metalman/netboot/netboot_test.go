@@ -419,10 +419,10 @@ func TestTFTPServerRecordsOnlyInitialBootLoader(t *testing.T) {
 	cache := setupOCICache(t, "ghcr.io/test/image:v1", "boot123", map[string][]byte{
 		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
 	})
-	recorder := &recordingBootLoaderDownloadRecorder{}
+	recorder := &recordingTFTPStatusRecorder{}
 	server := &TFTPServer{
-		FileResolver:               FileResolver{Cache: cache},
-		BootLoaderDownloadRecorder: recorder,
+		FileResolver:   FileResolver{Cache: cache},
+		StatusRecorder: recorder,
 	}
 
 	server.recordBootLoaderDownloaded(t.Context(), testLogger(), "machine-1", "ghcr.io/test/image:v1", "grubx64.efi")
@@ -432,7 +432,7 @@ func TestTFTPServerRecordsOnlyInitialBootLoader(t *testing.T) {
 	require.Equal(t, []string{"machine-1:shimx64.efi"}, recorder.calls)
 }
 
-func TestHTTPServerRecordsBootImageWriteStart(t *testing.T) {
+func TestHTTPServerDoesNotRecordBootImageWriteOnFileDownload(t *testing.T) {
 	diskImageData := []byte("test-disk-image")
 	cache := setupOCICache(t, "ghcr.io/test/image:v1", "disk123", map[string][]byte{
 		"disk.img.gz": diskImageData,
@@ -456,13 +456,13 @@ func TestHTTPServerRecordsBootImageWriteStart(t *testing.T) {
 		WithObjects(node).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
-	recorder := &recordingBootImageWriteRecorder{}
+	recorder := &recordingStatusRecorder{}
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
 			Cache:  cache,
 			Reader: fc,
 		},
-		BootImageWriteRecorder: recorder,
+		StatusRecorder: recorder,
 	}
 
 	mux := http.NewServeMux()
@@ -478,7 +478,7 @@ func TestHTTPServerRecordsBootImageWriteStart(t *testing.T) {
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Empty(t, recorder.calls)
+	require.Empty(t, recorder.bootImageWrittenEvents())
 
 	req, _ = http.NewRequest("GET", ts.URL+"/disk.img.gz", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.1.50")
@@ -490,7 +490,7 @@ func TestHTTPServerRecordsBootImageWriteStart(t *testing.T) {
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, diskImageData, body)
-	require.Equal(t, []string{"node-serve:Started"}, recorder.calls)
+	require.Empty(t, recorder.bootImageWrittenEvents())
 
 	req, _ = http.NewRequest("GET", ts.URL+"/missing", nil)
 	req.Header.Set("X-Forwarded-For", "10.0.1.50")
@@ -499,25 +499,15 @@ func TestHTTPServerRecordsBootImageWriteStart(t *testing.T) {
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
-	require.Equal(t, []string{"node-serve:Started"}, recorder.calls)
+	require.Empty(t, recorder.bootImageWrittenEvents())
 }
 
-type recordingBootLoaderDownloadRecorder struct {
+type recordingTFTPStatusRecorder struct {
 	calls []string
 }
 
-func (r *recordingBootLoaderDownloadRecorder) RecordBootLoaderDownloaded(_ context.Context, machineName, filename string) error {
+func (r *recordingTFTPStatusRecorder) RecordBootLoaderDownloaded(_ context.Context, machineName, filename string) error {
 	r.calls = append(r.calls, fmt.Sprintf("%s:%s", machineName, filename))
-
-	return nil
-}
-
-type recordingBootImageWriteRecorder struct {
-	calls []string
-}
-
-func (r *recordingBootImageWriteRecorder) RecordBootImageWrite(_ context.Context, machineName, stage string) error {
-	r.calls = append(r.calls, fmt.Sprintf("%s:%s", machineName, stage))
 
 	return nil
 }
@@ -533,14 +523,42 @@ type recordedPXEDisabled struct {
 	imageName     string
 }
 
-type recordingMachineStatusRecorder struct {
-	mu         sync.Mutex
-	err        error
-	conditions []recordedMachineCondition
-	disabled   []recordedPXEDisabled
+type recordingStatusRecorder struct {
+	mu               sync.Mutex
+	err              error
+	bootImageWritten []string
+	cloudInitDone    []string
+	conditions       []recordedMachineCondition
+	disabled         []recordedPXEDisabled
 }
 
-func (r *recordingMachineStatusRecorder) RecordMachineCondition(_ context.Context, machineName string, condition metav1.Condition) error {
+func (r *recordingStatusRecorder) RecordBootImageWritten(_ context.Context, machineName string) error {
+	if r.err != nil {
+		return r.err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.bootImageWritten = append(r.bootImageWritten, machineName)
+
+	return nil
+}
+
+func (r *recordingStatusRecorder) RecordCloudInitDone(_ context.Context, machineName string) error {
+	if r.err != nil {
+		return r.err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.cloudInitDone = append(r.cloudInitDone, machineName)
+
+	return nil
+}
+
+func (r *recordingStatusRecorder) RecordMachineCondition(_ context.Context, machineName string, condition metav1.Condition) error {
 	if r.err != nil {
 		return r.err
 	}
@@ -553,7 +571,7 @@ func (r *recordingMachineStatusRecorder) RecordMachineCondition(_ context.Contex
 	return nil
 }
 
-func (r *recordingMachineStatusRecorder) RecordPXEDisabled(_ context.Context, machineName string, repaveCounter int64, imageName string) error {
+func (r *recordingStatusRecorder) RecordPXEDisabled(_ context.Context, machineName string, repaveCounter int64, imageName string) error {
 	if r.err != nil {
 		return r.err
 	}
@@ -566,14 +584,28 @@ func (r *recordingMachineStatusRecorder) RecordPXEDisabled(_ context.Context, ma
 	return nil
 }
 
-func (r *recordingMachineStatusRecorder) conditionEvents() []recordedMachineCondition {
+func (r *recordingStatusRecorder) bootImageWrittenEvents() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]string(nil), r.bootImageWritten...)
+}
+
+func (r *recordingStatusRecorder) cloudInitDoneEvents() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]string(nil), r.cloudInitDone...)
+}
+
+func (r *recordingStatusRecorder) conditionEvents() []recordedMachineCondition {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	return append([]recordedMachineCondition(nil), r.conditions...)
 }
 
-func (r *recordingMachineStatusRecorder) pxeDisabledEvents() []recordedPXEDisabled {
+func (r *recordingStatusRecorder) pxeDisabledEvents() []recordedPXEDisabled {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -1805,11 +1837,11 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
+	recorder := &recordingStatusRecorder{}
 	srv := &HTTPServer{
-		Client:                 fc,
-		FileResolver:           FileResolver{Cache: cache, Reader: fc},
-		BootImageWriteRecorder: &recordingBootImageWriteRecorder{},
-		MachineStatusRecorder:  &recordingMachineStatusRecorder{},
+		Client:         fc,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		StatusRecorder: recorder,
 	}
 
 	mux := http.NewServeMux()
@@ -1834,13 +1866,8 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
 	}
 
-	recorder := srv.BootImageWriteRecorder.(*recordingBootImageWriteRecorder)
-	if len(recorder.calls) != 1 || recorder.calls[0] != "pxe-node:Finished" {
-		t.Fatalf("expected boot image write finish record, got %v", recorder.calls)
-	}
-
-	machineRecorder := srv.MachineStatusRecorder.(*recordingMachineStatusRecorder)
-	pxeDisabled := machineRecorder.pxeDisabledEvents()
+	require.Equal(t, []string{"pxe-node"}, recorder.bootImageWrittenEvents())
+	pxeDisabled := recorder.pxeDisabledEvents()
 	require.Equal(t, []recordedPXEDisabled{{machineName: "pxe-node", repaveCounter: 1, imageName: "ghcr.io/test/image:v1"}}, pxeDisabled)
 
 	// Second call should be idempotent (still 200)
@@ -1869,9 +1896,9 @@ func TestHTTPServer_DisablePXE_UnknownIP(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		Client:                fc,
-		FileResolver:          FileResolver{Cache: cache, Reader: fc},
-		MachineStatusRecorder: &recordingMachineStatusRecorder{},
+		Client:         fc,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		StatusRecorder: &recordingStatusRecorder{},
 	}
 
 	mux := http.NewServeMux()
@@ -2282,9 +2309,9 @@ func TestCloudInitCondition_StageStartSetsRunning(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		Client:                fc,
-		FileResolver:          FileResolver{Cache: cache, Reader: fc},
-		MachineStatusRecorder: &recordingMachineStatusRecorder{},
+		Client:         fc,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		StatusRecorder: &recordingStatusRecorder{},
 	}
 
 	mux := http.NewServeMux()
@@ -2308,7 +2335,7 @@ func TestCloudInitCondition_StageStartSetsRunning(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	recorder := srv.MachineStatusRecorder.(*recordingMachineStatusRecorder)
+	recorder := srv.StatusRecorder.(*recordingStatusRecorder)
 	conditions := recorder.conditionEvents()
 	require.Len(t, conditions, 1)
 	require.Equal(t, node.Name, conditions[0].machineName)
@@ -2344,9 +2371,9 @@ func TestCloudInitCondition_FinalStageSuccessSetsTrue(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		Client:                fc,
-		FileResolver:          FileResolver{Cache: cache, Reader: fc},
-		MachineStatusRecorder: &recordingMachineStatusRecorder{},
+		Client:         fc,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		StatusRecorder: &recordingStatusRecorder{},
 	}
 
 	mux := http.NewServeMux()
@@ -2370,7 +2397,7 @@ func TestCloudInitCondition_FinalStageSuccessSetsTrue(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	recorder := srv.MachineStatusRecorder.(*recordingMachineStatusRecorder)
+	recorder := srv.StatusRecorder.(*recordingStatusRecorder)
 	conditions := recorder.conditionEvents()
 	require.Len(t, conditions, 1)
 	require.Equal(t, node.Name, conditions[0].machineName)
@@ -2410,9 +2437,9 @@ func TestCloudInitCondition_StageFailureSetsFailedWithDetails(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		Client:                fc,
-		FileResolver:          FileResolver{Cache: cache, Reader: fc},
-		MachineStatusRecorder: &recordingMachineStatusRecorder{},
+		Client:         fc,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		StatusRecorder: &recordingStatusRecorder{},
 	}
 
 	mux := http.NewServeMux()
@@ -2436,7 +2463,7 @@ func TestCloudInitCondition_StageFailureSetsFailedWithDetails(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	recorder := srv.MachineStatusRecorder.(*recordingMachineStatusRecorder)
+	recorder := srv.StatusRecorder.(*recordingStatusRecorder)
 	conditions := recorder.conditionEvents()
 	require.Len(t, conditions, 1)
 	require.Equal(t, node.Name, conditions[0].machineName)
@@ -2497,9 +2524,9 @@ func TestCloudInitCondition_UnknownIPSkipsUpdate(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		Client:                fc,
-		FileResolver:          FileResolver{Cache: cache, Reader: fc},
-		MachineStatusRecorder: &recordingMachineStatusRecorder{},
+		Client:         fc,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		StatusRecorder: &recordingStatusRecorder{},
 	}
 
 	mux := http.NewServeMux()
@@ -2547,12 +2574,12 @@ func TestCloudInitCondition_StatusUpdateError(t *testing.T) {
 		WithStatusSubresource(&v1alpha3.Machine{}).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
-	recorder := &recordingMachineStatusRecorder{err: injectedErr}
+	recorder := &recordingStatusRecorder{err: injectedErr}
 
 	srv := &HTTPServer{
-		Client:                fc,
-		FileResolver:          FileResolver{Cache: cache, Reader: fc},
-		MachineStatusRecorder: recorder,
+		Client:         fc,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		StatusRecorder: recorder,
 	}
 
 	mux := http.NewServeMux()
@@ -2599,11 +2626,11 @@ func TestCloudInitCondition_FullLifecycle(t *testing.T) {
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
-	recorder := &recordingMachineStatusRecorder{}
+	recorder := &recordingStatusRecorder{}
 	srv := &HTTPServer{
-		Client:                fc,
-		FileResolver:          FileResolver{Cache: cache, Reader: fc},
-		MachineStatusRecorder: recorder,
+		Client:         fc,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		StatusRecorder: recorder,
 	}
 
 	mux := http.NewServeMux()
@@ -2676,7 +2703,7 @@ func TestCloudInitCondition_FullLifecycle(t *testing.T) {
 	}
 }
 
-func TestCloudInitStatusRecorderReceivesStableOperationEvents(t *testing.T) {
+func TestHTTPServerRecordsCloudInitDoneOnlyOnFinalSuccess(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci-operation-node"},
 		Spec: v1alpha3.MachineSpec{
@@ -2695,12 +2722,12 @@ func TestCloudInitStatusRecorderReceivesStableOperationEvents(t *testing.T) {
 		WithStatusSubresource(&v1alpha3.Machine{}).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
-	recorder := &recordingCloudInitStatusRecorder{}
+	recorder := &recordingStatusRecorder{}
 
 	srv := &HTTPServer{
-		Client:                  fc,
-		FileResolver:            FileResolver{Cache: cache, Reader: fc},
-		CloudInitStatusRecorder: recorder,
+		Client:         fc,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		StatusRecorder: recorder,
 	}
 
 	mux := http.NewServeMux()
@@ -2732,13 +2759,10 @@ func TestCloudInitStatusRecorderReceivesStableOperationEvents(t *testing.T) {
 	postEvent(`{"name":"modules-config","description":"modules-config done","event_type":"finish","origin":"cloudinit","timestamp":3.0,"result":"SUCCESS"}`)
 	postEvent(`{"name":"modules-final","description":"modules-final done","event_type":"finish","origin":"cloudinit","timestamp":4.0,"result":"SUCCESS"}`)
 
-	require.Equal(t, []recordedCloudInitStatus{
-		{machineName: node.Name, stage: CloudInitStarted},
-		{machineName: node.Name, stage: CloudInitSucceeded},
-	}, recorder.events())
+	require.Equal(t, []string{node.Name}, recorder.cloudInitDoneEvents())
 }
 
-func TestCloudInitStatusRecorderReceivesFailureSummary(t *testing.T) {
+func TestHTTPServerDoesNotRecordCloudInitDoneOnFailure(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci-operation-fail-node"},
 		Spec: v1alpha3.MachineSpec{
@@ -2757,12 +2781,12 @@ func TestCloudInitStatusRecorderReceivesFailureSummary(t *testing.T) {
 		WithStatusSubresource(&v1alpha3.Machine{}).
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
-	recorder := &recordingCloudInitStatusRecorder{}
+	recorder := &recordingStatusRecorder{}
 
 	srv := &HTTPServer{
-		Client:                  fc,
-		FileResolver:            FileResolver{Cache: cache, Reader: fc},
-		CloudInitStatusRecorder: recorder,
+		Client:         fc,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		StatusRecorder: recorder,
 	}
 
 	mux := http.NewServeMux()
@@ -2786,39 +2810,7 @@ func TestCloudInitStatusRecorderReceivesFailureSummary(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	events := recorder.events()
-	require.Len(t, events, 1)
-	require.Equal(t, node.Name, events[0].machineName)
-	require.Equal(t, CloudInitFailed, events[0].stage)
-	require.Contains(t, events[0].message, `stage "modules-final" failed`)
-	require.Contains(t, events[0].message, "apt-get install -y badpkg")
-}
-
-type recordedCloudInitStatus struct {
-	machineName string
-	stage       string
-	message     string
-}
-
-type recordingCloudInitStatusRecorder struct {
-	mu       sync.Mutex
-	recorded []recordedCloudInitStatus
-}
-
-func (r *recordingCloudInitStatusRecorder) RecordCloudInitStatus(_ context.Context, machineName, stage, message string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.recorded = append(r.recorded, recordedCloudInitStatus{machineName: machineName, stage: stage, message: message})
-
-	return nil
-}
-
-func (r *recordingCloudInitStatusRecorder) events() []recordedCloudInitStatus {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	return append([]recordedCloudInitStatus(nil), r.recorded...)
+	require.Empty(t, recorder.cloudInitDoneEvents())
 }
 
 func freePort(t *testing.T) int {

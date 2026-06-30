@@ -36,31 +36,15 @@ type HTTPServer struct {
 	Client   client.Client
 	Mux      *http.ServeMux
 	FileResolver
-	BootImageWriteRecorder  BootImageWriteRecorder
-	CloudInitStatusRecorder CloudInitStatusRecorder
-	MachineStatusRecorder   MachineStatusRecorder
+	StatusRecorder StatusRecorder
 }
 
-type BootImageWriteRecorder interface {
-	RecordBootImageWrite(ctx context.Context, machineName, stage string) error
-}
-
-type CloudInitStatusRecorder interface {
-	RecordCloudInitStatus(ctx context.Context, machineName, stage, message string) error
-}
-
-type MachineStatusRecorder interface {
+type StatusRecorder interface {
+	RecordBootImageWritten(ctx context.Context, machineName string) error
+	RecordCloudInitDone(ctx context.Context, machineName string) error
 	RecordMachineCondition(ctx context.Context, machineName string, condition metav1.Condition) error
 	RecordPXEDisabled(ctx context.Context, machineName string, repaveCounter int64, imageName string) error
 }
-
-const (
-	BootImageWriteStarted  = "Started"
-	BootImageWriteFinished = "Finished"
-	CloudInitStarted       = "Started"
-	CloudInitSucceeded     = "Succeeded"
-	CloudInitFailed        = "Failed"
-)
 
 func (h *HTTPServer) NeedLeaderElection() bool { return false }
 
@@ -141,8 +125,6 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.recordBootImageWriteStarted(r.Context(), log, node.Name, path)
-
 	if resolved.DiskPath != "" {
 		log.Info("serving cached file", "node", node.Name)
 		http.ServeFile(w, r, resolved.DiskPath)
@@ -211,8 +193,8 @@ func (h *HTTPServer) recordCloudInitCondition(ctx context.Context, log *slog.Log
 	}
 
 	cond := buildCloudInitCondition(ev, node.Generation)
-	if cond != nil && h.MachineStatusRecorder != nil {
-		if err := h.MachineStatusRecorder.RecordMachineCondition(ctx, node.Name, *cond); err != nil {
+	if cond != nil && h.StatusRecorder != nil {
+		if err := h.StatusRecorder.RecordMachineCondition(ctx, node.Name, *cond); err != nil {
 			log.Error("recording cloud-init condition", "node", node.Name, "err", err)
 		}
 	}
@@ -287,7 +269,7 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.recordBootImageWriteFinished(r.Context(), log, node.Name)
+	h.recordBootImageWritten(r.Context(), log, node.Name)
 
 	var specRepave, statusRepave int64
 	if node.Spec.Operations != nil {
@@ -310,8 +292,8 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		imageName = node.Spec.PXE.Image
 	}
 
-	if h.MachineStatusRecorder != nil {
-		if err := h.MachineStatusRecorder.RecordPXEDisabled(r.Context(), node.Name, specRepave, imageName); err != nil {
+	if h.StatusRecorder != nil {
+		if err := h.StatusRecorder.RecordPXEDisabled(r.Context(), node.Name, specRepave, imageName); err != nil {
 			log.Error("recording PXE disabled", "node", node.Name, "err", err)
 		}
 	}
@@ -320,71 +302,24 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (h *HTTPServer) recordBootImageWriteStarted(ctx context.Context, log *slog.Logger, machineName, path string) {
-	if h.BootImageWriteRecorder == nil || strings.TrimPrefix(path, "/") != "disk.img.gz" {
+func (h *HTTPServer) recordBootImageWritten(ctx context.Context, log *slog.Logger, machineName string) {
+	if h.StatusRecorder == nil {
 		return
 	}
 
-	if err := h.BootImageWriteRecorder.RecordBootImageWrite(ctx, machineName, BootImageWriteStarted); err != nil {
-		log.Error("recording boot image write start", "node", machineName, "err", err)
-	}
-}
-
-func (h *HTTPServer) recordBootImageWriteFinished(ctx context.Context, log *slog.Logger, machineName string) {
-	if h.BootImageWriteRecorder == nil {
-		return
-	}
-
-	if err := h.BootImageWriteRecorder.RecordBootImageWrite(ctx, machineName, BootImageWriteFinished); err != nil {
-		log.Error("recording boot image write finish", "node", machineName, "err", err)
+	if err := h.StatusRecorder.RecordBootImageWritten(ctx, machineName); err != nil {
+		log.Error("recording boot image written", "node", machineName, "err", err)
 	}
 }
 
 func (h *HTTPServer) recordCloudInitStatus(ctx context.Context, log *slog.Logger, machineName string, ev *cloudInitEvent) {
-	if h.CloudInitStatusRecorder == nil || machineName == "" {
+	if h.StatusRecorder == nil || machineName == "" || ev.EventType != "finish" || ev.Name != cloudInitLastStage || !strings.EqualFold(ev.Result, "SUCCESS") {
 		return
 	}
 
-	stage, message, ok := cloudInitOperationStatus(ev)
-	if !ok {
-		return
-	}
-
-	if err := h.CloudInitStatusRecorder.RecordCloudInitStatus(ctx, machineName, stage, message); err != nil {
+	if err := h.StatusRecorder.RecordCloudInitDone(ctx, machineName); err != nil {
 		log.Error("recording cloud-init status", "node", machineName, "err", err)
 	}
-}
-
-func cloudInitOperationStatus(ev *cloudInitEvent) (string, string, bool) {
-	switch ev.EventType {
-	case "start":
-		return CloudInitStarted, "", true
-	case "finish":
-		if !strings.EqualFold(ev.Result, "SUCCESS") {
-			return CloudInitFailed, cloudInitErrorSummary(ev), true
-		}
-
-		if ev.Name == cloudInitLastStage {
-			return CloudInitSucceeded, "", true
-		}
-	}
-
-	return "", "", false
-}
-
-func cloudInitErrorSummary(ev *cloudInitEvent) string {
-	result := strings.TrimSpace(ev.Result)
-	description := strings.TrimSpace(ev.Description)
-
-	if result == "" {
-		result = "failure"
-	}
-
-	if description == "" {
-		return fmt.Sprintf("stage %q failed with result %q", ev.Name, result)
-	}
-
-	return fmt.Sprintf("stage %q failed with result %q: %s", ev.Name, result, description)
 }
 
 func clientIP(r *http.Request) string {

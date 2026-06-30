@@ -261,15 +261,15 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("adding DHCP server: %w", err)
 			}
 
-			pxeStatusQueue := &metalmachineops.PXEStatusQueue{Client: mgr.GetClient()}
-			if err := mgr.Add(pxeStatusQueue); err != nil {
-				return fmt.Errorf("adding PXE status queue: %w", err)
+			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient()}
+			if err := mgr.Add(statusQueue); err != nil {
+				return fmt.Errorf("adding status queue: %w", err)
 			}
 
 			tftpServer := &netboot.TFTPServer{
-				BindAddr:                   bindAddress,
-				FileResolver:               resolver,
-				BootLoaderDownloadRecorder: pxeStatusQueue,
+				BindAddr:       bindAddress,
+				FileResolver:   resolver,
+				StatusRecorder: statusQueue,
 			}
 			if err := mgr.Add(tftpServer); err != nil {
 				return fmt.Errorf("adding TFTP server: %w", err)
@@ -286,14 +286,12 @@ func ServePXECmd() *cobra.Command {
 			httpMux.HandleFunc("POST /attest", attestHandler.Attest)
 
 			httpServer := &netboot.HTTPServer{
-				BindAddr:                bindAddress,
-				Port:                    httpPort,
-				Client:                  mgr.GetClient(),
-				Mux:                     httpMux,
-				FileResolver:            resolver,
-				BootImageWriteRecorder:  pxeStatusQueue,
-				CloudInitStatusRecorder: pxeStatusQueue,
-				MachineStatusRecorder:   pxeStatusQueue,
+				BindAddr:       bindAddress,
+				Port:           httpPort,
+				Client:         mgr.GetClient(),
+				Mux:            httpMux,
+				FileResolver:   resolver,
+				StatusRecorder: statusQueue,
 			}
 			if err := mgr.Add(httpServer); err != nil {
 				return fmt.Errorf("adding HTTP server: %w", err)
