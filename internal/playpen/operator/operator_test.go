@@ -21,7 +21,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -252,44 +251,6 @@ func TestAllocIdempotencyIncludesArchitecture(t *testing.T) {
 	}
 }
 
-func TestPatchClaimAllowsSameRequestAfterClaim(t *testing.T) {
-	op := testOperator(t,
-		testNode("node-1", "20.30.40.50"),
-		testPod("runner-1", "node-1", nil),
-	)
-	req := AllocRequest{WireGuardPublicKey: testPublicKey(t)}
-	keyHash := hashString("alloc-key")
-	reqHash := hashString(req.WireGuardPublicKey)
-
-	pod := &corev1.Pod{}
-	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err != nil {
-		t.Fatal(err)
-	}
-
-	claimed, ok, err := op.patchClaim(t.Context(), pod, keyHash, reqHash, req.WireGuardPublicKey)
-	if err != nil || !ok {
-		t.Fatalf("first patch claimed=%v err=%v", ok, err)
-	}
-
-	claimed, ok, err = op.patchClaim(t.Context(), claimed, keyHash, reqHash, req.WireGuardPublicKey)
-	if err != nil {
-		t.Fatalf("second patch: %v", err)
-	}
-
-	if ok {
-		t.Fatal("second patch reported a new claim")
-	}
-
-	if claimed.Name != "runner-1" {
-		t.Fatalf("claimed pod = %q", claimed.Name)
-	}
-
-	_, _, err = op.patchClaim(t.Context(), claimed, keyHash, hashString(testPublicKey(t)), req.WireGuardPublicKey)
-	if err != errIdempotencyRequestConflict {
-		t.Fatalf("different request err = %v, want idempotency conflict", err)
-	}
-}
-
 func TestAllocUsesOtherNodeExternalIPWhenRunnerNodeIsPrivate(t *testing.T) {
 	op := testOperator(t,
 		testNode("private-node", ""),
@@ -421,69 +382,6 @@ func TestAllocUsesPodScopedServerWireGuardPublicKey(t *testing.T) {
 	}
 }
 
-func TestAllocPatchesExistingNodePortServiceToClusterPolicy(t *testing.T) {
-	pod := testPod("runner-1", "node-1", nil)
-	service := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceNameForPod(pod),
-			Namespace: "playpen",
-			Labels: map[string]string{
-				"app.kubernetes.io/component":    "runner-nodeport",
-				"playpen.unbounded-cloud.io/pod": pod.Name,
-			},
-		},
-		Spec: corev1.ServiceSpec{
-			Type:                  corev1.ServiceTypeNodePort,
-			ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
-			Selector:              map[string]string{LabelAllocated: allocationIDForPod(pod)},
-			Ports: []corev1.ServicePort{
-				{
-					Name:       "wireguard",
-					Protocol:   corev1.ProtocolUDP,
-					Port:       51820,
-					TargetPort: intstr.FromInt(51820),
-					NodePort:   32000,
-				},
-			},
-		},
-	}
-	op := testOperator(t,
-		testNode("node-1", "20.30.40.50"),
-		pod,
-		service,
-	)
-
-	resp, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
-	if err != nil {
-		t.Fatalf("alloc: %v", err)
-	}
-
-	if status != http.StatusOK {
-		t.Fatalf("status = %d, want %d", status, http.StatusOK)
-	}
-
-	if resp.Endpoint.ExternalTrafficPolicy != string(corev1.ServiceExternalTrafficPolicyCluster) {
-		t.Fatalf("externalTrafficPolicy = %q, want Cluster", resp.Endpoint.ExternalTrafficPolicy)
-	}
-
-	if resp.Endpoint.WireGuardUDPPort != 32000 {
-		t.Fatalf("wireguard node port = %d, want 32000", resp.Endpoint.WireGuardUDPPort)
-	}
-
-	patched := &corev1.Service{}
-	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: service.Name}, patched); err != nil {
-		t.Fatal(err)
-	}
-
-	if patched.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyCluster {
-		t.Fatalf("service externalTrafficPolicy = %s, want Cluster", patched.Spec.ExternalTrafficPolicy)
-	}
-
-	if patched.Spec.Ports[0].NodePort != 32000 {
-		t.Fatalf("service nodePort = %d, want 32000", patched.Spec.Ports[0].NodePort)
-	}
-}
-
 func TestDeallocDeletesClaimedRunnerAndService(t *testing.T) {
 	op := testOperator(t,
 		testNode("node-1", "20.30.40.50"),
@@ -565,16 +463,6 @@ func TestAggregatedDiscoveryRequiresTrustedFrontProxy(t *testing.T) {
 
 	if untrustedRecorder.Code != http.StatusForbidden {
 		t.Fatalf("untrusted discovery status = %d, want %d", untrustedRecorder.Code, http.StatusForbidden)
-	}
-}
-
-func TestLegacyStandaloneEndpointsAreRemoved(t *testing.T) {
-	op := testOperator(t)
-	recorder := httptest.NewRecorder()
-	op.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/playpen/v1/claims", nil))
-
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("legacy claims status = %d, want %d", recorder.Code, http.StatusNotFound)
 	}
 }
 

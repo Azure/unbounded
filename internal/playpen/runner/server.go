@@ -256,10 +256,6 @@ func publishRunnerMetadata(ctx context.Context, cfg Config, serverPublicKey, red
 	return cfg.KubernetesClient.Patch(ctx, pod, client.MergeFrom(base))
 }
 
-func publishServerWireGuardPublicKey(ctx context.Context, cfg Config, serverPublicKey string) error {
-	return publishRunnerMetadata(ctx, cfg, serverPublicKey, "")
-}
-
 func waitForClientPublicKeyAnnotation(ctx context.Context, cfg Config, network *NetworkManager, state *RuntimeState) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()

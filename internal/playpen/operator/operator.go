@@ -366,7 +366,7 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 			continue
 		}
 
-		if !requestHashMatches(pod.Annotations[AnnotationRequestHash], req.WireGuardPublicKey, req.Architecture) {
+		if pod.Annotations[AnnotationRequestHash] != reqHash {
 			return AllocResponse{}, http.StatusConflict, fmt.Errorf("idempotency key was already used with a different request")
 		}
 
@@ -909,15 +909,6 @@ func (o *Operator) ensureNodePortService(ctx context.Context, pod *corev1.Pod) (
 
 	key := types.NamespacedName{Namespace: pod.Namespace, Name: name}
 	if err := o.Client.Get(ctx, key, service); err == nil {
-		if service.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal {
-			base := service.DeepCopy()
-
-			service.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyCluster
-			if err := o.Client.Patch(ctx, service, client.MergeFrom(base)); err != nil {
-				return nil, err
-			}
-		}
-
 		return service, nil
 	} else if !apierrors.IsNotFound(err) {
 		return nil, err
@@ -1038,14 +1029,6 @@ func normalizeArchitecture(value string) (string, error) {
 	default:
 		return "", fmt.Errorf("architecture must be %q or %q", ArchitectureAMD64, ArchitectureARM64)
 	}
-}
-
-func requestHashMatches(storedHash, wireGuardPublicKey, architecture string) bool {
-	if storedHash == hashString(wireGuardPublicKey+"\n"+architecture) {
-		return true
-	}
-
-	return architecture == ArchitectureAMD64 && storedHash == hashString(wireGuardPublicKey)
 }
 
 func podArchitecture(pod *corev1.Pod) string {

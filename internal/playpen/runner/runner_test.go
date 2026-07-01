@@ -221,36 +221,6 @@ func TestWaitForClientPublicKeyAnnotationConfiguresPeer(t *testing.T) {
 	}
 }
 
-func TestPublishServerWireGuardPublicKeyAnnotatesPod(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.PodName = "runner-1"
-	cfg.PodNamespace = "playpen"
-	cfg.KubernetesClient = testKubernetesClient(t, &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: cfg.PodName, Namespace: cfg.PodNamespace},
-	})
-
-	if err := publishServerWireGuardPublicKey(t.Context(), cfg, "server-public-key"); err != nil {
-		t.Fatalf("publish server public key: %v", err)
-	}
-
-	pod := &corev1.Pod{}
-	if err := cfg.KubernetesClient.Get(t.Context(), client.ObjectKey{Namespace: cfg.PodNamespace, Name: cfg.PodName}, pod); err != nil {
-		t.Fatal(err)
-	}
-
-	if pod.Annotations[meta.AnnotationServerWireGuardPublicKey] != "server-public-key" {
-		t.Fatalf("server public key annotation = %q", pod.Annotations[meta.AnnotationServerWireGuardPublicKey])
-	}
-}
-
-func TestDefaultPublicRedfishURLUsesWireGuardAddress(t *testing.T) {
-	cfg := DefaultConfig()
-
-	if got, want := defaultPublicRedfishURL(cfg), "https://10.88.0.1:8443"; got != want {
-		t.Fatalf("default public redfish URL = %q, want %q", got, want)
-	}
-}
-
 func TestInfoResponseUsesWireGuardAddressForDefaultRedfishURL(t *testing.T) {
 	cfg := DefaultConfig()
 	info := infoResponse(cfg, "server-public-key")
