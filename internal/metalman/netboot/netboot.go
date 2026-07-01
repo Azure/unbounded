@@ -226,6 +226,7 @@ type templateData struct {
 
 func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON string) templateData {
 	var specRepave, statusRepave int64
+
 	var agent *v1alpha3.AgentSpec
 
 	if node != nil {
