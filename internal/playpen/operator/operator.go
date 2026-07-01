@@ -4,6 +4,7 @@
 package operator
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -20,8 +21,10 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	authzv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,32 +32,59 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/klog/v2"
+	apiregclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-const idempotencyKeyHeader = "Idempotency-Key"
+const (
+	idempotencyKeyHeader = "Idempotency-Key"
+
+	apiGroup        = "playpen.unbounded-cloud.io"
+	apiVersion      = "v1alpha1"
+	apiGroupVersion = apiGroup + "/" + apiVersion
+	apiServiceName  = apiVersion + "." + apiGroup
+
+	aggregatedAPIGroupPath   = "/apis/" + apiGroup
+	aggregatedAPIVersionPath = aggregatedAPIGroupPath + "/" + apiVersion
+	allocsPath               = aggregatedAPIVersionPath + "/allocs"
+	deallocsPath             = aggregatedAPIVersionPath + "/deallocs"
+
+	extensionAuthNamespace       = "kube-system"
+	extensionAuthConfigMapName   = "extension-apiserver-authentication"
+	extensionAuthClientCAKey     = "requestheader-client-ca-file"
+	extensionAuthAllowedNamesKey = "requestheader-allowed-names"
+	remoteUserHeader             = "X-Remote-User"
+	remoteGroupHeader            = "X-Remote-Group"
+)
 
 type Operator struct {
-	Client client.Client
-	Config Config
-	Scheme *runtime.Scheme
+	Client       client.Client
+	KubeClient   kubernetes.Interface
+	APIRegClient apiregclient.Interface
+	Config       Config
+	Scheme       *runtime.Scheme
+
+	aggregatedMu               sync.RWMutex
+	aggregatedClientCAs        *x509.CertPool
+	aggregatedClientAllowedCNs map[string]struct{}
 }
 
-type ClaimRequest struct {
+type AllocRequest struct {
 	WireGuardPublicKey string `json:"wireGuardPublicKey"`
 }
 
-type ClaimResponse struct {
+type AllocResponse struct {
 	Pod       PodResponse       `json:"pod"`
 	Endpoint  EndpointResponse  `json:"endpoint"`
 	WireGuard WireGuardResponse `json:"wireGuard"`
 	VXLAN     VXLANResponse     `json:"vxlan"`
 	Network   NetworkResponse   `json:"network"`
 	Redfish   map[string]string `json:"redfish"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
 }
 
 type PodResponse struct {
@@ -99,6 +129,14 @@ func (o *Operator) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	certPEM, err := o.servingCertPEM(ctx)
+	if err != nil {
+		return err
+	}
+	if err := o.injectAPIServiceCABundle(ctx, certPEM); err != nil {
+		return err
+	}
+	o.refreshAggregatedClientCAs(ctx)
 
 	server := &http.Server{
 		Addr:              o.Config.ListenAddr,
@@ -107,6 +145,8 @@ func (o *Operator) Run(ctx context.Context) error {
 		TLSConfig: &tls.Config{
 			MinVersion:   tls.VersionTLS12,
 			Certificates: []tls.Certificate{cert},
+			ClientAuth:   tls.RequestClientCert,
+			ClientCAs:    o.aggregatedClientCAs,
 		},
 	}
 
@@ -134,6 +174,7 @@ func (o *Operator) Run(ctx context.Context) error {
 
 			return err
 		case <-ticker.C:
+			o.refreshAggregatedClientCAs(ctx)
 			_ = o.ReconcileRunners(ctx)
 		}
 	}
@@ -141,19 +182,82 @@ func (o *Operator) Run(ctx context.Context) error {
 
 func (o *Operator) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/playpen/v1/claims", o.handleClaims)
-	mux.HandleFunc("/playpen/v1/releases", o.handleReleases)
+	mux.HandleFunc(aggregatedAPIGroupPath, o.handleAPIGroupDiscovery)
+	mux.HandleFunc(aggregatedAPIVersionPath, o.handleAPIVersionDiscovery)
+	mux.HandleFunc(allocsPath, o.handleAllocs)
+	mux.HandleFunc(deallocsPath, o.handleDeallocs)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 
 	return mux
 }
 
-func (o *Operator) handleClaims(w http.ResponseWriter, r *http.Request) {
+func (o *Operator) handleAPIGroupDiscovery(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != aggregatedAPIGroupPath {
+		http.NotFound(w, r)
+
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
+		return
+	}
+	if !o.isTrustedAggregatedRequest(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"kind":       "APIGroup",
+		"apiVersion": "v1",
+		"name":       apiGroup,
+		"versions": []map[string]string{
+			{"groupVersion": apiGroupVersion, "version": apiVersion},
+		},
+		"preferredVersion": map[string]string{"groupVersion": apiGroupVersion, "version": apiVersion},
+	})
+}
+
+func (o *Operator) handleAPIVersionDiscovery(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != aggregatedAPIVersionPath {
+		http.NotFound(w, r)
+
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
+		return
+	}
+	if !o.isTrustedAggregatedRequest(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"kind":         "APIResourceList",
+		"apiVersion":   "v1",
+		"groupVersion": apiGroupVersion,
+		"resources": []map[string]any{
+			{"name": "allocs", "singularName": "alloc", "namespaced": false, "kind": "Alloc", "verbs": []string{"create"}},
+			{"name": "deallocs", "singularName": "dealloc", "namespaced": false, "kind": "Dealloc", "verbs": []string{"create"}},
+		},
+	})
+}
+
+func (o *Operator) handleAllocs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 
+		return
+	}
+	if !o.authorizeAggregatedRequest(w, r) {
 		return
 	}
 
@@ -164,7 +268,7 @@ func (o *Operator) handleClaims(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req ClaimRequest
+	var req AllocRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON request", http.StatusBadRequest)
 
@@ -178,7 +282,7 @@ func (o *Operator) handleClaims(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, status, err := o.Claim(r.Context(), idempotencyKey, req)
+	resp, status, err := o.Alloc(r.Context(), idempotencyKey, req)
 	if err != nil {
 		http.Error(w, err.Error(), status)
 
@@ -188,11 +292,14 @@ func (o *Operator) handleClaims(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (o *Operator) handleReleases(w http.ResponseWriter, r *http.Request) {
+func (o *Operator) handleDeallocs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 
+		return
+	}
+	if !o.authorizeAggregatedRequest(w, r) {
 		return
 	}
 
@@ -203,7 +310,7 @@ func (o *Operator) handleReleases(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status, err := o.Release(r.Context(), idempotencyKey)
+	status, err := o.Dealloc(r.Context(), idempotencyKey)
 	if err != nil {
 		http.Error(w, err.Error(), status)
 
@@ -213,13 +320,13 @@ func (o *Operator) handleReleases(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (o *Operator) Claim(ctx context.Context, idempotencyKey string, req ClaimRequest) (ClaimResponse, int, error) {
+func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRequest) (AllocResponse, int, error) {
 	keyHash := hashString(idempotencyKey)
 	reqHash := hashString(req.WireGuardPublicKey)
 
 	pods, err := o.listRunnerPods(ctx)
 	if err != nil {
-		return ClaimResponse{}, http.StatusInternalServerError, err
+		return AllocResponse{}, http.StatusInternalServerError, err
 	}
 
 	for i := range pods.Items {
@@ -229,12 +336,12 @@ func (o *Operator) Claim(ctx context.Context, idempotencyKey string, req ClaimRe
 		}
 
 		if pod.Annotations[AnnotationRequestHash] != reqHash {
-			return ClaimResponse{}, http.StatusConflict, fmt.Errorf("idempotency key was already used with a different request")
+			return AllocResponse{}, http.StatusConflict, fmt.Errorf("idempotency key was already used with a different request")
 		}
 
 		resp, err := o.responseForPod(ctx, pod)
 		if err != nil {
-			return ClaimResponse{}, http.StatusServiceUnavailable, err
+			return AllocResponse{}, http.StatusServiceUnavailable, err
 		}
 
 		return resp, http.StatusOK, nil
@@ -272,15 +379,15 @@ func (o *Operator) Claim(ctx context.Context, idempotencyKey string, req ClaimRe
 				continue
 			}
 			if errors.Is(err, errIdempotencyRequestConflict) {
-				return ClaimResponse{}, http.StatusConflict, err
+				return AllocResponse{}, http.StatusConflict, err
 			}
 
-			return ClaimResponse{}, http.StatusInternalServerError, err
+			return AllocResponse{}, http.StatusInternalServerError, err
 		}
 		if !claimed {
 			resp, err := o.responseForPod(ctx, allocatedPod)
 			if err != nil {
-				return ClaimResponse{}, http.StatusServiceUnavailable, err
+				return AllocResponse{}, http.StatusServiceUnavailable, err
 			}
 
 			return resp, http.StatusOK, nil
@@ -288,20 +395,20 @@ func (o *Operator) Claim(ctx context.Context, idempotencyKey string, req ClaimRe
 
 		service, err := o.ensureNodePortService(ctx, allocatedPod)
 		if err != nil {
-			return ClaimResponse{}, http.StatusInternalServerError, err
+			return AllocResponse{}, http.StatusInternalServerError, err
 		}
 
 		return o.buildResponse(allocatedPod, gatewayIP, nodePublicIP, service, serverPublicKey), http.StatusOK, nil
 	}
 
 	if len(unavailable) > 0 {
-		return ClaimResponse{}, http.StatusServiceUnavailable, fmt.Errorf("no idle playpen runner pods are available with an ExternalIP gateway: %s", strings.Join(unavailable, "; "))
+		return AllocResponse{}, http.StatusServiceUnavailable, fmt.Errorf("no idle playpen runner pods are available with an ExternalIP gateway: %s", strings.Join(unavailable, "; "))
 	}
 
-	return ClaimResponse{}, http.StatusServiceUnavailable, fmt.Errorf("no idle playpen runner pods are available")
+	return AllocResponse{}, http.StatusServiceUnavailable, fmt.Errorf("no idle playpen runner pods are available")
 }
 
-func (o *Operator) Release(ctx context.Context, idempotencyKey string) (int, error) {
+func (o *Operator) Dealloc(ctx context.Context, idempotencyKey string) (int, error) {
 	keyHash := hashString(idempotencyKey)
 
 	pods, err := o.listRunnerPods(ctx)
@@ -363,7 +470,17 @@ func (o *Operator) EnsureTLSSecret(ctx context.Context) (tls.Certificate, error)
 		return tls.Certificate{}, err
 	}
 
-	certPEM, keyPEM, err := selfSignedCert("playpen-operator", []string{"playpen-operator", "playpen-operator." + o.Config.Namespace, "localhost"})
+	serviceName := strings.TrimSpace(o.Config.ServiceName)
+	if serviceName == "" {
+		serviceName = "playpen-operator"
+	}
+	certPEM, keyPEM, err := selfSignedCert(serviceName, []string{
+		serviceName,
+		serviceName + "." + o.Config.Namespace,
+		serviceName + "." + o.Config.Namespace + ".svc",
+		serviceName + "." + o.Config.Namespace + ".svc.cluster.local",
+		"localhost",
+	})
 	if err != nil {
 		return tls.Certificate{}, err
 	}
@@ -381,6 +498,215 @@ func (o *Operator) EnsureTLSSecret(ctx context.Context) (tls.Certificate, error)
 	}
 
 	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+func (o *Operator) servingCertPEM(ctx context.Context) ([]byte, error) {
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: o.Config.Namespace, Name: o.Config.TLSSecretName}
+	if err := o.Client.Get(ctx, key, secret); err != nil {
+		return nil, err
+	}
+
+	certPEM := secret.Data[corev1.TLSCertKey]
+	if len(certPEM) == 0 {
+		return nil, fmt.Errorf("secret %s/%s is missing %s", o.Config.Namespace, o.Config.TLSSecretName, corev1.TLSCertKey)
+	}
+
+	return certPEM, nil
+}
+
+func (o *Operator) injectAPIServiceCABundle(ctx context.Context, caBundle []byte) error {
+	if o.APIRegClient == nil || len(caBundle) == 0 {
+		return nil
+	}
+
+	apiService, err := o.APIRegClient.ApiregistrationV1().APIServices().Get(ctx, apiServiceName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		klog.Warningf("APIService %s not found; skipping caBundle injection", apiServiceName)
+
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get APIService %s: %w", apiServiceName, err)
+	}
+	if bytes.Equal(apiService.Spec.CABundle, caBundle) {
+		return nil
+	}
+
+	apiService.Spec.CABundle = caBundle
+	if _, err := o.APIRegClient.ApiregistrationV1().APIServices().Update(ctx, apiService, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("update APIService %s caBundle: %w", apiServiceName, err)
+	}
+
+	return nil
+}
+
+func (o *Operator) refreshAggregatedClientCAs(ctx context.Context) {
+	if o.KubeClient == nil {
+		o.aggregatedMu.Lock()
+		defer o.aggregatedMu.Unlock()
+		o.aggregatedClientCAs = nil
+		o.aggregatedClientAllowedCNs = nil
+
+		return
+	}
+
+	cm, err := o.KubeClient.CoreV1().ConfigMaps(extensionAuthNamespace).Get(ctx, extensionAuthConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		klog.Warningf("Failed to read %s/%s: %v", extensionAuthNamespace, extensionAuthConfigMapName, err)
+		o.aggregatedMu.Lock()
+		defer o.aggregatedMu.Unlock()
+		o.aggregatedClientCAs = nil
+		o.aggregatedClientAllowedCNs = nil
+
+		return
+	}
+
+	pool := x509.NewCertPool()
+	caPEM := []byte(cm.Data[extensionAuthClientCAKey])
+	if len(caPEM) == 0 || !pool.AppendCertsFromPEM(caPEM) {
+		klog.Warningf("ConfigMap %s/%s does not contain valid %q PEM data", extensionAuthNamespace, extensionAuthConfigMapName, extensionAuthClientCAKey)
+		o.aggregatedMu.Lock()
+		defer o.aggregatedMu.Unlock()
+		o.aggregatedClientCAs = nil
+		o.aggregatedClientAllowedCNs = nil
+
+		return
+	}
+
+	allowedNames, err := parseRequestHeaderAllowedNames(cm.Data[extensionAuthAllowedNamesKey])
+	if err != nil {
+		klog.Warningf("Failed to parse %q from %s/%s: %v", extensionAuthAllowedNamesKey, extensionAuthNamespace, extensionAuthConfigMapName, err)
+		o.aggregatedMu.Lock()
+		defer o.aggregatedMu.Unlock()
+		o.aggregatedClientCAs = nil
+		o.aggregatedClientAllowedCNs = nil
+
+		return
+	}
+
+	o.aggregatedMu.Lock()
+	defer o.aggregatedMu.Unlock()
+	o.aggregatedClientCAs = pool
+	o.aggregatedClientAllowedCNs = allowedNames
+}
+
+func parseRequestHeaderAllowedNames(raw string) (map[string]struct{}, error) {
+	if raw == "" {
+		return nil, nil
+	}
+
+	var names []string
+	if err := json.Unmarshal([]byte(raw), &names); err != nil {
+		return nil, err
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+
+	allowed := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+
+		allowed[name] = struct{}{}
+	}
+	if len(allowed) == 0 {
+		return nil, nil
+	}
+
+	return allowed, nil
+}
+
+func (o *Operator) authorizeAggregatedRequest(w http.ResponseWriter, r *http.Request) bool {
+	if !o.isTrustedAggregatedRequest(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+
+		return false
+	}
+
+	user := strings.TrimSpace(r.Header.Get(remoteUserHeader))
+	if user == "" {
+		http.Error(w, "missing remote user", http.StatusForbidden)
+
+		return false
+	}
+	if o.KubeClient == nil {
+		http.Error(w, "authorization client is not configured", http.StatusInternalServerError)
+
+		return false
+	}
+
+	sar := &authzv1.SubjectAccessReview{
+		Spec: authzv1.SubjectAccessReviewSpec{
+			User:   user,
+			Groups: remoteGroups(r),
+			ResourceAttributes: &authzv1.ResourceAttributes{
+				Verb:     "create",
+				Group:    apiGroup,
+				Resource: "allocs",
+			},
+		},
+	}
+	result, err := o.KubeClient.AuthorizationV1().SubjectAccessReviews().Create(r.Context(), sar, metav1.CreateOptions{})
+	if err != nil {
+		http.Error(w, "authorization check failed", http.StatusInternalServerError)
+
+		return false
+	}
+	if !result.Status.Allowed || result.Status.Denied {
+		http.Error(w, "forbidden", http.StatusForbidden)
+
+		return false
+	}
+
+	return true
+}
+
+func remoteGroups(r *http.Request) []string {
+	var groups []string
+	for _, value := range r.Header.Values(remoteGroupHeader) {
+		for _, group := range strings.Split(value, ",") {
+			group = strings.TrimSpace(group)
+			if group != "" {
+				groups = append(groups, group)
+			}
+		}
+	}
+
+	return groups
+}
+
+func (o *Operator) isTrustedAggregatedRequest(r *http.Request) bool {
+	o.aggregatedMu.RLock()
+	clientCAs := o.aggregatedClientCAs
+	allowedCNs := o.aggregatedClientAllowedCNs
+	o.aggregatedMu.RUnlock()
+
+	if r == nil || r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || clientCAs == nil {
+		return false
+	}
+
+	leaf := r.TLS.PeerCertificates[0]
+	intermediates := x509.NewCertPool()
+	for _, cert := range r.TLS.PeerCertificates[1:] {
+		intermediates.AddCert(cert)
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:         clientCAs,
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		return false
+	}
+
+	if len(allowedCNs) == 0 {
+		return true
+	}
+	_, ok := allowedCNs[leaf.Subject.CommonName]
+
+	return ok
 }
 
 func (o *Operator) listRunnerPods(ctx context.Context) (*corev1.PodList, error) {
@@ -479,20 +805,20 @@ func (o *Operator) patchClaim(ctx context.Context, pod *corev1.Pod, keyHash, req
 	return updated, claimed, nil
 }
 
-func (o *Operator) responseForPod(ctx context.Context, pod *corev1.Pod) (ClaimResponse, error) {
+func (o *Operator) responseForPod(ctx context.Context, pod *corev1.Pod) (AllocResponse, error) {
 	serverPublicKey, err := serverWireGuardPublicKeyForPod(pod)
 	if err != nil {
-		return ClaimResponse{}, err
+		return AllocResponse{}, err
 	}
 
 	gatewayIP, nodePublicIP, err := o.gatewayForPod(ctx, pod.Spec.NodeName)
 	if err != nil {
-		return ClaimResponse{}, err
+		return AllocResponse{}, err
 	}
 
 	service, err := o.ensureNodePortService(ctx, pod)
 	if err != nil {
-		return ClaimResponse{}, err
+		return AllocResponse{}, err
 	}
 
 	return o.buildResponse(pod, gatewayIP, nodePublicIP, service, serverPublicKey), nil
@@ -553,7 +879,7 @@ func (o *Operator) ensureNodePortService(ctx context.Context, pod *corev1.Pod) (
 	return service, nil
 }
 
-func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string, service *corev1.Service, serverPublicKey string) ClaimResponse {
+func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string, service *corev1.Service, serverPublicKey string) AllocResponse {
 	runnerCfg := o.Config.Runner
 	nodePort := int32(0)
 	if len(service.Spec.Ports) > 0 {
@@ -567,7 +893,7 @@ func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string
 		redfishURL = "https://" + runnerCfg.ListenAddr
 	}
 
-	return ClaimResponse{
+	return AllocResponse{
 		Pod: PodResponse{
 			Namespace:    pod.Namespace,
 			Name:         pod.Name,
@@ -607,9 +933,6 @@ func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string
 			"deviceID":               runnerCfg.Redfish.DeviceID,
 			"systemURL":              redfishURL + "/redfish/v1/Systems/" + runnerCfg.Redfish.DeviceID,
 			"serialConsoleStreamURI": "/redfish/v1/Systems/" + runnerCfg.Redfish.DeviceID + "/Oem/Unbounded/SerialConsole/Stream",
-		},
-		Metadata: map[string]string{
-			"serviceName": service.Name,
 		},
 	}
 }
@@ -740,12 +1063,14 @@ func selfSignedCert(commonName string, hosts []string) ([]byte, []byte, error) {
 
 	notBefore := time.Now().Add(-time.Minute)
 	tmpl := x509.Certificate{
-		SerialNumber: big.NewInt(notBefore.UnixNano()),
-		Subject:      pkix.Name{CommonName: commonName},
-		NotBefore:    notBefore,
-		NotAfter:     notBefore.Add(365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		SerialNumber:          big.NewInt(notBefore.UnixNano()),
+		Subject:               pkix.Name{CommonName: commonName},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
 	}
 
 	for _, host := range hosts {

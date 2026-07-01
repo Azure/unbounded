@@ -23,6 +23,7 @@ const (
 type Config struct {
 	ListenAddr          string
 	Namespace           string
+	ServiceName         string
 	TLSSecretName       string
 	RunnerNamespace     string
 	RunnerLabelSelector string
@@ -37,6 +38,7 @@ func DefaultConfig() Config {
 	return Config{
 		ListenAddr:          ":8443",
 		Namespace:           "playpen",
+		ServiceName:         "playpen-operator",
 		TLSSecretName:       "playpen-operator-tls",
 		RunnerNamespace:     "playpen",
 		RunnerLabelSelector: "app.kubernetes.io/name=playpen-runner",

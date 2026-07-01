@@ -4,33 +4,44 @@
 package operator
 
 import (
+	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	authzv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	kubefake "k8s.io/client-go/kubernetes/fake"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	k8stesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-func TestClaimAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
+func TestAllocAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
 	op := testOperator(t,
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
 	)
-	req := ClaimRequest{WireGuardPublicKey: testPublicKey(t)}
+	req := AllocRequest{WireGuardPublicKey: testPublicKey(t)}
 
-	resp, status, err := op.Claim(t.Context(), "claim-key", req)
+	resp, status, err := op.Alloc(t.Context(), "alloc-key", req)
 	if err != nil {
-		t.Fatalf("claim: %v", err)
+		t.Fatalf("alloc: %v", err)
 	}
 	if status != 200 {
 		t.Fatalf("status = %d, want 200", status)
@@ -62,7 +73,7 @@ func TestClaimAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
 		t.Fatal(err)
 	}
 	if pod.Annotations[AnnotationClientWireGuardPublicKey] != req.WireGuardPublicKey {
-		t.Fatalf("pod claim annotation = %q, want %q", pod.Annotations[AnnotationClientWireGuardPublicKey], req.WireGuardPublicKey)
+		t.Fatalf("pod allocation annotation = %q, want %q", pod.Annotations[AnnotationClientWireGuardPublicKey], req.WireGuardPublicKey)
 	}
 	if pod.Labels[LabelAllocated] == "" {
 		t.Fatal("pod allocation label is empty")
@@ -93,28 +104,28 @@ func TestClaimAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
 	}
 }
 
-func TestClaimIsIdempotentAndConflictsOnDifferentRequest(t *testing.T) {
+func TestAllocIsIdempotentAndConflictsOnDifferentRequest(t *testing.T) {
 	op := testOperator(t,
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
 	)
-	req := ClaimRequest{WireGuardPublicKey: testPublicKey(t)}
+	req := AllocRequest{WireGuardPublicKey: testPublicKey(t)}
 
-	first, status, err := op.Claim(t.Context(), "claim-key", req)
+	first, status, err := op.Alloc(t.Context(), "alloc-key", req)
 	if err != nil || status != 200 {
-		t.Fatalf("first claim status=%d err=%v", status, err)
+		t.Fatalf("first alloc status=%d err=%v", status, err)
 	}
-	second, status, err := op.Claim(t.Context(), "claim-key", req)
+	second, status, err := op.Alloc(t.Context(), "alloc-key", req)
 	if err != nil || status != 200 {
-		t.Fatalf("second claim status=%d err=%v", status, err)
+		t.Fatalf("second alloc status=%d err=%v", status, err)
 	}
 	if second.Pod.Name != first.Pod.Name {
 		t.Fatalf("second pod = %q, want %q", second.Pod.Name, first.Pod.Name)
 	}
 
-	_, status, err = op.Claim(t.Context(), "claim-key", ClaimRequest{WireGuardPublicKey: testPublicKey(t)})
+	_, status, err = op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
 	if err == nil {
-		t.Fatal("different request with same idempotency key succeeded")
+		t.Fatal("different alloc request with same idempotency key succeeded")
 	}
 	if status != 409 {
 		t.Fatalf("conflict status = %d, want 409", status)
@@ -126,8 +137,8 @@ func TestPatchClaimAllowsSameRequestAfterClaim(t *testing.T) {
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
 	)
-	req := ClaimRequest{WireGuardPublicKey: testPublicKey(t)}
-	keyHash := hashString("claim-key")
+	req := AllocRequest{WireGuardPublicKey: testPublicKey(t)}
+	keyHash := hashString("alloc-key")
 	reqHash := hashString(req.WireGuardPublicKey)
 
 	pod := &corev1.Pod{}
@@ -156,16 +167,16 @@ func TestPatchClaimAllowsSameRequestAfterClaim(t *testing.T) {
 	}
 }
 
-func TestClaimUsesOtherNodeExternalIPWhenRunnerNodeIsPrivate(t *testing.T) {
+func TestAllocUsesOtherNodeExternalIPWhenRunnerNodeIsPrivate(t *testing.T) {
 	op := testOperator(t,
 		testNode("private-node", ""),
 		testNode("gateway-node", "20.30.40.50"),
 		testPod("runner-1", "private-node", nil),
 	)
 
-	resp, status, err := op.Claim(t.Context(), "claim-key", ClaimRequest{WireGuardPublicKey: testPublicKey(t)})
+	resp, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
 	if err != nil {
-		t.Fatalf("claim: %v", err)
+		t.Fatalf("alloc: %v", err)
 	}
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want %d", status, http.StatusOK)
@@ -178,15 +189,15 @@ func TestClaimUsesOtherNodeExternalIPWhenRunnerNodeIsPrivate(t *testing.T) {
 	}
 }
 
-func TestClaimRequiresAnyNodeExternalIP(t *testing.T) {
+func TestAllocRequiresAnyNodeExternalIP(t *testing.T) {
 	op := testOperator(t,
 		testNode("node-1", ""),
 		testPod("runner-1", "node-1", nil),
 	)
 
-	_, status, err := op.Claim(t.Context(), "claim-key", ClaimRequest{WireGuardPublicKey: testPublicKey(t)})
+	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
 	if err == nil {
-		t.Fatal("claim succeeded without any node ExternalIP")
+		t.Fatal("alloc succeeded without any node ExternalIP")
 	}
 	if status != 503 {
 		t.Fatalf("status = %d, want 503", status)
@@ -201,15 +212,15 @@ func TestClaimRequiresAnyNodeExternalIP(t *testing.T) {
 	}
 }
 
-func TestClaimSkipsRunnerWithoutServerWireGuardPublicKey(t *testing.T) {
+func TestAllocSkipsRunnerWithoutServerWireGuardPublicKey(t *testing.T) {
 	op := testOperator(t,
 		testNode("node-1", "20.30.40.50"),
 		testPodWithAnnotations("runner-1", "node-1", map[string]string{}),
 	)
 
-	_, status, err := op.Claim(t.Context(), "claim-key", ClaimRequest{WireGuardPublicKey: testPublicKey(t)})
+	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
 	if err == nil {
-		t.Fatal("claim succeeded without server WireGuard public key")
+		t.Fatal("alloc succeeded without server WireGuard public key")
 	}
 	if status != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", status, http.StatusServiceUnavailable)
@@ -224,7 +235,7 @@ func TestClaimSkipsRunnerWithoutServerWireGuardPublicKey(t *testing.T) {
 	}
 }
 
-func TestClaimSkipsUnavailableRunnerPods(t *testing.T) {
+func TestAllocSkipsUnavailableRunnerPods(t *testing.T) {
 	terminating := testPod("terminating-runner", "node-1", nil)
 	now := metav1.Now()
 	terminating.DeletionTimestamp = &now
@@ -244,39 +255,39 @@ func TestClaimSkipsUnavailableRunnerPods(t *testing.T) {
 		testPod("ready-runner", "node-1", nil),
 	)
 
-	resp, status, err := op.Claim(t.Context(), "claim-key", ClaimRequest{WireGuardPublicKey: testPublicKey(t)})
+	resp, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
 	if err != nil || status != http.StatusOK {
-		t.Fatalf("claim status=%d err=%v", status, err)
+		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
 	if resp.Pod.Name != "ready-runner" {
 		t.Fatalf("claimed pod = %q, want ready-runner", resp.Pod.Name)
 	}
 }
 
-func TestClaimUsesPodScopedServerWireGuardPublicKey(t *testing.T) {
+func TestAllocUsesPodScopedServerWireGuardPublicKey(t *testing.T) {
 	op := testOperator(t,
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
 		testPod("runner-2", "node-1", nil),
 	)
 
-	first, status, err := op.Claim(t.Context(), "claim-key-1", ClaimRequest{WireGuardPublicKey: testPublicKey(t)})
+	first, status, err := op.Alloc(t.Context(), "alloc-key-1", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
 	if err != nil || status != http.StatusOK {
-		t.Fatalf("first claim status=%d err=%v", status, err)
+		t.Fatalf("first alloc status=%d err=%v", status, err)
 	}
-	second, status, err := op.Claim(t.Context(), "claim-key-2", ClaimRequest{WireGuardPublicKey: testPublicKey(t)})
+	second, status, err := op.Alloc(t.Context(), "alloc-key-2", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
 	if err != nil || status != http.StatusOK {
-		t.Fatalf("second claim status=%d err=%v", status, err)
+		t.Fatalf("second alloc status=%d err=%v", status, err)
 	}
 	if first.Pod.Name == second.Pod.Name {
-		t.Fatalf("second claim reused pod %q", second.Pod.Name)
+		t.Fatalf("second alloc reused pod %q", second.Pod.Name)
 	}
 	if first.WireGuard.ServerPublicKey == second.WireGuard.ServerPublicKey {
-		t.Fatal("claims returned the same server WireGuard public key")
+		t.Fatal("allocs returned the same server WireGuard public key")
 	}
 }
 
-func TestClaimPatchesExistingNodePortServiceToClusterPolicy(t *testing.T) {
+func TestAllocPatchesExistingNodePortServiceToClusterPolicy(t *testing.T) {
 	pod := testPod("runner-1", "node-1", nil)
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -308,9 +319,9 @@ func TestClaimPatchesExistingNodePortServiceToClusterPolicy(t *testing.T) {
 		service,
 	)
 
-	resp, status, err := op.Claim(t.Context(), "claim-key", ClaimRequest{WireGuardPublicKey: testPublicKey(t)})
+	resp, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
 	if err != nil {
-		t.Fatalf("claim: %v", err)
+		t.Fatalf("alloc: %v", err)
 	}
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want %d", status, http.StatusOK)
@@ -334,27 +345,27 @@ func TestClaimPatchesExistingNodePortServiceToClusterPolicy(t *testing.T) {
 	}
 }
 
-func TestReleaseDeletesClaimedRunnerAndService(t *testing.T) {
+func TestDeallocDeletesClaimedRunnerAndService(t *testing.T) {
 	op := testOperator(t,
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
 	)
-	req := ClaimRequest{WireGuardPublicKey: testPublicKey(t)}
+	req := AllocRequest{WireGuardPublicKey: testPublicKey(t)}
 
-	if _, status, err := op.Claim(t.Context(), "claim-key", req); err != nil || status != 200 {
-		t.Fatalf("claim status=%d err=%v", status, err)
+	if _, status, err := op.Alloc(t.Context(), "alloc-key", req); err != nil || status != 200 {
+		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
-	status, err := op.Release(t.Context(), "claim-key")
+	status, err := op.Dealloc(t.Context(), "alloc-key")
 	if err != nil {
-		t.Fatalf("release: %v", err)
+		t.Fatalf("dealloc: %v", err)
 	}
 	if status != 204 {
-		t.Fatalf("release status = %d, want 204", status)
+		t.Fatalf("dealloc status = %d, want 204", status)
 	}
 
 	pod := &corev1.Pod{}
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err == nil {
-		t.Fatal("claimed pod still exists after release")
+		t.Fatal("allocated pod still exists after dealloc")
 	}
 
 	services := &corev1.ServiceList{}
@@ -366,40 +377,145 @@ func TestReleaseDeletesClaimedRunnerAndService(t *testing.T) {
 	}
 }
 
-func TestReleaseIsIdempotentWhenClaimIsMissing(t *testing.T) {
+func TestDeallocIsIdempotentWhenClaimIsMissing(t *testing.T) {
 	op := testOperator(t)
 
-	status, err := op.Release(t.Context(), "claim-key")
+	status, err := op.Dealloc(t.Context(), "alloc-key")
 	if err != nil {
-		t.Fatalf("release: %v", err)
+		t.Fatalf("dealloc: %v", err)
 	}
 	if status != 204 {
-		t.Fatalf("release status = %d, want 204", status)
+		t.Fatalf("dealloc status = %d, want 204", status)
 	}
 }
 
-func TestReleaseEndpointDeletesClaimedRunner(t *testing.T) {
-	op := testOperator(t,
+func TestAggregatedDiscoveryRequiresTrustedFrontProxy(t *testing.T) {
+	op := testAggregatedOperator(t, true)
+
+	groupReq := trustedAggregatedRequest(t, op, http.MethodGet, aggregatedAPIGroupPath, nil)
+	groupRecorder := httptest.NewRecorder()
+	op.Handler().ServeHTTP(groupRecorder, groupReq)
+	if groupRecorder.Code != http.StatusOK {
+		t.Fatalf("group discovery status = %d, want %d", groupRecorder.Code, http.StatusOK)
+	}
+	if !bytes.Contains(groupRecorder.Body.Bytes(), []byte(apiGroupVersion)) {
+		t.Fatalf("group discovery body = %s", groupRecorder.Body.String())
+	}
+
+	versionReq := trustedAggregatedRequest(t, op, http.MethodGet, aggregatedAPIVersionPath, nil)
+	versionRecorder := httptest.NewRecorder()
+	op.Handler().ServeHTTP(versionRecorder, versionReq)
+	if versionRecorder.Code != http.StatusOK {
+		t.Fatalf("version discovery status = %d, want %d", versionRecorder.Code, http.StatusOK)
+	}
+	if !bytes.Contains(versionRecorder.Body.Bytes(), []byte(`"allocs"`)) || !bytes.Contains(versionRecorder.Body.Bytes(), []byte(`"deallocs"`)) {
+		t.Fatalf("version discovery body = %s", versionRecorder.Body.String())
+	}
+
+	untrustedReq := httptest.NewRequest(http.MethodGet, aggregatedAPIVersionPath, nil)
+	untrustedRecorder := httptest.NewRecorder()
+	op.Handler().ServeHTTP(untrustedRecorder, untrustedReq)
+	if untrustedRecorder.Code != http.StatusForbidden {
+		t.Fatalf("untrusted discovery status = %d, want %d", untrustedRecorder.Code, http.StatusForbidden)
+	}
+}
+
+func TestLegacyStandaloneEndpointsAreRemoved(t *testing.T) {
+	op := testOperator(t)
+	recorder := httptest.NewRecorder()
+	op.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/playpen/v1/claims", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("legacy claims status = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
+}
+
+func TestAllocEndpointAuthorizesSharedAllocAction(t *testing.T) {
+	op := testAggregatedOperator(t, true,
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
 	)
-	req := ClaimRequest{WireGuardPublicKey: testPublicKey(t)}
-	if _, status, err := op.Claim(t.Context(), "claim-key", req); err != nil || status != 200 {
-		t.Fatalf("claim status=%d err=%v", status, err)
+	reqBody, err := json.Marshal(AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := trustedAggregatedRequest(t, op, http.MethodPost, allocsPath, bytes.NewReader(reqBody))
+	req.Header.Set(idempotencyKeyHeader, "alloc-key")
+	req.Header.Set(remoteUserHeader, "alice")
+	req.Header.Add(remoteGroupHeader, "team-a")
+	req.Header.Add(remoteGroupHeader, "team-b,team-c")
+
+	recorder := httptest.NewRecorder()
+	op.Handler().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("alloc endpoint status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+}
+
+func TestAllocEndpointRejectsMissingRemoteUser(t *testing.T) {
+	op := testAggregatedOperator(t, true,
+		testNode("node-1", "20.30.40.50"),
+		testPod("runner-1", "node-1", nil),
+	)
+	reqBody, err := json.Marshal(AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := trustedAggregatedRequest(t, op, http.MethodPost, allocsPath, bytes.NewReader(reqBody))
+	req.Header.Set(idempotencyKeyHeader, "alloc-key")
+
+	recorder := httptest.NewRecorder()
+	op.Handler().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("alloc endpoint status = %d, want %d", recorder.Code, http.StatusForbidden)
+	}
+}
+
+func TestAllocEndpointRejectsDeniedSubjectAccessReview(t *testing.T) {
+	op := testAggregatedOperator(t, false,
+		testNode("node-1", "20.30.40.50"),
+		testPod("runner-1", "node-1", nil),
+	)
+	reqBody, err := json.Marshal(AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := trustedAggregatedRequest(t, op, http.MethodPost, allocsPath, bytes.NewReader(reqBody))
+	req.Header.Set(idempotencyKeyHeader, "alloc-key")
+	req.Header.Set(remoteUserHeader, "alice")
+
+	recorder := httptest.NewRecorder()
+	op.Handler().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("alloc endpoint status = %d, want %d", recorder.Code, http.StatusForbidden)
+	}
+}
+
+func TestDeallocEndpointDeletesAllocatedRunner(t *testing.T) {
+	op := testAggregatedOperator(t, true,
+		testNode("node-1", "20.30.40.50"),
+		testPod("runner-1", "node-1", nil),
+	)
+	req := AllocRequest{WireGuardPublicKey: testPublicKey(t)}
+	if _, status, err := op.Alloc(t.Context(), "alloc-key", req); err != nil || status != 200 {
+		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
 
-	httpReq := httptest.NewRequest(http.MethodPost, "/playpen/v1/releases", nil)
-	httpReq.Header.Set(idempotencyKeyHeader, "claim-key")
+	httpReq := trustedAggregatedRequest(t, op, http.MethodPost, deallocsPath, nil)
+	httpReq.Header.Set(idempotencyKeyHeader, "alloc-key")
+	httpReq.Header.Set(remoteUserHeader, "alice")
 	recorder := httptest.NewRecorder()
 
 	op.Handler().ServeHTTP(recorder, httpReq)
 
 	if recorder.Code != http.StatusNoContent {
-		t.Fatalf("release endpoint status = %d, want %d", recorder.Code, http.StatusNoContent)
+		t.Fatalf("dealloc endpoint status = %d, want %d", recorder.Code, http.StatusNoContent)
 	}
 	pod := &corev1.Pod{}
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err == nil {
-		t.Fatal("claimed pod still exists after release endpoint call")
+		t.Fatal("claimed pod still exists after dealloc endpoint call")
 	}
 }
 
@@ -466,6 +582,110 @@ func testOperator(t *testing.T, objects ...client.Object) *Operator {
 	}
 
 	return op
+}
+
+var testAggregatedClientCerts = map[*Operator]*x509.Certificate{}
+
+func testAggregatedOperator(t *testing.T, sarAllowed bool, objects ...client.Object) *Operator {
+	t.Helper()
+
+	op := testOperator(t, objects...)
+	leaf, pool := testFrontProxyCert(t, "front-proxy-client")
+	op.aggregatedClientCAs = pool
+	op.aggregatedClientAllowedCNs = map[string]struct{}{leaf.Subject.CommonName: {}}
+	testAggregatedClientCerts[op] = leaf
+	op.KubeClient = kubefake.NewClientset()
+	op.KubeClient.(*kubefake.Clientset).PrependReactor("create", "subjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		sar := createAction.GetObject().(*authzv1.SubjectAccessReview)
+		if sar.Spec.User != "alice" {
+			t.Fatalf("SAR user = %q, want alice", sar.Spec.User)
+		}
+		if sar.Spec.ResourceAttributes == nil {
+			t.Fatal("SAR missing resource attributes")
+		}
+		attrs := sar.Spec.ResourceAttributes
+		if attrs.Verb != "create" || attrs.Group != apiGroup || attrs.Resource != "allocs" {
+			t.Fatalf("SAR attrs = %#v, want create %s allocs", attrs, apiGroup)
+		}
+
+		return true, &authzv1.SubjectAccessReview{Status: authzv1.SubjectAccessReviewStatus{Allowed: sarAllowed}}, nil
+	})
+
+	return op
+}
+
+func trustedAggregatedRequest(t *testing.T, op *Operator, method, path string, body *bytes.Reader) *http.Request {
+	t.Helper()
+
+	if body == nil {
+		body = bytes.NewReader(nil)
+	}
+	req := httptest.NewRequest(method, path, body)
+	_, ok := op.aggregatedClientAllowedCNs["front-proxy-client"]
+	if !ok {
+		t.Fatal("test operator is missing front-proxy-client allowed CN")
+	}
+	cert := testAggregatedClientCerts[op]
+	if cert == nil {
+		t.Fatal("test operator is missing client certificate")
+	}
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
+
+	return req
+}
+
+func testFrontProxyCert(t *testing.T, commonName string) (*x509.Certificate, *x509.CertPool) {
+	t.Helper()
+
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(now.UnixNano()),
+		Subject:               pkix.Name{CommonName: "test-front-proxy-ca"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(now.UnixNano() + 1),
+		Subject:      pkix.Name{CommonName: commonName},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	clientDER, err := x509.CreateCertificate(rand.Reader, clientTemplate, caTemplate, &clientKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCert, err := x509.ParseCertificate(clientDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool := x509.NewCertPool()
+	pool.AddCert(caCert)
+
+	return clientCert, pool
 }
 
 func testPod(name, nodeName string, annotations map[string]string) *corev1.Pod {

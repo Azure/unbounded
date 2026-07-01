@@ -5,6 +5,7 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -45,13 +46,13 @@ type TunnelConfig struct {
 type Tunnel struct {
 	cmd                 Commander
 	privateKey          string
-	metadata            operator.ClaimResponse
+	metadata            operator.AllocResponse
 	cfg                 TunnelConfig
 	createdPrivateKey   bool
 	createdPrivateKeyAt string
 }
 
-func NewTunnel(cmd Commander, privateKey string, metadata operator.ClaimResponse, cfg TunnelConfig) *Tunnel {
+func NewTunnel(cmd Commander, privateKey string, metadata operator.AllocResponse, cfg TunnelConfig) *Tunnel {
 	return &Tunnel{cmd: cmd, privateKey: privateKey, metadata: metadata, cfg: cfg}
 }
 
@@ -207,7 +208,7 @@ func singleIPCIDR(addr netip.Addr) string {
 }
 
 func shortHash(value string) string {
-	h := sha256Sum([]byte(value))
+	h := sha256.Sum256([]byte(value))
 
 	return hex.EncodeToString(h[:4])
 }

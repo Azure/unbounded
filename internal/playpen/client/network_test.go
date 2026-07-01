@@ -16,7 +16,7 @@ func TestTunnelSetupCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := &fakeCommander{}
-	metadata := testClaimResponse()
+	metadata := testAllocResponse()
 	tunnel := NewTunnel(fake, key.String(), metadata, TunnelConfig{
 		WireGuardInterface:  "wg-playpen",
 		VXLANInterface:      "vx-playpen",

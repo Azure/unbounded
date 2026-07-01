@@ -29,6 +29,7 @@ spec:
           args:
             - --listen-addr=:8443
             - --namespace={{ default "playpen" .Namespace }}
+            - --service-name=playpen-operator
             - --runner-namespace={{ default "playpen" .Namespace }}
             - --runner-label-selector=app.kubernetes.io/name=playpen-runner
             - --playpen-ttl={{ default "1h" .PlaypenTTL }}

@@ -5,61 +5,52 @@ package client
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+	"k8s.io/client-go/rest"
 
 	"github.com/Azure/unbounded/internal/playpen/operator"
 )
 
-func TestAllocateSendsAuthIdempotencyAndPublicKey(t *testing.T) {
+func TestAllocateSendsIdempotencyAndPublicKeyToAggregatedAPI(t *testing.T) {
 	privateKey, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	var gotAuth, gotKey, gotPublicKey string
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/playpen/v1/claims" {
+	var gotKey, gotPublicKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != allocsPath {
 			t.Fatalf("path = %s", r.URL.Path)
 		}
-		gotAuth = r.Header.Get("Authorization")
 		gotKey = r.Header.Get(idempotencyKeyHeader)
 
-		var req operator.ClaimRequest
+		var req operator.AllocRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatal(err)
 		}
 		gotPublicKey = req.WireGuardPublicKey
 
-		writeJSON(t, w, testClaimResponse())
+		writeJSON(t, w, testAllocResponse())
 	}))
 	defer server.Close()
 
-	c, err := New(Config{
-		BaseURL:                 server.URL,
-		CertFingerprint:         tlsServerFingerprint(server),
-		GitHubActionsOAuthToken: "github-token",
-	})
+	c, err := New(Config{RESTConfig: &rest.Config{Host: server.URL}, HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	p, err := c.Allocate(t.Context(), AllocateOptions{IdempotencyKey: "claim-key", WireGuardPrivateKey: privateKey.String()})
+	p, err := c.Allocate(t.Context(), AllocateOptions{IdempotencyKey: "alloc-key", WireGuardPrivateKey: privateKey.String()})
 	if err != nil {
 		t.Fatalf("allocate: %v", err)
 	}
 
-	if gotAuth != "Bearer github-token" {
-		t.Fatalf("authorization = %q", gotAuth)
-	}
-	if gotKey != "claim-key" {
+	if gotKey != "alloc-key" {
 		t.Fatalf("idempotency key = %q", gotKey)
 	}
 	if gotPublicKey != privateKey.PublicKey().String() {
@@ -70,50 +61,49 @@ func TestAllocateSendsAuthIdempotencyAndPublicKey(t *testing.T) {
 	}
 }
 
-func TestAllocateRejectsWrongOperatorFingerprint(t *testing.T) {
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(t, w, testClaimResponse())
+func TestNewRequiresRESTConfig(t *testing.T) {
+	_, err := New(Config{})
+	if err == nil || !strings.Contains(err.Error(), "REST config") {
+		t.Fatalf("error = %v, want REST config requirement", err)
+	}
+
+	_, err = New(Config{RESTConfig: &rest.Config{}})
+	if err == nil || !strings.Contains(err.Error(), "host") {
+		t.Fatalf("error = %v, want host requirement", err)
+	}
+}
+
+func TestNewUsesKubernetesAuthTransport(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
 
-	c, err := New(Config{
-		BaseURL:                 server.URL,
-		CertFingerprint:         formatFingerprint(make([]byte, sha256.Size)),
-		GitHubActionsOAuthToken: "token",
-	})
+	c, err := New(Config{RESTConfig: &rest.Config{Host: server.URL, BearerToken: "test-token"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	_, err = c.Allocate(t.Context(), AllocateOptions{IdempotencyKey: "claim-key"})
-	if err == nil || !strings.Contains(err.Error(), "TLS cert SHA256 mismatch") {
-		t.Fatalf("allocate error = %v, want TLS mismatch", err)
+	if err := c.Deallocate(t.Context(), "alloc-key"); err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Fatalf("authorization header = %q, want bearer token", gotAuth)
 	}
 }
 
-func TestNewRequiresExactlyOneToken(t *testing.T) {
-	_, err := New(Config{BaseURL: "https://example.com", CertFingerprint: "fp"})
-	if err == nil || !strings.Contains(err.Error(), "required") {
-		t.Fatalf("missing token error = %v", err)
-	}
-
-	_, err = New(Config{BaseURL: "https://example.com", CertFingerprint: "fp", GitHubActionsOAuthToken: "a", KubernetesToken: "b"})
-	if err == nil || !strings.Contains(err.Error(), "not both") {
-		t.Fatalf("two token error = %v", err)
-	}
-}
-
-func TestCloseTearsDownTunnelBeforeReleaseAndIsIdempotent(t *testing.T) {
+func TestCloseTearsDownTunnelBeforeDeallocateAndIsIdempotent(t *testing.T) {
 	fake := &fakeCommander{}
-	var releaseCount int
+	var deallocCount int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/playpen/v1/claims":
-			writeJSON(t, w, testClaimResponse())
-		case "/playpen/v1/releases":
-			releaseCount++
+		case allocsPath:
+			writeJSON(t, w, testAllocResponse())
+		case deallocsPath:
+			deallocCount++
 			if len(fake.commands) == 0 || !strings.Contains(fake.commands[len(fake.commands)-1], "ip link delete ppwg") {
-				t.Fatalf("release happened before tunnel teardown: %#v", fake.commands)
+				t.Fatalf("dealloc happened before tunnel teardown: %#v", fake.commands)
 			}
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -122,11 +112,11 @@ func TestCloseTearsDownTunnelBeforeReleaseAndIsIdempotent(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c, err := New(Config{BaseURL: server.URL, HTTPClient: server.Client(), KubernetesToken: "k8s-token", Commander: fake})
+	c, err := New(Config{RESTConfig: &rest.Config{Host: server.URL}, HTTPClient: server.Client(), Commander: fake})
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := c.Allocate(t.Context(), AllocateOptions{IdempotencyKey: "claim-key"})
+	p, err := c.Allocate(t.Context(), AllocateOptions{IdempotencyKey: "alloc-key"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,36 +129,32 @@ func TestCloseTearsDownTunnelBeforeReleaseAndIsIdempotent(t *testing.T) {
 	if err := p.Close(t.Context()); err != nil {
 		t.Fatalf("second close: %v", err)
 	}
-	if releaseCount != 1 {
-		t.Fatalf("release count = %d, want 1", releaseCount)
+	if deallocCount != 1 {
+		t.Fatalf("dealloc count = %d, want 1", deallocCount)
 	}
 }
 
-func TestReleaseSendsIdempotencyKey(t *testing.T) {
+func TestDeallocateSendsIdempotencyKey(t *testing.T) {
 	var gotKey string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != deallocsPath {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
 		gotKey = r.Header.Get(idempotencyKeyHeader)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
 
-	c, err := New(Config{BaseURL: server.URL, HTTPClient: server.Client(), KubernetesToken: "token"})
+	c, err := New(Config{RESTConfig: &rest.Config{Host: server.URL}, HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Release(t.Context(), "claim-key"); err != nil {
+	if err := c.Deallocate(t.Context(), "alloc-key"); err != nil {
 		t.Fatal(err)
 	}
-	if gotKey != "claim-key" {
+	if gotKey != "alloc-key" {
 		t.Fatalf("idempotency key = %q", gotKey)
 	}
-}
-
-func tlsServerFingerprint(server *httptest.Server) string {
-	cert := server.TLS.Certificates[0].Certificate[0]
-	sum := sha256.Sum256(cert)
-
-	return formatFingerprint(sum[:])
 }
 
 func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
@@ -179,8 +165,8 @@ func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	}
 }
 
-func testClaimResponse() operator.ClaimResponse {
-	return operator.ClaimResponse{
+func testAllocResponse() operator.AllocResponse {
+	return operator.AllocResponse{
 		Pod: operator.PodResponse{
 			Namespace: "playpen",
 			Name:      "runner-1",
@@ -225,21 +211,4 @@ func (f *fakeCommander) Run(_ context.Context, name string, args ...string) erro
 	f.commands = append(f.commands, strings.Join(append([]string{name}, args...), " "))
 
 	return nil
-}
-
-func TestHTTPClientDoesNotRequireFingerprint(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(t, w, testClaimResponse())
-	}))
-	defer server.Close()
-
-	c, err := New(Config{BaseURL: server.URL, HTTPClient: server.Client(), KubernetesToken: "token"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	if _, err := c.Allocate(ctx, AllocateOptions{IdempotencyKey: "claim-key"}); err != nil {
-		t.Fatal(err)
-	}
 }

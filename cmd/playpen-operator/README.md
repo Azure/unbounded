@@ -1,48 +1,56 @@
 # playpen-operator
 
-`playpen-operator` is the HTTPS allocator for playpen runner pods. It runs in
-Kubernetes next to a pool of `playpen-runner` pods and hands one idle runner to a
-client that presents a WireGuard public key.
+`playpen-operator` serves the aggregated Kubernetes API for playpen runner pods.
+It runs next to a pool of `playpen-runner` pods and allocates one idle runner to
+a client that presents a WireGuard public key.
 
-On claim, the operator patches the selected pod with the client key, creates a
+On alloc, the operator patches the selected pod with the client key, creates a
 per-runner UDP NodePort Service for WireGuard, and returns the endpoint, network,
 VXLAN, and Redfish details needed to use the playpen VM.
 
 The operator does not proxy Redfish or console traffic. Clients reach Redfish and
-the serial console stream on the runner through the WireGuard tunnel. The claim
+the serial console stream on the runner through the WireGuard tunnel. The alloc
 response includes the runner Redfish URL, the system URL, and the OEM serial
 console stream URI for convenience.
 
 ## API
 
-The server listens on `--listen-addr` (default `:8443`). It serves TLS using the
-Secret named by `--tls-secret-name`; if the Secret does not exist, the operator
-creates a self-signed certificate.
+The operator is registered as `v1alpha1.playpen.unbounded-cloud.io` and is meant
+to be reached through the Kubernetes API server, not by calling the operator
+Service directly. It trusts only Kubernetes front-proxy client certificates and
+authorizes requests with `SubjectAccessReview`.
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/playpen/v1/claims` | `POST` | Allocate an idle runner pod |
-| `/playpen/v1/releases` | `POST` | Release an allocation and delete its runner pod |
+| `/apis/playpen.unbounded-cloud.io` | `GET` | API group discovery |
+| `/apis/playpen.unbounded-cloud.io/v1alpha1` | `GET` | API version discovery |
+| `/apis/playpen.unbounded-cloud.io/v1alpha1/allocs` | `POST` | Allocate an idle runner pod |
+| `/apis/playpen.unbounded-cloud.io/v1alpha1/deallocs` | `POST` | Deallocate by idempotency key and delete the runner pod |
 | `/healthz` | `GET` | Liveness probe |
 | `/readyz` | `GET` | Readiness probe |
 
-Claim requests require an `Idempotency-Key` header and a valid WireGuard public
+Alloc and dealloc share one RBAC action. Both handlers authorize `create` on
+`allocs.playpen.unbounded-cloud.io`, so granting that action grants both API
+operations together.
+
+Alloc requests require an `Idempotency-Key` header and a valid WireGuard public
 key:
 
 ```bash
-curl -k -X POST https://playpen-operator/playpen/v1/claims \
-  -H 'Content-Type: application/json' \
+kubectl create --raw /apis/playpen.unbounded-cloud.io/v1alpha1/allocs \
   -H 'Idempotency-Key: smoke-test-1' \
-  -d '{"wireGuardPublicKey":"<client-wireguard-public-key>"}'
+  -f - <<'EOF'
+{"wireGuardPublicKey":"<client-wireguard-public-key>"}
+EOF
 ```
 
 The same idempotency key can be retried with the same request body. Reusing the
 key with a different WireGuard public key returns `409 Conflict`.
 
-Release uses the same idempotency key and is idempotent:
+Dealloc uses the same idempotency key and is idempotent:
 
 ```bash
-curl -k -X POST https://playpen-operator/playpen/v1/releases \
+kubectl create --raw /apis/playpen.unbounded-cloud.io/v1alpha1/deallocs \
   -H 'Idempotency-Key: smoke-test-1'
 ```
 
@@ -50,20 +58,20 @@ curl -k -X POST https://playpen-operator/playpen/v1/releases \
 
 - Runner pods are selected from `--runner-namespace` using
   `--runner-label-selector`.
-- A claim writes pod annotations for the client key, request hash, idempotency
-  key hash, and claim time, then labels the pod with an allocation ID.
+- An alloc writes pod annotations for the client key, request hash, idempotency
+  key hash, and allocation time, then labels the pod with an allocation ID.
 - The operator creates a `NodePort` Service named `playpen-runner-<hash>` for
   the runner's WireGuard UDP port. It does not create a NodePort for Redfish or
   serial console traffic.
-- The claim response uses the runner node's `ExternalIP` as the gateway. If that
+- The alloc response uses the runner node's `ExternalIP` as the gateway. If that
   node has no `ExternalIP`, any node `ExternalIP` may be used. If no node has an
-  `ExternalIP`, claims fail with `503 Service Unavailable`.
+  `ExternalIP`, allocs fail with `503 Service Unavailable`.
 - `--playpen-ttl` is the only playpen pod TTL enforcement point. It deletes
-  expired claimed pods. Releases also delete the claimed pod and its NodePort
+  expired allocated pods. Deallocs also delete the allocated pod and its NodePort
   Service. The runner Deployment is expected to replace the deleted pod with a
   fresh idle one.
-- On startup, the operator ensures the operator TLS Secret and the shared runner
-  WireGuard private-key Secret exist.
+- On startup, the operator ensures the operator TLS Secret exists, then injects
+  the serving certificate into the APIService `caBundle`.
 
 ## Run
 

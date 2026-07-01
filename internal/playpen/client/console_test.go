@@ -32,7 +32,7 @@ func TestStreamConsoleLogsAsync(t *testing.T) {
 	}))
 	defer server.Close()
 
-	metadata := testClaimResponse()
+	metadata := testAllocResponse()
 	metadata.Redfish["url"] = server.URL
 	p := &Playpen{Metadata: metadata}
 

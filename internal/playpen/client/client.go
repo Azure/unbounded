@@ -7,36 +7,32 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
-	"time"
+
+	"k8s.io/client-go/rest"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/Azure/unbounded/internal/playpen/operator"
 )
 
-const idempotencyKeyHeader = "Idempotency-Key"
+const (
+	idempotencyKeyHeader = "Idempotency-Key"
+	allocsPath           = "/apis/playpen.unbounded-cloud.io/v1alpha1/allocs"
+	deallocsPath         = "/apis/playpen.unbounded-cloud.io/v1alpha1/deallocs"
+)
 
-// Config contains settings for connecting to the playpen operator.
+// Config contains settings for connecting to the playpen aggregated API.
 type Config struct {
-	// BaseURL is the HTTPS base URL of the playpen operator.
-	BaseURL string
-	// CertFingerprint is the SHA256 fingerprint of the operator TLS certificate.
-	CertFingerprint string
-	// GitHubActionsOAuthToken is a bearer token issued to a GitHub Action.
-	GitHubActionsOAuthToken string
-	// KubernetesToken is a bearer token issued by Kubernetes with the "playpen" audience.
-	KubernetesToken string
-	// HTTPClient overrides the default pinned TLS HTTP client. It is intended for tests.
+	// RESTConfig connects to the Kubernetes API server hosting the playpen aggregated API.
+	RESTConfig *rest.Config
+	// HTTPClient overrides the client built from RESTConfig. It is intended for tests.
 	HTTPClient *http.Client
 	// Commander overrides local network command execution. It is intended for tests.
 	Commander Commander
@@ -45,7 +41,6 @@ type Config struct {
 // Client is a high-level client for allocating and releasing playpens.
 type Client struct {
 	baseURL    string
-	token      string
 	httpClient *http.Client
 	cmd        Commander
 }
@@ -69,31 +64,28 @@ type Playpen struct {
 	closed              bool
 	tunnel              *Tunnel
 
-	Metadata operator.ClaimResponse
+	Metadata operator.AllocResponse
 }
 
-// New returns a client configured with operator TLS pinning and bearer auth.
+// New returns a client configured to use the Kubernetes aggregated API server.
 func New(cfg Config) (*Client, error) {
-	baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
-	if baseURL == "" {
-		return nil, fmt.Errorf("base URL is required")
-	}
-	if _, err := url.ParseRequestURI(baseURL); err != nil {
-		return nil, fmt.Errorf("parse base URL: %w", err)
+	if cfg.RESTConfig == nil {
+		return nil, fmt.Errorf("REST config is required")
 	}
 
-	token, err := bearerToken(cfg)
-	if err != nil {
-		return nil, err
+	restConfig := rest.CopyConfig(cfg.RESTConfig)
+	baseURL := strings.TrimRight(strings.TrimSpace(restConfig.Host), "/")
+	if baseURL == "" {
+		return nil, fmt.Errorf("REST config host is required")
 	}
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		if strings.TrimSpace(cfg.CertFingerprint) == "" {
-			return nil, fmt.Errorf("cert fingerprint is required")
+		var err error
+		httpClient, err = rest.HTTPClientFor(restConfig)
+		if err != nil {
+			return nil, fmt.Errorf("create Kubernetes HTTP client: %w", err)
 		}
-
-		httpClient = newPinnedHTTPClient(normalizeFingerprint(cfg.CertFingerprint))
 	}
 
 	cmd := cfg.Commander
@@ -101,10 +93,10 @@ func New(cfg Config) (*Client, error) {
 		cmd = OSCommander{}
 	}
 
-	return &Client{baseURL: baseURL, token: token, httpClient: httpClient, cmd: cmd}, nil
+	return &Client{baseURL: baseURL, httpClient: httpClient, cmd: cmd}, nil
 }
 
-// Allocate claims an idle playpen runner and returns its metadata.
+// Allocate allocates an idle playpen runner and returns its metadata.
 func (c *Client) Allocate(ctx context.Context, opts AllocateOptions) (*Playpen, error) {
 	privateKey := strings.TrimSpace(opts.WireGuardPrivateKey)
 	if privateKey == "" {
@@ -129,19 +121,19 @@ func (c *Client) Allocate(ctx context.Context, opts AllocateOptions) (*Playpen, 
 		}
 	}
 
-	body, err := json.Marshal(operator.ClaimRequest{WireGuardPublicKey: key.PublicKey().String()})
+	body, err := json.Marshal(operator.AllocRequest{WireGuardPublicKey: key.PublicKey().String()})
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := c.newRequest(ctx, http.MethodPost, "/playpen/v1/claims", bytes.NewReader(body))
+	req, err := c.newRequest(ctx, http.MethodPost, allocsPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set(idempotencyKeyHeader, idempotencyKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	var resp operator.ClaimResponse
+	var resp operator.AllocResponse
 	if err := c.doJSON(req, http.StatusOK, &resp); err != nil {
 		return nil, err
 	}
@@ -158,9 +150,9 @@ func (c *Client) Allocate(ctx context.Context, opts AllocateOptions) (*Playpen, 
 	}, nil
 }
 
-// Release releases an allocation by idempotency key. It is idempotent server-side.
-func (c *Client) Release(ctx context.Context, idempotencyKey string) error {
-	req, err := c.newRequest(ctx, http.MethodPost, "/playpen/v1/releases", http.NoBody)
+// Deallocate deallocates a playpen by idempotency key. It is idempotent server-side.
+func (c *Client) Deallocate(ctx context.Context, idempotencyKey string) error {
+	req, err := c.newRequest(ctx, http.MethodPost, deallocsPath, http.NoBody)
 	if err != nil {
 		return err
 	}
@@ -209,7 +201,7 @@ func (p *Playpen) Close(ctx context.Context) error {
 	if tunnel != nil {
 		closeErr = tunnel.Teardown(ctx)
 	}
-	if err := client.Release(ctx, idempotencyKey); err != nil && closeErr == nil {
+	if err := client.Deallocate(ctx, idempotencyKey); err != nil && closeErr == nil {
 		closeErr = err
 	}
 
@@ -221,7 +213,6 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body io.Re
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
 
 	return req, nil
 }
@@ -248,44 +239,6 @@ func (c *Client) doJSON(req *http.Request, wantStatus int, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-func bearerToken(cfg Config) (string, error) {
-	githubToken := strings.TrimSpace(cfg.GitHubActionsOAuthToken)
-	kubernetesToken := strings.TrimSpace(cfg.KubernetesToken)
-	switch {
-	case githubToken != "" && kubernetesToken != "":
-		return "", fmt.Errorf("provide either GitHubActionsOAuthToken or KubernetesToken, not both")
-	case githubToken != "":
-		return githubToken, nil
-	case kubernetesToken != "":
-		return kubernetesToken, nil
-	default:
-		return "", fmt.Errorf("GitHubActionsOAuthToken or KubernetesToken is required")
-	}
-}
-
-func newPinnedHTTPClient(certFingerprint string) *http.Client {
-	return &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{ //nolint:gosec // Certificate trust is enforced by explicit SHA256 pinning below.
-				InsecureSkipVerify: true,
-				VerifyConnection: func(cs tls.ConnectionState) error {
-					if len(cs.PeerCertificates) == 0 {
-						return fmt.Errorf("no TLS peer certificates")
-					}
-
-					fp := formatFingerprint(sha256Sum(cs.PeerCertificates[0].Raw))
-					if fp != certFingerprint {
-						return fmt.Errorf("TLS cert SHA256 mismatch: got %s, want %s", fp, certFingerprint)
-					}
-
-					return nil
-				},
-			},
-		},
-	}
-}
-
 func randomHex(bytesLen int) (string, error) {
 	b := make([]byte, bytesLen)
 	if _, err := rand.Read(b); err != nil {
@@ -293,37 +246,4 @@ func randomHex(bytesLen int) (string, error) {
 	}
 
 	return hex.EncodeToString(b), nil
-}
-
-func sha256Sum(data []byte) []byte {
-	h := sha256.Sum256(data)
-
-	return h[:]
-}
-
-func formatFingerprint(b []byte) string {
-	parts := make([]string, len(b))
-	for i, v := range b {
-		parts[i] = fmt.Sprintf("%02x", v)
-	}
-
-	return strings.Join(parts, ":")
-}
-
-func normalizeFingerprint(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	if strings.Contains(value, ":") {
-		return value
-	}
-
-	if len(value) != sha256.Size*2 {
-		return value
-	}
-
-	parts := make([]string, sha256.Size)
-	for i := range sha256.Size {
-		parts[i] = value[i*2 : i*2+2]
-	}
-
-	return strings.Join(parts, ":")
 }
