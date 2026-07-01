@@ -52,6 +52,9 @@ func TestAllocAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
 	if resp.Pod.NodePublicIP != "20.30.40.50" {
 		t.Fatalf("pod node public ip = %q, want node external ip", resp.Pod.NodePublicIP)
 	}
+	if resp.Pod.Architecture != ArchitectureAMD64 {
+		t.Fatalf("pod architecture = %q, want %q", resp.Pod.Architecture, ArchitectureAMD64)
+	}
 	if resp.Endpoint.ExternalTrafficPolicy != string(corev1.ServiceExternalTrafficPolicyCluster) {
 		t.Fatalf("externalTrafficPolicy = %q, want Cluster", resp.Endpoint.ExternalTrafficPolicy)
 	}
@@ -129,6 +132,91 @@ func TestAllocIsIdempotentAndConflictsOnDifferentRequest(t *testing.T) {
 	}
 	if status != 409 {
 		t.Fatalf("conflict status = %d, want 409", status)
+	}
+}
+
+func TestAllocDefaultsToAMD64AndSkipsARM64Runner(t *testing.T) {
+	op := testOperator(t,
+		testNode("node-1", "20.30.40.50"),
+		testPodWithArchitecture("arm64-runner", "node-1", ArchitectureARM64),
+		testPodWithArchitecture("amd64-runner", "node-1", ArchitectureAMD64),
+	)
+
+	resp, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("alloc status=%d err=%v", status, err)
+	}
+	if resp.Pod.Name != "amd64-runner" {
+		t.Fatalf("pod name = %q, want amd64-runner", resp.Pod.Name)
+	}
+	if resp.Pod.Architecture != ArchitectureAMD64 {
+		t.Fatalf("pod architecture = %q, want %q", resp.Pod.Architecture, ArchitectureAMD64)
+	}
+}
+
+func TestAllocCanRequestARM64Runner(t *testing.T) {
+	op := testOperator(t,
+		testNode("node-1", "20.30.40.50"),
+		testPodWithArchitecture("amd64-runner", "node-1", ArchitectureAMD64),
+		testPodWithArchitecture("arm64-runner", "node-1", ArchitectureARM64),
+	)
+
+	resp, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t), Architecture: ArchitectureARM64})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("alloc status=%d err=%v", status, err)
+	}
+	if resp.Pod.Name != "arm64-runner" {
+		t.Fatalf("pod name = %q, want arm64-runner", resp.Pod.Name)
+	}
+	if resp.Pod.Architecture != ArchitectureARM64 {
+		t.Fatalf("pod architecture = %q, want %q", resp.Pod.Architecture, ArchitectureARM64)
+	}
+}
+
+func TestAllocRejectsInvalidArchitecture(t *testing.T) {
+	op := testOperator(t)
+
+	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t), Architecture: "s390x"})
+	if err == nil {
+		t.Fatal("alloc succeeded with invalid architecture")
+	}
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
+	}
+}
+
+func TestAllocReportsNoMatchingArchitecture(t *testing.T) {
+	op := testOperator(t,
+		testNode("node-1", "20.30.40.50"),
+		testPodWithArchitecture("amd64-runner", "node-1", ArchitectureAMD64),
+	)
+
+	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t), Architecture: ArchitectureARM64})
+	if err == nil {
+		t.Fatal("alloc succeeded without arm64 runner")
+	}
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", status, http.StatusServiceUnavailable)
+	}
+}
+
+func TestAllocIdempotencyIncludesArchitecture(t *testing.T) {
+	op := testOperator(t,
+		testNode("node-1", "20.30.40.50"),
+		testPodWithArchitecture("amd64-runner", "node-1", ArchitectureAMD64),
+		testPodWithArchitecture("arm64-runner", "node-1", ArchitectureARM64),
+	)
+	publicKey := testPublicKey(t)
+
+	if _, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: publicKey, Architecture: ArchitectureAMD64}); err != nil || status != http.StatusOK {
+		t.Fatalf("first alloc status=%d err=%v", status, err)
+	}
+	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: publicKey, Architecture: ArchitectureARM64})
+	if err == nil {
+		t.Fatal("same idempotency key succeeded with different architecture")
+	}
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", status, http.StatusConflict)
 	}
 }
 
@@ -695,6 +783,13 @@ func testPod(name, nodeName string, annotations map[string]string) *corev1.Pod {
 	annotations[AnnotationServerWireGuardPublicKey] = podServerPublicKey(name)
 
 	return testPodWithAnnotations(name, nodeName, annotations)
+}
+
+func testPodWithArchitecture(name, nodeName, architecture string) *corev1.Pod {
+	pod := testPod(name, nodeName, nil)
+	pod.Labels[LabelArchitecture] = architecture
+
+	return pod
 }
 
 func testPodWithAnnotations(name, nodeName string, annotations map[string]string) *corev1.Pod {

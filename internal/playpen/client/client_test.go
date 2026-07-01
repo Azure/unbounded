@@ -23,7 +23,7 @@ func TestAllocateSendsIdempotencyAndPublicKeyToAggregatedAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var gotKey, gotPublicKey string
+	var gotKey, gotPublicKey, gotArchitecture string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != allocsPath {
 			t.Fatalf("path = %s", r.URL.Path)
@@ -35,6 +35,7 @@ func TestAllocateSendsIdempotencyAndPublicKeyToAggregatedAPI(t *testing.T) {
 			t.Fatal(err)
 		}
 		gotPublicKey = req.WireGuardPublicKey
+		gotArchitecture = req.Architecture
 
 		writeJSON(t, w, testAllocResponse())
 	}))
@@ -45,7 +46,7 @@ func TestAllocateSendsIdempotencyAndPublicKeyToAggregatedAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p, err := c.Allocate(t.Context(), AllocateOptions{IdempotencyKey: "alloc-key", WireGuardPrivateKey: privateKey.String()})
+	p, err := c.Allocate(t.Context(), AllocateOptions{IdempotencyKey: "alloc-key", Architecture: operator.ArchitectureARM64, WireGuardPrivateKey: privateKey.String()})
 	if err != nil {
 		t.Fatalf("allocate: %v", err)
 	}
@@ -55,6 +56,9 @@ func TestAllocateSendsIdempotencyAndPublicKeyToAggregatedAPI(t *testing.T) {
 	}
 	if gotPublicKey != privateKey.PublicKey().String() {
 		t.Fatalf("public key = %q, want %q", gotPublicKey, privateKey.PublicKey().String())
+	}
+	if gotArchitecture != operator.ArchitectureARM64 {
+		t.Fatalf("architecture = %q, want %q", gotArchitecture, operator.ArchitectureARM64)
 	}
 	if p.Metadata.Pod.Name != "runner-1" {
 		t.Fatalf("pod name = %q", p.Metadata.Pod.Name)
@@ -168,9 +172,10 @@ func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 func testAllocResponse() operator.AllocResponse {
 	return operator.AllocResponse{
 		Pod: operator.PodResponse{
-			Namespace: "playpen",
-			Name:      "runner-1",
-			NodeName:  "node-1",
+			Namespace:    "playpen",
+			Name:         "runner-1",
+			NodeName:     "node-1",
+			Architecture: operator.ArchitectureAMD64,
 		},
 		Endpoint: operator.EndpointResponse{
 			Host:             "20.30.40.50",

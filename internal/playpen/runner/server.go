@@ -72,6 +72,9 @@ func (s *RuntimeState) ServerWireGuardPublicKey() string {
 }
 
 func Run(ctx context.Context, cfg Config) error {
+	if err := cfg.ApplyArchitectureDefaults(); err != nil {
+		return err
+	}
 	if cfg.Redfish.DeviceID == "" {
 		cfg.Redfish.DeviceID = "1"
 	}
@@ -169,6 +172,7 @@ func infoResponse(cfg Config, serverPublicKey string) map[string]any {
 	clientWG, _ := addressIP(cfg.WireGuard.ClientAddress)
 
 	return map[string]any{
+		"architecture": cfg.Architecture,
 		"wireGuard": map[string]any{
 			"interface":       cfg.WireGuard.Interface,
 			"serverPublicKey": serverPublicKey,

@@ -10,5 +10,9 @@ const (
 	AnnotationRequestHash              = "playpen.unbounded-cloud.io/request-hash"
 	AnnotationClaimedAt                = "playpen.unbounded-cloud.io/claimed-at"
 
-	LabelAllocated = "playpen.unbounded-cloud.io/allocated"
+	LabelAllocated    = "playpen.unbounded-cloud.io/allocated"
+	LabelArchitecture = "playpen.unbounded-cloud.io/architecture"
+
+	ArchitectureAMD64 = "amd64"
+	ArchitectureARM64 = "arm64"
 )

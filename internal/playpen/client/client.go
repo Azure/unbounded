@@ -49,6 +49,8 @@ type Client struct {
 type AllocateOptions struct {
 	// IdempotencyKey identifies the allocation. If empty, a random key is generated.
 	IdempotencyKey string
+	// Architecture optionally requests a runner architecture. Empty defaults to amd64.
+	Architecture string
 	// WireGuardPrivateKey is the client's WireGuard private key. If empty, one is generated.
 	WireGuardPrivateKey string
 	// Tunnel optionally overrides local tunnel settings.
@@ -121,7 +123,7 @@ func (c *Client) Allocate(ctx context.Context, opts AllocateOptions) (*Playpen, 
 		}
 	}
 
-	body, err := json.Marshal(operator.AllocRequest{WireGuardPublicKey: key.PublicKey().String()})
+	body, err := json.Marshal(operator.AllocRequest{WireGuardPublicKey: key.PublicKey().String(), Architecture: opts.Architecture})
 	if err != nil {
 		return nil, err
 	}

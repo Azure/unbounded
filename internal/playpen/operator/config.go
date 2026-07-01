@@ -17,7 +17,11 @@ const (
 	AnnotationRequestHash              = meta.AnnotationRequestHash
 	AnnotationClaimedAt                = meta.AnnotationClaimedAt
 
-	LabelAllocated = meta.LabelAllocated
+	LabelAllocated    = meta.LabelAllocated
+	LabelArchitecture = meta.LabelArchitecture
+
+	ArchitectureAMD64 = meta.ArchitectureAMD64
+	ArchitectureARM64 = meta.ArchitectureARM64
 )
 
 type Config struct {

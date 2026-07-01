@@ -76,6 +76,7 @@ type Operator struct {
 
 type AllocRequest struct {
 	WireGuardPublicKey string `json:"wireGuardPublicKey"`
+	Architecture       string `json:"architecture,omitempty"`
 }
 
 type AllocResponse struct {
@@ -92,6 +93,7 @@ type PodResponse struct {
 	Name         string `json:"name"`
 	NodeName     string `json:"nodeName"`
 	NodePublicIP string `json:"nodePublicIP"`
+	Architecture string `json:"architecture"`
 }
 
 type EndpointResponse struct {
@@ -281,6 +283,13 @@ func (o *Operator) handleAllocs(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+	arch, err := normalizeArchitecture(req.Architecture)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+
+		return
+	}
+	req.Architecture = arch
 
 	resp, status, err := o.Alloc(r.Context(), idempotencyKey, req)
 	if err != nil {
@@ -321,8 +330,14 @@ func (o *Operator) handleDeallocs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRequest) (AllocResponse, int, error) {
+	arch, err := normalizeArchitecture(req.Architecture)
+	if err != nil {
+		return AllocResponse{}, http.StatusBadRequest, err
+	}
+	req.Architecture = arch
+
 	keyHash := hashString(idempotencyKey)
-	reqHash := hashString(req.WireGuardPublicKey)
+	reqHash := hashString(req.WireGuardPublicKey + "\n" + req.Architecture)
 
 	pods, err := o.listRunnerPods(ctx)
 	if err != nil {
@@ -335,7 +350,7 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 			continue
 		}
 
-		if pod.Annotations[AnnotationRequestHash] != reqHash {
+		if !requestHashMatches(pod.Annotations[AnnotationRequestHash], req.WireGuardPublicKey, req.Architecture) {
 			return AllocResponse{}, http.StatusConflict, fmt.Errorf("idempotency key was already used with a different request")
 		}
 
@@ -348,11 +363,16 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 	}
 
 	var unavailable []string
+	matchingArchitecture := false
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.Annotations[AnnotationIdempotencyKeyHash] != "" {
 			continue
 		}
+		if podArchitecture(pod) != req.Architecture {
+			continue
+		}
+		matchingArchitecture = true
 		if reason := runnerPodUnavailableReason(pod); reason != "" {
 			unavailable = append(unavailable, reason)
 
@@ -403,6 +423,9 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 
 	if len(unavailable) > 0 {
 		return AllocResponse{}, http.StatusServiceUnavailable, fmt.Errorf("no idle playpen runner pods are available with an ExternalIP gateway: %s", strings.Join(unavailable, "; "))
+	}
+	if !matchingArchitecture {
+		return AllocResponse{}, http.StatusServiceUnavailable, fmt.Errorf("no idle %s playpen runner pods are available", req.Architecture)
 	}
 
 	return AllocResponse{}, http.StatusServiceUnavailable, fmt.Errorf("no idle playpen runner pods are available")
@@ -899,6 +922,7 @@ func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string
 			Name:         pod.Name,
 			NodeName:     pod.Spec.NodeName,
 			NodePublicIP: nodePublicIP,
+			Architecture: podArchitecture(pod),
 		},
 		Endpoint: EndpointResponse{
 			Host:                  gatewayIP,
@@ -935,6 +959,34 @@ func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string
 			"serialConsoleStreamURI": "/redfish/v1/Systems/" + runnerCfg.Redfish.DeviceID + "/Oem/Unbounded/SerialConsole/Stream",
 		},
 	}
+}
+
+func normalizeArchitecture(value string) (string, error) {
+	switch arch := strings.ToLower(strings.TrimSpace(value)); arch {
+	case "", ArchitectureAMD64:
+		return ArchitectureAMD64, nil
+	case ArchitectureARM64:
+		return ArchitectureARM64, nil
+	default:
+		return "", fmt.Errorf("architecture must be %q or %q", ArchitectureAMD64, ArchitectureARM64)
+	}
+}
+
+func requestHashMatches(storedHash, wireGuardPublicKey, architecture string) bool {
+	if storedHash == hashString(wireGuardPublicKey+"\n"+architecture) {
+		return true
+	}
+
+	return architecture == ArchitectureAMD64 && storedHash == hashString(wireGuardPublicKey)
+}
+
+func podArchitecture(pod *corev1.Pod) string {
+	arch, err := normalizeArchitecture(pod.Labels[LabelArchitecture])
+	if err != nil {
+		return pod.Labels[LabelArchitecture]
+	}
+
+	return arch
 }
 
 func serverWireGuardPublicKeyForPod(pod *corev1.Pod) (string, error) {

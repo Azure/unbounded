@@ -271,19 +271,19 @@ func (m *VMManager) qemuArgs() []string {
 
 	args := []string{
 		"-enable-kvm",
-		"-machine", "q35,accel=kvm",
-		"-cpu", "host",
+		"-machine", m.cfg.QEMU.Machine,
+		"-cpu", m.cfg.QEMU.CPU,
 		"-m", strconv.Itoa(m.cfg.QEMU.MemoryMiB),
 		"-smp", strconv.Itoa(m.cfg.QEMU.CPUs),
 		"-drive", "if=pflash,format=raw,readonly=on,file=" + m.cfg.QEMU.OVMFCodeFile,
 		"-drive", "if=pflash,format=raw,file=" + filepath.Join(m.cfg.DataDir, "OVMF_VARS.fd"),
 		"-drive", "file=" + filepath.Join(m.cfg.DataDir, "disk.qcow2") + ",format=qcow2,if=virtio",
 		"-netdev", "tap,id=net0,ifname=" + m.cfg.TapName + ",script=no,downscript=no",
-		"-device", "virtio-net-pci,netdev=net0,mac=" + m.cfg.Guest.MAC,
+		"-device", m.cfg.QEMU.NICDevice + ",netdev=net0,mac=" + m.cfg.Guest.MAC,
 		"-boot", "order=" + bootOrder,
 		"-serial", "file:" + filepath.Join(m.cfg.DataDir, "serial.log"),
 		"-chardev", "socket,path=" + filepath.Join(m.cfg.DataDir, "qga.sock") + ",server=on,wait=off,id=qga0",
-		"-device", "virtio-serial-pci",
+		"-device", m.cfg.QEMU.SerialDevice,
 		"-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
 		"-display", "none",
 	}
@@ -292,7 +292,7 @@ func (m *VMManager) qemuArgs() []string {
 		args = append(args,
 			"-chardev", "socket,id=chrtpm,path="+m.swtpmSocketPath(),
 			"-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
-			"-device", "tpm-tis,tpmdev=tpm0",
+			"-device", m.cfg.QEMU.TPMDevice+",tpmdev=tpm0",
 		)
 	}
 

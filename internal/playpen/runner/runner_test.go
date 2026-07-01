@@ -273,6 +273,7 @@ func TestVMManagerQEMUCommands(t *testing.T) {
 	for _, want := range []string{
 		"swtpm socket --tpm2 --runas 0",
 		"qemu-system-x86_64 -enable-kvm",
+		"-machine q35,accel=kvm",
 		"-netdev tap,id=net0,ifname=tap0,script=no,downscript=no",
 		"-device virtio-net-pci,netdev=net0,mac=52:54:00:aa:bb:01",
 		"-boot order=n",
@@ -292,6 +293,59 @@ func TestVMManagerQEMUCommands(t *testing.T) {
 
 	if state := vm.PowerState(); state != PowerOff {
 		t.Fatalf("power state = %s, want %s", state, PowerOff)
+	}
+}
+
+func TestVMManagerQEMUCommandsForARM64(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Architecture = ArchitectureARM64
+	cfg.QEMU.EnableTPM = true
+	if err := cfg.ApplyArchitectureDefaults(); err != nil {
+		t.Fatalf("apply architecture defaults: %v", err)
+	}
+	if err := os.WriteFile(cfg.QEMU.OVMFVarsTemplate, []byte("vars"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var swtpmSocket net.Listener
+	fake := &fakeCommander{
+		startHook: func(cmd recordedCommand) error {
+			if cmd.Name != cfg.QEMU.SWTPMBinary {
+				return nil
+			}
+
+			listener, err := net.Listen("unix", filepath.Join(os.TempDir(), "playpen-runner-swtpm.sock"))
+			if err != nil {
+				return err
+			}
+			swtpmSocket = listener
+
+			return nil
+		},
+	}
+	t.Cleanup(func() {
+		if swtpmSocket != nil {
+			_ = swtpmSocket.Close()
+		}
+		_ = os.Remove(filepath.Join(os.TempDir(), "playpen-runner-swtpm.sock"))
+	})
+	vm := NewVMManager(fake, cfg)
+
+	if err := vm.Reset(t.Context(), ResetOn); err != nil {
+		t.Fatalf("reset on: %v", err)
+	}
+
+	starts := strings.Join(fake.startStrings(), "\n")
+	for _, want := range []string{
+		"qemu-system-aarch64 -enable-kvm",
+		"-machine virt,accel=kvm",
+		"-cpu host",
+		"-drive if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd",
+		"-device virtio-net-pci,netdev=net0,mac=52:54:00:aa:bb:01",
+		"-device tpm-tis-device,tpmdev=tpm0",
+	} {
+		if !strings.Contains(starts, want) {
+			t.Fatalf("start commands missing %q:\n%s", want, starts)
+		}
 	}
 }
 
