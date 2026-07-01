@@ -3,11 +3,16 @@
 
 package runner
 
+import "sigs.k8s.io/controller-runtime/pkg/client"
+
 // Config contains all settings for one standalone playpen runner pod.
 type Config struct {
 	ListenAddr       string
 	PublicRedfishURL string
 	DataDir          string
+	PodName          string
+	PodNamespace     string
+	KubernetesClient client.Client
 	ConfigureNetwork bool
 	WireGuard        WireGuardConfig
 	VXLAN            VXLANConfig
@@ -19,13 +24,12 @@ type Config struct {
 }
 
 type WireGuardConfig struct {
-	PrivateKeyFile      string
-	ClientPublicKey     string
-	ClientPublicKeyFile string
-	Interface           string
-	ServerAddress       string
-	ClientAddress       string
-	ListenPort          int
+	PrivateKeyFile  string
+	ClientPublicKey string
+	Interface       string
+	ServerAddress   string
+	ClientAddress   string
+	ListenPort      int
 }
 
 type VXLANConfig struct {

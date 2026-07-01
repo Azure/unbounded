@@ -37,10 +37,9 @@ import (
 const idempotencyKeyHeader = "Idempotency-Key"
 
 type Operator struct {
-	Client                client.Client
-	Config                Config
-	Scheme                *runtime.Scheme
-	serverWireGuardPubKey string
+	Client client.Client
+	Config Config
+	Scheme *runtime.Scheme
 }
 
 type ClaimRequest struct {
@@ -97,10 +96,6 @@ type NetworkResponse struct {
 func (o *Operator) Run(ctx context.Context) error {
 	cert, err := o.EnsureTLSSecret(ctx)
 	if err != nil {
-		return err
-	}
-
-	if err := o.EnsureRunnerWireGuardSecret(ctx); err != nil {
 		return err
 	}
 
@@ -251,6 +246,13 @@ func (o *Operator) Claim(ctx context.Context, idempotencyKey string, req ClaimRe
 			continue
 		}
 
+		serverPublicKey, err := serverWireGuardPublicKeyForPod(pod)
+		if err != nil {
+			unavailable = append(unavailable, err.Error())
+
+			continue
+		}
+
 		gatewayIP, nodePublicIP, err := o.gatewayForPod(ctx, pod.Spec.NodeName)
 		if err != nil {
 			unavailable = append(unavailable, err.Error())
@@ -268,7 +270,7 @@ func (o *Operator) Claim(ctx context.Context, idempotencyKey string, req ClaimRe
 			return ClaimResponse{}, http.StatusInternalServerError, err
 		}
 
-		return o.buildResponse(allocatedPod, gatewayIP, nodePublicIP, service), http.StatusOK, nil
+		return o.buildResponse(allocatedPod, gatewayIP, nodePublicIP, service, serverPublicKey), http.StatusOK, nil
 	}
 
 	if len(unavailable) > 0 {
@@ -360,43 +362,6 @@ func (o *Operator) EnsureTLSSecret(ctx context.Context) (tls.Certificate, error)
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
-func (o *Operator) EnsureRunnerWireGuardSecret(ctx context.Context) error {
-	secret := &corev1.Secret{}
-	key := types.NamespacedName{Namespace: o.Config.RunnerNamespace, Name: o.Config.RunnerWireGuardSecretName}
-	if err := o.Client.Get(ctx, key, secret); err == nil {
-		privateKey := strings.TrimSpace(string(secret.Data[o.Config.RunnerWireGuardPrivateKeyDataKey]))
-		parsed, err := wgtypes.ParseKey(privateKey)
-		if err != nil {
-			return err
-		}
-
-		o.serverWireGuardPubKey = parsed.PublicKey().String()
-
-		return nil
-	} else if !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	privateKey, err := wgtypes.GeneratePrivateKey()
-	if err != nil {
-		return err
-	}
-
-	o.serverWireGuardPubKey = privateKey.PublicKey().String()
-	secret = &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: o.Config.RunnerWireGuardSecretName, Namespace: o.Config.RunnerNamespace},
-		Data: map[string][]byte{
-			o.Config.RunnerWireGuardPrivateKeyDataKey: []byte(privateKey.String() + "\n"),
-		},
-	}
-
-	if err := o.Client.Create(ctx, secret); err != nil && !apierrors.IsAlreadyExists(err) {
-		return err
-	}
-
-	return nil
-}
-
 func (o *Operator) listRunnerPods(ctx context.Context) (*corev1.PodList, error) {
 	selector, err := labels.Parse(o.Config.RunnerLabelSelector)
 	if err != nil {
@@ -444,6 +409,11 @@ func (o *Operator) patchClaim(ctx context.Context, pod *corev1.Pod, keyHash, req
 }
 
 func (o *Operator) responseForPod(ctx context.Context, pod *corev1.Pod) (ClaimResponse, error) {
+	serverPublicKey, err := serverWireGuardPublicKeyForPod(pod)
+	if err != nil {
+		return ClaimResponse{}, err
+	}
+
 	gatewayIP, nodePublicIP, err := o.gatewayForPod(ctx, pod.Spec.NodeName)
 	if err != nil {
 		return ClaimResponse{}, err
@@ -454,7 +424,7 @@ func (o *Operator) responseForPod(ctx context.Context, pod *corev1.Pod) (ClaimRe
 		return ClaimResponse{}, err
 	}
 
-	return o.buildResponse(pod, gatewayIP, nodePublicIP, service), nil
+	return o.buildResponse(pod, gatewayIP, nodePublicIP, service, serverPublicKey), nil
 }
 
 func (o *Operator) ensureNodePortService(ctx context.Context, pod *corev1.Pod) (*corev1.Service, error) {
@@ -508,7 +478,7 @@ func (o *Operator) ensureNodePortService(ctx context.Context, pod *corev1.Pod) (
 	return service, nil
 }
 
-func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string, service *corev1.Service) ClaimResponse {
+func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string, service *corev1.Service, serverPublicKey string) ClaimResponse {
 	runnerCfg := o.Config.Runner
 	nodePort := int32(0)
 	if len(service.Spec.Ports) > 0 {
@@ -536,7 +506,7 @@ func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string
 		},
 		WireGuard: WireGuardResponse{
 			Interface:       runnerCfg.WireGuard.Interface,
-			ServerPublicKey: o.serverWireGuardPubKey,
+			ServerPublicKey: serverPublicKey,
 			ServerAddress:   runnerCfg.WireGuard.ServerAddress,
 			ClientAddress:   runnerCfg.WireGuard.ClientAddress,
 			ListenPort:      runnerCfg.WireGuard.ListenPort,
@@ -567,6 +537,15 @@ func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string
 			"serviceName": service.Name,
 		},
 	}
+}
+
+func serverWireGuardPublicKeyForPod(pod *corev1.Pod) (string, error) {
+	serverPublicKey := strings.TrimSpace(pod.Annotations[AnnotationServerWireGuardPublicKey])
+	if _, err := wgtypes.ParseKey(serverPublicKey); err != nil {
+		return "", fmt.Errorf("runner pod %q has no valid server WireGuard public key", pod.Name)
+	}
+
+	return serverPublicKey, nil
 }
 
 func (o *Operator) gatewayForPod(ctx context.Context, nodeName string) (string, string, error) {

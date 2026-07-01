@@ -43,8 +43,6 @@ func main() {
 	flags.StringVar(&cfg.TLSSecretName, "tls-secret-name", cfg.TLSSecretName, "Secret storing the operator HTTPS serving certificate")
 	flags.StringVar(&cfg.RunnerNamespace, "runner-namespace", cfg.RunnerNamespace, "namespace containing playpen-runner pods")
 	flags.StringVar(&cfg.RunnerLabelSelector, "runner-label-selector", cfg.RunnerLabelSelector, "label selector for playpen-runner pods")
-	flags.StringVar(&cfg.RunnerWireGuardSecretName, "runner-wireguard-secret-name", cfg.RunnerWireGuardSecretName, "Secret containing the shared runner WireGuard private key")
-	flags.StringVar(&cfg.RunnerWireGuardPrivateKeyDataKey, "runner-wireguard-private-key-data-key", cfg.RunnerWireGuardPrivateKeyDataKey, "data key containing the runner WireGuard private key")
 	flags.DurationVar(&cfg.PlaypenTTL, "playpen-ttl", cfg.PlaypenTTL, "maximum lifetime for an allocated playpen pod; disabled when non-positive")
 	flags.DurationVar(&cfg.ReconcileInterval, "reconcile-interval", cfg.ReconcileInterval, "runner cleanup reconciliation interval")
 	flags.StringVar(&cfg.Runner.ListenAddr, "runner-listen-addr", cfg.Runner.ListenAddr, "runner HTTPS listen address returned in claims")

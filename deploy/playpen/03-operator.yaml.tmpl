@@ -31,7 +31,6 @@ spec:
             - --namespace={{ default "playpen" .Namespace }}
             - --runner-namespace={{ default "playpen" .Namespace }}
             - --runner-label-selector=app.kubernetes.io/name=playpen-runner
-            - --runner-wireguard-secret-name=playpen-runner-wireguard
             - --playpen-ttl={{ default "1h" .PlaypenTTL }}
           ports:
             - containerPort: 8443

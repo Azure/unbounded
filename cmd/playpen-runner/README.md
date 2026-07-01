@@ -41,12 +41,13 @@ With `--configure-network=true`, startup creates these interfaces:
 | Tap | `tap0` | QEMU NIC backend |
 
 The runner reads or creates its WireGuard private key at
-`--wireguard-private-key-file`. A client peer can be configured immediately with
-`--wireguard-client-public-key`, or later with
-`--wireguard-client-public-key-file`. The Kubernetes deployment uses the delayed
-file mode: the operator writes the client key into a pod annotation, and a
-downward API volume exposes it to the runner. In delayed mode, `/readyz` returns
-`503` until the peer is configured.
+`--wireguard-private-key-file` and publishes the corresponding public key to its
+pod's `playpen.unbounded-cloud.io/server-wireguard-public-key` annotation. A
+client peer can be configured immediately with `--wireguard-client-public-key`.
+In Kubernetes, the operator writes the client key into the runner pod's
+`playpen.unbounded-cloud.io/client-wireguard-public-key` annotation and the
+runner configures the peer after observing that annotation. In delayed mode,
+`/readyz` returns `503` until the peer is configured.
 
 The default WireGuard addresses are `10.88.0.1/24` for the runner and
 `10.88.0.2/32` for the client. The default guest metadata is MAC

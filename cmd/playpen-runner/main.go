@@ -9,7 +9,12 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/internal/playpen/runner"
 	"github.com/Azure/unbounded/internal/version"
@@ -19,6 +24,21 @@ func main() {
 	ctrl.SetLogger(logr.FromSlogHandler(slog.Default().Handler()))
 
 	cfg := runner.DefaultConfig()
+	cfg.PodName = os.Getenv("POD_NAME")
+	cfg.PodNamespace = os.Getenv("POD_NAMESPACE")
+	if cfg.PodName != "" && cfg.PodNamespace != "" {
+		scheme := runtime.NewScheme()
+		utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+		utilruntime.Must(corev1.AddToScheme(scheme))
+
+		kubeClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+		if err != nil {
+			slog.Error("create Kubernetes client", "error", err)
+			os.Exit(1)
+		}
+		cfg.KubernetesClient = kubeClient
+	}
+
 	root := &cobra.Command{
 		Use:   "playpen-runner",
 		Short: "Standalone VM runner for metalman smoke tests",
@@ -34,7 +54,6 @@ func main() {
 	flags.BoolVar(&cfg.ConfigureNetwork, "configure-network", cfg.ConfigureNetwork, "configure WireGuard, VXLAN, bridge, and tap interfaces")
 	flags.StringVar(&cfg.WireGuard.PrivateKeyFile, "wireguard-private-key-file", cfg.WireGuard.PrivateKeyFile, "path to the runner WireGuard private key")
 	flags.StringVar(&cfg.WireGuard.ClientPublicKey, "wireguard-client-public-key", cfg.WireGuard.ClientPublicKey, "client WireGuard public key")
-	flags.StringVar(&cfg.WireGuard.ClientPublicKeyFile, "wireguard-client-public-key-file", cfg.WireGuard.ClientPublicKeyFile, "path to a file containing the client WireGuard public key for delayed claims")
 	flags.StringVar(&cfg.WireGuard.Interface, "wireguard-interface", cfg.WireGuard.Interface, "WireGuard interface name")
 	flags.StringVar(&cfg.WireGuard.ServerAddress, "wireguard-server-address", cfg.WireGuard.ServerAddress, "runner WireGuard address with prefix")
 	flags.StringVar(&cfg.WireGuard.ClientAddress, "wireguard-client-address", cfg.WireGuard.ClientAddress, "client WireGuard address with prefix")

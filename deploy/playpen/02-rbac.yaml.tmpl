@@ -61,3 +61,33 @@ subjects:
   - kind: ServiceAccount
     name: playpen-operator
     namespace: {{ default "playpen" .Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: playpen-runner
+  namespace: {{ default "playpen" .Namespace }}
+  labels:
+    app.kubernetes.io/name: playpen-runner
+    app.kubernetes.io/component: runner
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: playpen-runner
+  namespace: {{ default "playpen" .Namespace }}
+  labels:
+    app.kubernetes.io/name: playpen-runner
+    app.kubernetes.io/component: runner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: playpen-runner
+subjects:
+  - kind: ServiceAccount
+    name: playpen-runner
+    namespace: {{ default "playpen" .Namespace }}

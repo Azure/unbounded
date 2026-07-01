@@ -19,8 +19,16 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	metalredfish "github.com/Azure/unbounded/internal/metalman/redfish"
+	"github.com/Azure/unbounded/internal/playpen/meta"
 )
 
 type recordedCommand struct {
@@ -151,22 +159,32 @@ func TestNetworkSetupWithoutInitialPeer(t *testing.T) {
 	}
 }
 
-func TestWaitForClientPublicKeyConfiguresPeer(t *testing.T) {
+func TestWaitForClientPublicKeyAnnotationConfiguresPeer(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ConfigureNetwork = true
+	cfg.PodName = "runner-1"
+	cfg.PodNamespace = "playpen"
+	cfg.KubernetesClient = testKubernetesClient(t, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: cfg.PodName, Namespace: cfg.PodNamespace},
+	})
 	fake := &fakeCommander{}
 	manager := NewNetworkManager(fake, cfg)
 	state := NewRuntimeState("server-public-key", false)
-	path := filepath.Join(t.TempDir(), "client-public-key")
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	go waitForClientPublicKey(ctx, path, manager, state)
+	go waitForClientPublicKeyAnnotation(ctx, cfg, manager, state)
 
 	if state.Ready() {
 		t.Fatal("state is ready before claim")
 	}
-	if err := os.WriteFile(path, []byte("client-public-key\n"), 0o600); err != nil {
+	pod := &corev1.Pod{}
+	if err := cfg.KubernetesClient.Get(t.Context(), client.ObjectKey{Namespace: cfg.PodNamespace, Name: cfg.PodName}, pod); err != nil {
+		t.Fatal(err)
+	}
+	base := pod.DeepCopy()
+	pod.Annotations = map[string]string{meta.AnnotationClientWireGuardPublicKey: "client-public-key"}
+	if err := cfg.KubernetesClient.Patch(t.Context(), pod, client.MergeFrom(base)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -181,6 +199,27 @@ func TestWaitForClientPublicKeyConfiguresPeer(t *testing.T) {
 	commands := strings.Join(fake.runStrings(), "\n")
 	if !strings.Contains(commands, "wg set wg0 peer client-public-key allowed-ips 10.88.0.2/32") {
 		t.Fatalf("commands missing delayed peer:\n%s", commands)
+	}
+}
+
+func TestPublishServerWireGuardPublicKeyAnnotatesPod(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PodName = "runner-1"
+	cfg.PodNamespace = "playpen"
+	cfg.KubernetesClient = testKubernetesClient(t, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: cfg.PodName, Namespace: cfg.PodNamespace},
+	})
+
+	if err := publishServerWireGuardPublicKey(t.Context(), cfg, "server-public-key"); err != nil {
+		t.Fatalf("publish server public key: %v", err)
+	}
+
+	pod := &corev1.Pod{}
+	if err := cfg.KubernetesClient.Get(t.Context(), client.ObjectKey{Namespace: cfg.PodNamespace, Name: cfg.PodName}, pod); err != nil {
+		t.Fatal(err)
+	}
+	if pod.Annotations[meta.AnnotationServerWireGuardPublicKey] != "server-public-key" {
+		t.Fatalf("server public key annotation = %q", pod.Annotations[meta.AnnotationServerWireGuardPublicKey])
 	}
 }
 
@@ -448,4 +487,14 @@ func redfishBasicAuthHeader(cfg Config) http.Header {
 	header.Set("Authorization", "Basic "+token)
 
 	return header
+}
+
+func testKubernetesClient(t *testing.T, objects ...client.Object) client.Client {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(corev1.AddToScheme(scheme))
+
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 }

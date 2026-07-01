@@ -4,7 +4,6 @@
 package operator
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -47,6 +46,9 @@ func TestClaimAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
 	}
 	if resp.WireGuard.ServerPublicKey == "" {
 		t.Fatal("server WireGuard public key is empty")
+	}
+	if resp.WireGuard.ServerPublicKey != podServerPublicKey("runner-1") {
+		t.Fatalf("server WireGuard public key = %q, want pod annotation", resp.WireGuard.ServerPublicKey)
 	}
 	if resp.Redfish["systemURL"] != resp.Redfish["url"]+"/redfish/v1/Systems/"+resp.Redfish["deviceID"] {
 		t.Fatalf("redfish system URL = %q", resp.Redfish["systemURL"])
@@ -161,6 +163,52 @@ func TestClaimRequiresAnyNodeExternalIP(t *testing.T) {
 	}
 	if pod.Annotations[AnnotationIdempotencyKeyHash] != "" {
 		t.Fatal("pod was allocated despite missing gateway ExternalIP")
+	}
+}
+
+func TestClaimSkipsRunnerWithoutServerWireGuardPublicKey(t *testing.T) {
+	op := testOperator(t,
+		testNode("node-1", "20.30.40.50"),
+		testPodWithAnnotations("runner-1", "node-1", map[string]string{}),
+	)
+
+	_, status, err := op.Claim(t.Context(), "claim-key", ClaimRequest{WireGuardPublicKey: testPublicKey(t)})
+	if err == nil {
+		t.Fatal("claim succeeded without server WireGuard public key")
+	}
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", status, http.StatusServiceUnavailable)
+	}
+
+	pod := &corev1.Pod{}
+	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err != nil {
+		t.Fatal(err)
+	}
+	if pod.Annotations[AnnotationIdempotencyKeyHash] != "" {
+		t.Fatal("pod was allocated despite missing server WireGuard public key")
+	}
+}
+
+func TestClaimUsesPodScopedServerWireGuardPublicKey(t *testing.T) {
+	op := testOperator(t,
+		testNode("node-1", "20.30.40.50"),
+		testPod("runner-1", "node-1", nil),
+		testPod("runner-2", "node-1", nil),
+	)
+
+	first, status, err := op.Claim(t.Context(), "claim-key-1", ClaimRequest{WireGuardPublicKey: testPublicKey(t)})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("first claim status=%d err=%v", status, err)
+	}
+	second, status, err := op.Claim(t.Context(), "claim-key-2", ClaimRequest{WireGuardPublicKey: testPublicKey(t)})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("second claim status=%d err=%v", status, err)
+	}
+	if first.Pod.Name == second.Pod.Name {
+		t.Fatalf("second claim reused pod %q", second.Pod.Name)
+	}
+	if first.WireGuard.ServerPublicKey == second.WireGuard.ServerPublicKey {
+		t.Fatal("claims returned the same server WireGuard public key")
 	}
 }
 
@@ -352,14 +400,20 @@ func testOperator(t *testing.T, objects ...client.Object) *Operator {
 		Config: DefaultConfig(),
 		Scheme: scheme,
 	}
-	if err := op.EnsureRunnerWireGuardSecret(context.Background()); err != nil {
-		t.Fatal(err)
-	}
 
 	return op
 }
 
 func testPod(name, nodeName string, annotations map[string]string) *corev1.Pod {
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[AnnotationServerWireGuardPublicKey] = podServerPublicKey(name)
+
+	return testPodWithAnnotations(name, nodeName, annotations)
+}
+
+func testPodWithAnnotations(name, nodeName string, annotations map[string]string) *corev1.Pod {
 	if annotations == nil {
 		annotations = map[string]string{}
 	}
@@ -373,6 +427,15 @@ func testPod(name, nodeName string, annotations map[string]string) *corev1.Pod {
 		},
 		Spec: corev1.PodSpec{NodeName: nodeName},
 	}
+}
+
+func podServerPublicKey(name string) string {
+	key := wgtypes.Key{}
+	for i := range key {
+		key[i] = byte(name[i%len(name)]) + byte(i)
+	}
+
+	return key.String()
 }
 
 func testNode(name, externalIP string) *corev1.Node {

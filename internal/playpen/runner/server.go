@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
 	"net/http"
@@ -20,6 +21,12 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/Azure/unbounded/internal/playpen/meta"
 )
 
 type RuntimeState struct {
@@ -77,6 +84,9 @@ func Run(ctx context.Context, cfg Config) error {
 		if err != nil {
 			return err
 		}
+		if err := publishServerWireGuardPublicKey(ctx, cfg, serverPublicKey); err != nil {
+			return err
+		}
 	}
 
 	state := NewRuntimeState(serverPublicKey, !cfg.ConfigureNetwork || cfg.WireGuard.ClientPublicKey != "")
@@ -101,8 +111,8 @@ func Run(ctx context.Context, cfg Config) error {
 	go func() {
 		errCh <- server.ListenAndServeTLS(filepath.Join(cfg.DataDir, "tls.crt"), filepath.Join(cfg.DataDir, "tls.key"))
 	}()
-	if cfg.ConfigureNetwork && cfg.WireGuard.ClientPublicKey == "" && cfg.WireGuard.ClientPublicKeyFile != "" {
-		go waitForClientPublicKey(ctx, cfg.WireGuard.ClientPublicKeyFile, network, state)
+	if cfg.ConfigureNetwork && cfg.WireGuard.ClientPublicKey == "" {
+		go waitForClientPublicKeyAnnotation(ctx, cfg, network, state)
 	}
 
 	select {
@@ -189,12 +199,32 @@ func infoResponse(cfg Config, serverPublicKey string) map[string]any {
 	}
 }
 
-func waitForClientPublicKey(ctx context.Context, path string, network *NetworkManager, state *RuntimeState) {
+func publishServerWireGuardPublicKey(ctx context.Context, cfg Config, serverPublicKey string) error {
+	if cfg.KubernetesClient == nil || cfg.PodName == "" || cfg.PodNamespace == "" {
+		return fmt.Errorf("pod name, namespace, and Kubernetes client are required to publish server WireGuard public key")
+	}
+
+	pod := &corev1.Pod{}
+	key := types.NamespacedName{Namespace: cfg.PodNamespace, Name: cfg.PodName}
+	if err := cfg.KubernetesClient.Get(ctx, key, pod); err != nil {
+		return err
+	}
+
+	base := pod.DeepCopy()
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[meta.AnnotationServerWireGuardPublicKey] = serverPublicKey
+
+	return cfg.KubernetesClient.Patch(ctx, pod, client.MergeFrom(base))
+}
+
+func waitForClientPublicKeyAnnotation(ctx context.Context, cfg Config, network *NetworkManager, state *RuntimeState) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
-		if clientPublicKey, err := readClientPublicKey(path); err == nil && clientPublicKey != "" {
+		if clientPublicKey, err := clientPublicKeyAnnotation(ctx, cfg); err == nil && clientPublicKey != "" {
 			if err := network.ConfigurePeer(ctx, clientPublicKey); err == nil {
 				state.SetReady()
 
@@ -210,13 +240,18 @@ func waitForClientPublicKey(ctx context.Context, path string, network *NetworkMa
 	}
 }
 
-func readClientPublicKey(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
+func clientPublicKeyAnnotation(ctx context.Context, cfg Config) (string, error) {
+	if cfg.KubernetesClient == nil || cfg.PodName == "" || cfg.PodNamespace == "" {
+		return "", fmt.Errorf("pod name, namespace, and Kubernetes client are required to read client WireGuard public key")
+	}
+
+	pod := &corev1.Pod{}
+	key := types.NamespacedName{Namespace: cfg.PodNamespace, Name: cfg.PodName}
+	if err := cfg.KubernetesClient.Get(ctx, key, pod); err != nil {
 		return "", err
 	}
 
-	return strings.TrimSpace(string(data)), nil
+	return strings.TrimSpace(pod.Annotations[meta.AnnotationClientWireGuardPublicKey]), nil
 }
 
 func ensureTLSCert(cfg Config) error {
