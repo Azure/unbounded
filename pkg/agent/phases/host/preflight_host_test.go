@@ -38,6 +38,15 @@ func TestCheckHostPackagesMissingPackageManager(t *testing.T) {
 func TestCheckHostPackagesListsMissingPackages(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.lookupPath = lookupPathWith(map[string]bool{"apt-get": true})
+	deps.detectPackageManager = func(func(string) (string, error)) (*hostPackageManager, error) {
+		return &hostPackageManager{
+			name:             "apt-get",
+			requiredPackages: []string{"systemd-container"},
+			installed: func(context.Context, *slog.Logger, string) bool {
+				return false
+			},
+		}, nil
+	}
 
 	results := checkHostPackages(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 

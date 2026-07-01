@@ -47,6 +47,7 @@ SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
 REGISTRY_PORT = 5555
 REGISTRY_CONTAINER = "unbounded-smoke-registry"
 IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
+NETBOOT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/netboot:smoke"
 AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 # The agent runs inside a VM on an isolated libvirt network. "localhost" inside
 # the VM resolves to the VM's own loopback, not the host.  Use the host's
@@ -1038,12 +1039,13 @@ def main() -> None:
     else:
         die("Local OCI registry did not become ready")
 
-    # Both Docker images (host-ubuntu2404 and agent-ubuntu2404) are pre-built
+    # Docker images are pre-built
     # by the GitHub Actions workflow using docker/build-push-action with GHA
     # layer caching.  They are already loaded into the local Docker daemon
-    # with the correct tags (IMAGE_NAME and AGENT_IMAGE_NAME).
+    # with the correct tags.
     log("Verifying pre-built OCI images are available")
     for name, tag in [("host-ubuntu2404", IMAGE_NAME),
+                      ("netboot", NETBOOT_IMAGE_NAME),
                       ("agent-ubuntu2404", AGENT_IMAGE_NAME)]:
         result = subprocess.run(
             ["docker", "image", "inspect", tag],
@@ -1063,6 +1065,7 @@ def main() -> None:
 
     log("Pushing OCI images to local registry")
     run(["docker", "push", IMAGE_NAME])
+    run(["docker", "push", NETBOOT_IMAGE_NAME])
     run(["docker", "push", AGENT_IMAGE_NAME])
 
     # Reclaim disk space consumed by Docker build cache.  The host-ubuntu2404
@@ -1121,6 +1124,7 @@ def main() -> None:
         str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
         f"--cache-dir={CACHE_DIR}",
         f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",
+        f"--default-netboot-image={NETBOOT_IMAGE_NAME}",
         "--leader-elect-lease-duration=60s",
         "--leader-elect-renew-deadline=40s",
         "--leader-elect-retry-period=5s",

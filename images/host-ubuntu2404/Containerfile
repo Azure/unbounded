@@ -1,36 +1,16 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-# ── Build the unbounded-agent binary ────────────────────────────────
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.4-trixie@sha256:0dcba0d95dbfb072e9917a106b9e07d7cc298097dc83e9307056ef1889de654d AS gobuilder
-
-ARG TARGETARCH
-ARG VERSION=dev
-
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
-    -ldflags "-s -w \
-      -X github.com/Azure/unbounded/internal/version.Version=${VERSION} \
-      -X github.com/Azure/unbounded/internal/version.GitCommit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
-    -o /unbounded-agent ./cmd/agent
-
-# ── Assemble host image artifacts ───────────────────────────────────
 FROM docker.io/library/ubuntu:24.04 AS build
 
 ARG TARGETARCH
+ARG UBUNTU_CLOUDIMG_URL=https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-${TARGETARCH}.img
 
-# Retry loop: Ubuntu mirrors rate-limit large downloads (e.g. linux-firmware,
-# ~600 MB) with HTTP 429.  apt's built-in Acquire::Retries does not add a
-# delay between attempts, so a shell-level retry with sleep is needed.
 RUN apt-get update && \
     ok=false && \
     for attempt in 1 2 3 4 5; do \
       if apt-get install -y --no-install-recommends \
-           cpio curl ca-certificates qemu-utils libguestfs-tools linux-image-generic pigz; then \
+           ca-certificates curl pigz qemu-utils; then \
         ok=true; break; \
       fi; \
       echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
@@ -39,130 +19,15 @@ RUN apt-get update && \
     done && $ok && \
     rm -rf /var/lib/apt/lists/*
 
-# ── Download netboot artifacts ──────────────────────────────────────
-# Ubuntu netboot layout differs by architecture:
-#   amd64: individual files at releases.ubuntu.com
-#   arm64: tarball at cdimage.ubuntu.com (individual URLs are unavailable)
-# File names follow UEFI convention: shimx64/grubx64 (amd64), shimaa64/grubaa64 (arm64).
-# metalman looks up the boot filename from metadata.yaml (dhcpBootImageName).
-#
-# --connect-timeout and --retry flags prevent CI hangs when upstream mirrors
-# stall (observed 112s+ stalls on releases.ubuntu.com).
-RUN mkdir -p /artifacts && \
-    KVER=$(ls /lib/modules | head -1) && \
-    cp "/boot/vmlinuz-${KVER}" /artifacts/vmlinuz && \
-    if [ "${TARGETARCH}" = "amd64" ]; then \
-        NETBOOT_BASE="https://releases.ubuntu.com/24.04.2/netboot/amd64"; \
-        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
-            -o /artifacts/shimx64.efi  "${NETBOOT_BASE}/bootx64.efi" && \
-        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
-            -o /artifacts/grubx64.efi  "${NETBOOT_BASE}/grubx64.efi" && \
-        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
-            -o /artifacts/initrd       "${NETBOOT_BASE}/initrd"; \
-    elif [ "${TARGETARCH}" = "arm64" ]; then \
-        NETBOOT_URL="https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.4-netboot-arm64.tar.gz"; \
-        curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
-            -o /tmp/netboot.tar.gz "${NETBOOT_URL}" && \
-        tar -xzf /tmp/netboot.tar.gz -C /tmp && \
-        cp /tmp/arm64/bootaa64.efi   /artifacts/shimaa64.efi && \
-        cp /tmp/arm64/grubaa64.efi   /artifacts/grubaa64.efi && \
-        cp /tmp/arm64/initrd          /artifacts/initrd && \
-        rm -rf /tmp/netboot.tar.gz /tmp/arm64; \
-    else \
-        echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1; \
-    fi
-
-# ── Build init.cpio overlay ─────────────────────────────────────────
-RUN apt-get update && apt-get install -y --no-install-recommends efibootmgr && \
-    rm -rf /var/lib/apt/lists/*
-
-COPY images/host-ubuntu2404/assets/init /tmp/initrd-root/init
-RUN chmod 755 /tmp/initrd-root/init && \
-    mkdir -p /tmp/initrd-root/usr/bin /tmp/initrd-root/usr/lib && \
-    cp /usr/bin/efibootmgr /tmp/initrd-root/usr/bin/ && \
-    for lib in $(ldd /usr/bin/efibootmgr | awk '/=>/{print $3}'); do \
-        mkdir -p "/tmp/initrd-root$(dirname "$lib")" && \
-        cp "$lib" "/tmp/initrd-root${lib}"; \
-    done && \
-    # Also copy the dynamic linker so efibootmgr can run in the initrd.
-    INTERP=$(ldd /usr/bin/efibootmgr | awk '/ld-linux/{print $1}') && \
-    mkdir -p "/tmp/initrd-root$(dirname "$INTERP")" && \
-    cp "$INTERP" "/tmp/initrd-root${INTERP}" && \
-    # Copy kernel modules into the overlay so modprobe can load network
-    # and storage drivers.  The Ubuntu netboot initrd is a minimal
-    # Debian-Installer image that does not ship ethernet driver modules;
-    # without them no NIC appears and the installer panics.
-    KVER=$(ls /lib/modules | head -1) && \
-    KMOD="/tmp/initrd-root/lib/modules/${KVER}" && \
-    mkdir -p "${KMOD}/kernel/drivers/net" \
-             "${KMOD}/kernel/drivers/scsi" \
-             "${KMOD}/kernel/drivers/ata" \
-             "${KMOD}/kernel/drivers/nvme" \
-             "${KMOD}/kernel/drivers/virtio" \
-             "${KMOD}/kernel/drivers/block" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/net/." \
-           "${KMOD}/kernel/drivers/net/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/scsi/." \
-           "${KMOD}/kernel/drivers/scsi/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/ata/." \
-           "${KMOD}/kernel/drivers/ata/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/nvme/." \
-           "${KMOD}/kernel/drivers/nvme/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/virtio/." \
-           "${KMOD}/kernel/drivers/virtio/" && \
-    cp -a "/lib/modules/${KVER}/kernel/drivers/block/." \
-           "${KMOD}/kernel/drivers/block/" && \
-    # modules.dep and map files so modprobe can resolve dependencies.
-    depmod -b /tmp/initrd-root "${KVER}" && \
-    cd /tmp/initrd-root && \
-    find . -print0 | cpio --create --format=newc --quiet --null > /artifacts/init.cpio
-
-# ── Assemble /disk directory ────────────────────────────────────────
-RUN mkdir -p /disk/grub /disk/cloud-init
-
-# Binary boot artifacts (architecture-specific EFI names for metalman TFTP).
-RUN cp /artifacts/vmlinuz /artifacts/initrd /artifacts/init.cpio /disk/ && \
-    if [ "${TARGETARCH}" = "amd64" ]; then \
-        cp /artifacts/shimx64.efi /artifacts/grubx64.efi /disk/; \
-    elif [ "${TARGETARCH}" = "arm64" ]; then \
-        cp /artifacts/shimaa64.efi /artifacts/grubaa64.efi /disk/; \
-    fi
-
-# Templates and static configs from assets/.
-COPY images/host-ubuntu2404/assets/grub.cfg.tmpl               /disk/grub/grub.cfg.tmpl
-COPY images/host-ubuntu2404/assets/meta-data.tmpl              /disk/cloud-init/meta-data.tmpl
-COPY images/host-ubuntu2404/assets/vendor-data.tmpl            /disk/cloud-init/vendor-data.tmpl
-
-# Generate metadata.yaml with the correct boot image name for this architecture.
-# metalman reads dhcpBootImageName to tell PXE clients which file to request via TFTP.
-RUN if [ "${TARGETARCH}" = "amd64" ]; then \
-        echo "dhcpBootImageName: shimx64.efi" > /disk/metadata.yaml; \
-    elif [ "${TARGETARCH}" = "arm64" ]; then \
-        echo "dhcpBootImageName: shimaa64.efi" > /disk/metadata.yaml; \
-    fi
-
-# ── Download and convert Ubuntu cloud image to raw+gzip ─────────────
-# Cloud image URL is parameterized by architecture.
-ARG UBUNTU_CLOUDIMG_URL=https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-${TARGETARCH}.img
-
-# Copy the agent binary from the builder so we can inject it into the
-# cloud image before gzipping.  It is also placed at /disk/unbounded-agent
-# (below) so metalman can serve it to other provisioning paths.
-COPY --from=gobuilder /unbounded-agent /tmp/unbounded-agent
-
-RUN curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
+RUN mkdir -p /disk && \
+    curl -fSL --connect-timeout 10 --retry 3 --retry-delay 2 \
         -o /tmp/cloudimg.qcow2 "${UBUNTU_CLOUDIMG_URL}" && \
     qemu-img convert -f qcow2 -O raw /tmp/cloudimg.qcow2 /tmp/disk.img && \
     rm /tmp/cloudimg.qcow2 && \
-    LIBGUESTFS_BACKEND=direct virt-customize -a /tmp/disk.img \
-        --mkdir /usr/local/bin \
-        --copy-in /tmp/unbounded-agent:/usr/local/bin \
-        --chmod 0755:/usr/local/bin/unbounded-agent && \
     pigz -1 /tmp/disk.img && \
     mv /tmp/disk.img.gz /disk/disk.img.gz
 
-# ── Agent binary built from source ──────────────────────────────────
-COPY --from=gobuilder /unbounded-agent /disk/unbounded-agent
-
 FROM scratch
+LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \
+      org.opencontainers.image.description="Metalman machine image for Ubuntu 24.04"
 COPY --from=build /disk /disk

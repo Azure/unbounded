@@ -19,7 +19,7 @@ metadata:
   name: node-01
 spec:
   pxe:
-    image: ghcr.io/azure/images/host-ubuntu2404:v1
+    image: ghcr.io/azure/host-ubuntu2404:v1
     dhcpLeases:
     - mac: "aa:bb:cc:dd:ee:01"
       ipv4: "10.0.0.11"
@@ -58,7 +58,7 @@ everything needed to PXE-boot and manage bare metal hosts:
 | Health  | 8081/tcp    | HTTP     | Liveness/readiness probes |
 
 The controller also runs reconcilers for OCI image pulling (downloading and
-caching netboot images from container registries) and Machine resources with
+caching machine and netboot images from container registries) and Machine resources with
 Redfish BMC specs (power management, boot order configuration).
 
 When deployed inside a cluster, the container entrypoint is `metalman` and the
@@ -85,11 +85,13 @@ It exposes ports 8880/tcp (HTTP), 8081/tcp (health), 67/udp (DHCP), and 69/udp (
 
 `site deploy-pxe` flags:
 
-- `--site` — Site name (required; scopes the PXE instance to machines
+- `--site` - Site name (required; scopes the PXE instance to machines
   labeled `unbounded-cloud.io/site=<site>`).
-- `--image` — Container image for the PXE deployment (default: build-time
+- `--image` - Container image for the PXE deployment (default: build-time
   value or `metalman:latest`).
-- `--kubeconfig` — Path to kubeconfig file.
+- `--default-netboot-image` - OCI image containing PXE boot artifacts to use
+  when a Machine omits `spec.pxe.netbootImage`.
+- `--kubeconfig` - Path to kubeconfig file.
 
 The generated Deployment uses host networking, a `CriticalAddonsOnly`
 toleration, DNS policy `ClusterFirstWithHostNet`, and a node selector
@@ -120,7 +122,7 @@ its own leader-election lease (`metalman-<site>`).
 
 A mostly-trusted network between the controller and the bare metal hosts is
 assumed. Bootstrap tokens (Kubernetes ServiceAccount tokens) are issued to
-nodes based on source IP — the controller looks up the Machine whose NIC
+nodes based on source IP - the controller looks up the Machine whose NIC
 matches the requesting IP and issues a short-lived token for that node.
 
 Bootstrap tokens are delivered using the standard TPM 2.0 credential encryption workflow.
@@ -148,28 +150,34 @@ at all.
 
 ### Images
 
-Netboot images are standard OCI container images built `FROM scratch` that
-contain all files needed for PXE booting a machine under `/disk/`. This
-follows the kubevirt containerDisk convention. Files
-with a `.tmpl` suffix are Go templates rendered per-machine at serve time;
-other files are served verbatim. A `metadata.yaml` file provides image-level
-configuration (e.g. `dhcpBootImageName`).
+Metalman uses two OCI images when repaving a machine:
+
+- `spec.pxe.image` is the machine image. It contains `/disk/disk.img.gz`, a
+  gzip-compressed raw disk image written to the target disk.
+- `spec.pxe.netbootImage` is the reusable PXE boot environment. It contains
+  bootloaders, kernel, initrd, templates, and metadata. Its cloud-init template
+  downloads and installs `unbounded-agent` from the configured release/source.
+  If omitted, Metalman uses the release-matched `--default-netboot-image`.
+
+Both images are built `FROM scratch` and use `/disk/` as the artifact root,
+following the kubevirt containerDisk convention. Files with a `.tmpl` suffix in
+the netboot image are Go templates rendered per-machine at serve time; other
+files are served verbatim. A `metadata.yaml` file in the netboot image provides
+image-level configuration such as `dhcpBootImageName`.
 
 Images are built, tagged, and pushed using standard container tooling:
 
 ```bash
-docker build -t ghcr.io/azure/images/host-ubuntu2404:v1 .
-docker push ghcr.io/azure/images/host-ubuntu2404:v1
+docker build -t ghcr.io/azure/host-ubuntu2404:v1 -f images/host-ubuntu2404/Containerfile .
+docker build -t ghcr.io/azure/netboot:v1 -f images/netboot/Containerfile .
+docker push ghcr.io/azure/host-ubuntu2404:v1
+docker push ghcr.io/azure/netboot:v1
 ```
-
-The OCI image layout is the one described above: boot artifacts live under
-`/disk/`, `.tmpl` files are rendered per-machine at serve time, and
-`metadata.yaml` carries image-level configuration.
 
 ### Machine
 
 A Machine is a cluster-scoped custom resource representing a single bare metal
-host. At minimum it needs a NIC (MAC + static IP) and a PXE image reference:
+host. At minimum it needs a NIC (MAC + static IP) and a machine image reference:
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -178,7 +186,7 @@ metadata:
   name: node-01
 spec:
   pxe:
-    image: ghcr.io/azure/images/host-ubuntu2404:v1
+    image: ghcr.io/azure/host-ubuntu2404:v1
     dhcpLeases:
     - mac: "aa:bb:cc:dd:ee:01"
       ipv4: "10.0.0.11"
@@ -187,8 +195,9 @@ spec:
 ```
 
 This is enough for the DHCP server to issue a lease and for TFTP/HTTP to serve
-boot artifacts. The node must be manually PXE-booted (or have PXE as its
-default boot option).
+boot artifacts from the default netboot image. Set `spec.pxe.netbootImage` only
+when a Machine needs a non-default PXE boot environment. The node must be
+manually PXE-booted (or have PXE as its default boot option).
 
 #### BMC
 
@@ -202,7 +211,7 @@ metadata:
   name: node-01
 spec:
   pxe:
-    image: ghcr.io/azure/images/host-ubuntu2404:v1
+    image: ghcr.io/azure/host-ubuntu2404:v1
     dhcpLeases:
     - mac: "aa:bb:cc:dd:ee:01"
       ipv4: "10.0.0.11"
@@ -229,5 +238,5 @@ kubectl unbounded machine repave node-01
 ```
 
 This increments `spec.operations.repaveCounter` and `spec.operations.rebootCounter`. The
-controller handles the rest — it configures the boot order to PXE, executes a
+controller handles the rest - it configures the boot order to PXE, executes a
 ForceOff/On power cycle, and clears the condition once the node is back up.

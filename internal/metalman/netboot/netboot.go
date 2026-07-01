@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"text/template"
 
@@ -63,9 +64,26 @@ type FileResolver struct {
 	Reader            client.Reader
 	Cluster           ClusterInfoProvider
 	ServeURL          string
+	DefaultNetbootRef string
 	KubernetesVersion string
 	ClusterDNS        string
 	ProviderLabels    map[string]string
+}
+
+func (f *FileResolver) NetbootImageRef(node *v1alpha3.Machine) string {
+	if node == nil || node.Spec.PXE == nil {
+		return ""
+	}
+
+	if node.Spec.PXE.NetbootImage != "" {
+		return node.Spec.PXE.NetbootImage
+	}
+
+	if f.DefaultNetbootRef != "" {
+		return f.DefaultNetbootRef
+	}
+
+	return node.Spec.PXE.Image
 }
 
 func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3.Machine, error) {
@@ -98,10 +116,15 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 		return &ResolvedFile{Data: []byte(defaultUserData), ContentType: "text/plain"}, nil
 	}
 
-	diskPath, isTemplate, err := f.Cache.ResolvePath(imageRef, path)
+	architecture := v1alpha3.DefaultPXEArchitecture
+	if node != nil && node.Spec.PXE != nil {
+		architecture = node.Spec.PXE.TargetArchitecture()
+	}
+
+	diskPath, isTemplate, err := f.Cache.ResolvePathForArchitecture(imageRef, architecture, path)
 	if err != nil {
 		// Check if the image just hasn't been pulled yet
-		digest := f.Cache.DigestFor(imageRef)
+		digest := f.Cache.DigestForArchitecture(imageRef, architecture)
 		if digest == "" {
 			return nil, ErrNotYetDownloaded
 		}
@@ -139,12 +162,7 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 				return nil, fmt.Errorf("marshal agent config: %w", err)
 			}
 
-			data, err := renderTemplate(string(content), templateData{
-				Machine:         node,
-				ApiserverURL:    ci.ApiserverURL,
-				ServeURL:        f.ServeURL,
-				AgentConfigJSON: string(agentConfigJSON),
-			})
+			data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON)))
 			if err != nil {
 				return nil, err
 			}
@@ -196,20 +214,64 @@ func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v
 }
 
 type templateData struct {
-	Machine         *v1alpha3.Machine
-	ApiserverURL    string
-	ServeURL        string
-	AgentConfigJSON string
+	Machine             *v1alpha3.Machine
+	ApiserverURL        string
+	ServeURL            string
+	AgentConfigJSON     string
+	InstallScript       string
+	InstallEnv          []string
+	SpecRepaveCounter   int64
+	StatusRepaveCounter int64
+}
+
+func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON string) templateData {
+	var specRepave, statusRepave int64
+	var agent *v1alpha3.AgentSpec
+
+	if node != nil {
+		agent = node.Spec.Agent
+
+		if node.Spec.Operations != nil {
+			specRepave = node.Spec.Operations.RepaveCounter
+		}
+
+		if node.Status.Operations != nil {
+			statusRepave = node.Status.Operations.RepaveCounter
+		}
+	}
+
+	return templateData{
+		Machine:             node,
+		ApiserverURL:        ci.ApiserverURL,
+		ServeURL:            serveURL,
+		AgentConfigJSON:     agentConfigJSON,
+		InstallScript:       provision.UnboundedAgentInstallScript(),
+		InstallEnv:          provision.AgentInstallEnv(agent),
+		SpecRepaveCounter:   specRepave,
+		StatusRepaveCounter: statusRepave,
+	}
 }
 
 var (
-	templateFuncMap = template.FuncMap{}
-	templatePool    = sync.Pool{
+	templateFuncMap = template.FuncMap{
+		"indent": indentTemplateBlock,
+	}
+	templatePool = sync.Pool{
 		New: func() any {
 			return new(bytes.Buffer)
 		},
 	}
 )
+
+func indentTemplateBlock(spaces int, value string) string {
+	if value == "" {
+		return ""
+	}
+
+	prefix := strings.Repeat(" ", spaces)
+
+	return prefix + strings.ReplaceAll(value, "\n", "\n"+prefix)
+}
 
 func renderTemplate(tmplStr string, data templateData) ([]byte, error) {
 	t, err := template.New("").Funcs(templateFuncMap).Parse(tmplStr)
