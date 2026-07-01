@@ -22,11 +22,12 @@ import (
 )
 
 type Server struct {
-	Interface string
-	Port      int
-	Reader    client.Reader
-	ServerIP  net.IP
-	OCICache  *netboot.OCICache
+	Interface         string
+	Port              int
+	Reader            client.Reader
+	ServerIP          net.IP
+	OCICache          *netboot.OCICache
+	DefaultNetbootRef string
 }
 
 func (s *Server) NeedLeaderElection() bool {
@@ -186,10 +187,17 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		}
 	}
 
-	if node.Spec.PXE.Image != "" && s.OCICache != nil {
-		meta, err := s.OCICache.MetadataForRef(node.Spec.PXE.Image)
+	netbootImage := node.Spec.PXE.NetbootImage
+	if netbootImage == "" {
+		netbootImage = s.DefaultNetbootRef
+	}
+
+	if netbootImage != "" && s.OCICache != nil {
+		architecture := node.Spec.PXE.TargetArchitecture()
+
+		meta, err := s.OCICache.MetadataForRefArchitecture(netbootImage, architecture)
 		if err != nil {
-			log.Warn("OCI image metadata not available", "image", node.Spec.PXE.Image, "err", err)
+			log.Warn("OCI image metadata not available", "image", netbootImage, "architecture", architecture, "err", err)
 		} else if meta.DHCPBootImageName != "" {
 			resp.UpdateOption(dhcpv4.OptTFTPServerName(s.ServerIP.String()))
 			resp.UpdateOption(dhcpv4.OptBootFileName(meta.DHCPBootImageName))
