@@ -16,7 +16,7 @@ import (
 // Orca + Azurite + Garage into. Mirrored here so the dev preset
 // can drive its own auto-port-forward without needing to read a
 // manifest or kubeconfig context annotation.
-const defaultNamespace = unbounded.SystemNamespace
+var defaultNamespace = unbounded.SystemNamespace()
 
 // Service name constants used by the dev preset. These match the
 // Service objects produced by deploy/orca/**/*.yaml.tmpl, which the

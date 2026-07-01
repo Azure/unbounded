@@ -29,7 +29,7 @@ func TestDefaultLeaderElectionConfig(t *testing.T) {
 		t.Fatalf("unexpected retry period: %v", cfg.RetryPeriod)
 	}
 
-	if cfg.ResourceNamespace != unbounded.SystemNamespace {
+	if cfg.ResourceNamespace != unbounded.SystemNamespace() {
 		t.Fatalf("unexpected resource namespace: %s", cfg.ResourceNamespace)
 	}
 

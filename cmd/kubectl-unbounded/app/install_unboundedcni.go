@@ -16,10 +16,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-const (
-	unboundedCNINamespace      = unbounded.SystemNamespace
-	unboundedCNIControllerName = "unbounded-net-controller"
-)
+const unboundedCNIControllerName = "unbounded-net-controller"
+
+// unboundedCNINamespace is the namespace unbounded-net is installed into.
+var unboundedCNINamespace = unbounded.SystemNamespace()
 
 // installUnboundedCNI installs unbounded-net manifests and waits for the
 // controller to become running.

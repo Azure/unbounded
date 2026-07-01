@@ -12,7 +12,11 @@ CONTAINER_REGISTRY ?= ghcr.io/azure
 # Unified install namespace for all unbounded components. Each component's
 # *_NAMESPACE var derives from this by default, so overriding UNBOUNDED_NAMESPACE
 # moves everything at once, while a component var can still be overridden
-# individually when needed.
+# individually when needed. Components resolve their runtime namespace from the
+# POD_NAMESPACE Downward-API env (see internal/unbounded.SystemNamespace), so a
+# non-default namespace lines up end to end; when installing to a non-default
+# namespace, pass `kubectl unbounded machine register --namespace <ns>` so the
+# SSH secret and its Machine ref land where machina runs.
 UNBOUNDED_NAMESPACE ?= unbounded-system
 
 FORGE_BIN=bin/forge

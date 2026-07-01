@@ -92,7 +92,7 @@ func DefaultLeaderElectionConfig() LeaderElectionConfig {
 		LeaseDuration:     15 * time.Second,
 		RenewDeadline:     10 * time.Second,
 		RetryPeriod:       2 * time.Second,
-		ResourceNamespace: unbounded.SystemNamespace,
+		ResourceNamespace: unbounded.SystemNamespace(),
 		ResourceName:      "unbounded-net-controller",
 	}
 }

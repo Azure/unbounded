@@ -49,7 +49,7 @@ func parseSecretKeyRef(ref string) (machinav1alpha3.SecretKeySelector, error) {
 		sel.Namespace = namespaceName[:idx]
 		sel.Name = namespaceName[idx+1:]
 	} else {
-		sel.Namespace = unbounded.SystemNamespace
+		sel.Namespace = unbounded.SystemNamespace()
 		sel.Name = namespaceName
 	}
 

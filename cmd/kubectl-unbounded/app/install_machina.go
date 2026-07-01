@@ -16,10 +16,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-const (
-	machinaNamespace      = unbounded.SystemNamespace
-	machinaControllerName = "machina-controller"
-)
+const machinaControllerName = "machina-controller"
+
+// machinaNamespace is the namespace machina is installed into.
+var machinaNamespace = unbounded.SystemNamespace()
 
 // installMachina installs machina manifests and waits for the controller to
 // become running.

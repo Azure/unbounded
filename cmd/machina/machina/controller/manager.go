@@ -22,6 +22,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 var scheme = runtime.NewScheme()
@@ -131,8 +132,8 @@ func machinaCacheOptions() cache.Options {
 			// Machina-managed secrets in the controller's own namespace.
 			&corev1.Secret{}: {
 				Namespaces: map[string]cache.Config{
-					metav1.NamespaceSystem:   {},
-					machinaSecretNamespace(): {},
+					metav1.NamespaceSystem:      {},
+					unbounded.SystemNamespace(): {},
 				},
 			},
 		},

@@ -35,12 +35,14 @@ import (
 )
 
 const (
-	BootstrapSAName      = "metalman-bootstrap"
-	BootstrapSANamespace = unbounded.SystemNamespace
+	BootstrapSAName = "metalman-bootstrap"
 
 	// maxRequestBodySize limits attestation request bodies to 1 MiB.
 	maxRequestBodySize = 1 << 20
 )
+
+// BootstrapSANamespace is the namespace of the metalman bootstrap ServiceAccount.
+var BootstrapSANamespace = unbounded.SystemNamespace()
 
 type Handler struct {
 	Clientset      kubernetes.Interface

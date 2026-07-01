@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-package unbounded_test
+package unbounded
 
 import (
 	"os"
@@ -13,7 +13,6 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
-	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 // namespaceTemplate names a component's manifest template directory and the
@@ -26,13 +25,13 @@ type namespaceTemplate struct {
 }
 
 // TestSystemNamespace_MatchesTemplateDefaults is the drift guard between the
-// Go-side default (unbounded.SystemNamespace) and the namespace baked into the
+// Go-side default (the systemNamespace const) and the namespace baked into the
 // manifest templates via `{{ default "unbounded-system" .Namespace }}`.
 //
 // It renders each component's templates with NO Namespace supplied (so the
 // template `default` fallback is exercised) and asserts the resulting Namespace
-// resource name equals unbounded.SystemNamespace. If someone changes the const
-// without updating the templates (or vice versa), this test fails loudly.
+// resource name equals systemNamespace. If someone changes the const without
+// updating the templates (or vice versa), this test fails loudly.
 func TestSystemNamespace_MatchesTemplateDefaults(t *testing.T) {
 	root := repoRoot(t)
 
@@ -63,9 +62,9 @@ func TestSystemNamespace_MatchesTemplateDefaults(t *testing.T) {
 			}
 
 			name := namespaceResourceName(t, raw)
-			if name != unbounded.SystemNamespace {
-				t.Fatalf("%s template default namespace %q does not match unbounded.SystemNamespace %q; keep the const and the manifest template defaults in sync",
-					tc.component, name, unbounded.SystemNamespace)
+			if name != systemNamespace {
+				t.Fatalf("%s template default namespace %q does not match systemNamespace %q; keep the const and the manifest template defaults in sync",
+					tc.component, name, systemNamespace)
 			}
 		})
 	}

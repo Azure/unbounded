@@ -30,10 +30,10 @@ import (
 // When not set (e.g. during development), it falls back to "metalman:latest".
 var MetalmanImage = "metalman:latest"
 
-const (
-	deployPXENamespace       = unbounded.SystemNamespace
-	deployPXEDefaultReplicas = 1
-)
+const deployPXEDefaultReplicas = 1
+
+// deployPXENamespace is the namespace the PXE Deployment is created in.
+var deployPXENamespace = unbounded.SystemNamespace()
 
 // deployPXEParams holds the values needed to build the PXE Deployment.
 type deployPXEParams struct {

@@ -136,7 +136,7 @@ func (p *pluginRuntime) namespace() (string, error) {
 		return ns, nil
 	}
 
-	candidates := deduplicateStrings(ns, unbounded.SystemNamespace, "unbounded-net", "kube-system")
+	candidates := deduplicateStrings(ns, unbounded.SystemNamespace(), "unbounded-net", "kube-system")
 
 	const selector = "app.kubernetes.io/name in (unbounded-net-controller, unbounded-net-node)"
 	for _, candidate := range candidates {
