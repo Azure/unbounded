@@ -77,6 +77,37 @@ same idempotent routine; per pass:
 The operator never deletes the legacy `Namespace` objects; an operator removes
 those manually once empty (`kubectl delete namespace unbounded-kube unbounded-net`).
 
+Migration is **operator-only**: there is no standalone shell migrator. For
+air-gapped or non-operator-managed clusters the same routine is available as the
+one-shot `unbounded-operator migrate-legacy` (runnable as a Job). The operator
+must have reconciled the Sites first (creating the new `unbounded-system`
+components, including per-site metalman) before the reaper drains the old
+namespaces.
+
+## Review fixes (PR #372 review)
+
+The initial #372 review raised four findings; disposition:
+
+- **1 (metalman PXE lease, High):** resolved by removing the shell migrator (it
+  copied live PXE Deployments verbatim, carrying old images / no `POD_NAMESPACE`)
+  and having the operator recreate metalman fresh. PR-A additionally injects
+  `POD_NAMESPACE` on the operator-created metalman Deployment so its lease is
+  correct under any install namespace.
+- **2 (release-upgrade.yaml, High):** not #372's; PR-A restructures that workflow
+  and PR-C makes it `unbounded-system`-aware. Gated by this integration branch -
+  no unified release is cut from `main` until PR-C merges (see below).
+- **3 (namespace override not end-to-end, Medium):** fixed in #372 - machina
+  resolves its SSH-secret namespace from `POD_NAMESPACE`, and `machine register`
+  gained `--namespace`, so a non-default install namespace lines up.
+- **4 (docs point at kube-system, Low):** fixed in #372 - net day-2 docs now
+  reference `unbounded-system`.
+
+**Release gate:** `main` must not cut a unified (`unbounded-system`) release
+until PR-C has merged into the integration branch, because `release-upgrade.yaml`
+only becomes `unbounded-system`-aware in PR-C. The integration branch enforces
+this: #372's manifest changes and PR-C's workflow changes reach `main` together
+in the single integration -> main merge.
+
 ## Base strategy and merge flow
 
 All PRs target `feature/unbounded-system` directly. Dependents are rebased
@@ -84,7 +115,7 @@ reactively as their prerequisites merge (PR-A after PR-B; PR-C is prepared only
 after PR-A and PR-B are merged). PRs are merged by reviewers after approval; the
 author does not self-merge. Each PR must be green on `make build`, `make lint`,
 `make test`; PR-C must additionally pass the kind `operator-reap` scenario in
-`hack/smoke-namespace-migration.py`.
+`hack/smoke-namespace-migration.py` (operator-only; re-homed from #372).
 
 ## Status checklist
 
@@ -93,6 +124,7 @@ author does not self-merge. Each PR must be green on `make build`, `make lint`,
 - [x] Open umbrella tracking PR #388 (`feature/unbounded-system` -> `main`)   (me opens / reviewers merge last)
 - [x] PR-B: re-target #372 -> `feature/unbounded-system`                      (me opens / reviewers merge)
 - [x] PR-A: open operator + Site redesign -> integration                     (me opens / reviewers merge)
+- [x] Apply #372 review fixes (findings 1-4 across #372 + PR-A)               (me)
 - [ ] PR-A: rebase after PR-B merges                                         (me)
 - [ ] PR-C: open operator-ns + migration -> integration (after A+B merged)   (me opens / reviewers merge)
 - [ ] Periodic `main` -> integration syncs                                   (me)
