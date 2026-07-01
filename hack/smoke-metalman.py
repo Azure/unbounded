@@ -13,6 +13,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import threading
@@ -41,9 +42,12 @@ DNS_SERVER = "8.8.8.8"
 MAC_ADDRESS = "52:54:00:aa:bb:01"
 SUSHY_PORT = 8443
 HTTP_PORT = 8880
+AGENT_DOWNLOAD_PORT = 8881
 CACHE_DIR = TMPDIR / "cache"
 ARTIFACT_DIR = TMPDIR / "artifacts"
 SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
+AGENT_TARBALL = ARTIFACT_DIR / "unbounded-agent-linux-amd64.tar.gz"
+AGENT_DOWNLOAD_URL = f"http://{SERVER_IP}:{AGENT_DOWNLOAD_PORT}/{AGENT_TARBALL.name}"
 REGISTRY_PORT = 5555
 REGISTRY_CONTAINER = "unbounded-smoke-registry"
 IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
@@ -54,6 +58,7 @@ AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 # bridge IP so the VM can reach the registry over the virtual network.
 AGENT_IMAGE_NAME_VM = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 BINARY = REPO_ROOT / "bin" / "metalman"
+AGENT_BINARY = REPO_ROOT / "bin" / "unbounded-agent"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
 QGA_SOCK = TMPDIR / "qga.sock"
@@ -993,10 +998,14 @@ def main() -> None:
     log("Rendering machina and net manifests")
     run(["make", "machina-manifests", "net-manifests"], cwd=str(REPO_ROOT))
 
-    log("Building metalman and kubectl-unbounded (parallel)")
+    log("Building metalman, kubectl-unbounded, and unbounded-agent (parallel)")
     go_builds: list[tuple[str, subprocess.Popen[Any]]] = [
         ("metalman", subprocess.Popen(
             ["go", "build", "-o", str(BINARY), "./cmd/metalman"],
+            cwd=str(REPO_ROOT),
+        )),
+        ("unbounded-agent", subprocess.Popen(
+            ["go", "build", "-o", str(AGENT_BINARY), "./cmd/agent"],
             cwd=str(REPO_ROOT),
         )),
         ("kubectl-unbounded", subprocess.Popen(
@@ -1063,6 +1072,20 @@ def main() -> None:
             die(f"go build {name} failed (exit code {rc})")
     log("  Go builds finished")
 
+    log("Packaging branch-built unbounded-agent")
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(AGENT_TARBALL, "w:gz") as tar:
+        tar.add(AGENT_BINARY, arcname="unbounded-agent")
+
+    log("Starting agent download server")
+    proc = spawn([
+        sys.executable, "-m", "http.server", str(AGENT_DOWNLOAD_PORT),
+        "--bind", SERVER_IP, "--directory", str(ARTIFACT_DIR),
+    ], TMPDIR / "agent-download.log")
+    log(f"  agent download PID={proc.pid}")
+    time.sleep(1)
+    check_procs()
+
     log("Pushing OCI images to local registry")
     run(["docker", "push", IMAGE_NAME])
     run(["docker", "push", NETBOOT_IMAGE_NAME])
@@ -1104,6 +1127,7 @@ def main() -> None:
             },
             "agent": {
                 "image": AGENT_IMAGE_NAME_VM,
+                "url": AGENT_DOWNLOAD_URL,
             },
             "kubernetes": {
                 "nodeLabels": {NODE_LABEL_KEY: NODE_LABEL_VALUE},
