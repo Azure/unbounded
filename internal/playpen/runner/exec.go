@@ -43,18 +43,14 @@ func (OSCommander) Start(ctx context.Context, name string, args []string, stdout
 
 	stderr, err := os.OpenFile(stderrPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		stdout.Close() //nolint:errcheck // Best effort after open failure.
-		return nil, err
+		return nil, errors.Join(err, stdout.Close())
 	}
 
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
-		stdout.Close() //nolint:errcheck // Best effort after start failure.
-		stderr.Close() //nolint:errcheck // Best effort after start failure.
-
-		return nil, err
+		return nil, errors.Join(err, stdout.Close(), stderr.Close())
 	}
 
 	p := &osProcess{cmd: cmd, done: make(chan struct{})}
