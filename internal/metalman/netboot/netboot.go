@@ -60,14 +60,15 @@ type StaticClusterInfo struct {
 func (s *StaticClusterInfo) ClusterInfo() ClusterInfo { return s.Info }
 
 type FileResolver struct {
-	Cache             *OCICache
-	Reader            client.Reader
-	Cluster           ClusterInfoProvider
-	ServeURL          string
-	DefaultNetbootRef string
-	KubernetesVersion string
-	ClusterDNS        string
-	ProviderLabels    map[string]string
+	Cache               *OCICache
+	Reader              client.Reader
+	Cluster             ClusterInfoProvider
+	ServeURL            string
+	DefaultNetbootRef   string
+	DefaultAgentVersion string
+	KubernetesVersion   string
+	ClusterDNS          string
+	ProviderLabels      map[string]string
 }
 
 func (f *FileResolver) NetbootImageRef(node *v1alpha3.Machine) string {
@@ -162,7 +163,7 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 				return nil, fmt.Errorf("marshal agent config: %w", err)
 			}
 
-			data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON)))
+			data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON), f.DefaultAgentVersion))
 			if err != nil {
 				return nil, err
 			}
@@ -224,7 +225,7 @@ type templateData struct {
 	StatusRepaveCounter int64
 }
 
-func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON string) templateData {
+func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, defaultAgentVersion string) templateData {
 	var specRepave, statusRepave int64
 
 	var agent *v1alpha3.AgentSpec
@@ -239,6 +240,16 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 		if node.Status.Operations != nil {
 			statusRepave = node.Status.Operations.RepaveCounter
 		}
+	}
+
+	if defaultAgentVersion != "" && (agent == nil || agent.Version == "" && agent.URL == "") {
+		agentWithDefault := v1alpha3.AgentSpec{Version: defaultAgentVersion}
+		if agent != nil {
+			agentWithDefault = *agent
+			agentWithDefault.Version = defaultAgentVersion
+		}
+
+		agent = &agentWithDefault
 	}
 
 	return templateData{

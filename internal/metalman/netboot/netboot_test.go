@@ -773,6 +773,7 @@ func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
 		ClusterInfo{ApiserverURL: "https://k8s.example.com"},
 		"http://10.0.1.1:8080",
 		"",
+		"",
 	)
 
 	result, err := renderTemplate(string(grubTmpl), data)
@@ -966,6 +967,50 @@ func TestVendorDataTemplate_AgentInstallEnv(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("expected %q in rendered vendor-data, got:\n%s", want, body)
 		}
+	}
+}
+
+func TestNewTemplateData_DefaultAgentVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		agent   *v1alpha3.AgentSpec
+		wantEnv []string
+	}{
+		{
+			name:    "no agent",
+			wantEnv: []string{"AGENT_VERSION='v1.2.3-rc.1+build.5'"},
+		},
+		{
+			name:    "empty agent",
+			agent:   &v1alpha3.AgentSpec{},
+			wantEnv: []string{"AGENT_VERSION='v1.2.3-rc.1+build.5'"},
+		},
+		{
+			name:    "base URL uses default version",
+			agent:   &v1alpha3.AgentSpec{BaseURL: "https://mirror.example.com/releases"},
+			wantEnv: []string{"AGENT_VERSION='v1.2.3-rc.1+build.5'", "AGENT_BASE_URL='https://mirror.example.com/releases'"},
+		},
+		{
+			name:    "explicit version wins",
+			agent:   &v1alpha3.AgentSpec{Version: "v9.9.9"},
+			wantEnv: []string{"AGENT_VERSION='v9.9.9'"},
+		},
+		{
+			name:    "explicit URL suppresses default version",
+			agent:   &v1alpha3.AgentSpec{URL: "https://downloads.example.com/unbounded-agent.tgz"},
+			wantEnv: []string{"AGENT_URL='https://downloads.example.com/unbounded-agent.tgz'"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := &v1alpha3.Machine{
+				Spec: v1alpha3.MachineSpec{Agent: tt.agent},
+			}
+
+			data := newTemplateData(node, ClusterInfo{}, "", "{}", "v1.2.3-rc.1+build.5")
+			require.Equal(t, tt.wantEnv, data.InstallEnv)
+		})
 	}
 }
 

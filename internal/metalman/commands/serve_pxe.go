@@ -33,6 +33,7 @@ import (
 	metalmachineops "github.com/Azure/unbounded/internal/metalman/machineops"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 // DefaultNetbootImage is the default netboot OCI image used when a Machine
@@ -226,14 +227,15 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			resolver := netboot.FileResolver{
-				Cache:             ociCache,
-				Reader:            mgr.GetClient(),
-				Cluster:           clusterInfoWatcher,
-				ServeURL:          serveURL,
-				DefaultNetbootRef: defaultNetbootImage,
-				KubernetesVersion: kubeVersion,
-				ClusterDNS:        clusterDNS,
-				ProviderLabels:    providerLabels,
+				Cache:               ociCache,
+				Reader:              mgr.GetClient(),
+				Cluster:             clusterInfoWatcher,
+				ServeURL:            serveURL,
+				DefaultNetbootRef:   defaultNetbootImage,
+				DefaultAgentVersion: version.Version,
+				KubernetesVersion:   kubeVersion,
+				ClusterDNS:          clusterDNS,
+				ProviderLabels:      providerLabels,
 			}
 
 			if dhcpInterface != "" && dhcpAutoInterface {
