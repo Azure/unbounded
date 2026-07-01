@@ -20,6 +20,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,7 @@ import (
 	authzv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -61,6 +63,19 @@ const (
 	extensionAuthAllowedNamesKey = "requestheader-allowed-names"
 	remoteUserHeader             = "X-Remote-User"
 	remoteGroupHeader            = "X-Remote-Group"
+
+	runnerAppName        = "playpen-runner"
+	runnerComponent      = "runner"
+	runnerHostPortLabel  = "playpen.unbounded-cloud.io/host-port"
+	runnerContainerName  = "runner"
+	runnerWireGuardPort  = "wireguard"
+	runnerHTTPSPort      = "https"
+	runnerKubeFQDNAnnot  = "kubernetes.azure.com/set-kube-service-host-fqdn"
+	runnerDataMountPath  = "/var/lib/playpen-runner"
+	runnerWGMountPath    = "/etc/playpen/wireguard"
+	runnerKVMPath        = "/dev/kvm"
+	runnerTunPath        = "/dev/net/tun"
+	runnerHTTPSContainer = int32(8443)
 )
 
 type Operator struct {
@@ -407,7 +422,14 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 			continue
 		}
 
-		gatewayIP, nodePublicIP, err := o.gatewayForPod(ctx, pod.Spec.NodeName)
+		endpointPort, externalTrafficPolicy, err := endpointForPod(pod)
+		if err != nil {
+			unavailable = append(unavailable, err.Error())
+
+			continue
+		}
+
+		gatewayIP, nodePublicIP, err := o.gatewayForPod(ctx, pod)
 		if err != nil {
 			unavailable = append(unavailable, err.Error())
 
@@ -436,12 +458,7 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 			return resp, http.StatusOK, nil
 		}
 
-		service, err := o.ensureNodePortService(ctx, allocatedPod)
-		if err != nil {
-			return AllocResponse{}, http.StatusInternalServerError, err
-		}
-
-		resp, err := o.buildResponse(allocatedPod, gatewayIP, nodePublicIP, service, serverPublicKey)
+		resp, err := o.buildResponse(allocatedPod, gatewayIP, nodePublicIP, endpointPort, externalTrafficPolicy, serverPublicKey)
 		if err != nil {
 			return AllocResponse{}, http.StatusInternalServerError, err
 		}
@@ -450,7 +467,7 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 	}
 
 	if len(unavailable) > 0 {
-		return AllocResponse{}, http.StatusServiceUnavailable, fmt.Errorf("no idle playpen runner pods are available with an ExternalIP gateway: %s", strings.Join(unavailable, "; "))
+		return AllocResponse{}, http.StatusServiceUnavailable, fmt.Errorf("no idle playpen runner pods are available with hostPort endpoints on ExternalIP nodes: %s", strings.Join(unavailable, "; "))
 	}
 
 	if !matchingArchitecture {
@@ -490,8 +507,8 @@ func (o *Operator) ReconcileRunners(ctx context.Context) error {
 		return err
 	}
 
-	activePods := map[string]struct{}{}
 	now := time.Now()
+	remaining := make([]corev1.Pod, 0, len(pods.Items))
 
 	for i := range pods.Items {
 		pod := &pods.Items[i]
@@ -503,10 +520,198 @@ func (o *Operator) ReconcileRunners(ctx context.Context) error {
 			continue
 		}
 
-		activePods[pod.Name] = struct{}{}
+		remaining = append(remaining, *pod)
 	}
 
-	return o.deleteStaleServices(ctx, activePods)
+	return o.reconcileRunnerPool(ctx, remaining)
+}
+
+type runnerPoolTarget struct {
+	architecture string
+	count        int
+}
+
+func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod) error {
+	targets := []runnerPoolTarget{
+		{architecture: ArchitectureAMD64, count: o.Config.RunnerAMD64Count},
+		{architecture: ArchitectureARM64, count: o.Config.RunnerARM64Count},
+	}
+
+	if o.Config.RunnerWireGuardHostPortStart <= 0 || o.Config.RunnerWireGuardHostPortEnd < o.Config.RunnerWireGuardHostPortStart {
+		return fmt.Errorf("runner WireGuard hostPort range is invalid")
+	}
+
+	usedHostPorts := map[int32]struct{}{}
+	idleCounts := map[string]int{}
+
+	for i := range pods {
+		pod := &pods[i]
+		hostPort := podWireGuardHostPort(pod)
+		if hostPort != 0 {
+			usedHostPorts[hostPort] = struct{}{}
+		}
+
+		if pod.DeletionTimestamp.IsZero() && pod.Annotations[AnnotationIdempotencyKeyHash] == "" && hostPort != 0 {
+			idleCounts[podArchitecture(pod)]++
+		}
+	}
+
+	for _, target := range targets {
+		if target.count < 0 {
+			return fmt.Errorf("desired %s runner count must be non-negative", target.architecture)
+		}
+
+		for idleCounts[target.architecture] < target.count {
+			hostPort, ok := o.nextRunnerHostPort(usedHostPorts)
+			if !ok {
+				return fmt.Errorf("no free WireGuard hostPorts are available in range %d-%d", o.Config.RunnerWireGuardHostPortStart, o.Config.RunnerWireGuardHostPortEnd)
+			}
+
+			usedHostPorts[hostPort] = struct{}{}
+			pod := o.runnerPod(target.architecture, hostPort)
+			if err := o.Client.Create(ctx, pod); apierrors.IsAlreadyExists(err) {
+				continue
+			} else if err != nil {
+				return err
+			}
+
+			idleCounts[target.architecture]++
+		}
+	}
+
+	return nil
+}
+
+func (o *Operator) nextRunnerHostPort(used map[int32]struct{}) (int32, bool) {
+	for port := o.Config.RunnerWireGuardHostPortStart; port <= o.Config.RunnerWireGuardHostPortEnd; port++ {
+		if _, ok := used[port]; !ok {
+			return port, true
+		}
+	}
+
+	return 0, false
+}
+
+func (o *Operator) runnerPod(architecture string, hostPort int32) *corev1.Pod {
+	privileged := true
+	listenPort := int32(o.Config.Runner.WireGuard.ListenPort) //nolint:gosec // User-configured Kubernetes port.
+	hostPathCharDevice := corev1.HostPathCharDev
+	imagePullPolicy := corev1.PullPolicy(strings.TrimSpace(o.Config.RunnerImagePullPolicy))
+	if imagePullPolicy == "" {
+		imagePullPolicy = corev1.PullAlways
+	}
+	volumeMounts := []corev1.VolumeMount{
+		{Name: "data", MountPath: runnerDataMountPath},
+		{Name: "wireguard", MountPath: runnerWGMountPath},
+		{Name: "tun", MountPath: runnerTunPath},
+	}
+	volumes := []corev1.Volume{
+		{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: "wireguard", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: "tun", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: runnerTunPath, Type: &hostPathCharDevice}}},
+	}
+	if o.Config.RunnerRequireKVM {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "kvm", MountPath: runnerKVMPath})
+		volumes = append(volumes, corev1.Volume{Name: "kvm", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: runnerKVMPath, Type: &hostPathCharDevice}}})
+	}
+
+	var tolerations []corev1.Toleration
+	if o.Config.RunnerControlPlaneToleration {
+		tolerations = []corev1.Toleration{
+			{Key: "node-role.kubernetes.io/control-plane", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+			{Key: "node-role.kubernetes.io/master", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+		}
+	}
+
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      runnerPodName(architecture, hostPort),
+			Namespace: o.Config.RunnerNamespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":      runnerAppName,
+				"app.kubernetes.io/component": runnerComponent,
+				LabelArchitecture:             architecture,
+				runnerHostPortLabel:           strconv.FormatInt(int64(hostPort), 10),
+			},
+			Annotations: map[string]string{
+				runnerKubeFQDNAnnot: "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			ServiceAccountName: o.Config.RunnerServiceAccountName,
+			RestartPolicy:      corev1.RestartPolicyAlways,
+			Tolerations:        tolerations,
+			NodeSelector: map[string]string{
+				"kubernetes.io/arch": architecture,
+			},
+			Containers: []corev1.Container{
+				{
+					Name:            runnerContainerName,
+					Image:           o.Config.RunnerImage,
+					ImagePullPolicy: imagePullPolicy,
+					Command:         []string{"/unbounded/bin/playpen-runner"},
+					Args: []string{
+						"--architecture=" + architecture,
+						"--wireguard-private-key-file=" + runnerWGMountPath + "/privatekey",
+						"--wireguard-listen-port=" + strconv.Itoa(o.Config.Runner.WireGuard.ListenPort),
+					},
+					Env: []corev1.EnvVar{
+						{
+							Name: "POD_NAME",
+							ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "metadata.name",
+							}},
+						},
+						{
+							Name: "POD_NAMESPACE",
+							ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "metadata.namespace",
+							}},
+						},
+					},
+					Ports: []corev1.ContainerPort{
+						{
+							Name:          runnerHTTPSPort,
+							Protocol:      corev1.ProtocolTCP,
+							ContainerPort: runnerHTTPSContainer,
+						},
+						{
+							Name:          runnerWireGuardPort,
+							Protocol:      corev1.ProtocolUDP,
+							ContainerPort: listenPort,
+							HostPort:      hostPort,
+						},
+					},
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("500m"),
+							corev1.ResourceMemory: resource.MustParse("1Gi"),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("4"),
+							corev1.ResourceMemory: resource.MustParse("8Gi"),
+						},
+					},
+					LivenessProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+							Path:   "/healthz",
+							Port:   intstr.FromString(runnerHTTPSPort),
+							Scheme: corev1.URISchemeHTTPS,
+						}},
+						InitialDelaySeconds: 10,
+						PeriodSeconds:       10,
+					},
+					SecurityContext: &corev1.SecurityContext{Privileged: &privileged},
+					VolumeMounts:    volumeMounts,
+				},
+			},
+			Volumes: volumes,
+		},
+	}
+}
+
+func runnerPodName(architecture string, hostPort int32) string {
+	return fmt.Sprintf("playpen-runner-%s-%d", architecture, hostPort)
 }
 
 func (o *Operator) EnsureTLSSecret(ctx context.Context) (tls.Certificate, error) {
@@ -890,74 +1095,29 @@ func (o *Operator) responseForPod(ctx context.Context, pod *corev1.Pod) (AllocRe
 		return AllocResponse{}, err
 	}
 
-	gatewayIP, nodePublicIP, err := o.gatewayForPod(ctx, pod.Spec.NodeName)
+	gatewayIP, nodePublicIP, err := o.gatewayForPod(ctx, pod)
 	if err != nil {
 		return AllocResponse{}, err
 	}
 
-	service, err := o.ensureNodePortService(ctx, pod)
+	endpointPort, externalTrafficPolicy, err := endpointForPod(pod)
 	if err != nil {
 		return AllocResponse{}, err
 	}
 
-	return o.buildResponse(pod, gatewayIP, nodePublicIP, service, serverPublicKey)
+	return o.buildResponse(pod, gatewayIP, nodePublicIP, endpointPort, externalTrafficPolicy, serverPublicKey)
 }
 
-func (o *Operator) ensureNodePortService(ctx context.Context, pod *corev1.Pod) (*corev1.Service, error) {
-	name := serviceNameForPod(pod)
-	service := &corev1.Service{}
-
-	key := types.NamespacedName{Namespace: pod.Namespace, Name: name}
-	if err := o.Client.Get(ctx, key, service); err == nil {
-		return service, nil
-	} else if !apierrors.IsNotFound(err) {
-		return nil, err
+func endpointForPod(pod *corev1.Pod) (int32, string, error) {
+	if hostPort := podWireGuardHostPort(pod); hostPort != 0 {
+		return hostPort, "HostPort", nil
 	}
 
-	service = &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: pod.Namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/name":         "playpen-runner",
-				"app.kubernetes.io/component":    "runner-nodeport",
-				"playpen.unbounded-cloud.io/pod": pod.Name,
-			},
-		},
-		Spec: corev1.ServiceSpec{
-			Type:                  corev1.ServiceTypeNodePort,
-			ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyCluster,
-			Selector: map[string]string{
-				LabelAllocated: allocationIDForPod(pod),
-			},
-			Ports: []corev1.ServicePort{
-				{
-					Name:       "wireguard",
-					Protocol:   corev1.ProtocolUDP,
-					Port:       int32(o.Config.Runner.WireGuard.ListenPort), //nolint:gosec // User-configured Kubernetes port.
-					TargetPort: intstr.FromInt(o.Config.Runner.WireGuard.ListenPort),
-				},
-			},
-		},
-	}
-	if err := o.Client.Create(ctx, service); apierrors.IsAlreadyExists(err) {
-		if err := o.Client.Get(ctx, key, service); err != nil {
-			return nil, err
-		}
-	} else if err != nil {
-		return nil, err
-	}
-
-	return service, nil
+	return 0, "", fmt.Errorf("runner pod %s/%s has no WireGuard hostPort", pod.Namespace, pod.Name)
 }
 
-func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string, service *corev1.Service, serverPublicKey string) (AllocResponse, error) {
+func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string, endpointPort int32, externalTrafficPolicy, serverPublicKey string) (AllocResponse, error) {
 	runnerCfg := o.Config.Runner
-
-	nodePort := int32(0)
-	if len(service.Spec.Ports) > 0 {
-		nodePort = service.Spec.Ports[0].NodePort
-	}
 
 	serverWG, err := runnerAddressIP(runnerCfg.WireGuard.ServerAddress)
 	if err != nil {
@@ -984,8 +1144,8 @@ func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string
 		},
 		Endpoint: EndpointResponse{
 			Host:                  gatewayIP,
-			WireGuardUDPPort:      nodePort,
-			ExternalTrafficPolicy: string(service.Spec.ExternalTrafficPolicy),
+			WireGuardUDPPort:      endpointPort,
+			ExternalTrafficPolicy: externalTrafficPolicy,
 		},
 		WireGuard: WireGuardResponse{
 			Interface:       runnerCfg.WireGuard.Interface,
@@ -1049,53 +1209,34 @@ func serverWireGuardPublicKeyForPod(pod *corev1.Pod) (string, error) {
 	return serverPublicKey, nil
 }
 
-func (o *Operator) gatewayForPod(ctx context.Context, nodeName string) (string, string, error) {
-	if nodeName == "" {
+func podWireGuardHostPort(pod *corev1.Pod) int32 {
+	for _, container := range pod.Spec.Containers {
+		for _, port := range container.Ports {
+			if port.Protocol == corev1.ProtocolUDP && port.HostPort != 0 && port.Name == "wireguard" {
+				return port.HostPort
+			}
+		}
+	}
+
+	return 0
+}
+
+func (o *Operator) gatewayForPod(ctx context.Context, pod *corev1.Pod) (string, string, error) {
+	if pod.Spec.NodeName == "" {
 		return "", "", fmt.Errorf("runner pod is not scheduled")
 	}
 
 	node := &corev1.Node{}
-	if err := o.Client.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+	if err := o.Client.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, node); err != nil {
 		return "", "", err
 	}
 
 	nodePublicIP := nodeExternalIP(node)
-	if nodePublicIP != "" {
-		return nodePublicIP, nodePublicIP, nil
+	if nodePublicIP == "" {
+		return "", "", fmt.Errorf("runner pod %s/%s is on node %s with no ExternalIP", pod.Namespace, pod.Name, pod.Spec.NodeName)
 	}
 
-	gatewayIP, err := o.randomNodeExternalIP(ctx)
-	if err != nil {
-		return "", "", err
-	}
-
-	return gatewayIP, "", nil
-}
-
-func (o *Operator) randomNodeExternalIP(ctx context.Context) (string, error) {
-	nodes := &corev1.NodeList{}
-	if err := o.Client.List(ctx, nodes); err != nil {
-		return "", err
-	}
-
-	var gatewayIPs []string
-
-	for i := range nodes.Items {
-		if ip := nodeExternalIP(&nodes.Items[i]); ip != "" {
-			gatewayIPs = append(gatewayIPs, ip)
-		}
-	}
-
-	if len(gatewayIPs) == 0 {
-		return "", fmt.Errorf("no nodes have ExternalIP addresses")
-	}
-
-	index, err := rand.Int(rand.Reader, big.NewInt(int64(len(gatewayIPs))))
-	if err != nil {
-		return "", err
-	}
-
-	return gatewayIPs[index.Int64()], nil
+	return nodePublicIP, nodePublicIP, nil
 }
 
 func nodeExternalIP(node *corev1.Node) string {
@@ -1108,40 +1249,7 @@ func nodeExternalIP(node *corev1.Node) string {
 	return ""
 }
 
-func (o *Operator) deleteStaleServices(ctx context.Context, activePods map[string]struct{}) error {
-	services := &corev1.ServiceList{}
-	if err := o.Client.List(ctx, services, client.InNamespace(o.Config.RunnerNamespace), client.MatchingLabels{"app.kubernetes.io/component": "runner-nodeport"}); err != nil {
-		return err
-	}
-
-	for i := range services.Items {
-		service := &services.Items[i]
-
-		podName := service.Labels["playpen.unbounded-cloud.io/pod"]
-		if _, ok := activePods[podName]; ok {
-			continue
-		}
-
-		if err := o.Client.Delete(ctx, service); err != nil && !apierrors.IsNotFound(err) {
-			return err
-		}
-	}
-
-	return nil
-}
-
 func (o *Operator) deleteRunnerPod(ctx context.Context, pod *corev1.Pod) error {
-	service := &corev1.Service{}
-
-	serviceKey := types.NamespacedName{Namespace: pod.Namespace, Name: serviceNameForPod(pod)}
-	if err := o.Client.Get(ctx, serviceKey, service); err == nil {
-		if err := o.Client.Delete(ctx, service); err != nil && !apierrors.IsNotFound(err) {
-			return err
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return err
-	}
-
 	if err := o.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
@@ -1201,10 +1309,6 @@ func selfSignedCert(commonName string, hosts []string) ([]byte, []byte, error) {
 
 func allocationIDForPod(pod *corev1.Pod) string {
 	return hashString(pod.Namespace + "/" + pod.Name)[:16]
-}
-
-func serviceNameForPod(pod *corev1.Pod) string {
-	return "playpen-runner-" + hashString(pod.Namespace + "/" + pod.Name)[:16]
 }
 
 func hashString(value string) string {

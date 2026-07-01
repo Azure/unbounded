@@ -8,23 +8,33 @@ on:
     paths:
       - cmd/agent/**
       - cmd/metalman/**
+      - cmd/kubectl-unbounded/**
       - internal/metalman/**
+      - internal/playpen/**
+      - e2e/metalman/**
       - api/machina/v1alpha3/**
-      - deploy/machina/crd/**
+      - deploy/machina/**
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
+      - hack/smoke-metalman-e2e.sh
+      - Makefile
   push:
     branches: [main]
     paths:
       - cmd/agent/**
       - cmd/metalman/**
+      - cmd/kubectl-unbounded/**
       - internal/metalman/**
+      - internal/playpen/**
+      - e2e/metalman/**
       - api/machina/v1alpha3/**
-      - deploy/machina/crd/**
+      - deploy/machina/**
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
+      - hack/smoke-metalman-e2e.sh
+      - Makefile
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
@@ -35,107 +45,49 @@ permissions:
 jobs:
   smoke:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
-      - name: Free disk space
-        run: |
-          # GitHub-hosted runners have ~14 GB free; the smoke test needs
-          # much more because it builds two Docker images (one containing a
-          # full Ubuntu cloud image) and creates a 20 GB qcow2 VM disk that
-          # grows dynamically.  Remove the largest pre-installed toolchains
-          # in parallel and prune unused Docker images.
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet \
-                      /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL &
-          sudo docker image prune -af &
-          wait
-          df -h /
-
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
+          cache-dependency-path: go.sum
 
-      - name: Cache apt packages
-        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
-        with:
-          path: /var/cache/apt/archives
-          key: apt-smoke-noble-${{ hashFiles('.github/workflows/smoke-metalman.yaml') }}
-          restore-keys: apt-smoke-noble-
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet \
+                      /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h /
 
-      - name: Install system dependencies
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.30.0
+
+      - name: Install network prerequisites
         run: |
           sudo apt-get update
-          # Install sushy-tools via pip in the background while apt-get
-          # installs system packages.  pip3 is already available on the
-          # runner image so this does not depend on apt-get.
-          sudo pip3 install --break-system-packages --ignore-installed sushy-tools &
-          PIP_PID=$!
           sudo apt-get install -y --no-install-recommends \
-            dnsmasq qemu-kvm libvirt-daemon-system libvirt-clients virtinst \
-            ovmf qemu-utils swtpm swtpm-tools \
-            python3-pip python3-yaml cpio iptables
-          sudo systemctl start libvirtd
-          wait "$PIP_PID"
+            bridge-utils iproute2 iptables python3 tar wireguard-tools
+          sudo modprobe wireguard || true
+          ip -V
+          wg --version
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
-        with:
-          driver-opts: network=host
-
-      - name: Build host-ubuntu2404 image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          file: images/host-ubuntu2404/Containerfile
-          load: true
-          tags: localhost:5555/unbounded/host-ubuntu2404:smoke
-          cache-from: type=gha,scope=host-ubuntu2404
-          cache-to: type=gha,mode=max,scope=host-ubuntu2404
-          provenance: false
-
-      - name: Build netboot image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          file: images/netboot/Containerfile
-          load: true
-          tags: localhost:5555/unbounded/netboot:smoke
-          cache-from: type=gha,scope=netboot
-          cache-to: type=gha,mode=max,scope=netboot
-          provenance: false
-
-      - name: Build agent-ubuntu2404 image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: images/agent-ubuntu2404
-          file: images/agent-ubuntu2404/Containerfile
-          load: true
-          tags: localhost:5555/unbounded/agent-ubuntu2404:smoke
-          cache-from: type=gha,scope=agent-ubuntu2404
-          cache-to: type=gha,mode=max,scope=agent-ubuntu2404
-          provenance: false
-
-      - name: Create kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
-        with:
-          cluster_name: kind
-          # The smoke test assigns 192.168.200.2 (KIND_SMOKE_IP) to the kind
-          # container on virbr-smoke and rewrites the apiserver URL to that IP.
-          # Include it as an extra SAN so the kubelet in the VM can verify the
-          # API server TLS certificate.
-          config: hack/kind-smoke-config.yaml
-
-      - name: Run smoke test
+      - name: Write Playpen kubeconfig
+        env:
+          PLAYPEN_KUBECONFIG_B64: ${{ secrets.PLAYPEN_KUBECONFIG_B64 }}
         run: |
-          sudo mkdir -p /root/.kube
-          sudo cp "${KUBECONFIG:-$HOME/.kube/config}" /root/.kube/config
-          sudo -E env "PATH=$PATH" \
-            python3 hack/smoke-metalman.py
+          if [ -z "${PLAYPEN_KUBECONFIG_B64}" ]; then
+            echo "PLAYPEN_KUBECONFIG_B64 secret is required for metalman smoke" >&2
+            exit 1
+          fi
+          mkdir -p "${HOME}/.kube"
+          printf '%s' "${PLAYPEN_KUBECONFIG_B64}" | base64 -d > "${HOME}/.kube/config.bench"
+          chmod 0600 "${HOME}/.kube/config.bench"
+
+      - name: Run Go smoke test
+        env:
+          METALMAN_E2E_ARTIFACT_MODE: local
+        run: |
+          ./hack/smoke-metalman-e2e.sh

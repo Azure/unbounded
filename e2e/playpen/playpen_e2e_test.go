@@ -25,7 +25,6 @@ import (
 	"testing"
 	"time"
 
-	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -87,10 +86,6 @@ func (t operatorTransport) allocate(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return jsonResponse(req, status, map[string]string{"error": err.Error()})
 	}
-	// The e2e runner uses host networking, so target the runner's WireGuard
-	// socket directly instead of adding kube-proxy NodePort behavior to this test.
-	allocResp.Endpoint.WireGuardUDPPort = int32(allocResp.WireGuard.ListenPort)
-
 	return jsonResponse(req, status, allocResp)
 }
 
@@ -183,7 +178,6 @@ func TestPlaypenBasicLifecycle(t *testing.T) {
 	}
 
 	h.waitForPodAnnotation(ctx, allocated.Metadata.Pod.Name, operator.AnnotationIdempotencyKeyHash, true)
-	h.waitForRunnerService(ctx, allocated.Metadata.Pod.Name, true)
 
 	if err := allocated.ConfigureTunnel(ctx); err != nil {
 		t.Fatalf("configure tunnel: %v", err)
@@ -197,7 +191,6 @@ func TestPlaypenBasicLifecycle(t *testing.T) {
 	}
 
 	h.waitForPodDeleted(ctx, allocated.Metadata.Pod.Name)
-	h.waitForRunnerService(ctx, allocated.Metadata.Pod.Name, false)
 }
 
 func newHarness(t *testing.T) *harness {
@@ -358,6 +351,11 @@ func (h *harness) renderManifests(ctx context.Context) {
 		"--output-dir", manifestDir,
 		"--set", "Namespace="+namespace,
 		"--set", "PlaypenImage="+imageTag,
+		"--set", "RunnerImagePullPolicy=IfNotPresent",
+		"--set", "RunnerAMD64Count=1",
+		"--set", "RunnerARM64Count=0",
+		"--set", "RunnerRequireKVM=false",
+		"--set", "RunnerControlPlaneTolerations=true",
 	); err != nil {
 		h.t.Fatalf("render playpen manifests: %v", err)
 	}
@@ -370,67 +368,6 @@ func (h *harness) applyManifests(ctx context.Context) {
 	if err := h.run(ctx, "kubectl", "apply", "-f", manifestDir); err != nil {
 		h.t.Fatalf("apply playpen manifests: %v", err)
 	}
-
-	h.patchDeploymentJSON(ctx, "playpen-runner-amd64", []map[string]any{
-		{
-			"op":    "add",
-			"path":  "/spec/template/spec/tolerations",
-			"value": controlPlaneTolerations(),
-		},
-		{
-			"op":    "add",
-			"path":  "/spec/template/spec/hostNetwork",
-			"value": true,
-		},
-		{
-			"op":    "add",
-			"path":  "/spec/template/spec/dnsPolicy",
-			"value": "ClusterFirstWithHostNet",
-		},
-		{
-			"op":    "replace",
-			"path":  "/spec/template/spec/containers/0/imagePullPolicy",
-			"value": "IfNotPresent",
-		},
-		{
-			"op":   "replace",
-			"path": "/spec/template/spec/containers/0/args",
-			"value": []string{
-				"--architecture=amd64",
-				"--wireguard-private-key-file=/etc/playpen/wireguard/privatekey",
-				"--wireguard-listen-port=51820",
-			},
-		},
-		{
-			"op":   "replace",
-			"path": "/spec/template/spec/containers/0/env",
-			"value": []map[string]any{
-				{"name": "POD_NAME", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.name"}}},
-				{"name": "POD_NAMESPACE", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.namespace"}}},
-				{"name": "KUBERNETES_SERVICE_HOST", "value": h.controlPlaneIP(ctx)},
-				{"name": "KUBERNETES_SERVICE_PORT", "value": "6443"},
-				{"name": "KUBERNETES_SERVICE_PORT_HTTPS", "value": "6443"},
-			},
-		},
-		{
-			"op":   "replace",
-			"path": "/spec/template/spec/containers/0/volumeMounts",
-			"value": []map[string]any{
-				{"name": "data", "mountPath": "/var/lib/playpen-runner"},
-				{"name": "wireguard", "mountPath": "/etc/playpen/wireguard"},
-				{"name": "tun", "mountPath": "/dev/net/tun"},
-			},
-		},
-		{
-			"op":   "replace",
-			"path": "/spec/template/spec/volumes",
-			"value": []map[string]any{
-				{"name": "data", "emptyDir": map[string]any{}},
-				{"name": "wireguard", "emptyDir": map[string]any{}},
-				{"name": "tun", "hostPath": map[string]any{"path": "/dev/net/tun", "type": "CharDevice"}},
-			},
-		},
-	})
 
 	operatorPatch := map[string]any{
 		"spec": map[string]any{
@@ -451,10 +388,6 @@ func (h *harness) applyManifests(ctx context.Context) {
 		},
 	}
 	h.patchDeployment(ctx, "playpen-operator", operatorPatch)
-
-	zero := int32(0)
-	scale := autoscaleScale("playpen-runner-arm64", zero)
-	_, _ = h.kubeClient.AppsV1().Deployments(namespace).UpdateScale(ctx, "playpen-runner-arm64", &scale, metav1.UpdateOptions{})
 }
 
 func controlPlaneTolerations() []map[string]any {
@@ -472,10 +405,6 @@ func controlPlaneTolerations() []map[string]any {
 	}
 }
 
-func autoscaleScale(name string, replicas int32) autoscalingv1.Scale {
-	return autoscalingv1.Scale{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}, Spec: autoscalingv1.ScaleSpec{Replicas: replicas}}
-}
-
 func (h *harness) patchDeployment(ctx context.Context, name string, patch map[string]any) {
 	h.t.Helper()
 
@@ -485,19 +414,6 @@ func (h *harness) patchDeployment(ctx context.Context, name string, patch map[st
 	}
 
 	if _, err := h.kubeClient.AppsV1().Deployments(namespace).Patch(ctx, name, types.StrategicMergePatchType, data, metav1.PatchOptions{}); err != nil {
-		h.t.Fatalf("patch deployment %s: %v", name, err)
-	}
-}
-
-func (h *harness) patchDeploymentJSON(ctx context.Context, name string, patch []map[string]any) {
-	h.t.Helper()
-
-	data, err := json.Marshal(patch)
-	if err != nil {
-		h.t.Fatalf("marshal deployment json patch: %v", err)
-	}
-
-	if _, err := h.kubeClient.AppsV1().Deployments(namespace).Patch(ctx, name, types.JSONPatchType, data, metav1.PatchOptions{}); err != nil {
 		h.t.Fatalf("patch deployment %s: %v", name, err)
 	}
 }
@@ -581,7 +497,7 @@ func (h *harness) controlPlaneIP(ctx context.Context) string {
 func (h *harness) waitForRollouts(ctx context.Context) {
 	h.t.Helper()
 
-	for _, name := range []string{"playpen-operator", "playpen-runner-amd64"} {
+	for _, name := range []string{"playpen-operator"} {
 		if err := h.run(ctx, "kubectl", "rollout", "status", "deployment/"+name, "-n", namespace, "--timeout=180s"); err != nil {
 			h.dumpDiagnostics(context.Background())
 			h.t.Fatalf("rollout %s: %v", name, err)
@@ -648,29 +564,6 @@ func (h *harness) waitForPodAnnotation(ctx context.Context, podName, annotation 
 		return present == wantPresent, nil
 	}); err != nil {
 		h.t.Fatalf("wait for pod %s annotation %s presence=%t: %v", podName, annotation, wantPresent, err)
-	}
-}
-
-func (h *harness) waitForRunnerService(ctx context.Context, podName string, wantPresent bool) {
-	h.t.Helper()
-
-	if err := wait(ctx, 90*time.Second, func(ctx context.Context) (bool, error) {
-		services, err := h.kubeClient.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app.kubernetes.io/component=runner-nodeport"})
-		if err != nil {
-			return false, nil
-		}
-
-		present := false
-
-		for _, service := range services.Items {
-			if service.Labels["playpen.unbounded-cloud.io/pod"] == podName {
-				present = true
-			}
-		}
-
-		return present == wantPresent, nil
-	}); err != nil {
-		h.t.Fatalf("wait for runner service pod=%s presence=%t: %v", podName, wantPresent, err)
 	}
 }
 
@@ -892,7 +785,7 @@ func (h *harness) dumpDiagnostics(ctx context.Context) {
 		{"get", "pods", "-n", namespace, "-o", "wide"},
 		{"describe", "pods", "-n", namespace},
 		{"logs", "-n", namespace, "deployment/playpen-operator"},
-		{"logs", "-n", namespace, "deployment/playpen-runner-amd64"},
+		{"logs", "-n", namespace, "-l", "app.kubernetes.io/name=playpen-runner", "--tail=200"},
 		{"get", "apiservice", "v1alpha1.playpen.unbounded-cloud.io", "-o", "yaml"},
 	} {
 		out, err := h.runOut(ctx, "kubectl", args...)

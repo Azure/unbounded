@@ -32,6 +32,15 @@ spec:
             - --service-name=playpen-operator
             - --runner-namespace={{ default "playpen" .Namespace }}
             - --runner-label-selector=app.kubernetes.io/name=playpen-runner
+            - --runner-image={{ default (default "ghcr.io/azure/playpen:latest" .PlaypenImage) .RunnerImage }}
+            - --runner-image-pull-policy={{ default "Always" .RunnerImagePullPolicy }}
+            - --runner-service-account-name=playpen-runner
+            - --runner-amd64-count={{ default "2" .RunnerAMD64Count }}
+            - --runner-arm64-count={{ default "2" .RunnerARM64Count }}
+            - --runner-wireguard-host-port-start={{ default "51820" .RunnerWireGuardHostPortStart }}
+            - --runner-wireguard-host-port-end={{ default "51899" .RunnerWireGuardHostPortEnd }}
+            - --runner-require-kvm={{ default "true" .RunnerRequireKVM }}
+            - --runner-control-plane-tolerations={{ default "false" .RunnerControlPlaneTolerations }}
             - --playpen-ttl={{ default "1h" .PlaypenTTL }}
           ports:
             - containerPort: 8443

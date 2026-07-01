@@ -31,7 +31,7 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-func TestAllocAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
+func TestAllocAllocatesRunnerWithHostPortEndpoint(t *testing.T) {
 	op := testOperator(t,
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
@@ -59,8 +59,12 @@ func TestAllocAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
 		t.Fatalf("pod architecture = %q, want %q", resp.Pod.Architecture, ArchitectureAMD64)
 	}
 
-	if resp.Endpoint.ExternalTrafficPolicy != string(corev1.ServiceExternalTrafficPolicyCluster) {
-		t.Fatalf("externalTrafficPolicy = %q, want Cluster", resp.Endpoint.ExternalTrafficPolicy)
+	if resp.Endpoint.WireGuardUDPPort == 0 {
+		t.Fatal("endpoint WireGuard UDP port is empty")
+	}
+
+	if resp.Endpoint.ExternalTrafficPolicy != "HostPort" {
+		t.Fatalf("externalTrafficPolicy = %q, want HostPort", resp.Endpoint.ExternalTrafficPolicy)
 	}
 
 	if resp.WireGuard.ServerPublicKey == "" {
@@ -96,34 +100,57 @@ func TestAllocAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
 		t.Fatal("pod allocation label is empty")
 	}
 
-	services := &corev1.ServiceList{}
-	if err := op.Client.List(t.Context(), services, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/component": "runner-nodeport"}); err != nil {
-		t.Fatal(err)
+}
+
+func TestAllocPrefersRunnerHostPortOnNodeExternalIP(t *testing.T) {
+	op := testOperator(t,
+		testNode("node-1", "20.30.40.50"),
+		testPodWithHostPort("runner-1", "node-1", 51821),
+	)
+
+	resp, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	if err != nil {
+		t.Fatalf("alloc: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+	if resp.Endpoint.Host != "20.30.40.50" {
+		t.Fatalf("endpoint host = %q, want runner node external IP", resp.Endpoint.Host)
+	}
+	if got, want := resp.Endpoint.WireGuardUDPPort, int32(51821); got != want {
+		t.Fatalf("endpoint port = %d, want host port %d", got, want)
+	}
+	if resp.Endpoint.ExternalTrafficPolicy != "HostPort" {
+		t.Fatalf("externalTrafficPolicy = %q, want HostPort", resp.Endpoint.ExternalTrafficPolicy)
 	}
 
-	if len(services.Items) != 1 {
-		t.Fatalf("services = %d, want 1", len(services.Items))
+}
+
+func TestAllocUsesDistinctHostPortsForMultiplePodsOnSameNode(t *testing.T) {
+	op := testOperator(t,
+		testNode("node-1", "20.30.40.50"),
+		testPodWithHostPort("runner-1", "node-1", 51821),
+		testPodWithHostPort("runner-2", "node-1", 51822),
+	)
+
+	first, status, err := op.Alloc(t.Context(), "alloc-key-1", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("first alloc status=%d err=%v", status, err)
+	}
+	second, status, err := op.Alloc(t.Context(), "alloc-key-2", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("second alloc status=%d err=%v", status, err)
 	}
 
-	service := services.Items[0]
-	if service.Spec.Type != corev1.ServiceTypeNodePort {
-		t.Fatalf("service type = %s, want NodePort", service.Spec.Type)
+	if first.Pod.Name == second.Pod.Name {
+		t.Fatalf("second alloc reused pod %q", second.Pod.Name)
 	}
-
-	if service.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyCluster {
-		t.Fatalf("service externalTrafficPolicy = %s, want Cluster", service.Spec.ExternalTrafficPolicy)
+	if first.Endpoint.Host != "20.30.40.50" || second.Endpoint.Host != "20.30.40.50" {
+		t.Fatalf("endpoints used unexpected hosts: first=%q second=%q", first.Endpoint.Host, second.Endpoint.Host)
 	}
-
-	if service.Spec.Selector[LabelAllocated] != pod.Labels[LabelAllocated] {
-		t.Fatalf("service selector does not match allocated pod")
-	}
-
-	if len(service.Spec.Ports) != 1 {
-		t.Fatalf("service ports = %d, want only the WireGuard port", len(service.Spec.Ports))
-	}
-
-	if service.Spec.Ports[0].Name != "wireguard" || service.Spec.Ports[0].Protocol != corev1.ProtocolUDP {
-		t.Fatalf("service port = %#v, want only WireGuard UDP", service.Spec.Ports[0])
+	if first.Endpoint.WireGuardUDPPort == second.Endpoint.WireGuardUDPPort {
+		t.Fatalf("allocs reused host port %d", first.Endpoint.WireGuardUDPPort)
 	}
 }
 
@@ -251,28 +278,29 @@ func TestAllocIdempotencyIncludesArchitecture(t *testing.T) {
 	}
 }
 
-func TestAllocUsesOtherNodeExternalIPWhenRunnerNodeIsPrivate(t *testing.T) {
+func TestAllocRequiresRunnerNodeExternalIP(t *testing.T) {
 	op := testOperator(t,
 		testNode("private-node", ""),
 		testNode("gateway-node", "20.30.40.50"),
 		testPod("runner-1", "private-node", nil),
 	)
 
-	resp, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
-	if err != nil {
-		t.Fatalf("alloc: %v", err)
+	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	if err == nil {
+		t.Fatal("alloc succeeded when runner node had no ExternalIP")
 	}
 
-	if status != http.StatusOK {
-		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", status, http.StatusServiceUnavailable)
 	}
 
-	if resp.Endpoint.Host != "20.30.40.50" {
-		t.Fatalf("endpoint host = %q, want gateway node external ip", resp.Endpoint.Host)
+	pod := &corev1.Pod{}
+	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err != nil {
+		t.Fatal(err)
 	}
 
-	if resp.Pod.NodePublicIP != "" {
-		t.Fatalf("pod node public ip = %q, want empty", resp.Pod.NodePublicIP)
+	if pod.Annotations[AnnotationIdempotencyKeyHash] != "" {
+		t.Fatal("pod was allocated despite missing runner node ExternalIP")
 	}
 }
 
@@ -382,7 +410,7 @@ func TestAllocUsesPodScopedServerWireGuardPublicKey(t *testing.T) {
 	}
 }
 
-func TestDeallocDeletesClaimedRunnerAndService(t *testing.T) {
+func TestDeallocDeletesClaimedRunner(t *testing.T) {
 	op := testOperator(t,
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
@@ -405,15 +433,6 @@ func TestDeallocDeletesClaimedRunnerAndService(t *testing.T) {
 	pod := &corev1.Pod{}
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err == nil {
 		t.Fatal("allocated pod still exists after dealloc")
-	}
-
-	services := &corev1.ServiceList{}
-	if err := op.Client.List(t.Context(), services, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/component": "runner-nodeport"}); err != nil {
-		t.Fatal(err)
-	}
-
-	if len(services.Items) != 0 {
-		t.Fatalf("services = %d, want 0", len(services.Items))
 	}
 }
 
@@ -615,6 +634,98 @@ func TestReconcileDeletesClaimWithInvalidClaimedAt(t *testing.T) {
 	}
 }
 
+func TestReconcileCreatesIdleRunnerPodsWithUniqueHostPorts(t *testing.T) {
+	op := testOperator(t)
+	op.Config.RunnerAMD64Count = 2
+	op.Config.RunnerARM64Count = 1
+	op.Config.RunnerWireGuardHostPortStart = 52000
+	op.Config.RunnerWireGuardHostPortEnd = 52002
+
+	if err := op.ReconcileRunners(t.Context()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	pods := &corev1.PodList{}
+	if err := op.Client.List(t.Context(), pods, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/name": "playpen-runner"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pods.Items) != 3 {
+		t.Fatalf("pods = %d, want 3", len(pods.Items))
+	}
+
+	hostPorts := map[int32]struct{}{}
+	counts := map[string]int{}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		hostPort := podWireGuardHostPort(pod)
+		if hostPort < 52000 || hostPort > 52002 {
+			t.Fatalf("pod %s hostPort = %d, want in range", pod.Name, hostPort)
+		}
+		if _, ok := hostPorts[hostPort]; ok {
+			t.Fatalf("duplicate hostPort %d", hostPort)
+		}
+		hostPorts[hostPort] = struct{}{}
+		counts[podArchitecture(pod)]++
+
+		if pod.Spec.ServiceAccountName != "playpen-runner" {
+			t.Fatalf("pod %s serviceAccount = %q", pod.Name, pod.Spec.ServiceAccountName)
+		}
+		if pod.Spec.NodeSelector["kubernetes.io/arch"] != podArchitecture(pod) {
+			t.Fatalf("pod %s node selector = %#v", pod.Name, pod.Spec.NodeSelector)
+		}
+	}
+
+	if counts[ArchitectureAMD64] != 2 || counts[ArchitectureARM64] != 1 {
+		t.Fatalf("counts = %#v, want amd64=2 arm64=1", counts)
+	}
+}
+
+func TestReconcileSkipsUsedRunnerHostPorts(t *testing.T) {
+	existing := testPodWithHostPort("existing-runner", "node-1", 52000)
+	op := testOperator(t, existing)
+	op.Config.RunnerAMD64Count = 2
+	op.Config.RunnerARM64Count = 0
+	op.Config.RunnerWireGuardHostPortStart = 52000
+	op.Config.RunnerWireGuardHostPortEnd = 52001
+
+	if err := op.ReconcileRunners(t.Context()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	pods := &corev1.PodList{}
+	if err := op.Client.List(t.Context(), pods, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/name": "playpen-runner"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pods.Items) != 2 {
+		t.Fatalf("pods = %d, want 2", len(pods.Items))
+	}
+
+	seen := map[int32]struct{}{}
+	for i := range pods.Items {
+		seen[podWireGuardHostPort(&pods.Items[i])] = struct{}{}
+	}
+	if _, ok := seen[52000]; !ok {
+		t.Fatal("existing hostPort 52000 was not preserved")
+	}
+	if _, ok := seen[52001]; !ok {
+		t.Fatal("new runner did not use next free hostPort 52001")
+	}
+}
+
+func TestReconcileReportsNoFreeRunnerHostPorts(t *testing.T) {
+	op := testOperator(t, testPodWithHostPort("existing-runner", "node-1", 52000))
+	op.Config.RunnerAMD64Count = 2
+	op.Config.RunnerARM64Count = 0
+	op.Config.RunnerWireGuardHostPortStart = 52000
+	op.Config.RunnerWireGuardHostPortEnd = 52000
+
+	if err := op.ReconcileRunners(t.Context()); err == nil {
+		t.Fatal("reconcile succeeded without a free hostPort")
+	}
+}
+
 func testOperator(t *testing.T, objects ...client.Object) *Operator {
 	t.Helper()
 
@@ -755,7 +866,10 @@ func testPod(name, nodeName string, annotations map[string]string) *corev1.Pod {
 
 	annotations[AnnotationServerWireGuardPublicKey] = podServerPublicKey(name)
 
-	return testPodWithAnnotations(name, nodeName, annotations)
+	pod := testPodWithAnnotations(name, nodeName, annotations)
+	setPodWireGuardHostPort(pod, testHostPort(name))
+
+	return pod
 }
 
 func testPodWithArchitecture(name, nodeName, architecture string) *corev1.Pod {
@@ -763,6 +877,38 @@ func testPodWithArchitecture(name, nodeName, architecture string) *corev1.Pod {
 	pod.Labels[LabelArchitecture] = architecture
 
 	return pod
+}
+
+func testPodWithHostPort(name, nodeName string, hostPort int32) *corev1.Pod {
+	pod := testPod(name, nodeName, nil)
+	setPodWireGuardHostPort(pod, hostPort)
+
+	return pod
+}
+
+func setPodWireGuardHostPort(pod *corev1.Pod, hostPort int32) {
+	pod.Spec.Containers = []corev1.Container{
+		{
+			Name: "runner",
+			Ports: []corev1.ContainerPort{
+				{
+					Name:          "wireguard",
+					Protocol:      corev1.ProtocolUDP,
+					ContainerPort: 51820,
+					HostPort:      hostPort,
+				},
+			},
+		},
+	}
+}
+
+func testHostPort(name string) int32 {
+	var sum int32
+	for _, r := range name {
+		sum += r
+	}
+
+	return 51000 + sum%1000
 }
 
 func testPodWithAnnotations(name, nodeName string, annotations map[string]string) *corev1.Pod {
@@ -777,7 +923,12 @@ func testPodWithAnnotations(name, nodeName string, annotations map[string]string
 			Labels:      map[string]string{"app.kubernetes.io/name": "playpen-runner"},
 			Annotations: annotations,
 		},
-		Spec: corev1.PodSpec{NodeName: nodeName},
+		Spec: corev1.PodSpec{
+			NodeName: nodeName,
+			Containers: []corev1.Container{
+				{Name: "runner"},
+			},
+		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
 			ContainerStatuses: []corev1.ContainerStatus{
