@@ -3,14 +3,11 @@
 
 package runner
 
-import "time"
-
 // Config contains all settings for one standalone playpen runner pod.
 type Config struct {
 	ListenAddr       string
 	PublicRedfishURL string
 	DataDir          string
-	TTL              time.Duration
 	ConfigureNetwork bool
 	WireGuard        WireGuardConfig
 	VXLAN            VXLANConfig
@@ -67,7 +64,6 @@ func DefaultConfig() Config {
 	return Config{
 		ListenAddr:       "10.88.0.1:8443",
 		DataDir:          "/var/lib/playpen-runner",
-		TTL:              time.Hour,
 		ConfigureNetwork: true,
 		WireGuard: WireGuardConfig{
 			PrivateKeyFile: "/etc/playpen/wireguard/privatekey",

@@ -53,9 +53,9 @@ Redfish `On` reset action. By default, the VM has 2 vCPUs, 4096 MiB of memory, a
 20G disk, UEFI firmware, and a software TPM. QEMU, serial, and swtpm logs are
 written under the data directory.
 
-The runner exits after `--ttl` (default `1h`) when the value is positive. In the
-Kubernetes playpen deployment, the operator also deletes claimed pods on release
-or TTL expiration so the Deployment can create fresh runners.
+The runner does not enforce a lifetime limit. In the Kubernetes playpen
+deployment, the operator owns pod TTL enforcement: it deletes claimed pods on
+release or `--playpen-ttl` expiration so the Deployment can create fresh runners.
 
 ## Run
 

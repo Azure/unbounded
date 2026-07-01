@@ -52,9 +52,10 @@ curl -k -X POST https://playpen-operator/playpen/v1/releases \
 - The claim response uses the runner node's `ExternalIP` as the gateway. If that
   node has no `ExternalIP`, any node `ExternalIP` may be used. If no node has an
   `ExternalIP`, claims fail with `503 Service Unavailable`.
-- `--playpen-ttl` deletes expired claimed pods. Releases also delete the claimed
-  pod and its NodePort Service. The runner Deployment is expected to replace the
-  deleted pod with a fresh idle one.
+- `--playpen-ttl` is the only playpen pod TTL enforcement point. It deletes
+  expired claimed pods. Releases also delete the claimed pod and its NodePort
+  Service. The runner Deployment is expected to replace the deleted pod with a
+  fresh idle one.
 - On startup, the operator ensures the operator TLS Secret and the shared runner
   WireGuard private-key Secret exist.
 

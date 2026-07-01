@@ -35,7 +35,6 @@ spec:
             - --wireguard-listen-port={{ default "51820" .WireGuardListenPort }}
             - --listen-addr=10.88.0.1:8443
             - --public-redfish-url=https://10.88.0.1:8443
-            - --ttl={{ default "1h" .RunnerTTL }}
           ports:
             - containerPort: 8443
               name: https

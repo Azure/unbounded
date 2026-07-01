@@ -31,7 +31,6 @@ func main() {
 	flags.StringVar(&cfg.ListenAddr, "listen-addr", cfg.ListenAddr, "HTTPS Redfish and info listen address")
 	flags.StringVar(&cfg.PublicRedfishURL, "public-redfish-url", cfg.PublicRedfishURL, "Redfish URL returned by /playpen/v1/info; defaults to https://<listen-addr>")
 	flags.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "runner state directory")
-	flags.DurationVar(&cfg.TTL, "ttl", cfg.TTL, "maximum runner lifetime before self-termination")
 	flags.BoolVar(&cfg.ConfigureNetwork, "configure-network", cfg.ConfigureNetwork, "configure WireGuard, VXLAN, bridge, and tap interfaces")
 	flags.StringVar(&cfg.WireGuard.PrivateKeyFile, "wireguard-private-key-file", cfg.WireGuard.PrivateKeyFile, "path to the runner WireGuard private key")
 	flags.StringVar(&cfg.WireGuard.ClientPublicKey, "wireguard-client-public-key", cfg.WireGuard.ClientPublicKey, "client WireGuard public key")

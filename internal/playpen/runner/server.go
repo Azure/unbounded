@@ -96,11 +96,6 @@ func Run(ctx context.Context, cfg Config) error {
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if cfg.TTL > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, cfg.TTL)
-		defer cancel()
-	}
 
 	errCh := make(chan error, 1)
 	go func() {
