@@ -51,7 +51,8 @@ METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
 NETBOOT_IMAGE ?= $(CONTAINER_REGISTRY)/netboot:$(VERSION)
 
-PLAYPEN_IMAGE ?= $(CONTAINER_REGISTRY)/playpen:$(VERSION)
+PLAYPEN_TAG ?= $(subst /,-,$(VERSION))
+PLAYPEN_IMAGE ?= $(CONTAINER_REGISTRY)/playpen:$(PLAYPEN_TAG)
 
 KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
 KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
@@ -1007,7 +1008,7 @@ image-playpen-local: ## Build the playpen container image locally (single-arch)
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t playpen:$(VERSION) -t $(PLAYPEN_IMAGE) \
+		-t playpen:$(PLAYPEN_TAG) -t $(PLAYPEN_IMAGE) \
 		-f ./images/playpen/Containerfile .
 	$(call trivy-maybe,$(PLAYPEN_IMAGE))
 
