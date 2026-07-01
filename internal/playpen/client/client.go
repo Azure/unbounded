@@ -215,6 +215,7 @@ func (p *Playpen) Command(ctx context.Context, name string, args ...string) (*ex
 	}
 
 	cmdArgs := append([]string{"netns", "exec", namespace, name}, args...)
+
 	cmdName := "ip"
 	if os.Geteuid() != 0 {
 		cmdArgs = append([]string{"-n", cmdName}, cmdArgs...)

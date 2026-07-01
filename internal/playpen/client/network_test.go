@@ -7,8 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Azure/unbounded/internal/playpen/operator"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
+	"github.com/Azure/unbounded/internal/playpen/operator"
 )
 
 func TestTunnelSetupCommands(t *testing.T) {
@@ -78,6 +79,7 @@ func TestTunnelSetupCommands(t *testing.T) {
 
 func TestGuestNetworkPrefixes(t *testing.T) {
 	metadata := testAllocResponse()
+
 	gatewayPrefix, guestSubnet, err := guestNetworkPrefixes(metadata.Network)
 	if err != nil {
 		t.Fatalf("guest network prefixes: %v", err)

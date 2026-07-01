@@ -32,6 +32,7 @@ func (osCommander) Run(ctx context.Context, name string, args ...string) error {
 	}
 
 	cmd := exec.CommandContext(ctx, name, args...)
+
 	out, err := cmd.CombinedOutput()
 	if err != nil && len(out) > 0 {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
@@ -90,6 +91,7 @@ func (t *tunnel) Setup(ctx context.Context) error {
 	}
 
 	endpoint := net.JoinHostPort(t.metadata.Endpoint.Host, fmt.Sprint(t.metadata.Endpoint.WireGuardUDPPort))
+
 	commands, err := t.setupCommands(privateKeyFile, endpoint, serverWG, clientWG)
 	if err != nil {
 		return err
