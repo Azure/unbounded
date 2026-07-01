@@ -48,8 +48,8 @@ The integration branch is periodically kept current by merging `main` into it
 | PR | Scope | Approx files | Source | Depends on |
 |----|-------|--------------|--------|------------|
 | **PR-B** | Namespace unification: `UNBOUNDED_NAMESPACE`, `internal/unbounded`, template defaults across machina/net/gantry/inventory/orca/machine-ops/storage, `migrate-namespace.sh`, smoke test | ~194 | existing open PR #372 (`unify-namespace-unbounded-system`), re-targeted to this branch | - |
-| **PR-A** | Operator + Site redesign: the operator, the Site API move to the machina group, kubectl install consolidation, net controller/webhook/client retargeting | ~94 | closed PR #353 (`shared-site`), reconciled with `main` | - |
-| **PR-C** | Operator on `unbounded-system` + operator-driven migration: operator template/Go namespace defaults, the reaper (`internal/operator/migrate.go`), `migrate-legacy` subcommand, RBAC, release-upgrade, docs, and the `operator-reap` e2e | ~24 | net-new | PR-A and PR-B |
+| **PR-A** | Operator + Site redesign on `unbounded-system`: the operator, the Site API move to the machina group, kubectl install consolidation, net controller/webhook/client retargeting, and the operator's own namespace defaults/templates resolved via `unbounded.SystemNamespace()` | ~93 | closed PR #353 (`shared-site`), reconciled onto the `#372`-merged integration branch | PR-B |
+| **PR-C** | Operator-driven migration of existing clusters: the reaper (`internal/operator/migrate.go`), `migrate-legacy` subcommand, its RBAC, release-upgrade, docs, and the `operator-reap` e2e | ~18 | net-new | PR-A |
 
 PR-B and PR-A are independent of each other (PR-A is the operator in the old
 namespaces; PR-B never touches the operator). PR-C makes the operator and its
@@ -126,11 +126,11 @@ author does not self-merge. Each PR must be green on `make build`, `make lint`,
 - [x] Create `feature/unbounded-system` from `main`                         (me)
 - [x] Add this plan doc to the integration branch                            (me)
 - [x] Open umbrella tracking PR #388 (`feature/unbounded-system` -> `main`)   (me opens / reviewers merge last)
-- [x] PR-B: re-target #372 -> `feature/unbounded-system`                      (me opens / reviewers merge)
+- [x] PR-B: re-target #372 -> `feature/unbounded-system` (MERGED)             (me opens / reviewers merge)
 - [x] PR-A: open operator + Site redesign -> integration                     (me opens / reviewers merge)
 - [x] Apply #372 review fixes (findings 1-4 across #372 + PR-A)               (me)
-- [ ] PR-A: rebase after PR-B merges                                         (me)
-- [ ] PR-C: open operator-ns + migration -> integration (after A+B merged)   (me opens / reviewers merge)
+- [x] PR-A: re-create clean on the #372-merged integration branch, operator on unbounded-system (me)
+- [ ] PR-C: open migration -> integration (after PR-A merges)                 (me opens / reviewers merge)
 - [ ] Periodic `main` -> integration syncs                                   (me)
 - [ ] Mark tracking PR #388 ready once all chunks merged                      (me; reviewers merge)
 - [ ] Close monolith #383                                                    (me, on approval)
@@ -140,9 +140,9 @@ author does not self-merge. Each PR must be green on `make build`, `make lint`,
 | PR | Branch | Number | State |
 |----|--------|--------|-------|
 | Tracking (umbrella) | `feature/unbounded-system` -> `main` | #388 | draft (merges last, after all chunks) |
-| PR-B | `unify-namespace-unbounded-system` | #372 | open, base = `feature/unbounded-system` (awaiting review/merge) |
-| PR-A | `operator-site-redesign` | #386 | open (awaiting review/merge; rebase on integration after PR-B merges) |
-| PR-C | `operator-system-migration` | TBD | blocked on PR-A + PR-B merging |
+| PR-B | `unify-namespace-unbounded-system` | #372 | **merged** into `feature/unbounded-system` |
+| PR-A | `operator-site-redesign` | #386 | open, resynced clean (one commit, operator on `unbounded-system`); awaiting review/merge |
+| PR-C | `operator-system-migration` | TBD | blocked on PR-A merging |
 
 ## Notes
 
