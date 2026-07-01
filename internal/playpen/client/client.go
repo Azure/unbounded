@@ -47,8 +47,6 @@ type Client struct {
 
 // AllocateOptions controls one playpen allocation.
 type AllocateOptions struct {
-	// IdempotencyKey identifies the allocation. If empty, a random key is generated.
-	IdempotencyKey string
 	// Architecture optionally requests a runner architecture. Empty defaults to amd64.
 	Architecture string
 	// WireGuardPrivateKey is the client's WireGuard private key. If empty, one is generated.
@@ -115,12 +113,9 @@ func (c *Client) Allocate(ctx context.Context, opts AllocateOptions) (*Playpen, 
 		return nil, fmt.Errorf("parse wireguard private key: %w", err)
 	}
 
-	idempotencyKey := strings.TrimSpace(opts.IdempotencyKey)
-	if idempotencyKey == "" {
-		idempotencyKey, err = randomHex(32)
-		if err != nil {
-			return nil, fmt.Errorf("generate idempotency key: %w", err)
-		}
+	idempotencyKey, err := randomHex(32)
+	if err != nil {
+		return nil, fmt.Errorf("generate idempotency key: %w", err)
 	}
 
 	body, err := json.Marshal(operator.AllocRequest{WireGuardPublicKey: key.PublicKey().String(), Architecture: opts.Architecture})
@@ -152,8 +147,7 @@ func (c *Client) Allocate(ctx context.Context, opts AllocateOptions) (*Playpen, 
 	}, nil
 }
 
-// Deallocate deallocates a playpen by idempotency key. It is idempotent server-side.
-func (c *Client) Deallocate(ctx context.Context, idempotencyKey string) error {
+func (c *Client) deallocate(ctx context.Context, idempotencyKey string) error {
 	req, err := c.newRequest(ctx, http.MethodPost, deallocsPath, http.NoBody)
 	if err != nil {
 		return err
@@ -161,11 +155,6 @@ func (c *Client) Deallocate(ctx context.Context, idempotencyKey string) error {
 	req.Header.Set(idempotencyKeyHeader, strings.TrimSpace(idempotencyKey))
 
 	return c.doJSON(req, http.StatusNoContent, nil)
-}
-
-// IdempotencyKey returns the key used to allocate this playpen.
-func (p *Playpen) IdempotencyKey() string {
-	return p.idempotencyKey
 }
 
 // WireGuardPrivateKey returns the client's WireGuard private key for this playpen.
@@ -203,7 +192,7 @@ func (p *Playpen) Close(ctx context.Context) error {
 	if tunnel != nil {
 		closeErr = tunnel.Teardown(ctx)
 	}
-	if err := client.Deallocate(ctx, idempotencyKey); err != nil && closeErr == nil {
+	if err := client.deallocate(ctx, idempotencyKey); err != nil && closeErr == nil {
 		closeErr = err
 	}
 

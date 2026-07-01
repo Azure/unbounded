@@ -17,7 +17,7 @@ import (
 	"github.com/Azure/unbounded/internal/playpen/operator"
 )
 
-func TestAllocateSendsIdempotencyAndPublicKeyToAggregatedAPI(t *testing.T) {
+func TestAllocateGeneratesIdempotencyKeyAndSendsPublicKeyToAggregatedAPI(t *testing.T) {
 	privateKey, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
 		t.Fatal(err)
@@ -46,13 +46,13 @@ func TestAllocateSendsIdempotencyAndPublicKeyToAggregatedAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p, err := c.Allocate(t.Context(), AllocateOptions{IdempotencyKey: "alloc-key", Architecture: operator.ArchitectureARM64, WireGuardPrivateKey: privateKey.String()})
+	p, err := c.Allocate(t.Context(), AllocateOptions{Architecture: operator.ArchitectureARM64, WireGuardPrivateKey: privateKey.String()})
 	if err != nil {
 		t.Fatalf("allocate: %v", err)
 	}
 
-	if gotKey != "alloc-key" {
-		t.Fatalf("idempotency key = %q", gotKey)
+	if gotKey == "" {
+		t.Fatal("idempotency key was not sent")
 	}
 	if gotPublicKey != privateKey.PublicKey().String() {
 		t.Fatalf("public key = %q, want %q", gotPublicKey, privateKey.PublicKey().String())
@@ -89,7 +89,7 @@ func TestNewUsesKubernetesAuthTransport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Deallocate(t.Context(), "alloc-key"); err != nil {
+	if err := c.deallocate(t.Context(), "alloc-key"); err != nil {
 		t.Fatal(err)
 	}
 	if gotAuth != "Bearer test-token" {
@@ -120,7 +120,7 @@ func TestCloseTearsDownTunnelBeforeDeallocateAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := c.Allocate(t.Context(), AllocateOptions{IdempotencyKey: "alloc-key"})
+	p, err := c.Allocate(t.Context(), AllocateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestDeallocateSendsIdempotencyKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Deallocate(t.Context(), "alloc-key"); err != nil {
+	if err := c.deallocate(t.Context(), "alloc-key"); err != nil {
 		t.Fatal(err)
 	}
 	if gotKey != "alloc-key" {
