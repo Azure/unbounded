@@ -47,42 +47,50 @@ The integration branch is periodically kept current by merging `main` into it
 
 | PR | Scope | Approx files | Source | Depends on |
 |----|-------|--------------|--------|------------|
-| **PR-B** | Namespace unification: `UNBOUNDED_NAMESPACE`, `internal/unbounded`, template defaults across machina/net/gantry/inventory/orca/machine-ops/storage, `migrate-namespace.sh`, smoke test | ~194 | existing open PR #372 (`unify-namespace-unbounded-system`), re-targeted to this branch | - |
-| **PR-A** | Operator + Site redesign: the operator, the Site API move to the machina group, kubectl install consolidation, net controller/webhook/client retargeting | ~94 | closed PR #353 (`shared-site`), reconciled with `main` | - |
-| **PR-C** | Operator on `unbounded-system` + operator-driven migration: operator template/Go namespace defaults, the reaper (`internal/operator/migrate.go`), `migrate-legacy` subcommand, RBAC, release-upgrade, docs, and the `operator-reap` e2e | ~24 | net-new | PR-A and PR-B |
+| **PR-B** | Namespace unification: `UNBOUNDED_NAMESPACE`, `internal/unbounded`, template defaults across machina/net/gantry/inventory/orca/machine-ops/storage | ~194 | existing open PR #372 (`unify-namespace-unbounded-system`), re-targeted to this branch | - |
+| **PR-A** | Operator + Site redesign **and** operator-driven migration: the operator on `unbounded-system`, the Site API move to the machina group, the component-model redesign (net/machina cluster singletons, per-site metalman/storage, components install at the operator version), kubectl install consolidation, net controller/webhook/client retargeting, and the reaper (`internal/operator/migrate.go`) with its RBAC and e2e | net-new + closed PR #353 (`shared-site`) | PR-B |
 
-PR-B and PR-A are independent of each other (PR-A is the operator in the old
-namespaces; PR-B never touches the operator). PR-C makes the operator and its
-migration consistent with the unified namespace and carries the only genuinely
-novel, higher-risk logic (the reaper), isolated for focused review.
+PR-B and PR-A are independent to review (PR-B never touches the operator). PR-A
+lands as two logical commits: (1) the operator + component-model redesign, and
+(2) the operator-driven migration (Site translation + reaper). **PR-C has been
+dropped**: the migration is small and cohesive with the redesign it depends on
+(it reaps exactly the components the redesign reshapes), so it folds into PR-A
+rather than living as a separate chunk.
 
-## Migration workflow (delivered by PR-C)
+## Migration workflow (delivered by PR-A, commit 2)
 
-Migration runs either continuously (operator flag `--reap-legacy-resources`, off
-by default) or as a one-shot (`unbounded-operator migrate-legacy`). Both run the
-same idempotent routine; per pass:
+Migration runs continuously as an always-on, leader-elected manager Runnable
+gated by the operator flag `--reap-legacy-resources` (default on). There is no
+one-shot subcommand and no standalone shell migrator. The routine is idempotent;
+per pass:
 
-1. Copy non-regenerable state (operator/user Secrets, the `machina-config`
-   ConfigMap) from the legacy namespaces into `unbounded-system`, stripping
-   server-managed metadata, never overwriting existing target copies, and
-   skipping regenerable/auto-managed secrets (net serving cert, SA tokens, Helm
-   release secrets).
+0. **Translate Sites.** For each pre-redesign net-group Site
+   (`sites.net.unbounded-cloud.io`), create the equivalent machina-group Site
+   (`sites.unbounded-cloud.io`) with the networking spec copied verbatim and
+   `spec.components` inferred from the running legacy workloads: storage is
+   enabled on every translated Site (each then gets its own node-selected
+   DaemonSet), machina on the `cluster` Site, and metalman where a per-site
+   metalman Deployment is detected. Existing machina-group Sites are never
+   clobbered.
+1. Copy non-regenerable state (operator/user Secrets, the `machina-config` and
+   `unbounded-storage-config` ConfigMaps) from the legacy namespaces into
+   `unbounded-system`, stripping server-managed metadata, never overwriting
+   existing target copies, and skipping regenerable/auto-managed secrets (net
+   serving cert, SA tokens, Helm release secrets).
 2. Rewrite the namespace embedded in cluster-scoped secret references
    (`Machine.spec.pxe.redfish.passwordRef`, `MachineOperationCredential`
    `spec.auth.secretRef`).
 3. Per component, once its target workloads are healthy, delete the
    operator-owned resources left behind in the legacy namespace (label-scoped;
    net reaped last; components with no legacy footprint skipped).
+4. Once every component is drained, delete the legacy net-group Site CRD and the
+   now-drained legacy `Namespace` objects.
 
-The operator never deletes the legacy `Namespace` objects; an operator removes
-those manually once empty (`kubectl delete namespace unbounded-kube unbounded-net`).
-
-Migration is **operator-only**: there is no standalone shell migrator. For
-air-gapped or non-operator-managed clusters the same routine is available as the
-one-shot `unbounded-operator migrate-legacy` (runnable as a Job). The operator
-must have reconciled the Sites first (creating the new `unbounded-system`
-components, including per-site metalman) before the reaper drains the old
-namespaces.
+Ordering makes the cutover safe: translating the Sites first gives the operator
+Sites to reconcile (bringing up the new `unbounded-system` components, including
+per-site metalman and the net singleton that re-labels nodes for storage
+node-selection) before the reaper drains the old namespaces; the per-component
+health gate ensures the new workload is Ready before the old one is removed.
 
 ## Review fixes (PR #372 review)
 
@@ -94,8 +102,8 @@ The initial #372 review raised four findings; disposition:
   `POD_NAMESPACE` on the operator-created metalman Deployment so its lease is
   correct under any install namespace.
 - **2 (release-upgrade.yaml, High):** not #372's; PR-A restructures that workflow
-  and PR-C makes it `unbounded-system`-aware. Gated by this integration branch -
-  no unified release is cut from `main` until PR-C merges (see below).
+  and makes it `unbounded-system`-aware. Gated by this integration branch -
+  no unified release is cut from `main` until PR-A merges (see below).
 - **3 (namespace override not end-to-end, Medium):** fixed in #372 - namespace
   resolution is centralized in `unbounded.SystemNamespace()`, a POD_NAMESPACE-aware
   helper (the raw default is the unexported `systemNamespace` const). Components
@@ -107,19 +115,39 @@ The initial #372 review raised four findings; disposition:
   reference `unbounded-system`.
 
 **Release gate:** `main` must not cut a unified (`unbounded-system`) release
-until PR-C has merged into the integration branch, because `release-upgrade.yaml`
-only becomes `unbounded-system`-aware in PR-C. The integration branch enforces
-this: #372's manifest changes and PR-C's workflow changes reach `main` together
+until PR-A has merged into the integration branch, because `release-upgrade.yaml`
+only becomes `unbounded-system`-aware in PR-A. The integration branch enforces
+this: #372's manifest changes and PR-A's workflow changes reach `main` together
 in the single integration -> main merge.
 
 ## Base strategy and merge flow
 
 All PRs target `feature/unbounded-system` directly. Dependents are rebased
-reactively as their prerequisites merge (PR-A after PR-B; PR-C is prepared only
-after PR-A and PR-B are merged). PRs are merged by reviewers after approval; the
-author does not self-merge. Each PR must be green on `make build`, `make lint`,
-`make test`; PR-C must additionally pass the kind `operator-reap` scenario in
-`hack/smoke-namespace-migration.py` (operator-only; re-homed from #372).
+reactively as their prerequisites merge (PR-A after PR-B). PRs are merged by
+reviewers after approval; the author does not self-merge. Each PR must be green
+on `make build`, `make lint`, `make test`; PR-A's migration commit must
+additionally pass the kind operator-reap e2e (`e2e/operator`, `//go:build e2e`),
+which the `operator-e2e-kind` GitHub workflow runs on changes under
+`internal/operator`, `cmd/unbounded-operator`, `deploy/unbounded-operator`,
+`deploy/machina/crd`, or `e2e/operator`.
+
+Two complementary reaper e2e's exist:
+
+- **In-process simulation** (`e2e/operator`, Go, `//go:build e2e`, per-PR): drives
+  the `LegacyReaper` library directly against a kind apiserver with staged inert
+  legacy workloads and Ready targets. Fast; covers the reaper logic including
+  storage/metalman reaping and the per-site storage gate.
+- **Faithful released-version upgrade** (`hack/operator-upgrade-e2e/e2e.py`,
+  standalone Python, run by the `operator-upgrade-e2e` workflow on
+  `workflow_dispatch` + nightly): stands up a kind cluster with a local OCI
+  registry, installs the last released multi-namespace version (default
+  `v0.1.19`) via that release's real `kubectl unbounded site init`
+  (`--manage-cni-plugin=false` so the real net-node coexists with kindnet), then
+  upgrades via this tree's `kubectl unbounded install` and asserts the operator's
+  reaper migrates net + machina for real. Storage (RDMA) and metalman (PXE)
+  cannot run in vanilla kind, so they are excluded from this path and stay
+  covered by the simulation + unit tests. The driver is self-contained so it runs
+  the same way locally (`python3 hack/operator-upgrade-e2e/e2e.py all`) and in CI.
 
 ## Status checklist
 
@@ -129,8 +157,14 @@ author does not self-merge. Each PR must be green on `make build`, `make lint`,
 - [x] PR-B: re-target #372 -> `feature/unbounded-system`                      (me opens / reviewers merge)
 - [x] PR-A: open operator + Site redesign -> integration                     (me opens / reviewers merge)
 - [x] Apply #372 review fixes (findings 1-4 across #372 + PR-A)               (me)
-- [ ] PR-A: rebase after PR-B merges                                         (me)
-- [ ] PR-C: open operator-ns + migration -> integration (after A+B merged)   (me opens / reviewers merge)
+- [x] PR-B: re-target #372 -> `feature/unbounded-system`                      (me opens / reviewers merge)
+- [x] PR-B: merged into integration                                          (reviewers)
+- [x] PR-A: open operator + Site redesign -> integration                     (me opens / reviewers merge)
+- [x] Apply #372 review fixes (findings 1-4 across #372 + PR-A)               (me)
+- [x] PR-A commit 1: operator + component-model redesign                      (me)
+- [x] PR-A commit 2: operator-driven migration (Site translation + reaper)   (me)
+- [x] PR-A: kind operator-reap e2e for the always-on reaper, wired into CI    (me)
+- [x] PR-A: faithful released-version upgrade e2e driver + nightly workflow    (me)
 - [ ] Periodic `main` -> integration syncs                                   (me)
 - [ ] Mark tracking PR #388 ready once all chunks merged                      (me; reviewers merge)
 - [ ] Close monolith #383                                                    (me, on approval)
@@ -140,14 +174,14 @@ author does not self-merge. Each PR must be green on `make build`, `make lint`,
 | PR | Branch | Number | State |
 |----|--------|--------|-------|
 | Tracking (umbrella) | `feature/unbounded-system` -> `main` | #388 | draft (merges last, after all chunks) |
-| PR-B | `unify-namespace-unbounded-system` | #372 | open, base = `feature/unbounded-system` (awaiting review/merge) |
-| PR-A | `operator-site-redesign` | #386 | open (awaiting review/merge; rebase on integration after PR-B merges) |
-| PR-C | `operator-system-migration` | TBD | blocked on PR-A + PR-B merging |
+| PR-B | `unify-namespace-unbounded-system` | #372 | merged into `feature/unbounded-system` |
+| PR-A | `operator-site-redesign` | #386 | open (operator+model and migration commits; awaiting review/merge) |
+| ~~PR-C~~ | - | - | dropped; folded into PR-A |
 
 ## Notes
 
 - The known-good, fully-integrated reference is kept on `unbounded-operator-poc`
-  until PR-C is cut, so no validated work is lost during the re-cut.
+  until PR-A's migration commit is validated, so no validated work is lost.
 - #353 is closed; its branch `shared-site` is the source for PR-A.
 - The monolith PR #383 (everything in one) is superseded by this decomposition
   and is closed once the chunk PRs are open.

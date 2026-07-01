@@ -53,6 +53,7 @@ func main() {
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace(), "Namespace for the leader election lease")
 	cmd.Flags().StringVar(&cfg.metalmanImage, "metalman-image", "", "Default metalman image")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint advertised by machina")
+	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", true, "Translate legacy net-group Sites, migrate state into unbounded-system, and reap the pre-consolidation namespaces")
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
 
@@ -69,6 +70,7 @@ type config struct {
 	leaderElectionNamespace string
 	metalmanImage           string
 	apiServerEndpoint       string
+	reapLegacyResources     bool
 }
 
 func run(ctx context.Context, cfg config) error {
@@ -98,6 +100,19 @@ func run(ctx context.Context, cfg config) error {
 		},
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup Site controller: %w", err)
+	}
+
+	if cfg.reapLegacyResources {
+		reaper := &operator.LegacyReaper{
+			Client:           mgr.GetClient(),
+			TargetNamespace:  unbounded.SystemNamespace(),
+			LegacyNamespaces: operator.LegacyNamespaces,
+			SkipSecretNames:  map[string]struct{}{"unbounded-net-serving-cert": {}},
+			CopyConfigMaps:   []string{"machina-config", "unbounded-storage-config"},
+		}
+		if err := reaper.SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("setup legacy reaper: %w", err)
+		}
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

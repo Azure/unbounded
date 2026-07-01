@@ -28,8 +28,15 @@ ARG TARGETARCH
 ARG VERSION=dev
 ARG GIT_COMMIT=
 ARG BUILD_TIME=
+# Optional overrides for the component images baked into the operator's embedded
+# manifests. They default to empty so release builds keep the Makefile defaults
+# (ghcr.io/azure/<component>:<version>); e2e/dev builds set them to point the
+# operator's applied net/machina workloads at a locally reachable registry.
+ARG NET_CONTROLLER_IMAGE=
+ARG NET_NODE_IMAGE=
+ARG MACHINA_IMAGE=
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    make unbounded-operator-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
+    make unbounded-operator-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}} ${NET_CONTROLLER_IMAGE:+NET_CONTROLLER_IMAGE=${NET_CONTROLLER_IMAGE}} ${NET_NODE_IMAGE:+NET_NODE_IMAGE=${NET_NODE_IMAGE}} ${MACHINA_IMAGE:+MACHINA_IMAGE=${MACHINA_IMAGE}}
 
 FROM ubuntu:noble
 

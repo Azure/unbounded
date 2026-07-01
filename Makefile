@@ -1056,6 +1056,9 @@ image-unbounded-operator-local: ## Build the unbounded-operator container image 
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		--build-arg NET_CONTROLLER_IMAGE=$(NET_CONTROLLER_IMAGE) \
+		--build-arg NET_NODE_IMAGE=$(NET_NODE_IMAGE) \
+		--build-arg MACHINA_IMAGE=$(MACHINA_IMAGE) \
 		-t unbounded-operator:$(VERSION) -t $(UNBOUNDED_OPERATOR_IMAGE) \
 		-f ./images/unbounded-operator/Containerfile .
 	$(call trivy-maybe,$(UNBOUNDED_OPERATOR_IMAGE))
