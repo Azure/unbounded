@@ -106,6 +106,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Build and push netboot dependency
+        if: needs.resolve.outputs.name == 'metalman'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: images/netboot/Containerfile
+          platforms: ${{ needs.resolve.outputs.platforms }}
+          push: true
+          tags: ${{ env.CONTAINER_REGISTRY }}/netboot:${{ needs.resolve.outputs.tag }}
+          cache-from: type=gha,scope=netboot
+          cache-to: type=gha,scope=netboot,mode=max
+
       - name: Build and push
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
