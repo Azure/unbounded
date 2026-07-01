@@ -39,6 +39,14 @@ const (
 	powerActionTimeout = 5 * time.Minute
 )
 
+type bootOrderAction string
+
+const (
+	bootOrderNone bootOrderAction = ""
+	bootOrderPXE  bootOrderAction = "pxe"
+	bootOrderHDD  bootOrderAction = "hdd"
+)
+
 type Reconciler struct {
 	Client client.Client
 	Pool   *Pool
@@ -130,10 +138,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Boot order configuration (skip if known unsupported).
 	pendingRepave := machine.Spec.Operations.RepaveCounter > machine.Status.Operations.RepaveCounter
+	bootAction := desiredBootOrderAction(&machine, pendingRepave)
 
 	bootCond := meta.FindStatusCondition(machine.Status.Conditions, condBootSupported)
-	if bootCond == nil || bootCond.Status != metav1.ConditionFalse {
-		if err := r.reconcileBootOrder(ctx, log, &machine, c, pendingRepave); err != nil {
+	if bootAction != bootOrderNone && (bootCond == nil || bootCond.Status != metav1.ConditionFalse) {
+		if err := r.reconcileBootOrder(ctx, log, &machine, c, bootAction); err != nil {
 			if errors.Is(err, ErrUnsupported) {
 				// BMCs commonly reject boot order changes during POST.
 				// Only conclude the feature is permanently unsupported
@@ -180,22 +189,41 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	return r.reconcilePowerOn(ctx, log, &machine, c, pendingRepave)
 }
 
+func desiredBootOrderAction(machine *v1alpha3.Machine, pendingRepave bool) bootOrderAction {
+	if !pendingRepave {
+		return bootOrderHDD
+	}
+
+	rebootPending := machine.Spec.Operations.RebootCounter > machine.Status.Operations.RebootCounter
+	if !rebootPending {
+		return bootOrderNone
+	}
+
+	// PXE is a one-shot boot override for the repave power cycle. Once the
+	// cycle has started, do not re-arm PXE while the installer is running.
+	if meta.FindStatusCondition(machine.Status.Conditions, condPoweredOff) != nil {
+		return bootOrderNone
+	}
+
+	return bootOrderPXE
+}
+
 // reconcileBootOrder ensures the boot source override matches the desired state.
 // Returns ErrUnsupported if the BMC does not support boot order configuration.
-func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine, c *Client, pendingRepave bool) error {
+func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine, c *Client, action bootOrderAction) error {
 	config, err := c.GetBootConfig(ctx)
 	if err != nil {
 		return err
 	}
 
-	if pendingRepave {
-		if config.Target == BootTargetPxe && config.Enabled == BootContinuous {
+	if action == bootOrderPXE {
+		if config.Target == BootTargetPxe && config.Enabled == BootOnce {
 			return nil // Already set to PXE boot.
 		}
 
 		log.Info("setting boot source override to PXE", "currentTarget", config.Target, "currentEnabled", config.Enabled)
 
-		return c.SetBootOverride(ctx, BootTargetPxe, BootContinuous)
+		return c.SetBootOverride(ctx, BootTargetPxe, BootOnce)
 	}
 
 	if config.Enabled == BootDisabled ||

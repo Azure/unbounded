@@ -35,7 +35,7 @@ func TestTimeoutRunningCondition(t *testing.T) {
 					Status:             metav1.ConditionFalse,
 					Reason:             "Running",
 					Message:            "stage \"modules-config\" started",
-					LastTransitionTime: metav1.NewTime(time.Now().Add(-10 * time.Minute)),
+					LastTransitionTime: metav1.NewTime(time.Now().Add(-cloudInitTimeout - time.Minute)),
 				},
 			},
 		},
@@ -166,8 +166,8 @@ func TestNotYetTimedOut(t *testing.T) {
 		t.Fatal("expected RequeueAfter for not-yet-expired timeout")
 	}
 
-	if result.RequeueAfter > 4*time.Minute {
-		t.Fatalf("expected RequeueAfter <= 4min, got %v", result.RequeueAfter)
+	if result.RequeueAfter <= 0 || result.RequeueAfter > cloudInitTimeout {
+		t.Fatalf("expected RequeueAfter within cloudInitTimeout, got %v", result.RequeueAfter)
 	}
 
 	var updated v1alpha3.Machine
@@ -225,7 +225,7 @@ func TestConditionAlreadyTrue(t *testing.T) {
 					Status:             metav1.ConditionTrue,
 					Reason:             "Succeeded",
 					Message:            "cloud-init completed successfully",
-					LastTransitionTime: metav1.NewTime(time.Now().Add(-10 * time.Minute)),
+					LastTransitionTime: metav1.NewTime(time.Now().Add(-cloudInitTimeout - time.Minute)),
 				},
 			},
 		},
@@ -260,8 +260,8 @@ func TestConditionAlreadyUnknown(t *testing.T) {
 					Type:               v1alpha3.MachineConditionCloudInitDone,
 					Status:             metav1.ConditionUnknown,
 					Reason:             "TimedOut",
-					Message:            "cloud-init did not complete within 5m0s",
-					LastTransitionTime: metav1.NewTime(time.Now().Add(-10 * time.Minute)),
+					Message:            "cloud-init did not complete within " + cloudInitTimeout.String(),
+					LastTransitionTime: metav1.NewTime(time.Now().Add(-cloudInitTimeout - time.Minute)),
 				},
 			},
 		},
@@ -402,7 +402,7 @@ func TestUnexpectedReasonTimesOut(t *testing.T) {
 					Type:               v1alpha3.MachineConditionCloudInitDone,
 					Status:             metav1.ConditionFalse,
 					Reason:             "SomethingElse",
-					LastTransitionTime: metav1.NewTime(time.Now().Add(-10 * time.Minute)),
+					LastTransitionTime: metav1.NewTime(time.Now().Add(-cloudInitTimeout - time.Minute)),
 				},
 			},
 		},

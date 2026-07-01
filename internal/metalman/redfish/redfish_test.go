@@ -95,7 +95,7 @@ func TestRedfishRebootCycle(t *testing.T) {
 				"PowerState": powerState.Load().(string),
 				"Boot": map[string]string{
 					"BootSourceOverrideTarget":  "Pxe",
-					"BootSourceOverrideEnabled": "Continuous",
+					"BootSourceOverrideEnabled": "Once",
 				},
 				"Links": map[string]any{
 					"Chassis": []map[string]any{
@@ -786,6 +786,9 @@ func TestBootOrderConfigPxeOn(t *testing.T) {
 			json.NewDecoder(r.Body).Decode(&patchBody)
 			w.WriteHeader(http.StatusOK)
 
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
+			w.WriteHeader(http.StatusOK)
+
 		case strings.Contains(r.URL.Path, "/TrustedComponents"):
 			http.NotFound(w, r)
 
@@ -816,6 +819,7 @@ func TestBootOrderConfigPxeOn(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
+				RebootCounter: 1,
 				RepaveCounter: 1,
 			},
 		},
@@ -852,8 +856,8 @@ func TestBootOrderConfigPxeOn(t *testing.T) {
 		t.Fatalf("expected BootSourceOverrideTarget=Pxe, got %v", boot["BootSourceOverrideTarget"])
 	}
 
-	if boot["BootSourceOverrideEnabled"] != "Continuous" {
-		t.Fatalf("expected BootSourceOverrideEnabled=Continuous, got %v", boot["BootSourceOverrideEnabled"])
+	if boot["BootSourceOverrideEnabled"] != "Once" {
+		t.Fatalf("expected BootSourceOverrideEnabled=Once, got %v", boot["BootSourceOverrideEnabled"])
 	}
 }
 
@@ -874,7 +878,7 @@ func TestBootOrderConfigPxeOff(t *testing.T) {
 				"PowerState": "On",
 				"Boot": map[string]string{
 					"BootSourceOverrideTarget":  "Pxe",
-					"BootSourceOverrideEnabled": "Continuous",
+					"BootSourceOverrideEnabled": "Once",
 				},
 				"Links": map[string]any{
 					"Chassis": []map[string]any{
@@ -956,6 +960,102 @@ func TestBootOrderConfigPxeOff(t *testing.T) {
 	}
 }
 
+func TestBootOrderConfigDoesNotRearmPXEAfterPowerCycleStarted(t *testing.T) {
+	var patchCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "Off",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Hdd",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{
+						{"@odata.id": "/redfish/v1/Chassis/1"},
+					},
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
+			w.WriteHeader(http.StatusOK)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("secret")},
+	}
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-started", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/test-image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b9", IPv4: "10.0.0.39", SubnetMask: "255.255.255.0"}},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{
+				RebootCounter: 1,
+				RepaveCounter: 1,
+			},
+		},
+		Status: v1alpha3.MachineStatus{
+			Redfish:    &v1alpha3.RedfishStatus{CertFingerprint: fp},
+			Operations: &v1alpha3.OperationsStatus{},
+			Conditions: []metav1.Condition{{
+				Type:               condPoweredOff,
+				Status:             metav1.ConditionTrue,
+				Reason:             reasonPoweringOn,
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node, secret).
+		WithStatusSubresource(node).
+		Build()
+
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-started", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if patchCalls.Load() != 0 {
+		t.Fatalf("expected 0 PATCH calls after power cycle started, got %d", patchCalls.Load())
+	}
+}
+
 func TestBootOrderConfigNoOp(t *testing.T) {
 	var patchCalls atomic.Int64
 
@@ -970,7 +1070,7 @@ func TestBootOrderConfigNoOp(t *testing.T) {
 				"PowerState": "On",
 				"Boot": map[string]string{
 					"BootSourceOverrideTarget":  "Pxe",
-					"BootSourceOverrideEnabled": "Continuous",
+					"BootSourceOverrideEnabled": "Once",
 				},
 				"Links": map[string]any{
 					"Chassis": []map[string]any{
@@ -981,6 +1081,9 @@ func TestBootOrderConfigNoOp(t *testing.T) {
 
 		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
 			patchCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
 			w.WriteHeader(http.StatusOK)
 
 		case strings.Contains(r.URL.Path, "/TrustedComponents"):
@@ -1013,6 +1116,7 @@ func TestBootOrderConfigNoOp(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
+				RebootCounter: 1,
 				RepaveCounter: 1,
 			},
 		},
@@ -1368,6 +1472,7 @@ func TestBootOrderConfigUnsupported(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
+				RebootCounter: 1,
 				RepaveCounter: 1,
 			},
 		},
@@ -1467,6 +1572,7 @@ func TestBootOrderConfigUnsupportedDuringPOST(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
+				RebootCounter: 1,
 				RepaveCounter: 1,
 			},
 		},
@@ -1588,6 +1694,7 @@ func TestBootOrderConfigTransientError(t *testing.T) {
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{
+				RebootCounter: 1,
 				RepaveCounter: 1,
 			},
 		},

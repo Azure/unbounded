@@ -18,10 +18,10 @@ import (
 )
 
 const (
-	// cloudInitTimeout is the maximum duration the CloudInitDone condition
-	// may remain in a non-terminal state (False/Running) before the
-	// controller marks it Unknown to signal that cloud-init appears stalled.
-	cloudInitTimeout = 5 * time.Minute
+	// cloudInitTimeout is the maximum duration the CloudInitDone condition may
+	// remain in a non-terminal state. First boot can spend a long time in
+	// modules-final while the agent provisions the node on slow metal.
+	cloudInitTimeout = 60 * time.Minute
 )
 
 type Reconciler struct {

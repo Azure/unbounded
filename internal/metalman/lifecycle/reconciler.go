@@ -19,7 +19,7 @@ import (
 const (
 	cloudInitReasonTimedOut = "TimedOut"
 
-	repaveTimeout = 30 * time.Minute // TODO: Make this configurable
+	repaveTimeout = 120 * time.Minute // TODO: Make this configurable
 )
 
 type Reconciler struct {

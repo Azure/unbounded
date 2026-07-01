@@ -49,6 +49,7 @@ type BootEnabled string
 
 const (
 	BootContinuous BootEnabled = "Continuous"
+	BootOnce       BootEnabled = "Once"
 	BootDisabled   BootEnabled = "Disabled"
 )
 
