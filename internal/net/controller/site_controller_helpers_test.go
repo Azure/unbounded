@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
@@ -64,9 +65,9 @@ func TestAssignmentConfigAndRegexHelpers(t *testing.T) {
 
 // TestCollectEnabledAssignmentsAndSelection tests collect enabled assignments and selection.
 func TestCollectEnabledAssignmentsAndSelection(t *testing.T) {
-	site := unboundednetv1alpha1.Site{
+	site := unboundedv1alpha3.Site{
 		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
-		Spec: unboundednetv1alpha1.SiteSpec{
+		Spec: unboundedv1alpha3.SiteSpec{
 			PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{
 				{AssignmentEnabled: ptrBool(true), CidrBlocks: []string{"10.244.0.0/16"}, NodeRegex: []string{"^node-"}, Priority: ptrInt32(20)},
 				{AssignmentEnabled: ptrBool(false), CidrBlocks: []string{"10.245.0.0/16"}, Priority: ptrInt32(1)},
@@ -79,7 +80,7 @@ func TestCollectEnabledAssignmentsAndSelection(t *testing.T) {
 		assignmentAllocators: map[string]*assignmentAllocator{},
 	}
 
-	enabled := sc.collectEnabledAssignments([]unboundednetv1alpha1.Site{site})
+	enabled := sc.collectEnabledAssignments([]unboundedv1alpha3.Site{site})
 	if len(enabled) != 2 {
 		t.Fatalf("expected two enabled assignments, got %d", len(enabled))
 	}
@@ -137,7 +138,7 @@ func TestCIDRAndAllocatorHelpers(t *testing.T) {
 	sc := &SiteController{}
 
 	state, err := sc.buildAssignmentAllocator(assignmentRef{
-		site:  unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}},
+		site:  unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}},
 		index: 0,
 		assignment: unboundednetv1alpha1.PodCidrAssignment{
 			CidrBlocks: []string{"10.250.0.0/16"},
@@ -149,7 +150,7 @@ func TestCIDRAndAllocatorHelpers(t *testing.T) {
 	}
 
 	if _, err := sc.buildAssignmentAllocator(assignmentRef{
-		site:       unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}},
+		site:       unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}},
 		index:      1,
 		assignment: unboundednetv1alpha1.PodCidrAssignment{},
 	}); err == nil {
@@ -237,25 +238,25 @@ func TestGatewayAndCIDROverlapHelpers(t *testing.T) {
 		t.Fatalf("isNodeGateway behavior mismatch")
 	}
 
-	noOverlap := []unboundednetv1alpha1.Site{
-		{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}, Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.0.0.0/16"}}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}, Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}}},
+	noOverlap := []unboundedv1alpha3.Site{
+		{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.0.0.0/16"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}}},
 	}
 	if err := validateSiteCIDRsNoOverlap(noOverlap); err != nil {
 		t.Fatalf("expected non-overlapping CIDRs, got %v", err)
 	}
 
-	exactOverlap := []unboundednetv1alpha1.Site{
-		{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}, Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.2.0.0/16"}}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}, Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.2.0.0/16"}}},
+	exactOverlap := []unboundedv1alpha3.Site{
+		{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.2.0.0/16"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.2.0.0/16"}}},
 	}
 	if err := validateSiteCIDRsNoOverlap(exactOverlap); err == nil {
 		t.Fatalf("expected exact CIDR overlap to fail")
 	}
 
-	rangeOverlap := []unboundednetv1alpha1.Site{
-		{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}, Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.3.0.0/16"}}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}, Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.3.1.0/24"}}},
+	rangeOverlap := []unboundedv1alpha3.Site{
+		{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.3.0.0/16"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.3.1.0/24"}}},
 	}
 	if err := validateSiteCIDRsNoOverlap(rangeOverlap); err == nil {
 		t.Fatalf("expected range overlap to fail")

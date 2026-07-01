@@ -132,8 +132,8 @@ Defaults are defined at the top of `create.sh`:
 
 ## End-to-End Flow: Joining a Nebius VM to an AKS Cluster
 
-This walks through the full flow of deploying the machina controller, creating
-a Nebius VM, and joining it as a worker node.
+This walks through the full flow of bootstrapping Unbounded, creating a Nebius
+VM, and joining it as a worker node.
 
 ### Prerequisites
 
@@ -141,23 +141,29 @@ a Nebius VM, and joining it as a worker node.
 - The `kubectl unbounded` plugin installed
 - The [Nebius CLI](https://docs.nebius.com/cli/install) installed and authenticated
 
-### Step 1: Deploy the machina controller
+### Step 1: Bootstrap Unbounded
 
-Install the CRDs and deploy the controller to your cluster:
+Install the CRDs and deploy `unbounded-operator` to your cluster:
 
 ```bash
-kubectl apply -f deploy/machina/crd/
-kubectl apply -f deploy/machina/
+kubectl unbounded install
 ```
 
-### Step 2: Run setup and generate SSH key
+### Step 2: Initialize the Site and generate SSH key
 
-This creates the RBAC resources, kubeadm configs, a bootstrap token, and an
-Ed25519 SSH key pair. The public key is saved locally as `unbounded_ed25519.pub`
-and the private key is stored as a Secret in the `unbounded-system` namespace.
+Create the Site resources and bootstrap token, then generate an Ed25519 SSH key
+pair. The public key is saved locally as `unbounded_ed25519.pub` and the private
+key is stored as a Secret in the `unbounded-system` namespace.
 
 ```bash
-kubectl unbounded setup
+kubectl unbounded site init \
+  --name site-nebius \
+  --cluster-node-cidr <AKS_NODE_CIDR> \
+  --cluster-pod-cidr <AKS_POD_CIDR> \
+  --node-cidr 172.20.0.0/16 \
+  --pod-cidr 10.200.0.0/16 \
+  --skip-install
+ssh-keygen -t ed25519 -f ./unbounded_ed25519 -N ""
 ```
 
 ### Step 3: Create Nebius network and apply the Site resource
@@ -175,7 +181,7 @@ The `site-nebius.yaml` declares the Nebius subnet CIDR (`172.20.0.0/16`) and
 the pod CIDR block (`10.200.0.0/16`) to assign to nodes at that site:
 
 ```yaml
-apiVersion: net.unbounded-cloud.io/v1alpha1
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Site
 metadata:
   name: site-nebius
@@ -203,12 +209,17 @@ Note the public IP from the output (e.g. `<NEBIUS_PUBLIC_IP>`).
 
 ### Step 5: Create a Machine pointing to the Nebius VM
 
-Create a Machine resource targeting the Nebius VM's public IP. The `--ssh-username`
+Register a Machine targeting the Nebius VM's public IP. The `--ssh-username`
 flag sets the SSH username for this specific machine (the Nebius default is
 `ubuntu`):
 
 ```bash
-kubectl unbounded create test1 --host <NEBIUS_PUBLIC_IP> --ssh-username ubuntu
+kubectl unbounded machine register \
+  --site site-nebius \
+  --name test1 \
+  --host <NEBIUS_PUBLIC_IP> \
+  --ssh-username ubuntu \
+  --ssh-private-key ./unbounded_ed25519
 ```
 
 The controller will probe the machine, SSH in, run the bootstrap script, and

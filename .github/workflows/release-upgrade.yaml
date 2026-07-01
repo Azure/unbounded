@@ -175,10 +175,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # Deploy the release to the target cluster.
   #
-  #   MODE=init     -> 'kubectl unbounded site init' using the embedded
-  #                    manifests bundled into the released plugin binary.
+  #   MODE=init     -> bootstrap CRDs/operator, then run 'kubectl unbounded site init'.
   #                    Used for the very first bootstrap of a cluster.
-  #   MODE=upgrade  -> server-side 'kubectl apply' of the rendered
+  #   MODE=upgrade  -> server-side apply CRDs/operator from the rendered
   #                    manifests that were attached to the GitHub Release.
   #
   # Note: this job downloads assets from the DRAFT GitHub Release (the
@@ -283,8 +282,8 @@ jobs:
           mkdir -p dist/manifests
           tar -xzf "dist/unbounded-manifests-${TAG}.tar.gz" -C dist/manifests
           MANIFESTS_DIR="dist/manifests/unbounded-manifests-${TAG}"
-          if [[ ! -d "${MANIFESTS_DIR}/net" || ! -d "${MANIFESTS_DIR}/machina" ]]; then
-            echo "::error::Tarball is missing expected net/ or machina/ subdir"
+          if [[ ! -d "${MANIFESTS_DIR}/net" || ! -d "${MANIFESTS_DIR}/machina" || ! -d "${MANIFESTS_DIR}/unbounded-operator" ]]; then
+            echo "::error::Tarball is missing expected net/, machina/, or unbounded-operator/ subdir"
             ls -la "${MANIFESTS_DIR}" || true
             exit 1
           fi
@@ -307,10 +306,13 @@ jobs:
           if [[ "${{ inputs.force_init }}" == "true" ]]; then
             MODE=init
             echo "force_init=true; selecting init mode"
-          elif ! kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1; then
+          elif kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1 && ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
+            echo "::error::Old Site CRD sites.net.unbounded-cloud.io is present but sites.unbounded-cloud.io is absent. Apply an explicit Site API migration before deploying this release."
+            exit 1
+          elif ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
             MODE=init
             echo "Site CRD not present; selecting init mode"
-          elif ! kubectl get site.net.unbounded-cloud.io "${SITE_NAME}" >/dev/null 2>&1; then
+          elif ! kubectl get site.unbounded-cloud.io "${SITE_NAME}" >/dev/null 2>&1; then
             MODE=init
             echo "Site '${SITE_NAME}' not present; selecting init mode"
           else
@@ -318,6 +320,11 @@ jobs:
           fi
           echo "MODE=${MODE}" >> "$GITHUB_ENV"
           echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+
+      - name: Bootstrap CRDs and operator
+        run: |
+          set -euo pipefail
+          kubectl unbounded install --timeout=5m
 
       - name: Run site init (first install)
         if: env.MODE == 'init'
@@ -329,15 +336,8 @@ jobs:
             --cluster-pod-cidr  "${CLUSTER_POD_CIDR}" \
             --node-cidr         "${SITE_NODE_CIDR}" \
             --pod-cidr          "${SITE_POD_CIDR}" \
-            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}"
-
-      - name: Apply CRDs (upgrade)
-        if: env.MODE == 'upgrade'
-        run: |
-          set -euo pipefail
-          kubectl apply --server-side --force-conflicts -f "${MANIFESTS_DIR}/net/crd/"
-          kubectl apply --server-side --force-conflicts -f "${MANIFESTS_DIR}/machina/crd/"
-          kubectl wait --for=condition=Established crd --all --timeout=120s
+            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}" \
+            --skip-install
 
       - name: Sanity check tarball contents (upgrade)
         if: env.MODE == 'upgrade'
@@ -354,84 +354,10 @@ jobs:
             exit 1
           fi
 
-      - name: Fetch release tooling from default branch (workaround for #235)
-        if: env.MODE == 'upgrade'
-        # The deploy job's primary checkout is pinned to the deployed tag,
-        # but the merge script for the #235 workaround lives under
-        # hack/release/ on the default branch and may not exist at older
-        # tags (e.g. when backfilling a release that predates the script).
-        # Pull just hack/release/ from the default branch into a tools
-        # subdirectory so the next step can invoke it regardless of the
-        # deployed tag.
-        #
-        # Mirrors the pattern used by smoke-discover and smoke-tests for
-        # hack/release/smoke/.
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          path: _release-tools
-          sparse-checkout: hack/release
-          sparse-checkout-cone-mode: true
-
-      - name: Workaround for #235 - merge bundled machina-config with live ConfigMap
-        if: env.MODE == 'upgrade'
-        # WORKAROUND for https://github.com/Azure/unbounded/issues/235.
-        #
-        # The shipped 03-config.yaml ships a machina-config ConfigMap whose
-        # inner config.yaml lacks the per-cluster `apiServerEndpoint` field
-        # required by machina-controller v0.1.5+. Only
-        # `kubectl unbounded site init` ever populates that field on the
-        # live ConfigMap. If we let the bundled template apply unmodified,
-        # it silently overwrites the live value and the controller starts
-        # crashing on the next pod restart.
-        #
-        # Instead of skipping the file outright (which would also drop any
-        # new keys the bundle introduces), we MERGE: load the live
-        # ConfigMap's inner config.yaml, load the bundle's inner
-        # config.yaml, take the union with LIVE WINNING on conflicts
-        # (policy A), and rewrite the bundle file in place. The subsequent
-        # `kubectl apply` then pushes a manifest that preserves all
-        # operator state while adding any new keys this release
-        # introduces.
-        #
-        # The merge logic lives in hack/release/merge-machina-config.py
-        # and is fetched from the default branch by the step above so
-        # backfills of older tags still get the latest version.
-        #
-        # REMOVE this step (along with the sparse checkout above and the
-        # merge script under hack/release/) once issue #235 lands upstream
-        # (e.g. controller falls back to in-cluster discovery, or the
-        # release tarball stops shipping 03-config.yaml).
-        env:
-          BUNDLE_FILE: ${{ env.MANIFESTS_DIR }}/machina/03-config.yaml
-          MERGE_SCRIPT: _release-tools/hack/release/merge-machina-config.py
-        run: |
-          set -euo pipefail
-          if [[ ! -f "$BUNDLE_FILE" ]]; then
-            echo "::warning::Workaround for #235 expected ${BUNDLE_FILE} but it was not present; the workaround may no longer be needed"
-            exit 0
-          fi
-
-          # Fetch the live inner config (empty if the ConfigMap does not exist yet).
-          LIVE_INNER=$(kubectl -n unbounded-kube get cm machina-config \
-            -o jsonpath='{.data.config\.yaml}' --ignore-not-found)
-          export LIVE_INNER
-
-          python3 "$MERGE_SCRIPT"
-
-          echo "Merged config.yaml that will be applied to the cluster:"
-          python3 -c "import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))['data']['config.yaml'])" "$BUNDLE_FILE"
-
-      - name: Apply manifests (upgrade)
-        if: env.MODE == 'upgrade'
-        run: |
-          set -euo pipefail
-          kubectl apply --server-side --force-conflicts -R -f "${MANIFESTS_DIR}/net/"
-          kubectl apply --server-side --force-conflicts -R -f "${MANIFESTS_DIR}/machina/"
-
       - name: Wait for rollouts
         run: |
           set -euo pipefail
+          kubectl -n unbounded-kube rollout status deploy/unbounded-operator       --timeout=5m
           kubectl -n unbounded-net  rollout status deploy/unbounded-net-controller --timeout=5m
           kubectl -n unbounded-net  rollout status ds/unbounded-net-node           --timeout=5m
           kubectl -n unbounded-kube rollout status deploy/machina-controller       --timeout=5m
@@ -451,6 +377,7 @@ jobs:
             echo "### Workload images"
             echo ""
             echo '```'
+            kubectl -n unbounded-kube get deploy unbounded-operator       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-net  get deploy unbounded-net-controller -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-net  get ds     unbounded-net-node       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-kube get deploy machina-controller       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true

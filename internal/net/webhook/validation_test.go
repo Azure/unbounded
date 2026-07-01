@@ -27,16 +27,16 @@ import (
 )
 
 type fakeSiteClient struct {
-	items []unboundednetv1alpha1.Site
+	items []unboundedv1alpha3.Site
 }
 
 // List lists resources for tests.
-func (f *fakeSiteClient) List(context.Context, metav1.ListOptions) (*unboundednetv1alpha1.SiteList, error) {
-	return &unboundednetv1alpha1.SiteList{Items: f.items}, nil
+func (f *fakeSiteClient) List(context.Context, metav1.ListOptions) (*unboundedv1alpha3.SiteList, error) {
+	return &unboundedv1alpha3.SiteList{Items: f.items}, nil
 }
 
 // Get gets a resource for tests.
-func (f *fakeSiteClient) Get(context.Context, string, metav1.GetOptions) (*unboundednetv1alpha1.Site, error) {
+func (f *fakeSiteClient) Get(context.Context, string, metav1.GetOptions) (*unboundedv1alpha3.Site, error) {
 	return nil, nil
 }
 
@@ -46,7 +46,7 @@ func (f *fakeSiteClient) Watch(context.Context, metav1.ListOptions) (watch.Inter
 }
 
 // UpdateStatus updates status for tests.
-func (f *fakeSiteClient) UpdateStatus(context.Context, *unboundednetv1alpha1.Site, metav1.UpdateOptions) (*unboundednetv1alpha1.Site, error) {
+func (f *fakeSiteClient) UpdateStatus(context.Context, *unboundedv1alpha3.Site, metav1.UpdateOptions) (*unboundedv1alpha3.Site, error) {
 	return nil, nil
 }
 
@@ -168,7 +168,7 @@ func TestValidateGatewayPool_AllowsValidHealthCheckSettings(t *testing.T) {
 // TestValidateSitePeering_RejectsUnknownSite tests validate site peering rejects unknown site.
 func TestValidateSitePeering_RejectsUnknownSite(t *testing.T) {
 	validator := &Validator{
-		siteClient: &fakeSiteClient{items: []unboundednetv1alpha1.Site{
+		siteClient: &fakeSiteClient{items: []unboundedv1alpha3.Site{
 			{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}},
 			{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}},
 		}},
@@ -198,7 +198,7 @@ func TestValidateSitePeering_RejectsUnknownSite(t *testing.T) {
 // TestValidateSiteGatewayPoolAssignment_RejectsUnknownPool tests validate site gateway pool assignment rejects unknown pool.
 func TestValidateSiteGatewayPoolAssignment_RejectsUnknownPool(t *testing.T) {
 	validator := &Validator{
-		siteClient: &fakeSiteClient{items: []unboundednetv1alpha1.Site{
+		siteClient: &fakeSiteClient{items: []unboundedv1alpha3.Site{
 			{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}},
 		}},
 		poolClient: &fakePoolClient{items: []unboundednetv1alpha1.GatewayPool{
@@ -290,10 +290,10 @@ func TestSplitCIDRBlocksAndResolveMaskSizes(t *testing.T) {
 
 // TestCollectAndValidateCIDROverlapHelpers tests collect and validate cidroverlap helpers.
 func TestCollectAndValidateCIDROverlapHelpers(t *testing.T) {
-	sites := []unboundednetv1alpha1.Site{
+	sites := []unboundedv1alpha3.Site{
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
-			Spec: unboundednetv1alpha1.SiteSpec{
+			Spec: unboundedv1alpha3.SiteSpec{
 				NodeCidrs: []string{"10.10.0.0/16"},
 				PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{
 					AssignmentEnabled: boolPtr(true),
@@ -303,7 +303,7 @@ func TestCollectAndValidateCIDROverlapHelpers(t *testing.T) {
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "site-b"},
-			Spec: unboundednetv1alpha1.SiteSpec{
+			Spec: unboundedv1alpha3.SiteSpec{
 				NodeCidrs: []string{"10.11.0.0/16"},
 				PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{
 					AssignmentEnabled: boolPtr(true),
@@ -329,9 +329,9 @@ func TestCollectAndValidateCIDROverlapHelpers(t *testing.T) {
 		t.Fatalf("validatePodCIDRsNoOverlap returned error: %v", err)
 	}
 
-	overlapSites := []unboundednetv1alpha1.Site{
-		{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}, Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.10.0.0/16"}}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}, Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.10.1.0/24"}}},
+	overlapSites := []unboundedv1alpha3.Site{
+		{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.10.0.0/16"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.10.1.0/24"}}},
 	}
 	if err := validateNodeCIDRsNoOverlap(overlapSites); err == nil {
 		t.Fatalf("expected overlap validation error")
@@ -340,7 +340,7 @@ func TestCollectAndValidateCIDROverlapHelpers(t *testing.T) {
 
 // TestDecodeSiteFromRequest tests decode site from request.
 func TestDecodeSiteFromRequest(t *testing.T) {
-	site := unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}}
+	site := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}}
 
 	raw, err := json.Marshal(site)
 	if err != nil {
@@ -459,13 +459,13 @@ func boolPtr(v bool) *bool {
 func TestValidateSiteSpecAndMergeSiteList(t *testing.T) {
 	// Empty nodeCidrs is now rejected by CRD schema (minItems: 1), so the
 	// webhook allows it through.
-	if err := validateSiteSpec(unboundednetv1alpha1.Site{}); err != nil {
+	if err := validateSiteSpec(unboundedv1alpha3.Site{}); err != nil {
 		t.Fatalf("expected validateSiteSpec to allow empty node CIDRs (CRD schema enforces minItems)")
 	}
 
-	site := unboundednetv1alpha1.Site{
+	site := unboundedv1alpha3.Site{
 		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
-		Spec: unboundednetv1alpha1.SiteSpec{
+		Spec: unboundedv1alpha3.SiteSpec{
 			NodeCidrs: []string{"10.0.0.0/16"},
 			PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{
 				AssignmentEnabled: boolPtr(false),
@@ -482,19 +482,19 @@ func TestValidateSiteSpecAndMergeSiteList(t *testing.T) {
 		t.Fatalf("expected invalid local CIDR to be rejected")
 	}
 
-	existing := []unboundednetv1alpha1.Site{{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}}}
+	existing := []unboundedv1alpha3.Site{{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}}}
 
-	merged := mergeSiteList(existing, unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}}, admissionv1.Create)
+	merged := mergeSiteList(existing, unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}}, admissionv1.Create)
 	if len(merged) != 2 {
 		t.Fatalf("expected create merge to append new site, got %#v", merged)
 	}
 
-	merged = mergeSiteList(existing, unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}, Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}}}, admissionv1.Update)
+	merged = mergeSiteList(existing, unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}}}, admissionv1.Update)
 	if len(merged) != 1 || len(merged[0].Spec.NodeCidrs) != 1 {
 		t.Fatalf("expected update merge to replace existing site, got %#v", merged)
 	}
 
-	merged = mergeSiteList(existing, unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-c"}}, admissionv1.Delete)
+	merged = mergeSiteList(existing, unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-c"}}, admissionv1.Delete)
 	if len(merged) != 1 || merged[0].Name != "site-a" {
 		t.Fatalf("expected delete merge to return existing list unchanged, got %#v", merged)
 	}
@@ -583,14 +583,14 @@ func TestValidateSiteCreateAndDelete(t *testing.T) {
 	client := kubefake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{"net.unbounded-cloud.io/site": "site-a"}}})
 	validator := &Validator{
 		clientset: client,
-		siteClient: &fakeSiteClient{items: []unboundednetv1alpha1.Site{
-			{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}, Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}}},
+		siteClient: &fakeSiteClient{items: []unboundedv1alpha3.Site{
+			{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}, Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}}},
 		}},
 	}
 
-	site := unboundednetv1alpha1.Site{
+	site := unboundedv1alpha3.Site{
 		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
-		Spec:       unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.0.0.0/16"}},
+		Spec:       unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.0.0.0/16"}},
 	}
 
 	raw, err := json.Marshal(site)
@@ -620,21 +620,21 @@ func TestValidateSiteCreateAndDelete(t *testing.T) {
 func TestValidateSiteRejectsDuplicateMachineSiteLabel(t *testing.T) {
 	validator := &Validator{
 		clientset: kubefake.NewClientset(),
-		siteClient: &fakeSiteClient{items: []unboundednetv1alpha1.Site{{
+		siteClient: &fakeSiteClient{items: []unboundedv1alpha3.Site{{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:   "remote",
 				Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "remote"},
 			},
-			Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}},
+			Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}},
 		}}},
 	}
 
-	site := unboundednetv1alpha1.Site{
+	site := unboundedv1alpha3.Site{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "remote-copy",
 			Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "remote"},
 		},
-		Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.2.0.0/16"}},
+		Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.2.0.0/16"}},
 	}
 
 	raw, err := json.Marshal(site)
@@ -659,21 +659,21 @@ func TestValidateSiteRejectsDuplicateMachineSiteLabel(t *testing.T) {
 func TestValidateSiteAllowsUpdateWithSameMachineSiteLabel(t *testing.T) {
 	validator := &Validator{
 		clientset: kubefake.NewClientset(),
-		siteClient: &fakeSiteClient{items: []unboundednetv1alpha1.Site{{
+		siteClient: &fakeSiteClient{items: []unboundedv1alpha3.Site{{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:   "remote",
 				Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "remote"},
 			},
-			Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}},
+			Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}},
 		}}},
 	}
 
-	site := unboundednetv1alpha1.Site{
+	site := unboundedv1alpha3.Site{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "remote",
 			Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "remote"},
 		},
-		Spec: unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}},
+		Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.1.0.0/16"}},
 	}
 
 	raw, err := json.Marshal(site)
@@ -862,8 +862,8 @@ func TestCidrsOverlap(t *testing.T) {
 // TestValidateIntraSiteCIDROverlap tests intra-site CIDR overlap detection.
 func TestValidateIntraSiteCIDROverlap(t *testing.T) {
 	// No overlap -- should pass
-	site := unboundednetv1alpha1.Site{
-		Spec: unboundednetv1alpha1.SiteSpec{
+	site := unboundedv1alpha3.Site{
+		Spec: unboundedv1alpha3.SiteSpec{
 			NodeCidrs:          []string{"10.0.0.0/16"},
 			NonMasqueradeCIDRs: []string{"172.16.0.0/16", "172.17.0.0/16"},
 			LocalCIDRs:         []string{"192.168.0.0/24", "192.168.1.0/24"},

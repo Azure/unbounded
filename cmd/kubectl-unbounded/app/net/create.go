@@ -382,7 +382,7 @@ CNI configuration.`,
 
 			obj := &unstructured.Unstructured{
 				Object: map[string]interface{}{
-					"apiVersion": "net.unbounded-cloud.io/v1alpha1",
+					"apiVersion": "unbounded-cloud.io/v1alpha3",
 					"kind":       "Site",
 					"metadata": map[string]interface{}{
 						"name": args[0],

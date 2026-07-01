@@ -4,9 +4,10 @@ weight: 2
 description: "Specifications for all 7 unbounded-net CRDs."
 ---
 
-unbounded-net uses seven Custom Resource Definitions (CRDs) in the
-`net.unbounded-cloud.io` API group. For a conceptual introduction to Sites and
-GatewayPools, see [Networking Concepts]({{< relref "concepts/networking" >}}).
+unbounded-net uses the shared `Site` resource in the `unbounded-cloud.io` API
+group plus network resources in the `net.unbounded-cloud.io` API group. For a
+conceptual introduction to Sites and GatewayPools, see
+[Networking Concepts]({{< relref "concepts/networking" >}}).
 
 ## Site
 
@@ -17,7 +18,7 @@ assigned to sites based on their internal IP addresses matching the site's
 ### Example
 
 ```yaml
-apiVersion: net.unbounded-cloud.io/v1alpha1
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Site
 metadata:
   name: site-east
@@ -108,7 +109,7 @@ kind: SiteNodeSlice
 metadata:
   name: site-east-0
   ownerReferences:
-    - apiVersion: net.unbounded-cloud.io/v1alpha1
+    - apiVersion: unbounded-cloud.io/v1alpha3
       kind: Site
       name: site-east
 siteName: site-east

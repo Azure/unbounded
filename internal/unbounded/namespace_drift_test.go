@@ -40,6 +40,7 @@ func TestSystemNamespace_MatchesTemplateDefaults(t *testing.T) {
 		{"machine-ops", filepath.Join("deploy", "machine-ops"), "00-namespace.yaml"},
 		{"orca", filepath.Join("deploy", "orca"), "01-namespace.yaml"},
 		{"storage-supervisor", filepath.Join("deploy", "unbounded-storage-supervisor"), "01-namespace.yaml"},
+		{"unbounded-operator", filepath.Join("deploy", "unbounded-operator"), "00-namespace.yaml"},
 		{"net", filepath.Join("deploy", "net"), "00-namespace.yaml"},
 		{"gantry", filepath.Join("deploy", "gantry"), "serviceaccount.yaml"},
 		{"inventory", filepath.Join("deploy", "inventory"), filepath.Join("common", "01-namespace.yaml")},

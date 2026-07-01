@@ -122,7 +122,7 @@ ensure_site_gateway_resources() {
 
     echo "==> Ensuring Site '${site_name}' and GatewayPool '${gateway_pool_name}' CRDs..."
     {
-        echo "apiVersion: net.unbounded-cloud.io/v1alpha1"
+        echo "apiVersion: unbounded-cloud.io/v1alpha3"
         echo "kind: Site"
         echo "metadata:"
         echo "  name: ${site_name}"
@@ -885,14 +885,14 @@ else
     kubectl rollout restart ds/kube-proxy -n kube-system 2>/dev/null || true
 fi
 
-echo "==> Running make -C hack/net deploy-crds..."
-(cd "$REPO_ROOT" && make -C hack/net deploy-crds)
+echo "==> Running make kubectl-unbounded-build..."
+(cd "$REPO_ROOT" && make kubectl-unbounded-build)
+
+echo "==> Bootstrapping CRDs and unbounded-operator..."
+(cd "$REPO_ROOT" && bin/kubectl-unbounded install)
 
 echo "==> Deploying site resources..."
 ensure_site_gateway_resources "$SITE_NAME" "${GATEWAY_POOL_NAME}"
-
-echo "==> Running make build && make -C hack/net deploy..."
-(cd "$REPO_ROOT" && make build && make -C hack/net deploy)
 
 echo ""
 echo "==> Kubeadm primary site '$SITE_NAME' deployment complete!"

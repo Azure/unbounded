@@ -15,7 +15,7 @@ rules:
     resources: ["nodes"]
     verbs: ["get", "watch", "patch"]
   # Sites: read to determine which site this node belongs to
-  - apiGroups: ["net.unbounded-cloud.io"]
+  - apiGroups: ["unbounded-cloud.io"]
     resources: ["sites"]
     verbs: ["get", "list", "watch"]
   # SiteNodeSlices: watch for peer information to configure WireGuard tunnels
