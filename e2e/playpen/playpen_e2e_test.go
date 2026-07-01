@@ -8,20 +8,21 @@ package playpen
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -55,35 +56,8 @@ type harness struct {
 	kubeClient kubernetes.Interface
 }
 
-type recordingCommander struct {
-	mu       sync.Mutex
-	commands []string
-}
-
 type operatorTransport struct {
 	op *operator.Operator
-}
-
-func (c *recordingCommander) Run(_ context.Context, name string, args ...string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.commands = append(c.commands, strings.Join(append([]string{name}, args...), " "))
-
-	return nil
-}
-
-func (c *recordingCommander) contains(fragment string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for _, cmd := range c.commands {
-		if strings.Contains(cmd, fragment) {
-			return true
-		}
-	}
-
-	return false
 }
 
 func (t operatorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -111,6 +85,9 @@ func (t operatorTransport) allocate(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return jsonResponse(req, status, map[string]string{"error": err.Error()})
 	}
+	// The e2e runner uses host networking, so target the runner's WireGuard
+	// socket directly instead of adding kube-proxy NodePort behavior to this test.
+	allocResp.Endpoint.WireGuardUDPPort = int32(allocResp.WireGuard.ListenPort)
 
 	return jsonResponse(req, status, allocResp)
 }
@@ -169,9 +146,7 @@ func TestPlaypenBasicLifecycle(t *testing.T) {
 	h.patchNodeExternalIPs(ctx)
 	h.waitForReadyRunner(ctx)
 
-	recorder := &recordingCommander{}
-
-	client, err := h.newPlaypenClient(recorder)
+	client, err := h.newPlaypenClient()
 	if err != nil {
 		t.Fatalf("create playpen client: %v", err)
 	}
@@ -180,6 +155,14 @@ func TestPlaypenBasicLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allocate playpen: %v", err)
 	}
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer closeCancel()
+
+		if err := allocated.Close(closeCtx); err != nil {
+			t.Logf("close playpen during cleanup: %v", err)
+		}
+	})
 
 	if allocated.Metadata.Pod.Namespace != namespace || allocated.Metadata.Pod.Name == "" {
 		t.Fatalf("allocation returned unexpected pod metadata: %#v", allocated.Metadata.Pod)
@@ -204,17 +187,8 @@ func TestPlaypenBasicLifecycle(t *testing.T) {
 		t.Fatalf("configure tunnel: %v", err)
 	}
 
-	if !recorder.contains("ip link add") || !recorder.contains("type wireguard") {
-		t.Fatalf("tunnel setup did not create a wireguard interface; commands: %#v", recorder.commands)
-	}
-
-	if !recorder.contains("type vxlan") {
-		t.Fatalf("tunnel setup did not create a vxlan interface; commands: %#v", recorder.commands)
-	}
-
-	if !recorder.contains(fmt.Sprintf("endpoint %s:%d", allocated.Metadata.Endpoint.Host, allocated.Metadata.Endpoint.WireGuardUDPPort)) {
-		t.Fatalf("tunnel setup did not target the allocated endpoint; commands: %#v", recorder.commands)
-	}
+	h.verifyTunnelInterfaces(ctx, allocated)
+	h.verifyTunnelConnectivity(ctx, allocated)
 
 	if err := allocated.Close(ctx); err != nil {
 		t.Fatalf("close playpen: %v", err)
@@ -245,9 +219,19 @@ func newHarness(t *testing.T) *harness {
 func (h *harness) checkPrereqs() {
 	h.t.Helper()
 
-	for _, bin := range []string{"docker", "kind", "kubectl"} {
+	for _, bin := range []string{"bridge", "docker", "ip", "kind", "kubectl", "wg"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			h.t.Skipf("e2e prereq %q missing on PATH; skipping suite", bin)
+		}
+	}
+
+	if os.Geteuid() != 0 {
+		if _, err := exec.LookPath("sudo"); err != nil {
+			h.t.Skipf("e2e prereq %q missing on PATH; skipping suite", "sudo")
+		}
+
+		if err := h.run(context.Background(), "sudo", "-n", "true"); err != nil {
+			h.t.Skipf("passwordless sudo unavailable (%v); skipping suite", err)
 		}
 	}
 
@@ -314,7 +298,7 @@ func (h *harness) initClients() {
 	h.kubeClient = kubeClient
 }
 
-func (h *harness) newPlaypenClient(cmd playpenclient.Commander) (*playpenclient.Client, error) {
+func (h *harness) newPlaypenClient() (*playpenclient.Client, error) {
 	h.t.Helper()
 
 	scheme := k8sruntime.NewScheme()
@@ -341,7 +325,6 @@ func (h *harness) newPlaypenClient(cmd playpenclient.Commander) (*playpenclient.
 	return playpenclient.New(playpenclient.Config{
 		RESTConfig: &rest.Config{Host: "http://playpen-e2e.local"},
 		HTTPClient: &http.Client{Transport: operatorTransport{op: op}},
-		Commander:  cmd,
 	})
 }
 
@@ -385,21 +368,21 @@ func (h *harness) applyManifests(ctx context.Context) {
 		h.t.Fatalf("apply playpen manifests: %v", err)
 	}
 
-	serverKey, err := wgtypes.GeneratePrivateKey()
-	if err != nil {
-		h.t.Fatalf("generate server wireguard key: %v", err)
-	}
-
 	h.patchDeploymentJSON(ctx, "playpen-runner-amd64", []map[string]any{
-		{
-			"op":    "add",
-			"path":  "/spec/template/metadata/annotations/playpen.unbounded-cloud.io~1server-wireguard-public-key",
-			"value": serverKey.PublicKey().String(),
-		},
 		{
 			"op":    "add",
 			"path":  "/spec/template/spec/tolerations",
 			"value": controlPlaneTolerations(),
+		},
+		{
+			"op":    "add",
+			"path":  "/spec/template/spec/hostNetwork",
+			"value": true,
+		},
+		{
+			"op":    "add",
+			"path":  "/spec/template/spec/dnsPolicy",
+			"value": "ClusterFirstWithHostNet",
 		},
 		{
 			"op":    "replace",
@@ -411,10 +394,21 @@ func (h *harness) applyManifests(ctx context.Context) {
 			"path": "/spec/template/spec/containers/0/args",
 			"value": []string{
 				"--architecture=amd64",
-				"--configure-network=false",
-				"--wireguard-client-public-key=e2e-client-key-placeholder",
+				"--wireguard-private-key-file=/etc/playpen/wireguard/privatekey",
+				"--wireguard-listen-port=51820",
 				"--listen-addr=:8443",
 				"--public-redfish-url=https://10.88.0.1:8443",
+			},
+		},
+		{
+			"op":   "replace",
+			"path": "/spec/template/spec/containers/0/env",
+			"value": []map[string]any{
+				{"name": "POD_NAME", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.name"}}},
+				{"name": "POD_NAMESPACE", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.namespace"}}},
+				{"name": "KUBERNETES_SERVICE_HOST", "value": h.controlPlaneIP(ctx)},
+				{"name": "KUBERNETES_SERVICE_PORT", "value": "6443"},
+				{"name": "KUBERNETES_SERVICE_PORT_HTTPS", "value": "6443"},
 			},
 		},
 		{
@@ -423,6 +417,7 @@ func (h *harness) applyManifests(ctx context.Context) {
 			"value": []map[string]any{
 				{"name": "data", "mountPath": "/var/lib/playpen-runner"},
 				{"name": "wireguard", "mountPath": "/etc/playpen/wireguard"},
+				{"name": "tun", "mountPath": "/dev/net/tun"},
 			},
 		},
 		{
@@ -431,6 +426,7 @@ func (h *harness) applyManifests(ctx context.Context) {
 			"value": []map[string]any{
 				{"name": "data", "emptyDir": map[string]any{}},
 				{"name": "wireguard", "emptyDir": map[string]any{}},
+				{"name": "tun", "hostPath": map[string]any{"path": "/dev/net/tun", "type": "CharDevice"}},
 			},
 		},
 	})
@@ -689,6 +685,121 @@ func (h *harness) waitForPodDeleted(ctx context.Context, podName string) {
 	}
 }
 
+func (h *harness) verifyTunnelInterfaces(ctx context.Context, allocated *playpenclient.Playpen) {
+	h.t.Helper()
+
+	cfg := allocated.TunnelConfig()
+	if err := h.runPrivileged(ctx, "ip", "link", "show", "dev", cfg.WireGuardInterface); err != nil {
+		h.t.Fatalf("show wireguard interface %s: %v", cfg.WireGuardInterface, err)
+	}
+
+	if err := h.runPrivileged(ctx, "ip", "-d", "link", "show", "dev", cfg.VXLANInterface); err != nil {
+		h.t.Fatalf("show vxlan interface %s: %v", cfg.VXLANInterface, err)
+	}
+
+	peers, err := h.runPrivilegedOut(ctx, "wg", "show", cfg.WireGuardInterface, "peers")
+	if err != nil {
+		h.t.Fatalf("show wireguard peers for %s: %v", cfg.WireGuardInterface, err)
+	}
+
+	if !strings.Contains(peers, allocated.Metadata.WireGuard.ServerPublicKey) {
+		h.t.Fatalf("wireguard peers for %s do not include server public key %s: %s", cfg.WireGuardInterface, allocated.Metadata.WireGuard.ServerPublicKey, peers)
+	}
+}
+
+func (h *harness) verifyTunnelConnectivity(ctx context.Context, allocated *playpenclient.Playpen) {
+	h.t.Helper()
+
+	client := h.redfishHTTPClient(allocated)
+	readyURL := strings.TrimRight(allocated.Metadata.Redfish["url"], "/") + "/readyz"
+	if _, err := url.ParseRequestURI(readyURL); err != nil {
+		h.t.Fatalf("parse redfish ready URL %q: %v", readyURL, err)
+	}
+
+	if err := wait(ctx, 45*time.Second, func(ctx context.Context) (bool, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, readyURL, http.NoBody)
+		if err != nil {
+			return false, err
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return false, nil
+		}
+		defer resp.Body.Close() //nolint:errcheck // Test cleanup only.
+
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck // Test response drain only.
+
+		return resp.StatusCode == http.StatusNoContent, nil
+	}); err != nil {
+		h.dumpTunnelDiagnostics(context.Background(), allocated)
+		h.t.Fatalf("verify tunnel connectivity to %s: %v", readyURL, err)
+	}
+}
+
+func (h *harness) dumpTunnelDiagnostics(ctx context.Context, allocated *playpenclient.Playpen) {
+	cfg := allocated.TunnelConfig()
+	for _, args := range [][]string{
+		{"addr", "show", "dev", cfg.WireGuardInterface},
+		{"route", "get", "10.88.0.1"},
+		{"-d", "link", "show", "dev", cfg.VXLANInterface},
+	} {
+		out, err := h.runPrivilegedOut(ctx, "ip", args...)
+		if err != nil {
+			h.t.Logf("ip %s failed: %v", strings.Join(args, " "), err)
+			continue
+		}
+
+		h.t.Logf("ip %s\n%s", strings.Join(args, " "), out)
+	}
+
+	for _, args := range [][]string{
+		{"show", cfg.WireGuardInterface},
+		{"show", cfg.WireGuardInterface, "endpoints"},
+		{"show", cfg.WireGuardInterface, "latest-handshakes"},
+	} {
+		out, err := h.runPrivilegedOut(ctx, "wg", args...)
+		if err != nil {
+			h.t.Logf("wg %s failed: %v", strings.Join(args, " "), err)
+			continue
+		}
+
+		h.t.Logf("wg %s\n%s", strings.Join(args, " "), out)
+	}
+
+	for _, args := range [][]string{
+		{"get", "pod", allocated.Metadata.Pod.Name, "-n", namespace, "-o", "yaml"},
+		{"logs", "-n", namespace, allocated.Metadata.Pod.Name, "--tail=200"},
+	} {
+		out, err := h.runOut(ctx, "kubectl", args...)
+		if err != nil {
+			h.t.Logf("kubectl %s failed: %v", strings.Join(args, " "), err)
+			continue
+		}
+
+		h.t.Logf("kubectl %s\n%s", strings.Join(args, " "), out)
+	}
+}
+
+func (h *harness) redfishHTTPClient(allocated *playpenclient.Playpen) *http.Client {
+	h.t.Helper()
+
+	certPEM := strings.TrimSpace(allocated.Metadata.Redfish["certPEM"])
+	if certPEM == "" {
+		h.t.Fatal("allocation redfish metadata did not include certPEM")
+	}
+
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM([]byte(certPEM)) {
+		h.t.Fatal("allocation redfish certPEM did not contain a valid certificate")
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
+
+	return &http.Client{Timeout: 5 * time.Second, Transport: transport}
+}
+
 func (h *harness) teardown(ctx context.Context) {
 	if err := h.run(ctx, "kind", "delete", "cluster", "--name", clusterName); err != nil {
 		h.t.Logf("kind delete cluster: %v", err)
@@ -723,6 +834,22 @@ func (h *harness) runOut(ctx context.Context, name string, args ...string) (stri
 	out, err := h.runCaptured(ctx, name, nil, args...)
 
 	return out, err
+}
+
+func (h *harness) runPrivileged(ctx context.Context, name string, args ...string) error {
+	_, err := h.runPrivilegedOut(ctx, name, args...)
+
+	return err
+}
+
+func (h *harness) runPrivilegedOut(ctx context.Context, name string, args ...string) (string, error) {
+	if os.Geteuid() == 0 {
+		return h.runOut(ctx, name, args...)
+	}
+
+	sudoArgs := append([]string{"-n", name}, args...)
+
+	return h.runOut(ctx, "sudo", sudoArgs...)
 }
 
 func (h *harness) runCaptured(ctx context.Context, name string, stdin io.Reader, args ...string) (string, error) {

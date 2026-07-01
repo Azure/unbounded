@@ -18,20 +18,26 @@ import (
 	"github.com/Azure/unbounded/internal/playpen/operator"
 )
 
-// Commander runs local network configuration commands.
-type Commander interface {
+// commander runs local network configuration commands.
+type commander interface {
 	Run(ctx context.Context, name string, args ...string) error
 }
 
-// OSCommander executes commands on the local host.
-type OSCommander struct{}
+type osCommander struct{}
 
-func (OSCommander) Run(ctx context.Context, name string, args ...string) error {
+func (osCommander) Run(ctx context.Context, name string, args ...string) error {
+	if os.Geteuid() != 0 {
+		args = append([]string{"-n", name}, args...)
+		name = "sudo"
+	}
+
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) > 0 {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
 
-	return cmd.Run()
+	return err
 }
 
 // TunnelConfig controls local interface names and WireGuard settings.
@@ -43,9 +49,8 @@ type TunnelConfig struct {
 	PrivateKeyFile      string
 }
 
-// Tunnel manages local network resources for a playpen.
-type Tunnel struct {
-	cmd                 Commander
+type tunnel struct {
+	cmd                 commander
 	privateKey          string
 	metadata            operator.AllocResponse
 	cfg                 TunnelConfig
@@ -53,11 +58,11 @@ type Tunnel struct {
 	createdPrivateKeyAt string
 }
 
-func NewTunnel(cmd Commander, privateKey string, metadata operator.AllocResponse, cfg TunnelConfig) *Tunnel {
-	return &Tunnel{cmd: cmd, privateKey: privateKey, metadata: metadata, cfg: cfg}
+func newTunnel(cmd commander, privateKey string, metadata operator.AllocResponse, cfg TunnelConfig) *tunnel {
+	return &tunnel{cmd: cmd, privateKey: privateKey, metadata: metadata, cfg: cfg}
 }
 
-func (t *Tunnel) Setup(ctx context.Context) error {
+func (t *tunnel) Setup(ctx context.Context) error {
 	if err := t.validate(); err != nil {
 		return err
 	}
@@ -117,7 +122,7 @@ func (t *Tunnel) Setup(ctx context.Context) error {
 	return nil
 }
 
-func (t *Tunnel) Teardown(ctx context.Context) error {
+func (t *tunnel) Teardown(ctx context.Context) error {
 	if t.cfg.VXLANInterface != "" {
 		t.cmd.Run(ctx, "ip", "link", "delete", t.cfg.VXLANInterface) //nolint:errcheck // Teardown is best-effort for idempotency.
 	}
@@ -135,7 +140,7 @@ func (t *Tunnel) Teardown(ctx context.Context) error {
 	return nil
 }
 
-func (t *Tunnel) validate() error {
+func (t *tunnel) validate() error {
 	if t.cmd == nil {
 		return fmt.Errorf("commander is required")
 	}
@@ -159,7 +164,7 @@ func (t *Tunnel) validate() error {
 	return nil
 }
 
-func (t *Tunnel) privateKeyFile() (string, error) {
+func (t *tunnel) privateKeyFile() (string, error) {
 	if t.cfg.PrivateKeyFile != "" {
 		return t.cfg.PrivateKeyFile, os.WriteFile(t.cfg.PrivateKeyFile, []byte(t.privateKey+"\n"), 0o600)
 	}

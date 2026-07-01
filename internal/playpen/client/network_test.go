@@ -18,7 +18,7 @@ func TestTunnelSetupCommands(t *testing.T) {
 
 	fake := &fakeCommander{}
 	metadata := testAllocResponse()
-	tunnel := NewTunnel(fake, key.String(), metadata, TunnelConfig{
+	tunnel := newTunnel(fake, key.String(), metadata, TunnelConfig{
 		WireGuardInterface:  "wg-playpen",
 		VXLANInterface:      "vx-playpen",
 		PersistentKeepalive: 25,

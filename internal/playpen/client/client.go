@@ -34,15 +34,14 @@ type Config struct {
 	RESTConfig *rest.Config
 	// HTTPClient overrides the client built from RESTConfig. It is intended for tests.
 	HTTPClient *http.Client
-	// Commander overrides local network command execution. It is intended for tests.
-	Commander Commander
+	cmd        commander
 }
 
 // Client is a high-level client for allocating and releasing playpens.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
-	cmd        Commander
+	cmd        commander
 }
 
 // AllocateOptions controls one playpen allocation.
@@ -62,7 +61,7 @@ type Playpen struct {
 	idempotencyKey      string
 	wireGuardPrivateKey string
 	closed              bool
-	tunnel              *Tunnel
+	tunnel              *tunnel
 
 	Metadata operator.AllocResponse
 }
@@ -90,9 +89,9 @@ func New(cfg Config) (*Client, error) {
 		}
 	}
 
-	cmd := cfg.Commander
+	cmd := cfg.cmd
 	if cmd == nil {
-		cmd = OSCommander{}
+		cmd = osCommander{}
 	}
 
 	return &Client{baseURL: baseURL, httpClient: httpClient, cmd: cmd}, nil
@@ -143,7 +142,7 @@ func (c *Client) Allocate(ctx context.Context, opts AllocateOptions) (*Playpen, 
 		idempotencyKey:      idempotencyKey,
 		wireGuardPrivateKey: privateKey,
 		Metadata:            resp,
-		tunnel: NewTunnel(c.cmd, privateKey, resp, tunnelConfigWithDefaults(
+		tunnel: newTunnel(c.cmd, privateKey, resp, tunnelConfigWithDefaults(
 			opts.Tunnel,
 			idempotencyKey,
 		)),
@@ -164,6 +163,14 @@ func (c *Client) deallocate(ctx context.Context, idempotencyKey string) error {
 // WireGuardPrivateKey returns the client's WireGuard private key for this playpen.
 func (p *Playpen) WireGuardPrivateKey() string {
 	return p.wireGuardPrivateKey
+}
+
+// TunnelConfig returns the local tunnel settings for this playpen.
+func (p *Playpen) TunnelConfig() TunnelConfig {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.tunnel.cfg
 }
 
 // ConfigureTunnel creates the local WireGuard and VXLAN resources for this playpen.

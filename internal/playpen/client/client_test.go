@@ -130,7 +130,7 @@ func TestCloseTearsDownTunnelBeforeDeallocateAndIsIdempotent(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c, err := New(Config{RESTConfig: &rest.Config{Host: server.URL}, HTTPClient: server.Client(), Commander: fake})
+	c, err := New(Config{RESTConfig: &rest.Config{Host: server.URL}, HTTPClient: server.Client(), cmd: fake})
 	if err != nil {
 		t.Fatal(err)
 	}
