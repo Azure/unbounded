@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -37,10 +38,11 @@ type recordedCommand struct {
 }
 
 type fakeCommander struct {
-	mu       sync.Mutex
-	runs     []recordedCommand
-	starts   []recordedCommand
-	startErr error
+	mu        sync.Mutex
+	runs      []recordedCommand
+	starts    []recordedCommand
+	startErr  error
+	startHook func(recordedCommand) error
 }
 
 func (f *fakeCommander) Run(_ context.Context, name string, args ...string) error {
@@ -52,11 +54,20 @@ func (f *fakeCommander) Run(_ context.Context, name string, args ...string) erro
 }
 
 func (f *fakeCommander) Start(_ context.Context, name string, args []string, _, _ string) (Process, error) {
+	cmd := recordedCommand{Name: name, Args: append([]string(nil), args...)}
+
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.starts = append(f.starts, recordedCommand{Name: name, Args: append([]string(nil), args...)})
-	if f.startErr != nil {
-		return nil, f.startErr
+	f.starts = append(f.starts, cmd)
+	startErr := f.startErr
+	startHook := f.startHook
+	f.mu.Unlock()
+	if startErr != nil {
+		return nil, startErr
+	}
+	if startHook != nil {
+		if err := startHook(cmd); err != nil {
+			return nil, err
+		}
 	}
 
 	return &fakeProcess{pid: len(f.starts)}, nil
@@ -226,7 +237,28 @@ func TestPublishServerWireGuardPublicKeyAnnotatesPod(t *testing.T) {
 func TestVMManagerQEMUCommands(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.QEMU.EnableTPM = true
-	fake := &fakeCommander{}
+	var swtpmSocket net.Listener
+	fake := &fakeCommander{
+		startHook: func(cmd recordedCommand) error {
+			if cmd.Name != cfg.QEMU.SWTPMBinary {
+				return nil
+			}
+
+			listener, err := net.Listen("unix", filepath.Join(os.TempDir(), "playpen-runner-swtpm.sock"))
+			if err != nil {
+				return err
+			}
+			swtpmSocket = listener
+
+			return nil
+		},
+	}
+	t.Cleanup(func() {
+		if swtpmSocket != nil {
+			_ = swtpmSocket.Close()
+		}
+		_ = os.Remove(filepath.Join(os.TempDir(), "playpen-runner-swtpm.sock"))
+	})
 	vm := NewVMManager(fake, cfg)
 
 	if err := vm.Reset(t.Context(), ResetOn); err != nil {

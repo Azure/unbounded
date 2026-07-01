@@ -220,11 +220,47 @@ func (m *VMManager) startSWTPM(ctx context.Context) (Process, error) {
 		"--log", "level=20",
 	}
 
-	return m.cmd.Start(ctx, m.cfg.QEMU.SWTPMBinary, args, filepath.Join(m.cfg.DataDir, "swtpm.log"), filepath.Join(m.cfg.DataDir, "swtpm.err"))
+	proc, err := m.cmd.Start(ctx, m.cfg.QEMU.SWTPMBinary, args, filepath.Join(m.cfg.DataDir, "swtpm.log"), filepath.Join(m.cfg.DataDir, "swtpm.err"))
+	if err != nil {
+		return nil, err
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := waitForUnixSocket(waitCtx, socketPath); err != nil {
+		return nil, errors.Join(err, m.stopProcess(proc))
+	}
+
+	return proc, nil
 }
 
 func (m *VMManager) swtpmSocketPath() string {
 	return filepath.Join(os.TempDir(), "playpen-runner-swtpm.sock")
+}
+
+func waitForUnixSocket(ctx context.Context, path string) error {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		info, err := os.Stat(path)
+		if err == nil {
+			if info.Mode()&os.ModeSocket == 0 {
+				return fmt.Errorf("%s exists but is not a Unix socket", path)
+			}
+
+			return nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for Unix socket %s: %w", path, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func (m *VMManager) qemuArgs() []string {
