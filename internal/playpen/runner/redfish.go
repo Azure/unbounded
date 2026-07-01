@@ -4,27 +4,37 @@
 package runner
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/coder/websocket"
 )
 
 type RedfishHandler struct {
 	vm       *VMManager
 	cfg      RedfishConfig
+	dataDir  string
 	sessions map[string]struct{}
 	mu       sync.Mutex
 }
 
-func NewRedfishHandler(vm *VMManager, cfg RedfishConfig) *RedfishHandler {
+func NewRedfishHandler(vm *VMManager, cfg RedfishConfig, dataDir string) *RedfishHandler {
 	return &RedfishHandler{
 		vm:       vm,
 		cfg:      cfg,
+		dataDir:  dataDir,
 		sessions: map[string]struct{}{},
 	}
 }
@@ -69,6 +79,8 @@ func (h *RedfishHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 	case r.Method == http.MethodGet && path == "/redfish/v1/Systems/"+h.cfg.DeviceID:
 		h.getSystem(w)
+	case r.Method == http.MethodGet && path == h.serialConsoleStreamPath():
+		h.streamSerialConsole(w, r)
 	case r.Method == http.MethodPatch && path == "/redfish/v1/Systems/"+h.cfg.DeviceID:
 		h.patchSystem(w, r)
 	case r.Method == http.MethodPost && path == "/redfish/v1/Systems/"+h.cfg.DeviceID+"/Actions/ComputerSystem.Reset":
@@ -143,14 +155,118 @@ func (h *RedfishHandler) credentialsMatch(user, pass string) bool {
 func (h *RedfishHandler) getSystem(w http.ResponseWriter) {
 	boot := h.vm.BootConfig()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"@odata.id":  "/redfish/v1/Systems/" + h.cfg.DeviceID,
-		"Id":         h.cfg.DeviceID,
-		"PowerState": h.vm.PowerState(),
+		"@odata.id":   "/redfish/v1/Systems/" + h.cfg.DeviceID,
+		"@odata.type": "#ComputerSystem.v1_20_0.ComputerSystem",
+		"Id":          h.cfg.DeviceID,
+		"Name":        "Playpen VM",
+		"PowerState":  h.vm.PowerState(),
 		"Boot": map[string]string{
 			"BootSourceOverrideTarget":  string(boot.Target),
 			"BootSourceOverrideEnabled": string(boot.Enabled),
 		},
+		"SerialConsole": map[string]any{
+			"ServiceEnabled":        true,
+			"MaxConcurrentSessions": 1,
+			"ConnectTypesSupported": []string{"OEM"},
+			"Oem": map[string]any{
+				"Unbounded": map[string]any{
+					"ReadOnly":  true,
+					"Protocol":  "WebSocket",
+					"StreamURI": h.serialConsoleStreamPath(),
+				},
+			},
+		},
 	})
+}
+
+func (h *RedfishHandler) streamSerialConsole(w http.ResponseWriter, r *http.Request) {
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: []string{"*"}})
+	if err != nil {
+		return
+	}
+	defer conn.CloseNow() //nolint:errcheck // Connection cleanup only.
+
+	if err := h.followSerialLog(r.Context(), conn); err != nil && !errors.Is(err, context.Canceled) {
+		_ = conn.Close(websocket.StatusInternalError, err.Error())
+	}
+}
+
+func (h *RedfishHandler) followSerialLog(ctx context.Context, conn *websocket.Conn) error {
+	path := filepath.Join(h.dataDir, "serial.log")
+	buf := make([]byte, 32*1024)
+
+	for {
+		file, err := os.Open(path)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+
+			if err := sleepContext(ctx, 200*time.Millisecond); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		if err := streamOpenSerialLog(ctx, conn, file, path, buf); err != nil {
+			_ = file.Close()
+
+			return err
+		}
+
+		_ = file.Close()
+	}
+}
+
+func streamOpenSerialLog(ctx context.Context, conn *websocket.Conn, file *os.File, path string, buf []byte) error {
+	for {
+		n, err := file.Read(buf)
+		if n > 0 {
+			if writeErr := conn.Write(ctx, websocket.MessageBinary, buf[:n]); writeErr != nil {
+				return writeErr
+			}
+		}
+
+		switch {
+		case err == nil:
+			continue
+		case errors.Is(err, io.EOF):
+			offset, seekErr := file.Seek(0, io.SeekCurrent)
+			if seekErr != nil {
+				return seekErr
+			}
+
+			info, statErr := os.Stat(path)
+			if statErr == nil && info.Size() < offset {
+				if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
+					return seekErr
+				}
+			}
+
+			if sleepErr := sleepContext(ctx, 200*time.Millisecond); sleepErr != nil {
+				return sleepErr
+			}
+		default:
+			return err
+		}
+	}
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (h *RedfishHandler) serialConsoleStreamPath() string {
+	return "/redfish/v1/Systems/" + h.cfg.DeviceID + "/Oem/Unbounded/SerialConsole/Stream"
 }
 
 func (h *RedfishHandler) patchSystem(w http.ResponseWriter, r *http.Request) {

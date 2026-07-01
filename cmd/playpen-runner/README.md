@@ -12,7 +12,8 @@ self-signed certificate stored in `--data-dir`.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `/redfish/v1/` | Minimal Redfish service for VM power and boot control |
+| `/redfish/v1/` | Minimal Redfish service for VM power, boot control, and serial console discovery |
+| `/redfish/v1/Systems/1/Oem/Unbounded/SerialConsole/Stream` | Authenticated read-only VM serial console WebSocket stream |
 | `/playpen/v1/info` | WireGuard, VXLAN, guest network, and Redfish metadata |
 | `/healthz` | Liveness probe |
 | `/readyz` | Readiness probe |
@@ -20,6 +21,13 @@ self-signed certificate stored in `--data-dir`.
 The Redfish implementation supports session tokens and basic authentication. It
 can report power state, set boot override, and handle `ComputerSystem.Reset`:
 `On` starts QEMU and `ForceOff` stops it. The default boot target is PXE.
+
+The `ComputerSystem` resource advertises the VM serial console through the
+standard `SerialConsole` property. The byte stream itself is an OEM WebSocket
+protocol exposed under the same Redfish service and marked with
+`ConnectTypesSupported: ["OEM"]`. The stream is read-only, requires Redfish auth,
+and is reachable through the runner listener, which is normally the WireGuard
+tunnel address `10.88.0.1:8443`.
 
 ## Networking
 

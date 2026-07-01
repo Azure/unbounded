@@ -6,7 +6,10 @@ package runner
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -14,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 
 	metalredfish "github.com/Azure/unbounded/internal/metalman/redfish"
 )
@@ -224,7 +229,7 @@ func TestRedfishWithMetalmanClient(t *testing.T) {
 	cfg.QEMU.EnableTPM = false
 	fake := &fakeCommander{}
 	vm := NewVMManager(fake, cfg)
-	handler := NewRedfishHandler(vm, cfg.Redfish)
+	handler := NewRedfishHandler(vm, cfg.Redfish, cfg.DataDir)
 	server := httptest.NewTLSServer(handler)
 	t.Cleanup(server.Close)
 
@@ -278,6 +283,138 @@ func TestRedfishWithMetalmanClient(t *testing.T) {
 	}
 }
 
+func TestRedfishSystemAdvertisesSerialConsole(t *testing.T) {
+	cfg := testConfig(t)
+	vm := NewVMManager(&fakeCommander{}, cfg)
+	server := httptest.NewServer(NewRedfishHandler(vm, cfg.Redfish, cfg.DataDir))
+	t.Cleanup(server.Close)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+"/redfish/v1/Systems/"+cfg.Redfish.DeviceID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth(cfg.Redfish.Username, cfg.Redfish.Password)
+
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var body struct {
+		ODataType     string `json:"@odata.type"`
+		ID            string `json:"Id"`
+		Name          string `json:"Name"`
+		SerialConsole struct {
+			ServiceEnabled        bool     `json:"ServiceEnabled"`
+			MaxConcurrentSessions int      `json:"MaxConcurrentSessions"`
+			ConnectTypesSupported []string `json:"ConnectTypesSupported"`
+			Oem                   struct {
+				Unbounded struct {
+					ReadOnly  bool   `json:"ReadOnly"`
+					Protocol  string `json:"Protocol"`
+					StreamURI string `json:"StreamURI"`
+				} `json:"Unbounded"`
+			} `json:"Oem"`
+		} `json:"SerialConsole"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+
+	if body.ODataType != "#ComputerSystem.v1_20_0.ComputerSystem" {
+		t.Fatalf("@odata.type = %q", body.ODataType)
+	}
+	if body.ID != cfg.Redfish.DeviceID || body.Name == "" {
+		t.Fatalf("unexpected system identity: id=%q name=%q", body.ID, body.Name)
+	}
+	if !body.SerialConsole.ServiceEnabled {
+		t.Fatal("serial console service is not enabled")
+	}
+	if body.SerialConsole.MaxConcurrentSessions != 1 {
+		t.Fatalf("max sessions = %d, want 1", body.SerialConsole.MaxConcurrentSessions)
+	}
+	if len(body.SerialConsole.ConnectTypesSupported) != 1 || body.SerialConsole.ConnectTypesSupported[0] != "OEM" {
+		t.Fatalf("connect types = %#v, want OEM", body.SerialConsole.ConnectTypesSupported)
+	}
+	if !body.SerialConsole.Oem.Unbounded.ReadOnly {
+		t.Fatal("serial console stream is not marked read-only")
+	}
+	if body.SerialConsole.Oem.Unbounded.Protocol != "WebSocket" {
+		t.Fatalf("protocol = %q, want WebSocket", body.SerialConsole.Oem.Unbounded.Protocol)
+	}
+	wantURI := "/redfish/v1/Systems/" + cfg.Redfish.DeviceID + "/Oem/Unbounded/SerialConsole/Stream"
+	if body.SerialConsole.Oem.Unbounded.StreamURI != wantURI {
+		t.Fatalf("stream URI = %q, want %q", body.SerialConsole.Oem.Unbounded.StreamURI, wantURI)
+	}
+}
+
+func TestRedfishSerialConsoleStreamRequiresAuth(t *testing.T) {
+	cfg := testConfig(t)
+	vm := NewVMManager(&fakeCommander{}, cfg)
+	server := httptest.NewServer(NewRedfishHandler(vm, cfg.Redfish, cfg.DataDir))
+	t.Cleanup(server.Close)
+
+	resp, err := server.Client().Get(server.URL + "/redfish/v1/Systems/" + cfg.Redfish.DeviceID + "/Oem/Unbounded/SerialConsole/Stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+func TestRedfishSerialConsoleStreamFollowsSerialLog(t *testing.T) {
+	cfg := testConfig(t)
+	vm := NewVMManager(&fakeCommander{}, cfg)
+	server := httptest.NewServer(NewRedfishHandler(vm, cfg.Redfish, cfg.DataDir))
+	t.Cleanup(server.Close)
+
+	if err := os.WriteFile(filepath.Join(cfg.DataDir, "serial.log"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/redfish/v1/Systems/" + cfg.Redfish.DeviceID + "/Oem/Unbounded/SerialConsole/Stream"
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: redfishBasicAuthHeader(cfg)})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow() //nolint:errcheck // Test cleanup.
+
+	file, err := os.OpenFile(filepath.Join(cfg.DataDir, "serial.log"), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("booting\n"); err != nil {
+		_ = file.Close()
+
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	messageType, data, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if messageType != websocket.MessageBinary {
+		t.Fatalf("message type = %v, want binary", messageType)
+	}
+	if string(data) != "booting\n" {
+		t.Fatalf("stream data = %q, want serial log bytes", string(data))
+	}
+}
+
 func testConfig(t *testing.T) Config {
 	t.Helper()
 
@@ -303,4 +440,12 @@ func tlsServerFingerprint(server *httptest.Server) string {
 	}
 
 	return strings.Join(parts, ":")
+}
+
+func redfishBasicAuthHeader(cfg Config) http.Header {
+	header := http.Header{}
+	token := base64.StdEncoding.EncodeToString([]byte(cfg.Redfish.Username + ":" + cfg.Redfish.Password))
+	header.Set("Authorization", "Basic "+token)
+
+	return header
 }

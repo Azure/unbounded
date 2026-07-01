@@ -556,10 +556,12 @@ func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string
 			DNS:         runnerCfg.Guest.DNS,
 		},
 		Redfish: map[string]string{
-			"url":      redfishURL,
-			"username": runnerCfg.Redfish.Username,
-			"password": runnerCfg.Redfish.Password,
-			"deviceID": runnerCfg.Redfish.DeviceID,
+			"url":                    redfishURL,
+			"username":               runnerCfg.Redfish.Username,
+			"password":               runnerCfg.Redfish.Password,
+			"deviceID":               runnerCfg.Redfish.DeviceID,
+			"systemURL":              redfishURL + "/redfish/v1/Systems/" + runnerCfg.Redfish.DeviceID,
+			"serialConsoleStreamURI": "/redfish/v1/Systems/" + runnerCfg.Redfish.DeviceID + "/Oem/Unbounded/SerialConsole/Stream",
 		},
 		Metadata: map[string]string{
 			"serviceName": service.Name,

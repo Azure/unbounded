@@ -8,6 +8,11 @@ On claim, the operator patches the selected pod with the client key, creates a
 per-runner UDP NodePort Service for WireGuard, and returns the endpoint, network,
 VXLAN, and Redfish details needed to use the playpen VM.
 
+The operator does not proxy Redfish or console traffic. Clients reach Redfish and
+the serial console stream on the runner through the WireGuard tunnel. The claim
+response includes the runner Redfish URL, the system URL, and the OEM serial
+console stream URI for convenience.
+
 ## API
 
 The server listens on `--listen-addr` (default `:8443`). It serves TLS using the
@@ -48,7 +53,8 @@ curl -k -X POST https://playpen-operator/playpen/v1/releases \
 - A claim writes pod annotations for the client key, request hash, idempotency
   key hash, and claim time, then labels the pod with an allocation ID.
 - The operator creates a `NodePort` Service named `playpen-runner-<hash>` for
-  the runner's WireGuard UDP port.
+  the runner's WireGuard UDP port. It does not create a NodePort for Redfish or
+  serial console traffic.
 - The claim response uses the runner node's `ExternalIP` as the gateway. If that
   node has no `ExternalIP`, any node `ExternalIP` may be used. If no node has an
   `ExternalIP`, claims fail with `503 Service Unavailable`.

@@ -48,6 +48,12 @@ func TestClaimAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
 	if resp.WireGuard.ServerPublicKey == "" {
 		t.Fatal("server WireGuard public key is empty")
 	}
+	if resp.Redfish["systemURL"] != resp.Redfish["url"]+"/redfish/v1/Systems/"+resp.Redfish["deviceID"] {
+		t.Fatalf("redfish system URL = %q", resp.Redfish["systemURL"])
+	}
+	if resp.Redfish["serialConsoleStreamURI"] != "/redfish/v1/Systems/"+resp.Redfish["deviceID"]+"/Oem/Unbounded/SerialConsole/Stream" {
+		t.Fatalf("redfish serial console stream URI = %q", resp.Redfish["serialConsoleStreamURI"])
+	}
 
 	pod := &corev1.Pod{}
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err != nil {
@@ -76,6 +82,12 @@ func TestClaimAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
 	}
 	if service.Spec.Selector[LabelAllocated] != pod.Labels[LabelAllocated] {
 		t.Fatalf("service selector does not match allocated pod")
+	}
+	if len(service.Spec.Ports) != 1 {
+		t.Fatalf("service ports = %d, want only the WireGuard port", len(service.Spec.Ports))
+	}
+	if service.Spec.Ports[0].Name != "wireguard" || service.Spec.Ports[0].Protocol != corev1.ProtocolUDP {
+		t.Fatalf("service port = %#v, want only WireGuard UDP", service.Spec.Ports[0])
 	}
 }
 

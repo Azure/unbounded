@@ -127,7 +127,7 @@ func NewServer(cfg Config, vm *VMManager, state *RuntimeState) (*http.Server, er
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/redfish/v1/", NewRedfishHandler(vm, cfg.Redfish))
+	mux.Handle("/redfish/v1/", NewRedfishHandler(vm, cfg.Redfish, cfg.DataDir))
 	mux.HandleFunc("/playpen/v1/info", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, infoResponse(cfg, state.ServerWireGuardPublicKey()))
 	})
