@@ -109,7 +109,8 @@ func newLogger(debug bool, format string) *slog.Logger {
 //     one temporary staging directory so artifacts with the same version, such as
 //     containerd or runc, are downloaded once and materialized into each bundle.
 //  5. Each bundle is validated before push so invalid local content fails the
-//     job before publishing to the registry.
+//     job before publishing to the registry. Published tags are OCI indexes with
+//     one platform manifest per target architecture.
 //  6. Each published OCI tag must keep the shape documented in
 //     designs/agent-offline-bootstrap.md:
 //     ghcr.io/<owner>/unbounded/bootstrap-artifacts:<tag-prefix>-k8s-<kubernetes-version>

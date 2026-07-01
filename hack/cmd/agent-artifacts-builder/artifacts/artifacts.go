@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/google/renameio/v2"
+	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sync/errgroup"
 	"oras.land/oras-go/v2"
@@ -200,28 +201,54 @@ func PushOCI(ctx context.Context, log *slog.Logger, rootDir, ref string) error {
 	}
 	defer store.Close() //nolint:errcheck // best effort close
 
-	paths, err := collectArtifactPaths(rootDir)
+	manifest, err := loadManifest(filepath.Join(rootDir, ManifestFileName))
 	if err != nil {
 		return err
 	}
 
-	descriptors := make([]ocispec.Descriptor, 0, len(paths))
-	for _, p := range paths {
-		desc, err := store.Add(ctx, p, fileMediaType, p)
+	manifest, err = agentartifacts.NormalizeManifest(manifest)
+	if err != nil {
+		return err
+	}
+
+	architectures, err := detectArchitectures(rootDir, manifest.Versions.Kubernetes)
+	if err != nil {
+		return err
+	}
+
+	descriptorsByPath := map[string]ocispec.Descriptor{}
+
+	platformManifests := make([]ocispec.Descriptor, 0, len(architectures))
+	for _, arch := range architectures {
+		desc, err := packPlatformManifest(ctx, store, manifest, arch, descriptorsByPath)
 		if err != nil {
-			return fmt.Errorf("add %q to OCI artifact: %w", p, err)
+			return err
 		}
 
-		descriptors = append(descriptors, desc)
+		platformManifests = append(platformManifests, desc)
 	}
 
-	manifestDesc, err := oras.PackManifest(ctx, store, oras.PackManifestVersion1_1, artifactType, oras.PackManifestOptions{Layers: descriptors})
-	if err != nil {
-		return fmt.Errorf("pack OCI artifact manifest: %w", err)
+	index := ocispec.Index{
+		Versioned:    specs.Versioned{SchemaVersion: 2},
+		MediaType:    ocispec.MediaTypeImageIndex,
+		ArtifactType: artifactType,
+		Manifests:    platformManifests,
 	}
+
+	indexBytes, err := json.Marshal(index)
+	if err != nil {
+		return fmt.Errorf("marshal OCI artifact index: %w", err)
+	}
+
+	indexDesc, err := oras.PushBytes(ctx, store, ocispec.MediaTypeImageIndex, indexBytes)
+	if err != nil {
+		return fmt.Errorf("push OCI artifact index: %w", err)
+	}
+
+	indexDesc.ArtifactType = artifactType
 
 	tag := repo.Reference.Reference
-	if err := store.Tag(ctx, manifestDesc, tag); err != nil {
+	if err := store.Tag(ctx, indexDesc, tag); err != nil {
 		return fmt.Errorf("tag OCI artifact %q: %w", tag, err)
 	}
 
@@ -233,6 +260,46 @@ func PushOCI(ctx context.Context, log *slog.Logger, rootDir, ref string) error {
 	log.Info("pushed offline artifact bundle", slog.String("oci_ref", "oci://"+ref), slog.String("digest", desc.Digest.String()))
 
 	return nil
+}
+
+func packPlatformManifest(ctx context.Context, store *file.Store, manifest agentartifacts.Manifest, arch string, descriptorsByPath map[string]ocispec.Descriptor) (ocispec.Descriptor, error) {
+	plan, err := NewPlan(Options{
+		OutputDir:     ".",
+		Manifest:      manifest,
+		Architectures: []string{arch},
+	})
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+
+	paths := expectedBundlePaths(plan)
+
+	descriptors := make([]ocispec.Descriptor, 0, len(paths))
+	for _, path := range paths {
+		desc, ok := descriptorsByPath[path]
+		if !ok {
+			var err error
+
+			desc, err = store.Add(ctx, path, fileMediaType, path)
+			if err != nil {
+				return ocispec.Descriptor{}, fmt.Errorf("add %q to OCI artifact: %w", path, err)
+			}
+
+			descriptorsByPath[path] = desc
+		}
+
+		descriptors = append(descriptors, desc)
+	}
+
+	manifestDesc, err := oras.PackManifest(ctx, store, oras.PackManifestVersion1_1, artifactType, oras.PackManifestOptions{Layers: descriptors})
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("pack %s OCI artifact manifest: %w", arch, err)
+	}
+
+	manifestDesc.ArtifactType = artifactType
+	manifestDesc.Platform = &ocispec.Platform{OS: "linux", Architecture: arch}
+
+	return manifestDesc, nil
 }
 
 func NewStagingDir() (string, func(), error) {

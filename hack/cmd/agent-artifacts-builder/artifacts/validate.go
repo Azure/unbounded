@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -25,11 +26,12 @@ import (
 	"github.com/Azure/unbounded/internal/ociutil"
 )
 
-// ValidateOCI pulls an offline artifact OCI bundle into a temporary staging
-// directory and validates the pulled content. It verifies that the remote
-// manifest has the expected artifact type, that all layers have file title
-// annotations, that the pulled bundle contains a valid manifest.json, and that
-// the files in the pulled bundle match the artifacts implied by manifest.json.
+// ValidateOCI pulls each platform from an offline artifact OCI index into a
+// temporary staging directory and validates the pulled content. It verifies that
+// the remote index has the expected artifact type, that each platform manifest
+// has file title annotations on all layers, that each pulled platform bundle
+// contains a valid manifest.json, and that the pulled files match the artifacts
+// implied by manifest.json for that platform.
 func ValidateOCI(ctx context.Context, log *slog.Logger, ref string) error {
 	ref = strings.TrimPrefix(ref, "oci://")
 	log.Info("validating offline artifact bundle", slog.String("oci_ref", "oci://"+ref))
@@ -54,11 +56,23 @@ func ValidateOCI(ctx context.Context, log *slog.Logger, ref string) error {
 
 	tag := repo.Reference.Reference
 
-	manifest, err := fetchOCIManifest(ctx, repo, tag, ref)
+	platforms, err := fetchOCIPlatforms(ctx, repo, tag, ref)
 	if err != nil {
 		return err
 	}
 
+	for _, platform := range platforms {
+		if err := validateOCIPlatform(ctx, log, repo, tag, ref, platform); err != nil {
+			return err
+		}
+	}
+
+	log.Info("validated offline artifact bundle", slog.String("oci_ref", "oci://"+ref), slog.Int("platforms", len(platforms)))
+
+	return nil
+}
+
+func validateOCIPlatform(ctx context.Context, log *slog.Logger, repo *remote.Repository, tag, ref string, platform ocispec.Platform) error {
 	stagingDir, cleanup, err := NewStagingDir()
 	if err != nil {
 		return err
@@ -71,45 +85,91 @@ func ValidateOCI(ctx context.Context, log *slog.Logger, ref string) error {
 	}
 	defer store.Close() //nolint:errcheck // best effort close
 
-	if _, err := oras.Copy(ctx, repo, tag, store, tag, oras.DefaultCopyOptions); err != nil {
-		return fmt.Errorf("pull OCI artifact %q: %w", ref, err)
+	copyOptions := oras.DefaultCopyOptions
+	copyOptions.WithTargetPlatform(&platform)
+
+	if _, err := oras.Copy(ctx, repo, tag, store, tag, copyOptions); err != nil {
+		return fmt.Errorf("pull OCI artifact %q for linux/%s: %w", ref, platform.Architecture, err)
 	}
 
 	if err := ValidateBundle(log, stagingDir); err != nil {
 		return err
 	}
 
-	log.Info("validated offline artifact bundle", slog.String("oci_ref", "oci://"+ref), slog.Int("layers", len(manifest.Layers)))
-
 	return nil
 }
 
-func fetchOCIManifest(ctx context.Context, repo *remote.Repository, tag, ref string) (ocispec.Manifest, error) {
+func fetchOCIPlatforms(ctx context.Context, repo *remote.Repository, tag, ref string) ([]ocispec.Platform, error) {
 	desc, data, err := oras.FetchBytes(ctx, repo, tag, oras.DefaultFetchBytesOptions)
 	if err != nil {
-		return ocispec.Manifest{}, fmt.Errorf("fetch OCI artifact manifest %q: %w", ref, err)
+		return nil, fmt.Errorf("fetch OCI artifact manifest %q: %w", ref, err)
 	}
 
-	if desc.MediaType != ocispec.MediaTypeImageManifest {
-		return ocispec.Manifest{}, fmt.Errorf("unexpected OCI manifest media type %q", desc.MediaType)
+	if desc.MediaType != ocispec.MediaTypeImageIndex {
+		return nil, fmt.Errorf("unexpected OCI manifest media type %q", desc.MediaType)
 	}
 
+	var index ocispec.Index
+	if err := json.Unmarshal(data, &index); err != nil {
+		return nil, fmt.Errorf("parse OCI artifact index: %w", err)
+	}
+
+	if index.ArtifactType != artifactType {
+		return nil, fmt.Errorf("unexpected OCI artifact type %q", index.ArtifactType)
+	}
+
+	platforms := make([]ocispec.Platform, 0, len(index.Manifests))
+	for _, manifestDesc := range index.Manifests {
+		if manifestDesc.Platform == nil {
+			return nil, fmt.Errorf("OCI artifact index manifest %s is missing platform", manifestDesc.Digest)
+		}
+
+		if manifestDesc.Platform.OS != "linux" || manifestDesc.Platform.Architecture == "" {
+			return nil, fmt.Errorf("unsupported OCI artifact platform %s/%s", manifestDesc.Platform.OS, manifestDesc.Platform.Architecture)
+		}
+
+		if err := fetchAndValidateOCIManifest(ctx, repo, manifestDesc); err != nil {
+			return nil, err
+		}
+
+		platforms = append(platforms, *manifestDesc.Platform)
+	}
+
+	return platforms, nil
+}
+
+func fetchAndValidateOCIManifest(ctx context.Context, repo *remote.Repository, desc ocispec.Descriptor) error {
+	rc, err := repo.Fetch(ctx, desc)
+	if err != nil {
+		return fmt.Errorf("fetch OCI artifact platform manifest %s: %w", desc.Digest, err)
+	}
+	defer rc.Close() //nolint:errcheck // best effort close
+
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return fmt.Errorf("read OCI artifact platform manifest %s: %w", desc.Digest, err)
+	}
+
+	return validateOCIManifest(data)
+}
+
+func validateOCIManifest(data []byte) error {
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return ocispec.Manifest{}, fmt.Errorf("parse OCI artifact manifest: %w", err)
+		return fmt.Errorf("parse OCI artifact manifest: %w", err)
 	}
 
 	if manifest.ArtifactType != artifactType {
-		return ocispec.Manifest{}, fmt.Errorf("unexpected OCI artifact type %q", manifest.ArtifactType)
+		return fmt.Errorf("unexpected OCI artifact type %q", manifest.ArtifactType)
 	}
 
 	for _, layer := range manifest.Layers {
 		if layer.Annotations[ocispec.AnnotationTitle] == "" {
-			return ocispec.Manifest{}, fmt.Errorf("OCI artifact layer %s is missing title annotation", layer.Digest)
+			return fmt.Errorf("OCI artifact layer %s is missing title annotation", layer.Digest)
 		}
 	}
 
-	return manifest, nil
+	return nil
 }
 
 // ValidateBundle validates a local offline artifact bundle directory. It reads
@@ -161,7 +221,7 @@ func validateBundle(rootDir string) error {
 	}
 
 	if !equalStrings(expectedPaths, actualPaths) {
-		return fmt.Errorf("pulled OCI artifact content mismatch: got %s, want %s", strings.Join(actualPaths, ", "), strings.Join(expectedPaths, ", "))
+		return fmt.Errorf("offline artifact bundle content mismatch: got %s, want %s", strings.Join(actualPaths, ", "), strings.Join(expectedPaths, ", "))
 	}
 
 	for _, artifact := range plan.Artifacts {
