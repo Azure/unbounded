@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: playpen-runner
+  namespace: {{ default "playpen" .Namespace }}
+  labels:
+    app.kubernetes.io/name: playpen-runner
+    app.kubernetes.io/component: runner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: playpen-runner
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: playpen-runner
+        app.kubernetes.io/component: runner
+      annotations:
+        kubernetes.azure.com/set-kube-service-host-fqdn: "true"
+        playpen.unbounded-cloud.io/client-wireguard-public-key: ""
+    spec:
+      serviceAccountName: playpen-runner
+      containers:
+        - name: runner
+          image: {{ default "ghcr.io/azure/playpen:latest" .PlaypenImage }}
+          imagePullPolicy: Always
+          command:
+            - /unbounded/bin/playpen-runner
+          securityContext:
+            privileged: true
+          args:
+            - --wireguard-private-key-file=/etc/playpen/wireguard/privatekey
+            - --wireguard-client-public-key-file=/etc/playpen/claim/client-public-key
+            - --wireguard-listen-port={{ default "51820" .WireGuardListenPort }}
+            - --listen-addr=10.88.0.1:8443
+            - --public-redfish-url=https://10.88.0.1:8443
+            - --ttl={{ default "1h" .RunnerTTL }}
+          ports:
+            - containerPort: 8443
+              name: https
+              protocol: TCP
+            - containerPort: 51820
+              name: wireguard
+              protocol: UDP
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/playpen-runner
+            - name: wireguard
+              mountPath: /etc/playpen/wireguard
+              readOnly: true
+            - name: claim
+              mountPath: /etc/playpen/claim
+              readOnly: true
+            - name: kvm
+              mountPath: /dev/kvm
+            - name: tun
+              mountPath: /dev/net/tun
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: wireguard
+          secret:
+            secretName: playpen-runner-wireguard
+        - name: claim
+          downwardAPI:
+            items:
+              - path: client-public-key
+                fieldRef:
+                  fieldPath: metadata.annotations['playpen.unbounded-cloud.io/client-wireguard-public-key']
+        - name: kvm
+          hostPath:
+            path: /dev/kvm
+            type: CharDevice
+        - name: tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice

@@ -1,0 +1,56 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.4-trixie AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    git \
+    make \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV CGO_ENABLED=0
+ENV GOPATH=/go
+ENV GOTOOLCHAIN=auto
+ENV PATH=$PATH:/go/bin
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build \
+      -ldflags "-X github.com/Azure/unbounded/internal/version.Version=${VERSION} -X github.com/Azure/unbounded/internal/version.GitCommit=${GIT_COMMIT} -X github.com/Azure/unbounded/internal/version.BuildTime=${BUILD_TIME}" \
+      -o bin/playpen-runner \
+      ./cmd/playpen-runner/main.go && \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build \
+      -ldflags "-X github.com/Azure/unbounded/internal/version.Version=${VERSION} -X github.com/Azure/unbounded/internal/version.GitCommit=${GIT_COMMIT} -X github.com/Azure/unbounded/internal/version.BuildTime=${BUILD_TIME}" \
+      -o bin/playpen-operator \
+      ./cmd/playpen-operator
+
+FROM ubuntu:noble
+
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    iproute2 \
+    ovmf \
+    qemu-system-x86 \
+    qemu-utils \
+    swtpm \
+    wireguard-tools \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /unbounded/bin /var/lib/playpen-runner /etc/playpen/wireguard
+COPY --from=builder /src/bin/playpen-runner /unbounded/bin/playpen-runner
+COPY --from=builder /src/bin/playpen-operator /unbounded/bin/playpen-operator
+
+ENV PATH="/unbounded/bin:${PATH}"
+WORKDIR /unbounded

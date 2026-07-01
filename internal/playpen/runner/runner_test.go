@@ -1,0 +1,306 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package runner
+
+import (
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	metalredfish "github.com/Azure/unbounded/internal/metalman/redfish"
+)
+
+type recordedCommand struct {
+	Name string
+	Args []string
+}
+
+type fakeCommander struct {
+	mu       sync.Mutex
+	runs     []recordedCommand
+	starts   []recordedCommand
+	startErr error
+}
+
+func (f *fakeCommander) Run(_ context.Context, name string, args ...string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runs = append(f.runs, recordedCommand{Name: name, Args: append([]string(nil), args...)})
+
+	return nil
+}
+
+func (f *fakeCommander) Start(_ context.Context, name string, args []string, _, _ string) (Process, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.starts = append(f.starts, recordedCommand{Name: name, Args: append([]string(nil), args...)})
+	if f.startErr != nil {
+		return nil, f.startErr
+	}
+
+	return &fakeProcess{pid: len(f.starts)}, nil
+}
+
+func (f *fakeCommander) runStrings() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	commands := make([]string, 0, len(f.runs))
+	for _, cmd := range f.runs {
+		commands = append(commands, cmd.Name+" "+strings.Join(cmd.Args, " "))
+	}
+
+	return commands
+}
+
+func (f *fakeCommander) startStrings() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	commands := make([]string, 0, len(f.starts))
+	for _, cmd := range f.starts {
+		commands = append(commands, cmd.Name+" "+strings.Join(cmd.Args, " "))
+	}
+
+	return commands
+}
+
+type fakeProcess struct {
+	pid    int
+	exited bool
+}
+
+func (p *fakeProcess) PID() int { return p.pid }
+
+func (p *fakeProcess) Exited() bool { return p.exited }
+
+func (p *fakeProcess) Signal(os.Signal) error {
+	p.exited = true
+
+	return nil
+}
+
+func (p *fakeProcess) Kill() error {
+	p.exited = true
+
+	return nil
+}
+
+func (p *fakeProcess) Wait() error { return nil }
+
+func TestNetworkSetupCommands(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WireGuard.ClientPublicKey = "client-public-key"
+	fake := &fakeCommander{}
+
+	manager := NewNetworkManager(fake, cfg)
+	if err := manager.Setup(t.Context()); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	commands := strings.Join(fake.runStrings(), "\n")
+	for _, want := range []string{
+		"ip link add wg0 type wireguard",
+		"wg set wg0 private-key /etc/playpen/wireguard/privatekey listen-port 51820",
+		"wg set wg0 peer client-public-key allowed-ips 10.88.0.2/32",
+		"ip link add br0 type bridge",
+		"ip link add vxlan0 type vxlan id 12001 dev wg0 local 10.88.0.1 remote 10.88.0.2 dstport 4789 nolearning",
+		"bridge fdb append 00:00:00:00:00:00 dev vxlan0 dst 10.88.0.2",
+		"ip tuntap add dev tap0 mode tap",
+	} {
+		if !strings.Contains(commands, want) {
+			t.Fatalf("commands missing %q:\n%s", want, commands)
+		}
+	}
+}
+
+func TestNetworkSetupWithoutInitialPeer(t *testing.T) {
+	cfg := DefaultConfig()
+	fake := &fakeCommander{}
+
+	manager := NewNetworkManager(fake, cfg)
+	if err := manager.Setup(t.Context()); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	commands := strings.Join(fake.runStrings(), "\n")
+	if strings.Contains(commands, " peer ") {
+		t.Fatalf("setup configured peer before claim:\n%s", commands)
+	}
+
+	if err := manager.ConfigurePeer(t.Context(), "client-public-key"); err != nil {
+		t.Fatalf("configure peer: %v", err)
+	}
+
+	commands = strings.Join(fake.runStrings(), "\n")
+	if !strings.Contains(commands, "wg set wg0 peer client-public-key allowed-ips 10.88.0.2/32") {
+		t.Fatalf("commands missing delayed peer:\n%s", commands)
+	}
+}
+
+func TestWaitForClientPublicKeyConfiguresPeer(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ConfigureNetwork = true
+	fake := &fakeCommander{}
+	manager := NewNetworkManager(fake, cfg)
+	state := NewRuntimeState("server-public-key", false)
+	path := filepath.Join(t.TempDir(), "client-public-key")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go waitForClientPublicKey(ctx, path, manager, state)
+
+	if state.Ready() {
+		t.Fatal("state is ready before claim")
+	}
+	if err := os.WriteFile(path, []byte("client-public-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !state.Ready() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !state.Ready() {
+		t.Fatal("state did not become ready")
+	}
+
+	commands := strings.Join(fake.runStrings(), "\n")
+	if !strings.Contains(commands, "wg set wg0 peer client-public-key allowed-ips 10.88.0.2/32") {
+		t.Fatalf("commands missing delayed peer:\n%s", commands)
+	}
+}
+
+func TestVMManagerQEMUCommands(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.QEMU.EnableTPM = true
+	fake := &fakeCommander{}
+	vm := NewVMManager(fake, cfg)
+
+	if err := vm.Reset(t.Context(), ResetOn); err != nil {
+		t.Fatalf("reset on: %v", err)
+	}
+
+	if state := vm.PowerState(); state != PowerOn {
+		t.Fatalf("power state = %s, want %s", state, PowerOn)
+	}
+
+	starts := strings.Join(fake.startStrings(), "\n")
+	for _, want := range []string{
+		"swtpm socket --tpm2 --runas 0",
+		"qemu-system-x86_64 -enable-kvm",
+		"-netdev tap,id=net0,ifname=tap0,script=no,downscript=no",
+		"-device virtio-net-pci,netdev=net0,mac=52:54:00:aa:bb:01",
+		"-boot order=n",
+		"-device tpm-tis,tpmdev=tpm0",
+	} {
+		if !strings.Contains(starts, want) {
+			t.Fatalf("start commands missing %q:\n%s", want, starts)
+		}
+	}
+	if strings.Contains(starts, "-no-reboot") {
+		t.Fatalf("qemu command disables guest reboot:\n%s", starts)
+	}
+
+	if err := vm.Reset(t.Context(), ResetForceOff); err != nil {
+		t.Fatalf("reset force off: %v", err)
+	}
+
+	if state := vm.PowerState(); state != PowerOff {
+		t.Fatalf("power state = %s, want %s", state, PowerOff)
+	}
+}
+
+func TestRedfishWithMetalmanClient(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.QEMU.EnableTPM = false
+	fake := &fakeCommander{}
+	vm := NewVMManager(fake, cfg)
+	handler := NewRedfishHandler(vm, cfg.Redfish)
+	server := httptest.NewTLSServer(handler)
+	t.Cleanup(server.Close)
+
+	client, err := metalredfish.Dial(t.Context(), server.URL, tlsServerFingerprint(server), cfg.Redfish.Username, cfg.Redfish.Password, cfg.Redfish.DeviceID)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(client.Close)
+
+	state, err := client.PowerState(t.Context())
+	if err != nil {
+		t.Fatalf("power state: %v", err)
+	}
+
+	if state != metalredfish.PowerOff {
+		t.Fatalf("power state = %s, want %s", state, metalredfish.PowerOff)
+	}
+
+	if err := client.SetBootOverride(t.Context(), metalredfish.BootTargetPxe, metalredfish.BootContinuous); err != nil {
+		t.Fatalf("set boot override: %v", err)
+	}
+
+	if err := client.Reset(t.Context(), metalredfish.ResetOn); err != nil {
+		t.Fatalf("reset on: %v", err)
+	}
+
+	state, err = client.PowerState(t.Context())
+	if err != nil {
+		t.Fatalf("power state after on: %v", err)
+	}
+
+	if state != metalredfish.PowerOn {
+		t.Fatalf("power state = %s, want %s", state, metalredfish.PowerOn)
+	}
+
+	if err := client.DisableBootOverride(t.Context()); err != nil {
+		t.Fatalf("disable boot override: %v", err)
+	}
+
+	boot, err := client.GetBootConfig(t.Context())
+	if err != nil {
+		t.Fatalf("get boot config: %v", err)
+	}
+
+	if boot.Enabled != metalredfish.BootDisabled {
+		t.Fatalf("boot enabled = %s, want %s", boot.Enabled, metalredfish.BootDisabled)
+	}
+
+	if err := client.Reset(t.Context(), metalredfish.ResetForceOff); err != nil {
+		t.Fatalf("reset force off: %v", err)
+	}
+}
+
+func testConfig(t *testing.T) Config {
+	t.Helper()
+
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.ConfigureNetwork = false
+	cfg.Redfish.Username = "admin"
+	cfg.Redfish.Password = "secret"
+	cfg.QEMU.OVMFVarsTemplate = filepath.Join(cfg.DataDir, "OVMF_VARS_TEMPLATE.fd")
+	if err := os.WriteFile(cfg.QEMU.OVMFVarsTemplate, []byte("vars"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	return cfg
+}
+
+func tlsServerFingerprint(server *httptest.Server) string {
+	cert := server.Certificate()
+	sum := sha256.Sum256(cert.Raw)
+	parts := make([]string, len(sum))
+	for i, b := range sum {
+		parts[i] = fmt.Sprintf("%02x", b)
+	}
+
+	return strings.Join(parts, ":")
+}

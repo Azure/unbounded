@@ -40,6 +40,7 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       file: ${{ steps.resolve.outputs.file }}
       platforms: ${{ steps.resolve.outputs.platforms }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -61,6 +62,12 @@ jobs:
 
           file="images/${name}/Containerfile"
 
+          if [[ ( "$name" == playpen || "$name" == playpen-* ) && "${{ github.event_name }}" != "workflow_dispatch" ]]; then
+            echo "::notice::Skipping ${name}; playpen images are manual-only. Dispatch this workflow with image=${name}."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [[ ! -f "$file" ]]; then
             echo "::error::No Containerfile found at ${file}"
             exit 1
@@ -76,6 +83,7 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "file=${file}" >> "$GITHUB_OUTPUT"
           echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
 
           echo "Image: ${name}:${tag}"
           echo "Containerfile: ${file}"
@@ -86,6 +94,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Normalize container registry
