@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -61,7 +62,7 @@ func (t *Tunnel) Setup(ctx context.Context) error {
 		return err
 	}
 
-	_ = t.Teardown(ctx)
+	t.Teardown(ctx) //nolint:errcheck // Setup is idempotent and recreates network resources below.
 
 	serverWG, err := addressIP(t.metadata.WireGuard.ServerAddress)
 	if err != nil {
@@ -81,24 +82,28 @@ func (t *Tunnel) Setup(ctx context.Context) error {
 	endpoint := net.JoinHostPort(t.metadata.Endpoint.Host, fmt.Sprint(t.metadata.Endpoint.WireGuardUDPPort))
 	commands := [][]string{
 		{"ip", "link", "add", t.cfg.WireGuardInterface, "type", "wireguard"},
-		{"wg", "set", t.cfg.WireGuardInterface,
+		{
+			"wg", "set", t.cfg.WireGuardInterface,
 			"private-key", privateKeyFile,
 			"listen-port", fmt.Sprint(t.cfg.WireGuardListenPort),
 			"peer", t.metadata.WireGuard.ServerPublicKey,
 			"endpoint", endpoint,
 			"allowed-ips", singleIPCIDR(serverWG),
-			"persistent-keepalive", fmt.Sprint(t.cfg.PersistentKeepalive)},
+			"persistent-keepalive", fmt.Sprint(t.cfg.PersistentKeepalive),
+		},
 		{"ip", "addr", "add", t.metadata.WireGuard.ClientAddress, "dev", t.cfg.WireGuardInterface},
 		{"ip", "link", "set", t.cfg.WireGuardInterface, "up"},
 		{"ip", "route", "add", singleIPCIDR(serverWG), "dev", t.cfg.WireGuardInterface},
-		{"ip", "link", "add", t.cfg.VXLANInterface,
+		{
+			"ip", "link", "add", t.cfg.VXLANInterface,
 			"type", "vxlan",
 			"id", fmt.Sprint(t.metadata.VXLAN.VNI),
 			"dev", t.cfg.WireGuardInterface,
 			"local", clientWG.String(),
 			"remote", serverWG.String(),
 			"dstport", fmt.Sprint(t.metadata.VXLAN.UDPPort),
-			"nolearning"},
+			"nolearning",
+		},
 		{"bridge", "fdb", "append", "00:00:00:00:00:00", "dev", t.cfg.VXLANInterface, "dst", serverWG.String()},
 		{"ip", "link", "set", t.cfg.VXLANInterface, "up"},
 	}
@@ -114,13 +119,15 @@ func (t *Tunnel) Setup(ctx context.Context) error {
 
 func (t *Tunnel) Teardown(ctx context.Context) error {
 	if t.cfg.VXLANInterface != "" {
-		_ = t.cmd.Run(ctx, "ip", "link", "delete", t.cfg.VXLANInterface)
+		t.cmd.Run(ctx, "ip", "link", "delete", t.cfg.VXLANInterface) //nolint:errcheck // Teardown is best-effort for idempotency.
 	}
+
 	if t.cfg.WireGuardInterface != "" {
-		_ = t.cmd.Run(ctx, "ip", "link", "delete", t.cfg.WireGuardInterface)
+		t.cmd.Run(ctx, "ip", "link", "delete", t.cfg.WireGuardInterface) //nolint:errcheck // Teardown is best-effort for idempotency.
 	}
+
 	if t.createdPrivateKeyAt != "" {
-		_ = os.Remove(t.createdPrivateKeyAt)
+		os.Remove(t.createdPrivateKeyAt) //nolint:errcheck // Temporary key cleanup is best-effort.
 		t.createdPrivateKeyAt = ""
 		t.createdPrivateKey = false
 	}
@@ -132,15 +139,19 @@ func (t *Tunnel) validate() error {
 	if t.cmd == nil {
 		return fmt.Errorf("commander is required")
 	}
+
 	if strings.TrimSpace(t.privateKey) == "" {
 		return fmt.Errorf("wireguard private key is required")
 	}
+
 	if strings.TrimSpace(t.metadata.WireGuard.ServerPublicKey) == "" {
 		return fmt.Errorf("server wireguard public key is required")
 	}
+
 	if strings.TrimSpace(t.metadata.Endpoint.Host) == "" || t.metadata.Endpoint.WireGuardUDPPort == 0 {
 		return fmt.Errorf("wireguard endpoint host and port are required")
 	}
+
 	if strings.TrimSpace(t.cfg.WireGuardInterface) == "" || strings.TrimSpace(t.cfg.VXLANInterface) == "" {
 		return fmt.Errorf("wireguard and vxlan interface names are required")
 	}
@@ -157,15 +168,16 @@ func (t *Tunnel) privateKeyFile() (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	path := file.Name()
 	if _, err := file.WriteString(t.privateKey + "\n"); err != nil {
-		_ = file.Close()
-		_ = os.Remove(path)
+		err = errors.Join(err, file.Close(), os.Remove(path))
 
 		return "", err
 	}
+
 	if err := file.Close(); err != nil {
-		_ = os.Remove(path)
+		err = errors.Join(err, os.Remove(path))
 
 		return "", err
 	}
@@ -181,9 +193,11 @@ func tunnelConfigWithDefaults(cfg TunnelConfig, idempotencyKey string) TunnelCon
 	if cfg.WireGuardInterface == "" {
 		cfg.WireGuardInterface = "ppwg" + suffix
 	}
+
 	if cfg.VXLANInterface == "" {
 		cfg.VXLANInterface = "ppvx" + suffix
 	}
+
 	if cfg.PersistentKeepalive == 0 {
 		cfg.PersistentKeepalive = 25
 	}

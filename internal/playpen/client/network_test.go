@@ -15,6 +15,7 @@ func TestTunnelSetupCommands(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	fake := &fakeCommander{}
 	metadata := testAllocResponse()
 	tunnel := NewTunnel(fake, key.String(), metadata, TunnelConfig{
@@ -53,6 +54,7 @@ func TestDefaultTunnelInterfaceNamesAreShort(t *testing.T) {
 	if !strings.HasPrefix(cfg.WireGuardInterface, "ppwg") || len(cfg.WireGuardInterface) > 15 {
 		t.Fatalf("wireguard interface = %q", cfg.WireGuardInterface)
 	}
+
 	if !strings.HasPrefix(cfg.VXLANInterface, "ppvx") || len(cfg.VXLANInterface) > 15 {
 		t.Fatalf("vxlan interface = %q", cfg.VXLANInterface)
 	}

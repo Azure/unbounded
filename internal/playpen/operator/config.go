@@ -13,6 +13,7 @@ import (
 const (
 	AnnotationClientWireGuardPublicKey = meta.AnnotationClientWireGuardPublicKey
 	AnnotationServerWireGuardPublicKey = meta.AnnotationServerWireGuardPublicKey
+	AnnotationRedfishCertPEM           = meta.AnnotationRedfishCertPEM
 	AnnotationIdempotencyKeyHash       = meta.AnnotationIdempotencyKeyHash
 	AnnotationRequestHash              = meta.AnnotationRequestHash
 	AnnotationClaimedAt                = meta.AnnotationClaimedAt

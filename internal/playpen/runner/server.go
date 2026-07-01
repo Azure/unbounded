@@ -10,10 +10,12 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -57,6 +59,7 @@ func (s *RuntimeState) SetReady() {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.ready = true
 }
 
@@ -75,24 +78,38 @@ func Run(ctx context.Context, cfg Config) error {
 	if err := cfg.ApplyArchitectureDefaults(); err != nil {
 		return err
 	}
+
 	if cfg.Redfish.DeviceID == "" {
 		cfg.Redfish.DeviceID = "1"
 	}
 
 	cmd := OSCommander{}
 	serverPublicKey := ""
+
 	if cfg.ConfigureNetwork {
 		var err error
+
 		serverPublicKey, err = ensureWireGuardPrivateKey(cfg.WireGuard.PrivateKeyFile)
 		if err != nil {
 			return err
 		}
-		if err := publishServerWireGuardPublicKey(ctx, cfg, serverPublicKey); err != nil {
+
+		if err := ensureTLSCert(cfg); err != nil {
+			return err
+		}
+
+		certPEM, err := readTLSCertPEM(cfg)
+		if err != nil {
+			return err
+		}
+
+		if err := publishRunnerMetadata(ctx, cfg, serverPublicKey, certPEM); err != nil {
 			return err
 		}
 	}
 
 	state := NewRuntimeState(serverPublicKey, !cfg.ConfigureNetwork || cfg.WireGuard.ClientPublicKey != "")
+
 	network := NewNetworkManager(cmd, cfg)
 	if err := network.Setup(ctx); err != nil {
 		return err
@@ -111,9 +128,11 @@ func Run(ctx context.Context, cfg Config) error {
 	defer stop()
 
 	errCh := make(chan error, 1)
+
 	go func() {
 		errCh <- server.ListenAndServeTLS(filepath.Join(cfg.DataDir, "tls.crt"), filepath.Join(cfg.DataDir, "tls.key"))
 	}()
+
 	if cfg.ConfigureNetwork && cfg.WireGuard.ClientPublicKey == "" {
 		go waitForClientPublicKeyAnnotation(ctx, cfg, network, state)
 	}
@@ -122,7 +141,8 @@ func Run(ctx context.Context, cfg Config) error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = server.Shutdown(shutdownCtx)
+
+		server.Shutdown(shutdownCtx) //nolint:errcheck // Process is exiting after context cancellation.
 
 		return nil
 	case err := <-errCh:
@@ -168,8 +188,17 @@ func infoResponse(cfg Config, serverPublicKey string) map[string]any {
 		redfishURL = "https://" + cfg.ListenAddr
 	}
 
-	serverWG, _ := addressIP(cfg.WireGuard.ServerAddress)
-	clientWG, _ := addressIP(cfg.WireGuard.ClientAddress)
+	serverWG, err := addressIP(cfg.WireGuard.ServerAddress)
+	if err != nil {
+		serverWG = netip.Addr{}
+	}
+
+	clientWG, err := addressIP(cfg.WireGuard.ClientAddress)
+	if err != nil {
+		clientWG = netip.Addr{}
+	}
+
+	certPEM, _ := readTLSCertPEM(cfg) //nolint:errcheck // Optional metadata for clients using trusted cluster TLS.
 
 	return map[string]any{
 		"architecture": cfg.Architecture,
@@ -198,17 +227,19 @@ func infoResponse(cfg Config, serverPublicKey string) map[string]any {
 			"url":      redfishURL,
 			"username": cfg.Redfish.Username,
 			"password": cfg.Redfish.Password,
+			"certPEM":  certPEM,
 			"deviceID": cfg.Redfish.DeviceID,
 		},
 	}
 }
 
-func publishServerWireGuardPublicKey(ctx context.Context, cfg Config, serverPublicKey string) error {
+func publishRunnerMetadata(ctx context.Context, cfg Config, serverPublicKey, redfishCertPEM string) error {
 	if cfg.KubernetesClient == nil || cfg.PodName == "" || cfg.PodNamespace == "" {
-		return fmt.Errorf("pod name, namespace, and Kubernetes client are required to publish server WireGuard public key")
+		return fmt.Errorf("pod name, namespace, and Kubernetes client are required to publish runner metadata")
 	}
 
 	pod := &corev1.Pod{}
+
 	key := types.NamespacedName{Namespace: cfg.PodNamespace, Name: cfg.PodName}
 	if err := cfg.KubernetesClient.Get(ctx, key, pod); err != nil {
 		return err
@@ -218,9 +249,15 @@ func publishServerWireGuardPublicKey(ctx context.Context, cfg Config, serverPubl
 	if pod.Annotations == nil {
 		pod.Annotations = map[string]string{}
 	}
+
 	pod.Annotations[meta.AnnotationServerWireGuardPublicKey] = serverPublicKey
+	pod.Annotations[meta.AnnotationRedfishCertPEM] = redfishCertPEM
 
 	return cfg.KubernetesClient.Patch(ctx, pod, client.MergeFrom(base))
+}
+
+func publishServerWireGuardPublicKey(ctx context.Context, cfg Config, serverPublicKey string) error {
+	return publishRunnerMetadata(ctx, cfg, serverPublicKey, "")
 }
 
 func waitForClientPublicKeyAnnotation(ctx context.Context, cfg Config, network *NetworkManager, state *RuntimeState) {
@@ -250,6 +287,7 @@ func clientPublicKeyAnnotation(ctx context.Context, cfg Config) (string, error) 
 	}
 
 	pod := &corev1.Pod{}
+
 	key := types.NamespacedName{Namespace: cfg.PodNamespace, Name: cfg.PodName}
 	if err := cfg.KubernetesClient.Get(ctx, key, pod); err != nil {
 		return "", err
@@ -264,6 +302,7 @@ func ensureTLSCert(cfg Config) error {
 	}
 
 	certPath := filepath.Join(cfg.DataDir, "tls.crt")
+
 	keyPath := filepath.Join(cfg.DataDir, "tls.key")
 	if _, err := os.Stat(certPath); err == nil {
 		if _, err := os.Stat(keyPath); err == nil {
@@ -308,8 +347,7 @@ func ensureTLSCert(cfg Config) error {
 	}
 
 	if err := pem.Encode(certFile, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
-		certFile.Close() //nolint:errcheck // Best effort after encode failure.
-		return err
+		return errors.Join(err, certFile.Close())
 	}
 
 	if err := certFile.Close(); err != nil {
@@ -322,11 +360,19 @@ func ensureTLSCert(cfg Config) error {
 	}
 
 	if err := pem.Encode(keyFile, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}); err != nil {
-		keyFile.Close() //nolint:errcheck // Best effort after encode failure.
-		return err
+		return errors.Join(err, keyFile.Close())
 	}
 
 	return keyFile.Close()
+}
+
+func readTLSCertPEM(cfg Config) (string, error) {
+	data, err := os.ReadFile(filepath.Join(cfg.DataDir, "tls.crt"))
+	if err != nil {
+		return "", err
+	}
+
+	return string(data), nil
 }
 
 func certHosts(cfg Config) []string {

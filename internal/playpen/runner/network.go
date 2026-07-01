@@ -38,25 +38,29 @@ func (m *NetworkManager) Setup(ctx context.Context) error {
 		return fmt.Errorf("parse wireguard client address: %w", err)
 	}
 
-	_ = m.Teardown(ctx)
+	m.Teardown(ctx) //nolint:errcheck // Setup is idempotent and recreates network resources below.
 
 	commands := [][]string{
 		{"ip", "link", "add", m.cfg.WireGuard.Interface, "type", "wireguard"},
-		{"wg", "set", m.cfg.WireGuard.Interface,
+		{
+			"wg", "set", m.cfg.WireGuard.Interface,
 			"private-key", m.cfg.WireGuard.PrivateKeyFile,
-			"listen-port", fmt.Sprint(m.cfg.WireGuard.ListenPort)},
+			"listen-port", fmt.Sprint(m.cfg.WireGuard.ListenPort),
+		},
 		{"ip", "addr", "add", m.cfg.WireGuard.ServerAddress, "dev", m.cfg.WireGuard.Interface},
 		{"ip", "link", "set", m.cfg.WireGuard.Interface, "up"},
 		{"ip", "link", "add", m.cfg.BridgeName, "type", "bridge"},
 		{"ip", "link", "set", m.cfg.BridgeName, "up"},
-		{"ip", "link", "add", m.cfg.VXLAN.Interface,
+		{
+			"ip", "link", "add", m.cfg.VXLAN.Interface,
 			"type", "vxlan",
 			"id", fmt.Sprint(m.cfg.VXLAN.VNI),
 			"dev", m.cfg.WireGuard.Interface,
 			"local", serverAddr.String(),
 			"remote", clientAddr.String(),
 			"dstport", fmt.Sprint(m.cfg.VXLAN.Port),
-			"nolearning"},
+			"nolearning",
+		},
 		{"bridge", "fdb", "append", "00:00:00:00:00:00", "dev", m.cfg.VXLAN.Interface, "dst", clientAddr.String()},
 		{"ip", "link", "set", m.cfg.VXLAN.Interface, "master", m.cfg.BridgeName},
 		{"ip", "link", "set", m.cfg.VXLAN.Interface, "up"},
@@ -90,9 +94,11 @@ func (m *NetworkManager) ConfigurePeer(ctx context.Context, clientPublicKey stri
 		return fmt.Errorf("wireguard client public key is required")
 	}
 
-	c := []string{"wg", "set", m.cfg.WireGuard.Interface,
+	c := []string{
+		"wg", "set", m.cfg.WireGuard.Interface,
 		"peer", clientPublicKey,
-		"allowed-ips", m.cfg.WireGuard.ClientAddress}
+		"allowed-ips", m.cfg.WireGuard.ClientAddress,
+	}
 	if err := m.cmd.Run(ctx, c[0], c[1:]...); err != nil {
 		return fmt.Errorf("run %q: %w", joinCommand(c), err)
 	}
@@ -111,7 +117,7 @@ func (m *NetworkManager) Teardown(ctx context.Context) error {
 		{"ip", "link", "delete", m.cfg.BridgeName},
 		{"ip", "link", "delete", m.cfg.WireGuard.Interface},
 	} {
-		_ = m.cmd.Run(ctx, c[0], c[1:]...)
+		m.cmd.Run(ctx, c[0], c[1:]...) //nolint:errcheck // Teardown is best-effort for idempotency.
 	}
 
 	return nil
@@ -127,6 +133,7 @@ func addressIP(value string) (netip.Addr, error) {
 
 func joinCommand(parts []string) string {
 	result := ""
+
 	for i, part := range parts {
 		if i > 0 {
 			result += " "

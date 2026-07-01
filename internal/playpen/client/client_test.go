@@ -24,16 +24,19 @@ func TestAllocateGeneratesIdempotencyKeyAndSendsPublicKeyToAggregatedAPI(t *test
 	}
 
 	var gotKey, gotPublicKey, gotArchitecture string
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != allocsPath {
 			t.Fatalf("path = %s", r.URL.Path)
 		}
+
 		gotKey = r.Header.Get(idempotencyKeyHeader)
 
 		var req operator.AllocRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatal(err)
 		}
+
 		gotPublicKey = req.WireGuardPublicKey
 		gotArchitecture = req.Architecture
 
@@ -54,12 +57,15 @@ func TestAllocateGeneratesIdempotencyKeyAndSendsPublicKeyToAggregatedAPI(t *test
 	if gotKey == "" {
 		t.Fatal("idempotency key was not sent")
 	}
+
 	if gotPublicKey != privateKey.PublicKey().String() {
 		t.Fatalf("public key = %q, want %q", gotPublicKey, privateKey.PublicKey().String())
 	}
+
 	if gotArchitecture != operator.ArchitectureARM64 {
 		t.Fatalf("architecture = %q, want %q", gotArchitecture, operator.ArchitectureARM64)
 	}
+
 	if p.Metadata.Pod.Name != "runner-1" {
 		t.Fatalf("pod name = %q", p.Metadata.Pod.Name)
 	}
@@ -79,8 +85,10 @@ func TestNewRequiresRESTConfig(t *testing.T) {
 
 func TestNewUsesKubernetesAuthTransport(t *testing.T) {
 	var gotAuth string
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
+
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
@@ -89,9 +97,11 @@ func TestNewUsesKubernetesAuthTransport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if err := c.deallocate(t.Context(), "alloc-key"); err != nil {
 		t.Fatal(err)
 	}
+
 	if gotAuth != "Bearer test-token" {
 		t.Fatalf("authorization header = %q, want bearer token", gotAuth)
 	}
@@ -99,16 +109,20 @@ func TestNewUsesKubernetesAuthTransport(t *testing.T) {
 
 func TestCloseTearsDownTunnelBeforeDeallocateAndIsIdempotent(t *testing.T) {
 	fake := &fakeCommander{}
+
 	var deallocCount int
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case allocsPath:
 			writeJSON(t, w, testAllocResponse())
 		case deallocsPath:
 			deallocCount++
+
 			if len(fake.commands) == 0 || !strings.Contains(fake.commands[len(fake.commands)-1], "ip link delete ppwg") {
 				t.Fatalf("dealloc happened before tunnel teardown: %#v", fake.commands)
 			}
+
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
@@ -120,19 +134,24 @@ func TestCloseTearsDownTunnelBeforeDeallocateAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	p, err := c.Allocate(t.Context(), AllocateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if err := p.ConfigureTunnel(t.Context()); err != nil {
 		t.Fatalf("configure tunnel: %v", err)
 	}
+
 	if err := p.Close(t.Context()); err != nil {
 		t.Fatalf("close: %v", err)
 	}
+
 	if err := p.Close(t.Context()); err != nil {
 		t.Fatalf("second close: %v", err)
 	}
+
 	if deallocCount != 1 {
 		t.Fatalf("dealloc count = %d, want 1", deallocCount)
 	}
@@ -140,11 +159,14 @@ func TestCloseTearsDownTunnelBeforeDeallocateAndIsIdempotent(t *testing.T) {
 
 func TestDeallocateSendsIdempotencyKey(t *testing.T) {
 	var gotKey string
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != deallocsPath {
 			t.Fatalf("path = %s", r.URL.Path)
 		}
+
 		gotKey = r.Header.Get(idempotencyKeyHeader)
+
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
@@ -153,9 +175,11 @@ func TestDeallocateSendsIdempotencyKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if err := c.deallocate(t.Context(), "alloc-key"); err != nil {
 		t.Fatal(err)
 	}
+
 	if gotKey != "alloc-key" {
 		t.Fatalf("idempotency key = %q", gotKey)
 	}
@@ -164,6 +188,7 @@ func TestDeallocateSendsIdempotencyKey(t *testing.T) {
 func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
+
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		t.Fatal(err)
 	}

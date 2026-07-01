@@ -131,13 +131,16 @@ func (o *Operator) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
 	certPEM, err := o.servingCertPEM(ctx)
 	if err != nil {
 		return err
 	}
+
 	if err := o.injectAPIServiceCABundle(ctx, certPEM); err != nil {
 		return err
 	}
+
 	o.refreshAggregatedClientCAs(ctx)
 
 	server := &http.Server{
@@ -153,20 +156,23 @@ func (o *Operator) Run(ctx context.Context) error {
 	}
 
 	errCh := make(chan error, 1)
+
 	go func() {
 		errCh <- server.ListenAndServeTLS("", "")
 	}()
 
 	ticker := time.NewTicker(o.Config.ReconcileInterval)
 	defer ticker.Stop()
-	_ = o.ReconcileRunners(ctx)
+
+	o.ReconcileRunners(ctx) //nolint:errcheck // Periodic reconciliation below will retry transient startup failures.
 
 	for {
 		select {
 		case <-ctx.Done():
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			_ = server.Shutdown(shutdownCtx)
+
+			server.Shutdown(shutdownCtx) //nolint:errcheck // Process is exiting after context cancellation.
 
 			return nil
 		case err := <-errCh:
@@ -177,7 +183,7 @@ func (o *Operator) Run(ctx context.Context) error {
 			return err
 		case <-ticker.C:
 			o.refreshAggregatedClientCAs(ctx)
-			_ = o.ReconcileRunners(ctx)
+			o.ReconcileRunners(ctx) //nolint:errcheck // Next tick retries transient reconciliation failures.
 		}
 	}
 }
@@ -200,12 +206,14 @@ func (o *Operator) handleAPIGroupDiscovery(w http.ResponseWriter, r *http.Reques
 
 		return
 	}
+
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 
 		return
 	}
+
 	if !o.isTrustedAggregatedRequest(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 
@@ -229,12 +237,14 @@ func (o *Operator) handleAPIVersionDiscovery(w http.ResponseWriter, r *http.Requ
 
 		return
 	}
+
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 
 		return
 	}
+
 	if !o.isTrustedAggregatedRequest(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 
@@ -259,6 +269,7 @@ func (o *Operator) handleAllocs(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
 	if !o.authorizeAggregatedRequest(w, r) {
 		return
 	}
@@ -283,12 +294,14 @@ func (o *Operator) handleAllocs(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
 	arch, err := normalizeArchitecture(req.Architecture)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 
 		return
 	}
+
 	req.Architecture = arch
 
 	resp, status, err := o.Alloc(r.Context(), idempotencyKey, req)
@@ -308,6 +321,7 @@ func (o *Operator) handleDeallocs(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
 	if !o.authorizeAggregatedRequest(w, r) {
 		return
 	}
@@ -334,6 +348,7 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 	if err != nil {
 		return AllocResponse{}, http.StatusBadRequest, err
 	}
+
 	req.Architecture = arch
 
 	keyHash := hashString(idempotencyKey)
@@ -363,16 +378,21 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 	}
 
 	var unavailable []string
+
 	matchingArchitecture := false
+
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.Annotations[AnnotationIdempotencyKeyHash] != "" {
 			continue
 		}
+
 		if podArchitecture(pod) != req.Architecture {
 			continue
 		}
+
 		matchingArchitecture = true
+
 		if reason := runnerPodUnavailableReason(pod); reason != "" {
 			unavailable = append(unavailable, reason)
 
@@ -398,12 +418,14 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 			if errors.Is(err, errRunnerAlreadyAllocated) {
 				continue
 			}
+
 			if errors.Is(err, errIdempotencyRequestConflict) {
 				return AllocResponse{}, http.StatusConflict, err
 			}
 
 			return AllocResponse{}, http.StatusInternalServerError, err
 		}
+
 		if !claimed {
 			resp, err := o.responseForPod(ctx, allocatedPod)
 			if err != nil {
@@ -418,12 +440,18 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 			return AllocResponse{}, http.StatusInternalServerError, err
 		}
 
-		return o.buildResponse(allocatedPod, gatewayIP, nodePublicIP, service, serverPublicKey), http.StatusOK, nil
+		resp, err := o.buildResponse(allocatedPod, gatewayIP, nodePublicIP, service, serverPublicKey)
+		if err != nil {
+			return AllocResponse{}, http.StatusInternalServerError, err
+		}
+
+		return resp, http.StatusOK, nil
 	}
 
 	if len(unavailable) > 0 {
 		return AllocResponse{}, http.StatusServiceUnavailable, fmt.Errorf("no idle playpen runner pods are available with an ExternalIP gateway: %s", strings.Join(unavailable, "; "))
 	}
+
 	if !matchingArchitecture {
 		return AllocResponse{}, http.StatusServiceUnavailable, fmt.Errorf("no idle %s playpen runner pods are available", req.Architecture)
 	}
@@ -463,6 +491,7 @@ func (o *Operator) ReconcileRunners(ctx context.Context) error {
 
 	activePods := map[string]struct{}{}
 	now := time.Now()
+
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if o.claimExpired(pod, now) {
@@ -481,6 +510,7 @@ func (o *Operator) ReconcileRunners(ctx context.Context) error {
 
 func (o *Operator) EnsureTLSSecret(ctx context.Context) (tls.Certificate, error) {
 	secret := &corev1.Secret{}
+
 	key := types.NamespacedName{Namespace: o.Config.Namespace, Name: o.Config.TLSSecretName}
 	if err := o.Client.Get(ctx, key, secret); err == nil {
 		cert, err := tls.X509KeyPair(secret.Data[corev1.TLSCertKey], secret.Data[corev1.TLSPrivateKeyKey])
@@ -497,6 +527,7 @@ func (o *Operator) EnsureTLSSecret(ctx context.Context) (tls.Certificate, error)
 	if serviceName == "" {
 		serviceName = "playpen-operator"
 	}
+
 	certPEM, keyPEM, err := selfSignedCert(serviceName, []string{
 		serviceName,
 		serviceName + "." + o.Config.Namespace,
@@ -525,6 +556,7 @@ func (o *Operator) EnsureTLSSecret(ctx context.Context) (tls.Certificate, error)
 
 func (o *Operator) servingCertPEM(ctx context.Context) ([]byte, error) {
 	secret := &corev1.Secret{}
+
 	key := types.NamespacedName{Namespace: o.Config.Namespace, Name: o.Config.TLSSecretName}
 	if err := o.Client.Get(ctx, key, secret); err != nil {
 		return nil, err
@@ -549,9 +581,11 @@ func (o *Operator) injectAPIServiceCABundle(ctx context.Context, caBundle []byte
 
 		return nil
 	}
+
 	if err != nil {
 		return fmt.Errorf("get APIService %s: %w", apiServiceName, err)
 	}
+
 	if bytes.Equal(apiService.Spec.CABundle, caBundle) {
 		return nil
 	}
@@ -568,6 +602,7 @@ func (o *Operator) refreshAggregatedClientCAs(ctx context.Context) {
 	if o.KubeClient == nil {
 		o.aggregatedMu.Lock()
 		defer o.aggregatedMu.Unlock()
+
 		o.aggregatedClientCAs = nil
 		o.aggregatedClientAllowedCNs = nil
 
@@ -579,6 +614,7 @@ func (o *Operator) refreshAggregatedClientCAs(ctx context.Context) {
 		klog.Warningf("Failed to read %s/%s: %v", extensionAuthNamespace, extensionAuthConfigMapName, err)
 		o.aggregatedMu.Lock()
 		defer o.aggregatedMu.Unlock()
+
 		o.aggregatedClientCAs = nil
 		o.aggregatedClientAllowedCNs = nil
 
@@ -586,11 +622,13 @@ func (o *Operator) refreshAggregatedClientCAs(ctx context.Context) {
 	}
 
 	pool := x509.NewCertPool()
+
 	caPEM := []byte(cm.Data[extensionAuthClientCAKey])
 	if len(caPEM) == 0 || !pool.AppendCertsFromPEM(caPEM) {
 		klog.Warningf("ConfigMap %s/%s does not contain valid %q PEM data", extensionAuthNamespace, extensionAuthConfigMapName, extensionAuthClientCAKey)
 		o.aggregatedMu.Lock()
 		defer o.aggregatedMu.Unlock()
+
 		o.aggregatedClientCAs = nil
 		o.aggregatedClientAllowedCNs = nil
 
@@ -602,6 +640,7 @@ func (o *Operator) refreshAggregatedClientCAs(ctx context.Context) {
 		klog.Warningf("Failed to parse %q from %s/%s: %v", extensionAuthAllowedNamesKey, extensionAuthNamespace, extensionAuthConfigMapName, err)
 		o.aggregatedMu.Lock()
 		defer o.aggregatedMu.Unlock()
+
 		o.aggregatedClientCAs = nil
 		o.aggregatedClientAllowedCNs = nil
 
@@ -610,6 +649,7 @@ func (o *Operator) refreshAggregatedClientCAs(ctx context.Context) {
 
 	o.aggregatedMu.Lock()
 	defer o.aggregatedMu.Unlock()
+
 	o.aggregatedClientCAs = pool
 	o.aggregatedClientAllowedCNs = allowedNames
 }
@@ -623,6 +663,7 @@ func parseRequestHeaderAllowedNames(raw string) (map[string]struct{}, error) {
 	if err := json.Unmarshal([]byte(raw), &names); err != nil {
 		return nil, err
 	}
+
 	if len(names) == 0 {
 		return nil, nil
 	}
@@ -635,6 +676,7 @@ func parseRequestHeaderAllowedNames(raw string) (map[string]struct{}, error) {
 
 		allowed[name] = struct{}{}
 	}
+
 	if len(allowed) == 0 {
 		return nil, nil
 	}
@@ -655,6 +697,7 @@ func (o *Operator) authorizeAggregatedRequest(w http.ResponseWriter, r *http.Req
 
 		return false
 	}
+
 	if o.KubeClient == nil {
 		http.Error(w, "authorization client is not configured", http.StatusInternalServerError)
 
@@ -672,12 +715,14 @@ func (o *Operator) authorizeAggregatedRequest(w http.ResponseWriter, r *http.Req
 			},
 		},
 	}
+
 	result, err := o.KubeClient.AuthorizationV1().SubjectAccessReviews().Create(r.Context(), sar, metav1.CreateOptions{})
 	if err != nil {
 		http.Error(w, "authorization check failed", http.StatusInternalServerError)
 
 		return false
 	}
+
 	if !result.Status.Allowed || result.Status.Denied {
 		http.Error(w, "forbidden", http.StatusForbidden)
 
@@ -689,6 +734,7 @@ func (o *Operator) authorizeAggregatedRequest(w http.ResponseWriter, r *http.Req
 
 func remoteGroups(r *http.Request) []string {
 	var groups []string
+
 	for _, value := range r.Header.Values(remoteGroupHeader) {
 		for _, group := range strings.Split(value, ",") {
 			group = strings.TrimSpace(group)
@@ -712,10 +758,12 @@ func (o *Operator) isTrustedAggregatedRequest(r *http.Request) bool {
 	}
 
 	leaf := r.TLS.PeerCertificates[0]
+
 	intermediates := x509.NewCertPool()
 	for _, cert := range r.TLS.PeerCertificates[1:] {
 		intermediates.AddCert(cert)
 	}
+
 	if _, err := leaf.Verify(x509.VerifyOptions{
 		Roots:         clientCAs,
 		Intermediates: intermediates,
@@ -727,6 +775,7 @@ func (o *Operator) isTrustedAggregatedRequest(r *http.Request) bool {
 	if len(allowedCNs) == 0 {
 		return true
 	}
+
 	_, ok := allowedCNs[leaf.Subject.CommonName]
 
 	return ok
@@ -750,9 +799,11 @@ func runnerPodUnavailableReason(pod *corev1.Pod) string {
 	if !pod.DeletionTimestamp.IsZero() {
 		return fmt.Sprintf("runner pod %s is terminating", pod.Name)
 	}
+
 	if pod.Status.Phase != corev1.PodRunning {
 		return fmt.Sprintf("runner pod %s is %s", pod.Name, pod.Status.Phase)
 	}
+
 	if len(pod.Status.ContainerStatuses) == 0 {
 		return fmt.Sprintf("runner pod %s has no container status", pod.Name)
 	}
@@ -761,6 +812,7 @@ func runnerPodUnavailableReason(pod *corev1.Pod) string {
 		if status.State.Running == nil {
 			return fmt.Sprintf("runner pod %s container %s is not running", pod.Name, status.Name)
 		}
+
 		if !status.Ready {
 			return fmt.Sprintf("runner pod %s container %s is not ready", pod.Name, status.Name)
 		}
@@ -776,6 +828,7 @@ var (
 
 func (o *Operator) patchClaim(ctx context.Context, pod *corev1.Pod, keyHash, reqHash, clientPublicKey string) (*corev1.Pod, bool, error) {
 	var updated *corev1.Pod
+
 	claimed := false
 
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
@@ -794,6 +847,7 @@ func (o *Operator) patchClaim(ctx context.Context, pod *corev1.Pod, keyHash, req
 
 			return nil
 		}
+
 		if current.Annotations[AnnotationIdempotencyKeyHash] != "" {
 			return errRunnerAlreadyAllocated
 		}
@@ -801,6 +855,7 @@ func (o *Operator) patchClaim(ctx context.Context, pod *corev1.Pod, keyHash, req
 		if current.Annotations == nil {
 			current.Annotations = map[string]string{}
 		}
+
 		if current.Labels == nil {
 			current.Labels = map[string]string{}
 		}
@@ -844,16 +899,18 @@ func (o *Operator) responseForPod(ctx context.Context, pod *corev1.Pod) (AllocRe
 		return AllocResponse{}, err
 	}
 
-	return o.buildResponse(pod, gatewayIP, nodePublicIP, service, serverPublicKey), nil
+	return o.buildResponse(pod, gatewayIP, nodePublicIP, service, serverPublicKey)
 }
 
 func (o *Operator) ensureNodePortService(ctx context.Context, pod *corev1.Pod) (*corev1.Service, error) {
 	name := serviceNameForPod(pod)
 	service := &corev1.Service{}
+
 	key := types.NamespacedName{Namespace: pod.Namespace, Name: name}
 	if err := o.Client.Get(ctx, key, service); err == nil {
 		if service.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyLocal {
 			base := service.DeepCopy()
+
 			service.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyCluster
 			if err := o.Client.Patch(ctx, service, client.MergeFrom(base)); err != nil {
 				return nil, err
@@ -902,15 +959,24 @@ func (o *Operator) ensureNodePortService(ctx context.Context, pod *corev1.Pod) (
 	return service, nil
 }
 
-func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string, service *corev1.Service, serverPublicKey string) AllocResponse {
+func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string, service *corev1.Service, serverPublicKey string) (AllocResponse, error) {
 	runnerCfg := o.Config.Runner
+
 	nodePort := int32(0)
 	if len(service.Spec.Ports) > 0 {
 		nodePort = service.Spec.Ports[0].NodePort
 	}
 
-	serverWG, _ := runnerAddressIP(runnerCfg.WireGuard.ServerAddress)
-	clientWG, _ := runnerAddressIP(runnerCfg.WireGuard.ClientAddress)
+	serverWG, err := runnerAddressIP(runnerCfg.WireGuard.ServerAddress)
+	if err != nil {
+		return AllocResponse{}, err
+	}
+
+	clientWG, err := runnerAddressIP(runnerCfg.WireGuard.ClientAddress)
+	if err != nil {
+		return AllocResponse{}, err
+	}
+
 	redfishURL := runnerCfg.PublicRedfishURL
 	if redfishURL == "" {
 		redfishURL = "https://" + runnerCfg.ListenAddr
@@ -954,11 +1020,12 @@ func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string
 			"url":                    redfishURL,
 			"username":               runnerCfg.Redfish.Username,
 			"password":               runnerCfg.Redfish.Password,
+			"certPEM":                pod.Annotations[AnnotationRedfishCertPEM],
 			"deviceID":               runnerCfg.Redfish.DeviceID,
 			"systemURL":              redfishURL + "/redfish/v1/Systems/" + runnerCfg.Redfish.DeviceID,
 			"serialConsoleStreamURI": "/redfish/v1/Systems/" + runnerCfg.Redfish.DeviceID + "/Oem/Unbounded/SerialConsole/Stream",
 		},
-	}
+	}, nil
 }
 
 func normalizeArchitecture(value string) (string, error) {
@@ -1028,11 +1095,13 @@ func (o *Operator) randomNodeExternalIP(ctx context.Context) (string, error) {
 	}
 
 	var gatewayIPs []string
+
 	for i := range nodes.Items {
 		if ip := nodeExternalIP(&nodes.Items[i]); ip != "" {
 			gatewayIPs = append(gatewayIPs, ip)
 		}
 	}
+
 	if len(gatewayIPs) == 0 {
 		return "", fmt.Errorf("no nodes have ExternalIP addresses")
 	}
@@ -1063,6 +1132,7 @@ func (o *Operator) deleteStaleServices(ctx context.Context, activePods map[strin
 
 	for i := range services.Items {
 		service := &services.Items[i]
+
 		podName := service.Labels["playpen.unbounded-cloud.io/pod"]
 		if _, ok := activePods[podName]; ok {
 			continue
@@ -1078,6 +1148,7 @@ func (o *Operator) deleteStaleServices(ctx context.Context, activePods map[strin
 
 func (o *Operator) deleteRunnerPod(ctx context.Context, pod *corev1.Pod) error {
 	service := &corev1.Service{}
+
 	serviceKey := types.NamespacedName{Namespace: pod.Namespace, Name: serviceNameForPod(pod)}
 	if err := o.Client.Get(ctx, serviceKey, service); err == nil {
 		if err := o.Client.Delete(ctx, service); err != nil && !apierrors.IsNotFound(err) {
@@ -1173,5 +1244,5 @@ func runnerAddressIP(value string) (string, error) {
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	json.NewEncoder(w).Encode(value) //nolint:errcheck // Response body write errors cannot be reported to the client.
 }

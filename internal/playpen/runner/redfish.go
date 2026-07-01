@@ -126,6 +126,7 @@ func (h *RedfishHandler) createSession(w http.ResponseWriter, r *http.Request) {
 
 func (h *RedfishHandler) deleteSession(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(strings.TrimRight(r.URL.Path, "/"), "/redfish/v1/SessionService/Sessions/")
+
 	h.mu.Lock()
 	delete(h.sessions, token)
 	h.mu.Unlock()
@@ -144,6 +145,7 @@ func (h *RedfishHandler) authenticated(r *http.Request) bool {
 	}
 
 	user, pass, ok := r.BasicAuth()
+
 	return ok && h.credentialsMatch(user, pass)
 }
 
@@ -187,7 +189,7 @@ func (h *RedfishHandler) streamSerialConsole(w http.ResponseWriter, r *http.Requ
 	defer conn.CloseNow() //nolint:errcheck // Connection cleanup only.
 
 	if err := h.followSerialLog(r.Context(), conn); err != nil && !errors.Is(err, context.Canceled) {
-		_ = conn.Close(websocket.StatusInternalError, err.Error())
+		conn.Close(websocket.StatusInternalError, err.Error()) //nolint:errcheck // Connection is already closing on stream failure.
 	}
 }
 
@@ -210,12 +212,12 @@ func (h *RedfishHandler) followSerialLog(ctx context.Context, conn *websocket.Co
 		}
 
 		if err := streamOpenSerialLog(ctx, conn, file, path, buf); err != nil {
-			_ = file.Close()
-
-			return err
+			return errors.Join(err, file.Close())
 		}
 
-		_ = file.Close()
+		if err := file.Close(); err != nil {
+			return err
+		}
 	}
 }
 
@@ -322,6 +324,7 @@ func randomToken() (string, error) {
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
+
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		fmt.Fprintln(w, err.Error()) //nolint:errcheck // Best effort after response write.
 	}

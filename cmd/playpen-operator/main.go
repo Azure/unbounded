@@ -80,14 +80,17 @@ func run(ctx context.Context, cfg operator.Config) error {
 
 	scheme := runtimeScheme()
 	restConfig := ctrl.GetConfigOrDie()
+
 	kubeClient, err := client.New(restConfig, client.Options{Scheme: scheme})
 	if err != nil {
 		return err
 	}
+
 	kubeClientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		return err
 	}
+
 	apiRegClient, err := apiregclient.NewForConfig(restConfig)
 	if err != nil {
 		return err

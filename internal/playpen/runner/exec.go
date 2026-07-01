@@ -5,6 +5,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 )
@@ -52,14 +53,23 @@ func (OSCommander) Start(ctx context.Context, name string, args []string, stdout
 	if err := cmd.Start(); err != nil {
 		stdout.Close() //nolint:errcheck // Best effort after start failure.
 		stderr.Close() //nolint:errcheck // Best effort after start failure.
+
 		return nil, err
 	}
 
 	p := &osProcess{cmd: cmd, done: make(chan struct{})}
+
 	go func() {
-		p.err = cmd.Wait()
-		stdout.Close() //nolint:errcheck // Process output file cleanup.
-		stderr.Close() //nolint:errcheck // Process output file cleanup.
+		waitErr := cmd.Wait()
+		stdoutErr := stdout.Close()
+		stderrErr := stderr.Close()
+
+		if waitErr != nil {
+			p.err = waitErr
+		} else {
+			p.err = errors.Join(stdoutErr, stderrErr)
+		}
+
 		close(p.done)
 	}()
 

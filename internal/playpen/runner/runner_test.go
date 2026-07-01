@@ -48,6 +48,7 @@ type fakeCommander struct {
 func (f *fakeCommander) Run(_ context.Context, name string, args ...string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
 	f.runs = append(f.runs, recordedCommand{Name: name, Args: append([]string(nil), args...)})
 
 	return nil
@@ -61,9 +62,11 @@ func (f *fakeCommander) Start(_ context.Context, name string, args []string, _, 
 	startErr := f.startErr
 	startHook := f.startHook
 	f.mu.Unlock()
+
 	if startErr != nil {
 		return nil, startErr
 	}
+
 	if startHook != nil {
 		if err := startHook(cmd); err != nil {
 			return nil, err
@@ -181,6 +184,7 @@ func TestWaitForClientPublicKeyAnnotationConfiguresPeer(t *testing.T) {
 	fake := &fakeCommander{}
 	manager := NewNetworkManager(fake, cfg)
 	state := NewRuntimeState("server-public-key", false)
+
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -189,11 +193,14 @@ func TestWaitForClientPublicKeyAnnotationConfiguresPeer(t *testing.T) {
 	if state.Ready() {
 		t.Fatal("state is ready before claim")
 	}
+
 	pod := &corev1.Pod{}
 	if err := cfg.KubernetesClient.Get(t.Context(), client.ObjectKey{Namespace: cfg.PodNamespace, Name: cfg.PodName}, pod); err != nil {
 		t.Fatal(err)
 	}
+
 	base := pod.DeepCopy()
+
 	pod.Annotations = map[string]string{meta.AnnotationClientWireGuardPublicKey: "client-public-key"}
 	if err := cfg.KubernetesClient.Patch(t.Context(), pod, client.MergeFrom(base)); err != nil {
 		t.Fatal(err)
@@ -203,6 +210,7 @@ func TestWaitForClientPublicKeyAnnotationConfiguresPeer(t *testing.T) {
 	for !state.Ready() && time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
 	}
+
 	if !state.Ready() {
 		t.Fatal("state did not become ready")
 	}
@@ -229,6 +237,7 @@ func TestPublishServerWireGuardPublicKeyAnnotatesPod(t *testing.T) {
 	if err := cfg.KubernetesClient.Get(t.Context(), client.ObjectKey{Namespace: cfg.PodNamespace, Name: cfg.PodName}, pod); err != nil {
 		t.Fatal(err)
 	}
+
 	if pod.Annotations[meta.AnnotationServerWireGuardPublicKey] != "server-public-key" {
 		t.Fatalf("server public key annotation = %q", pod.Annotations[meta.AnnotationServerWireGuardPublicKey])
 	}
@@ -237,7 +246,9 @@ func TestPublishServerWireGuardPublicKeyAnnotatesPod(t *testing.T) {
 func TestVMManagerQEMUCommands(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.QEMU.EnableTPM = true
+
 	var swtpmSocket net.Listener
+
 	fake := &fakeCommander{
 		startHook: func(cmd recordedCommand) error {
 			if cmd.Name != cfg.QEMU.SWTPMBinary {
@@ -248,17 +259,21 @@ func TestVMManagerQEMUCommands(t *testing.T) {
 			if err != nil {
 				return err
 			}
+
 			swtpmSocket = listener
 
 			return nil
 		},
 	}
+
 	t.Cleanup(func() {
 		if swtpmSocket != nil {
 			_ = swtpmSocket.Close()
 		}
+
 		_ = os.Remove(filepath.Join(os.TempDir(), "playpen-runner-swtpm.sock"))
 	})
+
 	vm := NewVMManager(fake, cfg)
 
 	if err := vm.Reset(t.Context(), ResetOn); err != nil {
@@ -283,6 +298,7 @@ func TestVMManagerQEMUCommands(t *testing.T) {
 			t.Fatalf("start commands missing %q:\n%s", want, starts)
 		}
 	}
+
 	if strings.Contains(starts, "-no-reboot") {
 		t.Fatalf("qemu command disables guest reboot:\n%s", starts)
 	}
@@ -299,14 +315,18 @@ func TestVMManagerQEMUCommands(t *testing.T) {
 func TestVMManagerQEMUCommandsForARM64(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Architecture = ArchitectureARM64
+
 	cfg.QEMU.EnableTPM = true
 	if err := cfg.ApplyArchitectureDefaults(); err != nil {
 		t.Fatalf("apply architecture defaults: %v", err)
 	}
+
 	if err := os.WriteFile(cfg.QEMU.OVMFVarsTemplate, []byte("vars"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+
 	var swtpmSocket net.Listener
+
 	fake := &fakeCommander{
 		startHook: func(cmd recordedCommand) error {
 			if cmd.Name != cfg.QEMU.SWTPMBinary {
@@ -317,17 +337,21 @@ func TestVMManagerQEMUCommandsForARM64(t *testing.T) {
 			if err != nil {
 				return err
 			}
+
 			swtpmSocket = listener
 
 			return nil
 		},
 	}
+
 	t.Cleanup(func() {
 		if swtpmSocket != nil {
 			_ = swtpmSocket.Close()
 		}
+
 		_ = os.Remove(filepath.Join(os.TempDir(), "playpen-runner-swtpm.sock"))
 	})
+
 	vm := NewVMManager(fake, cfg)
 
 	if err := vm.Reset(t.Context(), ResetOn); err != nil {
@@ -362,6 +386,7 @@ func TestRedfishWithMetalmanClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
+
 	t.Cleanup(client.Close)
 
 	state, err := client.PowerState(t.Context())
@@ -418,6 +443,7 @@ func TestRedfishSystemAdvertisesSerialConsole(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	req.SetBasicAuth(cfg.Redfish.Username, cfg.Redfish.Password)
 
 	resp, err := server.Client().Do(req)
@@ -454,24 +480,31 @@ func TestRedfishSystemAdvertisesSerialConsole(t *testing.T) {
 	if body.ODataType != "#ComputerSystem.v1_20_0.ComputerSystem" {
 		t.Fatalf("@odata.type = %q", body.ODataType)
 	}
+
 	if body.ID != cfg.Redfish.DeviceID || body.Name == "" {
 		t.Fatalf("unexpected system identity: id=%q name=%q", body.ID, body.Name)
 	}
+
 	if !body.SerialConsole.ServiceEnabled {
 		t.Fatal("serial console service is not enabled")
 	}
+
 	if body.SerialConsole.MaxConcurrentSessions != 1 {
 		t.Fatalf("max sessions = %d, want 1", body.SerialConsole.MaxConcurrentSessions)
 	}
+
 	if len(body.SerialConsole.ConnectTypesSupported) != 1 || body.SerialConsole.ConnectTypesSupported[0] != "OEM" {
 		t.Fatalf("connect types = %#v, want OEM", body.SerialConsole.ConnectTypesSupported)
 	}
+
 	if !body.SerialConsole.Oem.Unbounded.ReadOnly {
 		t.Fatal("serial console stream is not marked read-only")
 	}
+
 	if body.SerialConsole.Oem.Unbounded.Protocol != "WebSocket" {
 		t.Fatalf("protocol = %q, want WebSocket", body.SerialConsole.Oem.Unbounded.Protocol)
 	}
+
 	wantURI := "/redfish/v1/Systems/" + cfg.Redfish.DeviceID + "/Oem/Unbounded/SerialConsole/Stream"
 	if body.SerialConsole.Oem.Unbounded.StreamURI != wantURI {
 		t.Fatalf("stream URI = %q, want %q", body.SerialConsole.Oem.Unbounded.StreamURI, wantURI)
@@ -509,6 +542,7 @@ func TestRedfishSerialConsoleStreamFollowsSerialLog(t *testing.T) {
 	defer cancel()
 
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/redfish/v1/Systems/" + cfg.Redfish.DeviceID + "/Oem/Unbounded/SerialConsole/Stream"
+
 	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: redfishBasicAuthHeader(cfg)})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -519,11 +553,13 @@ func TestRedfishSerialConsoleStreamFollowsSerialLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if _, err := file.WriteString("booting\n"); err != nil {
 		_ = file.Close()
 
 		t.Fatal(err)
 	}
+
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -532,9 +568,11 @@ func TestRedfishSerialConsoleStreamFollowsSerialLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
+
 	if messageType != websocket.MessageBinary {
 		t.Fatalf("message type = %v, want binary", messageType)
 	}
+
 	if string(data) != "booting\n" {
 		t.Fatalf("stream data = %q, want serial log bytes", string(data))
 	}
@@ -548,6 +586,7 @@ func testConfig(t *testing.T) Config {
 	cfg.ConfigureNetwork = false
 	cfg.Redfish.Username = "admin"
 	cfg.Redfish.Password = "secret"
+
 	cfg.QEMU.OVMFVarsTemplate = filepath.Join(cfg.DataDir, "OVMF_VARS_TEMPLATE.fd")
 	if err := os.WriteFile(cfg.QEMU.OVMFVarsTemplate, []byte("vars"), 0o600); err != nil {
 		t.Fatal(err)
@@ -559,6 +598,7 @@ func testConfig(t *testing.T) Config {
 func tlsServerFingerprint(server *httptest.Server) string {
 	cert := server.Certificate()
 	sum := sha256.Sum256(cert.Raw)
+
 	parts := make([]string, len(sum))
 	for i, b := range sum {
 		parts[i] = fmt.Sprintf("%02x", b)

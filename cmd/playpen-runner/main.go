@@ -25,6 +25,7 @@ func main() {
 
 	cfg := runner.DefaultConfig()
 	cfg.PodName = os.Getenv("POD_NAME")
+
 	cfg.PodNamespace = os.Getenv("POD_NAMESPACE")
 	if cfg.PodName != "" && cfg.PodNamespace != "" {
 		scheme := runtime.NewScheme()
@@ -36,6 +37,7 @@ func main() {
 			slog.Error("create Kubernetes client", "error", err)
 			os.Exit(1)
 		}
+
 		cfg.KubernetesClient = kubeClient
 	}
 
@@ -88,6 +90,7 @@ func main() {
 	flags.IntVar(&cfg.QEMU.CPUs, "cpus", cfg.QEMU.CPUs, "VM vCPU count")
 
 	root.AddCommand(version.Command())
+
 	root.CompletionOptions.DisableDefaultCmd = true
 	if err := root.Execute(); err != nil {
 		os.Exit(1)

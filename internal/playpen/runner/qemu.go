@@ -141,9 +141,10 @@ func (m *VMManager) Start(ctx context.Context) error {
 	}
 
 	args := m.qemuArgs()
+
 	proc, err := m.cmd.Start(context.WithoutCancel(ctx), m.cfg.QEMU.Binary, args, filepath.Join(m.cfg.DataDir, "qemu.log"), filepath.Join(m.cfg.DataDir, "qemu.err"))
 	if err != nil {
-		m.stopProcess(m.swtpmProc)
+		err = errors.Join(err, m.stopProcess(m.swtpmProc))
 		m.swtpmProc = nil
 
 		return err
@@ -227,6 +228,7 @@ func (m *VMManager) startSWTPM(ctx context.Context) (Process, error) {
 
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+
 	if err := waitForUnixSocket(waitCtx, socketPath); err != nil {
 		return nil, errors.Join(err, m.stopProcess(proc))
 	}
@@ -251,6 +253,7 @@ func waitForUnixSocket(ctx context.Context, path string) error {
 
 			return nil
 		}
+
 		if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -309,6 +312,7 @@ func (m *VMManager) stopProcess(proc Process) error {
 	}
 
 	done := make(chan error, 1)
+
 	go func() { done <- proc.Wait() }()
 
 	select {

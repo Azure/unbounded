@@ -6,13 +6,13 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/coder/websocket"
 )
@@ -21,8 +21,10 @@ import (
 // ctx is canceled or the stream fails. The returned channel receives one error.
 func (p *Playpen) StreamConsoleLogs(ctx context.Context, dst io.Writer) <-chan error {
 	errCh := make(chan error, 1)
+
 	go func() {
 		errCh <- p.streamConsoleLogs(ctx, dst)
+
 		close(errCh)
 	}()
 
@@ -45,7 +47,7 @@ func (p *Playpen) streamConsoleLogs(ctx context.Context, dst io.Writer) error {
 	}
 
 	conn, _, err := websocket.Dial(ctx, streamURL, &websocket.DialOptions{
-		HTTPClient: redfishWebSocketHTTPClient(),
+		HTTPClient: redfishWebSocketHTTPClient(p.Metadata.Redfish),
 		HTTPHeader: header,
 	})
 	if err != nil {
@@ -58,9 +60,11 @@ func (p *Playpen) streamConsoleLogs(ctx context.Context, dst io.Writer) error {
 		if err != nil {
 			return err
 		}
+
 		if messageType != websocket.MessageBinary && messageType != websocket.MessageText {
 			continue
 		}
+
 		if _, err := dst.Write(data); err != nil {
 			return err
 		}
@@ -69,6 +73,7 @@ func (p *Playpen) streamConsoleLogs(ctx context.Context, dst io.Writer) error {
 
 func consoleStreamURL(redfish map[string]string) (string, error) {
 	base := strings.TrimRight(redfish["url"], "/")
+
 	path := redfish["serialConsoleStreamURI"]
 	if base == "" || path == "" {
 		return "", fmt.Errorf("redfish url and serialConsoleStreamURI are required")
@@ -78,6 +83,7 @@ func consoleStreamURL(redfish map[string]string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	switch parsed.Scheme {
 	case "https":
 		parsed.Scheme = "wss"
@@ -91,13 +97,24 @@ func consoleStreamURL(redfish map[string]string) (string, error) {
 	return parsed.String(), nil
 }
 
-func redfishWebSocketHTTPClient() *http.Client {
+func redfishWebSocketHTTPClient(redfish map[string]string) *http.Client {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return http.DefaultClient
+	}
+
+	clonedTransport := transport.Clone()
+
+	if certPEM := strings.TrimSpace(redfish["certPEM"]); certPEM != "" {
+		roots := x509.NewCertPool()
+		if roots.AppendCertsFromPEM([]byte(certPEM)) {
+			clonedTransport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
+		}
+	}
+
 	return &http.Client{
-		Timeout: 0,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // Redfish is reached through the allocated WireGuard tunnel.
-			IdleConnTimeout: 90 * time.Second,
-		},
+		Timeout:   0,
+		Transport: clonedTransport,
 	}
 }
 

@@ -74,6 +74,7 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	restConfig := rest.CopyConfig(cfg.RESTConfig)
+
 	baseURL := strings.TrimRight(strings.TrimSpace(restConfig.Host), "/")
 	if baseURL == "" {
 		return nil, fmt.Errorf("REST config host is required")
@@ -82,6 +83,7 @@ func New(cfg Config) (*Client, error) {
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		var err error
+
 		httpClient, err = rest.HTTPClientFor(restConfig)
 		if err != nil {
 			return nil, fmt.Errorf("create Kubernetes HTTP client: %w", err)
@@ -127,6 +129,7 @@ func (c *Client) Allocate(ctx context.Context, opts AllocateOptions) (*Playpen, 
 	if err != nil {
 		return nil, err
 	}
+
 	req.Header.Set(idempotencyKeyHeader, idempotencyKey)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -152,6 +155,7 @@ func (c *Client) deallocate(ctx context.Context, idempotencyKey string) error {
 	if err != nil {
 		return err
 	}
+
 	req.Header.Set(idempotencyKeyHeader, strings.TrimSpace(idempotencyKey))
 
 	return c.doJSON(req, http.StatusNoContent, nil)
@@ -182,6 +186,7 @@ func (p *Playpen) Close(ctx context.Context) error {
 
 		return nil
 	}
+
 	p.closed = true
 	tunnel := p.tunnel
 	idempotencyKey := p.idempotencyKey
@@ -192,6 +197,7 @@ func (p *Playpen) Close(ctx context.Context) error {
 	if tunnel != nil {
 		closeErr = tunnel.Teardown(ctx)
 	}
+
 	if err := client.deallocate(ctx, idempotencyKey); err != nil && closeErr == nil {
 		closeErr = err
 	}

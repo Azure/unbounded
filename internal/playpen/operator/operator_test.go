@@ -43,30 +43,39 @@ func TestAllocAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
 	if err != nil {
 		t.Fatalf("alloc: %v", err)
 	}
+
 	if status != 200 {
 		t.Fatalf("status = %d, want 200", status)
 	}
+
 	if resp.Endpoint.Host != "20.30.40.50" {
 		t.Fatalf("endpoint host = %q, want node external ip", resp.Endpoint.Host)
 	}
+
 	if resp.Pod.NodePublicIP != "20.30.40.50" {
 		t.Fatalf("pod node public ip = %q, want node external ip", resp.Pod.NodePublicIP)
 	}
+
 	if resp.Pod.Architecture != ArchitectureAMD64 {
 		t.Fatalf("pod architecture = %q, want %q", resp.Pod.Architecture, ArchitectureAMD64)
 	}
+
 	if resp.Endpoint.ExternalTrafficPolicy != string(corev1.ServiceExternalTrafficPolicyCluster) {
 		t.Fatalf("externalTrafficPolicy = %q, want Cluster", resp.Endpoint.ExternalTrafficPolicy)
 	}
+
 	if resp.WireGuard.ServerPublicKey == "" {
 		t.Fatal("server WireGuard public key is empty")
 	}
+
 	if resp.WireGuard.ServerPublicKey != podServerPublicKey("runner-1") {
 		t.Fatalf("server WireGuard public key = %q, want pod annotation", resp.WireGuard.ServerPublicKey)
 	}
+
 	if resp.Redfish["systemURL"] != resp.Redfish["url"]+"/redfish/v1/Systems/"+resp.Redfish["deviceID"] {
 		t.Fatalf("redfish system URL = %q", resp.Redfish["systemURL"])
 	}
+
 	if resp.Redfish["serialConsoleStreamURI"] != "/redfish/v1/Systems/"+resp.Redfish["deviceID"]+"/Oem/Unbounded/SerialConsole/Stream" {
 		t.Fatalf("redfish serial console stream URI = %q", resp.Redfish["serialConsoleStreamURI"])
 	}
@@ -75,9 +84,11 @@ func TestAllocAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err != nil {
 		t.Fatal(err)
 	}
+
 	if pod.Annotations[AnnotationClientWireGuardPublicKey] != req.WireGuardPublicKey {
 		t.Fatalf("pod allocation annotation = %q, want %q", pod.Annotations[AnnotationClientWireGuardPublicKey], req.WireGuardPublicKey)
 	}
+
 	if pod.Labels[LabelAllocated] == "" {
 		t.Fatal("pod allocation label is empty")
 	}
@@ -86,22 +97,28 @@ func TestAllocAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
 	if err := op.Client.List(t.Context(), services, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/component": "runner-nodeport"}); err != nil {
 		t.Fatal(err)
 	}
+
 	if len(services.Items) != 1 {
 		t.Fatalf("services = %d, want 1", len(services.Items))
 	}
+
 	service := services.Items[0]
 	if service.Spec.Type != corev1.ServiceTypeNodePort {
 		t.Fatalf("service type = %s, want NodePort", service.Spec.Type)
 	}
+
 	if service.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyCluster {
 		t.Fatalf("service externalTrafficPolicy = %s, want Cluster", service.Spec.ExternalTrafficPolicy)
 	}
+
 	if service.Spec.Selector[LabelAllocated] != pod.Labels[LabelAllocated] {
 		t.Fatalf("service selector does not match allocated pod")
 	}
+
 	if len(service.Spec.Ports) != 1 {
 		t.Fatalf("service ports = %d, want only the WireGuard port", len(service.Spec.Ports))
 	}
+
 	if service.Spec.Ports[0].Name != "wireguard" || service.Spec.Ports[0].Protocol != corev1.ProtocolUDP {
 		t.Fatalf("service port = %#v, want only WireGuard UDP", service.Spec.Ports[0])
 	}
@@ -118,10 +135,12 @@ func TestAllocIsIdempotentAndConflictsOnDifferentRequest(t *testing.T) {
 	if err != nil || status != 200 {
 		t.Fatalf("first alloc status=%d err=%v", status, err)
 	}
+
 	second, status, err := op.Alloc(t.Context(), "alloc-key", req)
 	if err != nil || status != 200 {
 		t.Fatalf("second alloc status=%d err=%v", status, err)
 	}
+
 	if second.Pod.Name != first.Pod.Name {
 		t.Fatalf("second pod = %q, want %q", second.Pod.Name, first.Pod.Name)
 	}
@@ -130,6 +149,7 @@ func TestAllocIsIdempotentAndConflictsOnDifferentRequest(t *testing.T) {
 	if err == nil {
 		t.Fatal("different alloc request with same idempotency key succeeded")
 	}
+
 	if status != 409 {
 		t.Fatalf("conflict status = %d, want 409", status)
 	}
@@ -146,9 +166,11 @@ func TestAllocDefaultsToAMD64AndSkipsARM64Runner(t *testing.T) {
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
+
 	if resp.Pod.Name != "amd64-runner" {
 		t.Fatalf("pod name = %q, want amd64-runner", resp.Pod.Name)
 	}
+
 	if resp.Pod.Architecture != ArchitectureAMD64 {
 		t.Fatalf("pod architecture = %q, want %q", resp.Pod.Architecture, ArchitectureAMD64)
 	}
@@ -165,9 +187,11 @@ func TestAllocCanRequestARM64Runner(t *testing.T) {
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
+
 	if resp.Pod.Name != "arm64-runner" {
 		t.Fatalf("pod name = %q, want arm64-runner", resp.Pod.Name)
 	}
+
 	if resp.Pod.Architecture != ArchitectureARM64 {
 		t.Fatalf("pod architecture = %q, want %q", resp.Pod.Architecture, ArchitectureARM64)
 	}
@@ -180,6 +204,7 @@ func TestAllocRejectsInvalidArchitecture(t *testing.T) {
 	if err == nil {
 		t.Fatal("alloc succeeded with invalid architecture")
 	}
+
 	if status != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
 	}
@@ -195,6 +220,7 @@ func TestAllocReportsNoMatchingArchitecture(t *testing.T) {
 	if err == nil {
 		t.Fatal("alloc succeeded without arm64 runner")
 	}
+
 	if status != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", status, http.StatusServiceUnavailable)
 	}
@@ -211,10 +237,12 @@ func TestAllocIdempotencyIncludesArchitecture(t *testing.T) {
 	if _, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: publicKey, Architecture: ArchitectureAMD64}); err != nil || status != http.StatusOK {
 		t.Fatalf("first alloc status=%d err=%v", status, err)
 	}
+
 	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: publicKey, Architecture: ArchitectureARM64})
 	if err == nil {
 		t.Fatal("same idempotency key succeeded with different architecture")
 	}
+
 	if status != http.StatusConflict {
 		t.Fatalf("status = %d, want %d", status, http.StatusConflict)
 	}
@@ -233,6 +261,7 @@ func TestPatchClaimAllowsSameRequestAfterClaim(t *testing.T) {
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err != nil {
 		t.Fatal(err)
 	}
+
 	claimed, ok, err := op.patchClaim(t.Context(), pod, keyHash, reqHash, req.WireGuardPublicKey)
 	if err != nil || !ok {
 		t.Fatalf("first patch claimed=%v err=%v", ok, err)
@@ -242,9 +271,11 @@ func TestPatchClaimAllowsSameRequestAfterClaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second patch: %v", err)
 	}
+
 	if ok {
 		t.Fatal("second patch reported a new claim")
 	}
+
 	if claimed.Name != "runner-1" {
 		t.Fatalf("claimed pod = %q", claimed.Name)
 	}
@@ -266,12 +297,15 @@ func TestAllocUsesOtherNodeExternalIPWhenRunnerNodeIsPrivate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("alloc: %v", err)
 	}
+
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want %d", status, http.StatusOK)
 	}
+
 	if resp.Endpoint.Host != "20.30.40.50" {
 		t.Fatalf("endpoint host = %q, want gateway node external ip", resp.Endpoint.Host)
 	}
+
 	if resp.Pod.NodePublicIP != "" {
 		t.Fatalf("pod node public ip = %q, want empty", resp.Pod.NodePublicIP)
 	}
@@ -287,6 +321,7 @@ func TestAllocRequiresAnyNodeExternalIP(t *testing.T) {
 	if err == nil {
 		t.Fatal("alloc succeeded without any node ExternalIP")
 	}
+
 	if status != 503 {
 		t.Fatalf("status = %d, want 503", status)
 	}
@@ -295,6 +330,7 @@ func TestAllocRequiresAnyNodeExternalIP(t *testing.T) {
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err != nil {
 		t.Fatal(err)
 	}
+
 	if pod.Annotations[AnnotationIdempotencyKeyHash] != "" {
 		t.Fatal("pod was allocated despite missing gateway ExternalIP")
 	}
@@ -310,6 +346,7 @@ func TestAllocSkipsRunnerWithoutServerWireGuardPublicKey(t *testing.T) {
 	if err == nil {
 		t.Fatal("alloc succeeded without server WireGuard public key")
 	}
+
 	if status != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", status, http.StatusServiceUnavailable)
 	}
@@ -318,6 +355,7 @@ func TestAllocSkipsRunnerWithoutServerWireGuardPublicKey(t *testing.T) {
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err != nil {
 		t.Fatal(err)
 	}
+
 	if pod.Annotations[AnnotationIdempotencyKeyHash] != "" {
 		t.Fatal("pod was allocated despite missing server WireGuard public key")
 	}
@@ -347,6 +385,7 @@ func TestAllocSkipsUnavailableRunnerPods(t *testing.T) {
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
+
 	if resp.Pod.Name != "ready-runner" {
 		t.Fatalf("claimed pod = %q, want ready-runner", resp.Pod.Name)
 	}
@@ -363,13 +402,16 @@ func TestAllocUsesPodScopedServerWireGuardPublicKey(t *testing.T) {
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("first alloc status=%d err=%v", status, err)
 	}
+
 	second, status, err := op.Alloc(t.Context(), "alloc-key-2", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("second alloc status=%d err=%v", status, err)
 	}
+
 	if first.Pod.Name == second.Pod.Name {
 		t.Fatalf("second alloc reused pod %q", second.Pod.Name)
 	}
+
 	if first.WireGuard.ServerPublicKey == second.WireGuard.ServerPublicKey {
 		t.Fatal("allocs returned the same server WireGuard public key")
 	}
@@ -411,12 +453,15 @@ func TestAllocPatchesExistingNodePortServiceToClusterPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("alloc: %v", err)
 	}
+
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want %d", status, http.StatusOK)
 	}
+
 	if resp.Endpoint.ExternalTrafficPolicy != string(corev1.ServiceExternalTrafficPolicyCluster) {
 		t.Fatalf("externalTrafficPolicy = %q, want Cluster", resp.Endpoint.ExternalTrafficPolicy)
 	}
+
 	if resp.Endpoint.WireGuardUDPPort != 32000 {
 		t.Fatalf("wireguard node port = %d, want 32000", resp.Endpoint.WireGuardUDPPort)
 	}
@@ -425,9 +470,11 @@ func TestAllocPatchesExistingNodePortServiceToClusterPolicy(t *testing.T) {
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: service.Name}, patched); err != nil {
 		t.Fatal(err)
 	}
+
 	if patched.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyCluster {
 		t.Fatalf("service externalTrafficPolicy = %s, want Cluster", patched.Spec.ExternalTrafficPolicy)
 	}
+
 	if patched.Spec.Ports[0].NodePort != 32000 {
 		t.Fatalf("service nodePort = %d, want 32000", patched.Spec.Ports[0].NodePort)
 	}
@@ -443,10 +490,12 @@ func TestDeallocDeletesClaimedRunnerAndService(t *testing.T) {
 	if _, status, err := op.Alloc(t.Context(), "alloc-key", req); err != nil || status != 200 {
 		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
+
 	status, err := op.Dealloc(t.Context(), "alloc-key")
 	if err != nil {
 		t.Fatalf("dealloc: %v", err)
 	}
+
 	if status != 204 {
 		t.Fatalf("dealloc status = %d, want 204", status)
 	}
@@ -460,6 +509,7 @@ func TestDeallocDeletesClaimedRunnerAndService(t *testing.T) {
 	if err := op.Client.List(t.Context(), services, client.InNamespace("playpen"), client.MatchingLabels{"app.kubernetes.io/component": "runner-nodeport"}); err != nil {
 		t.Fatal(err)
 	}
+
 	if len(services.Items) != 0 {
 		t.Fatalf("services = %d, want 0", len(services.Items))
 	}
@@ -472,6 +522,7 @@ func TestDeallocIsIdempotentWhenClaimIsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dealloc: %v", err)
 	}
+
 	if status != 204 {
 		t.Fatalf("dealloc status = %d, want 204", status)
 	}
@@ -483,9 +534,11 @@ func TestAggregatedDiscoveryRequiresTrustedFrontProxy(t *testing.T) {
 	groupReq := trustedAggregatedRequest(t, op, http.MethodGet, aggregatedAPIGroupPath, nil)
 	groupRecorder := httptest.NewRecorder()
 	op.Handler().ServeHTTP(groupRecorder, groupReq)
+
 	if groupRecorder.Code != http.StatusOK {
 		t.Fatalf("group discovery status = %d, want %d", groupRecorder.Code, http.StatusOK)
 	}
+
 	if !bytes.Contains(groupRecorder.Body.Bytes(), []byte(apiGroupVersion)) {
 		t.Fatalf("group discovery body = %s", groupRecorder.Body.String())
 	}
@@ -493,9 +546,11 @@ func TestAggregatedDiscoveryRequiresTrustedFrontProxy(t *testing.T) {
 	versionReq := trustedAggregatedRequest(t, op, http.MethodGet, aggregatedAPIVersionPath, nil)
 	versionRecorder := httptest.NewRecorder()
 	op.Handler().ServeHTTP(versionRecorder, versionReq)
+
 	if versionRecorder.Code != http.StatusOK {
 		t.Fatalf("version discovery status = %d, want %d", versionRecorder.Code, http.StatusOK)
 	}
+
 	if !bytes.Contains(versionRecorder.Body.Bytes(), []byte(`"allocs"`)) || !bytes.Contains(versionRecorder.Body.Bytes(), []byte(`"deallocs"`)) {
 		t.Fatalf("version discovery body = %s", versionRecorder.Body.String())
 	}
@@ -503,6 +558,7 @@ func TestAggregatedDiscoveryRequiresTrustedFrontProxy(t *testing.T) {
 	untrustedReq := httptest.NewRequest(http.MethodGet, aggregatedAPIVersionPath, nil)
 	untrustedRecorder := httptest.NewRecorder()
 	op.Handler().ServeHTTP(untrustedRecorder, untrustedReq)
+
 	if untrustedRecorder.Code != http.StatusForbidden {
 		t.Fatalf("untrusted discovery status = %d, want %d", untrustedRecorder.Code, http.StatusForbidden)
 	}
@@ -512,6 +568,7 @@ func TestLegacyStandaloneEndpointsAreRemoved(t *testing.T) {
 	op := testOperator(t)
 	recorder := httptest.NewRecorder()
 	op.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/playpen/v1/claims", nil))
+
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("legacy claims status = %d, want %d", recorder.Code, http.StatusNotFound)
 	}
@@ -522,10 +579,12 @@ func TestAllocEndpointAuthorizesSharedAllocAction(t *testing.T) {
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
 	)
+
 	reqBody, err := json.Marshal(AllocRequest{WireGuardPublicKey: testPublicKey(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	req := trustedAggregatedRequest(t, op, http.MethodPost, allocsPath, bytes.NewReader(reqBody))
 	req.Header.Set(idempotencyKeyHeader, "alloc-key")
 	req.Header.Set(remoteUserHeader, "alice")
@@ -545,10 +604,12 @@ func TestAllocEndpointRejectsMissingRemoteUser(t *testing.T) {
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
 	)
+
 	reqBody, err := json.Marshal(AllocRequest{WireGuardPublicKey: testPublicKey(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	req := trustedAggregatedRequest(t, op, http.MethodPost, allocsPath, bytes.NewReader(reqBody))
 	req.Header.Set(idempotencyKeyHeader, "alloc-key")
 
@@ -565,10 +626,12 @@ func TestAllocEndpointRejectsDeniedSubjectAccessReview(t *testing.T) {
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
 	)
+
 	reqBody, err := json.Marshal(AllocRequest{WireGuardPublicKey: testPublicKey(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	req := trustedAggregatedRequest(t, op, http.MethodPost, allocsPath, bytes.NewReader(reqBody))
 	req.Header.Set(idempotencyKeyHeader, "alloc-key")
 	req.Header.Set(remoteUserHeader, "alice")
@@ -586,6 +649,7 @@ func TestDeallocEndpointDeletesAllocatedRunner(t *testing.T) {
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
 	)
+
 	req := AllocRequest{WireGuardPublicKey: testPublicKey(t)}
 	if _, status, err := op.Alloc(t.Context(), "alloc-key", req); err != nil || status != 200 {
 		t.Fatalf("alloc status=%d err=%v", status, err)
@@ -594,6 +658,7 @@ func TestDeallocEndpointDeletesAllocatedRunner(t *testing.T) {
 	httpReq := trustedAggregatedRequest(t, op, http.MethodPost, deallocsPath, nil)
 	httpReq.Header.Set(idempotencyKeyHeader, "alloc-key")
 	httpReq.Header.Set(remoteUserHeader, "alice")
+
 	recorder := httptest.NewRecorder()
 
 	op.Handler().ServeHTTP(recorder, httpReq)
@@ -601,6 +666,7 @@ func TestDeallocEndpointDeletesAllocatedRunner(t *testing.T) {
 	if recorder.Code != http.StatusNoContent {
 		t.Fatalf("dealloc endpoint status = %d, want %d", recorder.Code, http.StatusNoContent)
 	}
+
 	pod := &corev1.Pod{}
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err == nil {
 		t.Fatal("claimed pod still exists after dealloc endpoint call")
@@ -632,6 +698,7 @@ func TestReconcileDeletesExpiredClaimedRunner(t *testing.T) {
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "old-runner"}, pod); err == nil {
 		t.Fatal("expired pod still exists after reconcile")
 	}
+
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "fresh-runner"}, pod); err != nil {
 		t.Fatalf("fresh pod was deleted: %v", err)
 	}
@@ -685,13 +752,16 @@ func testAggregatedOperator(t *testing.T, sarAllowed bool, objects ...client.Obj
 	op.KubeClient = kubefake.NewClientset()
 	op.KubeClient.(*kubefake.Clientset).PrependReactor("create", "subjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		createAction := action.(k8stesting.CreateAction)
+
 		sar := createAction.GetObject().(*authzv1.SubjectAccessReview)
 		if sar.Spec.User != "alice" {
 			t.Fatalf("SAR user = %q, want alice", sar.Spec.User)
 		}
+
 		if sar.Spec.ResourceAttributes == nil {
 			t.Fatal("SAR missing resource attributes")
 		}
+
 		attrs := sar.Spec.ResourceAttributes
 		if attrs.Verb != "create" || attrs.Group != apiGroup || attrs.Resource != "allocs" {
 			t.Fatalf("SAR attrs = %#v, want create %s allocs", attrs, apiGroup)
@@ -709,15 +779,19 @@ func trustedAggregatedRequest(t *testing.T, op *Operator, method, path string, b
 	if body == nil {
 		body = bytes.NewReader(nil)
 	}
+
 	req := httptest.NewRequest(method, path, body)
+
 	_, ok := op.aggregatedClientAllowedCNs["front-proxy-client"]
 	if !ok {
 		t.Fatal("test operator is missing front-proxy-client allowed CN")
 	}
+
 	cert := testAggregatedClientCerts[op]
 	if cert == nil {
 		t.Fatal("test operator is missing client certificate")
 	}
+
 	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
 
 	return req
@@ -730,6 +804,7 @@ func testFrontProxyCert(t *testing.T, commonName string) (*x509.Certificate, *x5
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	now := time.Now().UTC()
 	caTemplate := &x509.Certificate{
 		SerialNumber:          big.NewInt(now.UnixNano()),
@@ -740,10 +815,12 @@ func testFrontProxyCert(t *testing.T, commonName string) (*x509.Certificate, *x5
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 	}
+
 	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	caCert, err := x509.ParseCertificate(caDER)
 	if err != nil {
 		t.Fatal(err)
@@ -753,6 +830,7 @@ func testFrontProxyCert(t *testing.T, commonName string) (*x509.Certificate, *x5
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	clientTemplate := &x509.Certificate{
 		SerialNumber: big.NewInt(now.UnixNano() + 1),
 		Subject:      pkix.Name{CommonName: commonName},
@@ -761,10 +839,12 @@ func testFrontProxyCert(t *testing.T, commonName string) (*x509.Certificate, *x5
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
+
 	clientDER, err := x509.CreateCertificate(rand.Reader, clientTemplate, caTemplate, &clientKey.PublicKey, caKey)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	clientCert, err := x509.ParseCertificate(clientDER)
 	if err != nil {
 		t.Fatal(err)
@@ -780,6 +860,7 @@ func testPod(name, nodeName string, annotations map[string]string) *corev1.Pod {
 	if annotations == nil {
 		annotations = map[string]string{}
 	}
+
 	annotations[AnnotationServerWireGuardPublicKey] = podServerPublicKey(name)
 
 	return testPodWithAnnotations(name, nodeName, annotations)

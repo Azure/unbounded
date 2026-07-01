@@ -154,6 +154,7 @@ func (c *Config) ApplyArchitectureDefaults() error {
 	if err != nil {
 		return err
 	}
+
 	c.Architecture = arch
 
 	switch arch {
