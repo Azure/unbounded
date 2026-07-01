@@ -17,6 +17,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -91,8 +92,13 @@ type Operator struct {
 }
 
 type AllocRequest struct {
+	IdempotencyKey     string `json:"idempotencyKey,omitempty"`
 	WireGuardPublicKey string `json:"wireGuardPublicKey"`
 	Architecture       string `json:"architecture,omitempty"`
+}
+
+type DeallocRequest struct {
+	IdempotencyKey string `json:"idempotencyKey,omitempty"`
 }
 
 type AllocResponse struct {
@@ -290,16 +296,16 @@ func (o *Operator) handleAllocs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := strings.TrimSpace(r.Header.Get(idempotencyKeyHeader))
-	if idempotencyKey == "" {
-		http.Error(w, "Idempotency-Key header is required", http.StatusBadRequest)
+	var req AllocRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON request", http.StatusBadRequest)
 
 		return
 	}
 
-	var req AllocRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON request", http.StatusBadRequest)
+	idempotencyKey := requestIdempotencyKey(r, req.IdempotencyKey)
+	if idempotencyKey == "" {
+		http.Error(w, "Idempotency-Key header or idempotencyKey body field is required", http.StatusBadRequest)
 
 		return
 	}
@@ -342,9 +348,20 @@ func (o *Operator) handleDeallocs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := strings.TrimSpace(r.Header.Get(idempotencyKeyHeader))
+	idempotencyKey := requestIdempotencyKey(r, "")
 	if idempotencyKey == "" {
-		http.Error(w, "Idempotency-Key header is required", http.StatusBadRequest)
+		var req DeallocRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			http.Error(w, "invalid JSON request", http.StatusBadRequest)
+
+			return
+		}
+
+		idempotencyKey = requestIdempotencyKey(r, req.IdempotencyKey)
+	}
+
+	if idempotencyKey == "" {
+		http.Error(w, "Idempotency-Key header or idempotencyKey body field is required", http.StatusBadRequest)
 
 		return
 	}
@@ -357,6 +374,14 @@ func (o *Operator) handleDeallocs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func requestIdempotencyKey(r *http.Request, bodyKey string) string {
+	if headerKey := strings.TrimSpace(r.Header.Get(idempotencyKeyHeader)); headerKey != "" {
+		return headerKey
+	}
+
+	return strings.TrimSpace(bodyKey)
 }
 
 func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRequest) (AllocResponse, int, error) {
@@ -546,6 +571,7 @@ func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod) e
 
 	for i := range pods {
 		pod := &pods[i]
+
 		hostPort := podWireGuardHostPort(pod)
 		if hostPort != 0 {
 			usedHostPorts[hostPort] = struct{}{}
@@ -568,6 +594,7 @@ func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod) e
 			}
 
 			usedHostPorts[hostPort] = struct{}{}
+
 			pod := o.runnerPod(target.architecture, hostPort)
 			if err := o.Client.Create(ctx, pod); apierrors.IsAlreadyExists(err) {
 				continue
@@ -596,15 +623,18 @@ func (o *Operator) runnerPod(architecture string, hostPort int32) *corev1.Pod {
 	privileged := true
 	listenPort := int32(o.Config.Runner.WireGuard.ListenPort) //nolint:gosec // User-configured Kubernetes port.
 	hostPathCharDevice := corev1.HostPathCharDev
+
 	imagePullPolicy := corev1.PullPolicy(strings.TrimSpace(o.Config.RunnerImagePullPolicy))
 	if imagePullPolicy == "" {
 		imagePullPolicy = corev1.PullAlways
 	}
+
 	volumeMounts := []corev1.VolumeMount{
 		{Name: "data", MountPath: runnerDataMountPath},
 		{Name: "wireguard", MountPath: runnerWGMountPath},
 		{Name: "tun", MountPath: runnerTunPath},
 	}
+
 	volumes := []corev1.Volume{
 		{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 		{Name: "wireguard", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},

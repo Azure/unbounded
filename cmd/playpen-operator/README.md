@@ -38,14 +38,14 @@ Alloc and dealloc share one RBAC action. Both handlers authorize `create` on
 `allocs.playpen.unbounded-cloud.io`, so granting that action grants both API
 operations together.
 
-Alloc requests require an `Idempotency-Key` header and a valid WireGuard public
-key:
+Alloc requests require an idempotency key and a valid WireGuard public key. The
+idempotency key can be passed in the `Idempotency-Key` header or, for `kubectl`
+clients without a header flag, as `idempotencyKey` in the JSON body:
 
 ```bash
 kubectl create --raw /apis/playpen.unbounded-cloud.io/v1alpha1/allocs \
-  -H 'Idempotency-Key: smoke-test-1' \
-  -f - <<'EOF'
-{"wireGuardPublicKey":"<client-wireguard-public-key>"}
+	-f - <<'EOF'
+{"idempotencyKey":"smoke-test-1","wireGuardPublicKey":"<client-wireguard-public-key>"}
 EOF
 ```
 
@@ -56,7 +56,9 @@ Dealloc uses the same idempotency key and is idempotent:
 
 ```bash
 kubectl create --raw /apis/playpen.unbounded-cloud.io/v1alpha1/deallocs \
-  -H 'Idempotency-Key: smoke-test-1'
+	-f - <<'EOF'
+{"idempotencyKey":"smoke-test-1"}
+EOF
 ```
 
 ## Kubernetes Behavior

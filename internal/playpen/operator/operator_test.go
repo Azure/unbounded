@@ -99,7 +99,6 @@ func TestAllocAllocatesRunnerWithHostPortEndpoint(t *testing.T) {
 	if pod.Labels[LabelAllocated] == "" {
 		t.Fatal("pod allocation label is empty")
 	}
-
 }
 
 func TestAllocPrefersRunnerHostPortOnNodeExternalIP(t *testing.T) {
@@ -112,19 +111,22 @@ func TestAllocPrefersRunnerHostPortOnNodeExternalIP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("alloc: %v", err)
 	}
+
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want %d", status, http.StatusOK)
 	}
+
 	if resp.Endpoint.Host != "20.30.40.50" {
 		t.Fatalf("endpoint host = %q, want runner node external IP", resp.Endpoint.Host)
 	}
+
 	if got, want := resp.Endpoint.WireGuardUDPPort, int32(51821); got != want {
 		t.Fatalf("endpoint port = %d, want host port %d", got, want)
 	}
+
 	if resp.Endpoint.ExternalTrafficPolicy != "HostPort" {
 		t.Fatalf("externalTrafficPolicy = %q, want HostPort", resp.Endpoint.ExternalTrafficPolicy)
 	}
-
 }
 
 func TestAllocUsesDistinctHostPortsForMultiplePodsOnSameNode(t *testing.T) {
@@ -138,6 +140,7 @@ func TestAllocUsesDistinctHostPortsForMultiplePodsOnSameNode(t *testing.T) {
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("first alloc status=%d err=%v", status, err)
 	}
+
 	second, status, err := op.Alloc(t.Context(), "alloc-key-2", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("second alloc status=%d err=%v", status, err)
@@ -146,9 +149,11 @@ func TestAllocUsesDistinctHostPortsForMultiplePodsOnSameNode(t *testing.T) {
 	if first.Pod.Name == second.Pod.Name {
 		t.Fatalf("second alloc reused pod %q", second.Pod.Name)
 	}
+
 	if first.Endpoint.Host != "20.30.40.50" || second.Endpoint.Host != "20.30.40.50" {
 		t.Fatalf("endpoints used unexpected hosts: first=%q second=%q", first.Endpoint.Host, second.Endpoint.Host)
 	}
+
 	if first.Endpoint.WireGuardUDPPort == second.Endpoint.WireGuardUDPPort {
 		t.Fatalf("allocs reused host port %d", first.Endpoint.WireGuardUDPPort)
 	}
@@ -510,6 +515,28 @@ func TestAllocEndpointAuthorizesSharedAllocAction(t *testing.T) {
 	}
 }
 
+func TestAllocEndpointAcceptsBodyIdempotencyKey(t *testing.T) {
+	op := testAggregatedOperator(t, true,
+		testNode("node-1", "20.30.40.50"),
+		testPod("runner-1", "node-1", nil),
+	)
+
+	reqBody, err := json.Marshal(AllocRequest{IdempotencyKey: "alloc-key", WireGuardPublicKey: testPublicKey(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := trustedAggregatedRequest(t, op, http.MethodPost, allocsPath, bytes.NewReader(reqBody))
+	req.Header.Set(remoteUserHeader, "alice")
+
+	recorder := httptest.NewRecorder()
+	op.Handler().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("alloc endpoint status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+}
+
 func TestAllocEndpointRejectsMissingRemoteUser(t *testing.T) {
 	op := testAggregatedOperator(t, true,
 		testNode("node-1", "20.30.40.50"),
@@ -581,6 +608,33 @@ func TestDeallocEndpointDeletesAllocatedRunner(t *testing.T) {
 	pod := &corev1.Pod{}
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err == nil {
 		t.Fatal("claimed pod still exists after dealloc endpoint call")
+	}
+}
+
+func TestDeallocEndpointAcceptsBodyIdempotencyKey(t *testing.T) {
+	op := testAggregatedOperator(t, true,
+		testNode("node-1", "20.30.40.50"),
+		testPod("runner-1", "node-1", nil),
+	)
+
+	req := AllocRequest{WireGuardPublicKey: testPublicKey(t)}
+	if _, status, err := op.Alloc(t.Context(), "alloc-key", req); err != nil || status != 200 {
+		t.Fatalf("alloc status=%d err=%v", status, err)
+	}
+
+	reqBody, err := json.Marshal(DeallocRequest{IdempotencyKey: "alloc-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	httpReq := trustedAggregatedRequest(t, op, http.MethodPost, deallocsPath, bytes.NewReader(reqBody))
+	httpReq.Header.Set(remoteUserHeader, "alice")
+
+	recorder := httptest.NewRecorder()
+	op.Handler().ServeHTTP(recorder, httpReq)
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("dealloc endpoint status = %d, want %d", recorder.Code, http.StatusNoContent)
 	}
 }
 
@@ -656,21 +710,26 @@ func TestReconcileCreatesIdleRunnerPodsWithUniqueHostPorts(t *testing.T) {
 
 	hostPorts := map[int32]struct{}{}
 	counts := map[string]int{}
+
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+
 		hostPort := podWireGuardHostPort(pod)
 		if hostPort < 52000 || hostPort > 52002 {
 			t.Fatalf("pod %s hostPort = %d, want in range", pod.Name, hostPort)
 		}
+
 		if _, ok := hostPorts[hostPort]; ok {
 			t.Fatalf("duplicate hostPort %d", hostPort)
 		}
+
 		hostPorts[hostPort] = struct{}{}
 		counts[podArchitecture(pod)]++
 
 		if pod.Spec.ServiceAccountName != "playpen-runner" {
 			t.Fatalf("pod %s serviceAccount = %q", pod.Name, pod.Spec.ServiceAccountName)
 		}
+
 		if pod.Spec.NodeSelector["kubernetes.io/arch"] != podArchitecture(pod) {
 			t.Fatalf("pod %s node selector = %#v", pod.Name, pod.Spec.NodeSelector)
 		}
@@ -706,9 +765,11 @@ func TestReconcileSkipsUsedRunnerHostPorts(t *testing.T) {
 	for i := range pods.Items {
 		seen[podWireGuardHostPort(&pods.Items[i])] = struct{}{}
 	}
+
 	if _, ok := seen[52000]; !ok {
 		t.Fatal("existing hostPort 52000 was not preserved")
 	}
+
 	if _, ok := seen[52001]; !ok {
 		t.Fatal("new runner did not use next free hostPort 52001")
 	}
