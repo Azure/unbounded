@@ -224,6 +224,35 @@ func TestClaimSkipsRunnerWithoutServerWireGuardPublicKey(t *testing.T) {
 	}
 }
 
+func TestClaimSkipsUnavailableRunnerPods(t *testing.T) {
+	terminating := testPod("terminating-runner", "node-1", nil)
+	now := metav1.Now()
+	terminating.DeletionTimestamp = &now
+	terminating.Finalizers = []string{"test.finalizer"}
+
+	pending := testPod("pending-runner", "node-1", nil)
+	pending.Status.Phase = corev1.PodPending
+
+	unready := testPod("unready-runner", "node-1", nil)
+	unready.Status.ContainerStatuses[0].Ready = false
+
+	op := testOperator(t,
+		testNode("node-1", "20.30.40.50"),
+		terminating,
+		pending,
+		unready,
+		testPod("ready-runner", "node-1", nil),
+	)
+
+	resp, status, err := op.Claim(t.Context(), "claim-key", ClaimRequest{WireGuardPublicKey: testPublicKey(t)})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("claim status=%d err=%v", status, err)
+	}
+	if resp.Pod.Name != "ready-runner" {
+		t.Fatalf("claimed pod = %q, want ready-runner", resp.Pod.Name)
+	}
+}
+
 func TestClaimUsesPodScopedServerWireGuardPublicKey(t *testing.T) {
 	op := testOperator(t,
 		testNode("node-1", "20.30.40.50"),
@@ -461,6 +490,18 @@ func testPodWithAnnotations(name, nodeName string, annotations map[string]string
 			Annotations: annotations,
 		},
 		Spec: corev1.PodSpec{NodeName: nodeName},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name:  "runner",
+					Ready: true,
+					State: corev1.ContainerState{
+						Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()},
+					},
+				},
+			},
+		},
 	}
 }
 

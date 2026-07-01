@@ -246,6 +246,11 @@ func (o *Operator) Claim(ctx context.Context, idempotencyKey string, req ClaimRe
 		if pod.Annotations[AnnotationIdempotencyKeyHash] != "" {
 			continue
 		}
+		if reason := runnerPodUnavailableReason(pod); reason != "" {
+			unavailable = append(unavailable, reason)
+
+			continue
+		}
 
 		serverPublicKey, err := serverWireGuardPublicKeyForPod(pod)
 		if err != nil {
@@ -390,6 +395,29 @@ func (o *Operator) listRunnerPods(ctx context.Context) (*corev1.PodList, error) 
 	}
 
 	return list, nil
+}
+
+func runnerPodUnavailableReason(pod *corev1.Pod) string {
+	if !pod.DeletionTimestamp.IsZero() {
+		return fmt.Sprintf("runner pod %s is terminating", pod.Name)
+	}
+	if pod.Status.Phase != corev1.PodRunning {
+		return fmt.Sprintf("runner pod %s is %s", pod.Name, pod.Status.Phase)
+	}
+	if len(pod.Status.ContainerStatuses) == 0 {
+		return fmt.Sprintf("runner pod %s has no container status", pod.Name)
+	}
+
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.State.Running == nil {
+			return fmt.Sprintf("runner pod %s container %s is not running", pod.Name, status.Name)
+		}
+		if !status.Ready {
+			return fmt.Sprintf("runner pod %s container %s is not ready", pod.Name, status.Name)
+		}
+	}
+
+	return ""
 }
 
 var (

@@ -49,6 +49,13 @@ spec:
             - containerPort: 51820
               name: wireguard
               protocol: UDP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 10
           volumeMounts:
             - name: data
               mountPath: /var/lib/playpen-runner
