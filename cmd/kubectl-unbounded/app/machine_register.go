@@ -46,8 +46,12 @@ type machineRegisterHandler struct {
 	hostSSHPrivateKey string
 
 	// sshSecretName is the name of the Kubernetes secret that holds SSH credentials.
-	// Defaults to "ssh-${siteName}" in the unbounded-system namespace.
+	// Defaults to "ssh-${siteName}" in the machina namespace.
 	sshSecretName string
+
+	// namespace is the namespace the SSH secrets are written to and referenced
+	// in. It must match the namespace machina runs in (default: machinaNamespace).
+	namespace string
 
 	// bastionHost is the IP or DNS name and optionally port that Machina connects to first before jumping to host.
 	// If the port is omitted, it defaults to 22.
@@ -149,7 +153,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 			return fmt.Errorf("reading SSH private key %s: %w", h.hostSSHPrivateKey, err)
 		}
 
-		s := v1.Secret(h.sshSecretName, machinaNamespace).
+		s := v1.Secret(h.sshSecretName, h.namespace).
 			WithData(map[string][]byte{
 				"ssh-private-key": keyData,
 			})
@@ -158,7 +162,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 			return fmt.Errorf("applying SSH secret %s: %w", h.sshSecretName, err)
 		}
 
-		h.logger.Info("SSH secret applied", "name", h.sshSecretName, "namespace", machinaNamespace)
+		h.logger.Info("SSH secret applied", "name", h.sshSecretName, "namespace", h.namespace)
 	}
 
 	// Apply a separate bastion SSH secret when the bastion uses a different key file
@@ -170,7 +174,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 			return fmt.Errorf("reading bastion SSH private key %s: %w", h.bastionSSHPrivateKey, err)
 		}
 
-		s := v1.Secret(h.bastionSSHSecretName, machinaNamespace).
+		s := v1.Secret(h.bastionSSHSecretName, h.namespace).
 			WithData(map[string][]byte{
 				"ssh-private-key": keyData,
 			})
@@ -179,7 +183,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 			return fmt.Errorf("applying bastion SSH secret %s: %w", h.bastionSSHSecretName, err)
 		}
 
-		h.logger.Info("bastion SSH secret applied", "name", h.bastionSSHSecretName, "namespace", machinaNamespace)
+		h.logger.Info("bastion SSH secret applied", "name", h.bastionSSHSecretName, "namespace", h.namespace)
 	}
 
 	// Resolve the bootstrap token for this site.
@@ -218,7 +222,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 				Username: h.hostSSHUsername,
 				PrivateKeyRef: v1alpha3.SecretKeySelector{
 					Name:      h.sshSecretName,
-					Namespace: machinaNamespace,
+					Namespace: h.namespace,
 					Key:       "ssh-private-key",
 				},
 			},
@@ -245,7 +249,7 @@ func (h *machineRegisterHandler) executeAfterValidation(ctx context.Context) err
 		if h.bastionSSHSecretName != h.sshSecretName {
 			m.Spec.SSH.Bastion.PrivateKeyRef = &v1alpha3.SecretKeySelector{
 				Name:      h.bastionSSHSecretName,
-				Namespace: machinaNamespace,
+				Namespace: h.namespace,
 				Key:       "ssh-private-key",
 			}
 		}
@@ -321,6 +325,11 @@ func downloadSourceFromFlags(baseURL, url, version string) *v1alpha3.DownloadSou
 
 func (h *machineRegisterHandler) setDefaults() {
 	h.kubeconfigPath = getKubeconfigPath(h.kubeconfigPath)
+
+	// Default the SSH secret namespace to the machina namespace.
+	if isEmpty(h.namespace) {
+		h.namespace = machinaNamespace
+	}
 
 	// Default the SSH secret name to "ssh-${site}".
 	if isEmpty(h.sshSecretName) {
@@ -443,6 +452,7 @@ func machineRegisterCommand() *cobra.Command {
 	cmd.Flags().StringVar(&handler.hostSSHUsername, "ssh-username", "", "SSH username for connecting to the machine")
 	cmd.Flags().StringVar(&handler.hostSSHPrivateKey, "ssh-private-key", "", "Path to SSH private key file (required if no bastion flags are set)")
 	cmd.Flags().StringVar(&handler.sshSecretName, "ssh-secret-name", "", "Name of the Kubernetes secret for SSH credentials (defaults to ssh-$site)")
+	cmd.Flags().StringVar(&handler.namespace, "namespace", machinaNamespace, "Namespace for the SSH secrets and their Machine refs; must match the namespace machina runs in")
 	cmd.Flags().StringVar(&handler.bastionHost, "bastion-host", "", "Host and optionally port of the bastion (e.g. 5.6.7.8 or 5.6.7.8:2222)")
 	cmd.Flags().StringVar(&handler.bastionSSHSecretName, "bastion-ssh-secret-name", "", "Name of the Kubernetes secret for bastion SSH credentials (defaults to --ssh-secret-name)")
 	cmd.Flags().StringVar(&handler.bastionSSHUsername, "bastion-ssh-username", "", "SSH username for the bastion (defaults to --ssh-username)")

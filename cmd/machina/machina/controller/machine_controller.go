@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -63,11 +64,25 @@ const (
 	// uploaded on the remote machine.
 	remoteConfigPath = "/tmp/unbounded-agent.json"
 
-	// SecretNamespaceUnboundedSystem is the namespace where SSH key secrets
-	// must reside. Machine is cluster-scoped, so we use a fixed namespace
-	// for secret lookup.
+	// SecretNamespaceUnboundedSystem is the default namespace where SSH key
+	// secrets reside when POD_NAMESPACE is not set. Machine is cluster-scoped,
+	// so the namespace is resolved at runtime (see machinaSecretNamespace)
+	// rather than embedded in each ref.
 	SecretNamespaceUnboundedSystem = unbounded.SystemNamespace
 )
+
+// machinaSecretNamespace returns the namespace machina reads SSH key secrets
+// from. It follows the namespace machina is deployed into (POD_NAMESPACE,
+// injected via the Downward API) so secret lookup, the informer cache scope,
+// and the controller's namespace-scoped RBAC stay aligned under a non-default
+// install namespace. It falls back to SecretNamespaceUnboundedSystem.
+func machinaSecretNamespace() string {
+	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
+		return ns
+	}
+
+	return SecretNamespaceUnboundedSystem
+}
 
 // ReachabilityChecker checks if a machine is reachable via TCP.
 // When a bastion is configured, the check dials through the bastion's
@@ -452,10 +467,11 @@ func (r *MachineReconciler) buildSSHConfig(ctx context.Context, machine *unbound
 	}, nil
 }
 
-// getSecretValue retrieves a value from a secret in the unbounded-system namespace.
+// getSecretValue retrieves a value from a secret in the namespace machina is
+// deployed into (see machinaSecretNamespace).
 func getSecretValue(ctx context.Context, reader client.Reader, ref *unboundedv1alpha3.SecretKeySelector) (string, error) {
 	var secret corev1.Secret
-	if err := reader.Get(ctx, client.ObjectKey{Namespace: SecretNamespaceUnboundedSystem, Name: ref.Name}, &secret); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: machinaSecretNamespace(), Name: ref.Name}, &secret); err != nil {
 		return "", fmt.Errorf("get secret %s: %w", ref.Name, err)
 	}
 
