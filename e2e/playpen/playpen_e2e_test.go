@@ -396,8 +396,6 @@ func (h *harness) applyManifests(ctx context.Context) {
 				"--architecture=amd64",
 				"--wireguard-private-key-file=/etc/playpen/wireguard/privatekey",
 				"--wireguard-listen-port=51820",
-				"--listen-addr=:8443",
-				"--public-redfish-url=https://10.88.0.1:8443",
 			},
 		},
 		{

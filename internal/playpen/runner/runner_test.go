@@ -243,6 +243,24 @@ func TestPublishServerWireGuardPublicKeyAnnotatesPod(t *testing.T) {
 	}
 }
 
+func TestDefaultPublicRedfishURLUsesWireGuardAddress(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if got, want := defaultPublicRedfishURL(cfg), "https://10.88.0.1:8443"; got != want {
+		t.Fatalf("default public redfish URL = %q, want %q", got, want)
+	}
+}
+
+func TestInfoResponseUsesWireGuardAddressForDefaultRedfishURL(t *testing.T) {
+	cfg := DefaultConfig()
+	info := infoResponse(cfg, "server-public-key")
+	redfish := info["redfish"].(map[string]string)
+
+	if got, want := redfish["url"], "https://10.88.0.1:8443"; got != want {
+		t.Fatalf("redfish url = %q, want %q", got, want)
+	}
+}
+
 func TestVMManagerQEMUCommands(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.QEMU.EnableTPM = true

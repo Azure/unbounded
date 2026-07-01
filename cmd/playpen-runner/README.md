@@ -7,8 +7,8 @@ client to the VM NIC.
 
 ## Services
 
-The runner listens on `--listen-addr` (default `10.88.0.1:8443`) using a
-self-signed certificate stored in `--data-dir`.
+The runner listens on `--listen-addr` (default `:8443`) using a self-signed
+certificate stored in `--data-dir`.
 
 | Endpoint | Purpose |
 |----------|---------|
@@ -26,8 +26,8 @@ The `ComputerSystem` resource advertises the VM serial console through the
 standard `SerialConsole` property. The byte stream itself is an OEM WebSocket
 protocol exposed under the same Redfish service and marked with
 `ConnectTypesSupported: ["OEM"]`. The stream is read-only, requires Redfish auth,
-and is reachable through the runner listener, which is normally the WireGuard
-tunnel address `10.88.0.1:8443`.
+and is reachable through the default public Redfish URL, normally the WireGuard
+tunnel address `https://10.88.0.1:8443`.
 
 ## Networking
 

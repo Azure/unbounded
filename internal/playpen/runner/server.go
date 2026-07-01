@@ -185,7 +185,7 @@ func NewServer(cfg Config, vm *VMManager, state *RuntimeState) (*http.Server, er
 func infoResponse(cfg Config, serverPublicKey string) map[string]any {
 	redfishURL := cfg.PublicRedfishURL
 	if redfishURL == "" {
-		redfishURL = "https://" + cfg.ListenAddr
+		redfishURL = defaultPublicRedfishURL(cfg)
 	}
 
 	serverWG, err := addressIP(cfg.WireGuard.ServerAddress)
@@ -397,4 +397,18 @@ func certHosts(cfg Config) []string {
 	}
 
 	return hosts
+}
+
+func defaultPublicRedfishURL(cfg Config) string {
+	host, err := addressIP(cfg.WireGuard.ServerAddress)
+	if err != nil {
+		return "https://" + cfg.ListenAddr
+	}
+
+	_, port, err := net.SplitHostPort(cfg.ListenAddr)
+	if err != nil || port == "" {
+		port = "8443"
+	}
+
+	return "https://" + net.JoinHostPort(host.String(), port)
 }

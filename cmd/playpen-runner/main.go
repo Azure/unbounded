@@ -51,7 +51,7 @@ func main() {
 
 	flags := root.Flags()
 	flags.StringVar(&cfg.ListenAddr, "listen-addr", cfg.ListenAddr, "HTTPS Redfish and info listen address")
-	flags.StringVar(&cfg.PublicRedfishURL, "public-redfish-url", cfg.PublicRedfishURL, "Redfish URL returned by /playpen/v1/info; defaults to https://<listen-addr>")
+	flags.StringVar(&cfg.PublicRedfishURL, "public-redfish-url", cfg.PublicRedfishURL, "Redfish URL returned by /playpen/v1/info; defaults to the WireGuard server address")
 	flags.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "runner state directory")
 	flags.StringVar(&cfg.Architecture, "architecture", cfg.Architecture, "runner VM architecture: amd64 or arm64")
 	flags.BoolVar(&cfg.ConfigureNetwork, "configure-network", cfg.ConfigureNetwork, "configure WireGuard, VXLAN, bridge, and tap interfaces")

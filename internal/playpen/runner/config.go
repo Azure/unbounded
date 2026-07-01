@@ -102,7 +102,7 @@ type QEMUConfig struct {
 
 func DefaultConfig() Config {
 	return Config{
-		ListenAddr:       "10.88.0.1:8443",
+		ListenAddr:       ":8443",
 		DataDir:          "/var/lib/playpen-runner",
 		Architecture:     ArchitectureAMD64,
 		ConfigureNetwork: true,

@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	authzv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -38,7 +39,7 @@ import (
 	apiregclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+	"github.com/Azure/unbounded/internal/playpen/runner"
 )
 
 const (
@@ -979,7 +980,7 @@ func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string
 
 	redfishURL := runnerCfg.PublicRedfishURL
 	if redfishURL == "" {
-		redfishURL = "https://" + runnerCfg.ListenAddr
+		redfishURL = defaultRunnerPublicRedfishURL(runnerCfg)
 	}
 
 	return AllocResponse{
@@ -1239,6 +1240,20 @@ func runnerAddressIP(value string) (string, error) {
 	}
 
 	return value, nil
+}
+
+func defaultRunnerPublicRedfishURL(cfg runner.Config) string {
+	host, err := runnerAddressIP(cfg.WireGuard.ServerAddress)
+	if err != nil {
+		return "https://" + cfg.ListenAddr
+	}
+
+	_, port, err := net.SplitHostPort(cfg.ListenAddr)
+	if err != nil || port == "" {
+		port = "8443"
+	}
+
+	return "https://" + net.JoinHostPort(host, port)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

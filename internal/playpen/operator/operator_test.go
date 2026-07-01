@@ -72,6 +72,10 @@ func TestAllocAllocatesRunnerAndCreatesClusterNodePortService(t *testing.T) {
 		t.Fatalf("server WireGuard public key = %q, want pod annotation", resp.WireGuard.ServerPublicKey)
 	}
 
+	if got, want := resp.Redfish["url"], "https://10.88.0.1:8443"; got != want {
+		t.Fatalf("redfish url = %q, want %q", got, want)
+	}
+
 	if resp.Redfish["systemURL"] != resp.Redfish["url"]+"/redfish/v1/Systems/"+resp.Redfish["deviceID"] {
 		t.Fatalf("redfish system URL = %q", resp.Redfish["systemURL"])
 	}

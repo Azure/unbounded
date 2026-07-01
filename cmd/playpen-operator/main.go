@@ -49,7 +49,7 @@ func main() {
 	flags.DurationVar(&cfg.PlaypenTTL, "playpen-ttl", cfg.PlaypenTTL, "maximum lifetime for an allocated playpen pod; disabled when non-positive")
 	flags.DurationVar(&cfg.ReconcileInterval, "reconcile-interval", cfg.ReconcileInterval, "runner cleanup reconciliation interval")
 	flags.StringVar(&cfg.Runner.ListenAddr, "runner-listen-addr", cfg.Runner.ListenAddr, "runner HTTPS listen address returned in allocs")
-	flags.StringVar(&cfg.Runner.PublicRedfishURL, "runner-public-redfish-url", cfg.Runner.PublicRedfishURL, "runner Redfish URL returned in allocs")
+	flags.StringVar(&cfg.Runner.PublicRedfishURL, "runner-public-redfish-url", cfg.Runner.PublicRedfishURL, "runner Redfish URL returned in allocs; defaults to the runner WireGuard server address")
 	flags.StringVar(&cfg.Runner.WireGuard.Interface, "runner-wireguard-interface", cfg.Runner.WireGuard.Interface, "runner WireGuard interface")
 	flags.StringVar(&cfg.Runner.WireGuard.ServerAddress, "runner-wireguard-server-address", cfg.Runner.WireGuard.ServerAddress, "runner WireGuard address with prefix")
 	flags.StringVar(&cfg.Runner.WireGuard.ClientAddress, "runner-wireguard-client-address", cfg.Runner.WireGuard.ClientAddress, "client WireGuard address with prefix")
