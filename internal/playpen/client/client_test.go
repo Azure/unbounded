@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -119,7 +120,7 @@ func TestCloseTearsDownTunnelBeforeDeallocateAndIsIdempotent(t *testing.T) {
 		case deallocsPath:
 			deallocCount++
 
-			if len(fake.commands) == 0 || !strings.Contains(fake.commands[len(fake.commands)-1], "ip link delete ppwg") {
+			if len(fake.commands) == 0 || !containsCommand(fake.commands, "ip netns delete ppns") {
 				t.Fatalf("dealloc happened before tunnel teardown: %#v", fake.commands)
 			}
 
@@ -185,6 +186,30 @@ func TestDeallocateSendsIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestPlaypenCommandExecutesInNetworkNamespace(t *testing.T) {
+	p := &Playpen{
+		tunnel: newTunnel(&fakeCommander{}, "private-key", testAllocResponse(), TunnelConfig{NetworkNamespace: "ns-playpen"}),
+	}
+
+	cmd, err := p.Command(t.Context(), "ip", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := strings.Join(append([]string{cmd.Path}, cmd.Args[1:]...), " ")
+	if os.Geteuid() == 0 {
+		if !strings.Contains(got, "ip netns exec ns-playpen ip addr") {
+			t.Fatalf("command = %q", got)
+		}
+
+		return
+	}
+
+	if !strings.Contains(got, "sudo -n ip netns exec ns-playpen ip addr") {
+		t.Fatalf("command = %q", got)
+	}
+}
+
 func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
@@ -215,6 +240,13 @@ func testAllocResponse() operator.AllocResponse {
 			VNI:     12001,
 			UDPPort: 4789,
 		},
+		Network: operator.NetworkResponse{
+			GuestMAC:    "52:54:00:aa:bb:01",
+			GuestIPv4:   "192.168.200.10",
+			SubnetMask:  "255.255.255.0",
+			GatewayIPv4: "192.168.200.1",
+			DNS:         []string{"8.8.8.8"},
+		},
 		Redfish: map[string]string{
 			"url":                    "https://10.88.0.1:8443",
 			"username":               "admin",
@@ -241,4 +273,14 @@ func (f *fakeCommander) Run(_ context.Context, name string, args ...string) erro
 	f.commands = append(f.commands, strings.Join(append([]string{name}, args...), " "))
 
 	return nil
+}
+
+func containsCommand(commands []string, want string) bool {
+	for _, command := range commands {
+		if strings.Contains(command, want) {
+			return true
+		}
+	}
+
+	return false
 }

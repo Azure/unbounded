@@ -219,7 +219,7 @@ func newHarness(t *testing.T) *harness {
 func (h *harness) checkPrereqs() {
 	h.t.Helper()
 
-	for _, bin := range []string{"bridge", "docker", "ip", "kind", "kubectl", "wg"} {
+	for _, bin := range []string{"bridge", "docker", "ip", "iptables", "kind", "kubectl", "sysctl", "wg"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			h.t.Skipf("e2e prereq %q missing on PATH; skipping suite", bin)
 		}
@@ -687,15 +687,15 @@ func (h *harness) verifyTunnelInterfaces(ctx context.Context, allocated *playpen
 	h.t.Helper()
 
 	cfg := allocated.TunnelConfig()
-	if err := h.runPrivileged(ctx, "ip", "link", "show", "dev", cfg.WireGuardInterface); err != nil {
+	if err := allocated.Run(ctx, "ip", "link", "show", "dev", cfg.WireGuardInterface); err != nil {
 		h.t.Fatalf("show wireguard interface %s: %v", cfg.WireGuardInterface, err)
 	}
 
-	if err := h.runPrivileged(ctx, "ip", "-d", "link", "show", "dev", cfg.VXLANInterface); err != nil {
+	if err := allocated.Run(ctx, "ip", "-d", "link", "show", "dev", cfg.VXLANInterface); err != nil {
 		h.t.Fatalf("show vxlan interface %s: %v", cfg.VXLANInterface, err)
 	}
 
-	peers, err := h.runPrivilegedOut(ctx, "wg", "show", cfg.WireGuardInterface, "peers")
+	peers, err := h.runPlaypenOut(ctx, allocated, "wg", "show", cfg.WireGuardInterface, "peers")
 	if err != nil {
 		h.t.Fatalf("show wireguard peers for %s: %v", cfg.WireGuardInterface, err)
 	}
@@ -708,27 +708,29 @@ func (h *harness) verifyTunnelInterfaces(ctx context.Context, allocated *playpen
 func (h *harness) verifyTunnelConnectivity(ctx context.Context, allocated *playpenclient.Playpen) {
 	h.t.Helper()
 
-	client := h.redfishHTTPClient(allocated)
 	readyURL := strings.TrimRight(allocated.Metadata.Redfish["url"], "/") + "/readyz"
 	if _, err := url.ParseRequestURI(readyURL); err != nil {
 		h.t.Fatalf("parse redfish ready URL %q: %v", readyURL, err)
 	}
 
 	if err := wait(ctx, 45*time.Second, func(ctx context.Context) (bool, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, readyURL, http.NoBody)
+		cmd, err := allocated.Command(ctx, os.Args[0], "-test.run", "^TestPlaypenRedfishReadyProbe$", "-test.count=1")
 		if err != nil {
 			return false, err
 		}
 
-		resp, err := client.Do(req)
+		cmd.Dir = h.repoRoot
+		cmd.Env = append(os.Environ(),
+			"PLAYPEN_REDFISH_PROBE_URL="+readyURL,
+			"PLAYPEN_REDFISH_PROBE_CERT_PEM="+strings.TrimSpace(allocated.Metadata.Redfish["certPEM"]),
+		)
+
+		_, err = h.runPlaypenCmdOut(cmd)
 		if err != nil {
 			return false, nil
 		}
-		defer resp.Body.Close() //nolint:errcheck // Test cleanup only.
 
-		io.Copy(io.Discard, resp.Body) //nolint:errcheck // Test response drain only.
-
-		return resp.StatusCode == http.StatusNoContent, nil
+		return true, nil
 	}); err != nil {
 		h.dumpTunnelDiagnostics(context.Background(), allocated)
 		h.t.Fatalf("verify tunnel connectivity to %s: %v", readyURL, err)
@@ -742,7 +744,7 @@ func (h *harness) dumpTunnelDiagnostics(ctx context.Context, allocated *playpenc
 		{"route", "get", "10.88.0.1"},
 		{"-d", "link", "show", "dev", cfg.VXLANInterface},
 	} {
-		out, err := h.runPrivilegedOut(ctx, "ip", args...)
+		out, err := h.runPlaypenOut(ctx, allocated, "ip", args...)
 		if err != nil {
 			h.t.Logf("ip %s failed: %v", strings.Join(args, " "), err)
 			continue
@@ -756,7 +758,7 @@ func (h *harness) dumpTunnelDiagnostics(ctx context.Context, allocated *playpenc
 		{"show", cfg.WireGuardInterface, "endpoints"},
 		{"show", cfg.WireGuardInterface, "latest-handshakes"},
 	} {
-		out, err := h.runPrivilegedOut(ctx, "wg", args...)
+		out, err := h.runPlaypenOut(ctx, allocated, "wg", args...)
 		if err != nil {
 			h.t.Logf("wg %s failed: %v", strings.Join(args, " "), err)
 			continue
@@ -779,23 +781,41 @@ func (h *harness) dumpTunnelDiagnostics(ctx context.Context, allocated *playpenc
 	}
 }
 
-func (h *harness) redfishHTTPClient(allocated *playpenclient.Playpen) *http.Client {
-	h.t.Helper()
+func TestPlaypenRedfishReadyProbe(t *testing.T) {
+	readyURL := os.Getenv("PLAYPEN_REDFISH_PROBE_URL")
+	certPEM := os.Getenv("PLAYPEN_REDFISH_PROBE_CERT_PEM")
+	if readyURL == "" && certPEM == "" {
+		t.Skip("helper process only")
+	}
 
-	certPEM := strings.TrimSpace(allocated.Metadata.Redfish["certPEM"])
-	if certPEM == "" {
-		h.t.Fatal("allocation redfish metadata did not include certPEM")
+	if readyURL == "" || certPEM == "" {
+		t.Fatal("PLAYPEN_REDFISH_PROBE_URL and PLAYPEN_REDFISH_PROBE_CERT_PEM are required")
 	}
 
 	roots := x509.NewCertPool()
 	if !roots.AppendCertsFromPEM([]byte(certPEM)) {
-		h.t.Fatal("allocation redfish certPEM did not contain a valid certificate")
+		t.Fatal("invalid Redfish certificate PEM")
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
+	client := &http.Client{Timeout: 5 * time.Second, Transport: transport}
 
-	return &http.Client{Timeout: 5 * time.Second, Transport: transport}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, readyURL, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // Test cleanup only.
+
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck // Test response drain only.
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
 }
 
 func (h *harness) teardown(ctx context.Context) {
@@ -834,20 +854,32 @@ func (h *harness) runOut(ctx context.Context, name string, args ...string) (stri
 	return out, err
 }
 
-func (h *harness) runPrivileged(ctx context.Context, name string, args ...string) error {
-	_, err := h.runPrivilegedOut(ctx, name, args...)
+func (h *harness) runPlaypenOut(ctx context.Context, allocated *playpenclient.Playpen, name string, args ...string) (string, error) {
+	h.t.Helper()
 
-	return err
-}
-
-func (h *harness) runPrivilegedOut(ctx context.Context, name string, args ...string) (string, error) {
-	if os.Geteuid() == 0 {
-		return h.runOut(ctx, name, args...)
+	cmd, err := allocated.Command(ctx, name, args...)
+	if err != nil {
+		return "", err
 	}
 
-	sudoArgs := append([]string{"-n", name}, args...)
+	cmd.Dir = h.repoRoot
 
-	return h.runOut(ctx, "sudo", sudoArgs...)
+	return h.runPlaypenCmdOut(cmd)
+}
+
+func (h *harness) runPlaypenCmdOut(cmd *exec.Cmd) (string, error) {
+	h.t.Helper()
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+
+	err := cmd.Run()
+	if err != nil {
+		return out.String(), fmt.Errorf("%s %s: %w\n%s", cmd.Path, strings.Join(cmd.Args[1:], " "), err, out.String())
+	}
+
+	return out.String(), nil
 }
 
 func (h *harness) runCaptured(ctx context.Context, name string, stdin io.Reader, args ...string) (string, error) {

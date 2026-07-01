@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 
@@ -183,6 +185,43 @@ func (p *Playpen) ConfigureTunnel(ctx context.Context) error {
 	}
 
 	return p.tunnel.Setup(ctx)
+}
+
+// Run executes a command inside the playpen network namespace.
+func (p *Playpen) Run(ctx context.Context, name string, args ...string) error {
+	cmd, err := p.Command(ctx, name, args...)
+	if err != nil {
+		return err
+	}
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	return cmd.Run()
+}
+
+// Command returns a command configured to execute inside the playpen network namespace.
+func (p *Playpen) Command(ctx context.Context, name string, args ...string) (*exec.Cmd, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed {
+		return nil, fmt.Errorf("playpen is closed")
+	}
+
+	namespace := strings.TrimSpace(p.tunnel.cfg.NetworkNamespace)
+	if namespace == "" {
+		return nil, fmt.Errorf("network namespace is required")
+	}
+
+	cmdArgs := append([]string{"netns", "exec", namespace, name}, args...)
+	cmdName := "ip"
+	if os.Geteuid() != 0 {
+		cmdArgs = append([]string{"-n", cmdName}, cmdArgs...)
+		cmdName = "sudo"
+	}
+
+	return exec.CommandContext(ctx, cmdName, cmdArgs...), nil
 }
 
 // Close tears down local tunnel resources and releases the playpen.
