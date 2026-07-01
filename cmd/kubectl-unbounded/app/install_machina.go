@@ -18,9 +18,6 @@ import (
 
 const machinaControllerName = "machina-controller"
 
-// machinaNamespace is the namespace machina is installed into.
-var machinaNamespace = unbounded.SystemNamespace()
-
 // installMachina installs machina manifests and waits for the controller to
 // become running.
 type installMachina struct {
@@ -34,7 +31,7 @@ func newInstallMachina(fileOrURL string, httpClient *http.Client, logger *slog.L
 		logger:           logger,
 		kubeResourcesCli: kubeResourcesCli,
 		kubeCli:          kubeCli,
-		namespace:        machinaNamespace,
+		namespace:        unbounded.SystemNamespace(),
 		controllerName:   machinaControllerName,
 		waitTimeout:      5 * time.Minute,
 		pollInterval:     5 * time.Second,

@@ -32,9 +32,6 @@ var MetalmanImage = "metalman:latest"
 
 const deployPXEDefaultReplicas = 1
 
-// deployPXENamespace is the namespace the PXE Deployment is created in.
-var deployPXENamespace = unbounded.SystemNamespace()
-
 // deployPXEParams holds the values needed to build the PXE Deployment.
 type deployPXEParams struct {
 	Site     string
@@ -51,7 +48,7 @@ func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguratio
 		"unbounded-cloud.io/site": p.Site,
 	}
 
-	return acappsv1.Deployment(name, deployPXENamespace).
+	return acappsv1.Deployment(name, unbounded.SystemNamespace()).
 		WithLabels(labels).
 		WithSpec(acappsv1.DeploymentSpec().
 			WithReplicas(p.Replicas).
@@ -185,7 +182,7 @@ func (h *deployPXEHandler) execute(ctx context.Context) error {
 		Replicas: h.replicas,
 	})
 
-	result, err := clientset.AppsV1().Deployments(deployPXENamespace).Apply(
+	result, err := clientset.AppsV1().Deployments(unbounded.SystemNamespace()).Apply(
 		ctx, deploy, metav1.ApplyOptions{FieldManager: fieldManagerID},
 	)
 	if err != nil {

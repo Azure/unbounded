@@ -18,9 +18,6 @@ import (
 
 const unboundedCNIControllerName = "unbounded-net-controller"
 
-// unboundedCNINamespace is the namespace unbounded-net is installed into.
-var unboundedCNINamespace = unbounded.SystemNamespace()
-
 // installUnboundedCNI installs unbounded-net manifests and waits for the
 // controller to become running.
 type installUnboundedCNI struct {
@@ -34,7 +31,7 @@ func newInstallUnboundedCNI(fileOrURL string, httpClient *http.Client, logger *s
 		logger:           logger,
 		kubeResourcesCli: kubeResourcesCli,
 		kubeCli:          kubeCli,
-		namespace:        unboundedCNINamespace,
+		namespace:        unbounded.SystemNamespace(),
 		controllerName:   unboundedCNIControllerName,
 		waitTimeout:      5 * time.Minute,
 		pollInterval:     5 * time.Second,

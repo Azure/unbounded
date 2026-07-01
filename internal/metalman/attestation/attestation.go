@@ -41,9 +41,6 @@ const (
 	maxRequestBodySize = 1 << 20
 )
 
-// BootstrapSANamespace is the namespace of the metalman bootstrap ServiceAccount.
-var BootstrapSANamespace = unbounded.SystemNamespace()
-
 type Handler struct {
 	Clientset      kubernetes.Interface
 	ClusterCA      []byte // PEM-encoded cluster CA certificate
@@ -272,7 +269,7 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	tokenResp, err := h.Clientset.CoreV1().ServiceAccounts(BootstrapSANamespace).CreateToken(
+	tokenResp, err := h.Clientset.CoreV1().ServiceAccounts(unbounded.SystemNamespace()).CreateToken(
 		ctx, BootstrapSAName, tokenRequest, metav1.CreateOptions{},
 	)
 	if err != nil {
