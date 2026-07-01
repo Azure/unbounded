@@ -53,6 +53,13 @@ spec:
             - containerPort: 51820
               name: wireguard
               protocol: UDP
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
           livenessProbe:
             httpGet:
               path: /healthz
@@ -138,6 +145,13 @@ spec:
             - containerPort: 51820
               name: wireguard
               protocol: UDP
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
           livenessProbe:
             httpGet:
               path: /healthz

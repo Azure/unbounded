@@ -37,6 +37,13 @@ spec:
             - containerPort: 8443
               name: https
               protocol: TCP
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
           livenessProbe:
             httpGet:
               path: /healthz
