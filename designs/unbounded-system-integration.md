@@ -96,9 +96,13 @@ The initial #372 review raised four findings; disposition:
 - **2 (release-upgrade.yaml, High):** not #372's; PR-A restructures that workflow
   and PR-C makes it `unbounded-system`-aware. Gated by this integration branch -
   no unified release is cut from `main` until PR-C merges (see below).
-- **3 (namespace override not end-to-end, Medium):** fixed in #372 - machina
-  resolves its SSH-secret namespace from `POD_NAMESPACE`, and `machine register`
-  gained `--namespace`, so a non-default install namespace lines up.
+- **3 (namespace override not end-to-end, Medium):** fixed in #372 - namespace
+  resolution is centralized in `unbounded.SystemNamespace()`, a POD_NAMESPACE-aware
+  helper (the raw default is the unexported `systemNamespace` const). Components
+  read their runtime namespace from the Downward-API `POD_NAMESPACE` the
+  Deployments inject, so a non-default install namespace lines up end to end;
+  `kubectl unbounded machine register --namespace` aligns the client-written SSH
+  secret/ref. The Makefile documents this.
 - **4 (docs point at kube-system, Low):** fixed in #372 - net day-2 docs now
   reference `unbounded-system`.
 
