@@ -178,7 +178,7 @@ func isAlreadyExistsErr(err error) bool {
 func waitForMachine(ctx context.Context, log *slog.Logger, machine string) error {
 	const (
 		pollInterval = 500 * time.Millisecond
-		timeout      = 30 * time.Second
+		timeout      = 5 * time.Minute
 	)
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
