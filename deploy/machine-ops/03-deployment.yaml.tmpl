@@ -3,7 +3,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ $controllerName }}
-  namespace: {{ default "unbounded-kube" .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: {{ $controllerName }}
     app.kubernetes.io/component: controller
@@ -50,8 +50,8 @@ spec:
           imagePullPolicy: Always
           args:
             - --leader-elect=true
-            - --leader-elect-namespace={{ default "unbounded-kube" .Namespace }}
-            - --credential-secret-namespace={{ default "unbounded-kube" .Namespace }}
+            - --leader-elect-namespace={{ default "unbounded-system" .Namespace }}
+            - --credential-secret-namespace={{ default "unbounded-system" .Namespace }}
             - --max-concurrent-reconciles={{ default "10" .MaxConcurrentReconciles }}
             {{- if .Provider }}
             - --provider={{ .Provider }}

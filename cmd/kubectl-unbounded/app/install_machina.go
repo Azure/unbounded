@@ -11,14 +11,12 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	machinadeploy "github.com/Azure/unbounded/deploy/machina"
+	"github.com/Azure/unbounded/internal/unbounded"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-const (
-	machinaNamespace      = "unbounded-kube"
-	machinaControllerName = "machina-controller"
-)
+const machinaControllerName = "machina-controller"
 
 // installMachina installs machina manifests and waits for the controller to
 // become running.
@@ -33,7 +31,7 @@ func newInstallMachina(fileOrURL string, httpClient *http.Client, logger *slog.L
 		logger:           logger,
 		kubeResourcesCli: kubeResourcesCli,
 		kubeCli:          kubeCli,
-		namespace:        machinaNamespace,
+		namespace:        unbounded.SystemNamespace(),
 		controllerName:   machinaControllerName,
 		waitTimeout:      5 * time.Minute,
 		pollInterval:     5 * time.Second,

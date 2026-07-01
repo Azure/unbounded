@@ -19,6 +19,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/Azure/unbounded/internal/kube"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 // MetalmanImage is the default container image for the metalman controller
@@ -29,10 +30,7 @@ import (
 // When not set (e.g. during development), it falls back to "metalman:latest".
 var MetalmanImage = "metalman:latest"
 
-const (
-	deployPXENamespace       = "unbounded-kube"
-	deployPXEDefaultReplicas = 1
-)
+const deployPXEDefaultReplicas = 1
 
 // deployPXEParams holds the values needed to build the PXE Deployment.
 type deployPXEParams struct {
@@ -50,7 +48,7 @@ func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguratio
 		"unbounded-cloud.io/site": p.Site,
 	}
 
-	return acappsv1.Deployment(name, deployPXENamespace).
+	return acappsv1.Deployment(name, unbounded.SystemNamespace()).
 		WithLabels(labels).
 		WithSpec(acappsv1.DeploymentSpec().
 			WithReplicas(p.Replicas).
@@ -92,6 +90,14 @@ func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguratio
 						WithImage(p.Image).
 						WithImagePullPolicy(corev1.PullAlways).
 						WithArgs("serve-pxe", "--site="+p.Site, "--dhcp-auto-interface").
+						WithEnv(accorev1.EnvVar().
+							WithName("POD_NAMESPACE").
+							WithValueFrom(accorev1.EnvVarSource().
+								WithFieldRef(accorev1.ObjectFieldSelector().
+									WithFieldPath("metadata.namespace"),
+								),
+							),
+						).
 						WithPorts(
 							accorev1.ContainerPort().
 								WithContainerPort(8880).
@@ -176,7 +182,7 @@ func (h *deployPXEHandler) execute(ctx context.Context) error {
 		Replicas: h.replicas,
 	})
 
-	result, err := clientset.AppsV1().Deployments(deployPXENamespace).Apply(
+	result, err := clientset.AppsV1().Deployments(unbounded.SystemNamespace()).Apply(
 		ctx, deploy, metav1.ApplyOptions{FieldManager: fieldManagerID},
 	)
 	if err != nil {
@@ -196,7 +202,7 @@ func deployPXECommand() *cobra.Command {
 		Short: "Deploy the PXE server for a site",
 		Long: `Deploy (or update) a Kubernetes Deployment running metalman serve-pxe
 for a given site. The Deployment is server-side applied into the
-unbounded-kube namespace.`,
+unbounded-system namespace.`,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {

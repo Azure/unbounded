@@ -6,7 +6,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: unbounded-net-config
-  namespace: {{ .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
 data:
   LOG_LEVEL: "{{ default "2" .LogLevel }}"
   config.yaml: |
@@ -32,7 +32,7 @@ data:
         leaseDuration: "{{ default "30s" .ControllerLeaderElectionLeaseDuration }}"
         renewDeadline: "{{ default "15s" .ControllerLeaderElectionRenewDeadline }}"
         retryPeriod: "{{ default "10s" .ControllerLeaderElectionRetryPeriod }}"
-        resourceNamespace: {{ .Namespace }}
+        resourceNamespace: {{ default "unbounded-system" .Namespace }}
         resourceName: "{{ default "unbounded-net-controller" .ControllerLeaderElectionResourceName }}"
 
     node:

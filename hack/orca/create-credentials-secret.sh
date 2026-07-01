@@ -23,7 +23,7 @@
 #   --azure-account-key KEY   Azure storage account key (required; or set
 #                             env ORCA_AZUREBLOB_ACCOUNT_KEY)
 #   --context CTX             kubectl context to target (default: current)
-#   --namespace NS            namespace (default: unbounded-kube)
+#   --namespace NS            namespace (default: unbounded-system)
 #   --secret-name NAME        Secret name (default: orca-credentials)
 #   --access-key ID           Garage access key id (default: generated)
 #   --secret-key SECRET       Garage secret key (default: generated)
@@ -32,7 +32,7 @@
 set -euo pipefail
 
 CONTEXT=""
-NAMESPACE="unbounded-kube"
+NAMESPACE="unbounded-system"
 SECRET_NAME="orca-credentials"
 AZURE_ACCOUNT_KEY="${ORCA_AZUREBLOB_ACCOUNT_KEY:-}"
 ACCESS_KEY=""

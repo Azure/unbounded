@@ -282,7 +282,7 @@ resources:
 |----------|-------------|
 | `LOG_LEVEL` | Initial klog verbosity. For live changes, edit `common.logLevel` in ConfigMap. |
 | `POD_NAME` | Pod name for leader election identity (downward API). |
-| `POD_NAMESPACE` | Namespace for leader election lease (default: `kube-system`). |
+| `POD_NAMESPACE` | Namespace for leader election lease (default: `unbounded-system`). |
 | `POD_IP` | Pod IP for EndpointSlice management. |
 | `NODE_NAME` | Node name, displayed in dashboard. |
 

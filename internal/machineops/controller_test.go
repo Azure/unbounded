@@ -126,14 +126,14 @@ func TestMachineOperationReconciler_ResolvesSiteCredential(t *testing.T) {
 			Auth: unboundedv1alpha3.MachineOperationCredentialAuth{
 				Mode: unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin,
 				SecretRef: &unboundedv1alpha3.NamespacedSecretReference{
-					Namespace: "unbounded-kube",
+					Namespace: "unbounded-system",
 					Name:      "site-a-azure-sp",
 				},
 			},
 		},
 	}
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "unbounded-kube", Name: "site-a-azure-sp"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "unbounded-system", Name: "site-a-azure-sp"},
 		Data: map[string][]byte{
 			"tenantID":     []byte("tenant"),
 			"clientID":     []byte("client"),
@@ -394,7 +394,7 @@ func TestMachineOperationReconciler_FailsCredentialSecretOutsideAllowedNamespace
 		Client:                    c,
 		Providers:                 []Provider{provider},
 		Now:                       fixedOperationNow,
-		CredentialSecretNamespace: "unbounded-kube",
+		CredentialSecretNamespace: "unbounded-system",
 	}
 
 	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
@@ -858,7 +858,7 @@ func newMachineOperationCredential(name, site, provider string) *unboundedv1alph
 			Auth: unboundedv1alpha3.MachineOperationCredentialAuth{
 				Mode: unboundedv1alpha3.MachineOperationCredentialAuthExternalPlugin,
 				SecretRef: &unboundedv1alpha3.NamespacedSecretReference{
-					Namespace: "unbounded-kube",
+					Namespace: "unbounded-system",
 					Name:      name,
 				},
 			},

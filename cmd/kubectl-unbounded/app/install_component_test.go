@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	machinadeploy "github.com/Azure/unbounded/deploy/machina"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 // discardLogger returns a logger that discards all output.
@@ -255,7 +256,7 @@ func TestWaitForController_PodRunning(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "unbounded-net-controller-abc123",
-			Namespace: unboundedCNINamespace,
+			Namespace: unbounded.SystemNamespace(),
 		},
 		Status: corev1.PodStatus{
 			Phase:             corev1.PodRunning,
@@ -266,7 +267,7 @@ func TestWaitForController_PodRunning(t *testing.T) {
 	inst := &kubeComponentInstaller{
 		kubeCli:        cli,
 		logger:         discardLogger(),
-		namespace:      unboundedCNINamespace,
+		namespace:      unbounded.SystemNamespace(),
 		controllerName: unboundedCNIControllerName,
 	}
 	err := inst.waitForController(context.Background())
@@ -279,7 +280,7 @@ func TestWaitForController_PodRunningButContainerNotReady(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "unbounded-net-controller-abc123",
-			Namespace: unboundedCNINamespace,
+			Namespace: unbounded.SystemNamespace(),
 		},
 		Status: corev1.PodStatus{
 			Phase:             corev1.PodRunning,
@@ -290,7 +291,7 @@ func TestWaitForController_PodRunningButContainerNotReady(t *testing.T) {
 	inst := &kubeComponentInstaller{
 		kubeCli:        cli,
 		logger:         discardLogger(),
-		namespace:      unboundedCNINamespace,
+		namespace:      unbounded.SystemNamespace(),
 		controllerName: unboundedCNIControllerName,
 		waitTimeout:    200 * time.Millisecond,
 		pollInterval:   50 * time.Millisecond,
@@ -304,7 +305,7 @@ func TestWaitForController_PodPending(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "unbounded-net-controller-abc123",
-			Namespace: unboundedCNINamespace,
+			Namespace: unbounded.SystemNamespace(),
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodPending,
@@ -314,7 +315,7 @@ func TestWaitForController_PodPending(t *testing.T) {
 	inst := &kubeComponentInstaller{
 		kubeCli:        cli,
 		logger:         discardLogger(),
-		namespace:      unboundedCNINamespace,
+		namespace:      unbounded.SystemNamespace(),
 		controllerName: unboundedCNIControllerName,
 		waitTimeout:    200 * time.Millisecond,
 		pollInterval:   50 * time.Millisecond,
@@ -329,7 +330,7 @@ func TestWaitForController_NoPod(t *testing.T) {
 	inst := &kubeComponentInstaller{
 		kubeCli:        cli,
 		logger:         discardLogger(),
-		namespace:      unboundedCNINamespace,
+		namespace:      unbounded.SystemNamespace(),
 		controllerName: unboundedCNIControllerName,
 		waitTimeout:    200 * time.Millisecond,
 		pollInterval:   50 * time.Millisecond,
@@ -343,7 +344,7 @@ func TestWaitForController_IgnoresOtherPods(t *testing.T) {
 	otherPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "some-other-pod",
-			Namespace: unboundedCNINamespace,
+			Namespace: unbounded.SystemNamespace(),
 		},
 		Status: corev1.PodStatus{
 			Phase:             corev1.PodRunning,
@@ -354,7 +355,7 @@ func TestWaitForController_IgnoresOtherPods(t *testing.T) {
 	inst := &kubeComponentInstaller{
 		kubeCli:        cli,
 		logger:         discardLogger(),
-		namespace:      unboundedCNINamespace,
+		namespace:      unbounded.SystemNamespace(),
 		controllerName: unboundedCNIControllerName,
 		waitTimeout:    200 * time.Millisecond,
 		pollInterval:   50 * time.Millisecond,
@@ -368,7 +369,7 @@ func TestWaitForController_MachinaNamespace(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "machina-controller-xyz789",
-			Namespace: machinaNamespace,
+			Namespace: unbounded.SystemNamespace(),
 		},
 		Status: corev1.PodStatus{
 			Phase:             corev1.PodRunning,
@@ -379,7 +380,7 @@ func TestWaitForController_MachinaNamespace(t *testing.T) {
 	inst := &kubeComponentInstaller{
 		kubeCli:        cli,
 		logger:         discardLogger(),
-		namespace:      machinaNamespace,
+		namespace:      unbounded.SystemNamespace(),
 		controllerName: machinaControllerName,
 	}
 	err := inst.waitForController(context.Background())
@@ -731,7 +732,7 @@ func TestNewInstallMachina(t *testing.T) {
 	require.Equal(t, logger, im.logger)
 	require.Equal(t, kubeResourcesCli, im.kubeResourcesCli)
 	require.Equal(t, kubeCli, im.kubeCli)
-	require.Equal(t, machinaNamespace, im.namespace)
+	require.Equal(t, unbounded.SystemNamespace(), im.namespace)
 	require.Equal(t, machinaControllerName, im.controllerName)
 	require.Equal(t, "machina", im.tempPrefix)
 	require.Equal(t, 5*time.Minute, im.waitTimeout)
@@ -766,7 +767,7 @@ func TestNewInstallUnboundedCNI(t *testing.T) {
 	require.Equal(t, logger, iu.logger)
 	require.Equal(t, kubeResourcesCli, iu.kubeResourcesCli)
 	require.Equal(t, kubeCli, iu.kubeCli)
-	require.Equal(t, unboundedCNINamespace, iu.namespace)
+	require.Equal(t, unbounded.SystemNamespace(), iu.namespace)
 	require.Equal(t, unboundedCNIControllerName, iu.controllerName)
 	require.Equal(t, "unbounded-net", iu.tempPrefix)
 	require.Equal(t, 5*time.Minute, iu.waitTimeout)

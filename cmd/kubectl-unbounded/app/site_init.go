@@ -23,6 +23,7 @@ import (
 
 	"github.com/Azure/unbounded/cmd/machina/machina/controller"
 	"github.com/Azure/unbounded/internal/kube"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 //go:embed assets/unbounded-net-site/*.yaml
@@ -294,12 +295,12 @@ func (h *siteInitHandler) ensureMachinaIsRunning(ctx context.Context) error {
 		FieldManager: fieldManagerID,
 	}
 
-	// Ensure the unbounded-kube namespace exists before applying the
-	// ConfigMap — the namespace manifest is part of the installer bundle
+	// Ensure the install namespace exists before applying the
+	// ConfigMap - the namespace manifest is part of the installer bundle
 	// but we need it earlier.
-	nsApply := v1.Namespace(machinaNamespace)
+	nsApply := v1.Namespace(unbounded.SystemNamespace())
 	if _, err := h.kubeCli.CoreV1().Namespaces().Apply(ctx, nsApply, ao); err != nil {
-		return fmt.Errorf("ensuring namespace %s: %w", machinaNamespace, err)
+		return fmt.Errorf("ensuring namespace %s: %w", unbounded.SystemNamespace(), err)
 	}
 
 	b, err := yaml.Marshal(machinaCfg)
@@ -307,7 +308,7 @@ func (h *siteInitHandler) ensureMachinaIsRunning(ctx context.Context) error {
 		return fmt.Errorf("marshaling machina controller config: %w", err)
 	}
 
-	s := v1.ConfigMap("machina-config", "unbounded-kube").
+	s := v1.ConfigMap("machina-config", unbounded.SystemNamespace()).
 		WithData(map[string]string{
 			"config.yaml": string(b),
 		})

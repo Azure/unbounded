@@ -353,7 +353,7 @@ def clean_libvirt() -> None:
     # Stop and remove leftover local registry container.
     run_quiet(["docker", "rm", "-f", REGISTRY_CONTAINER])
     # Delete stale leader-election leases so new processes acquire immediately.
-    run_quiet([KUBECTL, "-n", "unbounded-kube", "delete", "lease",
+    run_quiet([KUBECTL, "-n", "unbounded-system", "delete", "lease",
                f"metalman-{SITE}"])
     time.sleep(1)
 

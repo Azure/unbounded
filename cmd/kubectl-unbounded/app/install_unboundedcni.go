@@ -11,14 +11,12 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	netdeploy "github.com/Azure/unbounded/deploy/net"
+	"github.com/Azure/unbounded/internal/unbounded"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-const (
-	unboundedCNINamespace      = "unbounded-net"
-	unboundedCNIControllerName = "unbounded-net-controller"
-)
+const unboundedCNIControllerName = "unbounded-net-controller"
 
 // installUnboundedCNI installs unbounded-net manifests and waits for the
 // controller to become running.
@@ -33,7 +31,7 @@ func newInstallUnboundedCNI(fileOrURL string, httpClient *http.Client, logger *s
 		logger:           logger,
 		kubeResourcesCli: kubeResourcesCli,
 		kubeCli:          kubeCli,
-		namespace:        unboundedCNINamespace,
+		namespace:        unbounded.SystemNamespace(),
 		controllerName:   unboundedCNIControllerName,
 		waitTimeout:      5 * time.Minute,
 		pollInterval:     5 * time.Second,

@@ -6,7 +6,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: unbounded-net-controller
-  namespace: {{ .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: unbounded-net-controller
     app.kubernetes.io/component: controller
@@ -104,7 +104,7 @@ spec:
           args:
             - -v=$(LOG_LEVEL)
             - --config-file=/etc/unbounded-net/config.yaml
-            - --leader-elect-resource-namespace={{ .Namespace }}
+            - --leader-elect-resource-namespace={{ default "unbounded-system" .Namespace }}
             - --force-not-leader={{ .ForceNotLeader }}
           ports:
             - name: https

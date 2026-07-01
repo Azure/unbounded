@@ -154,7 +154,7 @@ func TestRedfishPowerClientFactoryRejectsMissingSecretKey(t *testing.T) {
 	factory := &RedfishPowerClientFactory{Reader: c, Pool: redfish.NewPool()}
 
 	_, err := factory.ForMachine(context.Background(), machine)
-	require.ErrorContains(t, err, `redfish password secret unbounded-kube/redfish missing key "password"`)
+	require.ErrorContains(t, err, `redfish password secret unbounded-system/redfish missing key "password"`)
 }
 
 func TestReconcilerSnapshotsSiteScopedSelectorTargets(t *testing.T) {
@@ -600,7 +600,7 @@ func testBareMetalMachine(name, site string) *v1alpha3.Machine {
 					URL:         "https://bmc.example.com",
 					Username:    "admin",
 					DeviceID:    "1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "redfish", Namespace: "unbounded-kube", Key: "password"},
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "redfish", Namespace: "unbounded-system", Key: "password"},
 				},
 			},
 		},
@@ -610,7 +610,7 @@ func testBareMetalMachine(name, site string) *v1alpha3.Machine {
 
 func testRedfishSecret() *corev1.Secret {
 	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "redfish", Namespace: "unbounded-kube"},
+		ObjectMeta: metav1.ObjectMeta{Name: "redfish", Namespace: "unbounded-system"},
 		Data:       map[string][]byte{"password": []byte("secret")},
 	}
 }
