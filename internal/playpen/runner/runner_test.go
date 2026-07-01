@@ -147,6 +147,17 @@ func TestNetworkSetupCommands(t *testing.T) {
 			t.Fatalf("commands missing %q:\n%s", want, commands)
 		}
 	}
+
+	for _, forbidden := range []string{
+		"192.168.200.1",
+		"MASQUERADE",
+		"net.ipv4.ip_forward",
+		"iptables",
+	} {
+		if strings.Contains(commands, forbidden) {
+			t.Fatalf("runner network setup contains %q, want VM egress isolated to VXLAN:\n%s", forbidden, commands)
+		}
+	}
 }
 
 func TestNetworkSetupWithoutInitialPeer(t *testing.T) {

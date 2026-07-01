@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -349,7 +351,8 @@ func (h *harness) renderManifests(ctx context.Context) {
 		h.t.Fatalf("clean rendered manifests: %v", err)
 	}
 
-	if err := h.run(ctx,
+	if err := h.run(
+		ctx,
 		"go", "run", "./hack/cmd/render-manifests",
 		"--templates-dir", filepath.Join(h.repoRoot, "deploy", "playpen"),
 		"--output-dir", manifestDir,
@@ -703,6 +706,65 @@ func (h *harness) verifyTunnelInterfaces(ctx context.Context, allocated *playpen
 	if !strings.Contains(peers, allocated.Metadata.WireGuard.ServerPublicKey) {
 		h.t.Fatalf("wireguard peers for %s do not include server public key %s: %s", cfg.WireGuardInterface, allocated.Metadata.WireGuard.ServerPublicKey, peers)
 	}
+
+	guestGateway := guestGatewayPrefix(h.t, allocated.Metadata.Network)
+	vxlanAddr, err := h.runPlaypenOut(ctx, allocated, "ip", "addr", "show", "dev", cfg.VXLANInterface)
+	if err != nil {
+		h.t.Fatalf("show vxlan address for %s: %v", cfg.VXLANInterface, err)
+	}
+
+	if !strings.Contains(vxlanAddr, guestGateway) {
+		h.t.Fatalf("vxlan interface %s missing guest gateway %s:\n%s", cfg.VXLANInterface, guestGateway, vxlanAddr)
+	}
+
+	guestSubnet := guestSubnetCIDR(h.t, allocated.Metadata.Network)
+	natRules, err := h.runPlaypenOut(ctx, allocated, "iptables", "-t", "nat", "-S", "POSTROUTING")
+	if err != nil {
+		h.t.Fatalf("show playpen namespace NAT rules: %v", err)
+	}
+
+	wantNAT := "-A POSTROUTING -s " + guestSubnet + " -o " + cfg.ManagementNamespaceInterface + " -j MASQUERADE"
+	if !strings.Contains(natRules, wantNAT) {
+		h.t.Fatalf("playpen namespace NAT rules missing %q:\n%s", wantNAT, natRules)
+	}
+}
+
+func guestGatewayPrefix(t *testing.T, network operator.NetworkResponse) string {
+	t.Helper()
+
+	gatewayIP, err := netip.ParseAddr(network.GatewayIPv4)
+	if err != nil {
+		t.Fatalf("parse gateway IPv4 %q: %v", network.GatewayIPv4, err)
+	}
+
+	return netip.PrefixFrom(gatewayIP, subnetMaskPrefixLength(t, network.SubnetMask)).String()
+}
+
+func guestSubnetCIDR(t *testing.T, network operator.NetworkResponse) string {
+	t.Helper()
+
+	guestIP, err := netip.ParseAddr(network.GuestIPv4)
+	if err != nil {
+		t.Fatalf("parse guest IPv4 %q: %v", network.GuestIPv4, err)
+	}
+
+	return netip.PrefixFrom(guestIP, subnetMaskPrefixLength(t, network.SubnetMask)).Masked().String()
+}
+
+func subnetMaskPrefixLength(t *testing.T, subnetMask string) int {
+	t.Helper()
+
+	mask := net.ParseIP(subnetMask).To4()
+	if mask == nil {
+		t.Fatalf("parse subnet mask %q", subnetMask)
+	}
+
+	ones, bits := net.IPMask(mask).Size()
+	if bits != 32 {
+		t.Fatalf("subnet mask %q is not contiguous", subnetMask)
+	}
+
+	return ones
 }
 
 func (h *harness) verifyTunnelConnectivity(ctx context.Context, allocated *playpenclient.Playpen) {
@@ -720,7 +782,8 @@ func (h *harness) verifyTunnelConnectivity(ctx context.Context, allocated *playp
 		}
 
 		cmd.Dir = h.repoRoot
-		cmd.Env = append(os.Environ(),
+		cmd.Env = append(
+			os.Environ(),
 			"PLAYPEN_REDFISH_PROBE_URL="+readyURL,
 			"PLAYPEN_REDFISH_PROBE_CERT_PEM="+strings.TrimSpace(allocated.Metadata.Redfish["certPEM"]),
 		)

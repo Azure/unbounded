@@ -8,6 +8,10 @@ On alloc, the operator patches the selected pod with the client key, creates a
 per-runner UDP NodePort Service for WireGuard, and returns the endpoint, network,
 VXLAN, and Redfish details needed to use the playpen VM.
 
+The returned guest network metadata is intended for a VM whose default gateway is
+configured on the client side of the tunnel. The runner pod exposes only the VM's
+L2 path into VXLAN; VM egress is routed and NATed by the client tunnel namespace.
+
 The operator does not proxy Redfish or console traffic. Clients reach Redfish and
 the serial console stream on the runner through the WireGuard tunnel. The alloc
 response includes the runner Redfish URL, the system URL, and the OEM serial

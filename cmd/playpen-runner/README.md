@@ -49,10 +49,16 @@ In Kubernetes, the operator writes the client key into the runner pod's
 runner configures the peer after observing that annotation. In delayed mode,
 `/readyz` returns `503` until the peer is configured.
 
+The runner side is L2-only for the VM: it connects QEMU's tap to the bridge and
+VXLAN, but does not assign the guest gateway address, enable forwarding, or NAT
+guest traffic through the runner pod. The guest can only emit frames onto the
+VXLAN overlay.
+
 The default WireGuard addresses are `10.88.0.1/24` for the runner and
 `10.88.0.2/32` for the client. The default guest metadata is MAC
 `52:54:00:aa:bb:01`, IPv4 `192.168.200.10`, gateway `192.168.200.1`, and DNS
-`8.8.8.8`.
+`8.8.8.8`. The client tunnel configures that gateway address on its side of the
+VXLAN and NATs guest egress through the client's network namespace.
 
 ## VM Lifecycle
 
