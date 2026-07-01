@@ -36,6 +36,25 @@ func TestDiscoverKVMDevicePath_Absent(t *testing.T) {
 	}
 }
 
+func TestDiscoverExistingDevicePaths(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	tun := filepath.Join(dir, "net", "tun")
+	vhostNet := filepath.Join(dir, "vhost-net")
+	missing := filepath.Join(dir, "missing")
+
+	require.NoError(t, os.Mkdir(filepath.Dir(tun), 0o755))
+
+	for _, path := range []string{tun, vhostNet} {
+		f, err := os.Create(path)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+	}
+
+	require.Equal(t, []string{tun, vhostNet}, discoverExistingDevicePaths(tun, missing, vhostNet))
+}
+
 func TestDiscoverBlockDevicePaths(t *testing.T) {
 	t.Parallel()
 
@@ -200,6 +219,7 @@ func TestHostDevices_Paths_MergesDedupesSorts(t *testing.T) {
 
 	d := HostDevices{
 		KVM:        []string{"/dev/kvm"},
+		Network:    []string{"/dev/net/tun", "/dev/vhost-net"},
 		Block:      []string{"/dev/sdb", "/dev/sda", "/dev/kvm"},
 		Infiniband: []string{"/dev/infiniband/uverbs0"},
 	}
@@ -207,8 +227,10 @@ func TestHostDevices_Paths_MergesDedupesSorts(t *testing.T) {
 	want := []string{
 		"/dev/infiniband/uverbs0",
 		"/dev/kvm",
+		"/dev/net/tun",
 		"/dev/sda",
 		"/dev/sdb",
+		"/dev/vhost-net",
 	}
 	require.Equal(t, want, d.Paths())
 }

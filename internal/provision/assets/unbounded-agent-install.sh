@@ -28,6 +28,9 @@ set -eo pipefail
 #                           AGENT_BASE_URL entirely.
 #   AGENT_DEBUG           - enable debug mode for unbounded-agent
 #                           (e.g. "1", "true", "yes").
+#   AGENT_PREFLIGHT       - run unbounded-agent preflight before start.
+#                           Defaults to enabled. Set to "0", "false", or
+#                           "no" to skip preflight.
 
 if [ -z "${UNBOUNDED_AGENT_CONFIG_FILE}" ]; then
     echo "UNBOUNDED_AGENT_CONFIG_FILE is not set" >&2
@@ -77,6 +80,15 @@ install -m 0755 "${tmp_dir}/unbounded-agent" "${AGENT_BIN}"
 _START_ARGS=""
 case "${AGENT_DEBUG}" in
     1|true|yes|TRUE|YES|True|Yes) _START_ARGS="--debug" ;;
+esac
+
+case "${AGENT_PREFLIGHT:-true}" in
+    0|false|no|FALSE|NO|False|No)
+        ;;
+    *)
+        echo "Running unbounded-agent preflight..."
+        "${AGENT_BIN}" preflight ${_START_ARGS}
+        ;;
 esac
 
 echo "Running unbounded-agent start..."

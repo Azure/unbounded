@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,8 +30,6 @@ import (
 
 const (
 	siteLabel = "unbounded-cloud.io/site"
-
-	conditionCompleted = "Completed"
 
 	reasonSucceeded                = "Succeeded"
 	reasonInvalidTargetScope       = "InvalidTargetScope"
@@ -71,7 +70,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/status,verbs=get
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -121,7 +120,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	if older, err := r.olderActiveOperation(ctx, &op); err != nil {
+	if older, err := r.olderConflictingOperation(ctx, &op); err != nil {
 		return ctrl.Result{}, err
 	} else if older != "" {
 		message := fmt.Sprintf("waiting for older host operation %s", older)
@@ -152,9 +151,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
+	restoreHostReplaceTriggerConditions := op.Spec.OperationKind == v1alpha3.OperationHostReplace && hostReplaceTriggerConditionsMissing(&op)
+
 	changes, requeueAfter := r.advanceTargets(ctx, &op)
-	if len(changes) > 0 {
-		if err := r.applyTargetChanges(ctx, op.Name, changes); err != nil {
+	if len(changes) > 0 || restoreHostReplaceTriggerConditions {
+		if err := r.applyTargetChanges(ctx, op.Name, changes, restoreHostReplaceTriggerConditions); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -198,6 +199,10 @@ func (r *Reconciler) snapshotTargets(ctx context.Context, op *v1alpha3.MachineOp
 		latest.Status.StartedAt = &now
 		latest.Status.Targets = targetStatuses
 		setCompletedCondition(latest, metav1.ConditionFalse, "InProgress", latest.Status.Message)
+
+		if op.Spec.OperationKind == v1alpha3.OperationHostReplace {
+			setHostReplaceTriggerConditions(latest)
+		}
 	})
 }
 
@@ -358,7 +363,9 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 		return failTarget(target, reasonUnsupportedTarget, fmt.Sprintf("Machine %s is not a bare-metal Redfish target", machine.Name), now)
 	}
 
-	target.ObservedGeneration = machine.Generation
+	if op.Spec.OperationKind != v1alpha3.OperationHostReplace || target.TargetOperations == nil {
+		target.ObservedGeneration = machine.Generation
+	}
 
 	switch op.Spec.OperationKind {
 	case v1alpha3.OperationHostPowerOff:
@@ -368,7 +375,7 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 	case v1alpha3.OperationHostReboot:
 		return r.advanceReboot(ctx, &machine, target, now)
 	case v1alpha3.OperationHostReplace:
-		return r.advanceReplace(ctx, &machine, target, now)
+		return r.advanceReplace(ctx, op, &machine, target, now)
 	default:
 		return failTarget(target, reasonUnsupportedTarget, fmt.Sprintf("%s is not handled by metalman", op.Spec.OperationKind), now)
 	}
@@ -519,7 +526,7 @@ func (r *Reconciler) waitForPowerAction(target v1alpha3.MachineOperationTargetSt
 	return targetChange{}, false
 }
 
-func (r *Reconciler) advanceReplace(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
 	if target.TargetOperations == nil {
 		target.TargetOperations = computeReplaceTargets(machine)
 		target.Stage = v1alpha3.OperationStageRepaveRequested
@@ -541,10 +548,18 @@ func (r *Reconciler) advanceReplace(ctx context.Context, machine *v1alpha3.Machi
 		return targetChange{target: target}
 	}
 
+	if target.ObservedGeneration == 0 || target.Stage == v1alpha3.OperationStageRepaveRequested {
+		target.ObservedGeneration = machine.Generation
+	}
+
 	if machine.Status.Operations != nil &&
 		machine.Status.Operations.RebootCounter >= target.TargetOperations.RebootCounter &&
 		machine.Status.Operations.RepaveCounter >= target.TargetOperations.RepaveCounter &&
 		apimeta.IsStatusConditionTrue(machine.Status.Conditions, v1alpha3.MachineConditionRepaved) {
+		if change, done := cloudInitReplaceStatus(machine, target, now); done {
+			return change
+		}
+
 		nodeName := nodeNameForMachine(machine)
 
 		var node corev1.Node
@@ -566,6 +581,24 @@ func (r *Reconciler) advanceReplace(ctx context.Context, machine *v1alpha3.Machi
 	target.Message = "waiting for PXE repave to complete"
 
 	return targetChange{target: target}
+}
+
+func cloudInitReplaceStatus(machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) (targetChange, bool) {
+	cond := apimeta.FindStatusCondition(machine.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
+	if cond != nil && cond.ObservedGeneration >= target.ObservedGeneration {
+		if cond.Status == metav1.ConditionTrue {
+			return targetChange{}, false
+		}
+
+		if cond.Reason == "Failed" {
+			return failTarget(target, reasonExecutionFailed, cond.Message, now), true
+		}
+	}
+
+	target.Stage = v1alpha3.OperationStageWaitingCloudInit
+	target.Message = "waiting for first-boot cloud-init to complete"
+
+	return targetChange{target: target}, true
 }
 
 func nodeNameForMachine(machine *v1alpha3.Machine) string {
@@ -612,7 +645,7 @@ func (r *Reconciler) patchMachineOperations(ctx context.Context, machineName str
 	})
 }
 
-func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, changes []targetChange) error {
+func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, changes []targetChange, restoreHostReplaceTriggerConditions bool) error {
 	for _, change := range changes {
 		if change.err != nil {
 			return change.err
@@ -634,6 +667,10 @@ func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, chan
 			if updated, ok := byName[target.MachineRef]; ok {
 				latest.Status.Targets[i] = updated
 			}
+		}
+
+		if restoreHostReplaceTriggerConditions {
+			setHostReplaceTriggerConditions(latest)
 		}
 
 		r.aggregateStatus(latest)
@@ -684,22 +721,44 @@ func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
 	setCompletedCondition(op, metav1.ConditionFalse, "InProgress", message)
 }
 
-func (r *Reconciler) olderActiveOperation(ctx context.Context, op *v1alpha3.MachineOperation) (string, error) {
+func (r *Reconciler) olderConflictingOperation(ctx context.Context, op *v1alpha3.MachineOperation) (string, error) {
+	opKeys, err := r.operationConflictKeys(ctx, op)
+	if err != nil {
+		return "", err
+	}
+
+	if len(opKeys) == 0 {
+		return "", nil
+	}
+
 	var list v1alpha3.MachineOperationList
 	if err := r.List(ctx, &list); err != nil {
 		return "", fmt.Errorf("list MachineOperations: %w", err)
 	}
+
+	candidates := make([]v1alpha3.MachineOperation, 0, len(list.Items))
 
 	for _, candidate := range list.Items {
 		if candidate.Name == op.Name || candidate.Status.IsTerminal() || !isHostOperation(candidate.Spec.OperationKind) {
 			continue
 		}
 
-		if !r.operationBelongsToSite(ctx, &candidate) {
+		if !operationBefore(&candidate, op) {
 			continue
 		}
 
-		if operationBefore(&candidate, op) {
+		candidates = append(candidates, candidate)
+	}
+
+	sort.Slice(candidates, func(i, j int) bool { return operationBefore(&candidates[i], &candidates[j]) })
+
+	for _, candidate := range candidates {
+		candidateKeys, err := r.operationConflictKeys(ctx, &candidate)
+		if err != nil {
+			return "", err
+		}
+
+		if conflictSetsOverlap(opKeys, candidateKeys) {
 			return candidate.Name, nil
 		}
 	}
@@ -707,32 +766,97 @@ func (r *Reconciler) olderActiveOperation(ctx context.Context, op *v1alpha3.Mach
 	return "", nil
 }
 
-func (r *Reconciler) operationBelongsToSite(ctx context.Context, op *v1alpha3.MachineOperation) bool {
+func (r *Reconciler) operationConflictKeys(ctx context.Context, op *v1alpha3.MachineOperation) (map[string]struct{}, error) {
+	keys := map[string]struct{}{}
+
 	if len(op.Status.Targets) > 0 {
 		for _, target := range op.Status.Targets {
-			var machine v1alpha3.Machine
-			if err := r.Get(ctx, client.ObjectKey{Name: target.MachineRef}, &machine); err == nil && r.ownsMachine(&machine) {
-				return true
+			if isTerminalTarget(target) {
+				continue
+			}
+
+			if err := r.addTargetConflictKeys(ctx, keys, target.MachineRef); err != nil {
+				return nil, err
 			}
 		}
 
-		return false
+		return keys, nil
 	}
 
-	if op.Spec.MachineRef != "" {
-		var machine v1alpha3.Machine
-		if err := r.Get(ctx, client.ObjectKey{Name: op.Spec.MachineRef}, &machine); err != nil {
-			return false
+	targets, err := r.resolveTargets(ctx, op)
+	if err != nil {
+		var opErr operationError
+		if errors.As(err, &opErr) {
+			return keys, nil
 		}
 
-		return r.ownsMachine(&machine)
+		return nil, err
 	}
 
-	if op.Spec.MachineSelector != nil && r.Site != "" {
-		return r.validateSelectorScope(op.Spec.MachineSelector) == nil
+	for i := range targets {
+		addMachineConflictKeys(keys, &targets[i])
+	}
+
+	return keys, nil
+}
+
+func (r *Reconciler) addTargetConflictKeys(ctx context.Context, keys map[string]struct{}, machineName string) error {
+	if machineName == "" {
+		return nil
+	}
+
+	keys["machine:"+machineName] = struct{}{}
+
+	var machine v1alpha3.Machine
+	if err := r.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+
+		return fmt.Errorf("get Machine %s for operation conflict detection: %w", machineName, err)
+	}
+
+	if !r.ownsMachine(&machine) {
+		delete(keys, "machine:"+machineName)
+
+		return nil
+	}
+
+	addMachineConflictKeys(keys, &machine)
+
+	return nil
+}
+
+func addMachineConflictKeys(keys map[string]struct{}, machine *v1alpha3.Machine) {
+	keys["machine:"+machine.Name] = struct{}{}
+
+	if machine.Spec.PXE == nil || machine.Spec.PXE.Redfish == nil || machine.Spec.PXE.Redfish.URL == "" {
+		return
+	}
+
+	keys["redfish:"+normalizeRedfishURL(machine.Spec.PXE.Redfish.URL)] = struct{}{}
+}
+
+func isTerminalTarget(target v1alpha3.MachineOperationTargetStatus) bool {
+	return target.Phase == v1alpha3.OperationPhaseComplete || target.Phase == v1alpha3.OperationPhaseFailed
+}
+
+func conflictSetsOverlap(a, b map[string]struct{}) bool {
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+
+	for key := range a {
+		if _, ok := b[key]; ok {
+			return true
+		}
 	}
 
 	return false
+}
+
+func normalizeRedfishURL(raw string) string {
+	return strings.TrimRight(raw, "/")
 }
 
 func operationBefore(a, b *v1alpha3.MachineOperation) bool {
@@ -798,8 +922,34 @@ func (r *Reconciler) finishOperation(ctx context.Context, name string, phase v1a
 
 func setCompletedCondition(op *v1alpha3.MachineOperation, status metav1.ConditionStatus, reason, message string) {
 	apimeta.SetStatusCondition(&op.Status.Conditions, metav1.Condition{
-		Type:               conditionCompleted,
+		Type:               v1alpha3.MachineOperationConditionCompleted,
 		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: op.Generation,
+	})
+}
+
+func hostReplaceTriggerConditionsMissing(op *v1alpha3.MachineOperation) bool {
+	return apimeta.FindStatusCondition(op.Status.Conditions, v1alpha3.MachineOperationConditionBootLoaderDownloaded) == nil ||
+		apimeta.FindStatusCondition(op.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten) == nil ||
+		apimeta.FindStatusCondition(op.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone) == nil
+}
+
+func setHostReplaceTriggerConditions(op *v1alpha3.MachineOperation) {
+	setConditionIfMissing(op, v1alpha3.MachineOperationConditionBootLoaderDownloaded, "Pending", "waiting for initial boot loader download")
+	setConditionIfMissing(op, v1alpha3.MachineOperationConditionBootImageWritten, "Pending", "waiting for PXE installer to finish writing the boot image")
+	setConditionIfMissing(op, v1alpha3.MachineOperationConditionCloudInitDone, "Pending", "waiting for first-boot cloud-init to complete")
+}
+
+func setConditionIfMissing(op *v1alpha3.MachineOperation, conditionType, reason, message string) {
+	if apimeta.FindStatusCondition(op.Status.Conditions, conditionType) != nil {
+		return
+	}
+
+	apimeta.SetStatusCondition(&op.Status.Conditions, metav1.Condition{
+		Type:               conditionType,
+		Status:             metav1.ConditionUnknown,
 		Reason:             reason,
 		Message:            message,
 		ObservedGeneration: op.Generation,

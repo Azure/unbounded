@@ -64,7 +64,7 @@ func TestServiceOverride_HostDevicesDeviceAllow(t *testing.T) {
 func TestServiceOverride_MultipleHostDevices(t *testing.T) {
 	t.Parallel()
 
-	devices := []string{"/dev/kvm", "/dev/sda", "/dev/infiniband/uverbs0"}
+	devices := []string{"/dev/kvm", "/dev/net/tun", "/dev/vhost-net", "/dev/sda", "/dev/infiniband/uverbs0"}
 
 	var nspawnBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{

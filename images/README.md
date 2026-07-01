@@ -1,14 +1,14 @@
 # Container Images
 
-This directory contains container image definitions for the project. Each subdirectory with a
-`Containerfile` represents a buildable image.
+This directory contains container image definitions for the project. Most subdirectories with a
+`Containerfile` represent one buildable image.
 
 ## Directory Structure
 
 ```
 images/
   <image-name>/
-    Containerfile       # required — defines the container build
+    Containerfile       # required - defines the container build
     ...                 # any supporting assets
 ```
 
@@ -20,6 +20,13 @@ produces `ghcr.io/<owner>/agent-ubuntu2404`.
 Images are built automatically by the **Build Container Images** GitHub Actions workflow
 (`.github/workflows/images.yaml`). All builds produce multi-arch images for `linux/amd64` and
 `linux/arm64`.
+
+### Metalman Netboot Image
+
+The `netboot` image contains the reusable PXE boot environment: bootloaders, kernel, initrd overlay,
+GRUB and cloud-init templates, and metadata. The cloud-init template downloads and installs
+`unbounded-agent` from the configured release/source during first boot. It does not contain a
+machine disk image.
 
 ### Tagged Release
 
@@ -53,5 +60,6 @@ ghcr.io/<owner>/agent-ubuntu2404:<commit-sha>
 
 1. Create a new directory under `images/` with a descriptive name.
 2. Add a `Containerfile` in that directory.
-3. The workflow discovers it automatically — no workflow changes needed.
+3. The workflow discovers it automatically - no workflow changes needed unless the image reuses a
+   shared Containerfile.
 4. Tag and push to build: `git tag images/<your-image>/v0.1.0 && git push origin images/<your-image>/v0.1.0`.

@@ -13,6 +13,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import threading
@@ -41,18 +42,23 @@ DNS_SERVER = "8.8.8.8"
 MAC_ADDRESS = "52:54:00:aa:bb:01"
 SUSHY_PORT = 8443
 HTTP_PORT = 8880
+AGENT_DOWNLOAD_PORT = 8881
 CACHE_DIR = TMPDIR / "cache"
 ARTIFACT_DIR = TMPDIR / "artifacts"
 SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
+AGENT_TARBALL = ARTIFACT_DIR / "unbounded-agent-linux-amd64.tar.gz"
+AGENT_DOWNLOAD_URL = f"http://{SERVER_IP}:{AGENT_DOWNLOAD_PORT}/{AGENT_TARBALL.name}"
 REGISTRY_PORT = 5555
 REGISTRY_CONTAINER = "unbounded-smoke-registry"
 IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
+NETBOOT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/netboot:smoke"
 AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 # The agent runs inside a VM on an isolated libvirt network. "localhost" inside
 # the VM resolves to the VM's own loopback, not the host.  Use the host's
 # bridge IP so the VM can reach the registry over the virtual network.
 AGENT_IMAGE_NAME_VM = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 BINARY = REPO_ROOT / "bin" / "metalman"
+AGENT_BINARY = REPO_ROOT / "bin" / "unbounded-agent"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
 QGA_SOCK = TMPDIR / "qga.sock"
@@ -805,6 +811,32 @@ def create_machine_operation(
     return name
 
 
+def run_kubectl_unbounded_operation(args: list[str], log_name: str) -> subprocess.Popen[Any]:
+    proc = spawn([str(KUBECTL_UNBOUNDED), "machine", *args], TMPDIR / log_name)
+    log(f"  kubectl-unbounded {' '.join(args)} PID={proc.pid}")
+    return proc
+
+
+def wait_process_success(proc: subprocess.Popen[Any], timeout: int) -> None:
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        die(f"Process {proc.args} did not finish within {timeout}s")
+    try:
+        _procs.remove(proc)
+    except ValueError:
+        # Process cleanup is best-effort because another cleanup path may have removed it.
+        pass
+    if rc != 0:
+        die(f"Process {proc.args} exited with code {rc}")
+
+
+def assert_log_contains(path: Path, needle: str) -> None:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if needle not in text:
+        die(f"Expected {path} to contain {needle!r}")
+
+
 def run_operation_smoke_suite() -> None:
     log("Running bare-metal MachineOperation smoke suite")
 
@@ -966,10 +998,14 @@ def main() -> None:
     log("Rendering machina and net manifests")
     run(["make", "machina-manifests", "net-manifests"], cwd=str(REPO_ROOT))
 
-    log("Building metalman and kubectl-unbounded (parallel)")
+    log("Building metalman, kubectl-unbounded, and unbounded-agent (parallel)")
     go_builds: list[tuple[str, subprocess.Popen[Any]]] = [
         ("metalman", subprocess.Popen(
             ["go", "build", "-o", str(BINARY), "./cmd/metalman"],
+            cwd=str(REPO_ROOT),
+        )),
+        ("unbounded-agent", subprocess.Popen(
+            ["go", "build", "-o", str(AGENT_BINARY), "./cmd/agent"],
             cwd=str(REPO_ROOT),
         )),
         ("kubectl-unbounded", subprocess.Popen(
@@ -1012,12 +1048,13 @@ def main() -> None:
     else:
         die("Local OCI registry did not become ready")
 
-    # Both Docker images (host-ubuntu2404 and agent-ubuntu2404) are pre-built
+    # Docker images are pre-built
     # by the GitHub Actions workflow using docker/build-push-action with GHA
     # layer caching.  They are already loaded into the local Docker daemon
-    # with the correct tags (IMAGE_NAME and AGENT_IMAGE_NAME).
+    # with the correct tags.
     log("Verifying pre-built OCI images are available")
     for name, tag in [("host-ubuntu2404", IMAGE_NAME),
+                      ("netboot", NETBOOT_IMAGE_NAME),
                       ("agent-ubuntu2404", AGENT_IMAGE_NAME)]:
         result = subprocess.run(
             ["docker", "image", "inspect", tag],
@@ -1035,8 +1072,23 @@ def main() -> None:
             die(f"go build {name} failed (exit code {rc})")
     log("  Go builds finished")
 
+    log("Packaging branch-built unbounded-agent")
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(AGENT_TARBALL, "w:gz") as tar:
+        tar.add(AGENT_BINARY, arcname="unbounded-agent")
+
+    log("Starting agent download server")
+    proc = spawn([
+        sys.executable, "-m", "http.server", str(AGENT_DOWNLOAD_PORT),
+        "--bind", SERVER_IP, "--directory", str(ARTIFACT_DIR),
+    ], TMPDIR / "agent-download.log")
+    log(f"  agent download PID={proc.pid}")
+    time.sleep(1)
+    check_procs()
+
     log("Pushing OCI images to local registry")
     run(["docker", "push", IMAGE_NAME])
+    run(["docker", "push", NETBOOT_IMAGE_NAME])
     run(["docker", "push", AGENT_IMAGE_NAME])
 
     # Reclaim disk space consumed by Docker build cache.  The host-ubuntu2404
@@ -1075,6 +1127,7 @@ def main() -> None:
             },
             "agent": {
                 "image": AGENT_IMAGE_NAME_VM,
+                "url": AGENT_DOWNLOAD_URL,
             },
             "kubernetes": {
                 "nodeLabels": {NODE_LABEL_KEY: NODE_LABEL_VALUE},
@@ -1095,6 +1148,7 @@ def main() -> None:
         str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
         f"--cache-dir={CACHE_DIR}",
         f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",
+        f"--default-netboot-image={NETBOOT_IMAGE_NAME}",
         "--leader-elect-lease-duration=60s",
         "--leader-elect-renew-deadline=40s",
         "--leader-elect-retry-period=5s",
@@ -1104,8 +1158,12 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Triggering HostReplace MachineOperation")
-    operation_name = create_machine_operation("smoke-host-replace", "HostReplace")
+    log("Triggering HostReplace through kubectl-unbounded")
+    operation_log = TMPDIR / "kubectl-host-replace.log"
+    operation_proc = run_kubectl_unbounded_operation(
+        ["replace", NODE_NAME, "--force", "--ttl=3600"],
+        operation_log.name,
+    )
 
     # Log free space so we can correlate disk exhaustion with VM failures.
     df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
@@ -1114,7 +1172,8 @@ def main() -> None:
     log("Waiting for cloud-init to complete...")
     assert_cloud_init_done(timeout=900)
 
-    wait_machine_operation_complete(operation_name, timeout=900)
+    wait_process_success(operation_proc, timeout=900)
+    assert_log_contains(operation_log, "Condition CloudInitDone: True/Succeeded")
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)

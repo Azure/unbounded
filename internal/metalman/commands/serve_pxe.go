@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -34,6 +35,10 @@ import (
 	"github.com/Azure/unbounded/internal/metalman/redfish"
 )
 
+// DefaultNetbootImage is the default netboot OCI image used when a Machine
+// omits spec.pxe.netbootImage. It is set at build time via -ldflags.
+var DefaultNetbootImage = "netboot:latest"
+
 // ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.
 func ServePXECmd() *cobra.Command {
 	var (
@@ -52,6 +57,7 @@ func ServePXECmd() *cobra.Command {
 		operationMaxConcurrentMachines int
 		operationMaxAttempts           int32
 		operationPollInterval          time.Duration
+		defaultNetbootImage            string
 	)
 
 	cmd := &cobra.Command{
@@ -180,11 +186,14 @@ func ServePXECmd() *cobra.Command {
 				serveURL = fmt.Sprintf("http://%s:%d", ip, httpPort)
 			}
 
+			defaultNetbootImage = strings.TrimSpace(defaultNetbootImage)
+
 			ociCache := netboot.NewOCICache(cacheDir)
 
 			if err := (&netboot.OCIReconciler{
-				Client: mgr.GetClient(),
-				Cache:  ociCache,
+				Client:            mgr.GetClient(),
+				Cache:             ociCache,
+				DefaultNetbootRef: defaultNetbootImage,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up OCI reconciler: %w", err)
 			}
@@ -221,6 +230,7 @@ func ServePXECmd() *cobra.Command {
 				Reader:            mgr.GetClient(),
 				Cluster:           clusterInfoWatcher,
 				ServeURL:          serveURL,
+				DefaultNetbootRef: defaultNetbootImage,
 				KubernetesVersion: kubeVersion,
 				ClusterDNS:        clusterDNS,
 				ProviderLabels:    providerLabels,
@@ -251,19 +261,26 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			dhcpServer := &dhcp.Server{
-				Interface: dhcpInterface,
-				Port:      dhcpPort,
-				Reader:    mgr.GetClient(),
-				ServerIP:  dhcpServerIP,
-				OCICache:  ociCache,
+				Interface:         dhcpInterface,
+				Port:              dhcpPort,
+				Reader:            mgr.GetClient(),
+				ServerIP:          dhcpServerIP,
+				OCICache:          ociCache,
+				DefaultNetbootRef: defaultNetbootImage,
 			}
 			if err := mgr.Add(dhcpServer); err != nil {
 				return fmt.Errorf("adding DHCP server: %w", err)
 			}
 
+			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient()}
+			if err := mgr.Add(statusQueue); err != nil {
+				return fmt.Errorf("adding status queue: %w", err)
+			}
+
 			tftpServer := &netboot.TFTPServer{
-				BindAddr:     bindAddress,
-				FileResolver: resolver,
+				BindAddr:       bindAddress,
+				FileResolver:   resolver,
+				StatusRecorder: statusQueue,
 			}
 			if err := mgr.Add(tftpServer); err != nil {
 				return fmt.Errorf("adding TFTP server: %w", err)
@@ -280,11 +297,12 @@ func ServePXECmd() *cobra.Command {
 			httpMux.HandleFunc("POST /attest", attestHandler.Attest)
 
 			httpServer := &netboot.HTTPServer{
-				BindAddr:     bindAddress,
-				Port:         httpPort,
-				Client:       mgr.GetClient(),
-				Mux:          httpMux,
-				FileResolver: resolver,
+				BindAddr:       bindAddress,
+				Port:           httpPort,
+				Client:         mgr.GetClient(),
+				Mux:            httpMux,
+				FileResolver:   resolver,
+				StatusRecorder: statusQueue,
 			}
 			if err := mgr.Add(httpServer); err != nil {
 				return fmt.Errorf("adding HTTP server: %w", err)
@@ -298,6 +316,7 @@ func ServePXECmd() *cobra.Command {
 			PrintConfig("site", siteDisplay)
 			PrintConfig("leader-election", leID)
 			PrintConfig("serve-url", serveURL)
+			PrintConfig("default-netboot-image", defaultNetbootImage)
 			PrintConfig("cache-dir", cacheDir)
 			PrintConfig("dhcp-interface", dhcpInterface)
 			PrintConfig("dhcp-port", fmt.Sprintf("%d", dhcpPort))
@@ -333,6 +352,7 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().IntVar(&operationMaxConcurrentMachines, "operation-max-concurrent-machines", 10, "Maximum target Machines advanced concurrently within one MachineOperation")
 	cmd.Flags().Int32Var(&operationMaxAttempts, "operation-max-attempts", 3, "Maximum Redfish action attempts per target Machine")
 	cmd.Flags().DurationVar(&operationPollInterval, "operation-poll-interval", 5*time.Second, "Poll interval for in-progress MachineOperations")
+	cmd.Flags().StringVar(&defaultNetbootImage, "default-netboot-image", DefaultNetbootImage, "Default OCI image containing PXE netboot artifacts")
 
 	return cmd
 }

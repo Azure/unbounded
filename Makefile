@@ -5,6 +5,9 @@ GOBUILD=$(GOCMD) build
 GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
+GO_PACKAGE_PATTERNS=./api/... ./cmd/... ./hack/... ./internal/... ./pkg/...
+GO_PACKAGES=$(shell $(GOCMD) list $(GO_PACKAGE_PATTERNS))
+GO_PACKAGE_DIRS=$(shell $(GOCMD) list -f '{{.Dir}}' $(GO_PACKAGE_PATTERNS))
 
 CONTAINER_ENGINE ?= podman
 CONTAINER_REGISTRY ?= ghcr.io/azure
@@ -46,6 +49,7 @@ MACHINE_OPS_SITE ?=
 
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
+NETBOOT_IMAGE ?= $(CONTAINER_REGISTRY)/netboot:$(VERSION)
 
 KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
 KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
@@ -143,6 +147,7 @@ BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 STAMP_LDFLAGS=-X github.com/Azure/unbounded/internal/version.Version=$(VERSION) \
               -X github.com/Azure/unbounded/internal/version.GitCommit=$(GIT_COMMIT) \
               -X github.com/Azure/unbounded/internal/version.BuildTime=$(BUILD_TIME)
+METALMAN_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded/internal/metalman/commands.DefaultNetbootImage=$(NETBOOT_IMAGE)
 
 METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(VERSION)
 
@@ -405,33 +410,33 @@ check-deps: ## Verify required tools (gofumpt, golangci-lint v2) are installed
 		  echo "  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"; exit 1; }
 
 fmt: check-deps ## Format all Go source files (gofumpt + wsl_v5 whitespace)
-	$(GOFMT) -w .
-	$(GOLINT) --fix -E wsl_v5 ./...
+	$(GOFMT) -w $(GO_PACKAGE_DIRS)
+	$(GOLINT) --fix -E wsl_v5 $(GO_PACKAGE_PATTERNS)
 
 # lint runs the same checks locally and in CI and does NOT auto-fix. Run
 # `make fmt` to apply fixes. wsl_v5 is enforced via .golangci.yaml.
 lint: ## Run golangci-lint (matches CI; run `make fmt` to auto-fix)
-	$(GOLINT) ./...
+	$(GOLINT) $(GO_PACKAGE_PATTERNS)
 
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
 test: machina-manifests net-manifests ## Run all tests with race detector
-	$(GOTEST) -race ./...
+	$(GOTEST) -race $(GO_PACKAGES)
 
 else
 # Locally, chain test -> lint for convenience.
 
 test: lint machina-manifests net-manifests ## Run all tests (implies lint)
-	$(GOTEST) ./...
+	$(GOTEST) $(GO_PACKAGES)
 
 endif
 
 build: machina-manifests net-manifests ## Build all Go packages
-	$(GOBUILD) ./...
+	$(GOBUILD) $(GO_PACKAGES)
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
-	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate ./...
+	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate $(GO_PACKAGES)
 
 vulncheck: machina-manifests net-manifests ## Run govulncheck for known vulnerabilities
 	@# GO-2024-3218 (libp2p/go-libp2p-kad-dht): all versions affected, no fix
@@ -530,7 +535,7 @@ machine-ops-controller-build: machine-ops-manifests ## Build the machine-ops-con
 machine-ops-controller: test machine-ops-controller-build ## Build the machine-ops-controller (implies test)
 
 metalman-build: ## Build the metalman binary (no lint/test)
-	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
+	$(GOBUILD) -ldflags '$(METALMAN_LDFLAGS)' -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
 
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
@@ -971,6 +976,7 @@ image-metalman-local: ## Build the metalman container image locally (single-arch
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		--build-arg CONTAINER_REGISTRY=$(CONTAINER_REGISTRY) \
 		-t metalman:$(VERSION) -t $(METALMAN_IMAGE) \
 		-f ./images/metalman/Containerfile .
 	$(call trivy-maybe,$(METALMAN_IMAGE))

@@ -14,9 +14,7 @@ import (
 	"net/http"
 	"strings"
 
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -38,6 +36,14 @@ type HTTPServer struct {
 	Client   client.Client
 	Mux      *http.ServeMux
 	FileResolver
+	StatusRecorder StatusRecorder
+}
+
+type StatusRecorder interface {
+	RecordBootImageWritten(ctx context.Context, machineName string) error
+	RecordCloudInitDone(ctx context.Context, machineName string) error
+	RecordMachineCondition(ctx context.Context, machineName string, condition metav1.Condition) error
+	RecordPXEDisabled(ctx context.Context, machineName string, repaveCounter int64, imageName string) error
 }
 
 func (h *HTTPServer) NeedLeaderElection() bool { return false }
@@ -103,7 +109,19 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resolved, err := h.ResolveFileByPath(r.Context(), path, node, node.Spec.PXE.Image)
+	imageRef := node.Spec.PXE.Image
+	if path != "disk.img.gz" {
+		imageRef = h.NetbootImageRef(node)
+	}
+
+	if imageRef == "" {
+		log.Warn("node has no image for requested path", "node", node.Name)
+		http.NotFound(w, r)
+
+		return
+	}
+
+	resolved, err := h.ResolveFileByPath(r.Context(), path, node, imageRef)
 	if err != nil {
 		if errors.Is(err, ErrNotYetDownloaded) {
 			log.Info("file not yet downloaded", "node", node.Name)
@@ -161,7 +179,8 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 		log.Info("cloud-init event", "type", ev.EventType, "description", ev.Description)
 	}
 
-	h.updateCloudInitCondition(r.Context(), log, ip, &ev)
+	machineName := h.recordCloudInitCondition(r.Context(), log, ip, &ev)
+	h.recordCloudInitStatus(r.Context(), log, machineName, &ev)
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -170,33 +189,29 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 // finishes successfully the CloudInitDone condition transitions to True.
 const cloudInitLastStage = "modules-final"
 
-// updateCloudInitCondition sets the CloudInitDone condition on the Machine
-// that matches the request source IP. The condition reflects the
-// cloud-init lifecycle reported through webhook events:
-func (h *HTTPServer) updateCloudInitCondition(ctx context.Context, log *slog.Logger, ip string, ev *cloudInitEvent) {
-	if h.Client == nil {
-		return
+// recordCloudInitCondition records the CloudInitDone condition for the Machine
+// that matches the request source IP. The recorder is asynchronous in the
+// serve-pxe command, so cloud-init webhooks do not wait on Kubernetes status IO.
+func (h *HTTPServer) recordCloudInitCondition(ctx context.Context, log *slog.Logger, ip string, ev *cloudInitEvent) string {
+	if h.Reader == nil {
+		return ""
 	}
 
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		node, err := h.LookupNodeByIP(ctx, ip)
-		if err != nil {
-			return err
-		}
-
-		cond := buildCloudInitCondition(ev, node.Generation)
-		if cond == nil {
-			return nil
-		}
-
-		// TODO(jordan): Rename all `node` references in this file to `machine`
-		meta.SetStatusCondition(&node.Status.Conditions, *cond)
-
-		return h.Client.Status().Update(ctx, node)
-	})
+	node, err := h.LookupNodeByIP(ctx, ip)
 	if err != nil {
-		log.Error("cloud-init condition: updating Machine status", "ip", ip, "err", err)
+		log.Error("cloud-init condition: looking up Machine", "ip", ip, "err", err)
+
+		return ""
 	}
+
+	cond := buildCloudInitCondition(ev, node.Generation)
+	if cond != nil && h.StatusRecorder != nil {
+		if err := h.StatusRecorder.RecordMachineCondition(ctx, node.Name, *cond); err != nil {
+			log.Error("recording cloud-init condition", "node", node.Name, "err", err)
+		}
+	}
+
+	return node.Name
 }
 
 const maxConditionMessageLen = 1024
@@ -266,6 +281,8 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.recordBootImageWritten(r.Context(), log, node.Name)
+
 	var specRepave, statusRepave int64
 	if node.Spec.Operations != nil {
 		specRepave = node.Spec.Operations.RepaveCounter
@@ -282,34 +299,47 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if node.Status.Operations == nil {
-		node.Status.Operations = &v1alpha3.OperationsStatus{}
-	}
-
-	node.Status.Operations.RepaveCounter = specRepave
-
 	imageName := ""
 	if node.Spec.PXE != nil {
 		imageName = node.Spec.PXE.Image
 	}
 
-	meta.SetStatusCondition(&node.Status.Conditions, metav1.Condition{
-		Type:               v1alpha3.MachineConditionRepaved,
-		Status:             metav1.ConditionTrue,
-		Reason:             "Succeeded",
-		Message:            "image=" + imageName,
-		ObservedGeneration: node.Generation,
-	})
+	if h.StatusRecorder == nil {
+		log.Error("recording PXE disabled", "node", node.Name, "err", "status recorder is not configured")
+		http.Error(w, "recording PXE disabled", http.StatusServiceUnavailable)
 
-	if err := h.Client.Status().Update(r.Context(), node); err != nil {
-		log.Error("updating Machine status", "node", node.Name, "err", err)
-		http.Error(w, "failed to disable PXE", http.StatusInternalServerError)
+		return
+	}
+
+	if err := h.StatusRecorder.RecordPXEDisabled(r.Context(), node.Name, specRepave, imageName); err != nil {
+		log.Error("recording PXE disabled", "node", node.Name, "err", err)
+		http.Error(w, "recording PXE disabled", http.StatusServiceUnavailable)
 
 		return
 	}
 
 	log.Info("repave cleared", "node", node.Name)
 	w.WriteHeader(http.StatusOK)
+}
+
+func (h *HTTPServer) recordBootImageWritten(ctx context.Context, log *slog.Logger, machineName string) {
+	if h.StatusRecorder == nil {
+		return
+	}
+
+	if err := h.StatusRecorder.RecordBootImageWritten(ctx, machineName); err != nil {
+		log.Error("recording boot image written", "node", machineName, "err", err)
+	}
+}
+
+func (h *HTTPServer) recordCloudInitStatus(ctx context.Context, log *slog.Logger, machineName string, ev *cloudInitEvent) {
+	if h.StatusRecorder == nil || machineName == "" || ev.EventType != "finish" || ev.Name != cloudInitLastStage || !strings.EqualFold(ev.Result, "SUCCESS") {
+		return
+	}
+
+	if err := h.StatusRecorder.RecordCloudInitDone(ctx, machineName); err != nil {
+		log.Error("recording cloud-init status", "node", machineName, "err", err)
+	}
 }
 
 func clientIP(r *http.Request) string {

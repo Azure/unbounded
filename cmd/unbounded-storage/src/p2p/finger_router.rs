@@ -130,7 +130,7 @@ mod tests {
         let fingers = Arc::new(FingerTable::build(
             local.clone(),
             &[],
-            FingerTableConfig { k: 8 },
+            FingerTableConfig::with_k(8),
         ));
         let node_to_peer = node_to_peer_map(&[1]);
 
@@ -153,7 +153,7 @@ mod tests {
         let fingers = Arc::new(FingerTable::build(
             local.clone(),
             std::slice::from_ref(&other),
-            FingerTableConfig { k: 8 },
+            FingerTableConfig::with_k(8),
         ));
         let node_to_peer = node_to_peer_map(&[1, 2]);
         let router = FingerRouter::new(fingers.clone(), node_to_peer);

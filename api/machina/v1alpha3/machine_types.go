@@ -84,6 +84,13 @@ const (
 	// logging into the machine.
 	MachineConditionCloudInitDone = "CloudInitDone"
 
+	// MachineConditionAgentBootstrapped indicates whether the unbounded
+	// agent completed initial node bootstrap. Status is False with Reason
+	// "Running" while the agent is preparing the nspawn node, False with
+	// a failure reason when nspawn startup or kubelet TLS bootstrap fails,
+	// and True with Reason "Succeeded" once the kubelet has bootstrapped.
+	MachineConditionAgentBootstrapped = "AgentBootstrapped"
+
 	// MachineConditionNodeUpdated indicates the result of a node
 	// update performed by the agent daemon. Status is True with
 	// Reason "Succeeded" after a successful update, and False with
@@ -266,10 +273,24 @@ type RedfishSpec struct {
 
 // PXESpec defines PXE boot configuration for a Machine.
 type PXESpec struct {
-	// Image is an OCI image reference containing netboot artifacts.
-	// Example: "ghcr.io/azure/images/host-ubuntu2404:v1"
+	// Image is an OCI image reference containing the machine disk image.
+	// The image must contain /disk/disk.img.gz.
+	// Example: "ghcr.io/azure/host-ubuntu2404:v1"
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
+
+	// Architecture is the target CPU architecture for PXE boot artifacts and
+	// machine images.
+	// +kubebuilder:validation:Enum=amd64;arm64
+	// +kubebuilder:default=amd64
+	// +optional
+	Architecture string `json:"architecture,omitempty"`
+
+	// NetbootImage is an OCI image reference containing the PXE boot
+	// artifacts used to install Image. When omitted, metalman uses the
+	// default netboot image that corresponds to its release.
+	// +optional
+	NetbootImage string `json:"netbootImage,omitempty"`
 
 	// DHCPLeases defines static DHCP leases for PXE booting.
 	// +optional
@@ -283,6 +304,24 @@ type PXESpec struct {
 	// machines.
 	// +optional
 	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
+}
+
+const (
+	// PXEArchitectureAMD64 is the x86_64 target architecture for PXE boot.
+	PXEArchitectureAMD64 = "amd64"
+	// PXEArchitectureARM64 is the aarch64 target architecture for PXE boot.
+	PXEArchitectureARM64 = "arm64"
+	// DefaultPXEArchitecture is used when spec.pxe.architecture is omitted.
+	DefaultPXEArchitecture = PXEArchitectureAMD64
+)
+
+// TargetArchitecture returns the effective PXE target architecture.
+func (p *PXESpec) TargetArchitecture() string {
+	if p == nil || p.Architecture == "" {
+		return DefaultPXEArchitecture
+	}
+
+	return p.Architecture
 }
 
 // CloudInitSpec defines cloud-init customization for PXE-booted machines.

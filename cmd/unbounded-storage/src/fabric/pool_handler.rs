@@ -44,7 +44,7 @@ use std::task::{Context, Poll};
 use crate::bufferpool::{BlockStore, BulkRef, PageRef, Req};
 use crate::memory::Backing;
 
-use super::handler::{Handler, HandlerStream};
+use super::handler::{FabricPage, Handler, HandlerStream};
 use super::scratch::ScratchBacking;
 
 /// Error surfaced by [`PoolHandler`]'s response stream.
@@ -161,7 +161,7 @@ impl<R: Req, S: BlockStore + Send + Sync + 'static> HandlerStream for PoolHandle
     fn poll_next(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<PageRef, PoolHandlerError>>> {
+    ) -> Poll<Option<Result<FabricPage, PoolHandlerError>>> {
         match self.state {
             StreamState::Done | StreamState::Ended => {
                 self.state = StreamState::Ended;
@@ -172,7 +172,7 @@ impl<R: Req, S: BlockStore + Send + Sync + 'static> HandlerStream for PoolHandle
                 match result {
                     Ok(page) => {
                         self.state = StreamState::Done;
-                        Poll::Ready(Some(Ok(page)))
+                        Poll::Ready(Some(Ok(page.into())))
                     }
                     Err(e) => {
                         self.state = StreamState::Ended;
@@ -346,7 +346,7 @@ mod tests {
         handler: &PoolHandler<S>,
         key: [u8; 32],
         len: u32,
-    ) -> Vec<Result<PageRef, PoolHandlerError>> {
+    ) -> Vec<Result<crate::fabric::FabricPage, PoolHandlerError>> {
         let req = KeyReq(StripeKey(key));
         let src = BulkRef {
             stripe: StripeKey(key),
@@ -382,10 +382,10 @@ mod tests {
         let out = drain(&handler, key, PAGE as u32);
         assert_eq!(out.len(), 1, "expected exactly one page yielded");
         let page = out[0].as_ref().expect("resident page must be Ok");
-        assert_eq!(page.len, PAGE as u32);
+        assert_eq!(page.page.len, PAGE as u32);
         // The yielded page index points into the filled scratch page.
         // SAFETY: page_idx is within the scratch backing.
-        let byte = unsafe { *base.add(page.page_idx as usize * PAGE) };
+        let byte = unsafe { *base.add(page.page.page_idx as usize * PAGE) };
         assert_eq!(byte, 0xAB, "scratch page was not filled from the store");
         assert_eq!(st.reads.load(Ordering::Relaxed), 1);
     }
@@ -430,7 +430,7 @@ mod tests {
 
         let out = drain(&handler, key, 1024);
         let page = out[0].as_ref().expect("ok");
-        assert_eq!(page.len, 1024, "handler must honor BulkRef.len window");
+        assert_eq!(page.page.len, 1024, "handler must honor BulkRef.len window");
     }
 
     #[test]

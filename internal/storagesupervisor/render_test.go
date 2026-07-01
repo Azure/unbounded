@@ -328,6 +328,12 @@ func TestRenderConfigActiveRingMergesPeers(t *testing.T) {
 	// YAML-declared routing knobs are preserved while self is stamped in.
 	dir := writeSource(t, `
 fingers_per_node: 5
+topology_weighting:
+  prefix_weights:
+    - tag_index: 0
+      weight: 0.25
+    - tag_index: 1
+      weight: -0.5
 startup:
   fabric:
     tcp:
@@ -363,6 +369,11 @@ peers:
 	assert.Equal(t, "node-a", cfg.GetSelf())
 	assert.NotNil(t, cfg.FingersPerNode)
 	assert.Equal(t, uint32(5), cfg.GetFingersPerNode())
+	require.Len(t, cfg.GetTopologyWeighting().GetPrefixWeights(), 2)
+	assert.Equal(t, uint32(0), cfg.GetTopologyWeighting().GetPrefixWeights()[0].GetTagIndex())
+	assert.Equal(t, 0.25, cfg.GetTopologyWeighting().GetPrefixWeights()[0].GetWeight())
+	assert.Equal(t, uint32(1), cfg.GetTopologyWeighting().GetPrefixWeights()[1].GetTagIndex())
+	assert.Equal(t, -0.5, cfg.GetTopologyWeighting().GetPrefixWeights()[1].GetWeight())
 
 	// Discovered peers merge with declared node-z and are sorted by name.
 	require.Len(t, cfg.GetPeers(), 4)

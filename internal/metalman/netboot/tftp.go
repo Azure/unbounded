@@ -19,6 +19,11 @@ import (
 type TFTPServer struct {
 	BindAddr string
 	FileResolver
+	StatusRecorder TFTPStatusRecorder
+}
+
+type TFTPStatusRecorder interface {
+	RecordBootLoaderDownloaded(ctx context.Context, machineName, filename string) error
 }
 
 func (t *TFTPServer) NeedLeaderElection() bool { return false }
@@ -61,7 +66,13 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		return fmt.Errorf("node %s has no PXE config", node.Name)
 	}
 
-	resolved, err := t.ResolveFileByPath(ctx, filename, node, node.Spec.PXE.Image)
+	imageRef := t.NetbootImageRef(node)
+	if imageRef == "" {
+		log.Warn("node has no netboot image", "node", node.Name)
+		return fmt.Errorf("node %s has no netboot image", node.Name)
+	}
+
+	resolved, err := t.ResolveFileByPath(ctx, filename, node, imageRef)
 	if err != nil {
 		log.Warn("resolving file", "node", node.Name, "err", err)
 		return err
@@ -82,6 +93,8 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 			return err
 		}
 
+		t.recordBootLoaderDownloaded(ctx, log, node.Name, node.Spec.PXE.Image, filename)
+
 		return nil
 	}
 
@@ -92,5 +105,30 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		return err
 	}
 
+	t.recordBootLoaderDownloaded(ctx, log, node.Name, node.Spec.PXE.Image, filename)
+
 	return nil
+}
+
+func (t *TFTPServer) recordBootLoaderDownloaded(ctx context.Context, log *slog.Logger, machineName, imageRef, filename string) {
+	if t.StatusRecorder == nil || !t.isInitialBootLoaderDownload(imageRef, filename) {
+		return
+	}
+
+	if err := t.StatusRecorder.RecordBootLoaderDownloaded(ctx, machineName, filename); err != nil {
+		log.Error("recording boot loader download", "node", machineName, "err", err)
+	}
+}
+
+func (t *TFTPServer) isInitialBootLoaderDownload(imageRef, filename string) bool {
+	if t.Cache == nil || imageRef == "" {
+		return true
+	}
+
+	meta, err := t.Cache.MetadataForRef(imageRef)
+	if err != nil || meta.DHCPBootImageName == "" {
+		return true
+	}
+
+	return strings.TrimPrefix(meta.DHCPBootImageName, "/") == filename
 }

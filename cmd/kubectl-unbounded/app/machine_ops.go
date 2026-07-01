@@ -6,9 +6,12 @@ package app
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -45,6 +48,58 @@ func printConfig(key, value string) {
 
 func printReady() {
 	fmt.Printf("\n  %s%sready%s\n\n", green, bold, reset)
+}
+
+type conditionState struct {
+	Status  metav1.ConditionStatus
+	Reason  string
+	Message string
+}
+
+func conditionChanged(cond metav1.Condition, seen map[string]conditionState) bool {
+	state := conditionState{
+		Status:  cond.Status,
+		Reason:  cond.Reason,
+		Message: cond.Message,
+	}
+
+	last, ok := seen[cond.Type]
+	if ok && last == state {
+		return false
+	}
+
+	seen[cond.Type] = state
+
+	return true
+}
+
+func reportConditionTransitions(conditions []metav1.Condition, seen map[string]conditionState) {
+	ordered := append([]metav1.Condition(nil), conditions...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].Type < ordered[j].Type
+	})
+
+	for _, cond := range ordered {
+		if !conditionChanged(cond, seen) {
+			continue
+		}
+
+		printStep(fmt.Sprintf("Condition %s: %s", cond.Type, formatConditionState(cond)))
+	}
+}
+
+func formatConditionState(cond metav1.Condition) string {
+	parts := []string{string(cond.Status)}
+	if cond.Reason != "" {
+		parts = append(parts, cond.Reason)
+	}
+
+	state := strings.Join(parts, "/")
+	if cond.Message == "" {
+		return state
+	}
+
+	return fmt.Sprintf("%s - %s", state, cond.Message)
 }
 
 // newMachineClient creates a controller-runtime client configured for Machine resources.
@@ -85,6 +140,8 @@ func watchReboot(ctx context.Context, c client.WithWatch, name string, target in
 
 	var lastReason string
 
+	seenConditions := map[string]conditionState{}
+
 	for ev := range watcher.ResultChan() {
 		if ev.Type == watch.Error {
 			return fmt.Errorf("watch error: %v", ev.Object)
@@ -98,6 +155,8 @@ func watchReboot(ctx context.Context, c client.WithWatch, name string, target in
 		if !ok {
 			continue
 		}
+
+		reportConditionTransitions(m.Status.Conditions, seenConditions)
 
 		cond := meta.FindStatusCondition(m.Status.Conditions, "PoweredOff")
 
