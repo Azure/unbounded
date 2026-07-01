@@ -121,6 +121,41 @@ func TestClaimIsIdempotentAndConflictsOnDifferentRequest(t *testing.T) {
 	}
 }
 
+func TestPatchClaimAllowsSameRequestAfterClaim(t *testing.T) {
+	op := testOperator(t,
+		testNode("node-1", "20.30.40.50"),
+		testPod("runner-1", "node-1", nil),
+	)
+	req := ClaimRequest{WireGuardPublicKey: testPublicKey(t)}
+	keyHash := hashString("claim-key")
+	reqHash := hashString(req.WireGuardPublicKey)
+
+	pod := &corev1.Pod{}
+	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := op.patchClaim(t.Context(), pod, keyHash, reqHash, req.WireGuardPublicKey)
+	if err != nil || !ok {
+		t.Fatalf("first patch claimed=%v err=%v", ok, err)
+	}
+
+	claimed, ok, err = op.patchClaim(t.Context(), claimed, keyHash, reqHash, req.WireGuardPublicKey)
+	if err != nil {
+		t.Fatalf("second patch: %v", err)
+	}
+	if ok {
+		t.Fatal("second patch reported a new claim")
+	}
+	if claimed.Name != "runner-1" {
+		t.Fatalf("claimed pod = %q", claimed.Name)
+	}
+
+	_, _, err = op.patchClaim(t.Context(), claimed, keyHash, hashString(testPublicKey(t)), req.WireGuardPublicKey)
+	if err != errIdempotencyRequestConflict {
+		t.Fatalf("different request err = %v, want idempotency conflict", err)
+	}
+}
+
 func TestClaimUsesOtherNodeExternalIPWhenRunnerNodeIsPrivate(t *testing.T) {
 	op := testOperator(t,
 		testNode("private-node", ""),

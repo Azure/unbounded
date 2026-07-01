@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -260,9 +261,24 @@ func (o *Operator) Claim(ctx context.Context, idempotencyKey string, req ClaimRe
 			continue
 		}
 
-		allocatedPod, err := o.patchClaim(ctx, pod, keyHash, reqHash, req.WireGuardPublicKey)
+		allocatedPod, claimed, err := o.patchClaim(ctx, pod, keyHash, reqHash, req.WireGuardPublicKey)
 		if err != nil {
-			return ClaimResponse{}, http.StatusConflict, err
+			if errors.Is(err, errRunnerAlreadyAllocated) {
+				continue
+			}
+			if errors.Is(err, errIdempotencyRequestConflict) {
+				return ClaimResponse{}, http.StatusConflict, err
+			}
+
+			return ClaimResponse{}, http.StatusInternalServerError, err
+		}
+		if !claimed {
+			resp, err := o.responseForPod(ctx, allocatedPod)
+			if err != nil {
+				return ClaimResponse{}, http.StatusServiceUnavailable, err
+			}
+
+			return resp, http.StatusOK, nil
 		}
 
 		service, err := o.ensureNodePortService(ctx, allocatedPod)
@@ -376,36 +392,63 @@ func (o *Operator) listRunnerPods(ctx context.Context) (*corev1.PodList, error) 
 	return list, nil
 }
 
-func (o *Operator) patchClaim(ctx context.Context, pod *corev1.Pod, keyHash, reqHash, clientPublicKey string) (*corev1.Pod, error) {
-	updated := &corev1.Pod{}
-	if err := o.Client.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, updated); err != nil {
-		return nil, err
+var (
+	errRunnerAlreadyAllocated     = errors.New("runner pod was already allocated")
+	errIdempotencyRequestConflict = errors.New("idempotency key was already used with a different request")
+)
+
+func (o *Operator) patchClaim(ctx context.Context, pod *corev1.Pod, keyHash, reqHash, clientPublicKey string) (*corev1.Pod, bool, error) {
+	var updated *corev1.Pod
+	claimed := false
+
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		current := &corev1.Pod{}
+		if err := o.Client.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, current); err != nil {
+			return err
+		}
+
+		if current.Annotations[AnnotationIdempotencyKeyHash] == keyHash {
+			if current.Annotations[AnnotationRequestHash] != reqHash {
+				return errIdempotencyRequestConflict
+			}
+
+			updated = current
+			claimed = false
+
+			return nil
+		}
+		if current.Annotations[AnnotationIdempotencyKeyHash] != "" {
+			return errRunnerAlreadyAllocated
+		}
+
+		if current.Annotations == nil {
+			current.Annotations = map[string]string{}
+		}
+		if current.Labels == nil {
+			current.Labels = map[string]string{}
+		}
+
+		allocationID := allocationIDForPod(pod)
+		current.Annotations[AnnotationIdempotencyKeyHash] = keyHash
+		current.Annotations[AnnotationRequestHash] = reqHash
+		current.Annotations[AnnotationClientWireGuardPublicKey] = clientPublicKey
+		current.Annotations[AnnotationClaimedAt] = time.Now().UTC().Format(time.RFC3339)
+		current.Labels[LabelAllocated] = allocationID
+
+		if err := o.Client.Update(ctx, current); err != nil {
+			return err
+		}
+
+		updated = current
+		claimed = true
+
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
 	}
 
-	if updated.Annotations[AnnotationIdempotencyKeyHash] != "" {
-		return nil, fmt.Errorf("runner pod %q was already allocated", pod.Name)
-	}
-
-	base := updated.DeepCopy()
-	if updated.Annotations == nil {
-		updated.Annotations = map[string]string{}
-	}
-	if updated.Labels == nil {
-		updated.Labels = map[string]string{}
-	}
-
-	allocationID := allocationIDForPod(pod)
-	updated.Annotations[AnnotationIdempotencyKeyHash] = keyHash
-	updated.Annotations[AnnotationRequestHash] = reqHash
-	updated.Annotations[AnnotationClientWireGuardPublicKey] = clientPublicKey
-	updated.Annotations[AnnotationClaimedAt] = time.Now().UTC().Format(time.RFC3339)
-	updated.Labels[LabelAllocated] = allocationID
-
-	if err := o.Client.Patch(ctx, updated, client.MergeFrom(base)); err != nil {
-		return nil, err
-	}
-
-	return updated, nil
+	return updated, claimed, nil
 }
 
 func (o *Operator) responseForPod(ctx context.Context, pod *corev1.Pod) (ClaimResponse, error) {
@@ -471,7 +514,11 @@ func (o *Operator) ensureNodePortService(ctx context.Context, pod *corev1.Pod) (
 			},
 		},
 	}
-	if err := o.Client.Create(ctx, service); err != nil {
+	if err := o.Client.Create(ctx, service); apierrors.IsAlreadyExists(err) {
+		if err := o.Client.Get(ctx, key, service); err != nil {
+			return nil, err
+		}
+	} else if err != nil {
 		return nil, err
 	}
 
