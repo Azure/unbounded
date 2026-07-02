@@ -188,6 +188,7 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 
 func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
 	ip := clientIP(r)
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		slog.Error("reading install log body", "ip", ip, "err", err)
