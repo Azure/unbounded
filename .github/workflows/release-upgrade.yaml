@@ -654,7 +654,7 @@ jobs:
   # validation is NOT this job's responsibility - rely on the cluster's
   # monitoring for that.
   #
-  # Not to be confused with hack/smoke-metalman.py / hack/smoke-storage.py,
+  # Not to be confused with the metalman e2e suite or hack/smoke-storage.py,
   # which are component-level smoke tests used by CI workflows. Those run
   # against ephemeral test environments; this runs against the deployed
   # unbounded-stable cluster.

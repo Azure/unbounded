@@ -209,7 +209,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push playpen-manifests e2e-playpen e2e-metalman gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -235,6 +235,7 @@ help: ## Show this help
 	@echo "  lint                             Run golangci-lint"
 	@echo "  test                             Run all tests"
 	@echo "  build                            Compile all Go packages"
+	@echo "  e2e-metalman                     Run the Playpen-based metalman smoke suite"
 	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
 	@echo "  vulncheck                        Run govulncheck"
 	@echo "  gomod                            go mod tidy"
@@ -438,6 +439,9 @@ endif
 
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
+
+e2e-metalman: ## Run the Playpen-based metalman smoke suite
+	$(GOTEST) -tags=e2e ./e2e/metalman -v -timeout=45m
 
 build: machina-manifests machine-ops-manifests playpen-manifests net-manifests ## Build all Go packages
 	$(GOBUILD) $(GO_PACKAGES)
@@ -948,6 +952,7 @@ MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
 PLAYPEN_NAMESPACE ?= playpen
 PLAYPEN_AMD64_RUNNERS ?= 2
 PLAYPEN_ARM64_RUNNERS ?= 2
+PLAYPEN_RUNNER_REQUIRE_KVM ?= true
 PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_START ?= 51820
 PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_END ?= 51899
 PLAYPEN_CONTROL_PLANE_COUNT ?= 1
@@ -995,6 +1000,7 @@ playpen-manifests: ## Render playpen operator and runner manifests into deploy/p
 		--set PlaypenImage=$(PLAYPEN_IMAGE) \
 		--set RunnerAMD64Count=$(PLAYPEN_AMD64_RUNNERS) \
 		--set RunnerARM64Count=$(PLAYPEN_ARM64_RUNNERS) \
+		--set RunnerRequireKVM=$(PLAYPEN_RUNNER_REQUIRE_KVM) \
 		--set RunnerWireGuardHostPortStart=$(PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_START) \
 		--set RunnerWireGuardHostPortEnd=$(PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_END) \
 		--set ControlPlaneCount=$(PLAYPEN_CONTROL_PLANE_COUNT) \
