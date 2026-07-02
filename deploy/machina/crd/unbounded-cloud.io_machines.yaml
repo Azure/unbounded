@@ -328,6 +328,16 @@ spec:
                     - amd64
                     - arm64
                     type: string
+                  bootProtocol:
+                    default: PXE
+                    description: |-
+                      BootProtocol selects how metalman should trigger network boot for
+                      repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
+                      HTTP boot with a URL derived from the netboot image metadata.
+                    enum:
+                    - PXE
+                    - HTTP
+                    type: string
                   cloudInit:
                     description: |-
                       CloudInit contains optional cloud-init customization for PXE-booted

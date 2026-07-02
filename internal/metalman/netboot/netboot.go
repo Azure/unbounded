@@ -8,7 +8,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
+	pathpkg "path"
 	"strings"
 	"sync"
 	"text/template"
@@ -84,6 +86,80 @@ func (f *FileResolver) NetbootImageRef(node *v1alpha3.Machine) string {
 	}
 
 	return node.Spec.PXE.Image
+}
+
+func (f *FileResolver) HTTPBootPath(node *v1alpha3.Machine) (string, error) {
+	if node == nil || node.Spec.PXE == nil {
+		return "", fmt.Errorf("node has no PXE config")
+	}
+
+	imageRef := f.NetbootImageRef(node)
+	if imageRef == "" {
+		return "", fmt.Errorf("node %s has no netboot image", node.Name)
+	}
+
+	if f.Cache == nil {
+		return "", fmt.Errorf("OCI cache is not configured")
+	}
+
+	meta, err := f.Cache.MetadataForRefArchitecture(imageRef, node.Spec.PXE.TargetArchitecture())
+	if err != nil {
+		return "", err
+	}
+
+	return HTTPBootPathFromMetadata(meta), nil
+}
+
+func (f *FileResolver) HTTPBootURL(node *v1alpha3.Machine) (string, error) {
+	path, err := f.HTTPBootPath(node)
+	if err != nil {
+		return "", err
+	}
+
+	return JoinServeURLPath(f.ServeURL, path)
+}
+
+func HTTPBootPathFromMetadata(meta *ImageMetadata) string {
+	if meta == nil {
+		return ""
+	}
+
+	if meta.HTTPBootPath != "" {
+		return strings.TrimPrefix(meta.HTTPBootPath, "/")
+	}
+
+	return strings.TrimPrefix(meta.DHCPBootImageName, "/")
+}
+
+func JoinServeURLPath(serveURL, path string) (string, error) {
+	if strings.TrimSpace(serveURL) == "" {
+		return "", fmt.Errorf("serve URL is not configured")
+	}
+
+	path = strings.TrimPrefix(path, "/")
+	if path == "" {
+		return "", fmt.Errorf("HTTP boot path is not configured")
+	}
+
+	cleanPath := pathpkg.Clean(path)
+	if cleanPath == "." || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
+		return "", fmt.Errorf("invalid HTTP boot path %q: resolves outside cache directory", path)
+	}
+
+	base, err := url.Parse(serveURL)
+	if err != nil {
+		return "", fmt.Errorf("parsing serve URL: %w", err)
+	}
+
+	if base.Scheme == "" || base.Host == "" {
+		return "", fmt.Errorf("serve URL %q must be absolute", serveURL)
+	}
+
+	base.Path = strings.TrimRight(base.Path, "/") + "/" + cleanPath
+	base.RawQuery = ""
+	base.Fragment = ""
+
+	return base.String(), nil
 }
 
 func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3.Machine, error) {
