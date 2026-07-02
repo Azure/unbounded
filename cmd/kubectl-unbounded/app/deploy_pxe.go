@@ -36,9 +36,10 @@ const (
 
 // deployPXEParams holds the values needed to build the PXE Deployment.
 type deployPXEParams struct {
-	Site     string
-	Image    string
-	Replicas int32
+	Site                string
+	Image               string
+	DefaultNetbootImage string
+	Replicas            int32
 }
 
 // buildPXEDeployment constructs the Deployment apply configuration for the
@@ -48,6 +49,11 @@ func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguratio
 	labels := map[string]string{
 		"app":                     "unbounded-pxe",
 		"unbounded-cloud.io/site": p.Site,
+	}
+
+	args := []string{"serve-pxe", "--site=" + p.Site, "--dhcp-auto-interface"}
+	if p.DefaultNetbootImage != "" {
+		args = append(args, "--default-netboot-image="+p.DefaultNetbootImage)
 	}
 
 	return acappsv1.Deployment(name, deployPXENamespace).
@@ -91,7 +97,7 @@ func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguratio
 						WithName("metalman").
 						WithImage(p.Image).
 						WithImagePullPolicy(corev1.PullAlways).
-						WithArgs("serve-pxe", "--site="+p.Site, "--dhcp-auto-interface").
+						WithArgs(args...).
 						WithPorts(
 							accorev1.ContainerPort().
 								WithContainerPort(8880).
@@ -152,10 +158,11 @@ func buildPXEDeployment(p deployPXEParams) *acappsv1.DeploymentApplyConfiguratio
 
 // deployPXEHandler holds flags and state for the deploy-pxe command.
 type deployPXEHandler struct {
-	kubeconfigPath string
-	site           string
-	image          string
-	replicas       int32
+	kubeconfigPath      string
+	site                string
+	image               string
+	defaultNetbootImage string
+	replicas            int32
 }
 
 func (h *deployPXEHandler) execute(ctx context.Context) error {
@@ -171,9 +178,10 @@ func (h *deployPXEHandler) execute(ctx context.Context) error {
 	}
 
 	deploy := buildPXEDeployment(deployPXEParams{
-		Site:     h.site,
-		Image:    h.image,
-		Replicas: h.replicas,
+		Site:                h.site,
+		Image:               h.image,
+		DefaultNetbootImage: h.defaultNetbootImage,
+		Replicas:            h.replicas,
 	})
 
 	result, err := clientset.AppsV1().Deployments(deployPXENamespace).Apply(
@@ -207,6 +215,7 @@ unbounded-kube namespace.`,
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.site, "site", "", "Site name (required; scopes the PXE instance to machines labeled unbounded-cloud.io/site=<site>)")
 	cmd.Flags().StringVar(&handler.image, "image", MetalmanImage, "Container image for the PXE deployment")
+	cmd.Flags().StringVar(&handler.defaultNetbootImage, "default-netboot-image", "", "Default OCI image containing PXE netboot artifacts")
 	cmd.Flags().Int32Var(&handler.replicas, "replicas", deployPXEDefaultReplicas, "Number of PXE Deployment replicas")
 
 	if err := cmd.MarkFlagRequired("site"); err != nil {

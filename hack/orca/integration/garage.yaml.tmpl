@@ -1,10 +1,11 @@
 ---
 # Integration-cluster Garage: a single-node Garage cluster used ONLY as
-# Orca's cachestore (s3 driver) on the unbounded-stable integration
-# cluster. Unlike the dev manifest (deploy/orca/dev/01-garage.yaml.tmpl)
-# this does NOT double as an origin emulator: on unbounded-stable the
-# origin is real Azure Blob storage, so the only bucket created here is
-# the cachestore bucket (orca-cache).
+# Orca's cachestore (s3 driver) on an integration cluster (e.g.
+# unbounded-stable or unbounded-nightly). Unlike the dev manifest
+# (deploy/orca/dev/01-garage.yaml.tmpl) this does NOT double as an origin
+# emulator: on an integration cluster the origin is real Azure Blob
+# storage, so the only bucket created here is the cachestore bucket
+# (orca-cache).
 #
 # This lives under hack/ on purpose: Garage is a test/integration
 # dependency, not a component we ship to customers, so it must not live
@@ -29,7 +30,7 @@ metadata:
   namespace: {{ default "unbounded-kube" .Namespace }}
   labels:
     app.kubernetes.io/name: garage
-    app.kubernetes.io/part-of: orca-stable
+    app.kubernetes.io/part-of: orca
 data:
   garage.toml: |
     metadata_dir = "/var/lib/garage/meta"
@@ -51,7 +52,7 @@ data:
 
     [admin]
     api_bind_addr = "[::]:3903"
-    admin_token = "{{ default "orca-stable-admin-token" .GarageAdminToken }}"
+    admin_token = "{{ default "orca-admin-token" .GarageAdminToken }}"
 
 ---
 apiVersion: v1
@@ -61,7 +62,7 @@ metadata:
   namespace: {{ default "unbounded-kube" .Namespace }}
   labels:
     app.kubernetes.io/name: garage
-    app.kubernetes.io/part-of: orca-stable
+    app.kubernetes.io/part-of: orca
 spec:
   accessModes:
     - ReadWriteOnce
@@ -78,7 +79,7 @@ metadata:
   namespace: {{ default "unbounded-kube" .Namespace }}
   labels:
     app.kubernetes.io/name: garage
-    app.kubernetes.io/part-of: orca-stable
+    app.kubernetes.io/part-of: orca
 spec:
   type: ClusterIP
   selector:
@@ -97,7 +98,7 @@ metadata:
   namespace: {{ default "unbounded-kube" .Namespace }}
   labels:
     app.kubernetes.io/name: garage
-    app.kubernetes.io/part-of: orca-stable
+    app.kubernetes.io/part-of: orca
 spec:
   replicas: 1
   # Recreate: the data PVC is ReadWriteOnce, so the old pod must release
@@ -112,7 +113,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: garage
-        app.kubernetes.io/part-of: orca-stable
+        app.kubernetes.io/part-of: orca
     spec:
       containers:
         - name: garage

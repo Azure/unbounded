@@ -1,0 +1,56 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: playpen e2e
+
+on:
+  pull_request:
+    paths:
+      - cmd/playpen-operator/**
+      - cmd/playpen-runner/**
+      - internal/playpen/**
+      - deploy/playpen/**
+      - images/playpen/**
+      - e2e/playpen/**
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/playpen-e2e.yaml
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "23 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  playpen-e2e:
+    name: playpen e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.30.0
+
+      - name: Install network prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 kmod wireguard-tools
+          sudo modprobe wireguard || true
+          ip -V
+          wg --version
+
+      - name: Run playpen e2e
+        run: make e2e-playpen

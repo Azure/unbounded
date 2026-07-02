@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-name: unbounded-storage-sim
+name: storage-nightly
 
 on:
   schedule:
@@ -18,13 +18,78 @@ on:
         default: "32768"
 
 concurrency:
-  group: unbounded-storage-sim-${{ github.ref }}
+  group: storage-nightly-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  arm64-build:
+    name: ARM64 build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Resolve native dependency versions from Makefile
+        run: |
+          set -euo pipefail
+          libfabric_version="$(sed -n 's/^LIBFABRIC_VERSION[[:space:]]*?=[[:space:]]*//p' Makefile | head -n1)"
+          openssl_version="$(sed -n 's/^OPENSSL_VERSION[[:space:]]*?=[[:space:]]*//p' Makefile | head -n1)"
+          if [[ -z "$libfabric_version" || -z "$openssl_version" ]]; then
+            echo "could not determine native dependency versions from Makefile" >&2
+            exit 1
+          fi
+          echo "LIBFABRIC_VERSION=$libfabric_version" >> "$GITHUB_ENV"
+          echo "OPENSSL_VERSION=$openssl_version" >> "$GITHUB_ENV"
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config ca-certificates curl liburing-dev \
+            libibverbs-dev librdmacm-dev
+
+      - name: Cache pinned libfabric
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        with:
+          path: tmp/libfabric
+          key: libfabric-${{ env.LIBFABRIC_VERSION }}-arm64-${{ runner.os }}-${{ hashFiles('Makefile') }}
+
+      - name: Build pinned libfabric
+        run: make libfabric LIBFABRIC_VERSION="$LIBFABRIC_VERSION"
+
+      - name: Cache pinned OpenSSL
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        with:
+          path: tmp/openssl
+          key: openssl-${{ env.OPENSSL_VERSION }}-arm64-${{ runner.os }}-${{ hashFiles('Makefile') }}
+
+      - name: Build pinned OpenSSL
+        run: make openssl OPENSSL_VERSION="$OPENSSL_VERSION"
+
+      - name: Set up Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cmd/unbounded-storage/target
+          key: cargo-storage-nightly-arm64-${{ runner.os }}-fabric-openssl-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c', 'cmd/unbounded-storage/src/tls/shim.c') }}
+          restore-keys: |
+            cargo-storage-nightly-arm64-${{ runner.os }}-fabric-openssl-
+            cargo-storage-nightly-arm64-${{ runner.os }}-
+
+      - name: Build release binary
+        run: make unbounded-storage-build LIBFABRIC_VERSION="$LIBFABRIC_VERSION" OPENSSL_VERSION="$OPENSSL_VERSION"
+
   sim:
     name: DST soak
     runs-on: ubuntu-latest
@@ -76,13 +141,13 @@ jobs:
             ~/.cargo/git
             cmd/unbounded-storage/target
           # Key on lockfile + manifest plus the native build inputs. The
-          # `-sim-` tier lets the soak job share a key space with the PR job's
+          # `storage-nightly` lets the soak job share a key space with the PR job's
           # restore keys while keeping a dedicated primary key for release-mode
           # artifacts.
-          key: cargo-unbounded-storage-sim-${{ runner.os }}-fabric-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c') }}
+          key: cargo-storage-nightly-${{ runner.os }}-fabric-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c') }}
           restore-keys: |
-            cargo-unbounded-storage-sim-${{ runner.os }}-fabric-
-            cargo-unbounded-storage-sim-${{ runner.os }}-
+            cargo-storage-nightly-${{ runner.os }}-fabric-
+            cargo-storage-nightly-${{ runner.os }}-
             cargo-unbounded-storage-${{ runner.os }}-fabric-
             cargo-unbounded-storage-${{ runner.os }}-
 

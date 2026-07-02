@@ -22,7 +22,9 @@ name: unbounded release
 #     -> binaries          (GoReleaser; creates draft GitHub release)
 #     -> net-images        (matrix: amd64-native, arm64-native)
 #         -> net-images-manifest (multi-arch tag stitch + sign + SBOM attest)
-#     -> component-images  (matrix: machina, machine-ops-controller, metalman, host-ubuntu2404)
+#     -> netboot-image     (PXE boot artifact image)
+#         -> metalman-image (stamped with the matching default netboot image)
+#     -> component-images  (matrix: machina, machine-ops-controller, orca, host-ubuntu2404)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> storage-binaries  (matrix: amd64, arm64; binary + bundled libfabric)
 #     -> finalize          (attach extras + krew manifest)
@@ -440,10 +442,166 @@ jobs:
           done
 
   # ---------------------------------------------------------------------------
-  # Build, scan, push, sign, and SBOM-attest the component images.
-  # machina/metalman cross-compile natively for amd64 and arm64;
-  # host-ubuntu2404 is amd64-only because virt-customize cannot run
-  # under QEMU user-mode emulation.
+  # Build, push, sign, and SBOM-attest the netboot image before metalman is
+  # built. The metalman binary is stamped with this exact default netboot tag.
+  # ---------------------------------------------------------------------------
+  netboot-image:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Normalize container registry to lowercase
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: images/netboot/Containerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            CONTAINER_REGISTRY=${{ env.REGISTRY }}
+          tags: ${{ env.REGISTRY }}/netboot:${{ needs.version.outputs.tag }}
+          cache-from: type=gha,scope=netboot
+          cache-to: type=gha,scope=netboot,mode=max
+
+      - name: Sign container image
+        run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/netboot@${{ steps.push.outputs.digest }}"
+
+      - name: Generate and attach SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.REGISTRY }}/netboot@${{ steps.push.outputs.digest }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          format: spdx-json
+          artifact-name: sbom-netboot.spdx.json
+          output-file: sbom-netboot.spdx.json
+
+      - name: Attest SBOM to image
+        run: |
+          cosign attest --yes \
+            --predicate sbom-netboot.spdx.json \
+            --type spdxjson \
+            "${{ env.REGISTRY }}/netboot@${{ steps.push.outputs.digest }}"
+
+  # ---------------------------------------------------------------------------
+  # Build, scan, push, sign, and SBOM-attest metalman after its default netboot
+  # image has been published.
+  # ---------------------------------------------------------------------------
+  metalman-image:
+    needs: [version, netboot-image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Normalize container registry to lowercase
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image for scanning
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: images/metalman/Containerfile
+          push: false
+          load: true
+          build-args: |
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            CONTAINER_REGISTRY=${{ env.REGISTRY }}
+          tags: scan/metalman:${{ needs.version.outputs.tag }}
+
+      - name: Scan with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scan/metalman:${{ needs.version.outputs.tag }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          trivyignores: images/metalman/.trivyignore
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: images/metalman/Containerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            CONTAINER_REGISTRY=${{ env.REGISTRY }}
+          tags: ${{ env.REGISTRY }}/metalman:${{ needs.version.outputs.tag }}
+          cache-from: type=gha,scope=metalman
+          cache-to: type=gha,scope=metalman,mode=max
+
+      - name: Sign container image
+        run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/metalman@${{ steps.push.outputs.digest }}"
+
+      - name: Generate and attach SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.REGISTRY }}/metalman@${{ steps.push.outputs.digest }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          format: spdx-json
+          artifact-name: sbom-metalman.spdx.json
+          output-file: sbom-metalman.spdx.json
+
+      - name: Attest SBOM to image
+        run: |
+          cosign attest --yes \
+            --predicate sbom-metalman.spdx.json \
+            --type spdxjson \
+            "${{ env.REGISTRY }}/metalman@${{ steps.push.outputs.digest }}"
+
+  # ---------------------------------------------------------------------------
+  # Build, scan, push, sign, and SBOM-attest the component images that have no
+  # release-time image ordering requirements.
+  # machina cross-compiles natively for amd64 and arm64; host-ubuntu2404
+  # publishes both platforms for PXE architecture support.
   # ---------------------------------------------------------------------------
   component-images:
     needs: version
@@ -459,17 +617,13 @@ jobs:
             file: images/machine-ops-controller/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
-          - name: metalman
-            file: images/metalman/Containerfile
-            platforms: linux/amd64,linux/arm64
-            trivy: true
           - name: orca
             file: images/orca/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
           - name: host-ubuntu2404
             file: images/host-ubuntu2404/Containerfile
-            platforms: linux/amd64
+            platforms: linux/amd64,linux/arm64
             trivy: false
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -504,6 +658,7 @@ jobs:
           build-args: |
             VERSION=${{ needs.version.outputs.tag }}
             GIT_COMMIT=${{ github.sha }}
+            CONTAINER_REGISTRY=${{ env.REGISTRY }}
           tags: scan/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
 
       - name: Scan with Trivy
@@ -526,6 +681,7 @@ jobs:
           build-args: |
             VERSION=${{ needs.version.outputs.tag }}
             GIT_COMMIT=${{ github.sha }}
+            CONTAINER_REGISTRY=${{ env.REGISTRY }}
           tags: ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
           cache-from: type=gha,scope=${{ matrix.component.name }}
           cache-to: type=gha,scope=${{ matrix.component.name }},mode=max
@@ -724,6 +880,8 @@ jobs:
       - changelog
       - binaries
       - net-images-manifest
+      - netboot-image
+      - metalman-image
       - component-images
       - manifests-tarball
       - storage-binaries

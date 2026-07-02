@@ -3,33 +3,25 @@
 # Overlaid on top of the Ubuntu netboot initrd via a second cpio archive.
 # Downloads a compressed raw disk image over HTTP, writes it to disk,
 # injects cloud-init datasource configuration, and reboots.
-#
-# Expected kernel cmdline parameters:
-#   unbounded.image_url=<url>    URL of the gzipped raw disk image
-#   unbounded.serve_url=<url>    Base URL of the unbounded-metal serve instance
-#   unbounded.disk=<dev>         Target block device (default: auto-detect largest)
-#   unbounded.ds_url=<url>       cloud-init NoCloud datasource seed URL
-#   ip=<ip>::<gw>:<mask>::<iface>:none  Static IP configuration
 
 set -e
 
-mkdir -p /proc /sys /dev /tmp /run /mnt
+mkdir -p /proc /sys /dev /tmp /run /mnt /mnt/esp
 mount -t proc proc /proc 2>/dev/null || true
 mount -t sysfs sysfs /sys 2>/dev/null || true
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 
-# Send all output through the kernel log so it appears on every console
-# (tty0, ttyS0, etc.), not just /dev/console.
+# Send output through the kernel log so it appears on all consoles.
 exec >/dev/kmsg 2>&1
 
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-log()   { echo "unbounded-metal: $*"; }
+log() { echo "unbounded-metal: $*"; }
 fatal() { log "FATAL: $*"; exec sh; }
 
-# Retry a command with logging. Usage: retry <attempts> <delay> <desc> <cmd...>
 retry() {
-    local n="$1" delay="$2" desc="$3" i; shift 3
+    local n="$1" delay="$2" desc="$3" i
+    shift 3
     for i in $(seq 1 "$n"); do
         if "$@"; then
             [ "$i" -gt 1 ] && log "$desc succeeded (attempt $i/$n)"
@@ -43,32 +35,24 @@ retry() {
 
 log "installer starting"
 
-# ── Load essential modules ──
 KVER=$(uname -r)
-if [ ! -d "/lib/modules/${KVER}" ]; then
-    log "WARNING: /lib/modules/${KVER} not found, modules may fail to load"
-fi
-for mod in virtio_pci virtio_blk ahci sd_mod nvme; do
+for mod in virtio_pci virtio_blk ahci sd_mod nvme xfs ext4; do
     modprobe "$mod" 2>/dev/null || true
 done
-for mod in virtio_net e1000 e1000e igb ixgbe i40e ice \
-           mlx5_core mlx4_core bnxt_en tg3 be2net ena; do
+for mod in virtio_net e1000 e1000e igb ixgbe i40e ice mlx5_core mlx4_core bnxt_en tg3 be2net ena; do
     modprobe "$mod" 2>/dev/null || true
 done
 for f in /lib/modules/"${KVER}"/kernel/drivers/net/ethernet/*/*.ko* \
          /lib/modules/"${KVER}"/kernel/drivers/net/ethernet/*/*/*.ko*; do
     [ -e "$f" ] || continue
-    mod=$(basename "$f"); mod=${mod%.ko*}
+    mod=$(basename "$f")
+    mod=${mod%.ko*}
     modprobe "$mod" 2>/dev/null || true
 done
-# FAT/VFAT is needed to mount the EFI System Partition later.
-for mod in nls_cp437 nls_ascii nls_utf8 fat vfat; do
+for mod in nls_cp437 nls_ascii nls_utf8 fat vfat efivarfs; do
     modprobe "$mod" 2>/dev/null || true
 done
-# efivarfs is needed for efibootmgr to create NVRAM entries.
-modprobe efivarfs 2>/dev/null || true
 
-# ── Wait for network interface ──
 log "waiting for network interface"
 IFACE=""
 find_iface() {
@@ -77,11 +61,10 @@ find_iface() {
 }
 retry 30 1 "find network interface" find_iface || fatal "no network interface found"
 
-# ── Parse kernel command line ──
 CMDLINE=$(cat /proc/cmdline)
 get_param() {
     for tok in $CMDLINE; do
-        case "$tok" in ${1}=*) echo "${tok#"${1}"=}"; return 0 ;; esac
+        case "$tok" in "$1"=*) echo "${tok#"$1"=}"; return 0 ;; esac
     done
     return 1
 }
@@ -94,7 +77,6 @@ NODE_NAME=$(get_param unbounded.node_name || true)
 NODE_NAMESPACE=$(get_param unbounded.node_namespace || true)
 APISERVER_URL=$(get_param unbounded.apiserver_url || true)
 
-# ── Configure network ──
 mask2cidr() {
     local cidr=0
     for octet in $(echo "$1" | tr '.' ' '); do
@@ -117,7 +99,7 @@ if [ -n "$IP_PARAM" ]; then
 
     case "$MASK" in
         *.*.*.*) PREFIX=$(mask2cidr "$MASK") ;;
-        *)       PREFIX="$MASK" ;;
+        *) PREFIX="$MASK" ;;
     esac
 
     if [ -n "$IFACE_PARAM" ] && [ -e "/sys/class/net/$IFACE_PARAM" ]; then
@@ -128,18 +110,13 @@ if [ -n "$IP_PARAM" ]; then
     retry 5 2 "link up $IFACE" ip link set "$IFACE" up || fatal "failed to bring up $IFACE"
     retry 3 1 "add address" ip addr add "$CLIENT_IP/$PREFIX" dev "$IFACE" || true
     retry 3 1 "add default route" ip route add default via "$GW" dev "$IFACE" || true
-
-    log "waiting for carrier on $IFACE"
-    check_carrier() { [ "$(cat "/sys/class/net/$IFACE/carrier" 2>/dev/null)" = "1" ]; }
-    retry 30 1 "carrier detect on $IFACE" check_carrier \
-        || log "WARNING: no carrier on $IFACE, continuing anyway"
 fi
 
-# ── Detect target disk ──
 if [ -z "$TARGET_DISK" ]; then
     log "waiting for block devices"
     find_disk() {
-        TARGET_DISK="" MAX_SIZE=0
+        TARGET_DISK=""
+        MAX_SIZE=0
         for disk in /sys/block/sd* /sys/block/nvme* /sys/block/vd*; do
             [ -e "$disk" ] || continue
             SIZE=$(cat "$disk/size" 2>/dev/null || echo 0)
@@ -154,43 +131,49 @@ if [ -z "$TARGET_DISK" ]; then
 fi
 log "target disk: $TARGET_DISK"
 
-# ── Download and write disk image ──
-# The server may return 503 while the image is still being prepared;
-# retry until the download succeeds.
 log "downloading disk image from $IMAGE_URL"
 retry 120 5 "download disk image" wget -q -O /tmp/disk.img.gz "$IMAGE_URL" \
-    || fatal "failed to download disk image after 120 attempts"
+    || fatal "failed to download disk image"
 
 log "writing disk image to $TARGET_DISK"
 write_image() { gunzip -c /tmp/disk.img.gz | dd of="$TARGET_DISK" bs=4194304; }
 retry 3 5 "write disk image" write_image || fatal "failed to write disk image"
 rm -f /tmp/disk.img.gz
 sync
-log "disk image written"
 
-# ── Re-read partition table ──
 retry 5 2 "re-read partition table" blockdev --rereadpt "$TARGET_DISK" \
     || log "WARNING: could not re-read partition table"
 sleep 2
 
-# ── Inject cloud-init datasource configuration ──
+parts_for_disk() {
+    base=$(basename "$TARGET_DISK")
+    for p in /sys/block/"$base"/"$base"*; do
+        [ -e "$p" ] || continue
+        echo "/dev/$(basename "$p")"
+    done
+}
+
+find_root_part() {
+    ROOT_PART=""
+    for part in $(parts_for_disk); do
+        if mount "$part" /mnt 2>/dev/null; then
+            if [ -d /mnt/etc ] && [ -d /mnt/var ]; then
+                ROOT_PART="$part"
+                umount /mnt
+                return 0
+            fi
+            umount /mnt
+        fi
+    done
+    return 1
+}
+
 if [ -n "$DS_URL" ]; then
     log "injecting cloud-init datasource: $DS_URL"
-
-    # Find the root partition (largest ext4/xfs partition on the target disk).
-    # Ubuntu cloud images typically have: partition 1 = ESP, partition 2 = root.
-    find_root_part() {
-        for suffix in 2 1 p2 p1; do
-            [ -b "${TARGET_DISK}${suffix}" ] && { ROOT_PART="${TARGET_DISK}${suffix}"; return 0; }
-        done
-        return 1
-    }
-    ROOT_PART=""
-    retry 10 2 "find root partition" find_root_part || fatal "no root partition found on $TARGET_DISK"
-
+    retry 20 2 "find root partition" find_root_part || fatal "no root partition found on $TARGET_DISK"
     retry 5 2 "mount $ROOT_PART" mount "$ROOT_PART" /mnt || fatal "failed to mount $ROOT_PART"
 
-    mkdir -p /mnt/etc/cloud/cloud.cfg.d
+    mkdir -p /mnt/etc/cloud/cloud.cfg.d /mnt/etc/unbounded-metal
     cat > /mnt/etc/cloud/cloud.cfg.d/99-unbounded-metal.cfg <<CLOUDINIT
 datasource_list: [NoCloud]
 datasource:
@@ -198,81 +181,50 @@ datasource:
     seedfrom: ${DS_URL}
 CLOUDINIT
     rm -f /mnt/etc/cloud/cloud-init.disabled
-    log "wrote cloud-init datasource config"
-
-    if [ -n "$SERVE_URL" ] || [ -n "$NODE_NAME" ] || [ -n "$APISERVER_URL" ]; then
-        mkdir -p /mnt/etc/unbounded-metal
-        cat > /mnt/etc/unbounded-metal/config <<UMCONFIG
+    cat > /mnt/etc/unbounded-metal/config <<UMCONFIG
 SERVE_URL=${SERVE_URL}
 NODE_NAME=${NODE_NAME}
 NODE_NAMESPACE=${NODE_NAMESPACE}
 APISERVER_URL=${APISERVER_URL}
 UMCONFIG
-        log "wrote /etc/unbounded-metal/config"
-    fi
-
     sync
     umount /mnt
     log "cloud-init configured on $ROOT_PART"
 fi
 
-# ── Create UEFI NVRAM boot entry for the installed disk ──
-# After dd'ing the cloud image the ESP contains a bootloader but the
-# firmware has no Boot#### NVRAM variable pointing at it.  Without one,
-# OVMF (and many physical BMCs) will skip the disk and PXE-boot again.
 if [ -d /sys/firmware/efi ]; then
     log "creating UEFI boot entry for local disk"
-
-    # Mount efivarfs so efibootmgr can read/write NVRAM variables.
     if ! mountpoint -q /sys/firmware/efi/efivars 2>/dev/null; then
         mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null || true
     fi
 
-    # Discover the EFI System Partition.  Ubuntu cloud images use
-    # partition 15; fall back to partition 1 for standard layouts.
-    ESP_PART=""
-    for suffix in 15 1 p15 p1; do
-        if [ -b "${TARGET_DISK}${suffix}" ]; then
-            ESP_PART="${TARGET_DISK}${suffix}"
-            ESP_NUM="${suffix#p}"
-            break
-        fi
-    done
-
-    if [ -n "$ESP_PART" ] && command -v efibootmgr >/dev/null 2>&1; then
-        # Verify shimx64.efi exists on the ESP before creating the entry.
-        mkdir -p /mnt/esp
-        if mount -t vfat "$ESP_PART" /mnt/esp 2>/dev/null; then
-            if [ -f /mnt/esp/EFI/ubuntu/shimx64.efi ]; then
-                LOADER='\EFI\ubuntu\shimx64.efi'
-            elif [ -f /mnt/esp/EFI/BOOT/BOOTX64.EFI ]; then
-                LOADER='\EFI\BOOT\BOOTX64.EFI'
-            else
-                LOADER=""
-                log "WARNING: no EFI bootloader found on ESP"
-            fi
+    for part in $(parts_for_disk); do
+        if mount -t vfat "$part" /mnt/esp 2>/dev/null; then
+            LOADER=""
+            for candidate in \
+                /EFI/BOOT/BOOTX64.EFI \
+                /EFI/BOOT/BOOTAA64.EFI \
+                /EFI/ubuntu/shimx64.efi \
+                /EFI/ubuntu/shimaa64.efi; do
+                if [ -f "/mnt/esp${candidate}" ]; then
+                    LOADER="$(echo "$candidate" | tr '/' '\\')"
+                    break
+                fi
+            done
             umount /mnt/esp
 
-            if [ -n "$LOADER" ]; then
-                efibootmgr --create \
-                    --disk "$TARGET_DISK" \
-                    --part "$ESP_NUM" \
-                    --loader "$LOADER" \
-                    --label "ubuntu" 2>&1 \
+            if [ -n "$LOADER" ] && command -v efibootmgr >/dev/null 2>&1; then
+                ESP_NUM=$(basename "$part" | sed "s/^$(basename "$TARGET_DISK")//; s/^p//")
+                efibootmgr --create --disk "$TARGET_DISK" --part "$ESP_NUM" \
+                    --loader "$LOADER" --label "unbounded" 2>&1 \
                     && log "UEFI boot entry created (${LOADER} on part ${ESP_NUM})" \
                     || log "WARNING: efibootmgr failed, PXE chainloader will be used as fallback"
+                break
             fi
-        else
-            log "WARNING: could not mount ESP $ESP_PART"
         fi
-    else
-        log "WARNING: efibootmgr not available or no ESP found, skipping NVRAM entry"
-    fi
-else
-    log "not booted in UEFI mode, skipping NVRAM boot entry"
+    done
 fi
 
-# ── Disable PXE so the next boot uses the installed disk ──
 if [ -n "$SERVE_URL" ]; then
     log "disabling PXE boot"
     retry 5 2 "disable PXE" wget -q -O /dev/null "$SERVE_URL/pxe/disable" \
