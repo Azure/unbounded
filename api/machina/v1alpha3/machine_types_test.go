@@ -27,18 +27,3 @@ func TestKubernetesSpecOmitsUnsetBootstrapTokenRef(t *testing.T) {
 		t.Fatalf("marshaled KubernetesSpec = %s, want bootstrapTokenRef omitted", data)
 	}
 }
-
-func TestAgentSpecAdditionalHostDevicesJSON(t *testing.T) {
-	spec := AgentSpec{
-		AdditionalHostDevices: []string{"/dev/uinput"},
-	}
-
-	data, err := json.Marshal(spec)
-	if err != nil {
-		t.Fatalf("marshal AgentSpec: %v", err)
-	}
-
-	if !bytes.Contains(data, []byte(`"additionalHostDevices":["/dev/uinput"]`)) {
-		t.Fatalf("marshaled AgentSpec = %s, want additionalHostDevices", data)
-	}
-}

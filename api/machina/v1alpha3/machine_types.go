@@ -413,14 +413,6 @@ type AgentSpec struct {
 	// artifact from its upstream default host.
 	// +optional
 	Downloads *AgentDownloadsSpec `json:"downloads,omitempty"`
-
-	// AdditionalHostDevices lists extra host device nodes under /dev to
-	// expose inside the nspawn machine. The agent also exposes its
-	// automatically discovered devices, such as KVM, network virtualization,
-	// block, InfiniBand, and GPU devices.
-	// +optional
-	// +kubebuilder:validation:items:Pattern=`^/dev/[^[:space:]:]+$`
-	AdditionalHostDevices []string `json:"additionalHostDevices,omitempty"`
 }
 
 // AgentDownloadsSpec overrides the download sources for the artifacts the

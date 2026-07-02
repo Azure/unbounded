@@ -59,16 +59,6 @@ spec:
               agent:
                 description: Agent contains settings for the unbounded node agent.
                 properties:
-                  additionalHostDevices:
-                    description: |-
-                      AdditionalHostDevices lists extra host device nodes under /dev to
-                      expose inside the nspawn machine. The agent also exposes its
-                      automatically discovered devices, such as KVM, network virtualization,
-                      block, InfiniBand, and GPU devices.
-                    items:
-                      pattern: ^/dev/[^[:space:]:]+$
-                      type: string
-                    type: array
                   baseURL:
                     description: |-
                       BaseURL overrides the base URL used to construct the

@@ -125,8 +125,8 @@ The agent also auto-mounts host storage and InfiniBand hardware:
   `/dev/infiniband` (e.g. `uverbs0`, `umad0`, `issm0`, `rdma_cm`) is
   bind-mounted so that RDMA workloads inside the container can reach the
   host's HCAs.
-- **Configured extra devices.** `spec.agent.additionalHostDevices` can list
-  non-standard host device nodes under `/dev` (for example `/dev/uinput`) that
+- **Configured extra devices.** `AdditionalHostDevices` in the agent config can
+  list non-standard host device nodes under `/dev` (for example `/dev/uinput`) that
   should be exposed to workloads inside the machine.
 
 Device discovery runs once when the machine is provisioned. Disks or HCAs
@@ -155,7 +155,7 @@ The configuration is written to two files on the host before the machine boots:
 | `Bind=/dev/kvm` | nspawn config | KVM device bind-mount (auto-generated when `/dev/kvm` is present). |
 | `Bind=<block device>` | nspawn config | Storage block device bind-mount (auto-generated for non-virtual `/sys/class/block` entries, including partitions, `dm-*`, and `md*`). |
 | `Bind=/dev/infiniband/*` | nspawn config | InfiniBand HCA device bind-mount (auto-generated when `/dev/infiniband` devices are present). |
-| `Bind=<configured /dev path>` | nspawn config | Additional host device bind-mount (configured with `spec.agent.additionalHostDevices`). |
+| `Bind=<configured /dev path>` | nspawn config | Additional host device bind-mount (configured with agent config `AdditionalHostDevices`). |
 | `Bind=` / `BindReadOnly=` | nspawn config | GPU device and library bind-mounts (auto-generated when GPUs are present). |
 | `DeviceAllow=` | Service override | Cgroup device permissions for all bind-mounted host device nodes (KVM, block, InfiniBand, configured extra devices, GPU). |
 
