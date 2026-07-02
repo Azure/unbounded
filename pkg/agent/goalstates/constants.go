@@ -3,7 +3,10 @@
 
 package goalstates
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 const (
 	// ConfigDir is the host-level configuration directory for unbounded-kube.
@@ -77,13 +80,25 @@ func AppliedConfigPath(machineName string) string {
 	return fmt.Sprintf("%s/%s-applied-config.json", AgentConfigDir, machineName)
 }
 
+func KubeProxyImage(kubernetesVersion string) string {
+	kubernetesVersion = strings.TrimSpace(kubernetesVersion)
+	if kubernetesVersion == "" {
+		kubernetesVersion = "latest"
+	} else if !strings.HasPrefix(kubernetesVersion, "v") {
+		kubernetesVersion = "v" + kubernetesVersion
+	}
+
+	return KubeProxyImageRepository + ":" + kubernetesVersion
+}
+
 const (
 	ContainerdVersion = "2.1.8"
 	RunCVersion       = "1.5.0"
 	CNIPluginVersion  = "1.5.1"
 
 	ContainerdMetricsAddress = "0.0.0.0:10257"
-	SandboxImage             = "mcr.microsoft.com/oss/kubernetes/pause:3.9"
+	SandboxImage             = "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9"
+	KubeProxyImageRepository = "mcr.microsoft.com/oss/v2/kubernetes/kube-proxy"
 
 	CNIBinDir    = "/opt/cni/bin"
 	CNIConfigDir = "/etc/cni/net.d"

@@ -61,9 +61,16 @@ type Artifact struct {
 	GenerateChecksum bool
 }
 
+type ContainerImageArchive struct {
+	ImageTag string
+	Arch     string
+	Path     string
+}
+
 type Plan struct {
-	Manifest  agentartifacts.Manifest
-	Artifacts []Artifact
+	Manifest        agentartifacts.Manifest
+	Artifacts       []Artifact
+	ContainerImages []ContainerImageArchive
 }
 
 func Build(ctx context.Context, log *slog.Logger, opts Options) error {
@@ -87,7 +94,15 @@ func Build(ctx context.Context, log *slog.Logger, opts Options) error {
 		return err
 	}
 
+	if err := exportContainerImages(ctx, log, stagingDir, plan.ContainerImages); err != nil {
+		return err
+	}
+
 	if err := materializeArtifacts(stagingDir, opts.OutputDir, plan.Artifacts); err != nil {
+		return err
+	}
+
+	if err := materializeContainerImages(stagingDir, opts.OutputDir, plan.ContainerImages); err != nil {
 		return err
 	}
 
@@ -130,12 +145,22 @@ func NewPlan(opts Options) (Plan, error) {
 	}
 
 	artifacts := make([]Artifact, 0, len(arches)*10)
+
+	containerImages := make([]ContainerImageArchive, 0, len(arches)*len(manifest.ContainerImages))
 	for _, arch := range arches {
 		for _, binary := range agentartifacts.KubernetesBinaries {
 			path := agentartifacts.KubernetesArtifactPath(manifest.Versions.Kubernetes, arch, binary)
 			url := agentartifacts.KubernetesBinary(nil, manifest.Versions.Kubernetes, arch, binary)
 			artifacts = append(artifacts, Artifact{Name: binary, URL: url, Path: path})
 			artifacts = append(artifacts, Artifact{Name: binary + ".sha256", URL: url + ".sha256", Path: path + ".sha256"})
+		}
+
+		for _, imageTag := range manifest.ContainerImages {
+			containerImages = append(containerImages, ContainerImageArchive{
+				ImageTag: imageTag,
+				Arch:     arch,
+				Path:     agentartifacts.ContainerImageArchivePath(arch, imageTag),
+			})
 		}
 
 		artifacts = append(artifacts,
@@ -166,7 +191,7 @@ func NewPlan(opts Options) (Plan, error) {
 		)
 	}
 
-	return Plan{Manifest: manifest, Artifacts: artifacts}, nil
+	return Plan{Manifest: manifest, Artifacts: artifacts, ContainerImages: containerImages}, nil
 }
 
 func PushOCI(ctx context.Context, log *slog.Logger, rootDir, ref string) error {
@@ -330,6 +355,20 @@ func materializeArtifacts(stagingDir, outputDir string, artifacts []Artifact) er
 			if err := materializeArtifact(stagingDir, outputDir, artifact.Path+".sha256"); err != nil {
 				return err
 			}
+		}
+	}
+
+	return nil
+}
+
+func materializeContainerImages(stagingDir, outputDir string, images []ContainerImageArchive) error {
+	for _, image := range images {
+		if err := materializeArtifact(stagingDir, outputDir, image.Path); err != nil {
+			return err
+		}
+
+		if err := materializeArtifact(stagingDir, outputDir, image.Path+".sha256"); err != nil {
+			return err
 		}
 	}
 
@@ -585,6 +624,7 @@ func defaultManifest(kubernetesVersion string) (agentartifacts.Manifest, error) 
 			CNI:        goalstates.CNIPluginVersion,
 			Crictl:     crictlVersion,
 		},
+		ContainerImages: agentartifacts.DefaultContainerImages(kubernetesVersion),
 	})
 }
 

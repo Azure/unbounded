@@ -239,11 +239,18 @@ func validateBundle(rootDir string) error {
 		}
 	}
 
+	for _, image := range plan.ContainerImages {
+		path := filepath.Join(rootDir, filepath.FromSlash(image.Path))
+		if err := verifyChecksum(path); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
 func expectedBundlePaths(plan Plan) []string {
-	paths := make([]string, 0, len(plan.Artifacts)*2+1)
+	paths := make([]string, 0, len(plan.Artifacts)*2+len(plan.ContainerImages)*2+1)
 	paths = append(paths, ManifestFileName)
 
 	for _, artifact := range plan.Artifacts {
@@ -251,6 +258,10 @@ func expectedBundlePaths(plan Plan) []string {
 		if artifact.GenerateChecksum {
 			paths = append(paths, artifact.Path+".sha256")
 		}
+	}
+
+	for _, image := range plan.ContainerImages {
+		paths = append(paths, image.Path, image.Path+".sha256")
 	}
 
 	sort.Strings(paths)
