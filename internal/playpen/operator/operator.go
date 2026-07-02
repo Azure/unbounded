@@ -1778,6 +1778,7 @@ func latestConfiguredKubernetesVersion(versions []string) (string, error) {
 	}
 
 	latest := ""
+
 	var latestParts kubernetesVersionParts
 
 	for _, version := range versions {
@@ -1804,6 +1805,7 @@ func parseKubernetesVersionParts(version string) (kubernetesVersionParts, error)
 	trimmed := strings.TrimPrefix(strings.TrimSpace(version), "v")
 	trimmed = strings.SplitN(trimmed, "-", 2)[0]
 	trimmed = strings.SplitN(trimmed, "+", 2)[0]
+
 	fields := strings.Split(trimmed, ".")
 	if len(fields) != 3 {
 		return kubernetesVersionParts{}, fmt.Errorf("kubernetes version %q must be major.minor.patch", version)
@@ -1831,6 +1833,7 @@ func compareKubernetesVersionParts(a, b kubernetesVersionParts) int {
 	if a.major != b.major {
 		return a.major - b.major
 	}
+
 	if a.minor != b.minor {
 		return a.minor - b.minor
 	}

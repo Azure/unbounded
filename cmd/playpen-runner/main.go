@@ -95,6 +95,7 @@ func main() {
 
 	root.CompletionOptions.DisableDefaultCmd = true
 	root.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
+
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
