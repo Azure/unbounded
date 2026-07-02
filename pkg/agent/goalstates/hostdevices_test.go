@@ -222,6 +222,7 @@ func TestHostDevices_Paths_MergesDedupesSorts(t *testing.T) {
 		Network:    []string{"/dev/net/tun", "/dev/vhost-net"},
 		Block:      []string{"/dev/sdb", "/dev/sda", "/dev/kvm"},
 		Infiniband: []string{"/dev/infiniband/uverbs0"},
+		Additional: []string{"/dev/uinput", "/dev/net/tun"},
 	}
 
 	want := []string{
@@ -230,6 +231,7 @@ func TestHostDevices_Paths_MergesDedupesSorts(t *testing.T) {
 		"/dev/net/tun",
 		"/dev/sda",
 		"/dev/sdb",
+		"/dev/uinput",
 		"/dev/vhost-net",
 	}
 	require.Equal(t, want, d.Paths())

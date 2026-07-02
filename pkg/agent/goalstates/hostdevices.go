@@ -59,6 +59,8 @@ type HostDevices struct {
 	// Infiniband holds InfiniBand/RDMA HCA character device node paths from
 	// /dev/infiniband.
 	Infiniband []string
+	// Additional holds extra host device node paths requested by config.
+	Additional []string
 }
 
 // Paths returns every discovered device node path merged into a single
@@ -69,7 +71,7 @@ func (d HostDevices) Paths() []string {
 
 	var paths []string
 
-	for _, group := range [][]string{d.KVM, d.Network, d.Block, d.Infiniband} {
+	for _, group := range [][]string{d.KVM, d.Network, d.Block, d.Infiniband, d.Additional} {
 		for _, p := range group {
 			if seen[p] {
 				continue

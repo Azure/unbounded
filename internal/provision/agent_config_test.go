@@ -36,7 +36,8 @@ func TestAgentConfig_MarshalJSON(t *testing.T) {
 			},
 			RegisterWithTaints: []string{"dedicated=gpu:NoSchedule"},
 		},
-		OCIImage: "ghcr.io/azure/agent:v1.0.0",
+		OCIImage:              "ghcr.io/azure/agent:v1.0.0",
+		AdditionalHostDevices: []string{"/dev/uinput"},
 	}
 
 	data, err := json.Marshal(cfg)
@@ -68,6 +69,8 @@ func TestAgentConfig_MarshalJSON(t *testing.T) {
 	require.Equal(t, "dedicated=gpu:NoSchedule", taints[0])
 
 	require.Equal(t, "ghcr.io/azure/agent:v1.0.0", parsed["OCIImage"])
+	devices := parsed["AdditionalHostDevices"].([]interface{})
+	require.Equal(t, "/dev/uinput", devices[0])
 }
 
 func TestAgentConfig_RoundTrip(t *testing.T) {
@@ -90,7 +93,8 @@ func TestAgentConfig_RoundTrip(t *testing.T) {
 			Labels:             map[string]string{"key": "value"},
 			RegisterWithTaints: []string{"key=value:NoSchedule", "key2=value2:NoExecute"},
 		},
-		OCIImage: "ghcr.io/azure/rootfs:v2.0.0",
+		OCIImage:              "ghcr.io/azure/rootfs:v2.0.0",
+		AdditionalHostDevices: []string{"/dev/uinput"},
 	}
 
 	data, err := json.Marshal(original)
@@ -106,6 +110,7 @@ func TestAgentConfig_RoundTrip(t *testing.T) {
 	require.Equal(t, original.Kubelet.Labels, decoded.Kubelet.Labels)
 	require.Equal(t, original.Kubelet.RegisterWithTaints, decoded.Kubelet.RegisterWithTaints)
 	require.Equal(t, original.OCIImage, decoded.OCIImage)
+	require.Equal(t, original.AdditionalHostDevices, decoded.AdditionalHostDevices)
 }
 
 func TestAgentConfig_EmptyFields(t *testing.T) {
@@ -221,7 +226,10 @@ func TestBuildAgentConfig(t *testing.T) {
 							NodeLabels:         map[string]string{"env": "prod", "team": "infra"},
 							RegisterWithTaints: []string{"dedicated=gpu:NoSchedule"},
 						},
-						Agent: &v1alpha3.AgentSpec{Image: "ghcr.io/org/rootfs:v1"},
+						Agent: &v1alpha3.AgentSpec{
+							Image:                 "ghcr.io/org/rootfs:v1",
+							AdditionalHostDevices: []string{"/dev/uinput"},
+						},
 					},
 				},
 				Cluster: ClusterEndpoint{
@@ -242,6 +250,7 @@ func TestBuildAgentConfig(t *testing.T) {
 				require.Equal(t, "api.example.com:443", cfg.Kubelet.ApiServer)
 				require.Equal(t, "abc123.secret456", cfg.Kubelet.Auth.BootstrapToken)
 				require.Equal(t, "ghcr.io/org/rootfs:v1", cfg.OCIImage)
+				require.Equal(t, []string{"/dev/uinput"}, cfg.AdditionalHostDevices)
 				require.Nil(t, cfg.Attest)
 
 				// Labels: user + common + provider

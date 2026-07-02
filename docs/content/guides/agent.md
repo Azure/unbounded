@@ -273,6 +273,26 @@ Leaving any artifact unset preserves the upstream default, so you can
 mirror a subset of the artifacts and let the rest fall back to the
 public CDN.
 
+### Exposing extra host devices
+
+The agent automatically exposes common host devices for KVM, networking,
+storage, InfiniBand, and GPUs. To expose a non-standard device such as
+`/dev/uinput`, add it under `spec.agent.additionalHostDevices`:
+
+```yaml
+apiVersion: unbounded-kube.io/v1alpha3
+kind: Machine
+metadata:
+  name: mysite-worker-01
+spec:
+  agent:
+    additionalHostDevices:
+      - /dev/uinput
+  ssh:
+    host: 10.0.0.5
+    # ...
+```
+
 A successful run looks like this (timestamps shortened for readability):
 
 ```

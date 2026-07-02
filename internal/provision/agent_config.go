@@ -5,6 +5,7 @@ package provision
 
 import (
 	"maps"
+	"slices"
 	"strings"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -197,6 +198,10 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 			OCIImage: ociImage,
 		},
 		Downloads: downloads,
+	}
+
+	if machine.Spec.Agent != nil {
+		cfg.AdditionalHostDevices = slices.Clone(machine.Spec.Agent.AdditionalHostDevices)
 	}
 
 	if params.AttestURL != "" {
