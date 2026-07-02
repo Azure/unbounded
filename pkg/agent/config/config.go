@@ -54,6 +54,19 @@ type AgentConfig struct {
 	// should be exposed to the nspawn machine in addition to automatically
 	// discovered devices.
 	AdditionalHostDevices []string `json:"AdditionalHostDevices,omitempty"`
+
+	// OfflineArtifacts points to a complete offline binary artifact source.
+	// When set, it takes precedence over download overrides. Source is rendered
+	// as a strict Go template using the cluster Kubernetes version, then
+	// resolved as an absolute filesystem path, file:// URL, or oci:// artifact
+	// reference.
+	OfflineArtifacts *AgentOfflineArtifacts `json:"OfflineArtifacts,omitempty"`
+}
+
+// AgentOfflineArtifacts configures a complete offline source for binaries the
+// agent installs into the nspawn rootfs.
+type AgentOfflineArtifacts struct {
+	Source string `json:"Source,omitempty"`
 }
 
 // BackfillNodeName resolves and stores the Kubernetes Node name once. An
@@ -115,6 +128,10 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
+
+	if a.OfflineArtifacts != nil {
+		out.OfflineArtifacts = &AgentOfflineArtifacts{Source: a.OfflineArtifacts.Source}
+	}
 
 	return &out
 }
@@ -253,6 +270,9 @@ type CRIConfig struct {
 type ContainerdConfig struct {
 	// Version overrides the default containerd version (e.g. "2.1.8").
 	Version string `json:"Version,omitempty"`
+
+	// SandboxImage overrides the CRI sandbox image used by containerd.
+	SandboxImage string `json:"SandboxImage,omitempty"`
 }
 
 // RuncConfig holds runc-specific overrides.

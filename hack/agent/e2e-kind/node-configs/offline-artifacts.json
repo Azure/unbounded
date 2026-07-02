@@ -1,0 +1,10 @@
+{
+  "name": "offline-artifacts",
+  "nodeLabels": {
+    "e2e.unbounded-cloud.io/config": "offline-artifacts"
+  },
+  "offlineArtifactsOCIRef": "oci://ghcr.io/azure/unbounded/bootstrap-artifacts:alpha-4cc8b3d-k8s-v1.35.0",
+  "offlineRootfsOCIImage": "oci://ghcr.io/azure/agent-ubuntu2404:v20260619",
+  "sandboxImage": "mcr.microsoft.com/oss/kubernetes/pause:3.9",
+  "blockExternalNetwork": true
+}

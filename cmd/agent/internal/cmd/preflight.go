@@ -88,9 +88,9 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 	}
 
 	checks := preflight.Flatten(
-		host.Preflight(logger, cfg, goalState),
-		nodestart.Preflight(logger, cfg, goalState),
-		rootfs.Preflight(logger, cfg, goalState),
+		host.Preflight(logger, cfg.AgentConfig, goalState),
+		nodestart.Preflight(logger, cfg.AgentConfig, goalState),
+		rootfs.Preflight(logger, cfg.AgentConfig, goalState),
 	)
 
 	opts := preflight.Options{

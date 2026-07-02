@@ -9,15 +9,25 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"iter"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
+
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"oras.land/oras-go/v2/registry/remote"
+	"oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/retry"
+
+	"github.com/Azure/unbounded/internal/ociutil"
 )
 
 const remoteHTTPProbeTimeout = 10 * time.Second
@@ -40,8 +50,160 @@ func newRemoteHTTPProbeTransport() http.RoundTripper {
 	return transport.Clone()
 }
 
-func downloadFromRemote(ctx context.Context, url string) (io.ReadCloser, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
+func downloadFromRemote(ctx context.Context, source string) (io.ReadCloser, error) {
+	parsed, err := url.Parse(source)
+	if err != nil {
+		return nil, fmt.Errorf("parse download source %q: %w", source, err)
+	}
+
+	switch parsed.Scheme {
+	case "", "file":
+		return openLocalSource(parsed, source)
+	case "http", "https":
+		return downloadHTTP(ctx, source)
+	case "oci":
+		return downloadOCI(ctx, parsed)
+	default:
+		return nil, fmt.Errorf("unsupported download source scheme %q", parsed.Scheme)
+	}
+}
+
+func downloadOCI(ctx context.Context, parsed *url.URL) (io.ReadCloser, error) {
+	title := strings.TrimPrefix(parsed.Fragment, "/")
+	if title == "" {
+		return nil, fmt.Errorf("OCI download source must include a blob title fragment")
+	}
+
+	repo, reference, err := openOCIRepository(parsed)
+	if err != nil {
+		return nil, err
+	}
+
+	manifest, err := fetchOCIArtifactManifest(ctx, repo, reference)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, desc := range manifest.Layers {
+		if desc.Annotations[ocispec.AnnotationTitle] == title {
+			body, err := repo.Fetch(ctx, desc)
+			if err != nil {
+				return nil, fmt.Errorf("fetch OCI blob %q: %w", title, err)
+			}
+
+			return body, nil
+		}
+	}
+
+	return nil, fmt.Errorf("OCI artifact does not contain blob %q", title)
+}
+
+func fetchOCIArtifactManifest(ctx context.Context, repo *remote.Repository, reference string) (ocispec.Manifest, error) {
+	desc, err := repo.Resolve(ctx, reference)
+	if err != nil {
+		return ocispec.Manifest{}, fmt.Errorf("resolve OCI artifact: %w", err)
+	}
+
+	return fetchOCIArtifactManifestDescriptor(ctx, repo, desc)
+}
+
+func fetchOCIArtifactManifestDescriptor(ctx context.Context, repo *remote.Repository, desc ocispec.Descriptor) (ocispec.Manifest, error) {
+	body, err := repo.Fetch(ctx, desc)
+	if err != nil {
+		return ocispec.Manifest{}, fmt.Errorf("fetch OCI artifact manifest: %w", err)
+	}
+	defer body.Close() //nolint:errcheck // best effort close
+
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return ocispec.Manifest{}, fmt.Errorf("read OCI artifact manifest: %w", err)
+	}
+
+	if desc.MediaType == ocispec.MediaTypeImageIndex {
+		return fetchOCIPlatformManifest(ctx, repo, data)
+	}
+
+	var manifest ocispec.Manifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return ocispec.Manifest{}, fmt.Errorf("decode OCI artifact manifest: %w", err)
+	}
+
+	if manifest.MediaType == ocispec.MediaTypeImageIndex {
+		return fetchOCIPlatformManifest(ctx, repo, data)
+	}
+
+	return manifest, nil
+}
+
+func fetchOCIPlatformManifest(ctx context.Context, repo *remote.Repository, data []byte) (ocispec.Manifest, error) {
+	var index ocispec.Index
+	if err := json.Unmarshal(data, &index); err != nil {
+		return ocispec.Manifest{}, fmt.Errorf("decode OCI artifact index: %w", err)
+	}
+
+	platformDesc, err := selectOCIPlatformManifest(index)
+	if err != nil {
+		return ocispec.Manifest{}, err
+	}
+
+	return fetchOCIArtifactManifestDescriptor(ctx, repo, platformDesc)
+}
+
+func selectOCIPlatformManifest(index ocispec.Index) (ocispec.Descriptor, error) {
+	available := make([]string, 0, len(index.Manifests))
+	for _, manifestDesc := range index.Manifests {
+		if manifestDesc.Platform == nil {
+			available = append(available, "<unknown>")
+			continue
+		}
+
+		platform := manifestDesc.Platform
+		available = append(available, platform.OS+"/"+platform.Architecture)
+
+		if platform.OS == runtime.GOOS && platform.Architecture == runtime.GOARCH {
+			return manifestDesc, nil
+		}
+	}
+
+	return ocispec.Descriptor{}, fmt.Errorf("OCI artifact index does not contain platform %s/%s (available: %s)", runtime.GOOS, runtime.GOARCH, strings.Join(available, ", "))
+}
+
+func openOCIRepository(parsed *url.URL) (*remote.Repository, string, error) {
+	ref := parsed.Host + parsed.Path
+
+	name, reference, err := splitOCIReference(ref)
+	if err != nil {
+		return nil, "", err
+	}
+
+	repo, err := remote.NewRepository(name)
+	if err != nil {
+		return nil, "", fmt.Errorf("parse OCI repository %q: %w", name, err)
+	}
+
+	ociutil.ConfigurePlainHTTP(repo)
+	repo.Client = &auth.Client{Client: retry.DefaultClient, Cache: auth.DefaultCache}
+
+	return repo, reference, nil
+}
+
+func splitOCIReference(ref string) (name, reference string, err error) {
+	if idx := strings.LastIndex(ref, "@"); idx != -1 {
+		return ref[:idx], ref[idx+1:], nil
+	}
+
+	lastSlash := strings.LastIndex(ref, "/")
+
+	lastColon := strings.LastIndex(ref, ":")
+	if lastColon > lastSlash && lastColon != -1 {
+		return ref[:lastColon], ref[lastColon+1:], nil
+	}
+
+	return "", "", fmt.Errorf("OCI download source %q must include a tag or digest", ref)
+}
+
+func downloadHTTP(ctx context.Context, source string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
@@ -53,25 +215,73 @@ func downloadFromRemote(ctx context.Context, url string) (io.ReadCloser, error) 
 
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close() //nolint:errcheck // body close
-		return nil, fmt.Errorf("download %q failed with status code %d", url, resp.StatusCode)
+		return nil, fmt.Errorf("download %q failed with status code %d", source, resp.StatusCode)
 	}
 
 	return resp.Body, nil
 }
 
-// ProbeRemoteHTTPObject checks that an HTTP artifact object is reachable
-// without downloading the full object. It first tries HEAD, then falls back to a
-// ranged GET for servers that do not support or incorrectly reject HEAD.
-func ProbeRemoteHTTPObject(ctx context.Context, url string) error {
-	if err := probeRemoteHTTPObject(ctx, http.MethodHead, url); err == nil {
-		return nil
+func openLocalSource(parsed *url.URL, source string) (io.ReadCloser, error) {
+	path := source
+
+	if parsed.Scheme == "file" {
+		if parsed.Host != "" && parsed.Host != "localhost" {
+			return nil, fmt.Errorf("file download source must not include host %q", parsed.Host)
+		}
+
+		path = parsed.Path
 	}
 
-	return probeRemoteHTTPObject(ctx, http.MethodGet, url)
+	if path == "" || !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("file download source must use an absolute path: %q", source)
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open file download source %q: %w", path, err)
+	}
+
+	return file, nil
 }
 
-func probeRemoteHTTPObject(ctx context.Context, method, url string) error {
-	req, err := http.NewRequestWithContext(ctx, method, url, http.NoBody)
+// ProbeRemoteHTTPObject checks that an HTTP artifact object is reachable
+// without downloading the full object. It first tries HEAD, then falls back to a
+// ranged GET for servers that do not support or incorrectly reject HEAD. It also
+// accepts local file sources for offline bootstrap artifacts.
+func ProbeRemoteHTTPObject(ctx context.Context, source string) error {
+	parsed, err := url.Parse(source)
+	if err != nil {
+		return fmt.Errorf("parse download source %q: %w", source, err)
+	}
+
+	switch parsed.Scheme {
+	case "", "file":
+		body, err := openLocalSource(parsed, source)
+		if err != nil {
+			return err
+		}
+
+		return body.Close()
+	case "http", "https":
+		if err := probeRemoteHTTPObject(ctx, http.MethodHead, source); err == nil {
+			return nil
+		}
+
+		return probeRemoteHTTPObject(ctx, http.MethodGet, source)
+	case "oci":
+		body, err := downloadOCI(ctx, parsed)
+		if err != nil {
+			return err
+		}
+
+		return body.Close()
+	default:
+		return fmt.Errorf("unsupported download source scheme %q", parsed.Scheme)
+	}
+}
+
+func probeRemoteHTTPObject(ctx context.Context, method, source string) error {
+	req, err := http.NewRequestWithContext(ctx, method, source, http.NoBody)
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP request: %w", err)
 	}

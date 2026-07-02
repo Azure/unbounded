@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"text/template"
 
 	"github.com/Azure/unbounded/internal/executil"
@@ -26,7 +28,8 @@ var assets embed.FS
 var assetsTemplate = template.Must(template.New("assets").ParseFS(assets, "assets/*"))
 
 const (
-	nvidiaRuntimeDropInName = "99-nvidia-runtime.toml"
+	nvidiaRuntimeDropInName      = "99-nvidia-runtime.toml"
+	containerImageArchiveHostDir = "/var/lib/unbounded/container-images"
 )
 
 type configureContainerd struct {
@@ -45,6 +48,10 @@ func (c *configureContainerd) Name() string { return "configure-containerd" }
 func (c *configureContainerd) Do(_ context.Context) error {
 	if err := c.ensureContainerdConfig(); err != nil {
 		return fmt.Errorf("ensure containerd config: %w", err)
+	}
+
+	if err := c.ensureContainerdPlainHTTPHosts(); err != nil {
+		return fmt.Errorf("ensure containerd plain HTTP hosts: %w", err)
 	}
 
 	if err := c.ensureContainerdServiceUnit(); err != nil {
@@ -96,6 +103,44 @@ func (c *configureContainerd) ensureContainerdServiceUnit() error {
 	return utilio.WriteFile(dest, buf.Bytes(), 0o644)
 }
 
+// ensureContainerdPlainHTTPHosts configures containerd to use HTTP for private
+// IP sandbox image registries. This matches the agent's OCI plain-HTTP behavior
+// for local bootstrap registries used in disconnected environments.
+func (c *configureContainerd) ensureContainerdPlainHTTPHosts() error {
+	registry, ok := plainHTTPRegistryHost(c.goalState.Containerd.SandboxImage)
+	if !ok {
+		return nil
+	}
+
+	content := []byte(fmt.Sprintf("server = \"http://%s\"\n\n[host.\"http://%s\"]\n  capabilities = [\"pull\", \"resolve\"]\n", registry, registry))
+	dest := filepath.Join(c.goalState.MachineDir, "/etc/containerd/certs.d", registry, "hosts.toml")
+
+	return utilio.WriteFile(dest, content, 0o644)
+}
+
+func plainHTTPRegistryHost(image string) (string, bool) {
+	registry := strings.SplitN(image, "/", 2)[0]
+	if registry == "" || !strings.ContainsAny(registry, ".:") {
+		return "", false
+	}
+
+	hostname := registry
+	if host, _, err := net.SplitHostPort(registry); err == nil {
+		hostname = host
+	}
+
+	if hostname == "localhost" {
+		return registry, true
+	}
+
+	ip := net.ParseIP(hostname)
+	if ip == nil {
+		return "", false
+	}
+
+	return registry, ip.IsLoopback() || ip.IsPrivate()
+}
+
 // ensureGPUDropInConfigs manages GPU-related containerd drop-in configs.
 // When the nvidia runtime is enabled the drop-in is written; otherwise it is
 // removed.
@@ -119,10 +164,21 @@ type startContainerd struct {
 	goalState *goalstates.NodeStart
 }
 
+type importContainerImages struct {
+	log       *slog.Logger
+	goalState *goalstates.NodeStart
+}
+
 // StartContainerd returns a task that enables and starts the containerd systemd service
 // inside the running nspawn machine.
 func StartContainerd(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
 	return &startContainerd{log: log, goalState: goalState}
+}
+
+// ImportContainerImages returns a task that preloads configured container
+// image archives into containerd.
+func ImportContainerImages(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
+	return &importContainerImages{log: log, goalState: goalState}
 }
 
 func (s *startContainerd) Name() string { return "start-containerd" }
@@ -133,6 +189,27 @@ func (s *startContainerd) Do(ctx context.Context) error {
 	); err != nil {
 		return fmt.Errorf("systemctl enable --now %s in %s: %w",
 			goalstates.SystemdUnitContainerd, s.goalState.MachineName, err)
+	}
+
+	return nil
+}
+
+func (i *importContainerImages) Name() string { return "import-container-images" }
+
+func (i *importContainerImages) Do(ctx context.Context) error {
+	for idx, archiveURL := range i.goalState.Containerd.ContainerImageArchiveURLs {
+		archivePath := filepath.Join(containerImageArchiveHostDir, fmt.Sprintf("image-%d.tar", idx))
+		hostPath := filepath.Join(i.goalState.MachineDir, strings.TrimPrefix(archivePath, "/"))
+
+		if err := utilio.DownloadToLocalFile(ctx, archiveURL, hostPath, 0o644); err != nil {
+			return fmt.Errorf("download container image archive %q: %w", archiveURL, err)
+		}
+
+		if _, err := executil.MachineRun(ctx, i.log, i.goalState.MachineName,
+			"ctr", "--namespace", "k8s.io", "images", "import", archivePath,
+		); err != nil {
+			return fmt.Errorf("import container image archive in %s: %w", i.goalState.MachineName, err)
+		}
 	}
 
 	return nil

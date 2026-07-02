@@ -23,6 +23,9 @@ Subcommands (called as individual workflow steps):
     create-vm                          Create bridge networking and launch a QEMU VM.
     ensure-kind-bridge                 Verify/repair veth pair connecting Kind to VM bridge.
     run-agent                          Build agent, generate bootstrap script, run on VM.
+    prepare-blocked-network-vm         Install host packages before blocking VM egress.
+    block-external-network             Block VM egress outside the local e2e networks.
+    unblock-external-network           Remove VM external egress block rules.
     wait-for-node                      Wait for the node to appear and become Ready.
     validate-host-nspawn-distro        Verify the nspawn machine distro matches the host.
     validate-node-config               Verify configured labels and taints reached the Node.
@@ -62,7 +65,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from threading import Thread
@@ -90,6 +93,7 @@ KIND_CLUSTER_NAME = os.environ.get("KIND_CLUSTER_NAME", "kind")
 KIND_CONTAINER = f"{KIND_CLUSTER_NAME}-control-plane"
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
+OFFLINE_BOOTSTRAP = os.environ.get("OFFLINE_BOOTSTRAP", "").lower() in ("1", "true", "yes")
 
 # Site name used when generating the bootstrap script via kubectl-unbounded.
 E2E_SITE_NAME = os.environ.get("E2E_SITE_NAME", "e2e")
@@ -123,6 +127,11 @@ NET_CONTROLLER_E2E_IMAGE = os.environ.get(
     "NET_CONTROLLER_E2E_IMAGE",
     "unbounded-net-controller:agent-e2e",
 )
+AGENT_ARTIFACTS_BUILDER = str(REPO_ROOT / "bin" / "agent-artifacts-builder")
+ORAS = str(REPO_ROOT / "bin" / "oras")
+LOCAL_ARTIFACT_REGISTRY_NAME = f"{KIND_CLUSTER_NAME}-bootstrap-artifacts-registry"
+LOCAL_ARTIFACT_REGISTRY_PORT = os.environ.get("LOCAL_ARTIFACT_REGISTRY_PORT", "5000")
+ORAS_LOGGED_IN_REGISTRIES: set[str] = set()
 
 TEST_NS = "e2e-workload-test"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
@@ -560,13 +569,29 @@ class NodeConfig:
     node_labels: dict[str, str]
     register_with_taints: list[str]
     node_ip: str = ""
+    offline_artifacts_oci_ref: str = ""
+    rootfs_oci_image: str = ""
+    sandbox_image: str = ""
+    block_external_network: bool = False
     path: str = ""
 
 
-def load_node_config(path: str | None) -> NodeConfig:
+def load_node_config(
+    path: str | None,
+    offline_artifacts_oci_ref_override: str = "",
+    offline_rootfs_oci_image_override: str = "",
+    sandbox_image_override: str = "",
+) -> NodeConfig:
     """Load a node config variant from *path*, or return the default config."""
     if not path:
-        return NodeConfig(name="default", node_labels={}, register_with_taints=[])
+        return NodeConfig(
+            name="default",
+            node_labels={},
+            register_with_taints=[],
+            offline_artifacts_oci_ref=offline_artifacts_oci_ref_override,
+            rootfs_oci_image=offline_rootfs_oci_image_override,
+            sandbox_image=sandbox_image_override,
+        )
 
     config_path = Path(path)
     if not config_path.is_absolute():
@@ -584,6 +609,10 @@ def load_node_config(path: str | None) -> NodeConfig:
     node_labels = cfg.get("nodeLabels", {})
     register_with_taints = cfg.get("registerWithTaints", [])
     node_ip = cfg.get("nodeIP", "")
+    offline_artifacts_oci_ref = offline_artifacts_oci_ref_override or cfg.get("offlineArtifactsOCIRef", "")
+    rootfs_oci_image = offline_rootfs_oci_image_override or cfg.get("offlineRootfsOCIImage", "")
+    sandbox_image = sandbox_image_override or cfg.get("sandboxImage", "")
+    block_external_network = cfg.get("blockExternalNetwork", False)
 
     if not isinstance(name, str) or not name:
         die(f"node config {config_path} field 'name' must be a non-empty string")
@@ -598,12 +627,24 @@ def load_node_config(path: str | None) -> NodeConfig:
         die(f"node config {config_path} field 'registerWithTaints' must be a list of strings")
     if not isinstance(node_ip, str):
         die(f"node config {config_path} field 'nodeIP' must be a string")
+    if not isinstance(offline_artifacts_oci_ref, str):
+        die(f"node config {config_path} field 'offlineArtifactsOCIRef' must be a string")
+    if not isinstance(rootfs_oci_image, str):
+        die(f"node config {config_path} field 'offlineRootfsOCIImage' must be a string")
+    if not isinstance(sandbox_image, str):
+        die(f"node config {config_path} field 'sandboxImage' must be a string")
+    if not isinstance(block_external_network, bool):
+        die(f"node config {config_path} field 'blockExternalNetwork' must be a boolean")
 
     return NodeConfig(
         name=name,
         node_labels=dict(node_labels),
         register_with_taints=list(register_with_taints),
         node_ip=node_ip,
+        offline_artifacts_oci_ref=offline_artifacts_oci_ref,
+        rootfs_oci_image=rootfs_oci_image,
+        sandbox_image=sandbox_image,
+        block_external_network=block_external_network,
         path=str(config_path),
     )
 
@@ -652,6 +693,10 @@ def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
         args.extend(["--node-label", f"{key}={value}"])
     for taint in expected_node_taint_strings(node_config):
         args.extend(["--register-with-taint", taint])
+    if node_config.rootfs_oci_image:
+        args.extend(["--oci-image", node_config.rootfs_oci_image])
+    if node_config.sandbox_image:
+        args.extend(["--sandbox-image", node_config.sandbox_image])
     return args
 
 
@@ -663,6 +708,10 @@ def log_active_node_config(node_config: NodeConfig) -> None:
     log(f"  node ip: {expected_node_ip(node_config) if node_config.node_ip else '<default>'}")
     log(f"  node labels: {', '.join(labels) if labels else '<none>'}")
     log(f"  register-with-taints: {', '.join(taints) if taints else '<none>'}")
+    log(f"  offline artifacts OCI ref: {node_config.offline_artifacts_oci_ref or '<none>'}")
+    log(f"  rootfs OCI image: {node_config.rootfs_oci_image or '<default>'}")
+    log(f"  sandbox image: {node_config.sandbox_image or '<default>'}")
+    log(f"  block external network: {node_config.block_external_network}")
 
 
 def _safe_name(value: str) -> str:
@@ -863,8 +912,9 @@ def restart_crashing_daemonset_pods(node_name: str, namespace: str, label: str) 
             restart_count = container_status.get("restartCount", 0)
             waiting_reason = waiting.get("reason")
             terminated_reason = terminated.get("reason")
-            if restart_count >= 2 or waiting_reason == "CrashLoopBackOff":
-                log(f"  Deleting crashing pod {pod_name} "
+            backoff_reasons = {"CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull"}
+            if restart_count >= 2 or waiting_reason in backoff_reasons:
+                log(f"  Deleting unhealthy pod {pod_name} "
                     f"(restarts={restart_count}, waiting={waiting_reason or 'none'}, "
                     f"terminated={terminated_reason or 'none'}) to reset backoff")
                 subprocess.run(
@@ -1475,6 +1525,96 @@ def create_vm() -> None:
 
 
 # ---------------------------------------------------------------------------
+# external network block
+# ---------------------------------------------------------------------------
+def _container_ips(container: str) -> list[str]:
+    """Return Docker/Podman network IPs for *container*."""
+    if shutil.which(CONTAINER_ENGINE) is None:
+        return []
+
+    result = subprocess.run(
+        [CONTAINER_ENGINE, "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", container],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return []
+
+    return [ip for ip in result.stdout.split() if ip]
+
+
+def _kind_control_plane_ips() -> list[str]:
+    """Return known control plane IPs that blocked-network VMs may reach."""
+    ips = {f"{VM_SUBNET}.2"}
+
+    if shutil.which(KUBECTL) is not None:
+        result = subprocess.run(
+            [KUBECTL, "get", "node", KIND_CONTAINER, "-o", "jsonpath={.status.addresses[?(@.type=='InternalIP')].address}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            ips.update(ip for ip in result.stdout.split() if ip)
+
+    ips.update(_container_ips(KIND_CONTAINER))
+
+    return sorted(ips)
+
+
+def _local_registry_ips() -> list[str]:
+    """Return local registry container IPs that blocked-network VMs may reach."""
+    return _container_ips(LOCAL_ARTIFACT_REGISTRY_NAME)
+
+
+def _external_network_block_rules() -> list[list[str]]:
+    """Return iptables FORWARD rules that block VM egress outside e2e networks."""
+    rules = [["-s", VM_IP, "-d", f"{VM_SUBNET}.0/24", "-j", "ACCEPT"]]
+
+    for ip in _kind_control_plane_ips() + _local_registry_ips():
+        rules.append(["-s", VM_IP, "-d", ip, "-j", "ACCEPT"])
+
+    rules.extend([
+        ["-s", VM_IP, "-p", "tcp", "--dport", "6443", "-j", "ACCEPT"],
+        ["-s", VM_IP, "-p", "tcp", "-m", "multiport", "--dports", f"{LOCAL_ARTIFACT_REGISTRY_PORT},{SERVE_PORT}", "-j", "ACCEPT"],
+        ["-s", VM_IP, "-d", "10.244.0.0/16", "-j", "ACCEPT"],
+        ["-s", VM_IP, "-d", "10.96.0.0/12", "-j", "ACCEPT"],
+        ["-s", VM_IP, "-j", "REJECT"],
+    ])
+
+    return rules
+
+
+def unblock_external_network() -> None:
+    """Remove VM external egress block rules."""
+    if shutil.which("iptables") is None:
+        return
+
+    for rule in _external_network_block_rules():
+        for _ in range(10):
+            result = run_quiet(["sudo", "iptables", "-D", "FORWARD", *rule], check=False)
+            if result.returncode != 0:
+                break
+
+
+def block_external_network() -> None:
+    """Block VM egress outside local e2e networks while keeping cluster access."""
+    log(f"Blocking external network egress from VM {VM_IP}...")
+    if shutil.which("iptables") is None:
+        die("iptables is required but not found in PATH")
+
+    unblock_external_network()
+    for rule in reversed(_external_network_block_rules()):
+        run(["sudo", "iptables", "-I", "FORWARD", "1", *rule])
+
+
+def prepare_blocked_network_vm() -> None:
+    """Install host packages that are outside the bootstrap artifact bundle."""
+    log("Preparing VM host packages before blocking external egress...")
+    ssh_cmd("sudo cloud-init status --wait || true")
+    ssh_cmd("sudo env DEBIAN_FRONTEND=noninteractive sh -c 'rm -f /var/cache/apt/pkgcache.bin /var/cache/apt/srcpkgcache.bin && apt-get update && apt-get install -y systemd-container nftables'")
+
+
+# ---------------------------------------------------------------------------
 # ensure-kind-bridge
 # ---------------------------------------------------------------------------
 VETH_HOST = "veth-kind-e2e"
@@ -1628,6 +1768,396 @@ def prepare_agent_artifacts() -> str:
     return agent_url
 
 
+def kubernetes_server_version() -> str:
+    """Return the normalized Kubernetes server version for the active cluster."""
+    version_raw = capture([KUBECTL, "version", "-o", "json"])
+    version_info = json.loads(version_raw)
+    kube_version = version_info.get("serverVersion", {}).get("gitVersion", "")
+    if not kube_version:
+        die("could not determine Kubernetes server gitVersion")
+    if not kube_version.startswith("v"):
+        kube_version = "v" + kube_version
+    return kube_version
+
+
+def prepare_offline_bootstrap_artifacts(node_config: NodeConfig) -> str:
+    """Prepare offline bootstrap artifacts and return an agent config source."""
+    oci_ref = node_config.offline_artifacts_oci_ref
+    if not OFFLINE_BOOTSTRAP and not oci_ref:
+        return ""
+
+    log("Preparing offline bootstrap artifact bundle...")
+
+    kube_version = kubernetes_server_version()
+
+    if oci_ref:
+        log(f"Using offline artifact bundle from OCI ref {oci_ref}")
+        return oci_ref
+
+    offline_dir = VM_DIR / "offline-bootstrap-artifacts" / kube_version
+    if offline_dir.exists():
+        shutil.rmtree(offline_dir)
+    offline_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    if not oci_ref:
+        log("Building agent-artifacts-builder...")
+        run(["go", "build", "-o", AGENT_ARTIFACTS_BUILDER,
+             str(REPO_ROOT / "hack" / "cmd" / "agent-artifacts-builder" / "main.go")])
+
+        manifest_path = VM_DIR / "offline-bootstrap-manifest.json"
+        manifest_path.write_text(json.dumps({
+            "versions": {
+                "kubernetes": kube_version,
+                "containerd": "2.1.8",
+                "runc": "1.5.0",
+                "cni": "1.5.1",
+                "crictl": _crictl_version_for_kubernetes(kube_version),
+            },
+        }, indent=2))
+
+        arch = "amd64"
+        log(f"Building offline artifact bundle for Kubernetes {kube_version} ({arch})...")
+        run([
+            AGENT_ARTIFACTS_BUILDER,
+            "--output-dir", str(offline_dir),
+            "--manifest", str(manifest_path),
+            "--arch", arch,
+        ])
+
+    tarball = VM_DIR / "offline-bootstrap-artifacts.tar.gz"
+    if tarball.exists():
+        tarball.unlink()
+    run(["tar", "-czf", str(tarball), "-C", str(offline_dir.parent), kube_version])
+
+    log("Copying offline artifact bundle to VM...")
+    scp_cmd(str(tarball), f"{SSH_TARGET}:/tmp/offline-bootstrap-artifacts.tar.gz")
+    ssh_cmd("sudo rm -rf /opt/unbounded/artifacts && sudo mkdir -p /opt/unbounded/artifacts")
+    ssh_cmd("sudo tar -xzf /tmp/offline-bootstrap-artifacts.tar.gz -C /opt/unbounded/artifacts")
+
+    source = f"file:///opt/unbounded/artifacts/{kube_version}"
+    log(f"Offline artifact source installed on VM: {source}")
+    return source
+
+
+def start_local_artifact_registry() -> str:
+    """Start a local OCI registry for mirrored offline bootstrap artifacts."""
+    if shutil.which(CONTAINER_ENGINE) is None:
+        die(f"{CONTAINER_ENGINE} is required but not found in PATH")
+
+    registry = f"{VM_GATEWAY}:{LOCAL_ARTIFACT_REGISTRY_PORT}"
+    run_quiet([CONTAINER_ENGINE, "rm", "-f", LOCAL_ARTIFACT_REGISTRY_NAME], check=False)
+    run([
+        CONTAINER_ENGINE,
+        "run",
+        "-d",
+        "--name",
+        LOCAL_ARTIFACT_REGISTRY_NAME,
+        "--restart",
+        "no",
+        "-p",
+        f"{registry}:5000",
+        "registry:2",
+    ])
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        result = subprocess.run(
+            ["curl", "-fsS", f"http://{registry}/v2/"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode == 0:
+            log(f"Local artifact registry is ready at {registry}")
+            return registry
+        time.sleep(1)
+
+    die(f"timed out waiting for local artifact registry at {registry}")
+
+
+def mirror_oci_refs_to_local_registry(configs: list[NodeConfig]) -> list[NodeConfig]:
+    """Mirror configured OCI refs to a local e2e registry."""
+    preload_images = cluster_preload_images() if any(cfg.block_external_network for cfg in configs) else []
+    if not any(cfg.offline_artifacts_oci_ref or cfg.rootfs_oci_image or cfg.sandbox_image for cfg in configs) and not preload_images:
+        return configs
+
+    registry = start_local_artifact_registry()
+    mirrored: dict[str, str] = {}
+    out: list[NodeConfig] = []
+
+    preload_mirrors: dict[str, str] = {}
+    for source_ref in preload_images:
+        if source_ref in mirrored:
+            continue
+
+        local_ref = local_preload_ref(registry, source_ref)
+        log(f"Mirroring cluster image {source_ref} -> {local_ref}")
+        oras_copy(source_ref, local_ref)
+        mirrored[source_ref] = local_ref
+        preload_mirrors[source_ref] = local_ref
+
+    for cfg in configs:
+        offline_ref = cfg.offline_artifacts_oci_ref
+        rootfs_ref = cfg.rootfs_oci_image
+        sandbox_ref = cfg.sandbox_image
+
+        if offline_ref:
+            source_ref = offline_ref
+            local_ref = mirrored.get(source_ref)
+            if local_ref is None:
+                local_ref = local_artifact_ref(registry, source_ref)
+                log(f"Mirroring offline artifacts {source_ref} -> {local_ref}")
+                oras_copy(source_ref, local_ref)
+                mirrored[source_ref] = local_ref
+            offline_ref = local_ref
+
+        if rootfs_ref:
+            source_ref = rootfs_ref
+            local_ref = mirrored.get(source_ref)
+            if local_ref is None:
+                local_ref = local_rootfs_ref(registry, source_ref)
+                log(f"Mirroring rootfs image {source_ref} -> {local_ref}")
+                oras_copy(source_ref, local_ref)
+                mirrored[source_ref] = local_ref
+            rootfs_ref = local_ref
+
+        if sandbox_ref:
+            source_ref = sandbox_ref
+            local_ref = mirrored.get(source_ref)
+            if local_ref is None:
+                local_ref = local_sandbox_ref(registry, source_ref)
+                log(f"Mirroring sandbox image {source_ref} -> {local_ref}")
+                oras_copy(source_ref, local_ref)
+                mirrored[source_ref] = local_ref
+            sandbox_ref = local_ref
+
+        out.append(replace(
+            cfg,
+            offline_artifacts_oci_ref=offline_ref,
+            rootfs_oci_image=rootfs_ref,
+            sandbox_image=sandbox_ref,
+        ))
+
+    return out
+
+
+def local_artifact_ref(registry: str, source_ref: str) -> str:
+    """Return the local registry ref used for a mirrored artifact bundle."""
+    _name, tag = split_tagged_oci_ref(source_ref, "offline artifact OCI ref")
+    return f"oci://{registry}/unbounded/bootstrap-artifacts:{tag}"
+
+
+def local_rootfs_ref(registry: str, source_ref: str) -> str:
+    """Return the local registry ref used for a mirrored rootfs image."""
+    name, tag = split_tagged_oci_ref(source_ref, "rootfs OCI image")
+    repo = name.split("/", 1)[1] if "/" in name else name
+    repo = re.sub(r"[^a-z0-9._/-]+", "-", repo.lower()).strip("/") or "rootfs"
+    return f"{registry}/rootfs/{repo}:{tag}"
+
+
+def local_sandbox_ref(registry: str, source_ref: str) -> str:
+    """Return the local registry ref used for a mirrored sandbox image."""
+    _name, tag = split_tagged_oci_ref(source_ref, "sandbox image")
+    return f"{registry}/sandbox/pause:{tag}"
+
+
+def local_preload_ref(registry: str, source_ref: str) -> str:
+    """Return the local registry ref used for a mirrored cluster image."""
+    name, tag = split_tagged_oci_ref(source_ref, "cluster preload image")
+    repo = re.sub(r"[^a-z0-9._/-]+", "-", name.lower()).strip("/")
+    return f"{registry}/preload/{repo}:{tag}"
+
+
+def split_tagged_oci_ref(ref: str, label: str) -> tuple[str, str]:
+    ref = ref.removeprefix("oci://")
+    last = ref.rsplit("/", 1)[-1]
+    if ":" not in last:
+        die(f"{label} must include a tag: {ref}")
+    name, tag = ref.rsplit(":", 1)
+    if not name or not tag:
+        die(f"{label} must include a non-empty image name and tag: {ref}")
+    return name, tag
+
+
+def oras_copy(source_ref: str, target_ref: str) -> None:
+    maybe_oras_login(source_ref)
+    maybe_oras_login(target_ref)
+
+    cmd = [ensure_oras(), "copy"]
+    if is_plain_http_oci_ref(source_ref):
+        cmd.append("--from-plain-http")
+    if is_plain_http_oci_ref(target_ref):
+        cmd.append("--to-plain-http")
+    cmd.extend([source_ref.removeprefix("oci://"), target_ref.removeprefix("oci://")])
+    run(cmd)
+
+
+def cluster_preload_images() -> list[str]:
+    """Return cluster DaemonSet images that blocked-network nodes must preload."""
+    result = subprocess.run(
+        [KUBECTL, "get", "daemonsets", "-n", "kube-system", "-o", "json"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        die(f"failed to list kube-system DaemonSets: {result.stderr.strip()}")
+
+    images: set[str] = set()
+    daemonsets = json.loads(result.stdout).get("items", [])
+    for daemonset in daemonsets:
+        pod_spec = daemonset.get("spec", {}).get("template", {}).get("spec", {})
+        for field in ("initContainers", "containers"):
+            for container in pod_spec.get(field, []) or []:
+                image = container.get("image", "")
+                if image:
+                    images.add(image)
+
+    return sorted(images)
+
+
+def patch_kube_system_daemonset_images(image_map: dict[str, str]) -> None:
+    """Patch kube-system DaemonSets so mirrored/preloaded images are reusable."""
+    result = subprocess.run(
+        [KUBECTL, "get", "daemonsets", "-n", "kube-system", "-o", "json"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        die(f"failed to list kube-system DaemonSets: {result.stderr.strip()}")
+
+    daemonsets = json.loads(result.stdout).get("items", [])
+    for daemonset in daemonsets:
+        name = daemonset.get("metadata", {}).get("name", "")
+        pod_spec = daemonset.get("spec", {}).get("template", {}).get("spec", {})
+        patch_spec: dict[str, Any] = {}
+        for field in ("initContainers", "containers"):
+            patched_containers = []
+            for container in pod_spec.get(field, []) or []:
+                image = container.get("image", "")
+                if image in image_map:
+                    patched_containers.append({
+                        "name": container["name"],
+                        "imagePullPolicy": "IfNotPresent",
+                    })
+            if patched_containers:
+                patch_spec[field] = patched_containers
+
+        if not patch_spec:
+            continue
+
+        log(f"Patching kube-system DaemonSet {name} to reuse preloaded images")
+        patch = {"spec": {"template": {"spec": patch_spec}}}
+        kubectl(["patch", "daemonset", name, "-n", "kube-system", "--type", "strategic", "-p", json.dumps(patch)])
+
+
+def reset_offline_daemonset_pods() -> None:
+    """Delete kube-system DaemonSet pods on the offline node to clear pull backoff."""
+    for label in ("k8s-app=kube-proxy", "app=kindnet"):
+        run_quiet([
+            KUBECTL, "delete", "pod", "-n", "kube-system",
+            "--field-selector", f"spec.nodeName={AGENT_MACHINE_NAME}",
+            "-l", label,
+            "--ignore-not-found",
+        ], check=False)
+
+
+def preload_cluster_images() -> None:
+    """Pull mirrored cluster images into the active nspawn containerd."""
+    images = cluster_preload_images()
+    if not images:
+        log("No kube-system DaemonSet images to preload")
+        return
+
+    registry = f"{VM_GATEWAY}:{LOCAL_ARTIFACT_REGISTRY_PORT}"
+    deadline = time.time() + 120
+    while True:
+        for machine in NSPAWN_MACHINE_NAMES:
+            result = ssh_capture_quiet(f"sudo machinectl show {machine}")
+            if result.returncode == 0:
+                log(f"Preloading cluster images into nspawn machine {machine}...")
+                image_map: dict[str, str] = {}
+                for source_ref in images:
+                    local_ref = source_ref if is_local_registry_ref(registry, source_ref) else local_preload_ref(registry, source_ref)
+                    image_map[source_ref] = local_ref
+                    log(f"  importing {source_ref} from {local_ref}")
+                    machine_shell(machine, f"ctr --namespace k8s.io images pull --plain-http {local_ref}")
+                    if local_ref != source_ref:
+                        machine_shell(machine, f"ctr --namespace k8s.io images tag --force {local_ref} {source_ref}")
+
+                patch_kube_system_daemonset_images(image_map)
+                reset_offline_daemonset_pods()
+                return
+
+        if time.time() >= deadline:
+            die("timed out waiting for active nspawn machine to preload cluster images")
+
+        time.sleep(5)
+
+
+def is_plain_http_oci_ref(ref: str) -> bool:
+    ref = ref.removeprefix("oci://")
+    return (
+        ref.startswith(f"{VM_GATEWAY}:{LOCAL_ARTIFACT_REGISTRY_PORT}/")
+        or ref.startswith("localhost:")
+        or ref.startswith("127.0.0.1:")
+    )
+
+
+def is_local_registry_ref(registry: str, ref: str) -> bool:
+    return ref.removeprefix("oci://").startswith(registry + "/")
+
+
+def oci_registry_host(ref: str) -> str:
+    return ref.removeprefix("oci://").split("/", 1)[0]
+
+
+def maybe_oras_login(ref: str) -> None:
+    registry = oci_registry_host(ref)
+    if registry != "ghcr.io" or registry in ORAS_LOGGED_IN_REGISTRIES:
+        return
+
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        return
+
+    log("Logging into ghcr.io for offline e2e artifact mirror...")
+    result = subprocess.run(
+        [ensure_oras(), "login", "ghcr.io", "-u", "github-actions", "--password-stdin"],
+        input=token,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        die("oras login to ghcr.io failed")
+
+    ORAS_LOGGED_IN_REGISTRIES.add(registry)
+
+
+def ensure_oras() -> str:
+    """Return an oras CLI path, installing it locally if needed."""
+    if shutil.which("oras"):
+        return "oras"
+    if Path(ORAS).exists():
+        return ORAS
+
+    log("Installing oras CLI...")
+    run(
+        ["go", "install", "oras.land/oras/cmd/oras@v1.3.0"],
+        env={**os.environ, "GOBIN": str(REPO_ROOT / "bin")},
+    )
+    if not Path(ORAS).exists():
+        die(f"oras install did not produce expected binary: {ORAS}")
+    return ORAS
+
+
+def _crictl_version_for_kubernetes(kube_version: str) -> str:
+    match = re.match(r"^v?(\d+)\.(\d+)", kube_version)
+    if not match:
+        die(f"invalid Kubernetes version for crictl derivation: {kube_version}")
+    return f"{match.group(1)}.{match.group(2)}.0"
+
+
+
 def _make_handler(directory: str) -> type:
     """Create a SimpleHTTPRequestHandler bound to *directory*."""
     class Handler(SimpleHTTPRequestHandler):
@@ -1699,12 +2229,29 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     if not local_api_server:
         die("Could not determine local API server URL from kubeconfig")
 
+    # Wait for cloud-init and verify connectivity before preparing optional
+    # offline artifacts because preparing them copies files to the VM.
+    log("Waiting for cloud-init to complete on VM...")
+    subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, "sudo cloud-init status --wait"],
+                    check=False)
+
+    log("Verifying VM can reach agent download URL...")
+    ssh_cmd(f"curl -fsSL --connect-timeout 10 -o /dev/null {agent_url}")
+
+    log("Verifying VM can reach Kind API server...")
+    ssh_cmd(f"curl -fsSk --connect-timeout 10 {api_server}/healthz")
+
+    offline_source = prepare_offline_bootstrap_artifacts(node_config)
+
     bootstrap_args = [
         KUBECTL_UNBOUNDED, "machine", "manual-bootstrap",
         AGENT_MACHINE_NAME,
         "--site", E2E_SITE_NAME,
         *node_config_bootstrap_args(node_config),
     ]
+    if offline_source:
+        bootstrap_args.extend(["--offline-artifacts-source", offline_source])
+
     bootstrap_script = capture(bootstrap_args)
 
     # The kubeconfig uses a localhost address that is not reachable from the VM.
@@ -1736,17 +2283,6 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     bootstrap_script = bootstrap_preflight_script
     bootstrap_script_path.write_text(bootstrap_script)
 
-    # Wait for cloud-init and verify connectivity
-    log("Waiting for cloud-init to complete on VM...")
-    subprocess.run(["ssh", *SSH_OPTS, SSH_TARGET, "sudo cloud-init status --wait"],
-                    check=False)
-
-    log("Verifying VM can reach agent download URL...")
-    ssh_cmd(f"curl -fsSL --connect-timeout 10 -o /dev/null {agent_url}")
-
-    log("Verifying VM can reach Kind API server...")
-    ssh_cmd(f"curl -fsSk --connect-timeout 10 {api_server}/healthz")
-
     # Copy bootstrap script to VM and execute it.
     log("Copying bootstrap script to VM...")
     scp_cmd(str(bootstrap_script_path), f"{SSH_TARGET}:/tmp/bootstrap.sh")
@@ -1769,13 +2305,11 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
 # ---------------------------------------------------------------------------
 # wait-for-node
 # ---------------------------------------------------------------------------
-def wait_for_node() -> None:
-    """Wait for the agent node to appear and become Ready."""
+def wait_for_node_registered() -> None:
+    """Wait for the agent node object to appear."""
 
     node_timeout = int(os.environ.get("NODE_TIMEOUT", "300"))
-    ready_timeout = int(os.environ.get("READY_TIMEOUT", "720"))
 
-    # Wait for node to appear
     log(f"Waiting for node '{AGENT_MACHINE_NAME}' to appear (timeout: {node_timeout}s)...")
     elapsed = 0
     while elapsed < node_timeout:
@@ -1785,16 +2319,23 @@ def wait_for_node() -> None:
         )
         if ret.returncode == 0:
             log(f"Node '{AGENT_MACHINE_NAME}' appeared after {elapsed}s")
-            break
+            return
         if elapsed > 0 and elapsed % 30 == 0:
             log(f"  ({elapsed}s) Node not yet visible...")
         time.sleep(5)
         elapsed += 5
-    else:
-        log("Current nodes:")
-        subprocess.run([KUBECTL, "get", "nodes", "-o", "wide"], check=False)
-        die(f"Timed out waiting for node '{AGENT_MACHINE_NAME}' after {node_timeout}s")
 
+    log("Current nodes:")
+    subprocess.run([KUBECTL, "get", "nodes", "-o", "wide"], check=False)
+    die(f"Timed out waiting for node '{AGENT_MACHINE_NAME}' after {node_timeout}s")
+
+
+def wait_for_node() -> None:
+    """Wait for the agent node to appear and become Ready."""
+
+    ready_timeout = int(os.environ.get("READY_TIMEOUT", "720"))
+
+    wait_for_node_registered()
     wait_for_node_ready(AGENT_MACHINE_NAME, ready_timeout)
 
     log("============================================")
@@ -1842,11 +2383,66 @@ def validate_node_config(node_config: NodeConfig) -> None:
     log_active_node_config(node_config)
     node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
     _assert_expected_node_config(node, node_config)
+    validate_offline_bootstrap_config(node_config)
 
     log("============================================")
     log("  Node config validation PASSED")
     log("============================================")
     kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
+
+
+def validate_offline_bootstrap_config(node_config: NodeConfig) -> None:
+    """Verify an offline scenario persisted and staged offline artifacts."""
+    if not node_config.offline_artifacts_oci_ref:
+        return
+
+    log("Validating offline bootstrap agent config...")
+    expected_source = json.dumps(node_config.offline_artifacts_oci_ref)
+    ssh_cmd(f"""
+sudo python3 - <<'PY'
+import json
+import pathlib
+import sys
+
+expected_source = {expected_source}
+paths = sorted(pathlib.Path("/tmp").glob("unbounded-agent-config.*.json"))
+paths.append(pathlib.Path("/etc/unbounded/agent/config.json"))
+for config_path in paths:
+    if not config_path.exists():
+        continue
+    cfg = json.loads(config_path.read_text())
+    offline = cfg.get("OfflineArtifacts") or {{}}
+    source = offline.get("Source", "")
+    if source == expected_source:
+        if "Downloads" in cfg:
+            sys.exit("Downloads must not be present when OfflineArtifacts is configured")
+        print(f"OfflineArtifacts.Source verified in {{config_path}}: {{source}}")
+        break
+else:
+    sys.exit(f"OfflineArtifacts.Source {{expected_source!r}} not found in bootstrap config files")
+PY
+""")
+
+    validate_local_registry_served_offline_artifacts(node_config.offline_artifacts_oci_ref)
+
+
+def validate_local_registry_served_offline_artifacts(oci_ref: str) -> None:
+    """Verify the local registry served offline artifact blobs."""
+    if shutil.which(CONTAINER_ENGINE) is None:
+        die(f"{CONTAINER_ENGINE} is required but not found in PATH")
+
+    ref = oci_ref.removeprefix("oci://")
+    registry, rest = ref.split("/", 1)
+    if registry != f"{VM_GATEWAY}:{LOCAL_ARTIFACT_REGISTRY_PORT}":
+        die(f"offline artifact ref {oci_ref!r} does not use the local e2e registry")
+
+    repository = rest.rsplit(":", 1)[0]
+    logs = capture([CONTAINER_ENGINE, "logs", LOCAL_ARTIFACT_REGISTRY_NAME])
+    marker = f"GET /v2/{repository}/blobs/sha256:"
+    if marker not in logs:
+        die(f"local registry logs do not show offline artifact blob GETs for {repository}")
+
+    log(f"Local registry served offline artifacts for {repository}")
 
 
 def _run_scenario_command(command: str, node_config: NodeConfig, env: dict[str, str]) -> None:
@@ -1855,6 +2451,12 @@ def _run_scenario_command(command: str, node_config: NodeConfig, env: dict[str, 
         args.append("--verbose")
     if node_config.path:
         args.extend(["--node-config", node_config.path])
+    if node_config.offline_artifacts_oci_ref:
+        args.extend(["--offline-artifacts-oci-ref", node_config.offline_artifacts_oci_ref])
+    if node_config.rootfs_oci_image:
+        args.extend(["--offline-rootfs-oci-image", node_config.rootfs_oci_image])
+    if node_config.sandbox_image:
+        args.extend(["--sandbox-image", node_config.sandbox_image])
     args.append(command)
 
     child_env = {**os.environ, **env}
@@ -1867,23 +2469,60 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
     env["AGENT_URL"] = agent_url
 
     log(f"Starting agent config scenario {name!r} on {env['VM_NAME']} ({env['VM_IP']})")
+    _run_scenario_command("launch-vm", node_config, env)
+    if node_config.block_external_network:
+        _run_scenario_command("prepare-blocked-network-vm", node_config, env)
+        _run_scenario_command("block-external-network", node_config, env)
+
+    _run_scenario_command("run-agent", node_config, env)
+    if node_config.block_external_network:
+        _run_scenario_command("preload-cluster-images", node_config, env)
+
+    wait_command = "wait-for-node-registered" if node_config.block_external_network else "wait-for-node"
     for command in (
-        "launch-vm",
-        "run-agent",
-        "wait-for-node",
+        wait_command,
         "validate-node-config",
         "dump-persisted-agent-config",
         "validate-machine-cr-created",
-        "validate-workload",
-        "validate-node-repave-upgrade",
     ):
         _run_scenario_command(command, node_config, env)
+
+    if node_config.block_external_network:
+        log(f"Skipping workload and repave validation for blocked-network scenario {name!r}")
+    else:
+        for command in (
+            "validate-workload",
+            "validate-node-repave-upgrade",
+        ):
+            _run_scenario_command(command, node_config, env)
+
     log(f"Agent config scenario {name!r} passed")
+
+
+def patch_kind_control_plane_node_ip() -> None:
+    """Advertise the Kind control plane IP reachable from e2e VMs."""
+    patch = [
+        {
+            "op": "replace",
+            "path": "/status/addresses",
+            "value": [
+                {"type": "InternalIP", "address": f"{VM_SUBNET}.2"},
+                {"type": "Hostname", "address": KIND_CONTAINER},
+            ],
+        },
+    ]
+    run_quiet([
+        KUBECTL, "patch", "node", KIND_CONTAINER,
+        "--subresource", "status",
+        "--type", "json",
+        "-p", json.dumps(patch),
+    ], check=False)
 
 
 def validate_node_config_scenarios() -> None:
     """Discover node config scenarios and validate them in parallel."""
-    configs = discover_node_configs()
+    patch_kind_control_plane_node_ip()
+    configs = mirror_oci_refs_to_local_registry(discover_node_configs())
     agent_url = prepare_agent_artifacts()
 
     log(f"Starting HTTP file server on {VM_GATEWAY}:{SERVE_PORT}...")
@@ -1894,27 +2533,50 @@ def validate_node_config_scenarios() -> None:
     log(f"Agent download URL: {agent_url}")
 
     failures: list[str] = []
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(configs)) as executor:
+
+    def record_failure(name: str, exc: Exception) -> None:
+        if isinstance(exc, subprocess.CalledProcessError):
+            failures.append(f"{name}: {exc.cmd} exited with {exc.returncode}")
+        else:
+            failures.append(f"{name}: {exc}")
+
+    def run_parallel(scenarios: list[tuple[int, NodeConfig]]) -> None:
+        if not scenarios:
+            return
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(scenarios)) as executor:
             futures = {
                 executor.submit(_validate_node_config_scenario, cfg, index, agent_url): cfg.name
-                for index, cfg in enumerate(configs)
+                for index, cfg in scenarios
             }
             for future in concurrent.futures.as_completed(futures):
                 name = futures[future]
                 try:
                     future.result()
-                except subprocess.CalledProcessError as exc:
-                    failures.append(f"{name}: {exc.cmd} exited with {exc.returncode}")
                 except Exception as exc:
-                    failures.append(f"{name}: {exc}")
+                    record_failure(name, exc)
+
+    try:
+        indexed_configs = list(enumerate(configs))
+        run_parallel([(index, cfg) for index, cfg in indexed_configs if not cfg.block_external_network])
+        if not failures:
+            for index, cfg in indexed_configs:
+                if not cfg.block_external_network:
+                    continue
+                try:
+                    _validate_node_config_scenario(cfg, index, agent_url)
+                except Exception as exc:
+                    record_failure(cfg.name, exc)
     finally:
         httpd.shutdown()
 
     if failures:
         die("agent config scenario validation failed: " + "; ".join(failures))
 
-    validate_kube_proxy()
+    if any(cfg.block_external_network for cfg in configs):
+        log("Skipping final kube-proxy validation because blocked-network scenarios may stay NotReady")
+    else:
+        validate_kube_proxy()
 
 
 # ---------------------------------------------------------------------------
@@ -3090,6 +3752,9 @@ def collect_logs() -> None:
 def cleanup() -> None:
     """Tear down VM, networking, and Kind cluster."""
 
+    if shutil.which(CONTAINER_ENGINE):
+        run_quiet([CONTAINER_ENGINE, "rm", "-f", LOCAL_ARTIFACT_REGISTRY_NAME], check=False)
+
     # Stop QEMU VM
     _stop_qemu()
     if os.environ.get("COLLECT_NODE_CONFIG_LOGS", "").lower() == "true" or VM_NAME == "agent-config-e2e":
@@ -3099,6 +3764,7 @@ def cleanup() -> None:
 
     # Remove networking
     log("Cleaning up networking...")
+    unblock_external_network()
     run_quiet(["sudo", "ip", "link", "del", TAP_NAME], check=False)
     if VM_NAME == "agent-config-e2e":
         for index, _cfg in enumerate(discover_node_configs()):
@@ -3167,11 +3833,16 @@ COMMANDS: dict[str, Command] = {
     "collect-logs": _without_node_config(collect_logs),
     "create-vm-bridge": _without_node_config(create_vm_bridge),
     "create-vm": _without_node_config(create_vm),
+    "prepare-blocked-network-vm": _without_node_config(prepare_blocked_network_vm),
+    "block-external-network": _without_node_config(block_external_network),
+    "unblock-external-network": _without_node_config(unblock_external_network),
+    "preload-cluster-images": _without_node_config(preload_cluster_images),
     "ensure-kind-bridge": _without_node_config(ensure_kind_bridge),
     "dump-persisted-agent-config": _without_node_config(dump_persisted_agent_config),
     "launch-vm": _without_node_config(launch_vm),
     "run-agent": run_agent,
     "wait-for-node": _without_node_config(wait_for_node),
+    "wait-for-node-registered": _without_node_config(wait_for_node_registered),
     "validate-host-nspawn-distro": _without_node_config(validate_host_nspawn_distro),
     "validate-node-config": validate_node_config,
     "validate-kube-proxy": _without_node_config(validate_kube_proxy),
@@ -3215,9 +3886,29 @@ def main() -> None:
         default="",
         help="Path to a JSON node config variant file",
     )
+    parser.add_argument(
+        "--offline-artifacts-oci-ref",
+        default="",
+        help="Override offlineArtifactsOCIRef from the node config JSON",
+    )
+    parser.add_argument(
+        "--offline-rootfs-oci-image",
+        default="",
+        help="Override offlineRootfsOCIImage from the node config JSON",
+    )
+    parser.add_argument(
+        "--sandbox-image",
+        default="",
+        help="Override sandboxImage from the node config JSON",
+    )
     args = parser.parse_args()
     VERBOSE = args.verbose
-    node_config = load_node_config(args.node_config)
+    node_config = load_node_config(
+        args.node_config,
+        offline_artifacts_oci_ref_override=args.offline_artifacts_oci_ref,
+        offline_rootfs_oci_image_override=args.offline_rootfs_oci_image,
+        sandbox_image_override=args.sandbox_image,
+    )
 
     COMMANDS[args.command](node_config)
 

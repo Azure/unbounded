@@ -29,7 +29,7 @@ func TestCheckHostPackagesMissingPackageManager(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.lookupPath = lookupPathWith(nil)
 
-	results := checkHostPackages(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkHostPackages(slog.New(slog.DiscardHandler), false, deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Contains(t, results[0].Message, "apt-get")
@@ -38,19 +38,21 @@ func TestCheckHostPackagesMissingPackageManager(t *testing.T) {
 func TestCheckHostPackagesListsMissingPackages(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.lookupPath = lookupPathWith(map[string]bool{"apt-get": true})
-	deps.detectPackageManager = func(func(string) (string, error)) (*hostPackageManager, error) {
-		return &hostPackageManager{
-			name:             "apt-get",
-			requiredPackages: []string{"systemd-container"},
-			installed: func(context.Context, *slog.Logger, string) bool {
-				return false
-			},
-		}, nil
-	}
 
-	results := checkHostPackages(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkHostPackages(slog.New(slog.DiscardHandler), false, deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
+	assert.Contains(t, results[0].Message, "systemd-container")
+}
+
+func TestCheckHostPackagesBlocksMissingPackagesWhenOfflineArtifactsConfigured(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	deps.lookupPath = lookupPathWith(map[string]bool{"apt-get": true})
+
+	results := checkHostPackages(slog.New(slog.DiscardHandler), true, deps).Check(context.Background())
+
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, "OfflineArtifacts")
 	assert.Contains(t, results[0].Message, "systemd-container")
 }
 

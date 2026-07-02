@@ -7,24 +7,30 @@ import "path/filepath"
 
 // Containerd describes the containerd configuration goal state.
 type Containerd struct {
-	SandboxImage      string
-	ContainerdBinPath string
-	RuncBinaryPath    string
-	CNIBinDir         string
-	CNIConfDir        string
-	MetricsAddress    string
-	NvidiaRuntime     NvidiaRuntime
+	SandboxImage              string
+	ContainerImageArchiveURLs []string
+	ContainerdBinPath         string
+	RuncBinaryPath            string
+	CNIBinDir                 string
+	CNIConfDir                string
+	MetricsAddress            string
+	NvidiaRuntime             NvidiaRuntime
 }
 
 // ResolveContainerd returns the containerd configuration goal state.
-func ResolveContainerd() Containerd {
+func ResolveContainerd(sandboxImage string, containerImageArchiveURLs []string) Containerd {
+	if sandboxImage == "" {
+		sandboxImage = SandboxImage
+	}
+
 	return Containerd{
-		SandboxImage:      SandboxImage,
-		ContainerdBinPath: filepath.Join("/"+BinDir, "containerd"),
-		RuncBinaryPath:    filepath.Join("/"+BinDir, "runc"),
-		CNIBinDir:         CNIBinDir,
-		CNIConfDir:        CNIConfigDir,
-		MetricsAddress:    ContainerdMetricsAddress,
-		NvidiaRuntime:     resolveNvidiaRuntime(),
+		SandboxImage:              sandboxImage,
+		ContainerImageArchiveURLs: containerImageArchiveURLs,
+		ContainerdBinPath:         filepath.Join("/"+BinDir, "containerd"),
+		RuncBinaryPath:            filepath.Join("/"+BinDir, "runc"),
+		CNIBinDir:                 CNIBinDir,
+		CNIConfDir:                CNIConfigDir,
+		MetricsAddress:            ContainerdMetricsAddress,
+		NvidiaRuntime:             resolveNvidiaRuntime(),
 	}
 }

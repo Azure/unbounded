@@ -11,6 +11,10 @@ inputs:
     description: Whether to launch the default e2e VM.
     required: false
     default: "true"
+  node-image:
+    description: Kind node image.
+    required: false
+    default: kindest/node:v1.33.1
 runs:
   using: composite
   steps:
@@ -39,6 +43,7 @@ runs:
       with:
         cluster_name: ${{ inputs['cluster-name'] }}
         version: v0.29.0
+        node_image: ${{ inputs['node-image'] }}
 
     - name: Configure Kind cluster networking for VM
       shell: bash

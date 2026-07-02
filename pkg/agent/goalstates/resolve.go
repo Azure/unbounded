@@ -36,6 +36,15 @@ type MachineGoalState struct {
 // resolves the complete goal state for the named nspawn machine from an agent
 // config.
 func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
+	downloads, sandboxImage, err := ResolveBootstrapDownloads(cfg, downloads)
+	if err != nil {
+		return nil, fmt.Errorf("resolve bootstrap artifact sources: %w", err)
+	}
+
+	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
+		return nil, err
+	}
+
 	kernel, err := hostKernel()
 	if err != nil {
 		return nil, fmt.Errorf("get host kernel: %w", err)
@@ -44,10 +53,6 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	hostname, err := os.Hostname()
 	if err != nil {
 		return nil, fmt.Errorf("get host hostname: %w", err)
-	}
-
-	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
-		return nil, err
 	}
 
 	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
@@ -104,12 +109,20 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		HostDevices:       DiscoverHostDevices(cfg.AdditionalHostDevices),
 	}
 
+	containerImageArchiveURLs := []string(nil)
+	if downloads != nil {
+		containerImageArchiveURLs = make([]string, 0, len(downloads.ContainerImageArchives))
+		for _, archive := range downloads.ContainerImageArchives {
+			containerImageArchiveURLs = append(containerImageArchiveURLs, fmt.Sprintf(archive.URL, rootFS.HostArch))
+		}
+	}
+
 	nodeStart := &NodeStart{
 		MachineName:     machineName,
 		KubeMachineName: cfg.MachineName,
 		NodeName:        cfg.NodeName,
 		MachineDir:      filepath.Join("/var/lib/machines", machineName),
-		Containerd:      ResolveContainerd(),
+		Containerd:      ResolveContainerd(sandboxImage, containerImageArchiveURLs),
 		Kubelet:         kubelet,
 		Nvidia:          nvidia,
 	}
