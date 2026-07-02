@@ -2,8 +2,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 #
-# smoke-stable.sh - Functional end-to-end smoke test for an Orca deploy
-# on an integration cluster (real Azure Blob origin + Garage cachestore).
+# smoke-integration.sh - Functional end-to-end smoke test for an Orca
+# deploy on an integration cluster (real Azure Blob origin + Garage
+# cachestore).
 #
 # It generates a large random object, uploads it to the Azure origin
 # container, then fetches it through Orca's edge twice:
@@ -23,7 +24,7 @@
 # Requires: kubectl, az (Azure CLI), curl, dd, and a SHA-256 tool
 # (sha256sum, shasum, or openssl).
 #
-# Usage: smoke-stable.sh [flags]
+# Usage: smoke-integration.sh [flags]
 #
 #   --context CTX        kubectl context to target (default: current)
 #   --namespace NS       namespace Orca is deployed in (default: unbounded-kube)
