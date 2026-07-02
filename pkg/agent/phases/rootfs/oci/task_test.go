@@ -127,3 +127,70 @@ func TestMaxOCIPullRetryDelay(t *testing.T) {
 		t.Fatalf("maxOCIPullRetryDelay() = %v, want %v", got, want)
 	}
 }
+
+func TestParseOCILayoutReference(t *testing.T) {
+	tests := []struct {
+		name       string
+		image      string
+		wantLayout string
+		wantTag    string
+		wantOK     bool
+		wantErr    bool
+	}{
+		{
+			name:       "tagged layout",
+			image:      "oci-layout:///opt/unbounded/images/agent-ubuntu2404:v20260619",
+			wantLayout: "/opt/unbounded/images/agent-ubuntu2404",
+			wantTag:    "v20260619",
+			wantOK:     true,
+		},
+		{
+			name:       "default latest",
+			image:      "oci-layout:///opt/unbounded/images/agent-ubuntu2404",
+			wantLayout: "/opt/unbounded/images/agent-ubuntu2404",
+			wantTag:    "latest",
+			wantOK:     true,
+		},
+		{
+			name:   "not layout",
+			image:  "ghcr.io/azure/agent-ubuntu2404:v20260619",
+			wantOK: false,
+		},
+		{
+			name:    "missing source",
+			image:   "oci-layout://",
+			wantOK:  true,
+			wantErr: true,
+		},
+		{
+			name:    "empty tag",
+			image:   "oci-layout:///opt/unbounded/images/agent-ubuntu2404:",
+			wantOK:  true,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotLayout, gotTag, gotOK, err := parseOCILayoutReference(tt.image)
+			if gotOK != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", gotOK, tt.wantOK)
+			}
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("err = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if gotLayout != tt.wantLayout {
+				t.Fatalf("layout = %q, want %q", gotLayout, tt.wantLayout)
+			}
+			if gotTag != tt.wantTag {
+				t.Fatalf("tag = %q, want %q", gotTag, tt.wantTag)
+			}
+		})
+	}
+}

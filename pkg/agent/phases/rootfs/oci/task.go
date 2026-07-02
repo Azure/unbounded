@@ -27,6 +27,7 @@ import (
 )
 
 const (
+	ociLayoutScheme    = "oci-layout://"
 	ociPullMaxAttempts = 5
 	ociPullRetryDelay  = 2 * time.Second
 )
@@ -64,6 +65,30 @@ func (d *downloadRootFS) Do(ctx context.Context) error {
 
 	if !empty {
 		d.log.Warn("machine directory is not empty, skipping rootfs bootstrap", slog.String("dir", d.machineDir))
+		return nil
+	}
+
+	if layoutDir, tag, ok, err := parseOCILayoutReference(d.ociImage); ok || err != nil {
+		if err != nil {
+			return fmt.Errorf("parse OCI layout reference %q: %w", d.ociImage, err)
+		}
+
+		d.log.Info("using local OCI layout image",
+			slog.String("image", d.ociImage),
+			slog.String("layout", layoutDir),
+			slog.String("dest", d.machineDir))
+
+		if err := os.MkdirAll(d.machineDir, 0o755); err != nil {
+			return fmt.Errorf("create machine directory: %w", err)
+		}
+
+		if err := unpackOCILayout(ctx, d.log, d.hostArch, layoutDir, tag, d.machineDir); err != nil {
+			return fmt.Errorf("unpack OCI layout image: %w", err)
+		}
+
+		d.log.Info("OCI image extraction complete",
+			slog.String("dest", d.machineDir))
+
 		return nil
 	}
 
@@ -237,6 +262,23 @@ func maxOCIPullRetryDelay() time.Duration {
 // CheckImageReachable validates that an OCI image manifest can be resolved
 // without pulling layers or writing durable state.
 func CheckImageReachable(ctx context.Context, image string) error {
+	if layoutDir, tag, ok, err := parseOCILayoutReference(image); ok || err != nil {
+		if err != nil {
+			return fmt.Errorf("parse OCI layout reference: %w", err)
+		}
+
+		store, err := oci.New(layoutDir)
+		if err != nil {
+			return fmt.Errorf("open OCI layout: %w", err)
+		}
+
+		if _, err := store.Resolve(ctx, tag); err != nil {
+			return fmt.Errorf("resolve OCI layout image manifest: %w", err)
+		}
+
+		return nil
+	}
+
 	ref, tag, err := parseImageReference(image)
 	if err != nil {
 		return fmt.Errorf("parse image reference: %w", err)
@@ -252,6 +294,30 @@ func CheckImageReachable(ctx context.Context, image string) error {
 	}
 
 	return nil
+}
+
+func parseOCILayoutReference(image string) (layoutDir, tag string, ok bool, err error) {
+	if !strings.HasPrefix(image, ociLayoutScheme) {
+		return "", "", false, nil
+	}
+
+	source := strings.TrimPrefix(image, ociLayoutScheme)
+	if source == "" {
+		return "", "", true, fmt.Errorf("empty OCI layout reference")
+	}
+
+	lastSlash := strings.LastIndex(source, "/")
+	lastColon := strings.LastIndex(source, ":")
+	if lastColon > lastSlash {
+		layoutDir = source[:lastColon]
+		tag = source[lastColon+1:]
+		if layoutDir == "" || tag == "" {
+			return "", "", true, fmt.Errorf("invalid OCI layout reference")
+		}
+		return layoutDir, tag, true, nil
+	}
+
+	return source, "latest", true, nil
 }
 
 // parseImageReference splits an OCI image reference like
