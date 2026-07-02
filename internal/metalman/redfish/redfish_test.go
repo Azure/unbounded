@@ -1234,10 +1234,13 @@ func TestUEFIHTTPBootEndToEnd(t *testing.T) {
 	defer cancel()
 
 	serverErr := make(chan error, 1)
+
 	go func() { serverErr <- httpServer.Start(ctx) }()
+
 	waitForHTTPHealth(t, serveURL+"/healthz")
 
 	reconciler := &Reconciler{Client: fc, Pool: NewPool(), FileResolver: &resolver}
+
 	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-http-e2e", Namespace: "default"}})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -1267,6 +1270,7 @@ func TestUEFIHTTPBootEndToEnd(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1284,6 +1288,7 @@ func TestUEFIHTTPBootEndToEnd(t *testing.T) {
 	}
 
 	cancel()
+
 	if err := <-serverErr; err != nil {
 		t.Fatalf("HTTP server returned error: %v", err)
 	}
@@ -2133,6 +2138,7 @@ func waitForHTTPHealth(t *testing.T, healthURL string) {
 		resp, err := http.Get(healthURL)
 		if err == nil {
 			resp.Body.Close()
+
 			if resp.StatusCode == http.StatusOK {
 				return
 			}

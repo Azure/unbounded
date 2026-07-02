@@ -671,13 +671,6 @@ func (r *recordingStatusRecorder) bootImageWrittenEvents() []string {
 	return append([]string(nil), r.bootImageWritten...)
 }
 
-func (r *recordingStatusRecorder) bootLoaderEvents() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	return append([]string(nil), r.bootLoader...)
-}
-
 func (r *recordingStatusRecorder) cloudInitDoneEvents() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
