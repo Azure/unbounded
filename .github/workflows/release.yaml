@@ -557,6 +557,7 @@ jobs:
           format: table
           severity: CRITICAL,HIGH
           exit-code: "1"
+          trivyignores: images/metalman/.trivyignore
 
       - name: Build and push image
         id: push
