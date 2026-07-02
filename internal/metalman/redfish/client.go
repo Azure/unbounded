@@ -69,6 +69,11 @@ type BootConfig struct {
 	UefiHTTPSource string
 }
 
+// SecureBootConfig holds the current UEFI Secure Boot configuration.
+type SecureBootConfig struct {
+	Enabled bool
+}
+
 // Client provides Redfish operations against a single BMC.
 // Created via Pool.Get or Dial. Must be closed when no longer needed.
 type Client struct {
@@ -236,6 +241,56 @@ func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error 
 
 	if !isSuccessStatus(status) {
 		return fmt.Errorf("unexpected status %d from UEFI HTTP boot override PATCH", status)
+	}
+
+	return nil
+}
+
+// GetSecureBootConfig returns the current UEFI Secure Boot configuration.
+// Returns ErrUnsupported if the BMC does not expose the SecureBoot resource.
+func (c *Client) GetSecureBootConfig(ctx context.Context) (SecureBootConfig, error) {
+	path := fmt.Sprintf("/redfish/v1/Systems/%s/SecureBoot", c.deviceID)
+
+	data, status, err := c.session.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return SecureBootConfig{}, err
+	}
+
+	if isUnsupportedStatus(status) {
+		return SecureBootConfig{}, fmt.Errorf("SecureBoot GET returned %d: %w", status, ErrUnsupported)
+	}
+
+	if status != http.StatusOK {
+		return SecureBootConfig{}, fmt.Errorf("unexpected status %d from %s: %s", status, path, data)
+	}
+
+	var result struct {
+		SecureBootEnable bool `json:"SecureBootEnable"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return SecureBootConfig{}, fmt.Errorf("parsing SecureBoot config: %w", err)
+	}
+
+	return SecureBootConfig{Enabled: result.SecureBootEnable}, nil
+}
+
+// SetSecureBootEnabled sets UEFI Secure Boot to the requested state.
+// Returns ErrUnsupported if the BMC does not support the PATCH.
+func (c *Client) SetSecureBootEnabled(ctx context.Context, enabled bool) error {
+	path := fmt.Sprintf("/redfish/v1/Systems/%s/SecureBoot", c.deviceID)
+	body := map[string]bool{"SecureBootEnable": enabled}
+
+	_, status, err := c.session.do(ctx, http.MethodPatch, path, body)
+	if err != nil {
+		return err
+	}
+
+	if isUnsupportedStatus(status) {
+		return fmt.Errorf("SecureBoot PATCH returned %d: %w", status, ErrUnsupported)
+	}
+
+	if !isSuccessStatus(status) {
+		return fmt.Errorf("unexpected status %d from SecureBoot PATCH", status)
 	}
 
 	return nil

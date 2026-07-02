@@ -964,8 +964,10 @@ func TestBootOrderConfigPxeOff(t *testing.T) {
 
 func TestBootOrderConfigUEFIHTTPOn(t *testing.T) {
 	var (
-		patchCalls atomic.Int64
-		patchBody  map[string]any
+		bootPatchCalls       atomic.Int64
+		bootPatchBody        map[string]any
+		secureBootPatchCalls atomic.Int64
+		secureBootPatchBody  map[string]any
 	)
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -989,8 +991,16 @@ func TestBootOrderConfigUEFIHTTPOn(t *testing.T) {
 			})
 
 		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			patchCalls.Add(1)
-			json.NewDecoder(r.Body).Decode(&patchBody)
+			bootPatchCalls.Add(1)
+			json.NewDecoder(r.Body).Decode(&bootPatchBody)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			json.NewEncoder(w).Encode(map[string]any{"SecureBootEnable": false})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			secureBootPatchCalls.Add(1)
+			json.NewDecoder(r.Body).Decode(&secureBootPatchBody)
 			w.WriteHeader(http.StatusOK)
 
 		case strings.Contains(r.URL.Path, "/TrustedComponents"):
@@ -1051,11 +1061,19 @@ func TestBootOrderConfigUEFIHTTPOn(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	if patchCalls.Load() != 1 {
-		t.Fatalf("expected 1 PATCH call, got %d", patchCalls.Load())
+	if secureBootPatchCalls.Load() != 1 {
+		t.Fatalf("expected 1 SecureBoot PATCH call, got %d", secureBootPatchCalls.Load())
 	}
 
-	boot, ok := patchBody["Boot"].(map[string]any)
+	if secureBootPatchBody["SecureBootEnable"] != true {
+		t.Fatalf("expected SecureBootEnable=true, got %v", secureBootPatchBody["SecureBootEnable"])
+	}
+
+	if bootPatchCalls.Load() != 1 {
+		t.Fatalf("expected 1 boot PATCH call, got %d", bootPatchCalls.Load())
+	}
+
+	boot, ok := bootPatchBody["Boot"].(map[string]any)
 	if !ok {
 		t.Fatal("expected Boot in PATCH body")
 	}
@@ -1099,6 +1117,13 @@ func TestBootOrderConfigUEFIHTTPNoOp(t *testing.T) {
 			})
 
 		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			json.NewEncoder(w).Encode(map[string]any{"SecureBootEnable": true})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
 			patchCalls.Add(1)
 			w.WriteHeader(http.StatusOK)
 
@@ -1152,8 +1177,100 @@ func TestBootOrderConfigUEFIHTTPNoOp(t *testing.T) {
 	}
 }
 
+func TestBootOrderConfigUEFIHTTPDisablesSecureBoot(t *testing.T) {
+	var (
+		bootPatchCalls       atomic.Int64
+		secureBootPatchCalls atomic.Int64
+		secureBootPatchBody  map[string]any
+	)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "UefiHttp",
+					"BootSourceOverrideEnabled": "Once",
+					"BootSourceOverrideMode":    "UEFI",
+					"HttpBootUri":               "http://10.0.0.10:8880/shimx64.efi",
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			bootPatchCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			json.NewEncoder(w).Encode(map[string]any{"SecureBootEnable": true})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			secureBootPatchCalls.Add(1)
+			json.NewDecoder(r.Body).Decode(&secureBootPatchBody)
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"}, Data: map[string][]byte{"password": []byte("secret")}}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-http-insecure", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:                     "ghcr.io/test/test-image:v1",
+				BootProtocol:              v1alpha3.PXEBootProtocolHTTP,
+				InsecureDisableSecureBoot: true,
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp}},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, secret).WithStatusSubresource(node).Build()
+	reconciler := &Reconciler{
+		Client: fc,
+		Pool:   NewPool(),
+		FileResolver: &netboot.FileResolver{
+			Cache:    setupRedfishOCICache(t, "ghcr.io/test/test-image:v1", "httpredfishinsecure123", "httpBootPath: shimx64.efi\n"),
+			ServeURL: "http://10.0.0.10:8880",
+		},
+	}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-http-insecure", Namespace: "default"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if secureBootPatchCalls.Load() != 1 {
+		t.Fatalf("expected 1 SecureBoot PATCH call, got %d", secureBootPatchCalls.Load())
+	}
+
+	if secureBootPatchBody["SecureBootEnable"] != false {
+		t.Fatalf("expected SecureBootEnable=false, got %v", secureBootPatchBody["SecureBootEnable"])
+	}
+
+	if bootPatchCalls.Load() != 0 {
+		t.Fatalf("expected no boot PATCH call, got %d", bootPatchCalls.Load())
+	}
+}
+
 func TestUEFIHTTPBootEndToEnd(t *testing.T) {
-	var patchBody map[string]any
+	var bootPatchBody map[string]any
 
 	bmc := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !testSessionAuth(w, r) {
@@ -1174,7 +1291,13 @@ func TestUEFIHTTPBootEndToEnd(t *testing.T) {
 			})
 
 		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewDecoder(r.Body).Decode(&patchBody)
+			json.NewDecoder(r.Body).Decode(&bootPatchBody)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			json.NewEncoder(w).Encode(map[string]any{"SecureBootEnable": true})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
 			w.WriteHeader(http.StatusOK)
 
 		case strings.Contains(r.URL.Path, "/TrustedComponents"):
@@ -1246,7 +1369,7 @@ func TestUEFIHTTPBootEndToEnd(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	boot, ok := patchBody["Boot"].(map[string]any)
+	boot, ok := bootPatchBody["Boot"].(map[string]any)
 	if !ok {
 		t.Fatal("expected Boot in Redfish PATCH body")
 	}

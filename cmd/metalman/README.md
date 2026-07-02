@@ -189,6 +189,9 @@ spec:
     image: ghcr.io/azure/host-ubuntu2404:v1
     # Defaults to PXE. Set to HTTP to use Redfish UEFI HTTP boot.
     bootProtocol: PXE
+    # HTTP boot enables UEFI Secure Boot by default. Set this only when
+    # the target image or firmware cannot boot with Secure Boot enabled.
+    insecureDisableSecureBoot: false
     dhcpLeases:
     - mac: "aa:bb:cc:dd:ee:01"
       ipv4: "10.0.0.11"
@@ -200,6 +203,13 @@ This is enough for the DHCP server to issue a lease and for TFTP/HTTP to serve
 boot artifacts from the default netboot image. Set `spec.pxe.netbootImage` only
 when a Machine needs a non-default PXE boot environment. The node must be
 manually PXE-booted (or have PXE as its default boot option).
+
+When `spec.pxe.bootProtocol` is `HTTP`, Metalman uses Redfish UEFI HTTP boot and
+reconciles the BMC SecureBoot resource before the repave. Secure Boot is enabled
+by default. Set `spec.pxe.insecureDisableSecureBoot: true` to actively reconcile
+`SecureBootEnable` to `false`. The default netboot image serves signed shim
+artifacts via `metadata.yaml:httpBootPath`; custom netboot images should set
+`httpBootPath` to their signed HTTP bootloader path.
 
 #### BMC
 

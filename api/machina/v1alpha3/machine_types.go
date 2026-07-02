@@ -300,6 +300,11 @@ type PXESpec struct {
 	// +optional
 	BootProtocol string `json:"bootProtocol,omitempty"`
 
+	// InsecureDisableSecureBoot disables UEFI Secure Boot when using HTTP
+	// boot. By default, metalman enables Secure Boot for HTTP boot repaves.
+	// +optional
+	InsecureDisableSecureBoot bool `json:"insecureDisableSecureBoot,omitempty"`
+
 	// DHCPLeases defines static DHCP leases for PXE booting.
 	// +optional
 	DHCPLeases []DHCPLease `json:"dhcpLeases,omitempty"`

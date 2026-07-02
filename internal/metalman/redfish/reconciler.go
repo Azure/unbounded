@@ -197,6 +197,11 @@ func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, m
 				return err
 			}
 
+			desiredSecureBoot := !machine.Spec.PXE.InsecureDisableSecureBoot
+			if err := reconcileSecureBoot(ctx, log, c, desiredSecureBoot); err != nil {
+				return err
+			}
+
 			if config.Target == BootTargetUefiHTTP && config.Enabled == BootOnce && config.Mode == BootModeUEFI && config.UefiHTTPSource == bootURL {
 				return nil // Already set to one-time UEFI HTTP boot.
 			}
@@ -223,6 +228,21 @@ func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, m
 	log.Info("disabling boot source override", "currentTarget", config.Target, "currentEnabled", config.Enabled)
 
 	return c.DisableBootOverride(ctx)
+}
+
+func reconcileSecureBoot(ctx context.Context, log *slog.Logger, c *Client, desired bool) error {
+	config, err := c.GetSecureBootConfig(ctx)
+	if err != nil {
+		return err
+	}
+
+	if config.Enabled == desired {
+		return nil
+	}
+
+	log.Info("setting Secure Boot state", "currentEnabled", config.Enabled, "desiredEnabled", desired)
+
+	return c.SetSecureBootEnabled(ctx, desired)
 }
 
 func (r *Reconciler) httpBootURL(machine *v1alpha3.Machine) (string, error) {

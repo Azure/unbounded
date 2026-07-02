@@ -400,6 +400,11 @@ spec:
                       The image must contain /disk/disk.img.gz.
                       Example: "ghcr.io/azure/host-ubuntu2404:v1"
                     type: string
+                  insecureDisableSecureBoot:
+                    description: |-
+                      InsecureDisableSecureBoot disables UEFI Secure Boot when using HTTP
+                      boot. By default, metalman enables Secure Boot for HTTP boot repaves.
+                    type: boolean
                   netbootImage:
                     description: |-
                       NetbootImage is an OCI image reference containing the PXE boot
