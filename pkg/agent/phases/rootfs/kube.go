@@ -12,23 +12,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Masterminds/semver/v3"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-)
-
-const (
-	// kubernetesDefaultBaseURL is the upstream base URL for Kubernetes
-	// binary releases. Mirrors must preserve the <base>/v<ver>/bin/linux/<arch>/
-	// layout used by dl.k8s.io.
-	kubernetesDefaultBaseURL = "https://dl.k8s.io"
-
-	// criToolsDefaultBaseURL is the upstream base URL for cri-tools releases.
-	criToolsDefaultBaseURL = "https://github.com/kubernetes-sigs/cri-tools/releases/download"
 )
 
 // requiredKubeBinaries lists the Kubernetes binaries that must be present for a valid installation.
@@ -232,41 +222,18 @@ func resolveCrictlVersion(override *goalstates.DownloadSource, kubernetesVersion
 // crictlVersionForKubernetesVersion returns the cri-tools version for the Kubernetes major.minor release.
 // cri-tools releases are published as v<major>.<minor>.0.
 func crictlVersionForKubernetesVersion(kubernetesVersion string) (string, error) {
-	version, err := semver.NewVersion(strings.TrimSpace(kubernetesVersion))
-	if err != nil {
-		return "", fmt.Errorf("parse kubernetes version %q: %w", kubernetesVersion, err)
-	}
-
-	return fmt.Sprintf("%d.%d.0", version.Major(), version.Minor()), nil
+	return agentartifacts.CrictlVersionForKubernetesVersion(kubernetesVersion)
 }
 
 // kubernetesBinaryURL resolves the download URL for a kubernetes binary
 // (kubelet, kubectl, kube-proxy) honoring the optional override.
 func kubernetesBinaryURL(override *goalstates.DownloadSource, version, arch, binary string) string {
-	if override != nil && override.URL != "" {
-		return fmt.Sprintf(override.URL, version, arch, binary)
-	}
-
-	base := kubernetesDefaultBaseURL
-	if override != nil && override.BaseURL != "" {
-		base = strings.TrimRight(override.BaseURL, "/")
-	}
-
-	return fmt.Sprintf("%s/v%s/bin/linux/%s/%s", base, version, arch, binary)
+	return agentartifacts.KubernetesBinary(override, version, arch, binary)
 }
 
 // crictlDownloadURL resolves the cri-tools crictl tarball URL honoring
 // the optional override. Mirrors must publish assets under the same
 // <base>/v<ver>/<asset> layout as GitHub releases.
 func crictlDownloadURL(override *goalstates.DownloadSource, version, hostOS, hostArch string) string {
-	if override != nil && override.URL != "" {
-		return fmt.Sprintf(override.URL, version, version, hostOS, hostArch)
-	}
-
-	base := criToolsDefaultBaseURL
-	if override != nil && override.BaseURL != "" {
-		base = strings.TrimRight(override.BaseURL, "/")
-	}
-
-	return fmt.Sprintf("%s/v%s/crictl-v%s-%s-%s.tar.gz", base, version, version, hostOS, hostArch)
+	return agentartifacts.CrictlArchive(override, version, hostOS, hostArch)
 }

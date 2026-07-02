@@ -390,7 +390,9 @@ resolved artifact source = <resolved-offline-source>#<component-prefixed-offline
 
 The component-prefixed offline artifact path becomes the OCI blob title selector, using versions from `manifest.json`. The OCI artifact must also contain a blob titled `manifest.json`.
 
-The agent should resolve and fetch the OCI artifact manifest once per resolved `OfflineArtifacts.Source` and cache its descriptor map for the provisioning run. Each binary artifact is fetched as an individual blob selected by title. The agent should not copy or download the entire OCI artifact bundle for each binary.
+Published OCI bundles should use a single tag per Kubernetes version and an OCI image index to distinguish host architectures. Each platform manifest in the index should set `platform.os` to `linux` and `platform.architecture` to the supported host architecture, for example `amd64` or `arm64`. The agent should select the platform manifest matching `RootFS.HostArch` before building the title-to-descriptor map.
+
+The agent should resolve and fetch the OCI artifact manifest once per resolved `OfflineArtifacts.Source` and selected platform, then cache its descriptor map for the provisioning run. Each binary artifact is fetched as an individual blob selected by title. The agent should not copy or download the entire OCI artifact bundle for each binary.
 
 With this config:
 
@@ -402,7 +404,7 @@ With this config:
 }
 ```
 
-the OCI artifact should contain blobs titled like:
+the selected `linux/amd64` platform manifest should contain blobs titled like:
 
 ```text
 manifest.json
@@ -499,6 +501,8 @@ Each bundle should contain:
 - Kubernetes binaries and `.sha256` files for the declared Kubernetes version.
 - `containerd`, `runc`, CNI plugin, and `crictl` artifacts for the versions declared in `manifest.json`.
 - Artifacts for each supported host architecture.
+
+OCI bundles should be published as multi-platform OCI indexes under the single Kubernetes-versioned tag. Each index entry points to a platform-specific artifact manifest, and each platform-specific manifest contains only that architecture's blobs plus `manifest.json`. For example, pulling `--platform linux/amd64` should return only `amd64` binaries and pulling `--platform linux/arm64` should return only `arm64` binaries. The tag remains architecture-neutral.
 
 The bundle should use one OCI blob per target artifact, not one tarball containing all artifacts. This lets the agent fetch only the artifacts it needs and allows registries to deduplicate unchanged blobs across bundle tags.
 

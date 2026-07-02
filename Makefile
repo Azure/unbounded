@@ -15,6 +15,9 @@ CONTAINER_REGISTRY ?= ghcr.io/azure
 FORGE_BIN=bin/forge
 FORGE_CMD=./hack/cmd/forge
 
+AGENT_ARTIFACTS_BUILDER_BIN=bin/agent-artifacts-builder
+AGENT_ARTIFACTS_BUILDER_CMD=./hack/cmd/agent-artifacts-builder
+
 INVENTORY_AGENT_BIN=bin/inventory-agent
 INVENTORY_AGENT_CMD=./cmd/inventory/inventory-agent
 
@@ -209,7 +212,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -244,6 +247,8 @@ help: ## Show this help
 	@echo "Build:"
 	@echo "  kubectl-unbounded                Build kubectl-unbounded plugin"
 	@echo "  forge                            Build forge dev tool"
+	@echo "  agent-artifacts-builder          Build offline agent artifacts builder"
+	@echo "  agent-artifacts-builder-build    Build offline agent artifacts builder without test"
 	@echo "  orcadev                          Build orcadev dev/debug tool"
 	@echo "  inventory-all                    Build all inventory components"
 	@echo "  inventory-agent                  Build inventory-agent for amd64 and arm64"
@@ -488,6 +493,11 @@ kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded p
 
 forge: test ## Build the forge dev tool (implies test)
 	$(GOBUILD) -o $(FORGE_BIN) $(FORGE_CMD)/main.go
+
+agent-artifacts-builder-build: ## Build the offline agent artifacts builder (no lint/test)
+	$(GOBUILD) -o $(AGENT_ARTIFACTS_BUILDER_BIN) $(AGENT_ARTIFACTS_BUILDER_CMD)/main.go
+
+agent-artifacts-builder: test agent-artifacts-builder-build ## Build the offline agent artifacts builder (implies test)
 
 ORCADEV_BIN=bin/orcadev
 ORCADEV_CMD=./hack/cmd/orcadev
