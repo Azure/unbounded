@@ -55,37 +55,6 @@ func TestResolveMachineUsesAgentConfigOfflineArtifacts(t *testing.T) {
 	require.Contains(t, got.NodeStart.Containerd.ContainerImageArchiveURLs[0], "file://")
 }
 
-func TestResolveBootstrapDownloadsUsesAgentConfigOfflineArtifacts(t *testing.T) {
-	root := writeGoalStateOfflineBundle(t, OfflineArtifactManifest{
-		Versions: OfflineArtifactVersions{
-			Kubernetes: "v1.34.2",
-			Containerd: "2.1.8",
-			Runc:       "1.5.0",
-			CNI:        "1.5.1",
-			Crictl:     "1.34.0",
-		},
-		ContainerImages: []string{SandboxImage, KubeProxyImage("v1.34.2")},
-	})
-
-	downloads, sandboxImage, err := ResolveBootstrapDownloads(&config.AgentConfig{
-		Cluster: config.AgentClusterConfig{Version: "1.34.2"},
-		OfflineArtifacts: &config.AgentOfflineArtifacts{
-			Source: root,
-		},
-	}, &DownloadOverrides{
-		Runc: &DownloadSource{BaseURL: "https://ignored.example.test/runc"},
-	})
-
-	require.NoError(t, err)
-	require.NotNil(t, downloads)
-	require.Empty(t, sandboxImage)
-	require.Equal(t, "1.5.0", downloads.Runc.Version)
-	require.Contains(t, downloads.Runc.URL, "file://")
-	require.Contains(t, downloads.Runc.URL, "/runc/v%s/runc.%s")
-	require.NotContains(t, downloads.Runc.URL, "ignored")
-	require.Len(t, downloads.ContainerImageArchives, 2)
-}
-
 func writeGoalStateOfflineBundle(t *testing.T, manifest OfflineArtifactManifest) string {
 	t.Helper()
 

@@ -61,28 +61,6 @@ type ResolvedOfflineArtifacts struct {
 	Manifest   OfflineArtifactManifest
 }
 
-// ResolveBootstrapDownloads returns rootfs binary download sources for the
-// agent config. OfflineArtifacts, when configured, is a complete artifact set
-// and takes precedence over the explicit download overrides. The returned
-// sandbox image is the sandbox image configured directly on AgentConfig, if any.
-func ResolveBootstrapDownloads(cfg *config.AgentConfig, downloads *DownloadOverrides) (*DownloadOverrides, string, error) {
-	if cfg == nil {
-		return downloads, "", nil
-	}
-
-	sandboxImage := cfg.CRI.Containerd.SandboxImage
-	if cfg.OfflineArtifacts != nil && strings.TrimSpace(cfg.OfflineArtifacts.Source) != "" {
-		resolved, err := ResolveOfflineArtifacts(cfg, cfg.OfflineArtifacts)
-		if err != nil {
-			return nil, "", err
-		}
-
-		return DownloadOverridesFromOfflineArtifacts(resolved.SourceRoot, resolved.Manifest), sandboxImage, nil
-	}
-
-	return downloads, sandboxImage, nil
-}
-
 func ResolveOfflineArtifacts(cfg *config.AgentConfig, offline *config.AgentOfflineArtifacts) (*ResolvedOfflineArtifacts, error) {
 	if offline == nil || strings.TrimSpace(offline.Source) == "" {
 		return nil, errors.New("OfflineArtifacts.Source is required")
@@ -309,7 +287,7 @@ func verifyOCIArtifacts(sourceRoot string, paths []string) error {
 	return errors.Join(errs...)
 }
 
-func DownloadOverridesFromOfflineArtifacts(sourceRoot string, manifest OfflineArtifactManifest) *DownloadOverrides {
+func downloadOverridesFromOfflineArtifacts(sourceRoot string, manifest OfflineArtifactManifest) *DownloadOverrides {
 	rootURL := offlineArtifactURLRoot(sourceRoot)
 
 	separator := "/"
@@ -340,13 +318,23 @@ func DownloadOverridesFromOfflineArtifacts(sourceRoot string, manifest OfflineAr
 		},
 	}
 
-	for _, imageTag := range manifest.ContainerImages {
-		overrides.ContainerImageArchives = append(overrides.ContainerImageArchives, DownloadSource{
-			URL: rootURL + separator + offlineContainerImageArchivePath("%s", imageTag),
-		})
+	return overrides
+}
+
+func containerImageArchiveURLsFromOfflineArtifacts(sourceRoot string, manifest OfflineArtifactManifest, arch string) []string {
+	rootURL := offlineArtifactURLRoot(sourceRoot)
+
+	separator := "/"
+	if strings.HasPrefix(sourceRoot, "oci://") {
+		separator = "#"
 	}
 
-	return overrides
+	urls := make([]string, 0, len(manifest.ContainerImages))
+	for _, imageTag := range manifest.ContainerImages {
+		urls = append(urls, rootURL+separator+offlineContainerImageArchivePath(arch, imageTag))
+	}
+
+	return urls
 }
 
 func offlineArtifactURLRoot(sourceRoot string) string {

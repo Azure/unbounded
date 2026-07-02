@@ -36,9 +36,18 @@ type MachineGoalState struct {
 // resolves the complete goal state for the named nspawn machine from an agent
 // config.
 func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
-	downloads, sandboxImage, err := ResolveBootstrapDownloads(cfg, downloads)
-	if err != nil {
-		return nil, fmt.Errorf("resolve bootstrap artifact sources: %w", err)
+	sandboxImage := cfg.CRI.Containerd.SandboxImage
+
+	var offlineArtifacts *ResolvedOfflineArtifacts
+
+	if cfg.OfflineArtifacts != nil && strings.TrimSpace(cfg.OfflineArtifacts.Source) != "" {
+		resolved, err := ResolveOfflineArtifacts(cfg, cfg.OfflineArtifacts)
+		if err != nil {
+			return nil, fmt.Errorf("resolve bootstrap artifact sources: %w", err)
+		}
+
+		offlineArtifacts = resolved
+		downloads = downloadOverridesFromOfflineArtifacts(resolved.SourceRoot, resolved.Manifest)
 	}
 
 	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
@@ -110,11 +119,12 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	}
 
 	containerImageArchiveURLs := []string(nil)
-	if downloads != nil {
-		containerImageArchiveURLs = make([]string, 0, len(downloads.ContainerImageArchives))
-		for _, archive := range downloads.ContainerImageArchives {
-			containerImageArchiveURLs = append(containerImageArchiveURLs, fmt.Sprintf(archive.URL, rootFS.HostArch))
-		}
+	if offlineArtifacts != nil {
+		containerImageArchiveURLs = containerImageArchiveURLsFromOfflineArtifacts(
+			offlineArtifacts.SourceRoot,
+			offlineArtifacts.Manifest,
+			rootFS.HostArch,
+		)
 	}
 
 	nodeStart := &NodeStart{

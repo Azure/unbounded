@@ -17,7 +17,7 @@ import (
 	"github.com/Azure/unbounded/internal/agentartifacts"
 )
 
-func TestResolveBootstrapDownloadsOfflineArtifacts(t *testing.T) {
+func TestResolveOfflineArtifacts(t *testing.T) {
 	root := writeOfflineBundle(t, agentartifacts.Manifest{
 		Versions: agentartifacts.Versions{
 			Kubernetes: "v1.34.2",
@@ -29,26 +29,14 @@ func TestResolveBootstrapDownloadsOfflineArtifacts(t *testing.T) {
 		ContainerImages: []string{"mcr.microsoft.com/oss/kubernetes/pause:3.9"},
 	})
 
-	cfg := &UnboundedAgentConfig{
-		AgentConfig: AgentConfig{
-			Cluster:          AgentClusterConfig{Version: "1.34.2"},
-			OfflineArtifacts: &AgentOfflineArtifacts{Source: root},
-		},
-		Downloads: &AgentDownloads{
-			Runc: &AgentDownloadSource{BaseURL: "https://ignored.example.com/runc"},
-		},
-	}
-
-	downloads, err := ResolveBootstrapDownloads(cfg)
+	resolved, err := ResolveOfflineArtifacts(
+		&AgentConfig{Cluster: AgentClusterConfig{Version: "1.34.2"}},
+		&AgentOfflineArtifacts{Source: root},
+	)
 	require.NoError(t, err)
-	require.NotNil(t, downloads)
-	require.NotNil(t, downloads.Runc)
-	require.Equal(t, "1.5.0", downloads.Runc.Version)
-	require.Contains(t, downloads.Runc.URL, "file://")
-	require.Contains(t, downloads.Runc.URL, "/runc/v%s/runc.%s")
-	require.NotContains(t, downloads.Runc.URL, "ignored")
-	require.Empty(t, cfg.CRI.Containerd.SandboxImage)
-	require.Len(t, downloads.ContainerImageArchives, 1)
+	require.Equal(t, root, resolved.SourceRoot)
+	require.Equal(t, "v1.34.2", resolved.Manifest.Versions.Kubernetes)
+	require.Equal(t, []string{"mcr.microsoft.com/oss/kubernetes/pause:3.9"}, resolved.Manifest.ContainerImages)
 }
 
 func TestResolveOfflineArtifactsRendersStrictTemplate(t *testing.T) {

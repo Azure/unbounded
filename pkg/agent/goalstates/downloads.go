@@ -18,9 +18,6 @@ type DownloadOverrides struct {
 	CNI *DownloadSource
 	// Crictl overrides the source for the crictl release tarball.
 	Crictl *DownloadSource
-	// ContainerImageArchives points to optional container image archive files to
-	// import into the node containerd before kubelet starts.
-	ContainerImageArchives []DownloadSource
 }
 
 // DownloadSource configures the override for a single binary download.
