@@ -168,6 +168,10 @@ var nvidiaArchMap = map[string]nvidiaArch{
 // Returns nil (not an error) when no NVIDIA devices are found; the host
 // simply does not have NVIDIA GPUs or the driver is not loaded.
 func discoverNVIDIADevices() []string {
+	return discoverNVIDIADevicesFrom(devDir, nvidiaCapsDir, driDir)
+}
+
+func discoverNVIDIADevicesFrom(devDir, nvidiaCapsDir, driDir string) []string {
 	var devices []string
 
 	entries, err := os.ReadDir(devDir)

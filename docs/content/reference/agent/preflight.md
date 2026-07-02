@@ -172,7 +172,7 @@ The `nvidia-driver` check can return multiple results with different targets:
 | `NVIDIA PCI hardware` | OK | NVIDIA PCI devices were detected. |
 | `NVIDIA PCI driver` | Error or warning | NVIDIA PCI devices are bound to the `nvidia` kernel driver. Device nodes without matching PCI hardware are reported as a warning. |
 | `NVIDIA kernel modules` | Error or warning | Required modules are loaded: `nvidia`, `nvidia_modeset`, `nvidia_uvm`, and `nvidia_drm`. Missing modules are errors. An unknown module version is a warning. |
-| `NVIDIA device nodes` | Error or warning | Required device nodes exist, including `/dev/nvidiactl`, `/dev/nvidia-uvm`, and at least one `/dev/nvidia<N>` GPU node. Missing required nodes are errors. Missing UVM tools, capability, or DRI render nodes are warnings. |
+| `NVIDIA device nodes` | Error or warning | Required device nodes exist, including `/dev/nvidiactl`, `/dev/nvidia-modeset`, `/dev/nvidia-uvm`, and at least one `/dev/nvidia<N>` GPU node. Missing required nodes are errors. Missing UVM tools, capability, or DRI render nodes are warnings. |
 | `NVIDIA driver libraries` | Error | `ldconfig` can discover required host driver libraries for the host architecture, including `libcuda.so.1` and `libnvidia-ml.so.1`. |
 | `NVIDIA diagnostic tooling` | Error or warning | `nvidia-smi -L` can query GPUs. Missing `nvidia-smi` is a warning. A failed or empty query is an error. |
 | `NVIDIA persistence service` | Warning | `nvidia-persistence-mode.service` is installed and active when systemd is available. |

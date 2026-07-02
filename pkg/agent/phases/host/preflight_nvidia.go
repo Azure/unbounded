@@ -36,7 +36,7 @@ const (
 
 var (
 	nvidiaRequiredModules = []string{"nvidia", "nvidia_modeset", "nvidia_uvm", "nvidia_drm"}
-	nvidiaRequiredNodes   = []string{"nvidiactl", "nvidia-uvm"}
+	nvidiaRequiredNodes   = []string{"nvidiactl", "nvidia-modeset", "nvidia-uvm"}
 	nvidiaRequiredLibs    = []string{"libcuda.so.1", "libnvidia-ml.so.1"}
 	nvidiaGPUDeviceRE     = regexp.MustCompile(`^nvidia[0-9]+$`)
 )

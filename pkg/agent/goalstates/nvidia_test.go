@@ -4,6 +4,9 @@
 package goalstates
 
 import (
+	"os"
+	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -178,5 +181,43 @@ func Test_buildNVIDIALibMounts_Empty(t *testing.T) {
 
 	if mounts != nil {
 		t.Errorf("buildNVIDIALibMounts(nil) returned non-nil mounts")
+	}
+}
+
+func TestDiscoverNVIDIADevicesIncludesModeset(t *testing.T) {
+	root := t.TempDir()
+	devDir := filepath.Join(root, "dev")
+	capsDir := filepath.Join(devDir, "nvidia-caps")
+	driDir := filepath.Join(devDir, "dri")
+
+	for _, dir := range []string{devDir, capsDir, driDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, path := range []string{
+		filepath.Join(devDir, "nvidia0"),
+		filepath.Join(devDir, "nvidiactl"),
+		filepath.Join(devDir, "nvidia-modeset"),
+		filepath.Join(capsDir, "nvidia-cap1"),
+		filepath.Join(driDir, "renderD128"),
+	} {
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	devices := discoverNVIDIADevicesFrom(devDir, capsDir, driDir)
+	for _, want := range []string{
+		filepath.Join(devDir, "nvidia-modeset"),
+		filepath.Join(devDir, "nvidia0"),
+		filepath.Join(devDir, "nvidiactl"),
+		filepath.Join(capsDir, "nvidia-cap1"),
+		filepath.Join(driDir, "renderD128"),
+	} {
+		if !slices.Contains(devices, want) {
+			t.Fatalf("discoverNVIDIADevicesFrom() = %#v, want %q", devices, want)
+		}
 	}
 }

@@ -118,6 +118,28 @@ func TestServiceOverride_AMDGPUDevices(t *testing.T) {
 	require.Contains(t, nspawnBuf.String(), "BindReadOnly=/sys/class/kfd")
 }
 
+func TestNSpawnConfig_NvidiaModesetDevice(t *testing.T) {
+	t.Parallel()
+
+	devices := []string{"/dev/nvidia0", "/dev/nvidiactl", "/dev/nvidia-modeset", "/dev/nvidia-uvm"}
+
+	var nspawnBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
+		BPFFSMountPath:       goalstates.BPFFSMountPath("kube1"),
+		NvidiaGPUDevicePaths: devices,
+	}))
+
+	var overrideBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", nspawnTemplateData{
+		MachineName:          "kube1",
+		BPFFSMountPath:       goalstates.BPFFSMountPath("kube1"),
+		NvidiaGPUDevicePaths: devices,
+	}))
+
+	require.Contains(t, nspawnBuf.String(), "Bind=/dev/nvidia-modeset")
+	require.Contains(t, overrideBuf.String(), "DeviceAllow=/dev/nvidia-modeset rwm")
+}
+
 func TestPathsExcluding(t *testing.T) {
 	t.Parallel()
 

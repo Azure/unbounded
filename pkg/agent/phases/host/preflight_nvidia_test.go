@@ -62,6 +62,7 @@ func TestCheckNvidiaDriverAvailable(t *testing.T) {
 	for _, name := range []string{
 		"nvidiactl",
 		"nvidia0",
+		"nvidia-modeset",
 		"nvidia-uvm",
 		"nvidia-uvm-tools",
 	} {
