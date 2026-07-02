@@ -237,6 +237,17 @@ func TestHostDevices_Paths_MergesDedupesSorts(t *testing.T) {
 	require.Equal(t, want, d.Paths())
 }
 
+func TestDiscoverHostDevices_Additional(t *testing.T) {
+	t.Parallel()
+
+	additional := []string{"/dev/uinput"}
+
+	got := DiscoverHostDevices(additional)
+
+	require.Equal(t, additional, got.Additional)
+	require.Contains(t, got.Paths(), "/dev/uinput")
+}
+
 func TestHostDevices_Paths_Empty(t *testing.T) {
 	t.Parallel()
 

@@ -90,7 +90,7 @@ func (d HostDevices) Paths() []string {
 // DiscoverHostDevices probes the host for device nodes that should be
 // bind-mounted into the nspawn container, grouped by category. Repeated calls
 // produce the same output because each group is returned in a stable order.
-func DiscoverHostDevices() HostDevices {
+func DiscoverHostDevices(additional []string) HostDevices {
 	var devices HostDevices
 
 	if p := discoverKVMDevicePath(kvmDevicePath); p != "" {
@@ -100,6 +100,7 @@ func DiscoverHostDevices() HostDevices {
 	devices.Network = discoverExistingDevicePaths(tunDevicePath, vhostNetDevicePath)
 	devices.Block = discoverBlockDevicePaths(sysClassBlockDir, devDir)
 	devices.Infiniband = discoverInfinibandDevicePaths(infinibandDir, rdmaCMMiscDevPath, true)
+	devices.Additional = additional
 
 	return devices
 }

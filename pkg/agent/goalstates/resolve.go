@@ -79,9 +79,6 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		cniVersion = CNIPluginVersion
 	}
 
-	hostDevices := DiscoverHostDevices()
-	hostDevices.Additional = cfg.AdditionalHostDevices
-
 	rootFS := &RootFS{
 		MachineDir: filepath.Join("/var/lib/machines", machineName),
 		NSpawnConfigFile: filepath.Join(
@@ -104,7 +101,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		OCIImage:          ociImage,
 		Nvidia:            nvidia,
 		AMD:               amd,
-		HostDevices:       hostDevices,
+		HostDevices:       DiscoverHostDevices(cfg.AdditionalHostDevices),
 	}
 
 	nodeStart := &NodeStart{
