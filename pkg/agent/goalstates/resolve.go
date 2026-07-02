@@ -41,7 +41,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	var offlineArtifacts *ResolvedOfflineArtifacts
 
 	if cfg.OfflineArtifacts != nil && strings.TrimSpace(cfg.OfflineArtifacts.Source) != "" {
-		resolved, err := ResolveOfflineArtifacts(cfg, cfg.OfflineArtifacts)
+		resolved, err := resolveOfflineArtifacts(cfg, cfg.OfflineArtifacts)
 		if err != nil {
 			return nil, fmt.Errorf("resolve bootstrap artifact sources: %w", err)
 		}

@@ -61,7 +61,7 @@ type ResolvedOfflineArtifacts struct {
 	Manifest   OfflineArtifactManifest
 }
 
-func ResolveOfflineArtifacts(cfg *config.AgentConfig, offline *config.AgentOfflineArtifacts) (*ResolvedOfflineArtifacts, error) {
+func resolveOfflineArtifacts(cfg *config.AgentConfig, offline *config.AgentOfflineArtifacts) (*ResolvedOfflineArtifacts, error) {
 	if offline == nil || strings.TrimSpace(offline.Source) == "" {
 		return nil, errors.New("OfflineArtifacts.Source is required")
 	}

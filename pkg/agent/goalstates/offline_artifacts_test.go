@@ -55,10 +55,103 @@ func TestResolveMachineUsesAgentConfigOfflineArtifacts(t *testing.T) {
 	require.Contains(t, got.NodeStart.Containerd.ContainerImageArchiveURLs[0], "file://")
 }
 
+func TestResolveOfflineArtifacts(t *testing.T) {
+	root := writeGoalStateOfflineBundle(t, OfflineArtifactManifest{
+		Versions: OfflineArtifactVersions{
+			Kubernetes: "v1.34.2",
+			Containerd: "2.1.8",
+			Runc:       "1.5.0",
+			CNI:        "1.5.1",
+			Crictl:     "1.34.0",
+		},
+		ContainerImages: []string{"mcr.microsoft.com/oss/kubernetes/pause:3.9"},
+	})
+
+	resolved, err := resolveOfflineArtifacts(
+		&config.AgentConfig{Cluster: config.AgentClusterConfig{Version: "1.34.2"}},
+		&config.AgentOfflineArtifacts{Source: root},
+	)
+	require.NoError(t, err)
+	require.Equal(t, root, resolved.SourceRoot)
+	require.Equal(t, "v1.34.2", resolved.Manifest.Versions.Kubernetes)
+	require.Equal(t, []string{"mcr.microsoft.com/oss/kubernetes/pause:3.9"}, resolved.Manifest.ContainerImages)
+}
+
+func TestResolveOfflineArtifactsRendersStrictTemplate(t *testing.T) {
+	root := writeGoalStateOfflineBundle(t, OfflineArtifactManifest{Versions: OfflineArtifactVersions{
+		Kubernetes: "v1.34.2",
+		Containerd: "2.1.8",
+		Runc:       "1.5.0",
+		CNI:        "1.5.1",
+		Crictl:     "1.34.0",
+	}})
+	parent := filepath.Dir(root)
+
+	cfg := &config.AgentConfig{Cluster: config.AgentClusterConfig{Version: "1.34.2"}}
+	resolved, err := resolveOfflineArtifacts(cfg, &config.AgentOfflineArtifacts{Source: filepath.Join(parent, "{{ .KubernetesVersion }}")})
+	require.NoError(t, err)
+	require.Equal(t, root, resolved.SourceRoot)
+
+	_, err = resolveOfflineArtifacts(cfg, &config.AgentOfflineArtifacts{Source: filepath.Join(parent, "{{ .Typo }}")})
+	require.ErrorContains(t, err, "render OfflineArtifacts.Source template")
+}
+
+func TestResolveOfflineArtifactsRejectsVersionMismatch(t *testing.T) {
+	root := writeGoalStateOfflineBundle(t, OfflineArtifactManifest{Versions: OfflineArtifactVersions{
+		Kubernetes: "v1.34.2",
+		Containerd: "2.1.8",
+		Runc:       "1.5.0",
+		CNI:        "1.5.1",
+		Crictl:     "1.34.0",
+	}})
+
+	_, err := resolveOfflineArtifacts(
+		&config.AgentConfig{Cluster: config.AgentClusterConfig{Version: "1.35.0"}},
+		&config.AgentOfflineArtifacts{Source: root},
+	)
+	require.ErrorContains(t, err, "does not match Cluster.Version")
+}
+
+func TestResolveOfflineArtifactsRejectsRuntimeConflict(t *testing.T) {
+	root := writeGoalStateOfflineBundle(t, OfflineArtifactManifest{Versions: OfflineArtifactVersions{
+		Kubernetes: "v1.34.2",
+		Containerd: "2.1.8",
+		Runc:       "1.5.0",
+		CNI:        "1.5.1",
+		Crictl:     "1.34.0",
+	}})
+
+	_, err := resolveOfflineArtifacts(
+		&config.AgentConfig{
+			Cluster: config.AgentClusterConfig{Version: "1.34.2"},
+			CRI:     config.CRIConfig{Containerd: config.ContainerdConfig{Version: "2.1.9"}},
+		},
+		&config.AgentOfflineArtifacts{Source: root},
+	)
+	require.ErrorContains(t, err, "conflicts with offline manifest")
+}
+
+func TestResolveOfflineArtifactsRequiresExistingFiles(t *testing.T) {
+	root := writeGoalStateOfflineBundle(t, OfflineArtifactManifest{Versions: OfflineArtifactVersions{
+		Kubernetes: "v1.34.2",
+		Containerd: "2.1.8",
+		Runc:       "1.5.0",
+		CNI:        "1.5.1",
+		Crictl:     "1.34.0",
+	}})
+	require.NoError(t, os.Remove(filepath.Join(root, "runc", "v1.5.0", "runc."+runtime.GOARCH)))
+
+	_, err := resolveOfflineArtifacts(
+		&config.AgentConfig{Cluster: config.AgentClusterConfig{Version: "1.34.2"}},
+		&config.AgentOfflineArtifacts{Source: root},
+	)
+	require.ErrorContains(t, err, "required offline artifact")
+}
+
 func writeGoalStateOfflineBundle(t *testing.T, manifest OfflineArtifactManifest) string {
 	t.Helper()
 
-	root := t.TempDir()
+	root := filepath.Join(t.TempDir(), normalizeKubernetesVersion(manifest.Versions.Kubernetes))
 	manifest.SchemaVersion = 1
 	manifest.Versions.Kubernetes = normalizeKubernetesVersion(manifest.Versions.Kubernetes)
 	manifest.Versions.Containerd = stripLeadingV(manifest.Versions.Containerd)
@@ -68,6 +161,7 @@ func writeGoalStateOfflineBundle(t *testing.T, manifest OfflineArtifactManifest)
 
 	data, err := json.Marshal(manifest)
 	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(root, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(root, OfflineArtifactManifestFileName), data, 0o644))
 
 	paths := offlineArtifactPaths(manifest, runtime.GOARCH)
