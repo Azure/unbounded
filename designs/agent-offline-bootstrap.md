@@ -331,8 +331,8 @@ Minimal manifest:
     "crictl": "1.34.0"
   },
   "containerImages": [
-    "mcr.microsoft.com/oss/kubernetes/kube-proxy:v1.34.2",
-    "mcr.microsoft.com/oss/kubernetes/pause:3.9"
+    "mcr.microsoft.com/oss/v2/kubernetes/kube-proxy:v1.34.2",
+    "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9"
   ]
 }
 ```

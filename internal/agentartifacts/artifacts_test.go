@@ -278,8 +278,8 @@ func TestCrictlArchive(t *testing.T) {
 func TestContainerImageArchivePath(t *testing.T) {
 	t.Parallel()
 
-	got := ContainerImageArchivePath("amd64", "mcr.microsoft.com/oss/kubernetes/pause:3.9")
-	require.Equal(t, "container-images/amd64/mcr.microsoft.com_oss_kubernetes_pause_3.9-ea7c9a2ed959.tar", got)
+	got := ContainerImageArchivePath("amd64", "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9")
+	require.Equal(t, "container-images/amd64/mcr.microsoft.com_oss_v2_kubernetes_pause_3.9-a68ffa05fa78.tar", got)
 }
 
 func TestNormalizeManifest(t *testing.T) {

@@ -97,8 +97,8 @@ const (
 	CNIPluginVersion  = "1.5.1"
 
 	ContainerdMetricsAddress = "0.0.0.0:10257"
-	SandboxImage             = "mcr.microsoft.com/oss/kubernetes/pause:3.9"
-	KubeProxyImageRepository = "mcr.microsoft.com/oss/kubernetes/kube-proxy"
+	SandboxImage             = "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9"
+	KubeProxyImageRepository = "mcr.microsoft.com/oss/v2/kubernetes/kube-proxy"
 
 	CNIBinDir    = "/opt/cni/bin"
 	CNIConfigDir = "/etc/cni/net.d"

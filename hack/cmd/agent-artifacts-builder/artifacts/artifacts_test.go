@@ -78,14 +78,14 @@ func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []ContainerImageArchive{
 		{
-			ImageTag: "mcr.microsoft.com/oss/kubernetes/kube-proxy:v1.34.2",
+			ImageTag: "mcr.microsoft.com/oss/v2/kubernetes/kube-proxy:v1.34.2",
 			Arch:     "amd64",
-			Path:     "container-images/amd64/mcr.microsoft.com_oss_kubernetes_kube-proxy_v1.34.2-5587e541715b.tar",
+			Path:     "container-images/amd64/mcr.microsoft.com_oss_v2_kubernetes_kube-proxy_v1.34.2-3a45ebd35773.tar",
 		},
 		{
-			ImageTag: "mcr.microsoft.com/oss/kubernetes/pause:3.9",
+			ImageTag: "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9",
 			Arch:     "amd64",
-			Path:     "container-images/amd64/mcr.microsoft.com_oss_kubernetes_pause_3.9-ea7c9a2ed959.tar",
+			Path:     "container-images/amd64/mcr.microsoft.com_oss_v2_kubernetes_pause_3.9-a68ffa05fa78.tar",
 		},
 	}, plan.ContainerImages)
 	require.Equal(t, agentartifacts.Manifest{
