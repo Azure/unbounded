@@ -1061,10 +1061,10 @@ func TestBootOrderConfigUEFIHTTPOn(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"BootSourceOverrideTarget":     "UefiHttp",
-		"BootSourceOverrideEnabled":    "Once",
-		"BootSourceOverrideMode":       "UEFI",
-		"UefiTargetBootSourceOverride": "http://10.0.0.10:8880/shimx64.efi",
+		"BootSourceOverrideTarget":  "UefiHttp",
+		"BootSourceOverrideEnabled": "Once",
+		"BootSourceOverrideMode":    "UEFI",
+		"HttpBootUri":               "http://10.0.0.10:8880/shimx64.efi",
 	}
 	for key, value := range want {
 		if boot[key] != value {
@@ -1086,10 +1086,10 @@ func TestBootOrderConfigUEFIHTTPNoOp(t *testing.T) {
 			json.NewEncoder(w).Encode(map[string]any{
 				"PowerState": "On",
 				"Boot": map[string]string{
-					"BootSourceOverrideTarget":     "UefiHttp",
-					"BootSourceOverrideEnabled":    "Once",
-					"BootSourceOverrideMode":       "UEFI",
-					"UefiTargetBootSourceOverride": "http://10.0.0.10:8880/shimx64.efi",
+					"BootSourceOverrideTarget":  "UefiHttp",
+					"BootSourceOverrideEnabled": "Once",
+					"BootSourceOverrideMode":    "UEFI",
+					"HttpBootUri":               "http://10.0.0.10:8880/shimx64.efi",
 				},
 				"Links": map[string]any{
 					"Chassis": []map[string]any{
@@ -1251,9 +1251,9 @@ func TestUEFIHTTPBootEndToEnd(t *testing.T) {
 		t.Fatal("expected Boot in Redfish PATCH body")
 	}
 
-	bootURL, ok := boot["UefiTargetBootSourceOverride"].(string)
+	bootURL, ok := boot["HttpBootUri"].(string)
 	if !ok || bootURL != serveURL+"/shimx64.efi" {
-		t.Fatalf("expected UEFI HTTP URL %s/shimx64.efi, got %v", serveURL, boot["UefiTargetBootSourceOverride"])
+		t.Fatalf("expected UEFI HTTP URL %s/shimx64.efi, got %v", serveURL, boot["HttpBootUri"])
 	}
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, bootURL, nil)

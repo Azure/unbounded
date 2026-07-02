@@ -165,10 +165,10 @@ func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
 
 	var system struct {
 		Boot struct {
-			BootSourceOverrideTarget     BootTarget  `json:"BootSourceOverrideTarget"`
-			BootSourceOverrideEnabled    BootEnabled `json:"BootSourceOverrideEnabled"`
-			BootSourceOverrideMode       BootMode    `json:"BootSourceOverrideMode"`
-			UefiTargetBootSourceOverride string      `json:"UefiTargetBootSourceOverride"`
+			BootSourceOverrideTarget  BootTarget  `json:"BootSourceOverrideTarget"`
+			BootSourceOverrideEnabled BootEnabled `json:"BootSourceOverrideEnabled"`
+			BootSourceOverrideMode    BootMode    `json:"BootSourceOverrideMode"`
+			HTTPBootURI               string      `json:"HttpBootUri"`
 		} `json:"Boot"`
 	}
 	if err := json.Unmarshal(data, &system); err != nil {
@@ -179,7 +179,7 @@ func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
 		Target:         system.Boot.BootSourceOverrideTarget,
 		Enabled:        system.Boot.BootSourceOverrideEnabled,
 		Mode:           system.Boot.BootSourceOverrideMode,
-		UefiHTTPSource: system.Boot.UefiTargetBootSourceOverride,
+		UefiHTTPSource: system.Boot.HTTPBootURI,
 	}, nil
 }
 
@@ -218,10 +218,10 @@ func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error 
 
 	body := map[string]any{
 		"Boot": map[string]string{
-			"BootSourceOverrideTarget":     string(BootTargetUefiHTTP),
-			"BootSourceOverrideEnabled":    string(BootOnce),
-			"BootSourceOverrideMode":       string(BootModeUEFI),
-			"UefiTargetBootSourceOverride": bootURL,
+			"BootSourceOverrideTarget":  string(BootTargetUefiHTTP),
+			"BootSourceOverrideEnabled": string(BootOnce),
+			"BootSourceOverrideMode":    string(BootModeUEFI),
+			"HttpBootUri":               bootURL,
 		},
 	}
 
