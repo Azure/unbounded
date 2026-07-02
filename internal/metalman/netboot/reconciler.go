@@ -5,6 +5,8 @@ package netboot
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -15,9 +17,12 @@ import (
 	"github.com/opencontainers/umoci"
 	"github.com/opencontainers/umoci/oci/casext"
 	"github.com/opencontainers/umoci/oci/layer"
+	corev1 "k8s.io/api/core/v1"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
 	"oras.land/oras-go/v2/registry/remote"
+	"oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -37,12 +42,19 @@ func init() {
 const imageResyncInterval = 5 * time.Minute
 
 // OCIReconciler watches Machine CRs and pulls their referenced OCI images.
-// Work items are deduplicated by image reference so that multiple machines
-// sharing the same image only trigger a single download.
+// Work items are deduplicated by image reference, architecture, and pull secret
+// so machines sharing the same pull identity only trigger one download.
 type OCIReconciler struct {
-	Client            client.Client
-	Cache             *OCICache
-	DefaultNetbootRef string
+	Client                      client.Client
+	Cache                       *OCICache
+	DefaultNetbootRef           string
+	DefaultNetbootPullSecretRef *v1alpha3.NamespacedSecretReference
+}
+
+type imagePullRequest struct {
+	ImageRef      string                              `json:"imageRef"`
+	Architecture  string                              `json:"architecture"`
+	PullSecretRef *v1alpha3.NamespacedSecretReference `json:"pullSecretRef,omitempty"`
 }
 
 func (r *OCIReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -65,31 +77,49 @@ func (r *OCIReconciler) mapMachineToImage(_ context.Context, obj client.Object) 
 		return nil
 	}
 
-	refs := []string{machine.Spec.PXE.Image}
+	refs := []imagePullRequest{
+		{
+			ImageRef:      machine.Spec.PXE.Image,
+			Architecture:  machine.Spec.PXE.TargetArchitecture(),
+			PullSecretRef: machine.Spec.PXE.PullSecretRef,
+		},
+	}
+
 	if machine.Spec.PXE.NetbootImage != "" {
-		refs = append(refs, machine.Spec.PXE.NetbootImage)
+		refs = append(refs, imagePullRequest{
+			ImageRef:      machine.Spec.PXE.NetbootImage,
+			Architecture:  machine.Spec.PXE.TargetArchitecture(),
+			PullSecretRef: machine.Spec.PXE.NetbootPullSecretRef,
+		})
 	} else {
-		refs = append(refs, r.DefaultNetbootRef)
+		refs = append(refs, imagePullRequest{
+			ImageRef:      r.DefaultNetbootRef,
+			Architecture:  machine.Spec.PXE.TargetArchitecture(),
+			PullSecretRef: r.DefaultNetbootPullSecretRef,
+		})
 	}
 
 	reqs := make([]reconcile.Request, 0, len(refs))
 
-	seen := make(map[imageRefKey]struct{}, len(refs))
-	architecture := machine.Spec.PXE.TargetArchitecture()
+	seen := make(map[string]struct{}, len(refs))
 
-	for _, ref := range refs {
-		if ref == "" {
+	for _, pullReq := range refs {
+		if pullReq.ImageRef == "" {
 			continue
 		}
 
-		key := imageRefKey{imageRef: ref, architecture: architecture}
+		key, err := encodeImagePullRequest(pullReq)
+		if err != nil {
+			continue
+		}
+
 		if _, ok := seen[key]; ok {
 			continue
 		}
 
 		seen[key] = struct{}{}
 
-		reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKey{Namespace: architecture, Name: ref}})
+		reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKey{Namespace: normalizeArchitecture(pullReq.Architecture), Name: key}})
 	}
 
 	return reqs
@@ -98,12 +128,17 @@ func (r *OCIReconciler) mapMachineToImage(_ context.Context, obj client.Object) 
 func (r *OCIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// req.Name is the OCI image reference, mapped from Machine events.
-	imageRef := req.Name
-	architecture := normalizeArchitecture(req.Namespace)
+	pullReq, err := decodeImagePullRequest(req.NamespacedName)
+	if err != nil {
+		logger.Error(err, "decoding OCI image pull request", "request", req.String())
+		return ctrl.Result{}, nil
+	}
+
+	imageRef := pullReq.ImageRef
+	architecture := normalizeArchitecture(pullReq.Architecture)
 
 	// Always resolve the remote digest so we detect tag updates.
-	remoteDigest, repo, err := r.resolveRemoteDigest(ctx, imageRef)
+	remoteDigest, repo, err := r.resolveRemoteDigest(ctx, imageRef, pullReq.PullSecretRef)
 	if err != nil {
 		logger.Error(err, "resolving OCI image digest", "image", imageRef)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -142,12 +177,53 @@ func newRepository(imageRef string) (*remote.Repository, error) {
 	return repo, nil
 }
 
+func encodeImagePullRequest(req imagePullRequest) (string, error) {
+	req.Architecture = normalizeArchitecture(req.Architecture)
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("marshal image pull request: %w", err)
+	}
+
+	return base64.RawURLEncoding.EncodeToString(data), nil
+}
+
+func decodeImagePullRequest(key client.ObjectKey) (imagePullRequest, error) {
+	data, err := base64.RawURLEncoding.DecodeString(key.Name)
+	if err != nil {
+		return imagePullRequest{}, fmt.Errorf("decode request name: %w", err)
+	}
+
+	var req imagePullRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return imagePullRequest{}, fmt.Errorf("unmarshal request name: %w", err)
+	}
+
+	if req.ImageRef == "" {
+		return imagePullRequest{}, fmt.Errorf("image reference is empty")
+	}
+
+	if key.Namespace != "" {
+		req.Architecture = key.Namespace
+	}
+
+	req.Architecture = normalizeArchitecture(req.Architecture)
+
+	return req, nil
+}
+
 // resolveRemoteDigest resolves the tag or digest in an image reference to its
 // canonical digest by querying the remote registry.
-func (r *OCIReconciler) resolveRemoteDigest(ctx context.Context, imageRef string) (string, *remote.Repository, error) {
+func (r *OCIReconciler) resolveRemoteDigest(ctx context.Context, imageRef string, pullSecretRef *v1alpha3.NamespacedSecretReference) (string, *remote.Repository, error) {
 	repo, err := newRepository(imageRef)
 	if err != nil {
 		return "", nil, err
+	}
+
+	if pullSecretRef != nil {
+		if err := r.configureRepositoryAuth(ctx, repo, pullSecretRef); err != nil {
+			return "", nil, err
+		}
 	}
 
 	tagOrDigest := repo.Reference.Reference
@@ -158,6 +234,156 @@ func (r *OCIReconciler) resolveRemoteDigest(ctx context.Context, imageRef string
 	}
 
 	return desc.Digest.String(), repo, nil
+}
+
+func (r *OCIReconciler) configureRepositoryAuth(ctx context.Context, repo *remote.Repository, ref *v1alpha3.NamespacedSecretReference) error {
+	if ref.Name == "" || ref.Namespace == "" {
+		return fmt.Errorf("pull secret reference is incomplete")
+	}
+
+	var secret corev1.Secret
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, &secret); err != nil {
+		return fmt.Errorf("get pull secret %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+
+	credential, err := credentialFromPullSecret(&secret, repo.Reference.Registry)
+	if err != nil {
+		return fmt.Errorf("pull secret %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+
+	repo.Client = &auth.Client{
+		Client:     retry.DefaultClient,
+		Header:     auth.DefaultClient.Header.Clone(),
+		Credential: auth.StaticCredential(repo.Reference.Registry, credential),
+	}
+
+	return nil
+}
+
+type dockerConfigJSON struct {
+	Auths map[string]dockerAuthConfig `json:"auths"`
+}
+
+type dockerAuthConfig struct {
+	Username      string `json:"username"`
+	Password      string `json:"password"`
+	Auth          string `json:"auth"`
+	IdentityToken string `json:"identitytoken"`
+	RegistryToken string `json:"registrytoken"`
+}
+
+func credentialFromPullSecret(secret *corev1.Secret, registry string) (auth.Credential, error) {
+	switch secret.Type {
+	case corev1.SecretTypeDockerConfigJson:
+		data := secret.Data[corev1.DockerConfigJsonKey]
+		if len(data) == 0 {
+			return auth.EmptyCredential, fmt.Errorf("missing %s data", corev1.DockerConfigJsonKey)
+		}
+
+		var cfg dockerConfigJSON
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return auth.EmptyCredential, fmt.Errorf("parse %s: %w", corev1.DockerConfigJsonKey, err)
+		}
+
+		return credentialFromDockerAuths(cfg.Auths, registry)
+	case corev1.SecretTypeDockercfg:
+		data := secret.Data[corev1.DockerConfigKey]
+		if len(data) == 0 {
+			return auth.EmptyCredential, fmt.Errorf("missing %s data", corev1.DockerConfigKey)
+		}
+
+		var auths map[string]dockerAuthConfig
+		if err := json.Unmarshal(data, &auths); err != nil {
+			return auth.EmptyCredential, fmt.Errorf("parse %s: %w", corev1.DockerConfigKey, err)
+		}
+
+		return credentialFromDockerAuths(auths, registry)
+	default:
+		return auth.EmptyCredential, fmt.Errorf("unsupported secret type %q", secret.Type)
+	}
+}
+
+func credentialFromDockerAuths(auths map[string]dockerAuthConfig, registry string) (auth.Credential, error) {
+	if len(auths) == 0 {
+		return auth.EmptyCredential, fmt.Errorf("docker config has no auth entries")
+	}
+
+	registry = normalizeRegistryHost(registry)
+	for server, cfg := range auths {
+		if registryHostsMatch(registry, normalizeRegistryHost(server)) {
+			return credentialFromDockerAuthConfig(cfg)
+		}
+	}
+
+	return auth.EmptyCredential, fmt.Errorf("docker config has no credentials for registry %q", registry)
+}
+
+func credentialFromDockerAuthConfig(cfg dockerAuthConfig) (auth.Credential, error) {
+	username := cfg.Username
+	password := cfg.Password
+
+	if (username == "" || password == "") && cfg.Auth != "" {
+		decoded, err := base64.StdEncoding.DecodeString(cfg.Auth)
+		if err != nil {
+			return auth.EmptyCredential, fmt.Errorf("decode auth field: %w", err)
+		}
+
+		user, pass, ok := strings.Cut(string(decoded), ":")
+		if !ok {
+			return auth.EmptyCredential, fmt.Errorf("decode auth field: missing ':' separator")
+		}
+
+		if username == "" {
+			username = user
+		}
+
+		if password == "" {
+			password = pass
+		}
+	}
+
+	credential := auth.Credential{
+		Username:     username,
+		Password:     password,
+		RefreshToken: cfg.IdentityToken,
+		AccessToken:  cfg.RegistryToken,
+	}
+
+	if credential == auth.EmptyCredential {
+		return auth.EmptyCredential, fmt.Errorf("docker auth entry has no credentials")
+	}
+
+	return credential, nil
+}
+
+func normalizeRegistryHost(server string) string {
+	server = strings.TrimSpace(server)
+	server = strings.TrimPrefix(server, "http://")
+	server = strings.TrimPrefix(server, "https://")
+	server = strings.TrimSuffix(server, "/")
+
+	if slash := strings.Index(server, "/"); slash >= 0 {
+		server = server[:slash]
+	}
+
+	return strings.ToLower(server)
+}
+
+func registryHostsMatch(registry, candidate string) bool {
+	if registry == candidate {
+		return true
+	}
+
+	return isDockerHubRegistry(registry) && isDockerHubRegistry(candidate)
+}
+
+func isDockerHubRegistry(registry string) bool {
+	switch registry {
+	case "docker.io", "index.docker.io", "registry-1.docker.io":
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest string, repo *remote.Repository, architecture string) error {
