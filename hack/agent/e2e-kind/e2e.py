@@ -571,7 +571,6 @@ class NodeConfig:
     node_ip: str = ""
     offline_artifacts_oci_ref: str = ""
     rootfs_oci_image: str = ""
-    sandbox_image: str = ""
     block_external_network: bool = False
     path: str = ""
 
@@ -580,7 +579,6 @@ def load_node_config(
     path: str | None,
     offline_artifacts_oci_ref_override: str = "",
     offline_rootfs_oci_image_override: str = "",
-    sandbox_image_override: str = "",
 ) -> NodeConfig:
     """Load a node config variant from *path*, or return the default config."""
     if not path:
@@ -590,7 +588,6 @@ def load_node_config(
             register_with_taints=[],
             offline_artifacts_oci_ref=offline_artifacts_oci_ref_override,
             rootfs_oci_image=offline_rootfs_oci_image_override,
-            sandbox_image=sandbox_image_override,
         )
 
     config_path = Path(path)
@@ -611,7 +608,6 @@ def load_node_config(
     node_ip = cfg.get("nodeIP", "")
     offline_artifacts_oci_ref = offline_artifacts_oci_ref_override or cfg.get("offlineArtifactsOCIRef", "")
     rootfs_oci_image = offline_rootfs_oci_image_override or cfg.get("offlineRootfsOCIImage", "")
-    sandbox_image = sandbox_image_override or cfg.get("sandboxImage", "")
     block_external_network = cfg.get("blockExternalNetwork", False)
 
     if not isinstance(name, str) or not name:
@@ -631,8 +627,6 @@ def load_node_config(
         die(f"node config {config_path} field 'offlineArtifactsOCIRef' must be a string")
     if not isinstance(rootfs_oci_image, str):
         die(f"node config {config_path} field 'offlineRootfsOCIImage' must be a string")
-    if not isinstance(sandbox_image, str):
-        die(f"node config {config_path} field 'sandboxImage' must be a string")
     if not isinstance(block_external_network, bool):
         die(f"node config {config_path} field 'blockExternalNetwork' must be a boolean")
 
@@ -643,7 +637,6 @@ def load_node_config(
         node_ip=node_ip,
         offline_artifacts_oci_ref=offline_artifacts_oci_ref,
         rootfs_oci_image=rootfs_oci_image,
-        sandbox_image=sandbox_image,
         block_external_network=block_external_network,
         path=str(config_path),
     )
@@ -695,8 +688,6 @@ def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
         args.extend(["--register-with-taint", taint])
     if node_config.rootfs_oci_image:
         args.extend(["--oci-image", node_config.rootfs_oci_image])
-    if node_config.sandbox_image:
-        args.extend(["--sandbox-image", node_config.sandbox_image])
     return args
 
 
@@ -710,7 +701,6 @@ def log_active_node_config(node_config: NodeConfig) -> None:
     log(f"  register-with-taints: {', '.join(taints) if taints else '<none>'}")
     log(f"  offline artifacts OCI ref: {node_config.offline_artifacts_oci_ref or '<none>'}")
     log(f"  rootfs OCI image: {node_config.rootfs_oci_image or '<default>'}")
-    log(f"  sandbox image: {node_config.sandbox_image or '<default>'}")
     log(f"  block external network: {node_config.block_external_network}")
 
 
@@ -1878,7 +1868,7 @@ def start_local_artifact_registry() -> str:
 def mirror_oci_refs_to_local_registry(configs: list[NodeConfig]) -> list[NodeConfig]:
     """Mirror configured OCI refs to a local e2e registry."""
     preload_images = cluster_preload_images() if any(cfg.block_external_network for cfg in configs) else []
-    if not any(cfg.offline_artifacts_oci_ref or cfg.rootfs_oci_image or cfg.sandbox_image for cfg in configs) and not preload_images:
+    if not any(cfg.offline_artifacts_oci_ref or cfg.rootfs_oci_image for cfg in configs) and not preload_images:
         return configs
 
     registry = start_local_artifact_registry()
@@ -1899,8 +1889,6 @@ def mirror_oci_refs_to_local_registry(configs: list[NodeConfig]) -> list[NodeCon
     for cfg in configs:
         offline_ref = cfg.offline_artifacts_oci_ref
         rootfs_ref = cfg.rootfs_oci_image
-        sandbox_ref = cfg.sandbox_image
-
         if offline_ref:
             source_ref = offline_ref
             local_ref = mirrored.get(source_ref)
@@ -1921,21 +1909,10 @@ def mirror_oci_refs_to_local_registry(configs: list[NodeConfig]) -> list[NodeCon
                 mirrored[source_ref] = local_ref
             rootfs_ref = local_ref
 
-        if sandbox_ref:
-            source_ref = sandbox_ref
-            local_ref = mirrored.get(source_ref)
-            if local_ref is None:
-                local_ref = local_sandbox_ref(registry, source_ref)
-                log(f"Mirroring sandbox image {source_ref} -> {local_ref}")
-                oras_copy(source_ref, local_ref)
-                mirrored[source_ref] = local_ref
-            sandbox_ref = local_ref
-
         out.append(replace(
             cfg,
             offline_artifacts_oci_ref=offline_ref,
             rootfs_oci_image=rootfs_ref,
-            sandbox_image=sandbox_ref,
         ))
 
     return out
@@ -1954,11 +1931,6 @@ def local_rootfs_ref(registry: str, source_ref: str) -> str:
     repo = re.sub(r"[^a-z0-9._/-]+", "-", repo.lower()).strip("/") or "rootfs"
     return f"{registry}/rootfs/{repo}:{tag}"
 
-
-def local_sandbox_ref(registry: str, source_ref: str) -> str:
-    """Return the local registry ref used for a mirrored sandbox image."""
-    _name, tag = split_tagged_oci_ref(source_ref, "sandbox image")
-    return f"{registry}/sandbox/pause:{tag}"
 
 
 def local_preload_ref(registry: str, source_ref: str) -> str:
@@ -2455,8 +2427,6 @@ def _run_scenario_command(command: str, node_config: NodeConfig, env: dict[str, 
         args.extend(["--offline-artifacts-oci-ref", node_config.offline_artifacts_oci_ref])
     if node_config.rootfs_oci_image:
         args.extend(["--offline-rootfs-oci-image", node_config.rootfs_oci_image])
-    if node_config.sandbox_image:
-        args.extend(["--sandbox-image", node_config.sandbox_image])
     args.append(command)
 
     child_env = {**os.environ, **env}
@@ -3896,18 +3866,12 @@ def main() -> None:
         default="",
         help="Override offlineRootfsOCIImage from the node config JSON",
     )
-    parser.add_argument(
-        "--sandbox-image",
-        default="",
-        help="Override sandboxImage from the node config JSON",
-    )
     args = parser.parse_args()
     VERBOSE = args.verbose
     node_config = load_node_config(
         args.node_config,
         offline_artifacts_oci_ref_override=args.offline_artifacts_oci_ref,
         offline_rootfs_oci_image_override=args.offline_rootfs_oci_image,
-        sandbox_image_override=args.sandbox_image,
     )
 
     COMMANDS[args.command](node_config)

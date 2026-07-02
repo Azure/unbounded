@@ -308,12 +308,15 @@ func parseOCILayoutReference(image string) (layoutDir, tag string, ok bool, err 
 
 	lastSlash := strings.LastIndex(source, "/")
 	lastColon := strings.LastIndex(source, ":")
+
 	if lastColon > lastSlash {
 		layoutDir = source[:lastColon]
 		tag = source[lastColon+1:]
+
 		if layoutDir == "" || tag == "" {
 			return "", "", true, fmt.Errorf("invalid OCI layout reference")
 		}
+
 		return layoutDir, tag, true, nil
 	}
 

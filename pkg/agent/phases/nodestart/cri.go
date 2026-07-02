@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,10 +47,6 @@ func (c *configureContainerd) Name() string { return "configure-containerd" }
 func (c *configureContainerd) Do(_ context.Context) error {
 	if err := c.ensureContainerdConfig(); err != nil {
 		return fmt.Errorf("ensure containerd config: %w", err)
-	}
-
-	if err := c.ensureContainerdPlainHTTPHosts(); err != nil {
-		return fmt.Errorf("ensure containerd plain HTTP hosts: %w", err)
 	}
 
 	if err := c.ensureContainerdServiceUnit(); err != nil {
@@ -101,44 +96,6 @@ func (c *configureContainerd) ensureContainerdServiceUnit() error {
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitContainerd)
 
 	return utilio.WriteFile(dest, buf.Bytes(), 0o644)
-}
-
-// ensureContainerdPlainHTTPHosts configures containerd to use HTTP for private
-// IP sandbox image registries. This matches the agent's OCI plain-HTTP behavior
-// for local bootstrap registries used in disconnected environments.
-func (c *configureContainerd) ensureContainerdPlainHTTPHosts() error {
-	registry, ok := plainHTTPRegistryHost(c.goalState.Containerd.SandboxImage)
-	if !ok {
-		return nil
-	}
-
-	content := []byte(fmt.Sprintf("server = \"http://%s\"\n\n[host.\"http://%s\"]\n  capabilities = [\"pull\", \"resolve\"]\n", registry, registry))
-	dest := filepath.Join(c.goalState.MachineDir, "/etc/containerd/certs.d", registry, "hosts.toml")
-
-	return utilio.WriteFile(dest, content, 0o644)
-}
-
-func plainHTTPRegistryHost(image string) (string, bool) {
-	registry := strings.SplitN(image, "/", 2)[0]
-	if registry == "" || !strings.ContainsAny(registry, ".:") {
-		return "", false
-	}
-
-	hostname := registry
-	if host, _, err := net.SplitHostPort(registry); err == nil {
-		hostname = host
-	}
-
-	if hostname == "localhost" {
-		return registry, true
-	}
-
-	ip := net.ParseIP(hostname)
-	if ip == nil {
-		return "", false
-	}
-
-	return registry, ip.IsLoopback() || ip.IsPrivate()
 }
 
 // ensureGPUDropInConfigs manages GPU-related containerd drop-in configs.

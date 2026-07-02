@@ -176,18 +176,23 @@ func TestParseOCILayoutReference(t *testing.T) {
 			if gotOK != tt.wantOK {
 				t.Fatalf("ok = %v, want %v", gotOK, tt.wantOK)
 			}
+
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("err = nil, want error")
 				}
+
 				return
 			}
+
 			if err != nil {
 				t.Fatalf("err = %v, want nil", err)
 			}
+
 			if gotLayout != tt.wantLayout {
 				t.Fatalf("layout = %q, want %q", gotLayout, tt.wantLayout)
 			}
+
 			if gotTag != tt.wantTag {
 				t.Fatalf("tag = %q, want %q", gotTag, tt.wantTag)
 			}
