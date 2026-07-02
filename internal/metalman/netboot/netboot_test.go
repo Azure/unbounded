@@ -845,11 +845,19 @@ func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
 		"/usr/local/bin/unbounded-agent-install.sh",
 		"/latest/download/unbounded-agent-linux-",
 		"export UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json",
-		"bash /usr/local/bin/unbounded-agent-install.sh",
+		"install_log=/var/log/unbounded-agent-install.log",
+		"trap report_unbounded_failure ERR",
+		"last 120 lines of ${install_log}",
+		`curl -fsS -m 10 -X POST -H "Content-Type: text/plain" --data-binary @- "http://10.0.1.1:8080/unbounded-agent/install-log"`,
+		`bash /usr/local/bin/unbounded-agent-install.sh 2>&1 | tee "$install_log"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("expected %q in rendered vendor-data, got:\n%s", want, body)
 		}
+	}
+
+	if strings.Contains(body, "python3") {
+		t.Errorf("expected Bash-only failure reporting, got:\n%s", body)
 	}
 
 	if strings.Contains(body, "{{ .ServeURL }}/unbounded-agent") {
@@ -2716,6 +2724,51 @@ func TestBuildCloudInitCondition_MessageTruncation(t *testing.T) {
 	if !strings.Contains(cond.Message, "modules-config") {
 		t.Errorf("truncated message should contain stage name, got %q", cond.Message[:100])
 	}
+}
+
+func TestInstallLogEndpointAcceptsPlainTextWithoutRecordingCondition(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "install-log-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:78", IPv4: "10.0.20.18", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	recorder := &recordingStatusRecorder{}
+
+	srv := &HTTPServer{
+		Client:         fc,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		StatusRecorder: recorder,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /unbounded-agent/install-log", srv.handleInstallLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := "unbounded-agent install exited with status 42\n\nlast 120 lines of /var/log/unbounded-agent-install.log:\nfailed to download agent"
+	req, _ := http.NewRequest("POST", ts.URL+"/unbounded-agent/install-log", strings.NewReader(body))
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("X-Forwarded-For", "10.0.20.18")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Empty(t, recorder.conditionEvents())
 }
 
 func TestCloudInitCondition_StageStartSetsRunning(t *testing.T) {

@@ -4,6 +4,7 @@
 package cloudinit
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"testing"
@@ -47,7 +48,8 @@ func TestTimeoutRunningCondition(t *testing.T) {
 		WithStatusSubresource(machine).
 		Build()
 
-	reconciler := &Reconciler{Client: fc}
+	recorder := &recordingStatusRecorder{}
+	reconciler := &Reconciler{Client: fc, StatusRecorder: recorder}
 	ctx := t.Context()
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "machine-timeout"}}
 
@@ -76,6 +78,18 @@ func TestTimeoutRunningCondition(t *testing.T) {
 
 	if cond.Reason != "TimedOut" {
 		t.Fatalf("expected reason TimedOut, got %s", cond.Reason)
+	}
+
+	if len(recorder.conditions) != 1 {
+		t.Fatalf("expected one recorded condition, got %d", len(recorder.conditions))
+	}
+
+	if recorder.conditions[0].machineName != machine.Name {
+		t.Fatalf("expected recorded machine %s, got %s", machine.Name, recorder.conditions[0].machineName)
+	}
+
+	if recorder.conditions[0].condition.Status != metav1.ConditionUnknown || recorder.conditions[0].condition.Reason != "TimedOut" {
+		t.Fatalf("expected recorded timeout condition, got %+v", recorder.conditions[0].condition)
 	}
 }
 
@@ -473,4 +487,19 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	}
 
 	return s
+}
+
+type recordedMachineCondition struct {
+	machineName string
+	condition   metav1.Condition
+}
+
+type recordingStatusRecorder struct {
+	conditions []recordedMachineCondition
+}
+
+func (r *recordingStatusRecorder) RecordMachineCondition(_ context.Context, machineName string, condition metav1.Condition) error {
+	r.conditions = append(r.conditions, recordedMachineCondition{machineName: machineName, condition: condition})
+
+	return nil
 }
