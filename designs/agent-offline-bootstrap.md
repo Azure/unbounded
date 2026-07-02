@@ -329,11 +329,15 @@ Minimal manifest:
     "runc": "1.5.0",
     "cni": "1.5.1",
     "crictl": "1.34.0"
-  }
+  },
+  "containerImages": [
+    "mcr.microsoft.com/oss/kubernetes/kube-proxy:v1.34.2",
+    "mcr.microsoft.com/oss/kubernetes/pause:3.9"
+  ]
 }
 ```
 
-The manifest is the source of truth for binary versions in offline mode. This prevents a newer agent binary from resolving newer built-in runtime defaults against an older offline bundle. For example, if the agent's built-in containerd default changes from `2.1.8` to `2.1.9`, but the offline manifest declares `2.1.8`, the agent resolves and installs the `2.1.8` artifact from the bundle.
+The manifest is the source of truth for binary versions and included container images in offline mode. This prevents a newer agent binary from resolving newer built-in runtime defaults against an older offline bundle. For example, if the agent's built-in containerd default changes from `2.1.8` to `2.1.9`, but the offline manifest declares `2.1.8`, the agent resolves and installs the `2.1.8` artifact from the bundle. Similarly, `containerImages` lists image tags that should be available in containerd after bootstrap imports the bundled image archives, including the pause and kube-proxy images.
 
 The offline bundle should be versioned by Kubernetes version because Kubernetes is the primary compatibility axis. Example OCI tags:
 
@@ -500,9 +504,11 @@ Each bundle should contain:
 - `manifest.json`.
 - Kubernetes binaries and `.sha256` files for the declared Kubernetes version.
 - `containerd`, `runc`, CNI plugin, and `crictl` artifacts for the versions declared in `manifest.json`.
+- Included container images declared by `manifest.json`, starting with the pause image.
+- Container image archives under `container-images/`, which bootstrap should import before validating the listed `containerImages` tags.
 - Artifacts for each supported host architecture.
 
-OCI bundles should be published as multi-platform OCI indexes under the single Kubernetes-versioned tag. Each index entry points to a platform-specific artifact manifest, and each platform-specific manifest contains only that architecture's blobs plus `manifest.json`. For example, pulling `--platform linux/amd64` should return only `amd64` binaries and pulling `--platform linux/arm64` should return only `arm64` binaries. The tag remains architecture-neutral.
+OCI bundles should be published as multi-platform OCI indexes under the single Kubernetes-versioned tag. Each index entry points to a platform-specific artifact manifest, and each platform-specific manifest contains only that architecture's blobs plus `manifest.json` and platform-specific image archives under `container-images/`. For example, pulling `--platform linux/amd64` should return only `amd64` binaries and `amd64` image archives, and pulling `--platform linux/arm64` should return only `arm64` binaries and `arm64` image archives. The tag remains architecture-neutral.
 
 The bundle should use one OCI blob per target artifact, not one tarball containing all artifacts. This lets the agent fetch only the artifacts it needs and allows registries to deduplicate unchanged blobs across bundle tags.
 

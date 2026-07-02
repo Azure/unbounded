@@ -44,6 +44,7 @@ func TestNewPlan(t *testing.T) {
 			CNI:        "1.5.1",
 			Crictl:     "1.34.0",
 		},
+		ContainerImages: []string{},
 	}, plan.Manifest)
 
 	artifactsByPath := map[string]Artifact{}
@@ -84,6 +85,7 @@ func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
 			CNI:        "1.5.1",
 			Crictl:     "1.34.0",
 		},
+		ContainerImages: agentartifacts.DefaultContainerImages("v1.34.2"),
 	}, plan.Manifest)
 }
 

@@ -585,6 +585,7 @@ func defaultManifest(kubernetesVersion string) (agentartifacts.Manifest, error) 
 			CNI:        goalstates.CNIPluginVersion,
 			Crictl:     crictlVersion,
 		},
+		ContainerImages: agentartifacts.DefaultContainerImages(kubernetesVersion),
 	})
 }
 

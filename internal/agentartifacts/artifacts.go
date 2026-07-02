@@ -7,6 +7,7 @@ package agentartifacts
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/Masterminds/semver/v3"
@@ -40,6 +41,13 @@ const (
 
 var KubernetesBinaries = []string{"kubelet", "kubectl", "kube-proxy"}
 
+func DefaultContainerImages(kubernetesVersion string) []string {
+	return normalizeContainerImages([]string{
+		goalstates.SandboxImage,
+		goalstates.KubeProxyImage(kubernetesVersion),
+	})
+}
+
 type Versions struct {
 	Kubernetes string `json:"kubernetes"`
 	Containerd string `json:"containerd"`
@@ -49,8 +57,9 @@ type Versions struct {
 }
 
 type Manifest struct {
-	SchemaVersion int      `json:"schemaVersion,omitempty"`
-	Versions      Versions `json:"versions"`
+	SchemaVersion   int      `json:"schemaVersion,omitempty"`
+	Versions        Versions `json:"versions"`
+	ContainerImages []string `json:"containerImages"`
 }
 
 // KubernetesBinary resolves the download URL for a Kubernetes binary
@@ -188,6 +197,7 @@ func NormalizeManifest(manifest Manifest) (Manifest, error) {
 	manifest.Versions.Runc = StripLeadingV(manifest.Versions.Runc)
 	manifest.Versions.CNI = StripLeadingV(manifest.Versions.CNI)
 	manifest.Versions.Crictl = StripLeadingV(manifest.Versions.Crictl)
+	manifest.ContainerImages = normalizeContainerImages(manifest.ContainerImages)
 
 	missing := make([]string, 0, 5)
 	if manifest.Versions.Kubernetes == "v" {
@@ -215,6 +225,29 @@ func NormalizeManifest(manifest Manifest) (Manifest, error) {
 	}
 
 	return manifest, nil
+}
+
+func normalizeContainerImages(images []string) []string {
+	seen := map[string]struct{}{}
+
+	out := make([]string, 0, len(images))
+	for _, image := range images {
+		image = strings.TrimSpace(image)
+		if image == "" {
+			continue
+		}
+
+		if _, ok := seen[image]; ok {
+			continue
+		}
+
+		seen[image] = struct{}{}
+		out = append(out, image)
+	}
+
+	sort.Strings(out)
+
+	return out
 }
 
 func NormalizeKubernetesVersion(version string) string {
