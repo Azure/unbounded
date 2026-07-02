@@ -93,7 +93,7 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 			return err
 		}
 
-		t.recordBootLoaderDownloaded(ctx, log, node.Name, node.Spec.PXE.Image, filename)
+		t.recordBootLoaderDownloaded(ctx, log, node.Name, imageRef, filename)
 
 		return nil
 	}
@@ -105,7 +105,7 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		return err
 	}
 
-	t.recordBootLoaderDownloaded(ctx, log, node.Name, node.Spec.PXE.Image, filename)
+	t.recordBootLoaderDownloaded(ctx, log, node.Name, imageRef, filename)
 
 	return nil
 }

@@ -192,7 +192,7 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		netbootImage = s.DefaultNetbootRef
 	}
 
-	if netbootImage != "" && s.OCICache != nil {
+	if node.Spec.PXE.TargetBootProtocol() != v1alpha3.PXEBootProtocolHTTP && netbootImage != "" && s.OCICache != nil {
 		architecture := node.Spec.PXE.TargetArchitecture()
 
 		meta, err := s.OCICache.MetadataForRefArchitecture(netbootImage, architecture)

@@ -292,6 +292,14 @@ type PXESpec struct {
 	// +optional
 	NetbootImage string `json:"netbootImage,omitempty"`
 
+	// BootProtocol selects how metalman should trigger network boot for
+	// repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
+	// HTTP boot with a URL derived from the netboot image metadata.
+	// +kubebuilder:validation:Enum=PXE;HTTP
+	// +kubebuilder:default=PXE
+	// +optional
+	BootProtocol string `json:"bootProtocol,omitempty"`
+
 	// DHCPLeases defines static DHCP leases for PXE booting.
 	// +optional
 	DHCPLeases []DHCPLease `json:"dhcpLeases,omitempty"`
@@ -307,12 +315,18 @@ type PXESpec struct {
 }
 
 const (
+	// PXEBootProtocolPXE uses DHCP/TFTP PXE boot.
+	PXEBootProtocolPXE = "PXE"
+	// PXEBootProtocolHTTP uses Redfish UEFI HTTP boot.
+	PXEBootProtocolHTTP = "HTTP"
 	// PXEArchitectureAMD64 is the x86_64 target architecture for PXE boot.
 	PXEArchitectureAMD64 = "amd64"
 	// PXEArchitectureARM64 is the aarch64 target architecture for PXE boot.
 	PXEArchitectureARM64 = "arm64"
 	// DefaultPXEArchitecture is used when spec.pxe.architecture is omitted.
 	DefaultPXEArchitecture = PXEArchitectureAMD64
+	// DefaultPXEBootProtocol is used when spec.pxe.bootProtocol is omitted.
+	DefaultPXEBootProtocol = PXEBootProtocolPXE
 )
 
 // TargetArchitecture returns the effective PXE target architecture.
@@ -322,6 +336,15 @@ func (p *PXESpec) TargetArchitecture() string {
 	}
 
 	return p.Architecture
+}
+
+// TargetBootProtocol returns the effective network boot protocol.
+func (p *PXESpec) TargetBootProtocol() string {
+	if p == nil || p.BootProtocol == "" {
+		return DefaultPXEBootProtocol
+	}
+
+	return p.BootProtocol
 }
 
 // CloudInitSpec defines cloud-init customization for PXE-booted machines.

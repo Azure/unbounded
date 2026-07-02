@@ -203,7 +203,18 @@ func ServePXECmd() *cobra.Command {
 
 			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient()}
 
-			if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool}).SetupWithManager(mgr); err != nil {
+			resolver := netboot.FileResolver{
+				Cache:             ociCache,
+				Reader:            mgr.GetClient(),
+				Cluster:           clusterInfoWatcher,
+				ServeURL:          serveURL,
+				DefaultNetbootRef: defaultNetbootImage,
+				KubernetesVersion: kubeVersion,
+				ClusterDNS:        clusterDNS,
+				ProviderLabels:    providerLabels,
+			}
+
+			if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool, FileResolver: &resolver}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up Redfish reconciler: %w", err)
 			}
 
@@ -225,17 +236,6 @@ func ServePXECmd() *cobra.Command {
 
 			if err := (&cloudinit.Reconciler{Client: mgr.GetClient(), StatusRecorder: statusQueue}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up CloudInit reconciler: %w", err)
-			}
-
-			resolver := netboot.FileResolver{
-				Cache:             ociCache,
-				Reader:            mgr.GetClient(),
-				Cluster:           clusterInfoWatcher,
-				ServeURL:          serveURL,
-				DefaultNetbootRef: defaultNetbootImage,
-				KubernetesVersion: kubeVersion,
-				ClusterDNS:        clusterDNS,
-				ProviderLabels:    providerLabels,
 			}
 
 			if dhcpInterface != "" && dhcpAutoInterface {

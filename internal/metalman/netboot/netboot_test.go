@@ -592,10 +592,24 @@ type recordedPXEDisabled struct {
 type recordingStatusRecorder struct {
 	mu               sync.Mutex
 	err              error
+	bootLoader       []string
 	bootImageWritten []string
 	cloudInitDone    []string
 	conditions       []recordedMachineCondition
 	disabled         []recordedPXEDisabled
+}
+
+func (r *recordingStatusRecorder) RecordBootLoaderDownloaded(_ context.Context, machineName, filename string) error {
+	if r.err != nil {
+		return r.err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.bootLoader = append(r.bootLoader, fmt.Sprintf("%s:%s", machineName, filename))
+
+	return nil
 }
 
 func (r *recordingStatusRecorder) RecordBootImageWritten(_ context.Context, machineName string) error {
@@ -2311,7 +2325,7 @@ func TestOCICache_Metadata(t *testing.T) {
 	cache := NewOCICache(cacheDir)
 
 	digest := "testdigest123"
-	metadataContent := "dhcpBootImageName: shimx64.efi\n"
+	metadataContent := "dhcpBootImageName: shimx64.efi\nhttpBootPath: http/shimx64.efi\n"
 
 	if err := populateOCICache(cacheDir, digest, map[string][]byte{
 		"metadata.yaml": []byte(metadataContent),
@@ -2329,6 +2343,51 @@ func TestOCICache_Metadata(t *testing.T) {
 	if meta.DHCPBootImageName != "shimx64.efi" {
 		t.Errorf("DHCPBootImageName: got %q, want %q", meta.DHCPBootImageName, "shimx64.efi")
 	}
+
+	if meta.HTTPBootPath != "http/shimx64.efi" {
+		t.Errorf("HTTPBootPath: got %q, want %q", meta.HTTPBootPath, "http/shimx64.efi")
+	}
+}
+
+func TestFileResolverHTTPBootURL(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpurl123", map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: /efi/bootx64.efi\n"),
+	})
+
+	resolver := &FileResolver{Cache: cache, ServeURL: "http://10.0.0.10:8880/base/"}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-http-url"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{Image: "ghcr.io/test/image:v1"},
+		},
+	}
+
+	bootURL, err := resolver.HTTPBootURL(node)
+	require.NoError(t, err)
+	require.Equal(t, "http://10.0.0.10:8880/base/efi/bootx64.efi", bootURL)
+}
+
+func TestFileResolverHTTPBootURLFallsBackToDHCPBootImageName(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpfallback123", map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
+	})
+
+	resolver := &FileResolver{Cache: cache, ServeURL: "http://10.0.0.10:8880"}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-http-url"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{Image: "ghcr.io/test/image:v1"},
+		},
+	}
+
+	bootURL, err := resolver.HTTPBootURL(node)
+	require.NoError(t, err)
+	require.Equal(t, "http://10.0.0.10:8880/shimx64.efi", bootURL)
+}
+
+func TestJoinServeURLPathRejectsTraversal(t *testing.T) {
+	_, err := JoinServeURLPath("http://10.0.0.10:8880", "../shimx64.efi")
+	require.Error(t, err)
 }
 
 func TestOCICache_MetadataNoFile(t *testing.T) {
