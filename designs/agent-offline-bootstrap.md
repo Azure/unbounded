@@ -337,7 +337,7 @@ Minimal manifest:
 }
 ```
 
-The manifest is the source of truth for binary versions and included container images in offline mode. This prevents a newer agent binary from resolving newer built-in runtime defaults against an older offline bundle. For example, if the agent's built-in containerd default changes from `2.1.8` to `2.1.9`, but the offline manifest declares `2.1.8`, the agent resolves and installs the `2.1.8` artifact from the bundle. Similarly, `containerImages` lists image tags that should be available in containerd after bootstrap imports the bundled image archives, including the pause and kube-proxy images.
+The manifest is the source of truth for binary versions and included container images in offline mode. This prevents a newer agent binary from resolving newer built-in runtime defaults against an older offline bundle. For example, if the agent's built-in containerd default changes from `2.1.8` to `2.1.9`, but the offline manifest declares `2.1.8`, the agent resolves and installs the `2.1.8` artifact from the bundle. Similarly, `containerImages` lists image tags that should be available in containerd after bootstrap imports the bundled image archives, including the pause and kube-proxy images. The initial artifact builder supports exporting publicly pullable container images; private image registry authentication is out of scope for the initial implementation.
 
 The offline bundle should be versioned by Kubernetes version because Kubernetes is the primary compatibility axis. Example OCI tags:
 

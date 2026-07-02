@@ -6,6 +6,7 @@
 package agentartifacts
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"sort"
 	"strings"
@@ -181,6 +182,18 @@ func CNIArtifactPath(version, arch string) string {
 func CrictlArtifactPath(version, hostOS, arch string) string {
 	version = StripLeadingV(version)
 	return fmt.Sprintf("crictl/v%s/crictl-v%s-%s-%s.tar.gz", version, version, hostOS, arch)
+}
+
+func ContainerImageArchivePath(arch, imageTag string) string {
+	imageTag = strings.TrimSpace(imageTag)
+	name := strings.NewReplacer(
+		"/", "_",
+		":", "_",
+		"@", "_",
+	).Replace(imageTag)
+	digest := sha256.Sum256([]byte(imageTag))
+
+	return fmt.Sprintf("container-images/%s/%s-%x.tar", arch, name, digest[:6])
 }
 
 func NormalizeManifest(manifest Manifest) (Manifest, error) {

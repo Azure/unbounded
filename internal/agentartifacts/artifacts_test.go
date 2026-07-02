@@ -275,6 +275,13 @@ func TestCrictlArchive(t *testing.T) {
 	}
 }
 
+func TestContainerImageArchivePath(t *testing.T) {
+	t.Parallel()
+
+	got := ContainerImageArchivePath("amd64", "mcr.microsoft.com/oss/kubernetes/pause:3.9")
+	require.Equal(t, "container-images/amd64/mcr.microsoft.com_oss_kubernetes_pause_3.9-ea7c9a2ed959.tar", got)
+}
+
 func TestNormalizeManifest(t *testing.T) {
 	t.Parallel()
 
