@@ -2,15 +2,18 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 #
-# deploy-stable.sh - Deploy Orca onto an integration cluster
-# (unbounded-stable) with a real Azure Blob origin and an in-cluster
-# single-node Garage cachestore (PVC-backed).
+# deploy-integration.sh - Deploy Orca onto an integration cluster with a
+# real Azure Blob origin and an in-cluster single-node Garage cachestore
+# (PVC-backed).
 #
-# This is the integration-test deploy path. It is intentionally NOT
-# coupled to Azurite (the dev emulator): the origin is a real Azure
-# storage account. It renders the shippable Orca manifests from
-# deploy/orca and the test-only Garage manifest from hack/orca/stable,
-# applies them, bootstraps Garage, and waits for the rollout.
+# This is the integration-test deploy path, used by both the
+# unbounded-stable (release-upgrade) and unbounded-nightly workflows. It
+# is deployment-neutral: it targets whatever cluster the current kube
+# context / KUBECONFIG points at. It is intentionally NOT coupled to
+# Azurite (the dev emulator): the origin is a real Azure storage account.
+# It renders the shippable Orca manifests from deploy/orca and the
+# test-only Garage manifest from hack/orca/integration, applies them,
+# bootstraps Garage, and waits for the rollout.
 #
 # Confidential values (Azure account key, Garage S3 keys) come from a
 # pre-created Secret named orca-credentials and are injected into Orca
@@ -22,7 +25,7 @@
 # endpoint, origin id) are rendered into the orca-config ConfigMap from
 # the flags below.
 #
-# Usage: deploy-stable.sh [flags]
+# Usage: deploy-integration.sh [flags]
 #
 #   --context CTX          kubectl context to target (default: current)
 #   --namespace NS         namespace to install into (default: unbounded-kube)
@@ -168,7 +171,7 @@ log "Rendering orca manifests (image ${ORCA_IMAGE}, origin azureblob account ${A
 
 log "Rendering Garage manifest (PVC ${PVC_SIZE} on ${STORAGE_CLASS})"
 ( cd "${REPO_ROOT}" && go run ./hack/cmd/render-manifests \
-    --templates-dir "${REPO_ROOT}/hack/orca/stable" \
+    --templates-dir "${REPO_ROOT}/hack/orca/integration" \
     --output-dir "${rendered_garage}" \
     --set "Namespace=${NAMESPACE}" \
     --set "CachestoreRegion=us-east-1" \

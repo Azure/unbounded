@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/netboot"
 )
 
 const (
@@ -40,8 +41,9 @@ const (
 )
 
 type Reconciler struct {
-	Client client.Client
-	Pool   *Pool
+	Client       client.Client
+	Pool         *Pool
+	FileResolver *netboot.FileResolver
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -189,6 +191,21 @@ func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, m
 	}
 
 	if pendingRepave {
+		if machine.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
+			bootURL, err := r.httpBootURL(machine)
+			if err != nil {
+				return err
+			}
+
+			if config.Target == BootTargetUefiHTTP && config.Enabled == BootOnce && config.Mode == BootModeUEFI && config.UefiHTTPSource == bootURL {
+				return nil // Already set to one-time UEFI HTTP boot.
+			}
+
+			log.Info("setting boot source override to UEFI HTTP", "currentTarget", config.Target, "currentEnabled", config.Enabled, "bootURL", bootURL)
+
+			return c.SetHTTPBootOverride(ctx, bootURL)
+		}
+
 		if config.Target == BootTargetPxe && config.Enabled == BootContinuous {
 			return nil // Already set to PXE boot.
 		}
@@ -206,6 +223,19 @@ func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, m
 	log.Info("disabling boot source override", "currentTarget", config.Target, "currentEnabled", config.Enabled)
 
 	return c.DisableBootOverride(ctx)
+}
+
+func (r *Reconciler) httpBootURL(machine *v1alpha3.Machine) (string, error) {
+	if r.FileResolver == nil {
+		return "", fmt.Errorf("netboot file resolver is not configured")
+	}
+
+	bootURL, err := r.FileResolver.HTTPBootURL(machine)
+	if err != nil {
+		return "", fmt.Errorf("resolving UEFI HTTP boot URL: %w", err)
+	}
+
+	return bootURL, nil
 }
 
 // reconcilePowerOff drives the machine to the Off state by sending ForceOff

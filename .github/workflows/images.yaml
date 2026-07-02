@@ -14,6 +14,10 @@ on:
         description: "Image to build (directory name under images/, e.g. \"agent-ubuntu2404\")"
         required: true
         type: string
+      platforms:
+        description: "Platforms to build, e.g. linux/amd64 or linux/amd64,linux/arm64"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -35,11 +39,15 @@ jobs:
       name: ${{ steps.resolve.outputs.name }}
       tag: ${{ steps.resolve.outputs.tag }}
       file: ${{ steps.resolve.outputs.file }}
+      platforms: ${{ steps.resolve.outputs.platforms }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Resolve image name and tag
         id: resolve
+        env:
+          INPUT_PLATFORMS: ${{ inputs.platforms || '' }}
         run: |
           if [[ "${{ github.event_name }}" == "push" ]]; then
             # Tag is like "images/agent-ubuntu2404/v1.0.0"
@@ -54,23 +62,39 @@ jobs:
 
           file="images/${name}/Containerfile"
 
+          if [[ ( "$name" == playpen || "$name" == playpen-* ) && "${{ github.event_name }}" != "workflow_dispatch" ]]; then
+            echo "::notice::Skipping ${name}; playpen images are manual-only. Dispatch this workflow with image=${name}."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [[ ! -f "$file" ]]; then
             echo "::error::No Containerfile found at ${file}"
             exit 1
           fi
 
+          if [[ -n "$INPUT_PLATFORMS" ]]; then
+            platforms="$INPUT_PLATFORMS"
+          else
+            platforms="linux/amd64,linux/arm64"
+          fi
+
           echo "name=${name}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "file=${file}" >> "$GITHUB_OUTPUT"
+          echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
 
           echo "Image: ${name}:${tag}"
           echo "Containerfile: ${file}"
+          echo "Platforms: ${platforms}"
 
   # ---------------------------------------------------------------------------
   # Build and push multi-arch container image.
   # ---------------------------------------------------------------------------
   build:
     needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Normalize container registry
@@ -91,13 +115,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Build and push netboot dependency
+        if: needs.resolve.outputs.name == 'metalman'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: images/netboot/Containerfile
+          platforms: ${{ needs.resolve.outputs.platforms }}
+          push: true
+          tags: ${{ env.CONTAINER_REGISTRY }}/netboot:${{ needs.resolve.outputs.tag }}
+          cache-from: type=gha,scope=netboot
+          cache-to: type=gha,scope=netboot,mode=max
+
       - name: Build and push
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: ${{ needs.resolve.outputs.file }}
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ needs.resolve.outputs.platforms }}
           push: true
           tags: ${{ env.CONTAINER_REGISTRY }}/${{ needs.resolve.outputs.name }}:${{ needs.resolve.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ needs.resolve.outputs.tag }}
+            CONTAINER_REGISTRY=${{ env.CONTAINER_REGISTRY }}

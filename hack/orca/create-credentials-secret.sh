@@ -10,7 +10,7 @@
 #   - ORCA_CACHESTORE_S3_ACCESS_KEY  Garage S3 access key id (generated here)
 #   - ORCA_CACHESTORE_S3_SECRET_KEY  Garage S3 secret key   (generated here)
 #
-# The Garage S3 keys are the single source of truth: hack/orca/deploy-stable.sh
+# The Garage S3 keys are the single source of truth: hack/orca/deploy-integration.sh
 # imports them into Garage (via bootstrap-garage.sh) and injects them into
 # Orca via envFrom. This script generates fresh ones in the format Garage
 # requires (access id = "GK" + 12 hex bytes; secret = 32 hex bytes) unless
@@ -100,5 +100,5 @@ cat >&2 <<EOF
 Secret ${SECRET_NAME} applied to namespace ${NAMESPACE}.
 
 Garage S3 credentials are recorded only in the Secret and are imported
-into Garage automatically by hack/orca/deploy-stable.sh.
+into Garage automatically by hack/orca/deploy-integration.sh.
 EOF

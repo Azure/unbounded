@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -34,6 +35,10 @@ import (
 	"github.com/Azure/unbounded/internal/metalman/redfish"
 )
 
+// DefaultNetbootImage is the default netboot OCI image used when a Machine
+// omits spec.pxe.netbootImage. It is set at build time via -ldflags.
+var DefaultNetbootImage = "netboot:latest"
+
 // ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.
 func ServePXECmd() *cobra.Command {
 	var (
@@ -52,6 +57,7 @@ func ServePXECmd() *cobra.Command {
 		operationMaxConcurrentMachines int
 		operationMaxAttempts           int32
 		operationPollInterval          time.Duration
+		defaultNetbootImage            string
 	)
 
 	cmd := &cobra.Command{
@@ -180,11 +186,14 @@ func ServePXECmd() *cobra.Command {
 				serveURL = fmt.Sprintf("http://%s:%d", ip, httpPort)
 			}
 
+			defaultNetbootImage = strings.TrimSpace(defaultNetbootImage)
+
 			ociCache := netboot.NewOCICache(cacheDir)
 
 			if err := (&netboot.OCIReconciler{
-				Client: mgr.GetClient(),
-				Cache:  ociCache,
+				Client:            mgr.GetClient(),
+				Cache:             ociCache,
+				DefaultNetbootRef: defaultNetbootImage,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up OCI reconciler: %w", err)
 			}
@@ -192,7 +201,20 @@ func ServePXECmd() *cobra.Command {
 			redfishPool := redfish.NewPool()
 			defer redfishPool.Close()
 
-			if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool}).SetupWithManager(mgr); err != nil {
+			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient()}
+
+			resolver := netboot.FileResolver{
+				Cache:             ociCache,
+				Reader:            mgr.GetClient(),
+				Cluster:           clusterInfoWatcher,
+				ServeURL:          serveURL,
+				DefaultNetbootRef: defaultNetbootImage,
+				KubernetesVersion: kubeVersion,
+				ClusterDNS:        clusterDNS,
+				ProviderLabels:    providerLabels,
+			}
+
+			if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool, FileResolver: &resolver}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up Redfish reconciler: %w", err)
 			}
 
@@ -212,18 +234,8 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("setting up Lifecycle reconciler: %w", err)
 			}
 
-			if err := (&cloudinit.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+			if err := (&cloudinit.Reconciler{Client: mgr.GetClient(), StatusRecorder: statusQueue}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up CloudInit reconciler: %w", err)
-			}
-
-			resolver := netboot.FileResolver{
-				Cache:             ociCache,
-				Reader:            mgr.GetClient(),
-				Cluster:           clusterInfoWatcher,
-				ServeURL:          serveURL,
-				KubernetesVersion: kubeVersion,
-				ClusterDNS:        clusterDNS,
-				ProviderLabels:    providerLabels,
 			}
 
 			if dhcpInterface != "" && dhcpAutoInterface {
@@ -251,17 +263,17 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			dhcpServer := &dhcp.Server{
-				Interface: dhcpInterface,
-				Port:      dhcpPort,
-				Reader:    mgr.GetClient(),
-				ServerIP:  dhcpServerIP,
-				OCICache:  ociCache,
+				Interface:         dhcpInterface,
+				Port:              dhcpPort,
+				Reader:            mgr.GetClient(),
+				ServerIP:          dhcpServerIP,
+				OCICache:          ociCache,
+				DefaultNetbootRef: defaultNetbootImage,
 			}
 			if err := mgr.Add(dhcpServer); err != nil {
 				return fmt.Errorf("adding DHCP server: %w", err)
 			}
 
-			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient()}
 			if err := mgr.Add(statusQueue); err != nil {
 				return fmt.Errorf("adding status queue: %w", err)
 			}
@@ -305,6 +317,7 @@ func ServePXECmd() *cobra.Command {
 			PrintConfig("site", siteDisplay)
 			PrintConfig("leader-election", leID)
 			PrintConfig("serve-url", serveURL)
+			PrintConfig("default-netboot-image", defaultNetbootImage)
 			PrintConfig("cache-dir", cacheDir)
 			PrintConfig("dhcp-interface", dhcpInterface)
 			PrintConfig("dhcp-port", fmt.Sprintf("%d", dhcpPort))
@@ -340,6 +353,7 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().IntVar(&operationMaxConcurrentMachines, "operation-max-concurrent-machines", 10, "Maximum target Machines advanced concurrently within one MachineOperation")
 	cmd.Flags().Int32Var(&operationMaxAttempts, "operation-max-attempts", 3, "Maximum Redfish action attempts per target Machine")
 	cmd.Flags().DurationVar(&operationPollInterval, "operation-poll-interval", 5*time.Second, "Poll interval for in-progress MachineOperations")
+	cmd.Flags().StringVar(&defaultNetbootImage, "default-netboot-image", DefaultNetbootImage, "Default OCI image containing PXE netboot artifacts")
 
 	return cmd
 }

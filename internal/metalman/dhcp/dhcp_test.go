@@ -107,12 +107,13 @@ func TestDHCPHandlerPXE(t *testing.T) {
 	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:f1")
 	serverIP := net.ParseIP("10.0.1.254").To4()
 
-	imageRef := "ghcr.io/test/ubuntu-24-04:v1"
+	machineImageRef := "ghcr.io/test/ubuntu-24-04:v1"
+	netbootImageRef := "ghcr.io/test/netboot:v1"
 
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-02"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{Image: imageRef, DHCPLeases: []v1alpha3.DHCPLease{{
+			PXE: &v1alpha3.PXESpec{Image: machineImageRef, NetbootImage: netbootImageRef, DHCPLeases: []v1alpha3.DHCPLease{{
 				MAC:        "aa:bb:cc:dd:ee:f1",
 				IPv4:       "10.0.1.11",
 				SubnetMask: "255.255.255.0",
@@ -120,12 +121,12 @@ func TestDHCPHandlerPXE(t *testing.T) {
 		},
 	}
 
-	// Set up OCI cache with metadata for the image ref.
+	// Set up OCI cache with metadata for the netboot image ref.
 	cacheDir := t.TempDir()
 	ociCache := netboot.NewOCICache(cacheDir)
 
 	digest := "sha256:abcdef1234567890"
-	ociCache.SetDigest(imageRef, digest)
+	ociCache.SetDigest(netbootImageRef, digest)
 
 	diskDir := filepath.Join(ociCache.DiskDir(digest))
 	if err := os.MkdirAll(diskDir, 0o755); err != nil {
@@ -184,6 +185,149 @@ func TestDHCPHandlerPXE(t *testing.T) {
 
 	if !resp.ServerIPAddr.Equal(serverIP) {
 		t.Errorf("expected next-server %s, got %s", serverIP, resp.ServerIPAddr)
+	}
+}
+
+func TestDHCPHandlerPXEUsesDefaultNetbootImage(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:f2")
+	serverIP := net.ParseIP("10.0.1.254").To4()
+	netbootImageRef := "ghcr.io/test/default-netboot:v1"
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-default-netboot"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Architecture: v1alpha3.PXEArchitectureARM64,
+				DHCPLeases: []v1alpha3.DHCPLease{{
+					MAC:        "aa:bb:cc:dd:ee:f2",
+					IPv4:       "10.0.1.12",
+					SubnetMask: "255.255.255.0",
+				}},
+			},
+		},
+	}
+
+	cacheDir := t.TempDir()
+	ociCache := netboot.NewOCICache(cacheDir)
+
+	digest := "sha256:default1234567890"
+	ociCache.SetDigestForArchitecture(netbootImageRef, v1alpha3.PXEArchitectureARM64, digest)
+
+	diskDir := filepath.Join(ociCache.DiskDirForArchitecture(digest, v1alpha3.PXEArchitectureARM64))
+	if err := os.MkdirAll(diskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(diskDir, "metadata.yaml"),
+		[]byte("dhcpBootImageName: shimaa64.efi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := newFakeReader(t, node)
+	srv := &Server{
+		Interface:         "eth0",
+		Reader:            reader,
+		ServerIP:          serverIP,
+		OCICache:          ociCache,
+		DefaultNetbootRef: netbootImageRef,
+	}
+
+	discover, err := dhcpv4.NewDiscovery(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn := &fakePacketConn{}
+	peer := &net.UDPAddr{IP: net.ParseIP("10.0.1.12"), Port: 68}
+
+	srv.handler(conn, peer, discover)
+
+	if conn.written == nil {
+		t.Fatal("expected DHCP response, got none")
+	}
+
+	resp, err := dhcpv4.FromBytes(conn.written)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if bootfile := resp.BootFileNameOption(); bootfile != "shimaa64.efi" {
+		t.Errorf("expected bootfile shimaa64.efi, got %s", bootfile)
+	}
+}
+
+func TestDHCPHandlerHTTPBootSuppressesPXEBootOptions(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:f3")
+	serverIP := net.ParseIP("10.0.1.254").To4()
+	netbootImageRef := "ghcr.io/test/netboot:v1"
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-http-boot"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				NetbootImage: netbootImageRef,
+				BootProtocol: v1alpha3.PXEBootProtocolHTTP,
+				DHCPLeases: []v1alpha3.DHCPLease{{
+					MAC:        "aa:bb:cc:dd:ee:f3",
+					IPv4:       "10.0.1.13",
+					SubnetMask: "255.255.255.0",
+				}},
+			},
+		},
+	}
+
+	cacheDir := t.TempDir()
+	ociCache := netboot.NewOCICache(cacheDir)
+
+	digest := "sha256:httpboot1234567890"
+	ociCache.SetDigest(netbootImageRef, digest)
+
+	diskDir := filepath.Join(ociCache.DiskDir(digest))
+	if err := os.MkdirAll(diskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(diskDir, "metadata.yaml"), []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: shimx64.efi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := newFakeReader(t, node)
+	srv := &Server{
+		Interface: "eth0",
+		Reader:    reader,
+		ServerIP:  serverIP,
+		OCICache:  ociCache,
+	}
+
+	discover, err := dhcpv4.NewDiscovery(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn := &fakePacketConn{}
+	peer := &net.UDPAddr{IP: net.ParseIP("10.0.1.13"), Port: 68}
+
+	srv.handler(conn, peer, discover)
+
+	if conn.written == nil {
+		t.Fatal("expected DHCP response, got none")
+	}
+
+	resp, err := dhcpv4.FromBytes(conn.written)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if tftpServer := resp.TFTPServerName(); tftpServer != "" {
+		t.Errorf("expected no TFTP server for HTTP boot, got %s", tftpServer)
+	}
+
+	if bootfile := resp.BootFileNameOption(); bootfile != "" {
+		t.Errorf("expected no bootfile for HTTP boot, got %s", bootfile)
+	}
+
+	if !resp.YourIPAddr.Equal(net.ParseIP("10.0.1.13")) {
+		t.Errorf("expected YourIP 10.0.1.13, got %s", resp.YourIPAddr)
 	}
 }
 

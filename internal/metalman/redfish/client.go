@@ -40,8 +40,9 @@ const (
 type BootTarget string
 
 const (
-	BootTargetPxe BootTarget = "Pxe"
-	BootTargetHdd BootTarget = "Hdd"
+	BootTargetPxe      BootTarget = "Pxe"
+	BootTargetHdd      BootTarget = "Hdd"
+	BootTargetUefiHTTP BootTarget = "UefiHttp"
 )
 
 // BootEnabled represents a Redfish boot source override enabled mode.
@@ -49,13 +50,23 @@ type BootEnabled string
 
 const (
 	BootContinuous BootEnabled = "Continuous"
+	BootOnce       BootEnabled = "Once"
 	BootDisabled   BootEnabled = "Disabled"
+)
+
+// BootMode represents a Redfish boot source override mode.
+type BootMode string
+
+const (
+	BootModeUEFI BootMode = "UEFI"
 )
 
 // BootConfig holds the current boot source override configuration.
 type BootConfig struct {
-	Target  BootTarget
-	Enabled BootEnabled
+	Target         BootTarget
+	Enabled        BootEnabled
+	Mode           BootMode
+	UefiHTTPSource string
 }
 
 // Client provides Redfish operations against a single BMC.
@@ -156,6 +167,8 @@ func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
 		Boot struct {
 			BootSourceOverrideTarget  BootTarget  `json:"BootSourceOverrideTarget"`
 			BootSourceOverrideEnabled BootEnabled `json:"BootSourceOverrideEnabled"`
+			BootSourceOverrideMode    BootMode    `json:"BootSourceOverrideMode"`
+			HTTPBootURI               string      `json:"HttpBootUri"`
 		} `json:"Boot"`
 	}
 	if err := json.Unmarshal(data, &system); err != nil {
@@ -163,8 +176,10 @@ func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
 	}
 
 	return BootConfig{
-		Target:  system.Boot.BootSourceOverrideTarget,
-		Enabled: system.Boot.BootSourceOverrideEnabled,
+		Target:         system.Boot.BootSourceOverrideTarget,
+		Enabled:        system.Boot.BootSourceOverrideEnabled,
+		Mode:           system.Boot.BootSourceOverrideMode,
+		UefiHTTPSource: system.Boot.HTTPBootURI,
 	}, nil
 }
 
@@ -191,6 +206,36 @@ func (c *Client) SetBootOverride(ctx context.Context, target BootTarget, enabled
 
 	if !isSuccessStatus(status) {
 		return fmt.Errorf("unexpected status %d from boot override PATCH", status)
+	}
+
+	return nil
+}
+
+// SetHTTPBootOverride sets a one-time Redfish UEFI HTTP boot override.
+// Returns ErrUnsupported if the BMC does not support the PATCH.
+func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error {
+	path := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
+
+	body := map[string]any{
+		"Boot": map[string]string{
+			"BootSourceOverrideTarget":  string(BootTargetUefiHTTP),
+			"BootSourceOverrideEnabled": string(BootOnce),
+			"BootSourceOverrideMode":    string(BootModeUEFI),
+			"HttpBootUri":               bootURL,
+		},
+	}
+
+	_, status, err := c.session.do(ctx, http.MethodPatch, path, body)
+	if err != nil {
+		return err
+	}
+
+	if isUnsupportedStatus(status) {
+		return fmt.Errorf("UEFI HTTP boot override PATCH returned %d: %w", status, ErrUnsupported)
+	}
+
+	if !isSuccessStatus(status) {
+		return fmt.Errorf("unexpected status %d from UEFI HTTP boot override PATCH", status)
 	}
 
 	return nil

@@ -340,7 +340,7 @@ fn ssl_error(context: &str) -> Error {
         if code == 0 {
             String::new()
         } else {
-            let mut buf = [0i8; 256];
+            let mut buf = [0 as std::ffi::c_char; 256];
             ffi::ERR_error_string_n(code, buf.as_mut_ptr(), buf.len());
             let bytes = buf
                 .iter()

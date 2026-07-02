@@ -33,15 +33,15 @@ SSH connection details. When `ssh` is nil, the machina controller skips the Mach
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `ssh` | SSHSpec | No | — | SSH connection configuration. |
-| `ssh.host` | string | Yes | — | Hostname or IP, optionally with port (e.g. `1.2.3.4:2222`). Port 22 is assumed when omitted. |
+| `ssh` | SSHSpec | No | - | SSH connection configuration. |
+| `ssh.host` | string | Yes | - | Hostname or IP, optionally with port (e.g. `1.2.3.4:2222`). Port 22 is assumed when omitted. |
 | `ssh.username` | string | No | `"azureuser"` | SSH username. |
-| `ssh.privateKeyRef` | SecretKeySelector | Yes | — | Reference to a Secret containing the SSH private key. Must reside in the `unbounded-kube` namespace. |
-| `ssh.privateKeyRef.name` | string | Yes | — | Secret name. |
-| `ssh.privateKeyRef.namespace` | string | Yes | — | Secret namespace (must be `unbounded-kube`). |
+| `ssh.privateKeyRef` | SecretKeySelector | Yes | - | Reference to a Secret containing the SSH private key. Must reside in the `unbounded-kube` namespace. |
+| `ssh.privateKeyRef.name` | string | Yes | - | Secret name. |
+| `ssh.privateKeyRef.namespace` | string | Yes | - | Secret namespace (must be `unbounded-kube`). |
 | `ssh.privateKeyRef.key` | string | No | `"ssh-privatekey"` | Key within the Secret's `data` map. |
-| `ssh.bastion` | BastionSSHSpec | No | — | Optional jump host for the SSH connection. |
-| `ssh.bastion.host` | string | Yes | — | Bastion hostname or IP, optionally with port. |
+| `ssh.bastion` | BastionSSHSpec | No | - | Optional jump host for the SSH connection. |
+| `ssh.bastion.host` | string | Yes | - | Bastion hostname or IP, optionally with port. |
 | `ssh.bastion.username` | string | No | `"azureuser"` | Bastion SSH username. |
 | `ssh.bastion.privateKeyRef` | *SecretKeySelector | No | Same as `ssh.privateKeyRef` | Bastion SSH key. Falls back to the parent `ssh.privateKeyRef` when omitted. |
 
@@ -51,23 +51,26 @@ PXE boot configuration consumed by the metalman controller.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `pxe` | PXESpec | No | — | PXE boot configuration. |
-| `pxe.image` | string | Yes | — | OCI image reference containing netboot artifacts (e.g. `"ghcr.io/azure/images/host-ubuntu2404:v1"`). |
-| `pxe.dhcpLeases` | []DHCPLease | No | — | Static DHCP leases served during PXE boot. |
-| `pxe.dhcpLeases[].ipv4` | string | Yes | — | Static IPv4 address to assign. |
-| `pxe.dhcpLeases[].mac` | string | Yes | — | NIC MAC address (matched case-insensitively). |
-| `pxe.dhcpLeases[].subnetMask` | string | Yes | — | Subnet mask. |
-| `pxe.dhcpLeases[].gateway` | string | Yes | — | Default gateway. |
-| `pxe.dhcpLeases[].dns` | []string | No | — | DNS server addresses. |
-| `pxe.redfish` | RedfishSpec | No | — | BMC access via the Redfish API. |
-| `pxe.redfish.url` | string | Yes | — | Redfish endpoint URL. |
-| `pxe.redfish.username` | string | Yes | — | Redfish username. |
+| `pxe` | PXESpec | No | - | PXE boot configuration. |
+| `pxe.image` | string | Yes | - | OCI machine image reference containing `/disk/disk.img.gz` (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`). |
+| `pxe.architecture` | string | No | `amd64` | Target CPU architecture for PXE boot artifacts and machine images. Allowed values: `amd64`, `arm64`. |
+| `pxe.netbootImage` | string | No | Metalman default | OCI netboot image reference containing PXE boot artifacts. |
+| `pxe.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP boot with a URL derived from the netboot image metadata. Allowed values: `PXE`, `HTTP`. |
+| `pxe.dhcpLeases` | []DHCPLease | No | - | Static DHCP leases served during PXE boot. |
+| `pxe.dhcpLeases[].ipv4` | string | Yes | - | Static IPv4 address to assign. |
+| `pxe.dhcpLeases[].mac` | string | Yes | - | NIC MAC address (matched case-insensitively). |
+| `pxe.dhcpLeases[].subnetMask` | string | Yes | - | Subnet mask. |
+| `pxe.dhcpLeases[].gateway` | string | Yes | - | Default gateway. |
+| `pxe.dhcpLeases[].dns` | []string | No | - | DNS server addresses. |
+| `pxe.redfish` | RedfishSpec | No | - | BMC access via the Redfish API. |
+| `pxe.redfish.url` | string | Yes | - | Redfish endpoint URL. |
+| `pxe.redfish.username` | string | Yes | - | Redfish username. |
 | `pxe.redfish.deviceID` | string | No | `"1"` | Redfish system device ID. |
-| `pxe.redfish.passwordRef` | SecretKeySelector | Yes | — | Secret containing the Redfish password. |
-| `pxe.cloudInit` | CloudInitSpec | No | — | Optional cloud-init customization for PXE-booted machines. |
-| `pxe.cloudInit.userDataConfigMapRef` | ConfigMapKeySelector | No | — | Reference to a ConfigMap containing custom cloud-init user-data. |
-| `pxe.cloudInit.userDataConfigMapRef.name` | string | Yes | — | ConfigMap name. |
-| `pxe.cloudInit.userDataConfigMapRef.namespace` | string | Yes | — | ConfigMap namespace. |
+| `pxe.redfish.passwordRef` | SecretKeySelector | Yes | - | Secret containing the Redfish password. |
+| `pxe.cloudInit` | CloudInitSpec | No | - | Optional cloud-init customization for PXE-booted machines. |
+| `pxe.cloudInit.userDataConfigMapRef` | ConfigMapKeySelector | No | - | Reference to a ConfigMap containing custom cloud-init user-data. |
+| `pxe.cloudInit.userDataConfigMapRef.name` | string | Yes | - | ConfigMap name. |
+| `pxe.cloudInit.userDataConfigMapRef.namespace` | string | Yes | - | ConfigMap namespace. |
 | `pxe.cloudInit.userDataConfigMapRef.key` | string | No | `"user-data"` | Key within the ConfigMap. |
 
 ### spec.kubernetes
@@ -76,11 +79,11 @@ Kubernetes join configuration.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `kubernetes` | KubernetesSpec | No | — | Kubernetes join settings. |
+| `kubernetes` | KubernetesSpec | No | - | Kubernetes join settings. |
 | `kubernetes.version` | string | No | Cluster version | Desired Kubernetes version (e.g. `"v1.34.0"`). A `v` prefix is added automatically if missing. |
-| `kubernetes.nodeRef` | *LocalObjectReference | No | — | Reference to the corresponding Node object. Set by the controller. |
-| `kubernetes.nodeLabels` | map[string]string | No | — | Labels to apply to the Node (not yet propagated by the machina controller). |
-| `kubernetes.bootstrapTokenRef.name` | string | Yes | — | Name of the bootstrap token Secret in `kube-system`. |
+| `kubernetes.nodeRef` | *LocalObjectReference | No | - | Reference to the corresponding Node object. Set by the controller. |
+| `kubernetes.nodeLabels` | map[string]string | No | - | Labels to apply to the Node (not yet propagated by the machina controller). |
+| `kubernetes.bootstrapTokenRef.name` | string | Yes | - | Name of the bootstrap token Secret in `kube-system`. |
 
 ### spec.operations
 
@@ -239,11 +242,11 @@ The machina controller drives the following phases:
 | Phase | Meaning | Requeue interval |
 |-------|---------|------------------|
 | `Pending` | SSH is unreachable. | 30 s |
-| `Provisioning` | Install script is running over SSH. | — |
+| `Provisioning` | Install script is running over SSH. | - |
 | `Joining` | Provisioned; waiting for a Node with the matching label. | 30 s |
 | `Ready` | Node exists, or no `kubernetes` spec is present. | 5 min |
 | `Failed` | Provisioning encountered an error. | 60 s |
-| `Rebooting` | Reserved for metalman or provider controllers. | — |
+| `Rebooting` | Reserved for metalman or provider controllers. | - |
 
 ### Labels and annotations
 
@@ -372,7 +375,8 @@ spec:
       name: ssh-key
       namespace: unbounded-kube
   pxe:
-    image: ghcr.io/azure/images/host-ubuntu2404:v1
+    image: ghcr.io/azure/host-ubuntu2404:v1
+    architecture: amd64
     dhcpLeases:
     - ipv4: "10.0.0.60"
       mac: "aa:bb:cc:dd:ee:ff"
@@ -398,15 +402,22 @@ spec:
 
 ---
 
-## Netboot OCI Images
+## PXE OCI Images
 
-Netboot images are standard OCI container images built `FROM scratch` that
-contain all files needed for PXE booting a machine under `/disk/`. This follows
-the kubevirt containerDisk convention.
+Metalman uses a machine image and a netboot image for PXE repaves. The machine
+image is referenced by `spec.pxe.image` and contains `/disk/disk.img.gz`. The
+netboot image is referenced by `spec.pxe.netbootImage`, or by Metalman's default
+when that field is omitted, and contains the reusable PXE boot environment.
+`spec.pxe.architecture` selects the OCI platform manifest to pull for both
+images and defaults to `amd64`.
 
-Files with a `.tmpl` suffix are Go templates rendered per-machine at serve time;
-other files are served verbatim. A `metadata.yaml` file provides image-level
-configuration (e.g. `dhcpBootImageName`).
+Both images are standard OCI container images built `FROM scratch` with artifacts
+under `/disk/`. This follows the kubevirt containerDisk convention.
+
+Files with a `.tmpl` suffix in the netboot image are Go templates rendered
+per-machine at serve time; other files are served verbatim. A `metadata.yaml`
+file in the netboot image provides image-level configuration such as
+`dhcpBootImageName` and `httpBootPath`.
 
 ### Image layout
 
@@ -429,20 +440,28 @@ Templates receive the following data object:
 Images are built, tagged, and pushed using standard container tooling:
 
 ```bash
-docker build -t ghcr.io/azure/images/host-ubuntu2404:v1 .
-docker push ghcr.io/azure/images/host-ubuntu2404:v1
+docker build -t ghcr.io/azure/host-ubuntu2404:v1 -f images/host-ubuntu2404/Containerfile .
+docker build -t ghcr.io/azure/netboot:v1 -f images/netboot/Containerfile .
+docker push ghcr.io/azure/host-ubuntu2404:v1
+docker push ghcr.io/azure/netboot:v1
 ```
 
-See `images/host-ubuntu2404/` for an example Containerfile.
+See `images/host-ubuntu2404/` for a machine image Containerfile and `images/netboot/` for the
+reusable netboot image Containerfile.
 
 ### metadata.yaml
 
 ```yaml
 dhcpBootImageName: shimx64.efi
+httpBootPath: shimx64.efi
 ```
 
 The `dhcpBootImageName` field specifies the boot filename included in DHCP
-responses (option 67).
+responses (option 67) for `spec.pxe.bootProtocol: PXE`.
+
+The `httpBootPath` field specifies the file path, relative to metalman's HTTP
+artifact server, used for `spec.pxe.bootProtocol: HTTP`. If `httpBootPath` is
+omitted, metalman falls back to `dhcpBootImageName` for the UEFI HTTP boot URL.
 
 ---
 
