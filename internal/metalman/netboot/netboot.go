@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -217,6 +218,7 @@ type templateData struct {
 	Machine             *v1alpha3.Machine
 	ApiserverURL        string
 	ServeURL            string
+	GrubServeRoot       string
 	AgentConfigJSON     string
 	InstallScript       string
 	InstallEnv          []string
@@ -245,12 +247,26 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 		Machine:             node,
 		ApiserverURL:        ci.ApiserverURL,
 		ServeURL:            serveURL,
+		GrubServeRoot:       grubServeRoot(serveURL),
 		AgentConfigJSON:     agentConfigJSON,
 		InstallScript:       provision.UnboundedAgentInstallScript(),
 		InstallEnv:          provision.AgentInstallEnv(agent),
 		SpecRepaveCounter:   specRepave,
 		StatusRepaveCounter: statusRepave,
 	}
+}
+
+func grubServeRoot(serveURL string) string {
+	u, err := url.Parse(serveURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return serveURL
+	}
+
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return serveURL
+	}
+
+	return fmt.Sprintf("(%s,%s)%s", u.Scheme, u.Host, strings.TrimRight(u.EscapedPath(), "/"))
 }
 
 var (

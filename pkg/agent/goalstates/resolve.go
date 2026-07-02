@@ -105,7 +105,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		KubeMachineName: cfg.MachineName,
 		NodeName:        cfg.NodeName,
 		MachineDir:      filepath.Join("/var/lib/machines", machineName),
-		Containerd:      ResolveContainerd(),
+		Containerd:      ResolveContainerd(ociImage),
 		Kubelet:         kubelet,
 		Nvidia:          nvidia,
 	}

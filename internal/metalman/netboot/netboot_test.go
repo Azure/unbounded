@@ -783,6 +783,8 @@ func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
 	body := string(result)
 	for _, want := range []string{
 		"No pending repave",
+		"linux (http,10.0.1.1:8080)/vmlinuz",
+		"initrd (http,10.0.1.1:8080)/initrd (http,10.0.1.1:8080)/init.cpio",
 		"unbounded.image_url=http://10.0.1.1:8080/disk.img.gz",
 		"unbounded.node_name=node-no-operations",
 		"ip=10.0.1.20::10.0.1.1:255.255.255.0::eth0:none",

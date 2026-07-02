@@ -27,7 +27,7 @@ set default=0
 set timeout=0
 
 menuentry "Unbounded Metal Install" {
-  linux /vmlinuz \
+  linux {{ .GrubServeRoot }}/vmlinuz \
     unbounded.image_url={{ .ServeURL }}/disk.img.gz \
     unbounded.serve_url={{ .ServeURL }} \
     unbounded.ds_url={{ .ServeURL }}/cloud-init/ \
@@ -37,5 +37,5 @@ menuentry "Unbounded Metal Install" {
     ip={{ (index .Machine.Spec.PXE.DHCPLeases 0).IPv4 }}::{{ (index .Machine.Spec.PXE.DHCPLeases 0).Gateway }}:{{ (index .Machine.Spec.PXE.DHCPLeases 0).SubnetMask }}::eth0:none \
     console=tty0 console=ttyS0,115200n8 \
     ---
-  initrd /initrd /init.cpio
+  initrd {{ .GrubServeRoot }}/initrd {{ .GrubServeRoot }}/init.cpio
 }

@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/pin/tftp/v3"
 )
@@ -30,6 +31,8 @@ func (t *TFTPServer) NeedLeaderElection() bool { return false }
 
 func (t *TFTPServer) Start(ctx context.Context) error {
 	s := tftp.NewServer(t.readHandler, nil)
+	s.SetRetries(12)
+	s.SetTimeout(10 * time.Second)
 	s.SetAnticipate(0)
 
 	addr := net.JoinHostPort(t.BindAddr, "69")

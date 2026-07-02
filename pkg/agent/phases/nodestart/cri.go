@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"text/template"
 
 	"github.com/Azure/unbounded/internal/executil"
@@ -51,6 +52,10 @@ func (c *configureContainerd) Do(_ context.Context) error {
 		return fmt.Errorf("ensure containerd service unit: %w", err)
 	}
 
+	if err := c.ensureRegistryHosts(); err != nil {
+		return fmt.Errorf("ensure registry hosts: %w", err)
+	}
+
 	if err := c.ensureGPUDropInConfigs(); err != nil {
 		return fmt.Errorf("ensure GPU drop-in configs: %w", err)
 	}
@@ -77,6 +82,19 @@ func (c *configureContainerd) ensureContainerdConfig() error {
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.ContainerdConfigPath)
 
 	return utilio.WriteFile(dest, buf.Bytes(), 0o644)
+}
+
+func (c *configureContainerd) ensureRegistryHosts() error {
+	for _, host := range c.goalState.Containerd.RegistryHosts {
+		content := fmt.Sprintf("server = %q\n\n[host.%q]\n  capabilities = [\"pull\", \"resolve\"]\n", host.Server, host.Server)
+
+		dest := filepath.Join(c.goalState.MachineDir, "/etc/containerd/certs.d", strings.TrimSpace(host.Host), "hosts.toml")
+		if err := utilio.WriteFile(dest, []byte(content), 0o644); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // ensureContainerdServiceUnit renders and writes the containerd systemd unit

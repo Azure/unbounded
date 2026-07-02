@@ -10,6 +10,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,15 +27,18 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	api_meta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	intstr "k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -41,6 +46,7 @@ import (
 	metalredfish "github.com/Azure/unbounded/internal/metalman/redfish"
 	playpenclient "github.com/Azure/unbounded/internal/playpen/client"
 	"github.com/Azure/unbounded/internal/playpen/runner"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 const (
@@ -57,6 +63,13 @@ const (
 
 	artifactModeGHCR  = "ghcr"
 	artifactModeLocal = "local"
+
+	playpenEndpointDirect       = "direct"
+	playpenEndpointLoadBalancer = "loadbalancer"
+	playpenEndpointRelay        = "relay"
+
+	kindnetSmokeDaemonSet = "kindnet-metalman"
+	kindnetSmokeApp       = "kindnet-metalman"
 )
 
 type harness struct {
@@ -70,6 +83,7 @@ type harness struct {
 	targetKubeconfig  string
 	apiserverURL      string
 	apiserverProxyTo  string
+	playpenEndpoint   string
 	artifactMode      string
 
 	hostImage       string
@@ -111,7 +125,9 @@ func TestPlaypenMetalmanSmoke(t *testing.T) {
 
 	h.buildBinaries(ctx)
 	h.packageAgentTarball()
+	h.mirrorAgentDownloads(ctx)
 	h.allocatePlaypen(ctx)
+	h.startConsoleLog(ctx)
 	h.prepareImages(ctx)
 	h.startAPIServerProxy(ctx)
 	h.startAgentServer(ctx)
@@ -131,15 +147,13 @@ func TestPlaypenMetalmanSmoke(t *testing.T) {
 	initialBootID := h.nodeBootID(ctx, machineName)
 
 	h.runHostPowerOff(ctx)
-	h.waitRedfishPowerState(ctx, metalredfish.PowerOff, 5*time.Minute)
+	h.waitNodeNotReady(ctx, machineName)
 
 	h.runHostPowerOn(ctx)
-	h.waitRedfishPowerState(ctx, metalredfish.PowerOn, 5*time.Minute)
 	h.waitNodeReady(ctx, machineName)
 	bootIDAfterPowerOn := h.waitNodeBootIDChanged(ctx, machineName, initialBootID)
 
 	h.runSelectorHostReboot(ctx)
-	h.waitRedfishPowerState(ctx, metalredfish.PowerOn, 5*time.Minute)
 	h.waitNodeReady(ctx, machineName)
 	h.waitNodeBootIDChanged(ctx, machineName, bootIDAfterPowerOn)
 }
@@ -186,7 +200,13 @@ func TestDebugPlaypenReachability(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	h := &harness{t: t, repoRoot: repoRoot(t), artifacts: t.TempDir(), playpenKubeconfig: envDefault("PLAYPEN_KUBECONFIG", filepath.Join(homeDir(t), ".kube", "config.bench"))}
+	h := &harness{
+		t:                 t,
+		repoRoot:          repoRoot(t),
+		artifacts:         t.TempDir(),
+		playpenKubeconfig: envDefault("PLAYPEN_KUBECONFIG", filepath.Join(homeDir(t), ".kube", "config.bench")),
+		playpenEndpoint:   strings.ToLower(strings.TrimSpace(os.Getenv("METALMAN_E2E_PLAYPEN_ENDPOINT"))),
+	}
 	h.configurePlaypenTunnel(ctx)
 	redfishURL := strings.TrimRight(h.playpen.Metadata.Redfish["url"], "/") + "/redfish/v1/"
 	redfishHost := ""
@@ -233,8 +253,20 @@ func TestDebugPlaypenReachability(t *testing.T) {
 		if err != nil {
 			failed = append(failed, fmt.Sprintf("%s: %v", strings.Join(args, " "), err))
 		}
+		h.checkProcesses()
 	}
 	if len(failed) > 0 {
+		cmd, err := h.playpen.Command(ctx, "wg", "show")
+		if err == nil {
+			out, runErr := h.runCmdOut(cmd)
+			t.Logf("$ wg show after probes\n%s", out)
+			if runErr != nil {
+				t.Logf("wg show after probes failed: %v", runErr)
+			}
+		} else {
+			t.Logf("build wg show after probes: %v", err)
+		}
+		h.logProcessLogs()
 		t.Fatalf("Playpen reachability checks failed:\n%s", strings.Join(failed, "\n"))
 	}
 }
@@ -285,6 +317,7 @@ func newHarness(t *testing.T) *harness {
 		targetKubeconfig:  targetKubeconfig,
 		apiserverURL:      apiserverURL,
 		apiserverProxyTo:  strings.TrimSpace(os.Getenv("METALMAN_E2E_APISERVER_PROXY_TARGET")),
+		playpenEndpoint:   strings.ToLower(strings.TrimSpace(os.Getenv("METALMAN_E2E_PLAYPEN_ENDPOINT"))),
 		artifactMode:      mode,
 		hostImage:         strings.TrimSpace(os.Getenv("METALMAN_E2E_HOST_IMAGE")),
 		netbootImage:      strings.TrimSpace(os.Getenv("METALMAN_E2E_NETBOOT_IMAGE")),
@@ -489,6 +522,142 @@ func (h *harness) packageAgentTarball() {
 	}
 }
 
+func (h *harness) mirrorAgentDownloads(ctx context.Context) {
+	h.t.Helper()
+
+	kubernetesVersion := h.targetKubernetesVersion()
+	h.mirrorKubernetesBinaries(ctx, kubernetesVersion, "amd64")
+
+	containerdVersion := goalstates.ContainerdVersion
+	h.mirrorRemoteFile(
+		ctx,
+		fmt.Sprintf("https://github.com/containerd/containerd/releases/download/v%s/containerd-%s-linux-amd64.tar.gz", containerdVersion, containerdVersion),
+		filepath.Join(h.artifacts, "containerd", "v"+containerdVersion, fmt.Sprintf("containerd-%s-linux-amd64.tar.gz", containerdVersion)),
+	)
+
+	runcVersion := goalstates.RunCVersion
+	h.mirrorRemoteFile(
+		ctx,
+		fmt.Sprintf("https://github.com/opencontainers/runc/releases/download/v%s/runc.amd64", runcVersion),
+		filepath.Join(h.artifacts, "runc", "v"+runcVersion, "runc.amd64"),
+	)
+
+	cniVersion := goalstates.CNIPluginVersion
+	h.mirrorRemoteFile(
+		ctx,
+		fmt.Sprintf("https://github.com/containernetworking/plugins/releases/download/v%s/cni-plugins-linux-amd64-v%s.tgz", cniVersion, cniVersion),
+		filepath.Join(h.artifacts, "cni", "v"+cniVersion, fmt.Sprintf("cni-plugins-linux-amd64-v%s.tgz", cniVersion)),
+	)
+
+	crictlVersion := crictlVersionForKubernetes(h.t, kubernetesVersion)
+	h.mirrorRemoteFile(
+		ctx,
+		fmt.Sprintf("https://github.com/kubernetes-sigs/cri-tools/releases/download/v%s/crictl-v%s-linux-amd64.tar.gz", crictlVersion, crictlVersion),
+		filepath.Join(h.artifacts, "crictl", "v"+crictlVersion, fmt.Sprintf("crictl-v%s-linux-amd64.tar.gz", crictlVersion)),
+	)
+}
+
+func (h *harness) targetKubernetesVersion() string {
+	h.t.Helper()
+
+	version, err := h.targetKube.Discovery().ServerVersion()
+	if err != nil {
+		h.t.Fatalf("resolve target Kubernetes version: %v", err)
+	}
+	if version.GitVersion == "" {
+		h.t.Fatal("target Kubernetes version is empty")
+	}
+
+	return version.GitVersion
+}
+
+func (h *harness) mirrorKubernetesBinaries(ctx context.Context, version, arch string) {
+	h.t.Helper()
+
+	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
+	if version == "" {
+		h.t.Fatal("Kubernetes version is empty")
+	}
+
+	for _, binary := range []string{"kubelet", "kubectl", "kube-proxy"} {
+		dst := filepath.Join(h.artifacts, "kubernetes", "v"+version, "bin", "linux", arch, binary)
+		h.mirrorRemoteFile(ctx, fmt.Sprintf("https://dl.k8s.io/v%s/bin/linux/%s/%s", version, arch, binary), dst)
+		h.writeSHA256File(dst, binary)
+	}
+}
+
+func (h *harness) mirrorRemoteFile(ctx context.Context, src, dst string) {
+	h.t.Helper()
+
+	if stat, err := os.Stat(dst); err == nil && stat.Size() > 0 {
+		return
+	} else if err != nil && !os.IsNotExist(err) {
+		h.t.Fatalf("stat mirrored artifact %s: %v", dst, err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		h.t.Fatalf("mkdir mirrored artifact dir: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, http.NoBody)
+	if err != nil {
+		h.t.Fatalf("create download request %s: %v", src, err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.t.Fatalf("download %s: %v", src, err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // Test artifact download cleanup.
+	if resp.StatusCode != http.StatusOK {
+		h.t.Fatalf("download %s returned HTTP %d", src, resp.StatusCode)
+	}
+
+	tmp := dst + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		h.t.Fatalf("create mirrored artifact %s: %v", tmp, err)
+	}
+	if _, err := io.Copy(file, resp.Body); err != nil {
+		file.Close()   //nolint:errcheck // Best-effort cleanup before fatal.
+		os.Remove(tmp) //nolint:errcheck // Best-effort cleanup before fatal.
+		h.t.Fatalf("write mirrored artifact %s: %v", tmp, err)
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(tmp) //nolint:errcheck // Best-effort cleanup before fatal.
+		h.t.Fatalf("close mirrored artifact %s: %v", tmp, err)
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp) //nolint:errcheck // Best-effort cleanup before fatal.
+		h.t.Fatalf("install mirrored artifact %s: %v", dst, err)
+	}
+}
+
+func (h *harness) writeSHA256File(path, name string) {
+	h.t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		h.t.Fatalf("read mirrored artifact %s: %v", path, err)
+	}
+	hash := sha256.Sum256(data)
+	checksum := fmt.Sprintf("%s  %s\n", hex.EncodeToString(hash[:]), name)
+	if err := os.WriteFile(path+".sha256", []byte(checksum), 0o644); err != nil {
+		h.t.Fatalf("write mirrored artifact checksum %s: %v", path+".sha256", err)
+	}
+}
+
+func crictlVersionForKubernetes(t *testing.T, kubernetesVersion string) string {
+	t.Helper()
+
+	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(kubernetesVersion), "v"), ".")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		t.Fatalf("parse Kubernetes version %q", kubernetesVersion)
+	}
+
+	return parts[0] + "." + parts[1] + ".0"
+}
+
 func (h *harness) prepareImages(ctx context.Context) {
 	h.t.Helper()
 
@@ -530,7 +699,124 @@ func (h *harness) prepareImages(ctx context.Context) {
 	h.runOrFatal(ctx, "push host image", "docker", "push", hostImage)
 	h.runOrFatal(ctx, "push netboot image", "docker", "push", netbootImage)
 	h.runOrFatal(ctx, "push agent image", "docker", "push", agentImage)
+	kindnetImage := h.mirrorKindnetImage(ctx, registry, guestRegistry)
 	h.startRegistryForwarder(ctx, port)
+	h.patchKindnet(ctx, kindnetImage)
+}
+
+func (h *harness) mirrorKindnetImage(ctx context.Context, registry, guestRegistry string) string {
+	h.t.Helper()
+
+	image := h.kindnetImage(ctx)
+	localImage := rewriteRegistryHost(image, registry)
+	guestImage := rewriteRegistryHost(image, guestRegistry)
+	h.runOrFatal(ctx, "pull kindnet image", "docker", "pull", image)
+	h.runOrFatal(ctx, "tag kindnet image", "docker", "tag", image, localImage)
+	h.runOrFatal(ctx, "push kindnet image", "docker", "push", localImage)
+
+	return guestImage
+}
+
+func (h *harness) kindnetImage(ctx context.Context) string {
+	h.t.Helper()
+
+	ds, err := h.targetKube.AppsV1().DaemonSets("kube-system").Get(ctx, "kindnet", metav1.GetOptions{})
+	if err != nil {
+		h.t.Fatalf("get kindnet DaemonSet: %v", err)
+	}
+	for _, container := range ds.Spec.Template.Spec.Containers {
+		if container.Name == "kindnet-cni" {
+			if strings.TrimSpace(container.Image) == "" {
+				h.t.Fatal("kindnet-cni container image is empty")
+			}
+
+			return container.Image
+		}
+	}
+
+	h.t.Fatal("kindnet DaemonSet has no kindnet-cni container")
+	return ""
+}
+
+func (h *harness) patchKindnet(ctx context.Context, image string) {
+	h.t.Helper()
+
+	ds, err := h.targetKube.AppsV1().DaemonSets("kube-system").Get(ctx, "kindnet", metav1.GetOptions{})
+	if err != nil {
+		h.t.Fatalf("get kindnet DaemonSet: %v", err)
+	}
+
+	h.restrictKindnetToControlPlane(ctx, ds.DeepCopy())
+	h.ensureSmokeKindnet(ctx, ds, image)
+}
+
+func (h *harness) restrictKindnetToControlPlane(ctx context.Context, ds *appsv1.DaemonSet) {
+	h.t.Helper()
+
+	if ds.Spec.Template.Spec.NodeSelector == nil {
+		ds.Spec.Template.Spec.NodeSelector = map[string]string{}
+	}
+	ds.Spec.Template.Spec.NodeSelector["node-role.kubernetes.io/control-plane"] = ""
+	if _, err := h.targetKube.AppsV1().DaemonSets(ds.Namespace).Update(ctx, ds, metav1.UpdateOptions{}); err != nil {
+		h.t.Fatalf("restrict kindnet DaemonSet to control-plane: %v", err)
+	}
+}
+
+func (h *harness) ensureSmokeKindnet(ctx context.Context, base *appsv1.DaemonSet, image string) {
+	h.t.Helper()
+
+	labels := map[string]string{
+		"app":                          kindnetSmokeApp,
+		"app.kubernetes.io/name":       kindnetSmokeApp,
+		"app.kubernetes.io/component":  "cni",
+		"app.kubernetes.io/managed-by": "metalman-e2e",
+	}
+	ds := base.DeepCopy()
+	ds.ObjectMeta = metav1.ObjectMeta{Name: kindnetSmokeDaemonSet, Namespace: base.Namespace}
+	ds.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
+	ds.Spec.Template.ObjectMeta.Labels = labels
+	ds.Spec.Template.Spec.NodeSelector = map[string]string{nodeLabelKey: nodeLabelVal}
+
+	for i := range ds.Spec.Template.Spec.Containers {
+		if ds.Spec.Template.Spec.Containers[i].Name != "kindnet-cni" {
+			continue
+		}
+		if strings.TrimSpace(image) != "" {
+			ds.Spec.Template.Spec.Containers[i].Image = image
+		}
+		ds.Spec.Template.Spec.Containers[i].Env = setEnv(ds.Spec.Template.Spec.Containers[i].Env, "CONTROL_PLANE_ENDPOINT", h.playpen.Metadata.Network.GatewayIPv4+":6443")
+
+		daemonsets := h.targetKube.AppsV1().DaemonSets(ds.Namespace)
+		existing, err := daemonsets.Get(ctx, ds.Name, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+			if _, err := daemonsets.Create(ctx, ds, metav1.CreateOptions{}); err != nil {
+				h.t.Fatalf("create smoke kindnet DaemonSet: %v", err)
+			}
+		case err != nil:
+			h.t.Fatalf("get smoke kindnet DaemonSet: %v", err)
+		default:
+			ds.ResourceVersion = existing.ResourceVersion
+			if _, err := daemonsets.Update(ctx, ds, metav1.UpdateOptions{}); err != nil {
+				h.t.Fatalf("update smoke kindnet DaemonSet: %v", err)
+			}
+		}
+
+		return
+	}
+
+	h.t.Fatal("kindnet DaemonSet has no kindnet-cni container")
+}
+
+func setEnv(env []corev1.EnvVar, name, value string) []corev1.EnvVar {
+	for i := range env {
+		if env[i].Name == name {
+			env[i].Value = value
+			return env
+		}
+	}
+
+	return append(env, corev1.EnvVar{Name: name, Value: value})
 }
 
 func (h *harness) startRegistryForwarder(ctx context.Context, port string) {
@@ -569,13 +855,23 @@ func (h *harness) configurePlaypenTunnel(ctx context.Context) {
 		h.t.Fatalf("create Playpen client: %v", err)
 	}
 
-	p, err := c.Allocate(ctx, playpenclient.AllocateOptions{Architecture: runner.ArchitectureAMD64})
-	if err != nil {
-		h.t.Fatalf("allocate Playpen from %s: %v", h.playpenKubeconfig, err)
-	}
+	p := h.allocatePlaypenWithRetry(ctx, c)
 	h.playpen = p
 
+	var startEndpoint func(context.Context)
+	if h.playpenEndpoint == playpenEndpointLoadBalancer {
+		h.exposePlaypenLoadBalancer(ctx, p)
+	} else if h.playpenEndpoint == playpenEndpointRelay {
+		startEndpoint = h.exposePlaypenRelay(ctx, p)
+	} else if h.playpenEndpoint != "" && h.playpenEndpoint != playpenEndpointDirect {
+		h.t.Fatalf("METALMAN_E2E_PLAYPEN_ENDPOINT must be empty, %q, %q, or %q", playpenEndpointDirect, playpenEndpointLoadBalancer, playpenEndpointRelay)
+	}
+
 	h.t.Cleanup(func() {
+		if h.keep {
+			return
+		}
+
 		closeCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 		if err := p.Close(closeCtx); err != nil {
@@ -586,8 +882,348 @@ func (h *harness) configurePlaypenTunnel(ctx context.Context) {
 	if err := p.ConfigureTunnel(ctx); err != nil {
 		h.t.Fatalf("configure Playpen tunnel: %v", err)
 	}
+	if startEndpoint != nil {
+		startEndpoint(ctx)
+	}
 	if h.apiserverURL == "" {
 		h.apiserverURL = fmt.Sprintf("https://%s:6443", p.Metadata.Network.GatewayIPv4)
+	}
+}
+
+func (h *harness) allocatePlaypenWithRetry(ctx context.Context, c *playpenclient.Client) *playpenclient.Playpen {
+	h.t.Helper()
+
+	deadline := time.Now().Add(2 * time.Minute)
+	var lastErr error
+
+	for {
+		p, err := c.Allocate(ctx, playpenclient.AllocateOptions{Architecture: runner.ArchitectureAMD64})
+		if err == nil {
+			return p
+		}
+
+		lastErr = err
+		if !isTransientPlaypenCapacityError(err) || time.Now().After(deadline) {
+			h.t.Fatalf("allocate Playpen from %s: %v", h.playpenKubeconfig, err)
+		}
+
+		h.t.Logf("Playpen capacity is reconciling; retrying allocation after transient error: %v", err)
+
+		select {
+		case <-ctx.Done():
+			h.t.Fatalf("allocate Playpen from %s: %v", h.playpenKubeconfig, ctx.Err())
+		case <-time.After(5 * time.Second):
+		}
+	}
+
+	h.t.Fatalf("allocate Playpen from %s: %v", h.playpenKubeconfig, lastErr)
+
+	return nil
+}
+
+func isTransientPlaypenCapacityError(err error) bool {
+	if err != nil {
+		message := err.Error()
+
+		return strings.Contains(message, "returned 503") && strings.Contains(message, "no idle") && strings.Contains(message, "playpen runner pods")
+	}
+
+	return false
+}
+
+func (h *harness) exposePlaypenLoadBalancer(ctx context.Context, p *playpenclient.Playpen) {
+	h.t.Helper()
+
+	playpenREST, err := clientcmd.BuildConfigFromFlags("", h.playpenKubeconfig)
+	if err != nil {
+		h.t.Fatalf("load Playpen kubeconfig: %v", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(playpenREST)
+	if err != nil {
+		h.t.Fatalf("create Playpen Kubernetes client: %v", err)
+	}
+
+	listenPort := int32(p.Metadata.WireGuard.ListenPort) //nolint:gosec // Test deployment uses Kubernetes service port range values.
+	serviceName := "metalman-e2e-" + p.Metadata.Pod.Name
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName,
+			Namespace: p.Metadata.Pod.Namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Type:                  corev1.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
+			Selector: map[string]string{
+				"app.kubernetes.io/name":                  "playpen-runner",
+				"playpen.unbounded-cloud.io/host-port":    fmt.Sprint(p.Metadata.Endpoint.WireGuardUDPPort),
+				"playpen.unbounded-cloud.io/architecture": p.Metadata.Pod.Architecture,
+			},
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "wireguard",
+					Protocol:   corev1.ProtocolUDP,
+					Port:       listenPort,
+					TargetPort: intstr.FromInt32(listenPort),
+				},
+			},
+		},
+	}
+
+	services := clientset.CoreV1().Services(p.Metadata.Pod.Namespace)
+	if _, err := services.Create(ctx, service, metav1.CreateOptions{}); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			h.t.Fatalf("create Playpen WireGuard LoadBalancer service: %v", err)
+		}
+
+		if _, err := services.Update(ctx, service, metav1.UpdateOptions{}); err != nil {
+			h.t.Fatalf("update Playpen WireGuard LoadBalancer service: %v", err)
+		}
+	}
+
+	h.t.Cleanup(func() {
+		deleteCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := services.Delete(deleteCtx, serviceName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			h.t.Logf("delete Playpen WireGuard LoadBalancer service: %v", err)
+		}
+	})
+
+	endpointHost := h.waitPlaypenLoadBalancer(ctx, clientset, p.Metadata.Pod.Namespace, serviceName)
+	h.waitPlaypenLoadBalancerEndpoints(ctx, clientset, p.Metadata.Pod.Namespace, serviceName)
+	h.waitPlaypenLoadBalancerReady(ctx)
+	h.t.Logf("using Playpen WireGuard LoadBalancer endpoint %s:%d instead of %s:%d", endpointHost, p.Metadata.WireGuard.ListenPort, p.Metadata.Endpoint.Host, p.Metadata.Endpoint.WireGuardUDPPort)
+	p.OverrideEndpoint(endpointHost, int32(p.Metadata.WireGuard.ListenPort))
+}
+
+func (h *harness) waitPlaypenLoadBalancer(ctx context.Context, clientset kubernetes.Interface, namespace, name string) string {
+	h.t.Helper()
+
+	deadline := time.Now().Add(10 * time.Minute)
+	for {
+		svc, err := clientset.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			h.t.Fatalf("get Playpen WireGuard LoadBalancer service: %v", err)
+		}
+
+		for _, ingress := range svc.Status.LoadBalancer.Ingress {
+			if ingress.IP != "" {
+				return ingress.IP
+			}
+			if ingress.Hostname != "" {
+				return ingress.Hostname
+			}
+		}
+
+		if time.Now().After(deadline) {
+			h.t.Fatalf("timed out waiting for Playpen WireGuard LoadBalancer service %s/%s", namespace, name)
+		}
+
+		select {
+		case <-ctx.Done():
+			h.t.Fatalf("wait for Playpen WireGuard LoadBalancer service %s/%s: %v", namespace, name, ctx.Err())
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+func (h *harness) waitPlaypenLoadBalancerEndpoints(ctx context.Context, clientset kubernetes.Interface, namespace, name string) {
+	h.t.Helper()
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		endpoints, err := clientset.CoreV1().Endpoints(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err == nil {
+			for _, subset := range endpoints.Subsets {
+				if len(subset.Addresses) > 0 && len(subset.Ports) > 0 {
+					return
+				}
+			}
+		} else if !apierrors.IsNotFound(err) {
+			h.t.Fatalf("get Playpen WireGuard LoadBalancer endpoints: %v", err)
+		}
+
+		if time.Now().After(deadline) {
+			h.t.Fatalf("timed out waiting for Playpen WireGuard LoadBalancer endpoints %s/%s", namespace, name)
+		}
+
+		select {
+		case <-ctx.Done():
+			h.t.Fatalf("wait for Playpen WireGuard LoadBalancer endpoints %s/%s: %v", namespace, name, ctx.Err())
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func (h *harness) waitPlaypenLoadBalancerReady(ctx context.Context) {
+	h.t.Helper()
+
+	select {
+	case <-ctx.Done():
+		h.t.Fatalf("wait for Playpen WireGuard LoadBalancer programming: %v", ctx.Err())
+	case <-time.After(2 * time.Minute):
+	}
+}
+
+func (h *harness) exposePlaypenRelay(ctx context.Context, p *playpenclient.Playpen) func(context.Context) {
+	h.t.Helper()
+
+	playpenREST, err := clientcmd.BuildConfigFromFlags("", h.playpenKubeconfig)
+	if err != nil {
+		h.t.Fatalf("load Playpen kubeconfig: %v", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(playpenREST)
+	if err != nil {
+		h.t.Fatalf("create Playpen Kubernetes client: %v", err)
+	}
+
+	runnerPod, err := clientset.CoreV1().Pods(p.Metadata.Pod.Namespace).Get(ctx, p.Metadata.Pod.Name, metav1.GetOptions{})
+	if err != nil {
+		h.t.Fatalf("get Playpen runner pod: %v", err)
+	}
+	if runnerPod.Status.PodIP == "" {
+		h.t.Fatalf("Playpen runner pod %s/%s has no pod IP", p.Metadata.Pod.Namespace, p.Metadata.Pod.Name)
+	}
+
+	const relayPodPort = 15182
+
+	localTCPPort := freeLocalPort(h.t, "tcp", "127.0.0.1:0")
+	localUDPPort := freeLocalPort(h.t, "udp", "127.0.0.1:0")
+	relayName := "metalman-e2e-relay-" + p.Metadata.Pod.Name
+	relay := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      relayName,
+			Namespace: p.Metadata.Pod.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":      "metalman-e2e-playpen-relay",
+				"app.kubernetes.io/component": "e2e",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			NodeName:      p.Metadata.Pod.NodeName,
+			Containers: []corev1.Container{
+				{
+					Name:  "relay",
+					Image: "nicolaka/netshoot:latest",
+					Command: []string{
+						"python3",
+						"-c",
+						tcpUDPRelayPython(),
+						runnerPod.Status.PodIP,
+						fmt.Sprint(p.Metadata.WireGuard.ListenPort),
+						"0.0.0.0",
+						fmt.Sprint(relayPodPort),
+					},
+					Ports: []corev1.ContainerPort{
+						{Name: "wireguard-tcp", ContainerPort: relayPodPort, Protocol: corev1.ProtocolTCP},
+					},
+				},
+			},
+		},
+	}
+
+	pods := clientset.CoreV1().Pods(p.Metadata.Pod.Namespace)
+	if err := pods.Delete(ctx, relayName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		h.t.Fatalf("delete stale Playpen WireGuard relay pod: %v", err)
+	}
+	h.waitPodDeleted(ctx, pods, p.Metadata.Pod.Namespace, relayName)
+	if _, err := pods.Create(ctx, relay, metav1.CreateOptions{}); err != nil {
+		h.t.Fatalf("create Playpen WireGuard relay pod: %v", err)
+	}
+
+	h.t.Cleanup(func() {
+		deleteCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := pods.Delete(deleteCtx, relayName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			h.t.Logf("delete Playpen WireGuard relay pod: %v", err)
+		}
+	})
+
+	h.waitPodReady(ctx, pods, p.Metadata.Pod.Namespace, relayName)
+
+	portForward := exec.CommandContext(
+		ctx,
+		"kubectl",
+		"--kubeconfig", h.playpenKubeconfig,
+		"-n", p.Metadata.Pod.Namespace,
+		"port-forward",
+		"--address", "127.0.0.1",
+		"pod/"+relayName,
+		fmt.Sprintf("%d:%d", localTCPPort, relayPodPort),
+	)
+	h.startProcess(ctx, "playpen-wireguard-port-forward", portForward)
+	h.waitTCP(ctx, "Playpen WireGuard relay port-forward", net.JoinHostPort("127.0.0.1", fmt.Sprint(localTCPPort)))
+
+	managementHost := addressFromCIDR(h.t, p.TunnelConfig().ManagementHostAddress)
+	p.OverrideEndpoint(managementHost, int32(localUDPPort)) //nolint:gosec // Test-picked local port fits int32.
+
+	return func(ctx context.Context) {
+		cmd := exec.CommandContext(
+			ctx,
+			"python3",
+			"-c",
+			udpTCPRelayPython(),
+			managementHost,
+			fmt.Sprint(localUDPPort),
+			"127.0.0.1",
+			fmt.Sprint(localTCPPort),
+		)
+		h.startProcess(ctx, "playpen-wireguard-local-relay", cmd)
+	}
+}
+
+func (h *harness) waitPodReady(ctx context.Context, pods corev1client.PodInterface, namespace, name string) {
+	h.t.Helper()
+
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		pod, err := pods.Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			h.t.Fatalf("get pod %s/%s: %v", namespace, name, err)
+		}
+		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+			h.t.Fatalf("pod %s/%s exited with phase %s", namespace, name, pod.Status.Phase)
+		}
+		if podReady(pod) {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			h.t.Fatalf("timed out waiting for pod %s/%s to become ready", namespace, name)
+		}
+
+		select {
+		case <-ctx.Done():
+			h.t.Fatalf("wait for pod %s/%s: %v", namespace, name, ctx.Err())
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func (h *harness) waitPodDeleted(ctx context.Context, pods corev1client.PodInterface, namespace, name string) {
+	h.t.Helper()
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		_, err := pods.Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		if err != nil {
+			h.t.Fatalf("get pod %s/%s: %v", namespace, name, err)
+		}
+
+		if time.Now().After(deadline) {
+			h.t.Fatalf("timed out waiting for pod %s/%s deletion", namespace, name)
+		}
+
+		select {
+		case <-ctx.Done():
+			h.t.Fatalf("wait for pod %s/%s deletion: %v", namespace, name, ctx.Err())
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 
@@ -699,10 +1335,11 @@ func (h *harness) startMetalman(ctx context.Context) {
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		h.t.Fatalf("mkdir metalman cache: %v", err)
 	}
+	metalmanKubeconfig := h.writePlaypenTargetKubeconfig()
 
 	cmd, err := h.playpen.Command(ctx,
 		"env",
-		"KUBECONFIG="+h.targetKubeconfig,
+		"KUBECONFIG="+metalmanKubeconfig,
 		"METALMAN_APISERVER_URL="+h.apiserverURL,
 		filepath.Join(h.repoRoot, "bin", "metalman"),
 		"serve-pxe",
@@ -722,6 +1359,37 @@ func (h *harness) startMetalman(ctx context.Context) {
 	}
 	h.startProcess(ctx, "metalman", cmd)
 	h.waitPlaypenHTTP(ctx, "metalman health", fmt.Sprintf("http://%s:8081/healthz", h.playpen.Metadata.Network.GatewayIPv4))
+}
+
+func (h *harness) writePlaypenTargetKubeconfig() string {
+	h.t.Helper()
+
+	raw, err := clientcmd.LoadFromFile(h.targetKubeconfig)
+	if err != nil {
+		h.t.Fatalf("load target kubeconfig %s: %v", h.targetKubeconfig, err)
+	}
+	if raw.CurrentContext == "" {
+		h.t.Fatalf("target kubeconfig %s has no current context", h.targetKubeconfig)
+	}
+	context := raw.Contexts[raw.CurrentContext]
+	if context == nil {
+		h.t.Fatalf("target kubeconfig %s current context %q is missing", h.targetKubeconfig, raw.CurrentContext)
+	}
+	cluster := raw.Clusters[context.Cluster]
+	if cluster == nil {
+		h.t.Fatalf("target kubeconfig %s cluster %q is missing", h.targetKubeconfig, context.Cluster)
+	}
+	cluster.Server = h.apiserverURL
+
+	path := filepath.Join(h.artifacts, "metalman.kubeconfig")
+	if err := clientcmd.WriteToFile(*raw, path); err != nil {
+		h.t.Fatalf("write metalman kubeconfig %s: %v", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		h.t.Fatalf("chmod metalman kubeconfig %s: %v", path, err)
+	}
+
+	return path
 }
 
 func (h *harness) createBMCSecret(ctx context.Context) {
@@ -785,6 +1453,13 @@ func (h *harness) createMachine(ctx context.Context) {
 			Agent: &v1alpha3.AgentSpec{
 				Image: h.agentGuestImage,
 				URL:   fmt.Sprintf("http://%s:8881/%s", h.playpen.Metadata.Network.GatewayIPv4, agentTarballName),
+				Downloads: &v1alpha3.AgentDownloadsSpec{
+					Kubernetes: &v1alpha3.DownloadSource{BaseURL: fmt.Sprintf("http://%s:8881/kubernetes", h.playpen.Metadata.Network.GatewayIPv4)},
+					Containerd: &v1alpha3.DownloadSource{BaseURL: fmt.Sprintf("http://%s:8881/containerd", h.playpen.Metadata.Network.GatewayIPv4)},
+					Runc:       &v1alpha3.DownloadSource{BaseURL: fmt.Sprintf("http://%s:8881/runc", h.playpen.Metadata.Network.GatewayIPv4)},
+					CNI:        &v1alpha3.DownloadSource{BaseURL: fmt.Sprintf("http://%s:8881/cni", h.playpen.Metadata.Network.GatewayIPv4)},
+					Crictl:     &v1alpha3.DownloadSource{BaseURL: fmt.Sprintf("http://%s:8881/crictl", h.playpen.Metadata.Network.GatewayIPv4)},
+				},
 			},
 			Kubernetes: &v1alpha3.KubernetesSpec{
 				NodeLabels: map[string]string{nodeLabelKey: nodeLabelVal},
@@ -840,10 +1515,15 @@ func (h *harness) waitNodeReady(ctx context.Context, name string) {
 	h.t.Helper()
 
 	deadline := time.Now().Add(30 * time.Minute)
+	lastKindnetRecovery := time.Time{}
 	for time.Now().Before(deadline) {
 		node, err := h.targetKube.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
 		if err == nil && nodeReady(node) {
 			return
+		}
+		if err == nil && time.Since(lastKindnetRecovery) >= 30*time.Second {
+			h.recoverKindnetPods(ctx, name)
+			lastKindnetRecovery = time.Now()
 		}
 		h.checkProcesses()
 		sleepOrDone(ctx, 3*time.Second)
@@ -851,6 +1531,46 @@ func (h *harness) waitNodeReady(ctx context.Context, name string) {
 
 	h.collectDiagnostics(context.Background())
 	h.t.Fatalf("timed out waiting for Node %q Ready", name)
+}
+
+func (h *harness) waitNodeNotReady(ctx context.Context, name string) {
+	h.t.Helper()
+
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		node, err := h.targetKube.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+		if err == nil && !nodeReady(node) {
+			return
+		}
+		h.checkProcesses()
+		sleepOrDone(ctx, 3*time.Second)
+	}
+
+	h.collectDiagnostics(context.Background())
+	h.t.Fatalf("timed out waiting for Node %q NotReady", name)
+}
+
+func (h *harness) recoverKindnetPods(ctx context.Context, nodeName string) {
+	h.t.Helper()
+
+	pods, err := h.targetKube.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{FieldSelector: "spec.nodeName=" + nodeName})
+	if err != nil {
+		h.t.Logf("list kindnet pods on %s: %v", nodeName, err)
+		return
+	}
+
+	zero := int64(0)
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !strings.HasPrefix(pod.Name, "kindnet-") || !kindnetPodNeedsRestart(pod) {
+			continue
+		}
+
+		h.t.Logf("deleting restarting kindnet pod %s/%s while waiting for Node %s Ready", pod.Namespace, pod.Name, nodeName)
+		if err := h.targetKube.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{GracePeriodSeconds: &zero}); err != nil && !apierrors.IsNotFound(err) {
+			h.t.Logf("delete kindnet pod %s/%s: %v", pod.Namespace, pod.Name, err)
+		}
+	}
 }
 
 func (h *harness) assertNodeLabel(ctx context.Context) {
@@ -1084,6 +1804,26 @@ func (h *harness) checkProcesses() {
 	}
 }
 
+func (h *harness) logProcessLogs() {
+	h.t.Helper()
+
+	for _, proc := range h.processes {
+		path := filepath.Join(h.artifacts, proc.name+".log")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			h.t.Logf("read %s log %s: %v", proc.name, path, err)
+			continue
+		}
+
+		if len(data) == 0 {
+			h.t.Logf("%s log %s is empty", proc.name, path)
+			continue
+		}
+
+		h.t.Logf("%s log %s:\n%s", proc.name, path, string(data))
+	}
+}
+
 func (h *harness) waitHTTP(ctx context.Context, name, url string) {
 	h.t.Helper()
 
@@ -1185,6 +1925,14 @@ func (h *harness) collectDiagnostics(ctx context.Context) {
 		{"get", "machineoperations.unbounded-cloud.io", "-o", "yaml"},
 		{"describe", "node", machineName},
 		{"get", "pods", "-A", "-o", "wide"},
+		{"describe", "pods", "-n", "kube-system", "-l", "app=kindnet"},
+		{"describe", "pods", "-n", "kube-system", "-l", "app=" + kindnetSmokeApp},
+		{"logs", "-n", "kube-system", "-l", "app=kindnet", "--all-containers=true", "--prefix=true", "--tail=-1"},
+		{"logs", "-n", "kube-system", "-l", "app=kindnet", "--all-containers=true", "--prefix=true", "--tail=-1", "--previous"},
+		{"logs", "-n", "kube-system", "-l", "app=" + kindnetSmokeApp, "--all-containers=true", "--prefix=true", "--tail=-1"},
+		{"logs", "-n", "kube-system", "-l", "app=" + kindnetSmokeApp, "--all-containers=true", "--prefix=true", "--tail=-1", "--previous"},
+		{"logs", "-n", "kube-system", "-l", "k8s-app=kube-proxy", "--all-containers=true", "--prefix=true", "--tail=-1"},
+		{"logs", "-n", "kube-system", "-l", "k8s-app=kube-proxy", "--all-containers=true", "--prefix=true", "--tail=-1", "--previous"},
 		{"get", "events", "-A", "--sort-by=.lastTimestamp"},
 	}
 	for _, args := range commands {
@@ -1298,6 +2046,36 @@ func nodeReady(node *corev1.Node) bool {
 	return false
 }
 
+func podReady(pod *corev1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+
+	return false
+}
+
+func kindnetPodNeedsRestart(pod *corev1.Pod) bool {
+	if podReady(pod) {
+		return false
+	}
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.RestartCount > 1 {
+			return true
+		}
+		if status.State.Waiting == nil {
+			continue
+		}
+		switch status.State.Waiting.Reason {
+		case "CrashLoopBackOff", "Error", "RunContainerError":
+			return true
+		}
+	}
+
+	return false
+}
+
 func operationHasCompleteTarget(op *v1alpha3.MachineOperation, machine string) bool {
 	for _, target := range op.Status.Targets {
 		if target.MachineRef == machine && target.Phase == v1alpha3.OperationPhaseComplete {
@@ -1360,6 +2138,33 @@ func addressFromCIDR(t *testing.T, value string) string {
 		t.Fatalf("parse address %q: %v", value, err)
 	}
 	return prefix.Addr().String()
+}
+
+func freeLocalPort(t *testing.T, network, address string) int {
+	t.Helper()
+
+	switch network {
+	case "tcp":
+		listener, err := net.Listen(network, address)
+		if err != nil {
+			t.Fatalf("listen on %s %s: %v", network, address, err)
+		}
+		defer listener.Close() //nolint:errcheck // Test port probe cleanup.
+
+		return listener.Addr().(*net.TCPAddr).Port
+	case "udp":
+		packet, err := net.ListenPacket(network, address)
+		if err != nil {
+			t.Fatalf("listen on %s %s: %v", network, address, err)
+		}
+		defer packet.Close() //nolint:errcheck // Test port probe cleanup.
+
+		return packet.LocalAddr().(*net.UDPAddr).Port
+	default:
+		t.Fatalf("unsupported network %q", network)
+	}
+
+	return 0
 }
 
 func firstClusterServer(t *testing.T, kubeconfig string) string {
@@ -1444,6 +2249,140 @@ class Handler(socketserver.BaseRequestHandler):
         pump(upstream,self.request)
         upstream.close()
 with Server((listen_host,listen_port), Handler) as server:
+    server.serve_forever()
+`
+}
+
+func udpTCPRelayPython() string {
+	return `import socket, struct, sys, threading
+listen_host=sys.argv[1]
+listen_port=int(sys.argv[2])
+target_host=sys.argv[3]
+target_port=int(sys.argv[4])
+def tune(sock):
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4*1024*1024)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4*1024*1024)
+def tune_tcp(sock):
+    tune(sock)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+sock=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+tune(sock)
+sock.bind((listen_host, listen_port))
+sessions={}
+sessions_lock=threading.Lock()
+def recvall(conn, n):
+    data=b""
+    while len(data) < n:
+        chunk=conn.recv(n-len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+class Session:
+    def __init__(self, addr):
+        self.addr=addr
+        self.conn=socket.create_connection((target_host, target_port), timeout=5)
+        tune_tcp(self.conn)
+        self.conn.settimeout(None)
+        self.lock=threading.Lock()
+        self.closed=False
+        threading.Thread(target=self.recv_loop, daemon=True).start()
+    def recv_loop(self):
+        try:
+            while True:
+                header=recvall(self.conn, 2)
+                if header is None:
+                    break
+                size=struct.unpack("!H", header)[0]
+                reply=recvall(self.conn, size)
+                if reply is None:
+                    break
+                sock.sendto(reply, self.addr)
+        finally:
+            self.close()
+    def send(self, data):
+        with self.lock:
+            self.conn.sendall(struct.pack("!H", len(data))+data)
+    def close(self):
+        with sessions_lock:
+            if sessions.get(self.addr) is self:
+                del sessions[self.addr]
+        if not self.closed:
+            self.closed=True
+            try: self.conn.close()
+            except OSError: pass
+def session_for(addr):
+    with sessions_lock:
+        session=sessions.get(addr)
+        if session is None or session.closed:
+            session=Session(addr)
+            sessions[addr]=session
+        return session
+while True:
+    data, addr=sock.recvfrom(65536)
+    try:
+        session_for(addr).send(data)
+    except OSError:
+        with sessions_lock:
+            session=sessions.pop(addr, None)
+        if session is not None:
+            session.close()
+`
+}
+
+func tcpUDPRelayPython() string {
+	return `import socket, socketserver, struct, sys, threading
+target_host=sys.argv[1]
+target_port=int(sys.argv[2])
+listen_host=sys.argv[3]
+listen_port=int(sys.argv[4])
+def tune(sock):
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4*1024*1024)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4*1024*1024)
+def tune_tcp(sock):
+    tune(sock)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+def recvall(conn, n):
+    data=b""
+    while len(data) < n:
+        chunk=conn.recv(n-len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address=True
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        tune_tcp(self.request)
+        udp=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tune(udp)
+        stop=threading.Event()
+        send_lock=threading.Lock()
+        def udp_to_tcp():
+            try:
+                while not stop.is_set():
+                    reply, _=udp.recvfrom(65535)
+                    with send_lock:
+                        self.request.sendall(struct.pack("!H", len(reply))+reply)
+            except OSError:
+                pass
+        try:
+            threading.Thread(target=udp_to_tcp, daemon=True).start()
+            while True:
+                header=recvall(self.request, 2)
+                if header is None:
+                    return
+                size=struct.unpack("!H", header)[0]
+                data=recvall(self.request, size)
+                if data is None:
+                    return
+                udp.sendto(data, (target_host, target_port))
+        finally:
+            stop.set()
+            udp.close()
+with Server((listen_host, listen_port), Handler) as server:
     server.serve_forever()
 `
 }

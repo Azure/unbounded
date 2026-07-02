@@ -210,6 +210,24 @@ func TestPlaypenCommandExecutesInNetworkNamespace(t *testing.T) {
 	}
 }
 
+func TestOverrideEndpointUpdatesTunnelMetadata(t *testing.T) {
+	metadata := testAllocResponse()
+	p := &Playpen{
+		Metadata: metadata,
+		tunnel:   newTunnel(&fakeCommander{}, "private-key", metadata, TunnelConfig{}),
+	}
+
+	p.OverrideEndpoint("  lb.example.test  ", 51820)
+
+	if p.Metadata.Endpoint.Host != "lb.example.test" || p.Metadata.Endpoint.WireGuardUDPPort != 51820 {
+		t.Fatalf("metadata endpoint = %s:%d", p.Metadata.Endpoint.Host, p.Metadata.Endpoint.WireGuardUDPPort)
+	}
+
+	if p.tunnel.metadata.Endpoint.Host != "lb.example.test" || p.tunnel.metadata.Endpoint.WireGuardUDPPort != 51820 {
+		t.Fatalf("tunnel endpoint = %s:%d", p.tunnel.metadata.Endpoint.Host, p.tunnel.metadata.Endpoint.WireGuardUDPPort)
+	}
+}
+
 func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")

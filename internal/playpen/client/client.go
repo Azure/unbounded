@@ -175,6 +175,17 @@ func (p *Playpen) TunnelConfig() TunnelConfig {
 	return p.tunnel.cfg
 }
 
+// OverrideEndpoint replaces the WireGuard endpoint used by future tunnel setup.
+func (p *Playpen) OverrideEndpoint(host string, port int32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.Metadata.Endpoint.Host = strings.TrimSpace(host)
+	p.Metadata.Endpoint.WireGuardUDPPort = port
+	p.tunnel.metadata.Endpoint.Host = p.Metadata.Endpoint.Host
+	p.tunnel.metadata.Endpoint.WireGuardUDPPort = p.Metadata.Endpoint.WireGuardUDPPort
+}
+
 // ConfigureTunnel creates the local WireGuard and VXLAN resources for this playpen.
 func (p *Playpen) ConfigureTunnel(ctx context.Context) error {
 	p.mu.Lock()

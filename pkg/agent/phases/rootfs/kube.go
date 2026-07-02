@@ -247,6 +247,8 @@ func kubernetesBinaryURL(override *goalstates.DownloadSource, version, arch, bin
 		return fmt.Sprintf(override.URL, version, arch, binary)
 	}
 
+	version = strings.TrimPrefix(version, "v")
+
 	base := kubernetesDefaultBaseURL
 	if override != nil && override.BaseURL != "" {
 		base = strings.TrimRight(override.BaseURL, "/")

@@ -370,3 +370,24 @@ func TestResolveMachine_UsesConfigNodeName(t *testing.T) {
 	assert.Equal(t, "kube1", got.NodeStart.MachineName)
 	assert.Equal(t, "machine-1", got.NodeStart.KubeMachineName)
 }
+
+func TestResolveMachine_ConfiguresPlainHTTPRegistryForPrivateOCIImage(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName: "machine-1",
+		NodeName:    "configured-node",
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+		OCIImage: "192.168.200.1:5555/unbounded/agent-ubuntu2404:smoke",
+	}
+
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+	require.Equal(t, []ContainerdRegistryHost{{
+		Host:   "192.168.200.1:5555",
+		Server: "http://192.168.200.1:5555",
+	}}, got.NodeStart.Containerd.RegistryHosts)
+}

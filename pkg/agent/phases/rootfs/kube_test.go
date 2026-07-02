@@ -223,6 +223,13 @@ func TestKubernetesBinaryURL(t *testing.T) {
 			want:     "https://mirror.example.com/k8s/v1.33.5/bin/linux/amd64/kubelet",
 		},
 		{
+			name:    "v-prefixed version",
+			version: "v1.33.5",
+			arch:    "amd64",
+			binary:  "kubelet",
+			want:    "https://dl.k8s.io/v1.33.5/bin/linux/amd64/kubelet",
+		},
+		{
 			name:     "url override",
 			override: &goalstates.DownloadSource{URL: "https://mirror.example.com/%s/%s/%s"},
 			version:  "1.33.5",
