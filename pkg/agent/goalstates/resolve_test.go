@@ -370,3 +370,40 @@ func TestResolveMachine_UsesConfigNodeName(t *testing.T) {
 	assert.Equal(t, "kube1", got.NodeStart.MachineName)
 	assert.Equal(t, "machine-1", got.NodeStart.KubeMachineName)
 }
+
+func TestResolveMachine_AdditionalHostDevices(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName:           "machine-1",
+		NodeName:              "configured-node",
+		AdditionalHostDevices: []string{"/dev/uinput"},
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+
+	require.Equal(t, []string{"/dev/uinput"}, got.RootFS.HostDevices.Additional)
+	require.Contains(t, got.RootFS.HostDevices.Paths(), "/dev/uinput")
+}
+
+func TestResolveMachine_InvalidAdditionalHostDevice(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName:           "machine-1",
+		NodeName:              "configured-node",
+		AdditionalHostDevices: []string{"/etc/passwd"},
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	_, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.ErrorContains(t, err, "AdditionalHostDevices")
+}

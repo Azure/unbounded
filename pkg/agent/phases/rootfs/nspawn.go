@@ -97,7 +97,8 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 			"kvm", len(e.goalState.HostDevices.KVM),
 			"network", len(e.goalState.HostDevices.Network),
 			"block", len(e.goalState.HostDevices.Block),
-			"infiniband", len(e.goalState.HostDevices.Infiniband))
+			"infiniband", len(e.goalState.HostDevices.Infiniband),
+			"additional", len(e.goalState.HostDevices.Additional))
 	}
 
 	if len(e.goalState.Nvidia.GPUDevicePaths) > 0 {

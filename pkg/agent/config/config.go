@@ -20,6 +20,7 @@ import (
 	"maps"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -48,6 +49,11 @@ type AgentConfig struct {
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
 	// When empty the agent uses the built-in default image.
 	OCIImage string `json:"OCIImage,omitempty"`
+
+	// AdditionalHostDevices lists extra host device nodes under /dev that
+	// should be exposed to the nspawn machine in addition to automatically
+	// discovered devices.
+	AdditionalHostDevices []string `json:"AdditionalHostDevices,omitempty"`
 }
 
 // BackfillNodeName resolves and stores the Kubernetes Node name once. An
@@ -108,6 +114,7 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	}
 
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
+	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
 
 	return &out
 }
@@ -136,6 +143,10 @@ func (a *AgentConfig) Validate() error {
 		errs = append(errs, fmt.Errorf("Cluster.ClusterDNS is required"))
 	}
 
+	if err := ValidateAdditionalHostDevices(a.AdditionalHostDevices); err != nil {
+		errs = append(errs, err)
+	}
+
 	apiServer := strings.TrimSpace(a.Kubelet.ApiServer)
 	if apiServer == "" {
 		errs = append(errs, fmt.Errorf("Kubelet.ApiServer is required"))
@@ -149,6 +160,36 @@ func (a *AgentConfig) Validate() error {
 	// static bootstrap credential should validate Kubelet.Auth separately.
 
 	return errors.Join(errs...)
+}
+
+// ValidateAdditionalHostDevices checks that configured host device paths are
+// safe to render into systemd-nspawn Bind= and DeviceAllow= directives.
+func ValidateAdditionalHostDevices(paths []string) error {
+	var errs []error
+
+	for _, path := range paths {
+		if err := validateAdditionalHostDevice(path); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateAdditionalHostDevice(path string) error {
+	if path != strings.TrimSpace(path) || strings.ContainsAny(path, " \t\r\n:") {
+		return fmt.Errorf("AdditionalHostDevices entry %q must not contain whitespace or ':'", path)
+	}
+
+	if path == "" || !strings.HasPrefix(path, "/dev/") {
+		return fmt.Errorf("AdditionalHostDevices entry %q must be an absolute path under /dev", path)
+	}
+
+	if cleaned := filepath.Clean(path); cleaned != path || !strings.HasPrefix(cleaned, "/dev/") {
+		return fmt.Errorf("AdditionalHostDevices entry %q must be a clean absolute path under /dev", path)
+	}
+
+	return nil
 }
 
 // AgentClusterConfig holds the cluster-level values the agent needs to

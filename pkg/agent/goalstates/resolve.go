@@ -46,6 +46,10 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		return nil, fmt.Errorf("get host hostname: %w", err)
 	}
 
+	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
+		return nil, err
+	}
+
 	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
 	if err != nil {
 		return nil, fmt.Errorf("resolve nvidia host: %w", err)
@@ -97,7 +101,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		OCIImage:          ociImage,
 		Nvidia:            nvidia,
 		AMD:               amd,
-		HostDevices:       DiscoverHostDevices(),
+		HostDevices:       DiscoverHostDevices(cfg.AdditionalHostDevices),
 	}
 
 	nodeStart := &NodeStart{
