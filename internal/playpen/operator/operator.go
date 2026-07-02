@@ -21,13 +21,13 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	authzv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
@@ -69,16 +70,16 @@ const (
 
 	runnerAppName        = "playpen-runner"
 	runnerComponent      = "runner"
-	runnerHostPortLabel  = "playpen.unbounded-cloud.io/host-port"
 	runnerContainerName  = "runner"
-	runnerWireGuardPort  = "wireguard"
 	runnerHTTPSPort      = "https"
 	runnerKubeFQDNAnnot  = "kubernetes.azure.com/set-kube-service-host-fqdn"
 	runnerDataMountPath  = "/var/lib/playpen-runner"
-	runnerWGMountPath    = "/etc/playpen/wireguard"
 	runnerKVMPath        = "/dev/kvm"
 	runnerTunPath        = "/dev/net/tun"
 	runnerHTTPSContainer = int32(8443)
+
+	playpenHostPortLabel  = "playpen.unbounded-cloud.io/host-port"
+	unboundedNetSiteLabel = "net.unbounded-cloud.io/site"
 
 	controlPlaneAppName       = "playpen-control-plane"
 	controlPlaneComponent     = "control-plane"
@@ -97,17 +98,18 @@ type Operator struct {
 	Config       Config
 	Scheme       *runtime.Scheme
 
-	aggregatedMu               sync.RWMutex
-	aggregatedClientCAs        *x509.CertPool
-	aggregatedClientAllowedCNs map[string]struct{}
+	aggregatedMu                sync.RWMutex
+	aggregatedClientCAs         *x509.CertPool
+	aggregatedClientAllowedCNs  map[string]struct{}
+	assignExternalClientPodCIDR func(context.Context, string) error
 }
 
 type AllocRequest struct {
-	IdempotencyKey     string `json:"idempotencyKey,omitempty"`
-	ResourceType       string `json:"resourceType,omitempty"`
-	KubernetesVersion  string `json:"kubernetesVersion,omitempty"`
-	WireGuardPublicKey string `json:"wireGuardPublicKey,omitempty"`
-	Architecture       string `json:"architecture,omitempty"`
+	IdempotencyKey           string `json:"idempotencyKey,omitempty"`
+	ResourceType             string `json:"resourceType,omitempty"`
+	KubernetesVersion        string `json:"kubernetesVersion,omitempty"`
+	Architecture             string `json:"architecture,omitempty"`
+	ExternalClientInternalIP string `json:"externalClientInternalIP,omitempty"`
 }
 
 type DeallocRequest struct {
@@ -115,14 +117,14 @@ type DeallocRequest struct {
 }
 
 type AllocResponse struct {
-	ResourceType string               `json:"resourceType"`
-	Pod          PodResponse          `json:"pod"`
-	Endpoint     EndpointResponse     `json:"endpoint"`
-	WireGuard    WireGuardResponse    `json:"wireGuard"`
-	VXLAN        VXLANResponse        `json:"vxlan"`
-	Network      NetworkResponse      `json:"network"`
-	Redfish      map[string]string    `json:"redfish"`
-	ControlPlane ControlPlaneResponse `json:"controlPlane,omitempty"`
+	ResourceType   string                 `json:"resourceType"`
+	Pod            PodResponse            `json:"pod"`
+	Endpoint       EndpointResponse       `json:"endpoint"`
+	ExternalClient ExternalClientResponse `json:"externalClient,omitempty"`
+	VXLAN          VXLANResponse          `json:"vxlan"`
+	Network        NetworkResponse        `json:"network"`
+	Redfish        map[string]string      `json:"redfish"`
+	ControlPlane   ControlPlaneResponse   `json:"controlPlane,omitempty"`
 }
 
 type PodResponse struct {
@@ -137,9 +139,14 @@ type PodResponse struct {
 
 type EndpointResponse struct {
 	Host                  string `json:"host"`
-	WireGuardUDPPort      int32  `json:"wireGuardUDPPort"`
 	APIServerTCPPort      int32  `json:"apiServerTCPPort,omitempty"`
 	ExternalTrafficPolicy string `json:"externalTrafficPolicy"`
+}
+
+type ExternalClientResponse struct {
+	NodeName string `json:"nodeName"`
+	Site     string `json:"site"`
+	PodCIDR  string `json:"podCIDR"`
 }
 
 type ControlPlaneResponse struct {
@@ -149,16 +156,9 @@ type ControlPlaneResponse struct {
 	GuestAPIServerURL string `json:"guestAPIServerURL"`
 }
 
-type WireGuardResponse struct {
-	Interface       string `json:"interface"`
-	ServerPublicKey string `json:"serverPublicKey"`
-	ServerAddress   string `json:"serverAddress"`
-	ClientAddress   string `json:"clientAddress"`
-	ListenPort      int    `json:"listenPort"`
-}
-
 type VXLANResponse struct {
 	Interface     string `json:"interface"`
+	Device        string `json:"device"`
 	VNI           int    `json:"vni"`
 	UDPPort       int    `json:"udpPort"`
 	ServerAddress string `json:"serverAddress"`
@@ -344,15 +344,6 @@ func (o *Operator) handleAllocs(w http.ResponseWriter, r *http.Request) {
 
 	req.ResourceType = resourceType
 
-	req.WireGuardPublicKey = strings.TrimSpace(req.WireGuardPublicKey)
-	if resourceType == ResourceTypeRunner {
-		if _, err := wgtypes.ParseKey(req.WireGuardPublicKey); err != nil {
-			http.Error(w, "wireGuardPublicKey must be a valid WireGuard public key", http.StatusBadRequest)
-
-			return
-		}
-	}
-
 	arch, err := normalizeArchitecture(req.Architecture)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -361,6 +352,14 @@ func (o *Operator) handleAllocs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.Architecture = arch
+
+	if req.ResourceType == ResourceTypeRunner {
+		if err := normalizeExternalClientInternalIP(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+
+			return
+		}
+	}
 
 	resp, status, err := o.Alloc(r.Context(), idempotencyKey, req)
 	if err != nil {
@@ -420,6 +419,22 @@ func requestIdempotencyKey(r *http.Request, bodyKey string) string {
 	return strings.TrimSpace(bodyKey)
 }
 
+func normalizeExternalClientInternalIP(req *AllocRequest) error {
+	internalIP := strings.TrimSpace(req.ExternalClientInternalIP)
+	if internalIP == "" {
+		req.ExternalClientInternalIP = ""
+
+		return fmt.Errorf("externalClientInternalIP is required")
+	}
+	if net.ParseIP(internalIP) == nil {
+		return fmt.Errorf("externalClientInternalIP %q is invalid", req.ExternalClientInternalIP)
+	}
+
+	req.ExternalClientInternalIP = internalIP
+
+	return nil
+}
+
 func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRequest) (AllocResponse, int, error) {
 	resourceType, err := normalizeResourceType(req.ResourceType)
 	if err != nil {
@@ -435,6 +450,12 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 
 	req.Architecture = arch
 
+	if resourceType == ResourceTypeRunner {
+		if err := normalizeExternalClientInternalIP(&req); err != nil {
+			return AllocResponse{}, http.StatusBadRequest, err
+		}
+	}
+
 	kubernetesVersion := ""
 	if resourceType == ResourceTypeControlPlane {
 		kubernetesVersion, err = o.normalizeKubernetesVersion(req.KubernetesVersion)
@@ -445,12 +466,8 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 		req.KubernetesVersion = kubernetesVersion
 	}
 
-	if resourceType == ResourceTypeRunner && strings.TrimSpace(req.WireGuardPublicKey) == "" {
-		return AllocResponse{}, http.StatusBadRequest, fmt.Errorf("wireGuardPublicKey is required for runner allocations")
-	}
-
 	keyHash := hashString(idempotencyKey)
-	reqHash := hashString(strings.Join([]string{req.ResourceType, req.KubernetesVersion, req.WireGuardPublicKey, req.Architecture}, "\n"))
+	reqHash := hashString(strings.Join([]string{req.ResourceType, req.KubernetesVersion, req.Architecture, req.ExternalClientInternalIP}, "\n"))
 
 	managedPods, err := o.listManagedPods(ctx)
 	if err != nil {
@@ -488,6 +505,13 @@ func (o *Operator) allocRunner(ctx context.Context, keyHash, reqHash string, req
 		return AllocResponse{}, http.StatusInternalServerError, err
 	}
 
+	externalClientNodeCreated := false
+	defer func() {
+		if externalClientNodeCreated {
+			o.deleteExternalClientNode(context.Background(), keyHash) //nolint:errcheck // Best-effort cleanup after a failed allocation.
+		}
+	}()
+
 	var unavailable []string
 
 	matchingArchitecture := false
@@ -510,28 +534,22 @@ func (o *Operator) allocRunner(ctx context.Context, keyHash, reqHash string, req
 			continue
 		}
 
-		serverPublicKey, err := serverWireGuardPublicKeyForPod(pod)
+		externalClientNode, created, err := o.ensureExternalClientNode(ctx, keyHash, req.ExternalClientInternalIP)
+		if err != nil {
+			unavailable = append(unavailable, err.Error())
+
+			continue
+		}
+		externalClientNodeCreated = externalClientNodeCreated || created
+
+		clientVXLAN, err := externalClientVXLANAddress(externalClientNode)
 		if err != nil {
 			unavailable = append(unavailable, err.Error())
 
 			continue
 		}
 
-		endpointPort, externalTrafficPolicy, err := endpointForPod(pod)
-		if err != nil {
-			unavailable = append(unavailable, err.Error())
-
-			continue
-		}
-
-		gatewayIP, nodePublicIP, err := o.gatewayForPod(ctx, pod)
-		if err != nil {
-			unavailable = append(unavailable, err.Error())
-
-			continue
-		}
-
-		allocatedPod, claimed, err := o.patchClaim(ctx, pod, keyHash, reqHash, req.WireGuardPublicKey)
+		allocatedPod, claimed, err := o.patchClaim(ctx, pod, keyHash, reqHash, req.ExternalClientInternalIP, clientVXLAN)
 		if err != nil {
 			if errors.Is(err, errRunnerAlreadyAllocated) {
 				continue
@@ -553,16 +571,18 @@ func (o *Operator) allocRunner(ctx context.Context, keyHash, reqHash string, req
 			return resp, http.StatusOK, nil
 		}
 
-		resp, err := o.buildResponse(allocatedPod, gatewayIP, nodePublicIP, endpointPort, externalTrafficPolicy, serverPublicKey)
+		resp, err := o.buildResponse(allocatedPod, keyHash, externalClientNode)
 		if err != nil {
 			return AllocResponse{}, http.StatusInternalServerError, err
 		}
+
+		externalClientNodeCreated = false
 
 		return resp, http.StatusOK, nil
 	}
 
 	if len(unavailable) > 0 {
-		return AllocResponse{}, http.StatusServiceUnavailable, fmt.Errorf("no idle playpen runner pods are available with hostPort endpoints on ExternalIP nodes: %s", strings.Join(unavailable, "; "))
+		return AllocResponse{}, http.StatusServiceUnavailable, fmt.Errorf("no idle playpen runner pods are available: %s", strings.Join(unavailable, "; "))
 	}
 
 	if !matchingArchitecture {
@@ -620,7 +640,7 @@ func (o *Operator) allocControlPlane(ctx context.Context, keyHash, reqHash strin
 			continue
 		}
 
-		allocatedPod, claimed, err := o.patchClaim(ctx, pod, keyHash, reqHash, "")
+		allocatedPod, claimed, err := o.patchClaim(ctx, pod, keyHash, reqHash, "", "")
 		if err != nil {
 			if errors.Is(err, errRunnerAlreadyAllocated) {
 				continue
@@ -725,12 +745,8 @@ func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod) e
 		{architecture: ArchitectureARM64, count: o.Config.RunnerARM64Count},
 	}
 
-	if o.Config.RunnerWireGuardHostPortStart <= 0 || o.Config.RunnerWireGuardHostPortEnd < o.Config.RunnerWireGuardHostPortStart {
-		return fmt.Errorf("runner WireGuard hostPort range is invalid")
-	}
-
-	usedHostPorts := map[int32]struct{}{}
 	idleCounts := map[string]int{}
+	usedNames := map[string]struct{}{}
 
 	for i := range pods {
 		pod := &pods[i]
@@ -738,12 +754,9 @@ func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod) e
 			continue
 		}
 
-		hostPort := podWireGuardHostPort(pod)
-		if hostPort != 0 {
-			usedHostPorts[hostPort] = struct{}{}
-		}
+		usedNames[pod.Name] = struct{}{}
 
-		if pod.DeletionTimestamp.IsZero() && pod.Annotations[AnnotationIdempotencyKeyHash] == "" && hostPort != 0 {
+		if pod.DeletionTimestamp.IsZero() && pod.Annotations[AnnotationIdempotencyKeyHash] == "" {
 			idleCounts[podArchitecture(pod)]++
 		}
 	}
@@ -754,25 +767,30 @@ func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod) e
 		}
 
 		for idleCounts[target.architecture] < target.count {
-			hostPort, ok := o.nextRunnerHostPort(usedHostPorts)
-			if !ok {
-				return fmt.Errorf("no free WireGuard hostPorts are available in range %d-%d", o.Config.RunnerWireGuardHostPortStart, o.Config.RunnerWireGuardHostPortEnd)
-			}
-
-			usedHostPorts[hostPort] = struct{}{}
-
-			pod := o.runnerPod(target.architecture, hostPort)
+			index := nextRunnerPodIndex(target.architecture, usedNames)
+			pod := o.runnerPod(target.architecture, index)
 			if err := o.Client.Create(ctx, pod); apierrors.IsAlreadyExists(err) {
+				usedNames[pod.Name] = struct{}{}
+
 				continue
 			} else if err != nil {
 				return err
 			}
 
+			usedNames[pod.Name] = struct{}{}
 			idleCounts[target.architecture]++
 		}
 	}
 
 	return nil
+}
+
+func nextRunnerPodIndex(architecture string, usedNames map[string]struct{}) int {
+	for index := 0; ; index++ {
+		if _, ok := usedNames[runnerPodName(architecture, index)]; !ok {
+			return index
+		}
+	}
 }
 
 type controlPlanePoolTarget struct {
@@ -841,16 +859,6 @@ func (o *Operator) reconcileControlPlanePool(ctx context.Context, pods []corev1.
 	return nil
 }
 
-func (o *Operator) nextRunnerHostPort(used map[int32]struct{}) (int32, bool) {
-	for port := o.Config.RunnerWireGuardHostPortStart; port <= o.Config.RunnerWireGuardHostPortEnd; port++ {
-		if _, ok := used[port]; !ok {
-			return port, true
-		}
-	}
-
-	return 0, false
-}
-
 func (o *Operator) nextControlPlaneHostPort(used map[int32]struct{}) (int32, bool) {
 	for port := o.Config.ControlPlaneAPIServerHostPortStart; port <= o.Config.ControlPlaneAPIServerHostPortEnd; port++ {
 		if _, ok := used[port]; !ok {
@@ -861,9 +869,8 @@ func (o *Operator) nextControlPlaneHostPort(used map[int32]struct{}) (int32, boo
 	return 0, false
 }
 
-func (o *Operator) runnerPod(architecture string, hostPort int32) *corev1.Pod {
+func (o *Operator) runnerPod(architecture string, index int) *corev1.Pod {
 	privileged := true
-	listenPort := int32(o.Config.Runner.WireGuard.ListenPort) //nolint:gosec // User-configured Kubernetes port.
 	hostPathCharDevice := corev1.HostPathCharDev
 
 	imagePullPolicy := corev1.PullPolicy(strings.TrimSpace(o.Config.RunnerImagePullPolicy))
@@ -873,13 +880,11 @@ func (o *Operator) runnerPod(architecture string, hostPort int32) *corev1.Pod {
 
 	volumeMounts := []corev1.VolumeMount{
 		{Name: "data", MountPath: runnerDataMountPath},
-		{Name: "wireguard", MountPath: runnerWGMountPath},
 		{Name: "tun", MountPath: runnerTunPath},
 	}
 
 	volumes := []corev1.Volume{
 		{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-		{Name: "wireguard", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 		{Name: "tun", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: runnerTunPath, Type: &hostPathCharDevice}}},
 	}
 	if o.Config.RunnerRequireKVM {
@@ -897,14 +902,13 @@ func (o *Operator) runnerPod(architecture string, hostPort int32) *corev1.Pod {
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      runnerPodName(architecture, hostPort),
+			Name:      runnerPodName(architecture, index),
 			Namespace: o.Config.RunnerNamespace,
 			Labels: map[string]string{
 				"app.kubernetes.io/name":      runnerAppName,
 				"app.kubernetes.io/component": runnerComponent,
 				LabelResourceType:             ResourceTypeRunner,
 				LabelArchitecture:             architecture,
-				runnerHostPortLabel:           strconv.FormatInt(int64(hostPort), 10),
 			},
 			Annotations: map[string]string{
 				runnerKubeFQDNAnnot: "true",
@@ -913,6 +917,7 @@ func (o *Operator) runnerPod(architecture string, hostPort int32) *corev1.Pod {
 		Spec: corev1.PodSpec{
 			ServiceAccountName: o.Config.RunnerServiceAccountName,
 			RestartPolicy:      corev1.RestartPolicyAlways,
+			DNSPolicy:          corev1.DNSClusterFirst,
 			Tolerations:        tolerations,
 			NodeSelector: map[string]string{
 				"kubernetes.io/arch": architecture,
@@ -923,11 +928,7 @@ func (o *Operator) runnerPod(architecture string, hostPort int32) *corev1.Pod {
 					Image:           o.Config.RunnerImage,
 					ImagePullPolicy: imagePullPolicy,
 					Command:         []string{"/unbounded/bin/playpen-runner"},
-					Args: []string{
-						"--architecture=" + architecture,
-						"--wireguard-private-key-file=" + runnerWGMountPath + "/privatekey",
-						"--wireguard-listen-port=" + strconv.Itoa(o.Config.Runner.WireGuard.ListenPort),
-					},
+					Args:            runnerPodArgs(architecture, o.Config.Runner),
 					Env: append([]corev1.EnvVar{
 						{
 							Name: "POD_NAME",
@@ -941,20 +942,14 @@ func (o *Operator) runnerPod(architecture string, hostPort int32) *corev1.Pod {
 								FieldPath: "metadata.namespace",
 							}},
 						},
+						{
+							Name: "POD_IP",
+							ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "status.podIP",
+							}},
+						},
 					}, kubernetesServiceEnv()...),
-					Ports: []corev1.ContainerPort{
-						{
-							Name:          runnerHTTPSPort,
-							Protocol:      corev1.ProtocolTCP,
-							ContainerPort: runnerHTTPSContainer,
-						},
-						{
-							Name:          runnerWireGuardPort,
-							Protocol:      corev1.ProtocolUDP,
-							ContainerPort: listenPort,
-							HostPort:      hostPort,
-						},
-					},
+					Ports: []corev1.ContainerPort{{Name: runnerHTTPSPort, Protocol: corev1.ProtocolTCP, ContainerPort: runnerHTTPSContainer}},
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceCPU:    resource.MustParse("500m"),
@@ -980,6 +975,27 @@ func (o *Operator) runnerPod(architecture string, hostPort int32) *corev1.Pod {
 			},
 			Volumes: volumes,
 		},
+	}
+}
+
+func runnerPodArgs(architecture string, cfg runner.Config) []string {
+	return []string{
+		"--architecture=" + architecture,
+		"--listen-addr=" + cfg.ListenAddr,
+		"--public-redfish-url=" + cfg.PublicRedfishURL,
+		"--vxlan-interface=" + cfg.VXLAN.Interface,
+		"--vxlan-vni=" + strconv.Itoa(cfg.VXLAN.VNI),
+		"--vxlan-port=" + strconv.Itoa(cfg.VXLAN.Port),
+		"--bridge=" + cfg.BridgeName,
+		"--tap=" + cfg.TapName,
+		"--guest-mac=" + cfg.Guest.MAC,
+		"--guest-ipv4=" + cfg.Guest.IPv4,
+		"--guest-subnet-mask=" + cfg.Guest.SubnetMask,
+		"--guest-gateway=" + cfg.Guest.Gateway,
+		"--guest-dns=" + strings.Join(cfg.Guest.DNS, ","),
+		"--redfish-username=" + cfg.Redfish.Username,
+		"--redfish-password=" + cfg.Redfish.Password,
+		"--redfish-device-id=" + cfg.Redfish.DeviceID,
 	}
 }
 
@@ -1016,7 +1032,7 @@ func (o *Operator) controlPlanePod(kubernetesVersion string, hostPort int32) *co
 				"app.kubernetes.io/component": controlPlaneComponent,
 				LabelResourceType:             ResourceTypeControlPlane,
 				LabelKubernetesVersion:        sanitizeLabelValue(kubernetesVersion),
-				runnerHostPortLabel:           strconv.FormatInt(int64(hostPort), 10),
+				playpenHostPortLabel:          strconv.FormatInt(int64(hostPort), 10),
 			},
 			Annotations: map[string]string{
 				AnnotationControlPlaneGuestServer: guestServer,
@@ -1105,8 +1121,8 @@ func (o *Operator) controlPlanePod(kubernetesVersion string, hostPort int32) *co
 	}
 }
 
-func runnerPodName(architecture string, hostPort int32) string {
-	return fmt.Sprintf("playpen-runner-%s-%d", architecture, hostPort)
+func runnerPodName(architecture string, index int) string {
+	return fmt.Sprintf("playpen-runner-%s-%d", architecture, index)
 }
 
 func controlPlanePodName(kubernetesVersion string, hostPort int32) string {
@@ -1461,6 +1477,13 @@ func runnerPodUnavailableReason(pod *corev1.Pod) string {
 		return fmt.Sprintf("runner pod %s is %s", pod.Name, pod.Status.Phase)
 	}
 
+	if podResourceType(pod) == ResourceTypeRunner && strings.TrimSpace(pod.Status.PodIP) == "" {
+		return fmt.Sprintf("runner pod %s has no pod IP", pod.Name)
+	}
+	if podResourceType(pod) == ResourceTypeRunner && strings.TrimSpace(pod.Annotations[AnnotationRedfishCertPEM]) == "" {
+		return fmt.Sprintf("runner pod %s has no Redfish certificate annotation", pod.Name)
+	}
+
 	if len(pod.Status.ContainerStatuses) == 0 {
 		return fmt.Sprintf("runner pod %s has no container status", pod.Name)
 	}
@@ -1483,7 +1506,7 @@ var (
 	errIdempotencyRequestConflict = errors.New("idempotency key was already used with a different request")
 )
 
-func (o *Operator) patchClaim(ctx context.Context, pod *corev1.Pod, keyHash, reqHash, clientPublicKey string) (*corev1.Pod, bool, error) {
+func (o *Operator) patchClaim(ctx context.Context, pod *corev1.Pod, keyHash, reqHash, externalClientInternalIP, vxlanRemoteAddress string) (*corev1.Pod, bool, error) {
 	var updated *corev1.Pod
 
 	claimed := false
@@ -1520,8 +1543,14 @@ func (o *Operator) patchClaim(ctx context.Context, pod *corev1.Pod, keyHash, req
 		allocationID := allocationIDForPod(pod)
 		current.Annotations[AnnotationIdempotencyKeyHash] = keyHash
 		current.Annotations[AnnotationRequestHash] = reqHash
-		current.Annotations[AnnotationClientWireGuardPublicKey] = clientPublicKey
 		current.Annotations[AnnotationClaimedAt] = time.Now().UTC().Format(time.RFC3339)
+		if externalClientInternalIP != "" {
+			current.Annotations[AnnotationExternalClientInternalIP] = externalClientInternalIP
+		}
+		if vxlanRemoteAddress != "" {
+			current.Annotations[AnnotationVXLANRemoteAddress] = vxlanRemoteAddress
+			delete(current.Annotations, AnnotationRunnerNetworkReady)
+		}
 		current.Labels[LabelAllocated] = allocationID
 
 		if err := o.Client.Update(ctx, current); err != nil {
@@ -1555,30 +1584,17 @@ func (o *Operator) responseForPod(ctx context.Context, pod *corev1.Pod) (AllocRe
 		return o.buildControlPlaneResponse(pod, gatewayIP, nodePublicIP, endpointPort, externalTrafficPolicy)
 	}
 
-	serverPublicKey, err := serverWireGuardPublicKeyForPod(pod)
+	keyHash := pod.Annotations[AnnotationIdempotencyKeyHash]
+	if keyHash == "" {
+		return AllocResponse{}, fmt.Errorf("runner pod %s/%s is not allocated", pod.Namespace, pod.Name)
+	}
+
+	externalClientNode, _, err := o.ensureExternalClientNode(ctx, keyHash, pod.Annotations[AnnotationExternalClientInternalIP])
 	if err != nil {
 		return AllocResponse{}, err
 	}
 
-	gatewayIP, nodePublicIP, err := o.gatewayForPod(ctx, pod)
-	if err != nil {
-		return AllocResponse{}, err
-	}
-
-	endpointPort, externalTrafficPolicy, err := endpointForPod(pod)
-	if err != nil {
-		return AllocResponse{}, err
-	}
-
-	return o.buildResponse(pod, gatewayIP, nodePublicIP, endpointPort, externalTrafficPolicy, serverPublicKey)
-}
-
-func endpointForPod(pod *corev1.Pod) (int32, string, error) {
-	if hostPort := podWireGuardHostPort(pod); hostPort != 0 {
-		return hostPort, "HostPort", nil
-	}
-
-	return 0, "", fmt.Errorf("runner pod %s/%s has no WireGuard hostPort", pod.Namespace, pod.Name)
+	return o.buildResponse(pod, keyHash, externalClientNode)
 }
 
 func controlPlaneEndpointForPod(pod *corev1.Pod) (int32, string, error) {
@@ -1589,22 +1605,23 @@ func controlPlaneEndpointForPod(pod *corev1.Pod) (int32, string, error) {
 	return 0, "", fmt.Errorf("control-plane pod %s/%s has no API server hostPort", pod.Namespace, pod.Name)
 }
 
-func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string, endpointPort int32, externalTrafficPolicy, serverPublicKey string) (AllocResponse, error) {
+func (o *Operator) buildResponse(pod *corev1.Pod, keyHash string, externalClientNode *corev1.Node) (AllocResponse, error) {
 	runnerCfg := o.Config.Runner
+	serverVXLAN := strings.TrimSpace(pod.Status.PodIP)
+	if net.ParseIP(serverVXLAN) == nil {
+		return AllocResponse{}, fmt.Errorf("runner pod %s/%s has invalid pod IP %q", pod.Namespace, pod.Name, pod.Status.PodIP)
+	}
 
-	serverWG, err := runnerAddressIP(runnerCfg.WireGuard.ServerAddress)
+	clientVXLAN, err := externalClientVXLANAddress(externalClientNode)
 	if err != nil {
 		return AllocResponse{}, err
 	}
 
-	clientWG, err := runnerAddressIP(runnerCfg.WireGuard.ClientAddress)
-	if err != nil {
-		return AllocResponse{}, err
-	}
+	podCIDR := externalClientPodCIDR(externalClientNode)
 
 	redfishURL := runnerCfg.PublicRedfishURL
 	if redfishURL == "" {
-		redfishURL = defaultRunnerPublicRedfishURL(runnerCfg)
+		redfishURL = defaultRunnerPublicRedfishURL(runnerCfg, serverVXLAN)
 	}
 
 	return AllocResponse{
@@ -1613,28 +1630,25 @@ func (o *Operator) buildResponse(pod *corev1.Pod, gatewayIP, nodePublicIP string
 			Namespace:    pod.Namespace,
 			Name:         pod.Name,
 			NodeName:     pod.Spec.NodeName,
-			NodePublicIP: nodePublicIP,
 			ResourceType: ResourceTypeRunner,
 			Architecture: podArchitecture(pod),
 		},
 		Endpoint: EndpointResponse{
-			Host:                  gatewayIP,
-			WireGuardUDPPort:      endpointPort,
-			ExternalTrafficPolicy: externalTrafficPolicy,
+			Host:                  serverVXLAN,
+			ExternalTrafficPolicy: "unbounded-net",
 		},
-		WireGuard: WireGuardResponse{
-			Interface:       runnerCfg.WireGuard.Interface,
-			ServerPublicKey: serverPublicKey,
-			ServerAddress:   runnerCfg.WireGuard.ServerAddress,
-			ClientAddress:   runnerCfg.WireGuard.ClientAddress,
-			ListenPort:      runnerCfg.WireGuard.ListenPort,
+		ExternalClient: ExternalClientResponse{
+			NodeName: externalClientNodeName(keyHash),
+			Site:     strings.TrimSpace(o.Config.ExternalClientSite),
+			PodCIDR:  podCIDR,
 		},
 		VXLAN: VXLANResponse{
 			Interface:     runnerCfg.VXLAN.Interface,
+			Device:        runner.VXLANDevice,
 			VNI:           runnerCfg.VXLAN.VNI,
 			UDPPort:       runnerCfg.VXLAN.Port,
-			ServerAddress: serverWG,
-			ClientAddress: clientWG,
+			ServerAddress: serverVXLAN,
+			ClientAddress: clientVXLAN,
 		},
 		Network: NetworkResponse{
 			GuestMAC:    runnerCfg.Guest.MAC,
@@ -1894,27 +1908,6 @@ func podKubernetesVersion(pod *corev1.Pod) string {
 	return version
 }
 
-func serverWireGuardPublicKeyForPod(pod *corev1.Pod) (string, error) {
-	serverPublicKey := strings.TrimSpace(pod.Annotations[AnnotationServerWireGuardPublicKey])
-	if _, err := wgtypes.ParseKey(serverPublicKey); err != nil {
-		return "", fmt.Errorf("runner pod %q has no valid server WireGuard public key", pod.Name)
-	}
-
-	return serverPublicKey, nil
-}
-
-func podWireGuardHostPort(pod *corev1.Pod) int32 {
-	for _, container := range pod.Spec.Containers {
-		for _, port := range container.Ports {
-			if port.Protocol == corev1.ProtocolUDP && port.HostPort != 0 && port.Name == "wireguard" {
-				return port.HostPort
-			}
-		}
-	}
-
-	return 0
-}
-
 func podControlPlaneHostPort(pod *corev1.Pod) int32 {
 	for _, container := range pod.Spec.Containers {
 		for _, port := range container.Ports {
@@ -1956,11 +1949,212 @@ func nodeExternalIP(node *corev1.Node) string {
 }
 
 func (o *Operator) deleteRunnerPod(ctx context.Context, pod *corev1.Pod) error {
+	keyHash := pod.Annotations[AnnotationIdempotencyKeyHash]
+	if keyHash != "" {
+		if err := o.deleteExternalClientNode(ctx, keyHash); err != nil {
+			return err
+		}
+	}
+
 	if err := o.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
 
 	return nil
+}
+
+func (o *Operator) ensureExternalClientNode(ctx context.Context, keyHash, internalIP string) (*corev1.Node, bool, error) {
+	site := strings.TrimSpace(o.Config.ExternalClientSite)
+	if site == "" {
+		return nil, false, fmt.Errorf("external client site is required")
+	}
+
+	node := &corev1.Node{}
+	name := externalClientNodeName(keyHash)
+	created := false
+	if err := o.Client.Get(ctx, types.NamespacedName{Name: name}, node); apierrors.IsNotFound(err) {
+		resolvedInternalIP, err := o.externalClientInternalIP(node, internalIP)
+		if err != nil {
+			return nil, false, err
+		}
+
+		node = externalClientNode(name, site, keyHash, resolvedInternalIP)
+		if err := o.Client.Create(ctx, node); err != nil && !apierrors.IsAlreadyExists(err) {
+			return nil, false, err
+		} else if err == nil {
+			created = true
+		}
+	} else if err != nil {
+		return nil, false, err
+	}
+
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		current := &corev1.Node{}
+		if err := o.Client.Get(ctx, types.NamespacedName{Name: name}, current); err != nil {
+			return err
+		}
+
+		resolvedInternalIP, err := o.externalClientInternalIP(current, internalIP)
+		if err != nil {
+			return err
+		}
+
+		base := current.DeepCopy()
+		if current.Labels == nil {
+			current.Labels = map[string]string{}
+		}
+
+		current.Labels[unboundedNetSiteLabel] = site
+		current.Labels[LabelResourceType] = ResourceTypeRunner
+		current.Labels[LabelAllocated] = keyHash[:16]
+
+		if err := o.Client.Patch(ctx, current, client.MergeFrom(base)); err != nil {
+			return err
+		}
+
+		updated := &corev1.Node{}
+		if err := o.Client.Get(ctx, types.NamespacedName{Name: name}, updated); err != nil {
+			return err
+		}
+
+		statusBase := updated.DeepCopy()
+		setNodeInternalIP(updated, resolvedInternalIP)
+
+		return o.Client.Status().Patch(ctx, updated, client.MergeFrom(statusBase))
+	}); err != nil {
+		return nil, created, err
+	}
+
+	if o.assignExternalClientPodCIDR != nil {
+		if err := o.assignExternalClientPodCIDR(ctx, name); err != nil {
+			return nil, created, err
+		}
+	}
+
+	node, err := o.waitExternalClientNodePodCIDR(ctx, name)
+	if err != nil {
+		return nil, created, err
+	}
+
+	return node, created, nil
+}
+
+func (o *Operator) externalClientInternalIP(node *corev1.Node, requested string) (string, error) {
+	internalIP := strings.TrimSpace(requested)
+	if internalIP == "" {
+		internalIP = nodeAddress(node, corev1.NodeInternalIP)
+	}
+	if internalIP == "" {
+		return "", fmt.Errorf("external client internal IP is required")
+	}
+	if net.ParseIP(internalIP) == nil {
+		return "", fmt.Errorf("external client internal IP %q is invalid", internalIP)
+	}
+
+	return internalIP, nil
+}
+
+func setNodeInternalIP(node *corev1.Node, internalIP string) {
+	addresses := make([]corev1.NodeAddress, 0, len(node.Status.Addresses)+1)
+	for _, address := range node.Status.Addresses {
+		if address.Type != corev1.NodeInternalIP {
+			addresses = append(addresses, address)
+		}
+	}
+
+	addresses = append(addresses, corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: internalIP})
+	node.Status.Addresses = addresses
+}
+
+func (o *Operator) waitExternalClientNodePodCIDR(ctx context.Context, name string) (*corev1.Node, error) {
+	node := &corev1.Node{}
+	err := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		if err := o.Client.Get(ctx, types.NamespacedName{Name: name}, node); err != nil {
+			return false, err
+		}
+
+		return externalClientPodCIDR(node) != "", nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("wait for external client node %s pod CIDR: %w", name, err)
+	}
+
+	return node, nil
+}
+
+func externalClientPodCIDR(node *corev1.Node) string {
+	if node == nil {
+		return ""
+	}
+
+	for _, podCIDR := range node.Spec.PodCIDRs {
+		if podCIDR = strings.TrimSpace(podCIDR); podCIDR != "" {
+			return podCIDR
+		}
+	}
+
+	return strings.TrimSpace(node.Spec.PodCIDR)
+}
+
+func externalClientVXLANAddress(node *corev1.Node) (string, error) {
+	podCIDR := externalClientPodCIDR(node)
+	if podCIDR == "" {
+		return "", fmt.Errorf("external client node %s has no pod CIDR", node.Name)
+	}
+
+	prefix, err := netip.ParsePrefix(podCIDR)
+	if err != nil {
+		return "", fmt.Errorf("parse external client pod CIDR %q: %w", podCIDR, err)
+	}
+
+	addr := prefix.Masked().Addr()
+	if prefix.Bits() == addr.BitLen() {
+		return addr.String(), nil
+	}
+
+	next := addr.Next()
+	if prefix.Contains(next) {
+		return next.String(), nil
+	}
+
+	return addr.String(), nil
+}
+
+func nodeAddress(node *corev1.Node, addressType corev1.NodeAddressType) string {
+	if node == nil {
+		return ""
+	}
+
+	for _, address := range node.Status.Addresses {
+		if address.Type == addressType {
+			return strings.TrimSpace(address.Address)
+		}
+	}
+
+	return ""
+}
+
+func (o *Operator) deleteExternalClientNode(ctx context.Context, keyHash string) error {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: externalClientNodeName(keyHash)}}
+	if err := o.Client.Delete(ctx, node); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	return nil
+}
+
+func externalClientNode(name, site, keyHash, address string) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			Labels: map[string]string{
+				unboundedNetSiteLabel: site,
+				LabelResourceType:     ResourceTypeRunner,
+				LabelAllocated:        keyHash[:16],
+			},
+		},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: address}}},
+	}
 }
 
 func (o *Operator) claimExpired(pod *corev1.Pod, now time.Time) bool {
@@ -2017,6 +2211,10 @@ func allocationIDForPod(pod *corev1.Pod) string {
 	return hashString(pod.Namespace + "/" + pod.Name)[:16]
 }
 
+func externalClientNodeName(keyHash string) string {
+	return "playpen-client-" + keyHash[:16]
+}
+
 func hashString(value string) string {
 	sum := sha256.Sum256([]byte(value))
 
@@ -2027,24 +2225,7 @@ func sanitizeLabelValue(value string) string {
 	return strings.Trim(strings.NewReplacer("+", "-", "_", "-").Replace(value), "-.")
 }
 
-func runnerAddressIP(value string) (string, error) {
-	if i := strings.Index(value, "/"); i >= 0 {
-		value = value[:i]
-	}
-
-	if net.ParseIP(value) == nil {
-		return "", fmt.Errorf("invalid IP address %q", value)
-	}
-
-	return value, nil
-}
-
-func defaultRunnerPublicRedfishURL(cfg runner.Config) string {
-	host, err := runnerAddressIP(cfg.WireGuard.ServerAddress)
-	if err != nil {
-		return "https://" + cfg.ListenAddr
-	}
-
+func defaultRunnerPublicRedfishURL(cfg runner.Config, host string) string {
 	_, port, err := net.SplitHostPort(cfg.ListenAddr)
 	if err != nil || port == "" {
 		port = "8443"

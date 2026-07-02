@@ -47,10 +47,9 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     qemu-system-x86 \
     qemu-utils \
     swtpm \
-    wireguard-tools \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /unbounded/bin /var/lib/playpen-runner /etc/playpen/wireguard
+RUN mkdir -p /unbounded/bin /var/lib/playpen-runner
 COPY --from=builder /src/bin/playpen-runner /unbounded/bin/playpen-runner
 COPY --from=builder /src/bin/playpen-operator /unbounded/bin/playpen-operator
 

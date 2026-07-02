@@ -37,10 +37,12 @@ spec:
             - --runner-service-account-name=playpen-runner
             - --runner-amd64-count={{ default "2" .RunnerAMD64Count }}
             - --runner-arm64-count={{ default "2" .RunnerARM64Count }}
-            - --runner-wireguard-host-port-start={{ default "51820" .RunnerWireGuardHostPortStart }}
-            - --runner-wireguard-host-port-end={{ default "51899" .RunnerWireGuardHostPortEnd }}
             - --runner-require-kvm={{ default "true" .RunnerRequireKVM }}
             - --runner-control-plane-tolerations={{ default "false" .RunnerControlPlaneTolerations }}
+            {{- if .RunnerPublicRedfishURL }}
+            - --runner-public-redfish-url={{ .RunnerPublicRedfishURL }}
+            {{- end }}
+            - --external-client-site={{ default "playpen-external" .ExternalClientSite }}
             - --control-plane-count={{ default "1" .ControlPlaneCount }}
             - --control-plane-versions={{ default "v1.33.0" .ControlPlaneVersions }}
             - --control-plane-image={{ default "rancher/k3s:{version}-k3s1" .ControlPlaneImage }}

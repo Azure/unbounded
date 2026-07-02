@@ -4,12 +4,13 @@
 package meta
 
 const (
-	AnnotationClientWireGuardPublicKey = "playpen.unbounded-cloud.io/client-wireguard-public-key"
-	AnnotationServerWireGuardPublicKey = "playpen.unbounded-cloud.io/server-wireguard-public-key"
 	AnnotationRedfishCertPEM           = "playpen.unbounded-cloud.io/redfish-cert-pem"
 	AnnotationIdempotencyKeyHash       = "playpen.unbounded-cloud.io/idempotency-key-hash"
 	AnnotationRequestHash              = "playpen.unbounded-cloud.io/request-hash"
 	AnnotationClaimedAt                = "playpen.unbounded-cloud.io/claimed-at"
+	AnnotationExternalClientInternalIP = "playpen.unbounded-cloud.io/external-client-internal-ip"
+	AnnotationVXLANRemoteAddress       = "playpen.unbounded-cloud.io/vxlan-remote-address"
+	AnnotationRunnerNetworkReady       = "playpen.unbounded-cloud.io/network-ready"
 	AnnotationControlPlaneKubeconfig   = "playpen.unbounded-cloud.io/control-plane-kubeconfig"
 	AnnotationControlPlaneGuestServer  = "playpen.unbounded-cloud.io/control-plane-guest-server"
 

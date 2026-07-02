@@ -21,7 +21,6 @@ import (
 
 	"github.com/coder/websocket"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -29,7 +28,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	metalredfish "github.com/Azure/unbounded/internal/metalman/redfish"
-	"github.com/Azure/unbounded/internal/playpen/meta"
 )
 
 type recordedCommand struct {
@@ -125,22 +123,18 @@ func (p *fakeProcess) Wait() error { return nil }
 
 func TestNetworkSetupCommands(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.WireGuard.ClientPublicKey = "client-public-key"
 	fake := &fakeCommander{}
 
 	manager := NewNetworkManager(fake, cfg)
-	if err := manager.Setup(t.Context()); err != nil {
+	if err := manager.Setup(t.Context(), "10.244.0.10", "10.250.0.1"); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 
 	commands := strings.Join(fake.runStrings(), "\n")
 	for _, want := range []string{
-		"ip link add wg0 type wireguard",
-		"wg set wg0 private-key /etc/playpen/wireguard/privatekey listen-port 51820",
-		"wg set wg0 peer client-public-key allowed-ips 10.88.0.2/32",
 		"ip link add br0 type bridge",
-		"ip link add vxlan0 type vxlan id 12001 dev wg0 local 10.88.0.1 remote 10.88.0.2 dstport 4789 nolearning",
-		"bridge fdb append 00:00:00:00:00:00 dev vxlan0 dst 10.88.0.2",
+		"ip link add vxlan0 type vxlan id 12001 local 10.244.0.10 remote 10.250.0.1 dstport 4789 nolearning",
+		"bridge fdb append 00:00:00:00:00:00 dev vxlan0 dst 10.250.0.1",
 		"ip tuntap add dev tap0 mode tap",
 	} {
 		if !strings.Contains(commands, want) {
@@ -149,6 +143,9 @@ func TestNetworkSetupCommands(t *testing.T) {
 	}
 
 	for _, forbidden := range []string{
+		"dev unbounded0",
+		"wireguard",
+		"wg set",
 		"192.168.200.1",
 		"MASQUERADE",
 		"net.ipv4.ip_forward",
@@ -160,84 +157,13 @@ func TestNetworkSetupCommands(t *testing.T) {
 	}
 }
 
-func TestNetworkSetupWithoutInitialPeer(t *testing.T) {
+func TestInfoResponseUsesVXLANAddressForDefaultRedfishURL(t *testing.T) {
 	cfg := DefaultConfig()
-	fake := &fakeCommander{}
-
-	manager := NewNetworkManager(fake, cfg)
-	if err := manager.Setup(t.Context()); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-
-	commands := strings.Join(fake.runStrings(), "\n")
-	if strings.Contains(commands, " peer ") {
-		t.Fatalf("setup configured peer before claim:\n%s", commands)
-	}
-
-	if err := manager.ConfigurePeer(t.Context(), "client-public-key"); err != nil {
-		t.Fatalf("configure peer: %v", err)
-	}
-
-	commands = strings.Join(fake.runStrings(), "\n")
-	if !strings.Contains(commands, "wg set wg0 peer client-public-key allowed-ips 10.88.0.2/32") {
-		t.Fatalf("commands missing delayed peer:\n%s", commands)
-	}
-}
-
-func TestWaitForClientPublicKeyAnnotationConfiguresPeer(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.ConfigureNetwork = true
-	cfg.PodName = "runner-1"
-	cfg.PodNamespace = "playpen"
-	cfg.KubernetesClient = testKubernetesClient(t, &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: cfg.PodName, Namespace: cfg.PodNamespace},
-	})
-	fake := &fakeCommander{}
-	manager := NewNetworkManager(fake, cfg)
-	state := NewRuntimeState("server-public-key", false)
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	go waitForClientPublicKeyAnnotation(ctx, cfg, manager, state)
-
-	if state.Ready() {
-		t.Fatal("state is ready before claim")
-	}
-
-	pod := &corev1.Pod{}
-	if err := cfg.KubernetesClient.Get(t.Context(), client.ObjectKey{Namespace: cfg.PodNamespace, Name: cfg.PodName}, pod); err != nil {
-		t.Fatal(err)
-	}
-
-	base := pod.DeepCopy()
-
-	pod.Annotations = map[string]string{meta.AnnotationClientWireGuardPublicKey: "client-public-key"}
-	if err := cfg.KubernetesClient.Patch(t.Context(), pod, client.MergeFrom(base)); err != nil {
-		t.Fatal(err)
-	}
-
-	deadline := time.Now().Add(5 * time.Second)
-	for !state.Ready() && time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	if !state.Ready() {
-		t.Fatal("state did not become ready")
-	}
-
-	commands := strings.Join(fake.runStrings(), "\n")
-	if !strings.Contains(commands, "wg set wg0 peer client-public-key allowed-ips 10.88.0.2/32") {
-		t.Fatalf("commands missing delayed peer:\n%s", commands)
-	}
-}
-
-func TestInfoResponseUsesWireGuardAddressForDefaultRedfishURL(t *testing.T) {
-	cfg := DefaultConfig()
-	info := infoResponse(cfg, "server-public-key")
+	cfg.PodIP = "10.244.0.10"
+	info := infoResponse(cfg)
 	redfish := info["redfish"].(map[string]string)
 
-	if got, want := redfish["url"], "https://10.88.0.1:8443"; got != want {
+	if got, want := redfish["url"], "https://10.244.0.10:8443"; got != want {
 		t.Fatalf("redfish url = %q, want %q", got, want)
 	}
 }

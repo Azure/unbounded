@@ -2,25 +2,23 @@
 
 `playpen-operator` serves the aggregated Kubernetes API for playpen runner pods.
 It runs next to a pool of `playpen-runner` pods and allocates one idle runner to
-a client that presents a WireGuard public key.
+each client request.
 
-The operator maintains the runner pod pool itself. It assigns each runner a
-unique WireGuard UDP `hostPort`, and on alloc patches the selected pod with the
-client key and returns the endpoint, network, VXLAN, and Redfish details needed
-to use the playpen VM.
-
-The returned guest network metadata is intended for a VM whose default gateway is
-configured on the client side of the tunnel. The runner pod exposes only the VM's
-L2 path into VXLAN; VM egress is routed and NATed by the client tunnel namespace.
+Playpen assumes the cluster is already running unbounded-net as the CNI. Runner
+pods use ordinary pod networking only. On allocation, the operator creates a
+temporary synthetic Kubernetes `Node` for the external client, labels it with the
+configured external unbounded-net site, and waits for unbounded-net to assign a
+PodCIDR. The runner pod IP becomes the server-side VXLAN endpoint and the
+client-side VXLAN endpoint is derived from the synthetic Node PodCIDR.
 
 The same runner image is also used for pooled k3s control-plane pods. Those pods
 run k3s plus `playpen-runner control-plane`, which publishes the kubeconfig and
 guest API server metadata consumed by control-plane allocations.
 
 The operator does not proxy Redfish or console traffic. Clients reach Redfish and
-the serial console stream on the runner through the WireGuard tunnel. The alloc
-response includes the runner Redfish URL, the system URL, and the OEM serial
-console stream URI for convenience.
+the serial console stream through the Playpen VXLAN path. The alloc response
+includes the runner Redfish URL, the system URL, and the OEM serial console
+stream URI for convenience.
 
 ## API
 
@@ -42,19 +40,20 @@ Alloc and dealloc share one RBAC action. Both handlers authorize `create` on
 `allocs.playpen.unbounded-cloud.io`, so granting that action grants both API
 operations together.
 
-Alloc requests require an idempotency key and a valid WireGuard public key. The
-idempotency key can be passed in the `Idempotency-Key` header or, for `kubectl`
-clients without a header flag, as `idempotencyKey` in the JSON body:
+Runner alloc requests require an idempotency key and the external client's real
+unbounded-net underlay InternalIP. The idempotency key can be passed in the
+`Idempotency-Key` header or, for `kubectl` clients without a header flag, as
+`idempotencyKey` in the JSON body:
 
 ```bash
 kubectl create --raw /apis/playpen.unbounded-cloud.io/v1alpha1/allocs \
 	-f - <<'EOF'
-{"idempotencyKey":"smoke-test-1","wireGuardPublicKey":"<client-wireguard-public-key>"}
+{"idempotencyKey":"smoke-test-1","externalClientInternalIP":"10.0.0.25"}
 EOF
 ```
 
 The same idempotency key can be retried with the same request body. Reusing the
-key with a different WireGuard public key returns `409 Conflict`.
+key with a different request returns `409 Conflict`.
 
 Dealloc uses the same idempotency key and is idempotent:
 
@@ -70,19 +69,19 @@ EOF
 - Runner pods are created in `--runner-namespace` from `--runner-image`.
 - `--runner-amd64-count` and `--runner-arm64-count` set the desired idle pool
   size for each architecture.
-- `--runner-wireguard-host-port-start` and
-  `--runner-wireguard-host-port-end` define the cluster-wide UDP hostPort range
-  used for runner WireGuard endpoints.
+- Runner pods always use normal pod networking, never Kubernetes `hostNetwork`.
 - Runner pods are selected from `--runner-namespace` using
   `--runner-label-selector` for allocation and reconciliation.
-- An alloc writes pod annotations for the client key, request hash, idempotency
-  key hash, and allocation time, then labels the pod with an allocation ID.
-- The alloc response uses the runner node's `ExternalIP` and the runner pod's
-  WireGuard `hostPort` as the externally reachable endpoint. If the runner node
-  has no `ExternalIP`, allocs fail with `503 Service Unavailable`.
+- An alloc creates or updates the synthetic external-client Node, waits for its
+  PodCIDR, then writes pod annotations for the request hash, idempotency key
+  hash, client InternalIP, client VXLAN address, and allocation time.
+- The alloc response uses the selected runner pod IP as the server VXLAN address
+  and Redfish host. Real Kubernetes Node `ExternalIP` addresses are not used for
+  runner allocations.
 - `--playpen-ttl` is the only playpen pod TTL enforcement point. It deletes
-  expired allocated pods. Deallocs also delete the allocated pod. The operator
-  replaces deleted allocated pods during runner pool reconciliation.
+  expired allocated pods. Deallocs also delete the allocated pod and synthetic
+  client Node. The operator replaces deleted allocated pods during runner pool
+  reconciliation.
 - On startup, the operator ensures the operator TLS Secret exists, then injects
   the serving certificate into the APIService `caBundle`.
 

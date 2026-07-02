@@ -442,7 +442,7 @@ test: lint machina-manifests machine-ops-manifests playpen-manifests net-manifes
 endif
 
 e2e-playpen: ## Run the kind-based playpen e2e suite
-	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
+	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=30m
 
 build: machina-manifests machine-ops-manifests playpen-manifests net-manifests ## Build all Go packages
 	$(GOBUILD) $(GO_PACKAGES)
@@ -958,8 +958,9 @@ MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
 PLAYPEN_NAMESPACE ?= playpen
 PLAYPEN_AMD64_RUNNERS ?= 2
 PLAYPEN_ARM64_RUNNERS ?= 2
-PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_START ?= 51820
-PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_END ?= 51899
+PLAYPEN_RUNNER_REQUIRE_KVM ?= true
+PLAYPEN_EXTERNAL_CLIENT_SITE ?= playpen-external
+PLAYPEN_EXTERNAL_CLIENT_POD_CIDR ?= 10.88.0.2/32
 PLAYPEN_CONTROL_PLANE_COUNT ?= 1
 PLAYPEN_CONTROL_PLANE_VERSIONS ?= v1.33.0
 PLAYPEN_CONTROL_PLANE_IMAGE ?= rancher/k3s:{version}-k3s1
@@ -1005,8 +1006,9 @@ playpen-manifests: ## Render playpen operator and runner manifests into deploy/p
 		--set PlaypenImage=$(PLAYPEN_IMAGE) \
 		--set RunnerAMD64Count=$(PLAYPEN_AMD64_RUNNERS) \
 		--set RunnerARM64Count=$(PLAYPEN_ARM64_RUNNERS) \
-		--set RunnerWireGuardHostPortStart=$(PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_START) \
-		--set RunnerWireGuardHostPortEnd=$(PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_END) \
+		--set RunnerRequireKVM=$(PLAYPEN_RUNNER_REQUIRE_KVM) \
+		--set ExternalClientSite=$(PLAYPEN_EXTERNAL_CLIENT_SITE) \
+		--set ExternalClientPodCIDR=$(PLAYPEN_EXTERNAL_CLIENT_POD_CIDR) \
 		--set ControlPlaneCount=$(PLAYPEN_CONTROL_PLANE_COUNT) \
 		--set ControlPlaneVersions=$(PLAYPEN_CONTROL_PLANE_VERSIONS) \
 		--set ControlPlaneImage=$(PLAYPEN_CONTROL_PLANE_IMAGE) \

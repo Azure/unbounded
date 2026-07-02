@@ -19,8 +19,6 @@ import (
 
 	"k8s.io/client-go/rest"
 
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-
 	"github.com/Azure/unbounded/internal/playpen/operator"
 )
 
@@ -52,20 +50,19 @@ type AllocateOptions struct {
 	Architecture string
 	// KubernetesVersion optionally requests a control-plane Kubernetes version.
 	KubernetesVersion string
-	// WireGuardPrivateKey is the client's WireGuard private key. If empty, one is generated.
-	WireGuardPrivateKey string
+	// ExternalClientInternalIP is the real underlay InternalIP used by unbounded-net for the synthetic client Node.
+	ExternalClientInternalIP string
 	// Tunnel optionally overrides local tunnel settings.
 	Tunnel TunnelConfig
 }
 
 // Playpen represents one allocated playpen runner pod and its local resources.
 type Playpen struct {
-	client              *Client
-	mu                  sync.Mutex
-	idempotencyKey      string
-	wireGuardPrivateKey string
-	closed              bool
-	tunnel              *tunnel
+	client         *Client
+	mu             sync.Mutex
+	idempotencyKey string
+	closed         bool
+	tunnel         *tunnel
 
 	Metadata operator.AllocResponse
 }
@@ -113,27 +110,12 @@ func New(cfg Config) (*Client, error) {
 
 // Allocate allocates an idle playpen runner and returns its metadata.
 func (c *Client) Allocate(ctx context.Context, opts AllocateOptions) (*Playpen, error) {
-	privateKey := strings.TrimSpace(opts.WireGuardPrivateKey)
-	if privateKey == "" {
-		key, err := wgtypes.GeneratePrivateKey()
-		if err != nil {
-			return nil, fmt.Errorf("generate wireguard key: %w", err)
-		}
-
-		privateKey = key.String()
-	}
-
-	key, err := wgtypes.ParseKey(privateKey)
-	if err != nil {
-		return nil, fmt.Errorf("parse wireguard private key: %w", err)
-	}
-
 	idempotencyKey, err := randomHex(32)
 	if err != nil {
 		return nil, fmt.Errorf("generate idempotency key: %w", err)
 	}
 
-	body, err := json.Marshal(operator.AllocRequest{WireGuardPublicKey: key.PublicKey().String(), Architecture: opts.Architecture})
+	body, err := json.Marshal(operator.AllocRequest{Architecture: opts.Architecture, ExternalClientInternalIP: opts.ExternalClientInternalIP})
 	if err != nil {
 		return nil, err
 	}
@@ -152,11 +134,10 @@ func (c *Client) Allocate(ctx context.Context, opts AllocateOptions) (*Playpen, 
 	}
 
 	return &Playpen{
-		client:              c,
-		idempotencyKey:      idempotencyKey,
-		wireGuardPrivateKey: privateKey,
-		Metadata:            resp,
-		tunnel: newTunnel(c.cmd, privateKey, resp, tunnelConfigWithDefaults(
+		client:         c,
+		idempotencyKey: idempotencyKey,
+		Metadata:       resp,
+		tunnel: newTunnel(c.cmd, resp, tunnelConfigWithDefaults(
 			opts.Tunnel,
 			idempotencyKey,
 		)),
@@ -202,11 +183,6 @@ func (c *Client) deallocate(ctx context.Context, idempotencyKey string) error {
 	return c.doJSON(req, http.StatusNoContent, nil)
 }
 
-// WireGuardPrivateKey returns the client's WireGuard private key for this playpen.
-func (p *Playpen) WireGuardPrivateKey() string {
-	return p.wireGuardPrivateKey
-}
-
 // TunnelConfig returns the local tunnel settings for this playpen.
 func (p *Playpen) TunnelConfig() TunnelConfig {
 	p.mu.Lock()
@@ -215,18 +191,7 @@ func (p *Playpen) TunnelConfig() TunnelConfig {
 	return p.tunnel.cfg
 }
 
-// OverrideEndpoint replaces the WireGuard endpoint used by future tunnel setup.
-func (p *Playpen) OverrideEndpoint(host string, port int32) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.Metadata.Endpoint.Host = strings.TrimSpace(host)
-	p.Metadata.Endpoint.WireGuardUDPPort = port
-	p.tunnel.metadata.Endpoint.Host = p.Metadata.Endpoint.Host
-	p.tunnel.metadata.Endpoint.WireGuardUDPPort = p.Metadata.Endpoint.WireGuardUDPPort
-}
-
-// ConfigureTunnel creates the local WireGuard and VXLAN resources for this playpen.
+// ConfigureTunnel creates the local VXLAN resources for this playpen.
 func (p *Playpen) ConfigureTunnel(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -238,7 +203,7 @@ func (p *Playpen) ConfigureTunnel(ctx context.Context) error {
 	return p.tunnel.Setup(ctx)
 }
 
-// Run executes a command inside the playpen network namespace.
+// Run executes a command in the configured playpen network context.
 func (p *Playpen) Run(ctx context.Context, name string, args ...string) error {
 	cmd, err := p.Command(ctx, name, args...)
 	if err != nil {
@@ -251,7 +216,7 @@ func (p *Playpen) Run(ctx context.Context, name string, args ...string) error {
 	return cmd.Run()
 }
 
-// Command returns a command configured to execute inside the playpen network namespace.
+// Command returns a command configured to execute in the playpen network context.
 func (p *Playpen) Command(ctx context.Context, name string, args ...string) (*exec.Cmd, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -260,16 +225,10 @@ func (p *Playpen) Command(ctx context.Context, name string, args ...string) (*ex
 		return nil, fmt.Errorf("playpen is closed")
 	}
 
-	namespace := strings.TrimSpace(p.tunnel.cfg.NetworkNamespace)
-	if namespace == "" {
-		return nil, fmt.Errorf("network namespace is required")
-	}
-
-	cmdArgs := append([]string{"netns", "exec", namespace, name}, args...)
-
-	cmdName := "ip"
+	cmdName := name
+	cmdArgs := args
 	if os.Geteuid() != 0 {
-		cmdArgs = append([]string{"-n", cmdName}, cmdArgs...)
+		cmdArgs = append([]string{"-n", name}, args...)
 		cmdName = "sudo"
 	}
 

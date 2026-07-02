@@ -5,15 +5,18 @@ package operator
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,17 +31,15 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-func TestAllocAllocatesRunnerWithHostPortEndpoint(t *testing.T) {
+func TestAllocAllocatesRunnerWithUnboundedNetEndpoint(t *testing.T) {
 	op := testOperator(
 		t,
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
 	)
-	req := AllocRequest{WireGuardPublicKey: testPublicKey(t)}
+	req := testRunnerAllocRequest()
 
 	resp, status, err := op.Alloc(t.Context(), "alloc-key", req)
 	if err != nil {
@@ -49,40 +50,32 @@ func TestAllocAllocatesRunnerWithHostPortEndpoint(t *testing.T) {
 		t.Fatalf("status = %d, want 200", status)
 	}
 
-	if resp.Endpoint.Host != "20.30.40.50" {
-		t.Fatalf("endpoint host = %q, want node external ip", resp.Endpoint.Host)
+	if resp.Endpoint.Host != "10.244.0.1" {
+		t.Fatalf("endpoint host = %q, want pod IP", resp.Endpoint.Host)
 	}
 
-	if resp.Pod.NodePublicIP != "20.30.40.50" {
-		t.Fatalf("pod node public ip = %q, want node external ip", resp.Pod.NodePublicIP)
+	if resp.Pod.NodePublicIP != "" {
+		t.Fatalf("pod node public ip = %q, want empty", resp.Pod.NodePublicIP)
 	}
 
 	if resp.Pod.Architecture != ArchitectureAMD64 {
 		t.Fatalf("pod architecture = %q, want %q", resp.Pod.Architecture, ArchitectureAMD64)
 	}
 
-	if resp.Endpoint.WireGuardUDPPort == 0 {
-		t.Fatal("endpoint WireGuard UDP port is empty")
+	if resp.Endpoint.ExternalTrafficPolicy != "unbounded-net" {
+		t.Fatalf("externalTrafficPolicy = %q, want unbounded-net", resp.Endpoint.ExternalTrafficPolicy)
 	}
 
-	if resp.Endpoint.ExternalTrafficPolicy != "HostPort" {
-		t.Fatalf("externalTrafficPolicy = %q, want HostPort", resp.Endpoint.ExternalTrafficPolicy)
-	}
-
-	if resp.WireGuard.ServerPublicKey == "" {
-		t.Fatal("server WireGuard public key is empty")
-	}
-
-	if resp.WireGuard.ServerPublicKey != podServerPublicKey("runner-1") {
-		t.Fatalf("server WireGuard public key = %q, want pod annotation", resp.WireGuard.ServerPublicKey)
-	}
-
-	if got, want := resp.Redfish["url"], "https://10.88.0.1:8443"; got != want {
+	if got, want := resp.Redfish["url"], "https://10.244.0.1:8443"; got != want {
 		t.Fatalf("redfish url = %q, want %q", got, want)
 	}
 
 	if resp.Redfish["systemURL"] != resp.Redfish["url"]+"/redfish/v1/Systems/"+resp.Redfish["deviceID"] {
 		t.Fatalf("redfish system URL = %q", resp.Redfish["systemURL"])
+	}
+
+	if resp.Redfish["certPEM"] == "" {
+		t.Fatal("redfish certPEM is empty")
 	}
 
 	if resp.Redfish["serialConsoleStreamURI"] != "/redfish/v1/Systems/"+resp.Redfish["deviceID"]+"/Oem/Unbounded/SerialConsole/Stream" {
@@ -94,23 +87,52 @@ func TestAllocAllocatesRunnerWithHostPortEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if pod.Annotations[AnnotationClientWireGuardPublicKey] != req.WireGuardPublicKey {
-		t.Fatalf("pod allocation annotation = %q, want %q", pod.Annotations[AnnotationClientWireGuardPublicKey], req.WireGuardPublicKey)
-	}
-
 	if pod.Labels[LabelAllocated] == "" {
 		t.Fatal("pod allocation label is empty")
 	}
+
+	if resp.ExternalClient.NodeName == "" {
+		t.Fatal("external client node name is empty")
+	}
+
+	if resp.ExternalClient.Site != op.Config.ExternalClientSite {
+		t.Fatalf("external client site = %q, want %q", resp.ExternalClient.Site, op.Config.ExternalClientSite)
+	}
+
+	if resp.ExternalClient.PodCIDR != "10.250.0.0/30" {
+		t.Fatalf("external client pod CIDR = %q, want 10.250.0.0/30", resp.ExternalClient.PodCIDR)
+	}
+
+	if resp.VXLAN.Device != "unbounded0" || resp.VXLAN.ServerAddress != "10.244.0.1" || resp.VXLAN.ClientAddress != "10.250.0.1" {
+		t.Fatalf("vxlan response = %#v", resp.VXLAN)
+	}
+
+	node := &corev1.Node{}
+	if err := op.Client.Get(t.Context(), client.ObjectKey{Name: resp.ExternalClient.NodeName}, node); err != nil {
+		t.Fatalf("get synthetic node: %v", err)
+	}
+
+	if node.Labels[unboundedNetSiteLabel] != op.Config.ExternalClientSite {
+		t.Fatalf("synthetic node site label = %q", node.Labels[unboundedNetSiteLabel])
+	}
+
+	if node.Spec.PodCIDR != "10.250.0.0/30" {
+		t.Fatalf("synthetic node pod CIDR = %q", node.Spec.PodCIDR)
+	}
+
+	if nodeAddress(node, corev1.NodeInternalIP) != "10.88.0.2" {
+		t.Fatalf("synthetic node addresses = %#v", node.Status.Addresses)
+	}
 }
 
-func TestAllocPrefersRunnerHostPortOnNodeExternalIP(t *testing.T) {
+func TestAllocUsesRunnerPodIP(t *testing.T) {
 	op := testOperator(
 		t,
 		testNode("node-1", "20.30.40.50"),
-		testPodWithHostPort("runner-1", "node-1", 51821),
+		testPod("runner-1", "node-1", nil),
 	)
 
-	resp, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	resp, status, err := op.Alloc(t.Context(), "alloc-key", testRunnerAllocRequest())
 	if err != nil {
 		t.Fatalf("alloc: %v", err)
 	}
@@ -119,33 +141,31 @@ func TestAllocPrefersRunnerHostPortOnNodeExternalIP(t *testing.T) {
 		t.Fatalf("status = %d, want %d", status, http.StatusOK)
 	}
 
-	if resp.Endpoint.Host != "20.30.40.50" {
-		t.Fatalf("endpoint host = %q, want runner node external IP", resp.Endpoint.Host)
+	if resp.Endpoint.Host != "10.244.0.1" {
+		t.Fatalf("endpoint host = %q, want runner pod IP", resp.Endpoint.Host)
 	}
 
-	if got, want := resp.Endpoint.WireGuardUDPPort, int32(51821); got != want {
-		t.Fatalf("endpoint port = %d, want host port %d", got, want)
-	}
-
-	if resp.Endpoint.ExternalTrafficPolicy != "HostPort" {
-		t.Fatalf("externalTrafficPolicy = %q, want HostPort", resp.Endpoint.ExternalTrafficPolicy)
+	if resp.Endpoint.ExternalTrafficPolicy != "unbounded-net" {
+		t.Fatalf("externalTrafficPolicy = %q, want unbounded-net", resp.Endpoint.ExternalTrafficPolicy)
 	}
 }
 
-func TestAllocUsesDistinctHostPortsForMultiplePodsOnSameNode(t *testing.T) {
+func TestAllocUsesDistinctSyntheticClientNodes(t *testing.T) {
 	op := testOperator(
 		t,
 		testNode("node-1", "20.30.40.50"),
-		testPodWithHostPort("runner-1", "node-1", 51821),
-		testPodWithHostPort("runner-2", "node-1", 51822),
+		testPod("runner-1", "node-1", nil),
+		testPod("runner-2", "node-1", nil),
 	)
 
-	first, status, err := op.Alloc(t.Context(), "alloc-key-1", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	first, status, err := op.Alloc(t.Context(), "alloc-key-1", testRunnerAllocRequest())
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("first alloc status=%d err=%v", status, err)
 	}
 
-	second, status, err := op.Alloc(t.Context(), "alloc-key-2", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	secondReq := testRunnerAllocRequest()
+	secondReq.ExternalClientInternalIP = "10.88.0.3"
+	second, status, err := op.Alloc(t.Context(), "alloc-key-2", secondReq)
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("second alloc status=%d err=%v", status, err)
 	}
@@ -154,12 +174,16 @@ func TestAllocUsesDistinctHostPortsForMultiplePodsOnSameNode(t *testing.T) {
 		t.Fatalf("second alloc reused pod %q", second.Pod.Name)
 	}
 
-	if first.Endpoint.Host != "20.30.40.50" || second.Endpoint.Host != "20.30.40.50" {
+	if first.Endpoint.Host == second.Endpoint.Host {
 		t.Fatalf("endpoints used unexpected hosts: first=%q second=%q", first.Endpoint.Host, second.Endpoint.Host)
 	}
 
-	if first.Endpoint.WireGuardUDPPort == second.Endpoint.WireGuardUDPPort {
-		t.Fatalf("allocs reused host port %d", first.Endpoint.WireGuardUDPPort)
+	if first.ExternalClient.NodeName == second.ExternalClient.NodeName {
+		t.Fatalf("allocs reused external client node %q", first.ExternalClient.NodeName)
+	}
+
+	if first.ExternalClient.PodCIDR == second.ExternalClient.PodCIDR || first.VXLAN.ClientAddress == second.VXLAN.ClientAddress {
+		t.Fatalf("allocs reused client network: first=%#v second=%#v", first.ExternalClient, second.ExternalClient)
 	}
 }
 
@@ -169,7 +193,7 @@ func TestAllocIsIdempotentAndConflictsOnDifferentRequest(t *testing.T) {
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
 	)
-	req := AllocRequest{WireGuardPublicKey: testPublicKey(t)}
+	req := testRunnerAllocRequest()
 
 	first, status, err := op.Alloc(t.Context(), "alloc-key", req)
 	if err != nil || status != 200 {
@@ -185,7 +209,9 @@ func TestAllocIsIdempotentAndConflictsOnDifferentRequest(t *testing.T) {
 		t.Fatalf("second pod = %q, want %q", second.Pod.Name, first.Pod.Name)
 	}
 
-	_, status, err = op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	conflictReq := testRunnerAllocRequest()
+	conflictReq.Architecture = ArchitectureARM64
+	_, status, err = op.Alloc(t.Context(), "alloc-key", conflictReq)
 	if err == nil {
 		t.Fatal("different alloc request with same idempotency key succeeded")
 	}
@@ -203,7 +229,7 @@ func TestAllocDefaultsToAMD64AndSkipsARM64Runner(t *testing.T) {
 		testPodWithArchitecture("amd64-runner", "node-1", ArchitectureAMD64),
 	)
 
-	resp, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	resp, status, err := op.Alloc(t.Context(), "alloc-key", testRunnerAllocRequest())
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
@@ -225,7 +251,9 @@ func TestAllocCanRequestARM64Runner(t *testing.T) {
 		testPodWithArchitecture("arm64-runner", "node-1", ArchitectureARM64),
 	)
 
-	resp, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t), Architecture: ArchitectureARM64})
+	req := testRunnerAllocRequest()
+	req.Architecture = ArchitectureARM64
+	resp, status, err := op.Alloc(t.Context(), "alloc-key", req)
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
@@ -242,7 +270,7 @@ func TestAllocCanRequestARM64Runner(t *testing.T) {
 func TestAllocRejectsInvalidArchitecture(t *testing.T) {
 	op := testOperator(t)
 
-	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t), Architecture: "s390x"})
+	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{Architecture: "s390x"})
 	if err == nil {
 		t.Fatal("alloc succeeded with invalid architecture")
 	}
@@ -259,7 +287,9 @@ func TestAllocReportsNoMatchingArchitecture(t *testing.T) {
 		testPodWithArchitecture("amd64-runner", "node-1", ArchitectureAMD64),
 	)
 
-	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t), Architecture: ArchitectureARM64})
+	req := testRunnerAllocRequest()
+	req.Architecture = ArchitectureARM64
+	_, status, err := op.Alloc(t.Context(), "alloc-key", req)
 	if err == nil {
 		t.Fatal("alloc succeeded without arm64 runner")
 	}
@@ -276,13 +306,15 @@ func TestAllocIdempotencyIncludesArchitecture(t *testing.T) {
 		testPodWithArchitecture("amd64-runner", "node-1", ArchitectureAMD64),
 		testPodWithArchitecture("arm64-runner", "node-1", ArchitectureARM64),
 	)
-	publicKey := testPublicKey(t)
-
-	if _, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: publicKey, Architecture: ArchitectureAMD64}); err != nil || status != http.StatusOK {
+	amd64Req := testRunnerAllocRequest()
+	amd64Req.Architecture = ArchitectureAMD64
+	if _, status, err := op.Alloc(t.Context(), "alloc-key", amd64Req); err != nil || status != http.StatusOK {
 		t.Fatalf("first alloc status=%d err=%v", status, err)
 	}
 
-	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: publicKey, Architecture: ArchitectureARM64})
+	arm64Req := testRunnerAllocRequest()
+	arm64Req.Architecture = ArchitectureARM64
+	_, status, err := op.Alloc(t.Context(), "alloc-key", arm64Req)
 	if err == nil {
 		t.Fatal("same idempotency key succeeded with different architecture")
 	}
@@ -358,10 +390,6 @@ func TestAllocAllocatesControlPlaneWithHostReachableKubeconfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if pod.Annotations[AnnotationClientWireGuardPublicKey] != "" {
-		t.Fatalf("client public key = %q, want empty", pod.Annotations[AnnotationClientWireGuardPublicKey])
-	}
-
 	if pod.Labels[LabelAllocated] == "" {
 		t.Fatal("pod allocation label is empty")
 	}
@@ -426,7 +454,7 @@ func TestAllocIdempotencyIncludesResourceType(t *testing.T) {
 		testControlPlanePod("control-plane-1", "node-1", "v1.33.0", 16443),
 	)
 
-	if _, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)}); err != nil || status != http.StatusOK {
+	if _, status, err := op.Alloc(t.Context(), "alloc-key", testRunnerAllocRequest()); err != nil || status != http.StatusOK {
 		t.Fatalf("runner alloc status=%d err=%v", status, err)
 	}
 
@@ -440,7 +468,7 @@ func TestAllocIdempotencyIncludesResourceType(t *testing.T) {
 	}
 }
 
-func TestAllocRequiresRunnerNodeExternalIP(t *testing.T) {
+func TestAllocAllowsRunnerOnNodeWithoutExternalIP(t *testing.T) {
 	op := testOperator(
 		t,
 		testNode("private-node", ""),
@@ -448,65 +476,30 @@ func TestAllocRequiresRunnerNodeExternalIP(t *testing.T) {
 		testPod("runner-1", "private-node", nil),
 	)
 
-	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
-	if err == nil {
-		t.Fatal("alloc succeeded when runner node had no ExternalIP")
+	resp, status, err := op.Alloc(t.Context(), "alloc-key", testRunnerAllocRequest())
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
 
-	if status != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want %d", status, http.StatusServiceUnavailable)
-	}
-
-	pod := &corev1.Pod{}
-	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err != nil {
-		t.Fatal(err)
-	}
-
-	if pod.Annotations[AnnotationIdempotencyKeyHash] != "" {
-		t.Fatal("pod was allocated despite missing runner node ExternalIP")
+	if resp.Endpoint.Host != "10.244.0.1" {
+		t.Fatalf("endpoint host = %q, want runner pod IP", resp.Endpoint.Host)
 	}
 }
 
-func TestAllocRequiresAnyNodeExternalIP(t *testing.T) {
-	op := testOperator(
-		t,
-		testNode("node-1", ""),
-		testPod("runner-1", "node-1", nil),
-	)
-
-	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
-	if err == nil {
-		t.Fatal("alloc succeeded without any node ExternalIP")
-	}
-
-	if status != 503 {
-		t.Fatalf("status = %d, want 503", status)
-	}
-
-	pod := &corev1.Pod{}
-	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err != nil {
-		t.Fatal(err)
-	}
-
-	if pod.Annotations[AnnotationIdempotencyKeyHash] != "" {
-		t.Fatal("pod was allocated despite missing gateway ExternalIP")
-	}
-}
-
-func TestAllocSkipsRunnerWithoutServerWireGuardPublicKey(t *testing.T) {
+func TestAllocRequiresExternalClientInternalIP(t *testing.T) {
 	op := testOperator(
 		t,
 		testNode("node-1", "20.30.40.50"),
-		testPodWithAnnotations("runner-1", "node-1", map[string]string{}),
+		testPod("runner-1", "node-1", nil),
 	)
 
-	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	_, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{})
 	if err == nil {
-		t.Fatal("alloc succeeded without server WireGuard public key")
+		t.Fatal("alloc succeeded without external client internal IP")
 	}
 
-	if status != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want %d", status, http.StatusServiceUnavailable)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
 	}
 
 	pod := &corev1.Pod{}
@@ -515,7 +508,7 @@ func TestAllocSkipsRunnerWithoutServerWireGuardPublicKey(t *testing.T) {
 	}
 
 	if pod.Annotations[AnnotationIdempotencyKeyHash] != "" {
-		t.Fatal("pod was allocated despite missing server WireGuard public key")
+		t.Fatal("pod was allocated despite invalid request")
 	}
 }
 
@@ -540,7 +533,7 @@ func TestAllocSkipsUnavailableRunnerPods(t *testing.T) {
 		testPod("ready-runner", "node-1", nil),
 	)
 
-	resp, status, err := op.Alloc(t.Context(), "alloc-key", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	resp, status, err := op.Alloc(t.Context(), "alloc-key", testRunnerAllocRequest())
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
@@ -550,30 +543,33 @@ func TestAllocSkipsUnavailableRunnerPods(t *testing.T) {
 	}
 }
 
-func TestAllocUsesPodScopedServerWireGuardPublicKey(t *testing.T) {
+func TestAllocRequiresRunnerRedfishCertMetadata(t *testing.T) {
 	op := testOperator(
 		t,
 		testNode("node-1", "20.30.40.50"),
-		testPod("runner-1", "node-1", nil),
-		testPod("runner-2", "node-1", nil),
+		testPodWithAnnotations("runner-1", "node-1", map[string]string{}),
 	)
 
-	first, status, err := op.Alloc(t.Context(), "alloc-key-1", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
-	if err != nil || status != http.StatusOK {
-		t.Fatalf("first alloc status=%d err=%v", status, err)
+	_, status, err := op.Alloc(t.Context(), "alloc-key", testRunnerAllocRequest())
+	if err == nil {
+		t.Fatal("alloc succeeded without runner Redfish certificate metadata")
 	}
 
-	second, status, err := op.Alloc(t.Context(), "alloc-key-2", AllocRequest{WireGuardPublicKey: testPublicKey(t)})
-	if err != nil || status != http.StatusOK {
-		t.Fatalf("second alloc status=%d err=%v", status, err)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", status, http.StatusServiceUnavailable)
 	}
 
-	if first.Pod.Name == second.Pod.Name {
-		t.Fatalf("second alloc reused pod %q", second.Pod.Name)
+	if !strings.Contains(err.Error(), "Redfish certificate annotation") {
+		t.Fatalf("error = %v, want Redfish certificate annotation", err)
 	}
 
-	if first.WireGuard.ServerPublicKey == second.WireGuard.ServerPublicKey {
-		t.Fatal("allocs returned the same server WireGuard public key")
+	pod := &corev1.Pod{}
+	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err != nil {
+		t.Fatal(err)
+	}
+
+	if pod.Annotations[AnnotationIdempotencyKeyHash] != "" {
+		t.Fatal("pod was allocated without runner Redfish certificate metadata")
 	}
 }
 
@@ -583,13 +579,14 @@ func TestDeallocDeletesClaimedRunner(t *testing.T) {
 		testNode("node-1", "20.30.40.50"),
 		testPod("runner-1", "node-1", nil),
 	)
-	req := AllocRequest{WireGuardPublicKey: testPublicKey(t)}
+	req := testRunnerAllocRequest()
 
-	if _, status, err := op.Alloc(t.Context(), "alloc-key", req); err != nil || status != 200 {
+	resp, status, err := op.Alloc(t.Context(), "alloc-key", req)
+	if err != nil || status != 200 {
 		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
 
-	status, err := op.Dealloc(t.Context(), "alloc-key")
+	status, err = op.Dealloc(t.Context(), "alloc-key")
 	if err != nil {
 		t.Fatalf("dealloc: %v", err)
 	}
@@ -601,6 +598,11 @@ func TestDeallocDeletesClaimedRunner(t *testing.T) {
 	pod := &corev1.Pod{}
 	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: "runner-1"}, pod); err == nil {
 		t.Fatal("allocated pod still exists after dealloc")
+	}
+
+	node := &corev1.Node{}
+	if err := op.Client.Get(t.Context(), client.ObjectKey{Name: resp.ExternalClient.NodeName}, node); err == nil {
+		t.Fatal("synthetic client node still exists after dealloc")
 	}
 }
 
@@ -660,7 +662,7 @@ func TestAllocEndpointAuthorizesSharedAllocAction(t *testing.T) {
 		testPod("runner-1", "node-1", nil),
 	)
 
-	reqBody, err := json.Marshal(AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	reqBody, err := json.Marshal(testRunnerAllocRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -686,7 +688,9 @@ func TestAllocEndpointAcceptsBodyIdempotencyKey(t *testing.T) {
 		testPod("runner-1", "node-1", nil),
 	)
 
-	reqBody, err := json.Marshal(AllocRequest{IdempotencyKey: "alloc-key", WireGuardPublicKey: testPublicKey(t)})
+	allocReq := testRunnerAllocRequest()
+	allocReq.IdempotencyKey = "alloc-key"
+	reqBody, err := json.Marshal(allocReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -709,7 +713,7 @@ func TestAllocEndpointRejectsMissingRemoteUser(t *testing.T) {
 		testPod("runner-1", "node-1", nil),
 	)
 
-	reqBody, err := json.Marshal(AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	reqBody, err := json.Marshal(AllocRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -732,7 +736,7 @@ func TestAllocEndpointRejectsDeniedSubjectAccessReview(t *testing.T) {
 		testPod("runner-1", "node-1", nil),
 	)
 
-	reqBody, err := json.Marshal(AllocRequest{WireGuardPublicKey: testPublicKey(t)})
+	reqBody, err := json.Marshal(AllocRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -756,7 +760,7 @@ func TestDeallocEndpointDeletesAllocatedRunner(t *testing.T) {
 		testPod("runner-1", "node-1", nil),
 	)
 
-	req := AllocRequest{WireGuardPublicKey: testPublicKey(t)}
+	req := testRunnerAllocRequest()
 	if _, status, err := op.Alloc(t.Context(), "alloc-key", req); err != nil || status != 200 {
 		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
@@ -786,7 +790,7 @@ func TestDeallocEndpointAcceptsBodyIdempotencyKey(t *testing.T) {
 		testPod("runner-1", "node-1", nil),
 	)
 
-	req := AllocRequest{WireGuardPublicKey: testPublicKey(t)}
+	req := testRunnerAllocRequest()
 	if _, status, err := op.Alloc(t.Context(), "alloc-key", req); err != nil || status != 200 {
 		t.Fatalf("alloc status=%d err=%v", status, err)
 	}
@@ -858,12 +862,10 @@ func TestReconcileDeletesClaimWithInvalidClaimedAt(t *testing.T) {
 	}
 }
 
-func TestReconcileCreatesIdleRunnerPodsWithUniqueHostPorts(t *testing.T) {
+func TestReconcileCreatesIdleRunnerPods(t *testing.T) {
 	op := testOperator(t)
 	op.Config.RunnerAMD64Count = 2
 	op.Config.RunnerARM64Count = 1
-	op.Config.RunnerWireGuardHostPortStart = 52000
-	op.Config.RunnerWireGuardHostPortEnd = 52002
 
 	if err := op.ReconcileRunners(t.Context()); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -878,22 +880,10 @@ func TestReconcileCreatesIdleRunnerPodsWithUniqueHostPorts(t *testing.T) {
 		t.Fatalf("pods = %d, want 3", len(pods.Items))
 	}
 
-	hostPorts := map[int32]struct{}{}
 	counts := map[string]int{}
 
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-
-		hostPort := podWireGuardHostPort(pod)
-		if hostPort < 52000 || hostPort > 52002 {
-			t.Fatalf("pod %s hostPort = %d, want in range", pod.Name, hostPort)
-		}
-
-		if _, ok := hostPorts[hostPort]; ok {
-			t.Fatalf("duplicate hostPort %d", hostPort)
-		}
-
-		hostPorts[hostPort] = struct{}{}
 		counts[podArchitecture(pod)]++
 
 		if pod.Spec.ServiceAccountName != "playpen-runner" {
@@ -910,13 +900,11 @@ func TestReconcileCreatesIdleRunnerPodsWithUniqueHostPorts(t *testing.T) {
 	}
 }
 
-func TestReconcileSkipsUsedRunnerHostPorts(t *testing.T) {
-	existing := testPodWithHostPort("existing-runner", "node-1", 52000)
+func TestReconcileCountsExistingIdleRunnerPods(t *testing.T) {
+	existing := testPod("existing-runner", "node-1", nil)
 	op := testOperator(t, existing)
 	op.Config.RunnerAMD64Count = 2
 	op.Config.RunnerARM64Count = 0
-	op.Config.RunnerWireGuardHostPortStart = 52000
-	op.Config.RunnerWireGuardHostPortEnd = 52001
 
 	if err := op.ReconcileRunners(t.Context()); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -931,29 +919,37 @@ func TestReconcileSkipsUsedRunnerHostPorts(t *testing.T) {
 		t.Fatalf("pods = %d, want 2", len(pods.Items))
 	}
 
-	seen := map[int32]struct{}{}
+	seen := map[string]struct{}{}
 	for i := range pods.Items {
-		seen[podWireGuardHostPort(&pods.Items[i])] = struct{}{}
+		seen[pods.Items[i].Name] = struct{}{}
 	}
 
-	if _, ok := seen[52000]; !ok {
-		t.Fatal("existing hostPort 52000 was not preserved")
+	if _, ok := seen["existing-runner"]; !ok {
+		t.Fatal("existing runner was not preserved")
 	}
 
-	if _, ok := seen[52001]; !ok {
-		t.Fatal("new runner did not use next free hostPort 52001")
+	if _, ok := seen[runnerPodName(ArchitectureAMD64, 0)]; !ok {
+		t.Fatalf("new runner %q was not created", runnerPodName(ArchitectureAMD64, 0))
 	}
 }
 
-func TestReconcileReportsNoFreeRunnerHostPorts(t *testing.T) {
-	op := testOperator(t, testPodWithHostPort("existing-runner", "node-1", 52000))
+func TestReconcileReplenishesIdleRunnersWhenIndexedPodsAreAllocated(t *testing.T) {
+	allocated := testPod(runnerPodName(ArchitectureAMD64, 0), "node-1", map[string]string{
+		AnnotationIdempotencyKeyHash: hashString("alloc-key"),
+		AnnotationClaimedAt:          time.Now().UTC().Format(time.RFC3339),
+	})
+	idle := testPod(runnerPodName(ArchitectureAMD64, 1), "node-1", nil)
+	op := testOperator(t, allocated, idle)
 	op.Config.RunnerAMD64Count = 2
 	op.Config.RunnerARM64Count = 0
-	op.Config.RunnerWireGuardHostPortStart = 52000
-	op.Config.RunnerWireGuardHostPortEnd = 52000
 
-	if err := op.ReconcileRunners(t.Context()); err == nil {
-		t.Fatal("reconcile succeeded without a free hostPort")
+	if err := op.ReconcileRunners(t.Context()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	created := &corev1.Pod{}
+	if err := op.Client.Get(t.Context(), client.ObjectKey{Namespace: "playpen", Name: runnerPodName(ArchitectureAMD64, 2)}, created); err != nil {
+		t.Fatalf("replacement runner was not created: %v", err)
 	}
 }
 
@@ -1049,6 +1045,36 @@ func TestManagedPodsInheritKubernetesServiceEnvOverrides(t *testing.T) {
 	assertEnvVar(t, cpPod.Spec.Containers[1].Env, "KUBERNETES_SERVICE_PORT_HTTPS", "6443")
 }
 
+func TestRunnerPodNeverUsesHostNetwork(t *testing.T) {
+	op := testOperator(t)
+
+	pod := op.runnerPod(ArchitectureAMD64, 0)
+	if pod.Spec.HostNetwork {
+		t.Fatal("runner pod HostNetwork = true, want false")
+	}
+
+	if pod.Spec.DNSPolicy != corev1.DNSClusterFirst {
+		t.Fatalf("runner pod DNSPolicy = %q, want %q", pod.Spec.DNSPolicy, corev1.DNSClusterFirst)
+	}
+
+	if env := findEnvVar(pod.Spec.Containers[0].Env, "POD_NAME"); env == nil || env.ValueFrom == nil || env.ValueFrom.FieldRef == nil || env.ValueFrom.FieldRef.FieldPath != "metadata.name" {
+		t.Fatalf("POD_NAME env = %#v, want downward API metadata.name", env)
+	}
+	if env := findEnvVar(pod.Spec.Containers[0].Env, "POD_IP"); env == nil || env.ValueFrom == nil || env.ValueFrom.FieldRef == nil || env.ValueFrom.FieldRef.FieldPath != "status.podIP" {
+		t.Fatalf("POD_IP env = %#v, want downward API status.podIP", env)
+	}
+}
+
+func findEnvVar(env []corev1.EnvVar, name string) *corev1.EnvVar {
+	for i := range env {
+		if env[i].Name == name {
+			return &env[i]
+		}
+	}
+
+	return nil
+}
+
 func assertEnvVar(t *testing.T, env []corev1.EnvVar, name, want string) {
 	t.Helper()
 
@@ -1073,9 +1099,28 @@ func testOperator(t *testing.T, objects ...client.Object) *Operator {
 	utilruntime.Must(corev1.AddToScheme(scheme))
 
 	op := &Operator{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build(),
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&corev1.Node{}).WithObjects(objects...).Build(),
 		Config: DefaultConfig(),
 		Scheme: scheme,
+	}
+
+	externalClientCIDRIndex := 0
+	op.assignExternalClientPodCIDR = func(ctx context.Context, name string) error {
+		node := &corev1.Node{}
+		if err := op.Client.Get(ctx, client.ObjectKey{Name: name}, node); err != nil {
+			return err
+		}
+		if node.Spec.PodCIDR != "" || len(node.Spec.PodCIDRs) > 0 {
+			return nil
+		}
+
+		base := node.DeepCopy()
+		podCIDR := fmt.Sprintf("10.250.0.%d/30", externalClientCIDRIndex*4)
+		externalClientCIDRIndex++
+		node.Spec.PodCIDR = podCIDR
+		node.Spec.PodCIDRs = []string{podCIDR}
+
+		return op.Client.Patch(ctx, node, client.MergeFrom(base))
 	}
 
 	return op
@@ -1202,25 +1247,16 @@ func testPod(name, nodeName string, annotations map[string]string) *corev1.Pod {
 	if annotations == nil {
 		annotations = map[string]string{}
 	}
+	if _, ok := annotations[AnnotationRedfishCertPEM]; !ok {
+		annotations[AnnotationRedfishCertPEM] = "test-redfish-cert"
+	}
 
-	annotations[AnnotationServerWireGuardPublicKey] = podServerPublicKey(name)
-
-	pod := testPodWithAnnotations(name, nodeName, annotations)
-	setPodWireGuardHostPort(pod, testHostPort(name))
-
-	return pod
+	return testPodWithAnnotations(name, nodeName, annotations)
 }
 
 func testPodWithArchitecture(name, nodeName, architecture string) *corev1.Pod {
 	pod := testPod(name, nodeName, nil)
 	pod.Labels[LabelArchitecture] = architecture
-
-	return pod
-}
-
-func testPodWithHostPort(name, nodeName string, hostPort int32) *corev1.Pod {
-	pod := testPod(name, nodeName, nil)
-	setPodWireGuardHostPort(pod, hostPort)
 
 	return pod
 }
@@ -1291,31 +1327,6 @@ users:
 `
 }
 
-func setPodWireGuardHostPort(pod *corev1.Pod, hostPort int32) {
-	pod.Spec.Containers = []corev1.Container{
-		{
-			Name: "runner",
-			Ports: []corev1.ContainerPort{
-				{
-					Name:          "wireguard",
-					Protocol:      corev1.ProtocolUDP,
-					ContainerPort: 51820,
-					HostPort:      hostPort,
-				},
-			},
-		},
-	}
-}
-
-func testHostPort(name string) int32 {
-	var sum int32
-	for _, r := range name {
-		sum += r
-	}
-
-	return 51000 + sum%1000
-}
-
 func testPodWithAnnotations(name, nodeName string, annotations map[string]string) *corev1.Pod {
 	if annotations == nil {
 		annotations = map[string]string{}
@@ -1336,6 +1347,7 @@ func testPodWithAnnotations(name, nodeName string, annotations map[string]string
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
+			PodIP: testPodIP(name),
 			ContainerStatuses: []corev1.ContainerStatus{
 				{
 					Name:  "runner",
@@ -1349,13 +1361,25 @@ func testPodWithAnnotations(name, nodeName string, annotations map[string]string
 	}
 }
 
-func podServerPublicKey(name string) string {
-	key := wgtypes.Key{}
-	for i := range key {
-		key[i] = byte(name[i%len(name)]) + byte(i)
+func testRunnerAllocRequest() AllocRequest {
+	return AllocRequest{ExternalClientInternalIP: "10.88.0.2"}
+}
+
+func testPodIP(name string) string {
+	for i := len(name) - 1; i >= 0; i-- {
+		if name[i] < '0' || name[i] > '9' {
+			if i == len(name)-1 {
+				break
+			}
+
+			return "10.244.0." + name[i+1:]
+		}
+	}
+	if name != "" && name[0] >= '0' && name[0] <= '9' {
+		return "10.244.0." + name
 	}
 
-	return key.String()
+	return "10.244.0.10"
 }
 
 func testNode(name, externalIP string) *corev1.Node {
@@ -1365,15 +1389,4 @@ func testNode(name, externalIP string) *corev1.Node {
 	}
 
 	return node
-}
-
-func testPublicKey(t *testing.T) string {
-	t.Helper()
-
-	key, err := wgtypes.GeneratePrivateKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return key.PublicKey().String()
 }

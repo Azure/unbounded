@@ -11,12 +11,13 @@ import (
 )
 
 const (
-	AnnotationClientWireGuardPublicKey = meta.AnnotationClientWireGuardPublicKey
-	AnnotationServerWireGuardPublicKey = meta.AnnotationServerWireGuardPublicKey
 	AnnotationRedfishCertPEM           = meta.AnnotationRedfishCertPEM
 	AnnotationIdempotencyKeyHash       = meta.AnnotationIdempotencyKeyHash
 	AnnotationRequestHash              = meta.AnnotationRequestHash
 	AnnotationClaimedAt                = meta.AnnotationClaimedAt
+	AnnotationExternalClientInternalIP = meta.AnnotationExternalClientInternalIP
+	AnnotationVXLANRemoteAddress       = meta.AnnotationVXLANRemoteAddress
+	AnnotationRunnerNetworkReady       = meta.AnnotationRunnerNetworkReady
 	AnnotationControlPlaneKubeconfig   = meta.AnnotationControlPlaneKubeconfig
 	AnnotationControlPlaneGuestServer  = meta.AnnotationControlPlaneGuestServer
 
@@ -44,10 +45,9 @@ type Config struct {
 	RunnerServiceAccountName           string
 	RunnerAMD64Count                   int
 	RunnerARM64Count                   int
-	RunnerWireGuardHostPortStart       int32
-	RunnerWireGuardHostPortEnd         int32
 	RunnerRequireKVM                   bool
 	RunnerControlPlaneToleration       bool
+	ExternalClientSite                 string
 	ControlPlaneCount                  int
 	ControlPlaneVersions               []string
 	ControlPlaneImage                  string
@@ -74,10 +74,9 @@ func DefaultConfig() Config {
 		RunnerServiceAccountName:           "playpen-runner",
 		RunnerAMD64Count:                   1,
 		RunnerARM64Count:                   1,
-		RunnerWireGuardHostPortStart:       51820,
-		RunnerWireGuardHostPortEnd:         51899,
 		RunnerRequireKVM:                   true,
 		RunnerControlPlaneToleration:       false,
+		ExternalClientSite:                 "playpen-external",
 		ControlPlaneCount:                  0,
 		ControlPlaneVersions:               []string{"v1.33.0"},
 		ControlPlaneImage:                  "rancher/k3s:{version}-k3s1",

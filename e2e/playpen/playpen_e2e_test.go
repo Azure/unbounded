@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -42,9 +43,15 @@ import (
 )
 
 const (
-	clusterName = "playpen-e2e"
-	imageTag    = "playpen:e2e"
-	namespace   = "playpen"
+	clusterName           = "playpen-e2e"
+	imageTag              = "playpen:e2e"
+	netControllerImageTag = "unbounded-net-controller:e2e"
+	netNodeImageTag       = "unbounded-net-node:e2e"
+	namespace             = "playpen"
+	netNamespace          = "unbounded-net"
+	runnerSite            = "playpen-runner"
+	externalSite          = "playpen-external"
+	externalPodCIDRPool   = "10.250.0.0/27"
 )
 
 type harness struct {
@@ -53,8 +60,9 @@ type harness struct {
 	artifacts   string
 	keepCluster bool
 
-	restConfig *rest.Config
-	kubeClient kubernetes.Interface
+	restConfig     *rest.Config
+	kubeconfigPath string
+	kubeClient     kubernetes.Interface
 }
 
 type operatorTransport struct {
@@ -124,7 +132,7 @@ func jsonResponse(req *http.Request, status int, value any) (*http.Response, err
 }
 
 func TestPlaypenBasicLifecycle(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
 	defer cancel()
 
 	h := newHarness(t)
@@ -136,6 +144,10 @@ func TestPlaypenBasicLifecycle(t *testing.T) {
 	}
 
 	h.buildAndLoadImage(ctx)
+	h.buildAndLoadNetImages(ctx)
+	h.deployUnboundedNet(ctx)
+	h.configureUnboundedNetTopology(ctx)
+	externalClientInternalIP := h.externalClientInternalIP(ctx)
 	h.renderManifests(ctx)
 	h.applyManifests(ctx)
 	h.patchNodeExternalIPs(ctx)
@@ -148,7 +160,10 @@ func TestPlaypenBasicLifecycle(t *testing.T) {
 		t.Fatalf("create playpen client: %v", err)
 	}
 
-	allocated, err := client.Allocate(ctx, playpenclient.AllocateOptions{Architecture: runner.ArchitectureAMD64})
+	allocated, err := client.Allocate(ctx, playpenclient.AllocateOptions{
+		Architecture:             runner.ArchitectureAMD64,
+		ExternalClientInternalIP: externalClientInternalIP,
+	})
 	if err != nil {
 		t.Fatalf("allocate playpen: %v", err)
 	}
@@ -165,12 +180,12 @@ func TestPlaypenBasicLifecycle(t *testing.T) {
 		t.Fatalf("allocation returned unexpected pod metadata: %#v", allocated.Metadata.Pod)
 	}
 
-	if allocated.Metadata.Endpoint.Host == "" || allocated.Metadata.Endpoint.WireGuardUDPPort == 0 {
+	if allocated.Metadata.Endpoint.Host == "" {
 		t.Fatalf("allocation returned incomplete endpoint metadata: %#v", allocated.Metadata.Endpoint)
 	}
 
-	if allocated.Metadata.WireGuard.ServerPublicKey == "" || allocated.Metadata.WireGuard.ClientAddress == "" {
-		t.Fatalf("allocation returned incomplete wireguard metadata: %#v", allocated.Metadata.WireGuard)
+	if allocated.Metadata.ExternalClient.NodeName == "" || allocated.Metadata.ExternalClient.Site == "" || allocated.Metadata.ExternalClient.PodCIDR == "" {
+		t.Fatalf("allocation returned incomplete external client metadata: %#v", allocated.Metadata.ExternalClient)
 	}
 
 	if allocated.Metadata.VXLAN.VNI == 0 || allocated.Metadata.VXLAN.UDPPort == 0 {
@@ -178,6 +193,9 @@ func TestPlaypenBasicLifecycle(t *testing.T) {
 	}
 
 	h.waitForPodAnnotation(ctx, allocated.Metadata.Pod.Name, operator.AnnotationIdempotencyKeyHash, true)
+	externalNodeCancel := h.startExternalUnboundedNetNode(ctx, allocated.Metadata.ExternalClient.NodeName)
+	t.Cleanup(externalNodeCancel)
+	h.waitForExternalUnboundedNet(ctx, allocated.Metadata.VXLAN.ClientAddress, allocated.Metadata.VXLAN.ServerAddress)
 
 	if err := allocated.ConfigureTunnel(ctx); err != nil {
 		t.Fatalf("configure tunnel: %v", err)
@@ -214,7 +232,7 @@ func newHarness(t *testing.T) *harness {
 func (h *harness) checkPrereqs() {
 	h.t.Helper()
 
-	for _, bin := range []string{"bridge", "docker", "ip", "iptables", "kind", "kubectl", "sysctl", "wg"} {
+	for _, bin := range []string{"bridge", "docker", "ip", "iptables", "kind", "kubectl", "make", "sysctl"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			h.t.Skipf("e2e prereq %q missing on PATH; skipping suite", bin)
 		}
@@ -279,6 +297,11 @@ func (h *harness) initClients() {
 		h.t.Fatalf("kind get kubeconfig: %v", err)
 	}
 
+	kubeconfigPath := filepath.Join(h.artifacts, "kubeconfig")
+	if err := os.WriteFile(kubeconfigPath, []byte(kubeconfig), 0o600); err != nil {
+		h.t.Fatalf("write kubeconfig: %v", err)
+	}
+
 	restConfig, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfig))
 	if err != nil {
 		h.t.Fatalf("parse kubeconfig: %v", err)
@@ -290,6 +313,7 @@ func (h *harness) initClients() {
 	}
 
 	h.restConfig = restConfig
+	h.kubeconfigPath = kubeconfigPath
 	h.kubeClient = kubeClient
 }
 
@@ -309,6 +333,7 @@ func (h *harness) newPlaypenClient() (*playpenclient.Client, error) {
 	cfg.Namespace = namespace
 	cfg.RunnerNamespace = namespace
 	cfg.RunnerLabelSelector = "app.kubernetes.io/name=playpen-runner"
+	cfg.ExternalClientSite = externalSite
 
 	op := &operator.Operator{
 		Client:     kubeClient,
@@ -336,6 +361,217 @@ func (h *harness) buildAndLoadImage(ctx context.Context) {
 	}
 }
 
+func (h *harness) buildAndLoadNetImages(ctx context.Context) {
+	h.t.Helper()
+
+	cniArchive := fmt.Sprintf("resources/cni-plugins-linux-%s-v1.9.1.tgz", goArchForDocker(runtime.GOARCH))
+	if err := h.run(ctx, "make", cniArchive); err != nil {
+		h.t.Fatalf("fetch CNI plugins archive: %v", err)
+	}
+
+	for _, build := range []struct {
+		target string
+		image  string
+	}{
+		{target: "controller", image: netControllerImageTag},
+		{target: "node", image: netNodeImageTag},
+	} {
+		if err := h.run(
+			ctx,
+			"docker", "build",
+			"--target", build.target,
+			"--build-arg", "CNI_PLUGINS_VERSION=v1.9.1",
+			"--build-arg", "BUILDARCH="+goArchForDocker(runtime.GOARCH),
+			"-t", build.image,
+			"-f", filepath.Join(h.repoRoot, "images", "net", "Containerfile"),
+			h.repoRoot,
+		); err != nil {
+			h.t.Fatalf("build unbounded-net %s image: %v", build.target, err)
+		}
+	}
+
+	for _, image := range []string{netControllerImageTag, netNodeImageTag} {
+		if err := h.run(ctx, "kind", "load", "docker-image", image, "--name", clusterName); err != nil {
+			h.t.Fatalf("kind load %s: %v", image, err)
+		}
+	}
+}
+
+func (h *harness) deployUnboundedNet(ctx context.Context) {
+	h.t.Helper()
+
+	manifestDir := filepath.Join(h.artifacts, "net-rendered")
+	if err := os.RemoveAll(manifestDir); err != nil {
+		h.t.Fatalf("clean net rendered manifests: %v", err)
+	}
+
+	if err := h.run(
+		ctx,
+		"go", "run", "./hack/cmd/render-manifests",
+		"--templates-dir", filepath.Join(h.repoRoot, "deploy", "net"),
+		"--output-dir", manifestDir,
+		"--set", "Namespace="+netNamespace,
+		"--set", "ControllerImage="+netControllerImageTag,
+		"--set", "NodeImage="+netNodeImageTag,
+		"--set", "ForceNotLeader=false",
+		"--set", "AzureTenantID=",
+		"--set", "ApiserverURL=",
+		"--set", "ControllerManagedKubeProxyEnabled=false",
+		"--set", "ControllerRegisterAggregatedAPIServer=false",
+		"--set", "NodeStatusWebsocketEnabled=false",
+		"--set", "NodeStatusWebsocketApiserverMode=never",
+		"--set", "NodeStatusPushEnabled=false",
+		"--set", "NodeRemoveConfigurationOnShutdown=true",
+	); err != nil {
+		h.t.Fatalf("render unbounded-net manifests: %v", err)
+	}
+	h.patchRenderedNetManifests(ctx, manifestDir)
+
+	if err := h.run(ctx, "kubectl", "apply", "-f", filepath.Join(h.repoRoot, "deploy", "net", "crd")); err != nil {
+		h.t.Fatalf("apply unbounded-net CRDs: %v", err)
+	}
+	if err := h.run(ctx, "kubectl", "apply", "-R", "-f", manifestDir); err != nil {
+		h.t.Fatalf("apply unbounded-net manifests: %v", err)
+	}
+	if err := h.run(ctx, "kubectl", "rollout", "status", "deployment/unbounded-net-controller", "-n", netNamespace, "--timeout=180s"); err != nil {
+		h.dumpDiagnostics(context.Background())
+		h.t.Fatalf("rollout unbounded-net-controller: %v", err)
+	}
+}
+
+func (h *harness) patchRenderedNetManifests(ctx context.Context, manifestDir string) {
+	h.t.Helper()
+
+	replacements := []struct {
+		path string
+		old  string
+		new  string
+	}{
+		{path: filepath.Join(manifestDir, "controller", "03-deployment.yaml"), old: "imagePullPolicy: Always", new: "imagePullPolicy: IfNotPresent"},
+		{path: filepath.Join(manifestDir, "node", "03-daemonset.yaml"), old: "imagePullPolicy: Always", new: "imagePullPolicy: IfNotPresent"},
+	}
+
+	apiServer := "https://" + h.controlPlaneIP(ctx) + ":6443"
+	replacements = append(replacements, struct {
+		path string
+		old  string
+		new  string
+	}{path: filepath.Join(manifestDir, "01-configmap.yaml"), old: `apiserverURL: ""`, new: `apiserverURL: "` + apiServer + `"`})
+
+	for _, replacement := range replacements {
+		data, err := os.ReadFile(replacement.path)
+		if err != nil {
+			h.t.Fatalf("read %s: %v", replacement.path, err)
+		}
+
+		updated := strings.ReplaceAll(string(data), replacement.old, replacement.new)
+		if updated == string(data) {
+			h.t.Fatalf("%s did not contain %q", replacement.path, replacement.old)
+		}
+
+		if err := os.WriteFile(replacement.path, []byte(updated), 0o644); err != nil {
+			h.t.Fatalf("write %s: %v", replacement.path, err)
+		}
+	}
+}
+
+func (h *harness) configureUnboundedNetTopology(ctx context.Context) {
+	h.t.Helper()
+
+	nodes, err := h.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/control-plane"})
+	if err != nil {
+		h.t.Fatalf("list control-plane nodes: %v", err)
+	}
+	if len(nodes.Items) == 0 {
+		h.t.Fatal("no control-plane node found")
+	}
+
+	runnerNode := nodes.Items[0]
+	if err := h.patchNodeSite(ctx, runnerNode.Name, runnerSite); err != nil {
+		h.t.Fatalf("patch runner node for unbounded-net: %v", err)
+	}
+
+	runnerPodCIDR := runnerNode.Spec.PodCIDR
+	if runnerPodCIDR == "" && len(runnerNode.Spec.PodCIDRs) > 0 {
+		runnerPodCIDR = runnerNode.Spec.PodCIDRs[0]
+	}
+	if runnerPodCIDR == "" {
+		h.t.Fatalf("runner node %s has no pod CIDR", runnerNode.Name)
+	}
+
+	runnerInternalIP := nodeAddress(runnerNode, corev1.NodeInternalIP)
+	if runnerInternalIP == "" {
+		h.t.Fatalf("runner node %s has no InternalIP", runnerNode.Name)
+	}
+	externalInternalIP := h.externalClientInternalIP(ctx)
+
+	netYAML := fmt.Sprintf(`apiVersion: net.unbounded-cloud.io/v1alpha1
+kind: Site
+metadata:
+  name: %[1]s
+spec:
+  manageCniPlugin: false
+  healthCheckSettings:
+    enabled: false
+  nodeCidrs:
+    - %[2]s/32
+  podCidrAssignments:
+    - cidrBlocks:
+        - %[3]s
+      nodeBlockSizes:
+        ipv4: 28
+  tunnelProtocol: WireGuard
+---
+apiVersion: net.unbounded-cloud.io/v1alpha1
+kind: Site
+metadata:
+  name: %[4]s
+spec:
+  manageCniPlugin: false
+  healthCheckSettings:
+    enabled: false
+  nodeCidrs:
+    - %[5]s/32
+  podCidrAssignments:
+    - cidrBlocks:
+        - %[6]s
+      nodeBlockSizes:
+        ipv4: 28
+  tunnelProtocol: WireGuard
+---
+apiVersion: net.unbounded-cloud.io/v1alpha1
+kind: SitePeering
+metadata:
+  name: playpen-e2e
+spec:
+  healthCheckSettings:
+    enabled: false
+  sites:
+    - %[1]s
+    - %[4]s
+  meshNodes: true
+  tunnelProtocol: WireGuard
+`, runnerSite, runnerInternalIP, runnerPodCIDR, externalSite, externalInternalIP, externalPodCIDRPool)
+
+	if err := h.runWithInput(ctx, strings.NewReader(netYAML), "kubectl", "apply", "-f", "-"); err != nil {
+		h.t.Fatalf("apply unbounded-net topology: %v", err)
+	}
+}
+
+func (h *harness) patchNodeSite(ctx context.Context, nodeName, site string) error {
+	patch := map[string]any{
+		"metadata": map[string]any{"labels": map[string]string{netv1alpha1.SiteLabelKey: site}},
+	}
+	data, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+
+	_, err = h.kubeClient.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, data, metav1.PatchOptions{})
+
+	return err
+}
+
 func (h *harness) renderManifests(ctx context.Context) {
 	h.t.Helper()
 
@@ -357,6 +593,7 @@ func (h *harness) renderManifests(ctx context.Context) {
 		"--set", "ControlPlaneCount=0",
 		"--set", "RunnerRequireKVM=false",
 		"--set", "RunnerControlPlaneTolerations=true",
+		"--set", "ExternalClientSite="+externalSite,
 	); err != nil {
 		h.t.Fatalf("render playpen manifests: %v", err)
 	}
@@ -495,6 +732,192 @@ func (h *harness) controlPlaneIP(ctx context.Context) string {
 	return address
 }
 
+func (h *harness) externalClientInternalIP(ctx context.Context) string {
+	h.t.Helper()
+
+	out, err := h.runOut(ctx, "docker", "network", "inspect", "kind", "--format", "{{range .IPAM.Config}}{{println .Gateway}}{{end}}")
+	if err != nil {
+		h.t.Fatalf("inspect kind docker network: %v", err)
+	}
+
+	for _, field := range strings.Fields(out) {
+		address := strings.TrimSpace(field)
+		parsed := net.ParseIP(address)
+		if parsed != nil && parsed.To4() != nil {
+			return address
+		}
+	}
+
+	h.t.Fatalf("kind docker network has no IPv4 gateway in %q", strings.TrimSpace(out))
+	return ""
+}
+
+func (h *harness) runnerVXLANAddress(ctx context.Context) string {
+	h.t.Helper()
+
+	nodes, err := h.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/control-plane"})
+	if err != nil {
+		h.t.Fatalf("list control-plane nodes: %v", err)
+	}
+	if len(nodes.Items) == 0 {
+		h.t.Fatal("no control-plane node found")
+	}
+
+	podCIDR := nodes.Items[0].Spec.PodCIDR
+	if podCIDR == "" && len(nodes.Items[0].Spec.PodCIDRs) > 0 {
+		podCIDR = nodes.Items[0].Spec.PodCIDRs[0]
+	}
+	if podCIDR == "" {
+		h.t.Fatalf("control-plane node %s has no pod CIDR", nodes.Items[0].Name)
+	}
+
+	return gatewayIPFromCIDR(h.t, podCIDR)
+}
+
+func gatewayIPFromCIDR(t *testing.T, cidr string) string {
+	t.Helper()
+
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		t.Fatalf("parse CIDR %q: %v", cidr, err)
+	}
+
+	addr := prefix.Addr()
+	if !addr.Is4() {
+		t.Fatalf("CIDR %q is not IPv4", cidr)
+	}
+
+	next := addr.Next()
+	if !prefix.Contains(next) {
+		t.Fatalf("CIDR %q has no usable gateway address", cidr)
+	}
+
+	return next.String()
+}
+
+func (h *harness) waitForRunnerUnboundedNet(ctx context.Context, runnerVXLANAddress string) {
+	h.t.Helper()
+
+	if err := h.run(ctx, "kubectl", "rollout", "status", "daemonset/unbounded-net-node", "-n", netNamespace, "--timeout=180s"); err != nil {
+		h.dumpDiagnostics(context.Background())
+		h.t.Fatalf("rollout unbounded-net-node: %v", err)
+	}
+
+	if err := wait(ctx, 90*time.Second, func(ctx context.Context) (bool, error) {
+		out, err := h.runOut(ctx, "docker", "exec", clusterName+"-control-plane", "ip", "addr", "show", "dev", "unbounded0")
+		if err != nil {
+			return false, nil
+		}
+
+		return strings.Contains(out, runnerVXLANAddress), nil
+	}); err != nil {
+		h.dumpDiagnostics(context.Background())
+		h.t.Fatalf("wait for runner unbounded0 address %s: %v", runnerVXLANAddress, err)
+	}
+}
+
+func (h *harness) startExternalUnboundedNetNode(ctx context.Context, nodeName string) func() {
+	h.t.Helper()
+
+	binPath := filepath.Join(h.artifacts, "unbounded-net-node")
+	if err := h.run(ctx, "go", "build", "-o", binPath, "./cmd/unbounded-net-node"); err != nil {
+		h.t.Fatalf("build external unbounded-net-node: %v", err)
+	}
+
+	if err := h.run(ctx, "sudo", "-n", "ip", "link", "delete", "unbounded0"); err != nil {
+		h.t.Logf("delete stale host unbounded0: %v", err)
+	}
+
+	wgDir := filepath.Join("/var/tmp", "unbounded-playpen-e2e", "external-wg")
+	if err := h.run(ctx, "sudo", "-n", "rm", "-rf", wgDir); err != nil {
+		h.t.Fatalf("remove stale external wireguard dir: %v", err)
+	}
+	if err := h.run(ctx, "sudo", "-n", "mkdir", "-p", wgDir); err != nil {
+		h.t.Fatalf("mkdir external wireguard dir: %v", err)
+	}
+
+	cniConfDir := filepath.Join(h.artifacts, "external-cni")
+	configPath := filepath.Join(h.artifacts, "external-unbounded-net-node-config.yaml")
+	config := fmt.Sprintf("node:\n  cniConfDir: %q\n", cniConfDir)
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		h.t.Fatalf("write external unbounded-net-node config: %v", err)
+	}
+
+	procCtx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(
+		procCtx,
+		"sudo", "-n", binPath,
+		"--config-file", configPath,
+		"--kubeconfig", h.kubeconfigPath,
+		"--node-name", nodeName,
+		"--wireguard-dir", wgDir,
+		"--health-port", "0",
+		"--healthcheck-port", "0",
+		"--status-push-enabled=false",
+		"--status-ws-enabled=false",
+		"--status-ws-apiserver-mode=never",
+		"--preferred-public-encap=WireGuard",
+		"--preferred-private-encap=WireGuard",
+		"--remove-configuration-on-shutdown",
+	)
+	cmd.Dir = h.repoRoot
+	logPath := filepath.Join(h.artifacts, "external-unbounded-net-node.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		h.t.Fatalf("create external unbounded-net-node log: %v", err)
+	}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	if err := cmd.Start(); err != nil {
+		logFile.Close() //nolint:errcheck // Cleanup after failed process start.
+		h.t.Fatalf("start external unbounded-net-node: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+		logFile.Close() //nolint:errcheck // Test cleanup only.
+	}()
+
+	return func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				h.t.Logf("external unbounded-net-node exited: %v", err)
+			}
+		case <-time.After(20 * time.Second):
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		}
+		if err := h.run(context.Background(), "sudo", "-n", "ip", "link", "delete", "unbounded0"); err != nil {
+			h.t.Logf("delete host unbounded0 during cleanup: %v", err)
+		}
+		if err := h.run(context.Background(), "sudo", "-n", "rm", "-rf", filepath.Dir(wgDir)); err != nil {
+			h.t.Logf("remove external wireguard dir during cleanup: %v", err)
+		}
+	}
+}
+
+func (h *harness) waitForExternalUnboundedNet(ctx context.Context, clientVXLANAddress, runnerVXLANAddress string) {
+	h.t.Helper()
+
+	if err := wait(ctx, 120*time.Second, func(ctx context.Context) (bool, error) {
+		out, err := h.runOut(ctx, "sudo", "-n", "ip", "addr", "show", "dev", "unbounded0")
+		if err != nil {
+			return false, nil
+		}
+
+		return strings.Contains(out, clientVXLANAddress), nil
+	}); err != nil {
+		h.dumpHostUnboundedNetDiagnostics(context.Background(), runnerVXLANAddress)
+		h.dumpDiagnostics(context.Background())
+		h.t.Fatalf("wait for external unbounded0 address %s: %v", clientVXLANAddress, err)
+	}
+}
+
 func (h *harness) waitForRollouts(ctx context.Context) {
 	h.t.Helper()
 
@@ -521,7 +944,7 @@ func (h *harness) waitForReadyRunner(ctx context.Context) {
 				continue
 			}
 
-			if pod.Annotations[operator.AnnotationIdempotencyKeyHash] != "" || pod.Annotations[operator.AnnotationServerWireGuardPublicKey] == "" {
+			if pod.Annotations[operator.AnnotationIdempotencyKeyHash] != "" {
 				continue
 			}
 
@@ -584,21 +1007,8 @@ func (h *harness) verifyTunnelInterfaces(ctx context.Context, allocated *playpen
 	h.t.Helper()
 
 	cfg := allocated.TunnelConfig()
-	if err := allocated.Run(ctx, "ip", "link", "show", "dev", cfg.WireGuardInterface); err != nil {
-		h.t.Fatalf("show wireguard interface %s: %v", cfg.WireGuardInterface, err)
-	}
-
 	if err := allocated.Run(ctx, "ip", "-d", "link", "show", "dev", cfg.VXLANInterface); err != nil {
 		h.t.Fatalf("show vxlan interface %s: %v", cfg.VXLANInterface, err)
-	}
-
-	peers, err := h.runPlaypenOut(ctx, allocated, "wg", "show", cfg.WireGuardInterface, "peers")
-	if err != nil {
-		h.t.Fatalf("show wireguard peers for %s: %v", cfg.WireGuardInterface, err)
-	}
-
-	if !strings.Contains(peers, allocated.Metadata.WireGuard.ServerPublicKey) {
-		h.t.Fatalf("wireguard peers for %s do not include server public key %s: %s", cfg.WireGuardInterface, allocated.Metadata.WireGuard.ServerPublicKey, peers)
 	}
 
 	guestGateway := guestGatewayPrefix(h.t, allocated.Metadata.Network)
@@ -611,16 +1021,6 @@ func (h *harness) verifyTunnelInterfaces(ctx context.Context, allocated *playpen
 		h.t.Fatalf("vxlan interface %s missing guest gateway %s:\n%s", cfg.VXLANInterface, guestGateway, vxlanAddr)
 	}
 
-	guestSubnet := guestSubnetCIDR(h.t, allocated.Metadata.Network)
-	natRules, err := h.runPlaypenOut(ctx, allocated, "iptables", "-t", "nat", "-S", "POSTROUTING")
-	if err != nil {
-		h.t.Fatalf("show playpen namespace NAT rules: %v", err)
-	}
-
-	wantNAT := "-A POSTROUTING -s " + guestSubnet + " -o " + cfg.ManagementNamespaceInterface + " -j MASQUERADE"
-	if !strings.Contains(natRules, wantNAT) {
-		h.t.Fatalf("playpen namespace NAT rules missing %q:\n%s", wantNAT, natRules)
-	}
 }
 
 func guestGatewayPrefix(t *testing.T, network operator.NetworkResponse) string {
@@ -697,8 +1097,8 @@ func (h *harness) verifyTunnelConnectivity(ctx context.Context, allocated *playp
 func (h *harness) dumpTunnelDiagnostics(ctx context.Context, allocated *playpenclient.Playpen) {
 	cfg := allocated.TunnelConfig()
 	for _, args := range [][]string{
-		{"addr", "show", "dev", cfg.WireGuardInterface},
-		{"route", "get", "10.88.0.1"},
+		{"route", "get", allocated.Metadata.VXLAN.ServerAddress},
+		{"addr", "show", "dev", "unbounded0"},
 		{"-d", "link", "show", "dev", cfg.VXLANInterface},
 	} {
 		out, err := h.runPlaypenOut(ctx, allocated, "ip", args...)
@@ -708,20 +1108,6 @@ func (h *harness) dumpTunnelDiagnostics(ctx context.Context, allocated *playpenc
 		}
 
 		h.t.Logf("ip %s\n%s", strings.Join(args, " "), out)
-	}
-
-	for _, args := range [][]string{
-		{"show", cfg.WireGuardInterface},
-		{"show", cfg.WireGuardInterface, "endpoints"},
-		{"show", cfg.WireGuardInterface, "latest-handshakes"},
-	} {
-		out, err := h.runPlaypenOut(ctx, allocated, "wg", args...)
-		if err != nil {
-			h.t.Logf("wg %s failed: %v", strings.Join(args, " "), err)
-			continue
-		}
-
-		h.t.Logf("wg %s\n%s", strings.Join(args, " "), out)
 	}
 
 	for _, args := range [][]string{
@@ -736,6 +1122,31 @@ func (h *harness) dumpTunnelDiagnostics(ctx context.Context, allocated *playpenc
 
 		h.t.Logf("kubectl %s\n%s", strings.Join(args, " "), out)
 	}
+}
+
+func (h *harness) dumpHostUnboundedNetDiagnostics(ctx context.Context, runnerVXLANAddress string) {
+	for _, args := range [][]string{
+		{"ip", "addr", "show", "dev", "unbounded0"},
+		{"ip", "route", "get", runnerVXLANAddress},
+		{"wg", "show"},
+	} {
+		out, err := h.runOut(ctx, "sudo", append([]string{"-n"}, args...)...)
+		if err != nil {
+			h.t.Logf("sudo %s failed: %v", strings.Join(args, " "), err)
+			continue
+		}
+
+		h.t.Logf("sudo %s\n%s", strings.Join(args, " "), out)
+	}
+
+	logPath := filepath.Join(h.artifacts, "external-unbounded-net-node.log")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		h.t.Logf("read %s failed: %v", logPath, err)
+		return
+	}
+
+	h.t.Logf("external unbounded-net-node log\n%s", string(data))
 }
 
 func TestPlaypenRedfishReadyProbe(t *testing.T) {
@@ -783,6 +1194,12 @@ func (h *harness) teardown(ctx context.Context) {
 
 func (h *harness) dumpDiagnostics(ctx context.Context) {
 	for _, args := range [][]string{
+		{"get", "pods", "-n", netNamespace, "-o", "wide"},
+		{"describe", "pods", "-n", netNamespace},
+		{"logs", "-n", netNamespace, "deployment/unbounded-net-controller", "--tail=200"},
+		{"logs", "-n", netNamespace, "daemonset/unbounded-net-node", "--tail=200"},
+		{"get", "sites,sitepeerings,sitenodeslices", "-o", "yaml"},
+		{"get", "nodes", "-o", "yaml"},
 		{"get", "pods", "-n", namespace, "-o", "wide"},
 		{"describe", "pods", "-n", namespace},
 		{"logs", "-n", namespace, "deployment/playpen-operator"},
@@ -809,6 +1226,12 @@ func (h *harness) runOut(ctx context.Context, name string, args ...string) (stri
 	out, err := h.runCaptured(ctx, name, nil, args...)
 
 	return out, err
+}
+
+func (h *harness) runWithInput(ctx context.Context, stdin io.Reader, name string, args ...string) error {
+	_, err := h.runCaptured(ctx, name, stdin, args...)
+
+	return err
 }
 
 func (h *harness) runPlaypenOut(ctx context.Context, allocated *playpenclient.Playpen, name string, args ...string) (string, error) {

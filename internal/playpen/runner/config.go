@@ -16,6 +16,8 @@ const (
 	ArchitectureAMD64 = meta.ArchitectureAMD64
 	ArchitectureARM64 = meta.ArchitectureARM64
 
+	VXLANDevice = "unbounded0"
+
 	defaultAMD64QEMUBinary       = "qemu-system-x86_64"
 	defaultAMD64QEMUMachine      = "q35,accel=kvm"
 	defaultAMD64QEMUCPU          = "host"
@@ -42,25 +44,16 @@ type Config struct {
 	DataDir          string
 	PodName          string
 	PodNamespace     string
+	PodIP            string
 	Architecture     string
 	KubernetesClient client.Client
 	ConfigureNetwork bool
-	WireGuard        WireGuardConfig
 	VXLAN            VXLANConfig
 	BridgeName       string
 	TapName          string
 	Guest            GuestConfig
 	Redfish          RedfishConfig
 	QEMU             QEMUConfig
-}
-
-type WireGuardConfig struct {
-	PrivateKeyFile  string
-	ClientPublicKey string
-	Interface       string
-	ServerAddress   string
-	ClientAddress   string
-	ListenPort      int
 }
 
 type VXLANConfig struct {
@@ -106,13 +99,6 @@ func DefaultConfig() Config {
 		DataDir:          "/var/lib/playpen-runner",
 		Architecture:     ArchitectureAMD64,
 		ConfigureNetwork: true,
-		WireGuard: WireGuardConfig{
-			PrivateKeyFile: "/etc/playpen/wireguard/privatekey",
-			Interface:      "wg0",
-			ServerAddress:  "10.88.0.1/24",
-			ClientAddress:  "10.88.0.2/32",
-			ListenPort:     51820,
-		},
 		VXLAN: VXLANConfig{
 			Interface: "vxlan0",
 			VNI:       12001,

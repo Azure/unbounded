@@ -16,7 +16,6 @@ import (
 	"math/big"
 	"net"
 	"net/http"
-	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -33,13 +32,12 @@ import (
 )
 
 type RuntimeState struct {
-	mu                       sync.RWMutex
-	ready                    bool
-	serverWireGuardPublicKey string
+	mu    sync.RWMutex
+	ready bool
 }
 
-func NewRuntimeState(serverWireGuardPublicKey string, ready bool) *RuntimeState {
-	return &RuntimeState{serverWireGuardPublicKey: serverWireGuardPublicKey, ready: ready}
+func NewRuntimeState(ready bool) *RuntimeState {
+	return &RuntimeState{ready: ready}
 }
 
 func (s *RuntimeState) Ready() bool {
@@ -64,17 +62,6 @@ func (s *RuntimeState) SetReady() {
 	s.ready = true
 }
 
-func (s *RuntimeState) ServerWireGuardPublicKey() string {
-	if s == nil {
-		return ""
-	}
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	return s.serverWireGuardPublicKey
-}
-
 func Run(ctx context.Context, cfg Config) error {
 	if err := cfg.ApplyArchitectureDefaults(); err != nil {
 		return err
@@ -84,17 +71,7 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.Redfish.DeviceID = "1"
 	}
 
-	cmd := OSCommander{}
-	serverPublicKey := ""
-
 	if cfg.ConfigureNetwork {
-		var err error
-
-		serverPublicKey, err = ensureWireGuardPrivateKey(cfg.WireGuard.PrivateKeyFile)
-		if err != nil {
-			return err
-		}
-
 		if err := ensureTLSCert(cfg); err != nil {
 			return err
 		}
@@ -104,16 +81,15 @@ func Run(ctx context.Context, cfg Config) error {
 			return err
 		}
 
-		go publishRunnerMetadataUntilReady(ctx, cfg, serverPublicKey, certPEM)
+		go publishRunnerMetadataUntilReady(ctx, cfg, certPEM)
 	}
 
-	state := NewRuntimeState(serverPublicKey, !cfg.ConfigureNetwork || cfg.WireGuard.ClientPublicKey != "")
-
+	cmd := OSCommander{}
+	state := NewRuntimeState(!cfg.ConfigureNetwork)
 	network := NewNetworkManager(cmd, cfg)
-	if err := network.Setup(ctx); err != nil {
-		return err
+	if cfg.ConfigureNetwork {
+		defer network.Teardown(context.Background()) //nolint:errcheck // Pod teardown also removes the network namespace.
 	}
-	defer network.Teardown(context.Background()) //nolint:errcheck // Pod teardown also removes the network namespace.
 
 	vm := NewVMManager(cmd, cfg)
 	defer vm.Stop() //nolint:errcheck // Best effort on process exit.
@@ -128,13 +104,17 @@ func Run(ctx context.Context, cfg Config) error {
 
 	errCh := make(chan error, 1)
 
+	if cfg.ConfigureNetwork {
+		go func() {
+			if err := configureClaimedNetwork(ctx, cfg, network, state); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- err
+			}
+		}()
+	}
+
 	go func() {
 		errCh <- server.ListenAndServeTLS(filepath.Join(cfg.DataDir, "tls.crt"), filepath.Join(cfg.DataDir, "tls.key"))
 	}()
-
-	if cfg.ConfigureNetwork && cfg.WireGuard.ClientPublicKey == "" {
-		go waitForClientPublicKeyAnnotation(ctx, cfg, network, state)
-	}
 
 	select {
 	case <-ctx.Done():
@@ -153,6 +133,30 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
+func configureClaimedNetwork(ctx context.Context, cfg Config, network *NetworkManager, state *RuntimeState) error {
+	podIP, err := addressIP(cfg.PodIP)
+	if err != nil {
+		return fmt.Errorf("parse pod IP: %w", err)
+	}
+
+	remoteAddress, err := waitVXLANRemoteAddress(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	if err := network.Setup(ctx, podIP.String(), remoteAddress); err != nil {
+		return err
+	}
+
+	if err := markRunnerNetworkReady(ctx, cfg); err != nil {
+		return err
+	}
+
+	state.SetReady()
+
+	return nil
+}
+
 func NewServer(cfg Config, vm *VMManager, state *RuntimeState) (*http.Server, error) {
 	if err := ensureTLSCert(cfg); err != nil {
 		return nil, err
@@ -161,7 +165,7 @@ func NewServer(cfg Config, vm *VMManager, state *RuntimeState) (*http.Server, er
 	mux := http.NewServeMux()
 	mux.Handle("/redfish/v1/", NewRedfishHandler(vm, cfg.Redfish, cfg.DataDir))
 	mux.HandleFunc("/playpen/v1/info", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, infoResponse(cfg, state.ServerWireGuardPublicKey()))
+		writeJSON(w, http.StatusOK, infoResponse(cfg))
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
@@ -181,39 +185,31 @@ func NewServer(cfg Config, vm *VMManager, state *RuntimeState) (*http.Server, er
 	}, nil
 }
 
-func infoResponse(cfg Config, serverPublicKey string) map[string]any {
+func infoResponse(cfg Config) map[string]any {
 	redfishURL := cfg.PublicRedfishURL
 	if redfishURL == "" {
 		redfishURL = defaultPublicRedfishURL(cfg)
 	}
 
-	serverWG, err := addressIP(cfg.WireGuard.ServerAddress)
+	serverAddress := ""
+	serverAddr, err := addressIP(cfg.PodIP)
 	if err != nil {
-		serverWG = netip.Addr{}
-	}
-
-	clientWG, err := addressIP(cfg.WireGuard.ClientAddress)
-	if err != nil {
-		clientWG = netip.Addr{}
+		serverAddress = strings.TrimSpace(cfg.PodIP)
+	} else {
+		serverAddress = serverAddr.String()
 	}
 
 	certPEM, _ := readTLSCertPEM(cfg) //nolint:errcheck // Optional metadata for clients using trusted cluster TLS.
 
 	return map[string]any{
 		"architecture": cfg.Architecture,
-		"wireGuard": map[string]any{
-			"interface":       cfg.WireGuard.Interface,
-			"serverPublicKey": serverPublicKey,
-			"serverAddress":   cfg.WireGuard.ServerAddress,
-			"clientAddress":   cfg.WireGuard.ClientAddress,
-			"listenPort":      cfg.WireGuard.ListenPort,
-		},
 		"vxlan": map[string]any{
 			"interface":     cfg.VXLAN.Interface,
+			"device":        VXLANDevice,
 			"vni":           cfg.VXLAN.VNI,
 			"udpPort":       cfg.VXLAN.Port,
-			"serverAddress": serverWG.String(),
-			"clientAddress": clientWG.String(),
+			"serverAddress": serverAddress,
+			"clientAddress": "",
 		},
 		"network": map[string]any{
 			"guestMAC":    cfg.Guest.MAC,
@@ -232,7 +228,60 @@ func infoResponse(cfg Config, serverPublicKey string) map[string]any {
 	}
 }
 
-func publishRunnerMetadata(ctx context.Context, cfg Config, serverPublicKey, redfishCertPEM string) error {
+func waitVXLANRemoteAddress(ctx context.Context, cfg Config) (string, error) {
+	if cfg.KubernetesClient == nil || cfg.PodName == "" || cfg.PodNamespace == "" {
+		return "", fmt.Errorf("pod name, namespace, and Kubernetes client are required to wait for VXLAN metadata")
+	}
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		pod := &corev1.Pod{}
+		key := types.NamespacedName{Namespace: cfg.PodNamespace, Name: cfg.PodName}
+		if err := cfg.KubernetesClient.Get(ctx, key, pod); err != nil {
+			return "", err
+		}
+
+		remoteAddress := strings.TrimSpace(pod.Annotations[meta.AnnotationVXLANRemoteAddress])
+		if remoteAddress != "" {
+			if _, err := addressIP(remoteAddress); err != nil {
+				return "", fmt.Errorf("parse VXLAN remote address %q: %w", remoteAddress, err)
+			}
+
+			return remoteAddress, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func markRunnerNetworkReady(ctx context.Context, cfg Config) error {
+	if cfg.KubernetesClient == nil || cfg.PodName == "" || cfg.PodNamespace == "" {
+		return fmt.Errorf("pod name, namespace, and Kubernetes client are required to publish runner network readiness")
+	}
+
+	pod := &corev1.Pod{}
+	key := types.NamespacedName{Namespace: cfg.PodNamespace, Name: cfg.PodName}
+	if err := cfg.KubernetesClient.Get(ctx, key, pod); err != nil {
+		return err
+	}
+
+	base := pod.DeepCopy()
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+
+	pod.Annotations[meta.AnnotationRunnerNetworkReady] = "true"
+
+	return cfg.KubernetesClient.Patch(ctx, pod, client.MergeFrom(base))
+}
+
+func publishRunnerMetadata(ctx context.Context, cfg Config, redfishCertPEM string) error {
 	if cfg.KubernetesClient == nil || cfg.PodName == "" || cfg.PodNamespace == "" {
 		return fmt.Errorf("pod name, namespace, and Kubernetes client are required to publish runner metadata")
 	}
@@ -249,18 +298,17 @@ func publishRunnerMetadata(ctx context.Context, cfg Config, serverPublicKey, red
 		pod.Annotations = map[string]string{}
 	}
 
-	pod.Annotations[meta.AnnotationServerWireGuardPublicKey] = serverPublicKey
 	pod.Annotations[meta.AnnotationRedfishCertPEM] = redfishCertPEM
 
 	return cfg.KubernetesClient.Patch(ctx, pod, client.MergeFrom(base))
 }
 
-func publishRunnerMetadataUntilReady(ctx context.Context, cfg Config, serverPublicKey, redfishCertPEM string) {
+func publishRunnerMetadataUntilReady(ctx context.Context, cfg Config, redfishCertPEM string) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
-		if err := publishRunnerMetadata(ctx, cfg, serverPublicKey, redfishCertPEM); err == nil {
+		if err := publishRunnerMetadata(ctx, cfg, redfishCertPEM); err == nil {
 			return
 		} else {
 			slog.Warn("publish runner metadata", "error", err)
@@ -272,42 +320,6 @@ func publishRunnerMetadataUntilReady(ctx context.Context, cfg Config, serverPubl
 		case <-ticker.C:
 		}
 	}
-}
-
-func waitForClientPublicKeyAnnotation(ctx context.Context, cfg Config, network *NetworkManager, state *RuntimeState) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		if clientPublicKey, err := clientPublicKeyAnnotation(ctx, cfg); err == nil && clientPublicKey != "" {
-			if err := network.ConfigurePeer(ctx, clientPublicKey); err == nil {
-				state.SetReady()
-
-				return
-			}
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-func clientPublicKeyAnnotation(ctx context.Context, cfg Config) (string, error) {
-	if cfg.KubernetesClient == nil || cfg.PodName == "" || cfg.PodNamespace == "" {
-		return "", fmt.Errorf("pod name, namespace, and Kubernetes client are required to read client WireGuard public key")
-	}
-
-	pod := &corev1.Pod{}
-
-	key := types.NamespacedName{Namespace: cfg.PodNamespace, Name: cfg.PodName}
-	if err := cfg.KubernetesClient.Get(ctx, key, pod); err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(pod.Annotations[meta.AnnotationClientWireGuardPublicKey]), nil
 }
 
 func ensureTLSCert(cfg Config) error {
@@ -336,7 +348,7 @@ func ensureTLSCert(cfg Config) error {
 			CommonName: "playpen-runner",
 		},
 		NotBefore:             notBefore,
-		NotAfter:              notBefore.Add(24 * time.Hour),
+		NotAfter:              notBefore.Add(30 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
@@ -395,7 +407,7 @@ func certHosts(cfg Config) []string {
 		hosts = append(hosts, strings.Trim(host, "[]"))
 	}
 
-	if addr, err := addressIP(cfg.WireGuard.ServerAddress); err == nil {
+	if addr, err := addressIP(cfg.PodIP); err == nil {
 		hosts = append(hosts, addr.String())
 	}
 
@@ -414,7 +426,7 @@ func certHosts(cfg Config) []string {
 }
 
 func defaultPublicRedfishURL(cfg Config) string {
-	host, err := addressIP(cfg.WireGuard.ServerAddress)
+	host, err := addressIP(cfg.PodIP)
 	if err != nil {
 		return "https://" + cfg.ListenAddr
 	}

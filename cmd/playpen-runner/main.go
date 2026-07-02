@@ -25,8 +25,8 @@ func main() {
 
 	cfg := runner.DefaultConfig()
 	cfg.PodName = os.Getenv("POD_NAME")
-
 	cfg.PodNamespace = os.Getenv("POD_NAMESPACE")
+	cfg.PodIP = os.Getenv("POD_IP")
 	if cfg.PodName != "" && cfg.PodNamespace != "" {
 		scheme := runtime.NewScheme()
 		utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -52,16 +52,10 @@ func main() {
 
 	flags := root.Flags()
 	flags.StringVar(&cfg.ListenAddr, "listen-addr", cfg.ListenAddr, "HTTPS Redfish and info listen address")
-	flags.StringVar(&cfg.PublicRedfishURL, "public-redfish-url", cfg.PublicRedfishURL, "Redfish URL returned by /playpen/v1/info; defaults to the WireGuard server address")
+	flags.StringVar(&cfg.PublicRedfishURL, "public-redfish-url", cfg.PublicRedfishURL, "Redfish URL returned by /playpen/v1/info; defaults to the pod IP")
 	flags.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "runner state directory")
 	flags.StringVar(&cfg.Architecture, "architecture", cfg.Architecture, "runner VM architecture: amd64 or arm64")
-	flags.BoolVar(&cfg.ConfigureNetwork, "configure-network", cfg.ConfigureNetwork, "configure WireGuard, VXLAN, bridge, and tap interfaces")
-	flags.StringVar(&cfg.WireGuard.PrivateKeyFile, "wireguard-private-key-file", cfg.WireGuard.PrivateKeyFile, "path to the runner WireGuard private key")
-	flags.StringVar(&cfg.WireGuard.ClientPublicKey, "wireguard-client-public-key", cfg.WireGuard.ClientPublicKey, "client WireGuard public key")
-	flags.StringVar(&cfg.WireGuard.Interface, "wireguard-interface", cfg.WireGuard.Interface, "WireGuard interface name")
-	flags.StringVar(&cfg.WireGuard.ServerAddress, "wireguard-server-address", cfg.WireGuard.ServerAddress, "runner WireGuard address with prefix")
-	flags.StringVar(&cfg.WireGuard.ClientAddress, "wireguard-client-address", cfg.WireGuard.ClientAddress, "client WireGuard address with prefix")
-	flags.IntVar(&cfg.WireGuard.ListenPort, "wireguard-listen-port", cfg.WireGuard.ListenPort, "WireGuard UDP listen port")
+	flags.BoolVar(&cfg.ConfigureNetwork, "configure-network", cfg.ConfigureNetwork, "configure VXLAN, bridge, and tap interfaces")
 	flags.StringVar(&cfg.VXLAN.Interface, "vxlan-interface", cfg.VXLAN.Interface, "VXLAN interface name")
 	flags.IntVar(&cfg.VXLAN.VNI, "vxlan-vni", cfg.VXLAN.VNI, "VXLAN network identifier")
 	flags.IntVar(&cfg.VXLAN.Port, "vxlan-port", cfg.VXLAN.Port, "VXLAN UDP destination port")

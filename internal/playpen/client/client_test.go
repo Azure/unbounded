@@ -12,19 +12,13 @@ import (
 	"strings"
 	"testing"
 
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	"k8s.io/client-go/rest"
 
 	"github.com/Azure/unbounded/internal/playpen/operator"
 )
 
-func TestAllocateGeneratesIdempotencyKeyAndSendsPublicKeyToAggregatedAPI(t *testing.T) {
-	privateKey, err := wgtypes.GeneratePrivateKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var gotKey, gotPublicKey, gotArchitecture string
+func TestAllocateGeneratesIdempotencyKeyAndSendsRequestToAggregatedAPI(t *testing.T) {
+	var gotKey, gotArchitecture string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != allocsPath {
@@ -38,7 +32,6 @@ func TestAllocateGeneratesIdempotencyKeyAndSendsPublicKeyToAggregatedAPI(t *test
 			t.Fatal(err)
 		}
 
-		gotPublicKey = req.WireGuardPublicKey
 		gotArchitecture = req.Architecture
 
 		writeJSON(t, w, testAllocResponse())
@@ -50,17 +43,13 @@ func TestAllocateGeneratesIdempotencyKeyAndSendsPublicKeyToAggregatedAPI(t *test
 		t.Fatal(err)
 	}
 
-	p, err := c.Allocate(t.Context(), AllocateOptions{Architecture: operator.ArchitectureARM64, WireGuardPrivateKey: privateKey.String()})
+	p, err := c.Allocate(t.Context(), AllocateOptions{Architecture: operator.ArchitectureARM64})
 	if err != nil {
 		t.Fatalf("allocate: %v", err)
 	}
 
 	if gotKey == "" {
 		t.Fatal("idempotency key was not sent")
-	}
-
-	if gotPublicKey != privateKey.PublicKey().String() {
-		t.Fatalf("public key = %q, want %q", gotPublicKey, privateKey.PublicKey().String())
 	}
 
 	if gotArchitecture != operator.ArchitectureARM64 {
@@ -73,7 +62,7 @@ func TestAllocateGeneratesIdempotencyKeyAndSendsPublicKeyToAggregatedAPI(t *test
 }
 
 func TestAllocateControlPlaneSendsResourceTypeAndVersion(t *testing.T) {
-	var gotKey, gotResourceType, gotVersion, gotPublicKey string
+	var gotKey, gotResourceType, gotVersion string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != allocsPath {
@@ -89,8 +78,6 @@ func TestAllocateControlPlaneSendsResourceTypeAndVersion(t *testing.T) {
 
 		gotResourceType = req.ResourceType
 		gotVersion = req.KubernetesVersion
-		gotPublicKey = req.WireGuardPublicKey
-
 		writeJSON(t, w, testControlPlaneAllocResponse())
 	}))
 	defer server.Close()
@@ -115,10 +102,6 @@ func TestAllocateControlPlaneSendsResourceTypeAndVersion(t *testing.T) {
 
 	if gotVersion != "v1.33.1" {
 		t.Fatalf("kubernetesVersion = %q, want v1.33.1", gotVersion)
-	}
-
-	if gotPublicKey != "" {
-		t.Fatalf("wireGuardPublicKey = %q, want empty", gotPublicKey)
 	}
 
 	if cp.Kubeconfig() != "host-kubeconfig" {
@@ -174,7 +157,7 @@ func TestCloseTearsDownTunnelBeforeDeallocateAndIsIdempotent(t *testing.T) {
 		case deallocsPath:
 			deallocCount++
 
-			if len(fake.commands) == 0 || !containsCommand(fake.commands, "ip netns delete ppns") {
+			if len(fake.commands) == 0 || !strings.HasPrefix(fake.commands[len(fake.commands)-1], "ip link delete ppvx") {
 				t.Fatalf("dealloc happened before tunnel teardown: %#v", fake.commands)
 			}
 
@@ -280,9 +263,9 @@ func TestControlPlaneCloseDeallocatesOnce(t *testing.T) {
 	}
 }
 
-func TestPlaypenCommandExecutesInNetworkNamespace(t *testing.T) {
+func TestPlaypenCommandExecutesInCurrentNamespace(t *testing.T) {
 	p := &Playpen{
-		tunnel: newTunnel(&fakeCommander{}, "private-key", testAllocResponse(), TunnelConfig{NetworkNamespace: "ns-playpen"}),
+		tunnel: newTunnel(&fakeCommander{}, testAllocResponse(), TunnelConfig{}),
 	}
 
 	cmd, err := p.Command(t.Context(), "ip", "addr")
@@ -290,35 +273,41 @@ func TestPlaypenCommandExecutesInNetworkNamespace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := strings.Join(append([]string{cmd.Path}, cmd.Args[1:]...), " ")
+	got := strings.Join(cmd.Args, " ")
 	if os.Geteuid() == 0 {
-		if !strings.Contains(got, "ip netns exec ns-playpen ip addr") {
+		if got != "ip addr" {
 			t.Fatalf("command = %q", got)
 		}
 
 		return
 	}
 
-	if !strings.Contains(got, "sudo -n ip netns exec ns-playpen ip addr") {
+	if got != "sudo -n ip addr" {
 		t.Fatalf("command = %q", got)
 	}
 }
 
-func TestOverrideEndpointUpdatesTunnelMetadata(t *testing.T) {
-	metadata := testAllocResponse()
+func TestPlaypenCommandElevatesWrapperCommand(t *testing.T) {
 	p := &Playpen{
-		Metadata: metadata,
-		tunnel:   newTunnel(&fakeCommander{}, "private-key", metadata, TunnelConfig{}),
+		tunnel: newTunnel(&fakeCommander{}, testAllocResponse(), TunnelConfig{}),
 	}
 
-	p.OverrideEndpoint("  lb.example.test  ", 51820)
-
-	if p.Metadata.Endpoint.Host != "lb.example.test" || p.Metadata.Endpoint.WireGuardUDPPort != 51820 {
-		t.Fatalf("metadata endpoint = %s:%d", p.Metadata.Endpoint.Host, p.Metadata.Endpoint.WireGuardUDPPort)
+	cmd, err := p.Command(t.Context(), "env", "FOO=bar", "metalman", "serve-pxe")
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	if p.tunnel.metadata.Endpoint.Host != "lb.example.test" || p.tunnel.metadata.Endpoint.WireGuardUDPPort != 51820 {
-		t.Fatalf("tunnel endpoint = %s:%d", p.tunnel.metadata.Endpoint.Host, p.tunnel.metadata.Endpoint.WireGuardUDPPort)
+	got := strings.Join(cmd.Args, " ")
+	if os.Geteuid() == 0 {
+		if got != "env FOO=bar metalman serve-pxe" {
+			t.Fatalf("command = %q", got)
+		}
+
+		return
+	}
+
+	if got != "sudo -n env FOO=bar metalman serve-pxe" {
+		t.Fatalf("command = %q", got)
 	}
 }
 
@@ -342,17 +331,15 @@ func testAllocResponse() operator.AllocResponse {
 			Architecture: operator.ArchitectureAMD64,
 		},
 		Endpoint: operator.EndpointResponse{
-			Host:             "20.30.40.50",
-			WireGuardUDPPort: 32000,
-		},
-		WireGuard: operator.WireGuardResponse{
-			ServerPublicKey: testPublicKey(),
-			ServerAddress:   "10.88.0.1/24",
-			ClientAddress:   "10.88.0.2/32",
+			Host: "20.30.40.50",
 		},
 		VXLAN: operator.VXLANResponse{
-			VNI:     12001,
-			UDPPort: 4789,
+			Interface:     "vxlan0",
+			Device:        "unbounded0",
+			VNI:           12001,
+			UDPPort:       4789,
+			ServerAddress: "10.88.0.1",
+			ClientAddress: "10.88.0.2",
 		},
 		Network: operator.NetworkResponse{
 			GuestMAC:    "52:54:00:aa:bb:01",
@@ -388,15 +375,6 @@ func testControlPlaneAllocResponse() operator.AllocResponse {
 			GuestAPIServerURL: "https://10.88.0.1:6443",
 		},
 	}
-}
-
-func testPublicKey() string {
-	key, err := wgtypes.GeneratePrivateKey()
-	if err != nil {
-		panic(err)
-	}
-
-	return key.PublicKey().String()
 }
 
 type fakeCommander struct {

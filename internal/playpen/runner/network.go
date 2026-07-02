@@ -7,11 +7,6 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
-	"os"
-	"path/filepath"
-	"strings"
-
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 type NetworkManager struct {
@@ -23,45 +18,36 @@ func NewNetworkManager(cmd Commander, cfg Config) *NetworkManager {
 	return &NetworkManager{cmd: cmd, cfg: cfg}
 }
 
-func (m *NetworkManager) Setup(ctx context.Context) error {
+func (m *NetworkManager) Setup(ctx context.Context, localAddress, remoteAddress string) error {
 	if !m.cfg.ConfigureNetwork {
 		return nil
 	}
 
-	serverAddr, err := addressIP(m.cfg.WireGuard.ServerAddress)
+	localAddr, err := addressIP(localAddress)
 	if err != nil {
-		return fmt.Errorf("parse wireguard server address: %w", err)
+		return fmt.Errorf("parse vxlan local address: %w", err)
 	}
 
-	clientAddr, err := addressIP(m.cfg.WireGuard.ClientAddress)
+	remoteAddr, err := addressIP(remoteAddress)
 	if err != nil {
-		return fmt.Errorf("parse wireguard client address: %w", err)
+		return fmt.Errorf("parse vxlan remote address: %w", err)
 	}
 
 	m.Teardown(ctx) //nolint:errcheck // Setup is idempotent and recreates network resources below.
 
 	commands := [][]string{
-		{"ip", "link", "add", m.cfg.WireGuard.Interface, "type", "wireguard"},
-		{
-			"wg", "set", m.cfg.WireGuard.Interface,
-			"private-key", m.cfg.WireGuard.PrivateKeyFile,
-			"listen-port", fmt.Sprint(m.cfg.WireGuard.ListenPort),
-		},
-		{"ip", "addr", "add", m.cfg.WireGuard.ServerAddress, "dev", m.cfg.WireGuard.Interface},
-		{"ip", "link", "set", m.cfg.WireGuard.Interface, "up"},
 		{"ip", "link", "add", m.cfg.BridgeName, "type", "bridge"},
 		{"ip", "link", "set", m.cfg.BridgeName, "up"},
 		{
 			"ip", "link", "add", m.cfg.VXLAN.Interface,
 			"type", "vxlan",
 			"id", fmt.Sprint(m.cfg.VXLAN.VNI),
-			"dev", m.cfg.WireGuard.Interface,
-			"local", serverAddr.String(),
-			"remote", clientAddr.String(),
+			"local", localAddr.String(),
+			"remote", remoteAddr.String(),
 			"dstport", fmt.Sprint(m.cfg.VXLAN.Port),
 			"nolearning",
 		},
-		{"bridge", "fdb", "append", "00:00:00:00:00:00", "dev", m.cfg.VXLAN.Interface, "dst", clientAddr.String()},
+		{"bridge", "fdb", "append", "00:00:00:00:00:00", "dev", m.cfg.VXLAN.Interface, "dst", remoteAddr.String()},
 		{"ip", "link", "set", m.cfg.VXLAN.Interface, "master", m.cfg.BridgeName},
 		{"ip", "link", "set", m.cfg.VXLAN.Interface, "up"},
 		{"ip", "tuntap", "add", "dev", m.cfg.TapName, "mode", "tap"},
@@ -73,34 +59,6 @@ func (m *NetworkManager) Setup(ctx context.Context) error {
 		if err := m.cmd.Run(ctx, c[0], c[1:]...); err != nil {
 			return fmt.Errorf("run %q: %w", joinCommand(c), err)
 		}
-	}
-
-	if m.cfg.WireGuard.ClientPublicKey != "" {
-		if err := m.ConfigurePeer(ctx, m.cfg.WireGuard.ClientPublicKey); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (m *NetworkManager) ConfigurePeer(ctx context.Context, clientPublicKey string) error {
-	if !m.cfg.ConfigureNetwork {
-		return nil
-	}
-
-	clientPublicKey = strings.TrimSpace(clientPublicKey)
-	if clientPublicKey == "" {
-		return fmt.Errorf("wireguard client public key is required")
-	}
-
-	c := []string{
-		"wg", "set", m.cfg.WireGuard.Interface,
-		"peer", clientPublicKey,
-		"allowed-ips", m.cfg.WireGuard.ClientAddress,
-	}
-	if err := m.cmd.Run(ctx, c[0], c[1:]...); err != nil {
-		return fmt.Errorf("run %q: %w", joinCommand(c), err)
 	}
 
 	return nil
@@ -115,7 +73,6 @@ func (m *NetworkManager) Teardown(ctx context.Context) error {
 		{"ip", "link", "delete", m.cfg.TapName},
 		{"ip", "link", "delete", m.cfg.VXLAN.Interface},
 		{"ip", "link", "delete", m.cfg.BridgeName},
-		{"ip", "link", "delete", m.cfg.WireGuard.Interface},
 	} {
 		m.cmd.Run(ctx, c[0], c[1:]...) //nolint:errcheck // Teardown is best-effort for idempotency.
 	}
@@ -143,32 +100,4 @@ func joinCommand(parts []string) string {
 	}
 
 	return result
-}
-
-func ensureWireGuardPrivateKey(path string) (string, error) {
-	if existing, err := os.ReadFile(path); err == nil {
-		key, err := wgtypes.ParseKey(strings.TrimSpace(string(existing)))
-		if err != nil {
-			return "", fmt.Errorf("parse wireguard private key: %w", err)
-		}
-
-		return key.PublicKey().String(), nil
-	} else if !os.IsNotExist(err) {
-		return "", err
-	}
-
-	key, err := wgtypes.GeneratePrivateKey()
-	if err != nil {
-		return "", err
-	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", err
-	}
-
-	if err := os.WriteFile(path, []byte(key.String()+"\n"), 0o600); err != nil {
-		return "", err
-	}
-
-	return key.PublicKey().String(), nil
 }
