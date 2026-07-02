@@ -201,6 +201,8 @@ func ServePXECmd() *cobra.Command {
 			redfishPool := redfish.NewPool()
 			defer redfishPool.Close()
 
+			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient()}
+
 			if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up Redfish reconciler: %w", err)
 			}
@@ -221,7 +223,7 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("setting up Lifecycle reconciler: %w", err)
 			}
 
-			if err := (&cloudinit.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+			if err := (&cloudinit.Reconciler{Client: mgr.GetClient(), StatusRecorder: statusQueue}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up CloudInit reconciler: %w", err)
 			}
 
@@ -272,7 +274,6 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("adding DHCP server: %w", err)
 			}
 
-			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient()}
 			if err := mgr.Add(statusQueue); err != nil {
 				return fmt.Errorf("adding status queue: %w", err)
 			}

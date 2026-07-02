@@ -59,6 +59,7 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 		w.Write([]byte("ok")) //nolint:errcheck // Best-effort health check response.
 	})
 	mux.HandleFunc("POST /cloudinit/log", h.handleCloudInitLog)
+	mux.HandleFunc("POST /unbounded-agent/install-log", h.handleInstallLog)
 
 	if h.Client != nil {
 		mux.HandleFunc("POST /pxe/disable", h.handleDisablePXE)
@@ -182,6 +183,21 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 	machineName := h.recordCloudInitCondition(r.Context(), log, ip, &ev)
 	h.recordCloudInitStatus(r.Context(), log, machineName, &ev)
 
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		slog.Error("reading install log body", "ip", ip, "err", err)
+		http.Error(w, "bad request", http.StatusBadRequest)
+
+		return
+	}
+
+	slog.Warn("unbounded-agent install log", "ip", ip, "body", strings.TrimSpace(string(body)))
 	w.WriteHeader(http.StatusOK)
 }
 

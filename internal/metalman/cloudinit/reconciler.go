@@ -25,7 +25,12 @@ const (
 )
 
 type Reconciler struct {
-	Client client.Client
+	Client         client.Client
+	StatusRecorder StatusRecorder
+}
+
+type StatusRecorder interface {
+	RecordMachineCondition(ctx context.Context, machineName string, condition metav1.Condition) error
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -71,13 +76,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	log.Info("cloud-init timed out, marking condition Unknown",
 		"reason", cond.Reason, "elapsed", elapsed)
 
-	meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+	condition := metav1.Condition{
 		Type:               v1alpha3.MachineConditionCloudInitDone,
 		Status:             metav1.ConditionUnknown,
 		Reason:             "TimedOut",
 		Message:            fmt.Sprintf("cloud-init did not complete within %s", cloudInitTimeout),
 		ObservedGeneration: machine.Generation,
-	})
+	}
+	meta.SetStatusCondition(&machine.Status.Conditions, condition)
 
-	return ctrl.Result{}, r.Client.Status().Update(ctx, &machine)
+	if err := r.Client.Status().Update(ctx, &machine); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if r.StatusRecorder != nil {
+		if err := r.StatusRecorder.RecordMachineCondition(ctx, machine.Name, condition); err != nil {
+			log.Error("recording cloud-init timeout condition", "err", err)
+		}
+	}
+
+	return ctrl.Result{}, nil
 }
