@@ -82,7 +82,7 @@ func resolveOfflineArtifacts(cfg *config.AgentConfig, offline *config.AgentOffli
 		return nil, errors.New("Cluster.Version is required when OfflineArtifacts.Source is configured")
 	}
 
-	renderedSource, err := renderOfflineSource(offline.Source, clusterVersion)
+	renderedSource, err := RenderOfflineSource(offline.Source, clusterVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +112,9 @@ func resolveOfflineArtifacts(cfg *config.AgentConfig, offline *config.AgentOffli
 	return &ResolvedOfflineArtifacts{SourceRoot: sourceRoot, Manifest: manifest}, nil
 }
 
-func renderOfflineSource(sourceTemplate, kubernetesVersion string) (string, error) {
+// RenderOfflineSource renders an OfflineArtifacts.Source template for the given
+// Kubernetes version.
+func RenderOfflineSource(sourceTemplate, kubernetesVersion string) (string, error) {
 	data := OfflineTemplateData{
 		KubernetesVersion:    kubernetesVersion,
 		KubernetesVersionNoV: stripLeadingV(kubernetesVersion),
