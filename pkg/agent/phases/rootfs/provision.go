@@ -23,6 +23,7 @@ func Provision(log *slog.Logger, gs *goalstates.RootFS) phases.Task {
 			DownloadKubeBinaries(log, gs),
 			DownloadCRIBinaries(log, gs),
 			DownloadCNIBinaries(log, gs),
+			DownloadContainerImageArchives(log, gs),
 			ConfigureOS(gs),
 			DisableResolved(gs),
 		),

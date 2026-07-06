@@ -10,7 +10,6 @@ import (
 	"runtime"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs/oci"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
@@ -228,7 +227,7 @@ func probeRemoteArtifactSource(ctx context.Context, source remoteArtifactSource)
 			return fmt.Errorf("missing HTTP source")
 		}
 
-		return utilio.ProbeRemoteHTTPObject(ctx, source.http.url)
+		return probeArtifactObject(ctx, source.http.url)
 	default:
 		return fmt.Errorf("unsupported remote artifact source kind %q", source.kind)
 	}

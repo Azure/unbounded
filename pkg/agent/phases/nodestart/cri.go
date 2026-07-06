@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"text/template"
 
 	"github.com/Azure/unbounded/internal/executil"
@@ -26,10 +25,7 @@ var assets embed.FS
 
 var assetsTemplate = template.Must(template.New("assets").ParseFS(assets, "assets/*"))
 
-const (
-	nvidiaRuntimeDropInName      = "99-nvidia-runtime.toml"
-	containerImageArchiveHostDir = "/var/lib/unbounded/container-images"
-)
+const nvidiaRuntimeDropInName = "99-nvidia-runtime.toml"
 
 type configureContainerd struct {
 	goalState *goalstates.NodeStart
@@ -154,19 +150,16 @@ func (s *startContainerd) Do(ctx context.Context) error {
 func (i *importContainerImages) Name() string { return "import-container-images" }
 
 func (i *importContainerImages) Do(ctx context.Context) error {
-	for idx, archiveURL := range i.goalState.Containerd.ContainerImageArchiveURLs {
-		archivePath := filepath.Join(containerImageArchiveHostDir, fmt.Sprintf("image-%d.tar", idx))
-		hostPath := filepath.Join(i.goalState.MachineDir, strings.TrimPrefix(archivePath, "/"))
-
-		if err := utilio.DownloadToLocalFile(ctx, archiveURL, hostPath, 0o644); err != nil {
-			return fmt.Errorf("download container image archive %q: %w", archiveURL, err)
-		}
-
-		if _, err := executil.MachineRun(ctx, i.log, i.goalState.MachineName,
-			"ctr", "--namespace", "k8s.io", "images", "import", archivePath,
-		); err != nil {
-			return fmt.Errorf("import container image archive in %s: %w", i.goalState.MachineName, err)
-		}
+	if _, err := executil.MachineRun(ctx, i.log, i.goalState.MachineName,
+		"sh", "-c", fmt.Sprintf(`
+set -eu
+for archive in %s/*.tar; do
+    [ -e "$archive" ] || exit 0
+    ctr --namespace k8s.io images import "$archive"
+done
+`, goalstates.ContainerImageArchiveDir),
+	); err != nil {
+		return fmt.Errorf("import container image archives in %s: %w", i.goalState.MachineName, err)
 	}
 
 	return nil

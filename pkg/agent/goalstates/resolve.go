@@ -93,6 +93,15 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		cniVersion = CNIPluginVersion
 	}
 
+	containerImageArchiveURLs := []string(nil)
+	if offlineArtifacts != nil {
+		containerImageArchiveURLs = containerImageArchiveURLsFromOfflineArtifacts(
+			offlineArtifacts.SourceRoot,
+			offlineArtifacts.Manifest,
+			runtime.GOARCH,
+		)
+	}
+
 	rootFS := &RootFS{
 		MachineDir: filepath.Join("/var/lib/machines", machineName),
 		NSpawnConfigFile: filepath.Join(
@@ -104,27 +113,19 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 			fmt.Sprintf("systemd-nspawn@%s.service.d", machineName),
 			"override.conf",
 		),
-		HostArch:          runtime.GOARCH,
-		HostKernel:        kernel,
-		Hostname:          hostname,
-		ContainerdVersion: containerdVersion,
-		RunCVersion:       runcVersion,
-		CNIPluginVersion:  cniVersion,
-		KubernetesVersion: cfg.Cluster.Version,
-		Downloads:         downloads,
-		OCIImage:          ociImage,
-		Nvidia:            nvidia,
-		AMD:               amd,
-		HostDevices:       DiscoverHostDevices(cfg.AdditionalHostDevices),
-	}
-
-	containerImageArchiveURLs := []string(nil)
-	if offlineArtifacts != nil {
-		containerImageArchiveURLs = containerImageArchiveURLsFromOfflineArtifacts(
-			offlineArtifacts.SourceRoot,
-			offlineArtifacts.Manifest,
-			rootFS.HostArch,
-		)
+		HostArch:                  runtime.GOARCH,
+		HostKernel:                kernel,
+		Hostname:                  hostname,
+		ContainerdVersion:         containerdVersion,
+		RunCVersion:               runcVersion,
+		CNIPluginVersion:          cniVersion,
+		KubernetesVersion:         cfg.Cluster.Version,
+		Downloads:                 downloads,
+		ContainerImageArchiveURLs: containerImageArchiveURLs,
+		OCIImage:                  ociImage,
+		Nvidia:                    nvidia,
+		AMD:                       amd,
+		HostDevices:               DiscoverHostDevices(cfg.AdditionalHostDevices),
 	}
 
 	nodeStart := &NodeStart{
@@ -132,7 +133,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		KubeMachineName: cfg.MachineName,
 		NodeName:        cfg.NodeName,
 		MachineDir:      filepath.Join("/var/lib/machines", machineName),
-		Containerd:      ResolveContainerd(sandboxImage, containerImageArchiveURLs),
+		Containerd:      ResolveContainerd(sandboxImage),
 		Kubelet:         kubelet,
 		Nvidia:          nvidia,
 	}

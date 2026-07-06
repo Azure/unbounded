@@ -53,7 +53,7 @@ func (d *downloadCNIBinaries) Do(ctx context.Context) error {
 		return nil
 	}
 
-	for tarFile, err := range utilio.DecompressTarGzFromRemote(ctx, downloadURL) {
+	for tarFile, err := range decompressTarGzFromRemote(ctx, downloadURL) {
 		if err != nil {
 			return fmt.Errorf("decompress CNI plugins tar: %w", err)
 		}

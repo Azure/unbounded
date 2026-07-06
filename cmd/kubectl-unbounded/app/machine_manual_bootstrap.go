@@ -193,44 +193,56 @@ func validateOfflineArtifactsSource(source string) error {
 	}
 
 	if strings.HasPrefix(source, "oci://") {
-		u, err := url.Parse(source)
-		if err != nil {
-			return fmt.Errorf("parse OCI URL: %w", err)
-		}
-
-		if u.Host == "" || strings.Trim(u.Path, "/") == "" {
-			return errors.New("OCI URL must include registry and repository")
-		}
-
-		if u.Fragment != "" {
-			return errors.New("OCI URL must not include a fragment")
-		}
-
-		last := u.Path[strings.LastIndex(u.Path, "/")+1:]
-		if !strings.Contains(last, ":") && !strings.Contains(u.Path, "@") {
-			return errors.New("OCI URL must include a tag or digest")
-		}
-
-		return nil
+		return validateOCIArtifactsSource(source)
 	}
 
 	if strings.HasPrefix(source, "file://") {
-		u, err := url.Parse(source)
-		if err != nil {
-			return fmt.Errorf("parse file URL: %w", err)
-		}
-
-		if u.Host != "" && u.Host != "localhost" {
-			return fmt.Errorf("file URL must not include host %q", u.Host)
-		}
-
-		if u.Path == "" || !filepath.IsAbs(u.Path) {
-			return errors.New("file URL path must be absolute")
-		}
-
-		return nil
+		return validateFileArtifactsSource(source)
 	}
 
+	return validatePathArtifactsSource(source)
+}
+
+func validateOCIArtifactsSource(source string) error {
+	u, err := url.Parse(source)
+	if err != nil {
+		return fmt.Errorf("parse OCI URL: %w", err)
+	}
+
+	if u.Host == "" || strings.Trim(u.Path, "/") == "" {
+		return errors.New("OCI URL must include registry and repository")
+	}
+
+	if u.Fragment != "" {
+		return errors.New("OCI URL must not include a fragment")
+	}
+
+	last := u.Path[strings.LastIndex(u.Path, "/")+1:]
+	if !strings.Contains(last, ":") && !strings.Contains(u.Path, "@") {
+		return errors.New("OCI URL must include a tag or digest")
+	}
+
+	return nil
+}
+
+func validateFileArtifactsSource(source string) error {
+	u, err := url.Parse(source)
+	if err != nil {
+		return fmt.Errorf("parse file URL: %w", err)
+	}
+
+	if u.Host != "" && u.Host != "localhost" {
+		return fmt.Errorf("file URL must not include host %q", u.Host)
+	}
+
+	if u.Path == "" || !filepath.IsAbs(u.Path) {
+		return errors.New("file URL path must be absolute")
+	}
+
+	return nil
+}
+
+func validatePathArtifactsSource(source string) error {
 	if strings.Contains(source, "://") {
 		return fmt.Errorf("unsupported scheme in %q; supported sources are absolute paths, file:// URLs, and oci:// URLs", source)
 	}

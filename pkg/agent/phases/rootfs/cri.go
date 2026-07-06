@@ -84,7 +84,7 @@ func runcDownloadURL(override *goalstates.DownloadSource, version, arch string) 
 
 // downloadContainerd downloads and extracts containerd binaries from a tar.gz archive.
 func downloadContainerd(ctx context.Context, downloadURL, destDir string) error {
-	for tarFile, err := range utilio.DecompressTarGzFromRemote(ctx, downloadURL) {
+	for tarFile, err := range decompressTarGzFromRemote(ctx, downloadURL) {
 		if err != nil {
 			return fmt.Errorf("decompress containerd tar: %w", err)
 		}
@@ -107,7 +107,7 @@ func downloadContainerd(ctx context.Context, downloadURL, destDir string) error 
 // downloadRunc downloads the runc binary directly.
 func downloadRunc(ctx context.Context, downloadURL, destDir string) error {
 	runcPath := filepath.Join(destDir, "runc")
-	if err := utilio.DownloadToLocalFile(ctx, downloadURL, runcPath, 0o755); err != nil {
+	if err := downloadToLocalFile(ctx, downloadURL, runcPath, 0o755); err != nil {
 		return fmt.Errorf("download runc: %w", err)
 	}
 

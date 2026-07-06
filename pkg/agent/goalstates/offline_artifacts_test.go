@@ -51,8 +51,8 @@ func TestResolveMachineUsesAgentConfigOfflineArtifacts(t *testing.T) {
 	require.Contains(t, got.RootFS.Downloads.Runc.URL, "file://")
 	require.NotContains(t, got.RootFS.Downloads.Runc.URL, "ignored")
 	require.Equal(t, SandboxImage, got.NodeStart.Containerd.SandboxImage)
-	require.Len(t, got.NodeStart.Containerd.ContainerImageArchiveURLs, 2)
-	require.Contains(t, got.NodeStart.Containerd.ContainerImageArchiveURLs[0], "file://")
+	require.Len(t, got.RootFS.ContainerImageArchiveURLs, 2)
+	require.Contains(t, got.RootFS.ContainerImageArchiveURLs[0], "file://")
 }
 
 func TestResolveOfflineArtifacts(t *testing.T) {

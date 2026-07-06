@@ -102,7 +102,7 @@ func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary, binar
 
 		start := time.Now()
 
-		if err := utilio.DownloadWithSHA256Verification(ctx, binaryURL, checksumURL, targetFilePath, 0o755); err != nil {
+		if err := downloadWithSHA256Verification(ctx, binaryURL, checksumURL, targetFilePath, 0o755); err != nil {
 			logger.Error("download failed", "error", err)
 			return fmt.Errorf("download kubernetes binary %q: %w", binary, err)
 		}
@@ -123,7 +123,7 @@ func (d *downloadKubeBinaries) downloadCrictlBinary(ctx context.Context, downloa
 		start := time.Now()
 		found := false
 
-		for tarFile, err := range utilio.DecompressTarGzFromRemote(ctx, downloadURL) {
+		for tarFile, err := range decompressTarGzFromRemote(ctx, downloadURL) {
 			if err != nil {
 				logger.Error("download failed", "error", err)
 				return fmt.Errorf("download crictl archive: %w", err)
