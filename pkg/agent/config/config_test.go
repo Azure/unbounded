@@ -273,6 +273,30 @@ func TestAgentOfflineArtifacts_DeepCopyNil(t *testing.T) {
 	require.Nil(t, original.DeepCopy())
 }
 
+func TestAgentConfig_OfflineArtifactsConfigured(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		cfg  *AgentConfig
+		want bool
+	}{
+		{name: "nil config"},
+		{name: "nil offline artifacts", cfg: &AgentConfig{}},
+		{name: "empty source", cfg: &AgentConfig{OfflineArtifacts: &AgentOfflineArtifacts{}}},
+		{name: "whitespace source", cfg: &AgentConfig{OfflineArtifacts: &AgentOfflineArtifacts{Source: "   "}}},
+		{name: "configured", cfg: &AgentConfig{OfflineArtifacts: &AgentOfflineArtifacts{Source: "file:///opt/unbounded/artifacts"}}, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tt.want, tt.cfg.OfflineArtifactsConfigured())
+		})
+	}
+}
+
 func TestAgentConfig_BackfillNodeName(t *testing.T) {
 	t.Parallel()
 

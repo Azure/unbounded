@@ -47,7 +47,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 			log := cmdCtx.Logger
 
-			downloads, containerImageArchives, err := goalstates.ResolveDownloadOverridesWithOfflineArtifacts(&cfg.AgentConfig, provision.ResolveDownloadOverrides(cfg.Downloads))
+			downloads, containerImageArchives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(cfg)
 			if err != nil {
 				return err
 			}

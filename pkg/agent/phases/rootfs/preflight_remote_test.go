@@ -10,12 +10,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
@@ -88,14 +90,13 @@ func TestRemoteArtifactCheckerUsesHeadBeforeGet(t *testing.T) {
 }
 
 func TestRemoteArtifactCheckerCollectsAllFailures(t *testing.T) {
-	checker := remoteArtifactChecker{
-		log:        slog.New(slog.DiscardHandler),
-		name:       checkKubernetesArtifactsName,
-		target:     "kubernetes artifacts",
-		errMessage: "one or more required Kubernetes artifact sources are not reachable",
-		rootFS:     remoteRootFSGoalState(),
-		sources: func(*goalstates.RootFS) (downloadArtifactSources, error) {
-			return downloadArtifactSources{
+	checker := artifactsource.ReachabilityChecker{
+		Log:        slog.New(slog.DiscardHandler),
+		CheckName:  checkKubernetesArtifactsName,
+		Target:     "kubernetes artifacts",
+		ErrMessage: "one or more required Kubernetes artifact sources are not reachable",
+		Sources: func() (artifactsource.Sources, error) {
+			return artifactsource.Sources{
 				"kubelet":    mustDownloadSource(t, filepath.Join(t.TempDir(), "missing-kubelet")),
 				"kubectl":    mustDownloadSource(t, writeProbeSource(t)),
 				"kube-proxy": mustDownloadSource(t, filepath.Join(t.TempDir(), "missing-kube-proxy")),
@@ -154,17 +155,23 @@ func writeProbeSource(t *testing.T) string {
 	return path
 }
 
-func mustDownloadSource(t *testing.T, source string) downloadSource {
+func mustDownloadSource(t *testing.T, source string) artifactsource.Source {
 	t.Helper()
 
-	parsed, err := parseDownloadSource(source)
+	parsed, err := artifactsource.Parse(source)
 	require.NoError(t, err)
 
 	return parsed
 }
 
-func sourceNames(sources downloadArtifactSources) []string {
-	names := sortedDownloadArtifactSourceNames(sources)
+func sourceNames(sources artifactsource.Sources) []string {
+	names := make([]string, 0, len(sources))
+	for name := range sources {
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+
 	for _, source := range sources {
 		if strings.Contains(source.String(), ".sha256") {
 			names = append(names, "unexpected-checksum")

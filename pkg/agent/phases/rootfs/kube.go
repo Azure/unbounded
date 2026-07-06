@@ -16,6 +16,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -109,7 +110,7 @@ func (d *downloadKubeBinaries) enqueueCrictlDownload(ctx context.Context, eg *er
 
 // downloadBinary returns a function that downloads a single Kubernetes binary,
 // verifies its SHA256 checksum, and logs the duration of the download.
-func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary string, binaryURL downloadSource, targetFilePath string) func() error {
+func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary string, binaryURL artifactsource.Source, targetFilePath string) func() error {
 	return func() error {
 		logger := d.log.With("binary", binary, "url", binaryURL.String())
 
@@ -117,18 +118,18 @@ func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary string
 
 		start := time.Now()
 
-		checksumSource, err := parseDownloadSource(binaryURL.String() + ".sha256")
+		checksumSource, err := artifactsource.Parse(binaryURL.String() + ".sha256")
 		if err != nil {
 			return fmt.Errorf("parse kubernetes binary checksum source %q: %w", binary, err)
 		}
 
-		expectedHash, err := readExpectedSHA256(ctx, checksumSource)
+		expectedHash, err := artifactsource.ReadExpectedSHA256(ctx, checksumSource)
 		if err != nil {
 			logger.Error("checksum download failed", "error", err)
 			return fmt.Errorf("read kubernetes binary checksum %q: %w", binary, err)
 		}
 
-		if err := binaryURL.downloadWithSHA256Verification(ctx, expectedHash, targetFilePath, 0o755); err != nil {
+		if err := binaryURL.DownloadWithSHA256Verification(ctx, expectedHash, targetFilePath, 0o755); err != nil {
 			logger.Error("download failed", "error", err)
 			return fmt.Errorf("download kubernetes binary %q: %w", binary, err)
 		}
@@ -140,7 +141,7 @@ func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary string
 }
 
 // downloadCrictlBinary returns a function that downloads the crictl tarball and installs the crictl binary.
-func (d *downloadKubeBinaries) downloadCrictlBinary(ctx context.Context, downloadURL downloadSource, targetFilePath string) func() error {
+func (d *downloadKubeBinaries) downloadCrictlBinary(ctx context.Context, downloadURL artifactsource.Source, targetFilePath string) func() error {
 	return func() error {
 		logger := d.log.With("binary", "crictl", "url", downloadURL.String())
 
@@ -149,7 +150,7 @@ func (d *downloadKubeBinaries) downloadCrictlBinary(ctx context.Context, downloa
 		start := time.Now()
 		found := false
 
-		for tarFile, err := range downloadURL.decompressTarGz(ctx) {
+		for tarFile, err := range downloadURL.DecompressTarGz(ctx) {
 			if err != nil {
 				logger.Error("download failed", "error", err)
 				return fmt.Errorf("download crictl archive: %w", err)
@@ -253,13 +254,13 @@ func crictlVersionForKubernetesVersion(kubernetesVersion string) (string, error)
 
 // kubernetesBinaryURL resolves the download URL for a kubernetes binary
 // (kubelet, kubectl, kube-proxy) honoring the optional override.
-func kubernetesBinaryURL(override *goalstates.DownloadSource, version, arch, binary string) (downloadSource, error) {
-	return parseDownloadSource(agentartifacts.KubernetesBinary(override, version, arch, binary))
+func kubernetesBinaryURL(override *goalstates.DownloadSource, version, arch, binary string) (artifactsource.Source, error) {
+	return artifactsource.Parse(agentartifacts.KubernetesBinary(override, version, arch, binary))
 }
 
 // crictlDownloadURL resolves the cri-tools crictl tarball URL honoring
 // the optional override. Mirrors must publish assets under the same
 // <base>/v<ver>/<asset> layout as GitHub releases.
-func crictlDownloadURL(override *goalstates.DownloadSource, version, hostOS, hostArch string) (downloadSource, error) {
-	return parseDownloadSource(agentartifacts.CrictlArchive(override, version, hostOS, hostArch))
+func crictlDownloadURL(override *goalstates.DownloadSource, version, hostOS, hostArch string) (artifactsource.Source, error) {
+	return artifactsource.Parse(agentartifacts.CrictlArchive(override, version, hostOS, hostArch))
 }

@@ -70,7 +70,7 @@ func (c simpleHostChecker) Check(ctx context.Context) []preflight.Result { retur
 func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
 	return []preflight.Checker{
 		CheckIsPrivilegedUser(log),
-		checkHostPackages(log, cfg.OfflineArtifacts != nil, defaultHostCheckDeps()),
+		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), defaultHostCheckDeps()),
 		CheckHostOSConfiguration(log),
 		CheckNSpawnRuntime(log),
 		CheckDockerActive(log),

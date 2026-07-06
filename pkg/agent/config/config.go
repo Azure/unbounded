@@ -80,6 +80,11 @@ func (a *AgentOfflineArtifacts) DeepCopy() *AgentOfflineArtifacts {
 	return &out
 }
 
+// OfflineArtifactsConfigured reports whether an offline artifact source is configured.
+func (a *AgentConfig) OfflineArtifactsConfigured() bool {
+	return a != nil && a.OfflineArtifacts != nil && strings.TrimSpace(a.OfflineArtifacts.Source) != ""
+}
+
 // BackfillNodeName resolves and stores the Kubernetes Node name once. An
 // explicit NodeName wins when set. Otherwise, a valid host hostname wins, then
 // MachineName is used as the final fallback.

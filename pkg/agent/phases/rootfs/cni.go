@@ -12,6 +12,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -56,7 +57,7 @@ func (d *downloadCNIBinaries) Do(ctx context.Context) error {
 		return nil
 	}
 
-	for tarFile, err := range downloadURL.decompressTarGz(ctx) {
+	for tarFile, err := range downloadURL.DecompressTarGz(ctx) {
 		if err != nil {
 			return fmt.Errorf("decompress CNI plugins tar: %w", err)
 		}
@@ -73,8 +74,8 @@ func (d *downloadCNIBinaries) Do(ctx context.Context) error {
 
 // cniDownloadURL resolves the CNI plugins tarball URL honoring the
 // optional override. Mirrors must publish under <base>/v<ver>/<asset>.
-func cniDownloadURL(override *goalstates.DownloadSource, version, arch string) (downloadSource, error) {
-	return parseDownloadSource(agentartifacts.CNIPluginsArchive(override, version, arch))
+func cniDownloadURL(override *goalstates.DownloadSource, version, arch string) (artifactsource.Source, error) {
+	return artifactsource.Parse(agentartifacts.CNIPluginsArchive(override, version, arch))
 }
 
 // hasRequiredCNIPlugins checks if all required CNI plugins are installed and executable.

@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime"
-	"sort"
 
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs/oci"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
@@ -21,20 +21,8 @@ const (
 	checkCNIArtifactsName        = "cni-artifacts"
 )
 
-type downloadArtifactSources map[string]downloadSource
-
 type ociImageReachableChecker struct {
 	rootFS *goalstates.RootFS
-}
-
-type remoteArtifactChecker struct {
-	log        *slog.Logger
-	name       string
-	target     string
-	okMessage  string
-	errMessage string
-	rootFS     *goalstates.RootFS
-	sources    func(*goalstates.RootFS) (downloadArtifactSources, error)
 }
 
 // CheckOCIImageReachable validates that the OCI rootfs image manifest can be
@@ -64,91 +52,57 @@ func (c ociImageReachableChecker) Check(ctx context.Context) []preflight.Result 
 // CheckKubernetesArtifacts validates that Kubernetes binary artifact URLs are
 // reachable without downloading the full binaries or checksum files.
 func CheckKubernetesArtifacts(log *slog.Logger, rootFS *goalstates.RootFS) preflight.Checker {
-	return remoteArtifactChecker{
-		log:        log,
-		name:       checkKubernetesArtifactsName,
-		target:     "kubernetes artifacts",
-		okMessage:  "Kubernetes artifact sources are reachable",
-		errMessage: "one or more required Kubernetes artifact sources are not reachable",
-		rootFS:     rootFS,
-		sources:    kubernetesArtifactSources,
+	return artifactsource.ReachabilityChecker{
+		Log:        log,
+		CheckName:  checkKubernetesArtifactsName,
+		Target:     "kubernetes artifacts",
+		OKMessage:  "Kubernetes artifact sources are reachable",
+		ErrMessage: "one or more required Kubernetes artifact sources are not reachable",
+		Sources: func() (artifactsource.Sources, error) {
+			return kubernetesArtifactSources(rootFS)
+		},
 	}
 }
 
 // CheckCRIArtifacts validates that CRI artifact URLs are reachable without
 // downloading or extracting the full artifacts.
 func CheckCRIArtifacts(log *slog.Logger, rootFS *goalstates.RootFS) preflight.Checker {
-	return remoteArtifactChecker{
-		log:        log,
-		name:       checkCRIArtifactsName,
-		target:     "CRI artifacts",
-		okMessage:  "CRI artifact sources are reachable",
-		errMessage: "one or more required CRI artifact sources are not reachable",
-		rootFS:     rootFS,
-		sources:    criArtifactSources,
+	return artifactsource.ReachabilityChecker{
+		Log:        log,
+		CheckName:  checkCRIArtifactsName,
+		Target:     "CRI artifacts",
+		OKMessage:  "CRI artifact sources are reachable",
+		ErrMessage: "one or more required CRI artifact sources are not reachable",
+		Sources: func() (artifactsource.Sources, error) {
+			return criArtifactSources(rootFS)
+		},
 	}
 }
 
 // CheckCNIArtifacts validates that CNI artifact URLs are reachable without
 // downloading or extracting the full artifact.
 func CheckCNIArtifacts(log *slog.Logger, rootFS *goalstates.RootFS) preflight.Checker {
-	return remoteArtifactChecker{
-		log:        log,
-		name:       checkCNIArtifactsName,
-		target:     "CNI artifacts",
-		okMessage:  "CNI artifact sources are reachable",
-		errMessage: "required CNI artifact source is not reachable",
-		rootFS:     rootFS,
-		sources:    cniArtifactSources,
+	return artifactsource.ReachabilityChecker{
+		Log:        log,
+		CheckName:  checkCNIArtifactsName,
+		Target:     "CNI artifacts",
+		OKMessage:  "CNI artifact sources are reachable",
+		ErrMessage: "required CNI artifact source is not reachable",
+		Sources: func() (artifactsource.Sources, error) {
+			return cniArtifactSources(rootFS)
+		},
 	}
 }
 
-func (c remoteArtifactChecker) Name() string { return c.name }
-
-func (c remoteArtifactChecker) Check(ctx context.Context) []preflight.Result {
-	if c.rootFS == nil {
-		return preflight.ResultsError(c.name, c.target, "goal state could not be resolved")
+func kubernetesArtifactSources(rootFS *goalstates.RootFS) (artifactsource.Sources, error) {
+	if rootFS == nil {
+		return nil, fmt.Errorf("rootfs goal state is required")
 	}
 
-	sources, err := c.sources(c.rootFS)
-	if err != nil {
-		return preflight.ResultsError(c.name, c.target, "artifact sources could not be resolved")
-	}
-
-	var failures []preflight.Result
-
-	for _, sourceName := range sortedDownloadArtifactSourceNames(sources) {
-		source := sources[sourceName]
-		if err := source.probe(ctx); err != nil {
-			c.log.Debug("preflight remote artifact probe failed", slog.String("check", c.name), slog.String("source", sourceName))
-
-			failures = append(failures, preflight.Error(c.name, c.target, "%s: %s", c.errMessage, sourceName))
-		}
-	}
-
-	if len(failures) > 0 {
-		return failures
-	}
-
-	return preflight.ResultsOK(c.name, c.target, c.okMessage)
-}
-
-func sortedDownloadArtifactSourceNames(sources downloadArtifactSources) []string {
-	names := make([]string, 0, len(sources))
-	for name := range sources {
-		names = append(names, name)
-	}
-
-	sort.Strings(names)
-
-	return names
-}
-
-func kubernetesArtifactSources(rootFS *goalstates.RootFS) (downloadArtifactSources, error) {
 	override := kubernetesDownloadSource(rootFS)
 	version := downloadSourceVersion(rootFS.KubernetesVersion, override)
 
-	sources := make(downloadArtifactSources, len(requiredKubeBinaries))
+	sources := make(artifactsource.Sources, len(requiredKubeBinaries))
 	for _, binary := range requiredKubeBinaries {
 		source, err := kubernetesBinaryURL(override, version, rootFS.HostArch, binary)
 		if err != nil {
@@ -161,7 +115,11 @@ func kubernetesArtifactSources(rootFS *goalstates.RootFS) (downloadArtifactSourc
 	return sources, nil
 }
 
-func criArtifactSources(rootFS *goalstates.RootFS) (downloadArtifactSources, error) {
+func criArtifactSources(rootFS *goalstates.RootFS) (artifactsource.Sources, error) {
+	if rootFS == nil {
+		return nil, fmt.Errorf("rootfs goal state is required")
+	}
+
 	containerdOverride := containerdDownloadSource(rootFS)
 	runcOverride := runcDownloadSource(rootFS)
 	crictlOverride := crictlDownloadSource(rootFS)
@@ -189,14 +147,18 @@ func criArtifactSources(rootFS *goalstates.RootFS) (downloadArtifactSources, err
 		return nil, fmt.Errorf("resolve crictl source: %w", err)
 	}
 
-	return downloadArtifactSources{
+	return artifactsource.Sources{
 		"containerd": containerdSource,
 		"runc":       runcSource,
 		"crictl":     crictlSource,
 	}, nil
 }
 
-func cniArtifactSources(rootFS *goalstates.RootFS) (downloadArtifactSources, error) {
+func cniArtifactSources(rootFS *goalstates.RootFS) (artifactsource.Sources, error) {
+	if rootFS == nil {
+		return nil, fmt.Errorf("rootfs goal state is required")
+	}
+
 	override := cniDownloadSource(rootFS)
 	version := downloadSourceVersion(rootFS.CNIPluginVersion, override)
 
@@ -205,5 +167,5 @@ func cniArtifactSources(rootFS *goalstates.RootFS) (downloadArtifactSources, err
 		return nil, fmt.Errorf("resolve CNI plugin source: %w", err)
 	}
 
-	return downloadArtifactSources{"cni-plugins": source}, nil
+	return artifactsource.Sources{"cni-plugins": source}, nil
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -79,19 +80,19 @@ func (d *downloadCRIBinaries) Do(ctx context.Context) error {
 // honoring BaseURL / URL overrides. The upstream path-and-filename layout
 // (containerd-<ver>-linux-<arch>.tar.gz) is preserved so mirrors must
 // publish under the same structure.
-func containerdDownloadURL(override *goalstates.DownloadSource, version, arch string) (downloadSource, error) {
-	return parseDownloadSource(agentartifacts.ContainerdArchive(override, version, arch))
+func containerdDownloadURL(override *goalstates.DownloadSource, version, arch string) (artifactsource.Source, error) {
+	return artifactsource.Parse(agentartifacts.ContainerdArchive(override, version, arch))
 }
 
 // runcDownloadURL resolves the runc binary URL, honoring BaseURL / URL
 // overrides. The upstream filename (runc.<arch>) is preserved.
-func runcDownloadURL(override *goalstates.DownloadSource, version, arch string) (downloadSource, error) {
-	return parseDownloadSource(agentartifacts.RuncBinary(override, version, arch))
+func runcDownloadURL(override *goalstates.DownloadSource, version, arch string) (artifactsource.Source, error) {
+	return artifactsource.Parse(agentartifacts.RuncBinary(override, version, arch))
 }
 
 // downloadContainerd downloads and extracts containerd binaries from a tar.gz archive.
-func downloadContainerd(ctx context.Context, downloadURL downloadSource, destDir string) error {
-	for tarFile, err := range downloadURL.decompressTarGz(ctx) {
+func downloadContainerd(ctx context.Context, downloadURL artifactsource.Source, destDir string) error {
+	for tarFile, err := range downloadURL.DecompressTarGz(ctx) {
 		if err != nil {
 			return fmt.Errorf("decompress containerd tar: %w", err)
 		}
@@ -112,9 +113,9 @@ func downloadContainerd(ctx context.Context, downloadURL downloadSource, destDir
 }
 
 // downloadRunc downloads the runc binary directly.
-func downloadRunc(ctx context.Context, downloadURL downloadSource, destDir string) error {
+func downloadRunc(ctx context.Context, downloadURL artifactsource.Source, destDir string) error {
 	runcPath := filepath.Join(destDir, "runc")
-	if err := downloadURL.downloadToLocalFile(ctx, runcPath, 0o755); err != nil {
+	if err := downloadURL.DownloadToLocalFile(ctx, runcPath, 0o755); err != nil {
 		return fmt.Errorf("download runc: %w", err)
 	}
 
