@@ -134,7 +134,7 @@ LOCAL_ARTIFACT_REGISTRY_PORT = os.environ.get("LOCAL_ARTIFACT_REGISTRY_PORT", "5
 ORAS_LOGGED_IN_REGISTRIES: set[str] = set()
 
 TEST_NS = "e2e-workload-test"
-E2E_WORKLOAD_IMAGE = "busybox:1.36"
+E2E_WORKLOAD_IMAGE = "docker.io/library/busybox:1.36"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
 DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
 DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
