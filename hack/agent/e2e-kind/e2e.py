@@ -134,6 +134,7 @@ LOCAL_ARTIFACT_REGISTRY_PORT = os.environ.get("LOCAL_ARTIFACT_REGISTRY_PORT", "5
 ORAS_LOGGED_IN_REGISTRIES: set[str] = set()
 
 TEST_NS = "e2e-workload-test"
+E2E_WORKLOAD_IMAGE = "busybox:1.36"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
 DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
 DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
@@ -1770,6 +1771,42 @@ def kubernetes_server_version() -> str:
     return kube_version
 
 
+def build_agent_artifacts_builder() -> None:
+    """Build the offline artifact builder binary."""
+    log("Building agent-artifacts-builder...")
+    run(["go", "build", "-o", AGENT_ARTIFACTS_BUILDER,
+         str(REPO_ROOT / "hack" / "cmd" / "agent-artifacts-builder" / "main.go")])
+
+
+def offline_artifact_manifest(kube_version: str, container_images: list[str] | None = None) -> dict[str, Any]:
+    """Return a manifest for an e2e offline bootstrap artifact bundle."""
+    manifest: dict[str, Any] = {
+        "versions": {
+            "kubernetes": kube_version,
+            "containerd": "2.1.8",
+            "runc": "1.5.0",
+            "cni": "1.5.1",
+            "crictl": _crictl_version_for_kubernetes(kube_version),
+        },
+    }
+    if container_images is not None:
+        manifest["containerImages"] = sorted(set(container_images))
+    return manifest
+
+
+def default_offline_container_images(kube_version: str) -> list[str]:
+    """Return the agent's default offline container images for e2e bundles."""
+    return [
+        "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9",
+        f"mcr.microsoft.com/oss/v2/kubernetes/kube-proxy:{kube_version}",
+    ]
+
+
+def e2e_offline_container_images(kube_version: str, cluster_images: list[str]) -> list[str]:
+    """Return images needed for a blocked-network e2e node to become useful."""
+    return sorted(set(default_offline_container_images(kube_version) + cluster_images + [E2E_WORKLOAD_IMAGE]))
+
+
 def prepare_offline_bootstrap_artifacts(node_config: NodeConfig) -> str:
     """Prepare offline bootstrap artifacts and return an agent config source."""
     oci_ref = node_config.offline_artifacts_oci_ref
@@ -1790,20 +1827,10 @@ def prepare_offline_bootstrap_artifacts(node_config: NodeConfig) -> str:
     offline_dir.parent.mkdir(parents=True, exist_ok=True)
 
     if not oci_ref:
-        log("Building agent-artifacts-builder...")
-        run(["go", "build", "-o", AGENT_ARTIFACTS_BUILDER,
-             str(REPO_ROOT / "hack" / "cmd" / "agent-artifacts-builder" / "main.go")])
+        build_agent_artifacts_builder()
 
         manifest_path = VM_DIR / "offline-bootstrap-manifest.json"
-        manifest_path.write_text(json.dumps({
-            "versions": {
-                "kubernetes": kube_version,
-                "containerd": "2.1.8",
-                "runc": "1.5.0",
-                "cni": "1.5.1",
-                "crictl": _crictl_version_for_kubernetes(kube_version),
-            },
-        }, indent=2))
+        manifest_path.write_text(json.dumps(offline_artifact_manifest(kube_version), indent=2))
 
         arch = "amd64"
         log(f"Building offline artifact bundle for Kubernetes {kube_version} ({arch})...")
@@ -1867,29 +1894,24 @@ def start_local_artifact_registry() -> str:
 
 def mirror_oci_refs_to_local_registry(configs: list[NodeConfig]) -> list[NodeConfig]:
     """Mirror configured OCI refs to a local e2e registry."""
-    preload_images = cluster_preload_images() if any(cfg.block_external_network for cfg in configs) else []
-    if not any(cfg.offline_artifacts_oci_ref or cfg.rootfs_oci_image for cfg in configs) and not preload_images:
+    blocked_network = any(cfg.block_external_network for cfg in configs)
+    if not any(cfg.offline_artifacts_oci_ref or cfg.rootfs_oci_image for cfg in configs) and not blocked_network:
         return configs
 
     registry = start_local_artifact_registry()
     mirrored: dict[str, str] = {}
     out: list[NodeConfig] = []
+    e2e_offline_ref = ""
 
-    preload_mirrors: dict[str, str] = {}
-    for source_ref in preload_images:
-        if source_ref in mirrored:
-            continue
-
-        local_ref = local_preload_ref(registry, source_ref)
-        log(f"Mirroring cluster image {source_ref} -> {local_ref}")
-        oras_copy(source_ref, local_ref)
-        mirrored[source_ref] = local_ref
-        preload_mirrors[source_ref] = local_ref
+    if blocked_network:
+        e2e_offline_ref = build_e2e_offline_artifact_bundle(registry, cluster_preload_images())
 
     for cfg in configs:
         offline_ref = cfg.offline_artifacts_oci_ref
         rootfs_ref = cfg.rootfs_oci_image
-        if offline_ref:
+        if cfg.block_external_network:
+            offline_ref = e2e_offline_ref
+        elif offline_ref:
             source_ref = offline_ref
             local_ref = mirrored.get(source_ref)
             if local_ref is None:
@@ -1918,6 +1940,37 @@ def mirror_oci_refs_to_local_registry(configs: list[NodeConfig]) -> list[NodeCon
     return out
 
 
+def build_e2e_offline_artifact_bundle(registry: str, cluster_images: list[str]) -> str:
+    """Build and push an e2e offline artifact bundle with cluster and workload images."""
+    kube_version = kubernetes_server_version()
+    image_refs = e2e_offline_container_images(kube_version, cluster_images)
+    output_dir = VM_DIR / "offline-bootstrap-artifacts-e2e" / kube_version
+    manifest_path = VM_DIR / "offline-bootstrap-manifest-e2e.json"
+    local_ref = f"oci://{registry}/unbounded/bootstrap-artifacts:e2e-k8s-{kube_version.removeprefix('v')}"
+
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(offline_artifact_manifest(kube_version, image_refs), indent=2))
+
+    build_agent_artifacts_builder()
+
+    log("Building e2e offline artifact bundle with cluster and workload images:")
+    for image in image_refs:
+        log(f"  {image}")
+
+    run([
+        AGENT_ARTIFACTS_BUILDER,
+        "--output-dir", str(output_dir),
+        "--manifest", str(manifest_path),
+        "--arch", "amd64",
+        "--oci-ref", local_ref,
+    ])
+
+    log(f"Built e2e offline artifact bundle {local_ref}")
+    return local_ref
+
+
 def local_artifact_ref(registry: str, source_ref: str) -> str:
     """Return the local registry ref used for a mirrored artifact bundle."""
     _name, tag = split_tagged_oci_ref(source_ref, "offline artifact OCI ref")
@@ -1931,13 +1984,6 @@ def local_rootfs_ref(registry: str, source_ref: str) -> str:
     repo = re.sub(r"[^a-z0-9._/-]+", "-", repo.lower()).strip("/") or "rootfs"
     return f"{registry}/rootfs/{repo}:{tag}"
 
-
-
-def local_preload_ref(registry: str, source_ref: str) -> str:
-    """Return the local registry ref used for a mirrored cluster image."""
-    name, tag = split_tagged_oci_ref(source_ref, "cluster preload image")
-    repo = re.sub(r"[^a-z0-9._/-]+", "-", name.lower()).strip("/")
-    return f"{registry}/preload/{repo}:{tag}"
 
 
 def split_tagged_oci_ref(ref: str, label: str) -> tuple[str, str]:
@@ -1987,85 +2033,6 @@ def cluster_preload_images() -> list[str]:
     return sorted(images)
 
 
-def patch_kube_system_daemonset_images(image_map: dict[str, str]) -> None:
-    """Patch kube-system DaemonSets so mirrored/preloaded images are reusable."""
-    result = subprocess.run(
-        [KUBECTL, "get", "daemonsets", "-n", "kube-system", "-o", "json"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        die(f"failed to list kube-system DaemonSets: {result.stderr.strip()}")
-
-    daemonsets = json.loads(result.stdout).get("items", [])
-    for daemonset in daemonsets:
-        name = daemonset.get("metadata", {}).get("name", "")
-        pod_spec = daemonset.get("spec", {}).get("template", {}).get("spec", {})
-        patch_spec: dict[str, Any] = {}
-        for field in ("initContainers", "containers"):
-            patched_containers = []
-            for container in pod_spec.get(field, []) or []:
-                image = container.get("image", "")
-                if image in image_map:
-                    patched_containers.append({
-                        "name": container["name"],
-                        "imagePullPolicy": "IfNotPresent",
-                    })
-            if patched_containers:
-                patch_spec[field] = patched_containers
-
-        if not patch_spec:
-            continue
-
-        log(f"Patching kube-system DaemonSet {name} to reuse preloaded images")
-        patch = {"spec": {"template": {"spec": patch_spec}}}
-        kubectl(["patch", "daemonset", name, "-n", "kube-system", "--type", "strategic", "-p", json.dumps(patch)])
-
-
-def reset_offline_daemonset_pods() -> None:
-    """Delete kube-system DaemonSet pods on the offline node to clear pull backoff."""
-    for label in ("k8s-app=kube-proxy", "app=kindnet"):
-        run_quiet([
-            KUBECTL, "delete", "pod", "-n", "kube-system",
-            "--field-selector", f"spec.nodeName={AGENT_MACHINE_NAME}",
-            "-l", label,
-            "--ignore-not-found",
-        ], check=False)
-
-
-def preload_cluster_images() -> None:
-    """Pull mirrored cluster images into the active nspawn containerd."""
-    images = cluster_preload_images()
-    if not images:
-        log("No kube-system DaemonSet images to preload")
-        return
-
-    registry = f"{VM_GATEWAY}:{LOCAL_ARTIFACT_REGISTRY_PORT}"
-    deadline = time.time() + 120
-    while True:
-        for machine in NSPAWN_MACHINE_NAMES:
-            result = ssh_capture_quiet(f"sudo machinectl show {machine}")
-            if result.returncode == 0:
-                log(f"Preloading cluster images into nspawn machine {machine}...")
-                image_map: dict[str, str] = {}
-                for source_ref in images:
-                    local_ref = source_ref if is_local_registry_ref(registry, source_ref) else local_preload_ref(registry, source_ref)
-                    image_map[source_ref] = local_ref
-                    log(f"  importing {source_ref} from {local_ref}")
-                    machine_shell(machine, f"ctr --namespace k8s.io images pull --plain-http {local_ref}")
-                    if local_ref != source_ref:
-                        machine_shell(machine, f"ctr --namespace k8s.io images tag --force {local_ref} {source_ref}")
-
-                patch_kube_system_daemonset_images(image_map)
-                reset_offline_daemonset_pods()
-                return
-
-        if time.time() >= deadline:
-            die("timed out waiting for active nspawn machine to preload cluster images")
-
-        time.sleep(5)
-
-
 def is_plain_http_oci_ref(ref: str) -> bool:
     ref = ref.removeprefix("oci://")
     return (
@@ -2073,10 +2040,6 @@ def is_plain_http_oci_ref(ref: str) -> bool:
         or ref.startswith("localhost:")
         or ref.startswith("127.0.0.1:")
     )
-
-
-def is_local_registry_ref(registry: str, ref: str) -> bool:
-    return ref.removeprefix("oci://").startswith(registry + "/")
 
 
 def oci_registry_host(ref: str) -> str:
@@ -2445,10 +2408,8 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
         _run_scenario_command("block-external-network", node_config, env)
 
     _run_scenario_command("run-agent", node_config, env)
-    if node_config.block_external_network:
-        _run_scenario_command("preload-cluster-images", node_config, env)
 
-    wait_command = "wait-for-node-registered" if node_config.block_external_network else "wait-for-node"
+    wait_command = "wait-for-node"
     for command in (
         wait_command,
         "validate-node-config",
@@ -2458,7 +2419,8 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
         _run_scenario_command(command, node_config, env)
 
     if node_config.block_external_network:
-        log(f"Skipping workload and repave validation for blocked-network scenario {name!r}")
+        _run_scenario_command("validate-workload", node_config, env)
+        log(f"Skipping repave validation for blocked-network scenario {name!r}")
     else:
         for command in (
             "validate-workload",
@@ -2543,10 +2505,7 @@ def validate_node_config_scenarios() -> None:
     if failures:
         die("agent config scenario validation failed: " + "; ".join(failures))
 
-    if any(cfg.block_external_network for cfg in configs):
-        log("Skipping final kube-proxy validation because blocked-network scenarios may stay NotReady")
-    else:
-        validate_kube_proxy()
+    validate_kube_proxy()
 
 
 # ---------------------------------------------------------------------------
@@ -2786,7 +2745,7 @@ def validate_workload() -> None:
             "nodeName": AGENT_MACHINE_NAME,
             "containers": [{
                 "name": "hello",
-                "image": "busybox:1.36",
+                "image": E2E_WORKLOAD_IMAGE,
                 "command": ["sh", "-c", "echo 'Hello from unbounded agent node!' && sleep 3600"],
             }],
             "restartPolicy": "Never",
@@ -2869,7 +2828,7 @@ def validate_workload() -> None:
             "nodeName": AGENT_MACHINE_NAME,
             "containers": [{
                 "name": "dns",
-                "image": "busybox:1.36",
+                "image": E2E_WORKLOAD_IMAGE,
                 "command": ["sh", "-c",
                             "nslookup kubernetes.default.svc.cluster.local && echo 'DNS_OK'"],
             }],
@@ -3806,7 +3765,6 @@ COMMANDS: dict[str, Command] = {
     "prepare-blocked-network-vm": _without_node_config(prepare_blocked_network_vm),
     "block-external-network": _without_node_config(block_external_network),
     "unblock-external-network": _without_node_config(unblock_external_network),
-    "preload-cluster-images": _without_node_config(preload_cluster_images),
     "ensure-kind-bridge": _without_node_config(ensure_kind_bridge),
     "dump-persisted-agent-config": _without_node_config(dump_persisted_agent_config),
     "launch-vm": _without_node_config(launch_vm),
