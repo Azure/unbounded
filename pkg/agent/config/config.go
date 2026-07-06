@@ -54,6 +54,35 @@ type AgentConfig struct {
 	// should be exposed to the nspawn machine in addition to automatically
 	// discovered devices.
 	AdditionalHostDevices []string `json:"AdditionalHostDevices,omitempty"`
+
+	// OfflineArtifacts points to a complete offline binary artifact source.
+	// When set, it takes precedence over download overrides. Source is rendered
+	// as a strict Go template using the cluster Kubernetes version, then
+	// resolved as an absolute filesystem path, file:// URL, or oci:// artifact
+	// reference.
+	OfflineArtifacts *AgentOfflineArtifacts `json:"OfflineArtifacts,omitempty"`
+}
+
+// AgentOfflineArtifacts configures a complete offline source for binaries the
+// agent installs into the nspawn rootfs.
+type AgentOfflineArtifacts struct {
+	Source string `json:"Source,omitempty"`
+}
+
+// DeepCopy returns a copy of AgentOfflineArtifacts.
+func (a *AgentOfflineArtifacts) DeepCopy() *AgentOfflineArtifacts {
+	if a == nil {
+		return nil
+	}
+
+	out := *a
+
+	return &out
+}
+
+// OfflineArtifactsConfigured reports whether an offline artifact source is configured.
+func (a *AgentConfig) OfflineArtifactsConfigured() bool {
+	return a != nil && a.OfflineArtifacts != nil && strings.TrimSpace(a.OfflineArtifacts.Source) != ""
 }
 
 // BackfillNodeName resolves and stores the Kubernetes Node name once. An
@@ -115,6 +144,8 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
+
+	out.OfflineArtifacts = a.OfflineArtifacts.DeepCopy()
 
 	return &out
 }

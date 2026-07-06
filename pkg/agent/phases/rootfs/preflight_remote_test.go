@@ -8,12 +8,16 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
@@ -36,15 +40,15 @@ func TestRemoteArtifactSourcesOmitChecksums(t *testing.T) {
 
 	kubeSources, err := kubernetesArtifactSources(rootFS)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"kubelet", "kubectl", "kube-proxy"}, sourceNames(kubeSources))
+	assert.Equal(t, []string{"kube-proxy", "kubectl", "kubelet"}, sourceNames(kubeSources))
 
 	for _, source := range kubeSources {
-		assert.NotContains(t, source.http.url, ".sha256")
+		assert.NotContains(t, source.String(), ".sha256")
 	}
 
 	criSources, err := criArtifactSources(rootFS)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"containerd", "runc", "crictl"}, sourceNames(criSources))
+	assert.Equal(t, []string{"containerd", "crictl", "runc"}, sourceNames(criSources))
 
 	cniSources, err := cniArtifactSources(rootFS)
 	require.NoError(t, err)
@@ -86,25 +90,17 @@ func TestRemoteArtifactCheckerUsesHeadBeforeGet(t *testing.T) {
 }
 
 func TestRemoteArtifactCheckerCollectsAllFailures(t *testing.T) {
-	checker := remoteArtifactChecker{
-		log:        slog.New(slog.DiscardHandler),
-		name:       checkKubernetesArtifactsName,
-		target:     "kubernetes artifacts",
-		errMessage: "one or more required Kubernetes artifact sources are not reachable",
-		rootFS:     remoteRootFSGoalState(),
-		sources: func(*goalstates.RootFS) ([]remoteArtifactSource, error) {
-			return []remoteArtifactSource{
-				httpArtifactSource("kubelet", "kubernetes artifacts", "https://example.invalid/kubelet"),
-				httpArtifactSource("kubectl", "kubernetes artifacts", "https://example.invalid/kubectl"),
-				httpArtifactSource("kube-proxy", "kubernetes artifacts", "https://example.invalid/kube-proxy"),
+	checker := artifactsource.ReachabilityChecker{
+		Log:        slog.New(slog.DiscardHandler),
+		CheckName:  checkKubernetesArtifactsName,
+		Target:     "kubernetes artifacts",
+		ErrMessage: "one or more required Kubernetes artifact sources are not reachable",
+		Sources: func() (artifactsource.Sources, error) {
+			return artifactsource.Sources{
+				"kubelet":    mustDownloadSource(t, filepath.Join(t.TempDir(), "missing-kubelet")),
+				"kubectl":    mustDownloadSource(t, writeProbeSource(t)),
+				"kube-proxy": mustDownloadSource(t, filepath.Join(t.TempDir(), "missing-kube-proxy")),
 			}, nil
-		},
-		probe: func(_ context.Context, source remoteArtifactSource) error {
-			if source.name == "kubectl" {
-				return nil
-			}
-
-			return assert.AnError
 		},
 	}
 
@@ -112,9 +108,9 @@ func TestRemoteArtifactCheckerCollectsAllFailures(t *testing.T) {
 
 	require.Len(t, results, 2)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
-	assert.Contains(t, results[0].Message, "kubelet")
+	assert.Contains(t, results[0].Message, "kube-proxy")
 	assert.Equal(t, preflight.SeverityError, results[1].Severity)
-	assert.Contains(t, results[1].Message, "kube-proxy")
+	assert.Contains(t, results[1].Message, "kubelet")
 }
 
 func TestRemoteArtifactCheckerRedactsFailedURL(t *testing.T) {
@@ -150,12 +146,33 @@ func TestCheckOCIImageReachableRequiresImage(t *testing.T) {
 	assert.Equal(t, "OCI rootfs image is required but no image was selected", results[0].Message)
 }
 
-func sourceNames(sources []remoteArtifactSource) []string {
-	names := make([]string, 0, len(sources))
-	for _, source := range sources {
-		names = append(names, source.name)
+func writeProbeSource(t *testing.T) string {
+	t.Helper()
 
-		if source.http != nil && strings.Contains(source.http.url, ".sha256") {
+	path := filepath.Join(t.TempDir(), "artifact")
+	require.NoError(t, os.WriteFile(path, []byte("ok"), 0o644))
+
+	return path
+}
+
+func mustDownloadSource(t *testing.T, source string) artifactsource.Source {
+	t.Helper()
+
+	parsed, err := artifactsource.Parse(source)
+	require.NoError(t, err)
+
+	return parsed
+}
+
+func sourceNames(sources artifactsource.Sources) []string {
+	names := make([]string, 0, len(sources))
+	for name := range sources {
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+	for _, source := range sources {
+		if strings.Contains(source.String(), ".sha256") {
 			names = append(names, "unexpected-checksum")
 		}
 	}

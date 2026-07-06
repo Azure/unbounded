@@ -143,9 +143,13 @@ func TestCrictlDownloadURL(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := crictlDownloadURL(testCase.override, testCase.version, testCase.hostOS, testCase.hostArch)
-			if got != testCase.want {
-				t.Fatalf("got URL %q, want %q", got, testCase.want)
+			got, err := crictlDownloadURL(testCase.override, testCase.version, testCase.hostOS, testCase.hostArch)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if got.String() != testCase.want {
+				t.Fatalf("got URL %q, want %q", got.String(), testCase.want)
 			}
 		})
 	}
@@ -237,9 +241,13 @@ func TestKubernetesBinaryURL(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := kubernetesBinaryURL(testCase.override, testCase.version, testCase.arch, testCase.binary)
-			if got != testCase.want {
-				t.Fatalf("got URL %q, want %q", got, testCase.want)
+			got, err := kubernetesBinaryURL(testCase.override, testCase.version, testCase.arch, testCase.binary)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if got.String() != testCase.want {
+				t.Fatalf("got URL %q, want %q", got.String(), testCase.want)
 			}
 		})
 	}
