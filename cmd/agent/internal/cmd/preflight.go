@@ -77,20 +77,25 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("validate agent config: %w", err)
 	}
 
+	downloads, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(cfg)
+	if err != nil {
+		return fmt.Errorf("resolve download overrides: %w", err)
+	}
+
 	goalState, err := goalstates.ResolveMachine(
 		logger,
 		&cfg.AgentConfig,
 		goalstates.NSpawnMachineKube1,
-		provision.ResolveDownloadOverrides(cfg.Downloads),
+		downloads,
 	)
 	if err != nil {
 		return fmt.Errorf("resolve goal state: %w", err)
 	}
 
 	checks := preflight.Flatten(
-		host.Preflight(logger, cfg, goalState),
-		nodestart.Preflight(logger, cfg, goalState),
-		rootfs.Preflight(logger, cfg, goalState),
+		host.Preflight(logger, cfg.AgentConfig, goalState),
+		nodestart.Preflight(logger, cfg.AgentConfig, goalState),
+		rootfs.Preflight(logger, cfg.AgentConfig, goalState),
 	)
 
 	opts := preflight.Options{

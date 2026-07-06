@@ -211,7 +211,12 @@ func (nspawnNodeOperator) RepaveNode(
 	)
 
 	// Resolve goal states for the new machine.
-	gs, err := goalstates.ResolveMachine(log, &newCfg.AgentConfig, newMachine, provision.ResolveDownloadOverrides(newCfg.Downloads))
+	downloads, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(newCfg)
+	if err != nil {
+		return fmt.Errorf("resolve download overrides: %w", err)
+	}
+
+	gs, err := goalstates.ResolveMachine(log, &newCfg.AgentConfig, newMachine, downloads)
 	if err != nil {
 		return fmt.Errorf("resolve machine goal state: %w", err)
 	}
