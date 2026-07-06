@@ -1941,11 +1941,22 @@ def mirror_oci_refs_to_local_registry(configs: list[NodeConfig]) -> list[NodeCon
 
 
 def build_e2e_offline_artifact_bundle(registry: str, cluster_images: list[str]) -> str:
-    """Build and push an e2e offline artifact bundle with cluster and workload images."""
-    kube_version = kubernetes_server_version()
+    """Build and push e2e offline bundles for bootstrap and repave versions."""
+    current_version = kubernetes_server_version()
+    target_version = _next_patch_version(current_version)
+
+    build_agent_artifacts_builder()
+    for kube_version in (current_version, target_version):
+        build_one_e2e_offline_artifact_bundle(registry, kube_version, cluster_images)
+
+    return f"oci://{registry}/unbounded/bootstrap-artifacts:e2e-k8s-{{{{ .KubernetesVersionNoV }}}}"
+
+
+def build_one_e2e_offline_artifact_bundle(registry: str, kube_version: str, cluster_images: list[str]) -> str:
+    """Build and push one e2e offline artifact bundle version."""
     image_refs = e2e_offline_container_images(kube_version, cluster_images)
     output_dir = VM_DIR / "offline-bootstrap-artifacts-e2e" / kube_version
-    manifest_path = VM_DIR / "offline-bootstrap-manifest-e2e.json"
+    manifest_path = VM_DIR / f"offline-bootstrap-manifest-e2e-{kube_version}.json"
     local_ref = f"oci://{registry}/unbounded/bootstrap-artifacts:e2e-k8s-{kube_version.removeprefix('v')}"
 
     if output_dir.exists():
@@ -1953,9 +1964,7 @@ def build_e2e_offline_artifact_bundle(registry: str, cluster_images: list[str]) 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(offline_artifact_manifest(kube_version, image_refs), indent=2))
 
-    build_agent_artifacts_builder()
-
-    log("Building e2e offline artifact bundle with cluster and workload images:")
+    log(f"Building e2e offline artifact bundle for Kubernetes {kube_version} with cluster and workload images:")
     for image in image_refs:
         log(f"  {image}")
 
@@ -2418,15 +2427,11 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
     ):
         _run_scenario_command(command, node_config, env)
 
-    if node_config.block_external_network:
-        _run_scenario_command("validate-workload", node_config, env)
-        log(f"Skipping repave validation for blocked-network scenario {name!r}")
-    else:
-        for command in (
-            "validate-workload",
-            "validate-node-repave-upgrade",
-        ):
-            _run_scenario_command(command, node_config, env)
+    for command in (
+        "validate-workload",
+        "validate-node-repave-upgrade",
+    ):
+        _run_scenario_command(command, node_config, env)
 
     log(f"Agent config scenario {name!r} passed")
 
