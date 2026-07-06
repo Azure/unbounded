@@ -66,43 +66,58 @@ func (d *downloadKubeBinaries) Do(ctx context.Context) error {
 	eg, ctx := errgroup.WithContext(ctx)
 
 	if needsKubeBinaries {
-		d.enqueueKubernetesBinaryDownloads(ctx, eg, kubeOverride, kubernetesVersion, arch, destDir)
+		if err := d.enqueueKubernetesBinaryDownloads(ctx, eg, kubeOverride, kubernetesVersion, arch, destDir); err != nil {
+			return err
+		}
 	}
 
 	if needsCrictl {
-		d.enqueueCrictlDownload(ctx, eg, crictlOverride, crictlVersion, arch, destDir)
+		if err := d.enqueueCrictlDownload(ctx, eg, crictlOverride, crictlVersion, arch, destDir); err != nil {
+			return err
+		}
 	}
 
 	return eg.Wait()
 }
 
-func (d *downloadKubeBinaries) enqueueKubernetesBinaryDownloads(ctx context.Context, eg *errgroup.Group, override *goalstates.DownloadSource, kubernetesVersion, arch, destDir string) {
+func (d *downloadKubeBinaries) enqueueKubernetesBinaryDownloads(ctx context.Context, eg *errgroup.Group, override *goalstates.DownloadSource, kubernetesVersion, arch, destDir string) error {
 	for _, binary := range requiredKubeBinaries {
-		binaryURL := kubernetesBinaryURL(override, kubernetesVersion, arch, binary)
-		checksumURL := kubernetesBinaryURL(override, kubernetesVersion, arch, binary) + ".sha256"
+		binaryURL, err := kubernetesBinaryURL(override, kubernetesVersion, arch, binary)
+		if err != nil {
+			return fmt.Errorf("resolve kubernetes binary download source %q: %w", binary, err)
+		}
+
 		targetFilePath := filepath.Join(destDir, binary)
 
-		eg.Go(d.downloadBinary(ctx, binary, binaryURL, checksumURL, targetFilePath))
+		eg.Go(d.downloadBinary(ctx, binary, binaryURL, targetFilePath))
 	}
+
+	return nil
 }
 
-func (d *downloadKubeBinaries) enqueueCrictlDownload(ctx context.Context, eg *errgroup.Group, override *goalstates.DownloadSource, crictlVersion, arch, destDir string) {
-	downloadURL := crictlDownloadURL(override, crictlVersion, runtime.GOOS, arch)
+func (d *downloadKubeBinaries) enqueueCrictlDownload(ctx context.Context, eg *errgroup.Group, override *goalstates.DownloadSource, crictlVersion, arch, destDir string) error {
+	downloadURL, err := crictlDownloadURL(override, crictlVersion, runtime.GOOS, arch)
+	if err != nil {
+		return fmt.Errorf("resolve crictl download source: %w", err)
+	}
+
 	targetFilePath := filepath.Join(destDir, "crictl")
 	eg.Go(d.downloadCrictlBinary(ctx, downloadURL, targetFilePath))
+
+	return nil
 }
 
 // downloadBinary returns a function that downloads a single Kubernetes binary,
 // verifies its SHA256 checksum, and logs the duration of the download.
-func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary, binaryURL, checksumURL, targetFilePath string) func() error {
+func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary string, binaryURL downloadSource, targetFilePath string) func() error {
 	return func() error {
-		logger := d.log.With("binary", binary, "url", binaryURL)
+		logger := d.log.With("binary", binary, "url", binaryURL.String())
 
 		logger.Info("downloading kubernetes binary")
 
 		start := time.Now()
 
-		if err := downloadWithSHA256Verification(ctx, binaryURL, checksumURL, targetFilePath, 0o755); err != nil {
+		if err := binaryURL.downloadWithSHA256Verification(ctx, binaryURL.checksumSource(), targetFilePath, 0o755); err != nil {
 			logger.Error("download failed", "error", err)
 			return fmt.Errorf("download kubernetes binary %q: %w", binary, err)
 		}
@@ -114,16 +129,16 @@ func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary, binar
 }
 
 // downloadCrictlBinary returns a function that downloads the crictl tarball and installs the crictl binary.
-func (d *downloadKubeBinaries) downloadCrictlBinary(ctx context.Context, downloadURL, targetFilePath string) func() error {
+func (d *downloadKubeBinaries) downloadCrictlBinary(ctx context.Context, downloadURL downloadSource, targetFilePath string) func() error {
 	return func() error {
-		logger := d.log.With("binary", "crictl", "url", downloadURL)
+		logger := d.log.With("binary", "crictl", "url", downloadURL.String())
 
 		logger.Info("downloading cri-tools binary")
 
 		start := time.Now()
 		found := false
 
-		for tarFile, err := range decompressTarGzFromRemote(ctx, downloadURL) {
+		for tarFile, err := range downloadURL.decompressTarGz(ctx) {
 			if err != nil {
 				logger.Error("download failed", "error", err)
 				return fmt.Errorf("download crictl archive: %w", err)
@@ -144,7 +159,7 @@ func (d *downloadKubeBinaries) downloadCrictlBinary(ctx context.Context, downloa
 		}
 
 		if !found {
-			return fmt.Errorf("crictl binary not found in archive %q", downloadURL)
+			return fmt.Errorf("crictl binary not found in archive %q", downloadURL.String())
 		}
 
 		logger.Info("downloaded cri-tools binary", "duration", time.Since(start))
@@ -227,13 +242,13 @@ func crictlVersionForKubernetesVersion(kubernetesVersion string) (string, error)
 
 // kubernetesBinaryURL resolves the download URL for a kubernetes binary
 // (kubelet, kubectl, kube-proxy) honoring the optional override.
-func kubernetesBinaryURL(override *goalstates.DownloadSource, version, arch, binary string) string {
-	return agentartifacts.KubernetesBinary(override, version, arch, binary)
+func kubernetesBinaryURL(override *goalstates.DownloadSource, version, arch, binary string) (downloadSource, error) {
+	return parseDownloadSource(agentartifacts.KubernetesBinary(override, version, arch, binary))
 }
 
 // crictlDownloadURL resolves the cri-tools crictl tarball URL honoring
 // the optional override. Mirrors must publish assets under the same
 // <base>/v<ver>/<asset> layout as GitHub releases.
-func crictlDownloadURL(override *goalstates.DownloadSource, version, hostOS, hostArch string) string {
-	return agentartifacts.CrictlArchive(override, version, hostOS, hostArch)
+func crictlDownloadURL(override *goalstates.DownloadSource, version, hostOS, hostArch string) (downloadSource, error) {
+	return parseDownloadSource(agentartifacts.CrictlArchive(override, version, hostOS, hostArch))
 }

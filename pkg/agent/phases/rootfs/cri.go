@@ -50,8 +50,15 @@ func (d *downloadCRIBinaries) Do(ctx context.Context) error {
 	containerdVersion := downloadSourceVersion(d.goalState.ContainerdVersion, containerdOverride)
 	runcVersion := downloadSourceVersion(d.goalState.RunCVersion, runcOverride)
 
-	containerdURL := containerdDownloadURL(containerdOverride, containerdVersion, d.goalState.HostArch)
-	runcURL := runcDownloadURL(runcOverride, runcVersion, d.goalState.HostArch)
+	containerdURL, err := containerdDownloadURL(containerdOverride, containerdVersion, d.goalState.HostArch)
+	if err != nil {
+		return fmt.Errorf("resolve containerd download source: %w", err)
+	}
+
+	runcURL, err := runcDownloadURL(runcOverride, runcVersion, d.goalState.HostArch)
+	if err != nil {
+		return fmt.Errorf("resolve runc download source: %w", err)
+	}
 
 	if !containerdVersionMatch(ctx, d.log, destDir, containerdVersion) {
 		if err := downloadContainerd(ctx, containerdURL, destDir); err != nil {
@@ -72,19 +79,19 @@ func (d *downloadCRIBinaries) Do(ctx context.Context) error {
 // honoring BaseURL / URL overrides. The upstream path-and-filename layout
 // (containerd-<ver>-linux-<arch>.tar.gz) is preserved so mirrors must
 // publish under the same structure.
-func containerdDownloadURL(override *goalstates.DownloadSource, version, arch string) string {
-	return agentartifacts.ContainerdArchive(override, version, arch)
+func containerdDownloadURL(override *goalstates.DownloadSource, version, arch string) (downloadSource, error) {
+	return parseDownloadSource(agentartifacts.ContainerdArchive(override, version, arch))
 }
 
 // runcDownloadURL resolves the runc binary URL, honoring BaseURL / URL
 // overrides. The upstream filename (runc.<arch>) is preserved.
-func runcDownloadURL(override *goalstates.DownloadSource, version, arch string) string {
-	return agentartifacts.RuncBinary(override, version, arch)
+func runcDownloadURL(override *goalstates.DownloadSource, version, arch string) (downloadSource, error) {
+	return parseDownloadSource(agentartifacts.RuncBinary(override, version, arch))
 }
 
 // downloadContainerd downloads and extracts containerd binaries from a tar.gz archive.
-func downloadContainerd(ctx context.Context, downloadURL, destDir string) error {
-	for tarFile, err := range decompressTarGzFromRemote(ctx, downloadURL) {
+func downloadContainerd(ctx context.Context, downloadURL downloadSource, destDir string) error {
+	for tarFile, err := range downloadURL.decompressTarGz(ctx) {
 		if err != nil {
 			return fmt.Errorf("decompress containerd tar: %w", err)
 		}
@@ -105,9 +112,9 @@ func downloadContainerd(ctx context.Context, downloadURL, destDir string) error 
 }
 
 // downloadRunc downloads the runc binary directly.
-func downloadRunc(ctx context.Context, downloadURL, destDir string) error {
+func downloadRunc(ctx context.Context, downloadURL downloadSource, destDir string) error {
 	runcPath := filepath.Join(destDir, "runc")
-	if err := downloadToLocalFile(ctx, downloadURL, runcPath, 0o755); err != nil {
+	if err := downloadURL.downloadToLocalFile(ctx, runcPath, 0o755); err != nil {
 		return fmt.Errorf("download runc: %w", err)
 	}
 

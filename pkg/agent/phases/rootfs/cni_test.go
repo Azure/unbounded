@@ -46,9 +46,13 @@ func TestCNIDownloadURL(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := cniDownloadURL(testCase.override, testCase.version, testCase.arch)
-			if got != testCase.want {
-				t.Fatalf("got URL %q, want %q", got, testCase.want)
+			got, err := cniDownloadURL(testCase.override, testCase.version, testCase.arch)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if got.String() != testCase.want {
+				t.Fatalf("got URL %q, want %q", got.String(), testCase.want)
 			}
 		})
 	}
