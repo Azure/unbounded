@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"text/template"
 
 	"github.com/Azure/unbounded/internal/executil"
@@ -150,19 +151,61 @@ func (s *startContainerd) Do(ctx context.Context) error {
 func (i *importContainerImages) Name() string { return "import-container-images" }
 
 func (i *importContainerImages) Do(ctx context.Context) error {
-	if _, err := executil.MachineRun(ctx, i.log, i.goalState.MachineName,
-		"sh", "-c", fmt.Sprintf(`
-set -eu
-for archive in %s/*.tar; do
-    [ -e "$archive" ] || exit 0
-    ctr --namespace k8s.io images import "$archive"
-done
-`, goalstates.ContainerImageArchiveDir),
-	); err != nil {
-		return fmt.Errorf("import container image archives in %s: %w", i.goalState.MachineName, err)
+	archives, err := stagedContainerImageArchives(goalstates.ContainerImageArchiveHostDir)
+	if err != nil {
+		return err
+	}
+
+	for _, archive := range archives {
+		i.log.Info("importing container image archive",
+			"archive", archive.machinePath,
+			"host_archive", archive.hostPath,
+		)
+
+		if _, err := executil.MachineRun(ctx, i.log, i.goalState.MachineName,
+			"ctr", "--namespace", "k8s.io", "images", "import", archive.machinePath,
+		); err != nil {
+			return fmt.Errorf("import container image archive %s in %s: %w", archive.machinePath, i.goalState.MachineName, err)
+		}
+
+		i.log.Info("imported container image archive", "archive", archive.machinePath)
 	}
 
 	return nil
+}
+
+type stagedContainerImageArchive struct {
+	hostPath    string
+	machinePath string
+}
+
+func stagedContainerImageArchives(hostDir string) ([]stagedContainerImageArchive, error) {
+	entries, err := os.ReadDir(hostDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("read staged container image archive directory %s: %w", hostDir, err)
+	}
+
+	archives := make([]stagedContainerImageArchive, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".tar" {
+			continue
+		}
+
+		archives = append(archives, stagedContainerImageArchive{
+			hostPath:    filepath.Join(hostDir, entry.Name()),
+			machinePath: filepath.Join(goalstates.ContainerImageArchiveDir, entry.Name()),
+		})
+	}
+
+	sort.Slice(archives, func(i, j int) bool {
+		return archives[i].machinePath < archives[j].machinePath
+	})
+
+	return archives, nil
 }
 
 // ensureDropInConfig writes or removes a containerd drop-in config file in the
