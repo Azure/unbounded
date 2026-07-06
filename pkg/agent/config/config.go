@@ -69,6 +69,17 @@ type AgentOfflineArtifacts struct {
 	Source string `json:"Source,omitempty"`
 }
 
+// DeepCopy returns a copy of AgentOfflineArtifacts.
+func (a *AgentOfflineArtifacts) DeepCopy() *AgentOfflineArtifacts {
+	if a == nil {
+		return nil
+	}
+
+	out := *a
+
+	return &out
+}
+
 // BackfillNodeName resolves and stores the Kubernetes Node name once. An
 // explicit NodeName wins when set. Otherwise, a valid host hostname wins, then
 // MachineName is used as the final fallback.
@@ -129,9 +140,7 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
 
-	if a.OfflineArtifacts != nil {
-		out.OfflineArtifacts = &AgentOfflineArtifacts{Source: a.OfflineArtifacts.Source}
-	}
+	out.OfflineArtifacts = a.OfflineArtifacts.DeepCopy()
 
 	return &out
 }

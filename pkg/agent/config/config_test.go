@@ -253,6 +253,26 @@ func TestAgentConfig_DeepCopyNil(t *testing.T) {
 	require.Nil(t, original.DeepCopy())
 }
 
+func TestAgentOfflineArtifacts_DeepCopy(t *testing.T) {
+	t.Parallel()
+
+	original := &AgentOfflineArtifacts{Source: "oci://registry.example.com/unbounded/bootstrap-artifacts:v1"}
+
+	copy := original.DeepCopy()
+	require.NotSame(t, original, copy)
+	require.Equal(t, original, copy)
+
+	copy.Source = "file:///opt/unbounded/artifacts"
+	require.Equal(t, "oci://registry.example.com/unbounded/bootstrap-artifacts:v1", original.Source)
+}
+
+func TestAgentOfflineArtifacts_DeepCopyNil(t *testing.T) {
+	t.Parallel()
+
+	var original *AgentOfflineArtifacts
+	require.Nil(t, original.DeepCopy())
+}
+
 func TestAgentConfig_BackfillNodeName(t *testing.T) {
 	t.Parallel()
 
