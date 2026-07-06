@@ -15,7 +15,7 @@ import (
 	"syscall"
 
 	"github.com/Azure/unbounded/internal/executil"
-	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
@@ -69,10 +69,10 @@ func (c simpleHostChecker) Check(ctx context.Context) []preflight.Result { retur
 
 // Preflight returns the standard host environment checks required before
 // provisioning an nspawn machine.
-func Preflight(log *slog.Logger, _ *provision.UnboundedAgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
+func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
 	return []preflight.Checker{
 		CheckIsPrivilegedUser(log),
-		CheckHostPackages(log),
+		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), defaultHostCheckDeps()),
 		CheckHostOSConfiguration(log),
 		CheckNSpawnRuntime(log),
 		CheckDockerActive(log),
@@ -103,10 +103,10 @@ func checkIsPrivilegedUser(log *slog.Logger, deps hostCheckDeps) preflight.Check
 
 // CheckHostPackages verifies all required host packages are already installed.
 func CheckHostPackages(log *slog.Logger) preflight.Checker {
-	return checkHostPackages(log, defaultHostCheckDeps())
+	return checkHostPackages(log, false, defaultHostCheckDeps())
 }
 
-func checkHostPackages(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+func checkHostPackages(log *slog.Logger, failMissing bool, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkHostPackagesName, check: func(ctx context.Context) []preflight.Result {
 		pm, err := deps.detectPackageManager(deps.lookupPath)
 		if err != nil {
@@ -129,9 +129,6 @@ func checkHostPackages(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 
 		for _, pkg := range pm.requiredPackages {
 			if !pm.installed(ctx, log, pkg) {
-				// TODO: when offline mode is configured, missing required host
-				// packages should be reported as an error because bootstrap cannot
-				// rely on package source access to remediate them.
 				missing = append(missing, pkg)
 			}
 		}
@@ -139,9 +136,15 @@ func checkHostPackages(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
 		if len(missing) > 0 {
 			log.Debug("required host packages are missing", "packages", strings.Join(missing, ","))
 
-			// TODO: when offline mode is configured, missing required host
-			// packages should be reported as an error because bootstrap cannot
-			// rely on package source access to remediate them.
+			if failMissing {
+				return preflight.ResultsError(
+					checkHostPackagesName,
+					"host packages",
+					"required host packages are missing and cannot be installed automatically when OfflineArtifacts is configured: %s",
+					strings.Join(missing, ", "),
+				)
+			}
+
 			return preflight.ResultsWarning(
 				checkHostPackagesName,
 				"host packages",
