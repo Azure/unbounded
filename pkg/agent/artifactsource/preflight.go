@@ -17,6 +17,9 @@ import (
 type Sources map[string]Source
 
 // ReachabilityChecker checks that a set of artifact sources is reachable.
+// Sources must be set. Source names returned by Sources are included in
+// preflight output, so they must be redacted labels rather than raw source
+// strings.
 type ReachabilityChecker struct {
 	Log        *slog.Logger
 	CheckName  string
