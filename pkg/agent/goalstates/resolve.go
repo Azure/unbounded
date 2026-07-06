@@ -34,21 +34,9 @@ type MachineGoalState struct {
 
 // ResolveMachine probes the host (kernel version, hostname, GPU hardware) and
 // resolves the complete goal state for the named nspawn machine from an agent
-// config.
+// config and caller-provided download overrides.
 func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
 	sandboxImage := cfg.CRI.Containerd.SandboxImage
-
-	var offlineArtifacts *ResolvedOfflineArtifacts
-
-	if cfg.OfflineArtifacts != nil && strings.TrimSpace(cfg.OfflineArtifacts.Source) != "" {
-		resolved, err := resolveOfflineArtifacts(cfg, cfg.OfflineArtifacts)
-		if err != nil {
-			return nil, fmt.Errorf("resolve bootstrap artifact sources: %w", err)
-		}
-
-		offlineArtifacts = resolved
-		downloads = downloadOverridesFromOfflineArtifacts(resolved.SourceRoot, resolved.Manifest)
-	}
 
 	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
 		return nil, err
@@ -93,15 +81,6 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		cniVersion = CNIPluginVersion
 	}
 
-	containerImageArchiveURLs := []string(nil)
-	if offlineArtifacts != nil {
-		containerImageArchiveURLs = containerImageArchiveURLsFromOfflineArtifacts(
-			offlineArtifacts.SourceRoot,
-			offlineArtifacts.Manifest,
-			runtime.GOARCH,
-		)
-	}
-
 	rootFS := &RootFS{
 		MachineDir: filepath.Join("/var/lib/machines", machineName),
 		NSpawnConfigFile: filepath.Join(
@@ -113,19 +92,18 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 			fmt.Sprintf("systemd-nspawn@%s.service.d", machineName),
 			"override.conf",
 		),
-		HostArch:                  runtime.GOARCH,
-		HostKernel:                kernel,
-		Hostname:                  hostname,
-		ContainerdVersion:         containerdVersion,
-		RunCVersion:               runcVersion,
-		CNIPluginVersion:          cniVersion,
-		KubernetesVersion:         cfg.Cluster.Version,
-		Downloads:                 downloads,
-		ContainerImageArchiveURLs: containerImageArchiveURLs,
-		OCIImage:                  ociImage,
-		Nvidia:                    nvidia,
-		AMD:                       amd,
-		HostDevices:               DiscoverHostDevices(cfg.AdditionalHostDevices),
+		HostArch:          runtime.GOARCH,
+		HostKernel:        kernel,
+		Hostname:          hostname,
+		ContainerdVersion: containerdVersion,
+		RunCVersion:       runcVersion,
+		CNIPluginVersion:  cniVersion,
+		KubernetesVersion: cfg.Cluster.Version,
+		Downloads:         downloads,
+		OCIImage:          ociImage,
+		Nvidia:            nvidia,
+		AMD:               amd,
+		HostDevices:       DiscoverHostDevices(cfg.AdditionalHostDevices),
 	}
 
 	nodeStart := &NodeStart{

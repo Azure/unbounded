@@ -61,6 +61,18 @@ type ResolvedOfflineArtifacts struct {
 	Manifest   OfflineArtifactManifest
 }
 
+// ContainerImageArchiveStaging describes host-side staged container image archives.
+type ContainerImageArchiveStaging struct {
+	// HostDir is the source-specific host directory containing staged archives.
+	HostDir string
+	// URLs lists archive sources to download into HostDir.
+	URLs []string
+}
+
+func emptyContainerImageArchiveStaging() *ContainerImageArchiveStaging {
+	return &ContainerImageArchiveStaging{HostDir: filepath.Join(ContainerImageArchiveHostSourceDir, "empty")}
+}
+
 func resolveOfflineArtifacts(cfg *config.AgentConfig, offline *config.AgentOfflineArtifacts) (*ResolvedOfflineArtifacts, error) {
 	if offline == nil || strings.TrimSpace(offline.Source) == "" {
 		return nil, errors.New("OfflineArtifacts.Source is required")
@@ -287,11 +299,35 @@ func verifyOCIArtifacts(sourceRoot string, paths []string) error {
 	return errors.Join(errs...)
 }
 
-func downloadOverridesFromOfflineArtifacts(sourceRoot string, manifest OfflineArtifactManifest) *DownloadOverrides {
-	rootURL := offlineArtifactURLRoot(sourceRoot)
+// ResolveDownloadOverridesWithOfflineArtifacts resolves AgentConfig.OfflineArtifacts
+// and returns download overrides plus container image archive staging metadata
+// that point at the offline artifact source. When OfflineArtifacts is not
+// configured, the input downloads are returned unchanged and no archive staging
+// is returned.
+func ResolveDownloadOverridesWithOfflineArtifacts(cfg *config.AgentConfig, downloads *DownloadOverrides) (*DownloadOverrides, *ContainerImageArchiveStaging, error) {
+	if cfg == nil || cfg.OfflineArtifacts == nil || strings.TrimSpace(cfg.OfflineArtifacts.Source) == "" {
+		return downloads, emptyContainerImageArchiveStaging(), nil
+	}
+
+	resolved, err := resolveOfflineArtifacts(cfg, cfg.OfflineArtifacts)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve bootstrap artifact sources: %w", err)
+	}
+
+	staging := &ContainerImageArchiveStaging{
+		HostDir: containerImageArchiveHostDir(resolved.SourceRoot),
+		URLs:    containerImageArchiveURLsFromOfflineArtifacts(resolved, runtime.GOARCH),
+	}
+
+	return downloadOverridesFromOfflineArtifacts(resolved), staging, nil
+}
+
+func downloadOverridesFromOfflineArtifacts(offlineArtifacts *ResolvedOfflineArtifacts) *DownloadOverrides {
+	manifest := offlineArtifacts.Manifest
+	rootURL := offlineArtifactURLRoot(offlineArtifacts.SourceRoot)
 
 	separator := "/"
-	if strings.HasPrefix(sourceRoot, "oci://") {
+	if strings.HasPrefix(offlineArtifacts.SourceRoot, "oci://") {
 		separator = "#"
 	}
 
@@ -321,20 +357,58 @@ func downloadOverridesFromOfflineArtifacts(sourceRoot string, manifest OfflineAr
 	return overrides
 }
 
-func containerImageArchiveURLsFromOfflineArtifacts(sourceRoot string, manifest OfflineArtifactManifest, arch string) []string {
-	rootURL := offlineArtifactURLRoot(sourceRoot)
+func containerImageArchiveURLsFromOfflineArtifacts(offlineArtifacts *ResolvedOfflineArtifacts, arch string) []string {
+	if offlineArtifacts == nil {
+		return []string{}
+	}
+
+	rootURL := offlineArtifactURLRoot(offlineArtifacts.SourceRoot)
 
 	separator := "/"
-	if strings.HasPrefix(sourceRoot, "oci://") {
+	if strings.HasPrefix(offlineArtifacts.SourceRoot, "oci://") {
 		separator = "#"
 	}
 
-	urls := make([]string, 0, len(manifest.ContainerImages))
-	for _, imageTag := range manifest.ContainerImages {
+	urls := make([]string, 0, len(offlineArtifacts.Manifest.ContainerImages))
+	for _, imageTag := range offlineArtifacts.Manifest.ContainerImages {
 		urls = append(urls, rootURL+separator+offlineContainerImageArchivePath(arch, imageTag))
 	}
 
 	return urls
+}
+
+func containerImageArchiveHostDir(sourceRoot string) string {
+	return filepath.Join(ContainerImageArchiveHostSourceDir, containerImageArchiveSourceKey(sourceRoot))
+}
+
+func containerImageArchiveSourceKey(sourceRoot string) string {
+	var b strings.Builder
+
+	for _, r := range strings.ToLower(sourceRoot) {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+
+	prefix := strings.Trim(b.String(), "-")
+	if len(prefix) > 80 {
+		prefix = strings.TrimRight(prefix[:80], "-")
+	}
+
+	if prefix == "" {
+		prefix = "source"
+	}
+
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(sourceRoot)))[:12]
+
+	return prefix + "-" + hash
 }
 
 func offlineArtifactURLRoot(sourceRoot string) string {

@@ -77,11 +77,16 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("validate agent config: %w", err)
 	}
 
+	downloads, _, err := goalstates.ResolveDownloadOverridesWithOfflineArtifacts(&cfg.AgentConfig, provision.ResolveDownloadOverrides(cfg.Downloads))
+	if err != nil {
+		return fmt.Errorf("resolve download overrides: %w", err)
+	}
+
 	goalState, err := goalstates.ResolveMachine(
 		logger,
 		&cfg.AgentConfig,
 		goalstates.NSpawnMachineKube1,
-		provision.ResolveDownloadOverrides(cfg.Downloads),
+		downloads,
 	)
 	if err != nil {
 		return fmt.Errorf("resolve goal state: %w", err)

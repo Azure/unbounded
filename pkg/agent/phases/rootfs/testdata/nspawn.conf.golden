@@ -27,3 +27,5 @@ BindReadOnly=/lib/modules
 # Bind this machine's private bpffs so eBPF CNIs can create and share BPF maps
 # without seeing pins from other nspawn machines.
 Bind=/run/bpffs/kube1:/sys/fs/bpf
+# Bind staged offline container image archives read-only into the container.
+BindReadOnly=/var/lib/unbounded/container-images/current:/var/lib/unbounded/container-images

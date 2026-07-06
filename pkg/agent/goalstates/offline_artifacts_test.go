@@ -15,7 +15,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
-func TestResolveMachineUsesAgentConfigOfflineArtifacts(t *testing.T) {
+func TestResolveDownloadOverridesWithOfflineArtifacts(t *testing.T) {
 	root := writeGoalStateOfflineBundle(t, OfflineArtifactManifest{
 		Versions: OfflineArtifactVersions{
 			Kubernetes: "v1.34.2",
@@ -27,7 +27,7 @@ func TestResolveMachineUsesAgentConfigOfflineArtifacts(t *testing.T) {
 		ContainerImages: []string{SandboxImage, KubeProxyImage("v1.34.2")},
 	})
 
-	got, err := ResolveMachine(discardLogger(), &config.AgentConfig{
+	cfg := &config.AgentConfig{
 		MachineName: "machine-1",
 		NodeName:    "node-1",
 		Cluster: config.AgentClusterConfig{
@@ -41,18 +41,44 @@ func TestResolveMachineUsesAgentConfigOfflineArtifacts(t *testing.T) {
 		OfflineArtifacts: &config.AgentOfflineArtifacts{
 			Source: root,
 		},
-	}, "kube1", &DownloadOverrides{
+	}
+
+	downloads, containerImageArchives, err := ResolveDownloadOverridesWithOfflineArtifacts(cfg, &DownloadOverrides{
 		Runc: &DownloadSource{BaseURL: "https://ignored.example.test/runc"},
 	})
-
 	require.NoError(t, err)
-	require.NotNil(t, got.RootFS.Downloads)
-	require.Equal(t, "1.5.0", got.RootFS.Downloads.Runc.Version)
-	require.Contains(t, got.RootFS.Downloads.Runc.URL, "file://")
-	require.NotContains(t, got.RootFS.Downloads.Runc.URL, "ignored")
+	require.NotNil(t, downloads)
+	assertOfflineArtifactDownloads(t, downloads)
+	require.NotNil(t, containerImageArchives)
+	require.Contains(t, containerImageArchives.HostDir, ContainerImageArchiveHostSourceDir)
+	require.Len(t, containerImageArchives.URLs, 2)
+	require.Contains(t, containerImageArchives.URLs[0], "file://")
+
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", downloads)
+	require.NoError(t, err)
 	require.Equal(t, SandboxImage, got.NodeStart.Containerd.SandboxImage)
-	require.Len(t, got.RootFS.ContainerImageArchiveURLs, 2)
-	require.Contains(t, got.RootFS.ContainerImageArchiveURLs[0], "file://")
+	require.Same(t, downloads, got.RootFS.Downloads)
+}
+
+func assertOfflineArtifactDownloads(t *testing.T, downloads *DownloadOverrides) {
+	t.Helper()
+
+	require.Equal(t, "1.5.0", downloads.Runc.Version)
+	require.Contains(t, downloads.Runc.URL, "file://")
+	require.NotContains(t, downloads.Runc.URL, "ignored")
+}
+
+func TestResolveDownloadOverridesWithOfflineArtifactsNoopWithoutOfflineConfig(t *testing.T) {
+	t.Parallel()
+
+	input := &DownloadOverrides{Runc: &DownloadSource{BaseURL: "https://example.test/runc"}}
+
+	got, containerImageArchives, err := ResolveDownloadOverridesWithOfflineArtifacts(&config.AgentConfig{}, input)
+	require.NoError(t, err)
+	require.Same(t, input, got)
+	require.NotNil(t, containerImageArchives)
+	require.Equal(t, filepath.Join(ContainerImageArchiveHostSourceDir, "empty"), containerImageArchives.HostDir)
+	require.Empty(t, containerImageArchives.URLs)
 }
 
 func TestResolveOfflineArtifacts(t *testing.T) {

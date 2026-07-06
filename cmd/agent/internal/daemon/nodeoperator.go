@@ -164,6 +164,11 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 }
 
 func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
+	_, containerImageArchives, err := goalstates.ResolveDownloadOverridesWithOfflineArtifacts(active.Config, nil)
+	if err != nil {
+		return fmt.Errorf("resolve download overrides: %w", err)
+	}
+
 	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
 	if err != nil {
 		return fmt.Errorf("resolve machine goal state: %w", err)
@@ -172,6 +177,7 @@ func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, act
 	log.Info("restarting active node", "machine", active.Name)
 
 	err = phases.Serial(log,
+		rootfs.DownloadContainerImageArchives(log, containerImageArchives),
 		rootfs.EnsureNSpawnWorkspace(log, gs.RootFS),
 		nodestop.StopNode(log, active.Name),
 		nodestart.StartNode(log, gs.NodeStart),
@@ -211,12 +217,18 @@ func (nspawnNodeOperator) RepaveNode(
 	)
 
 	// Resolve goal states for the new machine.
-	gs, err := goalstates.ResolveMachine(log, &newCfg.AgentConfig, newMachine, provision.ResolveDownloadOverrides(newCfg.Downloads))
+	downloads, containerImageArchives, err := goalstates.ResolveDownloadOverridesWithOfflineArtifacts(&newCfg.AgentConfig, provision.ResolveDownloadOverrides(newCfg.Downloads))
+	if err != nil {
+		return fmt.Errorf("resolve download overrides: %w", err)
+	}
+
+	gs, err := goalstates.ResolveMachine(log, &newCfg.AgentConfig, newMachine, downloads)
 	if err != nil {
 		return fmt.Errorf("resolve machine goal state: %w", err)
 	}
 
 	err = phases.Serial(log,
+		rootfs.DownloadContainerImageArchives(log, containerImageArchives),
 		rootfs.Provision(log, gs.RootFS),
 		nodestop.StopNode(log, oldMachine),
 		nodestart.StartNode(log, gs.NodeStart),
