@@ -117,7 +117,18 @@ func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary string
 
 		start := time.Now()
 
-		if err := binaryURL.downloadWithSHA256Verification(ctx, binaryURL.checksumSource(), targetFilePath, 0o755); err != nil {
+		checksumSource, err := parseDownloadSource(binaryURL.String() + ".sha256")
+		if err != nil {
+			return fmt.Errorf("parse kubernetes binary checksum source %q: %w", binary, err)
+		}
+
+		expectedHash, err := readExpectedSHA256(ctx, checksumSource)
+		if err != nil {
+			logger.Error("checksum download failed", "error", err)
+			return fmt.Errorf("read kubernetes binary checksum %q: %w", binary, err)
+		}
+
+		if err := binaryURL.downloadWithSHA256Verification(ctx, expectedHash, targetFilePath, 0o755); err != nil {
 			logger.Error("download failed", "error", err)
 			return fmt.Errorf("download kubernetes binary %q: %w", binary, err)
 		}

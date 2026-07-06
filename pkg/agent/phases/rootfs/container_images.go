@@ -47,7 +47,22 @@ func (d *downloadContainerImageArchives) Do(ctx context.Context) error {
 		archivePath := filepath.Join(d.staging.HostDir, fmt.Sprintf("image-%d.tar", idx))
 		expected[archivePath] = struct{}{}
 
-		if err := downloadWithSHA256Verification(ctx, archiveURL, archiveURL+".sha256", archivePath, 0o644); err != nil {
+		source, err := parseDownloadSource(archiveURL)
+		if err != nil {
+			return fmt.Errorf("parse container image archive source %q: %w", archiveURL, err)
+		}
+
+		checksumSource, err := parseDownloadSource(archiveURL + ".sha256")
+		if err != nil {
+			return fmt.Errorf("parse container image archive checksum source %q: %w", archiveURL, err)
+		}
+
+		expectedHash, err := readExpectedSHA256(ctx, checksumSource)
+		if err != nil {
+			return fmt.Errorf("read container image archive checksum %q: %w", archiveURL, err)
+		}
+
+		if err := source.downloadWithSHA256Verification(ctx, expectedHash, archivePath, 0o644); err != nil {
 			return fmt.Errorf("download container image archive %q: %w", archiveURL, err)
 		}
 	}

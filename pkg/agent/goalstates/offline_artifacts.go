@@ -19,13 +19,8 @@ import (
 	"strings"
 	"text/template"
 
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"oras.land/oras-go/v2/registry/remote"
-	"oras.land/oras-go/v2/registry/remote/auth"
-	"oras.land/oras-go/v2/registry/remote/retry"
-
-	"github.com/Azure/unbounded/internal/ociutil"
 	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/internal/ociartifact"
 )
 
 // OfflineArtifactManifestFileName is the manifest file name in an offline artifact bundle.
@@ -281,12 +276,12 @@ func offlineArtifactPaths(manifest OfflineArtifactManifest, arch string) []strin
 }
 
 func verifyOCIArtifacts(sourceRoot string, paths []string) error {
-	manifest, err := fetchOCIManifest(context.Background(), sourceRoot)
+	manifest, err := ociartifact.FetchManifest(context.Background(), sourceRoot)
 	if err != nil {
 		return err
 	}
 
-	byTitle := ociDescriptorsByTitle(manifest)
+	byTitle := ociartifact.DescriptorsByTitle(manifest)
 
 	var errs []error
 
@@ -424,24 +419,9 @@ func fileURL(path string) string {
 }
 
 func fetchOCIBlobByTitle(ctx context.Context, sourceRoot, title string) ([]byte, error) {
-	manifest, err := fetchOCIManifest(ctx, sourceRoot)
+	body, err := ociartifact.Open(ctx, sourceRoot+"#"+title)
 	if err != nil {
 		return nil, err
-	}
-
-	desc, ok := ociDescriptorsByTitle(manifest)[title]
-	if !ok {
-		return nil, fmt.Errorf("OCI artifact %q does not contain %q", sourceRoot, title)
-	}
-
-	repo, _, err := openOCIRepository(sourceRoot)
-	if err != nil {
-		return nil, err
-	}
-
-	body, err := repo.Fetch(ctx, desc)
-	if err != nil {
-		return nil, fmt.Errorf("fetch OCI blob %q: %w", title, err)
 	}
 	defer body.Close() //nolint:errcheck // best effort close
 
@@ -451,128 +431,6 @@ func fetchOCIBlobByTitle(ctx context.Context, sourceRoot, title string) ([]byte,
 	}
 
 	return data, nil
-}
-
-func fetchOCIManifest(ctx context.Context, sourceRoot string) (ocispec.Manifest, error) {
-	repo, ref, err := openOCIRepository(sourceRoot)
-	if err != nil {
-		return ocispec.Manifest{}, err
-	}
-
-	desc, err := repo.Resolve(ctx, ref)
-	if err != nil {
-		return ocispec.Manifest{}, fmt.Errorf("resolve OCI artifact %q: %w", sourceRoot, err)
-	}
-
-	return fetchOCIManifestDescriptor(ctx, repo, sourceRoot, desc)
-}
-
-func fetchOCIManifestDescriptor(ctx context.Context, repo *remote.Repository, sourceRoot string, desc ocispec.Descriptor) (ocispec.Manifest, error) {
-	body, err := repo.Fetch(ctx, desc)
-	if err != nil {
-		return ocispec.Manifest{}, fmt.Errorf("fetch OCI artifact manifest %q: %w", sourceRoot, err)
-	}
-	defer body.Close() //nolint:errcheck // best effort close
-
-	data, err := io.ReadAll(body)
-	if err != nil {
-		return ocispec.Manifest{}, fmt.Errorf("read OCI artifact manifest %q: %w", sourceRoot, err)
-	}
-
-	if desc.MediaType == ocispec.MediaTypeImageIndex {
-		return fetchOCIPlatformManifest(ctx, repo, sourceRoot, data)
-	}
-
-	var manifest ocispec.Manifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return ocispec.Manifest{}, fmt.Errorf("decode OCI artifact manifest %q: %w", sourceRoot, err)
-	}
-
-	if manifest.MediaType == ocispec.MediaTypeImageIndex {
-		return fetchOCIPlatformManifest(ctx, repo, sourceRoot, data)
-	}
-
-	return manifest, nil
-}
-
-func fetchOCIPlatformManifest(ctx context.Context, repo *remote.Repository, sourceRoot string, data []byte) (ocispec.Manifest, error) {
-	var index ocispec.Index
-	if err := json.Unmarshal(data, &index); err != nil {
-		return ocispec.Manifest{}, fmt.Errorf("decode OCI artifact index %q: %w", sourceRoot, err)
-	}
-
-	platformDesc, err := selectOCIPlatformManifest(sourceRoot, index)
-	if err != nil {
-		return ocispec.Manifest{}, err
-	}
-
-	return fetchOCIManifestDescriptor(ctx, repo, sourceRoot, platformDesc)
-}
-
-func selectOCIPlatformManifest(sourceRoot string, index ocispec.Index) (ocispec.Descriptor, error) {
-	available := make([]string, 0, len(index.Manifests))
-	for _, manifestDesc := range index.Manifests {
-		if manifestDesc.Platform == nil {
-			available = append(available, "<unknown>")
-			continue
-		}
-
-		platform := manifestDesc.Platform
-		available = append(available, platform.OS+"/"+platform.Architecture)
-
-		if platform.OS == runtime.GOOS && platform.Architecture == runtime.GOARCH {
-			return manifestDesc, nil
-		}
-	}
-
-	return ocispec.Descriptor{}, fmt.Errorf("OCI artifact %q does not contain platform %s/%s (available: %s)", sourceRoot, runtime.GOOS, runtime.GOARCH, strings.Join(available, ", "))
-}
-
-func ociDescriptorsByTitle(manifest ocispec.Manifest) map[string]ocispec.Descriptor {
-	out := make(map[string]ocispec.Descriptor, len(manifest.Layers))
-
-	for _, desc := range manifest.Layers {
-		title := desc.Annotations[ocispec.AnnotationTitle]
-		if title != "" {
-			out[title] = desc
-		}
-	}
-
-	return out
-}
-
-func openOCIRepository(sourceRoot string) (*remote.Repository, string, error) {
-	ref := strings.TrimPrefix(sourceRoot, "oci://")
-
-	name, reference, err := splitOCIReference(ref)
-	if err != nil {
-		return nil, "", err
-	}
-
-	repo, err := remote.NewRepository(name)
-	if err != nil {
-		return nil, "", fmt.Errorf("parse OCI repository %q: %w", name, err)
-	}
-
-	ociutil.ConfigurePlainHTTP(repo)
-	repo.Client = &auth.Client{Client: retry.DefaultClient, Cache: auth.DefaultCache}
-
-	return repo, reference, nil
-}
-
-func splitOCIReference(ref string) (name, reference string, err error) {
-	if idx := strings.LastIndex(ref, "@"); idx != -1 {
-		return ref[:idx], ref[idx+1:], nil
-	}
-
-	lastSlash := strings.LastIndex(ref, "/")
-
-	lastColon := strings.LastIndex(ref, ":")
-	if lastColon > lastSlash && lastColon != -1 {
-		return ref[:lastColon], ref[lastColon+1:], nil
-	}
-
-	return "", "", fmt.Errorf("OCI artifact source %q must include a tag or digest", ref)
 }
 
 func offlineKubernetesArtifactPath(version, arch, binary string) string {

@@ -80,17 +80,6 @@ func parseLocalDownloadSource(source string, parsed *url.URL) (downloadSource, e
 	return downloadSource{raw: source, kind: downloadSourceLocal, localPath: path}, nil
 }
 
-func (s downloadSource) checksumSource() downloadSource {
-	out := s
-
-	out.raw += ".sha256"
-	if out.localPath != "" {
-		out.localPath += ".sha256"
-	}
-
-	return out
-}
-
 func (s downloadSource) open(ctx context.Context) (io.ReadCloser, error) {
 	switch s.kind {
 	case downloadSourceLocal:
@@ -138,29 +127,7 @@ func (s downloadSource) downloadToLocalFile(ctx context.Context, filename string
 	return utilio.InstallFile(filename, body, perm)
 }
 
-func downloadWithSHA256Verification(ctx context.Context, source, checksumSource, filename string, perm os.FileMode) error {
-	parsedSource, err := parseDownloadSource(source)
-	if err != nil {
-		return err
-	}
-
-	parsedChecksum := parsedSource.checksumSource()
-	if parsedChecksum.raw != checksumSource {
-		parsedChecksum, err = parseDownloadSource(checksumSource)
-		if err != nil {
-			return err
-		}
-	}
-
-	return parsedSource.downloadWithSHA256Verification(ctx, parsedChecksum, filename, perm)
-}
-
-func (s downloadSource) downloadWithSHA256Verification(ctx context.Context, checksumSource downloadSource, filename string, perm os.FileMode) error {
-	expectedHash, err := checksumSource.fetchSHA256(ctx)
-	if err != nil {
-		return fmt.Errorf("fetch checksum from %q: %w", checksumSource.raw, err)
-	}
-
+func (s downloadSource) downloadWithSHA256Verification(ctx context.Context, expectedHash, filename string, perm os.FileMode) error {
 	body, err := s.open(ctx)
 	if err != nil {
 		return err
@@ -183,8 +150,8 @@ func (s downloadSource) downloadWithSHA256Verification(ctx context.Context, chec
 	return nil
 }
 
-func (s downloadSource) fetchSHA256(ctx context.Context) (string, error) {
-	body, err := s.open(ctx)
+func readExpectedSHA256(ctx context.Context, checksumSource downloadSource) (string, error) {
+	body, err := checksumSource.open(ctx)
 	if err != nil {
 		return "", err
 	}
