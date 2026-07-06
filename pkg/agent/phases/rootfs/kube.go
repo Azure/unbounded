@@ -112,7 +112,7 @@ func (d *downloadKubeBinaries) enqueueCrictlDownload(ctx context.Context, eg *er
 // verifies its SHA256 checksum, and logs the duration of the download.
 func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary string, binaryURL artifactsource.Source, targetFilePath string) func() error {
 	return func() error {
-		logger := d.log.With("binary", binary, "url", binaryURL.String())
+		logger := d.log.With("binary", binary)
 
 		logger.Info("downloading kubernetes binary")
 
@@ -143,7 +143,7 @@ func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary string
 // downloadCrictlBinary returns a function that downloads the crictl tarball and installs the crictl binary.
 func (d *downloadKubeBinaries) downloadCrictlBinary(ctx context.Context, downloadURL artifactsource.Source, targetFilePath string) func() error {
 	return func() error {
-		logger := d.log.With("binary", "crictl", "url", downloadURL.String())
+		logger := d.log.With("binary", "crictl")
 
 		logger.Info("downloading cri-tools binary")
 

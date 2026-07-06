@@ -6,6 +6,7 @@ package artifactsource
 import (
 	"context"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -20,6 +21,25 @@ func TestSourceOpenFileURL(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("artifact-data"), 0o644))
 
 	source, err := Parse("file://" + path)
+	require.NoError(t, err)
+
+	body, err := source.Open(context.Background())
+	require.NoError(t, err)
+
+	defer body.Close() //nolint:errcheck // test cleanup
+
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.Equal(t, "artifact-data", string(got))
+}
+
+func TestSourceOpenFileURLUnescapesPath(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "artifact with space")
+	require.NoError(t, os.WriteFile(path, []byte("artifact-data"), 0o644))
+
+	source, err := Parse((&url.URL{Scheme: "file", Path: path}).String())
 	require.NoError(t, err)
 
 	body, err := source.Open(context.Background())
@@ -56,6 +76,13 @@ func TestParseRejectsRelativePath(t *testing.T) {
 
 	_, err := Parse("relative/path")
 	require.ErrorContains(t, err, "absolute path")
+}
+
+func TestParseRejectsOCIWithoutBlobTitle(t *testing.T) {
+	t.Parallel()
+
+	_, err := Parse("oci://registry.example.com/unbounded/bootstrap-artifacts:v1")
+	require.ErrorContains(t, err, "blob title fragment")
 }
 
 func TestReadExpectedSHA256(t *testing.T) {

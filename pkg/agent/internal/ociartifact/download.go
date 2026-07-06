@@ -20,8 +20,10 @@ import (
 	"github.com/Azure/unbounded/internal/ociutil"
 )
 
-// Open opens an OCI artifact blob selected by title from a source of the form
-// oci://registry/repo:tag#path/to/blob.
+// Open opens one OCI artifact blob selected by title from a source of the form
+// oci://registry/repo:tag#path/to/blob. It resolves and reads the artifact
+// manifest metadata for the source, then returns a reader for only the selected
+// blob. It does not pull or materialize the whole OCI artifact bundle.
 func Open(ctx context.Context, source string) (io.ReadCloser, error) {
 	parsed, title, err := parseBlobSource(source)
 	if err != nil {
@@ -134,7 +136,7 @@ func fetchManifestDescriptor(ctx context.Context, repo *remote.Repository, sourc
 		return ocispec.Manifest{}, fmt.Errorf("read OCI artifact manifest %q: %w", sourceRoot, err)
 	}
 
-	if desc.MediaType == ocispec.MediaTypeImageIndex {
+	if isIndexMediaType(desc.MediaType) {
 		return fetchPlatformManifest(ctx, repo, sourceRoot, data)
 	}
 
@@ -143,11 +145,15 @@ func fetchManifestDescriptor(ctx context.Context, repo *remote.Repository, sourc
 		return ocispec.Manifest{}, fmt.Errorf("decode OCI artifact manifest %q: %w", sourceRoot, err)
 	}
 
-	if manifest.MediaType == ocispec.MediaTypeImageIndex {
+	if isIndexMediaType(manifest.MediaType) {
 		return fetchPlatformManifest(ctx, repo, sourceRoot, data)
 	}
 
 	return manifest, nil
+}
+
+func isIndexMediaType(mediaType string) bool {
+	return mediaType == ocispec.MediaTypeImageIndex || mediaType == ociutil.DockerMediaTypeManifestList
 }
 
 func fetchPlatformManifest(ctx context.Context, repo *remote.Repository, sourceRoot string, data []byte) (ocispec.Manifest, error) {

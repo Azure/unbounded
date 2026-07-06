@@ -56,6 +56,10 @@ func Parse(source string) (Source, error) {
 	case "http", "https":
 		return Source{raw: source, kind: sourceHTTP}, nil
 	case "oci":
+		if strings.TrimPrefix(parsed.Fragment, "/") == "" {
+			return Source{}, fmt.Errorf("OCI artifact source must include a blob title fragment")
+		}
+
 		return Source{raw: source, kind: sourceOCI}, nil
 	default:
 		return Source{}, fmt.Errorf("unsupported artifact source scheme %q", parsed.Scheme)
@@ -70,7 +74,12 @@ func parseLocal(source string, parsed *url.URL) (Source, error) {
 			return Source{}, fmt.Errorf("file artifact source must not include host %q", parsed.Host)
 		}
 
-		path = parsed.Path
+		unescapedPath, err := url.PathUnescape(parsed.Path)
+		if err != nil {
+			return Source{}, fmt.Errorf("unescape file artifact source path %q: %w", parsed.Path, err)
+		}
+
+		path = filepath.Clean(unescapedPath)
 	}
 
 	if path == "" || !filepath.IsAbs(path) {
