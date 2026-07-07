@@ -134,8 +134,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	desiredSecureBoot := !machine.Spec.PXE.InsecureDisableSecureBoot
 	secureBootCond := meta.FindStatusCondition(machine.Status.Conditions, condSecureBootSupported)
 	secureBootStatusChanged := false
+
 	if secureBootCond != nil && secureBootCond.Status == metav1.ConditionFalse && desiredSecureBoot {
-		return ctrl.Result{}, fmt.Errorf("Secure Boot config is not supported but Secure Boot is enabled: %w", ErrUnsupported)
+		return ctrl.Result{}, fmt.Errorf("secure boot config is not supported but secure boot is enabled: %w", ErrUnsupported)
 	}
 
 	if secureBootCond == nil || secureBootCond.Status != metav1.ConditionFalse {
@@ -148,13 +149,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 					Reason:             reasonNotSupported,
 					ObservedGeneration: machine.Generation,
 				})
+
 				secureBootStatusChanged = true
+
 				if desiredSecureBoot {
 					if err := r.Client.Status().Update(ctx, &machine); err != nil {
 						return ctrl.Result{}, fmt.Errorf("updating Secure Boot support status: %w", err)
 					}
 
-					return ctrl.Result{}, fmt.Errorf("Secure Boot config is not supported but Secure Boot is enabled: %w", err)
+					return ctrl.Result{}, fmt.Errorf("secure boot config is not supported but secure boot is enabled: %w", err)
 				}
 			} else {
 				return ctrl.Result{}, fmt.Errorf("configuring Secure Boot: %w", err)
