@@ -310,6 +310,10 @@ Offline artifact paths are component-prefixed to avoid ambiguity when different 
 | `Runc` | `runc/v<version>/runc.<arch>` |
 | `CNI` | `cni/v<version>/cni-plugins-linux-<arch>-v<version>.tgz` |
 | `Crictl` | `crictl/v<version>/crictl-v<version>-<os>-<arch>.tar.gz` |
+| Container image archive | `container-images/<arch>/<sanitized-image-ref>-<hash>.tar` |
+| Container image archive checksum | `container-images/<arch>/<sanitized-image-ref>-<hash>.tar.sha256` |
+
+Container image archive paths are derived from each image ref in `manifest.json` `containerImages`. The filename is stable for a given image ref and includes a sanitized image ref plus a hash to avoid collisions. The archive is a local image archive suitable for `ctr --namespace k8s.io images import`.
 
 The existing `Downloads` block remains the regular per-artifact override mechanism. As a separate compatibility improvement, `Downloads.*.BaseURL` and `Downloads.*.URL` should also support `file://` and `oci://` endpoints for non-offline custom layouts. Those `Downloads` settings are ignored whenever offline artifacts are configured.
 
@@ -422,7 +426,43 @@ containerd/v2.1.8/containerd-2.1.8-linux-amd64.tar.gz
 runc/v1.5.0/runc.amd64
 cni/v1.5.1/cni-plugins-linux-amd64-v1.5.1.tgz
 crictl/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz
+container-images/amd64/mcr.microsoft.com_oss_v2_kubernetes_pause_3.9-<hash>.tar
+container-images/amd64/mcr.microsoft.com_oss_v2_kubernetes_pause_3.9-<hash>.tar.sha256
 ```
+
+### Container image archive staging
+
+Offline container image archives are staged on the host before the nspawn machine starts. The agent downloads archives listed by `manifest.json` `containerImages` from the resolved offline source, verifies each archive with the adjacent `.sha256` artifact, and writes them into a source-specific host cache directory.
+
+The host-side staging layout is:
+
+```text
+/var/lib/unbounded/container-images/
+  current -> <source-cache-dir>
+  <source-cache-dir>/
+    image-0.tar
+    image-1.tar
+    ...
+  empty/
+```
+
+`<source-cache-dir>` is derived from the resolved `OfflineArtifacts.Source` and includes a short hash of that source, so different Kubernetes versions or registries do not share one cache directory. The stable `current` symlink points at the cache directory for the most recently resolved offline source. When offline artifacts are not configured, the staging target is the `empty/` directory.
+
+The nspawn machine bind-mounts the stable host path read-only:
+
+```text
+host:    /var/lib/unbounded/container-images/current
+machine: /var/lib/unbounded/container-images
+mode:    read-only
+```
+
+Inside the running machine, node-start imports every staged `.tar` file visible at `/var/lib/unbounded/container-images` with:
+
+```bash
+ctr --namespace k8s.io images import /var/lib/unbounded/container-images/image-<n>.tar
+```
+
+The staging cache is host-level instead of machine-rootfs-specific. This lets alternating nspawn machines, such as `kube1` and `kube2`, share already downloaded image archives across initial bootstrap and repave. Node restart does not redownload archives because it reuses the existing rootfs and host staging state.
 
 ### Regular `Downloads` endpoint support
 
