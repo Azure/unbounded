@@ -7,7 +7,7 @@ package ociutil
 import (
 	"net"
 
-	"oras.land/oras-go/v2/registry/remote"
+	"github.com/oras-project/oras-go/v3/registry/remote"
 )
 
 // ConfigurePlainHTTP sets PlainHTTP on the repository when the registry host
@@ -16,7 +16,7 @@ import (
 // never serve TLS and defaulting to HTTPS causes "http: server gave HTTP
 // response to HTTPS client" errors.
 func ConfigurePlainHTTP(repo *remote.Repository) {
-	host := repo.Reference.Host()
+	host := repo.Reference().Host()
 
 	// Strip the port if present so we can parse the bare IP/hostname.
 	hostname := host
@@ -25,7 +25,7 @@ func ConfigurePlainHTTP(repo *remote.Repository) {
 	}
 
 	if hostname == "localhost" {
-		repo.PlainHTTP = true
+		repo.Registry.PlainHTTP = true
 		return
 	}
 
@@ -35,6 +35,6 @@ func ConfigurePlainHTTP(repo *remote.Repository) {
 	}
 
 	if ip.IsLoopback() || ip.IsPrivate() {
-		repo.PlainHTTP = true
+		repo.Registry.PlainHTTP = true
 	}
 }

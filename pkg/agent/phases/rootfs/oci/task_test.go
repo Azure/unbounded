@@ -12,18 +12,18 @@ import (
 	"testing"
 	"time"
 
-	"oras.land/oras-go/v2/registry/remote"
-	"oras.land/oras-go/v2/registry/remote/auth"
-	"oras.land/oras-go/v2/registry/remote/retry"
+	"github.com/oras-project/oras-go/v3/registry/remote"
+	"github.com/oras-project/oras-go/v3/registry/remote/auth"
+	"github.com/oras-project/oras-go/v3/registry/remote/retry"
 )
 
 func TestConfigureOCIPullRetryUsesORASRetryClient(t *testing.T) {
-	repo := &remote.Repository{}
+	repo := &remote.Repository{Registry: &remote.Registry{}}
 	configureOCIPullRetry(repo)
 
-	authClient, ok := repo.Client.(*auth.Client)
+	authClient, ok := repo.Registry.Client.(*auth.Client)
 	if !ok {
-		t.Fatalf("repo.Client = %T, want *auth.Client", repo.Client)
+		t.Fatalf("repo.Registry.Client = %T, want *auth.Client", repo.Registry.Client)
 	}
 
 	transport, ok := authClient.Client.Transport.(*retry.Transport)

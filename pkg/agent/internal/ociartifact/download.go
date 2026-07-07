@@ -13,9 +13,9 @@ import (
 	"strings"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"oras.land/oras-go/v2/registry/remote"
-	"oras.land/oras-go/v2/registry/remote/auth"
-	"oras.land/oras-go/v2/registry/remote/retry"
+	"github.com/oras-project/oras-go/v3/registry/remote"
+	"github.com/oras-project/oras-go/v3/registry/remote/auth"
+	"github.com/oras-project/oras-go/v3/registry/remote/retry"
 
 	"github.com/Azure/unbounded/internal/ociutil"
 )
@@ -203,7 +203,7 @@ func openRepository(parsed *url.URL) (*remote.Repository, string, error) {
 	}
 
 	ociutil.ConfigurePlainHTTP(repo)
-	repo.Client = &auth.Client{Client: retry.DefaultClient, Cache: auth.DefaultCache}
+	repo.Registry.Client = &auth.Client{Client: retry.DefaultClient, Cache: auth.DefaultCache}
 
 	return repo, reference, nil
 }

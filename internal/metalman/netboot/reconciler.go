@@ -17,12 +17,13 @@ import (
 	"github.com/opencontainers/umoci"
 	"github.com/opencontainers/umoci/oci/casext"
 	"github.com/opencontainers/umoci/oci/layer"
+	"github.com/oras-project/oras-go/v3"
+	"github.com/oras-project/oras-go/v3/content/oci"
+	"github.com/oras-project/oras-go/v3/registry/remote"
+	"github.com/oras-project/oras-go/v3/registry/remote/auth"
+	"github.com/oras-project/oras-go/v3/registry/remote/credentials"
+	"github.com/oras-project/oras-go/v3/registry/remote/retry"
 	corev1 "k8s.io/api/core/v1"
-	"oras.land/oras-go/v2"
-	"oras.land/oras-go/v2/content/oci"
-	"oras.land/oras-go/v2/registry/remote"
-	"oras.land/oras-go/v2/registry/remote/auth"
-	"oras.land/oras-go/v2/registry/remote/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -226,7 +227,7 @@ func (r *OCIReconciler) resolveRemoteDigest(ctx context.Context, imageRef string
 		}
 	}
 
-	tagOrDigest := repo.Reference.Reference
+	tagOrDigest := repo.Reference().Reference
 
 	desc, err := repo.Resolve(ctx, tagOrDigest)
 	if err != nil {
@@ -246,15 +247,15 @@ func (r *OCIReconciler) configureRepositoryAuth(ctx context.Context, repo *remot
 		return fmt.Errorf("get pull secret %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
 
-	credential, err := credentialFromPullSecret(&secret, repo.Reference.Registry)
+	credential, err := credentialFromPullSecret(&secret, repo.Reference().Registry)
 	if err != nil {
 		return fmt.Errorf("pull secret %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
 
-	repo.Client = &auth.Client{
-		Client:     retry.DefaultClient,
-		Header:     auth.DefaultClient.Header.Clone(),
-		Credential: auth.StaticCredential(repo.Reference.Registry, credential),
+	repo.Registry.Client = &auth.Client{
+		Client:         retry.DefaultClient,
+		Header:         auth.DefaultClient.Header.Clone(),
+		CredentialFunc: credentials.StaticCredentialFunc(repo.Reference().Registry, credential),
 	}
 
 	return nil
@@ -272,40 +273,40 @@ type dockerAuthConfig struct {
 	RegistryToken string `json:"registrytoken"`
 }
 
-func credentialFromPullSecret(secret *corev1.Secret, registry string) (auth.Credential, error) {
+func credentialFromPullSecret(secret *corev1.Secret, registry string) (credentials.Credential, error) {
 	switch secret.Type {
 	case corev1.SecretTypeDockerConfigJson:
 		data := secret.Data[corev1.DockerConfigJsonKey]
 		if len(data) == 0 {
-			return auth.EmptyCredential, fmt.Errorf("missing %s data", corev1.DockerConfigJsonKey)
+			return credentials.EmptyCredential, fmt.Errorf("missing %s data", corev1.DockerConfigJsonKey)
 		}
 
 		var cfg dockerConfigJSON
 		if err := json.Unmarshal(data, &cfg); err != nil {
-			return auth.EmptyCredential, fmt.Errorf("parse %s: %w", corev1.DockerConfigJsonKey, err)
+			return credentials.EmptyCredential, fmt.Errorf("parse %s: %w", corev1.DockerConfigJsonKey, err)
 		}
 
 		return credentialFromDockerAuths(cfg.Auths, registry)
 	case corev1.SecretTypeDockercfg:
 		data := secret.Data[corev1.DockerConfigKey]
 		if len(data) == 0 {
-			return auth.EmptyCredential, fmt.Errorf("missing %s data", corev1.DockerConfigKey)
+			return credentials.EmptyCredential, fmt.Errorf("missing %s data", corev1.DockerConfigKey)
 		}
 
 		var auths map[string]dockerAuthConfig
 		if err := json.Unmarshal(data, &auths); err != nil {
-			return auth.EmptyCredential, fmt.Errorf("parse %s: %w", corev1.DockerConfigKey, err)
+			return credentials.EmptyCredential, fmt.Errorf("parse %s: %w", corev1.DockerConfigKey, err)
 		}
 
 		return credentialFromDockerAuths(auths, registry)
 	default:
-		return auth.EmptyCredential, fmt.Errorf("unsupported secret type %q", secret.Type)
+		return credentials.EmptyCredential, fmt.Errorf("unsupported secret type %q", secret.Type)
 	}
 }
 
-func credentialFromDockerAuths(auths map[string]dockerAuthConfig, registry string) (auth.Credential, error) {
+func credentialFromDockerAuths(auths map[string]dockerAuthConfig, registry string) (credentials.Credential, error) {
 	if len(auths) == 0 {
-		return auth.EmptyCredential, fmt.Errorf("docker config has no auth entries")
+		return credentials.EmptyCredential, fmt.Errorf("docker config has no auth entries")
 	}
 
 	registry = normalizeRegistryHost(registry)
@@ -315,22 +316,22 @@ func credentialFromDockerAuths(auths map[string]dockerAuthConfig, registry strin
 		}
 	}
 
-	return auth.EmptyCredential, fmt.Errorf("docker config has no credentials for registry %q", registry)
+	return credentials.EmptyCredential, fmt.Errorf("docker config has no credentials for registry %q", registry)
 }
 
-func credentialFromDockerAuthConfig(cfg dockerAuthConfig) (auth.Credential, error) {
+func credentialFromDockerAuthConfig(cfg dockerAuthConfig) (credentials.Credential, error) {
 	username := cfg.Username
 	password := cfg.Password
 
 	if (username == "" || password == "") && cfg.Auth != "" {
 		decoded, err := base64.StdEncoding.DecodeString(cfg.Auth)
 		if err != nil {
-			return auth.EmptyCredential, fmt.Errorf("decode auth field: %w", err)
+			return credentials.EmptyCredential, fmt.Errorf("decode auth field: %w", err)
 		}
 
 		user, pass, ok := strings.Cut(string(decoded), ":")
 		if !ok {
-			return auth.EmptyCredential, fmt.Errorf("decode auth field: missing ':' separator")
+			return credentials.EmptyCredential, fmt.Errorf("decode auth field: missing ':' separator")
 		}
 
 		if username == "" {
@@ -342,15 +343,15 @@ func credentialFromDockerAuthConfig(cfg dockerAuthConfig) (auth.Credential, erro
 		}
 	}
 
-	credential := auth.Credential{
+	credential := credentials.Credential{
 		Username:     username,
 		Password:     password,
 		RefreshToken: cfg.IdentityToken,
 		AccessToken:  cfg.RegistryToken,
 	}
 
-	if credential == auth.EmptyCredential {
-		return auth.EmptyCredential, fmt.Errorf("docker auth entry has no credentials")
+	if credential == credentials.EmptyCredential {
+		return credentials.EmptyCredential, fmt.Errorf("docker auth entry has no credentials")
 	}
 
 	return credential, nil
@@ -398,7 +399,7 @@ func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest
 		return fmt.Errorf("creating image dir: %w", err)
 	}
 
-	tagOrDigest := repo.Reference.Reference
+	tagOrDigest := repo.Reference().Reference
 
 	// Create a temporary directory for the OCI layout store.
 	layoutDir, err := os.MkdirTemp("", "metalman-oci-*")

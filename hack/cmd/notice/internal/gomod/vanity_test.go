@@ -37,7 +37,7 @@ func TestVanityRepoBase(t *testing.T) {
 		{"gopkg.in/user/foo.v1", "https://github.com/user/foo"},
 		{"google.golang.org/grpc", "https://github.com/grpc/grpc-go"},
 		{"google.golang.org/protobuf", "https://github.com/protocolbuffers/protobuf-go"},
-		{"oras.land/oras-go/v2", "https://github.com/oras-project/oras-go"},
+		{"github.com/oras-project/oras-go/v3", "https://github.com/oras-project/oras-go"},
 		{"modernc.org/sqlite", "https://gitlab.com/cznic/sqlite"},
 		{"golang.zx2c4.com/wireguard/wgctrl", "https://github.com/WireGuard/wgctrl-go"},
 		{"example.com/foo", "https://example.com/foo"},
