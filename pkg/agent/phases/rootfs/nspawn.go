@@ -18,11 +18,11 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs/oci"
 )
 
-//go:embed assets/nspawn.conf assets/nspawn-config-refresh.service assets/service-override.conf
+//go:embed assets/nspawn.conf assets/config-regeneration.service assets/service-override.conf
 var nspawnAssets embed.FS
 
 var nspawnTemplates = template.Must(
-	template.New("nspawn").ParseFS(nspawnAssets, "assets/nspawn.conf", "assets/nspawn-config-refresh.service", "assets/service-override.conf"),
+	template.New("nspawn").ParseFS(nspawnAssets, "assets/nspawn.conf", "assets/config-regeneration.service", "assets/service-override.conf"),
 )
 
 type ensureNSpawnWorkspace struct {
@@ -80,15 +80,15 @@ func (e *ensureNSpawnWorkspace) bootstrapWorkspace(ctx context.Context) error {
 type nspawnTemplateData struct {
 	// MachineName is the nspawn machine name (e.g. "kube1"). Used by the
 	// service drop-in for the ExecStartPre `machinectl terminate` cleanup.
-	MachineName          string
-	BPFFSMountPath       string
-	HostDevicePaths      []string
-	NvidiaGPUDevicePaths []string
-	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
-	AMDGPUDevicePaths    []string
-	AMDSysFSPaths        []string
-	ConfigRefreshUnit    string
-	AgentBinaryPath      string
+	MachineName            string
+	BPFFSMountPath         string
+	HostDevicePaths        []string
+	NvidiaGPUDevicePaths   []string
+	NvidiaLibDirMounts     []goalstates.NvidiaLibDirMount
+	AMDGPUDevicePaths      []string
+	AMDSysFSPaths          []string
+	ConfigRegenerationUnit string
+	AgentBinaryPath        string
 }
 
 // writeNSpawnConfigs renders the nspawn-related templates with device and GPU
@@ -101,15 +101,15 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 	hostDevicePaths := goalState.HostDevices.Paths()
 	amdGPUDevicePaths := pathsExcluding(goalState.AMD.GPUDevicePaths, goalState.Nvidia.GPUDevicePaths)
 	templateData := nspawnTemplateData{
-		MachineName:          machineName,
-		BPFFSMountPath:       goalstates.BPFFSMountPath(machineName),
-		HostDevicePaths:      hostDevicePaths,
-		NvidiaGPUDevicePaths: goalState.Nvidia.GPUDevicePaths,
-		NvidiaLibDirMounts:   goalState.Nvidia.LibDirMounts,
-		AMDGPUDevicePaths:    amdGPUDevicePaths,
-		AMDSysFSPaths:        goalState.AMD.SysFSPaths,
-		ConfigRefreshUnit:    goalstates.NSpawnConfigRefreshUnit(machineName),
-		AgentBinaryPath:      goalstates.DaemonBinaryPath,
+		MachineName:            machineName,
+		BPFFSMountPath:         goalstates.BPFFSMountPath(machineName),
+		HostDevicePaths:        hostDevicePaths,
+		NvidiaGPUDevicePaths:   goalState.Nvidia.GPUDevicePaths,
+		NvidiaLibDirMounts:     goalState.Nvidia.LibDirMounts,
+		AMDGPUDevicePaths:      amdGPUDevicePaths,
+		AMDSysFSPaths:          goalState.AMD.SysFSPaths,
+		ConfigRegenerationUnit: goalstates.ConfigRegenerationUnit(machineName),
+		AgentBinaryPath:        goalstates.DaemonBinaryPath,
 	}
 
 	if len(hostDevicePaths) > 0 {
@@ -152,14 +152,15 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		return fmt.Errorf("write service override %s: %w", goalState.ServiceOverrideFile, err)
 	}
 
-	unitFile := filepath.Join(goalstates.SystemdSystemDir, templateData.ConfigRefreshUnit)
+	unitFile := filepath.Join(goalstates.SystemdSystemDir, templateData.ConfigRegenerationUnit)
+
 	unitBuf := &bytes.Buffer{}
-	if err := nspawnTemplates.ExecuteTemplate(unitBuf, "nspawn-config-refresh.service", templateData); err != nil {
-		return fmt.Errorf("render nspawn config refresh unit template: %w", err)
+	if err := nspawnTemplates.ExecuteTemplate(unitBuf, "config-regeneration.service", templateData); err != nil {
+		return fmt.Errorf("render config regeneration unit template: %w", err)
 	}
 
 	if err := utilio.WriteFile(unitFile, unitBuf.Bytes(), 0o644); err != nil {
-		return fmt.Errorf("write nspawn config refresh unit %s: %w", unitFile, err)
+		return fmt.Errorf("write config regeneration unit %s: %w", unitFile, err)
 	}
 
 	return nil

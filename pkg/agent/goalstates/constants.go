@@ -74,10 +74,10 @@ func BPFFSMountPath(machineName string) string {
 	return fmt.Sprintf("%s/%s", BPFFSMountDir, machineName)
 }
 
-// NSpawnConfigRefreshUnit returns the systemd unit that refreshes host-side
-// nspawn configuration before the named machine starts.
-func NSpawnConfigRefreshUnit(machineName string) string {
-	return fmt.Sprintf("unbounded-agent-nspawn-config@%s.service", machineName)
+// ConfigRegenerationUnit returns the systemd unit that regenerates host-side
+// configuration before the named machine starts.
+func ConfigRegenerationUnit(machineName string) string {
+	return fmt.Sprintf("unbounded-agent-regenerate-config@%s.service", machineName)
 }
 
 // AppliedConfigPath returns the path to the applied config file for the

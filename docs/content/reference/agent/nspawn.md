@@ -142,7 +142,7 @@ The configuration is written to these files on the host before the machine boots
 |---|---|
 | nspawn config | `/etc/systemd/nspawn/<MachineName>.nspawn` |
 | Service override | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` |
-| Config refresh unit | `/etc/systemd/system/unbounded-agent-nspawn-config@<MachineName>.service` |
+| Config regeneration unit | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` |
 
 ### Customization points
 
@@ -261,7 +261,7 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 | `/var/lib/machines/<MachineName>` | Container rootfs directory. |
 | `/etc/systemd/nspawn/<MachineName>.nspawn` | nspawn configuration file. |
 | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` | Systemd service override. |
-| `/etc/systemd/system/unbounded-agent-nspawn-config@<MachineName>.service` | Host-side oneshot unit that refreshes nspawn configuration before machine start. |
+| `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` | Host-side oneshot unit that regenerates host-side configuration before machine start. |
 | `/run/host-nvidia/<index>/` | (Inside container) Read-only bind-mount of host NVIDIA library directories. |
 
 ## See Also

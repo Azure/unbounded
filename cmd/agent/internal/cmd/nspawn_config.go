@@ -20,6 +20,25 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
 )
 
+func newCmdRegenerateConfig(cmdCtx *CommandContext) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:    "regenerate-config MACHINE_NAME",
+		Short:  "Regenerate host-side configuration for a machine",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
+			defer cancel()
+
+			cmdCtx.Setup()
+
+			return regenerateConfig(ctx, cmdCtx.Logger, args[0])
+		},
+	}
+
+	return cmd
+}
+
 func newCmdRegenerateNSpawnConfig(cmdCtx *CommandContext) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:    "regenerate-nspawn-config MACHINE_NAME",
@@ -37,6 +56,10 @@ func newCmdRegenerateNSpawnConfig(cmdCtx *CommandContext) *cobra.Command {
 	}
 
 	return cmd
+}
+
+func regenerateConfig(ctx context.Context, log *slog.Logger, machineName string) error {
+	return regenerateNSpawnConfig(ctx, log, machineName)
 }
 
 func regenerateNSpawnConfig(ctx context.Context, log *slog.Logger, machineName string) error {
@@ -68,6 +91,7 @@ func loadAppliedConfigForMachine(log *slog.Logger, machineName string) (*provisi
 	}
 
 	path := goalstates.AppliedConfigPath(machineName)
+
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
@@ -83,7 +107,8 @@ func loadAppliedConfigForMachine(log *slog.Logger, machineName string) (*provisi
 	}
 
 	if _, statErr := os.Stat(checksumPath); errors.Is(statErr, os.ErrNotExist) {
-		log.Warn("no checksum sidecar found, skipping integrity check",
+		log.Warn(
+			"no checksum sidecar found, skipping integrity check",
 			"config_path", path,
 			"checksum_path", checksumPath,
 		)

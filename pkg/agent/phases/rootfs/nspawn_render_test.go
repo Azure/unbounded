@@ -36,6 +36,7 @@ func TestServiceOverride_HostDevicesDeviceAllow(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
+
 	data := defaultNSpawnTemplateData("kube1")
 	data.HostDevicePaths = []string{"/dev/kvm"}
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", data))
@@ -57,6 +58,7 @@ func TestServiceOverride_MultipleHostDevices(t *testing.T) {
 	devices := []string{"/dev/kvm", "/dev/net/tun", "/dev/vhost-net", "/dev/sda", "/dev/infiniband/uverbs0"}
 
 	var nspawnBuf bytes.Buffer
+
 	data := defaultNSpawnTemplateData("kube1")
 	data.HostDevicePaths = devices
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
@@ -79,6 +81,7 @@ func TestServiceOverride_AMDGPUDevices(t *testing.T) {
 	devices := []string{"/dev/dri/card0", "/dev/dri/renderD128", "/dev/kfd"}
 
 	var nspawnBuf bytes.Buffer
+
 	data := defaultNSpawnTemplateData("kube1")
 	data.AMDGPUDevicePaths = devices
 	data.AMDSysFSPaths = []string{"/sys/module/amdgpu", "/sys/class/kfd"}
@@ -120,35 +123,35 @@ func TestServiceOverride_NoHostDevicesNoDeviceAllow(t *testing.T) {
 	require.NotContains(t, buf.String(), "DeviceAllow=")
 }
 
-func TestServiceOverride_ConfigRefreshDependency(t *testing.T) {
+func TestServiceOverride_ConfigRegenerationDependency(t *testing.T) {
 	t.Parallel()
 
 	out := requireRenderedSnapshot(t, "service-override-kube1.conf.golden", "service-override.conf", defaultNSpawnTemplateData("kube1"))
 
-	require.Contains(t, out, "Requires=unbounded-agent-nspawn-config@kube1.service")
-	require.Contains(t, out, "After=unbounded-agent-nspawn-config@kube1.service")
-	require.Less(t, strings.Index(out, "[Unit]"), strings.Index(out, "Requires=unbounded-agent-nspawn-config@kube1.service"))
-	require.Less(t, strings.Index(out, "After=unbounded-agent-nspawn-config@kube1.service"), strings.Index(out, "[Service]"))
+	require.Contains(t, out, "Requires=unbounded-agent-regenerate-config@kube1.service")
+	require.Contains(t, out, "After=unbounded-agent-regenerate-config@kube1.service")
+	require.Less(t, strings.Index(out, "[Unit]"), strings.Index(out, "Requires=unbounded-agent-regenerate-config@kube1.service"))
+	require.Less(t, strings.Index(out, "After=unbounded-agent-regenerate-config@kube1.service"), strings.Index(out, "[Service]"))
 }
 
-func TestNSpawnConfigRefreshUnit(t *testing.T) {
+func TestConfigRegenerationUnit(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "nspawn-config-refresh.service", defaultNSpawnTemplateData("kube1")))
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "config-regeneration.service", defaultNSpawnTemplateData("kube1")))
 
 	out := buf.String()
-	require.Contains(t, out, "Description=Regenerate nspawn configuration for kube1")
+	require.Contains(t, out, "Description=Regenerate configuration for kube1")
 	require.Contains(t, out, "Type=oneshot")
-	require.Contains(t, out, "ExecStart=/usr/local/bin/unbounded-agent regenerate-nspawn-config kube1")
+	require.Contains(t, out, "ExecStart=/usr/local/bin/unbounded-agent regenerate-config kube1")
 }
 
 func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {
 	return nspawnTemplateData{
-		MachineName:       machineName,
-		BPFFSMountPath:    goalstates.BPFFSMountPath(machineName),
-		ConfigRefreshUnit: goalstates.NSpawnConfigRefreshUnit(machineName),
-		AgentBinaryPath:   goalstates.DaemonBinaryPath,
+		MachineName:            machineName,
+		BPFFSMountPath:         goalstates.BPFFSMountPath(machineName),
+		ConfigRegenerationUnit: goalstates.ConfigRegenerationUnit(machineName),
+		AgentBinaryPath:        goalstates.DaemonBinaryPath,
 	}
 }
 
