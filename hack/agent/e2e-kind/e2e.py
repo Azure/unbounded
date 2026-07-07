@@ -1557,34 +1557,42 @@ def _local_registry_ips() -> list[str]:
     return _container_ips(LOCAL_ARTIFACT_REGISTRY_NAME)
 
 
-def _external_network_block_rules() -> list[list[str]]:
+def _external_network_block_rules(vm_ip: str = VM_IP) -> list[list[str]]:
     """Return iptables FORWARD rules that block VM egress outside e2e networks."""
-    rules = [["-s", VM_IP, "-d", f"{VM_SUBNET}.0/24", "-j", "ACCEPT"]]
+    rules = [["-s", vm_ip, "-d", f"{VM_SUBNET}.0/24", "-j", "ACCEPT"]]
 
     for ip in _kind_control_plane_ips() + _local_registry_ips():
-        rules.append(["-s", VM_IP, "-d", ip, "-j", "ACCEPT"])
+        rules.append(["-s", vm_ip, "-d", ip, "-j", "ACCEPT"])
 
     rules.extend([
-        ["-s", VM_IP, "-p", "tcp", "--dport", "6443", "-j", "ACCEPT"],
-        ["-s", VM_IP, "-p", "tcp", "-m", "multiport", "--dports", f"{LOCAL_ARTIFACT_REGISTRY_PORT},{SERVE_PORT}", "-j", "ACCEPT"],
-        ["-s", VM_IP, "-d", "10.244.0.0/16", "-j", "ACCEPT"],
-        ["-s", VM_IP, "-d", "10.96.0.0/12", "-j", "ACCEPT"],
-        ["-s", VM_IP, "-j", "REJECT"],
+        ["-s", vm_ip, "-d", "10.244.0.0/16", "-j", "ACCEPT"],
+        ["-s", vm_ip, "-d", "10.96.0.0/12", "-j", "ACCEPT"],
+        ["-s", vm_ip, "-j", "REJECT"],
     ])
 
     return rules
 
 
-def unblock_external_network() -> None:
+def unblock_external_network(vm_ip: str = VM_IP) -> None:
     """Remove VM external egress block rules."""
     if shutil.which("iptables") is None:
         return
 
-    for rule in _external_network_block_rules():
+    for rule in _external_network_block_rules(vm_ip):
         for _ in range(10):
             result = run_quiet(["sudo", "iptables", "-D", "FORWARD", *rule], check=False)
             if result.returncode != 0:
                 break
+
+
+def unblock_all_external_network_rules() -> None:
+    """Remove external egress block rules for default and config e2e VMs."""
+    unblock_external_network(VM_IP)
+    if VM_NAME != "agent-config-e2e":
+        return
+
+    for index, _cfg in enumerate(discover_node_configs()):
+        unblock_external_network(f"{VM_SUBNET}.{10 + index}")
 
 
 def block_external_network() -> None:
@@ -1593,8 +1601,8 @@ def block_external_network() -> None:
     if shutil.which("iptables") is None:
         die("iptables is required but not found in PATH")
 
-    unblock_external_network()
-    for rule in reversed(_external_network_block_rules()):
+    unblock_external_network(VM_IP)
+    for rule in reversed(_external_network_block_rules(VM_IP)):
         run(["sudo", "iptables", "-I", "FORWARD", "1", *rule])
 
 
@@ -1602,7 +1610,26 @@ def prepare_blocked_network_vm() -> None:
     """Install host packages that are outside the bootstrap artifact bundle."""
     log("Preparing VM host packages before blocking external egress...")
     ssh_cmd("sudo cloud-init status --wait || true")
-    ssh_cmd("sudo env DEBIAN_FRONTEND=noninteractive sh -c 'rm -f /var/cache/apt/pkgcache.bin /var/cache/apt/srcpkgcache.bin && apt-get update && apt-get install -y systemd-container nftables'")
+    ssh_cmd(r"""
+sudo bash -s <<'SH'
+set -euo pipefail
+if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    rm -f /var/cache/apt/pkgcache.bin /var/cache/apt/srcpkgcache.bin
+    apt-get update
+    apt-get install -y systemd-container curl nftables util-linux
+elif command -v tdnf >/dev/null 2>&1; then
+    tdnf install -y systemd-container curl nftables util-linux
+elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y systemd-container curl nftables util-linux
+elif command -v yum >/dev/null 2>&1; then
+    yum install -y systemd-container curl nftables util-linux
+else
+    echo "no supported package manager found for blocked-network preparation" >&2
+    exit 1
+fi
+SH
+""")
 
 
 # ---------------------------------------------------------------------------
@@ -1910,6 +1937,8 @@ def mirror_oci_refs_to_local_registry(configs: list[NodeConfig]) -> list[NodeCon
         offline_ref = cfg.offline_artifacts_oci_ref
         rootfs_ref = cfg.rootfs_oci_image
         if cfg.block_external_network:
+            if not rootfs_ref:
+                die(f"node config {cfg.name!r} blocks external network but does not set offlineRootfsOCIImage")
             offline_ref = e2e_offline_ref
         elif offline_ref:
             source_ref = offline_ref
@@ -3686,6 +3715,10 @@ def collect_logs() -> None:
 def cleanup() -> None:
     """Tear down VM, networking, and Kind cluster."""
 
+    # Remove blocked-network rules while local infrastructure containers still
+    # exist, so rule reconstruction can include their current IPs.
+    unblock_all_external_network_rules()
+
     if shutil.which(CONTAINER_ENGINE):
         run_quiet([CONTAINER_ENGINE, "rm", "-f", LOCAL_ARTIFACT_REGISTRY_NAME], check=False)
 
@@ -3698,7 +3731,7 @@ def cleanup() -> None:
 
     # Remove networking
     log("Cleaning up networking...")
-    unblock_external_network()
+    unblock_all_external_network_rules()
     run_quiet(["sudo", "ip", "link", "del", TAP_NAME], check=False)
     if VM_NAME == "agent-config-e2e":
         for index, _cfg in enumerate(discover_node_configs()):
