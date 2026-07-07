@@ -279,6 +279,12 @@ type PXESpec struct {
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
 
+	// PullSecretRef references a Docker registry credential Secret used to pull
+	// Image. The Secret must be type kubernetes.io/dockerconfigjson or
+	// kubernetes.io/dockercfg.
+	// +optional
+	PullSecretRef *NamespacedSecretReference `json:"pullSecretRef,omitempty"`
+
 	// Architecture is the target CPU architecture for PXE boot artifacts and
 	// machine images.
 	// +kubebuilder:validation:Enum=amd64;arm64
@@ -291,6 +297,14 @@ type PXESpec struct {
 	// default netboot image that corresponds to its release.
 	// +optional
 	NetbootImage string `json:"netbootImage,omitempty"`
+
+	// NetbootPullSecretRef references a Docker registry credential Secret used to
+	// pull NetbootImage. It is ignored when NetbootImage is omitted; metalman's
+	// configured default netboot pull secret is used for the default netboot image.
+	// The Secret must be type kubernetes.io/dockerconfigjson or
+	// kubernetes.io/dockercfg.
+	// +optional
+	NetbootPullSecretRef *NamespacedSecretReference `json:"netbootPullSecretRef,omitempty"`
 
 	// BootProtocol selects how metalman should trigger network boot for
 	// repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
