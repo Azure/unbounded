@@ -196,7 +196,6 @@ jobs:
           cluster-name: ${{ env.KIND_CLUSTER_NAME }}
           vm-subnet: ${{ env.VM_SUBNET }}
           create-vm: "false"
-          node-image: kindest/node:v1.35.0
 
       - name: Set up machina resources
         uses: ./.github/actions/agent-e2e-machina-setup
