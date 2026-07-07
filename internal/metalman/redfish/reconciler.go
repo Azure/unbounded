@@ -26,10 +26,11 @@ import (
 
 const (
 	// Condition types set by this controller.
-	condPoweredOff          = "PoweredOff"
-	condBootSupported       = "BootOrderConfigSupported"
-	condSecureBootSupported = "SecureBootConfigSupported"
-	condRepaved             = "Repaved"
+	condPoweredOff              = "PoweredOff"
+	condBootSupported           = "BootOrderConfigSupported"
+	condSecureBootSupported     = "SecureBootConfigSupported"
+	condSecureBootKeysSupported = "SecureBootKeyEnrollmentSupported"
+	condRepaved                 = "Repaved"
 
 	// Condition reasons.
 	reasonPoweringOff  = "PoweringOff"
@@ -123,7 +124,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, fmt.Errorf("getting Redfish password secret: %w", err)
 	}
 
-	password := string(secret.Data[rf.PasswordRef.Key])
+	passwordBytes, ok := secret.Data[rf.PasswordRef.Key]
+	if !ok {
+		return ctrl.Result{}, fmt.Errorf("key %q not found in Redfish password secret %s/%s", rf.PasswordRef.Key, rf.PasswordRef.Namespace, rf.PasswordRef.Name)
+	}
+
+	password := string(passwordBytes)
 
 	// Acquire Redfish client.
 	c, err := r.Pool.Get(ctx, rf.URL, fingerprint, rf.Username, password, rf.DeviceID)
@@ -133,7 +139,46 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	desiredSecureBoot := !machine.Spec.PXE.InsecureDisableSecureBoot
 	secureBootCond := meta.FindStatusCondition(machine.Status.Conditions, condSecureBootSupported)
+	secureBootKeysCond := meta.FindStatusCondition(machine.Status.Conditions, condSecureBootKeysSupported)
 	secureBootStatusChanged := false
+	secureBootKeysStatusChanged := false
+
+	if len(machine.Spec.PXE.TrustedSecureBootKeys) > 0 {
+		if secureBootKeysCond != nil && secureBootKeysCond.Status == metav1.ConditionFalse {
+			return ctrl.Result{}, fmt.Errorf("secure boot key enrollment is not supported but trusted keys are configured: %w", ErrUnsupported)
+		}
+
+		if err := r.reconcileSecureBootKeys(ctx, log, &machine, c); err != nil {
+			if errors.Is(err, ErrUnsupported) {
+				log.Info("Secure Boot key enrollment not supported", "err", err)
+				meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+					Type:               condSecureBootKeysSupported,
+					Status:             metav1.ConditionFalse,
+					Reason:             reasonNotSupported,
+					ObservedGeneration: machine.Generation,
+				})
+
+				if err := r.Client.Status().Update(ctx, &machine); err != nil {
+					return ctrl.Result{}, fmt.Errorf("updating Secure Boot key enrollment support status: %w", err)
+				}
+
+				return ctrl.Result{}, fmt.Errorf("secure boot key enrollment is not supported but trusted keys are configured: %w", err)
+			}
+
+			return ctrl.Result{}, fmt.Errorf("reconciling Secure Boot trusted keys: %w", err)
+		}
+
+		if secureBootKeysCond == nil || secureBootKeysCond.Status != metav1.ConditionTrue || secureBootKeysCond.ObservedGeneration != machine.Generation {
+			meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+				Type:               condSecureBootKeysSupported,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Reconciled",
+				ObservedGeneration: machine.Generation,
+			})
+
+			secureBootKeysStatusChanged = true
+		}
+	}
 
 	if secureBootCond != nil && secureBootCond.Status == metav1.ConditionFalse && desiredSecureBoot {
 		return ctrl.Result{}, fmt.Errorf("secure boot config is not supported but secure boot is enabled: %w", ErrUnsupported)
@@ -206,7 +251,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// No reboot pending - done.
 	if machine.Spec.Operations.RebootCounter <= machine.Status.Operations.RebootCounter {
-		if secureBootStatusChanged {
+		if secureBootStatusChanged || secureBootKeysStatusChanged {
 			return ctrl.Result{}, r.Client.Status().Update(ctx, &machine)
 		}
 
@@ -219,6 +264,87 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	return r.reconcilePowerOn(ctx, log, &machine, c, pendingRepave)
+}
+
+func (r *Reconciler) reconcileSecureBootKeys(ctx context.Context, log *slog.Logger, machine *v1alpha3.Machine, c *Client) error {
+	for i := range machine.Spec.PXE.TrustedSecureBootKeys {
+		keyRef := &machine.Spec.PXE.TrustedSecureBootKeys[i]
+		database := keyRef.TargetDatabase()
+
+		certPEM, err := r.resolveSecureBootCertificate(ctx, keyRef)
+		if err != nil {
+			return err
+		}
+
+		cert, err := ParseSecureBootCertificate(certPEM)
+		if err != nil {
+			return err
+		}
+
+		existing, err := c.ListSecureBootCertificates(ctx, database)
+		if err != nil {
+			return err
+		}
+
+		if secureBootCertificateInstalled(existing, cert) {
+			continue
+		}
+
+		log.Info("enrolling Secure Boot trusted certificate", "database", database, "fingerprint", cert.SHA256Fingerprint)
+
+		if err := c.InstallSecureBootCertificate(ctx, database, cert); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *Reconciler) resolveSecureBootCertificate(ctx context.Context, keyRef *v1alpha3.TrustedSecureBootKeyRef) (string, error) {
+	if keyRef.SecretKeyRef == nil && keyRef.ConfigMapKeyRef == nil {
+		return "", fmt.Errorf("trusted Secure Boot key must set secretKeyRef or configMapKeyRef")
+	}
+
+	if keyRef.SecretKeyRef != nil && keyRef.ConfigMapKeyRef != nil {
+		return "", fmt.Errorf("trusted Secure Boot key must not set both secretKeyRef and configMapKeyRef")
+	}
+
+	if keyRef.SecretKeyRef != nil {
+		return r.resolveSecureBootCertificateFromSecret(ctx, keyRef.SecretKeyRef)
+	}
+
+	return r.resolveSecureBootCertificateFromConfigMap(ctx, keyRef.ConfigMapKeyRef)
+}
+
+func (r *Reconciler) resolveSecureBootCertificateFromSecret(ctx context.Context, ref *v1alpha3.SecureBootObjectKeySelector) (string, error) {
+	var secret corev1.Secret
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace}, &secret); err != nil {
+		return "", fmt.Errorf("getting Secure Boot certificate secret %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+
+	data, ok := secret.Data[ref.Key]
+	if !ok {
+		return "", fmt.Errorf("key %q not found in Secure Boot certificate secret %s/%s", ref.Key, ref.Namespace, ref.Name)
+	}
+
+	return string(data), nil
+}
+
+func (r *Reconciler) resolveSecureBootCertificateFromConfigMap(ctx context.Context, ref *v1alpha3.SecureBootObjectKeySelector) (string, error) {
+	var cm corev1.ConfigMap
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace}, &cm); err != nil {
+		return "", fmt.Errorf("getting Secure Boot certificate ConfigMap %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+
+	if data, ok := cm.Data[ref.Key]; ok {
+		return data, nil
+	}
+
+	if data, ok := cm.BinaryData[ref.Key]; ok {
+		return string(data), nil
+	}
+
+	return "", fmt.Errorf("key %q not found in Secure Boot certificate ConfigMap %s/%s", ref.Key, ref.Namespace, ref.Name)
 }
 
 // reconcileBootOrder ensures the boot source override matches the desired state.

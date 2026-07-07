@@ -5,12 +5,19 @@ package redfish
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1530,6 +1537,345 @@ func TestSecureBootUnsupportedWhenEnabledFailsClosed(t *testing.T) {
 	}
 }
 
+func TestSecureBootTrustedKeyInstallsMissingCertificate(t *testing.T) {
+	var (
+		postCalls atomic.Int64
+		postBody  map[string]any
+	)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot/SecureBootDatabases/db/Certificates"):
+			json.NewEncoder(w).Encode(map[string]any{"Members": []any{}})
+
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot/SecureBootDatabases/db/Certificates"):
+			postCalls.Add(1)
+			json.NewDecoder(r.Body).Decode(&postBody)
+			w.WriteHeader(http.StatusCreated)
+
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			json.NewEncoder(w).Encode(map[string]any{"SecureBootEnable": true})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			t.Fatal("unexpected SecureBoot PATCH")
+
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Hdd",
+					"BootSourceOverrideEnabled": "Disabled",
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			t.Fatal("unexpected boot PATCH")
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	certPEM := testSecureBootCertificatePEM(t)
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"}, Data: map[string][]byte{"password": []byte("secret")}}
+	certSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "secure-boot", Namespace: "default"}, Data: map[string][]byte{"db.pem": []byte(certPEM)}}
+	node := testSecureBootKeyMachine(srv.URL, tlsServerFingerprint(srv), &v1alpha3.TrustedSecureBootKeyRef{
+		SecretKeyRef: &v1alpha3.SecureBootObjectKeySelector{Name: "secure-boot", Namespace: "default", Key: "db.pem"},
+	})
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, secret, certSecret).WithStatusSubresource(node).Build()
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: node.Name, Namespace: node.Namespace}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if postCalls.Load() != 1 {
+		t.Fatalf("expected 1 certificate POST call, got %d", postCalls.Load())
+	}
+
+	if postBody["CertificateType"] != certificateTypePEM {
+		t.Fatalf("expected CertificateType=%s, got %v", certificateTypePEM, postBody["CertificateType"])
+	}
+
+	if postBody["CertificateString"] != certPEM {
+		t.Fatalf("expected posted certificate to match ref data")
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), types.NamespacedName{Name: node.Name, Namespace: node.Namespace}, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, condSecureBootKeysSupported)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Reconciled" {
+		t.Fatalf("expected SecureBootKeyEnrollmentSupported=True/Reconciled, got %+v", cond)
+	}
+}
+
+func TestSecureBootTrustedKeyAlreadyInstalledNoOp(t *testing.T) {
+	var postCalls atomic.Int64
+
+	certPEM := testSecureBootCertificatePEM(t)
+
+	material, err := ParseSecureBootCertificate(certPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot/SecureBootDatabases/db/Certificates"):
+			json.NewEncoder(w).Encode(map[string]any{"Members": []map[string]any{{
+				"Fingerprint":              material.SHA256Fingerprint,
+				"FingerprintHashAlgorithm": "SHA256",
+			}}})
+
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot/SecureBootDatabases/db/Certificates"):
+			postCalls.Add(1)
+			w.WriteHeader(http.StatusCreated)
+
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			json.NewEncoder(w).Encode(map[string]any{"SecureBootEnable": true})
+
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Hdd",
+					"BootSourceOverrideEnabled": "Disabled",
+				},
+			})
+
+		case r.Method == http.MethodPatch:
+			t.Fatal("unexpected PATCH")
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"}, Data: map[string][]byte{"password": []byte("secret")}}
+	certSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "secure-boot", Namespace: "default"}, Data: map[string][]byte{"db.pem": []byte(certPEM)}}
+	node := testSecureBootKeyMachine(srv.URL, tlsServerFingerprint(srv), &v1alpha3.TrustedSecureBootKeyRef{
+		SecretKeyRef: &v1alpha3.SecureBootObjectKeySelector{Name: "secure-boot", Namespace: "default", Key: "db.pem"},
+	})
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, secret, certSecret).WithStatusSubresource(node).Build()
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+
+	_, err = reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: node.Name, Namespace: node.Namespace}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if postCalls.Load() != 0 {
+		t.Fatalf("expected no certificate POST calls, got %d", postCalls.Load())
+	}
+}
+
+func TestSecureBootTrustedKeyFromConfigMapWithDatabase(t *testing.T) {
+	var postPath string
+
+	certPEM := testSecureBootCertificatePEM(t)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot/SecureBootDatabases/KEK/Certificates"):
+			json.NewEncoder(w).Encode(map[string]any{"Members": []any{}})
+
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot/SecureBootDatabases/KEK/Certificates"):
+			postPath = r.URL.Path
+
+			w.WriteHeader(http.StatusCreated)
+
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			json.NewEncoder(w).Encode(map[string]any{"SecureBootEnable": true})
+
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Hdd",
+					"BootSourceOverrideEnabled": "Disabled",
+				},
+			})
+
+		case r.Method == http.MethodPatch:
+			t.Fatal("unexpected PATCH")
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"}, Data: map[string][]byte{"password": []byte("secret")}}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "secure-boot", Namespace: "default"}, Data: map[string]string{"kek.pem": certPEM}}
+	node := testSecureBootKeyMachine(srv.URL, tlsServerFingerprint(srv), &v1alpha3.TrustedSecureBootKeyRef{
+		Database:        v1alpha3.SecureBootDatabaseKEK,
+		ConfigMapKeyRef: &v1alpha3.SecureBootObjectKeySelector{Name: "secure-boot", Namespace: "default", Key: "kek.pem"},
+	})
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, secret, cm).WithStatusSubresource(node).Build()
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: node.Name, Namespace: node.Namespace}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if !strings.HasSuffix(postPath, "/Systems/System.Embedded.1/SecureBoot/SecureBootDatabases/KEK/Certificates") {
+		t.Fatalf("expected KEK certificate collection POST, got %q", postPath)
+	}
+}
+
+func TestSecureBootTrustedKeyInvalidPEMFailsBeforePost(t *testing.T) {
+	var postCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/SecureBootDatabases/"):
+			postCalls.Add(1)
+			w.WriteHeader(http.StatusCreated)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"}, Data: map[string][]byte{"password": []byte("secret")}}
+	certSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "secure-boot", Namespace: "default"}, Data: map[string][]byte{"db.pem": []byte("not a certificate")}}
+	node := testSecureBootKeyMachine(srv.URL, tlsServerFingerprint(srv), &v1alpha3.TrustedSecureBootKeyRef{
+		SecretKeyRef: &v1alpha3.SecureBootObjectKeySelector{Name: "secure-boot", Namespace: "default", Key: "db.pem"},
+	})
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, secret, certSecret).WithStatusSubresource(node).Build()
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: node.Name, Namespace: node.Namespace}})
+	if err == nil || !strings.Contains(err.Error(), "no PEM block") {
+		t.Fatalf("expected invalid PEM error, got %v", err)
+	}
+
+	if postCalls.Load() != 0 {
+		t.Fatalf("expected no certificate POST calls, got %d", postCalls.Load())
+	}
+}
+
+func TestSecureBootTrustedKeyUnsupportedFailsClosed(t *testing.T) {
+	var getCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot/SecureBootDatabases/db/Certificates"):
+			getCalls.Add(1)
+			http.NotFound(w, r)
+
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/SecureBootDatabases/"):
+			t.Fatal("unexpected certificate POST")
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	certPEM := testSecureBootCertificatePEM(t)
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"}, Data: map[string][]byte{"password": []byte("secret")}}
+	certSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "secure-boot", Namespace: "default"}, Data: map[string][]byte{"db.pem": []byte(certPEM)}}
+	node := testSecureBootKeyMachine(srv.URL, tlsServerFingerprint(srv), &v1alpha3.TrustedSecureBootKeyRef{
+		SecretKeyRef: &v1alpha3.SecureBootObjectKeySelector{Name: "secure-boot", Namespace: "default", Key: "db.pem"},
+	})
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, secret, certSecret).WithStatusSubresource(node).Build()
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: node.Name, Namespace: node.Namespace}}
+
+	_, err := reconciler.Reconcile(t.Context(), req)
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("expected ErrUnsupported, got %v", err)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), types.NamespacedName{Name: node.Name, Namespace: node.Namespace}, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, condSecureBootKeysSupported)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonNotSupported {
+		t.Fatalf("expected SecureBootKeyEnrollmentSupported=False/NotSupported, got %+v", cond)
+	}
+
+	if getCalls.Load() != 1 {
+		t.Fatalf("expected 1 certificate GET call, got %d", getCalls.Load())
+	}
+
+	_, err = reconciler.Reconcile(t.Context(), req)
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("expected cached ErrUnsupported, got %v", err)
+	}
+
+	if getCalls.Load() != 1 {
+		t.Fatalf("expected certificate GET to be skipped after unsupported condition, got %d calls", getCalls.Load())
+	}
+}
+
+func TestSecureBootTrustedKeyMissingSecretKeyFails(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"}, Data: map[string][]byte{"password": []byte("secret")}}
+	certSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "secure-boot", Namespace: "default"}, Data: map[string][]byte{"other.pem": []byte(testSecureBootCertificatePEM(t))}}
+	node := testSecureBootKeyMachine(srv.URL, tlsServerFingerprint(srv), &v1alpha3.TrustedSecureBootKeyRef{
+		SecretKeyRef: &v1alpha3.SecureBootObjectKeySelector{Name: "secure-boot", Namespace: "default", Key: "db.pem"},
+	})
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, secret, certSecret).WithStatusSubresource(node).Build()
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: node.Name, Namespace: node.Namespace}})
+	if err == nil || !strings.Contains(err.Error(), "key \"db.pem\" not found") {
+		t.Fatalf("expected missing key error, got %v", err)
+	}
+}
+
 func TestUEFIHTTPBootEndToEnd(t *testing.T) {
 	var bootPatchBody map[string]any
 
@@ -2554,6 +2900,53 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	}
 
 	return s
+}
+
+func testSecureBootKeyMachine(redfishURL, fingerprint string, keyRef *v1alpha3.TrustedSecureBootKeyRef) *v1alpha3.Machine {
+	return &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-secure-boot-key", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:                 "ghcr.io/test/test-image:v1",
+				TrustedSecureBootKeys: []v1alpha3.TrustedSecureBootKeyRef{*keyRef},
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         redfishURL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{},
+		},
+		Status: v1alpha3.MachineStatus{Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fingerprint}},
+	}
+}
+
+func testSecureBootCertificatePEM(t testing.TB) string {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "unbounded-db",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }
 
 func tlsServerFingerprint(srv *httptest.Server) string {

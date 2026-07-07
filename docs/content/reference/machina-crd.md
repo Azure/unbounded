@@ -56,6 +56,17 @@ PXE boot configuration consumed by the metalman controller.
 | `pxe.architecture` | string | No | `amd64` | Target CPU architecture for PXE boot artifacts and machine images. Allowed values: `amd64`, `arm64`. |
 | `pxe.netbootImage` | string | No | Metalman default | OCI netboot image reference containing PXE boot artifacts. |
 | `pxe.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP boot with a URL derived from the netboot image metadata. Allowed values: `PXE`, `HTTP`. |
+| `pxe.insecureDisableSecureBoot` | bool | No | `false` | Disables UEFI Secure Boot configuration through Redfish. By default, metalman enables Secure Boot for HTTP boot repaves. |
+| `pxe.trustedSecureBootKeys` | []TrustedSecureBootKeyRef | No | - | PEM-encoded X.509 certificates to enroll into UEFI Secure Boot databases through Redfish. Metalman enrolls missing certificates and does not remove existing keys. |
+| `pxe.trustedSecureBootKeys[].database` | string | No | `db` | UEFI Secure Boot database to enroll into. Allowed values: `PK`, `KEK`, `db`, `dbx`. |
+| `pxe.trustedSecureBootKeys[].secretKeyRef` | SecureBootObjectKeySelector | No | - | Secret key containing a PEM-encoded X.509 certificate. Exactly one of `secretKeyRef` or `configMapKeyRef` should be set. |
+| `pxe.trustedSecureBootKeys[].configMapKeyRef` | SecureBootObjectKeySelector | No | - | ConfigMap key containing a PEM-encoded X.509 certificate. Exactly one of `secretKeyRef` or `configMapKeyRef` should be set. |
+| `pxe.trustedSecureBootKeys[].secretKeyRef.name` | string | Yes | - | Secret name. |
+| `pxe.trustedSecureBootKeys[].secretKeyRef.namespace` | string | Yes | - | Secret namespace. |
+| `pxe.trustedSecureBootKeys[].secretKeyRef.key` | string | Yes | - | Secret data key. |
+| `pxe.trustedSecureBootKeys[].configMapKeyRef.name` | string | Yes | - | ConfigMap name. |
+| `pxe.trustedSecureBootKeys[].configMapKeyRef.namespace` | string | Yes | - | ConfigMap namespace. |
+| `pxe.trustedSecureBootKeys[].configMapKeyRef.key` | string | Yes | - | ConfigMap data or binaryData key. |
 | `pxe.dhcpLeases` | []DHCPLease | No | - | Static DHCP leases served during PXE boot. |
 | `pxe.dhcpLeases[].ipv4` | string | Yes | - | Static IPv4 address to assign. |
 | `pxe.dhcpLeases[].mac` | string | Yes | - | NIC MAC address (matched case-insensitively). |

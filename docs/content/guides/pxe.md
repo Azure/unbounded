@@ -118,6 +118,53 @@ spec:
 
 Store BMC passwords in a Secret referenced by `passwordRef`. See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for all fields.
 
+## Secure Boot Trusted Keys
+
+When a Machine has `spec.pxe.redfish`, metalman can enroll trusted UEFI Secure Boot certificates through Redfish before enabling Secure Boot or changing boot order. Each trusted key must be a PEM-encoded X.509 certificate stored in a Secret or ConfigMap. By default certificates are enrolled into `db`, the UEFI allowed signatures database used to trust bootloader signing keys.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: secure-boot-certs
+  namespace: unbounded-kube
+type: Opaque
+stringData:
+  db.pem: |
+    -----BEGIN CERTIFICATE-----
+    ...
+    -----END CERTIFICATE-----
+```
+
+Reference the certificate from the Machine:
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
+metadata:
+  name: server-01
+spec:
+  pxe:
+    image: ghcr.io/azure/host-ubuntu2404:v1
+    redfish:
+      url: "https://bmc-01.example.com"
+      username: admin
+      passwordRef:
+        name: bmc-passwords
+        namespace: unbounded-kube
+        key: bmc-01
+    trustedSecureBootKeys:
+    - database: db
+      secretKeyRef:
+        name: secure-boot-certs
+        namespace: unbounded-kube
+        key: db.pem
+```
+
+`database` can be `PK`, `KEK`, `db`, or `dbx`; omit it to use `db`. ConfigMap-backed certificates use `configMapKeyRef` with the same `name`, `namespace`, and `key` fields.
+
+Metalman compares the certificate's SHA-256 DER fingerprint with certificates already reported by the BMC and only POSTs missing certificates. It does not delete keys that are present on the BMC but absent from the Machine spec. If a Machine configures trusted keys and the BMC does not support Redfish certificate enrollment, reconciliation fails closed and sets `SecureBootKeyEnrollmentSupported=False`.
+
 ## Cloud-Init Customization
 
 Cloud-init on PXE-booted machines uses two data sources that are merged at boot:

@@ -425,7 +425,7 @@ func resolveDeviceID(ctx context.Context, s *bmcSession, deviceID string) (strin
 
 // isSuccessStatus returns true for HTTP status codes indicating success.
 func isSuccessStatus(code int) bool {
-	return code == http.StatusOK || code == http.StatusNoContent || code == http.StatusAccepted
+	return code == http.StatusOK || code == http.StatusCreated || code == http.StatusNoContent || code == http.StatusAccepted
 }
 
 // isUnsupportedStatus returns true for HTTP status codes that indicate the BMC

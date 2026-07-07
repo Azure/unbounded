@@ -305,6 +305,13 @@ type PXESpec struct {
 	// +optional
 	InsecureDisableSecureBoot bool `json:"insecureDisableSecureBoot,omitempty"`
 
+	// TrustedSecureBootKeys configures public certificates that metalman
+	// enrolls into UEFI Secure Boot databases through Redfish. The referenced
+	// data must contain a PEM-encoded X.509 certificate. Metalman only enrolls
+	// missing certificates and does not remove keys already present on the BMC.
+	// +optional
+	TrustedSecureBootKeys []TrustedSecureBootKeyRef `json:"trustedSecureBootKeys,omitempty"`
+
 	// DHCPLeases defines static DHCP leases for PXE booting.
 	// +optional
 	DHCPLeases []DHCPLease `json:"dhcpLeases,omitempty"`
@@ -332,7 +339,65 @@ const (
 	DefaultPXEArchitecture = PXEArchitectureAMD64
 	// DefaultPXEBootProtocol is used when spec.pxe.bootProtocol is omitted.
 	DefaultPXEBootProtocol = PXEBootProtocolPXE
+	// SecureBootDatabasePK is the UEFI Platform Key database.
+	SecureBootDatabasePK = "PK"
+	// SecureBootDatabaseKEK is the UEFI Key Exchange Key database.
+	SecureBootDatabaseKEK = "KEK"
+	// SecureBootDatabaseDB is the UEFI allowed signatures database.
+	SecureBootDatabaseDB = "db"
+	// SecureBootDatabaseDBX is the UEFI forbidden signatures database.
+	SecureBootDatabaseDBX = "dbx"
+	// DefaultSecureBootDatabase is used when a trusted Secure Boot key does
+	// not specify a database.
+	DefaultSecureBootDatabase = SecureBootDatabaseDB
 )
+
+// TrustedSecureBootKeyRef references a public Secure Boot certificate to enroll.
+type TrustedSecureBootKeyRef struct {
+	// Database is the UEFI Secure Boot database to enroll into. Defaults to db,
+	// the allowed signatures database used to trust bootloader signing keys.
+	// +kubebuilder:validation:Enum=PK;KEK;db;dbx
+	// +kubebuilder:default=db
+	// +optional
+	Database string `json:"database,omitempty"`
+
+	// SecretKeyRef references a Secret key containing a PEM-encoded X.509
+	// certificate.
+	// +optional
+	SecretKeyRef *SecureBootObjectKeySelector `json:"secretKeyRef,omitempty"`
+
+	// ConfigMapKeyRef references a ConfigMap key containing a PEM-encoded X.509
+	// certificate.
+	// +optional
+	ConfigMapKeyRef *SecureBootObjectKeySelector `json:"configMapKeyRef,omitempty"`
+}
+
+// TargetDatabase returns the effective UEFI Secure Boot database.
+func (r *TrustedSecureBootKeyRef) TargetDatabase() string {
+	if r == nil || r.Database == "" {
+		return DefaultSecureBootDatabase
+	}
+
+	return r.Database
+}
+
+// SecureBootObjectKeySelector selects a key from a Secret or ConfigMap.
+type SecureBootObjectKeySelector struct {
+	// Name of the object.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Namespace of the object.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Namespace string `json:"namespace"`
+
+	// Key within the object.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Key string `json:"key"`
+}
 
 // TargetArchitecture returns the effective PXE target architecture.
 func (p *PXESpec) TargetArchitecture() string {

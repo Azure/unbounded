@@ -448,6 +448,73 @@ spec:
                     - url
                     - username
                     type: object
+                  trustedSecureBootKeys:
+                    description: |-
+                      TrustedSecureBootKeys configures public certificates that metalman
+                      enrolls into UEFI Secure Boot databases through Redfish. The referenced
+                      data must contain a PEM-encoded X.509 certificate. Metalman only enrolls
+                      missing certificates and does not remove keys already present on the BMC.
+                    items:
+                      description: TrustedSecureBootKeyRef references a public Secure
+                        Boot certificate to enroll.
+                      properties:
+                        configMapKeyRef:
+                          description: |-
+                            ConfigMapKeyRef references a ConfigMap key containing a PEM-encoded X.509
+                            certificate.
+                          properties:
+                            key:
+                              description: Key within the object.
+                              minLength: 1
+                              type: string
+                            name:
+                              description: Name of the object.
+                              minLength: 1
+                              type: string
+                            namespace:
+                              description: Namespace of the object.
+                              minLength: 1
+                              type: string
+                          required:
+                          - key
+                          - name
+                          - namespace
+                          type: object
+                        database:
+                          default: db
+                          description: |-
+                            Database is the UEFI Secure Boot database to enroll into. Defaults to db,
+                            the allowed signatures database used to trust bootloader signing keys.
+                          enum:
+                          - PK
+                          - KEK
+                          - db
+                          - dbx
+                          type: string
+                        secretKeyRef:
+                          description: |-
+                            SecretKeyRef references a Secret key containing a PEM-encoded X.509
+                            certificate.
+                          properties:
+                            key:
+                              description: Key within the object.
+                              minLength: 1
+                              type: string
+                            name:
+                              description: Name of the object.
+                              minLength: 1
+                              type: string
+                            namespace:
+                              description: Namespace of the object.
+                              minLength: 1
+                              type: string
+                          required:
+                          - key
+                          - name
+                          - namespace
+                          type: object
+                      type: object
+                    type: array
                 required:
                 - image
                 type: object
