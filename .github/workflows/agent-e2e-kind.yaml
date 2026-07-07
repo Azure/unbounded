@@ -11,8 +11,10 @@ on:
       - internal/cloudprovider/**
       - pkg/agent/**
       - internal/provision/**
+      - internal/agentartifacts/**
       - internal/kube/**
       - hack/agent/e2e-kind/**
+      - hack/cmd/agent-artifacts-builder/**
       - deploy/machina/crd/**
       - deploy/machina/*.yaml.tmpl
       - deploy/net/crd/**
@@ -31,8 +33,10 @@ on:
       - internal/cloudprovider/**
       - pkg/agent/**
       - internal/provision/**
+      - internal/agentartifacts/**
       - internal/kube/**
       - hack/agent/e2e-kind/**
+      - hack/cmd/agent-artifacts-builder/**
       - deploy/machina/crd/**
       - deploy/machina/*.yaml.tmpl
       - deploy/net/crd/**
@@ -47,6 +51,7 @@ on:
 
 permissions:
   contents: read
+  packages: read
 
 jobs:
   agent-e2e:
@@ -180,6 +185,7 @@ jobs:
       VM_SUBNET: "192.168.110"
       VM_IP: "192.168.110.10"
       AGENT_MACHINE_NAME: agent-config-e2e
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

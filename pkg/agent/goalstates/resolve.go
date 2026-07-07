@@ -34,8 +34,14 @@ type MachineGoalState struct {
 
 // ResolveMachine probes the host (kernel version, hostname, GPU hardware) and
 // resolves the complete goal state for the named nspawn machine from an agent
-// config.
+// config and caller-provided download overrides.
 func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
+	sandboxImage := cfg.CRI.Containerd.SandboxImage
+
+	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
+		return nil, err
+	}
+
 	kernel, err := hostKernel()
 	if err != nil {
 		return nil, fmt.Errorf("get host kernel: %w", err)
@@ -44,10 +50,6 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	hostname, err := os.Hostname()
 	if err != nil {
 		return nil, fmt.Errorf("get host hostname: %w", err)
-	}
-
-	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
-		return nil, err
 	}
 
 	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
@@ -109,7 +111,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		KubeMachineName: cfg.MachineName,
 		NodeName:        cfg.NodeName,
 		MachineDir:      filepath.Join("/var/lib/machines", machineName),
-		Containerd:      ResolveContainerd(),
+		Containerd:      ResolveContainerd(sandboxImage),
 		Kubelet:         kubelet,
 		Nvidia:          nvidia,
 	}

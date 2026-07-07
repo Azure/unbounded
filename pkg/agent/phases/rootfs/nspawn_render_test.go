@@ -148,10 +148,12 @@ func TestConfigRegenerationUnit(t *testing.T) {
 
 func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {
 	return nspawnTemplateData{
-		MachineName:            machineName,
-		BPFFSMountPath:         goalstates.BPFFSMountPath(machineName),
-		ConfigRegenerationUnit: goalstates.ConfigRegenerationUnit(machineName),
-		AgentBinaryPath:        goalstates.DaemonBinaryPath,
+		MachineName:                  machineName,
+		BPFFSMountPath:               goalstates.BPFFSMountPath(machineName),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
+		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
+		AgentBinaryPath:              goalstates.DaemonBinaryPath,
 	}
 }
 

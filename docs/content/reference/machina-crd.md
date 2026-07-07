@@ -62,6 +62,7 @@ PXE boot configuration consumed by the metalman controller.
 | `pxe.dhcpLeases[].subnetMask` | string | Yes | - | Subnet mask. |
 | `pxe.dhcpLeases[].gateway` | string | Yes | - | Default gateway. |
 | `pxe.dhcpLeases[].dns` | []string | No | - | DNS server addresses. |
+| `pxe.targetDisk` | string | No | Installer-selected | Block device the installer writes the machine image to, such as `/dev/nvme0n1` or `/dev/disk/by-id/...`. When omitted, the initrd selects a disk automatically. |
 | `pxe.redfish` | RedfishSpec | No | - | BMC access via the Redfish API. |
 | `pxe.redfish.url` | string | Yes | - | Redfish endpoint URL. |
 | `pxe.redfish.username` | string | Yes | - | Redfish username. |
@@ -430,10 +431,17 @@ Templates receive the following data object:
 | Field | Type | Description |
 |-------|------|-------------|
 | `.Machine` | *Machine | The Machine CR that initiated the request. |
+| `.BootLease` | *DHCPLease | The DHCP lease matching the request source IP, or the first lease when no match is available. Netboot templates use this to pass the provisioning NIC MAC and static IP to the installer. |
 | `.ApiserverURL` | string | External Kubernetes API server URL. |
 | `.ServeURL` | string | External metalman HTTP URL. |
 | `.KubernetesVersion` | string | Resolved Kubernetes version for the machine. |
 | `.ClusterDNS` | string | Cluster DNS service IP. |
+
+The default netboot template passes `.BootLease.MAC` as `unbounded.boot_mac`.
+The installer initrd uses that MAC address to configure the provisioning
+interface instead of relying on kernel interface names such as `eth0`.
+If `spec.pxe.targetDisk` is set, the template passes it as `unbounded.disk`;
+otherwise the installer falls back to automatic disk selection.
 
 ### Building images
 

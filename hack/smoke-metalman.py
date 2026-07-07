@@ -31,6 +31,8 @@ API_GROUP = "unbounded-cloud.io"
 API_VERSION = f"{API_GROUP}/v1alpha3"
 NODE_LABEL_KEY = "unbounded-cloud.io/smoke-test"
 NODE_LABEL_VALUE = "metalman"
+METALMAN_NAMESPACE = "unbounded-kube"
+METALMAN_CONTROLLER_SA = "metalman-controller"
 VM_NAME = "unbounded-metal-smoke"
 NET_NAME = "unbounded-metal-smoke"
 SUBNET = "192.168.200"
@@ -356,10 +358,12 @@ def clean_libvirt() -> None:
     # Kill any leftover metalman serve-pxe from a previous run.
     # Use the binary path to avoid matching this script (smoke-metalman.py).
     run_quiet(["sudo", "pkill", "-f", "bin/metalman"])
+    # Kill any leftover artifact download server from a previous run.
+    run_quiet(["sudo", "pkill", "-f", f"python3 -m http.server {AGENT_DOWNLOAD_PORT}"])
     # Stop and remove leftover local registry container.
     run_quiet(["docker", "rm", "-f", REGISTRY_CONTAINER])
     # Delete stale leader-election leases so new processes acquire immediately.
-    run_quiet([KUBECTL, "-n", "unbounded-kube", "delete", "lease",
+    run_quiet([KUBECTL, "-n", METALMAN_NAMESPACE, "delete", "lease",
                f"metalman-{SITE}"])
     time.sleep(1)
 
@@ -405,6 +409,47 @@ def _sigint_handler(sig: int, frame: Any) -> None:
 
 def kubectl(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
     return run([KUBECTL, *args], **kw)
+
+
+def write_service_account_kubeconfig(namespace: str, service_account: str, path: Path) -> None:
+    token = run(
+        [KUBECTL, "-n", namespace, "create", "token", service_account, "--duration=2h"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if not token:
+        die(f"Failed to create token for ServiceAccount {namespace}/{service_account}")
+
+    raw_config = run(
+        [KUBECTL, "config", "view", "--raw", "--minify", "-o", "json"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    current = json.loads(raw_config)
+    clusters = current.get("clusters", [])
+    if len(clusters) != 1:
+        die(f"Expected one current kubeconfig cluster, got {len(clusters)}")
+    cluster_name = clusters[0]["name"]
+
+    user_name = f"{namespace}:{service_account}"
+    kubeconfig = {
+        "apiVersion": "v1",
+        "kind": "Config",
+        "clusters": clusters,
+        "contexts": [{
+            "name": user_name,
+            "context": {
+                "cluster": cluster_name,
+                "namespace": namespace,
+                "user": user_name,
+            },
+        }],
+        "current-context": user_name,
+        "users": [{"name": user_name, "user": {"token": token}}],
+    }
+
+    path.write_text(json.dumps(kubeconfig), encoding="utf-8")
+    os.chmod(path, 0o600)
 
 
 def apiserver_url() -> str:
@@ -1139,9 +1184,10 @@ def main() -> None:
     log("  Resources created")
 
     log("Starting metalman serve-pxe")
+    metalman_kubeconfig = TMPDIR / "metalman-controller.kubeconfig"
+    write_service_account_kubeconfig(METALMAN_NAMESPACE, METALMAN_CONTROLLER_SA, metalman_kubeconfig)
     metalman_env = [f"METALMAN_APISERVER_URL={server_url}"]
-    if kubeconfig := os.environ.get("KUBECONFIG"):
-        metalman_env.append(f"KUBECONFIG={kubeconfig}")
+    metalman_env.append(f"KUBECONFIG={metalman_kubeconfig}")
 
     proc = spawn([
         "sudo", "env", *metalman_env,

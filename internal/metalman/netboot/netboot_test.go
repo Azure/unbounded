@@ -429,16 +429,54 @@ func TestTFTPServerRecordsOnlyInitialBootLoader(t *testing.T) {
 		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
 	})
 	recorder := &recordingTFTPStatusRecorder{}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-1"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{},
+		},
+	}
 	server := &TFTPServer{
 		FileResolver:   FileResolver{Cache: cache},
 		StatusRecorder: recorder,
 	}
 
-	server.recordBootLoaderDownloaded(t.Context(), testLogger(), "machine-1", "ghcr.io/test/image:v1", "grubx64.efi")
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, "ghcr.io/test/image:v1", "grubx64.efi")
 	require.Empty(t, recorder.calls)
 
-	server.recordBootLoaderDownloaded(t.Context(), testLogger(), "machine-1", "ghcr.io/test/image:v1", "shimx64.efi")
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, "ghcr.io/test/image:v1", "shimx64.efi")
 	require.Equal(t, []string{"machine-1:shimx64.efi"}, recorder.calls)
+}
+
+func TestTFTPServerRecordsInitialBootLoaderForTargetArchitecture(t *testing.T) {
+	cacheDir := t.TempDir()
+	cache := NewOCICache(cacheDir)
+
+	require.NoError(t, populateOCICacheForArchitecture(cacheDir, "amd64digest", v1alpha3.PXEArchitectureAMD64, map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
+	}))
+	require.NoError(t, populateOCICacheForArchitecture(cacheDir, "arm64digest", v1alpha3.PXEArchitectureARM64, map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimaa64.efi\n"),
+	}))
+	cache.SetDigestForArchitecture("ghcr.io/test/image:v1", v1alpha3.PXEArchitectureAMD64, "sha256:amd64digest")
+	cache.SetDigestForArchitecture("ghcr.io/test/image:v1", v1alpha3.PXEArchitectureARM64, "sha256:arm64digest")
+
+	recorder := &recordingTFTPStatusRecorder{}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-arm"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{Architecture: v1alpha3.PXEArchitectureARM64},
+		},
+	}
+	server := &TFTPServer{
+		FileResolver:   FileResolver{Cache: cache},
+		StatusRecorder: recorder,
+	}
+
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, "ghcr.io/test/image:v1", "shimx64.efi")
+	require.Empty(t, recorder.calls)
+
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, "ghcr.io/test/image:v1", "shimaa64.efi")
+	require.Equal(t, []string{"machine-arm:shimaa64.efi"}, recorder.calls)
 }
 
 func TestHTTPServerDoesNotRecordBootImageWriteOnFileDownload(t *testing.T) {
@@ -773,8 +811,10 @@ func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-no-operations", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
+				TargetDisk: "/dev/disk/by-id/test-os-disk",
 				DHCPLeases: []v1alpha3.DHCPLease{{
 					IPv4:       "10.0.1.20",
+					MAC:        "aa:bb:cc:dd:ee:20",
 					Gateway:    "10.0.1.1",
 					SubnetMask: "255.255.255.0",
 				}},
@@ -786,6 +826,7 @@ func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
 		node,
 		ClusterInfo{ApiserverURL: "https://k8s.example.com"},
 		"http://10.0.1.1:8080",
+		"",
 		"",
 	)
 
@@ -799,12 +840,51 @@ func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
 		"No pending repave",
 		"unbounded.image_url=http://10.0.1.1:8080/disk.img.gz",
 		"unbounded.node_name=node-no-operations",
-		"ip=10.0.1.20::10.0.1.1:255.255.255.0::eth0:none",
+		"unbounded.boot_mac=aa:bb:cc:dd:ee:20",
+		"unbounded.disk=/dev/disk/by-id/test-os-disk",
+		"ip=10.0.1.20::10.0.1.1:255.255.255.0:::none",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("expected %q in rendered grub.cfg, got:\n%s", want, body)
 		}
 	}
+
+	require.NotContains(t, body, "eth0")
+}
+
+func TestGrubTemplate_SelectsBootLeaseByRequestIP(t *testing.T) {
+	grubTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "grub.cfg.tmpl"))
+	require.NoError(t, err)
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-multi-lease", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				DHCPLeases: []v1alpha3.DHCPLease{
+					{IPv4: "10.0.1.20", MAC: "aa:bb:cc:dd:ee:20", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0"},
+					{IPv4: "10.0.1.21", MAC: "aa:bb:cc:dd:ee:21", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+	}
+
+	data := newTemplateData(
+		node,
+		ClusterInfo{ApiserverURL: "https://k8s.example.com"},
+		"http://10.0.1.1:8080",
+		"",
+		"10.0.1.21",
+	)
+
+	result, err := renderTemplate(string(grubTmpl), data)
+	require.NoError(t, err)
+
+	body := string(result)
+	require.Contains(t, body, "unbounded.boot_mac=aa:bb:cc:dd:ee:21")
+	require.Contains(t, body, "ip=10.0.1.21::10.0.1.1:255.255.255.0:::none")
+	require.NotContains(t, body, "unbounded.boot_mac=aa:bb:cc:dd:ee:20")
+	require.NotContains(t, body, "unbounded.disk=")
 }
 
 func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
