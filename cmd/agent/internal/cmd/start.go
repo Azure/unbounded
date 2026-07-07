@@ -47,7 +47,12 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 			log := cmdCtx.Logger
 
-			gs, err := goalstates.ResolveMachine(log, &cfg.AgentConfig, goalstates.NSpawnMachineKube1, provision.ResolveDownloadOverrides(cfg.Downloads))
+			downloads, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(cfg)
+			if err != nil {
+				return err
+			}
+
+			gs, err := goalstates.ResolveMachine(log, &cfg.AgentConfig, goalstates.NSpawnMachineKube1, downloads)
 			if err != nil {
 				return err
 			}

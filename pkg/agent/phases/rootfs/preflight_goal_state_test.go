@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
@@ -26,7 +27,7 @@ func validRootFSGoalState(t *testing.T) *goalstates.RootFS {
 }
 
 func TestRootFSPreflightCheckSet(t *testing.T) {
-	checks := Preflight(slog.New(slog.DiscardHandler), nil, &goalstates.MachineGoalState{RootFS: validRootFSGoalState(t)})
+	checks := Preflight(slog.New(slog.DiscardHandler), config.AgentConfig{}, &goalstates.MachineGoalState{RootFS: validRootFSGoalState(t)})
 
 	names := make([]string, 0, len(checks))
 	for _, check := range checks {
