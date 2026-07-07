@@ -284,6 +284,10 @@ type CRIConfig struct {
 type ContainerdConfig struct {
 	// Version overrides the default containerd version (e.g. "2.1.8").
 	Version string `json:"Version,omitempty"`
+
+	// SandboxImage overrides the CRI sandbox image used by containerd
+	// (e.g. "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9").
+	SandboxImage string `json:"SandboxImage,omitempty"`
 }
 
 // RuncConfig holds runc-specific overrides.

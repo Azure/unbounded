@@ -77,7 +77,7 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("validate agent config: %w", err)
 	}
 
-	downloads, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(cfg)
+	downloads, _, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(cfg)
 	if err != nil {
 		return fmt.Errorf("resolve download overrides: %w", err)
 	}

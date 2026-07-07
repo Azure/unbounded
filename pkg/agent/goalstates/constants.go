@@ -80,6 +80,12 @@ func AppliedConfigPath(machineName string) string {
 	return fmt.Sprintf("%s/%s-applied-config.json", AgentConfigDir, machineName)
 }
 
+// ContainerImageArchivePath returns the path inside the nspawn machine where a
+// preloaded container image archive is staged before importing into containerd.
+func ContainerImageArchivePath(index int) string {
+	return fmt.Sprintf("%s/image-%d.tar", ContainerImageArchiveDir, index)
+}
+
 func KubeProxyImage(kubernetesVersion string) string {
 	kubernetesVersion = strings.TrimSpace(kubernetesVersion)
 	if kubernetesVersion == "" {
@@ -99,6 +105,16 @@ const (
 	ContainerdMetricsAddress = "0.0.0.0:10257"
 	SandboxImage             = "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9"
 	KubeProxyImageRepository = "mcr.microsoft.com/oss/v2/kubernetes/kube-proxy"
+
+	// ContainerImageArchiveDir is the path inside the nspawn machine where
+	// staged container image archives are mounted.
+	ContainerImageArchiveDir = "/var/lib/unbounded/container-images"
+	// ContainerImageArchiveHostDir is the stable host-side symlink bind-mounted
+	// read-only at ContainerImageArchiveDir inside nspawn machines.
+	ContainerImageArchiveHostDir = ContainerImageArchiveDir + "/current"
+	// ContainerImageArchiveHostSourceDir stores source-specific archive staging
+	// directories pointed to by ContainerImageArchiveHostDir.
+	ContainerImageArchiveHostSourceDir = ContainerImageArchiveDir
 
 	CNIBinDir    = "/opt/cni/bin"
 	CNIConfigDir = "/etc/cni/net.d"

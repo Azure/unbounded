@@ -9,7 +9,9 @@ import (
 	"embed"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"strings"
 	"text/template"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -63,13 +65,15 @@ func (e *ensureNSpawnWorkspace) bootstrapWorkspace(ctx context.Context) error {
 type nspawnTemplateData struct {
 	// MachineName is the nspawn machine name (e.g. "kube1"). Used by the
 	// service drop-in for the ExecStartPre `machinectl terminate` cleanup.
-	MachineName          string
-	BPFFSMountPath       string
-	HostDevicePaths      []string
-	NvidiaGPUDevicePaths []string
-	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
-	AMDGPUDevicePaths    []string
-	AMDSysFSPaths        []string
+	MachineName                  string
+	BPFFSMountPath               string
+	ContainerImageArchiveDir     string
+	ContainerImageArchiveHostDir string
+	HostDevicePaths              []string
+	NvidiaGPUDevicePaths         []string
+	NvidiaLibDirMounts           []goalstates.NvidiaLibDirMount
+	AMDGPUDevicePaths            []string
+	AMDSysFSPaths                []string
 }
 
 // writeNSpawnConfigs renders the nspawn and service-override templates with
@@ -81,14 +85,22 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	machineName := filepath.Base(e.goalState.MachineDir)
 	hostDevicePaths := e.goalState.HostDevices.Paths()
 	amdGPUDevicePaths := pathsExcluding(e.goalState.AMD.GPUDevicePaths, e.goalState.Nvidia.GPUDevicePaths)
+
+	archiveDir := filepath.Join(e.goalState.MachineDir, strings.TrimPrefix(goalstates.ContainerImageArchiveDir, "/"))
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		return fmt.Errorf("create container image archive mount point: %w", err)
+	}
+
 	templateData := nspawnTemplateData{
-		MachineName:          machineName,
-		BPFFSMountPath:       goalstates.BPFFSMountPath(machineName),
-		HostDevicePaths:      hostDevicePaths,
-		NvidiaGPUDevicePaths: e.goalState.Nvidia.GPUDevicePaths,
-		NvidiaLibDirMounts:   e.goalState.Nvidia.LibDirMounts,
-		AMDGPUDevicePaths:    amdGPUDevicePaths,
-		AMDSysFSPaths:        e.goalState.AMD.SysFSPaths,
+		MachineName:                  machineName,
+		BPFFSMountPath:               goalstates.BPFFSMountPath(machineName),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
+		HostDevicePaths:              hostDevicePaths,
+		NvidiaGPUDevicePaths:         e.goalState.Nvidia.GPUDevicePaths,
+		NvidiaLibDirMounts:           e.goalState.Nvidia.LibDirMounts,
+		AMDGPUDevicePaths:            amdGPUDevicePaths,
+		AMDSysFSPaths:                e.goalState.AMD.SysFSPaths,
 	}
 
 	if len(hostDevicePaths) > 0 {

@@ -247,12 +247,18 @@ func downloadSourceFromSpec(s *v1alpha3.DownloadSource) *AgentDownloadSource {
 }
 
 // ResolveDownloadOverridesWithOfflineArtifacts resolves the rootfs download
-// overrides for cfg. AgentConfig.OfflineArtifacts takes precedence over
-// cfg.Downloads when configured; otherwise cfg.Downloads is converted into the
-// goalstates.DownloadOverrides shape that rootfs phase tasks consume. Returns
-// nil when no overrides are set.
-func ResolveDownloadOverridesWithOfflineArtifacts(cfg *UnboundedAgentConfig) (*goalstates.DownloadOverrides, error) {
+// overrides and container image archive staging for cfg. AgentConfig.OfflineArtifacts
+// takes precedence over cfg.Downloads when configured; otherwise cfg.Downloads is
+// converted into the goalstates.DownloadOverrides shape that rootfs phase tasks
+// consume.
+func ResolveDownloadOverridesWithOfflineArtifacts(cfg *UnboundedAgentConfig) (*goalstates.DownloadOverrides, *goalstates.ContainerImageArchiveStaging, error) {
 	return goalstates.ResolveDownloadOverridesWithOfflineArtifacts(&cfg.AgentConfig, resolveDownloadOverrides(cfg.Downloads))
+}
+
+// ResolveDownloadOverrides converts the provision AgentDownloads into the
+// goalstates.DownloadOverrides shape that rootfs phase tasks consume.
+func ResolveDownloadOverrides(d *AgentDownloads) *goalstates.DownloadOverrides {
+	return resolveDownloadOverrides(d)
 }
 
 func resolveDownloadOverrides(d *AgentDownloads) *goalstates.DownloadOverrides {

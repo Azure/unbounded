@@ -211,7 +211,7 @@ func (nspawnNodeOperator) RepaveNode(
 	)
 
 	// Resolve goal states for the new machine.
-	downloads, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(newCfg)
+	downloads, containerImageArchives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(newCfg)
 	if err != nil {
 		return fmt.Errorf("resolve download overrides: %w", err)
 	}
@@ -222,6 +222,7 @@ func (nspawnNodeOperator) RepaveNode(
 	}
 
 	err = phases.Serial(log,
+		rootfs.DownloadContainerImageArchives(log, containerImageArchives),
 		rootfs.Provision(log, gs.RootFS),
 		nodestop.StopNode(log, oldMachine),
 		nodestart.StartNode(log, gs.NodeStart),

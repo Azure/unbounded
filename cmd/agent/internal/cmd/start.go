@@ -47,7 +47,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 			log := cmdCtx.Logger
 
-			downloads, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(cfg)
+			downloads, containerImageArchives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(cfg)
 			if err != nil {
 				return err
 			}
@@ -76,6 +76,9 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 				// TPM Attestation (no-op when not configured).
 				attest.ApplyAttestation(log, cfg.Attest, cfg.MachineName, nodeStartGoalState),
+
+				// Stage offline container image archives before status reporting starts.
+				rootfs.DownloadContainerImageArchives(log, containerImageArchives),
 			}
 
 			if err := phases.Serial(log, preBootstrapTasks...).Do(ctx); err != nil {

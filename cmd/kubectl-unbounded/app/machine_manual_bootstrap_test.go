@@ -115,6 +115,53 @@ func TestManualBootstrapHandler_Validate(t *testing.T) {
 			},
 		},
 		{
+			name: "valid: offline artifacts file URL",
+			handler: manualBootstrapHandler{
+				siteName:               "dc1",
+				machineName:            "my-node",
+				kubeconfigPath:         kubeconfigPath,
+				offlineArtifactsSource: "file:///opt/unbounded/artifacts/v1.31.2",
+			},
+		},
+		{
+			name: "valid: offline artifacts absolute path",
+			handler: manualBootstrapHandler{
+				siteName:               "dc1",
+				machineName:            "my-node",
+				kubeconfigPath:         kubeconfigPath,
+				offlineArtifactsSource: "/opt/unbounded/artifacts/v1.31.2",
+			},
+		},
+		{
+			name: "valid: offline artifacts OCI source",
+			handler: manualBootstrapHandler{
+				siteName:               "dc1",
+				machineName:            "my-node",
+				kubeconfigPath:         kubeconfigPath,
+				offlineArtifactsSource: "oci://registry.example.com/unbounded/bootstrap-artifacts:v1",
+			},
+		},
+		{
+			name: "invalid: offline artifacts OCI source without tag",
+			handler: manualBootstrapHandler{
+				siteName:               "dc1",
+				machineName:            "my-node",
+				kubeconfigPath:         kubeconfigPath,
+				offlineArtifactsSource: "oci://registry.example.com/unbounded/bootstrap-artifacts",
+			},
+			expectErr: "OCI URL must include a tag or digest",
+		},
+		{
+			name: "invalid: offline artifacts relative path",
+			handler: manualBootstrapHandler{
+				siteName:               "dc1",
+				machineName:            "my-node",
+				kubeconfigPath:         kubeconfigPath,
+				offlineArtifactsSource: "artifacts/v1.31.2",
+			},
+			expectErr: "source without a scheme must be an absolute path",
+		},
+		{
 			name: "valid: variant defaults to script when empty",
 			handler: manualBootstrapHandler{
 				siteName:       "dc1",
@@ -179,15 +226,16 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 	kubeCli := newFakeCluster(t, "dc1")
 
 	h := &manualBootstrapHandler{
-		siteName:    "dc1",
-		machineName: "my-node",
-		nodeLabels:  []string{"env=prod"},
-		taints:      []string{"dedicated=gpu:NoSchedule"},
-		nodeIP:      " 10.0.0.15 ",
-		ociImage:    "ghcr.io/azure/rootfs:v1",
-		kubeCli:     kubeCli,
-		kubeConfig:  &rest.Config{Host: "https://my-api-server:6443"},
-		logger:      discardLogger(),
+		siteName:               "dc1",
+		machineName:            "my-node",
+		nodeLabels:             []string{"env=prod"},
+		taints:                 []string{"dedicated=gpu:NoSchedule"},
+		nodeIP:                 " 10.0.0.15 ",
+		ociImage:               "ghcr.io/azure/rootfs:v1",
+		offlineArtifactsSource: " file:///opt/unbounded/artifacts/v1.31.2 ",
+		kubeCli:                kubeCli,
+		kubeConfig:             &rest.Config{Host: "https://my-api-server:6443"},
+		logger:                 discardLogger(),
 	}
 
 	cfg, err := h.buildAgentConfig(context.Background())
@@ -203,6 +251,7 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 	require.Equal(t, map[string]string{"env": "prod"}, cfg.Kubelet.Labels)
 	require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
 	require.Equal(t, "ghcr.io/azure/rootfs:v1", cfg.OCIImage)
+	require.Equal(t, "file:///opt/unbounded/artifacts/v1.31.2", cfg.OfflineArtifacts.Source)
 }
 
 func TestManualBootstrapHandler_BuildAgentConfig_KubernetesVersionOverride(t *testing.T) {
@@ -693,12 +742,15 @@ func TestManualBootstrapHandler_Execute_WithAgentURL(t *testing.T) {
 		"--site", "dc1",
 		"--kubeconfig", kubeconfigPath,
 		"--agent-url", "file:///tmp/unbounded-agent-linux-amd64.tar.gz",
+		"--offline-artifacts-source", "file:///opt/unbounded/artifacts/v1.31.2",
 		"node-1",
 	})
 
 	err := cmd.ExecuteContext(context.Background())
 	require.NoError(t, err)
 	require.Contains(t, buf.String(), "export AGENT_URL='file:///tmp/unbounded-agent-linux-amd64.tar.gz'")
+	require.Contains(t, buf.String(), `"OfflineArtifacts": {`)
+	require.Contains(t, buf.String(), `"Source": "file:///opt/unbounded/artifacts/v1.31.2"`)
 }
 
 func TestManualBootstrapHandler_Execute(t *testing.T) {

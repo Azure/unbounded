@@ -17,9 +17,13 @@ type Containerd struct {
 }
 
 // ResolveContainerd returns the containerd configuration goal state.
-func ResolveContainerd() Containerd {
+func ResolveContainerd(sandboxImage string) Containerd {
+	if sandboxImage == "" {
+		sandboxImage = SandboxImage
+	}
+
 	return Containerd{
-		SandboxImage:      SandboxImage,
+		SandboxImage:      sandboxImage,
 		ContainerdBinPath: filepath.Join("/"+BinDir, "containerd"),
 		RuncBinaryPath:    filepath.Join("/"+BinDir, "runc"),
 		CNIBinDir:         CNIBinDir,

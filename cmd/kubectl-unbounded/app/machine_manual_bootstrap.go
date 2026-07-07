@@ -13,7 +13,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/template"
 
@@ -82,6 +84,9 @@ type manualBootstrapHandler struct {
 	// image to bootstrap the machine rootfs.
 	ociImage string
 
+	// sandboxImage overrides the containerd CRI sandbox image.
+	sandboxImage string
+
 	// kubernetesVersion overrides the Kubernetes version that would otherwise
 	// be auto-detected from the API server. When empty the version is resolved
 	// via the discovery client.
@@ -101,6 +106,10 @@ type manualBootstrapHandler struct {
 	// follow the same layout as GitHub releases
 	// (<base>/latest/download/<asset> and <base>/download/<tag>/<asset>).
 	agentBaseURL string
+
+	// offlineArtifactsSource configures a complete offline source for rootfs
+	// binary artifacts installed by the agent.
+	offlineArtifactsSource string
 
 	// Download override flags for rootfs binaries installed by the agent.
 	// See `kubectl unbounded machine register --help` for the equivalent
@@ -177,6 +186,74 @@ func (h *manualBootstrapHandler) execute(ctx context.Context) error {
 	return err
 }
 
+func validateOfflineArtifactsSource(source string) error {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return nil
+	}
+
+	if strings.HasPrefix(source, "oci://") {
+		return validateOCIArtifactsSource(source)
+	}
+
+	if strings.HasPrefix(source, "file://") {
+		return validateFileArtifactsSource(source)
+	}
+
+	return validatePathArtifactsSource(source)
+}
+
+func validateOCIArtifactsSource(source string) error {
+	u, err := url.Parse(source)
+	if err != nil {
+		return fmt.Errorf("parse OCI URL: %w", err)
+	}
+
+	if u.Host == "" || strings.Trim(u.Path, "/") == "" {
+		return errors.New("OCI URL must include registry and repository")
+	}
+
+	if u.Fragment != "" {
+		return errors.New("OCI URL must not include a fragment")
+	}
+
+	last := u.Path[strings.LastIndex(u.Path, "/")+1:]
+	if !strings.Contains(last, ":") && !strings.Contains(u.Path, "@") {
+		return errors.New("OCI URL must include a tag or digest")
+	}
+
+	return nil
+}
+
+func validateFileArtifactsSource(source string) error {
+	u, err := url.Parse(source)
+	if err != nil {
+		return fmt.Errorf("parse file URL: %w", err)
+	}
+
+	if u.Host != "" && u.Host != "localhost" {
+		return fmt.Errorf("file URL must not include host %q", u.Host)
+	}
+
+	if u.Path == "" || !filepath.IsAbs(u.Path) {
+		return errors.New("file URL path must be absolute")
+	}
+
+	return nil
+}
+
+func validatePathArtifactsSource(source string) error {
+	if strings.Contains(source, "://") {
+		return fmt.Errorf("unsupported scheme in %q; supported sources are absolute paths, file:// URLs, and oci:// URLs", source)
+	}
+
+	if !filepath.IsAbs(source) {
+		return errors.New("source without a scheme must be an absolute path")
+	}
+
+	return nil
+}
+
 func (h *manualBootstrapHandler) validate() error {
 	if isEmpty(h.siteName) {
 		return errors.New("site name is required")
@@ -203,6 +280,10 @@ func (h *manualBootstrapHandler) validate() error {
 
 	if _, err := parseBootstrapVariant(h.variant); err != nil {
 		return err
+	}
+
+	if err := validateOfflineArtifactsSource(h.offlineArtifactsSource); err != nil {
+		return fmt.Errorf("invalid --offline-artifacts-source: %w", err)
 	}
 
 	h.kubeconfigPath = getKubeconfigPath(h.kubeconfigPath)
@@ -312,7 +393,13 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		ProviderLabels: providerLabels,
 		BootstrapToken: bootstrapToken,
 	})
+
 	cfg.Kubelet.NodeIP = strings.TrimSpace(h.nodeIP)
+	if source := strings.TrimSpace(h.offlineArtifactsSource); source != "" {
+		cfg.OfflineArtifacts = &provision.AgentOfflineArtifacts{Source: source}
+	}
+
+	cfg.CRI.Containerd.SandboxImage = strings.TrimSpace(h.sandboxImage)
 
 	return &cfg, nil
 }
@@ -513,6 +600,8 @@ Examples:
 	cmd.Flags().StringArrayVar(&handler.taints, "register-with-taint", nil, "Taint to register on the node (can be repeated)")
 	cmd.Flags().StringVar(&handler.nodeIP, "node-ip", "", "IP address to pass to kubelet")
 	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image reference for the agent rootfs")
+	cmd.Flags().StringVar(&handler.sandboxImage, "sandbox-image", "", "Containerd CRI sandbox image reference")
+	cmd.Flags().StringVar(&handler.offlineArtifactsSource, "offline-artifacts-source", "", "Offline rootfs binary artifact source to embed in agent config (absolute path, file:// URL, or oci:// artifact reference)")
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")
 	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script or cloud-init")
 	cmd.Flags().StringVar(&handler.agentVersion, "agent-version", "", "Pin the unbounded-agent release tag to download on the host (default: latest GitHub release)")

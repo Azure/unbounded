@@ -6,6 +6,7 @@ package goalstates
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"text/template"
 
@@ -54,6 +56,18 @@ type ResolvedOfflineArtifacts struct {
 	Manifest   OfflineArtifactManifest
 }
 
+// ContainerImageArchiveStaging describes host-side staged container image archives.
+type ContainerImageArchiveStaging struct {
+	// HostDir is the source-specific host directory containing staged archives.
+	HostDir string
+	// URLs lists archive sources to download into HostDir.
+	URLs []string
+}
+
+func emptyContainerImageArchiveStaging() *ContainerImageArchiveStaging {
+	return &ContainerImageArchiveStaging{HostDir: filepath.Join(ContainerImageArchiveHostSourceDir, "empty")}
+}
+
 func resolveOfflineArtifacts(cfg *config.AgentConfig, offline *config.AgentOfflineArtifacts) (*ResolvedOfflineArtifacts, error) {
 	if offline == nil || strings.TrimSpace(offline.Source) == "" {
 		return nil, errors.New("OfflineArtifacts.Source is required")
@@ -68,7 +82,7 @@ func resolveOfflineArtifacts(cfg *config.AgentConfig, offline *config.AgentOffli
 		return nil, errors.New("Cluster.Version is required when OfflineArtifacts.Source is configured")
 	}
 
-	renderedSource, err := renderOfflineSource(offline.Source, clusterVersion)
+	renderedSource, err := RenderOfflineSource(offline.Source, clusterVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +112,9 @@ func resolveOfflineArtifacts(cfg *config.AgentConfig, offline *config.AgentOffli
 	return &ResolvedOfflineArtifacts{SourceRoot: sourceRoot, Manifest: manifest}, nil
 }
 
-func renderOfflineSource(sourceTemplate, kubernetesVersion string) (string, error) {
+// RenderOfflineSource renders an OfflineArtifacts.Source template for the given
+// Kubernetes version.
+func RenderOfflineSource(sourceTemplate, kubernetesVersion string) (string, error) {
 	data := OfflineTemplateData{
 		KubernetesVersion:    kubernetesVersion,
 		KubernetesVersionNoV: stripLeadingV(kubernetesVersion),
@@ -137,10 +153,6 @@ func normalizeOfflineSourceRoot(source string) (string, error) {
 			return "", fmt.Errorf("OCI offline artifact source must not include a fragment: %q", source)
 		}
 
-		if !ociSourceHasReference(u) {
-			return "", fmt.Errorf("OCI offline artifact source must include a tag or digest: %q", source)
-		}
-
 		return strings.TrimRight(source, "/"), nil
 	}
 
@@ -154,16 +166,11 @@ func normalizeOfflineSourceRoot(source string) (string, error) {
 			return "", fmt.Errorf("file offline artifact source must not include host %q", u.Host)
 		}
 
-		path, err := url.PathUnescape(u.Path)
-		if err != nil {
-			return "", fmt.Errorf("unescape file offline artifact source path %q: %w", u.Path, err)
-		}
-
-		if path == "" || !filepath.IsAbs(path) {
+		if u.Path == "" || !filepath.IsAbs(u.Path) {
 			return "", fmt.Errorf("file offline artifact source must use an absolute path: %q", source)
 		}
 
-		return filepath.Clean(path), nil
+		return filepath.Clean(u.Path), nil
 	}
 
 	if strings.Contains(source, "://") {
@@ -175,14 +182,6 @@ func normalizeOfflineSourceRoot(source string) (string, error) {
 	}
 
 	return filepath.Clean(source), nil
-}
-
-func ociSourceHasReference(u *url.URL) bool {
-	path := strings.Trim(u.Path, "/")
-	lastSlash := strings.LastIndex(path, "/")
-	lastColon := strings.LastIndex(path, ":")
-
-	return strings.Contains(path, "@") || lastColon > lastSlash
 }
 
 func loadOfflineManifest(sourceRoot string) (OfflineArtifactManifest, error) {
@@ -270,6 +269,11 @@ func offlineArtifactPaths(manifest OfflineArtifactManifest, arch string) []strin
 		offlineCrictlArtifactPath(manifest.Versions.Crictl, "linux", arch),
 	)
 
+	for _, imageTag := range manifest.ContainerImages {
+		path := offlineContainerImageArchivePath(arch, imageTag)
+		paths = append(paths, path, path+".sha256")
+	}
+
 	return paths
 }
 
@@ -292,21 +296,27 @@ func verifyOCIArtifacts(sourceRoot string, paths []string) error {
 	return errors.Join(errs...)
 }
 
-// ResolveDownloadOverridesWithOfflineArtifacts resolves cfg.OfflineArtifacts
-// and returns download overrides that point at the offline artifact source. When
-// OfflineArtifacts is not configured, the input downloads are returned unchanged.
-// cfg must be non-nil.
-func ResolveDownloadOverridesWithOfflineArtifacts(cfg *config.AgentConfig, downloads *DownloadOverrides) (*DownloadOverrides, error) {
-	if cfg.OfflineArtifacts == nil || strings.TrimSpace(cfg.OfflineArtifacts.Source) == "" {
-		return downloads, nil
+// ResolveDownloadOverridesWithOfflineArtifacts resolves AgentConfig.OfflineArtifacts
+// and returns download overrides plus container image archive staging metadata
+// that point at the offline artifact source. When OfflineArtifacts is not
+// configured, the input downloads are returned unchanged and staging points at
+// the host-side empty archive directory.
+func ResolveDownloadOverridesWithOfflineArtifacts(cfg *config.AgentConfig, downloads *DownloadOverrides) (*DownloadOverrides, *ContainerImageArchiveStaging, error) {
+	if cfg == nil || cfg.OfflineArtifacts == nil || strings.TrimSpace(cfg.OfflineArtifacts.Source) == "" {
+		return downloads, emptyContainerImageArchiveStaging(), nil
 	}
 
 	resolved, err := resolveOfflineArtifacts(cfg, cfg.OfflineArtifacts)
 	if err != nil {
-		return nil, fmt.Errorf("resolve bootstrap artifact sources: %w", err)
+		return nil, nil, fmt.Errorf("resolve bootstrap artifact sources: %w", err)
 	}
 
-	return downloadOverridesFromOfflineArtifacts(resolved), nil
+	staging := &ContainerImageArchiveStaging{
+		HostDir: containerImageArchiveHostDir(resolved.SourceRoot),
+		URLs:    containerImageArchiveURLsFromOfflineArtifacts(resolved, runtime.GOARCH),
+	}
+
+	return downloadOverridesFromOfflineArtifacts(resolved), staging, nil
 }
 
 func downloadOverridesFromOfflineArtifacts(offlineArtifacts *ResolvedOfflineArtifacts) *DownloadOverrides {
@@ -342,6 +352,60 @@ func downloadOverridesFromOfflineArtifacts(offlineArtifacts *ResolvedOfflineArti
 	}
 
 	return overrides
+}
+
+func containerImageArchiveURLsFromOfflineArtifacts(offlineArtifacts *ResolvedOfflineArtifacts, arch string) []string {
+	if offlineArtifacts == nil {
+		return []string{}
+	}
+
+	rootURL := offlineArtifactURLRoot(offlineArtifacts.SourceRoot)
+
+	separator := "/"
+	if strings.HasPrefix(offlineArtifacts.SourceRoot, "oci://") {
+		separator = "#"
+	}
+
+	urls := make([]string, 0, len(offlineArtifacts.Manifest.ContainerImages))
+	for _, imageTag := range offlineArtifacts.Manifest.ContainerImages {
+		urls = append(urls, rootURL+separator+offlineContainerImageArchivePath(arch, imageTag))
+	}
+
+	return urls
+}
+
+func containerImageArchiveHostDir(sourceRoot string) string {
+	return filepath.Join(ContainerImageArchiveHostSourceDir, containerImageArchiveSourceKey(sourceRoot))
+}
+
+func containerImageArchiveSourceKey(sourceRoot string) string {
+	var b strings.Builder
+
+	for _, r := range strings.ToLower(sourceRoot) {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+
+	prefix := strings.Trim(b.String(), "-")
+	if len(prefix) > 80 {
+		prefix = strings.TrimRight(prefix[:80], "-")
+	}
+
+	if prefix == "" {
+		prefix = "source"
+	}
+
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(sourceRoot)))[:12]
+
+	return prefix + "-" + hash
 }
 
 func offlineArtifactURLRoot(sourceRoot string) string {
@@ -394,6 +458,18 @@ func offlineCrictlArtifactPath(version, hostOS, arch string) string {
 	return fmt.Sprintf("crictl/v%s/crictl-v%s-%s-%s.tar.gz", version, version, hostOS, arch)
 }
 
+func offlineContainerImageArchivePath(arch, imageTag string) string {
+	imageTag = strings.TrimSpace(imageTag)
+	name := strings.NewReplacer(
+		"/", "_",
+		":", "_",
+		"@", "_",
+	).Replace(imageTag)
+	digest := sha256.Sum256([]byte(imageTag))
+
+	return fmt.Sprintf("container-images/%s/%s-%x.tar", arch, name, digest[:6])
+}
+
 func normalizeOfflineManifest(manifest OfflineArtifactManifest) (OfflineArtifactManifest, error) {
 	if manifest.SchemaVersion == 0 {
 		manifest.SchemaVersion = 1
@@ -408,6 +484,7 @@ func normalizeOfflineManifest(manifest OfflineArtifactManifest) (OfflineArtifact
 	manifest.Versions.Runc = stripLeadingV(manifest.Versions.Runc)
 	manifest.Versions.CNI = stripLeadingV(manifest.Versions.CNI)
 	manifest.Versions.Crictl = stripLeadingV(manifest.Versions.Crictl)
+	manifest.ContainerImages = normalizeContainerImages(manifest.ContainerImages)
 
 	missing := make([]string, 0, 5)
 	if manifest.Versions.Kubernetes == "v" {
@@ -448,4 +525,27 @@ func normalizeKubernetesVersion(version string) string {
 
 func stripLeadingV(version string) string {
 	return strings.TrimPrefix(strings.TrimSpace(version), "v")
+}
+
+func normalizeContainerImages(images []string) []string {
+	seen := map[string]struct{}{}
+
+	out := make([]string, 0, len(images))
+	for _, image := range images {
+		image = strings.TrimSpace(image)
+		if image == "" {
+			continue
+		}
+
+		if _, ok := seen[image]; ok {
+			continue
+		}
+
+		seen[image] = struct{}{}
+		out = append(out, image)
+	}
+
+	sort.Strings(out)
+
+	return out
 }

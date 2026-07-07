@@ -5,7 +5,6 @@ package goalstates
 
 import (
 	"encoding/json"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -44,12 +43,16 @@ func TestResolveDownloadOverridesWithOfflineArtifacts(t *testing.T) {
 		},
 	}
 
-	downloads, err := ResolveDownloadOverridesWithOfflineArtifacts(cfg, &DownloadOverrides{
+	downloads, containerImageArchives, err := ResolveDownloadOverridesWithOfflineArtifacts(cfg, &DownloadOverrides{
 		Runc: &DownloadSource{BaseURL: "https://ignored.example.test/runc"},
 	})
 	require.NoError(t, err)
 	require.NotNil(t, downloads)
 	assertOfflineArtifactDownloads(t, downloads)
+	require.NotNil(t, containerImageArchives)
+	require.Contains(t, containerImageArchives.HostDir, ContainerImageArchiveHostSourceDir)
+	require.Len(t, containerImageArchives.URLs, 2)
+	require.Contains(t, containerImageArchives.URLs[0], "file://")
 
 	got, err := ResolveMachine(discardLogger(), cfg, "kube1", downloads)
 	require.NoError(t, err)
@@ -70,9 +73,12 @@ func TestResolveDownloadOverridesWithOfflineArtifactsNoopWithoutOfflineConfig(t 
 
 	input := &DownloadOverrides{Runc: &DownloadSource{BaseURL: "https://example.test/runc"}}
 
-	got, err := ResolveDownloadOverridesWithOfflineArtifacts(&config.AgentConfig{}, input)
+	got, containerImageArchives, err := ResolveDownloadOverridesWithOfflineArtifacts(&config.AgentConfig{}, input)
 	require.NoError(t, err)
 	require.Same(t, input, got)
+	require.NotNil(t, containerImageArchives)
+	require.Equal(t, filepath.Join(ContainerImageArchiveHostSourceDir, "empty"), containerImageArchives.HostDir)
+	require.Empty(t, containerImageArchives.URLs)
 }
 
 func TestResolveOfflineArtifacts(t *testing.T) {
@@ -114,24 +120,6 @@ func TestResolveOfflineArtifactsRendersStrictTemplate(t *testing.T) {
 
 	_, err = resolveOfflineArtifacts(cfg, &config.AgentOfflineArtifacts{Source: filepath.Join(parent, "{{ .Typo }}")})
 	require.ErrorContains(t, err, "render OfflineArtifacts.Source template")
-}
-
-func TestNormalizeOfflineSourceRootRequiresOCIReference(t *testing.T) {
-	t.Parallel()
-
-	_, err := normalizeOfflineSourceRoot("oci://registry.example.com/unbounded/bootstrap-artifacts")
-	require.ErrorContains(t, err, "tag or digest")
-}
-
-func TestNormalizeOfflineSourceRootUnescapesFileURLPath(t *testing.T) {
-	t.Parallel()
-
-	root := filepath.Join(t.TempDir(), "artifact bundle")
-	source := (&url.URL{Scheme: "file", Path: root}).String()
-
-	got, err := normalizeOfflineSourceRoot(source)
-	require.NoError(t, err)
-	require.Equal(t, root, got)
 }
 
 func TestResolveOfflineArtifactsRejectsVersionMismatch(t *testing.T) {
