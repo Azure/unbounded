@@ -227,7 +227,7 @@ func (r *OCIReconciler) resolveRemoteDigest(ctx context.Context, imageRef string
 		}
 	}
 
-	tagOrDigest := repo.Reference().Reference
+	tagOrDigest := repo.Reference().GetReference()
 
 	desc, err := repo.Resolve(ctx, tagOrDigest)
 	if err != nil {
@@ -399,7 +399,7 @@ func (r *OCIReconciler) pullAndUnpack(ctx context.Context, imageRef, imageDigest
 		return fmt.Errorf("creating image dir: %w", err)
 	}
 
-	tagOrDigest := repo.Reference().Reference
+	tagOrDigest := repo.Reference().GetReference()
 
 	// Create a temporary directory for the OCI layout store.
 	layoutDir, err := os.MkdirTemp("", "metalman-oci-*")

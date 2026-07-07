@@ -272,7 +272,7 @@ func PushOCI(ctx context.Context, log *slog.Logger, rootDir, ref string) error {
 
 	indexDesc.ArtifactType = artifactType
 
-	tag := repo.Reference().Reference
+	tag := repo.Reference().GetReference()
 	if err := store.Tag(ctx, indexDesc, tag); err != nil {
 		return fmt.Errorf("tag OCI artifact %q: %w", tag, err)
 	}

@@ -54,7 +54,7 @@ func ValidateOCI(ctx context.Context, log *slog.Logger, ref string) error {
 		CredentialFunc: credentialStore.Get,
 	}
 
-	tag := repo.Reference().Reference
+	tag := repo.Reference().GetReference()
 
 	platforms, err := fetchOCIPlatforms(ctx, repo, tag, ref)
 	if err != nil {
