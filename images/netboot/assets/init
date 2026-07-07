@@ -83,6 +83,24 @@ log_disks() {
     done
 }
 
+target_disk_sysfs() {
+    base=$(basename "$TARGET_DISK")
+    sysdisk=$(readlink -f "/sys/class/block/$base" 2>/dev/null || true)
+    if [ -z "$sysdisk" ]; then
+        sysdisk="/sys/block/$base"
+    fi
+
+    [ -d "$sysdisk" ] || return 1
+    [ ! -e "$sysdisk/partition" ] || fatal "target disk $TARGET_DISK is a partition, expected whole disk"
+
+    echo "$sysdisk"
+}
+
+partition_number() {
+    part=$(basename "$1")
+    cat "/sys/class/block/$part/partition" 2>/dev/null || true
+}
+
 KVER=$(uname -r)
 for mod in virtio_pci virtio_blk ahci sd_mod nvme xfs ext4; do
     modprobe "$mod" 2>/dev/null || true
@@ -234,14 +252,8 @@ retry 5 2 "re-read partition table" blockdev --rereadpt "$TARGET_DISK" \
 sleep 2
 
 parts_for_disk() {
-    base=$(basename "$TARGET_DISK")
-    sysdisk="/sys/block/$base"
-    if [ ! -d "$sysdisk" ]; then
-        sysdisk=$(readlink -f "/sys/class/block/$base" 2>/dev/null || true)
-        sysdisk=${sysdisk%/*}
-    fi
-    [ -d "$sysdisk" ] || return 0
-    for p in "$sysdisk"/"$base"*; do
+    sysdisk=$(target_disk_sysfs) || return 0
+    for p in "$sysdisk"/*; do
         [ -e "$p" ] || continue
         [ -e "$p/partition" ] || continue
         echo "/dev/$(basename "$p")"
@@ -309,12 +321,14 @@ if [ -d /sys/firmware/efi ]; then
             umount /mnt/esp
 
             if [ -n "$LOADER" ] && command -v efibootmgr >/dev/null 2>&1; then
-                ESP_NUM=$(basename "$part" | sed "s/^$(basename "$TARGET_DISK")//; s/^p//")
-                efibootmgr --create --disk "$TARGET_DISK" --part "$ESP_NUM" \
-                    --loader "$LOADER" --label "unbounded" 2>&1 \
-                    && log "UEFI boot entry created (${LOADER} on part ${ESP_NUM})" \
-                    || log "WARNING: efibootmgr failed, PXE chainloader will be used as fallback"
-                break
+                ESP_NUM=$(partition_number "$part")
+                if [ -n "$ESP_NUM" ]; then
+                    efibootmgr --create --disk "$TARGET_DISK" --part "$ESP_NUM" \
+                        --loader "$LOADER" --label "unbounded" 2>&1 \
+                        && log "UEFI boot entry created (${LOADER} on part ${ESP_NUM})" \
+                        || log "WARNING: efibootmgr failed, PXE chainloader will be used as fallback"
+                    break
+                fi
             fi
         fi
     done
