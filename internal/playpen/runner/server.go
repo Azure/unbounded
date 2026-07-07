@@ -86,6 +86,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	cmd := OSCommander{}
 	state := NewRuntimeState(!cfg.ConfigureNetwork)
+
 	network := NewNetworkManager(cmd, cfg)
 	if cfg.ConfigureNetwork {
 		defer network.Teardown(context.Background()) //nolint:errcheck // Pod teardown also removes the network namespace.
@@ -192,6 +193,7 @@ func infoResponse(cfg Config) map[string]any {
 	}
 
 	serverAddress := ""
+
 	serverAddr, err := addressIP(cfg.PodIP)
 	if err != nil {
 		serverAddress = strings.TrimSpace(cfg.PodIP)
@@ -238,6 +240,7 @@ func waitVXLANRemoteAddress(ctx context.Context, cfg Config) (string, error) {
 
 	for {
 		pod := &corev1.Pod{}
+
 		key := types.NamespacedName{Namespace: cfg.PodNamespace, Name: cfg.PodName}
 		if err := cfg.KubernetesClient.Get(ctx, key, pod); err != nil {
 			return "", err
@@ -266,6 +269,7 @@ func markRunnerNetworkReady(ctx context.Context, cfg Config) error {
 	}
 
 	pod := &corev1.Pod{}
+
 	key := types.NamespacedName{Namespace: cfg.PodNamespace, Name: cfg.PodName}
 	if err := cfg.KubernetesClient.Get(ctx, key, pod); err != nil {
 		return err

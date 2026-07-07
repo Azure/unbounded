@@ -20,12 +20,6 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	metalredfish "github.com/Azure/unbounded/internal/metalman/redfish"
 )
@@ -538,14 +532,4 @@ func redfishBasicAuthHeader(cfg Config) http.Header {
 	header.Set("Authorization", "Basic "+token)
 
 	return header
-}
-
-func testKubernetesClient(t *testing.T, objects ...client.Object) client.Client {
-	t.Helper()
-
-	scheme := runtime.NewScheme()
-	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(corev1.AddToScheme(scheme))
-
-	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 }

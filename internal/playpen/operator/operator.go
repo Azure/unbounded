@@ -426,6 +426,7 @@ func normalizeExternalClientInternalIP(req *AllocRequest) error {
 
 		return fmt.Errorf("externalClientInternalIP is required")
 	}
+
 	if net.ParseIP(internalIP) == nil {
 		return fmt.Errorf("externalClientInternalIP %q is invalid", req.ExternalClientInternalIP)
 	}
@@ -506,6 +507,7 @@ func (o *Operator) allocRunner(ctx context.Context, keyHash, reqHash string, req
 	}
 
 	externalClientNodeCreated := false
+
 	defer func() {
 		if externalClientNodeCreated {
 			o.deleteExternalClientNode(context.Background(), keyHash) //nolint:errcheck // Best-effort cleanup after a failed allocation.
@@ -540,6 +542,7 @@ func (o *Operator) allocRunner(ctx context.Context, keyHash, reqHash string, req
 
 			continue
 		}
+
 		externalClientNodeCreated = externalClientNodeCreated || created
 
 		clientVXLAN, err := externalClientVXLANAddress(externalClientNode)
@@ -768,6 +771,7 @@ func (o *Operator) reconcileRunnerPool(ctx context.Context, pods []corev1.Pod) e
 
 		for idleCounts[target.architecture] < target.count {
 			index := nextRunnerPodIndex(target.architecture, usedNames)
+
 			pod := o.runnerPod(target.architecture, index)
 			if err := o.Client.Create(ctx, pod); apierrors.IsAlreadyExists(err) {
 				usedNames[pod.Name] = struct{}{}
@@ -1480,6 +1484,7 @@ func runnerPodUnavailableReason(pod *corev1.Pod) string {
 	if podResourceType(pod) == ResourceTypeRunner && strings.TrimSpace(pod.Status.PodIP) == "" {
 		return fmt.Sprintf("runner pod %s has no pod IP", pod.Name)
 	}
+
 	if podResourceType(pod) == ResourceTypeRunner && strings.TrimSpace(pod.Annotations[AnnotationRedfishCertPEM]) == "" {
 		return fmt.Sprintf("runner pod %s has no Redfish certificate annotation", pod.Name)
 	}
@@ -1543,14 +1548,17 @@ func (o *Operator) patchClaim(ctx context.Context, pod *corev1.Pod, keyHash, req
 		allocationID := allocationIDForPod(pod)
 		current.Annotations[AnnotationIdempotencyKeyHash] = keyHash
 		current.Annotations[AnnotationRequestHash] = reqHash
+
 		current.Annotations[AnnotationClaimedAt] = time.Now().UTC().Format(time.RFC3339)
 		if externalClientInternalIP != "" {
 			current.Annotations[AnnotationExternalClientInternalIP] = externalClientInternalIP
 		}
+
 		if vxlanRemoteAddress != "" {
 			current.Annotations[AnnotationVXLANRemoteAddress] = vxlanRemoteAddress
 			delete(current.Annotations, AnnotationRunnerNetworkReady)
 		}
+
 		current.Labels[LabelAllocated] = allocationID
 
 		if err := o.Client.Update(ctx, current); err != nil {
@@ -1607,6 +1615,7 @@ func controlPlaneEndpointForPod(pod *corev1.Pod) (int32, string, error) {
 
 func (o *Operator) buildResponse(pod *corev1.Pod, keyHash string, externalClientNode *corev1.Node) (AllocResponse, error) {
 	runnerCfg := o.Config.Runner
+
 	serverVXLAN := strings.TrimSpace(pod.Status.PodIP)
 	if net.ParseIP(serverVXLAN) == nil {
 		return AllocResponse{}, fmt.Errorf("runner pod %s/%s has invalid pod IP %q", pod.Namespace, pod.Name, pod.Status.PodIP)
@@ -1972,6 +1981,7 @@ func (o *Operator) ensureExternalClientNode(ctx context.Context, keyHash, intern
 	node := &corev1.Node{}
 	name := externalClientNodeName(keyHash)
 	created := false
+
 	if err := o.Client.Get(ctx, types.NamespacedName{Name: name}, node); apierrors.IsNotFound(err) {
 		resolvedInternalIP, err := o.externalClientInternalIP(node, internalIP)
 		if err != nil {
@@ -2044,9 +2054,11 @@ func (o *Operator) externalClientInternalIP(node *corev1.Node, requested string)
 	if internalIP == "" {
 		internalIP = nodeAddress(node, corev1.NodeInternalIP)
 	}
+
 	if internalIP == "" {
 		return "", fmt.Errorf("external client internal IP is required")
 	}
+
 	if net.ParseIP(internalIP) == nil {
 		return "", fmt.Errorf("external client internal IP %q is invalid", internalIP)
 	}
@@ -2068,6 +2080,7 @@ func setNodeInternalIP(node *corev1.Node, internalIP string) {
 
 func (o *Operator) waitExternalClientNodePodCIDR(ctx context.Context, name string) (*corev1.Node, error) {
 	node := &corev1.Node{}
+
 	err := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		if err := o.Client.Get(ctx, types.NamespacedName{Name: name}, node); err != nil {
 			return false, err

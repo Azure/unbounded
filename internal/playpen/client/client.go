@@ -226,6 +226,7 @@ func (p *Playpen) Command(ctx context.Context, name string, args ...string) (*ex
 	}
 
 	cmdName := name
+
 	cmdArgs := args
 	if os.Geteuid() != 0 {
 		cmdArgs = append([]string{"-n", name}, args...)

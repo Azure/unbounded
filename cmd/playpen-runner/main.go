@@ -26,6 +26,7 @@ func main() {
 	cfg := runner.DefaultConfig()
 	cfg.PodName = os.Getenv("POD_NAME")
 	cfg.PodNamespace = os.Getenv("POD_NAMESPACE")
+
 	cfg.PodIP = os.Getenv("POD_IP")
 	if cfg.PodName != "" && cfg.PodNamespace != "" {
 		scheme := runtime.NewScheme()

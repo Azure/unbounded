@@ -165,6 +165,7 @@ func TestAllocUsesDistinctSyntheticClientNodes(t *testing.T) {
 
 	secondReq := testRunnerAllocRequest()
 	secondReq.ExternalClientInternalIP = "10.88.0.3"
+
 	second, status, err := op.Alloc(t.Context(), "alloc-key-2", secondReq)
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("second alloc status=%d err=%v", status, err)
@@ -211,6 +212,7 @@ func TestAllocIsIdempotentAndConflictsOnDifferentRequest(t *testing.T) {
 
 	conflictReq := testRunnerAllocRequest()
 	conflictReq.Architecture = ArchitectureARM64
+
 	_, status, err = op.Alloc(t.Context(), "alloc-key", conflictReq)
 	if err == nil {
 		t.Fatal("different alloc request with same idempotency key succeeded")
@@ -253,6 +255,7 @@ func TestAllocCanRequestARM64Runner(t *testing.T) {
 
 	req := testRunnerAllocRequest()
 	req.Architecture = ArchitectureARM64
+
 	resp, status, err := op.Alloc(t.Context(), "alloc-key", req)
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("alloc status=%d err=%v", status, err)
@@ -289,6 +292,7 @@ func TestAllocReportsNoMatchingArchitecture(t *testing.T) {
 
 	req := testRunnerAllocRequest()
 	req.Architecture = ArchitectureARM64
+
 	_, status, err := op.Alloc(t.Context(), "alloc-key", req)
 	if err == nil {
 		t.Fatal("alloc succeeded without arm64 runner")
@@ -307,6 +311,7 @@ func TestAllocIdempotencyIncludesArchitecture(t *testing.T) {
 		testPodWithArchitecture("arm64-runner", "node-1", ArchitectureARM64),
 	)
 	amd64Req := testRunnerAllocRequest()
+
 	amd64Req.Architecture = ArchitectureAMD64
 	if _, status, err := op.Alloc(t.Context(), "alloc-key", amd64Req); err != nil || status != http.StatusOK {
 		t.Fatalf("first alloc status=%d err=%v", status, err)
@@ -314,6 +319,7 @@ func TestAllocIdempotencyIncludesArchitecture(t *testing.T) {
 
 	arm64Req := testRunnerAllocRequest()
 	arm64Req.Architecture = ArchitectureARM64
+
 	_, status, err := op.Alloc(t.Context(), "alloc-key", arm64Req)
 	if err == nil {
 		t.Fatal("same idempotency key succeeded with different architecture")
@@ -690,6 +696,7 @@ func TestAllocEndpointAcceptsBodyIdempotencyKey(t *testing.T) {
 
 	allocReq := testRunnerAllocRequest()
 	allocReq.IdempotencyKey = "alloc-key"
+
 	reqBody, err := json.Marshal(allocReq)
 	if err != nil {
 		t.Fatal(err)
@@ -1060,6 +1067,7 @@ func TestRunnerPodNeverUsesHostNetwork(t *testing.T) {
 	if env := findEnvVar(pod.Spec.Containers[0].Env, "POD_NAME"); env == nil || env.ValueFrom == nil || env.ValueFrom.FieldRef == nil || env.ValueFrom.FieldRef.FieldPath != "metadata.name" {
 		t.Fatalf("POD_NAME env = %#v, want downward API metadata.name", env)
 	}
+
 	if env := findEnvVar(pod.Spec.Containers[0].Env, "POD_IP"); env == nil || env.ValueFrom == nil || env.ValueFrom.FieldRef == nil || env.ValueFrom.FieldRef.FieldPath != "status.podIP" {
 		t.Fatalf("POD_IP env = %#v, want downward API status.podIP", env)
 	}
@@ -1110,6 +1118,7 @@ func testOperator(t *testing.T, objects ...client.Object) *Operator {
 		if err := op.Client.Get(ctx, client.ObjectKey{Name: name}, node); err != nil {
 			return err
 		}
+
 		if node.Spec.PodCIDR != "" || len(node.Spec.PodCIDRs) > 0 {
 			return nil
 		}
@@ -1247,6 +1256,7 @@ func testPod(name, nodeName string, annotations map[string]string) *corev1.Pod {
 	if annotations == nil {
 		annotations = map[string]string{}
 	}
+
 	if _, ok := annotations[AnnotationRedfishCertPEM]; !ok {
 		annotations[AnnotationRedfishCertPEM] = "test-redfish-cert"
 	}
@@ -1375,6 +1385,7 @@ func testPodIP(name string) string {
 			return "10.244.0." + name[i+1:]
 		}
 	}
+
 	if name != "" && name[0] >= '0' && name[0] <= '9' {
 		return "10.244.0." + name
 	}

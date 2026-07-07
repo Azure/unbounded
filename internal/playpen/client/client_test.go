@@ -78,6 +78,7 @@ func TestAllocateControlPlaneSendsResourceTypeAndVersion(t *testing.T) {
 
 		gotResourceType = req.ResourceType
 		gotVersion = req.KubernetesVersion
+
 		writeJSON(t, w, testControlPlaneAllocResponse())
 	}))
 	defer server.Close()
@@ -385,14 +386,4 @@ func (f *fakeCommander) Run(_ context.Context, name string, args ...string) erro
 	f.commands = append(f.commands, strings.Join(append([]string{name}, args...), " "))
 
 	return nil
-}
-
-func containsCommand(commands []string, want string) bool {
-	for _, command := range commands {
-		if strings.Contains(command, want) {
-			return true
-		}
-	}
-
-	return false
 }
