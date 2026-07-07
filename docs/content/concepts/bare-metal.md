@@ -9,7 +9,7 @@ description: "How metalman PXE-boots bare-metal servers and joins them to your c
 Use metalman when you have physical servers that need to be:
 
 - **Netbooted** from bare metal (no pre-installed OS).
-- **Repaved** on demand without physical access.
+- **Reimaged** on demand without physical access.
 - **Power-managed** remotely via Redfish BMC APIs.
 - **Securely bootstrapped** using TPM 2.0 hardware attestation.
 
@@ -134,17 +134,17 @@ metalman uses TPM 2.0 for secure bootstrap token delivery:
 This ensures that bootstrap tokens cannot be intercepted by other machines on
 the network.
 
-### Counter-Based Operations
+### MachineOperation-Based Operations
 
-metalman supports two counter-based operations for day-2 management:
+metalman supports day-2 host operations through `MachineOperation` resources:
 
-- **Reboot** -- Increment `spec.operations.rebootCounter` to trigger a
-  reboot via Redfish.
-- **Repave** -- Increment `spec.operations.repaveCounter` to wipe and
-  re-provision the machine from scratch.
+- **HostReboot** -- Restarts the machine through Redfish.
+- **HostReplace** -- Sets the PXE or HTTP boot override, force-restarts the
+  machine, writes the selected image, and waits for first-boot cloud-init and
+  the Kubernetes Node object.
 
-The controller compares the spec counter against the status counter and acts
-when they differ.
+Progress is recorded on the `MachineOperation` target state and conditions such
+as `BootImageWritten` and `CloudInitDone`.
 
 ## Next Steps
 

@@ -24,8 +24,7 @@ func TestStatusQueueRecordsServerMilestones(t *testing.T) {
 	machine := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "machine-1", Generation: 7},
 		Spec: v1alpha3.MachineSpec{
-			PXE:        &v1alpha3.PXESpec{Image: "ghcr.io/test/image:v1"},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 3},
+			PXE: &v1alpha3.PXESpec{Image: "ghcr.io/test/image:v1"},
 		},
 	}
 	op := testOperation("op-queue", v1alpha3.OperationHostReplace)
@@ -51,7 +50,7 @@ func TestStatusQueueRecordsServerMilestones(t *testing.T) {
 		Reason:  "Succeeded",
 		Message: "cloud-init completed successfully",
 	}))
-	require.NoError(t, queue.RecordPXEDisabled(context.Background(), machine.Name, 3, "ghcr.io/test/image:v1"))
+	require.NoError(t, queue.RecordPXEDisabled(context.Background(), machine.Name, "ghcr.io/test/image:v1"))
 
 	for queue.processNextUpdate(context.Background()) {
 	}
@@ -82,13 +81,10 @@ func TestStatusQueueRecordsServerMilestones(t *testing.T) {
 	require.Equal(t, metav1.ConditionTrue, machineCloudInit.Status)
 	require.Equal(t, machine.Generation, machineCloudInit.ObservedGeneration)
 
-	require.NotNil(t, updatedMachine.Status.Operations)
-	require.Equal(t, int64(3), updatedMachine.Status.Operations.RepaveCounter)
-	repaved := apimeta.FindStatusCondition(updatedMachine.Status.Conditions, v1alpha3.MachineConditionRepaved)
-	require.NotNil(t, repaved)
-	require.Equal(t, metav1.ConditionTrue, repaved.Status)
-	require.Equal(t, "Succeeded", repaved.Reason)
-	require.Equal(t, "image=ghcr.io/test/image:v1", repaved.Message)
+	bootImage = apimeta.FindStatusCondition(updatedOp.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten)
+	require.NotNil(t, bootImage)
+	require.Equal(t, metav1.ConditionTrue, bootImage.Status)
+	require.Equal(t, "Machine machine-1 finished writing image ghcr.io/test/image:v1 to disk", bootImage.Message)
 }
 
 func TestStatusQueueDropsBestEffortUpdatesWhenFull(t *testing.T) {
@@ -107,20 +103,24 @@ func TestStatusQueueRecordsPXEDisabledSynchronously(t *testing.T) {
 
 	s := testScheme(t)
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-1", Generation: 7}}
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).WithStatusSubresource(machine).Build()
+	op := testOperation("op-pxe-disabled", v1alpha3.OperationHostReplace)
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: machine.Name,
+		Phase:      v1alpha3.OperationPhaseInProgress,
+	}}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(machine, op).Build()
 	queue := &StatusQueue{Client: c, Now: fixedNow}
 
-	require.NoError(t, queue.RecordPXEDisabled(context.Background(), machine.Name, 3, "ghcr.io/test/image:v1"))
+	require.NoError(t, queue.RecordPXEDisabled(context.Background(), machine.Name, "ghcr.io/test/image:v1"))
 	require.Len(t, queue.updates, 0)
 
-	var updated v1alpha3.Machine
-	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: machine.Name}, &updated))
-	require.NotNil(t, updated.Status.Operations)
-	require.Equal(t, int64(3), updated.Status.Operations.RepaveCounter)
-	repaved := apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineConditionRepaved)
-	require.NotNil(t, repaved)
-	require.Equal(t, metav1.ConditionTrue, repaved.Status)
-	require.Equal(t, "image=ghcr.io/test/image:v1", repaved.Message)
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	bootImage := apimeta.FindStatusCondition(updated.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten)
+	require.NotNil(t, bootImage)
+	require.Equal(t, metav1.ConditionTrue, bootImage.Status)
+	require.Equal(t, "Machine machine-1 finished writing image ghcr.io/test/image:v1 to disk", bootImage.Message)
 }
 
 func TestStatusQueueLatchesTrueOperationConditions(t *testing.T) {

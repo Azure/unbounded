@@ -234,12 +234,6 @@ type MachineOperationTargetStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// TargetOperations records the Machine operation counters this operation
-	// requested. It is used by counter-backed HostReplace operations to remain
-	// idempotent across controller restarts.
-	// +optional
-	TargetOperations *OperationsStatus `json:"targetOperations,omitempty"`
-
 	// Attempts is the number of external action attempts made for this target.
 	// Polling expected state changes does not increment this field.
 	// +optional

@@ -286,23 +286,6 @@ spec:
                       description: StartedAt is when execution began for this target.
                       format: date-time
                       type: string
-                    targetOperations:
-                      description: |-
-                        TargetOperations records the Machine operation counters this operation
-                        requested. It is used by counter-backed HostReplace operations to remain
-                        idempotent across controller restarts.
-                      properties:
-                        rebootCounter:
-                          description: RebootCounter is the last reboot counter value
-                            that was acted on.
-                          format: int64
-                          type: integer
-                        repaveCounter:
-                          description: RepaveCounter is the last repave counter value
-                            that was acted on.
-                          format: int64
-                          type: integer
-                      type: object
                   required:
                   - machineRef
                   type: object

@@ -58,8 +58,9 @@ everything needed to PXE-boot and manage bare metal hosts:
 | Health  | 8081/tcp    | HTTP     | Liveness/readiness probes |
 
 The controller also runs reconcilers for OCI image pulling (downloading and
-caching machine and netboot images from container registries) and Machine resources with
-Redfish BMC specs (power management, boot order configuration).
+caching machine and netboot images from container registries), Redfish TLS
+certificate pinning, and `MachineOperation` host actions such as reboot and
+repave.
 
 When deployed inside a cluster, the container entrypoint is `metalman` and the
 `site deploy-pxe` command passes `serve-pxe` as an argument:
@@ -211,8 +212,8 @@ selection.
 
 #### BMC
 
-Adding a `redfish` block enables remote power management. The controller will
-manage boot order and execute reboot cycles without physical access:
+Adding a `redfish` block enables remote power management. Metalman uses it for
+`MachineOperation` host actions without physical access:
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -247,7 +248,7 @@ To repave a node with BMC access:
 kubectl unbounded machine repave node-01
 ```
 
-This increments `spec.operations.repaveCounter` and `spec.operations.rebootCounter`. The
-controller handles the rest - it configures the boot order for the selected
-`spec.pxe.bootProtocol`, executes a ForceOff/On power cycle, and clears the
-condition once the node is back up.
+This creates a `HostReplace` `MachineOperation`. Metalman handles the rest: it
+configures the boot override for the selected `spec.pxe.bootProtocol`, executes
+a Redfish force restart, waits for the installer `/pxe/disable` signal, tracks
+first-boot cloud-init on the operation, and completes after the node is back up.

@@ -26,7 +26,6 @@ const (
 	statusUpdateBootImageWritten
 	statusUpdateCloudInitDone
 	statusUpdateMachineCondition
-	statusUpdatePXEDisabled
 )
 
 // StatusQueue records server-observed status milestones. Most updates are best
@@ -49,12 +48,6 @@ type statusUpdate struct {
 	kind        statusUpdateKind
 	filename    string
 	condition   *metav1.Condition
-	repave      *statusRepaveUpdate
-}
-
-type statusRepaveUpdate struct {
-	counter int64
-	image   string
 }
 
 func (q *StatusQueue) NeedLeaderElection() bool { return false }
@@ -90,12 +83,17 @@ func (q *StatusQueue) RecordMachineCondition(_ context.Context, machineName stri
 	return q.enqueue(statusUpdate{machineName: machineName, kind: statusUpdateMachineCondition, condition: &cond})
 }
 
-func (q *StatusQueue) RecordPXEDisabled(ctx context.Context, machineName string, repaveCounter int64, imageName string) error {
+func (q *StatusQueue) RecordPXEDisabled(ctx context.Context, machineName, imageName string) error {
 	if q == nil || q.Client == nil || machineName == "" {
 		return fmt.Errorf("status queue is not configured")
 	}
 
-	return q.flushPXEDisabled(ctx, machineName, &statusRepaveUpdate{counter: repaveCounter, image: imageName})
+	message := fmt.Sprintf("Machine %s finished writing image %s to disk", machineName, imageName)
+	if imageName == "" {
+		message = fmt.Sprintf("Machine %s finished writing the boot image to disk", machineName)
+	}
+
+	return q.flushOperationCondition(ctx, machineName, v1alpha3.MachineOperationConditionBootImageWritten, metav1.ConditionTrue, "Succeeded", message)
 }
 
 func (q *StatusQueue) enqueue(update statusUpdate) error {
@@ -166,12 +164,6 @@ func (q *StatusQueue) flush(ctx context.Context, update statusUpdate) error {
 		}
 
 		return nil
-	case statusUpdatePXEDisabled:
-		if update.repave == nil {
-			return nil
-		}
-
-		return q.flushPXEDisabled(ctx, update.machineName, update.repave)
 	default:
 		return fmt.Errorf("unknown status update kind %d", update.kind)
 	}
@@ -214,43 +206,6 @@ func (q *StatusQueue) flushMachineCondition(ctx context.Context, machineName str
 
 		condition.ObservedGeneration = machine.Generation
 		apimeta.SetStatusCondition(&machine.Status.Conditions, condition)
-
-		return q.Client.Status().Update(ctx, &machine)
-	})
-}
-
-func (q *StatusQueue) flushPXEDisabled(ctx context.Context, machineName string, update *statusRepaveUpdate) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var machine v1alpha3.Machine
-		if err := q.Client.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil
-			}
-
-			return fmt.Errorf("get Machine: %w", err)
-		}
-
-		var statusRepave int64
-		if machine.Status.Operations != nil {
-			statusRepave = machine.Status.Operations.RepaveCounter
-		}
-
-		if update.counter <= statusRepave {
-			return nil
-		}
-
-		if machine.Status.Operations == nil {
-			machine.Status.Operations = &v1alpha3.OperationsStatus{}
-		}
-
-		machine.Status.Operations.RepaveCounter = update.counter
-		apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-			Type:               v1alpha3.MachineConditionRepaved,
-			Status:             metav1.ConditionTrue,
-			Reason:             "Succeeded",
-			Message:            "image=" + update.image,
-			ObservedGeneration: machine.Generation,
-		})
 
 		return q.Client.Status().Update(ctx, &machine)
 	})

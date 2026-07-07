@@ -44,7 +44,7 @@ type StatusRecorder interface {
 	RecordBootImageWritten(ctx context.Context, machineName string) error
 	RecordCloudInitDone(ctx context.Context, machineName string) error
 	RecordMachineCondition(ctx context.Context, machineName string, condition metav1.Condition) error
-	RecordPXEDisabled(ctx context.Context, machineName string, repaveCounter int64, imageName string) error
+	RecordPXEDisabled(ctx context.Context, machineName, imageName string) error
 }
 
 func (h *HTTPServer) NeedLeaderElection() bool { return false }
@@ -311,22 +311,6 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 
 	h.recordBootImageWritten(r.Context(), log, node.Name)
 
-	var specRepave, statusRepave int64
-	if node.Spec.Operations != nil {
-		specRepave = node.Spec.Operations.RepaveCounter
-	}
-
-	if node.Status.Operations != nil {
-		statusRepave = node.Status.Operations.RepaveCounter
-	}
-
-	if specRepave <= statusRepave {
-		log.Info("repave already cleared", "node", node.Name)
-		w.WriteHeader(http.StatusOK)
-
-		return
-	}
-
 	imageName := ""
 	if node.Spec.PXE != nil {
 		imageName = node.Spec.PXE.Image
@@ -339,7 +323,7 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.StatusRecorder.RecordPXEDisabled(r.Context(), node.Name, specRepave, imageName); err != nil {
+	if err := h.StatusRecorder.RecordPXEDisabled(r.Context(), node.Name, imageName); err != nil {
 		log.Error("recording PXE disabled", "node", node.Name, "err", err)
 		http.Error(w, "recording PXE disabled", http.StatusServiceUnavailable)
 

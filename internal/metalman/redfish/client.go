@@ -32,8 +32,9 @@ const (
 type ResetType string
 
 const (
-	ResetForceOff ResetType = "ForceOff"
-	ResetOn       ResetType = "On"
+	ResetForceOff     ResetType = "ForceOff"
+	ResetForceRestart ResetType = "ForceRestart"
+	ResetOn           ResetType = "On"
 )
 
 // BootTarget represents a Redfish boot source override target.

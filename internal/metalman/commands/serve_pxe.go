@@ -29,7 +29,6 @@ import (
 	"github.com/Azure/unbounded/internal/metalman/cloudinit"
 	"github.com/Azure/unbounded/internal/metalman/dhcp"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
-	"github.com/Azure/unbounded/internal/metalman/lifecycle"
 	metalmachineops "github.com/Azure/unbounded/internal/metalman/machineops"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
@@ -231,15 +230,12 @@ func ServePXECmd() *cobra.Command {
 				APIReader:             mgr.GetAPIReader(),
 				Site:                  site,
 				PowerClients:          &metalmachineops.RedfishPowerClientFactory{Reader: mgr.GetClient(), Pool: redfishPool},
+				HTTPBootURL:           resolver.HTTPBootURL,
 				MaxConcurrentMachines: operationMaxConcurrentMachines,
 				MaxAttempts:           operationMaxAttempts,
 				PollInterval:          operationPollInterval,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up MachineOperation reconciler: %w", err)
-			}
-
-			if err := (&lifecycle.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
-				return fmt.Errorf("setting up Lifecycle reconciler: %w", err)
 			}
 
 			if err := (&cloudinit.Reconciler{Client: mgr.GetClient(), StatusRecorder: statusQueue}).SetupWithManager(mgr); err != nil {
