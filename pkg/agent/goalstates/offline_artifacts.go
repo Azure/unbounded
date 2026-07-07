@@ -299,8 +299,8 @@ func verifyOCIArtifacts(sourceRoot string, paths []string) error {
 // ResolveDownloadOverridesWithOfflineArtifacts resolves AgentConfig.OfflineArtifacts
 // and returns download overrides plus container image archive staging metadata
 // that point at the offline artifact source. When OfflineArtifacts is not
-// configured, the input downloads are returned unchanged and no archive staging
-// is returned.
+// configured, the input downloads are returned unchanged and staging points at
+// the host-side empty archive directory.
 func ResolveDownloadOverridesWithOfflineArtifacts(cfg *config.AgentConfig, downloads *DownloadOverrides) (*DownloadOverrides, *ContainerImageArchiveStaging, error) {
 	if cfg == nil || cfg.OfflineArtifacts == nil || strings.TrimSpace(cfg.OfflineArtifacts.Source) == "" {
 		return downloads, emptyContainerImageArchiveStaging(), nil
