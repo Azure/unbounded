@@ -35,24 +35,26 @@ const (
 )
 
 type hostCheckDeps struct {
-	lookupPath func(string) (string, error)
-	uid        func() int
-	statfs     func(string, *syscall.Statfs_t) error
-	readFile   func(string) ([]byte, error)
-	stat       func(string) (fs.FileInfo, error)
-	writeProbe func(string) error
-	outputCmd  func(context.Context, *slog.Logger, string, ...string) (string, error)
+	lookupPath           func(string) (string, error)
+	detectPackageManager func(func(string) (string, error)) (*hostPackageManager, error)
+	uid                  func() int
+	statfs               func(string, *syscall.Statfs_t) error
+	readFile             func(string) ([]byte, error)
+	stat                 func(string) (fs.FileInfo, error)
+	writeProbe           func(string) error
+	outputCmd            func(context.Context, *slog.Logger, string, ...string) (string, error)
 }
 
 func defaultHostCheckDeps() hostCheckDeps {
 	return hostCheckDeps{
-		lookupPath: exec.LookPath,
-		uid:        os.Geteuid,
-		statfs:     syscall.Statfs,
-		readFile:   os.ReadFile,
-		stat:       os.Stat,
-		writeProbe: utilio.ProbeWritableDir,
-		outputCmd:  executil.OutputCmd,
+		lookupPath:           exec.LookPath,
+		detectPackageManager: detectHostPackageManager,
+		uid:                  os.Geteuid,
+		statfs:               syscall.Statfs,
+		readFile:             os.ReadFile,
+		stat:                 os.Stat,
+		writeProbe:           utilio.ProbeWritableDir,
+		outputCmd:            executil.OutputCmd,
 	}
 }
 
@@ -106,7 +108,7 @@ func CheckHostPackages(log *slog.Logger) preflight.Checker {
 
 func checkHostPackages(log *slog.Logger, failMissing bool, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkHostPackagesName, check: func(ctx context.Context) []preflight.Result {
-		pm, err := detectHostPackageManager(deps.lookupPath)
+		pm, err := deps.detectPackageManager(deps.lookupPath)
 		if err != nil {
 			log.Debug("host package manager detection failed")
 

@@ -37,7 +37,7 @@ func TestCheckHostPackagesMissingPackageManager(t *testing.T) {
 
 func TestCheckHostPackagesListsMissingPackages(t *testing.T) {
 	deps := defaultHostCheckDeps()
-	deps.lookupPath = lookupPathWith(map[string]bool{"apt-get": true})
+	deps.detectPackageManager = packageManagerWithInstalled(false)
 
 	results := checkHostPackages(slog.New(slog.DiscardHandler), false, deps).Check(context.Background())
 
@@ -47,7 +47,7 @@ func TestCheckHostPackagesListsMissingPackages(t *testing.T) {
 
 func TestCheckHostPackagesBlocksMissingPackagesWhenOfflineArtifactsConfigured(t *testing.T) {
 	deps := defaultHostCheckDeps()
-	deps.lookupPath = lookupPathWith(map[string]bool{"apt-get": true})
+	deps.detectPackageManager = packageManagerWithInstalled(false)
 
 	results := checkHostPackages(slog.New(slog.DiscardHandler), true, deps).Check(context.Background())
 
@@ -167,6 +167,18 @@ func statExists() func(string) (fs.FileInfo, error) {
 
 func statMissing() func(string) (fs.FileInfo, error) {
 	return func(string) (fs.FileInfo, error) { return nil, errors.New("missing") }
+}
+
+func packageManagerWithInstalled(installed bool) func(func(string) (string, error)) (*hostPackageManager, error) {
+	return func(func(string) (string, error)) (*hostPackageManager, error) {
+		return &hostPackageManager{
+			name:             "test-package-manager",
+			requiredPackages: []string{"systemd-container", "curl"},
+			installed: func(context.Context, *slog.Logger, string) bool {
+				return installed
+			},
+		}, nil
+	}
 }
 
 func lookupPathWith(paths map[string]bool) func(string) (string, error) {
