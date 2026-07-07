@@ -275,6 +275,13 @@ func TestCrictlArchive(t *testing.T) {
 	}
 }
 
+func TestContainerImageArchivePath(t *testing.T) {
+	t.Parallel()
+
+	got := ContainerImageArchivePath("amd64", "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9")
+	require.Equal(t, "container-images/amd64/mcr.microsoft.com_oss_v2_kubernetes_pause_3.9-a68ffa05fa78.tar", got)
+}
+
 func TestNormalizeManifest(t *testing.T) {
 	t.Parallel()
 
@@ -297,7 +304,25 @@ func TestNormalizeManifest(t *testing.T) {
 			CNI:        "1.5.1",
 			Crictl:     "1.34.0",
 		},
+		ContainerImages: []string{},
 	}, got)
+}
+
+func TestNormalizeManifestPreservesContainerImages(t *testing.T) {
+	t.Parallel()
+
+	got, err := NormalizeManifest(Manifest{
+		Versions: Versions{
+			Kubernetes: "v1.34.2",
+			Containerd: "2.1.8",
+			Runc:       "1.5.0",
+			CNI:        "1.5.1",
+			Crictl:     "1.34.0",
+		},
+		ContainerImages: []string{" registry.example.com/pause:3.9 ", "", "registry.example.com/kube-proxy:v1.34.2", "registry.example.com/pause:3.9"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"registry.example.com/kube-proxy:v1.34.2", "registry.example.com/pause:3.9"}, got.ContainerImages)
 }
 
 func TestNormalizeManifestRejectsUnsupportedSchema(t *testing.T) {

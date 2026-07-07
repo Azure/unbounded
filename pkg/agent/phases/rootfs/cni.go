@@ -12,6 +12,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -47,13 +48,16 @@ func (d *downloadCNIBinaries) Do(ctx context.Context) error {
 	override := cniDownloadSource(d.goalState)
 	version := downloadSourceVersion(d.goalState.CNIPluginVersion, override)
 
-	downloadURL := cniDownloadURL(override, version, d.goalState.HostArch)
+	downloadURL, err := cniDownloadURL(override, version, d.goalState.HostArch)
+	if err != nil {
+		return fmt.Errorf("resolve CNI download source: %w", err)
+	}
 
 	if hasRequiredCNIPlugins(destDir) && cniPluginsVersionMatch(ctx, d.log, destDir, version) {
 		return nil
 	}
 
-	for tarFile, err := range utilio.DecompressTarGzFromRemote(ctx, downloadURL) {
+	for tarFile, err := range downloadURL.DecompressTarGz(ctx) {
 		if err != nil {
 			return fmt.Errorf("decompress CNI plugins tar: %w", err)
 		}
@@ -70,8 +74,8 @@ func (d *downloadCNIBinaries) Do(ctx context.Context) error {
 
 // cniDownloadURL resolves the CNI plugins tarball URL honoring the
 // optional override. Mirrors must publish under <base>/v<ver>/<asset>.
-func cniDownloadURL(override *goalstates.DownloadSource, version, arch string) string {
-	return agentartifacts.CNIPluginsArchive(override, version, arch)
+func cniDownloadURL(override *goalstates.DownloadSource, version, arch string) (artifactsource.Source, error) {
+	return artifactsource.Parse(agentartifacts.CNIPluginsArchive(override, version, arch))
 }
 
 // hasRequiredCNIPlugins checks if all required CNI plugins are installed and executable.

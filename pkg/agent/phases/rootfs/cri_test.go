@@ -46,9 +46,13 @@ func TestContainerdDownloadURL(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := containerdDownloadURL(testCase.override, testCase.version, testCase.arch)
-			if got != testCase.want {
-				t.Fatalf("got URL %q, want %q", got, testCase.want)
+			got, err := containerdDownloadURL(testCase.override, testCase.version, testCase.arch)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if got.String() != testCase.want {
+				t.Fatalf("got URL %q, want %q", got.String(), testCase.want)
 			}
 		})
 	}
@@ -84,9 +88,13 @@ func TestRuncDownloadURL(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := runcDownloadURL(testCase.override, testCase.version, testCase.arch)
-			if got != testCase.want {
-				t.Fatalf("got URL %q, want %q", got, testCase.want)
+			got, err := runcDownloadURL(testCase.override, testCase.version, testCase.arch)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if got.String() != testCase.want {
+				t.Fatalf("got URL %q, want %q", got.String(), testCase.want)
 			}
 		})
 	}

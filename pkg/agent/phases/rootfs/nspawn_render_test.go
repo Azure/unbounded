@@ -36,7 +36,9 @@ func TestNSpawnConfig_RenderedSnapshot(t *testing.T) {
 	t.Parallel()
 
 	requireRenderedSnapshot(t, "nspawn.conf.golden", "nspawn.conf", nspawnTemplateData{
-		BPFFSMountPath: goalstates.BPFFSMountPath("kube1"),
+		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 	})
 }
 
@@ -68,8 +70,10 @@ func TestServiceOverride_MultipleHostDevices(t *testing.T) {
 
 	var nspawnBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
-		BPFFSMountPath:  goalstates.BPFFSMountPath("kube1"),
-		HostDevicePaths: devices,
+		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
+		HostDevicePaths:              devices,
 	}))
 
 	var overrideBuf bytes.Buffer
@@ -95,9 +99,11 @@ func TestServiceOverride_AMDGPUDevices(t *testing.T) {
 
 	var nspawnBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
-		BPFFSMountPath:    goalstates.BPFFSMountPath("kube1"),
-		AMDGPUDevicePaths: devices,
-		AMDSysFSPaths:     []string{"/sys/module/amdgpu", "/sys/class/kfd"},
+		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
+		AMDGPUDevicePaths:            devices,
+		AMDSysFSPaths:                []string{"/sys/module/amdgpu", "/sys/class/kfd"},
 	}))
 
 	var overrideBuf bytes.Buffer

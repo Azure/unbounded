@@ -406,6 +406,44 @@ spec:
                       artifacts used to install Image. When omitted, metalman uses the
                       default netboot image that corresponds to its release.
                     type: string
+                  netbootPullSecretRef:
+                    description: |-
+                      NetbootPullSecretRef references a Docker registry credential Secret used to
+                      pull NetbootImage. It is ignored when NetbootImage is omitted; metalman's
+                      configured default netboot pull secret is used for the default netboot image.
+                      The Secret must be type kubernetes.io/dockerconfigjson or
+                      kubernetes.io/dockercfg.
+                    properties:
+                      name:
+                        description: Name of the secret.
+                        minLength: 1
+                        type: string
+                      namespace:
+                        description: Namespace of the secret.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    - namespace
+                    type: object
+                  pullSecretRef:
+                    description: |-
+                      PullSecretRef references a Docker registry credential Secret used to pull
+                      Image. The Secret must be type kubernetes.io/dockerconfigjson or
+                      kubernetes.io/dockercfg.
+                    properties:
+                      name:
+                        description: Name of the secret.
+                        minLength: 1
+                        type: string
+                      namespace:
+                        description: Namespace of the secret.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    - namespace
+                    type: object
                   redfish:
                     description: Redfish configures optional Redfish BMC access.
                     properties:
@@ -443,6 +481,12 @@ spec:
                     - url
                     - username
                     type: object
+                  targetDisk:
+                    description: |-
+                      TargetDisk is the block device the installer writes the machine image to.
+                      Examples: /dev/nvme0n1, /dev/sda, /dev/disk/by-id/...
+                      When omitted, the installer chooses a target disk automatically.
+                    type: string
                 required:
                 - image
                 type: object

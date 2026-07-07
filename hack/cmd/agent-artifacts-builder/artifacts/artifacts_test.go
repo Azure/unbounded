@@ -44,6 +44,7 @@ func TestNewPlan(t *testing.T) {
 			CNI:        "1.5.1",
 			Crictl:     "1.34.0",
 		},
+		ContainerImages: []string{},
 	}, plan.Manifest)
 
 	artifactsByPath := map[string]Artifact{}
@@ -75,6 +76,18 @@ func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
 		Architectures:     []string{"amd64"},
 	})
 	require.NoError(t, err)
+	require.Equal(t, []ContainerImageArchive{
+		{
+			ImageTag: "mcr.microsoft.com/oss/v2/kubernetes/kube-proxy:v1.34.2",
+			Arch:     "amd64",
+			Path:     "container-images/amd64/mcr.microsoft.com_oss_v2_kubernetes_kube-proxy_v1.34.2-3a45ebd35773.tar",
+		},
+		{
+			ImageTag: "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9",
+			Arch:     "amd64",
+			Path:     "container-images/amd64/mcr.microsoft.com_oss_v2_kubernetes_pause_3.9-a68ffa05fa78.tar",
+		},
+	}, plan.ContainerImages)
 	require.Equal(t, agentartifacts.Manifest{
 		SchemaVersion: 1,
 		Versions: agentartifacts.Versions{
@@ -84,6 +97,7 @@ func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
 			CNI:        "1.5.1",
 			Crictl:     "1.34.0",
 		},
+		ContainerImages: agentartifacts.DefaultContainerImages("v1.34.2"),
 	}, plan.Manifest)
 }
 

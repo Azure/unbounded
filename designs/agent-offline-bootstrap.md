@@ -310,6 +310,10 @@ Offline artifact paths are component-prefixed to avoid ambiguity when different 
 | `Runc` | `runc/v<version>/runc.<arch>` |
 | `CNI` | `cni/v<version>/cni-plugins-linux-<arch>-v<version>.tgz` |
 | `Crictl` | `crictl/v<version>/crictl-v<version>-<os>-<arch>.tar.gz` |
+| Container image archive | `container-images/<arch>/<sanitized-image-ref>-<hash>.tar` |
+| Container image archive checksum | `container-images/<arch>/<sanitized-image-ref>-<hash>.tar.sha256` |
+
+Container image archive paths are derived from each image ref in `manifest.json` `containerImages`. The filename is stable for a given image ref and includes a sanitized image ref plus a hash to avoid collisions. The archive is a local image archive suitable for `ctr --namespace k8s.io images import`.
 
 The existing `Downloads` block remains the regular per-artifact override mechanism. As a separate compatibility improvement, `Downloads.*.BaseURL` and `Downloads.*.URL` should also support `file://` and `oci://` endpoints for non-offline custom layouts. Those `Downloads` settings are ignored whenever offline artifacts are configured.
 
@@ -329,11 +333,15 @@ Minimal manifest:
     "runc": "1.5.0",
     "cni": "1.5.1",
     "crictl": "1.34.0"
-  }
+  },
+  "containerImages": [
+    "mcr.microsoft.com/oss/v2/kubernetes/kube-proxy:v1.34.2",
+    "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9"
+  ]
 }
 ```
 
-The manifest is the source of truth for binary versions in offline mode. This prevents a newer agent binary from resolving newer built-in runtime defaults against an older offline bundle. For example, if the agent's built-in containerd default changes from `2.1.8` to `2.1.9`, but the offline manifest declares `2.1.8`, the agent resolves and installs the `2.1.8` artifact from the bundle.
+The manifest is the source of truth for binary versions and included container images in offline mode. This prevents a newer agent binary from resolving newer built-in runtime defaults against an older offline bundle. For example, if the agent's built-in containerd default changes from `2.1.8` to `2.1.9`, but the offline manifest declares `2.1.8`, the agent resolves and installs the `2.1.8` artifact from the bundle. Similarly, `containerImages` lists image tags that should be available in containerd after bootstrap imports the bundled image archives, including the pause and kube-proxy images. The initial artifact builder supports exporting publicly pullable container images; private image registry authentication is out of scope for the initial implementation.
 
 The offline bundle should be versioned by Kubernetes version because Kubernetes is the primary compatibility axis. Example OCI tags:
 
@@ -418,7 +426,43 @@ containerd/v2.1.8/containerd-2.1.8-linux-amd64.tar.gz
 runc/v1.5.0/runc.amd64
 cni/v1.5.1/cni-plugins-linux-amd64-v1.5.1.tgz
 crictl/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz
+container-images/amd64/mcr.microsoft.com_oss_v2_kubernetes_pause_3.9-<hash>.tar
+container-images/amd64/mcr.microsoft.com_oss_v2_kubernetes_pause_3.9-<hash>.tar.sha256
 ```
+
+### Container image archive staging
+
+Offline container image archives are staged on the host before the nspawn machine starts. The agent downloads archives listed by `manifest.json` `containerImages` from the resolved offline source, verifies each archive with the adjacent `.sha256` artifact, and writes them into a source-specific host cache directory.
+
+The host-side staging layout is:
+
+```text
+/var/lib/unbounded/container-images/
+  current -> <source-cache-dir>
+  <source-cache-dir>/
+    image-0.tar
+    image-1.tar
+    ...
+  empty/
+```
+
+`<source-cache-dir>` is derived from the resolved `OfflineArtifacts.Source` and includes a short hash of that source, so different Kubernetes versions or registries do not share one cache directory. The stable `current` symlink points at the cache directory for the most recently resolved offline source. When offline artifacts are not configured, the staging target is the `empty/` directory.
+
+The nspawn machine bind-mounts the stable host path read-only:
+
+```text
+host:    /var/lib/unbounded/container-images/current
+machine: /var/lib/unbounded/container-images
+mode:    read-only
+```
+
+Inside the running machine, node-start imports every staged `.tar` file visible at `/var/lib/unbounded/container-images` with:
+
+```bash
+ctr --namespace k8s.io images import /var/lib/unbounded/container-images/image-<n>.tar
+```
+
+The staging cache is host-level instead of machine-rootfs-specific. This lets alternating nspawn machines, such as `kube1` and `kube2`, share already downloaded image archives across initial bootstrap and repave. Node restart does not redownload archives because it reuses the existing rootfs and host staging state.
 
 ### Regular `Downloads` endpoint support
 
@@ -500,9 +544,11 @@ Each bundle should contain:
 - `manifest.json`.
 - Kubernetes binaries and `.sha256` files for the declared Kubernetes version.
 - `containerd`, `runc`, CNI plugin, and `crictl` artifacts for the versions declared in `manifest.json`.
+- Included container images declared by `manifest.json`, starting with the pause image.
+- Container image archives under `container-images/`, which bootstrap should import before validating the listed `containerImages` tags.
 - Artifacts for each supported host architecture.
 
-OCI bundles should be published as multi-platform OCI indexes under the single Kubernetes-versioned tag. Each index entry points to a platform-specific artifact manifest, and each platform-specific manifest contains only that architecture's blobs plus `manifest.json`. For example, pulling `--platform linux/amd64` should return only `amd64` binaries and pulling `--platform linux/arm64` should return only `arm64` binaries. The tag remains architecture-neutral.
+OCI bundles should be published as multi-platform OCI indexes under the single Kubernetes-versioned tag. Each index entry points to a platform-specific artifact manifest, and each platform-specific manifest contains only that architecture's blobs plus `manifest.json` and platform-specific image archives under `container-images/`. For example, pulling `--platform linux/amd64` should return only `amd64` binaries and `amd64` image archives, and pulling `--platform linux/arm64` should return only `arm64` binaries and `arm64` image archives. The tag remains architecture-neutral.
 
 The bundle should use one OCI blob per target artifact, not one tarball containing all artifacts. This lets the agent fetch only the artifacts it needs and allows registries to deduplicate unchanged blobs across bundle tags.
 
