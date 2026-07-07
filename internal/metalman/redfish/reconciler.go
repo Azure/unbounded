@@ -26,9 +26,10 @@ import (
 
 const (
 	// Condition types set by this controller.
-	condPoweredOff    = "PoweredOff"
-	condBootSupported = "BootOrderConfigSupported"
-	condRepaved       = "Repaved"
+	condPoweredOff          = "PoweredOff"
+	condBootSupported       = "BootOrderConfigSupported"
+	condSecureBootSupported = "SecureBootConfigSupported"
+	condRepaved             = "Repaved"
 
 	// Condition reasons.
 	reasonPoweringOff  = "PoweringOff"
@@ -131,8 +132,34 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	desiredSecureBoot := !machine.Spec.PXE.InsecureDisableSecureBoot
-	if err := reconcileSecureBoot(ctx, log, c, desiredSecureBoot); err != nil && !errors.Is(err, ErrUnsupported) {
-		return ctrl.Result{}, fmt.Errorf("configuring Secure Boot: %w", err)
+	secureBootCond := meta.FindStatusCondition(machine.Status.Conditions, condSecureBootSupported)
+	secureBootStatusChanged := false
+	if secureBootCond != nil && secureBootCond.Status == metav1.ConditionFalse && desiredSecureBoot {
+		return ctrl.Result{}, fmt.Errorf("Secure Boot config is not supported but Secure Boot is enabled: %w", ErrUnsupported)
+	}
+
+	if secureBootCond == nil || secureBootCond.Status != metav1.ConditionFalse {
+		if err := reconcileSecureBoot(ctx, log, c, desiredSecureBoot); err != nil {
+			if errors.Is(err, ErrUnsupported) {
+				log.Info("Secure Boot config not supported", "err", err)
+				meta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+					Type:               condSecureBootSupported,
+					Status:             metav1.ConditionFalse,
+					Reason:             reasonNotSupported,
+					ObservedGeneration: machine.Generation,
+				})
+				secureBootStatusChanged = true
+				if desiredSecureBoot {
+					if err := r.Client.Status().Update(ctx, &machine); err != nil {
+						return ctrl.Result{}, fmt.Errorf("updating Secure Boot support status: %w", err)
+					}
+
+					return ctrl.Result{}, fmt.Errorf("Secure Boot config is not supported but Secure Boot is enabled: %w", err)
+				}
+			} else {
+				return ctrl.Result{}, fmt.Errorf("configuring Secure Boot: %w", err)
+			}
+		}
 	}
 
 	// Boot order configuration (skip if known unsupported).
@@ -176,6 +203,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// No reboot pending - done.
 	if machine.Spec.Operations.RebootCounter <= machine.Status.Operations.RebootCounter {
+		if secureBootStatusChanged {
+			return ctrl.Result{}, r.Client.Status().Update(ctx, &machine)
+		}
+
 		return ctrl.Result{}, nil
 	}
 

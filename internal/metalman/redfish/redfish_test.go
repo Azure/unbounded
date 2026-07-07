@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -147,8 +148,9 @@ func TestRedfishRebootCycle(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-01", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f0", IPv4: "10.0.0.1", SubnetMask: "255.255.255.0"}},
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				DHCPLeases:                []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f0", IPv4: "10.0.0.1", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
 					Username:    "admin",
@@ -385,8 +387,9 @@ func TestRedfishPowerOnTimeoutRetry(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-stuck", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f5", IPv4: "10.0.0.6", SubnetMask: "255.255.255.0"}},
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				DHCPLeases:                []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f5", IPv4: "10.0.0.6", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
 					Username:    "admin",
@@ -515,8 +518,9 @@ func TestRedfishForceOffTimeoutRetry(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-stuck-off", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f6", IPv4: "10.0.0.7", SubnetMask: "255.255.255.0"}},
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				DHCPLeases:                []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f6", IPv4: "10.0.0.7", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
 					Username:    "admin",
@@ -702,8 +706,9 @@ func TestRedfishExactlyOnceSemantics(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-once", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f4", IPv4: "10.0.0.5", SubnetMask: "255.255.255.0"}},
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				DHCPLeases:                []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f4", IPv4: "10.0.0.5", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
 					Username:    "admin",
@@ -812,8 +817,9 @@ func TestBootOrderConfigPxeOn(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-pxe", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b0", IPv4: "10.0.0.30", SubnetMask: "255.255.255.0"}},
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				DHCPLeases:                []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b0", IPv4: "10.0.0.30", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
 					Username:    "admin",
@@ -914,8 +920,9 @@ func TestBootOrderConfigPxeOff(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-hdd", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b1", IPv4: "10.0.0.31", SubnetMask: "255.255.255.0"}},
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				DHCPLeases:                []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b1", IPv4: "10.0.0.31", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
 					Username:    "admin",
@@ -1352,6 +1359,177 @@ func TestBootOrderConfigPXEDisablesSecureBoot(t *testing.T) {
 	}
 }
 
+func TestSecureBootUnsupportedWhenDisabledSetsCondition(t *testing.T) {
+	var secureBootGetCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+			})
+
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			secureBootGetCalls.Add(1)
+			http.NotFound(w, r)
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			t.Fatal("unexpected SecureBoot PATCH")
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"}, Data: map[string][]byte{"password": []byte("secret")}}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-secure-boot-unsupported", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp}},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, secret).WithStatusSubresource(node).Build()
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-secure-boot-unsupported", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, condSecureBootSupported)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonNotSupported {
+		t.Fatalf("expected SecureBootConfigSupported=False/NotSupported, got %+v", cond)
+	}
+
+	if secureBootGetCalls.Load() != 1 {
+		t.Fatalf("expected 1 SecureBoot GET call, got %d", secureBootGetCalls.Load())
+	}
+
+	// The second reconcile skips Secure Boot and continues through the rest of
+	// the Redfish flow.
+	_, err = reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+
+	if secureBootGetCalls.Load() != 1 {
+		t.Fatalf("expected SecureBoot GET to be skipped after unsupported condition, got %d calls", secureBootGetCalls.Load())
+	}
+}
+
+func TestSecureBootUnsupportedWhenEnabledFailsClosed(t *testing.T) {
+	var secureBootGetCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+			})
+
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			secureBootGetCalls.Add(1)
+			http.NotFound(w, r)
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			t.Fatal("unexpected SecureBoot PATCH")
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"}, Data: map[string][]byte{"password": []byte("secret")}}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-secure-boot-fail-closed", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image: "ghcr.io/test/test-image:v1",
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp}},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, secret).WithStatusSubresource(node).Build()
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-secure-boot-fail-closed", Namespace: "default"}}
+
+	_, err := reconciler.Reconcile(t.Context(), req)
+	if err == nil || !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("expected ErrUnsupported, got %v", err)
+	}
+
+	var updated v1alpha3.Machine
+	if err := fc.Get(t.Context(), req.NamespacedName, &updated); err != nil {
+		t.Fatal(err)
+	}
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, condSecureBootSupported)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonNotSupported {
+		t.Fatalf("expected SecureBootConfigSupported=False/NotSupported, got %+v", cond)
+	}
+
+	if secureBootGetCalls.Load() != 1 {
+		t.Fatalf("expected 1 SecureBoot GET call, got %d", secureBootGetCalls.Load())
+	}
+
+	_, err = reconciler.Reconcile(t.Context(), req)
+	if err == nil || !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("expected cached ErrUnsupported, got %v", err)
+	}
+
+	if secureBootGetCalls.Load() != 1 {
+		t.Fatalf("expected SecureBoot GET to be skipped after unsupported condition, got %d calls", secureBootGetCalls.Load())
+	}
+}
+
 func TestUEFIHTTPBootEndToEnd(t *testing.T) {
 	var bootPatchBody map[string]any
 
@@ -1547,8 +1725,9 @@ func TestBootOrderConfigNoOp(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-noop", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b2", IPv4: "10.0.0.32", SubnetMask: "255.255.255.0"}},
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				DHCPLeases:                []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b2", IPv4: "10.0.0.32", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
 					Username:    "admin",
@@ -1632,8 +1811,9 @@ func TestBootOrderConfigNoOpPxeOff(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-noop-off", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b5", IPv4: "10.0.0.35", SubnetMask: "255.255.255.0"}},
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				DHCPLeases:                []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b5", IPv4: "10.0.0.35", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
 					Username:    "admin",
@@ -1728,8 +1908,9 @@ func TestBootOrderConfigPxeOffDisableFallbackToHdd(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-fallback", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b6", IPv4: "10.0.0.36", SubnetMask: "255.255.255.0"}},
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				DHCPLeases:                []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b6", IPv4: "10.0.0.36", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
 					Username:    "admin",
@@ -1823,8 +2004,9 @@ func TestBootOrderConfigNoOpPxeOffHdd(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-noop-hdd", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b7", IPv4: "10.0.0.37", SubnetMask: "255.255.255.0"}},
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				DHCPLeases:                []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b7", IPv4: "10.0.0.37", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
 					Username:    "admin",
@@ -1902,8 +2084,9 @@ func TestBootOrderConfigUnsupported(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-unsup", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b3", IPv4: "10.0.0.33", SubnetMask: "255.255.255.0"}},
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				DHCPLeases:                []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b3", IPv4: "10.0.0.33", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
 					Username:    "admin",
@@ -2001,8 +2184,9 @@ func TestBootOrderConfigUnsupportedDuringPOST(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-post", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b8", IPv4: "10.0.0.38", SubnetMask: "255.255.255.0"}},
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				DHCPLeases:                []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b8", IPv4: "10.0.0.38", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
 					Username:    "admin",
@@ -2122,8 +2306,9 @@ func TestBootOrderConfigTransientError(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-503", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b4", IPv4: "10.0.0.34", SubnetMask: "255.255.255.0"}},
+				Image:                     "ghcr.io/test/test-image:v1",
+				InsecureDisableSecureBoot: true,
+				DHCPLeases:                []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b4", IPv4: "10.0.0.34", SubnetMask: "255.255.255.0"}},
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         srv.URL,
 					Username:    "admin",
