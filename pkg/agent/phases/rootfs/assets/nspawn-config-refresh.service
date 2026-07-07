@@ -1,0 +1,9 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[Unit]
+Description=Regenerate nspawn configuration for {{.MachineName}}
+
+[Service]
+Type=oneshot
+ExecStart={{.AgentBinaryPath}} regenerate-nspawn-config {{.MachineName}}

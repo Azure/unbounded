@@ -129,16 +129,20 @@ The agent also auto-mounts host storage and InfiniBand hardware:
   list non-standard host device nodes under `/dev` (for example `/dev/uinput`) that
   should be exposed to workloads inside the machine.
 
-Device discovery runs once when the machine is provisioned. Disks or HCAs
-hot-plugged after the machine has started are not picked up until the machine
-is re-provisioned or soft-rebooted.
+Device discovery runs when the machine is provisioned and is refreshed by a
+host-side systemd hook before systemd starts the nspawn machine. Device mapping
+changes that occur while the host is offline are picked up on the next host
+boot before the machine starts. Disks or HCAs hot-plugged after the machine has
+started are not picked up until the machine is restarted, re-provisioned, or
+soft-rebooted.
 
-The configuration is written to two files on the host before the machine boots:
+The configuration is written to these files on the host before the machine boots:
 
 | File | Path |
 |---|---|
 | nspawn config | `/etc/systemd/nspawn/<MachineName>.nspawn` |
 | Service override | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` |
+| Config refresh unit | `/etc/systemd/system/unbounded-agent-nspawn-config@<MachineName>.service` |
 
 ### Customization points
 
@@ -257,6 +261,7 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 | `/var/lib/machines/<MachineName>` | Container rootfs directory. |
 | `/etc/systemd/nspawn/<MachineName>.nspawn` | nspawn configuration file. |
 | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` | Systemd service override. |
+| `/etc/systemd/system/unbounded-agent-nspawn-config@<MachineName>.service` | Host-side oneshot unit that refreshes nspawn configuration before machine start. |
 | `/run/host-nvidia/<index>/` | (Inside container) Read-only bind-mount of host NVIDIA library directories. |
 
 ## See Also

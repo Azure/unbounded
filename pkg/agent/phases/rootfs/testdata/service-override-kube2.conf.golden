@@ -32,6 +32,8 @@
 # maps, but each nspawn machine should get its own pinned-object namespace.
 
 [Unit]
+Requires=unbounded-agent-nspawn-config@kube2.service
+After=unbounded-agent-nspawn-config@kube2.service
 StartLimitIntervalSec=0
 
 [Service]

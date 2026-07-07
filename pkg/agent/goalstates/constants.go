@@ -74,6 +74,12 @@ func BPFFSMountPath(machineName string) string {
 	return fmt.Sprintf("%s/%s", BPFFSMountDir, machineName)
 }
 
+// NSpawnConfigRefreshUnit returns the systemd unit that refreshes host-side
+// nspawn configuration before the named machine starts.
+func NSpawnConfigRefreshUnit(machineName string) string {
+	return fmt.Sprintf("unbounded-agent-nspawn-config@%s.service", machineName)
+}
+
 // AppliedConfigPath returns the path to the applied config file for the
 // given nspawn machine name, e.g. /etc/unbounded/agent/kube1-applied-config.json.
 func AppliedConfigPath(machineName string) string {

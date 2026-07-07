@@ -17,38 +17,28 @@ import (
 func TestServiceOverride_RenderedSnapshot(t *testing.T) {
 	t.Parallel()
 
-	requireRenderedSnapshot(t, "service-override-kube1.conf.golden", "service-override.conf", nspawnTemplateData{
-		MachineName:    "kube1",
-		BPFFSMountPath: goalstates.BPFFSMountPath("kube1"),
-	})
+	requireRenderedSnapshot(t, "service-override-kube1.conf.golden", "service-override.conf", defaultNSpawnTemplateData("kube1"))
 }
 
 func TestServiceOverride_MachineNameSnapshot(t *testing.T) {
 	t.Parallel()
 
-	requireRenderedSnapshot(t, "service-override-kube2.conf.golden", "service-override.conf", nspawnTemplateData{
-		MachineName:    "kube2",
-		BPFFSMountPath: goalstates.BPFFSMountPath("kube2"),
-	})
+	requireRenderedSnapshot(t, "service-override-kube2.conf.golden", "service-override.conf", defaultNSpawnTemplateData("kube2"))
 }
 
 func TestNSpawnConfig_RenderedSnapshot(t *testing.T) {
 	t.Parallel()
 
-	requireRenderedSnapshot(t, "nspawn.conf.golden", "nspawn.conf", nspawnTemplateData{
-		BPFFSMountPath: goalstates.BPFFSMountPath("kube1"),
-	})
+	requireRenderedSnapshot(t, "nspawn.conf.golden", "nspawn.conf", defaultNSpawnTemplateData("kube1"))
 }
 
 func TestServiceOverride_HostDevicesDeviceAllow(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", nspawnTemplateData{
-		MachineName:     "kube1",
-		BPFFSMountPath:  goalstates.BPFFSMountPath("kube1"),
-		HostDevicePaths: []string{"/dev/kvm"},
-	}))
+	data := defaultNSpawnTemplateData("kube1")
+	data.HostDevicePaths = []string{"/dev/kvm"}
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", data))
 
 	out := buf.String()
 
@@ -67,17 +57,12 @@ func TestServiceOverride_MultipleHostDevices(t *testing.T) {
 	devices := []string{"/dev/kvm", "/dev/net/tun", "/dev/vhost-net", "/dev/sda", "/dev/infiniband/uverbs0"}
 
 	var nspawnBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
-		BPFFSMountPath:  goalstates.BPFFSMountPath("kube1"),
-		HostDevicePaths: devices,
-	}))
+	data := defaultNSpawnTemplateData("kube1")
+	data.HostDevicePaths = devices
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
 
 	var overrideBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", nspawnTemplateData{
-		MachineName:     "kube1",
-		BPFFSMountPath:  goalstates.BPFFSMountPath("kube1"),
-		HostDevicePaths: devices,
-	}))
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
 
 	// Every host device must get both a bind mount in the .nspawn config and a
 	// matching cgroup DeviceAllow in the service drop-in; otherwise the node is
@@ -94,18 +79,13 @@ func TestServiceOverride_AMDGPUDevices(t *testing.T) {
 	devices := []string{"/dev/dri/card0", "/dev/dri/renderD128", "/dev/kfd"}
 
 	var nspawnBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
-		BPFFSMountPath:    goalstates.BPFFSMountPath("kube1"),
-		AMDGPUDevicePaths: devices,
-		AMDSysFSPaths:     []string{"/sys/module/amdgpu", "/sys/class/kfd"},
-	}))
+	data := defaultNSpawnTemplateData("kube1")
+	data.AMDGPUDevicePaths = devices
+	data.AMDSysFSPaths = []string{"/sys/module/amdgpu", "/sys/class/kfd"}
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
 
 	var overrideBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", nspawnTemplateData{
-		MachineName:       "kube1",
-		BPFFSMountPath:    goalstates.BPFFSMountPath("kube1"),
-		AMDGPUDevicePaths: devices,
-	}))
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
 
 	for _, dev := range devices {
 		require.Contains(t, nspawnBuf.String(), "Bind="+dev)
@@ -133,15 +113,43 @@ func TestServiceOverride_NoHostDevicesNoDeviceAllow(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", nspawnTemplateData{
-		MachineName:    "kube1",
-		BPFFSMountPath: goalstates.BPFFSMountPath("kube1"),
-		// No HostDevicePaths and no GPU devices.
-	}))
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", defaultNSpawnTemplateData("kube1")))
 
 	// With no devices the drop-in must not contain any DeviceAllow lines,
 	// which is what keeps the existing golden snapshots unchanged.
 	require.NotContains(t, buf.String(), "DeviceAllow=")
+}
+
+func TestServiceOverride_ConfigRefreshDependency(t *testing.T) {
+	t.Parallel()
+
+	out := requireRenderedSnapshot(t, "service-override-kube1.conf.golden", "service-override.conf", defaultNSpawnTemplateData("kube1"))
+
+	require.Contains(t, out, "Requires=unbounded-agent-nspawn-config@kube1.service")
+	require.Contains(t, out, "After=unbounded-agent-nspawn-config@kube1.service")
+	require.Less(t, strings.Index(out, "[Unit]"), strings.Index(out, "Requires=unbounded-agent-nspawn-config@kube1.service"))
+	require.Less(t, strings.Index(out, "After=unbounded-agent-nspawn-config@kube1.service"), strings.Index(out, "[Service]"))
+}
+
+func TestNSpawnConfigRefreshUnit(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "nspawn-config-refresh.service", defaultNSpawnTemplateData("kube1")))
+
+	out := buf.String()
+	require.Contains(t, out, "Description=Regenerate nspawn configuration for kube1")
+	require.Contains(t, out, "Type=oneshot")
+	require.Contains(t, out, "ExecStart=/usr/local/bin/unbounded-agent regenerate-nspawn-config kube1")
+}
+
+func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {
+	return nspawnTemplateData{
+		MachineName:       machineName,
+		BPFFSMountPath:    goalstates.BPFFSMountPath(machineName),
+		ConfigRefreshUnit: goalstates.NSpawnConfigRefreshUnit(machineName),
+		AgentBinaryPath:   goalstates.DaemonBinaryPath,
+	}
 }
 
 func requireRenderedSnapshot(t *testing.T, goldenFile, templateName string, data nspawnTemplateData) string {

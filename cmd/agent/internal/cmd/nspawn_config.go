@@ -1,0 +1,111 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package cmd
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+
+	"github.com/spf13/cobra"
+
+	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/phases"
+	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
+)
+
+func newCmdRegenerateNSpawnConfig(cmdCtx *CommandContext) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:    "regenerate-nspawn-config MACHINE_NAME",
+		Short:  "Regenerate host-side nspawn configuration for a machine",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
+			defer cancel()
+
+			cmdCtx.Setup()
+
+			return regenerateNSpawnConfig(ctx, cmdCtx.Logger, args[0])
+		},
+	}
+
+	return cmd
+}
+
+func regenerateNSpawnConfig(ctx context.Context, log *slog.Logger, machineName string) error {
+	cfg, ok, err := loadAppliedConfigForMachine(log, machineName)
+	if err != nil {
+		return err
+	}
+
+	if !ok {
+		log.Info("applied config not found, skipping nspawn config regeneration", "machine", machineName)
+		return nil
+	}
+
+	gs, err := goalstates.ResolveMachine(log, cfg, machineName, nil)
+	if err != nil {
+		return fmt.Errorf("resolve machine goal state: %w", err)
+	}
+
+	if err := phases.ExecuteTask(ctx, log, rootfs.EnsureNSpawnConfig(log, gs.RootFS)); err != nil {
+		return fmt.Errorf("regenerate nspawn config for %s: %w", machineName, err)
+	}
+
+	return nil
+}
+
+func loadAppliedConfigForMachine(log *slog.Logger, machineName string) (*provision.AgentConfig, bool, error) {
+	if machineName != goalstates.NSpawnMachineKube1 && machineName != goalstates.NSpawnMachineKube2 {
+		return nil, false, fmt.Errorf("unsupported nspawn machine %q", machineName)
+	}
+
+	path := goalstates.AppliedConfigPath(machineName)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+
+	if err != nil {
+		return nil, false, fmt.Errorf("read applied config %s: %w", path, err)
+	}
+
+	checksumPath := goalstates.AppliedConfigChecksumPath(machineName)
+	if err := goalstates.VerifyChecksum(data, checksumPath); err != nil {
+		return nil, false, fmt.Errorf("verify applied config checksum for %s: %w", machineName, err)
+	}
+
+	if _, statErr := os.Stat(checksumPath); errors.Is(statErr, os.ErrNotExist) {
+		log.Warn("no checksum sidecar found, skipping integrity check",
+			"config_path", path,
+			"checksum_path", checksumPath,
+		)
+	}
+
+	var cfg provision.AgentConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, false, fmt.Errorf("decode applied config %s: %w", path, err)
+	}
+
+	source, err := provision.ResolveMachineName(&cfg)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve applied config machine name %s: %w", path, err)
+	}
+
+	if source != "config" {
+		log.Info("resolved unbounded MachineName", "name", cfg.MachineName, "source", source)
+	}
+
+	if err := cfg.BackfillNodeName(); err != nil {
+		return nil, false, fmt.Errorf("backfill applied config node name %s: %w", path, err)
+	}
+
+	return &cfg, true, nil
+}
