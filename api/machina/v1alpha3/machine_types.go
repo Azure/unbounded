@@ -304,6 +304,12 @@ type PXESpec struct {
 	// +optional
 	DHCPLeases []DHCPLease `json:"dhcpLeases,omitempty"`
 
+	// TargetDisk is the block device the installer writes the machine image to.
+	// Examples: /dev/nvme0n1, /dev/sda, /dev/disk/by-id/...
+	// When omitted, the installer chooses a target disk automatically.
+	// +optional
+	TargetDisk string `json:"targetDisk,omitempty"`
+
 	// Redfish configures optional Redfish BMC access.
 	// +optional
 	Redfish *RedfishSpec `json:"redfish,omitempty"`

@@ -98,6 +98,8 @@ spec:
     bootProtocol: PXE
     # Optional. Omit to use Metalman's default netboot image.
     netbootImage: ghcr.io/azure/netboot:v1
+    # Optional. Recommended on hosts with multiple disks.
+    targetDisk: /dev/disk/by-id/example-os-disk
     dhcpLeases:
     - ipv4: "10.10.0.50"
       mac: "aa:bb:cc:dd:ee:ff"
@@ -173,11 +175,11 @@ If the referenced ConfigMap does not exist, metalman falls back to the default m
 
 1. **Machine CR created.** The Redfish reconciler sets the boot device and power-cycles the server (ForceOff → On). For `bootProtocol: PXE`, it selects PXE boot. For `bootProtocol: HTTP`, it sets a one-time Redfish UEFI HTTP boot URL from the netboot image metadata.
 2. **Network boot.** DHCP assigns the static IP by MAC. In PXE mode, DHCP also advertises the TFTP bootfile and TFTP serves `shimx64.efi`. In HTTP mode, the firmware downloads the Redfish-supplied URL from metalman's HTTP server.
-3. **GRUB decision.** A rendered `grub.cfg` (from a `.tmpl` file in the netboot image) checks `repaveCounter` against status: if counter is ahead, boot the PXE installer; otherwise chainload the local OS.
+3. **GRUB decision.** A rendered `grub.cfg` (from a `.tmpl` file in the netboot image) checks `repaveCounter` against status: if counter is ahead, boot the PXE installer; otherwise chainload the local OS. When a Machine has multiple DHCP leases, metalman renders the lease matching the request source IP and passes that lease's MAC as `unbounded.boot_mac`.
 4. **Installer (initrd overlay).** An init script in the initrd:
-   - Loads storage and network drivers, configures the static IP from kernel cmdline.
+   - Loads storage and network drivers, selects the provisioning NIC by MAC, and configures the static IP from kernel cmdline.
    - Downloads the gzip-compressed raw disk image from the machine image over HTTP (retries up to 120 times).
-   - Writes the image to the largest block device via `dd`.
+   - Writes the image to `spec.pxe.targetDisk` when set, otherwise to an automatically selected block device.
    - Mounts the root filesystem and injects cloud-init config and the agent configuration.
    - Calls `/pxe/disable` on metalman to signal completion, then reboots.
 5. **First boot.** cloud-init downloads the `unbounded-agent` binary from metalman and runs `unbounded-agent start`.

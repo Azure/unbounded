@@ -443,6 +443,12 @@ spec:
                     - url
                     - username
                     type: object
+                  targetDisk:
+                    description: |-
+                      TargetDisk is the block device the installer writes the machine image to.
+                      Examples: /dev/nvme0n1, /dev/sda, /dev/disk/by-id/...
+                      When omitted, the installer chooses a target disk automatically.
+                    type: string
                 required:
                 - image
                 type: object

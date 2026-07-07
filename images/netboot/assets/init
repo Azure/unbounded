@@ -35,6 +35,54 @@ retry() {
 
 log "installer starting"
 
+CMDLINE=$(cat /proc/cmdline)
+get_param() {
+    for tok in $CMDLINE; do
+        case "$tok" in "$1"=*) echo "${tok#"$1"=}"; return 0 ;; esac
+    done
+    return 1
+}
+
+normalize_mac() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | tr '-' ':'
+}
+
+bootif_to_mac() {
+    value=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+    case "$value" in
+        01-*) value=${value#01-} ;;
+    esac
+    echo "$value" | tr '-' ':'
+}
+
+log_interfaces() {
+    log "network interfaces:"
+    for dev in /sys/class/net/*; do
+        [ -e "$dev" ] || continue
+        name=$(basename "$dev")
+        mac=$(cat "$dev/address" 2>/dev/null || true)
+        state=$(cat "$dev/operstate" 2>/dev/null || true)
+        log "  $name mac=${mac:-unknown} state=${state:-unknown}"
+    done
+}
+
+log_disks() {
+    log "candidate disks:"
+    for disk in /sys/block/sd* /sys/block/nvme*n* /sys/block/vd*; do
+        [ -e "$disk" ] || continue
+        case "$(basename "$disk")" in
+            *p[0-9]*|*[0-9])
+                [ -e "$disk/partition" ] && continue
+                ;;
+        esac
+        size=$(cat "$disk/size" 2>/dev/null || echo 0)
+        model=$(cat "$disk/device/model" 2>/dev/null || true)
+        serial=$(cat "$disk/device/serial" 2>/dev/null || true)
+        removable=$(cat "$disk/removable" 2>/dev/null || true)
+        log "  /dev/$(basename "$disk") sectors=$size model=${model:-unknown} serial=${serial:-unknown} removable=${removable:-unknown}"
+    done
+}
+
 KVER=$(uname -r)
 for mod in virtio_pci virtio_blk ahci sd_mod nvme xfs ext4; do
     modprobe "$mod" 2>/dev/null || true
@@ -53,29 +101,61 @@ for mod in nls_cp437 nls_ascii nls_utf8 fat vfat efivarfs; do
     modprobe "$mod" 2>/dev/null || true
 done
 
-log "waiting for network interface"
-IFACE=""
-find_iface() {
-    IFACE=$(ls /sys/class/net/ 2>/dev/null | grep -v lo | head -1)
-    [ -n "$IFACE" ]
-}
-retry 30 1 "find network interface" find_iface || fatal "no network interface found"
-
-CMDLINE=$(cat /proc/cmdline)
-get_param() {
-    for tok in $CMDLINE; do
-        case "$tok" in "$1"=*) echo "${tok#"$1"=}"; return 0 ;; esac
-    done
-    return 1
-}
-
 IMAGE_URL=$(get_param unbounded.image_url) || fatal "unbounded.image_url not set"
 SERVE_URL=$(get_param unbounded.serve_url || true)
 TARGET_DISK=$(get_param unbounded.disk || true)
+BOOT_MAC=$(get_param unbounded.boot_mac || true)
+BOOTIF=$(get_param BOOTIF || true)
 DS_URL=$(get_param unbounded.ds_url || true)
 NODE_NAME=$(get_param unbounded.node_name || true)
 NODE_NAMESPACE=$(get_param unbounded.node_namespace || true)
 APISERVER_URL=$(get_param unbounded.apiserver_url || true)
+BOOT_MAC=$(normalize_mac "$BOOT_MAC")
+if [ -z "$BOOT_MAC" ] && [ -n "$BOOTIF" ]; then
+    BOOT_MAC=$(bootif_to_mac "$BOOTIF")
+fi
+
+log_interfaces
+
+log "waiting for network interface"
+IFACE=""
+find_iface_by_mac() {
+    [ -n "$BOOT_MAC" ] || return 1
+    for dev in /sys/class/net/*; do
+        [ -e "$dev" ] || continue
+        name=$(basename "$dev")
+        [ "$name" = "lo" ] && continue
+        mac=$(normalize_mac "$(cat "$dev/address" 2>/dev/null || true)")
+        if [ "$mac" = "$BOOT_MAC" ]; then
+            IFACE="$name"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_first_iface() {
+    for dev in /sys/class/net/*; do
+        [ -e "$dev" ] || continue
+        name=$(basename "$dev")
+        [ "$name" = "lo" ] && continue
+        IFACE="$name"
+        return 0
+    done
+    return 1
+}
+
+if [ -n "$BOOT_MAC" ]; then
+    retry 30 1 "find network interface with MAC $BOOT_MAC" find_iface_by_mac \
+        || log "WARNING: no network interface found with MAC $BOOT_MAC"
+fi
+
+if [ -z "$IFACE" ]; then
+    retry 30 1 "find network interface" find_first_iface || fatal "no network interface found"
+    log "WARNING: using first non-loopback network interface $IFACE"
+else
+    log "selected network interface $IFACE for MAC $BOOT_MAC"
+fi
 
 mask2cidr() {
     local cidr=0
@@ -117,8 +197,9 @@ if [ -z "$TARGET_DISK" ]; then
     find_disk() {
         TARGET_DISK=""
         MAX_SIZE=0
-        for disk in /sys/block/sd* /sys/block/nvme* /sys/block/vd*; do
+        for disk in /sys/block/sd* /sys/block/nvme*n* /sys/block/vd*; do
             [ -e "$disk" ] || continue
+            [ -e "$disk/partition" ] && continue
             SIZE=$(cat "$disk/size" 2>/dev/null || echo 0)
             if [ "$SIZE" -gt "$MAX_SIZE" ]; then
                 MAX_SIZE=$SIZE
@@ -127,8 +208,15 @@ if [ -z "$TARGET_DISK" ]; then
         done
         [ -n "$TARGET_DISK" ]
     }
+    log_disks
     retry 30 1 "find block device" find_disk || fatal "no target disk found"
+    log "WARNING: target disk was not specified, selected largest disk"
+else
+    if [ ! -e "$TARGET_DISK" ]; then
+        fatal "target disk $TARGET_DISK does not exist"
+    fi
 fi
+TARGET_DISK=$(readlink -f "$TARGET_DISK" 2>/dev/null || echo "$TARGET_DISK")
 log "target disk: $TARGET_DISK"
 
 log "downloading disk image from $IMAGE_URL"
@@ -147,8 +235,15 @@ sleep 2
 
 parts_for_disk() {
     base=$(basename "$TARGET_DISK")
-    for p in /sys/block/"$base"/"$base"*; do
+    sysdisk="/sys/block/$base"
+    if [ ! -d "$sysdisk" ]; then
+        sysdisk=$(readlink -f "/sys/class/block/$base" 2>/dev/null || true)
+        sysdisk=${sysdisk%/*}
+    fi
+    [ -d "$sysdisk" ] || return 0
+    for p in "$sysdisk"/"$base"*; do
         [ -e "$p" ] || continue
+        [ -e "$p/partition" ] || continue
         echo "/dev/$(basename "$p")"
     done
 }
