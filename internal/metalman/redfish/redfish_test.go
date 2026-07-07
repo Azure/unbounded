@@ -1269,6 +1269,89 @@ func TestBootOrderConfigUEFIHTTPDisablesSecureBoot(t *testing.T) {
 	}
 }
 
+func TestBootOrderConfigPXEDisablesSecureBoot(t *testing.T) {
+	var (
+		bootPatchCalls       atomic.Int64
+		secureBootPatchCalls atomic.Int64
+		secureBootPatchBody  map[string]any
+	)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Pxe",
+					"BootSourceOverrideEnabled": "Continuous",
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			bootPatchCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			json.NewEncoder(w).Encode(map[string]any{"SecureBootEnable": true})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/SecureBoot"):
+			secureBootPatchCalls.Add(1)
+			json.NewDecoder(r.Body).Decode(&secureBootPatchBody)
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fp := tlsServerFingerprint(srv)
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"}, Data: map[string][]byte{"password": []byte("secret")}}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-pxe-insecure", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:                     "ghcr.io/test/test-image:v1",
+				BootProtocol:              v1alpha3.PXEBootProtocolPXE,
+				InsecureDisableSecureBoot: true,
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp}},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, secret).WithStatusSubresource(node).Build()
+	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-pxe-insecure", Namespace: "default"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if secureBootPatchCalls.Load() != 1 {
+		t.Fatalf("expected 1 SecureBoot PATCH call, got %d", secureBootPatchCalls.Load())
+	}
+
+	if secureBootPatchBody["SecureBootEnable"] != false {
+		t.Fatalf("expected SecureBootEnable=false, got %v", secureBootPatchBody["SecureBootEnable"])
+	}
+
+	if bootPatchCalls.Load() != 0 {
+		t.Fatalf("expected no boot PATCH call, got %d", bootPatchCalls.Load())
+	}
+}
+
 func TestUEFIHTTPBootEndToEnd(t *testing.T) {
 	var bootPatchBody map[string]any
 

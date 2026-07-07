@@ -130,6 +130,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, fmt.Errorf("getting Redfish client: %w", err)
 	}
 
+	desiredSecureBoot := !machine.Spec.PXE.InsecureDisableSecureBoot
+	if err := reconcileSecureBoot(ctx, log, c, desiredSecureBoot); err != nil && !errors.Is(err, ErrUnsupported) {
+		return ctrl.Result{}, fmt.Errorf("configuring Secure Boot: %w", err)
+	}
+
 	// Boot order configuration (skip if known unsupported).
 	pendingRepave := machine.Spec.Operations.RepaveCounter > machine.Status.Operations.RepaveCounter
 
@@ -194,11 +199,6 @@ func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, m
 		if machine.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
 			bootURL, err := r.httpBootURL(machine)
 			if err != nil {
-				return err
-			}
-
-			desiredSecureBoot := !machine.Spec.PXE.InsecureDisableSecureBoot
-			if err := reconcileSecureBoot(ctx, log, c, desiredSecureBoot); err != nil {
 				return err
 			}
 
