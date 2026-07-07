@@ -13,7 +13,6 @@ import (
 	"iter"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -40,22 +39,10 @@ func newRemoteHTTPProbeTransport() http.RoundTripper {
 }
 
 func downloadFromRemote(ctx context.Context, source string) (io.ReadCloser, error) {
-	parsed, err := url.Parse(source)
-	if err != nil {
-		return nil, fmt.Errorf("parse download source %q: %w", source, err)
+	if err := validateHTTPDownloadSource(source); err != nil {
+		return nil, err
 	}
 
-	switch parsed.Scheme {
-	case "", "file":
-		return openLocalSource(parsed, source)
-	case "http", "https":
-		return downloadHTTP(ctx, source)
-	default:
-		return nil, fmt.Errorf("unsupported download source scheme %q", parsed.Scheme)
-	}
-}
-
-func downloadHTTP(ctx context.Context, source string) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
@@ -74,48 +61,32 @@ func downloadHTTP(ctx context.Context, source string) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
-func openLocalSource(parsed *url.URL, source string) (io.ReadCloser, error) {
-	path := source
-
-	if parsed.Scheme == "file" {
-		if parsed.Host != "" && parsed.Host != "localhost" {
-			return nil, fmt.Errorf("file download source must not include host %q", parsed.Host)
-		}
-
-		path = parsed.Path
-	}
-
-	if path == "" || !filepath.IsAbs(path) {
-		return nil, fmt.Errorf("file download source must use an absolute path: %q", source)
-	}
-
-	file, err := os.Open(path)
+func validateHTTPDownloadSource(source string) error {
+	parsed, err := url.Parse(source)
 	if err != nil {
-		return nil, fmt.Errorf("open file download source %q: %w", path, err)
+		return fmt.Errorf("parse download source %q: %w", source, err)
 	}
 
-	return file, nil
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("unsupported download source scheme %q", parsed.Scheme)
+	}
+
+	return nil
 }
 
 // ProbeRemoteHTTPObject checks that an HTTP artifact object is reachable
 // without downloading the full object. It first tries HEAD, then falls back to a
 // ranged GET for servers that do not support or incorrectly reject HEAD.
 func ProbeRemoteHTTPObject(ctx context.Context, source string) error {
-	parsed, err := url.Parse(source)
-	if err != nil {
-		return fmt.Errorf("parse download source %q: %w", source, err)
+	if err := validateHTTPDownloadSource(source); err != nil {
+		return err
 	}
 
-	switch parsed.Scheme {
-	case "http", "https":
-		if err := probeRemoteHTTPObject(ctx, http.MethodHead, source); err == nil {
-			return nil
-		}
-
-		return probeRemoteHTTPObject(ctx, http.MethodGet, source)
-	default:
-		return fmt.Errorf("unsupported HTTP artifact source scheme %q", parsed.Scheme)
+	if err := probeRemoteHTTPObject(ctx, http.MethodHead, source); err == nil {
+		return nil
 	}
+
+	return probeRemoteHTTPObject(ctx, http.MethodGet, source)
 }
 
 func probeRemoteHTTPObject(ctx context.Context, method, source string) error {
@@ -158,7 +129,7 @@ type TarFile struct {
 
 type TarFileSeq = iter.Seq2[*TarFile, error]
 
-// DecompressTarGzFromRemote returns an iterator that yields the files contained in a .tar.gz file located at the given URL.
+// DecompressTarGzFromRemote returns an iterator that yields the files contained in a .tar.gz file located at the given HTTP(S) URL.
 func DecompressTarGzFromRemote(ctx context.Context, url string) TarFileSeq {
 	return func(yield func(*TarFile, error) bool) {
 		body, err := downloadFromRemote(ctx, url)
