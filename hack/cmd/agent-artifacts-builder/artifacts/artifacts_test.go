@@ -13,8 +13,8 @@ import (
 	"testing"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/oras-project/oras-go/v3/content/file"
 	"github.com/stretchr/testify/require"
+	"oras.land/oras-go/v2/content/file"
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
 )

@@ -6,7 +6,7 @@ package ociutil
 import (
 	"testing"
 
-	"github.com/oras-project/oras-go/v3/registry/remote"
+	"oras.land/oras-go/v2/registry/remote"
 )
 
 func TestConfigurePlainHTTP(t *testing.T) {
@@ -47,9 +47,9 @@ func TestConfigurePlainHTTP(t *testing.T) {
 
 			ConfigurePlainHTTP(repo)
 
-			if repo.Registry.PlainHTTP != tt.wantPlain {
+			if repo.PlainHTTP != tt.wantPlain {
 				t.Errorf("ConfigurePlainHTTP(%q): PlainHTTP = %v, want %v",
-					tt.imageRef, repo.Registry.PlainHTTP, tt.wantPlain)
+					tt.imageRef, repo.PlainHTTP, tt.wantPlain)
 			}
 		})
 	}

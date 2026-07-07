@@ -15,11 +15,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/oras-project/oras-go/v3"
-	"github.com/oras-project/oras-go/v3/content/oci"
-	"github.com/oras-project/oras-go/v3/registry/remote"
-	"github.com/oras-project/oras-go/v3/registry/remote/auth"
-	"github.com/oras-project/oras-go/v3/registry/remote/retry"
+	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/content/oci"
+	"oras.land/oras-go/v2/registry/remote"
+	"oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/retry"
 
 	"github.com/Azure/unbounded/internal/ociutil"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
@@ -167,7 +167,7 @@ func newRemoteRepository(ref string) (*remote.Repository, error) {
 }
 
 func configureOCIPullRetry(repo *remote.Repository) {
-	repo.Registry.Client = &auth.Client{
+	repo.Client = &auth.Client{
 		Client: &http.Client{
 			Transport: &retry.Transport{
 				Policy: func() retry.Policy {

@@ -15,12 +15,12 @@ import (
 	"strings"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/oras-project/oras-go/v3"
-	"github.com/oras-project/oras-go/v3/content/file"
-	"github.com/oras-project/oras-go/v3/registry/remote"
-	"github.com/oras-project/oras-go/v3/registry/remote/auth"
-	"github.com/oras-project/oras-go/v3/registry/remote/credentials"
-	"github.com/oras-project/oras-go/v3/registry/remote/retry"
+	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/content/file"
+	"oras.land/oras-go/v2/registry/remote"
+	"oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/credentials"
+	"oras.land/oras-go/v2/registry/remote/retry"
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/ociutil"
@@ -48,13 +48,13 @@ func ValidateOCI(ctx context.Context, log *slog.Logger, ref string) error {
 		return fmt.Errorf("load OCI registry credentials: %w", err)
 	}
 
-	repo.Registry.Client = &auth.Client{
-		Client:         retry.DefaultClient,
-		Cache:          auth.DefaultCache,
-		CredentialFunc: credentialStore.Get,
+	repo.Client = &auth.Client{
+		Client:     retry.DefaultClient,
+		Cache:      auth.DefaultCache,
+		Credential: credentials.Credential(credentialStore),
 	}
 
-	tag := repo.Reference().GetReference()
+	tag := repo.Reference.Reference
 
 	platforms, err := fetchOCIPlatforms(ctx, repo, tag, ref)
 	if err != nil {

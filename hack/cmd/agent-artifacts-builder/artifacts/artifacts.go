@@ -23,13 +23,13 @@ import (
 	"github.com/google/renameio/v2"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/oras-project/oras-go/v3"
-	"github.com/oras-project/oras-go/v3/content/file"
-	"github.com/oras-project/oras-go/v3/registry/remote"
-	"github.com/oras-project/oras-go/v3/registry/remote/auth"
-	"github.com/oras-project/oras-go/v3/registry/remote/credentials"
-	"github.com/oras-project/oras-go/v3/registry/remote/retry"
 	"golang.org/x/sync/errgroup"
+	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/content/file"
+	"oras.land/oras-go/v2/registry/remote"
+	"oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/credentials"
+	"oras.land/oras-go/v2/registry/remote/retry"
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/ociutil"
@@ -214,10 +214,10 @@ func PushOCI(ctx context.Context, log *slog.Logger, rootDir, ref string) error {
 		return fmt.Errorf("load OCI registry credentials: %w", err)
 	}
 
-	repo.Registry.Client = &auth.Client{
-		Client:         retry.DefaultClient,
-		Cache:          auth.DefaultCache,
-		CredentialFunc: credentialStore.Get,
+	repo.Client = &auth.Client{
+		Client:     retry.DefaultClient,
+		Cache:      auth.DefaultCache,
+		Credential: credentials.Credential(credentialStore),
 	}
 
 	store, err := file.New(rootDir)
@@ -272,7 +272,7 @@ func PushOCI(ctx context.Context, log *slog.Logger, rootDir, ref string) error {
 
 	indexDesc.ArtifactType = artifactType
 
-	tag := repo.Reference().GetReference()
+	tag := repo.Reference.Reference
 	if err := store.Tag(ctx, indexDesc, tag); err != nil {
 		return fmt.Errorf("tag OCI artifact %q: %w", tag, err)
 	}

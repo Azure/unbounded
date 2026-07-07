@@ -63,7 +63,6 @@ require (
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/umoci v0.6.0
 	github.com/oracle/oci-go-sdk/v65 v65.118.1
-	github.com/oras-project/oras-go/v3 v3.0.0-dev
 	github.com/pin/tftp/v3 v3.2.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/spf13/cobra v1.10.2
@@ -89,6 +88,7 @@ require (
 	k8s.io/kube-aggregator v0.36.2
 	k8s.io/utils v0.0.0-20260319190234-28399d86e0b5
 	modernc.org/sqlite v1.53.0
+	oras.land/oras-go/v2 v2.6.1
 	sigs.k8s.io/controller-runtime v0.24.1
 	sigs.k8s.io/yaml v1.6.0
 )
