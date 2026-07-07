@@ -13,6 +13,8 @@ import (
 	"os"
 	"strings"
 
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+
 	"github.com/pin/tftp/v3"
 )
 
@@ -72,7 +74,7 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		return fmt.Errorf("node %s has no netboot image", node.Name)
 	}
 
-	resolved, err := t.ResolveFileByPath(ctx, filename, node, imageRef)
+	resolved, err := t.ResolveFileByPathForIP(ctx, filename, node, imageRef, ip)
 	if err != nil {
 		log.Warn("resolving file", "node", node.Name, "err", err)
 		return err
@@ -93,7 +95,7 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 			return err
 		}
 
-		t.recordBootLoaderDownloaded(ctx, log, node.Name, imageRef, filename)
+		t.recordBootLoaderDownloaded(ctx, log, node, imageRef, filename)
 
 		return nil
 	}
@@ -105,27 +107,27 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		return err
 	}
 
-	t.recordBootLoaderDownloaded(ctx, log, node.Name, imageRef, filename)
+	t.recordBootLoaderDownloaded(ctx, log, node, imageRef, filename)
 
 	return nil
 }
 
-func (t *TFTPServer) recordBootLoaderDownloaded(ctx context.Context, log *slog.Logger, machineName, imageRef, filename string) {
-	if t.StatusRecorder == nil || !t.isInitialBootLoaderDownload(imageRef, filename) {
+func (t *TFTPServer) recordBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, imageRef, filename string) {
+	if node == nil || t.StatusRecorder == nil || !t.isInitialBootLoaderDownload(imageRef, node.Spec.PXE.TargetArchitecture(), filename) {
 		return
 	}
 
-	if err := t.StatusRecorder.RecordBootLoaderDownloaded(ctx, machineName, filename); err != nil {
-		log.Error("recording boot loader download", "node", machineName, "err", err)
+	if err := t.StatusRecorder.RecordBootLoaderDownloaded(ctx, node.Name, filename); err != nil {
+		log.Error("recording boot loader download", "node", node.Name, "err", err)
 	}
 }
 
-func (t *TFTPServer) isInitialBootLoaderDownload(imageRef, filename string) bool {
+func (t *TFTPServer) isInitialBootLoaderDownload(imageRef, architecture, filename string) bool {
 	if t.Cache == nil || imageRef == "" {
 		return true
 	}
 
-	meta, err := t.Cache.MetadataForRef(imageRef)
+	meta, err := t.Cache.MetadataForRefArchitecture(imageRef, architecture)
 	if err != nil || meta.DHCPBootImageName == "" {
 		return true
 	}

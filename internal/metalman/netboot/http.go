@@ -123,7 +123,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resolved, err := h.ResolveFileByPath(r.Context(), path, node, imageRef)
+	resolved, err := h.ResolveFileByPathForIP(r.Context(), path, node, imageRef, ip)
 	if err != nil {
 		if errors.Is(err, ErrNotYetDownloaded) {
 			log.Info("file not yet downloaded", "node", node.Name)
