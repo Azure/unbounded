@@ -67,16 +67,6 @@ const (
 	// attempts (e.g. after a controller restart).
 	MachineConditionProvisioning = "Provisioning"
 
-	// MachineConditionCloudInitDone indicates whether cloud-init has
-	// finished on the machine. Status is True with Reason "Succeeded"
-	// when cloud-init completes without errors, False with Reason
-	// "Running" while cloud-init stages are still executing, and
-	// False with Reason "Failed" when a cloud-init stage reports a
-	// failure. On failure the message includes the stage name and the
-	// error result so that operators can diagnose the problem without
-	// logging into the machine.
-	MachineConditionCloudInitDone = "CloudInitDone"
-
 	// MachineConditionAgentBootstrapped indicates whether the unbounded
 	// agent completed initial node bootstrap. Status is False with Reason
 	// "Running" while the agent is preparing the nspawn node, False with

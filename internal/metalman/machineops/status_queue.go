@@ -10,7 +10,6 @@ import (
 	"sort"
 	"sync"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
@@ -25,7 +24,7 @@ const (
 	statusUpdateBootLoaderDownloaded statusUpdateKind = iota
 	statusUpdateBootImageWritten
 	statusUpdateCloudInitDone
-	statusUpdateMachineCondition
+	statusUpdateOperationCondition
 )
 
 // StatusQueue records server-observed status milestones. Most updates are best
@@ -77,10 +76,10 @@ func (q *StatusQueue) RecordCloudInitDone(_ context.Context, machineName string)
 	return q.enqueue(statusUpdate{machineName: machineName, kind: statusUpdateCloudInitDone})
 }
 
-func (q *StatusQueue) RecordMachineCondition(_ context.Context, machineName string, condition metav1.Condition) error {
+func (q *StatusQueue) RecordOperationCondition(_ context.Context, machineName string, condition metav1.Condition) error {
 	cond := condition
 
-	return q.enqueue(statusUpdate{machineName: machineName, kind: statusUpdateMachineCondition, condition: &cond})
+	return q.enqueue(statusUpdate{machineName: machineName, kind: statusUpdateOperationCondition, condition: &cond})
 }
 
 func (q *StatusQueue) RecordPXEDisabled(ctx context.Context, machineName, imageName string) error {
@@ -150,20 +149,12 @@ func (q *StatusQueue) flush(ctx context.Context, update statusUpdate) error {
 		return q.flushOperationCondition(ctx, update.machineName, v1alpha3.MachineOperationConditionBootImageWritten, metav1.ConditionTrue, "Succeeded", fmt.Sprintf("Machine %s finished writing the boot image to disk", update.machineName))
 	case statusUpdateCloudInitDone:
 		return q.flushOperationCondition(ctx, update.machineName, v1alpha3.MachineOperationConditionCloudInitDone, metav1.ConditionTrue, "Succeeded", fmt.Sprintf("Machine %s completed first-boot cloud-init successfully", update.machineName))
-	case statusUpdateMachineCondition:
+	case statusUpdateOperationCondition:
 		if update.condition == nil {
 			return nil
 		}
 
-		if err := q.flushMachineCondition(ctx, update.machineName, *update.condition); err != nil {
-			return err
-		}
-
-		if update.condition.Type == v1alpha3.MachineConditionCloudInitDone && update.condition.Status != metav1.ConditionTrue {
-			return q.flushOperationCondition(ctx, update.machineName, v1alpha3.MachineOperationConditionCloudInitDone, update.condition.Status, update.condition.Reason, update.condition.Message)
-		}
-
-		return nil
+		return q.flushOperationCondition(ctx, update.machineName, update.condition.Type, update.condition.Status, update.condition.Reason, update.condition.Message)
 	default:
 		return fmt.Errorf("unknown status update kind %d", update.kind)
 	}
@@ -190,24 +181,6 @@ func (q *StatusQueue) flushOperationCondition(ctx context.Context, machineName, 
 		})
 
 		return q.Client.Status().Update(ctx, op)
-	})
-}
-
-func (q *StatusQueue) flushMachineCondition(ctx context.Context, machineName string, condition metav1.Condition) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var machine v1alpha3.Machine
-		if err := q.Client.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil
-			}
-
-			return fmt.Errorf("get Machine: %w", err)
-		}
-
-		condition.ObservedGeneration = machine.Generation
-		apimeta.SetStatusCondition(&machine.Status.Conditions, condition)
-
-		return q.Client.Status().Update(ctx, &machine)
 	})
 }
 

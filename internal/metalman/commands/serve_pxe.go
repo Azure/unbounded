@@ -26,7 +26,6 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/internal/metalman/attestation"
-	"github.com/Azure/unbounded/internal/metalman/cloudinit"
 	"github.com/Azure/unbounded/internal/metalman/dhcp"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 	metalmachineops "github.com/Azure/unbounded/internal/metalman/machineops"
@@ -236,10 +235,6 @@ func ServePXECmd() *cobra.Command {
 				PollInterval:          operationPollInterval,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up MachineOperation reconciler: %w", err)
-			}
-
-			if err := (&cloudinit.Reconciler{Client: mgr.GetClient(), StatusRecorder: statusQueue}).SetupWithManager(mgr); err != nil {
-				return fmt.Errorf("setting up CloudInit reconciler: %w", err)
 			}
 
 			if dhcpInterface != "" && dhcpAutoInterface {

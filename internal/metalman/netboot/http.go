@@ -43,7 +43,7 @@ type StatusRecorder interface {
 	RecordBootLoaderDownloaded(ctx context.Context, machineName, filename string) error
 	RecordBootImageWritten(ctx context.Context, machineName string) error
 	RecordCloudInitDone(ctx context.Context, machineName string) error
-	RecordMachineCondition(ctx context.Context, machineName string, condition metav1.Condition) error
+	RecordOperationCondition(ctx context.Context, machineName string, condition metav1.Condition) error
 	RecordPXEDisabled(ctx context.Context, machineName, imageName string) error
 }
 
@@ -217,9 +217,8 @@ func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
 // finishes successfully the CloudInitDone condition transitions to True.
 const cloudInitLastStage = "modules-final"
 
-// recordCloudInitCondition records the CloudInitDone condition for the Machine
-// that matches the request source IP. The recorder is asynchronous in the
-// serve-pxe command, so cloud-init webhooks do not wait on Kubernetes status IO.
+// recordCloudInitCondition records the CloudInitDone condition for the active
+// MachineOperation targeting the Machine that matches the request source IP.
 func (h *HTTPServer) recordCloudInitCondition(ctx context.Context, log *slog.Logger, ip string, ev *cloudInitEvent) string {
 	if h.Reader == nil {
 		return ""
@@ -234,7 +233,7 @@ func (h *HTTPServer) recordCloudInitCondition(ctx context.Context, log *slog.Log
 
 	cond := buildCloudInitCondition(ev, node.Generation)
 	if cond != nil && h.StatusRecorder != nil {
-		if err := h.StatusRecorder.RecordMachineCondition(ctx, node.Name, *cond); err != nil {
+		if err := h.StatusRecorder.RecordOperationCondition(ctx, node.Name, *cond); err != nil {
 			log.Error("recording cloud-init condition", "node", node.Name, "err", err)
 		}
 	}
@@ -250,7 +249,7 @@ func buildCloudInitCondition(ev *cloudInitEvent, generation int64) *metav1.Condi
 	switch ev.EventType {
 	case "start":
 		return &metav1.Condition{
-			Type:               v1alpha3.MachineConditionCloudInitDone,
+			Type:               v1alpha3.MachineOperationConditionCloudInitDone,
 			Status:             metav1.ConditionFalse,
 			Reason:             "Running",
 			Message:            fmt.Sprintf("stage %q started: %s", ev.Name, ev.Description),
@@ -265,7 +264,7 @@ func buildCloudInitCondition(ev *cloudInitEvent, generation int64) *metav1.Condi
 			}
 
 			return &metav1.Condition{
-				Type:               v1alpha3.MachineConditionCloudInitDone,
+				Type:               v1alpha3.MachineOperationConditionCloudInitDone,
 				Status:             metav1.ConditionFalse,
 				Reason:             "Failed",
 				Message:            msg,
@@ -275,7 +274,7 @@ func buildCloudInitCondition(ev *cloudInitEvent, generation int64) *metav1.Condi
 
 		if ev.Name == cloudInitLastStage {
 			return &metav1.Condition{
-				Type:               v1alpha3.MachineConditionCloudInitDone,
+				Type:               v1alpha3.MachineOperationConditionCloudInitDone,
 				Status:             metav1.ConditionTrue,
 				Reason:             "Succeeded",
 				Message:            "cloud-init completed successfully",
@@ -285,7 +284,7 @@ func buildCloudInitCondition(ev *cloudInitEvent, generation int64) *metav1.Condi
 
 		// An earlier stage succeeded - cloud-init is still running.
 		return &metav1.Condition{
-			Type:               v1alpha3.MachineConditionCloudInitDone,
+			Type:               v1alpha3.MachineOperationConditionCloudInitDone,
 			Status:             metav1.ConditionFalse,
 			Reason:             "Running",
 			Message:            fmt.Sprintf("stage %q finished successfully, waiting for remaining stages", ev.Name),

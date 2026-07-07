@@ -765,7 +765,7 @@ func (r *recordingStatusRecorder) RecordCloudInitDone(_ context.Context, machine
 	return nil
 }
 
-func (r *recordingStatusRecorder) RecordMachineCondition(_ context.Context, machineName string, condition metav1.Condition) error {
+func (r *recordingStatusRecorder) RecordOperationCondition(_ context.Context, machineName string, condition metav1.Condition) error {
 	if r.err != nil {
 		return r.err
 	}
@@ -2971,8 +2971,8 @@ func TestBuildCloudInitCondition(t *testing.T) {
 				t.Fatal("expected non-nil condition")
 			}
 
-			if cond.Type != v1alpha3.MachineConditionCloudInitDone {
-				t.Errorf("type: got %q, want %q", cond.Type, v1alpha3.MachineConditionCloudInitDone)
+			if cond.Type != v1alpha3.MachineOperationConditionCloudInitDone {
+				t.Errorf("type: got %q, want %q", cond.Type, v1alpha3.MachineOperationConditionCloudInitDone)
 			}
 
 			if cond.Status != tt.wantStatus {

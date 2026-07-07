@@ -44,8 +44,8 @@ func TestStatusQueueRecordsServerMilestones(t *testing.T) {
 	require.NoError(t, queue.RecordBootLoaderDownloaded(context.Background(), machine.Name, "shimx64.efi"))
 	require.NoError(t, queue.RecordBootImageWritten(context.Background(), machine.Name))
 	require.NoError(t, queue.RecordCloudInitDone(context.Background(), machine.Name))
-	require.NoError(t, queue.RecordMachineCondition(context.Background(), machine.Name, metav1.Condition{
-		Type:    v1alpha3.MachineConditionCloudInitDone,
+	require.NoError(t, queue.RecordOperationCondition(context.Background(), machine.Name, metav1.Condition{
+		Type:    v1alpha3.MachineOperationConditionCloudInitDone,
 		Status:  metav1.ConditionTrue,
 		Reason:  "Succeeded",
 		Message: "cloud-init completed successfully",
@@ -75,11 +75,7 @@ func TestStatusQueueRecordsServerMilestones(t *testing.T) {
 
 	var updatedMachine v1alpha3.Machine
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: machine.Name}, &updatedMachine))
-
-	machineCloudInit := apimeta.FindStatusCondition(updatedMachine.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
-	require.NotNil(t, machineCloudInit)
-	require.Equal(t, metav1.ConditionTrue, machineCloudInit.Status)
-	require.Equal(t, machine.Generation, machineCloudInit.ObservedGeneration)
+	require.Empty(t, updatedMachine.Status.Conditions)
 
 	bootImage = apimeta.FindStatusCondition(updatedOp.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten)
 	require.NotNil(t, bootImage)
@@ -174,8 +170,8 @@ func TestStatusQueueCopiesCloudInitProgressToHostReplaceOperation(t *testing.T) 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(machine, op).Build()
 	queue := &StatusQueue{Client: c, Now: fixedNow}
 
-	require.NoError(t, queue.RecordMachineCondition(context.Background(), machine.Name, metav1.Condition{
-		Type:    v1alpha3.MachineConditionCloudInitDone,
+	require.NoError(t, queue.RecordOperationCondition(context.Background(), machine.Name, metav1.Condition{
+		Type:    v1alpha3.MachineOperationConditionCloudInitDone,
 		Status:  metav1.ConditionFalse,
 		Reason:  "Running",
 		Message: "stage \"init\" started",
@@ -215,8 +211,8 @@ func TestStatusQueueCopiesCloudInitTimeoutToHostReplaceOperation(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(machine, op).Build()
 	queue := &StatusQueue{Client: c, Now: fixedNow}
 
-	require.NoError(t, queue.RecordMachineCondition(context.Background(), machine.Name, metav1.Condition{
-		Type:    v1alpha3.MachineConditionCloudInitDone,
+	require.NoError(t, queue.RecordOperationCondition(context.Background(), machine.Name, metav1.Condition{
+		Type:    v1alpha3.MachineOperationConditionCloudInitDone,
 		Status:  metav1.ConditionUnknown,
 		Reason:  "TimedOut",
 		Message: "cloud-init did not complete within 5m0s",

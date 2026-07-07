@@ -39,6 +39,9 @@ const (
 	reasonTargetNoLongerOwned      = "TargetNoLongerOwned"
 	reasonExecutionFailed          = "ExecutionFailed"
 	reasonWaitingForOlderOperation = "WaitingForOlderOperation"
+	reasonTimedOut                 = "TimedOut"
+
+	cloudInitTimeout = 5 * time.Minute
 )
 
 // PowerClient is the Redfish power operation subset used by MachineOperation reconciliation.
@@ -637,6 +640,10 @@ func cloudInitReplaceStatus(op *v1alpha3.MachineOperation, target v1alpha3.Machi
 		case metav1.ConditionFalse:
 			if cond.Reason == "Failed" {
 				return failTarget(target, reasonExecutionFailed, cond.Message, now), true
+			}
+
+			if !cond.LastTransitionTime.IsZero() && now.Sub(cond.LastTransitionTime.Time) >= cloudInitTimeout {
+				return failTarget(target, reasonTimedOut, fmt.Sprintf("cloud-init did not complete within %s", cloudInitTimeout), now), true
 			}
 		}
 	}
