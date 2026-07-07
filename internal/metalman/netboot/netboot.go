@@ -182,6 +182,10 @@ const userDataPath = "cloud-init/user-data"
 const defaultUserData = "#cloud-config\n"
 
 func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node *v1alpha3.Machine, imageRef string) (*ResolvedFile, error) {
+	return f.ResolveFileByPathForIP(ctx, path, node, imageRef, "")
+}
+
+func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, node *v1alpha3.Machine, imageRef, requestIP string) (*ResolvedFile, error) {
 	if path == userDataPath && node != nil {
 		if data, ok, err := f.resolveUserDataFromConfigMap(ctx, node); err != nil {
 			return nil, fmt.Errorf("resolving user-data from ConfigMap: %w", err)
@@ -238,7 +242,7 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 				return nil, fmt.Errorf("marshal agent config: %w", err)
 			}
 
-			data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON)))
+			data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON), requestIP))
 			if err != nil {
 				return nil, err
 			}
@@ -291,6 +295,7 @@ func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v
 
 type templateData struct {
 	Machine             *v1alpha3.Machine
+	BootLease           *v1alpha3.DHCPLease
 	ApiserverURL        string
 	ServeURL            string
 	AgentConfigJSON     string
@@ -300,13 +305,17 @@ type templateData struct {
 	StatusRepaveCounter int64
 }
 
-func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON string) templateData {
+func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, requestIP string) templateData {
 	var specRepave, statusRepave int64
 
-	var agent *v1alpha3.AgentSpec
+	var (
+		agent     *v1alpha3.AgentSpec
+		bootLease *v1alpha3.DHCPLease
+	)
 
 	if node != nil {
 		agent = node.Spec.Agent
+		bootLease = selectBootLease(node, requestIP)
 
 		if node.Spec.Operations != nil {
 			specRepave = node.Spec.Operations.RepaveCounter
@@ -319,6 +328,7 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 
 	return templateData{
 		Machine:             node,
+		BootLease:           bootLease,
 		ApiserverURL:        ci.ApiserverURL,
 		ServeURL:            serveURL,
 		AgentConfigJSON:     agentConfigJSON,
@@ -327,6 +337,20 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 		SpecRepaveCounter:   specRepave,
 		StatusRepaveCounter: statusRepave,
 	}
+}
+
+func selectBootLease(node *v1alpha3.Machine, requestIP string) *v1alpha3.DHCPLease {
+	if node == nil || node.Spec.PXE == nil || len(node.Spec.PXE.DHCPLeases) == 0 {
+		return nil
+	}
+
+	for i := range node.Spec.PXE.DHCPLeases {
+		if node.Spec.PXE.DHCPLeases[i].IPv4 == requestIP {
+			return &node.Spec.PXE.DHCPLeases[i]
+		}
+	}
+
+	return &node.Spec.PXE.DHCPLeases[0]
 }
 
 var (

@@ -98,12 +98,17 @@ For PXE-provisioned machines, the `Machine` resource includes:
   PXE boot artifacts. When omitted, Metalman uses its configured default
   `netboot` image.
 - **`spec.pxe.dhcpLeases`** -- NIC specifications: MAC address and IP
-  assignment for each interface.
+  assignment for each interface. During install, the default netboot template
+  passes the matching lease MAC to the initrd so it can select the provisioning
+  NIC without relying on names such as `eth0`.
+- **`spec.pxe.targetDisk`** -- Optional block device path for the disk that
+  receives the machine image. Set this on hosts with multiple disks; when
+  omitted, the installer selects a disk automatically.
 - **`spec.pxe.redfish`** -- Optional BMC connection details (endpoint, username,
   password secret) for remote power management.
 - **`spec.pxe.cloudInit`** -- Optional cloud-init customization. References a
   ConfigMap containing user-data that is merged with the vendor-data managed by
-Unbounded.
+  Unbounded.
 
 ### Site Isolation
 
