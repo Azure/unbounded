@@ -15,10 +15,7 @@ const checkOCIImageReachableName = "oci-image-reachable"
 
 // Preflight returns the standard rootfs checks for a resolved machine goal state.
 func Preflight(log *slog.Logger, _ config.AgentConfig, goalState *goalstates.MachineGoalState) []preflight.Checker {
-	var rootFS *goalstates.RootFS
-	if goalState != nil {
-		rootFS = goalState.RootFS
-	}
+	rootFS := goalState.RootFS
 
 	return []preflight.Checker{
 		CheckOCIImageReachable(log, rootFS),

@@ -34,10 +34,6 @@ func CheckOCIImageReachable(_ *slog.Logger, rootFS *goalstates.RootFS) preflight
 func (c ociImageReachableChecker) Name() string { return checkOCIImageReachableName }
 
 func (c ociImageReachableChecker) Check(ctx context.Context) []preflight.Result {
-	if c.rootFS == nil {
-		return preflight.ResultsError(checkOCIImageReachableName, "rootfs image", "goal state could not be resolved")
-	}
-
 	if c.rootFS.OCIImage == "" {
 		return preflight.ResultsError(checkOCIImageReachableName, "rootfs image", "OCI rootfs image is required but no image was selected")
 	}
@@ -95,10 +91,6 @@ func CheckCNIArtifacts(log *slog.Logger, rootFS *goalstates.RootFS) preflight.Ch
 }
 
 func kubernetesArtifactSources(rootFS *goalstates.RootFS) (artifactsource.Sources, error) {
-	if rootFS == nil {
-		return nil, fmt.Errorf("rootfs goal state is required")
-	}
-
 	override := kubernetesDownloadSource(rootFS)
 	version := downloadSourceVersion(rootFS.KubernetesVersion, override)
 
@@ -116,10 +108,6 @@ func kubernetesArtifactSources(rootFS *goalstates.RootFS) (artifactsource.Source
 }
 
 func criArtifactSources(rootFS *goalstates.RootFS) (artifactsource.Sources, error) {
-	if rootFS == nil {
-		return nil, fmt.Errorf("rootfs goal state is required")
-	}
-
 	containerdOverride := containerdDownloadSource(rootFS)
 	runcOverride := runcDownloadSource(rootFS)
 	crictlOverride := crictlDownloadSource(rootFS)
@@ -155,10 +143,6 @@ func criArtifactSources(rootFS *goalstates.RootFS) (artifactsource.Sources, erro
 }
 
 func cniArtifactSources(rootFS *goalstates.RootFS) (artifactsource.Sources, error) {
-	if rootFS == nil {
-		return nil, fmt.Errorf("rootfs goal state is required")
-	}
-
 	override := cniDownloadSource(rootFS)
 	version := downloadSourceVersion(rootFS.CNIPluginVersion, override)
 
