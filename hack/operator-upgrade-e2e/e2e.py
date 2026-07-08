@@ -13,11 +13,16 @@ upgrades to the operator model built from the current tree via
 everything onto the unified `unbounded-system` namespace:
 
   * the pre-redesign net-group Sites are translated into machina-group Sites,
-  * operator/user Secrets and the machina/storage ConfigMaps are copied over,
+  * operator/user Secrets and the machina-config ConfigMap are copied over,
   * cluster-scoped secret references (Machine.spec.pxe.redfish.passwordRef) are
     repointed,
   * the new net + machina workloads come up Ready (real datapath, via the
-    net-node hostNetwork cutover), and
+    net-node hostNetwork cutover),
+  * the cluster Site's Nodes carry the canonical `unbounded-cloud.io/site`
+    label alongside the deprecated `net.unbounded-cloud.io/site` (the net
+    controller dual-writes both during the label deprecation window),
+  * unbounded-net-controller restarts cleanly (its hostNetwork Deployment uses
+    maxSurge=0 so a rollout does not deadlock on host port 9999), and
   * the legacy `unbounded-kube`/`unbounded-net` namespaces and the old
     `sites.net.unbounded-cloud.io` CRD are reaped.
 
@@ -73,12 +78,16 @@ CLUSTER_SITE = "cluster"
 
 PAUSE_IMAGE = "registry.k8s.io/pause:3.10"
 
-# Arbitrary but valid CIDRs for the Site spec. Because the old install uses
-# --manage-cni-plugin=false, these are never applied to the kind node's CNI;
-# they only populate the Site's networking spec (which the reaper copies).
-CLUSTER_NODE_CIDR = "172.20.0.0/16"
+# CIDRs for the Site spec. Because the old install uses --manage-cni-plugin=false
+# these are never applied to the kind node's CNI. The cluster Site's node CIDR is
+# computed at install time to cover the kind nodes' InternalIPs (see
+# kind_cluster_node_cidr) so the net controller genuinely assigns the site label
+# to them; that is what lets the upgrade exercise the canonical/deprecated
+# site-label dual-write. The remote ("edge") Site node CIDR is a CGNAT range that
+# no kind node matches and that never overlaps the cluster range.
+CLUSTER_NODE_CIDR = "172.20.0.0/16"  # fallback; normally computed from kind nodes
 CLUSTER_POD_CIDR = "10.244.0.0/16"
-SITE_NODE_CIDR = "172.21.0.0/16"
+SITE_NODE_CIDR = "100.64.0.0/16"
 SITE_POD_CIDR = "10.245.0.0/16"
 
 
@@ -177,6 +186,31 @@ def control_plane_node() -> str:
     die(f"kind cluster {CLUSTER} has no control-plane node")
 
     return ""
+
+
+def kind_cluster_node_cidr() -> str:
+    """Derive a /16 covering the kind nodes' InternalIPs.
+
+    kind places every node on a single docker network, so a /16 taken from any
+    node's InternalIP covers them all. Making the cluster Site's nodeCidr cover
+    the nodes is what causes the net controller to assign them the site label,
+    which the upgrade then asserts is dual-written (canonical + deprecated).
+    """
+    out = kubectl_out([
+        "get", "nodes", "-o",
+        "jsonpath={range .items[*]}{.status.addresses[?(@.type=='InternalIP')].address}{'\\n'}{end}",
+    ], check=False)
+    ips = [line.strip() for line in out.splitlines() if line.strip()]
+    if not ips:
+        log(f"WARNING: could not read node InternalIPs; falling back to {CLUSTER_NODE_CIDR}")
+        return CLUSTER_NODE_CIDR
+
+    octets = ips[0].split(".")
+    if len(octets) != 4:
+        log(f"WARNING: unexpected node InternalIP {ips[0]!r}; falling back to {CLUSTER_NODE_CIDR}")
+        return CLUSTER_NODE_CIDR
+
+    return f"{octets[0]}.{octets[1]}.0.0/16"
 
 
 def ensure_kubeconfig() -> None:
@@ -357,13 +391,18 @@ def cmd_install_old(args: argparse.Namespace) -> None:
     kubectl(["label", "node", node,
              "unbounded-cloud.io/unbounded-net-gateway=true", "--overwrite"])
 
+    # Match the cluster Site's node CIDR to the kind nodes so net assigns them
+    # the site label (the upgrade asserts the canonical/deprecated dual-write).
+    cluster_node_cidr = kind_cluster_node_cidr()
+    log(f"cluster Site nodeCidr = {cluster_node_cidr} (covers the kind nodes)")
+
     log(f"installing released {args.old_version} via `site init` (CNI-free)")
     run([
         str(plugin), "site", "init",
         "--kubeconfig", str(KUBECONFIG),
         "--name", REMOTE_SITE,
         "--manage-cni-plugin=false",
-        "--cluster-node-cidr", CLUSTER_NODE_CIDR,
+        "--cluster-node-cidr", cluster_node_cidr,
         "--cluster-pod-cidr", CLUSTER_POD_CIDR,
         "--node-cidr", SITE_NODE_CIDR,
         "--pod-cidr", SITE_POD_CIDR,
@@ -380,15 +419,6 @@ def cmd_install_old(args: argparse.Namespace) -> None:
         "type: Opaque\n"
         "stringData:\n"
         "  password: hunter2\n"
-    )
-    kubectl_apply_stdin(
-        "apiVersion: v1\n"
-        "kind: ConfigMap\n"
-        "metadata:\n"
-        "  name: unbounded-storage-config\n"
-        f"  namespace: {LEGACY_KUBE}\n"
-        "data:\n"
-        '  config.yaml: "log_level: info"\n'
     )
     kubectl_apply_stdin(
         "apiVersion: unbounded-cloud.io/v1alpha3\n"
@@ -444,6 +474,8 @@ def _dump_diagnostics() -> None:
     kubectl(["get", "ns"], check=False)
     kubectl(["get", "pods", "-A"], check=False)
     kubectl(["get", "sites.unbounded-cloud.io"], check=False)
+    kubectl(["get", "nodes", "-L", "unbounded-cloud.io/site",
+             "-L", "net.unbounded-cloud.io/site"], check=False)
     kubectl(["-n", TARGET_NS, "logs", "deploy/unbounded-operator",
              "--tail=120"], check=False)
 
@@ -474,9 +506,8 @@ def _migration_complete() -> tuple[bool, str]:
     # 4. Non-regenerable state copied across.
     if not resource_exists(["-n", TARGET_NS, "secret", "redfish-password"]):
         return False, "redfish-password not yet copied"
-    for cm in ("machina-config", "unbounded-storage-config"):
-        if not resource_exists(["-n", TARGET_NS, "configmap", cm]):
-            return False, f"configmap {cm} not yet copied"
+    if not resource_exists(["-n", TARGET_NS, "configmap", "machina-config"]):
+        return False, "configmap machina-config not yet copied"
 
     # 5. Machine secret-ref namespace rewritten.
     out = kubectl_out(["get", "machine.unbounded-cloud.io", "m1", "-o", "json"],
@@ -496,7 +527,24 @@ def _migration_complete() -> tuple[bool, str]:
     if resource_exists(["crd", LEGACY_SITE_CRD]):
         return False, f"legacy CRD {LEGACY_SITE_CRD} not yet deleted"
 
+    # 7. The cluster Site's Nodes carry the canonical site label, dual-written
+    # alongside the deprecated one by the upgraded net controller.
+    canonical = _nodes_with_label("unbounded-cloud.io/site", CLUSTER_SITE)
+    deprecated = _nodes_with_label("net.unbounded-cloud.io/site", CLUSTER_SITE)
+    if not canonical:
+        return False, "no Node carries the canonical unbounded-cloud.io/site=cluster label yet"
+    if canonical != deprecated:
+        return False, (f"site-label dual-write mismatch: "
+                       f"canonical={sorted(canonical)} deprecated={sorted(deprecated)}")
+
     return True, "migration complete"
+
+
+def _nodes_with_label(key: str, value: str) -> set[str]:
+    out = kubectl_out(
+        ["get", "nodes", "-l", f"{key}={value}",
+         "-o", "jsonpath={.items[*].metadata.name}"], check=False)
+    return set(out.split())
 
 
 def _workload_ready(kind: str, name: str) -> bool:
@@ -526,6 +574,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
         ok, msg = _migration_complete()
         if ok:
             log("PASS: " + msg)
+            _assert_net_controller_restarts()
             return
         if msg != last:
             log("waiting: " + msg)
@@ -534,6 +583,27 @@ def cmd_verify(args: argparse.Namespace) -> None:
 
     _dump_diagnostics()
     die(f"migration did not complete within {args.verify_timeout}s (last: {last})")
+
+
+def _assert_net_controller_restarts() -> None:
+    """Guard the hostNetwork rolling-restart deadlock.
+
+    unbounded-net-controller is hostNetwork and binds host port 9999. With the
+    default (surge) strategy a rollout deadlocks because the new pod cannot bind
+    the port while the old one holds it. The Deployment sets maxSurge=0 so the
+    old pod is terminated first; a rollout restart must therefore complete.
+    """
+    log("verifying unbounded-net-controller restarts cleanly (hostNetwork rollout)")
+    kubectl(["-n", TARGET_NS, "rollout", "restart", "deployment/unbounded-net-controller"])
+
+    rc = kubectl(["-n", TARGET_NS, "rollout", "status", "deployment/unbounded-net-controller",
+                  "--timeout=180s"], check=False)
+    if rc != 0:
+        _dump_diagnostics()
+        die("unbounded-net-controller did not roll out cleanly on restart "
+            "(hostNetwork surge deadlock?)")
+
+    log("PASS: unbounded-net-controller restarted cleanly")
 
 
 def cmd_cleanup(args: argparse.Namespace) -> None:

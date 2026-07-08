@@ -18,7 +18,9 @@ func init() {
 }
 
 const (
-	// MachineSiteLabelKey identifies the site a Machine belongs to.
+	// MachineSiteLabelKey is the canonical site-membership label. It scopes a
+	// Machine to a site and is also the canonical label the net controller
+	// applies to Nodes, superseding the deprecated net.unbounded-cloud.io/site.
 	MachineSiteLabelKey = "unbounded-cloud.io/site"
 )
 

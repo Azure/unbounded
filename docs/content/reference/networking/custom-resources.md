@@ -405,7 +405,7 @@ deterministic name order and the first profile is kept.
 
 | Label | Applied To | Description |
 |-------|-----------|-------------|
-| `net.unbounded-cloud.io/site` | Node | Site membership (set by controller). |
+| `unbounded-cloud.io/site` | Node | Site membership (set by controller). Supersedes the deprecated `net.unbounded-cloud.io/site`, which the controller still writes alongside it during the deprecation window. |
 
 ### Annotations
 

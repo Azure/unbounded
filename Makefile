@@ -99,7 +99,9 @@ GANTRY_MANIFEST_RENDERED_DIR  := deploy/gantry/rendered
 # unbounded-storage-supervisor (Go binary; distinct from the Rust crate below)
 UNBOUNDED_STORAGE_SUPERVISOR_BIN=bin/unbounded-storage-supervisor
 UNBOUNDED_STORAGE_SUPERVISOR_CMD=./cmd/unbounded-storage-supervisor
-UNBOUNDED_STORAGE_SUPERVISOR_TAG ?= latest
+# Default to the version-matched tag so operator-managed storage components stay
+# aligned with the release; override for local/e2e (e.g. TAG=dev).
+UNBOUNDED_STORAGE_SUPERVISOR_TAG ?= $(VERSION)
 UNBOUNDED_STORAGE_SUPERVISOR_IMAGE=$(CONTAINER_REGISTRY)/unbounded-storage-supervisor:$(UNBOUNDED_STORAGE_SUPERVISOR_TAG)
 UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-storage-supervisor

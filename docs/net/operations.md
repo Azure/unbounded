@@ -184,7 +184,7 @@ kubectl label node gateway-west-1 net.unbounded-cloud.io/gateway=true
 
 ```bash
 # Check site membership
-kubectl get nodes -L net.unbounded-cloud.io/site
+kubectl get nodes -L unbounded-cloud.io/site
 
 # Check gateway pool status
 kubectl get gp main-gateways -o yaml
@@ -745,7 +745,7 @@ kubectl -n unbounded-system logs -l app.kubernetes.io/name=unbounded-net-control
 kubectl get sites -o yaml
 
 # Check node site label
-kubectl get node <node-name> -L net.unbounded-cloud.io/site
+kubectl get node <node-name> -L unbounded-cloud.io/site
 
 # Check allocator status (in logs)
 kubectl -n unbounded-system logs -l app.kubernetes.io/name=unbounded-net-controller | grep -i alloc
@@ -802,7 +802,7 @@ modprobe wireguard
 iptables -L -n | grep 51820
 
 # Verify site label
-kubectl get node <node-name> -L net.unbounded-cloud.io/site
+kubectl get node <node-name> -L unbounded-cloud.io/site
 ```
 
 #### 3. Cross-Site Traffic Failing
@@ -924,7 +924,7 @@ kubectl get st
 kubectl get gp
 
 # Node site assignments
-kubectl get nodes -L net.unbounded-cloud.io/site
+kubectl get nodes -L unbounded-cloud.io/site
 
 # === Per-Node Diagnostics (WireGuard) ===
 # WireGuard status
@@ -1059,7 +1059,7 @@ spec:
 EOF
 
 # 3. Wait for nodes to be labeled
-watch kubectl get nodes -L net.unbounded-cloud.io/site
+watch kubectl get nodes -L unbounded-cloud.io/site
 
 # 3. Label gateway node
 kubectl label node gateway-new net.unbounded-cloud.io/gateway=true

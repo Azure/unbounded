@@ -479,8 +479,8 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 			nodeStatus.NodeInfo.K8sUpdatedAt = &t
 		}
 
-		if nodeStatus.NodeInfo.SiteName == "" && node.Labels != nil {
-			if siteLabel, ok := node.Labels[controller.SiteLabelKey]; ok && siteLabel != "" {
+		if nodeStatus.NodeInfo.SiteName == "" {
+			if siteLabel := controller.NodeSiteLabel(node); siteLabel != "" {
 				nodeStatus.NodeInfo.SiteName = siteLabel
 			}
 		}

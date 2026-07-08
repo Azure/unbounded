@@ -29,8 +29,14 @@ spec:
           args:
             - --leader-elect=true
             - --leader-elect-namespace={{ default "unbounded-system" .Namespace }}
+            - --namespace={{ default "unbounded-system" .Namespace }}
             - --metalman-image={{ .MetalmanImage }}
             - --api-server-endpoint={{ default "" .APIServerEndpoint }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: metrics
               containerPort: 8080

@@ -228,11 +228,11 @@ func TestSiteInitComponentOwnership(t *testing.T) {
 
 	cluster := h.clusterSiteConfig()
 	assert.True(t, cluster.EnableMachina)
-	assert.True(t, cluster.EnableStorage)
+	assert.False(t, cluster.EnableStorage)
 	assert.False(t, cluster.EnableMetalman)
 
 	remote := h.remoteSiteConfig()
 	assert.False(t, remote.EnableMachina)
-	assert.False(t, remote.EnableStorage)
+	assert.True(t, remote.EnableStorage)
 	assert.True(t, remote.EnableMetalman)
 }

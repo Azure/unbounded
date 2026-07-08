@@ -4,10 +4,12 @@
 package controller
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
@@ -163,7 +165,7 @@ func TestNodeAndStringHelpers(t *testing.T) {
 	nodeA := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        "node-a",
-			Labels:      map[string]string{SiteLabelKey: "site-a", "role": "gateway"},
+			Labels:      map[string]string{canonicalSiteLabelKey: "site-a", "role": "gateway"},
 			Annotations: map[string]string{WireGuardPubKeyAnnotation: "pub-a"},
 		},
 		Spec: corev1.NodeSpec{
@@ -308,4 +310,117 @@ func ptrBool(v bool) *bool {
 
 func ptrInt32(v int32) *int32 {
 	return &v
+}
+
+// TestNodeSiteLabelFallback verifies the canonical-first, deprecated-fallback
+// read of a Node's site membership.
+func TestNodeSiteLabelFallback(t *testing.T) {
+	cases := []struct {
+		name   string
+		labels map[string]string
+		want   string
+	}{
+		{name: "canonical", labels: map[string]string{canonicalSiteLabelKey: "s1"}, want: "s1"},
+		{name: "deprecated only", labels: map[string]string{deprecatedSiteLabelKey: "s2"}, want: "s2"},
+		{name: "both", labels: map[string]string{canonicalSiteLabelKey: "s3", deprecatedSiteLabelKey: "old"}, want: "s3"},
+		{name: "none", labels: map[string]string{}, want: ""},
+		{name: "nil labels", labels: nil, want: ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: tc.labels}}
+			if got := NodeSiteLabel(node); got != tc.want {
+				t.Fatalf("NodeSiteLabel = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNodeSiteLabelsCurrent verifies dual-write convergence: a Node is only
+// up-to-date when it carries the site under BOTH keys, so a node labeled only
+// with the deprecated key by an older controller is re-labeled.
+func TestNodeSiteLabelsCurrent(t *testing.T) {
+	deprecatedOnly := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{deprecatedSiteLabelKey: "s1"}}}
+	if nodeSiteLabelsCurrent(deprecatedOnly, "s1") {
+		t.Fatalf("deprecated-only node must be considered stale so the canonical label is added")
+	}
+
+	both := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{canonicalSiteLabelKey: "s1", deprecatedSiteLabelKey: "s1"}}}
+	if !nodeSiteLabelsCurrent(both, "s1") {
+		t.Fatalf("node carrying both keys must be current")
+	}
+
+	unlabeled := &corev1.Node{ObjectMeta: metav1.ObjectMeta{}}
+	if !nodeSiteLabelsCurrent(unlabeled, "") {
+		t.Fatalf("unlabeled node must be current for empty site")
+	}
+
+	if nodeSiteLabelsCurrent(both, "") {
+		t.Fatalf("labeled node must be stale for empty site (labels need removing)")
+	}
+}
+
+// TestSiteLabelPatches verifies the add/remove patch builders cover both keys.
+func TestSiteLabelPatches(t *testing.T) {
+	ops := siteLabelAddPatchOps("s1")
+	if len(ops) != 2 {
+		t.Fatalf("expected an op per site label key, got %d", len(ops))
+	}
+
+	paths := map[string]bool{}
+	for _, op := range ops {
+		paths[op["path"].(string)] = true
+
+		if op["value"] != "s1" || op["op"] != "add" {
+			t.Fatalf("unexpected op %#v", op)
+		}
+	}
+
+	if !paths["/metadata/labels/"+escapeJSONPointer(canonicalSiteLabelKey)] || !paths["/metadata/labels/"+escapeJSONPointer(deprecatedSiteLabelKey)] {
+		t.Fatalf("add ops missing a site key: %#v", paths)
+	}
+
+	remove, err := siteLabelRemoveMergePatch()
+	if err != nil {
+		t.Fatalf("siteLabelRemoveMergePatch: %v", err)
+	}
+
+	for _, key := range siteLabelKeys() {
+		if !strings.Contains(string(remove), key) {
+			t.Fatalf("remove patch missing key %q: %s", key, remove)
+		}
+	}
+}
+
+// TestBuildSliceObjectOwnerRefUsesMachinaSiteGVK guards that SiteNodeSlice owner
+// references point at the Site's real GVK (unbounded-cloud.io/v1alpha3). A stale
+// net-group ownerRef would let the garbage collector orphan or wrongly collect
+// slices once the legacy net Site CRD is reaped during migration.
+func TestBuildSliceObjectOwnerRefUsesMachinaSiteGVK(t *testing.T) {
+	site := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a", UID: "uid-123"}}
+
+	obj := (&SiteController{}).buildSliceObject(site, "site-a-0", 0, nil)
+
+	owners, found, err := unstructured.NestedSlice(obj.Object, "metadata", "ownerReferences")
+	if err != nil || !found || len(owners) != 1 {
+		t.Fatalf("ownerReferences missing: found=%t err=%v len=%d", found, err, len(owners))
+	}
+
+	owner, ok := owners[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("owner reference has unexpected type %T", owners[0])
+	}
+
+	if got := owner["apiVersion"]; got != unboundedv1alpha3.GroupVersion.String() {
+		t.Fatalf("owner apiVersion = %v, want %s", got, unboundedv1alpha3.GroupVersion.String())
+	}
+
+	if got := owner["kind"]; got != "Site" {
+		t.Fatalf("owner kind = %v, want Site", got)
+	}
+
+	if got := owner["uid"]; got != "uid-123" {
+		t.Fatalf("owner uid = %v, want uid-123", got)
+	}
 }

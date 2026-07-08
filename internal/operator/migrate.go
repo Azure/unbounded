@@ -282,6 +282,12 @@ func (r *LegacyReaper) reapOnce(ctx context.Context, logger logr.Logger) (bool, 
 		return false, fmt.Errorf("rewrite cluster-scoped secret references: %w", err)
 	}
 
+	// 3b: copy Machine cloud-init ConfigMaps out of the legacy namespaces and
+	// repoint their refs, so they survive the legacy namespace deletion.
+	if err := r.migrateMachineCloudInitConfigMaps(ctx, logger, target); err != nil {
+		return false, fmt.Errorf("migrate machine cloud-init configmaps: %w", err)
+	}
+
 	// 4 & 5: per component, gate on the target workloads being healthy, then
 	// delete the operator-owned resources in the legacy namespace.
 	allReaped := true
@@ -437,7 +443,21 @@ func (r *LegacyReaper) detectComponents(ctx context.Context, siteName string) (m
 	}
 
 	if storage {
-		components["storage"] = map[string]any{"enabled": true}
+		storageComponent := map[string]any{"enabled": true}
+
+		// Preserve the legacy shared storage config by folding it into the
+		// per-Site spec; storage config is per-Site in the new API and is
+		// rendered into a per-site ConfigMap by the reconciler.
+		config, err := r.legacyStorageConfig(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		if config != "" {
+			storageComponent["config"] = config
+		}
+
+		components["storage"] = storageComponent
 	}
 
 	if siteName == clusterSiteName {
@@ -497,6 +517,29 @@ func (r *LegacyReaper) legacyWorkloadExists(ctx context.Context, kind string, ma
 	return false, nil
 }
 
+// legacyStorageConfig returns the config.yaml from the legacy shared
+// unbounded-storage-config ConfigMap, if present in any legacy namespace.
+func (r *LegacyReaper) legacyStorageConfig(ctx context.Context) (string, error) {
+	for _, legacyNs := range r.LegacyNamespaces {
+		var cm corev1.ConfigMap
+
+		err := r.Get(ctx, client.ObjectKey{Namespace: legacyNs, Name: "unbounded-storage-config"}, &cm)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+
+		if err != nil {
+			return "", err
+		}
+
+		if v, ok := cm.Data["config.yaml"]; ok {
+			return v, nil
+		}
+	}
+
+	return "", nil
+}
+
 // migrateSecrets copies every non-auto-managed, non-skipped Secret from the
 // legacy namespace into the target namespace, creating it only if absent.
 func (r *LegacyReaper) migrateSecrets(ctx context.Context, logger logr.Logger, legacyNs, target string) error {
@@ -532,6 +575,11 @@ func (r *LegacyReaper) migrateSecrets(ctx context.Context, logger logr.Logger, l
 }
 
 // migrateConfigMaps copies the configured operator-owned ConfigMaps by name.
+// Unlike secrets, these are upserted (their data overwrites the target) so that
+// config migrated from the legacy namespace wins over any default the component
+// reconciler may have already created in the target. Once the legacy namespace
+// is drained the source is gone and this becomes a no-op, so the migrated data
+// is preserved thereafter.
 func (r *LegacyReaper) migrateConfigMaps(ctx context.Context, logger logr.Logger, legacyNs, target string) error {
 	for _, name := range r.CopyConfigMaps {
 		var src corev1.ConfigMap
@@ -543,13 +591,7 @@ func (r *LegacyReaper) migrateConfigMaps(ctx context.Context, logger logr.Logger
 			return err
 		}
 
-		dst := &corev1.ConfigMap{
-			ObjectMeta: copyObjectMeta(src.ObjectMeta, target),
-			Data:       src.Data,
-			BinaryData: src.BinaryData,
-		}
-
-		if err := r.createIfAbsent(ctx, dst); err != nil {
+		if err := r.upsertConfigMap(ctx, copyObjectMeta(src.ObjectMeta, target), src.Data, src.BinaryData); err != nil {
 			return fmt.Errorf("copy configmap %s/%s: %w", legacyNs, name, err)
 		}
 
@@ -557,6 +599,25 @@ func (r *LegacyReaper) migrateConfigMaps(ctx context.Context, logger logr.Logger
 	}
 
 	return nil
+}
+
+// upsertConfigMap creates the target ConfigMap, or updates its data if it
+// already exists.
+func (r *LegacyReaper) upsertConfigMap(ctx context.Context, meta metav1.ObjectMeta, data map[string]string, binaryData map[string][]byte) error {
+	existing := &corev1.ConfigMap{}
+
+	err := r.Get(ctx, client.ObjectKey{Namespace: meta.Namespace, Name: meta.Name}, existing)
+	switch {
+	case apierrors.IsNotFound(err):
+		return r.Create(ctx, &corev1.ConfigMap{ObjectMeta: meta, Data: data, BinaryData: binaryData})
+	case err != nil:
+		return err
+	default:
+		existing.Data = data
+		existing.BinaryData = binaryData
+
+		return r.Update(ctx, existing)
+	}
 }
 
 // rewriteClusterScopedRefs repoints secret-reference namespaces embedded in
@@ -602,6 +663,105 @@ func (r *LegacyReaper) rewriteClusterScopedRefs(ctx context.Context, logger logr
 			logger.Info("rewrote cluster-scoped secret reference namespace",
 				"kind", obj.GetKind(), "name", obj.GetName(), "from", current, "to", target)
 		}
+	}
+
+	return nil
+}
+
+// machineCloudInitConfigMapPath is the path to the Machine cloud-init user-data
+// ConfigMap reference (Machine.spec.pxe.cloudInit.userDataConfigMapRef).
+var machineCloudInitConfigMapPath = []string{"spec", "pxe", "cloudInit", "userDataConfigMapRef"}
+
+// migrateMachineCloudInitConfigMaps copies the ConfigMap each Machine references
+// for cloud-init user-data out of a legacy namespace into the target namespace
+// and repoints the reference. Unlike secret refs (whose secrets are copied
+// wholesale by migrateSecrets), these ConfigMaps have arbitrary names and are
+// not covered by migrateConfigMaps, so they would otherwise be lost when the
+// legacy namespace is deleted.
+func (r *LegacyReaper) migrateMachineCloudInitConfigMaps(ctx context.Context, logger logr.Logger, target string) error {
+	legacy := map[string]struct{}{}
+	for _, ns := range r.LegacyNamespaces {
+		legacy[ns] = struct{}{}
+	}
+
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   unboundedv1alpha3.GroupVersion.Group,
+		Version: unboundedv1alpha3.GroupVersion.Version,
+		Kind:    "MachineList",
+	})
+
+	if err := r.List(ctx, list); err != nil {
+		if apimeta.IsNoMatchError(err) {
+			return nil // Machine CRD not installed; nothing to migrate.
+		}
+
+		return err
+	}
+
+	for i := range list.Items {
+		obj := &list.Items[i]
+
+		ref, found, err := unstructured.NestedMap(obj.Object, machineCloudInitConfigMapPath...)
+		if err != nil || !found {
+			continue
+		}
+
+		name, ok := ref["name"].(string)
+		if !ok || name == "" {
+			continue
+		}
+
+		namespace, ok := ref["namespace"].(string)
+		if !ok {
+			continue
+		}
+
+		if _, isLegacy := legacy[namespace]; !isLegacy {
+			continue
+		}
+
+		if err := r.copyConfigMapByName(ctx, namespace, name, target); err != nil {
+			return err
+		}
+
+		ref["namespace"] = target
+		if err := unstructured.SetNestedMap(obj.Object, ref, machineCloudInitConfigMapPath...); err != nil {
+			return err
+		}
+
+		if err := r.Update(ctx, obj); err != nil {
+			return fmt.Errorf("rewrite machine %s cloud-init configmap ref: %w", obj.GetName(), err)
+		}
+
+		logger.Info("migrated machine cloud-init configmap",
+			"machine", obj.GetName(), "configmap", name, "from", namespace, "to", target)
+	}
+
+	return nil
+}
+
+// copyConfigMapByName copies a single ConfigMap from a source namespace into the
+// target namespace, creating it only if absent. A missing source is treated as
+// success (it may already have been copied and the source namespace drained).
+func (r *LegacyReaper) copyConfigMapByName(ctx context.Context, srcNs, name, target string) error {
+	var src corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: srcNs, Name: name}, &src); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+
+		return err
+	}
+
+	dst := &corev1.ConfigMap{
+		ObjectMeta: copyObjectMeta(src.ObjectMeta, target),
+		Data:       src.Data,
+		BinaryData: src.BinaryData,
+	}
+
+	if err := r.createIfAbsent(ctx, dst); err != nil {
+		return fmt.Errorf("copy configmap %s/%s: %w", srcNs, name, err)
 	}
 
 	return nil
@@ -702,8 +862,15 @@ func (r *LegacyReaper) netTargetsPresent(ctx context.Context, target string) (bo
 	return true, nil
 }
 
-// storageTargetsReady reports whether at least one per-site storage supervisor
-// DaemonSet exists in the target namespace and all such DaemonSets are Ready.
+// storageTargetsReady reports whether legacy storage may be reaped. It is a
+// conjunction of two invariants:
+//
+//   - Every per-site unbounded-storage-supervisor-<site> DaemonSet that exists
+//     in the target namespace must be Ready, and at least one must exist (do not
+//     reap before the operator has created a replacement).
+//   - Every storage-enabled translated Site must have its per-site DaemonSet
+//     present, so a multi-site cluster never loses the legacy supervisor before
+//     every storage-enabled Site has its own replacement.
 func (r *LegacyReaper) storageTargetsReady(ctx context.Context, target string) (bool, error) {
 	var list appsv1.DaemonSetList
 	if err := r.List(ctx, &list, client.InNamespace(target)); err != nil {
@@ -722,6 +889,29 @@ func (r *LegacyReaper) storageTargetsReady(ctx context.Context, target string) (
 
 		if !daemonSetReady(ds) {
 			return false, nil
+		}
+	}
+
+	// Require every storage-enabled Site to have its per-site DaemonSet present
+	// before reaping the legacy supervisor.
+	var sites unboundedv1alpha3.SiteList
+	if err := r.List(ctx, &sites); err != nil {
+		return false, fmt.Errorf("list sites: %w", err)
+	}
+
+	for i := range sites.Items {
+		site := &sites.Items[i]
+		if !componentEnabled(site, ComponentStorage) {
+			continue
+		}
+
+		var ds appsv1.DaemonSet
+		if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: storageDaemonSetName(site.Name)}, &ds); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+
+			return false, err
 		}
 	}
 
@@ -800,6 +990,14 @@ func (r *LegacyReaper) cleanup(ctx context.Context, logger logr.Logger) (bool, e
 // deleteLegacySiteCRD deletes the pre-redesign net-group Site CRD. It reports
 // gone=true once the CRD no longer exists.
 func (r *LegacyReaper) deleteLegacySiteCRD(ctx context.Context, logger logr.Logger) (bool, error) {
+	// The legacy net-group Sites carry the net controller's protection
+	// finalizer (added once nodes are assigned). The old net controller is
+	// already reaped, so nothing remains to remove it; clearing it here lets the
+	// CRD's cascade delete complete instead of deadlocking on a stuck Site.
+	if err := r.clearLegacyNetSiteFinalizers(ctx, logger); err != nil {
+		return false, err
+	}
+
 	crd := &unstructured.Unstructured{}
 	crd.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "apiextensions.k8s.io",
@@ -819,6 +1017,49 @@ func (r *LegacyReaper) deleteLegacySiteCRD(ctx context.Context, logger logr.Logg
 	default:
 		return false, fmt.Errorf("delete legacy site crd: %w", err)
 	}
+}
+
+// clearLegacyNetSiteFinalizers strips finalizers from any remaining legacy
+// net-group Sites so they (and their CRD) can be deleted. By the time this runs
+// the Sites have been translated into machina-group Sites and the old net
+// controller that owned their protection finalizer is gone, so the finalizers
+// would otherwise block deletion forever.
+func (r *LegacyReaper) clearLegacyNetSiteFinalizers(ctx context.Context, logger logr.Logger) error {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   legacySiteGVK.Group,
+		Version: legacySiteGVK.Version,
+		Kind:    legacySiteGVK.Kind + "List",
+	})
+
+	if err := r.List(ctx, list); err != nil {
+		if apimeta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+			return nil
+		}
+
+		return err
+	}
+
+	for i := range list.Items {
+		site := &list.Items[i]
+		if len(site.GetFinalizers()) == 0 {
+			continue
+		}
+
+		site.SetFinalizers(nil)
+
+		if err := r.Update(ctx, site); err != nil {
+			if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
+				continue
+			}
+
+			return fmt.Errorf("clear finalizers on legacy net Site %s: %w", site.GetName(), err)
+		}
+
+		logger.Info("cleared finalizers on legacy net Site to allow CRD deletion", "site", site.GetName())
+	}
+
+	return nil
 }
 
 func (r *LegacyReaper) deleteNamespace(ctx context.Context, name string) error {

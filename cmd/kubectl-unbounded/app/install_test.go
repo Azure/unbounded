@@ -82,6 +82,46 @@ func TestInstallHandlerApplyBootstrapManifests(t *testing.T) {
 	require.Contains(t, applied, "unbounded-operator")
 }
 
+func TestMutateOperatorObjectRetargetsNamespace(t *testing.T) {
+	t.Parallel()
+
+	h := &installHandler{namespace: "custom-system"}
+
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata":   map[string]any{"name": "unbounded-operator", "namespace": "unbounded-system"},
+		"spec": map[string]any{
+			"template": map[string]any{
+				"spec": map[string]any{
+					"containers": []any{map[string]any{
+						"name": "controller",
+						"args": []any{
+							"--leader-elect=true",
+							"--leader-elect-namespace=unbounded-system",
+							"--namespace=unbounded-system",
+							"--metalman-image=x",
+							"--api-server-endpoint=y",
+						},
+					}},
+				},
+			},
+		},
+	}}
+
+	require.NoError(t, h.mutateOperatorObject(obj))
+
+	require.Equal(t, "custom-system", obj.GetNamespace())
+
+	containers, _, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+	require.NoError(t, err)
+
+	args, _, err := unstructured.NestedStringSlice(containers[0].(map[string]any), "args")
+	require.NoError(t, err)
+	require.Contains(t, args, "--namespace=custom-system")
+	require.Contains(t, args, "--leader-elect-namespace=custom-system")
+}
+
 func TestCRDEstablished(t *testing.T) {
 	t.Parallel()
 

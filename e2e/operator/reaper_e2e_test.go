@@ -113,7 +113,7 @@ func TestOperatorReaperMigration(t *testing.T) {
 		TargetNamespace:  targetNS,
 		LegacyNamespaces: operator.LegacyNamespaces,
 		SkipSecretNames:  map[string]struct{}{"unbounded-net-serving-cert": {}},
-		CopyConfigMaps:   []string{"machina-config", "unbounded-storage-config"},
+		CopyConfigMaps:   []string{"machina-config"},
 		Interval:         2 * time.Second,
 	}
 
@@ -194,7 +194,16 @@ func stageMachine(ctx context.Context, t *testing.T, cli client.Client) {
 	mustSetNested(t, m, "admin", "spec", "pxe", "redfish", "username")
 	mustSetNested(t, m, legacyKube, "spec", "pxe", "redfish", "passwordRef", "namespace")
 	mustSetNested(t, m, "redfish-password", "spec", "pxe", "redfish", "passwordRef", "name")
+	// Cloud-init user-data ConfigMap ref in a legacy namespace: the reaper must
+	// copy the ConfigMap into the target and repoint this ref.
+	mustSetNested(t, m, "cloud-init-user-data", "spec", "pxe", "cloudInit", "userDataConfigMapRef", "name")
+	mustSetNested(t, m, legacyKube, "spec", "pxe", "cloudInit", "userDataConfigMapRef", "namespace")
 	mustCreate(ctx, t, cli, m)
+
+	mustCreate(ctx, t, cli, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: legacyKube, Name: "cloud-init-user-data"},
+		Data:       map[string]string{"user-data": "#cloud-config"},
+	})
 }
 
 func stageTargetWorkloads(ctx context.Context, t *testing.T, cli client.Client) {
@@ -229,6 +238,12 @@ func assertTranslatedSites(ctx context.Context, t *testing.T, cli client.Client)
 		t.Fatalf("expected storage enabled on cluster site")
 	}
 
+	// The legacy shared storage config is folded into each storage-enabled
+	// Site's spec (storage config is per-Site in the new API).
+	if cfg, _, _ := unstructured.NestedString(cluster.Object, "spec", "components", "storage", "config"); cfg != "log_level: info" {
+		t.Fatalf("cluster site storage config not folded from legacy: %q", cfg)
+	}
+
 	edge := getMachinaSite(ctx, t, cli, "edge")
 	if nestedBool(edge, "spec", "components", "machina", "enabled") {
 		t.Fatalf("did not expect machina enabled on edge site")
@@ -236,6 +251,10 @@ func assertTranslatedSites(ctx context.Context, t *testing.T, cli client.Client)
 
 	if !nestedBool(edge, "spec", "components", "storage", "enabled") {
 		t.Fatalf("expected storage enabled on edge site")
+	}
+
+	if cfg, _, _ := unstructured.NestedString(edge.Object, "spec", "components", "storage", "config"); cfg != "log_level: info" {
+		t.Fatalf("edge site storage config not folded from legacy: %q", cfg)
 	}
 
 	if !nestedBool(edge, "spec", "components", "metalman", "enabled") {
@@ -259,10 +278,24 @@ func assertStateMigrated(ctx context.Context, t *testing.T, cli client.Client) {
 		t.Fatalf("regenerable serving cert must NOT be copied, err=%v", err)
 	}
 
-	for _, name := range []string{"machina-config", "unbounded-storage-config"} {
-		if err := cli.Get(ctx, client.ObjectKey{Namespace: targetNS, Name: name}, &corev1.ConfigMap{}); err != nil {
-			t.Fatalf("expected configmap %s copied to target: %v", name, err)
-		}
+	// machina-config is copied by name; storage config is NOT copied as a
+	// ConfigMap (it is folded into each Site's spec and rendered per-site).
+	if err := cli.Get(ctx, client.ObjectKey{Namespace: targetNS, Name: "machina-config"}, &corev1.ConfigMap{}); err != nil {
+		t.Fatalf("expected machina-config copied to target: %v", err)
+	}
+
+	if err := cli.Get(ctx, client.ObjectKey{Namespace: targetNS, Name: "unbounded-storage-config"}, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("shared storage config must NOT be copied (it is folded into Sites), err=%v", err)
+	}
+
+	// The Machine cloud-init ConfigMap is copied out of the legacy namespace.
+	var cloudInit corev1.ConfigMap
+	if err := cli.Get(ctx, client.ObjectKey{Namespace: targetNS, Name: "cloud-init-user-data"}, &cloudInit); err != nil {
+		t.Fatalf("expected cloud-init configmap copied to target: %v", err)
+	}
+
+	if cloudInit.Data["user-data"] != "#cloud-config" {
+		t.Fatalf("cloud-init configmap data not preserved: %q", cloudInit.Data["user-data"])
 	}
 }
 
@@ -279,6 +312,11 @@ func assertMachineRefRewritten(ctx context.Context, t *testing.T, cli client.Cli
 	got, _, _ := unstructured.NestedString(m.Object, "spec", "pxe", "redfish", "passwordRef", "namespace")
 	if got != targetNS {
 		t.Fatalf("machine passwordRef namespace = %q, want %q", got, targetNS)
+	}
+
+	cloudInitNS, _, _ := unstructured.NestedString(m.Object, "spec", "pxe", "cloudInit", "userDataConfigMapRef", "namespace")
+	if cloudInitNS != targetNS {
+		t.Fatalf("machine cloud-init configmap namespace = %q, want %q", cloudInitNS, targetNS)
 	}
 }
 

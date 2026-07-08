@@ -68,18 +68,26 @@ per pass:
    (`sites.net.unbounded-cloud.io`), create the equivalent machina-group Site
    (`sites.unbounded-cloud.io`) with the networking spec copied verbatim and
    `spec.components` inferred from the running legacy workloads: storage is
-   enabled on every translated Site (each then gets its own node-selected
-   DaemonSet), machina on the `cluster` Site, and metalman where a per-site
-   metalman Deployment is detected. Existing machina-group Sites are never
-   clobbered.
-1. Copy non-regenerable state (operator/user Secrets, the `machina-config` and
-   `unbounded-storage-config` ConfigMaps) from the legacy namespaces into
-   `unbounded-system`, stripping server-managed metadata, never overwriting
-   existing target copies, and skipping regenerable/auto-managed secrets (net
-   serving cert, SA tokens, Helm release secrets).
+   enabled on every translated Site that had a legacy storage DaemonSet (each
+   then gets its own node-selected DaemonSet, and the legacy shared storage
+   config is folded into that Site's `spec.components.storage.config` so it is
+   preserved per-Site), machina on the `cluster` Site, and metalman where a
+   per-site metalman Deployment is detected. Existing machina-group Sites are
+   never clobbered.
+1. Copy non-regenerable state (operator/user Secrets and the `machina-config`
+   ConfigMap) from the legacy namespaces into `unbounded-system`, stripping
+   server-managed metadata and skipping regenerable/auto-managed secrets (net
+   serving cert, SA tokens, Helm release secrets). Secrets are copied only if
+   absent; `machina-config` is upserted so config migrated from the legacy
+   namespace wins over any default the component reconciler already created,
+   and is then preserved once the source namespace is drained. Storage config is
+   not copied as a ConfigMap; it is folded into the per-Site spec (step 0).
 2. Rewrite the namespace embedded in cluster-scoped secret references
    (`Machine.spec.pxe.redfish.passwordRef`, `MachineOperationCredential`
-   `spec.auth.secretRef`).
+   `spec.auth.secretRef`), and copy each Machine's cloud-init user-data
+   ConfigMap (`Machine.spec.pxe.cloudInit.userDataConfigMapRef`) out of the
+   legacy namespace into `unbounded-system`, repointing the reference so it
+   survives the legacy namespace deletion.
 3. Per component, once its target workloads are healthy, delete the
    operator-owned resources left behind in the legacy namespace (label-scoped;
    net reaped last; components with no legacy footprint skipped).

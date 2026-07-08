@@ -146,7 +146,7 @@ kubectl -n unbounded-system get pods -l app.kubernetes.io/name=unbounded-net-con
 kubectl -n unbounded-system get pods -l app.kubernetes.io/name=unbounded-net-node -o wide
 
 # Nodes should be labeled with their site
-kubectl get nodes -L net.unbounded-cloud.io/site
+kubectl get nodes -L unbounded-cloud.io/site
 ```
 
 If you have the kubectl plugin installed (`make kubectl-unbounded`):

@@ -12,6 +12,16 @@ metadata:
     app.kubernetes.io/component: controller
 spec:
   replicas: 1
+  # The controller is hostNetwork and binds host port 9999, so a surge pod
+  # cannot start while the old pod holds the port on the same node. Terminate
+  # the old pod before creating the new one (maxSurge: 0) to avoid a rollout
+  # deadlock. The net webhooks are failurePolicy: Ignore, so the brief serving
+  # gap is harmless.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: unbounded-net-controller

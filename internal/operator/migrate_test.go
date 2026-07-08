@@ -56,7 +56,7 @@ func newReaper(t *testing.T, objs ...client.Object) *LegacyReaper {
 		TargetNamespace:  "unbounded-system",
 		LegacyNamespaces: []string{legacyKubeNamespace, legacyNetNamespace},
 		SkipSecretNames:  map[string]struct{}{"unbounded-net-serving-cert": {}},
-		CopyConfigMaps:   []string{"machina-config", "unbounded-storage-config"},
+		CopyConfigMaps:   []string{"machina-config"},
 	}
 }
 
@@ -638,6 +638,141 @@ func TestStorageTargetsReadyGatesOnPerSiteDaemonSets(t *testing.T) {
 	}
 }
 
+func storageEnabledSite(name string) *unboundedv1alpha3.Site {
+	enabled := true
+
+	return &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{
+			Storage: &unboundedv1alpha3.StorageComponentSpec{SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: &enabled}},
+		}},
+	}
+}
+
+func TestStorageTargetsReadyRequiresEveryStorageEnabledSite(t *testing.T) {
+	// Two storage-enabled Sites, but only the cluster Site has a Ready
+	// DaemonSet. The gate must stay closed until edge has one too, so a
+	// multi-site cluster never loses the legacy supervisor early.
+	r := newReaper(t,
+		ns("unbounded-system"),
+		storageEnabledSite("cluster"),
+		storageEnabledSite("edge"),
+		readyDaemonSet("unbounded-system", "unbounded-storage-supervisor-cluster"),
+	)
+
+	ready, err := r.storageTargetsReady(t.Context(), "unbounded-system")
+	if err != nil {
+		t.Fatalf("storageTargetsReady: %v", err)
+	}
+
+	if ready {
+		t.Fatalf("expected not ready while the edge Site has no storage DaemonSet")
+	}
+
+	// Add edge's Ready DaemonSet: every storage-enabled Site now has one.
+	if err := r.Create(t.Context(), readyDaemonSet("unbounded-system", "unbounded-storage-supervisor-edge")); err != nil {
+		t.Fatalf("create edge ds: %v", err)
+	}
+
+	ready, err = r.storageTargetsReady(t.Context(), "unbounded-system")
+	if err != nil {
+		t.Fatalf("storageTargetsReady: %v", err)
+	}
+
+	if !ready {
+		t.Fatalf("expected ready once every storage-enabled Site has a Ready DaemonSet")
+	}
+}
+
+func TestDetectComponentsFoldsLegacyStorageConfig(t *testing.T) {
+	r := newReaper(t,
+		ns(legacyKubeNamespace),
+		storageDaemonSet(legacyKubeNamespace),
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "unbounded-storage-config", Namespace: legacyKubeNamespace},
+			Data:       map[string]string{"config.yaml": "version: 7"},
+		},
+	)
+
+	components, err := r.detectComponents(t.Context(), clusterSiteName)
+	if err != nil {
+		t.Fatalf("detectComponents: %v", err)
+	}
+
+	storage, ok := components["storage"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected storage component: %#v", components)
+	}
+
+	if storage["config"] != "version: 7" {
+		t.Fatalf("legacy storage config not folded into Site spec: %#v", storage)
+	}
+}
+
+func TestMigrateConfigMapsUpsertsOverReconcilerDefault(t *testing.T) {
+	// The reconciler already created a default machina-config in the target;
+	// the reaper must overwrite it with the migrated (legacy) config.
+	r := newReaper(t,
+		ns(legacyKubeNamespace),
+		ns("unbounded-system"),
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "machina-config", Namespace: legacyKubeNamespace}, Data: map[string]string{"config.yaml": "migrated: true"}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "machina-config", Namespace: "unbounded-system"}, Data: map[string]string{"config.yaml": "default: true"}},
+	)
+
+	if err := r.migrateConfigMaps(t.Context(), logr.Discard(), legacyKubeNamespace, "unbounded-system"); err != nil {
+		t.Fatalf("migrateConfigMaps: %v", err)
+	}
+
+	var cm corev1.ConfigMap
+	if err := r.Get(t.Context(), client.ObjectKey{Namespace: "unbounded-system", Name: "machina-config"}, &cm); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if cm.Data["config.yaml"] != "migrated: true" {
+		t.Fatalf("expected migrated config to win, got %q", cm.Data["config.yaml"])
+	}
+}
+
+func machineWithCloudInitConfigMap(name, cmName, namespace string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "unbounded-cloud.io", Version: "v1alpha3", Kind: "Machine"})
+	obj.SetName(name)
+	_ = unstructured.SetNestedField(obj.Object, cmName, "spec", "pxe", "cloudInit", "userDataConfigMapRef", "name")
+	_ = unstructured.SetNestedField(obj.Object, namespace, "spec", "pxe", "cloudInit", "userDataConfigMapRef", "namespace")
+
+	return obj
+}
+
+func TestMigrateMachineCloudInitConfigMaps(t *testing.T) {
+	r := newReaper(t,
+		ns(legacyKubeNamespace),
+		ns("unbounded-system"),
+		machineWithCloudInitConfigMap("m1", "user-data", legacyKubeNamespace),
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "user-data", Namespace: legacyKubeNamespace},
+			Data:       map[string]string{"user-data": "#cloud-config"},
+		},
+	)
+
+	if err := r.migrateMachineCloudInitConfigMaps(t.Context(), logr.Discard(), "unbounded-system"); err != nil {
+		t.Fatalf("migrateMachineCloudInitConfigMaps: %v", err)
+	}
+
+	// ConfigMap copied to target with data preserved.
+	var cm corev1.ConfigMap
+	if err := r.Get(t.Context(), client.ObjectKey{Namespace: "unbounded-system", Name: "user-data"}, &cm); err != nil {
+		t.Fatalf("expected cloud-init configmap copied: %v", err)
+	}
+
+	if cm.Data["user-data"] != "#cloud-config" {
+		t.Fatalf("cloud-init configmap data not preserved: %q", cm.Data["user-data"])
+	}
+
+	// The Machine ref namespace was rewritten to the target.
+	assertNestedString(t, r, "Machine", "m1", "unbounded-system",
+		"spec", "pxe", "cloudInit", "userDataConfigMapRef", "namespace")
+}
+
 func TestReapOnceStorageGatedOnPerSiteDaemonSet(t *testing.T) {
 	r := newReaper(t,
 		ns(legacyKubeNamespace),
@@ -698,6 +833,31 @@ func TestReapOnceSkipsComponentsWithoutLegacyFootprint(t *testing.T) {
 
 	if err := r.Get(t.Context(), client.ObjectKey{Name: legacyKubeNamespace}, &corev1.Namespace{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected legacy namespace deleted, err=%v", err)
+	}
+}
+
+func TestClearLegacyNetSiteFinalizers(t *testing.T) {
+	// A translated-but-abandoned legacy net Site still carries the net
+	// controller's protection finalizer; the reaper must clear it so the CRD can
+	// be deleted (the old net controller that owned it is gone).
+	site := legacySite("cluster", map[string]any{"nodeCidrs": []any{"10.0.0.0/16"}})
+	site.SetFinalizers([]string{"net.unbounded-cloud.io/protection"})
+
+	r := newReaper(t, site)
+
+	if err := r.clearLegacyNetSiteFinalizers(t.Context(), logr.Discard()); err != nil {
+		t.Fatalf("clearLegacyNetSiteFinalizers: %v", err)
+	}
+
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(legacySiteGVK)
+
+	if err := r.Get(t.Context(), client.ObjectKey{Name: "cluster"}, got); err != nil {
+		t.Fatalf("get legacy site: %v", err)
+	}
+
+	if fin := got.GetFinalizers(); len(fin) != 0 {
+		t.Fatalf("expected finalizers cleared, got %#v", fin)
 	}
 }
 

@@ -132,7 +132,6 @@ func (h *siteInitHandler) clusterSiteConfig() unboundedSiteConfig {
 		PodCIDRs:        []string{h.clusterPodCIDR},
 		ManageCniPlugin: h.manageCniPlugin,
 		EnableMachina:   h.enableMachina,
-		EnableStorage:   h.enableStorage,
 		Manifests: []string{
 			"gatewaypool.yaml",
 			"site.yaml",
@@ -148,6 +147,9 @@ func (h *siteInitHandler) remoteSiteConfig() unboundedSiteConfig {
 		PodCIDRs:        []string{h.podCIDR},
 		ManageCniPlugin: h.manageCniPlugin,
 		EnableMetalman:  h.enableMetalman,
+		// Storage (RDMA) targets the worker nodes of the site being
+		// initialized, so --enable-storage applies to the remote Site.
+		EnableStorage: h.enableStorage,
 		Manifests: []string{
 			"site.yaml",
 			"sitegatewaypoolassignment.yaml",

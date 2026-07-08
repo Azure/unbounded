@@ -176,6 +176,7 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 			value  string
 		}{
 			{prefix: "--leader-elect-namespace=", value: h.namespace},
+			{prefix: "--namespace=", value: h.namespace},
 			{prefix: "--metalman-image=", value: h.metalmanImage},
 			{prefix: "--api-server-endpoint=", value: h.apiServerEndpoint},
 		} {

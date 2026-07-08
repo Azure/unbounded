@@ -275,7 +275,7 @@ func (c *ManagedKubeProxyController) reconcileNodeLabel(ctx context.Context, nod
 }
 
 func shouldManageKubeProxyForNode(node *corev1.Node, providerDS []*appsv1.DaemonSet) bool {
-	if node.Labels == nil || node.Labels[SiteLabelKey] == "" {
+	if NodeSiteLabel(node) == "" {
 		return false
 	}
 
@@ -397,11 +397,45 @@ func (c *ManagedKubeProxyController) ensureDaemonSet(ctx context.Context, site u
 		return err
 	}
 
+	// spec.selector is immutable. When it differs (e.g. the site label moved
+	// from the deprecated key to the canonical unbounded-cloud.io/site), the
+	// DaemonSet cannot be updated in place; delete and recreate it. This is a
+	// one-time, per-site kube-proxy blip during the label migration.
+	if !equalLabelSelector(existing.Spec.Selector, want.Spec.Selector) {
+		if err := c.clientset.AppsV1().DaemonSets(c.options.Namespace).Delete(ctx, existing.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+
+		_, err = c.clientset.AppsV1().DaemonSets(c.options.Namespace).Create(ctx, want, metav1.CreateOptions{})
+
+		return err
+	}
+
 	existing.Spec.Template = want.Spec.Template
 	existing.Spec.UpdateStrategy = want.Spec.UpdateStrategy
 	_, err = c.clientset.AppsV1().DaemonSets(c.options.Namespace).Update(ctx, existing, metav1.UpdateOptions{})
 
 	return err
+}
+
+// equalLabelSelector reports whether two label selectors have the same
+// matchLabels (matchExpressions are not used for the managed kube-proxy DS).
+func equalLabelSelector(a, b *metav1.LabelSelector) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+
+	if len(a.MatchLabels) != len(b.MatchLabels) {
+		return false
+	}
+
+	for k, v := range a.MatchLabels {
+		if b.MatchLabels[k] != v {
+			return false
+		}
+	}
+
+	return true
 }
 
 func siteKubeProxyClusterCIDR(site unboundedv1alpha3.Site) (string, bool) {
@@ -447,7 +481,7 @@ func (c *ManagedKubeProxyController) daemonSetForSite(site unboundedv1alpha3.Sit
 	labels := map[string]string{
 		"app.kubernetes.io/name":      managedKubeProxyAppName,
 		"app.kubernetes.io/component": "kube-proxy",
-		SiteLabelKey:                  site.Name,
+		canonicalSiteLabelKey:         site.Name,
 	}
 	maxUnavailable := intstr.FromInt32(1)
 
@@ -458,7 +492,7 @@ func (c *ManagedKubeProxyController) daemonSetForSite(site unboundedv1alpha3.Sit
 			Labels:    labels,
 		},
 		Spec: appsv1.DaemonSetSpec{
-			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": managedKubeProxyAppName, SiteLabelKey: site.Name}},
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": managedKubeProxyAppName, canonicalSiteLabelKey: site.Name}},
 			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{
 				Type:          appsv1.RollingUpdateDaemonSetStrategyType,
 				RollingUpdate: &appsv1.RollingUpdateDaemonSet{MaxUnavailable: &maxUnavailable},
@@ -474,7 +508,7 @@ func (c *ManagedKubeProxyController) daemonSetForSite(site unboundedv1alpha3.Sit
 					PriorityClassName:  "system-node-critical",
 					NodeSelector: map[string]string{
 						ManagedKubeProxyNodeLabelKey: ManagedKubeProxyNodeLabelValue,
-						SiteLabelKey:                 site.Name,
+						canonicalSiteLabelKey:        site.Name,
 					},
 					Tolerations: []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
 					InitContainers: []corev1.Container{{

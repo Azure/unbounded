@@ -43,8 +43,16 @@ import (
 )
 
 const (
-	// SiteLabelKey is the label key used to identify which site a node belongs to
-	SiteLabelKey = "net.unbounded-cloud.io/site"
+	// canonicalSiteLabelKey is the canonical site-membership label the
+	// controller applies to Nodes (shared with the Machine site label). It
+	// supersedes deprecatedSiteLabelKey.
+	canonicalSiteLabelKey = unboundedv1alpha3.MachineSiteLabelKey
+
+	// deprecatedSiteLabelKey is the pre-rename site label. During the
+	// deprecation window the controller dual-writes it alongside the canonical
+	// label and falls back to reading it, so in-flight upgrades and older
+	// consumers keep working. A future release removes it.
+	deprecatedSiteLabelKey = unboundednetv1alpha1.SiteLabelKey
 
 	// WireGuardPubKeyAnnotation is the annotation key for a node's WireGuard public key
 	WireGuardPubKeyAnnotation = "net.unbounded-cloud.io/wg-pubkey"
@@ -849,7 +857,7 @@ func (sc *SiteController) syncNode(ctx context.Context, key string) error {
 
 	// Get current site label
 	currentSite := getNodeSiteLabel(node)
-	needsLabel := currentSite != siteName
+	needsLabel := !nodeSiteLabelsCurrent(node, siteName)
 	needsCIDRs := !hasAssignedPodCIDRs
 
 	// If node needs both label and CIDRs, do them in a single combined patch
@@ -865,36 +873,28 @@ func (sc *SiteController) syncNode(ctx context.Context, key string) error {
 
 	// Update label if needed
 	if needsLabel {
-		var patchOps []map[string]interface{}
 		if siteName != "" {
-			patchOps = append(patchOps, map[string]interface{}{
-				"op":    "add",
-				"path":  "/metadata/labels/" + escapeJSONPointer(SiteLabelKey),
-				"value": siteName,
-			})
-		} else if currentSite != "" {
-			patchOps = append(patchOps, map[string]interface{}{
-				"op":   "remove",
-				"path": "/metadata/labels/" + escapeJSONPointer(SiteLabelKey),
-			})
-		}
-
-		if len(patchOps) > 0 {
-			patchData, err := json.Marshal(patchOps)
+			patchData, err := json.Marshal(siteLabelAddPatchOps(siteName))
 			if err != nil {
 				return fmt.Errorf("failed to marshal patch: %w", err)
 			}
 
-			_, err = sc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.JSONPatchType, patchData, metav1.PatchOptions{})
-			if err != nil {
+			if _, err := sc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.JSONPatchType, patchData, metav1.PatchOptions{}); err != nil {
 				return fmt.Errorf("failed to patch node: %w", err)
 			}
 
-			if siteName != "" {
-				klog.Infof("Labeled node %s with site %s", node.Name, siteName)
-			} else {
-				klog.Infof("Removed site label from node %s", node.Name)
+			klog.Infof("Labeled node %s with site %s", node.Name, siteName)
+		} else if currentSite != "" {
+			patchData, err := siteLabelRemoveMergePatch()
+			if err != nil {
+				return fmt.Errorf("failed to marshal patch: %w", err)
 			}
+
+			if _, err := sc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patchData, metav1.PatchOptions{}); err != nil {
+				return fmt.Errorf("failed to patch node: %w", err)
+			}
+
+			klog.Infof("Removed site label from node %s", node.Name)
 		}
 
 		sc.markSlicesDirty()
@@ -1203,7 +1203,11 @@ func (sc *SiteController) buildSliceObject(site unboundedv1alpha3.Site, sliceNam
 				"name": sliceName,
 				"ownerReferences": []interface{}{
 					map[string]interface{}{
-						"apiVersion":         "net.unbounded-cloud.io/v1alpha1",
+						// Site now lives in the machina group
+						// (unbounded-cloud.io/v1alpha3); the ownerRef must match
+						// the owner's real GVK or the garbage collector will
+						// orphan or wrongly collect the slice after migration.
+						"apiVersion":         unboundedv1alpha3.GroupVersion.String(),
 						"kind":               "Site",
 						"name":               site.Name,
 						"uid":                string(site.UID),
@@ -1717,24 +1721,31 @@ func (sc *SiteController) patchNodeCIDRs(ctx context.Context, nodeName, podCIDR 
 }
 
 // patchNodeLabelAndCIDRs applies both a site label and pod CIDRs in a single
-// MergePatch to cut the number of API calls in half during scale-in.
+// MergePatch to cut the number of API calls in half during scale-in. It sets
+// every site-membership label key (canonical + deprecated) during the
+// deprecation window.
 func (sc *SiteController) patchNodeLabelAndCIDRs(ctx context.Context, nodeName, siteName, podCIDR string, podCIDRs []string) error {
-	podCIDRsJSON := "["
-
-	for i, cidr := range podCIDRs {
-		if i > 0 {
-			podCIDRsJSON += ","
-		}
-
-		podCIDRsJSON += fmt.Sprintf("%q", cidr)
+	labels := map[string]interface{}{}
+	for _, key := range siteLabelKeys() {
+		labels[key] = siteName
 	}
 
-	podCIDRsJSON += "]"
+	spec := map[string]interface{}{"podCIDR": podCIDR}
+	if podCIDRs != nil {
+		spec["podCIDRs"] = podCIDRs
+	} else {
+		spec["podCIDRs"] = []string{}
+	}
 
-	patch := fmt.Sprintf(`{"metadata":{"labels":{%q:%q}},"spec":{"podCIDR":%q,"podCIDRs":%s}}`,
-		SiteLabelKey, siteName, podCIDR, podCIDRsJSON)
+	patch, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{"labels": labels},
+		"spec":     spec,
+	})
+	if err != nil {
+		return err
+	}
 
-	_, err := sc.clientset.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+	_, err = sc.clientset.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patch, metav1.PatchOptions{})
 	if err != nil {
 		return err
 	}
@@ -1960,12 +1971,76 @@ func (sc *SiteController) GetSiteForNode(node *corev1.Node) string {
 
 // Helper functions
 
-func getNodeSiteLabel(node *corev1.Node) string {
+// siteLabelKeys are the node site-membership label keys in priority order:
+// canonical first, deprecated fallback.
+func siteLabelKeys() []string {
+	return []string{canonicalSiteLabelKey, deprecatedSiteLabelKey}
+}
+
+// NodeSiteLabel returns the site a Node belongs to, preferring the canonical
+// label (unbounded-cloud.io/site) and falling back to the deprecated
+// net.unbounded-cloud.io/site.
+func NodeSiteLabel(node *corev1.Node) string {
 	if node.Labels == nil {
 		return ""
 	}
 
-	return node.Labels[SiteLabelKey]
+	for _, key := range siteLabelKeys() {
+		if value := node.Labels[key]; value != "" {
+			return value
+		}
+	}
+
+	return ""
+}
+
+// nodeSiteLabelsCurrent reports whether the Node already carries siteName under
+// every site-membership key (or, when siteName is empty, carries none). It
+// drives dual-write so a Node labeled only with the deprecated key by an older
+// controller is converged to also carry the canonical key.
+func nodeSiteLabelsCurrent(node *corev1.Node, siteName string) bool {
+	if siteName == "" {
+		return NodeSiteLabel(node) == ""
+	}
+
+	for _, key := range siteLabelKeys() {
+		if node.Labels[key] != siteName {
+			return false
+		}
+	}
+
+	return true
+}
+
+// siteLabelAddPatchOps builds JSONPatch ops that set every site-membership label
+// key to siteName.
+func siteLabelAddPatchOps(siteName string) []map[string]interface{} {
+	ops := make([]map[string]interface{}, 0, len(siteLabelKeys()))
+	for _, key := range siteLabelKeys() {
+		ops = append(ops, map[string]interface{}{
+			"op":    "add",
+			"path":  "/metadata/labels/" + escapeJSONPointer(key),
+			"value": siteName,
+		})
+	}
+
+	return ops
+}
+
+// siteLabelRemoveMergePatch builds a merge patch that clears every
+// site-membership label key. A merge patch (null value) is used instead of a
+// JSONPatch remove so it tolerates keys that are already absent.
+func siteLabelRemoveMergePatch() ([]byte, error) {
+	labels := map[string]interface{}{}
+	for _, key := range siteLabelKeys() {
+		labels[key] = nil
+	}
+
+	return json.Marshal(map[string]interface{}{"metadata": map[string]interface{}{"labels": labels}})
+}
+
+func getNodeSiteLabel(node *corev1.Node) string {
+	return NodeSiteLabel(node)
 }
 
 func getNodeAnnotation(node *corev1.Node, key string) string {

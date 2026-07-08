@@ -227,7 +227,7 @@ ip route show dev wg51821
 
 **Check:**
 ```bash
-kubectl get node <name> -L net.unbounded-cloud.io/site
+kubectl get node <name> -L unbounded-cloud.io/site
 kubectl get sites -o yaml
 kubectl -n unbounded-system logs -l app.kubernetes.io/name=unbounded-net-controller | grep -i alloc
 ```
@@ -310,7 +310,7 @@ kubectl -n unbounded-system get endpoints unbounded-net-controller 2>&1
 # Cluster overview
 kubectl get st                                    # Sites
 kubectl get gp                                    # Gateway pools
-kubectl get nodes -L net.unbounded-cloud.io/site   # Node assignments
+kubectl get nodes -L unbounded-cloud.io/site   # Node assignments
 
 # Per-node (eBPF)
 tc filter show dev unbounded0 egress              # BPF program

@@ -56,7 +56,7 @@ edge deployment. Each site is defined by:
   controller hands out per-node slices from these pools.
 
 When a node joins the cluster, the controller matches its internal IP against
-all Site `nodeCidrs` and labels it with `net.unbounded-cloud.io/site=<name>`.
+all Site `nodeCidrs` and labels it with `unbounded-cloud.io/site=<name>`.
 
 ### Gateway Pools
 

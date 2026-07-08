@@ -12,15 +12,18 @@ metadata:
 rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["sites"]
-    verbs: ["get", "list", "watch", "create"]
+    # update/patch are required to add and remove the operator's cleanup
+    # finalizer on Sites (see internal/operator siteFinalizer).
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["sites/status"]
     verbs: ["get", "patch", "update"]
   # Legacy net-group Sites are read during migration and translated into the
-  # machina-group Sites above; the CRD itself is deleted once drained.
+  # machina-group Sites above; their finalizers are cleared (update/patch) so the
+  # CRD can be deleted once drained.
   - apiGroups: ["net.unbounded-cloud.io"]
     resources: ["sites"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "update", "patch"]
   # Cluster-scoped custom resources whose embedded secret references are
   # repointed from the legacy namespaces to unbounded-system.
   - apiGroups: ["unbounded-cloud.io"]

@@ -51,6 +51,7 @@ func main() {
 	cmd.Flags().StringVar(&cfg.probeAddr, "health-probe-bind-address", ":8081", "Address for health probes")
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace(), "Namespace for the leader election lease")
+	cmd.Flags().StringVar(&cfg.namespace, "namespace", unbounded.SystemNamespace(), "Namespace the operator reconciles components into and migrates legacy state to")
 	cmd.Flags().StringVar(&cfg.metalmanImage, "metalman-image", "", "Default metalman image")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint advertised by machina")
 	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", true, "Translate legacy net-group Sites, migrate state into unbounded-system, and reap the pre-consolidation namespaces")
@@ -68,6 +69,7 @@ type config struct {
 	probeAddr               string
 	leaderElection          bool
 	leaderElectionNamespace string
+	namespace               string
 	metalmanImage           string
 	apiServerEndpoint       string
 	reapLegacyResources     bool
@@ -77,6 +79,11 @@ func run(ctx context.Context, cfg config) error {
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 
 	scheme := runtimeScheme()
+
+	namespace := cfg.namespace
+	if namespace == "" {
+		namespace = unbounded.SystemNamespace()
+	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                        scheme,
@@ -92,8 +99,9 @@ func run(ctx context.Context, cfg config) error {
 	}
 
 	if err := (&operator.SiteReconciler{
-		Client: mgr.GetClient(),
-		Scheme: scheme,
+		Client:    mgr.GetClient(),
+		Scheme:    scheme,
+		Namespace: namespace,
 		Config: operator.Config{
 			MetalmanImage:     cfg.metalmanImage,
 			APIServerEndpoint: cfg.apiServerEndpoint,
@@ -105,10 +113,10 @@ func run(ctx context.Context, cfg config) error {
 	if cfg.reapLegacyResources {
 		reaper := &operator.LegacyReaper{
 			Client:           mgr.GetClient(),
-			TargetNamespace:  unbounded.SystemNamespace(),
+			TargetNamespace:  namespace,
 			LegacyNamespaces: operator.LegacyNamespaces,
 			SkipSecretNames:  map[string]struct{}{"unbounded-net-serving-cert": {}},
-			CopyConfigMaps:   []string{"machina-config", "unbounded-storage-config"},
+			CopyConfigMaps:   []string{"machina-config"},
 		}
 		if err := reaper.SetupWithManager(mgr); err != nil {
 			return fmt.Errorf("setup legacy reaper: %w", err)
