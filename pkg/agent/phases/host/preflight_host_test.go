@@ -100,7 +100,8 @@ func TestCheckExistingDeploymentDetectsMachineRegistration(t *testing.T) {
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Equal(t, "kube2", results[0].Target)
 	assert.Contains(t, results[0].Message, "registered nspawn machine kube2")
-	assert.Contains(t, results[0].Message, "unbounded-agent reset")
+	assert.Contains(t, results[0].Message, "node reset is needed")
+	assert.NotContains(t, results[0].Message, "unbounded-agent reset")
 }
 
 func TestCheckExistingDeploymentDetectsPartialArtifact(t *testing.T) {
@@ -114,7 +115,8 @@ func TestCheckExistingDeploymentDetectsPartialArtifact(t *testing.T) {
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
 	assert.Equal(t, "/var/lib/machines/kube1", results[0].Target)
 	assert.Contains(t, results[0].Message, "nspawn machine rootfs")
-	assert.Contains(t, results[0].Message, "unbounded-agent reset")
+	assert.Contains(t, results[0].Message, "node reset is needed")
+	assert.NotContains(t, results[0].Message, "unbounded-agent reset")
 }
 
 func TestEnsureNoExistingDeploymentReturnsResetInstruction(t *testing.T) {
@@ -125,7 +127,8 @@ func TestEnsureNoExistingDeploymentReturnsResetInstruction(t *testing.T) {
 	err := ensureNoExistingDeployment(context.Background(), slog.New(slog.DiscardHandler), deps)
 
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "unbounded-agent reset")
+	assert.Contains(t, err.Error(), "node reset is needed")
+	assert.NotContains(t, err.Error(), "unbounded-agent reset")
 	assert.Contains(t, err.Error(), "/etc/systemd/system/unbounded-agent-daemon.service")
 }
 

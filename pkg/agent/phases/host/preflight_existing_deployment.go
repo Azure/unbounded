@@ -19,7 +19,7 @@ import (
 const checkExistingDeploymentName = "existing-deployment"
 
 // CheckExistingDeployment verifies the host does not already contain
-// unbounded-agent deployment artifacts. Bootstrap must start from a clean host;
+// node deployment artifacts. Bootstrap must start from a clean host;
 // otherwise partial state from a prior run can be reused accidentally.
 func CheckExistingDeployment(log *slog.Logger) preflight.Checker {
 	return checkExistingDeployment(log, defaultHostCheckDeps())
@@ -35,13 +35,13 @@ func checkExistingDeployment(log *slog.Logger, deps hostCheckDeps) preflight.Che
 		return preflight.ResultsOK(
 			checkExistingDeploymentName,
 			"host deployment",
-			"no existing unbounded-agent deployment was detected",
+			"no existing node deployment was detected",
 		)
 	}}
 }
 
 // EnsureNoExistingDeployment returns an error when the host already contains
-// unbounded-agent deployment artifacts. It is used by start before any
+// node deployment artifacts. It is used by start before any
 // bootstrap task mutates host state.
 func EnsureNoExistingDeployment(ctx context.Context, log *slog.Logger) error {
 	return ensureNoExistingDeployment(ctx, log, defaultHostCheckDeps())
@@ -64,7 +64,7 @@ func ensureNoExistingDeployment(ctx context.Context, log *slog.Logger, deps host
 	}
 
 	return fmt.Errorf(
-		"existing unbounded-agent deployment detected; run `unbounded-agent reset` before running start again: %s",
+		"existing node deployment detected; node reset is needed before running start again: %s",
 		strings.Join(messages, "; "),
 	)
 }
@@ -153,7 +153,7 @@ func appendExistingDeploymentArtifactResult(
 		return append(results, preflight.Error(
 			checkExistingDeploymentName,
 			artifact.path,
-			"existing deployment artifact cannot be inspected: %s; run `unbounded-agent reset` before running preflight or start again",
+			"existing deployment artifact cannot be inspected: %s; node reset is needed before running preflight or start again",
 			artifact.path,
 		))
 	}
@@ -165,7 +165,7 @@ func existingDeploymentResult(description, target, detail string) preflight.Resu
 	return preflight.Error(
 		checkExistingDeploymentName,
 		target,
-		"existing unbounded-agent deployment artifact detected (%s): %s; run `unbounded-agent reset` before running preflight or start again",
+		"existing node deployment artifact detected (%s): %s; node reset is needed before running preflight or start again",
 		description,
 		detail,
 	)
