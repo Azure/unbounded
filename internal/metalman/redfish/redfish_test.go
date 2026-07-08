@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1073,6 +1074,184 @@ func TestBootOrderConfigUEFIHTTPOn(t *testing.T) {
 	}
 }
 
+func TestBootOrderConfigUEFIHTTPFallback(t *testing.T) {
+	var (
+		patchCalls atomic.Int64
+		patches    []map[string]any
+	)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Hdd",
+					"BootSourceOverrideEnabled": "Disabled",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{{"@odata.id": "/redfish/v1/Chassis/1"}},
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+
+			var patchBody map[string]any
+			json.NewDecoder(r.Body).Decode(&patchBody)
+			patches = append(patches, patchBody)
+
+			if patchCalls.Load() == 1 {
+				http.Error(w, "HttpBootUri is not writable", http.StatusBadRequest)
+				return
+			}
+
+			w.WriteHeader(http.StatusOK)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"}, Data: map[string][]byte{"password": []byte("secret")}}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-http-fallback", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:        "ghcr.io/test/test-image:v1",
+				BootProtocol: v1alpha3.PXEBootProtocolHTTP,
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{Redfish: &v1alpha3.RedfishStatus{CertFingerprint: tlsServerFingerprint(srv)}},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, secret).WithStatusSubresource(node).Build()
+	reconciler := &Reconciler{
+		Client: fc,
+		Pool:   NewPool(),
+		FileResolver: &netboot.FileResolver{
+			Cache:    setupRedfishOCICache(t, "ghcr.io/test/test-image:v1", "httpfallback123", "httpBootPath: shimx64.efi\n"),
+			ServeURL: "http://10.0.0.10:8880",
+		},
+	}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-http-fallback", Namespace: "default"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if patchCalls.Load() != 2 {
+		t.Fatalf("expected 2 PATCH calls, got %d", patchCalls.Load())
+	}
+
+	firstBoot, ok := patches[0]["Boot"].(map[string]any)
+	if !ok {
+		t.Fatal("expected Boot in first PATCH body")
+	}
+
+	if firstBoot["HttpBootUri"] != "http://10.0.0.10:8880/shimx64.efi" {
+		t.Fatalf("first PATCH HttpBootUri = %v", firstBoot["HttpBootUri"])
+	}
+
+	fallbackBoot, ok := patches[1]["Boot"].(map[string]any)
+	if !ok {
+		t.Fatal("expected Boot in fallback PATCH body")
+	}
+
+	want := map[string]string{
+		"BootSourceOverrideTarget":  "UefiHttp",
+		"BootSourceOverrideEnabled": "Once",
+	}
+	for key, value := range want {
+		if fallbackBoot[key] != value {
+			t.Fatalf("fallback PATCH %s = %v, want %s", key, fallbackBoot[key], value)
+		}
+	}
+
+	if _, ok := fallbackBoot["BootSourceOverrideMode"]; ok {
+		t.Fatalf("fallback PATCH should not set BootSourceOverrideMode: %v", fallbackBoot)
+	}
+
+	if _, ok := fallbackBoot["HttpBootUri"]; ok {
+		t.Fatalf("fallback PATCH should not set HttpBootUri: %v", fallbackBoot)
+	}
+}
+
+func TestClientSetHTTPBootOverrideUnsupportedDoesNotFallback(t *testing.T) {
+	var (
+		patchCalls atomic.Int64
+		patchBody  map[string]any
+	)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+			json.NewDecoder(r.Body).Decode(&patchBody)
+			http.Error(w, "HttpBootUri is not writable", http.StatusBadRequest)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client, err := Dial(t.Context(), srv.URL, tlsServerFingerprint(srv), "admin", "secret", "System.Embedded.1")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	err = client.SetHTTPBootOverride(t.Context(), "http://10.0.0.10:8880/shimx64.efi")
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("SetHTTPBootOverride error = %v, want ErrUnsupported", err)
+	}
+
+	if patchCalls.Load() != 1 {
+		t.Fatalf("expected one client PATCH call, got %d", patchCalls.Load())
+	}
+
+	boot, ok := patchBody["Boot"].(map[string]any)
+	if !ok {
+		t.Fatal("expected Boot in PATCH body")
+	}
+
+	want := map[string]string{
+		"BootSourceOverrideTarget":  "UefiHttp",
+		"BootSourceOverrideEnabled": "Once",
+		"BootSourceOverrideMode":    "UEFI",
+		"HttpBootUri":               "http://10.0.0.10:8880/shimx64.efi",
+	}
+	for key, value := range want {
+		if boot[key] != value {
+			t.Fatalf("client PATCH %s = %v, want %s", key, boot[key], value)
+		}
+	}
+}
+
 func TestBootOrderConfigUEFIHTTPNoOp(t *testing.T) {
 	var patchCalls atomic.Int64
 
@@ -1143,6 +1322,81 @@ func TestBootOrderConfigUEFIHTTPNoOp(t *testing.T) {
 	}
 
 	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-http-noop", Namespace: "default"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if patchCalls.Load() != 0 {
+		t.Fatalf("expected no PATCH call, got %d", patchCalls.Load())
+	}
+}
+
+func TestBootOrderConfigUEFIHTTPNoOpWithoutURI(t *testing.T) {
+	var patchCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "UefiHttp",
+					"BootSourceOverrideEnabled": "Once",
+					"BootSourceOverrideMode":    "UEFI",
+				},
+				"Links": map[string]any{
+					"Chassis": []map[string]any{{"@odata.id": "/redfish/v1/Chassis/1"}},
+				},
+			})
+
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"}, Data: map[string][]byte{"password": []byte("secret")}}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-http-noop-empty-uri", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:        "ghcr.io/test/test-image:v1",
+				BootProtocol: v1alpha3.PXEBootProtocolHTTP,
+				Redfish: &v1alpha3.RedfishSpec{
+					URL:         srv.URL,
+					Username:    "admin",
+					DeviceID:    "System.Embedded.1",
+					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+		Status: v1alpha3.MachineStatus{Redfish: &v1alpha3.RedfishStatus{CertFingerprint: tlsServerFingerprint(srv)}},
+	}
+
+	scheme := testScheme(t)
+	fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, secret).WithStatusSubresource(node).Build()
+	reconciler := &Reconciler{
+		Client: fc,
+		Pool:   NewPool(),
+		FileResolver: &netboot.FileResolver{
+			Cache:    setupRedfishOCICache(t, "ghcr.io/test/test-image:v1", "httpnoopempty123", "httpBootPath: shimx64.efi\n"),
+			ServeURL: "http://10.0.0.10:8880",
+		},
+	}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-http-noop-empty-uri", Namespace: "default"}})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}

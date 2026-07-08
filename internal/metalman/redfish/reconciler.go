@@ -197,13 +197,13 @@ func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, m
 				return err
 			}
 
-			if config.Target == BootTargetUefiHTTP && config.Enabled == BootOnce && config.Mode == BootModeUEFI && config.UefiHTTPSource == bootURL {
+			if isHTTPBootOverrideConfigured(config, bootURL) {
 				return nil // Already set to one-time UEFI HTTP boot.
 			}
 
 			log.Info("setting boot source override to UEFI HTTP", "currentTarget", config.Target, "currentEnabled", config.Enabled, "bootURL", bootURL)
 
-			return c.SetHTTPBootOverride(ctx, bootURL)
+			return r.setHTTPBootOverride(ctx, log, c, bootURL)
 		}
 
 		if config.Target == BootTargetPxe && config.Enabled == BootContinuous {
@@ -223,6 +223,32 @@ func (r *Reconciler) reconcileBootOrder(ctx context.Context, log *slog.Logger, m
 	log.Info("disabling boot source override", "currentTarget", config.Target, "currentEnabled", config.Enabled)
 
 	return c.DisableBootOverride(ctx)
+}
+
+func (r *Reconciler) setHTTPBootOverride(ctx context.Context, log *slog.Logger, c *Client, bootURL string) error {
+	if err := c.SetHTTPBootOverride(ctx, bootURL); err != nil {
+		if !errors.Is(err, ErrUnsupported) {
+			return err
+		}
+
+		log.Info("standard UEFI HTTP boot override not supported, falling back to UefiHttp target", "err", err)
+
+		return c.SetBootOverride(ctx, BootTargetUefiHTTP, BootOnce)
+	}
+
+	return nil
+}
+
+func isHTTPBootOverrideConfigured(config BootConfig, bootURL string) bool {
+	if config.Target != BootTargetUefiHTTP || config.Enabled != BootOnce {
+		return false
+	}
+
+	if config.Mode != "" && config.Mode != BootModeUEFI {
+		return false
+	}
+
+	return config.UefiHTTPSource == "" || config.UefiHTTPSource == bootURL
 }
 
 func (r *Reconciler) httpBootURL(machine *v1alpha3.Machine) (string, error) {

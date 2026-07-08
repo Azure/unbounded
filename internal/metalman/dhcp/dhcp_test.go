@@ -331,6 +331,87 @@ func TestDHCPHandlerHTTPBootSuppressesPXEBootOptions(t *testing.T) {
 	}
 }
 
+func TestDHCPHandlerHTTPBootClientGetsHTTPBootURL(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:f4")
+	serverIP := net.ParseIP("10.0.1.254").To4()
+	netbootImageRef := "ghcr.io/test/netboot:v1"
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-http-client-boot"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				NetbootImage: netbootImageRef,
+				BootProtocol: v1alpha3.PXEBootProtocolHTTP,
+				DHCPLeases: []v1alpha3.DHCPLease{{
+					MAC:        "aa:bb:cc:dd:ee:f4",
+					IPv4:       "10.0.1.14",
+					SubnetMask: "255.255.255.0",
+				}},
+			},
+		},
+	}
+
+	cacheDir := t.TempDir()
+	ociCache := netboot.NewOCICache(cacheDir)
+
+	digest := "sha256:httpclientboot1234567890"
+	ociCache.SetDigest(netbootImageRef, digest)
+
+	diskDir := filepath.Join(ociCache.DiskDir(digest))
+	if err := os.MkdirAll(diskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(diskDir, "metadata.yaml"), []byte("dhcpBootImageName: pxe-shimx64.efi\nhttpBootPath: http/shimx64.efi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := newFakeReader(t, node)
+	srv := &Server{
+		Interface: "eth0",
+		Reader:    reader,
+		ServerIP:  serverIP,
+		OCICache:  ociCache,
+		ServeURL:  "http://10.0.1.254:8880/base/",
+	}
+
+	discover, err := dhcpv4.NewDiscovery(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discover.UpdateOption(dhcpv4.OptClassIdentifier("HTTPClient:Arch:00016:UNDI:003016"))
+
+	conn := &fakePacketConn{}
+	peer := &net.UDPAddr{IP: net.ParseIP("10.0.1.14"), Port: 68}
+
+	srv.handler(conn, peer, discover)
+
+	if conn.written == nil {
+		t.Fatal("expected DHCP response, got none")
+	}
+
+	resp, err := dhcpv4.FromBytes(conn.written)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if tftpServer := resp.TFTPServerName(); tftpServer != "" {
+		t.Errorf("expected no TFTP server for HTTP boot, got %s", tftpServer)
+	}
+
+	if bootfile := resp.BootFileNameOption(); bootfile != "http://10.0.1.254:8880/base/http/shimx64.efi" {
+		t.Errorf("expected HTTP boot URL, got %s", bootfile)
+	}
+
+	if resp.GetOneOption(dhcpv4.OptionTFTPServerName) != nil {
+		t.Error("expected no TFTP server option for HTTP boot")
+	}
+
+	if !resp.YourIPAddr.Equal(net.ParseIP("10.0.1.14")) {
+		t.Errorf("expected YourIP 10.0.1.14, got %s", resp.YourIPAddr)
+	}
+}
+
 func TestDHCPHandlerUnknownMAC(t *testing.T) {
 	mac, _ := net.ParseMAC("ff:ff:ff:ff:ff:ff")
 	serverIP := net.ParseIP("10.0.1.254").To4()
