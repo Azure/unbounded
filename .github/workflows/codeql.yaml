@@ -34,10 +34,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - language: go
-            build-mode: autobuild
-          - language: javascript-typescript
-            build-mode: none
+          # GitHub default CodeQL setup covers Go, JavaScript/TypeScript, and
+          # Python for this repository. Keep this workflow for Rust, which
+          # default setup does not currently scan here, to avoid duplicate
+          # long-running Go and JavaScript analyses on every run.
           - language: rust
             build-mode: none
 
