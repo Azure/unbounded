@@ -10,7 +10,7 @@ import (
 	"sync"
 )
 
-const logPrefix = "metalman"
+const logPrefix = "unbounded-metal"
 
 // Logger writes init messages with the same prefix as the old shell script.
 type Logger struct {

@@ -143,7 +143,12 @@ func (i *Installer) targetDiskSysfs(targetDisk string) (string, error) {
 	return sysdisk, nil
 }
 
-func (i *Installer) partsForDisk(targetDisk string) []string {
+type partition struct {
+	Device string
+	Number string
+}
+
+func (i *Installer) partitionsForDisk(targetDisk string) []partition {
 	sysdisk, err := i.targetDiskSysfs(targetDisk)
 	if err != nil {
 		return nil
@@ -154,16 +159,13 @@ func (i *Installer) partsForDisk(targetDisk string) []string {
 		return nil
 	}
 
-	parts := make([]string, 0, len(entries))
+	parts := make([]partition, 0, len(entries))
 	for _, entry := range entries {
-		if pathExists(filepath.Join(sysdisk, entry.Name(), "partition")) {
-			parts = append(parts, "/dev/"+entry.Name())
+		number := strings.TrimSpace(readFileString(filepath.Join(sysdisk, entry.Name(), "partition")))
+		if number != "" {
+			parts = append(parts, partition{Device: "/dev/" + entry.Name(), Number: number})
 		}
 	}
 
 	return parts
-}
-
-func (i *Installer) partitionNumber(part string) string {
-	return strings.TrimSpace(readFileString(filepath.Join(i.SysfsRoot, "class/block", filepath.Base(part), "partition")))
 }

@@ -10,8 +10,6 @@ import (
 	"os"
 	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -20,6 +18,8 @@ const (
 	defaultMountRoot     = "/mnt"
 	defaultESPMountPoint = "/mnt/esp"
 )
+
+var rootFilesystems = []string{"ext4", "xfs", ""}
 
 // Installer implements the metalman netboot init process. It is written so the
 // hardware-facing pieces are small wrappers around testable decision logic.
@@ -30,8 +30,10 @@ type Installer struct {
 	ESPMountPoint string
 	Logger        *Logger
 	Runner        CommandRunner
+	System        SystemOps
+	Network       NetworkConfigurator
 	HTTPClient    *http.Client
-	Sleep         func(time.Duration)
+	Sleep         func(context.Context, time.Duration) error
 }
 
 // NewInstaller returns an installer configured for the real initrd environment.
@@ -42,8 +44,10 @@ func NewInstaller() *Installer {
 		MountRoot:     defaultMountRoot,
 		ESPMountPoint: defaultESPMountPoint,
 		Runner:        realCommandRunner{},
+		System:        realSystemOps{},
+		Network:       realNetworkConfigurator{},
 		HTTPClient:    http.DefaultClient,
-		Sleep:         time.Sleep,
+		Sleep:         sleepContext,
 	}
 }
 
@@ -68,12 +72,20 @@ func (i *Installer) normalize() {
 		i.Runner = realCommandRunner{}
 	}
 
+	if i.System == nil {
+		i.System = realSystemOps{}
+	}
+
+	if i.Network == nil {
+		i.Network = realNetworkConfigurator{}
+	}
+
 	if i.HTTPClient == nil {
 		i.HTTPClient = http.DefaultClient
 	}
 
 	if i.Sleep == nil {
-		i.Sleep = time.Sleep
+		i.Sleep = sleepContext
 	}
 }
 
@@ -131,15 +143,17 @@ func (i *Installer) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to download and write disk image: %w", err)
 	}
 
-	unix.Sync()
+	i.System.Sync()
 
 	if err := retry(ctx, 5, 2*time.Second, "re-read partition table", i.Sleep, i.Logger, func() error {
-		return i.Runner.Run(ctx, "blockdev", "--rereadpt", targetDisk)
+		return i.System.RereadPartitionTable(targetDisk)
 	}); err != nil {
 		i.Logger.Printf("WARNING: could not re-read partition table")
 	}
 
-	i.Sleep(2 * time.Second)
+	if err := i.Sleep(ctx, 2*time.Second); err != nil {
+		return err
+	}
 
 	if cfg.CloudInit.DSURL != "" {
 		if err := i.injectCloudInit(ctx, targetDisk, cfg.CloudInit); err != nil {
@@ -162,10 +176,12 @@ func (i *Installer) Run(ctx context.Context) error {
 	}
 
 	i.Logger.Printf("installation complete, rebooting")
-	i.Sleep(2 * time.Second)
+	if err := i.Sleep(ctx, 2*time.Second); err != nil {
+		return err
+	}
 
 	if err := retry(ctx, 3, 2*time.Second, "reboot", i.Sleep, i.Logger, func() error {
-		return i.Runner.Run(ctx, "reboot", "-f")
+		return i.System.Reboot()
 	}); err != nil {
 		return fmt.Errorf("failed to reboot: %w", err)
 	}

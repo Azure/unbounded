@@ -10,8 +10,8 @@ import (
 	"strings"
 )
 
-// CommandRunner runs external programs that are already present in the Ubuntu
-// netboot initrd, such as modprobe, mount, ip, blockdev, and efibootmgr.
+// CommandRunner runs external programs that are still delegated to the Ubuntu
+// netboot initrd, such as modprobe, efibootmgr, and the emergency shell.
 type CommandRunner interface {
 	Run(ctx context.Context, name string, args ...string) error
 	Output(ctx context.Context, name string, args ...string) (string, error)

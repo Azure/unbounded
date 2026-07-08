@@ -25,17 +25,18 @@ func (i *Installer) createUEFIBootEntry(ctx context.Context, targetDisk string) 
 		i.Logger.Printf("WARNING: creating efivars mount point failed: %v", err)
 	}
 
-	if err := unix.Mount("efivarfs", efivars, "efivarfs", 0, ""); err != nil && !errors.Is(err, unix.EBUSY) {
+	if err := i.System.Mount("efivarfs", efivars, "efivarfs"); err != nil && !errors.Is(err, unix.EBUSY) {
 		i.Logger.Printf("WARNING: efivarfs mount failed: %v", err)
 	}
 
-	for _, part := range i.partsForDisk(targetDisk) {
-		if err := i.Runner.Run(ctx, "mount", "-t", "vfat", part, i.ESPMountPoint); err != nil {
+	for _, part := range i.partitionsForDisk(targetDisk) {
+		var loader string
+		if err := i.withMounted(part.Device, i.ESPMountPoint, []string{"vfat"}, func() error {
+			loader = findEFILoader(i.ESPMountPoint)
+			return nil
+		}); err != nil {
 			continue
 		}
-
-		loader := findEFILoader(i.ESPMountPoint)
-		runBestEffort(ctx, i.Runner, "umount", i.ESPMountPoint)
 
 		if loader == "" {
 			continue
@@ -45,15 +46,14 @@ func (i *Installer) createUEFIBootEntry(ctx context.Context, targetDisk string) 
 			continue
 		}
 
-		espNum := i.partitionNumber(part)
-		if espNum == "" {
+		if part.Number == "" {
 			continue
 		}
 
-		if err := i.Runner.Run(ctx, "efibootmgr", "--create", "--disk", targetDisk, "--part", espNum, "--loader", loader, "--label", "metalman"); err != nil {
+		if err := i.Runner.Run(ctx, "efibootmgr", "--create", "--disk", targetDisk, "--part", part.Number, "--loader", loader, "--label", "unbounded"); err != nil {
 			i.Logger.Printf("WARNING: efibootmgr failed, PXE chainloader will be used as fallback")
 		} else {
-			i.Logger.Printf("UEFI boot entry created (%s on part %s)", loader, espNum)
+			i.Logger.Printf("UEFI boot entry created (%s on part %s)", loader, part.Number)
 		}
 
 		break

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -129,13 +130,16 @@ func (i *Installer) findFirstInterface() (string, bool) {
 }
 
 type ipConfig struct {
-	ClientIP string
-	Gateway  string
-	Prefix   string
-	Iface    string
+	Address *net.IPNet
+	Gateway net.IP
+	Iface   string
 }
 
-func parseIPParam(value string) ipConfig {
+func parseIPParam(value string) (ipConfig, error) {
+	if value == "dhcp" || value == "on" || value == "any" {
+		return ipConfig{}, fmt.Errorf("unsupported ip parameter %q", value)
+	}
+
 	fields := strings.Split(value, ":")
 	field := func(idx int) string {
 		if idx >= len(fields) {
@@ -145,73 +149,77 @@ func parseIPParam(value string) ipConfig {
 		return fields[idx]
 	}
 
+	clientIP := net.ParseIP(field(0)).To4()
+	if clientIP == nil {
+		return ipConfig{}, fmt.Errorf("invalid IPv4 client IP %q", field(0))
+	}
+
 	mask := field(3)
-
-	prefix := mask
+	prefix, err := strconv.Atoi(mask)
 	if strings.Contains(mask, ".") {
-		prefix = maskToCIDR(mask)
+		prefix, err = maskToCIDR(mask)
+	}
+	if err != nil || prefix < 0 || prefix > 32 {
+		return ipConfig{}, fmt.Errorf("invalid network mask %q", mask)
 	}
 
-	return ipConfig{
-		ClientIP: field(0),
-		Gateway:  field(2),
-		Prefix:   prefix,
-		Iface:    field(5),
-	}
-}
-
-func maskToCIDR(mask string) string {
-	cidr := 0
-
-	for _, octet := range strings.Split(mask, ".") {
-		switch octet {
-		case "255":
-			cidr += 8
-		case "254":
-			cidr += 7
-		case "252":
-			cidr += 6
-		case "248":
-			cidr += 5
-		case "240":
-			cidr += 4
-		case "224":
-			cidr += 3
-		case "192":
-			cidr += 2
-		case "128":
-			cidr++
+	var gateway net.IP
+	if field(2) != "" {
+		gateway = net.ParseIP(field(2)).To4()
+		if gateway == nil {
+			return ipConfig{}, fmt.Errorf("invalid IPv4 gateway IP %q", field(2))
 		}
 	}
 
-	return strconv.Itoa(cidr)
+	return ipConfig{
+		Address: &net.IPNet{IP: clientIP, Mask: net.CIDRMask(prefix, 32)},
+		Gateway: gateway,
+		Iface:   field(5),
+	}, nil
+}
+
+func maskToCIDR(mask string) (int, error) {
+	ip := net.ParseIP(mask).To4()
+	if ip == nil {
+		return 0, fmt.Errorf("invalid IPv4 mask %q", mask)
+	}
+
+	ones, bits := net.IPMask(ip).Size()
+	if bits != 32 {
+		return 0, fmt.Errorf("invalid IPv4 mask %q", mask)
+	}
+
+	return ones, nil
 }
 
 func (i *Installer) configureStaticIP(ctx context.Context, selectedIface, value string) error {
-	cfg := parseIPParam(value)
+	cfg, err := parseIPParam(value)
+	if err != nil {
+		return err
+	}
 
 	iface := selectedIface
 	if cfg.Iface != "" && pathExists(filepath.Join(i.SysfsRoot, "class/net", cfg.Iface)) {
 		iface = cfg.Iface
 	}
 
-	i.Logger.Printf("configuring %s with %s/%s gw %s", iface, cfg.ClientIP, cfg.Prefix, cfg.Gateway)
+	i.Logger.Printf("configuring %s with %s gw %s", iface, cfg.Address.String(), cfg.Gateway.String())
 
 	if err := retry(ctx, 5, 2*time.Second, "link up "+iface, i.Sleep, i.Logger, func() error {
-		return i.Runner.Run(ctx, "ip", "link", "set", iface, "up")
+		return i.Network.LinkSetUp(iface)
 	}); err != nil {
 		return fmt.Errorf("failed to bring up %s: %w", iface, err)
 	}
 
 	if err := retry(ctx, 3, time.Second, "add address", i.Sleep, i.Logger, func() error {
-		return i.Runner.Run(ctx, "ip", "addr", "add", cfg.ClientIP+"/"+cfg.Prefix, "dev", iface)
+		return i.Network.AddrAdd(iface, cfg.Address)
 	}); err != nil {
 		i.Logger.Printf("WARNING: failed to add address")
 	}
 
-	if cfg.Gateway != "" {
+	if cfg.Gateway != nil {
 		if err := retry(ctx, 3, time.Second, "add default route", i.Sleep, i.Logger, func() error {
-			return i.Runner.Run(ctx, "ip", "route", "add", "default", "via", cfg.Gateway, "dev", iface)
+			return i.Network.RouteAddDefault(iface, cfg.Gateway)
 		}); err != nil {
 			i.Logger.Printf("WARNING: failed to add default route")
 		}

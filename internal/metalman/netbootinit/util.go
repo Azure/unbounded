@@ -22,7 +22,7 @@ func closeBestEffort(c io.Closer) {
 	}
 }
 
-func retry(ctx context.Context, attempts int, delay time.Duration, desc string, sleep func(time.Duration), log *Logger, fn func() error) error {
+func retry(ctx context.Context, attempts int, delay time.Duration, desc string, sleep func(context.Context, time.Duration) error, log *Logger, fn func() error) error {
 	var lastErr error
 
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -42,11 +42,8 @@ func retry(ctx context.Context, attempts int, delay time.Duration, desc string, 
 
 		log.Printf("%s failed (attempt %d/%d), retrying in %ds", desc, attempt, attempts, int(delay.Seconds()))
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			sleep(delay)
+		if err := sleep(ctx, delay); err != nil {
+			return err
 		}
 	}
 

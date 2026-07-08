@@ -32,7 +32,7 @@ func (i *Installer) setupMounts() error {
 	}
 
 	for _, m := range mounts {
-		if err := unix.Mount(m.source, m.target, m.fstype, 0, ""); err != nil && !errors.Is(err, unix.EBUSY) {
+		if err := i.System.Mount(m.source, m.target, m.fstype); err != nil && !errors.Is(err, unix.EBUSY) {
 			// The Ubuntu netboot initrd may already have some pseudo filesystems
 			// mounted before this overlay init runs. Keep startup tolerant.
 			continue
@@ -51,7 +51,7 @@ func (i *Installer) loadKernelModules(ctx context.Context) error {
 		runBestEffort(ctx, i.Runner, "modprobe", mod)
 	}
 
-	kver, err := i.Runner.Output(ctx, "uname", "-r")
+	kver, err := i.System.KernelRelease()
 	if err != nil {
 		return nil
 	}
