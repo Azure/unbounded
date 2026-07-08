@@ -6,6 +6,7 @@ __debug*
 tmp/
 .tmp/
 dist/
+cmd/unbounded-storage/target/
 
 # Docker
 .dockerignore
