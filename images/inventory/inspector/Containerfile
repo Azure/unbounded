@@ -35,7 +35,8 @@ COPY . .
 ARG VERSION=dev
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    make inventory-inspector VERSION=${VERSION} CI=1
+    mkdir -p bin && \
+    go build -o bin/inventory-inspector ./cmd/inventory/inventory-inspector/main.go
 
 # Runtime stage
 FROM ubuntu:noble

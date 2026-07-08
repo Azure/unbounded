@@ -35,7 +35,8 @@ COPY . .
 ARG VERSION=dev
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    make inventory-aggregator VERSION=${VERSION} CI=1
+    mkdir -p bin && \
+    go build -o bin/inventory-aggregator ./cmd/inventory/inventory-aggregator/main.go
 
 # Runtime stage
 FROM ubuntu:noble
