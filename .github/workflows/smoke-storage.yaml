@@ -67,6 +67,7 @@ jobs:
           key: libfabric-${{ env.LIBFABRIC_VERSION }}-${{ runner.os }}-${{ hashFiles('Makefile') }}
 
       - name: Build libfabric
+        if: steps.cache-libfabric.outputs.cache-hit != 'true'
         run: make libfabric LIBFABRIC_VERSION="$LIBFABRIC_VERSION"
 
       # The distro OpenSSL (3.0.x) only wires up kTLS for the send direction
@@ -81,6 +82,7 @@ jobs:
           key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}
 
       - name: Build openssl
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
         run: make openssl OPENSSL_VERSION="$OPENSSL_VERSION"
 
       - name: Set up Rust toolchain
