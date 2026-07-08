@@ -20,6 +20,36 @@ import (
 // ErrUnsupported indicates the BMC does not support the requested operation.
 var ErrUnsupported = errors.New("not supported by BMC")
 
+type responseError struct {
+	method string
+	path   string
+	status int
+	body   []byte
+	cause  error
+}
+
+func redfishResponseError(method, path string, status int, body []byte, cause error) error {
+	return &responseError{
+		method: method,
+		path:   path,
+		status: status,
+		body:   append([]byte(nil), body...),
+		cause:  cause,
+	}
+}
+
+func (e *responseError) Error() string {
+	if len(e.body) == 0 {
+		return fmt.Sprintf("Redfish %s %s returned HTTP %d", e.method, e.path, e.status)
+	}
+
+	return fmt.Sprintf("Redfish %s %s returned HTTP %d: %s", e.method, e.path, e.status, e.body)
+}
+
+func (e *responseError) Unwrap() error {
+	return e.cause
+}
+
 // PowerState represents the power state of a Redfish system.
 type PowerState string
 
@@ -121,7 +151,7 @@ func (c *Client) PowerState(ctx context.Context) (PowerState, error) {
 	}
 
 	if status != http.StatusOK {
-		return "", fmt.Errorf("unexpected status %d from %s: %s", status, path, data)
+		return "", redfishResponseError(http.MethodGet, path, status, data, nil)
 	}
 
 	var result struct {
@@ -145,7 +175,7 @@ func (c *Client) Reset(ctx context.Context, resetType ResetType) error {
 	}
 
 	if !isSuccessStatus(status) {
-		return fmt.Errorf("unexpected status %d from reset %s: %s", status, resetType, data)
+		return fmt.Errorf("reset %s failed: %w", resetType, redfishResponseError(http.MethodPost, path, status, data, nil))
 	}
 
 	return nil
@@ -161,7 +191,7 @@ func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
 	}
 
 	if status != http.StatusOK {
-		return BootConfig{}, fmt.Errorf("unexpected status %d from %s: %s", status, path, data)
+		return BootConfig{}, redfishResponseError(http.MethodGet, path, status, data, nil)
 	}
 
 	var system struct {
@@ -196,17 +226,17 @@ func (c *Client) SetBootOverride(ctx context.Context, target BootTarget, enabled
 		},
 	}
 
-	_, status, err := c.session.do(ctx, http.MethodPatch, path, body)
+	data, status, err := c.session.do(ctx, http.MethodPatch, path, body)
 	if err != nil {
 		return err
 	}
 
 	if isUnsupportedStatus(status) {
-		return fmt.Errorf("boot override PATCH returned %d: %w", status, ErrUnsupported)
+		return redfishResponseError(http.MethodPatch, path, status, data, ErrUnsupported)
 	}
 
 	if !isSuccessStatus(status) {
-		return fmt.Errorf("unexpected status %d from boot override PATCH", status)
+		return redfishResponseError(http.MethodPatch, path, status, data, nil)
 	}
 
 	return nil
@@ -226,17 +256,17 @@ func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error 
 		},
 	}
 
-	_, status, err := c.session.do(ctx, http.MethodPatch, path, body)
+	data, status, err := c.session.do(ctx, http.MethodPatch, path, body)
 	if err != nil {
 		return err
 	}
 
 	if isUnsupportedStatus(status) {
-		return fmt.Errorf("UEFI HTTP boot override PATCH returned %d: %w", status, ErrUnsupported)
+		return redfishResponseError(http.MethodPatch, path, status, data, ErrUnsupported)
 	}
 
 	if !isSuccessStatus(status) {
-		return fmt.Errorf("unexpected status %d from UEFI HTTP boot override PATCH", status)
+		return redfishResponseError(http.MethodPatch, path, status, data, nil)
 	}
 
 	return nil
@@ -253,20 +283,20 @@ func (c *Client) DisableBootOverride(ctx context.Context) error {
 		},
 	}
 
-	_, status, err := c.session.do(ctx, http.MethodPatch, path, body)
+	data, status, err := c.session.do(ctx, http.MethodPatch, path, body)
 	if err != nil {
 		return err
 	}
 
-	if isSuccessStatus(status) {
-		return nil
-	}
-
 	if isUnsupportedStatus(status) {
-		return fmt.Errorf("disable boot override PATCH returned %d: %w", status, ErrUnsupported)
+		return redfishResponseError(http.MethodPatch, path, status, data, ErrUnsupported)
 	}
 
-	return fmt.Errorf("unexpected status %d from boot override PATCH", status)
+	if !isSuccessStatus(status) {
+		return redfishResponseError(http.MethodPatch, path, status, data, nil)
+	}
+
+	return nil
 }
 
 // CaptureFingerprint connects to a BMC without cert pinning and returns
@@ -339,7 +369,7 @@ func resolveDeviceID(ctx context.Context, s *bmcSession, deviceID string) (strin
 	}
 
 	if status != http.StatusOK {
-		return "", fmt.Errorf("unexpected status %d from /redfish/v1/Systems: %s", status, data)
+		return "", redfishResponseError(http.MethodGet, "/redfish/v1/Systems", status, data, nil)
 	}
 
 	var collection struct {

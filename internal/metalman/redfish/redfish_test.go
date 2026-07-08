@@ -210,6 +210,56 @@ func TestBootOrderConfigTransientError(t *testing.T) {
 	require.Error(t, client.SetBootOverride(t.Context(), BootTargetPxe, BootContinuous))
 }
 
+func TestRedfishErrorIncludesFullResponseBody(t *testing.T) {
+	const responseBody = `{"error":{"message":"reset failed with detailed BMC diagnostics"}}`
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
+			http.Error(w, responseBody, http.StatusInternalServerError)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	err := client.Reset(t.Context(), ResetOn)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), responseBody)
+}
+
+func TestRedfishUnsupportedErrorIncludesFullResponseBody(t *testing.T) {
+	const responseBody = `{"error":{"message":"BootSourceOverrideTarget is not writable"}}`
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			http.Error(w, responseBody, http.StatusBadRequest)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	err := client.SetBootOverride(t.Context(), BootTargetPxe, BootContinuous)
+	require.ErrorIs(t, err, ErrUnsupported)
+	require.Contains(t, err.Error(), responseBody)
+}
+
 func TestSessionExpiryRetry(t *testing.T) {
 	var sessions atomic.Int64
 
