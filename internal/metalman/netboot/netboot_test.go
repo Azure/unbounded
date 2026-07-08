@@ -195,6 +195,102 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 	}
 }
 
+func TestHTTPServer_HTTPBootLoaderRequiresPendingRepave(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpboot123", map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: shimx64.efi\n"),
+		"shimx64.efi":   []byte("shim"),
+		"vmlinuz":       []byte("kernel"),
+	})
+
+	tests := []struct {
+		name          string
+		path          string
+		statusRepave  int64
+		wantStatus    int
+		wantBody      []byte
+		wantBootEvent []string
+	}{
+		{
+			name:          "pending repave serves bootloader",
+			path:          "shimx64.efi",
+			statusRepave:  0,
+			wantStatus:    http.StatusOK,
+			wantBody:      []byte("shim"),
+			wantBootEvent: []string{"node-http:shimx64.efi"},
+		},
+		{
+			name:         "cleared repave hides bootloader",
+			path:         "shimx64.efi",
+			statusRepave: 1,
+			wantStatus:   http.StatusNotFound,
+		},
+		{
+			name:         "cleared repave serves follow-on artifacts",
+			path:         "vmlinuz",
+			statusRepave: 1,
+			wantStatus:   http.StatusOK,
+			wantBody:     []byte("kernel"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-http"},
+				Spec: v1alpha3.MachineSpec{
+					PXE: &v1alpha3.PXESpec{
+						Image:        "ghcr.io/test/image:v1",
+						BootProtocol: v1alpha3.PXEBootProtocolHTTP,
+						DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:10", IPv4: "10.0.1.60", SubnetMask: "255.255.255.0"}},
+					},
+					Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+				},
+				Status: v1alpha3.MachineStatus{
+					Operations: &v1alpha3.OperationsStatus{RepaveCounter: tt.statusRepave},
+				},
+			}
+
+			scheme := newScheme(t)
+			fc := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(node).
+				WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+				Build()
+			recorder := &recordingStatusRecorder{}
+			srv := &HTTPServer{
+				FileResolver: FileResolver{
+					Cache:  cache,
+					Reader: fc,
+				},
+				StatusRecorder: recorder,
+			}
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /", srv.handleFile)
+
+			ts := httptest.NewServer(mux)
+			defer ts.Close()
+
+			req, _ := http.NewRequest("GET", ts.URL+"/"+tt.path, nil)
+			req.Header.Set("X-Forwarded-For", "10.0.1.60")
+
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			require.NoError(t, err)
+
+			require.Equal(t, tt.wantStatus, resp.StatusCode)
+
+			if tt.wantBody != nil {
+				require.Equal(t, tt.wantBody, body)
+			}
+
+			require.Equal(t, tt.wantBootEvent, recorder.bootLoaderEvents())
+		})
+	}
+}
+
 func TestHTTPServer_TemplateRendered(t *testing.T) {
 	bootTemplate := `set default=0
 menuentry "Install" {
@@ -707,6 +803,13 @@ func (r *recordingStatusRecorder) bootImageWrittenEvents() []string {
 	defer r.mu.Unlock()
 
 	return append([]string(nil), r.bootImageWritten...)
+}
+
+func (r *recordingStatusRecorder) bootLoaderEvents() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]string(nil), r.bootLoader...)
 }
 
 func (r *recordingStatusRecorder) cloudInitDoneEvents() []string {
