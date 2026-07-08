@@ -123,6 +123,15 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if node.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP &&
+		h.isHTTPBootLoaderDownload(imageRef, node.Spec.PXE.TargetArchitecture(), path) &&
+		!pxeRepavePending(node) {
+		log.Info("HTTP boot disabled because repave is not pending", "node", node.Name)
+		http.NotFound(w, r)
+
+		return
+	}
+
 	resolved, err := h.ResolveFileByPathForIP(r.Context(), path, node, imageRef, ip)
 	if err != nil {
 		if errors.Is(err, ErrNotYetDownloaded) {
@@ -376,6 +385,19 @@ func (h *HTTPServer) isHTTPBootLoaderDownload(imageRef, architecture, path strin
 	}
 
 	return HTTPBootPathFromMetadata(meta) == strings.TrimPrefix(path, "/")
+}
+
+func pxeRepavePending(node *v1alpha3.Machine) bool {
+	var specRepave, statusRepave int64
+	if node != nil && node.Spec.Operations != nil {
+		specRepave = node.Spec.Operations.RepaveCounter
+	}
+
+	if node != nil && node.Status.Operations != nil {
+		statusRepave = node.Status.Operations.RepaveCounter
+	}
+
+	return specRepave > statusRepave
 }
 
 func (h *HTTPServer) recordCloudInitStatus(ctx context.Context, log *slog.Logger, machineName string, ev *cloudInitEvent) {
