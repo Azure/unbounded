@@ -124,16 +124,21 @@ func (w *ClusterInfoWatcher) refresh(ctx context.Context) error {
 		apiserverURL = w.apiserverURLOverride
 	}
 
-	w.mu.Lock()
-	w.info = netboot.ClusterInfo{
+	info := netboot.ClusterInfo{
 		ApiserverURL: apiserverURL,
 		CACertBase64: base64.StdEncoding.EncodeToString(resolved.CACertPEM),
 	}
+
+	w.mu.Lock()
+	changed := w.info != info
+	w.info = info
 	w.mu.Unlock()
 
-	w.log.Info("cluster-info refreshed",
-		"apiserverURL", apiserverURL,
-	)
+	if changed {
+		w.log.Info("cluster-info refreshed",
+			"apiserverURL", apiserverURL,
+		)
+	}
 
 	return nil
 }

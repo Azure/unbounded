@@ -53,7 +53,7 @@ jobs:
             libibverbs-dev librdmacm-dev
 
       - name: Cache pinned libfabric
-        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: tmp/libfabric
           key: libfabric-${{ env.LIBFABRIC_VERSION }}-arm64-${{ runner.os }}-${{ hashFiles('Makefile') }}
@@ -62,7 +62,7 @@ jobs:
         run: make libfabric LIBFABRIC_VERSION="$LIBFABRIC_VERSION"
 
       - name: Cache pinned OpenSSL
-        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: tmp/openssl
           key: openssl-${{ env.OPENSSL_VERSION }}-arm64-${{ runner.os }}-${{ hashFiles('Makefile') }}
@@ -76,7 +76,7 @@ jobs:
           rustup default stable
 
       - name: Cache cargo registry and target
-        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -118,7 +118,7 @@ jobs:
       # `src_addr` member on `struct fi_cq_err_entry` that the shim references,
       # so building against it fails to compile.
       - name: Cache pinned libfabric
-        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: tmp/libfabric
           key: libfabric-${{ runner.os }}-${{ hashFiles('Makefile') }}
@@ -134,7 +134,7 @@ jobs:
           echo "LD_LIBRARY_PATH=${prefix}/lib" >> "${GITHUB_ENV}"
 
       - name: Cache cargo registry and target
-        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -207,7 +207,7 @@ jobs:
           java-version: "21"
 
       - name: Cache tla2tools.jar
-        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: tmp/tla2tools.jar
           # Key derives from the pinned TLA_TOOLS_VERSION / SHA in the
