@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
@@ -5,14 +7,12 @@
 FROM docker.io/library/golang:1.26.5-trixie AS builder
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    golang \
     make \
-    gcc \
     git \
     ca-certificates \
-    && apt-get clean
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Set up Go environment
 ENV CGO_ENABLED=0
@@ -20,31 +20,30 @@ ENV GOPATH=/go
 ENV GOTOOLCHAIN=auto
 ENV PATH=$PATH:/go/bin
 
-# Install gofumpt and golangci-lint for the build
-RUN go install mvdan.cc/gofumpt@latest && \
-    go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
-
 # Set working directory
 WORKDIR /src
 
 # Copy go mod files first for better caching
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 # Copy the rest of the source code
-COPY ../../ .
+COPY . .
 
 # VERSION is passed from the release workflow to inject version metadata via ldflags.
 ARG VERSION=dev
-RUN make inventory-viewer VERSION=${VERSION}
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    make inventory-viewer VERSION=${VERSION}
 
 # Runtime stage
 FROM ubuntu:noble
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    && apt-get clean
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Create unbounded directory
 RUN mkdir -p /unbounded/bin
