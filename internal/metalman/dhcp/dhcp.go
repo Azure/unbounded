@@ -159,7 +159,8 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		return
 	}
 
-	resp, err := dhcpv4.NewReplyFromRequest(m,
+	resp, err := dhcpv4.NewReplyFromRequest(
+		m,
 		dhcpv4.WithYourIP(clientIP),
 		dhcpv4.WithServerIP(s.ServerIP),
 		dhcpv4.WithOption(dhcpv4.OptSubnetMask(net.IPMask(net.ParseIP(lease.SubnetMask).To4()))),
