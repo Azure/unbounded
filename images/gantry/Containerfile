@@ -4,7 +4,7 @@
 # Build stage
 # Pin the builder to BUILDPLATFORM so the Go toolchain runs natively on the
 # host even when targeting a foreign TARGETPLATFORM.
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.4-trixie AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.5-trixie AS builder
 
 RUN apt-get update && apt-get install -y \
     build-essential \
