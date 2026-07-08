@@ -117,11 +117,6 @@ func (t *tunnel) setupCommands(privateKeyFile, endpoint string, serverWG, client
 		return nil, fmt.Errorf("parse management namespace address: %w", err)
 	}
 
-	guestGatewayPrefix, guestSubnetCIDR, err := guestNetworkPrefixes(t.metadata.Network)
-	if err != nil {
-		return nil, err
-	}
-
 	commands := [][]string{
 		{"ip", "netns", "add", t.cfg.NetworkNamespace},
 		{"ip", "link", "add", t.cfg.ManagementHostInterface, "type", "veth", "peer", "name", t.cfg.ManagementNamespaceInterface},
@@ -167,11 +162,9 @@ func (t *tunnel) setupCommands(privateKeyFile, endpoint string, serverWG, client
 	commands = append(commands, []string{"ip", "-n", t.cfg.NetworkNamespace, "link", "set", t.cfg.VXLANInterface, "up"})
 	commands = append(
 		commands,
-		[]string{"ip", "-n", t.cfg.NetworkNamespace, "addr", "add", guestGatewayPrefix, "dev", t.cfg.VXLANInterface},
 		[]string{"ip", "netns", "exec", t.cfg.NetworkNamespace, "sysctl", "-w", "net.ipv4.ip_forward=1"},
 		[]string{"ip", "netns", "exec", t.cfg.NetworkNamespace, "iptables", "-A", "FORWARD", "-i", t.cfg.VXLANInterface, "-o", t.cfg.ManagementNamespaceInterface, "-j", "ACCEPT"},
 		[]string{"ip", "netns", "exec", t.cfg.NetworkNamespace, "iptables", "-A", "FORWARD", "-i", t.cfg.ManagementNamespaceInterface, "-o", t.cfg.VXLANInterface, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
-		[]string{"ip", "netns", "exec", t.cfg.NetworkNamespace, "iptables", "-t", "nat", "-A", "POSTROUTING", "-s", guestSubnetCIDR, "-o", t.cfg.ManagementNamespaceInterface, "-j", "MASQUERADE"},
 	)
 
 	return commands, nil

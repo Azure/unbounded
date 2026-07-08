@@ -28,8 +28,8 @@ ARG BUILD_TIME=
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build \
       -ldflags "-X github.com/Azure/unbounded/internal/version.Version=${VERSION} -X github.com/Azure/unbounded/internal/version.GitCommit=${GIT_COMMIT} -X github.com/Azure/unbounded/internal/version.BuildTime=${BUILD_TIME}" \
-      -o bin/playpen-runner \
-      ./cmd/playpen-runner && \
+      -o bin/playpen-endpoint \
+      ./cmd/playpen-endpoint && \
     GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build \
       -ldflags "-X github.com/Azure/unbounded/internal/version.Version=${VERSION} -X github.com/Azure/unbounded/internal/version.GitCommit=${GIT_COMMIT} -X github.com/Azure/unbounded/internal/version.BuildTime=${BUILD_TIME}" \
@@ -40,18 +40,13 @@ FROM ubuntu:noble
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \
+    bridge-utils \
     iproute2 \
-    ovmf \
-    qemu-efi-aarch64 \
-    qemu-system-arm \
-    qemu-system-x86 \
-    qemu-utils \
-    swtpm \
     wireguard-tools \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /unbounded/bin /var/lib/playpen-runner /etc/playpen/wireguard
-COPY --from=builder /src/bin/playpen-runner /unbounded/bin/playpen-runner
+RUN mkdir -p /unbounded/bin
+COPY --from=builder /src/bin/playpen-endpoint /unbounded/bin/playpen-endpoint
 COPY --from=builder /src/bin/playpen-operator /unbounded/bin/playpen-operator
 
 ENV PATH="/unbounded/bin:${PATH}"

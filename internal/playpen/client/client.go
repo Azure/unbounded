@@ -17,49 +17,41 @@ import (
 	"strings"
 	"sync"
 
-	"k8s.io/client-go/rest"
-
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/client-go/rest"
 
 	"github.com/Azure/unbounded/internal/playpen/operator"
 )
 
 const (
 	idempotencyKeyHeader = "Idempotency-Key"
-	allocsPath           = "/apis/playpen.unbounded-cloud.io/v1alpha1/allocs"
-	deallocsPath         = "/apis/playpen.unbounded-cloud.io/v1alpha1/deallocs"
+	allocationsPath      = "/apis/playpen.unbounded-cloud.io/v1alpha1/allocations"
+	deallocationsPath    = "/apis/playpen.unbounded-cloud.io/v1alpha1/deallocations"
 )
 
-// Config contains settings for connecting to the playpen aggregated API.
 type Config struct {
-	// RESTConfig connects to the Kubernetes API server hosting the playpen aggregated API.
 	RESTConfig *rest.Config
-	// HTTPClient overrides the client built from RESTConfig. It is intended for tests.
 	HTTPClient *http.Client
 	cmd        commander
 }
 
-// Client is a high-level client for allocating and releasing playpens.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	cmd        commander
 }
 
-// AllocateOptions controls one playpen allocation.
-type AllocateOptions struct {
-	// Architecture optionally requests a runner architecture. Empty defaults to amd64.
-	Architecture string
-	// KubernetesVersion optionally requests a control-plane Kubernetes version.
-	KubernetesVersion string
-	// WireGuardPrivateKey is the client's WireGuard private key. If empty, one is generated.
+type AllocateVMOptions struct {
+	Architecture        string
+	DiskSize            resource.Quantity
+	Memory              resource.Quantity
+	CPUs                int
 	WireGuardPrivateKey string
-	// Tunnel optionally overrides local tunnel settings.
-	Tunnel TunnelConfig
+	Tunnel              TunnelConfig
 }
 
-// Playpen represents one allocated playpen runner pod and its local resources.
-type Playpen struct {
+type Allocation struct {
 	client              *Client
 	mu                  sync.Mutex
 	idempotencyKey      string
@@ -70,24 +62,18 @@ type Playpen struct {
 	Metadata operator.AllocResponse
 }
 
-// ControlPlane represents one allocated playpen Kubernetes control plane.
-type ControlPlane struct {
-	client         *Client
-	mu             sync.Mutex
-	idempotencyKey string
-	closed         bool
-
-	Metadata operator.AllocResponse
+type PXEServerOptions struct {
+	Command string
+	Args    []string
+	Env     []string
 }
 
-// New returns a client configured to use the Kubernetes aggregated API server.
 func New(cfg Config) (*Client, error) {
 	if cfg.RESTConfig == nil {
 		return nil, fmt.Errorf("REST config is required")
 	}
 
 	restConfig := rest.CopyConfig(cfg.RESTConfig)
-
 	baseURL := strings.TrimRight(strings.TrimSpace(restConfig.Host), "/")
 	if baseURL == "" {
 		return nil, fmt.Errorf("REST config host is required")
@@ -96,7 +82,6 @@ func New(cfg Config) (*Client, error) {
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		var err error
-
 		httpClient, err = rest.HTTPClientFor(restConfig)
 		if err != nil {
 			return nil, fmt.Errorf("create Kubernetes HTTP client: %w", err)
@@ -111,8 +96,7 @@ func New(cfg Config) (*Client, error) {
 	return &Client{baseURL: baseURL, httpClient: httpClient, cmd: cmd}, nil
 }
 
-// Allocate allocates an idle playpen runner and returns its metadata.
-func (c *Client) Allocate(ctx context.Context, opts AllocateOptions) (*Playpen, error) {
+func (c *Client) AllocateVM(ctx context.Context, opts AllocateVMOptions) (*Allocation, error) {
 	privateKey := strings.TrimSpace(opts.WireGuardPrivateKey)
 	if privateKey == "" {
 		key, err := wgtypes.GeneratePrivateKey()
@@ -133,16 +117,24 @@ func (c *Client) Allocate(ctx context.Context, opts AllocateOptions) (*Playpen, 
 		return nil, fmt.Errorf("generate idempotency key: %w", err)
 	}
 
-	body, err := json.Marshal(operator.AllocRequest{WireGuardPublicKey: key.PublicKey().String(), Architecture: opts.Architecture})
+	reqBody := operator.AllocRequest{WireGuardPublicKey: key.PublicKey().String(), Architecture: opts.Architecture, CPUs: opts.CPUs}
+	if !opts.DiskSize.IsZero() {
+		reqBody.DiskSize = opts.DiskSize.String()
+	}
+
+	if !opts.Memory.IsZero() {
+		reqBody.Memory = opts.Memory.String()
+	}
+
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := c.newRequest(ctx, http.MethodPost, allocsPath, bytes.NewReader(body))
+	req, err := c.newRequest(ctx, http.MethodPost, allocationsPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-
 	req.Header.Set(idempotencyKeyHeader, idempotencyKey)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -151,96 +143,84 @@ func (c *Client) Allocate(ctx context.Context, opts AllocateOptions) (*Playpen, 
 		return nil, err
 	}
 
-	return &Playpen{
+	return &Allocation{
 		client:              c,
 		idempotencyKey:      idempotencyKey,
 		wireGuardPrivateKey: privateKey,
 		Metadata:            resp,
-		tunnel: newTunnel(c.cmd, privateKey, resp, tunnelConfigWithDefaults(
-			opts.Tunnel,
-			idempotencyKey,
-		)),
+		tunnel:              newTunnel(c.cmd, privateKey, resp, tunnelConfigWithDefaults(opts.Tunnel, idempotencyKey)),
 	}, nil
 }
 
-// AllocateControlPlane allocates an idle Kubernetes control plane and returns its metadata.
-func (c *Client) AllocateControlPlane(ctx context.Context, opts AllocateOptions) (*ControlPlane, error) {
-	idempotencyKey, err := randomHex(32)
-	if err != nil {
-		return nil, fmt.Errorf("generate idempotency key: %w", err)
-	}
-
-	body, err := json.Marshal(operator.AllocRequest{ResourceType: operator.ResourceTypeControlPlane, KubernetesVersion: opts.KubernetesVersion})
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := c.newRequest(ctx, http.MethodPost, allocsPath, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set(idempotencyKeyHeader, idempotencyKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	var resp operator.AllocResponse
-	if err := c.doJSON(req, http.StatusOK, &resp); err != nil {
-		return nil, err
-	}
-
-	return &ControlPlane{client: c, idempotencyKey: idempotencyKey, Metadata: resp}, nil
+// Allocate is retained as a convenience alias for existing smoke tests moving to AllocateVM.
+func (c *Client) Allocate(ctx context.Context, opts AllocateVMOptions) (*Allocation, error) {
+	return c.AllocateVM(ctx, opts)
 }
 
-func (c *Client) deallocate(ctx context.Context, idempotencyKey string) error {
-	req, err := c.newRequest(ctx, http.MethodPost, deallocsPath, http.NoBody)
+func (c *Client) deallocate(ctx context.Context, allocationID, idempotencyKey string) error {
+	body, err := json.Marshal(operator.DeallocRequest{AllocationID: allocationID, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return err
 	}
 
+	req, err := c.newRequest(ctx, http.MethodPost, deallocationsPath, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
 	req.Header.Set(idempotencyKeyHeader, strings.TrimSpace(idempotencyKey))
+	req.Header.Set("Content-Type", "application/json")
 
 	return c.doJSON(req, http.StatusNoContent, nil)
 }
 
-// WireGuardPrivateKey returns the client's WireGuard private key for this playpen.
-func (p *Playpen) WireGuardPrivateKey() string {
-	return p.wireGuardPrivateKey
+func (a *Allocation) WireGuardPrivateKey() string {
+	return a.wireGuardPrivateKey
 }
 
-// TunnelConfig returns the local tunnel settings for this playpen.
-func (p *Playpen) TunnelConfig() TunnelConfig {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (a *Allocation) TunnelConfig() TunnelConfig {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-	return p.tunnel.cfg
+	return a.tunnel.cfg
 }
 
-// OverrideEndpoint replaces the WireGuard endpoint used by future tunnel setup.
-func (p *Playpen) OverrideEndpoint(host string, port int32) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (a *Allocation) ConfigureNetwork(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-	p.Metadata.Endpoint.Host = strings.TrimSpace(host)
-	p.Metadata.Endpoint.WireGuardUDPPort = port
-	p.tunnel.metadata.Endpoint.Host = p.Metadata.Endpoint.Host
-	p.tunnel.metadata.Endpoint.WireGuardUDPPort = p.Metadata.Endpoint.WireGuardUDPPort
-}
-
-// ConfigureTunnel creates the local WireGuard and VXLAN resources for this playpen.
-func (p *Playpen) ConfigureTunnel(ctx context.Context) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.closed {
-		return fmt.Errorf("playpen is closed")
+	if a.closed {
+		return fmt.Errorf("allocation is closed")
 	}
 
-	return p.tunnel.Setup(ctx)
+	return a.tunnel.Setup(ctx)
 }
 
-// Run executes a command inside the playpen network namespace.
-func (p *Playpen) Run(ctx context.Context, name string, args ...string) error {
-	cmd, err := p.Command(ctx, name, args...)
+func (a *Allocation) ConfigureTunnel(ctx context.Context) error {
+	return a.ConfigureNetwork(ctx)
+}
+
+func (a *Allocation) ServePXE(ctx context.Context, opts PXEServerOptions) (*exec.Cmd, error) {
+	if strings.TrimSpace(opts.Command) == "" {
+		return nil, fmt.Errorf("PXE command is required")
+	}
+
+	cmd, err := a.Command(ctx, opts.Command, opts.Args...)
+	if err != nil {
+		return nil, err
+	}
+
+	cmd.Env = append(os.Environ(), opts.Env...)
+	cmd.Env = append(cmd.Env,
+		"PLAYPEN_GUEST_MAC="+a.Metadata.Network.GuestMAC,
+		"PLAYPEN_GUEST_IPV4="+a.Metadata.Network.GuestIPv4,
+		"PLAYPEN_GATEWAY_IPV4="+a.Metadata.Network.GatewayIPv4,
+	)
+
+	return cmd, cmd.Start()
+}
+
+func (a *Allocation) Run(ctx context.Context, name string, args ...string) error {
+	cmd, err := a.Command(ctx, name, args...)
 	if err != nil {
 		return err
 	}
@@ -251,22 +231,20 @@ func (p *Playpen) Run(ctx context.Context, name string, args ...string) error {
 	return cmd.Run()
 }
 
-// Command returns a command configured to execute inside the playpen network namespace.
-func (p *Playpen) Command(ctx context.Context, name string, args ...string) (*exec.Cmd, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (a *Allocation) Command(ctx context.Context, name string, args ...string) (*exec.Cmd, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-	if p.closed {
-		return nil, fmt.Errorf("playpen is closed")
+	if a.closed {
+		return nil, fmt.Errorf("allocation is closed")
 	}
 
-	namespace := strings.TrimSpace(p.tunnel.cfg.NetworkNamespace)
+	namespace := strings.TrimSpace(a.tunnel.cfg.NetworkNamespace)
 	if namespace == "" {
 		return nil, fmt.Errorf("network namespace is required")
 	}
 
 	cmdArgs := append([]string{"netns", "exec", namespace, name}, args...)
-
 	cmdName := "ip"
 	if os.Geteuid() != 0 {
 		cmdArgs = append([]string{"-n", cmdName}, cmdArgs...)
@@ -276,65 +254,35 @@ func (p *Playpen) Command(ctx context.Context, name string, args ...string) (*ex
 	return exec.CommandContext(ctx, cmdName, cmdArgs...), nil
 }
 
-// Close tears down local tunnel resources and releases the playpen.
-func (p *Playpen) Close(ctx context.Context) error {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
+func (a *Allocation) Close(ctx context.Context) error {
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
 
 		return nil
 	}
 
-	p.closed = true
-	tunnel := p.tunnel
-	idempotencyKey := p.idempotencyKey
-	client := p.client
-	p.mu.Unlock()
+	a.closed = true
+	tunnel := a.tunnel
+	idempotencyKey := a.idempotencyKey
+	allocationID := a.Metadata.ID
+	client := a.client
+	a.mu.Unlock()
 
 	var closeErr error
 	if tunnel != nil {
 		closeErr = tunnel.Teardown(ctx)
 	}
 
-	if err := client.deallocate(ctx, idempotencyKey); err != nil && closeErr == nil {
+	if err := client.deallocate(ctx, allocationID, idempotencyKey); err != nil && closeErr == nil {
 		closeErr = err
 	}
 
 	return closeErr
 }
 
-// Kubeconfig returns the host-reachable kubeconfig for this control plane.
-func (cp *ControlPlane) Kubeconfig() string {
-	cp.mu.Lock()
-	defer cp.mu.Unlock()
-
-	return cp.Metadata.ControlPlane.Kubeconfig
-}
-
-// Close releases the control-plane allocation.
-func (cp *ControlPlane) Close(ctx context.Context) error {
-	cp.mu.Lock()
-	if cp.closed {
-		cp.mu.Unlock()
-
-		return nil
-	}
-
-	cp.closed = true
-	idempotencyKey := cp.idempotencyKey
-	client := cp.client
-	cp.mu.Unlock()
-
-	return client.deallocate(ctx, idempotencyKey)
-}
-
 func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
+	return http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
 }
 
 func (c *Client) doJSON(req *http.Request, wantStatus int, out any) error {
@@ -342,16 +290,16 @@ func (c *Client) doJSON(req *http.Request, wantStatus int, out any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close() //nolint:errcheck // Best-effort close of HTTP response body.
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != wantStatus {
-		data, _ := io.ReadAll(resp.Body) //nolint:errcheck // Best-effort error body read.
+		data, _ := io.ReadAll(resp.Body) //nolint:errcheck
 
 		return fmt.Errorf("%s %s returned %d: %s", req.Method, req.URL.Path, resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 
 	if out == nil {
-		io.Copy(io.Discard, resp.Body) //nolint:errcheck // Best-effort drain of response body.
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 
 		return nil
 	}
@@ -359,8 +307,8 @@ func (c *Client) doJSON(req *http.Request, wantStatus int, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-func randomHex(bytesLen int) (string, error) {
-	b := make([]byte, bytesLen)
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}

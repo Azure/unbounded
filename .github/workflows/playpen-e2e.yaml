@@ -7,7 +7,7 @@ on:
   pull_request:
     paths:
       - cmd/playpen-operator/**
-      - cmd/playpen-runner/**
+      - cmd/playpen-endpoint/**
       - internal/playpen/**
       - deploy/playpen/**
       - images/playpen/**

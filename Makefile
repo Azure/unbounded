@@ -956,15 +956,9 @@ MACHINE_OPS_API_SERVER_ENDPOINT ?=
 MACHINE_OPS_MANIFEST_TEMPLATES_DIR := deploy/machine-ops
 MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
 PLAYPEN_NAMESPACE ?= playpen
-PLAYPEN_AMD64_RUNNERS ?= 2
-PLAYPEN_ARM64_RUNNERS ?= 2
-PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_START ?= 51820
-PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_END ?= 51899
-PLAYPEN_CONTROL_PLANE_COUNT ?= 1
-PLAYPEN_CONTROL_PLANE_VERSIONS ?= v1.33.0
-PLAYPEN_CONTROL_PLANE_IMAGE ?= rancher/k3s:{version}-k3s1
-PLAYPEN_CONTROL_PLANE_API_SERVER_HOST_PORT_START ?= 16443
-PLAYPEN_CONTROL_PLANE_API_SERVER_HOST_PORT_END ?= 16499
+PLAYPEN_ALLOCATION_TTL ?= 30m
+PLAYPEN_WIREGUARD_HOST_PORT_START ?= 51820
+PLAYPEN_WIREGUARD_HOST_PORT_END ?= 51899
 PLAYPEN_MANIFEST_TEMPLATES_DIR := deploy/playpen
 PLAYPEN_MANIFEST_RENDERED_DIR  := deploy/playpen/rendered
 
@@ -995,7 +989,7 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT)
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 
-playpen-manifests: ## Render playpen operator and runner manifests into deploy/playpen/rendered
+playpen-manifests: ## Render playpen KubeVirt allocator manifests into deploy/playpen/rendered
 	@mkdir -p $(PLAYPEN_MANIFEST_RENDERED_DIR)
 	@find $(PLAYPEN_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
 	$(GOCMD) run ./hack/cmd/render-manifests \
@@ -1003,15 +997,9 @@ playpen-manifests: ## Render playpen operator and runner manifests into deploy/p
 		--output-dir $(PLAYPEN_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(PLAYPEN_NAMESPACE) \
 		--set PlaypenImage=$(PLAYPEN_IMAGE) \
-		--set RunnerAMD64Count=$(PLAYPEN_AMD64_RUNNERS) \
-		--set RunnerARM64Count=$(PLAYPEN_ARM64_RUNNERS) \
-		--set RunnerWireGuardHostPortStart=$(PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_START) \
-		--set RunnerWireGuardHostPortEnd=$(PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_END) \
-		--set ControlPlaneCount=$(PLAYPEN_CONTROL_PLANE_COUNT) \
-		--set ControlPlaneVersions=$(PLAYPEN_CONTROL_PLANE_VERSIONS) \
-		--set ControlPlaneImage=$(PLAYPEN_CONTROL_PLANE_IMAGE) \
-		--set ControlPlaneAPIServerHostPortStart=$(PLAYPEN_CONTROL_PLANE_API_SERVER_HOST_PORT_START) \
-		--set ControlPlaneAPIServerHostPortEnd=$(PLAYPEN_CONTROL_PLANE_API_SERVER_HOST_PORT_END)
+		--set AllocationTTL=$(PLAYPEN_ALLOCATION_TTL) \
+		--set WireGuardHostPortStart=$(PLAYPEN_WIREGUARD_HOST_PORT_START) \
+		--set WireGuardHostPortEnd=$(PLAYPEN_WIREGUARD_HOST_PORT_END)
 	@echo "Rendered playpen manifests into $(PLAYPEN_MANIFEST_RENDERED_DIR) (image: $(PLAYPEN_IMAGE))"
 
 machina-run: machina ## Replace the in-cluster machina with a locally built binary

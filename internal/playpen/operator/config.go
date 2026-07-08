@@ -3,89 +3,56 @@
 
 package operator
 
-import (
-	"time"
-
-	"github.com/Azure/unbounded/internal/playpen/meta"
-	"github.com/Azure/unbounded/internal/playpen/runner"
-)
+import "time"
 
 const (
-	AnnotationClientWireGuardPublicKey = meta.AnnotationClientWireGuardPublicKey
-	AnnotationServerWireGuardPublicKey = meta.AnnotationServerWireGuardPublicKey
-	AnnotationRedfishCertPEM           = meta.AnnotationRedfishCertPEM
-	AnnotationIdempotencyKeyHash       = meta.AnnotationIdempotencyKeyHash
-	AnnotationRequestHash              = meta.AnnotationRequestHash
-	AnnotationClaimedAt                = meta.AnnotationClaimedAt
-	AnnotationControlPlaneKubeconfig   = meta.AnnotationControlPlaneKubeconfig
-	AnnotationControlPlaneGuestServer  = meta.AnnotationControlPlaneGuestServer
-
-	LabelAllocated         = meta.LabelAllocated
-	LabelArchitecture      = meta.LabelArchitecture
-	LabelResourceType      = meta.LabelResourceType
-	LabelKubernetesVersion = meta.LabelKubernetesVersion
-
-	ArchitectureAMD64 = meta.ArchitectureAMD64
-	ArchitectureARM64 = meta.ArchitectureARM64
-
-	ResourceTypeRunner       = meta.ResourceTypeRunner
-	ResourceTypeControlPlane = meta.ResourceTypeControlPlane
+	ArchitectureAMD64 = "amd64"
+	ArchitectureARM64 = "arm64"
 )
 
 type Config struct {
-	ListenAddr                         string
-	Namespace                          string
-	ServiceName                        string
-	TLSSecretName                      string
-	RunnerNamespace                    string
-	RunnerLabelSelector                string
-	RunnerImage                        string
-	RunnerImagePullPolicy              string
-	RunnerServiceAccountName           string
-	RunnerAMD64Count                   int
-	RunnerARM64Count                   int
-	RunnerWireGuardHostPortStart       int32
-	RunnerWireGuardHostPortEnd         int32
-	RunnerRequireKVM                   bool
-	RunnerControlPlaneToleration       bool
-	ControlPlaneCount                  int
-	ControlPlaneVersions               []string
-	ControlPlaneImage                  string
-	ControlPlaneServiceAccountName     string
-	ControlPlaneAPIServerHostPortStart int32
-	ControlPlaneAPIServerHostPortEnd   int32
-	PlaypenTTL                         time.Duration
-	ReconcileInterval                  time.Duration
-	Runner                             runner.Config
+	ListenAddr        string
+	Namespace         string
+	ServiceName       string
+	TLSSecretName     string
+	Image             string
+	ImagePullPolicy   string
+	ServiceAccount    string
+	AllocationTTL     time.Duration
+	ReconcileInterval time.Duration
+
+	WireGuardHostPortStart int32
+	WireGuardHostPortEnd   int32
+	EndpointListenPort     int
+	RedfishPort            int
+	VXLANPort              int
+	GuestCIDR              string
+	GuestDNS               []string
+	DefaultDiskSize        string
+	DefaultMemory          string
+	DefaultCPUs            int
 }
 
 func DefaultConfig() Config {
-	runnerCfg := runner.DefaultConfig()
-
 	return Config{
-		ListenAddr:                         ":8443",
-		Namespace:                          "playpen",
-		ServiceName:                        "playpen-operator",
-		TLSSecretName:                      "playpen-operator-tls",
-		RunnerNamespace:                    "playpen",
-		RunnerLabelSelector:                "app.kubernetes.io/name=playpen-runner",
-		RunnerImage:                        "ghcr.io/azure/playpen:latest",
-		RunnerImagePullPolicy:              "Always",
-		RunnerServiceAccountName:           "playpen-runner",
-		RunnerAMD64Count:                   1,
-		RunnerARM64Count:                   1,
-		RunnerWireGuardHostPortStart:       51820,
-		RunnerWireGuardHostPortEnd:         51899,
-		RunnerRequireKVM:                   true,
-		RunnerControlPlaneToleration:       false,
-		ControlPlaneCount:                  0,
-		ControlPlaneVersions:               []string{"v1.33.0"},
-		ControlPlaneImage:                  "rancher/k3s:{version}-k3s1",
-		ControlPlaneServiceAccountName:     "playpen-control-plane",
-		ControlPlaneAPIServerHostPortStart: 16443,
-		ControlPlaneAPIServerHostPortEnd:   16499,
-		PlaypenTTL:                         time.Hour,
-		ReconcileInterval:                  30 * time.Second,
-		Runner:                             runnerCfg,
+		ListenAddr:             ":8443",
+		Namespace:              "playpen",
+		ServiceName:            "playpen-operator",
+		TLSSecretName:          "playpen-operator-tls",
+		Image:                  "ghcr.io/azure/playpen:latest",
+		ImagePullPolicy:        "Always",
+		ServiceAccount:         "playpen-operator",
+		AllocationTTL:          30 * time.Minute,
+		ReconcileInterval:      30 * time.Second,
+		WireGuardHostPortStart: 51820,
+		WireGuardHostPortEnd:   51899,
+		EndpointListenPort:     51820,
+		RedfishPort:            8443,
+		VXLANPort:              4789,
+		GuestCIDR:              "192.168.200.0/24",
+		GuestDNS:               []string{"1.1.1.1", "8.8.8.8"},
+		DefaultDiskSize:        "40Gi",
+		DefaultMemory:          "2Gi",
+		DefaultCPUs:            2,
 	}
 }

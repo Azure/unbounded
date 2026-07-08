@@ -19,7 +19,7 @@ import (
 
 // StreamConsoleLogs asynchronously streams serial console logs into dst until
 // ctx is canceled or the stream fails. The returned channel receives one error.
-func (p *Playpen) StreamConsoleLogs(ctx context.Context, dst io.Writer) <-chan error {
+func (p *Allocation) StreamConsoleLogs(ctx context.Context, dst io.Writer) <-chan error {
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -31,7 +31,7 @@ func (p *Playpen) StreamConsoleLogs(ctx context.Context, dst io.Writer) <-chan e
 	return errCh
 }
 
-func (p *Playpen) streamConsoleLogs(ctx context.Context, dst io.Writer) error {
+func (p *Allocation) streamConsoleLogs(ctx context.Context, dst io.Writer) error {
 	if dst == nil {
 		return fmt.Errorf("writer is required")
 	}

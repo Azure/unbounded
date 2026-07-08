@@ -39,7 +39,7 @@ func TestStreamConsoleLogsAsync(t *testing.T) {
 
 	metadata := testAllocResponse()
 	metadata.Redfish["url"] = server.URL
-	p := &Playpen{Metadata: metadata}
+	p := &Allocation{Metadata: metadata}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()

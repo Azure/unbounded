@@ -30,35 +30,22 @@ spec:
             - --listen-addr=:8443
             - --namespace={{ default "playpen" .Namespace }}
             - --service-name=playpen-operator
-            - --runner-namespace={{ default "playpen" .Namespace }}
-            - --runner-label-selector=app.kubernetes.io/name=playpen-runner
-            - --runner-image={{ default (default "ghcr.io/azure/playpen:latest" .PlaypenImage) .RunnerImage }}
-            - --runner-image-pull-policy={{ default "Always" .RunnerImagePullPolicy }}
-            - --runner-service-account-name=playpen-runner
-            - --runner-amd64-count={{ default "2" .RunnerAMD64Count }}
-            - --runner-arm64-count={{ default "2" .RunnerARM64Count }}
-            - --runner-wireguard-host-port-start={{ default "51820" .RunnerWireGuardHostPortStart }}
-            - --runner-wireguard-host-port-end={{ default "51899" .RunnerWireGuardHostPortEnd }}
-            - --runner-require-kvm={{ default "true" .RunnerRequireKVM }}
-            - --runner-control-plane-tolerations={{ default "false" .RunnerControlPlaneTolerations }}
-            - --control-plane-count={{ default "1" .ControlPlaneCount }}
-            - --control-plane-versions={{ default "v1.33.0" .ControlPlaneVersions }}
-            - --control-plane-image={{ default "rancher/k3s:{version}-k3s1" .ControlPlaneImage }}
-            - --control-plane-service-account-name=playpen-control-plane
-            - --control-plane-apiserver-host-port-start={{ default "16443" .ControlPlaneAPIServerHostPortStart }}
-            - --control-plane-apiserver-host-port-end={{ default "16499" .ControlPlaneAPIServerHostPortEnd }}
-            - --playpen-ttl={{ default "1h" .PlaypenTTL }}
+            - --image={{ default "ghcr.io/azure/playpen:latest" .PlaypenImage }}
+            - --image-pull-policy={{ default "Always" .ImagePullPolicy }}
+            - --allocation-ttl={{ default "30m" .AllocationTTL }}
+            - --wireguard-host-port-start={{ default "51820" .WireGuardHostPortStart }}
+            - --wireguard-host-port-end={{ default "51899" .WireGuardHostPortEnd }}
           ports:
             - containerPort: 8443
               name: https
               protocol: TCP
           resources:
             requests:
-              cpu: 500m
-              memory: 1Gi
+              cpu: 100m
+              memory: 128Mi
             limits:
-              cpu: "4"
-              memory: 8Gi
+              cpu: "1"
+              memory: 512Mi
           livenessProbe:
             httpGet:
               path: /healthz
