@@ -332,8 +332,9 @@ spec:
                     default: PXE
                     description: |-
                       BootProtocol selects how metalman should trigger network boot for
-                      repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
-                      HTTP boot with a URL derived from the netboot image metadata.
+                      repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses UEFI HTTP boot:
+                      Redfish-capable machines receive a one-time HTTP boot URL, and DHCP
+                      HTTPClient firmware requests receive an absolute HTTP bootfile URL.
                     enum:
                     - PXE
                     - HTTP
@@ -396,10 +397,40 @@ spec:
                     type: array
                   image:
                     description: |-
-                      Image is an OCI image reference containing the machine disk image.
-                      The image must contain /disk/disk.img.gz.
+                      Image is an OCI image reference containing machine install artifacts.
+                      Raw installs require /disk/disk.img.gz. RAID1 installs require
+                      /disk/rootfs.tar.zst and /disk/esp.tar.zst.
                       Example: "ghcr.io/azure/host-ubuntu2404:v1"
                     type: string
+                  install:
+                    description: |-
+                      Install configures how the PXE installer writes the machine image.
+                      When omitted, the installer uses the legacy raw disk image flow.
+                    properties:
+                      mode:
+                        default: Raw
+                        description: |-
+                          Mode selects the install workflow used by the PXE initrd.
+                          Raw writes /disk/disk.img.gz directly to one disk. RAID1 creates a
+                          mirrored root disk from rootfs and ESP tarball machine artifacts.
+                        enum:
+                        - Raw
+                        - RAID1
+                        type: string
+                      targetDisks:
+                        description: |-
+                          TargetDisks are explicit whole-disk device paths used by the selected
+                          install mode. RAID1 requires exactly two paths. Raw uses the first path
+                          when set and otherwise falls back to targetDisk or automatic selection.
+                          Examples: /dev/nvme0n1, /dev/sda, /dev/disk/by-id/...
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                    x-kubernetes-validations:
+                    - message: RAID1 install requires exactly two targetDisks
+                      rule: '!has(self.mode) || self.mode != ''RAID1'' || (has(self.targetDisks)
+                        && size(self.targetDisks) == 2)'
                   netbootImage:
                     description: |-
                       NetbootImage is an OCI image reference containing the PXE boot

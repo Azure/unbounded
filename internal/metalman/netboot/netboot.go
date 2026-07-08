@@ -219,6 +219,12 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 		}
 
 		if node != nil {
+			if path == "grub/grub.cfg" && repavePending(node) && node.Spec.PXE != nil {
+				if err := node.Spec.PXE.ValidateInstall(); err != nil {
+					return nil, fmt.Errorf("invalid PXE install config: %w", err)
+				}
+			}
+
 			ci := f.Cluster.ClusterInfo()
 
 			agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
@@ -256,6 +262,21 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 
 	// Static file - serve from disk
 	return &ResolvedFile{DiskPath: diskPath}, nil
+}
+
+func repavePending(node *v1alpha3.Machine) bool {
+	if node == nil || node.Spec.Operations == nil {
+		return false
+	}
+
+	var statusRepave int64
+
+	specRepave := node.Spec.Operations.RepaveCounter
+	if node.Status.Operations != nil {
+		statusRepave = node.Status.Operations.RepaveCounter
+	}
+
+	return specRepave > statusRepave
 }
 
 func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v1alpha3.Machine) ([]byte, bool, error) {
@@ -301,6 +322,8 @@ type templateData struct {
 	AgentConfigJSON     string
 	InstallScript       string
 	InstallEnv          []string
+	InstallMode         string
+	InstallKernelArgs   []string
 	SpecRepaveCounter   int64
 	StatusRepaveCounter int64
 }
@@ -311,10 +334,12 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 	var (
 		agent     *v1alpha3.AgentSpec
 		bootLease *v1alpha3.DHCPLease
+		pxe       *v1alpha3.PXESpec
 	)
 
 	if node != nil {
 		agent = node.Spec.Agent
+		pxe = node.Spec.PXE
 		bootLease = selectBootLease(node, requestIP)
 
 		if node.Spec.Operations != nil {
@@ -334,9 +359,30 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 		AgentConfigJSON:     agentConfigJSON,
 		InstallScript:       provision.UnboundedAgentInstallScript(),
 		InstallEnv:          provision.AgentInstallEnv(agent),
+		InstallMode:         pxe.TargetInstallMode(),
+		InstallKernelArgs:   installKernelArgs(pxe),
 		SpecRepaveCounter:   specRepave,
 		StatusRepaveCounter: statusRepave,
 	}
+}
+
+func installKernelArgs(pxe *v1alpha3.PXESpec) []string {
+	mode := pxe.TargetInstallMode()
+	args := []string{fmt.Sprintf("unbounded.install_mode=%s", mode)}
+	disks := pxe.InstallTargetDisks()
+
+	switch mode {
+	case v1alpha3.PXEInstallModeRAID1:
+		for i, disk := range disks {
+			args = append(args, fmt.Sprintf("unbounded.disk%d=%s", i, disk))
+		}
+	default:
+		if len(disks) > 0 {
+			args = append(args, fmt.Sprintf("unbounded.disk=%s", disks[0]))
+		}
+	}
+
+	return args
 }
 
 func selectBootLease(node *v1alpha3.Machine, requestIP string) *v1alpha3.DHCPLease {

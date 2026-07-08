@@ -11,9 +11,11 @@ on:
       - internal/metalman/**
       - api/machina/v1alpha3/**
       - deploy/machina/crd/**
+      - hack/smoke-metalman.py
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
+      - .github/workflows/smoke-metalman.yaml
   push:
     branches: [main]
     paths:
@@ -22,9 +24,11 @@ on:
       - internal/metalman/**
       - api/machina/v1alpha3/**
       - deploy/machina/crd/**
+      - hack/smoke-metalman.py
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
+      - .github/workflows/smoke-metalman.yaml
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
@@ -34,8 +38,22 @@ permissions:
 
 jobs:
   smoke:
+    name: smoke (${{ matrix.install-mode }}, ${{ matrix.boot-protocol }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - install-mode: Raw
+            boot-protocol: PXE
+          - install-mode: RAID1
+            boot-protocol: PXE
+          - install-mode: RAID1
+            boot-protocol: HTTP
+    env:
+      SMOKE_INSTALL_MODE: ${{ matrix.install-mode }}
+      SMOKE_BOOT_PROTOCOL: ${{ matrix.boot-protocol }}
     steps:
       - name: Free disk space
         run: |
@@ -82,6 +100,16 @@ jobs:
             dnsmasq qemu-kvm libvirt-daemon-system libvirt-clients virtinst \
             ovmf qemu-utils swtpm swtpm-tools \
             python3-pip python3-yaml cpio iptables
+          EXTRA_PKGS=()
+          if [ "${SMOKE_INSTALL_MODE}" = "RAID1" ] || [ "${SMOKE_BOOT_PROTOCOL}" = "HTTP" ]; then
+            EXTRA_PKGS+=(libguestfs-tools)
+          fi
+          if [ "${SMOKE_INSTALL_MODE}" = "RAID1" ]; then
+            EXTRA_PKGS+=(zstd)
+          fi
+          if [ "${#EXTRA_PKGS[@]}" -gt 0 ]; then
+            sudo apt-get install -y --no-install-recommends "${EXTRA_PKGS[@]}"
+          fi
           sudo systemctl start libvirtd
           wait "$PIP_PID"
 

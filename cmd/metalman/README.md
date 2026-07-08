@@ -187,7 +187,7 @@ metadata:
 spec:
   pxe:
     image: ghcr.io/azure/host-ubuntu2404:v1
-    # Defaults to PXE. Set to HTTP to use Redfish UEFI HTTP boot.
+    # Defaults to PXE. Set to HTTP to use UEFI HTTP boot.
     bootProtocol: PXE
     # Optional. Recommended when the host has multiple disks.
     targetDisk: /dev/disk/by-id/example-os-disk

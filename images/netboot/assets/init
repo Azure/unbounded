@@ -1,8 +1,8 @@
 #!/bin/sh
 # Unbounded Metal installer initrd /init script.
 # Overlaid on top of the Ubuntu netboot initrd via a second cpio archive.
-# Downloads a compressed raw disk image over HTTP, writes it to disk,
-# injects cloud-init datasource configuration, and reboots.
+# Installs a machine image to local disks, injects cloud-init datasource
+# configuration, disables PXE, and reboots.
 
 set -e
 
@@ -15,9 +15,18 @@ mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 exec >/dev/kmsg 2>&1
 
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
 
-log() { echo "unbounded-metal: $*"; }
-fatal() { log "FATAL: $*"; exec sh; }
+log() {
+    msg="unbounded-metal: $*"
+    echo "$msg" >/dev/kmsg 2>/dev/null || true
+    echo "$msg" >/dev/console 2>/dev/null || true
+}
+
+fatal() {
+    log "FATAL: $*"
+    exec sh </dev/console >/dev/console 2>&1
+}
 
 retry() {
     local n="$1" delay="$2" desc="$3" i
@@ -31,6 +40,23 @@ retry() {
         log "$desc failed (attempt $i/$n), retrying in ${delay}s"
         sleep "$delay"
     done
+}
+
+run_logged() {
+    desc="$1"
+    shift
+    log_file="/tmp/unbounded-metal-command.log"
+    log "starting: $desc"
+    if "$@" >"$log_file" 2>&1; then
+        rm -f "$log_file"
+    else
+        log "output from failed command:"
+        while IFS= read -r line; do
+            log "  $line"
+        done <"$log_file"
+        fatal "failed: $desc"
+    fi
+    log "completed: $desc"
 }
 
 log "installer starting"
@@ -77,23 +103,169 @@ log_disks() {
         esac
         size=$(cat "$disk/size" 2>/dev/null || echo 0)
         model=$(cat "$disk/device/model" 2>/dev/null || true)
-        serial=$(cat "$disk/device/serial" 2>/dev/null || true)
+        serial=$(cat "$disk/serial" 2>/dev/null || cat "$disk/device/serial" 2>/dev/null || true)
         removable=$(cat "$disk/removable" 2>/dev/null || true)
         log "  /dev/$(basename "$disk") sectors=$size model=${model:-unknown} serial=${serial:-unknown} removable=${removable:-unknown}"
     done
 }
 
 target_disk_sysfs() {
-    base=$(basename "$TARGET_DISK")
+    disk="$1"
+    base=$(basename "$disk")
     sysdisk=$(readlink -f "/sys/class/block/$base" 2>/dev/null || true)
     if [ -z "$sysdisk" ]; then
         sysdisk="/sys/block/$base"
     fi
 
     [ -d "$sysdisk" ] || return 1
-    [ ! -e "$sysdisk/partition" ] || fatal "target disk $TARGET_DISK is a partition, expected whole disk"
+    [ ! -e "$sysdisk/partition" ] || fatal "target disk $disk is a partition, expected whole disk"
 
     echo "$sysdisk"
+}
+
+normalize_disk_id() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]' '_'
+}
+
+disk_id_candidate_matches() {
+    wanted="$1"
+    candidate="$2"
+    candidate_id=$(normalize_disk_id "$candidate")
+    [ -n "$candidate_id" ] || return 1
+    [ "$wanted" = "$candidate_id" ]
+}
+
+disk_id_matches_prefixed_value() {
+    wanted="$1"
+    value="$2"
+    shift 2
+    value_id=$(normalize_disk_id "$value")
+    [ -n "$value_id" ] || return 1
+
+    for prefix in "$@"; do
+        disk_id_candidate_matches "$wanted" "${prefix}_${value_id}" && return 0
+    done
+
+    return 1
+}
+
+disk_id_matches_wwid() {
+    wanted="$1"
+    value="$2"
+    value_id=$(normalize_disk_id "$value")
+    [ -n "$value_id" ] || return 1
+
+    disk_id_candidate_matches "$wanted" "wwn_${value_id}" && return 0
+    disk_id_candidate_matches "$wanted" "scsi_${value_id}" && return 0
+    disk_id_candidate_matches "$wanted" "nvme_${value_id}" && return 0
+
+    case "$value_id" in
+        0x*) ;;
+        *) disk_id_candidate_matches "$wanted" "wwn_0x${value_id}" && return 0 ;;
+    esac
+
+    return 1
+}
+
+disk_identity_matches() {
+    wanted="$1"
+    sysdisk="$2"
+
+    for attr in "$sysdisk/serial" "$sysdisk/device/serial"; do
+        [ -r "$attr" ] || continue
+        value=$(cat "$attr" 2>/dev/null || true)
+        disk_id_matches_prefixed_value "$wanted" "$value" virtio ata scsi nvme usb \
+            && return 0
+    done
+
+    for attr in "$sysdisk/wwid" "$sysdisk/device/wwid"; do
+        [ -r "$attr" ] || continue
+        value=$(cat "$attr" 2>/dev/null || true)
+        disk_id_matches_wwid "$wanted" "$value" && return 0
+    done
+
+    for attr in "$sysdisk/device/eui"; do
+        [ -r "$attr" ] || continue
+        value=$(cat "$attr" 2>/dev/null || true)
+        disk_id_matches_prefixed_value "$wanted" "$value" nvme_eui eui && return 0
+    done
+
+    for attr in "$sysdisk/device/nguid"; do
+        [ -r "$attr" ] || continue
+        value=$(cat "$attr" 2>/dev/null || true)
+        disk_id_matches_prefixed_value "$wanted" "$value" nvme_nguid nguid && return 0
+    done
+
+    model=$(cat "$sysdisk/device/model" 2>/dev/null || true)
+    serial=$(cat "$sysdisk/serial" 2>/dev/null || cat "$sysdisk/device/serial" 2>/dev/null || true)
+    if [ -n "$model" ] && [ -n "$serial" ]; then
+        disk_id_matches_prefixed_value "$wanted" "${model}_${serial}" ata scsi nvme usb \
+            && return 0
+    fi
+
+    return 1
+}
+
+resolve_disk_by_id_path() {
+    path="$1"
+    wanted=$(normalize_disk_id "$(basename "$path")")
+    DISK_BY_ID_RESOLVED=""
+    matches=""
+    count=0
+
+    for sysdisk in /sys/block/sd* /sys/block/nvme*n* /sys/block/vd*; do
+        [ -e "$sysdisk" ] || continue
+        [ ! -e "$sysdisk/partition" ] || continue
+        base=$(basename "$sysdisk")
+        [ -b "/dev/$base" ] || continue
+
+        if disk_identity_matches "$wanted" "$sysdisk"; then
+            count=$((count + 1))
+            DISK_BY_ID_RESOLVED="/dev/$base"
+            matches="${matches} /dev/$base"
+        fi
+    done
+
+    case "$count" in
+        0) return 1 ;;
+        1) return 0 ;;
+        *) fatal "target disk $path matched multiple disks:${matches}" ;;
+    esac
+}
+
+resolve_whole_disk() {
+    disk="$1"
+    RESOLVED_DISK=""
+    [ -n "$disk" ] || return 1
+    resolved="$disk"
+
+    if [ ! -e "$resolved" ]; then
+        case "$disk" in
+            /dev/disk/by-id/*)
+                if resolve_disk_by_id_path "$disk"; then
+                    resolved="$DISK_BY_ID_RESOLVED"
+                    log "resolved $disk to $resolved from sysfs identity"
+                fi
+                ;;
+        esac
+    fi
+
+    [ -e "$resolved" ] || return 1
+
+    resolved=$(readlink -f "$resolved" 2>/dev/null || echo "$resolved")
+    [ -b "$resolved" ] || fatal "target disk $disk is not a block device"
+    sysdisk=$(target_disk_sysfs "$resolved") || fatal "target disk $disk does not exist in sysfs"
+
+    removable=$(cat "$sysdisk/removable" 2>/dev/null || echo 0)
+    [ "$removable" = "0" ] || fatal "target disk $disk is removable"
+
+    RESOLVED_DISK="$resolved"
+}
+
+resolve_required_whole_disk() {
+    disk="$1"
+    retry 30 1 "resolve target disk $disk" resolve_whole_disk "$disk" \
+        || fatal "target disk $disk does not exist"
 }
 
 partition_number() {
@@ -101,8 +273,430 @@ partition_number() {
     cat "/sys/class/block/$part/partition" 2>/dev/null || true
 }
 
+parts_for_disk() {
+    sysdisk=$(target_disk_sysfs "$1") || return 0
+    for p in "$sysdisk"/*; do
+        [ -e "$p" ] || continue
+        [ -e "$p/partition" ] || continue
+        echo "/dev/$(basename "$p")"
+    done
+}
+
+part_path() {
+    disk="$1"
+    number="$2"
+    case "$disk" in
+        /dev/nvme*n*|/dev/mmcblk*|/dev/loop*) echo "${disk}p${number}" ;;
+        *) echo "${disk}${number}" ;;
+    esac
+}
+
+block_exists() {
+    [ -b "$1" ]
+}
+
+download_file() {
+    url="$1"
+    dest="$2"
+    wget -q -O "$dest" "$url"
+}
+
+extract_tar_zst() {
+    archive="$1"
+    dest="$2"
+    zstd -dc "$archive" | tar -xpf - -C "$dest"
+}
+
+efi_loader_candidates() {
+    cat <<EOF
+/EFI/BOOT/BOOTX64.EFI
+/EFI/BOOT/BOOTAA64.EFI
+/EFI/ubuntu/shimx64.efi
+/EFI/ubuntu/shimaa64.efi
+/EFI/ubuntu/grubx64.efi
+/EFI/ubuntu/grubaa64.efi
+EOF
+}
+
+find_loader_in_mount() {
+    root="$1"
+    for candidate in $(efi_loader_candidates); do
+        if [ -f "${root}${candidate}" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+configure_cloud_init() {
+    root="$1"
+    [ -n "$DS_URL" ] || return 0
+
+    log "injecting cloud-init datasource: $DS_URL"
+    mkdir -p "$root/etc/cloud/cloud.cfg.d" "$root/etc/unbounded-metal"
+    cat > "$root/etc/cloud/cloud.cfg.d/99-unbounded-metal.cfg" <<CLOUDINIT
+datasource_list: [NoCloud]
+datasource:
+  NoCloud:
+    seedfrom: ${DS_URL}
+CLOUDINIT
+    rm -f "$root/etc/cloud/cloud-init.disabled"
+    cat > "$root/etc/unbounded-metal/config" <<UMCONFIG
+SERVE_URL=${SERVE_URL}
+NODE_NAME=${NODE_NAME}
+NODE_NAMESPACE=${NODE_NAMESPACE}
+APISERVER_URL=${APISERVER_URL}
+UMCONFIG
+}
+
+mount_chroot_filesystems() {
+    mkdir -p /mnt/dev /mnt/proc /mnt/sys /mnt/run
+    mountpoint -q /mnt/dev 2>/dev/null || mount -n --rbind /dev /mnt/dev
+    mountpoint -q /mnt/proc 2>/dev/null || mount -n -t proc proc /mnt/proc
+    mountpoint -q /mnt/sys 2>/dev/null || mount -n --rbind /sys /mnt/sys
+    mountpoint -q /mnt/run 2>/dev/null || mount -n --bind /run /mnt/run
+}
+
+umount_chroot_filesystems() {
+    umount -l /mnt/run 2>/dev/null || true
+    umount -l /mnt/sys 2>/dev/null || true
+    umount -l /mnt/proc 2>/dev/null || true
+    umount -l /mnt/dev 2>/dev/null || true
+}
+
+grub_target() {
+    case "$(uname -m)" in
+        x86_64) echo "x86_64-efi" ;;
+        aarch64|arm64) echo "arm64-efi" ;;
+        *) echo "" ;;
+    esac
+}
+
+write_esp_grub_config() {
+    root_uuid="$1"
+    esp_root="$2"
+
+    [ -n "$root_uuid" ] || fatal "root UUID is required for ESP GRUB config"
+    mkdir -p "$esp_root/EFI/ubuntu" "$esp_root/EFI/BOOT" "$esp_root/unbounded"
+    {
+        echo "insmod part_gpt"
+        echo "insmod fat"
+        echo "insmod gzio"
+        echo "insmod linux"
+        echo "search --no-floppy --file --set=root /unbounded/vmlinuz"
+        echo "linux /unbounded/vmlinuz root=UUID=${root_uuid} ro console=tty1 console=ttyS0"
+        echo "initrd /unbounded/initrd.img"
+        echo "boot"
+    } > "$esp_root/unbounded/grub.cfg"
+    cp "$esp_root/unbounded/grub.cfg" "$esp_root/EFI/ubuntu/grub.cfg"
+    cp "$esp_root/EFI/ubuntu/grub.cfg" "$esp_root/EFI/BOOT/grub.cfg"
+}
+
+copy_grub_modules() {
+    target="$1"
+    src="/mnt/usr/lib/grub/$target"
+    dest="/mnt/boot/grub/$target"
+
+    [ -d "$src" ] || fatal "host image does not contain GRUB modules for $target"
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    run_logged "copying GRUB modules for $target" cp -a "$src/." "$dest/"
+}
+
+copy_esp_boot_artifacts() {
+    esp_root="$1"
+
+    [ -f /mnt/boot/vmlinuz ] || fatal "host image does not contain /boot/vmlinuz"
+    [ -f /mnt/boot/initrd.img ] || fatal "host image does not contain /boot/initrd.img"
+    mkdir -p "$esp_root/unbounded"
+    run_logged "copying kernel to ESP" cp -L /mnt/boot/vmlinuz "$esp_root/unbounded/vmlinuz"
+    run_logged "copying initramfs to ESP" cp -L /mnt/boot/initrd.img "$esp_root/unbounded/initrd.img"
+}
+
+refresh_host_boot() {
+    esp0="$1"
+    esp1="$2"
+    root_uuid="$3"
+
+    mount_chroot_filesystems
+    mkdir -p /mnt/boot/efi /mnt/boot/grub
+    run_logged "mounting primary ESP $esp0 for host boot refresh" \
+        mount -n "$esp0" /mnt/boot/efi
+
+    [ -x /mnt/usr/sbin/update-initramfs ] \
+        || fatal "RAID1 host image must contain update-initramfs"
+    run_logged "refreshing host initramfs" \
+        chroot /mnt /usr/sbin/update-initramfs -u -k all
+
+    [ -x /mnt/usr/sbin/update-grub ] \
+        || fatal "RAID1 host image must contain update-grub"
+    run_logged "refreshing host GRUB config" \
+        chroot /mnt /usr/sbin/update-grub
+
+    target=$(grub_target)
+    [ -n "$target" ] || fatal "unsupported architecture for grub-install: $(uname -m)"
+    [ -x /mnt/usr/sbin/grub-install ] \
+        || fatal "RAID1 host image must contain grub-install"
+    copy_grub_modules "$target"
+
+    for esp in "$esp0" "$esp1"; do
+        if [ "$esp" != "$esp0" ]; then
+            umount /mnt/boot/efi 2>/dev/null || true
+            run_logged "mounting ESP $esp for boot refresh" mount -n "$esp" /mnt/boot/efi
+        fi
+
+        run_logged "installing GRUB fallback loader on $esp" \
+            chroot /mnt /usr/sbin/grub-install \
+            --target="$target" \
+            --efi-directory=/boot/efi \
+            --bootloader-id=ubuntu \
+            --modules="part_gpt fat ext2 mdraid1x diskfilter search search_fs_uuid normal configfile linux gzio" \
+            --no-nvram \
+            --removable
+
+        copy_esp_boot_artifacts /mnt/boot/efi
+        write_esp_grub_config "$root_uuid" /mnt/boot/efi
+        find_loader_in_mount /mnt/boot/efi >/dev/null \
+            || fatal "ESP $esp does not contain a known EFI loader"
+        sync
+        umount /mnt/boot/efi
+    done
+
+    umount_chroot_filesystems
+}
+
+find_root_part() {
+    disk="$1"
+    ROOT_PART=""
+    for part in $(parts_for_disk "$disk"); do
+        if mount -n "$part" /mnt 2>/dev/null; then
+            if [ -d /mnt/etc ] && [ -d /mnt/var ]; then
+                ROOT_PART="$part"
+                umount /mnt
+                return 0
+            fi
+            umount /mnt
+        fi
+    done
+    return 1
+}
+
+install_raw() {
+    [ -n "$IMAGE_URL" ] || fatal "unbounded.image_url not set"
+
+    if [ -z "$TARGET_DISK" ] && [ -n "$TARGET_DISK0" ]; then
+        TARGET_DISK="$TARGET_DISK0"
+    fi
+
+    if [ -z "$TARGET_DISK" ]; then
+        log "waiting for block devices"
+        find_disk() {
+            TARGET_DISK=""
+            MAX_SIZE=0
+            for disk in /sys/block/sd* /sys/block/nvme*n* /sys/block/vd*; do
+                [ -e "$disk" ] || continue
+                [ -e "$disk/partition" ] && continue
+                SIZE=$(cat "$disk/size" 2>/dev/null || echo 0)
+                if [ "$SIZE" -gt "$MAX_SIZE" ]; then
+                    MAX_SIZE=$SIZE
+                    TARGET_DISK="/dev/$(basename "$disk")"
+                fi
+            done
+            [ -n "$TARGET_DISK" ]
+        }
+        log_disks
+        retry 30 1 "find block device" find_disk || fatal "no target disk found"
+        log "WARNING: target disk was not specified, selected largest disk"
+    fi
+
+    resolve_required_whole_disk "$TARGET_DISK"
+    TARGET_DISK="$RESOLVED_DISK"
+    UEFI_DISKS="$TARGET_DISK"
+    log "target disk: $TARGET_DISK"
+
+    log "downloading disk image from $IMAGE_URL"
+    retry 120 5 "download disk image" download_file "$IMAGE_URL" /tmp/disk.img.gz \
+        || fatal "failed to download disk image"
+
+    log "writing disk image to $TARGET_DISK"
+    write_image() { gunzip -c /tmp/disk.img.gz | dd of="$TARGET_DISK" bs=4194304; }
+    retry 3 5 "write disk image" write_image || fatal "failed to write disk image"
+    rm -f /tmp/disk.img.gz
+    sync
+
+    retry 5 2 "re-read partition table" blockdev --rereadpt "$TARGET_DISK" \
+        || log "WARNING: could not re-read partition table"
+    sleep 2
+
+    if [ -n "$DS_URL" ]; then
+        retry 20 2 "find root partition" find_root_part "$TARGET_DISK" \
+            || fatal "no root partition found on $TARGET_DISK"
+        retry 5 2 "mount $ROOT_PART" mount -n "$ROOT_PART" /mnt \
+            || fatal "failed to mount $ROOT_PART"
+        configure_cloud_init /mnt
+        sync
+        umount /mnt
+        log "cloud-init configured on $ROOT_PART"
+    fi
+}
+
+prepare_raid_disk() {
+    disk="$1"
+    log "partitioning $disk for RAID1 install"
+    sgdisk --zap-all "$disk"
+    sgdisk \
+        -n 1:1MiB:+1024MiB -t 1:ef00 -c 1:unbounded-efi \
+        -n 2:0:0 -t 2:fd00 -c 2:unbounded-root \
+        "$disk"
+    partprobe "$disk" 2>/dev/null || blockdev --rereadpt "$disk" \
+        || log "WARNING: could not re-read partition table on $disk"
+}
+
+install_raid1() {
+    [ -n "$SERVE_URL" ] || fatal "unbounded.serve_url is required for RAID1 install"
+    [ -n "$TARGET_DISK0" ] || fatal "RAID1 install requires unbounded.disk0"
+    [ -n "$TARGET_DISK1" ] || fatal "RAID1 install requires unbounded.disk1"
+
+    resolve_required_whole_disk "$TARGET_DISK0"
+    DISK0="$RESOLVED_DISK"
+    resolve_required_whole_disk "$TARGET_DISK1"
+    DISK1="$RESOLVED_DISK"
+    [ "$DISK0" != "$DISK1" ] || fatal "RAID1 install requires two distinct disks"
+
+    UEFI_DISKS="$DISK0 $DISK1"
+    log_disks
+    log "target disks: $DISK0 $DISK1"
+
+    machine_url="${SERVE_URL%/}/machine"
+    log "downloading rootfs from ${machine_url}/rootfs.tar.zst"
+    retry 120 5 "download rootfs" download_file "${machine_url}/rootfs.tar.zst" /tmp/rootfs.tar.zst \
+        || fatal "failed to download rootfs.tar.zst"
+    log "downloading ESP from ${machine_url}/esp.tar.zst"
+    retry 120 5 "download ESP" download_file "${machine_url}/esp.tar.zst" /tmp/esp.tar.zst \
+        || fatal "failed to download esp.tar.zst"
+
+    for disk in "$DISK0" "$DISK1"; do
+        prepare_raid_disk "$disk"
+    done
+    sleep 2
+
+    ESP0=$(part_path "$DISK0" 1)
+    ROOT0=$(part_path "$DISK0" 2)
+    ESP1=$(part_path "$DISK1" 1)
+    ROOT1=$(part_path "$DISK1" 2)
+    retry 30 1 "wait for $ESP0" block_exists "$ESP0" || fatal "$ESP0 did not appear"
+    retry 30 1 "wait for $ROOT0" block_exists "$ROOT0" || fatal "$ROOT0 did not appear"
+    retry 30 1 "wait for $ESP1" block_exists "$ESP1" || fatal "$ESP1 did not appear"
+    retry 30 1 "wait for $ROOT1" block_exists "$ROOT1" || fatal "$ROOT1 did not appear"
+
+    mdadm --stop /dev/md/unbounded-root 2>/dev/null || true
+    mdadm --zero-superblock --force "$ROOT0" "$ROOT1" 2>/dev/null || true
+
+    mkdir -p /dev/md
+    log "creating RAID1 array /dev/md/unbounded-root"
+    mdadm --create /dev/md/unbounded-root \
+        --metadata=1.2 \
+        --level=1 \
+        --raid-devices=2 \
+        --force \
+        "$ROOT0" "$ROOT1" \
+        --run \
+        || fatal "failed to create RAID1 array"
+    retry 30 1 "wait for RAID array" block_exists /dev/md/unbounded-root \
+        || fatal "/dev/md/unbounded-root did not appear"
+
+    run_logged "formatting RAID root filesystem" mkfs.ext4 -F -L unbounded-root /dev/md/unbounded-root
+    run_logged "formatting primary ESP $ESP0" mkfs.vfat -F 32 -n UBNDEFI0 "$ESP0"
+    run_logged "formatting secondary ESP $ESP1" mkfs.vfat -F 32 -n UBNDEFI1 "$ESP1"
+
+    run_logged "mounting RAID root filesystem" mount -n /dev/md/unbounded-root /mnt
+    log "extracting rootfs"
+    extract_tar_zst /tmp/rootfs.tar.zst /mnt || fatal "failed to extract rootfs"
+
+    mkdir -p /mnt/boot/efi /mnt/boot/efi-secondary
+    run_logged "mounting primary ESP $ESP0" mount -n "$ESP0" /mnt/boot/efi
+    log "extracting ESP to $ESP0"
+    extract_tar_zst /tmp/esp.tar.zst /mnt/boot/efi || fatal "failed to extract ESP to $ESP0"
+    umount /mnt/boot/efi
+
+    run_logged "mounting secondary ESP $ESP1" mount -n "$ESP1" /mnt/boot/efi-secondary
+    log "extracting ESP to $ESP1"
+    extract_tar_zst /tmp/esp.tar.zst /mnt/boot/efi-secondary || fatal "failed to extract ESP to $ESP1"
+    umount /mnt/boot/efi-secondary
+
+    mkdir -p /mnt/etc/mdadm
+    mdadm --detail --scan > /mnt/etc/mdadm/mdadm.conf
+
+    ROOT_UUID=$(blkid -s UUID -o value /dev/md/unbounded-root)
+    ESP0_UUID=$(blkid -s UUID -o value "$ESP0")
+    ESP1_UUID=$(blkid -s UUID -o value "$ESP1")
+    [ -n "$ROOT_UUID" ] || fatal "could not read RAID root UUID"
+    [ -n "$ESP0_UUID" ] || fatal "could not read primary ESP UUID"
+    [ -n "$ESP1_UUID" ] || fatal "could not read secondary ESP UUID"
+
+    if [ -f /mnt/etc/fstab ]; then
+        cp /mnt/etc/fstab /mnt/etc/fstab.unbounded.bak
+    fi
+    cat > /mnt/etc/fstab <<FSTAB
+UUID=${ROOT_UUID} / ext4 defaults 0 1
+UUID=${ESP0_UUID} /boot/efi vfat umask=0077 0 1
+UUID=${ESP1_UUID} /boot/efi-secondary vfat noauto,umask=0077 0 0
+FSTAB
+
+    configure_cloud_init /mnt
+    refresh_host_boot "$ESP0" "$ESP1" "$ROOT_UUID"
+    sync
+
+    umount /mnt 2>/dev/null || true
+    rm -f /tmp/rootfs.tar.zst /tmp/esp.tar.zst
+}
+
+create_uefi_boot_entries() {
+    [ -n "$UEFI_DISKS" ] || return 0
+    [ -d /sys/firmware/efi ] || return 0
+
+    log "creating UEFI boot entries for local disks"
+    if ! mountpoint -q /sys/firmware/efi/efivars 2>/dev/null; then
+        mount -n -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null || true
+    fi
+
+    for disk in $UEFI_DISKS; do
+        for part in $(parts_for_disk "$disk"); do
+            if mount -n -t vfat "$part" /mnt/esp 2>/dev/null; then
+                LOADER=$(find_loader_in_mount /mnt/esp || true)
+                umount /mnt/esp
+
+                if [ -n "$LOADER" ] && command -v efibootmgr >/dev/null 2>&1; then
+                    ESP_NUM=$(partition_number "$part")
+                    if [ -n "$ESP_NUM" ]; then
+                        LOADER_EFI=$(echo "$LOADER" | tr '/' '\\')
+                        efibootmgr --create --disk "$disk" --part "$ESP_NUM" \
+                            --loader "$LOADER_EFI" --label "unbounded" 2>&1 \
+                            && log "UEFI boot entry created (${LOADER} on $disk part ${ESP_NUM})" \
+                            || log "WARNING: efibootmgr failed, PXE chainloader will be used as fallback"
+                        break
+                    fi
+                fi
+            fi
+        done
+    done
+}
+
+disable_pxe() {
+    [ -n "$SERVE_URL" ] || return 0
+
+    log "disabling PXE boot"
+    retry 5 2 "disable PXE" wget -q -O /dev/null "$SERVE_URL/pxe/disable" \
+        || log "WARNING: failed to disable PXE boot"
+}
+
 KVER=$(uname -r)
 for mod in virtio_pci virtio_blk ahci sd_mod nvme xfs ext4; do
+    modprobe "$mod" 2>/dev/null || true
+done
+for mod in md_mod raid1 linear multipath; do
     modprobe "$mod" 2>/dev/null || true
 done
 for mod in virtio_net e1000 e1000e igb ixgbe i40e ice mlx5_core mlx4_core bnxt_en tg3 be2net ena; do
@@ -119,15 +713,27 @@ for mod in nls_cp437 nls_ascii nls_utf8 fat vfat efivarfs; do
     modprobe "$mod" 2>/dev/null || true
 done
 
-IMAGE_URL=$(get_param unbounded.image_url) || fatal "unbounded.image_url not set"
+IMAGE_URL=$(get_param unbounded.image_url || true)
 SERVE_URL=$(get_param unbounded.serve_url || true)
+INSTALL_MODE=$(get_param unbounded.install_mode || echo Raw)
 TARGET_DISK=$(get_param unbounded.disk || true)
+TARGET_DISK0=$(get_param unbounded.disk0 || true)
+TARGET_DISK1=$(get_param unbounded.disk1 || true)
 BOOT_MAC=$(get_param unbounded.boot_mac || true)
 BOOTIF=$(get_param BOOTIF || true)
 DS_URL=$(get_param unbounded.ds_url || true)
 NODE_NAME=$(get_param unbounded.node_name || true)
 NODE_NAMESPACE=$(get_param unbounded.node_namespace || true)
 APISERVER_URL=$(get_param unbounded.apiserver_url || true)
+UEFI_DISKS=""
+
+case "$INSTALL_MODE" in
+    ""|Raw|raw|RAW) INSTALL_MODE=Raw ;;
+    RAID1|raid1|Raid1) INSTALL_MODE=RAID1 ;;
+    *) fatal "unsupported install mode $INSTALL_MODE" ;;
+esac
+log "install mode: $INSTALL_MODE"
+
 BOOT_MAC=$(normalize_mac "$BOOT_MAC")
 if [ -z "$BOOT_MAC" ] && [ -n "$BOOTIF" ]; then
     BOOT_MAC=$(bootif_to_mac "$BOOTIF")
@@ -210,135 +816,13 @@ if [ -n "$IP_PARAM" ]; then
     retry 3 1 "add default route" ip route add default via "$GW" dev "$IFACE" || true
 fi
 
-if [ -z "$TARGET_DISK" ]; then
-    log "waiting for block devices"
-    find_disk() {
-        TARGET_DISK=""
-        MAX_SIZE=0
-        for disk in /sys/block/sd* /sys/block/nvme*n* /sys/block/vd*; do
-            [ -e "$disk" ] || continue
-            [ -e "$disk/partition" ] && continue
-            SIZE=$(cat "$disk/size" 2>/dev/null || echo 0)
-            if [ "$SIZE" -gt "$MAX_SIZE" ]; then
-                MAX_SIZE=$SIZE
-                TARGET_DISK="/dev/$(basename "$disk")"
-            fi
-        done
-        [ -n "$TARGET_DISK" ]
-    }
-    log_disks
-    retry 30 1 "find block device" find_disk || fatal "no target disk found"
-    log "WARNING: target disk was not specified, selected largest disk"
-else
-    if [ ! -e "$TARGET_DISK" ]; then
-        fatal "target disk $TARGET_DISK does not exist"
-    fi
-fi
-TARGET_DISK=$(readlink -f "$TARGET_DISK" 2>/dev/null || echo "$TARGET_DISK")
-log "target disk: $TARGET_DISK"
+case "$INSTALL_MODE" in
+    Raw) install_raw ;;
+    RAID1) install_raid1 ;;
+esac
 
-log "downloading disk image from $IMAGE_URL"
-retry 120 5 "download disk image" wget -q -O /tmp/disk.img.gz "$IMAGE_URL" \
-    || fatal "failed to download disk image"
-
-log "writing disk image to $TARGET_DISK"
-write_image() { gunzip -c /tmp/disk.img.gz | dd of="$TARGET_DISK" bs=4194304; }
-retry 3 5 "write disk image" write_image || fatal "failed to write disk image"
-rm -f /tmp/disk.img.gz
-sync
-
-retry 5 2 "re-read partition table" blockdev --rereadpt "$TARGET_DISK" \
-    || log "WARNING: could not re-read partition table"
-sleep 2
-
-parts_for_disk() {
-    sysdisk=$(target_disk_sysfs) || return 0
-    for p in "$sysdisk"/*; do
-        [ -e "$p" ] || continue
-        [ -e "$p/partition" ] || continue
-        echo "/dev/$(basename "$p")"
-    done
-}
-
-find_root_part() {
-    ROOT_PART=""
-    for part in $(parts_for_disk); do
-        if mount "$part" /mnt 2>/dev/null; then
-            if [ -d /mnt/etc ] && [ -d /mnt/var ]; then
-                ROOT_PART="$part"
-                umount /mnt
-                return 0
-            fi
-            umount /mnt
-        fi
-    done
-    return 1
-}
-
-if [ -n "$DS_URL" ]; then
-    log "injecting cloud-init datasource: $DS_URL"
-    retry 20 2 "find root partition" find_root_part || fatal "no root partition found on $TARGET_DISK"
-    retry 5 2 "mount $ROOT_PART" mount "$ROOT_PART" /mnt || fatal "failed to mount $ROOT_PART"
-
-    mkdir -p /mnt/etc/cloud/cloud.cfg.d /mnt/etc/unbounded-metal
-    cat > /mnt/etc/cloud/cloud.cfg.d/99-unbounded-metal.cfg <<CLOUDINIT
-datasource_list: [NoCloud]
-datasource:
-  NoCloud:
-    seedfrom: ${DS_URL}
-CLOUDINIT
-    rm -f /mnt/etc/cloud/cloud-init.disabled
-    cat > /mnt/etc/unbounded-metal/config <<UMCONFIG
-SERVE_URL=${SERVE_URL}
-NODE_NAME=${NODE_NAME}
-NODE_NAMESPACE=${NODE_NAMESPACE}
-APISERVER_URL=${APISERVER_URL}
-UMCONFIG
-    sync
-    umount /mnt
-    log "cloud-init configured on $ROOT_PART"
-fi
-
-if [ -d /sys/firmware/efi ]; then
-    log "creating UEFI boot entry for local disk"
-    if ! mountpoint -q /sys/firmware/efi/efivars 2>/dev/null; then
-        mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null || true
-    fi
-
-    for part in $(parts_for_disk); do
-        if mount -t vfat "$part" /mnt/esp 2>/dev/null; then
-            LOADER=""
-            for candidate in \
-                /EFI/BOOT/BOOTX64.EFI \
-                /EFI/BOOT/BOOTAA64.EFI \
-                /EFI/ubuntu/shimx64.efi \
-                /EFI/ubuntu/shimaa64.efi; do
-                if [ -f "/mnt/esp${candidate}" ]; then
-                    LOADER="$(echo "$candidate" | tr '/' '\\')"
-                    break
-                fi
-            done
-            umount /mnt/esp
-
-            if [ -n "$LOADER" ] && command -v efibootmgr >/dev/null 2>&1; then
-                ESP_NUM=$(partition_number "$part")
-                if [ -n "$ESP_NUM" ]; then
-                    efibootmgr --create --disk "$TARGET_DISK" --part "$ESP_NUM" \
-                        --loader "$LOADER" --label "unbounded" 2>&1 \
-                        && log "UEFI boot entry created (${LOADER} on part ${ESP_NUM})" \
-                        || log "WARNING: efibootmgr failed, PXE chainloader will be used as fallback"
-                    break
-                fi
-            fi
-        fi
-    done
-fi
-
-if [ -n "$SERVE_URL" ]; then
-    log "disabling PXE boot"
-    retry 5 2 "disable PXE" wget -q -O /dev/null "$SERVE_URL/pxe/disable" \
-        || log "WARNING: failed to disable PXE boot"
-fi
+create_uefi_boot_entries
+disable_pxe
 
 log "installation complete, rebooting"
 sleep 2

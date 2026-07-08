@@ -3,8 +3,28 @@
 insmod part_gpt
 insmod fat
 insmod search_fs_file
+insmod configfile
 insmod chain
 
+if search --no-floppy --set=root --file /unbounded/grub.cfg; then
+  configfile /unbounded/grub.cfg
+fi
+if search --no-floppy --set=root --file /EFI/BOOT/grubx64.efi; then
+  chainloader /EFI/BOOT/grubx64.efi
+  boot
+fi
+if search --no-floppy --set=root --file /EFI/ubuntu/grubx64.efi; then
+  chainloader /EFI/ubuntu/grubx64.efi
+  boot
+fi
+if search --no-floppy --set=root --file /EFI/BOOT/grubaa64.efi; then
+  chainloader /EFI/BOOT/grubaa64.efi
+  boot
+fi
+if search --no-floppy --set=root --file /EFI/ubuntu/grubaa64.efi; then
+  chainloader /EFI/ubuntu/grubaa64.efi
+  boot
+fi
 if search --no-floppy --set=root --file /EFI/BOOT/BOOTX64.EFI; then
   chainloader /EFI/BOOT/BOOTX64.EFI
   boot
@@ -38,8 +58,8 @@ menuentry "Unbounded Metal Install" {
     unbounded.boot_mac={{ .BootLease.MAC }} \
     ip={{ .BootLease.IPv4 }}::{{ .BootLease.Gateway }}:{{ .BootLease.SubnetMask }}:::none \
     {{- end }}
-    {{- if .Machine.Spec.PXE.TargetDisk }}
-    unbounded.disk={{ .Machine.Spec.PXE.TargetDisk }} \
+    {{- range .InstallKernelArgs }}
+    {{ . }} \
     {{- end }}
     console=tty0 console=ttyS0,115200n8 \
     ---

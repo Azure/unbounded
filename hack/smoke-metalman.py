@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import gzip
 import json
 import os
 import signal
@@ -22,7 +23,9 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TMPDIR = Path(tempfile.mkdtemp())
+TMP_ROOT = Path(os.environ.get("SMOKE_TMP_ROOT", tempfile.gettempdir()))
+TMP_ROOT.mkdir(parents=True, exist_ok=True)
+TMPDIR = Path(tempfile.mkdtemp(prefix="unbounded-metal-smoke-", dir=TMP_ROOT))
 os.chmod(TMPDIR, 0o755)
 SITE = "smoke"
 NODE_NAME = "smoke-node"
@@ -52,7 +55,8 @@ AGENT_TARBALL = ARTIFACT_DIR / "unbounded-agent-linux-amd64.tar.gz"
 AGENT_DOWNLOAD_URL = f"http://{SERVER_IP}:{AGENT_DOWNLOAD_PORT}/{AGENT_TARBALL.name}"
 REGISTRY_PORT = 5555
 REGISTRY_CONTAINER = "unbounded-smoke-registry"
-IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
+RAW_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
+RAID_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404-raid:smoke"
 NETBOOT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/netboot:smoke"
 AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 # The agent runs inside a VM on an isolated libvirt network. "localhost" inside
@@ -64,6 +68,27 @@ AGENT_BINARY = REPO_ROOT / "bin" / "unbounded-agent"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
 QGA_SOCK = TMPDIR / "qga.sock"
+INSTALL_MODE = os.environ.get("SMOKE_INSTALL_MODE", "Raw")
+if INSTALL_MODE.lower() == "raw":
+    INSTALL_MODE = "Raw"
+elif INSTALL_MODE.lower() == "raid1":
+    INSTALL_MODE = "RAID1"
+else:
+    print(f"FAIL: unsupported SMOKE_INSTALL_MODE={INSTALL_MODE!r}; expected Raw or RAID1", file=sys.stderr)
+    sys.exit(1)
+BOOT_PROTOCOL = os.environ.get("SMOKE_BOOT_PROTOCOL", "PXE")
+if BOOT_PROTOCOL.lower() == "pxe":
+    BOOT_PROTOCOL = "PXE"
+elif BOOT_PROTOCOL.lower() == "http":
+    BOOT_PROTOCOL = "HTTP"
+else:
+    print(f"FAIL: unsupported SMOKE_BOOT_PROTOCOL={BOOT_PROTOCOL!r}; expected PXE or HTTP", file=sys.stderr)
+    sys.exit(1)
+IMAGE_NAME = RAID_IMAGE_NAME if INSTALL_MODE == "RAID1" else RAW_IMAGE_NAME
+RAID_DISK_A_SERIAL = "unbounded-raid-a"
+RAID_DISK_B_SERIAL = "unbounded-raid-b"
+RAID_DISK_A_PATH = f"/dev/disk/by-id/virtio-{RAID_DISK_A_SERIAL}"
+RAID_DISK_B_PATH = f"/dev/disk/by-id/virtio-{RAID_DISK_B_SERIAL}"
 # The nspawn machine name used by the agent (must match the constant in
 # cmd/agent/internal/goalstates/constants.go - NSpawnMachineKube1).
 NSPAWN_MACHINE = "kube1"
@@ -73,6 +98,14 @@ VIRSH = ["virsh", "--connect", "qemu:///system"]
 DEVNULL = subprocess.DEVNULL
 
 _procs: list[subprocess.Popen[Any]] = []
+
+_TRANSIENT_QGA_ERRORS = (
+    "domain is not running",
+    "guest agent is not responding",
+    "qemu guest agent is not connected",
+    "qemu guest agent is not configured",
+    "guest agent is not available",
+)
 
 
 def log(msg: str) -> None:
@@ -86,6 +119,21 @@ def die(msg: str) -> None:
     except Exception as e:
         log(f"  (debug log collection failed: {e})")
     sys.exit(1)
+
+
+def find_ovmf_firmware() -> tuple[Path, Path]:
+    candidates = [
+        (Path("/usr/share/OVMF/OVMF_CODE_4M.fd"), Path("/usr/share/OVMF/OVMF_VARS_4M.fd")),
+        (Path("/usr/share/OVMF/OVMF_CODE.fd"), Path("/usr/share/OVMF/OVMF_VARS.fd")),
+        (Path("/usr/share/edk2/x64/OVMF_CODE.4m.fd"), Path("/usr/share/edk2/x64/OVMF_VARS.4m.fd")),
+        (Path("/usr/share/edk2/x64/OVMF_CODE.fd"), Path("/usr/share/edk2/x64/OVMF_VARS.fd")),
+        (Path("/usr/share/edk2/ovmf/OVMF_CODE.fd"), Path("/usr/share/edk2/ovmf/OVMF_VARS.fd")),
+    ]
+    for code, vars_template in candidates:
+        if code.is_file() and vars_template.is_file():
+            return code, vars_template
+
+    die("could not find OVMF firmware; install ovmf or edk2-ovmf")
 
 
 def run(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
@@ -161,6 +209,11 @@ def forward_console(sock_path: Path) -> None:
         time.sleep(1)
 
 
+def _is_transient_qga_error(stderr: str) -> bool:
+    err = stderr.lower()
+    return any(marker in err for marker in _TRANSIENT_QGA_ERRORS)
+
+
 def guest_exec(command: str, timeout: int = 30) -> tuple[int, str, str]:
     """Execute a command inside the VM via the QEMU guest agent.
 
@@ -168,45 +221,75 @@ def guest_exec(command: str, timeout: int = 30) -> tuple[int, str, str]:
     to be configured on the VM and the qemu-guest-agent service running
     inside the guest.
     """
-    exec_req = json.dumps({
-        "execute": "guest-exec",
-        "arguments": {
-            "path": "/bin/bash",
-            "arg": ["-c", command],
-            "capture-output": True,
-        },
-    })
-    result = subprocess.run(
-        [*VIRSH, "qemu-agent-command", VM_NAME, exec_req],
-        capture_output=True, text=True, timeout=10,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"guest-exec failed: {result.stderr.strip()}")
-    pid = json.loads(result.stdout)["return"]["pid"]
-
-    # Poll guest-exec-status until the process exits.
     deadline = time.monotonic() + timeout
-    while True:
-        status_req = json.dumps({
-            "execute": "guest-exec-status",
-            "arguments": {"pid": pid},
+    last_error = ""
+
+    while time.monotonic() < deadline:
+        if not _vm_is_running():
+            time.sleep(1)
+            continue
+
+        exec_req = json.dumps({
+            "execute": "guest-exec",
+            "arguments": {
+                "path": "/bin/bash",
+                "arg": ["-c", command],
+                "capture-output": True,
+            },
         })
         result = subprocess.run(
-            [*VIRSH, "qemu-agent-command", VM_NAME, status_req],
-            capture_output=True, text=True, timeout=10,
+            [*VIRSH, "qemu-agent-command", VM_NAME, exec_req],
+            capture_output=True, text=True,
+            timeout=max(1, min(10, deadline - time.monotonic())),
         )
         if result.returncode != 0:
-            raise RuntimeError(f"guest-exec-status failed: {result.stderr.strip()}")
-        status = json.loads(result.stdout)["return"]
-        if status.get("exited"):
-            exit_code = status.get("exitcode", -1)
-            stdout = base64.b64decode(status.get("out-data", "")).decode("utf-8", errors="replace")
-            stderr = base64.b64decode(status.get("err-data", "")).decode("utf-8", errors="replace")
-            return exit_code, stdout, stderr
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"guest-exec pid {pid} did not exit within {timeout}s")
-        time.sleep(0.5)
+            last_error = result.stderr.strip()
+            if _is_transient_qga_error(last_error):
+                time.sleep(1)
+                continue
+            raise RuntimeError(f"guest-exec failed: {last_error}")
 
+        pid = json.loads(result.stdout)["return"]["pid"]
+
+        # Poll guest-exec-status until the process exits.  If the guest
+        # reboots while the command is active, restart the command.
+        restart_command = False
+        while time.monotonic() < deadline:
+            status_req = json.dumps({
+                "execute": "guest-exec-status",
+                "arguments": {"pid": pid},
+            })
+            result = subprocess.run(
+                [*VIRSH, "qemu-agent-command", VM_NAME, status_req],
+                capture_output=True, text=True,
+                timeout=max(1, min(10, deadline - time.monotonic())),
+            )
+            if result.returncode != 0:
+                last_error = result.stderr.strip()
+                if _is_transient_qga_error(last_error):
+                    restart_command = True
+                    break
+                raise RuntimeError(f"guest-exec-status failed: {last_error}")
+
+            status = json.loads(result.stdout)["return"]
+            if status.get("exited"):
+                exit_code = status.get("exitcode", -1)
+                stdout = base64.b64decode(status.get("out-data", "")).decode("utf-8", errors="replace")
+                stderr = base64.b64decode(status.get("err-data", "")).decode("utf-8", errors="replace")
+                return exit_code, stdout, stderr
+
+            time.sleep(0.5)
+
+        if restart_command:
+            time.sleep(1)
+            continue
+
+        break
+
+    if last_error:
+        raise TimeoutError(f"guest-exec did not complete within {timeout}s; last error: {last_error}")
+
+    raise TimeoutError(f"guest-exec did not complete within {timeout}s")
 
 def collect_debug_logs() -> None:
     """Use the QEMU guest agent to dump kubelet and agent debug information.
@@ -219,6 +302,11 @@ def collect_debug_logs() -> None:
         ("resolv.conf", "cat /etc/resolv.conf"),
         ("ip addr", "ip -4 addr show"),
         ("ip route", "ip route show"),
+        ("block devices", "lsblk -o NAME,PATH,SIZE,FSTYPE,TYPE,MOUNTPOINTS"),
+        ("fstab", "cat /etc/fstab"),
+        ("mdstat", "cat /proc/mdstat 2>/dev/null || true"),
+        ("mdadm detail", "mdadm --detail /dev/md/unbounded-root 2>/dev/null || mdadm --detail /dev/md* 2>/dev/null || true"),
+        ("efibootmgr", "efibootmgr -v 2>/dev/null || true"),
         ("dns test (dl.k8s.io)", "timeout 5 getent hosts dl.k8s.io || echo 'DNS FAILED'"),
         ("curl test (dl.k8s.io)", "timeout 10 curl -sS -o /dev/null -w '%{http_code}' https://dl.k8s.io/ || echo 'CURL FAILED'"),
         ("dns test (github.com)", "timeout 5 getent hosts github.com || echo 'DNS FAILED'"),
@@ -395,6 +483,7 @@ def cleanup() -> None:
     # Remove iptables rules that were added for VM ↔ kind connectivity.
     # Use check=False so these are best-effort (rules may not exist if setup
     # failed before they were inserted).
+    run_quiet(["sudo", "iptables", "-D", "INPUT", "-i", "virbr-smoke", "-j", "ACCEPT"], check=False)
     run_quiet(["sudo", "iptables", "-D", "FORWARD", "-i", "virbr-smoke", "-j", "ACCEPT"], check=False)
     run_quiet(["sudo", "iptables", "-D", "FORWARD", "-o", "virbr-smoke", "-j", "ACCEPT"], check=False)
     run_quiet(["sudo", "iptables", "-t", "raw", "-D", "PREROUTING",
@@ -791,10 +880,51 @@ def assert_cloud_init_done(timeout: int = 900) -> None:
             return
         if status == "False" and reason == "Failed":
             die(f"Cloud-init failed: {message}")
+        if BOOT_PROTOCOL == "HTTP" and elapsed > 15 and not _vm_is_running():
+            die("VM powered off during HTTP boot before CloudInitDone")
         if elapsed > 0 and elapsed % 30 == 0:
             log(f"    ({elapsed}s) CloudInitDone status={status or 'not set'} reason={reason or 'not set'}")
         time.sleep(1)
     die(f"Timed out waiting for CloudInitDone condition on Machine '{NODE_NAME}'")
+
+
+def assert_machine_condition(
+    condition_type: str,
+    expected_status: str,
+    expected_reason: str | None = None,
+    timeout: int = 300,
+) -> None:
+    """Assert a Machine condition reaches the requested status and reason."""
+    log(f"  Waiting for Machine '{NODE_NAME}' condition {condition_type}={expected_status}...")
+    last: str | None = None
+    for elapsed in range(timeout):
+        check_procs()
+        result = subprocess.run(
+            [KUBECTL, "get", f"machines.{API_GROUP}", NODE_NAME, "-o", "json"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            machine = json.loads(result.stdout)
+            for cond in machine.get("status", {}).get("conditions", []):
+                if cond.get("type") != condition_type:
+                    continue
+                status = cond.get("status", "")
+                reason = cond.get("reason", "")
+                current = f"{status}/{reason}"
+                if status == expected_status and (expected_reason is None or reason == expected_reason):
+                    log(f"  Machine condition {condition_type} is {current}")
+                    return
+                if current != last:
+                    last = current
+                    log(f"    ({elapsed}s) {condition_type}={current}")
+        elif elapsed % 15 == 0:
+            log(f"    ({elapsed}s) Machine not readable yet: {result.stderr.strip()}")
+        time.sleep(1)
+
+    if expected_reason is None:
+        die(f"Timed out waiting for Machine condition {condition_type}={expected_status}")
+    die(f"Timed out waiting for Machine condition {condition_type}={expected_status}/{expected_reason}")
 
 
 def wait_machine_operation_complete(name: str, timeout: int = 1800) -> None:
@@ -882,6 +1012,350 @@ def assert_log_contains(path: Path, needle: str) -> None:
         die(f"Expected {path} to contain {needle!r}")
 
 
+def guestfs_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("LIBGUESTFS_BACKEND", "direct")
+    env["TMPDIR"] = str(TMPDIR)
+    env["TEMP"] = str(TMPDIR)
+    env["TMP"] = str(TMPDIR)
+    return env
+
+
+def require_tools(tools: list[str]) -> None:
+    missing = [tool for tool in tools if shutil.which(tool) is None]
+    if missing:
+        die("Missing required tool(s): " + ", ".join(missing))
+
+
+def docker_copy_from_image(image: str, src: str, dest: Path) -> None:
+    result = run(
+        ["docker", "create", image, "/copy-only"],
+        capture_output=True,
+        text=True,
+    )
+    cid = result.stdout.strip()
+    if not cid:
+        die(f"docker create {image} did not return a container id")
+
+    try:
+        run(["docker", "cp", f"{cid}:{src}", str(dest)])
+    finally:
+        run_quiet(["docker", "rm", "-f", cid], check=False)
+
+
+HTTP_BOOT_SELECTOR_SCRIPT = """\
+#!/bin/bash
+set -euxo pipefail
+
+log_file=/var/log/metalman-httpboot-selector.log
+touch "${log_file}"
+chmod 0644 "${log_file}"
+if [ -w /dev/ttyS0 ]; then
+    exec > >(tee -a "${log_file}" >/dev/ttyS0) 2>&1
+else
+    exec >>"${log_file}" 2>&1
+fi
+
+state_dir=/var/lib/metalman-httpboot-selector
+state_file="${state_dir}/requested"
+mkdir -p "${state_dir}"
+
+echo "=== metalman HTTP boot selector ==="
+date -u
+
+if [ -f "${state_file}" ]; then
+    echo "=== returned to helper disk after requesting HTTP BootNext ==="
+    echo "Firmware HTTP boot likely failed or fell through to disk."
+    efibootmgr -v || true
+    systemctl poweroff --force
+    exit 0
+fi
+
+echo requested >"${state_file}"
+
+for attempt in $(seq 1 10); do
+    echo "=== efibootmgr before, attempt ${attempt} ==="
+    efibootmgr -v || true
+    entry="$(efibootmgr -v 2>/dev/null | sed -n 's/^Boot\\([0-9A-Fa-f]\\{4\\}\\).*UEFI HTTPv4.*/\\1/p' | head -n1)"
+    if [ -n "${entry}" ]; then
+        break
+    fi
+    sleep 1
+done
+
+if [ -z "${entry:-}" ]; then
+    echo "=== no UEFI HTTPv4 boot entry found ==="
+    systemctl poweroff --force
+    exit 1
+fi
+
+echo "=== setting BootNext to UEFI HTTPv4 Boot${entry} ==="
+efibootmgr -n "${entry}"
+efibootmgr -v || true
+echo "=== rebooting into UEFI HTTPv4 ==="
+systemctl reboot --force
+exit 0
+"""
+
+
+HTTP_BOOT_SELECTOR_SERVICE = """\
+[Unit]
+Description=One-shot metalman UEFI HTTP boot selector
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/metalman-httpboot-selector.sh
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def prepare_http_boot_helper_disk(raw_image: str, dest: Path) -> None:
+    log(f"Preparing HTTP boot helper disk {dest.name}")
+    require_tools(["docker", "virt-customize", "qemu-img"])
+
+    workdir = TMPDIR / "http-boot-helper"
+    workdir.mkdir(parents=True, exist_ok=True)
+    disk_gz = workdir / "disk.img.gz"
+    disk_raw = workdir / "disk.img"
+    script = workdir / "metalman-httpboot-selector.sh"
+    service = workdir / "metalman-httpboot-selector.service"
+
+    log(f"  Extracting /disk/disk.img.gz from {raw_image}")
+    docker_copy_from_image(raw_image, "/disk/disk.img.gz", disk_gz)
+    with gzip.open(disk_gz, "rb") as src, disk_raw.open("wb") as dst:
+        shutil.copyfileobj(src, dst)
+    disk_gz.unlink()
+
+    script.write_text(HTTP_BOOT_SELECTOR_SCRIPT, encoding="utf-8")
+    service.write_text(HTTP_BOOT_SELECTOR_SERVICE, encoding="utf-8")
+
+    log("  Injecting one-shot efibootmgr selector")
+    run([
+        "virt-customize",
+        "-a", str(disk_raw),
+        "--copy-in", f"{script}:/usr/local/sbin",
+        "--copy-in", f"{service}:/etc/systemd/system",
+        "--run-command", "chmod 0755 /usr/local/sbin/metalman-httpboot-selector.sh",
+        "--run-command", "mkdir -p /etc/cloud && touch /etc/cloud/cloud-init.disabled",
+        "--run-command", "rm -rf /var/lib/metalman-httpboot-selector",
+        "--run-command", "systemctl enable metalman-httpboot-selector.service",
+    ], env=guestfs_env())
+
+    log("  Converting helper disk to qcow2")
+    run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2", str(disk_raw), str(dest)])
+    run(["qemu-img", "resize", str(dest), "20G"])
+
+
+def virt_filesystems(image: Path) -> list[tuple[str, str, str]]:
+    result = run(
+        ["virt-filesystems", "-a", str(image), "--filesystems", "--long", "--no-title"],
+        capture_output=True,
+        text=True,
+        env=guestfs_env(),
+    )
+    filesystems: list[tuple[str, str, str]] = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        filesystems.append((fields[0], fields[2].lower(), fields[3]))
+    if not filesystems:
+        die(f"virt-filesystems found no filesystems in {image}")
+    return filesystems
+
+
+def virt_has_file(image: Path, device: str, path: str) -> bool:
+    result = subprocess.run(
+        ["virt-cat", "-a", str(image), "-m", device, path],
+        stdout=DEVNULL,
+        stderr=DEVNULL,
+        env=guestfs_env(),
+    )
+    return result.returncode == 0
+
+
+def virt_has_dir(image: Path, device: str, path: str) -> bool:
+    result = subprocess.run(
+        ["virt-ls", "-a", str(image), "-m", device, path],
+        stdout=DEVNULL,
+        stderr=DEVNULL,
+        env=guestfs_env(),
+    )
+    return result.returncode == 0
+
+
+def virt_list(image: Path, device: str, path: str) -> list[str]:
+    result = subprocess.run(
+        ["virt-ls", "-a", str(image), "-m", device, path],
+        capture_output=True,
+        text=True,
+        env=guestfs_env(),
+    )
+    if result.returncode != 0:
+        return []
+    return result.stdout.splitlines()
+
+
+def find_root_partition(image: Path, filesystems: list[tuple[str, str, str]]) -> str:
+    for device, vfs, _label in filesystems:
+        if vfs not in ("ext2", "ext3", "ext4", "xfs", "btrfs"):
+            continue
+        if virt_has_file(image, device, "/etc/os-release"):
+            return device
+    die(f"Could not identify root filesystem in {image}")
+
+
+def find_esp_partition(image: Path, filesystems: list[tuple[str, str, str]]) -> str:
+    for device, vfs, _label in filesystems:
+        if vfs not in ("vfat", "fat", "msdos"):
+            continue
+        if virt_has_dir(image, device, "/EFI"):
+            return device
+    die(f"Could not identify EFI system partition in {image}")
+
+
+def find_boot_partition(image: Path, filesystems: list[tuple[str, str, str]], root_device: str) -> str | None:
+    candidates: list[tuple[str, str, str]] = []
+    for device, vfs, label in filesystems:
+        if device == root_device:
+            continue
+        if vfs in ("ext2", "ext3", "ext4", "xfs", "btrfs"):
+            candidates.append((device, vfs, label))
+
+    for device, _vfs, label in candidates:
+        if label.lower() == "boot":
+            return device
+
+    for device, _vfs, _label in candidates:
+        names = virt_list(image, device, "/")
+        if any(name.startswith("vmlinuz-") for name in names) and "grub" in names:
+            return device
+
+    return None
+
+
+def virt_tar_zst(
+    image: Path,
+    mount_device: str,
+    dest: Path,
+    extra_mounts: list[tuple[str, str]] | None = None,
+) -> None:
+    extra_mounts = extra_mounts or []
+    mount_args = ["-m", f"{mount_device}:/"]
+    for device, mountpoint in extra_mounts:
+        mount_args.extend(["-m", f"{device}:{mountpoint}"])
+
+    mount_desc = ", ".join([mount_device] + [f"{device} at {mountpoint}" for device, mountpoint in extra_mounts])
+    log(f"  Exporting {mount_desc} to {dest.name}")
+    tar_proc = subprocess.Popen(
+        ["virt-tar-out", "--ro", "--no-sync", "-a", str(image), *mount_args, "/", "-"],
+        stdout=subprocess.PIPE,
+        env=guestfs_env(),
+    )
+    if tar_proc.stdout is None:
+        die("virt-tar-out did not provide stdout")
+    zstd_proc = subprocess.Popen(
+        ["zstd", "-T0", "-q", "-f", "-o", str(dest), "-"],
+        stdin=tar_proc.stdout,
+    )
+    tar_proc.stdout.close()
+    zstd_rc = zstd_proc.wait()
+    tar_rc = tar_proc.wait()
+    if tar_rc != 0 or zstd_rc != 0:
+        die(f"Failed to export {mount_device}: virt-tar-out={tar_rc}, zstd={zstd_rc}")
+
+
+def prepare_raid_machine_image(raw_image: str, raid_image: str) -> None:
+    log("Preparing RAID1 machine image from host-ubuntu2404")
+    require_tools([
+        "docker", "virt-customize", "virt-filesystems", "virt-cat", "virt-ls",
+        "virt-tar-out", "zstd",
+    ])
+
+    workdir = TMPDIR / "raid-machine-image"
+    workdir.mkdir(parents=True, exist_ok=True)
+    disk_gz = workdir / "disk.img.gz"
+    disk_raw = workdir / "disk.img"
+
+    log(f"  Extracting /disk/disk.img.gz from {raw_image}")
+    docker_copy_from_image(raw_image, "/disk/disk.img.gz", disk_gz)
+    with gzip.open(disk_gz, "rb") as src, disk_raw.open("wb") as dst:
+        shutil.copyfileobj(src, dst)
+    disk_gz.unlink()
+
+    log("  Installing RAID boot dependencies into copied host image")
+    run([
+        "virt-customize",
+        "-a", str(disk_raw),
+        "--run-command", "apt-get update",
+        "--install", "mdadm,grub-efi-amd64,grub-efi-amd64-bin,shim-signed,qemu-guest-agent",
+        "--run-command", "systemctl enable qemu-guest-agent || true",
+    ], env=guestfs_env())
+
+    filesystems = virt_filesystems(disk_raw)
+    root_part = find_root_partition(disk_raw, filesystems)
+    esp_part = find_esp_partition(disk_raw, filesystems)
+    boot_part = find_boot_partition(disk_raw, filesystems, root_part)
+    boot_mounts = [(boot_part, "/boot")] if boot_part else []
+    log(f"  Identified root={root_part} boot={boot_part or 'inline'} esp={esp_part}")
+
+    virt_tar_zst(disk_raw, root_part, workdir / "rootfs.tar.zst", boot_mounts)
+    virt_tar_zst(disk_raw, esp_part, workdir / "esp.tar.zst")
+    (workdir / "install.yaml").write_text("version: 1\nmode: RAID1\n", encoding="utf-8")
+    (workdir / "Containerfile").write_text(textwrap.dedent("""\
+        FROM scratch
+        COPY rootfs.tar.zst /disk/rootfs.tar.zst
+        COPY esp.tar.zst /disk/esp.tar.zst
+        COPY install.yaml /disk/install.yaml
+    """), encoding="utf-8")
+
+    log(f"  Building {raid_image}")
+    run(["docker", "build", "-t", raid_image, "-f", str(workdir / "Containerfile"), str(workdir)])
+
+
+def assert_raid1_install() -> None:
+    if INSTALL_MODE != "RAID1":
+        return
+
+    log("Verifying RAID1 install inside guest")
+    wait_vm_state("running", timeout=180)
+    wait_guest_agent(timeout=300)
+
+    command = textwrap.dedent(f"""\
+        set -euo pipefail
+        root_src="$(findmnt -n -o SOURCE /)"
+        case "$root_src" in
+          /dev/md*|/dev/mapper/*) ;;
+          *) echo "root filesystem is not on md device: $root_src" >&2; exit 1 ;;
+        esac
+        test -e {RAID_DISK_A_PATH}
+        test -e {RAID_DISK_B_PATH}
+        grep -q unbounded-root /etc/mdadm/mdadm.conf
+        grep -q '/boot/efi-secondary' /etc/fstab
+        grep -q '\\[UU\\]' /proc/mdstat
+        mdadm --detail "$root_src" | grep -q 'Raid Level : raid1'
+        mdadm --detail "$root_src" | grep -q 'Raid Devices : 2'
+        findmnt /boot/efi >/dev/null
+        lsblk -o NAME,PATH,SIZE,FSTYPE,TYPE,MOUNTPOINTS
+        cat /proc/mdstat
+        mdadm --detail "$root_src"
+    """)
+    exit_code, stdout, stderr = guest_exec(command, timeout=60)
+    if stdout:
+        sys.stderr.write(stdout)
+        sys.stderr.flush()
+    if stderr:
+        sys.stderr.write(stderr)
+        sys.stderr.flush()
+    if exit_code != 0:
+        die(f"RAID1 guest verification failed with exit code {exit_code}")
+
+    log("  RAID1 guest verification passed")
+
+
 def run_operation_smoke_suite() -> None:
     log("Running bare-metal MachineOperation smoke suite")
 
@@ -914,6 +1388,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sigint_handler)
     atexit.register(cleanup)
 
+    log(f"Metalman smoke install mode: {INSTALL_MODE}")
+    log(f"Metalman smoke boot protocol: {BOOT_PROTOCOL}")
+
     log("Cleaning up stale libvirt resources")
     clean_libvirt()
 
@@ -933,6 +1410,9 @@ def main() -> None:
     # Allow the VM to reach the kind Docker network (Docker's bridge
     # isolation rules block cross-bridge traffic by default).
     log("Adding iptables rules for VM ↔ kind connectivity")
+    # Some developer machines default-drop INPUT through UFW.  The VM must
+    # reach metalman's DHCP, TFTP, HTTP, and health endpoints on this bridge.
+    run(["sudo", "iptables", "-I", "INPUT", "-i", "virbr-smoke", "-j", "ACCEPT"])
     run(["sudo", "iptables", "-I", "FORWARD", "-i", "virbr-smoke", "-j", "ACCEPT"])
     run(["sudo", "iptables", "-I", "FORWARD", "-o", "virbr-smoke", "-j", "ACCEPT"])
     # Docker may insert a raw PREROUTING DROP rule that blocks non-Docker
@@ -990,17 +1470,34 @@ def main() -> None:
              "--type=strategic", "-p", patch])
 
     log("Creating UEFI VM (powered off, with TPM)")
+    ovmf_code, ovmf_vars_template = find_ovmf_firmware()
+    log(f"  Using OVMF loader {ovmf_code}")
     ovmf_vars = TMPDIR / "OVMF_VARS.fd"
-    shutil.copy2("/usr/share/OVMF/OVMF_VARS_4M.fd", ovmf_vars)
-    disk = str(TMPDIR / "disk.qcow2")
-    run_quiet(["qemu-img", "create", "-f", "qcow2", disk, "20G"], check=True)
+    shutil.copy2(ovmf_vars_template, ovmf_vars)
+    disk_args: list[str] = []
+    if INSTALL_MODE == "RAID1":
+        for index, (name, serial) in enumerate((("disk-a.qcow2", RAID_DISK_A_SERIAL), ("disk-b.qcow2", RAID_DISK_B_SERIAL))):
+            disk_path = TMPDIR / name
+            if BOOT_PROTOCOL == "HTTP" and index == 0:
+                prepare_http_boot_helper_disk(RAW_IMAGE_NAME, disk_path)
+            else:
+                run_quiet(["qemu-img", "create", "-f", "qcow2", str(disk_path), "20G"], check=True)
+            disk_args.extend(["--disk", f"path={disk_path},format=qcow2,bus=virtio,serial={serial}"])
+    else:
+        disk_path = TMPDIR / "disk.qcow2"
+        if BOOT_PROTOCOL == "HTTP":
+            prepare_http_boot_helper_disk(RAW_IMAGE_NAME, disk_path)
+        else:
+            run_quiet(["qemu-img", "create", "-f", "qcow2", str(disk_path), "20G"], check=True)
+        disk_args.extend(["--disk", f"path={disk_path},format=qcow2,bus=virtio"])
+
     run_quiet([
         "virt-install",
         "--connect", "qemu:///system",
         "--name", VM_NAME, "--ram", "4096", "--vcpus", "2",
-        "--disk", f"path={disk},format=qcow2,bus=virtio",
+        *disk_args,
         "--network", f"network={NET_NAME},mac={MAC_ADDRESS}",
-        "--boot", f"uefi,loader=/usr/share/OVMF/OVMF_CODE_4M.fd,nvram={ovmf_vars},hd,network",
+        "--boot", f"uefi,loader={ovmf_code},nvram={ovmf_vars},hd,network",
         "--tpm", "backend.type=emulator,backend.version=2.0",
         "--serial", f"unix,path={SERIAL_SOCK},mode=bind",
         "--channel", f"unix,path={QGA_SOCK},mode=bind,target.type=virtio,target.name=org.qemu.guest_agent.0",
@@ -1015,25 +1512,26 @@ def main() -> None:
     )
     console_thread.start()
 
-    log("Starting sushy-emulator")
-    run_quiet([
-        "openssl", "req", "-x509", "-newkey", "rsa:2048",
-        "-keyout", str(TMPDIR / "sushy.key"),
-        "-out", str(TMPDIR / "sushy.crt"),
-        "-days", "1", "-nodes",
-        "-subj", "/CN=sushy-emulator",
-        "-addext", "subjectAltName=IP:127.0.0.1",
-    ], check=True)
-    sushy_url = f"https://127.0.0.1:{SUSHY_PORT}"
-    proc = spawn([
-        "sushy-emulator", "--libvirt-uri", "qemu:///system",
-        "-i", "127.0.0.1", "-p", str(SUSHY_PORT),
-        "--ssl-certificate", str(TMPDIR / "sushy.crt"),
-        "--ssl-key", str(TMPDIR / "sushy.key"),
-    ], TMPDIR / "sushy.log")
-    log(f"  sushy-emulator PID={proc.pid}")
-    time.sleep(2)
-    check_procs()
+    if BOOT_PROTOCOL == "PXE":
+        log("Starting sushy-emulator")
+        run_quiet([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", str(TMPDIR / "sushy.key"),
+            "-out", str(TMPDIR / "sushy.crt"),
+            "-days", "1", "-nodes",
+            "-subj", "/CN=sushy-emulator",
+            "-addext", "subjectAltName=IP:127.0.0.1",
+        ], check=True)
+        sushy_url = f"https://127.0.0.1:{SUSHY_PORT}"
+        proc = spawn([
+            "sushy-emulator", "--libvirt-uri", "qemu:///system",
+            "-i", "127.0.0.1", "-p", str(SUSHY_PORT),
+            "--ssl-certificate", str(TMPDIR / "sushy.crt"),
+            "--ssl-key", str(TMPDIR / "sushy.key"),
+        ], TMPDIR / "sushy.log")
+        log(f"  sushy-emulator PID={proc.pid}")
+        time.sleep(2)
+        check_procs()
 
     # Start Go builds in the background so they overlap with Kubernetes
     # setup and Docker image builds.  Both targets share the Go build
@@ -1098,7 +1596,7 @@ def main() -> None:
     # layer caching.  They are already loaded into the local Docker daemon
     # with the correct tags.
     log("Verifying pre-built OCI images are available")
-    for name, tag in [("host-ubuntu2404", IMAGE_NAME),
+    for name, tag in [("host-ubuntu2404", RAW_IMAGE_NAME),
                       ("netboot", NETBOOT_IMAGE_NAME),
                       ("agent-ubuntu2404", AGENT_IMAGE_NAME)]:
         result = subprocess.run(
@@ -1109,6 +1607,9 @@ def main() -> None:
             die(f"Pre-built image {tag} not found in local Docker daemon. "
                 "Ensure the workflow builds it before running this script.")
         log(f"  {name} image found: {tag}")
+
+    if INSTALL_MODE == "RAID1":
+        prepare_raid_machine_image(RAW_IMAGE_NAME, RAID_IMAGE_NAME)
 
     # Wait for Go builds (likely already finished during k8s setup).
     for name, proc in go_builds:
@@ -1146,6 +1647,26 @@ def main() -> None:
 
     server_url = apiserver_url()
     log(f"  API server URL: {server_url}")
+    pxe_spec: dict[str, Any] = {
+        "image": IMAGE_NAME,
+        "dhcpLeases": [{
+            "mac": MAC_ADDRESS,
+            "ipv4": NODE_IP,
+            "subnetMask": "255.255.255.0",
+            "gateway": GATEWAY,
+            "dns": [DNS_SERVER],
+        }],
+    }
+    if BOOT_PROTOCOL == "HTTP":
+        pxe_spec["bootProtocol"] = "HTTP"
+    else:
+        pxe_spec["redfish"] = {
+            "url": sushy_url,
+            "username": "",
+            "deviceID": VM_NAME,
+            "passwordRef": {"name": "bmc-pass", "key": "password", "namespace": NODE_NS},
+        }
+
     protonode = {
         "apiVersion": API_VERSION,
         "kind": "Machine",
@@ -1154,22 +1675,7 @@ def main() -> None:
             "labels": {f"{API_GROUP}/site": SITE},
         },
         "spec": {
-            "pxe": {
-                "image": IMAGE_NAME,
-                "redfish": {
-                    "url": sushy_url,
-                    "username": "",
-                    "deviceID": VM_NAME,
-                    "passwordRef": {"name": "bmc-pass", "key": "password", "namespace": NODE_NS},
-                },
-                "dhcpLeases": [{
-                    "mac": MAC_ADDRESS,
-                    "ipv4": NODE_IP,
-                    "subnetMask": "255.255.255.0",
-                    "gateway": GATEWAY,
-                    "dns": [DNS_SERVER],
-                }],
-            },
+            "pxe": pxe_spec,
             "agent": {
                 "image": AGENT_IMAGE_NAME_VM,
                 "url": AGENT_DOWNLOAD_URL,
@@ -1179,6 +1685,16 @@ def main() -> None:
             },
         },
     }
+    if INSTALL_MODE == "RAID1":
+        protonode["spec"]["pxe"]["install"] = {
+            "mode": "RAID1",
+            "targetDisks": [RAID_DISK_A_PATH, RAID_DISK_B_PATH],
+        }
+    if BOOT_PROTOCOL == "HTTP":
+        protonode["spec"]["operations"] = {
+            "rebootCounter": 1,
+            "repaveCounter": 1,
+        }
     kubectl(["apply", "-f", "-"], input=json.dumps(protonode).encode(),
             stdout=DEVNULL)
     log("  Resources created")
@@ -1204,12 +1720,19 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Triggering HostReplace through kubectl-unbounded")
-    operation_log = TMPDIR / "kubectl-host-replace.log"
-    operation_proc = run_kubectl_unbounded_operation(
-        ["replace", NODE_NAME, "--force", "--ttl=3600"],
-        operation_log.name,
-    )
+    operation_log: Path | None = None
+    operation_proc: subprocess.Popen[Any] | None = None
+    if BOOT_PROTOCOL == "HTTP":
+        log("Starting VM for out-of-band UEFI HTTP boot")
+        run([*VIRSH, "start", VM_NAME])
+        wait_vm_state("running", timeout=180)
+    else:
+        log("Triggering HostReplace through kubectl-unbounded")
+        operation_log = TMPDIR / "kubectl-host-replace.log"
+        operation_proc = run_kubectl_unbounded_operation(
+            ["replace", NODE_NAME, "--force", "--ttl=3600"],
+            operation_log.name,
+        )
 
     # Log free space so we can correlate disk exhaustion with VM failures.
     df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
@@ -1218,15 +1741,22 @@ def main() -> None:
     log("Waiting for cloud-init to complete...")
     assert_cloud_init_done(timeout=900)
 
-    wait_process_success(operation_proc, timeout=900)
-    assert_log_contains(operation_log, "Condition CloudInitDone: True/Succeeded")
+    if operation_proc is not None and operation_log is not None:
+        wait_process_success(operation_proc, timeout=900)
+        assert_log_contains(operation_log, "Condition CloudInitDone: True/Succeeded")
+    else:
+        assert_machine_condition("Repaved", "True", "Succeeded", timeout=300)
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
     assert_node_ready(NODE_NAME, timeout=720)
     assert_node_label(NODE_NAME, NODE_LABEL_KEY, NODE_LABEL_VALUE)
+    assert_raid1_install()
 
-    run_operation_smoke_suite()
+    if BOOT_PROTOCOL == "PXE":
+        run_operation_smoke_suite()
+    else:
+        log("Skipping MachineOperation smoke suite for out-of-band HTTP boot")
 
     log("")
     log("Smoke test PASSED")

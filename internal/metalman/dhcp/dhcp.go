@@ -26,6 +26,7 @@ type Server struct {
 	Port              int
 	Reader            client.Reader
 	ServerIP          net.IP
+	ServeURL          string
 	OCICache          *netboot.OCICache
 	DefaultNetbootRef string
 }
@@ -120,7 +121,7 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	}
 
 	mac := strings.ToLower(m.ClientHWAddr.String())
-	log := slog.With("mac", mac, "type", m.MessageType().String())
+	log := slog.With("mac", mac, "type", m.MessageType().String(), "class", m.ClassIdentifier())
 
 	ctx := context.Background()
 
@@ -192,13 +193,29 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		netbootImage = s.DefaultNetbootRef
 	}
 
-	if node.Spec.PXE.TargetBootProtocol() != v1alpha3.PXEBootProtocolHTTP && netbootImage != "" && s.OCICache != nil {
+	if netbootImage != "" && s.OCICache != nil {
 		architecture := node.Spec.PXE.TargetArchitecture()
 
 		meta, err := s.OCICache.MetadataForRefArchitecture(netbootImage, architecture)
 		if err != nil {
 			log.Warn("OCI image metadata not available", "image", netbootImage, "architecture", architecture, "err", err)
-		} else if meta.DHCPBootImageName != "" {
+		} else if node.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP && isHTTPBootClient(m) {
+			bootPath := netboot.HTTPBootPathFromMetadata(meta)
+
+			bootURL, err := netboot.JoinServeURLPath(s.ServeURL, bootPath)
+			if err != nil {
+				log.Warn("HTTP boot URL not available", "image", netbootImage, "architecture", architecture, "err", err)
+			} else {
+				resp.UpdateOption(dhcpv4.OptBootFileName(bootURL))
+				resp.UpdateOption(dhcpv4.OptClassIdentifier("HTTPClient"))
+
+				if len(bootURL) <= 127 {
+					resp.BootFileName = bootURL
+				} else {
+					log.Warn("HTTP boot URL too long for BOOTP file field; setting DHCP option only", "bootURL", bootURL)
+				}
+			}
+		} else if node.Spec.PXE.TargetBootProtocol() != v1alpha3.PXEBootProtocolHTTP && meta.DHCPBootImageName != "" {
 			resp.UpdateOption(dhcpv4.OptTFTPServerName(s.ServerIP.String()))
 			resp.UpdateOption(dhcpv4.OptBootFileName(meta.DHCPBootImageName))
 			resp.ServerIPAddr = s.ServerIP
@@ -219,9 +236,22 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		dest = peer
 	}
 
-	log.Info("sending DHCP response", "node", node.Name, "ip", lease.IPv4, "response", resp.MessageType().String())
+	log.Info(
+		"sending DHCP response",
+		"node", node.Name,
+		"ip", lease.IPv4,
+		"response", resp.MessageType().String(),
+		"bootfileOption", resp.BootFileNameOption(),
+		"bootfile", resp.BootFileName,
+	)
 
 	if _, err := conn.WriteTo(resp.ToBytes(), dest); err != nil {
 		log.Error("sending DHCP response", "err", err)
 	}
+}
+
+func isHTTPBootClient(m *dhcpv4.DHCPv4) bool {
+	classID := m.ClassIdentifier()
+
+	return strings.HasPrefix(classID, "HTTPClient")
 }

@@ -841,6 +841,7 @@ func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
 		"unbounded.image_url=http://10.0.1.1:8080/disk.img.gz",
 		"unbounded.node_name=node-no-operations",
 		"unbounded.boot_mac=aa:bb:cc:dd:ee:20",
+		"unbounded.install_mode=Raw",
 		"unbounded.disk=/dev/disk/by-id/test-os-disk",
 		"ip=10.0.1.20::10.0.1.1:255.255.255.0:::none",
 	} {
@@ -849,7 +850,92 @@ func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
 		}
 	}
 
+	require.Contains(t, body, "unbounded.install_mode=Raw \\\n    unbounded.disk=/dev/disk/by-id/test-os-disk")
 	require.NotContains(t, body, "eth0")
+
+	espConfig := strings.Index(body, "configfile /unbounded/grub.cfg")
+	directGRUB := strings.Index(body, "chainloader /EFI/BOOT/grubx64.efi")
+	shim := strings.Index(body, "chainloader /EFI/BOOT/BOOTX64.EFI")
+
+	require.NotEqual(t, -1, espConfig)
+	require.NotEqual(t, -1, directGRUB)
+	require.NotEqual(t, -1, shim)
+	require.Less(t, espConfig, directGRUB)
+	require.Less(t, directGRUB, shim)
+}
+
+func TestGrubTemplate_RAID1InstallArgs(t *testing.T) {
+	grubTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "grub.cfg.tmpl"))
+	require.NoError(t, err)
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-raid", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Install: &v1alpha3.PXEInstallSpec{
+					Mode: v1alpha3.PXEInstallModeRAID1,
+					TargetDisks: []string{
+						"/dev/disk/by-id/nvme-a",
+						"/dev/disk/by-id/nvme-b",
+					},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+	}
+
+	data := newTemplateData(
+		node,
+		ClusterInfo{ApiserverURL: "https://k8s.example.com"},
+		"http://10.0.1.1:8080",
+		"",
+		"",
+	)
+
+	result, err := renderTemplate(string(grubTmpl), data)
+	require.NoError(t, err)
+
+	body := string(result)
+	for _, want := range []string{
+		"unbounded.install_mode=RAID1",
+		"unbounded.disk0=/dev/disk/by-id/nvme-a",
+		"unbounded.disk1=/dev/disk/by-id/nvme-b",
+		"unbounded.serve_url=http://10.0.1.1:8080",
+	} {
+		require.Contains(t, body, want)
+	}
+
+	require.Contains(t, body, "unbounded.install_mode=RAID1 \\\n    unbounded.disk0=/dev/disk/by-id/nvme-a")
+	require.Contains(t, body, "unbounded.disk1=/dev/disk/by-id/nvme-b \\\n    console=tty0")
+	require.NotContains(t, body, "unbounded.disk=/dev/disk")
+}
+
+func TestFileResolverRejectsInvalidRAID1InstallBeforeRenderingGRUB(t *testing.T) {
+	imageRef := "ghcr.io/test/image:v1"
+	cache := setupOCICache(t, imageRef, "badraid123", map[string][]byte{
+		"grub/grub.cfg.tmpl": []byte(`{{ range .InstallKernelArgs }}{{ . }} {{ end }}`),
+	})
+	resolver := FileResolver{
+		Cache:    cache,
+		Cluster:  &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
+		ServeURL: "http://10.0.1.1:8080",
+	}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-raid", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Install: &v1alpha3.PXEInstallSpec{
+					Mode:        v1alpha3.PXEInstallModeRAID1,
+					TargetDisks: []string{"/dev/disk/by-id/nvme-a"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+	}
+
+	_, err := resolver.ResolveFileByPath(t.Context(), "grub/grub.cfg", node, imageRef)
+	require.ErrorContains(t, err, "invalid PXE install config")
+	require.ErrorContains(t, err, "RAID1 install requires exactly two targetDisks")
 }
 
 func TestGrubTemplate_SelectsBootLeaseByRequestIP(t *testing.T) {
@@ -1939,12 +2025,20 @@ menuentry "Install {{ .Machine.Name }}" {
 
 func TestHTTPServer_RoutesDiskFromMachineImageAndBootFromNetbootImage(t *testing.T) {
 	machineData := []byte("machine-disk-data")
+	rootfsData := []byte("machine-rootfs-data")
 	netbootData := []byte("netboot-kernel-data")
 
 	cacheDir := t.TempDir()
 	cache := NewOCICache(cacheDir)
 
-	if err := populateOCICache(cacheDir, "machine123", map[string][]byte{"disk.img.gz": machineData}); err != nil {
+	if err := populateOCICache(cacheDir, "machine123", map[string][]byte{
+		"disk.img.gz":     machineData,
+		"rootfs.tar.zst":  rootfsData,
+		"esp.tar.zst":     []byte("machine-esp-data"),
+		"install.yaml":    []byte("version: 1\n"),
+		"grub/grub.cfg":   []byte("machine-grub-data"),
+		"grub/grub.cfg.1": []byte("machine-grub-data-1"),
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1986,6 +2080,7 @@ func TestHTTPServer_RoutesDiskFromMachineImageAndBootFromNetbootImage(t *testing
 		want []byte
 	}{
 		{path: "/disk.img.gz", want: machineData},
+		{path: "/machine/rootfs.tar.zst", want: rootfsData},
 		{path: "/vmlinuz", want: netbootData},
 	} {
 		req, _ := http.NewRequest("GET", ts.URL+tt.path, nil)

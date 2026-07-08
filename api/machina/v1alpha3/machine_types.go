@@ -4,6 +4,8 @@
 package v1alpha3
 
 import (
+	"fmt"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -273,8 +275,9 @@ type RedfishSpec struct {
 
 // PXESpec defines PXE boot configuration for a Machine.
 type PXESpec struct {
-	// Image is an OCI image reference containing the machine disk image.
-	// The image must contain /disk/disk.img.gz.
+	// Image is an OCI image reference containing machine install artifacts.
+	// Raw installs require /disk/disk.img.gz. RAID1 installs require
+	// /disk/rootfs.tar.zst and /disk/esp.tar.zst.
 	// Example: "ghcr.io/azure/host-ubuntu2404:v1"
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
@@ -307,8 +310,9 @@ type PXESpec struct {
 	NetbootPullSecretRef *NamespacedSecretReference `json:"netbootPullSecretRef,omitempty"`
 
 	// BootProtocol selects how metalman should trigger network boot for
-	// repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
-	// HTTP boot with a URL derived from the netboot image metadata.
+	// repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses UEFI HTTP boot:
+	// Redfish-capable machines receive a one-time HTTP boot URL, and DHCP
+	// HTTPClient firmware requests receive an absolute HTTP bootfile URL.
 	// +kubebuilder:validation:Enum=PXE;HTTP
 	// +kubebuilder:default=PXE
 	// +optional
@@ -324,6 +328,11 @@ type PXESpec struct {
 	// +optional
 	TargetDisk string `json:"targetDisk,omitempty"`
 
+	// Install configures how the PXE installer writes the machine image.
+	// When omitted, the installer uses the legacy raw disk image flow.
+	// +optional
+	Install *PXEInstallSpec `json:"install,omitempty"`
+
 	// Redfish configures optional Redfish BMC access.
 	// +optional
 	Redfish *RedfishSpec `json:"redfish,omitempty"`
@@ -334,10 +343,29 @@ type PXESpec struct {
 	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
 }
 
+// PXEInstallSpec configures how the PXE installer writes a machine image.
+// +kubebuilder:validation:XValidation:rule="!has(self.mode) || self.mode != 'RAID1' || (has(self.targetDisks) && size(self.targetDisks) == 2)",message="RAID1 install requires exactly two targetDisks"
+type PXEInstallSpec struct {
+	// Mode selects the install workflow used by the PXE initrd.
+	// Raw writes /disk/disk.img.gz directly to one disk. RAID1 creates a
+	// mirrored root disk from rootfs and ESP tarball machine artifacts.
+	// +kubebuilder:validation:Enum=Raw;RAID1
+	// +kubebuilder:default=Raw
+	// +optional
+	Mode string `json:"mode,omitempty"`
+
+	// TargetDisks are explicit whole-disk device paths used by the selected
+	// install mode. RAID1 requires exactly two paths. Raw uses the first path
+	// when set and otherwise falls back to targetDisk or automatic selection.
+	// Examples: /dev/nvme0n1, /dev/sda, /dev/disk/by-id/...
+	// +optional
+	TargetDisks []string `json:"targetDisks,omitempty"`
+}
+
 const (
 	// PXEBootProtocolPXE uses DHCP/TFTP PXE boot.
 	PXEBootProtocolPXE = "PXE"
-	// PXEBootProtocolHTTP uses Redfish UEFI HTTP boot.
+	// PXEBootProtocolHTTP uses UEFI HTTP boot.
 	PXEBootProtocolHTTP = "HTTP"
 	// PXEArchitectureAMD64 is the x86_64 target architecture for PXE boot.
 	PXEArchitectureAMD64 = "amd64"
@@ -347,6 +375,12 @@ const (
 	DefaultPXEArchitecture = PXEArchitectureAMD64
 	// DefaultPXEBootProtocol is used when spec.pxe.bootProtocol is omitted.
 	DefaultPXEBootProtocol = PXEBootProtocolPXE
+	// PXEInstallModeRaw writes a raw disk image to a single target disk.
+	PXEInstallModeRaw = "Raw"
+	// PXEInstallModeRAID1 creates a mirrored root disk from machine artifacts.
+	PXEInstallModeRAID1 = "RAID1"
+	// DefaultPXEInstallMode is used when spec.pxe.install.mode is omitted.
+	DefaultPXEInstallMode = PXEInstallModeRaw
 )
 
 // TargetArchitecture returns the effective PXE target architecture.
@@ -365,6 +399,46 @@ func (p *PXESpec) TargetBootProtocol() string {
 	}
 
 	return p.BootProtocol
+}
+
+// TargetInstallMode returns the effective PXE install mode.
+func (p *PXESpec) TargetInstallMode() string {
+	if p == nil || p.Install == nil || p.Install.Mode == "" {
+		return DefaultPXEInstallMode
+	}
+
+	return p.Install.Mode
+}
+
+// InstallTargetDisks returns the effective installer target disk list.
+func (p *PXESpec) InstallTargetDisks() []string {
+	if p == nil {
+		return nil
+	}
+
+	if p.Install != nil && len(p.Install.TargetDisks) > 0 {
+		return p.Install.TargetDisks
+	}
+
+	if p.TargetDisk != "" {
+		return []string{p.TargetDisk}
+	}
+
+	return nil
+}
+
+// ValidateInstall returns an error when the PXE install configuration cannot
+// be rendered into a safe installer command line.
+func (p *PXESpec) ValidateInstall() error {
+	switch p.TargetInstallMode() {
+	case PXEInstallModeRAID1:
+		disks := p.InstallTargetDisks()
+		if len(disks) != 2 {
+			return fmt.Errorf("RAID1 install requires exactly two targetDisks, got %d", len(disks))
+		}
+	}
+
+	return nil
 }
 
 // CloudInitSpec defines cloud-init customization for PXE-booted machines.
