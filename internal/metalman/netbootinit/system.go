@@ -99,6 +99,7 @@ func (i *Installer) withMounted(source, target string, filesystems []string, fn 
 	}
 
 	mounted := true
+
 	defer func() {
 		if mounted {
 			unmountBestEffort(i.System, target)
