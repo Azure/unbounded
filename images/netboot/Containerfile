@@ -1,6 +1,20 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.4-trixie AS init-builder
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ARG TARGETOS=linux
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -o /out/metalman-netboot-init ./cmd/metalman-netboot-init
+
 FROM docker.io/library/ubuntu:24.04 AS build
 
 ARG TARGETARCH
@@ -42,9 +56,10 @@ RUN mkdir -p /artifacts && \
         echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1; \
     fi
 
-COPY images/netboot/assets/init /tmp/initrd-root/init
+COPY --from=init-builder /out/metalman-netboot-init /tmp/initrd-root/init
 RUN chmod 755 /tmp/initrd-root/init && \
-    mkdir -p /tmp/initrd-root/usr/bin /tmp/initrd-root/usr/lib && \
+    mkdir -p /tmp/initrd-root/etc/ssl/certs /tmp/initrd-root/usr/bin /tmp/initrd-root/usr/lib && \
+    cp /etc/ssl/certs/ca-certificates.crt /tmp/initrd-root/etc/ssl/certs/ && \
     cp /usr/bin/efibootmgr /tmp/initrd-root/usr/bin/ && \
     for lib in $(ldd /usr/bin/efibootmgr | awk '/=>/{print $3}'); do \
         mkdir -p "/tmp/initrd-root$(dirname "$lib")" && \
