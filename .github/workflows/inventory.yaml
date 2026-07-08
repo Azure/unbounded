@@ -35,11 +35,11 @@ jobs:
       - name: Build all inventory binaries
         run: make inventory-all
 
-      - name: Build all inventory container images
-        run: make image-inventory-all-local CONTAINER_ENGINE=docker
-
       - name: Vulnerability check
         run: make vulncheck
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Log in to ghcr.io
         uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
@@ -48,5 +48,35 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push all inventory container images
-        run: make image-inventory-all-push CONTAINER_ENGINE=docker
+      - name: Build and push inventory-aggregator image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/inventory/aggregator/Containerfile
+          push: true
+          tags: ${{ env.CONTAINER_REGISTRY }}/inventory-aggregator:latest
+          cache-from: type=gha,scope=inventory-aggregator
+          cache-to: type=gha,mode=max,scope=inventory-aggregator
+          provenance: false
+
+      - name: Build and push inventory-inspector image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/inventory/inspector/Containerfile
+          push: true
+          tags: ${{ env.CONTAINER_REGISTRY }}/inventory-inspector:latest
+          cache-from: type=gha,scope=inventory-inspector
+          cache-to: type=gha,mode=max,scope=inventory-inspector
+          provenance: false
+
+      - name: Build and push inventory-viewer image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: images/inventory/viewer/Containerfile
+          push: true
+          tags: ${{ env.CONTAINER_REGISTRY }}/inventory-viewer:latest
+          cache-from: type=gha,scope=inventory-viewer
+          cache-to: type=gha,mode=max,scope=inventory-viewer
+          provenance: false
