@@ -35,7 +35,7 @@ func TestAllocateVMSendsWireGuardPublicKeyToAggregatedAPI(t *testing.T) {
 			Architecture: operator.ArchitectureAMD64,
 			Endpoint:     operator.EndpointResponse{Host: "203.0.113.10", WireGuardUDPPort: 51820},
 			WireGuard:    operator.WireGuardResponse{ServerPublicKey: "kX4Z6LwejXzAl2m4nA1rY3EWB3yJe2rZXYc2umY7jU0=", ServerAddress: "10.250.1.1/24", ClientAddress: "10.250.1.2/24"},
-			VXLAN:        operator.VXLANResponse{VNI: 12001, UDPPort: 4789, ServerAddress: "10.250.1.1", ClientAddress: "10.250.1.2"},
+			VXLAN:        operator.VXLANResponse{VNI: 12001, UDPPort: 4789},
 			Network:      operator.NetworkResponse{GuestMAC: "02:00:00:00:00:01", GuestIPv4: "192.168.10.10", GatewayIPv4: "192.168.10.1", SubnetMask: "255.255.255.0"},
 		})
 	}))

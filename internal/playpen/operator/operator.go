@@ -55,8 +55,6 @@ const (
 	aggregatedAPIVersionPath = aggregatedAPIGroupPath + "/" + apiVersion
 	allocationsPath          = aggregatedAPIVersionPath + "/allocations"
 	deallocationsPath        = aggregatedAPIVersionPath + "/deallocations"
-	allocsPath               = aggregatedAPIVersionPath + "/allocs"
-	deallocsPath             = aggregatedAPIVersionPath + "/deallocs"
 
 	extensionAuthNamespace       = "kube-system"
 	extensionAuthConfigMapName   = "extension-apiserver-authentication"
@@ -119,25 +117,19 @@ type AllocResponse struct {
 }
 
 type EndpointResponse struct {
-	Host                  string `json:"host"`
-	WireGuardUDPPort      int32  `json:"wireGuardUDPPort"`
-	ExternalTrafficPolicy string `json:"externalTrafficPolicy"`
+	Host             string `json:"host"`
+	WireGuardUDPPort int32  `json:"wireGuardUDPPort"`
 }
 
 type WireGuardResponse struct {
-	Interface       string `json:"interface"`
 	ServerPublicKey string `json:"serverPublicKey"`
 	ServerAddress   string `json:"serverAddress"`
 	ClientAddress   string `json:"clientAddress"`
-	ListenPort      int    `json:"listenPort"`
 }
 
 type VXLANResponse struct {
-	Interface     string `json:"interface"`
-	VNI           int    `json:"vni"`
-	UDPPort       int    `json:"udpPort"`
-	ServerAddress string `json:"serverAddress"`
-	ClientAddress string `json:"clientAddress"`
+	VNI     int `json:"vni"`
+	UDPPort int `json:"udpPort"`
 }
 
 type NetworkResponse struct {
@@ -212,8 +204,6 @@ func (o *Operator) Handler() http.Handler {
 	mux.HandleFunc(aggregatedAPIVersionPath, o.handleAPIVersionDiscovery)
 	mux.HandleFunc(allocationsPath, o.handleAllocs)
 	mux.HandleFunc(deallocationsPath, o.handleDeallocs)
-	mux.HandleFunc(allocsPath, o.handleAllocs)
-	mux.HandleFunc(deallocsPath, o.handleDeallocs)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 
@@ -278,8 +268,6 @@ func (o *Operator) handleAPIVersionDiscovery(w http.ResponseWriter, r *http.Requ
 		"resources": []map[string]any{
 			{"name": "allocations", "singularName": "allocation", "namespaced": false, "kind": "Allocation", "verbs": []string{"create", "get"}},
 			{"name": "deallocations", "singularName": "deallocation", "namespaced": false, "kind": "Deallocation", "verbs": []string{"create"}},
-			{"name": "allocs", "singularName": "alloc", "namespaced": false, "kind": "Alloc", "verbs": []string{"create"}},
-			{"name": "deallocs", "singularName": "dealloc", "namespaced": false, "kind": "Dealloc", "verbs": []string{"create"}},
 		},
 	})
 }
@@ -292,12 +280,7 @@ func (o *Operator) handleAllocs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resourceName := "allocations"
-	if strings.HasSuffix(r.URL.Path, "/allocs") {
-		resourceName = "allocs"
-	}
-
-	if !o.authorizeAggregatedRequest(w, r, resourceName) {
+	if !o.authorizeAggregatedRequest(w, r, "allocations") {
 		return
 	}
 
@@ -339,12 +322,7 @@ func (o *Operator) handleDeallocs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resourceName := "deallocations"
-	if strings.HasSuffix(r.URL.Path, "/deallocs") {
-		resourceName = "deallocs"
-	}
-
-	if !o.authorizeAggregatedRequest(w, r, resourceName) {
+	if !o.authorizeAggregatedRequest(w, r, "deallocations") {
 		return
 	}
 
@@ -427,7 +405,7 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 		return AllocResponse{}, http.StatusServiceUnavailable, err
 	}
 
-	params := allocationParams(id, hostPort, o.Config)
+	params := allocationParams(id)
 
 	redfishCert, redfishKey, err := selfSignedCert(name, []string{name, "localhost", params.serverWG})
 	if err != nil {
@@ -444,20 +422,15 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 			"endpoint":  name + "-endpoint",
 			"secret":    name,
 		},
-		Endpoint: EndpointResponse{Host: "", WireGuardUDPPort: hostPort, ExternalTrafficPolicy: "Local"},
+		Endpoint: EndpointResponse{Host: "", WireGuardUDPPort: hostPort},
 		WireGuard: WireGuardResponse{
-			Interface:       "wg0",
 			ServerPublicKey: serverKey.PublicKey().String(),
 			ServerAddress:   params.serverWG + "/24",
 			ClientAddress:   params.clientWG + "/24",
-			ListenPort:      o.Config.EndpointListenPort,
 		},
 		VXLAN: VXLANResponse{
-			Interface:     "vxlan0",
-			VNI:           params.vni,
-			UDPPort:       o.Config.VXLANPort,
-			ServerAddress: params.serverWG,
-			ClientAddress: params.clientWG,
+			VNI:     params.vni,
+			UDPPort: o.Config.VXLANPort,
 		},
 		Network: NetworkResponse{
 			GuestMAC:    params.mac,
@@ -467,19 +440,32 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 			DNS:         o.Config.GuestDNS,
 		},
 		Redfish: map[string]string{
-			"url":                    "https://" + params.serverWG + ":" + strconv.Itoa(o.Config.RedfishPort),
-			"username":               "playpen",
-			"password":               redfishPassword,
-			"deviceID":               "1",
-			"certPEM":                string(redfishCert),
-			"systemURL":              "https://" + params.serverWG + ":" + strconv.Itoa(o.Config.RedfishPort) + "/redfish/v1/Systems/1",
-			"serialConsoleStreamURI": "/redfish/v1/Systems/1/Oem/Unbounded/SerialConsole/Stream",
+			"url":       "https://" + params.serverWG + ":" + strconv.Itoa(o.Config.RedfishPort),
+			"username":  "playpen",
+			"password":  redfishPassword,
+			"deviceID":  "1",
+			"certPEM":   string(redfishCert),
+			"systemURL": "https://" + params.serverWG + ":" + strconv.Itoa(o.Config.RedfishPort) + "/redfish/v1/Systems/1",
 		},
 	}
 
 	labels := allocationLabels(id, arch)
-
 	annotations := map[string]string{annotationExpiresAt: expiresAt.Format(time.RFC3339), annotationRequest: requestHash}
+	cleanupOnFailure := true
+
+	defer func() {
+		if !cleanupOnFailure {
+			return
+		}
+
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := o.deleteAllocation(cleanupCtx, name); err != nil {
+			klog.Warningf("Failed to clean up failed playpen allocation %s: %v", name, err)
+		}
+	}()
+
 	if err := o.createSecret(ctx, name, labels, annotations, serverKey.String(), redfishPassword, redfishCert, redfishKey); err != nil {
 		return AllocResponse{}, http.StatusInternalServerError, err
 	}
@@ -488,15 +474,18 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 		return AllocResponse{}, http.StatusInternalServerError, err
 	}
 
-	if err := o.createVM(ctx, name, arch, req, labels, annotations, params); err != nil {
-		return AllocResponse{}, http.StatusInternalServerError, err
-	}
-
 	if err := o.createEndpointPod(ctx, name, arch, req.WireGuardPublicKey, labels, annotations, params, hostPort); err != nil {
 		return AllocResponse{}, http.StatusInternalServerError, err
 	}
 
-	if err := o.fillEndpointHost(ctx, &resp, name); err != nil {
+	placement, err := o.waitForEndpointPlacement(ctx, name)
+	if err != nil {
+		return AllocResponse{}, http.StatusInternalServerError, err
+	}
+
+	resp.Endpoint.Host = placement.host
+
+	if err := o.createVM(ctx, name, arch, req, labels, annotations, params, placement.hostname); err != nil {
 		return AllocResponse{}, http.StatusInternalServerError, err
 	}
 
@@ -512,6 +501,8 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 	if err := o.Client.Create(ctx, cm); err != nil && !apierrors.IsAlreadyExists(err) {
 		return AllocResponse{}, http.StatusInternalServerError, err
 	}
+
+	cleanupOnFailure = false
 
 	return resp, http.StatusOK, nil
 }
@@ -608,7 +599,7 @@ func (o *Operator) createNADs(ctx context.Context, name string, labels, annotati
 	return nil
 }
 
-func (o *Operator) createVM(ctx context.Context, name, arch string, req AllocRequest, labels, annotations map[string]string, params allocationParameters) error {
+func (o *Operator) createVM(ctx context.Context, name, arch string, req AllocRequest, labels, annotations map[string]string, params allocationParameters, nodeHostname string) error {
 	diskSize := strings.TrimSpace(req.DiskSize)
 	if diskSize == "" {
 		diskSize = o.Config.DefaultDiskSize
@@ -631,6 +622,11 @@ func (o *Operator) createVM(ctx context.Context, name, arch string, req AllocReq
 		machine["type"] = "virt"
 	}
 
+	nodeSelector := map[string]any{"kubernetes.io/arch": arch}
+	if nodeHostname != "" {
+		nodeSelector["kubernetes.io/hostname"] = nodeHostname
+	}
+
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "kubevirt.io/v1",
 		"kind":       "VirtualMachine",
@@ -645,7 +641,7 @@ func (o *Operator) createVM(ctx context.Context, name, arch string, req AllocReq
 			"template": map[string]any{
 				"metadata": map[string]any{"labels": labels, "annotations": annotations},
 				"spec": map[string]any{
-					"nodeSelector": map[string]any{"kubernetes.io/arch": arch},
+					"nodeSelector": nodeSelector,
 					"domain": map[string]any{
 						"cpu":       map[string]any{"cores": cpus},
 						"firmware":  firmware,
@@ -730,18 +726,12 @@ func (o *Operator) createEndpointPod(ctx context.Context, name, arch, clientPubK
 	return ignoreAlreadyExists(o.Client.Create(ctx, pod))
 }
 
-func (o *Operator) fillEndpointHost(ctx context.Context, resp *AllocResponse, name string) error {
-	host, err := o.waitForEndpointHost(ctx, name)
-	if err != nil {
-		return err
-	}
-
-	resp.Endpoint.Host = host
-
-	return nil
+type endpointPlacement struct {
+	host     string
+	hostname string
 }
 
-func (o *Operator) waitForEndpointHost(ctx context.Context, name string) (string, error) {
+func (o *Operator) waitForEndpointPlacement(ctx context.Context, name string) (endpointPlacement, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
@@ -751,9 +741,9 @@ func (o *Operator) waitForEndpointHost(ctx context.Context, name string) (string
 	var lastErr error
 
 	for {
-		host, err := o.endpointHost(ctx, name)
-		if err == nil && host != "" {
-			return host, nil
+		placement, err := o.endpointPlacement(ctx, name)
+		if err == nil && placement.host != "" {
+			return placement, nil
 		}
 
 		if err != nil {
@@ -763,43 +753,48 @@ func (o *Operator) waitForEndpointHost(ctx context.Context, name string) (string
 		select {
 		case <-ctx.Done():
 			if lastErr != nil {
-				return "", fmt.Errorf("waiting for endpoint host: %w", lastErr)
+				return endpointPlacement{}, fmt.Errorf("waiting for endpoint placement: %w", lastErr)
 			}
 
-			return "", fmt.Errorf("waiting for endpoint host: %w", ctx.Err())
+			return endpointPlacement{}, fmt.Errorf("waiting for endpoint placement: %w", ctx.Err())
 		case <-ticker.C:
 		}
 	}
 }
 
-func (o *Operator) endpointHost(ctx context.Context, name string) (string, error) {
+func (o *Operator) endpointPlacement(ctx context.Context, name string) (endpointPlacement, error) {
 	pod := &corev1.Pod{}
 	if err := o.Client.Get(ctx, types.NamespacedName{Namespace: o.Config.Namespace, Name: name + "-endpoint"}, pod); err != nil {
-		return "", err
+		return endpointPlacement{}, err
 	}
 
 	if pod.Spec.NodeName == "" {
-		return "", nil
+		return endpointPlacement{}, nil
 	}
 
 	node := &corev1.Node{}
 	if err := o.Client.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, node); err != nil {
-		return "", err
+		return endpointPlacement{}, err
+	}
+
+	hostname := node.Labels[corev1.LabelHostname]
+	if hostname == "" {
+		hostname = node.Name
 	}
 
 	for _, addr := range node.Status.Addresses {
 		if addr.Type == corev1.NodeExternalIP && addr.Address != "" {
-			return addr.Address, nil
+			return endpointPlacement{host: addr.Address, hostname: hostname}, nil
 		}
 	}
 
 	for _, addr := range node.Status.Addresses {
 		if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
-			return addr.Address, nil
+			return endpointPlacement{host: addr.Address, hostname: hostname}, nil
 		}
 	}
 
-	return "", fmt.Errorf("node %s has no usable address", node.Name)
+	return endpointPlacement{}, fmt.Errorf("node %s has no usable address", node.Name)
 }
 
 func (o *Operator) allocateHostPort(ctx context.Context, name string) (int32, error) {
@@ -870,7 +865,7 @@ type allocationParameters struct {
 	gatewayIP string
 }
 
-func allocationParams(id string, _ int32, cfg Config) allocationParameters {
+func allocationParams(id string) allocationParameters {
 	sum := sha256.Sum256([]byte(id))
 
 	third := int(sum[0])

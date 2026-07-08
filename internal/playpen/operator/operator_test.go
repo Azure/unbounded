@@ -46,10 +46,9 @@ func TestAllocationIDIsStableAndShort(t *testing.T) {
 }
 
 func TestAllocationParamsAreDeterministic(t *testing.T) {
-	cfg := DefaultConfig()
-	first := allocationParams("0123456789abcdef", 51820, cfg)
+	first := allocationParams("0123456789abcdef")
 
-	second := allocationParams("0123456789abcdef", 51820, cfg)
+	second := allocationParams("0123456789abcdef")
 	if first != second {
 		t.Fatalf("params differ: %#v != %#v", first, second)
 	}

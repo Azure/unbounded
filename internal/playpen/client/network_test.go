@@ -64,6 +64,7 @@ func TestTunnelSetupCommands(t *testing.T) {
 		"ip -n ns-playpen route add 10.88.0.1/32 dev wg-playpen",
 		"ip -n ns-playpen link add vx-playpen type vxlan id 12001 dev wg-playpen local 10.88.0.2 remote 10.88.0.1 dstport 4789 nolearning",
 		"ip netns exec ns-playpen bridge fdb append 00:00:00:00:00:00 dev vx-playpen dst 10.88.0.1",
+		"ip -n ns-playpen addr add 192.168.200.1/24 dev vx-playpen",
 		"ip -n ns-playpen link set vx-playpen up",
 		"ip netns exec ns-playpen sysctl -w net.ipv4.ip_forward=1",
 		"ip netns exec ns-playpen iptables -A FORWARD -i vx-playpen -o mn-playpen -j ACCEPT",
@@ -75,24 +76,20 @@ func TestTunnelSetupCommands(t *testing.T) {
 	}
 }
 
-func TestGuestNetworkPrefixes(t *testing.T) {
+func TestGuestGatewayPrefix(t *testing.T) {
 	metadata := testAllocResponse()
 
-	gatewayPrefix, guestSubnet, err := guestNetworkPrefixes(metadata.Network)
+	gatewayPrefix, err := guestGatewayPrefix(metadata.Network)
 	if err != nil {
-		t.Fatalf("guest network prefixes: %v", err)
+		t.Fatalf("guest gateway prefix: %v", err)
 	}
 
 	if gatewayPrefix != "192.168.200.1/24" {
 		t.Fatalf("gateway prefix = %q, want 192.168.200.1/24", gatewayPrefix)
 	}
-
-	if guestSubnet != "192.168.200.0/24" {
-		t.Fatalf("guest subnet = %q, want 192.168.200.0/24", guestSubnet)
-	}
 }
 
-func TestGuestNetworkPrefixesRejectsInvalidMetadata(t *testing.T) {
+func TestGuestGatewayPrefixRejectsInvalidMetadata(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
 		mutate func(*operator.NetworkResponse)
@@ -126,8 +123,8 @@ func TestGuestNetworkPrefixesRejectsInvalidMetadata(t *testing.T) {
 			metadata := testAllocResponse()
 			tt.mutate(&metadata.Network)
 
-			if _, _, err := guestNetworkPrefixes(metadata.Network); err == nil {
-				t.Fatal("guest network prefixes succeeded, want error")
+			if _, err := guestGatewayPrefix(metadata.Network); err == nil {
+				t.Fatal("guest gateway prefix succeeded, want error")
 			}
 		})
 	}

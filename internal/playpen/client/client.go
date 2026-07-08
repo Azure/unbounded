@@ -155,11 +155,6 @@ func (c *Client) AllocateVM(ctx context.Context, opts AllocateVMOptions) (*Alloc
 	}, nil
 }
 
-// Allocate is retained as a convenience alias for existing smoke tests moving to AllocateVM.
-func (c *Client) Allocate(ctx context.Context, opts AllocateVMOptions) (*Allocation, error) {
-	return c.AllocateVM(ctx, opts)
-}
-
 func (c *Client) deallocate(ctx context.Context, allocationID, idempotencyKey string) error {
 	body, err := json.Marshal(operator.DeallocRequest{AllocationID: allocationID, IdempotencyKey: idempotencyKey})
 	if err != nil {
@@ -197,10 +192,6 @@ func (a *Allocation) ConfigureNetwork(ctx context.Context) error {
 	}
 
 	return a.tunnel.Setup(ctx)
-}
-
-func (a *Allocation) ConfigureTunnel(ctx context.Context) error {
-	return a.ConfigureNetwork(ctx)
 }
 
 func (a *Allocation) ServePXE(ctx context.Context, opts PXEServerOptions) (*exec.Cmd, error) {

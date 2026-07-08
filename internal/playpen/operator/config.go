@@ -26,7 +26,6 @@ type Config struct {
 	EndpointListenPort     int
 	RedfishPort            int
 	VXLANPort              int
-	GuestCIDR              string
 	GuestDNS               []string
 	DefaultDiskSize        string
 	DefaultMemory          string
@@ -49,7 +48,6 @@ func DefaultConfig() Config {
 		EndpointListenPort:     51820,
 		RedfishPort:            8443,
 		VXLANPort:              4789,
-		GuestCIDR:              "192.168.200.0/24",
 		GuestDNS:               []string{"1.1.1.1", "8.8.8.8"},
 		DefaultDiskSize:        "40Gi",
 		DefaultMemory:          "2Gi",

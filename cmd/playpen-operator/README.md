@@ -12,6 +12,12 @@ WireGuard/VXLAN peer and can run local PXE services against the returned VM MAC
 and lease metadata. Redfish is served by the endpoint pod over the WireGuard
 address and controls the VM through KubeVirt subresources.
 
+The data path is intentionally small: one hostPort-backed WireGuard UDP socket
+reaches the endpoint pod, and a point-to-point VXLAN device over that WireGuard
+link carries only PXE/guest traffic. The client creates a private network
+namespace with the matching WireGuard/VXLAN devices and assigns the returned
+guest gateway address to the VXLAN device before running PXE helpers there.
+
 ## API
 
 The operator is registered as `v1alpha1.playpen.unbounded-cloud.io` and is meant
@@ -27,9 +33,6 @@ authorizes requests with `SubjectAccessReview`.
 | `/apis/playpen.unbounded-cloud.io/v1alpha1/deallocations` | `POST` | Delete an allocation |
 | `/healthz` | `GET` | Liveness probe |
 | `/readyz` | `GET` | Readiness probe |
-
-Compatibility aliases `/allocs` and `/deallocs` are still served for older local
-helpers, but new callers should use `/allocations` and `/deallocations`.
 
 Alloc requests require an idempotency key and a valid WireGuard public key. The
 idempotency key can be passed in the `Idempotency-Key` header or, for `kubectl`
