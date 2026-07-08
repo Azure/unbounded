@@ -54,9 +54,6 @@ METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
 NETBOOT_IMAGE ?= $(CONTAINER_REGISTRY)/netboot:$(VERSION)
 
-PLAYPEN_TAG ?= $(subst /,-,$(VERSION))
-PLAYPEN_IMAGE ?= $(CONTAINER_REGISTRY)/playpen:$(PLAYPEN_TAG)
-
 KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
 KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
 
@@ -212,9 +209,9 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
-.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
+.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
@@ -295,7 +292,6 @@ help: ## Show this help
 	@echo "  image-machina-local              Build machina image with \$$(CONTAINER_ENGINE)"
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-metalman-local             Build metalman image"
-	@echo "  image-playpen-local              Build playpen image"
 	@echo "  image-net-controller-local       Build unbounded-net-controller image"
 	@echo "  image-net-controller-push        Build and push unbounded-net-controller image"
 	@echo "  image-net-node-local             Build unbounded-net-node image"
@@ -430,27 +426,24 @@ lint: ## Run golangci-lint (matches CI; run `make fmt` to auto-fix)
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-test: machina-manifests machine-ops-manifests playpen-manifests net-manifests ## Run all tests with race detector
+test: machina-manifests machine-ops-manifests net-manifests ## Run all tests with race detector
 	$(GOTEST) -race $(GO_PACKAGES)
 
 else
 # Locally, chain test -> lint for convenience.
 
-test: lint machina-manifests machine-ops-manifests playpen-manifests net-manifests ## Run all tests (implies lint)
+test: lint machina-manifests machine-ops-manifests net-manifests ## Run all tests (implies lint)
 	$(GOTEST) $(GO_PACKAGES)
 
 endif
 
-e2e-playpen: ## Run the kind-based playpen e2e suite
-	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
-
-build: machina-manifests machine-ops-manifests playpen-manifests net-manifests ## Build all Go packages
+build: machina-manifests machine-ops-manifests net-manifests ## Build all Go packages
 	$(GOBUILD) $(GO_PACKAGES)
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate $(GO_PACKAGES)
 
-vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifests ## Run govulncheck for known vulnerabilities
+vulncheck: machina-manifests machine-ops-manifests net-manifests ## Run govulncheck for known vulnerabilities
 	@# GO-2024-3218 (libp2p/go-libp2p-kad-dht): all versions affected, no fix
 	@# available. Theoretical DHT content-censorship attack, not exploitable in
 	@# gantry's private-cluster deployment model. Tracked upstream at
@@ -955,13 +948,6 @@ MACHINE_OPS_NAMESPACE ?= unbounded-kube
 MACHINE_OPS_API_SERVER_ENDPOINT ?=
 MACHINE_OPS_MANIFEST_TEMPLATES_DIR := deploy/machine-ops
 MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
-PLAYPEN_NAMESPACE ?= playpen
-PLAYPEN_ALLOCATION_TTL ?= 30m
-PLAYPEN_WIREGUARD_HOST_PORT_START ?= 51820
-PLAYPEN_WIREGUARD_HOST_PORT_END ?= 51899
-PLAYPEN_MANIFEST_TEMPLATES_DIR := deploy/playpen
-PLAYPEN_MANIFEST_RENDERED_DIR  := deploy/playpen/rendered
-
 machina-manifests: ## Render machina deployment manifests into deploy/machina/rendered
 	@mkdir -p $(MACHINA_MANIFEST_RENDERED_DIR)
 	@find $(MACHINA_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
@@ -989,19 +975,6 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT)
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 
-playpen-manifests: ## Render playpen KubeVirt allocator manifests into deploy/playpen/rendered
-	@mkdir -p $(PLAYPEN_MANIFEST_RENDERED_DIR)
-	@find $(PLAYPEN_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
-	$(GOCMD) run ./hack/cmd/render-manifests \
-		--templates-dir $(PLAYPEN_MANIFEST_TEMPLATES_DIR) \
-		--output-dir $(PLAYPEN_MANIFEST_RENDERED_DIR) \
-		--set Namespace=$(PLAYPEN_NAMESPACE) \
-		--set PlaypenImage=$(PLAYPEN_IMAGE) \
-		--set AllocationTTL=$(PLAYPEN_ALLOCATION_TTL) \
-		--set WireGuardHostPortStart=$(PLAYPEN_WIREGUARD_HOST_PORT_START) \
-		--set WireGuardHostPortEnd=$(PLAYPEN_WIREGUARD_HOST_PORT_END)
-	@echo "Rendered playpen manifests into $(PLAYPEN_MANIFEST_RENDERED_DIR) (image: $(PLAYPEN_IMAGE))"
-
 machina-run: machina ## Replace the in-cluster machina with a locally built binary
 	kubectl scale deployment/machina-controller --replicas=0 -n unbounded-kube
 	kubectl get configmap machina-config -n unbounded-kube -o jsonpath='{.data.config\.yaml}' > hack/machina-config.yaml
@@ -1021,15 +994,6 @@ metalman-oci: image-metalman-local ## Alias for image-metalman-local
 
 metalman-oci-push: metalman-oci ## Build and push the metalman container image
 	$(CONTAINER_ENGINE) push $(METALMAN_IMAGE)
-
-image-playpen-local: ## Build the playpen container image locally (single-arch)
-	$(CONTAINER_ENGINE) build \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
-		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t playpen:$(PLAYPEN_TAG) -t $(PLAYPEN_IMAGE) \
-		-f ./images/playpen/Containerfile .
-	$(call trivy-maybe,$(PLAYPEN_IMAGE))
 
 image-gantry-local: ## Build the gantry container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
