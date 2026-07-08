@@ -754,47 +754,81 @@ def assert_node_label(name: str, key: str, value: str) -> None:
     log(f"  Node '{name}' has label {key}={value}")
 
 
+def operation_targets_node(op: dict[str, Any]) -> bool:
+    if op.get("spec", {}).get("machineRef") == NODE_NAME:
+        return True
+    for target in op.get("status", {}).get("targets", []):
+        if target.get("machineRef") == NODE_NAME:
+            return True
+    return False
+
+
+def find_host_replace_operation(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+    candidates = [
+        op for op in items
+        if op.get("spec", {}).get("operationKind") == "HostReplace" and operation_targets_node(op)
+    ]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda op: (
+        op.get("metadata", {}).get("creationTimestamp", ""),
+        op.get("metadata", {}).get("name", ""),
+    ))[0]
+
+
 def assert_cloud_init_done(timeout: int = 900) -> None:
-    """Assert the Machine's CloudInitDone condition reaches True/Succeeded.
+    """Assert the HostReplace operation's CloudInitDone condition is True/Succeeded.
 
     Called before waiting for the Kubernetes Node to appear because
     cloud-init must finish before the kubelet can join the cluster.
     Fails fast if the condition transitions to Failed so that the
     smoke test does not wait for the full node-join timeout.
     """
-    log(f"  Waiting for Machine '{NODE_NAME}' CloudInitDone condition...")
+    log(f"  Waiting for HostReplace MachineOperation CloudInitDone condition for '{NODE_NAME}'...")
     for elapsed in range(timeout):
         check_procs()
         result = subprocess.run(
-            [KUBECTL, "get", f"machines.{API_GROUP}", NODE_NAME, "-o", "json"],
+            [KUBECTL, "get", f"machineoperations.{API_GROUP}", "-o", "json"],
             capture_output=True, text=True,
         )
+        op_name = ""
+        phase = ""
         status = ""
         reason = ""
         message = ""
         if result.returncode == 0:
             try:
-                conditions = json.loads(result.stdout).get("status", {}).get("conditions", [])
-                for c in conditions:
-                    if c.get("type") == "CloudInitDone":
-                        status = c.get("status", "")
-                        reason = c.get("reason", "")
-                        message = c.get("message", "")
-                        break
+                op = find_host_replace_operation(json.loads(result.stdout).get("items", []))
+                if op is not None:
+                    op_name = op.get("metadata", {}).get("name", "")
+                    op_status = op.get("status", {})
+                    phase = op_status.get("phase", "")
+                    message = op_status.get("message", "")
+                    for c in op_status.get("conditions", []):
+                        if c.get("type") == "CloudInitDone":
+                            status = c.get("status", "")
+                            reason = c.get("reason", "")
+                            message = c.get("message", "")
+                            break
             except (json.JSONDecodeError, KeyError):
                 pass
 
+        if phase == "Failed":
+            die(f"HostReplace MachineOperation '{op_name}' failed: {message}")
         if status == "True":
             if reason != "Succeeded":
                 die(f"CloudInitDone condition is True but reason is {reason!r}, expected 'Succeeded'")
-            log(f"  Machine '{NODE_NAME}' CloudInitDone condition is True/Succeeded")
+            log(f"  MachineOperation '{op_name}' CloudInitDone condition is True/Succeeded")
             return
         if status == "False" and reason == "Failed":
             die(f"Cloud-init failed: {message}")
         if elapsed > 0 and elapsed % 30 == 0:
-            log(f"    ({elapsed}s) CloudInitDone status={status or 'not set'} reason={reason or 'not set'}")
+            if op_name:
+                log(f"    ({elapsed}s) MachineOperation '{op_name}' phase={phase or 'empty'} CloudInitDone status={status or 'not set'} reason={reason or 'not set'}")
+            else:
+                log(f"    ({elapsed}s) HostReplace MachineOperation not found yet")
         time.sleep(1)
-    die(f"Timed out waiting for CloudInitDone condition on Machine '{NODE_NAME}'")
+    die(f"Timed out waiting for CloudInitDone condition on HostReplace MachineOperation for '{NODE_NAME}'")
 
 
 def wait_machine_operation_complete(name: str, timeout: int = 1800) -> None:
