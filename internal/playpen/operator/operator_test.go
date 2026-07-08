@@ -34,6 +34,7 @@ func TestNormalizeArchitecture(t *testing.T) {
 
 func TestAllocationIDIsStableAndShort(t *testing.T) {
 	first := allocationID("key")
+
 	second := allocationID("key")
 	if first != second {
 		t.Fatalf("ids differ: %s != %s", first, second)
@@ -47,6 +48,7 @@ func TestAllocationIDIsStableAndShort(t *testing.T) {
 func TestAllocationParamsAreDeterministic(t *testing.T) {
 	cfg := DefaultConfig()
 	first := allocationParams("0123456789abcdef", 51820, cfg)
+
 	second := allocationParams("0123456789abcdef", 51820, cfg)
 	if first != second {
 		t.Fatalf("params differ: %#v != %#v", first, second)

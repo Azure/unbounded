@@ -74,6 +74,7 @@ type bootConfig struct {
 
 func main() {
 	ctx := context.Background()
+
 	cfg, err := loadConfig()
 	if err != nil {
 		fatal(err)
@@ -274,6 +275,7 @@ func (h *redfishServer) createSession(w http.ResponseWriter, r *http.Request) {
 
 func (h *redfishServer) deleteSession(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(strings.TrimRight(r.URL.Path, "/"), "/redfish/v1/SessionService/Sessions/")
+
 	h.mu.Lock()
 	delete(h.sessions, token)
 	h.mu.Unlock()
@@ -285,6 +287,7 @@ func (h *redfishServer) authenticated(r *http.Request) bool {
 		h.mu.Lock()
 		_, ok := h.sessions[token]
 		h.mu.Unlock()
+
 		if ok {
 			return true
 		}
@@ -301,9 +304,11 @@ func (h *redfishServer) credentialsMatch(user, pass string) bool {
 
 func (h *redfishServer) getSystem(w http.ResponseWriter, r *http.Request) {
 	powerState := "Off"
+
 	vm, err := h.vm(r.Context())
 	if err == nil {
-		if created, _, _ := unstructured.NestedBool(vm.Object, "status", "created"); created {
+		created, _, err := unstructured.NestedBool(vm.Object, "status", "created")
+		if err == nil && created {
 			powerState = "On"
 		}
 	}
@@ -353,6 +358,7 @@ func (h *redfishServer) patchSystem(w http.ResponseWriter, r *http.Request) {
 	if body.Boot.HttpBootUri != "" {
 		h.boot.HTTPBootURI = body.Boot.HttpBootUri
 	}
+
 	boot := h.boot
 	h.mu.Unlock()
 
@@ -376,6 +382,7 @@ func (h *redfishServer) reset(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var err error
+
 	switch body.ResetType {
 	case "On":
 		err = h.subresource(r.Context(), "start", nil)
@@ -406,6 +413,7 @@ func (h *redfishServer) applyBootOrder(ctx context.Context, target string) error
 		{"op": "replace", "path": "/spec/template/spec/domain/devices/interfaces/1/bootOrder", "value": nicOrder},
 		{"op": "replace", "path": "/spec/template/spec/domain/devices/disks/0/bootOrder", "value": diskOrder},
 	}
+
 	data, err := json.Marshal(patch)
 	if err != nil {
 		return err
@@ -422,6 +430,7 @@ func (h *redfishServer) vm(ctx context.Context) (*unstructured.Unstructured, err
 
 func (h *redfishServer) subresource(ctx context.Context, name string, body map[string]any) error {
 	var reader io.Reader = http.NoBody
+
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
@@ -432,6 +441,7 @@ func (h *redfishServer) subresource(ctx context.Context, name string, body map[s
 	}
 
 	url := strings.TrimRight(h.restConfig.Host, "/") + "/apis/subresources.kubevirt.io/v1/namespaces/" + h.cfg.Namespace + "/virtualmachines/" + h.cfg.VMName + "/" + name
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, reader)
 	if err != nil {
 		return err
@@ -464,6 +474,7 @@ func (h *redfishServer) subresource(ctx context.Context, name string, body map[s
 
 func run(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
+
 	out, err := cmd.CombinedOutput()
 	if err != nil && len(out) > 0 {
 		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))

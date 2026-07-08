@@ -16,6 +16,7 @@ import (
 
 func TestAllocateVMSendsWireGuardPublicKeyToAggregatedAPI(t *testing.T) {
 	var got operator.AllocRequest
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != allocationsPath {
 			t.Fatalf("path = %s", r.URL.Path)
@@ -65,10 +66,12 @@ func TestAllocateVMSendsWireGuardPublicKeyToAggregatedAPI(t *testing.T) {
 
 func TestCloseTearsDownTunnelBeforeDeallocate(t *testing.T) {
 	var deallocated bool
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case deallocationsPath:
 			deallocated = true
+
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
@@ -77,6 +80,7 @@ func TestCloseTearsDownTunnelBeforeDeallocate(t *testing.T) {
 	defer server.Close()
 
 	fake := &fakeCommander{}
+
 	c, err := New(Config{RESTConfig: &rest.Config{Host: server.URL}, HTTPClient: server.Client(), cmd: fake})
 	if err != nil {
 		t.Fatal(err)

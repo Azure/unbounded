@@ -178,6 +178,7 @@ func (o *Operator) Run(ctx context.Context) error {
 	}
 
 	errCh := make(chan error, 1)
+
 	go func() { errCh <- server.ListenAndServeTLS("", "") }()
 
 	ticker := time.NewTicker(o.Config.ReconcileInterval)
@@ -188,6 +189,7 @@ func (o *Operator) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
+
 			server.Shutdown(shutdownCtx) //nolint:errcheck
 
 			return nil
@@ -386,7 +388,12 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 
 	id := allocationID(idempotencyKey)
 	name := allocationName(id)
-	requestHash := hashRequest(req)
+
+	requestHash, err := hashRequest(req)
+	if err != nil {
+		return AllocResponse{}, http.StatusInternalServerError, err
+	}
+
 	cm := &corev1.ConfigMap{}
 	if err := o.Client.Get(ctx, types.NamespacedName{Namespace: o.Config.Namespace, Name: name}, cm); err == nil {
 		if cm.Annotations[annotationRequest] != requestHash {
@@ -414,12 +421,14 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 	}
 
 	expiresAt := time.Now().UTC().Add(o.Config.AllocationTTL)
+
 	hostPort, err := o.allocateHostPort(ctx, name)
 	if err != nil {
 		return AllocResponse{}, http.StatusServiceUnavailable, err
 	}
 
 	params := allocationParams(id, hostPort, o.Config)
+
 	redfishCert, redfishKey, err := selfSignedCert(name, []string{name, "localhost", params.serverWG})
 	if err != nil {
 		return AllocResponse{}, http.StatusInternalServerError, err
@@ -469,6 +478,7 @@ func (o *Operator) Alloc(ctx context.Context, idempotencyKey string, req AllocRe
 	}
 
 	labels := allocationLabels(id, arch)
+
 	annotations := map[string]string{annotationExpiresAt: expiresAt.Format(time.RFC3339), annotationRequest: requestHash}
 	if err := o.createSecret(ctx, name, labels, annotations, serverKey.String(), redfishPassword, redfishCert, redfishKey); err != nil {
 		return AllocResponse{}, http.StatusInternalServerError, err
@@ -526,6 +536,7 @@ func (o *Operator) Reconcile(ctx context.Context) error {
 	}
 
 	now := time.Now()
+
 	for _, cm := range list.Items {
 		expiresAt, err := time.Parse(time.RFC3339, cm.Annotations[annotationExpiresAt])
 		if err != nil || now.After(expiresAt) {
@@ -614,6 +625,7 @@ func (o *Operator) createVM(ctx context.Context, name, arch string, req AllocReq
 	}
 
 	firmware := map[string]any{"bootloader": map[string]any{"efi": map[string]any{"secureBoot": false}}}
+
 	machine := map[string]any{}
 	if arch == ArchitectureARM64 {
 		machine["type"] = "virt"
@@ -737,6 +749,7 @@ func (o *Operator) waitForEndpointHost(ctx context.Context, name string) (string
 	defer ticker.Stop()
 
 	var lastErr error
+
 	for {
 		host, err := o.endpointHost(ctx, name)
 		if err == nil && host != "" {
@@ -796,6 +809,7 @@ func (o *Operator) allocateHostPort(ctx context.Context, name string) (int32, er
 	}
 
 	used := map[int32]struct{}{}
+
 	for _, pod := range pods.Items {
 		if pod.Name == name+"-endpoint" {
 			for _, c := range pod.Spec.Containers {
@@ -826,14 +840,24 @@ func (o *Operator) allocateHostPort(ctx context.Context, name string) (int32, er
 }
 
 func (o *Operator) deleteAllocation(ctx context.Context, name string) error {
-	_ = o.Dynamic.Resource(virtualMachinesGVR).Namespace(o.Config.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	_ = o.Dynamic.Resource(nadsGVR).Namespace(o.Config.Namespace).Delete(ctx, name+"-vm", metav1.DeleteOptions{})
-	_ = o.Dynamic.Resource(nadsGVR).Namespace(o.Config.Namespace).Delete(ctx, name+"-pod", metav1.DeleteOptions{})
-	_ = o.Client.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name + "-endpoint", Namespace: o.Config.Namespace}})
-	_ = o.Client.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: o.Config.Namespace}})
-	_ = o.Client.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: o.Config.Namespace}})
+	var err error
 
-	return nil
+	err = errors.Join(err, ignoreNotFound(o.Dynamic.Resource(virtualMachinesGVR).Namespace(o.Config.Namespace).Delete(ctx, name, metav1.DeleteOptions{})))
+	err = errors.Join(err, ignoreNotFound(o.Dynamic.Resource(nadsGVR).Namespace(o.Config.Namespace).Delete(ctx, name+"-vm", metav1.DeleteOptions{})))
+	err = errors.Join(err, ignoreNotFound(o.Dynamic.Resource(nadsGVR).Namespace(o.Config.Namespace).Delete(ctx, name+"-pod", metav1.DeleteOptions{})))
+	err = errors.Join(err, ignoreNotFound(o.Client.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name + "-endpoint", Namespace: o.Config.Namespace}})))
+	err = errors.Join(err, ignoreNotFound(o.Client.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: o.Config.Namespace}})))
+	err = errors.Join(err, ignoreNotFound(o.Client.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: o.Config.Namespace}})))
+
+	return err
+}
+
+func ignoreNotFound(err error) error {
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+
+	return err
 }
 
 type allocationParameters struct {
@@ -848,6 +872,7 @@ type allocationParameters struct {
 
 func allocationParams(id string, _ int32, cfg Config) allocationParameters {
 	sum := sha256.Sum256([]byte(id))
+
 	third := int(sum[0])
 	if third == 0 || third == 255 {
 		third = 42
@@ -903,12 +928,17 @@ func normalizeArchitecture(arch string) (string, error) {
 	}
 }
 
-func hashRequest(req AllocRequest) string {
+func hashRequest(req AllocRequest) (string, error) {
 	req.IdempotencyKey = ""
-	data, _ := json.Marshal(req)
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		return "", err
+	}
+
 	sum := sha256.Sum256(data)
 
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func binaryMod(data []byte, mod uint64) uint64 {
@@ -929,7 +959,7 @@ func randomHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func copyMap(base map[string]string, extra map[string]string) map[string]string {
+func copyMap(base, extra map[string]string) map[string]string {
 	out := make(map[string]string, len(base)+len(extra))
 	for k, v := range base {
 		out[k] = v
@@ -969,6 +999,7 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func (o *Operator) EnsureTLSSecret(ctx context.Context) (tls.Certificate, error) {
 	secret := &corev1.Secret{}
+
 	key := types.NamespacedName{Namespace: o.Config.Namespace, Name: o.Config.TLSSecretName}
 	if err := o.Client.Get(ctx, key, secret); err == nil {
 		return tls.X509KeyPair(secret.Data[corev1.TLSCertKey], secret.Data[corev1.TLSPrivateKeyKey])
@@ -1059,6 +1090,7 @@ func (o *Operator) refreshAggregatedClientCAs(ctx context.Context) {
 
 	o.aggregatedMu.Lock()
 	defer o.aggregatedMu.Unlock()
+
 	o.aggregatedClientCAs = pool
 	o.aggregatedClientAllowedCNs = allowed
 }
@@ -1074,6 +1106,7 @@ func parseRequestHeaderAllowedNames(raw string) (map[string]struct{}, error) {
 	}
 
 	allowed := map[string]struct{}{}
+
 	for _, name := range names {
 		if name != "" {
 			allowed[name] = struct{}{}
@@ -1119,6 +1152,7 @@ func (o *Operator) authorizeAggregatedRequest(w http.ResponseWriter, r *http.Req
 
 func remoteGroups(r *http.Request) []string {
 	var groups []string
+
 	for _, value := range r.Header.Values(remoteGroupHeader) {
 		for _, group := range strings.Split(value, ",") {
 			if group = strings.TrimSpace(group); group != "" {
@@ -1141,6 +1175,7 @@ func (o *Operator) isTrustedAggregatedRequest(r *http.Request) bool {
 	}
 
 	leaf := r.TLS.PeerCertificates[0]
+
 	intermediates := x509.NewCertPool()
 	for _, cert := range r.TLS.PeerCertificates[1:] {
 		intermediates.AddCert(cert)

@@ -24,6 +24,10 @@ func TestAllocateKubeVirtPlaypenVM(t *testing.T) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	restConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{}).ClientConfig()
 	if err != nil {
+		if clientcmd.IsEmptyConfig(err) {
+			t.Skipf("skipping playpen e2e: no Kubernetes configuration was provided: %v", err)
+		}
+
 		t.Fatal(err)
 	}
 

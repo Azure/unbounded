@@ -74,6 +74,7 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	restConfig := rest.CopyConfig(cfg.RESTConfig)
+
 	baseURL := strings.TrimRight(strings.TrimSpace(restConfig.Host), "/")
 	if baseURL == "" {
 		return nil, fmt.Errorf("REST config host is required")
@@ -82,6 +83,7 @@ func New(cfg Config) (*Client, error) {
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		var err error
+
 		httpClient, err = rest.HTTPClientFor(restConfig)
 		if err != nil {
 			return nil, fmt.Errorf("create Kubernetes HTTP client: %w", err)
@@ -135,6 +137,7 @@ func (c *Client) AllocateVM(ctx context.Context, opts AllocateVMOptions) (*Alloc
 	if err != nil {
 		return nil, err
 	}
+
 	req.Header.Set(idempotencyKeyHeader, idempotencyKey)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -167,6 +170,7 @@ func (c *Client) deallocate(ctx context.Context, allocationID, idempotencyKey st
 	if err != nil {
 		return err
 	}
+
 	req.Header.Set(idempotencyKeyHeader, strings.TrimSpace(idempotencyKey))
 	req.Header.Set("Content-Type", "application/json")
 
@@ -245,6 +249,7 @@ func (a *Allocation) Command(ctx context.Context, name string, args ...string) (
 	}
 
 	cmdArgs := append([]string{"netns", "exec", namespace, name}, args...)
+
 	cmdName := "ip"
 	if os.Geteuid() != 0 {
 		cmdArgs = append([]string{"-n", cmdName}, cmdArgs...)
