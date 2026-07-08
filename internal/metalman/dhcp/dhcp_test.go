@@ -379,6 +379,7 @@ func TestDHCPHandlerHTTPBootClientGetsHTTPBootURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	discover.UpdateOption(dhcpv4.OptClassIdentifier("HTTPClient:Arch:00016:UNDI:003016"))
 
 	conn := &fakePacketConn{}
