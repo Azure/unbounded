@@ -151,6 +151,12 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if node.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP && isOptionalShimRevocationsFile(path) {
+			serveMissingShimRevocationsFile(w, log, node, path)
+
+			return
+		}
+
 		log.Warn("resolving file", "node", node.Name, "err", err)
 		http.NotFound(w, r)
 
@@ -169,6 +175,33 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", resolved.ContentType)
 	w.Write(resolved.Data) //nolint:errcheck // Best-effort HTTP response write.
 	h.recordHTTPBootLoaderDownloaded(r.Context(), log, node, imageRef, path)
+}
+
+const shimRevocationsNotPresentBody = "unbounded: no optional shim revocations file is present\n"
+
+func isOptionalShimRevocationsFile(path string) bool {
+	path = strings.Trim(path, "/")
+	if i := strings.LastIndex(path, "/"); i >= 0 {
+		path = path[i+1:]
+	}
+
+	switch strings.ToLower(path) {
+	case "revocations.efi", "revocations_sbat.efi", "revocations_sku.efi":
+		return true
+	default:
+		return false
+	}
+}
+
+func serveMissingShimRevocationsFile(w http.ResponseWriter, log *slog.Logger, node *v1alpha3.Machine, path string) {
+	// shim treats these files as optional for netboot, but its HTTP fetch path
+	// requires a 200 response with a non-empty body. Returning a small invalid
+	// EFI payload preserves the "not present" semantics without sending a 404.
+	log.Info("serving no-op body for missing optional shim revocations file", "node", node.Name, "path", path)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", fmt.Sprint(len(shimRevocationsNotPresentBody)))
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(shimRevocationsNotPresentBody)) //nolint:errcheck // Best-effort HTTP response write.
 }
 
 func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) {
