@@ -194,7 +194,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 	}
 }
 
-func TestHTTPServer_HTTPBootLoaderRequiresPendingRepave(t *testing.T) {
+func TestHTTPServer_HTTPBootLoaderRequiresActiveInstallOperation(t *testing.T) {
 	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpboot123", map[string][]byte{
 		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: shimx64.efi\n"),
 		"shimx64.efi":   []byte("shim"),
@@ -204,31 +204,29 @@ func TestHTTPServer_HTTPBootLoaderRequiresPendingRepave(t *testing.T) {
 	tests := []struct {
 		name          string
 		path          string
-		statusRepave  int64
+		installActive bool
 		wantStatus    int
 		wantBody      []byte
 		wantBootEvent []string
 	}{
 		{
-			name:          "pending repave serves bootloader",
+			name:          "active install serves bootloader",
 			path:          "shimx64.efi",
-			statusRepave:  0,
+			installActive: true,
 			wantStatus:    http.StatusOK,
 			wantBody:      []byte("shim"),
 			wantBootEvent: []string{"node-http:shimx64.efi"},
 		},
 		{
-			name:         "cleared repave hides bootloader",
-			path:         "shimx64.efi",
-			statusRepave: 1,
-			wantStatus:   http.StatusNotFound,
+			name:       "no active install hides bootloader",
+			path:       "shimx64.efi",
+			wantStatus: http.StatusNotFound,
 		},
 		{
-			name:         "cleared repave serves follow-on artifacts",
-			path:         "vmlinuz",
-			statusRepave: 1,
-			wantStatus:   http.StatusOK,
-			wantBody:     []byte("kernel"),
+			name:       "no active install serves follow-on artifacts",
+			path:       "vmlinuz",
+			wantStatus: http.StatusOK,
+			wantBody:   []byte("kernel"),
 		},
 	}
 
@@ -242,17 +240,32 @@ func TestHTTPServer_HTTPBootLoaderRequiresPendingRepave(t *testing.T) {
 						BootProtocol: v1alpha3.PXEBootProtocolHTTP,
 						DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:10", IPv4: "10.0.1.60", SubnetMask: "255.255.255.0"}},
 					},
-					Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 				},
-				Status: v1alpha3.MachineStatus{
-					Operations: &v1alpha3.OperationsStatus{RepaveCounter: tt.statusRepave},
-				},
+			}
+
+			objects := []client.Object{node}
+			if tt.installActive {
+				objects = append(objects, &v1alpha3.MachineOperation{
+					ObjectMeta: metav1.ObjectMeta{Name: "replace-node-http"},
+					Spec: v1alpha3.MachineOperationSpec{
+						OperationKind: v1alpha3.OperationHostReplace,
+						MachineRef:    node.Name,
+					},
+					Status: v1alpha3.MachineOperationStatus{
+						Phase: v1alpha3.OperationPhaseInProgress,
+						Targets: []v1alpha3.MachineOperationTargetStatus{{
+							MachineRef: node.Name,
+							Phase:      v1alpha3.OperationPhaseInProgress,
+							Stage:      v1alpha3.OperationStageWaitingRepave,
+						}},
+					},
+				})
 			}
 
 			scheme := newScheme(t)
 			fc := fake.NewClientBuilder().
 				WithScheme(scheme).
-				WithObjects(node).
+				WithObjects(objects...).
 				WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 				Build()
 			recorder := &recordingStatusRecorder{}

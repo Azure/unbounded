@@ -124,12 +124,21 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if node.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP &&
-		h.isHTTPBootLoaderDownload(imageRef, node.Spec.PXE.TargetArchitecture(), path) &&
-		!pxeRepavePending(node) {
-		log.Info("HTTP boot disabled because repave is not pending", "node", node.Name)
-		http.NotFound(w, r)
+		h.isHTTPBootLoaderDownload(imageRef, node.Spec.PXE.TargetArchitecture(), path) {
+		installRequested, err := h.installRequested(r.Context(), node)
+		if err != nil {
+			log.Warn("checking active install operation", "node", node.Name, "err", err)
+			http.Error(w, "checking active install operation", http.StatusServiceUnavailable)
 
-		return
+			return
+		}
+
+		if !installRequested {
+			log.Info("HTTP boot disabled because no install operation is active", "node", node.Name)
+			http.NotFound(w, r)
+
+			return
+		}
 	}
 
 	resolved, err := h.ResolveFileByPathForIP(r.Context(), path, node, imageRef, ip)
@@ -368,19 +377,6 @@ func (h *HTTPServer) isHTTPBootLoaderDownload(imageRef, architecture, path strin
 	}
 
 	return HTTPBootPathFromMetadata(meta) == strings.TrimPrefix(path, "/")
-}
-
-func pxeRepavePending(node *v1alpha3.Machine) bool {
-	var specRepave, statusRepave int64
-	if node != nil && node.Spec.Operations != nil {
-		specRepave = node.Spec.Operations.RepaveCounter
-	}
-
-	if node != nil && node.Status.Operations != nil {
-		statusRepave = node.Status.Operations.RepaveCounter
-	}
-
-	return specRepave > statusRepave
 }
 
 func (h *HTTPServer) recordCloudInitStatus(ctx context.Context, log *slog.Logger, machineName string, ev *cloudInitEvent) {
