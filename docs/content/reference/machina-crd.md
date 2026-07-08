@@ -86,13 +86,6 @@ Kubernetes join configuration.
 | `kubernetes.nodeLabels` | map[string]string | No | - | Labels to apply to the Node (not yet propagated by the machina controller). |
 | `kubernetes.bootstrapTokenRef.name` | string | Yes | - | Name of the bootstrap token Secret in `kube-system`. |
 
-### spec.operations
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `operations.rebootCounter` | int64 | No | `0` | Triggers a reboot when the spec value exceeds the status value. |
-| `operations.repaveCounter` | int64 | No | `0` | Triggers a PXE repave when the spec value exceeds the status value. |
-
 ### spec.provider and spec.providerID
 
 `provider` selects the external control provider for out-of-band operations.
@@ -208,7 +201,6 @@ and remains authoritative even if labels later change. Each entry includes:
 | `startedAt` | time | Target start timestamp. |
 | `completedAt` | time | Target terminal timestamp. |
 | `observedGeneration` | int64 | Machine generation acted on. |
-| `targetOperations` | OperationsStatus | Counter targets used by bare-metal `HostReplace`. |
 | `attempts` | int32 | External action attempts for retryable Redfish operations. |
 | `lastAttemptAt` | time | Most recent external action attempt timestamp. |
 
@@ -221,8 +213,6 @@ and remains authoritative even if labels later change. Each entry includes:
 | `ssh.fingerprint` | string | SSH host key fingerprint (not yet implemented). |
 | `redfish.certFingerprint` | string | BMC TLS certificate SHA-256 fingerprint. Set by metalman using TOFU. |
 | `tpm.ekPublicKey` | string | TPM endorsement key in PEM format. Set by metalman attestation using TOFU. |
-| `operations.rebootCounter` | int64 | Last-acted reboot counter value. |
-| `operations.repaveCounter` | int64 | Last-acted repave counter value. |
 | `conditions` | []Condition | Standard Kubernetes conditions (see below). |
 
 ### Conditions
@@ -232,9 +222,7 @@ and remains authoritative even if labels later change. Each entry includes:
 | `SSHReachable` | machina | `True` / `False` based on a TCP probe to the SSH port. |
 | `Provisioning` | machina | `True` while the install script is running over SSH. `lastTransitionTime` records when provisioning started, used to detect stale provisioning attempts (e.g. after a controller restart). |
 | `Provisioned` | machina | `True` after successful SSH provisioning. `ObservedGeneration` tracks the spec generation. |
-| `PoweredOff` | metalman | Tracks BMC power state during a reboot cycle. Removed after power-on completes. Not defined as a CRD type constant; set directly by the metalman redfish reconciler. |
-| `BootOrderConfigSupported` | metalman | Set to `False` when the BMC does not support boot order configuration. Not defined as a CRD type constant; set directly by the metalman redfish reconciler. |
-| `Repaved` | metalman | `False`/`Pending` during repave; `True`/`Succeeded` after `/pxe/disable`. Stale `False` conditions are removed after a 30-minute timeout. |
+| `CloudInitDone` | metalman | Observed first-boot cloud-init result for PXE machines. Metalman also mirrors cloud-init progress to active `HostReplace` `MachineOperation` conditions. |
 
 ### Phase lifecycle
 
