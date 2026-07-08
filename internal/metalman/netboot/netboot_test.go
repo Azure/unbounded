@@ -281,6 +281,7 @@ func TestHTTPServer_HTTPBootLoaderRequiresPendingRepave(t *testing.T) {
 			require.NoError(t, err)
 
 			require.Equal(t, tt.wantStatus, resp.StatusCode)
+
 			if tt.wantBody != nil {
 				require.Equal(t, tt.wantBody, body)
 			}
