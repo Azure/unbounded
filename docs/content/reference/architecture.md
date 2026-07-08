@@ -53,8 +53,8 @@ Runs three reconcilers and four network servers:
 | Reconciler / Server     | Role                                                        |
 |-------------------------|-------------------------------------------------------------|
 | OCIReconciler           | Pulls and caches OCI netboot images from container registries. |
-| Redfish Reconciler      | BMC power control and boot order via Redfish REST. TOFU TLS cert pinning. |
-| Lifecycle Reconciler    | Detects 30-min repave timeout and triggers automatic retry. |
+| Redfish Reconciler      | TOFU TLS cert pinning for BMC Redfish endpoints. |
+| MachineOperation Reconciler | BMC power control, boot override, reboot, and repave operations via Redfish REST. |
 | DHCP server (UDP/67)    | Static IP assignment by MAC address.                        |
 | TFTP server (UDP/69)    | Bootloader delivery.                                        |
 | HTTP server (TCP/8880)  | Kernel, initrd, Go-templated configs, `/attest` (TPM), `/pxe/disable`. |
@@ -93,14 +93,12 @@ Represents a host and drives its lifecycle.
 | `spec.ssh`            | SSH connectivity (host, port, user, privateKeyRef) and optional bastion config. |
 | `spec.pxe`            | PXE config: machine image reference, optional netboot image override, dhcpLeases, redfish settings. |
 | `spec.kubernetes`     | Kubernetes version, bootstrapTokenRef, nodeRef, nodeLabels. |
-| `spec.operations`     | Reboot and repave counters. |
 
 Status includes phase, message, conditions, SSH fingerprint, Redfish cert
-fingerprint, TPM info, and operation results. The API defines four condition
-type constants: `Provisioned`, `SSHReachable`, `Provisioning`, and `Repaved`.
-Additional conditions such as `PoweredOff` and `BootOrderConfigSupported` may
-be set by the metalman controller but are not defined as constants in the
-Machine types.
+fingerprint, and TPM info. The API defines condition type constants including
+`Provisioned`, `SSHReachable`, `Provisioning`, `CloudInitDone`, and
+`RepavePending`. Day-2 reboot and repave progress is tracked on
+`MachineOperation` objects rather than on the Machine itself.
 
 ### Netboot OCI Images
 
@@ -155,7 +153,7 @@ For a walkthrough, see the [SSH Provisioning Guide]({{< ref "guides/ssh" >}}).
 ### PXE Path (metalman)
 
 1. `Machine` CR created with `spec.pxe`.
-2. Redfish reconciler sets boot device to PXE and power-cycles the host.
+2. A `HostReplace` `MachineOperation` requests a repave; metalman sets the PXE or HTTP boot override and force-restarts the host through Redfish.
 3. Host PXE-boots: DHCP (IP + boot filename) -> TFTP (bootloader) -> HTTP
    (kernel, initrd, configs).
 4. Init script: writes disk image, injects configs, calls `/pxe/disable`,

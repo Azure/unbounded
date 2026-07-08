@@ -39,6 +39,9 @@ const (
 	reasonTargetNoLongerOwned      = "TargetNoLongerOwned"
 	reasonExecutionFailed          = "ExecutionFailed"
 	reasonWaitingForOlderOperation = "WaitingForOlderOperation"
+	reasonTimedOut                 = "TimedOut"
+
+	cloudInitTimeout = 5 * time.Minute
 )
 
 // PowerClient is the Redfish power operation subset used by MachineOperation reconciliation.
@@ -46,6 +49,8 @@ type PowerClient interface {
 	PowerState(ctx context.Context) (redfish.PowerState, error)
 	Reset(ctx context.Context, resetType redfish.ResetType) error
 	DisableBootOverride(ctx context.Context) error
+	SetBootOverride(ctx context.Context, target redfish.BootTarget, enabled redfish.BootEnabled) error
+	SetHTTPBootOverride(ctx context.Context, bootURL string) error
 }
 
 // PowerClientFactory builds a PowerClient for a Machine.
@@ -60,6 +65,7 @@ type Reconciler struct {
 
 	Site                  string
 	PowerClients          PowerClientFactory
+	HTTPBootURL           func(*v1alpha3.Machine) (string, error)
 	MaxConcurrentMachines int
 	MaxAttempts           int32
 	PollInterval          time.Duration
@@ -363,7 +369,7 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 		return failTarget(target, reasonUnsupportedTarget, fmt.Sprintf("Machine %s is not a bare-metal Redfish target", machine.Name), now)
 	}
 
-	if op.Spec.OperationKind != v1alpha3.OperationHostReplace || target.TargetOperations == nil {
+	if op.Spec.OperationKind != v1alpha3.OperationHostReplace || target.ObservedGeneration == 0 {
 		target.ObservedGeneration = machine.Generation
 	}
 
@@ -371,9 +377,9 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 	case v1alpha3.OperationHostPowerOff:
 		return r.advancePowerOff(ctx, &machine, target, now)
 	case v1alpha3.OperationHostPowerOn:
-		return r.advancePowerOn(ctx, &machine, target, now)
+		return r.advancePowerOn(ctx, op, &machine, target, now)
 	case v1alpha3.OperationHostReboot:
-		return r.advanceReboot(ctx, &machine, target, now)
+		return r.advanceReboot(ctx, op, &machine, target, now)
 	case v1alpha3.OperationHostReplace:
 		return r.advanceReplace(ctx, op, &machine, target, now)
 	default:
@@ -412,13 +418,13 @@ func (r *Reconciler) advancePowerOff(ctx context.Context, machine *v1alpha3.Mach
 	return targetChange{target: target}
 }
 
-func (r *Reconciler) advancePowerOn(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+func (r *Reconciler) advancePowerOn(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
 	pc, err := r.PowerClients.ForMachine(ctx, machine)
 	if err != nil {
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
-	if err := pc.DisableBootOverride(ctx); err != nil {
+	if err := disableBootOverride(ctx, pc, &target, op.Generation, now); err != nil {
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
@@ -447,13 +453,13 @@ func (r *Reconciler) advancePowerOn(ctx context.Context, machine *v1alpha3.Machi
 	return targetChange{target: target}
 }
 
-func (r *Reconciler) advanceReboot(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+func (r *Reconciler) advanceReboot(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
 	pc, err := r.PowerClients.ForMachine(ctx, machine)
 	if err != nil {
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
-	if err := pc.DisableBootOverride(ctx); err != nil {
+	if err := disableBootOverride(ctx, pc, &target, op.Generation, now); err != nil {
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
@@ -509,6 +515,31 @@ func (r *Reconciler) advanceReboot(ctx context.Context, machine *v1alpha3.Machin
 	}
 }
 
+func disableBootOverride(ctx context.Context, pc PowerClient, target *v1alpha3.MachineOperationTargetStatus, observedGeneration int64, now metav1.Time) error {
+	if apimeta.IsStatusConditionTrue(target.Conditions, v1alpha3.MachineOperationTargetConditionRedfishDisableBootOverrideUnsupported) {
+		return pc.SetBootOverride(ctx, redfish.BootTargetHdd, redfish.BootContinuous)
+	}
+
+	if err := pc.DisableBootOverride(ctx); err != nil {
+		if !errors.Is(err, redfish.ErrUnsupported) {
+			return err
+		}
+
+		apimeta.SetStatusCondition(&target.Conditions, metav1.Condition{
+			Type:               v1alpha3.MachineOperationTargetConditionRedfishDisableBootOverrideUnsupported,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Unsupported",
+			Message:            "BMC does not support disabling Redfish boot override; falling back to Hdd/Continuous",
+			ObservedGeneration: observedGeneration,
+			LastTransitionTime: now,
+		})
+
+		return pc.SetBootOverride(ctx, redfish.BootTargetHdd, redfish.BootContinuous)
+	}
+
+	return nil
+}
+
 func (r *Reconciler) waitForPowerAction(target v1alpha3.MachineOperationTargetStatus, stage v1alpha3.OperationStage, waitingMessage, timeoutMessage string, now metav1.Time) (targetChange, bool) {
 	if target.Stage != stage || target.LastAttemptAt == nil {
 		return targetChange{}, false
@@ -527,71 +558,118 @@ func (r *Reconciler) waitForPowerAction(target v1alpha3.MachineOperationTargetSt
 }
 
 func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
-	if target.TargetOperations == nil {
-		target.TargetOperations = computeReplaceTargets(machine)
-		target.Stage = v1alpha3.OperationStageRepaveRequested
-		target.Message = "computed PXE repave target counters"
+	if target.Stage == "" {
+		if err := r.requestRepaveBoot(ctx, machine); err != nil {
+			return retryTarget(target, err, now, r.maxAttempts())
+		}
+
+		target.Stage = v1alpha3.OperationStageWaitingRepave
+		target.Attempts++
+		target.LastAttemptAt = &now
+		target.Message = "requested PXE repave boot"
 
 		return targetChange{target: target}
 	}
 
-	if machine.Spec.Operations == nil ||
-		machine.Spec.Operations.RebootCounter < target.TargetOperations.RebootCounter ||
-		machine.Spec.Operations.RepaveCounter < target.TargetOperations.RepaveCounter {
-		target.Stage = v1alpha3.OperationStageRepaveRequested
-		target.Message = "requesting PXE repave"
-
-		if err := r.patchMachineOperations(ctx, machine.Name, target.TargetOperations); err != nil {
-			return targetChange{target: target, err: err}
-		}
-
-		return targetChange{target: target}
+	if !apimeta.IsStatusConditionTrue(op.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten) {
+		return r.waitForRepaveBoot(ctx, machine, target, now)
 	}
 
-	if target.ObservedGeneration == 0 || target.Stage == v1alpha3.OperationStageRepaveRequested {
-		target.ObservedGeneration = machine.Generation
+	if change, done := cloudInitReplaceStatus(op, target, now); done {
+		return change
 	}
 
-	if machine.Status.Operations != nil &&
-		machine.Status.Operations.RebootCounter >= target.TargetOperations.RebootCounter &&
-		machine.Status.Operations.RepaveCounter >= target.TargetOperations.RepaveCounter &&
-		apimeta.IsStatusConditionTrue(machine.Status.Conditions, v1alpha3.MachineConditionRepaved) {
-		if change, done := cloudInitReplaceStatus(machine, target, now); done {
-			return change
+	nodeName := nodeNameForMachine(machine)
+
+	var node corev1.Node
+	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			target.Stage = v1alpha3.OperationStageWaitingNode
+			target.Message = fmt.Sprintf("waiting for Node %s to exist", nodeName)
+
+			return targetChange{target: target}
 		}
 
-		nodeName := nodeNameForMachine(machine)
+		return targetChange{target: target, err: fmt.Errorf("get Node %s: %w", nodeName, err)}
+	}
 
-		var node corev1.Node
-		if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
-			if apierrors.IsNotFound(err) {
-				target.Stage = v1alpha3.OperationStageWaitingNode
-				target.Message = fmt.Sprintf("waiting for Node %s to exist", nodeName)
+	return completeTarget(target, "HostReplace completed", now)
+}
 
-				return targetChange{target: target}
-			}
+func (r *Reconciler) requestRepaveBoot(ctx context.Context, machine *v1alpha3.Machine) error {
+	pc, err := r.PowerClients.ForMachine(ctx, machine)
+	if err != nil {
+		return err
+	}
 
-			return targetChange{target: target, err: fmt.Errorf("get Node %s: %w", nodeName, err)}
+	if machine.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
+		if r.HTTPBootURL == nil {
+			return fmt.Errorf("HTTP boot URL resolver is not configured")
 		}
 
-		return completeTarget(target, "HostReplace completed", now)
+		bootURL, err := r.HTTPBootURL(machine)
+		if err != nil {
+			return err
+		}
+
+		if err := pc.SetHTTPBootOverride(ctx, bootURL); err != nil {
+			return err
+		}
+	} else if err := pc.SetBootOverride(ctx, redfish.BootTargetPxe, redfish.BootContinuous); err != nil {
+		return err
+	}
+
+	state, err := pc.PowerState(ctx)
+	if err != nil {
+		return err
+	}
+
+	if state == redfish.PowerOff {
+		return pc.Reset(ctx, redfish.ResetOn)
+	}
+
+	return pc.Reset(ctx, redfish.ResetForceRestart)
+}
+
+func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+	if target.Stage == v1alpha3.OperationStageWaitingRepave && target.LastAttemptAt != nil {
+		if now.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
+			target.Message = "waiting for PXE installer to write the boot image"
+
+			return targetChange{target: target}
+		}
+
+		if target.Attempts >= r.maxAttempts() {
+			return failTarget(target, reasonExecutionFailed, fmt.Sprintf("timed out waiting for PXE repave after %d attempts", target.Attempts), now)
+		}
+	}
+
+	if err := r.requestRepaveBoot(ctx, machine); err != nil {
+		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
 	target.Stage = v1alpha3.OperationStageWaitingRepave
-	target.Message = "waiting for PXE repave to complete"
+	target.Attempts++
+	target.LastAttemptAt = &now
+	target.Message = "retrying PXE repave boot"
 
 	return targetChange{target: target}
 }
 
-func cloudInitReplaceStatus(machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) (targetChange, bool) {
-	cond := apimeta.FindStatusCondition(machine.Status.Conditions, v1alpha3.MachineConditionCloudInitDone)
-	if cond != nil && cond.ObservedGeneration >= target.ObservedGeneration {
-		if cond.Status == metav1.ConditionTrue {
+func cloudInitReplaceStatus(op *v1alpha3.MachineOperation, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) (targetChange, bool) {
+	cond := apimeta.FindStatusCondition(op.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+	if cond != nil {
+		switch cond.Status {
+		case metav1.ConditionTrue:
 			return targetChange{}, false
-		}
+		case metav1.ConditionFalse:
+			if cond.Reason == "Failed" {
+				return failTarget(target, reasonExecutionFailed, cond.Message, now), true
+			}
 
-		if cond.Reason == "Failed" {
-			return failTarget(target, reasonExecutionFailed, cond.Message, now), true
+			if !cond.LastTransitionTime.IsZero() && now.Sub(cond.LastTransitionTime.Time) >= cloudInitTimeout {
+				return failTarget(target, reasonTimedOut, fmt.Sprintf("cloud-init did not complete within %s", cloudInitTimeout), now), true
+			}
 		}
 	}
 
@@ -607,42 +685,6 @@ func nodeNameForMachine(machine *v1alpha3.Machine) string {
 	}
 
 	return machine.Name
-}
-
-func computeReplaceTargets(machine *v1alpha3.Machine) *v1alpha3.OperationsStatus {
-	var specReboot, specRepave, statusReboot, statusRepave int64
-	if machine.Spec.Operations != nil {
-		specReboot = machine.Spec.Operations.RebootCounter
-		specRepave = machine.Spec.Operations.RepaveCounter
-	}
-
-	if machine.Status.Operations != nil {
-		statusReboot = machine.Status.Operations.RebootCounter
-		statusRepave = machine.Status.Operations.RepaveCounter
-	}
-
-	return &v1alpha3.OperationsStatus{
-		RebootCounter: maxInt64(specReboot, statusReboot) + 1,
-		RepaveCounter: maxInt64(specRepave, statusRepave) + 1,
-	}
-}
-
-func (r *Reconciler) patchMachineOperations(ctx context.Context, machineName string, target *v1alpha3.OperationsStatus) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var machine v1alpha3.Machine
-		if err := r.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
-			return err
-		}
-
-		if machine.Spec.Operations == nil {
-			machine.Spec.Operations = &v1alpha3.OperationsSpec{}
-		}
-
-		machine.Spec.Operations.RebootCounter = target.RebootCounter
-		machine.Spec.Operations.RepaveCounter = target.RepaveCounter
-
-		return r.Update(ctx, &machine)
-	})
 }
 
 func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, changes []targetChange, restoreHostReplaceTriggerConditions bool) error {
@@ -1066,12 +1108,4 @@ func (r *Reconciler) powerActionTimeout() time.Duration {
 	}
 
 	return r.PowerActionTimeout
-}
-
-func maxInt64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-
-	return b
 }

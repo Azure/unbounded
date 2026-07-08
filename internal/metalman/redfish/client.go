@@ -32,8 +32,9 @@ const (
 type ResetType string
 
 const (
-	ResetForceOff ResetType = "ForceOff"
-	ResetOn       ResetType = "On"
+	ResetForceOff     ResetType = "ForceOff"
+	ResetForceRestart ResetType = "ForceRestart"
+	ResetOn           ResetType = "On"
 )
 
 // BootTarget represents a Redfish boot source override target.
@@ -241,9 +242,8 @@ func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error 
 	return nil
 }
 
-// DisableBootOverride disables the boot source override. If the BMC does
-// not support disabling, it falls back to setting Hdd/Continuous.
-// Returns ErrUnsupported if neither approach works.
+// DisableBootOverride disables the boot source override.
+// Returns ErrUnsupported if the BMC does not support disabling.
 func (c *Client) DisableBootOverride(ctx context.Context) error {
 	path := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
 
@@ -262,15 +262,11 @@ func (c *Client) DisableBootOverride(ctx context.Context) error {
 		return nil
 	}
 
-	if !isUnsupportedStatus(status) {
-		return fmt.Errorf("unexpected status %d from boot override PATCH", status)
+	if isUnsupportedStatus(status) {
+		return fmt.Errorf("disable boot override PATCH returned %d: %w", status, ErrUnsupported)
 	}
 
-	// Some BMCs do not support disabling the boot source override.
-	// Fall back to setting Hdd/Continuous, which prevents PXE boot.
-	slog.Info("BMC does not support Disabled boot override, falling back to Hdd")
-
-	return c.SetBootOverride(ctx, BootTargetHdd, BootContinuous)
+	return fmt.Errorf("unexpected status %d from boot override PATCH", status)
 }
 
 // CaptureFingerprint connects to a BMC without cert pinning and returns

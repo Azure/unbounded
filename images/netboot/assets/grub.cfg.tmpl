@@ -1,4 +1,4 @@
-{{ if le .SpecRepaveCounter .StatusRepaveCounter }}
+{{ if not .InstallRequested }}
 # No pending repave. Chainload the locally installed bootloader.
 insmod part_gpt
 insmod fat
