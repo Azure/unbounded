@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -43,6 +44,71 @@ func TestMACNormalization(t *testing.T) {
 
 	if got := bootifToMAC("01-AA-BB-CC-DD-EE-FF"); got != "aa:bb:cc:dd:ee:ff" {
 		t.Fatalf("bootifToMAC = %q", got)
+	}
+}
+
+func TestInstallConfigFromCmdline(t *testing.T) {
+	cfg, err := installConfigFromCmdline(strings.Join([]string{
+		"BOOTIF=01-AA-BB-CC-DD-EE-FF",
+		"unbounded.image_url=http://10.0.0.1/disk.img.gz",
+		"unbounded.serve_url=http://10.0.0.1",
+		"unbounded.disk=/dev/nvme0n1",
+		"unbounded.ds_url=http://10.0.0.1/cloud-init/",
+		"unbounded.node_name=node-1",
+		"unbounded.node_namespace=default",
+		"unbounded.apiserver_url=https://api.example.com",
+		"ip=10.0.0.10::10.0.0.1:255.255.255.0:::none",
+	}, " "))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.ImageURL != "http://10.0.0.1/disk.img.gz" {
+		t.Fatalf("image url = %q", cfg.ImageURL)
+	}
+
+	if cfg.ServeURL != "http://10.0.0.1" {
+		t.Fatalf("serve url = %q", cfg.ServeURL)
+	}
+
+	if cfg.TargetDisk != "/dev/nvme0n1" {
+		t.Fatalf("target disk = %q", cfg.TargetDisk)
+	}
+
+	if cfg.BootMAC != "aa:bb:cc:dd:ee:ff" {
+		t.Fatalf("boot MAC = %q", cfg.BootMAC)
+	}
+
+	if cfg.IPParam != "10.0.0.10::10.0.0.1:255.255.255.0:::none" {
+		t.Fatalf("ip param = %q", cfg.IPParam)
+	}
+
+	wantCloudInit := cloudInitConfig{
+		DSURL:         "http://10.0.0.1/cloud-init/",
+		ServeURL:      "http://10.0.0.1",
+		NodeName:      "node-1",
+		NodeNamespace: "default",
+		APIServerURL:  "https://api.example.com",
+	}
+	if cfg.CloudInit != wantCloudInit {
+		t.Fatalf("cloud-init config = %#v, want %#v", cfg.CloudInit, wantCloudInit)
+	}
+}
+
+func TestInstallConfigFromCmdlinePrefersExplicitBootMAC(t *testing.T) {
+	cfg, err := installConfigFromCmdline("BOOTIF=01-AA-BB-CC-DD-EE-FF unbounded.boot_mac=11-22-33-44-55-66 unbounded.image_url=http://10.0.0.1/disk.img.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.BootMAC != "11:22:33:44:55:66" {
+		t.Fatalf("boot MAC = %q", cfg.BootMAC)
+	}
+}
+
+func TestInstallConfigFromCmdlineRequiresImageURL(t *testing.T) {
+	if _, err := installConfigFromCmdline("BOOTIF=01-AA-BB-CC-DD-EE-FF"); err == nil {
+		t.Fatal("expected missing image URL error")
 	}
 }
 
