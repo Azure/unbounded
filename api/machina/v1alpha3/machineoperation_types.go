@@ -114,6 +114,15 @@ const (
 	MachineOperationConditionCloudInitDone = "CloudInitDone"
 )
 
+// Condition types for MachineOperation targets.
+const (
+	// MachineOperationTargetConditionRedfishDisableBootOverrideUnsupported
+	// indicates that metalman determined the target BMC does not support
+	// disabling the Redfish boot override. When True, metalman falls back to
+	// setting Hdd/Continuous for this target within this operation only.
+	MachineOperationTargetConditionRedfishDisableBootOverrideUnsupported = "RedfishDisableBootOverrideUnsupported"
+)
+
 // OperationStage represents the current stage of a target operation.
 type OperationStage string
 
@@ -242,6 +251,14 @@ type MachineOperationTargetStatus struct {
 	// LastAttemptAt records when the latest external action attempt occurred.
 	// +optional
 	LastAttemptAt *metav1.Time `json:"lastAttemptAt,omitempty"`
+
+	// Conditions represent target-scoped observations for this operation. These
+	// conditions are not persisted on the Machine, so BMC capability fallbacks
+	// apply only to this MachineOperation target.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // IsTerminal returns true if the operation phase is Complete or Failed.

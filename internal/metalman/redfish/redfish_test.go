@@ -148,7 +148,7 @@ func TestUEFIHTTPBootEndToEnd(t *testing.T)        { TestBootOrderConfigUEFIHTTP
 func TestBootOrderConfigNoOp(t *testing.T)         { TestBootOrderConfigPxeOff(t) }
 func TestBootOrderConfigNoOpPxeOff(t *testing.T)   { TestBootOrderConfigPxeOff(t) }
 
-func TestBootOrderConfigPxeOffDisableFallbackToHdd(t *testing.T) {
+func TestBootOrderConfigPxeOffUnsupported(t *testing.T) {
 	var (
 		patchCalls  atomic.Int64
 		patchBodies []map[string]any
@@ -184,15 +184,17 @@ func TestBootOrderConfigPxeOffDisableFallbackToHdd(t *testing.T) {
 	defer srv.Close()
 
 	client := dialTestClient(t, srv)
-	require.NoError(t, client.DisableBootOverride(t.Context()))
-	require.Equal(t, int64(2), patchCalls.Load())
+	require.ErrorIs(t, client.DisableBootOverride(t.Context()), ErrUnsupported)
+	require.Equal(t, int64(1), patchCalls.Load())
 
-	boot := patchBodies[1]["Boot"].(map[string]any)
-	require.Equal(t, "Hdd", boot["BootSourceOverrideTarget"])
-	require.Equal(t, "Continuous", boot["BootSourceOverrideEnabled"])
+	boot := patchBodies[0]["Boot"].(map[string]any)
+	require.Equal(t, "Disabled", boot["BootSourceOverrideEnabled"])
 }
 
-func TestBootOrderConfigNoOpPxeOffHdd(t *testing.T) { TestBootOrderConfigPxeOffDisableFallbackToHdd(t) }
+func TestBootOrderConfigPxeOffDisableFallbackToHdd(t *testing.T) {
+	TestBootOrderConfigPxeOffUnsupported(t)
+}
+func TestBootOrderConfigNoOpPxeOffHdd(t *testing.T) { TestBootOrderConfigPxeOffUnsupported(t) }
 
 func TestBootOrderConfigUnsupported(t *testing.T) {
 	srv, _, _, _ := testBMCWithPatchStatus(t, http.StatusNotImplemented)

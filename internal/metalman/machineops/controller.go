@@ -377,9 +377,9 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 	case v1alpha3.OperationHostPowerOff:
 		return r.advancePowerOff(ctx, &machine, target, now)
 	case v1alpha3.OperationHostPowerOn:
-		return r.advancePowerOn(ctx, &machine, target, now)
+		return r.advancePowerOn(ctx, op, &machine, target, now)
 	case v1alpha3.OperationHostReboot:
-		return r.advanceReboot(ctx, &machine, target, now)
+		return r.advanceReboot(ctx, op, &machine, target, now)
 	case v1alpha3.OperationHostReplace:
 		return r.advanceReplace(ctx, op, &machine, target, now)
 	default:
@@ -418,13 +418,13 @@ func (r *Reconciler) advancePowerOff(ctx context.Context, machine *v1alpha3.Mach
 	return targetChange{target: target}
 }
 
-func (r *Reconciler) advancePowerOn(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+func (r *Reconciler) advancePowerOn(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
 	pc, err := r.PowerClients.ForMachine(ctx, machine)
 	if err != nil {
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
-	if err := pc.DisableBootOverride(ctx); err != nil {
+	if err := disableBootOverride(ctx, pc, &target, op.Generation, now); err != nil {
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
@@ -453,13 +453,13 @@ func (r *Reconciler) advancePowerOn(ctx context.Context, machine *v1alpha3.Machi
 	return targetChange{target: target}
 }
 
-func (r *Reconciler) advanceReboot(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+func (r *Reconciler) advanceReboot(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
 	pc, err := r.PowerClients.ForMachine(ctx, machine)
 	if err != nil {
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
-	if err := pc.DisableBootOverride(ctx); err != nil {
+	if err := disableBootOverride(ctx, pc, &target, op.Generation, now); err != nil {
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
@@ -513,6 +513,31 @@ func (r *Reconciler) advanceReboot(ctx context.Context, machine *v1alpha3.Machin
 	default:
 		return failTarget(target, reasonExecutionFailed, fmt.Sprintf("unknown stage %s", target.Stage), now)
 	}
+}
+
+func disableBootOverride(ctx context.Context, pc PowerClient, target *v1alpha3.MachineOperationTargetStatus, observedGeneration int64, now metav1.Time) error {
+	if apimeta.IsStatusConditionTrue(target.Conditions, v1alpha3.MachineOperationTargetConditionRedfishDisableBootOverrideUnsupported) {
+		return pc.SetBootOverride(ctx, redfish.BootTargetHdd, redfish.BootContinuous)
+	}
+
+	if err := pc.DisableBootOverride(ctx); err != nil {
+		if !errors.Is(err, redfish.ErrUnsupported) {
+			return err
+		}
+
+		apimeta.SetStatusCondition(&target.Conditions, metav1.Condition{
+			Type:               v1alpha3.MachineOperationTargetConditionRedfishDisableBootOverrideUnsupported,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Unsupported",
+			Message:            "BMC does not support disabling Redfish boot override; falling back to Hdd/Continuous",
+			ObservedGeneration: observedGeneration,
+			LastTransitionTime: now,
+		})
+
+		return pc.SetBootOverride(ctx, redfish.BootTargetHdd, redfish.BootContinuous)
+	}
+
+	return nil
 }
 
 func (r *Reconciler) waitForPowerAction(target v1alpha3.MachineOperationTargetStatus, stage v1alpha3.OperationStage, waitingMessage, timeoutMessage string, now metav1.Time) (targetChange, bool) {
