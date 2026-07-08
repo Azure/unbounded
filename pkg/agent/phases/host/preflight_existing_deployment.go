@@ -54,6 +54,7 @@ func ensureNoExistingDeployment(ctx context.Context, log *slog.Logger, deps host
 	}
 
 	var messages []string
+
 	for _, result := range results {
 		if result.Target != "" {
 			messages = append(messages, fmt.Sprintf("%s (%s)", result.Message, result.Target))
@@ -73,6 +74,7 @@ func existingDeploymentResults(ctx context.Context, log *slog.Logger, deps hostC
 
 	for _, machineName := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
 		log.Debug("checking for registered nspawn machine", "machine", machineName)
+
 		if _, err := deps.outputCmd(ctx, log, "machinectl", "show", machineName); err == nil {
 			results = append(results, existingDeploymentResult(
 				"nspawn machine",
