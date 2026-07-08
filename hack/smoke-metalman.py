@@ -1148,6 +1148,7 @@ def prepare_http_boot_helper_disk(raw_image: str, dest: Path) -> None:
     log("  Converting helper disk to qcow2")
     run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2", str(disk_raw), str(dest)])
     run(["qemu-img", "resize", str(dest), "20G"])
+    shutil.rmtree(workdir, ignore_errors=True)
 
 
 def virt_filesystems(image: Path) -> list[tuple[str, str, str]]:
@@ -1386,6 +1387,7 @@ def prepare_raid_machine_image(raw_image: str, raid_image: str) -> None:
 
     log(f"  Building {raid_image}")
     run(["docker", "build", "-t", raid_image, "-f", str(workdir / "Containerfile"), str(workdir)])
+    shutil.rmtree(workdir, ignore_errors=True)
 
 
 def assert_raid1_install() -> None:
@@ -1709,12 +1711,14 @@ def main() -> None:
     run(["docker", "push", NETBOOT_IMAGE_NAME])
     run(["docker", "push", AGENT_IMAGE_NAME])
 
-    # Reclaim disk space consumed by Docker build cache.  The host-ubuntu2404
-    # build downloads a ~2 GB Ubuntu cloud image and converts it to raw; the
-    # intermediate layers are no longer needed once the images are pushed.
-    # Only prune the build cache (not running container images) to avoid
-    # disturbing the registry container.
-    log("Pruning Docker build cache to free disk space")
+    # Reclaim disk space after pushing to the local registry. Metalman pulls
+    # from the registry, so the duplicate loaded image tags and BuildKit cache
+    # are no longer needed. Keep the registry container itself running.
+    pushed_images = [IMAGE_NAME, NETBOOT_IMAGE_NAME, AGENT_IMAGE_NAME]
+    if IMAGE_NAME != RAW_IMAGE_NAME:
+        pushed_images.append(RAW_IMAGE_NAME)
+    log("Removing duplicate loaded OCI images and BuildKit cache")
+    run_quiet(["docker", "image", "rm", "-f", *dict.fromkeys(pushed_images)], check=False)
     run_quiet(["docker", "builder", "prune", "-af"], check=False)
 
     server_url = apiserver_url()
