@@ -456,7 +456,7 @@ vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifes
 	@# gantry's private-cluster deployment model. Tracked upstream at
 	@# https://github.com/advisories/GHSA-mqr9-hjr8-2m9w
 	@tmpf=$$(mktemp); \
-	$(GOCMD) tool govulncheck ./... > "$$tmpf" 2>&1; rc=$$?; \
+	$(GOCMD) tool govulncheck $(GO_PACKAGE_PATTERNS) > "$$tmpf" 2>&1; rc=$$?; \
 	cat "$$tmpf"; \
 	if [ $$rc -eq 0 ]; then rm -f "$$tmpf"; exit 0; fi; \
 	if grep -q 'affected by 1 vulnerability' "$$tmpf" && grep -q 'GO-2024-3218' "$$tmpf"; then \
