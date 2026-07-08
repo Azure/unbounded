@@ -6,6 +6,10 @@ package app
 import "github.com/spf13/cobra"
 
 func machineCommandGroup() *cobra.Command {
+	return newMachineCommandGroup(newMachineCommandRuntime())
+}
+
+func newMachineCommandGroup(rt *machineCommandRuntime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "machine",
 		Short: "Manage unbounded-kube machines",
@@ -13,8 +17,15 @@ func machineCommandGroup() *cobra.Command {
 
 	cmd.AddCommand(
 		configCommandGroup(),
+		newMachineOperationCommandGroup(rt),
 		machineRegisterCommand(),
-		machineReplaceCommand(),
+		newMachineNodeRebootCommand(rt),
+		newMachineHostRebootCommand(rt),
+		newMachinePowerOffCommand(rt),
+		newMachinePowerOnCommand(rt),
+		newMachineAgentUpgradeCommand(rt),
+		newMachineAgentResetCommand(rt),
+		newMachineReplaceCommand(rt),
 		machineRebootCommand(),
 		machineHardRebootCommand(),
 		machineRepaveCommand(),
