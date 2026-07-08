@@ -62,10 +62,9 @@ PXE boot configuration consumed by the metalman controller.
 | `pxe.dhcpLeases[].subnetMask` | string | Yes | - | Subnet mask. |
 | `pxe.dhcpLeases[].gateway` | string | Yes | - | Default gateway. |
 | `pxe.dhcpLeases[].dns` | []string | No | - | DNS server addresses. |
-| `pxe.targetDisk` | string | No | Installer-selected | Legacy raw-mode block device override, such as `/dev/nvme0n1` or `/dev/disk/by-id/...`. When omitted in `Raw` mode, the initrd selects a disk automatically. |
-| `pxe.install` | PXEInstallSpec | No | `Raw` | Installer workflow configuration. Omit for the legacy raw single-disk workflow. |
-| `pxe.install.mode` | string | No | `Raw` | Install workflow. Allowed values: `Raw`, `RAID1`. |
-| `pxe.install.targetDisks` | []string | No | - | Explicit whole-disk device paths. `RAID1` requires exactly two paths and does not fall back to automatic disk selection. `Raw` uses the first path when set. |
+| `pxe.targetDisks` | []string | No | Installer-selected | Explicit whole-disk device paths, such as `/dev/nvme0n1` or `/dev/disk/by-id/...`. Raw installs use the first path when set. RAID1 installs require exactly two paths. |
+| `pxe.install` | PXEInstallSpec | No | `None` | Optional install layout configuration. Omit for the legacy raw single-disk workflow. |
+| `pxe.install.raidMode` | string | No | `None` | Software RAID layout. Allowed values: `None`, `RAID1`. |
 | `pxe.redfish` | RedfishSpec | No | - | BMC access via the Redfish API. |
 | `pxe.redfish.url` | string | Yes | - | Redfish endpoint URL. |
 | `pxe.redfish.username` | string | Yes | - | Redfish username. |
@@ -454,7 +453,7 @@ interface instead of relying on kernel interface names such as `eth0`.
 In `Raw` mode, the template passes a configured disk as `unbounded.disk` and
 the installer falls back to automatic disk selection when no disk is configured.
 In `RAID1` mode, the template passes `unbounded.disk0` and `unbounded.disk1`
-from `spec.pxe.install.targetDisks`; the installer fails closed when either
+from `spec.pxe.targetDisks`; the installer fails closed when either
 disk is missing or invalid. RAID1 host images must include mdadm,
 update-initramfs, and GRUB tooling so the installer can refresh boot artifacts
 for the mirrored root before disabling PXE.

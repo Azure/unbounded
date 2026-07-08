@@ -28,6 +28,42 @@ func TestKubernetesSpecOmitsUnsetBootstrapTokenRef(t *testing.T) {
 	}
 }
 
+func TestPXESpecTargetRAIDMode(t *testing.T) {
+	tests := []struct {
+		name string
+		pxe  *PXESpec
+		want string
+	}{
+		{
+			name: "nil pxe defaults none",
+			want: PXERAIDModeNone,
+		},
+		{
+			name: "nil install defaults none",
+			pxe:  &PXESpec{},
+			want: PXERAIDModeNone,
+		},
+		{
+			name: "empty install raid mode defaults none",
+			pxe:  &PXESpec{Install: &PXEInstallSpec{}},
+			want: PXERAIDModeNone,
+		},
+		{
+			name: "explicit raid1",
+			pxe:  &PXESpec{Install: &PXEInstallSpec{RAIDMode: PXERAIDModeRAID1}},
+			want: PXERAIDModeRAID1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.pxe.TargetRAIDMode(); got != tt.want {
+				t.Fatalf("TargetRAIDMode() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestPXESpecTargetInstallMode(t *testing.T) {
 	tests := []struct {
 		name string
@@ -39,18 +75,13 @@ func TestPXESpecTargetInstallMode(t *testing.T) {
 			want: PXEInstallModeRaw,
 		},
 		{
-			name: "nil install defaults raw",
-			pxe:  &PXESpec{},
+			name: "none raid mode maps to raw install",
+			pxe:  &PXESpec{Install: &PXEInstallSpec{RAIDMode: PXERAIDModeNone}},
 			want: PXEInstallModeRaw,
 		},
 		{
-			name: "empty install mode defaults raw",
-			pxe:  &PXESpec{Install: &PXEInstallSpec{}},
-			want: PXEInstallModeRaw,
-		},
-		{
-			name: "explicit raid1",
-			pxe:  &PXESpec{Install: &PXEInstallSpec{Mode: PXEInstallModeRAID1}},
+			name: "raid1 maps to raid1 install",
+			pxe:  &PXESpec{Install: &PXEInstallSpec{RAIDMode: PXERAIDModeRAID1}},
 			want: PXEInstallModeRAID1,
 		},
 	}
@@ -74,18 +105,8 @@ func TestPXESpecInstallTargetDisks(t *testing.T) {
 			name: "nil pxe",
 		},
 		{
-			name: "legacy target disk",
-			pxe:  &PXESpec{TargetDisk: "/dev/disk/by-id/os"},
-			want: []string{"/dev/disk/by-id/os"},
-		},
-		{
-			name: "install target disks override legacy target disk",
-			pxe: &PXESpec{
-				TargetDisk: "/dev/disk/by-id/legacy",
-				Install: &PXEInstallSpec{
-					TargetDisks: []string{"/dev/disk/by-id/a", "/dev/disk/by-id/b"},
-				},
-			},
+			name: "top-level target disks",
+			pxe:  &PXESpec{TargetDisks: []string{"/dev/disk/by-id/a", "/dev/disk/by-id/b"}},
 			want: []string{"/dev/disk/by-id/a", "/dev/disk/by-id/b"},
 		},
 	}
@@ -122,24 +143,22 @@ func TestPXESpecValidateInstall(t *testing.T) {
 		{
 			name: "raw allows explicit disk",
 			pxe: &PXESpec{
-				Install: &PXEInstallSpec{
-					TargetDisks: []string{"/dev/disk/by-id/os"},
-				},
+				TargetDisks: []string{"/dev/disk/by-id/os"},
 			},
 		},
 		{
 			name: "raid1 requires disks",
 			pxe: &PXESpec{
-				Install: &PXEInstallSpec{Mode: PXEInstallModeRAID1},
+				Install: &PXEInstallSpec{RAIDMode: PXERAIDModeRAID1},
 			},
 			wantErr: true,
 		},
 		{
 			name: "raid1 rejects one disk",
 			pxe: &PXESpec{
+				TargetDisks: []string{"/dev/disk/by-id/a"},
 				Install: &PXEInstallSpec{
-					Mode:        PXEInstallModeRAID1,
-					TargetDisks: []string{"/dev/disk/by-id/a"},
+					RAIDMode: PXERAIDModeRAID1,
 				},
 			},
 			wantErr: true,
@@ -147,27 +166,27 @@ func TestPXESpecValidateInstall(t *testing.T) {
 		{
 			name: "raid1 accepts two disks",
 			pxe: &PXESpec{
+				TargetDisks: []string{"/dev/disk/by-id/a", "/dev/disk/by-id/b"},
 				Install: &PXEInstallSpec{
-					Mode:        PXEInstallModeRAID1,
-					TargetDisks: []string{"/dev/disk/by-id/a", "/dev/disk/by-id/b"},
+					RAIDMode: PXERAIDModeRAID1,
 				},
 			},
 		},
 		{
 			name: "raid1 rejects three disks",
 			pxe: &PXESpec{
+				TargetDisks: []string{"/dev/disk/by-id/a", "/dev/disk/by-id/b", "/dev/disk/by-id/c"},
 				Install: &PXEInstallSpec{
-					Mode:        PXEInstallModeRAID1,
-					TargetDisks: []string{"/dev/disk/by-id/a", "/dev/disk/by-id/b", "/dev/disk/by-id/c"},
+					RAIDMode: PXERAIDModeRAID1,
 				},
 			},
 			wantErr: true,
 		},
 		{
-			name: "raid1 does not use legacy single disk",
+			name: "raid1 does not use a single top-level disk",
 			pxe: &PXESpec{
-				TargetDisk: "/dev/disk/by-id/legacy",
-				Install:    &PXEInstallSpec{Mode: PXEInstallModeRAID1},
+				TargetDisks: []string{"/dev/disk/by-id/os"},
+				Install:     &PXEInstallSpec{RAIDMode: PXERAIDModeRAID1},
 			},
 			wantErr: true,
 		},

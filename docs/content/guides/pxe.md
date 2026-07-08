@@ -55,9 +55,11 @@ Metalman uses a machine image and a netboot image for each PXE repave.
 - `spec.pxe.architecture` selects the target architecture (`amd64` or `arm64`)
   used when pulling machine and netboot image platform manifests. It defaults
   to `amd64`.
-- `spec.pxe.install` selects the install workflow. When omitted, metalman uses
-  the legacy raw single-disk workflow. `RAID1` requires exactly two explicit
-  whole-disk paths in `spec.pxe.install.targetDisks`.
+- `spec.pxe.targetDisks` optionally selects explicit whole-disk paths. Raw
+  installs use the first path when set and otherwise choose a disk
+  automatically. `RAID1` requires exactly two paths.
+- `spec.pxe.install.raidMode` selects optional software RAID layout. When
+  omitted or set to `None`, metalman uses the legacy raw single-disk workflow.
 - `spec.pxe.netbootImage` is the reusable PXE boot environment. It contains
   bootloaders, kernel, initrd, templates, metadata, and `unbounded-agent`. If
   omitted, Metalman uses the release-matched `--default-netboot-image`.
@@ -113,14 +115,13 @@ spec:
     bootProtocol: PXE
     # Optional. Omit to use Metalman's default netboot image.
     netbootImage: ghcr.io/azure/netboot:v1
-    # Raw mode only. Recommended on hosts with multiple disks.
-    # targetDisk: /dev/disk/by-id/example-os-disk
+    # Optional. Raw uses the first path; RAID1 requires exactly two paths.
+    targetDisks:
+    - /dev/disk/by-id/example-os-disk-a
+    - /dev/disk/by-id/example-os-disk-b
     # Optional. Omit for the legacy Raw single-disk install mode.
     install:
-      mode: RAID1
-      targetDisks:
-      - /dev/disk/by-id/example-os-disk-a
-      - /dev/disk/by-id/example-os-disk-b
+      raidMode: RAID1
     dhcpLeases:
     - ipv4: "10.10.0.50"
       mac: "aa:bb:cc:dd:ee:ff"
@@ -199,7 +200,7 @@ If the referenced ConfigMap does not exist, metalman falls back to the default m
 3. **GRUB decision.** A rendered `grub.cfg` (from a `.tmpl` file in the netboot image) checks `repaveCounter` against status: if counter is ahead, boot the PXE installer; otherwise chainload the local OS. When a Machine has multiple DHCP leases, metalman renders the lease matching the request source IP and passes that lease's MAC as `unbounded.boot_mac`.
 4. **Installer (initrd overlay).** An init script in the initrd:
    - Loads storage and network drivers, selects the provisioning NIC by MAC, and configures the static IP from kernel cmdline.
-   - In `Raw` mode, downloads the gzip-compressed raw disk image from the machine image over HTTP and writes it to `spec.pxe.targetDisk`, `spec.pxe.install.targetDisks[0]`, or an automatically selected block device.
+   - In `Raw` mode, downloads the gzip-compressed raw disk image from the machine image over HTTP and writes it to `spec.pxe.targetDisks[0]` or an automatically selected block device.
    - In `RAID1` mode, requires two explicit whole-disk paths, creates an ESP on each disk, creates a mirrored root array, extracts the rootfs and ESP artifacts, writes `mdadm.conf` and `fstab`, and refreshes host boot artifacts. The host image must include mdadm, initramfs, and GRUB tooling or the installer fails before disabling PXE.
    - Mounts the root filesystem and injects cloud-init config and the agent configuration.
    - Calls `/pxe/disable` on metalman to signal completion, then reboots.

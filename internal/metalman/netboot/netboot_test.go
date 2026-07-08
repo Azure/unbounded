@@ -811,7 +811,7 @@ func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-no-operations", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				TargetDisk: "/dev/disk/by-id/test-os-disk",
+				TargetDisks: []string{"/dev/disk/by-id/test-os-disk"},
 				DHCPLeases: []v1alpha3.DHCPLease{{
 					IPv4:       "10.0.1.20",
 					MAC:        "aa:bb:cc:dd:ee:20",
@@ -872,12 +872,12 @@ func TestGrubTemplate_RAID1InstallArgs(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-raid", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
+				TargetDisks: []string{
+					"/dev/disk/by-id/nvme-a",
+					"/dev/disk/by-id/nvme-b",
+				},
 				Install: &v1alpha3.PXEInstallSpec{
-					Mode: v1alpha3.PXEInstallModeRAID1,
-					TargetDisks: []string{
-						"/dev/disk/by-id/nvme-a",
-						"/dev/disk/by-id/nvme-b",
-					},
+					RAIDMode: v1alpha3.PXERAIDModeRAID1,
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
@@ -924,9 +924,9 @@ func TestFileResolverRejectsInvalidRAID1InstallBeforeRenderingGRUB(t *testing.T)
 		ObjectMeta: metav1.ObjectMeta{Name: "node-raid", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
+				TargetDisks: []string{"/dev/disk/by-id/nvme-a"},
 				Install: &v1alpha3.PXEInstallSpec{
-					Mode:        v1alpha3.PXEInstallModeRAID1,
-					TargetDisks: []string{"/dev/disk/by-id/nvme-a"},
+					RAIDMode: v1alpha3.PXERAIDModeRAID1,
 				},
 			},
 			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},

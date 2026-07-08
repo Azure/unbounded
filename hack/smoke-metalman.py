@@ -1135,6 +1135,7 @@ def prepare_http_boot_helper_disk(raw_image: str, dest: Path) -> None:
     log("  Injecting one-shot efibootmgr selector")
     run([
         "virt-customize",
+        "--no-network",
         "-a", str(disk_raw),
         "--copy-in", f"{script}:/usr/local/sbin",
         "--copy-in", f"{service}:/etc/systemd/system",
@@ -1268,6 +1269,53 @@ def virt_tar_zst(
         die(f"Failed to export {mount_device}: virt-tar-out={tar_rc}, zstd={zstd_rc}")
 
 
+def apt_dependency_closure(packages: list[str]) -> list[str]:
+    result = run([
+        "apt-cache",
+        "depends",
+        "--recurse",
+        "--no-recommends",
+        "--no-suggests",
+        "--no-conflicts",
+        "--no-breaks",
+        "--no-replaces",
+        "--no-enhances",
+        *packages,
+    ], capture_output=True, text=True)
+
+    deps = set(packages)
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip().lstrip("|").strip()
+        if not line or line.startswith("<"):
+            continue
+
+        if ":" in line:
+            field, value = line.split(":", 1)
+            if field not in ("Depends", "PreDepends"):
+                continue
+            name = value.strip().split()[0]
+        else:
+            name = line.split()[0]
+
+        if not name or name.startswith("<"):
+            continue
+        deps.add(name.split(":", 1)[0])
+
+    return sorted(deps)
+
+
+def download_debs(packages: list[str], dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    debs = list(dest.glob("*.deb"))
+    if debs:
+        for deb in debs:
+            deb.unlink()
+
+    deps = apt_dependency_closure(packages)
+    log(f"  Downloading {len(deps)} RAID boot package(s) on the host")
+    run(["apt-get", "download", *deps], cwd=str(dest))
+
+
 def prepare_raid_machine_image(raw_image: str, raid_image: str) -> None:
     log("Preparing RAID1 machine image from host-ubuntu2404")
     require_tools([
@@ -1279,6 +1327,7 @@ def prepare_raid_machine_image(raw_image: str, raid_image: str) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     disk_gz = workdir / "disk.img.gz"
     disk_raw = workdir / "disk.img"
+    deb_dir = workdir / "raid-debs"
 
     log(f"  Extracting /disk/disk.img.gz from {raw_image}")
     docker_copy_from_image(raw_image, "/disk/disk.img.gz", disk_gz)
@@ -1286,14 +1335,37 @@ def prepare_raid_machine_image(raw_image: str, raid_image: str) -> None:
         shutil.copyfileobj(src, dst)
     disk_gz.unlink()
 
+    packages = [
+        "mdadm",
+        "grub-efi-amd64",
+        "grub-efi-amd64-bin",
+        "shim-signed",
+        "qemu-guest-agent",
+    ]
+
     log("  Installing RAID boot dependencies into copied host image")
-    run([
-        "virt-customize",
-        "-a", str(disk_raw),
-        "--run-command", "apt-get update",
-        "--install", "mdadm,grub-efi-amd64,grub-efi-amd64-bin,shim-signed,qemu-guest-agent",
-        "--run-command", "systemctl enable qemu-guest-agent || true",
-    ], env=guestfs_env())
+    if shutil.which("apt-cache") and shutil.which("apt-get"):
+        download_debs(packages, deb_dir)
+        run([
+            "virt-customize",
+            "--no-network",
+            "-a", str(disk_raw),
+            "--copy-in", f"{deb_dir}:/tmp",
+            "--run-command",
+            "DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/raid-debs/*.deb || "
+            "DEBIAN_FRONTEND=noninteractive apt-get -f install -y --no-download",
+            "--run-command", "systemctl enable qemu-guest-agent || true",
+            "--run-command", "rm -rf /tmp/raid-debs",
+        ], env=guestfs_env())
+    else:
+        log("  Host apt tools unavailable; using guest-networked virt-customize install")
+        run([
+            "virt-customize",
+            "-a", str(disk_raw),
+            "--run-command", "apt-get update",
+            "--install", ",".join(packages),
+            "--run-command", "systemctl enable qemu-guest-agent || true",
+        ], env=guestfs_env())
 
     filesystems = virt_filesystems(disk_raw)
     root_part = find_root_partition(disk_raw, filesystems)
@@ -1686,9 +1758,9 @@ def main() -> None:
         },
     }
     if INSTALL_MODE == "RAID1":
+        protonode["spec"]["pxe"]["targetDisks"] = [RAID_DISK_A_PATH, RAID_DISK_B_PATH]
         protonode["spec"]["pxe"]["install"] = {
-            "mode": "RAID1",
-            "targetDisks": [RAID_DISK_A_PATH, RAID_DISK_B_PATH],
+            "raidMode": "RAID1",
         }
     if BOOT_PROTOCOL == "HTTP":
         protonode["spec"]["operations"] = {
