@@ -11,9 +11,11 @@ on:
       - internal/metalman/**
       - api/machina/v1alpha3/**
       - deploy/machina/crd/**
+      - hack/smoke-metalman.py
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
+      - .github/workflows/smoke-metalman.yaml
   push:
     branches: [main]
     paths:
@@ -22,9 +24,11 @@ on:
       - internal/metalman/**
       - api/machina/v1alpha3/**
       - deploy/machina/crd/**
+      - hack/smoke-metalman.py
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
+      - .github/workflows/smoke-metalman.yaml
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
@@ -34,8 +38,22 @@ permissions:
 
 jobs:
   smoke:
+    name: smoke (${{ matrix.install-mode }}, ${{ matrix.boot-protocol }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - install-mode: Raw
+            boot-protocol: PXE
+          - install-mode: RAID1
+            boot-protocol: PXE
+          - install-mode: RAID1
+            boot-protocol: HTTP
+    env:
+      SMOKE_INSTALL_MODE: ${{ matrix.install-mode }}
+      SMOKE_BOOT_PROTOCOL: ${{ matrix.boot-protocol }}
     steps:
       - name: Free disk space
         run: |
@@ -72,18 +90,50 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          # Install sushy-tools via pip in the background while apt-get
-          # installs system packages.  pip3 is already available on the
-          # runner image so this does not depend on apt-get.
-          sudo pip3 install --break-system-packages --ignore-installed sushy-tools &
-          PIP_PID=$!
-          sudo apt-get install -y --no-install-recommends \
+          retry_root() {
+            local timeout_seconds=$1
+            shift
+
+            local attempt status
+            for attempt in 1 2 3; do
+              if sudo timeout --kill-after=30s "${timeout_seconds}s" "$@"; then
+                return 0
+              fi
+
+              status=$?
+              if [ "$attempt" -eq 3 ]; then
+                return "$status"
+              fi
+
+              echo "command failed with status ${status} (attempt ${attempt}/3); retrying"
+              sleep $((attempt * 10))
+            done
+          }
+
+          APT_OPTS=(
+            -o Acquire::Retries=3
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+            -o DPkg::Lock::Timeout=120
+          )
+
+          retry_root 300 apt-get "${APT_OPTS[@]}" update
+          retry_root 600 env DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
             dnsmasq qemu-kvm libvirt-daemon-system libvirt-clients virtinst \
             ovmf qemu-utils swtpm swtpm-tools \
             python3-pip python3-yaml cpio iptables
+          EXTRA_PKGS=()
+          if [ "${SMOKE_INSTALL_MODE}" = "RAID1" ] || [ "${SMOKE_BOOT_PROTOCOL}" = "HTTP" ]; then
+            EXTRA_PKGS+=(libguestfs-tools)
+          fi
+          if [ "${SMOKE_INSTALL_MODE}" = "RAID1" ]; then
+            EXTRA_PKGS+=(zstd)
+          fi
+          if [ "${#EXTRA_PKGS[@]}" -gt 0 ]; then
+            retry_root 600 env DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "${EXTRA_PKGS[@]}"
+          fi
+          retry_root 300 pip3 install --break-system-packages --ignore-installed sushy-tools
           sudo systemctl start libvirtd
-          wait "$PIP_PID"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0

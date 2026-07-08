@@ -275,6 +275,7 @@ func ServePXECmd() *cobra.Command {
 				Port:              dhcpPort,
 				Reader:            mgr.GetClient(),
 				ServerIP:          dhcpServerIP,
+				ServeURL:          serveURL,
 				OCICache:          ociCache,
 				DefaultNetbootRef: defaultNetbootImage,
 			}

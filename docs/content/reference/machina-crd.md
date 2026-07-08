@@ -52,17 +52,19 @@ PXE boot configuration consumed by the metalman controller.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `pxe` | PXESpec | No | - | PXE boot configuration. |
-| `pxe.image` | string | Yes | - | OCI machine image reference containing `/disk/disk.img.gz` (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`). |
+| `pxe.image` | string | Yes | - | OCI machine image reference. `Raw` installs read `/disk/disk.img.gz`; `RAID1` installs read `/disk/rootfs.tar.zst` and `/disk/esp.tar.zst`. |
 | `pxe.architecture` | string | No | `amd64` | Target CPU architecture for PXE boot artifacts and machine images. Allowed values: `amd64`, `arm64`. |
 | `pxe.netbootImage` | string | No | Metalman default | OCI netboot image reference containing PXE boot artifacts. |
-| `pxe.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP boot with a URL derived from the netboot image metadata. Allowed values: `PXE`, `HTTP`. |
+| `pxe.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses UEFI HTTP boot with a URL derived from the netboot image metadata. Redfish-capable machines receive a one-time HTTP boot URL; DHCP `HTTPClient` firmware requests receive an absolute HTTP bootfile URL. Allowed values: `PXE`, `HTTP`. |
 | `pxe.dhcpLeases` | []DHCPLease | No | - | Static DHCP leases served during PXE boot. |
 | `pxe.dhcpLeases[].ipv4` | string | Yes | - | Static IPv4 address to assign. |
 | `pxe.dhcpLeases[].mac` | string | Yes | - | NIC MAC address (matched case-insensitively). |
 | `pxe.dhcpLeases[].subnetMask` | string | Yes | - | Subnet mask. |
 | `pxe.dhcpLeases[].gateway` | string | Yes | - | Default gateway. |
 | `pxe.dhcpLeases[].dns` | []string | No | - | DNS server addresses. |
-| `pxe.targetDisk` | string | No | Installer-selected | Block device the installer writes the machine image to, such as `/dev/nvme0n1` or `/dev/disk/by-id/...`. When omitted, the initrd selects a disk automatically. |
+| `pxe.targetDisks` | []string | No | Installer-selected | Explicit whole-disk device paths, such as `/dev/nvme0n1` or `/dev/disk/by-id/...`. Raw installs use the first path when set. RAID1 installs require exactly two paths. |
+| `pxe.install` | PXEInstallSpec | No | `None` | Optional install layout configuration. Omit for the legacy raw single-disk workflow. |
+| `pxe.install.raidMode` | string | No | `None` | Software RAID layout. Allowed values: `None`, `RAID1`. |
 | `pxe.redfish` | RedfishSpec | No | - | BMC access via the Redfish API. |
 | `pxe.redfish.url` | string | Yes | - | Redfish endpoint URL. |
 | `pxe.redfish.username` | string | Yes | - | Redfish username. |
@@ -406,14 +408,20 @@ spec:
 ## PXE OCI Images
 
 Metalman uses a machine image and a netboot image for PXE repaves. The machine
-image is referenced by `spec.pxe.image` and contains `/disk/disk.img.gz`. The
-netboot image is referenced by `spec.pxe.netbootImage`, or by Metalman's default
-when that field is omitted, and contains the reusable PXE boot environment.
-`spec.pxe.architecture` selects the OCI platform manifest to pull for both
-images and defaults to `amd64`.
+image is referenced by `spec.pxe.image`. In `Raw` mode it contains
+`/disk/disk.img.gz`. In `RAID1` mode it contains `/disk/rootfs.tar.zst` and
+`/disk/esp.tar.zst`, with `/disk/install.yaml` reserved for future metadata.
+The netboot image is referenced by `spec.pxe.netbootImage`, or by Metalman's
+default when that field is omitted, and contains the reusable PXE boot
+environment. `spec.pxe.architecture` selects the OCI platform manifest to pull
+for both images and defaults to `amd64`.
 
 Both images are standard OCI container images built `FROM scratch` with artifacts
 under `/disk/`. This follows the kubevirt containerDisk convention.
+
+Metalman serves the legacy raw artifact at `/disk.img.gz` and serves v2 machine
+image artifacts under `/machine/`, for example `/machine/rootfs.tar.zst` and
+`/machine/esp.tar.zst`.
 
 Files with a `.tmpl` suffix in the netboot image are Go templates rendered
 per-machine at serve time; other files are served verbatim. A `metadata.yaml`
@@ -436,12 +444,19 @@ Templates receive the following data object:
 | `.ServeURL` | string | External metalman HTTP URL. |
 | `.KubernetesVersion` | string | Resolved Kubernetes version for the machine. |
 | `.ClusterDNS` | string | Cluster DNS service IP. |
+| `.InstallMode` | string | Effective PXE install mode. Defaults to `Raw`. |
+| `.InstallKernelArgs` | []string | Kernel arguments that pass install mode and target disks to the initrd. |
 
 The default netboot template passes `.BootLease.MAC` as `unbounded.boot_mac`.
 The installer initrd uses that MAC address to configure the provisioning
 interface instead of relying on kernel interface names such as `eth0`.
-If `spec.pxe.targetDisk` is set, the template passes it as `unbounded.disk`;
-otherwise the installer falls back to automatic disk selection.
+In `Raw` mode, the template passes a configured disk as `unbounded.disk` and
+the installer falls back to automatic disk selection when no disk is configured.
+In `RAID1` mode, the template passes `unbounded.disk0` and `unbounded.disk1`
+from `spec.pxe.targetDisks`; the installer fails closed when either
+disk is missing or invalid. RAID1 host images must include mdadm,
+update-initramfs, and GRUB tooling so the installer can refresh boot artifacts
+for the mirrored root before disabling PXE.
 
 ### Building images
 
@@ -461,15 +476,18 @@ reusable netboot image Containerfile.
 
 ```yaml
 dhcpBootImageName: shimx64.efi
-httpBootPath: shimx64.efi
+httpBootPath: grubx64.efi
 ```
 
 The `dhcpBootImageName` field specifies the boot filename included in DHCP
 responses (option 67) for `spec.pxe.bootProtocol: PXE`.
 
 The `httpBootPath` field specifies the file path, relative to metalman's HTTP
-artifact server, used for `spec.pxe.bootProtocol: HTTP`. If `httpBootPath` is
-omitted, metalman falls back to `dhcpBootImageName` for the UEFI HTTP boot URL.
+artifact server, used for `spec.pxe.bootProtocol: HTTP`. The default netboot
+image uses shim for PXE/TFTP and GRUB for HTTP boot because some UEFI HTTP
+clients fetch shim companion files that are not part of Ubuntu's netboot
+artifact set. If `httpBootPath` is omitted, metalman falls back to
+`dhcpBootImageName` for the UEFI HTTP boot URL.
 
 ---
 

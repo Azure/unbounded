@@ -112,18 +112,22 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	imageRef := node.Spec.PXE.Image
-	if path != "disk.img.gz" {
+
+	resolvePath := path
+	if strings.HasPrefix(path, "machine/") {
+		resolvePath = strings.TrimPrefix(path, "machine/")
+	} else if path != "disk.img.gz" {
 		imageRef = h.NetbootImageRef(node)
 	}
 
-	if imageRef == "" {
+	if imageRef == "" || resolvePath == "" {
 		log.Warn("node has no image for requested path", "node", node.Name)
 		http.NotFound(w, r)
 
 		return
 	}
 
-	resolved, err := h.ResolveFileByPathForIP(r.Context(), path, node, imageRef, ip)
+	resolved, err := h.ResolveFileByPathForIP(r.Context(), resolvePath, node, imageRef, ip)
 	if err != nil {
 		if errors.Is(err, ErrNotYetDownloaded) {
 			log.Info("file not yet downloaded", "node", node.Name)

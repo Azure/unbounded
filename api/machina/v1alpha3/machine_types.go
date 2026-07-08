@@ -4,6 +4,8 @@
 package v1alpha3
 
 import (
+	"fmt"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -272,9 +274,11 @@ type RedfishSpec struct {
 }
 
 // PXESpec defines PXE boot configuration for a Machine.
+// +kubebuilder:validation:XValidation:rule="!has(self.install) || !has(self.install.raidMode) || self.install.raidMode != 'RAID1' || (has(self.targetDisks) && size(self.targetDisks) == 2)",message="RAID1 install requires exactly two targetDisks"
 type PXESpec struct {
-	// Image is an OCI image reference containing the machine disk image.
-	// The image must contain /disk/disk.img.gz.
+	// Image is an OCI image reference containing machine install artifacts.
+	// Raw installs require /disk/disk.img.gz. RAID1 installs require
+	// /disk/rootfs.tar.zst and /disk/esp.tar.zst.
 	// Example: "ghcr.io/azure/host-ubuntu2404:v1"
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
@@ -307,8 +311,9 @@ type PXESpec struct {
 	NetbootPullSecretRef *NamespacedSecretReference `json:"netbootPullSecretRef,omitempty"`
 
 	// BootProtocol selects how metalman should trigger network boot for
-	// repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
-	// HTTP boot with a URL derived from the netboot image metadata.
+	// repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses UEFI HTTP boot:
+	// Redfish-capable machines receive a one-time HTTP boot URL, and DHCP
+	// HTTPClient firmware requests receive an absolute HTTP bootfile URL.
 	// +kubebuilder:validation:Enum=PXE;HTTP
 	// +kubebuilder:default=PXE
 	// +optional
@@ -318,11 +323,18 @@ type PXESpec struct {
 	// +optional
 	DHCPLeases []DHCPLease `json:"dhcpLeases,omitempty"`
 
-	// TargetDisk is the block device the installer writes the machine image to.
+	// TargetDisks are explicit whole-disk device paths the installer can write
+	// the machine image to. Raw installs use the first path when set and
+	// otherwise choose a disk automatically. RAID1 installs require exactly two
+	// paths and mirror the root filesystem across them.
 	// Examples: /dev/nvme0n1, /dev/sda, /dev/disk/by-id/...
-	// When omitted, the installer chooses a target disk automatically.
 	// +optional
-	TargetDisk string `json:"targetDisk,omitempty"`
+	TargetDisks []string `json:"targetDisks,omitempty"`
+
+	// Install configures how the PXE installer writes the machine image.
+	// When omitted, the installer uses the legacy raw disk image flow.
+	// +optional
+	Install *PXEInstallSpec `json:"install,omitempty"`
 
 	// Redfish configures optional Redfish BMC access.
 	// +optional
@@ -334,10 +346,21 @@ type PXESpec struct {
 	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
 }
 
+// PXEInstallSpec configures optional install layout behavior for PXE images.
+type PXEInstallSpec struct {
+	// RAIDMode selects the software RAID layout used by the PXE initrd. None
+	// writes /disk/disk.img.gz directly to one disk. RAID1 creates a mirrored
+	// root disk from rootfs and ESP tarball machine artifacts.
+	// +kubebuilder:validation:Enum=None;RAID1
+	// +kubebuilder:default=None
+	// +optional
+	RAIDMode string `json:"raidMode,omitempty"`
+}
+
 const (
 	// PXEBootProtocolPXE uses DHCP/TFTP PXE boot.
 	PXEBootProtocolPXE = "PXE"
-	// PXEBootProtocolHTTP uses Redfish UEFI HTTP boot.
+	// PXEBootProtocolHTTP uses UEFI HTTP boot.
 	PXEBootProtocolHTTP = "HTTP"
 	// PXEArchitectureAMD64 is the x86_64 target architecture for PXE boot.
 	PXEArchitectureAMD64 = "amd64"
@@ -347,6 +370,18 @@ const (
 	DefaultPXEArchitecture = PXEArchitectureAMD64
 	// DefaultPXEBootProtocol is used when spec.pxe.bootProtocol is omitted.
 	DefaultPXEBootProtocol = PXEBootProtocolPXE
+	// PXERAIDModeNone disables software RAID for PXE installs.
+	PXERAIDModeNone = "None"
+	// PXERAIDModeRAID1 mirrors the PXE-installed root disk.
+	PXERAIDModeRAID1 = "RAID1"
+	// DefaultPXERAIDMode is used when spec.pxe.install.raidMode is omitted.
+	DefaultPXERAIDMode = PXERAIDModeNone
+	// PXEInstallModeRaw writes a raw disk image to a single target disk. This
+	// is the installer kernel argument value for non-RAID installs.
+	PXEInstallModeRaw = "Raw"
+	// PXEInstallModeRAID1 creates a mirrored root disk from machine artifacts.
+	// This is the installer kernel argument value for RAID1 installs.
+	PXEInstallModeRAID1 = "RAID1"
 )
 
 // TargetArchitecture returns the effective PXE target architecture.
@@ -365,6 +400,48 @@ func (p *PXESpec) TargetBootProtocol() string {
 	}
 
 	return p.BootProtocol
+}
+
+// TargetInstallMode returns the effective PXE install mode.
+func (p *PXESpec) TargetInstallMode() string {
+	switch p.TargetRAIDMode() {
+	case PXERAIDModeRAID1:
+		return PXEInstallModeRAID1
+	default:
+		return PXEInstallModeRaw
+	}
+}
+
+// TargetRAIDMode returns the effective PXE software RAID mode.
+func (p *PXESpec) TargetRAIDMode() string {
+	if p == nil || p.Install == nil || p.Install.RAIDMode == "" {
+		return DefaultPXERAIDMode
+	}
+
+	return p.Install.RAIDMode
+}
+
+// InstallTargetDisks returns the effective installer target disk list.
+func (p *PXESpec) InstallTargetDisks() []string {
+	if p == nil {
+		return nil
+	}
+
+	return p.TargetDisks
+}
+
+// ValidateInstall returns an error when the PXE install configuration cannot
+// be rendered into a safe installer command line.
+func (p *PXESpec) ValidateInstall() error {
+	switch p.TargetRAIDMode() {
+	case PXERAIDModeRAID1:
+		disks := p.InstallTargetDisks()
+		if len(disks) != 2 {
+			return fmt.Errorf("RAID1 install requires exactly two targetDisks, got %d", len(disks))
+		}
+	}
+
+	return nil
 }
 
 // CloudInitSpec defines cloud-init customization for PXE-booted machines.

@@ -9,7 +9,7 @@ RUN apt-get update && \
     ok=false && \
     for attempt in 1 2 3 4 5; do \
       if apt-get install -y --no-install-recommends \
-           ca-certificates cpio curl efibootmgr kmod linux-image-generic xz-utils; then \
+           ca-certificates cpio curl dosfstools e2fsprogs efibootmgr gdisk kmod linux-image-generic mdadm parted tar xz-utils zstd; then \
         ok=true; break; \
       fi; \
       echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
@@ -45,29 +45,42 @@ RUN mkdir -p /artifacts && \
 COPY images/netboot/assets/init /tmp/initrd-root/init
 RUN chmod 755 /tmp/initrd-root/init && \
     mkdir -p /tmp/initrd-root/usr/bin /tmp/initrd-root/usr/lib && \
-    cp /usr/bin/efibootmgr /tmp/initrd-root/usr/bin/ && \
-    for lib in $(ldd /usr/bin/efibootmgr | awk '/=>/{print $3}'); do \
-        mkdir -p "/tmp/initrd-root$(dirname "$lib")" && \
-        cp "$lib" "/tmp/initrd-root${lib}"; \
+    for bin in efibootmgr mdadm sgdisk partprobe mkfs.ext4 mkfs.vfat zstd tar blkid chroot; do \
+        src="$(command -v "$bin")" || { echo "missing required binary: $bin" >&2; exit 1; }; \
+        mkdir -p "/tmp/initrd-root$(dirname "$src")" && \
+        cp -L "$src" "/tmp/initrd-root${src}" && \
+        for lib in $(ldd "$src" | awk '/=>/{print $3} /^\//{print $1}'); do \
+            [ -n "$lib" ] || continue; \
+            mkdir -p "/tmp/initrd-root$(dirname "$lib")" && \
+            cp -L "$lib" "/tmp/initrd-root${lib}"; \
+        done && \
+        interp="$(ldd "$src" | awk '/ld-linux/{print $1; exit}')" && \
+        if [ -n "$interp" ]; then \
+            mkdir -p "/tmp/initrd-root$(dirname "$interp")" && \
+            cp -L "$interp" "/tmp/initrd-root${interp}"; \
+        fi; \
     done && \
-    INTERP=$(ldd /usr/bin/efibootmgr | awk '/ld-linux/{print $1}') && \
-    mkdir -p "/tmp/initrd-root$(dirname "$INTERP")" && \
-    cp "$INTERP" "/tmp/initrd-root${INTERP}" && \
     KVER=$(ls /lib/modules | head -1) && \
     KMOD="/tmp/initrd-root/lib/modules/${KVER}" && \
     mkdir -p "${KMOD}/kernel/drivers/net" \
              "${KMOD}/kernel/drivers/scsi" \
              "${KMOD}/kernel/drivers/ata" \
              "${KMOD}/kernel/drivers/nvme" \
+             "${KMOD}/kernel/drivers/md" \
              "${KMOD}/kernel/drivers/virtio" \
              "${KMOD}/kernel/drivers/block" \
+             "${KMOD}/kernel/crypto" \
+             "${KMOD}/kernel/lib" \
              "${KMOD}/kernel/fs" && \
     cp -a "/lib/modules/${KVER}/kernel/drivers/net/." "${KMOD}/kernel/drivers/net/" && \
     cp -a "/lib/modules/${KVER}/kernel/drivers/scsi/." "${KMOD}/kernel/drivers/scsi/" && \
     cp -a "/lib/modules/${KVER}/kernel/drivers/ata/." "${KMOD}/kernel/drivers/ata/" && \
     cp -a "/lib/modules/${KVER}/kernel/drivers/nvme/." "${KMOD}/kernel/drivers/nvme/" && \
+    cp -a "/lib/modules/${KVER}/kernel/drivers/md/." "${KMOD}/kernel/drivers/md/" && \
     cp -a "/lib/modules/${KVER}/kernel/drivers/virtio/." "${KMOD}/kernel/drivers/virtio/" && \
     cp -a "/lib/modules/${KVER}/kernel/drivers/block/." "${KMOD}/kernel/drivers/block/" && \
+    cp -a "/lib/modules/${KVER}/kernel/crypto/." "${KMOD}/kernel/crypto/" && \
+    cp -a "/lib/modules/${KVER}/kernel/lib/." "${KMOD}/kernel/lib/" && \
     cp -a "/lib/modules/${KVER}/kernel/fs/." "${KMOD}/kernel/fs/" && \
     depmod -b /tmp/initrd-root "${KVER}" && \
     cd /tmp/initrd-root && \
@@ -77,10 +90,10 @@ RUN mkdir -p /disk/grub /disk/cloud-init && \
     cp /artifacts/vmlinuz /artifacts/initrd /artifacts/init.cpio /disk/ && \
 	if [ "${TARGETARCH}" = "amd64" ]; then \
 		cp /artifacts/shimx64.efi /artifacts/grubx64.efi /disk/ && \
-		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: shimx64.efi" > /disk/metadata.yaml; \
+		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: grubx64.efi" > /disk/metadata.yaml; \
 	elif [ "${TARGETARCH}" = "arm64" ]; then \
 		cp /artifacts/shimaa64.efi /artifacts/grubaa64.efi /disk/ && \
-		printf '%s\n' "dhcpBootImageName: shimaa64.efi" "httpBootPath: shimaa64.efi" > /disk/metadata.yaml; \
+		printf '%s\n' "dhcpBootImageName: shimaa64.efi" "httpBootPath: grubaa64.efi" > /disk/metadata.yaml; \
 	fi
 
 COPY images/netboot/assets/grub.cfg.tmpl /disk/grub/grub.cfg.tmpl

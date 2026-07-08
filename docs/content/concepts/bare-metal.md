@@ -101,9 +101,10 @@ For PXE-provisioned machines, the `Machine` resource includes:
   assignment for each interface. During install, the default netboot template
   passes the matching lease MAC to the initrd so it can select the provisioning
   NIC without relying on names such as `eth0`.
-- **`spec.pxe.targetDisk`** -- Optional block device path for the disk that
-  receives the machine image. Set this on hosts with multiple disks; when
-  omitted, the installer selects a disk automatically.
+- **`spec.pxe.targetDisks`** -- Optional block device paths for disks that can
+  receive the machine image. Raw installs use the first path when set; RAID1
+  installs require exactly two paths. When omitted for raw installs, the
+  installer selects a disk automatically.
 - **`spec.pxe.redfish`** -- Optional BMC connection details (endpoint, username,
   password secret) for remote power management.
 - **`spec.pxe.cloudInit`** -- Optional cloud-init customization. References a

@@ -187,10 +187,11 @@ metadata:
 spec:
   pxe:
     image: ghcr.io/azure/host-ubuntu2404:v1
-    # Defaults to PXE. Set to HTTP to use Redfish UEFI HTTP boot.
+    # Defaults to PXE. Set to HTTP to use UEFI HTTP boot.
     bootProtocol: PXE
     # Optional. Recommended when the host has multiple disks.
-    targetDisk: /dev/disk/by-id/example-os-disk
+    targetDisks:
+    - /dev/disk/by-id/example-os-disk
     dhcpLeases:
     - mac: "aa:bb:cc:dd:ee:01"
       ipv4: "10.0.0.11"
@@ -205,9 +206,9 @@ manually PXE-booted (or have PXE as its default boot option).
 
 The default netboot template passes the matching DHCP lease MAC to the installer
 initrd, which uses it to select the provisioning NIC instead of assuming a fixed
-interface name such as `eth0`. If `spec.pxe.targetDisk` is set, the installer
-writes the image to that disk; otherwise it falls back to automatic disk
-selection.
+interface name such as `eth0`. If `spec.pxe.targetDisks` is set, raw installs
+write the image to the first disk in the list; otherwise the installer falls
+back to automatic disk selection.
 
 #### BMC
 
