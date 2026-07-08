@@ -212,7 +212,7 @@ func (c *Client) SetBootOverride(ctx context.Context, target BootTarget, enabled
 	return nil
 }
 
-// SetHTTPBootOverride sets a one-time Redfish UEFI HTTP boot override.
+// SetHTTPBootOverride sets a persistent Redfish UEFI HTTP boot override.
 // Returns ErrUnsupported if the BMC does not support the PATCH.
 func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error {
 	path := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
@@ -220,7 +220,7 @@ func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error 
 	body := map[string]any{
 		"Boot": map[string]string{
 			"BootSourceOverrideTarget":  string(BootTargetUefiHTTP),
-			"BootSourceOverrideEnabled": string(BootOnce),
+			"BootSourceOverrideEnabled": string(BootContinuous),
 			"BootSourceOverrideMode":    string(BootModeUEFI),
 			"HttpBootUri":               bootURL,
 		},
