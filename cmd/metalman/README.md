@@ -163,7 +163,7 @@ Both images are built `FROM scratch` and use `/disk/` as the artifact root,
 following the kubevirt containerDisk convention. Files with a `.tmpl` suffix in
 the netboot image are Go templates rendered per-machine at serve time; other
 files are served verbatim. A `metadata.yaml` file in the netboot image provides
-image-level configuration such as `dhcpBootImageName`.
+image-level configuration such as `dhcpBootImageName` and `httpBootPath`.
 
 Images are built, tagged, and pushed using standard container tooling:
 
@@ -187,6 +187,10 @@ metadata:
 spec:
   pxe:
     image: ghcr.io/azure/host-ubuntu2404:v1
+    # Defaults to PXE. Set to HTTP to use Redfish UEFI HTTP boot.
+    bootProtocol: PXE
+    # Optional. Recommended when the host has multiple disks.
+    targetDisk: /dev/disk/by-id/example-os-disk
     dhcpLeases:
     - mac: "aa:bb:cc:dd:ee:01"
       ipv4: "10.0.0.11"
@@ -198,6 +202,12 @@ This is enough for the DHCP server to issue a lease and for TFTP/HTTP to serve
 boot artifacts from the default netboot image. Set `spec.pxe.netbootImage` only
 when a Machine needs a non-default PXE boot environment. The node must be
 manually PXE-booted (or have PXE as its default boot option).
+
+The default netboot template passes the matching DHCP lease MAC to the installer
+initrd, which uses it to select the provisioning NIC instead of assuming a fixed
+interface name such as `eth0`. If `spec.pxe.targetDisk` is set, the installer
+writes the image to that disk; otherwise it falls back to automatic disk
+selection.
 
 #### BMC
 
@@ -238,5 +248,6 @@ kubectl unbounded machine repave node-01
 ```
 
 This increments `spec.operations.repaveCounter` and `spec.operations.rebootCounter`. The
-controller handles the rest - it configures the boot order to PXE, executes a
-ForceOff/On power cycle, and clears the condition once the node is back up.
+controller handles the rest - it configures the boot order for the selected
+`spec.pxe.bootProtocol`, executes a ForceOff/On power cycle, and clears the
+condition once the node is back up.

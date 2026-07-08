@@ -58,6 +58,7 @@ func ServePXECmd() *cobra.Command {
 		operationMaxAttempts           int32
 		operationPollInterval          time.Duration
 		defaultNetbootImage            string
+		defaultNetbootPullSecret       string
 	)
 
 	cmd := &cobra.Command{
@@ -187,13 +188,20 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			defaultNetbootImage = strings.TrimSpace(defaultNetbootImage)
+			defaultNetbootPullSecret = strings.TrimSpace(defaultNetbootPullSecret)
+
+			defaultNetbootPullSecretRef, err := parseNamespacedSecretReference(defaultNetbootPullSecret)
+			if err != nil {
+				return err
+			}
 
 			ociCache := netboot.NewOCICache(cacheDir)
 
 			if err := (&netboot.OCIReconciler{
-				Client:            mgr.GetClient(),
-				Cache:             ociCache,
-				DefaultNetbootRef: defaultNetbootImage,
+				Client:                      mgr.GetClient(),
+				Cache:                       ociCache,
+				DefaultNetbootRef:           defaultNetbootImage,
+				DefaultNetbootPullSecretRef: defaultNetbootPullSecretRef,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up OCI reconciler: %w", err)
 			}
@@ -201,7 +209,20 @@ func ServePXECmd() *cobra.Command {
 			redfishPool := redfish.NewPool()
 			defer redfishPool.Close()
 
-			if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool}).SetupWithManager(mgr); err != nil {
+			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient()}
+
+			resolver := netboot.FileResolver{
+				Cache:             ociCache,
+				Reader:            mgr.GetClient(),
+				Cluster:           clusterInfoWatcher,
+				ServeURL:          serveURL,
+				DefaultNetbootRef: defaultNetbootImage,
+				KubernetesVersion: kubeVersion,
+				ClusterDNS:        clusterDNS,
+				ProviderLabels:    providerLabels,
+			}
+
+			if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool, FileResolver: &resolver}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up Redfish reconciler: %w", err)
 			}
 
@@ -221,19 +242,8 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("setting up Lifecycle reconciler: %w", err)
 			}
 
-			if err := (&cloudinit.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+			if err := (&cloudinit.Reconciler{Client: mgr.GetClient(), StatusRecorder: statusQueue}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up CloudInit reconciler: %w", err)
-			}
-
-			resolver := netboot.FileResolver{
-				Cache:             ociCache,
-				Reader:            mgr.GetClient(),
-				Cluster:           clusterInfoWatcher,
-				ServeURL:          serveURL,
-				DefaultNetbootRef: defaultNetbootImage,
-				KubernetesVersion: kubeVersion,
-				ClusterDNS:        clusterDNS,
-				ProviderLabels:    providerLabels,
 			}
 
 			if dhcpInterface != "" && dhcpAutoInterface {
@@ -272,7 +282,6 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("adding DHCP server: %w", err)
 			}
 
-			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient()}
 			if err := mgr.Add(statusQueue); err != nil {
 				return fmt.Errorf("adding status queue: %w", err)
 			}
@@ -353,6 +362,20 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().Int32Var(&operationMaxAttempts, "operation-max-attempts", 3, "Maximum Redfish action attempts per target Machine")
 	cmd.Flags().DurationVar(&operationPollInterval, "operation-poll-interval", 5*time.Second, "Poll interval for in-progress MachineOperations")
 	cmd.Flags().StringVar(&defaultNetbootImage, "default-netboot-image", DefaultNetbootImage, "Default OCI image containing PXE netboot artifacts")
+	cmd.Flags().StringVar(&defaultNetbootPullSecret, "default-netboot-pull-secret", "", "Namespaced Secret reference (namespace/name) for pulling the default netboot OCI image")
 
 	return cmd
+}
+
+func parseNamespacedSecretReference(ref string) (*v1alpha3.NamespacedSecretReference, error) {
+	if ref == "" {
+		return nil, nil
+	}
+
+	namespace, name, ok := strings.Cut(ref, "/")
+	if !ok || namespace == "" || name == "" || strings.Contains(name, "/") {
+		return nil, fmt.Errorf("--default-netboot-pull-secret must use namespace/name")
+	}
+
+	return &v1alpha3.NamespacedSecretReference{Namespace: namespace, Name: name}, nil
 }

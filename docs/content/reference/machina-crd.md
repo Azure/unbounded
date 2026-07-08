@@ -55,12 +55,14 @@ PXE boot configuration consumed by the metalman controller.
 | `pxe.image` | string | Yes | - | OCI machine image reference containing `/disk/disk.img.gz` (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`). |
 | `pxe.architecture` | string | No | `amd64` | Target CPU architecture for PXE boot artifacts and machine images. Allowed values: `amd64`, `arm64`. |
 | `pxe.netbootImage` | string | No | Metalman default | OCI netboot image reference containing PXE boot artifacts. |
+| `pxe.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP boot with a URL derived from the netboot image metadata. Allowed values: `PXE`, `HTTP`. |
 | `pxe.dhcpLeases` | []DHCPLease | No | - | Static DHCP leases served during PXE boot. |
 | `pxe.dhcpLeases[].ipv4` | string | Yes | - | Static IPv4 address to assign. |
 | `pxe.dhcpLeases[].mac` | string | Yes | - | NIC MAC address (matched case-insensitively). |
 | `pxe.dhcpLeases[].subnetMask` | string | Yes | - | Subnet mask. |
 | `pxe.dhcpLeases[].gateway` | string | Yes | - | Default gateway. |
 | `pxe.dhcpLeases[].dns` | []string | No | - | DNS server addresses. |
+| `pxe.targetDisk` | string | No | Installer-selected | Block device the installer writes the machine image to, such as `/dev/nvme0n1` or `/dev/disk/by-id/...`. When omitted, the initrd selects a disk automatically. |
 | `pxe.redfish` | RedfishSpec | No | - | BMC access via the Redfish API. |
 | `pxe.redfish.url` | string | Yes | - | Redfish endpoint URL. |
 | `pxe.redfish.username` | string | Yes | - | Redfish username. |
@@ -416,7 +418,7 @@ under `/disk/`. This follows the kubevirt containerDisk convention.
 Files with a `.tmpl` suffix in the netboot image are Go templates rendered
 per-machine at serve time; other files are served verbatim. A `metadata.yaml`
 file in the netboot image provides image-level configuration such as
-`dhcpBootImageName`.
+`dhcpBootImageName` and `httpBootPath`.
 
 ### Image layout
 
@@ -429,10 +431,17 @@ Templates receive the following data object:
 | Field | Type | Description |
 |-------|------|-------------|
 | `.Machine` | *Machine | The Machine CR that initiated the request. |
+| `.BootLease` | *DHCPLease | The DHCP lease matching the request source IP, or the first lease when no match is available. Netboot templates use this to pass the provisioning NIC MAC and static IP to the installer. |
 | `.ApiserverURL` | string | External Kubernetes API server URL. |
 | `.ServeURL` | string | External metalman HTTP URL. |
 | `.KubernetesVersion` | string | Resolved Kubernetes version for the machine. |
 | `.ClusterDNS` | string | Cluster DNS service IP. |
+
+The default netboot template passes `.BootLease.MAC` as `unbounded.boot_mac`.
+The installer initrd uses that MAC address to configure the provisioning
+interface instead of relying on kernel interface names such as `eth0`.
+If `spec.pxe.targetDisk` is set, the template passes it as `unbounded.disk`;
+otherwise the installer falls back to automatic disk selection.
 
 ### Building images
 
@@ -452,10 +461,15 @@ reusable netboot image Containerfile.
 
 ```yaml
 dhcpBootImageName: shimx64.efi
+httpBootPath: shimx64.efi
 ```
 
 The `dhcpBootImageName` field specifies the boot filename included in DHCP
-responses (option 67).
+responses (option 67) for `spec.pxe.bootProtocol: PXE`.
+
+The `httpBootPath` field specifies the file path, relative to metalman's HTTP
+artifact server, used for `spec.pxe.bootProtocol: HTTP`. If `httpBootPath` is
+omitted, metalman falls back to `dhcpBootImageName` for the UEFI HTTP boot URL.
 
 ---
 

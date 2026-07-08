@@ -200,6 +200,38 @@ func TestStatusQueueCopiesCloudInitProgressToHostReplaceOperation(t *testing.T) 
 	require.Equal(t, "Succeeded", cloudInit.Reason)
 }
 
+func TestStatusQueueCopiesCloudInitTimeoutToHostReplaceOperation(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-1", Generation: 4}}
+	op := testOperation("op-cloud-init-timeout", v1alpha3.OperationHostReplace)
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: machine.Name,
+		Phase:      v1alpha3.OperationPhaseInProgress,
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(machine, op).Build()
+	queue := &StatusQueue{Client: c, Now: fixedNow}
+
+	require.NoError(t, queue.RecordMachineCondition(context.Background(), machine.Name, metav1.Condition{
+		Type:    v1alpha3.MachineConditionCloudInitDone,
+		Status:  metav1.ConditionUnknown,
+		Reason:  "TimedOut",
+		Message: "cloud-init did not complete within 5m0s",
+	}))
+	require.True(t, queue.processNextUpdate(context.Background()))
+
+	var updatedOp v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updatedOp))
+	cloudInit := apimeta.FindStatusCondition(updatedOp.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+	require.NotNil(t, cloudInit)
+	require.Equal(t, metav1.ConditionUnknown, cloudInit.Status)
+	require.Equal(t, "TimedOut", cloudInit.Reason)
+	require.Equal(t, "cloud-init did not complete within 5m0s", cloudInit.Message)
+}
+
 func TestStatusQueueIgnoresTerminalAndNonHostReplaceOperations(t *testing.T) {
 	t.Parallel()
 

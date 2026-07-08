@@ -12,23 +12,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Masterminds/semver/v3"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-)
-
-const (
-	// kubernetesDefaultBaseURL is the upstream base URL for Kubernetes
-	// binary releases. Mirrors must preserve the <base>/v<ver>/bin/linux/<arch>/
-	// layout used by dl.k8s.io.
-	kubernetesDefaultBaseURL = "https://dl.k8s.io"
-
-	// criToolsDefaultBaseURL is the upstream base URL for cri-tools releases.
-	criToolsDefaultBaseURL = "https://github.com/kubernetes-sigs/cri-tools/releases/download"
 )
 
 // requiredKubeBinaries lists the Kubernetes binaries that must be present for a valid installation.
@@ -76,43 +67,69 @@ func (d *downloadKubeBinaries) Do(ctx context.Context) error {
 	eg, ctx := errgroup.WithContext(ctx)
 
 	if needsKubeBinaries {
-		d.enqueueKubernetesBinaryDownloads(ctx, eg, kubeOverride, kubernetesVersion, arch, destDir)
+		if err := d.enqueueKubernetesBinaryDownloads(ctx, eg, kubeOverride, kubernetesVersion, arch, destDir); err != nil {
+			return err
+		}
 	}
 
 	if needsCrictl {
-		d.enqueueCrictlDownload(ctx, eg, crictlOverride, crictlVersion, arch, destDir)
+		if err := d.enqueueCrictlDownload(ctx, eg, crictlOverride, crictlVersion, arch, destDir); err != nil {
+			return err
+		}
 	}
 
 	return eg.Wait()
 }
 
-func (d *downloadKubeBinaries) enqueueKubernetesBinaryDownloads(ctx context.Context, eg *errgroup.Group, override *goalstates.DownloadSource, kubernetesVersion, arch, destDir string) {
+func (d *downloadKubeBinaries) enqueueKubernetesBinaryDownloads(ctx context.Context, eg *errgroup.Group, override *goalstates.DownloadSource, kubernetesVersion, arch, destDir string) error {
 	for _, binary := range requiredKubeBinaries {
-		binaryURL := kubernetesBinaryURL(override, kubernetesVersion, arch, binary)
-		checksumURL := kubernetesBinaryURL(override, kubernetesVersion, arch, binary) + ".sha256"
+		binaryURL, err := kubernetesBinaryURL(override, kubernetesVersion, arch, binary)
+		if err != nil {
+			return fmt.Errorf("resolve kubernetes binary download source %q: %w", binary, err)
+		}
+
 		targetFilePath := filepath.Join(destDir, binary)
 
-		eg.Go(d.downloadBinary(ctx, binary, binaryURL, checksumURL, targetFilePath))
+		eg.Go(d.downloadBinary(ctx, binary, binaryURL, targetFilePath))
 	}
+
+	return nil
 }
 
-func (d *downloadKubeBinaries) enqueueCrictlDownload(ctx context.Context, eg *errgroup.Group, override *goalstates.DownloadSource, crictlVersion, arch, destDir string) {
-	downloadURL := crictlDownloadURL(override, crictlVersion, runtime.GOOS, arch)
+func (d *downloadKubeBinaries) enqueueCrictlDownload(ctx context.Context, eg *errgroup.Group, override *goalstates.DownloadSource, crictlVersion, arch, destDir string) error {
+	downloadURL, err := crictlDownloadURL(override, crictlVersion, runtime.GOOS, arch)
+	if err != nil {
+		return fmt.Errorf("resolve crictl download source: %w", err)
+	}
+
 	targetFilePath := filepath.Join(destDir, "crictl")
 	eg.Go(d.downloadCrictlBinary(ctx, downloadURL, targetFilePath))
+
+	return nil
 }
 
 // downloadBinary returns a function that downloads a single Kubernetes binary,
 // verifies its SHA256 checksum, and logs the duration of the download.
-func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary, binaryURL, checksumURL, targetFilePath string) func() error {
+func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary string, binaryURL artifactsource.Source, targetFilePath string) func() error {
 	return func() error {
-		logger := d.log.With("binary", binary, "url", binaryURL)
+		logger := d.log.With("binary", binary)
 
 		logger.Info("downloading kubernetes binary")
 
 		start := time.Now()
 
-		if err := utilio.DownloadWithSHA256Verification(ctx, binaryURL, checksumURL, targetFilePath, 0o755); err != nil {
+		checksumSource, err := artifactsource.Parse(binaryURL.String() + ".sha256")
+		if err != nil {
+			return fmt.Errorf("parse kubernetes binary checksum source %q: %w", binary, err)
+		}
+
+		expectedHash, err := artifactsource.ReadExpectedSHA256(ctx, checksumSource)
+		if err != nil {
+			logger.Error("checksum download failed", "error", err)
+			return fmt.Errorf("read kubernetes binary checksum %q: %w", binary, err)
+		}
+
+		if err := binaryURL.DownloadWithSHA256Verification(ctx, expectedHash, targetFilePath, 0o755); err != nil {
 			logger.Error("download failed", "error", err)
 			return fmt.Errorf("download kubernetes binary %q: %w", binary, err)
 		}
@@ -124,16 +141,16 @@ func (d *downloadKubeBinaries) downloadBinary(ctx context.Context, binary, binar
 }
 
 // downloadCrictlBinary returns a function that downloads the crictl tarball and installs the crictl binary.
-func (d *downloadKubeBinaries) downloadCrictlBinary(ctx context.Context, downloadURL, targetFilePath string) func() error {
+func (d *downloadKubeBinaries) downloadCrictlBinary(ctx context.Context, downloadURL artifactsource.Source, targetFilePath string) func() error {
 	return func() error {
-		logger := d.log.With("binary", "crictl", "url", downloadURL)
+		logger := d.log.With("binary", "crictl")
 
 		logger.Info("downloading cri-tools binary")
 
 		start := time.Now()
 		found := false
 
-		for tarFile, err := range utilio.DecompressTarGzFromRemote(ctx, downloadURL) {
+		for tarFile, err := range downloadURL.DecompressTarGz(ctx) {
 			if err != nil {
 				logger.Error("download failed", "error", err)
 				return fmt.Errorf("download crictl archive: %w", err)
@@ -154,7 +171,7 @@ func (d *downloadKubeBinaries) downloadCrictlBinary(ctx context.Context, downloa
 		}
 
 		if !found {
-			return fmt.Errorf("crictl binary not found in archive %q", downloadURL)
+			return fmt.Errorf("crictl binary not found in archive %q", downloadURL.String())
 		}
 
 		logger.Info("downloaded cri-tools binary", "duration", time.Since(start))
@@ -232,41 +249,18 @@ func resolveCrictlVersion(override *goalstates.DownloadSource, kubernetesVersion
 // crictlVersionForKubernetesVersion returns the cri-tools version for the Kubernetes major.minor release.
 // cri-tools releases are published as v<major>.<minor>.0.
 func crictlVersionForKubernetesVersion(kubernetesVersion string) (string, error) {
-	version, err := semver.NewVersion(strings.TrimSpace(kubernetesVersion))
-	if err != nil {
-		return "", fmt.Errorf("parse kubernetes version %q: %w", kubernetesVersion, err)
-	}
-
-	return fmt.Sprintf("%d.%d.0", version.Major(), version.Minor()), nil
+	return agentartifacts.CrictlVersionForKubernetesVersion(kubernetesVersion)
 }
 
 // kubernetesBinaryURL resolves the download URL for a kubernetes binary
 // (kubelet, kubectl, kube-proxy) honoring the optional override.
-func kubernetesBinaryURL(override *goalstates.DownloadSource, version, arch, binary string) string {
-	if override != nil && override.URL != "" {
-		return fmt.Sprintf(override.URL, version, arch, binary)
-	}
-
-	base := kubernetesDefaultBaseURL
-	if override != nil && override.BaseURL != "" {
-		base = strings.TrimRight(override.BaseURL, "/")
-	}
-
-	return fmt.Sprintf("%s/v%s/bin/linux/%s/%s", base, version, arch, binary)
+func kubernetesBinaryURL(override *goalstates.DownloadSource, version, arch, binary string) (artifactsource.Source, error) {
+	return artifactsource.Parse(agentartifacts.KubernetesBinary(override, version, arch, binary))
 }
 
 // crictlDownloadURL resolves the cri-tools crictl tarball URL honoring
 // the optional override. Mirrors must publish assets under the same
 // <base>/v<ver>/<asset> layout as GitHub releases.
-func crictlDownloadURL(override *goalstates.DownloadSource, version, hostOS, hostArch string) string {
-	if override != nil && override.URL != "" {
-		return fmt.Sprintf(override.URL, version, version, hostOS, hostArch)
-	}
-
-	base := criToolsDefaultBaseURL
-	if override != nil && override.BaseURL != "" {
-		base = strings.TrimRight(override.BaseURL, "/")
-	}
-
-	return fmt.Sprintf("%s/v%s/crictl-v%s-%s-%s.tar.gz", base, version, version, hostOS, hostArch)
+func crictlDownloadURL(override *goalstates.DownloadSource, version, hostOS, hostArch string) (artifactsource.Source, error) {
+	return artifactsource.Parse(agentartifacts.CrictlArchive(override, version, hostOS, hostArch))
 }

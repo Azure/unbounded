@@ -56,12 +56,15 @@ Metalman uses a machine image and a netboot image for each PXE repave.
 - `spec.pxe.netbootImage` is the reusable PXE boot environment. It contains
   bootloaders, kernel, initrd, templates, metadata, and `unbounded-agent`. If
   omitted, Metalman uses the release-matched `--default-netboot-image`.
+- `spec.pxe.bootProtocol` selects the network boot trigger. `PXE` is the
+  default and uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP
+  boot and requires a Redfish block.
 
 Both images are standard OCI container images built `FROM scratch` with
 artifacts under `/disk/`. Files with a `.tmpl` suffix in the netboot image are
 Go templates rendered per-machine at serve time; other files are served
 verbatim. A `metadata.yaml` file in the netboot image provides image-level
-configuration such as `dhcpBootImageName`.
+configuration such as `dhcpBootImageName` and `httpBootPath`.
 
 Images are built, tagged, and pushed using standard container tooling:
 
@@ -91,8 +94,12 @@ spec:
   pxe:
     image: ghcr.io/azure/host-ubuntu2404:v1
     architecture: amd64
+    # Optional. Defaults to PXE. Set to HTTP for Redfish UEFI HTTP boot.
+    bootProtocol: PXE
     # Optional. Omit to use Metalman's default netboot image.
     netbootImage: ghcr.io/azure/netboot:v1
+    # Optional. Recommended on hosts with multiple disks.
+    targetDisk: /dev/disk/by-id/example-os-disk
     dhcpLeases:
     - ipv4: "10.10.0.50"
       mac: "aa:bb:cc:dd:ee:ff"
@@ -166,13 +173,13 @@ If the referenced ConfigMap does not exist, metalman falls back to the default m
 
 ## Boot Flow
 
-1. **Machine CR created.** The Redfish reconciler sets the boot device to PXE and power-cycles the server (ForceOff → On).
-2. **PXE boot.** DHCP assigns the static IP by MAC. TFTP serves `shimx64.efi`, which chainloads GRUB over HTTP.
-3. **GRUB decision.** A rendered `grub.cfg` (from a `.tmpl` file in the netboot image) checks `repaveCounter` against status: if counter is ahead, boot the PXE installer; otherwise chainload the local OS.
+1. **Machine CR created.** The Redfish reconciler sets the boot device and power-cycles the server (ForceOff → On). For `bootProtocol: PXE`, it selects PXE boot. For `bootProtocol: HTTP`, it sets a one-time Redfish UEFI HTTP boot URL from the netboot image metadata.
+2. **Network boot.** DHCP assigns the static IP by MAC. In PXE mode, DHCP also advertises the TFTP bootfile and TFTP serves `shimx64.efi`. In HTTP mode, the firmware downloads the Redfish-supplied URL from metalman's HTTP server.
+3. **GRUB decision.** A rendered `grub.cfg` (from a `.tmpl` file in the netboot image) checks `repaveCounter` against status: if counter is ahead, boot the PXE installer; otherwise chainload the local OS. When a Machine has multiple DHCP leases, metalman renders the lease matching the request source IP and passes that lease's MAC as `unbounded.boot_mac`.
 4. **Installer (initrd overlay).** An init script in the initrd:
-   - Loads storage and network drivers, configures the static IP from kernel cmdline.
+   - Loads storage and network drivers, selects the provisioning NIC by MAC, and configures the static IP from kernel cmdline.
    - Downloads the gzip-compressed raw disk image from the machine image over HTTP (retries up to 120 times).
-   - Writes the image to the largest block device via `dd`.
+   - Writes the image to `spec.pxe.targetDisk` when set, otherwise to an automatically selected block device.
    - Mounts the root filesystem and injects cloud-init config and the agent configuration.
    - Calls `/pxe/disable` on metalman to signal completion, then reboots.
 5. **First boot.** cloud-init downloads the `unbounded-agent` binary from metalman and runs `unbounded-agent start`.

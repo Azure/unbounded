@@ -279,6 +279,12 @@ type PXESpec struct {
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
 
+	// PullSecretRef references a Docker registry credential Secret used to pull
+	// Image. The Secret must be type kubernetes.io/dockerconfigjson or
+	// kubernetes.io/dockercfg.
+	// +optional
+	PullSecretRef *NamespacedSecretReference `json:"pullSecretRef,omitempty"`
+
 	// Architecture is the target CPU architecture for PXE boot artifacts and
 	// machine images.
 	// +kubebuilder:validation:Enum=amd64;arm64
@@ -292,9 +298,31 @@ type PXESpec struct {
 	// +optional
 	NetbootImage string `json:"netbootImage,omitempty"`
 
+	// NetbootPullSecretRef references a Docker registry credential Secret used to
+	// pull NetbootImage. It is ignored when NetbootImage is omitted; metalman's
+	// configured default netboot pull secret is used for the default netboot image.
+	// The Secret must be type kubernetes.io/dockerconfigjson or
+	// kubernetes.io/dockercfg.
+	// +optional
+	NetbootPullSecretRef *NamespacedSecretReference `json:"netbootPullSecretRef,omitempty"`
+
+	// BootProtocol selects how metalman should trigger network boot for
+	// repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
+	// HTTP boot with a URL derived from the netboot image metadata.
+	// +kubebuilder:validation:Enum=PXE;HTTP
+	// +kubebuilder:default=PXE
+	// +optional
+	BootProtocol string `json:"bootProtocol,omitempty"`
+
 	// DHCPLeases defines static DHCP leases for PXE booting.
 	// +optional
 	DHCPLeases []DHCPLease `json:"dhcpLeases,omitempty"`
+
+	// TargetDisk is the block device the installer writes the machine image to.
+	// Examples: /dev/nvme0n1, /dev/sda, /dev/disk/by-id/...
+	// When omitted, the installer chooses a target disk automatically.
+	// +optional
+	TargetDisk string `json:"targetDisk,omitempty"`
 
 	// Redfish configures optional Redfish BMC access.
 	// +optional
@@ -307,12 +335,18 @@ type PXESpec struct {
 }
 
 const (
+	// PXEBootProtocolPXE uses DHCP/TFTP PXE boot.
+	PXEBootProtocolPXE = "PXE"
+	// PXEBootProtocolHTTP uses Redfish UEFI HTTP boot.
+	PXEBootProtocolHTTP = "HTTP"
 	// PXEArchitectureAMD64 is the x86_64 target architecture for PXE boot.
 	PXEArchitectureAMD64 = "amd64"
 	// PXEArchitectureARM64 is the aarch64 target architecture for PXE boot.
 	PXEArchitectureARM64 = "arm64"
 	// DefaultPXEArchitecture is used when spec.pxe.architecture is omitted.
 	DefaultPXEArchitecture = PXEArchitectureAMD64
+	// DefaultPXEBootProtocol is used when spec.pxe.bootProtocol is omitted.
+	DefaultPXEBootProtocol = PXEBootProtocolPXE
 )
 
 // TargetArchitecture returns the effective PXE target architecture.
@@ -322,6 +356,15 @@ func (p *PXESpec) TargetArchitecture() string {
 	}
 
 	return p.Architecture
+}
+
+// TargetBootProtocol returns the effective network boot protocol.
+func (p *PXESpec) TargetBootProtocol() string {
+	if p == nil || p.BootProtocol == "" {
+		return DefaultPXEBootProtocol
+	}
+
+	return p.BootProtocol
 }
 
 // CloudInitSpec defines cloud-init customization for PXE-booted machines.

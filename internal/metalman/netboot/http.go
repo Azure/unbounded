@@ -40,6 +40,7 @@ type HTTPServer struct {
 }
 
 type StatusRecorder interface {
+	RecordBootLoaderDownloaded(ctx context.Context, machineName, filename string) error
 	RecordBootImageWritten(ctx context.Context, machineName string) error
 	RecordCloudInitDone(ctx context.Context, machineName string) error
 	RecordMachineCondition(ctx context.Context, machineName string, condition metav1.Condition) error
@@ -59,6 +60,7 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 		w.Write([]byte("ok")) //nolint:errcheck // Best-effort health check response.
 	})
 	mux.HandleFunc("POST /cloudinit/log", h.handleCloudInitLog)
+	mux.HandleFunc("POST /unbounded-agent/install-log", h.handleInstallLog)
 
 	if h.Client != nil {
 		mux.HandleFunc("POST /pxe/disable", h.handleDisablePXE)
@@ -121,7 +123,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resolved, err := h.ResolveFileByPath(r.Context(), path, node, imageRef)
+	resolved, err := h.ResolveFileByPathForIP(r.Context(), path, node, imageRef, ip)
 	if err != nil {
 		if errors.Is(err, ErrNotYetDownloaded) {
 			log.Info("file not yet downloaded", "node", node.Name)
@@ -140,6 +142,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	if resolved.DiskPath != "" {
 		log.Info("serving cached file", "node", node.Name)
 		http.ServeFile(w, r, resolved.DiskPath)
+		h.recordHTTPBootLoaderDownloaded(r.Context(), log, node, imageRef, path)
 
 		return
 	}
@@ -147,6 +150,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	log.Info("serving file", "node", node.Name, "size", len(resolved.Data))
 	w.Header().Set("Content-Type", resolved.ContentType)
 	w.Write(resolved.Data) //nolint:errcheck // Best-effort HTTP response write.
+	h.recordHTTPBootLoaderDownloaded(r.Context(), log, node, imageRef, path)
 }
 
 func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) {
@@ -182,6 +186,21 @@ func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) 
 	machineName := h.recordCloudInitCondition(r.Context(), log, ip, &ev)
 	h.recordCloudInitStatus(r.Context(), log, machineName, &ev)
 
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		slog.Error("reading install log body", "ip", ip, "err", err)
+		http.Error(w, "bad request", http.StatusBadRequest)
+
+		return
+	}
+
+	slog.Warn("unbounded-agent install log", "ip", ip, "body", strings.TrimSpace(string(body)))
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -330,6 +349,33 @@ func (h *HTTPServer) recordBootImageWritten(ctx context.Context, log *slog.Logge
 	if err := h.StatusRecorder.RecordBootImageWritten(ctx, machineName); err != nil {
 		log.Error("recording boot image written", "node", machineName, "err", err)
 	}
+}
+
+func (h *HTTPServer) recordHTTPBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, imageRef, path string) {
+	if h.StatusRecorder == nil || node == nil || node.Spec.PXE == nil || node.Spec.PXE.TargetBootProtocol() != v1alpha3.PXEBootProtocolHTTP {
+		return
+	}
+
+	if !h.isHTTPBootLoaderDownload(imageRef, node.Spec.PXE.TargetArchitecture(), path) {
+		return
+	}
+
+	if err := h.StatusRecorder.RecordBootLoaderDownloaded(ctx, node.Name, path); err != nil {
+		log.Error("recording boot loader download", "node", node.Name, "err", err)
+	}
+}
+
+func (h *HTTPServer) isHTTPBootLoaderDownload(imageRef, architecture, path string) bool {
+	if h.Cache == nil || imageRef == "" {
+		return false
+	}
+
+	meta, err := h.Cache.MetadataForRefArchitecture(imageRef, architecture)
+	if err != nil {
+		return false
+	}
+
+	return HTTPBootPathFromMetadata(meta) == strings.TrimPrefix(path, "/")
 }
 
 func (h *HTTPServer) recordCloudInitStatus(ctx context.Context, log *slog.Logger, machineName string, ev *cloudInitEvent) {

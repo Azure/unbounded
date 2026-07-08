@@ -17,6 +17,7 @@ import (
 
 type ImageMetadata struct {
 	DHCPBootImageName string `yaml:"dhcpBootImageName"`
+	HTTPBootPath      string `yaml:"httpBootPath"`
 }
 
 // OCICache manages unpacked OCI images on the local filesystem.

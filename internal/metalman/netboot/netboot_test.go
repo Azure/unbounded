@@ -429,16 +429,54 @@ func TestTFTPServerRecordsOnlyInitialBootLoader(t *testing.T) {
 		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
 	})
 	recorder := &recordingTFTPStatusRecorder{}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-1"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{},
+		},
+	}
 	server := &TFTPServer{
 		FileResolver:   FileResolver{Cache: cache},
 		StatusRecorder: recorder,
 	}
 
-	server.recordBootLoaderDownloaded(t.Context(), testLogger(), "machine-1", "ghcr.io/test/image:v1", "grubx64.efi")
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, "ghcr.io/test/image:v1", "grubx64.efi")
 	require.Empty(t, recorder.calls)
 
-	server.recordBootLoaderDownloaded(t.Context(), testLogger(), "machine-1", "ghcr.io/test/image:v1", "shimx64.efi")
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, "ghcr.io/test/image:v1", "shimx64.efi")
 	require.Equal(t, []string{"machine-1:shimx64.efi"}, recorder.calls)
+}
+
+func TestTFTPServerRecordsInitialBootLoaderForTargetArchitecture(t *testing.T) {
+	cacheDir := t.TempDir()
+	cache := NewOCICache(cacheDir)
+
+	require.NoError(t, populateOCICacheForArchitecture(cacheDir, "amd64digest", v1alpha3.PXEArchitectureAMD64, map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
+	}))
+	require.NoError(t, populateOCICacheForArchitecture(cacheDir, "arm64digest", v1alpha3.PXEArchitectureARM64, map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimaa64.efi\n"),
+	}))
+	cache.SetDigestForArchitecture("ghcr.io/test/image:v1", v1alpha3.PXEArchitectureAMD64, "sha256:amd64digest")
+	cache.SetDigestForArchitecture("ghcr.io/test/image:v1", v1alpha3.PXEArchitectureARM64, "sha256:arm64digest")
+
+	recorder := &recordingTFTPStatusRecorder{}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-arm"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{Architecture: v1alpha3.PXEArchitectureARM64},
+		},
+	}
+	server := &TFTPServer{
+		FileResolver:   FileResolver{Cache: cache},
+		StatusRecorder: recorder,
+	}
+
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, "ghcr.io/test/image:v1", "shimx64.efi")
+	require.Empty(t, recorder.calls)
+
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, "ghcr.io/test/image:v1", "shimaa64.efi")
+	require.Equal(t, []string{"machine-arm:shimaa64.efi"}, recorder.calls)
 }
 
 func TestHTTPServerDoesNotRecordBootImageWriteOnFileDownload(t *testing.T) {
@@ -592,10 +630,24 @@ type recordedPXEDisabled struct {
 type recordingStatusRecorder struct {
 	mu               sync.Mutex
 	err              error
+	bootLoader       []string
 	bootImageWritten []string
 	cloudInitDone    []string
 	conditions       []recordedMachineCondition
 	disabled         []recordedPXEDisabled
+}
+
+func (r *recordingStatusRecorder) RecordBootLoaderDownloaded(_ context.Context, machineName, filename string) error {
+	if r.err != nil {
+		return r.err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.bootLoader = append(r.bootLoader, fmt.Sprintf("%s:%s", machineName, filename))
+
+	return nil
 }
 
 func (r *recordingStatusRecorder) RecordBootImageWritten(_ context.Context, machineName string) error {
@@ -759,8 +811,10 @@ func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-no-operations", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
+				TargetDisk: "/dev/disk/by-id/test-os-disk",
 				DHCPLeases: []v1alpha3.DHCPLease{{
 					IPv4:       "10.0.1.20",
+					MAC:        "aa:bb:cc:dd:ee:20",
 					Gateway:    "10.0.1.1",
 					SubnetMask: "255.255.255.0",
 				}},
@@ -772,6 +826,7 @@ func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
 		node,
 		ClusterInfo{ApiserverURL: "https://k8s.example.com"},
 		"http://10.0.1.1:8080",
+		"",
 		"",
 	)
 
@@ -785,12 +840,51 @@ func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
 		"No pending repave",
 		"unbounded.image_url=http://10.0.1.1:8080/disk.img.gz",
 		"unbounded.node_name=node-no-operations",
-		"ip=10.0.1.20::10.0.1.1:255.255.255.0::eth0:none",
+		"unbounded.boot_mac=aa:bb:cc:dd:ee:20",
+		"unbounded.disk=/dev/disk/by-id/test-os-disk",
+		"ip=10.0.1.20::10.0.1.1:255.255.255.0:::none",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("expected %q in rendered grub.cfg, got:\n%s", want, body)
 		}
 	}
+
+	require.NotContains(t, body, "eth0")
+}
+
+func TestGrubTemplate_SelectsBootLeaseByRequestIP(t *testing.T) {
+	grubTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "grub.cfg.tmpl"))
+	require.NoError(t, err)
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-multi-lease", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				DHCPLeases: []v1alpha3.DHCPLease{
+					{IPv4: "10.0.1.20", MAC: "aa:bb:cc:dd:ee:20", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0"},
+					{IPv4: "10.0.1.21", MAC: "aa:bb:cc:dd:ee:21", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0"},
+				},
+			},
+			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
+		},
+	}
+
+	data := newTemplateData(
+		node,
+		ClusterInfo{ApiserverURL: "https://k8s.example.com"},
+		"http://10.0.1.1:8080",
+		"",
+		"10.0.1.21",
+	)
+
+	result, err := renderTemplate(string(grubTmpl), data)
+	require.NoError(t, err)
+
+	body := string(result)
+	require.Contains(t, body, "unbounded.boot_mac=aa:bb:cc:dd:ee:21")
+	require.Contains(t, body, "ip=10.0.1.21::10.0.1.1:255.255.255.0:::none")
+	require.NotContains(t, body, "unbounded.boot_mac=aa:bb:cc:dd:ee:20")
+	require.NotContains(t, body, "unbounded.disk=")
 }
 
 func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
@@ -845,11 +939,19 @@ func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
 		"/usr/local/bin/unbounded-agent-install.sh",
 		"/latest/download/unbounded-agent-linux-",
 		"export UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json",
-		"bash /usr/local/bin/unbounded-agent-install.sh",
+		"install_log=/var/log/unbounded-agent-install.log",
+		"trap report_unbounded_failure ERR",
+		"last 120 lines of ${install_log}",
+		`curl -fsS -m 10 -X POST -H "Content-Type: text/plain" --data-binary @- "http://10.0.1.1:8080/unbounded-agent/install-log"`,
+		`bash /usr/local/bin/unbounded-agent-install.sh 2>&1 | tee "$install_log"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("expected %q in rendered vendor-data, got:\n%s", want, body)
 		}
+	}
+
+	if strings.Contains(body, "python3") {
+		t.Errorf("expected Bash-only failure reporting, got:\n%s", body)
 	}
 
 	if strings.Contains(body, "{{ .ServeURL }}/unbounded-agent") {
@@ -2303,7 +2405,7 @@ func TestOCICache_Metadata(t *testing.T) {
 	cache := NewOCICache(cacheDir)
 
 	digest := "testdigest123"
-	metadataContent := "dhcpBootImageName: shimx64.efi\n"
+	metadataContent := "dhcpBootImageName: shimx64.efi\nhttpBootPath: http/shimx64.efi\n"
 
 	if err := populateOCICache(cacheDir, digest, map[string][]byte{
 		"metadata.yaml": []byte(metadataContent),
@@ -2321,6 +2423,51 @@ func TestOCICache_Metadata(t *testing.T) {
 	if meta.DHCPBootImageName != "shimx64.efi" {
 		t.Errorf("DHCPBootImageName: got %q, want %q", meta.DHCPBootImageName, "shimx64.efi")
 	}
+
+	if meta.HTTPBootPath != "http/shimx64.efi" {
+		t.Errorf("HTTPBootPath: got %q, want %q", meta.HTTPBootPath, "http/shimx64.efi")
+	}
+}
+
+func TestFileResolverHTTPBootURL(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpurl123", map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: /efi/bootx64.efi\n"),
+	})
+
+	resolver := &FileResolver{Cache: cache, ServeURL: "http://10.0.0.10:8880/base/"}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-http-url"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{Image: "ghcr.io/test/image:v1"},
+		},
+	}
+
+	bootURL, err := resolver.HTTPBootURL(node)
+	require.NoError(t, err)
+	require.Equal(t, "http://10.0.0.10:8880/base/efi/bootx64.efi", bootURL)
+}
+
+func TestFileResolverHTTPBootURLFallsBackToDHCPBootImageName(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpfallback123", map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
+	})
+
+	resolver := &FileResolver{Cache: cache, ServeURL: "http://10.0.0.10:8880"}
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-http-url"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{Image: "ghcr.io/test/image:v1"},
+		},
+	}
+
+	bootURL, err := resolver.HTTPBootURL(node)
+	require.NoError(t, err)
+	require.Equal(t, "http://10.0.0.10:8880/shimx64.efi", bootURL)
+}
+
+func TestJoinServeURLPathRejectsTraversal(t *testing.T) {
+	_, err := JoinServeURLPath("http://10.0.0.10:8880", "../shimx64.efi")
+	require.Error(t, err)
 }
 
 func TestOCICache_MetadataNoFile(t *testing.T) {
@@ -2716,6 +2863,51 @@ func TestBuildCloudInitCondition_MessageTruncation(t *testing.T) {
 	if !strings.Contains(cond.Message, "modules-config") {
 		t.Errorf("truncated message should contain stage name, got %q", cond.Message[:100])
 	}
+}
+
+func TestInstallLogEndpointAcceptsPlainTextWithoutRecordingCondition(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "install-log-node"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:78", IPv4: "10.0.20.18", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	cache := NewOCICache(t.TempDir())
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithStatusSubresource(&v1alpha3.Machine{}).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	recorder := &recordingStatusRecorder{}
+
+	srv := &HTTPServer{
+		Client:         fc,
+		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		StatusRecorder: recorder,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /unbounded-agent/install-log", srv.handleInstallLog)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := "unbounded-agent install exited with status 42\n\nlast 120 lines of /var/log/unbounded-agent-install.log:\nfailed to download agent"
+	req, _ := http.NewRequest("POST", ts.URL+"/unbounded-agent/install-log", strings.NewReader(body))
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("X-Forwarded-For", "10.0.20.18")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Empty(t, recorder.conditionEvents())
 }
 
 func TestCloudInitCondition_StageStartSetsRunning(t *testing.T) {

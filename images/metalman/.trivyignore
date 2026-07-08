@@ -1,0 +1,8 @@
+# CVE-2026-50163: oras-go tar extraction - hardlink Linkname path traversal
+# (oras.land/oras-go/v2, all versions through v2.6.1, no upstream fix available)
+#
+# This CVE affects the content/file store, which performs tar extraction to the
+# local filesystem. metalman uses only content/oci (a raw OCI layout blob store)
+# and delegates layer unpacking to umoci. The vulnerable tar extraction code
+# path in content/file is never invoked by this binary.
+CVE-2026-50163

@@ -8,6 +8,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/go-logr/logr"
+	ctrl "sigs.k8s.io/controller-runtime"
+
 	"github.com/Azure/unbounded/internal/logger"
 )
 
@@ -42,4 +45,6 @@ func (c *CommandContext) Setup() {
 			AttrOrder: []string{"task"},
 		}))
 	}
+
+	ctrl.SetLogger(logr.FromSlogHandler(c.Logger.Handler()))
 }
