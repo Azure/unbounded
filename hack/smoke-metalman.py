@@ -1238,7 +1238,7 @@ def find_boot_partition(image: Path, filesystems: list[tuple[str, str, str]], ro
     return None
 
 
-def virt_tar_zst(
+def guestfish_tar_zst(
     image: Path,
     mount_device: str,
     dest: Path,
@@ -1252,12 +1252,12 @@ def virt_tar_zst(
     mount_desc = ", ".join([mount_device] + [f"{device} at {mountpoint}" for device, mountpoint in extra_mounts])
     log(f"  Exporting {mount_desc} to {dest.name}")
     tar_proc = subprocess.Popen(
-        ["virt-tar-out", "--ro", "--no-sync", "-a", str(image), *mount_args, "/", "-"],
+        ["guestfish", "--ro", "--no-sync", "-a", str(image), *mount_args, "tar-out", "/", "-"],
         stdout=subprocess.PIPE,
         env=guestfs_env(),
     )
     if tar_proc.stdout is None:
-        die("virt-tar-out did not provide stdout")
+        die("guestfish tar-out did not provide stdout")
     zstd_proc = subprocess.Popen(
         ["zstd", "-T0", "-q", "-f", "-o", str(dest), "-"],
         stdin=tar_proc.stdout,
@@ -1266,7 +1266,7 @@ def virt_tar_zst(
     zstd_rc = zstd_proc.wait()
     tar_rc = tar_proc.wait()
     if tar_rc != 0 or zstd_rc != 0:
-        die(f"Failed to export {mount_device}: virt-tar-out={tar_rc}, zstd={zstd_rc}")
+        die(f"Failed to export {mount_device}: guestfish={tar_rc}, zstd={zstd_rc}")
 
 
 def apt_dependency_closure(packages: list[str]) -> list[str]:
@@ -1319,8 +1319,8 @@ def download_debs(packages: list[str], dest: Path) -> None:
 def prepare_raid_machine_image(raw_image: str, raid_image: str) -> None:
     log("Preparing RAID1 machine image from host-ubuntu2404")
     require_tools([
-        "docker", "virt-customize", "virt-filesystems", "virt-cat", "virt-ls",
-        "virt-tar-out", "zstd",
+        "docker", "guestfish", "virt-customize", "virt-filesystems", "virt-cat",
+        "virt-ls", "zstd",
     ])
 
     workdir = TMPDIR / "raid-machine-image"
@@ -1374,8 +1374,8 @@ def prepare_raid_machine_image(raw_image: str, raid_image: str) -> None:
     boot_mounts = [(boot_part, "/boot")] if boot_part else []
     log(f"  Identified root={root_part} boot={boot_part or 'inline'} esp={esp_part}")
 
-    virt_tar_zst(disk_raw, root_part, workdir / "rootfs.tar.zst", boot_mounts)
-    virt_tar_zst(disk_raw, esp_part, workdir / "esp.tar.zst")
+    guestfish_tar_zst(disk_raw, root_part, workdir / "rootfs.tar.zst", boot_mounts)
+    guestfish_tar_zst(disk_raw, esp_part, workdir / "esp.tar.zst")
     (workdir / "install.yaml").write_text("version: 1\nmode: RAID1\n", encoding="utf-8")
     (workdir / "Containerfile").write_text(textwrap.dedent("""\
         FROM scratch
