@@ -98,6 +98,7 @@ type BootConfig struct {
 	Enabled        BootEnabled
 	Mode           BootMode
 	UefiHTTPSource string
+	HasHTTPBootURI bool
 }
 
 const biosHTTPBootURIAttribute = "UrlBootFile"
@@ -198,22 +199,29 @@ func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
 
 	var system struct {
 		Boot struct {
-			BootSourceOverrideTarget  BootTarget  `json:"BootSourceOverrideTarget"`
-			BootSourceOverrideEnabled BootEnabled `json:"BootSourceOverrideEnabled"`
-			BootSourceOverrideMode    BootMode    `json:"BootSourceOverrideMode"`
-			HTTPBootURI               string      `json:"HttpBootUri"`
+			BootSourceOverrideTarget  BootTarget      `json:"BootSourceOverrideTarget"`
+			BootSourceOverrideEnabled BootEnabled     `json:"BootSourceOverrideEnabled"`
+			BootSourceOverrideMode    BootMode        `json:"BootSourceOverrideMode"`
+			HTTPBootURI               json.RawMessage `json:"HttpBootUri"`
 		} `json:"Boot"`
 	}
 	if err := json.Unmarshal(data, &system); err != nil {
 		return BootConfig{}, fmt.Errorf("parsing system boot config: %w", err)
 	}
 
-	return BootConfig{
+	config := BootConfig{
 		Target:         system.Boot.BootSourceOverrideTarget,
 		Enabled:        system.Boot.BootSourceOverrideEnabled,
 		Mode:           system.Boot.BootSourceOverrideMode,
-		UefiHTTPSource: system.Boot.HTTPBootURI,
-	}, nil
+		HasHTTPBootURI: system.Boot.HTTPBootURI != nil,
+	}
+	if system.Boot.HTTPBootURI != nil && string(system.Boot.HTTPBootURI) != "null" {
+		if err := json.Unmarshal(system.Boot.HTTPBootURI, &config.UefiHTTPSource); err != nil {
+			return BootConfig{}, fmt.Errorf("parsing system HTTP boot URI: %w", err)
+		}
+	}
+
+	return config, nil
 }
 
 // SetBootOverride sets the boot source override target and enabled mode.

@@ -143,6 +143,35 @@ func TestBootOrderConfigUEFIHTTPOn(t *testing.T) {
 	require.Equal(t, "http://192.0.2.1/boot/grubx64.efi", boot["HttpBootUri"])
 }
 
+func TestClientGetBootConfigTracksHTTPBootURIFieldPresence(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Hdd",
+					"BootSourceOverrideEnabled": "Disabled",
+				},
+			})
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	config, err := client.GetBootConfig(t.Context())
+	require.NoError(t, err)
+	require.False(t, config.HasHTTPBootURI)
+}
+
 func TestBootOrderConfigUEFIHTTPNoOp(t *testing.T) { TestBootOrderConfigUEFIHTTPOn(t) }
 func TestUEFIHTTPBootEndToEnd(t *testing.T)        { TestBootOrderConfigUEFIHTTPOn(t) }
 func TestBootOrderConfigNoOp(t *testing.T)         { TestBootOrderConfigPxeOff(t) }
