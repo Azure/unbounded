@@ -100,6 +100,8 @@ type BootConfig struct {
 	UefiHTTPSource string
 }
 
+const biosHTTPBootURIAttribute = "UrlBootFile"
+
 // Client provides Redfish operations against a single BMC.
 // Created via Pool.Get or Dial. Must be closed when no longer needed.
 type Client struct {
@@ -253,6 +255,62 @@ func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error 
 			"BootSourceOverrideEnabled": string(BootContinuous),
 			"BootSourceOverrideMode":    string(BootModeUEFI),
 			"HttpBootUri":               bootURL,
+		},
+	}
+
+	data, status, err := c.session.do(ctx, http.MethodPatch, path, body)
+	if err != nil {
+		return err
+	}
+
+	if isUnsupportedStatus(status) {
+		return redfishResponseError(http.MethodPatch, path, status, data, ErrUnsupported)
+	}
+
+	if !isSuccessStatus(status) {
+		return redfishResponseError(http.MethodPatch, path, status, data, nil)
+	}
+
+	return nil
+}
+
+// GetBIOSHTTPBootURI returns the pending BIOS UEFI HTTP boot URI.
+// Returns ErrUnsupported if the BMC does not support BIOS settings.
+func (c *Client) GetBIOSHTTPBootURI(ctx context.Context) (string, error) {
+	path := fmt.Sprintf("/redfish/v1/Systems/%s/Bios/Settings", c.deviceID)
+
+	data, status, err := c.session.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return "", err
+	}
+
+	if isUnsupportedStatus(status) {
+		return "", redfishResponseError(http.MethodGet, path, status, data, ErrUnsupported)
+	}
+
+	if status != http.StatusOK {
+		return "", redfishResponseError(http.MethodGet, path, status, data, nil)
+	}
+
+	var result struct {
+		Attributes struct {
+			HTTPBootURI string `json:"UrlBootFile"`
+		} `json:"Attributes"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", fmt.Errorf("parsing BIOS HTTP boot URI: %w", err)
+	}
+
+	return result.Attributes.HTTPBootURI, nil
+}
+
+// SetBIOSHTTPBootURI sets the pending BIOS UEFI HTTP boot URI.
+// Returns ErrUnsupported if the BMC does not support BIOS settings.
+func (c *Client) SetBIOSHTTPBootURI(ctx context.Context, bootURL string) error {
+	path := fmt.Sprintf("/redfish/v1/Systems/%s/Bios/Settings", c.deviceID)
+	body := map[string]any{
+		"Attributes": map[string]string{
+			biosHTTPBootURIAttribute: bootURL,
 		},
 	}
 

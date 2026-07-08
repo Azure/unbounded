@@ -83,7 +83,5 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, r.Client.Status().Update(ctx, &machine)
 	}
 
-	_ = log
-
 	return ctrl.Result{}, nil
 }
