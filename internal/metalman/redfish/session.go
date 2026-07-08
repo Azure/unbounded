@@ -46,7 +46,7 @@ func createSession(ctx context.Context, httpClient *http.Client, baseURL, user, 
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("Redfish %s %s failed: %w", http.MethodPost, "/redfish/v1/SessionService/Sessions", err)
+		return "", "", fmt.Errorf("redfish %s %s failed: %w", http.MethodPost, "/redfish/v1/SessionService/Sessions", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // Best-effort close of HTTP response body.
 
@@ -123,7 +123,7 @@ func (s *bmcSession) doOnce(ctx context.Context, method, path string, body any) 
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("Redfish %s %s failed: %w", method, path, err)
+		return nil, 0, fmt.Errorf("redfish %s %s failed: %w", method, path, err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // Best-effort close of HTTP response body.
 
