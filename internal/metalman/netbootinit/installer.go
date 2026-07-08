@@ -176,6 +176,7 @@ func (i *Installer) Run(ctx context.Context) error {
 	}
 
 	i.Logger.Printf("installation complete, rebooting")
+
 	if err := i.Sleep(ctx, 2*time.Second); err != nil {
 		return err
 	}

@@ -88,6 +88,7 @@ func writeCloudInitFiles(root string, cfg cloudInitConfig) error {
 func (i *Installer) findRootPartition(targetDisk string) (string, bool) {
 	for _, part := range i.partitionsForDisk(targetDisk) {
 		var isRoot bool
+
 		if err := i.withMounted(part.Device, i.MountRoot, rootFilesystems, func() error {
 			isRoot = pathExists(filepath.Join(i.MountRoot, "etc")) && pathExists(filepath.Join(i.MountRoot, "var"))
 			return nil

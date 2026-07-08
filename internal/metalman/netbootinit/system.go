@@ -77,6 +77,7 @@ func bytesToString(chars []byte) string {
 
 func (i *Installer) mountAny(source, target string, filesystems ...string) error {
 	var lastErr error
+
 	for _, fstype := range filesystems {
 		if err := i.System.Mount(source, target, fstype); err == nil {
 			return nil
@@ -100,7 +101,7 @@ func (i *Installer) withMounted(source, target string, filesystems []string, fn 
 	mounted := true
 	defer func() {
 		if mounted {
-			_ = i.System.Unmount(target)
+			unmountBestEffort(i.System, target)
 		}
 	}()
 
@@ -111,6 +112,7 @@ func (i *Installer) withMounted(source, target string, filesystems []string, fn 
 	if err := i.System.Unmount(target); err != nil {
 		return err
 	}
+
 	mounted = false
 
 	return nil

@@ -155,10 +155,12 @@ func parseIPParam(value string) (ipConfig, error) {
 	}
 
 	mask := field(3)
+
 	prefix, err := strconv.Atoi(mask)
 	if strings.Contains(mask, ".") {
 		prefix, err = maskToCIDR(mask)
 	}
+
 	if err != nil || prefix < 0 || prefix > 32 {
 		return ipConfig{}, fmt.Errorf("invalid network mask %q", mask)
 	}

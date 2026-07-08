@@ -31,6 +31,7 @@ func (i *Installer) createUEFIBootEntry(ctx context.Context, targetDisk string) 
 
 	for _, part := range i.partitionsForDisk(targetDisk) {
 		var loader string
+
 		if err := i.withMounted(part.Device, i.ESPMountPoint, []string{"vfat"}, func() error {
 			loader = findEFILoader(i.ESPMountPoint)
 			return nil

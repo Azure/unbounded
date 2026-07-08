@@ -22,6 +22,12 @@ func closeBestEffort(c io.Closer) {
 	}
 }
 
+func unmountBestEffort(system SystemOps, target string) {
+	if err := system.Unmount(target); err != nil {
+		return
+	}
+}
+
 func retry(ctx context.Context, attempts int, delay time.Duration, desc string, sleep func(context.Context, time.Duration) error, log *Logger, fn func() error) error {
 	var lastErr error
 
