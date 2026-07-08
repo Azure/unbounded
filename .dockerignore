@@ -19,6 +19,7 @@ cmd/unbounded-storage/target/
 .github/
 
 # IDE
+.opencode/
 .idea/
 .vscode/
 *.swp
