@@ -3,11 +3,9 @@
 
 //! Reusable origin TCP connections for HTTP-family backends.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
 use std::os::fd::RawFd;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use std::thread::ThreadId;
 
 use crate::bufferpool::Error;
 use crate::http::{ResponseHead, StatusCode, response_keep_alive};
@@ -16,61 +14,38 @@ use crate::tls::TlsContext;
 
 #[derive(Clone)]
 pub(super) struct OriginConnPool {
-    inner: Arc<Mutex<PoolInner>>,
+    inner: Rc<RefCell<PoolInner>>,
 }
 
 struct PoolInner {
-    max_idle_per_ring: usize,
-    idle: HashMap<PoolKey, Vec<TcpConn>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct PoolKey {
-    thread: ThreadId,
-    ring: usize,
+    max_idle: usize,
+    idle: Vec<TcpConn>,
 }
 
 impl OriginConnPool {
-    pub(super) fn new(max_idle_per_ring: usize) -> Self {
+    pub(super) fn new(max_idle: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(PoolInner {
-                max_idle_per_ring: max_idle_per_ring.max(1),
-                idle: HashMap::new(),
+            inner: Rc::new(RefCell::new(PoolInner {
+                max_idle: max_idle.max(1),
+                idle: Vec::new(),
             })),
         }
     }
 
-    pub(super) fn checkout(&self, handle: &NetHandle) -> Option<TcpConn> {
-        let key = pool_key(handle);
+    pub(super) fn checkout(&self) -> Option<TcpConn> {
         loop {
-            let conn = self
-                .inner
-                .lock()
-                .expect("origin connection pool poisoned")
-                .idle
-                .get_mut(&key)
-                .and_then(Vec::pop)?;
+            let conn = self.inner.borrow_mut().idle.pop()?;
             if tcp_conn_is_reusable(conn.fd()) {
                 return Some(conn);
             }
         }
     }
 
-    pub(super) fn put(&self, handle: &NetHandle, conn: TcpConn) {
-        let key = pool_key(handle);
-        let mut inner = self.inner.lock().expect("origin connection pool poisoned");
-        let max_idle = inner.max_idle_per_ring;
-        let idle = inner.idle.entry(key).or_default();
-        if idle.len() < max_idle {
-            idle.push(conn);
+    pub(super) fn put(&self, conn: TcpConn) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.idle.len() < inner.max_idle {
+            inner.idle.push(conn);
         }
-    }
-}
-
-fn pool_key(handle: &NetHandle) -> PoolKey {
-    PoolKey {
-        thread: std::thread::current().id(),
-        ring: handle.ring_key(),
     }
 }
 
@@ -129,7 +104,7 @@ async fn checkout_or_connect(
     tls: &Option<Rc<TlsContext>>,
     sni_host: &str,
 ) -> Result<OriginConn, Error> {
-    if let Some(conn) = pool.checkout(handle) {
+    if let Some(conn) = pool.checkout() {
         return Ok(OriginConn { conn, reused: true });
     }
 
@@ -165,7 +140,7 @@ pub(super) async fn send_request_read_head(
 
         match handle.send(fd, request.clone()).await {
             Ok(_) => {}
-            Err(e) if reused && stale_retry => {
+            Err(_) if reused && stale_retry => {
                 stale_retry = false;
                 continue;
             }

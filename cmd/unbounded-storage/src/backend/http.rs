@@ -12,8 +12,7 @@
 //!
 //! Origin connections are kept alive when the response has a known,
 //! fully-consumed body and the peer did not ask to close the stream. Idle
-//! sockets stay ring-local so the shard ring and worker-local RPC rings
-//! never share fds.
+//! sockets remain in the backend's shard-local pool.
 //!
 //! ## Address resolution and the `Host` header
 //!
@@ -499,7 +498,7 @@ async fn fetch(
         leading.len(),
         filled,
     ) {
-        conns.put(&handle, conn);
+        conns.put(conn);
     }
     Ok(())
 }
@@ -571,7 +570,7 @@ async fn fetch_metadata(
     let body = ObjectMetadata::new(length).encode()?;
     copy_body_into_pages(&body, &dsts, backing_base, page_size)?;
     if head_response_reusable(version_minor, connection.as_deref(), header_end, buf.len()) {
-        conns.put(&handle, conn);
+        conns.put(conn);
     }
     Ok(())
 }

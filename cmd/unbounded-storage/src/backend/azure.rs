@@ -442,7 +442,7 @@ async fn fetch(
         leading.len(),
         filled,
     ) {
-        conns.put(&handle, conn);
+        conns.put(conn);
     }
     Ok(())
 }
@@ -509,7 +509,7 @@ async fn fetch_metadata(
     let body = ObjectMetadata::new(length).encode()?;
     copy_body_into_pages(&body, &dsts, backing_base, page_size)?;
     if head_response_reusable(version_minor, connection.as_deref(), header_end, buf.len()) {
-        conns.put(&handle, conn);
+        conns.put(conn);
     }
     Ok(())
 }
