@@ -52,29 +52,15 @@ pub struct EngineConfig {
     /// the CoW B+tree commit cost; the mutator never exceeds this
     /// per commit.
     pub commit_batch_max: usize,
-    /// Target batch-coalescing latency, in microseconds. This is a
-    /// logical hint, not a value the engine reads as elapsed time:
-    /// the deterministic-simulation harness forbids reading the
-    /// wall clock, so the mutator realizes this budget as
-    /// [`Self::commit_batch_ticks`] cooperative yields rather than
-    /// a real deadline. Retained for documentation and future
-    /// production tuning.
-    pub commit_batch_deadline_us: u64,
     /// Number of cooperative yields the mutator may spend waiting
     /// for more requests to coalesce into a batch that has not yet
-    /// reached [`Self::commit_batch_max`]. This is the
-    /// wall-clock-free realization of
-    /// [`Self::commit_batch_deadline_us`]: each yield lets the
+    /// reached [`Self::commit_batch_max`]. Each yield lets the
     /// executor interleave producers that are about to enqueue, so
     /// the batch grows under load while a drained or closed queue
-    /// commits immediately. Default 8 (roughly
-    /// `commit_batch_deadline_us / 25us` per yield); 0 disables
-    /// coalescing.
+    /// commits immediately. Default 8; 0 disables coalescing.
     pub commit_batch_ticks: u32,
     pub eviction_watermark: f32,
-    pub probationary_fraction: f32,
     pub singleflight_shards: usize,
-    pub restart_scan_queue_depth: u32,
     /// Number of 4 KiB registered scratch buffers reserved for
     /// btree / meta I/O. This is the hard ceiling on how many
     /// btree page writes a single path-copy commit can keep in
@@ -126,12 +112,9 @@ impl Default for EngineConfig {
             page_size_bytes: 2 * 1024 * 1024,
             btree_page_bytes: 4096,
             commit_batch_max: 1024,
-            commit_batch_deadline_us: 200,
             commit_batch_ticks: 8,
             eviction_watermark: 0.9,
-            probationary_fraction: 0.1,
             singleflight_shards: 64,
-            restart_scan_queue_depth: 256,
             btree_scratch_pages: 64,
             bypass_admission: false,
             bypass_index_read: false,
@@ -781,9 +764,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             // Coalesce up to `commit_batch_max`, spending a bounded
             // budget of cooperative yields (`commit_batch_ticks`)
             // so producers that are about to enqueue join this
-            // commit. Wall-clock-free stand-in for
-            // `commit_batch_deadline_us`; see
-            // `MutatorQueue::drain_batch`. The drain stops early if
+            // commit. The drain stops early if
             // the queue closes, so a draining shutdown still
             // terminates.
             let batch = self

@@ -227,12 +227,10 @@ impl MutatorQueue {
     /// as the batch reaches `max`, the queue is closed, or the
     /// yield budget is exhausted.
     ///
-    /// This is the wall-clock-free realization of
-    /// [`crate::storage::EngineConfig::commit_batch_deadline_us`]:
-    /// the DST harness forbids reading elapsed time, so the
-    /// deadline is expressed as a budget of `ticks` logical yields
-    /// (see [`crate::storage::EngineConfig::commit_batch_ticks`]).
-    /// Each [`yield_once`] gives the executor a chance to
+    /// The DST harness forbids reading elapsed time, so coalescing is
+    /// expressed as a budget of `ticks` logical yields (see
+    /// [`crate::storage::EngineConfig::commit_batch_ticks`]). Each
+    /// [`yield_once`] gives the executor a chance to
     /// interleave producers that are about to push, so batches
     /// grow under load while a drained or closed queue never
     /// stalls. `ticks == 0` disables coalescing (a single drain).
