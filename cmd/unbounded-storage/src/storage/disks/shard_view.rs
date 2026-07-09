@@ -14,7 +14,7 @@
 //! touches the device directly.
 //!
 //! On every `BlockStore` call the view loads the directory's published
-//! `(channels, generation)` pair atomically and compares the
+//! channel snapshot and compares its generation
 //! generation against the one it last replayed against; on a mismatch
 //! it re-registers every recorded backing against every channel in
 //! the newly-published set before delegating. Because the snapshot
@@ -149,11 +149,10 @@ impl CacheDirectorySet {
         self.get_or_create(cache_id).apply_channels(channels);
     }
 
-    pub fn drive_numa(&self, cache_id: Option<&str>) -> Arc<Vec<Option<u16>>> {
+    pub fn snapshot(&self, cache_id: Option<&str>) -> Option<Arc<super::channels::ChannelSet>> {
         cache_id
             .and_then(|id| self.get(id))
-            .map(|directory| directory.drive_numa())
-            .unwrap_or_else(|| Arc::new(Vec::new()))
+            .map(|directory| directory.snapshot())
     }
 }
 
@@ -243,12 +242,14 @@ impl LiveShardLocalStore {
     /// [`DiskChannelDirectory::snapshot`] load, so the pair is
     /// consistent. Returns `None` when the directory has no channels.
     fn current_or_replay(&self) -> Option<Arc<super::channels::ChannelSet>> {
-        let (set, gen_n) = self.directory.snapshot();
-        let set = set?;
+        let set = self.directory.snapshot();
+        if set.channels.is_empty() {
+            return None;
+        }
         let mut guard = self.state.lock().unwrap();
-        if guard.last_seen_generation != Some(gen_n) {
+        if guard.last_seen_generation != Some(set.generation) {
             Self::replay_locked(&set.channels, &guard.registered);
-            guard.last_seen_generation = Some(gen_n);
+            guard.last_seen_generation = Some(set.generation);
         }
         Some(set)
     }
