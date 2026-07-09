@@ -143,6 +143,35 @@ func TestBootOrderConfigUEFIHTTPOn(t *testing.T) {
 	require.Equal(t, "http://192.0.2.1/boot/grubx64.efi", boot["HttpBootUri"])
 }
 
+func TestClientGetBootConfigTracksHTTPBootURIFieldPresence(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Hdd",
+					"BootSourceOverrideEnabled": "Disabled",
+				},
+			})
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	config, err := client.GetBootConfig(t.Context())
+	require.NoError(t, err)
+	require.False(t, config.HasHTTPBootURI)
+}
+
 func TestBootOrderConfigUEFIHTTPNoOp(t *testing.T) { TestBootOrderConfigUEFIHTTPOn(t) }
 func TestUEFIHTTPBootEndToEnd(t *testing.T)        { TestBootOrderConfigUEFIHTTPOn(t) }
 func TestBootOrderConfigNoOp(t *testing.T)         { TestBootOrderConfigPxeOff(t) }
@@ -208,6 +237,155 @@ func TestBootOrderConfigTransientError(t *testing.T) {
 	srv, _, _, _ := testBMCWithPatchStatus(t, http.StatusInternalServerError)
 	client := dialTestClient(t, srv)
 	require.Error(t, client.SetBootOverride(t.Context(), BootTargetPxe, BootContinuous))
+}
+
+func TestRedfishErrorIncludesFullResponseBody(t *testing.T) {
+	const responseBody = `{"error":{"message":"reset failed with detailed BMC diagnostics"}}`
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
+			http.Error(w, responseBody, http.StatusInternalServerError)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	err := client.Reset(t.Context(), ResetOn)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), responseBody)
+}
+
+func TestRedfishUnsupportedErrorIncludesFullResponseBody(t *testing.T) {
+	const responseBody = `{"error":{"message":"BootSourceOverrideTarget is not writable"}}`
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			http.Error(w, responseBody, http.StatusBadRequest)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	err := client.SetBootOverride(t.Context(), BootTargetPxe, BootContinuous)
+	require.ErrorIs(t, err, ErrUnsupported)
+	require.Contains(t, err.Error(), responseBody)
+}
+
+func TestClientSetBIOSHTTPBootURI(t *testing.T) {
+	var patchBody map[string]any
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/Bios/Settings"):
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&patchBody))
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	require.NoError(t, client.SetBIOSHTTPBootURI(t.Context(), "http://192.0.2.1/boot/shimx64.efi"))
+	require.Equal(t, "http://192.0.2.1/boot/shimx64.efi", patchBody["Attributes"].(map[string]any)["UrlBootFile"])
+}
+
+func TestClientGetBIOSHTTPBootURI(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/Bios/Settings"):
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"Attributes": map[string]string{"UrlBootFile": "http://192.0.2.1/boot/shimx64.efi"},
+			}))
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	uri, err := client.GetBIOSHTTPBootURI(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "http://192.0.2.1/boot/shimx64.efi", uri)
+}
+
+func TestClientSetBIOSHTTPBootURIUnsupported(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/Bios/Settings"):
+			http.Error(w, "BIOS settings unsupported", http.StatusNotFound)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	require.ErrorIs(t, client.SetBIOSHTTPBootURI(t.Context(), "http://192.0.2.1/boot/shimx64.efi"), ErrUnsupported)
+}
+
+func TestClientSetHTTPBootOverrideUnsupportedDoesNotFallback(t *testing.T) {
+	var patchCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+			http.Error(w, "HttpBootUri is not writable", http.StatusBadRequest)
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/Bios/Settings"):
+			t.Fatal("SetHTTPBootOverride should not write BIOS settings directly")
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	err := client.SetHTTPBootOverride(t.Context(), "http://192.0.2.1/boot/shimx64.efi")
+	require.ErrorIs(t, err, ErrUnsupported)
+	require.Equal(t, int64(1), patchCalls.Load())
 }
 
 func TestSessionExpiryRetry(t *testing.T) {

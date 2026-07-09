@@ -50,7 +50,9 @@ type PowerClient interface {
 	Reset(ctx context.Context, resetType redfish.ResetType) error
 	DisableBootOverride(ctx context.Context) error
 	SetBootOverride(ctx context.Context, target redfish.BootTarget, enabled redfish.BootEnabled) error
+	GetBootConfig(ctx context.Context) (redfish.BootConfig, error)
 	SetHTTPBootOverride(ctx context.Context, bootURL string) error
+	SetBIOSHTTPBootURI(ctx context.Context, bootURL string) error
 }
 
 // PowerClientFactory builds a PowerClient for a Machine.
@@ -612,7 +614,7 @@ func (r *Reconciler) requestRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 			return err
 		}
 
-		if err := pc.SetHTTPBootOverride(ctx, bootURL); err != nil {
+		if err := setHTTPBootOverride(ctx, pc, bootURL); err != nil {
 			return err
 		}
 	} else if err := pc.SetBootOverride(ctx, redfish.BootTargetPxe, redfish.BootContinuous); err != nil {
@@ -629,6 +631,35 @@ func (r *Reconciler) requestRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 	}
 
 	return pc.Reset(ctx, redfish.ResetForceRestart)
+}
+
+func setHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string) error {
+	config, err := pc.GetBootConfig(ctx)
+	if err != nil {
+		return err
+	}
+
+	if !config.HasHTTPBootURI {
+		return setBIOSHTTPBootOverride(ctx, pc, bootURL)
+	}
+
+	if err := pc.SetHTTPBootOverride(ctx, bootURL); err != nil {
+		if !errors.Is(err, redfish.ErrUnsupported) {
+			return err
+		}
+
+		return setBIOSHTTPBootOverride(ctx, pc, bootURL)
+	}
+
+	return nil
+}
+
+func setBIOSHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string) error {
+	if err := pc.SetBIOSHTTPBootURI(ctx, bootURL); err != nil {
+		return err
+	}
+
+	return pc.SetBootOverride(ctx, redfish.BootTargetUefiHTTP, redfish.BootOnce)
 }
 
 func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
