@@ -116,10 +116,21 @@ pub struct DiskReport {
 pub struct DiskRegistry<T: DiskTarget> {
     target: T,
     disk_slots: Vec<DiskCpuSlot>,
-    handles: HashMap<PathBuf, T::Handle>,
-    channels: HashMap<PathBuf, PageChannel>,
-    applied: HashMap<PathBuf, DiskSpec>,
-    placement: HashMap<PathBuf, Option<DiskCpuSlot>>,
+    entries: HashMap<PathBuf, OpenDiskEntry<T::Handle>>,
+}
+
+struct OpenDiskEntry<H> {
+    channel: PageChannel,
+    spec: DiskSpec,
+    placement: Option<DiskCpuSlot>,
+    handle: H,
+}
+
+impl<H> OpenDiskEntry<H> {
+    fn close(self) {
+        drop(self.channel);
+        drop(self.handle);
+    }
 }
 
 pub struct DiskRegistrySet<T: DiskTarget> {
@@ -137,10 +148,7 @@ impl<T: DiskTarget> DiskRegistry<T> {
         Self {
             target,
             disk_slots,
-            handles: HashMap::new(),
-            channels: HashMap::new(),
-            applied: HashMap::new(),
-            placement: HashMap::new(),
+            entries: HashMap::new(),
         }
     }
 
@@ -171,19 +179,17 @@ impl<T: DiskTarget> DiskRegistry<T> {
         }
 
         let to_remove: Vec<PathBuf> = self
-            .handles
+            .entries
             .keys()
             .filter(|p| match desired_paths.get(p.as_path()) {
                 None => true,
-                Some(spec) => specs_drifted(self.applied.get(*p), spec),
+                Some(spec) => specs_drifted(self.entries.get(*p).map(|entry| &entry.spec), spec),
             })
             .cloned()
             .collect();
         for path in to_remove {
-            if self.handles.remove(&path).is_some() {
-                self.channels.remove(&path);
-                self.applied.remove(&path);
-                self.placement.remove(&path);
+            if let Some(entry) = self.entries.remove(&path) {
+                entry.close();
                 report.removed += 1;
             }
         }
@@ -196,25 +202,35 @@ impl<T: DiskTarget> DiskRegistry<T> {
         // invariant). This is idempotent across reconciles (same
         // desired set -> same assignment) and never leaks a slot when a
         // disk churns out and back in.
+        let open_placements: HashMap<PathBuf, Option<DiskCpuSlot>> = self
+            .entries
+            .iter()
+            .map(|(path, entry)| (path.clone(), entry.placement))
+            .collect();
         let assignment = if reserved_slots.is_empty() {
-            assign_disk_cpus(desired, &self.disk_slots, &self.placement)
+            assign_disk_cpus(desired, &self.disk_slots, &open_placements)
         } else {
-            assign_disk_cpus_reserved(desired, &self.disk_slots, &self.placement, reserved_slots)
+            assign_disk_cpus_reserved(desired, &self.disk_slots, &open_placements, reserved_slots)
         };
 
         for spec in desired {
             let path = disk_path(spec);
-            if self.handles.contains_key(Path::new(path)) {
-                self.applied.insert(PathBuf::from(path), spec.clone());
+            if let Some(entry) = self.entries.get_mut(Path::new(path)) {
+                entry.spec = spec.clone();
                 continue;
             }
             let pin = assignment.get(Path::new(path)).copied().flatten();
             match self.target.open(spec, pin) {
                 Ok((handle, channel)) => {
-                    self.handles.insert(PathBuf::from(path), handle);
-                    self.channels.insert(PathBuf::from(path), channel);
-                    self.applied.insert(PathBuf::from(path), spec.clone());
-                    self.placement.insert(PathBuf::from(path), pin);
+                    self.entries.insert(
+                        PathBuf::from(path),
+                        OpenDiskEntry {
+                            channel,
+                            spec: spec.clone(),
+                            placement: pin,
+                            handle,
+                        },
+                    );
                     report.added += 1;
                 }
                 Err(e) => {
@@ -235,21 +251,16 @@ impl<T: DiskTarget> DiskRegistry<T> {
     /// stripe's serving shard on the same node as its disk.
     pub fn channels_snapshot(&self) -> Vec<(PathBuf, PageChannel, Option<u16>, bool)> {
         let mut out: Vec<(PathBuf, PageChannel, Option<u16>, bool)> = self
-            .channels
+            .entries
             .iter()
-            .map(|(p, c)| {
-                let numa = self
-                    .placement
-                    .get(p)
-                    .copied()
-                    .flatten()
-                    .and_then(|s| s.numa);
-                let page_cache_enabled = self
-                    .applied
-                    .get(p)
-                    .map(|spec| !spec.disable_page_cache)
-                    .unwrap_or(true);
-                (p.clone(), c.clone(), numa, page_cache_enabled)
+            .map(|(path, entry)| {
+                let numa = entry.placement.and_then(|slot| slot.numa);
+                (
+                    path.clone(),
+                    entry.channel.clone(),
+                    numa,
+                    !entry.spec.disable_page_cache,
+                )
             })
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -261,15 +272,14 @@ impl<T: DiskTarget> DiskRegistry<T> {
     /// to the storage cores; that lets the storage cores observe the
     /// channel disconnect and exit promptly.
     pub fn drain(mut self) {
-        self.channels.clear();
-        self.handles.clear();
-        self.applied.clear();
-        self.placement.clear();
+        for (_, entry) in self.entries.drain() {
+            entry.close();
+        }
     }
 
     /// Paths whose handle is currently open. Order is unspecified.
     pub fn current_paths(&self) -> Vec<PathBuf> {
-        self.handles.keys().cloned().collect()
+        self.entries.keys().cloned().collect()
     }
 
     /// The CPU slot assigned to each currently-open disk, in
@@ -278,9 +288,9 @@ impl<T: DiskTarget> DiskRegistry<T> {
     /// logs.
     pub fn placement_snapshot(&self) -> Vec<(PathBuf, Option<DiskCpuSlot>)> {
         let mut out: Vec<(PathBuf, Option<DiskCpuSlot>)> = self
-            .placement
+            .entries
             .iter()
-            .map(|(p, h)| (p.clone(), *h))
+            .map(|(path, entry)| (path.clone(), entry.placement))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -344,7 +354,12 @@ impl<T: DiskTarget> DiskRegistrySet<T> {
         self.registries
             .iter()
             .filter(|(id, _)| id.as_str() != cache_id)
-            .flat_map(|(_, registry)| registry.placement.values().copied().flatten())
+            .flat_map(|(_, registry)| {
+                registry
+                    .entries
+                    .values()
+                    .filter_map(|entry| entry.placement)
+            })
             .collect()
     }
 }
@@ -603,7 +618,7 @@ mod tests {
         assert_eq!(report.added, 0);
         assert_eq!(report.removed, 0);
         assert_eq!(state.lock().unwrap().open_calls, calls_after_first);
-        assert!(reg.applied[&PathBuf::from("/a")].disable_page_cache);
+        assert!(reg.entries[&PathBuf::from("/a")].spec.disable_page_cache);
         assert!(!reg.channels_snapshot()[0].3);
     }
 
@@ -615,7 +630,7 @@ mod tests {
         let report = reg.reconcile(&[spec("/a", Some(32))]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert_eq!(reg.applied[&PathBuf::from("/a")].queue_depth, Some(32));
+        assert_eq!(reg.entries[&PathBuf::from("/a")].spec.queue_depth, Some(32));
     }
 
     #[test]
@@ -626,8 +641,8 @@ mod tests {
         let report = reg.reconcile(&[spec("/b", None)]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert!(reg.applied.contains_key(&PathBuf::from("/b")));
-        assert!(!reg.applied.contains_key(&PathBuf::from("/a")));
+        assert!(reg.entries.contains_key(&PathBuf::from("/b")));
+        assert!(!reg.entries.contains_key(&PathBuf::from("/a")));
     }
 
     #[test]
@@ -879,7 +894,7 @@ mod tests {
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
         assert_eq!(
-            reg.applied[&PathBuf::from("/a")].page_size_bytes,
+            reg.entries[&PathBuf::from("/a")].spec.page_size_bytes,
             Some(4096)
         );
     }
@@ -924,7 +939,7 @@ mod tests {
         let report = reg.reconcile(&[next]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert!(reg.applied[&PathBuf::from("/a")].skip_recovery_scan);
+        assert!(reg.entries[&PathBuf::from("/a")].spec.skip_recovery_scan);
     }
 
     #[test]
@@ -937,7 +952,7 @@ mod tests {
         let report = reg.reconcile(&[next]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert!(reg.applied[&PathBuf::from("/a")].force_format);
+        assert!(reg.entries[&PathBuf::from("/a")].spec.force_format);
     }
 
     #[test]
@@ -950,7 +965,7 @@ mod tests {
         let report = reg.reconcile(&[next]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert!(reg.applied[&PathBuf::from("/a")].bypass_admission);
+        assert!(reg.entries[&PathBuf::from("/a")].spec.bypass_admission);
     }
 
     #[test]
@@ -963,7 +978,7 @@ mod tests {
         let report = reg.reconcile(&[next]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert!(reg.applied[&PathBuf::from("/a")].bypass_index_read);
+        assert!(reg.entries[&PathBuf::from("/a")].spec.bypass_index_read);
     }
 
     #[test]
@@ -976,7 +991,7 @@ mod tests {
         let report = reg.reconcile(&[next]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert!(reg.applied[&PathBuf::from("/a")].bypass_checksum);
+        assert!(reg.entries[&PathBuf::from("/a")].spec.bypass_checksum);
     }
 
     #[test]
