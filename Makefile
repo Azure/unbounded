@@ -54,9 +54,6 @@ METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
 NETBOOT_IMAGE ?= $(CONTAINER_REGISTRY)/netboot:$(VERSION)
 
-PLAYPEN_BIN=bin/playpen
-PLAYPEN_CMD=./cmd/playpen
-
 KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
 KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
 
@@ -212,7 +209,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push playpen playpen-build gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -261,7 +258,6 @@ help: ## Show this help
 	@echo "  machina | machina-build          Build machina controller (with/without lint/test)"
 	@echo "  machine-ops-controller           Build machine-ops-controller"
 	@echo "  metalman | metalman-build        Build metalman controller (with/without lint/test)"
-	@echo "  playpen | playpen-build          Build playpen metalman test tool"
 	@echo "  unbounded-net-controller         Build net controller"
 	@echo "  unbounded-net-node               Build net node agent"
 	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
@@ -552,11 +548,6 @@ metalman-build: ## Build the metalman binary (no lint/test)
 	$(GOBUILD) -ldflags '$(METALMAN_LDFLAGS)' -o $(METALMAN_BIN) $(METALMAN_CMD)/main.go
 
 metalman: test metalman-build ## Build the metalman controller (implies test)
-
-playpen-build: ## Build the playpen binary (no lint/test)
-	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(PLAYPEN_BIN) $(PLAYPEN_CMD)
-
-playpen: test playpen-build ## Build playpen (implies test)
 
 ##@ Net Binaries
 
