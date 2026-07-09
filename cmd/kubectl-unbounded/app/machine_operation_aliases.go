@@ -146,6 +146,7 @@ func newMachineOperationAliasCommand(rt *machineCommandRuntime, use, short strin
 			}
 
 			baseCtx := rt.context(cmd.Context())
+
 			return runMachineOperationAlias(baseCtx, *o, cmd.OutOrStdout())
 		},
 	}

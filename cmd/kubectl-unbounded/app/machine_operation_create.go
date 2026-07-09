@@ -44,10 +44,6 @@ type machineOperationCreateOptions struct {
 	ownerReferenceMachine bool
 }
 
-func machineOperationCreateCommand() *cobra.Command {
-	return newMachineOperationCreateCommand(newMachineCommandRuntime())
-}
-
 func newMachineOperationCreateCommand(rt *machineCommandRuntime) *cobra.Command {
 	o := &machineOperationCreateOptions{
 		ttlSeconds:    -1,
@@ -80,6 +76,7 @@ terminal phase.`,
 			o.ttlSet = cmd.Flags().Changed("ttl")
 
 			ctx := rt.context(cmd.Context())
+
 			return o.run(ctx)
 		},
 	}

@@ -26,6 +26,7 @@ func newMachineOperationWaitCommand(rt *machineCommandRuntime) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			baseCtx := rt.context(cmd.Context())
+
 			ctx, cancel := contextWithOptionalTimeout(baseCtx, timeout)
 			defer cancel()
 

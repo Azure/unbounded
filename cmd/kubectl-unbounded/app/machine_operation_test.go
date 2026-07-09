@@ -6,6 +6,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -386,7 +387,14 @@ func executeMachineOperationCreateCommand(t *testing.T, args ...string) (string,
 
 	var out bytes.Buffer
 
-	cmd := machineOperationCreateCommand()
+	cmd := newMachineOperationCreateCommand(&machineCommandRuntime{
+		newClientWithKubeconfig: func(string) (client.WithWatch, error) {
+			return nil, errors.New("unexpected kube client")
+		},
+		commandContext: func(ctx context.Context) context.Context {
+			return ctx
+		},
+	})
 	cmd.SetOut(&out)
 	cmd.SetArgs(args)
 	cmd.SilenceErrors = true
