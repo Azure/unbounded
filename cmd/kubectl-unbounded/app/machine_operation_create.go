@@ -79,7 +79,8 @@ terminal phase.`,
 			o.out = cmd.OutOrStdout()
 			o.ttlSet = cmd.Flags().Changed("ttl")
 
-			return o.run(cmd.Context())
+			ctx := rt.context(cmd.Context())
+			return o.run(ctx)
 		},
 	}
 
