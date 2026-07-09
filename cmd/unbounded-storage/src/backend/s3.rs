@@ -72,17 +72,6 @@ pub struct S3Backend {
     conns: OriginConnPool,
 }
 
-// SAFETY: mirrors `HttpBackend`'s justification. `S3Backend` is
-// shard-pinned: the embedder constructs it on, and only ever drives it
-// from, a single pinned shard thread. The `NetHandle`, any `Rc`/
-// `RefCell` it holds, and the raw `backing_base` pointer are never
-// shared across threads at runtime. The `Send + Sync` marker exists
-// solely to satisfy the `Backend: Send + Sync` bound the embedder
-// requires when it stores the backend in a cross-shard registry; it is
-// not an invitation to touch the backend off its shard.
-unsafe impl Send for S3Backend {}
-unsafe impl Sync for S3Backend {}
-
 impl S3Backend {
     #[allow(clippy::too_many_arguments)]
     pub fn new(

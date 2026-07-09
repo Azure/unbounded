@@ -32,7 +32,7 @@ use super::http::copy_body_into_pages;
 /// [`HttpBackend`](super::http::HttpBackend): the raw `backing_base`
 /// pointer is only ever written on the single thread that drives the
 /// backend. Unlike the HTTP backend it holds no ring, so the only
-/// cross-thread concern is the backing pointer.
+/// only unsafe concern is the backing pointer.
 pub struct FakeBackend {
     backend_id: String,
     stripe_size: u64,
@@ -40,15 +40,6 @@ pub struct FakeBackend {
     page_size: usize,
     backing_base: *mut u8,
 }
-
-// SAFETY: mirrors `HttpBackend`. `FakeBackend` is shard-pinned: the
-// embedder constructs it on, and only ever drives it from, a single
-// pinned shard thread, so the raw `backing_base` pointer is never
-// touched concurrently. The `Send + Sync` marker exists solely to
-// satisfy the `Backend: Send + Sync` bound the cross-shard registry
-// requires; it is not an invitation to touch the backend off its shard.
-unsafe impl Send for FakeBackend {}
-unsafe impl Sync for FakeBackend {}
 
 impl FakeBackend {
     pub fn new(

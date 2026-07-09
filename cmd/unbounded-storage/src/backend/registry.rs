@@ -61,15 +61,6 @@ pub struct BackendRegistry {
     ctx: BuildCtx,
 }
 
-// SAFETY: shard-pinned exactly like the `OriginBackend`s it holds (see
-// `backend::http`/`backend::s3`). The `*mut u8` build base and the
-// `Rc`-bearing `NetHandle` are only ever touched on the owning shard
-// thread; the marker only lets the registry live in the
-// `Send + Sync` generic slots the transport/handler require. It is not
-// safe to move a registry to an unrelated thread.
-unsafe impl Send for BackendRegistry {}
-unsafe impl Sync for BackendRegistry {}
-
 impl BackendRegistry {
     /// Build a registry seeded from `specs`, fetching through `handle`
     /// into the region based at `backing_base`. A spec that fails to
