@@ -11,57 +11,18 @@
 //! node->peer map so ownership decisions stay consistent across the
 //! transport, the local-ownership pre-check, and the forwarding path.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use crate::bufferpool::Req;
 use crate::fabric::{PeerId, PeerRouter};
-use crate::p2p::{FingerTable, NodeId, RouteTableHandle, RoutingHandle, stripe_to_ring};
+use crate::p2p::{RouteTableHandle, stripe_to_ring};
 
-/// `PeerRouter` backed by a finger table. Maps a request's stripe to
-/// the owning peer's `PeerId` via the Chord `next_hop` lookup, then
-/// the `node -> peer` map. The routing surface lives behind a shared
-/// [`RoutingHandle`] so a peer-set change republished through that
-/// handle is observed here without rebuilding the router.
-pub struct FingerRouter {
-    routing: RoutingHandle,
-}
-
+/// Routes requests through the finger table for their cache ID.
 pub struct ChainFingerRouter {
     routes: RouteTableHandle,
-}
-
-impl FingerRouter {
-    /// Build a router over a freshly-seeded [`RoutingHandle`]. Retained
-    /// for callers (and tests) that hold the two maps directly; the
-    /// resulting router owns its own handle and is not live-reloadable
-    /// from elsewhere.
-    pub fn new(fingers: Arc<FingerTable>, node_to_peer: Arc<HashMap<NodeId, PeerId>>) -> Self {
-        Self::from_handle(RoutingHandle::new(fingers, node_to_peer))
-    }
-
-    /// Build a router that shares an existing [`RoutingHandle`]. A
-    /// `store` on any clone of `routing` is observed by this router's
-    /// next `route` call, which is how a shard fans a peer-set reload
-    /// out to every consumer at once.
-    pub fn from_handle(routing: RoutingHandle) -> Self {
-        Self { routing }
-    }
 }
 
 impl ChainFingerRouter {
     pub fn new(routes: RouteTableHandle) -> Self {
         Self { routes }
-    }
-}
-
-impl<R: Req> PeerRouter<R> for FingerRouter {
-    fn route(&self, req: &R) -> Option<PeerId> {
-        let target = stripe_to_ring(req.key());
-        let snap = self.routing.snapshot();
-        snap.fingers
-            .next_hop(target)
-            .and_then(|pe| snap.node_to_peer.get(&pe.node).copied())
     }
 }
 
@@ -86,13 +47,20 @@ mod tests {
         stripe_to_ring,
     };
 
-    use super::FingerRouter;
+    use super::ChainFingerRouter;
 
-    struct TestReq(StripeKey);
+    struct TestReq {
+        key: StripeKey,
+        cache_id: String,
+    }
 
     impl Req for TestReq {
         fn key(&self) -> StripeKey {
-            self.0
+            self.key
+        }
+
+        fn cache_id(&self) -> Option<&String> {
+            Some(&self.cache_id)
         }
     }
 
@@ -116,6 +84,26 @@ mod tests {
         Arc::new(nodes.iter().map(|&n| (NodeId(n), PeerId(n))).collect())
     }
 
+    fn router(
+        fingers: Arc<FingerTable>,
+        node_to_peer: Arc<HashMap<NodeId, PeerId>>,
+    ) -> ChainFingerRouter {
+        ChainFingerRouter::new(crate::p2p::RouteTableHandle::new(HashMap::from([(
+            "cache-a".to_string(),
+            crate::p2p::RoutingSnapshot {
+                fingers,
+                node_to_peer,
+            },
+        )])))
+    }
+
+    fn req(key: StripeKey) -> TestReq {
+        TestReq {
+            key,
+            cache_id: "cache-a".to_string(),
+        }
+    }
+
     #[test]
     fn key_for_ring_round_trips() {
         assert_eq!(stripe_to_ring(key_for_ring(12345)), RingId(12345));
@@ -124,7 +112,7 @@ mod tests {
     #[test]
     fn local_owned_stripe_routes_to_backend_and_router_returns_none() {
         // Single-node table: local owns everything, so next_hop is
-        // always None for any target. FingerRouter therefore yields
+        // always None for any target. ChainFingerRouter therefore yields
         // no peer (backend arm).
         let local = peer(1);
         let fingers = Arc::new(FingerTable::build(
@@ -134,11 +122,11 @@ mod tests {
         ));
         let node_to_peer = node_to_peer_map(&[1]);
 
-        let router = FingerRouter::new(fingers.clone(), node_to_peer);
+        let router = router(fingers.clone(), node_to_peer);
         // Pick a target that is not the local ring id so the owner
         // check still exercises the predecessor path (single node
         // owns everything regardless).
-        let req = TestReq(key_for_ring(local.ring.0.wrapping_add(999)));
+        let req = req(key_for_ring(local.ring.0.wrapping_add(999)));
         assert!(fingers.next_hop(stripe_to_ring(req.key())).is_none());
         assert!(PeerRouter::<TestReq>::route(&router, &req).is_none());
     }
@@ -156,10 +144,10 @@ mod tests {
             FingerTableConfig::with_k(8),
         ));
         let node_to_peer = node_to_peer_map(&[1, 2]);
-        let router = FingerRouter::new(fingers.clone(), node_to_peer);
+        let router = router(fingers.clone(), node_to_peer);
 
         // Target == other's ring id: local forwards to other.
-        let req = TestReq(key_for_ring(other.ring.0));
+        let req = req(key_for_ring(other.ring.0));
         let hop = fingers
             .next_hop(stripe_to_ring(req.key()))
             .expect("local should forward to a peer");

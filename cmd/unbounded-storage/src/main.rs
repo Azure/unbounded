@@ -701,7 +701,7 @@ fn run_shard(
         Ok(t) => t,
         Err(e) => {
             let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: RoutedTransport::new: {e}",
+                "worker={}: RoutedTransport::with_routes: {e}",
                 widx.0,
             )));
             return;
@@ -887,7 +887,7 @@ fn run_shard(
     // Control-drain tick hook: applies live config changes on this
     // shard's own thread so all `!Send` per-shard state stays
     // thread-local. Each `ShardCommand::ApplyConfig` republishes the
-    // routing surface through this shard's `RoutingHandle` (observed
+    // routing surface through this shard's `RouteTableHandle` (observed
     // atomically by its transport; the fabric RPC handlers are reloaded
     // separately by the `FabricGroup`), refreshes the stripe geometry,
     // reconciles the transport origin-backend registry and the frontend

@@ -369,7 +369,7 @@ between them, and the origin `Backend` is the final fallback.
 - `RoutedTransport<R, B: Backend<Req = R>>` (the client side) makes the
   first-hop decision via a single Chord `next_hop(stripe_to_ring(key))`:
   - `None` -> this node owns the stripe; serve from the local origin `Backend`.
-  - `Some(peer)` -> hand off to a wrapped `FabricTransport<R, FingerRouter>`
+  - `Some(peer)` -> hand off to a wrapped `FabricTransport<R, ChainFingerRouter>`
     with a `MAX_HOPS` TTL; recursion happens server-side.
 - `RecursiveHandler` (the server side) **resolves** every request (in contrast
   to `fabric::PoolHandler`, which only serves locally resident pages). It
