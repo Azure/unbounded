@@ -24,17 +24,18 @@ func newMachineOperationWaitCommand(rt *machineCommandRuntime) *cobra.Command {
 		Use:   "wait NAME",
 		Short: "Wait for a MachineOperation to complete",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, cancel := contextWithOptionalTimeout(cmd.Context(), timeout)
-			defer cancel()
+RunE: func(cmd *cobra.Command, args []string) error {
+	baseCtx := rt.context(cmd.Context())
+	ctx, cancel := contextWithOptionalTimeout(baseCtx, timeout)
+	defer cancel()
 
-			c, err := rt.clientWithKubeconfig(kubeconfig)
-			if err != nil {
-				return err
-			}
+	c, err := rt.clientWithKubeconfig(kubeconfig)
+	if err != nil {
+		return err
+	}
 
-			return waitForMachineOperation(ctx, c, args[0])
-		},
+	return waitForMachineOperation(ctx, c, args[0])
+},
 	}
 
 	cmd.Flags().DurationVar(&timeout, "timeout", 0, "Time to wait for completion (0 waits indefinitely)")
