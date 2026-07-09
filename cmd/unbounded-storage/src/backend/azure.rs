@@ -40,7 +40,6 @@ use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
 use super::limiter::FetchLimiter;
-use super::origin_ring::OriginRing;
 
 /// The pinned `x-ms-version` REST API version sent on every Azure Blob
 /// request. Azure requires this header to select the wire semantics of
@@ -51,14 +50,10 @@ const AZURE_MS_VERSION: &str = "2021-08-06";
 /// Origin backend that fetches stripe byte ranges from an Azure Blob
 /// origin into bufferpool pages over plaintext HTTP/1.1.
 ///
-/// Shard-pinned: the [`OriginRing`] and the raw `backing_base` pointer
-/// are only ever touched on the owning shard thread that built this
-/// backend, OR (for the RPC-handler instance) on the ephemeral
-/// `fabric-rpc-worker` thread that uses an [`OriginRing::WorkerLocal`]
-/// ring private to that thread. See the `unsafe impl Send + Sync`
-/// below.
+/// Shard-pinned: the [`NetHandle`] and raw `backing_base` pointer are
+/// only ever touched on the owning shard thread that built this backend.
 pub struct AzureBackend {
-    ring: OriginRing,
+    handle: NetHandle,
     origin: SockAddr,
     /// The origin host used for the `Host:` header. The TCP connect
     /// uses `origin` (the resolved IPv4), but the storage account's
@@ -79,7 +74,7 @@ pub struct AzureBackend {
 
 // SAFETY: mirrors `S3Backend`'s justification. `AzureBackend` is
 // shard-pinned: the embedder constructs it on, and only ever drives it
-// from, a single pinned shard thread. The `OriginRing`, any `Rc`/
+// from, a single pinned shard thread. The `NetHandle`, any `Rc`/
 // `RefCell` it holds, and the raw `backing_base` pointer are never
 // shared across threads at runtime. The `Send + Sync` marker exists
 // solely to satisfy the `Backend: Send + Sync` bound the embedder
@@ -91,7 +86,7 @@ unsafe impl Sync for AzureBackend {}
 impl AzureBackend {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        ring: OriginRing,
+        handle: NetHandle,
         origin: SockAddr,
         host: String,
         sni_host: String,
@@ -103,7 +98,7 @@ impl AzureBackend {
         http_concurrency: usize,
     ) -> Self {
         Self {
-            ring,
+            handle,
             origin,
             host,
             sni_host,
@@ -151,10 +146,7 @@ impl AzureBackend {
         let path = origin.origin_object_id.clone();
 
         let dsts_owned = dsts.to_vec();
-        let handle = match self.ring.handle() {
-            Ok(h) => h,
-            Err(e) => return AzureFetchStream::immediate_err(io_to_err(e)),
-        };
+        let handle = self.handle.clone();
         let origin_addr = self.origin;
         let backing_base = self.backing_base;
         let page_size = self.page_size;
@@ -260,14 +252,6 @@ impl<'a> AzureFetchStream<'a> {
     fn immediate_error(msg: &'static str) -> Self {
         Self {
             state: FetchState::Failed(Some(Error::from(msg))),
-            delivered: Vec::new(),
-            next: 0,
-        }
-    }
-
-    fn immediate_err(err: Error) -> Self {
-        Self {
-            state: FetchState::Failed(Some(err)),
             delivered: Vec::new(),
             next: 0,
         }
@@ -782,13 +766,6 @@ fn format_head_request(path: &str, host: &str) -> Result<Vec<u8>, Error> {
         .body(())
         .map_err(|_| Error::from("azure backend: failed to build origin HEAD request"))?;
     Ok(serialize_request(&req))
-}
-
-fn io_to_err(e: std::io::Error) -> Error {
-    match e.raw_os_error() {
-        Some(code) => Error::Io(code),
-        None => Error::transport(e),
-    }
 }
 
 #[cfg(test)]

@@ -20,9 +20,6 @@ mod limiter;
 mod origin;
 
 #[cfg(target_os = "linux")]
-mod origin_ring;
-
-#[cfg(target_os = "linux")]
 mod registry;
 
 #[cfg(target_os = "linux")]
@@ -48,9 +45,6 @@ pub use limiter::{Acquire, FetchLimiter, FetchPermit};
 
 #[cfg(target_os = "linux")]
 pub use origin::{OriginBackend, OriginStream};
-
-#[cfg(target_os = "linux")]
-pub use origin_ring::{FixedRegion, OriginRing};
 
 #[cfg(target_os = "linux")]
 pub use registry::{BackendRegistry, RegistryFetchStream};

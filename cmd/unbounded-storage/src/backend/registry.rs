@@ -31,23 +31,22 @@ use arc_swap::ArcSwap;
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::config::reconcile::BackendReconcileTarget;
 use crate::config::{BackendSpec, backend_spec};
+use crate::ring::NetHandle;
 use crate::storage::StripeReq;
 use crate::tls::{TlsConfig, TlsContext};
 
 use super::url::parse_endpoint;
 use super::{
-    AzureBackend, Backend, FakeBackend, HttpBackend, OriginBackend, OriginRing, OriginStream,
-    S3Backend,
+    AzureBackend, Backend, FakeBackend, HttpBackend, OriginBackend, OriginStream, S3Backend,
 };
 
 /// The build context a registry needs to (re)construct an
 /// [`OriginBackend`] from a [`BackendSpec`]. Captured once per registry
-/// instance because the pool transport and the RPC handler each own a
-/// registry that differs only in which ring a cache-miss fetch drives
-/// and which registered region origin bytes land in.
+/// instance because every shard has its own network ring and registered
+/// backing region.
 #[derive(Clone)]
 struct BuildCtx {
-    ring: OriginRing,
+    handle: NetHandle,
     page_size: usize,
     backing_base: *mut u8,
 }
@@ -64,28 +63,27 @@ pub struct BackendRegistry {
 
 // SAFETY: shard-pinned exactly like the `OriginBackend`s it holds (see
 // `backend::http`/`backend::s3`). The `*mut u8` build base and the
-// `Rc`-bearing `OriginRing::Shard` are only ever touched on the owning
-// shard thread or the ephemeral `fabric-rpc-worker` thread driving a
-// `WorkerLocal` ring; the marker only lets the registry live in the
+// `Rc`-bearing `NetHandle` are only ever touched on the owning shard
+// thread; the marker only lets the registry live in the
 // `Send + Sync` generic slots the transport/handler require. It is not
 // safe to move a registry to an unrelated thread.
 unsafe impl Send for BackendRegistry {}
 unsafe impl Sync for BackendRegistry {}
 
 impl BackendRegistry {
-    /// Build a registry seeded from `specs`, fetching through `ring`
+    /// Build a registry seeded from `specs`, fetching through `handle`
     /// into the region based at `backing_base`. A spec that fails to
     /// build (e.g. a URL that does not resolve) aborts the seed
     /// with the error, because startup must fail loudly rather than
     /// silently drop a configured backend.
     pub fn new(
         specs: &[BackendSpec],
-        ring: OriginRing,
+        handle: NetHandle,
         page_size: usize,
         backing_base: *mut u8,
     ) -> io::Result<Self> {
         let ctx = BuildCtx {
-            ring,
+            handle,
             page_size,
             backing_base,
         };
@@ -141,7 +139,7 @@ impl BuildCtx {
                 )?;
                 let origin = HttpBackend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::Http(HttpBackend::new(
-                    self.ring.clone(),
+                    self.handle.clone(),
                     origin,
                     endpoint.host,
                     endpoint.sni_host,
@@ -163,7 +161,7 @@ impl BuildCtx {
                 )?;
                 let origin = S3Backend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::S3(S3Backend::new(
-                    self.ring.clone(),
+                    self.handle.clone(),
                     origin,
                     endpoint.host,
                     endpoint.sni_host,
@@ -185,7 +183,7 @@ impl BuildCtx {
                 )?;
                 let origin = AzureBackend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::Azure(AzureBackend::new(
-                    self.ring.clone(),
+                    self.handle.clone(),
                     origin,
                     endpoint.host,
                     endpoint.sni_host,
@@ -343,10 +341,13 @@ impl PageStream for RegistryFetchStream<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::ptr;
+    use std::rc::Rc;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 
     use crate::config::{FakeBackendConfig, HttpBackendConfig, backend_spec};
+    use crate::ring::NetworkRing;
 
     use super::*;
 
@@ -375,21 +376,10 @@ mod tests {
         }
     }
 
-    /// A registry over a worker-local ring with no fixed region and a
-    /// null backing base. Sound for tests that never drive a fetch (they
-    /// only exercise the id map and the unknown-backend path); the ring
-    /// is built lazily on first `handle()`, which these tests never hit.
     fn registry(specs: &[BackendSpec]) -> BackendRegistry {
-        BackendRegistry::new(
-            specs,
-            OriginRing::WorkerLocal {
-                queue_depth: 1,
-                region: None,
-            },
-            4096,
-            ptr::null_mut(),
-        )
-        .expect("seed registry")
+        let ring = Rc::new(RefCell::new(NetworkRing::new(8).expect("network ring")));
+        BackendRegistry::new(specs, NetHandle::new(ring), 4096, ptr::null_mut())
+            .expect("seed registry")
     }
 
     fn noop_waker() -> Waker {
