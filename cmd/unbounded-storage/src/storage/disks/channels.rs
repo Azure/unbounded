@@ -34,7 +34,7 @@ pub struct ChannelSet {
     pub page_cache_enabled: Vec<bool>,
     pub drive_numa: Vec<Option<u16>>,
     pub generation: u64,
-    key: Vec<(PathBuf, usize, Option<u16>)>,
+    key: Vec<(PathBuf, u64, Option<u16>)>,
 }
 
 /// Owns the published per-disk channel set. A change-bearing
@@ -73,7 +73,7 @@ impl DiskChannelDirectory {
     /// do not needlessly reseat per-shard registrations.
     pub fn apply_channels(&self, mut channels: Vec<(PathBuf, PageChannel, Option<u16>, bool)>) {
         channels.sort_by(|a, b| a.0.cmp(&b.0));
-        let key: Vec<(PathBuf, usize, Option<u16>)> = channels
+        let key: Vec<(PathBuf, u64, Option<u16>)> = channels
             .iter()
             .map(|(p, c, numa, _)| (p.clone(), c.service_id(), *numa))
             .collect();
