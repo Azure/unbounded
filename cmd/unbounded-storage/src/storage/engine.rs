@@ -73,7 +73,6 @@ pub struct EngineConfig {
     pub commit_batch_ticks: u32,
     pub eviction_watermark: f32,
     pub probationary_fraction: f32,
-    pub admission_sketch_multiplier: usize,
     pub singleflight_shards: usize,
     pub restart_scan_queue_depth: u32,
     /// Number of 4 KiB registered scratch buffers reserved for
@@ -131,7 +130,6 @@ impl Default for EngineConfig {
             commit_batch_ticks: 8,
             eviction_watermark: 0.9,
             probationary_fraction: 0.1,
-            admission_sketch_multiplier: 2,
             singleflight_shards: 64,
             restart_scan_queue_depth: 256,
             btree_scratch_pages: 64,
@@ -285,10 +283,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             .await?,
         );
         let lru = Arc::new(SieveLru::new(capacity, refcount.clone()));
-        let admission = Arc::new(AdmissionFilter::new(
-            capacity,
-            cfg.admission_sketch_multiplier.max(1) as u32,
-        ));
+        let admission = Arc::new(AdmissionFilter::new(capacity));
         let singleflight = Arc::new(Singleflight::new(cfg.singleflight_shards.max(1)));
         let engine = Self {
             device,
@@ -628,7 +623,6 @@ impl<B: BlockDevice> StorageEngine<B> {
         }
 
         self.lru.touch(entry.lba);
-        self.admission.record_frequency(&pk);
         self.metric(|m| m.hits += 1);
         crate::metrics::storage_lookup(crate::metrics::Lookup::Hit);
         Ok(true)

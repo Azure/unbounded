@@ -480,7 +480,7 @@ touches the kernel device) -> `alloc` + `refcount` (pure LBA tables) -> `btree`
 `btree_page_bytes`), `btree_page_bytes` 4096 (the device atomic write unit),
 `commit_batch_max` 1024, `commit_batch_deadline_us` 200,
 `eviction_watermark` 0.9, `probationary_fraction` 0.1,
-`admission_sketch_multiplier` 2, `singleflight_shards` 64,
+`singleflight_shards` 64,
 `restart_scan_queue_depth` 256, `bypass_admission` false (bench/tooling only),
 and `skip_recovery_scan_if_no_meta` false (set from the public
 `skip_recovery_scan` config flag; production keeps it false so partial recovery
