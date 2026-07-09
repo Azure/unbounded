@@ -37,7 +37,7 @@ use unbounded_storage::fabric::PeerId;
 use unbounded_storage::p2p::RouteTableHandle;
 use unbounded_storage::runtime::{JoinHandle, Threading, WorkerIdx};
 use unbounded_storage::storage::StripeReq;
-use unbounded_storage::storage::disks::{CacheDirectorySet, DiskRegistrySet, UringDiskTarget};
+use unbounded_storage::storage::disks::{CacheDirectorySet, DiskRegistry, UringDiskTarget};
 use unbounded_storage::topology::ServingShard;
 
 use crate::StartupSettings;
@@ -435,14 +435,14 @@ pub struct ProcessApplyTarget {
     /// `Option` so the layer can be moved out at shutdown via
     /// [`Self::into_parts`]. Always `Some` while the process is serving.
     layer: Option<ShardLayer>,
-    disk_registry: DiskRegistrySet<UringDiskTarget>,
+    disk_registry: DiskRegistry<UringDiskTarget>,
     cache_directories: Arc<CacheDirectorySet>,
 }
 
 impl ProcessApplyTarget {
     pub fn new(
         layer: ShardLayer,
-        disk_registry: DiskRegistrySet<UringDiskTarget>,
+        disk_registry: DiskRegistry<UringDiskTarget>,
         cache_directories: Arc<CacheDirectorySet>,
     ) -> Self {
         Self {
@@ -462,7 +462,7 @@ impl ProcessApplyTarget {
     /// Consume the target at shutdown, returning the live layer (if any)
     /// and the disk registry so the caller can tear them down in the
     /// correct order (shards first, then disks).
-    pub fn into_parts(self) -> (Option<ShardLayer>, DiskRegistrySet<UringDiskTarget>) {
+    pub fn into_parts(self) -> (Option<ShardLayer>, DiskRegistry<UringDiskTarget>) {
         (self.layer, self.disk_registry)
     }
 }

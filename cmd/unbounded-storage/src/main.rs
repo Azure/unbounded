@@ -36,7 +36,7 @@ use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
 use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{
-    CacheDirectorySet, ChainLocalStore, DiskRegistrySet, UringDiskTarget,
+    CacheDirectorySet, ChainLocalStore, DiskRegistry, UringDiskTarget,
 };
 use unbounded_storage::topology::{CorePlan, CorePlanConfig, DiskCpuSlot, Host, ServingShard};
 
@@ -49,7 +49,6 @@ mod shard_layer;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
-const SHARED_DISK_REGISTRY_ID: &str = "shared";
 
 /// Stripe granularity used to build an inert origin backend on shards
 /// that have no configured backend. Such a backend is never exercised
@@ -408,7 +407,7 @@ fn main() -> ExitCode {
             numa: core.numa,
         })
         .collect();
-    let mut disk_registry = DiskRegistrySet::new(UringDiskTarget::new(runtime.clone()), disk_slots);
+    let mut disk_registry = DiskRegistry::new(UringDiskTarget::new(runtime.clone()), disk_slots);
 
     // Bring up the initial shard layer. A bring-up failure is fatal:
     // there is no running process to reconcile into.
@@ -1202,17 +1201,16 @@ fn p2p_topology_weighting(weighting: &config::TopologyWeighting) -> TopologyWeig
 }
 
 fn reconcile_cache_disks(
-    disk_registry: &mut DiskRegistrySet<UringDiskTarget>,
+    disk_registry: &mut DiskRegistry<UringDiskTarget>,
     cache_directories: &CacheDirectorySet,
     projection: &config::RuntimeGraph,
 ) {
     let mut cache_ids: Vec<String> = projection.caches.keys().cloned().collect();
     cache_ids.sort();
-    disk_registry.reconcile_ids([SHARED_DISK_REGISTRY_ID.to_string()]);
     cache_directories.reconcile(cache_ids.iter().cloned());
 
     let disks = config::runtime_disks(projection);
-    let report = disk_registry.reconcile_cache(SHARED_DISK_REGISTRY_ID, &disks);
+    let report = disk_registry.reconcile(&disks);
     eprintln!(
         "config: shared disks: added={} removed={} failures={}",
         report.added,
@@ -1223,7 +1221,7 @@ fn reconcile_cache_disks(
         eprintln!("disk {}: open failed: {msg}", path.display());
     }
 
-    let channels = disk_registry.channels_snapshot(SHARED_DISK_REGISTRY_ID);
+    let channels = disk_registry.channels_snapshot();
     for cache_id in cache_ids {
         cache_directories.apply_channels(&cache_id, channels.clone());
     }
