@@ -69,9 +69,9 @@ per pass:
    (`sites.unbounded-cloud.io`) with the networking spec copied verbatim and
    `spec.components` inferred from the running legacy workloads: storage is
    enabled on every translated Site that had a legacy storage DaemonSet (each
-   then gets its own node-selected DaemonSet, and the legacy shared storage
-   config is folded into that Site's `spec.components.storage.config` so it is
-   preserved per-Site), machina on the `cluster` Site, and metalman where a
+   then gets its own node-selected DaemonSet and an operator-managed
+   `unbounded-storage-config-<site>` ConfigMap seeded from the legacy shared
+   storage config), machina on the `cluster` Site, and metalman where a
    per-site metalman Deployment is detected. Existing machina-group Sites are
    never clobbered.
 1. Copy non-regenerable state (operator/user Secrets and the `machina-config`
@@ -81,7 +81,8 @@ per pass:
    absent; `machina-config` is upserted so config migrated from the legacy
    namespace wins over any default the component reconciler already created,
    and is then preserved once the source namespace is drained. Storage config is
-   not copied as a ConfigMap; it is folded into the per-Site spec (step 0).
+   copied into per-Site `unbounded-storage-config-<site>` ConfigMaps (created
+   from the embedded default when absent; adopted/preserved when present).
 2. Rewrite the namespace embedded in cluster-scoped secret references
    (`Machine.spec.pxe.redfish.passwordRef`, `MachineOperationCredential`
    `spec.auth.secretRef`), and copy each Machine's cloud-init user-data

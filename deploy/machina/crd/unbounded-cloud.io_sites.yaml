@@ -87,11 +87,9 @@ spec:
                     type: object
                   storage:
                     description: Storage configures the unbounded-storage supervisor
-                      for this site.
+                      for this site. Storage daemon config is held in the operator-managed
+                      unbounded-storage-config-<site> ConfigMap.
                     properties:
-                      config:
-                        description: Config overrides the supervisor config.yaml content.
-                        type: string
                       enabled:
                         description: Enabled controls whether the component is reconciled.
                         type: boolean

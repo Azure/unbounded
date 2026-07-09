@@ -288,6 +288,12 @@ func (r *LegacyReaper) reapOnce(ctx context.Context, logger logr.Logger) (bool, 
 		return false, fmt.Errorf("migrate machine cloud-init configmaps: %w", err)
 	}
 
+	// 3c: migrate legacy storage config into the per-site ConfigMaps the
+	// operator now uses as the storage config source of truth.
+	if err := r.migrateStorageConfigMaps(ctx, logger, target); err != nil {
+		return false, fmt.Errorf("migrate storage configmaps: %w", err)
+	}
+
 	// 4 & 5: per component, gate on the target workloads being healthy, then
 	// delete the operator-owned resources in the legacy namespace.
 	allReaped := true
@@ -443,21 +449,7 @@ func (r *LegacyReaper) detectComponents(ctx context.Context, siteName string) (m
 	}
 
 	if storage {
-		storageComponent := map[string]any{"enabled": true}
-
-		// Preserve the legacy shared storage config by folding it into the
-		// per-Site spec; storage config is per-Site in the new API and is
-		// rendered into a per-site ConfigMap by the reconciler.
-		config, err := r.legacyStorageConfig(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		if config != "" {
-			storageComponent["config"] = config
-		}
-
-		components["storage"] = storageComponent
+		components["storage"] = map[string]any{"enabled": true}
 	}
 
 	if siteName == clusterSiteName {
@@ -515,29 +507,6 @@ func (r *LegacyReaper) legacyWorkloadExists(ctx context.Context, kind string, ma
 	}
 
 	return false, nil
-}
-
-// legacyStorageConfig returns the config.yaml from the legacy shared
-// unbounded-storage-config ConfigMap, if present in any legacy namespace.
-func (r *LegacyReaper) legacyStorageConfig(ctx context.Context) (string, error) {
-	for _, legacyNs := range r.LegacyNamespaces {
-		var cm corev1.ConfigMap
-
-		err := r.Get(ctx, client.ObjectKey{Namespace: legacyNs, Name: "unbounded-storage-config"}, &cm)
-		if apierrors.IsNotFound(err) {
-			continue
-		}
-
-		if err != nil {
-			return "", err
-		}
-
-		if v, ok := cm.Data["config.yaml"]; ok {
-			return v, nil
-		}
-	}
-
-	return "", nil
 }
 
 // migrateSecrets copies every non-auto-managed, non-skipped Secret from the
@@ -765,6 +734,59 @@ func (r *LegacyReaper) copyConfigMapByName(ctx context.Context, srcNs, name, tar
 	}
 
 	return nil
+}
+
+// migrateStorageConfigMaps copies the legacy shared storage config into the new
+// per-site storage ConfigMaps the operator uses as the config source of truth.
+// It upserts so migrated config wins any race with the operator creating a
+// default per-site ConfigMap before the reaper sees the legacy source.
+func (r *LegacyReaper) migrateStorageConfigMaps(ctx context.Context, logger logr.Logger, target string) error {
+	legacy, found, err := r.legacyStorageConfigMap(ctx)
+	if err != nil || !found {
+		return err
+	}
+
+	var sites unboundedv1alpha3.SiteList
+	if err := r.List(ctx, &sites); err != nil {
+		return fmt.Errorf("list sites: %w", err)
+	}
+
+	for i := range sites.Items {
+		site := &sites.Items[i]
+		if !componentEnabled(site, ComponentStorage) {
+			continue
+		}
+
+		meta := copyObjectMeta(legacy.ObjectMeta, target)
+		meta.Name = storageConfigName(site.Name)
+
+		if err := r.upsertConfigMap(ctx, meta, legacy.Data, legacy.BinaryData); err != nil {
+			return fmt.Errorf("copy storage configmap for Site %s: %w", site.Name, err)
+		}
+
+		logger.V(1).Info("ensured per-site storage config migrated", "site", site.Name, "name", meta.Name, "to", target)
+	}
+
+	return nil
+}
+
+func (r *LegacyReaper) legacyStorageConfigMap(ctx context.Context) (*corev1.ConfigMap, bool, error) {
+	for _, legacyNs := range r.LegacyNamespaces {
+		var cm corev1.ConfigMap
+
+		err := r.Get(ctx, client.ObjectKey{Namespace: legacyNs, Name: "unbounded-storage-config"}, &cm)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+
+		if err != nil {
+			return nil, false, err
+		}
+
+		return &cm, true, nil
+	}
+
+	return nil, false, nil
 }
 
 // reapComponent deletes the operator-owned resources for a component in its

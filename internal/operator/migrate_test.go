@@ -699,28 +699,36 @@ func TestStorageTargetsReadyRequiresEveryStorageEnabledSite(t *testing.T) {
 	}
 }
 
-func TestDetectComponentsFoldsLegacyStorageConfig(t *testing.T) {
+func TestMigrateStorageConfigMapsCreatesPerSiteConfigs(t *testing.T) {
 	r := newReaper(t,
 		ns(legacyKubeNamespace),
+		ns("unbounded-system"),
+		storageEnabledSite("cluster"),
+		storageEnabledSite("edge"),
 		storageDaemonSet(legacyKubeNamespace),
 		&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Name: "unbounded-storage-config", Namespace: legacyKubeNamespace},
 			Data:       map[string]string{"config.yaml": "version: 7"},
 		},
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "unbounded-storage-config-edge", Namespace: "unbounded-system"},
+			Data:       map[string]string{"config.yaml": "default: true"},
+		},
 	)
 
-	components, err := r.detectComponents(t.Context(), clusterSiteName)
-	if err != nil {
-		t.Fatalf("detectComponents: %v", err)
+	if err := r.migrateStorageConfigMaps(t.Context(), logr.Discard(), "unbounded-system"); err != nil {
+		t.Fatalf("migrateStorageConfigMaps: %v", err)
 	}
 
-	storage, ok := components["storage"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected storage component: %#v", components)
-	}
+	for _, name := range []string{"unbounded-storage-config-cluster", "unbounded-storage-config-edge"} {
+		var cm corev1.ConfigMap
+		if err := r.Get(t.Context(), client.ObjectKey{Namespace: "unbounded-system", Name: name}, &cm); err != nil {
+			t.Fatalf("expected migrated storage config %s: %v", name, err)
+		}
 
-	if storage["config"] != "version: 7" {
-		t.Fatalf("legacy storage config not folded into Site spec: %#v", storage)
+		if cm.Data["config.yaml"] != "version: 7" {
+			t.Fatalf("%s config.yaml = %q, want version: 7", name, cm.Data["config.yaml"])
+		}
 	}
 }
 

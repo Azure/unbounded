@@ -137,13 +137,12 @@ type MetalmanComponentSpec struct {
 	DHCPAutoInterface *bool `json:"dhcpAutoInterface,omitempty"`
 }
 
-// StorageComponentSpec configures unbounded-storage for a site.
+// StorageComponentSpec configures unbounded-storage for a site. Storage daemon
+// config is held in the operator-managed ConfigMap
+// unbounded-storage-config-<site>: the operator creates it from the embedded
+// default when absent and preserves/adopts it when present.
 type StorageComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
-
-	// Config overrides the supervisor config.yaml content.
-	// +optional
-	Config string `json:"config,omitempty"`
 }
 
 // SiteStatus defines the observed state of Site.

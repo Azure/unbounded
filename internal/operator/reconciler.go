@@ -295,9 +295,114 @@ func (r *SiteReconciler) reconcileMetalman(ctx context.Context, site *unboundedv
 // reconcileStorage deploys a site-scoped storage supervisor DaemonSet that runs
 // only on the nodes belonging to the Site.
 func (r *SiteReconciler) reconcileStorage(ctx context.Context, site *unboundedv1alpha3.Site) error {
+	if err := r.ensureStorageConfig(ctx, site); err != nil {
+		return err
+	}
+
 	return r.applyManifestFS(ctx, storagemanifests.Manifests, func(obj *unstructured.Unstructured) error {
 		return mutateStorageObject(site, obj)
 	})
+}
+
+// ensureStorageConfig creates the per-site storage ConfigMap from the embedded
+// default when it is absent. If an operator/user already created it (or the
+// reaper migrated it), preserve the data and only adopt it with a Site ownerRef
+// so it is garbage-collected with the Site. Do not server-side-apply metadata
+// for existing ConfigMaps: if the operator previously owned data.config.yaml,
+// an apply that omits data would delete it.
+func (r *SiteReconciler) ensureStorageConfig(ctx context.Context, site *unboundedv1alpha3.Site) error {
+	key := client.ObjectKey{Namespace: r.namespace(), Name: storageConfigName(site.Name)}
+	existing := &corev1.ConfigMap{}
+
+	err := r.Get(ctx, key, existing)
+	switch {
+	case err == nil:
+		return r.adoptStorageConfig(ctx, site, existing)
+	case !apierrors.IsNotFound(err):
+		return fmt.Errorf("get storage config %s/%s: %w", key.Namespace, key.Name, err)
+	}
+
+	cm, err := defaultStorageConfigMap(site, r.namespace())
+	if err != nil {
+		return err
+	}
+
+	if err := r.Create(ctx, cm); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create storage config %s/%s: %w", cm.Namespace, cm.Name, err)
+		}
+
+		// Race with a user/reaper create; adopt what won without touching data.
+		if getErr := r.Get(ctx, key, existing); getErr != nil {
+			return fmt.Errorf("get raced storage config %s/%s: %w", key.Namespace, key.Name, getErr)
+		}
+
+		return r.adoptStorageConfig(ctx, site, existing)
+	}
+
+	return nil
+}
+
+func (r *SiteReconciler) adoptStorageConfig(ctx context.Context, site *unboundedv1alpha3.Site, cm *corev1.ConfigMap) error {
+	owner := siteOwnerReference(site)
+
+	refs, changed := upsertOwnerReference(cm.OwnerReferences, owner)
+	if !changed {
+		return nil
+	}
+
+	before := cm.DeepCopy()
+	cm.OwnerReferences = refs
+
+	if err := r.Patch(ctx, cm, client.MergeFrom(before)); err != nil {
+		return fmt.Errorf("adopt storage config %s/%s: %w", cm.Namespace, cm.Name, err)
+	}
+
+	return nil
+}
+
+func defaultStorageConfigMap(site *unboundedv1alpha3.Site, namespace string) (*corev1.ConfigMap, error) {
+	files, err := yamlFiles(storagemanifests.Manifests)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, file := range files {
+		data, err := fs.ReadFile(storagemanifests.Manifests, file)
+		if err != nil {
+			return nil, fmt.Errorf("read storage manifest %s: %w", file, err)
+		}
+
+		decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+
+		for {
+			obj := &unstructured.Unstructured{}
+			if err := decoder.Decode(obj); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+
+				return nil, fmt.Errorf("decode storage manifest %s: %w", file, err)
+			}
+
+			if obj.Object == nil || obj.GetKind() != "ConfigMap" || obj.GetName() != "unbounded-storage-config" {
+				continue
+			}
+
+			cm := &corev1.ConfigMap{}
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, cm); err != nil {
+				return nil, fmt.Errorf("convert storage config template: %w", err)
+			}
+
+			cm.Name = storageConfigName(site.Name)
+			cm.Namespace = namespace
+			cm.OwnerReferences = []metav1.OwnerReference{siteOwnerReference(site)}
+
+			return cm, nil
+		}
+	}
+
+	return nil, errors.New("storage config template not found")
 }
 
 // cleanupMetalman removes the per-site metalman Deployment when metalman is
@@ -523,6 +628,26 @@ func siteOwnerReference(site *unboundedv1alpha3.Site) metav1.OwnerReference {
 	}
 }
 
+func upsertOwnerReference(refs []metav1.OwnerReference, owner metav1.OwnerReference) ([]metav1.OwnerReference, bool) {
+	for i := range refs {
+		if refs[i].UID == owner.UID && refs[i].Kind == owner.Kind && refs[i].APIVersion == owner.APIVersion {
+			if refs[i].Name == owner.Name {
+				return refs, false
+			}
+
+			out := append([]metav1.OwnerReference(nil), refs...)
+			out[i] = owner
+
+			return out, true
+		}
+	}
+
+	out := append([]metav1.OwnerReference(nil), refs...)
+	out = append(out, owner)
+
+	return out, true
+}
+
 // siteNodeAffinity matches Nodes carrying either the canonical site label or the
 // deprecated net-prefixed site label. The OR is required during migration: old
 // net labels Nodes with the deprecated key, while the upgraded net dual-writes
@@ -550,21 +675,16 @@ func siteNodeSelectorTerm(key, siteName string) corev1.NodeSelectorTerm {
 	}
 }
 
-// mutateStorageObject scopes the storage supervisor manifests to the Site: the
-// DaemonSet is per-site (name, labels, nodeSelector, and config mount) and the
-// ConfigMap is per-site (name + Site-provided config). The SA and RBAC are
-// shared across sites.
+// mutateStorageObject scopes the storage supervisor manifests to the Site. The
+// DaemonSet is per-site (name, labels, node affinity, and config mount). The
+// per-site ConfigMap is handled by ensureStorageConfig so existing config data
+// is preserved; the SA and RBAC are shared across sites.
 func mutateStorageObject(site *unboundedv1alpha3.Site, obj *unstructured.Unstructured) error {
 	switch {
 	case obj.GetKind() == "DaemonSet" && obj.GetName() == "unbounded-storage-supervisor":
 		return scopeStorageDaemonSetToSite(site, obj)
 	case obj.GetKind() == "ConfigMap" && obj.GetName() == "unbounded-storage-config":
-		obj.SetName(storageConfigName(site.Name))
-		obj.SetOwnerReferences([]metav1.OwnerReference{siteOwnerReference(site)})
-
-		if site.Spec.Components.Storage != nil && site.Spec.Components.Storage.Config != "" {
-			obj.Object["data"] = map[string]any{"config.yaml": site.Spec.Components.Storage.Config}
-		}
+		obj.Object = nil
 
 		return nil
 	default:

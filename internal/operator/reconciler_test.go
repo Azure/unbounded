@@ -69,40 +69,6 @@ func TestMutateStorageScopesDaemonSetToSite(t *testing.T) {
 	assertSiteAffinityMap(t, affinity, "rack-a")
 }
 
-func TestMutateStorageAppliesConfigOverride(t *testing.T) {
-	site := &unboundedv1alpha3.Site{
-		ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"},
-		Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{
-			Storage: &unboundedv1alpha3.StorageComponentSpec{Config: "custom: true"},
-		}},
-	}
-	obj := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "v1",
-		"kind":       "ConfigMap",
-		"metadata":   map[string]any{"name": "unbounded-storage-config"},
-		"data":       map[string]any{"config.yaml": "custom: false"},
-	}}
-
-	if err := mutateStorageObject(site, obj); err != nil {
-		t.Fatalf("mutateStorageObject returned error: %v", err)
-	}
-
-	if got := obj.GetName(); got != "unbounded-storage-config-rack-a" {
-		t.Fatalf("configmap name = %q, want unbounded-storage-config-rack-a", got)
-	}
-
-	assertSiteOwnerRef(t, obj.GetOwnerReferences(), "rack-a", "site-uid")
-
-	got, ok, err := unstructured.NestedString(obj.Object, "data", "config.yaml")
-	if err != nil || !ok {
-		t.Fatalf("missing data.config.yaml: ok=%t err=%v", ok, err)
-	}
-
-	if got != "custom: true" {
-		t.Fatalf("config.yaml = %q, want custom: true", got)
-	}
-}
-
 func TestMutateMachinaSkipsMetalmanSupport(t *testing.T) {
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "rbac.authorization.k8s.io/v1",
@@ -282,6 +248,60 @@ func TestStorageDaemonSetPointsAtPerSiteConfig(t *testing.T) {
 	if cm["name"] != "unbounded-storage-config-rack-a" {
 		t.Fatalf("config volume name = %v, want unbounded-storage-config-rack-a", cm["name"])
 	}
+}
+
+func TestEnsureStorageConfigCreatesDefaultWhenAbsent(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1: %v", err)
+	}
+
+	r := &SiteReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
+
+	if err := r.ensureStorageConfig(t.Context(), site); err != nil {
+		t.Fatalf("ensureStorageConfig: %v", err)
+	}
+
+	var got corev1.ConfigMap
+	if err := r.Get(t.Context(), client.ObjectKey{Namespace: DefaultNamespace, Name: "unbounded-storage-config-rack-a"}, &got); err != nil {
+		t.Fatalf("get created configmap: %v", err)
+	}
+
+	if got.Data["config.yaml"] == "" {
+		t.Fatalf("default config.yaml was not seeded")
+	}
+
+	assertSiteOwnerRef(t, got.OwnerReferences, "rack-a", "site-uid")
+}
+
+func TestEnsureStorageConfigAdoptsExistingAndPreservesData(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1: %v", err)
+	}
+
+	existing := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "unbounded-storage-config-rack-a", Namespace: DefaultNamespace},
+		Data:       map[string]string{"config.yaml": "custom: true"},
+	}
+	r := &SiteReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()}
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
+
+	if err := r.ensureStorageConfig(t.Context(), site); err != nil {
+		t.Fatalf("ensureStorageConfig: %v", err)
+	}
+
+	var got corev1.ConfigMap
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(existing), &got); err != nil {
+		t.Fatalf("get adopted configmap: %v", err)
+	}
+
+	if got.Data["config.yaml"] != "custom: true" {
+		t.Fatalf("existing config data was not preserved: %q", got.Data["config.yaml"])
+	}
+
+	assertSiteOwnerRef(t, got.OwnerReferences, "rack-a", "site-uid")
 }
 
 func TestReconcilePerSiteComponentDisabledRunsCleanup(t *testing.T) {
