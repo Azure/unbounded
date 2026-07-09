@@ -17,7 +17,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,7 +24,6 @@ import (
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -48,10 +46,11 @@ const (
 	// operator uses it to node-select site-scoped components (storage, metalman).
 	siteLabelKey = unboundedv1alpha3.MachineSiteLabelKey
 
-	// siteFinalizer guards Site deletion so the operator can tear down the
-	// per-site workloads it created (metalman Deployment, storage DaemonSet and
-	// config) before the Site object is removed.
-	siteFinalizer = "unbounded-cloud.io/operator-cleanup"
+	// deprecatedSiteLabelKey is the node site-membership label used by released
+	// net controllers before the switch to unbounded-cloud.io/site. Per-site
+	// workloads target either key during the deprecation window so they schedule
+	// before the upgraded net has converged all Nodes to the canonical label.
+	deprecatedSiteLabelKey = "net.unbounded-cloud.io/site"
 )
 
 // DefaultNamespace is the namespace the operator installs components into. It
@@ -110,20 +109,6 @@ func (r *SiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
-	// A Site pending deletion: tear down the per-site workloads the operator
-	// created, then release the finalizer. The cluster singletons are
-	// re-evaluated on the subsequent not-found reconcile once the object is
-	// gone.
-	if !site.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, r.finalizeSite(ctx, &site)
-	}
-
-	if controllerutil.AddFinalizer(&site, siteFinalizer) {
-		if err := r.Update(ctx, &site); err != nil {
-			return ctrl.Result{}, fmt.Errorf("add finalizer: %w", err)
-		}
-	}
-
 	statuses := map[string]unboundedv1alpha3.SiteComponentStatus{}
 
 	// Cluster singletons: net is deployed whenever at least one Site exists;
@@ -165,26 +150,6 @@ func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&unboundedv1alpha3.Site{}).
 		Complete(r)
-}
-
-// finalizeSite removes the per-site workloads the operator created for a Site
-// that is being deleted and then releases the operator finalizer.
-func (r *SiteReconciler) finalizeSite(ctx context.Context, site *unboundedv1alpha3.Site) error {
-	if err := r.cleanupMetalman(ctx, site); err != nil {
-		return err
-	}
-
-	if err := r.cleanupStorage(ctx, site); err != nil {
-		return err
-	}
-
-	if controllerutil.RemoveFinalizer(site, siteFinalizer) {
-		if err := r.Update(ctx, site); err != nil {
-			return fmt.Errorf("remove finalizer: %w", err)
-		}
-	}
-
-	return nil
 }
 
 // reconcilePerSiteComponent reconciles a per-site component when enabled and
@@ -229,12 +194,9 @@ func (r *SiteReconciler) reconcileNet(ctx context.Context) unboundedv1alpha3.Sit
 	}
 
 	if len(sites) == 0 {
-		// No Sites left: tear down the net singleton so a drained cluster does
-		// not keep hostNetwork net workloads running.
-		if err := r.deleteManifestFS(ctx, netmanifests.Manifests, nil); err != nil {
-			return unboundedv1alpha3.SiteComponentStatus{Ready: false, Message: err.Error()}
-		}
-
+		// Net is the cluster dataplane. Do not auto-delete it just because the
+		// last Site was removed; deleting net-node can break pod networking across
+		// the whole cluster. A future explicit uninstall flow should handle removal.
 		return unboundedv1alpha3.SiteComponentStatus{Ready: true, Message: "no sites"}
 	}
 
@@ -263,13 +225,9 @@ func (r *SiteReconciler) reconcileMachina(ctx context.Context) unboundedv1alpha3
 	}
 
 	if !enabled {
-		// No Site enables machina: tear down the singleton. The metalman RBAC
-		// that also ships in the machina manifests is skipped by
-		// mutateMachinaObject, so per-site metalman is unaffected.
-		if err := r.deleteManifestFS(ctx, machinamanifests.Manifests, r.mutateMachinaObject); err != nil {
-			return unboundedv1alpha3.SiteComponentStatus{Ready: false, Message: err.Error()}
-		}
-
+		// Keep machina installed once the operator has taken ownership. Automatic
+		// singleton removal is surprising and can strand related controllers/RBAC;
+		// a future explicit uninstall flow should handle removal.
 		return unboundedv1alpha3.SiteComponentStatus{Ready: true, Message: "disabled"}
 	}
 
@@ -454,84 +412,6 @@ func (r *SiteReconciler) applyObject(ctx context.Context, obj client.Object) err
 	return nil
 }
 
-// deleteManifestFS deletes every object in a set of embedded manifests, applying
-// the same mutate (so objects the mutate drops or transforms are handled the
-// same way as on apply). Cluster-shared infrastructure (the unified Namespace,
-// CRDs) is never deleted; see isClusterSharedInfra.
-func (r *SiteReconciler) deleteManifestFS(ctx context.Context, manifests fs.FS, mutate func(*unstructured.Unstructured) error) error {
-	files, err := yamlFiles(manifests)
-	if err != nil {
-		return err
-	}
-
-	for _, file := range files {
-		data, err := fs.ReadFile(manifests, file)
-		if err != nil {
-			return fmt.Errorf("read manifest %s: %w", file, err)
-		}
-
-		if err := r.deleteManifestData(ctx, data, mutate); err != nil {
-			return fmt.Errorf("delete manifest %s: %w", file, err)
-		}
-	}
-
-	return nil
-}
-
-func (r *SiteReconciler) deleteManifestData(ctx context.Context, data []byte, mutate func(*unstructured.Unstructured) error) error {
-	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
-
-	for {
-		obj := &unstructured.Unstructured{}
-		if err := decoder.Decode(obj); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-
-			return fmt.Errorf("decode resource: %w", err)
-		}
-
-		if obj.Object == nil {
-			continue
-		}
-
-		if mutate != nil {
-			if err := mutate(obj); err != nil {
-				return err
-			}
-		}
-
-		if obj.Object == nil {
-			continue
-		}
-
-		if isClusterSharedInfra(obj) {
-			continue
-		}
-
-		r.retargetNamespace(obj)
-
-		if err := r.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) && !apimeta.IsNoMatchError(err) {
-			return fmt.Errorf("delete %s %s/%s: %w", obj.GetKind(), obj.GetNamespace(), obj.GetName(), err)
-		}
-	}
-
-	return nil
-}
-
-// isClusterSharedInfra reports whether an object is cluster-shared infrastructure
-// that must survive a component teardown: the unified Namespace (deleting it
-// would remove the operator and every other component) and CRDs (shared, and
-// deleting one cascades to all of its custom resources, including Sites).
-func isClusterSharedInfra(obj *unstructured.Unstructured) bool {
-	switch obj.GetKind() {
-	case "Namespace", "CustomResourceDefinition":
-		return true
-	default:
-		return false
-	}
-}
-
 // retargetNamespace rewrites embedded-manifest namespace references from the
 // build-time default (buildDefaultNamespace) to the operator's configured
 // namespace, so components follow a custom install namespace. It is a no-op in
@@ -631,6 +511,45 @@ func storageDaemonSetName(site string) string { return "unbounded-storage-superv
 // sharing a single one.
 func storageConfigName(site string) string { return "unbounded-storage-config-" + site }
 
+// siteOwnerReference builds the owner reference used for per-site resources.
+// Using ownerRefs rather than a Site finalizer lets Kubernetes garbage collect
+// per-site workloads if a Site is deleted while the operator is down.
+func siteOwnerReference(site *unboundedv1alpha3.Site) metav1.OwnerReference {
+	return metav1.OwnerReference{
+		APIVersion: unboundedv1alpha3.GroupVersion.String(),
+		Kind:       "Site",
+		Name:       site.Name,
+		UID:        site.UID,
+	}
+}
+
+// siteNodeAffinity matches Nodes carrying either the canonical site label or the
+// deprecated net-prefixed site label. The OR is required during migration: old
+// net labels Nodes with the deprecated key, while the upgraded net dual-writes
+// both. Remove the deprecated term when the deprecated label write is removed.
+func siteNodeAffinity(siteName string) *corev1.Affinity {
+	return &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					siteNodeSelectorTerm(siteLabelKey, siteName),
+					siteNodeSelectorTerm(deprecatedSiteLabelKey, siteName),
+				},
+			},
+		},
+	}
+}
+
+func siteNodeSelectorTerm(key, siteName string) corev1.NodeSelectorTerm {
+	return corev1.NodeSelectorTerm{
+		MatchExpressions: []corev1.NodeSelectorRequirement{{
+			Key:      key,
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{siteName},
+		}},
+	}
+}
+
 // mutateStorageObject scopes the storage supervisor manifests to the Site: the
 // DaemonSet is per-site (name, labels, nodeSelector, and config mount) and the
 // ConfigMap is per-site (name + Site-provided config). The SA and RBAC are
@@ -641,6 +560,7 @@ func mutateStorageObject(site *unboundedv1alpha3.Site, obj *unstructured.Unstruc
 		return scopeStorageDaemonSetToSite(site, obj)
 	case obj.GetKind() == "ConfigMap" && obj.GetName() == "unbounded-storage-config":
 		obj.SetName(storageConfigName(site.Name))
+		obj.SetOwnerReferences([]metav1.OwnerReference{siteOwnerReference(site)})
 
 		if site.Spec.Components.Storage != nil && site.Spec.Components.Storage.Config != "" {
 			obj.Object["data"] = map[string]any{"config.yaml": site.Spec.Components.Storage.Config}
@@ -654,6 +574,7 @@ func mutateStorageObject(site *unboundedv1alpha3.Site, obj *unstructured.Unstruc
 
 func scopeStorageDaemonSetToSite(site *unboundedv1alpha3.Site, obj *unstructured.Unstructured) error {
 	obj.SetName(storageDaemonSetName(site.Name))
+	obj.SetOwnerReferences([]metav1.OwnerReference{siteOwnerReference(site)})
 
 	labels := obj.GetLabels()
 	if labels == nil {
@@ -666,11 +587,19 @@ func scopeStorageDaemonSetToSite(site *unboundedv1alpha3.Site, obj *unstructured
 	for _, path := range [][]string{
 		{"spec", "selector", "matchLabels", siteLabelKey},
 		{"spec", "template", "metadata", "labels", siteLabelKey},
-		{"spec", "template", "spec", "nodeSelector", siteLabelKey},
 	} {
 		if err := unstructured.SetNestedField(obj.Object, site.Name, path...); err != nil {
 			return fmt.Errorf("scope storage daemonset (%v): %w", path, err)
 		}
+	}
+
+	affinityMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(siteNodeAffinity(site.Name))
+	if err != nil {
+		return fmt.Errorf("scope storage daemonset affinity: %w", err)
+	}
+
+	if err := unstructured.SetNestedMap(obj.Object, affinityMap, "spec", "template", "spec", "affinity"); err != nil {
+		return fmt.Errorf("set storage daemonset affinity: %w", err)
 	}
 
 	return pointDaemonSetAtSiteConfig(site, obj)
@@ -767,9 +696,10 @@ func metalmanDeployment(site *unboundedv1alpha3.Site, namespace string, cfg Conf
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-			Labels:    labels,
+			Name:            name,
+			Namespace:       namespace,
+			Labels:          labels,
+			OwnerReferences: []metav1.OwnerReference{siteOwnerReference(site)},
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: ptrInt32(1),
@@ -786,12 +716,10 @@ func metalmanDeployment(site *unboundedv1alpha3.Site, namespace string, cfg Conf
 				Spec: corev1.PodSpec{
 					HostNetwork:        true,
 					ServiceAccountName: "metalman-controller",
-					// Node selection uses the canonical site-membership label
-					// (unbounded-cloud.io/site) the net controller applies to
-					// Nodes. Storage scopes its DaemonSet the same way.
-					NodeSelector: map[string]string{
-						siteLabelKey: site.Name,
-					},
+					// Match either the canonical or deprecated site label during
+					// the node-label deprecation window. Storage scopes its
+					// DaemonSet the same way.
+					Affinity: siteNodeAffinity(site.Name),
 					Containers: []corev1.Container{{
 						Name:            "metalman",
 						Image:           image,

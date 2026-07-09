@@ -874,12 +874,12 @@ func (sc *SiteController) syncNode(ctx context.Context, key string) error {
 	// Update label if needed
 	if needsLabel {
 		if siteName != "" {
-			patchData, err := json.Marshal(siteLabelAddPatchOps(siteName))
+			patchData, err := siteLabelAddMergePatch(siteName)
 			if err != nil {
 				return fmt.Errorf("failed to marshal patch: %w", err)
 			}
 
-			if _, err := sc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.JSONPatchType, patchData, metav1.PatchOptions{}); err != nil {
+			if _, err := sc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patchData, metav1.PatchOptions{}); err != nil {
 				return fmt.Errorf("failed to patch node: %w", err)
 			}
 
@@ -2012,19 +2012,16 @@ func nodeSiteLabelsCurrent(node *corev1.Node, siteName string) bool {
 	return true
 }
 
-// siteLabelAddPatchOps builds JSONPatch ops that set every site-membership label
-// key to siteName.
-func siteLabelAddPatchOps(siteName string) []map[string]interface{} {
-	ops := make([]map[string]interface{}, 0, len(siteLabelKeys()))
+// siteLabelAddMergePatch builds a merge patch that sets every site-membership
+// label key to siteName. A merge patch tolerates Nodes whose metadata.labels map
+// is absent, unlike a JSONPatch add to /metadata/labels/<key>.
+func siteLabelAddMergePatch(siteName string) ([]byte, error) {
+	labels := map[string]interface{}{}
 	for _, key := range siteLabelKeys() {
-		ops = append(ops, map[string]interface{}{
-			"op":    "add",
-			"path":  "/metadata/labels/" + escapeJSONPointer(key),
-			"value": siteName,
-		})
+		labels[key] = siteName
 	}
 
-	return ops
+	return json.Marshal(map[string]interface{}{"metadata": map[string]interface{}{"labels": labels}})
 }
 
 // siteLabelRemoveMergePatch builds a merge patch that clears every

@@ -90,8 +90,23 @@ func metalmanDeploymentForSite(namespace, site string) *appsv1.Deployment {
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
 			Name:      "metalman-controller-" + site,
-			Labels:    map[string]string{"app": "unbounded-pxe", unboundedv1alpha3.MachineSiteLabelKey: site},
+			// Match the v0.1.19 deploy-pxe Deployment label shape. This is the
+			// supported released-version upgrade baseline for the operator reaper.
+			Labels: map[string]string{"app": "unbounded-pxe", unboundedv1alpha3.MachineSiteLabelKey: site},
 		},
+	}
+}
+
+func TestDetectComponentsMatchesV019MetalmanLabels(t *testing.T) {
+	r := newReaper(t, metalmanDeploymentForSite(legacyKubeNamespace, "edge"))
+
+	components, err := r.detectComponents(t.Context(), "edge")
+	if err != nil {
+		t.Fatalf("detectComponents: %v", err)
+	}
+
+	if !componentEnabledInMap(components, "metalman") {
+		t.Fatalf("expected v0.1.19 metalman labels to enable metalman: %#v", components)
 	}
 }
 

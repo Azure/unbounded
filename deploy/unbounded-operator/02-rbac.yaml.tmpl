@@ -12,9 +12,7 @@ metadata:
 rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["sites"]
-    # update/patch are required to add and remove the operator's cleanup
-    # finalizer on Sites (see internal/operator siteFinalizer).
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    verbs: ["get", "list", "watch", "create"]
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["sites/status"]
     verbs: ["get", "patch", "update"]

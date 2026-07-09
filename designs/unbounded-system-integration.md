@@ -156,6 +156,28 @@ Two complementary reaper e2e's exist:
   cannot run in vanilla kind, so they are excluded from this path and stay
   covered by the simulation + unit tests. The driver is self-contained so it runs
   the same way locally (`python3 hack/operator-upgrade-e2e/e2e.py all`) and in CI.
+  The e2e also verifies the node site-label dual-write and a clean
+  unbounded-net-controller restart.
+
+Operational notes from the review hardening:
+
+- `net.unbounded-cloud.io/site` is deprecated in favor of
+  `unbounded-cloud.io/site`. During the deprecation window net dual-writes both
+  labels and storage/metalman target either key so they can schedule before the
+  upgraded net has converged node labels. Remove the deprecated affinity term in
+  the same future release that removes the deprecated write/fallback.
+- Net and machina singletons are no longer auto-deleted when the last Site is
+  removed (or when no Site enables machina). Net is the dataplane and deleting
+  net-node can cause a cluster-wide outage; singleton removal should be handled
+  by a future explicit uninstall flow.
+- The hostNetwork net-controller and metalman Deployments use RollingUpdate with
+  `maxSurge: 0`, so rollouts terminate the old pod before the new one starts and
+  can bind the same host ports. A broken new image can therefore cause a brief
+  zero-available window; roll back on failed rollout and alert on
+  `AvailableReplicas == 0`.
+- Custom install namespaces are supported by manifest rewriting, but are not
+  currently covered by the faithful upgrade e2e and should be treated as
+  experimental until that path is exercised.
 
 ## Status checklist
 

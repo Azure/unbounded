@@ -124,21 +124,6 @@ func TestOperatorClusterRoleAllowsComponentRBACInstall(t *testing.T) {
 	}
 }
 
-// TestOperatorClusterRoleAllowsSiteFinalizer guards against the reconcile
-// failure the faithful upgrade e2e surfaced: the SiteReconciler adds and removes
-// a cleanup finalizer on Sites via Update, which the apiserver forbids unless
-// the operator ClusterRole grants update/patch on sites. Without it, reconcile
-// fails at "add finalizer" and never deploys net/machina.
-func TestOperatorClusterRoleAllowsSiteFinalizer(t *testing.T) {
-	cr := loadOperatorClusterRole(t)
-
-	for _, verb := range []string{"update", "patch"} {
-		if !clusterRoleGrants(cr, "unbounded-cloud.io", "sites", verb) {
-			t.Fatalf("operator ClusterRole must grant %q on sites (needed to add/remove the %q finalizer)", verb, siteFinalizer)
-		}
-	}
-}
-
 // TestOperatorClusterRoleGrantsReaperDeletes guards against the reaper's
 // DeleteAllOf (deletecollection) being forbidden: the operator ClusterRole must
 // grant deletecollection on every kind the reaper deletes by label.

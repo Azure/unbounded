@@ -363,22 +363,15 @@ func TestNodeSiteLabelsCurrent(t *testing.T) {
 
 // TestSiteLabelPatches verifies the add/remove patch builders cover both keys.
 func TestSiteLabelPatches(t *testing.T) {
-	ops := siteLabelAddPatchOps("s1")
-	if len(ops) != 2 {
-		t.Fatalf("expected an op per site label key, got %d", len(ops))
+	add, err := siteLabelAddMergePatch("s1")
+	if err != nil {
+		t.Fatalf("siteLabelAddMergePatch: %v", err)
 	}
 
-	paths := map[string]bool{}
-	for _, op := range ops {
-		paths[op["path"].(string)] = true
-
-		if op["value"] != "s1" || op["op"] != "add" {
-			t.Fatalf("unexpected op %#v", op)
+	for _, key := range siteLabelKeys() {
+		if !strings.Contains(string(add), key) || !strings.Contains(string(add), "s1") {
+			t.Fatalf("add patch missing key %q or value: %s", key, add)
 		}
-	}
-
-	if !paths["/metadata/labels/"+escapeJSONPointer(canonicalSiteLabelKey)] || !paths["/metadata/labels/"+escapeJSONPointer(deprecatedSiteLabelKey)] {
-		t.Fatalf("add ops missing a site key: %#v", paths)
 	}
 
 	remove, err := siteLabelRemoveMergePatch()
