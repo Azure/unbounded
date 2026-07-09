@@ -7,6 +7,7 @@
 //! if the tcp provider is not installed in the libfabric build
 //! available to the test binary.
 
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::ptr;
 use std::sync::Arc;
@@ -972,7 +973,7 @@ use crate::fanout::{
 };
 use crate::p2p::{
     FingerTable, FingerTableConfig, NodeId, OwnerShardSource, OwnerShardTable, PeerEntry,
-    RecursiveHandler, RingId, RouteTableHandle, RoutingSnapshot, TopologyTags,
+    RecursiveHandler, RingId, RouteTableHandle, TopologyTags,
 };
 use crate::storage::StripeReq;
 
@@ -1084,11 +1085,7 @@ fn start_recursive_node(
         RecursiveHandler::with_routes(
             scratch,
             RECURSIVE_SCRATCH_PAGES as u32,
-            RouteTableHandle::new(
-                [(CHAIN_CACHE_ID.to_string(), RoutingSnapshot { fingers })]
-                    .into_iter()
-                    .collect(),
-            ),
+            RouteTableHandle::new(HashSet::from([CHAIN_CACHE_ID.to_string()]), fingers),
             fabric.clone(),
             scratch_mr,
             page_size,

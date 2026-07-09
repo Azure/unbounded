@@ -77,10 +77,10 @@ impl<R, B: Backend<Req = R>> RoutedTransport<R, B> {
     where
         R: Req,
     {
-        let Some(route) = self.routes.route_for_req(req) else {
+        let Some(fingers) = self.routes.route_for_req(req) else {
             return true;
         };
-        route.fingers.next_hop(stripe_to_ring(req.key())).is_none()
+        fingers.next_hop(stripe_to_ring(req.key())).is_none()
     }
 }
 

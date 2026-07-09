@@ -29,8 +29,8 @@ impl ChainFingerRouter {
 
 impl<R: Req> PeerRouter<R> for ChainFingerRouter {
     fn route(&self, req: &R) -> Option<PeerId> {
-        let snap = self.routes.route_for_req(req)?;
-        snap.fingers
+        self.routes
+            .route_for_req(req)?
             .next_hop(stripe_to_ring(req.key()))
             .map(|peer| PeerId(peer.node.0))
     }
@@ -38,7 +38,7 @@ impl<R: Req> PeerRouter<R> for ChainFingerRouter {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use crate::bufferpool::{Req, StripeKey};
@@ -82,10 +82,10 @@ mod tests {
     }
 
     fn router(fingers: Arc<FingerTable>) -> ChainFingerRouter {
-        ChainFingerRouter::new(crate::p2p::RouteTableHandle::new(HashMap::from([(
-            "cache-a".to_string(),
-            crate::p2p::RoutingSnapshot { fingers },
-        )])))
+        ChainFingerRouter::new(crate::p2p::RouteTableHandle::new(
+            HashSet::from(["cache-a".to_string()]),
+            fingers,
+        ))
     }
 
     fn req(key: StripeKey) -> TestReq {

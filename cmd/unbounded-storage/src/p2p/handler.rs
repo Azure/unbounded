@@ -210,7 +210,7 @@ impl Handler<StripeReq> for RecursiveHandler {
     ) -> Self::Stream<'a> {
         RecursiveHandlerStream {
             scratch: self.scratch.clone(),
-            fingers: self.routes.route_for_req(req).map(|route| route.fingers),
+            fingers: self.routes.route_for_req(req),
             forward: &self.forward,
             owners: &self.owners,
             req,

@@ -24,35 +24,29 @@
 //!
 //! [`RecursiveHandler`]: crate::p2p::RecursiveHandler
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
 use crate::p2p::FingerTable;
 
-/// Immutable routing surface for one cache.
-///
-/// Cloning shares the underlying finger table.
-#[derive(Clone)]
-pub struct RoutingSnapshot {
-    pub fingers: Arc<FingerTable>,
-}
-
 #[derive(Clone, Default)]
 pub struct RouteTableSnapshot {
-    pub routes: HashMap<String, RoutingSnapshot>,
+    pub cache_ids: HashSet<String>,
+    pub fingers: Option<Arc<FingerTable>>,
 }
 
-/// Shared, live-reloadable handle to cache-keyed routing snapshots.
+/// Shared, live-reloadable handle to one routing table and its cache membership.
 #[derive(Clone)]
 pub struct RouteTableHandle(Arc<ArcSwap<RouteTableSnapshot>>);
 
 impl RouteTableHandle {
-    pub fn new(routes: HashMap<String, RoutingSnapshot>) -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(RouteTableSnapshot {
-            routes,
-        })))
+    pub fn new(cache_ids: HashSet<String>, fingers: Arc<FingerTable>) -> Self {
+        Self::from_snapshot(RouteTableSnapshot {
+            cache_ids,
+            fingers: Some(fingers),
+        })
     }
 
     pub fn from_snapshot(snapshot: RouteTableSnapshot) -> Self {
@@ -60,11 +54,14 @@ impl RouteTableHandle {
     }
 
     pub fn empty() -> Self {
-        Self::new(HashMap::new())
+        Self::from_snapshot(RouteTableSnapshot::default())
     }
 
-    pub fn store(&self, routes: HashMap<String, RoutingSnapshot>) {
-        self.0.store(Arc::new(RouteTableSnapshot { routes }));
+    pub fn store(&self, cache_ids: HashSet<String>, fingers: Arc<FingerTable>) {
+        self.store_snapshot(RouteTableSnapshot {
+            cache_ids,
+            fingers: Some(fingers),
+        });
     }
 
     pub fn store_snapshot(&self, snapshot: RouteTableSnapshot) {
@@ -75,14 +72,19 @@ impl RouteTableHandle {
         self.0.load_full()
     }
 
-    pub fn route(&self, route_id: &str) -> Option<RoutingSnapshot> {
-        self.snapshot().routes.get(route_id).cloned()
+    pub fn route(&self, route_id: &str) -> Option<Arc<FingerTable>> {
+        let snapshot = self.snapshot();
+        snapshot
+            .cache_ids
+            .contains(route_id)
+            .then(|| snapshot.fingers.clone())
+            .flatten()
     }
 
     pub fn route_for_req<R: crate::bufferpool::Req + ?Sized>(
         &self,
         req: &R,
-    ) -> Option<RoutingSnapshot> {
+    ) -> Option<Arc<FingerTable>> {
         self.route(req.cache_id()?.as_str())
     }
 }
@@ -115,26 +117,18 @@ mod tests {
         // every clone shares one ArcSwap, so this is the property the
         // shard relies on to fan a reload out to consumers it already
         // handed clones to.
-        let handle = RouteTableHandle::new(HashMap::from([(
-            "cache-a".to_string(),
-            RoutingSnapshot {
-                fingers: table(1, &[]),
-            },
-        )]));
+        let handle = RouteTableHandle::new(HashSet::from(["cache-a".to_string()]), table(1, &[]));
         let consumer = handle.clone();
         let before = consumer.route("cache-a").expect("route");
-        assert!(before.fingers.next_hop(node_to_ring(NodeId(2))).is_none());
+        assert!(before.next_hop(node_to_ring(NodeId(2))).is_none());
+        assert!(consumer.route("cache-b").is_none());
 
-        handle.store(HashMap::from([(
-            "cache-a".to_string(),
-            RoutingSnapshot {
-                fingers: table(1, &[2]),
-            },
-        )]));
+        handle.store(HashSet::from(["cache-b".to_string()]), table(1, &[2]));
 
-        let snap = consumer.route("cache-a").expect("route");
+        assert!(consumer.route("cache-a").is_none());
+        let fingers = consumer.route("cache-b").expect("route");
         assert_eq!(
-            snap.fingers
+            fingers
                 .next_hop(node_to_ring(NodeId(2)))
                 .map(|peer| peer.node),
             Some(NodeId(2)),

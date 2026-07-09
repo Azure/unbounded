@@ -29,8 +29,8 @@ use unbounded_storage::frontend::{
 };
 use unbounded_storage::p2p::{
     FingerTable, FingerTableConfig, PeerEntry, RouteTableHandle, RouteTableSnapshot,
-    RoutedTransport, RoutingSnapshot, TopologyPrefixWeight, TopologySelection, TopologyTags,
-    TopologyWeighting, node_to_ring,
+    RoutedTransport, TopologyPrefixWeight, TopologySelection, TopologyTags, TopologyWeighting,
+    node_to_ring,
 };
 use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
@@ -1109,7 +1109,8 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
     let projection = config::runtime_projection(config).expect("loaded config projects to runtime");
     if projection.caches.is_empty() {
         return RouteTableSnapshot {
-            routes: HashMap::new(),
+            cache_ids: HashSet::new(),
+            fingers: None,
         };
     }
 
@@ -1165,19 +1166,10 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
             },
         ))
     };
-    let routes = projection
-        .caches
-        .keys()
-        .map(|id| {
-            (
-                id.clone(),
-                RoutingSnapshot {
-                    fingers: fingers.clone(),
-                },
-            )
-        })
-        .collect();
-    RouteTableSnapshot { routes }
+    RouteTableSnapshot {
+        cache_ids: projection.caches.keys().cloned().collect(),
+        fingers: Some(fingers),
+    }
 }
 
 fn p2p_topology_weighting(weighting: &config::TopologyWeighting) -> TopologyWeighting {
