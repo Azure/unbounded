@@ -13,7 +13,7 @@
 //! embedder selects at construction time.
 
 use std::pin::Pin;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
@@ -33,11 +33,11 @@ pub enum OriginBackend {
 
 impl OriginBackend {
     /// Owned-stream variant used by [`super::registry::BackendRegistry`].
-    /// The registry gives the stream an `Arc` guard so a backend can be
+    /// The registry gives the stream an `Rc` guard so a backend can be
     /// borrowed safely without forcing every concrete backend to copy its
     /// destination-page slice.
     pub fn fetch_stream<'a>(
-        backend: Arc<Self>,
+        backend: Rc<Self>,
         req: &StripeReq,
         src: BulkRef,
         dsts: &'a [PageRef],
@@ -89,7 +89,7 @@ pub enum OriginStream<'a> {
     S3(<S3Backend as Backend>::Stream<'static>),
     Azure(<AzureBackend as Backend>::Stream<'static>),
     Fake {
-        backend: Arc<OriginBackend>,
+        backend: Rc<OriginBackend>,
         delivered: &'a [PageRef],
         state: FakeOwnedState,
         next: usize,

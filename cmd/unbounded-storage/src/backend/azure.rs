@@ -121,8 +121,8 @@ impl AzureBackend {
     /// Owned-stream variant of [`Backend::bulk_get`]. Mirrors
     /// [`super::S3Backend::fetch_stream`]: the returned stream borrows
     /// nothing from `self`, so it is `'static` and can be handed out by
-    /// a [`super::registry::BackendRegistry`] holding the backend behind
-    /// an `Arc`/`ArcSwap`.
+    /// a [`super::registry::BackendRegistry`] owning the backend through
+    /// an `Rc`.
     pub fn fetch_stream(
         &self,
         req: &StripeReq,

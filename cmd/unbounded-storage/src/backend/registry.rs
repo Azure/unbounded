@@ -8,10 +8,10 @@
 //! [`OriginRef::backend_id`](crate::storage::OriginRef), stamped by the
 //! frontend that accepted it, so the data path can resolve which
 //! configured backend to fetch from per request. [`BackendRegistry`]
-//! owns the `name -> OriginBackend` map behind an [`ArcSwap`] so the
+//! owns the `name -> OriginBackend` map in shard-local storage so the
 //! config watcher can add, remove, or replace a backend at runtime
-//! without tearing down the shard: a reconcile pass builds the new map
-//! and publishes it atomically, and the next fetch observes it.
+//! without tearing down the shard. In-flight streams retain their chosen
+//! backend independently of later registry changes.
 //!
 //! The registry implements [`Backend`] itself, so it drops into the
 //! same generic slot the single [`OriginBackend`] used to fill in the
@@ -19,14 +19,12 @@
 //! [`BackendReconcileTarget`] so the live-config reconciler drives it
 //! the same way it drives the peer fabric.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::task::{Context, Poll};
-
-use arc_swap::ArcSwap;
 
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::config::reconcile::BackendReconcileTarget;
@@ -52,12 +50,12 @@ struct BuildCtx {
 }
 
 /// A shard-local set of origin backends keyed by component name, swappable at
-/// runtime. Clones share the same underlying map (cheap `Arc` clone),
+/// runtime. Clones share the same underlying map (cheap `Rc` clone),
 /// so a clone handed to the control-drain tick hook reconciles the
 /// very map the data path reads.
 #[derive(Clone)]
 pub struct BackendRegistry {
-    backends: Arc<ArcSwap<HashMap<String, Arc<OriginBackend>>>>,
+    backends: Rc<RefCell<HashMap<String, Rc<OriginBackend>>>>,
     ctx: BuildCtx,
 }
 
@@ -78,12 +76,12 @@ impl BackendRegistry {
             page_size,
             backing_base,
         };
-        let mut map: HashMap<String, Arc<OriginBackend>> = HashMap::with_capacity(specs.len());
+        let mut map: HashMap<String, Rc<OriginBackend>> = HashMap::with_capacity(specs.len());
         for spec in specs {
-            map.insert(spec.name.clone(), Arc::new(ctx.build(spec)?));
+            map.insert(spec.name.clone(), Rc::new(ctx.build(spec)?));
         }
         Ok(Self {
-            backends: Arc::new(ArcSwap::from_pointee(map)),
+            backends: Rc::new(RefCell::new(map)),
             ctx,
         })
     }
@@ -91,21 +89,13 @@ impl BackendRegistry {
     /// Number of backends currently registered.
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.backends.load().len()
+        self.backends.borrow().len()
     }
 
     /// Whether a backend with `name` is currently registered.
     #[cfg(test)]
     pub fn contains(&self, id: &str) -> bool {
-        self.backends.load().contains_key(id)
-    }
-
-    /// Copy-on-write mutate the live map: clone the current contents,
-    /// apply `f`, then publish the result atomically.
-    fn mutate<F: FnOnce(&mut HashMap<String, Arc<OriginBackend>>)>(&self, f: F) {
-        let mut next = HashMap::clone(&self.backends.load());
-        f(&mut next);
-        self.backends.store(Arc::new(next));
+        self.backends.borrow().contains_key(id)
     }
 }
 
@@ -253,14 +243,11 @@ impl Backend for BackendRegistry {
             Some(origin) => origin.backend_id.as_str(),
             None => return RegistryFetchStream::unknown(""),
         };
-        let map = self.backends.load();
-        match map.get(backend_id) {
-            Some(backend) => RegistryFetchStream::Origin(OriginBackend::fetch_stream(
-                Arc::clone(backend),
-                req,
-                src,
-                dsts,
-            )),
+        let backend = self.backends.borrow().get(backend_id).cloned();
+        match backend {
+            Some(backend) => {
+                RegistryFetchStream::Origin(OriginBackend::fetch_stream(backend, req, src, dsts))
+            }
             None => RegistryFetchStream::unknown(backend_id),
         }
     }
@@ -268,27 +255,23 @@ impl Backend for BackendRegistry {
 
 impl BackendReconcileTarget for BackendRegistry {
     fn list(&self) -> Vec<String> {
-        self.backends.load().keys().cloned().collect()
+        self.backends.borrow().keys().cloned().collect()
     }
 
     fn add(&self, spec: &BackendSpec) -> Result<(), String> {
-        // Build before taking the swap so a failed build leaves the
-        // live map untouched.
+        // Build before mutating so a failed build leaves the live map untouched.
         let backend = self
             .ctx
             .build(spec)
             .map_err(|e| format!("build backend {}: {e}", spec.name))?;
-        let built = Arc::new(backend);
-        self.mutate(|map| {
-            map.insert(spec.name.clone(), built);
-        });
+        self.backends
+            .borrow_mut()
+            .insert(spec.name.clone(), Rc::new(backend));
         Ok(())
     }
 
     fn remove(&self, id: &str) -> Result<(), String> {
-        self.mutate(|map| {
-            map.remove(id);
-        });
+        self.backends.borrow_mut().remove(id);
         Ok(())
     }
 }
@@ -337,8 +320,10 @@ mod tests {
     use std::rc::Rc;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 
+    use crate::bufferpool::StripeKey;
     use crate::config::{FakeBackendConfig, HttpBackendConfig, backend_spec};
     use crate::ring::NetworkRing;
+    use crate::storage::{OriginRef, synthetic_object_id};
 
     use super::*;
 
@@ -456,5 +441,58 @@ mod tests {
         let reg = registry(&[fake_spec("synthetic", 1024 * 1024)]);
         assert_eq!(reg.len(), 1);
         assert!(reg.contains("synthetic"));
+    }
+
+    #[test]
+    fn selected_backend_outlives_removal() {
+        let reg = registry(&[fake_spec("synthetic", 1024 * 1024)]);
+        let selected = Rc::downgrade(
+            reg.backends
+                .borrow()
+                .get("synthetic")
+                .expect("seeded backend"),
+        );
+        let origin = OriginRef::new("synthetic", synthetic_object_id(1, 2), 0);
+        let req = StripeReq::new(StripeKey([0; 32])).with_origin(origin);
+        let dsts = [];
+        let src = BulkRef {
+            stripe: StripeKey([0; 32]),
+            offset: 0,
+            len: 0,
+        };
+        let stream = reg.bulk_get(&req, src, &dsts);
+
+        reg.remove("synthetic").expect("remove backend");
+        assert!(selected.upgrade().is_some());
+
+        drop(stream);
+        assert!(selected.upgrade().is_none());
+    }
+
+    #[test]
+    fn selected_backend_outlives_same_name_replacement() {
+        let reg = registry(&[fake_spec("synthetic", 1024 * 1024)]);
+        let selected = Rc::downgrade(
+            reg.backends
+                .borrow()
+                .get("synthetic")
+                .expect("seeded backend"),
+        );
+        let origin = OriginRef::new("synthetic", synthetic_object_id(3, 4), 0);
+        let req = StripeReq::new(StripeKey([0; 32])).with_origin(origin);
+        let dsts = [];
+        let src = BulkRef {
+            stripe: StripeKey([0; 32]),
+            offset: 0,
+            len: 0,
+        };
+        let stream = reg.bulk_get(&req, src, &dsts);
+
+        reg.add(&fake_spec("synthetic", 2 * 1024 * 1024))
+            .expect("replace backend");
+        assert!(selected.upgrade().is_some());
+
+        drop(stream);
+        assert!(selected.upgrade().is_none());
     }
 }

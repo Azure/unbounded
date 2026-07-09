@@ -152,8 +152,7 @@ impl HttpBackend {
     /// destination pages are copied into an owned `Vec`, and the ring
     /// handle is owned. That makes the stream `'static`, which is what
     /// lets a [`super::registry::BackendRegistry`] hand out streams from
-    /// a backend it only holds behind an `Arc`/`ArcSwap` (the temporary
-    /// `Arc` guard does not have to outlive the stream).
+    /// a backend it owns through an `Rc` without borrowing the registry.
     pub fn fetch_stream(
         &self,
         req: &StripeReq,
