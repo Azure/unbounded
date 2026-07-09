@@ -4,8 +4,24 @@
 package goalstates
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
+
+func TestDiscoverNVIDIADevicesIncludesIMEXChannels(t *testing.T) {
+	t.Parallel()
+
+	deviceDir := t.TempDir()
+	imexDir := filepath.Join(deviceDir, nvidiaIMEXDirName)
+	channel := filepath.Join(imexDir, "channel0")
+	require.NoError(t, os.MkdirAll(imexDir, 0o755))
+	require.NoError(t, os.WriteFile(channel, nil, 0o644))
+
+	require.Contains(t, discoverNVIDIADevicesIn(deviceDir), channel)
+}
 
 func TestParseNVIDIALibraries(t *testing.T) {
 	ldconfigOutput := []byte(`	linux-vdso.so.1 (LINUX_VDSO) => linux-vdso.so.1
