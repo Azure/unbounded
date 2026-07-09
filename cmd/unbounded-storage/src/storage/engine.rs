@@ -35,7 +35,7 @@ use crate::storage::btree::{BTreeIndex, LeafEntry, Mutation};
 use crate::storage::lru::SieveLru;
 use crate::storage::mutator::{MutatorOutcome, MutatorQueue, MutatorReply, MutatorReq};
 use crate::storage::refcount::RefcountTable;
-use crate::storage::singleflight::{Acquire, Singleflight};
+use crate::storage::singleflight::Singleflight;
 use crate::storage::traits::{PageChecksum, Xxh3Checksum};
 use crate::storage::types::{Lba, PageKey};
 
@@ -165,7 +165,7 @@ pub struct StorageEngine<B: BlockDevice> {
     btree: Arc<BTreeIndex<B>>,
     lru: Arc<SieveLru>,
     admission: Arc<AdmissionFilter>,
-    singleflight: Arc<Singleflight>,
+    singleflight: Singleflight,
     cfg: EngineConfig,
     bufferpool: Mutex<BufferpoolBinding>,
     /// Reverse map start-LBA -> (PageKey, byte_len). Eviction
@@ -284,7 +284,7 @@ impl<B: BlockDevice> StorageEngine<B> {
         );
         let lru = Arc::new(SieveLru::new(capacity, refcount.clone()));
         let admission = Arc::new(AdmissionFilter::new(capacity));
-        let singleflight = Arc::new(Singleflight::new(cfg.singleflight_shards.max(1)));
+        let singleflight = Singleflight::new(cfg.singleflight_shards.max(1));
         let engine = Self {
             device,
             allocator,
@@ -660,12 +660,8 @@ impl<B: BlockDevice> StorageEngine<B> {
             return Ok(());
         }
 
-        let acquire = self.singleflight.acquire(pk);
-        let leader = match acquire {
-            Acquire::Leader(g) => g,
-            Acquire::Follower(_w) => {
-                return Ok(());
-            }
+        let Some(_leader) = self.singleflight.try_acquire(pk) else {
+            return Ok(());
         };
 
         // SAFETY: caller-provided contract on `src`.
@@ -685,7 +681,6 @@ impl<B: BlockDevice> StorageEngine<B> {
                 src_buf.len(),
                 self.cfg.btree_page_bytes,
             );
-            leader.abandon();
             return Err(bufferpool::Error::Io(libc::EINVAL));
         }
 
@@ -693,7 +688,6 @@ impl<B: BlockDevice> StorageEngine<B> {
         let lba = match self.allocator.alloc_contig(n_pages) {
             Ok(l) => l,
             Err(_) => {
-                leader.abandon();
                 return Ok(());
             }
         };
@@ -714,7 +708,6 @@ impl<B: BlockDevice> StorageEngine<B> {
                 crate::metrics::Outcome::Err,
             );
             let _ = self.allocator.free_range(lba, n_pages);
-            leader.abandon();
             return Err(bufferpool::Error::Io(io_errno(&e)));
         }
         crate::metrics::storage_disk_op(
@@ -751,7 +744,6 @@ impl<B: BlockDevice> StorageEngine<B> {
                 // the device-write branch above.
                 self.metric(|m| m.write_io_errors += 1);
                 let _ = self.allocator.free_range(lba, n_pages);
-                leader.abandon();
                 return Err(bufferpool::Error::Io(libc::EIO));
             }
             MutatorOutcome::DeleteCommitted => {
@@ -769,8 +761,6 @@ impl<B: BlockDevice> StorageEngine<B> {
         }
         self.lru.admit(lba);
         self.metric(|m| m.admitted += 1);
-        leader.publish(entry);
-
         self.evict_if_over_watermark().await;
 
         Ok(())
