@@ -138,7 +138,7 @@ func TestBootOrderConfigUEFIHTTPOn(t *testing.T) {
 	})
 	boot := patch["Boot"].(map[string]any)
 	require.Equal(t, "UefiHttp", boot["BootSourceOverrideTarget"])
-	require.Equal(t, "Once", boot["BootSourceOverrideEnabled"])
+	require.Equal(t, "Continuous", boot["BootSourceOverrideEnabled"])
 	require.Equal(t, "UEFI", boot["BootSourceOverrideMode"])
 	require.Equal(t, "http://192.0.2.1/boot/grubx64.efi", boot["HttpBootUri"])
 }
