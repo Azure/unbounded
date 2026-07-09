@@ -32,7 +32,7 @@
 //! Internal entries store, in their `key` slot, the *smallest* key
 //! reachable through their child.
 
-use crate::storage::traits::{PageChecksum, Xxh3Checksum};
+use crate::storage::checksum::checksum;
 use crate::storage::types::{Checksum, Error, Lba, PageKey};
 
 pub const HEADER_LEN: usize = 32;
@@ -132,7 +132,7 @@ fn verify_checksum(page: &mut [u8], stored: u64) -> bool {
     let saved: [u8; HDR_CSUM_END - HDR_CSUM_OFF] =
         page[HDR_CSUM_OFF..HDR_CSUM_END].try_into().unwrap();
     page[HDR_CSUM_OFF..HDR_CSUM_END].fill(0);
-    let actual = Xxh3Checksum::checksum_of(page).0;
+    let actual = checksum(page).0;
     page[HDR_CSUM_OFF..HDR_CSUM_END].copy_from_slice(&saved);
     actual == stored
 }
@@ -294,7 +294,7 @@ fn seal_checksum(page: &mut [u8]) {
     for b in &mut page[HDR_CSUM_OFF..HDR_CSUM_END] {
         *b = 0;
     }
-    let cs = Xxh3Checksum::checksum_of(page).0;
+    let cs = checksum(page).0;
     page[HDR_CSUM_OFF..HDR_CSUM_END].copy_from_slice(&cs.to_le_bytes());
 }
 

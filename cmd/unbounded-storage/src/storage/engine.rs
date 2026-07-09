@@ -32,11 +32,11 @@ use crate::storage::admission::AdmissionFilter;
 use crate::storage::alloc::Allocator;
 use crate::storage::blockdev::{BlockDevice, ScratchPool};
 use crate::storage::btree::{BTreeIndex, LeafEntry, Mutation};
+use crate::storage::checksum::checksum;
 use crate::storage::lru::SieveLru;
 use crate::storage::mutator::{MutatorOutcome, MutatorQueue, MutatorReply, MutatorReq};
 use crate::storage::refcount::RefcountTable;
 use crate::storage::singleflight::Singleflight;
-use crate::storage::traits::{PageChecksum, Xxh3Checksum};
 use crate::storage::types::{Lba, PageKey};
 
 #[derive(Clone, Debug)]
@@ -611,9 +611,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             crate::metrics::Outcome::Ok,
         );
 
-        if !self.cfg.bypass_checksum
-            && Xxh3Checksum::checksum_of(dst_buf).0 != entry.data_checksum.0
-        {
+        if !self.cfg.bypass_checksum && checksum(dst_buf).0 != entry.data_checksum.0 {
             self.metric(|m| {
                 m.misses += 1;
                 m.checksum_misses += 1;
@@ -716,7 +714,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             crate::metrics::Outcome::Ok,
         );
 
-        let cs = Xxh3Checksum::checksum_of(src_buf);
+        let cs = checksum(src_buf);
         let entry = LeafEntry {
             lba,
             data_checksum: cs,
