@@ -7,9 +7,8 @@
 //! `Box::into_raw`s the slot and hands the resulting `*mut c_void` to
 //! libfabric as the operation's `op_context`. On the progress thread,
 //! `fi_cq_read` returns the same pointer back inside a
-//! `fi_cq_data_entry`; we `Box::from_raw` it, drop the box (releasing
-//! libfabric's reference) after calling `complete`, and the awaiting
-//! future is woken.
+//! `fi_cq_data_entry`; we `Box::from_raw` it, release its registry
+//! reservation, run its completion handler, and wake the awaiting future.
 //!
 //! The slot's shared state lives in an `Arc<SlotInner>` cloned into a
 //! `CompletionFuture`, so completion and future-drop can race in
@@ -25,7 +24,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -118,14 +117,15 @@ impl SlotInner {
 /// dropping the reclaimed box releases libfabric's reference.
 pub struct CompletionSlot {
     inner: Arc<SlotInner>,
-    /// Back-reference so the registry's live count drops when this
-    /// box is reclaimed by the progress thread (or by `cancel_raw`
-    /// on a synchronous submission failure).
+    /// Back-reference so the registry reservation is released before a
+    /// completion handler runs, or when the box is dropped after a
+    /// synchronous submission failure.
     registry: Arc<RegistryShared>,
     /// Optional handler invoked when the slot completes, before the
     /// future is woken. Used by the ping responder to re-post its
     /// recv and emit the pong without involving any future at all.
     handler: Mutex<Option<Box<dyn FnOnce(&Result<CompletionInfo>) + Send>>>,
+    reservation_live: AtomicBool,
 }
 
 impl CompletionSlot {
@@ -148,10 +148,14 @@ impl CompletionSlot {
         unsafe { Box::from_raw(ptr as *mut CompletionSlot) }
     }
 
-    /// Store a result and wake the awaiting future. If a handler was
-    /// installed via [`CompletionSlot::set_handler`] it is invoked
-    /// first; the handler may not panic.
+    /// Release registry capacity, store a result, and wake the awaiting
+    /// future. If a handler was installed via
+    /// [`CompletionSlot::set_handler`] it is invoked after capacity is
+    /// released and before the future is woken; the handler may not panic.
     pub fn complete(&self, result: Result<CompletionInfo>) {
+        // Completion handlers may allocate a replacement slot, notably
+        // when a receive pool rearms at full registry capacity.
+        self.release_reservation();
         let handler = self.handler.lock().ok().and_then(|mut h| h.take());
         if let Some(h) = handler {
             h(&result);
@@ -173,14 +177,20 @@ impl CompletionSlot {
             *h = Some(Box::new(f));
         }
     }
+
+    fn release_reservation(&self) {
+        if self.reservation_live.swap(false, Ordering::AcqRel) {
+            self.registry.live.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl Drop for CompletionSlot {
     fn drop(&mut self) {
-        // Decrement live-slot count exactly once, on the same box
-        // libfabric handed back. The `CompletionFuture` keeps the
-        // inner `SlotInner` Arc alive across this drop if needed.
-        self.registry.live.fetch_sub(1, Ordering::AcqRel);
+        // Synchronous submission failures drop without completing. A
+        // completed slot already released its reservation before running
+        // its handler, so this is idempotent.
+        self.release_reservation();
     }
 }
 
@@ -212,9 +222,9 @@ pub(crate) struct RegistryShared {
 }
 
 /// Bounded back-pressure on in-flight ops. Capacity is checked at
-/// allocate time; the count drops when the boxed slot is freed (by
-/// the progress thread reclaiming it, or by `CompletionSlot::cancel`
-/// on a synchronous submission failure).
+/// allocate time; the count drops when completion begins, before its
+/// handler runs, or when an unsubmitted slot is dropped after a
+/// synchronous submission failure.
 pub struct CompletionRegistry {
     shared: Arc<RegistryShared>,
 }
@@ -258,6 +268,7 @@ impl CompletionRegistry {
             inner: inner.clone(),
             registry: self.shared.clone(),
             handler: Mutex::new(None),
+            reservation_live: AtomicBool::new(true),
         });
         let fut = CompletionFuture { inner };
         Ok((slot, fut))
@@ -378,6 +389,40 @@ mod tests {
         assert_eq!(reg.available_count(), 1);
         let (_s2, _f2) = reg.allocate().unwrap();
         assert_eq!(reg.peak_inflight(), 2);
+    }
+
+    #[test]
+    fn completion_handler_can_replace_slot_at_full_capacity() {
+        let reg = CompletionRegistry::new(1);
+        let (slot, _fut) = reg.allocate().unwrap();
+        let replacement = Arc::new(Mutex::new(None));
+
+        let handler_reg = Arc::clone(&reg);
+        let handler_replacement = Arc::clone(&replacement);
+        slot.set_handler(move |_| {
+            let (slot, _fut) = handler_reg
+                .allocate()
+                .expect("completed slot releases capacity before handler");
+            *handler_replacement.lock().unwrap() = Some(slot);
+        });
+
+        let raw = slot.into_raw();
+        // SAFETY: raw was just produced by `into_raw`.
+        let reclaimed = unsafe { CompletionSlot::from_raw(raw) };
+        reclaimed.complete(Ok(CompletionInfo {
+            flags: 0,
+            bytes: 0,
+            tag: 0,
+            src_addr: 0,
+            op_context: raw as usize,
+            data: 0,
+        }));
+
+        assert_eq!(reg.live_count(), 1);
+        drop(reclaimed);
+        assert_eq!(reg.live_count(), 1);
+        drop(replacement.lock().unwrap().take());
+        assert_eq!(reg.live_count(), 0);
     }
 
     #[test]
