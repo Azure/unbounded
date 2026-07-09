@@ -60,11 +60,11 @@ pub async fn load_meta<B: BlockDevice>(
     // We tolerate I/O errors here: the design wants us to treat a
     // partially-failing disk as "no meta", not propagate the error.
     let a = match device.read(page::META_SLOT_A, buf_a.as_mut_slice()).await {
-        Ok(()) => page::decode(buf_a.as_slice()),
+        Ok(()) => page::decode(buf_a.as_mut_slice()),
         Err(_) => Decoded::Empty,
     };
     let b = match device.read(page::META_SLOT_B, buf_b.as_mut_slice()).await {
-        Ok(()) => page::decode(buf_b.as_slice()),
+        Ok(()) => page::decode(buf_b.as_mut_slice()),
         Err(_) => Decoded::Empty,
     };
     let a_meta = as_meta(a, MetaSlot::A);

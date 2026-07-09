@@ -361,7 +361,7 @@ fn snapshot_drop_frees_old_pages() {
 fn read_meta_slot(dev: &MockDevice, lba: Lba) -> Option<(u64, Lba, u64)> {
     let mut buf = vec![0u8; dev.page_size()];
     dev.peek(lba, &mut buf);
-    match page::decode(&buf) {
+    match page::decode(&mut buf) {
         Decoded::Meta {
             txn_id,
             root_lba,
