@@ -73,11 +73,6 @@ pub trait BlockDevice {
     /// semantics as [`BlockDevice::read`].
     async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), Error>;
 
-    /// Hint for how many concurrent writes the device can absorb
-    /// efficiently. The mutator uses this to size its commit
-    /// batches.
-    fn write_queue_depth(&self) -> u32;
-
     /// Drive any submitted-but-not-yet-completed I/O forward. The
     /// io_uring backend pushes queued SQEs to the kernel and reaps
     /// available CQEs, waking the tasks awaiting them. Backends

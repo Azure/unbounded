@@ -859,10 +859,6 @@ impl BlockDevice for GateDevice {
         self.inner.register_buffers(base, len)
     }
 
-    fn write_queue_depth(&self) -> u32 {
-        self.inner.write_queue_depth()
-    }
-
     async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), crate::storage::types::Error> {
         self.inner.read(lba, dst).await
     }
