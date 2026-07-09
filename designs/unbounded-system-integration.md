@@ -47,7 +47,7 @@ The integration branch is periodically kept current by merging `main` into it
 
 | PR | Scope | Approx files | Source | Depends on |
 |----|-------|--------------|--------|------------|
-| **PR-B** | Namespace unification: `UNBOUNDED_NAMESPACE`, `internal/unbounded`, template defaults across machina/net/gantry/inventory/orca/machine-ops/storage | ~194 | existing open PR #372 (`unify-namespace-unbounded-system`), re-targeted to this branch | - |
+| **PR-B** | Namespace unification: `UNBOUNDED_NAMESPACE`, `internal/unbounded`, template defaults across machina/net/gantry/inventory/orca/machine-ops/storage, `migrate-namespace.sh`, smoke test | ~194 | existing open PR #372 (`unify-namespace-unbounded-system`), re-targeted to this branch | - |
 | **PR-A** | Operator + Site redesign **and** operator-driven migration: the operator on `unbounded-system`, the Site API move to the machina group, the component-model redesign (net/machina cluster singletons, per-site metalman/storage, components install at the operator version), kubectl install consolidation, net controller/webhook/client retargeting, and the reaper (`internal/operator/migrate.go`) with its RBAC and e2e | net-new + closed PR #353 (`shared-site`) | PR-B |
 
 PR-B and PR-A are independent to review (PR-B never touches the operator). PR-A
@@ -185,17 +185,15 @@ Operational notes from the review hardening:
 - [x] Create `feature/unbounded-system` from `main`                         (me)
 - [x] Add this plan doc to the integration branch                            (me)
 - [x] Open umbrella tracking PR #388 (`feature/unbounded-system` -> `main`)   (me opens / reviewers merge last)
-- [x] PR-B: re-target #372 -> `feature/unbounded-system`                      (me opens / reviewers merge)
+- [x] PR-B: re-target #372 -> `feature/unbounded-system` (MERGED)             (me opens / reviewers merge)
 - [x] PR-A: open operator + Site redesign -> integration                     (me opens / reviewers merge)
 - [x] Apply #372 review fixes (findings 1-4 across #372 + PR-A)               (me)
-- [x] PR-B: re-target #372 -> `feature/unbounded-system`                      (me opens / reviewers merge)
-- [x] PR-B: merged into integration                                          (reviewers)
-- [x] PR-A: open operator + Site redesign -> integration                     (me opens / reviewers merge)
-- [x] Apply #372 review fixes (findings 1-4 across #372 + PR-A)               (me)
+- [x] PR-A: re-create clean on the #372-merged integration branch, operator on unbounded-system (me)
 - [x] PR-A commit 1: operator + component-model redesign                      (me)
-- [x] PR-A commit 2: operator-driven migration (Site translation + reaper)   (me)
+- [x] PR-A commit 2: operator-driven migration (Site translation + reaper)    (me)
 - [x] PR-A: kind operator-reap e2e for the always-on reaper, wired into CI    (me)
-- [x] PR-A: faithful released-version upgrade e2e driver + nightly workflow    (me)
+- [x] PR-A: faithful released-version upgrade e2e driver + nightly workflow   (me)
+- [x] PR-C: dropped; migration folded into PR-A                               (me)
 - [ ] Periodic `main` -> integration syncs                                   (me)
 - [ ] Mark tracking PR #388 ready once all chunks merged                      (me; reviewers merge)
 - [ ] Close monolith #383                                                    (me, on approval)
@@ -205,7 +203,7 @@ Operational notes from the review hardening:
 | PR | Branch | Number | State |
 |----|--------|--------|-------|
 | Tracking (umbrella) | `feature/unbounded-system` -> `main` | #388 | draft (merges last, after all chunks) |
-| PR-B | `unify-namespace-unbounded-system` | #372 | merged into `feature/unbounded-system` |
+| PR-B | `unify-namespace-unbounded-system` | #372 | **merged** into `feature/unbounded-system` |
 | PR-A | `operator-site-redesign` | #386 | open (operator+model and migration commits; awaiting review/merge) |
 | ~~PR-C~~ | - | - | dropped; folded into PR-A |
 
