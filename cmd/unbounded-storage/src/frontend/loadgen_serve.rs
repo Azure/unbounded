@@ -559,18 +559,8 @@ mod tests {
             &[peer],
             FingerTableConfig::with_k(4),
         ));
-        let node_to_peer = std::sync::Arc::new(std::collections::HashMap::from([(
-            NodeId(2),
-            crate::fabric::PeerId(2),
-        )]));
         let mut routes = std::collections::HashMap::new();
-        routes.insert(
-            "cache".to_string(),
-            crate::p2p::RoutingSnapshot {
-                fingers,
-                node_to_peer,
-            },
-        );
+        routes.insert("cache".to_string(), crate::p2p::RoutingSnapshot { fingers });
 
         RouteTableHandle::new(routes)
     }

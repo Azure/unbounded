@@ -144,9 +144,9 @@ excluded from the live-reload diff.
    publication surface for disk channels.
 7. Read-only shared state (`Arc<Vec<FrontendSpec>>`, `Arc<Vec<BackendSpec>>`;
    startup-fixed fabric settings come from the config `[startup]` section via
-   `StartupSettings`) and routing (`build_routing` -> `Arc<FingerTable>` plus
-   `Arc<HashMap<NodeId, PeerId>>`) are constructed once and shared across
-   shards.
+   `StartupSettings`) and routing (`build_routing` -> `Arc<FingerTable>`) are
+   constructed once and shared across shards. `PeerId` uses the same stable
+   numeric identity as `NodeId`.
 8. Each shard is spawned with `rt.spawn_pinned(widx, name, Box<FnOnce>)`. The
    `!Send` shard objects are constructed **inside** `run_shard`, after pinning.
 9. After every shard reports `Up`, peers are reconciled per shard, the disk

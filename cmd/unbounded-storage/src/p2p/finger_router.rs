@@ -4,11 +4,12 @@
 //! `PeerRouter` backed by the p2p finger table.
 //!
 //! Maps a request's stripe to the owning peer's `PeerId` via the
-//! Chord `next_hop` lookup, then the `node -> peer` map. This is the
+//! Chord `next_hop` lookup. Node and fabric peer IDs share the same
+//! stable numeric identity. This is the
 //! router the client-side `FabricTransport` consults to pick the
 //! first hop; the server-side `RecursiveHandler` reuses the same type
-//! to forward to the next hop. Both share the same `FingerTable` and
-//! node->peer map so ownership decisions stay consistent across the
+//! to forward to the next hop. Both share the same `FingerTable` so
+//! ownership decisions stay consistent across the
 //! transport, the local-ownership pre-check, and the forwarding path.
 
 use crate::bufferpool::Req;
@@ -31,7 +32,7 @@ impl<R: Req> PeerRouter<R> for ChainFingerRouter {
         let snap = self.routes.route_for_req(req)?;
         snap.fingers
             .next_hop(stripe_to_ring(req.key()))
-            .and_then(|pe| snap.node_to_peer.get(&pe.node).copied())
+            .map(|peer| PeerId(peer.node.0))
     }
 }
 
@@ -80,20 +81,10 @@ mod tests {
         StripeKey(k)
     }
 
-    fn node_to_peer_map(nodes: &[u64]) -> Arc<HashMap<NodeId, PeerId>> {
-        Arc::new(nodes.iter().map(|&n| (NodeId(n), PeerId(n))).collect())
-    }
-
-    fn router(
-        fingers: Arc<FingerTable>,
-        node_to_peer: Arc<HashMap<NodeId, PeerId>>,
-    ) -> ChainFingerRouter {
+    fn router(fingers: Arc<FingerTable>) -> ChainFingerRouter {
         ChainFingerRouter::new(crate::p2p::RouteTableHandle::new(HashMap::from([(
             "cache-a".to_string(),
-            crate::p2p::RoutingSnapshot {
-                fingers,
-                node_to_peer,
-            },
+            crate::p2p::RoutingSnapshot { fingers },
         )])))
     }
 
@@ -120,9 +111,7 @@ mod tests {
             &[],
             FingerTableConfig::with_k(8),
         ));
-        let node_to_peer = node_to_peer_map(&[1]);
-
-        let router = router(fingers.clone(), node_to_peer);
+        let router = router(fingers.clone());
         // Pick a target that is not the local ring id so the owner
         // check still exercises the predecessor path (single node
         // owns everything regardless).
@@ -143,8 +132,7 @@ mod tests {
             std::slice::from_ref(&other),
             FingerTableConfig::with_k(8),
         ));
-        let node_to_peer = node_to_peer_map(&[1, 2]);
-        let router = router(fingers.clone(), node_to_peer);
+        let router = router(fingers.clone());
 
         // Target == other's ring id: local forwards to other.
         let req = req(key_for_ring(other.ring.0));

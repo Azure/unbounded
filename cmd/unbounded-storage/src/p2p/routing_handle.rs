@@ -3,9 +3,8 @@
 
 //! Live-reloadable route table shared across p2p consumers.
 //!
-//! The finger table and the `node -> peer` map are derived together
-//! from the active cache keyspace projected by the config graph. Three independent
-//! consumers read them on the hot path:
+//! The finger table is derived from the active cache keyspace projected
+//! by the config graph. Three independent consumers read it on the hot path:
 //!
 //! * [`crate::p2p::ChainFingerRouter`] (the first-hop lookup wrapped by
 //!   every [`crate::fabric::FabricTransport`]),
@@ -30,19 +29,14 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use crate::fabric::PeerId;
-use crate::p2p::{FingerTable, NodeId};
+use crate::p2p::FingerTable;
 
-/// Immutable view of the routing surface. Published as a unit so a
-/// reader can never observe a new finger table paired with a stale
-/// `node -> peer` map (or vice versa).
+/// Immutable routing surface for one cache.
 ///
-/// Cloning is cheap: both fields are `Arc`s, so a clone is two atomic
-/// refcount bumps and shares the underlying tables.
+/// Cloning shares the underlying finger table.
 #[derive(Clone)]
 pub struct RoutingSnapshot {
     pub fingers: Arc<FingerTable>,
-    pub node_to_peer: Arc<HashMap<NodeId, PeerId>>,
 }
 
 #[derive(Clone, Default)]
@@ -96,7 +90,7 @@ impl RouteTableHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::p2p::{FingerTableConfig, PeerEntry, TopologyTags, node_to_ring};
+    use crate::p2p::{FingerTableConfig, NodeId, PeerEntry, TopologyTags, node_to_ring};
 
     fn peer(node: u64) -> PeerEntry {
         PeerEntry {
@@ -115,10 +109,6 @@ mod tests {
         ))
     }
 
-    fn map(nodes: &[u64]) -> Arc<HashMap<NodeId, PeerId>> {
-        Arc::new(nodes.iter().map(|&n| (NodeId(n), PeerId(n))).collect())
-    }
-
     #[test]
     fn store_is_observed_by_existing_clones() {
         // A clone taken BEFORE the store must observe the new snapshot:
@@ -129,24 +119,25 @@ mod tests {
             "cache-a".to_string(),
             RoutingSnapshot {
                 fingers: table(1, &[]),
-                node_to_peer: map(&[1]),
             },
         )]));
         let consumer = handle.clone();
         let before = consumer.route("cache-a").expect("route");
-        assert!(before.node_to_peer.contains_key(&NodeId(1)));
-        assert!(!before.node_to_peer.contains_key(&NodeId(2)));
+        assert!(before.fingers.next_hop(node_to_ring(NodeId(2))).is_none());
 
         handle.store(HashMap::from([(
             "cache-a".to_string(),
             RoutingSnapshot {
                 fingers: table(1, &[2]),
-                node_to_peer: map(&[1, 2]),
             },
         )]));
 
         let snap = consumer.route("cache-a").expect("route");
-        assert!(snap.node_to_peer.contains_key(&NodeId(2)));
-        assert_eq!(snap.node_to_peer.get(&NodeId(2)), Some(&PeerId(2)));
+        assert_eq!(
+            snap.fingers
+                .next_hop(node_to_ring(NodeId(2)))
+                .map(|peer| peer.node),
+            Some(NodeId(2)),
+        );
     }
 }

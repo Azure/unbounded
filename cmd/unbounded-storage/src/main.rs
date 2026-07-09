@@ -28,7 +28,7 @@ use unbounded_storage::frontend::{
     HttpDriver, HttpFrontend, LoadgenDriver, LoadgenFrontend, S3Driver, S3Frontend,
 };
 use unbounded_storage::p2p::{
-    FingerTable, FingerTableConfig, NodeId, PeerEntry, RouteTableHandle, RouteTableSnapshot,
+    FingerTable, FingerTableConfig, PeerEntry, RouteTableHandle, RouteTableSnapshot,
     RoutedTransport, RoutingSnapshot, TopologyPrefixWeight, TopologySelection, TopologyTags,
     TopologyWeighting, node_to_ring,
 };
@@ -1119,12 +1119,6 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
         ring: node_to_ring(mesh.self_node_id),
         tags: TopologyTags(mesh.self_tags.clone()),
     };
-    let node_to_peer: HashMap<NodeId, unbounded_storage::fabric::PeerId> = mesh
-        .peers
-        .iter()
-        .map(|peer| (peer.node_id, peer.fabric_peer_id))
-        .collect();
-    let node_to_peer = Arc::new(node_to_peer);
     let fingers = if let Some(plan) = &mesh.routing_plan {
         let peer_by_name: HashMap<&str, &config::RuntimePeer> = mesh
             .peers
@@ -1179,7 +1173,6 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
                 id.clone(),
                 RoutingSnapshot {
                     fingers: fingers.clone(),
-                    node_to_peer: node_to_peer.clone(),
                 },
             )
         })
