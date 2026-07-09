@@ -25,8 +25,6 @@
 //! NVMe-backed engine.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use crate::bufferpool::{self, PageRef, StripeKey};
@@ -422,89 +420,85 @@ impl<B: BlockDevice> StorageEngine<B> {
         }
     }
 
-    fn evict_if_over_watermark<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
-        // Boxed because called from inside an async fn that's
-        // already 'a; eviction may itself await on the mutator.
-        Box::pin(async move {
-            if !self
-                .lru
-                .watermark_exceeded(self.cfg.eviction_watermark as f64)
-            {
-                return;
+    async fn evict_if_over_watermark(&self) {
+        if !self
+            .lru
+            .watermark_exceeded(self.cfg.eviction_watermark as f64)
+        {
+            return;
+        }
+        let candidates = self.lru.sweep(8);
+        if candidates.is_empty() {
+            return;
+        }
+        // Skip pinned LBAs - an in-flight reader still
+        // references them. Re-admit so they remain tracked
+        // and are reconsidered on a later sweep.
+        let mut victims: Vec<Lba> = Vec::with_capacity(candidates.len());
+        for lba in candidates {
+            if self.refcount.pin_count(lba.0).unwrap_or(0) == 0 {
+                victims.push(lba);
+            } else {
+                self.lru.admit(lba);
             }
-            let candidates = self.lru.sweep(8);
-            if candidates.is_empty() {
-                return;
-            }
-            // Skip pinned LBAs - an in-flight reader still
-            // references them. Re-admit so they remain tracked
-            // and are reconsidered on a later sweep.
-            let mut victims: Vec<Lba> = Vec::with_capacity(candidates.len());
-            for lba in candidates {
-                if self.refcount.pin_count(lba.0).unwrap_or(0) == 0 {
-                    victims.push(lba);
-                } else {
-                    self.lru.admit(lba);
+        }
+        if victims.is_empty() {
+            return;
+        }
+        // Resolve victim start-LBAs to (key, byte_len) via
+        // the reverse map before submitting: the mutator only
+        // needs the keys to commit the delete, and we still
+        // own the LBA runs here for the post-commit free
+        // below.
+        let mut keys: Vec<PageKey> = Vec::with_capacity(victims.len());
+        let mut victim_runs: Vec<(Lba, u64)> = Vec::with_capacity(victims.len());
+        {
+            let rev = self.reverse.lock().unwrap();
+            for lba in &victims {
+                if let Some((k, byte_len)) = rev.get(&lba.0).copied() {
+                    keys.push(k);
+                    victim_runs.push((*lba, self.n_pages(byte_len)));
                 }
             }
-            if victims.is_empty() {
+        }
+        if keys.is_empty() {
+            return;
+        }
+        // The btree mutation MUST commit before the allocator
+        // slot is released: a concurrent writer that observes
+        // the stale btree entry would otherwise call
+        // retire_lba and double-free the slot the allocator
+        // already handed back. The mutator is the single
+        // committer, so this ordering is preserved by
+        // construction once `done.wait()` returns.
+        let done = MutatorReply::new();
+        self.mutator_queue.push(MutatorReq::Delete {
+            keys,
+            done: done.clone(),
+        });
+        match done.wait().await {
+            MutatorOutcome::DeleteCommitted => {}
+            _ => {
+                // Apply failed or queue closed: leave the
+                // LBAs allocated and tracked. A later sweep
+                // will retry.
                 return;
             }
-            // Resolve victim start-LBAs to (key, byte_len) via
-            // the reverse map before submitting: the mutator only
-            // needs the keys to commit the delete, and we still
-            // own the LBA runs here for the post-commit free
-            // below.
-            let mut keys: Vec<PageKey> = Vec::with_capacity(victims.len());
-            let mut victim_runs: Vec<(Lba, u64)> = Vec::with_capacity(victims.len());
-            {
-                let rev = self.reverse.lock().unwrap();
-                for lba in &victims {
-                    if let Some((k, byte_len)) = rev.get(&lba.0).copied() {
-                        keys.push(k);
-                        victim_runs.push((*lba, self.n_pages(byte_len)));
-                    }
-                }
+        }
+        {
+            let mut rev = self.reverse.lock().unwrap();
+            for (lba, _) in &victim_runs {
+                rev.remove(&lba.0);
             }
-            if keys.is_empty() {
-                return;
-            }
-            // The btree mutation MUST commit before the allocator
-            // slot is released: a concurrent writer that observes
-            // the stale btree entry would otherwise call
-            // retire_lba and double-free the slot the allocator
-            // already handed back. The mutator is the single
-            // committer, so this ordering is preserved by
-            // construction once `done.wait()` returns.
-            let done = MutatorReply::new();
-            self.mutator_queue.push(MutatorReq::Delete {
-                keys,
-                done: done.clone(),
-            });
-            match done.wait().await {
-                MutatorOutcome::DeleteCommitted => {}
-                _ => {
-                    // Apply failed or queue closed: leave the
-                    // LBAs allocated and tracked. A later sweep
-                    // will retry.
-                    return;
-                }
-            }
-            {
-                let mut rev = self.reverse.lock().unwrap();
-                for (lba, _) in &victim_runs {
-                    rev.remove(&lba.0);
-                }
-            }
-            for (lba, n) in &victim_runs {
-                let _ = self.allocator.free_range(*lba, *n);
-                let _ = self.refcount.reset(lba.0);
-            }
-            self.metric(|m| m.evictions += victim_runs.len() as u64);
-            for _ in &victim_runs {
-                crate::metrics::storage_eviction(self.disk());
-            }
-        })
+        }
+        for (lba, n) in &victim_runs {
+            let _ = self.allocator.free_range(*lba, *n);
+            let _ = self.refcount.reset(lba.0);
+        }
+        self.metric(|m| m.evictions += victim_runs.len() as u64);
+        for _ in &victim_runs {
+            crate::metrics::storage_eviction(self.disk());
+        }
     }
 }
 
