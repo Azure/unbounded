@@ -16,7 +16,7 @@ use std::time::Duration;
 use clap::Parser;
 
 use unbounded_storage::backend::{BackendRegistry, OriginRing};
-use unbounded_storage::bufferpool::{Pool, PoolConfig, ShardDescriptor, StripeKey};
+use unbounded_storage::bufferpool::{Pool, PoolConfig};
 use unbounded_storage::config::{
     self, BackendSpec, Config, FrontendSpec, ResolvedFrontendBinding, frontend_spec,
 };
@@ -782,10 +782,7 @@ fn run_shard(
     // reverse declaration order; the shared `fabric` is released by the
     // `FabricGroup`, not here).
     let _ = tx.send(ShardReady::Up {
-        descriptor: ShardDescriptor {
-            worker_idx: widx,
-            numa: shard.numa,
-        },
+        worker_idx: widx,
         publish: ShardPublish {
             backing_base: backing_base as usize,
             backing_len,
@@ -1212,15 +1209,6 @@ fn reconcile_cache_disks(
     }
 }
 
-/// Hash a `StripeKey` into a shard index. Delegates to the library
-/// [`unbounded_storage::fanout::owner_shard`] so the binary's
-/// `PoolGroup` router and the library frontend's fan-out path share one
-/// ownership function. The modulus is the shard count; `shard_count` is
-/// asserted non-zero by `PoolGroup::new`.
-fn stripe_key_to_shard(key: &StripeKey, shard_count: usize) -> usize {
-    unbounded_storage::fanout::owner_shard(key, shard_count)
-}
-
 /// Validate and log the configured backends.
 ///
 /// [`OriginBackend`] is now the active origin tier: it is built per
@@ -1477,7 +1465,7 @@ impl config::reconcile::FrontendReconcileTarget for FrontendRegistry {
 /// failed during bring-up.
 enum ShardReady {
     Up {
-        descriptor: ShardDescriptor,
+        worker_idx: WorkerIdx,
         /// Cross-shard fan-out endpoints this shard exposes: its
         /// registered backing region and the channel to its fetch
         /// service. The layer collects these from every shard and
@@ -1517,8 +1505,7 @@ struct ShardPublish {
 
 /// One entry in the broadcast peer list every shard receives in phase B.
 /// `shard_index` is the position in the worker-index-sorted shard order,
-/// matching [`stripe_key_to_shard`] and the process `PoolGroup` so
-/// ownership indices are consistent across the data path.
+/// which keeps ownership indices consistent across the fan-out data path.
 struct PeerPublish {
     shard_index: usize,
     worker_idx: WorkerIdx,

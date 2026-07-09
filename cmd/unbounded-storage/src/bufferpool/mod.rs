@@ -2,7 +2,6 @@
 // Licensed under the MIT License.
 
 mod free_list;
-mod group;
 mod inflight;
 mod null;
 mod pipeline;
@@ -18,7 +17,6 @@ mod owned_future_tests;
 mod tests;
 
 pub use free_list::RecvQuarantineHandle;
-pub use group::{PoolGroup, ShardDescriptor, ShardRouter};
 pub use null::NullBlockStore;
 pub use pipeline::{PipelinedRead, StripePlan};
 pub use pool::Pool;

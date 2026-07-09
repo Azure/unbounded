@@ -346,9 +346,8 @@ stripe, and knows how to fill a miss from either a peer or the local disk.
   local, futures-core-free `Stream` of `Result<PageRef, Error>`); and
   `Transport<R> { bulk_get(&req, src: BulkRef, dsts: &[PageRef]) -> Stream }`,
   which fetches from a **peer**. Blanket impls cover `Arc<T>`.
-- Public surface also includes `PoolGroup`/`ShardDescriptor`/`ShardRouter`
-  (sharding helpers), `PageGuard`/`ReadStream`/`WindowedRead` (read API), and
-  `NullBlockStore`.
+- Public surface also includes `PageGuard`/`ReadStream`/`WindowedRead` (read
+  API) and `NullBlockStore`.
 
 A shard's data path therefore has two miss sources: the `Transport` (peer pull
 over fabric) and the `BlockStore` (local NVMe). The `RoutedTransport` decides

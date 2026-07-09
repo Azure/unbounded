@@ -4,9 +4,8 @@
 //! Stripe-to-shard ownership routing for cross-shard fan-out.
 //!
 //! [`owner_shard`] is the content-hash fallback: "which shard owns this
-//! stripe key?" with no topology input. It is still used by the binary's
-//! off-path [`crate::bufferpool::PoolGroup`] router closure and as the
-//! spread function whenever NUMA-local routing cannot place a stripe.
+//! stripe key?" with no topology input. It is the spread function whenever
+//! NUMA-local routing cannot place a stripe.
 //!
 //! [`numa_local_shard`] is the NUMA-aware data-path router: it maps a
 //! stripe key to the drive that backs it (via [`disk_for`], the same
