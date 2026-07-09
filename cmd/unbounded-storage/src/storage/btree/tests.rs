@@ -1007,10 +1007,19 @@ fn failed_write_mid_commit_unwinds_and_preserves_tree() {
             Some(entry(i as u64)),
             "pre-commit key {i} lost",
         );
+        assert_eq!(
+            idx.lookup_committed_mirror(&key(i)),
+            Some(entry(i as u64)),
+            "pre-commit mirror entry {i} lost",
+        );
     }
     assert!(
         block_on(idx.lookup(&key(250))).unwrap().is_none(),
         "key from the failed commit must not be visible",
+    );
+    assert!(
+        idx.lookup_committed_mirror(&key(250)).is_none(),
+        "key from the failed commit must not enter the mirror",
     );
 
     // The tree must still accept new commits after the failure.
