@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: playpen
+  namespace: unbounded-kube
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: playpen
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: playpen
+    spec:
+      serviceAccountName: playpen
+      containers:
+      - name: playpen
+        image: ghcr.io/azure/playpen:dev
+        args:
+        - operator
+        - --namespace=unbounded-kube
+        - --service-name=playpen
+        ports:
+        - name: https
+          containerPort: 9443
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        readinessProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /readyz
+            port: https
+        livenessProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /healthz
+            port: https

@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: unbounded-kube
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: playpen
+  namespace: unbounded-kube
