@@ -24,7 +24,6 @@
 //! [`crate::bufferpool::Pool`] can be configured against an
 //! NVMe-backed engine.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::bufferpool::{self, PageRef, StripeKey};
@@ -33,7 +32,7 @@ use crate::storage::alloc::Allocator;
 use crate::storage::blockdev::{BlockDevice, ScratchPool};
 use crate::storage::btree::{BTreeIndex, LeafEntry, Mutation};
 use crate::storage::checksum::checksum;
-use crate::storage::lru::SieveLru;
+use crate::storage::lru::{Resident, SieveLru};
 use crate::storage::mutator::{MutatorOutcome, MutatorQueue, MutatorReply, MutatorReq};
 use crate::storage::refcount::RefcountTable;
 use crate::storage::singleflight::Singleflight;
@@ -151,11 +150,6 @@ pub struct StorageEngine<B: BlockDevice> {
     singleflight: Singleflight,
     cfg: EngineConfig,
     bufferpool: Mutex<BufferpoolBinding>,
-    /// Reverse map start-LBA -> (PageKey, byte_len). Eviction
-    /// targets pick a start LBA from the LRU; the entry's
-    /// byte_len tells the engine how many contiguous LBAs the
-    /// run covers so the whole run is freed atomically.
-    reverse: Mutex<HashMap<u64, (PageKey, u32)>>,
     /// Runs that have been logically orphaned (no btree entry,
     /// removed from the LRU) but cannot be freed yet because a
     /// reader still holds a pin on the start LBA. Drained by the
@@ -282,7 +276,6 @@ impl<B: BlockDevice> StorageEngine<B> {
                 page_size: 0,
                 page_count: 0,
             }),
-            reverse: Mutex::new(HashMap::new()),
             pending_free: Mutex::new(Vec::new()),
             mutator_queue: Arc::new(MutatorQueue::new()),
             metrics: EngineMetrics::new(),
@@ -385,10 +378,6 @@ impl<B: BlockDevice> StorageEngine<B> {
     /// bookkeeping and either free it immediately or queue it for
     /// later reclamation when its readers are done.
     fn retire_range(&self, old: Lba, n: u64) {
-        {
-            let mut rev = self.reverse.lock().unwrap();
-            rev.remove(&old.0);
-        }
         self.lru.forget(old);
         if self.refcount.pin_count(old.0).unwrap_or(0) == 0 {
             let _ = self.allocator.free_range(old, n);
@@ -412,36 +401,18 @@ impl<B: BlockDevice> StorageEngine<B> {
         // Skip pinned LBAs - an in-flight reader still
         // references them. Re-admit so they remain tracked
         // and are reconsidered on a later sweep.
-        let mut victims: Vec<Lba> = Vec::with_capacity(candidates.len());
-        for lba in candidates {
-            if self.refcount.pin_count(lba.0).unwrap_or(0) == 0 {
-                victims.push(lba);
+        let mut victims: Vec<Resident> = Vec::with_capacity(candidates.len());
+        for resident in candidates {
+            if self.refcount.pin_count(resident.lba.0).unwrap_or(0) == 0 {
+                victims.push(resident);
             } else {
-                self.lru.admit(lba);
+                self.lru.admit(resident);
             }
         }
         if victims.is_empty() {
             return;
         }
-        // Resolve victim start-LBAs to (key, byte_len) via
-        // the reverse map before submitting: the mutator only
-        // needs the keys to commit the delete, and we still
-        // own the LBA runs here for the post-commit free
-        // below.
-        let mut keys: Vec<PageKey> = Vec::with_capacity(victims.len());
-        let mut victim_runs: Vec<(Lba, u64)> = Vec::with_capacity(victims.len());
-        {
-            let rev = self.reverse.lock().unwrap();
-            for lba in &victims {
-                if let Some((k, byte_len)) = rev.get(&lba.0).copied() {
-                    keys.push(k);
-                    victim_runs.push((*lba, self.n_pages(byte_len)));
-                }
-            }
-        }
-        if keys.is_empty() {
-            return;
-        }
+        let keys = victims.iter().map(|resident| resident.key).collect();
         // The btree mutation MUST commit before the allocator
         // slot is released: a concurrent writer that observes
         // the stale btree entry would otherwise call
@@ -457,24 +428,22 @@ impl<B: BlockDevice> StorageEngine<B> {
         match done.wait().await {
             MutatorOutcome::DeleteCommitted => {}
             _ => {
-                // Apply failed or queue closed: leave the
-                // LBAs allocated and tracked. A later sweep
-                // will retry.
+                // Apply failed or queue closed: restore the
+                // resident records so a later sweep retries.
+                for resident in victims {
+                    self.lru.admit(resident);
+                }
                 return;
             }
         }
-        {
-            let mut rev = self.reverse.lock().unwrap();
-            for (lba, _) in &victim_runs {
-                rev.remove(&lba.0);
-            }
+        for resident in &victims {
+            let _ = self
+                .allocator
+                .free_range(resident.lba, self.n_pages(resident.byte_len));
+            let _ = self.refcount.reset(resident.lba.0);
         }
-        for (lba, n) in &victim_runs {
-            let _ = self.allocator.free_range(*lba, *n);
-            let _ = self.refcount.reset(lba.0);
-        }
-        self.metric(|m| m.evictions += victim_runs.len() as u64);
-        for _ in &victim_runs {
+        self.metric(|m| m.evictions += victims.len() as u64);
+        for _ in &victims {
             crate::metrics::storage_eviction(self.disk());
         }
     }
@@ -736,11 +705,11 @@ impl<B: BlockDevice> StorageEngine<B> {
             self.retire_range(old.lba, self.n_pages(old.byte_len));
         }
 
-        {
-            let mut rev = self.reverse.lock().unwrap();
-            rev.insert(lba.0, (pk, src_buf.len() as u32));
-        }
-        self.lru.admit(lba);
+        self.lru.admit(Resident {
+            lba,
+            key: pk,
+            byte_len: src_buf.len() as u32,
+        });
         self.metric(|m| m.admitted += 1);
         self.evict_if_over_watermark().await;
 

@@ -23,11 +23,20 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::storage::refcount::RefcountTable;
-use crate::storage::types::Lba;
+use crate::storage::types::{Lba, PageKey};
+
+/// Metadata needed to evict one resident data run without a
+/// separate reverse-LBA index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Resident {
+    pub lba: Lba,
+    pub key: PageKey,
+    pub byte_len: u32,
+}
 
 pub struct SieveLru {
     capacity: u64,
-    queue: Mutex<VecDeque<Lba>>,
+    queue: Mutex<VecDeque<Resident>>,
     refcount: Arc<RefcountTable>,
 }
 
@@ -61,8 +70,8 @@ impl SieveLru {
         len / cap >= fraction
     }
 
-    pub fn admit(&self, lba: Lba) {
-        self.queue.lock().unwrap().push_front(lba);
+    pub fn admit(&self, resident: Resident) {
+        self.queue.lock().unwrap().push_front(resident);
     }
 
     pub fn touch(&self, lba: Lba) {
@@ -76,23 +85,25 @@ impl SieveLru {
     /// victims. The sweep gives up after seeing twice the
     /// queue's length to avoid an unbounded loop when every
     /// resident page is pinned.
-    pub fn sweep(&self, target: usize) -> Vec<Lba> {
+    pub fn sweep(&self, target: usize) -> Vec<Resident> {
         let mut victims = Vec::with_capacity(target.min(64));
         let mut q = self.queue.lock().unwrap();
         let mut budget = q.len() * 2;
         while victims.len() < target && budget > 0 {
             budget -= 1;
-            let Some(lba) = q.pop_back() else { break };
-            if self.refcount.is_pinned(lba.0).unwrap_or(false) {
-                q.push_front(lba);
+            let Some(resident) = q.pop_back() else {
+                break;
+            };
+            if self.refcount.is_pinned(resident.lba.0).unwrap_or(false) {
+                q.push_front(resident);
                 continue;
             }
-            if self.refcount.is_referenced(lba.0).unwrap_or(false) {
-                let _ = self.refcount.clear_referenced(lba.0);
-                q.push_front(lba);
+            if self.refcount.is_referenced(resident.lba.0).unwrap_or(false) {
+                let _ = self.refcount.clear_referenced(resident.lba.0);
+                q.push_front(resident);
                 continue;
             }
-            victims.push(lba);
+            victims.push(resident);
         }
         victims
     }
@@ -102,7 +113,7 @@ impl SieveLru {
     /// observed bitrot).
     pub fn forget(&self, lba: Lba) {
         let mut q = self.queue.lock().unwrap();
-        if let Some(pos) = q.iter().position(|&x| x == lba) {
+        if let Some(pos) = q.iter().position(|resident| resident.lba == lba) {
             q.remove(pos);
         }
     }
@@ -111,6 +122,14 @@ impl SieveLru {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resident(i: u64) -> Resident {
+        Resident {
+            lba: Lba(i),
+            key: PageKey::new([i as u8; 32], i as u32),
+            byte_len: 4096,
+        }
+    }
 
     fn lru(capacity: u64) -> SieveLru {
         let rc = Arc::new(RefcountTable::new(capacity));
@@ -121,10 +140,10 @@ mod tests {
     fn admit_then_sweep_returns_cold_pages_in_lru_order() {
         let l = lru(16);
         for i in 2..6 {
-            l.admit(Lba(i));
+            l.admit(resident(i));
         }
         let v = l.sweep(2);
-        assert_eq!(v, vec![Lba(2), Lba(3)]);
+        assert_eq!(v, vec![resident(2), resident(3)]);
         assert_eq!(l.len(), 2);
     }
 
@@ -132,15 +151,15 @@ mod tests {
     fn touched_pages_survive_first_sweep() {
         let l = lru(16);
         for i in 2..6 {
-            l.admit(Lba(i));
+            l.admit(resident(i));
         }
         l.touch(Lba(2));
         // Hand reaches Lba(2) first; bit set => clear+rotate.
         let v = l.sweep(1);
-        assert_eq!(v, vec![Lba(3)]);
+        assert_eq!(v, vec![resident(3)]);
         // Sweep again: now Lba(2) has bit cleared and gets evicted next.
         let v = l.sweep(1);
-        assert_eq!(v, vec![Lba(4)]);
+        assert_eq!(v, vec![resident(4)]);
     }
 
     #[test]
@@ -148,11 +167,11 @@ mod tests {
         let l = lru(16);
         let rc = l.refcount.clone();
         for i in 2..6 {
-            l.admit(Lba(i));
+            l.admit(resident(i));
         }
         let _g = rc.pin(2).unwrap();
         let v = l.sweep(3);
-        assert_eq!(v, vec![Lba(3), Lba(4), Lba(5)]);
+        assert_eq!(v, vec![resident(3), resident(4), resident(5)]);
         // Lba(2) is still in the queue (skipped, re-enqueued).
         assert_eq!(l.len(), 1);
     }
@@ -162,7 +181,7 @@ mod tests {
         let l = lru(10);
         assert!(!l.watermark_exceeded(0.9));
         for i in 2..11 {
-            l.admit(Lba(i));
+            l.admit(resident(i));
         }
         assert!(l.watermark_exceeded(0.9));
     }
@@ -170,10 +189,10 @@ mod tests {
     #[test]
     fn forget_removes_lba() {
         let l = lru(8);
-        l.admit(Lba(2));
-        l.admit(Lba(3));
+        l.admit(resident(2));
+        l.admit(resident(3));
         l.forget(Lba(2));
         assert_eq!(l.len(), 1);
-        assert_eq!(l.sweep(2), vec![Lba(3)]);
+        assert_eq!(l.sweep(2), vec![resident(3)]);
     }
 }
