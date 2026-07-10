@@ -32,7 +32,7 @@
 //! Internal entries store, in their `key` slot, the *smallest* key
 //! reachable through their child.
 
-use crate::storage::traits::{PageChecksum, Xxh3Checksum};
+use crate::storage::checksum::checksum;
 use crate::storage::types::{Checksum, Error, Lba, PageKey};
 
 pub const HEADER_LEN: usize = 32;
@@ -107,7 +107,7 @@ pub fn max_internal_keys(page_size: usize) -> usize {
 
 /// Decode a page slice. The slice must be exactly `page_size`
 /// bytes (the caller has already loaded it from disk).
-pub fn decode(page: &[u8]) -> Decoded {
+pub fn decode(page: &mut [u8]) -> Decoded {
     if page.len() < HEADER_LEN {
         return Decoded::Empty;
     }
@@ -116,7 +116,6 @@ pub fn decode(page: &[u8]) -> Decoded {
     let txn_id = u64::from_le_bytes(page[8..16].try_into().unwrap());
     let stored_checksum = u64::from_le_bytes(page[HDR_CSUM_OFF..HDR_CSUM_END].try_into().unwrap());
 
-    // Validate checksum: clone the page with checksum field zeroed.
     if !verify_checksum(page, stored_checksum) {
         return Decoded::Empty;
     }
@@ -129,16 +128,13 @@ pub fn decode(page: &[u8]) -> Decoded {
     }
 }
 
-fn verify_checksum(page: &[u8], stored: u64) -> bool {
-    // xxh3 in this crate only has a one-shot helper, so we hash a
-    // copy of the page with the checksum field zeroed. One Vec
-    // allocation; the body bytes copy is unavoidable without a
-    // streaming API.
-    let mut buf = page.to_vec();
-    for b in &mut buf[HDR_CSUM_OFF..HDR_CSUM_END] {
-        *b = 0;
-    }
-    Xxh3Checksum::checksum_of(&buf).0 == stored
+fn verify_checksum(page: &mut [u8], stored: u64) -> bool {
+    let saved: [u8; HDR_CSUM_END - HDR_CSUM_OFF] =
+        page[HDR_CSUM_OFF..HDR_CSUM_END].try_into().unwrap();
+    page[HDR_CSUM_OFF..HDR_CSUM_END].fill(0);
+    let actual = checksum(page).0;
+    page[HDR_CSUM_OFF..HDR_CSUM_END].copy_from_slice(&saved);
+    actual == stored
 }
 
 fn decode_leaf(page: &[u8], nentries: usize, txn_id: u64) -> Decoded {
@@ -298,7 +294,7 @@ fn seal_checksum(page: &mut [u8]) {
     for b in &mut page[HDR_CSUM_OFF..HDR_CSUM_END] {
         *b = 0;
     }
-    let cs = Xxh3Checksum::checksum_of(page).0;
+    let cs = checksum(page).0;
     page[HDR_CSUM_OFF..HDR_CSUM_END].copy_from_slice(&cs.to_le_bytes());
 }
 
@@ -330,8 +326,8 @@ mod tests {
                 },
             ),
         ];
-        let p = encode_leaf(4096, 42, &entries).unwrap();
-        match decode(&p) {
+        let mut p = encode_leaf(4096, 42, &entries).unwrap();
+        match decode(&mut p) {
             Decoded::Leaf {
                 txn_id,
                 entries: got,
@@ -347,8 +343,8 @@ mod tests {
     fn internal_roundtrip() {
         let keys = vec![key(1), key(5), key(9)];
         let children = vec![Lba(10), Lba(20), Lba(30)];
-        let p = encode_internal(4096, 7, &keys, &children).unwrap();
-        match decode(&p) {
+        let mut p = encode_internal(4096, 7, &keys, &children).unwrap();
+        match decode(&mut p) {
             Decoded::Internal {
                 txn_id,
                 keys: gk,
@@ -364,8 +360,8 @@ mod tests {
 
     #[test]
     fn meta_roundtrip() {
-        let p = encode_meta(4096, 99, Lba(12345), 7777);
-        match decode(&p) {
+        let mut p = encode_meta(4096, 99, Lba(12345), 7777);
+        match decode(&mut p) {
             Decoded::Meta {
                 txn_id,
                 root_lba,
@@ -385,8 +381,8 @@ mod tests {
         // meta page written with hwm = 0 decodes back as hwm = 0,
         // matching what an old encoder that left the trailing
         // reserved bytes zeroed would produce.
-        let p = encode_meta(4096, 1, Lba(42), 0);
-        match decode(&p) {
+        let mut p = encode_meta(4096, 1, Lba(42), 0);
+        match decode(&mut p) {
             Decoded::Meta { hwm, .. } => assert_eq!(hwm, 0),
             other => panic!("expected meta, got {other:?}"),
         }
@@ -397,7 +393,18 @@ mod tests {
         let p = encode_meta(4096, 1, Lba(1), 0);
         let mut bad = p.clone();
         bad[HEADER_LEN] ^= 0x01; // flip a byte in the body
-        assert!(matches!(decode(&bad), Decoded::Empty));
+        let before = bad.clone();
+        assert!(matches!(decode(&mut bad), Decoded::Empty));
+        assert_eq!(bad, before);
+    }
+
+    #[test]
+    fn decode_restores_checksum_bytes() {
+        let mut page = encode_meta(4096, 1, Lba(1), 0);
+        let before = page.clone();
+
+        assert!(matches!(decode(&mut page), Decoded::Meta { .. }));
+        assert_eq!(page, before);
     }
 
     #[test]
@@ -406,7 +413,7 @@ mod tests {
         p[0] = 99;
         // reseal so checksum is valid but type is unknown
         seal_checksum(&mut p);
-        assert!(matches!(decode(&p), Decoded::Empty));
+        assert!(matches!(decode(&mut p), Decoded::Empty));
     }
 
     #[test]

@@ -832,7 +832,7 @@ fn concurrent_writes_same_key_collapse_to_one_entry() {
     // Eight concurrent writers, all aimed at the same key/offset.
     // Each writer issues two `write_page` calls so the admission
     // filter promotes the key past its "second touch" gate: the
-    // first call from each writer primes the sketch, the second
+    // first call from each writer primes the doorkeeper, the second
     // becomes a singleflight contender. Without this, eight
     // single-shot writers all get filter-rejected and the engine
     // never reaches the device path the test exists to exercise.

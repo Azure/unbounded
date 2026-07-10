@@ -361,7 +361,7 @@ fn snapshot_drop_frees_old_pages() {
 fn read_meta_slot(dev: &MockDevice, lba: Lba) -> Option<(u64, Lba, u64)> {
     let mut buf = vec![0u8; dev.page_size()];
     dev.peek(lba, &mut buf);
-    match page::decode(&buf) {
+    match page::decode(&mut buf) {
         Decoded::Meta {
             txn_id,
             root_lba,
@@ -859,10 +859,6 @@ impl BlockDevice for GateDevice {
         self.inner.register_buffers(base, len)
     }
 
-    fn write_queue_depth(&self) -> u32 {
-        self.inner.write_queue_depth()
-    }
-
     async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), crate::storage::types::Error> {
         self.inner.read(lba, dst).await
     }
@@ -1007,10 +1003,19 @@ fn failed_write_mid_commit_unwinds_and_preserves_tree() {
             Some(entry(i as u64)),
             "pre-commit key {i} lost",
         );
+        assert_eq!(
+            idx.lookup_committed_mirror(&key(i)),
+            Some(entry(i as u64)),
+            "pre-commit mirror entry {i} lost",
+        );
     }
     assert!(
         block_on(idx.lookup(&key(250))).unwrap().is_none(),
         "key from the failed commit must not be visible",
+    );
+    assert!(
+        idx.lookup_committed_mirror(&key(250)).is_none(),
+        "key from the failed commit must not enter the mirror",
     );
 
     // The tree must still accept new commits after the failure.

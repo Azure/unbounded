@@ -24,9 +24,6 @@
 //! [`crate::bufferpool::Pool`] can be configured against an
 //! NVMe-backed engine.
 
-use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use crate::bufferpool::{self, PageRef, StripeKey};
@@ -34,11 +31,11 @@ use crate::storage::admission::AdmissionFilter;
 use crate::storage::alloc::Allocator;
 use crate::storage::blockdev::{BlockDevice, ScratchPool};
 use crate::storage::btree::{BTreeIndex, LeafEntry, Mutation};
-use crate::storage::lru::SieveLru;
+use crate::storage::checksum::checksum;
+use crate::storage::lru::{Resident, SieveLru};
 use crate::storage::mutator::{MutatorOutcome, MutatorQueue, MutatorReply, MutatorReq};
 use crate::storage::refcount::RefcountTable;
-use crate::storage::singleflight::{Acquire, Singleflight};
-use crate::storage::traits::{PageChecksum, Xxh3Checksum};
+use crate::storage::singleflight::Singleflight;
 use crate::storage::types::{Lba, PageKey};
 
 #[derive(Clone, Debug)]
@@ -54,30 +51,15 @@ pub struct EngineConfig {
     /// the CoW B+tree commit cost; the mutator never exceeds this
     /// per commit.
     pub commit_batch_max: usize,
-    /// Target batch-coalescing latency, in microseconds. This is a
-    /// logical hint, not a value the engine reads as elapsed time:
-    /// the deterministic-simulation harness forbids reading the
-    /// wall clock, so the mutator realizes this budget as
-    /// [`Self::commit_batch_ticks`] cooperative yields rather than
-    /// a real deadline. Retained for documentation and future
-    /// production tuning.
-    pub commit_batch_deadline_us: u64,
     /// Number of cooperative yields the mutator may spend waiting
     /// for more requests to coalesce into a batch that has not yet
-    /// reached [`Self::commit_batch_max`]. This is the
-    /// wall-clock-free realization of
-    /// [`Self::commit_batch_deadline_us`]: each yield lets the
+    /// reached [`Self::commit_batch_max`]. Each yield lets the
     /// executor interleave producers that are about to enqueue, so
     /// the batch grows under load while a drained or closed queue
-    /// commits immediately. Default 8 (roughly
-    /// `commit_batch_deadline_us / 25us` per yield); 0 disables
-    /// coalescing.
+    /// commits immediately. Default 8; 0 disables coalescing.
     pub commit_batch_ticks: u32,
     pub eviction_watermark: f32,
-    pub probationary_fraction: f32,
-    pub admission_sketch_multiplier: usize,
     pub singleflight_shards: usize,
-    pub restart_scan_queue_depth: u32,
     /// Number of 4 KiB registered scratch buffers reserved for
     /// btree / meta I/O. This is the hard ceiling on how many
     /// btree page writes a single path-copy commit can keep in
@@ -129,13 +111,9 @@ impl Default for EngineConfig {
             page_size_bytes: 2 * 1024 * 1024,
             btree_page_bytes: 4096,
             commit_batch_max: 1024,
-            commit_batch_deadline_us: 200,
             commit_batch_ticks: 8,
             eviction_watermark: 0.9,
-            probationary_fraction: 0.1,
-            admission_sketch_multiplier: 2,
             singleflight_shards: 64,
-            restart_scan_queue_depth: 256,
             btree_scratch_pages: 64,
             bypass_admission: false,
             bypass_index_read: false,
@@ -169,14 +147,9 @@ pub struct StorageEngine<B: BlockDevice> {
     btree: Arc<BTreeIndex<B>>,
     lru: Arc<SieveLru>,
     admission: Arc<AdmissionFilter>,
-    singleflight: Arc<Singleflight>,
+    singleflight: Singleflight,
     cfg: EngineConfig,
     bufferpool: Mutex<BufferpoolBinding>,
-    /// Reverse map start-LBA -> (PageKey, byte_len). Eviction
-    /// targets pick a start LBA from the LRU; the entry's
-    /// byte_len tells the engine how many contiguous LBAs the
-    /// run covers so the whole run is freed atomically.
-    reverse: Mutex<HashMap<u64, (PageKey, u32)>>,
     /// Runs that have been logically orphaned (no btree entry,
     /// removed from the LRU) but cannot be freed yet because a
     /// reader still holds a pin on the start LBA. Drained by the
@@ -287,11 +260,8 @@ impl<B: BlockDevice> StorageEngine<B> {
             .await?,
         );
         let lru = Arc::new(SieveLru::new(capacity, refcount.clone()));
-        let admission = Arc::new(AdmissionFilter::new(
-            capacity,
-            cfg.admission_sketch_multiplier.max(1) as u32,
-        ));
-        let singleflight = Arc::new(Singleflight::new(cfg.singleflight_shards.max(1)));
+        let admission = Arc::new(AdmissionFilter::new(capacity));
+        let singleflight = Singleflight::new(cfg.singleflight_shards.max(1));
         let engine = Self {
             device,
             allocator,
@@ -306,7 +276,6 @@ impl<B: BlockDevice> StorageEngine<B> {
                 page_size: 0,
                 page_count: 0,
             }),
-            reverse: Mutex::new(HashMap::new()),
             pending_free: Mutex::new(Vec::new()),
             mutator_queue: Arc::new(MutatorQueue::new()),
             metrics: EngineMetrics::new(),
@@ -409,10 +378,6 @@ impl<B: BlockDevice> StorageEngine<B> {
     /// bookkeeping and either free it immediately or queue it for
     /// later reclamation when its readers are done.
     fn retire_range(&self, old: Lba, n: u64) {
-        {
-            let mut rev = self.reverse.lock().unwrap();
-            rev.remove(&old.0);
-        }
         self.lru.forget(old);
         if self.refcount.pin_count(old.0).unwrap_or(0) == 0 {
             let _ = self.allocator.free_range(old, n);
@@ -422,89 +387,64 @@ impl<B: BlockDevice> StorageEngine<B> {
         }
     }
 
-    fn evict_if_over_watermark<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
-        // Boxed because called from inside an async fn that's
-        // already 'a; eviction may itself await on the mutator.
-        Box::pin(async move {
-            if !self
-                .lru
-                .watermark_exceeded(self.cfg.eviction_watermark as f64)
-            {
+    async fn evict_if_over_watermark(&self) {
+        if !self
+            .lru
+            .watermark_exceeded(self.cfg.eviction_watermark as f64)
+        {
+            return;
+        }
+        let candidates = self.lru.sweep(8);
+        if candidates.is_empty() {
+            return;
+        }
+        // Skip pinned LBAs - an in-flight reader still
+        // references them. Re-admit so they remain tracked
+        // and are reconsidered on a later sweep.
+        let mut victims: Vec<Resident> = Vec::with_capacity(candidates.len());
+        for resident in candidates {
+            if self.refcount.pin_count(resident.lba.0).unwrap_or(0) == 0 {
+                victims.push(resident);
+            } else {
+                self.lru.admit(resident);
+            }
+        }
+        if victims.is_empty() {
+            return;
+        }
+        // The btree mutation MUST commit before the allocator
+        // slot is released: a concurrent writer that observes
+        // the stale btree entry would otherwise call
+        // retire_lba and double-free the slot the allocator
+        // already handed back. The mutator is the single
+        // committer, so this ordering is preserved by
+        // construction once `done.wait()` returns.
+        let done = MutatorReply::new();
+        self.mutator_queue.push(MutatorReq::Delete {
+            victims: victims.clone(),
+            done: done.clone(),
+        });
+        let removed = match done.wait().await {
+            MutatorOutcome::DeleteCommitted { removed } => removed,
+            _ => {
+                // Apply failed or queue closed: restore the
+                // resident records so a later sweep retries.
+                for resident in victims {
+                    self.lru.admit(resident);
+                }
                 return;
             }
-            let candidates = self.lru.sweep(8);
-            if candidates.is_empty() {
-                return;
-            }
-            // Skip pinned LBAs - an in-flight reader still
-            // references them. Re-admit so they remain tracked
-            // and are reconsidered on a later sweep.
-            let mut victims: Vec<Lba> = Vec::with_capacity(candidates.len());
-            for lba in candidates {
-                if self.refcount.pin_count(lba.0).unwrap_or(0) == 0 {
-                    victims.push(lba);
-                } else {
-                    self.lru.admit(lba);
-                }
-            }
-            if victims.is_empty() {
-                return;
-            }
-            // Resolve victim start-LBAs to (key, byte_len) via
-            // the reverse map before submitting: the mutator only
-            // needs the keys to commit the delete, and we still
-            // own the LBA runs here for the post-commit free
-            // below.
-            let mut keys: Vec<PageKey> = Vec::with_capacity(victims.len());
-            let mut victim_runs: Vec<(Lba, u64)> = Vec::with_capacity(victims.len());
-            {
-                let rev = self.reverse.lock().unwrap();
-                for lba in &victims {
-                    if let Some((k, byte_len)) = rev.get(&lba.0).copied() {
-                        keys.push(k);
-                        victim_runs.push((*lba, self.n_pages(byte_len)));
-                    }
-                }
-            }
-            if keys.is_empty() {
-                return;
-            }
-            // The btree mutation MUST commit before the allocator
-            // slot is released: a concurrent writer that observes
-            // the stale btree entry would otherwise call
-            // retire_lba and double-free the slot the allocator
-            // already handed back. The mutator is the single
-            // committer, so this ordering is preserved by
-            // construction once `done.wait()` returns.
-            let done = MutatorReply::new();
-            self.mutator_queue.push(MutatorReq::Delete {
-                keys,
-                done: done.clone(),
-            });
-            match done.wait().await {
-                MutatorOutcome::DeleteCommitted => {}
-                _ => {
-                    // Apply failed or queue closed: leave the
-                    // LBAs allocated and tracked. A later sweep
-                    // will retry.
-                    return;
-                }
-            }
-            {
-                let mut rev = self.reverse.lock().unwrap();
-                for (lba, _) in &victim_runs {
-                    rev.remove(&lba.0);
-                }
-            }
-            for (lba, n) in &victim_runs {
-                let _ = self.allocator.free_range(*lba, *n);
-                let _ = self.refcount.reset(lba.0);
-            }
-            self.metric(|m| m.evictions += victim_runs.len() as u64);
-            for _ in &victim_runs {
-                crate::metrics::storage_eviction(self.disk());
-            }
-        })
+        };
+        for resident in &removed {
+            let _ = self
+                .allocator
+                .free_range(resident.lba, self.n_pages(resident.byte_len));
+            let _ = self.refcount.reset(resident.lba.0);
+        }
+        self.metric(|m| m.evictions += removed.len() as u64);
+        for _ in &removed {
+            crate::metrics::storage_eviction(self.disk());
+        }
     }
 }
 
@@ -622,9 +562,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             crate::metrics::Outcome::Ok,
         );
 
-        if !self.cfg.bypass_checksum
-            && Xxh3Checksum::checksum_of(dst_buf).0 != entry.data_checksum.0
-        {
+        if !self.cfg.bypass_checksum && checksum(dst_buf).0 != entry.data_checksum.0 {
             self.metric(|m| {
                 m.misses += 1;
                 m.checksum_misses += 1;
@@ -634,7 +572,6 @@ impl<B: BlockDevice> StorageEngine<B> {
         }
 
         self.lru.touch(entry.lba);
-        self.admission.record_frequency(&pk);
         self.metric(|m| m.hits += 1);
         crate::metrics::storage_lookup(crate::metrics::Lookup::Hit);
         Ok(true)
@@ -672,12 +609,8 @@ impl<B: BlockDevice> StorageEngine<B> {
             return Ok(());
         }
 
-        let acquire = self.singleflight.acquire(pk);
-        let leader = match acquire {
-            Acquire::Leader(g) => g,
-            Acquire::Follower(_w) => {
-                return Ok(());
-            }
+        let Some(_leader) = self.singleflight.try_acquire(pk) else {
+            return Ok(());
         };
 
         // SAFETY: caller-provided contract on `src`.
@@ -697,7 +630,6 @@ impl<B: BlockDevice> StorageEngine<B> {
                 src_buf.len(),
                 self.cfg.btree_page_bytes,
             );
-            leader.abandon();
             return Err(bufferpool::Error::Io(libc::EINVAL));
         }
 
@@ -705,7 +637,6 @@ impl<B: BlockDevice> StorageEngine<B> {
         let lba = match self.allocator.alloc_contig(n_pages) {
             Ok(l) => l,
             Err(_) => {
-                leader.abandon();
                 return Ok(());
             }
         };
@@ -726,7 +657,6 @@ impl<B: BlockDevice> StorageEngine<B> {
                 crate::metrics::Outcome::Err,
             );
             let _ = self.allocator.free_range(lba, n_pages);
-            leader.abandon();
             return Err(bufferpool::Error::Io(io_errno(&e)));
         }
         crate::metrics::storage_disk_op(
@@ -735,7 +665,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             crate::metrics::Outcome::Ok,
         );
 
-        let cs = Xxh3Checksum::checksum_of(src_buf);
+        let cs = checksum(src_buf);
         let entry = LeafEntry {
             lba,
             data_checksum: cs,
@@ -763,10 +693,9 @@ impl<B: BlockDevice> StorageEngine<B> {
                 // the device-write branch above.
                 self.metric(|m| m.write_io_errors += 1);
                 let _ = self.allocator.free_range(lba, n_pages);
-                leader.abandon();
                 return Err(bufferpool::Error::Io(libc::EIO));
             }
-            MutatorOutcome::DeleteCommitted => {
+            MutatorOutcome::DeleteCommitted { .. } => {
                 unreachable!("mutator returned DeleteCommitted for an Insert request")
             }
         };
@@ -775,14 +704,12 @@ impl<B: BlockDevice> StorageEngine<B> {
             self.retire_range(old.lba, self.n_pages(old.byte_len));
         }
 
-        {
-            let mut rev = self.reverse.lock().unwrap();
-            rev.insert(lba.0, (pk, src_buf.len() as u32));
-        }
-        self.lru.admit(lba);
+        self.lru.admit(Resident {
+            lba,
+            key: pk,
+            byte_len: src_buf.len() as u32,
+        });
         self.metric(|m| m.admitted += 1);
-        leader.publish(entry);
-
         self.evict_if_over_watermark().await;
 
         Ok(())
@@ -805,9 +732,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             // Coalesce up to `commit_batch_max`, spending a bounded
             // budget of cooperative yields (`commit_batch_ticks`)
             // so producers that are about to enqueue join this
-            // commit. Wall-clock-free stand-in for
-            // `commit_batch_deadline_us`; see
-            // `MutatorQueue::drain_batch`. The drain stops early if
+            // commit. The drain stops early if
             // the queue closes, so a draining shutdown still
             // terminates.
             let batch = self
@@ -839,16 +764,9 @@ impl<B: BlockDevice> StorageEngine<B> {
         if batch.is_empty() {
             return;
         }
-        // Look up prior LBAs for every Insert before applying;
-        // the mutator is the single committer so these reads are
-        // consistent with what `apply_batch` is about to replace.
-        // Singleflight guarantees at most one Insert per key is
-        // in flight at a time, so an Insert key cannot also
-        // appear in a Delete in the same batch (a Delete only
-        // comes from eviction, which would not target a key that
-        // has an in-flight write because the LBA is admitted to
-        // the LRU only after publish). Debug-assert the simpler
-        // condition: each insert key appears at most once.
+        // Deletes may overlap an Insert because eviction releases the SIEVE
+        // record before enqueueing. Fold requests in queue order and compare
+        // each victim's expected LBA against that logical state.
         #[cfg(debug_assertions)]
         {
             use std::collections::HashSet;
@@ -863,23 +781,47 @@ impl<B: BlockDevice> StorageEngine<B> {
             }
         }
 
+        let mut states: std::collections::HashMap<PageKey, Option<LeafEntry>> =
+            std::collections::HashMap::new();
         let mut priors: Vec<Option<LeafEntry>> = Vec::with_capacity(batch.len());
+        let mut removed_by_req: Vec<Vec<Resident>> = Vec::with_capacity(batch.len());
         let mut mutations: Vec<Mutation> = Vec::new();
         for req in &batch {
             match req {
                 MutatorReq::Insert { key, entry, .. } => {
-                    let prior = self.btree.lookup(key).await.ok().flatten();
+                    let prior = if let Some(prior) = states.get(key) {
+                        *prior
+                    } else {
+                        let prior = self.btree.lookup(key).await.ok().flatten();
+                        states.insert(*key, prior);
+                        prior
+                    };
                     priors.push(prior);
+                    removed_by_req.push(Vec::new());
+                    states.insert(*key, Some(*entry));
                     mutations.push(Mutation::Insert {
                         key: *key,
                         value: *entry,
                     });
                 }
-                MutatorReq::Delete { keys, .. } => {
+                MutatorReq::Delete { victims, .. } => {
                     priors.push(None);
-                    for k in keys {
-                        mutations.push(Mutation::Delete { key: *k });
+                    let mut removed = Vec::new();
+                    for victim in victims {
+                        let current = if let Some(current) = states.get(&victim.key) {
+                            *current
+                        } else {
+                            let current = self.btree.lookup(&victim.key).await.ok().flatten();
+                            states.insert(victim.key, current);
+                            current
+                        };
+                        if current.is_some_and(|entry| entry.lba == victim.lba) {
+                            states.insert(victim.key, None);
+                            mutations.push(Mutation::Delete { key: victim.key });
+                            removed.push(*victim);
+                        }
                     }
+                    removed_by_req.push(removed);
                 }
             }
         }
@@ -904,7 +846,9 @@ impl<B: BlockDevice> StorageEngine<B> {
                     MutatorReq::Insert { .. } => {
                         MutatorOutcome::InsertCommitted { prior: priors[i] }
                     }
-                    MutatorReq::Delete { .. } => MutatorOutcome::DeleteCommitted,
+                    MutatorReq::Delete { .. } => MutatorOutcome::DeleteCommitted {
+                        removed: std::mem::take(&mut removed_by_req[i]),
+                    },
                 }
             };
             done.set(outcome);
@@ -947,7 +891,7 @@ mod tests {
     use crate::bufferpool::BlockStore;
     use crate::memory::Backing;
     use crate::storage::blockdev::{MockDevice, MockDeviceConfig, MockFaultMode};
-    use crate::storage::types::Lba;
+    use crate::storage::types::{Checksum, Lba};
 
     fn test_backing(base: *mut u8, page_size: usize, page_count: usize) -> Backing {
         Backing {
@@ -1024,6 +968,88 @@ mod tests {
         let mut s = [0u8; 32];
         s[0] = i;
         StripeKey(s)
+    }
+
+    fn entry(lba: u64) -> LeafEntry {
+        LeafEntry {
+            lba: Lba(lba),
+            data_checksum: Checksum(lba),
+            byte_len: 4096,
+        }
+    }
+
+    fn resident(key: PageKey, lba: u64) -> Resident {
+        Resident {
+            key,
+            lba: Lba(lba),
+            byte_len: 4096,
+        }
+    }
+
+    #[test]
+    fn stale_eviction_after_same_batch_overwrite_is_ignored() {
+        let (eng, _buf) = engine(256);
+        let key = StorageEngine::<MockDevice>::page_key(&stripe(21), 0, 4096);
+        let seed = MutatorReply::new();
+        block_on(eng.process_batch(vec![MutatorReq::Insert {
+            key,
+            entry: entry(200),
+            done: seed.clone(),
+        }]));
+        assert!(matches!(
+            block_on(seed.wait()),
+            MutatorOutcome::InsertCommitted { prior: None }
+        ));
+
+        let overwrite = MutatorReply::new();
+        let eviction = MutatorReply::new();
+        block_on(eng.process_batch(vec![
+            MutatorReq::Insert {
+                key,
+                entry: entry(201),
+                done: overwrite.clone(),
+            },
+            MutatorReq::Delete {
+                victims: vec![resident(key, 200)],
+                done: eviction.clone(),
+            },
+        ]));
+
+        assert_eq!(eng.btree.lookup_committed_mirror(&key), Some(entry(201)));
+        assert!(matches!(
+            block_on(eviction.wait()),
+            MutatorOutcome::DeleteCommitted { removed } if removed.is_empty()
+        ));
+    }
+
+    #[test]
+    fn stale_eviction_after_adjacent_batch_overwrite_is_ignored() {
+        let (eng, _buf) = engine(256);
+        let key = StorageEngine::<MockDevice>::page_key(&stripe(22), 0, 4096);
+        let seed = MutatorReply::new();
+        block_on(eng.process_batch(vec![MutatorReq::Insert {
+            key,
+            entry: entry(200),
+            done: seed,
+        }]));
+
+        let overwrite = MutatorReply::new();
+        block_on(eng.process_batch(vec![MutatorReq::Insert {
+            key,
+            entry: entry(201),
+            done: overwrite,
+        }]));
+        let eviction = MutatorReply::new();
+        block_on(eng.process_batch(vec![MutatorReq::Delete {
+            victims: vec![resident(key, 200)],
+            done: eviction.clone(),
+        }]));
+
+        assert_eq!(eng.btree.lookup_committed_mirror(&key), Some(entry(201)));
+        assert!(matches!(
+            block_on(eviction.wait()),
+            MutatorOutcome::DeleteCommitted { removed } if removed.is_empty()
+        ));
     }
 
     #[test]
