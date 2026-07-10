@@ -387,7 +387,7 @@ fn request_from_origin(origin_ref: OriginRef, cfg: &LoadgenRun) -> StripeReq {
     let key = cfg
         .cache_id
         .as_deref()
-        .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id))
+        .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id, cfg.stripe_size))
         .unwrap_or_else(|| origin_ref.stripe_key());
     StripeReq::new(key)
         .with_origin(origin_ref)
@@ -785,7 +785,7 @@ mod tests {
         cfg.fabric_only = true;
         cfg.skip_local_disk = true;
         let origin = OriginRef::new("fake", "obj", 3);
-        let key = origin.stripe_key_for_cache("cache");
+        let key = origin.stripe_key_for_cache("cache", cfg.stripe_size);
         let req = request_from_origin(origin, &cfg);
         assert_eq!(req.key(), key);
         assert_eq!(req.origin().unwrap().backend_id, "fake");

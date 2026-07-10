@@ -4,9 +4,10 @@
 //! Stripe-to-origin mapping.
 //!
 //! The P2P cache is keyspace-addressed: a cached stripe is identified
-//! by its cache id, logical object id, and stripe index. That key is
-//! sufficient for peer routing and dedup inside one cache, but it
-//! carries no information about *where the bytes came from*. When a
+//! by its cache id, stripe geometry, logical object id, and stripe
+//! index. That key is sufficient for peer routing and dedup inside one
+//! cache, but it carries no information about *where the bytes came
+//! from*. When a
 //! read misses all the way through to the origin tier, the backend
 //! needs to map a [`StripeKey`] back to a concrete origin object and
 //! byte range so it can issue (for example) an S3 `GET` with the right
@@ -114,9 +115,10 @@ impl OriginRef {
     /// 1. `cache_id.len()` as 8 little-endian bytes
     ///    (`u64::to_le_bytes`).
     /// 2. `cache_id` as raw UTF-8 bytes.
-    /// 3. `origin_object_id.len()` as 8 little-endian bytes.
-    /// 4. `origin_object_id` as raw UTF-8 bytes.
-    /// 5. `stripe_idx` as 8 little-endian bytes (`u64::to_le_bytes`).
+    /// 3. `stripe_size_bytes` as 8 little-endian bytes.
+    /// 4. `origin_object_id.len()` as 8 little-endian bytes.
+    /// 5. `origin_object_id` as raw UTF-8 bytes.
+    /// 6. `stripe_idx` as 8 little-endian bytes (`u64::to_le_bytes`).
     ///
     /// The 32-byte blake3 digest is the [`StripeKey`]. blake3's output
     /// is already 32 bytes, so no truncation or expansion is needed.
@@ -127,8 +129,13 @@ impl OriginRef {
     /// split between `cache_id` and `origin_object_id` need not be
     /// pinned out-of-band for correctness. The 8-byte little-endian
     /// `stripe_idx` suffix is fixed width.
-    pub fn stripe_key_for_cache(&self, cache_id: &str) -> StripeKey {
-        stripe_key(cache_id, &self.origin_object_id, self.stripe_idx)
+    pub fn stripe_key_for_cache(&self, cache_id: &str, stripe_size_bytes: u64) -> StripeKey {
+        stripe_key(
+            cache_id,
+            stripe_size_bytes,
+            &self.origin_object_id,
+            self.stripe_idx,
+        )
     }
 
     /// Whether this reference names an object's metadata entry rather
@@ -269,10 +276,16 @@ impl Req for StripeReq {
 /// Free-function form of [`OriginRef::stripe_key_for_cache`], for callers that
 /// have the parts in hand without an `OriginRef` value. See
 /// [`OriginRef::stripe_key_for_cache`] for the exact byte layout.
-pub fn stripe_key(cache_id: &str, origin_object_id: &str, stripe_idx: u64) -> StripeKey {
+pub fn stripe_key(
+    cache_id: &str,
+    stripe_size_bytes: u64,
+    origin_object_id: &str,
+    stripe_idx: u64,
+) -> StripeKey {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&(cache_id.len() as u64).to_le_bytes());
     hasher.update(cache_id.as_bytes());
+    hasher.update(&stripe_size_bytes.to_le_bytes());
     hasher.update(&(origin_object_id.len() as u64).to_le_bytes());
     hasher.update(origin_object_id.as_bytes());
     hasher.update(&stripe_idx.to_le_bytes());
@@ -298,13 +311,13 @@ mod tests {
         let a = OriginRef::new("primary-s3", "models/llama.bin", 12);
         let b = OriginRef::new("secondary-s3", "models/llama.bin", 12);
         assert_eq!(
-            a.stripe_key_for_cache("cache-a"),
-            b.stripe_key_for_cache("cache-a")
+            a.stripe_key_for_cache("cache-a", 4096),
+            b.stripe_key_for_cache("cache-a", 4096)
         );
         // Free function agrees with the method.
         assert_eq!(
-            a.stripe_key_for_cache("cache-a"),
-            stripe_key("cache-a", "models/llama.bin", 12)
+            a.stripe_key_for_cache("cache-a", 4096),
+            stripe_key("cache-a", 4096, "models/llama.bin", 12)
         );
     }
 
@@ -315,17 +328,18 @@ mod tests {
         let diff_object = OriginRef::new("primary-s3", "models/other.bin", 12);
         let diff_idx = OriginRef::new("primary-s3", "models/llama.bin", 13);
 
-        let k = base.stripe_key_for_cache("cache-a");
-        assert_eq!(k, diff_cache.stripe_key_for_cache("cache-a"));
-        assert_ne!(k, base.stripe_key_for_cache("cache-b"));
-        assert_ne!(k, diff_object.stripe_key_for_cache("cache-a"));
-        assert_ne!(k, diff_idx.stripe_key_for_cache("cache-a"));
+        let k = base.stripe_key_for_cache("cache-a", 4096);
+        assert_eq!(k, diff_cache.stripe_key_for_cache("cache-a", 4096));
+        assert_ne!(k, base.stripe_key_for_cache("cache-b", 4096));
+        assert_ne!(k, base.stripe_key_for_cache("cache-a", 8192));
+        assert_ne!(k, diff_object.stripe_key_for_cache("cache-a", 4096));
+        assert_ne!(k, diff_idx.stripe_key_for_cache("cache-a", 4096));
     }
 
     #[test]
     fn stripe_key_matches_documented_byte_layout() {
         // Reconstruct the digest by hand from the documented layout:
-        // cache_len_le || cache_id bytes || object_len_le ||
+        // cache_len_le || cache_id bytes || stripe_size_le || object_len_le ||
         // origin_object_id bytes || idx_le.
         let cache = "c";
         let object = "obj";
@@ -334,12 +348,13 @@ mod tests {
         let mut expected_input = Vec::new();
         expected_input.extend_from_slice(&(cache.len() as u64).to_le_bytes());
         expected_input.extend_from_slice(cache.as_bytes());
+        expected_input.extend_from_slice(&4096u64.to_le_bytes());
         expected_input.extend_from_slice(&(object.len() as u64).to_le_bytes());
         expected_input.extend_from_slice(object.as_bytes());
         expected_input.extend_from_slice(&idx.to_le_bytes());
         let expected = StripeKey(*blake3::hash(&expected_input).as_bytes());
 
-        assert_eq!(stripe_key(cache, object, idx), expected);
+        assert_eq!(stripe_key(cache, 4096, object, idx), expected);
     }
 
     #[test]
@@ -347,18 +362,21 @@ mod tests {
         // The length prefix on each variable-length field must make
         // distinct (cache_id, origin_object_id) splits unambiguous:
         // without it, "ab"+"c" and "a"+"bc" hash the same bytes.
-        assert_ne!(stripe_key("ab", "c", 0), stripe_key("a", "bc", 0));
+        assert_ne!(
+            stripe_key("ab", 4096, "c", 0),
+            stripe_key("a", 4096, "bc", 0)
+        );
 
         // Moving a byte across the field boundary changes the key even
         // when the concatenation is otherwise identical.
         assert_ne!(
-            stripe_key("foo", "barbaz", 7),
-            stripe_key("foobar", "baz", 7)
+            stripe_key("foo", 4096, "barbaz", 7),
+            stripe_key("foobar", 4096, "baz", 7)
         );
 
         // Empty-vs-nonempty split of the same concatenation also
         // differs.
-        assert_ne!(stripe_key("", "x", 0), stripe_key("x", "", 0));
+        assert_ne!(stripe_key("", 4096, "x", 0), stripe_key("x", 4096, "", 0));
     }
 
     #[test]
@@ -368,21 +386,23 @@ mod tests {
         let mut input = Vec::new();
         input.extend_from_slice(&1u64.to_le_bytes());
         input.extend_from_slice(b"b");
+        input.extend_from_slice(&4096u64.to_le_bytes());
         input.extend_from_slice(&3u64.to_le_bytes());
         input.extend_from_slice(b"obj");
         input.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
         let expected = StripeKey(*blake3::hash(&input).as_bytes());
-        assert_eq!(stripe_key("b", "obj", 1), expected);
+        assert_eq!(stripe_key("b", 4096, "obj", 1), expected);
 
         // And that little-endian 1 differs from big-endian 1 framing.
         let mut be_input = Vec::new();
         be_input.extend_from_slice(&1u64.to_le_bytes());
         be_input.extend_from_slice(b"b");
+        be_input.extend_from_slice(&4096u64.to_le_bytes());
         be_input.extend_from_slice(&3u64.to_le_bytes());
         be_input.extend_from_slice(b"obj");
         be_input.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
         let be = StripeKey(*blake3::hash(&be_input).as_bytes());
-        assert_ne!(stripe_key("b", "obj", 1), be);
+        assert_ne!(stripe_key("b", 4096, "obj", 1), be);
     }
 
     #[test]
@@ -414,7 +434,7 @@ mod tests {
         assert_eq!(a.stripe_key(), b.stripe_key());
         // The metadata entry rides the same keying machinery as a data
         // stripe at the sentinel index.
-        assert_eq!(a.stripe_key(), stripe_key("b", "obj", u64::MAX));
+        assert_eq!(a.stripe_key(), origin_stripe_key("b", "obj", u64::MAX));
     }
 
     #[test]

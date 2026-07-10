@@ -380,30 +380,39 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // (404 NoSuchKey) from any other failure (500 InternalError). Unlike
     // the plain HTTP frontend, a length-read failure is never a silently
     // dropped connection.
-    let len =
-        match read_object_length_s3(pool, backend_id, cache_id, &path, page_size, bypass).await {
-            LenResult::Len(l) => l,
-            LenResult::NotFound => {
-                let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
-                let _ = send_all(handle, conn_fd, bytes).await;
-                log.field("status", 404);
-                outcome.status = 404;
-                return Ok(());
-            }
-            LenResult::Other => {
-                let bytes = error_bytes(
-                    S3ErrorCode::InternalError,
-                    &path,
-                    &request_id,
-                    is_head,
-                    None,
-                );
-                let _ = send_all(handle, conn_fd, bytes).await;
-                log.field("status", 500);
-                outcome.status = 500;
-                return Ok(());
-            }
-        };
+    let len = match read_object_length_s3(
+        pool,
+        backend_id,
+        cache_id,
+        &path,
+        stripe_size,
+        page_size,
+        bypass,
+    )
+    .await
+    {
+        LenResult::Len(l) => l,
+        LenResult::NotFound => {
+            let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
+            let _ = send_all(handle, conn_fd, bytes).await;
+            log.field("status", 404);
+            outcome.status = 404;
+            return Ok(());
+        }
+        LenResult::Other => {
+            let bytes = error_bytes(
+                S3ErrorCode::InternalError,
+                &path,
+                &request_id,
+                is_head,
+                None,
+            );
+            let _ = send_all(handle, conn_fd, bytes).await;
+            log.field("status", 500);
+            outcome.status = 500;
+            return Ok(());
+        }
+    };
 
     // 6. Resolve the requested range against the length.
     let resolved = match range {
@@ -489,7 +498,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 stripe_idx: slice.stripe_idx,
             };
             let key = cache_id
-                .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id))
+                .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id, stripe_size))
                 .unwrap_or_else(|| origin_ref.stripe_key());
             StripePlan {
                 req: StripeReq::new(key)
@@ -561,12 +570,13 @@ async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
     backend_id: &str,
     cache_id: Option<&str>,
     path: &str,
+    stripe_size: u64,
     page_size: usize,
     bypass: bool,
 ) -> LenResult {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
     let key = cache_id
-        .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id))
+        .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id, stripe_size))
         .unwrap_or_else(|| origin_ref.stripe_key());
     let req = StripeReq::new(key)
         .with_origin(origin_ref)

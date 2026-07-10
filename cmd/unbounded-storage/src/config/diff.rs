@@ -62,6 +62,9 @@ pub struct ConfigDiff {
     /// `[[backends]]` changed. Broadcast to every shard, which rebuilds
     /// its origin-backend registry in place (no shard restart).
     pub backends_changed: bool,
+    /// An existing backend's stripe geometry changed. This moves the backend
+    /// to a new cache keyspace and is restart-only.
+    pub backend_geometry_changed: bool,
     /// `[[frontends]]` changed. Broadcast to every shard, which binds or
     /// closes the affected listener in place (no shard restart).
     pub frontends_changed: bool,
@@ -83,6 +86,11 @@ impl ConfigDiff {
                 || old.topology_weighting != new.topology_weighting,
             peers_changed: old.peers != new.peers,
             backends_changed: old.backends != new.backends,
+            backend_geometry_changed: new.backends.iter().any(|next| {
+                old.backends.iter().any(|prev| {
+                    prev.name == next.name && prev.stripe_size_bytes() != next.stripe_size_bytes()
+                })
+            }),
             frontends_changed: old.frontends != new.frontends,
         }
     }
@@ -96,6 +104,7 @@ impl ConfigDiff {
             || self.routing_changed
             || self.peers_changed
             || self.backends_changed
+            || self.backend_geometry_changed
             || self.frontends_changed
     }
 
@@ -110,7 +119,7 @@ impl ConfigDiff {
 
     /// Whether the process must restart before the new config can be applied.
     pub fn requires_restart(&self) -> bool {
-        self.identity_changed
+        self.identity_changed || self.backend_geometry_changed
     }
 
     /// Whether fabric peer connections must be reconciled.
@@ -263,6 +272,50 @@ mod tests {
         assert!(d.backends_changed);
         assert!(d.any());
         assert!(!d.requires_routing_reload());
+        assert!(!d.requires_restart());
+    }
+
+    #[test]
+    fn existing_backend_stripe_geometry_change_requires_restart() {
+        let mut a = base();
+        a.backends.push(http_backend("b", 4 * 1024 * 1024, 64));
+        let mut b = a.clone();
+        b.backends[0] = http_backend("b", 8 * 1024 * 1024, 64);
+
+        let d = ConfigDiff::between(&a, &b);
+
+        assert!(d.backends_changed);
+        assert!(d.backend_geometry_changed);
+        assert!(d.requires_restart());
+    }
+
+    #[test]
+    fn existing_backend_non_geometry_change_remains_live() {
+        let mut a = base();
+        a.backends.push(http_backend("b", 4 * 1024 * 1024, 64));
+        let mut b = a.clone();
+        b.backends[0] = http_backend("b", 4 * 1024 * 1024, 128);
+
+        let d = ConfigDiff::between(&a, &b);
+
+        assert!(d.backends_changed);
+        assert!(!d.backend_geometry_changed);
+        assert!(!d.requires_restart());
+    }
+
+    fn http_backend(name: &str, stripe_size_bytes: u64, http_concurrency: u32) -> BackendSpec {
+        BackendSpec {
+            name: name.to_string(),
+            config: Some(backend_spec::Config::Http(HttpBackendConfig {
+                url: "https://example.com".to_string(),
+                stripe_size_bytes: Some(stripe_size_bytes),
+                http_concurrency: Some(http_concurrency),
+                ca_cert_path: None,
+                insecure_skip_verify: false,
+                client_cert_path: None,
+                client_key_path: None,
+            })),
+        }
     }
 
     #[test]

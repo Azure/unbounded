@@ -440,7 +440,17 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     // metadata entry through the pool. The HTTP backend fills it from
     // an origin HEAD on a miss; local-disk and peer hits skip the
     // origin entirely.
-    let len = match read_object_length(pool, backend_id, cache_id, &path, page_size, bypass).await {
+    let len = match read_object_length(
+        pool,
+        backend_id,
+        cache_id,
+        &path,
+        stripe_size,
+        page_size,
+        bypass,
+    )
+    .await
+    {
         LenResult::Len(len) => len,
         LenResult::NotFound => {
             let _ = send_all(handle, conn_fd, status_line_response(404, keep_alive)).await;
@@ -544,6 +554,7 @@ fn stripe_request(
     backend_id: &str,
     cache_id: Option<&str>,
     path: &str,
+    stripe_size: u64,
     slice: StripeSlice,
     bypass: bool,
 ) -> (StripeKey, StripeReq) {
@@ -553,7 +564,7 @@ fn stripe_request(
         stripe_idx: slice.stripe_idx,
     };
     let key = cache_id
-        .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id))
+        .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id, stripe_size))
         .unwrap_or_else(|| origin_ref.stripe_key());
     let req = StripeReq::new(key)
         .with_origin(origin_ref)
@@ -683,10 +694,11 @@ async fn dispatch_ticket(
     backend_id: &str,
     cache_id: Option<&str>,
     path: &str,
+    stripe_size: u64,
     slice: StripeSlice,
     bypass: bool,
 ) -> Ticket {
-    let (key, req) = stripe_request(backend_id, cache_id, path, slice, bypass);
+    let (key, req) = stripe_request(backend_id, cache_id, path, stripe_size, slice, bypass);
     match fanout.owner_of_cache(&key, cache_id, slice.intra_offset) {
         Owner::Local => Ticket::Local { slice },
         Owner::Peer(peer) => {
@@ -733,7 +745,8 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
         let plans: Vec<StripePlan<StripeReq>> = slices
             .into_iter()
             .map(|slice| {
-                let (_key, req) = stripe_request(backend_id, cache_id, path, slice, bypass);
+                let (_key, req) =
+                    stripe_request(backend_id, cache_id, path, stripe_size, slice, bypass);
                 StripePlan {
                     req,
                     intra_offset: slice.intra_offset,
@@ -756,13 +769,22 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
     let mut window: VecDeque<Ticket> = VecDeque::new();
     while next < slices.len() && window.len() < multi_shard_window() {
         window.push_back(
-            dispatch_ticket(fanout, backend_id, cache_id, path, slices[next], bypass).await,
+            dispatch_ticket(
+                fanout,
+                backend_id,
+                cache_id,
+                path,
+                stripe_size,
+                slices[next],
+                bypass,
+            )
+            .await,
         );
         next += 1;
     }
 
     let local_plan = |slice: StripeSlice| {
-        let (_key, req) = stripe_request(backend_id, cache_id, path, slice, bypass);
+        let (_key, req) = stripe_request(backend_id, cache_id, path, stripe_size, slice, bypass);
         StripePlan {
             req,
             intra_offset: slice.intra_offset,
@@ -808,7 +830,16 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
 
         while next < slices.len() && window.len() < multi_shard_window() {
             window.push_back(
-                dispatch_ticket(fanout, backend_id, cache_id, path, slices[next], bypass).await,
+                dispatch_ticket(
+                    fanout,
+                    backend_id,
+                    cache_id,
+                    path,
+                    stripe_size,
+                    slices[next],
+                    bypass,
+                )
+                .await,
             );
             next += 1;
         }
@@ -830,12 +861,13 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
     backend_id: &str,
     cache_id: Option<&str>,
     path: &str,
+    stripe_size: u64,
     page_size: usize,
     bypass: bool,
 ) -> LenResult {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
     let key = cache_id
-        .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id))
+        .map(|cache_id| origin_ref.stripe_key_for_cache(cache_id, stripe_size))
         .unwrap_or_else(|| origin_ref.stripe_key());
     let req = StripeReq::new(key)
         .with_origin(origin_ref)
@@ -1224,11 +1256,11 @@ mod tests {
             intra_len: 4,
         };
         // Non-bypass requests carry the cache path (bypass == false).
-        let (_k, normal) = stripe_request("primary", Some("cache-a"), "/o", slice, false);
+        let (_k, normal) = stripe_request("primary", Some("cache-a"), "/o", 4096, slice, false);
         assert!(!normal.bypass());
         assert_eq!(normal.cache_id(), Some("cache-a"));
         // Bridge-mode frontends stamp bypass == true onto every request.
-        let (k, bridged) = stripe_request("primary", None, "/o", slice, true);
+        let (k, bridged) = stripe_request("primary", None, "/o", 4096, slice, true);
         assert!(bridged.bypass());
         // Cache id is the only logical key prefix, so cached and uncached
         // requests for the same origin intentionally use different keys.
@@ -1252,10 +1284,13 @@ mod tests {
         let origin_ref = OriginRef::metadata_entry("primary", "/o");
         assert!(origin_ref.is_metadata_entry());
 
-        let req =
-            StripeReq::new(origin_ref.stripe_key_for_cache("cache-a")).with_origin(origin_ref);
+        let req = StripeReq::new(origin_ref.stripe_key_for_cache("cache-a", 4096))
+            .with_origin(origin_ref);
         assert!(req.origin().unwrap().is_metadata_entry());
-        assert_eq!(req.key(), stripe_key("cache-a", "/o", METADATA_STRIPE_IDX));
+        assert_eq!(
+            req.key(),
+            stripe_key("cache-a", 4096, "/o", METADATA_STRIPE_IDX)
+        );
         assert_eq!(METADATA_STRIPE_IDX, u64::MAX);
     }
 
@@ -1318,7 +1353,13 @@ mod tests {
         });
 
         let result = block_on(read_object_length(
-            &pool, "primary", None, "/missing", 4096, false,
+            &pool,
+            "primary",
+            None,
+            "/missing",
+            4 * 1024 * 1024,
+            4096,
+            false,
         ));
 
         assert_eq!(result, LenResult::NotFound);
@@ -1331,7 +1372,13 @@ mod tests {
         });
 
         let result = block_on(read_object_length(
-            &pool, "primary", None, "/broken", 4096, false,
+            &pool,
+            "primary",
+            None,
+            "/broken",
+            4 * 1024 * 1024,
+            4096,
+            false,
         ));
 
         assert_eq!(result, LenResult::Other);
