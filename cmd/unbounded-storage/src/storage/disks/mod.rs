@@ -133,15 +133,10 @@ impl<T: DiskTarget> DiskRegistry<T> {
 
     /// Reconcile the open set against `desired`.
     ///
-    /// Paths missing from `desired` are dropped (closing the handle).
-    /// Paths present in `desired` but not currently open are opened.
-    /// Paths whose [`DiskSpec`] drifted in any field that affects how
-    /// the disk is opened (config / queue_depth / page_size_bytes /
-    /// skip_recovery_scan / force_format / bypass_admission /
-    /// bypass_index_read / bypass_checksum) are treated as a remove followed by an add.
-    /// Partial failures during opens are reported after all desired paths
-    /// have been attempted. Callers publish the realized open subset before
-    /// deciding whether the desired configuration converged.
+    /// New disks are staged before the live set is changed. If any open fails,
+    /// all staged handles are closed and the old set remains intact. Changes to
+    /// open-time settings on an existing path require a restart because the old
+    /// handle cannot be safely closed before its replacement is known to open.
     pub fn reconcile(&mut self, desired: &[DiskSpec]) -> DiskReport {
         let mut report = DiskReport::default();
 
@@ -150,20 +145,18 @@ impl<T: DiskTarget> DiskRegistry<T> {
             desired_paths.insert(Path::new(disk_path(spec)), spec);
         }
 
-        let to_remove: Vec<PathBuf> = self
-            .entries
-            .keys()
-            .filter(|p| match desired_paths.get(p.as_path()) {
-                None => true,
-                Some(spec) => specs_drifted(self.entries.get(*p).map(|entry| &entry.spec), spec),
-            })
-            .cloned()
-            .collect();
-        for path in to_remove {
-            if let Some(entry) = self.entries.remove(&path) {
-                entry.close();
-                report.removed += 1;
+        for (path, entry) in &self.entries {
+            if let Some(spec) = desired_paths.get(path.as_path())
+                && specs_drifted(Some(&entry.spec), spec)
+            {
+                report.failures.push((
+                    path.clone(),
+                    "open-time disk settings changed; restart required".to_string(),
+                ));
             }
+        }
+        if !report.failures.is_empty() {
+            return report;
         }
 
         // Compute the slot assignment over the FULL desired set rather
@@ -177,20 +170,21 @@ impl<T: DiskTarget> DiskRegistry<T> {
         let open_placements: HashMap<PathBuf, Option<DiskCpuSlot>> = self
             .entries
             .iter()
+            .filter(|(path, _)| desired_paths.contains_key(path.as_path()))
             .map(|(path, entry)| (path.clone(), entry.placement))
             .collect();
         let assignment = assign_disk_cpus(desired, &self.disk_slots, &open_placements);
 
+        let mut staged = HashMap::new();
         for spec in desired {
             let path = disk_path(spec);
-            if let Some(entry) = self.entries.get_mut(Path::new(path)) {
-                entry.spec = spec.clone();
+            if self.entries.contains_key(Path::new(path)) {
                 continue;
             }
             let pin = assignment.get(Path::new(path)).copied().flatten();
             match self.target.open(spec, pin) {
                 Ok((handle, channel)) => {
-                    self.entries.insert(
+                    staged.insert(
                         PathBuf::from(path),
                         OpenDiskEntry {
                             channel,
@@ -199,13 +193,39 @@ impl<T: DiskTarget> DiskRegistry<T> {
                             handle,
                         },
                     );
-                    report.added += 1;
                 }
                 Err(e) => {
                     report.failures.push((PathBuf::from(path), e.to_string()));
                 }
             }
         }
+
+        if !report.failures.is_empty() {
+            for (_, entry) in staged {
+                entry.close();
+            }
+            return report;
+        }
+
+        let to_remove: Vec<PathBuf> = self
+            .entries
+            .keys()
+            .filter(|path| !desired_paths.contains_key(path.as_path()))
+            .cloned()
+            .collect();
+        for path in to_remove {
+            if let Some(entry) = self.entries.remove(&path) {
+                entry.close();
+                report.removed += 1;
+            }
+        }
+        for spec in desired {
+            if let Some(entry) = self.entries.get_mut(Path::new(disk_path(spec))) {
+                entry.spec = spec.clone();
+            }
+        }
+        report.added = staged.len();
+        self.entries.extend(staged);
 
         report
     }
@@ -509,14 +529,15 @@ mod tests {
     }
 
     #[test]
-    fn queue_depth_drift_triggers_remove_add() {
+    fn queue_depth_drift_requires_restart_and_preserves_old_disk() {
         let (target, _state) = MockDiskTarget::new();
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", Some(8))]);
         let report = reg.reconcile(&[spec("/a", Some(32))]);
-        assert_eq!(report.added, 1);
-        assert_eq!(report.removed, 1);
-        assert_eq!(reg.entries[&PathBuf::from("/a")].spec.queue_depth, Some(32));
+        assert_eq!(report.added, 0);
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(reg.entries[&PathBuf::from("/a")].spec.queue_depth, Some(8));
     }
 
     #[test]
@@ -532,24 +553,16 @@ mod tests {
     }
 
     #[test]
-    fn failure_injection_does_not_block_others() {
+    fn failed_staging_rolls_back_other_new_disks() {
         let (target, state) = MockDiskTarget::new();
         state.lock().unwrap().fail_on.insert(PathBuf::from("/bad"));
         let mut reg = DiskRegistry::new(target, vec![]);
         let report = reg.reconcile(&[spec("/bad", None), spec("/good", None)]);
-        assert_eq!(report.added, 1);
+        assert_eq!(report.added, 0);
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].0, PathBuf::from("/bad"));
-        assert!(
-            state
-                .lock()
-                .unwrap()
-                .opened
-                .contains(&PathBuf::from("/good"))
-        );
-        // Failed open must not pollute the channel map.
-        assert_eq!(reg.channels_snapshot().len(), 1);
-        assert_eq!(reg.channels_snapshot()[0].0, PathBuf::from("/good"));
+        assert!(state.lock().unwrap().opened.is_empty());
+        assert!(reg.channels_snapshot().is_empty());
     }
 
     #[test]
@@ -571,23 +584,18 @@ mod tests {
     }
 
     #[test]
-    fn failed_drift_replacement_remains_retryable() {
+    fn open_time_drift_is_rejected_without_closing_old_disk() {
         let (target, state) = MockDiskTarget::new();
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", Some(8))]);
 
-        state.lock().unwrap().fail_on.insert(PathBuf::from("/a"));
         let desired = [spec("/a", Some(32))];
         let failed = reg.reconcile(&desired);
-        assert_eq!(failed.removed, 1);
+        assert_eq!(failed.removed, 0);
+        assert_eq!(failed.added, 0);
         assert_eq!(failed.failures.len(), 1);
-        assert!(!reg.entries.contains_key(&PathBuf::from("/a")));
-
-        state.lock().unwrap().fail_on.clear();
-        let retried = reg.reconcile(&desired);
-        assert_eq!(retried.added, 1);
-        assert!(retried.failures.is_empty());
-        assert_eq!(reg.entries[&PathBuf::from("/a")].spec.queue_depth, Some(32));
+        assert_eq!(reg.entries[&PathBuf::from("/a")].spec.queue_depth, Some(8));
+        assert!(state.lock().unwrap().opened.contains(&PathBuf::from("/a")));
     }
 
     /// Records the per-disk `(path, cpu_hint)` decisions so tests can
@@ -772,19 +780,17 @@ mod tests {
     }
 
     #[test]
-    fn page_size_drift_triggers_remove_add() {
+    fn page_size_drift_requires_restart() {
         let (target, _state) = MockDiskTarget::new();
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", None)]);
         let mut next = spec("/a", None);
         next.page_size_bytes = Some(4096);
         let report = reg.reconcile(&[next]);
-        assert_eq!(report.added, 1);
-        assert_eq!(report.removed, 1);
-        assert_eq!(
-            reg.entries[&PathBuf::from("/a")].spec.page_size_bytes,
-            Some(4096)
-        );
+        assert_eq!(report.added, 0);
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(reg.entries[&PathBuf::from("/a")].spec.page_size_bytes, None);
     }
 
     /// A file-backed spec that differs only in `size` must be detected
@@ -818,68 +824,63 @@ mod tests {
     }
 
     #[test]
-    fn skip_recovery_scan_drift_triggers_remove_add() {
+    fn skip_recovery_scan_drift_requires_restart() {
         let (target, _state) = MockDiskTarget::new();
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", None)]);
         let mut next = spec("/a", None);
         next.skip_recovery_scan = true;
         let report = reg.reconcile(&[next]);
-        assert_eq!(report.added, 1);
-        assert_eq!(report.removed, 1);
-        assert!(reg.entries[&PathBuf::from("/a")].spec.skip_recovery_scan);
+        assert_eq!(report.failures.len(), 1);
+        assert!(!reg.entries[&PathBuf::from("/a")].spec.skip_recovery_scan);
     }
 
     #[test]
-    fn force_format_drift_triggers_remove_add() {
+    fn force_format_drift_requires_restart() {
         let (target, _state) = MockDiskTarget::new();
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", None)]);
         let mut next = spec("/a", None);
         next.force_format = true;
         let report = reg.reconcile(&[next]);
-        assert_eq!(report.added, 1);
-        assert_eq!(report.removed, 1);
-        assert!(reg.entries[&PathBuf::from("/a")].spec.force_format);
+        assert_eq!(report.failures.len(), 1);
+        assert!(!reg.entries[&PathBuf::from("/a")].spec.force_format);
     }
 
     #[test]
-    fn bypass_admission_drift_triggers_remove_add() {
+    fn bypass_admission_drift_requires_restart() {
         let (target, _state) = MockDiskTarget::new();
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", None)]);
         let mut next = spec("/a", None);
         next.bypass_admission = true;
         let report = reg.reconcile(&[next]);
-        assert_eq!(report.added, 1);
-        assert_eq!(report.removed, 1);
-        assert!(reg.entries[&PathBuf::from("/a")].spec.bypass_admission);
+        assert_eq!(report.failures.len(), 1);
+        assert!(!reg.entries[&PathBuf::from("/a")].spec.bypass_admission);
     }
 
     #[test]
-    fn bypass_index_read_drift_triggers_remove_add() {
+    fn bypass_index_read_drift_requires_restart() {
         let (target, _state) = MockDiskTarget::new();
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", None)]);
         let mut next = spec("/a", None);
         next.bypass_index_read = true;
         let report = reg.reconcile(&[next]);
-        assert_eq!(report.added, 1);
-        assert_eq!(report.removed, 1);
-        assert!(reg.entries[&PathBuf::from("/a")].spec.bypass_index_read);
+        assert_eq!(report.failures.len(), 1);
+        assert!(!reg.entries[&PathBuf::from("/a")].spec.bypass_index_read);
     }
 
     #[test]
-    fn bypass_checksum_drift_triggers_remove_add() {
+    fn bypass_checksum_drift_requires_restart() {
         let (target, _state) = MockDiskTarget::new();
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", None)]);
         let mut next = spec("/a", None);
         next.bypass_checksum = true;
         let report = reg.reconcile(&[next]);
-        assert_eq!(report.added, 1);
-        assert_eq!(report.removed, 1);
-        assert!(reg.entries[&PathBuf::from("/a")].spec.bypass_checksum);
+        assert_eq!(report.failures.len(), 1);
+        assert!(!reg.entries[&PathBuf::from("/a")].spec.bypass_checksum);
     }
 
     #[test]

@@ -512,6 +512,10 @@ fn main() -> ExitCode {
                                     "config: apply gen={} version={} failed: {e}",
                                     update.generation, version
                                 );
+                                mark_fatal_apply_failure(
+                                    &mut exit_code,
+                                    SHUTDOWN.load(Ordering::Acquire),
+                                );
                             }
                         }
                     }
@@ -1182,7 +1186,6 @@ fn reconcile_cache_disks(
 ) -> DiskReport {
     let mut cache_ids: Vec<String> = projection.caches.keys().cloned().collect();
     cache_ids.sort();
-    cache_directories.reconcile(cache_ids.iter().cloned());
 
     let disks = config::runtime_disks(projection);
     let report = disk_registry.reconcile(&disks);
@@ -1196,9 +1199,12 @@ fn reconcile_cache_disks(
         eprintln!("disk {}: open failed: {msg}", path.display());
     }
 
-    let channels = disk_registry.channels_snapshot();
-    for cache_id in cache_ids {
-        cache_directories.apply_channels(&cache_id, channels.clone());
+    if report.failures.is_empty() {
+        cache_directories.reconcile(cache_ids.iter().cloned());
+        let channels = disk_registry.channels_snapshot();
+        for cache_id in cache_ids {
+            cache_directories.apply_channels(&cache_id, channels.clone());
+        }
     }
 
     report
@@ -1956,6 +1962,12 @@ fn shutdown_on_watcher_error(err: mpsc::RecvTimeoutError) -> bool {
     matches!(err, mpsc::RecvTimeoutError::Disconnected)
 }
 
+fn mark_fatal_apply_failure(exit_code: &mut ExitCode, shutdown_requested: bool) {
+    if shutdown_requested {
+        *exit_code = ExitCode::FAILURE;
+    }
+}
+
 /// Install a SIGINT/SIGTERM handler that flips [`SHUTDOWN`]. The
 /// handler is async-signal-safe (only a relaxed atomic store).
 /// All threads observe the flag via their poll loops.
@@ -2557,5 +2569,19 @@ mod tests {
             mpsc::RecvTimeoutError::Disconnected
         ));
         assert!(!shutdown_on_watcher_error(mpsc::RecvTimeoutError::Timeout));
+    }
+
+    #[test]
+    fn fatal_apply_failure_sets_failure_exit_status() {
+        let mut exit_code = ExitCode::SUCCESS;
+        mark_fatal_apply_failure(&mut exit_code, true);
+        assert_eq!(exit_code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn rollback_safe_apply_failure_keeps_success_exit_status() {
+        let mut exit_code = ExitCode::SUCCESS;
+        mark_fatal_apply_failure(&mut exit_code, false);
+        assert_eq!(exit_code, ExitCode::SUCCESS);
     }
 }
