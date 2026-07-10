@@ -30,10 +30,12 @@
 //! blocking fan-out/fan-in primitive used by that implementation lives
 //! here as [`ShardControlGroup`].
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvError, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
 
 use crate::config::{Config, ConfigDiff};
 use crate::p2p::RouteTableSnapshot;
@@ -89,7 +91,19 @@ pub enum ApplyError {
     ShardSend(WorkerIdx),
     /// The ack channel disconnected before every shard reported, so we
     /// cannot prove the apply completed everywhere.
-    AckDisconnected { expected: usize, received: usize },
+    AckDisconnected {
+        expected: usize,
+        received: usize,
+        outstanding: Vec<WorkerIdx>,
+    },
+    /// Not every shard acknowledged before the control deadline. Commands
+    /// already delivered may still complete, so the live process can no
+    /// longer safely retry the apply.
+    AckTimeout {
+        expected: usize,
+        received: usize,
+        outstanding: Vec<WorkerIdx>,
+    },
     /// One or more shards reported a failure while applying.
     ShardApply(Vec<(WorkerIdx, String)>),
     /// The process-level apply target rejected the config before shard
@@ -103,9 +117,23 @@ impl fmt::Display for ApplyError {
             ApplyError::ShardSend(w) => {
                 write!(f, "shard {} control channel closed before apply", w.0)
             }
-            ApplyError::AckDisconnected { expected, received } => write!(
+            ApplyError::AckDisconnected {
+                expected,
+                received,
+                outstanding,
+            } => write!(
                 f,
-                "ack channel disconnected after {received}/{expected} shards reported",
+                "ack channel disconnected after {received}/{expected} shards reported; outstanding workers: {}",
+                format_workers(outstanding),
+            ),
+            ApplyError::AckTimeout {
+                expected,
+                received,
+                outstanding,
+            } => write!(
+                f,
+                "ack deadline expired after {received}/{expected} shards reported; outstanding workers: {}",
+                format_workers(outstanding),
             ),
             ApplyError::ShardApply(failures) => {
                 write!(f, "{} shard(s) failed to apply config:", failures.len())?;
@@ -120,6 +148,18 @@ impl fmt::Display for ApplyError {
 }
 
 impl std::error::Error for ApplyError {}
+
+impl ApplyError {
+    /// Whether some shards may still apply a command after this error is
+    /// returned. The process must stop rather than retry against its old
+    /// controller snapshot.
+    pub fn apply_state_is_indeterminate(&self) -> bool {
+        matches!(
+            self,
+            Self::ShardSend(_) | Self::AckDisconnected { .. } | Self::AckTimeout { .. }
+        )
+    }
+}
 
 /// Which path an apply took. Returned so callers (and tests) can assert
 /// on the work that actually happened.
@@ -345,17 +385,22 @@ impl<T: ConfigApplyTarget> ConfigController<T> {
 ///
 /// [`broadcast_apply`](Self::broadcast_apply) sends one
 /// [`ShardCommand::ApplyConfig`] to every shard and blocks until each
-/// has acknowledged, so the caller can guarantee the change has landed
-/// on every shard thread before returning. This is the concrete
+/// has acknowledged or the group's absolute deadline expires, so the caller
+/// can guarantee the change has landed on every shard thread before returning
+/// success. This is the concrete
 /// "close the loop" mechanism a [`ConfigApplyTarget`] builds its Tier 1
 /// path on.
 pub struct ShardControlGroup {
     senders: Vec<(WorkerIdx, Sender<ShardCommand>)>,
+    ack_timeout: Duration,
 }
 
 impl ShardControlGroup {
-    pub fn new(senders: Vec<(WorkerIdx, Sender<ShardCommand>)>) -> Self {
-        Self { senders }
+    pub fn new(senders: Vec<(WorkerIdx, Sender<ShardCommand>)>, ack_timeout: Duration) -> Self {
+        Self {
+            senders,
+            ack_timeout,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -370,77 +415,40 @@ impl ShardControlGroup {
     /// them acknowledge.
     ///
     /// Returns `Ok(())` only when every shard reports success. If a
-    /// channel is closed at send time, or the ack channel disconnects
-    /// before all shards report, or any shard reports a failure, the
-    /// corresponding [`ApplyError`] is returned. The fan-in always
-    /// drains every ack that does arrive so a single failing shard does
-    /// not mask the others.
+    /// channel is closed at send time, the ack deadline expires, the ack
+    /// channel disconnects before all shards report, or any shard reports a
+    /// failure, the corresponding [`ApplyError`] is returned. Until a terminal
+    /// channel/deadline error, fan-in keeps collecting reports so one failing
+    /// shard does not mask failures from the others.
     pub fn broadcast_apply(
         &self,
         config: Arc<Config>,
         routes: RouteTableSnapshot,
         diff: ConfigDiff,
     ) -> Result<(), ApplyError> {
-        let expected = self.senders.len();
-        if expected == 0 {
-            return Ok(());
-        }
-
-        let (ack_tx, ack_rx) = mpsc::channel::<ShardAck>();
-
-        for (worker, sender) in &self.senders {
-            let cmd = ShardCommand::ApplyConfig(ShardApply {
+        self.broadcast(|ack| {
+            ShardCommand::ApplyConfig(ShardApply {
                 config: config.clone(),
                 routes: routes.clone(),
                 diff,
-                ack: ack_tx.clone(),
-            });
-            sender
-                .send(cmd)
-                .map_err(|_| ApplyError::ShardSend(*worker))?;
-        }
-        // Drop our own handle so the channel closes once every shard's
-        // cloned sender is dropped; that is how the fan-in loop below
-        // detects "no more acks coming".
-        drop(ack_tx);
-
-        let mut received = 0usize;
-        let mut failures = Vec::new();
-        loop {
-            match ack_rx.recv() {
-                Ok(ack) => {
-                    received += 1;
-                    if let Err(e) = ack.result {
-                        failures.push((ack.worker, e));
-                    }
-                    if received == expected {
-                        break;
-                    }
-                }
-                Err(RecvError) => {
-                    return Err(ApplyError::AckDisconnected { expected, received });
-                }
-            }
-        }
-
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(ApplyError::ShardApply(failures))
-        }
+                ack,
+            })
+        })
     }
 
     /// Ask every shard to drain retained RAM page-cache entries and block
     /// until all have acknowledged.
     pub fn broadcast_drain_page_cache(&self) -> Result<(), ApplyError> {
-        self.broadcast_drain(|ack| ShardCommand::DrainPageCache(ShardDrainPageCache { ack }))
+        self.broadcast(|ack| ShardCommand::DrainPageCache(ShardDrainPageCache { ack }))
     }
 
-    fn broadcast_drain<F>(&self, make_cmd: F) -> Result<(), ApplyError>
+    fn broadcast<F>(&self, make_cmd: F) -> Result<(), ApplyError>
     where
         F: Fn(Sender<ShardAck>) -> ShardCommand,
     {
-        let expected = self.senders.len();
+        let mut outstanding: HashSet<WorkerIdx> =
+            self.senders.iter().map(|(worker, _)| *worker).collect();
+        let expected = outstanding.len();
         if expected == 0 {
             return Ok(());
         }
@@ -453,21 +461,39 @@ impl ShardControlGroup {
         }
         drop(ack_tx);
 
+        let deadline = Instant::now() + self.ack_timeout;
         let mut received = 0usize;
         let mut failures = Vec::new();
-        loop {
-            match ack_rx.recv() {
+        while !outstanding.is_empty() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(ApplyError::AckTimeout {
+                    expected,
+                    received,
+                    outstanding: sorted_workers(&outstanding),
+                });
+            };
+            match ack_rx.recv_timeout(remaining) {
                 Ok(ack) => {
-                    received += 1;
-                    if let Err(e) = ack.result {
-                        failures.push((ack.worker, e));
-                    }
-                    if received == expected {
-                        break;
+                    if outstanding.remove(&ack.worker) {
+                        received += 1;
+                        if let Err(e) = ack.result {
+                            failures.push((ack.worker, e));
+                        }
                     }
                 }
-                Err(RecvError) => {
-                    return Err(ApplyError::AckDisconnected { expected, received });
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(ApplyError::AckTimeout {
+                        expected,
+                        received,
+                        outstanding: sorted_workers(&outstanding),
+                    });
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(ApplyError::AckDisconnected {
+                        expected,
+                        received,
+                        outstanding: sorted_workers(&outstanding),
+                    });
                 }
             }
         }
@@ -480,17 +506,43 @@ impl ShardControlGroup {
     }
 }
 
+fn sorted_workers(workers: &HashSet<WorkerIdx>) -> Vec<WorkerIdx> {
+    let mut workers: Vec<_> = workers.iter().copied().collect();
+    workers.sort_by_key(|worker| worker.0);
+    workers
+}
+
+fn format_workers(workers: &[WorkerIdx]) -> String {
+    workers
+        .iter()
+        .map(|worker| worker.0.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     use super::*;
     use crate::p2p::RouteTableSnapshot;
 
     fn empty_routes() -> RouteTableSnapshot {
         RouteTableSnapshot::default()
+    }
+
+    fn control_group(senders: Vec<(WorkerIdx, Sender<ShardCommand>)>) -> ShardControlGroup {
+        ShardControlGroup::new(senders, Duration::from_secs(1))
+    }
+
+    fn ack_sender(cmd: ShardCommand) -> Sender<ShardAck> {
+        match cmd {
+            ShardCommand::ApplyConfig(apply) => apply.ack,
+            ShardCommand::DrainPageCache(drain) => drain.ack,
+        }
     }
 
     /// Spawn `n` mock shard threads that drain a control channel and ack
@@ -537,7 +589,7 @@ mod tests {
     #[test]
     fn broadcast_apply_blocks_until_every_shard_acks() {
         let (senders, joins) = spawn_mock_shards(vec![Ok(()), Ok(()), Ok(())]);
-        let group = ShardControlGroup::new(senders);
+        let group = control_group(senders);
 
         let out = group.broadcast_apply(
             Arc::new(Config::default()),
@@ -557,7 +609,7 @@ mod tests {
     #[test]
     fn broadcast_apply_reports_shard_failures() {
         let (senders, joins) = spawn_mock_shards(vec![Ok(()), Err("boom".to_string()), Ok(())]);
-        let group = ShardControlGroup::new(senders);
+        let group = control_group(senders);
 
         let err = group
             .broadcast_apply(
@@ -583,7 +635,7 @@ mod tests {
 
     #[test]
     fn broadcast_apply_on_empty_group_is_a_noop() {
-        let group = ShardControlGroup::new(Vec::new());
+        let group = control_group(Vec::new());
         assert!(group.is_empty());
         assert!(
             group
@@ -603,7 +655,7 @@ mod tests {
         let (dead_tx, dead_rx) = mpsc::channel::<ShardCommand>();
         drop(dead_rx);
         senders.push((WorkerIdx(99), dead_tx));
-        let group = ShardControlGroup::new(senders);
+        let group = control_group(senders);
 
         let err = group
             .broadcast_apply(
@@ -613,11 +665,127 @@ mod tests {
             )
             .expect_err("closed channel must error");
         assert!(matches!(err, ApplyError::ShardSend(WorkerIdx(99))));
+        assert!(err.apply_state_is_indeterminate());
 
         drop(group);
         for j in joins {
             j.join().unwrap();
         }
+    }
+
+    #[test]
+    fn reported_shard_failure_is_not_indeterminate() {
+        assert!(
+            !ApplyError::ShardApply(vec![(WorkerIdx(1), "failed".to_string())])
+                .apply_state_is_indeterminate()
+        );
+        assert!(!ApplyError::Target("rejected".to_string()).apply_state_is_indeterminate());
+    }
+
+    #[test]
+    fn broadcast_apply_timeout_lists_outstanding_workers() {
+        let (tx0, rx0) = mpsc::channel::<ShardCommand>();
+        let (tx1, rx1) = mpsc::channel::<ShardCommand>();
+        let join0 = thread::spawn(move || {
+            let ack = ack_sender(rx0.recv().unwrap());
+            ack.send(ShardAck {
+                worker: WorkerIdx(0),
+                result: Ok(()),
+            })
+            .unwrap();
+        });
+        let join1 = thread::spawn(move || {
+            let ack = ack_sender(rx1.recv().unwrap());
+            thread::sleep(Duration::from_millis(100));
+            let _ = ack.send(ShardAck {
+                worker: WorkerIdx(1),
+                result: Ok(()),
+            });
+        });
+        let group = ShardControlGroup::new(
+            vec![(WorkerIdx(0), tx0), (WorkerIdx(1), tx1)],
+            Duration::from_millis(20),
+        );
+
+        let error = group
+            .broadcast_apply(
+                Arc::new(Config::default()),
+                empty_routes(),
+                ConfigDiff::default(),
+            )
+            .expect_err("missing acknowledgement must time out");
+        assert!(matches!(
+            error,
+            ApplyError::AckTimeout {
+                expected: 2,
+                received: 1,
+                outstanding,
+            } if outstanding == vec![WorkerIdx(1)]
+        ));
+
+        join0.join().unwrap();
+        join1.join().unwrap();
+    }
+
+    #[test]
+    fn duplicate_ack_does_not_hide_outstanding_worker() {
+        let (tx0, rx0) = mpsc::channel::<ShardCommand>();
+        let (tx1, rx1) = mpsc::channel::<ShardCommand>();
+        let join0 = thread::spawn(move || {
+            let ack = ack_sender(rx0.recv().unwrap());
+            for _ in 0..2 {
+                ack.send(ShardAck {
+                    worker: WorkerIdx(0),
+                    result: Ok(()),
+                })
+                .unwrap();
+            }
+        });
+        let join1 = thread::spawn(move || {
+            let ack = ack_sender(rx1.recv().unwrap());
+            thread::sleep(Duration::from_millis(100));
+            drop(ack);
+        });
+        let group = ShardControlGroup::new(
+            vec![(WorkerIdx(0), tx0), (WorkerIdx(1), tx1)],
+            Duration::from_millis(20),
+        );
+
+        let error = group
+            .broadcast_drain_page_cache()
+            .expect_err("duplicate acknowledgement must not complete fan-in");
+        assert!(matches!(
+            error,
+            ApplyError::AckTimeout {
+                expected: 2,
+                received: 1,
+                outstanding,
+            } if outstanding == vec![WorkerIdx(1)]
+        ));
+
+        join0.join().unwrap();
+        join1.join().unwrap();
+    }
+
+    #[test]
+    fn disconnected_ack_channel_lists_outstanding_workers() {
+        let (tx, rx) = mpsc::channel::<ShardCommand>();
+        let join = thread::spawn(move || drop(ack_sender(rx.recv().unwrap())));
+        let group = control_group(vec![(WorkerIdx(7), tx)]);
+
+        let error = group
+            .broadcast_drain_page_cache()
+            .expect_err("dropped acknowledgement sender must disconnect fan-in");
+        assert!(matches!(
+            error,
+            ApplyError::AckDisconnected {
+                expected: 1,
+                received: 0,
+                outstanding,
+            } if outstanding == vec![WorkerIdx(7)]
+        ));
+
+        join.join().unwrap();
     }
 
     // ---- ConfigController classification ----

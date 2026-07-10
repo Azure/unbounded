@@ -578,7 +578,11 @@ registries are all updated without tearing the shard layer down. Backing
 memory, the topology plan, the fabric max in-flight knob, and the local
 `self` peer identity are fixed at startup (mostly sourced from the
 config `[startup]` section, see the CLI section), not reloadable config
-fields.
+fields. Shard apply and page-cache-drain fan-in use one 60-second deadline
+for the complete worker set and report outstanding worker identities. A
+timeout, acknowledgement-channel disconnect, or partial broadcast send failure
+requests process shutdown: already-delivered commands may complete later, so
+retrying against the old controller snapshot would be unsafe.
 
 Sections (all optional, each falling back to defaults):
 

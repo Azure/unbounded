@@ -29,6 +29,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use unbounded_storage::config::{
     self, ApplyError, Config, ConfigApplyTarget, ConfigDiff, ShardControlGroup,
@@ -43,6 +44,8 @@ use unbounded_storage::topology::ServingShard;
 
 use crate::StartupSettings;
 use crate::fabric_group::{FabricGroup, FabricPlan, FabricUnitAddress, RpcShardPublish};
+
+const SHARD_CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Inputs that are constant across the life of the process and used to
 /// spawn the shard layer. Cloned cheaply into every shard thread.
@@ -344,7 +347,7 @@ pub fn prepare_shard_layer(
         retire_failed_activation(
             joins,
             fabric_group,
-            ShardControlGroup::new(control_senders),
+            ShardControlGroup::new(control_senders, SHARD_CONTROL_TIMEOUT),
             layer_stop,
             backing_keepalives,
             serve_start_txs,
@@ -355,7 +358,7 @@ pub fn prepare_shard_layer(
     Ok(PreparedShardLayer {
         joins,
         fabric_group,
-        control: ShardControlGroup::new(control_senders),
+        control: ShardControlGroup::new(control_senders, SHARD_CONTROL_TIMEOUT),
         layer_stop,
         backing_keepalives,
         rpc_shards,
@@ -584,7 +587,12 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             // each has acked, so the routing surface and per-shard
             // backend/frontend reconcile each shard performs on receipt
             // have provably landed.
-            layer.control.broadcast_apply(new.clone(), routes, *diff)?;
+            if let Err(error) = layer.control.broadcast_apply(new.clone(), routes, *diff) {
+                if error.apply_state_is_indeterminate() {
+                    crate::SHUTDOWN.store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
         }
 
         if diff.disks_changed {
@@ -592,7 +600,12 @@ impl ConfigApplyTarget for ProcessApplyTarget {
                 .layer
                 .as_mut()
                 .expect("shard layer present between applies");
-            layer.control.broadcast_drain_page_cache()?;
+            if let Err(error) = layer.control.broadcast_drain_page_cache() {
+                if error.apply_state_is_indeterminate() {
+                    crate::SHUTDOWN.store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
         }
 
         // Disk/channel changes mutate live registries and directories, so
