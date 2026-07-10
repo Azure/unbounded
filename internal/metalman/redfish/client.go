@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -101,7 +103,25 @@ type BootConfig struct {
 	HasHTTPBootURI bool
 }
 
+// StaticIPv4Config holds static host NIC settings for Redfish EthernetInterface.
+type StaticIPv4Config struct {
+	MAC        string
+	Address    string
+	SubnetMask string
+	Gateway    string
+	DNS        []string
+}
+
 const biosHTTPBootURIAttribute = "UrlBootFile"
+
+const (
+	biosDHCPv4Attribute         = "Dhcpv4"
+	biosDHCPv4DisabledValue     = "Disabled"
+	biosIPv4AddressAttribute    = "Ipv4Address"
+	biosIPv4SubnetMaskAttribute = "Ipv4SubnetMask"
+	biosIPv4GatewayAttribute    = "Ipv4Gateway"
+	biosIPv4PrimaryDNSAttribute = "Ipv4PrimaryDNS"
+)
 
 // Client provides Redfish operations against a single BMC.
 // Created via Pool.Get or Dial. Must be closed when no longer needed.
@@ -338,6 +358,101 @@ func (c *Client) SetBIOSHTTPBootURI(ctx context.Context, bootURL string) error {
 	return nil
 }
 
+// SetBIOSStaticIPv4 sets pending BIOS UEFI HTTP boot IPv4 settings.
+// Returns ErrUnsupported if the BMC does not support BIOS settings.
+func (c *Client) SetBIOSStaticIPv4(ctx context.Context, config StaticIPv4Config) error {
+	if err := ValidateStaticIPv4Config(config); err != nil {
+		return err
+	}
+
+	path := fmt.Sprintf("/redfish/v1/Systems/%s/Bios/Settings", c.deviceID)
+
+	attributes := map[string]string{
+		biosDHCPv4Attribute:         biosDHCPv4DisabledValue,
+		biosIPv4AddressAttribute:    config.Address,
+		biosIPv4SubnetMaskAttribute: config.SubnetMask,
+		biosIPv4GatewayAttribute:    config.Gateway,
+	}
+	for _, dns := range config.DNS {
+		if net.ParseIP(dns).To4() != nil {
+			attributes[biosIPv4PrimaryDNSAttribute] = dns
+
+			break
+		}
+	}
+
+	body := map[string]any{
+		"Attributes": attributes,
+	}
+
+	data, status, err := c.session.do(ctx, http.MethodPatch, path, body)
+	if err != nil {
+		return err
+	}
+
+	if isUnsupportedStatus(status) {
+		return redfishResponseError(http.MethodPatch, path, status, data, ErrUnsupported)
+	}
+
+	if !isSuccessStatus(status) {
+		return redfishResponseError(http.MethodPatch, path, status, data, nil)
+	}
+
+	return nil
+}
+
+// SetStaticIPv4 configures a host EthernetInterface with static IPv4 settings.
+// The interface is selected by MACAddress or PermanentMACAddress.
+// Returns ErrUnsupported if the BMC does not expose writable EthernetInterface resources.
+func (c *Client) SetStaticIPv4(ctx context.Context, config StaticIPv4Config) error {
+	mac, err := normalizeMAC(config.MAC)
+	if err != nil {
+		return err
+	}
+
+	if err := ValidateStaticIPv4Config(config); err != nil {
+		return err
+	}
+
+	path, err := c.findEthernetInterfacePath(ctx, mac)
+	if err != nil {
+		return err
+	}
+
+	address := map[string]string{
+		"Address":    config.Address,
+		"SubnetMask": config.SubnetMask,
+	}
+	if config.Gateway != "" {
+		address["Gateway"] = config.Gateway
+	}
+
+	body := map[string]any{
+		"DHCPv4": map[string]bool{
+			"DHCPEnabled": false,
+		},
+		"IPv4StaticAddresses": []map[string]string{address},
+	}
+	if len(config.DNS) > 0 {
+		body["StaticNameServers"] = config.DNS
+	}
+
+	data, status, err := c.session.do(ctx, http.MethodPatch, path, body)
+	if err != nil {
+		return err
+	}
+
+	if isUnsupportedStatus(status) {
+		return redfishResponseError(http.MethodPatch, path, status, data, ErrUnsupported)
+	}
+
+	if !isSuccessStatus(status) {
+		return redfishResponseError(http.MethodPatch, path, status, data, nil)
+	}
+
+	return nil
+}
+
 // DisableBootOverride disables the boot source override.
 // Returns ErrUnsupported if the BMC does not support disabling.
 func (c *Client) DisableBootOverride(ctx context.Context) error {
@@ -363,6 +478,182 @@ func (c *Client) DisableBootOverride(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (c *Client) findEthernetInterfacePath(ctx context.Context, mac string) (string, error) {
+	systemPath := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
+
+	data, status, err := c.session.do(ctx, http.MethodGet, systemPath, nil)
+	if err != nil {
+		return "", err
+	}
+
+	if status != http.StatusOK {
+		return "", redfishResponseError(http.MethodGet, systemPath, status, data, nil)
+	}
+
+	var system struct {
+		EthernetInterfaces struct {
+			ODataID string `json:"@odata.id"`
+		} `json:"EthernetInterfaces"`
+	}
+	if err := json.Unmarshal(data, &system); err != nil {
+		return "", fmt.Errorf("parsing system EthernetInterfaces link: %w", err)
+	}
+
+	collectionPath, err := redfishPathFromODataID(system.EthernetInterfaces.ODataID, systemPath)
+	if err != nil {
+		return "", fmt.Errorf("system EthernetInterfaces link missing: %w", ErrUnsupported)
+	}
+
+	data, status, err = c.session.do(ctx, http.MethodGet, collectionPath, nil)
+	if err != nil {
+		return "", err
+	}
+
+	if isUnsupportedStatus(status) {
+		return "", redfishResponseError(http.MethodGet, collectionPath, status, data, ErrUnsupported)
+	}
+
+	if status != http.StatusOK {
+		return "", redfishResponseError(http.MethodGet, collectionPath, status, data, nil)
+	}
+
+	var collection struct {
+		Members []struct {
+			ODataID string `json:"@odata.id"`
+		} `json:"Members"`
+	}
+	if err := json.Unmarshal(data, &collection); err != nil {
+		return "", fmt.Errorf("parsing EthernetInterfaces collection: %w", err)
+	}
+
+	for _, member := range collection.Members {
+		interfacePath, err := redfishPathFromODataID(member.ODataID, collectionPath)
+		if err != nil {
+			return "", fmt.Errorf("parsing EthernetInterface member link: %w", err)
+		}
+
+		data, status, err = c.session.do(ctx, http.MethodGet, interfacePath, nil)
+		if err != nil {
+			return "", err
+		}
+
+		if status != http.StatusOK {
+			return "", redfishResponseError(http.MethodGet, interfacePath, status, data, nil)
+		}
+
+		var ethernetInterface struct {
+			MACAddress          string `json:"MACAddress"`
+			PermanentMACAddress string `json:"PermanentMACAddress"`
+		}
+		if err := json.Unmarshal(data, &ethernetInterface); err != nil {
+			return "", fmt.Errorf("parsing EthernetInterface %s: %w", interfacePath, err)
+		}
+
+		if macMatches(mac, ethernetInterface.MACAddress) || macMatches(mac, ethernetInterface.PermanentMACAddress) {
+			return interfacePath, nil
+		}
+	}
+
+	return "", fmt.Errorf("no Redfish Ethernet interface found for MAC %s", mac)
+}
+
+// ValidateStaticIPv4Config validates the IP fields in a static network configuration.
+func ValidateStaticIPv4Config(config StaticIPv4Config) error {
+	if err := validateIPv4Field("address", config.Address, true); err != nil {
+		return err
+	}
+
+	if err := validateIPv4Field("subnet mask", config.SubnetMask, true); err != nil {
+		return err
+	}
+
+	if err := validateIPv4Field("gateway", config.Gateway, false); err != nil {
+		return err
+	}
+
+	for _, dns := range config.DNS {
+		if err := validateIPField("DNS server", dns); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateIPv4Field(name, value string, required bool) error {
+	if value == "" && !required {
+		return nil
+	}
+
+	if ip := net.ParseIP(value); ip == nil || ip.To4() == nil {
+		return fmt.Errorf("invalid static IPv4 %s %q", name, value)
+	}
+
+	return nil
+}
+
+func validateIPField(name, value string) error {
+	if ip := net.ParseIP(value); ip == nil {
+		return fmt.Errorf("invalid IP %s %q", name, value)
+	}
+
+	return nil
+}
+
+func macMatches(target, candidate string) bool {
+	candidate, err := normalizeMAC(candidate)
+	if err != nil {
+		return false
+	}
+
+	return candidate == target
+}
+
+func normalizeMAC(value string) (string, error) {
+	mac, err := net.ParseMAC(value)
+	if err != nil {
+		return "", fmt.Errorf("invalid MAC address %q: %w", value, err)
+	}
+
+	return mac.String(), nil
+}
+
+func redfishPathFromODataID(id, basePath string) (string, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", fmt.Errorf("empty @odata.id")
+	}
+
+	u, err := url.Parse(id)
+	if err != nil {
+		return "", err
+	}
+
+	if !u.IsAbs() && !strings.HasPrefix(id, "/") {
+		base, err := url.Parse(basePath)
+		if err != nil {
+			return "", err
+		}
+
+		u = base.ResolveReference(u)
+	}
+
+	path := u.EscapedPath()
+	if path == "" {
+		return "", fmt.Errorf("empty @odata.id path")
+	}
+
+	if u.RawQuery != "" {
+		path += "?" + u.RawQuery
+	}
+
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	return path, nil
 }
 
 // CaptureFingerprint connects to a BMC without cert pinning and returns

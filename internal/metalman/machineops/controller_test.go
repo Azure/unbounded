@@ -5,7 +5,9 @@ package machineops
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -307,6 +309,12 @@ func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) 
 
 	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
 	require.NoError(t, err)
+
+	var poweringOff v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &poweringOff))
+	require.Equal(t, v1alpha3.OperationStageWaitingOff, poweringOff.Status.Targets[0].Stage)
+	require.Equal(t, []string{"machine-1:ForceOff"}, power.calls)
+
 	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
 	require.NoError(t, err)
 
@@ -316,7 +324,7 @@ func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) 
 	require.Len(t, inProgress.Status.Targets, 1)
 	require.Equal(t, v1alpha3.OperationStageWaitingRepave, inProgress.Status.Targets[0].Stage)
 	require.Equal(t, int32(1), inProgress.Status.Targets[0].Attempts)
-	require.Equal(t, []string{"machine-1:SetBootOverride:Pxe:Continuous", "machine-1:ForceRestart"}, power.calls)
+	require.Equal(t, []string{"machine-1:ForceOff", "machine-1:SetBootOverride:Pxe:Continuous", "machine-1:On"}, power.calls)
 
 	bootLoaderCond := apimeta.FindStatusCondition(inProgress.Status.Conditions, v1alpha3.MachineOperationConditionBootLoaderDownloaded)
 	require.NotNil(t, bootLoaderCond)
@@ -371,12 +379,73 @@ func TestReconcilerPowersOnHostReplaceTargetWhenOff(t *testing.T) {
 	require.Equal(t, []string{"machine-1:SetBootOverride:Pxe:Continuous", "machine-1:On"}, power.calls)
 }
 
+func TestReconcilerRetriesHostReplacePowerOffAfterTimeout(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	op := testOperation("op-replace-poweroff-failed", v1alpha3.OperationHostReplace)
+	op.Spec.MachineRef = machine.Name
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef:    machine.Name,
+		Phase:         v1alpha3.OperationPhaseInProgress,
+		Stage:         v1alpha3.OperationStageWaitingOff,
+		LastAttemptAt: ptrTo(metav1.NewTime(fixedNow().Add(-2 * time.Minute))),
+		StartedAt:     ptrTo(fixedNow()),
+	}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
+	power := &recordingPowerClient{states: map[string]redfish.PowerState{machine.Name: redfish.PowerOn}}
+	reconciler := testReconciler(c, power, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[0].Phase)
+	require.Equal(t, v1alpha3.OperationStageWaitingOff, updated.Status.Targets[0].Stage)
+	require.Zero(t, updated.Status.Targets[0].Attempts)
+	require.Equal(t, "sent ForceOff before configuring repave boot", updated.Status.Targets[0].Message)
+	require.Equal(t, []string{"machine-1:ForceOff"}, power.calls)
+}
+
+func TestReconcilerReturnsHostReplacePowerOnFailure(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	op := testOperation("op-replace-poweron-failed", v1alpha3.OperationHostReplace)
+	op.Spec.MachineRef = machine.Name
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
+	power := &recordingPowerClient{
+		states:      map[string]redfish.PowerState{machine.Name: redfish.PowerOff},
+		resetErrors: map[redfish.ResetType]error{redfish.ResetOn: errors.New("power on failed")},
+	}
+	reconciler := testReconciler(c, power, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.ErrorContains(t, err, "power on failed")
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+	require.Equal(t, v1alpha3.OperationPhasePending, updated.Status.Targets[0].Phase)
+	require.Equal(t, int32(0), updated.Status.Targets[0].Attempts)
+	require.Equal(t, "target snapshotted", updated.Status.Targets[0].Message)
+	require.Equal(t, []string{"machine-1:SetBootOverride:Pxe:Continuous", "machine-1:On"}, power.calls)
+}
+
 func TestReconcilerFallsBackToBIOSHTTPBootURIForHostReplace(t *testing.T) {
 	t.Parallel()
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
 	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
 
@@ -400,11 +469,14 @@ func TestReconcilerFallsBackToBIOSHTTPBootURIForHostReplace(t *testing.T) {
 	require.Len(t, inProgress.Status.Targets, 1)
 	require.Equal(t, v1alpha3.OperationStageWaitingRepave, inProgress.Status.Targets[0].Stage)
 	require.Equal(t, []string{
+		"machine-1:ForceOff",
 		"machine-1:GetBootConfig",
+		"machine-1:SetStaticIPv4:aa:bb:cc:dd:ee:01:10.0.0.20:255.255.255.0:10.0.0.1:10.0.0.53",
 		"machine-1:SetHTTPBootOverride:http://10.0.0.10:8880/http/shimx64.efi",
+		"machine-1:SetBIOSStaticIPv4:10.0.0.20:255.255.255.0:10.0.0.1",
 		"machine-1:SetBIOSHTTPBootURI:http://10.0.0.10:8880/http/shimx64.efi",
 		"machine-1:SetBootOverride:UefiHttp:Once",
-		"machine-1:ForceRestart",
+		"machine-1:On",
 	}, power.calls)
 }
 
@@ -414,6 +486,7 @@ func TestReconcilerUsesBIOSHTTPBootURIWhenStandardURIAbsent(t *testing.T) {
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
 	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http-bios", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
 
@@ -430,6 +503,8 @@ func TestReconcilerUsesBIOSHTTPBootURIWhenStandardURIAbsent(t *testing.T) {
 	require.NoError(t, err)
 	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
 	require.NoError(t, err)
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
 
 	var inProgress v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &inProgress))
@@ -437,11 +512,124 @@ func TestReconcilerUsesBIOSHTTPBootURIWhenStandardURIAbsent(t *testing.T) {
 	require.Len(t, inProgress.Status.Targets, 1)
 	require.Equal(t, v1alpha3.OperationStageWaitingRepave, inProgress.Status.Targets[0].Stage)
 	require.Equal(t, []string{
+		"machine-1:ForceOff",
 		"machine-1:GetBootConfig",
+		"machine-1:SetBIOSStaticIPv4:10.0.0.20:255.255.255.0:10.0.0.1",
 		"machine-1:SetBIOSHTTPBootURI:http://10.0.0.10:8880/http/shimx64.efi",
 		"machine-1:SetBootOverride:UefiHttp:Once",
-		"machine-1:ForceRestart",
+		"machine-1:On",
 	}, power.calls)
+}
+
+func TestReconcilerFallsBackToBIOSWhenStaticInterfaceIsReadOnly(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
+	op := testOperation("op-replace-http-read-only-nic", v1alpha3.OperationHostReplace)
+	op.Spec.MachineRef = machine.Name
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
+	power := &recordingPowerClient{staticIPv4Unsupported: map[string]bool{machine.Name: true}}
+	reconciler := testReconciler(c, power, "rack-a")
+	reconciler.HTTPBootURL = func(m *v1alpha3.Machine) (string, error) {
+		require.Equal(t, machine.Name, m.Name)
+
+		return "http://10.0.0.10:8880/http/shimx64.efi", nil
+	}
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var inProgress v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &inProgress))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, inProgress.Status.Phase)
+	require.Equal(t, v1alpha3.OperationStageWaitingRepave, inProgress.Status.Targets[0].Stage)
+	require.Equal(t, []string{
+		"machine-1:ForceOff",
+		"machine-1:GetBootConfig",
+		"machine-1:SetStaticIPv4:aa:bb:cc:dd:ee:01:10.0.0.20:255.255.255.0:10.0.0.1:10.0.0.53",
+		"machine-1:SetBIOSStaticIPv4:10.0.0.20:255.255.255.0:10.0.0.1",
+		"machine-1:SetBIOSHTTPBootURI:http://10.0.0.10:8880/http/shimx64.efi",
+		"machine-1:SetBootOverride:UefiHttp:Once",
+		"machine-1:On",
+	}, power.calls)
+}
+
+func TestSetHTTPBootOverrideRefreshesStandardAndBIOSURLs(t *testing.T) {
+	t.Parallel()
+
+	power := &recordingPowerClient{}
+	client := &recordingMachinePowerClient{parent: power, machine: "machine-1"}
+	staticConfig := redfish.StaticIPv4Config{
+		MAC:        "aa:bb:cc:dd:ee:01",
+		Address:    "10.0.0.20",
+		SubnetMask: "255.255.255.0",
+		Gateway:    "10.0.0.1",
+		DNS:        []string{"10.0.0.53"},
+	}
+
+	require.NoError(t, setHTTPBootOverride(t.Context(), client, "http://10.0.0.10:8880/http/shimx64.efi", staticConfig))
+	require.Equal(t, []string{
+		"machine-1:GetBootConfig",
+		"machine-1:SetStaticIPv4:aa:bb:cc:dd:ee:01:10.0.0.20:255.255.255.0:10.0.0.1:10.0.0.53",
+		"machine-1:SetHTTPBootOverride:http://10.0.0.10:8880/http/shimx64.efi",
+		"machine-1:SetBIOSStaticIPv4:10.0.0.20:255.255.255.0:10.0.0.1",
+		"machine-1:SetBIOSHTTPBootURI:http://10.0.0.10:8880/http/shimx64.efi",
+	}, power.calls)
+}
+
+func TestSetHTTPBootOverrideAllowsUnsupportedBIOSURL(t *testing.T) {
+	t.Parallel()
+
+	power := &recordingPowerClient{biosHTTPBootUnsupported: map[string]bool{"machine-1": true}}
+	client := &recordingMachinePowerClient{parent: power, machine: "machine-1"}
+
+	require.NoError(t, setHTTPBootOverride(t.Context(), client, "http://10.0.0.10:8880/http/shimx64.efi", redfish.StaticIPv4Config{}))
+	require.Equal(t, []string{
+		"machine-1:GetBootConfig",
+		"machine-1:SetStaticIPv4:::::",
+		"machine-1:SetHTTPBootOverride:http://10.0.0.10:8880/http/shimx64.efi",
+		"machine-1:SetBIOSStaticIPv4:::",
+		"machine-1:SetBIOSHTTPBootURI:http://10.0.0.10:8880/http/shimx64.efi",
+	}, power.calls)
+}
+
+func TestReconcilerRetriesHTTPHostReplaceWithoutStaticLease(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	op := testOperation("op-replace-http-no-lease", v1alpha3.OperationHostReplace)
+	op.Spec.MachineRef = machine.Name
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
+	power := &recordingPowerClient{}
+	reconciler := testReconciler(c, power, "rack-a")
+	reconciler.HTTPBootURL = func(m *v1alpha3.Machine) (string, error) {
+		require.Equal(t, machine.Name, m.Name)
+
+		return "http://10.0.0.10:8880/http/shimx64.efi", nil
+	}
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[0].Phase)
+	require.Equal(t, "HTTP boot requires at least one static lease in spec.pxe.dhcpLeases", updated.Status.Targets[0].Message)
+	require.Empty(t, power.calls)
 }
 
 func TestReconcilerRestoresMissingHostReplaceTriggerConditions(t *testing.T) {
@@ -893,12 +1081,15 @@ func testReconciler(c client.Client, power PowerClientFactory, site string) *Rec
 }
 
 type recordingPowerClient struct {
-	mu                     sync.Mutex
-	states                 map[string]redfish.PowerState
-	disableBootUnsupported map[string]bool
-	httpBootUnsupported    map[string]bool
-	httpBootURIAbsent      map[string]bool
-	calls                  []string
+	mu                      sync.Mutex
+	states                  map[string]redfish.PowerState
+	disableBootUnsupported  map[string]bool
+	httpBootUnsupported     map[string]bool
+	httpBootURIAbsent       map[string]bool
+	staticIPv4Unsupported   map[string]bool
+	biosHTTPBootUnsupported map[string]bool
+	resetErrors             map[redfish.ResetType]error
+	calls                   []string
 }
 
 func (r *recordingPowerClient) ForMachine(_ context.Context, machine *v1alpha3.Machine) (PowerClient, error) {
@@ -933,6 +1124,10 @@ func (c *recordingMachinePowerClient) Reset(_ context.Context, resetType redfish
 	defer c.parent.mu.Unlock()
 
 	c.parent.calls = append(c.parent.calls, fmt.Sprintf("%s:%s", c.machine, resetType))
+	if err := c.parent.resetErrors[resetType]; err != nil {
+		return err
+	}
+
 	switch resetType {
 	case redfish.ResetForceOff:
 		c.parent.states[c.machine] = redfish.PowerOff
@@ -973,6 +1168,26 @@ func (c *recordingMachinePowerClient) GetBootConfig(context.Context) (redfish.Bo
 	return redfish.BootConfig{HasHTTPBootURI: !c.parent.httpBootURIAbsent[c.machine]}, nil
 }
 
+func (c *recordingMachinePowerClient) SetStaticIPv4(_ context.Context, config redfish.StaticIPv4Config) error {
+	c.parent.mu.Lock()
+	defer c.parent.mu.Unlock()
+
+	c.parent.calls = append(c.parent.calls, fmt.Sprintf(
+		"%s:SetStaticIPv4:%s:%s:%s:%s:%s",
+		c.machine,
+		config.MAC,
+		config.Address,
+		config.SubnetMask,
+		config.Gateway,
+		strings.Join(config.DNS, ","),
+	))
+	if c.parent.staticIPv4Unsupported[c.machine] {
+		return fmt.Errorf("static IPv4 unsupported: %w", redfish.ErrUnsupported)
+	}
+
+	return nil
+}
+
 func (c *recordingMachinePowerClient) SetHTTPBootOverride(_ context.Context, bootURL string) error {
 	c.parent.mu.Lock()
 	defer c.parent.mu.Unlock()
@@ -985,11 +1200,29 @@ func (c *recordingMachinePowerClient) SetHTTPBootOverride(_ context.Context, boo
 	return nil
 }
 
+func (c *recordingMachinePowerClient) SetBIOSStaticIPv4(_ context.Context, config redfish.StaticIPv4Config) error {
+	c.parent.mu.Lock()
+	defer c.parent.mu.Unlock()
+
+	c.parent.calls = append(c.parent.calls, fmt.Sprintf(
+		"%s:SetBIOSStaticIPv4:%s:%s:%s",
+		c.machine,
+		config.Address,
+		config.SubnetMask,
+		config.Gateway,
+	))
+
+	return nil
+}
+
 func (c *recordingMachinePowerClient) SetBIOSHTTPBootURI(_ context.Context, bootURL string) error {
 	c.parent.mu.Lock()
 	defer c.parent.mu.Unlock()
 
 	c.parent.calls = append(c.parent.calls, fmt.Sprintf("%s:SetBIOSHTTPBootURI:%s", c.machine, bootURL))
+	if c.parent.biosHTTPBootUnsupported[c.machine] {
+		return fmt.Errorf("BIOS HTTP boot unsupported: %w", redfish.ErrUnsupported)
+	}
 
 	return nil
 }
@@ -1026,6 +1259,16 @@ func testBareMetalMachine(name, site string) *v1alpha3.Machine {
 			},
 		},
 		Status: v1alpha3.MachineStatus{Redfish: &v1alpha3.RedfishStatus{CertFingerprint: "fp"}},
+	}
+}
+
+func httpBootLease() v1alpha3.DHCPLease {
+	return v1alpha3.DHCPLease{
+		MAC:        "aa:bb:cc:dd:ee:01",
+		IPv4:       "10.0.0.20",
+		SubnetMask: "255.255.255.0",
+		Gateway:    "10.0.0.1",
+		DNS:        []string{"10.0.0.53"},
 	}
 }
 

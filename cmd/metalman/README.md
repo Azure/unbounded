@@ -52,7 +52,7 @@ everything needed to PXE-boot and manage bare metal hosts:
 
 | Service | Default Port | Protocol | Purpose |
 |---------|-------------|----------|---------|
-| DHCP    | 67/udp      | DHCPv4   | Static leases derived from Machine NIC specs |
+| DHCP    | 67/udp      | DHCPv4   | Static leases derived from Machine NIC specs for PXE or DHCP-assisted HTTP boot |
 | TFTP    | 69/udp      | TFTP     | Initial bootloader delivery (e.g. shimx64.efi) |
 | HTTP    | 8880/tcp    | HTTP     | Artifact serving, templated configs, attestation endpoints |
 | Health  | 8081/tcp    | HTTP     | Liveness/readiness probes |
@@ -204,7 +204,15 @@ boot artifacts from the default netboot image. Set `spec.pxe.netbootImage` only
 when a Machine needs a non-default PXE boot environment. The node must be
 manually PXE-booted (or have PXE as its default boot option).
 
-The default netboot template passes the matching DHCP lease MAC to the installer
+When `spec.pxe.bootProtocol` is `HTTP`, `dhcpLeases` also supplies the static
+UEFI HTTP boot client configuration. Metalman uses Redfish to disable DHCPv4 on
+the host EthernetInterface matching the first lease MAC and writes that lease's
+IPv4 address, subnet mask, gateway, and DNS servers before setting the UEFI HTTP
+boot override. With Redfish access and an HTTP boot URL, repaving can run without
+any DHCP server on the provisioning network. If a host has multiple NICs, put the
+UEFI HTTP boot NIC first in `dhcpLeases`.
+
+The default netboot template passes the selected lease MAC to the installer
 initrd, which uses it to select the provisioning NIC instead of assuming a fixed
 interface name such as `eth0`. If `spec.pxe.targetDisk` is set, the installer
 writes the image to that disk; otherwise it falls back to automatic disk
