@@ -168,17 +168,27 @@ impl RecvPoolShared {
                     // this recv buffer but writes no frame into it; the
                     // page ordinal rides in the CQ immediate data. Route it
                     // by the packed handle instead of parsing a header.
-                    if info.flags & ffi::FI_REMOTE_CQ_DATA != 0 {
-                        shared.handle_remote_write(info.data);
+                    let remote_write = if info.flags & ffi::FI_REMOTE_CQ_DATA != 0 {
+                        Some(info.data)
                     } else {
-                        shared.handle_message(&recv.bytes[..], info.bytes);
-                    }
+                        None
+                    };
+                    let message = if remote_write.is_none() {
+                        shared.decode_message(&recv.bytes[..], info.bytes)
+                    } else {
+                        None
+                    };
                     // Re-arm the stable buffer and local MR on a fresh
-                    // completion slot. A failure or transient EAGAIN here
-                    // shrinks the pool by one; record it but do not unwind
-                    // on the progress thread.
+                    // completion slot before dispatching. Dispatch may send an
+                    // overload reply from this thread and must not consume the
+                    // completion capacity reserved for the receive lane.
                     if !matches!(shared.repost(recv), Ok(true)) {
                         shared.errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(data) = remote_write {
+                        shared.handle_remote_write(data);
+                    } else if let Some((header, body)) = message {
+                        shared.handle_message(header, body);
                     }
                 }
                 Err(_) => {
@@ -221,19 +231,23 @@ impl RecvPoolShared {
     /// or truncated frames are dropped (counted as errors) rather than
     /// propagated, since there is no caller to surface them to on the
     /// progress thread.
-    fn handle_message(self: &Arc<Self>, buf: &[u8], n: usize) {
+    fn decode_message(&self, buf: &[u8], n: usize) -> Option<(MsgHeader, Vec<u8>)> {
         if n < MSG_HEADER_LEN {
             self.errors.fetch_add(1, Ordering::Relaxed);
-            return;
+            return None;
         }
         let header = match MsgHeader::read_from(&buf[..n]) {
             Ok(h) => h,
             Err(_) => {
                 self.errors.fetch_add(1, Ordering::Relaxed);
-                return;
+                return None;
             }
         };
         let body = buf[MSG_HEADER_LEN..n].to_vec();
+        Some((header, body))
+    }
+
+    fn handle_message(self: &Arc<Self>, header: MsgHeader, body: Vec<u8>) {
         let reply = ReplyCtx::new(self.ep, self.peer);
         self.dispatch
             .route(header.kind, header.request_id, &reply, body);

@@ -354,14 +354,17 @@ mod tests {
         let reg = CompletionRegistry::new(1);
         let (mut slot, _fut) = reg.allocate().unwrap();
         let replacement = Arc::new(Mutex::new(None));
+        let dispatch_was_blocked = Arc::new(AtomicBool::new(false));
 
         let handler_reg = Arc::clone(&reg);
         let handler_replacement = Arc::clone(&replacement);
+        let handler_dispatch_was_blocked = Arc::clone(&dispatch_was_blocked);
         slot.set_handler(move |_| {
             let (slot, _fut) = handler_reg
                 .allocate()
                 .expect("completed slot releases capacity before handler");
             *handler_replacement.lock().unwrap() = Some(slot);
+            handler_dispatch_was_blocked.store(handler_reg.allocate().is_err(), Ordering::Release);
         });
 
         let raw = slot.into_raw();
@@ -377,6 +380,7 @@ mod tests {
         }));
 
         assert_eq!(reg.live_count(), 1);
+        assert!(dispatch_was_blocked.load(Ordering::Acquire));
         drop(reclaimed);
         assert_eq!(reg.live_count(), 1);
         drop(replacement.lock().unwrap().take());
