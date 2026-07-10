@@ -5,6 +5,7 @@ package orcadev
 
 import (
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -94,4 +95,32 @@ func TestRingBufferLargeAccumulationStaysBounded(t *testing.T) {
 	if len(got) != capBytes {
 		t.Fatalf("ring length = %d, want %d", len(got), capBytes)
 	}
+}
+
+func TestRingBufferConcurrentWriteAndRead(t *testing.T) {
+	t.Parallel()
+
+	rb := newRingBuffer(64)
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		<-start
+
+		for i := 0; i < 1000; i++ {
+			_, _ = rb.Write([]byte("abcdefghijklmnopqrstuvwxyz"))
+		}
+	}()
+
+	close(start)
+
+	for i := 0; i < 1000; i++ {
+		_ = rb.String()
+	}
+
+	wg.Wait()
 }

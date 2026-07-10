@@ -3,15 +3,15 @@
 
 package orcadev
 
+import "sync"
+
 // ringBuffer is a fixed-capacity io.Writer that retains the most
 // recently written bytes and discards older bytes when the buffer
 // fills. Used by spawnPortForward to drain a subprocess's stderr
 // for diagnostic-on-failure purposes without leaking unbounded
 // memory across long-lived sessions.
-//
-// Not safe for concurrent use; the caller (a single io.Copy
-// goroutine) handles sequencing.
 type ringBuffer struct {
+	mu   sync.RWMutex
 	buf  []byte
 	pos  int  // next write index
 	full bool // true once the buffer has wrapped at least once
@@ -29,6 +29,9 @@ func newRingBuffer(size int) *ringBuffer {
 // the logical stream once capacity is reached. Always returns
 // (len(p), nil); writes never fail.
 func (r *ringBuffer) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	written := len(p)
 	size := len(r.buf)
 
@@ -65,6 +68,9 @@ func (r *ringBuffer) Write(p []byte) (int, error) {
 
 // String returns the retained bytes in write order (oldest first).
 func (r *ringBuffer) String() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	if !r.full {
 		return string(r.buf[:r.pos])
 	}
