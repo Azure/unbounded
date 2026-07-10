@@ -937,15 +937,8 @@ fn run_shard(
                             &last_backends,
                             desired_backends,
                         );
-                        if !frontends_to_rebuild.is_empty() {
-                            for id in frontends_to_rebuild {
-                                let _ = config::reconcile::FrontendReconcileTarget::remove(
-                                    &frontend_registry,
-                                    &id,
-                                );
-                                last_frontends.remove(&id);
-                            }
-                        }
+                        let forced_frontend_updates: HashSet<String> =
+                            frontends_to_rebuild.into_iter().collect();
                         *bindings.borrow_mut() = projection.frontends.clone();
 
                         // Drive the transport backend registry and the
@@ -957,12 +950,38 @@ fn run_shard(
                             desired_backends,
                             desired_frontends,
                             &desired_frontend_backends,
+                            &forced_frontend_updates,
                             Some(&last_backends),
                             Some(&last_frontends),
                         );
                         last_backends = combined.backends.applied;
                         last_frontends = combined.frontends.applied;
-                        last_bindings = projection.frontends;
+
+                        // Replacement construction happens against desired
+                        // geometry/bindings, then failed replacements retain
+                        // their prior live resource and prior auxiliary state.
+                        {
+                            let mut g = geometry.borrow_mut();
+                            g.clear();
+                            for spec in last_backends.values() {
+                                g.insert(spec.name.clone(), spec.stripe_size_bytes());
+                            }
+                        }
+                        let mut applied_bindings = HashMap::new();
+                        for (id, spec) in &last_frontends {
+                            let desired_spec = desired_frontends.iter().find(|f| f.name == *id);
+                            if desired_spec == Some(spec) {
+                                if let Some(binding) = projection.frontends.get(id) {
+                                    applied_bindings.insert(id.clone(), binding.clone());
+                                    continue;
+                                }
+                            }
+                            if let Some(binding) = last_bindings.get(id) {
+                                applied_bindings.insert(id.clone(), binding.clone());
+                            }
+                        }
+                        *bindings.borrow_mut() = applied_bindings.clone();
+                        last_bindings = applied_bindings;
 
                         let mut failures = combined.backends.failures;
                         failures.extend(combined.frontends.failures);

@@ -176,6 +176,12 @@ a terminal report on abnormal exit. That report also sets process-wide
 shutdown; teardown drains terminal reports and returns a failing process status
 instead of continuing with a missing shard.
 
+Backend and frontend reloads construct replacements before swapping them into
+their shard-local registries. A failed replacement therefore leaves the prior
+resource, binding, and stripe geometry live and retryable. This is a
+per-resource guarantee; route, peer, shard, and disk publication across the
+whole process is not yet one transaction.
+
 ### Shutdown
 
 A process-wide `static SHUTDOWN: AtomicBool` is set by an async-signal-safe
