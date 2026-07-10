@@ -5,7 +5,7 @@
 //!
 //! [`RingCore`](core::RingCore) is the single low-level engine; the two
 //! facades over it are [`StorageRing`] (block read/write, IOPOLL-capable)
-//! and [`NetworkRing`] (sockets, no IOPOLL). [`set_current_storage_ring`]
+//! and [`NetworkRing`] (sockets, no IOPOLL). [`install_current_storage_ring`]
 //! and friends expose a thread-local registry of the current shard's
 //! [`StorageRing`].
 
@@ -21,7 +21,7 @@ pub use network::{
     TLS_RECORD_TYPE_APPLICATION_DATA, TLS_RECORD_TYPE_HANDSHAKE,
 };
 pub use registry::{
-    clear_current_storage_ring, current_storage_ring, set_current_storage_ring,
-    with_current_storage_ring,
+    CurrentStorageRingGuard, clear_current_storage_ring, current_storage_ring,
+    install_current_storage_ring, with_current_storage_ring,
 };
 pub use storage::{StorageRing, StorageRingConfig};
