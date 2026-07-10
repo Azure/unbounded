@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use unbounded_storage::backend::BackendRegistry;
+use unbounded_storage::backend::{BackendRegistry, BackendRegistryTransaction};
 use unbounded_storage::bufferpool::{Pool, PoolConfig};
 use unbounded_storage::config::{
     self, BackendSpec, Config, FrontendSpec, LoadedConfig, ResolvedFrontendBinding, frontend_spec,
@@ -698,9 +698,8 @@ fn run_shard(
     // Shared, live-reloadable routing surface. Built once from the
     // startup config and handed (by cheap clone) to every p2p consumer
     // on this shard: the pool transport, the recursive RPC handler, and
-    // the control-drain tick hook below. A `ShardCommand::ApplyConfig`
-    // republishes through this single handle so all consumers observe
-    // the new finger table atomically without a restart.
+    // the control-drain tick hook below. Process-level route publication
+    // updates this handle atomically for all consumers.
     let transport = match RoutedTransport::with_routes(
         fabric.clone(),
         mr,
@@ -875,18 +874,8 @@ fn run_shard(
         }
     };
 
-    // Control-drain tick hook: applies live config changes on this
-    // shard's own thread so all `!Send` per-shard state stays
-    // thread-local. Each `ShardCommand::ApplyConfig` republishes the
-    // routing surface through this shard's `RouteTableHandle` (observed
-    // atomically by its transport; the fabric RPC handlers are reloaded
-    // separately by the `FabricGroup`), refreshes the stripe geometry,
-    // reconciles the transport origin-backend registry and the frontend
-    // registry toward the new config, applies disk-policy side effects,
-    // and then acknowledges so the coordinator's blocking apply can
-    // complete. Everything is driven from this one thread, and the
-    // build-from-spec work (DNS resolve, listener bind) stays off the
-    // fast path.
+    // Control-drain tick hook: stages and finishes backend/frontend changes
+    // on this shard's thread so the `!Send` transactions remain thread-local.
     {
         let transport_registry = transport_registry.clone();
         let frontend_registry = frontend_registry.clone();
@@ -901,113 +890,165 @@ fn run_shard(
             .iter()
             .map(|f| (f.name.clone(), f.clone()))
             .collect();
+        let mut transaction = PendingShardState::Idle;
         shard_loop.add_tick_hook(move || {
             let mut did_work = false;
             while let Ok(cmd) = ctrl_rx.try_recv() {
                 match cmd {
-                    config::ShardCommand::ApplyConfig(apply) => {
-                        let desired_backends = apply.loaded.config().backends.as_slice();
-                        let desired_frontends = apply.loaded.config().frontends.as_slice();
-                        let desired_frontend_backends =
-                            config::frontend_backend_map(&apply.loaded.runtime().frontends);
-                        let prior_geometry = geometry.borrow().clone();
-                        let prior_bindings = bindings.borrow().clone();
-                        // Refresh stripe geometry before building any
-                        // frontend so a co-applied backend stripe change
-                        // is visible to a frontend add in the same pass.
-                        {
-                            let mut g = geometry.borrow_mut();
-                            g.clear();
-                            for b in desired_backends {
-                                g.insert(b.name.clone(), b.stripe_size_bytes());
-                            }
-                        }
-
-                        let desired_activations = frontend_activations(
-                            &apply.loaded.runtime().frontends,
-                            desired_backends,
-                        );
-                        let frontends_to_rebuild = frontend_rebuild_ids(
-                            &frontend_registry.realized_activations(),
-                            &desired_activations,
-                        );
-                        let forced_frontend_updates: HashSet<String> =
-                            frontends_to_rebuild.into_iter().collect();
-                        *bindings.borrow_mut() = apply.loaded.runtime().frontends.clone();
-
-                        let backend_transaction = transport_registry.transaction();
-                        let frontend_transaction = frontend_registry.transaction();
-
-                        // Drive provisional backend and frontend maps together
-                        // so frontend adds are gated on the desired backend.
-                        let combined = config::reconcile::reconcile_backends_and_frontends(
-                            &backend_transaction,
-                            &frontend_transaction,
-                            desired_backends,
-                            desired_frontends,
-                            &desired_frontend_backends,
-                            &forced_frontend_updates,
-                            Some(&last_backends),
-                            Some(&last_frontends),
-                        );
-                        let mut failures = combined.backends.failures.clone();
-                        failures.extend(combined.frontends.failures.clone());
-                        let commit = failures.is_empty() && combined.frontends.deferred.is_empty();
-                        let result = if commit {
-                            // Activate and retire old frontends before their
-                            // old backends. A local activation failure leaves
-                            // both live registries unchanged.
-                            if let Err(error) = frontend_transaction.finalize() {
-                                backend_transaction.rollback();
-                                *geometry.borrow_mut() = prior_geometry;
-                                *bindings.borrow_mut() = prior_bindings;
-                                let _ = apply.ack.send(config::ShardAck {
-                                    worker: widx,
-                                    result: Err(error),
-                                });
-                                did_work = true;
-                                continue;
-                            }
-                            backend_transaction.finalize();
-                            last_backends = combined.backends.applied;
-                            last_frontends = combined.frontends.applied;
+                    config::ShardCommand::PrepareConfig(prepare) => {
+                        let result = if !matches!(transaction, PendingShardState::Idle) {
+                            Err(format!(
+                                "cannot prepare transaction {} while {}",
+                                prepare.id.0,
+                                transaction.description()
+                            ))
+                        } else {
+                            let desired_backends = prepare.loaded.config().backends.as_slice();
+                            let desired_frontends = prepare.loaded.config().frontends.as_slice();
+                            let desired_frontend_backends =
+                                config::frontend_backend_map(&prepare.loaded.runtime().frontends);
+                            let prior_geometry = geometry.borrow().clone();
+                            let prior_bindings = bindings.borrow().clone();
+                            // Refresh stripe geometry before building any
+                            // frontend so a co-applied backend stripe change
+                            // is visible to a frontend add in the same pass.
                             {
                                 let mut g = geometry.borrow_mut();
                                 g.clear();
-                                for spec in last_backends.values() {
-                                    g.insert(spec.name.clone(), spec.stripe_size_bytes());
+                                for b in desired_backends {
+                                    g.insert(b.name.clone(), b.stripe_size_bytes());
                                 }
                             }
-                            *bindings.borrow_mut() = frontend_registry
-                                .realized_activations()
-                                .into_iter()
-                                .map(|(id, activation)| (id, activation.binding))
-                                .collect();
-                            Ok(())
-                        } else {
-                            // Restore backends before frontends that reference
-                            // them, then restore the auxiliary build surfaces.
-                            backend_transaction.rollback();
-                            frontend_transaction.rollback();
+
+                            let desired_activations = frontend_activations(
+                                &prepare.loaded.runtime().frontends,
+                                desired_backends,
+                            );
+                            let frontends_to_rebuild = frontend_rebuild_ids(
+                                &frontend_registry.realized_activations(),
+                                &desired_activations,
+                            );
+                            let forced_frontend_updates: HashSet<String> =
+                                frontends_to_rebuild.into_iter().collect();
+                            *bindings.borrow_mut() = prepare.loaded.runtime().frontends.clone();
+
+                            let backend_transaction = transport_registry.transaction();
+                            let frontend_transaction = frontend_registry.transaction();
+
+                            // Drive provisional backend and frontend maps together
+                            // so frontend adds are gated on the desired backend.
+                            let combined = config::reconcile::reconcile_backends_and_frontends(
+                                &backend_transaction,
+                                &frontend_transaction,
+                                desired_backends,
+                                desired_frontends,
+                                &desired_frontend_backends,
+                                &forced_frontend_updates,
+                                Some(&last_backends),
+                                Some(&last_frontends),
+                            );
+                            let mut failures = combined.backends.failures.clone();
+                            failures.extend(combined.frontends.failures.clone());
                             *geometry.borrow_mut() = prior_geometry;
                             *bindings.borrow_mut() = prior_bindings;
-                            Err(format!(
-                                "config reconcile failed: failures={failures:?} deferred={:?}",
-                                combined.frontends.deferred
-                            ))
+                            if failures.is_empty() && combined.frontends.deferred.is_empty() {
+                                transaction = PendingShardState::Prepared(PendingShardApply {
+                                    id: prepare.id,
+                                    backend: backend_transaction,
+                                    frontend: frontend_transaction,
+                                    backends: combined.backends.applied,
+                                    frontends: combined.frontends.applied,
+                                });
+                                Ok(())
+                            } else {
+                                backend_transaction.rollback();
+                                frontend_transaction.rollback();
+                                transaction = PendingShardState::Rejected(prepare.id);
+                                Err(format!(
+                                    "config reconcile failed: failures={failures:?} deferred={:?}",
+                                    combined.frontends.deferred
+                                ))
+                            }
                         };
 
-                        let _ = apply.ack.send(config::ShardAck {
+                        let _ = prepare.ack.send(config::ShardAck {
+                            id: prepare.id,
+                            worker: widx,
+                            result,
+                        });
+                        did_work = true;
+                    }
+                    config::ShardCommand::FinishConfig(finish) => {
+                        let result = if !transaction.matches(finish.id) {
+                            Err(format!(
+                                "cannot finish transaction {} while {}",
+                                finish.id.0,
+                                transaction.description()
+                            ))
+                        } else if matches!(transaction, PendingShardState::Rejected(_)) {
+                            if finish.decision == config::ShardDecision::Abort {
+                                transaction = PendingShardState::Idle;
+                                Ok(())
+                            } else {
+                                Err("cannot commit a rejected transaction".to_string())
+                            }
+                        } else {
+                            match std::mem::replace(&mut transaction, PendingShardState::Idle) {
+                                PendingShardState::Prepared(pending) => match finish.decision {
+                                    config::ShardDecision::Abort => {
+                                        pending.backend.rollback();
+                                        pending.frontend.rollback();
+                                        Ok(())
+                                    }
+                                    config::ShardDecision::Commit => {
+                                        if let Err(error) = pending.frontend.finalize() {
+                                            pending.backend.rollback();
+                                            Err(error)
+                                        } else {
+                                            pending.backend.finalize();
+                                            last_backends = pending.backends;
+                                            last_frontends = pending.frontends;
+                                            *geometry.borrow_mut() = last_backends
+                                                .values()
+                                                .map(|spec| {
+                                                    (spec.name.clone(), spec.stripe_size_bytes())
+                                                })
+                                                .collect();
+                                            *bindings.borrow_mut() = frontend_registry
+                                                .realized_activations()
+                                                .into_iter()
+                                                .map(|(id, activation)| (id, activation.binding))
+                                                .collect();
+                                            Ok(())
+                                        }
+                                    }
+                                },
+                                PendingShardState::Rejected(_) => unreachable!(),
+                                PendingShardState::Idle => unreachable!(),
+                            }
+                        };
+                        let _ = finish.ack.send(config::ShardAck {
+                            id: finish.id,
                             worker: widx,
                             result,
                         });
                         did_work = true;
                     }
                     config::ShardCommand::DrainPageCache(drain) => {
-                        pool.drain_page_cache();
+                        let result = if transaction.is_prepared(drain.id) {
+                            pool.drain_page_cache();
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "cannot drain transaction {} while {}",
+                                drain.id.0,
+                                transaction.description()
+                            ))
+                        };
                         let _ = drain.ack.send(config::ShardAck {
+                            id: drain.id,
                             worker: widx,
-                            result: Ok(()),
+                            result,
                         });
                         did_work = true;
                     }
@@ -1064,6 +1105,42 @@ fn run_shard(
     drop(pool);
     drop(socket);
     serving_guard.complete();
+}
+
+struct PendingShardApply {
+    id: config::ShardTransactionId,
+    backend: BackendRegistryTransaction,
+    frontend: FrontendRegistryTransaction,
+    backends: HashMap<String, BackendSpec>,
+    frontends: HashMap<String, FrontendSpec>,
+}
+
+enum PendingShardState {
+    Idle,
+    Prepared(PendingShardApply),
+    Rejected(config::ShardTransactionId),
+}
+
+impl PendingShardState {
+    fn matches(&self, id: config::ShardTransactionId) -> bool {
+        match self {
+            Self::Idle => false,
+            Self::Prepared(pending) => pending.id == id,
+            Self::Rejected(rejected) => *rejected == id,
+        }
+    }
+
+    fn is_prepared(&self, id: config::ShardTransactionId) -> bool {
+        matches!(self, Self::Prepared(pending) if pending.id == id)
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::Idle => "idle".to_string(),
+            Self::Prepared(pending) => format!("transaction {} is prepared", pending.id.0),
+            Self::Rejected(id) => format!("transaction {} is rejected", id.0),
+        }
+    }
 }
 
 /// Log a shard panic and preserve it for the owning join handle.

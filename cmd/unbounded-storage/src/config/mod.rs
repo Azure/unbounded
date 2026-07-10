@@ -15,8 +15,8 @@ pub mod watch;
 pub use apply::peer_spec_to_connection;
 pub use control::{
     ApplyError, ApplyOutcome, ApplyTier, ConfigApplyTarget, ConfigController,
-    ConfigVersionSnapshot, ConfigVersionStatus, ShardAck, ShardApply, ShardCommand,
-    ShardControlGroup,
+    ConfigVersionSnapshot, ConfigVersionStatus, ShardAck, ShardCommand, ShardControlGroup,
+    ShardDecision, ShardDrainPageCache, ShardFinish, ShardPrepare, ShardTransactionId,
 };
 pub use diff::ConfigDiff;
 pub use graph::{

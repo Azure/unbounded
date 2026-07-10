@@ -45,24 +45,36 @@ use crate::runtime::WorkerIdx;
 /// command there (so all `!Send` per-shard state stays thread-local),
 /// then acknowledges.
 pub enum ShardCommand {
-    /// Apply a new configuration in place: republish routing and
-    /// reconcile this shard's backend registry, frontend registry, and
-    /// any disk-policy side effects.
-    ApplyConfig(ShardApply),
-    /// Drop all retained in-memory page-cache entries after process-level
-    /// disk policy publication has landed.
+    /// Stage a new backend/frontend configuration without publishing it.
+    PrepareConfig(ShardPrepare),
+    /// Commit or discard a previously prepared configuration.
+    FinishConfig(ShardFinish),
+    /// Drop retained in-memory page-cache entries before process-level
+    /// disk reconciliation and publication.
     DrainPageCache(ShardDrainPageCache),
 }
 
 /// Payload of [`ShardCommand::DrainPageCache`].
 pub struct ShardDrainPageCache {
+    pub id: ShardTransactionId,
     /// Channel the shard sends its [`ShardAck`] on once the drain has
     /// completed on the shard thread.
     pub ack: Sender<ShardAck>,
 }
 
-/// Payload of [`ShardCommand::ApplyConfig`].
-pub struct ShardApply {
+/// Identifier shared by every command and acknowledgement in one apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardTransactionId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardDecision {
+    Commit,
+    Abort,
+}
+
+/// Payload of [`ShardCommand::PrepareConfig`].
+pub struct ShardPrepare {
+    pub id: ShardTransactionId,
     /// The new finalized config, runtime graph, and route table.
     pub loaded: Arc<LoadedConfig>,
     /// Section-level diff that selected this apply path.
@@ -72,9 +84,17 @@ pub struct ShardApply {
     pub ack: Sender<ShardAck>,
 }
 
+/// Payload of [`ShardCommand::FinishConfig`].
+pub struct ShardFinish {
+    pub id: ShardTransactionId,
+    pub decision: ShardDecision,
+    pub ack: Sender<ShardAck>,
+}
+
 /// A shard's acknowledgement that it finished (or failed) applying a
 /// [`ShardCommand`].
 pub struct ShardAck {
+    pub id: ShardTransactionId,
     pub worker: WorkerIdx,
     pub result: Result<(), String>,
 }
@@ -100,8 +120,15 @@ pub enum ApplyError {
         received: usize,
         outstanding: Vec<WorkerIdx>,
     },
+    /// A shard acknowledged a different transaction, so the requested
+    /// transaction's state cannot be established safely.
+    AckTransactionMismatch {
+        worker: WorkerIdx,
+        expected: ShardTransactionId,
+        received: ShardTransactionId,
+    },
     /// One or more shards reported a failure while applying.
-    ShardApply(Vec<(WorkerIdx, String)>),
+    ShardFailure(Vec<(WorkerIdx, String)>),
     /// The process-level apply target rejected the config.
     Target(String),
 }
@@ -130,7 +157,16 @@ impl fmt::Display for ApplyError {
                 "ack deadline expired after {received}/{expected} shards reported; outstanding workers: {}",
                 format_workers(outstanding),
             ),
-            ApplyError::ShardApply(failures) => {
+            ApplyError::AckTransactionMismatch {
+                worker,
+                expected,
+                received,
+            } => write!(
+                f,
+                "shard {} acknowledged transaction {} while transaction {} was expected",
+                worker.0, received.0, expected.0,
+            ),
+            ApplyError::ShardFailure(failures) => {
                 write!(f, "{} shard(s) failed to apply config:", failures.len())?;
                 for (w, e) in failures {
                     write!(f, " [shard {}: {e}]", w.0)?;
@@ -151,7 +187,10 @@ impl ApplyError {
     pub fn apply_state_is_indeterminate(&self) -> bool {
         matches!(
             self,
-            Self::ShardSend(_) | Self::AckDisconnected { .. } | Self::AckTimeout { .. }
+            Self::ShardSend(_)
+                | Self::AckDisconnected { .. }
+                | Self::AckTimeout { .. }
+                | Self::AckTransactionMismatch { .. }
         )
     }
 }
@@ -382,8 +421,8 @@ impl<T: ConfigApplyTarget> ConfigController<T> {
 /// A reusable blocking fan-out/fan-in primitive over a set of shard
 /// control channels.
 ///
-/// [`broadcast_apply`](Self::broadcast_apply) sends one
-/// [`ShardCommand::ApplyConfig`] to every shard and blocks until each
+/// [`broadcast_prepare`](Self::broadcast_prepare) sends one
+/// [`ShardCommand::PrepareConfig`] to every shard and blocks until each
 /// has acknowledged or the group's absolute deadline expires, so the caller
 /// can guarantee the change has landed on every shard thread before returning
 /// success. This is the concrete
@@ -410,8 +449,7 @@ impl ShardControlGroup {
         self.senders.is_empty()
     }
 
-    /// Send one loaded snapshot to every shard and block until all of
-    /// them acknowledge.
+    /// Stage one loaded snapshot on every shard and block until all acknowledge.
     ///
     /// Returns `Ok(())` only when every shard reports success. If a
     /// channel is closed at send time, the ack deadline expires, the ack
@@ -419,13 +457,15 @@ impl ShardControlGroup {
     /// failure, the corresponding [`ApplyError`] is returned. Until a terminal
     /// channel/deadline error, fan-in keeps collecting reports so one failing
     /// shard does not mask failures from the others.
-    pub fn broadcast_apply(
+    pub fn broadcast_prepare(
         &self,
+        id: ShardTransactionId,
         loaded: Arc<LoadedConfig>,
         diff: ConfigDiff,
     ) -> Result<(), ApplyError> {
-        self.broadcast(|ack| {
-            ShardCommand::ApplyConfig(ShardApply {
+        self.broadcast(id, |ack| {
+            ShardCommand::PrepareConfig(ShardPrepare {
+                id,
                 loaded: loaded.clone(),
                 diff,
                 ack,
@@ -433,13 +473,26 @@ impl ShardControlGroup {
         })
     }
 
-    /// Ask every shard to drain retained RAM page-cache entries and block
-    /// until all have acknowledged.
-    pub fn broadcast_drain_page_cache(&self) -> Result<(), ApplyError> {
-        self.broadcast(|ack| ShardCommand::DrainPageCache(ShardDrainPageCache { ack }))
+    /// Commit or abort a prepared transaction on every shard.
+    pub fn broadcast_finish(
+        &self,
+        id: ShardTransactionId,
+        decision: ShardDecision,
+    ) -> Result<(), ApplyError> {
+        self.broadcast(id, |ack| {
+            ShardCommand::FinishConfig(ShardFinish { id, decision, ack })
+        })
     }
 
-    fn broadcast<F>(&self, make_cmd: F) -> Result<(), ApplyError>
+    /// Ask every shard to drain retained RAM page-cache entries and block
+    /// until all have acknowledged.
+    pub fn broadcast_drain_page_cache(&self, id: ShardTransactionId) -> Result<(), ApplyError> {
+        self.broadcast(id, |ack| {
+            ShardCommand::DrainPageCache(ShardDrainPageCache { id, ack })
+        })
+    }
+
+    fn broadcast<F>(&self, id: ShardTransactionId, make_cmd: F) -> Result<(), ApplyError>
     where
         F: Fn(Sender<ShardAck>) -> ShardCommand,
     {
@@ -471,6 +524,13 @@ impl ShardControlGroup {
             };
             match ack_rx.recv_timeout(remaining) {
                 Ok(ack) => {
+                    if ack.id != id {
+                        return Err(ApplyError::AckTransactionMismatch {
+                            worker: ack.worker,
+                            expected: id,
+                            received: ack.id,
+                        });
+                    }
                     if outstanding.remove(&ack.worker) {
                         received += 1;
                         if let Err(e) = ack.result {
@@ -498,7 +558,7 @@ impl ShardControlGroup {
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(ApplyError::ShardApply(failures))
+            Err(ApplyError::ShardFailure(failures))
         }
     }
 }
@@ -536,7 +596,8 @@ mod tests {
 
     fn ack_sender(cmd: ShardCommand) -> Sender<ShardAck> {
         match cmd {
-            ShardCommand::ApplyConfig(apply) => apply.ack,
+            ShardCommand::PrepareConfig(prepare) => prepare.ack,
+            ShardCommand::FinishConfig(finish) => finish.ack,
             ShardCommand::DrainPageCache(drain) => drain.ack,
         }
     }
@@ -560,9 +621,18 @@ mod tests {
                 let mut applied = 0usize;
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
-                        ShardCommand::ApplyConfig(apply) => {
+                        ShardCommand::PrepareConfig(apply) => {
                             applied += 1;
                             let _ = apply.ack.send(ShardAck {
+                                id: apply.id,
+                                worker: widx,
+                                result: result.clone(),
+                            });
+                        }
+                        ShardCommand::FinishConfig(finish) => {
+                            applied += 1;
+                            let _ = finish.ack.send(ShardAck {
+                                id: finish.id,
                                 worker: widx,
                                 result: result.clone(),
                             });
@@ -570,6 +640,7 @@ mod tests {
                         ShardCommand::DrainPageCache(drain) => {
                             applied += 1;
                             let _ = drain.ack.send(ShardAck {
+                                id: drain.id,
                                 worker: widx,
                                 result: result.clone(),
                             });
@@ -583,11 +654,15 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_apply_blocks_until_every_shard_acks() {
+    fn broadcast_prepare_blocks_until_every_shard_acks() {
         let (senders, joins) = spawn_mock_shards(vec![Ok(()), Ok(()), Ok(())]);
         let group = control_group(senders);
 
-        let out = group.broadcast_apply(loaded(Config::default()), ConfigDiff::default());
+        let out = group.broadcast_prepare(
+            ShardTransactionId(1),
+            loaded(Config::default()),
+            ConfigDiff::default(),
+        );
         assert!(out.is_ok(), "expected success, got {out:?}");
 
         // Closing the group drops the senders so the mock shard threads
@@ -599,19 +674,21 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_apply_delivers_the_same_loaded_snapshot() {
+    fn broadcast_prepare_delivers_the_same_id_and_loaded_snapshot() {
         let (tx, rx) = mpsc::channel::<ShardCommand>();
         let group = control_group(vec![(WorkerIdx(0), tx)]);
         let loaded = loaded(Config::default());
         let expected = loaded.clone();
         let join = thread::spawn(move || {
-            let ShardCommand::ApplyConfig(apply) = rx.recv().unwrap() else {
+            let ShardCommand::PrepareConfig(apply) = rx.recv().unwrap() else {
                 panic!("expected config apply");
             };
+            assert_eq!(apply.id, ShardTransactionId(17));
             assert!(Arc::ptr_eq(&apply.loaded, &expected));
             apply
                 .ack
                 .send(ShardAck {
+                    id: apply.id,
                     worker: WorkerIdx(0),
                     result: Ok(()),
                 })
@@ -619,21 +696,96 @@ mod tests {
         });
 
         group
-            .broadcast_apply(loaded, ConfigDiff::default())
+            .broadcast_prepare(ShardTransactionId(17), loaded, ConfigDiff::default())
             .unwrap();
         join.join().unwrap();
     }
 
     #[test]
-    fn broadcast_apply_reports_shard_failures() {
+    fn broadcast_finish_and_drain_carry_transaction_id() {
+        let (tx, rx) = mpsc::channel::<ShardCommand>();
+        let group = control_group(vec![(WorkerIdx(0), tx)]);
+        let join = thread::spawn(move || {
+            let ShardCommand::DrainPageCache(drain) = rx.recv().unwrap() else {
+                panic!("expected page-cache drain");
+            };
+            assert_eq!(drain.id, ShardTransactionId(23));
+            drain
+                .ack
+                .send(ShardAck {
+                    id: drain.id,
+                    worker: WorkerIdx(0),
+                    result: Ok(()),
+                })
+                .unwrap();
+
+            let ShardCommand::FinishConfig(finish) = rx.recv().unwrap() else {
+                panic!("expected config finish");
+            };
+            assert_eq!(finish.id, ShardTransactionId(23));
+            assert_eq!(finish.decision, ShardDecision::Commit);
+            finish
+                .ack
+                .send(ShardAck {
+                    id: finish.id,
+                    worker: WorkerIdx(0),
+                    result: Ok(()),
+                })
+                .unwrap();
+        });
+
+        group
+            .broadcast_drain_page_cache(ShardTransactionId(23))
+            .unwrap();
+        group
+            .broadcast_finish(ShardTransactionId(23), ShardDecision::Commit)
+            .unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn mismatched_ack_transaction_is_indeterminate() {
+        let (tx, rx) = mpsc::channel::<ShardCommand>();
+        let group = control_group(vec![(WorkerIdx(4), tx)]);
+        let join = thread::spawn(move || {
+            let ack = ack_sender(rx.recv().unwrap());
+            ack.send(ShardAck {
+                id: ShardTransactionId(99),
+                worker: WorkerIdx(4),
+                result: Ok(()),
+            })
+            .unwrap();
+        });
+
+        let error = group
+            .broadcast_finish(ShardTransactionId(3), ShardDecision::Abort)
+            .expect_err("mismatched transaction must fail fan-in");
+        assert!(matches!(
+            error,
+            ApplyError::AckTransactionMismatch {
+                worker: WorkerIdx(4),
+                expected: ShardTransactionId(3),
+                received: ShardTransactionId(99),
+            }
+        ));
+        assert!(error.apply_state_is_indeterminate());
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn broadcast_prepare_reports_shard_failures() {
         let (senders, joins) = spawn_mock_shards(vec![Ok(()), Err("boom".to_string()), Ok(())]);
         let group = control_group(senders);
 
         let err = group
-            .broadcast_apply(loaded(Config::default()), ConfigDiff::default())
+            .broadcast_prepare(
+                ShardTransactionId(1),
+                loaded(Config::default()),
+                ConfigDiff::default(),
+            )
             .expect_err("a failing shard must surface as an error");
         match err {
-            ApplyError::ShardApply(failures) => {
+            ApplyError::ShardFailure(failures) => {
                 assert_eq!(failures.len(), 1);
                 assert_eq!(failures[0].0, WorkerIdx(1));
                 assert_eq!(failures[0].1, "boom");
@@ -648,18 +800,22 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_apply_on_empty_group_is_a_noop() {
+    fn broadcast_prepare_on_empty_group_is_a_noop() {
         let group = control_group(Vec::new());
         assert!(group.is_empty());
         assert!(
             group
-                .broadcast_apply(loaded(Config::default()), ConfigDiff::default(),)
+                .broadcast_prepare(
+                    ShardTransactionId(1),
+                    loaded(Config::default()),
+                    ConfigDiff::default(),
+                )
                 .is_ok()
         );
     }
 
     #[test]
-    fn broadcast_apply_errors_when_a_shard_channel_is_closed() {
+    fn broadcast_prepare_errors_when_a_shard_channel_is_closed() {
         let (mut senders, joins) = spawn_mock_shards(vec![Ok(())]);
         // Add a dead channel whose receiver has already been dropped.
         let (dead_tx, dead_rx) = mpsc::channel::<ShardCommand>();
@@ -668,7 +824,11 @@ mod tests {
         let group = control_group(senders);
 
         let err = group
-            .broadcast_apply(loaded(Config::default()), ConfigDiff::default())
+            .broadcast_prepare(
+                ShardTransactionId(1),
+                loaded(Config::default()),
+                ConfigDiff::default(),
+            )
             .expect_err("closed channel must error");
         assert!(matches!(err, ApplyError::ShardSend(WorkerIdx(99))));
         assert!(err.apply_state_is_indeterminate());
@@ -682,19 +842,20 @@ mod tests {
     #[test]
     fn reported_shard_failure_is_not_indeterminate() {
         assert!(
-            !ApplyError::ShardApply(vec![(WorkerIdx(1), "failed".to_string())])
+            !ApplyError::ShardFailure(vec![(WorkerIdx(1), "failed".to_string())])
                 .apply_state_is_indeterminate()
         );
         assert!(!ApplyError::Target("rejected".to_string()).apply_state_is_indeterminate());
     }
 
     #[test]
-    fn broadcast_apply_timeout_lists_outstanding_workers() {
+    fn broadcast_prepare_timeout_lists_outstanding_workers() {
         let (tx0, rx0) = mpsc::channel::<ShardCommand>();
         let (tx1, rx1) = mpsc::channel::<ShardCommand>();
         let join0 = thread::spawn(move || {
             let ack = ack_sender(rx0.recv().unwrap());
             ack.send(ShardAck {
+                id: ShardTransactionId(1),
                 worker: WorkerIdx(0),
                 result: Ok(()),
             })
@@ -704,6 +865,7 @@ mod tests {
             let ack = ack_sender(rx1.recv().unwrap());
             thread::sleep(Duration::from_millis(100));
             let _ = ack.send(ShardAck {
+                id: ShardTransactionId(1),
                 worker: WorkerIdx(1),
                 result: Ok(()),
             });
@@ -714,7 +876,11 @@ mod tests {
         );
 
         let error = group
-            .broadcast_apply(loaded(Config::default()), ConfigDiff::default())
+            .broadcast_prepare(
+                ShardTransactionId(1),
+                loaded(Config::default()),
+                ConfigDiff::default(),
+            )
             .expect_err("missing acknowledgement must time out");
         assert!(matches!(
             error,
@@ -737,6 +903,7 @@ mod tests {
             let ack = ack_sender(rx0.recv().unwrap());
             for _ in 0..2 {
                 ack.send(ShardAck {
+                    id: ShardTransactionId(1),
                     worker: WorkerIdx(0),
                     result: Ok(()),
                 })
@@ -754,7 +921,7 @@ mod tests {
         );
 
         let error = group
-            .broadcast_drain_page_cache()
+            .broadcast_drain_page_cache(ShardTransactionId(1))
             .expect_err("duplicate acknowledgement must not complete fan-in");
         assert!(matches!(
             error,
@@ -776,7 +943,7 @@ mod tests {
         let group = control_group(vec![(WorkerIdx(7), tx)]);
 
         let error = group
-            .broadcast_drain_page_cache()
+            .broadcast_drain_page_cache(ShardTransactionId(1))
             .expect_err("dropped acknowledgement sender must disconnect fan-in");
         assert!(matches!(
             error,
@@ -807,7 +974,10 @@ mod tests {
         ) -> Result<(), ApplyError> {
             self.last_diff = Some(*diff);
             if self.fail_in_place {
-                return Err(ApplyError::ShardApply(vec![(WorkerIdx(0), "nope".into())]));
+                return Err(ApplyError::ShardFailure(vec![(
+                    WorkerIdx(0),
+                    "nope".into(),
+                )]));
             }
             self.in_place += 1;
             Ok(())

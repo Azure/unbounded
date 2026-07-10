@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use unbounded_storage::config::{
     self, ApplyError, ConfigApplyTarget, ConfigDiff, LoadedConfig, ShardControlGroup,
+    ShardDecision, ShardTransactionId,
 };
 use unbounded_storage::fabric::PeerId;
 use unbounded_storage::memory::HUGEPAGE_2MB;
@@ -559,6 +560,7 @@ pub struct ProcessApplyTarget {
     layer: Option<ShardLayer>,
     disk_registry: DiskRegistry<UringDiskTarget>,
     cache_directories: Arc<CacheDirectorySet>,
+    next_transaction_id: u64,
 }
 
 impl ProcessApplyTarget {
@@ -571,6 +573,7 @@ impl ProcessApplyTarget {
             layer: Some(layer),
             disk_registry,
             cache_directories,
+            next_transaction_id: 1,
         }
     }
 
@@ -607,6 +610,14 @@ impl ProcessApplyTarget {
     pub fn into_parts(self) -> (Option<ShardLayer>, DiskRegistry<UringDiskTarget>) {
         (self.layer, self.disk_registry)
     }
+
+    fn allocate_transaction_id(&mut self) -> Result<ShardTransactionId, ApplyError> {
+        let id = ShardTransactionId(self.next_transaction_id);
+        self.next_transaction_id = self.next_transaction_id.checked_add(1).ok_or_else(|| {
+            ApplyError::Target("shard transaction id space exhausted".to_string())
+        })?;
+        Ok(id)
+    }
 }
 
 impl ConfigApplyTarget for ProcessApplyTarget {
@@ -632,80 +643,141 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             || diff.frontends_changed;
 
         if needs_broadcast {
-            let layer = self
+            {
+                let layer = self
+                    .layer
+                    .as_mut()
+                    .expect("shard layer present between applies");
+
+                // Peer connections live on the shared fabric endpoints, not
+                // on individual shards, so they are reconciled once per
+                // endpoint here.
+                if diff.requires_peer_reconcile() {
+                    let runtime_peers = config::runtime_peers(new.runtime());
+                    if let Err(failures) = layer.fabric_group.reconcile_peers(&runtime_peers) {
+                        crate::SHUTDOWN.store(true, Ordering::Release);
+                        return Err(ApplyError::Target(format!(
+                            "hard peer reconciliation failure(s): {}",
+                            failures.join("; ")
+                        )));
+                    }
+                }
+
+                // The RPC-side backend registries also live on the shared
+                // endpoints; reconcile them before broadcasting so the shards
+                // rebuild their own transport registries against an already
+                // up-to-date origin surface.
+                if diff.backends_changed {
+                    layer
+                        .fabric_group
+                        .reconcile_backends(&new.config().backends);
+                }
+            }
+
+            let id = self.allocate_transaction_id()?;
+
+            let prepare = self
                 .layer
-                .as_mut()
-                .expect("shard layer present between applies");
-
-            // Peer connections live on the shared fabric endpoints, not
-            // on individual shards, so they are reconciled once per
-            // endpoint here.
-            if diff.requires_peer_reconcile() {
-                let runtime_peers = config::runtime_peers(new.runtime());
-                if let Err(failures) = layer.fabric_group.reconcile_peers(&runtime_peers) {
-                    crate::SHUTDOWN.store(true, Ordering::Release);
-                    return Err(ApplyError::Target(format!(
-                        "hard peer reconciliation failure(s): {}",
-                        failures.join("; ")
-                    )));
-                }
-            }
-
-            // The RPC-side backend registries also live on the shared
-            // endpoints; reconcile them before broadcasting so the shards
-            // rebuild their own transport registries against an already
-            // up-to-date origin surface.
-            if diff.backends_changed {
-                layer
-                    .fabric_group
-                    .reconcile_backends(&new.config().backends);
-            }
-
-            // Republish config + routing to every shard and block until
-            // each has acked, so the routing surface and per-shard
-            // backend/frontend reconcile each shard performs on receipt
-            // have provably landed.
-            if let Err(error) = layer.control.broadcast_apply(new.clone(), *diff) {
-                if error.apply_state_is_indeterminate() {
-                    crate::SHUTDOWN.store(true, Ordering::Release);
-                }
-                return Err(error);
-            }
-        }
-
-        if diff.disks_changed {
-            let layer = self
-                .layer
-                .as_mut()
-                .expect("shard layer present between applies");
-            if let Err(error) = layer.control.broadcast_drain_page_cache() {
-                if error.apply_state_is_indeterminate() {
-                    crate::SHUTDOWN.store(true, Ordering::Release);
-                }
-                return Err(error);
-            }
-        }
-
-        // Disk/channel changes mutate live registries and directories, so
-        // all fallible shard broadcasts must complete before this point.
-        // If a broadcast fails, ConfigController keeps the old config as
-        // current and disk reconciliation does not begin. Once reconciliation
-        // begins, its realized subset is published even when an open fails;
-        // returning that failure keeps the desired snapshot retryable.
-        if diff.caches_changed || diff.disks_changed {
-            self.reconcile_disks(new.runtime())?;
-        }
-
-        // Routing is the process-wide visibility point for a successful
-        // apply. Publish it only after every fallible shard broadcast and
-        // the disk update have completed, so failed applies retain the
-        // prior route snapshot everywhere.
-        if diff.requires_routing_reload() {
-            self.layer
                 .as_ref()
                 .expect("shard layer present between applies")
-                .routes
-                .store_snapshot(new.routes().clone());
+                .control
+                .broadcast_prepare(id, new.clone(), *diff);
+            if let Err(error) = prepare {
+                if error.apply_state_is_indeterminate() {
+                    crate::SHUTDOWN.store(true, Ordering::Release);
+                    return Err(error);
+                }
+                if let Err(abort_error) = self
+                    .layer
+                    .as_ref()
+                    .expect("shard layer present between applies")
+                    .control
+                    .broadcast_finish(id, ShardDecision::Abort)
+                {
+                    crate::SHUTDOWN.store(true, Ordering::Release);
+                    return Err(abort_error);
+                }
+                return Err(error);
+            }
+
+            if diff.disks_changed {
+                let drain = self
+                    .layer
+                    .as_ref()
+                    .expect("shard layer present between applies")
+                    .control
+                    .broadcast_drain_page_cache(id);
+                if let Err(error) = drain {
+                    if error.apply_state_is_indeterminate() {
+                        crate::SHUTDOWN.store(true, Ordering::Release);
+                        return Err(error);
+                    }
+                    if let Err(abort_error) = self
+                        .layer
+                        .as_ref()
+                        .expect("shard layer present between applies")
+                        .control
+                        .broadcast_finish(id, ShardDecision::Abort)
+                    {
+                        crate::SHUTDOWN.store(true, Ordering::Release);
+                        return Err(abort_error);
+                    }
+                    return Err(error);
+                }
+            }
+
+            if diff.caches_changed || diff.disks_changed {
+                if let Err(error) = self.reconcile_disks(new.runtime()) {
+                    let layer = self
+                        .layer
+                        .as_ref()
+                        .expect("shard layer present between applies");
+                    if let Err(abort_error) =
+                        layer.control.broadcast_finish(id, ShardDecision::Abort)
+                    {
+                        crate::SHUTDOWN.store(true, Ordering::Release);
+                        return Err(abort_error);
+                    }
+                    return Err(error);
+                }
+            }
+
+            // Route publication is irrevocable. A subsequent commit failure
+            // therefore makes the process unsafe to continue.
+            if diff.requires_routing_reload() {
+                self.layer
+                    .as_ref()
+                    .expect("shard layer present between applies")
+                    .routes
+                    .store_snapshot(new.routes().clone());
+            }
+
+            let layer = self
+                .layer
+                .as_ref()
+                .expect("shard layer present between applies");
+            if let Err(error) = layer.control.broadcast_finish(id, ShardDecision::Commit) {
+                crate::SHUTDOWN.store(true, Ordering::Release);
+                return Err(error);
+            }
+        } else {
+            // Keep non-shard process surfaces correct if a future diff flag
+            // stops requiring a shard transaction.
+            if diff.caches_changed || diff.disks_changed {
+                if let Err(error) = self.reconcile_disks(new.runtime()) {
+                    if error.apply_state_is_indeterminate() {
+                        crate::SHUTDOWN.store(true, Ordering::Release);
+                    }
+                    return Err(error);
+                }
+            }
+            if diff.requires_routing_reload() {
+                self.layer
+                    .as_ref()
+                    .expect("shard layer present between applies")
+                    .routes
+                    .store_snapshot(new.routes().clone());
+            }
         }
 
         Ok(())

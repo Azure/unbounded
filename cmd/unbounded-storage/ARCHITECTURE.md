@@ -183,12 +183,15 @@ dormant `SO_REUSEPORT` socket, then enter the listening state only during
 activation. A failed preparation therefore leaves the prior resource, binding,
 and stripe geometry live and retryable. Active frontend entries record the
 binding and stripe geometry they realized, so a failed rebuild is detected and
-retried on the next apply. Replacement uses an undo-log transaction: the old
-backend and frontend remain owned until finalization and can be restored if a
-later local activation fails. A shard commits its complete backend/frontend pass
-together, retiring old frontends before old backends; any failure or deferral
-restores both registries plus their prior geometry and bindings. Cross-shard
-commit/rollback is not yet wired to this transaction boundary.
+retried on the next apply. Replacement is coordinated across shards with
+two-phase commit. Prepare stages backend and dormant frontend replacements
+invisibly while the old registries, geometry, and bindings remain live. After
+page-cache drain and disk reconciliation complete when required, routes are
+published and Commit activates frontends first, publishes backends next, then
+updates geometry, bindings, and spec maps. Abort drops staged transactions.
+Transaction-id mismatch or incomplete fan-in is indeterminate and fail-stop.
+Peer and disk reconciliation remain outside this rollback boundary, and route
+publication before Commit is irrevocable.
 
 ### Shutdown
 
@@ -602,7 +605,8 @@ registries are all updated without tearing the shard layer down. Backing
 memory, the topology plan, the fabric max in-flight knob, and the local
 `self` peer identity are fixed at startup (mostly sourced from the
 config `[startup]` section, see the CLI section), not reloadable config
-fields. Shard apply and page-cache-drain fan-in use one 60-second deadline
+fields. Each shard prepare, finish, and page-cache-drain fan-in uses one
+60-second absolute deadline
 for the complete worker set and report outstanding worker identities. A
 timeout, acknowledgement-channel disconnect, or partial broadcast send failure
 requests process shutdown: already-delivered commands may complete later, so
@@ -613,12 +617,13 @@ lifecycle/configuration failures; startup rejects them, while live apply
 requests fail-stop shutdown because remove/add mutations cannot be rolled back.
 All shard transports and fabric RPC handlers share one process-wide
 `RouteTableHandle`. The apply target is its only writer and publishes the new
-snapshot once, after shard acknowledgement, page-cache drain, and disk
-publication succeed. Disk open failures are returned after the realized subset
-is published, leaving the desired config retryable and routing on the prior
-snapshot. This keeps routing on the prior snapshot when an earlier
-apply step reports failure; other resource reconciliation is still not a
-whole-process transaction.
+snapshot after prepare, page-cache drain, and disk publication succeed and
+before the shard Commit decision. Backend/frontend resources remain invisible
+until Commit. A determinate prepare, drain, or disk failure is followed by
+Abort; an indeterminate phase or any failed Commit or Abort requests shutdown.
+Disk reconciliation still publishes its realized subset and peer reconciliation
+still mutates shared fabric state outside this transaction, so this is not
+whole-process transactionality.
 
 Sections (all optional, each falling back to defaults):
 
@@ -667,12 +672,11 @@ Sections (all optional, each falling back to defaults):
 After defaults and validation, loading constructs one immutable `LoadedConfig`:
 the raw `Config`, one owned `RuntimeGraph`, and one route snapshot built from
 that graph. The watcher (`notify`-based) emits these loaded snapshots; main's
-`wait_for_shutdown_with_updates` reconciles peers (remove + add on address/numa
-drift, via a `last_applied` cache), disks, and - by broadcasting the applied
-config to every shard - each shard's backend and frontend registries plus the
-routing snapshot. The apply target and shards consume the same loaded graph and
-routes; this is coherent preparation, not whole-process transactionality. It
-republishes the channel snapshot each update, logs
+`wait_for_shutdown_with_updates` reconciles peers, coordinates cross-shard
+backend/frontend two-phase commit, reconciles disks, and publishes routes. The
+apply target and shards consume the same loaded graph and transaction id. Peer
+and disk changes remain outside rollback, so this is not whole-process
+transactionality. It republishes the channel snapshot each update, logs
 `config gen=N ...`, and sets `SHUTDOWN` if the watcher disconnects.
 
 ### 7.12 `tls/` - the shared TLS transport
