@@ -777,6 +777,16 @@ impl ProcessApplyTarget {
     }
 }
 
+fn fail_stop_disk_reconcile<T>(
+    result: Result<T, ApplyError>,
+    shutdown: &AtomicBool,
+) -> Result<T, ApplyError> {
+    if result.is_err() {
+        shutdown.store(true, Ordering::Release);
+    }
+    result
+}
+
 impl ConfigApplyTarget for ProcessApplyTarget {
     fn apply_in_place(
         &mut self,
@@ -855,25 +865,19 @@ impl ConfigApplyTarget for ProcessApplyTarget {
                 }
             }
 
+            // Opening a disk may provision a file or format metadata. Cross
+            // the fail-stop boundary before reconciliation because closing a
+            // staged handle cannot undo either operation.
             if diff.caches_changed || diff.disks_changed {
-                if let Err(error) = self.reconcile_disks(new.runtime()) {
-                    let layer = self
-                        .layer
-                        .as_ref()
-                        .expect("shard layer present between applies");
-                    if let Err(abort_error) =
-                        layer.control.broadcast_finish(id, ShardDecision::Abort)
-                    {
-                        crate::SHUTDOWN.store(true, Ordering::Release);
-                        return Err(abort_error);
-                    }
+                if let Err(error) =
+                    fail_stop_disk_reconcile(self.reconcile_disks(new.runtime()), &crate::SHUTDOWN)
+                {
                     return Err(error);
                 }
             }
 
-            // Shared fabric state cannot be rolled back. Reconcile it only
-            // after every abortable shard and disk preparation has succeeded;
-            // failures from this point onward are fail-stop.
+            // Shared fabric state cannot be rolled back either. Reconcile it
+            // only after shard preparation and disk reconciliation succeed.
             {
                 let layer = self
                     .layer
@@ -918,10 +922,9 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             // Keep non-shard process surfaces correct if a future diff flag
             // stops requiring a shard transaction.
             if diff.caches_changed || diff.disks_changed {
-                if let Err(error) = self.reconcile_disks(new.runtime()) {
-                    if error.apply_state_is_indeterminate() {
-                        crate::SHUTDOWN.store(true, Ordering::Release);
-                    }
+                if let Err(error) =
+                    fail_stop_disk_reconcile(self.reconcile_disks(new.runtime()), &crate::SHUTDOWN)
+                {
                     return Err(error);
                 }
             }
@@ -1054,6 +1057,20 @@ mod tests {
         watchdog.disarm();
 
         assert_eq!(terminated.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn disk_reconcile_failure_is_fail_stop() {
+        let shutdown = AtomicBool::new(false);
+        let result: Result<(), ApplyError> = fail_stop_disk_reconcile(
+            Err(ApplyError::Target(
+                "later disk failed after destructive open".into(),
+            )),
+            &shutdown,
+        );
+
+        assert!(result.is_err());
+        assert!(shutdown.load(Ordering::Acquire));
     }
 
     #[test]
