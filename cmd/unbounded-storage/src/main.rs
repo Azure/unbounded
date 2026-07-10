@@ -899,6 +899,7 @@ fn run_shard(
             .map(|f| (f.name.clone(), f.clone()))
             .collect();
         let mut last_bindings: HashMap<String, ResolvedFrontendBinding> = frontend_bindings.clone();
+        let mut pending_frontend_updates = HashSet::new();
         shard_loop.add_tick_hook(move || {
             let mut did_work = false;
             while let Ok(cmd) = ctrl_rx.try_recv() {
@@ -924,6 +925,7 @@ fn run_shard(
                             &apply.loaded.runtime().frontends,
                             &last_backends,
                             desired_backends,
+                            &pending_frontend_updates,
                         );
                         let forced_frontend_updates: HashSet<String> =
                             frontends_to_rebuild.into_iter().collect();
@@ -955,19 +957,24 @@ fn run_shard(
                                 g.insert(spec.name.clone(), spec.stripe_size_bytes());
                             }
                         }
-                        let mut applied_bindings = HashMap::new();
-                        for (id, spec) in &last_frontends {
-                            let desired_spec = desired_frontends.iter().find(|f| f.name == *id);
-                            if desired_spec == Some(spec) {
-                                if let Some(binding) = apply.loaded.runtime().frontends.get(id) {
-                                    applied_bindings.insert(id.clone(), binding.clone());
-                                    continue;
-                                }
-                            }
-                            if let Some(binding) = last_bindings.get(id) {
-                                applied_bindings.insert(id.clone(), binding.clone());
-                            }
-                        }
+                        let unsuccessful_frontends: HashSet<String> = combined
+                            .frontends
+                            .failures
+                            .iter()
+                            .chain(&combined.frontends.deferred)
+                            .map(|(id, _)| id.clone())
+                            .collect();
+                        pending_frontend_updates = forced_frontend_updates
+                            .intersection(&unsuccessful_frontends)
+                            .cloned()
+                            .collect();
+                        let applied_bindings = applied_frontend_bindings(
+                            &last_bindings,
+                            &apply.loaded.runtime().frontends,
+                            desired_frontends,
+                            &last_frontends,
+                            &unsuccessful_frontends,
+                        );
                         *bindings.borrow_mut() = applied_bindings.clone();
                         last_bindings = applied_bindings;
 
@@ -1204,6 +1211,7 @@ fn frontend_rebuild_ids(
     next_bindings: &HashMap<String, ResolvedFrontendBinding>,
     last_backends: &HashMap<String, BackendSpec>,
     desired_backends: &[BackendSpec],
+    pending_updates: &HashSet<String>,
 ) -> Vec<String> {
     let changed_backend_geometry: HashSet<String> = desired_backends
         .iter()
@@ -1221,8 +1229,31 @@ fn frontend_rebuild_ids(
             .then(|| id.clone())
         })
         .collect();
+    rebuild.extend(pending_updates.iter().cloned());
     rebuild.sort();
+    rebuild.dedup();
     rebuild
+}
+
+fn applied_frontend_bindings(
+    last_bindings: &HashMap<String, ResolvedFrontendBinding>,
+    desired_bindings: &HashMap<String, ResolvedFrontendBinding>,
+    desired_frontends: &[FrontendSpec],
+    applied_frontends: &HashMap<String, FrontendSpec>,
+    unsuccessful_frontends: &HashSet<String>,
+) -> HashMap<String, ResolvedFrontendBinding> {
+    applied_frontends
+        .iter()
+        .filter_map(|(id, spec)| {
+            let desired_spec = desired_frontends.iter().find(|desired| desired.name == *id);
+            let binding = if desired_spec == Some(spec) && !unsuccessful_frontends.contains(id) {
+                desired_bindings.get(id)
+            } else {
+                last_bindings.get(id)
+            }?;
+            Some((id.clone(), binding.clone()))
+        })
+        .collect()
 }
 
 impl FrontendBuildCtx {
@@ -2035,29 +2066,79 @@ mod tests {
     }
 
     #[test]
-    fn backend_stripe_size_change_rebuilds_frontend() {
-        let mut last_bindings = HashMap::new();
-        last_bindings.insert("f".to_string(), binding("f", "b"));
-
-        let mut next_bindings = HashMap::new();
-        next_bindings.insert("f".to_string(), binding("f", "b"));
-
+    fn failed_stripe_size_rebuild_retries() {
+        let bindings = HashMap::from([("f".to_string(), binding("f", "b"))]);
         let old_backend = backend_spec("b");
         let mut new_backend = old_backend.clone();
         let Some(config::backend_spec::Config::Http(cfg)) = new_backend.config.as_mut() else {
             panic!("expected http backend config");
         };
         *cfg.stripe_size_bytes.as_mut().expect("stripe size set") *= 2;
-
-        let mut last_backends = HashMap::new();
-        last_backends.insert(old_backend.name.clone(), old_backend);
+        let desired_backends = [new_backend];
+        let last_backends = HashMap::from([("b".to_string(), old_backend)]);
 
         assert_eq!(
             frontend_rebuild_ids(
-                &last_bindings,
-                &next_bindings,
+                &bindings,
+                &bindings,
                 &last_backends,
-                &[new_backend]
+                &desired_backends,
+                &HashSet::new(),
+            ),
+            vec!["f".to_string()],
+        );
+
+        // The backend update can apply before the forced frontend replacement
+        // fails, so geometry drift alone disappears from the next diff.
+        let advanced_backends = HashMap::from([("b".to_string(), desired_backends[0].clone())]);
+        assert_eq!(
+            frontend_rebuild_ids(
+                &bindings,
+                &bindings,
+                &advanced_backends,
+                &desired_backends,
+                &HashSet::from(["f".to_string()]),
+            ),
+            vec!["f".to_string()],
+            "failed forced replacement must be retried",
+        );
+    }
+
+    #[test]
+    fn failed_binding_rebuild_preserves_old_binding() {
+        let old_bindings = HashMap::from([("f".to_string(), binding("f", "old"))]);
+        let new_bindings = HashMap::from([("f".to_string(), binding("f", "new"))]);
+        let frontend = FrontendSpec {
+            name: "f".to_string(),
+            source: "new".to_string(),
+            ..Default::default()
+        };
+        let desired_frontends = [frontend.clone()];
+        let applied_frontends = HashMap::from([("f".to_string(), frontend)]);
+
+        let after_failure = applied_frontend_bindings(
+            &old_bindings,
+            &new_bindings,
+            &desired_frontends,
+            &applied_frontends,
+            &HashSet::from(["f".to_string()]),
+        );
+        assert_eq!(
+            after_failure["f"].backend_id, "old",
+            "failed replacement must retain its live binding",
+        );
+        let last_backends = HashMap::from([
+            ("old".to_string(), backend_spec("old")),
+            ("new".to_string(), backend_spec("new")),
+        ]);
+        let desired_backends = [backend_spec("old"), backend_spec("new")];
+        assert_eq!(
+            frontend_rebuild_ids(
+                &after_failure,
+                &new_bindings,
+                &last_backends,
+                &desired_backends,
+                &HashSet::new(),
             ),
             vec!["f".to_string()],
         );
