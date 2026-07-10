@@ -33,6 +33,7 @@ use unbounded_storage::config::{
     self, ApplyError, Config, ConfigApplyTarget, ConfigDiff, ShardControlGroup,
 };
 use unbounded_storage::fabric::PeerId;
+use unbounded_storage::memory::HUGEPAGE_2MB;
 use unbounded_storage::p2p::RouteTableHandle;
 use unbounded_storage::runtime::{JoinHandle, Threading, WorkerIdx};
 use unbounded_storage::storage::StripeReq;
@@ -117,15 +118,8 @@ pub fn spawn_shard_layer(
     let layer_stop = Arc::new(AtomicBool::new(false));
     let worker_count = deps.workers.len();
     let settings = &deps.settings;
-    // `memory_total_bytes` is the whole host backing budget; split it
-    // evenly across the serving shards so each gets a NUMA-local slice
-    // and the host footprint stays fixed regardless of the auto-scaled
-    // serving-shard count.
-    let bytes_per_shard = if worker_count == 0 {
-        0
-    } else {
-        settings.memory_total_bytes / worker_count
-    };
+    let shard_backing_sizes = shard_backing_sizes(settings.memory_total_bytes, worker_count)
+        .map_err(|e| vec![format!("invalid shard memory budget: {e}")])?;
     let projection = config::runtime_projection(config)
         .map_err(|e| vec![format!("config projection failed: {e}")])?;
     let frontend_specs = Arc::new(config.frontends.clone());
@@ -169,6 +163,7 @@ pub fn spawn_shard_layer(
 
     for (i, (shard, _)) in deps.workers.iter().enumerate() {
         let widx = WorkerIdx(u16::try_from(i).expect("worker index fits in u16"));
+        let backing_size = shard_backing_sizes[i];
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<config::ShardCommand>();
         control_senders.push((widx, ctrl_tx));
         let (peer_tx, peer_rx) = mpsc::channel::<Arc<Vec<crate::PeerPublish>>>();
@@ -200,7 +195,7 @@ pub fn spawn_shard_layer(
                         fabric,
                         tx,
                         backing_kind,
-                        bytes_per_shard,
+                        backing_size,
                         cache_directories,
                         route_handle,
                         frontend_specs,
@@ -365,6 +360,28 @@ pub fn spawn_shard_layer(
         layer_stop,
         _backing_keepalives: backing_keepalives,
     })
+}
+
+fn shard_backing_sizes(
+    memory_total_bytes: usize,
+    shard_count: usize,
+) -> Result<Vec<usize>, String> {
+    if shard_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let total_pages = memory_total_bytes / HUGEPAGE_2MB;
+    if total_pages < shard_count {
+        return Err(format!(
+            "{memory_total_bytes} bytes provides {total_pages} whole 2 MiB pages for {shard_count} serving shards"
+        ));
+    }
+
+    let pages_per_shard = total_pages / shard_count;
+    let remainder = total_pages % shard_count;
+    Ok((0..shard_count)
+        .map(|i| (pages_per_shard + usize::from(i < remainder)) * HUGEPAGE_2MB)
+        .collect())
 }
 
 fn local_self_peer(projection: &config::RuntimeGraph) -> Result<PeerId, String> {
@@ -550,5 +567,49 @@ mod tests {
         let graph = graph_with_self_peer(PeerId(7));
 
         assert_eq!(local_self_peer(&graph).unwrap(), PeerId(7));
+    }
+
+    #[test]
+    fn shard_backing_sizes_split_evenly() {
+        assert_eq!(
+            shard_backing_sizes(4 * HUGEPAGE_2MB, 2).unwrap(),
+            vec![2 * HUGEPAGE_2MB, 2 * HUGEPAGE_2MB]
+        );
+    }
+
+    #[test]
+    fn shard_backing_sizes_assign_remainder_in_worker_order() {
+        assert_eq!(
+            shard_backing_sizes(5 * HUGEPAGE_2MB, 2).unwrap(),
+            vec![3 * HUGEPAGE_2MB, 2 * HUGEPAGE_2MB]
+        );
+    }
+
+    #[test]
+    fn shard_backing_sizes_ignore_partial_trailing_page() {
+        let total = 5 * HUGEPAGE_2MB + HUGEPAGE_2MB - 1;
+        let sizes = shard_backing_sizes(total, 2).unwrap();
+
+        assert_eq!(sizes, vec![3 * HUGEPAGE_2MB, 2 * HUGEPAGE_2MB]);
+        assert!(sizes.iter().sum::<usize>() <= total);
+    }
+
+    #[test]
+    fn shard_backing_sizes_accept_exact_minimum() {
+        assert_eq!(
+            shard_backing_sizes(3 * HUGEPAGE_2MB, 3).unwrap(),
+            vec![HUGEPAGE_2MB; 3]
+        );
+    }
+
+    #[test]
+    fn shard_backing_sizes_reject_insufficient_or_zero_budget() {
+        assert!(shard_backing_sizes(2 * HUGEPAGE_2MB, 3).is_err());
+        assert!(shard_backing_sizes(0, 1).is_err());
+    }
+
+    #[test]
+    fn shard_backing_sizes_allow_zero_shards() {
+        assert_eq!(shard_backing_sizes(0, 0).unwrap(), Vec::<usize>::new());
     }
 }

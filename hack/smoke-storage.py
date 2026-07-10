@@ -168,19 +168,24 @@ DISK_SIZE = 2 * 1024 * 1024 * 1024
 
 # Hugepage backing. The daemon defaults to `backing_kind = "hugepage2_mb"`,
 # so the smoke test exercises that real path by reserving 2 MiB hugepages on
-# the host up front (rather than passing `--no-hugepages` to fall back to the
+# the host up front (rather than setting `no_hugepages` to fall back to the
 # heap). `memory_total_bytes` is pinned so the reservation below is exact.
 HUGEPAGE_SIZE = 2 * 1024 * 1024  # 2 MiB; matches memory::HUGEPAGE_2MB
-MEMORY_TOTAL_BYTES = 128 * 1024 * 1024  # matches StorageCfg default; pinned for exactness
-RPC_SCRATCH_PAGES = 8  # matches main.rs RPC_SCRATCH_PAGES
+MEMORY_TOTAL_BYTES = 128 * 1024 * 1024  # node-wide data pool; matches config default
+RPC_SCRATCH_PAGES_PER_FABRIC_UNIT = 8  # matches fabric_group.rs
+FABRIC_UNITS_PER_NODE = 1  # the smoke config uses one shared TCP fabric unit
 NODES_PER_SCENARIO = 2
 
-# Hugepages the per-node pool backing needs: the whole memory_total_bytes
-# pool (split across the node's serving shards) plus scratch, each rounded up.
-_HP_PER_SHARD = (MEMORY_TOTAL_BYTES + HUGEPAGE_SIZE - 1) // HUGEPAGE_SIZE + RPC_SCRATCH_PAGES
+# The daemon floors the node-wide data pool to whole pages before splitting it
+# across serving shards. RPC scratch is a separate fixed backing per fabric unit.
+_POOL_PAGES_PER_NODE = MEMORY_TOTAL_BYTES // HUGEPAGE_SIZE
+_RPC_SCRATCH_PAGES_PER_NODE = (
+    RPC_SCRATCH_PAGES_PER_FABRIC_UNIT * FABRIC_UNITS_PER_NODE
+)
+HUGEPAGES_PER_NODE = _POOL_PAGES_PER_NODE + _RPC_SCRATCH_PAGES_PER_NODE
 # Total for a scenario's two concurrent nodes, plus 50% headroom for any
 # allocator rounding / transient double-counting during teardown overlap.
-HUGEPAGES_NEEDED = _HP_PER_SHARD * NODES_PER_SCENARIO
+HUGEPAGES_NEEDED = HUGEPAGES_PER_NODE * NODES_PER_SCENARIO
 HUGEPAGES_RESERVE = HUGEPAGES_NEEDED + HUGEPAGES_NEEDED // 2
 
 NR_HUGEPAGES_PATH = Path("/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages")
@@ -772,7 +777,7 @@ def write_config(
     # config table name.
     #
     # Startup-fixed knobs live in the `[startup]` section of the config:
-    # the fabric bind address, the per-shard hugepage backing size
+    # the fabric bind address, the node-wide hugepage data pool
     # (memory_total_bytes, leaving the daemon's hugepage default in place), and
     # forcing the libfabric tcp provider (disable_rdma) even on hosts that
     # expose an unusable RDMA HCA in sysfs. They only take effect at process
