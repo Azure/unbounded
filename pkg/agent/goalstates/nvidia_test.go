@@ -103,6 +103,43 @@ func TestParseNVIDIALibraries_DeduplicatesByBasename(t *testing.T) {
 	}
 }
 
+func TestParseNVIDIALibraries_IncludesVDPAU(t *testing.T) {
+	libs := parseNVIDIALibraries([]byte(
+		"libvdpau_nvidia.so.580.126.09 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/vdpau/libvdpau_nvidia.so.580.126.09\n",
+	), "x86-64")
+
+	if got := len(libs); got != 1 {
+		t.Fatalf("parseNVIDIALibraries() returned %d libs, want 1", got)
+	}
+
+	if got, want := libs[0].HostPath, "/usr/lib/x86_64-linux-gnu/vdpau/libvdpau_nvidia.so.580.126.09"; got != want {
+		t.Errorf("HostPath = %q, want %q", got, want)
+	}
+}
+
+func TestBuildNVIDIAI386LibMounts(t *testing.T) {
+	ldconfigOutput := []byte(`libnvidia-ml.so.580.126.09 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.580.126.09
+libnvidia-ml.so.580.126.09 (libc6) => /usr/lib/i386-linux-gnu/libnvidia-ml.so.580.126.09
+libcuda.so.1 (libc6) => /usr/lib/i386-linux-gnu/libcuda.so.1
+libnvidia-ml.so.570.86.15 (libc6) => /usr/lib/i386-linux-gnu/libnvidia-ml.so.570.86.15
+`)
+	libs := parseNVIDIALibraries(ldconfigOutput, "x86-64")
+
+	mounts := buildNVIDIAI386LibMounts(ldconfigOutput, libs, "/usr/lib/i386-linux-gnu")
+
+	if got := len(mounts); got != 1 {
+		t.Fatalf("buildNVIDIAI386LibMounts() returned %d mounts, want 1", got)
+	}
+
+	if got, want := mounts[0].HostDir, "/usr/lib/i386-linux-gnu"; got != want {
+		t.Errorf("HostDir = %q, want %q", got, want)
+	}
+
+	if got, want := mounts[0].ContainerDir, "/run/host-nvidia-i386/0"; got != want {
+		t.Errorf("ContainerDir = %q, want %q", got, want)
+	}
+}
+
 func Test_buildNVIDIALibMounts(t *testing.T) {
 	libs := []NvidiaLibMapping{
 		{HostPath: "/usr/lib/x86_64-linux-gnu/libcuda.so.1"},

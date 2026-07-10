@@ -61,6 +61,13 @@ type NvidiaHost struct {
 	// /run/host-nvidia/<index>/. After boot, symlinks from the container's
 	// standard library path are created by the setup-nvidia-libraries task.
 	LibDirMounts []NvidiaLibDirMount
+
+	// I386LibDirMounts lists optional i386 driver library directories with a
+	// driver version matching the 64-bit driver libraries.
+	I386LibDirMounts []NvidiaLibDirMount
+
+	// NvidiaSMIPath is the host path to nvidia-smi, when available.
+	NvidiaSMIPath string
 }
 
 // NvidiaLibMapping maps a host NVIDIA library to its corresponding paths
@@ -102,13 +109,15 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 	}
 
 	devices := discoverNVIDIADevices()
-	libs, mounts := resolveNVIDIALibraries(archInfo)
+	libs, mounts, i386Mounts := resolveNVIDIALibraries(archInfo)
 
 	return NvidiaHost{
-		GPUDevicePaths:  devices,
-		ContainerLibDir: archInfo.libDir,
-		LibMappings:     libs,
-		LibDirMounts:    mounts,
+		GPUDevicePaths:   devices,
+		ContainerLibDir:  archInfo.libDir,
+		LibMappings:      libs,
+		LibDirMounts:     mounts,
+		I386LibDirMounts: i386Mounts,
+		NvidiaSMIPath:    discoverNVIDIASMI(),
 	}, nil
 }
 
@@ -144,11 +153,14 @@ type nvidiaArch struct {
 	// bind-mounted host NVIDIA libraries are created here inside the
 	// nspawn container.
 	libDir string
+
+	// i386LibDir is the optional 32-bit library directory on amd64 hosts.
+	i386LibDir string
 }
 
 // nvidiaArchMap maps GOARCH values to their NVIDIA-specific arch parameters.
 var nvidiaArchMap = map[string]nvidiaArch{
-	"amd64": {ldconfigTag: "x86-64", libDir: "/usr/lib/x86_64-linux-gnu"},
+	"amd64": {ldconfigTag: "x86-64", libDir: "/usr/lib/x86_64-linux-gnu", i386LibDir: "/usr/lib/i386-linux-gnu"},
 	"arm64": {ldconfigTag: "aarch64", libDir: "/usr/lib/aarch64-linux-gnu"},
 }
 
@@ -232,19 +244,99 @@ var nvidiaLibPrefixes = []string{
 	"libGLESv2_nvidia",
 	"libnvcuvid",
 	"libnvoptix",
+	"libvdpau_nvidia",
 }
 
 // resolveNVIDIALibraries runs ldconfig -p on the host and returns enriched
 // library mappings and their corresponding bind-mount specs.
-func resolveNVIDIALibraries(arch nvidiaArch) ([]NvidiaLibMapping, []NvidiaLibDirMount) {
+func resolveNVIDIALibraries(arch nvidiaArch) ([]NvidiaLibMapping, []NvidiaLibDirMount, []NvidiaLibDirMount) {
 	out, err := exec.Command("ldconfig", "-p").Output()
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	libs := parseNVIDIALibraries(out, arch.ldconfigTag)
 
-	return buildNVIDIALibMounts(libs, arch.libDir)
+	libs, mounts := buildNVIDIALibMounts(libs, arch.libDir)
+
+	return libs, mounts, buildNVIDIAI386LibMounts(out, libs, arch.i386LibDir)
+}
+
+func discoverNVIDIASMI() string {
+	for _, path := range []string{"/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi"} {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path
+		}
+	}
+
+	return ""
+}
+
+func buildNVIDIAI386LibMounts(ldconfigOutput []byte, libs []NvidiaLibMapping, i386LibDir string) []NvidiaLibDirMount {
+	if i386LibDir == "" {
+		return nil
+	}
+
+	versions := nvidiaDriverVersions(libs)
+	if len(versions) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+
+	var dirs []string
+
+	for _, lib := range parseNVIDIALibraries(ldconfigOutput, "") {
+		if !strings.HasPrefix(lib.HostPath, i386LibDir+"/") || !hasNvidiaDriverVersion(filepath.Base(lib.HostPath), versions) {
+			continue
+		}
+
+		dir := filepath.Dir(lib.HostPath)
+		if !seen[dir] {
+			seen[dir] = true
+			dirs = append(dirs, dir)
+		}
+	}
+
+	sort.Strings(dirs)
+
+	mounts := make([]NvidiaLibDirMount, len(dirs))
+	for i, dir := range dirs {
+		mounts[i] = NvidiaLibDirMount{
+			Index:        i,
+			HostDir:      dir,
+			ContainerDir: fmt.Sprintf("%s/%d", NvidiaHostI386LibDir, i),
+		}
+	}
+
+	return mounts
+}
+
+func nvidiaDriverVersions(libs []NvidiaLibMapping) map[string]bool {
+	versions := make(map[string]bool)
+
+	for _, lib := range libs {
+		_, version, found := strings.Cut(filepath.Base(lib.HostPath), ".so.")
+		if !found || strings.Count(version, ".") < 1 {
+			continue
+		}
+
+		if strings.Trim(version, "0123456789.") == "" {
+			versions[version] = true
+		}
+	}
+
+	return versions
+}
+
+func hasNvidiaDriverVersion(name string, versions map[string]bool) bool {
+	for version := range versions {
+		if strings.HasSuffix(name, "."+version) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // buildNVIDIALibMounts takes parsed library mappings (from parseNVIDIALibraries),
@@ -320,8 +412,8 @@ func parseNVIDIALibraries(ldconfigOutput []byte, archTag string) []NvidiaLibMapp
 			continue
 		}
 
-		// Filter to the target architecture only.
-		if !strings.Contains(line, archTag) {
+		// Filter to the target architecture only when an architecture was given.
+		if archTag != "" && !strings.Contains(line, archTag) {
 			continue
 		}
 
@@ -351,12 +443,19 @@ func parseNVIDIALibraries(ldconfigOutput []byte, archTag string) []NvidiaLibMapp
 
 		basename := filepath.Base(hostPath)
 
-		// Deduplicate by basename — first match wins (ldconfig orders by priority).
-		if seen[basename] {
+		// Deduplicate by basename for an architecture-specific lookup, where
+		// ldconfig priority determines the preferred library. Keep paths
+		// distinct when collecting optional i386 directories.
+		key := basename
+		if archTag == "" {
+			key = hostPath
+		}
+
+		if seen[key] {
 			continue
 		}
 
-		seen[basename] = true
+		seen[key] = true
 
 		libs = append(libs, NvidiaLibMapping{HostPath: hostPath})
 	}

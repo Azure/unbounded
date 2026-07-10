@@ -56,6 +56,10 @@ func (s *setupNVIDIA) Do(ctx context.Context) error {
 		return err
 	}
 
+	if err := s.prepareDriverRoot(ctx); err != nil {
+		return err
+	}
+
 	if err := s.generateCDISpec(ctx); err != nil {
 		return err
 	}
@@ -102,6 +106,80 @@ func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
 	s.log.Info("NVIDIA library symlinks created and ldconfig updated",
 		slog.Int("count", len(libs)),
 	)
+
+	return nil
+}
+
+func (s *setupNVIDIA) prepareDriverRoot(ctx context.Context) error {
+	machine := s.goalState.MachineName
+	driverDir := goalstates.NvidiaDriverDir
+	driverLibDir := filepath.Join(driverDir, "lib", filepath.Base(s.goalState.Nvidia.ContainerLibDir))
+	i386LibDir := filepath.Join(driverDir, "lib", "i386-linux-gnu")
+
+	if _, err := executil.MachineRun(ctx, s.log, machine,
+		"rm", "-rf", driverDir,
+	); err != nil {
+		return fmt.Errorf("remove NVIDIA driver root: %w", err)
+	}
+
+	if _, err := executil.MachineRun(ctx, s.log, machine,
+		"mkdir", "-p", driverLibDir, i386LibDir,
+		filepath.Join(driverDir, "usr", "bin"),
+		filepath.Join(driverDir, "usr", "lib"),
+		filepath.Join(driverDir, "sbin"),
+		filepath.Join(driverDir, "etc"),
+	); err != nil {
+		return fmt.Errorf("create NVIDIA driver root: %w", err)
+	}
+
+	for _, lib := range s.goalState.Nvidia.LibMappings {
+		destination := filepath.Join(driverLibDir, filepath.Base(lib.ContainerPath))
+		if filepath.Base(filepath.Dir(lib.HostPath)) == "vdpau" {
+			destination = filepath.Join(driverLibDir, "vdpau", filepath.Base(lib.ContainerPath))
+			if _, err := executil.MachineRun(ctx, s.log, machine, "mkdir", "-p", filepath.Dir(destination)); err != nil {
+				return fmt.Errorf("create NVIDIA VDPAU directory: %w", err)
+			}
+		}
+
+		if _, err := executil.MachineRun(ctx, s.log, machine, "cp", "-aL", lib.ContainerPath, destination); err != nil {
+			return fmt.Errorf("copy NVIDIA library %s: %w", lib.ContainerPath, err)
+		}
+	}
+
+	for _, mount := range s.goalState.Nvidia.I386LibDirMounts {
+		if _, err := executil.MachineRun(ctx, s.log, machine, "cp", "-aL", mount.ContainerDir+"/.", i386LibDir); err != nil {
+			return fmt.Errorf("copy i386 NVIDIA libraries from %s: %w", mount.ContainerDir, err)
+		}
+	}
+
+	if s.goalState.Nvidia.NvidiaSMIPath != "" {
+		if _, err := executil.MachineRun(ctx, s.log, machine,
+			"cp", "-L", filepath.Join(goalstates.NvidiaHostBinDir, filepath.Base(s.goalState.Nvidia.NvidiaSMIPath)),
+			filepath.Join(driverDir, "usr", "bin", "nvidia-smi"),
+		); err != nil {
+			return fmt.Errorf("copy nvidia-smi: %w", err)
+		}
+	}
+
+	if _, err := executil.MachineRun(ctx, s.log, machine,
+		"ln", "-sfn", filepath.Join("..", "..", "lib", filepath.Base(s.goalState.Nvidia.ContainerLibDir)),
+		filepath.Join(driverDir, "usr", "lib", filepath.Base(s.goalState.Nvidia.ContainerLibDir)),
+	); err != nil {
+		return fmt.Errorf("link NVIDIA multiarch library directory: %w", err)
+	}
+
+	if _, err := executil.MachineRun(ctx, s.log, machine,
+		"ln", "-sfn", filepath.Join("..", "..", "lib", "i386-linux-gnu"),
+		filepath.Join(driverDir, "usr", "lib", "i386-linux-gnu"),
+	); err != nil {
+		return fmt.Errorf("link NVIDIA i386 library directory: %w", err)
+	}
+
+	if _, err := executil.MachineRun(ctx, s.log, machine,
+		"ln", "-sfn", "/sbin/ldconfig", filepath.Join(driverDir, "sbin", "ldconfig"),
+	); err != nil {
+		return fmt.Errorf("link NVIDIA driver ldconfig: %w", err)
+	}
 
 	return nil
 }

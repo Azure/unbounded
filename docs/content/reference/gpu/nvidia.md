@@ -46,9 +46,13 @@ full sequence is:
    entries into the nspawn and systemd service override configs.
 4. **NVIDIA setup.** After the nspawn boots, creates symlinks in the
    container's multiarch library directory pointing into `/run/host-nvidia/`,
-   runs `ldconfig`, then runs `nvidia-ctk cdi generate` to produce the CDI
-   spec at `/etc/cdi/nvidia.yaml`. Most CDI hooks are disabled to avoid
-   interference with the nspawn environment.
+   then prepares `/run/nvidia/driver` for NVIDIA container tooling and device
+   plugins. The driver root contains copied 64-bit NVIDIA and VDPAU libraries,
+   `nvidia-smi` when present on the host, optional matching i386 libraries,
+   and multiarch compatibility symlinks. The agent then runs `ldconfig` and
+   `nvidia-ctk cdi generate` to produce the CDI spec at
+   `/etc/cdi/nvidia.yaml`. Most CDI hooks are disabled to avoid interference
+   with the nspawn environment.
 5. **containerd runtime configuration.** Writes a containerd drop-in that
    enables CDI support and registers the `nvidia` runtime class.
 6. **kubelet GPU advertisement.** Once kubelet starts and a user-deployed
