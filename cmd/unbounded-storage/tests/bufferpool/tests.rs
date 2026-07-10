@@ -25,208 +25,22 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// Invariant: byte correctness for successful clients.
-    /// For every client that finishes via `ClientOutcome::Ok`,
-    /// `PageGuard::as_slice()` bytes concatenate to the oracle
-    /// slice for the client's `(key, offset, len)`. `FetchErr` is
-    /// tolerated only under fault injection (`io_fault_rate > 0`);
-    /// a happy-path run that produces a `FetchErr` is itself a bug.
-    /// `ReadErr` is tolerated only when it's `StreamLimit` (the
-    /// only `Pool::read` error the harness can produce); other
-    /// `ReadErr` variants would indicate a regression.
     #[test]
-    fn invariant_byte_correctness(seed in any::<u64>(), w in workload_strategy()) {
+    fn bufferpool_invariants(seed in any::<u64>(), w in workload_strategy()) {
         let faults_enabled = w.io_fault_rate > 0;
-        let report = run_workload(seed, w).expect("run completed");
-        for (i, o) in report.outcomes.iter().enumerate() {
-            match o {
-                ClientOutcome::Ok { got, expected } => {
-                    prop_assert_eq!(got, expected, "client {} bytes mismatch", i);
-                }
-                ClientOutcome::Cancelled { got, expected, .. } => {
-                    prop_assert!(
-                        got.len() <= expected.len(),
-                        "client {} cancelled with got.len()={} > expected.len()={}",
-                        i, got.len(), expected.len(),
-                    );
-                    prop_assert_eq!(
-                        &got[..], &expected[..got.len()],
-                        "client {} cancelled-prefix bytes mismatch", i,
-                    );
-                }
-                ClientOutcome::ReadErr(e) => {
-                    prop_assert!(
-                        is_stream_limit(e),
-                        "client {} unexpected read error: {}", i, e,
-                    );
-                }
-                ClientOutcome::FetchErr(e) => {
-                    prop_assert!(
-                        faults_enabled,
-                        "client {} got FetchErr ({}) with io_fault_rate=0",
-                        i, e,
-                    );
-                }
-            }
-        }
-    }
-
-    /// Invariant: bounded termination.
-    /// `run_workload` returning `Ok` already implies the executor
-    /// neither deadlocked nor exhausted its step budget. The
-    /// property re-asserts that explicitly so a future refactor
-    /// can't silently flip the return type.
-    #[test]
-    fn invariant_bounded_termination(seed in any::<u64>(), w in workload_strategy()) {
-        let report = run_workload(seed, w).expect("run completed without deadlock or budget exhaustion");
-        // Sanity: every spawned client produced an outcome.
-        prop_assert!(!report.outcomes.is_empty());
-    }
-
-    /// Invariant: page accounting at quiescence.
-    /// Once every client has dropped its `ReadStream` and any tee
-    /// has drained, every backing page must be either free or
-    /// retained as an idle cache entry, with no active inflight
-    /// entries. This catches leaks in the recycle/cache paths
-    /// (`release_guard`, `decrement_stream`, `TeeGuard::drop`,
-    /// `LeaderGuard::drop`, and the `ParkOutcome::Error` cleanup
-    /// path).
-    ///
-    /// Must hold under fault injection too: error paths are not
-    /// allowed to leak pages or inflight entries.
-    #[test]
-    fn invariant_page_accounting_at_quiescence(seed in any::<u64>(), w in workload_strategy()) {
         let page_count = w.page_count;
         let page_cache_enabled = w.page_cache_enabled;
-        let report = run_workload(seed, w).expect("run completed");
-        assert_quiescent_accounting(&report, page_count)?;
-        if !page_cache_enabled {
-            prop_assert_eq!(
-                report.cached_pages_at_end,
-                0,
-                "disabled page cache retained {} pages",
-                report.cached_pages_at_end,
-            );
-        }
-        prop_assert_eq!(
-            report.prefetch_inflight_at_end, 0,
-            "prefetch budget not released: {} pages still reserved",
-            report.prefetch_inflight_at_end,
-        );
-    }
-
-    /// Invariant: single-flight coalescing per page.
-    /// For any `(key, page_no)` the pool issued `bulk_get` to, at
-    /// most one `bulk_get` may be in flight at a time. Sequential
-    /// re-issues (slot recycled and later refetched - including
-    /// after a transport-error tear-down) are allowed; concurrent
-    /// ones violate single-flight.
-    #[test]
-    fn invariant_single_flight_per_page(seed in any::<u64>(), w in workload_strategy()) {
-        let report = run_workload(seed, w).expect("run completed");
-        for (k, n) in &report.bulk_get_max_inflight {
-            prop_assert!(
-                *n <= 1,
-                "(key {:?}, page {}) had {} concurrent bulk_get calls; expected single-flight",
-                k.0, k.1, n,
-            );
-        }
-    }
-
-    /// Invariant: error outcomes do not stall the pool.
-    /// For workloads with fault injection, every client must
-    /// terminate with either `Ok` or `FetchErr` (never hang), and
-    /// the pool must still drain pages + inflight at quiescence.
-    /// This is the "no leaks on error paths" property that the
-    /// recycle-after-Error logic in `Action::Park` (and the
-    /// leader's error branch) is responsible for.
-    #[test]
-    fn invariant_no_leak_under_faults(seed in any::<u64>(), w in workload_strategy()) {
-        let page_count = w.page_count;
-        let report = run_workload(seed, w).expect("run completed under faults");
-        for (i, o) in report.outcomes.iter().enumerate() {
-            match o {
-                ClientOutcome::Ok { .. }
-                | ClientOutcome::Cancelled { .. }
-                | ClientOutcome::FetchErr(_) => {}
-                ClientOutcome::ReadErr(e) => {
-                    prop_assert!(
-                        is_stream_limit(e),
-                        "client {} unexpected ReadErr: {}", i, e,
-                    );
-                }
-            }
-        }
-        assert_quiescent_accounting(&report, page_count)?;
-    }
-
-    /// Invariant: `max_concurrent_streams` enforcement.
-    /// Every `ReadErr` outcome must be `Error::StreamLimit` (the
-    /// only `Pool::read` error the harness can produce), and the
-    /// pool must still drain pages + inflight at quiescence even
-    /// when some `read()` calls were rejected. When the workload
-    /// gives the pool enough headroom (limit >= clients), the
-    /// reject path must not fire at all.
-    #[test]
-    fn invariant_stream_limit_bounds(seed in any::<u64>(), w in workload_strategy()) {
-        let page_count = w.page_count;
         let limit = w.max_concurrent_streams;
         let n_clients = w.clients.len();
-        let report = run_workload(seed, w).expect("run completed");
-        let mut rejects = 0usize;
-        for (i, o) in report.outcomes.iter().enumerate() {
-            if let ClientOutcome::ReadErr(e) = o {
-                prop_assert!(
-                    is_stream_limit(e),
-                    "client {} unexpected ReadErr: {}", i, e,
-                );
-                rejects += 1;
-            }
-        }
-        if limit >= n_clients {
-            prop_assert_eq!(
-                rejects, 0,
-                "limit={} >= clients={} but {} streams were rejected",
-                limit, n_clients, rejects,
-            );
-        }
-        prop_assert!(
-            rejects <= n_clients,
-            "more rejects ({}) than clients ({})", rejects, n_clients,
-        );
-        assert_quiescent_accounting(&report, page_count)?;
-    }
-
-    /// Invariant: drain on mid-stream cancellation.
-    /// A `ClientSpec.cancel_after = Some(k)` client drops its
-    /// `ReadStream` after `k` successful `next_page` calls (or
-    /// immediately when `k == 0`). The pool must drain to a clean
-    /// state regardless: all pages back on the free list and no
-    /// inflight entries left, even when cancellations interleave
-    /// with faults, stream-limit rejects, and full reads. This
-    /// explicitly exercises the partial-iteration paths in
-    /// `decrement_stream` (slot in Idle/Loading at the time of
-    /// drop) and `release_guard` (last guard for a tee-pending
-    /// page).
-    #[test]
-    fn invariant_drain_on_cancellation(seed in any::<u64>(), w in workload_strategy()) {
-        let page_count = w.page_count;
-        let report = run_workload(seed, w).expect("run completed");
-        // Bytes for cancelled clients must be a prefix of the oracle.
-        for (i, o) in report.outcomes.iter().enumerate() {
-            if let ClientOutcome::Cancelled { got, expected, .. } = o {
-                prop_assert!(
-                    got.len() <= expected.len(),
-                    "client {} cancelled with got.len()={} > expected.len()={}",
-                    i, got.len(), expected.len(),
-                );
-                prop_assert_eq!(
-                    &got[..], &expected[..got.len()],
-                    "client {} cancelled-prefix bytes mismatch", i,
-                );
-            }
-        }
-        assert_quiescent_accounting(&report, page_count)?;
+        let report = run_workload(seed, w)
+            .expect("run completed without deadlock or budget exhaustion");
+        assert_byte_correctness(&report, faults_enabled)?;
+        assert_bounded_termination(&report)?;
+        assert_page_accounting(&report, page_count, page_cache_enabled)?;
+        assert_single_flight(&report)?;
+        assert_no_leak_under_faults(&report, page_count)?;
+        assert_stream_limit_bounds(&report, page_count, limit, n_clients)?;
+        assert_drain_on_cancellation(&report, page_count)?;
     }
 }
 
@@ -236,127 +50,298 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// Invariant: pipelined byte correctness with in-order delivery.
-    /// `read_pipelined` admits one stream per active plan slice and
-    /// pipelines page fetches across stripe boundaries, yet must
-    /// still deliver pages strictly in global plan order. For every
-    /// pipeline that finishes via `Ok`, the concatenated
-    /// `PageGuard` bytes must equal the oracle bytes for the plan's
-    /// ordered `(key, offset, len)` slices. Cancelled pipelines must
-    /// yield a prefix of the expected bytes (in-order truncation).
-    /// `FetchErr` is tolerated only under fault injection; `ReadErr`
-    /// only when it is `StreamLimit` (the pinned-high limit makes
-    /// this effectively unreachable, but we tolerate it rather than
-    /// assert a stronger property the harness does not guarantee).
     #[test]
-    fn pipelined_invariant_byte_correctness(
+    fn pipelined_bufferpool_invariants(
         seed in any::<u64>(),
         w in pipelined_workload_strategy(),
     ) {
         let faults_enabled = w.io_fault_rate > 0;
-        let report = run_workload(seed, w).expect("run completed");
-        for (i, o) in report.outcomes.iter().enumerate() {
-            match o {
-                ClientOutcome::Ok { got, expected } => {
-                    prop_assert_eq!(got, expected, "pipeline {} bytes mismatch", i);
-                }
-                ClientOutcome::Cancelled { got, expected, .. } => {
-                    prop_assert!(
-                        got.len() <= expected.len(),
-                        "pipeline {} cancelled with got.len()={} > expected.len()={}",
-                        i, got.len(), expected.len(),
-                    );
-                    prop_assert_eq!(
-                        &got[..], &expected[..got.len()],
-                        "pipeline {} cancelled-prefix bytes mismatch", i,
-                    );
-                }
-                ClientOutcome::ReadErr(e) => {
-                    prop_assert!(
-                        is_stream_limit(e),
-                        "pipeline {} unexpected read error: {}", i, e,
-                    );
-                }
-                ClientOutcome::FetchErr(e) => {
-                    prop_assert!(
-                        faults_enabled,
-                        "pipeline {} got FetchErr ({}) with io_fault_rate=0",
-                        i, e,
-                    );
-                }
+        let page_count = w.page_count;
+        let page_cache_enabled = w.page_cache_enabled;
+        let report = run_workload(seed, w)
+            .expect("run completed without deadlock or budget exhaustion");
+        assert_pipelined_byte_correctness(&report, faults_enabled)?;
+        assert_pipelined_page_accounting(&report, page_count, page_cache_enabled)?;
+        assert_pipelined_single_flight(&report)?;
+        assert_pipelined_bounded_termination(&report)?;
+    }
+}
+
+/// Invariant: byte correctness for successful clients and oracle-prefix
+/// correctness for cancelled clients. Fetch errors require fault injection,
+/// and read errors must be stream-limit rejections.
+fn assert_byte_correctness(report: &RunReport, faults_enabled: bool) -> Result<(), TestCaseError> {
+    for (i, o) in report.outcomes.iter().enumerate() {
+        match o {
+            ClientOutcome::Ok { got, expected } => {
+                prop_assert_eq!(got, expected, "client {} bytes mismatch", i);
+            }
+            ClientOutcome::Cancelled { got, expected, .. } => {
+                prop_assert!(
+                    got.len() <= expected.len(),
+                    "client {} cancelled with got.len()={} > expected.len()={}",
+                    i,
+                    got.len(),
+                    expected.len(),
+                );
+                prop_assert_eq!(
+                    &got[..],
+                    &expected[..got.len()],
+                    "client {} cancelled-prefix bytes mismatch",
+                    i,
+                );
+            }
+            ClientOutcome::ReadErr(e) => {
+                prop_assert!(
+                    is_stream_limit(e),
+                    "client {} unexpected read error: {}",
+                    i,
+                    e,
+                );
+            }
+            ClientOutcome::FetchErr(e) => {
+                prop_assert!(
+                    faults_enabled,
+                    "client {} got FetchErr ({}) with io_fault_rate=0",
+                    i,
+                    e,
+                );
             }
         }
     }
+    Ok(())
+}
 
-    /// Invariant: pipelined page accounting at quiescence.
-    /// The cross-stripe reader admits and releases one stream per
-    /// slice as the global cursor advances (`release_passed_slices`)
-    /// and shares the global prefetch budget. Once every pipeline
-    /// has dropped its `PipelinedRead`, all pages must be free or
-    /// idle-cached, no active inflight entries may remain, and the
-    /// prefetch budget must be fully released. Catches leaks in
-    /// `release_guard`, `release_prefetch`, and the per-slice
-    /// `decrement_stream`.
-    /// Must hold under faults and mid-stream cancellation too.
-    #[test]
-    fn pipelined_invariant_page_accounting(
-        seed in any::<u64>(),
-        w in pipelined_workload_strategy(),
-    ) {
-        let page_count = w.page_count;
-        let page_cache_enabled = w.page_cache_enabled;
-        let report = run_workload(seed, w).expect("run completed");
-        assert_quiescent_accounting(&report, page_count)?;
-        if !page_cache_enabled {
-            prop_assert_eq!(
-                report.cached_pages_at_end,
-                0,
-                "disabled page cache retained {} pages",
-                report.cached_pages_at_end,
-            );
-        }
+/// Invariant: every spawned client terminates within the executor budget.
+fn assert_bounded_termination(report: &RunReport) -> Result<(), TestCaseError> {
+    prop_assert!(!report.outcomes.is_empty());
+    Ok(())
+}
+
+/// Invariant: pages, inflight entries, cache policy, and prefetch reservations
+/// are fully accounted for at quiescence, including under fault injection.
+fn assert_page_accounting(
+    report: &RunReport,
+    page_count: usize,
+    page_cache_enabled: bool,
+) -> Result<(), TestCaseError> {
+    assert_quiescent_accounting(report, page_count)?;
+    if !page_cache_enabled {
         prop_assert_eq!(
-            report.prefetch_inflight_at_end, 0,
-            "prefetch budget not released: {} pages still reserved",
-            report.prefetch_inflight_at_end,
+            report.cached_pages_at_end,
+            0,
+            "disabled page cache retained {} pages",
+            report.cached_pages_at_end,
         );
     }
+    prop_assert_eq!(
+        report.prefetch_inflight_at_end,
+        0,
+        "prefetch budget not released: {} pages still reserved",
+        report.prefetch_inflight_at_end,
+    );
+    Ok(())
+}
 
-    /// Invariant: single-flight coalescing survives pipelining.
-    /// Even though the pipelined reader may have many pages in
-    /// flight across stripes (and the same stripe can appear in
-    /// more than one plan slice), no `(key, page_no)` may have more
-    /// than one concurrent `bulk_get`. Sequential re-issues remain
-    /// allowed.
-    #[test]
-    fn pipelined_invariant_single_flight(
-        seed in any::<u64>(),
-        w in pipelined_workload_strategy(),
-    ) {
-        let report = run_workload(seed, w).expect("run completed");
-        for (k, n) in &report.bulk_get_max_inflight {
+/// Invariant: at most one `bulk_get` is concurrently in flight per logical
+/// page; sequential reissues after recycle or failure remain allowed.
+fn assert_single_flight(report: &RunReport) -> Result<(), TestCaseError> {
+    for (k, n) in &report.bulk_get_max_inflight {
+        prop_assert!(
+            *n <= 1,
+            "(key {:?}, page {}) had {} concurrent bulk_get calls; expected single-flight",
+            k.0,
+            k.1,
+            n,
+        );
+    }
+    Ok(())
+}
+
+/// Invariant: error outcomes neither stall clients nor leak pages or inflight
+/// entries; read errors remain limited to stream admission rejection.
+fn assert_no_leak_under_faults(report: &RunReport, page_count: usize) -> Result<(), TestCaseError> {
+    for (i, o) in report.outcomes.iter().enumerate() {
+        match o {
+            ClientOutcome::Ok { .. }
+            | ClientOutcome::Cancelled { .. }
+            | ClientOutcome::FetchErr(_) => {}
+            ClientOutcome::ReadErr(e) => {
+                prop_assert!(is_stream_limit(e), "client {} unexpected ReadErr: {}", i, e,);
+            }
+        }
+    }
+    assert_quiescent_accounting(report, page_count)
+}
+
+/// Invariant: `max_concurrent_streams` rejects only with `StreamLimit`, never
+/// rejects when the limit covers all clients, and cannot reject extra clients.
+fn assert_stream_limit_bounds(
+    report: &RunReport,
+    page_count: usize,
+    limit: usize,
+    n_clients: usize,
+) -> Result<(), TestCaseError> {
+    let mut rejects = 0usize;
+    for (i, o) in report.outcomes.iter().enumerate() {
+        if let ClientOutcome::ReadErr(e) = o {
+            prop_assert!(is_stream_limit(e), "client {} unexpected ReadErr: {}", i, e,);
+            rejects += 1;
+        }
+    }
+    if limit >= n_clients {
+        prop_assert_eq!(
+            rejects,
+            0,
+            "limit={} >= clients={} but {} streams were rejected",
+            limit,
+            n_clients,
+            rejects,
+        );
+    }
+    prop_assert!(
+        rejects <= n_clients,
+        "more rejects ({}) than clients ({})",
+        rejects,
+        n_clients,
+    );
+    assert_quiescent_accounting(report, page_count)
+}
+
+/// Invariant: dropping a stream before EOF returns only an oracle prefix and
+/// drains pages and inflight entries despite faults or admission rejection.
+fn assert_drain_on_cancellation(
+    report: &RunReport,
+    page_count: usize,
+) -> Result<(), TestCaseError> {
+    for (i, o) in report.outcomes.iter().enumerate() {
+        if let ClientOutcome::Cancelled { got, expected, .. } = o {
             prop_assert!(
-                *n <= 1,
-                "(key {:?}, page {}) had {} concurrent bulk_get calls; expected single-flight",
-                k.0, k.1, n,
+                got.len() <= expected.len(),
+                "client {} cancelled with got.len()={} > expected.len()={}",
+                i,
+                got.len(),
+                expected.len(),
+            );
+            prop_assert_eq!(
+                &got[..],
+                &expected[..got.len()],
+                "client {} cancelled-prefix bytes mismatch",
+                i,
             );
         }
     }
+    assert_quiescent_accounting(report, page_count)
+}
 
-    /// Invariant: pipelined bounded termination.
-    /// `run_workload` returning `Ok` already implies no deadlock or
-    /// budget exhaustion; re-assert it explicitly and confirm every
-    /// spawned pipeline produced an outcome. This is the deadlock
-    /// guard for the cross-stripe driver under page pressure.
-    #[test]
-    fn pipelined_invariant_bounded_termination(
-        seed in any::<u64>(),
-        w in pipelined_workload_strategy(),
-    ) {
-        let report = run_workload(seed, w)
-            .expect("run completed without deadlock or budget exhaustion");
-        prop_assert!(!report.outcomes.is_empty());
+/// Invariant: pipelined reads deliver plan bytes in global order; cancellation
+/// yields an ordered prefix, and errors obey the standard fault constraints.
+fn assert_pipelined_byte_correctness(
+    report: &RunReport,
+    faults_enabled: bool,
+) -> Result<(), TestCaseError> {
+    for (i, o) in report.outcomes.iter().enumerate() {
+        match o {
+            ClientOutcome::Ok { got, expected } => {
+                prop_assert_eq!(got, expected, "pipeline {} bytes mismatch", i);
+            }
+            ClientOutcome::Cancelled { got, expected, .. } => {
+                prop_assert!(
+                    got.len() <= expected.len(),
+                    "pipeline {} cancelled with got.len()={} > expected.len()={}",
+                    i,
+                    got.len(),
+                    expected.len(),
+                );
+                prop_assert_eq!(
+                    &got[..],
+                    &expected[..got.len()],
+                    "pipeline {} cancelled-prefix bytes mismatch",
+                    i,
+                );
+            }
+            ClientOutcome::ReadErr(e) => {
+                prop_assert!(
+                    is_stream_limit(e),
+                    "pipeline {} unexpected read error: {}",
+                    i,
+                    e,
+                );
+            }
+            ClientOutcome::FetchErr(e) => {
+                prop_assert!(
+                    faults_enabled,
+                    "pipeline {} got FetchErr ({}) with io_fault_rate=0",
+                    i,
+                    e,
+                );
+            }
+        }
     }
+    Ok(())
+}
+
+/// Invariant: pipelined readers release pages, per-slice streams, inflight
+/// entries, cache-disabled pages, and the shared prefetch budget at quiescence.
+fn assert_pipelined_page_accounting(
+    report: &RunReport,
+    page_count: usize,
+    page_cache_enabled: bool,
+) -> Result<(), TestCaseError> {
+    assert_quiescent_accounting(report, page_count)?;
+    if !page_cache_enabled {
+        prop_assert_eq!(
+            report.cached_pages_at_end,
+            0,
+            "disabled page cache retained {} pages",
+            report.cached_pages_at_end,
+        );
+    }
+    prop_assert_eq!(
+        report.prefetch_inflight_at_end,
+        0,
+        "prefetch budget not released: {} pages still reserved",
+        report.prefetch_inflight_at_end,
+    );
+    Ok(())
+}
+
+/// Invariant: cross-stripe pipelining preserves per-page single-flight even
+/// when a stripe appears in multiple plan slices.
+fn assert_pipelined_single_flight(report: &RunReport) -> Result<(), TestCaseError> {
+    assert_single_flight(report)
+}
+
+/// Invariant: every spawned pipeline terminates without deadlock or executor
+/// budget exhaustion under cross-stripe page pressure.
+fn assert_pipelined_bounded_termination(report: &RunReport) -> Result<(), TestCaseError> {
+    prop_assert!(!report.outcomes.is_empty());
+    Ok(())
+}
+
+/// `Error::StreamLimit`'s Display string from `src/bufferpool/types.rs`.
+/// The harness flattens errors to `String` at the framework boundary.
+fn is_stream_limit(msg: &str) -> bool {
+    msg == "max_concurrent_streams reached"
+}
+
+fn assert_quiescent_accounting(report: &RunReport, page_count: usize) -> Result<(), TestCaseError> {
+    prop_assert_eq!(
+        report.free_pages_at_end + report.cached_pages_at_end,
+        page_count,
+        "free_pages={} cached_pages={} expected total {}",
+        report.free_pages_at_end,
+        report.cached_pages_at_end,
+        page_count,
+    );
+    prop_assert_eq!(
+        report.active_inflight_entries_at_end,
+        0,
+        "active inflight not drained: {} entries (raw inflight={})",
+        report.active_inflight_entries_at_end,
+        report.inflight_entries_at_end,
+    );
+    Ok(())
 }
 
 /// Scenario test: with `max_concurrent_streams=1` and four
@@ -447,32 +432,6 @@ fn stream_limit_rejects_excess_concurrent_reads() {
     }
     assert_quiescent_accounting(&report, 2).expect("quiescent accounting");
 }
-/// `Error::StreamLimit`'s Display string from
-/// `src/bufferpool/types.rs`. We match on the message because the
-/// harness flattens errors to `String` at the framework boundary.
-fn is_stream_limit(msg: &str) -> bool {
-    msg == "max_concurrent_streams reached"
-}
-
-fn assert_quiescent_accounting(report: &RunReport, page_count: usize) -> Result<(), TestCaseError> {
-    prop_assert_eq!(
-        report.free_pages_at_end + report.cached_pages_at_end,
-        page_count,
-        "free_pages={} cached_pages={} expected total {}",
-        report.free_pages_at_end,
-        report.cached_pages_at_end,
-        page_count,
-    );
-    prop_assert_eq!(
-        report.active_inflight_entries_at_end,
-        0,
-        "active inflight not drained: {} entries (raw inflight={})",
-        report.active_inflight_entries_at_end,
-        report.inflight_entries_at_end,
-    );
-    Ok(())
-}
-
 /// Regression: a 5-client / 2-page / fault-injecting workload
 /// shrunk from `invariant_single_flight_per_page` was deadlocking
 /// (no task ready while at least one was still alive). The bug
