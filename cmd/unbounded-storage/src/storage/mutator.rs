@@ -26,6 +26,7 @@ use std::task::{Context, Poll, Waker};
 
 use crate::storage::btree::LeafEntry;
 use crate::storage::completion::{Completion, CompletionWait};
+use crate::storage::lru::Resident;
 use crate::storage::types::PageKey;
 
 /// A single submission to the mutator. The submitter has already
@@ -40,7 +41,7 @@ pub(crate) enum MutatorReq {
         done: Arc<MutatorReply>,
     },
     Delete {
-        keys: Vec<PageKey>,
+        victims: Vec<Resident>,
         done: Arc<MutatorReply>,
     },
 }
@@ -53,8 +54,9 @@ pub(crate) enum MutatorOutcome {
     /// `None` if the key was unmapped. The entry's `byte_len` lets
     /// the submitter free the entire prior contiguous LBA range.
     InsertCommitted { prior: Option<LeafEntry> },
-    /// `apply_batch` committed the delete set.
-    DeleteCommitted,
+    /// `apply_batch` committed. Only victims whose expected LBA still matched
+    /// are returned for reclamation.
+    DeleteCommitted { removed: Vec<Resident> },
     /// `apply_batch` returned an error. The submitter must clean
     /// up the LBA range it allocated (insert) or leave eviction
     /// state untouched (delete).
@@ -300,9 +302,9 @@ mod tests {
     #[test]
     fn reply_resolves_after_set() {
         let r = MutatorReply::new();
-        r.set(MutatorOutcome::DeleteCommitted);
+        r.set(MutatorOutcome::DeleteCommitted { removed: vec![] });
         let out = block_on(r.wait());
-        assert!(matches!(out, MutatorOutcome::DeleteCommitted));
+        assert!(matches!(out, MutatorOutcome::DeleteCommitted { .. }));
     }
 
     #[test]
@@ -311,11 +313,11 @@ mod tests {
         let r1 = MutatorReply::new();
         let r2 = MutatorReply::new();
         q.push(MutatorReq::Delete {
-            keys: vec![],
+            victims: vec![],
             done: r1.clone(),
         });
         q.push(MutatorReq::Delete {
-            keys: vec![],
+            victims: vec![],
             done: r2.clone(),
         });
         let drained = q.try_drain_up_to(10);
@@ -328,7 +330,7 @@ mod tests {
         q.close();
         let r = MutatorReply::new();
         q.push(MutatorReq::Delete {
-            keys: vec![],
+            victims: vec![],
             done: r.clone(),
         });
         let out = block_on(r.wait());
@@ -346,7 +348,7 @@ mod tests {
     fn push_n(q: &Arc<MutatorQueue>, n: usize) {
         for _ in 0..n {
             q.push(MutatorReq::Delete {
-                keys: vec![],
+                victims: vec![],
                 done: MutatorReply::new(),
             });
         }
@@ -503,7 +505,7 @@ mod tests {
             }
         } else {
             MutatorReq::Delete {
-                keys: vec![page_key(idx as u32)],
+                victims: vec![],
                 done: reply.clone(),
             }
         };
@@ -540,7 +542,7 @@ mod tests {
                             done.set(MutatorOutcome::InsertCommitted { prior: None })
                         }
                         MutatorReq::Delete { done, .. } => {
-                            done.set(MutatorOutcome::DeleteCommitted)
+                            done.set(MutatorOutcome::DeleteCommitted { removed: vec![] })
                         }
                     }
                 }
