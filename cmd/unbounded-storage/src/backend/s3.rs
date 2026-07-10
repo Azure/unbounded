@@ -25,14 +25,11 @@
 //!   rather than the generic non-2xx error, so the pool can distinguish a
 //!   missing object from a transport failure.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
 
 use ::http::header::{HOST, RANGE};
 
-use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
+use crate::bufferpool::{BulkRef, Error, PageRef};
 use crate::http::{Method, StatusCode, response_closes_after_body, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
@@ -43,6 +40,9 @@ use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
 use super::limiter::FetchLimiter;
+
+/// Stream produced by [`S3Backend::bulk_get`].
+pub type S3FetchStream<'a> = super::http_family::FetchStream<'a>;
 
 /// Origin backend that fetches stripe byte ranges from an
 /// S3-compatible origin into bufferpool pages. The endpoint scheme
@@ -224,81 +224,6 @@ impl Backend for S3Backend {
         dsts: &'a [PageRef],
     ) -> Self::Stream<'a> {
         self.fetch_stream(req, src, dsts)
-    }
-}
-
-/// Stream produced by [`S3Backend::bulk_get`]. Drives one boxed fetch
-/// future to completion, then yields each destination [`PageRef`] in
-/// order (one per `poll_next`) followed by `None`. On a fetch error it
-/// yields that error once then `None`.
-pub struct S3FetchStream<'a> {
-    state: FetchState<'a>,
-    delivered: Vec<PageRef>,
-    next: usize,
-}
-
-enum FetchState<'a> {
-    Running(Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>),
-    Delivering,
-    Failed(Option<Error>),
-    Done,
-}
-
-impl<'a> S3FetchStream<'a> {
-    fn pending(
-        fut: Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>,
-        delivered: Vec<PageRef>,
-    ) -> Self {
-        Self {
-            state: FetchState::Running(fut),
-            delivered,
-            next: 0,
-        }
-    }
-
-    fn immediate_error(msg: &'static str) -> Self {
-        Self {
-            state: FetchState::Failed(Some(Error::from(msg))),
-            delivered: Vec::new(),
-            next: 0,
-        }
-    }
-}
-
-impl PageStream for S3FetchStream<'_> {
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<PageRef, Error>>> {
-        let this = self.get_mut();
-        loop {
-            match &mut this.state {
-                FetchState::Running(fut) => match fut.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(())) => {
-                        this.state = FetchState::Delivering;
-                    }
-                    Poll::Ready(Err(e)) => {
-                        this.state = FetchState::Failed(Some(e));
-                    }
-                },
-                FetchState::Delivering => {
-                    if this.next >= this.delivered.len() {
-                        this.state = FetchState::Done;
-                        return Poll::Ready(None);
-                    }
-                    let page = this.delivered[this.next];
-                    this.next += 1;
-                    return Poll::Ready(Some(Ok(page)));
-                }
-                FetchState::Failed(slot) => {
-                    let e = slot.take();
-                    this.state = FetchState::Done;
-                    return Poll::Ready(e.map(Err));
-                }
-                FetchState::Done => return Poll::Ready(None),
-            }
-        }
     }
 }
 

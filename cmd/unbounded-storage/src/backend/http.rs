@@ -30,14 +30,11 @@
 //!   ETag yields a new key), rather than being tracked as separate
 //!   per-stripe metadata.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
 
 use ::http::header::{HOST, RANGE};
 
-use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
+use crate::bufferpool::{BulkRef, Error, PageRef};
 use crate::http::{Method, StatusCode, response_closes_after_body, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
@@ -48,6 +45,9 @@ use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
 use super::limiter::FetchLimiter;
+
+/// Stream produced by [`HttpBackend::bulk_get`].
+pub type HttpFetchStream<'a> = super::http_family::FetchStream<'a>;
 
 /// Origin backend that fetches stripe byte ranges from an HTTP/1.1
 /// origin server (plaintext `http://` or kernel-TLS `https://`) into
@@ -253,87 +253,6 @@ impl Backend for HttpBackend {
         dsts: &'a [PageRef],
     ) -> Self::Stream<'a> {
         self.fetch_stream(req, src, dsts)
-    }
-}
-
-/// Stream produced by [`HttpBackend::bulk_get`]. Drives one boxed fetch
-/// future to completion, then yields each destination [`PageRef`] in
-/// order (one per `poll_next`) followed by `None`. On a fetch error it
-/// yields that error once then `None`.
-pub struct HttpFetchStream<'a> {
-    state: FetchState<'a>,
-    /// The destination pages to yield, in order, once the fetch lands.
-    delivered: Vec<PageRef>,
-    next: usize,
-}
-
-enum FetchState<'a> {
-    /// Fetch still running; the boxed future fills the destination
-    /// pages and resolves `Ok(())` or `Err`.
-    Running(Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>),
-    /// Fetch landed; emit each delivered page in order.
-    Delivering,
-    /// A single error to emit before ending the stream.
-    Failed(Option<Error>),
-    /// Stream exhausted.
-    Done,
-}
-
-impl<'a> HttpFetchStream<'a> {
-    fn pending(
-        fut: Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>,
-        delivered: Vec<PageRef>,
-    ) -> Self {
-        Self {
-            state: FetchState::Running(fut),
-            delivered,
-            next: 0,
-        }
-    }
-
-    fn immediate_error(msg: &'static str) -> Self {
-        Self {
-            state: FetchState::Failed(Some(Error::from(msg))),
-            delivered: Vec::new(),
-            next: 0,
-        }
-    }
-}
-
-impl PageStream for HttpFetchStream<'_> {
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<PageRef, Error>>> {
-        let this = self.get_mut();
-        loop {
-            match &mut this.state {
-                FetchState::Running(fut) => match fut.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(())) => {
-                        this.state = FetchState::Delivering;
-                    }
-                    Poll::Ready(Err(e)) => {
-                        this.state = FetchState::Failed(Some(e));
-                    }
-                },
-                FetchState::Delivering => {
-                    if this.next >= this.delivered.len() {
-                        this.state = FetchState::Done;
-                        return Poll::Ready(None);
-                    }
-                    let page = this.delivered[this.next];
-                    this.next += 1;
-                    return Poll::Ready(Some(Ok(page)));
-                }
-                FetchState::Failed(slot) => {
-                    let e = slot.take();
-                    this.state = FetchState::Done;
-                    return Poll::Ready(e.map(Err));
-                }
-                FetchState::Done => return Poll::Ready(None),
-            }
-        }
     }
 }
 

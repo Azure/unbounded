@@ -14,6 +14,9 @@ mod conn;
 mod http;
 
 #[cfg(target_os = "linux")]
+mod http_family;
+
+#[cfg(target_os = "linux")]
 mod limiter;
 
 #[cfg(target_os = "linux")]

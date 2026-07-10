@@ -22,14 +22,11 @@
 //! targets public-read containers (or the Azurite emulator) and sends no
 //! authorization or shared-key signature.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
 
 use ::http::header::{HOST, RANGE};
 
-use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
+use crate::bufferpool::{BulkRef, Error, PageRef};
 use crate::http::{Method, StatusCode, response_closes_after_body, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
@@ -40,6 +37,9 @@ use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
 use super::limiter::FetchLimiter;
+
+/// Stream produced by [`AzureBackend::bulk_get`].
+pub type AzureFetchStream<'a> = super::http_family::FetchStream<'a>;
 
 /// The pinned `x-ms-version` REST API version sent on every Azure Blob
 /// request. Azure requires this header to select the wire semantics of
@@ -206,81 +206,6 @@ impl Backend for AzureBackend {
         dsts: &'a [PageRef],
     ) -> Self::Stream<'a> {
         self.fetch_stream(req, src, dsts)
-    }
-}
-
-/// Stream produced by [`AzureBackend::bulk_get`]. Drives one boxed fetch
-/// future to completion, then yields each destination [`PageRef`] in
-/// order (one per `poll_next`) followed by `None`. On a fetch error it
-/// yields that error once then `None`.
-pub struct AzureFetchStream<'a> {
-    state: FetchState<'a>,
-    delivered: Vec<PageRef>,
-    next: usize,
-}
-
-enum FetchState<'a> {
-    Running(Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>),
-    Delivering,
-    Failed(Option<Error>),
-    Done,
-}
-
-impl<'a> AzureFetchStream<'a> {
-    fn pending(
-        fut: Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>,
-        delivered: Vec<PageRef>,
-    ) -> Self {
-        Self {
-            state: FetchState::Running(fut),
-            delivered,
-            next: 0,
-        }
-    }
-
-    fn immediate_error(msg: &'static str) -> Self {
-        Self {
-            state: FetchState::Failed(Some(Error::from(msg))),
-            delivered: Vec::new(),
-            next: 0,
-        }
-    }
-}
-
-impl PageStream for AzureFetchStream<'_> {
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<PageRef, Error>>> {
-        let this = self.get_mut();
-        loop {
-            match &mut this.state {
-                FetchState::Running(fut) => match fut.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(())) => {
-                        this.state = FetchState::Delivering;
-                    }
-                    Poll::Ready(Err(e)) => {
-                        this.state = FetchState::Failed(Some(e));
-                    }
-                },
-                FetchState::Delivering => {
-                    if this.next >= this.delivered.len() {
-                        this.state = FetchState::Done;
-                        return Poll::Ready(None);
-                    }
-                    let page = this.delivered[this.next];
-                    this.next += 1;
-                    return Poll::Ready(Some(Ok(page)));
-                }
-                FetchState::Failed(slot) => {
-                    let e = slot.take();
-                    this.state = FetchState::Done;
-                    return Poll::Ready(e.map(Err));
-                }
-                FetchState::Done => return Poll::Ready(None),
-            }
-        }
     }
 }
 
