@@ -1,16 +1,25 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Shared mechanics for HTTP-family origin backends.
+//! Shared GET/HEAD engines and page mechanics for HTTP-family origin backends.
 
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use ::http::header::{HOST, RANGE};
 
 use crate::bufferpool::{Error, PageRef, PageStream};
 use crate::http::{Method, StatusCode, response_closes_after_body, serialize_request};
+use crate::ring::{NetHandle, SockAddr};
+use crate::storage::ObjectMetadata;
+use crate::tls::TlsContext;
+
+use super::conn::{
+    OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
+};
+use super::limiter::FetchLimiter;
 
 const AZURE_MS_VERSION: &str = "2021-08-06";
 
@@ -22,20 +31,8 @@ pub(super) enum HttpFlavor {
 }
 
 impl HttpFlavor {
-    const fn get_build_error(self) -> &'static str {
-        match self {
-            Self::Http => "http backend: failed to build origin GET request",
-            Self::S3 => "s3 backend: failed to build origin GET request",
-            Self::Azure => "azure backend: failed to build origin GET request",
-        }
-    }
-
-    const fn head_build_error(self) -> &'static str {
-        match self {
-            Self::Http => "http backend: failed to build origin HEAD request",
-            Self::S3 => "s3 backend: failed to build origin HEAD request",
-            Self::Azure => "azure backend: failed to build origin HEAD request",
-        }
+    const fn is_azure(self) -> bool {
+        matches!(self, Self::Azure)
     }
 }
 
@@ -63,25 +60,6 @@ impl ResponseErrorMessages {
     }
 }
 
-pub(super) const HTTP_RESPONSE_ERRORS: ResponseErrorMessages = ResponseErrorMessages::new(
-    "http backend: origin response missing Content-Length on keep-alive connection",
-    "http backend: origin Content-Length exceeds requested range",
-    "http backend: origin returned non-2xx status",
-    "http backend: origin ignored Range (200) for a non-zero offset",
-);
-pub(super) const S3_RESPONSE_ERRORS: ResponseErrorMessages = ResponseErrorMessages::new(
-    "s3 backend: origin response missing Content-Length on keep-alive connection",
-    "s3 backend: origin Content-Length exceeds requested range",
-    "s3 backend: origin returned non-2xx status",
-    "s3 backend: origin ignored Range (200) for a non-zero offset",
-);
-pub(super) const AZURE_RESPONSE_ERRORS: ResponseErrorMessages = ResponseErrorMessages::new(
-    "azure backend: origin response missing Content-Length on keep-alive connection",
-    "azure backend: origin Content-Length exceeds requested range",
-    "azure backend: origin returned non-2xx status",
-    "azure backend: origin ignored Range (200) for a non-zero offset",
-);
-
 #[derive(Clone, Copy)]
 pub(super) struct PageErrorMessages {
     over_read: &'static str,
@@ -101,14 +79,137 @@ pub(super) const HTTP_PAGE_ERRORS: PageErrorMessages = PageErrorMessages::new(
     "http backend: over read from origin",
     "http backend: page byte offset overflow",
 );
-pub(super) const S3_PAGE_ERRORS: PageErrorMessages = PageErrorMessages::new(
-    "s3 backend: over read from origin",
-    "s3 backend: page byte offset overflow",
-);
-pub(super) const AZURE_PAGE_ERRORS: PageErrorMessages = PageErrorMessages::new(
-    "azure backend: over read from origin",
-    "azure backend: page byte offset overflow",
-);
+
+#[derive(Clone, Copy)]
+pub(super) struct HttpEnginePolicy {
+    flavor: HttpFlavor,
+    response_errors: ResponseErrorMessages,
+    page_errors: PageErrorMessages,
+    pub(super) missing_origin: &'static str,
+    get_build: &'static str,
+    get_destination_mismatch: &'static str,
+    get_zero_length: &'static str,
+    get_malformed_head: &'static str,
+    get_closed_head: &'static str,
+    get_head_too_large: &'static str,
+    get_content_range_mismatch: &'static str,
+    get_short_read: &'static str,
+    head_build: &'static str,
+    head_destination_too_small: &'static str,
+    head_malformed: &'static str,
+    head_closed: &'static str,
+    head_too_large: &'static str,
+    head_non_200: &'static str,
+    head_missing_content_length: &'static str,
+}
+
+pub(super) static HTTP_ENGINE_POLICY: HttpEnginePolicy = HttpEnginePolicy {
+    flavor: HttpFlavor::Http,
+    response_errors: ResponseErrorMessages::new(
+        "http backend: origin response missing Content-Length on keep-alive connection",
+        "http backend: origin Content-Length exceeds requested range",
+        "http backend: origin returned non-2xx status",
+        "http backend: origin ignored Range (200) for a non-zero offset",
+    ),
+    page_errors: HTTP_PAGE_ERRORS,
+    missing_origin: "http backend: request missing origin",
+    get_build: "http backend: failed to build origin GET request",
+    get_destination_mismatch: "http backend: destination page lengths do not match requested range",
+    get_zero_length: "http backend: zero-length fetch requested",
+    get_malformed_head: "http backend: malformed origin response head",
+    get_closed_head: "http backend: connection closed before response headers complete",
+    get_head_too_large: "http backend: response head exceeds limit",
+    get_content_range_mismatch: "http backend: origin Content-Range start does not match request",
+    get_short_read: "http backend: short read from origin",
+    head_build: "http backend: failed to build origin HEAD request",
+    head_destination_too_small: "http backend: length entry destination smaller than 8 bytes",
+    head_malformed: "http backend: malformed origin response head",
+    head_closed: "http backend: connection closed before metadata HEAD headers complete",
+    head_too_large: "http backend: metadata HEAD response head exceeds 64 KiB",
+    head_non_200: "http backend: metadata HEAD returned non-200 status",
+    head_missing_content_length: "http backend: metadata HEAD missing Content-Length",
+};
+
+pub(super) static S3_ENGINE_POLICY: HttpEnginePolicy = HttpEnginePolicy {
+    flavor: HttpFlavor::S3,
+    response_errors: ResponseErrorMessages::new(
+        "s3 backend: origin response missing Content-Length on keep-alive connection",
+        "s3 backend: origin Content-Length exceeds requested range",
+        "s3 backend: origin returned non-2xx status",
+        "s3 backend: origin ignored Range (200) for a non-zero offset",
+    ),
+    page_errors: PageErrorMessages::new(
+        "s3 backend: over read from origin",
+        "s3 backend: page byte offset overflow",
+    ),
+    missing_origin: "s3 backend: request missing origin",
+    get_build: "s3 backend: failed to build origin GET request",
+    get_destination_mismatch: "s3 backend: destination page lengths do not match requested range",
+    get_zero_length: "s3 backend: zero-length fetch requested",
+    get_malformed_head: "s3 backend: malformed origin response head",
+    get_closed_head: "s3 backend: connection closed before response headers complete",
+    get_head_too_large: "s3 backend: response head exceeds limit",
+    get_content_range_mismatch: "s3 backend: origin Content-Range start does not match request",
+    get_short_read: "s3 backend: short read from origin",
+    head_build: "s3 backend: failed to build origin HEAD request",
+    head_destination_too_small: "s3 backend: length entry destination smaller than 8 bytes",
+    head_malformed: "s3 backend: malformed origin response head",
+    head_closed: "s3 backend: connection closed before metadata HEAD headers complete",
+    head_too_large: "s3 backend: metadata HEAD response head exceeds 64 KiB",
+    head_non_200: "s3 backend: metadata HEAD returned non-200 status",
+    head_missing_content_length: "s3 backend: metadata HEAD missing Content-Length",
+};
+
+pub(super) static AZURE_ENGINE_POLICY: HttpEnginePolicy = HttpEnginePolicy {
+    flavor: HttpFlavor::Azure,
+    response_errors: ResponseErrorMessages::new(
+        "azure backend: origin response missing Content-Length on keep-alive connection",
+        "azure backend: origin Content-Length exceeds requested range",
+        "azure backend: origin returned non-2xx status",
+        "azure backend: origin ignored Range (200) for a non-zero offset",
+    ),
+    page_errors: PageErrorMessages::new(
+        "azure backend: over read from origin",
+        "azure backend: page byte offset overflow",
+    ),
+    missing_origin: "azure backend: request missing origin",
+    get_build: "azure backend: failed to build origin GET request",
+    get_destination_mismatch: "azure backend: destination page lengths do not match requested range",
+    get_zero_length: "azure backend: zero-length fetch requested",
+    get_malformed_head: "azure backend: malformed origin response head",
+    get_closed_head: "azure backend: connection closed before response headers complete",
+    get_head_too_large: "azure backend: response head exceeds limit",
+    get_content_range_mismatch: "azure backend: origin Content-Range start does not match request",
+    get_short_read: "azure backend: short read from origin",
+    head_build: "azure backend: failed to build origin HEAD request",
+    head_destination_too_small: "azure backend: length entry destination smaller than 8 bytes",
+    head_malformed: "azure backend: malformed origin response head",
+    head_closed: "azure backend: connection closed before metadata HEAD headers complete",
+    head_too_large: "azure backend: metadata HEAD response head exceeds 64 KiB",
+    head_non_200: "azure backend: metadata HEAD returned non-200 status",
+    head_missing_content_length: "azure backend: metadata HEAD missing Content-Length",
+};
+
+pub(super) struct OriginFetchInputs {
+    pub(super) handle: NetHandle,
+    pub(super) conns: OriginConnPool,
+    pub(super) origin: SockAddr,
+    pub(super) host: String,
+    pub(super) sni_host: String,
+    pub(super) tls: Option<Rc<TlsContext>>,
+    pub(super) path: String,
+    pub(super) dsts: Vec<PageRef>,
+    pub(super) backing_base: *mut u8,
+    pub(super) page_size: usize,
+    pub(super) limiter: FetchLimiter,
+    pub(super) policy: &'static HttpEnginePolicy,
+}
+
+pub(super) struct GetFetchInputs {
+    pub(super) origin: OriginFetchInputs,
+    pub(super) start: u64,
+    pub(super) len: u64,
+}
 
 /// Drives one origin fetch to completion, then yields its destination pages in
 /// order. A failed fetch yields exactly one error before terminating.
@@ -363,8 +464,8 @@ pub(super) fn expected_body_len(
     Ok(Some(content_length.min(requested_len)))
 }
 
-pub(super) fn format_get_request(
-    flavor: HttpFlavor,
+fn format_get_request(
+    policy: &'static HttpEnginePolicy,
     path: &str,
     host: &str,
     start: u64,
@@ -375,17 +476,17 @@ pub(super) fn format_get_request(
         .uri(path)
         .header(HOST, host)
         .header(RANGE, format!("bytes={start}-{end}"));
-    if matches!(flavor, HttpFlavor::Azure) {
+    if policy.flavor.is_azure() {
         builder = builder.header("x-ms-version", AZURE_MS_VERSION);
     }
     let request = builder
         .body(())
-        .map_err(|_| Error::from(flavor.get_build_error()))?;
+        .map_err(|_| Error::from(policy.get_build))?;
     Ok(serialize_request(&request))
 }
 
-pub(super) fn format_head_request(
-    flavor: HttpFlavor,
+fn format_head_request(
+    policy: &'static HttpEnginePolicy,
     path: &str,
     host: &str,
 ) -> Result<Vec<u8>, Error> {
@@ -393,13 +494,198 @@ pub(super) fn format_head_request(
         .method(Method::HEAD)
         .uri(path)
         .header(HOST, host);
-    if matches!(flavor, HttpFlavor::Azure) {
+    if policy.flavor.is_azure() {
         builder = builder.header("x-ms-version", AZURE_MS_VERSION);
     }
     let request = builder
         .body(())
-        .map_err(|_| Error::from(flavor.head_build_error()))?;
+        .map_err(|_| Error::from(policy.head_build))?;
     Ok(serialize_request(&request))
+}
+
+pub(super) async fn fetch_range(inputs: GetFetchInputs) -> Result<(), Error> {
+    let GetFetchInputs {
+        origin:
+            OriginFetchInputs {
+                handle,
+                conns,
+                origin,
+                host,
+                sni_host,
+                tls,
+                path,
+                dsts,
+                backing_base,
+                page_size,
+                limiter,
+                policy,
+            },
+        start,
+        len,
+    } = inputs;
+
+    let total: u64 = dsts.iter().map(|p| p.len as u64).sum();
+    if total != len {
+        return Err(Error::from(policy.get_destination_mismatch));
+    }
+    if len == 0 {
+        return Err(Error::from(policy.get_zero_length));
+    }
+
+    let _permit = limiter.acquire().await;
+    let request = format_get_request(policy, &path, &host, start, start + len - 1)?;
+    let (conn, head) = send_request_read_head(
+        &conns,
+        &handle,
+        origin,
+        &tls,
+        &sni_host,
+        request,
+        None,
+        policy.get_malformed_head,
+        policy.get_closed_head,
+        policy.get_head_too_large,
+    )
+    .await?;
+    let fd = conn.fd();
+    let is_tls = conn.is_tls();
+    let status = head.status;
+    let version_minor = head.version_minor;
+    let header_end = head.header_end;
+    let content_length = head.content_length;
+    let content_range_start = head.content_range_start;
+    let connection = head.connection;
+    let buf = head.buf;
+
+    check_origin_status(status, start, policy.response_errors)?;
+    if let Some(cr_start) = content_range_start {
+        if cr_start != start {
+            return Err(Error::from(policy.get_content_range_mismatch));
+        }
+    }
+
+    let body_start = header_end;
+    let body_len_mode = expected_body_len(
+        status,
+        version_minor,
+        connection.as_deref(),
+        content_length,
+        len,
+        policy.response_errors,
+    )?;
+    let capacity = pages_capacity(&dsts);
+    debug_assert_eq!(capacity as u64, len, "capacity must equal requested range");
+    let body_cap: usize = match body_len_mode {
+        Some(n) => n as usize,
+        None => len as usize,
+    };
+    if body_cap > capacity {
+        return Err(Error::from(policy.page_errors.over_read));
+    }
+
+    let leading = &buf[body_start..];
+    let lead_take = leading.len().min(body_cap);
+    if lead_take > 0 {
+        write_slice_into_pages(
+            &leading[..lead_take],
+            &dsts,
+            0,
+            backing_base,
+            page_size,
+            policy.page_errors,
+        )?;
+    }
+    let mut filled = lead_take;
+
+    while filled < body_cap {
+        let Some((page_byte_off, room)) =
+            locate_in_pages(&dsts, filled, page_size, policy.page_errors)?
+        else {
+            break;
+        };
+        let recv_len = room.min(body_cap - filled);
+        let n_recv = crate::tls::recv_fixed(&handle, fd, is_tls, page_byte_off, recv_len).await?;
+        if n_recv == 0 {
+            match body_len_mode {
+                Some(_) => return Err(Error::from(policy.get_short_read)),
+                None => break,
+            }
+        }
+        filled += n_recv;
+    }
+
+    zero_fill_pages_from(&dsts, filled, backing_base, page_size, policy.page_errors)?;
+    if body_response_reusable(
+        version_minor,
+        connection.as_deref(),
+        content_length,
+        body_cap,
+        leading.len(),
+        filled,
+    ) {
+        conns.put(conn);
+    }
+    Ok(())
+}
+
+pub(super) async fn fetch_metadata(inputs: OriginFetchInputs) -> Result<(), Error> {
+    let OriginFetchInputs {
+        handle,
+        conns,
+        origin,
+        host,
+        sni_host,
+        tls,
+        path,
+        dsts,
+        backing_base,
+        page_size,
+        limiter,
+        policy,
+    } = inputs;
+
+    let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
+    if capacity < 8 {
+        return Err(Error::from(policy.head_destination_too_small));
+    }
+
+    let _permit = limiter.acquire().await;
+    let request = format_head_request(policy, &path, &host)?;
+    const MAX_HEAD: usize = 64 * 1024;
+    let (conn, head) = send_request_read_head(
+        &conns,
+        &handle,
+        origin,
+        &tls,
+        &sni_host,
+        request,
+        Some(MAX_HEAD),
+        policy.head_malformed,
+        policy.head_closed,
+        policy.head_too_large,
+    )
+    .await?;
+    let status = head.status;
+    let version_minor = head.version_minor;
+    let header_end = head.header_end;
+    let content_length = head.content_length;
+    let connection = head.connection;
+    let buf = head.buf;
+
+    if status == StatusCode::NOT_FOUND {
+        return Err(Error::OriginNotFound);
+    }
+    if status != StatusCode::OK {
+        return Err(Error::from(policy.head_non_200));
+    }
+    let length = content_length.ok_or_else(|| Error::from(policy.head_missing_content_length))?;
+
+    let body = ObjectMetadata::new(length).encode()?;
+    copy_body_into_pages(&body, &dsts, backing_base, page_size, policy.page_errors)?;
+    if head_response_reusable(version_minor, connection.as_deref(), header_end, buf.len()) {
+        conns.put(conn);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -412,11 +698,8 @@ mod tests {
         "test backend: page byte offset overflow",
     );
 
-    const RESPONSE_ERRORS: [ResponseErrorMessages; 3] = [
-        HTTP_RESPONSE_ERRORS,
-        S3_RESPONSE_ERRORS,
-        AZURE_RESPONSE_ERRORS,
-    ];
+    const POLICIES: [&HttpEnginePolicy; 3] =
+        [&HTTP_ENGINE_POLICY, &S3_ENGINE_POLICY, &AZURE_ENGINE_POLICY];
 
     fn page(page_idx: u32) -> PageRef {
         PageRef {
@@ -682,21 +965,25 @@ mod tests {
 
     #[test]
     fn response_status_policy_is_shared_by_all_flavors() {
-        for errors in RESPONSE_ERRORS {
+        for policy in POLICIES {
             assert!(matches!(
-                check_origin_status(StatusCode::NOT_FOUND, 4096, errors),
+                check_origin_status(StatusCode::NOT_FOUND, 4096, policy.response_errors),
                 Err(Error::OriginNotFound)
             ));
-            assert!(check_origin_status(StatusCode::PARTIAL_CONTENT, 4096, errors).is_ok());
-            assert!(check_origin_status(StatusCode::OK, 0, errors).is_ok());
-            assert!(check_origin_status(StatusCode::OK, 1, errors).is_err());
-            assert!(check_origin_status(StatusCode::FORBIDDEN, 0, errors).is_err());
+            assert!(
+                check_origin_status(StatusCode::PARTIAL_CONTENT, 4096, policy.response_errors)
+                    .is_ok()
+            );
+            assert!(check_origin_status(StatusCode::OK, 0, policy.response_errors).is_ok());
+            assert!(check_origin_status(StatusCode::OK, 1, policy.response_errors).is_err());
+            assert!(check_origin_status(StatusCode::FORBIDDEN, 0, policy.response_errors).is_err());
         }
     }
 
     #[test]
     fn response_length_policy_is_shared_by_all_flavors() {
-        for errors in RESPONSE_ERRORS {
+        for policy in POLICIES {
+            let errors = policy.response_errors;
             assert_eq!(
                 expected_body_len(
                     StatusCode::PARTIAL_CONTENT,
@@ -742,9 +1029,9 @@ mod tests {
 
     #[test]
     fn http_and_s3_requests_have_common_anonymous_headers() {
-        for flavor in [HttpFlavor::Http, HttpFlavor::S3] {
+        for policy in [&HTTP_ENGINE_POLICY, &S3_ENGINE_POLICY] {
             let request =
-                format_get_request(flavor, "/bucket/key", "origin.example", 0, 4095).unwrap();
+                format_get_request(policy, "/bucket/key", "origin.example", 0, 4095).unwrap();
             let text = std::str::from_utf8(&request).unwrap();
             assert!(text.starts_with("GET /bucket/key HTTP/1.1\r\n"));
             assert!(text.contains("host: origin.example\r\n"));
@@ -754,7 +1041,7 @@ mod tests {
             assert!(!text.contains("x-amz-date"));
             assert!(!text.contains("x-ms-version"));
 
-            let request = format_head_request(flavor, "/bucket/key", "origin.example").unwrap();
+            let request = format_head_request(policy, "/bucket/key", "origin.example").unwrap();
             let text = std::str::from_utf8(&request).unwrap();
             assert!(text.starts_with("HEAD /bucket/key HTTP/1.1\r\n"));
             assert!(!text.contains("range:"));
@@ -764,7 +1051,7 @@ mod tests {
     #[test]
     fn azure_requests_include_version_header() {
         let request = format_get_request(
-            HttpFlavor::Azure,
+            &AZURE_ENGINE_POLICY,
             "/container/key",
             "acct.blob.core.windows.net",
             4096,
@@ -777,7 +1064,7 @@ mod tests {
         assert!(!text.contains("authorization"));
 
         let request = format_head_request(
-            HttpFlavor::Azure,
+            &AZURE_ENGINE_POLICY,
             "/container/key",
             "acct.blob.core.windows.net",
         )
@@ -785,6 +1072,48 @@ mod tests {
         let text = std::str::from_utf8(&request).unwrap();
         assert!(text.contains("x-ms-version: 2021-08-06\r\n"));
         assert!(!text.contains("range:"));
+    }
+
+    #[test]
+    fn engine_policies_preserve_backend_literals_and_wire_variation() {
+        let cases = [
+            (
+                &HTTP_ENGINE_POLICY,
+                HttpFlavor::Http,
+                "http backend: request missing origin",
+                "http backend: destination page lengths do not match requested range",
+                "http backend: metadata HEAD response head exceeds 64 KiB",
+            ),
+            (
+                &S3_ENGINE_POLICY,
+                HttpFlavor::S3,
+                "s3 backend: request missing origin",
+                "s3 backend: destination page lengths do not match requested range",
+                "s3 backend: metadata HEAD response head exceeds 64 KiB",
+            ),
+            (
+                &AZURE_ENGINE_POLICY,
+                HttpFlavor::Azure,
+                "azure backend: request missing origin",
+                "azure backend: destination page lengths do not match requested range",
+                "azure backend: metadata HEAD response head exceeds 64 KiB",
+            ),
+        ];
+
+        for (policy, flavor, missing_origin, destination_mismatch, head_too_large) in cases {
+            assert!(matches!(
+                (policy.flavor, flavor),
+                (HttpFlavor::Http, HttpFlavor::Http)
+                    | (HttpFlavor::S3, HttpFlavor::S3)
+                    | (HttpFlavor::Azure, HttpFlavor::Azure)
+            ));
+            assert_eq!(policy.missing_origin, missing_origin);
+            assert_eq!(policy.get_destination_mismatch, destination_mismatch);
+            assert_eq!(policy.head_too_large, head_too_large);
+        }
+        assert!(!HTTP_ENGINE_POLICY.flavor.is_azure());
+        assert!(!S3_ENGINE_POLICY.flavor.is_azure());
+        assert!(AZURE_ENGINE_POLICY.flavor.is_azure());
     }
 
     fn format_error(error: Error) -> String {

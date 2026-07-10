@@ -24,20 +24,16 @@
 
 use std::rc::Rc;
 
-use crate::bufferpool::{BulkRef, Error, PageRef};
-use crate::http::StatusCode;
+use crate::bufferpool::{BulkRef, PageRef};
 use crate::ring::{NetHandle, SockAddr};
-use crate::storage::{ObjectMetadata, StripeReq};
+use crate::storage::StripeReq;
 use crate::tls::TlsContext;
 
 use super::Backend;
-use super::conn::{
-    OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
-};
+use super::conn::OriginConnPool;
 use super::http_family::{
-    AZURE_PAGE_ERRORS, AZURE_RESPONSE_ERRORS, HttpFlavor, absolute_range, check_origin_status,
-    copy_body_into_pages, expected_body_len, format_get_request, format_head_request,
-    locate_in_pages, pages_capacity, write_slice_into_pages, zero_fill_pages_from,
+    AZURE_ENGINE_POLICY, GetFetchInputs, OriginFetchInputs, absolute_range, fetch_metadata,
+    fetch_range,
 };
 use super::limiter::FetchLimiter;
 
@@ -127,7 +123,7 @@ impl AzureBackend {
         dsts: &[PageRef],
     ) -> AzureFetchStream<'static> {
         let Some(origin) = req.origin() else {
-            return AzureFetchStream::immediate_error("azure backend: request missing origin");
+            return AzureFetchStream::immediate_error(AZURE_ENGINE_POLICY.missing_origin);
         };
         let path = origin.origin_object_id.clone();
 
@@ -149,19 +145,20 @@ impl AzureBackend {
             let fut = Box::pin(crate::metrics::instrument_backend(
                 self.backend_id().to_string(),
                 page_size as u64,
-                fetch_metadata(
+                fetch_metadata(OriginFetchInputs {
                     handle,
-                    origin_addr,
+                    conns,
+                    origin: origin_addr,
                     host,
                     sni_host,
                     tls,
                     path,
-                    dsts_owned.clone(),
+                    dsts: dsts_owned.clone(),
                     backing_base,
                     page_size,
-                    self.limiter.clone(),
-                    conns,
-                ),
+                    limiter: self.limiter.clone(),
+                    policy: &AZURE_ENGINE_POLICY,
+                }),
             ));
             return AzureFetchStream::pending(fut, dsts_owned);
         }
@@ -172,21 +169,24 @@ impl AzureBackend {
         let fut = Box::pin(crate::metrics::instrument_backend(
             self.backend_id().to_string(),
             len,
-            fetch(
-                handle,
-                conns,
-                origin_addr,
-                host,
-                sni_host,
-                tls,
-                path,
+            fetch_range(GetFetchInputs {
+                origin: OriginFetchInputs {
+                    handle,
+                    conns,
+                    origin: origin_addr,
+                    host,
+                    sni_host,
+                    tls,
+                    path,
+                    dsts: dsts_owned.clone(),
+                    backing_base,
+                    page_size,
+                    limiter: self.limiter.clone(),
+                    policy: &AZURE_ENGINE_POLICY,
+                },
                 start,
                 len,
-                dsts_owned.clone(),
-                backing_base,
-                page_size,
-                self.limiter.clone(),
-            ),
+            }),
         ));
         AzureFetchStream::pending(fut, dsts_owned)
     }
@@ -204,246 +204,6 @@ impl Backend for AzureBackend {
     ) -> Self::Stream<'a> {
         self.fetch_stream(req, src, dsts)
     }
-}
-
-/// Perform one whole origin fetch: dial the origin, send a ranged GET,
-/// accumulate the response, validate it, and memcpy the body into the
-/// destination pages.
-#[allow(clippy::too_many_arguments)]
-async fn fetch(
-    handle: NetHandle,
-    conns: OriginConnPool,
-    origin: SockAddr,
-    host: String,
-    sni_host: String,
-    tls: Option<Rc<TlsContext>>,
-    path: String,
-    start: u64,
-    len: u64,
-    dsts: Vec<PageRef>,
-    backing_base: *mut u8,
-    page_size: usize,
-    limiter: FetchLimiter,
-) -> Result<(), Error> {
-    let total: u64 = dsts.iter().map(|p| p.len as u64).sum();
-    if total != len {
-        return Err(Error::from(
-            "azure backend: destination page lengths do not match requested range",
-        ));
-    }
-    if len == 0 {
-        // Guards the inclusive `start + len - 1` Range bound below
-        // against underflow. The Pool always requests a full page, so
-        // this is defensive.
-        return Err(Error::from("azure backend: zero-length fetch requested"));
-    }
-
-    // Bound concurrent origin work to `http_concurrency`. The permit is
-    // held for the whole fetch and returned to the pool on drop.
-    let _permit = limiter.acquire().await;
-    let request = format_get_request(HttpFlavor::Azure, &path, &host, start, start + len - 1)?;
-    let (conn, head) = send_request_read_head(
-        &conns,
-        &handle,
-        origin,
-        &tls,
-        &sni_host,
-        request,
-        None,
-        "azure backend: malformed origin response head",
-        "azure backend: connection closed before response headers complete",
-        "azure backend: response head exceeds limit",
-    )
-    .await?;
-    let fd = conn.fd();
-    let is_tls = conn.is_tls();
-    let status = head.status;
-    let version_minor = head.version_minor;
-    let header_end = head.header_end;
-    let content_length = head.content_length;
-    let content_range_start = head.content_range_start;
-    let connection = head.connection;
-    let buf = head.buf;
-
-    check_origin_status(status, start, AZURE_RESPONSE_ERRORS)?;
-
-    // An origin that answers a different slice than we asked for would
-    // silently corrupt the stripe, so reject a mismatched Content-Range.
-    if let Some(cr_start) = content_range_start {
-        if cr_start != start {
-            return Err(Error::from(
-                "azure backend: origin Content-Range start does not match request",
-            ));
-        }
-    }
-
-    // The origin tells us how many body bytes this response carries. A
-    // ranged request whose end runs past the object's EOF gets a short
-    // 206 (Content-Length < the page we asked for) covering only the
-    // bytes that exist; we read exactly that many and zero-fill the rest
-    // of the page. The frontend clamps every served read to the object
-    // length, so the padding is never handed to a client. A connection
-    // that closes before the advertised length is a genuine truncation.
-    let body_start = header_end;
-    let body_len_mode = expected_body_len(
-        status,
-        version_minor,
-        connection.as_deref(),
-        content_length,
-        len,
-        AZURE_RESPONSE_ERRORS,
-    )?;
-
-    // `body_cap` is the most body bytes we will accept into the pages.
-    // For a known Content-Length it is that length (already validated by
-    // `expected_body_len` to be <= the requested range, hence <=
-    // capacity); for the close-delimited case it is the requested range,
-    // which equals the page capacity. Either way it never exceeds
-    // `capacity`, so the destination pages always have room.
-    let capacity = pages_capacity(&dsts);
-    debug_assert_eq!(capacity as u64, len, "capacity must equal requested range");
-    let body_cap: usize = match body_len_mode {
-        Some(n) => n as usize,
-        None => len as usize,
-    };
-    if body_cap > capacity {
-        return Err(Error::from("azure backend: over read from origin"));
-    }
-
-    // recv_fixed targets the registered fixed backing at buf index 0,
-    // whose base is `backing_base` (Phase 2 invariant). The page math
-    // below produces registered byte offsets relative to that same base.
-
-    // Body bytes that shared the header TCP segment are already in `buf`
-    // past `header_end`; place them first with a page-aware memcpy. Any
-    // bytes beyond `body_cap` are surplus the origin overstuffed and are
-    // dropped (the old path truncated them identically).
-    let leading = &buf[body_start..];
-    let lead_take = leading.len().min(body_cap);
-    if lead_take > 0 {
-        write_slice_into_pages(
-            &leading[..lead_take],
-            &dsts,
-            0,
-            backing_base,
-            page_size,
-            AZURE_PAGE_ERRORS,
-        )?;
-    }
-    let mut filled = lead_take;
-
-    // Stream the remaining body straight into the destination pages. A
-    // single recv never crosses a page boundary (pages are contiguous
-    // within themselves but not with each other in the backing), so the
-    // length is capped at the room left in the current page and at the
-    // bytes still wanted.
-    while filled < body_cap {
-        let Some((page_byte_off, room)) =
-            locate_in_pages(&dsts, filled, page_size, AZURE_PAGE_ERRORS)?
-        else {
-            break;
-        };
-        let recv_len = room.min(body_cap - filled);
-        // SAFETY: `page_byte_off` addresses a page inside the registered
-        // fixed backing (buf index 0, base == backing_base) that the
-        // Pool reserves for this fetch across every await here; the
-        // backend is shard-pinned so no other thread touches it. The
-        // destination stays reserved until this future resolves.
-        let n_recv = crate::tls::recv_fixed(&handle, fd, is_tls, page_byte_off, recv_len).await?;
-        if n_recv == 0 {
-            // EOF. With a known length this is a truncation; for the
-            // close-delimited case it is the normal end of the body.
-            match body_len_mode {
-                Some(_) => return Err(Error::from("azure backend: short read from origin")),
-                None => break,
-            }
-        }
-        filled += n_recv;
-    }
-
-    // Zero-fill the tail the body did not cover (short 206 / short 200 /
-    // close-delimited stream that ended early). The frontend clamps
-    // served reads to the object length, so this padding is never
-    // returned to a client.
-    zero_fill_pages_from(&dsts, filled, backing_base, page_size, AZURE_PAGE_ERRORS)?;
-    if body_response_reusable(
-        version_minor,
-        connection.as_deref(),
-        content_length,
-        body_cap,
-        leading.len(),
-        filled,
-    ) {
-        conns.put(conn);
-    }
-    Ok(())
-}
-
-/// Fill a metadata entry: HEAD the origin object, take its
-/// `Content-Length` as the object's byte length, and write the encoded
-/// [`ObjectMetadata`] into the (single) destination page.
-#[allow(clippy::too_many_arguments)]
-async fn fetch_metadata(
-    handle: NetHandle,
-    origin: SockAddr,
-    host: String,
-    sni_host: String,
-    tls: Option<Rc<TlsContext>>,
-    path: String,
-    dsts: Vec<PageRef>,
-    backing_base: *mut u8,
-    page_size: usize,
-    limiter: FetchLimiter,
-    conns: OriginConnPool,
-) -> Result<(), Error> {
-    let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
-    if capacity < 8 {
-        return Err(Error::from(
-            "azure backend: length entry destination smaller than 8 bytes",
-        ));
-    }
-
-    // Bound concurrent origin work to `http_concurrency` (see `fetch`).
-    let _permit = limiter.acquire().await;
-    let request = format_head_request(HttpFlavor::Azure, &path, &host)?;
-    const MAX_HEAD: usize = 64 * 1024;
-    let (conn, head) = send_request_read_head(
-        &conns,
-        &handle,
-        origin,
-        &tls,
-        &sni_host,
-        request,
-        Some(MAX_HEAD),
-        "azure backend: malformed origin response head",
-        "azure backend: connection closed before metadata HEAD headers complete",
-        "azure backend: metadata HEAD response head exceeds 64 KiB",
-    )
-    .await?;
-    let status = head.status;
-    let version_minor = head.version_minor;
-    let header_end = head.header_end;
-    let content_length = head.content_length;
-    let connection = head.connection;
-    let buf = head.buf;
-
-    if status == StatusCode::NOT_FOUND {
-        return Err(Error::OriginNotFound);
-    }
-    if status != StatusCode::OK {
-        return Err(Error::from(
-            "azure backend: metadata HEAD returned non-200 status",
-        ));
-    }
-    let length = content_length
-        .ok_or_else(|| Error::from("azure backend: metadata HEAD missing Content-Length"))?;
-
-    let body = ObjectMetadata::new(length).encode()?;
-    copy_body_into_pages(&body, &dsts, backing_base, page_size, AZURE_PAGE_ERRORS)?;
-    if head_response_reusable(version_minor, connection.as_deref(), header_end, buf.len()) {
-        conns.put(conn);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
