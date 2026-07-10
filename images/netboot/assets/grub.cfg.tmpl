@@ -36,6 +36,9 @@ menuentry "Unbounded Metal Install" {
     unbounded.apiserver_url={{ .ApiserverURL }} \
     {{- if .BootLease }}
     unbounded.boot_mac={{ .BootLease.MAC }} \
+    {{- if .BootLease.DNS }}
+    unbounded.dns={{ join (ipAddresses .BootLease.DNS) "," }} \
+    {{- end }}
     ip={{ .BootLease.IPv4 }}::{{ .BootLease.Gateway }}:{{ .BootLease.SubnetMask }}:::none \
     {{- end }}
     {{- if .Machine.Spec.PXE.TargetDisk }}

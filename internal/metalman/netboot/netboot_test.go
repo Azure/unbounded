@@ -1039,6 +1039,7 @@ func TestGrubTemplate_NoInstallRequested(t *testing.T) {
 					MAC:        "aa:bb:cc:dd:ee:20",
 					Gateway:    "10.0.1.1",
 					SubnetMask: "255.255.255.0",
+					DNS:        []string{"10.0.1.53", "10.0.1.54"},
 				}},
 			},
 		},
@@ -1064,6 +1065,7 @@ func TestGrubTemplate_NoInstallRequested(t *testing.T) {
 		"unbounded.image_url=http://10.0.1.1:8080/disk.img.gz",
 		"unbounded.node_name=node-no-operations",
 		"unbounded.boot_mac=aa:bb:cc:dd:ee:20",
+		"unbounded.dns=10.0.1.53,10.0.1.54",
 		"unbounded.disk=/dev/disk/by-id/test-os-disk",
 		"ip=10.0.1.20::10.0.1.1:255.255.255.0:::none",
 	} {
@@ -1073,6 +1075,76 @@ func TestGrubTemplate_NoInstallRequested(t *testing.T) {
 	}
 
 	require.NotContains(t, body, "eth0")
+}
+
+func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
+	networkTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "network-config.tmpl"))
+	require.NoError(t, err)
+
+	node := &v1alpha3.Machine{
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				DHCPLeases: []v1alpha3.DHCPLease{
+					{IPv4: "10.0.1.20", MAC: "aa:bb:cc:dd:ee:20", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0"},
+					{
+						IPv4:       "10.0.2.21",
+						MAC:        "aa:bb:cc:dd:ee:21",
+						Gateway:    "10.0.2.1",
+						SubnetMask: "255.255.254.0",
+						DNS:        []string{"10.0.2.53", "2001:db8::53"},
+					},
+				},
+			},
+		},
+	}
+
+	data := newTemplateData(node, ClusterInfo{}, "", "", "10.0.2.21", true)
+	result, err := renderTemplate(string(networkTmpl), data)
+	require.NoError(t, err)
+
+	body := string(result)
+	require.Contains(t, body, `macaddress: "aa:bb:cc:dd:ee:21"`)
+	require.Contains(t, body, `- "10.0.2.21/23"`)
+	require.Contains(t, body, `via: "10.0.2.1"`)
+	require.Contains(t, body, `- "10.0.2.53"`)
+	require.Contains(t, body, `- "2001:db8::53"`)
+	require.Contains(t, body, "dhcp4: false")
+	require.Contains(t, body, "dhcp6: false")
+	require.NotContains(t, body, "10.0.1.20")
+}
+
+func TestNetworkConfigTemplate_NoLeaseDisablesDynamicConfiguration(t *testing.T) {
+	networkTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "network-config.tmpl"))
+	require.NoError(t, err)
+
+	result, err := renderTemplate(string(networkTmpl), newTemplateData(&v1alpha3.Machine{}, ClusterInfo{}, "", "", "", false))
+	require.NoError(t, err)
+	require.Equal(t, "\nversion: 2\nethernets: {}\n", string(result))
+}
+
+func TestNetworkConfigTemplate_InvalidSubnetMask(t *testing.T) {
+	networkTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "network-config.tmpl"))
+	require.NoError(t, err)
+
+	node := &v1alpha3.Machine{Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+		IPv4: "10.0.1.20", MAC: "aa:bb:cc:dd:ee:20", Gateway: "10.0.1.1", SubnetMask: "255.0.255.0",
+	}}}}}
+
+	_, err = renderTemplate(string(networkTmpl), newTemplateData(node, ClusterInfo{}, "", "", "10.0.1.20", true))
+	require.ErrorContains(t, err, "non-contiguous IPv4 subnet mask")
+}
+
+func TestNetworkConfigTemplate_InvalidDNS(t *testing.T) {
+	networkTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "network-config.tmpl"))
+	require.NoError(t, err)
+
+	node := &v1alpha3.Machine{Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+		IPv4: "10.0.1.20", MAC: "aa:bb:cc:dd:ee:20", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0",
+		DNS: []string{"not-an-address"},
+	}}}}}
+
+	_, err = renderTemplate(string(networkTmpl), newTemplateData(node, ClusterInfo{}, "", "", "10.0.1.20", true))
+	require.ErrorContains(t, err, `invalid IP address "not-an-address"`)
 }
 
 func TestGrubTemplate_SelectsBootLeaseByRequestIP(t *testing.T) {

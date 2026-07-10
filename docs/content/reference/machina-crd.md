@@ -56,7 +56,7 @@ PXE boot configuration consumed by the metalman controller.
 | `pxe.architecture` | string | No | `amd64` | Target CPU architecture for PXE boot artifacts and machine images. Allowed values: `amd64`, `arm64`. |
 | `pxe.netbootImage` | string | No | Metalman default | OCI netboot image reference containing PXE boot artifacts. |
 | `pxe.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP boot with a URL derived from the netboot image metadata. Allowed values: `PXE`, `HTTP`. |
-| `pxe.dhcpLeases` | []DHCPLease | No | - | Static DHCP leases served during PXE boot. |
+| `pxe.dhcpLeases` | []DHCPLease | No | - | Provisioning network settings. They are served as static DHCP leases during PXE boot and used for Redfish firmware, installer, NoCloud, and installed-system static configuration during HTTP boot. |
 | `pxe.dhcpLeases[].ipv4` | string | Yes | - | Static IPv4 address to assign. |
 | `pxe.dhcpLeases[].mac` | string | Yes | - | NIC MAC address (matched case-insensitively). |
 | `pxe.dhcpLeases[].subnetMask` | string | Yes | - | Subnet mask. |
@@ -419,7 +419,7 @@ Templates receive the following data object:
 | Field | Type | Description |
 |-------|------|-------------|
 | `.Machine` | *Machine | The Machine CR that initiated the request. |
-| `.BootLease` | *DHCPLease | The DHCP lease matching the request source IP, or the first lease when no match is available. Netboot templates use this to pass the provisioning NIC MAC and static IP to the installer. |
+| `.BootLease` | *DHCPLease | The DHCP lease matching the request source IP, or the first lease when no match is available. Netboot templates use this to pass the provisioning NIC MAC, static IP, gateway, and DNS to the installer and NoCloud network configuration. |
 | `.ApiserverURL` | string | External Kubernetes API server URL. |
 | `.ServeURL` | string | External metalman HTTP URL. |
 | `.KubernetesVersion` | string | Resolved Kubernetes version for the machine. |

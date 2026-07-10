@@ -128,6 +128,7 @@ DS_URL=$(get_param unbounded.ds_url || true)
 NODE_NAME=$(get_param unbounded.node_name || true)
 NODE_NAMESPACE=$(get_param unbounded.node_namespace || true)
 APISERVER_URL=$(get_param unbounded.apiserver_url || true)
+DNS_SERVERS=$(get_param unbounded.dns || true)
 BOOT_MAC=$(normalize_mac "$BOOT_MAC")
 if [ -z "$BOOT_MAC" ] && [ -n "$BOOTIF" ]; then
     BOOT_MAC=$(bootif_to_mac "$BOOTIF")
@@ -165,7 +166,7 @@ find_first_iface() {
 
 if [ -n "$BOOT_MAC" ]; then
     retry 30 1 "find network interface with MAC $BOOT_MAC" find_iface_by_mac \
-        || log "WARNING: no network interface found with MAC $BOOT_MAC"
+        || fatal "no network interface found with MAC $BOOT_MAC"
 fi
 
 if [ -z "$IFACE" ]; then
@@ -176,15 +177,28 @@ else
 fi
 
 mask2cidr() {
-    local cidr=0
+    local cidr=0 octets=0 suffix=0
     for octet in $(echo "$1" | tr '.' ' '); do
+        octets=$((octets + 1))
+        [ "$octets" -le 4 ] || return 1
+        if [ "$suffix" -eq 1 ]; then
+            [ "$octet" = 0 ] || return 1
+            continue
+        fi
         case "$octet" in
-            255) cidr=$((cidr + 8)) ;; 254) cidr=$((cidr + 7)) ;;
-            252) cidr=$((cidr + 6)) ;; 248) cidr=$((cidr + 5)) ;;
-            240) cidr=$((cidr + 4)) ;; 224) cidr=$((cidr + 3)) ;;
-            192) cidr=$((cidr + 2)) ;; 128) cidr=$((cidr + 1)) ;;
+            255) cidr=$((cidr + 8)) ;;
+            254) cidr=$((cidr + 7)); suffix=1 ;;
+            252) cidr=$((cidr + 6)); suffix=1 ;;
+            248) cidr=$((cidr + 5)); suffix=1 ;;
+            240) cidr=$((cidr + 4)); suffix=1 ;;
+            224) cidr=$((cidr + 3)); suffix=1 ;;
+            192) cidr=$((cidr + 2)); suffix=1 ;;
+            128) cidr=$((cidr + 1)); suffix=1 ;;
+            0) suffix=1 ;;
+            *) return 1 ;;
         esac
     done
+    [ "$octets" -eq 4 ] || return 1
     echo "$cidr"
 }
 
@@ -196,9 +210,16 @@ if [ -n "$IP_PARAM" ]; then
     IFACE_PARAM=$(echo "$IP_PARAM" | cut -d: -f6)
 
     case "$MASK" in
-        *.*.*.*) PREFIX=$(mask2cidr "$MASK") ;;
+        *.*.*.*) PREFIX=$(mask2cidr "$MASK") || fatal "invalid or non-contiguous subnet mask $MASK" ;;
         *) PREFIX="$MASK" ;;
     esac
+    case "$PREFIX" in
+        ''|*[!0-9]*) fatal "invalid IPv4 prefix $PREFIX" ;;
+    esac
+    [ "$PREFIX" -le 32 ] || fatal "invalid IPv4 prefix $PREFIX"
+    [ -n "$CLIENT_IP" ] || fatal "static client IP is empty"
+    [ -n "$GW" ] || fatal "static gateway is empty"
+    [ -n "$BOOT_MAC" ] || fatal "unbounded.boot_mac is required for persistent static networking"
 
     if [ -n "$IFACE_PARAM" ] && [ -e "/sys/class/net/$IFACE_PARAM" ]; then
         IFACE="$IFACE_PARAM"
@@ -206,8 +227,24 @@ if [ -n "$IP_PARAM" ]; then
 
     log "configuring $IFACE with $CLIENT_IP/$PREFIX gw $GW"
     retry 5 2 "link up $IFACE" ip link set "$IFACE" up || fatal "failed to bring up $IFACE"
-    retry 3 1 "add address" ip addr add "$CLIENT_IP/$PREFIX" dev "$IFACE" || true
-    retry 3 1 "add default route" ip route add default via "$GW" dev "$IFACE" || true
+    retry 3 1 "set address" ip addr replace "$CLIENT_IP/$PREFIX" dev "$IFACE" \
+        || fatal "failed to configure $CLIENT_IP/$PREFIX on $IFACE"
+    retry 3 1 "set default route" ip route replace default via "$GW" dev "$IFACE" \
+        || fatal "failed to configure default route through $GW"
+
+    if [ -n "$DNS_SERVERS" ]; then
+        : > /etc/resolv.conf
+        old_ifs=$IFS
+        IFS=,
+        for dns in $DNS_SERVERS; do
+            IFS=$old_ifs
+            [ -n "$dns" ] || fatal "empty DNS server in unbounded.dns"
+            case "$dns" in *[!0-9a-fA-F:.]*) fatal "invalid DNS server $dns" ;; esac
+            echo "nameserver $dns" >> /etc/resolv.conf
+            IFS=,
+        done
+        IFS=$old_ifs
+    fi
 fi
 
 if [ -z "$TARGET_DISK" ]; then
@@ -275,28 +312,68 @@ find_root_part() {
     return 1
 }
 
-if [ -n "$DS_URL" ]; then
-    log "injecting cloud-init datasource: $DS_URL"
+if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ]; then
     retry 20 2 "find root partition" find_root_part || fatal "no root partition found on $TARGET_DISK"
     retry 5 2 "mount $ROOT_PART" mount "$ROOT_PART" /mnt || fatal "failed to mount $ROOT_PART"
 
-    mkdir -p /mnt/etc/cloud/cloud.cfg.d /mnt/etc/unbounded-metal
-    cat > /mnt/etc/cloud/cloud.cfg.d/99-unbounded-metal.cfg <<CLOUDINIT
+    if [ -n "$IP_PARAM" ]; then
+        log "persisting static network configuration"
+        mkdir -p /mnt/etc/netplan
+        rm -f /mnt/etc/netplan/50-cloud-init.yaml
+        cat > /mnt/etc/netplan/99-unbounded-metal.yaml <<NETPLAN
+network:
+  version: 2
+  ethernets:
+    provisioning:
+      match:
+        macaddress: "${BOOT_MAC}"
+      dhcp4: false
+      dhcp6: false
+      addresses:
+        - "${CLIENT_IP}/${PREFIX}"
+      routes:
+        - to: default
+          via: "${GW}"
+NETPLAN
+        if [ -n "$DNS_SERVERS" ]; then
+            cat >> /mnt/etc/netplan/99-unbounded-metal.yaml <<NETPLANDNS
+      nameservers:
+        addresses:
+NETPLANDNS
+            old_ifs=$IFS
+            IFS=,
+            for dns in $DNS_SERVERS; do
+                IFS=$old_ifs
+                echo "          - \"${dns}\"" >> /mnt/etc/netplan/99-unbounded-metal.yaml
+                IFS=,
+            done
+            IFS=$old_ifs
+        fi
+        chmod 600 /mnt/etc/netplan/99-unbounded-metal.yaml
+    fi
+
+    if [ -n "$DS_URL" ]; then
+        log "injecting cloud-init datasource: $DS_URL"
+        mkdir -p /mnt/etc/cloud/cloud.cfg.d /mnt/etc/unbounded-metal
+        cat > /mnt/etc/cloud/cloud.cfg.d/99-unbounded-metal.cfg <<CLOUDINIT
 datasource_list: [NoCloud]
 datasource:
   NoCloud:
     seedfrom: ${DS_URL}
+network:
+  config: disabled
 CLOUDINIT
-    rm -f /mnt/etc/cloud/cloud-init.disabled
-    cat > /mnt/etc/unbounded-metal/config <<UMCONFIG
+        rm -f /mnt/etc/cloud/cloud-init.disabled
+        cat > /mnt/etc/unbounded-metal/config <<UMCONFIG
 SERVE_URL=${SERVE_URL}
 NODE_NAME=${NODE_NAME}
 NODE_NAMESPACE=${NODE_NAMESPACE}
 APISERVER_URL=${APISERVER_URL}
 UMCONFIG
+    fi
     sync
     umount /mnt
-    log "cloud-init configured on $ROOT_PART"
+    log "installed system configured on $ROOT_PART"
 fi
 
 if [ -d /sys/firmware/efi ]; then
