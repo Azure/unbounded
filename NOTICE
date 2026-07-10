@@ -176,35 +176,35 @@ notices:
       - Copyright 2014-2015 Stripe, Inc.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.42.0/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.42.1/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/config
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.25/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.29/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/credentials
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.24/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.28/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/service/s3
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.104.0/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.105.0/LICENSE.txt
   - dependency: github.com/aws/smithy-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/smithy-go/blob/v1.27.2/LICENSE
+        link: https://github.com/aws/smithy-go/blob/v1.27.3/LICENSE
   - dependency: github.com/bougou/go-ipmi
     ecosystem: go
     copyright:
@@ -220,7 +220,7 @@ notices:
       - Copyright (c) 2019 Authors of Cilium
     license:
       - name: MIT License
-        link: https://github.com/cilium/ebpf/blob/v0.21.0/LICENSE
+        link: https://github.com/cilium/ebpf/blob/v0.22.0/LICENSE
   - dependency: github.com/coder/websocket
     ecosystem: go
     copyright:
@@ -358,7 +358,7 @@ notices:
       - Copyright (c) 2016 Protocol Labs, Inc.
     license:
       - name: MIT License
-        link: https://github.com/ipfs/go-cid/blob/v0.6.1/LICENSE
+        link: https://github.com/ipfs/go-cid/blob/v0.6.2/LICENSE
   - dependency: github.com/lib/pq
     ecosystem: go
     copyright:
@@ -379,7 +379,7 @@ notices:
       - Copyright (c) 2016 Protocol Labs, Inc.
     license:
       - name: MIT License
-        link: https://github.com/libp2p/go-libp2p-kad-dht/blob/v0.40.0/LICENSE
+        link: https://github.com/libp2p/go-libp2p-kad-dht/blob/v0.41.0/LICENSE
   - dependency: github.com/libp2p/go-msgio
     ecosystem: go
     copyright:
@@ -431,9 +431,9 @@ notices:
       - Copyright (c) 2016, 2016, Oracle and/or its affiliates. All rights reserved.
     license:
       - name: UPL-1.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.118.1/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.120.0/LICENSE.txt
       - name: Apache License, Version 2.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.118.1/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.120.0/LICENSE.txt
   - dependency: github.com/pin/tftp/v3
     ecosystem: go
     copyright:
@@ -542,7 +542,7 @@ notices:
       - Copyright 2014 gRPC authors.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/grpc/grpc-go/blob/v1.81.1/LICENSE
+        link: https://github.com/grpc/grpc-go/blob/v1.82.0/LICENSE
   - dependency: google.golang.org/protobuf
     ecosystem: go
     copyright:
@@ -623,7 +623,7 @@ notices:
       - Copyright 2021 ORAS Authors.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/oras-project/oras-go/blob/v2.6.1/LICENSE
+        link: https://github.com/oras-project/oras-go/blob/v2.6.2/LICENSE
   - dependency: react
     ecosystem: npm
     copyright:
