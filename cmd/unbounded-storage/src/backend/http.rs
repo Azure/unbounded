@@ -32,10 +32,8 @@
 
 use std::rc::Rc;
 
-use ::http::header::{HOST, RANGE};
-
 use crate::bufferpool::{BulkRef, Error, PageRef};
-use crate::http::{Method, StatusCode, serialize_request};
+use crate::http::StatusCode;
 use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
 use crate::tls::TlsContext;
@@ -45,9 +43,9 @@ use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
 use super::http_family::{
-    HTTP_PAGE_ERRORS, HTTP_RESPONSE_ERRORS, absolute_range, check_origin_status,
-    copy_body_into_pages, expected_body_len, locate_in_pages, pages_capacity,
-    write_slice_into_pages, zero_fill_pages_from,
+    HTTP_PAGE_ERRORS, HTTP_RESPONSE_ERRORS, HttpFlavor, absolute_range, check_origin_status,
+    copy_body_into_pages, expected_body_len, format_get_request, format_head_request,
+    locate_in_pages, pages_capacity, write_slice_into_pages, zero_fill_pages_from,
 };
 use super::limiter::FetchLimiter;
 
@@ -299,7 +297,7 @@ async fn fetch(
     // Bound concurrent origin work to `http_concurrency`. The permit is
     // held for the whole fetch and returned to the pool on drop.
     let _permit = limiter.acquire().await;
-    let request = format_get_request(&path, &host, start, start + len - 1)?;
+    let request = format_get_request(HttpFlavor::Http, &path, &host, start, start + len - 1)?;
     let (conn, head) = send_request_read_head(
         &conns,
         &handle,
@@ -468,7 +466,7 @@ async fn fetch_metadata(
 
     // Bound concurrent origin work to `http_concurrency` (see `fetch`).
     let _permit = limiter.acquire().await;
-    let request = format_head_request(&path, &host)?;
+    let request = format_head_request(HttpFlavor::Http, &path, &host)?;
     const MAX_HEAD: usize = 64 * 1024;
     let (conn, head) = send_request_read_head(
         &conns,
@@ -509,58 +507,9 @@ async fn fetch_metadata(
     Ok(())
 }
 
-/// Format a ranged HTTP/1.1 GET request. `start`/`end` are inclusive
-/// byte offsets for the `Range` header.
-fn format_get_request(path: &str, host: &str, start: u64, end: u64) -> Result<Vec<u8>, Error> {
-    let req = ::http::Request::builder()
-        .method(Method::GET)
-        .uri(path)
-        .header(HOST, host)
-        .header(RANGE, format!("bytes={start}-{end}"))
-        .body(())
-        .map_err(|_| Error::from("http backend: failed to build origin GET request"))?;
-    Ok(serialize_request(&req))
-}
-
-/// Format an HTTP/1.1 HEAD request. Used by the length-entry fill path
-/// to learn an object's byte length from its `Content-Length` without
-/// transferring a body. No `Range` header: HEAD asks about the whole
-/// object.
-fn format_head_request(path: &str, host: &str) -> Result<Vec<u8>, Error> {
-    let req = ::http::Request::builder()
-        .method(Method::HEAD)
-        .uri(path)
-        .header(HOST, host)
-        .body(())
-        .map_err(|_| Error::from("http backend: failed to build origin HEAD request"))?;
-    Ok(serialize_request(&req))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn format_get_request_emits_request_line_and_headers() {
-        let req = format_get_request("/models/llama.bin", "10.0.0.1:8080", 0, 4095).unwrap();
-        let s = std::str::from_utf8(&req).unwrap();
-        assert!(
-            s.starts_with("GET /models/llama.bin HTTP/1.1\r\n"),
-            "got: {s}"
-        );
-        assert!(s.contains("host: 10.0.0.1:8080\r\n"), "got: {s}");
-        assert!(s.contains("range: bytes=0-4095\r\n"), "got: {s}");
-        assert!(!s.contains("connection:"), "got: {s}");
-        assert!(s.ends_with("\r\n\r\n"), "got: {s}");
-    }
-
-    #[test]
-    fn format_get_request_nonzero_range() {
-        let req = format_get_request("/o", "h:1", 4096, 8191).unwrap();
-        let s = std::str::from_utf8(&req).unwrap();
-        assert!(s.contains("range: bytes=4096-8191\r\n"), "got: {s}");
-        assert!(s.ends_with("\r\n\r\n"));
-    }
 
     #[test]
     fn resolve_origin_parses_ipv4() {
@@ -574,17 +523,6 @@ mod tests {
     #[test]
     fn resolve_origin_rejects_unparseable() {
         assert!(HttpBackend::resolve_origin("not a host:port at all").is_err());
-    }
-
-    #[test]
-    fn format_head_request_emits_head_line_and_headers() {
-        let req = format_head_request("/o", "h:1").unwrap();
-        let s = std::str::from_utf8(&req).unwrap();
-        assert!(s.starts_with("HEAD /o HTTP/1.1\r\n"), "got: {s}");
-        assert!(s.contains("host: h:1\r\n"), "got: {s}");
-        assert!(!s.contains("connection:"), "got: {s}");
-        assert!(s.ends_with("\r\n\r\n"), "got: {s}");
-        assert!(!s.contains("range:"), "got: {s}");
     }
 
     #[test]

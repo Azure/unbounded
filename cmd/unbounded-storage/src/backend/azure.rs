@@ -17,17 +17,15 @@
 //! [`Error::OriginNotFound`](crate::bufferpool::Error::OriginNotFound).
 //!
 //! It diverges from the S3 backend in one wire-level way: every GET/HEAD
-//! carries the [`AZURE_MS_VERSION`] `x-ms-version` header so the request
+//! carries the `2021-08-06` `x-ms-version` header so the request
 //! is conformant with the Azure Blob REST API. v1 is anonymous: it
 //! targets public-read containers (or the Azurite emulator) and sends no
 //! authorization or shared-key signature.
 
 use std::rc::Rc;
 
-use ::http::header::{HOST, RANGE};
-
 use crate::bufferpool::{BulkRef, Error, PageRef};
-use crate::http::{Method, StatusCode, serialize_request};
+use crate::http::StatusCode;
 use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
 use crate::tls::TlsContext;
@@ -37,20 +35,14 @@ use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
 use super::http_family::{
-    AZURE_PAGE_ERRORS, AZURE_RESPONSE_ERRORS, absolute_range, check_origin_status,
-    copy_body_into_pages, expected_body_len, locate_in_pages, pages_capacity,
-    write_slice_into_pages, zero_fill_pages_from,
+    AZURE_PAGE_ERRORS, AZURE_RESPONSE_ERRORS, HttpFlavor, absolute_range, check_origin_status,
+    copy_body_into_pages, expected_body_len, format_get_request, format_head_request,
+    locate_in_pages, pages_capacity, write_slice_into_pages, zero_fill_pages_from,
 };
 use super::limiter::FetchLimiter;
 
 /// Stream produced by [`AzureBackend::bulk_get`].
 pub type AzureFetchStream<'a> = super::http_family::FetchStream<'a>;
-
-/// The pinned `x-ms-version` REST API version sent on every Azure Blob
-/// request. Azure requires this header to select the wire semantics of
-/// the operation; pinning it keeps the backend's behavior stable across
-/// service-side default changes.
-const AZURE_MS_VERSION: &str = "2021-08-06";
 
 /// Origin backend that fetches stripe byte ranges from an Azure Blob
 /// origin into bufferpool pages over plaintext HTTP/1.1.
@@ -249,7 +241,7 @@ async fn fetch(
     // Bound concurrent origin work to `http_concurrency`. The permit is
     // held for the whole fetch and returned to the pool on drop.
     let _permit = limiter.acquire().await;
-    let request = format_get_request(&path, &host, start, start + len - 1)?;
+    let request = format_get_request(HttpFlavor::Azure, &path, &host, start, start + len - 1)?;
     let (conn, head) = send_request_read_head(
         &conns,
         &handle,
@@ -413,7 +405,7 @@ async fn fetch_metadata(
 
     // Bound concurrent origin work to `http_concurrency` (see `fetch`).
     let _permit = limiter.acquire().await;
-    let request = format_head_request(&path, &host)?;
+    let request = format_head_request(HttpFlavor::Azure, &path, &host)?;
     const MAX_HEAD: usize = 64 * 1024;
     let (conn, head) = send_request_read_head(
         &conns,
@@ -454,74 +446,9 @@ async fn fetch_metadata(
     Ok(())
 }
 
-/// Format a ranged HTTP/1.1 GET request against the Azure Blob origin.
-/// `start`/`end` are inclusive byte offsets for the `Range` header. The
-/// `x-ms-version` header pins the Azure Blob REST API version.
-fn format_get_request(path: &str, host: &str, start: u64, end: u64) -> Result<Vec<u8>, Error> {
-    let req = ::http::Request::builder()
-        .method(Method::GET)
-        .uri(path)
-        .header(HOST, host)
-        .header(RANGE, format!("bytes={start}-{end}"))
-        .header("x-ms-version", AZURE_MS_VERSION)
-        .body(())
-        .map_err(|_| Error::from("azure backend: failed to build origin GET request"))?;
-    Ok(serialize_request(&req))
-}
-
-/// Format an HTTP/1.1 HEAD request against the Azure Blob origin, used by
-/// the length-entry fill path. The `x-ms-version` header pins the Azure
-/// Blob REST API version.
-fn format_head_request(path: &str, host: &str) -> Result<Vec<u8>, Error> {
-    let req = ::http::Request::builder()
-        .method(Method::HEAD)
-        .uri(path)
-        .header(HOST, host)
-        .header("x-ms-version", AZURE_MS_VERSION)
-        .body(())
-        .map_err(|_| Error::from("azure backend: failed to build origin HEAD request"))?;
-    Ok(serialize_request(&req))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn get_request_has_expected_headers() {
-        let req =
-            format_get_request("/container/key", "acct.blob.core.windows.net", 0, 4095).unwrap();
-        let s = std::str::from_utf8(&req).unwrap();
-        assert!(s.starts_with("GET /container/key HTTP/1.1\r\n"), "got: {s}");
-        assert!(
-            s.contains("host: acct.blob.core.windows.net\r\n"),
-            "got: {s}"
-        );
-        assert!(s.contains("range: bytes=0-4095\r\n"), "got: {s}");
-        assert!(s.contains("x-ms-version: 2021-08-06\r\n"), "got: {s}");
-        assert!(!s.contains("connection:"), "got: {s}");
-        // v1 is anonymous: no shared-key signature or SAS authorization.
-        assert!(!s.contains("authorization"), "got: {s}");
-        assert!(s.ends_with("\r\n\r\n"), "got: {s}");
-    }
-
-    #[test]
-    fn head_request_omits_range_keeps_version() {
-        let req = format_head_request("/container/key", "acct.blob.core.windows.net").unwrap();
-        let s = std::str::from_utf8(&req).unwrap();
-        assert!(
-            s.starts_with("HEAD /container/key HTTP/1.1\r\n"),
-            "got: {s}"
-        );
-        assert!(
-            s.contains("host: acct.blob.core.windows.net\r\n"),
-            "got: {s}"
-        );
-        assert!(s.contains("x-ms-version: 2021-08-06\r\n"), "got: {s}");
-        assert!(!s.contains("range:"), "got: {s}");
-        assert!(!s.contains("authorization"), "got: {s}");
-        assert!(s.ends_with("\r\n\r\n"), "got: {s}");
-    }
 
     #[test]
     fn resolve_origin_parses_ipv4() {

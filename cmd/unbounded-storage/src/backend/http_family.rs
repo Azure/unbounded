@@ -7,8 +7,37 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use ::http::header::{HOST, RANGE};
+
 use crate::bufferpool::{Error, PageRef, PageStream};
-use crate::http::{StatusCode, response_closes_after_body};
+use crate::http::{Method, StatusCode, response_closes_after_body, serialize_request};
+
+const AZURE_MS_VERSION: &str = "2021-08-06";
+
+#[derive(Clone, Copy)]
+pub(super) enum HttpFlavor {
+    Http,
+    S3,
+    Azure,
+}
+
+impl HttpFlavor {
+    const fn get_build_error(self) -> &'static str {
+        match self {
+            Self::Http => "http backend: failed to build origin GET request",
+            Self::S3 => "s3 backend: failed to build origin GET request",
+            Self::Azure => "azure backend: failed to build origin GET request",
+        }
+    }
+
+    const fn head_build_error(self) -> &'static str {
+        match self {
+            Self::Http => "http backend: failed to build origin HEAD request",
+            Self::S3 => "s3 backend: failed to build origin HEAD request",
+            Self::Azure => "azure backend: failed to build origin HEAD request",
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct ResponseErrorMessages {
@@ -332,6 +361,45 @@ pub(super) fn expected_body_len(
         return Err(Error::from(errors.content_length_exceeds_range));
     }
     Ok(Some(content_length.min(requested_len)))
+}
+
+pub(super) fn format_get_request(
+    flavor: HttpFlavor,
+    path: &str,
+    host: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, Error> {
+    let mut builder = ::http::Request::builder()
+        .method(Method::GET)
+        .uri(path)
+        .header(HOST, host)
+        .header(RANGE, format!("bytes={start}-{end}"));
+    if matches!(flavor, HttpFlavor::Azure) {
+        builder = builder.header("x-ms-version", AZURE_MS_VERSION);
+    }
+    let request = builder
+        .body(())
+        .map_err(|_| Error::from(flavor.get_build_error()))?;
+    Ok(serialize_request(&request))
+}
+
+pub(super) fn format_head_request(
+    flavor: HttpFlavor,
+    path: &str,
+    host: &str,
+) -> Result<Vec<u8>, Error> {
+    let mut builder = ::http::Request::builder()
+        .method(Method::HEAD)
+        .uri(path)
+        .header(HOST, host);
+    if matches!(flavor, HttpFlavor::Azure) {
+        builder = builder.header("x-ms-version", AZURE_MS_VERSION);
+    }
+    let request = builder
+        .body(())
+        .map_err(|_| Error::from(flavor.head_build_error()))?;
+    Ok(serialize_request(&request))
 }
 
 #[cfg(test)]
@@ -670,6 +738,53 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn http_and_s3_requests_have_common_anonymous_headers() {
+        for flavor in [HttpFlavor::Http, HttpFlavor::S3] {
+            let request =
+                format_get_request(flavor, "/bucket/key", "origin.example", 0, 4095).unwrap();
+            let text = std::str::from_utf8(&request).unwrap();
+            assert!(text.starts_with("GET /bucket/key HTTP/1.1\r\n"));
+            assert!(text.contains("host: origin.example\r\n"));
+            assert!(text.contains("range: bytes=0-4095\r\n"));
+            assert!(!text.contains("connection:"));
+            assert!(!text.contains("authorization"));
+            assert!(!text.contains("x-amz-date"));
+            assert!(!text.contains("x-ms-version"));
+
+            let request = format_head_request(flavor, "/bucket/key", "origin.example").unwrap();
+            let text = std::str::from_utf8(&request).unwrap();
+            assert!(text.starts_with("HEAD /bucket/key HTTP/1.1\r\n"));
+            assert!(!text.contains("range:"));
+        }
+    }
+
+    #[test]
+    fn azure_requests_include_version_header() {
+        let request = format_get_request(
+            HttpFlavor::Azure,
+            "/container/key",
+            "acct.blob.core.windows.net",
+            4096,
+            8191,
+        )
+        .unwrap();
+        let text = std::str::from_utf8(&request).unwrap();
+        assert!(text.contains("range: bytes=4096-8191\r\n"));
+        assert!(text.contains("x-ms-version: 2021-08-06\r\n"));
+        assert!(!text.contains("authorization"));
+
+        let request = format_head_request(
+            HttpFlavor::Azure,
+            "/container/key",
+            "acct.blob.core.windows.net",
+        )
+        .unwrap();
+        let text = std::str::from_utf8(&request).unwrap();
+        assert!(text.contains("x-ms-version: 2021-08-06\r\n"));
+        assert!(!text.contains("range:"));
     }
 
     fn format_error(error: Error) -> String {
