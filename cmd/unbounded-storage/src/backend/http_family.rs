@@ -8,6 +8,50 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::bufferpool::{Error, PageRef, PageStream};
+use crate::http::{StatusCode, response_closes_after_body};
+
+#[derive(Clone, Copy)]
+pub(super) struct ResponseErrorMessages {
+    missing_content_length: &'static str,
+    content_length_exceeds_range: &'static str,
+    non_success_status: &'static str,
+    ignored_range: &'static str,
+}
+
+impl ResponseErrorMessages {
+    pub(super) const fn new(
+        missing_content_length: &'static str,
+        content_length_exceeds_range: &'static str,
+        non_success_status: &'static str,
+        ignored_range: &'static str,
+    ) -> Self {
+        Self {
+            missing_content_length,
+            content_length_exceeds_range,
+            non_success_status,
+            ignored_range,
+        }
+    }
+}
+
+pub(super) const HTTP_RESPONSE_ERRORS: ResponseErrorMessages = ResponseErrorMessages::new(
+    "http backend: origin response missing Content-Length on keep-alive connection",
+    "http backend: origin Content-Length exceeds requested range",
+    "http backend: origin returned non-2xx status",
+    "http backend: origin ignored Range (200) for a non-zero offset",
+);
+pub(super) const S3_RESPONSE_ERRORS: ResponseErrorMessages = ResponseErrorMessages::new(
+    "s3 backend: origin response missing Content-Length on keep-alive connection",
+    "s3 backend: origin Content-Length exceeds requested range",
+    "s3 backend: origin returned non-2xx status",
+    "s3 backend: origin ignored Range (200) for a non-zero offset",
+);
+pub(super) const AZURE_RESPONSE_ERRORS: ResponseErrorMessages = ResponseErrorMessages::new(
+    "azure backend: origin response missing Content-Length on keep-alive connection",
+    "azure backend: origin Content-Length exceeds requested range",
+    "azure backend: origin returned non-2xx status",
+    "azure backend: origin ignored Range (200) for a non-zero offset",
+);
 
 #[derive(Clone, Copy)]
 pub(super) struct PageErrorMessages {
@@ -238,6 +282,58 @@ pub(super) fn zero_fill_pages_from(
     Ok(())
 }
 
+/// Compute the absolute origin byte range for a stripe sub-range.
+pub(super) fn absolute_range(
+    stripe_idx: u64,
+    stripe_size: u64,
+    src_offset: u64,
+    src_len: u32,
+) -> (u64, u64) {
+    let start = stripe_idx
+        .saturating_mul(stripe_size)
+        .saturating_add(src_offset);
+    (start, src_len as u64)
+}
+
+/// Validate the response status against the requested absolute offset.
+pub(super) fn check_origin_status(
+    status: StatusCode,
+    start: u64,
+    errors: ResponseErrorMessages,
+) -> Result<(), Error> {
+    if status == StatusCode::NOT_FOUND {
+        return Err(Error::OriginNotFound);
+    }
+    if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
+        return Err(Error::from(errors.non_success_status));
+    }
+    if status == StatusCode::OK && start != 0 {
+        return Err(Error::from(errors.ignored_range));
+    }
+    Ok(())
+}
+
+/// Determine the expected body length, or `None` for a close-delimited body.
+pub(super) fn expected_body_len(
+    status: StatusCode,
+    version_minor: u8,
+    connection: Option<&str>,
+    content_length: Option<u64>,
+    requested_len: u64,
+    errors: ResponseErrorMessages,
+) -> Result<Option<u64>, Error> {
+    let Some(content_length) = content_length else {
+        if !response_closes_after_body(version_minor, connection) {
+            return Err(Error::from(errors.missing_content_length));
+        }
+        return Ok(None);
+    };
+    if status == StatusCode::PARTIAL_CONTENT && content_length > requested_len {
+        return Err(Error::from(errors.content_length_exceeds_range));
+    }
+    Ok(Some(content_length.min(requested_len)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +343,12 @@ mod tests {
         "test backend: over read from origin",
         "test backend: page byte offset overflow",
     );
+
+    const RESPONSE_ERRORS: [ResponseErrorMessages; 3] = [
+        HTTP_RESPONSE_ERRORS,
+        S3_RESPONSE_ERRORS,
+        AZURE_RESPONSE_ERRORS,
+    ];
 
     fn page(page_idx: u32) -> PageRef {
         PageRef {
@@ -498,6 +600,76 @@ mod tests {
         zero_fill_pages_from(&dsts, 2, via_stream.as_mut_ptr(), page_size, ERRORS).unwrap();
 
         assert_eq!(via_copy, via_stream);
+    }
+
+    #[test]
+    fn absolute_range_offsets_into_stripe() {
+        assert_eq!(absolute_range(0, 4 * 1024 * 1024, 100, 200), (100, 200));
+        let stripe = 4 * 1024 * 1024u64;
+        assert_eq!(
+            absolute_range(3, stripe, 8192, 4096),
+            (3 * stripe + 8192, 4096)
+        );
+    }
+
+    #[test]
+    fn response_status_policy_is_shared_by_all_flavors() {
+        for errors in RESPONSE_ERRORS {
+            assert!(matches!(
+                check_origin_status(StatusCode::NOT_FOUND, 4096, errors),
+                Err(Error::OriginNotFound)
+            ));
+            assert!(check_origin_status(StatusCode::PARTIAL_CONTENT, 4096, errors).is_ok());
+            assert!(check_origin_status(StatusCode::OK, 0, errors).is_ok());
+            assert!(check_origin_status(StatusCode::OK, 1, errors).is_err());
+            assert!(check_origin_status(StatusCode::FORBIDDEN, 0, errors).is_err());
+        }
+    }
+
+    #[test]
+    fn response_length_policy_is_shared_by_all_flavors() {
+        for errors in RESPONSE_ERRORS {
+            assert_eq!(
+                expected_body_len(
+                    StatusCode::PARTIAL_CONTENT,
+                    1,
+                    None,
+                    Some(1000),
+                    4096,
+                    errors,
+                )
+                .unwrap(),
+                Some(1000)
+            );
+            assert!(
+                expected_body_len(
+                    StatusCode::PARTIAL_CONTENT,
+                    1,
+                    None,
+                    Some(5000),
+                    4096,
+                    errors,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                expected_body_len(StatusCode::OK, 1, None, Some(1_000_000), 4096, errors).unwrap(),
+                Some(4096)
+            );
+            assert_eq!(
+                expected_body_len(StatusCode::OK, 1, Some("close"), None, 4096, errors).unwrap(),
+                None
+            );
+            assert_eq!(
+                expected_body_len(StatusCode::OK, 0, None, None, 4096, errors).unwrap(),
+                None
+            );
+            assert!(expected_body_len(StatusCode::OK, 1, None, None, 4096, errors).is_err());
+            assert!(
+                expected_body_len(StatusCode::OK, 0, Some("keep-alive"), None, 4096, errors)
+                    .is_err()
+            );
+        }
     }
 
     fn format_error(error: Error) -> String {

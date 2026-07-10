@@ -35,7 +35,7 @@ use std::rc::Rc;
 use ::http::header::{HOST, RANGE};
 
 use crate::bufferpool::{BulkRef, Error, PageRef};
-use crate::http::{Method, StatusCode, response_closes_after_body, serialize_request};
+use crate::http::{Method, StatusCode, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
 use crate::tls::TlsContext;
@@ -45,7 +45,8 @@ use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
 use super::http_family::{
-    HTTP_PAGE_ERRORS, copy_body_into_pages, locate_in_pages, pages_capacity,
+    HTTP_PAGE_ERRORS, HTTP_RESPONSE_ERRORS, absolute_range, check_origin_status,
+    copy_body_into_pages, expected_body_len, locate_in_pages, pages_capacity,
     write_slice_into_pages, zero_fill_pages_from,
 };
 use super::limiter::FetchLimiter;
@@ -322,7 +323,7 @@ async fn fetch(
     let connection = head.connection;
     let buf = head.buf;
 
-    check_origin_status(status, start)?;
+    check_origin_status(status, start, HTTP_RESPONSE_ERRORS)?;
 
     // An origin that answers a different slice than we asked for would
     // silently corrupt the stripe, so reject a mismatched Content-Range.
@@ -348,6 +349,7 @@ async fn fetch(
         connection.as_deref(),
         content_length,
         len,
+        HTTP_RESPONSE_ERRORS,
     )?;
 
     // `body_cap` is the most body bytes we will accept into the pages.
@@ -507,77 +509,6 @@ async fn fetch_metadata(
     Ok(())
 }
 
-/// Determine how many body bytes to read for this response, or `None`
-/// when the origin advertised no `Content-Length` but its connection
-/// semantics still guarantee EOF will delimit the body.
-///
-/// A `206` returns at most the bytes we asked for, so a `Content-Length`
-/// exceeding `len` is a protocol violation. A `200` (accepted only at
-/// offset 0) streams the whole object, which may be larger than one
-/// page; we only want the first `len` bytes of it.
-fn expected_body_len(
-    status: StatusCode,
-    version_minor: u8,
-    connection: Option<&str>,
-    content_length: Option<u64>,
-    len: u64,
-) -> Result<Option<u64>, Error> {
-    let Some(cl) = content_length else {
-        if !response_closes_after_body(version_minor, connection) {
-            return Err(Error::from(
-                "http backend: origin response missing Content-Length on keep-alive connection",
-            ));
-        }
-        return Ok(None);
-    };
-    let n = if status == StatusCode::PARTIAL_CONTENT {
-        if cl > len {
-            return Err(Error::from(
-                "http backend: origin Content-Length exceeds requested range",
-            ));
-        }
-        cl
-    } else {
-        cl.min(len)
-    };
-    Ok(Some(n))
-}
-
-/// Validate the origin's response status against the requested offset.
-///
-/// `404` maps to [`Error::OriginNotFound`] so frontends can return a
-/// not-found response instead of treating it as an opaque transport
-/// failure. `206` (Partial Content) is always fine. A `200` means the
-/// origin ignored our `Range` and is streaming the whole object from byte
-/// 0; that is only usable when we asked from offset 0, otherwise the body
-/// would not begin at `start` and copying it would silently corrupt the
-/// stripe. Other statuses are rejected as origin protocol failures.
-fn check_origin_status(status: StatusCode, start: u64) -> Result<(), Error> {
-    if status == StatusCode::NOT_FOUND {
-        return Err(Error::OriginNotFound);
-    }
-    if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
-        return Err(Error::from("http backend: origin returned non-2xx status"));
-    }
-    if status == StatusCode::OK && start != 0 {
-        return Err(Error::from(
-            "http backend: origin ignored Range (200) for a non-zero offset",
-        ));
-    }
-    Ok(())
-}
-
-/// Compute the absolute origin byte range for a stripe sub-range. The
-/// stripe begins at `stripe_idx * stripe_size`; `src_offset`/`src_len`
-/// select bytes within that stripe. Returns `(absolute_start,
-/// length)`.
-fn absolute_range(stripe_idx: u64, stripe_size: u64, src_offset: u64, src_len: u32) -> (u64, u64) {
-    let start = stripe_idx
-        .saturating_mul(stripe_size)
-        .saturating_add(src_offset);
-    (start, src_len as u64)
-}
-
 /// Format a ranged HTTP/1.1 GET request. `start`/`end` are inclusive
 /// byte offsets for the `Range` header.
 fn format_get_request(path: &str, host: &str, start: u64, end: u64) -> Result<Vec<u8>, Error> {
@@ -610,21 +541,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn absolute_range_offsets_into_stripe() {
-        // Stripe 0: range starts at the stripe base plus src.offset.
-        assert_eq!(absolute_range(0, 4 * 1024 * 1024, 0, 4096), (0, 4096));
-        assert_eq!(absolute_range(0, 4 * 1024 * 1024, 100, 200), (100, 200));
-
-        // Stripe 3 at 4 MiB stripes: base is 12 MiB, plus the offset.
-        let stripe = 4 * 1024 * 1024u64;
-        assert_eq!(absolute_range(3, stripe, 0, 4096), (3 * stripe, 4096));
-        assert_eq!(
-            absolute_range(3, stripe, 8192, 4096),
-            (3 * stripe + 8192, 4096)
-        );
-    }
-
-    #[test]
     fn format_get_request_emits_request_line_and_headers() {
         let req = format_get_request("/models/llama.bin", "10.0.0.1:8080", 0, 4095).unwrap();
         let s = std::str::from_utf8(&req).unwrap();
@@ -644,82 +560,6 @@ mod tests {
         let s = std::str::from_utf8(&req).unwrap();
         assert!(s.contains("range: bytes=4096-8191\r\n"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"));
-    }
-
-    #[test]
-    fn check_origin_status_rules() {
-        assert!(matches!(
-            check_origin_status(StatusCode::NOT_FOUND, 0),
-            Err(Error::OriginNotFound)
-        ));
-        assert!(matches!(
-            check_origin_status(StatusCode::NOT_FOUND, 4096),
-            Err(Error::OriginNotFound)
-        ));
-        assert!(matches!(
-            check_origin_status(StatusCode::INTERNAL_SERVER_ERROR, 0),
-            Err(Error::Transport(_))
-        ));
-        // 206 is always acceptable, at any offset.
-        assert!(check_origin_status(StatusCode::PARTIAL_CONTENT, 0).is_ok());
-        assert!(check_origin_status(StatusCode::PARTIAL_CONTENT, 4096).is_ok());
-        // 200 from offset 0 is the whole object, which is fine.
-        assert!(check_origin_status(StatusCode::OK, 0).is_ok());
-        // 200 for a non-zero offset means the origin ignored Range; using
-        // it would corrupt the stripe, so it must be rejected.
-        assert!(check_origin_status(StatusCode::OK, 1).is_err());
-        assert!(check_origin_status(StatusCode::OK, 4096).is_err());
-    }
-
-    #[test]
-    fn expected_body_len_206_uses_content_length() {
-        // Short tail: origin had fewer bytes than the page we asked for.
-        assert_eq!(
-            expected_body_len(StatusCode::PARTIAL_CONTENT, 1, None, Some(1000), 4096).unwrap(),
-            Some(1000)
-        );
-    }
-
-    #[test]
-    fn expected_body_len_206_rejects_overlong_content_length() {
-        // A 206 must not return more than we asked for.
-        assert!(expected_body_len(StatusCode::PARTIAL_CONTENT, 1, None, Some(5000), 4096).is_err());
-    }
-
-    #[test]
-    fn expected_body_len_200_caps_at_requested_len() {
-        // Whole-object 200 stream: we only want the first page.
-        assert_eq!(
-            expected_body_len(StatusCode::OK, 1, None, Some(1_000_000), 4096).unwrap(),
-            Some(4096)
-        );
-    }
-
-    #[test]
-    fn expected_body_len_200_short_object() {
-        // Object shorter than a page: read the 500 bytes, zero-fill rest.
-        assert_eq!(
-            expected_body_len(StatusCode::OK, 1, None, Some(500), 4096).unwrap(),
-            Some(500)
-        );
-    }
-
-    #[test]
-    fn expected_body_len_absent_content_length_reads_to_close() {
-        assert_eq!(
-            expected_body_len(StatusCode::OK, 1, Some("close"), None, 4096).unwrap(),
-            None
-        );
-        assert_eq!(
-            expected_body_len(StatusCode::OK, 0, None, None, 4096).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn expected_body_len_absent_content_length_rejects_keep_alive() {
-        assert!(expected_body_len(StatusCode::OK, 1, None, None, 4096).is_err());
-        assert!(expected_body_len(StatusCode::OK, 0, Some("keep-alive"), None, 4096).is_err());
     }
 
     #[test]

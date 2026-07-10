@@ -30,7 +30,7 @@ use std::rc::Rc;
 use ::http::header::{HOST, RANGE};
 
 use crate::bufferpool::{BulkRef, Error, PageRef};
-use crate::http::{Method, StatusCode, response_closes_after_body, serialize_request};
+use crate::http::{Method, StatusCode, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
 use crate::storage::{ObjectMetadata, StripeReq};
 use crate::tls::TlsContext;
@@ -40,7 +40,8 @@ use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
 use super::http_family::{
-    S3_PAGE_ERRORS, copy_body_into_pages, locate_in_pages, pages_capacity, write_slice_into_pages,
+    S3_PAGE_ERRORS, S3_RESPONSE_ERRORS, absolute_range, check_origin_status, copy_body_into_pages,
+    expected_body_len, locate_in_pages, pages_capacity, write_slice_into_pages,
     zero_fill_pages_from,
 };
 use super::limiter::FetchLimiter;
@@ -290,7 +291,7 @@ async fn fetch(
     let connection = head.connection;
     let buf = head.buf;
 
-    check_origin_status(status, start)?;
+    check_origin_status(status, start, S3_RESPONSE_ERRORS)?;
 
     // An origin that answers a different slice than we asked for would
     // silently corrupt the stripe, so reject a mismatched Content-Range.
@@ -316,6 +317,7 @@ async fn fetch(
         connection.as_deref(),
         content_length,
         len,
+        S3_RESPONSE_ERRORS,
     )?;
 
     // `body_cap` is the most body bytes we will accept into the pages.
@@ -470,69 +472,6 @@ async fn fetch_metadata(
     Ok(())
 }
 
-/// Determine how many body bytes to read for this response, or `None`
-/// when the origin advertised no `Content-Length` but its connection
-/// semantics still guarantee EOF will delimit the body.
-fn expected_body_len(
-    status: StatusCode,
-    version_minor: u8,
-    connection: Option<&str>,
-    content_length: Option<u64>,
-    len: u64,
-) -> Result<Option<u64>, Error> {
-    let Some(cl) = content_length else {
-        if !response_closes_after_body(version_minor, connection) {
-            return Err(Error::from(
-                "s3 backend: origin response missing Content-Length on keep-alive connection",
-            ));
-        }
-        return Ok(None);
-    };
-    let n = if status == StatusCode::PARTIAL_CONTENT {
-        if cl > len {
-            return Err(Error::from(
-                "s3 backend: origin Content-Length exceeds requested range",
-            ));
-        }
-        cl
-    } else {
-        cl.min(len)
-    };
-    Ok(Some(n))
-}
-
-/// Validate the origin's response status against the requested offset.
-///
-/// `206` (Partial Content) is always fine. A `200` means the origin
-/// ignored our `Range` and is streaming the whole object from byte 0;
-/// that is only usable when we asked from offset 0. A `404 Not Found`
-/// maps to [`Error::OriginNotFound`] so the pool can tell a missing
-/// object apart from a transport failure. Other non-2xx are generic.
-fn check_origin_status(status: StatusCode, start: u64) -> Result<(), Error> {
-    if status == StatusCode::NOT_FOUND {
-        return Err(Error::OriginNotFound);
-    }
-    if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
-        return Err(Error::from("s3 backend: origin returned non-2xx status"));
-    }
-    if status == StatusCode::OK && start != 0 {
-        return Err(Error::from(
-            "s3 backend: origin ignored Range (200) for a non-zero offset",
-        ));
-    }
-    Ok(())
-}
-
-/// Compute the absolute origin byte range for a stripe sub-range. The
-/// stripe begins at `stripe_idx * stripe_size`; `src_offset`/`src_len`
-/// select bytes within that stripe. Returns `(absolute_start, length)`.
-fn absolute_range(stripe_idx: u64, stripe_size: u64, src_offset: u64, src_len: u32) -> (u64, u64) {
-    let start = stripe_idx
-        .saturating_mul(stripe_size)
-        .saturating_add(src_offset);
-    (start, src_len as u64)
-}
-
 /// Format a ranged HTTP/1.1 GET request against the S3 origin.
 /// `start`/`end` are inclusive byte offsets for the `Range` header.
 fn format_get_request(path: &str, host: &str, start: u64, end: u64) -> Result<Vec<u8>, Error> {
@@ -563,36 +502,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn absolute_range_offsets_into_stripe() {
-        assert_eq!(absolute_range(0, 4 * 1024 * 1024, 0, 4096), (0, 4096));
-        let stripe = 4 * 1024 * 1024u64;
-        assert_eq!(
-            absolute_range(3, stripe, 8192, 4096),
-            (3 * stripe + 8192, 4096)
-        );
-    }
-
-    #[test]
-    fn check_origin_status_maps_404_to_origin_not_found() {
-        let err = check_origin_status(StatusCode::NOT_FOUND, 0).unwrap_err();
-        assert!(matches!(err, Error::OriginNotFound));
-        // 404 maps regardless of offset.
-        let err = check_origin_status(StatusCode::NOT_FOUND, 4096).unwrap_err();
-        assert!(matches!(err, Error::OriginNotFound));
-    }
-
-    #[test]
-    fn check_origin_status_keeps_http_rules() {
-        // 206 always ok; 200 ok only at offset 0.
-        assert!(check_origin_status(StatusCode::PARTIAL_CONTENT, 4096).is_ok());
-        assert!(check_origin_status(StatusCode::OK, 0).is_ok());
-        assert!(check_origin_status(StatusCode::OK, 1).is_err());
-        // Other non-2xx stay generic (not OriginNotFound).
-        let err = check_origin_status(StatusCode::FORBIDDEN, 0).unwrap_err();
-        assert!(matches!(err, Error::Transport(_)));
-    }
-
-    #[test]
     fn get_request_has_expected_headers() {
         let req = format_get_request("/bucket/key", "s3.example.com", 0, 4095).unwrap();
         let s = std::str::from_utf8(&req).unwrap();
@@ -614,20 +523,6 @@ mod tests {
         assert!(!s.contains("range:"), "got: {s}");
         assert!(!s.contains("x-amz-date"), "got: {s}");
         assert!(s.ends_with("\r\n\r\n"), "got: {s}");
-    }
-
-    #[test]
-    fn expected_body_len_absent_content_length_requires_close() {
-        assert_eq!(
-            expected_body_len(StatusCode::OK, 1, Some("close"), None, 4096).unwrap(),
-            None
-        );
-        assert_eq!(
-            expected_body_len(StatusCode::OK, 0, None, None, 4096).unwrap(),
-            None
-        );
-        assert!(expected_body_len(StatusCode::OK, 1, None, None, 4096).is_err());
-        assert!(expected_body_len(StatusCode::OK, 0, Some("keep-alive"), None, 4096).is_err());
     }
 
     #[test]
