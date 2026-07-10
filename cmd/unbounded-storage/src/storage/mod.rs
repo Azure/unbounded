@@ -22,6 +22,7 @@ pub mod types;
 mod alloc;
 mod btree;
 mod checksum;
+mod completion;
 mod engine;
 mod local;
 mod lru;

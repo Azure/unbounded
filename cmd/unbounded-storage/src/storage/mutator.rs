@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use crate::storage::btree::LeafEntry;
+use crate::storage::completion::{Completion, CompletionWait};
 use crate::storage::types::PageKey;
 
 /// A single submission to the mutator. The submitter has already
@@ -60,65 +61,9 @@ pub(crate) enum MutatorOutcome {
     Failed,
 }
 
-/// Shared reply slot: filled by the mutator, awaited by the
-/// submitter. Cheap to construct (`Arc<Self>`) so the engine can
-/// allocate one per request.
-pub(crate) struct MutatorReply {
-    inner: Mutex<ReplyInner>,
-}
-
-struct ReplyInner {
-    result: Option<MutatorOutcome>,
-    waker: Option<Waker>,
-}
-
-impl MutatorReply {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(ReplyInner {
-                result: None,
-                waker: None,
-            }),
-        })
-    }
-
-    /// Called by the mutator once the batch this request was part
-    /// of has been processed. Wakes the submitter if it has
-    /// already polled.
-    pub(crate) fn set(&self, outcome: MutatorOutcome) {
-        let waker = {
-            let mut g = self.inner.lock().unwrap();
-            g.result = Some(outcome);
-            g.waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
-    }
-
-    pub(crate) fn wait(self: Arc<Self>) -> ReplyWait {
-        ReplyWait { inner: self }
-    }
-}
-
-pub(crate) struct ReplyWait {
-    inner: Arc<MutatorReply>,
-}
-
-impl Future for ReplyWait {
-    type Output = MutatorOutcome;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut g = self.inner.inner.lock().unwrap();
-        if let Some(o) = g.result.take() {
-            Poll::Ready(o)
-        } else {
-            if !g.waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
-                g.waker = Some(cx.waker().clone());
-            }
-            Poll::Pending
-        }
-    }
-}
+/// Shared reply slot filled by the mutator and awaited by one submitter.
+pub(crate) type MutatorReply = Completion<MutatorOutcome>;
+pub(crate) type ReplyWait = CompletionWait<MutatorOutcome>;
 
 /// MPSC-style queue between writer/eviction tasks (producers)
 /// and the engine's `run_mutator` loop (single consumer). All
