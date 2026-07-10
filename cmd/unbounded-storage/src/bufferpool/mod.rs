@@ -22,5 +22,5 @@ pub use pipeline::{PipelinedRead, StripePlan};
 pub use pool::Pool;
 pub use stream::{OwnedPageFuture, PageGuard, ReadStream};
 pub use traits::{BlockStore, BufferPool, PageCachePolicy, PageStream, Req, Transport};
-pub use types::{BulkRef, Error, PageRef, PoolConfig, StripeKey, TraceCtx};
+pub use types::{BulkRef, Error, PageRef, PoolConfig, StripeKey};
 pub use window::WindowedRead;
