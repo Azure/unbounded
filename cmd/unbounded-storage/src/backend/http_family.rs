@@ -10,10 +10,10 @@ use std::task::{Context, Poll};
 
 use ::http::header::{HOST, RANGE};
 
-use crate::bufferpool::{Error, PageRef, PageStream};
+use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::http::{Method, StatusCode, response_closes_after_body, serialize_request};
 use crate::ring::{NetHandle, SockAddr};
-use crate::storage::ObjectMetadata;
+use crate::storage::{ObjectMetadata, StripeReq};
 use crate::tls::TlsContext;
 
 use super::conn::{
@@ -83,6 +83,7 @@ pub(super) const HTTP_PAGE_ERRORS: PageErrorMessages = PageErrorMessages::new(
 #[derive(Clone, Copy)]
 pub(super) struct HttpEnginePolicy {
     flavor: HttpFlavor,
+    log_target: Option<&'static str>,
     response_errors: ResponseErrorMessages,
     page_errors: PageErrorMessages,
     pub(super) missing_origin: &'static str,
@@ -105,6 +106,7 @@ pub(super) struct HttpEnginePolicy {
 
 pub(super) static HTTP_ENGINE_POLICY: HttpEnginePolicy = HttpEnginePolicy {
     flavor: HttpFlavor::Http,
+    log_target: Some("backend.http"),
     response_errors: ResponseErrorMessages::new(
         "http backend: origin response missing Content-Length on keep-alive connection",
         "http backend: origin Content-Length exceeds requested range",
@@ -132,6 +134,7 @@ pub(super) static HTTP_ENGINE_POLICY: HttpEnginePolicy = HttpEnginePolicy {
 
 pub(super) static S3_ENGINE_POLICY: HttpEnginePolicy = HttpEnginePolicy {
     flavor: HttpFlavor::S3,
+    log_target: Some("backend.s3"),
     response_errors: ResponseErrorMessages::new(
         "s3 backend: origin response missing Content-Length on keep-alive connection",
         "s3 backend: origin Content-Length exceeds requested range",
@@ -162,6 +165,7 @@ pub(super) static S3_ENGINE_POLICY: HttpEnginePolicy = HttpEnginePolicy {
 
 pub(super) static AZURE_ENGINE_POLICY: HttpEnginePolicy = HttpEnginePolicy {
     flavor: HttpFlavor::Azure,
+    log_target: None,
     response_errors: ResponseErrorMessages::new(
         "azure backend: origin response missing Content-Length on keep-alive connection",
         "azure backend: origin Content-Length exceeds requested range",
@@ -189,6 +193,162 @@ pub(super) static AZURE_ENGINE_POLICY: HttpEnginePolicy = HttpEnginePolicy {
     head_non_200: "azure backend: metadata HEAD returned non-200 status",
     head_missing_content_length: "azure backend: metadata HEAD missing Content-Length",
 };
+
+/// Shard-local state and behavior shared by the HTTP-family backends.
+pub(super) struct HttpBackendCore {
+    handle: NetHandle,
+    origin: SockAddr,
+    host: String,
+    sni_host: String,
+    tls: Option<Rc<TlsContext>>,
+    backend_id: String,
+    stripe_size: u64,
+    page_size: usize,
+    backing_base: *mut u8,
+    limiter: FetchLimiter,
+    conns: OriginConnPool,
+    policy: &'static HttpEnginePolicy,
+}
+
+impl HttpBackendCore {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        handle: NetHandle,
+        origin: SockAddr,
+        host: String,
+        sni_host: String,
+        tls: Option<Rc<TlsContext>>,
+        backend_id: String,
+        stripe_size: u64,
+        page_size: usize,
+        backing_base: *mut u8,
+        http_concurrency: usize,
+        policy: &'static HttpEnginePolicy,
+    ) -> Self {
+        Self {
+            handle,
+            origin,
+            host,
+            sni_host,
+            tls,
+            backend_id,
+            stripe_size,
+            page_size,
+            backing_base,
+            limiter: FetchLimiter::new(http_concurrency),
+            conns: OriginConnPool::new(http_concurrency),
+            policy,
+        }
+    }
+
+    pub(super) fn backend_id(&self) -> &str {
+        &self.backend_id
+    }
+
+    pub(super) fn resolve_origin(url: &str) -> std::io::Result<SockAddr> {
+        use std::net::{SocketAddr, ToSocketAddrs};
+
+        let mut last_v6 = false;
+        for addr in url.to_socket_addrs()? {
+            match addr {
+                SocketAddr::V4(v4) => {
+                    let sin = libc::sockaddr_in {
+                        sin_family: libc::AF_INET as libc::sa_family_t,
+                        sin_port: v4.port().to_be(),
+                        sin_addr: libc::in_addr {
+                            s_addr: u32::from(*v4.ip()).to_be(),
+                        },
+                        sin_zero: [0; 8],
+                    };
+                    return Ok(SockAddr::from_sockaddr_in(sin));
+                }
+                SocketAddr::V6(_) => last_v6 = true,
+            }
+        }
+        let msg = if last_v6 {
+            "http backend: origin resolved to IPv6 only; v1 dials IPv4 only"
+        } else {
+            "http backend: origin endpoint did not resolve to any address"
+        };
+        Err(std::io::Error::other(msg))
+    }
+
+    pub(super) fn fetch_stream(
+        &self,
+        req: &StripeReq,
+        src: BulkRef,
+        dsts: &[PageRef],
+    ) -> FetchStream<'static> {
+        let Some(origin) = req.origin() else {
+            return FetchStream::immediate_error(self.policy.missing_origin);
+        };
+        let path = origin.origin_object_id.clone();
+        let dsts_owned = dsts.to_vec();
+
+        let inputs = OriginFetchInputs {
+            handle: self.handle.clone(),
+            conns: self.conns.clone(),
+            origin: self.origin,
+            host: self.host.clone(),
+            sni_host: self.sni_host.clone(),
+            tls: self.tls.clone(),
+            path: path.clone(),
+            dsts: dsts_owned.clone(),
+            backing_base: self.backing_base,
+            page_size: self.page_size,
+            limiter: self.limiter.clone(),
+            policy: self.policy,
+        };
+
+        // Metadata is a synthetic entry, not a byte range. Branch before
+        // computing the range because its sentinel stripe index would overflow.
+        if origin.is_metadata_entry() {
+            let future = crate::metrics::instrument_backend(
+                self.backend_id.clone(),
+                self.page_size as u64,
+                fetch_metadata(inputs),
+            );
+            let fut: Pin<Box<dyn Future<Output = Result<(), Error>>>> =
+                if let Some(target) = self.policy.log_target {
+                    let mut log = crate::obs::ReqLog::new(target);
+                    log.str_field("op", "HEAD")
+                        .str_field("backend", self.backend_id())
+                        .str_field("path", &path)
+                        .field("pages", dsts_owned.len());
+                    Box::pin(crate::obs::instrument(log, future))
+                } else {
+                    Box::pin(future)
+                };
+            return FetchStream::pending(fut, dsts_owned);
+        }
+
+        debug_assert!(!origin.is_metadata_entry());
+        let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
+        let future = crate::metrics::instrument_backend(
+            self.backend_id.clone(),
+            len,
+            fetch_range(GetFetchInputs {
+                origin: inputs,
+                start,
+                len,
+            }),
+        );
+        let fut: Pin<Box<dyn Future<Output = Result<(), Error>>>> =
+            if let Some(target) = self.policy.log_target {
+                let mut log = crate::obs::ReqLog::new(target);
+                log.str_field("op", "GET")
+                    .str_field("backend", self.backend_id())
+                    .str_field("path", &path)
+                    .field("off", start)
+                    .field("len", len)
+                    .field("pages", dsts_owned.len());
+                Box::pin(crate::obs::instrument(log, future))
+            } else {
+                Box::pin(future)
+            };
+        FetchStream::pending(fut, dsts_owned)
+    }
+}
 
 pub(super) struct OriginFetchInputs {
     pub(super) handle: NetHandle,
@@ -1114,6 +1274,28 @@ mod tests {
         assert!(!HTTP_ENGINE_POLICY.flavor.is_azure());
         assert!(!S3_ENGINE_POLICY.flavor.is_azure());
         assert!(AZURE_ENGINE_POLICY.flavor.is_azure());
+    }
+
+    #[test]
+    fn engine_policies_preserve_core_identity_and_log_targets() {
+        let cases = [
+            (&HTTP_ENGINE_POLICY, HttpFlavor::Http, Some("backend.http")),
+            (&S3_ENGINE_POLICY, HttpFlavor::S3, Some("backend.s3")),
+            (&AZURE_ENGINE_POLICY, HttpFlavor::Azure, None),
+        ];
+
+        for (policy, flavor, log_target) in cases {
+            assert!(matches!(
+                (policy.flavor, flavor),
+                (HttpFlavor::Http, HttpFlavor::Http)
+                    | (HttpFlavor::S3, HttpFlavor::S3)
+                    | (HttpFlavor::Azure, HttpFlavor::Azure)
+            ));
+            assert_eq!(policy.log_target, log_target);
+        }
+        assert!(!std::ptr::eq(&HTTP_ENGINE_POLICY, &S3_ENGINE_POLICY));
+        assert!(!std::ptr::eq(&HTTP_ENGINE_POLICY, &AZURE_ENGINE_POLICY));
+        assert!(!std::ptr::eq(&S3_ENGINE_POLICY, &AZURE_ENGINE_POLICY));
     }
 
     fn format_error(error: Error) -> String {

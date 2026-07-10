@@ -38,12 +38,9 @@ use crate::storage::{ObjectMetadata, StripeReq};
 use crate::tls::TlsContext;
 
 use super::Backend;
-use super::conn::OriginConnPool;
 use super::http_family::{
-    GetFetchInputs, HTTP_ENGINE_POLICY, HTTP_PAGE_ERRORS, OriginFetchInputs, absolute_range,
-    copy_body_into_pages, fetch_metadata, fetch_range,
+    HTTP_ENGINE_POLICY, HTTP_PAGE_ERRORS, HttpBackendCore, copy_body_into_pages,
 };
-use super::limiter::FetchLimiter;
 
 /// Stream produced by [`HttpBackend::bulk_get`].
 pub type HttpFetchStream<'a> = super::http_family::FetchStream<'a>;
@@ -55,23 +52,7 @@ pub type HttpFetchStream<'a> = super::http_family::FetchStream<'a>;
 /// Shard-pinned: the [`NetHandle`] and raw `backing_base` pointer are
 /// only ever touched on the owning shard thread that built this backend.
 pub struct HttpBackend {
-    handle: NetHandle,
-    origin: SockAddr,
-    /// Authority sent in the `Host:` header (`host` or `host:port`),
-    /// derived from the configured endpoint URL.
-    host: String,
-    /// Hostname (no port) used for TLS SNI and certificate verification.
-    /// Empty on a plaintext (`http://`) backend.
-    sni_host: String,
-    /// TLS context when the endpoint is `https://`; `None` for plaintext.
-    /// Shared (`Rc`) across the fetch futures this backend spawns.
-    tls: Option<Rc<TlsContext>>,
-    backend_id: String,
-    stripe_size: u64,
-    page_size: usize,
-    backing_base: *mut u8,
-    limiter: FetchLimiter,
-    conns: OriginConnPool,
+    core: HttpBackendCore,
 }
 
 impl HttpBackend {
@@ -88,24 +69,26 @@ impl HttpBackend {
         http_concurrency: usize,
     ) -> Self {
         Self {
-            handle,
-            origin,
-            host,
-            sni_host,
-            tls,
-            backend_id,
-            stripe_size,
-            page_size,
-            backing_base,
-            limiter: FetchLimiter::new(http_concurrency),
-            conns: OriginConnPool::new(http_concurrency),
+            core: HttpBackendCore::new(
+                handle,
+                origin,
+                host,
+                sni_host,
+                tls,
+                backend_id,
+                stripe_size,
+                page_size,
+                backing_base,
+                http_concurrency,
+                &HTTP_ENGINE_POLICY,
+            ),
         }
     }
 
     /// The configured `backend_id` this backend serves, i.e. the
     /// `OriginRef::backend_id` whose stripes route here.
     pub fn backend_id(&self) -> &str {
-        &self.backend_id
+        self.core.backend_id()
     }
 
     /// Resolve a `host:port` URL value to a single IPv4 [`SockAddr`].
@@ -114,31 +97,7 @@ impl HttpBackend {
     /// startup is acceptable for the origin tier. If only IPv6
     /// addresses resolve, this returns an error: v1 dials IPv4 only.
     pub fn resolve_origin(url: &str) -> std::io::Result<SockAddr> {
-        use std::net::{SocketAddr, ToSocketAddrs};
-
-        let mut last_v6 = false;
-        for addr in url.to_socket_addrs()? {
-            match addr {
-                SocketAddr::V4(v4) => {
-                    let sin = libc::sockaddr_in {
-                        sin_family: libc::AF_INET as libc::sa_family_t,
-                        sin_port: v4.port().to_be(),
-                        sin_addr: libc::in_addr {
-                            s_addr: u32::from(*v4.ip()).to_be(),
-                        },
-                        sin_zero: [0; 8],
-                    };
-                    return Ok(SockAddr::from_sockaddr_in(sin));
-                }
-                SocketAddr::V6(_) => last_v6 = true,
-            }
-        }
-        let msg = if last_v6 {
-            "http backend: origin resolved to IPv6 only; v1 dials IPv4 only"
-        } else {
-            "http backend: origin endpoint did not resolve to any address"
-        };
-        Err(std::io::Error::new(std::io::ErrorKind::Other, msg))
+        HttpBackendCore::resolve_origin(url)
     }
 }
 
@@ -157,91 +116,7 @@ impl HttpBackend {
         src: BulkRef,
         dsts: &[PageRef],
     ) -> HttpFetchStream<'static> {
-        let Some(origin) = req.origin() else {
-            return HttpFetchStream::immediate_error(HTTP_ENGINE_POLICY.missing_origin);
-        };
-        let path = origin.origin_object_id.clone();
-        let host = self.host.clone();
-        let sni_host = self.sni_host.clone();
-        let tls = self.tls.clone();
-
-        let dsts_owned = dsts.to_vec();
-        let handle = self.handle.clone();
-        let origin_addr = self.origin;
-        let backing_base = self.backing_base;
-        let page_size = self.page_size;
-        let conns = self.conns.clone();
-
-        // A metadata entry is not a byte range of the object; it is a
-        // synthetic one-page cache entry whose payload is the object's
-        // metadata. The sentinel `stripe_idx` would overflow
-        // `absolute_range`, so this must branch before that is computed.
-        if origin.is_metadata_entry() {
-            let mut log = crate::obs::ReqLog::new("backend.http");
-            log.str_field("op", "HEAD")
-                .str_field("backend", self.backend_id())
-                .str_field("path", &path)
-                .field("pages", dsts_owned.len());
-            let fut = Box::pin(crate::obs::instrument(
-                log,
-                crate::metrics::instrument_backend(
-                    self.backend_id().to_string(),
-                    page_size as u64,
-                    fetch_metadata(OriginFetchInputs {
-                        handle,
-                        conns,
-                        origin: origin_addr,
-                        host,
-                        sni_host,
-                        tls,
-                        path,
-                        dsts: dsts_owned.clone(),
-                        backing_base,
-                        page_size,
-                        limiter: self.limiter.clone(),
-                        policy: &HTTP_ENGINE_POLICY,
-                    }),
-                ),
-            ));
-            return HttpFetchStream::pending(fut, dsts_owned);
-        }
-
-        debug_assert!(!origin.is_metadata_entry());
-        let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
-
-        let mut log = crate::obs::ReqLog::new("backend.http");
-        log.str_field("op", "GET")
-            .str_field("backend", self.backend_id())
-            .str_field("path", &path)
-            .field("off", start)
-            .field("len", len)
-            .field("pages", dsts_owned.len());
-        let fut = Box::pin(crate::obs::instrument(
-            log,
-            crate::metrics::instrument_backend(
-                self.backend_id().to_string(),
-                len,
-                fetch_range(GetFetchInputs {
-                    origin: OriginFetchInputs {
-                        handle,
-                        conns,
-                        origin: origin_addr,
-                        host,
-                        sni_host,
-                        tls,
-                        path,
-                        dsts: dsts_owned.clone(),
-                        backing_base,
-                        page_size,
-                        limiter: self.limiter.clone(),
-                        policy: &HTTP_ENGINE_POLICY,
-                    },
-                    start,
-                    len,
-                }),
-            ),
-        ));
-        HttpFetchStream::pending(fut, dsts_owned)
+        self.core.fetch_stream(req, src, dsts)
     }
 }
 

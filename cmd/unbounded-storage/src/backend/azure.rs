@@ -30,12 +30,7 @@ use crate::storage::StripeReq;
 use crate::tls::TlsContext;
 
 use super::Backend;
-use super::conn::OriginConnPool;
-use super::http_family::{
-    AZURE_ENGINE_POLICY, GetFetchInputs, OriginFetchInputs, absolute_range, fetch_metadata,
-    fetch_range,
-};
-use super::limiter::FetchLimiter;
+use super::http_family::{AZURE_ENGINE_POLICY, HttpBackendCore};
 
 /// Stream produced by [`AzureBackend::bulk_get`].
 pub type AzureFetchStream<'a> = super::http_family::FetchStream<'a>;
@@ -46,23 +41,7 @@ pub type AzureFetchStream<'a> = super::http_family::FetchStream<'a>;
 /// Shard-pinned: the [`NetHandle`] and raw `backing_base` pointer are
 /// only ever touched on the owning shard thread that built this backend.
 pub struct AzureBackend {
-    handle: NetHandle,
-    origin: SockAddr,
-    /// The origin host used for the `Host:` header. The TCP connect
-    /// uses `origin` (the resolved IPv4), but the storage account's
-    /// virtual-host name must travel in `Host:`.
-    host: String,
-    /// The hostname (no port) used for TLS SNI and certificate
-    /// verification. Empty for plaintext (`http://`) origins.
-    sni_host: String,
-    /// TLS context for `https://` origins; `None` for plaintext.
-    tls: Option<Rc<TlsContext>>,
-    backend_id: String,
-    stripe_size: u64,
-    page_size: usize,
-    backing_base: *mut u8,
-    limiter: FetchLimiter,
-    conns: OriginConnPool,
+    core: HttpBackendCore,
 }
 
 impl AzureBackend {
@@ -80,33 +59,35 @@ impl AzureBackend {
         http_concurrency: usize,
     ) -> Self {
         Self {
-            handle,
-            origin,
-            host,
-            sni_host,
-            tls,
-            backend_id,
-            stripe_size,
-            page_size,
-            backing_base,
-            limiter: FetchLimiter::new(http_concurrency),
-            conns: OriginConnPool::new(http_concurrency),
+            core: HttpBackendCore::new(
+                handle,
+                origin,
+                host,
+                sni_host,
+                tls,
+                backend_id,
+                stripe_size,
+                page_size,
+                backing_base,
+                http_concurrency,
+                &AZURE_ENGINE_POLICY,
+            ),
         }
     }
 
     /// The configured `backend_id` this backend serves, i.e. the
     /// `OriginRef::backend_id` whose stripes route here.
     pub fn backend_id(&self) -> &str {
-        &self.backend_id
+        self.core.backend_id()
     }
 
     /// Resolve a `host:port` URL value to a single IPv4 [`SockAddr`].
-    /// Delegates to [`HttpBackend::resolve_origin`](super::HttpBackend::resolve_origin),
-    /// which takes the first IPv4 `ToSocketAddrs` yields and errors on
-    /// IPv6-only origins (v1 dials IPv4 only). The hostname for the
-    /// `Host:` header is passed separately to [`AzureBackend::new`].
+    /// Uses the shared HTTP-family resolver, which takes the first IPv4
+    /// `ToSocketAddrs` result and errors on IPv6-only origins (v1 dials
+    /// IPv4 only). The hostname for the `Host:` header is passed
+    /// separately to [`AzureBackend::new`].
     pub fn resolve_origin(url: &str) -> std::io::Result<SockAddr> {
-        super::HttpBackend::resolve_origin(url)
+        HttpBackendCore::resolve_origin(url)
     }
 }
 
@@ -122,73 +103,7 @@ impl AzureBackend {
         src: BulkRef,
         dsts: &[PageRef],
     ) -> AzureFetchStream<'static> {
-        let Some(origin) = req.origin() else {
-            return AzureFetchStream::immediate_error(AZURE_ENGINE_POLICY.missing_origin);
-        };
-        let path = origin.origin_object_id.clone();
-
-        let dsts_owned = dsts.to_vec();
-        let handle = self.handle.clone();
-        let origin_addr = self.origin;
-        let backing_base = self.backing_base;
-        let page_size = self.page_size;
-        let host = self.host.clone();
-        let sni_host = self.sni_host.clone();
-        let tls = self.tls.clone();
-        let conns = self.conns.clone();
-
-        // A metadata entry is not a byte range of the object; it is a
-        // synthetic one-page cache entry whose payload is the object's
-        // metadata. The sentinel `stripe_idx` would overflow
-        // `absolute_range`, so this must branch before that is computed.
-        if origin.is_metadata_entry() {
-            let fut = Box::pin(crate::metrics::instrument_backend(
-                self.backend_id().to_string(),
-                page_size as u64,
-                fetch_metadata(OriginFetchInputs {
-                    handle,
-                    conns,
-                    origin: origin_addr,
-                    host,
-                    sni_host,
-                    tls,
-                    path,
-                    dsts: dsts_owned.clone(),
-                    backing_base,
-                    page_size,
-                    limiter: self.limiter.clone(),
-                    policy: &AZURE_ENGINE_POLICY,
-                }),
-            ));
-            return AzureFetchStream::pending(fut, dsts_owned);
-        }
-
-        debug_assert!(!origin.is_metadata_entry());
-        let (start, len) = absolute_range(origin.stripe_idx, self.stripe_size, src.offset, src.len);
-
-        let fut = Box::pin(crate::metrics::instrument_backend(
-            self.backend_id().to_string(),
-            len,
-            fetch_range(GetFetchInputs {
-                origin: OriginFetchInputs {
-                    handle,
-                    conns,
-                    origin: origin_addr,
-                    host,
-                    sni_host,
-                    tls,
-                    path,
-                    dsts: dsts_owned.clone(),
-                    backing_base,
-                    page_size,
-                    limiter: self.limiter.clone(),
-                    policy: &AZURE_ENGINE_POLICY,
-                },
-                start,
-                len,
-            }),
-        ));
-        AzureFetchStream::pending(fut, dsts_owned)
+        self.core.fetch_stream(req, src, dsts)
     }
 }
 
