@@ -390,6 +390,7 @@ mod tests {
     #[derive(Default)]
     struct MockState {
         opened: HashSet<PathBuf>,
+        durably_mutated: HashSet<PathBuf>,
         fail_on: HashSet<PathBuf>,
         open_calls: usize,
     }
@@ -432,6 +433,7 @@ mod tests {
                 return Err(DiskError::Open("injected".into()));
             }
             s.opened.insert(PathBuf::from(path));
+            s.durably_mutated.insert(PathBuf::from(path));
             drop(s);
             Ok((
                 MockHandle {
@@ -563,6 +565,25 @@ mod tests {
         assert_eq!(report.failures[0].0, PathBuf::from("/bad"));
         assert!(state.lock().unwrap().opened.is_empty());
         assert!(reg.channels_snapshot().is_empty());
+    }
+
+    #[test]
+    fn failed_staging_cannot_undo_destructive_open() {
+        let (target, state) = MockDiskTarget::new();
+        state
+            .lock()
+            .unwrap()
+            .fail_on
+            .insert(PathBuf::from("/later-fails"));
+        let mut reg = DiskRegistry::new(target, vec![]);
+
+        let report = reg.reconcile(&[spec("/destructive", None), spec("/later-fails", None)]);
+
+        assert_eq!(report.failures.len(), 1);
+        assert!(reg.current_paths().is_empty());
+        let state = state.lock().unwrap();
+        assert!(state.opened.is_empty());
+        assert!(state.durably_mutated.contains(Path::new("/destructive")));
     }
 
     #[test]
