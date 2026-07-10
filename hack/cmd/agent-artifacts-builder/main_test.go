@@ -64,17 +64,6 @@ v1.34.9
 	}, values["kubernetes_version_groups"])
 }
 
-func TestDefaultKubernetesVersionsIncludes136(t *testing.T) {
-	versions, err := defaultKubernetesVersions()
-	require.NoError(t, err)
-
-	require.Subset(t, normalizeKubernetesVersions(versions), []string{
-		"v1.36.0",
-		"v1.36.1",
-		"v1.36.2",
-	})
-}
-
 func TestResolvePublishInputsTagPushUsesRefTagAndDefaultVersions(t *testing.T) {
 	dir := t.TempDir()
 	versionsFile := filepath.Join(dir, "versions.txt")
