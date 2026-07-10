@@ -84,8 +84,8 @@ data:
         allow_inactive_port: false
         # Disable RDMA and force the libfabric tcp provider.
         disable_rdma: false
-        # Cap on serving-shard CPUs to pin. Omit to claim every usable core.
-        # serving_cores: 12
+        # Cap serving shards to fit the default data and RPC scratch budgets.
+        serving_cores: 8
         # NIC-worker CPUs to pin per active HCA.
         nic_workers: 4
       metrics:
