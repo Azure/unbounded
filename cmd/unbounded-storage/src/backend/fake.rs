@@ -24,7 +24,7 @@ use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::storage::{ObjectMetadata, StripeReq, fill_synthetic_pages, parse_synthetic_object_id};
 
 use super::Backend;
-use super::http::copy_body_into_pages;
+use super::http_family::{HTTP_PAGE_ERRORS, copy_body_into_pages};
 
 /// Origin backend that synthesizes deterministic objects of a fixed size.
 ///
@@ -125,7 +125,13 @@ impl FakeBackend {
                 "fake backend: metadata entry destination too small",
             ));
         }
-        copy_body_into_pages(&self.metadata_body, dsts, self.backing_base, self.page_size)
+        copy_body_into_pages(
+            &self.metadata_body,
+            dsts,
+            self.backing_base,
+            self.page_size,
+            HTTP_PAGE_ERRORS,
+        )
     }
 }
 

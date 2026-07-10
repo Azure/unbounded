@@ -36,6 +36,10 @@ use super::Backend;
 use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
+use super::http_family::{
+    AZURE_PAGE_ERRORS, copy_body_into_pages, locate_in_pages, pages_capacity,
+    write_slice_into_pages, zero_fill_pages_from,
+};
 use super::limiter::FetchLimiter;
 
 /// Stream produced by [`AzureBackend::bulk_get`].
@@ -323,7 +327,14 @@ async fn fetch(
     let leading = &buf[body_start..];
     let lead_take = leading.len().min(body_cap);
     if lead_take > 0 {
-        write_slice_into_pages(&leading[..lead_take], &dsts, 0, backing_base, page_size)?;
+        write_slice_into_pages(
+            &leading[..lead_take],
+            &dsts,
+            0,
+            backing_base,
+            page_size,
+            AZURE_PAGE_ERRORS,
+        )?;
     }
     let mut filled = lead_take;
 
@@ -333,7 +344,9 @@ async fn fetch(
     // length is capped at the room left in the current page and at the
     // bytes still wanted.
     while filled < body_cap {
-        let Some((page_byte_off, room)) = locate_in_pages(&dsts, filled, page_size)? else {
+        let Some((page_byte_off, room)) =
+            locate_in_pages(&dsts, filled, page_size, AZURE_PAGE_ERRORS)?
+        else {
             break;
         };
         let recv_len = room.min(body_cap - filled);
@@ -358,7 +371,7 @@ async fn fetch(
     // close-delimited stream that ended early). The frontend clamps
     // served reads to the object length, so this padding is never
     // returned to a client.
-    zero_fill_pages_from(&dsts, filled, backing_base, page_size)?;
+    zero_fill_pages_from(&dsts, filled, backing_base, page_size, AZURE_PAGE_ERRORS)?;
     if body_response_reusable(
         version_minor,
         connection.as_deref(),
@@ -432,7 +445,7 @@ async fn fetch_metadata(
         .ok_or_else(|| Error::from("azure backend: metadata HEAD missing Content-Length"))?;
 
     let body = ObjectMetadata::new(length).encode()?;
-    copy_body_into_pages(&body, &dsts, backing_base, page_size)?;
+    copy_body_into_pages(&body, &dsts, backing_base, page_size, AZURE_PAGE_ERRORS)?;
     if head_response_reusable(version_minor, connection.as_deref(), header_end, buf.len()) {
         conns.put(conn);
     }
@@ -488,157 +501,6 @@ fn check_origin_status(status: StatusCode, start: u64) -> Result<(), Error> {
         return Err(Error::from(
             "azure backend: origin ignored Range (200) for a non-zero offset",
         ));
-    }
-    Ok(())
-}
-
-/// Copy the `body` bytes into the destination pages in order,
-/// respecting each page's `len`, then zero-fill any page bytes the body
-/// did not cover. Absolute byte offset of a page within the registered
-/// backing is `page_idx * page_size + offset`.
-fn copy_body_into_pages(
-    body: &[u8],
-    dsts: &[PageRef],
-    backing_base: *mut u8,
-    page_size: usize,
-) -> Result<(), Error> {
-    let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
-    if body.len() > capacity {
-        return Err(Error::from("azure backend: over read from origin"));
-    }
-    let mut consumed = 0usize;
-    for page in dsts {
-        let n = page.len as usize;
-        let avail = body.len().saturating_sub(consumed).min(n);
-        let page_offset = (page.page_idx as usize)
-            .checked_mul(page_size)
-            .and_then(|base| base.checked_add(page.offset as usize))
-            .ok_or_else(|| Error::from("azure backend: page byte offset overflow"))?;
-        // SAFETY: the destination addresses a page inside the registered
-        // backing the embedder keeps alive for the shard's lifetime; the
-        // backend is shard-pinned so no other thread touches
-        // `backing_base`. `avail <= n` bytes are copied from `body`
-        // (bounds-checked above) and the remaining `n - avail` bytes of
-        // the page are zero-filled; the page geometry is the caller's
-        // invariant (pages were carved from this backing).
-        unsafe {
-            let dst = backing_base.add(page_offset);
-            if avail > 0 {
-                std::ptr::copy_nonoverlapping(body.as_ptr().add(consumed), dst, avail);
-            }
-            if avail < n {
-                std::ptr::write_bytes(dst.add(avail), 0, n - avail);
-            }
-        }
-        consumed += avail;
-    }
-    Ok(())
-}
-
-/// Total destination byte capacity across `dsts`.
-fn pages_capacity(dsts: &[PageRef]) -> usize {
-    dsts.iter().map(|p| p.len as usize).sum()
-}
-
-/// Registered byte offset of a page within the fixed backing
-/// (`page_idx * page_size + offset`). Identical to the math
-/// [`copy_body_into_pages`] uses against `backing_base`.
-fn page_byte_offset(page: &PageRef, page_size: usize) -> Result<usize, Error> {
-    (page.page_idx as usize)
-        .checked_mul(page_size)
-        .and_then(|base| base.checked_add(page.offset as usize))
-        .ok_or_else(|| Error::from("azure backend: page byte offset overflow"))
-}
-
-/// Locate the destination page covering logical body offset `at` and
-/// return `(registered_byte_offset, room)` where `room` is the number
-/// of bytes left in that page from `at`. Returns `None` once `at`
-/// reaches the pages' total capacity (no page covers it).
-fn locate_in_pages(
-    dsts: &[PageRef],
-    at: usize,
-    page_size: usize,
-) -> Result<Option<(usize, usize)>, Error> {
-    let mut page_start = 0usize;
-    for page in dsts {
-        let n = page.len as usize;
-        if at < page_start + n {
-            let within = at - page_start;
-            let off = page_byte_offset(page, page_size)?
-                .checked_add(within)
-                .ok_or_else(|| Error::from("azure backend: page byte offset overflow"))?;
-            return Ok(Some((off, n - within)));
-        }
-        page_start += n;
-    }
-    Ok(None)
-}
-
-/// Page-aware memcpy of `src` into the destination pages starting at
-/// logical body offset `start`, walking pages so a copy never crosses a
-/// page boundary. Unlike [`copy_body_into_pages`] this does NOT
-/// zero-fill the remainder; the tail is zeroed once after the whole
-/// body has landed (see [`zero_fill_pages_from`]). Errors if the slice
-/// would run past the pages' total capacity.
-fn write_slice_into_pages(
-    src: &[u8],
-    dsts: &[PageRef],
-    start: usize,
-    backing_base: *mut u8,
-    page_size: usize,
-) -> Result<(), Error> {
-    let end = start
-        .checked_add(src.len())
-        .ok_or_else(|| Error::from("azure backend: page byte offset overflow"))?;
-    if end > pages_capacity(dsts) {
-        return Err(Error::from("azure backend: over read from origin"));
-    }
-    let mut written = 0usize;
-    while written < src.len() {
-        let (off, room) = locate_in_pages(dsts, start + written, page_size)?
-            .ok_or_else(|| Error::from("azure backend: over read from origin"))?;
-        let n = room.min(src.len() - written);
-        // SAFETY: `off` addresses a page inside the registered backing
-        // the embedder keeps alive for the shard's lifetime; the backend
-        // is shard-pinned so no other thread touches `backing_base`. `n`
-        // bytes fit within the located page (n <= room) and within `src`
-        // (n <= src.len() - written), both bounds-checked above.
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr().add(written), backing_base.add(off), n);
-        }
-        written += n;
-    }
-    Ok(())
-}
-
-/// Zero-fill destination page bytes from logical offset `from` to the
-/// end of the pages' total capacity, writing directly into the backing.
-/// Preserves the tail-zeroing semantics of [`copy_body_into_pages`] for
-/// the zero-copy streaming path.
-fn zero_fill_pages_from(
-    dsts: &[PageRef],
-    from: usize,
-    backing_base: *mut u8,
-    page_size: usize,
-) -> Result<(), Error> {
-    let mut page_start = 0usize;
-    for page in dsts {
-        let n = page.len as usize;
-        let page_end = page_start + n;
-        if from < page_end {
-            let within = from.saturating_sub(page_start);
-            let off = page_byte_offset(page, page_size)?
-                .checked_add(within)
-                .ok_or_else(|| Error::from("azure backend: page byte offset overflow"))?;
-            // SAFETY: `off` addresses a page inside the registered
-            // backing kept alive for the shard's lifetime; the backend is
-            // shard-pinned. `n - within` bytes stay within this page
-            // (within <= n), so the write does not escape it.
-            unsafe {
-                std::ptr::write_bytes(backing_base.add(off), 0, n - within);
-            }
-        }
-        page_start = page_end;
     }
     Ok(())
 }
@@ -767,228 +629,11 @@ mod tests {
     }
 
     #[test]
-    fn copy_body_into_pages_zero_fills_short_body() {
-        let page_size = 4096usize;
-        let mut backing = vec![0xFFu8; page_size];
-        let base = backing.as_mut_ptr();
-        let dsts = [PageRef {
-            page_idx: 0,
-            offset: 0,
-            len: 8,
-        }];
-        copy_body_into_pages(&[1u8, 2, 3, 4], &dsts, base, page_size).unwrap();
-        assert_eq!(&backing[0..8], &[1, 2, 3, 4, 0, 0, 0, 0]);
-    }
-
-    #[test]
     fn resolve_origin_parses_ipv4() {
         let addr = AzureBackend::resolve_origin("127.0.0.1:10000").expect("resolves");
         assert_eq!(
             addr.as_ipv4(),
             Some((std::net::Ipv4Addr::new(127, 0, 0, 1), 10000))
         );
-    }
-
-    #[test]
-    fn pages_capacity_sums_page_lengths() {
-        let dsts = [
-            PageRef {
-                page_idx: 0,
-                offset: 0,
-                len: 4,
-            },
-            PageRef {
-                page_idx: 1,
-                offset: 16,
-                len: 7,
-            },
-        ];
-        assert_eq!(pages_capacity(&dsts), 11);
-        assert_eq!(pages_capacity(&[]), 0);
-    }
-
-    #[test]
-    fn locate_in_pages_walks_to_correct_page() {
-        let page_size = 4096usize;
-        // page 1 offset 0 len 4, page 2 offset 8 len 3.
-        let dsts = [
-            PageRef {
-                page_idx: 1,
-                offset: 0,
-                len: 4,
-            },
-            PageRef {
-                page_idx: 2,
-                offset: 8,
-                len: 3,
-            },
-        ];
-        assert_eq!(
-            locate_in_pages(&dsts, 0, page_size).unwrap(),
-            Some((page_size, 4))
-        );
-        assert_eq!(
-            locate_in_pages(&dsts, 3, page_size).unwrap(),
-            Some((page_size + 3, 1))
-        );
-        assert_eq!(
-            locate_in_pages(&dsts, 4, page_size).unwrap(),
-            Some((2 * page_size + 8, 3))
-        );
-        assert_eq!(
-            locate_in_pages(&dsts, 5, page_size).unwrap(),
-            Some((2 * page_size + 9, 2))
-        );
-        assert_eq!(locate_in_pages(&dsts, 7, page_size).unwrap(), None);
-        assert_eq!(locate_in_pages(&dsts, 100, page_size).unwrap(), None);
-    }
-
-    #[test]
-    fn write_slice_into_pages_fills_single_page_exactly() {
-        let page_size = 4096usize;
-        let mut backing = vec![0u8; page_size * 2];
-        let base = backing.as_mut_ptr();
-        let dsts = [PageRef {
-            page_idx: 1,
-            offset: 0,
-            len: 4,
-        }];
-        write_slice_into_pages(&[1u8, 2, 3, 4], &dsts, 0, base, page_size).unwrap();
-        assert_eq!(&backing[page_size..page_size + 4], &[1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn write_slice_into_pages_splits_across_pages() {
-        let page_size = 4096usize;
-        let mut backing = vec![0u8; page_size * 3];
-        let base = backing.as_mut_ptr();
-        let dsts = [
-            PageRef {
-                page_idx: 1,
-                offset: 0,
-                len: 4,
-            },
-            PageRef {
-                page_idx: 2,
-                offset: 8,
-                len: 3,
-            },
-        ];
-        write_slice_into_pages(&[1u8, 2, 3, 4, 5, 6, 7], &dsts, 0, base, page_size).unwrap();
-        assert_eq!(&backing[page_size..page_size + 4], &[1, 2, 3, 4]);
-        assert_eq!(&backing[2 * page_size + 8..2 * page_size + 11], &[5, 6, 7]);
-    }
-
-    #[test]
-    fn write_slice_into_pages_assembles_in_two_calls() {
-        // Leading bytes then remainder, written at increasing logical
-        // offsets, must assemble contiguously across the page boundary.
-        let page_size = 4096usize;
-        let mut backing = vec![0u8; page_size * 3];
-        let base = backing.as_mut_ptr();
-        let dsts = [
-            PageRef {
-                page_idx: 1,
-                offset: 0,
-                len: 4,
-            },
-            PageRef {
-                page_idx: 2,
-                offset: 8,
-                len: 3,
-            },
-        ];
-        write_slice_into_pages(&[10u8, 20, 30], &dsts, 0, base, page_size).unwrap();
-        write_slice_into_pages(&[40u8, 50, 60, 70], &dsts, 3, base, page_size).unwrap();
-        assert_eq!(&backing[page_size..page_size + 4], &[10, 20, 30, 40]);
-        assert_eq!(
-            &backing[2 * page_size + 8..2 * page_size + 11],
-            &[50, 60, 70]
-        );
-    }
-
-    #[test]
-    fn write_slice_into_pages_rejects_overflow() {
-        let page_size = 4096usize;
-        let mut backing = vec![0u8; page_size];
-        let base = backing.as_mut_ptr();
-        let dsts = [PageRef {
-            page_idx: 0,
-            offset: 0,
-            len: 4,
-        }];
-        let err = write_slice_into_pages(&[0u8; 6], &dsts, 0, base, page_size).unwrap_err();
-        assert!(matches!(err, Error::Transport(_)));
-        let err = write_slice_into_pages(&[0u8; 3], &dsts, 2, base, page_size).unwrap_err();
-        assert!(matches!(err, Error::Transport(_)));
-    }
-
-    #[test]
-    fn zero_fill_pages_from_zeros_tail_within_page() {
-        let page_size = 4096usize;
-        let mut backing = vec![0xFFu8; page_size];
-        let base = backing.as_mut_ptr();
-        let dsts = [PageRef {
-            page_idx: 0,
-            offset: 0,
-            len: 8,
-        }];
-        backing[0..4].copy_from_slice(&[1, 2, 3, 4]);
-        zero_fill_pages_from(&dsts, 4, base, page_size).unwrap();
-        assert_eq!(&backing[0..8], &[1, 2, 3, 4, 0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn zero_fill_pages_from_spans_remaining_pages() {
-        // `from` lands partway through the first page; the rest of that
-        // page and the whole second page must be zeroed.
-        let page_size = 4096usize;
-        let mut backing = vec![0xAAu8; page_size * 3];
-        let base = backing.as_mut_ptr();
-        let dsts = [
-            PageRef {
-                page_idx: 1,
-                offset: 0,
-                len: 4,
-            },
-            PageRef {
-                page_idx: 2,
-                offset: 0,
-                len: 4,
-            },
-        ];
-        zero_fill_pages_from(&dsts, 2, base, page_size).unwrap();
-        assert_eq!(&backing[page_size..page_size + 2], &[0xAA, 0xAA]);
-        assert_eq!(&backing[page_size + 2..page_size + 4], &[0, 0]);
-        assert_eq!(&backing[2 * page_size..2 * page_size + 4], &[0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn write_then_zero_fill_matches_copy_body_into_pages() {
-        // The streaming path (write leading + zero-fill tail) must land
-        // bytes identically to the heap memcpy path for a short body.
-        let page_size = 4096usize;
-        let dsts = [
-            PageRef {
-                page_idx: 1,
-                offset: 0,
-                len: 4,
-            },
-            PageRef {
-                page_idx: 2,
-                offset: 0,
-                len: 4,
-            },
-        ];
-
-        let mut via_copy = vec![0xAAu8; page_size * 3];
-        copy_body_into_pages(&[9u8, 8], &dsts, via_copy.as_mut_ptr(), page_size).unwrap();
-
-        let mut via_stream = vec![0xAAu8; page_size * 3];
-        let base = via_stream.as_mut_ptr();
-        write_slice_into_pages(&[9u8, 8], &dsts, 0, base, page_size).unwrap();
-        zero_fill_pages_from(&dsts, 2, base, page_size).unwrap();
-
-        assert_eq!(via_copy, via_stream);
     }
 }
