@@ -350,9 +350,13 @@ spec:
                         type: object
                     type: object
                   dhcpLeases:
-                    description: DHCPLeases defines static DHCP leases for PXE booting.
+                    description: |-
+                      DHCPLeases defines static IPv4 provisioning network settings. PXE boot
+                      uses them as DHCP leases. HTTP boot uses the first entry to configure the
+                      Redfish UEFI HTTP boot client.
                     items:
-                      description: DHCPLease defines a static DHCP lease for PXE booting.
+                      description: DHCPLease defines static IPv4 provisioning network
+                        settings.
                       properties:
                         dns:
                           description: DNS is a list of DNS server addresses.
