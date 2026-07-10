@@ -260,6 +260,7 @@ impl ConfigApplyTarget for SimApplyTarget {
     ) -> Result<(), ApplyError> {
         if diff.requires_routing_reload()
             || diff.caches_changed
+            || diff.disks_changed
             || diff.backends_changed
             || diff.frontends_changed
         {
@@ -272,7 +273,7 @@ impl ConfigApplyTarget for SimApplyTarget {
             }
         }
 
-        if diff.caches_changed {
+        if diff.caches_changed || diff.disks_changed {
             let disks = runtime_disks(new.runtime());
             let report = self.registry.reconcile(&disks);
             let mut metrics = self.metrics.borrow_mut();
@@ -456,12 +457,13 @@ pub fn expected_apply_counts(w: &Workload) -> ExpectedApplyCounts {
         let diff = ConfigDiff::between(&current, &next);
         if diff.requires_routing_reload()
             || diff.caches_changed
+            || diff.disks_changed
             || diff.backends_changed
             || diff.frontends_changed
         {
             out.broadcasts += 1;
         }
-        if diff.caches_changed {
+        if diff.caches_changed || diff.disks_changed {
             out.disk_applies += 1;
         }
         if diff.any() {

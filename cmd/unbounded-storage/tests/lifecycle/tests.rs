@@ -143,6 +143,9 @@ fn smoke_config_disk_and_shard_lifecycle() {
     };
     let report: RunReport = run_workload(0x51A7E, w).expect("smoke run");
     assert_eq!(report.phase_b_ready, 2);
-    assert_eq!(report.directory_generation, 1);
+    assert_eq!(report.broadcasts, 3);
+    assert_eq!(report.disk_applies, 1);
+    assert_eq!(report.shard_apply_counts, vec![3, 3]);
+    assert_eq!(report.directory_generation, 2);
     assert_eq!(report.clients_finished, 1);
 }
