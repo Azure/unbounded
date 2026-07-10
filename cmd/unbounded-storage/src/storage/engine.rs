@@ -412,7 +412,6 @@ impl<B: BlockDevice> StorageEngine<B> {
         if victims.is_empty() {
             return;
         }
-        let keys = victims.iter().map(|resident| resident.key).collect();
         // The btree mutation MUST commit before the allocator
         // slot is released: a concurrent writer that observes
         // the stale btree entry would otherwise call
@@ -422,11 +421,11 @@ impl<B: BlockDevice> StorageEngine<B> {
         // construction once `done.wait()` returns.
         let done = MutatorReply::new();
         self.mutator_queue.push(MutatorReq::Delete {
-            keys,
+            victims: victims.clone(),
             done: done.clone(),
         });
-        match done.wait().await {
-            MutatorOutcome::DeleteCommitted => {}
+        let removed = match done.wait().await {
+            MutatorOutcome::DeleteCommitted { removed } => removed,
             _ => {
                 // Apply failed or queue closed: restore the
                 // resident records so a later sweep retries.
@@ -435,15 +434,15 @@ impl<B: BlockDevice> StorageEngine<B> {
                 }
                 return;
             }
-        }
-        for resident in &victims {
+        };
+        for resident in &removed {
             let _ = self
                 .allocator
                 .free_range(resident.lba, self.n_pages(resident.byte_len));
             let _ = self.refcount.reset(resident.lba.0);
         }
-        self.metric(|m| m.evictions += victims.len() as u64);
-        for _ in &victims {
+        self.metric(|m| m.evictions += removed.len() as u64);
+        for _ in &removed {
             crate::metrics::storage_eviction(self.disk());
         }
     }
@@ -696,7 +695,7 @@ impl<B: BlockDevice> StorageEngine<B> {
                 let _ = self.allocator.free_range(lba, n_pages);
                 return Err(bufferpool::Error::Io(libc::EIO));
             }
-            MutatorOutcome::DeleteCommitted => {
+            MutatorOutcome::DeleteCommitted { .. } => {
                 unreachable!("mutator returned DeleteCommitted for an Insert request")
             }
         };
@@ -765,16 +764,9 @@ impl<B: BlockDevice> StorageEngine<B> {
         if batch.is_empty() {
             return;
         }
-        // Look up prior LBAs for every Insert before applying;
-        // the mutator is the single committer so these reads are
-        // consistent with what `apply_batch` is about to replace.
-        // Singleflight guarantees at most one Insert per key is
-        // in flight at a time, so an Insert key cannot also
-        // appear in a Delete in the same batch (a Delete only
-        // comes from eviction, which would not target a key that
-        // has an in-flight write because the LBA is admitted to
-        // the LRU only after publish). Debug-assert the simpler
-        // condition: each insert key appears at most once.
+        // Deletes may overlap an Insert because eviction releases the SIEVE
+        // record before enqueueing. Fold requests in queue order and compare
+        // each victim's expected LBA against that logical state.
         #[cfg(debug_assertions)]
         {
             use std::collections::HashSet;
@@ -789,23 +781,47 @@ impl<B: BlockDevice> StorageEngine<B> {
             }
         }
 
+        let mut states: std::collections::HashMap<PageKey, Option<LeafEntry>> =
+            std::collections::HashMap::new();
         let mut priors: Vec<Option<LeafEntry>> = Vec::with_capacity(batch.len());
+        let mut removed_by_req: Vec<Vec<Resident>> = Vec::with_capacity(batch.len());
         let mut mutations: Vec<Mutation> = Vec::new();
         for req in &batch {
             match req {
                 MutatorReq::Insert { key, entry, .. } => {
-                    let prior = self.btree.lookup(key).await.ok().flatten();
+                    let prior = if let Some(prior) = states.get(key) {
+                        *prior
+                    } else {
+                        let prior = self.btree.lookup(key).await.ok().flatten();
+                        states.insert(*key, prior);
+                        prior
+                    };
                     priors.push(prior);
+                    removed_by_req.push(Vec::new());
+                    states.insert(*key, Some(*entry));
                     mutations.push(Mutation::Insert {
                         key: *key,
                         value: *entry,
                     });
                 }
-                MutatorReq::Delete { keys, .. } => {
+                MutatorReq::Delete { victims, .. } => {
                     priors.push(None);
-                    for k in keys {
-                        mutations.push(Mutation::Delete { key: *k });
+                    let mut removed = Vec::new();
+                    for victim in victims {
+                        let current = if let Some(current) = states.get(&victim.key) {
+                            *current
+                        } else {
+                            let current = self.btree.lookup(&victim.key).await.ok().flatten();
+                            states.insert(victim.key, current);
+                            current
+                        };
+                        if current.is_some_and(|entry| entry.lba == victim.lba) {
+                            states.insert(victim.key, None);
+                            mutations.push(Mutation::Delete { key: victim.key });
+                            removed.push(*victim);
+                        }
                     }
+                    removed_by_req.push(removed);
                 }
             }
         }
@@ -830,7 +846,9 @@ impl<B: BlockDevice> StorageEngine<B> {
                     MutatorReq::Insert { .. } => {
                         MutatorOutcome::InsertCommitted { prior: priors[i] }
                     }
-                    MutatorReq::Delete { .. } => MutatorOutcome::DeleteCommitted,
+                    MutatorReq::Delete { .. } => MutatorOutcome::DeleteCommitted {
+                        removed: std::mem::take(&mut removed_by_req[i]),
+                    },
                 }
             };
             done.set(outcome);
@@ -873,7 +891,7 @@ mod tests {
     use crate::bufferpool::BlockStore;
     use crate::memory::Backing;
     use crate::storage::blockdev::{MockDevice, MockDeviceConfig, MockFaultMode};
-    use crate::storage::types::Lba;
+    use crate::storage::types::{Checksum, Lba};
 
     fn test_backing(base: *mut u8, page_size: usize, page_count: usize) -> Backing {
         Backing {
@@ -950,6 +968,88 @@ mod tests {
         let mut s = [0u8; 32];
         s[0] = i;
         StripeKey(s)
+    }
+
+    fn entry(lba: u64) -> LeafEntry {
+        LeafEntry {
+            lba: Lba(lba),
+            data_checksum: Checksum(lba),
+            byte_len: 4096,
+        }
+    }
+
+    fn resident(key: PageKey, lba: u64) -> Resident {
+        Resident {
+            key,
+            lba: Lba(lba),
+            byte_len: 4096,
+        }
+    }
+
+    #[test]
+    fn stale_eviction_after_same_batch_overwrite_is_ignored() {
+        let (eng, _buf) = engine(256);
+        let key = StorageEngine::<MockDevice>::page_key(&stripe(21), 0, 4096);
+        let seed = MutatorReply::new();
+        block_on(eng.process_batch(vec![MutatorReq::Insert {
+            key,
+            entry: entry(200),
+            done: seed.clone(),
+        }]));
+        assert!(matches!(
+            block_on(seed.wait()),
+            MutatorOutcome::InsertCommitted { prior: None }
+        ));
+
+        let overwrite = MutatorReply::new();
+        let eviction = MutatorReply::new();
+        block_on(eng.process_batch(vec![
+            MutatorReq::Insert {
+                key,
+                entry: entry(201),
+                done: overwrite.clone(),
+            },
+            MutatorReq::Delete {
+                victims: vec![resident(key, 200)],
+                done: eviction.clone(),
+            },
+        ]));
+
+        assert_eq!(eng.btree.lookup_committed_mirror(&key), Some(entry(201)));
+        assert!(matches!(
+            block_on(eviction.wait()),
+            MutatorOutcome::DeleteCommitted { removed } if removed.is_empty()
+        ));
+    }
+
+    #[test]
+    fn stale_eviction_after_adjacent_batch_overwrite_is_ignored() {
+        let (eng, _buf) = engine(256);
+        let key = StorageEngine::<MockDevice>::page_key(&stripe(22), 0, 4096);
+        let seed = MutatorReply::new();
+        block_on(eng.process_batch(vec![MutatorReq::Insert {
+            key,
+            entry: entry(200),
+            done: seed,
+        }]));
+
+        let overwrite = MutatorReply::new();
+        block_on(eng.process_batch(vec![MutatorReq::Insert {
+            key,
+            entry: entry(201),
+            done: overwrite,
+        }]));
+        let eviction = MutatorReply::new();
+        block_on(eng.process_batch(vec![MutatorReq::Delete {
+            victims: vec![resident(key, 200)],
+            done: eviction.clone(),
+        }]));
+
+        assert_eq!(eng.btree.lookup_committed_mirror(&key), Some(entry(201)));
+        assert!(matches!(
+            block_on(eviction.wait()),
+            MutatorOutcome::DeleteCommitted { removed } if removed.is_empty()
+        ));
     }
 
     #[test]
