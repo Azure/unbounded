@@ -8,25 +8,24 @@
 //! progress thread runs the slot handler installed here: it parses the
 //! [`MsgHeader`] prefix, hands the framed body to [`InboundDispatch`]
 //! for routing (server request or client ack), and then immediately
-//! re-arms a fresh recv so the pool depth stays constant. This mirrors
+//! re-arms the same buffer on a fresh completion slot so the pool depth
+//! stays constant. This mirrors
 //! the self-reposting request-recv pattern the tagged RDM server used,
 //! but every buffer now serves all four message kinds and is demuxed by
 //! the header rather than by tag.
 //!
-//! Buffer ownership: each posted recv owns one heap buffer captured by
-//! its completion handler. On success the handler reads the buffer and
-//! re-arms (allocating a new buffer for the replacement recv, freeing
-//! the old one when the closure returns). On error (including the
-//! cancellation libfabric delivers when the endpoint is closed) the
-//! handler frees its buffer and does not re-arm, so a closing endpoint
-//! drains its pool to zero.
+//! Buffer ownership: each posted recv owns one stable heap buffer captured
+//! by its completion handler. On success the handler reads the buffer and
+//! moves it into the replacement recv. On error (including the cancellation
+//! libfabric delivers when the endpoint is closed) the handler frees its
+//! buffer and does not re-arm, so a closing endpoint drains its pool to zero.
 //!
 //! Local descriptors: providers that negotiate `FI_MR_LOCAL` (verbs)
 //! require every recv buffer to carry a `desc` from a registered region.
-//! Each post registers a transient `LocalMr` for its buffer and hands
-//! its `desc` to `fi_recv`; the completion handler holds the `LocalMr`
-//! alongside the buffer, so the region is closed when the buffer is
-//! freed or re-armed. Providers without `FI_MR_LOCAL` (tcp) negotiate it
+//! Each receive lane registers one `LocalMr` for its buffer and hands its
+//! `desc` to every `fi_recv` repost; the completion handler moves the
+//! `LocalMr` alongside the stable buffer. Providers without `FI_MR_LOCAL`
+//! (tcp) negotiate it
 //! off, so `LocalMrCtx::register` returns `None` and the recv posts with
 //! `desc = NULL`.
 
@@ -35,7 +34,7 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::backing::LocalMrCtx;
+use super::backing::{LocalMr, LocalMrCtx};
 use super::completion::{CompletionInfo, CompletionRegistry};
 use super::dispatch::{EpPtr, InboundDispatch, ReplyCtx};
 use super::error::Result;
@@ -53,6 +52,34 @@ struct RecvPoolShared {
     dispatch: Arc<InboundDispatch>,
     local_ctx: LocalMrCtx,
     errors: AtomicU64,
+}
+
+struct RecvBuffer {
+    local_mr: Option<LocalMr>,
+    bytes: Box<[u8; RECV_BUF_LEN]>,
+}
+
+impl RecvBuffer {
+    fn new(local_ctx: &LocalMrCtx) -> Result<Self> {
+        let mut bytes = Box::new([0u8; RECV_BUF_LEN]);
+        let local_mr = local_ctx.register(
+            bytes.as_mut_ptr() as *mut c_void,
+            RECV_BUF_LEN,
+            ffi::FI_RECV,
+        )?;
+        Ok(Self { local_mr, bytes })
+    }
+
+    fn ptr(&mut self) -> *mut c_void {
+        self.bytes.as_mut_ptr() as *mut c_void
+    }
+
+    fn desc(&self) -> *mut c_void {
+        self.local_mr
+            .as_ref()
+            .map(LocalMr::desc)
+            .unwrap_or(ptr::null_mut())
+    }
 }
 
 impl RecvPool {
@@ -113,31 +140,28 @@ impl RecvPoolShared {
     /// and buffer are reclaimed and nothing is posted), and `Err` for a
     /// genuine post failure.
     fn post_one(self: &Arc<Self>) -> Result<bool> {
-        let mut buf: Box<[u8; RECV_BUF_LEN]> = Box::new([0u8; RECV_BUF_LEN]);
-        let buf_ptr = buf.as_mut_ptr();
-
         // The future is intentionally dropped: this slot is driven by
         // its handler, not awaited. The registry slot stays live until
         // `complete` runs on the progress thread.
         let (slot, _fut) = self.completions.allocate()?;
+        let recv = RecvBuffer::new(&self.local_ctx)?;
+        self.post_buffer(slot, recv)
+    }
 
-        // Transient local MR for the buffer on verbs (`FI_MR_LOCAL`);
-        // `None` on tcp. Held by the completion handler so it is closed
-        // when the buffer is freed or re-armed.
-        let local_mr =
-            self.local_ctx
-                .register(buf_ptr as *mut c_void, RECV_BUF_LEN, ffi::FI_RECV)?;
-        let desc = local_mr
-            .as_ref()
-            .map(|m| m.desc())
-            .unwrap_or(ptr::null_mut());
+    fn repost(self: &Arc<Self>, recv: RecvBuffer) -> Result<bool> {
+        let (slot, _fut) = self.completions.allocate()?;
+        self.post_buffer(slot, recv)
+    }
 
+    fn post_buffer(
+        self: &Arc<Self>,
+        slot: Box<super::completion::CompletionSlot>,
+        mut recv: RecvBuffer,
+    ) -> Result<bool> {
+        let buf_ptr = recv.ptr();
+        let desc = recv.desc();
         let shared = Arc::clone(self);
         slot.set_handler(move |result: &std::result::Result<CompletionInfo, _>| {
-            // Keep the buffer's local MR alive until the completion is
-            // reaped; it is closed when this handler (and its captures)
-            // is dropped.
-            let _local_mr = &local_mr;
             match result {
                 Ok(info) => {
                     // A write-with-immediate (page-landed signal) consumes
@@ -147,13 +171,13 @@ impl RecvPoolShared {
                     if info.flags & ffi::FI_REMOTE_CQ_DATA != 0 {
                         shared.handle_remote_write(info.data);
                     } else {
-                        shared.handle_message(&buf[..], info.bytes);
+                        shared.handle_message(&recv.bytes[..], info.bytes);
                     }
-                    // Re-arm to keep the pool depth constant. A failure
-                    // or transient EAGAIN here shrinks the pool by one;
-                    // record it but do not unwind on the progress
-                    // thread. Subsequent completions re-arm again.
-                    if !matches!(shared.post_one(), Ok(true)) {
+                    // Re-arm the stable buffer and local MR on a fresh
+                    // completion slot. A failure or transient EAGAIN here
+                    // shrinks the pool by one; record it but do not unwind
+                    // on the progress thread.
+                    if !matches!(shared.repost(recv), Ok(true)) {
                         shared.errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }

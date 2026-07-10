@@ -402,6 +402,8 @@ streaming RPC server plus client `Transport`.
 - The completion machinery (`CompletionFuture`, `CompletionInfo`,
   `CompletionRegistry`, `CompletionSlot`) bridges libfabric CQ entries to
   futures.
+- Each connection keeps stable receive buffers posted and reuses each buffer's
+  local MR across successful reposts; completion slots remain one-shot.
 - **RPC server model** (`rpc.rs`): `start_rpc_server` spawns a fixed pool of
   `rpc_worker_threads` long-lived OS threads pinned to the shard's worker slot.
   The connection receive path decodes framed requests and enqueues jobs onto a
