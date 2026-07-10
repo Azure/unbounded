@@ -183,11 +183,9 @@ dormant `SO_REUSEPORT` socket, then enter the listening state only during
 activation. A failed preparation therefore leaves the prior resource, binding,
 and stripe geometry live and retryable. Active frontend entries record the
 binding and stripe geometry they realized, so a failed rebuild is detected and
-retried on the next apply. Replacement uses an undo-log transaction: the old
-driver remains owned until finalization and can be restored if a later local
-activation fails. The current reconciler finalizes each frontend operation
-immediately; cross-resource and cross-shard commit/rollback is not yet wired to
-that transaction boundary.
+retried on the next apply. Replacement uses a staged transaction: the complete
+frontend change set is prepared before activation and swaps into the live
+registry only after every listener activates successfully.
 
 ### Shutdown
 
