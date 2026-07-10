@@ -784,9 +784,12 @@ impl ConfigApplyTarget for ProcessApplyTarget {
         diff: &ConfigDiff,
     ) -> Result<(), ApplyError> {
         if diff.requires_restart() {
-            return Err(ApplyError::Target(
-                "self peer identity changed; restart required".to_string(),
-            ));
+            let reason = if diff.identity_changed {
+                "self peer identity changed"
+            } else {
+                "backend stripe geometry changed"
+            };
+            return Err(ApplyError::Target(format!("{reason}; restart required")));
         }
 
         // The shards must see a new config whenever their routing surface,
@@ -800,37 +803,6 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             || diff.frontends_changed;
 
         if needs_broadcast {
-            {
-                let layer = self
-                    .layer
-                    .as_mut()
-                    .expect("shard layer present between applies");
-
-                // Peer connections live on the shared fabric endpoints, not
-                // on individual shards, so they are reconciled once per
-                // endpoint here.
-                if diff.requires_peer_reconcile() {
-                    let runtime_peers = config::runtime_peers(new.runtime());
-                    if let Err(failures) = layer.fabric_group.reconcile_peers(&runtime_peers) {
-                        crate::SHUTDOWN.store(true, Ordering::Release);
-                        return Err(ApplyError::Target(format!(
-                            "hard peer reconciliation failure(s): {}",
-                            failures.join("; ")
-                        )));
-                    }
-                }
-
-                // The RPC-side backend registries also live on the shared
-                // endpoints; reconcile them before broadcasting so the shards
-                // rebuild their own transport registries against an already
-                // up-to-date origin surface.
-                if diff.backends_changed {
-                    layer
-                        .fabric_group
-                        .reconcile_backends(&new.config().backends);
-                }
-            }
-
             let id = self.allocate_transaction_id()?;
 
             let prepare = self
@@ -896,6 +868,31 @@ impl ConfigApplyTarget for ProcessApplyTarget {
                         return Err(abort_error);
                     }
                     return Err(error);
+                }
+            }
+
+            // Shared fabric state cannot be rolled back. Reconcile it only
+            // after every abortable shard and disk preparation has succeeded;
+            // failures from this point onward are fail-stop.
+            {
+                let layer = self
+                    .layer
+                    .as_mut()
+                    .expect("shard layer present between applies");
+                if diff.requires_peer_reconcile() {
+                    let runtime_peers = config::runtime_peers(new.runtime());
+                    if let Err(failures) = layer.fabric_group.reconcile_peers(&runtime_peers) {
+                        crate::SHUTDOWN.store(true, Ordering::Release);
+                        return Err(ApplyError::Target(format!(
+                            "hard peer reconciliation failure(s): {}",
+                            failures.join("; ")
+                        )));
+                    }
+                }
+                if diff.backends_changed {
+                    layer
+                        .fabric_group
+                        .reconcile_backends(&new.config().backends);
                 }
             }
 
