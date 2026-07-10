@@ -430,6 +430,31 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
     })
 }
 
+/// Retire a prepared layer that must not be activated.
+pub fn retire_prepared_shard_layer(prepared: PreparedShardLayer) {
+    let PreparedShardLayer {
+        joins,
+        fabric_group,
+        control,
+        layer_stop,
+        backing_keepalives,
+        rpc_shards: _,
+        serve_start_txs,
+        terminal_rx,
+        routes,
+    } = prepared;
+    retire_failed_activation(
+        joins,
+        fabric_group,
+        control,
+        layer_stop,
+        backing_keepalives,
+        serve_start_txs,
+        terminal_rx,
+        routes,
+    );
+}
+
 fn retire_failed_activation(
     joins: Vec<JoinHandle>,
     fabric_group: FabricGroup,
@@ -552,8 +577,28 @@ impl ProcessApplyTarget {
     /// Reconcile projected cache disks in place and republish the
     /// resulting channel set to the live directory (idempotent when the
     /// disk set is unchanged).
-    fn reconcile_disks(&mut self, projection: &config::RuntimeGraph) {
-        crate::reconcile_cache_disks(&mut self.disk_registry, &self.cache_directories, projection);
+    fn reconcile_disks(&mut self, projection: &config::RuntimeGraph) -> Result<(), ApplyError> {
+        let report = crate::reconcile_cache_disks(
+            &mut self.disk_registry,
+            &self.cache_directories,
+            projection,
+        );
+        if report.failures.is_empty() {
+            return Ok(());
+        }
+
+        let failure_count = report.failures.len();
+        let mut failures = report.failures;
+        failures.sort_by(|a, b| a.0.cmp(&b.0));
+        let details = failures
+            .into_iter()
+            .map(|(path, error)| format!("{}: {error}", path.display()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(ApplyError::Target(format!(
+            "{} disk(s) failed to open: {details}",
+            failure_count
+        )))
     }
 
     /// Consume the target at shutdown, returning the live layer (if any)
@@ -638,9 +683,11 @@ impl ConfigApplyTarget for ProcessApplyTarget {
         // Disk/channel changes mutate live registries and directories, so
         // all fallible shard broadcasts must complete before this point.
         // If a broadcast fails, ConfigController keeps the old config as
-        // current and the live disk topology remains on that same version.
+        // current and disk reconciliation does not begin. Once reconciliation
+        // begins, its realized subset is published even when an open fails;
+        // returning that failure keeps the desired snapshot retryable.
         if diff.caches_changed || diff.disks_changed {
-            self.reconcile_disks(new.runtime());
+            self.reconcile_disks(new.runtime())?;
         }
 
         // Routing is the process-wide visibility point for a successful

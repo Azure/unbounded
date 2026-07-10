@@ -32,7 +32,7 @@ use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
 use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{
-    CacheDirectorySet, ChainLocalStore, DiskRegistry, UringDiskTarget,
+    CacheDirectorySet, ChainLocalStore, DiskRegistry, DiskReport, UringDiskTarget,
 };
 use unbounded_storage::topology::{CorePlan, CorePlanConfig, DiskCpuSlot, Host, ServingShard};
 
@@ -418,9 +418,16 @@ fn main() -> ExitCode {
         }
     };
     // Reconcile and publish the startup disk set before any frontend or
-    // recursive RPC path can serve. Individual disk-open failures remain
-    // nonfatal and the successfully opened subset is published.
-    reconcile_cache_disks(&mut disk_registry, &cache_directories, loaded.runtime());
+    // recursive RPC path can serve. There is no prior applied disk state
+    // to retain at startup, so an open failure aborts the prepared layer.
+    let disk_report =
+        reconcile_cache_disks(&mut disk_registry, &cache_directories, loaded.runtime());
+    if !disk_report.failures.is_empty() {
+        shard_layer::retire_prepared_shard_layer(prepared);
+        clear_cache_disk_publications(&cache_directories);
+        disk_registry.drain();
+        return ExitCode::FAILURE;
+    }
 
     let layer = match shard_layer::activate_shard_layer(prepared) {
         Ok(layer) => layer,
@@ -1077,7 +1084,7 @@ fn reconcile_cache_disks(
     disk_registry: &mut DiskRegistry<UringDiskTarget>,
     cache_directories: &CacheDirectorySet,
     projection: &config::RuntimeGraph,
-) {
+) -> DiskReport {
     let mut cache_ids: Vec<String> = projection.caches.keys().cloned().collect();
     cache_ids.sort();
     cache_directories.reconcile(cache_ids.iter().cloned());
@@ -1098,6 +1105,8 @@ fn reconcile_cache_disks(
     for cache_id in cache_ids {
         cache_directories.apply_channels(&cache_id, channels.clone());
     }
+
+    report
 }
 
 fn clear_cache_disk_publications(cache_directories: &CacheDirectorySet) {

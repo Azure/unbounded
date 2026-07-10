@@ -156,7 +156,8 @@ excluded from the live-reload diff.
    initial disks and publishes channels. Only after publication does activation
    start the recursive RPC servers and release shards into their serve loops;
    the config watcher then takes over for the lifetime of the process. Disk-open
-   failures remain nonfatal and the successfully opened subset is published.
+   failures retire the prepared layer rather than activating a partial startup
+   configuration.
 
 ### Shard readiness and panic safety
 
@@ -555,6 +556,10 @@ path-sorted for stable hashing; `drain()` clears channels before handles.
 `DiskChannelDirectory` is the Arc'd hot-swap publication surface, and
 `LiveShardLocalStore` is a per-shard view over the live directory that
 re-registers buffers when it observes a swap (`current_or_replay`).
+Every reconcile publishes the realized open subset. A live open failure aborts
+config convergence so the same desired snapshot remains retryable; a startup
+open failure retires the parked shard layer. Same-path drift remains remove then
+add because provisioning and recovery cannot safely run beside the old engine.
 
 **Stripe keys**: `stripe_key` derives the 32-byte content-addressed key;
 `METADATA_STRIPE_IDX` and `OriginRef`/`StripeReq` describe the request shape.
@@ -597,7 +602,9 @@ retrying against the old controller snapshot would be unsafe.
 All shard transports and fabric RPC handlers share one process-wide
 `RouteTableHandle`. The apply target is its only writer and publishes the new
 snapshot once, after shard acknowledgement, page-cache drain, and disk
-publication succeed. This keeps routing on the prior snapshot when an earlier
+publication succeed. Disk open failures are returned after the realized subset
+is published, leaving the desired config retryable and routing on the prior
+snapshot. This keeps routing on the prior snapshot when an earlier
 apply step reports failure; other resource reconciliation is still not a
 whole-process transaction.
 

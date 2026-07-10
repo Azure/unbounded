@@ -102,8 +102,7 @@ pub enum ApplyError {
     },
     /// One or more shards reported a failure while applying.
     ShardApply(Vec<(WorkerIdx, String)>),
-    /// The process-level apply target rejected the config before shard
-    /// broadcast.
+    /// The process-level apply target rejected the config.
     Target(String),
 }
 
