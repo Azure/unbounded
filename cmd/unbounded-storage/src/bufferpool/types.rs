@@ -39,16 +39,11 @@ pub struct PoolConfig {
     /// Caps the number of concurrent `ReadStream`s the pool will
     /// admit. v1 enforces this only at `read()` time.
     pub max_concurrent_streams: usize,
-    /// Global cap, shared across every windowed stream the pool is
-    /// serving, on speculative prefetch pages: pages a
-    /// [`crate::bufferpool::WindowedRead`] has launched a fetch for
-    /// while they sit strictly ahead of that stream's consumer
-    /// cursor and have not yet been consumed. The head-of-line page
-    /// (the one at the cursor) is always fetched and never counts
-    /// against this budget, so forward progress is guaranteed even
-    /// when the budget is fully reserved. Bounding speculation this
-    /// way keeps prefetch from starving the free list out from under
-    /// any stream's head fetch.
+    /// Global cap, shared across windowed and pipelined readers, on
+    /// speculative prefetch pages strictly ahead of a reader's
+    /// consumer cursor. The head-of-line page is always fetched and
+    /// never counts against this budget, so forward progress remains
+    /// possible when the budget is fully reserved.
     pub max_inflight_pages: usize,
 }
 

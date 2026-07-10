@@ -1185,6 +1185,68 @@ fn stream_limit_enforced() {
 }
 
 #[test]
+fn completed_window_retains_stream_slot_until_drop() {
+    const P: usize = 4096;
+    let backing = heap_backing(P, 2);
+    let t = Rc::new(MockTransport::new(backing.base, backing.page_size));
+    let s = Rc::new(MockBlockStore::new());
+    s.preload(key(0), 0, vec![0u8; P]);
+    let pool = Pool::new(
+        PoolConfig {
+            max_concurrent_streams: 1,
+            ..PoolConfig::default()
+        },
+        backing,
+        TransportRc(t),
+        BlockStoreRc(s),
+    )
+    .unwrap();
+    let req = TestReq::new(key(0));
+
+    block_on(async {
+        let mut first = pool.read_windowed(&req, 0, P as u64, 2).unwrap();
+        drop(first.next_page().await.unwrap().unwrap());
+        assert!(first.next_page().await.is_none());
+        assert!(matches!(
+            pool.read_windowed(&req, 0, P as u64, 2),
+            Err(Error::StreamLimit)
+        ));
+
+        drop(first);
+        let _next = pool.read_windowed(&req, 0, P as u64, 2).unwrap();
+    });
+}
+
+#[test]
+fn empty_window_retains_stream_slot_until_drop() {
+    const P: usize = 4096;
+    let backing = heap_backing(P, 1);
+    let t = Rc::new(MockTransport::new(backing.base, backing.page_size));
+    let s = Rc::new(MockBlockStore::new());
+    let pool = Pool::new(
+        PoolConfig {
+            max_concurrent_streams: 1,
+            ..PoolConfig::default()
+        },
+        backing,
+        TransportRc(t),
+        BlockStoreRc(s),
+    )
+    .unwrap();
+    let req = TestReq::new(key(0));
+
+    let mut first = pool.read_windowed(&req, 0, 0, 2).unwrap();
+    assert!(block_on(first.next_page()).is_none());
+    assert!(matches!(
+        pool.read_windowed(&req, 0, P as u64, 2),
+        Err(Error::StreamLimit)
+    ));
+
+    drop(first);
+    let _next = pool.read_windowed(&req, 0, P as u64, 2).unwrap();
+}
+
+#[test]
 fn rejects_bad_backing() {
     let backing = Backing {
         base: 0x1000 as *mut u8,

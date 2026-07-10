@@ -1,16 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Multi-stripe pipelined reader.
+//! Ordered prefetch scheduler for windowed and multi-stripe reads.
 //!
-//! [`PipelinedRead`] generalizes [`crate::bufferpool::WindowedRead`]
-//! from a single stripe to an ordered sequence of per-stripe slices.
-//! Where `WindowedRead` keeps up to `window` fetch futures in flight
-//! within one stripe, `PipelinedRead` keeps `window` fetch futures in
-//! flight across stripe boundaries, so origin (and peer) downloads
-//! pipeline continuously instead of draining one stripe before the
-//! next begins. Pages are still delivered to the consumer strictly in
-//! order, one [`PageGuard`] at a time.
+//! [`PipelinedRead`] schedules ordered prefetch across one or more
+//! per-stripe slices. The public multi-stripe path admits slices
+//! lazily; [`crate::bufferpool::WindowedRead`] uses its private
+//! single-stream mode after eager admission. Pages are delivered to
+//! the consumer strictly in order, one [`PageGuard`] at a time.
 //!
 //! Motivation: the frontends serve a byte range as a contiguous run
 //! of per-stripe slices. Driving each slice's `WindowedRead` to
@@ -120,6 +117,10 @@ pub struct PipelinedRead<'pool> {
     /// Lowest slice index not yet fully consumed; slices below this
     /// have been released. Used as the scan start for `locate`.
     first_active_slice: usize,
+    /// Multi-stripe reads release completed slices eagerly. A
+    /// windowed single-stripe read retains its eager admission until
+    /// reader drop, including for an empty range.
+    release_completed_slices: bool,
 }
 
 impl<'pool> std::fmt::Debug for PipelinedRead<'pool> {
@@ -181,7 +182,36 @@ impl<'pool> PipelinedRead<'pool> {
             pending: Vec::new(),
             ready: HashMap::new(),
             first_active_slice: 0,
+            release_completed_slices: true,
         }
+    }
+
+    /// Build the single-stripe mode used by `WindowedRead`. `src` is
+    /// already admitted and remains owned until this reader drops.
+    pub(super) fn single_stream(
+        src: Rc<dyn StreamSrc + 'pool>,
+        offset: u64,
+        end: u64,
+        page_size: u64,
+        window: usize,
+        max_inflight_pages: usize,
+    ) -> Self {
+        debug_assert!(end >= offset);
+        let slices = if end > offset {
+            vec![(offset, end - offset)]
+        } else {
+            Vec::new()
+        };
+        let retained = src.clone();
+        let admit: AdmitFn<'pool> = Box::new(move |_s| Ok(retained.clone()));
+        let mut read = Self::new(admit, slices, page_size, window, max_inflight_pages);
+        if read.srcs.is_empty() {
+            read.srcs.push(Some(src));
+        } else {
+            read.srcs[0] = Some(src);
+        }
+        read.release_completed_slices = false;
+        read
     }
 
     /// Next page in global order. Returns `None` at EOF. The returned
@@ -275,8 +305,8 @@ impl<'pool> PipelinedRead<'pool> {
         let page_start = page_no * self.page_size;
         let lo = std::cmp::max(page_start, geom.intra_offset);
         let hi = std::cmp::min(
-            page_start + self.page_size,
-            geom.intra_offset + geom.intra_len,
+            page_start.saturating_add(self.page_size),
+            geom.intra_offset.saturating_add(geom.intra_len),
         );
         let intra_off = (lo - page_start) as u32;
         let intra_len = (hi - lo) as u32;
@@ -300,8 +330,7 @@ impl<'pool> PipelinedRead<'pool> {
     /// Ensure the head page has an in-flight (or completed) fetch,
     /// then launch speculative fetches for subsequent global pages
     /// while the window has room and the global prefetch budget
-    /// allows. Mirrors `WindowedRead::ensure_head_and_refill` but
-    /// walks the global index across stripe boundaries.
+    /// allows, walking the global index across slice boundaries.
     fn ensure_head_and_refill(&mut self) {
         if self.head_g >= self.total_g {
             return;
@@ -369,6 +398,9 @@ impl<'pool> PipelinedRead<'pool> {
     /// `head_g` advance: a fully-passed slice can have no outstanding
     /// pending/ready entries (those only exist for `g >= head_g`).
     fn release_passed_slices(&mut self) {
+        if !self.release_completed_slices {
+            return;
+        }
         while self.first_active_slice < self.geom.len() {
             let s = self.first_active_slice;
             let end_g = self.geom[s].cum_before + self.geom[s].pages;
@@ -425,8 +457,7 @@ impl<'pool> Drop for PipelinedRead<'pool> {
 /// Drives every outstanding fetch future concurrently with a single
 /// `cx`, moving completions into `ready`. Polls the head future first
 /// so it wins any free-list allocation race against speculative
-/// siblings. Resolves once the head page is `ready`. Mirrors
-/// `window::DrivePending` over the global index.
+/// siblings. Resolves once the head page is `ready`.
 struct DrivePipeline<'a, 'pool> {
     r: &'a mut PipelinedRead<'pool>,
     head_g: u64,
