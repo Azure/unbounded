@@ -13,16 +13,19 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
-func machineReplaceCommand() *cobra.Command {
+func newMachineReplaceCommand(rt *machineCommandRuntime) *cobra.Command {
 	var (
-		ttl   int32
-		force bool
+		ttl           int32
+		force         bool
+		wait          bool
+		timeout       time.Duration
+		operationName string
+		kubeconfig    string
 	)
 
 	cmd := &cobra.Command{
@@ -34,34 +37,86 @@ provider by deleting and recreating the host VM with fresh bootstrap data.
 Host-local OS disk state is destroyed.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := ctrl.SetupSignalHandler()
+			ctx := rt.context(cmd.Context())
 
-			c, err := newMachineClient()
+			c, err := rt.clientWithKubeconfig(kubeconfig)
 			if err != nil {
 				return err
 			}
 
-			return runReplace(ctx, c, args[0], ttl, force)
+			return runReplaceWithOptions(ctx, c, args[0], machineReplaceOptions{
+				ttlSeconds:    ttl,
+				force:         force,
+				wait:          wait,
+				timeout:       timeout,
+				operationName: operationName,
+			})
 		},
 	}
 
 	cmd.Flags().Int32Var(&ttl, "ttl", defaultTTLSeconds,
 		"Seconds after completion before the MachineOperation CR is automatically deleted (0 to disable)")
 	cmd.Flags().BoolVar(&force, "force", false, "Skip confirmation for destructive VM replacement")
+	cmd.Flags().StringVar(&operationName, "operation-name", "", "Name for the MachineOperation resource")
+	cmd.Flags().BoolVar(&wait, "wait", true, "Wait until the operation reaches Complete or Failed")
+	cmd.Flags().DurationVar(&timeout, "timeout", 0, "Time to wait for completion when --wait is set (0 waits indefinitely)")
+	cmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 
 	return cmd
 }
 
+type machineReplaceOptions struct {
+	ttlSeconds    int32
+	force         bool
+	wait          bool
+	timeout       time.Duration
+	operationName string
+}
+
 func runReplace(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32, force bool) error {
-	if !force {
+	return runReplaceWithOptions(ctx, c, name, machineReplaceOptions{
+		ttlSeconds: ttlSeconds,
+		force:      force,
+		wait:       true,
+	})
+}
+
+func runReplaceWithOptions(ctx context.Context, c client.WithWatch, name string, opts machineReplaceOptions) error {
+	if !opts.force {
 		if err := confirmReplace(name, os.Stdin, os.Stderr); err != nil {
 			return err
 		}
 	}
 
-	opName := fmt.Sprintf("%s-replace-%d", name, time.Now().Unix())
+	opName := opts.operationName
+	if opName == "" {
+		opName = generateMachineOperationName(name, "replace", time.Now())
+	}
 
-	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostReplace, ttlSeconds); err != nil {
+	createOptions := &machineOperationCreateOptions{
+		name:         opName,
+		kind:         v1alpha3.OperationHostReplace,
+		machine:      name,
+		ttlSeconds:   opts.ttlSeconds,
+		output:       operationOutputName,
+		dryRun:       dryRunNone,
+		fieldManager: fieldManagerID,
+		printCreated: false,
+	}
+	if err := createOptions.validate(); err != nil {
+		return err
+	}
+
+	op, err := createOptions.build()
+	if err != nil {
+		return err
+	}
+
+	if err := addMachineOperationOwnerReference(ctx, c, op, name); err != nil {
+		return err
+	}
+
+	if err := createOptions.runWithClient(ctx, c, op); err != nil {
 		return err
 	}
 
@@ -69,7 +124,14 @@ func runReplace(ctx context.Context, c client.WithWatch, name string, ttlSeconds
 	printConfig("operation", opName)
 	fmt.Println()
 
-	return watchMachineOperation(ctx, c, opName)
+	if !opts.wait {
+		return nil
+	}
+
+	waitCtx, cancel := contextWithOptionalTimeout(ctx, opts.timeout)
+	defer cancel()
+
+	return waitForMachineOperation(waitCtx, c, opName)
 }
 
 func confirmReplace(name string, in *os.File, out io.Writer) error {

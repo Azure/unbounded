@@ -68,6 +68,26 @@ spec:
 kubectl apply -f reboot-worker-01.yaml
 ```
 
+If you have the kubectl plugin installed, you can create the same operation
+imperatively:
+
+```bash
+kubectl unbounded machine operation create reboot-worker-01 \
+  --kind HostReboot \
+  --machine worker-01
+```
+
+Convenience commands are also available for common single-machine operations:
+
+```bash
+kubectl unbounded machine node-reboot worker-01
+kubectl unbounded machine host-reboot worker-01
+kubectl unbounded machine power-off worker-01
+kubectl unbounded machine power-on worker-01
+kubectl unbounded machine agent-upgrade worker-01 --download-url https://example.com/agent.tar.gz
+kubectl unbounded machine agent-reset worker-01 --force
+```
+
 ## Checking Status
 
 Operations move through phases: `Pending`, `InProgress`, `Complete`, or

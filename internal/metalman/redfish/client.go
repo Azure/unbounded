@@ -20,6 +20,36 @@ import (
 // ErrUnsupported indicates the BMC does not support the requested operation.
 var ErrUnsupported = errors.New("not supported by BMC")
 
+type responseError struct {
+	method string
+	path   string
+	status int
+	body   []byte
+	cause  error
+}
+
+func redfishResponseError(method, path string, status int, body []byte, cause error) error {
+	return &responseError{
+		method: method,
+		path:   path,
+		status: status,
+		body:   append([]byte(nil), body...),
+		cause:  cause,
+	}
+}
+
+func (e *responseError) Error() string {
+	if len(e.body) == 0 {
+		return fmt.Sprintf("Redfish %s %s returned HTTP %d", e.method, e.path, e.status)
+	}
+
+	return fmt.Sprintf("Redfish %s %s returned HTTP %d: %s", e.method, e.path, e.status, e.body)
+}
+
+func (e *responseError) Unwrap() error {
+	return e.cause
+}
+
 // PowerState represents the power state of a Redfish system.
 type PowerState string
 
@@ -68,7 +98,10 @@ type BootConfig struct {
 	Enabled        BootEnabled
 	Mode           BootMode
 	UefiHTTPSource string
+	HasHTTPBootURI bool
 }
+
+const biosHTTPBootURIAttribute = "UrlBootFile"
 
 // Client provides Redfish operations against a single BMC.
 // Created via Pool.Get or Dial. Must be closed when no longer needed.
@@ -121,7 +154,7 @@ func (c *Client) PowerState(ctx context.Context) (PowerState, error) {
 	}
 
 	if status != http.StatusOK {
-		return "", fmt.Errorf("unexpected status %d from %s: %s", status, path, data)
+		return "", redfishResponseError(http.MethodGet, path, status, data, nil)
 	}
 
 	var result struct {
@@ -145,7 +178,7 @@ func (c *Client) Reset(ctx context.Context, resetType ResetType) error {
 	}
 
 	if !isSuccessStatus(status) {
-		return fmt.Errorf("unexpected status %d from reset %s: %s", status, resetType, data)
+		return fmt.Errorf("reset %s failed: %w", resetType, redfishResponseError(http.MethodPost, path, status, data, nil))
 	}
 
 	return nil
@@ -161,27 +194,34 @@ func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
 	}
 
 	if status != http.StatusOK {
-		return BootConfig{}, fmt.Errorf("unexpected status %d from %s: %s", status, path, data)
+		return BootConfig{}, redfishResponseError(http.MethodGet, path, status, data, nil)
 	}
 
 	var system struct {
 		Boot struct {
-			BootSourceOverrideTarget  BootTarget  `json:"BootSourceOverrideTarget"`
-			BootSourceOverrideEnabled BootEnabled `json:"BootSourceOverrideEnabled"`
-			BootSourceOverrideMode    BootMode    `json:"BootSourceOverrideMode"`
-			HTTPBootURI               string      `json:"HttpBootUri"`
+			BootSourceOverrideTarget  BootTarget      `json:"BootSourceOverrideTarget"`
+			BootSourceOverrideEnabled BootEnabled     `json:"BootSourceOverrideEnabled"`
+			BootSourceOverrideMode    BootMode        `json:"BootSourceOverrideMode"`
+			HTTPBootURI               json.RawMessage `json:"HttpBootUri"`
 		} `json:"Boot"`
 	}
 	if err := json.Unmarshal(data, &system); err != nil {
 		return BootConfig{}, fmt.Errorf("parsing system boot config: %w", err)
 	}
 
-	return BootConfig{
+	config := BootConfig{
 		Target:         system.Boot.BootSourceOverrideTarget,
 		Enabled:        system.Boot.BootSourceOverrideEnabled,
 		Mode:           system.Boot.BootSourceOverrideMode,
-		UefiHTTPSource: system.Boot.HTTPBootURI,
-	}, nil
+		HasHTTPBootURI: system.Boot.HTTPBootURI != nil,
+	}
+	if system.Boot.HTTPBootURI != nil && string(system.Boot.HTTPBootURI) != "null" {
+		if err := json.Unmarshal(system.Boot.HTTPBootURI, &config.UefiHTTPSource); err != nil {
+			return BootConfig{}, fmt.Errorf("parsing system HTTP boot URI: %w", err)
+		}
+	}
+
+	return config, nil
 }
 
 // SetBootOverride sets the boot source override target and enabled mode.
@@ -196,17 +236,17 @@ func (c *Client) SetBootOverride(ctx context.Context, target BootTarget, enabled
 		},
 	}
 
-	_, status, err := c.session.do(ctx, http.MethodPatch, path, body)
+	data, status, err := c.session.do(ctx, http.MethodPatch, path, body)
 	if err != nil {
 		return err
 	}
 
 	if isUnsupportedStatus(status) {
-		return fmt.Errorf("boot override PATCH returned %d: %w", status, ErrUnsupported)
+		return redfishResponseError(http.MethodPatch, path, status, data, ErrUnsupported)
 	}
 
 	if !isSuccessStatus(status) {
-		return fmt.Errorf("unexpected status %d from boot override PATCH", status)
+		return redfishResponseError(http.MethodPatch, path, status, data, nil)
 	}
 
 	return nil
@@ -226,17 +266,73 @@ func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error 
 		},
 	}
 
-	_, status, err := c.session.do(ctx, http.MethodPatch, path, body)
+	data, status, err := c.session.do(ctx, http.MethodPatch, path, body)
 	if err != nil {
 		return err
 	}
 
 	if isUnsupportedStatus(status) {
-		return fmt.Errorf("UEFI HTTP boot override PATCH returned %d: %w", status, ErrUnsupported)
+		return redfishResponseError(http.MethodPatch, path, status, data, ErrUnsupported)
 	}
 
 	if !isSuccessStatus(status) {
-		return fmt.Errorf("unexpected status %d from UEFI HTTP boot override PATCH", status)
+		return redfishResponseError(http.MethodPatch, path, status, data, nil)
+	}
+
+	return nil
+}
+
+// GetBIOSHTTPBootURI returns the pending BIOS UEFI HTTP boot URI.
+// Returns ErrUnsupported if the BMC does not support BIOS settings.
+func (c *Client) GetBIOSHTTPBootURI(ctx context.Context) (string, error) {
+	path := fmt.Sprintf("/redfish/v1/Systems/%s/Bios/Settings", c.deviceID)
+
+	data, status, err := c.session.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return "", err
+	}
+
+	if isUnsupportedStatus(status) {
+		return "", redfishResponseError(http.MethodGet, path, status, data, ErrUnsupported)
+	}
+
+	if status != http.StatusOK {
+		return "", redfishResponseError(http.MethodGet, path, status, data, nil)
+	}
+
+	var result struct {
+		Attributes struct {
+			HTTPBootURI string `json:"UrlBootFile"`
+		} `json:"Attributes"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", fmt.Errorf("parsing BIOS HTTP boot URI: %w", err)
+	}
+
+	return result.Attributes.HTTPBootURI, nil
+}
+
+// SetBIOSHTTPBootURI sets the pending BIOS UEFI HTTP boot URI.
+// Returns ErrUnsupported if the BMC does not support BIOS settings.
+func (c *Client) SetBIOSHTTPBootURI(ctx context.Context, bootURL string) error {
+	path := fmt.Sprintf("/redfish/v1/Systems/%s/Bios/Settings", c.deviceID)
+	body := map[string]any{
+		"Attributes": map[string]string{
+			biosHTTPBootURIAttribute: bootURL,
+		},
+	}
+
+	data, status, err := c.session.do(ctx, http.MethodPatch, path, body)
+	if err != nil {
+		return err
+	}
+
+	if isUnsupportedStatus(status) {
+		return redfishResponseError(http.MethodPatch, path, status, data, ErrUnsupported)
+	}
+
+	if !isSuccessStatus(status) {
+		return redfishResponseError(http.MethodPatch, path, status, data, nil)
 	}
 
 	return nil
@@ -253,20 +349,20 @@ func (c *Client) DisableBootOverride(ctx context.Context) error {
 		},
 	}
 
-	_, status, err := c.session.do(ctx, http.MethodPatch, path, body)
+	data, status, err := c.session.do(ctx, http.MethodPatch, path, body)
 	if err != nil {
 		return err
 	}
 
-	if isSuccessStatus(status) {
-		return nil
-	}
-
 	if isUnsupportedStatus(status) {
-		return fmt.Errorf("disable boot override PATCH returned %d: %w", status, ErrUnsupported)
+		return redfishResponseError(http.MethodPatch, path, status, data, ErrUnsupported)
 	}
 
-	return fmt.Errorf("unexpected status %d from boot override PATCH", status)
+	if !isSuccessStatus(status) {
+		return redfishResponseError(http.MethodPatch, path, status, data, nil)
+	}
+
+	return nil
 }
 
 // CaptureFingerprint connects to a BMC without cert pinning and returns
@@ -339,7 +435,7 @@ func resolveDeviceID(ctx context.Context, s *bmcSession, deviceID string) (strin
 	}
 
 	if status != http.StatusOK {
-		return "", fmt.Errorf("unexpected status %d from /redfish/v1/Systems: %s", status, data)
+		return "", redfishResponseError(http.MethodGet, "/redfish/v1/Systems", status, data, nil)
 	}
 
 	var collection struct {
