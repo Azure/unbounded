@@ -623,7 +623,7 @@ notices:
       - Copyright 2021 ORAS Authors.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/oras-project/oras-go/blob/v2.6.1/LICENSE
+        link: https://github.com/oras-project/oras-go/blob/v2.6.2/LICENSE
   - dependency: react
     ecosystem: npm
     copyright:
