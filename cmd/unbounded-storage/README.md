@@ -64,6 +64,9 @@ cleared, and disks are drained last. At startup shards complete both readiness
 phases while parked; initial disks are reconciled and published before RPC
 servers and shard serving are activated. A startup disk-open failure retires
 the prepared shard layer rather than reporting a partial startup configuration.
+Each shard startup phase has a 60-second worker-identified deadline, and shard
+cleanup hard-exits after 60 seconds rather than detaching threads from registered
+memory.
 
 ## Configuration file
 

@@ -1668,7 +1668,10 @@ enum ShardReady {
         /// peers' backings and build its [`FanoutTable`].
         publish: ShardPublish,
     },
-    Failed(String),
+    Failed {
+        worker_idx: WorkerIdx,
+        message: String,
+    },
 }
 
 /// Owning phase-A reporter. Consuming report methods and the Drop
@@ -1697,7 +1700,10 @@ impl PhaseAReporter {
 
     fn report_failed(mut self, message: String) {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(ShardReady::Failed(message));
+            let _ = tx.send(ShardReady::Failed {
+                worker_idx: self.worker_idx,
+                message,
+            });
         }
     }
 }
@@ -1705,10 +1711,13 @@ impl PhaseAReporter {
 impl Drop for PhaseAReporter {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: aborted during phase A bring-up",
-                self.worker_idx.0
-            )));
+            let _ = tx.send(ShardReady::Failed {
+                worker_idx: self.worker_idx,
+                message: format!(
+                    "worker={}: aborted during phase A bring-up",
+                    self.worker_idx.0
+                ),
+            });
         }
     }
 }
@@ -1761,7 +1770,10 @@ struct PeerPublish {
 /// registration) independently of the first (fabric/pool bring-up).
 enum PhaseBReport {
     Ready(WorkerIdx),
-    Failed(String),
+    Failed {
+        worker_idx: WorkerIdx,
+        message: String,
+    },
 }
 
 /// RAII guard ensuring a shard that has entered phase B reports exactly
@@ -1790,7 +1802,10 @@ impl PhaseBGuard {
 
     fn report_failed(mut self, msg: String) {
         self.reported = true;
-        let _ = self.tx.send(PhaseBReport::Failed(msg));
+        let _ = self.tx.send(PhaseBReport::Failed {
+            worker_idx: self.widx,
+            message: msg,
+        });
     }
 }
 
@@ -1848,10 +1863,10 @@ impl Drop for ServingGuard {
 impl Drop for PhaseBGuard {
     fn drop(&mut self) {
         if !self.reported {
-            let _ = self.tx.send(PhaseBReport::Failed(format!(
-                "worker={}: aborted during phase B bring-up",
-                self.widx.0
-            )));
+            let _ = self.tx.send(PhaseBReport::Failed {
+                worker_idx: self.widx,
+                message: format!("worker={}: aborted during phase B bring-up", self.widx.0),
+            });
         }
     }
 }
@@ -2476,9 +2491,13 @@ mod tests {
         let (tx, rx) = mpsc::channel::<ShardReady>();
         drop(PhaseAReporter::new(WorkerIdx(7), tx));
         match rx.recv() {
-            Ok(ShardReady::Failed(msg)) => {
-                assert!(msg.contains("worker=7"), "got: {msg}");
-                assert!(msg.contains("aborted during phase A"), "got: {msg}");
+            Ok(ShardReady::Failed {
+                worker_idx,
+                message,
+            }) => {
+                assert_eq!(worker_idx, WorkerIdx(7));
+                assert!(message.contains("worker=7"), "got: {message}");
+                assert!(message.contains("aborted during phase A"), "got: {message}");
             }
             other => panic!("expected Failed, got {:?}", other.is_ok()),
         }

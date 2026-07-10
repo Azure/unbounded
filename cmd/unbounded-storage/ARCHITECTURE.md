@@ -161,15 +161,13 @@ excluded from the live-reload diff.
 
 ### Shard readiness and panic safety
 
-Each shard owns a phase-A reporter that emits exactly one `ShardReady` message:
-`Up { worker_idx, publish }` or `Failed(String)`. Its Drop fallback covers an
-early return or panic before the explicit report. Phase B uses the same
-consuming-report/Drop pattern. Main performs a bounded `recv()` exactly
-`joins.len()` times (it does **not** drain to disconnect, because live shards
-retain channel senders). Preparation returns a `PreparedShardLayer` only after
-all phase-B reports succeed. Activation starts RPC and releases the parked
-shards; on failure it sets the layer stop flag, drops the serve gates, joins
-shards in reverse order, and tears down fabric and backing keepalives.
+Each shard owns a phase-A reporter that emits exactly one worker-identified
+`ShardReady` message. Its Drop fallback covers an early return or panic before
+the explicit report. Phase B uses the same consuming-report/Drop pattern. Each
+collector has one absolute 60-second deadline, rejects duplicate or unexpected
+worker identities, and reports sorted outstanding workers. Preparation returns
+a `PreparedShardLayer` only after all phase-B reports succeed. Activation starts
+RPC and releases the parked shards.
 
 Shard panics are logged and resumed so the native join handle remains failed.
 Once serving starts, a lifetime guard balances the live-shard metric and sends
@@ -201,7 +199,9 @@ Every thread polls this flag.
 
 Teardown order is deliberate: join shard threads in reverse (releasing
 `Arc<engine>` references) **first**, clear disk channel publications, then
-`disk_registry.drain()`.
+`disk_registry.drain()`. All shard cleanup paths share the same ordered cleanup
+routine. A 60-second watchdog hard-exits with status 1 if shard cleanup stalls;
+it never detaches shard threads or drops registered memory while they may run.
 
 ## 5. Shard Bring-up (`run_shard`)
 

@@ -26,10 +26,12 @@
 //! [`ConfigController`]: crate::config::ConfigController
 //! [`ConfigApplyTarget`]: crate::config::ConfigApplyTarget
 
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use unbounded_storage::config::{
     self, ApplyError, ConfigApplyTarget, ConfigDiff, LoadedConfig, ShardControlGroup,
@@ -46,6 +48,127 @@ use crate::StartupSettings;
 use crate::fabric_group::{FabricGroup, FabricPlan, FabricUnitAddress, RpcShardPublish};
 
 const SHARD_CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
+const SHARD_PHASE_TIMEOUT: Duration = Duration::from_secs(60);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct ShardJoin {
+    worker_idx: WorkerIdx,
+    handle: JoinHandle,
+}
+
+struct CleanupWatchdog {
+    disarm_tx: mpsc::Sender<()>,
+    join: thread::JoinHandle<()>,
+}
+
+struct CleanupProgress {
+    stage: &'static str,
+    outstanding_workers: Vec<u16>,
+}
+
+struct CollectedReports<R> {
+    reports: Vec<R>,
+    errors: Vec<String>,
+}
+
+fn collect_worker_reports<R, F>(
+    phase: &str,
+    rx: &mpsc::Receiver<R>,
+    expected: &[WorkerIdx],
+    timeout: Duration,
+    worker_of: F,
+) -> CollectedReports<R>
+where
+    F: Fn(&R) -> WorkerIdx,
+{
+    let deadline = Instant::now() + timeout;
+    let expected: HashSet<WorkerIdx> = expected.iter().copied().collect();
+    let mut outstanding = expected.clone();
+    let mut reports = Vec::with_capacity(expected.len());
+    let mut errors = Vec::new();
+
+    while !outstanding.is_empty() {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            errors.push(format_outstanding(phase, "timed out", &outstanding));
+            break;
+        };
+        match rx.recv_timeout(remaining) {
+            Ok(report) => {
+                let worker_idx = worker_of(&report);
+                if !expected.contains(&worker_idx) {
+                    errors.push(format!(
+                        "{phase} received unexpected report from worker={}",
+                        worker_idx.0
+                    ));
+                } else if !outstanding.remove(&worker_idx) {
+                    errors.push(format!(
+                        "{phase} received duplicate report from worker={}",
+                        worker_idx.0
+                    ));
+                } else {
+                    reports.push(report);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                errors.push(format_outstanding(phase, "timed out", &outstanding));
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                errors.push(format_outstanding(
+                    phase,
+                    "report channel disconnected",
+                    &outstanding,
+                ));
+                break;
+            }
+        }
+    }
+
+    CollectedReports { reports, errors }
+}
+
+fn format_outstanding(phase: &str, reason: &str, outstanding: &HashSet<WorkerIdx>) -> String {
+    let mut workers: Vec<u16> = outstanding.iter().map(|worker| worker.0).collect();
+    workers.sort_unstable();
+    format!("{phase} {reason}; outstanding workers={workers:?}")
+}
+
+impl CleanupWatchdog {
+    fn spawn<F, T>(timeout: Duration, on_timeout: F, terminate: T) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+        T: FnOnce() + Send + 'static,
+    {
+        let (disarm_tx, disarm_rx) = mpsc::channel();
+        let join = thread::spawn(move || match disarm_rx.recv_timeout(timeout) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                on_timeout();
+                terminate();
+            }
+        });
+        Self { disarm_tx, join }
+    }
+
+    fn production(progress: Arc<Mutex<CleanupProgress>>) -> Self {
+        Self::spawn(
+            CLEANUP_TIMEOUT,
+            move || {
+                let progress = progress.lock().unwrap_or_else(|error| error.into_inner());
+                eprintln!(
+                    "fatal: shard cleanup stalled for 60 seconds during {}; outstanding workers={:?}; forcing process exit because registered memory cannot be released safely",
+                    progress.stage, progress.outstanding_workers
+                );
+            },
+            || std::process::exit(1),
+        )
+    }
+
+    fn disarm(self) {
+        let _ = self.disarm_tx.send(());
+        let _ = self.join.join();
+    }
+}
 
 /// Inputs that are constant across the life of the process and used to
 /// spawn the shard layer. Cloned cheaply into every shard thread.
@@ -72,7 +195,7 @@ pub struct ShardSpawnDeps {
 /// A prepared set of shard threads parked after phase B, before RPC
 /// startup and serving activation.
 pub struct PreparedShardLayer {
-    joins: Vec<JoinHandle>,
+    joins: Vec<ShardJoin>,
     fabric_group: FabricGroup,
     control: ShardControlGroup,
     layer_stop: Arc<AtomicBool>,
@@ -88,7 +211,7 @@ pub struct PreparedShardLayer {
 /// [`teardown_shard_layer`].
 pub struct ShardLayer {
     /// Join handles for every shard thread, in spawn order.
-    joins: Vec<JoinHandle>,
+    joins: Vec<ShardJoin>,
     /// Owns every shared fabric endpoint (and its RPC server) the shards
     /// run on. Drives in-place peer and RPC-side backend reconcile, and
     /// is dropped during teardown after all shard threads have joined but
@@ -228,7 +351,10 @@ pub fn prepare_shard_layer(
                 });
             }),
         );
-        joins.push(handle);
+        joins.push(ShardJoin {
+            worker_idx: widx,
+            handle,
+        });
     }
     drop(ready_tx);
     // The layer keeps no phase-B sender of its own: collection below is
@@ -237,26 +363,31 @@ pub fn prepare_shard_layer(
     drop(phaseb_tx);
     drop(terminal_tx);
 
-    // Bounded readiness collection: read exactly one message per spawned
-    // thread. Shards that come up park holding their sender, so they
-    // never close the channel; only a panic-before-report or a clean
-    // failure surfaces here.
+    let expected_workers: Vec<WorkerIdx> = joins.iter().map(|join| join.worker_idx).collect();
     let mut publishes = Vec::new();
-    let mut errors = Vec::new();
-    for _ in 0..joins.len() {
-        match ready_rx.recv() {
-            Ok(crate::ShardReady::Up {
+    let collected = collect_worker_reports(
+        "shard phase A",
+        &ready_rx,
+        &expected_workers,
+        SHARD_PHASE_TIMEOUT,
+        |report| match report {
+            crate::ShardReady::Up { worker_idx, .. }
+            | crate::ShardReady::Failed { worker_idx, .. } => *worker_idx,
+        },
+    );
+    let mut errors = collected.errors;
+    for report in collected.reports {
+        match report {
+            crate::ShardReady::Up {
                 worker_idx,
                 publish,
-            }) => {
-                publishes.push((worker_idx, publish));
-            }
-            Ok(crate::ShardReady::Failed(err)) => {
-                eprintln!("shard failed: {err}");
-                errors.push(err);
-            }
-            Err(_) => {
-                errors.push("shard thread exited without reporting readiness".to_string());
+            } => publishes.push((worker_idx, publish)),
+            crate::ShardReady::Failed {
+                worker_idx: _,
+                message,
+            } => {
+                eprintln!("shard failed: {message}");
+                errors.push(message);
             }
         }
     }
@@ -267,14 +398,20 @@ pub fn prepare_shard_layer(
         // Dropping the peer senders unblocks any up-shard parked on
         // `peer_rx.recv()` so it can exit and be joined.
         drop(peer_txs);
-        drop(serve_start_txs);
-        layer_stop.store(true, Ordering::Relaxed);
-        for h in joins.into_iter().rev() {
-            let _ = h.join();
-        }
-        drop(control_senders);
-        drop(fabric_group);
-        drop(publishes);
+        let backing_keepalives = publishes
+            .into_iter()
+            .map(|(_, publish)| publish.backing_keepalive)
+            .collect();
+        cleanup_shards(
+            joins,
+            fabric_group,
+            ShardControlGroup::new(control_senders, SHARD_CONTROL_TIMEOUT),
+            layer_stop,
+            backing_keepalives,
+            serve_start_txs,
+            terminal_rx,
+            routes,
+        );
         return Err(errors);
     }
 
@@ -320,7 +457,6 @@ pub fn prepare_shard_layer(
             })
             .collect(),
     );
-    let up_count = peer_list.len();
     for tx in &peer_txs {
         // A send error means that shard died after phase A; it will be
         // surfaced as a missing/closed phase-B report below.
@@ -328,25 +464,30 @@ pub fn prepare_shard_layer(
     }
 
     // Phase-B collection: every up-shard reports exactly once (the
-    // `PhaseBGuard` guarantees this even on early return or panic), so
-    // this is bounded by `up_count`.
-    let mut phaseb_errors = Vec::new();
-    for _ in 0..up_count {
-        match phaseb_rx.recv() {
-            Ok(crate::PhaseBReport::Ready(_)) => {}
-            Ok(crate::PhaseBReport::Failed(err)) => {
-                eprintln!("shard phase-B failed: {err}");
-                phaseb_errors.push(err);
-            }
-            Err(_) => {
-                phaseb_errors
-                    .push("shard thread exited without reporting phase-B readiness".to_string());
-                break;
-            }
+    // `PhaseBGuard` guarantees this even on early return or panic).
+    let collected = collect_worker_reports(
+        "shard phase B",
+        &phaseb_rx,
+        &expected_workers,
+        SHARD_PHASE_TIMEOUT,
+        |report| match report {
+            crate::PhaseBReport::Ready(worker_idx)
+            | crate::PhaseBReport::Failed { worker_idx, .. } => *worker_idx,
+        },
+    );
+    let mut phaseb_errors = collected.errors;
+    for report in collected.reports {
+        if let crate::PhaseBReport::Failed {
+            worker_idx: _,
+            message,
+        } = report
+        {
+            eprintln!("shard phase-B failed: {message}");
+            phaseb_errors.push(message);
         }
     }
     if !phaseb_errors.is_empty() {
-        retire_failed_activation(
+        cleanup_shards(
             joins,
             fabric_group,
             ShardControlGroup::new(control_senders, SHARD_CONTROL_TIMEOUT),
@@ -389,7 +530,7 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
     } = prepared;
 
     if let Err(errors) = fabric_group.start_rpc_servers(&rpc_shards) {
-        retire_failed_activation(
+        cleanup_shards(
             joins,
             fabric_group,
             control,
@@ -403,7 +544,7 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
     }
     for tx in &serve_start_txs {
         if tx.send(()).is_err() {
-            retire_failed_activation(
+            cleanup_shards(
                 joins,
                 fabric_group,
                 control,
@@ -444,7 +585,7 @@ pub fn retire_prepared_shard_layer(prepared: PreparedShardLayer) {
         terminal_rx,
         routes,
     } = prepared;
-    retire_failed_activation(
+    cleanup_shards(
         joins,
         fabric_group,
         control,
@@ -456,8 +597,8 @@ pub fn retire_prepared_shard_layer(prepared: PreparedShardLayer) {
     );
 }
 
-fn retire_failed_activation(
-    joins: Vec<JoinHandle>,
+fn cleanup_shards(
+    joins: Vec<ShardJoin>,
     fabric_group: FabricGroup,
     control: ShardControlGroup,
     layer_stop: Arc<AtomicBool>,
@@ -465,17 +606,56 @@ fn retire_failed_activation(
     serve_start_txs: Vec<mpsc::Sender<()>>,
     terminal_rx: mpsc::Receiver<crate::ShardTerminalReport>,
     routes: RouteTableHandle,
-) {
+) -> bool {
+    let mut outstanding_workers: Vec<u16> = joins.iter().map(|join| join.worker_idx.0).collect();
+    outstanding_workers.sort_unstable();
+    let cleanup_progress = Arc::new(Mutex::new(CleanupProgress {
+        stage: "shard joins",
+        outstanding_workers,
+    }));
+    let watchdog = CleanupWatchdog::production(cleanup_progress.clone());
     layer_stop.store(true, Ordering::Relaxed);
     drop(serve_start_txs);
-    for h in joins.into_iter().rev() {
-        let _ = h.join();
+    // Reverse joins mirror spawn order. Only after every shard is gone may
+    // control, fabric, routes, and finally registered backing ownership drop.
+    let mut failed = false;
+    for join in joins.into_iter().rev() {
+        let worker_idx = join.worker_idx;
+        if let Err(error) = join.handle.join() {
+            eprintln!(
+                "shard worker={} panicked during cleanup: {error:?}",
+                worker_idx.0
+            );
+            failed = true;
+        }
+        cleanup_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .outstanding_workers
+            .retain(|worker| *worker != worker_idx.0);
+    }
+    for report in terminal_rx.try_iter() {
+        eprintln!(
+            "shard worker={} terminal failure: {}",
+            report.worker_idx.0, report.message
+        );
+        failed = true;
     }
     drop(control);
+    cleanup_progress
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .stage = "fabric teardown";
     drop(fabric_group);
+    cleanup_progress
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .stage = "registered backing teardown";
     drop(routes);
     drop(backing_keepalives);
     drop(terminal_rx);
+    watchdog.disarm();
+    failed
 }
 
 fn shard_backing_sizes(
@@ -516,39 +696,16 @@ pub fn teardown_shard_layer(layer: ShardLayer) -> bool {
         terminal_rx,
         routes,
     } = layer;
-    layer_stop.store(true, Ordering::Relaxed);
-    let mut failed = false;
-    for h in joins.into_iter().rev() {
-        if let Err(e) = h.join() {
-            eprintln!("shard thread panicked during teardown: {e:?}");
-            failed = true;
-        }
-    }
-    for report in terminal_rx.try_iter() {
-        eprintln!(
-            "shard worker={} terminal failure: {}",
-            report.worker_idx.0, report.message
-        );
-        failed = true;
-    }
-    // Drop the control senders only after every shard thread has
-    // exited, so nothing observes a half-torn layer.
-    drop(control);
-    // Now retire the shared fabric endpoints. Each unit drops its RPC
-    // server first (signalling shutdown and joining the RPC worker
-    // pool), then its `Fabric`, which closes every memory region
-    // registered against the domain: the shared RPC scratch and every
-    // assigned shard's data backing. The shard threads have already
-    // joined, so nothing still touches those regions.
-    drop(fabric_group);
-    drop(routes);
-    // Free every shard's backing only now: the fabrics above have closed
-    // their MRs, and all shard threads (and thus every io_uring ring that
-    // may still reference a peer's pages as a `SEND_ZC` source) have
-    // joined, so no mapping is unmapped out from under a live ring or an
-    // open MR.
-    drop(_backing_keepalives);
-    failed
+    cleanup_shards(
+        joins,
+        fabric_group,
+        control,
+        layer_stop,
+        _backing_keepalives,
+        Vec::new(),
+        terminal_rx,
+        routes,
+    )
 }
 
 /// The binary's [`ConfigApplyTarget`]: owns the live shard layer and
@@ -787,6 +944,7 @@ impl ConfigApplyTarget for ProcessApplyTarget {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
 
     use super::*;
     use unbounded_storage::p2p::NodeId;
@@ -814,6 +972,91 @@ mod tests {
         let graph = graph_with_self_peer(PeerId(7));
 
         assert_eq!(local_self_peer(&graph).unwrap(), PeerId(7));
+    }
+
+    #[test]
+    fn collector_timeout_reports_sorted_outstanding_workers() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(WorkerIdx(1)).unwrap();
+
+        let collected = collect_worker_reports(
+            "test phase",
+            &rx,
+            &[WorkerIdx(2), WorkerIdx(0), WorkerIdx(1)],
+            Duration::from_millis(1),
+            |worker| *worker,
+        );
+
+        assert_eq!(collected.reports, vec![WorkerIdx(1)]);
+        assert_eq!(
+            collected.errors,
+            vec!["test phase timed out; outstanding workers=[0, 2]"]
+        );
+    }
+
+    #[test]
+    fn collector_rejects_duplicate_worker_report() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(WorkerIdx(0)).unwrap();
+        tx.send(WorkerIdx(0)).unwrap();
+        tx.send(WorkerIdx(1)).unwrap();
+
+        let collected = collect_worker_reports(
+            "test phase",
+            &rx,
+            &[WorkerIdx(0), WorkerIdx(1)],
+            Duration::from_secs(1),
+            |worker| *worker,
+        );
+
+        assert_eq!(collected.reports, vec![WorkerIdx(0), WorkerIdx(1)]);
+        assert_eq!(
+            collected.errors,
+            vec!["test phase received duplicate report from worker=0"]
+        );
+    }
+
+    #[test]
+    fn cleanup_watchdog_disarms_without_firing() {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let terminated = Arc::new(AtomicUsize::new(0));
+        let fired_for_watchdog = fired.clone();
+        let terminated_for_watchdog = terminated.clone();
+        let watchdog = CleanupWatchdog::spawn(
+            Duration::from_secs(1),
+            move || {
+                fired_for_watchdog.fetch_add(1, Ordering::Relaxed);
+            },
+            move || {
+                terminated_for_watchdog.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+
+        watchdog.disarm();
+
+        assert_eq!(fired.load(Ordering::Relaxed), 0);
+        assert_eq!(terminated.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cleanup_watchdog_fires_and_terminates() {
+        let (fired_tx, fired_rx) = mpsc::channel();
+        let terminated = Arc::new(AtomicUsize::new(0));
+        let terminated_for_watchdog = terminated.clone();
+        let watchdog = CleanupWatchdog::spawn(
+            Duration::from_millis(1),
+            move || {
+                fired_tx.send(()).unwrap();
+            },
+            move || {
+                terminated_for_watchdog.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+
+        fired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        watchdog.disarm();
+
+        assert_eq!(terminated.load(Ordering::Relaxed), 1);
     }
 
     #[test]
