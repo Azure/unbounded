@@ -79,6 +79,7 @@ pub struct PreparedShardLayer {
     backing_keepalives: Vec<Arc<dyn Send + Sync>>,
     rpc_shards: Vec<RpcShardPublish>,
     serve_start_txs: Vec<mpsc::Sender<()>>,
+    terminal_rx: mpsc::Receiver<crate::ShardTerminalReport>,
 }
 
 /// A spawned set of shard threads plus the handles to drive and retire
@@ -106,6 +107,7 @@ pub struct ShardLayer {
     /// strictly after all joins, so no ring ever references unmapped
     /// memory.
     _backing_keepalives: Vec<Arc<dyn Send + Sync>>,
+    terminal_rx: mpsc::Receiver<crate::ShardTerminalReport>,
 }
 
 impl ShardLayer {
@@ -169,6 +171,7 @@ pub fn prepare_shard_layer(
     // from `ready_tx` so the layer can wait for the second rendezvous
     // (peer registration) after broadcasting the full peer set.
     let (phaseb_tx, phaseb_rx) = mpsc::channel::<crate::PhaseBReport>();
+    let (terminal_tx, terminal_rx) = mpsc::channel::<crate::ShardTerminalReport>();
     let mut joins = Vec::with_capacity(worker_count);
     let mut control_senders = Vec::with_capacity(worker_count);
     // Per-shard senders for broadcasting the assembled peer set in phase
@@ -199,13 +202,13 @@ pub fn prepare_shard_layer(
         let frontend_bindings = frontend_bindings.clone();
         let backend_specs = backend_specs.clone();
         let layer_stop = layer_stop.clone();
+        let terminal_tx = terminal_tx.clone();
         let rt = deps.runtime.clone();
-        let panic_tx = tx.clone();
         let handle = rt.spawn_pinned(
             widx,
             &format!("ub-storage-shard-{i}"),
             Box::new(move || {
-                crate::report_on_panic(panic_tx, widx, move || {
+                crate::report_on_panic(widx, move || {
                     crate::run_shard(
                         widx,
                         shard,
@@ -222,6 +225,7 @@ pub fn prepare_shard_layer(
                         peer_rx,
                         phaseb_tx,
                         serve_start_rx,
+                        terminal_tx,
                         layer_stop,
                     );
                 });
@@ -234,6 +238,7 @@ pub fn prepare_shard_layer(
     // bounded by the number of shards that came up, and each live shard
     // holds its sender, so this never closes the channel prematurely.
     drop(phaseb_tx);
+    drop(terminal_tx);
 
     // Bounded readiness collection: read exactly one message per spawned
     // thread. Shards that come up park holding their sender, so they
@@ -351,6 +356,7 @@ pub fn prepare_shard_layer(
             layer_stop,
             backing_keepalives,
             serve_start_txs,
+            terminal_rx,
         );
         return Err(phaseb_errors);
     }
@@ -363,6 +369,7 @@ pub fn prepare_shard_layer(
         backing_keepalives,
         rpc_shards,
         serve_start_txs,
+        terminal_rx,
     })
 }
 
@@ -378,6 +385,7 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
         backing_keepalives,
         rpc_shards,
         serve_start_txs,
+        terminal_rx,
     } = prepared;
 
     if let Err(errors) = fabric_group.start_rpc_servers(&rpc_shards) {
@@ -388,6 +396,7 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
             layer_stop,
             backing_keepalives,
             serve_start_txs,
+            terminal_rx,
         );
         return Err(errors);
     }
@@ -400,6 +409,7 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
                 layer_stop,
                 backing_keepalives,
                 serve_start_txs,
+                terminal_rx,
             );
             return Err(vec![
                 "shard exited before recursive RPC servers were ready".to_string(),
@@ -414,6 +424,7 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
         control,
         layer_stop,
         _backing_keepalives: backing_keepalives,
+        terminal_rx,
     })
 }
 
@@ -424,6 +435,7 @@ fn retire_failed_activation(
     layer_stop: Arc<AtomicBool>,
     backing_keepalives: Vec<Arc<dyn Send + Sync>>,
     serve_start_txs: Vec<mpsc::Sender<()>>,
+    terminal_rx: mpsc::Receiver<crate::ShardTerminalReport>,
 ) {
     layer_stop.store(true, Ordering::Relaxed);
     drop(serve_start_txs);
@@ -433,6 +445,7 @@ fn retire_failed_activation(
     drop(control);
     drop(fabric_group);
     drop(backing_keepalives);
+    drop(terminal_rx);
 }
 
 fn shard_backing_sizes(
@@ -463,19 +476,29 @@ fn local_self_peer(projection: &config::RuntimeGraph) -> Result<PeerId, String> 
 
 /// Retire a shard layer: signal its shards to exit, then join every
 /// thread in reverse spawn order so teardown mirrors bring-up.
-pub fn teardown_shard_layer(layer: ShardLayer) {
+pub fn teardown_shard_layer(layer: ShardLayer) -> bool {
     let ShardLayer {
         joins,
         fabric_group,
         control,
         layer_stop,
         _backing_keepalives,
+        terminal_rx,
     } = layer;
     layer_stop.store(true, Ordering::Relaxed);
+    let mut failed = false;
     for h in joins.into_iter().rev() {
         if let Err(e) = h.join() {
             eprintln!("shard thread panicked during teardown: {e:?}");
+            failed = true;
         }
+    }
+    for report in terminal_rx.try_iter() {
+        eprintln!(
+            "shard worker={} terminal failure: {}",
+            report.worker_idx.0, report.message
+        );
+        failed = true;
     }
     // Drop the control senders only after every shard thread has
     // exited, so nothing observes a half-torn layer.
@@ -493,6 +516,7 @@ pub fn teardown_shard_layer(layer: ShardLayer) {
     // joined, so no mapping is unmapped out from under a live ring or an
     // open MR.
     drop(_backing_keepalives);
+    failed
 }
 
 /// The binary's [`ConfigApplyTarget`]: owns the live shard layer and

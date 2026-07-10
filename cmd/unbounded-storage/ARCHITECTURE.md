@@ -160,16 +160,21 @@ excluded from the live-reload diff.
 
 ### Shard readiness and panic safety
 
-Each shard reports exactly one `ShardReady` message: `Up { descriptor, fabric }`
-(after which it parks while holding its `Sender`), or `Failed(String)`.
-`report_on_panic` wraps shard bring-up in `catch_unwind`/`AssertUnwindSafe` so a
-panicking shard still emits one `Failed` via a dedicated panic channel;
-otherwise main's bounded receive would hang. Main performs a bounded `recv()`
-exactly `joins.len()` times (it does **not** drain to disconnect, because `Up`
-shards never drop their sender). Preparation returns a `PreparedShardLayer`
-only after all phase-B reports succeed. Activation starts RPC and releases the
-parked shards; on failure it sets the layer stop flag, drops the serve gates,
-joins shards in reverse order, and tears down fabric and backing keepalives.
+Each shard owns a phase-A reporter that emits exactly one `ShardReady` message:
+`Up { worker_idx, publish }` or `Failed(String)`. Its Drop fallback covers an
+early return or panic before the explicit report. Phase B uses the same
+consuming-report/Drop pattern. Main performs a bounded `recv()` exactly
+`joins.len()` times (it does **not** drain to disconnect, because live shards
+retain channel senders). Preparation returns a `PreparedShardLayer` only after
+all phase-B reports succeed. Activation starts RPC and releases the parked
+shards; on failure it sets the layer stop flag, drops the serve gates, joins
+shards in reverse order, and tears down fabric and backing keepalives.
+
+Shard panics are logged and resumed so the native join handle remains failed.
+Once serving starts, a lifetime guard balances the live-shard metric and sends
+a terminal report on abnormal exit. That report also sets process-wide
+shutdown; teardown drains terminal reports and returns a failing process status
+instead of continuing with a missing shard.
 
 ### Shutdown
 

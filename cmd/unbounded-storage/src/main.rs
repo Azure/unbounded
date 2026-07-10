@@ -489,7 +489,7 @@ fn main() -> ExitCode {
     // Watch the config file and drive each update through the
     // controller until shutdown. Every apply is in place; an apply error
     // is logged and the process keeps serving on the last-good config.
-    let exit_code = ExitCode::SUCCESS;
+    let mut exit_code = ExitCode::SUCCESS;
     match config::ConfigWatcher::new(config_path.clone()) {
         Ok((_watcher, update_rx)) => {
             while !SHUTDOWN.load(Ordering::Acquire) {
@@ -533,7 +533,9 @@ fn main() -> ExitCode {
     // stop flag.
     let (layer, disk_registry) = controller.into_target().into_parts();
     if let Some(layer) = layer {
-        shard_layer::teardown_shard_layer(layer);
+        if shard_layer::teardown_shard_layer(layer) {
+            exit_code = ExitCode::FAILURE;
+        }
     }
     clear_cache_disk_publications(&cache_directories);
     disk_registry.drain();
@@ -569,8 +571,10 @@ fn run_shard(
     peer_rx: mpsc::Receiver<Arc<Vec<PeerPublish>>>,
     phaseb_tx: mpsc::Sender<PhaseBReport>,
     serve_start_rx: mpsc::Receiver<()>,
+    terminal_tx: mpsc::Sender<ShardTerminalReport>,
     layer_stop: Arc<AtomicBool>,
 ) {
+    let phase_a = PhaseAReporter::new(widx, tx);
     // The fabric endpoint is built and owned by the `FabricGroup` in the
     // shard layer and shared by every shard mapped onto it (one per shard
     // for the tcp fallback, one per HCA for verbs). This shard registers
@@ -589,10 +593,7 @@ fn run_shard(
     }) {
         Ok(b) => b,
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: backing allocation failed: {e}",
-                widx.0,
-            )));
+            phase_a.report_failed(format!("worker={}: backing allocation failed: {e}", widx.0,));
             return;
         }
     };
@@ -600,10 +601,7 @@ fn run_shard(
     let mr = match fabric.register_backing(&backing, shard.numa) {
         Ok(mr) => mr,
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: register_backing: {e}",
-                widx.0,
-            )));
+            phase_a.report_failed(format!("worker={}: register_backing: {e}", widx.0,));
             return;
         }
     };
@@ -616,18 +614,12 @@ fn run_shard(
     let socket = match NetworkRing::new(256) {
         Ok(s) => Rc::new(s),
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: NetworkRing::new: {e}",
-                widx.0,
-            )));
+            phase_a.report_failed(format!("worker={}: NetworkRing::new: {e}", widx.0,));
             return;
         }
     };
     if let Err(e) = socket.register_backing(&backing) {
-        let _ = tx.send(ShardReady::Failed(format!(
-            "worker={}: socket register_backing: {e}",
-            widx.0,
-        )));
+        phase_a.report_failed(format!("worker={}: socket register_backing: {e}", widx.0,));
         return;
     }
 
@@ -692,10 +684,7 @@ fn run_shard(
     ) {
         Ok(r) => r,
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: build backend registry: {e}",
-                widx.0,
-            )));
+            phase_a.report_failed(format!("worker={}: build backend registry: {e}", widx.0,));
             return;
         }
     };
@@ -714,10 +703,10 @@ fn run_shard(
     ) {
         Ok(t) => t,
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
+            phase_a.report_failed(format!(
                 "worker={}: RoutedTransport::with_routes: {e}",
                 widx.0,
-            )));
+            ));
             return;
         }
     };
@@ -736,10 +725,7 @@ fn run_shard(
     ) {
         Ok(p) => p,
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: Pool::new: {e}",
-                widx.0,
-            )));
+            phase_a.report_failed(format!("worker={}: Pool::new: {e}", widx.0,));
             return;
         }
     };
@@ -787,16 +773,13 @@ fn run_shard(
     // publishing; exit cleanly by returning (the shard locals drop in
     // reverse declaration order; the shared `fabric` is released by the
     // `FabricGroup`, not here).
-    let _ = tx.send(ShardReady::Up {
-        worker_idx: widx,
-        publish: ShardPublish {
-            backing_base: backing_base as usize,
-            backing_len,
-            fabric_mr: mr,
-            numa: shard.numa,
-            fetch_channel,
-            backing_keepalive,
-        },
+    phase_a.report_up(ShardPublish {
+        backing_base: backing_base as usize,
+        backing_len,
+        fabric_mr: mr,
+        numa: shard.numa,
+        fetch_channel,
+        backing_keepalive,
     });
     let peers = match peer_rx.recv() {
         Ok(peers) => peers,
@@ -807,7 +790,7 @@ fn run_shard(
     // The guard sends `Failed` on any early return or panic so the
     // layer's bounded Phase-B collection never hangs waiting on a shard
     // that aborted (mirroring `report_on_panic` for Phase A).
-    let mut phaseb_guard = PhaseBGuard::new(widx, phaseb_tx);
+    let phaseb_guard = PhaseBGuard::new(widx, phaseb_tx);
 
     // PHASE B: register every peer shard's backing on our socket ring
     // (recording the fixed-buffer index each lands at) and assemble the
@@ -1029,7 +1012,7 @@ fn run_shard(
         Ok(()) => {}
         Err(_) => return,
     }
-    metrics::shards_delta(1);
+    let serving_guard = ServingGuard::new(widx, terminal_tx, &SHUTDOWN);
 
     // Drive the shard's cooperative future set until shutdown. The loop
     // busy-polls socket I/O and frontend work while active and idles
@@ -1039,8 +1022,6 @@ fn run_shard(
         || SHUTDOWN.load(Ordering::Acquire) || layer_stop.load(Ordering::Acquire),
         Duration::from_micros(100),
     );
-
-    metrics::shards_delta(-1);
 
     // Drop order matters:
     //   1. `shard_loop` first - clears tick hooks and futures, releasing
@@ -1057,22 +1038,11 @@ fn run_shard(
     drop(shard_loop);
     drop(pool);
     drop(socket);
+    serving_guard.complete();
 }
 
-/// Run a shard thread body `f`, guaranteeing exactly one
-/// [`ShardReady`] is observed on `tx` even when `f` panics during
-/// bring-up.
-///
-/// `f` (i.e. [`run_shard`]) reports its own readiness on the normal
-/// success and error paths through a sender it owns. The `tx` handed
-/// here is a *separate* clone reserved solely for the panic path: if
-/// `f` unwinds before reporting, its own sender is dropped by the
-/// unwind, but the surviving shards stay parked holding their sender
-/// clones, so `main`'s bounded `recv()` would block forever. Emitting a
-/// `Failed` here keeps the readiness count whole. A panic *after* `f`
-/// already reported `Up` produces a harmless extra `Failed`: `main`
-/// reads exactly N messages and ignores any surplus.
-fn report_on_panic<F>(tx: mpsc::Sender<ShardReady>, widx: WorkerIdx, f: F)
+/// Log a shard panic and preserve it for the owning join handle.
+fn report_on_panic<F>(widx: WorkerIdx, f: F)
 where
     F: FnOnce(),
 {
@@ -1081,14 +1051,11 @@ where
     // process is headed for the coherent failure path regardless.
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         eprintln!(
-            "shard worker={} panicked during bring-up: {}",
+            "shard worker={} panicked: {}",
             widx.0,
-            panic_payload_str(&payload),
+            panic_payload_str(&payload)
         );
-        let _ = tx.send(ShardReady::Failed(format!(
-            "worker={}: panicked during bring-up",
-            widx.0,
-        )));
+        std::panic::resume_unwind(payload);
     }
 }
 
@@ -1484,6 +1451,48 @@ enum ShardReady {
     Failed(String),
 }
 
+/// Owning phase-A reporter. Consuming report methods and the Drop
+/// fallback guarantee exactly one readiness message per shard.
+struct PhaseAReporter {
+    worker_idx: WorkerIdx,
+    tx: Option<mpsc::Sender<ShardReady>>,
+}
+
+impl PhaseAReporter {
+    fn new(worker_idx: WorkerIdx, tx: mpsc::Sender<ShardReady>) -> Self {
+        Self {
+            worker_idx,
+            tx: Some(tx),
+        }
+    }
+
+    fn report_up(mut self, publish: ShardPublish) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(ShardReady::Up {
+                worker_idx: self.worker_idx,
+                publish,
+            });
+        }
+    }
+
+    fn report_failed(mut self, message: String) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(ShardReady::Failed(message));
+        }
+    }
+}
+
+impl Drop for PhaseAReporter {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(ShardReady::Failed(format!(
+                "worker={}: aborted during phase A bring-up",
+                self.worker_idx.0
+            )));
+        }
+    }
+}
+
 /// Phase-A publication from one shard: the backing region other shards
 /// must register to `SEND_ZC` from this shard's pinned pages, plus the
 /// channel to this shard's [`FetchService`]. The base is shipped as a
@@ -1554,14 +1563,65 @@ impl PhaseBGuard {
         }
     }
 
-    fn report_ready(&mut self) {
+    fn report_ready(mut self) {
         self.reported = true;
         let _ = self.tx.send(PhaseBReport::Ready(self.widx));
     }
 
-    fn report_failed(&mut self, msg: String) {
+    fn report_failed(mut self, msg: String) {
         self.reported = true;
         let _ = self.tx.send(PhaseBReport::Failed(msg));
+    }
+}
+
+#[derive(Debug)]
+struct ShardTerminalReport {
+    worker_idx: WorkerIdx,
+    message: String,
+}
+
+struct ServingGuard {
+    worker_idx: WorkerIdx,
+    tx: mpsc::Sender<ShardTerminalReport>,
+    shutdown: &'static AtomicBool,
+    completed: bool,
+}
+
+impl ServingGuard {
+    fn new(
+        worker_idx: WorkerIdx,
+        tx: mpsc::Sender<ShardTerminalReport>,
+        shutdown: &'static AtomicBool,
+    ) -> Self {
+        metrics::shards_delta(1);
+        Self {
+            worker_idx,
+            tx,
+            shutdown,
+            completed: false,
+        }
+    }
+
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for ServingGuard {
+    fn drop(&mut self) {
+        metrics::shards_delta(-1);
+        if !self.completed {
+            let message = format!(
+                "worker={}: shard terminated while serving",
+                self.worker_idx.0
+            );
+            eprintln!("{message}");
+            let _ = self.tx.send(ShardTerminalReport {
+                worker_idx: self.worker_idx,
+                message,
+            });
+            self.shutdown.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -2079,33 +2139,51 @@ mod tests {
     }
 
     #[test]
-    fn report_on_panic_emits_failed_when_body_panics() {
-        // A shard body that panics before reporting must still leave
-        // exactly one `Failed` on the channel so `main`'s bounded recv
-        // count stays whole and startup cannot deadlock.
+    fn phase_a_reporter_drop_reports_failure_once() {
         let (tx, rx) = mpsc::channel::<ShardReady>();
-        report_on_panic(tx, WorkerIdx(7), || {
-            panic!("boom during bring-up");
-        });
+        drop(PhaseAReporter::new(WorkerIdx(7), tx));
         match rx.recv() {
             Ok(ShardReady::Failed(msg)) => {
                 assert!(msg.contains("worker=7"), "got: {msg}");
-                assert!(msg.contains("panicked during bring-up"), "got: {msg}");
+                assert!(msg.contains("aborted during phase A"), "got: {msg}");
             }
             other => panic!("expected Failed, got {:?}", other.is_ok()),
         }
-        // No second message: the panic path reports exactly once.
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn report_on_panic_is_silent_when_body_succeeds() {
-        // On the normal path `run_shard` owns the reporting; the
-        // panic-path clone must stay quiet so no spurious `Failed`
-        // is appended.
-        let (tx, rx) = mpsc::channel::<ShardReady>();
-        report_on_panic(tx, WorkerIdx(0), || {});
+    fn report_on_panic_resumes_unwind() {
+        let result = std::panic::catch_unwind(|| {
+            report_on_panic(WorkerIdx(7), || panic!("boom during serving"));
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serving_guard_reports_abnormal_termination() {
+        static TEST_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+        TEST_SHUTDOWN.store(false, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+
+        drop(ServingGuard::new(WorkerIdx(3), tx, &TEST_SHUTDOWN));
+
+        let report = rx.recv().unwrap();
+        assert_eq!(report.worker_idx, WorkerIdx(3));
+        assert!(report.message.contains("terminated while serving"));
+        assert!(TEST_SHUTDOWN.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn serving_guard_normal_completion_is_silent() {
+        static TEST_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+        TEST_SHUTDOWN.store(false, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+
+        ServingGuard::new(WorkerIdx(3), tx, &TEST_SHUTDOWN).complete();
+
         assert!(rx.try_recv().is_err());
+        assert!(!TEST_SHUTDOWN.load(Ordering::Acquire));
     }
 
     #[test]
