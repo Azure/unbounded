@@ -64,25 +64,6 @@ impl OriginBackend {
     }
 }
 
-impl Backend for OriginBackend {
-    type Req = StripeReq;
-    type Stream<'a> = OriginBorrowedStream<'a>;
-
-    fn bulk_get<'a>(
-        &'a self,
-        req: &'a Self::Req,
-        src: BulkRef,
-        dsts: &'a [PageRef],
-    ) -> Self::Stream<'a> {
-        match self {
-            OriginBackend::Http(b) => OriginBorrowedStream::Http(b.bulk_get(req, src, dsts)),
-            OriginBackend::S3(b) => OriginBorrowedStream::S3(b.bulk_get(req, src, dsts)),
-            OriginBackend::Azure(b) => OriginBorrowedStream::Azure(b.bulk_get(req, src, dsts)),
-            OriginBackend::Fake(b) => OriginBorrowedStream::Fake(b.bulk_get(req, src, dsts)),
-        }
-    }
-}
-
 /// Stream produced by [`OriginBackend::fetch_stream`] for registry use.
 pub enum OriginStream<'a> {
     Http(<HttpBackend as Backend>::Stream<'static>),
@@ -139,28 +120,6 @@ impl PageStream for OriginStream<'_> {
                     }
                 }
             }
-        }
-    }
-}
-
-/// Stream produced by direct [`OriginBackend::bulk_get`] calls.
-pub enum OriginBorrowedStream<'a> {
-    Http(<HttpBackend as Backend>::Stream<'a>),
-    S3(<S3Backend as Backend>::Stream<'a>),
-    Azure(<AzureBackend as Backend>::Stream<'a>),
-    Fake(<FakeBackend as Backend>::Stream<'a>),
-}
-
-impl PageStream for OriginBorrowedStream<'_> {
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<PageRef, Error>>> {
-        match self.get_mut() {
-            OriginBorrowedStream::Http(s) => Pin::new(s).poll_next(cx),
-            OriginBorrowedStream::S3(s) => Pin::new(s).poll_next(cx),
-            OriginBorrowedStream::Azure(s) => Pin::new(s).poll_next(cx),
-            OriginBorrowedStream::Fake(s) => Pin::new(s).poll_next(cx),
         }
     }
 }
