@@ -3,10 +3,10 @@
 
 //! Cross-core `PageChannel` DST property tests.
 //!
-//! Each invariant drives a randomized workload end to end over real
-//! [`PageChannel`]s and asserts a single property of the
-//! shard-to-storage-core page path. A couple of hand-built smoke tests
-//! pin the round-trip and shutdown scenarios deterministically.
+//! Each generated case drives one randomized workload end to end over real
+//! [`PageChannel`]s, then checks every invariant against the resulting report.
+//! A couple of hand-built smoke tests pin the round-trip and shutdown scenarios
+//! deterministically.
 //!
 //! [`PageChannel`]: unbounded_storage::storage::PageChannel
 
@@ -23,105 +23,100 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// Invariant: bounded termination. `run_workload` returning `Ok`
-    /// proves the executor neither deadlocked nor exhausted its step
-    /// budget while driving the full channel + storage-core path.
     #[test]
-    fn invariant_bounded_termination(seed in any::<u64>(), w in workload_strategy()) {
-        let report = run_workload(seed, w)
+    fn page_channel_invariants(seed in any::<u64>(), w in workload_strategy()) {
+        let oracle = oracle_for_workload(&w);
+        let report = run_workload(seed, w.clone())
             .expect("run completed without deadlock or budget exhaustion");
-        prop_assert!(report.steps > 0);
+        assert_bounded_termination(&report)?;
+        assert_counters_consistent(&w, &report)?;
+        assert_shutdown_send_fails(&w, &report)?;
+        assert_hit_bytes_were_written(&report, &oracle)?;
+        assert_unwritten_keys_miss(&report, &oracle)?;
     }
+}
 
-    /// Invariant: counters are self-consistent. `hits + misses` cannot
-    /// exceed the number of `read_page` calls the workload issued, and
-    /// the per-disk device-write counters must sum to the aggregate.
-    #[test]
-    fn invariant_counters_consistent(seed in any::<u64>(), w in workload_strategy()) {
-        let mut reads = 0u64;
-        for c in &w.clients {
-            for op in &c.ops {
-                if matches!(op, Op::Read { .. }) {
-                    reads += 1;
-                }
-            }
-        }
-        let report = run_workload(seed, w).expect("run completed");
-        prop_assert!(
-            report.hits + report.misses <= reads,
-            "hits ({}) + misses ({}) > read calls ({})",
-            report.hits, report.misses, reads,
-        );
-        let per_disk_sum: u64 = report.device_writes_per_disk.iter().copied().sum();
-        prop_assert_eq!(
-            per_disk_sum, report.device_writes,
-            "device_writes ({}) disagrees with per-disk sum ({})",
-            report.device_writes, per_disk_sum,
-        );
+/// Invariant: the executor terminates within its step budget while driving the
+/// complete channel and storage-core path.
+fn assert_bounded_termination(report: &RunReport) -> Result<(), TestCaseError> {
+    prop_assert!(report.steps > 0);
+    Ok(())
+}
+
+/// Invariant: aggregate counters agree with workload and per-disk accounting.
+fn assert_counters_consistent(w: &Workload, report: &RunReport) -> Result<(), TestCaseError> {
+    let reads = w
+        .clients
+        .iter()
+        .flat_map(|c| &c.ops)
+        .filter(|op| matches!(op, Op::Read { .. }))
+        .count() as u64;
+    prop_assert!(
+        report.hits + report.misses <= reads,
+        "hits ({}) + misses ({}) > read calls ({})",
+        report.hits,
+        report.misses,
+        reads,
+    );
+    let per_disk_sum: u64 = report.device_writes_per_disk.iter().copied().sum();
+    prop_assert_eq!(
+        per_disk_sum,
+        report.device_writes,
+        "device_writes ({}) disagrees with per-disk sum ({})",
+        report.device_writes,
+        per_disk_sum,
+    );
+    Ok(())
+}
+
+/// Invariant: a send after service shutdown fails instead of parking forever on
+/// a reply slot whose receiver has exited.
+fn assert_shutdown_send_fails(w: &Workload, report: &RunReport) -> Result<(), TestCaseError> {
+    match report.post_shutdown_send_errored {
+        Some(errored) => prop_assert!(
+            errored,
+            "post-shutdown send unexpectedly succeeded; the service did not fail it",
+        ),
+        None => prop_assert!(
+            !w.probe_shutdown || report.outcomes.iter().any(|o| matches!(o, Outcome::Err(_))),
+            "probe requested but no channel existed, yet bootstrap reported no error",
+        ),
     }
+    Ok(())
+}
 
-    /// Invariant: the service-shutdown path fails sends cleanly. When
-    /// the workload requested the probe, every storage-core task has
-    /// exited by the time `run_workload` issues one more `write_page`
-    /// on a surviving channel clone; that send must resolve with an
-    /// error (the receiver is gone / the service marked itself dead)
-    /// rather than parking forever on a reply slot.
-    #[test]
-    fn invariant_shutdown_send_fails(seed in any::<u64>(), w in workload_strategy()) {
-        let probe_requested = w.probe_shutdown;
-        let report = run_workload(seed, w).expect("run completed");
-        match report.post_shutdown_send_errored {
-            Some(errored) => prop_assert!(
-                errored,
-                "post-shutdown send unexpectedly succeeded; the service did not fail it",
-            ),
-            None => prop_assert!(
-                !probe_requested || report.outcomes.iter().any(|o| matches!(o, Outcome::Err(_))),
-                "probe requested but no channel existed, yet bootstrap reported no error",
-            ),
-        }
-    }
-
-    /// Invariant: every reported hit returns bytes that were actually
-    /// submitted by some workload write for the same `(key, offset)`.
-    /// Fault injection may turn operations into `Err`, but it must never
-    /// permit a successful hit with corrupted or mis-routed bytes.
-    #[test]
-    fn invariant_hit_bytes_were_written(seed in any::<u64>(), w in workload_strategy()) {
-        let oracle = oracle_for_workload(&w);
-        let report = run_workload(seed, w).expect("run completed");
-        for (idx, outcome) in report.outcomes.iter().enumerate() {
-            if let Outcome::ReadHit { key, offset, bytes } = outcome {
-                prop_assert!(
-                    oracle.allows_read(*key, *offset, bytes),
-                    "read hit {} returned bytes never written for key {:?} offset {}",
-                    idx,
-                    key,
-                    offset,
-                );
-            }
-        }
-    }
-
-    /// Invariant: a key/offset the workload never wrote must not be
-    /// reported as a cache hit. Such reads may miss, or error under an
-    /// injected fault/shutdown race, but a hit would mean fabricated data.
-    #[test]
-    fn invariant_unwritten_keys_miss(seed in any::<u64>(), w in workload_strategy()) {
-        let oracle = oracle_for_workload(&w);
-        let report = run_workload(seed, w).expect("run completed");
-        for (idx, outcome) in report.outcomes.iter().enumerate() {
-            if let Outcome::ReadHit { key, offset, .. } = outcome {
-                prop_assert!(
-                    oracle.was_written(*key, *offset),
-                    "read hit {} for never-written key {:?} offset {}",
-                    idx,
-                    key,
-                    offset,
-                );
-            }
+/// Invariant: every reported hit contains bytes submitted by a workload write
+/// for the same logical page.
+fn assert_hit_bytes_were_written(report: &RunReport, oracle: &Oracle) -> Result<(), TestCaseError> {
+    for (idx, outcome) in report.outcomes.iter().enumerate() {
+        if let Outcome::ReadHit { key, offset, bytes } = outcome {
+            prop_assert!(
+                oracle.allows_read(*key, *offset, bytes),
+                "read hit {} returned bytes never written for key {:?} offset {}",
+                idx,
+                key,
+                offset,
+            );
         }
     }
+    Ok(())
+}
+
+/// Invariant: a logical page the workload never wrote cannot be reported as a
+/// hit; misses and injected errors remain legal.
+fn assert_unwritten_keys_miss(report: &RunReport, oracle: &Oracle) -> Result<(), TestCaseError> {
+    for (idx, outcome) in report.outcomes.iter().enumerate() {
+        if let Outcome::ReadHit { key, offset, .. } = outcome {
+            prop_assert!(
+                oracle.was_written(*key, *offset),
+                "read hit {} for never-written key {:?} offset {}",
+                idx,
+                key,
+                offset,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn oracle_for_workload(w: &Workload) -> Oracle {
