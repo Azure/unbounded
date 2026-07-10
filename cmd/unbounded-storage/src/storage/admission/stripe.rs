@@ -41,8 +41,7 @@ pub struct StripeAdmission {
 impl StripeAdmission {
     /// Construct with the same capacity semantics as
     /// [`AdmissionFilter`]. Sized for a few million entries at
-    /// roughly 1% FPR. The view uses doorkeeper-only mode; the
-    /// count-min sketch is not allocated.
+    /// roughly 1% FPR. The view's lifetime defines its admission epoch.
     pub fn new(capacity_stripes: u64) -> Self {
         Self {
             inner: Arc::new(AdmissionFilter::new_doorkeeper_only(capacity_stripes)),
@@ -62,7 +61,7 @@ impl StripeAdmission {
         }
     }
 
-    /// Reset the underlying doorkeeper and sketch. Used by tests
+    /// Reset the underlying doorkeeper. Used by tests
     /// and future warmup boundaries.
     pub fn reset(&self) {
         self.inner.reset();

@@ -183,10 +183,6 @@ impl BlockDevice for SimBlockDevice {
         self.inner.register_buffers(base, len)
     }
 
-    fn write_queue_depth(&self) -> u32 {
-        self.inner.write_queue_depth()
-    }
-
     async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), Error> {
         let delay = draw_delay(&self.cfg);
         let fault = draw_fault(&self.cfg);

@@ -70,8 +70,7 @@ impl UringDevice {
         let file_index = ring
             .register_file(file.as_raw_fd())
             .map_err(OpenError::RegisterFile)?;
-        let device =
-            CoreLocalDevice::new(file_index, page_size, capacity_pages, ring_cfg.queue_depth);
+        let device = CoreLocalDevice::new(file_index, page_size, capacity_pages);
         Ok(OpenDisk { device, ring, file })
     }
 }

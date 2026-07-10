@@ -495,9 +495,6 @@ mod tests {
             self.registers.fetch_add(1, Ordering::Relaxed);
             self.inner.register_buffers(base, len)
         }
-        fn write_queue_depth(&self) -> u32 {
-            self.inner.write_queue_depth()
-        }
         async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), DevError> {
             self.inner.read(lba, dst).await
         }
