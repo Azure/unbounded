@@ -128,8 +128,9 @@ excluded from the live-reload diff.
 
 ### Startup sequence
 
-1. Load and validate config; build `StartupSettings` from the config's
-   `[startup]` section.
+1. Load and validate config into one immutable `LoadedConfig` containing the raw
+   config, owned runtime graph, and route snapshot; build `StartupSettings` from
+   its raw config's `[startup]` section.
 2. `Host::discover()` reads hardware from sysfs.
 3. `CorePlan::for_host(&host, &settings.core_plan_config)` partitions the
    host's usable CPUs into three disjoint, NUMA-local classes: one
@@ -144,11 +145,10 @@ excluded from the live-reload diff.
    i-th worker thread to its assigned core and NUMA node.
 6. A `DiskChannelDirectory` (Arc) is created before shards as the hot-swap
    publication surface for disk channels.
-7. Read-only shared state (`Arc<Vec<FrontendSpec>>`, `Arc<Vec<BackendSpec>>`;
-   startup-fixed fabric settings come from the config `[startup]` section via
-   `StartupSettings`) and routing (`build_routing` -> `Arc<FingerTable>`) are
-   constructed once and shared across shards. `PeerId` uses the same stable
-   numeric identity as `NodeId`.
+7. One `Arc<LoadedConfig>` shares the raw config, owned runtime graph, and route
+   snapshot across startup consumers and shards. Startup-fixed fabric settings
+   still come from the raw `[startup]` section via `StartupSettings`. `PeerId`
+   uses the same stable numeric identity as `NodeId`.
 8. Each shard is spawned with `rt.spawn_pinned(widx, name, Box<FnOnce>)`. The
    `!Send` shard objects are constructed **inside** `run_shard`, after pinning.
 9. After every shard reports `Up`, peers are reconciled per shard and every
@@ -639,11 +639,15 @@ Sections (all optional, each falling back to defaults):
 - `[[frontends]]` - `name`, `source` (a backend or cache component name), and
   one `config` table (`http`, `s3`, or `loadgen`).
 
-The watcher (`notify`-based) emits `ConfigUpdate`s; main's
+After defaults and validation, loading constructs one immutable `LoadedConfig`:
+the raw `Config`, one owned `RuntimeGraph`, and one route snapshot built from
+that graph. The watcher (`notify`-based) emits these loaded snapshots; main's
 `wait_for_shutdown_with_updates` reconciles peers (remove + add on address/numa
 drift, via a `last_applied` cache), disks, and - by broadcasting the applied
 config to every shard - each shard's backend and frontend registries plus the
-routing snapshot. It republishes the channel snapshot each update, logs
+routing snapshot. The apply target and shards consume the same loaded graph and
+routes; this is coherent preparation, not whole-process transactionality. It
+republishes the channel snapshot each update, logs
 `config gen=N ...`, and sets `SHUTDOWN` if the watcher disconnects.
 
 ### 7.12 `tls/` - the shared TLS transport

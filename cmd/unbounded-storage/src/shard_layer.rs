@@ -32,13 +32,12 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use unbounded_storage::config::{
-    self, ApplyError, Config, ConfigApplyTarget, ConfigDiff, ShardControlGroup,
+    self, ApplyError, ConfigApplyTarget, ConfigDiff, LoadedConfig, ShardControlGroup,
 };
 use unbounded_storage::fabric::PeerId;
 use unbounded_storage::memory::HUGEPAGE_2MB;
 use unbounded_storage::p2p::RouteTableHandle;
 use unbounded_storage::runtime::{JoinHandle, Threading, WorkerIdx};
-use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{CacheDirectorySet, DiskRegistry, UringDiskTarget};
 use unbounded_storage::topology::ServingShard;
 
@@ -116,7 +115,7 @@ impl ShardLayer {
     }
 }
 
-/// Prepare a shard layer from `config` on the runtime in `deps`,
+/// Prepare a shard layer from `loaded` on the runtime in `deps`,
 /// blocking until every shard has completed phase B. The returned
 /// shards remain parked and no RPC server has started.
 ///
@@ -131,7 +130,7 @@ impl ShardLayer {
 /// shard failed to come up; any shards that *did* come up are torn down
 /// first so no threads leak.
 pub fn prepare_shard_layer(
-    config: &Config,
+    loaded: Arc<LoadedConfig>,
     deps: &ShardSpawnDeps,
 ) -> Result<PreparedShardLayer, Vec<String>> {
     let layer_stop = Arc::new(AtomicBool::new(false));
@@ -139,14 +138,11 @@ pub fn prepare_shard_layer(
     let settings = &deps.settings;
     let shard_backing_sizes = shard_backing_sizes(settings.memory_total_bytes, worker_count)
         .map_err(|e| vec![format!("invalid shard memory budget: {e}")])?;
-    let projection = config::runtime_projection(config)
-        .map_err(|e| vec![format!("config projection failed: {e}")])?;
-    let frontend_specs = Arc::new(config.frontends.clone());
-    let frontend_bindings = Arc::new(projection.frontends.clone());
-    let backend_specs = Arc::new(config.backends.clone());
-    let routes = crate::build_routes(config);
-    let runtime_peers = config::runtime_peers(&projection);
-    let self_peer = local_self_peer(&projection)
+    let config = loaded.config();
+    let runtime = loaded.runtime();
+    let routes = loaded.routes();
+    let runtime_peers = config::runtime_peers(runtime);
+    let self_peer = local_self_peer(runtime)
         .map_err(|e| vec![format!("unsupported fabric identity config: {e}")])?;
 
     // Bring up the shared fabric endpoints before spawning any shards:
@@ -198,9 +194,7 @@ pub fn prepare_shard_layer(
         let backing_kind = settings.backing_kind;
         let cache_directories = deps.cache_directories.clone();
         let route_handle = RouteTableHandle::from_snapshot(routes.clone());
-        let frontend_specs = frontend_specs.clone();
-        let frontend_bindings = frontend_bindings.clone();
-        let backend_specs = backend_specs.clone();
+        let loaded = loaded.clone();
         let layer_stop = layer_stop.clone();
         let terminal_tx = terminal_tx.clone();
         let rt = deps.runtime.clone();
@@ -218,9 +212,7 @@ pub fn prepare_shard_layer(
                         backing_size,
                         cache_directories,
                         route_handle,
-                        frontend_specs,
-                        frontend_bindings,
-                        backend_specs,
+                        loaded,
                         ctrl_rx,
                         peer_rx,
                         phaseb_tx,
@@ -559,15 +551,16 @@ impl ProcessApplyTarget {
 }
 
 impl ConfigApplyTarget for ProcessApplyTarget {
-    fn apply_in_place(&mut self, new: &Arc<Config>, diff: &ConfigDiff) -> Result<(), ApplyError> {
+    fn apply_in_place(
+        &mut self,
+        new: &Arc<LoadedConfig>,
+        diff: &ConfigDiff,
+    ) -> Result<(), ApplyError> {
         if diff.requires_restart() {
             return Err(ApplyError::Target(
                 "self peer identity changed; restart required".to_string(),
             ));
         }
-
-        let projection = config::runtime_projection(new)
-            .map_err(|e| ApplyError::Target(format!("config projection failed: {e}")))?;
 
         // The shards must see a new config whenever their routing surface,
         // graph projection, per-disk page-cache policy, or per-shard
@@ -580,7 +573,6 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             || diff.frontends_changed;
 
         if needs_broadcast {
-            let routes = crate::build_routes(new);
             let layer = self
                 .layer
                 .as_mut()
@@ -592,10 +584,10 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             // touching when the routing surface (p2p/peers) changed; a
             // backend/frontend-only change leaves them untouched.
             if diff.requires_routing_reload() {
-                layer.fabric_group.reload_routes(&routes);
+                layer.fabric_group.reload_routes(new.routes());
             }
             if diff.requires_peer_reconcile() {
-                let runtime_peers = config::runtime_peers(&projection);
+                let runtime_peers = config::runtime_peers(new.runtime());
                 layer.fabric_group.reconcile_peers(&runtime_peers);
             }
 
@@ -604,14 +596,16 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             // rebuild their own transport registries against an already
             // up-to-date origin surface.
             if diff.backends_changed {
-                layer.fabric_group.reconcile_backends(&new.backends);
+                layer
+                    .fabric_group
+                    .reconcile_backends(&new.config().backends);
             }
 
             // Republish config + routing to every shard and block until
             // each has acked, so the routing surface and per-shard
             // backend/frontend reconcile each shard performs on receipt
             // have provably landed.
-            if let Err(error) = layer.control.broadcast_apply(new.clone(), routes, *diff) {
+            if let Err(error) = layer.control.broadcast_apply(new.clone(), *diff) {
                 if error.apply_state_is_indeterminate() {
                     crate::SHUTDOWN.store(true, Ordering::Release);
                 }
@@ -637,7 +631,7 @@ impl ConfigApplyTarget for ProcessApplyTarget {
         // If a broadcast fails, ConfigController keeps the old config as
         // current and the live disk topology remains on that same version.
         if diff.caches_changed || diff.disks_changed {
-            self.reconcile_disks(&projection);
+            self.reconcile_disks(new.runtime());
         }
 
         Ok(())

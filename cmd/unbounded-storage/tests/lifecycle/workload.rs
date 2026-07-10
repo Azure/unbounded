@@ -17,9 +17,8 @@ use proptest::prelude::*;
 use unbounded_storage::bufferpool::{Error, StripeKey};
 use unbounded_storage::config::{
     ApplyError, BackendSpec, CacheSpec, Config, ConfigApplyTarget, ConfigController, ConfigDiff,
-    DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig, PeerSpec,
-    TcpPeerConfig, backend_spec, disk_spec, frontend_spec, peer_spec, runtime_disks,
-    runtime_projection,
+    DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig, LoadedConfig,
+    PeerSpec, TcpPeerConfig, backend_spec, disk_spec, frontend_spec, peer_spec, runtime_disks,
 };
 use unbounded_storage::runtime::ShardLoop;
 use unbounded_storage::storage::blockdev::MockDeviceConfig;
@@ -254,10 +253,11 @@ struct SimApplyTarget {
 }
 
 impl ConfigApplyTarget for SimApplyTarget {
-    fn apply_in_place(&mut self, new: &Arc<Config>, diff: &ConfigDiff) -> Result<(), ApplyError> {
-        let projection = runtime_projection(new)
-            .map_err(|e| ApplyError::Target(format!("config projection failed: {e}")))?;
-
+    fn apply_in_place(
+        &mut self,
+        new: &Arc<LoadedConfig>,
+        diff: &ConfigDiff,
+    ) -> Result<(), ApplyError> {
         if diff.requires_routing_reload()
             || diff.caches_changed
             || diff.backends_changed
@@ -265,12 +265,15 @@ impl ConfigApplyTarget for SimApplyTarget {
         {
             self.metrics.borrow_mut().broadcasts += 1;
             for shard in &self.shards {
-                shard.apply_queue.borrow_mut().push_back(new.version);
+                shard
+                    .apply_queue
+                    .borrow_mut()
+                    .push_back(new.config().version);
             }
         }
 
         if diff.caches_changed {
-            let disks = runtime_disks(&projection);
+            let disks = runtime_disks(new.runtime());
             let report = self.registry.reconcile(&disks);
             let mut metrics = self.metrics.borrow_mut();
             metrics.disk_applies += 1;
@@ -731,13 +734,15 @@ fn spawn_apply_driver(
         while !bootstrap_done.get() || !shards.iter().all(|s| s.phase_b.get()) {
             yield_once().await;
         }
-        let initial = Arc::new(config_for_generation(
-            0,
-            generation_disk_specs(0, w.initial_disks),
-        ));
+        let initial = Arc::new(
+            LoadedConfig::from_config(config_for_generation(
+                0,
+                generation_disk_specs(0, w.initial_disks),
+            ))
+            .expect("initial sim config loads"),
+        );
         let mut registry = DiskRegistry::new(RegistryTarget, disk_slots());
-        let projection = runtime_projection(&initial).expect("initial sim config projects");
-        let initial_disks = runtime_disks(&projection);
+        let initial_disks = runtime_disks(initial.runtime());
         let initial_report = registry.reconcile(&initial_disks);
         metrics.borrow_mut().registry_failures += initial_report.failures.len();
         let target = SimApplyTarget {
@@ -752,10 +757,14 @@ fn spawn_apply_driver(
         let mut controller = ConfigController::new(target, initial);
         for (idx, apply) in w.applies.iter().enumerate() {
             yield_n(apply.delay).await;
-            let mut next = (*controller.current()).as_ref().clone();
+            let mut next = controller.current().config().clone();
             next.version = idx as u64 + 1;
             mutate_config(&mut next, apply, idx + 1);
-            controller.apply(Arc::new(next)).expect("sim config apply");
+            controller
+                .apply(Arc::new(
+                    LoadedConfig::from_config(next).expect("sim config loads"),
+                ))
+                .expect("sim config apply");
         }
         let versions = controller.config_versions().snapshot();
         let mut m = metrics.borrow_mut();

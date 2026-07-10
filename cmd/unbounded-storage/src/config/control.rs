@@ -37,8 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use crate::config::{Config, ConfigDiff};
-use crate::p2p::RouteTableSnapshot;
+use crate::config::{ConfigDiff, LoadedConfig};
 use crate::runtime::WorkerIdx;
 
 /// A command delivered to a single shard's control channel. The shard
@@ -64,11 +63,8 @@ pub struct ShardDrainPageCache {
 
 /// Payload of [`ShardCommand::ApplyConfig`].
 pub struct ShardApply {
-    /// The new, defaults-applied, validated configuration.
-    pub config: Arc<Config>,
-    /// The route table rebuilt from `config`. Published into the shard's
-    /// route-table handle so transports observe it atomically.
-    pub routes: RouteTableSnapshot,
+    /// The new finalized config, runtime graph, and route table.
+    pub loaded: Arc<LoadedConfig>,
     /// Section-level diff that selected this apply path.
     pub diff: ConfigDiff,
     /// Channel the shard sends its [`ShardAck`] on once the apply has
@@ -287,7 +283,11 @@ pub trait ConfigApplyTarget {
     /// Apply a change in place. `diff` reports exactly which sections
     /// changed so the implementation can skip untouched work (e.g. only
     /// reconcile fabric peers when `requires_routing_reload`).
-    fn apply_in_place(&mut self, new: &Arc<Config>, diff: &ConfigDiff) -> Result<(), ApplyError>;
+    fn apply_in_place(
+        &mut self,
+        new: &Arc<LoadedConfig>,
+        diff: &ConfigDiff,
+    ) -> Result<(), ApplyError>;
 }
 
 /// The single funnel for configuration changes. Holds the currently
@@ -295,7 +295,7 @@ pub trait ConfigApplyTarget {
 /// [`ConfigApplyTarget`].
 pub struct ConfigController<T: ConfigApplyTarget> {
     target: T,
-    current: Arc<Config>,
+    current: Arc<LoadedConfig>,
     versions: ConfigVersionStatus,
 }
 
@@ -304,8 +304,8 @@ impl<T: ConfigApplyTarget> ConfigController<T> {
     /// to the process at startup. The latest-known, latest-applied, and
     /// startup config versions are all seeded from `initial`'s
     /// [`Config::version`].
-    pub fn new(target: T, initial: Arc<Config>) -> Self {
-        let versions = ConfigVersionStatus::new(initial.version);
+    pub fn new(target: T, initial: Arc<LoadedConfig>) -> Self {
+        let versions = ConfigVersionStatus::new(initial.config().version);
         Self {
             target,
             current: initial,
@@ -314,7 +314,7 @@ impl<T: ConfigApplyTarget> ConfigController<T> {
     }
 
     /// The configuration currently realized by the process.
-    pub fn current(&self) -> &Arc<Config> {
+    pub fn current(&self) -> &Arc<LoadedConfig> {
         &self.current
     }
 
@@ -354,15 +354,15 @@ impl<T: ConfigApplyTarget> ConfigController<T> {
     /// latest-applied config version is advanced to the same value only on
     /// full success - including a no-op apply against the already-running
     /// config - so observers can tell the process has converged onto it.
-    pub fn apply(&mut self, new: Arc<Config>) -> Result<ApplyOutcome, ApplyError> {
+    pub fn apply(&mut self, new: Arc<LoadedConfig>) -> Result<ApplyOutcome, ApplyError> {
         // Record the loaded version before doing any work so the
         // latest-known version advances even if the apply fails below.
-        self.versions.record_known(new.version);
+        self.versions.record_known(new.config().version);
 
-        let diff = ConfigDiff::between(&self.current, &new);
+        let diff = ConfigDiff::between(self.current.config(), new.config());
 
         if !diff.any() {
-            self.versions.record_applied(new.version);
+            self.versions.record_applied(new.config().version);
             return Ok(ApplyOutcome {
                 tier: ApplyTier::NoChange,
                 diff,
@@ -371,7 +371,7 @@ impl<T: ConfigApplyTarget> ConfigController<T> {
 
         self.target.apply_in_place(&new, &diff)?;
 
-        self.versions.record_applied(new.version);
+        self.versions.record_applied(new.config().version);
         self.current = new;
         Ok(ApplyOutcome {
             tier: ApplyTier::InPlace,
@@ -411,7 +411,7 @@ impl ShardControlGroup {
         self.senders.is_empty()
     }
 
-    /// Send `config` + `routes` to every shard and block until all of
+    /// Send one loaded snapshot to every shard and block until all of
     /// them acknowledge.
     ///
     /// Returns `Ok(())` only when every shard reports success. If a
@@ -422,14 +422,12 @@ impl ShardControlGroup {
     /// shard does not mask failures from the others.
     pub fn broadcast_apply(
         &self,
-        config: Arc<Config>,
-        routes: RouteTableSnapshot,
+        loaded: Arc<LoadedConfig>,
         diff: ConfigDiff,
     ) -> Result<(), ApplyError> {
         self.broadcast(|ack| {
             ShardCommand::ApplyConfig(ShardApply {
-                config: config.clone(),
-                routes: routes.clone(),
+                loaded: loaded.clone(),
                 diff,
                 ack,
             })
@@ -528,10 +526,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::p2p::RouteTableSnapshot;
-
-    fn empty_routes() -> RouteTableSnapshot {
-        RouteTableSnapshot::default()
+    use crate::config::Config;
+    fn loaded(config: Config) -> Arc<LoadedConfig> {
+        Arc::new(LoadedConfig::from_config(config).unwrap())
     }
 
     fn control_group(senders: Vec<(WorkerIdx, Sender<ShardCommand>)>) -> ShardControlGroup {
@@ -591,11 +588,7 @@ mod tests {
         let (senders, joins) = spawn_mock_shards(vec![Ok(()), Ok(()), Ok(())]);
         let group = control_group(senders);
 
-        let out = group.broadcast_apply(
-            Arc::new(Config::default()),
-            empty_routes(),
-            ConfigDiff::default(),
-        );
+        let out = group.broadcast_apply(loaded(Config::default()), ConfigDiff::default());
         assert!(out.is_ok(), "expected success, got {out:?}");
 
         // Closing the group drops the senders so the mock shard threads
@@ -607,16 +600,38 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_apply_delivers_the_same_loaded_snapshot() {
+        let (tx, rx) = mpsc::channel::<ShardCommand>();
+        let group = control_group(vec![(WorkerIdx(0), tx)]);
+        let loaded = loaded(Config::default());
+        let expected = loaded.clone();
+        let join = thread::spawn(move || {
+            let ShardCommand::ApplyConfig(apply) = rx.recv().unwrap() else {
+                panic!("expected config apply");
+            };
+            assert!(Arc::ptr_eq(&apply.loaded, &expected));
+            apply
+                .ack
+                .send(ShardAck {
+                    worker: WorkerIdx(0),
+                    result: Ok(()),
+                })
+                .unwrap();
+        });
+
+        group
+            .broadcast_apply(loaded, ConfigDiff::default())
+            .unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
     fn broadcast_apply_reports_shard_failures() {
         let (senders, joins) = spawn_mock_shards(vec![Ok(()), Err("boom".to_string()), Ok(())]);
         let group = control_group(senders);
 
         let err = group
-            .broadcast_apply(
-                Arc::new(Config::default()),
-                empty_routes(),
-                ConfigDiff::default(),
-            )
+            .broadcast_apply(loaded(Config::default()), ConfigDiff::default())
             .expect_err("a failing shard must surface as an error");
         match err {
             ApplyError::ShardApply(failures) => {
@@ -639,11 +654,7 @@ mod tests {
         assert!(group.is_empty());
         assert!(
             group
-                .broadcast_apply(
-                    Arc::new(Config::default()),
-                    empty_routes(),
-                    ConfigDiff::default(),
-                )
+                .broadcast_apply(loaded(Config::default()), ConfigDiff::default(),)
                 .is_ok()
         );
     }
@@ -658,11 +669,7 @@ mod tests {
         let group = control_group(senders);
 
         let err = group
-            .broadcast_apply(
-                Arc::new(Config::default()),
-                empty_routes(),
-                ConfigDiff::default(),
-            )
+            .broadcast_apply(loaded(Config::default()), ConfigDiff::default())
             .expect_err("closed channel must error");
         assert!(matches!(err, ApplyError::ShardSend(WorkerIdx(99))));
         assert!(err.apply_state_is_indeterminate());
@@ -708,11 +715,7 @@ mod tests {
         );
 
         let error = group
-            .broadcast_apply(
-                Arc::new(Config::default()),
-                empty_routes(),
-                ConfigDiff::default(),
-            )
+            .broadcast_apply(loaded(Config::default()), ConfigDiff::default())
             .expect_err("missing acknowledgement must time out");
         assert!(matches!(
             error,
@@ -800,7 +803,7 @@ mod tests {
     impl ConfigApplyTarget for RecordingTarget {
         fn apply_in_place(
             &mut self,
-            _new: &Arc<Config>,
+            _new: &Arc<LoadedConfig>,
             diff: &ConfigDiff,
         ) -> Result<(), ApplyError> {
             self.last_diff = Some(*diff);
@@ -830,6 +833,10 @@ mod tests {
         c
     }
 
+    fn loaded_with_peer(version: u64) -> Arc<LoadedConfig> {
+        loaded(config_with_peer(version))
+    }
+
     fn tcp_peer(name: &str, addr: &str) -> crate::config::PeerSpec {
         crate::config::PeerSpec {
             name: name.to_string(),
@@ -844,7 +851,7 @@ mod tests {
 
     #[test]
     fn apply_no_change_runs_neither_tier() {
-        let base = Arc::new(config_with_peer(1));
+        let base = loaded_with_peer(1);
         let mut ctrl = ConfigController::new(RecordingTarget::default(), base.clone());
         assert_eq!(
             ctrl.config_versions().snapshot(),
@@ -860,7 +867,7 @@ mod tests {
         // advances both known and applied: the process is converged on it.
         let mut bumped = config_with_peer(1);
         bumped.version = 2;
-        let out = ctrl.apply(Arc::new(bumped)).unwrap();
+        let out = ctrl.apply(loaded(bumped)).unwrap();
         assert_eq!(out.tier, ApplyTier::NoChange);
         assert_eq!(ctrl.target_mut().in_place, 0);
         assert_eq!(ctrl.config_versions().known(), 2);
@@ -872,13 +879,13 @@ mod tests {
 
     #[test]
     fn apply_peer_change_takes_in_place_tier() {
-        let base = Arc::new(config_with_peer(1));
+        let base = loaded_with_peer(1);
         let mut ctrl = ConfigController::new(RecordingTarget::default(), base.clone());
 
         let mut next = config_with_peer(2);
         next.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
 
-        let out = ctrl.apply(Arc::new(next)).unwrap();
+        let out = ctrl.apply(loaded(next)).unwrap();
         assert_eq!(out.tier, ApplyTier::InPlace);
         assert_eq!(ctrl.target_mut().in_place, 1);
         assert!(
@@ -892,11 +899,11 @@ mod tests {
 
     #[test]
     fn apply_backend_change_takes_in_place_tier() {
-        let base = Arc::new(config_with_peer(1));
+        let base = loaded_with_peer(1);
         let mut ctrl = ConfigController::new(RecordingTarget::default(), base.clone());
 
         let mut next = config_with_peer(3);
-        next.backends.push(crate::config::schema::BackendSpec {
+        next.backends[0] = crate::config::schema::BackendSpec {
             name: "b".to_string(),
             config: Some(crate::config::backend_spec::Config::Http(
                 crate::config::HttpBackendConfig {
@@ -909,12 +916,12 @@ mod tests {
                     client_key_path: None,
                 },
             )),
-        });
+        };
 
         // A backend change is now reconciled in place on the live shard
         // layer (each shard rebuilds its origin-backend registry from the
         // broadcast config); it no longer rebuilds the shard layer.
-        let out = ctrl.apply(Arc::new(next)).unwrap();
+        let out = ctrl.apply(loaded(next)).unwrap();
         assert_eq!(out.tier, ApplyTier::InPlace);
         assert_eq!(ctrl.target_mut().in_place, 1);
         assert!(ctrl.target_mut().last_diff.unwrap().backends_changed);
@@ -923,7 +930,7 @@ mod tests {
 
     #[test]
     fn failed_apply_leaves_current_config_unchanged() {
-        let base = Arc::new(config_with_peer(1));
+        let base = loaded_with_peer(1);
         let target = RecordingTarget {
             fail_in_place: true,
             ..RecordingTarget::default()
@@ -932,12 +939,15 @@ mod tests {
 
         let mut next = config_with_peer(5);
         next.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
-        let next = Arc::new(next);
+        let next = loaded(next);
 
         assert!(ctrl.apply(next.clone()).is_err());
         // Current must still be the original so a retry re-derives the
         // same diff.
-        assert_eq!(ctrl.current().peers.len(), base.peers.len());
+        assert_eq!(
+            ctrl.current().config().peers.len(),
+            base.config().peers.len()
+        );
         // A failed apply records the version as known (we loaded it) but
         // must NOT advance the applied version: the process did not
         // converge on the submitted config.
@@ -947,7 +957,7 @@ mod tests {
 
     #[test]
     fn config_version_handle_observes_later_applies() {
-        let base = Arc::new(config_with_peer(1));
+        let base = loaded_with_peer(1);
         let mut ctrl = ConfigController::new(RecordingTarget::default(), base.clone());
 
         // A handle taken early must observe applies that happen later,
@@ -964,7 +974,7 @@ mod tests {
 
         let mut next = config_with_peer(11);
         next.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
-        ctrl.apply(Arc::new(next)).unwrap();
+        ctrl.apply(loaded(next)).unwrap();
 
         assert_eq!(versions.known(), 11);
         assert_eq!(versions.applied(), 11);
@@ -980,7 +990,7 @@ mod tests {
 
     #[test]
     fn startup_version_is_pinned_across_applies_and_failures() {
-        let base = Arc::new(config_with_peer(1));
+        let base = loaded_with_peer(1);
         let target = RecordingTarget {
             fail_in_place: true,
             ..RecordingTarget::default()
@@ -991,7 +1001,7 @@ mod tests {
         // A failed apply advances known but neither applied nor startup.
         let mut failing = config_with_peer(7);
         failing.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
-        assert!(ctrl.apply(Arc::new(failing)).is_err());
+        assert!(ctrl.apply(loaded(failing)).is_err());
         assert_eq!(ctrl.config_versions().known(), 7);
         assert_eq!(ctrl.config_versions().applied(), 1);
         assert_eq!(ctrl.config_versions().startup(), 1);
@@ -1001,7 +1011,7 @@ mod tests {
         ctrl.target_mut().fail_in_place = false;
         let mut next = config_with_peer(8);
         next.peers.push(tcp_peer("node-c", "127.0.0.1:9997"));
-        ctrl.apply(Arc::new(next)).unwrap();
+        ctrl.apply(loaded(next)).unwrap();
         assert_eq!(ctrl.config_versions().applied(), 8);
         assert_eq!(ctrl.config_versions().startup(), 1);
     }

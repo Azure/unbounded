@@ -25,13 +25,13 @@ use std::time::Duration;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::load;
-use super::schema::Config;
+use super::load::LoadedConfig;
 
 const DEBOUNCE: Duration = Duration::from_millis(200);
 
 #[derive(Debug)]
 pub struct ConfigUpdate {
-    pub config: Arc<Config>,
+    pub loaded: Arc<LoadedConfig>,
     pub generation: u64,
 }
 
@@ -161,10 +161,10 @@ fn debounce_loop(
             }
         }
         match load::load(Path::new(&path)) {
-            Ok(cfg) => {
+            Ok(loaded) => {
                 generation = generation.wrapping_add(1);
                 let update = ConfigUpdate {
-                    config: Arc::new(cfg),
+                    loaded: Arc::new(loaded),
                     generation,
                 };
                 if update_tx.send(update).is_err() {
@@ -374,7 +374,7 @@ name = "b"
         write(&path, VALID_B);
         let update = recv_within(&rx, Duration::from_secs(3))
             .expect("a valid modification must yield a ConfigUpdate");
-        assert_eq!(update.config.fingers_per_node, Some(5678));
+        assert_eq!(update.loaded.config().fingers_per_node, Some(5678));
         assert!(update.generation >= 1, "generation must advance");
 
         // (2a) An unrelated sibling write is filtered out.
@@ -390,7 +390,7 @@ name = "b"
         write(&path, VALID_A);
         let update = recv_within(&rx, Duration::from_secs(3))
             .expect("a config change after a sibling write must still emit");
-        assert_eq!(update.config.fingers_per_node, Some(1234));
+        assert_eq!(update.loaded.config().fingers_per_node, Some(1234));
     }
 
     fn event_for(paths: &[&Path]) -> notify::Event {

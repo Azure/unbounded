@@ -18,7 +18,7 @@ use clap::Parser;
 use unbounded_storage::backend::BackendRegistry;
 use unbounded_storage::bufferpool::{Pool, PoolConfig};
 use unbounded_storage::config::{
-    self, BackendSpec, Config, FrontendSpec, ResolvedFrontendBinding, frontend_spec,
+    self, BackendSpec, Config, FrontendSpec, LoadedConfig, ResolvedFrontendBinding, frontend_spec,
 };
 use unbounded_storage::fabric::{self, Fabric, MrHandle, Provider};
 use unbounded_storage::fanout::{
@@ -27,11 +27,7 @@ use unbounded_storage::fanout::{
 use unbounded_storage::frontend::{
     HttpDriver, HttpFrontend, LoadgenDriver, LoadgenFrontend, S3Driver, S3Frontend,
 };
-use unbounded_storage::p2p::{
-    FingerTable, FingerTableConfig, PeerEntry, RouteTableHandle, RouteTableSnapshot,
-    RoutedTransport, TopologyPrefixWeight, TopologySelection, TopologyTags, TopologyWeighting,
-    node_to_ring,
-};
+use unbounded_storage::p2p::{RouteTableHandle, RoutedTransport};
 use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
 use unbounded_storage::storage::StripeReq;
@@ -223,7 +219,7 @@ fn main() -> ExitCode {
         None => (PathBuf::from(DEFAULT_CONFIG_PATH), false),
     };
 
-    let config = match load_config(&config_path, config_explicit) {
+    let loaded = match load_config(&config_path, config_explicit) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("config error: {e}");
@@ -237,7 +233,7 @@ fn main() -> ExitCode {
     // allocation, and only take effect at process start. `load_config`
     // has already run `apply_defaults`, so every startup field is
     // populated with its documented default when omitted.
-    let startup = config.startup();
+    let startup = loaded.config().startup();
     let memory = startup.memory();
     let fabric_cfg = startup.fabric();
     // The metrics exporter addr is a startup-fixed knob; capture
@@ -411,7 +407,8 @@ fn main() -> ExitCode {
 
     // Prepare the initial shard layer through phase B. The shards remain
     // parked and RPC serving stays off until initial disks are published.
-    let prepared = match shard_layer::prepare_shard_layer(&config, &deps) {
+    let loaded = Arc::new(loaded);
+    let prepared = match shard_layer::prepare_shard_layer(loaded.clone(), &deps) {
         Ok(prepared) => prepared,
         Err(errs) => {
             for e in &errs {
@@ -423,9 +420,7 @@ fn main() -> ExitCode {
     // Reconcile and publish the startup disk set before any frontend or
     // recursive RPC path can serve. Individual disk-open failures remain
     // nonfatal and the successfully opened subset is published.
-    let projection =
-        config::runtime_projection(&config).expect("loaded config projects to runtime");
-    reconcile_cache_disks(&mut disk_registry, &cache_directories, &projection);
+    reconcile_cache_disks(&mut disk_registry, &cache_directories, loaded.runtime());
 
     let layer = match shard_layer::activate_shard_layer(prepared) {
         Ok(layer) => layer,
@@ -459,7 +454,7 @@ fn main() -> ExitCode {
     // loaded and applied; the startup version stays pinned to the config
     // realized here at process start, since the `[startup]` knobs it
     // tracks only take effect on restart.
-    let mut controller = config::ConfigController::new(target, Arc::new(config));
+    let mut controller = config::ConfigController::new(target, loaded);
 
     // Start the Prometheus exporter once the controller exists, so it can
     // publish the live config-version gauges. A bind failure is logged
@@ -495,8 +490,8 @@ fn main() -> ExitCode {
             while !SHUTDOWN.load(Ordering::Acquire) {
                 match update_rx.recv_timeout(SHUTDOWN_POLL) {
                     Ok(update) => {
-                        let version = update.config.version;
-                        match controller.apply(update.config.clone()) {
+                        let version = update.loaded.config().version;
+                        match controller.apply(update.loaded.clone()) {
                             Ok(outcome) => eprintln!(
                                 "config: applied gen={} version={} tier={:?}",
                                 update.generation, version, outcome.tier
@@ -564,9 +559,7 @@ fn run_shard(
     bytes_per_shard: usize,
     cache_directories: Arc<CacheDirectorySet>,
     routes: RouteTableHandle,
-    frontend_specs: Arc<Vec<FrontendSpec>>,
-    frontend_bindings: Arc<HashMap<String, ResolvedFrontendBinding>>,
-    backend_specs: Arc<Vec<BackendSpec>>,
+    loaded: Arc<LoadedConfig>,
     ctrl_rx: mpsc::Receiver<config::ShardCommand>,
     peer_rx: mpsc::Receiver<Arc<Vec<PeerPublish>>>,
     phaseb_tx: mpsc::Sender<PhaseBReport>,
@@ -574,6 +567,9 @@ fn run_shard(
     terminal_tx: mpsc::Sender<ShardTerminalReport>,
     layer_stop: Arc<AtomicBool>,
 ) {
+    let frontend_specs = &loaded.config().frontends;
+    let frontend_bindings = &loaded.runtime().frontends;
+    let backend_specs = &loaded.config().backends;
     let phase_a = PhaseAReporter::new(widx, tx);
     // The fabric endpoint is built and owned by the `FabricGroup` in the
     // shard layer and shared by every shard mapped onto it (one per shard
@@ -855,7 +851,7 @@ fn run_shard(
         fanout: fanout.clone(),
         geometry: geometry.clone(),
         routes: routes.clone(),
-        bindings: Rc::new(RefCell::new((*frontend_bindings).clone())),
+        bindings: Rc::new(RefCell::new(frontend_bindings.clone())),
         page_size,
         worker_idx: widx.0,
         waker: shard_loop.waker(),
@@ -895,31 +891,18 @@ fn run_shard(
             .iter()
             .map(|f| (f.name.clone(), f.clone()))
             .collect();
-        let mut last_bindings: HashMap<String, ResolvedFrontendBinding> =
-            (*frontend_bindings).clone();
+        let mut last_bindings: HashMap<String, ResolvedFrontendBinding> = frontend_bindings.clone();
         shard_loop.add_tick_hook(move || {
             let mut did_work = false;
             while let Ok(cmd) = ctrl_rx.try_recv() {
                 match cmd {
                     config::ShardCommand::ApplyConfig(apply) => {
-                        routes.store_snapshot(apply.routes.clone());
+                        routes.store_snapshot(apply.loaded.routes().clone());
 
-                        let projection = match config::runtime_projection(&apply.config) {
-                            Ok(projection) => projection,
-                            Err(e) => {
-                                let _ = apply.ack.send(config::ShardAck {
-                                    worker: widx,
-                                    result: Err(format!("config projection failed: {e}")),
-                                });
-                                did_work = true;
-                                continue;
-                            }
-                        };
-
-                        let desired_backends = apply.config.backends.as_slice();
-                        let desired_frontends = apply.config.frontends.as_slice();
+                        let desired_backends = apply.loaded.config().backends.as_slice();
+                        let desired_frontends = apply.loaded.config().frontends.as_slice();
                         let desired_frontend_backends =
-                            config::frontend_backend_map(&projection.frontends);
+                            config::frontend_backend_map(&apply.loaded.runtime().frontends);
                         // Refresh stripe geometry before building any
                         // frontend so a co-applied backend stripe change
                         // is visible to a frontend add in the same pass.
@@ -933,13 +916,13 @@ fn run_shard(
 
                         let frontends_to_rebuild = frontend_rebuild_ids(
                             &last_bindings,
-                            &projection.frontends,
+                            &apply.loaded.runtime().frontends,
                             &last_backends,
                             desired_backends,
                         );
                         let forced_frontend_updates: HashSet<String> =
                             frontends_to_rebuild.into_iter().collect();
-                        *bindings.borrow_mut() = projection.frontends.clone();
+                        *bindings.borrow_mut() = apply.loaded.runtime().frontends.clone();
 
                         // Drive the transport backend registry and the
                         // frontend registry together so frontend adds are
@@ -971,7 +954,7 @@ fn run_shard(
                         for (id, spec) in &last_frontends {
                             let desired_spec = desired_frontends.iter().find(|f| f.name == *id);
                             if desired_spec == Some(spec) {
-                                if let Some(binding) = projection.frontends.get(id) {
+                                if let Some(binding) = apply.loaded.runtime().frontends.get(id) {
                                     applied_bindings.insert(id.clone(), binding.clone());
                                     continue;
                                 }
@@ -1089,86 +1072,6 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> &str {
         s.as_str()
     } else {
         "non-string panic payload"
-    }
-}
-
-fn build_routes(config: &Config) -> RouteTableSnapshot {
-    let projection = config::runtime_projection(config).expect("loaded config projects to runtime");
-    if projection.caches.is_empty() {
-        return RouteTableSnapshot {
-            cache_ids: HashSet::new(),
-            fingers: None,
-        };
-    }
-
-    let mesh = &projection.mesh;
-    let local = PeerEntry {
-        node: mesh.self_node_id,
-        ring: node_to_ring(mesh.self_node_id),
-        tags: TopologyTags(mesh.self_tags.clone()),
-    };
-    let fingers = if let Some(plan) = &mesh.routing_plan {
-        let peer_by_name: HashMap<&str, &config::RuntimePeer> = mesh
-            .peers
-            .iter()
-            .map(|peer| (peer.name.as_str(), peer))
-            .collect();
-        let entry_of = |name: &str| {
-            let peer = peer_by_name
-                .get(name)
-                .expect("validated routing_plan names reference peers");
-            PeerEntry {
-                node: peer.node_id,
-                ring: node_to_ring(peer.node_id),
-                tags: TopologyTags(peer.spec.tags.clone()),
-            }
-        };
-        Arc::new(FingerTable::from_explicit(
-            local,
-            plan.fingers.iter().map(|name| entry_of(name)).collect(),
-            plan.successor.as_deref().map(entry_of),
-            plan.predecessor.as_deref().map(entry_of),
-        ))
-    } else {
-        let peers: Vec<PeerEntry> = mesh
-            .peers
-            .iter()
-            .map(|peer| PeerEntry {
-                node: peer.node_id,
-                ring: node_to_ring(peer.node_id),
-                tags: TopologyTags(peer.spec.tags.clone()),
-            })
-            .collect();
-        Arc::new(FingerTable::build(
-            local,
-            &peers,
-            FingerTableConfig {
-                k: mesh.fingers_per_node.max(1),
-                topology: mesh
-                    .topology_weighting
-                    .as_ref()
-                    .map(p2p_topology_weighting)
-                    .map(TopologySelection::Weighted)
-                    .unwrap_or_default(),
-            },
-        ))
-    };
-    RouteTableSnapshot {
-        cache_ids: projection.caches.keys().cloned().collect(),
-        fingers: Some(fingers),
-    }
-}
-
-fn p2p_topology_weighting(weighting: &config::TopologyWeighting) -> TopologyWeighting {
-    TopologyWeighting {
-        prefix_weights: weighting
-            .prefix_weights
-            .iter()
-            .map(|weight| TopologyPrefixWeight {
-                tag_index: weight.tag_index,
-                weight: weight.weight,
-            })
-            .collect(),
     }
 }
 
@@ -1690,11 +1593,15 @@ struct Cli {
 /// the file is absent, fall back to [`Config::default`] with a
 /// warning. Any other failure - including explicit missing paths and
 /// parse errors - is fatal.
-fn load_config(path: &Path, explicit: bool) -> Result<Config, String> {
-    match Config::load(path) {
+fn load_config(path: &Path, explicit: bool) -> Result<LoadedConfig, String> {
+    match LoadedConfig::load(path) {
         Ok(c) => {
             if path.extension().and_then(|e| e.to_str()) == Some("binpb") {
-                eprintln!("config: loaded {} (binpb):\n{c:#?}", path.display());
+                eprintln!(
+                    "config: loaded {} (binpb):\n{:#?}",
+                    path.display(),
+                    c.config()
+                );
             }
             Ok(c)
         }
@@ -1710,9 +1617,8 @@ fn load_config(path: &Path, explicit: bool) -> Result<Config, String> {
             // (`startup()`, `p2p()`, ...) would panic. Promote the proto3
             // zero values to documented defaults exactly as the on-disk
             // path does.
-            let mut c = Config::default();
-            c.apply_defaults();
-            Ok(c)
+            LoadedConfig::from_config(Config::default())
+                .map_err(|e| format!("loading built-in defaults: {e}"))
         }
         Err(e) => Err(format!("loading {}: {e}", path.display())),
     }
@@ -2057,11 +1963,11 @@ mod tests {
         let cfg = load_config(path, false).expect("missing default path falls back to defaults");
         // These accessors panic if defaults were not applied.
         assert_eq!(
-            cfg.startup().fabric().default_listen_addr(),
+            cfg.config().startup().fabric().default_listen_addr(),
             Some("0.0.0.0:0")
         );
         assert_eq!(
-            cfg.startup().memory().memory_total_bytes,
+            cfg.config().startup().memory().memory_total_bytes,
             Some(128 * 1024 * 1024)
         );
     }
