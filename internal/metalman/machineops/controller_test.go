@@ -371,6 +371,79 @@ func TestReconcilerPowersOnHostReplaceTargetWhenOff(t *testing.T) {
 	require.Equal(t, []string{"machine-1:SetBootOverride:Pxe:Continuous", "machine-1:On"}, power.calls)
 }
 
+func TestReconcilerFallsBackToBIOSHTTPBootURIForHostReplace(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	op := testOperation("op-replace-http", v1alpha3.OperationHostReplace)
+	op.Spec.MachineRef = machine.Name
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
+	power := &recordingPowerClient{httpBootUnsupported: map[string]bool{machine.Name: true}}
+	reconciler := testReconciler(c, power, "rack-a")
+	reconciler.HTTPBootURL = func(m *v1alpha3.Machine) (string, error) {
+		require.Equal(t, machine.Name, m.Name)
+
+		return "http://10.0.0.10:8880/http/shimx64.efi", nil
+	}
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var inProgress v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &inProgress))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, inProgress.Status.Phase)
+	require.Len(t, inProgress.Status.Targets, 1)
+	require.Equal(t, v1alpha3.OperationStageWaitingRepave, inProgress.Status.Targets[0].Stage)
+	require.Equal(t, []string{
+		"machine-1:GetBootConfig",
+		"machine-1:SetHTTPBootOverride:http://10.0.0.10:8880/http/shimx64.efi",
+		"machine-1:SetBIOSHTTPBootURI:http://10.0.0.10:8880/http/shimx64.efi",
+		"machine-1:SetBootOverride:UefiHttp:Once",
+		"machine-1:ForceRestart",
+	}, power.calls)
+}
+
+func TestReconcilerUsesBIOSHTTPBootURIWhenStandardURIAbsent(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	op := testOperation("op-replace-http-bios", v1alpha3.OperationHostReplace)
+	op.Spec.MachineRef = machine.Name
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
+	power := &recordingPowerClient{httpBootURIAbsent: map[string]bool{machine.Name: true}}
+	reconciler := testReconciler(c, power, "rack-a")
+	reconciler.HTTPBootURL = func(m *v1alpha3.Machine) (string, error) {
+		require.Equal(t, machine.Name, m.Name)
+
+		return "http://10.0.0.10:8880/http/shimx64.efi", nil
+	}
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var inProgress v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &inProgress))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, inProgress.Status.Phase)
+	require.Len(t, inProgress.Status.Targets, 1)
+	require.Equal(t, v1alpha3.OperationStageWaitingRepave, inProgress.Status.Targets[0].Stage)
+	require.Equal(t, []string{
+		"machine-1:GetBootConfig",
+		"machine-1:SetBIOSHTTPBootURI:http://10.0.0.10:8880/http/shimx64.efi",
+		"machine-1:SetBootOverride:UefiHttp:Once",
+		"machine-1:ForceRestart",
+	}, power.calls)
+}
+
 func TestReconcilerRestoresMissingHostReplaceTriggerConditions(t *testing.T) {
 	t.Parallel()
 
@@ -823,6 +896,8 @@ type recordingPowerClient struct {
 	mu                     sync.Mutex
 	states                 map[string]redfish.PowerState
 	disableBootUnsupported map[string]bool
+	httpBootUnsupported    map[string]bool
+	httpBootURIAbsent      map[string]bool
 	calls                  []string
 }
 
@@ -889,11 +964,32 @@ func (c *recordingMachinePowerClient) SetBootOverride(_ context.Context, target 
 	return nil
 }
 
+func (c *recordingMachinePowerClient) GetBootConfig(context.Context) (redfish.BootConfig, error) {
+	c.parent.mu.Lock()
+	defer c.parent.mu.Unlock()
+
+	c.parent.calls = append(c.parent.calls, fmt.Sprintf("%s:GetBootConfig", c.machine))
+
+	return redfish.BootConfig{HasHTTPBootURI: !c.parent.httpBootURIAbsent[c.machine]}, nil
+}
+
 func (c *recordingMachinePowerClient) SetHTTPBootOverride(_ context.Context, bootURL string) error {
 	c.parent.mu.Lock()
 	defer c.parent.mu.Unlock()
 
 	c.parent.calls = append(c.parent.calls, fmt.Sprintf("%s:SetHTTPBootOverride:%s", c.machine, bootURL))
+	if c.parent.httpBootUnsupported[c.machine] {
+		return fmt.Errorf("http boot unsupported: %w", redfish.ErrUnsupported)
+	}
+
+	return nil
+}
+
+func (c *recordingMachinePowerClient) SetBIOSHTTPBootURI(_ context.Context, bootURL string) error {
+	c.parent.mu.Lock()
+	defer c.parent.mu.Unlock()
+
+	c.parent.calls = append(c.parent.calls, fmt.Sprintf("%s:SetBIOSHTTPBootURI:%s", c.machine, bootURL))
 
 	return nil
 }

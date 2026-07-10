@@ -303,6 +303,119 @@ func TestHTTPServer_HTTPBootLoaderRequiresActiveInstallOperation(t *testing.T) {
 	}
 }
 
+func TestHTTPServer_MissingOptionalShimRevocationsFilesHTTPBoot(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "revocations123", map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: shimx64.efi\n"),
+		"shimx64.efi":   []byte("shim"),
+	})
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-revocations"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:        "ghcr.io/test/image:v1",
+				BootProtocol: v1alpha3.PXEBootProtocolHTTP,
+				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:11", IPv4: "10.0.1.61", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	srv := &HTTPServer{
+		FileResolver: FileResolver{
+			Cache:  cache,
+			Reader: fc,
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", srv.handleFile)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	tests := []struct {
+		path       string
+		wantStatus int
+		wantBody   []byte
+	}{
+		{path: "revocations.efi", wantStatus: http.StatusOK, wantBody: []byte(shimRevocationsNotPresentBody)},
+		{path: "revocations_sbat.efi", wantStatus: http.StatusOK, wantBody: []byte(shimRevocationsNotPresentBody)},
+		{path: "revocations_sku.efi", wantStatus: http.StatusOK, wantBody: []byte(shimRevocationsNotPresentBody)},
+		{path: "nested/revocations.efi", wantStatus: http.StatusOK, wantBody: []byte(shimRevocationsNotPresentBody)},
+		{path: "missing.efi", wantStatus: http.StatusNotFound},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", ts.URL+"/"+tt.path, nil)
+			req.Header.Set("X-Forwarded-For", "10.0.1.61")
+
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			require.NoError(t, err)
+
+			require.Equal(t, tt.wantStatus, resp.StatusCode)
+
+			if tt.wantBody != nil {
+				require.Equal(t, tt.wantBody, body)
+				require.Equal(t, fmt.Sprint(len(tt.wantBody)), resp.Header.Get("Content-Length"))
+			}
+		})
+	}
+}
+
+func TestHTTPServer_MissingShimRevocationsFilePXEStill404(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "pxerevocations123", map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
+		"shimx64.efi":   []byte("shim"),
+	})
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-pxe-revocations"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:12", IPv4: "10.0.1.62", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	srv := &HTTPServer{
+		FileResolver: FileResolver{
+			Cache:  cache,
+			Reader: fc,
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", srv.handleFile)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/revocations.efi", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.1.62")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
 func TestHTTPServer_TemplateRendered(t *testing.T) {
 	bootTemplate := `set default=0
 menuentry "Install" {
