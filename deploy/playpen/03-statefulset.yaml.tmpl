@@ -1,0 +1,115 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: playpen
+  namespace: {{ default "unbounded-kube" .Namespace }}
+  labels:
+    app.kubernetes.io/name: playpen
+spec:
+  serviceName: playpen
+  replicas: {{ default "1" .Replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: playpen
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: playpen
+    spec:
+      serviceAccountName: playpen
+      containers:
+        - name: playpen
+          image: {{ default "ghcr.io/azure/playpen:latest" .Image | quote }}
+          imagePullPolicy: {{ default "IfNotPresent" .ImagePullPolicy }}
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            runAsUser: 0
+          args:
+            - server
+            - --vxlan-remote={{ .VXLANRemote }}
+            - --vxlan-vni={{ default "1" .VXLANVNI }}
+            - --vxlan-port={{ default "4789" .VXLANPort }}
+            - --cpus={{ default "2" .CPUs }}
+            - --memory={{ default "2048M" .Memory }}
+            - --mac-identity=$(PLAYPEN_POD_NAMESPACE)/$(PLAYPEN_POD_NAME)
+            - --disk=/var/lib/playpen/disk.raw
+            - --disk-size={{ default "20G" .DiskSize }}
+            - --bmc-listen=:{{ default "8443" .BMCPort }}
+            - --bmc-username={{ default "admin" .BMCUsername }}
+            - --bmc-password=$(PLAYPEN_BMC_PASSWORD)
+            - --bmc-device-id={{ default "1" .BMCDeviceID }}
+            - --mtu={{ default "1360" .MTU }}
+            {{- if .Arch }}
+            - --arch={{ .Arch }}
+            {{- end }}
+            {{- if .VXLANLocal }}
+            - --vxlan-local={{ .VXLANLocal }}
+            {{- end }}
+            {{- if .UEFICode }}
+            - --uefi-code={{ .UEFICode }}
+            {{- end }}
+            {{- if .UEFIVars }}
+            - --uefi-vars={{ .UEFIVars }}
+            {{- end }}
+            {{- if .QEMUBinary }}
+            - --qemu-binary={{ .QEMUBinary }}
+            {{- end }}
+          ports:
+            - containerPort: {{ default "4789" .VXLANPort }}
+              name: vxlan
+              protocol: UDP
+            - containerPort: {{ default "8443" .BMCPort }}
+              name: redfish
+              protocol: TCP
+          env:
+            - name: PLAYPEN_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: PLAYPEN_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PLAYPEN_BMC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: playpen-bmc
+                  key: password
+          resources:
+            requests:
+              cpu: {{ default "500m" .ResourceCPURequest }}
+              memory: {{ default "256Mi" .ResourceMemoryRequest }}
+            limits:
+              cpu: {{ default "4" .ResourceCPULimit }}
+              memory: {{ default "4Gi" .ResourceMemoryLimit }}
+          volumeMounts:
+            - name: dev-kvm
+              mountPath: /dev/kvm
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
+            - name: run-playpen
+              mountPath: /run/playpen
+            - name: guest-disk
+              mountPath: /var/lib/playpen
+      volumes:
+        - name: dev-kvm
+          hostPath:
+            path: /dev/kvm
+            type: CharDevice
+        - name: dev-net-tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+        - name: run-playpen
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: guest-disk
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ default "24Gi" .DiskStorage | quote }}

@@ -174,6 +174,32 @@ ORCA_DEV_IMAGE ?= ghcr.io/azure/orca:dev
 # the default in hack/orca/kind-up.sh.
 ORCA_KIND_CLUSTER ?= orca-dev
 
+# Playpen configuration
+PLAYPEN_BIN=bin/playpen
+PLAYPEN_CMD=./cmd/playpen
+PLAYPEN_IMAGE ?= $(CONTAINER_REGISTRY)/playpen:$(VERSION)
+PLAYPEN_NAMESPACE ?= unbounded-kube
+PLAYPEN_REPLICAS ?= 1
+PLAYPEN_MANIFEST_TEMPLATES_DIR := deploy/playpen
+PLAYPEN_MANIFEST_RENDERED_DIR  := deploy/playpen/rendered
+PLAYPEN_VXLAN_REMOTE ?=
+PLAYPEN_VXLAN_LOCAL ?=
+PLAYPEN_VXLAN_VNI ?= 1
+PLAYPEN_VXLAN_PORT ?= 4789
+PLAYPEN_CPUS ?= 2
+PLAYPEN_MEMORY ?= 2048M
+PLAYPEN_DISK_SIZE ?= 20G
+PLAYPEN_DISK_STORAGE ?= 24Gi
+PLAYPEN_BMC_PORT ?= 8443
+PLAYPEN_BMC_USERNAME ?= admin
+PLAYPEN_BMC_PASSWORD ?= playpen
+PLAYPEN_BMC_DEVICE_ID ?= 1
+PLAYPEN_MTU ?= 1360
+PLAYPEN_ARCH ?=
+PLAYPEN_QEMU_BINARY ?=
+PLAYPEN_UEFI_CODE ?=
+PLAYPEN_UEFI_VARS ?=
+
 # kubectl-unbounded also stamps the metalman image reference.
 KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
 
@@ -209,16 +235,16 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build playpen playpen-build playpen-e2e playpen-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
-.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
+.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push image-playpen-local image-playpen-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
 
 ##@ General
 
-all: kubectl-unbounded forge machina machine-ops-controller unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded forge machina machine-ops-controller unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry playpen ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -264,6 +290,8 @@ help: ## Show this help
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
 	@echo "  unbounded-storage-supervisor | unbounded-storage-supervisor-build  Build the storage supervisor (with/without lint/test)"
+	@echo "  playpen | playpen-build          Build the playpen server/client CLI (with/without lint/test)"
+	@echo "  playpen-e2e                     Run the kind, VXLAN, dnsmasq, and Alpine PXE smoke test"
 	@echo ""
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
@@ -304,6 +332,8 @@ help: ## Show this help
 	@echo "  metalman-oci-push                Build metalman image and push"
 	@echo "  image-orca-local                 Build orca image"
 	@echo "  orca-oci-push                    Build orca image and push"
+	@echo "  image-playpen-local              Build playpen image"
+	@echo "  image-playpen-push               Build and push playpen image"
 	@echo ""
 	@echo "Net Frontend:"
 	@echo "  net-frontend                     Build frontend into \$$(NET_FRONTEND_DIST_DIR) (cached)"
@@ -319,6 +349,7 @@ help: ## Show this help
 	@echo "  machine-ops-manifests            Render machine-ops manifests into deploy/machine-ops/rendered"
 	@echo "  net-manifests                    Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
 	@echo "  orca-manifests                   Render orca manifests into deploy/orca/rendered"
+	@echo "  playpen-manifests                Render playpen manifests into deploy/playpen/rendered"
 	@echo "  unbounded-storage-supervisor-manifests  Render storage supervisor manifests into deploy/unbounded-storage-supervisor/rendered"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
@@ -426,24 +457,24 @@ lint: ## Run golangci-lint (matches CI; run `make fmt` to auto-fix)
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-test: machina-manifests machine-ops-manifests net-manifests ## Run all tests with race detector
+test: machina-manifests machine-ops-manifests net-manifests playpen-manifests ## Run all tests with race detector
 	$(GOTEST) -race $(GO_PACKAGES)
 
 else
 # Locally, chain test -> lint for convenience.
 
-test: lint machina-manifests machine-ops-manifests net-manifests ## Run all tests (implies lint)
+test: lint machina-manifests machine-ops-manifests net-manifests playpen-manifests ## Run all tests (implies lint)
 	$(GOTEST) $(GO_PACKAGES)
 
 endif
 
-build: machina-manifests machine-ops-manifests net-manifests ## Build all Go packages
+build: machina-manifests machine-ops-manifests net-manifests playpen-manifests ## Build all Go packages
 	$(GOBUILD) $(GO_PACKAGES)
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate $(GO_PACKAGES)
 
-vulncheck: machina-manifests machine-ops-manifests net-manifests ## Run govulncheck for known vulnerabilities
+vulncheck: machina-manifests machine-ops-manifests net-manifests playpen-manifests ## Run govulncheck for known vulnerabilities
 	@# GO-2024-3218 (libp2p/go-libp2p-kad-dht): all versions affected, no fix
 	@# available. Theoretical DHT content-censorship attack, not exploitable in
 	@# gantry's private-cluster deployment model. Tracked upstream at
@@ -580,6 +611,14 @@ gantry-build: ## Build the gantry binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(GANTRY_BIN) $(GANTRY_CMD)
 
 gantry: test gantry-build ## Build gantry (implies test)
+
+playpen-build: ## Build the playpen binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(PLAYPEN_BIN) $(PLAYPEN_CMD)
+
+playpen: test playpen-build ## Build playpen (implies test)
+
+playpen-e2e: ## Run the privileged local kind PXE smoke test
+	hack/playpen/e2e.sh
 
 unbounded-storage-supervisor-build: ## Build the unbounded-storage-supervisor binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_STORAGE_SUPERVISOR_BIN) $(UNBOUNDED_STORAGE_SUPERVISOR_CMD)
@@ -1007,6 +1046,18 @@ image-gantry-local: ## Build the gantry container image locally (single-arch)
 image-gantry-push: image-gantry-local ## Build and push the gantry container image
 	$(CONTAINER_ENGINE) push $(GANTRY_IMAGE)
 
+image-playpen-local: ## Build the playpen container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t playpen:$(VERSION) -t $(PLAYPEN_IMAGE) \
+		-f ./images/playpen/Containerfile .
+	$(call trivy-maybe,$(PLAYPEN_IMAGE))
+
+image-playpen-push: image-playpen-local ## Build and push the playpen container image
+	$(CONTAINER_ENGINE) push $(PLAYPEN_IMAGE)
+
 ##@ Orca
 
 .PHONY: orca orca-build orca-manifests orca-oci orca-oci-push \
@@ -1040,6 +1091,34 @@ orca-oci: image-orca-local ## Alias for image-orca-local
 
 orca-oci-push: orca-oci ## Build and push the orca container image
 	$(CONTAINER_ENGINE) push $(ORCA_IMAGE)
+
+playpen-manifests: ## Render playpen deployment manifests into deploy/playpen/rendered
+	@mkdir -p $(PLAYPEN_MANIFEST_RENDERED_DIR)
+	@find $(PLAYPEN_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete 2>/dev/null || true
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(PLAYPEN_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(PLAYPEN_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(PLAYPEN_NAMESPACE) \
+		--set Replicas=$(PLAYPEN_REPLICAS) \
+		--set Image=$(PLAYPEN_IMAGE) \
+		--set VXLANRemote=$(PLAYPEN_VXLAN_REMOTE) \
+		--set VXLANLocal=$(PLAYPEN_VXLAN_LOCAL) \
+		--set VXLANVNI=$(PLAYPEN_VXLAN_VNI) \
+		--set VXLANPort=$(PLAYPEN_VXLAN_PORT) \
+		--set CPUs=$(PLAYPEN_CPUS) \
+		--set Memory=$(PLAYPEN_MEMORY) \
+		--set DiskSize=$(PLAYPEN_DISK_SIZE) \
+		--set DiskStorage=$(PLAYPEN_DISK_STORAGE) \
+		--set BMCPort=$(PLAYPEN_BMC_PORT) \
+		--set BMCUsername=$(PLAYPEN_BMC_USERNAME) \
+		--set BMCPassword=$(PLAYPEN_BMC_PASSWORD) \
+		--set BMCDeviceID=$(PLAYPEN_BMC_DEVICE_ID) \
+		--set MTU=$(PLAYPEN_MTU) \
+		--set Arch=$(PLAYPEN_ARCH) \
+		--set QEMUBinary=$(PLAYPEN_QEMU_BINARY) \
+		--set UEFICode=$(PLAYPEN_UEFI_CODE) \
+		--set UEFIVars=$(PLAYPEN_UEFI_VARS)
+	@echo "Rendered playpen manifests into $(PLAYPEN_MANIFEST_RENDERED_DIR) (image: $(PLAYPEN_IMAGE))"
 
 # Dev install entrypoints. There is exactly one supported install
 # path: ./hack/orca/setup-orca.sh. The Make targets below are thin

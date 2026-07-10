@@ -1,0 +1,3 @@
+# rendered manifests are gitignored; produced by `make playpen-manifests`.
+*
+!.gitignore
