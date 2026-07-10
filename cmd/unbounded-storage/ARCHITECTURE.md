@@ -178,8 +178,10 @@ shutdown; teardown drains terminal reports and returns a failing process status
 instead of continuing with a missing shard.
 
 Backend and frontend reloads construct replacements before swapping them into
-their shard-local registries. A failed replacement therefore leaves the prior
-resource, binding, and stripe geometry live and retryable. This is a
+their shard-local registries. Network frontends first validate and bind a
+dormant `SO_REUSEPORT` socket, then enter the listening state only during
+activation. A failed preparation therefore leaves the prior resource, binding,
+and stripe geometry live and retryable. This is a
 per-resource guarantee; route, peer, shard, and disk publication across the
 whole process is not yet one transaction.
 
@@ -220,10 +222,11 @@ per-shard `!Send` object graph:
    `LiveShardLocalStore` because a `PageRef` resolves through exactly one
    backing's geometry.
 6. **Frontends.** A shard hosts a `FrontendRegistry` of any number of
-   frontends keyed by component name. Each spec binds its listener with `SO_REUSEPORT` and
-   builds an `HttpDriver`/`S3Driver`; the registry can add and remove frontends
-   in place on a live config apply (a removed driver's `Drop` closes its
-   listener fd).
+   frontends keyed by component name. Each network frontend is prepared as a
+   bound but non-listening `SO_REUSEPORT` socket, then activated into an
+   `HttpDriver`/`S3Driver` that owns the listening socket. The registry can add
+   and remove frontends in place on a live config apply; RAII closes removed
+   listeners after their pending accept future is dropped.
 7. **Tick loop.** Register tick hooks (socket-ring `progress()`, the
    control-drain hook that reconciles backends/frontends/routing from applied
    configs, and the frontend registry's `progress()`), report `Up`, and run

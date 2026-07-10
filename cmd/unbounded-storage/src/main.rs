@@ -27,6 +27,7 @@ use unbounded_storage::fanout::{
 use unbounded_storage::frontend::{
     HttpDriver, HttpFrontend, LoadgenDriver, LoadgenFrontend, S3Driver, S3Frontend,
 };
+use unbounded_storage::http::BoundListener;
 use unbounded_storage::p2p::{RouteTableHandle, RoutedTransport};
 use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
@@ -1157,6 +1158,27 @@ impl ShardFrontendDriver {
     }
 }
 
+/// A validated frontend whose fallible address binding has completed,
+/// but which is not yet visible to traffic or driven by the shard loop.
+enum PreparedShardFrontend {
+    Http {
+        frontend: HttpFrontend,
+        socket: BoundListener,
+        binding: ResolvedFrontendBinding,
+        stripe_size: u64,
+    },
+    Loadgen {
+        frontend: LoadgenFrontend,
+        binding: ResolvedFrontendBinding,
+        stripe_size: u64,
+    },
+    S3 {
+        socket: BoundListener,
+        binding: ResolvedFrontendBinding,
+        stripe_size: u64,
+    },
+}
+
 /// Shard-local build context for frontend drivers: everything a
 /// [`FrontendSpec`] needs to become a running [`ShardFrontendDriver`]
 /// except the spec itself. Cheap to clone (all fields are handles), so
@@ -1226,13 +1248,8 @@ fn frontend_rebuild_ids(
 }
 
 impl FrontendBuildCtx {
-    /// Turn one [`FrontendSpec`] into a bound, ready-to-drive
-    /// [`ShardFrontendDriver`]. Validates the spec, binds the shard's
-    /// `SO_REUSEPORT` listener, and selects the stripe size from the
-    /// referenced backend's geometry (falling back to the default if the
-    /// backend is not yet known). Returns a human-readable error string
-    /// so it slots into the reconcile traits' `Result<_, String>`.
-    fn build(&self, spec: &FrontendSpec) -> Result<ShardFrontendDriver, String> {
+    /// Validate and bind one frontend without making it traffic-visible.
+    fn prepare(&self, spec: &FrontendSpec) -> Result<PreparedShardFrontend, String> {
         let binding = self
             .bindings
             .borrow()
@@ -1244,14 +1261,62 @@ impl FrontendBuildCtx {
             Some(frontend_spec::Config::Http(_)) => {
                 let frontend = HttpFrontend::from_spec(spec)
                     .map_err(|e| format!("frontend {} from_spec: {e}", spec.name))?;
-                let listener = frontend
-                    .bind_listener()
-                    .map_err(|e| format!("frontend {} bind_listener: {e}", spec.name))?;
+                let socket = frontend
+                    .bind_socket()
+                    .map_err(|e| format!("frontend {} bind_socket: {e}", spec.name))?;
+                Ok(PreparedShardFrontend::Http {
+                    frontend,
+                    socket,
+                    binding,
+                    stripe_size,
+                })
+            }
+            Some(frontend_spec::Config::S3(_)) => {
+                let frontend = S3Frontend::from_spec(spec)
+                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.name))?;
+                let socket = frontend
+                    .bind_socket()
+                    .map_err(|e| format!("frontend {} bind_socket: {e}", spec.name))?;
+                Ok(PreparedShardFrontend::S3 {
+                    socket,
+                    binding,
+                    stripe_size,
+                })
+            }
+            Some(frontend_spec::Config::Loadgen(_)) => {
+                let frontend = LoadgenFrontend::from_spec(spec)
+                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.name))?;
+                Ok(PreparedShardFrontend::Loadgen {
+                    frontend,
+                    binding,
+                    stripe_size,
+                })
+            }
+            None => Err(format!("frontend {} missing config", spec.name)),
+        }
+    }
+
+    /// Activate a prepared frontend and build its shard-local driver.
+    fn activate(
+        &self,
+        id: &str,
+        prepared: PreparedShardFrontend,
+    ) -> Result<ShardFrontendDriver, String> {
+        match prepared {
+            PreparedShardFrontend::Http {
+                frontend,
+                socket,
+                binding,
+                stripe_size,
+            } => {
+                let listener = socket
+                    .listen()
+                    .map_err(|e| format!("frontend {id} listen: {e}"))?;
                 Ok(ShardFrontendDriver::Http(HttpDriver::new(
                     self.pool.clone(),
                     self.handle.clone(),
                     listener,
-                    Rc::from(spec.name.as_str()),
+                    Rc::from(id),
                     binding.backend_id.clone(),
                     binding.cache_id.clone(),
                     stripe_size,
@@ -1261,17 +1326,19 @@ impl FrontendBuildCtx {
                     frontend.max_requests_per_connection(),
                 )))
             }
-            Some(frontend_spec::Config::S3(_)) => {
-                let frontend = S3Frontend::from_spec(spec)
-                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.name))?;
-                let listener = frontend
-                    .bind_listener()
-                    .map_err(|e| format!("frontend {} bind_listener: {e}", spec.name))?;
+            PreparedShardFrontend::S3 {
+                socket,
+                binding,
+                stripe_size,
+            } => {
+                let listener = socket
+                    .listen()
+                    .map_err(|e| format!("frontend {id} listen: {e}"))?;
                 Ok(ShardFrontendDriver::S3(S3Driver::new(
                     self.pool.clone(),
                     self.handle.clone(),
                     listener,
-                    Rc::from(spec.name.as_str()),
+                    Rc::from(id),
                     binding.backend_id.clone(),
                     binding.cache_id.clone(),
                     stripe_size,
@@ -1279,24 +1346,28 @@ impl FrontendBuildCtx {
                     binding.bypass_cache,
                 )))
             }
-            Some(frontend_spec::Config::Loadgen(_)) => {
-                let frontend = LoadgenFrontend::from_spec(spec)
-                    .map_err(|e| format!("frontend {} from_spec: {e}", spec.name))?;
-                Ok(ShardFrontendDriver::Loadgen(LoadgenDriver::new(
-                    frontend,
-                    self.pool.clone(),
-                    binding.backend_id.clone(),
-                    binding.cache_id.clone(),
-                    stripe_size,
-                    self.page_size,
-                    self.routes.clone(),
-                    binding.bypass_cache,
-                    self.worker_idx,
-                    self.waker.clone(),
-                )))
-            }
-            None => Err(format!("frontend {} missing config", spec.name)),
+            PreparedShardFrontend::Loadgen {
+                frontend,
+                binding,
+                stripe_size,
+            } => Ok(ShardFrontendDriver::Loadgen(LoadgenDriver::new(
+                frontend,
+                self.pool.clone(),
+                binding.backend_id.clone(),
+                binding.cache_id.clone(),
+                stripe_size,
+                self.page_size,
+                self.routes.clone(),
+                binding.bypass_cache,
+                self.worker_idx,
+                self.waker.clone(),
+            ))),
         }
+    }
+
+    fn build(&self, spec: &FrontendSpec) -> Result<ShardFrontendDriver, String> {
+        let prepared = self.prepare(spec)?;
+        self.activate(&spec.name, prepared)
     }
 }
 
