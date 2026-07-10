@@ -181,9 +181,13 @@ Backend and frontend reloads construct replacements before swapping them into
 their shard-local registries. Network frontends first validate and bind a
 dormant `SO_REUSEPORT` socket, then enter the listening state only during
 activation. A failed preparation therefore leaves the prior resource, binding,
-and stripe geometry live and retryable. This is a
-per-resource guarantee; route, peer, shard, and disk publication across the
-whole process is not yet one transaction.
+and stripe geometry live and retryable. Active frontend entries record the
+binding and stripe geometry they realized, so a failed rebuild is detected and
+retried on the next apply. Replacement uses an undo-log transaction: the old
+driver remains owned until finalization and can be restored if a later local
+activation fails. The current reconciler finalizes each frontend operation
+immediately; cross-resource and cross-shard commit/rollback is not yet wired to
+that transaction boundary.
 
 ### Shutdown
 

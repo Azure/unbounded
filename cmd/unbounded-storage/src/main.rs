@@ -42,7 +42,10 @@ use unbounded_storage::metrics;
 
 mod device_inventory;
 mod fabric_group;
+mod registry_transaction;
 mod shard_layer;
+
+use registry_transaction::RegistryTransaction;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
@@ -879,10 +882,10 @@ fn run_shard(
     // atomically by its transport; the fabric RPC handlers are reloaded
     // separately by the `FabricGroup`), refreshes the stripe geometry,
     // reconciles the transport origin-backend registry and the frontend
-    // registry toward the new config, applies disk-policy side effects, and then acknowledges
-    // so the coordinator's blocking apply can complete. Everything is
-    // driven from this one thread so the `ArcSwap` publishes are ordered
-    // and the build-from-spec (DNS resolve, listener bind) stays off the
+    // registry toward the new config, applies disk-policy side effects,
+    // and then acknowledges so the coordinator's blocking apply can
+    // complete. Everything is driven from this one thread, and the
+    // build-from-spec work (DNS resolve, listener bind) stays off the
     // fast path.
     {
         let routes = routes.clone();
@@ -899,7 +902,6 @@ fn run_shard(
             .iter()
             .map(|f| (f.name.clone(), f.clone()))
             .collect();
-        let mut last_bindings: HashMap<String, ResolvedFrontendBinding> = frontend_bindings.clone();
         shard_loop.add_tick_hook(move || {
             let mut did_work = false;
             while let Ok(cmd) = ctrl_rx.try_recv() {
@@ -920,11 +922,13 @@ fn run_shard(
                             }
                         }
 
-                        let frontends_to_rebuild = frontend_rebuild_ids(
-                            &last_bindings,
+                        let desired_activations = frontend_activations(
                             &apply.loaded.runtime().frontends,
-                            &last_backends,
                             desired_backends,
+                        );
+                        let frontends_to_rebuild = frontend_rebuild_ids(
+                            &frontend_registry.realized_activations(),
+                            &desired_activations,
                         );
                         let forced_frontend_updates: HashSet<String> =
                             frontends_to_rebuild.into_iter().collect();
@@ -956,21 +960,11 @@ fn run_shard(
                                 g.insert(spec.name.clone(), spec.stripe_size_bytes());
                             }
                         }
-                        let mut applied_bindings = HashMap::new();
-                        for (id, spec) in &last_frontends {
-                            let desired_spec = desired_frontends.iter().find(|f| f.name == *id);
-                            if desired_spec == Some(spec) {
-                                if let Some(binding) = apply.loaded.runtime().frontends.get(id) {
-                                    applied_bindings.insert(id.clone(), binding.clone());
-                                    continue;
-                                }
-                            }
-                            if let Some(binding) = last_bindings.get(id) {
-                                applied_bindings.insert(id.clone(), binding.clone());
-                            }
-                        }
-                        *bindings.borrow_mut() = applied_bindings.clone();
-                        last_bindings = applied_bindings;
+                        *bindings.borrow_mut() = frontend_registry
+                            .realized_activations()
+                            .into_iter()
+                            .map(|(id, activation)| (id, activation.binding))
+                            .collect();
 
                         let mut failures = combined.backends.failures;
                         failures.extend(combined.frontends.failures);
@@ -1148,6 +1142,17 @@ enum ShardFrontendDriver {
     S3(S3Driver<ShardPool>),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct FrontendActivation {
+    binding: ResolvedFrontendBinding,
+    stripe_size: u64,
+}
+
+struct ActiveShardFrontend {
+    driver: ShardFrontendDriver,
+    activation: FrontendActivation,
+}
+
 impl ShardFrontendDriver {
     fn progress(&mut self) -> bool {
         match self {
@@ -1221,26 +1226,44 @@ fn frontend_stripe_size(geometry: &HashMap<String, u64>, backend_id: &str) -> u6
         .unwrap_or(DEFAULT_STRIPE_SIZE_BYTES)
 }
 
-fn frontend_rebuild_ids(
-    last_bindings: &HashMap<String, ResolvedFrontendBinding>,
-    next_bindings: &HashMap<String, ResolvedFrontendBinding>,
-    last_backends: &HashMap<String, BackendSpec>,
+fn frontend_activations(
+    bindings: &HashMap<String, ResolvedFrontendBinding>,
     desired_backends: &[BackendSpec],
-) -> Vec<String> {
-    let changed_backend_geometry: HashSet<String> = desired_backends
+) -> HashMap<String, FrontendActivation> {
+    let geometry: HashMap<&str, u64> = desired_backends
         .iter()
-        .filter_map(|backend| {
-            let old = last_backends.get(&backend.name)?;
-            (old.stripe_size_bytes() != backend.stripe_size_bytes()).then(|| backend.name.clone())
-        })
+        .map(|backend| (backend.name.as_str(), backend.stripe_size_bytes()))
         .collect();
 
-    let mut rebuild: Vec<String> = next_bindings
+    bindings
         .iter()
-        .filter_map(|(id, binding)| {
-            (last_bindings.get(id) != Some(binding)
-                || changed_backend_geometry.contains(&binding.backend_id))
-            .then(|| id.clone())
+        .map(|(id, binding)| {
+            let stripe_size = geometry
+                .get(binding.backend_id.as_str())
+                .copied()
+                .unwrap_or(DEFAULT_STRIPE_SIZE_BYTES);
+            (
+                id.clone(),
+                FrontendActivation {
+                    binding: binding.clone(),
+                    stripe_size,
+                },
+            )
+        })
+        .collect()
+}
+
+fn frontend_rebuild_ids(
+    realized: &HashMap<String, FrontendActivation>,
+    desired: &HashMap<String, FrontendActivation>,
+) -> Vec<String> {
+    let mut rebuild: Vec<String> = desired
+        .iter()
+        .filter_map(|(id, activation)| {
+            realized
+                .get(id)
+                .is_some_and(|current| current != activation)
+                .then(|| id.clone())
         })
         .collect();
     rebuild.sort();
@@ -1301,8 +1324,8 @@ impl FrontendBuildCtx {
         &self,
         id: &str,
         prepared: PreparedShardFrontend,
-    ) -> Result<ShardFrontendDriver, String> {
-        match prepared {
+    ) -> Result<ActiveShardFrontend, String> {
+        let (driver, activation) = match prepared {
             PreparedShardFrontend::Http {
                 frontend,
                 socket,
@@ -1312,7 +1335,7 @@ impl FrontendBuildCtx {
                 let listener = socket
                     .listen()
                     .map_err(|e| format!("frontend {id} listen: {e}"))?;
-                Ok(ShardFrontendDriver::Http(HttpDriver::new(
+                let driver = ShardFrontendDriver::Http(HttpDriver::new(
                     self.pool.clone(),
                     self.handle.clone(),
                     listener,
@@ -1324,7 +1347,12 @@ impl FrontendBuildCtx {
                     self.fanout.clone(),
                     binding.bypass_cache,
                     frontend.max_requests_per_connection(),
-                )))
+                ));
+                let activation = FrontendActivation {
+                    binding,
+                    stripe_size,
+                };
+                (driver, activation)
             }
             PreparedShardFrontend::S3 {
                 socket,
@@ -1334,7 +1362,7 @@ impl FrontendBuildCtx {
                 let listener = socket
                     .listen()
                     .map_err(|e| format!("frontend {id} listen: {e}"))?;
-                Ok(ShardFrontendDriver::S3(S3Driver::new(
+                let driver = ShardFrontendDriver::S3(S3Driver::new(
                     self.pool.clone(),
                     self.handle.clone(),
                     listener,
@@ -1344,30 +1372,69 @@ impl FrontendBuildCtx {
                     stripe_size,
                     self.page_size,
                     binding.bypass_cache,
-                )))
+                ));
+                let activation = FrontendActivation {
+                    binding,
+                    stripe_size,
+                };
+                (driver, activation)
             }
             PreparedShardFrontend::Loadgen {
                 frontend,
                 binding,
                 stripe_size,
-            } => Ok(ShardFrontendDriver::Loadgen(LoadgenDriver::new(
-                frontend,
-                self.pool.clone(),
-                binding.backend_id.clone(),
-                binding.cache_id.clone(),
-                stripe_size,
-                self.page_size,
-                self.routes.clone(),
-                binding.bypass_cache,
-                self.worker_idx,
-                self.waker.clone(),
-            ))),
-        }
+            } => {
+                let driver = ShardFrontendDriver::Loadgen(LoadgenDriver::new(
+                    frontend,
+                    self.pool.clone(),
+                    binding.backend_id.clone(),
+                    binding.cache_id.clone(),
+                    stripe_size,
+                    self.page_size,
+                    self.routes.clone(),
+                    binding.bypass_cache,
+                    self.worker_idx,
+                    self.waker.clone(),
+                ));
+                let activation = FrontendActivation {
+                    binding,
+                    stripe_size,
+                };
+                (driver, activation)
+            }
+        };
+        Ok(ActiveShardFrontend { driver, activation })
     }
 
-    fn build(&self, spec: &FrontendSpec) -> Result<ShardFrontendDriver, String> {
+    fn build(&self, spec: &FrontendSpec) -> Result<ActiveShardFrontend, String> {
         let prepared = self.prepare(spec)?;
         self.activate(&spec.name, prepared)
+    }
+}
+
+struct FrontendRegistryTransaction {
+    ctx: FrontendBuildCtx,
+    entries: RegistryTransaction<ActiveShardFrontend>,
+}
+
+impl FrontendRegistryTransaction {
+    fn add(&mut self, spec: &FrontendSpec) -> Result<(), String> {
+        let frontend = self.ctx.build(spec)?;
+        self.entries.replace(spec.name.clone(), frontend);
+        Ok(())
+    }
+
+    fn remove(&mut self, id: &str) {
+        self.entries.remove(id);
+    }
+
+    fn finalize(self) {
+        self.entries.finalize();
+    }
+
+    #[cfg(test)]
+    fn rollback(self) {
+        self.entries.rollback();
     }
 }
 
@@ -1380,7 +1447,7 @@ impl FrontendBuildCtx {
 /// out of the backend registry resolving that name.
 #[derive(Clone)]
 struct FrontendRegistry {
-    drivers: Rc<RefCell<HashMap<String, ShardFrontendDriver>>>,
+    frontends: Rc<RefCell<HashMap<String, ActiveShardFrontend>>>,
     ctx: FrontendBuildCtx,
 }
 
@@ -1391,15 +1458,15 @@ impl FrontendRegistry {
     /// than silently serving a subset.
     fn new(specs: &[FrontendSpec], ctx: FrontendBuildCtx) -> Result<Self, String> {
         let registry = Self {
-            drivers: Rc::new(RefCell::new(HashMap::with_capacity(specs.len()))),
+            frontends: Rc::new(RefCell::new(HashMap::with_capacity(specs.len()))),
             ctx,
         };
         for spec in specs {
-            let driver = registry.ctx.build(spec)?;
+            let frontend = registry.ctx.build(spec)?;
             registry
-                .drivers
+                .frontends
                 .borrow_mut()
-                .insert(spec.name.clone(), driver);
+                .insert(spec.name.clone(), frontend);
         }
         Ok(registry)
     }
@@ -1410,28 +1477,44 @@ impl FrontendRegistry {
     /// reconcile that mutates the same map.
     fn progress(&self) -> bool {
         let mut busy = false;
-        for driver in self.drivers.borrow_mut().values_mut() {
-            busy |= driver.progress();
+        for frontend in self.frontends.borrow_mut().values_mut() {
+            busy |= frontend.driver.progress();
         }
         busy
+    }
+
+    fn transaction(&self) -> FrontendRegistryTransaction {
+        FrontendRegistryTransaction {
+            ctx: self.ctx.clone(),
+            entries: RegistryTransaction::new(self.frontends.clone()),
+        }
+    }
+
+    fn realized_activations(&self) -> HashMap<String, FrontendActivation> {
+        self.frontends
+            .borrow()
+            .iter()
+            .map(|(id, frontend)| (id.clone(), frontend.activation.clone()))
+            .collect()
     }
 }
 
 impl config::reconcile::FrontendReconcileTarget for FrontendRegistry {
     fn list(&self) -> Vec<String> {
-        self.drivers.borrow().keys().cloned().collect()
+        self.frontends.borrow().keys().cloned().collect()
     }
 
     fn add(&self, spec: &FrontendSpec) -> Result<(), String> {
-        let driver = self.ctx.build(spec)?;
-        self.drivers.borrow_mut().insert(spec.name.clone(), driver);
+        let mut transaction = self.transaction();
+        transaction.add(spec)?;
+        transaction.finalize();
         Ok(())
     }
 
     fn remove(&self, id: &str) -> Result<(), String> {
-        // Dropping the driver runs its `Drop`, which closes the listen
-        // fd, so a removed frontend stops accepting immediately.
-        self.drivers.borrow_mut().remove(id);
+        let mut transaction = self.transaction();
+        transaction.remove(id);
+        transaction.finalize();
         Ok(())
     }
 }
@@ -2107,31 +2190,141 @@ mod tests {
 
     #[test]
     fn backend_stripe_size_change_rebuilds_frontend() {
-        let mut last_bindings = HashMap::new();
-        last_bindings.insert("f".to_string(), binding("f", "b"));
-
-        let mut next_bindings = HashMap::new();
-        next_bindings.insert("f".to_string(), binding("f", "b"));
-
         let old_backend = backend_spec("b");
-        let mut new_backend = old_backend.clone();
+        let mut new_backend = old_backend;
         let Some(config::backend_spec::Config::Http(cfg)) = new_backend.config.as_mut() else {
             panic!("expected http backend config");
         };
         *cfg.stripe_size_bytes.as_mut().expect("stripe size set") *= 2;
 
-        let mut last_backends = HashMap::new();
-        last_backends.insert(old_backend.name.clone(), old_backend);
+        let bindings = HashMap::from([("f".to_string(), binding("f", "b"))]);
+        let realized = HashMap::from([(
+            "f".to_string(),
+            FrontendActivation {
+                binding: binding("f", "b"),
+                stripe_size: 4 * 1024 * 1024,
+            },
+        )]);
+        let desired = frontend_activations(&bindings, &[new_backend]);
 
         assert_eq!(
-            frontend_rebuild_ids(
-                &last_bindings,
-                &next_bindings,
-                &last_backends,
-                &[new_backend]
-            ),
+            frontend_rebuild_ids(&realized, &desired),
             vec!["f".to_string()],
         );
+    }
+
+    #[test]
+    fn binding_change_rebuilds_frontend_from_realized_state() {
+        let realized = HashMap::from([(
+            "f".to_string(),
+            FrontendActivation {
+                binding: binding("f", "old"),
+                stripe_size: 4 * 1024 * 1024,
+            },
+        )]);
+        let desired = HashMap::from([(
+            "f".to_string(),
+            FrontendActivation {
+                binding: binding("f", "new"),
+                stripe_size: 4 * 1024 * 1024,
+            },
+        )]);
+
+        assert_eq!(
+            frontend_rebuild_ids(&realized, &desired),
+            vec!["f".to_string()],
+        );
+    }
+
+    #[derive(Clone)]
+    struct DropValue {
+        id: &'static str,
+        drops: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropValue {
+        fn drop(&mut self) {
+            self.drops.borrow_mut().push(self.id);
+        }
+    }
+
+    fn drop_value(id: &'static str, drops: &Rc<RefCell<Vec<&'static str>>>) -> DropValue {
+        DropValue {
+            id,
+            drops: drops.clone(),
+        }
+    }
+
+    #[test]
+    fn registry_transaction_finalize_commits_replacement() {
+        let drops = Rc::new(RefCell::new(Vec::new()));
+        let live = Rc::new(RefCell::new(HashMap::from([(
+            "a".to_string(),
+            drop_value("old", &drops),
+        )])));
+        let mut transaction = RegistryTransaction::new(live.clone());
+        transaction.replace("a".to_string(), drop_value("new", &drops));
+
+        assert_eq!(live.borrow()["a"].id, "new");
+        assert!(drops.borrow().is_empty());
+        transaction.finalize();
+
+        assert_eq!(&*drops.borrow(), &["old"]);
+        assert_eq!(live.borrow()["a"].id, "new");
+    }
+
+    #[test]
+    fn registry_transaction_rollback_restores_originals() {
+        let drops = Rc::new(RefCell::new(Vec::new()));
+        let live = Rc::new(RefCell::new(HashMap::from([
+            ("a".to_string(), drop_value("old-a", &drops)),
+            ("b".to_string(), drop_value("old-b", &drops)),
+        ])));
+        let mut transaction = RegistryTransaction::new(live.clone());
+        transaction.replace("a".to_string(), drop_value("new-a", &drops));
+        transaction.replace("b".to_string(), drop_value("new-b", &drops));
+        transaction.rollback();
+
+        assert_eq!(live.borrow()["a"].id, "old-a");
+        assert_eq!(live.borrow()["b"].id, "old-b");
+        let mut dropped = drops.borrow().clone();
+        dropped.sort_unstable();
+        assert_eq!(dropped, ["new-a", "new-b"]);
+    }
+
+    #[test]
+    fn registry_transaction_drop_rolls_back_removal() {
+        let drops = Rc::new(RefCell::new(Vec::new()));
+        let live = Rc::new(RefCell::new(HashMap::from([(
+            "a".to_string(),
+            drop_value("old", &drops),
+        )])));
+        {
+            let mut transaction = RegistryTransaction::new(live.clone());
+            transaction.remove("a");
+            assert!(!live.borrow().contains_key("a"));
+        }
+
+        assert_eq!(live.borrow()["a"].id, "old");
+        assert!(drops.borrow().is_empty());
+    }
+
+    #[test]
+    fn registry_transaction_preserves_first_original() {
+        let drops = Rc::new(RefCell::new(Vec::new()));
+        let live = Rc::new(RefCell::new(HashMap::from([(
+            "a".to_string(),
+            drop_value("old", &drops),
+        )])));
+        let mut transaction = RegistryTransaction::new(live.clone());
+        transaction.replace("a".to_string(), drop_value("new-1", &drops));
+        transaction.replace("a".to_string(), drop_value("new-2", &drops));
+        transaction.rollback();
+
+        assert_eq!(live.borrow()["a"].id, "old");
+        let mut dropped = drops.borrow().clone();
+        dropped.sort_unstable();
+        assert_eq!(dropped, ["new-1", "new-2"]);
     }
 
     #[test]
