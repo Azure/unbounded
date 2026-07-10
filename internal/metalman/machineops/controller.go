@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -51,7 +52,9 @@ type PowerClient interface {
 	DisableBootOverride(ctx context.Context) error
 	SetBootOverride(ctx context.Context, target redfish.BootTarget, enabled redfish.BootEnabled) error
 	GetBootConfig(ctx context.Context) (redfish.BootConfig, error)
+	SetStaticIPv4(ctx context.Context, config redfish.StaticIPv4Config) error
 	SetHTTPBootOverride(ctx context.Context, bootURL string) error
+	SetBIOSStaticIPv4(ctx context.Context, config redfish.StaticIPv4Config) error
 	SetBIOSHTTPBootURI(ctx context.Context, bootURL string) error
 }
 
@@ -560,19 +563,6 @@ func (r *Reconciler) waitForPowerAction(target v1alpha3.MachineOperationTargetSt
 }
 
 func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
-	if target.Stage == "" {
-		if err := r.requestRepaveBoot(ctx, machine); err != nil {
-			return retryTarget(target, err, now, r.maxAttempts())
-		}
-
-		target.Stage = v1alpha3.OperationStageWaitingRepave
-		target.Attempts++
-		target.LastAttemptAt = &now
-		target.Message = "requested PXE repave boot"
-
-		return targetChange{target: target}
-	}
-
 	if !apimeta.IsStatusConditionTrue(op.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten) {
 		return r.waitForRepaveBoot(ctx, machine, target, now)
 	}
@@ -598,49 +588,82 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 	return completeTarget(target, "HostReplace completed", now)
 }
 
-func (r *Reconciler) requestRepaveBoot(ctx context.Context, machine *v1alpha3.Machine) error {
-	pc, err := r.PowerClients.ForMachine(ctx, machine)
-	if err != nil {
-		return err
-	}
-
+func (r *Reconciler) configureRepaveBoot(ctx context.Context, pc PowerClient, machine *v1alpha3.Machine) error {
 	if machine.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
-		if r.HTTPBootURL == nil {
-			return fmt.Errorf("HTTP boot URL resolver is not configured")
-		}
-
-		bootURL, err := r.HTTPBootURL(machine)
+		bootURL, staticConfig, err := r.httpBootConfig(machine)
 		if err != nil {
 			return err
 		}
 
-		if err := setHTTPBootOverride(ctx, pc, bootURL); err != nil {
+		if err := setHTTPBootOverride(ctx, pc, bootURL, staticConfig); err != nil {
 			return err
 		}
 	} else if err := pc.SetBootOverride(ctx, redfish.BootTargetPxe, redfish.BootContinuous); err != nil {
 		return err
 	}
 
-	state, err := pc.PowerState(ctx)
-	if err != nil {
-		return err
-	}
-
-	if state == redfish.PowerOff {
-		return pc.Reset(ctx, redfish.ResetOn)
-	}
-
-	return pc.Reset(ctx, redfish.ResetForceRestart)
+	return nil
 }
 
-func setHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string) error {
+func (r *Reconciler) httpBootConfig(machine *v1alpha3.Machine) (string, redfish.StaticIPv4Config, error) {
+	if r.HTTPBootURL == nil {
+		return "", redfish.StaticIPv4Config{}, fmt.Errorf("HTTP boot URL resolver is not configured")
+	}
+
+	bootURL, err := r.HTTPBootURL(machine)
+	if err != nil {
+		return "", redfish.StaticIPv4Config{}, err
+	}
+
+	staticConfig, err := httpBootStaticNetworkConfig(machine)
+	if err != nil {
+		return "", redfish.StaticIPv4Config{}, err
+	}
+
+	return bootURL, staticConfig, nil
+}
+
+func httpBootStaticNetworkConfig(machine *v1alpha3.Machine) (redfish.StaticIPv4Config, error) {
+	if machine.Spec.PXE == nil || len(machine.Spec.PXE.DHCPLeases) == 0 {
+		return redfish.StaticIPv4Config{}, fmt.Errorf("HTTP boot requires at least one static lease in spec.pxe.dhcpLeases")
+	}
+
+	lease := machine.Spec.PXE.DHCPLeases[0]
+	config := redfish.StaticIPv4Config{
+		MAC:        lease.MAC,
+		Address:    lease.IPv4,
+		SubnetMask: lease.SubnetMask,
+		Gateway:    lease.Gateway,
+		DNS:        lease.DNS,
+	}
+
+	if _, err := net.ParseMAC(config.MAC); err != nil {
+		return redfish.StaticIPv4Config{}, fmt.Errorf("invalid HTTP boot MAC address %q: %w", config.MAC, err)
+	}
+
+	if err := redfish.ValidateStaticIPv4Config(config); err != nil {
+		return redfish.StaticIPv4Config{}, err
+	}
+
+	return config, nil
+}
+
+func setHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string, staticConfig redfish.StaticIPv4Config) error {
 	config, err := pc.GetBootConfig(ctx)
 	if err != nil {
 		return err
 	}
 
 	if !config.HasHTTPBootURI {
-		return setBIOSHTTPBootOverride(ctx, pc, bootURL)
+		return setBIOSHTTPBootOverride(ctx, pc, bootURL, staticConfig)
+	}
+
+	if err := pc.SetStaticIPv4(ctx, staticConfig); err != nil {
+		if !errors.Is(err, redfish.ErrUnsupported) {
+			return err
+		}
+
+		return setBIOSHTTPBootOverride(ctx, pc, bootURL, staticConfig)
 	}
 
 	if err := pc.SetHTTPBootOverride(ctx, bootURL); err != nil {
@@ -648,13 +671,26 @@ func setHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string) er
 			return err
 		}
 
-		return setBIOSHTTPBootOverride(ctx, pc, bootURL)
+		return setBIOSHTTPBootOverride(ctx, pc, bootURL, staticConfig)
+	}
+
+	// Some BMCs expose both locations but boot from the vendor BIOS setting.
+	if err := pc.SetBIOSStaticIPv4(ctx, staticConfig); err != nil && !errors.Is(err, redfish.ErrUnsupported) {
+		return err
+	}
+
+	if err := pc.SetBIOSHTTPBootURI(ctx, bootURL); err != nil && !errors.Is(err, redfish.ErrUnsupported) {
+		return err
 	}
 
 	return nil
 }
 
-func setBIOSHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string) error {
+func setBIOSHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string, staticConfig redfish.StaticIPv4Config) error {
+	if err := pc.SetBIOSStaticIPv4(ctx, staticConfig); err != nil {
+		return err
+	}
+
 	if err := pc.SetBIOSHTTPBootURI(ctx, bootURL); err != nil {
 		return err
 	}
@@ -673,16 +709,59 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 		if target.Attempts >= r.maxAttempts() {
 			return failTarget(target, reasonExecutionFailed, fmt.Sprintf("timed out waiting for PXE repave after %d attempts", target.Attempts), now)
 		}
+
+		target.Stage = v1alpha3.OperationStagePoweringOff
+		target.LastAttemptAt = nil
 	}
 
-	if err := r.requestRepaveBoot(ctx, machine); err != nil {
+	if machine.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
+		if _, _, err := r.httpBootConfig(machine); err != nil {
+			return retryTarget(target, err, now, r.maxAttempts())
+		}
+	}
+
+	pc, err := r.PowerClients.ForMachine(ctx, machine)
+	if err != nil {
+		return targetChange{target: target, err: err}
+	}
+
+	state, err := pc.PowerState(ctx)
+	if err != nil {
+		return targetChange{target: target, err: err}
+	}
+
+	if state != redfish.PowerOff {
+		if target.Stage == v1alpha3.OperationStageWaitingOff && target.LastAttemptAt != nil {
+			if now.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
+				target.Message = "waiting for power off before configuring repave boot"
+
+				return targetChange{target: target}
+			}
+		}
+
+		if err := pc.Reset(ctx, redfish.ResetForceOff); err != nil {
+			return targetChange{target: target, err: err}
+		}
+
+		target.Stage = v1alpha3.OperationStageWaitingOff
+		target.LastAttemptAt = &now
+		target.Message = "sent ForceOff before configuring repave boot"
+
+		return targetChange{target: target}
+	}
+
+	if err := r.configureRepaveBoot(ctx, pc, machine); err != nil {
 		return retryTarget(target, err, now, r.maxAttempts())
+	}
+
+	if err := pc.Reset(ctx, redfish.ResetOn); err != nil {
+		return targetChange{target: target, err: err}
 	}
 
 	target.Stage = v1alpha3.OperationStageWaitingRepave
 	target.Attempts++
 	target.LastAttemptAt = &now
-	target.Message = "retrying PXE repave boot"
+	target.Message = "requested PXE repave boot"
 
 	return targetChange{target: target}
 }
