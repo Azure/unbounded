@@ -897,8 +897,6 @@ fn run_shard(
             while let Ok(cmd) = ctrl_rx.try_recv() {
                 match cmd {
                     config::ShardCommand::ApplyConfig(apply) => {
-                        routes.store_snapshot(apply.loaded.routes().clone());
-
                         let desired_backends = apply.loaded.config().backends.as_slice();
                         let desired_frontends = apply.loaded.config().frontends.as_slice();
                         let desired_frontend_backends =

@@ -28,7 +28,7 @@ use unbounded_storage::fabric::{
 use unbounded_storage::fanout::FetchChannel;
 use unbounded_storage::memory::{Backing, BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
 use unbounded_storage::p2p::{
-    OwnerShardSource, OwnerShardTable, RecursiveHandler, RouteTableHandle, RouteTableSnapshot,
+    OwnerShardSource, OwnerShardTable, RecursiveHandler, RouteTableHandle,
 };
 use unbounded_storage::runtime::{Threading, WorkerIdx};
 use unbounded_storage::storage::StripeReq;
@@ -293,7 +293,7 @@ impl FabricGroup {
         fabric_startup: &FabricStartup,
         _backend_specs: &[BackendSpec],
         cache_directories: Arc<CacheDirectorySet>,
-        routes: &RouteTableSnapshot,
+        routes: &RouteTableHandle,
         peers: &[RuntimePeer],
         self_peer: PeerId,
     ) -> Result<Self, Vec<String>> {
@@ -348,15 +348,6 @@ impl FabricGroup {
                 addr: unit.self_addr.clone(),
             })
             .collect()
-    }
-
-    /// Reload every endpoint's RPC-handler routing from a new snapshot.
-    /// Driven in lockstep with the per-shard transport reload so the
-    /// classify and forward paths move together.
-    pub fn reload_routes(&self, snapshot: &RouteTableSnapshot) {
-        for unit in &self.units {
-            unit.routes.store_snapshot(snapshot.clone());
-        }
     }
 
     /// Start every shared RPC server after shards have published the
@@ -462,7 +453,7 @@ fn build_unit(
     backing_kind: BackingKind,
     fabric_startup: &FabricStartup,
     cache_directories: &Arc<CacheDirectorySet>,
-    routes: &RouteTableSnapshot,
+    routes: &RouteTableHandle,
     peers: &[RuntimePeer],
     self_peer: PeerId,
 ) -> Result<FabricUnit, String> {
@@ -525,8 +516,6 @@ fn build_unit(
         .register_backing(&scratch, spec.numa)
         .map_err(|e| format!("worker={worker}: register rpc scratch: {e}"))?;
 
-    let routes = RouteTableHandle::from_snapshot(routes.clone());
-
     fabric.check_shared_domain_capacity(spec.expected_mr);
 
     let desired_peers = runtime_peer_connections_for_unit(peers, spec.unit_idx);
@@ -539,7 +528,7 @@ fn build_unit(
     Ok(FabricUnit {
         rpc_server: None,
         scratch: Some(scratch),
-        routes,
+        routes: routes.clone(),
         fabric,
         scratch_mr,
         page_size,

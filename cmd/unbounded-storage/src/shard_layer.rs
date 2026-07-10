@@ -79,6 +79,7 @@ pub struct PreparedShardLayer {
     rpc_shards: Vec<RpcShardPublish>,
     serve_start_txs: Vec<mpsc::Sender<()>>,
     terminal_rx: mpsc::Receiver<crate::ShardTerminalReport>,
+    routes: RouteTableHandle,
 }
 
 /// A spawned set of shard threads plus the handles to drive and retire
@@ -107,6 +108,9 @@ pub struct ShardLayer {
     /// memory.
     _backing_keepalives: Vec<Arc<dyn Send + Sync>>,
     terminal_rx: mpsc::Receiver<crate::ShardTerminalReport>,
+    /// The sole writer for the process-wide routing publication. Every
+    /// shard transport and fabric RPC handler holds a clone.
+    routes: RouteTableHandle,
 }
 
 impl ShardLayer {
@@ -140,7 +144,7 @@ pub fn prepare_shard_layer(
         .map_err(|e| vec![format!("invalid shard memory budget: {e}")])?;
     let config = loaded.config();
     let runtime = loaded.runtime();
-    let routes = loaded.routes();
+    let routes = RouteTableHandle::from_snapshot(loaded.routes().clone());
     let runtime_peers = config::runtime_peers(runtime);
     let self_peer = local_self_peer(runtime)
         .map_err(|e| vec![format!("unsupported fabric identity config: {e}")])?;
@@ -193,7 +197,7 @@ pub fn prepare_shard_layer(
         let tx = ready_tx.clone();
         let backing_kind = settings.backing_kind;
         let cache_directories = deps.cache_directories.clone();
-        let route_handle = RouteTableHandle::from_snapshot(routes.clone());
+        let route_handle = routes.clone();
         let loaded = loaded.clone();
         let layer_stop = layer_stop.clone();
         let terminal_tx = terminal_tx.clone();
@@ -349,6 +353,7 @@ pub fn prepare_shard_layer(
             backing_keepalives,
             serve_start_txs,
             terminal_rx,
+            routes,
         );
         return Err(phaseb_errors);
     }
@@ -362,6 +367,7 @@ pub fn prepare_shard_layer(
         rpc_shards,
         serve_start_txs,
         terminal_rx,
+        routes,
     })
 }
 
@@ -378,6 +384,7 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
         rpc_shards,
         serve_start_txs,
         terminal_rx,
+        routes,
     } = prepared;
 
     if let Err(errors) = fabric_group.start_rpc_servers(&rpc_shards) {
@@ -389,6 +396,7 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
             backing_keepalives,
             serve_start_txs,
             terminal_rx,
+            routes,
         );
         return Err(errors);
     }
@@ -402,6 +410,7 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
                 backing_keepalives,
                 serve_start_txs,
                 terminal_rx,
+                routes,
             );
             return Err(vec![
                 "shard exited before recursive RPC servers were ready".to_string(),
@@ -417,6 +426,7 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
         layer_stop,
         _backing_keepalives: backing_keepalives,
         terminal_rx,
+        routes,
     })
 }
 
@@ -428,6 +438,7 @@ fn retire_failed_activation(
     backing_keepalives: Vec<Arc<dyn Send + Sync>>,
     serve_start_txs: Vec<mpsc::Sender<()>>,
     terminal_rx: mpsc::Receiver<crate::ShardTerminalReport>,
+    routes: RouteTableHandle,
 ) {
     layer_stop.store(true, Ordering::Relaxed);
     drop(serve_start_txs);
@@ -436,6 +447,7 @@ fn retire_failed_activation(
     }
     drop(control);
     drop(fabric_group);
+    drop(routes);
     drop(backing_keepalives);
     drop(terminal_rx);
 }
@@ -476,6 +488,7 @@ pub fn teardown_shard_layer(layer: ShardLayer) -> bool {
         layer_stop,
         _backing_keepalives,
         terminal_rx,
+        routes,
     } = layer;
     layer_stop.store(true, Ordering::Relaxed);
     let mut failed = false;
@@ -502,6 +515,7 @@ pub fn teardown_shard_layer(layer: ShardLayer) -> bool {
     // assigned shard's data backing. The shard threads have already
     // joined, so nothing still touches those regions.
     drop(fabric_group);
+    drop(routes);
     // Free every shard's backing only now: the fabrics above have closed
     // their MRs, and all shard threads (and thus every io_uring ring that
     // may still reference a peer's pages as a `SEND_ZC` source) have
@@ -578,14 +592,9 @@ impl ConfigApplyTarget for ProcessApplyTarget {
                 .as_mut()
                 .expect("shard layer present between applies");
 
-            // Peer connections and the RPC handlers' routing live on the
-            // shared fabric endpoints, not on individual shards, so they
-            // are reconciled once per endpoint here. Both only need
-            // touching when the routing surface (p2p/peers) changed; a
-            // backend/frontend-only change leaves them untouched.
-            if diff.requires_routing_reload() {
-                layer.fabric_group.reload_routes(new.routes());
-            }
+            // Peer connections live on the shared fabric endpoints, not
+            // on individual shards, so they are reconciled once per
+            // endpoint here.
             if diff.requires_peer_reconcile() {
                 let runtime_peers = config::runtime_peers(new.runtime());
                 layer.fabric_group.reconcile_peers(&runtime_peers);
@@ -632,6 +641,18 @@ impl ConfigApplyTarget for ProcessApplyTarget {
         // current and the live disk topology remains on that same version.
         if diff.caches_changed || diff.disks_changed {
             self.reconcile_disks(new.runtime());
+        }
+
+        // Routing is the process-wide visibility point for a successful
+        // apply. Publish it only after every fallible shard broadcast and
+        // the disk update have completed, so failed applies retain the
+        // prior route snapshot everywhere.
+        if diff.requires_routing_reload() {
+            self.layer
+                .as_ref()
+                .expect("shard layer present between applies")
+                .routes
+                .store_snapshot(new.routes().clone());
         }
 
         Ok(())

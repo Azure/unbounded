@@ -594,6 +594,12 @@ for the complete worker set and report outstanding worker identities. A
 timeout, acknowledgement-channel disconnect, or partial broadcast send failure
 requests process shutdown: already-delivered commands may complete later, so
 retrying against the old controller snapshot would be unsafe.
+All shard transports and fabric RPC handlers share one process-wide
+`RouteTableHandle`. The apply target is its only writer and publishes the new
+snapshot once, after shard acknowledgement, page-cache drain, and disk
+publication succeed. This keeps routing on the prior snapshot when an earlier
+apply step reports failure; other resource reconciliation is still not a
+whole-process transaction.
 
 Sections (all optional, each falling back to defaults):
 
