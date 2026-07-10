@@ -534,10 +534,10 @@ fn spin_block_on_with_alive<T>(fut: ReplyWait<T>, service_alive: &AtomicBool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::flag_waker;
     use crate::storage::blockdev::{MockDevice, MockDeviceConfig};
     use crate::storage::engine::EngineConfig;
     use std::sync::mpsc::channel as std_channel;
-    use std::task::{RawWaker, RawWakerVTable};
     use std::time::Duration;
 
     fn block_on<F: Future>(mut fut: F) -> F::Output {
@@ -553,48 +553,6 @@ mod tests {
             std::thread::yield_now();
         }
         panic!("block_on: future did not complete within spin budget");
-    }
-
-    /// Build a waker whose `wake` flips a shared `Arc<AtomicBool>`,
-    /// mirroring the shard loop's `flag_waker`. The shard polls
-    /// page-channel reply futures with exactly this kind of waker, so
-    /// the `ReplySlot` stashes it and a cross-thread `set` must flip
-    /// the flag. This local copy lets the page-channel tests pin that
-    /// contract from this side of the boundary.
-    fn flag_waker() -> (Waker, Arc<AtomicBool>) {
-        let flag = Arc::new(AtomicBool::new(false));
-        let data = Arc::into_raw(flag.clone()) as *const ();
-        // SAFETY: `data` is a freshly leaked `Arc<AtomicBool>` and the
-        // vtable upholds the matching clone/wake/drop refcounting.
-        let waker = unsafe { Waker::from_raw(RawWaker::new(data, &FLAG_VTABLE)) };
-        (waker, flag)
-    }
-
-    static FLAG_VTABLE: RawWakerVTable =
-        RawWakerVTable::new(flag_clone, flag_wake, flag_wake_by_ref, flag_drop);
-
-    unsafe fn flag_clone(data: *const ()) -> RawWaker {
-        // SAFETY: `data` points at a live `Arc<AtomicBool>`.
-        unsafe { Arc::increment_strong_count(data as *const AtomicBool) };
-        RawWaker::new(data, &FLAG_VTABLE)
-    }
-
-    unsafe fn flag_wake(data: *const ()) {
-        // SAFETY: consumes the one owned ref this waker held.
-        let arc = unsafe { Arc::from_raw(data as *const AtomicBool) };
-        arc.store(true, Ordering::Release);
-    }
-
-    unsafe fn flag_wake_by_ref(data: *const ()) {
-        // SAFETY: borrows without consuming; the ref is handed back.
-        let arc = unsafe { Arc::from_raw(data as *const AtomicBool) };
-        arc.store(true, Ordering::Release);
-        let _ = Arc::into_raw(arc);
-    }
-
-    unsafe fn flag_drop(data: *const ()) {
-        // SAFETY: balances one clone/into_raw strong ref.
-        unsafe { Arc::decrement_strong_count(data as *const AtomicBool) };
     }
 
     /// Run a storage-core-like loop on the current thread: build a
