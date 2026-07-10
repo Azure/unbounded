@@ -412,9 +412,10 @@ streaming RPC server plus client `Transport`.
   submits libfabric writes/sends, and parks on completion futures with a real
   thread waker. Wire framing uses an 8-byte `MsgHeader` prefix with a message
   kind and request id. The client sends a bincode `RequestHeader` plus request
-  body; the server `fi_write`s each page into the client's destination MR and
-  sends one `PageAck` per page. A short success sends `RESPONSE_END`; any error
-  sends `ERROR_ACK`. `RpcServerHandle::drop` uninstalls the request sink, closes
+  body. Verbs uses write-with-immediate to deliver typed page ordinals; the TCP
+  fallback follows each `fi_write` with a framed bincode `PageAck`. A short
+  success sends `RESPONSE_END`; any error sends `ERROR_ACK`.
+  `RpcServerHandle::drop` uninstalls the request sink, closes
   the queue, signals shutdown, and joins the workers.
 - `Handler`/`HandlerStream` is the server-side resolution trait;
   `PoolHandler`/`PoolHandlerStream` serve locally-resident pages.
