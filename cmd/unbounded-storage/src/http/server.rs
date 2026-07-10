@@ -6,14 +6,14 @@
 //!
 //! This file owns the reusable, opinion-free pieces a server-side
 //! frontend needs regardless of which object protocol it speaks: the
-//! `SO_REUSEPORT` listener helper, the RAII socket-fd closer, the
+//! `SO_REUSEPORT` socket helpers, the RAII socket-fd closer, the
 //! request-target query splitter, the full-buffer send loop, and the
 //! size constants. None of it knows about ranges, stripe geometry, or
 //! which status a frontend returns; that policy lives with the concrete
 //! frontend (`crate::frontend::http_serve`) and a future S3 frontend
 //! can reuse everything here unchanged.
 //!
-//! The libc/`io_uring`-bearing helpers ([`bind_listener`], [`FdGuard`],
+//! The libc/`io_uring`-bearing helpers ([`bind_socket`], [`FdGuard`],
 //! [`send_all`]) are Linux-gated because they depend on `libc` and the
 //! io_uring [`NetHandle`](crate::ring::NetHandle); the pure helpers
 //! ([`split_query`]) and the constants are cross-platform.
@@ -21,7 +21,7 @@
 #[cfg(target_os = "linux")]
 use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 #[cfg(target_os = "linux")]
 use crate::ring::NetHandle;
@@ -37,16 +37,49 @@ pub(crate) const RECV_CHUNK: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
 const LISTEN_BACKLOG: i32 = 1024;
 
-/// Create, bind, and listen a TCP socket on `addr` with `SO_REUSEADDR`
-/// and `SO_REUSEPORT`. Supports IPv4 and IPv6 binds.
-///
-/// Returns the listening [`RawFd`]; the caller owns it and is
-/// responsible for closing it. Errors are surfaced as
-/// [`std::io::Error`] (from the failing syscall) so this stays free of
-/// any frontend-specific error type; the caller maps it onto whatever
-/// error it reports.
+/// A bound TCP socket that is not yet eligible to receive traffic.
 #[cfg(target_os = "linux")]
-pub(crate) fn bind_listener(addr: SocketAddr) -> Result<RawFd, std::io::Error> {
+pub struct BoundListener {
+    fd: OwnedFd,
+}
+
+/// An active listening socket owned by a frontend driver.
+#[cfg(target_os = "linux")]
+pub struct ListeningSocket {
+    fd: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl BoundListener {
+    /// Enter the listening state. Consuming `self` keeps failure cleanup
+    /// automatic and makes the dormant-to-active transition explicit.
+    pub fn listen(self) -> Result<ListeningSocket, std::io::Error> {
+        // SAFETY: fd is a bound stream socket.
+        if unsafe { libc::listen(self.fd.as_raw_fd(), LISTEN_BACKLOG) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(ListeningSocket { fd: self.fd })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsRawFd for BoundListener {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsRawFd for ListeningSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+/// Create and bind a dormant TCP socket on `addr` with `SO_REUSEADDR`
+/// and `SO_REUSEPORT`. Supports IPv4 and IPv6 binds.
+#[cfg(target_os = "linux")]
+pub(crate) fn bind_socket(addr: SocketAddr) -> Result<BoundListener, std::io::Error> {
     let family = match addr {
         SocketAddr::V4(_) => libc::AF_INET,
         SocketAddr::V6(_) => libc::AF_INET6,
@@ -56,14 +89,15 @@ pub(crate) fn bind_listener(addr: SocketAddr) -> Result<RawFd, std::io::Error> {
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let guard = FdGuard(fd);
+    // SAFETY: fd was just returned by socket() and has unique ownership.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
     let one: libc::c_int = 1;
     for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
         // SAFETY: &one outlives the call; size matches a c_int.
         let rc = unsafe {
             libc::setsockopt(
-                fd,
+                fd.as_raw_fd(),
                 libc::SOL_SOCKET,
                 opt,
                 &one as *const libc::c_int as *const libc::c_void,
@@ -88,7 +122,7 @@ pub(crate) fn bind_listener(addr: SocketAddr) -> Result<RawFd, std::io::Error> {
             // SAFETY: sin is a valid sockaddr_in for the call's duration.
             unsafe {
                 libc::bind(
-                    fd,
+                    fd.as_raw_fd(),
                     &sin as *const libc::sockaddr_in as *const libc::sockaddr,
                     std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
                 )
@@ -107,7 +141,7 @@ pub(crate) fn bind_listener(addr: SocketAddr) -> Result<RawFd, std::io::Error> {
             // SAFETY: sin6 is a valid sockaddr_in6 for the call's duration.
             unsafe {
                 libc::bind(
-                    fd,
+                    fd.as_raw_fd(),
                     &sin6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
                     std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
                 )
@@ -118,14 +152,7 @@ pub(crate) fn bind_listener(addr: SocketAddr) -> Result<RawFd, std::io::Error> {
         return Err(std::io::Error::last_os_error());
     }
 
-    // SAFETY: fd is a bound stream socket.
-    if unsafe { libc::listen(fd, LISTEN_BACKLOG) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    // Hand the fd out to the caller; defuse the guard.
-    std::mem::forget(guard);
-    Ok(fd)
+    Ok(BoundListener { fd })
 }
 
 /// RAII closer for a socket fd. The ring never creates fds; this owns
@@ -184,6 +211,11 @@ pub(crate) fn split_query(target: &str) -> (&str, &str) {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    use std::net::TcpStream;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
+
     #[test]
     fn split_query_strips_query() {
         assert_eq!(split_query("/bucket/key"), ("/bucket/key", ""));
@@ -196,15 +228,43 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bind_listener_creates_and_binds() {
-        match bind_listener("127.0.0.1:0".parse().unwrap()) {
-            Ok(fd) => {
-                assert!(fd >= 0);
-                unsafe {
-                    libc::close(fd);
-                }
+    fn bound_socket_can_enter_listening_state() {
+        match bind_socket("127.0.0.1:0".parse().unwrap()) {
+            Ok(bound) => assert!(bound.listen().is_ok()),
+            Err(e) => {
+                eprintln!("bound_socket_can_enter_listening_state: bind failed: {e}; skipping")
             }
-            Err(e) => eprintln!("bind_listener_creates_and_binds: bind failed: {e}; skipping"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bound_socket_is_dormant_until_listen() {
+        let bound = match bind_socket("127.0.0.1:0".parse().unwrap()) {
+            Ok(bound) => bound,
+            Err(e) => {
+                eprintln!("bound_socket_is_dormant_until_listen: bind failed: {e}; skipping");
+                return;
+            }
+        };
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        // SAFETY: addr and len provide valid output storage for getsockname.
+        assert_eq!(
+            unsafe {
+                libc::getsockname(
+                    bound.as_raw_fd(),
+                    &mut addr as *mut libc::sockaddr_in as *mut libc::sockaddr,
+                    &mut len,
+                )
+            },
+            0
+        );
+        let local = SocketAddr::from(([127, 0, 0, 1], u16::from_be(addr.sin_port)));
+
+        assert!(TcpStream::connect(local).is_err());
+        let listening = bound.listen().expect("listen after dormant bind");
+        assert!(TcpStream::connect(local).is_ok());
+        drop(listening);
     }
 }

@@ -24,7 +24,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,8 +40,8 @@ use crate::frontend::range::{ByteRange, RangeError, ResolvedRange, full_object, 
 use crate::frontend::s3_xml::{S3ErrorCode, error_xml};
 use crate::frontend::serve_metrics::{ConnGuard, ReqOutcome};
 use crate::http::{
-    FdGuard, HttpRequest, MAX_HEADER_BYTES, Method, ParseError, RECV_CHUNK, bind_listener,
-    send_all, serialize_response_head, split_query,
+    BoundListener, FdGuard, HttpRequest, ListeningSocket, MAX_HEADER_BYTES, Method, ParseError,
+    RECV_CHUNK, bind_socket, send_all, serialize_response_head, split_query,
 };
 use crate::ring::NetHandle;
 use crate::runtime::noop_waker;
@@ -102,14 +102,16 @@ impl S3Frontend {
         self.addr
     }
 
-    /// Create, bind, and listen the per-shard accept socket with
-    /// `SO_REUSEPORT` (and `SO_REUSEADDR`) so every shard accepts on the
-    /// same port, returning the listening [`RawFd`]. Linux-only.
-    ///
-    /// The caller owns the returned fd and is responsible for closing
-    /// it; [`S3Driver`] only reads it for `accept`.
-    pub fn bind_listener(&self) -> Result<RawFd, FrontendError> {
-        bind_listener(self.addr).map_err(|_| FrontendError::BadBind(self.addr.to_string()))
+    /// Bind a dormant per-shard `SO_REUSEPORT` socket.
+    pub fn bind_socket(&self) -> Result<BoundListener, FrontendError> {
+        bind_socket(self.addr).map_err(|_| FrontendError::BadBind(self.addr.to_string()))
+    }
+
+    /// Bind and activate the per-shard listener.
+    pub fn bind_listener(&self) -> Result<ListeningSocket, FrontendError> {
+        self.bind_socket()?
+            .listen()
+            .map_err(|_| FrontendError::BadBind(self.addr.to_string()))
     }
 }
 
@@ -125,7 +127,6 @@ impl S3Frontend {
 pub struct S3Driver<P: BufferPool<Req = StripeReq> + 'static> {
     pool: Rc<P>,
     handle: NetHandle,
-    listen_fd: RawFd,
     frontend_id: Rc<str>,
     backend_id: String,
     cache_id: Option<String>,
@@ -133,12 +134,14 @@ pub struct S3Driver<P: BufferPool<Req = StripeReq> + 'static> {
     page_size: usize,
     bypass: bool,
     accept_fut: Pin<Box<dyn Future<Output = std::io::Result<RawFd>>>>,
+    // Declared after the future so the pending accept is cancelled first.
+    listener: ListeningSocket,
     conns: Vec<Pin<Box<dyn Future<Output = ()>>>>,
     waker: Waker,
 }
 
 impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
-    /// Build a serving engine over a bound `listen_fd`.
+    /// Build a serving engine that owns an active listener.
     ///
     /// `stripe_size` and `page_size` come from the shard's pool
     /// geometry. When `bypass` is set, the frontend bridges straight to
@@ -146,7 +149,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
     pub fn new(
         pool: Rc<P>,
         handle: NetHandle,
-        listen_fd: RawFd,
+        listener: ListeningSocket,
         frontend_id: Rc<str>,
         backend_id: String,
         cache_id: Option<String>,
@@ -154,11 +157,10 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
         page_size: usize,
         bypass: bool,
     ) -> Self {
-        let accept_fut = Box::pin(handle.accept(listen_fd));
+        let accept_fut = Box::pin(handle.accept(listener.as_raw_fd()));
         Self {
             pool,
             handle,
-            listen_fd,
             frontend_id,
             backend_id,
             cache_id,
@@ -166,6 +168,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
             page_size,
             bypass,
             accept_fut,
+            listener,
             conns: Vec::new(),
             waker: noop_waker(),
         }
@@ -215,7 +218,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
                     }
                     // Rearm regardless of accept success so a transient
                     // accept error does not stop the listener.
-                    self.accept_fut = Box::pin(self.handle.accept(self.listen_fd));
+                    self.accept_fut = Box::pin(self.handle.accept(self.listener.as_raw_fd()));
                 }
                 Poll::Pending => break,
             }
@@ -232,24 +235,6 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
             }
         }
         busy
-    }
-}
-
-impl<P: BufferPool<Req = StripeReq> + 'static> Drop for S3Driver<P> {
-    /// Close the listen fd the driver owns. The driver is the sole owner
-    /// of this `SO_REUSEPORT` listener (the embedder hands it the fd from
-    /// `bind_listener` and never touches it again), so dropping the
-    /// driver (on shard shutdown or a live frontend removal) must close
-    /// it or the fd leaks. The accept future borrows only the fd number,
-    /// not ownership, so closing here is sound once the driver is gone.
-    fn drop(&mut self) {
-        if self.listen_fd >= 0 {
-            // SAFETY: `listen_fd` was returned by `bind_listener` and is
-            // owned exclusively by this driver; it is closed exactly once.
-            unsafe {
-                libc::close(self.listen_fd);
-            }
-        }
     }
 }
 
@@ -864,8 +849,8 @@ mod tests {
             }
         };
         let handle = NetHandle::new(ring);
-        let listen_fd = match bind_listener("127.0.0.1:0".parse().unwrap()) {
-            Ok(fd) => fd,
+        let listener = match bind_socket("127.0.0.1:0".parse().unwrap()).and_then(|b| b.listen()) {
+            Ok(listener) => listener,
             Err(e) => {
                 eprintln!("driver_idle_progress: bind failed: {e}; skipping");
                 return;
@@ -874,7 +859,7 @@ mod tests {
         let mut driver = S3Driver::new(
             Rc::new(MockPool),
             handle,
-            listen_fd,
+            listener,
             Rc::from("primary"),
             "primary".to_string(),
             None,

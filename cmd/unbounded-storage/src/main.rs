@@ -1244,13 +1244,13 @@ impl FrontendBuildCtx {
             Some(frontend_spec::Config::Http(_)) => {
                 let frontend = HttpFrontend::from_spec(spec)
                     .map_err(|e| format!("frontend {} from_spec: {e}", spec.name))?;
-                let listen_fd = frontend
+                let listener = frontend
                     .bind_listener()
                     .map_err(|e| format!("frontend {} bind_listener: {e}", spec.name))?;
                 Ok(ShardFrontendDriver::Http(HttpDriver::new(
                     self.pool.clone(),
                     self.handle.clone(),
-                    listen_fd,
+                    listener,
                     Rc::from(spec.name.as_str()),
                     binding.backend_id.clone(),
                     binding.cache_id.clone(),
@@ -1264,13 +1264,13 @@ impl FrontendBuildCtx {
             Some(frontend_spec::Config::S3(_)) => {
                 let frontend = S3Frontend::from_spec(spec)
                     .map_err(|e| format!("frontend {} from_spec: {e}", spec.name))?;
-                let listen_fd = frontend
+                let listener = frontend
                     .bind_listener()
                     .map_err(|e| format!("frontend {} bind_listener: {e}", spec.name))?;
                 Ok(ShardFrontendDriver::S3(S3Driver::new(
                     self.pool.clone(),
                     self.handle.clone(),
-                    listen_fd,
+                    listener,
                     Rc::from(spec.name.as_str()),
                     binding.backend_id.clone(),
                     binding.cache_id.clone(),

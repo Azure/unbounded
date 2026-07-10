@@ -32,7 +32,7 @@
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
@@ -51,9 +51,9 @@ use crate::frontend::range::{
 };
 use crate::frontend::serve_metrics::{ConnGuard, ReqOutcome};
 use crate::http::{
-    FdGuard, HttpRequest, MAX_HEADER_BYTES, Method, ParseError, RECV_CHUNK, bind_listener,
-    connection_header_value, request_allows_keep_alive, send_all, serialize_response_head,
-    split_query,
+    BoundListener, FdGuard, HttpRequest, ListeningSocket, MAX_HEADER_BYTES, Method, ParseError,
+    RECV_CHUNK, bind_socket, connection_header_value, request_allows_keep_alive, send_all,
+    serialize_response_head, split_query,
 };
 use crate::ring::NetHandle;
 use crate::runtime::noop_waker;
@@ -118,14 +118,16 @@ impl HttpFrontend {
         self.max_requests_per_connection
     }
 
-    /// Create, bind, and listen the per-shard accept socket with
-    /// `SO_REUSEPORT` (and `SO_REUSEADDR`) so every shard accepts on the
-    /// same port, returning the listening [`RawFd`]. Linux-only.
-    ///
-    /// The caller owns the returned fd and is responsible for closing
-    /// it; [`HttpDriver`] only reads it for `accept`.
-    pub fn bind_listener(&self) -> Result<RawFd, FrontendError> {
-        bind_listener(self.addr).map_err(|_| FrontendError::BadBind(self.addr.to_string()))
+    /// Bind a dormant per-shard `SO_REUSEPORT` socket.
+    pub fn bind_socket(&self) -> Result<BoundListener, FrontendError> {
+        bind_socket(self.addr).map_err(|_| FrontendError::BadBind(self.addr.to_string()))
+    }
+
+    /// Bind and activate the per-shard listener.
+    pub fn bind_listener(&self) -> Result<ListeningSocket, FrontendError> {
+        self.bind_socket()?
+            .listen()
+            .map_err(|_| FrontendError::BadBind(self.addr.to_string()))
     }
 }
 
@@ -143,7 +145,6 @@ impl HttpFrontend {
 pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
     pool: Rc<P>,
     handle: NetHandle,
-    listen_fd: RawFd,
     frontend_id: Rc<str>,
     backend_id: String,
     cache_id: Option<String>,
@@ -153,12 +154,14 @@ pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
     bypass: bool,
     max_requests_per_connection: usize,
     accept_fut: Pin<Box<dyn Future<Output = std::io::Result<RawFd>>>>,
+    // Declared after the future so the pending accept is cancelled first.
+    listener: ListeningSocket,
     conns: Vec<Pin<Box<dyn Future<Output = ()>>>>,
     waker: Waker,
 }
 
 impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
-    /// Build a serving engine over a bound `listen_fd`.
+    /// Build a serving engine that owns an active listener.
     ///
     /// `stripe_size` and `page_size` come from the shard's pool
     /// geometry. `fanout` is this shard's view of the stripe-ownership
@@ -168,7 +171,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
     pub fn new(
         pool: Rc<P>,
         handle: NetHandle,
-        listen_fd: RawFd,
+        listener: ListeningSocket,
         frontend_id: Rc<str>,
         backend_id: String,
         cache_id: Option<String>,
@@ -178,11 +181,10 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
         bypass: bool,
         max_requests_per_connection: usize,
     ) -> Self {
-        let accept_fut = Box::pin(handle.accept(listen_fd));
+        let accept_fut = Box::pin(handle.accept(listener.as_raw_fd()));
         Self {
             pool,
             handle,
-            listen_fd,
             frontend_id,
             backend_id,
             cache_id,
@@ -192,6 +194,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
             bypass,
             max_requests_per_connection,
             accept_fut,
+            listener,
             conns: Vec::new(),
             waker: noop_waker(),
         }
@@ -231,7 +234,8 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
                             unsafe {
                                 libc::close(fd);
                             }
-                            self.accept_fut = Box::pin(self.handle.accept(self.listen_fd));
+                            self.accept_fut =
+                                Box::pin(self.handle.accept(self.listener.as_raw_fd()));
                             continue;
                         }
                         let serve = serve_connection(
@@ -251,7 +255,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
                     }
                     // Rearm regardless of accept success so a transient
                     // accept error does not stop the listener.
-                    self.accept_fut = Box::pin(self.handle.accept(self.listen_fd));
+                    self.accept_fut = Box::pin(self.handle.accept(self.listener.as_raw_fd()));
                 }
                 Poll::Pending => break,
             }
@@ -268,24 +272,6 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
             }
         }
         busy
-    }
-}
-
-impl<P: BufferPool<Req = StripeReq> + 'static> Drop for HttpDriver<P> {
-    /// Close the listen fd the driver owns. The driver is the sole owner
-    /// of this `SO_REUSEPORT` listener (the embedder hands it the fd from
-    /// `bind_listener` and never touches it again), so dropping the
-    /// driver (on shard shutdown or a live frontend removal) must close
-    /// it or the fd leaks. The accept future borrows only the fd number,
-    /// not ownership, so closing here is sound once the driver is gone.
-    fn drop(&mut self) {
-        if self.listen_fd >= 0 {
-            // SAFETY: `listen_fd` was returned by `bind_listener` and is
-            // owned exclusively by this driver; it is closed exactly once.
-            unsafe {
-                libc::close(self.listen_fd);
-            }
-        }
     }
 }
 
@@ -1362,8 +1348,8 @@ mod tests {
             }
         };
         let handle = NetHandle::new(ring);
-        let listen_fd = match bind_listener("127.0.0.1:0".parse().unwrap()) {
-            Ok(fd) => fd,
+        let listener = match bind_socket("127.0.0.1:0".parse().unwrap()).and_then(|b| b.listen()) {
+            Ok(listener) => listener,
             Err(e) => {
                 eprintln!("driver_idle_progress: bind failed: {e}; skipping");
                 return;
@@ -1374,7 +1360,7 @@ mod tests {
                 err: Error::from("mock pool has no data"),
             }),
             handle,
-            listen_fd,
+            listener,
             Rc::from("primary"),
             "primary".to_string(),
             None,
