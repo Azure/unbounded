@@ -48,6 +48,11 @@ proptest! {
             report.serve_before_phase_b, 0,
             "serving future ran before phase-B peer publication",
         );
+        prop_assert_eq!(
+            report.serve_before_initial_disk_publication,
+            0,
+            "serving future ran before initial disk publication",
+        );
     }
 
     /// Invariant: disk config changes publish coherent directory generations

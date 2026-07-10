@@ -59,7 +59,11 @@ restart.
 | `-V, --version` | - | Print version. |
 
 The daemon traps `SIGINT` and `SIGTERM` and tears shards down in a
-deterministic order (disks closed first, then fabric / pool drops).
+deterministic order: shards stop and join first, disk-channel publications are
+cleared, and disks are drained last. At startup shards complete both readiness
+phases while parked; initial disks are reconciled and published before RPC
+servers and shard serving are activated. Individual disk-open failures remain
+nonfatal.
 
 ## Configuration file
 

@@ -151,9 +151,12 @@ excluded from the live-reload diff.
    numeric identity as `NodeId`.
 8. Each shard is spawned with `rt.spawn_pinned(widx, name, Box<FnOnce>)`. The
    `!Send` shard objects are constructed **inside** `run_shard`, after pinning.
-9. After every shard reports `Up`, peers are reconciled per shard, the disk
-   supervisor opens disks and publishes channels, and the config watcher takes
-   over for the lifetime of the process.
+9. After every shard reports `Up`, peers are reconciled per shard and every
+   shard completes phase B while parked. The disk supervisor then opens the
+   initial disks and publishes channels. Only after publication does activation
+   start the recursive RPC servers and release shards into their serve loops;
+   the config watcher then takes over for the lifetime of the process. Disk-open
+   failures remain nonfatal and the successfully opened subset is published.
 
 ### Shard readiness and panic safety
 
@@ -163,7 +166,10 @@ Each shard reports exactly one `ShardReady` message: `Up { descriptor, fabric }`
 panicking shard still emits one `Failed` via a dedicated panic channel;
 otherwise main's bounded receive would hang. Main performs a bounded `recv()`
 exactly `joins.len()` times (it does **not** drain to disconnect, because `Up`
-shards never drop their sender).
+shards never drop their sender). Preparation returns a `PreparedShardLayer`
+only after all phase-B reports succeed. Activation starts RPC and releases the
+parked shards; on failure it sets the layer stop flag, drops the serve gates,
+joins shards in reverse order, and tears down fabric and backing keepalives.
 
 ### Shutdown
 
@@ -172,7 +178,7 @@ SIGINT/SIGTERM handler (installed via `libc::sigaction`, relaxed atomic store).
 Every thread polls this flag.
 
 Teardown order is deliberate: join shard threads in reverse (releasing
-`Arc<engine>` references) **first**, then drop the disk channel directory, then
+`Arc<engine>` references) **first**, clear disk channel publications, then
 `disk_registry.drain()`.
 
 ## 5. Shard Bring-up (`run_shard`)
@@ -197,9 +203,10 @@ per-shard `!Send` object graph:
 5. **RPC server.** `FabricGroup`, constructed before the shards, allocates a
    **separate** scratch backing for each fabric unit (`RPC_SCRATCH_PAGES = 8`,
    one scratch page per in-flight serve/forward) and registers it as its own
-   fabric MR. After shard publication, it builds the unit's `RecursiveHandler`
-   and starts the RPC server. Scratch uses a distinct `LiveShardLocalStore`
-   because a `PageRef` resolves through exactly one backing's geometry.
+   fabric MR. After phase B and initial disk publication, activation builds the
+   unit's `RecursiveHandler` and starts the RPC server. Scratch uses a distinct
+   `LiveShardLocalStore` because a `PageRef` resolves through exactly one
+   backing's geometry.
 6. **Frontends.** A shard hosts a `FrontendRegistry` of any number of
    frontends keyed by component name. Each spec binds its listener with `SO_REUSEPORT` and
    builds an `HttpDriver`/`S3Driver`; the registry can add and remove frontends

@@ -409,14 +409,32 @@ fn main() -> ExitCode {
         .collect();
     let mut disk_registry = DiskRegistry::new(UringDiskTarget::new(runtime.clone()), disk_slots);
 
-    // Bring up the initial shard layer. A bring-up failure is fatal:
-    // there is no running process to reconcile into.
-    let layer = match shard_layer::spawn_shard_layer(&config, &deps) {
-        Ok(layer) => layer,
+    // Prepare the initial shard layer through phase B. The shards remain
+    // parked and RPC serving stays off until initial disks are published.
+    let prepared = match shard_layer::prepare_shard_layer(&config, &deps) {
+        Ok(prepared) => prepared,
         Err(errs) => {
             for e in &errs {
                 eprintln!("shard bring-up failed: {e}");
             }
+            return ExitCode::FAILURE;
+        }
+    };
+    // Reconcile and publish the startup disk set before any frontend or
+    // recursive RPC path can serve. Individual disk-open failures remain
+    // nonfatal and the successfully opened subset is published.
+    let projection =
+        config::runtime_projection(&config).expect("loaded config projects to runtime");
+    reconcile_cache_disks(&mut disk_registry, &cache_directories, &projection);
+
+    let layer = match shard_layer::activate_shard_layer(prepared) {
+        Ok(layer) => layer,
+        Err(errs) => {
+            for e in &errs {
+                eprintln!("shard activation failed: {e}");
+            }
+            clear_cache_disk_publications(&cache_directories);
+            disk_registry.drain();
             return ExitCode::FAILURE;
         }
     };
@@ -427,17 +445,12 @@ fn main() -> ExitCode {
     ));
     device_inventory.set_block(device_inventory::block_annotation(&host));
 
-    // Reconcile the startup disk set now that the shards are up, then
-    // publish the channel set so shards can reach their disks.
-    let projection =
-        config::runtime_projection(&config).expect("loaded config projects to runtime");
-    reconcile_cache_disks(&mut disk_registry, &cache_directories, &projection);
-
     // The config controller is the single funnel for live changes. It
     // owns the running shard layer and disk supervisor (via the apply
     // target) and blocks each apply until the process has converged onto
     // the new config.
-    let target = shard_layer::ProcessApplyTarget::new(layer, disk_registry, cache_directories);
+    let target =
+        shard_layer::ProcessApplyTarget::new(layer, disk_registry, cache_directories.clone());
     // Seeds the latest-known, latest-applied, and startup config
     // versions from the startup config's top-level `version`.
     // `controller.config_versions()` hands out a cloneable handle to all
@@ -522,6 +535,7 @@ fn main() -> ExitCode {
     if let Some(layer) = layer {
         shard_layer::teardown_shard_layer(layer);
     }
+    clear_cache_disk_publications(&cache_directories);
     disk_registry.drain();
 
     // The exporter polls `SHUTDOWN` on its accept loop; join it last so a
@@ -1197,6 +1211,10 @@ fn reconcile_cache_disks(
     for cache_id in cache_ids {
         cache_directories.apply_channels(&cache_id, channels.clone());
     }
+}
+
+fn clear_cache_disk_publications(cache_directories: &CacheDirectorySet) {
+    cache_directories.reconcile(std::iter::empty::<String>());
 }
 
 /// Validate and log the configured backends.

@@ -101,6 +101,7 @@ pub struct RunReport {
     pub phase_a_ready: usize,
     pub phase_b_ready: usize,
     pub serve_before_phase_b: u64,
+    pub serve_before_initial_disk_publication: u64,
     pub shard_apply_counts: Vec<usize>,
     pub broadcasts: usize,
     pub disk_applies: usize,
@@ -225,6 +226,7 @@ struct ShardState {
     apply_queue: RefCell<VecDeque<u64>>,
     applied: RefCell<Vec<u64>>,
     serve_before_phase_b: Cell<u64>,
+    serve_before_initial_disk_publication: Cell<u64>,
 }
 
 impl ShardState {
@@ -236,6 +238,7 @@ impl ShardState {
             apply_queue: RefCell::new(VecDeque::new()),
             applied: RefCell::new(Vec::new()),
             serve_before_phase_b: Cell::new(0),
+            serve_before_initial_disk_publication: Cell::new(0),
         }
     }
 }
@@ -321,6 +324,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         .map(|_| Rc::new(ShardState::new()))
         .collect();
     let peer_published = Rc::new(Cell::new(false));
+    let initial_disks_published = Rc::new(Cell::new(false));
     let serving_ready = Rc::new(Cell::new(false));
     let clients_finished = Rc::new(Cell::new(0usize));
     let completed_ops = Rc::new(Cell::new(0usize));
@@ -342,13 +346,21 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         pool_base,
         pool_len,
         bootstrap_done.clone(),
+        initial_disks_published.clone(),
     );
     spawn_storage_cores(&mut exec, generations.clone());
-    spawn_shards(&mut exec, &shard_states, peer_published.clone());
+    spawn_shards(
+        &mut exec,
+        &shard_states,
+        peer_published.clone(),
+        initial_disks_published.clone(),
+        serving_ready.clone(),
+    );
     spawn_phase_b_supervisor(
         &mut exec,
         &shard_states,
         peer_published.clone(),
+        initial_disks_published,
         serving_ready.clone(),
     );
     spawn_apply_driver(
@@ -408,6 +420,10 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         serve_before_phase_b: shard_states
             .iter()
             .map(|s| s.serve_before_phase_b.get())
+            .sum(),
+        serve_before_initial_disk_publication: shard_states
+            .iter()
+            .map(|s| s.serve_before_initial_disk_publication.get())
             .sum(),
         shard_apply_counts: shard_states
             .iter()
@@ -523,6 +539,7 @@ fn spawn_bootstrap(
     pool_base: usize,
     pool_len: usize,
     bootstrap_done: Rc<Cell<bool>>,
+    initial_disks_published: Rc<Cell<bool>>,
 ) {
     exec.spawn(async move {
         sim_cfg.max_io_delay.set(0);
@@ -555,6 +572,7 @@ fn spawn_bootstrap(
         }
         sim_cfg.max_io_delay.set(w.max_io_delay);
         publish_generation(&directory, &generations[0]);
+        initial_disks_published.set(true);
         bootstrap_done.set(true);
     });
 }
@@ -620,15 +638,19 @@ fn spawn_shards(
     exec: &mut Executor,
     shard_states: &[Rc<ShardState>],
     peer_published: Rc<Cell<bool>>,
+    initial_disks_published: Rc<Cell<bool>>,
+    serving_ready: Rc<Cell<bool>>,
 ) {
     for state in shard_states {
         let state = state.clone();
         let peer_published = peer_published.clone();
+        let initial_disks_published = initial_disks_published.clone();
+        let serving_ready = serving_ready.clone();
         exec.spawn(async move {
             let mut loop_driver = ShardLoop::new();
             let serving_state = state.clone();
             loop_driver.spawn(async move {
-                while !serving_state.phase_b.get() && !serving_state.stop.get() {
+                while !serving_ready.get() && !serving_state.stop.get() {
                     yield_once().await;
                 }
                 while !serving_state.stop.get() {
@@ -636,6 +658,11 @@ fn spawn_shards(
                         serving_state
                             .serve_before_phase_b
                             .set(serving_state.serve_before_phase_b.get() + 1);
+                    }
+                    if !initial_disks_published.get() {
+                        serving_state
+                            .serve_before_initial_disk_publication
+                            .set(serving_state.serve_before_initial_disk_publication.get() + 1);
                     }
                     yield_once().await;
                 }
@@ -671,6 +698,7 @@ fn spawn_phase_b_supervisor(
     exec: &mut Executor,
     shard_states: &[Rc<ShardState>],
     peer_published: Rc<Cell<bool>>,
+    initial_disks_published: Rc<Cell<bool>>,
     serving_ready: Rc<Cell<bool>>,
 ) {
     let shards = shard_states.to_vec();
@@ -680,6 +708,9 @@ fn spawn_phase_b_supervisor(
         }
         peer_published.set(true);
         while !shards.iter().all(|s| s.phase_b.get()) {
+            yield_once().await;
+        }
+        while !initial_disks_published.get() {
             yield_once().await;
         }
         serving_ready.set(true);

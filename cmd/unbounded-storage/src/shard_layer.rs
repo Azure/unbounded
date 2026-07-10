@@ -12,7 +12,8 @@
 //! that retires just this layer's shards without touching the
 //! process-wide shutdown signal.
 //!
-//! [`spawn_shard_layer`] brings a layer up from a config;
+//! [`prepare_shard_layer`] brings a layer through phase B without
+//! serving, [`activate_shard_layer`] starts RPC and releases the shards;
 //! [`teardown_shard_layer`] drains and joins it (used at process
 //! shutdown). [`ProcessApplyTarget`] realizes a live config apply
 //! entirely in place via [`ProcessApplyTarget::apply_in_place`]:
@@ -65,8 +66,20 @@ pub struct ShardSpawnDeps {
     pub fabric_plan: FabricPlan,
 }
 
+/// A prepared set of shard threads parked after phase B, before RPC
+/// startup and serving activation.
+pub struct PreparedShardLayer {
+    joins: Vec<JoinHandle>,
+    fabric_group: FabricGroup,
+    control: ShardControlGroup,
+    layer_stop: Arc<AtomicBool>,
+    backing_keepalives: Vec<Arc<dyn Send + Sync>>,
+    rpc_shards: Vec<RpcShardPublish>,
+    serve_start_txs: Vec<mpsc::Sender<()>>,
+}
+
 /// A spawned set of shard threads plus the handles to drive and retire
-/// them. Produced by [`spawn_shard_layer`], consumed by
+/// them. Produced by [`activate_shard_layer`], consumed by
 /// [`teardown_shard_layer`].
 pub struct ShardLayer {
     /// Join handles for every shard thread, in spawn order.
@@ -98,8 +111,9 @@ impl ShardLayer {
     }
 }
 
-/// Bring up a shard layer from `config` on the runtime in `deps`,
-/// blocking until every shard has reported readiness.
+/// Prepare a shard layer from `config` on the runtime in `deps`,
+/// blocking until every shard has completed phase B. The returned
+/// shards remain parked and no RPC server has started.
 ///
 /// Spawns one thread per worker in `deps.workers`, each with its own
 /// control channel (collected into the returned [`ShardControlGroup`])
@@ -111,10 +125,10 @@ impl ShardLayer {
 /// Returns `Err` with the collected per-shard error messages if any
 /// shard failed to come up; any shards that *did* come up are torn down
 /// first so no threads leak.
-pub fn spawn_shard_layer(
+pub fn prepare_shard_layer(
     config: &Config,
     deps: &ShardSpawnDeps,
-) -> Result<ShardLayer, Vec<String>> {
+) -> Result<PreparedShardLayer, Vec<String>> {
     let layer_stop = Arc::new(AtomicBool::new(false));
     let worker_count = deps.workers.len();
     let settings = &deps.settings;
@@ -134,7 +148,7 @@ pub fn spawn_shard_layer(
     // each shard registers its data backing against the endpoint it maps
     // onto. RPC servers start after shards publish their pool MRs/fetch
     // channels because owner responses source those bufferpool pages.
-    let mut fabric_group = FabricGroup::new(
+    let fabric_group = FabricGroup::new(
         &deps.runtime,
         &deps.fabric_plan,
         settings.backing_kind,
@@ -253,6 +267,9 @@ pub fn spawn_shard_layer(
         for h in joins.into_iter().rev() {
             let _ = h.join();
         }
+        drop(control_senders);
+        drop(fabric_group);
+        drop(publishes);
         return Err(errors);
     }
 
@@ -324,42 +341,95 @@ pub fn spawn_shard_layer(
         }
     }
     if !phaseb_errors.is_empty() {
-        layer_stop.store(true, Ordering::Relaxed);
-        drop(serve_start_txs);
-        for h in joins.into_iter().rev() {
-            let _ = h.join();
-        }
+        retire_failed_activation(
+            joins,
+            fabric_group,
+            ShardControlGroup::new(control_senders),
+            layer_stop,
+            backing_keepalives,
+            serve_start_txs,
+        );
         return Err(phaseb_errors);
     }
 
-    if let Err(mut rpc_errors) = fabric_group.start_rpc_servers(&rpc_shards) {
-        layer_stop.store(true, Ordering::Relaxed);
-        drop(serve_start_txs);
-        for h in joins.into_iter().rev() {
-            let _ = h.join();
-        }
-        phaseb_errors.append(&mut rpc_errors);
-        return Err(phaseb_errors);
+    Ok(PreparedShardLayer {
+        joins,
+        fabric_group,
+        control: ShardControlGroup::new(control_senders),
+        layer_stop,
+        backing_keepalives,
+        rpc_shards,
+        serve_start_txs,
+    })
+}
+
+/// Start recursive RPC servers and release every prepared shard into
+/// its serve loop. Any failure retires and joins the entire prepared
+/// layer before returning.
+pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, Vec<String>> {
+    let PreparedShardLayer {
+        joins,
+        mut fabric_group,
+        control,
+        layer_stop,
+        backing_keepalives,
+        rpc_shards,
+        serve_start_txs,
+    } = prepared;
+
+    if let Err(errors) = fabric_group.start_rpc_servers(&rpc_shards) {
+        retire_failed_activation(
+            joins,
+            fabric_group,
+            control,
+            layer_stop,
+            backing_keepalives,
+            serve_start_txs,
+        );
+        return Err(errors);
     }
-    for tx in serve_start_txs {
+    for tx in &serve_start_txs {
         if tx.send(()).is_err() {
-            layer_stop.store(true, Ordering::Relaxed);
-            for h in joins.into_iter().rev() {
-                let _ = h.join();
-            }
+            retire_failed_activation(
+                joins,
+                fabric_group,
+                control,
+                layer_stop,
+                backing_keepalives,
+                serve_start_txs,
+            );
             return Err(vec![
                 "shard exited before recursive RPC servers were ready".to_string(),
             ]);
         }
     }
+    drop(serve_start_txs);
 
     Ok(ShardLayer {
         joins,
         fabric_group,
-        control: ShardControlGroup::new(control_senders),
+        control,
         layer_stop,
         _backing_keepalives: backing_keepalives,
     })
+}
+
+fn retire_failed_activation(
+    joins: Vec<JoinHandle>,
+    fabric_group: FabricGroup,
+    control: ShardControlGroup,
+    layer_stop: Arc<AtomicBool>,
+    backing_keepalives: Vec<Arc<dyn Send + Sync>>,
+    serve_start_txs: Vec<mpsc::Sender<()>>,
+) {
+    layer_stop.store(true, Ordering::Relaxed);
+    drop(serve_start_txs);
+    for h in joins.into_iter().rev() {
+        let _ = h.join();
+    }
+    drop(control);
+    drop(fabric_group);
+    drop(backing_keepalives);
 }
 
 fn shard_backing_sizes(
