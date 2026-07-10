@@ -380,8 +380,8 @@ stripe, and knows how to fill a miss from either a peer or the local disk.
   local, futures-core-free `Stream` of `Result<PageRef, Error>`); and
   `Transport<R> { bulk_get(&req, src: BulkRef, dsts: &[PageRef]) -> Stream }`,
   which fetches from a **peer**. Blanket impls cover `Arc<T>`.
-- Public surface also includes `PageGuard`/`ReadStream`/`WindowedRead` (read
-  API) and `NullBlockStore`.
+- Public read surfaces also include `PageGuard`, `ReadStream`, `WindowedRead`,
+  and `PipelinedRead`.
 
 A shard's data path therefore has two miss sources: the `Transport` (peer pull
 over fabric) and the `BlockStore` (local NVMe). The `RoutedTransport` decides
@@ -464,8 +464,8 @@ These are symmetric twins around the buffer pool.
 - `Backend` (origin side): `bulk_get(&req, src: BulkRef, dsts: &[PageRef]) ->
   Stream` resolves a `BulkRef` from the authoritative **origin** into
   destination pages, one page at a time (contrast `Transport`, which pulls from
-  a peer). `HttpBackend` (Linux) memcpys origin bytes into pages carved from the
-  backing and holds an `Rc<socket>`. `NullBackend` is the no-op.
+  a peer). HTTP-family backends stream response bodies directly into registered
+  pages with fixed-buffer receives.
 - Frontend (client side): concrete `HttpFrontend`/`S3Frontend` (Linux), built
   from a `FrontendSpec` via `from_spec`, that bind a listener once per shard with
   `SO_REUSEPORT` (`bind_listener`) and produce a per-shard `HttpDriver`/`S3Driver`.

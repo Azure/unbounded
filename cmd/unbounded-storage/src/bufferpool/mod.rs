@@ -3,7 +3,6 @@
 
 mod free_list;
 mod inflight;
-mod null;
 mod pipeline;
 pub mod pool;
 pub mod stream;
@@ -17,7 +16,6 @@ mod owned_future_tests;
 mod tests;
 
 pub use free_list::RecvQuarantineHandle;
-pub use null::NullBlockStore;
 pub use pipeline::{PipelinedRead, StripePlan};
 pub use pool::Pool;
 pub use stream::{OwnedPageFuture, PageGuard, ReadStream};
