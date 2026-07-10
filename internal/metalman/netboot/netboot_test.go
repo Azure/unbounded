@@ -101,7 +101,6 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:01", IPv4: "10.0.1.50", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -195,7 +194,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 	}
 }
 
-func TestHTTPServer_HTTPBootLoaderRequiresPendingRepave(t *testing.T) {
+func TestHTTPServer_HTTPBootLoaderRequiresActiveInstallOperation(t *testing.T) {
 	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpboot123", map[string][]byte{
 		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: shimx64.efi\n"),
 		"shimx64.efi":   []byte("shim"),
@@ -205,31 +204,29 @@ func TestHTTPServer_HTTPBootLoaderRequiresPendingRepave(t *testing.T) {
 	tests := []struct {
 		name          string
 		path          string
-		statusRepave  int64
+		installActive bool
 		wantStatus    int
 		wantBody      []byte
 		wantBootEvent []string
 	}{
 		{
-			name:          "pending repave serves bootloader",
+			name:          "active install serves bootloader",
 			path:          "shimx64.efi",
-			statusRepave:  0,
+			installActive: true,
 			wantStatus:    http.StatusOK,
 			wantBody:      []byte("shim"),
 			wantBootEvent: []string{"node-http:shimx64.efi"},
 		},
 		{
-			name:         "cleared repave hides bootloader",
-			path:         "shimx64.efi",
-			statusRepave: 1,
-			wantStatus:   http.StatusNotFound,
+			name:       "no active install hides bootloader",
+			path:       "shimx64.efi",
+			wantStatus: http.StatusNotFound,
 		},
 		{
-			name:         "cleared repave serves follow-on artifacts",
-			path:         "vmlinuz",
-			statusRepave: 1,
-			wantStatus:   http.StatusOK,
-			wantBody:     []byte("kernel"),
+			name:       "no active install serves follow-on artifacts",
+			path:       "vmlinuz",
+			wantStatus: http.StatusOK,
+			wantBody:   []byte("kernel"),
 		},
 	}
 
@@ -243,17 +240,32 @@ func TestHTTPServer_HTTPBootLoaderRequiresPendingRepave(t *testing.T) {
 						BootProtocol: v1alpha3.PXEBootProtocolHTTP,
 						DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:10", IPv4: "10.0.1.60", SubnetMask: "255.255.255.0"}},
 					},
-					Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 				},
-				Status: v1alpha3.MachineStatus{
-					Operations: &v1alpha3.OperationsStatus{RepaveCounter: tt.statusRepave},
-				},
+			}
+
+			objects := []client.Object{node}
+			if tt.installActive {
+				objects = append(objects, &v1alpha3.MachineOperation{
+					ObjectMeta: metav1.ObjectMeta{Name: "replace-node-http"},
+					Spec: v1alpha3.MachineOperationSpec{
+						OperationKind: v1alpha3.OperationHostReplace,
+						MachineRef:    node.Name,
+					},
+					Status: v1alpha3.MachineOperationStatus{
+						Phase: v1alpha3.OperationPhaseInProgress,
+						Targets: []v1alpha3.MachineOperationTargetStatus{{
+							MachineRef: node.Name,
+							Phase:      v1alpha3.OperationPhaseInProgress,
+							Stage:      v1alpha3.OperationStageWaitingRepave,
+						}},
+					},
+				})
 			}
 
 			scheme := newScheme(t)
 			fc := fake.NewClientBuilder().
 				WithScheme(scheme).
-				WithObjects(node).
+				WithObjects(objects...).
 				WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 				Build()
 			recorder := &recordingStatusRecorder{}
@@ -291,6 +303,119 @@ func TestHTTPServer_HTTPBootLoaderRequiresPendingRepave(t *testing.T) {
 	}
 }
 
+func TestHTTPServer_MissingOptionalShimRevocationsFilesHTTPBoot(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "revocations123", map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: shimx64.efi\n"),
+		"shimx64.efi":   []byte("shim"),
+	})
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-revocations"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:        "ghcr.io/test/image:v1",
+				BootProtocol: v1alpha3.PXEBootProtocolHTTP,
+				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:11", IPv4: "10.0.1.61", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	srv := &HTTPServer{
+		FileResolver: FileResolver{
+			Cache:  cache,
+			Reader: fc,
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", srv.handleFile)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	tests := []struct {
+		path       string
+		wantStatus int
+		wantBody   []byte
+	}{
+		{path: "revocations.efi", wantStatus: http.StatusOK, wantBody: []byte(shimRevocationsNotPresentBody)},
+		{path: "revocations_sbat.efi", wantStatus: http.StatusOK, wantBody: []byte(shimRevocationsNotPresentBody)},
+		{path: "revocations_sku.efi", wantStatus: http.StatusOK, wantBody: []byte(shimRevocationsNotPresentBody)},
+		{path: "nested/revocations.efi", wantStatus: http.StatusOK, wantBody: []byte(shimRevocationsNotPresentBody)},
+		{path: "missing.efi", wantStatus: http.StatusNotFound},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", ts.URL+"/"+tt.path, nil)
+			req.Header.Set("X-Forwarded-For", "10.0.1.61")
+
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			require.NoError(t, err)
+
+			require.Equal(t, tt.wantStatus, resp.StatusCode)
+
+			if tt.wantBody != nil {
+				require.Equal(t, tt.wantBody, body)
+				require.Equal(t, fmt.Sprint(len(tt.wantBody)), resp.Header.Get("Content-Length"))
+			}
+		})
+	}
+}
+
+func TestHTTPServer_MissingShimRevocationsFilePXEStill404(t *testing.T) {
+	cache := setupOCICache(t, "ghcr.io/test/image:v1", "pxerevocations123", map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
+		"shimx64.efi":   []byte("shim"),
+	})
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-pxe-revocations"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:      "ghcr.io/test/image:v1",
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:12", IPv4: "10.0.1.62", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	scheme := newScheme(t)
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	srv := &HTTPServer{
+		FileResolver: FileResolver{
+			Cache:  cache,
+			Reader: fc,
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", srv.handleFile)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/revocations.efi", nil)
+	req.Header.Set("X-Forwarded-For", "10.0.1.62")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
 func TestHTTPServer_TemplateRendered(t *testing.T) {
 	bootTemplate := `set default=0
 menuentry "Install" {
@@ -308,7 +433,6 @@ menuentry "Install" {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f0", IPv4: "10.0.1.10", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -376,7 +500,6 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:02", IPv4: "10.0.1.51", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -435,7 +558,6 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:03", IPv4: "10.0.1.52", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -589,7 +711,6 @@ func TestHTTPServerDoesNotRecordBootImageWriteOnFileDownload(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:01", IPv4: "10.0.1.50", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -659,7 +780,6 @@ func TestHTTPServer_UsesMachineImageForBootFilesWhenNetbootImageUnset(t *testing
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:01", IPv4: "10.0.1.50", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -718,9 +838,8 @@ type recordedMachineCondition struct {
 }
 
 type recordedPXEDisabled struct {
-	machineName   string
-	repaveCounter int64
-	imageName     string
+	machineName string
+	imageName   string
 }
 
 type recordingStatusRecorder struct {
@@ -772,7 +891,7 @@ func (r *recordingStatusRecorder) RecordCloudInitDone(_ context.Context, machine
 	return nil
 }
 
-func (r *recordingStatusRecorder) RecordMachineCondition(_ context.Context, machineName string, condition metav1.Condition) error {
+func (r *recordingStatusRecorder) RecordOperationCondition(_ context.Context, machineName string, condition metav1.Condition) error {
 	if r.err != nil {
 		return r.err
 	}
@@ -785,7 +904,7 @@ func (r *recordingStatusRecorder) RecordMachineCondition(_ context.Context, mach
 	return nil
 }
 
-func (r *recordingStatusRecorder) RecordPXEDisabled(_ context.Context, machineName string, repaveCounter int64, imageName string) error {
+func (r *recordingStatusRecorder) RecordPXEDisabled(_ context.Context, machineName, imageName string) error {
 	if r.err != nil {
 		return r.err
 	}
@@ -793,7 +912,7 @@ func (r *recordingStatusRecorder) RecordPXEDisabled(_ context.Context, machineNa
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.disabled = append(r.disabled, recordedPXEDisabled{machineName: machineName, repaveCounter: repaveCounter, imageName: imageName})
+	r.disabled = append(r.disabled, recordedPXEDisabled{machineName: machineName, imageName: imageName})
 
 	return nil
 }
@@ -904,7 +1023,7 @@ func TestTemplateRendering_AgentConfigJSONUnset(t *testing.T) {
 	}
 }
 
-func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
+func TestGrubTemplate_NoInstallRequested(t *testing.T) {
 	grubTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "grub.cfg.tmpl"))
 	if err != nil {
 		t.Fatalf("reading grub.cfg.tmpl: %v", err)
@@ -931,6 +1050,7 @@ func TestGrubTemplate_MissingOperationsCounters(t *testing.T) {
 		"http://10.0.1.1:8080",
 		"",
 		"",
+		false,
 	)
 
 	result, err := renderTemplate(string(grubTmpl), data)
@@ -968,7 +1088,6 @@ func TestGrubTemplate_SelectsBootLeaseByRequestIP(t *testing.T) {
 					{IPv4: "10.0.1.21", MAC: "aa:bb:cc:dd:ee:21", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0"},
 				},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -978,6 +1097,7 @@ func TestGrubTemplate_SelectsBootLeaseByRequestIP(t *testing.T) {
 		"http://10.0.1.1:8080",
 		"",
 		"10.0.1.21",
+		true,
 	)
 
 	result, err := renderTemplate(string(grubTmpl), data)
@@ -988,6 +1108,78 @@ func TestGrubTemplate_SelectsBootLeaseByRequestIP(t *testing.T) {
 	require.Contains(t, body, "ip=10.0.1.21::10.0.1.1:255.255.255.0:::none")
 	require.NotContains(t, body, "unbounded.boot_mac=aa:bb:cc:dd:ee:20")
 	require.NotContains(t, body, "unbounded.disk=")
+}
+
+func TestInstallRequestedStopsAfterBootImageWritten(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-install", Namespace: "default"},
+	}
+	op := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "replace-node-install", Namespace: "default"},
+		Spec: v1alpha3.MachineOperationSpec{
+			OperationKind: v1alpha3.OperationHostReplace,
+			MachineRef:    node.Name,
+		},
+		Status: v1alpha3.MachineOperationStatus{
+			Phase: v1alpha3.OperationPhaseInProgress,
+			Targets: []v1alpha3.MachineOperationTargetStatus{{
+				MachineRef: node.Name,
+				Phase:      v1alpha3.OperationPhaseInProgress,
+				Stage:      v1alpha3.OperationStageWaitingCloudInit,
+			}},
+			Conditions: []metav1.Condition{{
+				Type:   v1alpha3.MachineOperationConditionBootImageWritten,
+				Status: metav1.ConditionTrue,
+				Reason: "Succeeded",
+			}},
+		},
+	}
+
+	fc := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithObjects(node, op).
+		Build()
+
+	resolver := FileResolver{Reader: fc}
+	installRequested, err := resolver.installRequested(t.Context(), node)
+	require.NoError(t, err)
+	require.False(t, installRequested)
+}
+
+func TestInstallRequestedBeforeBootImageWritten(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-install", Namespace: "default"},
+	}
+	op := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "replace-node-install", Namespace: "default"},
+		Spec: v1alpha3.MachineOperationSpec{
+			OperationKind: v1alpha3.OperationHostReplace,
+			MachineRef:    node.Name,
+		},
+		Status: v1alpha3.MachineOperationStatus{
+			Phase: v1alpha3.OperationPhaseInProgress,
+			Targets: []v1alpha3.MachineOperationTargetStatus{{
+				MachineRef: node.Name,
+				Phase:      v1alpha3.OperationPhaseInProgress,
+				Stage:      v1alpha3.OperationStageWaitingRepave,
+			}},
+			Conditions: []metav1.Condition{{
+				Type:   v1alpha3.MachineOperationConditionBootImageWritten,
+				Status: metav1.ConditionUnknown,
+				Reason: "Pending",
+			}},
+		},
+	}
+
+	fc := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithObjects(node, op).
+		Build()
+
+	resolver := FileResolver{Reader: fc}
+	installRequested, err := resolver.installRequested(t.Context(), node)
+	require.NoError(t, err)
+	require.True(t, installRequested)
 }
 
 func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
@@ -1566,7 +1758,6 @@ func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
 					},
 				},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -1644,7 +1835,6 @@ func TestHTTPServer_UserDataFromConfigMap(t *testing.T) {
 					},
 				},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -1965,7 +2155,6 @@ menuentry "Install {{ .Machine.Name }}" {
 				Image:      "ghcr.io/test/e2e:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:00:11:22", IPv4: "10.0.3.10", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -2066,7 +2255,6 @@ func TestHTTPServer_RoutesDiskFromMachineImageAndBootFromNetbootImage(t *testing
 				NetbootImage: "ghcr.io/test/netboot:v1",
 				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:80", IPv4: "10.0.30.10", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -2133,7 +2321,6 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 				NetbootImage: "ghcr.io/test/alpha:v1",
 				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:aa:aa:aa:aa:aa", IPv4: "10.0.10.1", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 	betaNode := &v1alpha3.Machine{
@@ -2144,7 +2331,6 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 				NetbootImage: "ghcr.io/test/beta:v1",
 				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "bb:bb:bb:bb:bb:bb", IPv4: "10.0.10.2", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -2297,7 +2483,6 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 				Image:      "ghcr.io/test/pending:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:10", IPv4: "10.0.5.10", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -2357,7 +2542,6 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:20", IPv4: "10.0.6.10", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -2402,7 +2586,7 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 
 	require.Equal(t, []string{"pxe-node"}, recorder.bootImageWrittenEvents())
 	pxeDisabled := recorder.pxeDisabledEvents()
-	require.Equal(t, []recordedPXEDisabled{{machineName: "pxe-node", repaveCounter: 1, imageName: "ghcr.io/test/image:v1"}}, pxeDisabled)
+	require.Equal(t, []recordedPXEDisabled{{machineName: "pxe-node", imageName: "ghcr.io/test/image:v1"}}, pxeDisabled)
 
 	// Second call should be idempotent (still 200)
 	req, _ = http.NewRequest("GET", ts.URL+"/pxe/disable", nil)
@@ -2428,7 +2612,6 @@ func TestHTTPServer_DisablePXE_RecordFailure(t *testing.T) {
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:21", IPv4: "10.0.6.11", SubnetMask: "255.255.255.0"}},
 			},
-			Operations: &v1alpha3.OperationsSpec{RepaveCounter: 1},
 		},
 	}
 
@@ -2914,8 +3097,8 @@ func TestBuildCloudInitCondition(t *testing.T) {
 				t.Fatal("expected non-nil condition")
 			}
 
-			if cond.Type != v1alpha3.MachineConditionCloudInitDone {
-				t.Errorf("type: got %q, want %q", cond.Type, v1alpha3.MachineConditionCloudInitDone)
+			if cond.Type != v1alpha3.MachineOperationConditionCloudInitDone {
+				t.Errorf("type: got %q, want %q", cond.Type, v1alpha3.MachineOperationConditionCloudInitDone)
 			}
 
 			if cond.Status != tt.wantStatus {

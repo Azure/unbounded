@@ -67,23 +67,6 @@ const (
 	// attempts (e.g. after a controller restart).
 	MachineConditionProvisioning = "Provisioning"
 
-	// MachineConditionRepaved indicates the state of a repave operation.
-	// Status is set to False (with Reason "Pending") when a repave begins,
-	// and True (with Reason "Succeeded") when the repave completes.
-	// The lastTransitionTime records when the repave started, which is
-	// used to detect stale repave attempts.
-	MachineConditionRepaved = "Repaved"
-
-	// MachineConditionCloudInitDone indicates whether cloud-init has
-	// finished on the machine. Status is True with Reason "Succeeded"
-	// when cloud-init completes without errors, False with Reason
-	// "Running" while cloud-init stages are still executing, and
-	// False with Reason "Failed" when a cloud-init stage reports a
-	// failure. On failure the message includes the stage name and the
-	// error result so that operators can diagnose the problem without
-	// logging into the machine.
-	MachineConditionCloudInitDone = "CloudInitDone"
-
 	// MachineConditionAgentBootstrapped indicates whether the unbounded
 	// agent completed initial node bootstrap. Status is False with Reason
 	// "Running" while the agent is preparing the nspawn node, False with
@@ -142,10 +125,6 @@ type MachineSpec struct {
 	// Agent contains settings for the unbounded node agent.
 	// +optional
 	Agent *AgentSpec `json:"agent,omitempty"`
-
-	// Operations contains counter-based operation triggers.
-	// +optional
-	Operations *OperationsSpec `json:"operations,omitempty"`
 
 	// Provider identifies the external control provider for this machine.
 	// +optional
@@ -233,7 +212,7 @@ type BastionSSHSpec struct {
 	PrivateKeyRef *SecretKeySelector `json:"privateKeyRef,omitempty"`
 }
 
-// DHCPLease defines a static DHCP lease for PXE booting.
+// DHCPLease defines static IPv4 provisioning network settings.
 type DHCPLease struct {
 	// IPv4 is the IP address to assign.
 	IPv4 string `json:"ipv4"`
@@ -314,7 +293,9 @@ type PXESpec struct {
 	// +optional
 	BootProtocol string `json:"bootProtocol,omitempty"`
 
-	// DHCPLeases defines static DHCP leases for PXE booting.
+	// DHCPLeases defines static IPv4 provisioning network settings. PXE boot
+	// uses them as DHCP leases. HTTP boot uses the first entry to configure the
+	// Redfish UEFI HTTP boot client.
 	// +optional
 	DHCPLeases []DHCPLease `json:"dhcpLeases,omitempty"`
 
@@ -513,21 +494,6 @@ type DownloadSource struct {
 	Version string `json:"version,omitempty"`
 }
 
-// OperationsSpec defines counter-based operation triggers.
-// Controllers compare spec counters against status counters to
-// determine if an operation is needed.
-type OperationsSpec struct {
-	// RebootCounter triggers a reboot when it exceeds the status
-	// reboot counter.
-	// +optional
-	RebootCounter int64 `json:"rebootCounter,omitempty"`
-
-	// RepaveCounter triggers a repave when it exceeds the status
-	// repave counter.
-	// +optional
-	RepaveCounter int64 `json:"repaveCounter,omitempty"`
-}
-
 // LocalObjectReference contains enough information to locate the referenced resource.
 type LocalObjectReference struct {
 	// Name of the referenced resource.
@@ -585,10 +551,6 @@ type MachineStatus struct {
 	// Agent holds the applied agent settings.
 	// +optional
 	Agent *AgentStatus `json:"agent,omitempty"`
-
-	// Operations holds the last-observed operation counters.
-	// +optional
-	Operations *OperationsStatus `json:"operations,omitempty"`
 
 	// Configuration records the MachineConfigurationVersion that was
 	// applied to this machine during the most recent provisioning.
@@ -652,13 +614,4 @@ type AgentStatus struct {
 	// Image is the OCI image reference that was applied to the
 	// nspawn machine.
 	Image string `json:"image,omitempty"`
-}
-
-// OperationsStatus holds the last-observed operation counters.
-type OperationsStatus struct {
-	// RebootCounter is the last reboot counter value that was acted on.
-	RebootCounter int64 `json:"rebootCounter,omitempty"`
-
-	// RepaveCounter is the last repave counter value that was acted on.
-	RepaveCounter int64 `json:"repaveCounter,omitempty"`
 }

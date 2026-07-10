@@ -108,8 +108,33 @@ func createMachineOperation(ctx context.Context, c client.WithWatch, name, opNam
 // watchMachineOperation watches a MachineOperation CR until it reaches a
 // terminal phase (Complete or Failed).
 func watchMachineOperation(ctx context.Context, c client.WithWatch, opName string) error {
-	watcher, err := c.Watch(ctx, &v1alpha3.MachineOperationList{},
+	var initial v1alpha3.MachineOperation
+	if err := c.Get(ctx, client.ObjectKey{Name: opName}, &initial); err != nil {
+		return fmt.Errorf("getting MachineOperation: %w", err)
+	}
+
+	if initial.Status.IsTerminal() {
+		return finishMachineOperationWait(&initial)
+	}
+
+	return watchMachineOperationFromResourceVersion(ctx, c, opName, initial.ResourceVersion)
+}
+
+func watchMachineOperationFromResourceVersion(ctx context.Context, c client.WithWatch, opName, resourceVersion string) error {
+	listOptions := []client.ListOption{
 		client.MatchingFields{"metadata.name": opName},
+	}
+	if resourceVersion != "" {
+		listOptions = append(listOptions, &client.ListOptions{
+			Raw: &metav1.ListOptions{
+				ResourceVersion: resourceVersion,
+			},
+		})
+	}
+
+	watcher, err := c.Watch(
+		ctx, &v1alpha3.MachineOperationList{},
+		listOptions...,
 	)
 	if err != nil {
 		return fmt.Errorf("watching MachineOperation: %w", err)
@@ -161,6 +186,10 @@ func watchMachineOperation(ctx context.Context, c client.WithWatch, opName strin
 
 			return nil
 		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	return fmt.Errorf("watch closed before operation completed")

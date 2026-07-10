@@ -289,22 +289,6 @@ spec:
                       Kubernetes version.
                     type: string
                 type: object
-              operations:
-                description: Operations contains counter-based operation triggers.
-                properties:
-                  rebootCounter:
-                    description: |-
-                      RebootCounter triggers a reboot when it exceeds the status
-                      reboot counter.
-                    format: int64
-                    type: integer
-                  repaveCounter:
-                    description: |-
-                      RepaveCounter triggers a repave when it exceeds the status
-                      repave counter.
-                    format: int64
-                    type: integer
-                type: object
               provider:
                 description: Provider identifies the external control provider for
                   this machine.
@@ -366,9 +350,13 @@ spec:
                         type: object
                     type: object
                   dhcpLeases:
-                    description: DHCPLeases defines static DHCP leases for PXE booting.
+                    description: |-
+                      DHCPLeases defines static IPv4 provisioning network settings. PXE boot
+                      uses them as DHCP leases. HTTP boot uses the first entry to configure the
+                      Redfish UEFI HTTP boot client.
                     items:
-                      description: DHCPLease defines a static DHCP lease for PXE booting.
+                      description: DHCPLease defines static IPv4 provisioning network
+                        settings.
                       properties:
                         dns:
                           description: DNS is a list of DNS server addresses.
@@ -660,20 +648,6 @@ spec:
               message:
                 description: Message provides additional status information.
                 type: string
-              operations:
-                description: Operations holds the last-observed operation counters.
-                properties:
-                  rebootCounter:
-                    description: RebootCounter is the last reboot counter value that
-                      was acted on.
-                    format: int64
-                    type: integer
-                  repaveCounter:
-                    description: RepaveCounter is the last repave counter value that
-                      was acted on.
-                    format: int64
-                    type: integer
-                type: object
               phase:
                 description: |-
                   Phase is the current phase of the machine. Intended for human

@@ -17,6 +17,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -242,7 +244,12 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 				return nil, fmt.Errorf("marshal agent config: %w", err)
 			}
 
-			data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON), requestIP))
+			installRequested, err := f.installRequested(ctx, node)
+			if err != nil {
+				return nil, err
+			}
+
+			data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON), requestIP, installRequested))
 			if err != nil {
 				return nil, err
 			}
@@ -294,20 +301,17 @@ func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v
 }
 
 type templateData struct {
-	Machine             *v1alpha3.Machine
-	BootLease           *v1alpha3.DHCPLease
-	ApiserverURL        string
-	ServeURL            string
-	AgentConfigJSON     string
-	InstallScript       string
-	InstallEnv          []string
-	SpecRepaveCounter   int64
-	StatusRepaveCounter int64
+	Machine          *v1alpha3.Machine
+	BootLease        *v1alpha3.DHCPLease
+	ApiserverURL     string
+	ServeURL         string
+	AgentConfigJSON  string
+	InstallScript    string
+	InstallEnv       []string
+	InstallRequested bool
 }
 
-func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, requestIP string) templateData {
-	var specRepave, statusRepave int64
-
+func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, requestIP string, installRequested bool) templateData {
 	var (
 		agent     *v1alpha3.AgentSpec
 		bootLease *v1alpha3.DHCPLease
@@ -316,26 +320,17 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 	if node != nil {
 		agent = node.Spec.Agent
 		bootLease = selectBootLease(node, requestIP)
-
-		if node.Spec.Operations != nil {
-			specRepave = node.Spec.Operations.RepaveCounter
-		}
-
-		if node.Status.Operations != nil {
-			statusRepave = node.Status.Operations.RepaveCounter
-		}
 	}
 
 	return templateData{
-		Machine:             node,
-		BootLease:           bootLease,
-		ApiserverURL:        ci.ApiserverURL,
-		ServeURL:            serveURL,
-		AgentConfigJSON:     agentConfigJSON,
-		InstallScript:       provision.UnboundedAgentInstallScript(),
-		InstallEnv:          provision.AgentInstallEnv(agent),
-		SpecRepaveCounter:   specRepave,
-		StatusRepaveCounter: statusRepave,
+		Machine:          node,
+		BootLease:        bootLease,
+		ApiserverURL:     ci.ApiserverURL,
+		ServeURL:         serveURL,
+		AgentConfigJSON:  agentConfigJSON,
+		InstallScript:    provision.UnboundedAgentInstallScript(),
+		InstallEnv:       provision.AgentInstallEnv(agent),
+		InstallRequested: installRequested,
 	}
 }
 
@@ -351,6 +346,45 @@ func selectBootLease(node *v1alpha3.Machine, requestIP string) *v1alpha3.DHCPLea
 	}
 
 	return &node.Spec.PXE.DHCPLeases[0]
+}
+
+func (f *FileResolver) installRequested(ctx context.Context, node *v1alpha3.Machine) (bool, error) {
+	if f.Reader == nil || node == nil {
+		return false, nil
+	}
+
+	var list v1alpha3.MachineOperationList
+	if err := f.Reader.List(ctx, &list); err != nil {
+		return false, fmt.Errorf("list MachineOperations: %w", err)
+	}
+
+	for _, op := range list.Items {
+		if op.Spec.OperationKind != v1alpha3.OperationHostReplace || op.Status.IsTerminal() {
+			continue
+		}
+
+		if operationRequestsInstall(&op, node.Name) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func operationRequestsInstall(op *v1alpha3.MachineOperation, machineName string) bool {
+	if cond := apimeta.FindStatusCondition(op.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten); cond != nil && cond.Status == metav1.ConditionTrue {
+		return false
+	}
+
+	for _, target := range op.Status.Targets {
+		if target.MachineRef != machineName {
+			continue
+		}
+
+		return target.Phase != v1alpha3.OperationPhaseComplete && target.Phase != v1alpha3.OperationPhaseFailed
+	}
+
+	return len(op.Status.Targets) == 0 && op.Spec.MachineRef == machineName
 }
 
 var (

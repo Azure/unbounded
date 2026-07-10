@@ -28,6 +28,7 @@ import (
 
 const (
 	ociLayoutScheme    = "oci-layout://"
+	ociImageScheme     = "oci://"
 	ociPullMaxAttempts = 5
 	ociPullRetryDelay  = 2 * time.Second
 )
@@ -324,9 +325,11 @@ func parseOCILayoutReference(image string) (layoutDir, tag string, ok bool, err 
 }
 
 // parseImageReference splits an OCI image reference like
-// "registry.example.com/repo:tag" into the repository reference and tag.
+// "registry.example.com/repo:tag" or "oci://registry.example.com/repo:tag"
+// into the repository reference and tag.
 // If no tag is specified, "latest" is used.
 func parseImageReference(image string) (ref, tag string, err error) {
+	image = strings.TrimPrefix(image, ociImageScheme)
 	if image == "" {
 		return "", "", fmt.Errorf("empty image reference")
 	}

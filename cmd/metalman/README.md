@@ -52,14 +52,15 @@ everything needed to PXE-boot and manage bare metal hosts:
 
 | Service | Default Port | Protocol | Purpose |
 |---------|-------------|----------|---------|
-| DHCP    | 67/udp      | DHCPv4   | Static leases derived from Machine NIC specs |
+| DHCP    | 67/udp      | DHCPv4   | Static leases derived from Machine NIC specs for PXE or DHCP-assisted HTTP boot |
 | TFTP    | 69/udp      | TFTP     | Initial bootloader delivery (e.g. shimx64.efi) |
 | HTTP    | 8880/tcp    | HTTP     | Artifact serving, templated configs, attestation endpoints |
 | Health  | 8081/tcp    | HTTP     | Liveness/readiness probes |
 
 The controller also runs reconcilers for OCI image pulling (downloading and
-caching machine and netboot images from container registries) and Machine resources with
-Redfish BMC specs (power management, boot order configuration).
+caching machine and netboot images from container registries), Redfish TLS
+certificate pinning, and `MachineOperation` host actions such as reboot and
+repave.
 
 When deployed inside a cluster, the container entrypoint is `metalman` and the
 `site deploy-pxe` command passes `serve-pxe` as an argument:
@@ -203,7 +204,15 @@ boot artifacts from the default netboot image. Set `spec.pxe.netbootImage` only
 when a Machine needs a non-default PXE boot environment. The node must be
 manually PXE-booted (or have PXE as its default boot option).
 
-The default netboot template passes the matching DHCP lease MAC to the installer
+When `spec.pxe.bootProtocol` is `HTTP`, `dhcpLeases` also supplies the static
+UEFI HTTP boot client configuration. Metalman uses Redfish to disable DHCPv4 on
+the host EthernetInterface matching the first lease MAC and writes that lease's
+IPv4 address, subnet mask, gateway, and DNS servers before setting the UEFI HTTP
+boot override. With Redfish access and an HTTP boot URL, repaving can run without
+any DHCP server on the provisioning network. If a host has multiple NICs, put the
+UEFI HTTP boot NIC first in `dhcpLeases`.
+
+The default netboot template passes the selected lease MAC to the installer
 initrd, which uses it to select the provisioning NIC instead of assuming a fixed
 interface name such as `eth0`. If `spec.pxe.targetDisk` is set, the installer
 writes the image to that disk; otherwise it falls back to automatic disk
@@ -211,8 +220,8 @@ selection.
 
 #### BMC
 
-Adding a `redfish` block enables remote power management. The controller will
-manage boot order and execute reboot cycles without physical access:
+Adding a `redfish` block enables remote power management. Metalman uses it for
+`MachineOperation` host actions without physical access:
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -247,7 +256,7 @@ To repave a node with BMC access:
 kubectl unbounded machine repave node-01
 ```
 
-This increments `spec.operations.repaveCounter` and `spec.operations.rebootCounter`. The
-controller handles the rest - it configures the boot order for the selected
-`spec.pxe.bootProtocol`, executes a ForceOff/On power cycle, and clears the
-condition once the node is back up.
+This creates a `HostReplace` `MachineOperation`. Metalman handles the rest: it
+configures the boot override for the selected `spec.pxe.bootProtocol`, executes
+a Redfish force restart, waits for the installer `/pxe/disable` signal, tracks
+first-boot cloud-init on the operation, and completes after the node is back up.
