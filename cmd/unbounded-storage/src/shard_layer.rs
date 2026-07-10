@@ -642,7 +642,13 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             // endpoint here.
             if diff.requires_peer_reconcile() {
                 let runtime_peers = config::runtime_peers(new.runtime());
-                layer.fabric_group.reconcile_peers(&runtime_peers);
+                if let Err(failures) = layer.fabric_group.reconcile_peers(&runtime_peers) {
+                    crate::SHUTDOWN.store(true, Ordering::Release);
+                    return Err(ApplyError::Target(format!(
+                        "hard peer reconciliation failure(s): {}",
+                        failures.join("; ")
+                    )));
+                }
             }
 
             // The RPC-side backend registries also live on the shared

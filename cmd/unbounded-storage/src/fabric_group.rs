@@ -416,7 +416,8 @@ impl FabricGroup {
     /// Re-drive every endpoint's fabric connection table toward `peers`.
     /// Connections live at the fabric/address-vector level, so this runs
     /// once per endpoint rather than once per shard.
-    pub fn reconcile_peers(&mut self, peers: &[RuntimePeer]) {
+    pub fn reconcile_peers(&mut self, peers: &[RuntimePeer]) -> Result<(), Vec<String>> {
+        let mut failures = Vec::new();
         for (unit_idx, unit) in self.units.iter_mut().enumerate() {
             let desired = runtime_peer_connections_for_unit(peers, unit_idx);
             let report = config::reconcile::reconcile_connections(
@@ -427,6 +428,10 @@ impl FabricGroup {
             unit.applied_peers = report.applied;
             for (peer, err) in &report.failures {
                 eprintln!("fabric peer reconcile failed: peer={} err={err}", peer.0);
+                failures.push(format!(
+                    "unit={unit_idx} device={} peer={}: {err}",
+                    unit.device_name, peer.0
+                ));
             }
             // Publish the full desired set so the background reconnect
             // thread keeps retrying peers whose dial lost the startup
@@ -434,6 +439,12 @@ impl FabricGroup {
             // connected, hence were never removed by reconcile) are
             // pruned from the desired set.
             unit.fabric.set_desired_peers(desired);
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures)
         }
     }
 
@@ -519,8 +530,20 @@ fn build_unit(
     fabric.check_shared_domain_capacity(spec.expected_mr);
 
     let desired_peers = runtime_peer_connections_for_unit(peers, spec.unit_idx);
-    let applied_peers =
-        config::reconcile::reconcile_connections(&fabric, &desired_peers, None).applied;
+    let peer_report = config::reconcile::reconcile_connections(&fabric, &desired_peers, None);
+    if !peer_report.failures.is_empty() {
+        let details = peer_report
+            .failures
+            .iter()
+            .map(|(peer, error)| format!("peer={}: {error}", peer.0))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "worker={worker}: {} peer(s) failed to reconcile: {details}",
+            peer_report.failures.len()
+        ));
+    }
+    let applied_peers = peer_report.applied;
     // Seed the desired-peer set so the background reconnect thread can
     // retry any peer whose initial dial lost the startup race.
     fabric.set_desired_peers(desired_peers.clone());
