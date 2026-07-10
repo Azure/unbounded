@@ -954,8 +954,20 @@ fn run_shard(
                         failures.extend(combined.frontends.failures.clone());
                         let commit = failures.is_empty() && combined.frontends.deferred.is_empty();
                         let result = if commit {
-                            // Retire old frontends before their old backends.
-                            frontend_transaction.finalize();
+                            // Activate and retire old frontends before their
+                            // old backends. A local activation failure leaves
+                            // both live registries unchanged.
+                            if let Err(error) = frontend_transaction.finalize() {
+                                backend_transaction.rollback();
+                                *geometry.borrow_mut() = prior_geometry;
+                                *bindings.borrow_mut() = prior_bindings;
+                                let _ = apply.ack.send(config::ShardAck {
+                                    worker: widx,
+                                    result: Err(error),
+                                });
+                                did_work = true;
+                                continue;
+                            }
                             backend_transaction.finalize();
                             last_backends = combined.backends.applied;
                             last_frontends = combined.frontends.applied;
@@ -1426,48 +1438,61 @@ impl FrontendBuildCtx {
 struct FrontendRegistryTransaction {
     ctx: FrontendBuildCtx,
     frontends: Rc<RefCell<HashMap<String, ActiveShardFrontend>>>,
-    entries: RefCell<Option<RegistryTransaction<ActiveShardFrontend>>>,
+    projected: RefCell<HashSet<String>>,
+    replacements: RefCell<HashMap<String, PreparedShardFrontend>>,
 }
 
 impl FrontendRegistryTransaction {
-    fn finalize(self) {
-        self.entries
-            .borrow_mut()
-            .take()
-            .expect("frontend transaction active")
-            .finalize();
+    fn finalize(self) -> Result<(), String> {
+        let projected = self.projected.into_inner();
+        let mut replacements: Vec<_> = self.replacements.into_inner().into_iter().collect();
+        replacements.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Activate every replacement before touching the live registry.
+        // If one listen/driver construction fails, the temporary drivers
+        // drop and every old frontend remains installed.
+        let mut activated = Vec::with_capacity(replacements.len());
+        for (id, prepared) in replacements {
+            activated.push((id.clone(), self.ctx.activate(&id, prepared)?));
+        }
+
+        let mut entries = RegistryTransaction::new(self.frontends.clone());
+        let current: Vec<_> = self.frontends.borrow().keys().cloned().collect();
+        for id in current {
+            if !projected.contains(&id) {
+                entries.remove(&id);
+            }
+        }
+        for (id, frontend) in activated {
+            entries.replace(id, frontend);
+        }
+        entries.finalize();
+        Ok(())
     }
 
     fn rollback(self) {
-        self.entries
-            .borrow_mut()
-            .take()
-            .expect("frontend transaction active")
-            .rollback();
+        // Prepared frontends have never listened or entered the live map.
+        // Dropping them closes dormant bound sockets.
     }
 }
 
 impl config::reconcile::FrontendReconcileTarget for FrontendRegistryTransaction {
     fn list(&self) -> Vec<String> {
-        self.frontends.borrow().keys().cloned().collect()
+        self.projected.borrow().iter().cloned().collect()
     }
 
     fn add(&self, spec: &FrontendSpec) -> Result<(), String> {
-        let frontend = self.ctx.build(spec)?;
-        self.entries
+        let frontend = self.ctx.prepare(spec)?;
+        self.projected.borrow_mut().insert(spec.name.clone());
+        self.replacements
             .borrow_mut()
-            .as_mut()
-            .expect("frontend transaction active")
-            .replace(spec.name.clone(), frontend);
+            .insert(spec.name.clone(), frontend);
         Ok(())
     }
 
     fn remove(&self, id: &str) -> Result<(), String> {
-        self.entries
-            .borrow_mut()
-            .as_mut()
-            .expect("frontend transaction active")
-            .remove(id);
+        self.projected.borrow_mut().remove(id);
+        self.replacements.borrow_mut().remove(id);
         Ok(())
     }
 }
@@ -1518,10 +1543,12 @@ impl FrontendRegistry {
     }
 
     fn transaction(&self) -> FrontendRegistryTransaction {
+        let projected = self.frontends.borrow().keys().cloned().collect();
         FrontendRegistryTransaction {
             ctx: self.ctx.clone(),
             frontends: self.frontends.clone(),
-            entries: RefCell::new(Some(RegistryTransaction::new(self.frontends.clone()))),
+            projected: RefCell::new(projected),
+            replacements: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1542,15 +1569,13 @@ impl config::reconcile::FrontendReconcileTarget for FrontendRegistry {
     fn add(&self, spec: &FrontendSpec) -> Result<(), String> {
         let transaction = self.transaction();
         config::reconcile::FrontendReconcileTarget::add(&transaction, spec)?;
-        transaction.finalize();
-        Ok(())
+        transaction.finalize()
     }
 
     fn remove(&self, id: &str) -> Result<(), String> {
         let transaction = self.transaction();
         config::reconcile::FrontendReconcileTarget::remove(&transaction, id)?;
-        transaction.finalize();
-        Ok(())
+        transaction.finalize()
     }
 }
 
