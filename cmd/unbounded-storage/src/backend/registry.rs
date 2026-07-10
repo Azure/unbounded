@@ -20,7 +20,7 @@
 //! the same way it drives the peer fabric.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -62,8 +62,8 @@ pub struct BackendRegistry {
 pub struct BackendRegistryTransaction {
     backends: Rc<RefCell<HashMap<String, Rc<OriginBackend>>>>,
     ctx: BuildCtx,
-    originals: RefCell<HashMap<String, Option<Rc<OriginBackend>>>>,
-    completed: bool,
+    projected: RefCell<HashSet<String>>,
+    replacements: RefCell<HashMap<String, Rc<OriginBackend>>>,
 }
 
 impl BackendRegistry {
@@ -106,50 +106,30 @@ impl BackendRegistry {
     }
 
     pub fn transaction(&self) -> BackendRegistryTransaction {
+        let projected = self.backends.borrow().keys().cloned().collect();
         BackendRegistryTransaction {
             backends: self.backends.clone(),
             ctx: self.ctx.clone(),
-            originals: RefCell::new(HashMap::new()),
-            completed: false,
+            projected: RefCell::new(projected),
+            replacements: RefCell::new(HashMap::new()),
         }
     }
 }
 
 impl BackendRegistryTransaction {
-    pub fn finalize(mut self) {
-        self.completed = true;
-        self.originals.get_mut().clear();
-    }
-
-    pub fn rollback(mut self) {
-        self.rollback_inner();
-        self.completed = true;
-    }
-
-    fn record_original(&self, id: &str) {
-        let mut originals = self.originals.borrow_mut();
-        if originals.contains_key(id) {
-            return;
-        }
-        originals.insert(id.to_string(), self.backends.borrow_mut().remove(id));
-    }
-
-    fn rollback_inner(&mut self) {
+    pub fn finalize(self) {
+        let projected = self.projected.into_inner();
+        let replacements = self.replacements.into_inner();
         let mut backends = self.backends.borrow_mut();
-        for (id, original) in self.originals.get_mut().drain() {
-            backends.remove(&id);
-            if let Some(original) = original {
-                backends.insert(id, original);
-            }
+        backends.retain(|id, _| projected.contains(id));
+        for (id, backend) in replacements {
+            backends.insert(id, backend);
         }
     }
-}
 
-impl Drop for BackendRegistryTransaction {
-    fn drop(&mut self) {
-        if !self.completed {
-            self.rollback_inner();
-        }
+    pub fn rollback(self) {
+        // Staged backends have never been published, so dropping the
+        // transaction is the complete rollback operation.
     }
 }
 
@@ -329,7 +309,7 @@ impl BackendReconcileTarget for BackendRegistry {
 
 impl BackendReconcileTarget for BackendRegistryTransaction {
     fn list(&self) -> Vec<String> {
-        self.backends.borrow().keys().cloned().collect()
+        self.projected.borrow().iter().cloned().collect()
     }
 
     fn add(&self, spec: &BackendSpec) -> Result<(), String> {
@@ -337,16 +317,16 @@ impl BackendReconcileTarget for BackendRegistryTransaction {
             .ctx
             .build(spec)
             .map_err(|e| format!("build backend {}: {e}", spec.name))?;
-        self.record_original(&spec.name);
-        self.backends
+        self.projected.borrow_mut().insert(spec.name.clone());
+        self.replacements
             .borrow_mut()
             .insert(spec.name.clone(), Rc::new(backend));
         Ok(())
     }
 
     fn remove(&self, id: &str) -> Result<(), String> {
-        self.record_original(id);
-        self.backends.borrow_mut().remove(id);
+        self.projected.borrow_mut().remove(id);
+        self.replacements.borrow_mut().remove(id);
         Ok(())
     }
 }
@@ -571,15 +551,17 @@ mod tests {
     }
 
     #[test]
-    fn transaction_drop_restores_all_backend_changes() {
+    fn transaction_stages_all_backend_changes_invisibly() {
         let reg = registry(&[fake_spec("keep", 1), fake_spec("remove", 2)]);
         {
             let transaction = reg.transaction();
             transaction.add(&fake_spec("keep", 3)).unwrap();
             transaction.add(&fake_spec("new", 4)).unwrap();
             transaction.remove("remove").unwrap();
-            assert!(reg.contains("new"));
-            assert!(!reg.contains("remove"));
+            assert!(transaction.list().contains(&"new".to_string()));
+            assert!(!transaction.list().contains(&"remove".to_string()));
+            assert!(!reg.contains("new"));
+            assert!(reg.contains("remove"));
         }
 
         assert!(reg.contains("keep"));
@@ -611,5 +593,18 @@ mod tests {
 
         assert!(reg.contains("keep"));
         assert!(!reg.contains("new"));
+    }
+
+    #[test]
+    fn remove_then_add_stages_a_replacement() {
+        let reg = registry(&[fake_spec("replace", 1)]);
+        let original = reg.backends.borrow()["replace"].clone();
+        let transaction = reg.transaction();
+        transaction.remove("replace").unwrap();
+        transaction.add(&fake_spec("replace", 2)).unwrap();
+
+        assert!(Rc::ptr_eq(&reg.backends.borrow()["replace"], &original));
+        transaction.finalize();
+        assert!(!Rc::ptr_eq(&reg.backends.borrow()["replace"], &original));
     }
 }
