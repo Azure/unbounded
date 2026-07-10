@@ -77,7 +77,7 @@ RUN mkdir -p /disk/grub /disk/cloud-init && \
     cp /artifacts/vmlinuz /artifacts/initrd /artifacts/init.cpio /disk/ && \
 	if [ "${TARGETARCH}" = "amd64" ]; then \
 		cp /artifacts/shimx64.efi /artifacts/grubx64.efi /disk/ && \
-		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: shimx64.efi" > /disk/metadata.yaml; \
+		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: grubx64.efi" > /disk/metadata.yaml; \
 	elif [ "${TARGETARCH}" = "arm64" ]; then \
 		cp /artifacts/shimaa64.efi /artifacts/grubaa64.efi /disk/ && \
 		printf '%s\n' "dhcpBootImageName: shimaa64.efi" "httpBootPath: shimaa64.efi" > /disk/metadata.yaml; \
