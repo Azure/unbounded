@@ -50,9 +50,9 @@ type AgentConfig struct {
 	// When empty the agent uses the built-in default image.
 	OCIImage string `json:"OCIImage,omitempty"`
 
-	// AdditionalHostDevices lists extra host device nodes under /dev that
-	// should be exposed to the nspawn machine in addition to automatically
-	// discovered devices.
+	// AdditionalHostDevices lists extra host device nodes under /dev or systemd
+	// device group specifiers that should be exposed to the nspawn machine in
+	// addition to automatically discovered devices.
 	AdditionalHostDevices []string `json:"AdditionalHostDevices,omitempty"`
 
 	// OfflineArtifacts points to a complete offline binary artifact source.
@@ -193,8 +193,8 @@ func (a *AgentConfig) Validate() error {
 	return errors.Join(errs...)
 }
 
-// ValidateAdditionalHostDevices checks that configured host device paths are
-// safe to render into systemd-nspawn Bind= and DeviceAllow= directives.
+// ValidateAdditionalHostDevices checks that configured host device paths and
+// systemd device group specifiers are safe to render into nspawn directives.
 func ValidateAdditionalHostDevices(paths []string) error {
 	var errs []error
 
@@ -212,8 +212,12 @@ func validateAdditionalHostDevice(path string) error {
 		return fmt.Errorf("AdditionalHostDevices entry %q must not contain whitespace or ':'", path)
 	}
 
+	if IsSystemdDeviceGroupSpecifier(path) {
+		return nil
+	}
+
 	if path == "" || !strings.HasPrefix(path, "/dev/") {
-		return fmt.Errorf("AdditionalHostDevices entry %q must be an absolute path under /dev", path)
+		return fmt.Errorf("AdditionalHostDevices entry %q must be an absolute path under /dev or a systemd device group specifier", path)
 	}
 
 	if cleaned := filepath.Clean(path); cleaned != path || !strings.HasPrefix(cleaned, "/dev/") {
@@ -221,6 +225,26 @@ func validateAdditionalHostDevice(path string) error {
 	}
 
 	return nil
+}
+
+// IsSystemdDeviceGroupSpecifier reports whether value is a systemd DeviceAllow
+// device group specifier, such as char-input or block-*.
+func IsSystemdDeviceGroupSpecifier(value string) bool {
+	for _, prefix := range []string{"char-", "block-"} {
+		if !strings.HasPrefix(value, prefix) {
+			continue
+		}
+
+		group := strings.TrimPrefix(value, prefix)
+
+		return group != "" && strings.IndexFunc(group, func(r rune) bool {
+			return (r < 'a' || r > 'z') &&
+				(r < 'A' || r > 'Z') &&
+				(r < '0' || r > '9') && !strings.ContainsRune("_-/*?", r)
+		}) == -1
+	}
+
+	return false
 }
 
 // AgentClusterConfig holds the cluster-level values the agent needs to

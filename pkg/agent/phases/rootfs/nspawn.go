@@ -70,6 +70,7 @@ type nspawnTemplateData struct {
 	ContainerImageArchiveDir     string
 	ContainerImageArchiveHostDir string
 	HostDevicePaths              []string
+	HostDeviceGroupSpecifiers    []string
 	NvidiaGPUDevicePaths         []string
 	NvidiaLibDirMounts           []goalstates.NvidiaLibDirMount
 	AMDGPUDevicePaths            []string
@@ -84,6 +85,7 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	// directory.
 	machineName := filepath.Base(e.goalState.MachineDir)
 	hostDevicePaths := e.goalState.HostDevices.Paths()
+	hostDeviceGroupSpecifiers := e.goalState.HostDevices.DeviceGroupSpecifiers()
 	amdGPUDevicePaths := pathsExcluding(e.goalState.AMD.GPUDevicePaths, e.goalState.Nvidia.GPUDevicePaths)
 
 	archiveDir := filepath.Join(e.goalState.MachineDir, strings.TrimPrefix(goalstates.ContainerImageArchiveDir, "/"))
@@ -97,6 +99,7 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 		HostDevicePaths:              hostDevicePaths,
+		HostDeviceGroupSpecifiers:    hostDeviceGroupSpecifiers,
 		NvidiaGPUDevicePaths:         e.goalState.Nvidia.GPUDevicePaths,
 		NvidiaLibDirMounts:           e.goalState.Nvidia.LibDirMounts,
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
