@@ -2,68 +2,53 @@
 // Licensed under the MIT License.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-pub(crate) struct RegistryTransaction<T> {
+pub(crate) struct RegistryTransaction<P, T> {
     live: Rc<RefCell<HashMap<String, T>>>,
-    originals: HashMap<String, Option<T>>,
-    completed: bool,
+    replacements: HashMap<String, P>,
+    removals: HashSet<String>,
 }
 
-impl<T> RegistryTransaction<T> {
+impl<P, T> RegistryTransaction<P, T> {
     pub(crate) fn new(live: Rc<RefCell<HashMap<String, T>>>) -> Self {
         Self {
             live,
-            originals: HashMap::new(),
-            completed: false,
+            replacements: HashMap::new(),
+            removals: HashSet::new(),
         }
     }
 
-    pub(crate) fn replace(&mut self, id: String, value: T) {
-        self.record_original(&id);
-        self.live.borrow_mut().insert(id, value);
+    pub(crate) fn replace(&mut self, id: String, value: P) {
+        self.removals.remove(&id);
+        self.replacements.insert(id, value);
     }
 
     pub(crate) fn remove(&mut self, id: &str) {
-        self.record_original(id);
-        self.live.borrow_mut().remove(id);
+        self.replacements.remove(id);
+        self.removals.insert(id.to_string());
     }
 
-    pub(crate) fn finalize(mut self) {
-        self.completed = true;
-        self.originals.clear();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn rollback(mut self) {
-        self.rollback_inner();
-        self.completed = true;
-    }
-
-    fn record_original(&mut self, id: &str) {
-        if self.originals.contains_key(id) {
-            return;
+    pub(crate) fn commit(
+        self,
+        mut activate: impl FnMut(&str, P) -> Result<T, String>,
+    ) -> Result<(), String> {
+        let mut replacements = HashMap::with_capacity(self.replacements.len());
+        let mut prepared: Vec<_> = self.replacements.into_iter().collect();
+        prepared.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (id, value) in prepared {
+            let active = activate(&id, value)?;
+            replacements.insert(id, active);
         }
-        let original = self.live.borrow_mut().remove(id);
-        self.originals.insert(id.to_string(), original);
-    }
 
-    fn rollback_inner(&mut self) {
         let mut live = self.live.borrow_mut();
-        for (id, original) in self.originals.drain() {
+        for id in self.removals {
             live.remove(&id);
-            if let Some(original) = original {
-                live.insert(id, original);
-            }
         }
-    }
-}
-
-impl<T> Drop for RegistryTransaction<T> {
-    fn drop(&mut self) {
-        if !self.completed {
-            self.rollback_inner();
+        for (id, active) in replacements {
+            live.insert(id, active);
         }
+        Ok(())
     }
 }

@@ -575,6 +575,7 @@ fn run_shard(
     peer_rx: mpsc::Receiver<Arc<Vec<PeerPublish>>>,
     phaseb_tx: mpsc::Sender<PhaseBReport>,
     serve_start_rx: mpsc::Receiver<()>,
+    activation_tx: mpsc::Sender<ShardActivationReport>,
     terminal_tx: mpsc::Sender<ShardTerminalReport>,
     layer_stop: Arc<AtomicBool>,
 ) {
@@ -888,7 +889,6 @@ fn run_shard(
     // build-from-spec work (DNS resolve, listener bind) stays off the
     // fast path.
     {
-        let routes = routes.clone();
         let transport_registry = transport_registry.clone();
         let frontend_registry = frontend_registry.clone();
         let pool = pool.clone();
@@ -937,7 +937,9 @@ fn run_shard(
                         // Drive the transport backend registry and the
                         // frontend registry together so frontend adds are
                         // gated on their referenced backend being present.
-                        let combined = config::reconcile::reconcile_backends_and_frontends(
+                        frontend_registry.begin_transaction();
+                        let previous_frontends = last_frontends.clone();
+                        let mut combined = config::reconcile::reconcile_backends_and_frontends(
                             &transport_registry,
                             &frontend_registry,
                             desired_backends,
@@ -947,8 +949,23 @@ fn run_shard(
                             Some(&last_backends),
                             Some(&last_frontends),
                         );
+                        if combined.frontends.failures.is_empty() {
+                            if let Err(error) = frontend_registry.commit_transaction() {
+                                combined
+                                    .frontends
+                                    .failures
+                                    .push(("transaction".to_string(), format!("commit: {error}")));
+                            }
+                        } else {
+                            frontend_registry.rollback_transaction();
+                        }
                         last_backends = combined.backends.applied;
-                        last_frontends = combined.frontends.applied;
+                        if combined.frontends.failures.is_empty() {
+                            last_frontends = combined.frontends.applied;
+                        } else {
+                            frontend_registry.rollback_transaction();
+                            last_frontends = previous_frontends;
+                        }
 
                         // Replacement construction happens against desired
                         // geometry/bindings, then failed replacements retain
@@ -1014,6 +1031,14 @@ fn run_shard(
         Ok(()) => {}
         Err(_) => return,
     }
+    if let Err(error) = frontend_registry.commit_transaction() {
+        let _ = activation_tx.send(ShardActivationReport::Failed(format!(
+            "worker={}: {error}",
+            widx.0
+        )));
+        return;
+    }
+    let _ = activation_tx.send(ShardActivationReport::Ready);
     let serving_guard = ServingGuard::new(widx, terminal_tx, &SHUTDOWN);
 
     // Drive the shard's cooperative future set until shutdown. The loop
@@ -1405,21 +1430,16 @@ impl FrontendBuildCtx {
         };
         Ok(ActiveShardFrontend { driver, activation })
     }
-
-    fn build(&self, spec: &FrontendSpec) -> Result<ActiveShardFrontend, String> {
-        let prepared = self.prepare(spec)?;
-        self.activate(&spec.name, prepared)
-    }
 }
 
 struct FrontendRegistryTransaction {
     ctx: FrontendBuildCtx,
-    entries: RegistryTransaction<ActiveShardFrontend>,
+    entries: RegistryTransaction<PreparedShardFrontend, ActiveShardFrontend>,
 }
 
 impl FrontendRegistryTransaction {
     fn add(&mut self, spec: &FrontendSpec) -> Result<(), String> {
-        let frontend = self.ctx.build(spec)?;
+        let frontend = self.ctx.prepare(spec)?;
         self.entries.replace(spec.name.clone(), frontend);
         Ok(())
     }
@@ -1428,13 +1448,9 @@ impl FrontendRegistryTransaction {
         self.entries.remove(id);
     }
 
-    fn finalize(self) {
-        self.entries.finalize();
-    }
-
-    #[cfg(test)]
-    fn rollback(self) {
-        self.entries.rollback();
+    fn commit(self) -> Result<(), String> {
+        self.entries
+            .commit(|id, prepared| self.ctx.activate(id, prepared))
     }
 }
 
@@ -1449,6 +1465,7 @@ impl FrontendRegistryTransaction {
 struct FrontendRegistry {
     frontends: Rc<RefCell<HashMap<String, ActiveShardFrontend>>>,
     ctx: FrontendBuildCtx,
+    transaction: Rc<RefCell<Option<FrontendRegistryTransaction>>>,
 }
 
 impl FrontendRegistry {
@@ -1460,13 +1477,14 @@ impl FrontendRegistry {
         let registry = Self {
             frontends: Rc::new(RefCell::new(HashMap::with_capacity(specs.len()))),
             ctx,
+            transaction: Rc::new(RefCell::new(None)),
         };
+        registry.begin_transaction();
         for spec in specs {
-            let frontend = registry.ctx.build(spec)?;
-            registry
-                .frontends
-                .borrow_mut()
-                .insert(spec.name.clone(), frontend);
+            if let Err(error) = registry.add_to_transaction(spec) {
+                registry.rollback_transaction();
+                return Err(error);
+            }
         }
         Ok(registry)
     }
@@ -1483,11 +1501,32 @@ impl FrontendRegistry {
         busy
     }
 
-    fn transaction(&self) -> FrontendRegistryTransaction {
-        FrontendRegistryTransaction {
+    fn begin_transaction(&self) {
+        let transaction = FrontendRegistryTransaction {
             ctx: self.ctx.clone(),
             entries: RegistryTransaction::new(self.frontends.clone()),
-        }
+        };
+        assert!(self.transaction.borrow_mut().replace(transaction).is_none());
+    }
+
+    fn add_to_transaction(&self, spec: &FrontendSpec) -> Result<(), String> {
+        self.transaction
+            .borrow_mut()
+            .as_mut()
+            .expect("frontend transaction started")
+            .add(spec)
+    }
+
+    fn commit_transaction(&self) -> Result<(), String> {
+        self.transaction
+            .borrow_mut()
+            .take()
+            .expect("frontend transaction started")
+            .commit()
+    }
+
+    fn rollback_transaction(&self) {
+        self.transaction.borrow_mut().take();
     }
 
     fn realized_activations(&self) -> HashMap<String, FrontendActivation> {
@@ -1505,16 +1544,15 @@ impl config::reconcile::FrontendReconcileTarget for FrontendRegistry {
     }
 
     fn add(&self, spec: &FrontendSpec) -> Result<(), String> {
-        let mut transaction = self.transaction();
-        transaction.add(spec)?;
-        transaction.finalize();
-        Ok(())
+        self.add_to_transaction(spec)
     }
 
     fn remove(&self, id: &str) -> Result<(), String> {
-        let mut transaction = self.transaction();
-        transaction.remove(id);
-        transaction.finalize();
+        self.transaction
+            .borrow_mut()
+            .as_mut()
+            .expect("frontend transaction started")
+            .remove(id);
         Ok(())
     }
 }
@@ -1624,6 +1662,11 @@ struct PeerPublish {
 /// registration) independently of the first (fabric/pool bring-up).
 enum PhaseBReport {
     Ready(WorkerIdx),
+    Failed(String),
+}
+
+enum ShardActivationReport {
+    Ready,
     Failed(String),
 }
 
@@ -2256,7 +2299,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_transaction_finalize_commits_replacement() {
+    fn registry_transaction_keeps_replacement_dormant_until_commit() {
         let drops = Rc::new(RefCell::new(Vec::new()));
         let live = Rc::new(RefCell::new(HashMap::from([(
             "a".to_string(),
@@ -2265,16 +2308,16 @@ mod tests {
         let mut transaction = RegistryTransaction::new(live.clone());
         transaction.replace("a".to_string(), drop_value("new", &drops));
 
-        assert_eq!(live.borrow()["a"].id, "new");
+        assert_eq!(live.borrow()["a"].id, "old");
         assert!(drops.borrow().is_empty());
-        transaction.finalize();
+        transaction.commit(|_, value| Ok(value)).unwrap();
 
         assert_eq!(&*drops.borrow(), &["old"]);
         assert_eq!(live.borrow()["a"].id, "new");
     }
 
     #[test]
-    fn registry_transaction_rollback_restores_originals() {
+    fn registry_transaction_activation_failure_has_no_partial_exposure() {
         let drops = Rc::new(RefCell::new(Vec::new()));
         let live = Rc::new(RefCell::new(HashMap::from([
             ("a".to_string(), drop_value("old-a", &drops)),
@@ -2283,8 +2326,15 @@ mod tests {
         let mut transaction = RegistryTransaction::new(live.clone());
         transaction.replace("a".to_string(), drop_value("new-a", &drops));
         transaction.replace("b".to_string(), drop_value("new-b", &drops));
-        transaction.rollback();
+        let result = transaction.commit(|id, value| {
+            if id == "b" {
+                Err("listen failed".to_string())
+            } else {
+                Ok(value)
+            }
+        });
 
+        assert!(result.is_err());
         assert_eq!(live.borrow()["a"].id, "old-a");
         assert_eq!(live.borrow()["b"].id, "old-b");
         let mut dropped = drops.borrow().clone();
@@ -2293,38 +2343,19 @@ mod tests {
     }
 
     #[test]
-    fn registry_transaction_drop_rolls_back_removal() {
+    fn registry_transaction_stages_removal_until_commit() {
         let drops = Rc::new(RefCell::new(Vec::new()));
         let live = Rc::new(RefCell::new(HashMap::from([(
             "a".to_string(),
             drop_value("old", &drops),
         )])));
-        {
-            let mut transaction = RegistryTransaction::new(live.clone());
-            transaction.remove("a");
-            assert!(!live.borrow().contains_key("a"));
-        }
-
+        let mut transaction: RegistryTransaction<DropValue, DropValue> =
+            RegistryTransaction::new(live.clone());
+        transaction.remove("a");
         assert_eq!(live.borrow()["a"].id, "old");
-        assert!(drops.borrow().is_empty());
-    }
-
-    #[test]
-    fn registry_transaction_preserves_first_original() {
-        let drops = Rc::new(RefCell::new(Vec::new()));
-        let live = Rc::new(RefCell::new(HashMap::from([(
-            "a".to_string(),
-            drop_value("old", &drops),
-        )])));
-        let mut transaction = RegistryTransaction::new(live.clone());
-        transaction.replace("a".to_string(), drop_value("new-1", &drops));
-        transaction.replace("a".to_string(), drop_value("new-2", &drops));
-        transaction.rollback();
-
-        assert_eq!(live.borrow()["a"].id, "old");
-        let mut dropped = drops.borrow().clone();
-        dropped.sort_unstable();
-        assert_eq!(dropped, ["new-1", "new-2"]);
+        transaction.commit(|_, value| Ok(value)).unwrap();
+        assert!(!live.borrow().contains_key("a"));
+        assert_eq!(&*drops.borrow(), &["old"]);
     }
 
     #[test]
