@@ -164,10 +164,10 @@ memory_total_bytes = 134217728   # u64 bytes (no K/M/G suffix). Total backing po
                                  #   evenly across serving shards. 0 -> 128 MiB.
 
 [startup.fabric]
-progress_threads    = 2          # libfabric progress threads per shard.
+progress_threads    = 2          # libfabric progress threads per fabric unit.
 progress_poll_us    = 10         # progress-thread busy-poll budget (us).
-rpc_worker_threads  = 4          # fabric RPC worker threads per shard.
-max_inflight        = 1024       # max in-flight fabric ops per shard (back-pressure).
+rpc_worker_threads  = 4          # RPC worker threads per fabric unit.
+max_inflight        = 1024       # max in-flight ops per fabric unit (back-pressure).
 
 [startup.fabric.binds.tcp]
 addr                = "0.0.0.0:0" # fabric listen address; :0 picks a free port.

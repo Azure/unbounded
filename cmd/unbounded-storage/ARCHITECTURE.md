@@ -642,8 +642,8 @@ required (kTLS receive on TLS 1.3).
 |-------|-----------|-------|
 | Shard | One pinned OS thread per `ServingShard` | Owns `!Send` pool, transport, frontend, RPC handler |
 | Shard loop | Cooperative tick hooks, noop waker | Busy-poll active, sleep 100us idle |
-| Fabric progress | One pinned thread per CQ | Self-driving |
-| Fabric RPC serve | Fixed worker pool per shard | Bounded job queue, real-waker completion waits |
+| Fabric progress | Fixed pool per fabric unit | Pinned across reserved workers, CQs distributed by NUMA |
+| Fabric RPC serve | Fixed worker pool per fabric unit | Bounded job queue, real-waker completion waits |
 | Storage engine | One pinned storage core per disk | Reached only via `PageChannel` mpsc |
 | Config watcher | `notify` thread + main loop | Reconciles peers/disks live |
 

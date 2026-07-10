@@ -28,9 +28,9 @@
 //! `dest_addr = FI_ADDR_UNSPEC`.
 //!
 //! **Worker model**: a fixed pool of `rpc_worker_threads` long-lived
-//! OS threads is spawned at `start_rpc_server`, each pinned to the
-//! shard's `worker_idx`. Inbound requests are demultiplexed on the
-//! progress thread by the connection's receive pool, handed to the
+//! OS threads is spawned at `start_rpc_server`, distributed over the
+//! fabric unit's reserved workers. Inbound requests are demultiplexed on
+//! the progress thread by the connection's receive pool, handed to the
 //! installed [`RequestSink`], decoded, and enqueued onto a bounded
 //! [`JobQueue`](super::rpc_queue::JobQueue) rather than spawning a
 //! thread per request. A pool worker pulls the job, drives the handler
@@ -362,13 +362,13 @@ impl Fabric {
 
         // Spawn the persistent worker pool before installing the request
         // sink so a request that lands immediately has a consumer
-        // waiting. Pin to this shard's worker index so handler
-        // scratch/MR access stays NUMA-local.
+        // waiting. Distribute the pool over this fabric unit's reserved
+        // workers so handler scratch/MR access stays NUMA-local.
         let runtime = shared.fabric.cfg.runtime.clone();
-        let worker_idx = shared.fabric.cfg.worker_idx;
         let pool_size = shared.fabric.cfg.rpc_worker_threads.max(1);
         let mut workers = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
+        for i in 0..pool_size {
+            let worker_idx = shared.fabric.cfg.worker_for_thread(i);
             let queue = shared.queue.clone();
             workers.push(runtime.spawn_pinned(
                 worker_idx,
