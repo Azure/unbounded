@@ -202,6 +202,7 @@ pub struct PreparedShardLayer {
     backing_keepalives: Vec<Arc<dyn Send + Sync>>,
     rpc_shards: Vec<RpcShardPublish>,
     serve_start_txs: Vec<mpsc::Sender<()>>,
+    activation_rx: mpsc::Receiver<crate::ShardActivationReport>,
     terminal_rx: mpsc::Receiver<crate::ShardTerminalReport>,
     routes: RouteTableHandle,
 }
@@ -296,6 +297,7 @@ pub fn prepare_shard_layer(
     // (peer registration) after broadcasting the full peer set.
     let (phaseb_tx, phaseb_rx) = mpsc::channel::<crate::PhaseBReport>();
     let (terminal_tx, terminal_rx) = mpsc::channel::<crate::ShardTerminalReport>();
+    let (activation_tx, activation_rx) = mpsc::channel::<crate::ShardActivationReport>();
     let mut joins = Vec::with_capacity(worker_count);
     let mut control_senders = Vec::with_capacity(worker_count);
     // Per-shard senders for broadcasting the assembled peer set in phase
@@ -325,6 +327,7 @@ pub fn prepare_shard_layer(
         let loaded = loaded.clone();
         let layer_stop = layer_stop.clone();
         let terminal_tx = terminal_tx.clone();
+        let activation_tx = activation_tx.clone();
         let rt = deps.runtime.clone();
         let handle = rt.spawn_pinned(
             widx,
@@ -345,6 +348,7 @@ pub fn prepare_shard_layer(
                         peer_rx,
                         phaseb_tx,
                         serve_start_rx,
+                        activation_tx,
                         terminal_tx,
                         layer_stop,
                     );
@@ -362,6 +366,7 @@ pub fn prepare_shard_layer(
     // holds its sender, so this never closes the channel prematurely.
     drop(phaseb_tx);
     drop(terminal_tx);
+    drop(activation_tx);
 
     let expected_workers: Vec<WorkerIdx> = joins.iter().map(|join| join.worker_idx).collect();
     let mut publishes = Vec::new();
@@ -509,6 +514,7 @@ pub fn prepare_shard_layer(
         rpc_shards,
         serve_start_txs,
         terminal_rx,
+        activation_rx,
         routes,
     })
 }
@@ -526,8 +532,10 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
         rpc_shards,
         serve_start_txs,
         terminal_rx,
+        activation_rx,
         routes,
     } = prepared;
+    let expected_workers: Vec<WorkerIdx> = joins.iter().map(|join| join.worker_idx).collect();
 
     if let Err(errors) = fabric_group.start_rpc_servers(&rpc_shards) {
         cleanup_shards(
@@ -559,6 +567,39 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
             ]);
         }
     }
+    let collected = collect_worker_reports(
+        "shard activation",
+        &activation_rx,
+        &expected_workers,
+        SHARD_PHASE_TIMEOUT,
+        |report| match report {
+            crate::ShardActivationReport::Ready(worker_idx)
+            | crate::ShardActivationReport::Failed { worker_idx, .. } => *worker_idx,
+        },
+    );
+    let mut activation_errors = collected.errors;
+    for report in collected.reports {
+        if let crate::ShardActivationReport::Failed {
+            worker_idx: _,
+            message,
+        } = report
+        {
+            activation_errors.push(message);
+        }
+    }
+    if !activation_errors.is_empty() {
+        cleanup_shards(
+            joins,
+            fabric_group,
+            control,
+            layer_stop,
+            backing_keepalives,
+            serve_start_txs,
+            terminal_rx,
+            routes,
+        );
+        return Err(activation_errors);
+    }
     drop(serve_start_txs);
 
     Ok(ShardLayer {
@@ -582,6 +623,7 @@ pub fn retire_prepared_shard_layer(prepared: PreparedShardLayer) {
         backing_keepalives,
         rpc_shards: _,
         serve_start_txs,
+        activation_rx: _,
         terminal_rx,
         routes,
     } = prepared;

@@ -239,11 +239,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bound_socket_is_dormant_until_listen() {
+    fn prepared_startup_socket_is_dormant_until_activation() {
         let bound = match bind_socket("127.0.0.1:0".parse().unwrap()) {
             Ok(bound) => bound,
             Err(e) => {
-                eprintln!("bound_socket_is_dormant_until_listen: bind failed: {e}; skipping");
+                eprintln!(
+                    "prepared_startup_socket_is_dormant_until_activation: bind failed: {e}; skipping"
+                );
                 return;
             }
         };
