@@ -184,12 +184,14 @@ binding and stripe geometry they realized, so a failed rebuild is detected and
 retried on the next apply. Replacement is coordinated across shards with
 two-phase commit. Prepare stages backend and dormant frontend replacements
 invisibly while the old registries, geometry, and bindings remain live. After
-page-cache drain and disk reconciliation complete when required, routes are
-published and Commit activates frontends first, publishes backends next, then
-updates geometry, bindings, and spec maps. Abort drops staged transactions.
-Transaction-id mismatch or incomplete fan-in is indeterminate and fail-stop.
-Peer and disk reconciliation remain outside this rollback boundary, and route
-publication before Commit is irrevocable.
+page-cache drain, disk reconciliation crosses the fail-stop boundary because
+opening a disk may provision or format it. Routes are then published and Commit
+activates frontends first, publishes backends next, then updates geometry,
+bindings, and spec maps. Abort drops staged transactions only before disk
+reconciliation begins. Transaction-id mismatch or incomplete fan-in is
+indeterminate and fail-stop. Peer and disk reconciliation remain outside this
+rollback boundary. Disk reconciliation begins the fail-stop region, and route
+publication before Commit is also irrevocable.
 
 ### Shutdown
 
@@ -567,10 +569,11 @@ path-sorted for stable hashing; `drain()` clears channels before handles.
 `DiskChannelDirectory` is the Arc'd hot-swap publication surface, and
 `LiveShardLocalStore` is a per-shard view over the live directory that
 re-registers buffers when it observes a swap (`current_or_replay`).
-Every reconcile publishes the realized open subset. A live open failure aborts
-config convergence so the same desired snapshot remains retryable; a startup
-open failure retires the parked shard layer. Same-path drift remains remove then
-add because provisioning and recovery cannot safely run beside the old engine.
+A successful reconcile publishes the new open set. A live open failure requests
+fail-stop shutdown because an earlier staged open may already have provisioned
+or formatted storage; a startup open failure retires the parked shard layer.
+Same-path drift requires restart because provisioning and recovery cannot safely
+run beside the old engine.
 
 **Stripe keys**: `stripe_key` derives the 32-byte content-addressed key;
 `METADATA_STRIPE_IDX` and `OriginRef`/`StripeReq` describe the request shape.
@@ -619,11 +622,12 @@ All shard transports and fabric RPC handlers share one process-wide
 `RouteTableHandle`. The apply target is its only writer and publishes the new
 snapshot after prepare, page-cache drain, and disk publication succeed and
 before the shard Commit decision. Backend/frontend resources remain invisible
-until Commit. A determinate prepare, drain, or disk failure is followed by
-Abort; an indeterminate phase or any failed Commit or Abort requests shutdown.
-Disk reconciliation still publishes its realized subset and peer reconciliation
-still mutates shared fabric state outside this transaction, so this is not
-whole-process transactionality.
+until Commit. A determinate prepare or drain failure is followed by Abort; a
+disk failure, an indeterminate phase, or any failed Commit or Abort requests
+shutdown.
+Disk reconciliation may mutate storage media and peer reconciliation mutates
+shared fabric state outside this transaction, so this is not whole-process
+transactionality.
 
 Sections (all optional, each falling back to defaults):
 
