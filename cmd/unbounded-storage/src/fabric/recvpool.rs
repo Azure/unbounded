@@ -155,7 +155,7 @@ impl RecvPoolShared {
 
     fn post_buffer(
         self: &Arc<Self>,
-        slot: Box<super::completion::CompletionSlot>,
+        mut slot: Box<super::completion::CompletionSlot>,
         mut recv: RecvBuffer,
     ) -> Result<bool> {
         let buf_ptr = recv.ptr();

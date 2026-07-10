@@ -1206,7 +1206,7 @@ fn wait_for_small_send(
 
 /// Block the calling worker thread on a libfabric completion, parking
 /// (not spinning) between polls. The progress-thread completion path
-/// (`CompletionSlot::complete` -> `AtomicWaker::wake`) unparks us, so
+/// (`CompletionSlot::complete` wakes the registered task) unparks us, so
 /// the wait resolves as soon as the CQE is reaped. Returns
 /// `FabricError::Timeout` if `timeout` elapses first, or as soon as
 /// `shutdown` is set so a draining server does not block joining a
@@ -1266,7 +1266,7 @@ mod tests {
         let (slot, fut) = reg.allocate().unwrap();
         let raw = slot.into_raw();
         // SAFETY: raw was just produced by `into_raw`.
-        let reclaimed = unsafe { CompletionSlot::from_raw(raw) };
+        let mut reclaimed = unsafe { CompletionSlot::from_raw(raw) };
         reclaimed.complete(result);
         fut
     }

@@ -24,60 +24,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use super::error::{FabricError, Result};
-
-const WAKER_NONE: u8 = 0;
-const WAKER_REGISTERED: u8 = 1;
-const WAKER_WOKEN: u8 = 3;
-
-/// Small register-store-wake state machine. One-shot semantics: a
-/// single completer wakes a single awaiter exactly once.
-struct AtomicWaker {
-    state: AtomicU8,
-    waker: Mutex<Option<Waker>>,
-}
-
-impl AtomicWaker {
-    fn new() -> Self {
-        Self {
-            state: AtomicU8::new(WAKER_NONE),
-            waker: Mutex::new(None),
-        }
-    }
-
-    fn register(&self, w: &Waker) {
-        if self.state.load(Ordering::Acquire) == WAKER_WOKEN {
-            w.wake_by_ref();
-            return;
-        }
-        if let Ok(mut slot) = self.waker.lock() {
-            *slot = Some(w.clone());
-        }
-        let prev = self.state.swap(WAKER_REGISTERED, Ordering::AcqRel);
-        if prev == WAKER_WOKEN {
-            if let Ok(mut slot) = self.waker.lock() {
-                if let Some(w) = slot.take() {
-                    w.wake();
-                }
-            }
-        }
-    }
-
-    fn wake(&self) {
-        let prev = self.state.swap(WAKER_WOKEN, Ordering::AcqRel);
-        if prev == WAKER_REGISTERED {
-            if let Ok(mut slot) = self.waker.lock() {
-                if let Some(w) = slot.take() {
-                    w.wake();
-                }
-            }
-        }
-    }
-}
 
 /// Result a `CompletionSlot` carries back to its future. Per-op
 /// metadata is encoded in `bytes`, `flags`, `tag` and `src_addr`
@@ -94,16 +45,22 @@ pub struct CompletionInfo {
     pub data: u64,
 }
 
+struct CompletionState {
+    result: Option<Result<CompletionInfo>>,
+    waker: Option<Waker>,
+}
+
 pub(crate) struct SlotInner {
-    result: Mutex<Option<Result<CompletionInfo>>>,
-    waker: AtomicWaker,
+    state: Mutex<CompletionState>,
 }
 
 impl SlotInner {
     fn new() -> Self {
         Self {
-            result: Mutex::new(None),
-            waker: AtomicWaker::new(),
+            state: Mutex::new(CompletionState {
+                result: None,
+                waker: None,
+            }),
         }
     }
 }
@@ -124,7 +81,7 @@ pub struct CompletionSlot {
     /// Optional handler invoked when the slot completes, before the
     /// future is woken. Used by the ping responder to re-post its
     /// recv and emit the pong without involving any future at all.
-    handler: Mutex<Option<Box<dyn FnOnce(&Result<CompletionInfo>) + Send>>>,
+    handler: Option<Box<dyn FnOnce(&Result<CompletionInfo>) + Send>>,
     reservation_live: AtomicBool,
 }
 
@@ -152,30 +109,31 @@ impl CompletionSlot {
     /// future. If a handler was installed via
     /// [`CompletionSlot::set_handler`] it is invoked after capacity is
     /// released and before the future is woken; the handler may not panic.
-    pub fn complete(&self, result: Result<CompletionInfo>) {
+    pub fn complete(&mut self, result: Result<CompletionInfo>) {
         // Completion handlers may allocate a replacement slot, notably
         // when a receive pool rearms at full registry capacity.
         self.release_reservation();
-        let handler = self.handler.lock().ok().and_then(|mut h| h.take());
-        if let Some(h) = handler {
+        if let Some(h) = self.handler.take() {
             h(&result);
         }
-        if let Ok(mut slot) = self.inner.result.lock() {
-            *slot = Some(result);
+        let waker = {
+            let mut state = self.inner.state.lock().expect("completion state mutex");
+            state.result = Some(result);
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
         }
-        self.inner.waker.wake();
     }
 
     /// Install a one-shot handler that fires when the slot completes.
     /// Used by self-managed slots (e.g. the ping responder) that do
     /// not have a future awaiting the outcome.
-    pub fn set_handler<F>(&self, f: F)
+    pub fn set_handler<F>(&mut self, f: F)
     where
         F: FnOnce(&Result<CompletionInfo>) + Send + 'static,
     {
-        if let Ok(mut h) = self.handler.lock() {
-            *h = Some(Box::new(f));
-        }
+        self.handler = Some(Box::new(f));
     }
 
     fn release_reservation(&self) {
@@ -205,11 +163,11 @@ pub struct CompletionFuture {
 impl Future for CompletionFuture {
     type Output = Result<CompletionInfo>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.inner.waker.register(cx.waker());
-        let mut result = self.inner.result.lock().expect("completion slot mutex");
-        if let Some(r) = result.take() {
+        let mut state = self.inner.state.lock().expect("completion state mutex");
+        if let Some(r) = state.result.take() {
             Poll::Ready(r)
         } else {
+            state.waker = Some(cx.waker().clone());
             Poll::Pending
         }
     }
@@ -267,7 +225,7 @@ impl CompletionRegistry {
         let slot = Box::new(CompletionSlot {
             inner: inner.clone(),
             registry: self.shared.clone(),
-            handler: Mutex::new(None),
+            handler: None,
             reservation_live: AtomicBool::new(true),
         });
         let fut = CompletionFuture { inner };
@@ -311,7 +269,7 @@ mod tests {
 
         let raw = slot.into_raw();
         // SAFETY: raw was just produced by `into_raw`.
-        let reclaimed = unsafe { CompletionSlot::from_raw(raw) };
+        let mut reclaimed = unsafe { CompletionSlot::from_raw(raw) };
         reclaimed.complete(Ok(CompletionInfo {
             flags: 0xCAFE,
             bytes: 4096,
@@ -338,7 +296,7 @@ mod tests {
         let (slot, mut fut) = reg.allocate().unwrap();
         let raw = slot.into_raw();
         // SAFETY: raw was just produced by `into_raw`.
-        let reclaimed = unsafe { CompletionSlot::from_raw(raw) };
+        let mut reclaimed = unsafe { CompletionSlot::from_raw(raw) };
         reclaimed.complete(Err(FabricError::Cq {
             prov_errno: -3,
             err: -5,
@@ -394,7 +352,7 @@ mod tests {
     #[test]
     fn completion_handler_can_replace_slot_at_full_capacity() {
         let reg = CompletionRegistry::new(1);
-        let (slot, _fut) = reg.allocate().unwrap();
+        let (mut slot, _fut) = reg.allocate().unwrap();
         let replacement = Arc::new(Mutex::new(None));
 
         let handler_reg = Arc::clone(&reg);
@@ -408,7 +366,7 @@ mod tests {
 
         let raw = slot.into_raw();
         // SAFETY: raw was just produced by `into_raw`.
-        let reclaimed = unsafe { CompletionSlot::from_raw(raw) };
+        let mut reclaimed = unsafe { CompletionSlot::from_raw(raw) };
         reclaimed.complete(Ok(CompletionInfo {
             flags: 0,
             bytes: 0,
@@ -431,7 +389,7 @@ mod tests {
         let (slot, mut fut) = reg.allocate().unwrap();
         let raw = slot.into_raw();
         // SAFETY: raw was just produced by `into_raw`.
-        let reclaimed = unsafe { CompletionSlot::from_raw(raw) };
+        let mut reclaimed = unsafe { CompletionSlot::from_raw(raw) };
         reclaimed.complete(Ok(CompletionInfo {
             flags: 0,
             bytes: 0,

@@ -322,7 +322,7 @@ fn deliver_success(entry: &ffi::fi_cq_data_entry) {
     // `CompletionSlot::into_raw` at submission; libfabric returns it
     // untouched on completion. Under MSG there is no tag or source
     // address, so those fields are zero.
-    let slot = unsafe { CompletionSlot::from_raw(ctx) };
+    let mut slot = unsafe { CompletionSlot::from_raw(ctx) };
     slot.complete(Ok(CompletionInfo {
         flags: entry.flags,
         bytes: entry.len,
@@ -348,7 +348,7 @@ fn drain_errors(cq: *mut ffi::fid_cq, errors: &AtomicU64) {
         let ctx = err_entry.op_context;
         if !ctx.is_null() {
             // SAFETY: same provenance contract as `deliver_success`.
-            let slot = unsafe { CompletionSlot::from_raw(ctx) };
+            let mut slot = unsafe { CompletionSlot::from_raw(ctx) };
             slot.complete(Err(FabricError::Cq {
                 prov_errno: err_entry.prov_errno,
                 err: err_entry.err,
