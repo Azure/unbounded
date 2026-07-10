@@ -35,7 +35,6 @@ impl<T> RegistryTransaction<T> {
         self.originals.clear();
     }
 
-    #[cfg(test)]
     pub(crate) fn rollback(mut self) {
         self.rollback_inner();
         self.completed = true;

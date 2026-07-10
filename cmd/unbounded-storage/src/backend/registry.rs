@@ -59,6 +59,13 @@ pub struct BackendRegistry {
     ctx: BuildCtx,
 }
 
+pub struct BackendRegistryTransaction {
+    backends: Rc<RefCell<HashMap<String, Rc<OriginBackend>>>>,
+    ctx: BuildCtx,
+    originals: RefCell<HashMap<String, Option<Rc<OriginBackend>>>>,
+    completed: bool,
+}
+
 impl BackendRegistry {
     /// Build a registry seeded from `specs`, fetching through `handle`
     /// into the region based at `backing_base`. A spec that fails to
@@ -96,6 +103,53 @@ impl BackendRegistry {
     #[cfg(test)]
     pub fn contains(&self, id: &str) -> bool {
         self.backends.borrow().contains_key(id)
+    }
+
+    pub fn transaction(&self) -> BackendRegistryTransaction {
+        BackendRegistryTransaction {
+            backends: self.backends.clone(),
+            ctx: self.ctx.clone(),
+            originals: RefCell::new(HashMap::new()),
+            completed: false,
+        }
+    }
+}
+
+impl BackendRegistryTransaction {
+    pub fn finalize(mut self) {
+        self.completed = true;
+        self.originals.get_mut().clear();
+    }
+
+    pub fn rollback(mut self) {
+        self.rollback_inner();
+        self.completed = true;
+    }
+
+    fn record_original(&self, id: &str) {
+        let mut originals = self.originals.borrow_mut();
+        if originals.contains_key(id) {
+            return;
+        }
+        originals.insert(id.to_string(), self.backends.borrow_mut().remove(id));
+    }
+
+    fn rollback_inner(&mut self) {
+        let mut backends = self.backends.borrow_mut();
+        for (id, original) in self.originals.get_mut().drain() {
+            backends.remove(&id);
+            if let Some(original) = original {
+                backends.insert(id, original);
+            }
+        }
+    }
+}
+
+impl Drop for BackendRegistryTransaction {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.rollback_inner();
+        }
     }
 }
 
@@ -259,11 +313,31 @@ impl BackendReconcileTarget for BackendRegistry {
     }
 
     fn add(&self, spec: &BackendSpec) -> Result<(), String> {
-        // Build before mutating so a failed build leaves the live map untouched.
+        let transaction = self.transaction();
+        transaction.add(spec)?;
+        transaction.finalize();
+        Ok(())
+    }
+
+    fn remove(&self, id: &str) -> Result<(), String> {
+        let transaction = self.transaction();
+        transaction.remove(id)?;
+        transaction.finalize();
+        Ok(())
+    }
+}
+
+impl BackendReconcileTarget for BackendRegistryTransaction {
+    fn list(&self) -> Vec<String> {
+        self.backends.borrow().keys().cloned().collect()
+    }
+
+    fn add(&self, spec: &BackendSpec) -> Result<(), String> {
         let backend = self
             .ctx
             .build(spec)
             .map_err(|e| format!("build backend {}: {e}", spec.name))?;
+        self.record_original(&spec.name);
         self.backends
             .borrow_mut()
             .insert(spec.name.clone(), Rc::new(backend));
@@ -271,6 +345,7 @@ impl BackendReconcileTarget for BackendRegistry {
     }
 
     fn remove(&self, id: &str) -> Result<(), String> {
+        self.record_original(id);
         self.backends.borrow_mut().remove(id);
         Ok(())
     }
@@ -493,5 +568,48 @@ mod tests {
 
         drop(stream);
         assert!(selected.upgrade().is_none());
+    }
+
+    #[test]
+    fn transaction_drop_restores_all_backend_changes() {
+        let reg = registry(&[fake_spec("keep", 1), fake_spec("remove", 2)]);
+        {
+            let transaction = reg.transaction();
+            transaction.add(&fake_spec("keep", 3)).unwrap();
+            transaction.add(&fake_spec("new", 4)).unwrap();
+            transaction.remove("remove").unwrap();
+            assert!(reg.contains("new"));
+            assert!(!reg.contains("remove"));
+        }
+
+        assert!(reg.contains("keep"));
+        assert!(!reg.contains("new"));
+        assert!(reg.contains("remove"));
+    }
+
+    #[test]
+    fn transaction_finalize_commits_all_backend_changes() {
+        let reg = registry(&[fake_spec("keep", 1), fake_spec("remove", 2)]);
+        let transaction = reg.transaction();
+        transaction.add(&fake_spec("keep", 3)).unwrap();
+        transaction.add(&fake_spec("new", 4)).unwrap();
+        transaction.remove("remove").unwrap();
+        transaction.finalize();
+
+        assert!(reg.contains("keep"));
+        assert!(reg.contains("new"));
+        assert!(!reg.contains("remove"));
+    }
+
+    #[test]
+    fn failed_transaction_build_leaves_original_for_rollback() {
+        let reg = registry(&[fake_spec("keep", 1)]);
+        let transaction = reg.transaction();
+        transaction.add(&fake_spec("new", 2)).unwrap();
+        assert!(transaction.add(&http_spec("keep", "://bad")).is_err());
+        transaction.rollback();
+
+        assert!(reg.contains("keep"));
+        assert!(!reg.contains("new"));
     }
 }

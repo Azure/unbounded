@@ -47,7 +47,7 @@ pub use limiter::{Acquire, FetchLimiter, FetchPermit};
 pub use origin::{OriginBackend, OriginStream};
 
 #[cfg(target_os = "linux")]
-pub use registry::{BackendRegistry, RegistryFetchStream};
+pub use registry::{BackendRegistry, BackendRegistryTransaction, RegistryFetchStream};
 
 #[cfg(target_os = "linux")]
 pub use s3::S3Backend;

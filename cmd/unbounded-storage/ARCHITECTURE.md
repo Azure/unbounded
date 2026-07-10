@@ -184,10 +184,11 @@ activation. A failed preparation therefore leaves the prior resource, binding,
 and stripe geometry live and retryable. Active frontend entries record the
 binding and stripe geometry they realized, so a failed rebuild is detected and
 retried on the next apply. Replacement uses an undo-log transaction: the old
-driver remains owned until finalization and can be restored if a later local
-activation fails. The current reconciler finalizes each frontend operation
-immediately; cross-resource and cross-shard commit/rollback is not yet wired to
-that transaction boundary.
+backend and frontend remain owned until finalization and can be restored if a
+later local activation fails. A shard commits its complete backend/frontend pass
+together, retiring old frontends before old backends; any failure or deferral
+restores both registries plus their prior geometry and bindings. Cross-shard
+commit/rollback is not yet wired to this transaction boundary.
 
 ### Shutdown
 

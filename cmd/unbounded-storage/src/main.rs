@@ -888,7 +888,6 @@ fn run_shard(
     // build-from-spec work (DNS resolve, listener bind) stays off the
     // fast path.
     {
-        let routes = routes.clone();
         let transport_registry = transport_registry.clone();
         let frontend_registry = frontend_registry.clone();
         let pool = pool.clone();
@@ -911,6 +910,8 @@ fn run_shard(
                         let desired_frontends = apply.loaded.config().frontends.as_slice();
                         let desired_frontend_backends =
                             config::frontend_backend_map(&apply.loaded.runtime().frontends);
+                        let prior_geometry = geometry.borrow().clone();
+                        let prior_bindings = bindings.borrow().clone();
                         // Refresh stripe geometry before building any
                         // frontend so a co-applied backend stripe change
                         // is visible to a frontend add in the same pass.
@@ -934,12 +935,14 @@ fn run_shard(
                             frontends_to_rebuild.into_iter().collect();
                         *bindings.borrow_mut() = apply.loaded.runtime().frontends.clone();
 
-                        // Drive the transport backend registry and the
-                        // frontend registry together so frontend adds are
-                        // gated on their referenced backend being present.
+                        let backend_transaction = transport_registry.transaction();
+                        let frontend_transaction = frontend_registry.transaction();
+
+                        // Drive provisional backend and frontend maps together
+                        // so frontend adds are gated on the desired backend.
                         let combined = config::reconcile::reconcile_backends_and_frontends(
-                            &transport_registry,
-                            &frontend_registry,
+                            &backend_transaction,
+                            &frontend_transaction,
                             desired_backends,
                             desired_frontends,
                             &desired_frontend_backends,
@@ -947,31 +950,39 @@ fn run_shard(
                             Some(&last_backends),
                             Some(&last_frontends),
                         );
-                        last_backends = combined.backends.applied;
-                        last_frontends = combined.frontends.applied;
-
-                        // Replacement construction happens against desired
-                        // geometry/bindings, then failed replacements retain
-                        // their prior live resource and prior auxiliary state.
-                        {
-                            let mut g = geometry.borrow_mut();
-                            g.clear();
-                            for spec in last_backends.values() {
-                                g.insert(spec.name.clone(), spec.stripe_size_bytes());
+                        let mut failures = combined.backends.failures.clone();
+                        failures.extend(combined.frontends.failures.clone());
+                        let commit = failures.is_empty() && combined.frontends.deferred.is_empty();
+                        let result = if commit {
+                            // Retire old frontends before their old backends.
+                            frontend_transaction.finalize();
+                            backend_transaction.finalize();
+                            last_backends = combined.backends.applied;
+                            last_frontends = combined.frontends.applied;
+                            {
+                                let mut g = geometry.borrow_mut();
+                                g.clear();
+                                for spec in last_backends.values() {
+                                    g.insert(spec.name.clone(), spec.stripe_size_bytes());
+                                }
                             }
-                        }
-                        *bindings.borrow_mut() = frontend_registry
-                            .realized_activations()
-                            .into_iter()
-                            .map(|(id, activation)| (id, activation.binding))
-                            .collect();
-
-                        let mut failures = combined.backends.failures;
-                        failures.extend(combined.frontends.failures);
-                        let result = if failures.is_empty() {
+                            *bindings.borrow_mut() = frontend_registry
+                                .realized_activations()
+                                .into_iter()
+                                .map(|(id, activation)| (id, activation.binding))
+                                .collect();
                             Ok(())
                         } else {
-                            Err(format!("config reconcile failed: {failures:?}"))
+                            // Restore backends before frontends that reference
+                            // them, then restore the auxiliary build surfaces.
+                            backend_transaction.rollback();
+                            frontend_transaction.rollback();
+                            *geometry.borrow_mut() = prior_geometry;
+                            *bindings.borrow_mut() = prior_bindings;
+                            Err(format!(
+                                "config reconcile failed: failures={failures:?} deferred={:?}",
+                                combined.frontends.deferred
+                            ))
                         };
 
                         let _ = apply.ack.send(config::ShardAck {
@@ -1414,27 +1425,50 @@ impl FrontendBuildCtx {
 
 struct FrontendRegistryTransaction {
     ctx: FrontendBuildCtx,
-    entries: RegistryTransaction<ActiveShardFrontend>,
+    frontends: Rc<RefCell<HashMap<String, ActiveShardFrontend>>>,
+    entries: RefCell<Option<RegistryTransaction<ActiveShardFrontend>>>,
 }
 
 impl FrontendRegistryTransaction {
-    fn add(&mut self, spec: &FrontendSpec) -> Result<(), String> {
+    fn finalize(self) {
+        self.entries
+            .borrow_mut()
+            .take()
+            .expect("frontend transaction active")
+            .finalize();
+    }
+
+    fn rollback(self) {
+        self.entries
+            .borrow_mut()
+            .take()
+            .expect("frontend transaction active")
+            .rollback();
+    }
+}
+
+impl config::reconcile::FrontendReconcileTarget for FrontendRegistryTransaction {
+    fn list(&self) -> Vec<String> {
+        self.frontends.borrow().keys().cloned().collect()
+    }
+
+    fn add(&self, spec: &FrontendSpec) -> Result<(), String> {
         let frontend = self.ctx.build(spec)?;
-        self.entries.replace(spec.name.clone(), frontend);
+        self.entries
+            .borrow_mut()
+            .as_mut()
+            .expect("frontend transaction active")
+            .replace(spec.name.clone(), frontend);
         Ok(())
     }
 
-    fn remove(&mut self, id: &str) {
-        self.entries.remove(id);
-    }
-
-    fn finalize(self) {
-        self.entries.finalize();
-    }
-
-    #[cfg(test)]
-    fn rollback(self) {
-        self.entries.rollback();
+    fn remove(&self, id: &str) -> Result<(), String> {
+        self.entries
+            .borrow_mut()
+            .as_mut()
+            .expect("frontend transaction active")
+            .remove(id);
+        Ok(())
     }
 }
 
@@ -1486,7 +1520,8 @@ impl FrontendRegistry {
     fn transaction(&self) -> FrontendRegistryTransaction {
         FrontendRegistryTransaction {
             ctx: self.ctx.clone(),
-            entries: RegistryTransaction::new(self.frontends.clone()),
+            frontends: self.frontends.clone(),
+            entries: RefCell::new(Some(RegistryTransaction::new(self.frontends.clone()))),
         }
     }
 
@@ -1505,15 +1540,15 @@ impl config::reconcile::FrontendReconcileTarget for FrontendRegistry {
     }
 
     fn add(&self, spec: &FrontendSpec) -> Result<(), String> {
-        let mut transaction = self.transaction();
-        transaction.add(spec)?;
+        let transaction = self.transaction();
+        config::reconcile::FrontendReconcileTarget::add(&transaction, spec)?;
         transaction.finalize();
         Ok(())
     }
 
     fn remove(&self, id: &str) -> Result<(), String> {
-        let mut transaction = self.transaction();
-        transaction.remove(id);
+        let transaction = self.transaction();
+        config::reconcile::FrontendReconcileTarget::remove(&transaction, id)?;
         transaction.finalize();
         Ok(())
     }
