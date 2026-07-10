@@ -67,6 +67,7 @@ use super::error::{FabricError, Result as FabResult};
 use super::fabric::{Fabric, FabricInner};
 use super::ffi;
 use super::handler::{FabricPage, Handler, HandlerStream, PageRelease, PageSource};
+use super::rpc_admission::RpcAdmission;
 use super::rpc_queue::{Job, JobQueue};
 use super::wire::{MsgHeader, MsgKind};
 
@@ -236,7 +237,7 @@ struct ServerShared {
     /// `max_inflight` as the server-side back-pressure limit: a request
     /// that would exceed it is rejected with a "server overloaded"
     /// `ERROR_ACK` instead of being enqueued.
-    inflight: AtomicU64,
+    admission: Arc<RpcAdmission>,
 }
 
 /// Inbound-request sink installed on the dispatch table. Decodes each
@@ -276,29 +277,20 @@ where
         // a fast "server overloaded" ack instead of being enqueued. This
         // runs on the progress thread, so the rejection ack is
         // fire-and-forget (see `reject_overloaded`).
-        let max_inflight = shared.fabric.cfg.max_inflight as u64;
-        let prev = shared.inflight.fetch_add(1, Ordering::AcqRel);
-        if prev >= max_inflight {
-            shared.inflight.fetch_sub(1, Ordering::AcqRel);
+        let Some(permit) = shared.admission.try_acquire() else {
             crate::metrics::fabric_rpc_served(crate::metrics::Outcome::Err);
             let _ = reject_overloaded(shared, reply.ep, request_id);
             return;
-        }
-        crate::metrics::fabric_inflight_delta(1);
+        };
 
         let shared_for_job = shared.clone();
         let handler_for_job = self.handler.clone();
         let job: Job = Box::new(move || {
+            let _permit = permit;
             run_worker::<R, H>(shared_for_job.clone(), handler_for_job, header, req, reply);
-            shared_for_job.inflight.fetch_sub(1, Ordering::AcqRel);
-            crate::metrics::fabric_inflight_delta(-1);
         });
-        if shared.queue.push(job).is_err() {
-            // Queue closed (server shutting down): the job never runs, so
-            // release the in-flight reservation it would have decremented.
-            shared.inflight.fetch_sub(1, Ordering::AcqRel);
-            crate::metrics::fabric_inflight_delta(-1);
-        }
+        // A closed queue returns the job; dropping it releases its permit.
+        drop(shared.queue.push(job));
     }
 }
 
@@ -357,7 +349,7 @@ impl Fabric {
             page_size,
             queue: Arc::new(JobQueue::new()),
             shutdown: AtomicBool::new(false),
-            inflight: AtomicU64::new(0),
+            admission: RpcAdmission::new(self.inner_arc().cfg.max_inflight),
         });
 
         // Spawn the persistent worker pool before installing the request
