@@ -10,84 +10,15 @@ import (
 
 const (
 	// SiteLabelKey identifies the site a Node belongs to.
+	//
+	// NOTE: this is the legacy site label. It is superseded by
+	// unbounded-cloud.io/site (machina v1alpha3 MachineSiteLabelKey). The net
+	// controller still dual-writes this key on Nodes and reads it as a fallback
+	// during the deprecation window; a future release will remove it. It is not
+	// marked with the godoc Deprecated: convention because it is still written
+	// and read intentionally until then.
 	SiteLabelKey = "net.unbounded-cloud.io/site"
 )
-
-// +genclient
-// +genclient:nonNamespaced
-// +kubebuilder:resource:scope=Cluster,shortName=st
-// +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="Node CIDRs",type=string,JSONPath=".spec.nodeCidrs"
-// +kubebuilder:printcolumn:name="Pod CIDR Assignments",type=string,JSONPath=".spec.podCidrAssignments"
-// +kubebuilder:printcolumn:name="Nodes",type=integer,JSONPath=".status.nodeCount"
-// +kubebuilder:printcolumn:name="Slices",type=integer,JSONPath=".status.sliceCount"
-// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
-// Site defines a network location containing nodes
-type Site struct {
-	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
-
-	Spec   SiteSpec   `json:"spec"`
-	Status SiteStatus `json:"status,omitempty"`
-}
-
-// SiteSpec defines the desired state of Site
-// +k8s:deepcopy-gen=true
-type SiteSpec struct {
-	// NodeCidrs are the CIDRs that contain the internal IPs of nodes at this site
-	// +kubebuilder:validation:MinItems=1
-	NodeCidrs []string `json:"nodeCidrs"`
-
-	// PodCidrAssignments define how pod CIDRs are allocated to nodes in this site.
-	// +kubebuilder:validation:MinItems=1
-	PodCidrAssignments []PodCidrAssignment `json:"podCidrAssignments"`
-
-	// ManageCniPlugin controls whether the node agent writes CNI configuration
-	// and creates tunnel endpoints for same-site nodes. When true (the default),
-	// CNI config is written and all same-site nodes are tunnel peers.
-	// When false, only tunnel links to gateway pools for other sites are created,
-	// allowing an external CNI plugin to manage intra-site networking.
-	// Pod CIDR assignment is also disabled when manageCniPlugin is false,
-	// regardless of the assignmentEnabled setting on individual podCidrAssignments
-	// rules. The podCidrAssignments are still required to define the CIDR ranges
-	// used for inter-site routing.
-	// +optional
-	ManageCniPlugin *bool `json:"manageCniPlugin,omitempty"`
-
-	// NonMasqueradeCIDRs are CIDR blocks that should NOT be masqueraded when
-	// traffic leaves the node via the default gateway. Traffic to these CIDRs
-	// will use the pod's actual IP address. This is useful for preserving source
-	// IPs when communicating with external networks (e.g., corporate networks, VPNs).
-	// If nodes are Azure VMs/VMSS instances, NIC ipForwarding must be enabled
-	// for this setting to work correctly.
-	// +optional
-	NonMasqueradeCIDRs []string `json:"nonMasqueradeCIDRs,omitempty"`
-
-	// LocalCIDRs are CIDR blocks that are considered local to this site.
-	// Traffic to these CIDRs should never be routed via gateway pools.
-	// +optional
-	LocalCIDRs []string `json:"localCidrs,omitempty"`
-
-	// HealthCheckSettings controls health check settings for inter-site tunnel peers.
-	// +optional
-	HealthCheckSettings *HealthCheckSettings `json:"healthCheckSettings,omitempty"`
-
-	// TunnelProtocol selects the tunnel protocol for this scope.
-	// Valid values are "WireGuard", "IPIP", "GENEVE", "VXLAN", "None", or "Auto".
-	// Defaults to "Auto" when unset. When "Auto", links using external IPs
-	// use WireGuard and links using only internal IPs use GENEVE.
-	// +kubebuilder:validation:Enum=WireGuard;IPIP;GENEVE;VXLAN;None;Auto
-	// +optional
-	TunnelProtocol *TunnelProtocol `json:"tunnelProtocol,omitempty"`
-
-	// TunnelMTU is the MTU to set on routes through tunnels for this scope.
-	// +kubebuilder:validation:Minimum=576
-	// +kubebuilder:validation:Maximum=9000
-	// +optional
-	TunnelMTU *int32 `json:"tunnelMTU,omitempty"`
-}
 
 // PodCidrAssignment defines a pod CIDR allocation rule for nodes in a site.
 // +k8s:deepcopy-gen=true
@@ -167,26 +98,6 @@ func SpecEnabled(enabled *bool) bool {
 	}
 
 	return *enabled
-}
-
-// SiteStatus defines the observed state of Site
-type SiteStatus struct {
-	// NodeCount is the number of nodes matched to this site
-	// +optional
-	NodeCount int `json:"nodeCount,omitempty"`
-
-	// SliceCount is the number of SiteNodeSlice objects for this site
-	// +optional
-	SliceCount int `json:"sliceCount,omitempty"`
-}
-
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
-// SiteList contains a list of Site
-type SiteList struct {
-	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []Site `json:"items"`
 }
 
 // +genclient

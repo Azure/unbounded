@@ -1,0 +1,56 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.4-trixie AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    make \
+    gcc \
+    git \
+    ca-certificates \
+    && apt-get clean
+
+ENV CGO_ENABLED=0
+ENV GOPATH=/go
+ENV GOTOOLCHAIN=auto
+ENV PATH=$PATH:/go/bin
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY ../../ .
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
+# Optional overrides for the component images baked into the operator's embedded
+# manifests. They default to empty so release builds keep the Makefile defaults
+# (ghcr.io/azure/<component>:<version>); e2e/dev builds set them to point the
+# operator's applied net/machina workloads at a locally reachable registry.
+ARG NET_CONTROLLER_IMAGE=
+ARG NET_NODE_IMAGE=
+ARG MACHINA_IMAGE=
+ARG STORAGE_SUPERVISOR_IMAGE=
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    make unbounded-operator-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}} ${NET_CONTROLLER_IMAGE:+NET_CONTROLLER_IMAGE=${NET_CONTROLLER_IMAGE}} ${NET_NODE_IMAGE:+NET_NODE_IMAGE=${NET_NODE_IMAGE}} ${MACHINA_IMAGE:+MACHINA_IMAGE=${MACHINA_IMAGE}} ${STORAGE_SUPERVISOR_IMAGE:+UNBOUNDED_STORAGE_SUPERVISOR_IMAGE=${STORAGE_SUPERVISOR_IMAGE}}
+
+FROM ubuntu:noble
+
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /unbounded/bin
+
+COPY --from=builder /src/bin/unbounded-operator /unbounded/bin/unbounded-operator
+
+ENV PATH="/unbounded/bin:${PATH}"
+
+WORKDIR /unbounded
+
+ENTRYPOINT ["/unbounded/bin/unbounded-operator"]

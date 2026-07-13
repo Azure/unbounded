@@ -18,7 +18,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	unboundedv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/unbounded"
 	"github.com/Azure/unbounded/internal/version"
 )
@@ -34,27 +35,27 @@ const (
 
 var supportedCreateResources = map[string]schema.GroupVersionResource{
 	"site": {
-		Group:    unboundedv1alpha1.GroupName,
-		Version:  "v1alpha1",
+		Group:    unboundedv1alpha3.GroupVersion.Group,
+		Version:  unboundedv1alpha3.GroupVersion.Version,
 		Resource: "sites",
 	},
 	"gatewaypool": {
-		Group:    unboundedv1alpha1.GroupName,
+		Group:    unboundednetv1alpha1.GroupName,
 		Version:  "v1alpha1",
 		Resource: "gatewaypools",
 	},
 	"sitepeering": {
-		Group:    unboundedv1alpha1.GroupName,
+		Group:    unboundednetv1alpha1.GroupName,
 		Version:  "v1alpha1",
 		Resource: "sitepeerings",
 	},
 	"sitegatewaypoolassignment": {
-		Group:    unboundedv1alpha1.GroupName,
+		Group:    unboundednetv1alpha1.GroupName,
 		Version:  "v1alpha1",
 		Resource: "sitegatewaypoolassignments",
 	},
 	"gatewaypoolpeering": {
-		Group:    unboundedv1alpha1.GroupName,
+		Group:    unboundednetv1alpha1.GroupName,
 		Version:  "v1alpha1",
 		Resource: "gatewaypoolpeerings",
 	},

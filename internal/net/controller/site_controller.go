@@ -37,13 +37,22 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/net/allocator"
 )
 
 const (
-	// SiteLabelKey is the label key used to identify which site a node belongs to
-	SiteLabelKey = "net.unbounded-cloud.io/site"
+	// canonicalSiteLabelKey is the canonical site-membership label the
+	// controller applies to Nodes (shared with the Machine site label). It
+	// supersedes deprecatedSiteLabelKey.
+	canonicalSiteLabelKey = unboundedv1alpha3.MachineSiteLabelKey
+
+	// deprecatedSiteLabelKey is the pre-rename site label. During the
+	// deprecation window the controller dual-writes it alongside the canonical
+	// label and falls back to reading it, so in-flight upgrades and older
+	// consumers keep working. A future release removes it.
+	deprecatedSiteLabelKey = unboundednetv1alpha1.SiteLabelKey
 
 	// WireGuardPubKeyAnnotation is the annotation key for a node's WireGuard public key
 	WireGuardPubKeyAnnotation = "net.unbounded-cloud.io/wg-pubkey"
@@ -65,8 +74,8 @@ const (
 )
 
 var siteGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-cloud.io",
-	Version:  "v1alpha1",
+	Group:    unboundedv1alpha3.GroupVersion.Group,
+	Version:  unboundedv1alpha3.GroupVersion.Version,
 	Resource: "sites",
 }
 
@@ -111,7 +120,7 @@ type SiteController struct {
 	workqueue workqueue.TypedRateLimitingInterface[string]
 
 	// Cache of sites for faster lookups
-	sitesCache     []unboundednetv1alpha1.Site
+	sitesCache     []unboundedv1alpha3.Site
 	sitesCacheLock sync.RWMutex
 
 	// Cache of gateway pools for filtering gateway nodes
@@ -388,7 +397,7 @@ func (sc *SiteController) enqueueSiteChange() {
 // updateSitesCache updates the cached list of sites from the informer
 func (sc *SiteController) updateSitesCache() {
 	items := sc.siteInformer.GetStore().List()
-	sites := make([]unboundednetv1alpha1.Site, 0, len(items))
+	sites := make([]unboundedv1alpha3.Site, 0, len(items))
 
 	for _, item := range items {
 		unstr, ok := item.(*unstructured.Unstructured)
@@ -396,7 +405,7 @@ func (sc *SiteController) updateSitesCache() {
 			continue
 		}
 
-		site := unboundednetv1alpha1.Site{}
+		site := unboundedv1alpha3.Site{}
 
 		data, err := unstr.MarshalJSON()
 		if err != nil {
@@ -461,7 +470,7 @@ func (sc *SiteController) updateGatewayPoolsCache() {
 }
 
 type assignmentRef struct {
-	site       unboundednetv1alpha1.Site
+	site       unboundedv1alpha3.Site
 	index      int
 	assignment unboundednetv1alpha1.PodCidrAssignment
 }
@@ -494,7 +503,7 @@ func assignmentMatchConfigEqual(a, b unboundednetv1alpha1.PodCidrAssignment) boo
 	return assignmentPriority(a.Priority) == assignmentPriority(b.Priority)
 }
 
-func (sc *SiteController) collectEnabledAssignments(sites []unboundednetv1alpha1.Site) []assignmentRef {
+func (sc *SiteController) collectEnabledAssignments(sites []unboundedv1alpha3.Site) []assignmentRef {
 	enabled := make([]assignmentRef, 0)
 
 	for _, site := range sites {
@@ -510,7 +519,7 @@ func (sc *SiteController) collectEnabledAssignments(sites []unboundednetv1alpha1
 	return enabled
 }
 
-func (sc *SiteController) updateAssignmentAllocators(sites []unboundednetv1alpha1.Site) {
+func (sc *SiteController) updateAssignmentAllocators(sites []unboundedv1alpha3.Site) {
 	enabledAssignments := sc.collectEnabledAssignments(sites)
 
 	desired := make(map[string]assignmentRef, len(enabledAssignments))
@@ -848,7 +857,7 @@ func (sc *SiteController) syncNode(ctx context.Context, key string) error {
 
 	// Get current site label
 	currentSite := getNodeSiteLabel(node)
-	needsLabel := currentSite != siteName
+	needsLabel := !nodeSiteLabelsCurrent(node, siteName)
 	needsCIDRs := !hasAssignedPodCIDRs
 
 	// If node needs both label and CIDRs, do them in a single combined patch
@@ -864,36 +873,28 @@ func (sc *SiteController) syncNode(ctx context.Context, key string) error {
 
 	// Update label if needed
 	if needsLabel {
-		var patchOps []map[string]interface{}
 		if siteName != "" {
-			patchOps = append(patchOps, map[string]interface{}{
-				"op":    "add",
-				"path":  "/metadata/labels/" + escapeJSONPointer(SiteLabelKey),
-				"value": siteName,
-			})
-		} else if currentSite != "" {
-			patchOps = append(patchOps, map[string]interface{}{
-				"op":   "remove",
-				"path": "/metadata/labels/" + escapeJSONPointer(SiteLabelKey),
-			})
-		}
-
-		if len(patchOps) > 0 {
-			patchData, err := json.Marshal(patchOps)
+			patchData, err := siteLabelAddMergePatch(siteName)
 			if err != nil {
 				return fmt.Errorf("failed to marshal patch: %w", err)
 			}
 
-			_, err = sc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.JSONPatchType, patchData, metav1.PatchOptions{})
-			if err != nil {
+			if _, err := sc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patchData, metav1.PatchOptions{}); err != nil {
 				return fmt.Errorf("failed to patch node: %w", err)
 			}
 
-			if siteName != "" {
-				klog.Infof("Labeled node %s with site %s", node.Name, siteName)
-			} else {
-				klog.Infof("Removed site label from node %s", node.Name)
+			klog.Infof("Labeled node %s with site %s", node.Name, siteName)
+		} else if currentSite != "" {
+			patchData, err := siteLabelRemoveMergePatch()
+			if err != nil {
+				return fmt.Errorf("failed to marshal patch: %w", err)
 			}
+
+			if _, err := sc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patchData, metav1.PatchOptions{}); err != nil {
+				return fmt.Errorf("failed to patch node: %w", err)
+			}
+
+			klog.Infof("Removed site label from node %s", node.Name)
 		}
 
 		sc.markSlicesDirty()
@@ -1016,7 +1017,7 @@ func (sc *SiteController) updateAllSiteSlices(ctx context.Context) {
 }
 
 // updateSiteSlices creates/updates/deletes SiteNodeSlice objects for a site
-func (sc *SiteController) updateSiteSlices(ctx context.Context, site unboundednetv1alpha1.Site, nodesInfo []unboundednetv1alpha1.NodeInfo) {
+func (sc *SiteController) updateSiteSlices(ctx context.Context, site unboundedv1alpha3.Site, nodesInfo []unboundednetv1alpha1.NodeInfo) {
 	// Calculate how many slices we need
 	numSlices := (len(nodesInfo) + unboundednetv1alpha1.MaxNodesPerSlice - 1) / unboundednetv1alpha1.MaxNodesPerSlice
 	if numSlices == 0 {
@@ -1096,7 +1097,7 @@ func (sc *SiteController) getExistingSlices(siteName string) []unboundednetv1alp
 }
 
 // createOrUpdateSlice creates or updates a SiteNodeSlice with retry logic for conflicts
-func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unboundednetv1alpha1.Site, sliceIndex int, nodes []unboundednetv1alpha1.NodeInfo) {
+func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unboundedv1alpha3.Site, sliceIndex int, nodes []unboundednetv1alpha1.NodeInfo) {
 	sliceName := fmt.Sprintf("%s-%d", site.Name, sliceIndex)
 
 	// Convert nodes to unstructured format
@@ -1193,7 +1194,7 @@ func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unbounde
 }
 
 // buildSliceObject constructs the unstructured SiteNodeSlice object
-func (sc *SiteController) buildSliceObject(site unboundednetv1alpha1.Site, sliceName string, sliceIndex int, nodesData []interface{}) *unstructured.Unstructured {
+func (sc *SiteController) buildSliceObject(site unboundedv1alpha3.Site, sliceName string, sliceIndex int, nodesData []interface{}) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "net.unbounded-cloud.io/v1alpha1",
@@ -1202,7 +1203,11 @@ func (sc *SiteController) buildSliceObject(site unboundednetv1alpha1.Site, slice
 				"name": sliceName,
 				"ownerReferences": []interface{}{
 					map[string]interface{}{
-						"apiVersion":         "net.unbounded-cloud.io/v1alpha1",
+						// Site now lives in the machina group
+						// (unbounded-cloud.io/v1alpha3); the ownerRef must match
+						// the owner's real GVK or the garbage collector will
+						// orphan or wrongly collect the slice after migration.
+						"apiVersion":         unboundedv1alpha3.GroupVersion.String(),
 						"kind":               "Site",
 						"name":               site.Name,
 						"uid":                string(site.UID),
@@ -1313,7 +1318,7 @@ func (sc *SiteController) buildNodeInfo(node *corev1.Node) unboundednetv1alpha1.
 }
 
 // updateSiteStatusIfChanged updates the status of a site only if it has changed
-func (sc *SiteController) updateSiteStatusIfChanged(ctx context.Context, site unboundednetv1alpha1.Site, nodeCount, sliceCount int) {
+func (sc *SiteController) updateSiteStatusIfChanged(ctx context.Context, site unboundedv1alpha3.Site, nodeCount, sliceCount int) {
 	// Always update gauges so they reflect the latest state.
 	SiteNodesGauge.WithLabelValues(site.Name).Set(float64(nodeCount))
 	SiteNodeSlicesGauge.WithLabelValues(site.Name).Set(float64(sliceCount))
@@ -1436,8 +1441,8 @@ func (sc *SiteController) getAssignmentAllocator(siteName string, assignmentInde
 	return state
 }
 
-func (sc *SiteController) selectAssignmentForNode(site unboundednetv1alpha1.Site, nodeName string) *assignmentAllocator {
-	enabledAssignments := sc.collectEnabledAssignments([]unboundednetv1alpha1.Site{site})
+func (sc *SiteController) selectAssignmentForNode(site unboundedv1alpha3.Site, nodeName string) *assignmentAllocator {
+	enabledAssignments := sc.collectEnabledAssignments([]unboundedv1alpha3.Site{site})
 
 	var (
 		selected         *assignmentAllocator
@@ -1466,7 +1471,7 @@ func (sc *SiteController) selectAssignmentForNode(site unboundednetv1alpha1.Site
 	return selected
 }
 
-func (sc *SiteController) assignPodCIDRsForNode(ctx context.Context, node *corev1.Node, sites []unboundednetv1alpha1.Site, siteName string) error {
+func (sc *SiteController) assignPodCIDRsForNode(ctx context.Context, node *corev1.Node, sites []unboundedv1alpha3.Site, siteName string) error {
 	if !sc.hasSynced.Load() {
 		return fmt.Errorf("informer caches not synced; refusing pod CIDR assignment for node %s", node.Name)
 	}
@@ -1479,7 +1484,7 @@ func (sc *SiteController) assignPodCIDRsForNode(ctx context.Context, node *corev
 		return nil
 	}
 
-	var site *unboundednetv1alpha1.Site
+	var site *unboundedv1alpha3.Site
 
 	for i := range sites {
 		if sites[i].Name == siteName {
@@ -1716,24 +1721,31 @@ func (sc *SiteController) patchNodeCIDRs(ctx context.Context, nodeName, podCIDR 
 }
 
 // patchNodeLabelAndCIDRs applies both a site label and pod CIDRs in a single
-// MergePatch to cut the number of API calls in half during scale-in.
+// MergePatch to cut the number of API calls in half during scale-in. It sets
+// every site-membership label key (canonical + deprecated) during the
+// deprecation window.
 func (sc *SiteController) patchNodeLabelAndCIDRs(ctx context.Context, nodeName, siteName, podCIDR string, podCIDRs []string) error {
-	podCIDRsJSON := "["
-
-	for i, cidr := range podCIDRs {
-		if i > 0 {
-			podCIDRsJSON += ","
-		}
-
-		podCIDRsJSON += fmt.Sprintf("%q", cidr)
+	labels := map[string]interface{}{}
+	for _, key := range siteLabelKeys() {
+		labels[key] = siteName
 	}
 
-	podCIDRsJSON += "]"
+	spec := map[string]interface{}{"podCIDR": podCIDR}
+	if podCIDRs != nil {
+		spec["podCIDRs"] = podCIDRs
+	} else {
+		spec["podCIDRs"] = []string{}
+	}
 
-	patch := fmt.Sprintf(`{"metadata":{"labels":{%q:%q}},"spec":{"podCIDR":%q,"podCIDRs":%s}}`,
-		SiteLabelKey, siteName, podCIDR, podCIDRsJSON)
+	patch, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{"labels": labels},
+		"spec":     spec,
+	})
+	if err != nil {
+		return err
+	}
 
-	_, err := sc.clientset.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+	_, err = sc.clientset.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patch, metav1.PatchOptions{})
 	if err != nil {
 		return err
 	}
@@ -1745,7 +1757,7 @@ func (sc *SiteController) patchNodeLabelAndCIDRs(ctx context.Context, nodeName, 
 
 // assignPodCIDRsForNodeWithLabel combines site labeling and pod CIDR assignment
 // into a single API call for new nodes that need both.
-func (sc *SiteController) assignPodCIDRsForNodeWithLabel(ctx context.Context, node *corev1.Node, sites []unboundednetv1alpha1.Site, siteName string) error {
+func (sc *SiteController) assignPodCIDRsForNodeWithLabel(ctx context.Context, node *corev1.Node, sites []unboundedv1alpha3.Site, siteName string) error {
 	if !sc.hasSynced.Load() {
 		return fmt.Errorf("informer caches not synced; refusing pod CIDR assignment for node %s", node.Name)
 	}
@@ -1758,7 +1770,7 @@ func (sc *SiteController) assignPodCIDRsForNodeWithLabel(ctx context.Context, no
 		return nil
 	}
 
-	var site *unboundednetv1alpha1.Site
+	var site *unboundedv1alpha3.Site
 
 	for i := range sites {
 		if sites[i].Name == siteName {
@@ -1817,8 +1829,8 @@ func (sc *SiteController) markSlicesDirty() {
 // markNodeCIDRsAllocated ensures a node's existing pod CIDRs are marked in the
 // allocator so they are never handed out to another node. Called for nodes that
 // already have CIDRs assigned (e.g., gateway and system nodes).
-func (sc *SiteController) markNodeCIDRsAllocated(node *corev1.Node, sites []unboundednetv1alpha1.Site, siteName string) {
-	var site *unboundednetv1alpha1.Site
+func (sc *SiteController) markNodeCIDRsAllocated(node *corev1.Node, sites []unboundedv1alpha3.Site, siteName string) {
+	var site *unboundedv1alpha3.Site
 
 	for i := range sites {
 		if sites[i].Name == siteName {
@@ -1851,7 +1863,7 @@ func (sc *SiteController) releaseNodeCIDRs(node *corev1.Node) {
 		return
 	}
 
-	var site *unboundednetv1alpha1.Site
+	var site *unboundedv1alpha3.Site
 
 	for i := range sites {
 		if sites[i].Name == siteName {
@@ -1909,7 +1921,7 @@ func (sc *SiteController) releaseNodeCIDRs(node *corev1.Node) {
 
 // findSiteForNode returns the name of the site that contains the node's internal IP.
 // Returns empty string if no site matches.
-func (sc *SiteController) findSiteForNode(node *corev1.Node, sites []unboundednetv1alpha1.Site) string {
+func (sc *SiteController) findSiteForNode(node *corev1.Node, sites []unboundedv1alpha3.Site) string {
 	// Get node's internal IPs
 	var internalIPs []net.IP
 
@@ -1959,12 +1971,73 @@ func (sc *SiteController) GetSiteForNode(node *corev1.Node) string {
 
 // Helper functions
 
-func getNodeSiteLabel(node *corev1.Node) string {
+// siteLabelKeys are the node site-membership label keys in priority order:
+// canonical first, deprecated fallback.
+func siteLabelKeys() []string {
+	return []string{canonicalSiteLabelKey, deprecatedSiteLabelKey}
+}
+
+// NodeSiteLabel returns the site a Node belongs to, preferring the canonical
+// label (unbounded-cloud.io/site) and falling back to the deprecated
+// net.unbounded-cloud.io/site.
+func NodeSiteLabel(node *corev1.Node) string {
 	if node.Labels == nil {
 		return ""
 	}
 
-	return node.Labels[SiteLabelKey]
+	for _, key := range siteLabelKeys() {
+		if value := node.Labels[key]; value != "" {
+			return value
+		}
+	}
+
+	return ""
+}
+
+// nodeSiteLabelsCurrent reports whether the Node already carries siteName under
+// every site-membership key (or, when siteName is empty, carries none). It
+// drives dual-write so a Node labeled only with the deprecated key by an older
+// controller is converged to also carry the canonical key.
+func nodeSiteLabelsCurrent(node *corev1.Node, siteName string) bool {
+	if siteName == "" {
+		return NodeSiteLabel(node) == ""
+	}
+
+	for _, key := range siteLabelKeys() {
+		if node.Labels[key] != siteName {
+			return false
+		}
+	}
+
+	return true
+}
+
+// siteLabelAddMergePatch builds a merge patch that sets every site-membership
+// label key to siteName. A merge patch tolerates Nodes whose metadata.labels map
+// is absent, unlike a JSONPatch add to /metadata/labels/<key>.
+func siteLabelAddMergePatch(siteName string) ([]byte, error) {
+	labels := map[string]interface{}{}
+	for _, key := range siteLabelKeys() {
+		labels[key] = siteName
+	}
+
+	return json.Marshal(map[string]interface{}{"metadata": map[string]interface{}{"labels": labels}})
+}
+
+// siteLabelRemoveMergePatch builds a merge patch that clears every
+// site-membership label key. A merge patch (null value) is used instead of a
+// JSONPatch remove so it tolerates keys that are already absent.
+func siteLabelRemoveMergePatch() ([]byte, error) {
+	labels := map[string]interface{}{}
+	for _, key := range siteLabelKeys() {
+		labels[key] = nil
+	}
+
+	return json.Marshal(map[string]interface{}{"metadata": map[string]interface{}{"labels": labels}})
+}
+
+func getNodeSiteLabel(node *corev1.Node) string {
+	return NodeSiteLabel(node)
 }
 
 func getNodeAnnotation(node *corev1.Node, key string) string {
@@ -2026,7 +2099,7 @@ func escapeJSONPointer(s string) string {
 
 // validateSiteCIDRsNoOverlap checks that no two sites have overlapping CIDRs.
 // This prevents routing conflicts where the same CIDR would be routed to multiple sites.
-func validateSiteCIDRsNoOverlap(sites []unboundednetv1alpha1.Site) error {
+func validateSiteCIDRsNoOverlap(sites []unboundedv1alpha3.Site) error {
 	// Build a map of all CIDRs to the site that owns them
 	type cidrOwner struct {
 		siteName string
@@ -2144,7 +2217,7 @@ func (sc *SiteController) TryAllocateForNode(nodeName string, internalIPs []stri
 		return "", nil, "", false
 	}
 
-	var site *unboundednetv1alpha1.Site
+	var site *unboundedv1alpha3.Site
 
 	for i := range sites {
 		if sites[i].Name == siteName {

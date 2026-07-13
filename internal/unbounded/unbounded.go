@@ -28,3 +28,20 @@ func SystemNamespace() string {
 
 	return systemNamespace
 }
+
+const (
+	// LegacyKubeNamespace is where machina, metalman, and storage ran before
+	// the consolidation onto SystemNamespace().
+	LegacyKubeNamespace = "unbounded-kube"
+
+	// LegacyNetNamespace is where unbounded-net ran before the consolidation.
+	LegacyNetNamespace = "unbounded-net"
+)
+
+// IsLegacyNamespace reports whether ns is one of the pre-consolidation
+// namespaces the operator's migration reaper drains and deletes. Installing
+// unbounded into one of these is unsafe: the reaper would delete the very
+// namespace it just migrated into.
+func IsLegacyNamespace(ns string) bool {
+	return ns == LegacyKubeNamespace || ns == LegacyNetNamespace
+}

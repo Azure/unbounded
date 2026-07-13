@@ -15,10 +15,11 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/rest"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
-func mustUnstructured(t *testing.T, obj interface{}, kind string) *unstructured.Unstructured {
+func mustUnstructured(t *testing.T, obj interface{}, apiVersion, kind string) *unstructured.Unstructured {
 	t.Helper()
 
 	data, err := json.Marshal(obj)
@@ -32,7 +33,7 @@ func mustUnstructured(t *testing.T, obj interface{}, kind string) *unstructured.
 	}
 
 	u := &unstructured.Unstructured{Object: m}
-	u.SetAPIVersion("net.unbounded-cloud.io/v1alpha1")
+	u.SetAPIVersion(apiVersion)
 	u.SetKind(kind)
 
 	return u
@@ -51,11 +52,11 @@ func newFakeDynamic(objects ...runtime.Object) *dynamicfake.FakeDynamicClient {
 
 // TestSiteClientListGetWatchAndUpdateStatus tests SiteClientListGetWatchAndUpdateStatus.
 func TestSiteClientListGetWatchAndUpdateStatus(t *testing.T) {
-	siteObj := mustUnstructured(t, &unboundednetv1alpha1.Site{
+	siteObj := mustUnstructured(t, &unboundedv1alpha3.Site{
 		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
-		Spec:       unboundednetv1alpha1.SiteSpec{NodeCidrs: []string{"10.0.0.0/16"}},
-		Status:     unboundednetv1alpha1.SiteStatus{NodeCount: 1, SliceCount: 1},
-	}, "Site")
+		Spec:       unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.0.0.0/16"}},
+		Status:     unboundedv1alpha3.SiteStatus{NodeCount: 1, SliceCount: 1},
+	}, unboundedv1alpha3.GroupVersion.String(), "Site")
 	dyn := newFakeDynamic(siteObj)
 	c := &siteClient{client: dyn.Resource(siteGVR)}
 	ctx := context.Background()
@@ -110,7 +111,7 @@ func TestGatewayPoolClientListGetAndWatch(t *testing.T) {
 			Type:         "External",
 			NodeSelector: map[string]string{"role": "gateway"},
 		},
-	}, "GatewayPool")
+	}, unboundednetv1alpha1.SchemeGroupVersion.String(), "GatewayPool")
 	dyn := newFakeDynamic(poolObj)
 	c := &gatewayPoolClient{client: dyn.Resource(gatewayPoolGVR)}
 	ctx := context.Background()

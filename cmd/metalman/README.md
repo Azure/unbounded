@@ -2,9 +2,9 @@
 
 Join bare metal nodes to a Kubernetes cluster using PXE and (optionally) Redfish.
 
-Metalman commands are available through the `kubectl unbounded` plugin. A
-dedicated `metalman` binary is also shipped as a container image for running
-the PXE server inside a cluster.
+A dedicated `metalman` binary is shipped as a container image for running the
+PXE server inside a cluster. `unbounded-operator` deploys that image when a
+Site enables the Metalman component.
 
 Run `metalman version` to print the binary version.
 
@@ -47,7 +47,7 @@ kubectl unbounded machine repave node-01
 
 ### Controller
 
-`kubectl unbounded site serve-pxe` runs a single long-lived process that provides
+`metalman serve-pxe` runs a single long-lived process that provides
 everything needed to PXE-boot and manage bare metal hosts:
 
 | Service | Default Port | Protocol | Purpose |
@@ -62,34 +62,31 @@ caching netboot images from container registries) and Machine resources with
 Redfish BMC specs (power management, boot order configuration).
 
 When deployed inside a cluster, the container entrypoint is `metalman` and the
-`site deploy-pxe` command passes `serve-pxe` as an argument:
+operator passes `serve-pxe` as an argument:
 
 ```bash
 metalman serve-pxe --site=<site> [flags]
 ```
 
-#### Deploying with `site deploy-pxe`
+#### Deploying With Site Components
 
-`kubectl unbounded site deploy-pxe` is a convenience command that creates (or
-updates) a Kubernetes Deployment running `metalman serve-pxe` for a given
-site. The Deployment is server-side applied into the `unbounded-system`
-namespace.
+Enable Metalman in the Site spec and let `unbounded-operator` create or update
+the per-site Deployment running `metalman serve-pxe`:
 
-```bash
-# Deploy the PXE server for a site called "rack-a"
-kubectl unbounded site deploy-pxe --site=rack-a
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Site
+metadata:
+  name: rack-a
+spec:
+  components:
+    metalman:
+      enabled: true
+      dhcpAutoInterface: true
 ```
 
 The resulting Deployment (`metalman-controller-<site>`) runs with host networking for DHCP.
 It exposes ports 8880/tcp (HTTP), 8081/tcp (health), 67/udp (DHCP), and 69/udp (TFTP).
-
-`site deploy-pxe` flags:
-
-- `--site` — Site name (required; scopes the PXE instance to machines
-  labeled `unbounded-cloud.io/site=<site>`).
-- `--image` — Container image for the PXE deployment (default: build-time
-  value or `metalman:latest`).
-- `--kubeconfig` — Path to kubeconfig file.
 
 The generated Deployment uses host networking, a `CriticalAddonsOnly`
 toleration, DNS policy `ClusterFirstWithHostNet`, and a node selector
@@ -129,20 +126,20 @@ So it's possible to prove that the bootstrap token was delivered only to trusted
 
 #### Sites
 
-The `--site` flag scopes a `site serve-pxe` instance to a subset of Machines. The
-value is matched against the `unbounded-cloud.io/site` label on Machine
+The `--site` flag scopes a `metalman serve-pxe` instance to a subset of Machines.
+The value is matched against the `unbounded-cloud.io/site` label on Machine
 resources:
 
 ```bash
 # Manage only Machines labeled site=rack-a
-kubectl unbounded site serve-pxe --site=rack-a --dhcp-interface=eth0
+metalman serve-pxe --site=rack-a --dhcp-interface=eth0
 
 # Manage only unlabeled Machines (the default)
-kubectl unbounded site serve-pxe --dhcp-interface=eth0
+metalman serve-pxe --dhcp-interface=eth0
 ```
 
 Each site gets its own leader-election lease (`metalman-<site>`), so
-multiple sites can coexist on one cluster with independent HA. A `site serve-pxe`
+multiple sites can coexist on one cluster with independent HA. A `metalman serve-pxe`
 instance with no `--site` manages Machines that do not have the site label
 at all.
 

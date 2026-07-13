@@ -94,17 +94,20 @@ spec:
         object.spec.all(k, k in ['podCIDR', 'podCIDRs'] || (k in oldObject.spec && object.spec[k] == oldObject.spec[k])) &&
         oldObject.spec.all(k, k in ['podCIDR', 'podCIDRs'] || (k in object.spec && oldObject.spec[k] == object.spec[k]))
       message: "unbounded-net may only modify spec.podCIDR and spec.podCIDRs on nodes"
-    # Labels: only net.unbounded-cloud.io/ prefix labels may be added, changed, or removed.
+    # Labels: only net.unbounded-cloud.io/ prefix labels and the canonical
+    # unbounded-cloud.io/site label may be added, changed, or removed. The
+    # canonical site label is dual-written alongside the deprecated
+    # net.unbounded-cloud.io/site during the label deprecation window.
     - expression: >-
         (!has(object.metadata.labels) && !has(oldObject.metadata.labels)) ||
-        (!has(oldObject.metadata.labels) && object.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/'))) ||
-        (!has(object.metadata.labels) && oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/'))) ||
+        (!has(oldObject.metadata.labels) && object.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') || k == 'unbounded-cloud.io/site')) ||
+        (!has(object.metadata.labels) && oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') || k == 'unbounded-cloud.io/site')) ||
         (has(object.metadata.labels) && has(oldObject.metadata.labels) &&
-          object.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') ||
+          object.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') || k == 'unbounded-cloud.io/site' ||
             (k in oldObject.metadata.labels && object.metadata.labels[k] == oldObject.metadata.labels[k])) &&
-          oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') ||
+          oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') || k == 'unbounded-cloud.io/site' ||
             (k in object.metadata.labels && oldObject.metadata.labels[k] == object.metadata.labels[k])))
-      message: "unbounded-net may only modify labels with net.unbounded-cloud.io/ prefix"
+      message: "unbounded-net may only modify labels with the net.unbounded-cloud.io/ prefix or the unbounded-cloud.io/site label"
     # Annotations: only net.unbounded-cloud.io/ prefix annotations may be added, changed, or removed.
     - expression: >-
         (!has(object.metadata.annotations) && !has(oldObject.metadata.annotations)) ||

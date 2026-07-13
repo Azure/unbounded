@@ -11,7 +11,7 @@ A Site represents a network location containing nodes. Nodes are automatically a
 ### Specification
 
 ```yaml
-apiVersion: net.unbounded-cloud.io/v1alpha1
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Site
 metadata:
   name: site-east
@@ -101,7 +101,7 @@ When `manageCniPlugin` is `false`, pod CIDR assignment by the controller is disa
 
 **Example -- site with an existing CNI plugin:**
 ```yaml
-apiVersion: net.unbounded-cloud.io/v1alpha1
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Site
 metadata:
   name: existing-cni-site
@@ -135,7 +135,7 @@ flowchart TD
     N[Node with Internal IP<br/>10.0.5.25] --> C{Check Site nodeCidrs}
     C --> S1{Site A<br/>10.0.0.0/16}
     C --> S2{Site B<br/>10.1.0.0/16}
-    S1 -->|Match!| L[Label: net.unbounded-cloud.io/site=site-a]
+    S1 -->|Match!| L[Label: unbounded-cloud.io/site=site-a]
     S2 -->|No Match| X[Skip]
 ```
 
@@ -143,7 +143,7 @@ flowchart TD
 
 **Basic Site:**
 ```yaml
-apiVersion: net.unbounded-cloud.io/v1alpha1
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Site
 metadata:
   name: datacenter-east
@@ -154,7 +154,7 @@ spec:
 
 **Multi-Region Site with Pod CIDR Assignments:**
 ```yaml
-apiVersion: net.unbounded-cloud.io/v1alpha1
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Site
 metadata:
   name: aws-us-east-1
@@ -189,7 +189,7 @@ kind: SiteNodeSlice
 metadata:
   name: site-east-0
   ownerReferences:
-    - apiVersion: net.unbounded-cloud.io/v1alpha1
+    - apiVersion: unbounded-cloud.io/v1alpha3
       kind: Site
       name: site-east
       uid: <site-uid>
@@ -729,7 +729,7 @@ spec:
 
 | Label | Applied To | Description |
 |-------|-----------|-------------|
-| `net.unbounded-cloud.io/site` | Node | Site membership. Set by Site controller. |
+| `unbounded-cloud.io/site` | Node | Site membership. Set by Site controller. Supersedes the deprecated `net.unbounded-cloud.io/site` (still written during the deprecation window). |
 | `app.kubernetes.io/name: unbounded-net` | CRDs | Identifies unbounded-net resources. |
 
 ### Annotations
@@ -844,7 +844,7 @@ kubectl describe st site-east
 kubectl get gp -o wide
 
 # View site node slices
-kubectl get sns -l net.unbounded-cloud.io/site=site-east
+kubectl get sns -l unbounded-cloud.io/site=site-east
 
 # Watch gateway pool status
 kubectl get gp main-gateways -o yaml -w

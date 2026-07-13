@@ -6,9 +6,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
-  name: sites.net.unbounded-cloud.io
+  name: sites.unbounded-cloud.io
 spec:
-  group: net.unbounded-cloud.io
+  group: unbounded-cloud.io
   names:
     kind: Site
     listKind: SiteList
@@ -19,25 +19,27 @@ spec:
   scope: Cluster
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.nodeCidrs
-      name: Node CIDRs
-      type: string
-    - jsonPath: .spec.podCidrAssignments
-      name: Pod CIDR Assignments
-      type: string
+    - jsonPath: .spec.components.machina.enabled
+      name: Machina
+      type: boolean
+    - jsonPath: .spec.components.metalman.enabled
+      name: Metalman
+      type: boolean
+    - jsonPath: .spec.components.storage.enabled
+      name: Storage
+      type: boolean
     - jsonPath: .status.nodeCount
       name: Nodes
-      type: integer
-    - jsonPath: .status.sliceCount
-      name: Slices
       type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
-    name: v1alpha1
+    name: v1alpha3
     schema:
       openAPIV3Schema:
-        description: Site defines a network location containing nodes
+        description: |-
+          Site defines a top-level Unbounded location and the optional components
+          enabled for that location.
         properties:
           apiVersion:
             description: |-
@@ -57,8 +59,41 @@ spec:
           metadata:
             type: object
           spec:
-            description: SiteSpec defines the desired state of Site
+            description: SiteSpec defines the desired state of Site.
             properties:
+              components:
+                description: Components declares optional Unbounded components managed
+                  for this site.
+                properties:
+                  machina:
+                    description: Machina configures the machina controller for this
+                      site.
+                    properties:
+                      enabled:
+                        description: Enabled controls whether the component is reconciled.
+                        type: boolean
+                    type: object
+                  metalman:
+                    description: Metalman configures the Metalman PXE controller for
+                      this site.
+                    properties:
+                      dhcpAutoInterface:
+                        description: DHCPAutoInterface lets Metalman choose the DHCP
+                          interface automatically.
+                        type: boolean
+                      enabled:
+                        description: Enabled controls whether the component is reconciled.
+                        type: boolean
+                    type: object
+                  storage:
+                    description: Storage configures the unbounded-storage supervisor
+                      for this site.
+                    properties:
+                      enabled:
+                        description: Enabled controls whether the component is reconciled.
+                        type: boolean
+                    type: object
+                type: object
               healthCheckSettings:
                 description: HealthCheckSettings controls health check settings for
                   inter-site tunnel peers.
@@ -113,7 +148,7 @@ spec:
                 type: boolean
               nodeCidrs:
                 description: NodeCidrs are the CIDRs that contain the internal IPs
-                  of nodes at this site
+                  of nodes at this site.
                 items:
                   type: string
                 minItems: 1
@@ -122,10 +157,7 @@ spec:
                 description: |-
                   NonMasqueradeCIDRs are CIDR blocks that should NOT be masqueraded when
                   traffic leaves the node via the default gateway. Traffic to these CIDRs
-                  will use the pod's actual IP address. This is useful for preserving source
-                  IPs when communicating with external networks (e.g., corporate networks, VPNs).
-                  If nodes are Azure VMs/VMSS instances, NIC ipForwarding must be enabled
-                  for this setting to work correctly.
+                  will use the pod's actual IP address.
                 items:
                   type: string
                 type: array
@@ -184,17 +216,16 @@ spec:
                 type: array
               tunnelMTU:
                 description: TunnelMTU is the MTU to set on routes through tunnels
-                  for this scope.
+                  for this site.
                 format: int32
                 maximum: 9000
                 minimum: 576
                 type: integer
               tunnelProtocol:
                 description: |-
-                  TunnelProtocol selects the tunnel protocol for this scope.
+                  TunnelProtocol selects the tunnel protocol for this site.
                   Valid values are "WireGuard", "IPIP", "GENEVE", "VXLAN", "None", or "Auto".
-                  Defaults to "Auto" when unset. When "Auto", links using external IPs
-                  use WireGuard and links using only internal IPs use GENEVE.
+                  Defaults to "Auto" when unset.
                 enum:
                 - WireGuard
                 - IPIP
@@ -208,18 +239,80 @@ spec:
             - podCidrAssignments
             type: object
           status:
-            description: SiteStatus defines the observed state of Site
+            description: SiteStatus defines the observed state of Site.
             properties:
+              conditions:
+                description: |-
+                  Conditions report the last observed state of site components. One
+                  condition is published per component (for example NetReady, MachinaReady,
+                  MetalmanReady, StorageReady) so callers can `kubectl wait` on a Site.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
               nodeCount:
                 description: NodeCount is the number of nodes matched to this site
+                  by unbounded-net.
                 type: integer
               sliceCount:
                 description: SliceCount is the number of SiteNodeSlice objects for
-                  this site
+                  this site.
                 type: integer
             type: object
-        required:
-        - spec
         type: object
     served: true
     storage: true

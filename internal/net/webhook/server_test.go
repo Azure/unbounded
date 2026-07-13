@@ -10,15 +10,20 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
 // TestIsTrustedAggregatedRequest tests is trusted aggregated request.
@@ -214,5 +219,37 @@ func TestGetClientCAs(t *testing.T) {
 	s.aggregatedClientCAs = pool
 	if got := s.GetClientCAs(); got != pool {
 		t.Fatal("expected GetClientCAs to return the set pool")
+	}
+}
+
+// TestBuildNodeAdmissionPatchDualWritesSiteLabels verifies the mutating webhook
+// stamps both the canonical (unbounded-cloud.io/site) and deprecated
+// (net.unbounded-cloud.io/site) site labels during the deprecation window.
+func TestBuildNodeAdmissionPatchDualWritesSiteLabels(t *testing.T) {
+	patch := buildNodeAdmissionPatch("10.0.0.0/24", []string{"10.0.0.0/24"}, "site-a")
+
+	var ops []map[string]interface{}
+	if err := json.Unmarshal(patch, &ops); err != nil {
+		t.Fatalf("unmarshal patch: %v", err)
+	}
+
+	labelValues := map[string]interface{}{}
+
+	for _, op := range ops {
+		path, _ := op["path"].(string)
+		if strings.HasPrefix(path, "/metadata/labels/") {
+			labelValues[path] = op["value"]
+		}
+	}
+
+	canonical := "/metadata/labels/" + escapeJSONPointer(unboundedv1alpha3.MachineSiteLabelKey)
+	deprecated := "/metadata/labels/" + escapeJSONPointer(unboundednetv1alpha1.SiteLabelKey)
+
+	if labelValues[canonical] != "site-a" {
+		t.Fatalf("canonical site label not set: %#v", labelValues)
+	}
+
+	if labelValues[deprecated] != "site-a" {
+		t.Fatalf("deprecated site label not set: %#v", labelValues)
 	}
 }

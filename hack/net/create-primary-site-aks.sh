@@ -39,7 +39,7 @@
 #   --grafana-admin-id      Entra ID object ID to grant Grafana Admin role
 #   --infra-only            Deploy Azure resources only; skip in-cluster configuration
 #   --skip-infra            Skip deploying Azure resources; only in-cluster configuration
-#   --skip-install          Skip installing unbounded-net (deploy infra and fetch credentials only)
+#   --skip-install          Skip bootstrapping Unbounded (deploy infra and fetch credentials only)
 #   -y, --yes               Skip confirmation prompt
 #   --help                  Show this help message
 #
@@ -219,7 +219,7 @@ ensure_site_gateway_resources() {
 
     echo "==> Ensuring Site '${site_name}' and GatewayPool '${gateway_pool_name}' CRDs..."
     {
-        echo "apiVersion: net.unbounded-cloud.io/v1alpha1"
+        echo "apiVersion: unbounded-cloud.io/v1alpha3"
         echo "kind: Site"
         echo "metadata:"
         echo "  name: ${site_name}"
@@ -491,15 +491,17 @@ ensure_unmanaged_kube_proxy_daemonset
 ensure_unmanaged_cloud_node_manager_daemonset
 
 if [[ "$SKIP_INSTALL" == true ]]; then
-    echo "==> --skip-install: skipping unbounded-net installation."
-    echo "==> Cluster is ready. Install unbounded-net manually with:"
-    echo "    make -C hack/net deploy"
+    echo "==> --skip-install: skipping Unbounded bootstrap."
+    echo "==> Cluster is ready. Bootstrap Unbounded manually with:"
+    echo "    kubectl unbounded install"
     exit 0
 fi
 
-echo "==> Running make -C hack/net deploy-crds..."
-(cd "$REPO_ROOT" && make -C hack/net deploy-crds)
+echo "==> Running make kubectl-unbounded-build..."
+(cd "$REPO_ROOT" && make kubectl-unbounded-build)
+
+echo "==> Bootstrapping CRDs and unbounded-operator..."
+(cd "$REPO_ROOT" && bin/kubectl-unbounded install)
+
 echo "==> Deploying site resources..."
 ensure_site_gateway_resources "$SITE_NAME" "${SITE_NAME}extgw1"
-echo "==> Running make build && make -C hack/net deploy..."
-(cd "$REPO_ROOT" && make build && make -C hack/net deploy)
