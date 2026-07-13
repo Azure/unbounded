@@ -42,6 +42,10 @@ type UnboundedAgentConfig struct {
 	// runc, CNI plugins, crictl). When unset the agent downloads each
 	// artifact from its upstream default host.
 	Downloads *AgentDownloads `json:"Downloads,omitempty"`
+
+	// ContainerImageArchives lists container image archives to preload into
+	// containerd. Each URL must have a sibling .sha256 checksum file.
+	ContainerImageArchives []string `json:"ContainerImageArchives,omitempty"`
 }
 
 // AgentAttestConfig holds configuration for TPM-based attestation against
@@ -199,6 +203,9 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 		},
 		Downloads: downloads,
 	}
+	if machine.Spec.Agent != nil {
+		cfg.ContainerImageArchives = append([]string(nil), machine.Spec.Agent.ContainerImageArchives...)
+	}
 
 	if params.AttestURL != "" {
 		cfg.Attest = &AgentAttestConfig{URL: params.AttestURL}
@@ -252,7 +259,15 @@ func downloadSourceFromSpec(s *v1alpha3.DownloadSource) *AgentDownloadSource {
 // converted into the goalstates.DownloadOverrides shape that rootfs phase tasks
 // consume.
 func ResolveDownloadOverridesWithOfflineArtifacts(cfg *UnboundedAgentConfig) (*goalstates.DownloadOverrides, *goalstates.ContainerImageArchiveStaging, error) {
-	return goalstates.ResolveDownloadOverridesWithOfflineArtifacts(&cfg.AgentConfig, resolveDownloadOverrides(cfg.Downloads))
+	downloads, staging, err := goalstates.ResolveDownloadOverridesWithOfflineArtifacts(&cfg.AgentConfig, resolveDownloadOverrides(cfg.Downloads))
+	if err != nil || cfg.OfflineArtifactsConfigured() || len(cfg.ContainerImageArchives) == 0 {
+		return downloads, staging, err
+	}
+
+	return downloads, &goalstates.ContainerImageArchiveStaging{
+		HostDir: goalstates.ContainerImageArchiveHostSourceDir + "/configured",
+		URLs:    append([]string(nil), cfg.ContainerImageArchives...),
+	}, nil
 }
 
 // ResolveDownloadOverrides converts the provision AgentDownloads into the

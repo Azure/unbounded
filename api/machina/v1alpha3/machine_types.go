@@ -456,6 +456,12 @@ type AgentSpec struct {
 	// artifact from its upstream default host.
 	// +optional
 	Downloads *AgentDownloadsSpec `json:"downloads,omitempty"`
+
+	// ContainerImageArchives lists container image archives to download and
+	// import into the node's containerd image store before kubelet starts.
+	// Each URL must have a sibling .sha256 checksum file.
+	// +optional
+	ContainerImageArchives []string `json:"containerImageArchives,omitempty"`
 }
 
 // AgentDownloadsSpec overrides the download sources for the artifacts the

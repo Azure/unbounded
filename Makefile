@@ -195,6 +195,10 @@ PLAYPEN_BMC_USERNAME ?= admin
 PLAYPEN_BMC_PASSWORD ?= playpen
 PLAYPEN_BMC_DEVICE_ID ?= 1
 PLAYPEN_MTU ?= 1360
+PLAYPEN_RESOURCE_CPU_REQUEST ?= 500m
+PLAYPEN_RESOURCE_MEMORY_REQUEST ?= 256Mi
+PLAYPEN_RESOURCE_CPU_LIMIT ?= 4
+PLAYPEN_RESOURCE_MEMORY_LIMIT ?= 4Gi
 PLAYPEN_ARCH ?=
 PLAYPEN_QEMU_BINARY ?=
 PLAYPEN_UEFI_CODE ?=
@@ -235,7 +239,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build playpen playpen-build playpen-e2e playpen-manifests
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build playpen playpen-build playpen-e2e playpen-manifests e2e-metalman
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push image-playpen-local image-playpen-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -292,6 +296,7 @@ help: ## Show this help
 	@echo "  unbounded-storage-supervisor | unbounded-storage-supervisor-build  Build the storage supervisor (with/without lint/test)"
 	@echo "  playpen | playpen-build          Build the playpen server/client CLI (with/without lint/test)"
 	@echo "  playpen-e2e                     Run the kind, VXLAN, dnsmasq, and Alpine PXE smoke test"
+	@echo "  e2e-metalman                    Run the Metalman smoke test on Playpen and local kind"
 	@echo ""
 	@echo "Rust Binaries:"
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
@@ -619,6 +624,9 @@ playpen: test playpen-build ## Build playpen (implies test)
 
 playpen-e2e: ## Run the privileged local kind PXE smoke test
 	hack/playpen/e2e.sh
+
+e2e-metalman: ## Run the privileged Metalman smoke test on Playpen and local kind
+	$(GOTEST) -tags=e2e ./e2e/metalman -v -timeout=13m
 
 unbounded-storage-supervisor-build: ## Build the unbounded-storage-supervisor binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_STORAGE_SUPERVISOR_BIN) $(UNBOUNDED_STORAGE_SUPERVISOR_CMD)
@@ -1114,6 +1122,10 @@ playpen-manifests: ## Render playpen deployment manifests into deploy/playpen/re
 		--set BMCPassword=$(PLAYPEN_BMC_PASSWORD) \
 		--set BMCDeviceID=$(PLAYPEN_BMC_DEVICE_ID) \
 		--set MTU=$(PLAYPEN_MTU) \
+		--set ResourceCPURequest=$(PLAYPEN_RESOURCE_CPU_REQUEST) \
+		--set ResourceMemoryRequest=$(PLAYPEN_RESOURCE_MEMORY_REQUEST) \
+		--set ResourceCPULimit=$(PLAYPEN_RESOURCE_CPU_LIMIT) \
+		--set ResourceMemoryLimit=$(PLAYPEN_RESOURCE_MEMORY_LIMIT) \
 		--set Arch=$(PLAYPEN_ARCH) \
 		--set QEMUBinary=$(PLAYPEN_QEMU_BINARY) \
 		--set UEFICode=$(PLAYPEN_UEFI_CODE) \

@@ -67,6 +67,14 @@ spec:
                       releases layout (<base>/latest/download/<asset> and
                       <base>/download/<tag>/<asset>).
                     type: string
+                  containerImageArchives:
+                    description: |-
+                      ContainerImageArchives lists container image archives to download and
+                      import into the node's containerd image store before kubelet starts.
+                      Each URL must have a sibling .sha256 checksum file.
+                    items:
+                      type: string
+                    type: array
                   downloads:
                     description: |-
                       Downloads overrides the download sources for the binaries the

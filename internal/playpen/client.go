@@ -352,6 +352,15 @@ func RunClient(ctx context.Context, cfg ClientConfig) (retErr error) {
 		}
 	}()
 
+	// A process killed after deleting its namespace can leave the host end of
+	// the deterministic veth behind. It cannot belong to a live client because
+	// creating the namespace above would have failed in that case.
+	if err := runner.run("link", "show", hostLink); err == nil {
+		if err := runner.run("link", "delete", hostLink); err != nil {
+			return fmt.Errorf("delete stale client veth %s: %w", hostLink, err)
+		}
+	}
+
 	if err := runner.run("link", "add", hostLink, "type", "veth", "peer", "name", peerLink); err != nil {
 		return fmt.Errorf("create client veth: %w", err)
 	}

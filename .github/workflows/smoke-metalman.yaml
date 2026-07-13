@@ -8,23 +8,47 @@ on:
     paths:
       - cmd/agent/**
       - cmd/metalman/**
+      - cmd/kubectl-unbounded/**
+      - cmd/playpen/**
       - internal/metalman/**
+      - internal/playpen/**
+      - internal/provision/**
+      - pkg/agent/**
       - api/machina/v1alpha3/**
+      - deploy/machina/06-metalman-rbac.yaml.tmpl
       - deploy/machina/crd/**
+      - deploy/playpen/**
+      - e2e/metalman/**
+      - images/playpen/**
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
+      - hack/kind-smoke-config.yaml
+      - Makefile
+      - .github/workflows/smoke-metalman.yaml
   push:
     branches: [main]
     paths:
       - cmd/agent/**
       - cmd/metalman/**
+      - cmd/kubectl-unbounded/**
+      - cmd/playpen/**
       - internal/metalman/**
+      - internal/playpen/**
+      - internal/provision/**
+      - pkg/agent/**
       - api/machina/v1alpha3/**
+      - deploy/machina/06-metalman-rbac.yaml.tmpl
       - deploy/machina/crd/**
+      - deploy/playpen/**
+      - e2e/metalman/**
+      - images/playpen/**
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
+      - hack/kind-smoke-config.yaml
+      - Makefile
+      - .github/workflows/smoke-metalman.yaml
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
@@ -41,8 +65,8 @@ jobs:
         run: |
           # GitHub-hosted runners have ~14 GB free; the smoke test needs
           # much more because it builds two Docker images (one containing a
-          # full Ubuntu cloud image) and creates a 20 GB qcow2 VM disk that
-          # grows dynamically.  Remove the largest pre-installed toolchains
+          # full Ubuntu cloud image) and creates a 20 GB sparse VM disk.
+          # Remove the largest pre-installed toolchains
           # in parallel and prune unused Docker images.
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet \
                       /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL &
@@ -63,27 +87,11 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Cache apt packages
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /var/cache/apt/archives
-          key: apt-smoke-noble-${{ hashFiles('.github/workflows/smoke-metalman.yaml') }}
-          restore-keys: apt-smoke-noble-
-
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          # Install sushy-tools via pip in the background while apt-get
-          # installs system packages.  pip3 is already available on the
-          # runner image so this does not depend on apt-get.
-          sudo pip3 install --break-system-packages --ignore-installed sushy-tools &
-          PIP_PID=$!
           sudo apt-get install -y --no-install-recommends \
-            dnsmasq qemu-kvm libvirt-daemon-system libvirt-clients virtinst \
-            ovmf qemu-utils swtpm swtpm-tools \
-            python3-pip python3-yaml cpio iptables
-          sudo systemctl start libvirtd
-          wait "$PIP_PID"
+            cpio curl iproute2 iptables
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -127,15 +135,21 @@ jobs:
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
         with:
           cluster_name: kind
-          # The smoke test assigns 192.168.200.2 (KIND_SMOKE_IP) to the kind
-          # container on virbr-smoke and rewrites the apiserver URL to that IP.
+          # The smoke test assigns 192.168.200.2 to the kind container on the
+          # Playpen bridge and rewrites the apiserver URL to that IP.
           # Include it as an extra SAN so the kubelet in the VM can verify the
           # API server TLS certificate.
           config: hack/kind-smoke-config.yaml
 
       - name: Run smoke test
         run: |
-          sudo mkdir -p /root/.kube
-          sudo cp "${KUBECONFIG:-$HOME/.kube/config}" /root/.kube/config
-          sudo -E env "PATH=$PATH" \
-            python3 hack/smoke-metalman.py
+          sudo -E env "PATH=$PATH" METALMAN_SMOKE_CLUSTER=kind \
+            make e2e-metalman
+
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: metalman-smoke-artifacts
+          path: e2e/metalman/.artifacts
+          if-no-files-found: ignore

@@ -5,13 +5,25 @@ package provision
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
+
+func TestResolveDownloadOverridesWithConfiguredContainerImages(t *testing.T) {
+	t.Parallel()
+
+	cfg := &UnboundedAgentConfig{ContainerImageArchives: []string{"https://mirror.example.com/images.tar"}}
+	_, staging, err := ResolveDownloadOverridesWithOfflineArtifacts(cfg)
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(goalstates.ContainerImageArchiveHostSourceDir, "configured"), staging.HostDir)
+	require.Equal(t, cfg.ContainerImageArchives, staging.URLs)
+}
 
 func TestAgentConfig_MarshalJSON(t *testing.T) {
 	t.Parallel()
@@ -221,7 +233,10 @@ func TestBuildAgentConfig(t *testing.T) {
 							NodeLabels:         map[string]string{"env": "prod", "team": "infra"},
 							RegisterWithTaints: []string{"dedicated=gpu:NoSchedule"},
 						},
-						Agent: &v1alpha3.AgentSpec{Image: "ghcr.io/org/rootfs:v1"},
+						Agent: &v1alpha3.AgentSpec{
+							Image:                  "ghcr.io/org/rootfs:v1",
+							ContainerImageArchives: []string{"https://mirror.example.com/images.tar"},
+						},
 					},
 				},
 				Cluster: ClusterEndpoint{
@@ -242,6 +257,7 @@ func TestBuildAgentConfig(t *testing.T) {
 				require.Equal(t, "api.example.com:443", cfg.Kubelet.ApiServer)
 				require.Equal(t, "abc123.secret456", cfg.Kubelet.Auth.BootstrapToken)
 				require.Equal(t, "ghcr.io/org/rootfs:v1", cfg.OCIImage)
+				require.Equal(t, []string{"https://mirror.example.com/images.tar"}, cfg.ContainerImageArchives)
 				require.Nil(t, cfg.Attest)
 
 				// Labels: user + common + provider
