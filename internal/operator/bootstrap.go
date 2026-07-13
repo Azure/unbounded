@@ -30,18 +30,20 @@ const (
 	// manifests.
 	crdKind = "CustomResourceDefinition"
 
-	// crdEstablishedTimeout bounds how long BootstrapCRDs waits for every applied
-	// CRD to be served by the apiserver before giving up. The operator health
-	// server only binds after bootstrap (mgr.Start), so the Deployment's
-	// startupProbe budget in deploy/unbounded-operator/03-deployment.yaml.tmpl
-	// must exceed this timeout, otherwise liveness restarts the container
-	// mid-bootstrap.
-	crdEstablishedTimeout = 2 * time.Minute
-
 	// crdEstablishedPoll is the poll interval while waiting for CRDs to become
 	// Established.
 	crdEstablishedPoll = time.Second
+
+	// crdEstablishedTimeout preserves the full establishment window after the
+	// apply phase while CRDBootstrapTimeout bounds the complete operation.
+	crdEstablishedTimeout = 2 * time.Minute
 )
+
+// CRDBootstrapTimeout bounds the complete CRD bootstrap, including manifest
+// applies and waiting for every CRD to be served by the apiserver. The operator
+// health server only binds after bootstrap, so the startupProbe budget in
+// deploy/unbounded-operator/04-deployment.yaml.tmpl must exceed this timeout.
+const CRDBootstrapTimeout = 4 * time.Minute
 
 // bootstrapManifestSets returns the embedded manifest filesystems whose CRDs the
 // operator installs at startup. The operator owns CRD lifecycle so a cluster can
@@ -57,6 +59,14 @@ func bootstrapManifestSets() []fs.FS {
 // manager starts, because the typed Site informer cannot sync until the Site CRD
 // is served.
 func BootstrapCRDs(ctx context.Context, c client.Client) error {
+	return bootstrapCRDs(ctx, c, CRDBootstrapTimeout)
+}
+
+func bootstrapCRDs(ctx context.Context, c client.Client, timeout time.Duration) error {
+	bootstrapCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ctx = bootstrapCtx
 	logger := log.FromContext(ctx).WithName("crd-bootstrap")
 
 	var names []string
@@ -129,7 +139,7 @@ func applyCRDsFromFS(ctx context.Context, logger logr.Logger, c client.Client, m
 }
 
 // waitForCRDsEstablished blocks until every named CRD reports the Established
-// condition or the timeout elapses.
+// condition or its context ends.
 func waitForCRDsEstablished(ctx context.Context, c client.Client, names []string) error {
 	waitCtx, cancel := context.WithTimeout(ctx, crdEstablishedTimeout)
 	defer cancel()

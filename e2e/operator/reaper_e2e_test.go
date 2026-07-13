@@ -18,6 +18,8 @@ package operatore2e
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -148,7 +150,9 @@ func stageLegacyWorkloads(ctx context.Context, t *testing.T, cli client.Client) 
 	// Legacy workloads only need to EXIST to have a footprint; keep them inert
 	// (0 replicas / unschedulable DaemonSets) so kind stays light.
 	mustCreate(ctx, t, cli, inertDeployment(legacyKube, "machina-controller", map[string]string{"app": "machina-controller"}))
-	mustCreate(ctx, t, cli, inertDeployment(legacyKube, "metalman-controller-edge", map[string]string{"app": "unbounded-pxe", unboundedv1alpha3.MachineSiteLabelKey: "edge"}))
+	metalman := inertDeployment(legacyKube, "metalman-controller-edge", map[string]string{"app": "unbounded-pxe", unboundedv1alpha3.MachineSiteLabelKey: "edge"})
+	metalman.Spec.Template.Spec.Containers[0].Args = []string{"serve-pxe", "--site=edge", "--dhcp-auto-interface"}
+	mustCreate(ctx, t, cli, metalman)
 	mustCreate(ctx, t, cli, unschedulableDaemonSet(legacyKube, "unbounded-storage-supervisor", map[string]string{"app.kubernetes.io/name": "unbounded-storage-supervisor"}))
 	mustCreate(ctx, t, cli, inertDeployment(legacyNet, "unbounded-net-controller", map[string]string{"app.kubernetes.io/name": "unbounded-net-controller"}))
 	mustCreate(ctx, t, cli, unschedulableDaemonSet(legacyNet, "unbounded-net-node", map[string]string{"app.kubernetes.io/name": "unbounded-net-node"}))
@@ -211,7 +215,12 @@ func stageTargetWorkloads(ctx context.Context, t *testing.T, cli client.Client) 
 
 	// New target workloads run as pause pods so they actually become Ready in
 	// kind, satisfying the reaper's per-component health gate.
-	mustCreate(ctx, t, cli, readyDeployment(targetNS, "machina-controller"))
+	config := "apiServerEndpoint: https://api.example:6443"
+	machina := readyDeployment(targetNS, "machina-controller")
+	machina.Spec.Template.Annotations = map[string]string{
+		"unbounded-cloud.io/machina-config-hash": configHash(config),
+	}
+	mustCreate(ctx, t, cli, machina)
 	mustCreate(ctx, t, cli, readyDeployment(targetNS, "unbounded-net-controller"))
 	mustCreate(ctx, t, cli, readyDaemonSet(targetNS, "unbounded-net-node"))
 	mustCreate(ctx, t, cli, readyDaemonSet(targetNS, "unbounded-storage-supervisor-cluster"))
@@ -253,6 +262,10 @@ func assertTranslatedSites(ctx context.Context, t *testing.T, cli client.Client)
 
 	if !nestedBool(edge, "spec", "components", "metalman", "enabled") {
 		t.Fatalf("expected metalman enabled on edge site")
+	}
+
+	if !nestedBool(edge, "spec", "components", "metalman", "dhcpAutoInterface") {
+		t.Fatalf("expected Metalman DHCP auto-interface mode preserved")
 	}
 }
 
@@ -436,6 +449,10 @@ func nestedBool(obj *unstructured.Unstructured, path ...string) bool {
 	v, _, _ := unstructured.NestedBool(obj.Object, path...)
 
 	return v
+}
+
+func configHash(config string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(config)))
 }
 
 // ---------------------------------------------------------------------------

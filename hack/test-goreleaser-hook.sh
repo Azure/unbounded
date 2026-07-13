@@ -16,7 +16,7 @@ MANIFEST="deploy/machina/rendered/04-deployment.yaml"
 EXPECTED_IMAGE="ghcr.io/azure/machina:${TAG}"
 NET_MANIFEST="deploy/net/rendered/controller/03-deployment.yaml"
 EXPECTED_NET_IMAGE="ghcr.io/azure/unbounded-net-controller:${TAG}"
-OPERATOR_MANIFEST="deploy/unbounded-operator/rendered/03-deployment.yaml"
+OPERATOR_MANIFEST="deploy/unbounded-operator/rendered/04-deployment.yaml"
 EXPECTED_OPERATOR_IMAGE="ghcr.io/azure/unbounded-operator:${TAG}"
 
 # Save the original manifest so we can restore it on exit.

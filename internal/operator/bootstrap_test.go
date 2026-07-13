@@ -5,8 +5,10 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -32,6 +34,32 @@ var embeddedCRDNames = []string{
 	"sitegatewaypoolassignments.net.unbounded-cloud.io",
 	"sitepeerings.net.unbounded-cloud.io",
 	"gatewaypoolpeerings.net.unbounded-cloud.io",
+}
+
+func TestBootstrapCRDsTimeoutCancelsBlockedApply(t *testing.T) {
+	applyStarted := make(chan struct{})
+
+	cli := fake.NewClientBuilder().
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(ctx context.Context, _ client.WithWatch, _ runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				close(applyStarted)
+				<-ctx.Done()
+
+				return ctx.Err()
+			},
+		}).
+		Build()
+
+	err := bootstrapCRDs(context.Background(), cli, 20*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bootstrapCRDs error = %v, want context deadline exceeded", err)
+	}
+
+	select {
+	case <-applyStarted:
+	default:
+		t.Fatal("BootstrapCRDs did not attempt an apply")
+	}
 }
 
 // TestBootstrapCRDsAppliesEmbeddedCRDs exercises the real startup CRD bootstrap

@@ -3,35 +3,107 @@
 
 package main
 
-import "testing"
+import (
+	"context"
+	"os"
+	"strings"
+	"testing"
+)
 
-func TestEnvBoolDefault(t *testing.T) {
+func TestReapLegacyResourcesConfiguration(t *testing.T) {
 	cases := []struct {
-		name     string
-		set      bool
-		value    string
-		fallback bool
-		want     bool
+		name    string
+		setEnv  bool
+		env     string
+		args    []string
+		want    bool
+		wantErr bool
 	}{
-		{name: "unset uses fallback true", set: false, fallback: true, want: true},
-		{name: "unset uses fallback false", set: false, fallback: false, want: false},
-		{name: "empty uses fallback", set: true, value: "", fallback: true, want: true},
-		{name: "explicit false overrides", set: true, value: "false", fallback: true, want: false},
-		{name: "explicit true overrides", set: true, value: "true", fallback: false, want: true},
-		{name: "unparseable uses fallback", set: true, value: "notabool", fallback: true, want: true},
+		{name: "unset defaults true", want: true},
+		{name: "valid false environment", setEnv: true, env: "false", want: false},
+		{name: "valid true environment", setEnv: true, env: "true", want: true},
+		{name: "empty environment errors", setEnv: true, env: "", wantErr: true},
+		{name: "invalid environment errors", setEnv: true, env: "notabool", wantErr: true},
+		{
+			name:   "explicit flag overrides malformed environment",
+			setEnv: true,
+			env:    "notabool",
+			args:   []string{"--reap-legacy-resources=false"},
+			want:   false,
+		},
 	}
 
-	const key = "UNBOUNDED_TEST_BOOL"
+	const key = "UNBOUNDED_REAP_LEGACY_RESOURCES"
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.set {
-				t.Setenv(key, tc.value)
+			if tc.setEnv {
+				t.Setenv(key, tc.env)
+			} else {
+				unsetenv(t, key)
 			}
 
-			if got := envBoolDefault(key, tc.fallback); got != tc.want {
-				t.Fatalf("envBoolDefault = %v, want %v", got, tc.want)
+			called := false
+
+			var got config
+
+			cmd := newCommand(func(_ context.Context, cfg config) error {
+				called = true
+				got = cfg
+
+				return nil
+			})
+			cmd.SetArgs(tc.args)
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+
+			err := cmd.Execute()
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), key) {
+					t.Fatalf("Execute error = %v, want error naming %s", err, key)
+				}
+
+				if called {
+					t.Fatal("runner called after environment parsing error")
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Execute returned error: %v", err)
+			}
+
+			if !called {
+				t.Fatal("runner was not called")
+			}
+
+			if got.reapLegacyResources != tc.want {
+				t.Fatalf("reapLegacyResources = %v, want %v", got.reapLegacyResources, tc.want)
 			}
 		})
 	}
+}
+
+func unsetenv(t *testing.T, key string) {
+	t.Helper()
+
+	value, ok := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("unset %s: %v", key, err)
+	}
+
+	t.Cleanup(func() {
+		if ok {
+			if err := os.Setenv(key, value); err != nil {
+				t.Errorf("restore %s: %v", key, err)
+			}
+
+			return
+		}
+
+		if err := os.Unsetenv(key); err != nil {
+			t.Errorf("unset %s during cleanup: %v", key, err)
+		}
+	})
 }

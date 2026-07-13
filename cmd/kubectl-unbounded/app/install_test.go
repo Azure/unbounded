@@ -70,11 +70,14 @@ func TestInstallHandlerApplyBootstrapManifests(t *testing.T) {
 	cli := fakeclient.NewClientBuilder().
 		WithInterceptorFuncs(interceptor.Funcs{
 			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
-				named, ok := obj.(interface{ GetName() string })
+				named, ok := obj.(interface {
+					GetKind() string
+					GetName() string
+				})
 				if ok {
 					mu.Lock()
 
-					applied = append(applied, named.GetName())
+					applied = append(applied, named.GetKind()+"/"+named.GetName())
 					mu.Unlock()
 				}
 
@@ -95,10 +98,25 @@ func TestInstallHandlerApplyBootstrapManifests(t *testing.T) {
 	require.NoError(t, h.execute(context.Background()))
 	// install applies only the operator manifests; CRDs are installed by the
 	// operator at startup (BootstrapCRDs), so install must NOT apply them.
-	require.Contains(t, applied, "unbounded-operator")
-	require.Contains(t, applied, "unbounded-operator-config")
-	require.NotContains(t, applied, "sites.unbounded-cloud.io")
-	require.NotContains(t, applied, "gatewaypools.net.unbounded-cloud.io")
+	require.Contains(t, applied, "Deployment/unbounded-operator")
+	require.Contains(t, applied, "ConfigMap/unbounded-operator-config")
+	require.NotContains(t, applied, "CustomResourceDefinition/sites.unbounded-cloud.io")
+	require.NotContains(t, applied, "CustomResourceDefinition/gatewaypools.net.unbounded-cloud.io")
+	require.Less(t,
+		indexOf(applied, "ConfigMap/unbounded-operator-config"),
+		indexOf(applied, "Deployment/unbounded-operator"),
+		"operator ConfigMap must be applied before its Deployment",
+	)
+}
+
+func indexOf(values []string, want string) int {
+	for i, value := range values {
+		if value == want {
+			return i
+		}
+	}
+
+	return -1
 }
 
 func TestMutateOperatorObjectWritesConfigEndpoint(t *testing.T) {

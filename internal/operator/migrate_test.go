@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+	"gopkg.in/yaml.v3"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -44,6 +45,10 @@ func reaperScheme(t *testing.T) *runtime.Scheme {
 	listGVK := legacySiteGVK
 	listGVK.Kind += "List"
 	scheme.AddKnownTypeWithName(listGVK, &unstructured.UnstructuredList{})
+	scheme.AddKnownTypeWithName(siteNodeSliceGVK, &unstructured.Unstructured{})
+	sliceListGVK := siteNodeSliceGVK
+	sliceListGVK.Kind += "List"
+	scheme.AddKnownTypeWithName(sliceListGVK, &unstructured.UnstructuredList{})
 
 	return scheme
 }
@@ -97,6 +102,13 @@ func metalmanDeploymentForSite(namespace, site string) *appsv1.Deployment {
 			Labels: map[string]string{"app": "unbounded-pxe", unboundedv1alpha3.MachineSiteLabelKey: site},
 		},
 	}
+}
+
+func metalmanDeploymentForSiteWithArgs(namespace, site string, args ...string) *appsv1.Deployment {
+	deploy := metalmanDeploymentForSite(namespace, site)
+	deploy.Spec.Template.Spec.Containers = []corev1.Container{{Name: "metalman", Args: args}}
+
+	return deploy
 }
 
 func TestDetectComponentsMatchesV019MetalmanLabels(t *testing.T) {
@@ -213,6 +225,87 @@ func TestTranslateSitesCreatesMachinaSite(t *testing.T) {
 	}
 }
 
+func TestTranslateSitesPreservesMetalmanDHCPAutoInterface(t *testing.T) {
+	tests := []struct {
+		name string
+		arg  string
+		want bool
+	}{
+		{name: "bare", arg: "--dhcp-auto-interface", want: true},
+		{name: "explicit true", arg: "--dhcp-auto-interface=true", want: true},
+		{name: "explicit false", arg: "--dhcp-auto-interface=false", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newReaper(t,
+				legacySite("edge", map[string]any{"nodeCidrs": []any{"10.0.0.0/16"}}),
+				metalmanDeploymentForSiteWithArgs(legacyKubeNamespace, "edge", "serve-pxe", tt.arg),
+			)
+
+			if err := r.translateSites(t.Context(), logr.Discard()); err != nil {
+				t.Fatalf("translateSites: %v", err)
+			}
+
+			got := &unstructured.Unstructured{}
+			got.SetGroupVersionKind(newSiteGVK())
+
+			if err := r.Get(t.Context(), client.ObjectKey{Name: "edge"}, got); err != nil {
+				t.Fatalf("get translated Site: %v", err)
+			}
+
+			value, found, err := unstructured.NestedBool(got.Object, "spec", "components", "metalman", "dhcpAutoInterface")
+			if err != nil || !found || value != tt.want {
+				t.Fatalf("dhcpAutoInterface = %t, found=%t, err=%v; want %t", value, found, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestMetalmanDHCPAutoInterface(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		want    *bool
+		wantErr bool
+	}{
+		{name: "absent", args: []string{"serve-pxe"}},
+		{name: "bare", args: []string{"--dhcp-auto-interface"}, want: boolPtr(true)},
+		{name: "explicit true", args: []string{"--dhcp-auto-interface=true"}, want: boolPtr(true)},
+		{name: "explicit false", args: []string{"--dhcp-auto-interface=false"}, want: boolPtr(false)},
+		{name: "repeated same value", args: []string{"--dhcp-auto-interface", "--dhcp-auto-interface=true"}, want: boolPtr(true)},
+		{name: "invalid", args: []string{"--dhcp-auto-interface=yes"}, wantErr: true},
+		{name: "conflicting", args: []string{"--dhcp-auto-interface", "--dhcp-auto-interface=false"}, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deploy := metalmanDeploymentForSiteWithArgs(legacyKubeNamespace, "edge", tt.args...)
+
+			got, err := metalmanDHCPAutoInterface(deploy)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("metalmanDHCPAutoInterface error = %v, wantErr %t", err, tt.wantErr)
+			}
+
+			if tt.wantErr {
+				return
+			}
+
+			if got == nil || tt.want == nil {
+				if got != nil || tt.want != nil {
+					t.Fatalf("metalmanDHCPAutoInterface = %v, want %v", got, tt.want)
+				}
+
+				return
+			}
+
+			if *got != *tt.want {
+				t.Fatalf("metalmanDHCPAutoInterface = %t, want %t", *got, *tt.want)
+			}
+		})
+	}
+}
+
 func TestTranslateSitesDoesNotClobberExisting(t *testing.T) {
 	existing := &unboundedv1alpha3.Site{
 		ObjectMeta: metav1.ObjectMeta{Name: clusterSiteName},
@@ -321,6 +414,38 @@ func TestMigrateConfigMapsCopiesNamedOnly(t *testing.T) {
 	}
 }
 
+func TestMigrateMachinaConfigUsesConfiguredEndpoint(t *testing.T) {
+	r := newReaper(t,
+		ns(legacyKubeNamespace),
+		ns("unbounded-system"),
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "machina-config", Namespace: legacyKubeNamespace},
+			Data: map[string]string{
+				"config.yaml": "apiServerEndpoint: https://old.example:6443\ncustom: keep\n",
+			},
+		},
+	)
+	r.APIServerEndpoint = "https://new.example:6443"
+
+	if err := r.migrateConfigMaps(t.Context(), logr.Discard(), legacyKubeNamespace, "unbounded-system"); err != nil {
+		t.Fatalf("migrateConfigMaps: %v", err)
+	}
+
+	var cm corev1.ConfigMap
+	if err := r.Get(t.Context(), client.ObjectKey{Namespace: "unbounded-system", Name: "machina-config"}, &cm); err != nil {
+		t.Fatalf("get migrated machina config: %v", err)
+	}
+
+	var config map[string]any
+	if err := yaml.Unmarshal([]byte(cm.Data["config.yaml"]), &config); err != nil {
+		t.Fatalf("unmarshal migrated config: %v", err)
+	}
+
+	if config["apiServerEndpoint"] != r.APIServerEndpoint || config["custom"] != "keep" {
+		t.Fatalf("migrated config = %#v", config)
+	}
+}
+
 func machineWithPasswordNS(name, namespace string) *unstructured.Unstructured {
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "unbounded-cloud.io", Version: "v1alpha3", Kind: "Machine"})
@@ -384,6 +509,23 @@ func readyDeployment(namespace, name string) *appsv1.Deployment {
 		Spec:       appsv1.DeploymentSpec{Replicas: &one},
 		Status:     appsv1.DeploymentStatus{AvailableReplicas: 1},
 	}
+}
+
+func readyMachinaTarget(namespace, config string) (*corev1.ConfigMap, *appsv1.Deployment) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "machina-config"},
+		Data:       map[string]string{"config.yaml": config},
+	}
+	deploy := readyDeployment(namespace, "machina-controller")
+	deploy.Generation = 1
+	deploy.Spec.Template.Annotations = map[string]string{
+		machinaConfigHashAnnotation: machinaConfigHash(config),
+	}
+	deploy.Status.ObservedGeneration = 1
+	deploy.Status.Replicas = 1
+	deploy.Status.UpdatedReplicas = 1
+
+	return cm, deploy
 }
 
 func readyDaemonSet(namespace, name string) *appsv1.DaemonSet {
@@ -836,11 +978,13 @@ func TestReapOnceStorageGatedOnPerSiteDaemonSet(t *testing.T) {
 func TestReapOnceSkipsComponentsWithoutLegacyFootprint(t *testing.T) {
 	// The legacy unbounded-kube namespace contains only machina (no storage).
 	// The reaper must NOT block waiting for a storage target that never exists.
+	config, target := readyMachinaTarget("unbounded-system", "apiServerEndpoint: https://api.example:6443\n")
 	r := newReaper(t,
 		ns(legacyKubeNamespace),
 		ns("unbounded-system"),
 		labeledAppDeployment(legacyKubeNamespace, "machina-controller", map[string]string{"app": "machina-controller"}),
-		readyDeployment("unbounded-system", "machina-controller"),
+		config,
+		target,
 	)
 
 	done, err := r.reapOnce(t.Context(), logr.Discard())

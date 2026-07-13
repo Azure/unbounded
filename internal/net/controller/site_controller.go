@@ -1164,7 +1164,9 @@ func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unbounde
 		existingNodes, _, _ := unstructured.NestedSlice(existing.Object, "nodes") //nolint:errcheck
 
 		existingNodeCount, foundNodeCount, _ := unstructured.NestedInt64(existing.Object, "nodeCount") //nolint:errcheck
-		if sc.sliceNodesEqual(existingNodes, nodesData) && foundNodeCount && existingNodeCount == int64(len(nodesData)) {
+		if sc.sliceNodesEqual(existingNodes, nodesData) &&
+			foundNodeCount && existingNodeCount == int64(len(nodesData)) &&
+			hasExactSiteOwnerReference(existing.GetOwnerReferences(), site) {
 			return
 		}
 
@@ -1222,6 +1224,21 @@ func (sc *SiteController) buildSliceObject(site unboundedv1alpha3.Site, sliceNam
 			"nodeCount":  int64(len(nodesData)),
 		},
 	}
+}
+
+func hasExactSiteOwnerReference(refs []metav1.OwnerReference, site unboundedv1alpha3.Site) bool {
+	if len(refs) != 1 {
+		return false
+	}
+
+	ref := refs[0]
+
+	return ref.APIVersion == unboundedv1alpha3.GroupVersion.String() &&
+		ref.Kind == "Site" &&
+		ref.Name == site.Name &&
+		ref.UID == site.UID &&
+		ref.Controller != nil && *ref.Controller &&
+		ref.BlockOwnerDeletion != nil && *ref.BlockOwnerDeletion
 }
 
 // sliceNodesEqual compares two node lists for equality

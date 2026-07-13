@@ -4,12 +4,17 @@
 package controller
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/tools/cache"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
@@ -415,5 +420,44 @@ func TestBuildSliceObjectOwnerRefUsesMachinaSiteGVK(t *testing.T) {
 
 	if got := owner["uid"]; got != "uid-123" {
 		t.Fatalf("owner uid = %v, want uid-123", got)
+	}
+}
+
+func TestCreateOrUpdateSliceRepairsOwnerReferenceWithoutNodeChanges(t *testing.T) {
+	site := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a", UID: "current-uid"}}
+	nodes := []interface{}{map[string]interface{}{"name": "node-a"}}
+	desired := (&SiteController{}).buildSliceObject(site, "site-a-0", 0, nodes)
+	stale := desired.DeepCopy()
+	stale.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: "net.unbounded-cloud.io/v1alpha1",
+		Kind:       "Site",
+		Name:       site.Name,
+		UID:        "legacy-uid",
+	}})
+
+	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := store.Add(stale.DeepCopy()); err != nil {
+		t.Fatalf("add stale slice to cache: %v", err)
+	}
+
+	dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{siteNodeSliceGVR: "SiteNodeSliceList"},
+		stale.DeepCopy(),
+	)
+	sc := &SiteController{
+		dynamicClient: dynamicClient,
+		sliceInformer: &fakeInformer{store: store},
+	}
+
+	sc.createOrUpdateSlice(context.Background(), site, 0, []unboundednetv1alpha1.NodeInfo{{Name: "node-a"}})
+
+	got, err := dynamicClient.Resource(siteNodeSliceGVR).Get(context.Background(), "site-a-0", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get updated SiteNodeSlice: %v", err)
+	}
+
+	if !hasExactSiteOwnerReference(got.GetOwnerReferences(), site) {
+		t.Fatalf("owner reference was not repaired: %#v", got.GetOwnerReferences())
 	}
 }

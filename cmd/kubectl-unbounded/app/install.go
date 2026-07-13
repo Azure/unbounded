@@ -202,7 +202,7 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 		}
 
 		// Stamp the config hash so a changed endpoint rolls the pod (see #3);
-		// this mirrors the render-time hash in 03-deployment.yaml.tmpl.
+		// this mirrors the render-time hash in 04-deployment.yaml.tmpl.
 		if err := unstructured.SetNestedField(obj.Object, operatorConfigHash(h.apiServerEndpoint), "spec", "template", "metadata", "annotations", operatorConfigHashAnnotation); err != nil {
 			return fmt.Errorf("set operator config hash annotation: %w", err)
 		}
@@ -212,7 +212,7 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 }
 
 // operatorConfigHash returns a stable hash of the environment-specific operator
-// config. It mirrors the render-time hash in 03-deployment.yaml.tmpl (sprig's
+// config. It mirrors the render-time hash in 04-deployment.yaml.tmpl (sprig's
 // sha256sum of the endpoint) so both the install path and make-rendered
 // manifests roll the operator when the advertised api-server-endpoint changes.
 func operatorConfigHash(apiServerEndpoint string) string {
