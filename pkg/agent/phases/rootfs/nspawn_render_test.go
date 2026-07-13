@@ -63,6 +63,29 @@ func TestServiceOverride_HostDevicesDeviceAllow(t *testing.T) {
 	require.Less(t, strings.Index(out, "[Service]"), strings.Index(out, "DeviceAllow=/dev/kvm rwm"))
 }
 
+func TestServiceOverride_HostDeviceGroupSpecifiers(t *testing.T) {
+	t.Parallel()
+
+	var nspawnBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
+		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
+		HostDeviceGroupSpecifiers:    []string{"char-input", "char-pts"},
+	}))
+
+	var overrideBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", nspawnTemplateData{
+		MachineName:               "kube1",
+		BPFFSMountPath:            goalstates.BPFFSMountPath("kube1"),
+		HostDeviceGroupSpecifiers: []string{"char-input", "char-pts"},
+	}))
+
+	require.NotContains(t, nspawnBuf.String(), "Bind=char-")
+	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-input rwm")
+	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-pts rwm")
+}
+
 func TestServiceOverride_MultipleHostDevices(t *testing.T) {
 	t.Parallel()
 
