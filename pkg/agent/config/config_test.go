@@ -105,6 +105,43 @@ func TestCRIConfig_JSONRoundTrip(t *testing.T) {
 	assert.Equal(t, []string{"/dev/uinput"}, decoded.AdditionalHostDevices)
 }
 
+func TestIsSystemdDeviceGroupSpecifier(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "character group", value: "char-input", want: true},
+		{name: "character wildcard", value: "char-*", want: true},
+		{name: "block group", value: "block-loop", want: true},
+		{name: "block wildcard", value: "block-*", want: true},
+		{name: "empty group", value: "char-", want: false},
+		{name: "slash group", value: "char-/", want: false},
+		{name: "slash wildcard", value: "char-/*", want: false},
+		{name: "nested group", value: "char-input/foo", want: false},
+		{name: "question mark wildcard", value: "block-??", want: false},
+		{name: "device path group", value: "block-/dev/sda", want: false},
+		{name: "parent traversal group", value: "char-..", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.want, IsSystemdDeviceGroupSpecifier(tt.value))
+		})
+	}
+}
+
+func TestValidateAdditionalHostDeviceRejectsInvalidGroupSpecifiers(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []string{"char-/", "char-input/foo", "block-/dev/sda", "char-.."} {
+		require.Error(t, validateAdditionalHostDevice(value), value)
+	}
+}
+
 func TestAgentConfig_Validate(t *testing.T) {
 	t.Parallel()
 

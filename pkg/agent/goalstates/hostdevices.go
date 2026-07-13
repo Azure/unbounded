@@ -61,7 +61,8 @@ type HostDevices struct {
 	// Infiniband holds InfiniBand/RDMA HCA character device node paths from
 	// /dev/infiniband.
 	Infiniband []string
-	// Additional holds extra host device node paths requested by config.
+	// Additional holds extra host device node paths and systemd device group
+	// specifiers requested by config.
 	Additional []string
 }
 
