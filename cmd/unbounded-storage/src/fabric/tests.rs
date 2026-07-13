@@ -7,6 +7,7 @@
 //! if the tcp provider is not installed in the libfabric build
 //! available to the test binary.
 
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::ptr;
 use std::sync::Arc;
@@ -967,14 +968,12 @@ fn pool_handler_reports_miss_for_non_resident_stripe() {
 // the production `FetchService` provides.
 // ---------------------------------------------------------------
 
-use std::collections::HashMap;
-
 use crate::fanout::{
     FetchChannel, FetchChannelReceiver, FetchCommand, FetchEvent, FetchPage, PageLoc,
 };
 use crate::p2p::{
     FingerTable, FingerTableConfig, NodeId, OwnerShardSource, OwnerShardTable, PeerEntry,
-    RecursiveHandler, RingId, RouteTableHandle, RoutingSnapshot, TopologyTags,
+    RecursiveHandler, RingId, RouteTableHandle, TopologyTags,
 };
 use crate::storage::StripeReq;
 
@@ -1080,24 +1079,13 @@ fn start_recursive_node(
     scratch_mr: MrHandle,
     page_size: usize,
     fingers: Arc<FingerTable>,
-    node_to_peer: Arc<HashMap<NodeId, PeerId>>,
     owners: OwnerShardTable,
 ) -> crate::fabric::RpcServerHandle {
     let handler = Arc::new(
         RecursiveHandler::with_routes(
             scratch,
             RECURSIVE_SCRATCH_PAGES as u32,
-            RouteTableHandle::new(
-                [(
-                    CHAIN_CACHE_ID.to_string(),
-                    RoutingSnapshot {
-                        fingers,
-                        node_to_peer,
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            ),
+            RouteTableHandle::new(HashSet::from([CHAIN_CACHE_ID.to_string()]), fingers),
             fabric.clone(),
             scratch_mr,
             page_size,
@@ -1200,11 +1188,6 @@ fn recursive_chain(
         std::slice::from_ref(&ring_peer(2, 100)),
         FingerTableConfig::with_k(8),
     ));
-    let b_n2p: Arc<HashMap<NodeId, PeerId>> =
-        Arc::new([(NodeId(3), PeerId(3))].into_iter().collect());
-    let c_n2p: Arc<HashMap<NodeId, PeerId>> =
-        Arc::new([(NodeId(2), PeerId(2))].into_iter().collect());
-
     let empty_owners = OwnerShardTable::new(
         Vec::new(),
         crate::storage::disks::CacheDirectorySet::new(),
@@ -1223,16 +1206,8 @@ fn recursive_chain(
         page_size,
     );
 
-    let b_handle = start_recursive_node(
-        &b,
-        b_scratch,
-        b_mr,
-        page_size,
-        b_fingers,
-        b_n2p,
-        empty_owners,
-    );
-    let c_handle = start_recursive_node(&c, c_scratch, c_mr, page_size, c_fingers, c_n2p, c_owners);
+    let b_handle = start_recursive_node(&b, b_scratch, b_mr, page_size, b_fingers, empty_owners);
+    let c_handle = start_recursive_node(&c, c_scratch, c_mr, page_size, c_fingers, c_owners);
 
     let transport = FabricTransport::<StripeReq, _>::new(
         a.clone(),

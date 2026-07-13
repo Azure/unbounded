@@ -171,10 +171,11 @@ If the referenced ConfigMap does not exist, metalman falls back to the default m
 ## Boot Flow
 
 1. **Repave requested.** A `HostReplace` `MachineOperation` targets the Machine. Metalman sets the boot override and force-restarts the server. For `bootProtocol: PXE`, it selects PXE boot. For `bootProtocol: HTTP`, it sets a Redfish UEFI HTTP boot URL from the netboot image metadata.
-2. **Network boot.** DHCP assigns the static IP by MAC. In PXE mode, DHCP also advertises the TFTP bootfile and TFTP serves `shimx64.efi`. In HTTP mode, the firmware downloads the Redfish-supplied URL from metalman's HTTP server.
+2. **Network boot.** In PXE mode, DHCP assigns the static IP by MAC, advertises the TFTP bootfile, and TFTP serves `shimx64.efi`. In HTTP mode, Metalman configures the first lease as a static Redfish EthernetInterface and the firmware downloads the Redfish-supplied URL from Metalman's HTTP server; DHCP is not required for this path.
 3. **GRUB decision.** A rendered `grub.cfg` checks for an active `HostReplace` `MachineOperation` targeting the Machine. If a repave is requested, GRUB boots the PXE installer; otherwise it chainloads the local OS. When a Machine has multiple DHCP leases, metalman renders the lease matching the request source IP and passes that lease's MAC as `unbounded.boot_mac`.
 4. **Installer (initrd overlay).** An init script in the initrd:
-   - Loads storage and network drivers, selects the provisioning NIC by MAC, and configures the static IP from kernel cmdline.
+   - Loads storage and network drivers, selects the provisioning NIC by MAC, and configures the static IP and DNS from kernel cmdline.
+   - Writes matching MAC-based static netplan configuration into the installed system before reboot and disables cloud-init network rendering so fallback DHCP configuration cannot conflict with it. The default netboot image also serves the selected lease as NoCloud `network-config`.
    - Downloads the gzip-compressed raw disk image from the machine image over HTTP (retries up to 120 times).
    - Writes the image to `spec.pxe.targetDisk` when set, otherwise to an automatically selected block device.
    - Mounts the root filesystem and injects cloud-init config and the agent configuration.

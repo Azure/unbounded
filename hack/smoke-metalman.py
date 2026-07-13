@@ -42,7 +42,7 @@ KIND_SMOKE_IP = f"{SUBNET}.2"  # IP assigned to the kind container on virbr-smok
 GATEWAY = SERVER_IP
 DNS_SERVER = "8.8.8.8"
 MAC_ADDRESS = "52:54:00:aa:bb:01"
-SUSHY_PORT = 8443
+REDFISH_PORT = 8443
 HTTP_PORT = 8880
 AGENT_DOWNLOAD_PORT = 8881
 CACHE_DIR = TMPDIR / "cache"
@@ -353,8 +353,8 @@ def clean_libvirt() -> None:
     run_quiet(["sudo", "ip", "link", "delete", "virbr-smoke"])
     # Remove veth pair used to connect kind container to virbr-smoke.
     run_quiet(["sudo", "ip", "link", "delete", "veth-kind-smoke"])
-    # Kill any leftover sushy-emulator from a previous run.
-    run_quiet(["sudo", "pkill", "-f", "sushy-emulator"])
+    # Kill any leftover Redfish fixture from a previous run.
+    run_quiet(["sudo", "pkill", "-f", "metalman-redfish-fixture.py"])
     # Kill any leftover metalman serve-pxe from a previous run.
     # Use the binary path to avoid matching this script (smoke-metalman.py).
     run_quiet(["sudo", "pkill", "-f", "bin/metalman"])
@@ -518,6 +518,31 @@ def configure_kind_control_plane_node_ip(container: str, node_ip: str) -> None:
         time.sleep(1)
 
     die(f"Timed out waiting for Node '{container}' to advertise only InternalIP {node_ip}")
+
+
+def configure_kind_kube_proxy_apiserver(api_server: str) -> None:
+    """Make newly scheduled kind kube-proxy pods use the VM-reachable API URL."""
+    log(f"Configuring kind kube-proxy API server as {api_server}")
+    result = run(
+        [KUBECTL, "-n", "kube-system", "get", "configmap", "kube-proxy", "-o", "json"],
+        capture_output=True,
+        text=True,
+    )
+    config_map = json.loads(result.stdout)
+    kubeconfig = config_map["data"]["kubeconfig.conf"]
+    lines = kubeconfig.splitlines()
+    server_lines = [index for index, line in enumerate(lines) if line.lstrip().startswith("server:")]
+    if len(server_lines) != 1:
+        die(f"Expected one kube-proxy API server entry, got {len(server_lines)}")
+    index = server_lines[0]
+    indentation = lines[index][:-len(lines[index].lstrip())]
+    lines[index] = f"{indentation}server: {api_server}"
+    config_map["data"]["kubeconfig.conf"] = "\n".join(lines) + "\n"
+    run(
+        [KUBECTL, "replace", "-f", "-"],
+        input=json.dumps(config_map),
+        text=True,
+    )
 
 
 def _probe_vm_network() -> None:
@@ -1022,6 +1047,7 @@ def main() -> None:
     })
     kubectl(["-n", "kube-system", "patch", "daemonset", "kindnet",
              "--type=strategic", "-p", patch])
+    configure_kind_kube_proxy_apiserver(f"https://{KIND_SMOKE_IP}:6443")
 
     log("Creating UEFI VM (powered off, with TPM)")
     ovmf_vars = TMPDIR / "OVMF_VARS.fd"
@@ -1049,23 +1075,27 @@ def main() -> None:
     )
     console_thread.start()
 
-    log("Starting sushy-emulator")
+    log("Starting recording Redfish fixture")
     run_quiet([
         "openssl", "req", "-x509", "-newkey", "rsa:2048",
-        "-keyout", str(TMPDIR / "sushy.key"),
-        "-out", str(TMPDIR / "sushy.crt"),
+        "-keyout", str(TMPDIR / "redfish.key"),
+        "-out", str(TMPDIR / "redfish.crt"),
         "-days", "1", "-nodes",
-        "-subj", "/CN=sushy-emulator",
+        "-subj", "/CN=metalman-redfish-fixture",
         "-addext", "subjectAltName=IP:127.0.0.1",
     ], check=True)
-    sushy_url = f"https://127.0.0.1:{SUSHY_PORT}"
+    redfish_url = f"https://127.0.0.1:{REDFISH_PORT}"
     proc = spawn([
-        "sushy-emulator", "--libvirt-uri", "qemu:///system",
-        "-i", "127.0.0.1", "-p", str(SUSHY_PORT),
-        "--ssl-certificate", str(TMPDIR / "sushy.crt"),
-        "--ssl-key", str(TMPDIR / "sushy.key"),
-    ], TMPDIR / "sushy.log")
-    log(f"  sushy-emulator PID={proc.pid}")
+        sys.executable, str(REPO_ROOT / "hack" / "metalman-redfish-fixture.py"),
+        "--domain", VM_NAME, "--mac", MAC_ADDRESS,
+        "--bind", "127.0.0.1", "--port", str(REDFISH_PORT),
+        "--cert", str(TMPDIR / "redfish.crt"),
+        "--key", str(TMPDIR / "redfish.key"),
+        "--record", str(TMPDIR / "redfish.jsonl"),
+        "--username", "", "--password", "smoke",
+        "--manage-boot-order",
+    ], TMPDIR / "redfish.log")
+    log(f"  Redfish fixture PID={proc.pid}")
     time.sleep(2)
     check_procs()
 
@@ -1191,7 +1221,7 @@ def main() -> None:
             "pxe": {
                 "image": IMAGE_NAME,
                 "redfish": {
-                    "url": sushy_url,
+                    "url": redfish_url,
                     "username": "",
                     "deviceID": VM_NAME,
                     "passwordRef": {"name": "bmc-pass", "key": "password", "namespace": NODE_NS},

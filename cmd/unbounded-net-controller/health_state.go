@@ -201,22 +201,47 @@ func (h *healthState) getLeaderInfo(ctx context.Context) (*LeaderInfo, error) {
 	return &LeaderInfo{PodName: leaderPodName, NodeName: nodeName}, nil
 }
 
-// updateServiceEndpoints creates/updates the unbounded-net-controller EndpointSlice
-// to point to the leader's IP on the HTTP health/status port.
+// updateServiceEndpoints creates/updates the unbounded-net-controller Endpoints
+// and EndpointSlice to point to the leader's IP on the HTTP health/status port.
+// Kubernetes 1.33 and earlier require Endpoints for APIService availability.
 func (h *healthState) updateServiceEndpoints(ctx context.Context) error {
-	if err := h.clientset.CoreV1().Endpoints(h.leaderElectionNS).Delete(ctx, "unbounded-net-controller", metav1.DeleteOptions{}); err != nil {
-		if !errors.IsNotFound(err) {
-			klog.Warningf("Failed to clean up stale Endpoints resource: %v", err)
-		}
-	} else {
-		klog.Info("Cleaned up stale v1/Endpoints resource for unbounded-net-controller")
-	}
-
 	port := int32(h.healthPort)
 	protocol := corev1.ProtocolTCP
 	portName := "https"
 	addressType := discoveryv1.AddressTypeIPv4
 	ready := true
+	endpoints := &corev1.Endpoints{ //nolint:staticcheck // required for APIService availability on Kubernetes 1.33 and earlier
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "unbounded-net-controller",
+			Namespace: h.leaderElectionNS,
+			Labels: map[string]string{
+				discoveryv1.LabelSkipMirror: "true",
+			},
+		},
+		Subsets: []corev1.EndpointSubset{{ //nolint:staticcheck // required for Kubernetes 1.33 compatibility
+			Addresses: []corev1.EndpointAddress{{IP: h.podIP}},
+			Ports: []corev1.EndpointPort{{
+				Name:     portName,
+				Port:     port,
+				Protocol: protocol,
+			}},
+		}},
+	}
+
+	existingEndpoints, err := h.clientset.CoreV1().Endpoints(h.leaderElectionNS).Get(ctx, endpoints.Name, metav1.GetOptions{}) //nolint:staticcheck // required for Kubernetes 1.33 compatibility
+	if errors.IsNotFound(err) {
+		if _, err = h.clientset.CoreV1().Endpoints(h.leaderElectionNS).Create(ctx, endpoints, metav1.CreateOptions{}); err != nil { //nolint:staticcheck // required for Kubernetes 1.33 compatibility
+			return fmt.Errorf("creating service endpoints: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("getting service endpoints: %w", err)
+	} else {
+		endpoints.ResourceVersion = existingEndpoints.ResourceVersion
+		if _, err = h.clientset.CoreV1().Endpoints(h.leaderElectionNS).Update(ctx, endpoints, metav1.UpdateOptions{}); err != nil { //nolint:staticcheck // required for Kubernetes 1.33 compatibility
+			return fmt.Errorf("updating service endpoints: %w", err)
+		}
+	}
+
 	endpointSlice := &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "unbounded-net-controller",
@@ -237,18 +262,68 @@ func (h *healthState) updateServiceEndpoints(ctx context.Context) error {
 		}},
 	}
 
-	_, err := h.clientset.DiscoveryV1().EndpointSlices(h.leaderElectionNS).Update(ctx, endpointSlice, metav1.UpdateOptions{})
+	existingEndpointSlice, err := h.clientset.DiscoveryV1().EndpointSlices(h.leaderElectionNS).Get(ctx, endpointSlice.Name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		_, err = h.clientset.DiscoveryV1().EndpointSlices(h.leaderElectionNS).Create(ctx, endpointSlice, metav1.CreateOptions{})
+	} else if err == nil {
+		endpointSlice.ResourceVersion = existingEndpointSlice.ResourceVersion
+		_, err = h.clientset.DiscoveryV1().EndpointSlices(h.leaderElectionNS).Update(ctx, endpointSlice, metav1.UpdateOptions{})
 	}
 
 	return err
 }
 
-// clearServiceEndpoints removes the EndpointSlice when losing leadership.
+// clearServiceEndpoints removes the Endpoints and EndpointSlice when losing leadership.
 func (h *healthState) clearServiceEndpoints(ctx context.Context) {
-	err := h.clientset.DiscoveryV1().EndpointSlices(h.leaderElectionNS).Delete(ctx, "unbounded-net-controller", metav1.DeleteOptions{})
-	if err != nil && !errors.IsNotFound(err) {
-		klog.Errorf("Failed to clear service endpoint slice: %v", err)
+	endpoints, err := h.clientset.CoreV1().Endpoints(h.leaderElectionNS).Get(ctx, "unbounded-net-controller", metav1.GetOptions{}) //nolint:staticcheck // required for Kubernetes 1.33 compatibility
+	if err == nil {
+		targetsThisPod := false
+
+		for _, subset := range endpoints.Subsets {
+			for _, address := range subset.Addresses {
+				if address.IP == h.podIP {
+					targetsThisPod = true
+					break
+				}
+			}
+		}
+
+		if targetsThisPod {
+			deleteOptions := metav1.DeleteOptions{Preconditions: &metav1.Preconditions{
+				UID:             &endpoints.UID,
+				ResourceVersion: &endpoints.ResourceVersion,
+			}}
+			if err := h.clientset.CoreV1().Endpoints(h.leaderElectionNS).Delete(ctx, endpoints.Name, deleteOptions); err != nil && !errors.IsNotFound(err) { //nolint:staticcheck // required for Kubernetes 1.33 compatibility
+				klog.Errorf("Failed to clear service endpoints: %v", err)
+			}
+		}
+	} else if !errors.IsNotFound(err) {
+		klog.Errorf("Failed to get service endpoints for cleanup: %v", err)
+	}
+
+	endpointSlice, err := h.clientset.DiscoveryV1().EndpointSlices(h.leaderElectionNS).Get(ctx, "unbounded-net-controller", metav1.GetOptions{})
+	if err == nil {
+		targetsThisPod := false
+
+		for _, endpoint := range endpointSlice.Endpoints {
+			for _, address := range endpoint.Addresses {
+				if address == h.podIP {
+					targetsThisPod = true
+					break
+				}
+			}
+		}
+
+		if targetsThisPod {
+			deleteOptions := metav1.DeleteOptions{Preconditions: &metav1.Preconditions{
+				UID:             &endpointSlice.UID,
+				ResourceVersion: &endpointSlice.ResourceVersion,
+			}}
+			if err := h.clientset.DiscoveryV1().EndpointSlices(h.leaderElectionNS).Delete(ctx, endpointSlice.Name, deleteOptions); err != nil && !errors.IsNotFound(err) {
+				klog.Errorf("Failed to clear service endpoint slice: %v", err)
+			}
+		}
+	} else if !errors.IsNotFound(err) {
+		klog.Errorf("Failed to get service endpoint slice for cleanup: %v", err)
 	}
 }
