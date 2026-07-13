@@ -60,6 +60,10 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			rootFSGoalState := gs.RootFS
 			nodeStartGoalState := gs.NodeStart
 
+			if err := host.EnsureNoExistingDeployment(ctx, log); err != nil {
+				return err
+			}
+
 			// Run host setup and attestation first. Metalman bootstrap tokens are
 			// only available after attestation, so Machine status reporting starts
 			// after this block.
