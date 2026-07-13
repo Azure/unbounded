@@ -87,6 +87,28 @@ func TestExpandNVIDIALibrariesFindsVersionedTargetsMissingFromLDConfig(t *testin
 	require.Equal(t, version, discoverNVIDIADriverVersion(libs, filepath.Join(t.TempDir(), "missing-version")))
 }
 
+func TestExpandNVIDIALibrariesUsesSameBasenameSymlinkTargetAsSource(t *testing.T) {
+	t.Parallel()
+
+	aliasDir := t.TempDir()
+	targetDir := t.TempDir()
+	aliasPath := filepath.Join(aliasDir, "libcuda.so.1")
+	targetPath := filepath.Join(targetDir, "libcuda.so.1")
+
+	require.NoError(t, os.WriteFile(targetPath, []byte("cuda"), 0o644))
+	require.NoError(t, os.Symlink(targetPath, aliasPath))
+
+	libs := expandNVIDIALibraries([]NvidiaLibMapping{{HostPath: aliasPath}})
+	require.Len(t, libs, 1)
+	require.Equal(t, targetPath, libs[0].ResolvedHostPath)
+
+	libs, mounts := buildNVIDIALibMounts(libs, "/usr/lib/x86_64-linux-gnu")
+	require.Len(t, mounts, 1)
+	require.Equal(t, targetDir, mounts[0].HostDir)
+	require.Equal(t, "/run/host-nvidia/0/libcuda.so.1", libs[0].ContainerPath)
+	require.Equal(t, "/usr/lib/x86_64-linux-gnu/libcuda.so.1", libs[0].LinkPath)
+}
+
 func TestDiscoverNVIDIADriverVersionFallsBackToGLX(t *testing.T) {
 	t.Parallel()
 
@@ -191,6 +213,11 @@ func TestResolveNVIDIAI386LibrariesScansMatchingDriverDirectory(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(libDir, name), []byte(name), 0o644))
 	}
 
+	vdpauDir := filepath.Join(libDir, "vdpau")
+	vdpauName := "libvdpau_nvidia.so." + version
+
+	require.NoError(t, os.Mkdir(vdpauDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(vdpauDir, vdpauName), []byte(vdpauName), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(libDir, "libpthread.so.0"), nil, 0o644))
 
 	libs, mounts := resolveNVIDIAI386Libraries(version, []string{libDir})
@@ -198,13 +225,21 @@ func TestResolveNVIDIAI386LibrariesScansMatchingDriverDirectory(t *testing.T) {
 
 	for _, lib := range libs {
 		libNames = append(libNames, filepath.Base(lib.HostPath))
-		require.Equal(t, filepath.Join(NvidiaHostI386LibDir, "0", filepath.Base(lib.HostPath)), lib.ContainerPath)
+
+		mountIndex := "0"
+		if filepath.Base(filepath.Dir(lib.HostPath)) == "vdpau" {
+			mountIndex = "1"
+		}
+
+		require.Equal(t, filepath.Join(NvidiaHostI386LibDir, mountIndex, filepath.Base(lib.HostPath)), lib.ContainerPath)
 	}
 
-	require.ElementsMatch(t, files, libNames)
-	require.Len(t, mounts, 1)
+	require.ElementsMatch(t, append(files, vdpauName), libNames)
+	require.Len(t, mounts, 2)
 	require.Equal(t, libDir, mounts[0].HostDir)
 	require.Equal(t, "/run/host-nvidia-i386/0", mounts[0].ContainerDir)
+	require.Equal(t, vdpauDir, mounts[1].HostDir)
+	require.Equal(t, "/run/host-nvidia-i386/1", mounts[1].ContainerDir)
 }
 
 func TestResolveNVIDIAI386LibrariesRejectsMismatchedDriver(t *testing.T) {

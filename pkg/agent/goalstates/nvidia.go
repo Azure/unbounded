@@ -82,9 +82,10 @@ type NvidiaHost struct {
 // NvidiaLibMapping maps a host NVIDIA library to its corresponding paths
 // inside the nspawn container.
 type NvidiaLibMapping struct {
-	HostPath      string // e.g. "/usr/lib/x86_64-linux-gnu/libcuda.so.580.126.09"
-	ContainerPath string // e.g. "/run/host-nvidia/0/libcuda.so.580.126.09", bind-mount source
-	LinkPath      string // e.g. "/usr/lib/x86_64-linux-gnu/libcuda.so.580.126.09", symlink in container
+	HostPath         string // e.g. "/usr/lib/x86_64-linux-gnu/libcuda.so.1", original discovered name
+	ResolvedHostPath string // e.g. "/usr/lib/nvidia/libcuda.so.580.126.09", real bind-mount source
+	ContainerPath    string // e.g. "/run/host-nvidia/0/libcuda.so.580.126.09", bind-mount source
+	LinkPath         string // e.g. "/usr/lib/x86_64-linux-gnu/libcuda.so.1", symlink in container
 }
 
 // NvidiaLibDirMount represents a read-only bind mount of a host directory
@@ -341,10 +342,11 @@ func expandNVIDIALibraries(libs []NvidiaLibMapping) []NvidiaLibMapping {
 	seenNames := make(map[string]bool, len(libs))
 	dirs := make(map[string]bool)
 
-	for _, lib := range libs {
-		seenPaths[lib.HostPath] = true
-		seenNames[filepath.Base(lib.HostPath)] = true
-		dirs[filepath.Dir(lib.HostPath)] = true
+	for i := range expanded {
+		expanded[i].ResolvedHostPath = resolveNVIDIALibraryPath(expanded[i].HostPath)
+		seenPaths[expanded[i].HostPath] = true
+		seenNames[filepath.Base(expanded[i].HostPath)] = true
+		dirs[filepath.Dir(expanded[i].HostPath)] = true
 	}
 
 	var matches []string
@@ -376,7 +378,10 @@ func expandNVIDIALibraries(libs []NvidiaLibMapping) []NvidiaLibMapping {
 		seenPaths[path] = true
 		seenNames[name] = true
 
-		expanded = append(expanded, NvidiaLibMapping{HostPath: path})
+		expanded = append(expanded, NvidiaLibMapping{
+			HostPath:         path,
+			ResolvedHostPath: resolveNVIDIALibraryPath(path),
+		})
 	}
 
 	for _, path := range matches {
@@ -393,6 +398,15 @@ func expandNVIDIALibraries(libs []NvidiaLibMapping) []NvidiaLibMapping {
 	}
 
 	return expanded
+}
+
+func resolveNVIDIALibraryPath(path string) string {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return resolved
+	}
+
+	return path
 }
 
 func isNVIDIALibraryName(name string) bool {
@@ -496,9 +510,11 @@ func resolveNVIDIAI386Libraries(driverVersion string, candidateDirs []string) ([
 		var matches []string
 
 		for _, pattern := range nvidiaI386LibGlobs {
-			found, globErr := filepath.Glob(filepath.Join(dir, pattern))
-			if globErr == nil {
-				matches = append(matches, found...)
+			for _, searchDir := range []string{dir, filepath.Join(dir, "vdpau")} {
+				found, globErr := filepath.Glob(filepath.Join(searchDir, pattern))
+				if globErr == nil {
+					matches = append(matches, found...)
+				}
 			}
 		}
 
@@ -517,7 +533,10 @@ func resolveNVIDIAI386Libraries(driverVersion string, candidateDirs []string) ([
 
 			seenNames[name] = true
 
-			libs = append(libs, NvidiaLibMapping{HostPath: path})
+			libs = append(libs, NvidiaLibMapping{
+				HostPath:         path,
+				ResolvedHostPath: resolveNVIDIALibraryPath(path),
+			})
 		}
 	}
 
@@ -555,7 +574,7 @@ func buildNVIDIALibMountsAt(libs []NvidiaLibMapping, containerLibDir, mountBaseD
 	var dirs []string
 
 	for _, lib := range libs {
-		dir := filepath.Dir(lib.HostPath)
+		dir := filepath.Dir(nvidiaLibSourceHostPath(lib))
 		if seen[dir] {
 			continue
 		}
@@ -581,17 +600,27 @@ func buildNVIDIALibMountsAt(libs []NvidiaLibMapping, containerLibDir, mountBaseD
 		dirToContainer[dir] = containerDir
 	}
 
-	// Stamp each library mapping with its container and link paths.
+	// Stamp each library mapping with its resolved container source and its
+	// original destination name. This avoids depending on absolute host
+	// symlinks resolving inside the nspawn machine.
 	for i := range libs {
-		basename := filepath.Base(libs[i].HostPath)
+		sourcePath := nvidiaLibSourceHostPath(libs[i])
 		libs[i].ContainerPath = filepath.Join(
-			dirToContainer[filepath.Dir(libs[i].HostPath)],
-			basename,
+			dirToContainer[filepath.Dir(sourcePath)],
+			filepath.Base(sourcePath),
 		)
-		libs[i].LinkPath = filepath.Join(containerLibDir, basename)
+		libs[i].LinkPath = filepath.Join(containerLibDir, filepath.Base(libs[i].HostPath))
 	}
 
 	return libs, mounts
+}
+
+func nvidiaLibSourceHostPath(lib NvidiaLibMapping) string {
+	if lib.ResolvedHostPath != "" {
+		return lib.ResolvedHostPath
+	}
+
+	return lib.HostPath
 }
 
 // parseNVIDIALibraries extracts NVIDIA library mappings from ldconfig -p
