@@ -800,25 +800,6 @@ impl RingCore {
     }
 }
 
-/// io_uring admits via the [`SubmitSlot`] park: when `submitted ==
-/// queue_depth` a submitter yields `Pending` until a completion frees a
-/// slot, so the policy is [`BackPressurePolicy::Parking`]. This impl is
-/// purely the shared introspection surface; the actual parking still
-/// lives in [`SubmitSlot`].
-impl crate::io::BackPressure for RingCore {
-    fn capacity(&self) -> usize {
-        self.queue_depth as usize
-    }
-
-    fn in_flight(&self) -> usize {
-        self.submitted.get() as usize
-    }
-
-    fn policy(&self) -> crate::io::BackPressurePolicy {
-        crate::io::BackPressurePolicy::Parking
-    }
-}
-
 impl Drop for RingCore {
     fn drop(&mut self) {
         // Best-effort: release the kernel-pinned buffer/file tables
@@ -1019,20 +1000,6 @@ mod tests {
         // kernel-side registration.
         assert_eq!(core.resolve_buf_index(base_a, PAGE).expect("resolve a"), 0);
         assert_eq!(core.resolve_buf_index(base_b, PAGE).expect("resolve b"), 1);
-    }
-
-    /// The ring reports itself through the shared [`crate::io::BackPressure`]
-    /// surface as a parking backend bounded by its queue depth.
-    #[test]
-    fn backpressure_surface_reports_parking_policy() {
-        use crate::io::{BackPressure, BackPressurePolicy};
-
-        let core = RingCore::new(8, RingSetup::default()).expect("core");
-        assert_eq!(core.capacity(), 8);
-        assert_eq!(core.in_flight(), 0);
-        assert_eq!(core.available(), 8);
-        assert!(core.admits());
-        assert_eq!(core.policy(), BackPressurePolicy::Parking);
     }
 
     #[test]
