@@ -58,6 +58,16 @@ type unboundedEncapUnbTraceEvent struct {
 	Verdict      int32
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	unboundedEncapMapUnbEndpts           = "unb_endpts"
+	unboundedEncapMapUnbTrace            = "unb_trace"
+	unboundedEncapProgUnboundedEncap     = "unbounded_encap"
+	unboundedEncapVarUnbTraceEventLayout = "_unb_trace_event_layout"
+)
+
 // loadUnboundedEncap returns the embedded CollectionSpec for unboundedEncap.
 func loadUnboundedEncap() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_UnboundedEncapBytes)
@@ -78,7 +88,7 @@ func loadUnboundedEncap() (*ebpf.CollectionSpec, error) {
 //	*unboundedEncapMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadUnboundedEncapObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadUnboundedEncapObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadUnboundedEncap()
 	if err != nil {
 		return err
