@@ -108,7 +108,7 @@ type SiteSpec struct {
 type SiteComponents struct {
 	// Machina configures the machina controller for this site.
 	// +optional
-	Machina *SiteComponentSpec `json:"machina,omitempty"`
+	Machina *MachinaComponentSpec `json:"machina,omitempty"`
 
 	// Metalman configures the Metalman PXE controller for this site.
 	// +optional
@@ -126,6 +126,11 @@ type SiteComponentSpec struct {
 	// Enabled controls whether the component is reconciled.
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
+}
+
+// MachinaComponentSpec configures the machina controller for a site.
+type MachinaComponentSpec struct {
+	SiteComponentSpec `json:",inline"`
 }
 
 // MetalmanComponentSpec configures Metalman for a site.
@@ -155,20 +160,13 @@ type SiteStatus struct {
 	// +optional
 	SliceCount int `json:"sliceCount,omitempty"`
 
-	// Components reports the last observed state of site components.
+	// Conditions report the last observed state of site components. One
+	// condition is published per component (for example NetReady, MachinaReady,
+	// MetalmanReady, StorageReady) so callers can `kubectl wait` on a Site.
 	// +optional
-	Components map[string]SiteComponentStatus `json:"components,omitempty"`
-}
-
-// SiteComponentStatus reports the observed state of a component.
-type SiteComponentStatus struct {
-	// Ready indicates whether the component was reconciled successfully.
-	// +optional
-	Ready bool `json:"ready,omitempty"`
-
-	// Message contains a short human-readable status message.
-	// +optional
-	Message string `json:"message,omitempty"`
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // ComponentEnabled reports whether a component spec enables a component.

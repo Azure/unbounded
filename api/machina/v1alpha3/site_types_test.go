@@ -66,7 +66,9 @@ func TestDeepCopySiteAndList(t *testing.T) {
 				TransmitInterval: &transmit,
 			},
 			Components: SiteComponents{
-				Machina: &SiteComponentSpec{Enabled: &enabled},
+				Machina: &MachinaComponentSpec{
+					SiteComponentSpec: SiteComponentSpec{Enabled: &enabled},
+				},
 				Metalman: &MetalmanComponentSpec{
 					SiteComponentSpec: SiteComponentSpec{Enabled: &enabled},
 					DHCPAutoInterface: &enabled,
@@ -76,8 +78,8 @@ func TestDeepCopySiteAndList(t *testing.T) {
 		Status: SiteStatus{
 			NodeCount:  2,
 			SliceCount: 1,
-			Components: map[string]SiteComponentStatus{
-				"machina": {Ready: true, Message: "ok"},
+			Conditions: []metav1.Condition{
+				{Type: "MachinaReady", Status: metav1.ConditionTrue, Reason: "Reconciled", Message: "ok"},
 			},
 		},
 	}
@@ -94,7 +96,7 @@ func TestDeepCopySiteAndList(t *testing.T) {
 	site.Spec.NodeCidrs[0] = "10.99.0.0/16"
 	site.Spec.PodCidrAssignments[0].CidrBlocks[0] = "10.250.0.0/16"
 	site.Spec.HealthCheckSettings.DetectMultiplier = ptrInt32(9)
-	site.Status.Components["machina"] = SiteComponentStatus{Ready: false}
+	site.Status.Conditions[0].Status = metav1.ConditionFalse
 
 	if copied.Spec.NodeCidrs[0] != "10.0.0.0/16" {
 		t.Fatalf("expected deep-copied NodeCidrs to be isolated")
@@ -108,8 +110,8 @@ func TestDeepCopySiteAndList(t *testing.T) {
 		t.Fatalf("expected deep-copied health check settings to be isolated")
 	}
 
-	if !copied.Status.Components["machina"].Ready {
-		t.Fatalf("expected deep-copied component status to be isolated")
+	if copied.Status.Conditions[0].Status != metav1.ConditionTrue {
+		t.Fatalf("expected deep-copied component condition to be isolated")
 	}
 
 	if site.DeepCopyObject() == nil {

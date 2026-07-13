@@ -17,6 +17,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -40,6 +41,13 @@ const (
 	ComponentMachina  = "machina"
 	ComponentMetalman = "metalman"
 	ComponentStorage  = "storage"
+
+	// Condition reasons published on Site.status.conditions. Reasons must be
+	// CamelCase alphanumeric to satisfy metav1.Condition validation.
+	reasonReconciled     = "Reconciled"
+	reasonDisabled       = "Disabled"
+	reasonNoSites        = "NoSites"
+	reasonReconcileError = "ReconcileError"
 
 	// siteLabelKey is the canonical node label for site membership
 	// (unbounded-cloud.io/site). The net controller applies it to Nodes and the
@@ -109,41 +117,81 @@ func (r *SiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
-	statuses := map[string]unboundedv1alpha3.SiteComponentStatus{}
+	results := map[string]componentResult{}
 
 	// Cluster singletons: net is deployed whenever at least one Site exists;
 	// machina whenever any Site enables it. Reconciled idempotently on every
 	// Site event and reported on each Site's status for visibility.
-	statuses[ComponentNet] = r.reconcileNet(ctx)
-	statuses[ComponentMachina] = r.reconcileMachina(ctx)
+	results[ComponentNet] = r.reconcileNet(ctx)
+	results[ComponentMachina] = r.reconcileMachina(ctx)
 
 	// Per-site components: reconcile when enabled, tear down when disabled so
 	// spec.components.*.enabled is declarative.
-	statuses[ComponentMetalman] = r.reconcilePerSiteComponent(
+	results[ComponentMetalman] = r.reconcilePerSiteComponent(
 		componentEnabled(&site, ComponentMetalman),
 		func() error { return r.reconcileMetalman(ctx, &site) },
 		func() error { return r.cleanupMetalman(ctx, &site) },
 	)
-	statuses[ComponentStorage] = r.reconcilePerSiteComponent(
+	results[ComponentStorage] = r.reconcilePerSiteComponent(
 		componentEnabled(&site, ComponentStorage),
 		func() error { return r.reconcileStorage(ctx, &site) },
 		func() error { return r.cleanupStorage(ctx, &site) },
 	)
 
-	for name, status := range statuses {
-		if !status.Ready {
-			logger.Info("component not ready", "site", site.Name, "component", name, "message", status.Message)
-		}
-	}
-
 	patch := client.MergeFrom(site.DeepCopy())
 
-	site.Status.Components = statuses
+	// Publish one condition per component in a stable order so the status patch
+	// is deterministic and callers can `kubectl wait --for=condition=NetReady`.
+	for _, name := range []string{ComponentNet, ComponentMachina, ComponentMetalman, ComponentStorage} {
+		res := results[name]
+		if !res.ready {
+			logger.Info("component not ready", "site", site.Name, "component", name, "message", res.message)
+		}
+
+		status := metav1.ConditionTrue
+		if !res.ready {
+			status = metav1.ConditionFalse
+		}
+
+		apimeta.SetStatusCondition(&site.Status.Conditions, metav1.Condition{
+			Type:               componentConditionType(name),
+			Status:             status,
+			Reason:             res.reason,
+			Message:            res.message,
+			ObservedGeneration: site.Generation,
+		})
+	}
+
 	if err := r.Status().Patch(ctx, &site, patch); err != nil {
 		return ctrl.Result{}, fmt.Errorf("patch site status: %w", err)
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// componentResult is the internal outcome of reconciling a single component,
+// translated into a Site status condition by Reconcile.
+type componentResult struct {
+	ready   bool
+	reason  string
+	message string
+}
+
+// componentConditionType maps a component name to its Site status condition
+// type (for example "net" -> "NetReady").
+func componentConditionType(component string) string {
+	switch component {
+	case ComponentNet:
+		return "NetReady"
+	case ComponentMachina:
+		return "MachinaReady"
+	case ComponentMetalman:
+		return "MetalmanReady"
+	case ComponentStorage:
+		return "StorageReady"
+	default:
+		return component + "Ready"
+	}
 }
 
 func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -153,32 +201,32 @@ func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 // reconcilePerSiteComponent reconciles a per-site component when enabled and
-// tears it down when disabled, turning the outcome into a SiteComponentStatus.
-func (r *SiteReconciler) reconcilePerSiteComponent(enabled bool, reconcile, cleanup func() error) unboundedv1alpha3.SiteComponentStatus {
+// tears it down when disabled, turning the outcome into a componentResult.
+func (r *SiteReconciler) reconcilePerSiteComponent(enabled bool, reconcile, cleanup func() error) componentResult {
 	if !enabled {
 		if err := cleanup(); err != nil {
-			return unboundedv1alpha3.SiteComponentStatus{Ready: false, Message: err.Error()}
+			return componentResult{ready: false, reason: reasonReconcileError, message: err.Error()}
 		}
 
-		return unboundedv1alpha3.SiteComponentStatus{Ready: true, Message: "disabled"}
+		return componentResult{ready: true, reason: reasonDisabled, message: "component disabled"}
 	}
 
 	if err := reconcile(); err != nil {
-		return unboundedv1alpha3.SiteComponentStatus{Ready: false, Message: err.Error()}
+		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error()}
 	}
 
-	return unboundedv1alpha3.SiteComponentStatus{Ready: true, Message: "reconciled"}
+	return componentResult{ready: true, reason: reasonReconciled, message: "component reconciled"}
 }
 
 // reconcileSingletons reconciles just the cluster-singleton components (net,
 // machina); used when a Site is deleted.
 func (r *SiteReconciler) reconcileSingletons(ctx context.Context) error {
-	if s := r.reconcileNet(ctx); !s.Ready {
-		return fmt.Errorf("net: %s", s.Message)
+	if s := r.reconcileNet(ctx); !s.ready {
+		return fmt.Errorf("net: %s", s.message)
 	}
 
-	if s := r.reconcileMachina(ctx); !s.Ready {
-		return fmt.Errorf("machina: %s", s.Message)
+	if s := r.reconcileMachina(ctx); !s.ready {
+		return fmt.Errorf("machina: %s", s.message)
 	}
 
 	return nil
@@ -187,32 +235,32 @@ func (r *SiteReconciler) reconcileSingletons(ctx context.Context) error {
 // reconcileNet deploys the unbounded-net cluster singleton whenever at least
 // one Site exists. Net is not a per-Site component: a single controller/node
 // pair reads the networking spec of every Site.
-func (r *SiteReconciler) reconcileNet(ctx context.Context) unboundedv1alpha3.SiteComponentStatus {
+func (r *SiteReconciler) reconcileNet(ctx context.Context) componentResult {
 	sites, err := r.listSites(ctx)
 	if err != nil {
-		return unboundedv1alpha3.SiteComponentStatus{Ready: false, Message: err.Error()}
+		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error()}
 	}
 
 	if len(sites) == 0 {
 		// Net is the cluster dataplane. Do not auto-delete it just because the
 		// last Site was removed; deleting net-node can break pod networking across
 		// the whole cluster. A future explicit uninstall flow should handle removal.
-		return unboundedv1alpha3.SiteComponentStatus{Ready: true, Message: "no sites"}
+		return componentResult{ready: true, reason: reasonNoSites, message: "no sites; net retained"}
 	}
 
 	if err := r.applyManifestFS(ctx, netmanifests.Manifests, nil); err != nil {
-		return unboundedv1alpha3.SiteComponentStatus{Ready: false, Message: err.Error()}
+		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error()}
 	}
 
-	return unboundedv1alpha3.SiteComponentStatus{Ready: true, Message: "reconciled"}
+	return componentResult{ready: true, reason: reasonReconciled, message: "component reconciled"}
 }
 
 // reconcileMachina deploys the machina controller singleton whenever any Site
 // enables it. (Machina is a singleton for now; it may become site-scoped.)
-func (r *SiteReconciler) reconcileMachina(ctx context.Context) unboundedv1alpha3.SiteComponentStatus {
+func (r *SiteReconciler) reconcileMachina(ctx context.Context) componentResult {
 	sites, err := r.listSites(ctx)
 	if err != nil {
-		return unboundedv1alpha3.SiteComponentStatus{Ready: false, Message: err.Error()}
+		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error()}
 	}
 
 	enabled := false
@@ -228,14 +276,14 @@ func (r *SiteReconciler) reconcileMachina(ctx context.Context) unboundedv1alpha3
 		// Keep machina installed once the operator has taken ownership. Automatic
 		// singleton removal is surprising and can strand related controllers/RBAC;
 		// a future explicit uninstall flow should handle removal.
-		return unboundedv1alpha3.SiteComponentStatus{Ready: true, Message: "disabled"}
+		return componentResult{ready: true, reason: reasonDisabled, message: "no site enables machina; retained"}
 	}
 
 	if err := r.applyManifestFS(ctx, machinamanifests.Manifests, r.machinaApplyMutator(ctx)); err != nil {
-		return unboundedv1alpha3.SiteComponentStatus{Ready: false, Message: err.Error()}
+		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error()}
 	}
 
-	return unboundedv1alpha3.SiteComponentStatus{Ready: true, Message: "reconciled"}
+	return componentResult{ready: true, reason: reasonReconciled, message: "component reconciled"}
 }
 
 // machinaApplyMutator returns the mutate used when applying the machina
@@ -765,7 +813,11 @@ func pointDaemonSetAtSiteConfig(site *unboundedv1alpha3.Site, obj *unstructured.
 func componentEnabled(site *unboundedv1alpha3.Site, component string) bool {
 	switch component {
 	case ComponentMachina:
-		return unboundedv1alpha3.ComponentEnabled(site.Spec.Components.Machina)
+		if site.Spec.Components.Machina == nil {
+			return false
+		}
+
+		return unboundedv1alpha3.ComponentEnabled(&site.Spec.Components.Machina.SiteComponentSpec)
 	case ComponentMetalman:
 		if site.Spec.Components.Metalman == nil {
 			return false

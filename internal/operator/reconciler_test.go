@@ -316,8 +316,8 @@ func TestReconcilePerSiteComponentDisabledRunsCleanup(t *testing.T) {
 		t.Fatal("cleanup was not called for a disabled component")
 	}
 
-	if !status.Ready || status.Message != "disabled" {
-		t.Fatalf("status = %+v, want ready/disabled", status)
+	if !status.ready || status.reason != reasonDisabled {
+		t.Fatalf("status = %+v, want ready with reason %q", status, reasonDisabled)
 	}
 }
 
