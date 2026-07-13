@@ -128,6 +128,14 @@ const (
 	// host NVIDIA library directories are bind-mounted read-only. Each unique
 	// host directory gets a numbered subdirectory (e.g. /run/host-nvidia/0/).
 	NvidiaHostLibDir = "/run/host-nvidia"
+	// NvidiaHostI386LibDir is the base directory for optional i386 NVIDIA
+	// library bind mounts.
+	NvidiaHostI386LibDir = "/run/host-nvidia-i386"
+	// NvidiaHostBinDir exposes the host directory containing nvidia-smi.
+	NvidiaHostBinDir = "/run/host-nvidia-bin"
+	// NvidiaDriverDir is the driver-root layout used by NVIDIA tooling and
+	// device plugins inside the nspawn machine.
+	NvidiaDriverDir = "/run/nvidia/driver"
 
 	NvidiaContainerRuntimePath = "/usr/bin/nvidia-container-runtime"
 	NvidiaRuntimeClassName     = "nvidia"

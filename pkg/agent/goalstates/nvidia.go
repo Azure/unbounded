@@ -20,14 +20,15 @@ import (
 // When the NVIDIA driver is installed on the host but the nspawn container
 // uses a separate rootfs (e.g. an OCI image), the driver's userspace
 // libraries (libnvidia-ml, libcuda, etc.) are only present on the host.
-// Tools that need them inside the container — in particular nvidia-ctk for
-// CDI spec generation — will fail with "ERROR_LIBRARY_NOT_FOUND".
+// Tools that need them inside the container, in particular nvidia-ctk for
+// CDI spec generation, will fail with "ERROR_LIBRARY_NOT_FOUND".
 //
 // The library discovery and bind-mount approach is derived from the intuneme
 // project (https://github.com/frostyard/intuneme).
 //
-//  1. Parse `ldconfig -p` on the host to discover NVIDIA libraries for the
-//     host architecture (x86-64 or aarch64).
+//  1. Parse `ldconfig -p` on the host to find NVIDIA library directories for
+//     the host architecture (x86-64 or aarch64), then scan those directories
+//     for aliases and real versioned files.
 //  2. Bind-mount the host directories containing those libraries into the
 //     nspawn container at /run/host-nvidia/0/, /run/host-nvidia/1/, etc.
 //  3. After the nspawn boots, create symlinks in the container's standard
@@ -50,10 +51,10 @@ type NvidiaHost struct {
 	// bind-mounted host NVIDIA libraries are created here.
 	ContainerLibDir string
 
-	// LibMappings contains NVIDIA userspace libraries discovered on the
-	// host via ldconfig -p. These are used to create symlinks inside the
-	// nspawn container so that the host's NVIDIA driver libraries are
-	// accessible.
+	// LibMappings contains NVIDIA userspace libraries discovered from
+	// ldconfig -p and filesystem scans. These are used to create symlinks
+	// inside the nspawn container so that the host's NVIDIA driver libraries
+	// are accessible.
 	LibMappings []NvidiaLibMapping
 
 	// LibDirMounts lists unique host directories containing NVIDIA libraries
@@ -61,14 +62,30 @@ type NvidiaHost struct {
 	// /run/host-nvidia/<index>/. After boot, symlinks from the container's
 	// standard library path are created by the setup-nvidia-libraries task.
 	LibDirMounts []NvidiaLibDirMount
+
+	// I386LibMappings contains optional i386 NVIDIA and GLVND libraries with a
+	// driver version matching the active 64-bit driver.
+	I386LibMappings []NvidiaLibMapping
+
+	// I386LibDirMounts lists the host directories for I386LibMappings.
+	I386LibDirMounts []NvidiaLibDirMount
+
+	// NvidiaSMIPath is the host path to nvidia-smi, when available.
+	NvidiaSMIPath string
+
+	// DriverVersion is the active NVIDIA kernel driver version. It is used to
+	// provide versioned library names when a host installation exposes only
+	// unversioned or SONAME aliases through ldconfig.
+	DriverVersion string
 }
 
 // NvidiaLibMapping maps a host NVIDIA library to its corresponding paths
 // inside the nspawn container.
 type NvidiaLibMapping struct {
-	HostPath      string // e.g. "/usr/lib/x86_64-linux-gnu/libcuda.so.580.126.09"
-	ContainerPath string // e.g. "/run/host-nvidia/0/libcuda.so.580.126.09" — bind-mount source
-	LinkPath      string // e.g. "/usr/lib/x86_64-linux-gnu/libcuda.so.580.126.09" — symlink in container
+	HostPath         string // e.g. "/usr/lib/x86_64-linux-gnu/libcuda.so.1", original discovered name
+	ResolvedHostPath string // e.g. "/usr/lib/nvidia/libcuda.so.580.126.09", real bind-mount source
+	ContainerPath    string // e.g. "/run/host-nvidia/0/libcuda.so.580.126.09", bind-mount source
+	LinkPath         string // e.g. "/usr/lib/x86_64-linux-gnu/libcuda.so.1", symlink in container
 }
 
 // NvidiaLibDirMount represents a read-only bind mount of a host directory
@@ -102,13 +119,17 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 	}
 
 	devices := discoverNVIDIADevices()
-	libs, mounts := resolveNVIDIALibraries(archInfo)
+	libraries := resolveNVIDIALibraries(archInfo)
 
 	return NvidiaHost{
-		GPUDevicePaths:  devices,
-		ContainerLibDir: archInfo.libDir,
-		LibMappings:     libs,
-		LibDirMounts:    mounts,
+		GPUDevicePaths:   devices,
+		ContainerLibDir:  archInfo.libDir,
+		LibMappings:      libraries.libMappings,
+		LibDirMounts:     libraries.libDirMounts,
+		I386LibMappings:  libraries.i386LibMappings,
+		I386LibDirMounts: libraries.i386LibDirMounts,
+		NvidiaSMIPath:    discoverNVIDIASMI(),
+		DriverVersion:    libraries.driverVersion,
 	}, nil
 }
 
@@ -144,11 +165,14 @@ type nvidiaArch struct {
 	// bind-mounted host NVIDIA libraries are created here inside the
 	// nspawn container.
 	libDir string
+
+	// i386LibDir is the optional 32-bit library directory on amd64 hosts.
+	i386LibDir string
 }
 
 // nvidiaArchMap maps GOARCH values to their NVIDIA-specific arch parameters.
 var nvidiaArchMap = map[string]nvidiaArch{
-	"amd64": {ldconfigTag: "x86-64", libDir: "/usr/lib/x86_64-linux-gnu"},
+	"amd64": {ldconfigTag: "x86-64", libDir: "/usr/lib/x86_64-linux-gnu", i386LibDir: "/usr/lib/i386-linux-gnu"},
 	"arm64": {ldconfigTag: "aarch64", libDir: "/usr/lib/aarch64-linux-gnu"},
 }
 
@@ -227,24 +251,325 @@ func discoverNVIDIADevices() []string {
 var nvidiaLibPrefixes = []string{
 	"libnvidia-",
 	"libcuda",
+	"libcudadebugger",
 	"libEGL_nvidia",
 	"libGLX_nvidia",
+	"libGLESv1_CM_nvidia",
 	"libGLESv2_nvidia",
 	"libnvcuvid",
 	"libnvoptix",
+	"libvdpau_nvidia",
+}
+
+// nvidiaLibGlobs includes both linker aliases and the real, versioned driver
+// files. ldconfig -p commonly reports only the aliases, while nvidia-ctk
+// explicitly looks for names such as libcuda.so.<driver-version>.
+var nvidiaLibGlobs = []string{
+	"libcuda.so*",
+	"libcudadebugger.so*",
+	"libnvidia*.so*",
+	"libEGL_nvidia.so*",
+	"libGLX_nvidia.so*",
+	"libGLESv*_nvidia.so*",
+	"libnvcuvid.so*",
+	"libnvoptix.so*",
+	"libvdpau_nvidia.so*",
+}
+
+// nvidiaI386LibGlobs also includes the architecture-neutral GLVND and OpenCL
+// loader names needed by 32-bit applications.
+var nvidiaI386LibGlobs = []string{
+	"libcuda.so*",
+	"libcudadebugger.so*",
+	"libnvcuvid.so*",
+	"libnvoptix.so*",
+	"libnvidia*.so*",
+	"libEGL_nvidia.so*",
+	"libGLX_nvidia.so*",
+	"libGLESv1_CM_nvidia.so*",
+	"libGLESv2_nvidia.so*",
+	"libEGL.so*",
+	"libGL.so*",
+	"libGLESv1_CM.so*",
+	"libGLESv2.so*",
+	"libGLX.so*",
+	"libGLX_indirect.so*",
+	"libOpenGL.so*",
+	"libGLdispatch.so*",
+	"libOpenCL.so*",
+	"libvdpau_nvidia.so*",
+}
+
+type nvidiaLibraryResolution struct {
+	libMappings      []NvidiaLibMapping
+	libDirMounts     []NvidiaLibDirMount
+	i386LibMappings  []NvidiaLibMapping
+	i386LibDirMounts []NvidiaLibDirMount
+	driverVersion    string
 }
 
 // resolveNVIDIALibraries runs ldconfig -p on the host and returns enriched
 // library mappings and their corresponding bind-mount specs.
-func resolveNVIDIALibraries(arch nvidiaArch) ([]NvidiaLibMapping, []NvidiaLibDirMount) {
+func resolveNVIDIALibraries(arch nvidiaArch) nvidiaLibraryResolution {
 	out, err := exec.Command("ldconfig", "-p").Output()
 	if err != nil {
-		return nil, nil
+		return nvidiaLibraryResolution{}
 	}
 
 	libs := parseNVIDIALibraries(out, arch.ldconfigTag)
+	libs = expandNVIDIALibraries(libs)
 
-	return buildNVIDIALibMounts(libs, arch.libDir)
+	driverVersion := discoverNVIDIADriverVersion(libs, "/sys/module/nvidia/version")
+	libs, mounts := buildNVIDIALibMounts(libs, arch.libDir)
+
+	i386Libs, i386Mounts := resolveNVIDIAI386Libraries(driverVersion, nvidiaI386LibraryDirs(arch.i386LibDir))
+
+	return nvidiaLibraryResolution{
+		libMappings:      libs,
+		libDirMounts:     mounts,
+		i386LibMappings:  i386Libs,
+		i386LibDirMounts: i386Mounts,
+		driverVersion:    driverVersion,
+	}
+}
+
+func discoverNVIDIASMI() string {
+	for _, path := range []string{"/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi"} {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path
+		}
+	}
+
+	return ""
+}
+
+// expandNVIDIALibraries scans every library directory selected by ldconfig for
+// NVIDIA aliases and versioned files. It also follows alternatives-style
+// symlinks so their real targets are included in the bind mounts.
+func expandNVIDIALibraries(libs []NvidiaLibMapping) []NvidiaLibMapping {
+	if len(libs) == 0 {
+		return nil
+	}
+
+	expanded := slices.Clone(libs)
+	seenPaths := make(map[string]bool, len(libs))
+	seenNames := make(map[string]bool, len(libs))
+	dirs := make(map[string]bool)
+
+	for i := range expanded {
+		expanded[i].ResolvedHostPath = resolveNVIDIALibraryPath(expanded[i].HostPath)
+		seenPaths[expanded[i].HostPath] = true
+		seenNames[filepath.Base(expanded[i].HostPath)] = true
+		dirs[filepath.Dir(expanded[i].HostPath)] = true
+	}
+
+	var matches []string
+
+	for dir := range dirs {
+		for _, pattern := range nvidiaLibGlobs {
+			// VDPAU is the Video Decode and Presentation API for Unix. NVIDIA's
+			// VDPAU implementation is conventionally installed in this subdirectory.
+			for _, searchDir := range []string{dir, filepath.Join(dir, "vdpau")} {
+				found, err := filepath.Glob(filepath.Join(searchDir, pattern))
+				if err == nil {
+					matches = append(matches, found...)
+				}
+			}
+		}
+	}
+
+	sort.Strings(matches)
+
+	add := func(path string) {
+		name := filepath.Base(path)
+		if seenPaths[path] || seenNames[name] || !isNVIDIALibraryName(name) {
+			return
+		}
+
+		info, err := os.Lstat(path)
+		if err != nil || info.IsDir() {
+			return
+		}
+
+		seenPaths[path] = true
+		seenNames[name] = true
+
+		expanded = append(expanded, NvidiaLibMapping{
+			HostPath:         path,
+			ResolvedHostPath: resolveNVIDIALibraryPath(path),
+		})
+	}
+
+	for _, path := range matches {
+		add(path)
+	}
+
+	// Resolve all aliases, including the original ldconfig entries. A target
+	// may live outside the alias directory, for example under alternatives.
+	for _, lib := range slices.Clone(expanded) {
+		target, err := filepath.EvalSymlinks(lib.HostPath)
+		if err == nil {
+			add(target)
+		}
+	}
+
+	return expanded
+}
+
+func resolveNVIDIALibraryPath(path string) string {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return resolved
+	}
+
+	return path
+}
+
+func isNVIDIALibraryName(name string) bool {
+	for _, pattern := range nvidiaLibGlobs {
+		matched, err := filepath.Match(pattern, name)
+		if err == nil && matched {
+			return true
+		}
+	}
+
+	return false
+}
+
+func discoverNVIDIADriverVersion(libs []NvidiaLibMapping, moduleVersionPath string) string {
+	// The active SONAME symlinks are the strongest userspace signal because a
+	// directory can contain files left behind by an older driver package.
+	for _, preferredName := range []string{"libcuda.so.1", "libnvidia-ml.so.1"} {
+		for _, lib := range libs {
+			if filepath.Base(lib.HostPath) != preferredName {
+				continue
+			}
+
+			target, err := filepath.EvalSymlinks(lib.HostPath)
+			if err == nil {
+				if version := nvidiaDriverVersionFromName(filepath.Base(target)); version != "" {
+					return version
+				}
+			}
+		}
+	}
+
+	if data, err := os.ReadFile(moduleVersionPath); err == nil {
+		if version := strings.TrimSpace(string(data)); isNVIDIADriverVersion(version) {
+			return version
+		}
+	}
+
+	for _, preferredPrefix := range []string{"libGLX_nvidia.so.", "libcuda.so.", "libnvidia-ml.so."} {
+		for _, lib := range libs {
+			name := filepath.Base(lib.HostPath)
+			if !strings.HasPrefix(name, preferredPrefix) {
+				continue
+			}
+
+			if version := nvidiaDriverVersionFromName(name); version != "" {
+				return version
+			}
+		}
+	}
+
+	return ""
+}
+
+func nvidiaDriverVersionFromName(name string) string {
+	_, version, found := strings.Cut(name, ".so.")
+	if found && isNVIDIADriverVersion(version) {
+		return version
+	}
+
+	return ""
+}
+
+func isNVIDIADriverVersion(version string) bool {
+	return strings.Count(version, ".") >= 2 && strings.Trim(version, "0123456789.") == ""
+}
+
+func nvidiaI386LibraryDirs(i386LibDir string) []string {
+	if i386LibDir == "" {
+		return nil
+	}
+
+	dirs := []string{i386LibDir}
+	if strings.HasPrefix(i386LibDir, "/usr/") {
+		dirs = append(dirs, strings.TrimPrefix(i386LibDir, "/usr"))
+	}
+
+	return dirs
+}
+
+// resolveNVIDIAI386Libraries finds a compat32 installation matching the active
+// driver version. This intentionally scans the filesystem because ldconfig -p
+// often lists only its SONAME aliases.
+func resolveNVIDIAI386Libraries(driverVersion string, candidateDirs []string) ([]NvidiaLibMapping, []NvidiaLibDirMount) {
+	if driverVersion == "" {
+		return nil, nil
+	}
+
+	seenDirs := make(map[string]bool)
+	seenNames := make(map[string]bool)
+
+	var libs []NvidiaLibMapping
+
+	for _, candidateDir := range candidateDirs {
+		dir, err := filepath.EvalSymlinks(candidateDir)
+		if err != nil || seenDirs[dir] || !hasNVIDIADriverVersionInDir(dir, driverVersion) {
+			continue
+		}
+
+		seenDirs[dir] = true
+
+		var matches []string
+
+		for _, pattern := range nvidiaI386LibGlobs {
+			// VDPAU is the Video Decode and Presentation API for Unix. NVIDIA's
+			// VDPAU implementation is conventionally installed in this subdirectory.
+			for _, searchDir := range []string{dir, filepath.Join(dir, "vdpau")} {
+				found, globErr := filepath.Glob(filepath.Join(searchDir, pattern))
+				if globErr == nil {
+					matches = append(matches, found...)
+				}
+			}
+		}
+
+		sort.Strings(matches)
+
+		for _, path := range matches {
+			name := filepath.Base(path)
+			if seenNames[name] {
+				continue
+			}
+
+			info, statErr := os.Lstat(path)
+			if statErr != nil || info.IsDir() {
+				continue
+			}
+
+			seenNames[name] = true
+
+			libs = append(libs, NvidiaLibMapping{
+				HostPath:         path,
+				ResolvedHostPath: resolveNVIDIALibraryPath(path),
+			})
+		}
+	}
+
+	return buildNVIDIALibMountsAt(libs, "/usr/lib/i386-linux-gnu", NvidiaHostI386LibDir)
+}
+
+func hasNVIDIADriverVersionInDir(dir, driverVersion string) bool {
+	for _, family := range []string{"libGLX_nvidia.so.", "libnvidia-ml.so.", "libcuda.so."} {
+		path := filepath.Join(dir, family+driverVersion)
+		if info, err := os.Lstat(path); err == nil && !info.IsDir() {
+			return true
+		}
+	}
+
+	return false
 }
 
 // buildNVIDIALibMounts takes parsed library mappings (from parseNVIDIALibraries),
@@ -252,6 +577,10 @@ func resolveNVIDIALibraries(arch nvidiaArch) ([]NvidiaLibMapping, []NvidiaLibDir
 // mapping with its container-side path. containerLibDir is the multiarch
 // library directory inside the container where symlinks will be created.
 func buildNVIDIALibMounts(libs []NvidiaLibMapping, containerLibDir string) ([]NvidiaLibMapping, []NvidiaLibDirMount) {
+	return buildNVIDIALibMountsAt(libs, containerLibDir, NvidiaHostLibDir)
+}
+
+func buildNVIDIALibMountsAt(libs []NvidiaLibMapping, containerLibDir, mountBaseDir string) ([]NvidiaLibMapping, []NvidiaLibDirMount) {
 	if len(libs) == 0 {
 		return nil, nil
 	}
@@ -263,7 +592,7 @@ func buildNVIDIALibMounts(libs []NvidiaLibMapping, containerLibDir string) ([]Nv
 	var dirs []string
 
 	for _, lib := range libs {
-		dir := filepath.Dir(lib.HostPath)
+		dir := filepath.Dir(nvidiaLibSourceHostPath(lib))
 		if seen[dir] {
 			continue
 		}
@@ -279,7 +608,7 @@ func buildNVIDIALibMounts(libs []NvidiaLibMapping, containerLibDir string) ([]Nv
 	mounts := make([]NvidiaLibDirMount, len(dirs))
 
 	for i, dir := range dirs {
-		containerDir := fmt.Sprintf("%s/%d", NvidiaHostLibDir, i)
+		containerDir := fmt.Sprintf("%s/%d", mountBaseDir, i)
 		mounts[i] = NvidiaLibDirMount{
 			Index:        i,
 			HostDir:      dir,
@@ -289,17 +618,27 @@ func buildNVIDIALibMounts(libs []NvidiaLibMapping, containerLibDir string) ([]Nv
 		dirToContainer[dir] = containerDir
 	}
 
-	// Stamp each library mapping with its container and link paths.
+	// Stamp each library mapping with its resolved container source and its
+	// original destination name. This avoids depending on absolute host
+	// symlinks resolving inside the nspawn machine.
 	for i := range libs {
-		basename := filepath.Base(libs[i].HostPath)
+		sourcePath := nvidiaLibSourceHostPath(libs[i])
 		libs[i].ContainerPath = filepath.Join(
-			dirToContainer[filepath.Dir(libs[i].HostPath)],
-			basename,
+			dirToContainer[filepath.Dir(sourcePath)],
+			filepath.Base(sourcePath),
 		)
-		libs[i].LinkPath = filepath.Join(containerLibDir, basename)
+		libs[i].LinkPath = filepath.Join(containerLibDir, filepath.Base(libs[i].HostPath))
 	}
 
 	return libs, mounts
+}
+
+func nvidiaLibSourceHostPath(lib NvidiaLibMapping) string {
+	if lib.ResolvedHostPath != "" {
+		return lib.ResolvedHostPath
+	}
+
+	return lib.HostPath
 }
 
 // parseNVIDIALibraries extracts NVIDIA library mappings from ldconfig -p
@@ -320,8 +659,8 @@ func parseNVIDIALibraries(ldconfigOutput []byte, archTag string) []NvidiaLibMapp
 			continue
 		}
 
-		// Filter to the target architecture only.
-		if !strings.Contains(line, archTag) {
+		// Filter to the target architecture only when an architecture was given.
+		if archTag != "" && !strings.Contains(line, archTag) {
 			continue
 		}
 
@@ -351,12 +690,19 @@ func parseNVIDIALibraries(ldconfigOutput []byte, archTag string) []NvidiaLibMapp
 
 		basename := filepath.Base(hostPath)
 
-		// Deduplicate by basename — first match wins (ldconfig orders by priority).
-		if seen[basename] {
+		// Deduplicate by basename for an architecture-specific lookup, where
+		// ldconfig priority determines the preferred library. Keep paths
+		// distinct when collecting optional i386 directories.
+		key := basename
+		if archTag == "" {
+			key = hostPath
+		}
+
+		if seen[key] {
 			continue
 		}
 
-		seen[basename] = true
+		seen[key] = true
 
 		libs = append(libs, NvidiaLibMapping{HostPath: hostPath})
 	}
