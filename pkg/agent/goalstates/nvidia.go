@@ -367,6 +367,8 @@ func expandNVIDIALibraries(libs []NvidiaLibMapping) []NvidiaLibMapping {
 
 	for dir := range dirs {
 		for _, pattern := range nvidiaLibGlobs {
+			// VDPAU is the Video Decode and Presentation API for Unix. NVIDIA's
+			// VDPAU implementation is conventionally installed in this subdirectory.
 			for _, searchDir := range []string{dir, filepath.Join(dir, "vdpau")} {
 				found, err := filepath.Glob(filepath.Join(searchDir, pattern))
 				if err == nil {
@@ -524,6 +526,8 @@ func resolveNVIDIAI386Libraries(driverVersion string, candidateDirs []string) ([
 		var matches []string
 
 		for _, pattern := range nvidiaI386LibGlobs {
+			// VDPAU is the Video Decode and Presentation API for Unix. NVIDIA's
+			// VDPAU implementation is conventionally installed in this subdirectory.
 			for _, searchDir := range []string{dir, filepath.Join(dir, "vdpau")} {
 				found, globErr := filepath.Glob(filepath.Join(searchDir, pattern))
 				if globErr == nil {
