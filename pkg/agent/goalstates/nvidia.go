@@ -126,11 +126,12 @@ func resolveNvidiaRuntime() NvidiaRuntime {
 }
 
 const (
-	devDir            = "/dev"
-	nvidiaCapsDirName = "nvidia-caps"
-	nvidiaIMEXDirName = "nvidia-caps-imex-channels"
-	driDir            = "/dev/dri"
-	nvidiaDevPrefix   = "nvidia"
+	devDir                  = "/dev"
+	nvidiaCapsDirName       = "nvidia-caps"
+	nvidiaIMEXDirName       = "nvidia-caps-imex-channels"
+	nvidiaIMEXChannelPrefix = "channel"
+	driDir                  = "/dev/dri"
+	nvidiaDevPrefix         = "nvidia"
 )
 
 // nvidiaArch contains architecture-specific values for NVIDIA library
@@ -216,7 +217,7 @@ func discoverNVIDIADevicesIn(deviceDir string) []string {
 	imexEntries, err := os.ReadDir(imexDir)
 	if err == nil {
 		for _, e := range imexEntries {
-			if e.IsDir() {
+			if e.IsDir() || !strings.HasPrefix(e.Name(), nvidiaIMEXChannelPrefix) {
 				continue
 			}
 

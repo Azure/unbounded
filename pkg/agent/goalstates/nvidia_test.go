@@ -17,10 +17,14 @@ func TestDiscoverNVIDIADevicesIncludesIMEXChannels(t *testing.T) {
 	deviceDir := t.TempDir()
 	imexDir := filepath.Join(deviceDir, nvidiaIMEXDirName)
 	channel := filepath.Join(imexDir, "channel0")
+	nonChannel := filepath.Join(imexDir, "not-a-channel")
 	require.NoError(t, os.MkdirAll(imexDir, 0o755))
 	require.NoError(t, os.WriteFile(channel, nil, 0o644))
+	require.NoError(t, os.WriteFile(nonChannel, nil, 0o644))
 
-	require.Contains(t, discoverNVIDIADevicesIn(deviceDir), channel)
+	devices := discoverNVIDIADevicesIn(deviceDir)
+	require.Contains(t, devices, channel)
+	require.NotContains(t, devices, nonChannel)
 }
 
 func TestParseNVIDIALibraries(t *testing.T) {
