@@ -59,6 +59,33 @@ full sequence is:
    NVIDIA device plugin is running, GPUs are registered as `nvidia.com/gpu`
    extended resources on the node.
 
+## Prepared Driver Root
+
+CDI generation is explicitly directed at the host-derived driver root:
+
+```text
+nvidia-ctk cdi generate \
+  --driver-root=/run/nvidia/driver \
+  --dev-root=/ \
+  --output=/etc/cdi/nvidia.yaml
+```
+
+`--driver-root` makes `nvidia-ctk` discover userspace libraries, linker data,
+and helper binaries from `/run/nvidia/driver` instead of the nspawn OCI
+filesystem. This prevents the generated CDI specification from depending on
+libraries in the image that may be absent or may not match the host kernel
+driver. `--dev-root=/` is separate: NVIDIA device nodes are bind-mounted at
+their normal paths in the nspawn machine, so device discovery remains rooted
+at `/`.
+
+The prepared root includes `etc/ld.so.cache` so `nvidia-ctk` can resolve the
+copied libraries and their SONAME aliases. When the host provides
+`nvidia-smi`, the agent also copies that host-matched binary to
+`/run/nvidia/driver/usr/bin/nvidia-smi`. Because helper discovery is scoped by
+`--driver-root`, this copy allows the CDI specification to expose a
+version-compatible `nvidia-smi` to GPU containers. The binary is useful for
+diagnostics and monitoring but is not required for compute-only CUDA access.
+
 ## Architecture Support
 
 Library discovery is architecture-aware. The agent uses `runtime.GOARCH` to
