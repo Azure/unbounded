@@ -12,8 +12,6 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
-
-	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 const (
@@ -67,7 +65,7 @@ type HostDevices struct {
 
 // Paths returns every discovered device node path merged into a single
 // de-duplicated, sorted slice. This is the form the nspawn templates consume
-// to emit Bind= directives.
+// to emit Bind= and DeviceAllow= directives.
 func (d HostDevices) Paths() []string {
 	seen := make(map[string]bool)
 
@@ -75,10 +73,6 @@ func (d HostDevices) Paths() []string {
 
 	for _, group := range [][]string{d.KVM, d.Network, d.Block, d.Infiniband, d.Additional} {
 		for _, p := range group {
-			if config.IsSystemdDeviceGroupSpecifier(p) {
-				continue
-			}
-
 			if seen[p] {
 				continue
 			}
@@ -91,27 +85,6 @@ func (d HostDevices) Paths() []string {
 	sort.Strings(paths)
 
 	return paths
-}
-
-// DeviceGroupSpecifiers returns additional systemd DeviceAllow device group
-// specifiers in a de-duplicated, sorted slice.
-func (d HostDevices) DeviceGroupSpecifiers() []string {
-	seen := make(map[string]bool)
-
-	var specifiers []string
-
-	for _, device := range d.Additional {
-		if !config.IsSystemdDeviceGroupSpecifier(device) || seen[device] {
-			continue
-		}
-
-		seen[device] = true
-		specifiers = append(specifiers, device)
-	}
-
-	sort.Strings(specifiers)
-
-	return specifiers
 }
 
 // DiscoverHostDevices probes the host for device nodes that should be
