@@ -144,9 +144,9 @@ excluded from the live-reload diff.
    publication surface for disk channels.
 7. Read-only shared state (`Arc<Vec<FrontendSpec>>`, `Arc<Vec<BackendSpec>>`;
    startup-fixed fabric settings come from the config `[startup]` section via
-   `StartupSettings`) and routing (`build_routing` -> `Arc<FingerTable>` plus
-   `Arc<HashMap<NodeId, PeerId>>`) are constructed once and shared across
-   shards.
+   `StartupSettings`) and routing (`build_routing` -> `Arc<FingerTable>`) are
+   constructed once and shared across shards. `PeerId` uses the same stable
+   numeric identity as `NodeId`.
 8. Each shard is spawned with `rt.spawn_pinned(widx, name, Box<FnOnce>)`. The
    `!Send` shard objects are constructed **inside** `run_shard`, after pinning.
 9. After every shard reports `Up`, peers are reconciled per shard, the disk
@@ -215,7 +215,7 @@ scratch MR, and tears libfabric down).
 ## 6. Module Map (`src/lib.rs`)
 
 All subsystems are `pub mod`: `backend`, `bufferpool`, `config`, `fabric`,
-`fanout`, `frontend`, `http`, `io`, `memory`, `metrics`, `obs`, `p2p`,
+`fanout`, `frontend`, `http`, `memory`, `metrics`, `obs`, `p2p`,
 `ring`, `runtime`, `storage`, `tls`, and `topology`. The `profiling` module is
 exported when the `profiling` feature is enabled.
 
@@ -346,9 +346,8 @@ stripe, and knows how to fill a miss from either a peer or the local disk.
   local, futures-core-free `Stream` of `Result<PageRef, Error>`); and
   `Transport<R> { bulk_get(&req, src: BulkRef, dsts: &[PageRef]) -> Stream }`,
   which fetches from a **peer**. Blanket impls cover `Arc<T>`.
-- Public surface also includes `PoolGroup`/`ShardDescriptor`/`ShardRouter`
-  (sharding helpers), `PageGuard`/`ReadStream`/`WindowedRead` (read API), and
-  `NullBlockStore`.
+- Public surface also includes `PageGuard`/`ReadStream`/`WindowedRead` (read
+  API) and `NullBlockStore`.
 
 A shard's data path therefore has two miss sources: the `Transport` (peer pull
 over fabric) and the `BlockStore` (local NVMe). The `RoutedTransport` decides
@@ -369,7 +368,7 @@ between them, and the origin `Backend` is the final fallback.
 - `RoutedTransport<R, B: Backend<Req = R>>` (the client side) makes the
   first-hop decision via a single Chord `next_hop(stripe_to_ring(key))`:
   - `None` -> this node owns the stripe; serve from the local origin `Backend`.
-  - `Some(peer)` -> hand off to a wrapped `FabricTransport<R, FingerRouter>`
+  - `Some(peer)` -> hand off to a wrapped `FabricTransport<R, ChainFingerRouter>`
     with a `MAX_HOPS` TTL; recursion happens server-side.
 - `RecursiveHandler` (the server side) **resolves** every request (in contrast
   to `fabric::PoolHandler`, which only serves locally resident pages). It
@@ -478,10 +477,10 @@ touches the kernel device) -> `alloc` + `refcount` (pure LBA tables) -> `btree`
 
 `EngineConfig` defaults: `page_size_bytes` 2 MiB (a multiple of
 `btree_page_bytes`), `btree_page_bytes` 4096 (the device atomic write unit),
-`commit_batch_max` 1024, `commit_batch_deadline_us` 200,
-`eviction_watermark` 0.9, `probationary_fraction` 0.1,
-`admission_sketch_multiplier` 2, `singleflight_shards` 64,
-`restart_scan_queue_depth` 256, `bypass_admission` false (bench/tooling only),
+`commit_batch_max` 1024, `commit_batch_ticks` 8,
+`eviction_watermark` 0.9,
+`singleflight_shards` 64,
+`bypass_admission` false (bench/tooling only),
 and `skip_recovery_scan_if_no_meta` false (set from the public
 `skip_recovery_scan` config flag; production keeps it false so partial recovery
 runs).
@@ -519,10 +518,10 @@ bufferpool `Backing`.
 
 **Disk lifecycle** (`disks/`): `trait DiskTarget { open(spec, pin) ->
 (Handle, PageChannel) }`, with `UringDiskTarget` in production (runs the disk on
-a pinned storage core) and a mock for tests. `DiskRegistrySet<T>` is seeded with
-the plan's disjoint NVMe `DiskCpuSlot`s, keeps those slots globally disjoint
-across per-cache registries, and `reconcile(desired)` closes missing paths, opens
-new ones, and treats any spec drift (kind/numa/size/queue_depth/page_size/
+a pinned storage core) and a mock for tests. `DiskRegistry<T>` is seeded with
+the plan's disjoint NVMe `DiskCpuSlot`s. `reconcile(desired)` closes missing
+paths, opens new ones, and treats any spec drift
+(kind/numa/size/queue_depth/page_size/
 skip_recovery_scan) as a remove + add.
 `assign_disk_cpus` keeps survivors on their physical pin (preserving the
 disjoint-CPU invariant and idempotence under churn) and assigns new disks

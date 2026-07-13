@@ -114,7 +114,7 @@ pub async fn build_internal_cache<B: BlockDevice>(
             Err(_) => continue,
         }
 
-        match page::decode(buf.as_slice()) {
+        match page::decode(buf.as_mut_slice()) {
             Decoded::Internal { keys, children, .. } if keys.len() == children.len() => {
                 if remaining_depth > 1 {
                     for &child in &children {
@@ -161,7 +161,7 @@ async fn internal_depth<B: BlockDevice>(
             Err(e) if strict => return Err(e),
             Err(_) => return Ok(depth),
         }
-        match page::decode(buf.as_slice()) {
+        match page::decode(buf.as_mut_slice()) {
             Decoded::Internal { children, .. } if !children.is_empty() => {
                 depth += 1;
                 cur = children[0];
@@ -208,7 +208,7 @@ pub async fn lookup<B: BlockDevice>(
             Ok(()) => {}
             Err(_) => return Ok(None),
         }
-        match page::decode(buf.as_slice()) {
+        match page::decode(buf.as_mut_slice()) {
             Decoded::Empty => return Ok(None),
             Decoded::Leaf { entries, .. } => {
                 for (k, v) in entries {
@@ -297,7 +297,7 @@ where
         if device.read(node, buf.as_mut_slice()).await.is_err() {
             continue;
         }
-        let decoded = page::decode(buf.as_slice());
+        let decoded = page::decode(buf.as_mut_slice());
         if let Decoded::Internal { ref children, .. } = decoded {
             for &c in children {
                 stack.push(c);
@@ -544,7 +544,7 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
             let decoded = {
                 let mut buf = self.scratch.acquire().await;
                 self.device.read(node_lba, buf.as_mut_slice()).await?;
-                page::decode(buf.as_slice())
+                page::decode(buf.as_mut_slice())
             };
 
             match decoded {

@@ -77,7 +77,8 @@ RUN mkdir -p /disk/grub /disk/cloud-init && \
     cp /artifacts/vmlinuz /artifacts/initrd /artifacts/init.cpio /disk/ && \
 	if [ "${TARGETARCH}" = "amd64" ]; then \
 		cp /artifacts/shimx64.efi /artifacts/grubx64.efi /disk/ && \
-		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: shimx64.efi" > /disk/metadata.yaml; \
+		cp /artifacts/shimx64.efi /disk/bootx64.efi && \
+		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: bootx64.efi" > /disk/metadata.yaml; \
 	elif [ "${TARGETARCH}" = "arm64" ]; then \
 		cp /artifacts/shimaa64.efi /artifacts/grubaa64.efi /disk/ && \
 		printf '%s\n' "dhcpBootImageName: shimaa64.efi" "httpBootPath: shimaa64.efi" > /disk/metadata.yaml; \
@@ -85,6 +86,7 @@ RUN mkdir -p /disk/grub /disk/cloud-init && \
 
 COPY images/netboot/assets/grub.cfg.tmpl /disk/grub/grub.cfg.tmpl
 COPY images/netboot/assets/meta-data.tmpl /disk/cloud-init/meta-data.tmpl
+COPY images/netboot/assets/network-config.tmpl /disk/cloud-init/network-config.tmpl
 COPY images/netboot/assets/vendor-data.tmpl /disk/cloud-init/vendor-data.tmpl
 
 FROM scratch

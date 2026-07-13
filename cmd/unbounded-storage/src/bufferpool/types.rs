@@ -32,10 +32,6 @@ pub struct BulkRef {
     pub len: u32,
 }
 
-/// Opaque tracing handle. The pool does not inspect it.
-#[derive(Clone, Debug, Default)]
-pub struct TraceCtx;
-
 /// Pool tunables. Most of the design's TODO knobs are still TBD;
 /// see `designs/bufferpool.md` "TODO(config)".
 #[derive(Clone, Debug)]

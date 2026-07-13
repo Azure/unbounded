@@ -16,7 +16,7 @@ use std::time::Duration;
 use clap::Parser;
 
 use unbounded_storage::backend::{BackendRegistry, OriginRing};
-use unbounded_storage::bufferpool::{Pool, PoolConfig, ShardDescriptor, StripeKey};
+use unbounded_storage::bufferpool::{Pool, PoolConfig};
 use unbounded_storage::config::{
     self, BackendSpec, Config, FrontendSpec, ResolvedFrontendBinding, frontend_spec,
 };
@@ -28,15 +28,15 @@ use unbounded_storage::frontend::{
     HttpDriver, HttpFrontend, LoadgenDriver, LoadgenFrontend, S3Driver, S3Frontend,
 };
 use unbounded_storage::p2p::{
-    FingerTable, FingerTableConfig, NodeId, PeerEntry, RouteTableHandle, RouteTableSnapshot,
-    RoutedTransport, RoutingSnapshot, TopologyPrefixWeight, TopologySelection, TopologyTags,
-    TopologyWeighting, node_to_ring,
+    FingerTable, FingerTableConfig, PeerEntry, RouteTableHandle, RouteTableSnapshot,
+    RoutedTransport, TopologyPrefixWeight, TopologySelection, TopologyTags, TopologyWeighting,
+    node_to_ring,
 };
 use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
 use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{
-    CacheDirectorySet, ChainLocalStore, DiskRegistrySet, UringDiskTarget,
+    CacheDirectorySet, ChainLocalStore, DiskRegistry, UringDiskTarget,
 };
 use unbounded_storage::topology::{CorePlan, CorePlanConfig, DiskCpuSlot, Host, ServingShard};
 
@@ -49,7 +49,6 @@ mod shard_layer;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
-const SHARED_DISK_REGISTRY_ID: &str = "shared";
 
 /// Stripe granularity used to build an inert origin backend on shards
 /// that have no configured backend. Such a backend is never exercised
@@ -408,7 +407,7 @@ fn main() -> ExitCode {
             numa: core.numa,
         })
         .collect();
-    let mut disk_registry = DiskRegistrySet::new(UringDiskTarget::new(runtime.clone()), disk_slots);
+    let mut disk_registry = DiskRegistry::new(UringDiskTarget::new(runtime.clone()), disk_slots);
 
     // Bring up the initial shard layer. A bring-up failure is fatal:
     // there is no running process to reconcile into.
@@ -702,7 +701,7 @@ fn run_shard(
         Ok(t) => t,
         Err(e) => {
             let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: RoutedTransport::new: {e}",
+                "worker={}: RoutedTransport::with_routes: {e}",
                 widx.0,
             )));
             return;
@@ -783,10 +782,7 @@ fn run_shard(
     // reverse declaration order; the shared `fabric` is released by the
     // `FabricGroup`, not here).
     let _ = tx.send(ShardReady::Up {
-        descriptor: ShardDescriptor {
-            worker_idx: widx,
-            numa: shard.numa,
-        },
+        worker_idx: widx,
         publish: ShardPublish {
             backing_base: backing_base as usize,
             backing_len,
@@ -888,7 +884,7 @@ fn run_shard(
     // Control-drain tick hook: applies live config changes on this
     // shard's own thread so all `!Send` per-shard state stays
     // thread-local. Each `ShardCommand::ApplyConfig` republishes the
-    // routing surface through this shard's `RoutingHandle` (observed
+    // routing surface through this shard's `RouteTableHandle` (observed
     // atomically by its transport; the fabric RPC handlers are reloaded
     // separately by the `FabricGroup`), refreshes the stripe geometry,
     // reconciles the transport origin-backend registry and the frontend
@@ -1110,7 +1106,8 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
     let projection = config::runtime_projection(config).expect("loaded config projects to runtime");
     if projection.caches.is_empty() {
         return RouteTableSnapshot {
-            routes: HashMap::new(),
+            cache_ids: HashSet::new(),
+            fingers: None,
         };
     }
 
@@ -1120,12 +1117,6 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
         ring: node_to_ring(mesh.self_node_id),
         tags: TopologyTags(mesh.self_tags.clone()),
     };
-    let node_to_peer: HashMap<NodeId, unbounded_storage::fabric::PeerId> = mesh
-        .peers
-        .iter()
-        .map(|peer| (peer.node_id, peer.fabric_peer_id))
-        .collect();
-    let node_to_peer = Arc::new(node_to_peer);
     let fingers = if let Some(plan) = &mesh.routing_plan {
         let peer_by_name: HashMap<&str, &config::RuntimePeer> = mesh
             .peers
@@ -1172,20 +1163,10 @@ fn build_routes(config: &Config) -> RouteTableSnapshot {
             },
         ))
     };
-    let routes = projection
-        .caches
-        .keys()
-        .map(|id| {
-            (
-                id.clone(),
-                RoutingSnapshot {
-                    fingers: fingers.clone(),
-                    node_to_peer: node_to_peer.clone(),
-                },
-            )
-        })
-        .collect();
-    RouteTableSnapshot { routes }
+    RouteTableSnapshot {
+        cache_ids: projection.caches.keys().cloned().collect(),
+        fingers: Some(fingers),
+    }
 }
 
 fn p2p_topology_weighting(weighting: &config::TopologyWeighting) -> TopologyWeighting {
@@ -1202,17 +1183,16 @@ fn p2p_topology_weighting(weighting: &config::TopologyWeighting) -> TopologyWeig
 }
 
 fn reconcile_cache_disks(
-    disk_registry: &mut DiskRegistrySet<UringDiskTarget>,
+    disk_registry: &mut DiskRegistry<UringDiskTarget>,
     cache_directories: &CacheDirectorySet,
     projection: &config::RuntimeGraph,
 ) {
     let mut cache_ids: Vec<String> = projection.caches.keys().cloned().collect();
     cache_ids.sort();
-    disk_registry.reconcile_ids([SHARED_DISK_REGISTRY_ID.to_string()]);
     cache_directories.reconcile(cache_ids.iter().cloned());
 
     let disks = config::runtime_disks(projection);
-    let report = disk_registry.reconcile_cache(SHARED_DISK_REGISTRY_ID, &disks);
+    let report = disk_registry.reconcile(&disks);
     eprintln!(
         "config: shared disks: added={} removed={} failures={}",
         report.added,
@@ -1223,19 +1203,10 @@ fn reconcile_cache_disks(
         eprintln!("disk {}: open failed: {msg}", path.display());
     }
 
-    let channels = disk_registry.channels_snapshot(SHARED_DISK_REGISTRY_ID);
+    let channels = disk_registry.channels_snapshot();
     for cache_id in cache_ids {
         cache_directories.apply_channels(&cache_id, channels.clone());
     }
-}
-
-/// Hash a `StripeKey` into a shard index. Delegates to the library
-/// [`unbounded_storage::fanout::owner_shard`] so the binary's
-/// `PoolGroup` router and the library frontend's fan-out path share one
-/// ownership function. The modulus is the shard count; `shard_count` is
-/// asserted non-zero by `PoolGroup::new`.
-fn stripe_key_to_shard(key: &StripeKey, shard_count: usize) -> usize {
-    unbounded_storage::fanout::owner_shard(key, shard_count)
 }
 
 /// Validate and log the configured backends.
@@ -1494,7 +1465,7 @@ impl config::reconcile::FrontendReconcileTarget for FrontendRegistry {
 /// failed during bring-up.
 enum ShardReady {
     Up {
-        descriptor: ShardDescriptor,
+        worker_idx: WorkerIdx,
         /// Cross-shard fan-out endpoints this shard exposes: its
         /// registered backing region and the channel to its fetch
         /// service. The layer collects these from every shard and
@@ -1534,8 +1505,7 @@ struct ShardPublish {
 
 /// One entry in the broadcast peer list every shard receives in phase B.
 /// `shard_index` is the position in the worker-index-sorted shard order,
-/// matching [`stripe_key_to_shard`] and the process `PoolGroup` so
-/// ownership indices are consistent across the data path.
+/// which keeps ownership indices consistent across the fan-out data path.
 struct PeerPublish {
     shard_index: usize,
     worker_idx: WorkerIdx,

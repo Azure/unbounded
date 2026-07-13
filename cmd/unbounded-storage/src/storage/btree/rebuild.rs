@@ -69,7 +69,7 @@ pub async fn scan_for_leaves<B: BlockDevice>(
         if device.read(Lba(lba), buf.as_mut_slice()).await.is_err() {
             continue;
         }
-        if let Decoded::Leaf { txn_id, entries } = page::decode(buf.as_slice()) {
+        if let Decoded::Leaf { txn_id, entries } = page::decode(buf.as_mut_slice()) {
             match txn_id.cmp(&best_txn) {
                 Ordering::Greater => {
                     best_txn = txn_id;

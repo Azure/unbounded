@@ -212,7 +212,7 @@ type BastionSSHSpec struct {
 	PrivateKeyRef *SecretKeySelector `json:"privateKeyRef,omitempty"`
 }
 
-// DHCPLease defines a static DHCP lease for PXE booting.
+// DHCPLease defines static IPv4 provisioning network settings.
 type DHCPLease struct {
 	// IPv4 is the IP address to assign.
 	IPv4 string `json:"ipv4"`
@@ -293,7 +293,9 @@ type PXESpec struct {
 	// +optional
 	BootProtocol string `json:"bootProtocol,omitempty"`
 
-	// DHCPLeases defines static DHCP leases for PXE booting.
+	// DHCPLeases defines static IPv4 provisioning network settings. PXE boot
+	// uses them as DHCP leases. HTTP boot uses the first entry to configure the
+	// Redfish UEFI HTTP boot client.
 	// +optional
 	DHCPLeases []DHCPLease `json:"dhcpLeases,omitempty"`
 
