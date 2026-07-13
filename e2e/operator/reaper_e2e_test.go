@@ -216,6 +216,10 @@ func stageTargetWorkloads(ctx context.Context, t *testing.T, cli client.Client) 
 	mustCreate(ctx, t, cli, readyDaemonSet(targetNS, "unbounded-net-node"))
 	mustCreate(ctx, t, cli, readyDaemonSet(targetNS, "unbounded-storage-supervisor-cluster"))
 	mustCreate(ctx, t, cli, readyDaemonSet(targetNS, "unbounded-storage-supervisor-edge"))
+	// The per-site metalman replacement must exist before the legacy metalman is
+	// reaped (presence gate; metalman is hostNetwork like net and cannot become
+	// Ready until the legacy one frees the host ports).
+	mustCreate(ctx, t, cli, readyDeployment(targetNS, "metalman-controller-edge"))
 }
 
 // ---------------------------------------------------------------------------

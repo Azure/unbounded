@@ -27,7 +27,6 @@ func TestInstallCommandFlags(t *testing.T) {
 		"operator-image",
 		"metalman-image",
 		"api-server-endpoint",
-		"skip-crds",
 		"wait",
 		"timeout",
 	} {
@@ -40,6 +39,9 @@ func TestInstallCommandFlags(t *testing.T) {
 		"net-node-image",
 		"machina-image",
 		"storage-supervisor-image",
+		// CRDs are now owned by the operator (BootstrapCRDs); install no longer
+		// applies them, so --skip-crds is gone.
+		"skip-crds",
 	} {
 		require.Nil(t, cmd.Flags().Lookup(name), "flag %s should be removed", name)
 	}
@@ -88,9 +90,31 @@ func TestInstallHandlerApplyBootstrapManifests(t *testing.T) {
 	}
 
 	require.NoError(t, h.execute(context.Background()))
-	require.Contains(t, applied, "sites.unbounded-cloud.io")
-	require.Contains(t, applied, "gatewaypools.net.unbounded-cloud.io")
+	// install applies only the operator manifests; CRDs are installed by the
+	// operator at startup (BootstrapCRDs), so install must NOT apply them.
 	require.Contains(t, applied, "unbounded-operator")
+	require.Contains(t, applied, "unbounded-operator-config")
+	require.NotContains(t, applied, "sites.unbounded-cloud.io")
+	require.NotContains(t, applied, "gatewaypools.net.unbounded-cloud.io")
+}
+
+func TestMutateOperatorObjectWritesConfigEndpoint(t *testing.T) {
+	t.Parallel()
+
+	h := &installHandler{namespace: "unbounded-system", apiServerEndpoint: "https://api.example.test:6443"}
+
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]any{"name": "unbounded-operator-config", "namespace": "unbounded-system"},
+		"data":       map[string]any{"UNBOUNDED_API_SERVER_ENDPOINT": ""},
+	}}
+
+	require.NoError(t, h.mutateOperatorObject(obj))
+
+	got, _, err := unstructured.NestedString(obj.Object, "data", "UNBOUNDED_API_SERVER_ENDPOINT")
+	require.NoError(t, err)
+	require.Equal(t, "https://api.example.test:6443", got)
 }
 
 func TestMutateOperatorObjectRetargetsNamespace(t *testing.T) {

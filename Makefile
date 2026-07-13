@@ -65,7 +65,6 @@ UNBOUNDED_OPERATOR_BIN=bin/unbounded-operator
 UNBOUNDED_OPERATOR_CMD=./cmd/unbounded-operator
 UNBOUNDED_OPERATOR_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-operator:$(VERSION)
 UNBOUNDED_OPERATOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
-UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
 UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
 UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-operator/rendered
 
@@ -1016,8 +1015,7 @@ unbounded-operator-manifests: ## Render unbounded-operator manifests into deploy
 		--output-dir $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(UNBOUNDED_OPERATOR_NAMESPACE) \
 		--set OperatorImage=$(UNBOUNDED_OPERATOR_IMAGE) \
-		--set MetalmanImage=$(METALMAN_IMAGE) \
-		--set APIServerEndpoint=$(UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT)
+		--set MetalmanImage=$(METALMAN_IMAGE)
 	@echo "Rendered unbounded-operator manifests into $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_OPERATOR_IMAGE))"
 
 machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/machine-ops/rendered

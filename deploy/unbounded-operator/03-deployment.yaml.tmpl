@@ -31,7 +31,11 @@ spec:
             - --leader-elect-namespace={{ default "unbounded-system" .Namespace }}
             - --namespace={{ default "unbounded-system" .Namespace }}
             - --metalman-image={{ .MetalmanImage }}
-            - --api-server-endpoint={{ default "" .APIServerEndpoint }}
+          envFrom:
+            # Environment-specific operator settings (api-server-endpoint, reaper
+            # toggle). See deploy/unbounded-operator/04-configmap.yaml.tmpl.
+            - configMapRef:
+                name: unbounded-operator-config
           env:
             - name: POD_NAMESPACE
               valueFrom:

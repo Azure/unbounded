@@ -26,6 +26,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
@@ -197,6 +198,12 @@ func componentConditionType(component string) string {
 func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&unboundedv1alpha3.Site{}).
+		// Site status is written by the net controller (nodeCount/sliceCount) on
+		// node churn; reconciling on those status-only updates would re-apply the
+		// full net + machina manifest sets on every event. Filter to spec/
+		// generation changes (Create/Delete still pass) so component reconcile is
+		// driven by intent, not status noise.
+		WithEventFilter(predicate.GenerationChangedPredicate{}).
 		Complete(r)
 }
 
@@ -248,7 +255,7 @@ func (r *SiteReconciler) reconcileNet(ctx context.Context) componentResult {
 		return componentResult{ready: true, reason: reasonNoSites, message: "no sites; net retained"}
 	}
 
-	if err := r.applyManifestFS(ctx, netmanifests.Manifests, nil); err != nil {
+	if err := r.applyManifestFS(ctx, netmanifests.Manifests, skipCRDObjects); err != nil {
 		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error()}
 	}
 
@@ -587,36 +594,70 @@ func (r *SiteReconciler) retargetNamespace(obj *unstructured.Unstructured) {
 		obj.SetNamespace(ns)
 	}
 
-	rewriteStringValues(obj.Object, buildDefaultNamespace, ns)
+	rewriteNamespaceValues(obj.Object, buildDefaultNamespace, ns)
 }
 
-// rewriteStringValues recursively replaces every string value equal to oldValue
-// with newValue, so embedded cross-references (RBAC subjects, webhook client
-// configs, config-map references) follow a retargeted namespace.
-func rewriteStringValues(value any, oldValue, newValue string) {
+// rewriteNamespaceValues recursively retargets every string value that embeds the
+// old namespace to the new one. Unlike a naive equality swap it also handles the
+// namespace appearing as a substring, which the rendered manifests rely on:
+//   - service-account usernames in ValidatingAdmissionPolicy CEL
+//     ("system:serviceaccount:<ns>:<sa>"), and
+//   - flag values ("--leader-elect-resource-namespace=<ns>").
+//
+// Runtime re-rendering of the templates is not an option here because the
+// component image references are baked into the rendered manifests at build time
+// and are not available to the operator process.
+func rewriteNamespaceValues(value any, oldNS, newNS string) {
 	switch typed := value.(type) {
 	case map[string]any:
 		for key, v := range typed {
-			if str, ok := v.(string); ok && str == oldValue {
-				typed[key] = newValue
+			if str, ok := v.(string); ok {
+				typed[key] = retargetNamespaceInString(str, oldNS, newNS)
 				continue
 			}
 
-			rewriteStringValues(v, oldValue, newValue)
+			rewriteNamespaceValues(v, oldNS, newNS)
 		}
 	case []any:
 		for i, v := range typed {
-			if str, ok := v.(string); ok && str == oldValue {
-				typed[i] = newValue
+			if str, ok := v.(string); ok {
+				typed[i] = retargetNamespaceInString(str, oldNS, newNS)
 				continue
 			}
 
-			rewriteStringValues(v, oldValue, newValue)
+			rewriteNamespaceValues(v, oldNS, newNS)
 		}
 	}
 }
 
+// retargetNamespaceInString rewrites the old namespace to the new one within a
+// single string value, covering exact matches, service-account usernames, and
+// flag values, while leaving unrelated strings (for example image references)
+// untouched.
+func retargetNamespaceInString(s, oldNS, newNS string) string {
+	if s == oldNS {
+		return newNS
+	}
+
+	if strings.Contains(s, "system:serviceaccount:"+oldNS+":") {
+		s = strings.ReplaceAll(s, "system:serviceaccount:"+oldNS+":", "system:serviceaccount:"+newNS+":")
+	}
+
+	if strings.HasPrefix(s, "--") && strings.HasSuffix(s, "="+oldNS) {
+		s = strings.TrimSuffix(s, "="+oldNS) + "=" + newNS
+	}
+
+	return s
+}
+
 func (r *SiteReconciler) mutateMachinaObject(obj *unstructured.Unstructured) error {
+	// CRDs are installed once at operator startup (BootstrapCRDs), not from the
+	// reconcile loop; skip them here so a Site event does not re-apply schemas.
+	if obj.GetKind() == crdKind {
+		obj.Object = nil
+		return nil
+	}
+
 	// Metalman RBAC ships in the machina manifests but is applied per-site by
 	// reconcileMetalman; skip it here so the singleton apply does not create it.
 	if isMetalmanSupportObject(obj) {
@@ -634,6 +675,17 @@ func (r *SiteReconciler) mutateMachinaObject(obj *unstructured.Unstructured) err
 		if err := unstructured.SetNestedField(obj.Object, updated, "data", "config.yaml"); err != nil {
 			return fmt.Errorf("set machina config data: %w", err)
 		}
+	}
+
+	return nil
+}
+
+// skipCRDObjects nils out CustomResourceDefinition objects so the reconcile
+// loop never applies CRDs; the operator installs them once at startup via
+// BootstrapCRDs.
+func skipCRDObjects(obj *unstructured.Unstructured) error {
+	if obj.GetKind() == crdKind {
+		obj.Object = nil
 	}
 
 	return nil

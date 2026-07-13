@@ -1,0 +1,29 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+---
+# unbounded-operator-config holds the environment-specific operator settings that
+# used to be passed as `kubectl unbounded install` flags. It is surfaced to the
+# operator Deployment via envFrom, and each operator flag defaults from the
+# matching env var (an explicit flag still overrides). Edit this ConfigMap and
+# then `kubectl rollout restart deployment/unbounded-operator` to apply changes:
+# env is read once at pod start.
+#
+# Release-baked settings (operator image, component images, metalman image) are
+# NOT here; they are version-matched into the manifests at build time.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-operator-config
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-operator
+    app.kubernetes.io/component: controller
+data:
+  # External Kubernetes API endpoint advertised to provisioned machines. Remote
+  # nodes dial this to join, so it must be reachable from outside the cluster and
+  # cannot be derived in-cluster. Set this before enabling machina provisioning.
+  UNBOUNDED_API_SERVER_ENDPOINT: ""
+  # Whether the operator translates legacy net-group Sites, migrates state into
+  # this namespace, and reaps the pre-consolidation namespaces.
+  UNBOUNDED_REAP_LEGACY_RESOURCES: "true"

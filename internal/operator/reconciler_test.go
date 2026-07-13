@@ -390,6 +390,92 @@ func TestRetargetNamespaceRewritesToCustomNamespace(t *testing.T) {
 	}
 }
 
+// Finding 4: retargeting a custom namespace must also rewrite the namespace
+// where it appears as a substring - service-account usernames in VAP CEL and
+// flag values - while leaving unrelated strings (image refs) untouched.
+func TestRetargetNamespaceRewritesServiceAccountAndArgs(t *testing.T) {
+	r := &SiteReconciler{Namespace: "custom-ns"}
+
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "admissionregistration.k8s.io/v1",
+		"kind":       "ValidatingAdmissionPolicy",
+		"metadata":   map[string]any{"name": "p"},
+		"spec": map[string]any{
+			"matchConditions": []any{
+				map[string]any{"expression": "request.userInfo.username == 'system:serviceaccount:unbounded-system:unbounded-net-controller'"},
+			},
+			"args":  []any{"--leader-elect-resource-namespace=unbounded-system"},
+			"image": "ghcr.io/azure/unbounded-system:v1",
+		},
+	}}
+
+	r.retargetNamespace(obj)
+
+	conds, _, _ := unstructured.NestedSlice(obj.Object, "spec", "matchConditions")
+	gotExpr := conds[0].(map[string]any)["expression"].(string)
+
+	if gotExpr != "request.userInfo.username == 'system:serviceaccount:custom-ns:unbounded-net-controller'" {
+		t.Fatalf("SA username not rewritten: %q", gotExpr)
+	}
+
+	args, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "args")
+	if len(args) != 1 || args[0] != "--leader-elect-resource-namespace=custom-ns" {
+		t.Fatalf("flag value not rewritten: %v", args)
+	}
+
+	if img, _, _ := unstructured.NestedString(obj.Object, "spec", "image"); img != "ghcr.io/azure/unbounded-system:v1" {
+		t.Fatalf("image ref must not be rewritten, got %q", img)
+	}
+}
+
+func TestRetargetNamespaceInString(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"unbounded-system", "custom-ns"},
+		{"system:serviceaccount:unbounded-system:sa", "system:serviceaccount:custom-ns:sa"},
+		{"--leader-elect-resource-namespace=unbounded-system", "--leader-elect-resource-namespace=custom-ns"},
+		{"ghcr.io/azure/unbounded-system:v1", "ghcr.io/azure/unbounded-system:v1"},
+		{"unbounded-system-other", "unbounded-system-other"},
+	}
+
+	for _, tc := range cases {
+		if got := retargetNamespaceInString(tc.in, "unbounded-system", "custom-ns"); got != tc.want {
+			t.Fatalf("retargetNamespaceInString(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Finding 3: the reconcile loop never applies CRDs (the operator installs them
+// once at startup via BootstrapCRDs).
+func TestSkipCRDObjects(t *testing.T) {
+	crd := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiextensions.k8s.io/v1",
+		"kind":       "CustomResourceDefinition",
+		"metadata":   map[string]any{"name": "sites.unbounded-cloud.io"},
+	}}
+
+	if err := skipCRDObjects(crd); err != nil {
+		t.Fatalf("skipCRDObjects: %v", err)
+	}
+
+	if crd.Object != nil {
+		t.Fatal("expected CRD object nilled out")
+	}
+
+	other := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "x"},
+	}}
+
+	if err := skipCRDObjects(other); err != nil {
+		t.Fatalf("skipCRDObjects: %v", err)
+	}
+
+	if other.Object == nil {
+		t.Fatal("non-CRD object must be preserved")
+	}
+}
+
 func assertSiteOwnerRef(t *testing.T, refs []metav1.OwnerReference, siteName, uid string) {
 	t.Helper()
 

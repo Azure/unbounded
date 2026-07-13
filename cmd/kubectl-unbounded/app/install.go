@@ -24,8 +24,6 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	machinamanifests "github.com/Azure/unbounded/deploy/machina"
-	netmanifests "github.com/Azure/unbounded/deploy/net"
 	operatormanifests "github.com/Azure/unbounded/deploy/unbounded-operator"
 	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/unbounded"
@@ -41,9 +39,8 @@ type installHandler struct {
 	metalmanImage     string
 	apiServerEndpoint string
 
-	skipCRDs bool
-	wait     bool
-	timeout  time.Duration
+	wait    bool
+	timeout time.Duration
 
 	kubeCli          kubernetes.Interface
 	kubeResourcesCli client.Client
@@ -77,7 +74,6 @@ func addInstallFlags(cmd *cobra.Command, handler *installHandler) {
 	cmd.Flags().StringVar(&handler.operatorImage, "operator-image", "", "unbounded-operator image override")
 	cmd.Flags().StringVar(&handler.metalmanImage, "metalman-image", "", "metalman image override")
 	cmd.Flags().StringVar(&handler.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint advertised to provisioned machines; defaults to the kubeconfig server")
-	cmd.Flags().BoolVar(&handler.skipCRDs, "skip-crds", false, "Skip applying CRDs")
 	cmd.Flags().BoolVar(&handler.wait, "wait", true, "Wait for unbounded-operator rollout")
 	cmd.Flags().DurationVar(&handler.timeout, "timeout", defaultInstallTimeout, "Timeout for rollout waits")
 }
@@ -115,28 +111,20 @@ func (h *installHandler) execute(ctx context.Context) error {
 		h.apiServerEndpoint = h.restConfig.Host
 	}
 
-	if !h.skipCRDs {
-		if err := applyManifestFS(ctx, h.logger, h.kubeResourcesCli, machinamanifests.Manifests, fieldManagerID, mutateCRDOnly); err != nil {
-			return fmt.Errorf("applying machina CRDs: %w", err)
-		}
-
-		if err := applyManifestFS(ctx, h.logger, h.kubeResourcesCli, netmanifests.Manifests, fieldManagerID, mutateCRDOnly); err != nil {
-			return fmt.Errorf("applying net CRDs: %w", err)
-		}
-
-		if h.wait {
-			if err := h.waitForCRDs(ctx); err != nil {
-				return err
-			}
-		}
-	}
-
+	// CRDs are installed and upgraded by the operator itself at startup
+	// (operator.BootstrapCRDs). install only bootstraps the operator; applying
+	// the operator manifests and waiting for its rollout is enough, because the
+	// operator becomes Ready only after it has established the CRDs.
 	if err := applyManifestFS(ctx, h.logger, h.kubeResourcesCli, operatormanifests.Manifests, fieldManagerID, h.mutateOperatorObject); err != nil {
 		return fmt.Errorf("applying unbounded-operator manifests: %w", err)
 	}
 
 	if h.wait {
 		if err := h.waitForOperator(ctx); err != nil {
+			return err
+		}
+
+		if err := h.waitForCRDs(ctx); err != nil {
 			return err
 		}
 	}
@@ -176,6 +164,15 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 	rewriteNamespace(obj, unbounded.SystemNamespace(), h.namespace)
 	setNamespace(obj, h.namespace)
 
+	// The api-server-endpoint is delivered to the operator via the
+	// unbounded-operator-config ConfigMap (envFrom), not a Deployment arg, so
+	// install and the apply-only path share one config surface.
+	if obj.GetKind() == "ConfigMap" && obj.GetName() == "unbounded-operator-config" && h.apiServerEndpoint != "" {
+		if err := unstructured.SetNestedField(obj.Object, h.apiServerEndpoint, "data", "UNBOUNDED_API_SERVER_ENDPOINT"); err != nil {
+			return fmt.Errorf("set operator config api-server-endpoint: %w", err)
+		}
+	}
+
 	if obj.GetKind() == "Deployment" && obj.GetName() == "unbounded-operator" {
 		if err := setContainerImage(obj, "controller", h.operatorImage); err != nil {
 			return err
@@ -188,7 +185,6 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 			{prefix: "--leader-elect-namespace=", value: h.namespace},
 			{prefix: "--namespace=", value: h.namespace},
 			{prefix: "--metalman-image=", value: h.metalmanImage},
-			{prefix: "--api-server-endpoint=", value: h.apiServerEndpoint},
 		} {
 			if err := replaceContainerArg(obj, "controller", replacement.prefix, replacement.value); err != nil {
 				return err
@@ -385,14 +381,6 @@ func yamlFiles(fsys fs.FS) ([]string, error) {
 	sort.Strings(files)
 
 	return files, nil
-}
-
-func mutateCRDOnly(obj *unstructured.Unstructured) error {
-	if obj.GetKind() != "CustomResourceDefinition" {
-		obj.Object = nil
-	}
-
-	return nil
 }
 
 func setNamespace(obj *unstructured.Unstructured, namespace string) {
