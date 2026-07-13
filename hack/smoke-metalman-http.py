@@ -322,7 +322,7 @@ def start_metalman_and_replace() -> None:
     for _ in range(300):
         disk_dirs = list(cache_dir.glob("*/amd64/disk"))
         host_ready = any((path / "disk.img.gz").is_file() for path in disk_dirs)
-        netboot_ready = any((path / "grubx64.efi").is_file() for path in disk_dirs)
+        netboot_ready = any((path / "bootx64.efi").is_file() for path in disk_dirs)
         if host_ready and netboot_ready:
             break
         time.sleep(1)
@@ -352,7 +352,7 @@ def assert_contract() -> None:
                     if entry["method"] == "PATCH" and entry["path"] == f"/redfish/v1/Systems/{VM}"]
     if not any(boot.get("BootSourceOverrideTarget") == "UefiHttp"
                and boot.get("BootSourceOverrideEnabled") == "Continuous"
-               and boot.get("HttpBootUri") == f"{SERVE_URL}/grubx64.efi" for boot in boot_patches):
+               and boot.get("HttpBootUri") == f"{SERVE_URL}/bootx64.efi" for boot in boot_patches):
         raise AssertionError(f"standard UefiHttp PATCH not recorded: {boot_patches}")
 
 

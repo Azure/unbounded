@@ -95,15 +95,19 @@ class State:
             try:
                 with subprocess.Popen(["mktemp", "-d"], stdout=subprocess.PIPE, text=True) as proc:
                     artifact_dir = Path(proc.communicate()[0].strip())
-                for path in (
-                    "shimx64.efi", "grubx64.efi", "vmlinuz", "initrd",
-                    "init.cpio", "grub/grub.cfg",
+                for path, url in (
+                    ("http-entrypoint.efi", boot_url),
+                    ("grubx64.efi", f"{base_url}/grubx64.efi"),
+                    ("vmlinuz", f"{base_url}/vmlinuz"),
+                    ("initrd", f"{base_url}/initrd"),
+                    ("init.cpio", f"{base_url}/init.cpio"),
+                    ("grub/grub.cfg", f"{base_url}/grub/grub.cfg"),
                 ):
                     target = artifact_dir / path
                     target.parent.mkdir(parents=True, exist_ok=True)
                     subprocess.run(
                         ["curl", "--fail", "--silent", "--show-error", "--interface", self.client_ip,
-                         "--output", str(target), f"{base_url}/{path}"],
+                         "--output", str(target), url],
                         check=True,
                     )
                 boundary = artifact_dir / "boundary.img"
@@ -114,7 +118,7 @@ class State:
                 subprocess.run(["mkfs.vfat", "-n", "HTTPBOOT", str(boundary)], check=True)
                 subprocess.run(["mmd", "-i", str(boundary), "::/EFI", "::/EFI/BOOT", "::/grub"], check=True)
                 for source, target in (
-                    ("shimx64.efi", "::/EFI/BOOT/BOOTX64.EFI"),
+                    ("http-entrypoint.efi", "::/EFI/BOOT/BOOTX64.EFI"),
                     ("grubx64.efi", "::/EFI/BOOT/grubx64.efi"),
                     ("vmlinuz", "::/vmlinuz"),
                     ("initrd", "::/initrd"),
