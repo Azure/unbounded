@@ -22,7 +22,7 @@ The container image is built from `images/gantry/Containerfile` via
 ```sh
 kubectl apply -f deploy/serviceaccount.yaml
 kubectl apply -f deploy/configmap.yaml
-# Operator: for any PRIVATE upstream registry, edit
+# Optional legacy shared-identity mode: edit
 # registry-secret.example.yaml (rename it, fill in real
 # username:password values keyed by registry `name:`) and apply,
 # AND uncomment the matching `credentials_path:` line in
@@ -37,6 +37,48 @@ kubectl apply -f deploy/daemonset.yaml
 # apply it as part of the initial install. See "Hardening overlays"
 # below for the workflow.
 ```
+
+### Requester-delegated registry authorization
+
+For a private HTTPS registry, the first unauthenticated digest request makes
+Gantry probe the configured upstream `/v2/` endpoint. Gantry validates and
+caches a `Basic` or `Bearer` challenge, returns it to containerd, and containerd
+retries the mirror using the credentials supplied by kubelet/CRI:
+
+- For `Bearer`, containerd exchanges the pull credential at the registry's
+   verified HTTPS token realm and sends Gantry only the scoped access token.
+- For `Basic`, containerd sends the Basic credential to Gantry directly.
+
+Gantry forwards the resulting request-scoped authorization through peer
+fetches and encrypted `please_pull` RPCs. A peer with the digest ignores it; a
+designated peer that must contact origin uses it for that request. Gantry never
+caches the credential or falls back to its own identity after rejection.
+
+Setting `credentials_path` explicitly opts that registry into the legacy
+shared-identity mode and skips requester challenge negotiation. Leave it unset
+to use containerd's pod/request credential. Anonymous HTTPS registries are
+detected by a `200` response from `/v2/` and continue without authentication.
+
+Peer transfer uses plaintext h2c on the cluster network. Forwarding Basic or
+Bearer authorization therefore requires a trusted, isolated network or an
+encryption layer such as a service mesh. Basic credentials may be longer-lived
+than Bearer tokens. The `please_pull` copy travels inside encrypted libp2p.
+
+#### Requester and puller on different nodes
+
+If the pod runs on node A but HRW selects node B as the designated origin
+puller, containerd on A first completes the Basic/Bearer challenge with its
+local Gantry agent. Gantry A then sends `please_pull` to Gantry B with the
+request-scoped `Authorization` value over encrypted libp2p. Gantry B ignores
+the credential if the digest is already local; otherwise it uses that exact
+credential for the HTTPS origin request. Node B does not need the pod's
+`imagePullSecret`, kubelet access, or separate registry credentials.
+
+`please_pull` acknowledges that background work started before the origin pull
+finishes. If origin later rejects the delegated credential on B, that 401
+cannot travel back through the completed RPC. No provider is advertised; A
+eventually retries or falls back to origin, where normal challenge negotiation
+can refresh the credential.
 
 ## Building the image locally
 

@@ -48,9 +48,10 @@
 #       * Storage backend health: `gantry_containerd_unavailable_total`
 #         and `gantry_containerd_open_error_total` flag containerd-side
 #         saturation independently of Gantry's CPU/memory.
-#   - The registry-credentials Secret is mounted read-only into
-#     /etc/gantry/registry; CredentialsPath in the agent config
-#     points at files inside it.
+#   - The optional fallback registry-credentials Secret is mounted read-only
+#     into /etc/gantry/registry; CredentialsPath in the agent config points at
+#     files inside it. Request-scoped Basic/Bearer challenge negotiation does
+#     not use this Secret; mounting it opts into legacy shared-identity mode.
 #
 # Apply with:
 #   kubectl apply -f deploy/serviceaccount.yaml

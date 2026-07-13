@@ -95,9 +95,11 @@ data:
     # Edit this list for each operator deployment. At least one
     # entry is required: origin.New fails fast on an empty list.
     #
-    # Credentials are OPTIONAL per entry. Omit credentials_path for
-    # public / anonymous registries (the default below). When you DO
-    # need credentials:
+    # Gantry discovers and relays the configured HTTPS registry's Basic or
+    # Bearer challenge so containerd can authenticate with the pull credential
+    # supplied by kubelet/CRI. credentials_path is OPTIONAL legacy
+    # shared-identity mode; setting it skips requester challenge negotiation.
+    # When you explicitly need shared Gantry credentials:
     #   1. apply deploy/registry-secret.example.yaml (renamed and
     #      filled in with your "username:password" pair, keyed by
     #      the registry's `name:` field below);
