@@ -16,6 +16,7 @@ on:
       - images/netboot/**
       - hack/metalman-redfish-fixture.py
       - hack/smoke-metalman-http.py
+      - hack/smoke-metalman.py
       - .github/workflows/smoke-metalman.yaml
   push:
     branches: [main]
@@ -30,6 +31,7 @@ on:
       - images/netboot/**
       - hack/metalman-redfish-fixture.py
       - hack/smoke-metalman-http.py
+      - hack/smoke-metalman.py
       - .github/workflows/smoke-metalman.yaml
   schedule:
     - cron: "0 7 * * *"
@@ -142,7 +144,7 @@ jobs:
 
   layered-http-smoke:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Free disk space
         run: |

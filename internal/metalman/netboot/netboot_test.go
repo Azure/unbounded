@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -1134,17 +1135,62 @@ func TestNetworkConfigTemplate_InvalidSubnetMask(t *testing.T) {
 	require.ErrorContains(t, err, "non-contiguous IPv4 subnet mask")
 }
 
-func TestNetworkConfigTemplate_InvalidDNS(t *testing.T) {
+func TestHTTPServer_NetworkConfigOmitsGatewayAndInvalidDNS(t *testing.T) {
 	networkTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "network-config.tmpl"))
 	require.NoError(t, err)
 
-	node := &v1alpha3.Machine{Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
-		IPv4: "10.0.1.20", MAC: "aa:bb:cc:dd:ee:20", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0",
-		DNS: []string{"not-an-address"},
-	}}}}}
+	const imageRef = "ghcr.io/test/netboot:v1"
 
-	_, err = renderTemplate(string(networkTmpl), newTemplateData(node, ClusterInfo{}, "", "", "10.0.1.20", true))
-	require.ErrorContains(t, err, `invalid IP address "not-an-address"`)
+	cache := setupOCICache(t, imageRef, "network-config", map[string][]byte{
+		"cloud-init/network-config.tmpl": networkTmpl,
+	})
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-on-link"},
+		Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+			IPv4: "10.0.1.20", MAC: "aa:bb:cc:dd:ee:20", SubnetMask: "255.255.255.0",
+			DNS: []string{"not-an-address", "10.0.1.53"},
+		}}}},
+	}
+	fc := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	server := &HTTPServer{FileResolver: FileResolver{
+		Cache: cache, Reader: fc, Cluster: &StaticClusterInfo{}, DefaultNetbootRef: imageRef,
+	}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", server.handleFile)
+
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	request, err := http.NewRequest(http.MethodGet, httpServer.URL+"/cloud-init/network-config", nil)
+	require.NoError(t, err)
+	request.Header.Set("X-Forwarded-For", "10.0.1.20")
+	response, err := http.DefaultClient.Do(request)
+	require.NoError(t, err)
+
+	defer response.Body.Close()
+
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+
+	var config struct {
+		Ethernets map[string]struct {
+			Addresses   []string `yaml:"addresses"`
+			Routes      []any    `yaml:"routes"`
+			Nameservers struct {
+				Addresses []string `yaml:"addresses"`
+			} `yaml:"nameservers"`
+		} `yaml:"ethernets"`
+	}
+	require.NoError(t, yaml.Unmarshal(body, &config), "rendered network configuration:\n%s", body)
+	provisioning := config.Ethernets["provisioning"]
+	require.Equal(t, []string{"10.0.1.20/24"}, provisioning.Addresses)
+	require.Empty(t, provisioning.Routes)
+	require.Equal(t, []string{"10.0.1.53"}, provisioning.Nameservers.Addresses)
 }
 
 func TestGrubTemplate_SelectsBootLeaseByRequestIP(t *testing.T) {

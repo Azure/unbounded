@@ -404,14 +404,15 @@ var (
 	}
 )
 
-func ipAddresses(values []string) ([]string, error) {
+func ipAddresses(values []string) []string {
+	result := make([]string, 0, len(values))
 	for _, value := range values {
-		if net.ParseIP(value) == nil {
-			return nil, fmt.Errorf("invalid IP address %q", value)
+		if net.ParseIP(value) != nil {
+			result = append(result, value)
 		}
 	}
 
-	return values, nil
+	return result
 }
 
 func subnetPrefix(mask string) (int, error) {

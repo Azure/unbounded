@@ -8,10 +8,12 @@ ethernets:
     dhcp6: false
     addresses:
       - {{ yamlQuote (printf "%s/%d" .BootLease.IPv4 (subnetPrefix .BootLease.SubnetMask)) }}
+{{- if .BootLease.Gateway }}
     routes:
       - to: default
         via: {{ yamlQuote .BootLease.Gateway }}
-{{- if .BootLease.DNS }}
+{{- end }}
+{{- if (ipAddresses .BootLease.DNS) }}
     nameservers:
       addresses:
 {{- range (ipAddresses .BootLease.DNS) }}

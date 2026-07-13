@@ -1092,6 +1092,7 @@ def main() -> None:
         "--cert", str(TMPDIR / "redfish.crt"),
         "--key", str(TMPDIR / "redfish.key"),
         "--record", str(TMPDIR / "redfish.jsonl"),
+        "--username", "", "--password", "smoke",
         "--manage-boot-order",
     ], TMPDIR / "redfish.log")
     log(f"  Redfish fixture PID={proc.pid}")

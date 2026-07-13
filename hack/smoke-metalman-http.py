@@ -98,8 +98,8 @@ def cleanup() -> None:
     for process in PROCS:
         try:
             os.killpg(process.pid, signal.SIGTERM)
-        except OSError:
-            pass
+        except OSError as exc:
+            log(f"Could not send SIGTERM to process group {process.pid}; continuing cleanup: {exc}")
     for process in PROCS:
         try:
             process.wait(timeout=5)
@@ -107,6 +107,7 @@ def cleanup() -> None:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except OSError:
+                # The process group may already have exited during teardown.
                 pass
     for args in (
         [*VIRSH, "destroy", VM],
@@ -181,16 +182,16 @@ def create_vm() -> tuple[Path, Path]:
     run(["truncate", "-s", "128M", str(blank_efi)])
     run(["mkfs.vfat", "-n", "HTTPBOOT", str(blank_efi)])
     shutil.copyfile(blank_efi, active_efi)
-    shutil.copyfile("/usr/share/OVMF/OVMF_VARS_4M.fd", nvram)
+    shutil.copyfile("/usr/share/OVMF/OVMF_VARS_4M.ms.fd", nvram)
     domain = TMP / "domain.xml"
     write(domain, f"""
         <domain type='kvm'>
           <name>{VM}</name><memory unit='MiB'>4096</memory><vcpu>2</vcpu>
           <os><type arch='x86_64' machine='q35'>hvm</type>
-            <loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE_4M.fd</loader>
+            <loader readonly='yes' secure='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE_4M.ms.fd</loader>
             <nvram>{nvram}</nvram>
           </os>
-          <features><acpi/><apic/></features><cpu mode='host-passthrough'/>
+          <features><acpi/><apic/><smm state='on'/></features><cpu mode='host-passthrough'/>
           <devices>
             <disk type='file' device='disk'><driver name='qemu' type='raw'/><source file='{active_efi}'/><target dev='vdb' bus='virtio'/><boot order='1'/></disk>
             <disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='{os_disk}'/><target dev='vda' bus='virtio'/><boot order='2'/></disk>
@@ -266,9 +267,10 @@ def start_fixture(blank_efi: Path, active_efi: Path) -> None:
          "-keyout", str(TMP / "redfish.key"), "-out", str(TMP / "redfish.crt")])
     spawn([sys.executable, str(ROOT / "hack/metalman-redfish-fixture.py"),
            "--domain", VM, "--mac", MAC, "--port", str(REDFISH_PORT),
-           "--cert", str(TMP / "redfish.crt"), "--key", str(TMP / "redfish.key"),
-           "--record", str(RECORD), "--efi-source", str(blank_efi),
-           "--efi-active", str(active_efi), "--bridge", BRIDGE, "--client-ip", NODE_IP],
+            "--cert", str(TMP / "redfish.crt"), "--key", str(TMP / "redfish.key"),
+            "--record", str(RECORD), "--efi-source", str(blank_efi),
+            "--efi-active", str(active_efi), "--bridge", BRIDGE,
+            "--cache-dir", str(TMP / "cache"), "--username", "smoke", "--password", "smoke"],
           "redfish.log")
     time.sleep(1)
 
@@ -319,11 +321,17 @@ def start_metalman_and_replace() -> None:
 
     log("Waiting for host and netboot OCI images to be cached")
     cache_dir = TMP / "cache" / "oci"
+    metalman_log = TMP / "metalman.log"
     for _ in range(300):
         disk_dirs = list(cache_dir.glob("*/amd64/disk"))
         host_ready = any((path / "disk.img.gz").is_file() for path in disk_dirs)
         netboot_ready = any((path / "bootx64.efi").is_file() for path in disk_dirs)
-        if host_ready and netboot_ready:
+        log_text = metalman_log.read_text(encoding="utf-8") if metalman_log.exists() else ""
+        host_published = any("OCI image cached" in line and f"image={HOST_IMAGE}" in line
+                             for line in log_text.splitlines())
+        netboot_published = any("OCI image cached" in line and f"image={NETBOOT_IMAGE}" in line
+                                for line in log_text.splitlines())
+        if host_ready and netboot_ready and host_published and netboot_published:
             break
         time.sleep(1)
     else:
@@ -351,9 +359,14 @@ def assert_contract() -> None:
     boot_patches = [entry["body"].get("Boot", {}) for entry in writes
                     if entry["method"] == "PATCH" and entry["path"] == f"/redfish/v1/Systems/{VM}"]
     if not any(boot.get("BootSourceOverrideTarget") == "UefiHttp"
-               and boot.get("BootSourceOverrideEnabled") == "Continuous"
-               and boot.get("HttpBootUri") == f"{SERVE_URL}/bootx64.efi" for boot in boot_patches):
+                and boot.get("BootSourceOverrideEnabled") == "Continuous"
+                and boot.get("BootSourceOverrideMode") == "UEFI"
+                and boot.get("HttpBootUri") == f"{SERVE_URL}/bootx64.efi" for boot in boot_patches):
         raise AssertionError(f"standard UefiHttp PATCH not recorded: {boot_patches}")
+    firmware_fetches = [entry for entry in writes if entry["method"] == "FIRMWARE_FETCH"]
+    if not any(entry["path"] == f"{SERVE_URL}/bootx64.efi"
+               and entry["body"] == {"source": NODE_IP} for entry in firmware_fetches):
+        raise AssertionError(f"state-derived post-power-on firmware fetch not recorded: {firmware_fetches}")
 
 
 def assert_guest_network() -> str:
@@ -362,6 +375,8 @@ def assert_guest_network() -> str:
         set -eu
         ip -4 address show | grep -F '{NODE_IP}/24'
         ip route show default | grep -F 'via {SERVER_IP}'
+        test "$(od -An -t u1 -j 4 -N 1 /sys/firmware/efi/efivars/SecureBoot-* | tr -d ' ')" = 1
+        test "$(od -An -t u1 -j 4 -N 1 /sys/firmware/efi/efivars/SetupMode-* | tr -d ' ')" = 0
         grep -R -F '{NODE_IP}/24' /etc/netplan /etc/cloud/cloud.cfg.d
         ! grep -R -E '(^|[^a-z])dhcp4:[[:space:]]*true' /etc/netplan /etc/cloud/cloud.cfg.d
         test ! -s /var/lib/dhcp/dhclient.leases
@@ -376,6 +391,13 @@ def assert_guest_network() -> str:
 
 
 def assert_no_dhcp() -> None:
+    guest_traffic = run(
+        ["sudo", "tcpdump", "-nn", "-r", str(PCAP), "ether", "src", MAC, "and", "not",
+         "(udp port 67 or udp port 68 or udp port 546 or udp port 547)"],
+        capture_output=True, text=True,
+    )
+    if not guest_traffic.stdout.strip():
+        raise AssertionError(f"packet capture contains no non-DHCP traffic from {MAC}")
     result = run(
         ["sudo", "tcpdump", "-nn", "-r", str(PCAP), "ether", "src", MAC, "and",
          "(udp port 67 or udp port 68 or udp port 546 or udp port 547)"],

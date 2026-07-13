@@ -13,8 +13,9 @@ DHCP-free UEFI HTTP boot.
 from __future__ import annotations
 
 import argparse
+import base64
+import hmac
 import json
-import os
 import shutil
 import ssl
 import subprocess
@@ -44,8 +45,10 @@ class State:
         self.efi_source = Path(args.efi_source) if args.efi_source else None
         self.efi_active = Path(args.efi_active) if args.efi_active else None
         self.bridge = args.bridge
-        self.client_ip = args.client_ip
+        self.cache_dir = Path(args.cache_dir) if args.cache_dir else None
         self.manage_boot_order = args.manage_boot_order
+        self.username = args.username
+        self.password = args.password
         self.lock = threading.Lock()
         self.boot: dict[str, Any] = {
             "BootSourceOverrideTarget": "None",
@@ -60,6 +63,38 @@ class State:
             "IPv4StaticAddresses": [],
             "StaticNameServers": [],
         }
+
+    def authorized(self, value: str | None) -> bool:
+        if not self.username:
+            return True
+        expected = "Basic " + base64.b64encode(
+            f"{self.username}:{self.password}".encode()
+        ).decode()
+        return hmac.compare_digest(value or "", expected)
+
+    def static_address(self) -> str:
+        if self.nic.get("DHCPv4") != {"DHCPEnabled": False}:
+            raise ValueError("UefiHttp requested before DHCPv4 was disabled")
+        addresses = self.nic.get("IPv4StaticAddresses")
+        if not isinstance(addresses, list) or len(addresses) != 1:
+            raise ValueError("UefiHttp requires exactly one accepted static IPv4 address")
+        address = addresses[0]
+        if not isinstance(address, dict) or not address.get("Address") or not address.get("SubnetMask"):
+            raise ValueError("UefiHttp static IPv4 address is incomplete")
+        return str(address["Address"])
+
+    def with_client_address(self, action: Any) -> None:
+        if not self.bridge:
+            raise ValueError("UefiHttp requested without an HTTP boundary bridge")
+        client_ip = self.static_address()
+        subprocess.run(["ip", "address", "add", f"{client_ip}/32", "dev", self.bridge], check=True)
+        try:
+            action(client_ip)
+        finally:
+            subprocess.run(
+                ["ip", "address", "delete", f"{client_ip}/32", "dev", self.bridge],
+                check=False,
+            )
 
     def append(self, method: str, path: str, body: Any, status: int) -> None:
         entry = {
@@ -78,7 +113,7 @@ class State:
         return "On" if result.returncode == 0 and "running" in result.stdout else "Off"
 
     def set_efi_boundary(self, enabled: bool) -> None:
-        if not all((self.efi_source, self.efi_active, self.bridge, self.client_ip)):
+        if not all((self.efi_source, self.efi_active, self.bridge, self.cache_dir)):
             raise ValueError("UefiHttp requested without HTTP boundary arguments")
 
         assert self.efi_source is not None
@@ -88,15 +123,18 @@ class State:
             if not boot_url:
                 raise ValueError("UefiHttp override has no HttpBootUri")
             base_url = boot_url.rsplit("/", 1)[0]
-            subprocess.run(
-                ["ip", "address", "add", f"{self.client_ip}/32", "dev", self.bridge],
-                check=True,
-            )
-            try:
+
+            def stage(client_ip: str) -> None:
                 with subprocess.Popen(["mktemp", "-d"], stdout=subprocess.PIPE, text=True) as proc:
                     artifact_dir = Path(proc.communicate()[0].strip())
+                entrypoint = boot_url.rsplit("/", 1)[-1]
+                candidates = list(self.cache_dir.glob(f"oci/*/amd64/disk/{entrypoint}"))
+                if len(candidates) != 1:
+                    raise ValueError(
+                        f"expected one cached HTTP entrypoint {entrypoint}, found {len(candidates)}"
+                    )
+                shutil.copyfile(candidates[0], artifact_dir / "http-entrypoint.efi")
                 for path, url in (
-                    ("http-entrypoint.efi", boot_url),
                     ("grubx64.efi", f"{base_url}/grubx64.efi"),
                     ("vmlinuz", f"{base_url}/vmlinuz"),
                     ("initrd", f"{base_url}/initrd"),
@@ -106,7 +144,7 @@ class State:
                     target = artifact_dir / path
                     target.parent.mkdir(parents=True, exist_ok=True)
                     subprocess.run(
-                        ["curl", "--fail", "--silent", "--show-error", "--interface", self.client_ip,
+                        ["curl", "--fail", "--silent", "--show-error", "--interface", client_ip,
                          "--output", str(target), url],
                         check=True,
                     )
@@ -128,14 +166,24 @@ class State:
                 ):
                     subprocess.run(["mcopy", "-o", "-i", str(boundary), str(artifact_dir / source), target], check=True)
                 shutil.copyfile(boundary, self.efi_active)
-                shutil.rmtree(artifact_dir)
-            finally:
-                subprocess.run(
-                    ["ip", "address", "delete", f"{self.client_ip}/32", "dev", self.bridge],
-                    check=False,
-                )
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+
+            self.with_client_address(stage)
         else:
             shutil.copyfile(self.efi_source, self.efi_active)
+
+    def fetch_boot_entrypoint(self) -> None:
+        boot_url = str(self.boot.get("HttpBootUri", ""))
+
+        def fetch(client_ip: str) -> None:
+            subprocess.run(
+                ["curl", "--fail", "--silent", "--show-error", "--interface", client_ip,
+                 "--output", "/dev/null", boot_url],
+                check=True,
+            )
+            self.append("FIRMWARE_FETCH", boot_url, {"source": client_ip}, 200)
+
+        self.with_client_address(fetch)
 
     def set_boot_order(self, target: str) -> None:
         if not self.manage_boot_order:
@@ -159,6 +207,10 @@ class State:
             virsh("destroy", self.domain, check=False)
         elif reset_type == "On":
             virsh("start", self.domain)
+            # OVMF cannot consume Redfish static NIC settings. Emulate only its
+            # initial fetch after power-on; EFI boundary preparation must not
+            # advance Metalman's boot status.
+            self.fetch_boot_entrypoint()
             # The staged disk substitutes only for firmware's initial HTTP
             # fetch. Remove it from the persistent domain after OVMF has loaded
             # shim/GRUB so the installer's reboot starts the written OS disk.
@@ -207,6 +259,9 @@ class Handler(BaseHTTPRequestHandler):
         status = 200
         response: Any | None = None
         try:
+            if not state.authorized(self.headers.get("Authorization")):
+                self.reply(401, {"error": {"message": "invalid Redfish credentials"}})
+                return
             if method in ("PATCH", "POST"):
                 body = self.body()
 
@@ -225,6 +280,12 @@ class Handler(BaseHTTPRequestHandler):
                 }
             elif method == "PATCH" and self.path == f"/redfish/v1/Systems/{state.domain}":
                 boot = body.get("Boot", {})
+                if boot.get("BootSourceOverrideTarget") == "UefiHttp":
+                    if boot.get("BootSourceOverrideMode") != "UEFI":
+                        raise ValueError("UefiHttp override must explicitly select UEFI mode")
+                    if boot.get("BootSourceOverrideEnabled") != "Continuous":
+                        raise ValueError("standard UefiHttp override must be continuous")
+                    state.static_address()
                 state.boot.update(boot)
                 if boot.get("BootSourceOverrideTarget") == "UefiHttp":
                     state.set_efi_boundary(True)
@@ -240,6 +301,11 @@ class Handler(BaseHTTPRequestHandler):
             elif method == "GET" and self.path.endswith("/EthernetInterfaces/NIC.1"):
                 response = state.nic
             elif method == "PATCH" and self.path.endswith("/EthernetInterfaces/NIC.1"):
+                if body.get("DHCPv4") != {"DHCPEnabled": False}:
+                    raise ValueError("static EthernetInterface PATCH must disable DHCPv4")
+                addresses = body.get("IPv4StaticAddresses")
+                if not isinstance(addresses, list) or len(addresses) != 1:
+                    raise ValueError("static EthernetInterface PATCH must contain one IPv4 address")
                 state.nic.update(body)
                 status = 204
             elif method == "POST" and self.path.endswith("/Actions/ComputerSystem.Reset"):
@@ -291,13 +357,15 @@ def main() -> None:
     parser.add_argument("--efi-source")
     parser.add_argument("--efi-active")
     parser.add_argument("--bridge")
-    parser.add_argument("--client-ip")
+    parser.add_argument("--cache-dir")
+    parser.add_argument("--username", default="")
+    parser.add_argument("--password", default="")
     parser.add_argument("--manage-boot-order", action="store_true")
     args = parser.parse_args()
 
-    boundary_values = (args.efi_source, args.efi_active, args.bridge, args.client_ip)
+    boundary_values = (args.efi_source, args.efi_active, args.bridge, args.cache_dir)
     if any(boundary_values) and not all(boundary_values):
-        parser.error("--efi-source, --efi-active, --bridge, and --client-ip must be used together")
+        parser.error("--efi-source, --efi-active, --bridge, and --cache-dir must be used together")
 
     state = State(args)
     state.record.parent.mkdir(parents=True, exist_ok=True)

@@ -218,19 +218,20 @@ if [ -n "$IP_PARAM" ]; then
     esac
     [ "$PREFIX" -le 32 ] || fatal "invalid IPv4 prefix $PREFIX"
     [ -n "$CLIENT_IP" ] || fatal "static client IP is empty"
-    [ -n "$GW" ] || fatal "static gateway is empty"
     [ -n "$BOOT_MAC" ] || fatal "unbounded.boot_mac is required for persistent static networking"
 
     if [ -n "$IFACE_PARAM" ] && [ -e "/sys/class/net/$IFACE_PARAM" ]; then
         IFACE="$IFACE_PARAM"
     fi
 
-    log "configuring $IFACE with $CLIENT_IP/$PREFIX gw $GW"
+    log "configuring $IFACE with $CLIENT_IP/$PREFIX"
     retry 5 2 "link up $IFACE" ip link set "$IFACE" up || fatal "failed to bring up $IFACE"
     retry 3 1 "set address" ip addr replace "$CLIENT_IP/$PREFIX" dev "$IFACE" \
         || fatal "failed to configure $CLIENT_IP/$PREFIX on $IFACE"
-    retry 3 1 "set default route" ip route replace default via "$GW" dev "$IFACE" \
-        || fatal "failed to configure default route through $GW"
+    if [ -n "$GW" ]; then
+        retry 3 1 "set default route" ip route replace default via "$GW" dev "$IFACE" \
+            || fatal "failed to configure default route through $GW"
+    fi
 
     if [ -n "$DNS_SERVERS" ]; then
         : > /etc/resolv.conf
@@ -331,10 +332,14 @@ network:
       dhcp6: false
       addresses:
         - "${CLIENT_IP}/${PREFIX}"
+NETPLAN
+        if [ -n "$GW" ]; then
+            cat >> /mnt/etc/netplan/99-unbounded-metal.yaml <<NETPLANROUTE
       routes:
         - to: default
           via: "${GW}"
-NETPLAN
+NETPLANROUTE
+        fi
         if [ -n "$DNS_SERVERS" ]; then
             cat >> /mnt/etc/netplan/99-unbounded-metal.yaml <<NETPLANDNS
       nameservers:
