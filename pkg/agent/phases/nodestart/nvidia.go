@@ -259,6 +259,11 @@ func (s *setupNVIDIA) copyDriverLibrary(ctx context.Context, lib goalstates.Nvid
 	return nil
 }
 
+// copyNVIDIASMI adds the host-matched diagnostic binary to the prepared root.
+// CDI generation uses --driver-root, so nvidia-ctk searches that root rather
+// than the nspawn OCI filesystem for driver helper binaries. Including the
+// host copy lets the resulting CDI spec expose a version-compatible nvidia-smi
+// to GPU containers. It remains optional for compute-only CUDA workloads.
 func (s *setupNVIDIA) copyNVIDIASMI(ctx context.Context, paths nvidiaDriverRootPaths) error {
 	if s.goalState.Nvidia.NvidiaSMIPath == "" {
 		return nil
@@ -484,6 +489,11 @@ func (s *setupNVIDIA) generateCDISpec(ctx context.Context) error {
 		slog.String("output", goalstates.CDISpecFile),
 	)
 
+	// Force driver artifact discovery through the root assembled from the host
+	// driver. Without --driver-root, nvidia-ctk inspects the nspawn OCI root and
+	// can generate a spec from missing or mismatched image libraries and helper
+	// binaries. Device nodes remain at their normal bind-mounted paths in the
+	// nspawn machine, so their discovery root is still /.
 	if _, err := executil.MachineRun(ctx, s.log, machine,
 		goalstates.NvidiaCTKPath, "cdi", "generate",
 		"--driver-root", goalstates.NvidiaDriverDir,
