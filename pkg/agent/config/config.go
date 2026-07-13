@@ -228,7 +228,8 @@ func validateAdditionalHostDevice(path string) error {
 }
 
 // IsSystemdDeviceGroupSpecifier reports whether value is a systemd DeviceAllow
-// device group specifier, such as char-input or block-*.
+// device group specifier, such as char-input or block-*. Group names accept
+// ASCII letters, digits, underscores, hyphens, and the '*' wildcard only.
 func IsSystemdDeviceGroupSpecifier(value string) bool {
 	for _, prefix := range []string{"char-", "block-"} {
 		if !strings.HasPrefix(value, prefix) {
@@ -240,7 +241,8 @@ func IsSystemdDeviceGroupSpecifier(value string) bool {
 		return group != "" && strings.IndexFunc(group, func(r rune) bool {
 			return (r < 'a' || r > 'z') &&
 				(r < 'A' || r > 'Z') &&
-				(r < '0' || r > '9') && !strings.ContainsRune("_-/*?", r)
+				(r < '0' || r > '9') &&
+				r != '_' && r != '-' && r != '*'
 		}) == -1
 	}
 

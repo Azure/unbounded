@@ -125,9 +125,11 @@ The agent also auto-mounts host storage and InfiniBand hardware:
   `/dev/infiniband` (e.g. `uverbs0`, `umad0`, `issm0`, `rdma_cm`) is
   bind-mounted so that RDMA workloads inside the container can reach the
   host's HCAs.
-- **Configured extra devices.** `AdditionalHostDevices` in the agent config can
-  list non-standard host device nodes under `/dev` (for example `/dev/uinput`) that
-  should be exposed to workloads inside the machine.
+- **Configured extra devices.** `AdditionalHostDevices` can list either
+  non-standard host device nodes under `/dev`, such as `/dev/uinput`, or systemd
+  device group specifiers, such as `char-input`, `char-pts`, and `block-*`.
+  Device paths are bind-mounted and granted with `DeviceAllow=`. Group
+  specifiers are rendered only as `DeviceAllow=` rules.
 
 Device discovery runs once when the machine is provisioned. Disks or HCAs
 hot-plugged after the machine has started are not picked up until the machine
@@ -158,6 +160,7 @@ The configuration is written to two files on the host before the machine boots:
 | `Bind=<configured /dev path>` | nspawn config | Additional host device bind-mount (configured with agent config `AdditionalHostDevices`). |
 | `Bind=` / `BindReadOnly=` | nspawn config | GPU device and library bind-mounts (auto-generated when GPUs are present). |
 | `DeviceAllow=` | Service override | Cgroup device permissions for all bind-mounted host device nodes (KVM, block, InfiniBand, configured extra devices, GPU). |
+| `DeviceAllow=<char/block group> rwm` | Service override | Additional systemd device group access configured through `AdditionalHostDevices`, for example `char-input`. |
 
 #### System call filter
 
