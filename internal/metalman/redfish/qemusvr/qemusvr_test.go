@@ -20,39 +20,37 @@ import (
 
 const testDomain = "smoke-vm"
 
-// fakeRunner records invocations and returns scripted results.
-type fakeRunner struct {
+// fakeBackend records invocations and returns scripted results. It is the sole
+// test fake for the Redfish server; the QEMU machine layer is not unit tested.
+type fakeBackend struct {
 	mu    sync.Mutex
-	calls [][]string
-	// stdout keyed by the command name; virsh keys use the first arg.
-	stdout map[string]string
-	code   map[string]int
+	calls []string
+
+	powerState string
+	powerOnErr error
+	restartErr error
+	bootOrder  error
+	stageErr   error
+	fetchErr   error
 }
 
-func newFakeRunner() *fakeRunner {
-	return &fakeRunner{stdout: map[string]string{}, code: map[string]int{}}
+func newFakeBackend() *fakeBackend {
+	return &fakeBackend{powerState: "Off"}
 }
 
-func (f *fakeRunner) Run(name string, args ...string) (string, int, error) {
+func (f *fakeBackend) record(name string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.calls = append(f.calls, append([]string{name}, args...))
-
-	key := name
-	if name == "virsh" && len(args) >= 3 {
-		key = "virsh:" + args[2] // skip --connect qemu:///system
-	}
-
-	return f.stdout[key], f.code[key], nil
+	f.calls = append(f.calls, name)
 }
 
-func (f *fakeRunner) called(name string) bool {
+func (f *fakeBackend) called(name string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	for _, c := range f.calls {
-		if c[0] == name {
+		if c == name {
 			return true
 		}
 	}
@@ -60,7 +58,42 @@ func (f *fakeRunner) called(name string) bool {
 	return false
 }
 
-func newTestState(t *testing.T, cfg Config, runner Runner) *State {
+func (f *fakeBackend) PowerState() string { f.record("PowerState"); return f.powerState }
+func (f *fakeBackend) PowerOff()          { f.record("PowerOff") }
+
+func (f *fakeBackend) PowerOn() error {
+	f.record("PowerOn")
+
+	return f.powerOnErr
+}
+
+func (f *fakeBackend) Restart() error {
+	f.record("Restart")
+
+	return f.restartErr
+}
+
+func (f *fakeBackend) SetBootOrder(target string) error {
+	f.record("SetBootOrder:" + target)
+
+	return f.bootOrder
+}
+
+func (f *fakeBackend) StageEFIBoundary(_ bool, _, _ string) error {
+	f.record("StageEFIBoundary")
+
+	return f.stageErr
+}
+
+func (f *fakeBackend) FetchBootEntrypoint(_, _ string) error {
+	f.record("FetchBootEntrypoint")
+
+	return f.fetchErr
+}
+
+func (f *fakeBackend) DetachEFIBoundary() { f.record("DetachEFIBoundary") }
+
+func newTestServer(t *testing.T, cfg Config, backend Backend) *Server {
 	t.Helper()
 
 	if cfg.Record == "" {
@@ -75,12 +108,12 @@ func newTestState(t *testing.T, cfg Config, runner Runner) *State {
 		cfg.MAC = "52:54:00:AB:CD:EF"
 	}
 
-	state, err := NewState(cfg, runner)
+	server, err := NewServer(cfg, backend)
 	if err != nil {
-		t.Fatalf("NewState: %v", err)
+		t.Fatalf("NewServer: %v", err)
 	}
 
-	return state
+	return server
 }
 
 func do(t *testing.T, h http.Handler, method, path string, body any, auth string) (*http.Response, []byte) {
@@ -120,8 +153,8 @@ func basicAuth(user, pass string) string {
 }
 
 func TestServiceRootAndSystems(t *testing.T) {
-	state := newTestState(t, Config{}, newFakeRunner())
-	h := state.Handler()
+	server := newTestServer(t, Config{}, newFakeBackend())
+	h := server.Handler()
 
 	resp, data := do(t, h, http.MethodGet, "/redfish/v1/", nil, "")
 	if resp.StatusCode != http.StatusOK {
@@ -152,11 +185,11 @@ func TestServiceRootAndSystems(t *testing.T) {
 }
 
 func TestGetSystemPowerState(t *testing.T) {
-	runner := newFakeRunner()
-	runner.stdout["virsh:domstate"] = "running\n"
-	state := newTestState(t, Config{}, runner)
+	backend := newFakeBackend()
+	backend.powerState = "On"
+	server := newTestServer(t, Config{}, backend)
 
-	resp, data := do(t, state.Handler(), http.MethodGet, "/redfish/v1/Systems/"+testDomain, nil, "")
+	resp, data := do(t, server.Handler(), http.MethodGet, "/redfish/v1/Systems/"+testDomain, nil, "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("system status = %d", resp.StatusCode)
 	}
@@ -178,8 +211,8 @@ func TestGetSystemPowerState(t *testing.T) {
 }
 
 func TestAuthorization(t *testing.T) {
-	state := newTestState(t, Config{Username: "smoke", Password: "secret"}, newFakeRunner())
-	h := state.Handler()
+	server := newTestServer(t, Config{Username: "smoke", Password: "secret"}, newFakeBackend())
+	h := server.Handler()
 
 	resp, _ := do(t, h, http.MethodGet, "/redfish/v1/", nil, "")
 	if resp.StatusCode != http.StatusUnauthorized {
@@ -197,15 +230,15 @@ func TestAuthorization(t *testing.T) {
 	}
 
 	// The rejected request must not be recorded.
-	if got := len(readRecord(t, state.cfg.Record)); got != 1 {
+	if got := len(readRecord(t, server.cfg.Record)); got != 1 {
 		t.Fatalf("record entries = %d, want 1 (only the authorized request)", got)
 	}
 }
 
 func TestEthernetInterfaceLifecycle(t *testing.T) {
 	base := "/redfish/v1/Systems/" + testDomain + "/EthernetInterfaces"
-	state := newTestState(t, Config{}, newFakeRunner())
-	h := state.Handler()
+	server := newTestServer(t, Config{}, newFakeBackend())
+	h := server.Handler()
 
 	resp, data := do(t, h, http.MethodGet, base, nil, "")
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(data), base+"/NIC.1") {
@@ -237,14 +270,14 @@ func TestEthernetInterfaceLifecycle(t *testing.T) {
 
 func TestEthernetInterfacePatchRejectsDHCP(t *testing.T) {
 	base := "/redfish/v1/Systems/" + testDomain + "/EthernetInterfaces/NIC.1"
-	state := newTestState(t, Config{}, newFakeRunner())
+	server := newTestServer(t, Config{}, newFakeBackend())
 
 	cases := []map[string]any{
 		{"DHCPv4": map[string]any{"DHCPEnabled": true}, "IPv4StaticAddresses": []any{map[string]any{"Address": "1.2.3.4"}}},
 		{"DHCPv4": map[string]any{"DHCPEnabled": false}, "IPv4StaticAddresses": []any{}},
 	}
 	for _, patch := range cases {
-		resp, _ := do(t, state.Handler(), http.MethodPatch, base, patch, "")
+		resp, _ := do(t, server.Handler(), http.MethodPatch, base, patch, "")
 		if resp.StatusCode != http.StatusInternalServerError {
 			t.Fatalf("patch %v status = %d, want 500", patch, resp.StatusCode)
 		}
@@ -252,24 +285,23 @@ func TestEthernetInterfacePatchRejectsDHCP(t *testing.T) {
 }
 
 func TestPatchBootPxeManagesBootOrder(t *testing.T) {
-	runner := newFakeRunner()
-	runner.stdout["virsh:dumpxml"] = `<domain><os><type>hvm</type><boot dev="hd"/></os></domain>`
-	state := newTestState(t, Config{ManageBootOrder: true}, runner)
+	backend := newFakeBackend()
+	server := newTestServer(t, Config{ManageBootOrder: true}, backend)
 
 	patch := map[string]any{"Boot": map[string]any{"BootSourceOverrideTarget": "Pxe"}}
 
-	resp, _ := do(t, state.Handler(), http.MethodPatch, "/redfish/v1/Systems/"+testDomain, patch, "")
+	resp, _ := do(t, server.Handler(), http.MethodPatch, "/redfish/v1/Systems/"+testDomain, patch, "")
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("boot patch status = %d, want 204", resp.StatusCode)
 	}
 
-	if !runner.called("virsh") {
-		t.Fatal("expected virsh to be called for boot order management")
+	if !backend.called("SetBootOrder:Pxe") {
+		t.Fatal("expected SetBootOrder(Pxe) for boot order management")
 	}
 }
 
 func TestPatchBootUefiHTTPRequiresStaticAddress(t *testing.T) {
-	state := newTestState(t, Config{}, newFakeRunner())
+	server := newTestServer(t, Config{}, newFakeBackend())
 
 	patch := map[string]any{"Boot": map[string]any{
 		"BootSourceOverrideTarget":  "UefiHttp",
@@ -278,7 +310,7 @@ func TestPatchBootUefiHTTPRequiresStaticAddress(t *testing.T) {
 		"HttpBootUri":               "http://server/bootx64.efi",
 	}}
 
-	resp, data := do(t, state.Handler(), http.MethodPatch, "/redfish/v1/Systems/"+testDomain, patch, "")
+	resp, data := do(t, server.Handler(), http.MethodPatch, "/redfish/v1/Systems/"+testDomain, patch, "")
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("uefihttp patch status = %d, want 500", resp.StatusCode)
 	}
@@ -291,35 +323,35 @@ func TestPatchBootUefiHTTPRequiresStaticAddress(t *testing.T) {
 func TestResetDispatch(t *testing.T) {
 	cases := []struct {
 		resetType string
-		wantVirsh string
+		wantCall  string
 		wantCode  int
 	}{
-		{"ForceOff", "destroy", http.StatusNoContent},
-		{"ForceRestart", "start", http.StatusNoContent},
+		{"ForceOff", "PowerOff", http.StatusNoContent},
+		{"ForceRestart", "Restart", http.StatusNoContent},
 		{"bogus", "", http.StatusInternalServerError},
 	}
 	for _, tc := range cases {
 		t.Run(tc.resetType, func(t *testing.T) {
-			runner := newFakeRunner()
-			state := newTestState(t, Config{}, runner)
+			backend := newFakeBackend()
+			server := newTestServer(t, Config{}, backend)
 
 			path := "/redfish/v1/Systems/" + testDomain + "/Actions/ComputerSystem.Reset"
-			resp, _ := do(t, state.Handler(), http.MethodPost, path, map[string]any{"ResetType": tc.resetType}, "")
+			resp, _ := do(t, server.Handler(), http.MethodPost, path, map[string]any{"ResetType": tc.resetType}, "")
 
 			if resp.StatusCode != tc.wantCode {
 				t.Fatalf("reset %s status = %d, want %d", tc.resetType, resp.StatusCode, tc.wantCode)
 			}
 
-			if tc.wantVirsh != "" && !runner.called("virsh") {
-				t.Fatalf("reset %s did not invoke virsh", tc.resetType)
+			if tc.wantCall != "" && !backend.called(tc.wantCall) {
+				t.Fatalf("reset %s did not invoke %s", tc.resetType, tc.wantCall)
 			}
 		})
 	}
 }
 
 func TestBiosAndSessionServiceUnsupported(t *testing.T) {
-	state := newTestState(t, Config{}, newFakeRunner())
-	h := state.Handler()
+	server := newTestServer(t, Config{}, newFakeBackend())
+	h := server.Handler()
 
 	system := "/redfish/v1/Systems/" + testDomain
 
@@ -337,11 +369,11 @@ func TestBiosAndSessionServiceUnsupported(t *testing.T) {
 }
 
 func TestRecordFormat(t *testing.T) {
-	state := newTestState(t, Config{}, newFakeRunner())
+	server := newTestServer(t, Config{}, newFakeBackend())
 
-	do(t, state.Handler(), http.MethodGet, "/redfish/v1/", nil, "")
+	do(t, server.Handler(), http.MethodGet, "/redfish/v1/", nil, "")
 
-	entries := readRecord(t, state.cfg.Record)
+	entries := readRecord(t, server.cfg.Record)
 	if len(entries) != 1 {
 		t.Fatalf("record entries = %d, want 1", len(entries))
 	}
