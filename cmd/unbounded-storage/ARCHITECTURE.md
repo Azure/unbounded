@@ -215,7 +215,7 @@ scratch MR, and tears libfabric down).
 ## 6. Module Map (`src/lib.rs`)
 
 All subsystems are `pub mod`: `backend`, `bufferpool`, `config`, `fabric`,
-`fanout`, `frontend`, `http`, `io`, `memory`, `metrics`, `obs`, `p2p`,
+`fanout`, `frontend`, `http`, `memory`, `metrics`, `obs`, `p2p`,
 `ring`, `runtime`, `storage`, `tls`, and `topology`. The `profiling` module is
 exported when the `profiling` feature is enabled.
 
