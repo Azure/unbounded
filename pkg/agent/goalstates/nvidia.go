@@ -120,17 +120,17 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 	}
 
 	devices := discoverNVIDIADevices()
-	libs, mounts, i386Libs, i386Mounts, driverVersion := resolveNVIDIALibraries(archInfo)
+	libraries := resolveNVIDIALibraries(archInfo)
 
 	return NvidiaHost{
 		GPUDevicePaths:   devices,
 		ContainerLibDir:  archInfo.libDir,
-		LibMappings:      libs,
-		LibDirMounts:     mounts,
-		I386LibMappings:  i386Libs,
-		I386LibDirMounts: i386Mounts,
+		LibMappings:      libraries.libMappings,
+		LibDirMounts:     libraries.libDirMounts,
+		I386LibMappings:  libraries.i386LibMappings,
+		I386LibDirMounts: libraries.i386LibDirMounts,
 		NvidiaSMIPath:    discoverNVIDIASMI(),
-		DriverVersion:    driverVersion,
+		DriverVersion:    libraries.driverVersion,
 	}, nil
 }
 
@@ -325,12 +325,20 @@ var nvidiaI386LibGlobs = []string{
 	"libvdpau_nvidia.so*",
 }
 
+type nvidiaLibraryResolution struct {
+	libMappings      []NvidiaLibMapping
+	libDirMounts     []NvidiaLibDirMount
+	i386LibMappings  []NvidiaLibMapping
+	i386LibDirMounts []NvidiaLibDirMount
+	driverVersion    string
+}
+
 // resolveNVIDIALibraries runs ldconfig -p on the host and returns enriched
 // library mappings and their corresponding bind-mount specs.
-func resolveNVIDIALibraries(arch nvidiaArch) ([]NvidiaLibMapping, []NvidiaLibDirMount, []NvidiaLibMapping, []NvidiaLibDirMount, string) {
+func resolveNVIDIALibraries(arch nvidiaArch) nvidiaLibraryResolution {
 	out, err := exec.Command("ldconfig", "-p").Output()
 	if err != nil {
-		return nil, nil, nil, nil, ""
+		return nvidiaLibraryResolution{}
 	}
 
 	libs := parseNVIDIALibraries(out, arch.ldconfigTag)
@@ -341,7 +349,13 @@ func resolveNVIDIALibraries(arch nvidiaArch) ([]NvidiaLibMapping, []NvidiaLibDir
 
 	i386Libs, i386Mounts := resolveNVIDIAI386Libraries(driverVersion, nvidiaI386LibraryDirs(arch.i386LibDir))
 
-	return libs, mounts, i386Libs, i386Mounts, driverVersion
+	return nvidiaLibraryResolution{
+		libMappings:      libs,
+		libDirMounts:     mounts,
+		i386LibMappings:  i386Libs,
+		i386LibDirMounts: i386Mounts,
+		driverVersion:    driverVersion,
+	}
 }
 
 func discoverNVIDIASMI() string {
