@@ -152,6 +152,7 @@ func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
 	const channel = "/dev/nvidia-caps-imex-channels/channel0"
 
 	data := nspawnTemplateData{
+		MachineName:                  "kube1",
 		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
