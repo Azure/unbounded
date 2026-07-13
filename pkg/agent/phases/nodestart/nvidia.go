@@ -177,6 +177,10 @@ func (s *setupNVIDIA) initializeDriverRoot(ctx context.Context, paths nvidiaDriv
 		return fmt.Errorf("remove NVIDIA driver root: %w", err)
 	}
 
+	// On amd64, the resolved command is equivalent to:
+	// mkdir -p /run/nvidia/driver/lib/x86_64-linux-gnu \
+	//   /run/nvidia/driver/lib/i386-linux-gnu /run/nvidia/driver/usr/bin \
+	//   /run/nvidia/driver/usr/lib /run/nvidia/driver/sbin /run/nvidia/driver/etc
 	if _, err := executil.MachineRun(ctx, s.log, machine,
 		"mkdir", "-p", paths.libDir, paths.i386LibDir,
 		filepath.Join(paths.rootDir, "usr", "bin"),
