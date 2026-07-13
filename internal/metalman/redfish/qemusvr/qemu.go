@@ -61,7 +61,22 @@ func NewMachine(cfg Config) (*Machine, error) {
 // is non-nil only when the command could not be started or run to completion; a
 // non-zero exit is reported through the exit code, not an error.
 func (m *Machine) run(name string, args ...string) (string, int, error) {
-	stdout, err := exec.Command(name, args...).Output()
+	return runCmd(exec.Command(name, args...))
+}
+
+// runStdin behaves like run but feeds stdin to the process standard input,
+// letting callers avoid staging data in a temp file on disk.
+func (m *Machine) runStdin(stdin, name string, args ...string) (string, int, error) {
+	cmd := exec.Command(name, args...)
+	cmd.Stdin = strings.NewReader(stdin)
+
+	return runCmd(cmd)
+}
+
+// runCmd runs cmd and reports a non-zero exit through the exit code rather than
+// an error, matching the exit-code semantics the virsh helpers rely on.
+func runCmd(cmd *exec.Cmd) (string, int, error) {
+	stdout, err := cmd.Output()
 
 	var exit *exec.ExitError
 	if err != nil {
@@ -78,6 +93,26 @@ func (m *Machine) run(name string, args ...string) (string, int, error) {
 // virsh runs a virsh subcommand against the system libvirt instance.
 func (m *Machine) virsh(args ...string) (string, int, error) {
 	return m.run("virsh", append([]string{"--connect", "qemu:///system"}, args...)...)
+}
+
+// virshStdin runs a virsh subcommand feeding stdin to the process, used for
+// commands like "define /dev/stdin" that consume XML from standard input.
+func (m *Machine) virshStdin(stdin string, args ...string) (string, int, error) {
+	return m.runStdin(stdin, "virsh", append([]string{"--connect", "qemu:///system"}, args...)...)
+}
+
+// virshCheckStdin runs virshStdin and returns an error on non-zero exit.
+func (m *Machine) virshCheckStdin(stdin string, args ...string) (string, error) {
+	stdout, code, err := m.virshStdin(stdin, args...)
+	if err != nil {
+		return stdout, err
+	}
+
+	if code != 0 {
+		return stdout, fmt.Errorf("virsh %s exited with code %d", strings.Join(args, " "), code)
+	}
+
+	return stdout, nil
 }
 
 // virshCheck runs virsh and returns an error on non-zero exit.
@@ -153,23 +188,9 @@ func (m *Machine) SetBootOrder(target string) error {
 		return err
 	}
 
-	tmp, err := os.CreateTemp("", "domain-*.xml")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name()) //nolint:errcheck // Best-effort cleanup of temp file.
-
-	if _, err := tmp.WriteString(rewritten); err != nil {
-		_ = tmp.Close() //nolint:errcheck // Best-effort close on the error path.
-
-		return err
-	}
-
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-
-	_, err = m.virshCheck("define", tmp.Name())
+	// Feed the rewritten domain XML to "virsh define" over stdin so nothing is
+	// staged in a temp file on disk.
+	_, err = m.virshCheckStdin(rewritten, "define", "/dev/stdin")
 
 	return err
 }
