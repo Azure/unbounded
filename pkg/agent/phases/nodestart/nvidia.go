@@ -141,9 +141,9 @@ func (s *setupNVIDIA) prepareDriverRoot(ctx context.Context) error {
 	}
 
 	for _, lib := range s.goalState.Nvidia.LibMappings {
-		destination := filepath.Join(driverLibDir, filepath.Base(lib.ContainerPath))
+		destination := filepath.Join(driverLibDir, filepath.Base(lib.HostPath))
 		if filepath.Base(filepath.Dir(lib.HostPath)) == "vdpau" {
-			destination = filepath.Join(driverLibDir, "vdpau", filepath.Base(lib.ContainerPath))
+			destination = filepath.Join(driverLibDir, "vdpau", filepath.Base(lib.HostPath))
 			if _, err := executil.MachineRun(ctx, s.log, machine, "mkdir", "-p", filepath.Dir(destination)); err != nil {
 				return fmt.Errorf("create NVIDIA VDPAU directory: %w", err)
 			}
@@ -178,9 +178,9 @@ func (s *setupNVIDIA) prepareDriverRoot(ctx context.Context) error {
 	}
 
 	for _, lib := range s.goalState.Nvidia.I386LibMappings {
-		destination := filepath.Join(i386LibDir, filepath.Base(lib.ContainerPath))
+		destination := filepath.Join(i386LibDir, filepath.Base(lib.HostPath))
 		if filepath.Base(filepath.Dir(lib.HostPath)) == "vdpau" {
-			destination = filepath.Join(i386LibDir, "vdpau", filepath.Base(lib.ContainerPath))
+			destination = filepath.Join(i386LibDir, "vdpau", filepath.Base(lib.HostPath))
 			if _, err := executil.MachineRun(ctx, s.log, machine, "mkdir", "-p", filepath.Dir(destination)); err != nil {
 				return fmt.Errorf("create i386 NVIDIA VDPAU directory: %w", err)
 			}
@@ -280,7 +280,7 @@ func versionedNVIDIALibraryCopies(libs []goalstates.NvidiaLibMapping, driverVers
 	candidates := make(map[string]candidate)
 
 	for _, lib := range libs {
-		name := filepath.Base(lib.ContainerPath)
+		name := filepath.Base(lib.HostPath)
 
 		soIndex := strings.Index(name, ".so")
 		if soIndex < 0 {
