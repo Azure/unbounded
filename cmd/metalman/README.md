@@ -214,9 +214,21 @@ UEFI HTTP boot NIC first in `dhcpLeases`.
 
 The default netboot template passes the selected lease MAC to the installer
 initrd, which uses it to select the provisioning NIC instead of assuming a fixed
-interface name such as `eth0`. If `spec.pxe.targetDisk` is set, the installer
-writes the image to that disk; otherwise it falls back to automatic disk
-selection.
+interface name such as `eth0`. It also passes the lease DNS servers, configures
+the installer network without DHCP, and writes matching MAC-based static netplan
+configuration into the installed system before its first boot. It disables
+cloud-init network rendering so fallback DHCP configuration cannot conflict with
+that file. The default netboot image serves the same lease as NoCloud
+`network-config`. If `spec.pxe.targetDisk` is
+set, the installer writes the image to that disk; otherwise it falls back to
+automatic disk selection.
+
+Stock Ubuntu OVMF and sushy-emulator cannot emulate the complete DHCP-free
+Redfish-to-firmware UEFI HTTP path. Repository CI therefore tests Metalman's
+Redfish writes and then starts at a staged post-firmware EFI boundary, while
+capturing the guest's traffic through installation and reboot to prove it emits
+no DHCP packets. Applying Redfish settings and fetching the first EFI binary
+remain firmware and BMC hardware-conformance responsibilities.
 
 #### BMC
 

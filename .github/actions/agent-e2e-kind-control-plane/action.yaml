@@ -113,3 +113,15 @@ runs:
         sudo ip link set eth-e2e netns "${KIND_PID}"
         sudo nsenter -t "${KIND_PID}" -n ip addr add "${VM_SUBNET}.2/24" dev eth-e2e
         sudo nsenter -t "${KIND_PID}" -n ip link set eth-e2e up
+
+    - name: Advertise Kind control-plane VM-bridge node IP
+      shell: bash
+      env:
+        KIND_CLUSTER_NAME: ${{ inputs['cluster-name'] }}
+        VM_SUBNET: ${{ inputs['vm-subnet'] }}
+      # Make the control-plane Node advertise its VM-bridge address instead of
+      # the Docker-network address. Worker kindnet installs the control-plane
+      # pod CIDR route via the Node InternalIP; the Docker address is not on-link
+      # from the VM subnet, so route reconciliation would otherwise panic with
+      # "network is unreachable" and leave the worker NetworkPluginNotReady.
+      run: python3 ./hack/agent/e2e-kind/e2e.py --verbose configure-kind-node-ip
