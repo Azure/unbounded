@@ -4,9 +4,8 @@
 //! Stripe-to-shard ownership routing for cross-shard fan-out.
 //!
 //! [`owner_shard`] is the content-hash fallback: "which shard owns this
-//! stripe key?" with no topology input. It is still used by the binary's
-//! off-path [`crate::bufferpool::PoolGroup`] router closure and as the
-//! spread function whenever NUMA-local routing cannot place a stripe.
+//! stripe key?" with no topology input. It is the spread function whenever
+//! NUMA-local routing cannot place a stripe.
 //!
 //! [`numa_local_shard`] is the NUMA-aware data-path router: it maps a
 //! stripe key to the drive that backs it (via [`disk_for`], the same
@@ -279,8 +278,12 @@ impl FanoutTable {
         cache_id: Option<&str>,
         stripe_off: u64,
     ) -> Owner<'_> {
-        let drive_numa = self.disk_channels.drive_numa(cache_id);
-        let pick = numa_local_shard(key, stripe_off, &drive_numa, &self.numa_shards);
+        let disk_snapshot = self.disk_channels.snapshot(cache_id);
+        let drive_numa = disk_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.drive_numa.as_slice())
+            .unwrap_or_default();
+        let pick = numa_local_shard(key, stripe_off, drive_numa, &self.numa_shards);
 
         if pick.cross_numa {
             crate::metrics::fanout_cross_numa_fetch();

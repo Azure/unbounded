@@ -14,7 +14,7 @@
 //! Every applicable change is realized in place: peers, disks, routing,
 //! backends, and frontends are all reconciled on the live shard layer
 //! without ever tearing it down or restarting the process. Routing is
-//! republished through the shared [`RoutingHandle`], and each shard
+//! republished through the shared [`RouteTableHandle`], and each shard
 //! reconciles its own backend and frontend registries from the
 //! broadcast config on its own thread. Startup-fixed knobs (the
 //! `[startup]` section: memory, fabric thread/endpoint/in-flight, and
