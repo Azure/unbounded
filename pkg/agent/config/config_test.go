@@ -161,6 +161,19 @@ func TestAgentConfig_Validate(t *testing.T) {
 			},
 		},
 		{
+			name: "additional host device group",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostDevices = []string{"char-input", "char-pts", "block-*"}
+			},
+		},
+		{
+			name: "additional host device group with invalid characters",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostDevices = []string{"char-input=all"}
+			},
+			wantErr: "AdditionalHostDevices",
+		},
+		{
 			name: "additional host device outside dev",
 			mutate: func(cfg *AgentConfig) {
 				cfg.AdditionalHostDevices = []string{"/sys/class/uinput"}
