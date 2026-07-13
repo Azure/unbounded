@@ -6,6 +6,7 @@ package operator
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -67,6 +69,12 @@ var legacySiteGVK = schema.GroupVersionKind{
 	Group:   "net.unbounded-cloud.io",
 	Version: "v1alpha1",
 	Kind:    "Site",
+}
+
+var siteNodeSliceGVK = schema.GroupVersionKind{
+	Group:   "net.unbounded-cloud.io",
+	Version: "v1alpha1",
+	Kind:    "SiteNodeSlice",
 }
 
 // legacySiteCRDName is the CustomResourceDefinition name for the pre-redesign
@@ -194,9 +202,18 @@ type LegacyReaper struct {
 	// CopyConfigMaps are operator-owned ConfigMaps to carry across by name.
 	CopyConfigMaps []string
 
+	// APIServerEndpoint overrides the endpoint in migrated Machina config while
+	// preserving every other legacy setting.
+	APIServerEndpoint string
+
 	// Interval is the requeue period while waiting for target workloads to
 	// become healthy.
 	Interval time.Duration
+
+	// Recorder, when set, receives Events for notable migration actions (for
+	// example a legacy namespace that still holds non-operator workloads at
+	// delete time). Optional; nil disables Event emission.
+	Recorder events.EventRecorder
 }
 
 // NeedLeaderElection ensures the reaper only runs on the elected leader.
@@ -369,7 +386,7 @@ func (r *LegacyReaper) reapOnce(ctx context.Context, logger logr.Logger) (bool, 
 
 	// 6: everything is migrated and reaped; remove the legacy Site CRD and the
 	// now-drained legacy namespaces.
-	return r.cleanup(ctx, logger)
+	return r.cleanup(ctx, logger, target)
 }
 
 // translateSites lists the pre-redesign net-group Sites and creates an
@@ -487,19 +504,122 @@ func (r *LegacyReaper) detectComponents(ctx context.Context, siteName string) (m
 		}
 	}
 
-	metalman, err := r.legacyWorkloadExists(ctx, "Deployment", map[string]string{
-		"app":                                 "unbounded-pxe",
-		unboundedv1alpha3.MachineSiteLabelKey: siteName,
-	})
+	metalman, dhcpAutoInterface, err := r.legacyMetalmanConfigForSite(ctx, siteName)
 	if err != nil {
 		return nil, err
 	}
 
 	if metalman {
-		components["metalman"] = map[string]any{"enabled": true}
+		config := map[string]any{"enabled": true}
+		if dhcpAutoInterface != nil {
+			config["dhcpAutoInterface"] = *dhcpAutoInterface
+		}
+
+		components["metalman"] = config
 	}
 
 	return components, nil
+}
+
+// legacyMetalmanExistsForSite reports whether a legacy per-site metalman
+// Deployment for siteName exists in any legacy namespace. It matches the
+// released deploy-pxe Deployment robustly: any `app: unbounded-pxe` Deployment
+// whose name is metalman-controller-<site> OR whose canonical/deprecated site
+// label equals siteName. Matching the name (which both the released installer
+// and the operator use) guards against the site label being carried under the
+// deprecated key on older clusters.
+func (r *LegacyReaper) legacyMetalmanExistsForSite(ctx context.Context, siteName string) (bool, error) {
+	found, _, err := r.legacyMetalmanConfigForSite(ctx, siteName)
+
+	return found, err
+}
+
+// legacyMetalmanConfigForSite finds the legacy per-site Metalman Deployment and
+// preserves its --dhcp-auto-interface setting. Malformed or contradictory flag
+// values block translation rather than silently changing DHCP behavior.
+func (r *LegacyReaper) legacyMetalmanConfigForSite(ctx context.Context, siteName string) (bool, *bool, error) {
+	var (
+		dhcpAutoInterface *bool
+		effectiveValue    *bool
+	)
+
+	found := false
+
+	for _, legacyNs := range r.LegacyNamespaces {
+		var list appsv1.DeploymentList
+		if err := r.List(ctx, &list, client.InNamespace(legacyNs), client.MatchingLabels{"app": "unbounded-pxe"}); err != nil {
+			return false, nil, err
+		}
+
+		for i := range list.Items {
+			d := &list.Items[i]
+			if d.Name != metalmanDeploymentName(siteName) &&
+				d.Labels[unboundedv1alpha3.MachineSiteLabelKey] != siteName &&
+				d.Labels[deprecatedSiteLabelKey] != siteName {
+				continue
+			}
+
+			found = true
+
+			value, err := metalmanDHCPAutoInterface(d)
+			if err != nil {
+				return false, nil, err
+			}
+
+			effective := false
+			if value != nil {
+				effective = *value
+			}
+
+			if effectiveValue != nil && *effectiveValue != effective {
+				return false, nil, fmt.Errorf("legacy Metalman Deployments for Site %s have conflicting --dhcp-auto-interface values", siteName)
+			}
+
+			matchedEffective := effective
+			effectiveValue = &matchedEffective
+
+			if value != nil {
+				dhcpAutoInterface = value
+			}
+		}
+	}
+
+	return found, dhcpAutoInterface, nil
+}
+
+func metalmanDHCPAutoInterface(deploy *appsv1.Deployment) (*bool, error) {
+	var found *bool
+
+	for _, container := range deploy.Spec.Template.Spec.Containers {
+		for _, arg := range container.Args {
+			var value bool
+
+			switch {
+			case arg == "--dhcp-auto-interface":
+				value = true
+			case strings.HasPrefix(arg, "--dhcp-auto-interface="):
+				switch strings.TrimPrefix(arg, "--dhcp-auto-interface=") {
+				case "true":
+					value = true
+				case "false":
+					value = false
+				default:
+					return nil, fmt.Errorf("legacy Metalman Deployment %s/%s has invalid argument %q", deploy.Namespace, deploy.Name, arg)
+				}
+			default:
+				continue
+			}
+
+			if found != nil && *found != value {
+				return nil, fmt.Errorf("legacy Metalman Deployment %s/%s has conflicting --dhcp-auto-interface arguments", deploy.Namespace, deploy.Name)
+			}
+
+			matched := value
+			found = &matched
+		}
+	}
+
+	return found, nil
 }
 
 // legacyWorkloadExists reports whether a Deployment or DaemonSet matching the
@@ -584,7 +704,22 @@ func (r *LegacyReaper) migrateConfigMaps(ctx context.Context, logger logr.Logger
 			return err
 		}
 
-		if err := r.upsertConfigMap(ctx, copyObjectMeta(src.ObjectMeta, target), src.Data, src.BinaryData); err != nil {
+		data := src.Data
+		if name == "machina-config" && r.APIServerEndpoint != "" {
+			data = make(map[string]string, len(src.Data))
+			for key, value := range src.Data {
+				data[key] = value
+			}
+
+			config, err := setMachinaAPIServerEndpoint(data["config.yaml"], r.APIServerEndpoint)
+			if err != nil {
+				return fmt.Errorf("update migrated machina config endpoint: %w", err)
+			}
+
+			data["config.yaml"] = config
+		}
+
+		if err := r.upsertConfigMap(ctx, copyObjectMeta(src.ObjectMeta, target), data, src.BinaryData); err != nil {
 			return fmt.Errorf("copy configmap %s/%s: %w", legacyNs, name, err)
 		}
 
@@ -870,13 +1005,80 @@ func (r *LegacyReaper) componentResourcesRemain(ctx context.Context, component l
 // other component uses its static gating workloads.
 func (r *LegacyReaper) componentReady(ctx context.Context, target string, component legacyComponent) (bool, error) {
 	switch component.name {
+	case ComponentMachina:
+		return r.machinaTargetReady(ctx, target)
 	case ComponentStorage:
 		return r.storageTargetsReady(ctx, target)
 	case ComponentNet:
 		return r.netTargetsPresent(ctx, target)
+	case ComponentMetalman:
+		return r.metalmanTargetsPresent(ctx, target)
 	default:
 		return r.targetsReady(ctx, target, component.targets)
 	}
+}
+
+func (r *LegacyReaper) machinaTargetReady(ctx context.Context, target string) (bool, error) {
+	var config corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: "machina-config"}, &config); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	var deploy appsv1.Deployment
+	if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: "machina-controller"}, &deploy); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	if deploy.Spec.Template.Annotations[machinaConfigHashAnnotation] != machinaConfigHash(config.Data["config.yaml"]) {
+		return false, nil
+	}
+
+	return deploymentRolloutComplete(&deploy), nil
+}
+
+// metalmanTargetsPresent reports whether the operator has created the per-site
+// metalman Deployment for every metalman-enabled Site. Like net, metalman is
+// hostNetwork and binds host ports (DHCP/TFTP/HTTP), so the new per-site pod
+// cannot become Ready while the legacy metalman on the same node still holds
+// those ports; gating on creation (not readiness) frees the ports without
+// deadlocking. If a legacy metalman footprint reached this gate but no Site
+// enables metalman (for example a detection miss), reaping is refused so the
+// workload is not silently dropped.
+func (r *LegacyReaper) metalmanTargetsPresent(ctx context.Context, target string) (bool, error) {
+	var sites unboundedv1alpha3.SiteList
+	if err := r.List(ctx, &sites); err != nil {
+		return false, fmt.Errorf("list sites: %w", err)
+	}
+
+	enabled := 0
+
+	for i := range sites.Items {
+		site := &sites.Items[i]
+		if !componentEnabled(site, ComponentMetalman) {
+			continue
+		}
+
+		enabled++
+
+		var deploy appsv1.Deployment
+		if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: metalmanDeploymentName(site.Name)}, &deploy); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+
+			return false, err
+		}
+	}
+
+	return enabled > 0, nil
 }
 
 // netTargetsPresent reports whether the operator has created the new net
@@ -912,8 +1114,9 @@ func (r *LegacyReaper) netTargetsPresent(ctx context.Context, target string) (bo
 // conjunction of two invariants:
 //
 //   - Every per-site unbounded-storage-supervisor-<site> DaemonSet that exists
-//     in the target namespace must be Ready, and at least one must exist (do not
-//     reap before the operator has created a replacement).
+//     in the target namespace must be Ready. A zero-desired DaemonSet is safe
+//     only when no Node InternalIP matches that Site's node CIDRs. At least one
+//     DaemonSet must exist (do not reap before a replacement is created).
 //   - Every storage-enabled translated Site must have its per-site DaemonSet
 //     present, so a multi-site cluster never loses the legacy supervisor before
 //     every storage-enabled Site has its own replacement.
@@ -922,6 +1125,18 @@ func (r *LegacyReaper) storageTargetsReady(ctx context.Context, target string) (
 	if err := r.List(ctx, &list, client.InNamespace(target)); err != nil {
 		return false, err
 	}
+
+	var sites unboundedv1alpha3.SiteList
+	if err := r.List(ctx, &sites); err != nil {
+		return false, fmt.Errorf("list sites: %w", err)
+	}
+
+	sitesByName := make(map[string]*unboundedv1alpha3.Site, len(sites.Items))
+	for i := range sites.Items {
+		sitesByName[sites.Items[i].Name] = &sites.Items[i]
+	}
+
+	var nodes *corev1.NodeList
 
 	found := false
 
@@ -933,18 +1148,44 @@ func (r *LegacyReaper) storageTargetsReady(ctx context.Context, target string) (
 
 		found = true
 
-		if !daemonSetReady(ds) {
+		if ds.Status.ObservedGeneration < ds.Generation {
+			return false, nil
+		}
+
+		if ds.Status.DesiredNumberScheduled == 0 {
+			siteName := strings.TrimPrefix(ds.Name, "unbounded-storage-supervisor-")
+
+			site := sitesByName[siteName]
+			if site == nil {
+				return false, nil
+			}
+
+			if nodes == nil {
+				nodes = &corev1.NodeList{}
+				if err := r.List(ctx, nodes); err != nil {
+					return false, fmt.Errorf("list nodes: %w", err)
+				}
+			}
+
+			matched, err := siteHasMatchingNode(site, nodes.Items)
+			if err != nil {
+				return false, err
+			}
+
+			if matched {
+				return false, nil
+			}
+
+			continue
+		}
+
+		if !storageDaemonSetReady(ds) {
 			return false, nil
 		}
 	}
 
 	// Require every storage-enabled Site to have its per-site DaemonSet present
 	// before reaping the legacy supervisor.
-	var sites unboundedv1alpha3.SiteList
-	if err := r.List(ctx, &sites); err != nil {
-		return false, fmt.Errorf("list sites: %w", err)
-	}
-
 	for i := range sites.Items {
 		site := &sites.Items[i]
 		if !componentEnabled(site, ComponentStorage) {
@@ -962,6 +1203,36 @@ func (r *LegacyReaper) storageTargetsReady(ctx context.Context, target string) (
 	}
 
 	return found, nil
+}
+
+func siteHasMatchingNode(site *unboundedv1alpha3.Site, nodes []corev1.Node) (bool, error) {
+	cidrs := make([]*net.IPNet, 0, len(site.Spec.NodeCidrs))
+
+	for _, raw := range site.Spec.NodeCidrs {
+		_, cidr, err := net.ParseCIDR(raw)
+		if err != nil {
+			return false, fmt.Errorf("site %s has invalid node CIDR %q: %w", site.Name, raw, err)
+		}
+
+		cidrs = append(cidrs, cidr)
+	}
+
+	for i := range nodes {
+		for _, address := range nodes[i].Status.Addresses {
+			if address.Type != corev1.NodeInternalIP {
+				continue
+			}
+
+			ip := net.ParseIP(address.Address)
+			for _, cidr := range cidrs {
+				if ip != nil && cidr.Contains(ip) {
+					return true, nil
+				}
+			}
+		}
+	}
+
+	return false, nil
 }
 
 // targetsReady reports whether every gating workload is healthy in the target
@@ -1004,10 +1275,10 @@ func (r *LegacyReaper) targetsReady(ctx context.Context, target string, refs []w
 // cleanup removes the legacy Site CRD and the drained legacy namespaces. It
 // returns done=true only once the CRD and every legacy namespace are gone
 // (namespace deletion is asynchronous, so a later pass observes completion).
-func (r *LegacyReaper) cleanup(ctx context.Context, logger logr.Logger) (bool, error) {
+func (r *LegacyReaper) cleanup(ctx context.Context, logger logr.Logger, target string) (bool, error) {
 	done := true
 
-	crdGone, err := r.deleteLegacySiteCRD(ctx, logger)
+	crdGone, err := r.cleanupLegacySiteCRD(ctx, logger, target)
 	if err != nil {
 		return false, err
 	}
@@ -1021,6 +1292,8 @@ func (r *LegacyReaper) cleanup(ctx context.Context, logger logr.Logger) (bool, e
 			continue
 		}
 
+		r.warnOnForeignWorkloads(ctx, logger, nsName)
+
 		if err := r.deleteNamespace(ctx, nsName); err != nil {
 			return false, fmt.Errorf("delete legacy namespace %s: %w", nsName, err)
 		}
@@ -1031,6 +1304,202 @@ func (r *LegacyReaper) cleanup(ctx context.Context, logger logr.Logger) (bool, e
 	}
 
 	return done, nil
+}
+
+// cleanupLegacySiteCRD deletes the legacy net-group Site CRD once it is safe to
+// do so. When the CRD still exists it is only deleted after the new net
+// controller is Available and every existing SiteNodeSlice has been re-owned by
+// its current v1alpha3 Site. Deleting the legacy CRD sooner could let garbage
+// collection remove slices that still reference legacy Sites. When the CRD is
+// already gone there is nothing to protect and it reports gone=true.
+func (r *LegacyReaper) cleanupLegacySiteCRD(ctx context.Context, logger logr.Logger, target string) (bool, error) {
+	exists, err := r.legacySiteCRDExists(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	if !exists {
+		return true, nil
+	}
+
+	netReady, err := r.netControllerAvailable(ctx, target)
+	if err != nil {
+		return false, err
+	}
+
+	if !netReady {
+		logger.Info("waiting for the new net controller to be Available before deleting the legacy Site CRD", "namespace", target)
+
+		return false, nil
+	}
+
+	slicesCurrent, err := r.siteNodeSlicesOwnedByCurrentSites(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	if !slicesCurrent {
+		logger.Info("waiting for SiteNodeSlices to be owned by their current v1alpha3 Sites")
+
+		return false, nil
+	}
+
+	return r.deleteLegacySiteCRD(ctx, logger)
+}
+
+func (r *LegacyReaper) siteNodeSlicesOwnedByCurrentSites(ctx context.Context) (bool, error) {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   siteNodeSliceGVK.Group,
+		Version: siteNodeSliceGVK.Version,
+		Kind:    siteNodeSliceGVK.Kind + "List",
+	})
+
+	if err := r.List(ctx, list); err != nil {
+		if apimeta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+			return true, nil
+		}
+
+		return false, fmt.Errorf("list SiteNodeSlices: %w", err)
+	}
+
+	for i := range list.Items {
+		slice := &list.Items[i]
+
+		siteName, found, err := unstructured.NestedString(slice.Object, "siteName")
+		if err != nil || !found || siteName == "" {
+			return false, nil
+		}
+
+		site := &unboundedv1alpha3.Site{}
+		if err := r.Get(ctx, client.ObjectKey{Name: siteName}, site); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+
+			return false, fmt.Errorf("get Site %s for SiteNodeSlice %s: %w", siteName, slice.GetName(), err)
+		}
+
+		if !hasExactSiteOwnerReference(slice.GetOwnerReferences(), site) {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+func hasExactSiteOwnerReference(refs []metav1.OwnerReference, site *unboundedv1alpha3.Site) bool {
+	if len(refs) != 1 {
+		return false
+	}
+
+	ref := refs[0]
+
+	return ref.APIVersion == unboundedv1alpha3.GroupVersion.String() &&
+		ref.Kind == "Site" &&
+		ref.Name == site.Name &&
+		ref.UID == site.UID &&
+		ref.Controller != nil && *ref.Controller &&
+		ref.BlockOwnerDeletion != nil && *ref.BlockOwnerDeletion
+}
+
+// legacySiteCRDExists reports whether the pre-redesign net-group Site CRD is
+// still installed.
+func (r *LegacyReaper) legacySiteCRDExists(ctx context.Context) (bool, error) {
+	crd := &unstructured.Unstructured{}
+	crd.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "apiextensions.k8s.io",
+		Version: "v1",
+		Kind:    "CustomResourceDefinition",
+	})
+
+	err := r.Get(ctx, client.ObjectKey{Name: legacySiteCRDName}, crd)
+	switch {
+	case err == nil:
+		return true, nil
+	case apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err):
+		return false, nil
+	default:
+		return false, fmt.Errorf("get legacy site crd: %w", err)
+	}
+}
+
+// netControllerAvailable reports whether the new net controller Deployment in the
+// target namespace is Available.
+func (r *LegacyReaper) netControllerAvailable(ctx context.Context, target string) (bool, error) {
+	var deploy appsv1.Deployment
+	if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: "unbounded-net-controller"}, &deploy); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	return deploymentAvailable(&deploy), nil
+}
+
+// warnOnForeignWorkloads logs a warning and emits an Event when a legacy
+// namespace still holds workloads the reaper did not create, so operators are
+// alerted before the whole-namespace delete removes them too. Deletion still
+// proceeds (the namespace is the migration target); the warning surfaces
+// unexpected residents rather than blocking the migration.
+func (r *LegacyReaper) warnOnForeignWorkloads(ctx context.Context, logger logr.Logger, nsName string) {
+	foreign, err := r.foreignWorkloads(ctx, nsName)
+	if err != nil {
+		logger.Error(err, "failed to check for foreign workloads before deleting legacy namespace", "namespace", nsName)
+		return
+	}
+
+	if len(foreign) == 0 {
+		return
+	}
+
+	logger.Info("legacy namespace still holds non-operator workloads; they will be deleted with the namespace",
+		"namespace", nsName, "workloads", foreign)
+
+	if r.Recorder != nil {
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
+		r.Recorder.Eventf(ns, nil, corev1.EventTypeWarning, "ForeignWorkloadsDeleted", "DeleteLegacyNamespace",
+			"deleting drained legacy namespace %s which still holds non-operator workloads: %v", nsName, foreign)
+	}
+}
+
+// foreignWorkloads returns the "Kind/name" of workload controllers in the
+// namespace that the reaper did not create. cleanup runs only after every
+// operator-owned Deployment/DaemonSet has been reaped, so any remaining
+// Deployment/DaemonSet/StatefulSet here is foreign.
+func (r *LegacyReaper) foreignWorkloads(ctx context.Context, nsName string) ([]string, error) {
+	var names []string
+
+	var deployments appsv1.DeploymentList
+	if err := r.List(ctx, &deployments, client.InNamespace(nsName)); err != nil {
+		return nil, err
+	}
+
+	for i := range deployments.Items {
+		names = append(names, "Deployment/"+deployments.Items[i].Name)
+	}
+
+	var daemonsets appsv1.DaemonSetList
+	if err := r.List(ctx, &daemonsets, client.InNamespace(nsName)); err != nil {
+		return nil, err
+	}
+
+	for i := range daemonsets.Items {
+		names = append(names, "DaemonSet/"+daemonsets.Items[i].Name)
+	}
+
+	var statefulsets appsv1.StatefulSetList
+	if err := r.List(ctx, &statefulsets, client.InNamespace(nsName)); err != nil {
+		return nil, err
+	}
+
+	for i := range statefulsets.Items {
+		names = append(names, "StatefulSet/"+statefulsets.Items[i].Name)
+	}
+
+	return names, nil
 }
 
 // deleteLegacySiteCRD deletes the pre-redesign net-group Site CRD. It reports
@@ -1193,6 +1662,18 @@ func deploymentAvailable(deploy *appsv1.Deployment) bool {
 	return deploy.Status.ObservedGeneration >= deploy.Generation && deploy.Status.AvailableReplicas >= desired
 }
 
+func deploymentRolloutComplete(deploy *appsv1.Deployment) bool {
+	desired := int32(1)
+	if deploy.Spec.Replicas != nil {
+		desired = *deploy.Spec.Replicas
+	}
+
+	return deploy.Status.ObservedGeneration >= deploy.Generation &&
+		deploy.Status.UpdatedReplicas == desired &&
+		deploy.Status.Replicas == desired &&
+		deploy.Status.AvailableReplicas == desired
+}
+
 func daemonSetReady(ds *appsv1.DaemonSet) bool {
 	if ds.Status.ObservedGeneration < ds.Generation {
 		return false
@@ -1200,6 +1681,21 @@ func daemonSetReady(ds *appsv1.DaemonSet) bool {
 
 	if ds.Status.DesiredNumberScheduled == 0 {
 		return true
+	}
+
+	return ds.Status.NumberReady >= ds.Status.DesiredNumberScheduled
+}
+
+// storageDaemonSetReady is stricter than daemonSetReady: absent the explicit
+// node-CIDR exception in storageTargetsReady, a per-site storage DaemonSet must
+// schedule at least one pod and have all scheduled pods Ready.
+func storageDaemonSetReady(ds *appsv1.DaemonSet) bool {
+	if ds.Status.ObservedGeneration < ds.Generation {
+		return false
+	}
+
+	if ds.Status.DesiredNumberScheduled < 1 {
+		return false
 	}
 
 	return ds.Status.NumberReady >= ds.Status.DesiredNumberScheduled

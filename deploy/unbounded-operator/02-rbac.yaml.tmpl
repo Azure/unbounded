@@ -22,6 +22,9 @@ rules:
   - apiGroups: ["net.unbounded-cloud.io"]
     resources: ["sites"]
     verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["net.unbounded-cloud.io"]
+    resources: ["sitenodeslices"]
+    verbs: ["get", "list", "watch"]
   # Cluster-scoped custom resources whose embedded secret references are
   # repointed from the legacy namespaces to unbounded-system.
   - apiGroups: ["unbounded-cloud.io"]
@@ -33,9 +36,15 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces", "serviceaccounts", "configmaps", "services", "secrets"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete", "deletecollection"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["deployments", "daemonsets"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete", "deletecollection"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
     # escalate + bind let the operator install the component RBAC (net,
@@ -56,6 +65,9 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

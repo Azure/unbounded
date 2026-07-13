@@ -4,19 +4,156 @@
 package operator
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
 
+	"gopkg.in/yaml.v3"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
+
+func TestReconcilePatchesAllConditionsAndReturnsComponentErrors(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	site := &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "rack-a", Generation: 7},
+	}
+	netErr := errors.New("net reconcile failed")
+	machinaErr := errors.New("machina reconcile failed")
+	listErrs := []error{netErr, machinaErr}
+	listCalls := 0
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(site).
+		WithStatusSubresource(site).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(_ context.Context, _ client.WithWatch, list client.ObjectList, _ ...client.ListOption) error {
+				if _, ok := list.(*unboundedv1alpha3.SiteList); !ok {
+					t.Fatalf("unexpected list type %T", list)
+				}
+
+				err := listErrs[listCalls]
+				listCalls++
+
+				return err
+			},
+		}).
+		Build()
+
+	r := &SiteReconciler{Client: cl, Scheme: scheme}
+
+	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(site)})
+	if !errors.Is(err, netErr) || !errors.Is(err, machinaErr) {
+		t.Fatalf("Reconcile error = %v, want joined net and machina errors", err)
+	}
+
+	var got unboundedv1alpha3.Site
+	if err := cl.Get(t.Context(), client.ObjectKeyFromObject(site), &got); err != nil {
+		t.Fatalf("get reconciled Site: %v", err)
+	}
+
+	want := map[string]struct {
+		status metav1.ConditionStatus
+		reason string
+	}{
+		"NetReady":      {status: metav1.ConditionFalse, reason: reasonReconcileError},
+		"MachinaReady":  {status: metav1.ConditionFalse, reason: reasonReconcileError},
+		"MetalmanReady": {status: metav1.ConditionTrue, reason: reasonDisabled},
+		"StorageReady":  {status: metav1.ConditionTrue, reason: reasonDisabled},
+	}
+
+	if len(got.Status.Conditions) != len(want) {
+		t.Fatalf("conditions len = %d, want %d: %#v", len(got.Status.Conditions), len(want), got.Status.Conditions)
+	}
+
+	for conditionType, expected := range want {
+		condition := apimeta.FindStatusCondition(got.Status.Conditions, conditionType)
+		if condition == nil {
+			t.Fatalf("condition %q not found", conditionType)
+		}
+
+		if condition.Status != expected.status || condition.Reason != expected.reason || condition.ObservedGeneration != site.Generation {
+			t.Fatalf("condition %q = %#v, want status=%s reason=%s generation=%d", conditionType, condition, expected.status, expected.reason, site.Generation)
+		}
+	}
+}
+
+func TestReconcileJoinsStatusPatchError(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}
+	componentErr := errors.New("component reconcile failed")
+	patchErr := errors.New("status patch failed")
+
+	var patched *unboundedv1alpha3.Site
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(site).
+		WithStatusSubresource(site).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(_ context.Context, _ client.WithWatch, _ client.ObjectList, _ ...client.ListOption) error {
+				return componentErr
+			},
+			SubResourcePatch: func(
+				_ context.Context,
+				_ client.Client,
+				subResourceName string,
+				obj client.Object,
+				_ client.Patch,
+				_ ...client.SubResourcePatchOption,
+			) error {
+				if subResourceName != "status" {
+					t.Fatalf("subresource = %q, want status", subResourceName)
+				}
+
+				patched = obj.(*unboundedv1alpha3.Site).DeepCopy()
+
+				return patchErr
+			},
+		}).
+		Build()
+
+	r := &SiteReconciler{Client: cl, Scheme: scheme}
+
+	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(site)})
+	if !errors.Is(err, componentErr) || !errors.Is(err, patchErr) {
+		t.Fatalf("Reconcile error = %v, want joined component and status patch errors", err)
+	}
+
+	if patched == nil || len(patched.Status.Conditions) != 4 {
+		t.Fatalf("status patch received conditions %#v, want all four", patched)
+	}
+}
+
+func newReconcilerTestScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	for name, add := range map[string]func(*runtime.Scheme) error{
+		"apps/v1":     appsv1.AddToScheme,
+		"core/v1":     corev1.AddToScheme,
+		"machina API": unboundedv1alpha3.AddToScheme,
+	} {
+		if err := add(scheme); err != nil {
+			t.Fatalf("add %s to scheme: %v", name, err)
+		}
+	}
+
+	return scheme
+}
 
 func TestMutateStorageScopesDaemonSetToSite(t *testing.T) {
 	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
@@ -86,26 +223,93 @@ func TestMutateMachinaSkipsMetalmanSupport(t *testing.T) {
 	}
 }
 
-func TestMutateMachinaInjectsAPIServerEndpoint(t *testing.T) {
+func TestSetMachinaAPIServerEndpointPreservesConfig(t *testing.T) {
+	input := `# retained comment
+apiServerEndpoint: "https://old.example:6443"
+maxConcurrentReconciles: 17
+customField: keep-me
+`
+	endpoint := "https://api.example:6443/path?mode=\"strict\"&ready=true"
+
+	got, err := setMachinaAPIServerEndpoint(input, endpoint)
+	if err != nil {
+		t.Fatalf("setMachinaAPIServerEndpoint: %v", err)
+	}
+
+	var config map[string]any
+	if err := yaml.Unmarshal([]byte(got), &config); err != nil {
+		t.Fatalf("unmarshal merged config: %v", err)
+	}
+
+	if config["apiServerEndpoint"] != endpoint {
+		t.Fatalf("apiServerEndpoint = %q, want %q", config["apiServerEndpoint"], endpoint)
+	}
+
+	if config["maxConcurrentReconciles"] != 17 || config["customField"] != "keep-me" {
+		t.Fatalf("custom config was not preserved: %#v", config)
+	}
+
+	if !strings.Contains(got, "# retained comment") {
+		t.Fatalf("config comment was not preserved: %q", got)
+	}
+}
+
+func TestEnsureMachinaConfigUpdatesEndpointAndPreservesData(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	existing := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "machina-config", Namespace: DefaultNamespace},
+		Data: map[string]string{
+			"config.yaml": "apiServerEndpoint: https://old.example:6443\ncustom: true\n",
+		},
+	}
+	r := &SiteReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build(),
+		Config: Config{APIServerEndpoint: "https://new.example:6443"},
+	}
+
+	hash, err := r.ensureMachinaConfig(t.Context())
+	if err != nil {
+		t.Fatalf("ensureMachinaConfig: %v", err)
+	}
+
+	var got corev1.ConfigMap
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(existing), &got); err != nil {
+		t.Fatalf("get machina config: %v", err)
+	}
+
+	var config map[string]any
+	if err := yaml.Unmarshal([]byte(got.Data["config.yaml"]), &config); err != nil {
+		t.Fatalf("unmarshal updated config: %v", err)
+	}
+
+	if config["apiServerEndpoint"] != "https://new.example:6443" || config["custom"] != true {
+		t.Fatalf("updated config = %#v", config)
+	}
+
+	if hash != machinaConfigHash(got.Data["config.yaml"]) {
+		t.Fatalf("hash = %q, want hash of exact stored config", hash)
+	}
+}
+
+func TestMachinaApplyMutatorStampsConfigHash(t *testing.T) {
 	obj := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "v1",
-		"kind":       "ConfigMap",
-		"metadata":   map[string]any{"name": "machina-config"},
-		"data":       map[string]any{"config.yaml": `apiServerEndpoint: ""`},
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata":   map[string]any{"name": "machina-controller"},
+		"spec": map[string]any{
+			"template": map[string]any{"metadata": map[string]any{}},
+		},
 	}}
 
-	r := &SiteReconciler{Config: Config{APIServerEndpoint: "https://api.example:6443"}}
-	if err := r.mutateMachinaObject(obj); err != nil {
-		t.Fatalf("mutateMachinaObject returned error: %v", err)
+	const hash = "config-hash"
+	if err := (&SiteReconciler{}).machinaApplyMutator(hash)(obj); err != nil {
+		t.Fatalf("machinaApplyMutator: %v", err)
 	}
 
-	got, ok, err := unstructured.NestedString(obj.Object, "data", "config.yaml")
-	if err != nil || !ok {
-		t.Fatalf("missing data.config.yaml: ok=%t err=%v", ok, err)
-	}
-
-	if got != `apiServerEndpoint: "https://api.example:6443"` {
-		t.Fatalf("config.yaml = %q", got)
+	got, found, err := unstructured.NestedString(obj.Object,
+		"spec", "template", "metadata", "annotations", machinaConfigHashAnnotation)
+	if err != nil || !found || got != hash {
+		t.Fatalf("config hash = %q found=%t err=%v, want %q", got, found, err, hash)
 	}
 }
 
@@ -387,6 +591,92 @@ func TestRetargetNamespaceRewritesToCustomNamespace(t *testing.T) {
 
 	if nsObj.GetName() != "unbounded-system" {
 		t.Fatalf("default install rewrote namespace to %q", nsObj.GetName())
+	}
+}
+
+// Finding 4: retargeting a custom namespace must also rewrite the namespace
+// where it appears as a substring - service-account usernames in VAP CEL and
+// flag values - while leaving unrelated strings (image refs) untouched.
+func TestRetargetNamespaceRewritesServiceAccountAndArgs(t *testing.T) {
+	r := &SiteReconciler{Namespace: "custom-ns"}
+
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "admissionregistration.k8s.io/v1",
+		"kind":       "ValidatingAdmissionPolicy",
+		"metadata":   map[string]any{"name": "p"},
+		"spec": map[string]any{
+			"matchConditions": []any{
+				map[string]any{"expression": "request.userInfo.username == 'system:serviceaccount:unbounded-system:unbounded-net-controller'"},
+			},
+			"args":  []any{"--leader-elect-resource-namespace=unbounded-system"},
+			"image": "ghcr.io/azure/unbounded-system:v1",
+		},
+	}}
+
+	r.retargetNamespace(obj)
+
+	conds, _, _ := unstructured.NestedSlice(obj.Object, "spec", "matchConditions")
+	gotExpr := conds[0].(map[string]any)["expression"].(string)
+
+	if gotExpr != "request.userInfo.username == 'system:serviceaccount:custom-ns:unbounded-net-controller'" {
+		t.Fatalf("SA username not rewritten: %q", gotExpr)
+	}
+
+	args, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "args")
+	if len(args) != 1 || args[0] != "--leader-elect-resource-namespace=custom-ns" {
+		t.Fatalf("flag value not rewritten: %v", args)
+	}
+
+	if img, _, _ := unstructured.NestedString(obj.Object, "spec", "image"); img != "ghcr.io/azure/unbounded-system:v1" {
+		t.Fatalf("image ref must not be rewritten, got %q", img)
+	}
+}
+
+func TestRetargetNamespaceInString(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"unbounded-system", "custom-ns"},
+		{"system:serviceaccount:unbounded-system:sa", "system:serviceaccount:custom-ns:sa"},
+		{"--leader-elect-resource-namespace=unbounded-system", "--leader-elect-resource-namespace=custom-ns"},
+		{"ghcr.io/azure/unbounded-system:v1", "ghcr.io/azure/unbounded-system:v1"},
+		{"unbounded-system-other", "unbounded-system-other"},
+	}
+
+	for _, tc := range cases {
+		if got := retargetNamespaceInString(tc.in, "unbounded-system", "custom-ns"); got != tc.want {
+			t.Fatalf("retargetNamespaceInString(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Finding 3: the reconcile loop never applies CRDs (the operator installs them
+// once at startup via BootstrapCRDs).
+func TestSkipCRDObjects(t *testing.T) {
+	crd := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiextensions.k8s.io/v1",
+		"kind":       "CustomResourceDefinition",
+		"metadata":   map[string]any{"name": "sites.unbounded-cloud.io"},
+	}}
+
+	if err := skipCRDObjects(crd); err != nil {
+		t.Fatalf("skipCRDObjects: %v", err)
+	}
+
+	if crd.Object != nil {
+		t.Fatal("expected CRD object nilled out")
+	}
+
+	other := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "x"},
+	}}
+
+	if err := skipCRDObjects(other); err != nil {
+		t.Fatalf("skipCRDObjects: %v", err)
+	}
+
+	if other.Object == nil {
+		t.Fatal("non-CRD object must be preserved")
 	}
 }
 

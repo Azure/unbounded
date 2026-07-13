@@ -20,6 +20,13 @@ spec:
       labels:
         app.kubernetes.io/name: unbounded-operator
         app.kubernetes.io/component: controller
+      annotations:
+        # Rolls the operator when the advertised api-server-endpoint changes at
+        # render time. envFrom is read once at pod start, so without a pod-template
+        # change a re-render with a new endpoint would not restart the operator.
+        # The `kubectl unbounded install` path stamps the same annotation. See
+        # deploy/unbounded-operator/03-configmap.yaml.tmpl.
+        unbounded-cloud.io/operator-config-hash: {{ default "" .APIServerEndpoint | sha256sum | quote }}
     spec:
       serviceAccountName: unbounded-operator
       containers:
@@ -31,7 +38,11 @@ spec:
             - --leader-elect-namespace={{ default "unbounded-system" .Namespace }}
             - --namespace={{ default "unbounded-system" .Namespace }}
             - --metalman-image={{ .MetalmanImage }}
-            - --api-server-endpoint={{ default "" .APIServerEndpoint }}
+          envFrom:
+            # Environment-specific operator settings (api-server-endpoint, reaper
+            # toggle). See deploy/unbounded-operator/03-configmap.yaml.tmpl.
+            - configMapRef:
+                name: unbounded-operator-config
           env:
             - name: POD_NAMESPACE
               valueFrom:
@@ -48,6 +59,17 @@ spec:
             requests:
               cpu: 50m
               memory: 64Mi
+          startupProbe:
+            # The operator applies and establishes CRDs at startup
+            # (operator.BootstrapCRDs, CRDBootstrapTimeout = 4m) before the
+            # manager starts and binds the health server, so /healthz is not
+            # served during bootstrap. Give startup up to 270s (54 x 5s), which
+            # exceeds the full bootstrap timeout, before liveness takes over.
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 5
+            failureThreshold: 54
           livenessProbe:
             httpGet:
               path: /healthz

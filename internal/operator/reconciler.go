@@ -24,8 +24,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
@@ -140,10 +144,16 @@ func (r *SiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	patch := client.MergeFrom(site.DeepCopy())
 
+	var reconcileErrs []error
+
 	// Publish one condition per component in a stable order so the status patch
 	// is deterministic and callers can `kubectl wait --for=condition=NetReady`.
 	for _, name := range []string{ComponentNet, ComponentMachina, ComponentMetalman, ComponentStorage} {
 		res := results[name]
+		if res.err != nil {
+			reconcileErrs = append(reconcileErrs, fmt.Errorf("%s: %w", name, res.err))
+		}
+
 		if !res.ready {
 			logger.Info("component not ready", "site", site.Name, "component", name, "message", res.message)
 		}
@@ -163,10 +173,10 @@ func (r *SiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	if err := r.Status().Patch(ctx, &site, patch); err != nil {
-		return ctrl.Result{}, fmt.Errorf("patch site status: %w", err)
+		reconcileErrs = append(reconcileErrs, fmt.Errorf("patch site status: %w", err))
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, errors.Join(reconcileErrs...)
 }
 
 // componentResult is the internal outcome of reconciling a single component,
@@ -175,6 +185,7 @@ type componentResult struct {
 	ready   bool
 	reason  string
 	message string
+	err     error
 }
 
 // componentConditionType maps a component name to its Site status condition
@@ -196,8 +207,56 @@ func componentConditionType(component string) string {
 
 func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&unboundedv1alpha3.Site{}).
+		For(&unboundedv1alpha3.Site{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		// Site status is written by the net controller (nodeCount/sliceCount) on
+		// node churn; reconciling on those status-only updates would re-apply the
+		// full net + machina manifest sets on every event. Filter to spec/
+		// generation changes (Create/Delete still pass) so component reconcile is
+		// driven by intent, not status noise.
+		Watches(
+			&corev1.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(r.requestsForMachinaConfig),
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc: func(e event.CreateEvent) bool { return r.isMachinaConfig(e.Object) },
+				DeleteFunc: func(e event.DeleteEvent) bool { return r.isMachinaConfig(e.Object) },
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					if !r.isMachinaConfig(e.ObjectNew) {
+						return false
+					}
+
+					oldConfig, oldOK := e.ObjectOld.(*corev1.ConfigMap)
+
+					newConfig, newOK := e.ObjectNew.(*corev1.ConfigMap)
+					if !oldOK || !newOK {
+						return false
+					}
+
+					return oldConfig.Data["config.yaml"] != newConfig.Data["config.yaml"]
+				},
+				GenericFunc: func(event.GenericEvent) bool { return false },
+			}),
+		).
 		Complete(r)
+}
+
+func (r *SiteReconciler) isMachinaConfig(obj client.Object) bool {
+	return obj.GetNamespace() == r.namespace() && obj.GetName() == "machina-config"
+}
+
+func (r *SiteReconciler) requestsForMachinaConfig(ctx context.Context, _ client.Object) []ctrl.Request {
+	sites, err := r.listSites(ctx)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "list Sites after machina config change")
+
+		return nil
+	}
+
+	requests := make([]ctrl.Request, 0, len(sites))
+	for i := range sites {
+		requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKey{Name: sites[i].Name}})
+	}
+
+	return requests
 }
 
 // reconcilePerSiteComponent reconciles a per-site component when enabled and
@@ -205,14 +264,14 @@ func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *SiteReconciler) reconcilePerSiteComponent(enabled bool, reconcile, cleanup func() error) componentResult {
 	if !enabled {
 		if err := cleanup(); err != nil {
-			return componentResult{ready: false, reason: reasonReconcileError, message: err.Error()}
+			return componentResult{ready: false, reason: reasonReconcileError, message: err.Error(), err: err}
 		}
 
 		return componentResult{ready: true, reason: reasonDisabled, message: "component disabled"}
 	}
 
 	if err := reconcile(); err != nil {
-		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error()}
+		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error(), err: err}
 	}
 
 	return componentResult{ready: true, reason: reasonReconciled, message: "component reconciled"}
@@ -238,7 +297,7 @@ func (r *SiteReconciler) reconcileSingletons(ctx context.Context) error {
 func (r *SiteReconciler) reconcileNet(ctx context.Context) componentResult {
 	sites, err := r.listSites(ctx)
 	if err != nil {
-		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error()}
+		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error(), err: err}
 	}
 
 	if len(sites) == 0 {
@@ -248,8 +307,8 @@ func (r *SiteReconciler) reconcileNet(ctx context.Context) componentResult {
 		return componentResult{ready: true, reason: reasonNoSites, message: "no sites; net retained"}
 	}
 
-	if err := r.applyManifestFS(ctx, netmanifests.Manifests, nil); err != nil {
-		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error()}
+	if err := r.applyManifestFS(ctx, netmanifests.Manifests, skipCRDObjects); err != nil {
+		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error(), err: err}
 	}
 
 	return componentResult{ready: true, reason: reasonReconciled, message: "component reconciled"}
@@ -260,7 +319,7 @@ func (r *SiteReconciler) reconcileNet(ctx context.Context) componentResult {
 func (r *SiteReconciler) reconcileMachina(ctx context.Context) componentResult {
 	sites, err := r.listSites(ctx)
 	if err != nil {
-		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error()}
+		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error(), err: err}
 	}
 
 	enabled := false
@@ -279,19 +338,21 @@ func (r *SiteReconciler) reconcileMachina(ctx context.Context) componentResult {
 		return componentResult{ready: true, reason: reasonDisabled, message: "no site enables machina; retained"}
 	}
 
-	if err := r.applyManifestFS(ctx, machinamanifests.Manifests, r.machinaApplyMutator(ctx)); err != nil {
-		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error()}
+	configHash, err := r.ensureMachinaConfig(ctx)
+	if err != nil {
+		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error(), err: err}
+	}
+
+	if err := r.applyManifestFS(ctx, machinamanifests.Manifests, r.machinaApplyMutator(configHash)); err != nil {
+		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error(), err: err}
 	}
 
 	return componentResult{ready: true, reason: reasonReconciled, message: "component reconciled"}
 }
 
-// machinaApplyMutator returns the mutate used when applying the machina
-// singleton. It layers migrated-config preservation on top of mutateMachinaObject:
-// the machina-config ConfigMap is created with embedded defaults only when it is
-// absent, so config migrated by the reaper (or later edited by an operator) is
-// never clobbered by a force-apply of the embedded defaults.
-func (r *SiteReconciler) machinaApplyMutator(ctx context.Context) func(*unstructured.Unstructured) error {
+// machinaApplyMutator skips the separately reconciled ConfigMap and stamps its
+// exact content hash on the Deployment so every config change rolls Machina.
+func (r *SiteReconciler) machinaApplyMutator(configHash string) func(*unstructured.Unstructured) error {
 	return func(obj *unstructured.Unstructured) error {
 		if err := r.mutateMachinaObject(obj); err != nil {
 			return err
@@ -302,14 +363,15 @@ func (r *SiteReconciler) machinaApplyMutator(ctx context.Context) func(*unstruct
 		}
 
 		if obj.GetKind() == "ConfigMap" && obj.GetName() == "machina-config" {
-			exists, err := r.objectExists(ctx, r.namespace(), "machina-config", &corev1.ConfigMap{})
-			if err != nil {
-				return err
-			}
+			obj.Object = nil
 
-			if exists {
-				// Preserve the existing (migrated/edited) config.
-				obj.Object = nil
+			return nil
+		}
+
+		if obj.GetKind() == "Deployment" && obj.GetName() == "machina-controller" {
+			if err := unstructured.SetNestedField(obj.Object, configHash,
+				"spec", "template", "metadata", "annotations", machinaConfigHashAnnotation); err != nil {
+				return fmt.Errorf("set machina config hash annotation: %w", err)
 			}
 		}
 
@@ -317,18 +379,96 @@ func (r *SiteReconciler) machinaApplyMutator(ctx context.Context) func(*unstruct
 	}
 }
 
-// objectExists reports whether a namespaced object of the given empty type
-// exists.
-func (r *SiteReconciler) objectExists(ctx context.Context, namespace, name string, obj client.Object) (bool, error) {
-	err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, obj)
-	switch {
-	case err == nil:
-		return true, nil
-	case apierrors.IsNotFound(err):
-		return false, nil
-	default:
-		return false, fmt.Errorf("get %s/%s: %w", namespace, name, err)
+func (r *SiteReconciler) ensureMachinaConfig(ctx context.Context) (string, error) {
+	desired, err := defaultMachinaConfigMap(r.namespace())
+	if err != nil {
+		return "", err
 	}
+
+	key := client.ObjectKeyFromObject(desired)
+	existing := &corev1.ConfigMap{}
+
+	err = r.Get(ctx, key, existing)
+	if apierrors.IsNotFound(err) {
+		config, mergeErr := setMachinaAPIServerEndpoint(desired.Data["config.yaml"], r.Config.APIServerEndpoint)
+		if mergeErr != nil {
+			return "", mergeErr
+		}
+
+		desired.Data["config.yaml"] = config
+		if createErr := r.Create(ctx, desired); createErr != nil {
+			return "", fmt.Errorf("create machina config %s/%s: %w", key.Namespace, key.Name, createErr)
+		}
+
+		return machinaConfigHash(config), nil
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("get machina config %s/%s: %w", key.Namespace, key.Name, err)
+	}
+
+	config := existing.Data["config.yaml"]
+
+	merged, err := setMachinaAPIServerEndpoint(config, r.Config.APIServerEndpoint)
+	if err != nil {
+		return "", err
+	}
+
+	if merged != config {
+		before := existing.DeepCopy()
+		if existing.Data == nil {
+			existing.Data = map[string]string{}
+		}
+
+		existing.Data["config.yaml"] = merged
+		if err := r.Patch(ctx, existing, client.MergeFrom(before)); err != nil {
+			return "", fmt.Errorf("update machina config %s/%s: %w", key.Namespace, key.Name, err)
+		}
+	}
+
+	return machinaConfigHash(merged), nil
+}
+
+func defaultMachinaConfigMap(namespace string) (*corev1.ConfigMap, error) {
+	files, err := yamlFiles(machinamanifests.Manifests)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, file := range files {
+		data, err := fs.ReadFile(machinamanifests.Manifests, file)
+		if err != nil {
+			return nil, fmt.Errorf("read machina manifest %s: %w", file, err)
+		}
+
+		decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+
+		for {
+			obj := &unstructured.Unstructured{}
+			if err := decoder.Decode(obj); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+
+				return nil, fmt.Errorf("decode machina manifest %s: %w", file, err)
+			}
+
+			if obj.Object == nil || obj.GetKind() != "ConfigMap" || obj.GetName() != "machina-config" {
+				continue
+			}
+
+			cm := &corev1.ConfigMap{}
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, cm); err != nil {
+				return nil, fmt.Errorf("convert machina config template: %w", err)
+			}
+
+			cm.Namespace = namespace
+
+			return cm, nil
+		}
+	}
+
+	return nil, errors.New("machina config template not found")
 }
 
 // reconcileMetalman deploys the per-site metalman PXE controller and its RBAC.
@@ -587,36 +727,70 @@ func (r *SiteReconciler) retargetNamespace(obj *unstructured.Unstructured) {
 		obj.SetNamespace(ns)
 	}
 
-	rewriteStringValues(obj.Object, buildDefaultNamespace, ns)
+	rewriteNamespaceValues(obj.Object, buildDefaultNamespace, ns)
 }
 
-// rewriteStringValues recursively replaces every string value equal to oldValue
-// with newValue, so embedded cross-references (RBAC subjects, webhook client
-// configs, config-map references) follow a retargeted namespace.
-func rewriteStringValues(value any, oldValue, newValue string) {
+// rewriteNamespaceValues recursively retargets every string value that embeds the
+// old namespace to the new one. Unlike a naive equality swap it also handles the
+// namespace appearing as a substring, which the rendered manifests rely on:
+//   - service-account usernames in ValidatingAdmissionPolicy CEL
+//     ("system:serviceaccount:<ns>:<sa>"), and
+//   - flag values ("--leader-elect-resource-namespace=<ns>").
+//
+// Runtime re-rendering of the templates is not an option here because the
+// component image references are baked into the rendered manifests at build time
+// and are not available to the operator process.
+func rewriteNamespaceValues(value any, oldNS, newNS string) {
 	switch typed := value.(type) {
 	case map[string]any:
 		for key, v := range typed {
-			if str, ok := v.(string); ok && str == oldValue {
-				typed[key] = newValue
+			if str, ok := v.(string); ok {
+				typed[key] = retargetNamespaceInString(str, oldNS, newNS)
 				continue
 			}
 
-			rewriteStringValues(v, oldValue, newValue)
+			rewriteNamespaceValues(v, oldNS, newNS)
 		}
 	case []any:
 		for i, v := range typed {
-			if str, ok := v.(string); ok && str == oldValue {
-				typed[i] = newValue
+			if str, ok := v.(string); ok {
+				typed[i] = retargetNamespaceInString(str, oldNS, newNS)
 				continue
 			}
 
-			rewriteStringValues(v, oldValue, newValue)
+			rewriteNamespaceValues(v, oldNS, newNS)
 		}
 	}
 }
 
+// retargetNamespaceInString rewrites the old namespace to the new one within a
+// single string value, covering exact matches, service-account usernames, and
+// flag values, while leaving unrelated strings (for example image references)
+// untouched.
+func retargetNamespaceInString(s, oldNS, newNS string) string {
+	if s == oldNS {
+		return newNS
+	}
+
+	if strings.Contains(s, "system:serviceaccount:"+oldNS+":") {
+		s = strings.ReplaceAll(s, "system:serviceaccount:"+oldNS+":", "system:serviceaccount:"+newNS+":")
+	}
+
+	if strings.HasPrefix(s, "--") && strings.HasSuffix(s, "="+oldNS) {
+		s = strings.TrimSuffix(s, "="+oldNS) + "=" + newNS
+	}
+
+	return s
+}
+
 func (r *SiteReconciler) mutateMachinaObject(obj *unstructured.Unstructured) error {
+	// CRDs are installed once at operator startup (BootstrapCRDs), not from the
+	// reconcile loop; skip them here so a Site event does not re-apply schemas.
+	if obj.GetKind() == crdKind {
+		obj.Object = nil
+		return nil
+	}
+
 	// Metalman RBAC ships in the machina manifests but is applied per-site by
 	// reconcileMetalman; skip it here so the singleton apply does not create it.
 	if isMetalmanSupportObject(obj) {
@@ -624,16 +798,15 @@ func (r *SiteReconciler) mutateMachinaObject(obj *unstructured.Unstructured) err
 		return nil
 	}
 
-	if obj.GetKind() == "ConfigMap" && obj.GetName() == "machina-config" && r.Config.APIServerEndpoint != "" {
-		current, _, err := unstructured.NestedString(obj.Object, "data", "config.yaml")
-		if err != nil {
-			return fmt.Errorf("get machina config data: %w", err)
-		}
+	return nil
+}
 
-		updated := strings.ReplaceAll(current, `apiServerEndpoint: ""`, fmt.Sprintf(`apiServerEndpoint: %q`, r.Config.APIServerEndpoint))
-		if err := unstructured.SetNestedField(obj.Object, updated, "data", "config.yaml"); err != nil {
-			return fmt.Errorf("set machina config data: %w", err)
-		}
+// skipCRDObjects nils out CustomResourceDefinition objects so the reconcile
+// loop never applies CRDs; the operator installs them once at startup via
+// BootstrapCRDs.
+func skipCRDObjects(obj *unstructured.Unstructured) error {
+	if obj.GetKind() == crdKind {
+		obj.Object = nil
 	}
 
 	return nil

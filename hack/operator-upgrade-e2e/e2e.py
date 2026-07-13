@@ -26,6 +26,10 @@ everything onto the unified `unbounded-system` namespace:
   * the legacy `unbounded-kube`/`unbounded-net` namespaces and the old
     `sites.net.unbounded-cloud.io` CRD are reaped.
 
+`kubectl unbounded install` no longer applies CRDs: the operator installs and
+upgrades them itself at startup (operator.BootstrapCRDs), so verify asserts the
+Site CRD is Established and owned by the unbounded-operator field manager.
+
 Scope: net + machina run for real in kind. Storage (RDMA) and metalman (PXE)
 cannot run in vanilla kind, so they are intentionally NOT installed in the old
 cluster (their reaping is covered by the in-process simulation test in
@@ -537,7 +541,38 @@ def _migration_complete() -> tuple[bool, str]:
         return False, (f"site-label dual-write mismatch: "
                        f"canonical={sorted(canonical)} deprecated={sorted(deprecated)}")
 
+    # 8. The operator owns CRD lifecycle: `kubectl unbounded install` no longer
+    # applies CRDs, the operator installs them at startup. Verify the Site CRD is
+    # Established and was server-side-applied by the operator field manager
+    # (proving the operator, not install, installed it).
+    if not _crd_established("sites.unbounded-cloud.io"):
+        return False, "sites.unbounded-cloud.io CRD not established yet"
+    if not _crd_managed_by("sites.unbounded-cloud.io", "unbounded-operator"):
+        return False, "sites.unbounded-cloud.io not yet owned by the unbounded-operator field manager"
+
+    # 9. Operator config is delivered via the ConfigMap install populated.
+    if not resource_exists(["-n", TARGET_NS, "configmap", "unbounded-operator-config"]):
+        return False, "unbounded-operator-config ConfigMap not present"
+
     return True, "migration complete"
+
+
+def _crd_established(name: str) -> bool:
+    out = kubectl_out(["get", "crd", name, "-o", "json"], check=False)
+    try:
+        conds = json.loads(out).get("status", {}).get("conditions", [])
+    except json.JSONDecodeError:
+        return False
+    return any(c.get("type") == "Established" and c.get("status") == "True" for c in conds)
+
+
+def _crd_managed_by(name: str, manager: str) -> bool:
+    out = kubectl_out(["get", "crd", name, "-o", "json"], check=False)
+    try:
+        managed = json.loads(out).get("metadata", {}).get("managedFields", [])
+    except json.JSONDecodeError:
+        return False
+    return any(f.get("manager") == manager for f in managed)
 
 
 def _nodes_with_label(key: str, value: str) -> set[str]:

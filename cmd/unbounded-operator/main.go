@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -21,6 +22,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -33,16 +35,33 @@ import (
 )
 
 func main() {
+	cmd := newCommand(run)
+	if err := cmd.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func newCommand(runFn func(context.Context, config) error) *cobra.Command {
 	var cfg config
 
 	cmd := &cobra.Command{
 		Use:   "unbounded-operator",
 		Short: "Controller for top-level Unbounded Site configuration",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if !cmd.Flags().Changed("reap-legacy-resources") {
+				reapLegacyResources, err := envBoolDefault("UNBOUNDED_REAP_LEGACY_RESOURCES", true)
+				if err != nil {
+					return err
+				}
+
+				cfg.reapLegacyResources = reapLegacyResources
+			}
+
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
 
-			return run(ctx, cfg)
+			return runFn(ctx, cfg)
 		},
 		Version: version.Version + " (commit: " + version.GitCommit + ")",
 	}
@@ -53,15 +72,12 @@ func main() {
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace(), "Namespace for the leader election lease")
 	cmd.Flags().StringVar(&cfg.namespace, "namespace", unbounded.SystemNamespace(), "Namespace the operator reconciles components into and migrates legacy state to")
 	cmd.Flags().StringVar(&cfg.metalmanImage, "metalman-image", "", "Default metalman image")
-	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint advertised by machina")
-	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", true, "Translate legacy net-group Sites, migrate state into unbounded-system, and reap the pre-consolidation namespaces")
+	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", os.Getenv("UNBOUNDED_API_SERVER_ENDPOINT"), "Kubernetes API server endpoint advertised by machina (defaults to $UNBOUNDED_API_SERVER_ENDPOINT)")
+	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", true, "Translate legacy net-group Sites, migrate state into unbounded-system, and reap the pre-consolidation namespaces (defaults to $UNBOUNDED_REAP_LEGACY_RESOURCES or true)")
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
 
-	if err := cmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
+	return cmd
 }
 
 type config struct {
@@ -75,6 +91,22 @@ type config struct {
 	reapLegacyResources     bool
 }
 
+// envBoolDefault returns the boolean value of the named environment variable, or
+// fallback when it is unset. Set values must be valid booleans.
+func envBoolDefault(name string, fallback bool) (bool, error) {
+	raw, ok := os.LookupEnv(name)
+	if !ok {
+		return fallback, nil
+	}
+
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("parse %s: %w", name, err)
+	}
+
+	return value, nil
+}
+
 func run(ctx context.Context, cfg config) error {
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 
@@ -85,7 +117,22 @@ func run(ctx context.Context, cfg config) error {
 		namespace = unbounded.SystemNamespace()
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restConfig := ctrl.GetConfigOrDie()
+
+	// Install/upgrade the CRDs before starting the manager: the typed Site
+	// informer cannot sync until the Site CRD is served, and the operator owns
+	// CRD lifecycle so a cluster can be maintained by applying the operator
+	// manifests alone. This runs on every start and is idempotent.
+	bootstrapClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		return fmt.Errorf("create bootstrap client: %w", err)
+	}
+
+	if err := operator.BootstrapCRDs(ctx, bootstrapClient); err != nil {
+		return fmt.Errorf("bootstrap CRDs: %w", err)
+	}
+
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                        scheme,
 		Metrics:                       metricsserver.Options{BindAddress: cfg.metricsAddr},
 		HealthProbeBindAddress:        cfg.probeAddr,
@@ -112,11 +159,13 @@ func run(ctx context.Context, cfg config) error {
 
 	if cfg.reapLegacyResources {
 		reaper := &operator.LegacyReaper{
-			Client:           mgr.GetClient(),
-			TargetNamespace:  namespace,
-			LegacyNamespaces: operator.LegacyNamespaces,
-			SkipSecretNames:  map[string]struct{}{"unbounded-net-serving-cert": {}},
-			CopyConfigMaps:   []string{"machina-config"},
+			Client:            mgr.GetClient(),
+			TargetNamespace:   namespace,
+			LegacyNamespaces:  operator.LegacyNamespaces,
+			SkipSecretNames:   map[string]struct{}{"unbounded-net-serving-cert": {}},
+			CopyConfigMaps:    []string{"machina-config"},
+			APIServerEndpoint: cfg.apiServerEndpoint,
+			Recorder:          mgr.GetEventRecorder("unbounded-operator-reaper"),
 		}
 		if err := reaper.SetupWithManager(mgr); err != nil {
 			return fmt.Errorf("setup legacy reaper: %w", err)

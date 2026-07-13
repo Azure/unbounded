@@ -50,9 +50,11 @@ below.
 ### `kubectl unbounded install`
 
 Bootstrap a cluster with the Unbounded CRDs and `unbounded-operator`. This
-command applies the machina CRDs, the net CRDs, and the operator manifests. It
-does not deploy component workloads directly; the operator reconciles those from
-`Site.spec.components` after Sites are created or updated.
+command applies the operator manifests and waits for the operator to roll out.
+The operator itself installs and upgrades the machina and net CRDs at startup, so
+`install` no longer applies CRDs directly. It does not deploy component workloads
+directly; the operator reconciles those from `Site.spec.components` after Sites
+are created or updated.
 
 ```bash
 kubectl unbounded install
@@ -64,10 +66,13 @@ Optional flags:
 |------|------|---------|-------------|
 | `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
 | `--namespace` | `string` | `unbounded-system` | Namespace for the operator and default components |
-| `--skip-crds` | `bool` | `false` | Skip applying CRDs |
-| `--wait` | `bool` | `true` | Wait for the operator rollout |
+| `--wait` | `bool` | `true` | Wait for the operator rollout and CRD establishment |
 | `--timeout` | `duration` | `5m0s` | Timeout for rollout waits |
 | `--api-server-endpoint` | `string` | kubeconfig server | API server endpoint advertised to provisioned machines |
+
+> **Breaking change:** the `--skip-crds` flag has been removed. CRDs are now owned
+> and installed by the operator at startup (`operator.BootstrapCRDs`), so there is
+> nothing for `install` to skip. Automation passing `--skip-crds` must drop it.
 
 The image flags (`--operator-image` and `--metalman-image`) override the images
 embedded in the release manifests.
