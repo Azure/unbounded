@@ -279,8 +279,12 @@ impl FanoutTable {
         cache_id: Option<&str>,
         stripe_off: u64,
     ) -> Owner<'_> {
-        let drive_numa = self.disk_channels.drive_numa(cache_id);
-        let pick = numa_local_shard(key, stripe_off, &drive_numa, &self.numa_shards);
+        let disk_snapshot = self.disk_channels.snapshot(cache_id);
+        let drive_numa = disk_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.drive_numa.as_slice())
+            .unwrap_or_default();
+        let pick = numa_local_shard(key, stripe_off, drive_numa, &self.numa_shards);
 
         if pick.cross_numa {
             crate::metrics::fanout_cross_numa_fetch();

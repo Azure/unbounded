@@ -78,7 +78,11 @@ impl OwnerShardTable {
             return None;
         }
 
-        let drive_numa = self.cache_directories.drive_numa(req.cache_id());
+        let disk_snapshot = self.cache_directories.snapshot(req.cache_id());
+        let drive_numa = disk_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.drive_numa.as_slice())
+            .unwrap_or_default();
         let target_numa = if drive_numa.is_empty() {
             None
         } else {
