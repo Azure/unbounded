@@ -23,7 +23,9 @@ data:
   # External Kubernetes API endpoint advertised to provisioned machines. Remote
   # nodes dial this to join, so it must be reachable from outside the cluster and
   # cannot be derived in-cluster. Set this before enabling machina provisioning.
-  UNBOUNDED_API_SERVER_ENDPOINT: ""
+  # Rendered from .APIServerEndpoint so make/GitOps deploys can set it via
+  # --set APIServerEndpoint=; `kubectl unbounded install` overrides it in place.
+  UNBOUNDED_API_SERVER_ENDPOINT: "{{ default "" .APIServerEndpoint }}"
   # Whether the operator translates legacy net-group Sites, migrates state into
   # this namespace, and reaps the pre-consolidation namespaces.
   UNBOUNDED_REAP_LEGACY_RESOURCES: "true"

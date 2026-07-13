@@ -6,6 +6,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -30,6 +32,14 @@ import (
 )
 
 const defaultInstallTimeout = 5 * time.Minute
+
+// operatorConfigHashAnnotation is stamped onto the operator Deployment pod
+// template so a change to the environment-specific operator config (currently the
+// advertised api-server-endpoint) changes the pod template and triggers a
+// rollout. Without it a re-install that only edits the unbounded-operator-config
+// ConfigMap would not restart the operator, and envFrom is read once at pod
+// start, so the running operator would keep advertising the old endpoint.
+const operatorConfigHashAnnotation = "unbounded-cloud.io/operator-config-hash"
 
 type installHandler struct {
 	kubeconfigPath string
@@ -190,9 +200,25 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 				return err
 			}
 		}
+
+		// Stamp the config hash so a changed endpoint rolls the pod (see #3);
+		// this mirrors the render-time hash in 03-deployment.yaml.tmpl.
+		if err := unstructured.SetNestedField(obj.Object, operatorConfigHash(h.apiServerEndpoint), "spec", "template", "metadata", "annotations", operatorConfigHashAnnotation); err != nil {
+			return fmt.Errorf("set operator config hash annotation: %w", err)
+		}
 	}
 
 	return nil
+}
+
+// operatorConfigHash returns a stable hash of the environment-specific operator
+// config. It mirrors the render-time hash in 03-deployment.yaml.tmpl (sprig's
+// sha256sum of the endpoint) so both the install path and make-rendered
+// manifests roll the operator when the advertised api-server-endpoint changes.
+func operatorConfigHash(apiServerEndpoint string) string {
+	sum := sha256.Sum256([]byte(apiServerEndpoint))
+
+	return hex.EncodeToString(sum[:])
 }
 
 func (h *installHandler) waitForOperator(ctx context.Context) error {
@@ -207,7 +233,7 @@ func (h *installHandler) waitForOperator(ctx context.Context) error {
 			if !apierrors.IsNotFound(err) {
 				return fmt.Errorf("get unbounded-operator deployment: %w", err)
 			}
-		} else if deploymentAvailable(deploy) {
+		} else if deploymentRolloutComplete(deploy) {
 			return nil
 		}
 
@@ -289,13 +315,27 @@ func crdEstablished(obj *unstructured.Unstructured) bool {
 	return false
 }
 
-func deploymentAvailable(deploy *appsv1.Deployment) bool {
+// deploymentRolloutComplete reports whether a Deployment rollout has fully
+// completed: the controller has observed the current generation and every
+// replica is updated, present, and available. This is the same condition
+// `kubectl rollout status` waits on.
+//
+// A weaker "available" check (AvailableReplicas >= desired) is not enough during
+// an upgrade: with the default RollingUpdate strategy at replicas: 1 the old
+// ReplicaSet stays Available while a new, possibly crash-looping, pod surges in,
+// so install would report success against the old operator. Requiring
+// Replicas == UpdatedReplicas == AvailableReplicas == desired rejects that case
+// (old replicas gone, the new pod is the only one and is available).
+func deploymentRolloutComplete(deploy *appsv1.Deployment) bool {
 	desired := int32(1)
 	if deploy.Spec.Replicas != nil {
 		desired = *deploy.Spec.Replicas
 	}
 
-	return deploy.Status.ObservedGeneration >= deploy.Generation && deploy.Status.AvailableReplicas >= desired
+	return deploy.Status.ObservedGeneration >= deploy.Generation &&
+		deploy.Status.UpdatedReplicas == desired &&
+		deploy.Status.Replicas == desired &&
+		deploy.Status.AvailableReplicas == desired
 }
 
 func applyManifestFS(ctx context.Context, logger *slog.Logger, k8sClient client.Client, manifests fs.FS, fieldManager string, mutate func(*unstructured.Unstructured) error) error {

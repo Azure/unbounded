@@ -20,6 +20,13 @@ spec:
       labels:
         app.kubernetes.io/name: unbounded-operator
         app.kubernetes.io/component: controller
+      annotations:
+        # Rolls the operator when the advertised api-server-endpoint changes at
+        # render time. envFrom is read once at pod start, so without a pod-template
+        # change a re-render with a new endpoint would not restart the operator.
+        # The `kubectl unbounded install` path stamps the same annotation. See
+        # deploy/unbounded-operator/04-configmap.yaml.tmpl.
+        unbounded-cloud.io/operator-config-hash: {{ default "" .APIServerEndpoint | sha256sum }}
     spec:
       serviceAccountName: unbounded-operator
       containers:
@@ -52,6 +59,18 @@ spec:
             requests:
               cpu: 50m
               memory: 64Mi
+          startupProbe:
+            # The operator installs/establishes CRDs at startup
+            # (operator.BootstrapCRDs, crdEstablishedTimeout ~= 2m) before the
+            # manager starts and binds the health server, so /healthz is not
+            # served during bootstrap. Give startup up to 150s (30 x 5s), which
+            # exceeds the bootstrap timeout, before liveness takes over; otherwise
+            # liveness would restart the container mid-bootstrap.
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 5
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: /healthz

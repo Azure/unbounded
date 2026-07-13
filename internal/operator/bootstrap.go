@@ -31,7 +31,11 @@ const (
 	crdKind = "CustomResourceDefinition"
 
 	// crdEstablishedTimeout bounds how long BootstrapCRDs waits for every applied
-	// CRD to be served by the apiserver before giving up.
+	// CRD to be served by the apiserver before giving up. The operator health
+	// server only binds after bootstrap (mgr.Start), so the Deployment's
+	// startupProbe budget in deploy/unbounded-operator/03-deployment.yaml.tmpl
+	// must exceed this timeout, otherwise liveness restarts the container
+	// mid-bootstrap.
 	crdEstablishedTimeout = 2 * time.Minute
 
 	// crdEstablishedPoll is the poll interval while waiting for CRDs to become
