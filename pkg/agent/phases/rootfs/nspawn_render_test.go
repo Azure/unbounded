@@ -124,6 +124,28 @@ func TestServiceOverride_AMDGPUDevices(t *testing.T) {
 	require.Contains(t, nspawnBuf.String(), "BindReadOnly=/sys/class/kfd")
 }
 
+func TestNSpawnConfig_NVIDIADriverRootMounts(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "nspawn.conf", nspawnTemplateData{
+		NvidiaGPUDevicePaths: []string{"/dev/nvidia0"},
+		NvidiaLibDirMounts: []goalstates.NvidiaLibDirMount{{
+			HostDir:      "/usr/lib/x86_64-linux-gnu",
+			ContainerDir: "/run/host-nvidia/0",
+		}},
+		NvidiaI386LibDirMounts: []goalstates.NvidiaLibDirMount{{
+			HostDir:      "/usr/lib/i386-linux-gnu",
+			ContainerDir: "/run/host-nvidia-i386/0",
+		}},
+		NvidiaSMIDir: "/usr/bin",
+	}))
+
+	require.Contains(t, buf.String(), "BindReadOnly=/usr/lib/x86_64-linux-gnu:/run/host-nvidia/0")
+	require.Contains(t, buf.String(), "BindReadOnly=/usr/lib/i386-linux-gnu:/run/host-nvidia-i386/0")
+	require.Contains(t, buf.String(), "BindReadOnly=/usr/bin:/run/host-nvidia-bin")
+}
+
 func TestPathsExcluding(t *testing.T) {
 	t.Parallel()
 
