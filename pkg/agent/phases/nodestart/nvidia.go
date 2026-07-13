@@ -114,46 +114,81 @@ func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
 	return nil
 }
 
-func (s *setupNVIDIA) prepareDriverRoot(ctx context.Context) error {
-	machine := s.goalState.MachineName
-	driverDir := goalstates.NvidiaDriverDir
-	driverLibDir := filepath.Join(driverDir, "lib", filepath.Base(s.goalState.Nvidia.ContainerLibDir))
-	i386LibDir := filepath.Join(driverDir, "lib", "i386-linux-gnu")
+type nvidiaDriverRootPaths struct {
+	rootDir    string
+	libDir     string
+	i386LibDir string
+	libDirName string
+}
 
+func (s *setupNVIDIA) prepareDriverRoot(ctx context.Context) error {
 	if s.goalState.Nvidia.DriverVersion == "" {
 		return fmt.Errorf("cannot prepare NVIDIA driver root: active driver version was not detected")
 	}
 
-	if _, err := executil.MachineRun(ctx, s.log, machine,
-		"rm", "-rf", driverDir,
-	); err != nil {
+	paths := s.driverRootPaths()
+
+	if err := s.initializeDriverRoot(ctx, paths); err != nil {
+		return err
+	}
+
+	if err := s.copyDriverLibraries(ctx, paths); err != nil {
+		return err
+	}
+
+	if err := s.copyCompat32DriverLibraries(ctx, paths); err != nil {
+		return err
+	}
+
+	if err := s.copyNVIDIASMI(ctx, paths); err != nil {
+		return err
+	}
+
+	if err := s.createDriverRootLinks(ctx, paths); err != nil {
+		return err
+	}
+
+	if err := s.generateDriverRootLinkerCache(ctx, paths); err != nil {
+		return err
+	}
+
+	return s.validateDriverRoot(ctx, paths)
+}
+
+func (s *setupNVIDIA) driverRootPaths() nvidiaDriverRootPaths {
+	libDirName := filepath.Base(s.goalState.Nvidia.ContainerLibDir)
+
+	return nvidiaDriverRootPaths{
+		rootDir:    goalstates.NvidiaDriverDir,
+		libDir:     filepath.Join(goalstates.NvidiaDriverDir, "lib", libDirName),
+		i386LibDir: filepath.Join(goalstates.NvidiaDriverDir, "lib", "i386-linux-gnu"),
+		libDirName: libDirName,
+	}
+}
+
+func (s *setupNVIDIA) initializeDriverRoot(ctx context.Context, paths nvidiaDriverRootPaths) error {
+	machine := s.goalState.MachineName
+	if _, err := executil.MachineRun(ctx, s.log, machine, "rm", "-rf", paths.rootDir); err != nil {
 		return fmt.Errorf("remove NVIDIA driver root: %w", err)
 	}
 
 	if _, err := executil.MachineRun(ctx, s.log, machine,
-		"mkdir", "-p", driverLibDir, i386LibDir,
-		filepath.Join(driverDir, "usr", "bin"),
-		filepath.Join(driverDir, "usr", "lib"),
-		filepath.Join(driverDir, "sbin"),
-		filepath.Join(driverDir, "etc"),
+		"mkdir", "-p", paths.libDir, paths.i386LibDir,
+		filepath.Join(paths.rootDir, "usr", "bin"),
+		filepath.Join(paths.rootDir, "usr", "lib"),
+		filepath.Join(paths.rootDir, "sbin"),
+		filepath.Join(paths.rootDir, "etc"),
 	); err != nil {
 		return fmt.Errorf("create NVIDIA driver root: %w", err)
 	}
 
-	for _, lib := range s.goalState.Nvidia.LibMappings {
-		destination := filepath.Join(driverLibDir, filepath.Base(lib.HostPath))
-		if filepath.Base(filepath.Dir(lib.HostPath)) == "vdpau" {
-			destination = filepath.Join(driverLibDir, "vdpau", filepath.Base(lib.HostPath))
-			if _, err := executil.MachineRun(ctx, s.log, machine, "mkdir", "-p", filepath.Dir(destination)); err != nil {
-				return fmt.Errorf("create NVIDIA VDPAU directory: %w", err)
-			}
-		}
+	return nil
+}
 
-		// Each discovered name is materialized as a regular file. Discovery
-		// includes both aliases and their versioned targets, so the driver root
-		// does not depend on symlinks resolving back into the host mount.
-		if _, err := executil.MachineRun(ctx, s.log, machine, "cp", "-aL", lib.ContainerPath, destination); err != nil {
-			return fmt.Errorf("copy NVIDIA library %s: %w", lib.ContainerPath, err)
+func (s *setupNVIDIA) copyDriverLibraries(ctx context.Context, paths nvidiaDriverRootPaths) error {
+	for _, lib := range s.goalState.Nvidia.LibMappings {
+		if err := s.copyDriverLibrary(ctx, lib, paths.libDir); err != nil {
+			return err
 		}
 	}
 
@@ -161,90 +196,121 @@ func (s *setupNVIDIA) prepareDriverRoot(ctx context.Context) error {
 	// filesystem scan. Materialize real files under the active driver version
 	// because nvidia-ctk requires those names for core libraries.
 	for _, copy := range versionedNVIDIALibraryCopies(s.goalState.Nvidia.LibMappings, s.goalState.Nvidia.DriverVersion) {
-		destination := filepath.Join(driverLibDir, copy.relativeDestination)
-		if _, err := executil.MachineRun(ctx, s.log, machine, "mkdir", "-p", filepath.Dir(destination)); err != nil {
+		destination := filepath.Join(paths.libDir, copy.relativeDestination)
+		if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName, "mkdir", "-p", filepath.Dir(destination)); err != nil {
 			return fmt.Errorf("create directory for versioned NVIDIA library: %w", err)
 		}
 
-		if _, err := executil.MachineRun(ctx, s.log, machine, "cp", "-aL", copy.source, destination); err != nil {
+		if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName, "cp", "-aL", copy.source, destination); err != nil {
 			return fmt.Errorf("create versioned NVIDIA library %s: %w", destination, err)
 		}
 	}
 
-	if filepath.Base(s.goalState.Nvidia.ContainerLibDir) == "x86_64-linux-gnu" && len(s.goalState.Nvidia.I386LibMappings) == 0 {
+	return nil
+}
+
+func (s *setupNVIDIA) copyCompat32DriverLibraries(ctx context.Context, paths nvidiaDriverRootPaths) error {
+	if paths.libDirName == "x86_64-linux-gnu" && len(s.goalState.Nvidia.I386LibMappings) == 0 {
 		s.log.Warn("matching NVIDIA compat32 libraries were not found",
 			slog.String("driverVersion", s.goalState.Nvidia.DriverVersion),
 		)
 	}
 
 	for _, lib := range s.goalState.Nvidia.I386LibMappings {
-		destination := filepath.Join(i386LibDir, filepath.Base(lib.HostPath))
-		if filepath.Base(filepath.Dir(lib.HostPath)) == "vdpau" {
-			destination = filepath.Join(i386LibDir, "vdpau", filepath.Base(lib.HostPath))
-			if _, err := executil.MachineRun(ctx, s.log, machine, "mkdir", "-p", filepath.Dir(destination)); err != nil {
-				return fmt.Errorf("create i386 NVIDIA VDPAU directory: %w", err)
-			}
-		}
-
-		if _, err := executil.MachineRun(ctx, s.log, machine, "cp", "-aL", lib.ContainerPath, destination); err != nil {
-			return fmt.Errorf("copy i386 NVIDIA library %s: %w", lib.ContainerPath, err)
+		if err := s.copyDriverLibrary(ctx, lib, paths.i386LibDir); err != nil {
+			return err
 		}
 	}
 
-	if s.goalState.Nvidia.NvidiaSMIPath != "" {
-		if _, err := executil.MachineRun(ctx, s.log, machine,
-			"cp", "-L", filepath.Join(goalstates.NvidiaHostBinDir, filepath.Base(s.goalState.Nvidia.NvidiaSMIPath)),
-			filepath.Join(driverDir, "usr", "bin", "nvidia-smi"),
-		); err != nil {
-			return fmt.Errorf("copy nvidia-smi: %w", err)
+	return nil
+}
+
+func (s *setupNVIDIA) copyDriverLibrary(ctx context.Context, lib goalstates.NvidiaLibMapping, destinationDir string) error {
+	destination := filepath.Join(destinationDir, filepath.Base(lib.HostPath))
+	if filepath.Base(filepath.Dir(lib.HostPath)) == "vdpau" {
+		destination = filepath.Join(destinationDir, "vdpau", filepath.Base(lib.HostPath))
+		if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName, "mkdir", "-p", filepath.Dir(destination)); err != nil {
+			return fmt.Errorf("create NVIDIA VDPAU directory: %w", err)
 		}
 	}
 
+	// Each discovered name is materialized as a regular file. Discovery
+	// includes both aliases and their versioned targets, so the driver root
+	// does not depend on symlinks resolving back into the host mount.
+	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName, "cp", "-aL", lib.ContainerPath, destination); err != nil {
+		return fmt.Errorf("copy NVIDIA library %s: %w", lib.ContainerPath, err)
+	}
+
+	return nil
+}
+
+func (s *setupNVIDIA) copyNVIDIASMI(ctx context.Context, paths nvidiaDriverRootPaths) error {
+	if s.goalState.Nvidia.NvidiaSMIPath == "" {
+		return nil
+	}
+
+	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName,
+		"cp", "-L", filepath.Join(goalstates.NvidiaHostBinDir, filepath.Base(s.goalState.Nvidia.NvidiaSMIPath)),
+		filepath.Join(paths.rootDir, "usr", "bin", "nvidia-smi"),
+	); err != nil {
+		return fmt.Errorf("copy nvidia-smi: %w", err)
+	}
+
+	return nil
+}
+
+func (s *setupNVIDIA) createDriverRootLinks(ctx context.Context, paths nvidiaDriverRootPaths) error {
+	machine := s.goalState.MachineName
 	if _, err := executil.MachineRun(ctx, s.log, machine,
-		"ln", "-sfn", filepath.Join("..", "..", "lib", filepath.Base(s.goalState.Nvidia.ContainerLibDir)),
-		filepath.Join(driverDir, "usr", "lib", filepath.Base(s.goalState.Nvidia.ContainerLibDir)),
+		"ln", "-sfn", filepath.Join("..", "..", "lib", paths.libDirName),
+		filepath.Join(paths.rootDir, "usr", "lib", paths.libDirName),
 	); err != nil {
 		return fmt.Errorf("link NVIDIA multiarch library directory: %w", err)
 	}
 
 	if _, err := executil.MachineRun(ctx, s.log, machine,
 		"ln", "-sfn", filepath.Join("..", "..", "lib", "i386-linux-gnu"),
-		filepath.Join(driverDir, "usr", "lib", "i386-linux-gnu"),
+		filepath.Join(paths.rootDir, "usr", "lib", "i386-linux-gnu"),
 	); err != nil {
 		return fmt.Errorf("link NVIDIA i386 library directory: %w", err)
 	}
 
 	if _, err := executil.MachineRun(ctx, s.log, machine,
-		"ln", "-sfn", "/sbin/ldconfig", filepath.Join(driverDir, "sbin", "ldconfig"),
+		"ln", "-sfn", "/sbin/ldconfig", filepath.Join(paths.rootDir, "sbin", "ldconfig"),
 	); err != nil {
 		return fmt.Errorf("link NVIDIA driver ldconfig: %w", err)
 	}
 
-	ldConfigPath := filepath.Join(driverDir, "etc", "ld.so.conf")
-	libDirName := filepath.Base(s.goalState.Nvidia.ContainerLibDir)
+	return nil
+}
 
-	ldConfigDirs := []string{filepath.Join("/lib", libDirName), filepath.Join("/usr/lib", libDirName)}
+func (s *setupNVIDIA) generateDriverRootLinkerCache(ctx context.Context, paths nvidiaDriverRootPaths) error {
+	ldConfigDirs := []string{filepath.Join("/lib", paths.libDirName), filepath.Join("/usr/lib", paths.libDirName)}
 	if len(s.goalState.Nvidia.I386LibDirMounts) > 0 {
 		ldConfigDirs = append(ldConfigDirs, "/lib/i386-linux-gnu", "/usr/lib/i386-linux-gnu")
 	}
 
-	writeConfigArgs := []string{"sh", "-c", `printf '%s\n' "$@" > "$0"`, ldConfigPath}
+	writeConfigArgs := []string{"sh", "-c", `printf '%s\n' "$@" > "$0"`, filepath.Join(paths.rootDir, "etc", "ld.so.conf")}
 	writeConfigArgs = append(writeConfigArgs, ldConfigDirs...)
 
-	if _, err := executil.MachineRun(ctx, s.log, machine, writeConfigArgs...); err != nil {
+	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName, writeConfigArgs...); err != nil {
 		return fmt.Errorf("write NVIDIA driver linker configuration: %w", err)
 	}
 
-	if _, err := executil.MachineRun(ctx, s.log, machine, "ldconfig", "-r", driverDir); err != nil {
+	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName, "ldconfig", "-r", paths.rootDir); err != nil {
 		return fmt.Errorf("generate NVIDIA driver linker cache: %w", err)
 	}
 
-	for _, requiredPath := range requiredVersionedNVIDIALibraryPaths(driverLibDir, s.goalState.Nvidia.DriverVersion) {
-		if _, err := executil.MachineRun(ctx, s.log, machine, "test", "-f", requiredPath); err != nil {
+	return nil
+}
+
+func (s *setupNVIDIA) validateDriverRoot(ctx context.Context, paths nvidiaDriverRootPaths) error {
+	for _, requiredPath := range requiredVersionedNVIDIALibraryPaths(paths.libDir, s.goalState.Nvidia.DriverVersion) {
+		if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName, "test", "-f", requiredPath); err != nil {
 			return fmt.Errorf("required NVIDIA driver library %s is missing: %w", requiredPath, err)
 		}
 
-		if _, err := executil.MachineRun(ctx, s.log, machine, "test", "!", "-L", requiredPath); err != nil {
+		if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName, "test", "!", "-L", requiredPath); err != nil {
 			return fmt.Errorf("required NVIDIA driver library %s is not a real file: %w", requiredPath, err)
 		}
 	}
