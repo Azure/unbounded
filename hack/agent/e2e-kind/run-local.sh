@@ -227,6 +227,11 @@ if command -v nmcli &>/dev/null; then
     sudo nmcli device set veth-kind-e2e managed no 2>/dev/null || true
 fi
 
+# Advertise the control-plane's VM-bridge IP as its Node InternalIP. Worker
+# kindnet routes the control-plane pod CIDR via this address; the Docker IP is
+# not on-link from the VM subnet and would make route reconciliation panic.
+python3 "$E2E" "${E2E_ARGS[@]}" configure-kind-node-ip
+
 # ---------------------------------------------------------------------------
 # Install Machine CRD
 # ---------------------------------------------------------------------------

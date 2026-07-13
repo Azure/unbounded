@@ -2,13 +2,9 @@
 // Licensed under the MIT License.
 
 //! Shared value types for the stripe DHT: ring positions, topology
-//! tags, peer entries, and the recursive-routing request.
+//! tags, and peer entries.
 
-use std::time::Instant;
-
-use crate::bufferpool::{Req, StripeKey, TraceCtx};
-use crate::p2p::ring::stripe_to_ring;
-use crate::storage::OriginRef;
+use crate::bufferpool::StripeKey;
 
 /// Opaque node identifier minted by the p2p layer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -50,113 +46,9 @@ pub struct PeerEntry {
     pub tags: TopologyTags,
 }
 
-/// Recursive-routing request. Unlike the old source-routed
-/// placeholder this carries no path; each forwarder computes its
-/// own next hop from its local finger table.
-#[derive(Clone, Debug)]
-pub struct P2pReq {
-    pub key: StripeKey,
-    /// Cached `stripe_to_ring(key)` so each forwarder can pick a
-    /// next hop without rehashing the 32-byte key. The caller is
-    /// responsible for keeping this consistent with `key`; tests
-    /// may pass a different mapping for coverage.
-    pub target: RingId,
-    pub deadline: Instant,
-    pub trace: TraceCtx,
-    pub hops: u32,
-    /// Origin context for the stripe, populated by a frontend that
-    /// knows which origin object the stripe came from. Peer
-    /// handlers ignore it (they serve from their local cache by
-    /// `key`); it is consulted only when the request falls through
-    /// to the origin tier and the backend must map `key` back to an
-    /// origin byte range. `None` for peer-internal forwarding where
-    /// no origin is known or needed.
-    pub origin: Option<OriginRef>,
-}
-
-impl P2pReq {
-    pub fn new(key: StripeKey, deadline: Instant, trace: TraceCtx) -> Self {
-        Self {
-            key,
-            target: stripe_to_ring(key),
-            deadline,
-            trace,
-            hops: 0,
-            origin: None,
-        }
-    }
-
-    pub fn new_with_target(
-        key: StripeKey,
-        target: RingId,
-        deadline: Instant,
-        trace: TraceCtx,
-    ) -> Self {
-        Self {
-            key,
-            target,
-            deadline,
-            trace,
-            hops: 0,
-            origin: None,
-        }
-    }
-
-    /// Attach origin context, consumed builder-style. Backward
-    /// compatible: callers that do not know the origin simply skip
-    /// this and leave `origin` as `None`.
-    pub fn with_origin(mut self, origin: OriginRef) -> Self {
-        self.origin = Some(origin);
-        self
-    }
-
-    /// Borrow the origin context, if any.
-    pub fn origin(&self) -> Option<&OriginRef> {
-        self.origin.as_ref()
-    }
-}
-
-impl Req for P2pReq {
-    fn key(&self) -> StripeKey {
-        self.key
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    #[test]
-    fn new_populates_fields_with_zero_hops() {
-        let key = StripeKey([7u8; 32]);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let req = P2pReq::new(key, deadline, TraceCtx::default());
-        assert_eq!(req.key, key);
-        assert_eq!(req.target, stripe_to_ring(key));
-        assert_eq!(req.deadline, deadline);
-        assert_eq!(req.hops, 0);
-    }
-
-    #[test]
-    fn req_trait_returns_key() {
-        let key = StripeKey([3u8; 32]);
-        let req = P2pReq::new_with_target(key, RingId(0), Instant::now(), TraceCtx::default());
-        assert_eq!(<P2pReq as Req>::key(&req), key);
-    }
-
-    #[test]
-    fn origin_defaults_none_and_round_trips_via_builder() {
-        let origin = OriginRef::new("primary-s3", "models/llama.bin", 5);
-        let key = origin.stripe_key();
-        let req = P2pReq::new(key, Instant::now(), TraceCtx::default());
-        assert_eq!(req.origin(), None);
-
-        let req = req.with_origin(origin.clone());
-        assert_eq!(req.origin(), Some(&origin));
-        // The key contract is untouched by attaching origin.
-        assert_eq!(<P2pReq as Req>::key(&req), key);
-    }
 
     #[test]
     fn ring_id_orders_by_raw_u64() {
