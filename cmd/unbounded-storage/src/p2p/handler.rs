@@ -15,7 +15,6 @@
 //! asks the next hop to RDMA-write into scratch, then relays that scratch
 //! page upstream.
 
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -25,14 +24,10 @@ use serde::de::DeserializeOwned;
 
 use crate::bufferpool::{BulkRef, Error as PoolError, PageRef, PageStream, Req, StripeKey};
 use crate::fabric::scratch::ScratchBacking;
-use crate::fabric::{
-    Fabric, FabricPage, FabricTransport, Handler, HandlerStream, MrHandle, PeerId,
-};
+use crate::fabric::{Fabric, FabricPage, FabricTransport, Handler, HandlerStream, MrHandle};
 use crate::fanout::{FetchChannel, FetchEvent, FetchStream};
 use crate::memory::Backing;
-use crate::p2p::{
-    ChainFingerRouter, FingerTable, NodeId, RingId, RouteTableHandle, RoutingHandle, stripe_to_ring,
-};
+use crate::p2p::{ChainFingerRouter, FingerTable, RingId, RouteTableHandle, stripe_to_ring};
 use crate::runtime::{block_on_cooperative, noop_waker};
 use crate::storage::disks::CacheDirectorySet;
 use crate::storage::{StripeReq, disk_for};
@@ -178,68 +173,6 @@ pub struct RecursiveHandler {
 }
 
 impl RecursiveHandler {
-    /// Build a recursive handler over a freshly-seeded routing surface.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        scratch: Backing,
-        scratch_pages: u32,
-        fingers: Arc<FingerTable>,
-        node_to_peer: Arc<HashMap<NodeId, PeerId>>,
-        fabric: Arc<Fabric>,
-        scratch_mr: MrHandle,
-        page_size: usize,
-        owners: OwnerShardTable,
-    ) -> crate::fabric::Result<Self> {
-        let mut routes = HashMap::new();
-        routes.insert(
-            RouteTableHandle::LEGACY_ROUTE_ID.to_string(),
-            crate::p2p::RoutingSnapshot {
-                fingers,
-                node_to_peer,
-            },
-        );
-        Self::with_routes(
-            scratch,
-            scratch_pages,
-            RouteTableHandle::new(routes),
-            fabric,
-            scratch_mr,
-            page_size,
-            owners,
-        )
-    }
-
-    /// Build a recursive handler that shares `routing` with other
-    /// consumers.
-    pub fn with_routing(
-        scratch: Backing,
-        scratch_pages: u32,
-        routing: RoutingHandle,
-        fabric: Arc<Fabric>,
-        scratch_mr: MrHandle,
-        page_size: usize,
-        owners: OwnerShardTable,
-    ) -> crate::fabric::Result<Self> {
-        let snap = routing.snapshot();
-        let mut routes = HashMap::new();
-        routes.insert(
-            RouteTableHandle::LEGACY_ROUTE_ID.to_string(),
-            crate::p2p::RoutingSnapshot {
-                fingers: snap.fingers.clone(),
-                node_to_peer: snap.node_to_peer.clone(),
-            },
-        );
-        Self::with_routes(
-            scratch,
-            scratch_pages,
-            RouteTableHandle::new(routes),
-            fabric,
-            scratch_mr,
-            page_size,
-            owners,
-        )
-    }
-
     /// Build a recursive handler over an existing route table.
     pub fn with_routes(
         scratch: Backing,
@@ -277,7 +210,7 @@ impl Handler<StripeReq> for RecursiveHandler {
     ) -> Self::Stream<'a> {
         RecursiveHandlerStream {
             scratch: self.scratch.clone(),
-            fingers: self.routes.route_for_req(req).map(|route| route.fingers),
+            fingers: self.routes.route_for_req(req),
             forward: &self.forward,
             owners: &self.owners,
             req,
@@ -558,7 +491,7 @@ fn block_on_local<F: std::future::Future>(fut: F) -> F::Output {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::p2p::{FingerTableConfig, PeerEntry, TopologyTags, node_to_ring};
+    use crate::p2p::{FingerTableConfig, NodeId, PeerEntry, TopologyTags, node_to_ring};
 
     const PAGE: usize = 4096;
     const SCRATCH_PAGES: usize = 4;

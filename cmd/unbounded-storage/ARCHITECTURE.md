@@ -144,9 +144,9 @@ excluded from the live-reload diff.
    publication surface for disk channels.
 7. Read-only shared state (`Arc<Vec<FrontendSpec>>`, `Arc<Vec<BackendSpec>>`;
    startup-fixed fabric settings come from the config `[startup]` section via
-   `StartupSettings`) and routing (`build_routing` -> `Arc<FingerTable>` plus
-   `Arc<HashMap<NodeId, PeerId>>`) are constructed once and shared across
-   shards.
+   `StartupSettings`) and routing (`build_routing` -> `Arc<FingerTable>`) are
+   constructed once and shared across shards. `PeerId` uses the same stable
+   numeric identity as `NodeId`.
 8. Each shard is spawned with `rt.spawn_pinned(widx, name, Box<FnOnce>)`. The
    `!Send` shard objects are constructed **inside** `run_shard`, after pinning.
 9. After every shard reports `Up`, peers are reconciled per shard, the disk
@@ -346,9 +346,8 @@ stripe, and knows how to fill a miss from either a peer or the local disk.
   local, futures-core-free `Stream` of `Result<PageRef, Error>`); and
   `Transport<R> { bulk_get(&req, src: BulkRef, dsts: &[PageRef]) -> Stream }`,
   which fetches from a **peer**. Blanket impls cover `Arc<T>`.
-- Public surface also includes `PoolGroup`/`ShardDescriptor`/`ShardRouter`
-  (sharding helpers), `PageGuard`/`ReadStream`/`WindowedRead` (read API), and
-  `NullBlockStore`.
+- Public surface also includes `PageGuard`/`ReadStream`/`WindowedRead` (read
+  API) and `NullBlockStore`.
 
 A shard's data path therefore has two miss sources: the `Transport` (peer pull
 over fabric) and the `BlockStore` (local NVMe). The `RoutedTransport` decides
@@ -369,7 +368,7 @@ between them, and the origin `Backend` is the final fallback.
 - `RoutedTransport<R, B: Backend<Req = R>>` (the client side) makes the
   first-hop decision via a single Chord `next_hop(stripe_to_ring(key))`:
   - `None` -> this node owns the stripe; serve from the local origin `Backend`.
-  - `Some(peer)` -> hand off to a wrapped `FabricTransport<R, FingerRouter>`
+  - `Some(peer)` -> hand off to a wrapped `FabricTransport<R, ChainFingerRouter>`
     with a `MAX_HOPS` TTL; recursion happens server-side.
 - `RecursiveHandler` (the server side) **resolves** every request (in contrast
   to `fabric::PoolHandler`, which only serves locally resident pages). It

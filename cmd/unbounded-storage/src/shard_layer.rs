@@ -29,7 +29,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
-use unbounded_storage::bufferpool::{PoolGroup, Req};
 use unbounded_storage::config::{
     self, ApplyError, Config, ConfigApplyTarget, ConfigDiff, ShardControlGroup,
 };
@@ -78,10 +77,6 @@ pub struct ShardLayer {
     fabric_group: FabricGroup,
     /// Blocking fan-out/fan-in over every shard's control channel.
     control: ShardControlGroup,
-    /// Process-wide-routing dispatcher kept alive for the layer's
-    /// lifetime (observability today; the seam cross-shard routing will
-    /// use). `None` only for the degenerate zero-shard layer.
-    _pool_group: Option<PoolGroup<StripeReq>>,
     /// Retires just this layer's shards (layer teardown at shutdown)
     /// without tripping the process-wide [`crate::SHUTDOWN`]. Each shard
     /// ORs it into its run-loop predicate.
@@ -232,17 +227,15 @@ pub fn spawn_shard_layer(
     // thread. Shards that come up park holding their sender, so they
     // never close the channel; only a panic-before-report or a clean
     // failure surfaces here.
-    let mut descriptors = Vec::new();
     let mut publishes = Vec::new();
     let mut errors = Vec::new();
     for _ in 0..joins.len() {
         match ready_rx.recv() {
             Ok(crate::ShardReady::Up {
-                descriptor,
+                worker_idx,
                 publish,
             }) => {
-                publishes.push((descriptor.worker_idx, publish));
-                descriptors.push(descriptor);
+                publishes.push((worker_idx, publish));
             }
             Ok(crate::ShardReady::Failed(err)) => {
                 eprintln!("shard failed: {err}");
@@ -268,11 +261,10 @@ pub fn spawn_shard_layer(
         return Err(errors);
     }
 
-    // Assemble the broadcast peer set: sort the up-shards by worker index
-    // so `shard_index` (the position here) matches the `PoolGroup`
-    // ordering and `stripe_key_to_shard`, then hand every shard the full
-    // list. Each shard locates its own entry by worker index, registers
-    // the others' backings, and reports phase-B readiness below.
+    // Assemble the broadcast peer set in worker-index order so
+    // `shard_index` is stable across every shard. Each shard locates its
+    // own entry, registers the others' backings, and reports phase-B
+    // readiness below.
     publishes.sort_by_key(|(widx, _)| widx.0);
     // Retain every shard's backing Drop carrier for the layer's whole
     // life. Split out here as the `ShardPublish` values are consumed
@@ -366,23 +358,10 @@ pub fn spawn_shard_layer(
         }
     }
 
-    descriptors.sort_by_key(|d| d.worker_idx.0);
-    let shard_count = descriptors.len();
-    let pool_group = if descriptors.is_empty() {
-        None
-    } else {
-        let group: PoolGroup<StripeReq> = PoolGroup::new(descriptors, move |req: &StripeReq| {
-            crate::stripe_key_to_shard(&req.key(), shard_count)
-        });
-        eprintln!("pool group up: shards={shard_count}");
-        Some(group)
-    };
-
     Ok(ShardLayer {
         joins,
         fabric_group,
         control: ShardControlGroup::new(control_senders),
-        _pool_group: pool_group,
         layer_stop,
         _backing_keepalives: backing_keepalives,
     })
@@ -399,7 +378,6 @@ pub fn teardown_shard_layer(layer: ShardLayer) {
         joins,
         fabric_group,
         control,
-        _pool_group,
         layer_stop,
         _backing_keepalives,
     } = layer;
@@ -412,7 +390,6 @@ pub fn teardown_shard_layer(layer: ShardLayer) {
     // Drop the control senders only after every shard thread has
     // exited, so nothing observes a half-torn layer.
     drop(control);
-    drop(_pool_group);
     // Now retire the shared fabric endpoints. Each unit drops its RPC
     // server first (signalling shutdown and joining the RPC worker
     // pool), then its `Fabric`, which closes every memory region
