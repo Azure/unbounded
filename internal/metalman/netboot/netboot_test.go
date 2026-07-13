@@ -3876,12 +3876,12 @@ func TestCleanRequestPath(t *testing.T) {
 	}
 }
 
-// TestLogRequestsNormalizesUncleanPath verifies that a request whose raw target
+// TestNormalizePathServesUncleanPath verifies that a request whose raw target
 // contains a double slash (as shim generates for its second-stage loader when
 // the shim is served from the web root, e.g. "//grubx64.efi") is normalized in
 // place and served directly with a 200, instead of the ServeMux emitting a 307
 // redirect that shim would refuse to follow (EFI_HTTP_ERROR / 0x23).
-func TestLogRequestsNormalizesUncleanPath(t *testing.T) {
+func TestNormalizePathServesUncleanPath(t *testing.T) {
 	t.Parallel()
 
 	var handlerHits []string
@@ -3893,7 +3893,7 @@ func TestLogRequestsNormalizesUncleanPath(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	ts := httptest.NewServer(logRequests(mux))
+	ts := httptest.NewServer(normalizePath(mux))
 	defer ts.Close()
 
 	host := strings.TrimPrefix(ts.URL, "http://")
