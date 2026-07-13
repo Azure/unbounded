@@ -897,3 +897,64 @@ func TestReapOnceCompletesWhenDrained(t *testing.T) {
 		t.Fatalf("expected done when nothing legacy remains")
 	}
 }
+
+func TestApplyDefaultsFiltersTargetFromLegacy(t *testing.T) {
+	// Installing into a legacy namespace must not make the reaper drain and
+	// delete the very namespace it migrated into.
+	r := &LegacyReaper{
+		TargetNamespace:  legacyKubeNamespace,
+		LegacyNamespaces: []string{legacyKubeNamespace, legacyNetNamespace},
+	}
+	r.applyDefaults()
+
+	for _, got := range r.LegacyNamespaces {
+		if got == legacyKubeNamespace {
+			t.Fatalf("target namespace %q must be filtered out of LegacyNamespaces, got %#v",
+				legacyKubeNamespace, r.LegacyNamespaces)
+		}
+	}
+
+	if len(r.LegacyNamespaces) != 1 || r.LegacyNamespaces[0] != legacyNetNamespace {
+		t.Fatalf("expected only %q to remain, got %#v", legacyNetNamespace, r.LegacyNamespaces)
+	}
+
+	// The shared package-level var must never be mutated.
+	if len(LegacyNamespaces) != 2 {
+		t.Fatalf("shared LegacyNamespaces was mutated: %#v", LegacyNamespaces)
+	}
+}
+
+func TestApplyDefaultsRetainsLegacyForNonLegacyTarget(t *testing.T) {
+	// The normal case (target unbounded-system) keeps both legacy namespaces.
+	r := &LegacyReaper{
+		TargetNamespace:  "unbounded-system",
+		LegacyNamespaces: []string{legacyKubeNamespace, legacyNetNamespace},
+	}
+	r.applyDefaults()
+
+	if len(r.LegacyNamespaces) != 2 {
+		t.Fatalf("expected both legacy namespaces retained, got %#v", r.LegacyNamespaces)
+	}
+}
+
+func TestApplyDefaultsFiltersDefaultTargetWhenTargetEmpty(t *testing.T) {
+	// An empty TargetNamespace defaults to DefaultNamespace; if that happens to
+	// be a legacy namespace it must still be filtered.
+	original := DefaultNamespace
+
+	t.Cleanup(func() { DefaultNamespace = original })
+
+	DefaultNamespace = legacyNetNamespace
+
+	r := &LegacyReaper{
+		LegacyNamespaces: []string{legacyKubeNamespace, legacyNetNamespace},
+	}
+	r.applyDefaults()
+
+	for _, got := range r.LegacyNamespaces {
+		if got == legacyNetNamespace {
+			t.Fatalf("defaulted target %q must be filtered out, got %#v",
+				legacyNetNamespace, r.LegacyNamespaces)
+		}
+	}
+}

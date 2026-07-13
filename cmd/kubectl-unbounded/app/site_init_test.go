@@ -236,3 +236,56 @@ func TestSiteInitComponentOwnership(t *testing.T) {
 	assert.True(t, remote.EnableStorage)
 	assert.True(t, remote.EnableMetalman)
 }
+
+func TestSiteInitValidateClusterCIDRMessages(t *testing.T) {
+	// A valid baseline handler; each case perturbs exactly one cluster CIDR
+	// field to assert the error message names the correct field (guarding
+	// against the previously swapped node/pod messages).
+	base := func() *siteInitHandler {
+		return &siteInitHandler{
+			name:            "edge",
+			clusterNodeCIDR: "10.0.0.0/24",
+			clusterPodCIDR:  "10.1.0.0/24",
+			nodeCIDR:        "10.2.0.0/24",
+			podCIDR:         "10.3.0.0/24",
+		}
+	}
+
+	cases := []struct {
+		name    string
+		mutate  func(*siteInitHandler)
+		wantErr string
+	}{
+		{
+			name:    "missing cluster node CIDR",
+			mutate:  func(h *siteInitHandler) { h.clusterNodeCIDR = "" },
+			wantErr: "cluster node CIDR is required",
+		},
+		{
+			name:    "invalid cluster node CIDR",
+			mutate:  func(h *siteInitHandler) { h.clusterNodeCIDR = "not-a-cidr" },
+			wantErr: "cluster node CIDR is invalid",
+		},
+		{
+			name:    "missing cluster pod CIDR",
+			mutate:  func(h *siteInitHandler) { h.clusterPodCIDR = "" },
+			wantErr: "cluster pod CIDR is required",
+		},
+		{
+			name:    "invalid cluster pod CIDR",
+			mutate:  func(h *siteInitHandler) { h.clusterPodCIDR = "not-a-cidr" },
+			wantErr: "cluster pod CIDR is invalid",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := base()
+			tc.mutate(h)
+
+			err := h.validate()
+			require.Error(t, err)
+			require.EqualError(t, err, tc.wantErr)
+		})
+	}
+}

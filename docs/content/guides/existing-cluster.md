@@ -105,7 +105,6 @@ kubectl unbounded site init \
 |------|-------------|
 | `--kubeconfig` | Path to kubeconfig file |
 | `--manage-cni-plugin` | Set to `false` when the cluster already has a CNI (default: `true`) |
-| `--enable-net` | Enable unbounded-net on the cluster Site (default: `true`) |
 | `--enable-machina` | Enable machina on the cluster Site (default: `true`) |
 | `--enable-metalman` | Enable the metalman component in the Site spec |
 | `--enable-storage` | Enable the unbounded-storage component in the Site spec |

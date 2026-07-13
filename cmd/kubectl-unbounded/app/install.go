@@ -91,6 +91,16 @@ func (h *installHandler) execute(ctx context.Context) error {
 		h.namespace = unbounded.SystemNamespace()
 	}
 
+	// Refuse to install into a legacy namespace: the operator's migration reaper
+	// drains and deletes these namespaces, so installing into one would delete
+	// the components we just bootstrapped.
+	if unbounded.IsLegacyNamespace(h.namespace) {
+		return fmt.Errorf(
+			"refusing to install into legacy namespace %q: the operator's migration reaper drains and deletes this namespace; choose a different --namespace (default %q)",
+			h.namespace, unbounded.SystemNamespace(),
+		)
+	}
+
 	if h.timeout == 0 {
 		h.timeout = defaultInstallTimeout
 	}

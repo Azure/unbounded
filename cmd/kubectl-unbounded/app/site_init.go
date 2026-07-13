@@ -169,11 +169,11 @@ func (h *siteInitHandler) validate() error {
 	}
 
 	if !isValidIPv4CIDR(h.clusterNodeCIDR) {
-		return errors.New("cluster pod CIDR is invalid")
+		return errors.New("cluster node CIDR is invalid")
 	}
 
 	if isEmpty(h.clusterPodCIDR) {
-		return errors.New("cluster node CIDR is required")
+		return errors.New("cluster pod CIDR is required")
 	}
 
 	if !isValidIPv4CIDR(h.clusterPodCIDR) {

@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 const (
@@ -40,11 +41,12 @@ const (
 	helmReleaseSecretType = "helm.sh/release.v1"
 
 	// legacyKubeNamespace is where machina, metalman, and storage ran before
-	// the move to unbounded-system.
-	legacyKubeNamespace = "unbounded-kube"
+	// the move to unbounded-system. Sourced from internal/unbounded so the CLI
+	// install guard and the reaper share a single source of truth.
+	legacyKubeNamespace = unbounded.LegacyKubeNamespace
 
 	// legacyNetNamespace is where unbounded-net ran before the move.
-	legacyNetNamespace = "unbounded-net"
+	legacyNetNamespace = unbounded.LegacyNetNamespace
 
 	// clusterSiteName is the conventional name of the Site that represents the
 	// main control-plane cluster (created by `kubectl unbounded site init`).
@@ -245,6 +247,28 @@ func (r *LegacyReaper) applyDefaults() {
 	if len(r.LegacyNamespaces) == 0 {
 		r.LegacyNamespaces = LegacyNamespaces
 	}
+
+	// Never treat the migration target as a legacy namespace: draining and
+	// deleting it in cleanup() would destroy the namespace we just migrated
+	// into. This guards against the operator running with
+	// --namespace unbounded-kube (or unbounded-net). A fresh slice is built so
+	// the shared package-level LegacyNamespaces var is never mutated.
+	target := r.TargetNamespace
+	if target == "" {
+		target = DefaultNamespace
+	}
+
+	kept := make([]string, 0, len(r.LegacyNamespaces))
+
+	for _, ns := range r.LegacyNamespaces {
+		if ns == target {
+			continue
+		}
+
+		kept = append(kept, ns)
+	}
+
+	r.LegacyNamespaces = kept
 }
 
 // reapOnce performs one idempotent pass. It returns done=true when every legacy

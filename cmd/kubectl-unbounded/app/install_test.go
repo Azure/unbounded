@@ -45,6 +45,17 @@ func TestInstallCommandFlags(t *testing.T) {
 	}
 }
 
+func TestInstallRejectsLegacyNamespace(t *testing.T) {
+	for _, ns := range []string{"unbounded-kube", "unbounded-net"} {
+		h := installHandler{namespace: ns, logger: discardLogger()}
+
+		err := h.execute(context.Background())
+		require.Error(t, err, "install into legacy namespace %q must be rejected", ns)
+		require.Contains(t, err.Error(), "legacy namespace")
+		require.Contains(t, err.Error(), ns)
+	}
+}
+
 func TestInstallHandlerApplyBootstrapManifests(t *testing.T) {
 	var (
 		mu      sync.Mutex

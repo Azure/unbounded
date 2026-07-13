@@ -357,10 +357,32 @@ jobs:
       - name: Wait for rollouts
         run: |
           set -euo pipefail
-          kubectl -n unbounded-kube rollout status deploy/unbounded-operator       --timeout=5m
-          kubectl -n unbounded-net  rollout status deploy/unbounded-net-controller --timeout=5m
-          kubectl -n unbounded-net  rollout status ds/unbounded-net-node           --timeout=5m
-          kubectl -n unbounded-kube rollout status deploy/machina-controller       --timeout=5m
+          # Post-redesign, all component workloads are created by the operator in
+          # the unified unbounded-system namespace. They appear asynchronously
+          # after the operator reconciles the Site, so wait for each object to
+          # exist before checking its rollout status.
+          NS=unbounded-system
+
+          wait_exists() {
+            local kind="$1" name="$2" deadline=$((SECONDS + 300))
+            until kubectl -n "$NS" get "$kind" "$name" >/dev/null 2>&1; do
+              if (( SECONDS >= deadline )); then
+                echo "::error::timed out waiting for $kind/$name in $NS to be created"
+                return 1
+              fi
+              sleep 5
+            done
+          }
+
+          for target in \
+            "deploy unbounded-operator" \
+            "deploy unbounded-net-controller" \
+            "ds unbounded-net-node" \
+            "deploy machina-controller"; do
+            set -- $target
+            wait_exists "$1" "$2"
+            kubectl -n "$NS" rollout status "$1/$2" --timeout=5m
+          done
 
       - name: Summarize deploy
         if: always()
@@ -377,10 +399,10 @@ jobs:
             echo "### Workload images"
             echo ""
             echo '```'
-            kubectl -n unbounded-kube get deploy unbounded-operator       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
-            kubectl -n unbounded-net  get deploy unbounded-net-controller -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
-            kubectl -n unbounded-net  get ds     unbounded-net-node       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
-            kubectl -n unbounded-kube get deploy machina-controller       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-system get deploy unbounded-operator       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-system get deploy unbounded-net-controller -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-system get ds     unbounded-net-node       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-system get deploy machina-controller       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

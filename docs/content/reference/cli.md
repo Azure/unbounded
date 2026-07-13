@@ -63,17 +63,14 @@ Optional flags:
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
-| `--namespace` | `string` | `unbounded-kube` | Namespace for the operator and default components |
-| `--net-namespace` | `string` | `unbounded-net` | Namespace for unbounded-net components |
+| `--namespace` | `string` | `unbounded-system` | Namespace for the operator and default components |
 | `--skip-crds` | `bool` | `false` | Skip applying CRDs |
 | `--wait` | `bool` | `true` | Wait for the operator rollout |
 | `--timeout` | `duration` | `5m0s` | Timeout for rollout waits |
 | `--api-server-endpoint` | `string` | kubeconfig server | API server endpoint advertised to provisioned machines |
 
-The image flags (`--operator-image`, `--net-controller-image`,
-`--net-node-image`, `--machina-image`, `--metalman-image`, and
-`--storage-supervisor-image`) override the images embedded in the release
-manifests.
+The image flags (`--operator-image` and `--metalman-image`) override the images
+embedded in the release manifests.
 
 ---
 
@@ -107,7 +104,6 @@ Site when `--enable-metalman` is set.
 |------|------|---------|-------------|
 | `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
 | `--manage-cni-plugin` | `bool` | `true` | Whether unbounded-net manages the CNI plugin |
-| `--enable-net` | `bool` | `true` | Enable unbounded-net in `Site.spec.components` |
 | `--enable-machina` | `bool` | `true` | Enable machina in `Site.spec.components` |
 | `--enable-metalman` | `bool` | `false` | Enable metalman in `Site.spec.components` |
 | `--enable-storage` | `bool` | `false` | Enable unbounded-storage in `Site.spec.components` |
