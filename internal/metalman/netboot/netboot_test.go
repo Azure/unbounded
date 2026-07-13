@@ -3853,6 +3853,82 @@ func freePort(t *testing.T) int {
 	return port
 }
 
+func TestCleanRequestPath(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", "/"},
+		{"/", "/"},
+		{"/bootx64.efi", "/bootx64.efi"},
+		{"//grubx64.efi", "/grubx64.efi"},
+		{"/a//b", "/a/b"},
+		{"/dir/", "/dir/"},
+		{"/dir//", "/dir/"},
+	}
+
+	for _, tc := range cases {
+		if got := cleanRequestPath(tc.in); got != tc.want {
+			t.Errorf("cleanRequestPath(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestLogRequestsRedirectsUncleanPath verifies that a request whose raw target
+// contains a double slash (as shim generates for its second-stage loader when
+// the shim is served from the web root, e.g. "//grubx64.efi") is redirected by
+// the ServeMux with a 307 and never reaches the wrapped handler. This is the
+// mechanism behind the UEFI HTTP boot failure: shim does not follow the
+// redirect and treats the 3xx as EFI_HTTP_ERROR (0x23).
+func TestLogRequestsRedirectsUncleanPath(t *testing.T) {
+	t.Parallel()
+
+	var handlerHits []string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		handlerHits = append(handlerHits, r.URL.Path)
+
+		w.WriteHeader(http.StatusOK)
+	})
+
+	ts := httptest.NewServer(logRequests(mux))
+	defer ts.Close()
+
+	host := strings.TrimPrefix(ts.URL, "http://")
+
+	statusLine := func(target string) string {
+		t.Helper()
+
+		conn, err := net.Dial("tcp", host)
+		require.NoError(t, err)
+
+		defer conn.Close()
+
+		_, err = fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", target, host)
+		require.NoError(t, err)
+
+		buf := make([]byte, 256)
+		n, _ := conn.Read(buf)
+
+		line := string(buf[:n])
+		if i := strings.Index(line, "\r\n"); i >= 0 {
+			line = line[:i]
+		}
+
+		return line
+	}
+
+	require.Contains(t, statusLine("/bootx64.efi"), "200")
+	require.Contains(t, statusLine("//grubx64.efi"), "307")
+
+	// The double-slash request must be redirected by the mux before dispatch, so
+	// the wrapped handler only ever saw the clean bootx64.efi request.
+	require.Equal(t, []string{"/bootx64.efi"}, handlerHits)
+}
+
 func waitForHTTP(t *testing.T, url string, timeout time.Duration) {
 	t.Helper()
 

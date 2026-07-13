@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -70,7 +71,7 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /", h.handleFile)
 
 	addr := fmt.Sprintf("%s:%d", h.BindAddr, h.Port)
-	srv := &http.Server{Addr: addr, Handler: mux}
+	srv := &http.Server{Addr: addr, Handler: logRequests(mux)}
 
 	go func() {
 		<-ctx.Done()
@@ -84,6 +85,100 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// statusRecorderWriter wraps an http.ResponseWriter to capture the status code
+// and number of bytes written so request-logging middleware can report them.
+type statusRecorderWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (w *statusRecorderWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusRecorderWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+
+	n, err := w.ResponseWriter.Write(b)
+	w.bytes += n
+
+	return n, err
+}
+
+// Unwrap exposes the underlying ResponseWriter so http.ResponseController and
+// http.ServeFile optimizations (e.g. sendfile, flushing) keep working.
+func (w *statusRecorderWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+// logRequests wraps a handler and logs every incoming request, including ones
+// the ServeMux rewrites or redirects before dispatch. This is important for
+// diagnosing UEFI HTTP boot: shim derives its second-stage URL by appending its
+// loader name to its own boot URL's directory, which for a root-served shim
+// yields a double slash (e.g. "//grubx64.efi"). Go's ServeMux path-cleans that
+// and returns a 307 redirect BEFORE handleFile runs, so without this middleware
+// the request produces no log line at all. shim does not follow redirects and
+// treats the 3xx as EFI_HTTP_ERROR (0x23), aborting the boot.
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorderWriter{ResponseWriter: w}
+
+		next.ServeHTTP(rec, r)
+
+		status := rec.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+
+		log := slog.With(
+			"proto", "http",
+			"method", r.Method,
+			"target", r.RequestURI,
+			"path", r.URL.Path,
+			"ip", clientIP(r),
+			"status", status,
+			"bytes", rec.bytes,
+		)
+
+		// A request-target that does not match its cleaned path (for example a
+		// leading double slash) is what triggers the ServeMux redirect. Flag it
+		// loudly because it is the signature of the shim second-stage failure.
+		if cleaned := cleanRequestPath(r.URL.Path); cleaned != r.URL.Path {
+			log.Warn("request path is not clean; ServeMux will redirect and shim will not follow it", "cleaned_path", cleaned)
+
+			return
+		}
+
+		if status >= 300 && status < 400 {
+			log.Warn("http request redirected", "location", rec.Header().Get("Location"))
+
+			return
+		}
+
+		log.Info("http request")
+	})
+}
+
+// cleanRequestPath normalizes a URL path the same way path.Clean does, so the
+// middleware can detect unclean paths (e.g. "//grubx64.efi") that the ServeMux
+// would redirect. A trailing slash is preserved to mirror ServeMux behavior.
+func cleanRequestPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+
+	cleaned := path.Clean(p)
+	if cleaned != "/" && strings.HasSuffix(p, "/") {
+		cleaned += "/"
+	}
+
+	return cleaned
 }
 
 func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
