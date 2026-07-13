@@ -3876,13 +3876,12 @@ func TestCleanRequestPath(t *testing.T) {
 	}
 }
 
-// TestLogRequestsRedirectsUncleanPath verifies that a request whose raw target
+// TestLogRequestsNormalizesUncleanPath verifies that a request whose raw target
 // contains a double slash (as shim generates for its second-stage loader when
-// the shim is served from the web root, e.g. "//grubx64.efi") is redirected by
-// the ServeMux with a 307 and never reaches the wrapped handler. This is the
-// mechanism behind the UEFI HTTP boot failure: shim does not follow the
-// redirect and treats the 3xx as EFI_HTTP_ERROR (0x23).
-func TestLogRequestsRedirectsUncleanPath(t *testing.T) {
+// the shim is served from the web root, e.g. "//grubx64.efi") is normalized in
+// place and served directly with a 200, instead of the ServeMux emitting a 307
+// redirect that shim would refuse to follow (EFI_HTTP_ERROR / 0x23).
+func TestLogRequestsNormalizesUncleanPath(t *testing.T) {
 	t.Parallel()
 
 	var handlerHits []string
@@ -3922,11 +3921,11 @@ func TestLogRequestsRedirectsUncleanPath(t *testing.T) {
 	}
 
 	require.Contains(t, statusLine("/bootx64.efi"), "200")
-	require.Contains(t, statusLine("//grubx64.efi"), "307")
+	// The double-slash request must be normalized and served (200), not redirected.
+	require.Contains(t, statusLine("//grubx64.efi"), "200")
 
-	// The double-slash request must be redirected by the mux before dispatch, so
-	// the wrapped handler only ever saw the clean bootx64.efi request.
-	require.Equal(t, []string{"/bootx64.efi"}, handlerHits)
+	// The handler must have seen both requests with clean, collapsed paths.
+	require.Equal(t, []string{"/bootx64.efi", "/grubx64.efi"}, handlerHits)
 }
 
 func waitForHTTP(t *testing.T, url string, timeout time.Duration) {

@@ -117,16 +117,31 @@ func (w *statusRecorderWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-// logRequests wraps a handler and logs every incoming request, including ones
-// the ServeMux rewrites or redirects before dispatch. This is important for
-// diagnosing UEFI HTTP boot: shim derives its second-stage URL by appending its
-// loader name to its own boot URL's directory, which for a root-served shim
-// yields a double slash (e.g. "//grubx64.efi"). Go's ServeMux path-cleans that
-// and returns a 307 redirect BEFORE handleFile runs, so without this middleware
-// the request produces no log line at all. shim does not follow redirects and
-// treats the 3xx as EFI_HTTP_ERROR (0x23), aborting the boot.
+// logRequests wraps a handler to normalize unclean request paths and log every
+// request. It is important for UEFI HTTP boot: shim derives its second-stage URL
+// by appending its loader name to its own boot URL's directory, which for a
+// root-served shim yields a double slash (e.g. "//grubx64.efi"). Go's ServeMux
+// path-cleans that and returns a 307 redirect, but shim does not follow
+// redirects and treats the 3xx as EFI_HTTP_ERROR (0x23), aborting the boot.
+//
+// To keep shim booting, this middleware collapses the duplicate slashes in
+// place before dispatch so the mux serves the file directly with a 200 instead
+// of redirecting. The original request-target is preserved in the log for
+// diagnostics.
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originalTarget := r.RequestURI
+
+		normalized := false
+
+		if cleaned := cleanRequestPath(r.URL.Path); cleaned != r.URL.Path {
+			// Rewrite to the cleaned path so ServeMux dispatches to handleFile
+			// with a 200 rather than emitting a redirect that shim cannot follow.
+			r.URL.Path = cleaned
+			r.URL.RawPath = ""
+			normalized = true
+		}
+
 		rec := &statusRecorderWriter{ResponseWriter: w}
 
 		next.ServeHTTP(rec, r)
@@ -139,18 +154,15 @@ func logRequests(next http.Handler) http.Handler {
 		log := slog.With(
 			"proto", "http",
 			"method", r.Method,
-			"target", r.RequestURI,
+			"target", originalTarget,
 			"path", r.URL.Path,
 			"ip", clientIP(r),
 			"status", status,
 			"bytes", rec.bytes,
 		)
 
-		// A request-target that does not match its cleaned path (for example a
-		// leading double slash) is what triggers the ServeMux redirect. Flag it
-		// loudly because it is the signature of the shim second-stage failure.
-		if cleaned := cleanRequestPath(r.URL.Path); cleaned != r.URL.Path {
-			log.Warn("request path is not clean; ServeMux will redirect and shim will not follow it", "cleaned_path", cleaned)
+		if normalized {
+			log.Warn("normalized unclean request path so it is served directly instead of redirected (shim second-stage double-slash)")
 
 			return
 		}
