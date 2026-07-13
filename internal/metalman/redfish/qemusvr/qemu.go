@@ -12,37 +12,44 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
+	"sync"
 )
 
 // Machine is the QEMU-interaction layer. It drives a single libvirt domain
-// through the virsh CLI and manages host networking and the HTTP boundary disk.
-// It performs no Redfish semantics and holds no Redfish resource state; it shells
-// out to external commands directly via os/exec and satisfies the Backend
-// interface consumed by Server.
+// through the virsh CLI and manages host networking. It performs no Redfish
+// semantics and holds no Redfish resource state; it shells out to external
+// commands directly via os/exec and satisfies the Backend interface consumed by
+// Server.
+//
+// For UefiHttp overrides it translates the Redfish static-NIC and HttpBootUri
+// settings into a dnsmasq configuration bound to the boundary bridge. Stock OVMF
+// then performs a genuine firmware-native UEFI HTTP boot: it DHCPs, learns its
+// reserved address and the HTTPClient boot URL, and fetches the boot entrypoint
+// over HTTP itself. No FAT boundary disk is built or staged.
 type Machine struct {
 	domain          string
 	bridge          string
-	efiSource       string
-	efiActive       string
-	cacheDir        string
+	mac             string
+	dnsmasqDir      string
 	manageBootOrder bool
+
+	mu      sync.Mutex
+	dnsmasq *exec.Cmd
 }
 
-// NewMachine builds the QEMU layer and, when an EFI source is configured, stages
-// the blank boundary disk so it is present at the next power-on.
+// NewMachine builds the QEMU layer and ensures the dnsmasq working directory
+// exists when HTTP boot support is configured.
 func NewMachine(cfg Config) (*Machine, error) {
 	m := &Machine{
 		domain:          cfg.Domain,
 		bridge:          cfg.Bridge,
-		efiSource:       cfg.EFISource,
-		efiActive:       cfg.EFIActive,
-		cacheDir:        cfg.CacheDir,
+		mac:             strings.ToLower(cfg.MAC),
+		dnsmasqDir:      cfg.DnsmasqDir,
 		manageBootOrder: cfg.ManageBootOrder,
 	}
 
-	if m.efiSource != "" {
-		if err := m.StageEFIBoundary(false, "", ""); err != nil {
+	if m.dnsmasqDir != "" {
+		if err := os.MkdirAll(m.dnsmasqDir, 0o755); err != nil {
 			return nil, err
 		}
 	}
@@ -123,15 +130,6 @@ func (m *Machine) Restart() error {
 	return err
 }
 
-// DetachEFIBoundary removes the staged boundary disk after firmware has loaded.
-// It sleeps first so OVMF has time to load shim/GRUB from the staged disk.
-func (m *Machine) DetachEFIBoundary() {
-	time.Sleep(60 * time.Second)
-
-	//nolint:errcheck // Best-effort detach of the staged boundary disk.
-	_, _, _ = m.virsh("detach-disk", m.domain, "vdb", "--live", "--config")
-}
-
 // SetBootOrder rewrites the libvirt domain boot order when boot-order management
 // is enabled. target "Pxe" boots the network first, anything else boots disk
 // first.
@@ -176,199 +174,107 @@ func (m *Machine) SetBootOrder(target string) error {
 	return err
 }
 
-// withClientAddress attaches the static client IP to the HTTP boundary bridge,
-// runs action, then removes the address.
-func (m *Machine) withClientAddress(clientIP string, action func() error) error {
-	if m.bridge == "" {
-		return errors.New("UefiHttp requested without an HTTP boundary bridge")
+// ConfigureHTTPBoot writes a dnsmasq configuration that hands the VM its static
+// address plus a UEFI HTTP boot URL via a DHCP reservation, then (re)starts
+// dnsmasq bound to the boundary bridge. Stock OVMF then performs a genuine
+// firmware-native HTTP boot from the URL.
+func (m *Machine) ConfigureHTTPBoot(mac, address, subnetMask, gateway string, dns []string, bootURL string) error {
+	if m.bridge == "" || m.dnsmasqDir == "" {
+		return errors.New("UefiHttp requested without a boundary bridge and dnsmasq directory")
 	}
 
-	if clientIP == "" {
-		return errors.New("UefiHttp requested without a static client address")
+	if mac == "" || address == "" || subnetMask == "" || bootURL == "" {
+		return errors.New("UefiHttp requires a MAC, static address, subnet mask, and boot URL")
 	}
 
-	if _, code, err := m.run("ip", "address", "add", clientIP+"/32", "dev", m.bridge); err != nil {
+	conf := m.renderDnsmasqConf(mac, address, subnetMask, gateway, dns, bootURL)
+
+	confPath := filepath.Join(m.dnsmasqDir, "dnsmasq.conf")
+	if err := os.WriteFile(confPath, []byte(conf), 0o644); err != nil {
 		return err
-	} else if code != 0 {
-		return fmt.Errorf("ip address add %s failed with code %d", clientIP, code)
 	}
 
-	defer func() {
-		//nolint:errcheck // Best-effort removal of the temporary client address.
-		_, _, _ = m.run("ip", "address", "delete", clientIP+"/32", "dev", m.bridge)
-	}()
-
-	return action()
+	return m.restartDnsmasq(confPath)
 }
 
-// FetchBootEntrypoint emulates firmware's initial HTTP fetch after power-on by
-// downloading bootURL over the boundary bridge from the static clientIP.
-func (m *Machine) FetchBootEntrypoint(bootURL, clientIP string) error {
-	return m.withClientAddress(clientIP, func() error {
-		_, code, err := m.run("curl", "--fail", "--silent", "--show-error",
-			"--interface", clientIP, "--output", "/dev/null", bootURL)
-		if err != nil {
-			return err
-		}
+// renderDnsmasqConf builds the dnsmasq configuration that reserves the VM's
+// address and advertises the UEFI HTTP boot URL. DNS is disabled (port=0) so it
+// does not collide with libvirt's per-network dnsmasq; it owns only DHCP on the
+// boundary bridge.
+func (m *Machine) renderDnsmasqConf(mac, address, subnetMask, gateway string, dns []string, bootURL string) string {
+	var b strings.Builder
 
-		if code != 0 {
-			return fmt.Errorf("curl %s failed with code %d", bootURL, code)
-		}
+	fmt.Fprintln(&b, "port=0")
+	fmt.Fprintf(&b, "interface=%s\n", m.bridge)
+	fmt.Fprintln(&b, "bind-interfaces")
+	fmt.Fprintln(&b, "dhcp-authoritative")
+	fmt.Fprintf(&b, "dhcp-leasefile=%s\n", filepath.Join(m.dnsmasqDir, "dnsmasq.leases"))
+	fmt.Fprintf(&b, "log-facility=%s\n", filepath.Join(m.dnsmasqDir, "dnsmasq.log"))
+	fmt.Fprintf(&b, "dhcp-range=%s,%s,%s,infinite\n", address, address, subnetMask)
+	fmt.Fprintf(&b, "dhcp-host=%s,%s,infinite\n", mac, address)
 
-		return nil
-	})
+	if gateway != "" {
+		fmt.Fprintf(&b, "dhcp-option=3,%s\n", gateway)
+	}
+
+	if len(dns) > 0 {
+		fmt.Fprintf(&b, "dhcp-option=6,%s\n", strings.Join(dns, ","))
+	}
+
+	// x64 UEFI HTTP clients advertise architecture 16 (RFC 3925/UEFI). Answer
+	// them with the HTTPClient vendor class and the boot URL as the bootfile so
+	// OVMF's HttpBootDxe fetches it directly.
+	fmt.Fprintln(&b, "dhcp-match=set:httpboot,option:client-arch,16")
+	fmt.Fprintf(&b, "dhcp-boot=tag:httpboot,%s\n", bootURL)
+	fmt.Fprintln(&b, "dhcp-option-force=tag:httpboot,60,HTTPClient")
+
+	return b.String()
 }
 
-// StageEFIBoundary makes the HTTP boundary disk visible at the next power-on.
-// When enabled, it stages a FAT disk built from the cached HTTP entrypoint and
-// artifacts fetched over the boundary bridge from clientIP. When disabled, it
-// restores the blank EFI source.
-func (m *Machine) StageEFIBoundary(enabled bool, bootURL, clientIP string) error {
-	if m.efiSource == "" || m.efiActive == "" || m.bridge == "" || m.cacheDir == "" {
-		return errors.New("UefiHttp requested without HTTP boundary arguments")
-	}
+// restartDnsmasq stops any running dnsmasq and starts a fresh one from confPath.
+func (m *Machine) restartDnsmasq(confPath string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	if !enabled {
-		return copyFile(m.efiSource, m.efiActive)
-	}
+	m.stopDnsmasqLocked()
 
-	if bootURL == "" {
-		return errors.New("UefiHttp override has no HttpBootUri")
-	}
+	cmd := exec.Command("dnsmasq", "--keep-in-foreground", "--conf-file="+confPath)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
 
-	baseURL := bootURL[:strings.LastIndex(bootURL, "/")]
-	entrypoint := bootURL[strings.LastIndex(bootURL, "/")+1:]
-
-	return m.withClientAddress(clientIP, func() error {
-		return m.stageBoundary(clientIP, baseURL, entrypoint)
-	})
-}
-
-// stageBoundary downloads the boot artifacts and builds the boundary FAT image.
-func (m *Machine) stageBoundary(clientIP, baseURL, entrypoint string) error {
-	artifactDir, err := os.MkdirTemp("", "boundary-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(artifactDir) //nolint:errcheck // Best-effort cleanup of staging dir.
-
-	candidates, err := filepath.Glob(filepath.Join(m.cacheDir, "oci", "*", "amd64", "disk", entrypoint))
-	if err != nil {
+	if err := cmd.Start(); err != nil {
 		return err
 	}
 
-	if len(candidates) != 1 {
-		return fmt.Errorf("expected one cached HTTP entrypoint %s, found %d", entrypoint, len(candidates))
-	}
-
-	if err := copyFile(candidates[0], filepath.Join(artifactDir, "http-entrypoint.efi")); err != nil {
-		return err
-	}
-
-	downloads := []struct{ path, url string }{
-		{"grubx64.efi", baseURL + "/grubx64.efi"},
-		{"vmlinuz", baseURL + "/vmlinuz"},
-		{"initrd", baseURL + "/initrd"},
-		{"init.cpio", baseURL + "/init.cpio"},
-		{"grub/grub.cfg", baseURL + "/grub/grub.cfg"},
-	}
-	for _, d := range downloads {
-		target := filepath.Join(artifactDir, filepath.FromSlash(d.path))
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
-		}
-
-		if _, code, err := m.run("curl", "--fail", "--silent", "--show-error",
-			"--interface", clientIP, "--output", target, d.url); err != nil {
-			return err
-		} else if code != 0 {
-			return fmt.Errorf("curl %s failed with code %d", d.url, code)
-		}
-	}
-
-	boundary := filepath.Join(artifactDir, "boundary.img")
-	if err := m.buildBoundaryImage(artifactDir, boundary); err != nil {
-		return err
-	}
-
-	return copyFile(boundary, m.efiActive)
-}
-
-// buildBoundaryImage creates a FAT image sized to hold the staged artifacts and
-// copies them into the expected layout.
-func (m *Machine) buildBoundaryImage(artifactDir, boundary string) error {
-	artifactSize, err := dirSize(artifactDir)
-	if err != nil {
-		return err
-	}
-
-	const (
-		minSize   = 64 * 1024 * 1024
-		slackBase = 32 * 1024 * 1024
-	)
-
-	slack := int64(slackBase)
-	if artifactSize/4 > slack {
-		slack = artifactSize / 4
-	}
-
-	boundarySize := int64(minSize)
-	if artifactSize+slack > boundarySize {
-		boundarySize = artifactSize + slack
-	}
-
-	if err := os.Truncate(boundary, boundarySize); err != nil {
-		f, cerr := os.Create(boundary)
-		if cerr != nil {
-			return cerr
-		}
-
-		_ = f.Close() //nolint:errcheck // Best-effort close before truncating the created file.
-
-		if err := os.Truncate(boundary, boundarySize); err != nil {
-			return err
-		}
-	}
-
-	if err := m.checkRun("mkfs.vfat", "-n", "HTTPBOOT", boundary); err != nil {
-		return err
-	}
-
-	if err := m.checkRun("mmd", "-i", boundary, "::/EFI", "::/EFI/BOOT", "::/grub"); err != nil {
-		return err
-	}
-
-	copies := []struct{ source, target string }{
-		{"http-entrypoint.efi", "::/EFI/BOOT/BOOTX64.EFI"},
-		{"grubx64.efi", "::/EFI/BOOT/grubx64.efi"},
-		{"vmlinuz", "::/vmlinuz"},
-		{"initrd", "::/initrd"},
-		{"init.cpio", "::/init.cpio"},
-		{"grub/grub.cfg", "::/grub/grub.cfg"},
-		{"grub/grub.cfg", "::/EFI/BOOT/grub.cfg"},
-	}
-	for _, c := range copies {
-		source := filepath.Join(artifactDir, filepath.FromSlash(c.source))
-		if err := m.checkRun("mcopy", "-o", "-i", boundary, source, c.target); err != nil {
-			return err
-		}
-	}
+	m.dnsmasq = cmd
 
 	return nil
 }
 
-// checkRun runs a command and returns an error on non-zero exit.
-func (m *Machine) checkRun(name string, args ...string) error {
-	_, code, err := m.run(name, args...)
-	if err != nil {
-		return err
-	}
+// ClearHTTPBoot stops the boundary dnsmasq so no DHCP reservation is served once
+// the HTTP boot override is disabled.
+func (m *Machine) ClearHTTPBoot() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	if code != 0 {
-		return fmt.Errorf("%s %s exited with code %d", name, strings.Join(args, " "), code)
-	}
+	m.stopDnsmasqLocked()
 
 	return nil
+}
+
+// stopDnsmasqLocked terminates and reaps the running dnsmasq. The caller holds
+// m.mu.
+func (m *Machine) stopDnsmasqLocked() {
+	if m.dnsmasq == nil || m.dnsmasq.Process == nil {
+		return
+	}
+
+	//nolint:errcheck // Best-effort teardown of the boundary dnsmasq.
+	_ = m.dnsmasq.Process.Kill()
+	//nolint:errcheck // Reap the killed process; the wait error is expected.
+	_ = m.dnsmasq.Wait()
+
+	m.dnsmasq = nil
 }
 
 // rewriteBootOrder replaces the <boot> children of the <os> element with one
@@ -434,43 +340,4 @@ func rewriteBootOrder(domainXML string, devices []string) (string, error) {
 	}
 
 	return out.String(), nil
-}
-
-func dirSize(root string) (int64, error) {
-	var total int64
-
-	err := filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if info.Mode().IsRegular() {
-			total += info.Size()
-		}
-
-		return nil
-	})
-
-	return total, err
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close() //nolint:errcheck // Best-effort close of source file.
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close() //nolint:errcheck // Best-effort close on the error path.
-
-		return err
-	}
-
-	return out.Close()
 }

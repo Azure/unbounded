@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-"""Layered DHCP-free Metalman HTTP provisioning contract smoke test.
+"""Layered Metalman UEFI HTTP provisioning contract smoke test.
 
-Stock Noble OVMF and sushy cannot emulate firmware-native DHCP-free UEFI HTTP.
-The VM therefore starts at the post-firmware EFI boundary: after Metalman has
-written standard Redfish static IPv4 and UefiHttp settings, the recording BMC
-fetches the real Metalman boot artifacts with the VM's source IP and exposes
-them on an EFI disk. From shim/GRUB onward the real kernel, installer initrd,
-machine image, cloud-init, and branch-built agent path runs unchanged.
+Metalman writes standard Redfish static IPv4 and UefiHttp settings. The
+recording BMC fixture translates those settings into a dnsmasq configuration
+bound to the boundary bridge: the static address becomes a DHCP reservation and
+the HttpBootUri becomes the UEFI HTTP boot URL. Stock OVMF then performs a
+genuine firmware-native UEFI HTTP boot, fetching the boot entrypoint over HTTP
+itself. From shim/GRUB onward the real kernel, installer initrd, machine image,
+cloud-init, and branch-built agent path runs unchanged.
+
+Upstream OVMF HttpBootDxe always DHCPs, so the node address and boot URL are
+delivered via a DHCP reservation rather than firmware static configuration.
+Metalman's Redfish behavior is exercised and asserted unchanged.
 """
 
 from __future__ import annotations
@@ -116,6 +121,9 @@ def cleanup() -> None:
         [*VIRSH, "net-undefine", NETWORK],
         ["sudo", "ip", "link", "delete", "veth-kind-http"],
         ["docker", "rm", "-f", REGISTRY],
+        # The fixture (run under sudo) launches dnsmasq as root; ensure it is
+        # gone even if the fixture was killed before it could tear it down.
+        ["sudo", "pkill", "-f", str(TMP / "dnsmasq" / "dnsmasq.conf")],
     ):
         quiet(args)
     for table_args in (
@@ -172,16 +180,11 @@ def setup_network() -> None:
     smoke.configure_kind_kube_proxy_apiserver(f"https://{KIND_IP}:6443")
 
 
-def create_vm() -> tuple[Path, Path]:
-    log("Defining powered-off VM at the documented post-firmware EFI boundary")
+def create_vm() -> None:
+    log("Defining powered-off VM that boots via firmware-native UEFI HTTP")
     os_disk = TMP / "os.qcow2"
-    blank_efi = TMP / "blank-efi.img"
-    active_efi = TMP / "active-efi.img"
     nvram = TMP / "OVMF_VARS.fd"
     run(["qemu-img", "create", "-f", "qcow2", str(os_disk), "20G"])
-    run(["truncate", "-s", "128M", str(blank_efi)])
-    run(["mkfs.vfat", "-n", "HTTPBOOT", str(blank_efi)])
-    shutil.copyfile(blank_efi, active_efi)
     shutil.copyfile("/usr/share/OVMF/OVMF_VARS_4M.ms.fd", nvram)
     domain = TMP / "domain.xml"
     write(domain, f"""
@@ -193,9 +196,8 @@ def create_vm() -> tuple[Path, Path]:
           </os>
           <features><acpi/><apic/><smm state='on'/></features><cpu mode='host-passthrough'/>
           <devices>
-            <disk type='file' device='disk'><driver name='qemu' type='raw'/><source file='{active_efi}'/><target dev='vdb' bus='virtio'/><boot order='1'/></disk>
             <disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='{os_disk}'/><target dev='vda' bus='virtio'/><boot order='2'/></disk>
-            <interface type='network'><mac address='{MAC}'/><source network='{NETWORK}'/><model type='virtio'/></interface>
+            <interface type='network'><mac address='{MAC}'/><source network='{NETWORK}'/><model type='virtio'/><boot order='1'/></interface>
             <tpm model='tpm-tis'><backend type='emulator' version='2.0'/></tpm>
             <serial type='file'><source path='{TMP / "console.log"}'/><target port='0'/></serial>
             <channel type='unix'><source mode='bind' path='{TMP / "qga.sock"}'/><target type='virtio' name='org.qemu.guest_agent.0'/></channel>
@@ -203,7 +205,6 @@ def create_vm() -> tuple[Path, Path]:
         </domain>
     """)
     run([*VIRSH, "define", str(domain)])
-    return blank_efi, active_efi
 
 
 def setup_kubernetes_and_images() -> None:
@@ -261,16 +262,20 @@ def setup_kubernetes_and_images() -> None:
            "--directory", str(artifact_dir)], "agent-http.log")
 
 
-def start_fixture(blank_efi: Path, active_efi: Path) -> None:
+def start_fixture() -> None:
     run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
          "-subj", "/CN=metalman-http-fixture", "-addext", "subjectAltName=IP:127.0.0.1",
          "-keyout", str(TMP / "redfish.key"), "-out", str(TMP / "redfish.crt")])
-    spawn([str(ROOT / "bin/metalman-redfish-fixture"),
+    dnsmasq_dir = TMP / "dnsmasq"
+    dnsmasq_dir.mkdir(exist_ok=True)
+    # Run the fixture under sudo so the dnsmasq it launches can bind the
+    # privileged DHCP port (UDP 67) on the boundary bridge.
+    spawn(["sudo", "env", f"PATH={os.environ['PATH']}",
+           str(ROOT / "bin/metalman-redfish-fixture"),
            "--domain", VM, "--mac", MAC, "--port", str(REDFISH_PORT),
             "--cert", str(TMP / "redfish.crt"), "--key", str(TMP / "redfish.key"),
-            "--record", str(RECORD), "--efi-source", str(blank_efi),
-            "--efi-active", str(active_efi), "--bridge", BRIDGE,
-            "--cache-dir", str(TMP / "cache"), "--username", "smoke", "--password", "smoke"],
+            "--record", str(RECORD), "--bridge", BRIDGE,
+            "--dnsmasq-dir", str(dnsmasq_dir), "--username", "smoke", "--password", "smoke"],
           "redfish.log")
     time.sleep(1)
 
@@ -363,10 +368,6 @@ def assert_contract() -> None:
                 and boot.get("BootSourceOverrideMode") == "UEFI"
                 and boot.get("HttpBootUri") == f"{SERVE_URL}/bootx64.efi" for boot in boot_patches):
         raise AssertionError(f"standard UefiHttp PATCH not recorded: {boot_patches}")
-    firmware_fetches = [entry for entry in writes if entry["method"] == "FIRMWARE_FETCH"]
-    if not any(entry["path"] == f"{SERVE_URL}/bootx64.efi"
-               and entry["body"] == {"source": NODE_IP} for entry in firmware_fetches):
-        raise AssertionError(f"state-derived post-power-on firmware fetch not recorded: {firmware_fetches}")
 
 
 def assert_guest_network() -> str:
@@ -390,21 +391,25 @@ def assert_guest_network() -> str:
     return stdout.splitlines()[-1].strip()
 
 
-def assert_no_dhcp() -> None:
-    guest_traffic = run(
-        ["sudo", "tcpdump", "-nn", "-r", str(PCAP), "ether", "src", MAC, "and", "not",
-         "(udp port 67 or udp port 68 or udp port 546 or udp port 547)"],
-        capture_output=True, text=True,
-    )
-    if not guest_traffic.stdout.strip():
-        raise AssertionError(f"packet capture contains no non-DHCP traffic from {MAC}")
-    result = run(
+def assert_dhcp_httpboot() -> None:
+    # Firmware-native UEFI HTTP boot DHCPs to learn its reserved address and boot
+    # URL, so DHCP from the node MAC is now expected.
+    dhcp = run(
         ["sudo", "tcpdump", "-nn", "-r", str(PCAP), "ether", "src", MAC, "and",
-         "(udp port 67 or udp port 68 or udp port 546 or udp port 547)"],
+         "(udp port 67 or udp port 68)"],
         capture_output=True, text=True,
     )
-    if result.stdout.strip():
-        raise AssertionError(f"DHCP traffic emitted by {MAC}:\n{result.stdout}")
+    if not dhcp.stdout.strip():
+        raise AssertionError(f"no firmware DHCP traffic from {MAC}; native HTTP boot did not start")
+    # The node must then fetch the boot entrypoint over HTTP from Metalman,
+    # proving a genuine firmware-native HTTP boot rather than a staged disk.
+    http_fetch = run(
+        ["sudo", "tcpdump", "-nn", "-r", str(PCAP), "ether", "src", MAC, "and",
+         "tcp", "and", "dst", "host", SERVER_IP, "and", "dst", "port", str(HTTP_PORT)],
+        capture_output=True, text=True,
+    )
+    if not http_fetch.stdout.strip():
+        raise AssertionError(f"no HTTP boot fetch from {MAC} to {SERVER_IP}:{HTTP_PORT}")
 
 
 def main() -> None:
@@ -412,13 +417,13 @@ def main() -> None:
 
     atexit.register(cleanup)
     setup_network()
-    blank_efi, active_efi = create_vm()
+    create_vm()
     # Capture starts while the domain is still off and remains active through
     # installer power-on, installer reboot, OS validation, and the final reboot.
     tcpdump = spawn(["sudo", "tcpdump", "-U", "-i", BRIDGE, "-w", str(PCAP)], "tcpdump.log")
     time.sleep(1)
     setup_kubernetes_and_images()
-    start_fixture(blank_efi, active_efi)
+    start_fixture()
     start_metalman_and_replace()
     assert_contract()
     first_boot = assert_guest_network()
@@ -437,9 +442,9 @@ def main() -> None:
     tcpdump.send_signal(signal.SIGINT)
     tcpdump.wait(timeout=15)
     PROCS.remove(tcpdump)
-    assert_no_dhcp()
+    assert_dhcp_httpboot()
     PASSED = True
-    log("Layered DHCP-free HTTP provisioning smoke PASSED")
+    log("Layered UEFI HTTP provisioning smoke PASSED")
 
 
 if __name__ == "__main__":

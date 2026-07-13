@@ -30,8 +30,20 @@ type fakeBackend struct {
 	powerOnErr error
 	restartErr error
 	bootOrder  error
-	stageErr   error
-	fetchErr   error
+	configErr  error
+	clearErr   error
+
+	httpBoot httpBootArgs
+}
+
+// httpBootArgs captures the last ConfigureHTTPBoot invocation for assertions.
+type httpBootArgs struct {
+	mac        string
+	address    string
+	subnetMask string
+	gateway    string
+	dns        []string
+	bootURL    string
 }
 
 func newFakeBackend() *fakeBackend {
@@ -79,19 +91,27 @@ func (f *fakeBackend) SetBootOrder(target string) error {
 	return f.bootOrder
 }
 
-func (f *fakeBackend) StageEFIBoundary(_ bool, _, _ string) error {
-	f.record("StageEFIBoundary")
+func (f *fakeBackend) ConfigureHTTPBoot(mac, address, subnetMask, gateway string, dns []string, bootURL string) error {
+	f.mu.Lock()
+	f.httpBoot = httpBootArgs{
+		mac:        mac,
+		address:    address,
+		subnetMask: subnetMask,
+		gateway:    gateway,
+		dns:        dns,
+		bootURL:    bootURL,
+	}
+	f.mu.Unlock()
+	f.record("ConfigureHTTPBoot")
 
-	return f.stageErr
+	return f.configErr
 }
 
-func (f *fakeBackend) FetchBootEntrypoint(_, _ string) error {
-	f.record("FetchBootEntrypoint")
+func (f *fakeBackend) ClearHTTPBoot() error {
+	f.record("ClearHTTPBoot")
 
-	return f.fetchErr
+	return f.clearErr
 }
-
-func (f *fakeBackend) DetachEFIBoundary() { f.record("DetachEFIBoundary") }
 
 func newTestServer(t *testing.T, cfg Config, backend Backend) *Server {
 	t.Helper()
@@ -317,6 +337,75 @@ func TestPatchBootUefiHTTPRequiresStaticAddress(t *testing.T) {
 
 	if !strings.Contains(string(data), "DHCPv4 was disabled") {
 		t.Fatalf("unexpected error body: %s", data)
+	}
+}
+
+func TestPatchBootUefiHTTPConfiguresHTTPBoot(t *testing.T) {
+	backend := newFakeBackend()
+	server := newTestServer(t, Config{}, backend)
+	h := server.Handler()
+
+	nicBase := "/redfish/v1/Systems/" + testDomain + "/EthernetInterfaces/NIC.1"
+	nicPatch := map[string]any{
+		"DHCPv4": map[string]any{"DHCPEnabled": false},
+		"IPv4StaticAddresses": []any{
+			map[string]any{
+				"Address":    "192.168.200.10",
+				"SubnetMask": "255.255.255.0",
+				"Gateway":    "192.168.200.1",
+			},
+		},
+		"StaticNameServers": []any{"8.8.8.8"},
+	}
+
+	if resp, _ := do(t, h, http.MethodPatch, nicBase, nicPatch, ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("nic patch status = %d, want 204", resp.StatusCode)
+	}
+
+	bootPatch := map[string]any{"Boot": map[string]any{
+		"BootSourceOverrideTarget":  "UefiHttp",
+		"BootSourceOverrideEnabled": "Continuous",
+		"BootSourceOverrideMode":    "UEFI",
+		"HttpBootUri":               "http://192.168.200.1:8882/bootx64.efi",
+	}}
+
+	if resp, data := do(t, h, http.MethodPatch, "/redfish/v1/Systems/"+testDomain, bootPatch, ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("boot patch status = %d, want 204: %s", resp.StatusCode, data)
+	}
+
+	if !backend.called("ConfigureHTTPBoot") {
+		t.Fatal("expected ConfigureHTTPBoot to be invoked")
+	}
+
+	got := backend.httpBoot
+	want := httpBootArgs{
+		mac:        "52:54:00:ab:cd:ef",
+		address:    "192.168.200.10",
+		subnetMask: "255.255.255.0",
+		gateway:    "192.168.200.1",
+		dns:        []string{"8.8.8.8"},
+		bootURL:    "http://192.168.200.1:8882/bootx64.efi",
+	}
+
+	if got.mac != want.mac || got.address != want.address || got.subnetMask != want.subnetMask ||
+		got.gateway != want.gateway || got.bootURL != want.bootURL ||
+		strings.Join(got.dns, ",") != strings.Join(want.dns, ",") {
+		t.Fatalf("ConfigureHTTPBoot args = %+v, want %+v", got, want)
+	}
+}
+
+func TestPatchBootDisabledClearsHTTPBoot(t *testing.T) {
+	backend := newFakeBackend()
+	server := newTestServer(t, Config{}, backend)
+
+	patch := map[string]any{"Boot": map[string]any{"BootSourceOverrideEnabled": "Disabled"}}
+
+	if resp, _ := do(t, server.Handler(), http.MethodPatch, "/redfish/v1/Systems/"+testDomain, patch, ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("boot patch status = %d, want 204", resp.StatusCode)
+	}
+
+	if !backend.called("ClearHTTPBoot") {
+		t.Fatal("expected ClearHTTPBoot on disabled override")
 	}
 }
 

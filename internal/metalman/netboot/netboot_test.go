@@ -417,6 +417,57 @@ func TestHTTPServer_MissingShimRevocationsFilePXEStill404(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
+func TestCollapsePath(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"/grubx64.efi", "/grubx64.efi"},
+		{"//grubx64.efi", "/grubx64.efi"},
+		{"///grubx64.efi", "/grubx64.efi"},
+		{"/a//b///c", "/a/b/c"},
+		{"/", "/"},
+		{"", ""},
+	}
+
+	for _, tt := range tests {
+		require.Equal(t, tt.want, collapsePath(tt.in), "collapsePath(%q)", tt.in)
+	}
+}
+
+// TestCollapseSlashesAvoidsRedirect verifies that a request with a double
+// leading slash (as produced by UEFI HTTP boot clients chaining from a
+// root-served loader) is normalized and served directly instead of provoking a
+// ServeMux redirect, which firmware HTTP boot clients do not follow.
+func TestCollapseSlashesAvoidsRedirect(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(r.URL.Path))
+	})
+
+	ts := httptest.NewServer(collapseSlashes(mux))
+	defer ts.Close()
+
+	// Mimic firmware HTTP boot clients, which do not follow redirects.
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	req, _ := http.NewRequest("GET", ts.URL+"//grubx64.efi", nil)
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.NoError(t, err)
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "/grubx64.efi", string(body))
+}
+
 func TestHTTPServer_TemplateRendered(t *testing.T) {
 	bootTemplate := `set default=0
 menuentry "Install" {

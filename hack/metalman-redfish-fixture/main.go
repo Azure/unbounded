@@ -32,10 +32,8 @@ func run() error {
 	fs.StringVar(&cfg.Domain, "domain", "", "libvirt domain name (required)")
 	fs.StringVar(&cfg.MAC, "mac", "", "host NIC MAC address (required)")
 	fs.StringVar(&cfg.Record, "record", "", "JSONL request record file (required)")
-	fs.StringVar(&cfg.EFISource, "efi-source", "", "blank EFI boundary disk source")
-	fs.StringVar(&cfg.EFIActive, "efi-active", "", "active EFI boundary disk path")
-	fs.StringVar(&cfg.Bridge, "bridge", "", "HTTP boundary bridge interface")
-	fs.StringVar(&cfg.CacheDir, "cache-dir", "", "metalman cache directory")
+	fs.StringVar(&cfg.Bridge, "bridge", "", "HTTP boot boundary bridge interface")
+	fs.StringVar(&cfg.DnsmasqDir, "dnsmasq-dir", "", "working directory for the HTTP boot dnsmasq")
 	fs.StringVar(&cfg.Username, "username", "", "basic auth username")
 	fs.StringVar(&cfg.Password, "password", "", "basic auth password")
 	fs.BoolVar(&cfg.ManageBootOrder, "manage-boot-order", false, "manage libvirt boot order")
@@ -53,19 +51,8 @@ func run() error {
 		}
 	}
 
-	boundary := []string{cfg.EFISource, cfg.EFIActive, cfg.Bridge, cfg.CacheDir}
-	any, all := false, true
-
-	for _, v := range boundary {
-		if v != "" {
-			any = true
-		} else {
-			all = false
-		}
-	}
-
-	if any && !all {
-		return fmt.Errorf("--efi-source, --efi-active, --bridge, and --cache-dir must be used together")
+	if (cfg.Bridge == "") != (cfg.DnsmasqDir == "") {
+		return fmt.Errorf("--bridge and --dnsmasq-dir must be used together")
 	}
 
 	return qemusvr.Serve(cfg)

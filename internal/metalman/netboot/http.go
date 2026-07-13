@@ -70,7 +70,7 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /", h.handleFile)
 
 	addr := fmt.Sprintf("%s:%d", h.BindAddr, h.Port)
-	srv := &http.Server{Addr: addr, Handler: mux}
+	srv := &http.Server{Addr: addr, Handler: collapseSlashes(mux)}
 
 	go func() {
 		<-ctx.Done()
@@ -84,6 +84,57 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// collapseSlashes normalizes runs of consecutive slashes in the request path to
+// a single slash before routing. UEFI HTTP boot clients (the Ubuntu shim and
+// OVMF's HttpBootDxe) build the next-stage URL by concatenating the base path of
+// the current image with the next filename. When the boot loader is served from
+// the server root (for example http://host/bootx64.efi), that concatenation
+// yields a double slash such as "//grubx64.efi". Go's http.ServeMux answers such
+// unclean paths with a redirect, but firmware HTTP boot clients do not follow
+// redirects and abort the boot. Normalizing the path here lets the file handler
+// serve the request directly.
+func collapseSlashes(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if cleaned := collapsePath(r.URL.Path); cleaned != r.URL.Path {
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = cleaned
+			r2.URL.RawPath = ""
+			r = r2
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// collapsePath replaces every run of consecutive slashes in p with a single
+// slash. It returns p unchanged when it contains no double slash.
+func collapsePath(p string) string {
+	if !strings.Contains(p, "//") {
+		return p
+	}
+
+	var (
+		b         strings.Builder
+		prevSlash bool
+	)
+
+	for _, c := range p {
+		if c == '/' {
+			if prevSlash {
+				continue
+			}
+
+			prevSlash = true
+		} else {
+			prevSlash = false
+		}
+
+		b.WriteRune(c)
+	}
+
+	return b.String()
 }
 
 func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {

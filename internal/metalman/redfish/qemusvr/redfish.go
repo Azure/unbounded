@@ -10,11 +10,14 @@
 // Machine (see qemu.go) drives the underlying libvirt domain. Server talks to
 // the machine layer only through the Backend interface, which is faked in tests.
 //
-// PXE overrides update the libvirt boot order directly. When the optional HTTP
-// boundary arguments are supplied, a UefiHttp PATCH makes a prebuilt EFI disk
-// visible at the next power-on. That disk is the HTTP smoke test's documented
-// post-firmware boundary; the fixture does not pretend that OVMF implements
-// native DHCP-free UEFI HTTP boot.
+// PXE overrides update the libvirt boot order directly. A UefiHttp PATCH is
+// translated into a dnsmasq configuration bound to the boundary bridge: the
+// Redfish static-NIC address becomes a DHCP reservation and the HttpBootUri
+// becomes the UEFI HTTP boot URL. Stock OVMF then performs a genuine
+// firmware-native UEFI HTTP boot, fetching the boot entrypoint over HTTP itself.
+// The address and boot URL are delivered via a DHCP reservation rather than
+// firmware static configuration because upstream OVMF HttpBootDxe always DHCPs;
+// Metalman's Redfish behavior is exercised and asserted unchanged.
 package qemusvr
 
 import (
@@ -45,18 +48,16 @@ type Config struct {
 	Domain          string
 	MAC             string
 	Record          string
-	EFISource       string
-	EFIActive       string
 	Bridge          string
-	CacheDir        string
+	DnsmasqDir      string
 	Username        string
 	Password        string
 	ManageBootOrder bool
 }
 
 // Backend performs the machine-level operations behind the Redfish semantics. It
-// is implemented by Machine and faked in tests. bootURL and clientIP are derived
-// from Redfish state by the Server and passed down.
+// is implemented by Machine and faked in tests. The static-NIC and HttpBootUri
+// values are derived from Redfish state by the Server and passed down.
 type Backend interface {
 	// PowerState reports "On" or "Off".
 	PowerState() string
@@ -68,14 +69,11 @@ type Backend interface {
 	Restart() error
 	// SetBootOrder sets the libvirt boot order for "Pxe" or "Hdd".
 	SetBootOrder(target string) error
-	// StageEFIBoundary stages (enabled) or restores (disabled) the EFI boundary
-	// disk.
-	StageEFIBoundary(enabled bool, bootURL, clientIP string) error
-	// FetchBootEntrypoint emulates firmware's initial HTTP fetch after power-on.
-	FetchBootEntrypoint(bootURL, clientIP string) error
-	// DetachEFIBoundary removes the staged boundary disk once firmware has
-	// loaded. It is expected to be called asynchronously.
-	DetachEFIBoundary()
+	// ConfigureHTTPBoot programs a DHCP reservation plus UEFI HTTP boot URL so
+	// stock OVMF performs a firmware-native HTTP boot at the next power-on.
+	ConfigureHTTPBoot(mac, address, subnetMask, gateway string, dns []string, bootURL string) error
+	// ClearHTTPBoot tears down the HTTP boot DHCP reservation.
+	ClearHTTPBoot() error
 }
 
 // Server is the Redfish fixture state for a single libvirt domain.
@@ -313,24 +311,38 @@ func (s *Server) authorized(value string) bool {
 	return subtle.ConstantTimeCompare([]byte(value), []byte(expected)) == 1
 }
 
-// staticAddress validates that exactly one complete static IPv4 address has been
-// accepted with DHCP disabled and returns its address.
-func (s *Server) staticAddress() (string, error) {
+// staticNIC captures the accepted static IPv4 configuration derived from the
+// EthernetInterface PATCH.
+type staticNIC struct {
+	address    string
+	subnetMask string
+	gateway    string
+	dns        []string
+}
+
+// staticConfig validates that exactly one complete static IPv4 address has been
+// accepted with DHCP disabled and returns the full static configuration.
+func (s *Server) staticConfig() (staticNIC, error) {
 	if !reflect.DeepEqual(s.nic["DHCPv4"], map[string]any{"DHCPEnabled": false}) {
-		return "", errors.New("UefiHttp requested before DHCPv4 was disabled")
+		return staticNIC{}, errors.New("UefiHttp requested before DHCPv4 was disabled")
 	}
 
 	addresses, ok := s.nic["IPv4StaticAddresses"].([]any)
 	if !ok || len(addresses) != 1 {
-		return "", errors.New("UefiHttp requires exactly one accepted static IPv4 address")
+		return staticNIC{}, errors.New("UefiHttp requires exactly one accepted static IPv4 address")
 	}
 
 	address := asMap(addresses[0])
 	if !nonEmptyString(address["Address"]) || !nonEmptyString(address["SubnetMask"]) {
-		return "", errors.New("UefiHttp static IPv4 address is incomplete")
+		return staticNIC{}, errors.New("UefiHttp static IPv4 address is incomplete")
 	}
 
-	return asString(address["Address"]), nil
+	return staticNIC{
+		address:    asString(address["Address"]),
+		subnetMask: asString(address["SubnetMask"]),
+		gateway:    asString(address["Gateway"]),
+		dns:        asStringSlice(s.nic["StaticNameServers"]),
+	}, nil
 }
 
 // patchSystem applies a PATCH to the system's Boot configuration.
@@ -338,7 +350,7 @@ func (s *Server) patchSystem(body map[string]any) error {
 	boot := asMap(body["Boot"])
 	target := asString(boot["BootSourceOverrideTarget"])
 
-	var clientIP string
+	var nic staticNIC
 
 	if target == "UefiHttp" {
 		if mode := asString(boot["BootSourceOverrideMode"]); mode != "UEFI" {
@@ -349,12 +361,12 @@ func (s *Server) patchSystem(body map[string]any) error {
 			return errors.New("standard UefiHttp override must be continuous")
 		}
 
-		addr, err := s.staticAddress()
+		accepted, err := s.staticConfig()
 		if err != nil {
 			return err
 		}
 
-		clientIP = addr
+		nic = accepted
 	}
 
 	for k, v := range boot {
@@ -363,7 +375,8 @@ func (s *Server) patchSystem(body map[string]any) error {
 
 	switch target {
 	case "UefiHttp":
-		if err := s.backend.StageEFIBoundary(true, asString(s.boot["HttpBootUri"]), clientIP); err != nil {
+		if err := s.backend.ConfigureHTTPBoot(strings.ToLower(s.cfg.MAC), nic.address,
+			nic.subnetMask, nic.gateway, nic.dns, asString(s.boot["HttpBootUri"])); err != nil {
 			return err
 		}
 	case "Pxe", "Hdd":
@@ -373,10 +386,8 @@ func (s *Server) patchSystem(body map[string]any) error {
 	}
 
 	if enabled := asString(boot["BootSourceOverrideEnabled"]); enabled == "Disabled" {
-		if s.cfg.EFISource != "" {
-			if err := s.backend.StageEFIBoundary(false, "", ""); err != nil {
-				return err
-			}
+		if err := s.backend.ClearHTTPBoot(); err != nil {
+			return err
 		}
 
 		if err := s.backend.SetBootOrder("Hdd"); err != nil {
@@ -411,19 +422,12 @@ func (s *Server) reset(resetType string) error {
 	case "ForceOff":
 		s.backend.PowerOff()
 	case "On":
+		// Power on and let firmware do the work. dnsmasq, programmed by the
+		// preceding UefiHttp PATCH, answers OVMF's DHCP with the reserved
+		// address and boot URL so firmware performs a native HTTP boot.
 		if err := s.backend.PowerOn(); err != nil {
 			return err
 		}
-		// OVMF cannot consume Redfish static NIC settings. Emulate only its
-		// initial fetch after power-on; EFI boundary preparation must not
-		// advance Metalman's boot status.
-		if err := s.fetchBootEntrypoint(); err != nil {
-			return err
-		}
-		// The staged disk substitutes only for firmware's initial HTTP fetch.
-		// Remove it from the persistent domain after OVMF has loaded shim/GRUB
-		// so the installer's reboot starts the written OS disk.
-		go s.backend.DetachEFIBoundary()
 	case "ForceRestart":
 		if err := s.backend.Restart(); err != nil {
 			return err
@@ -433,23 +437,6 @@ func (s *Server) reset(resetType string) error {
 	}
 
 	return nil
-}
-
-// fetchBootEntrypoint drives the backend's firmware fetch and records it as a
-// FIRMWARE_FETCH entry. The caller must hold s.mu.
-func (s *Server) fetchBootEntrypoint() error {
-	bootURL := asString(s.boot["HttpBootUri"])
-
-	clientIP, err := s.staticAddress()
-	if err != nil {
-		return err
-	}
-
-	if err := s.backend.FetchBootEntrypoint(bootURL, clientIP); err != nil {
-		return err
-	}
-
-	return s.appendRecord("FIRMWARE_FETCH", bootURL, map[string]any{"source": clientIP}, 200)
 }
 
 // appendRecord writes a single JSONL record entry. The caller must hold s.mu.
@@ -548,4 +535,23 @@ func asMap(v any) map[string]any {
 	}
 
 	return m
+}
+
+// asStringSlice returns v as a slice of strings, skipping any non-string
+// elements. It returns nil when v is not a JSON array.
+func asStringSlice(v any) []string {
+	items, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+
+	out := make([]string, 0, len(items))
+
+	for _, item := range items {
+		if str, ok := item.(string); ok {
+			out = append(out, str)
+		}
+	}
+
+	return out
 }
