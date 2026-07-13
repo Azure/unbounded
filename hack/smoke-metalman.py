@@ -62,6 +62,7 @@ AGENT_IMAGE_NAME_VM = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:s
 BINARY = REPO_ROOT / "bin" / "metalman"
 AGENT_BINARY = REPO_ROOT / "bin" / "unbounded-agent"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
+REDFISH_FIXTURE_BINARY = REPO_ROOT / "bin" / "metalman-redfish-fixture"
 SERIAL_SOCK = TMPDIR / "console.sock"
 QGA_SOCK = TMPDIR / "qga.sock"
 # The nspawn machine name used by the agent (must match the constant in
@@ -354,7 +355,7 @@ def clean_libvirt() -> None:
     # Remove veth pair used to connect kind container to virbr-smoke.
     run_quiet(["sudo", "ip", "link", "delete", "veth-kind-smoke"])
     # Kill any leftover Redfish fixture from a previous run.
-    run_quiet(["sudo", "pkill", "-f", "metalman-redfish-fixture.py"])
+    run_quiet(["sudo", "pkill", "-f", "metalman-redfish-fixture"])
     # Kill any leftover metalman serve-pxe from a previous run.
     # Use the binary path to avoid matching this script (smoke-metalman.py).
     run_quiet(["sudo", "pkill", "-f", "bin/metalman"])
@@ -1085,8 +1086,11 @@ def main() -> None:
         "-addext", "subjectAltName=IP:127.0.0.1",
     ], check=True)
     redfish_url = f"https://127.0.0.1:{REDFISH_PORT}"
+    log("Building metalman-redfish-fixture")
+    run(["go", "build", "-o", str(REDFISH_FIXTURE_BINARY),
+         "./hack/metalman-redfish-fixture"], cwd=str(REPO_ROOT))
     proc = spawn([
-        sys.executable, str(REPO_ROOT / "hack" / "metalman-redfish-fixture.py"),
+        str(REDFISH_FIXTURE_BINARY),
         "--domain", VM_NAME, "--mac", MAC_ADDRESS,
         "--bind", "127.0.0.1", "--port", str(REDFISH_PORT),
         "--cert", str(TMPDIR / "redfish.crt"),

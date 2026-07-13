@@ -209,7 +209,7 @@ def create_vm() -> tuple[Path, Path]:
 def setup_kubernetes_and_images() -> None:
     log("Building binaries and applying Metalman RBAC/CRDs")
     run(["make", "machina-manifests"], cwd=ROOT)
-    for output, package in (("metalman", "./cmd/metalman"), ("unbounded-agent", "./cmd/agent")):
+    for output, package in (("metalman", "./cmd/metalman"), ("unbounded-agent", "./cmd/agent"), ("metalman-redfish-fixture", "./hack/metalman-redfish-fixture")):
         run(["go", "build", "-o", str(ROOT / "bin" / output), package], cwd=ROOT)
     run(["kubectl", "apply", "--server-side", "--force-conflicts", "-f", str(ROOT / "deploy/machina/rendered/01-namespace.yaml")])
     run(["kubectl", "apply", "--server-side", "--force-conflicts", "-f", str(ROOT / "deploy/machina/crd")])
@@ -265,7 +265,7 @@ def start_fixture(blank_efi: Path, active_efi: Path) -> None:
     run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
          "-subj", "/CN=metalman-http-fixture", "-addext", "subjectAltName=IP:127.0.0.1",
          "-keyout", str(TMP / "redfish.key"), "-out", str(TMP / "redfish.crt")])
-    spawn([sys.executable, str(ROOT / "hack/metalman-redfish-fixture.py"),
+    spawn([str(ROOT / "bin/metalman-redfish-fixture"),
            "--domain", VM, "--mac", MAC, "--port", str(REDFISH_PORT),
             "--cert", str(TMP / "redfish.crt"), "--key", str(TMP / "redfish.key"),
             "--record", str(RECORD), "--efi-source", str(blank_efi),

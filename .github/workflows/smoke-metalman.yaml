@@ -14,7 +14,7 @@ on:
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
-      - hack/metalman-redfish-fixture.py
+      - hack/metalman-redfish-fixture/**
       - hack/smoke-metalman-http.py
       - hack/smoke-metalman.py
       - .github/workflows/smoke-metalman.yaml
@@ -29,7 +29,7 @@ on:
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
-      - hack/metalman-redfish-fixture.py
+      - hack/metalman-redfish-fixture/**
       - hack/smoke-metalman-http.py
       - hack/smoke-metalman.py
       - .github/workflows/smoke-metalman.yaml
