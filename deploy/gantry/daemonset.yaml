@@ -4,9 +4,9 @@
 #   - hostNetwork: false (§7.5) - pods use the cluster Pod network and
 #     dial each other directly via Pod IPs. peering ports (5001 +
 #     libp2p) are restricted by the optional hardening overlay in
-#     deploy/examples/networkpolicy.yaml (see deploy/README.md §
-#     Hardening overlays for the workflow - the overlay is NOT part
-#     of the default install).
+#     deploy/gantry/examples/networkpolicy.yaml (see the Production
+#     Security section of docs/content/guides/gantry.md - the overlay
+#     is NOT part of the default install).
 #   - hostPath mounts:
 #       /var/lib/gantry/libp2p  - persistent libp2p identity key, so
 #                                  the same peer ID survives restarts
@@ -54,12 +54,14 @@
 #     not use this Secret; mounting it opts into legacy shared-identity mode.
 #
 # Apply with:
-#   kubectl apply -f deploy/serviceaccount.yaml
-#   kubectl apply -f deploy/registry-secret.yaml   # operator-supplied
-#   kubectl apply -f deploy/daemonset.yaml
+#   kubectl apply -f deploy/gantry/serviceaccount.yaml
+#   kubectl apply -f deploy/gantry/configmap.yaml
+#   # Optional shared identity: apply an edited private copy of
+#   # deploy/gantry/examples/registry-secret.example.yaml first.
+#   kubectl apply -f deploy/gantry/daemonset.yaml
 #
 # After verifying rollout, optionally harden with:
-#   # 1. Copy deploy/examples/networkpolicy.yaml into your own overlay
+#   # 1. Copy deploy/gantry/examples/networkpolicy.yaml into your own overlay
 #   # 2. Edit every "OPERATOR ACTION REQUIRED" ipBlock
 #   # 3. kubectl apply -f <your-overlay>/networkpolicy.yaml
 ---

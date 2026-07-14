@@ -18,7 +18,7 @@ data:
     # ---------- Listeners ----------
     # mirror_listen binds 0.0.0.0:5000 inside the pod because the
     # DaemonSet exposes the mirror via hostPort with hostIP: 127.0.0.1
-    # (deploy/daemonset.yaml). kube-proxy / portmap DNATs the host's
+    # (deploy/gantry/daemonset.yaml). kube-proxy / portmap DNATs the host's
     # 127.0.0.1:5000 to <podIP>:5000 in the pod's network namespace -
     # a listener on the pod's loopback (127.0.0.1 inside the pod) is
     # unreachable through that path.
@@ -30,8 +30,9 @@ data:
     # network at <podIP>:5000. Operators who do not want peer pods
     # to be able to hit the mirror directly SHOULD apply the
     # optional NetworkPolicy overlay at
-    # deploy/examples/networkpolicy.yaml (see the "Hardening
-    # overlays" section of deploy/README.md). That overlay is
+    # deploy/gantry/examples/networkpolicy.yaml (see the
+    # "Production Security" section of docs/content/guides/gantry.md).
+    # That overlay is
     # recommended for production but not part of the default install
     # because its allow-list depends on the cluster's node-CIDR
     # range, which is site-specific.
@@ -100,9 +101,10 @@ data:
     # supplied by kubelet/CRI. credentials_path is OPTIONAL legacy
     # shared-identity mode; setting it skips requester challenge negotiation.
     # When you explicitly need shared Gantry credentials:
-    #   1. apply deploy/registry-secret.example.yaml (renamed and
-    #      filled in with your "username:password" pair, keyed by
-    #      the registry's `name:` field below);
+    #   1. copy deploy/gantry/examples/registry-secret.example.yaml
+    #      to a private location, fill in your "username:password"
+    #      pair keyed by the registry's `name:` field below, and
+    #      apply the resulting Secret;
     #   2. add `credentials_path: "/etc/gantry/registry/<name>"`
     #      to the matching entry here.
     # The agent reads each credentials_path EAGERLY at startup
