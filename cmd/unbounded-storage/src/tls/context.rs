@@ -59,13 +59,6 @@ pub struct TlsContext {
     verify: bool,
 }
 
-// SAFETY: the same shard-pinned justification as the backends. The
-// `SSL_CTX` is only used from the single thread that owns the context;
-// the Send + Sync bounds exist solely so a backend holding a
-// `TlsContext` can satisfy the `Backend: Send + Sync` supertrait.
-unsafe impl Send for TlsContext {}
-unsafe impl Sync for TlsContext {}
-
 impl TlsContext {
     /// Build a client TLS context from `config`.
     pub fn new(config: &TlsConfig) -> Result<Self, Error> {
