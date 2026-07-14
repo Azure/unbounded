@@ -36,7 +36,7 @@ spec:
         - operator: Exists
       containers:
         - name: install
-          image: ghcr.io/azure/acr-credential-provider-installer:latest
+          image: ghcr.io/azure/acr-credential-provider-installer:53b9d94e
           imagePullPolicy: IfNotPresent
           env:
             - name: ACR_PROVIDER_NAME

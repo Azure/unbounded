@@ -18,7 +18,7 @@ Gantry guide.
 1. Create or reuse an ACR.
 2. Import a small private test image into ACR.
 3. Grant the AKS kubelet identity `AcrPull` on the ACR.
-4. Build and publish a durable public ACR credential-provider installer image.
+4. Verify anonymous access to the published immutable provider installer image.
 5. Install the provider on every node with a DaemonSet.
 6. Validate a plain private ACR Pod before installing Gantry.
 7. Install Gantry service account, containerd node config, ConfigMap, and DaemonSet.
@@ -54,8 +54,6 @@ set -euo pipefail
 : "${RESOURCE_GROUP:?Set RESOURCE_GROUP}"
 : "${CLUSTER_NAME:?Set CLUSTER_NAME}"
 : "${ACR_NAME:?Set ACR_NAME}"
-: "${PUBLIC_PROVIDER_REGISTRY:?Set PUBLIC_PROVIDER_REGISTRY, for example ghcr.io/your-org}"
-: "${PROVIDER_VERSION:?Set PROVIDER_VERSION to a durable tag}"
 
 export KUBECONFIG
 
@@ -63,7 +61,9 @@ LOCATION="${LOCATION:-canadacentral}"
 WORK_DIR="${WORK_DIR:-tmp/gantry-standalone-live}"
 ACR_PROVIDER_ROOT="${ACR_PROVIDER_ROOT:-hack/acr-credential-provider}"
 ACR_PROVIDER_NAMESPACE="${ACR_PROVIDER_NAMESPACE:-acr-credential-provider-system}"
-ACR_PROVIDER_INSTALLER_IMAGE="${PUBLIC_PROVIDER_REGISTRY}/acr-credential-provider-installer:${PROVIDER_VERSION}"
+ACR_PROVIDER_INSTALLER_REPOSITORY="${ACR_PROVIDER_INSTALLER_REPOSITORY:-azure/acr-credential-provider-installer}"
+ACR_PROVIDER_INSTALLER_TAG="${ACR_PROVIDER_INSTALLER_TAG:-53b9d94e}"
+ACR_PROVIDER_INSTALLER_IMAGE="ghcr.io/${ACR_PROVIDER_INSTALLER_REPOSITORY}:${ACR_PROVIDER_INSTALLER_TAG}"
 
 az account set --subscription "$SUBSCRIPTION_ID"
 mkdir -p "$WORK_DIR"
@@ -135,28 +135,44 @@ az role assignment create \
   --only-show-errors || true
 ```
 
-## Build And Publish The Provider Installer
+## Verify The Provider Installer Image
 
-Build the repo-owned kubelet exec provider and publish its public installer
-image. Use a durable public registry tag for real cluster use. A short-lived
-test registry can prove the flow once, but it will not satisfy the new-node
-DaemonSet requirement later.
+The default provider installer is the public, immutable image validated by this
+playbook. Verify anonymous access before changing any node. Do not continue if
+either request fails, because new nodes must pull this image without registry
+credentials.
 
 ```bash
-GOTOOLCHAIN=auto make acr-credential-provider-build
+provider_token=$(curl -fsS \
+  "https://ghcr.io/token?service=ghcr.io&scope=repository:${ACR_PROVIDER_INSTALLER_REPOSITORY}:pull" | \
+  jq -r '.token // empty')
 
-GOTOOLCHAIN=auto make image-acr-credential-provider-installer-push \
-  CONTAINER_REGISTRY="$PUBLIC_PROVIDER_REGISTRY" \
-  VERSION="$PROVIDER_VERSION"
+if [ -z "$provider_token" ]; then
+  echo "GHCR did not issue an anonymous pull token" >&2
+  exit 1
+fi
+
+curl -fsS -o /dev/null \
+  -H "Authorization: Bearer ${provider_token}" \
+  -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+  "https://ghcr.io/v2/${ACR_PROVIDER_INSTALLER_REPOSITORY}/manifests/${ACR_PROVIDER_INSTALLER_TAG}"
+
+unset provider_token
+echo "verified anonymous pull access to ${ACR_PROVIDER_INSTALLER_IMAGE}"
 ```
 
-Render the installer DaemonSet with the published image. The example manifest
-is multi-document and includes the Namespace, so use direct rendering instead
-of `kubectl set image --local`.
+To validate provider source changes instead, build and publish a new immutable
+public tag using the commands in `hack/acr-credential-provider/README.md`, then
+override `ACR_PROVIDER_INSTALLER_REPOSITORY` and
+`ACR_PROVIDER_INSTALLER_TAG` before running this check.
+
+Render the installer DaemonSet with the verified image. The fixture manifest is
+multi-document and includes the Namespace, so use direct rendering instead of
+`kubectl set image --local`.
 
 ```bash
 sed \
-  -e "s#image: ghcr.io/azure/acr-credential-provider-installer:latest#image: ${ACR_PROVIDER_INSTALLER_IMAGE}#" \
+  -e "s#image: ghcr.io/azure/acr-credential-provider-installer:53b9d94e#image: ${ACR_PROVIDER_INSTALLER_IMAGE}#" \
   -e "s#acr-credential-provider-system#${ACR_PROVIDER_NAMESPACE}#g" \
   "$ACR_PROVIDER_ROOT/installer/daemonset.yaml" \
   > "$WORK_DIR/acr-credential-provider-installer.yaml"
