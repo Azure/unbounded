@@ -7,17 +7,21 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"reflect"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -188,6 +192,10 @@ func clusterScopedSecretRewrites() []secretNamespaceRewrite {
 // operator-owned resources (and the now-empty legacy namespaces) left behind.
 type LegacyReaper struct {
 	client.Client
+	// APIReader bypasses the manager cache for migration inventory, copy sources,
+	// target existence checks, and safety gates. It falls back to Client for
+	// direct construction in unit tests.
+	APIReader client.Reader
 
 	// TargetNamespace is the unified namespace components are consolidated into.
 	TargetNamespace string
@@ -305,7 +313,12 @@ func (r *LegacyReaper) reapOnce(ctx context.Context, logger logr.Logger) (bool, 
 	// 1 & 2: copy non-regenerable state (secrets + named configmaps) into the
 	// target namespace.
 	for _, legacyNs := range r.LegacyNamespaces {
-		if !r.namespaceExists(ctx, legacyNs) {
+		exists, err := r.namespaceExists(ctx, legacyNs)
+		if err != nil {
+			return false, fmt.Errorf("check legacy namespace %s: %w", legacyNs, err)
+		}
+
+		if !exists {
 			continue
 		}
 
@@ -340,7 +353,12 @@ func (r *LegacyReaper) reapOnce(ctx context.Context, logger logr.Logger) (bool, 
 	allReaped := true
 
 	for _, component := range legacyComponentsFor(target) {
-		if !r.namespaceExists(ctx, component.legacyNamespace) {
+		exists, err := r.namespaceExists(ctx, component.legacyNamespace)
+		if err != nil {
+			return false, fmt.Errorf("check legacy namespace %s: %w", component.legacyNamespace, err)
+		}
+
+		if !exists {
 			continue
 		}
 
@@ -400,7 +418,7 @@ func (r *LegacyReaper) translateSites(ctx context.Context, logger logr.Logger) e
 		Kind:    legacySiteGVK.Kind + "List",
 	})
 
-	if err := r.List(ctx, list); err != nil {
+	if err := r.liveReader().List(ctx, list); err != nil {
 		// The legacy Site CRD may already be gone (the cleanup step deletes it):
 		// a reloaded RESTMapper surfaces that as a no-match error, while a stale
 		// mapper issues a request that 404s. Either means nothing to translate.
@@ -423,13 +441,27 @@ func (r *LegacyReaper) translateSites(ctx context.Context, logger logr.Logger) e
 func (r *LegacyReaper) translateSite(ctx context.Context, logger logr.Logger, src *unstructured.Unstructured) error {
 	name := src.GetName()
 
-	// Do not clobber a Site that already exists in the machina group (already
-	// translated on a previous pass, or created directly against the new API).
+	networkingSpec, err := siteSpecWithoutComponents(src)
+	if err != nil {
+		return fmt.Errorf("read legacy site %s spec: %w", name, err)
+	}
+
+	// Do not clobber a Site that already exists in the machina group, but only
+	// accept it when it preserves the legacy networking configuration.
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(newSiteGVK())
 
-	err := r.Get(ctx, client.ObjectKey{Name: name}, existing)
+	err = r.liveReader().Get(ctx, client.ObjectKey{Name: name}, existing)
 	if err == nil {
+		existingNetworkingSpec, err := siteSpecWithoutComponents(existing)
+		if err != nil {
+			return fmt.Errorf("read machina site %s spec: %w", name, err)
+		}
+
+		if !reflect.DeepEqual(networkingSpec, existingNetworkingSpec) {
+			return migrationConflict(existing, "networking spec")
+		}
+
 		return nil
 	}
 
@@ -437,18 +469,9 @@ func (r *LegacyReaper) translateSite(ctx context.Context, logger logr.Logger, sr
 		return fmt.Errorf("get machina site %s: %w", name, err)
 	}
 
-	spec, _, err := unstructured.NestedMap(src.Object, "spec")
-	if err != nil {
-		return fmt.Errorf("read legacy site %s spec: %w", name, err)
-	}
-
-	if spec == nil {
-		spec = map[string]any{}
-	}
-
 	// The networking spec is identical between the two Site types; only the
 	// operator-managed components block is new.
-	delete(spec, "components")
+	spec := networkingSpec
 
 	components, err := r.detectComponents(ctx, name)
 	if err != nil {
@@ -474,6 +497,21 @@ func (r *LegacyReaper) translateSite(ctx context.Context, logger logr.Logger, sr
 	logger.Info("translated legacy net Site into machina Site", "site", name, "components", components)
 
 	return nil
+}
+
+func siteSpecWithoutComponents(site *unstructured.Unstructured) (map[string]any, error) {
+	spec, _, err := unstructured.NestedMap(site.Object, "spec")
+	if err != nil {
+		return nil, err
+	}
+
+	if spec == nil {
+		spec = map[string]any{}
+	}
+
+	delete(spec, "components")
+
+	return spec, nil
 }
 
 // detectComponents infers spec.components for a translated Site from the
@@ -538,6 +576,8 @@ func (r *LegacyReaper) legacyMetalmanExistsForSite(ctx context.Context, siteName
 // preserves its --dhcp-auto-interface setting. Malformed or contradictory flag
 // values block translation rather than silently changing DHCP behavior.
 func (r *LegacyReaper) legacyMetalmanConfigForSite(ctx context.Context, siteName string) (bool, *bool, error) {
+	reader := r.liveReader()
+
 	var (
 		dhcpAutoInterface *bool
 		effectiveValue    *bool
@@ -547,7 +587,7 @@ func (r *LegacyReaper) legacyMetalmanConfigForSite(ctx context.Context, siteName
 
 	for _, legacyNs := range r.LegacyNamespaces {
 		var list appsv1.DeploymentList
-		if err := r.List(ctx, &list, client.InNamespace(legacyNs), client.MatchingLabels{"app": "unbounded-pxe"}); err != nil {
+		if err := reader.List(ctx, &list, client.InNamespace(legacyNs), client.MatchingLabels{"app": "unbounded-pxe"}); err != nil {
 			return false, nil, err
 		}
 
@@ -625,13 +665,15 @@ func metalmanDHCPAutoInterface(deploy *appsv1.Deployment) (*bool, error) {
 // legacyWorkloadExists reports whether a Deployment or DaemonSet matching the
 // given labels exists in any legacy namespace.
 func (r *LegacyReaper) legacyWorkloadExists(ctx context.Context, kind string, matchLabels map[string]string) (bool, error) {
+	reader := r.liveReader()
+
 	for _, legacyNs := range r.LegacyNamespaces {
 		opts := []client.ListOption{client.InNamespace(legacyNs), client.MatchingLabels(matchLabels)}
 
 		switch kind {
 		case "Deployment":
 			var list appsv1.DeploymentList
-			if err := r.List(ctx, &list, opts...); err != nil {
+			if err := reader.List(ctx, &list, opts...); err != nil {
 				return false, err
 			}
 
@@ -640,7 +682,7 @@ func (r *LegacyReaper) legacyWorkloadExists(ctx context.Context, kind string, ma
 			}
 		case "DaemonSet":
 			var list appsv1.DaemonSetList
-			if err := r.List(ctx, &list, opts...); err != nil {
+			if err := reader.List(ctx, &list, opts...); err != nil {
 				return false, err
 			}
 
@@ -657,7 +699,7 @@ func (r *LegacyReaper) legacyWorkloadExists(ctx context.Context, kind string, ma
 // legacy namespace into the target namespace, creating it only if absent.
 func (r *LegacyReaper) migrateSecrets(ctx context.Context, logger logr.Logger, legacyNs, target string) error {
 	var secrets corev1.SecretList
-	if err := r.List(ctx, &secrets, client.InNamespace(legacyNs)); err != nil {
+	if err := r.liveReader().List(ctx, &secrets, client.InNamespace(legacyNs)); err != nil {
 		return err
 	}
 
@@ -675,6 +717,7 @@ func (r *LegacyReaper) migrateSecrets(ctx context.Context, logger logr.Logger, l
 			ObjectMeta: copyObjectMeta(src.ObjectMeta, target),
 			Type:       src.Type,
 			Data:       src.Data,
+			Immutable:  src.Immutable,
 		}
 
 		if err := r.createIfAbsent(ctx, dst); err != nil {
@@ -696,7 +739,7 @@ func (r *LegacyReaper) migrateSecrets(ctx context.Context, logger logr.Logger, l
 func (r *LegacyReaper) migrateConfigMaps(ctx context.Context, logger logr.Logger, legacyNs, target string) error {
 	for _, name := range r.CopyConfigMaps {
 		var src corev1.ConfigMap
-		if err := r.Get(ctx, client.ObjectKey{Namespace: legacyNs, Name: name}, &src); err != nil {
+		if err := r.liveReader().Get(ctx, client.ObjectKey{Namespace: legacyNs, Name: name}, &src); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
@@ -705,21 +748,19 @@ func (r *LegacyReaper) migrateConfigMaps(ctx context.Context, logger logr.Logger
 		}
 
 		data := src.Data
-		if name == "machina-config" && r.APIServerEndpoint != "" {
-			data = make(map[string]string, len(src.Data))
-			for key, value := range src.Data {
-				data[key] = value
-			}
 
-			config, err := setMachinaAPIServerEndpoint(data["config.yaml"], r.APIServerEndpoint)
+		binaryData := src.BinaryData
+		if name == "machina-config" && r.APIServerEndpoint != "" {
+			expected, err := r.machinaTargetConfig(&src)
 			if err != nil {
 				return fmt.Errorf("update migrated machina config endpoint: %w", err)
 			}
 
-			data["config.yaml"] = config
+			data = expected.Data
+			binaryData = expected.BinaryData
 		}
 
-		if err := r.upsertConfigMap(ctx, copyObjectMeta(src.ObjectMeta, target), data, src.BinaryData); err != nil {
+		if err := r.upsertConfigMap(ctx, copyObjectMeta(src.ObjectMeta, target), data, binaryData); err != nil {
 			return fmt.Errorf("copy configmap %s/%s: %w", legacyNs, name, err)
 		}
 
@@ -734,7 +775,7 @@ func (r *LegacyReaper) migrateConfigMaps(ctx context.Context, logger logr.Logger
 func (r *LegacyReaper) upsertConfigMap(ctx context.Context, meta metav1.ObjectMeta, data map[string]string, binaryData map[string][]byte) error {
 	existing := &corev1.ConfigMap{}
 
-	err := r.Get(ctx, client.ObjectKey{Namespace: meta.Namespace, Name: meta.Name}, existing)
+	err := r.liveReader().Get(ctx, client.ObjectKey{Namespace: meta.Namespace, Name: meta.Name}, existing)
 	switch {
 	case apierrors.IsNotFound(err):
 		return r.Create(ctx, &corev1.ConfigMap{ObjectMeta: meta, Data: data, BinaryData: binaryData})
@@ -760,7 +801,7 @@ func (r *LegacyReaper) rewriteClusterScopedRefs(ctx context.Context, logger logr
 		list := &unstructured.UnstructuredList{}
 		list.SetGroupVersionKind(rewrite.gvk)
 
-		if err := r.List(ctx, list); err != nil {
+		if err := r.liveReader().List(ctx, list); err != nil {
 			if apimeta.IsNoMatchError(err) {
 				continue // CRD not installed; nothing to rewrite.
 			}
@@ -819,7 +860,7 @@ func (r *LegacyReaper) migrateMachineCloudInitConfigMaps(ctx context.Context, lo
 		Kind:    "MachineList",
 	})
 
-	if err := r.List(ctx, list); err != nil {
+	if err := r.liveReader().List(ctx, list); err != nil {
 		if apimeta.IsNoMatchError(err) {
 			return nil // Machine CRD not installed; nothing to migrate.
 		}
@@ -870,12 +911,24 @@ func (r *LegacyReaper) migrateMachineCloudInitConfigMaps(ctx context.Context, lo
 }
 
 // copyConfigMapByName copies a single ConfigMap from a source namespace into the
-// target namespace, creating it only if absent. A missing source is treated as
-// success (it may already have been copied and the source namespace drained).
+// target namespace, creating it only if absent. A missing source is safe only
+// when the target already exists, so callers never rewrite a reference to a
+// dangling ConfigMap.
 func (r *LegacyReaper) copyConfigMapByName(ctx context.Context, srcNs, name, target string) error {
 	var src corev1.ConfigMap
-	if err := r.Get(ctx, client.ObjectKey{Namespace: srcNs, Name: name}, &src); err != nil {
+	if err := r.liveReader().Get(ctx, client.ObjectKey{Namespace: srcNs, Name: name}, &src); err != nil {
 		if apierrors.IsNotFound(err) {
+			var existing corev1.ConfigMap
+
+			targetKey := client.ObjectKey{Namespace: target, Name: name}
+			if targetErr := r.liveReader().Get(ctx, targetKey, &existing); targetErr != nil {
+				if apierrors.IsNotFound(targetErr) {
+					return fmt.Errorf("source configmap %s/%s is missing and target configmap %s/%s does not exist", srcNs, name, target, name)
+				}
+
+				return fmt.Errorf("confirm target configmap %s/%s after source disappeared: %w", target, name, targetErr)
+			}
+
 			return nil
 		}
 
@@ -906,7 +959,7 @@ func (r *LegacyReaper) migrateStorageConfigMaps(ctx context.Context, logger logr
 	}
 
 	var sites unboundedv1alpha3.SiteList
-	if err := r.List(ctx, &sites); err != nil {
+	if err := r.liveReader().List(ctx, &sites); err != nil {
 		return fmt.Errorf("list sites: %w", err)
 	}
 
@@ -933,7 +986,7 @@ func (r *LegacyReaper) legacyStorageConfigMap(ctx context.Context) (*corev1.Conf
 	for _, legacyNs := range r.LegacyNamespaces {
 		var cm corev1.ConfigMap
 
-		err := r.Get(ctx, client.ObjectKey{Namespace: legacyNs, Name: "unbounded-storage-config"}, &cm)
+		err := r.liveReader().Get(ctx, client.ObjectKey{Namespace: legacyNs, Name: "unbounded-storage-config"}, &cm)
 		if apierrors.IsNotFound(err) {
 			continue
 		}
@@ -972,11 +1025,13 @@ func (r *LegacyReaper) reapComponent(ctx context.Context, logger logr.Logger, co
 // componentResourcesRemain reports whether any operator-owned workloads for the
 // component still exist in its legacy namespace.
 func (r *LegacyReaper) componentResourcesRemain(ctx context.Context, component legacyComponent) (bool, error) {
+	reader := r.liveReader()
+
 	for _, selector := range component.selectors {
 		opts := []client.ListOption{client.InNamespace(component.legacyNamespace), client.MatchingLabels(selector)}
 
 		var deployments appsv1.DeploymentList
-		if err := r.List(ctx, &deployments, opts...); err != nil {
+		if err := reader.List(ctx, &deployments, opts...); err != nil {
 			return true, err
 		}
 
@@ -985,7 +1040,7 @@ func (r *LegacyReaper) componentResourcesRemain(ctx context.Context, component l
 		}
 
 		var daemonsets appsv1.DaemonSetList
-		if err := r.List(ctx, &daemonsets, opts...); err != nil {
+		if err := reader.List(ctx, &daemonsets, opts...); err != nil {
 			return true, err
 		}
 
@@ -1019,17 +1074,37 @@ func (r *LegacyReaper) componentReady(ctx context.Context, target string, compon
 }
 
 func (r *LegacyReaper) machinaTargetReady(ctx context.Context, target string) (bool, error) {
+	reader := r.liveReader()
+
 	var config corev1.ConfigMap
-	if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: "machina-config"}, &config); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: target, Name: "machina-config"}, &config); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
 
 		return false, err
+	}
+
+	wantHash := configMapPayloadHash(&config)
+
+	legacyConfig, sourceCurrent, err := r.legacyConfigMap(ctx, legacyKubeNamespace, "machina-config", "machina")
+	if err != nil || !sourceCurrent {
+		return false, err
+	}
+
+	if legacyConfig != nil {
+		expected, err := r.machinaTargetConfig(legacyConfig)
+		if err != nil {
+			return false, fmt.Errorf("transform legacy machina config: %w", err)
+		}
+
+		if configMapPayloadHash(expected) != wantHash {
+			return false, nil
+		}
 	}
 
 	var deploy appsv1.Deployment
-	if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: "machina-controller"}, &deploy); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: target, Name: "machina-controller"}, &deploy); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
@@ -1037,11 +1112,56 @@ func (r *LegacyReaper) machinaTargetReady(ctx context.Context, target string) (b
 		return false, err
 	}
 
-	if deploy.Spec.Template.Annotations[machinaConfigHashAnnotation] != machinaConfigHash(config.Data["config.yaml"]) {
+	if deploy.Spec.Template.Annotations[machinaConfigHashAnnotation] != wantHash || !deploymentRolloutComplete(&deploy) {
 		return false, nil
 	}
 
-	return deploymentRolloutComplete(&deploy), nil
+	targetCurrent, err := r.configMapPayloadStillCurrent(ctx, &config)
+	if err != nil || !targetCurrent {
+		return false, err
+	}
+
+	liveLegacyConfig, sourceCurrent, err := r.legacyConfigMap(ctx, legacyKubeNamespace, "machina-config", "machina")
+	if err != nil || !sourceCurrent {
+		return false, err
+	}
+
+	if liveLegacyConfig == nil {
+		return true, nil
+	}
+
+	if legacyConfig == nil || liveLegacyConfig.ResourceVersion != legacyConfig.ResourceVersion ||
+		configMapPayloadHash(liveLegacyConfig) != configMapPayloadHash(legacyConfig) {
+		return false, nil
+	}
+
+	expected, err := r.machinaTargetConfig(liveLegacyConfig)
+	if err != nil {
+		return false, fmt.Errorf("transform live legacy machina config: %w", err)
+	}
+
+	return configMapPayloadHash(expected) == wantHash, nil
+}
+
+func (r *LegacyReaper) machinaTargetConfig(source *corev1.ConfigMap) (*corev1.ConfigMap, error) {
+	expected := source.DeepCopy()
+	if r.APIServerEndpoint == "" {
+		return expected, nil
+	}
+
+	expected.Data = make(map[string]string, len(source.Data)+1)
+	for key, value := range source.Data {
+		expected.Data[key] = value
+	}
+
+	config, err := setMachinaAPIServerEndpoint(expected.Data["config.yaml"], r.APIServerEndpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	expected.Data["config.yaml"] = config
+
+	return expected, nil
 }
 
 // metalmanTargetsPresent reports whether the operator has created the per-site
@@ -1053,8 +1173,10 @@ func (r *LegacyReaper) machinaTargetReady(ctx context.Context, target string) (b
 // enables metalman (for example a detection miss), reaping is refused so the
 // workload is not silently dropped.
 func (r *LegacyReaper) metalmanTargetsPresent(ctx context.Context, target string) (bool, error) {
+	reader := r.liveReader()
+
 	var sites unboundedv1alpha3.SiteList
-	if err := r.List(ctx, &sites); err != nil {
+	if err := reader.List(ctx, &sites); err != nil {
 		return false, fmt.Errorf("list sites: %w", err)
 	}
 
@@ -1069,7 +1191,7 @@ func (r *LegacyReaper) metalmanTargetsPresent(ctx context.Context, target string
 		enabled++
 
 		var deploy appsv1.Deployment
-		if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: metalmanDeploymentName(site.Name)}, &deploy); err != nil {
+		if err := reader.Get(ctx, client.ObjectKey{Namespace: target, Name: metalmanDeploymentName(site.Name)}, &deploy); err != nil {
 			if apierrors.IsNotFound(err) {
 				return false, nil
 			}
@@ -1081,25 +1203,48 @@ func (r *LegacyReaper) metalmanTargetsPresent(ctx context.Context, target string
 	return enabled > 0, nil
 }
 
-// netTargetsPresent reports whether the operator has created the new net
-// controller and node in the target namespace. Net readiness is deliberately
-// NOT required: the old and new net-node DaemonSets both use hostNetwork and
-// contend for the same node host ports, so the new net pods remain Pending
-// until the old net is reaped. Gating on creation (rather than readiness) lets
-// the reaper remove the old net once the operator has taken over, freeing the
-// ports so the new net can schedule and become Ready.
+// netTargetsPresent reports whether the target config still matches any live
+// legacy source and both target net workloads carry its exact payload hash.
+// Readiness is deliberately not required because the old and new host-network
+// workloads contend for the same host ports.
 func (r *LegacyReaper) netTargetsPresent(ctx context.Context, target string) (bool, error) {
-	var deploy appsv1.Deployment
-	if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: "unbounded-net-controller"}, &deploy); err != nil {
+	reader := r.liveReader()
+
+	var config corev1.ConfigMap
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: target, Name: "unbounded-net-config"}, &config); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
 
 		return false, err
+	}
+
+	wantHash := configMapPayloadHash(&config)
+
+	legacyConfig, sourceCurrent, err := r.legacyNetConfig(ctx)
+	if err != nil || !sourceCurrent {
+		return false, err
+	}
+
+	if legacyConfig != nil && configMapPayloadHash(legacyConfig) != wantHash {
+		return false, nil
+	}
+
+	var deploy appsv1.Deployment
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: target, Name: "unbounded-net-controller"}, &deploy); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	if deploy.Spec.Template.Annotations[netConfigHashAnnotation] != wantHash {
+		return false, nil
 	}
 
 	var ds appsv1.DaemonSet
-	if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: "unbounded-net-node"}, &ds); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: target, Name: "unbounded-net-node"}, &ds); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
@@ -1107,27 +1252,101 @@ func (r *LegacyReaper) netTargetsPresent(ctx context.Context, target string) (bo
 		return false, err
 	}
 
-	return true, nil
+	if ds.Spec.Template.Annotations[netConfigHashAnnotation] != wantHash {
+		return false, nil
+	}
+
+	targetCurrent, err := r.configMapPayloadStillCurrent(ctx, &config)
+	if err != nil || !targetCurrent {
+		return false, err
+	}
+
+	liveLegacyConfig, sourceCurrent, err := r.legacyNetConfig(ctx)
+	if err != nil || !sourceCurrent {
+		return false, err
+	}
+
+	if liveLegacyConfig == nil {
+		return true, nil
+	}
+
+	if legacyConfig == nil {
+		return false, nil
+	}
+
+	return liveLegacyConfig.ResourceVersion == legacyConfig.ResourceVersion &&
+		configMapPayloadHash(liveLegacyConfig) == configMapPayloadHash(legacyConfig) &&
+		configMapPayloadHash(liveLegacyConfig) == wantHash, nil
+}
+
+// legacyNetConfig reads the migration source directly. A missing source is safe
+// only after its namespace is absent or terminating; otherwise the next reaper
+// pass must restore the target from the source before net can be reaped.
+func (r *LegacyReaper) legacyNetConfig(ctx context.Context) (*corev1.ConfigMap, bool, error) {
+	return r.legacyConfigMap(ctx, legacyNetNamespace, "unbounded-net-config", "net")
+}
+
+func (r *LegacyReaper) legacyConfigMap(
+	ctx context.Context,
+	namespace string,
+	name string,
+	component string,
+) (*corev1.ConfigMap, bool, error) {
+	reader := r.liveReader()
+	key := client.ObjectKey{Namespace: namespace, Name: name}
+
+	var config corev1.ConfigMap
+	if err := reader.Get(ctx, key, &config); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, false, fmt.Errorf("get legacy %s configmap: %w", component, err)
+		}
+
+		var legacyNamespace corev1.Namespace
+		if err := reader.Get(ctx, client.ObjectKey{Name: namespace}, &legacyNamespace); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, true, nil
+			}
+
+			return nil, false, fmt.Errorf("get legacy %s namespace: %w", component, err)
+		}
+
+		return nil, legacyNamespace.DeletionTimestamp != nil, nil
+	}
+
+	return &config, true, nil
 }
 
 // storageTargetsReady reports whether legacy storage may be reaped. It is a
 // conjunction of two invariants:
 //
 //   - Every per-site unbounded-storage-supervisor-<site> DaemonSet that exists
-//     in the target namespace must be Ready. A zero-desired DaemonSet is safe
-//     only when no Node InternalIP matches that Site's node CIDRs. At least one
-//     DaemonSet must exist (do not reap before a replacement is created).
+//     in the target namespace must carry its live ConfigMap payload hash and
+//     have a current, fully updated Ready rollout. A zero-desired DaemonSet is
+//     safe only when no Node InternalIP matches that Site's node CIDRs. At least
+//     one DaemonSet must exist (do not reap before a replacement is created).
 //   - Every storage-enabled translated Site must have its per-site DaemonSet
 //     present, so a multi-site cluster never loses the legacy supervisor before
 //     every storage-enabled Site has its own replacement.
 func (r *LegacyReaper) storageTargetsReady(ctx context.Context, target string) (bool, error) {
+	reader := r.liveReader()
+
+	legacyConfig, sourceCurrent, err := r.legacyConfigMap(ctx, legacyKubeNamespace, "unbounded-storage-config", "storage")
+	if err != nil || !sourceCurrent {
+		return false, err
+	}
+
+	legacyHash := ""
+	if legacyConfig != nil {
+		legacyHash = configMapPayloadHash(legacyConfig)
+	}
+
 	var list appsv1.DaemonSetList
-	if err := r.List(ctx, &list, client.InNamespace(target)); err != nil {
+	if err := reader.List(ctx, &list, client.InNamespace(target)); err != nil {
 		return false, err
 	}
 
 	var sites unboundedv1alpha3.SiteList
-	if err := r.List(ctx, &sites); err != nil {
+	if err := reader.List(ctx, &sites); err != nil {
 		return false, fmt.Errorf("list sites: %w", err)
 	}
 
@@ -1147,13 +1366,28 @@ func (r *LegacyReaper) storageTargetsReady(ctx context.Context, target string) (
 		}
 
 		found = true
+		siteName := strings.TrimPrefix(ds.Name, "unbounded-storage-supervisor-")
 
-		if ds.Status.ObservedGeneration < ds.Generation {
+		var config corev1.ConfigMap
+		if err := reader.Get(ctx, client.ObjectKey{Namespace: target, Name: storageConfigName(siteName)}, &config); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+
+			return false, err
+		}
+
+		configHash := configMapPayloadHash(&config)
+		if ds.Spec.Template.Annotations[storageConfigHashAnnotation] != configHash ||
+			(legacyConfig != nil && configHash != legacyHash) {
 			return false, nil
 		}
 
 		if ds.Status.DesiredNumberScheduled == 0 {
-			siteName := strings.TrimPrefix(ds.Name, "unbounded-storage-supervisor-")
+			if ds.Status.ObservedGeneration < ds.Generation ||
+				ds.Status.UpdatedNumberScheduled != ds.Status.DesiredNumberScheduled {
+				return false, nil
+			}
 
 			site := sitesByName[siteName]
 			if site == nil {
@@ -1162,7 +1396,7 @@ func (r *LegacyReaper) storageTargetsReady(ctx context.Context, target string) (
 
 			if nodes == nil {
 				nodes = &corev1.NodeList{}
-				if err := r.List(ctx, nodes); err != nil {
+				if err := reader.List(ctx, nodes); err != nil {
 					return false, fmt.Errorf("list nodes: %w", err)
 				}
 			}
@@ -1176,11 +1410,21 @@ func (r *LegacyReaper) storageTargetsReady(ctx context.Context, target string) (
 				return false, nil
 			}
 
+			current, err := r.configMapPayloadStillCurrent(ctx, &config)
+			if err != nil || !current {
+				return false, err
+			}
+
 			continue
 		}
 
 		if !storageDaemonSetReady(ds) {
 			return false, nil
+		}
+
+		current, err := r.configMapPayloadStillCurrent(ctx, &config)
+		if err != nil || !current {
+			return false, err
 		}
 	}
 
@@ -1193,7 +1437,7 @@ func (r *LegacyReaper) storageTargetsReady(ctx context.Context, target string) (
 		}
 
 		var ds appsv1.DaemonSet
-		if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: storageDaemonSetName(site.Name)}, &ds); err != nil {
+		if err := reader.Get(ctx, client.ObjectKey{Namespace: target, Name: storageDaemonSetName(site.Name)}, &ds); err != nil {
 			if apierrors.IsNotFound(err) {
 				return false, nil
 			}
@@ -1202,7 +1446,36 @@ func (r *LegacyReaper) storageTargetsReady(ctx context.Context, target string) (
 		}
 	}
 
-	return found, nil
+	if !found {
+		return false, nil
+	}
+
+	liveLegacyConfig, sourceCurrent, err := r.legacyConfigMap(ctx, legacyKubeNamespace, "unbounded-storage-config", "storage")
+	if err != nil || !sourceCurrent {
+		return false, err
+	}
+
+	if liveLegacyConfig == nil {
+		return true, nil
+	}
+
+	return legacyConfig != nil &&
+		liveLegacyConfig.ResourceVersion == legacyConfig.ResourceVersion &&
+		configMapPayloadHash(liveLegacyConfig) == legacyHash, nil
+}
+
+func (r *LegacyReaper) configMapPayloadStillCurrent(ctx context.Context, observed *corev1.ConfigMap) (bool, error) {
+	var current corev1.ConfigMap
+	if err := r.liveReader().Get(ctx, client.ObjectKeyFromObject(observed), &current); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	return current.ResourceVersion == observed.ResourceVersion &&
+		configMapPayloadHash(&current) == configMapPayloadHash(observed), nil
 }
 
 func siteHasMatchingNode(site *unboundedv1alpha3.Site, nodes []corev1.Node) (bool, error) {
@@ -1238,11 +1511,13 @@ func siteHasMatchingNode(site *unboundedv1alpha3.Site, nodes []corev1.Node) (boo
 // targetsReady reports whether every gating workload is healthy in the target
 // namespace. Components without gating workloads are always considered ready.
 func (r *LegacyReaper) targetsReady(ctx context.Context, target string, refs []workloadRef) (bool, error) {
+	reader := r.liveReader()
+
 	for _, ref := range refs {
 		switch ref.kind {
 		case "Deployment":
 			var deploy appsv1.Deployment
-			if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: ref.name}, &deploy); err != nil {
+			if err := reader.Get(ctx, client.ObjectKey{Namespace: target, Name: ref.name}, &deploy); err != nil {
 				if apierrors.IsNotFound(err) {
 					return false, nil
 				}
@@ -1255,7 +1530,7 @@ func (r *LegacyReaper) targetsReady(ctx context.Context, target string, refs []w
 			}
 		case "DaemonSet":
 			var ds appsv1.DaemonSet
-			if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: ref.name}, &ds); err != nil {
+			if err := reader.Get(ctx, client.ObjectKey{Namespace: target, Name: ref.name}, &ds); err != nil {
 				if apierrors.IsNotFound(err) {
 					return false, nil
 				}
@@ -1288,11 +1563,18 @@ func (r *LegacyReaper) cleanup(ctx context.Context, logger logr.Logger, target s
 	}
 
 	for _, nsName := range r.LegacyNamespaces {
-		if !r.namespaceExists(ctx, nsName) {
+		exists, err := r.namespaceExists(ctx, nsName)
+		if err != nil {
+			return false, fmt.Errorf("check legacy namespace %s: %w", nsName, err)
+		}
+
+		if !exists {
 			continue
 		}
 
-		r.warnOnForeignWorkloads(ctx, logger, nsName)
+		if err := r.warnOnForeignWorkloads(ctx, logger, nsName); err != nil {
+			return false, fmt.Errorf("audit legacy namespace %s: %w", nsName, err)
+		}
 
 		if err := r.deleteNamespace(ctx, nsName); err != nil {
 			return false, fmt.Errorf("delete legacy namespace %s: %w", nsName, err)
@@ -1348,6 +1630,8 @@ func (r *LegacyReaper) cleanupLegacySiteCRD(ctx context.Context, logger logr.Log
 }
 
 func (r *LegacyReaper) siteNodeSlicesOwnedByCurrentSites(ctx context.Context) (bool, error) {
+	reader := r.liveReader()
+
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   siteNodeSliceGVK.Group,
@@ -1355,7 +1639,7 @@ func (r *LegacyReaper) siteNodeSlicesOwnedByCurrentSites(ctx context.Context) (b
 		Kind:    siteNodeSliceGVK.Kind + "List",
 	})
 
-	if err := r.List(ctx, list); err != nil {
+	if err := reader.List(ctx, list); err != nil {
 		if apimeta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
 			return true, nil
 		}
@@ -1372,7 +1656,7 @@ func (r *LegacyReaper) siteNodeSlicesOwnedByCurrentSites(ctx context.Context) (b
 		}
 
 		site := &unboundedv1alpha3.Site{}
-		if err := r.Get(ctx, client.ObjectKey{Name: siteName}, site); err != nil {
+		if err := reader.Get(ctx, client.ObjectKey{Name: siteName}, site); err != nil {
 			if apierrors.IsNotFound(err) {
 				return false, nil
 			}
@@ -1400,7 +1684,7 @@ func hasExactSiteOwnerReference(refs []metav1.OwnerReference, site *unboundedv1a
 		ref.Name == site.Name &&
 		ref.UID == site.UID &&
 		ref.Controller != nil && *ref.Controller &&
-		ref.BlockOwnerDeletion != nil && *ref.BlockOwnerDeletion
+		(ref.BlockOwnerDeletion == nil || !*ref.BlockOwnerDeletion)
 }
 
 // legacySiteCRDExists reports whether the pre-redesign net-group Site CRD is
@@ -1413,7 +1697,7 @@ func (r *LegacyReaper) legacySiteCRDExists(ctx context.Context) (bool, error) {
 		Kind:    "CustomResourceDefinition",
 	})
 
-	err := r.Get(ctx, client.ObjectKey{Name: legacySiteCRDName}, crd)
+	err := r.liveReader().Get(ctx, client.ObjectKey{Name: legacySiteCRDName}, crd)
 	switch {
 	case err == nil:
 		return true, nil
@@ -1428,7 +1712,7 @@ func (r *LegacyReaper) legacySiteCRDExists(ctx context.Context) (bool, error) {
 // target namespace is Available.
 func (r *LegacyReaper) netControllerAvailable(ctx context.Context, target string) (bool, error) {
 	var deploy appsv1.Deployment
-	if err := r.Get(ctx, client.ObjectKey{Namespace: target, Name: "unbounded-net-controller"}, &deploy); err != nil {
+	if err := r.liveReader().Get(ctx, client.ObjectKey{Namespace: target, Name: "unbounded-net-controller"}, &deploy); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
@@ -1444,15 +1728,14 @@ func (r *LegacyReaper) netControllerAvailable(ctx context.Context, target string
 // alerted before the whole-namespace delete removes them too. Deletion still
 // proceeds (the namespace is the migration target); the warning surfaces
 // unexpected residents rather than blocking the migration.
-func (r *LegacyReaper) warnOnForeignWorkloads(ctx context.Context, logger logr.Logger, nsName string) {
+func (r *LegacyReaper) warnOnForeignWorkloads(ctx context.Context, logger logr.Logger, nsName string) error {
 	foreign, err := r.foreignWorkloads(ctx, nsName)
 	if err != nil {
-		logger.Error(err, "failed to check for foreign workloads before deleting legacy namespace", "namespace", nsName)
-		return
+		return err
 	}
 
 	if len(foreign) == 0 {
-		return
+		return nil
 	}
 
 	logger.Info("legacy namespace still holds non-operator workloads; they will be deleted with the namespace",
@@ -1463,48 +1746,169 @@ func (r *LegacyReaper) warnOnForeignWorkloads(ctx context.Context, logger logr.L
 		r.Recorder.Eventf(ns, nil, corev1.EventTypeWarning, "ForeignWorkloadsDeleted", "DeleteLegacyNamespace",
 			"deleting drained legacy namespace %s which still holds non-operator workloads: %v", nsName, foreign)
 	}
+
+	return nil
 }
 
-// foreignWorkloads returns the "Kind/name" of workload controllers in the
-// namespace that the reaper did not create. cleanup runs only after every
-// operator-owned Deployment/DaemonSet has been reaped, so any remaining
-// Deployment/DaemonSet/StatefulSet here is foreign.
+// foreignWorkloads returns sorted "Kind/name" entries for every top-level or
+// standalone workload remaining after operator-owned resources have been
+// reaped. Descendants of listed controllers are omitted to avoid reporting the
+// same workload once for its controller and again for its Pods/ReplicaSets.
 func (r *LegacyReaper) foreignWorkloads(ctx context.Context, nsName string) ([]string, error) {
-	var names []string
+	reader := r.liveReader()
+	opts := []client.ListOption{client.InNamespace(nsName)}
 
-	var deployments appsv1.DeploymentList
-	if err := r.List(ctx, &deployments, client.InNamespace(nsName)); err != nil {
+	var pods corev1.PodList
+	if err := reader.List(ctx, &pods, opts...); err != nil {
 		return nil, err
 	}
 
-	for i := range deployments.Items {
-		names = append(names, "Deployment/"+deployments.Items[i].Name)
+	var replicationControllers corev1.ReplicationControllerList
+	if err := reader.List(ctx, &replicationControllers, opts...); err != nil {
+		return nil, err
+	}
+
+	var deployments appsv1.DeploymentList
+	if err := reader.List(ctx, &deployments, opts...); err != nil {
+		return nil, err
 	}
 
 	var daemonsets appsv1.DaemonSetList
-	if err := r.List(ctx, &daemonsets, client.InNamespace(nsName)); err != nil {
+	if err := reader.List(ctx, &daemonsets, opts...); err != nil {
 		return nil, err
-	}
-
-	for i := range daemonsets.Items {
-		names = append(names, "DaemonSet/"+daemonsets.Items[i].Name)
 	}
 
 	var statefulsets appsv1.StatefulSetList
-	if err := r.List(ctx, &statefulsets, client.InNamespace(nsName)); err != nil {
+	if err := reader.List(ctx, &statefulsets, opts...); err != nil {
 		return nil, err
 	}
 
-	for i := range statefulsets.Items {
-		names = append(names, "StatefulSet/"+statefulsets.Items[i].Name)
+	var replicasets appsv1.ReplicaSetList
+	if err := reader.List(ctx, &replicasets, opts...); err != nil {
+		return nil, err
 	}
 
+	var jobs batchv1.JobList
+	if err := reader.List(ctx, &jobs, opts...); err != nil {
+		return nil, err
+	}
+
+	var cronjobs batchv1.CronJobList
+	if err := reader.List(ctx, &cronjobs, opts...); err != nil {
+		return nil, err
+	}
+
+	controllerUIDs := map[string]struct{}{}
+
+	for _, list := range []runtime.Object{
+		&replicationControllers,
+		&deployments,
+		&daemonsets,
+		&statefulsets,
+		&replicasets,
+		&jobs,
+		&cronjobs,
+	} {
+		objects, err := apimeta.ExtractList(list)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, obj := range objects {
+			metadata, err := apimeta.Accessor(obj)
+			if err != nil {
+				return nil, err
+			}
+
+			if metadata.GetUID() != "" {
+				controllerUIDs[string(metadata.GetUID())] = struct{}{}
+			}
+		}
+	}
+
+	var names []string
+
+	appendStandalone := func(kind string, list runtime.Object) error {
+		objects, err := apimeta.ExtractList(list)
+		if err != nil {
+			return err
+		}
+
+		for _, obj := range objects {
+			metadata, err := apimeta.Accessor(obj)
+			if err != nil {
+				return err
+			}
+
+			if ownedByListedController(metadata, controllerUIDs) {
+				continue
+			}
+
+			if (kind == "Pod" || kind == "ReplicaSet") &&
+				metadata.GetDeletionTimestamp() != nil && legacyOperatorWorkload(metadata.GetLabels()) {
+				continue
+			}
+
+			names = append(names, kind+"/"+metadata.GetName())
+		}
+
+		return nil
+	}
+
+	for kind, list := range map[string]runtime.Object{
+		"Pod":                   &pods,
+		"ReplicationController": &replicationControllers,
+		"Deployment":            &deployments,
+		"DaemonSet":             &daemonsets,
+		"StatefulSet":           &statefulsets,
+		"ReplicaSet":            &replicasets,
+		"Job":                   &jobs,
+		"CronJob":               &cronjobs,
+	} {
+		if err := appendStandalone(kind, list); err != nil {
+			return nil, err
+		}
+	}
+
+	sort.Strings(names)
+
 	return names, nil
+}
+
+func legacyOperatorWorkload(labels map[string]string) bool {
+	switch labels[appNameLabel] {
+	case "metalman-controller", "unbounded-storage-supervisor", "unbounded-net-controller", "unbounded-net-node", "unbounded-net-kube-proxy":
+		return true
+	}
+
+	switch labels["app"] {
+	case "machina-controller", "unbounded-pxe":
+		return true
+	default:
+		return false
+	}
+}
+
+func ownedByListedController(obj metav1.Object, controllerUIDs map[string]struct{}) bool {
+	for _, ref := range obj.GetOwnerReferences() {
+		if _, ok := controllerUIDs[string(ref.UID)]; ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 // deleteLegacySiteCRD deletes the pre-redesign net-group Site CRD. It reports
 // gone=true once the CRD no longer exists.
 func (r *LegacyReaper) deleteLegacySiteCRD(ctx context.Context, logger logr.Logger) (bool, error) {
+	// Re-list and translate from the live API immediately before deletion. This
+	// catches Sites created after the migration pass at the start of the reap
+	// iteration and verifies every existing target still matches.
+	if err := r.translateSites(ctx, logger); err != nil {
+		return false, fmt.Errorf("verify legacy sites before deleting legacy Site CRD: %w", err)
+	}
+
 	// The legacy net-group Sites carry the net controller's protection
 	// finalizer (added once nodes are assigned). The old net controller is
 	// already reaped, so nothing remains to remove it; clearing it here lets the
@@ -1547,7 +1951,7 @@ func (r *LegacyReaper) clearLegacyNetSiteFinalizers(ctx context.Context, logger 
 		Kind:    legacySiteGVK.Kind + "List",
 	})
 
-	if err := r.List(ctx, list); err != nil {
+	if err := r.liveReader().List(ctx, list); err != nil {
 		if apimeta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
 			return nil
 		}
@@ -1557,6 +1961,10 @@ func (r *LegacyReaper) clearLegacyNetSiteFinalizers(ctx context.Context, logger 
 
 	for i := range list.Items {
 		site := &list.Items[i]
+		if err := r.translateSite(ctx, logger, site); err != nil {
+			return fmt.Errorf("verify legacy net Site %s before clearing finalizers: %w", site.GetName(), err)
+		}
+
 		if len(site.GetFinalizers()) == 0 {
 			continue
 		}
@@ -1586,19 +1994,183 @@ func (r *LegacyReaper) deleteNamespace(ctx context.Context, name string) error {
 	return nil
 }
 
-func (r *LegacyReaper) namespaceExists(ctx context.Context, name string) bool {
+func (r *LegacyReaper) namespaceExists(ctx context.Context, name string) (bool, error) {
 	var ns corev1.Namespace
 
-	return r.Get(ctx, client.ObjectKey{Name: name}, &ns) == nil
+	err := r.liveReader().Get(ctx, client.ObjectKey{Name: name}, &ns)
+	if err == nil {
+		return true, nil
+	}
+
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+
+	return false, err
+}
+
+func (r *LegacyReaper) liveReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+
+	return r.Client
 }
 
 func (r *LegacyReaper) createIfAbsent(ctx context.Context, obj client.Object) error {
 	err := r.Create(ctx, obj)
 	if apierrors.IsAlreadyExists(err) {
+		// Get must decode into a freshly allocated, zero-valued object. The real
+		// controller-runtime client decodes the live object into the target via
+		// JSON unmarshal, which merges into (rather than resets) any pre-populated
+		// maps. Reusing a deep copy of the desired object would leave desired
+		// Data/BinaryData keys in place when the live target omits them, causing
+		// equivalentMigratedPayload to report a false match and the reaper to
+		// drop the legacy source. Allocating an empty target avoids that.
+		existing, err := newEmptyLike(obj)
+		if err != nil {
+			return err
+		}
+
+		if err := r.liveReader().Get(ctx, client.ObjectKeyFromObject(obj), existing); err != nil {
+			return err
+		}
+
+		equivalent, payload, err := equivalentMigratedPayload(obj, existing)
+		if err != nil {
+			return err
+		}
+
+		if !equivalent {
+			return migrationConflict(obj, payload)
+		}
+
 		return nil
 	}
 
 	return err
+}
+
+// newEmptyLike returns a freshly allocated, zero-valued object of the same
+// concrete type as obj, preserving the GVK for unstructured objects so the
+// client can resolve the resource on Get. The returned object must be empty so
+// a subsequent Get reflects only the live object's fields.
+func newEmptyLike(obj client.Object) (client.Object, error) {
+	switch o := obj.(type) {
+	case *corev1.Secret:
+		return &corev1.Secret{}, nil
+	case *corev1.ConfigMap:
+		return &corev1.ConfigMap{}, nil
+	case *unstructured.Unstructured:
+		fresh := &unstructured.Unstructured{}
+		fresh.SetGroupVersionKind(o.GroupVersionKind())
+
+		return fresh, nil
+	default:
+		return nil, fmt.Errorf("cannot allocate empty target for unsupported object %T", obj)
+	}
+}
+
+func equivalentMigratedPayload(desired, existing client.Object) (bool, string, error) {
+	switch desired := desired.(type) {
+	case *corev1.Secret:
+		live, ok := existing.(*corev1.Secret)
+		if !ok {
+			return false, "", fmt.Errorf("live object %T does not match desired Secret", existing)
+		}
+
+		return desired.Type == live.Type &&
+			byteMapEqual(desired.Data, live.Data) &&
+			secretImmutable(desired) == secretImmutable(live), "Secret Type, Data, or immutable value", nil
+	case *corev1.ConfigMap:
+		live, ok := existing.(*corev1.ConfigMap)
+		if !ok {
+			return false, "", fmt.Errorf("live object %T does not match desired ConfigMap", existing)
+		}
+
+		return stringMapEqual(desired.Data, live.Data) && byteMapEqual(desired.BinaryData, live.BinaryData),
+			"ConfigMap Data or BinaryData", nil
+	case *unstructured.Unstructured:
+		if desired.GroupVersionKind() != newSiteGVK() {
+			return false, "", fmt.Errorf("cannot verify create race for unsupported unstructured %s", desired.GroupVersionKind())
+		}
+
+		live, ok := existing.(*unstructured.Unstructured)
+		if !ok {
+			return false, "", fmt.Errorf("live object %T does not match desired Site", existing)
+		}
+
+		desiredSpec, _, err := unstructured.NestedMap(desired.Object, "spec")
+		if err != nil {
+			return false, "", fmt.Errorf("read desired Site spec: %w", err)
+		}
+
+		liveSpec, _, err := unstructured.NestedMap(live.Object, "spec")
+		if err != nil {
+			return false, "", fmt.Errorf("read live Site spec: %w", err)
+		}
+
+		return reflect.DeepEqual(desiredSpec, liveSpec), "Site spec", nil
+	default:
+		return false, "", fmt.Errorf("cannot verify create race for unsupported object %T", desired)
+	}
+}
+
+func migrationConflict(obj client.Object, payload string) error {
+	resource := schema.GroupResource{}
+
+	switch obj.(type) {
+	case *corev1.Secret:
+		resource.Resource = "secrets"
+	case *corev1.ConfigMap:
+		resource.Resource = "configmaps"
+	case *unstructured.Unstructured:
+		resource.Group = obj.GetObjectKind().GroupVersionKind().Group
+		resource.Resource = "sites"
+	default:
+		resource.Group = obj.GetObjectKind().GroupVersionKind().Group
+		resource.Resource = strings.ToLower(obj.GetObjectKind().GroupVersionKind().Kind)
+	}
+
+	name := obj.GetName()
+	if obj.GetNamespace() != "" {
+		name = obj.GetNamespace() + "/" + name
+	}
+
+	return apierrors.NewConflict(resource, obj.GetName(), fmt.Errorf("migration target %s already exists with different %s", name, payload))
+}
+
+func stringMapEqual(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	for key, value := range left {
+		if rightValue, ok := right[key]; !ok || rightValue != value {
+			return false
+		}
+	}
+
+	return true
+}
+
+func byteMapEqual(left, right map[string][]byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	for key, value := range left {
+		rightValue, ok := right[key]
+		if !ok || string(rightValue) != string(value) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func secretImmutable(secret *corev1.Secret) bool {
+	return secret.Immutable != nil && *secret.Immutable
 }
 
 // isAutoManagedSecret reports whether a Secret type is auto-managed and must
@@ -1698,7 +2270,8 @@ func storageDaemonSetReady(ds *appsv1.DaemonSet) bool {
 		return false
 	}
 
-	return ds.Status.NumberReady >= ds.Status.DesiredNumberScheduled
+	return ds.Status.UpdatedNumberScheduled == ds.Status.DesiredNumberScheduled &&
+		ds.Status.NumberReady >= ds.Status.DesiredNumberScheduled
 }
 
 // SetupWithManager registers the reaper as a leader-elected manager runnable.
