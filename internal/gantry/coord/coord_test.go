@@ -5,6 +5,7 @@ package coord_test
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 // helper: build two libp2p hosts that know each other's addresses.
@@ -170,6 +172,41 @@ func TestPleasePull_Started(t *testing.T) {
 
 	if atomic.LoadInt32(&pumpCalls) != 2 {
 		t.Errorf("pumpCalls = %d, want 2", pumpCalls)
+	}
+}
+
+func TestPleasePull_DelegatesAuthorization(t *testing.T) {
+	for _, authorization := range []string{
+		"Bearer requester-token",
+		"Basic cmVxdWVzdGVyOnNlY3JldA==",
+	} {
+		t.Run(strings.Fields(authorization)[0], func(t *testing.T) {
+			hClient, hServer := makeHostPair(t)
+			c := fakes.NewCache()
+			members := fakes.NewMembers(ifaces.NodeID(hServer.ID().String()))
+			infl := inflight.New(inflight.DefaultStalls(), nil)
+
+			seen := make(chan string, 1)
+			pump := coord.PullerPump(func(ctx context.Context, _, _ string, _ digest.Digest, _ ifaces.OriginRefKind) coord.PumpResult {
+				seen <- registryauth.Authorization(ctx)
+
+				return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
+			})
+
+			srv := coord.NewServer(c, members, infl, coord.WithPullerPump(pump))
+			srv.Bind(hServer)
+
+			ctx := registryauth.WithAuthorization(context.Background(), authorization)
+
+			d := digest.MustParse("sha256:" + rep('a', 64))
+			if _, err := coord.NewClient(hClient).PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d}); err != nil {
+				t.Fatalf("PleasePull: %v", err)
+			}
+
+			if got := <-seen; got != authorization {
+				t.Fatalf("pump authorization = %q, want %q", got, authorization)
+			}
+		})
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 // pickHRW0 returns the HRW rank-0 node ID for d across the given
@@ -360,6 +361,37 @@ func TestPrefetchChildren_SplitsByKindOnSamePuller(t *testing.T) {
 	for i, ds := range coord.pleasePullDgs {
 		if len(ds) != 1 {
 			t.Errorf("call[%d] batch size: got %d want 1 (kind splitting must not pack across kinds)", i, len(ds))
+		}
+	}
+}
+
+func TestPrefetchChildren_PropagatesDelegatedAuthorization(t *testing.T) {
+	cluster := clusterNodes()
+	self := ifaces.NodeID("n3")
+	dgs := findManyDigestsForPullers(t, cluster, map[ifaces.NodeID]int{"n0": 2})
+	children := []coldstart.ChildDigest{
+		{Digest: dgs[0], Kind: ifaces.KindConfig},
+		{Digest: dgs[1], Kind: ifaces.KindBlob},
+	}
+
+	coord := &stubCoord{}
+	r := buildResolver(t, coord, &stubDisco{health: 1.0}, self, cluster, coldstart.MetricsHooks{}, time.Now)
+	ctx := registryauth.WithAuthorization(context.Background(), "Bearer requester-token")
+
+	if err := r.PrefetchChildren(ctx, children, "docker.io", "library/nginx"); err != nil {
+		t.Fatalf("PrefetchChildren: %v", err)
+	}
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+
+	if len(coord.pleasePullAuth) == 0 {
+		t.Fatal("no PleasePull calls recorded")
+	}
+
+	for i, authorization := range coord.pleasePullAuth {
+		if authorization != "Bearer requester-token" {
+			t.Fatalf("PleasePull[%d] authorization = %q, want requester token", i, authorization)
 		}
 	}
 }

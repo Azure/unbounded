@@ -16,9 +16,10 @@
 #      containerd falls back to the next host entry.
 #   2. The `server` line is the canonical origin used for fallback.
 #
-# `skip_verify = true` is loopback-only and limited to the agent's
-# self-signed-or-plain mirror endpoint - the upstream `server` URL
-# still verifies TLS normally.
+# The mirror endpoint is plain HTTP on loopback, so no TLS
+# `skip_verify` setting is needed. This matters for authentication:
+# containerd may use the mirror authorizer's HTTP client to contact an
+# HTTPS Bearer token realm and that TLS exchange must remain verified.
 #
 # `capabilities = ["pull","resolve"]` matches the §7.1 / §4.4
 # semantics: gantry serves pull (blob) and resolve (manifest) but
@@ -31,7 +32,6 @@ server = "${REGISTRY_SERVER}"
 
 [host."http://127.0.0.1:5000"]
   capabilities = ["pull", "resolve"]
-  skip_verify = true
   # The agent uses ?ns=<host> to discriminate which upstream registry
   # the request targets, matching the canonical hostname of this
   # certs.d directory.

@@ -22,6 +22,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/origin"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 // prefetchSpy records OnManifestServed calls and lets tests block
@@ -36,6 +37,7 @@ type prefetchCall struct {
 	registry   string
 	repository string
 	digest     digest.Digest
+	auth       string
 }
 
 func newPrefetchSpy() *prefetchSpy {
@@ -45,9 +47,9 @@ func newPrefetchSpy() *prefetchSpy {
 	return s
 }
 
-func (s *prefetchSpy) OnManifestServed(_ context.Context, reg, repo string, d digest.Digest) {
+func (s *prefetchSpy) OnManifestServed(ctx context.Context, reg, repo string, d digest.Digest) {
 	s.mu.Lock()
-	s.calls = append(s.calls, prefetchCall{registry: reg, repository: repo, digest: d})
+	s.calls = append(s.calls, prefetchCall{registry: reg, repository: repo, digest: d, auth: registryauth.Authorization(ctx)})
 	s.cond.Broadcast()
 	s.mu.Unlock()
 }
@@ -84,21 +86,14 @@ func (s *prefetchSpy) waitForCount(n int, d time.Duration) int {
 		}
 		// sync.Cond can't take a timeout directly; spawn a timer
 		// that wakes us up if no Broadcast arrives in time.
-		stopped := make(chan struct{})
 		timer := time.AfterFunc(remaining, func() {
 			s.mu.Lock()
 			s.cond.Broadcast()
 			s.mu.Unlock()
-			close(stopped)
 		})
 
 		s.cond.Wait()
 		timer.Stop()
-
-		select {
-		case <-stopped:
-		default:
-		}
 	}
 
 	return len(s.calls)
@@ -215,6 +210,40 @@ func TestMirror_Prefetch_FiresOnManifestOriginServe(t *testing.T) {
 
 	if call.digest.String() != d.String() {
 		t.Errorf("digest: got %s want %s", call.digest, d)
+	}
+}
+
+func TestMirror_PrefetchRetainsDelegatedAuthorizationAfterDetaching(t *testing.T) {
+	body := []byte(`{"schemaVersion":2}`)
+	d := hashSum(body)
+	spy := newPrefetchSpy()
+	f := newPrefetchFixture(t, nil, spy)
+	f.cache.Put(d, body)
+
+	req, err := http.NewRequest(http.MethodGet, f.server.URL+"/v2/library/nginx/manifests/"+d.String()+"?ns=reg.example.com", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req.Header.Set("Authorization", "Bearer requester-token")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = resp.Body.Close() //nolint:errcheck // best-effort close
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if n := spy.waitForCount(1, 2*time.Second); n != 1 {
+		t.Fatalf("OnManifestServed calls = %d, want 1", n)
+	}
+
+	if got := spy.snapshot()[0].auth; got != "Bearer requester-token" {
+		t.Fatalf("prefetch authorization = %q, want requester token", got)
 	}
 }
 
