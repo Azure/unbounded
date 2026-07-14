@@ -17,6 +17,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
+	"github.com/Azure/unbounded/internal/clusterinfo"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 )
 
@@ -114,7 +115,7 @@ func (w *ClusterInfoWatcher) Start(ctx context.Context) error {
 
 // refresh re-resolves the cluster-info from the Kubernetes API.
 func (w *ClusterInfoWatcher) refresh(ctx context.Context) error {
-	resolved, err := ResolveClusterInfo(ctx, w.clientset)
+	resolved, err := clusterinfo.Resolve(ctx, w.clientset)
 	if err != nil {
 		return fmt.Errorf("resolving cluster info: %w", err)
 	}

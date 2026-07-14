@@ -94,7 +94,7 @@ func addInstallFlags(cmd *cobra.Command, handler *installHandler) {
 	cmd.Flags().StringVar(&handler.namespace, "namespace", unbounded.SystemNamespace(), "Namespace for unbounded-operator and default components")
 	cmd.Flags().StringVar(&handler.operatorImage, "operator-image", "", "unbounded-operator image override")
 	cmd.Flags().StringVar(&handler.metalmanImage, "metalman-image", "", "metalman image override")
-	cmd.Flags().StringVar(&handler.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint advertised to provisioned machines; defaults to the kubeconfig server")
+	cmd.Flags().StringVar(&handler.apiServerEndpoint, "api-server-endpoint", "", "Override the Kubernetes API server endpoint advertised to provisioned machines; by default the operator auto-discovers it from kube-public/cluster-info")
 	cmd.Flags().BoolVar(&handler.wait, "wait", true, "Wait for unbounded-operator rollout")
 	cmd.Flags().DurationVar(&handler.timeout, "timeout", defaultInstallTimeout, "Timeout for rollout waits")
 }
@@ -274,11 +274,12 @@ func operatorConfigHash(data map[string]string) string {
 }
 
 func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
-	endpoint := h.apiServerEndpoint
-	if endpoint == "" && h.restConfig != nil {
-		endpoint = h.restConfig.Host
-	}
-
+	// The operator auto-discovers the API server endpoint from
+	// kube-public/cluster-info at runtime, so the endpoint is only stored when
+	// explicitly overridden via --api-server-endpoint. A previously stored
+	// override is preserved across reinstalls (like the reaper flag) rather than
+	// being cleared or replaced with the kubeconfig host.
+	endpoint := ""
 	reapLegacyResources := true
 	configMap := &unstructured.Unstructured{}
 	configMap.SetAPIVersion("v1")
@@ -295,6 +296,8 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 			return fmt.Errorf("get existing unbounded-operator-config data: %w", err)
 		}
 
+		endpoint = data["UNBOUNDED_API_SERVER_ENDPOINT"]
+
 		if value, found := data["UNBOUNDED_REAP_LEGACY_RESOURCES"]; found {
 			parsed, err := strconv.ParseBool(value)
 			if err != nil {
@@ -303,6 +306,10 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 
 			reapLegacyResources = parsed
 		}
+	}
+
+	if h.apiServerEndpoint != "" {
+		endpoint = h.apiServerEndpoint
 	}
 
 	h.operatorConfigData = map[string]string{

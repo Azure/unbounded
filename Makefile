@@ -55,25 +55,25 @@ AGENT_CMD=./cmd/agent
 
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
-MACHINA_IMAGE ?= $(CONTAINER_REGISTRY)/machina:$(VERSION)
+MACHINA_IMAGE ?= $(CONTAINER_REGISTRY)/machina:$(VERSION_TAG)
 
 MACHINE_OPS_CONTROLLER_BIN=bin/machine-ops-controller
 MACHINE_OPS_CONTROLLER_CMD=./cmd/machine-ops-controller
-MACHINE_OPS_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/machine-ops-controller:$(VERSION)
+MACHINE_OPS_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/machine-ops-controller:$(VERSION_TAG)
 MACHINE_OPS_CONTROLLER_NAME ?= machine-ops-controller
 MACHINE_OPS_PROVIDER ?=
 MACHINE_OPS_SITE ?=
 
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
-NETBOOT_IMAGE ?= $(CONTAINER_REGISTRY)/netboot:$(VERSION)
+NETBOOT_IMAGE ?= $(CONTAINER_REGISTRY)/netboot:$(VERSION_TAG)
 
-PLAYPEN_TAG ?= $(subst /,-,$(VERSION))
+PLAYPEN_TAG ?= $(VERSION_TAG)
 PLAYPEN_IMAGE ?= $(CONTAINER_REGISTRY)/playpen:$(PLAYPEN_TAG)
 
 UNBOUNDED_OPERATOR_BIN=bin/unbounded-operator
 UNBOUNDED_OPERATOR_CMD=./cmd/unbounded-operator
-UNBOUNDED_OPERATOR_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-operator:$(VERSION)
+UNBOUNDED_OPERATOR_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-operator:$(VERSION_TAG)
 UNBOUNDED_OPERATOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
 UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
@@ -103,7 +103,7 @@ UNROUTE_CMD=./cmd/unroute
 # Gantry (peer-to-peer OCI distribution)
 GANTRY_BIN=bin/gantry
 GANTRY_CMD=./cmd/gantry
-GANTRY_IMAGE ?= $(CONTAINER_REGISTRY)/gantry:$(VERSION)
+GANTRY_IMAGE ?= $(CONTAINER_REGISTRY)/gantry:$(VERSION_TAG)
 GANTRY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 GANTRY_MANIFEST_TEMPLATES_DIR := deploy/gantry
 GANTRY_MANIFEST_RENDERED_DIR  := deploy/gantry/rendered
@@ -113,7 +113,7 @@ UNBOUNDED_STORAGE_SUPERVISOR_BIN=bin/unbounded-storage-supervisor
 UNBOUNDED_STORAGE_SUPERVISOR_CMD=./cmd/unbounded-storage-supervisor
 # Default to the version-matched tag so operator-managed storage components stay
 # aligned with the release; override for local/e2e (e.g. TAG=dev).
-UNBOUNDED_STORAGE_SUPERVISOR_TAG ?= $(VERSION)
+UNBOUNDED_STORAGE_SUPERVISOR_TAG ?= $(VERSION_TAG)
 UNBOUNDED_STORAGE_SUPERVISOR_IMAGE=$(CONTAINER_REGISTRY)/unbounded-storage-supervisor:$(UNBOUNDED_STORAGE_SUPERVISOR_TAG)
 UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-storage-supervisor
@@ -174,6 +174,11 @@ STORAGE_TARBALL := $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM).tar.gz
 
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# VERSION_TAG is VERSION made safe for use as a Docker image tag: git describe can
+# surface a nearest tag containing a slash (e.g. agent-artifacts/v20260710), which
+# is invalid in an image reference. VERSION itself is kept intact for the embedded
+# version string (ldflags) and release artifact paths.
+VERSION_TAG ?= $(subst /,-,$(VERSION))
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -183,12 +188,12 @@ STAMP_LDFLAGS=-X github.com/Azure/unbounded/internal/version.Version=$(VERSION) 
               -X github.com/Azure/unbounded/internal/version.BuildTime=$(BUILD_TIME)
 METALMAN_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded/internal/metalman/commands.DefaultNetbootImage=$(NETBOOT_IMAGE)
 
-METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(VERSION)
+METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(VERSION_TAG)
 
 # Orca configuration
 ORCA_BIN=bin/orca
 ORCA_CMD=./cmd/orca
-ORCA_IMAGE ?= $(CONTAINER_REGISTRY)/orca:$(VERSION)
+ORCA_IMAGE ?= $(CONTAINER_REGISTRY)/orca:$(VERSION_TAG)
 ORCA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 ORCA_MANIFEST_TEMPLATES_DIR := deploy/orca
 ORCA_MANIFEST_RENDERED_DIR  := deploy/orca/rendered
@@ -209,8 +214,8 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS)
 
 # --- Net (unbounded-net) configuration -------------------------------------
 # Container images for the net controller and node agent.
-NET_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-net-controller:$(VERSION)
-NET_NODE_IMAGE       ?= $(CONTAINER_REGISTRY)/unbounded-net-node:$(VERSION)
+NET_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-net-controller:$(VERSION_TAG)
+NET_NODE_IMAGE       ?= $(CONTAINER_REGISTRY)/unbounded-net-node:$(VERSION_TAG)
 
 # CNI plugins version baked into the net-node image. Keep in sync with the
 # defaults in images/net-{node,controller}/Dockerfile and the workflow envs.
@@ -986,7 +991,7 @@ image-machina-local: ## Build the machina container image locally (single-arch)
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t machina:$(VERSION) -t $(MACHINA_IMAGE) \
+		-t machina:$(VERSION_TAG) -t $(MACHINA_IMAGE) \
 		-f ./images/machina/Containerfile .
 	$(call trivy-maybe,$(MACHINA_IMAGE))
 
@@ -1001,7 +1006,7 @@ image-machine-ops-controller-local: ## Build the machine-ops-controller containe
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t machine-ops-controller:$(VERSION) -t $(MACHINE_OPS_CONTROLLER_IMAGE) \
+		-t machine-ops-controller:$(VERSION_TAG) -t $(MACHINE_OPS_CONTROLLER_IMAGE) \
 		-f ./images/machine-ops-controller/Containerfile .
 	$(call trivy-maybe,$(MACHINE_OPS_CONTROLLER_IMAGE))
 
@@ -1101,7 +1106,7 @@ image-metalman-local: ## Build the metalman container image locally (single-arch
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		--build-arg CONTAINER_REGISTRY=$(CONTAINER_REGISTRY) \
-		-t metalman:$(VERSION) -t $(METALMAN_IMAGE) \
+		-t metalman:$(VERSION_TAG) -t $(METALMAN_IMAGE) \
 		-f ./images/metalman/Containerfile .
 	$(call trivy-maybe,$(METALMAN_IMAGE))
 
@@ -1118,7 +1123,7 @@ image-unbounded-operator-local: ## Build the unbounded-operator container image 
 		--build-arg NET_CONTROLLER_IMAGE=$(NET_CONTROLLER_IMAGE) \
 		--build-arg NET_NODE_IMAGE=$(NET_NODE_IMAGE) \
 		--build-arg MACHINA_IMAGE=$(MACHINA_IMAGE) \
-		-t unbounded-operator:$(VERSION) -t $(UNBOUNDED_OPERATOR_IMAGE) \
+		-t unbounded-operator:$(VERSION_TAG) -t $(UNBOUNDED_OPERATOR_IMAGE) \
 		-f ./images/unbounded-operator/Containerfile .
 	$(call trivy-maybe,$(UNBOUNDED_OPERATOR_IMAGE))
 
@@ -1139,7 +1144,7 @@ image-gantry-local: ## Build the gantry container image locally (single-arch)
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t gantry:$(VERSION) -t $(GANTRY_IMAGE) \
+		-t gantry:$(VERSION_TAG) -t $(GANTRY_IMAGE) \
 		-f ./images/gantry/Containerfile .
 	$(call trivy-maybe,$(GANTRY_IMAGE))
 
@@ -1172,7 +1177,7 @@ image-orca-local: ## Build the orca container image locally (single-arch)
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t orca:$(VERSION) -t $(ORCA_IMAGE) \
+		-t orca:$(VERSION_TAG) -t $(ORCA_IMAGE) \
 		-f ./images/orca/Containerfile .
 
 orca-oci: image-orca-local ## Alias for image-orca-local

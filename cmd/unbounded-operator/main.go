@@ -19,6 +19,7 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -29,6 +30,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/internal/clusterinfo"
 	"github.com/Azure/unbounded/internal/operator"
 	"github.com/Azure/unbounded/internal/unbounded"
 	"github.com/Azure/unbounded/internal/version"
@@ -72,7 +74,7 @@ func newCommand(runFn func(context.Context, config) error) *cobra.Command {
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace(), "Namespace for the leader election lease")
 	cmd.Flags().StringVar(&cfg.namespace, "namespace", unbounded.SystemNamespace(), "Namespace the operator reconciles components into and migrates legacy state to")
 	cmd.Flags().StringVar(&cfg.metalmanImage, "metalman-image", "", "Default metalman image")
-	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", os.Getenv("UNBOUNDED_API_SERVER_ENDPOINT"), "Kubernetes API server endpoint advertised by machina (defaults to $UNBOUNDED_API_SERVER_ENDPOINT)")
+	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", os.Getenv("UNBOUNDED_API_SERVER_ENDPOINT"), "Kubernetes API server endpoint advertised by machina; overrides auto-discovery from kube-public/cluster-info (defaults to $UNBOUNDED_API_SERVER_ENDPOINT)")
 	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", true, "Translate legacy net-group Sites, migrate state into unbounded-system, and reap the pre-consolidation namespaces (defaults to $UNBOUNDED_REAP_LEGACY_RESOURCES or true)")
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
@@ -107,6 +109,25 @@ func envBoolDefault(name string, fallback bool) (bool, error) {
 	return value, nil
 }
 
+// resolveAPIServerEndpoint returns the Kubernetes API server endpoint advertised
+// to provisioned machines. An explicit override (from --api-server-endpoint /
+// $UNBOUNDED_API_SERVER_ENDPOINT) always wins; otherwise it is discovered from
+// the standard kube-public/cluster-info ConfigMap. Machina and metalman cannot
+// function without an endpoint, so an empty override with no discoverable value
+// is a hard error.
+func resolveAPIServerEndpoint(ctx context.Context, override string, clientset kubernetes.Interface) (string, error) {
+	if override != "" {
+		return override, nil
+	}
+
+	info, err := clusterinfo.Resolve(ctx, clientset)
+	if err != nil {
+		return "", fmt.Errorf("no API server endpoint configured (set --api-server-endpoint or $UNBOUNDED_API_SERVER_ENDPOINT) and cluster-info discovery failed: %w", err)
+	}
+
+	return info.ApiserverURL, nil
+}
+
 func run(ctx context.Context, cfg config) error {
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 
@@ -118,6 +139,22 @@ func run(ctx context.Context, cfg config) error {
 	}
 
 	restConfig := ctrl.GetConfigOrDie()
+
+	// Resolve the API server endpoint advertised to provisioned machines before
+	// wiring the reconciler/reaper: an explicit override wins, otherwise it is
+	// discovered from kube-public/cluster-info. Fail hard if neither is
+	// available since machina and metalman require it.
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("create kubernetes clientset: %w", err)
+	}
+
+	apiServerEndpoint, err := resolveAPIServerEndpoint(ctx, cfg.apiServerEndpoint, clientset)
+	if err != nil {
+		return err
+	}
+
+	cfg.apiServerEndpoint = apiServerEndpoint
 
 	// Install/upgrade the CRDs before starting the manager: the typed Site
 	// informer cannot sync until the Site CRD is served, and the operator owns

@@ -277,7 +277,7 @@ def start_fixture(blank_efi: Path, active_efi: Path) -> None:
 
 def start_metalman_and_replace() -> None:
     kubeconfig = TMP / "metalman.kubeconfig"
-    smoke.write_service_account_kubeconfig("unbounded-kube", "metalman-controller", kubeconfig)
+    smoke.write_service_account_kubeconfig(smoke.METALMAN_NAMESPACE, "metalman-controller", kubeconfig)
     # The guest cannot resolve Docker's kind-control-plane hostname. Use the
     # control-plane address attached directly to this test's L2 network.
     api_url = f"https://{KIND_IP}:6443"

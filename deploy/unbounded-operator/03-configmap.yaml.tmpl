@@ -21,10 +21,13 @@ metadata:
     app.kubernetes.io/component: controller
 data:
   # External Kubernetes API endpoint advertised to provisioned machines. Remote
-  # nodes dial this to join, so it must be reachable from outside the cluster and
-  # cannot be derived in-cluster. Set this before enabling machina provisioning.
-  # Rendered from .APIServerEndpoint so make/GitOps deploys can set it via
-  # --set APIServerEndpoint=; `kubectl unbounded install` overrides it in place.
+  # nodes dial this to join, so it must be reachable from outside the cluster.
+  # Leave empty to let the operator auto-discover it from the standard
+  # kube-public/cluster-info ConfigMap at startup; set a value only to override
+  # discovery or when the cluster does not publish cluster-info. Rendered from
+  # .APIServerEndpoint so make/GitOps deploys can override via
+  # --set APIServerEndpoint=; `kubectl unbounded install --api-server-endpoint`
+  # overrides it in place (an empty value is preserved across reinstalls).
   UNBOUNDED_API_SERVER_ENDPOINT: {{ default "" .APIServerEndpoint | quote }}
   # Whether the operator translates legacy net-group Sites, migrates state into
   # this namespace, and reaps the pre-consolidation namespaces.
