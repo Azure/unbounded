@@ -68,7 +68,7 @@ Optional flags:
 | `--namespace` | `string` | `unbounded-system` | Namespace for the operator and default components |
 | `--wait` | `bool` | `true` | Wait for the operator rollout and CRD establishment |
 | `--timeout` | `duration` | `5m0s` | Timeout for rollout waits |
-| `--api-server-endpoint` | `string` | auto-discovered | Override the API server endpoint advertised to provisioned machines; by default the operator discovers it from `kube-public/cluster-info` |
+| `--api-server-endpoint` | `string` | auto-discovered | Override the API server endpoint advertised to provisioned machines; by default the operator discovers it from `kube-public/cluster-info`, or the `KUBERNETES_SERVICE_HOST` FQDN on clusters (e.g. AKS) that do not publish cluster-info |
 
 > **Breaking change:** the `--skip-crds` flag has been removed. CRDs are now owned
 > and installed by the operator at startup (`operator.BootstrapCRDs`), so there is

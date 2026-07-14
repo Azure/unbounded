@@ -74,7 +74,7 @@ func newCommand(runFn func(context.Context, config) error) *cobra.Command {
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace(), "Namespace for the leader election lease")
 	cmd.Flags().StringVar(&cfg.namespace, "namespace", unbounded.SystemNamespace(), "Namespace the operator reconciles components into and migrates legacy state to")
 	cmd.Flags().StringVar(&cfg.metalmanImage, "metalman-image", "", "Default metalman image")
-	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", os.Getenv("UNBOUNDED_API_SERVER_ENDPOINT"), "Kubernetes API server endpoint advertised by machina; overrides auto-discovery from kube-public/cluster-info (defaults to $UNBOUNDED_API_SERVER_ENDPOINT)")
+	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", os.Getenv("UNBOUNDED_API_SERVER_ENDPOINT"), "Kubernetes API server endpoint advertised by machina; overrides auto-discovery from kube-public/cluster-info or the KUBERNETES_SERVICE_HOST FQDN (defaults to $UNBOUNDED_API_SERVER_ENDPOINT)")
 	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", true, "Translate legacy net-group Sites, migrate state into unbounded-system, and reap the pre-consolidation namespaces (defaults to $UNBOUNDED_REAP_LEGACY_RESOURCES or true)")
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
@@ -112,7 +112,10 @@ func envBoolDefault(name string, fallback bool) (bool, error) {
 // resolveAPIServerEndpoint returns the Kubernetes API server endpoint advertised
 // to provisioned machines. An explicit override (from --api-server-endpoint /
 // $UNBOUNDED_API_SERVER_ENDPOINT) always wins; otherwise it is discovered from
-// the standard kube-public/cluster-info ConfigMap. Machina and metalman cannot
+// the standard kube-public/cluster-info ConfigMap, and failing that from the
+// KUBERNETES_SERVICE_HOST FQDN (managed control planes such as AKS do not
+// publish cluster-info; the kubernetes.azure.com/set-kube-service-host-fqdn pod
+// label makes that env the public API FQDN). Machina and metalman cannot
 // function without an endpoint, so an empty override with no discoverable value
 // is a hard error.
 func resolveAPIServerEndpoint(ctx context.Context, override string, clientset kubernetes.Interface) (string, error) {
@@ -120,9 +123,9 @@ func resolveAPIServerEndpoint(ctx context.Context, override string, clientset ku
 		return override, nil
 	}
 
-	info, err := clusterinfo.Resolve(ctx, clientset)
+	info, err := clusterinfo.Discover(ctx, clientset)
 	if err != nil {
-		return "", fmt.Errorf("no API server endpoint configured (set --api-server-endpoint or $UNBOUNDED_API_SERVER_ENDPOINT) and cluster-info discovery failed: %w", err)
+		return "", fmt.Errorf("no API server endpoint configured (set --api-server-endpoint or $UNBOUNDED_API_SERVER_ENDPOINT) and endpoint discovery failed: %w", err)
 	}
 
 	return info.ApiserverURL, nil

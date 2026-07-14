@@ -61,6 +61,7 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 			Strategy map[string]any `yaml:"strategy"`
 			Template struct {
 				Metadata struct {
+					Labels      map[string]string `yaml:"labels"`
 					Annotations map[string]string `yaml:"annotations"`
 				} `yaml:"metadata"`
 				Spec struct {
@@ -89,6 +90,12 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 
 	if got := deploy.Spec.Template.Metadata.Annotations["unbounded-cloud.io/operator-config-hash"]; got != want {
 		t.Fatalf("deployment operator-config-hash annotation = %q, want %q (sha256 of complete ConfigMap data)", got, want)
+	}
+
+	// The pod carries the AKS FQDN label so KUBERNETES_SERVICE_HOST resolves to
+	// the public API FQDN, the last-resort source for the advertised endpoint.
+	if got := deploy.Spec.Template.Metadata.Labels["kubernetes.azure.com/set-kube-service-host-fqdn"]; got != "true" {
+		t.Fatalf("deployment pod label kubernetes.azure.com/set-kube-service-host-fqdn = %q, want \"true\"", got)
 	}
 
 	if deploy.Spec.Replicas != 1 {
