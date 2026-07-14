@@ -94,17 +94,47 @@ const (
 	OperationPhaseFailed     OperationPhase = "Failed"
 )
 
+// Condition types for MachineOperation.
+const (
+	// MachineOperationConditionCompleted indicates whether the operation has
+	// reached a terminal state.
+	MachineOperationConditionCompleted = "Completed"
+
+	// MachineOperationConditionBootLoaderDownloaded indicates that a metalman
+	// target has downloaded the initial PXE boot loader for the operation.
+	// Once set to True for an operation, it remains latched.
+	MachineOperationConditionBootLoaderDownloaded = "BootLoaderDownloaded"
+
+	// MachineOperationConditionBootImageWritten indicates that a metalman
+	// target has booted the PXE installer and written the boot image to disk.
+	MachineOperationConditionBootImageWritten = "BootImageWritten"
+
+	// MachineOperationConditionCloudInitDone indicates that a metalman PXE
+	// target has completed first-boot cloud-init after writing the boot image.
+	MachineOperationConditionCloudInitDone = "CloudInitDone"
+)
+
+// Condition types for MachineOperation targets.
+const (
+	// MachineOperationTargetConditionRedfishDisableBootOverrideUnsupported
+	// indicates that metalman determined the target BMC does not support
+	// disabling the Redfish boot override. When True, metalman falls back to
+	// setting Hdd/Continuous for this target within this operation only.
+	MachineOperationTargetConditionRedfishDisableBootOverrideUnsupported = "RedfishDisableBootOverrideUnsupported"
+)
+
 // OperationStage represents the current stage of a target operation.
 type OperationStage string
 
 const (
-	OperationStagePoweringOff     OperationStage = "PoweringOff"
-	OperationStageWaitingOff      OperationStage = "WaitingOff"
-	OperationStagePoweringOn      OperationStage = "PoweringOn"
-	OperationStageWaitingOn       OperationStage = "WaitingOn"
-	OperationStageRepaveRequested OperationStage = "RepaveRequested"
-	OperationStageWaitingRepave   OperationStage = "WaitingRepave"
-	OperationStageWaitingNode     OperationStage = "WaitingNode"
+	OperationStagePoweringOff      OperationStage = "PoweringOff"
+	OperationStageWaitingOff       OperationStage = "WaitingOff"
+	OperationStagePoweringOn       OperationStage = "PoweringOn"
+	OperationStageWaitingOn        OperationStage = "WaitingOn"
+	OperationStageRepaveRequested  OperationStage = "RepaveRequested"
+	OperationStageWaitingRepave    OperationStage = "WaitingRepave"
+	OperationStageWaitingCloudInit OperationStage = "WaitingCloudInit"
+	OperationStageWaitingNode      OperationStage = "WaitingNode"
 )
 
 // MachineOperationSpec defines the desired state of a MachineOperation.
@@ -213,12 +243,6 @@ type MachineOperationTargetStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// TargetOperations records the Machine operation counters this operation
-	// requested. It is used by counter-backed HostReplace operations to remain
-	// idempotent across controller restarts.
-	// +optional
-	TargetOperations *OperationsStatus `json:"targetOperations,omitempty"`
-
 	// Attempts is the number of external action attempts made for this target.
 	// Polling expected state changes does not increment this field.
 	// +optional
@@ -227,6 +251,14 @@ type MachineOperationTargetStatus struct {
 	// LastAttemptAt records when the latest external action attempt occurred.
 	// +optional
 	LastAttemptAt *metav1.Time `json:"lastAttemptAt,omitempty"`
+
+	// Conditions represent target-scoped observations for this operation. These
+	// conditions are not persisted on the Machine, so BMC capability fallbacks
+	// apply only to this MachineOperation target.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // IsTerminal returns true if the operation phase is Complete or Failed.

@@ -13,12 +13,19 @@ import (
 	"os"
 	"strings"
 
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+
 	"github.com/pin/tftp/v3"
 )
 
 type TFTPServer struct {
 	BindAddr string
 	FileResolver
+	StatusRecorder TFTPStatusRecorder
+}
+
+type TFTPStatusRecorder interface {
+	RecordBootLoaderDownloaded(ctx context.Context, machineName, filename string) error
 }
 
 func (t *TFTPServer) NeedLeaderElection() bool { return false }
@@ -61,7 +68,13 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		return fmt.Errorf("node %s has no PXE config", node.Name)
 	}
 
-	resolved, err := t.ResolveFileByPath(ctx, filename, node, node.Spec.PXE.Image)
+	imageRef := t.NetbootImageRef(node)
+	if imageRef == "" {
+		log.Warn("node has no netboot image", "node", node.Name)
+		return fmt.Errorf("node %s has no netboot image", node.Name)
+	}
+
+	resolved, err := t.ResolveFileByPathForIP(ctx, filename, node, imageRef, ip)
 	if err != nil {
 		log.Warn("resolving file", "node", node.Name, "err", err)
 		return err
@@ -82,6 +95,8 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 			return err
 		}
 
+		t.recordBootLoaderDownloaded(ctx, log, node, imageRef, filename)
+
 		return nil
 	}
 
@@ -92,5 +107,30 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		return err
 	}
 
+	t.recordBootLoaderDownloaded(ctx, log, node, imageRef, filename)
+
 	return nil
+}
+
+func (t *TFTPServer) recordBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, imageRef, filename string) {
+	if node == nil || t.StatusRecorder == nil || !t.isInitialBootLoaderDownload(imageRef, node.Spec.PXE.TargetArchitecture(), filename) {
+		return
+	}
+
+	if err := t.StatusRecorder.RecordBootLoaderDownloaded(ctx, node.Name, filename); err != nil {
+		log.Error("recording boot loader download", "node", node.Name, "err", err)
+	}
+}
+
+func (t *TFTPServer) isInitialBootLoaderDownload(imageRef, architecture, filename string) bool {
+	if t.Cache == nil || imageRef == "" {
+		return true
+	}
+
+	meta, err := t.Cache.MetadataForRefArchitecture(imageRef, architecture)
+	if err != nil || meta.DHCPBootImageName == "" {
+		return true
+	}
+
+	return strings.TrimPrefix(meta.DHCPBootImageName, "/") == filename
 }

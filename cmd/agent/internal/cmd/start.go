@@ -4,8 +4,12 @@
 package cmd
 
 import (
+	"context"
+	"encoding/base64"
+	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -43,7 +47,12 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 			log := cmdCtx.Logger
 
-			gs, err := goalstates.ResolveMachine(log, &cfg.AgentConfig, goalstates.NSpawnMachineKube1, provision.ResolveDownloadOverrides(cfg.Downloads))
+			downloads, containerImageArchives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(cfg)
+			if err != nil {
+				return err
+			}
+
+			gs, err := goalstates.ResolveMachine(log, &cfg.AgentConfig, goalstates.NSpawnMachineKube1, downloads)
 			if err != nil {
 				return err
 			}
@@ -51,8 +60,14 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			rootFSGoalState := gs.RootFS
 			nodeStartGoalState := gs.NodeStart
 
-			// Build the list of phases to execute.
-			tasks := []phases.Task{
+			if err := host.EnsureNoExistingDeployment(ctx, log); err != nil {
+				return err
+			}
+
+			// Run host setup and attestation first. Metalman bootstrap tokens are
+			// only available after attestation, so Machine status reporting starts
+			// after this block.
+			preBootstrapTasks := []phases.Task{
 				// Phase 1: host
 				host.InstallPackages(log),
 				phases.Parallel(log,
@@ -66,23 +81,80 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				// TPM Attestation (no-op when not configured).
 				attest.ApplyAttestation(log, cfg.Attest, cfg.MachineName, nodeStartGoalState),
 
-				// Phase 2: rootfs
-				rootfs.Provision(log, rootFSGoalState),
+				// Stage offline container image archives before status reporting starts.
+				rootfs.DownloadContainerImageArchives(log, containerImageArchives),
+			}
 
-				// Phase 3: node-start.
-				nodestart.StartNode(log, nodeStartGoalState),
+			if err := phases.Serial(log, preBootstrapTasks...).Do(ctx); err != nil {
+				return err
+			}
 
+			syncAttestedKubeletConfig(&cfg.AgentConfig, nodeStartGoalState)
+
+			reporter := daemon.NewBootstrapStatusReporter(ctx, log, &cfg.AgentConfig)
+			reporter.Running(ctx)
+
+			if err := runBootstrapTask(ctx, log, reporter, "RootFSFailed", rootfs.Provision(log, rootFSGoalState)); err != nil {
+				return err
+			}
+
+			if err := phases.ExecuteTask(ctx, log, nodestart.StartNode(log, nodeStartGoalState)); err != nil {
+				reporter.Failed(ctx, classifyNodeStartFailure(err), err)
+				return err
+			}
+
+			if err := runBootstrapTask(ctx, log, reporter, "KubeletBootstrapFailed", nodestart.WaitForKubeletBootstrap(log, nodeStartGoalState.MachineName)); err != nil {
+				return err
+			}
+
+			if err := phases.Serial(log,
 				// Phase 4: Persist the applied config for drift detection.
 				daemon.PersistAppliedConfig(log, nodeStartGoalState.MachineName, &cfg.AgentConfig),
 
 				// Phase 5: Enable and start the daemon that watches the
 				// Machine CR for drift detection and reconciliation.
 				daemon.EnableDaemon(log),
+			).Do(ctx); err != nil {
+				reporter.Failed(ctx, "Failed", err)
+				return err
 			}
 
-			return phases.Serial(log, tasks...).Do(ctx)
+			reporter.Succeeded(ctx)
+
+			return nil
 		},
 	}
 
 	return cmd
+}
+
+func syncAttestedKubeletConfig(cfg *provision.AgentConfig, nodeStart *goalstates.NodeStart) {
+	if nodeStart.Kubelet.BootstrapToken != "" {
+		cfg.Kubelet.Auth.BootstrapToken = nodeStart.Kubelet.BootstrapToken
+	}
+
+	if len(nodeStart.Kubelet.CACertData) > 0 {
+		cfg.Cluster.CaCertBase64 = base64.StdEncoding.EncodeToString(nodeStart.Kubelet.CACertData)
+	}
+}
+
+func runBootstrapTask(ctx context.Context, log *slog.Logger, reporter *daemon.BootstrapStatusReporter, reason string, task phases.Task) error {
+	if err := phases.ExecuteTask(ctx, log, task); err != nil {
+		reporter.Failed(ctx, reason, err)
+		return err
+	}
+
+	return nil
+}
+
+func classifyNodeStartFailure(err error) string {
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "start-kubelet"):
+		return "KubeletBootstrapFailed"
+	case strings.Contains(message, "start-nspawn-machine"):
+		return "NSpawnFailed"
+	default:
+		return "Failed"
+	}
 }

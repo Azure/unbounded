@@ -98,8 +98,10 @@ When GPUs are detected on the host, the agent automatically exposes the host
 paths needed by the corresponding Kubernetes device plugin:
 
 - **NVIDIA GPUs.** Bind-mounts GPU device nodes and host driver libraries,
-  grants cgroup device permissions, generates a CDI spec, and configures the
-  NVIDIA container runtime. See [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}).
+  including NVIDIA IMEX channel devices used by multi-node GPU and NVLink
+  communication, grants cgroup device permissions, generates a CDI spec, and
+  configures the NVIDIA container runtime. See
+  [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}).
 - **AMD GPUs.** Bind-mounts `/dev/kfd` and DRM device nodes, grants cgroup
   device permissions, and exposes AMD sysfs paths read-only so the AMD
   Kubernetes device plugin can discover GPUs inside nspawn. See
@@ -125,6 +127,11 @@ The agent also auto-mounts host storage and InfiniBand hardware:
   `/dev/infiniband` (e.g. `uverbs0`, `umad0`, `issm0`, `rdma_cm`) is
   bind-mounted so that RDMA workloads inside the container can reach the
   host's HCAs.
+- **Configured extra devices.** `AdditionalHostDevices` can list either
+  non-standard host device nodes under `/dev`, such as `/dev/uinput`, or systemd
+  device group specifiers, such as `char-input`, `char-pts`, and `block-*`.
+  Device paths are bind-mounted and granted with `DeviceAllow=`. Group
+  specifiers are rendered only as `DeviceAllow=` rules.
 
 Device discovery runs once when the machine is provisioned. Disks or HCAs
 hot-plugged after the machine has started are not picked up until the machine
@@ -152,8 +159,10 @@ The configuration is written to two files on the host before the machine boots:
 | `Bind=/dev/kvm` | nspawn config | KVM device bind-mount (auto-generated when `/dev/kvm` is present). |
 | `Bind=<block device>` | nspawn config | Storage block device bind-mount (auto-generated for non-virtual `/sys/class/block` entries, including partitions, `dm-*`, and `md*`). |
 | `Bind=/dev/infiniband/*` | nspawn config | InfiniBand HCA device bind-mount (auto-generated when `/dev/infiniband` devices are present). |
+| `Bind=<configured /dev path>` | nspawn config | Additional host device bind-mount (configured with agent config `AdditionalHostDevices`). |
 | `Bind=` / `BindReadOnly=` | nspawn config | GPU device and library bind-mounts (auto-generated when GPUs are present). |
-| `DeviceAllow=` | Service override | Cgroup device permissions for all bind-mounted host device nodes (KVM, block, InfiniBand, GPU). |
+| `DeviceAllow=` | Service override | Cgroup device permissions for all bind-mounted host device nodes (KVM, block, InfiniBand, configured extra devices, GPU). |
+| `DeviceAllow=<char/block group> rwm` | Service override | Additional systemd device group access configured through `AdditionalHostDevices`, for example `char-input`. |
 
 #### System call filter
 

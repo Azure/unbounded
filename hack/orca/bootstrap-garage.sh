@@ -121,11 +121,17 @@ secret_key="$(secret_value ORCA_CACHESTORE_S3_SECRET_KEY)"
 if ! gexec key list 2>/dev/null | grep -q "${access_key}"; then
   gexec key import "${access_key}" "${secret_key}" -n "${KEY_NAME}" --yes
 fi
-gexec key allow --create-bucket "${KEY_NAME}" >/dev/null 2>&1 || true
+# Grant by the unique access key id, not the human-readable name: if the
+# Secret's keys were ever regenerated, Garage ends up with multiple keys
+# sharing the name "${KEY_NAME}", and a name-based grant is ambiguous (it can
+# land on a stale key, leaving the key Orca actually uses unauthorized and
+# Orca failing with a 403 on its first cachestore call). The access key id is
+# unique, so granting on it always targets the key currently in the Secret.
+gexec key allow --create-bucket "${access_key}" >/dev/null 2>&1 || true
 
 # Ensure the cachestore bucket exists and is owned by the key.
 gexec bucket info "${BUCKET}" >/dev/null 2>&1 || gexec bucket create "${BUCKET}"
-gexec bucket allow --read --write --owner --key "${KEY_NAME}" "${BUCKET}" >/dev/null 2>&1 || true
+gexec bucket allow --read --write --owner --key "${access_key}" "${BUCKET}" >/dev/null 2>&1 || true
 
 # Verify the bucket is queryable before declaring success.
 gexec bucket info "${BUCKET}" >/dev/null 2>&1 \

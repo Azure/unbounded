@@ -8,12 +8,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	pathpkg "path"
+	"strconv"
+	"strings"
 	"sync"
 	"text/template"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -63,9 +70,100 @@ type FileResolver struct {
 	Reader            client.Reader
 	Cluster           ClusterInfoProvider
 	ServeURL          string
+	DefaultNetbootRef string
 	KubernetesVersion string
 	ClusterDNS        string
 	ProviderLabels    map[string]string
+}
+
+func (f *FileResolver) NetbootImageRef(node *v1alpha3.Machine) string {
+	if node == nil || node.Spec.PXE == nil {
+		return ""
+	}
+
+	if node.Spec.PXE.NetbootImage != "" {
+		return node.Spec.PXE.NetbootImage
+	}
+
+	if f.DefaultNetbootRef != "" {
+		return f.DefaultNetbootRef
+	}
+
+	return node.Spec.PXE.Image
+}
+
+func (f *FileResolver) HTTPBootPath(node *v1alpha3.Machine) (string, error) {
+	if node == nil || node.Spec.PXE == nil {
+		return "", fmt.Errorf("node has no PXE config")
+	}
+
+	imageRef := f.NetbootImageRef(node)
+	if imageRef == "" {
+		return "", fmt.Errorf("node %s has no netboot image", node.Name)
+	}
+
+	if f.Cache == nil {
+		return "", fmt.Errorf("OCI cache is not configured")
+	}
+
+	meta, err := f.Cache.MetadataForRefArchitecture(imageRef, node.Spec.PXE.TargetArchitecture())
+	if err != nil {
+		return "", err
+	}
+
+	return HTTPBootPathFromMetadata(meta), nil
+}
+
+func (f *FileResolver) HTTPBootURL(node *v1alpha3.Machine) (string, error) {
+	path, err := f.HTTPBootPath(node)
+	if err != nil {
+		return "", err
+	}
+
+	return JoinServeURLPath(f.ServeURL, path)
+}
+
+func HTTPBootPathFromMetadata(meta *ImageMetadata) string {
+	if meta == nil {
+		return ""
+	}
+
+	if meta.HTTPBootPath != "" {
+		return strings.TrimPrefix(meta.HTTPBootPath, "/")
+	}
+
+	return strings.TrimPrefix(meta.DHCPBootImageName, "/")
+}
+
+func JoinServeURLPath(serveURL, path string) (string, error) {
+	if strings.TrimSpace(serveURL) == "" {
+		return "", fmt.Errorf("serve URL is not configured")
+	}
+
+	path = strings.TrimPrefix(path, "/")
+	if path == "" {
+		return "", fmt.Errorf("HTTP boot path is not configured")
+	}
+
+	cleanPath := pathpkg.Clean(path)
+	if cleanPath == "." || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
+		return "", fmt.Errorf("invalid HTTP boot path %q: resolves outside cache directory", path)
+	}
+
+	base, err := url.Parse(serveURL)
+	if err != nil {
+		return "", fmt.Errorf("parsing serve URL: %w", err)
+	}
+
+	if base.Scheme == "" || base.Host == "" {
+		return "", fmt.Errorf("serve URL %q must be absolute", serveURL)
+	}
+
+	base.Path = strings.TrimRight(base.Path, "/") + "/" + cleanPath
+	base.RawQuery = ""
+	base.Fragment = ""
+
+	return base.String(), nil
 }
 
 func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3.Machine, error) {
@@ -88,6 +186,10 @@ const userDataPath = "cloud-init/user-data"
 const defaultUserData = "#cloud-config\n"
 
 func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node *v1alpha3.Machine, imageRef string) (*ResolvedFile, error) {
+	return f.ResolveFileByPathForIP(ctx, path, node, imageRef, "")
+}
+
+func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, node *v1alpha3.Machine, imageRef, requestIP string) (*ResolvedFile, error) {
 	if path == userDataPath && node != nil {
 		if data, ok, err := f.resolveUserDataFromConfigMap(ctx, node); err != nil {
 			return nil, fmt.Errorf("resolving user-data from ConfigMap: %w", err)
@@ -98,10 +200,15 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 		return &ResolvedFile{Data: []byte(defaultUserData), ContentType: "text/plain"}, nil
 	}
 
-	diskPath, isTemplate, err := f.Cache.ResolvePath(imageRef, path)
+	architecture := v1alpha3.DefaultPXEArchitecture
+	if node != nil && node.Spec.PXE != nil {
+		architecture = node.Spec.PXE.TargetArchitecture()
+	}
+
+	diskPath, isTemplate, err := f.Cache.ResolvePathForArchitecture(imageRef, architecture, path)
 	if err != nil {
 		// Check if the image just hasn't been pulled yet
-		digest := f.Cache.DigestFor(imageRef)
+		digest := f.Cache.DigestForArchitecture(imageRef, architecture)
 		if digest == "" {
 			return nil, ErrNotYetDownloaded
 		}
@@ -139,12 +246,12 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 				return nil, fmt.Errorf("marshal agent config: %w", err)
 			}
 
-			data, err := renderTemplate(string(content), templateData{
-				Machine:         node,
-				ApiserverURL:    ci.ApiserverURL,
-				ServeURL:        f.ServeURL,
-				AgentConfigJSON: string(agentConfigJSON),
-			})
+			installRequested, err := f.installRequested(ctx, node)
+			if err != nil {
+				return nil, err
+			}
+
+			data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON), requestIP, installRequested))
 			if err != nil {
 				return nil, err
 			}
@@ -196,20 +303,141 @@ func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v
 }
 
 type templateData struct {
-	Machine         *v1alpha3.Machine
-	ApiserverURL    string
-	ServeURL        string
-	AgentConfigJSON string
+	Machine          *v1alpha3.Machine
+	BootLease        *v1alpha3.DHCPLease
+	ApiserverURL     string
+	ServeURL         string
+	AgentConfigJSON  string
+	InstallScript    string
+	InstallEnv       []string
+	InstallRequested bool
+}
+
+func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, requestIP string, installRequested bool) templateData {
+	var (
+		agent     *v1alpha3.AgentSpec
+		bootLease *v1alpha3.DHCPLease
+	)
+
+	if node != nil {
+		agent = node.Spec.Agent
+		bootLease = selectBootLease(node, requestIP)
+	}
+
+	return templateData{
+		Machine:          node,
+		BootLease:        bootLease,
+		ApiserverURL:     ci.ApiserverURL,
+		ServeURL:         serveURL,
+		AgentConfigJSON:  agentConfigJSON,
+		InstallScript:    provision.UnboundedAgentInstallScript(),
+		InstallEnv:       provision.AgentInstallEnv(agent),
+		InstallRequested: installRequested,
+	}
+}
+
+func selectBootLease(node *v1alpha3.Machine, requestIP string) *v1alpha3.DHCPLease {
+	if node == nil || node.Spec.PXE == nil || len(node.Spec.PXE.DHCPLeases) == 0 {
+		return nil
+	}
+
+	for i := range node.Spec.PXE.DHCPLeases {
+		if node.Spec.PXE.DHCPLeases[i].IPv4 == requestIP {
+			return &node.Spec.PXE.DHCPLeases[i]
+		}
+	}
+
+	return &node.Spec.PXE.DHCPLeases[0]
+}
+
+func (f *FileResolver) installRequested(ctx context.Context, node *v1alpha3.Machine) (bool, error) {
+	if f.Reader == nil || node == nil {
+		return false, nil
+	}
+
+	var list v1alpha3.MachineOperationList
+	if err := f.Reader.List(ctx, &list); err != nil {
+		return false, fmt.Errorf("list MachineOperations: %w", err)
+	}
+
+	for _, op := range list.Items {
+		if op.Spec.OperationKind != v1alpha3.OperationHostReplace || op.Status.IsTerminal() {
+			continue
+		}
+
+		if operationRequestsInstall(&op, node.Name) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func operationRequestsInstall(op *v1alpha3.MachineOperation, machineName string) bool {
+	if cond := apimeta.FindStatusCondition(op.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten); cond != nil && cond.Status == metav1.ConditionTrue {
+		return false
+	}
+
+	for _, target := range op.Status.Targets {
+		if target.MachineRef != machineName {
+			continue
+		}
+
+		return target.Phase != v1alpha3.OperationPhaseComplete && target.Phase != v1alpha3.OperationPhaseFailed
+	}
+
+	return len(op.Status.Targets) == 0 && op.Spec.MachineRef == machineName
 }
 
 var (
-	templateFuncMap = template.FuncMap{}
-	templatePool    = sync.Pool{
+	templateFuncMap = template.FuncMap{
+		"indent":       indentTemplateBlock,
+		"ipAddresses":  ipAddresses,
+		"join":         strings.Join,
+		"subnetPrefix": subnetPrefix,
+		"yamlQuote":    strconv.Quote,
+	}
+	templatePool = sync.Pool{
 		New: func() any {
 			return new(bytes.Buffer)
 		},
 	}
 )
+
+func ipAddresses(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if net.ParseIP(value) != nil {
+			result = append(result, value)
+		}
+	}
+
+	return result
+}
+
+func subnetPrefix(mask string) (int, error) {
+	ip := net.ParseIP(mask)
+	if ip == nil || ip.To4() == nil {
+		return 0, fmt.Errorf("invalid IPv4 subnet mask %q", mask)
+	}
+
+	ones, bits := net.IPMask(ip.To4()).Size()
+	if bits != net.IPv4len*8 || ones < 0 {
+		return 0, fmt.Errorf("non-contiguous IPv4 subnet mask %q", mask)
+	}
+
+	return ones, nil
+}
+
+func indentTemplateBlock(spaces int, value string) string {
+	if value == "" {
+		return ""
+	}
+
+	prefix := strings.Repeat(" ", spaces)
+
+	return prefix + strings.ReplaceAll(value, "\n", "\n"+prefix)
+}
 
 func renderTemplate(tmplStr string, data templateData) ([]byte, error) {
 	t, err := template.New("").Funcs(templateFuncMap).Parse(tmplStr)

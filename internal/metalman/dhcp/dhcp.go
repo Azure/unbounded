@@ -22,11 +22,13 @@ import (
 )
 
 type Server struct {
-	Interface string
-	Port      int
-	Reader    client.Reader
-	ServerIP  net.IP
-	OCICache  *netboot.OCICache
+	Interface         string
+	Port              int
+	Reader            client.Reader
+	ServerIP          net.IP
+	OCICache          *netboot.OCICache
+	ServeURL          string
+	DefaultNetbootRef string
 }
 
 func (s *Server) NeedLeaderElection() bool {
@@ -157,7 +159,8 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		return
 	}
 
-	resp, err := dhcpv4.NewReplyFromRequest(m,
+	resp, err := dhcpv4.NewReplyFromRequest(
+		m,
 		dhcpv4.WithYourIP(clientIP),
 		dhcpv4.WithServerIP(s.ServerIP),
 		dhcpv4.WithOption(dhcpv4.OptSubnetMask(net.IPMask(net.ParseIP(lease.SubnetMask).To4()))),
@@ -186,10 +189,26 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		}
 	}
 
-	if node.Spec.PXE.Image != "" && s.OCICache != nil {
-		meta, err := s.OCICache.MetadataForRef(node.Spec.PXE.Image)
+	netbootImage := node.Spec.PXE.NetbootImage
+	if netbootImage == "" {
+		netbootImage = s.DefaultNetbootRef
+	}
+
+	if netbootImage != "" && s.OCICache != nil {
+		architecture := node.Spec.PXE.TargetArchitecture()
+
+		meta, err := s.OCICache.MetadataForRefArchitecture(netbootImage, architecture)
 		if err != nil {
-			log.Warn("OCI image metadata not available", "image", node.Spec.PXE.Image, "err", err)
+			log.Warn("OCI image metadata not available", "image", netbootImage, "architecture", architecture, "err", err)
+		} else if node.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
+			if isHTTPClientRequest(m) {
+				bootURL, err := netboot.JoinServeURLPath(s.ServeURL, netboot.HTTPBootPathFromMetadata(meta))
+				if err != nil {
+					log.Warn("HTTP boot URL not available", "image", netbootImage, "architecture", architecture, "err", err)
+				} else {
+					resp.UpdateOption(dhcpv4.OptBootFileName(bootURL))
+				}
+			}
 		} else if meta.DHCPBootImageName != "" {
 			resp.UpdateOption(dhcpv4.OptTFTPServerName(s.ServerIP.String()))
 			resp.UpdateOption(dhcpv4.OptBootFileName(meta.DHCPBootImageName))
@@ -216,4 +235,8 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	if _, err := conn.WriteTo(resp.ToBytes(), dest); err != nil {
 		log.Error("sending DHCP response", "err", err)
 	}
+}
+
+func isHTTPClientRequest(m *dhcpv4.DHCPv4) bool {
+	return strings.HasPrefix(m.ClassIdentifier(), "HTTPClient")
 }

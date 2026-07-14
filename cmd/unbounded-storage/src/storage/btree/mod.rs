@@ -457,30 +457,24 @@ impl<B: BlockDevice> BTreeIndex<B> {
     /// at most one task at a time (the engine's mutator).
     pub async fn apply_batch(&self, mutations: Vec<Mutation>) -> Result<(), Error> {
         // Coalesce the input mutations into a sorted (key, op)
-        // list with at most one entry per key, while also building
-        // the next-state mirror. We don't touch the live mirror
-        // yet: if path-copy or the meta-page write fails we leave
-        // the in-memory state exactly as it was so the caller's
-        // recovery (freeing the new data LBA, etc.) matches what
-        // is on disk.
-        let (sorted_ops, txn_id, next_entries) = {
+        // list with at most one entry per key. The live mirror is
+        // not touched until the inactive meta write makes the new
+        // root durable.
+        let (sorted_ops, txn_id) = {
             let state = self.mutator.borrow();
-            let mut next = state.entries.clone();
             let mut ops: BTreeMap<PageKey, Option<LeafEntry>> = BTreeMap::new();
             for m in mutations {
                 match m {
                     Mutation::Insert { key, value } => {
                         ops.insert(key, Some(value));
-                        next.insert(key, value);
                     }
                     Mutation::Delete { key } => {
                         ops.insert(key, None);
-                        next.remove(&key);
                     }
                 }
             }
             let sorted_ops: Vec<(PageKey, Option<LeafEntry>)> = ops.into_iter().collect();
-            (sorted_ops, state.next_txn_id, next)
+            (sorted_ops, state.next_txn_id)
         };
 
         if sorted_ops.is_empty() {
@@ -490,6 +484,9 @@ impl<B: BlockDevice> BTreeIndex<B> {
             return Ok(());
         }
 
+        // Path-copy consumes the operations, so retain only the bounded
+        // batch needed to update the mirror after the durable commit.
+        let mirror_ops = sorted_ops.clone();
         let parent_root = self.root.load().root_lba;
         let result = cow::apply_path_copy(
             &*self.device,
@@ -541,7 +538,16 @@ impl<B: BlockDevice> BTreeIndex<B> {
         // the published snapshot all advance together.
         {
             let mut state = self.mutator.borrow_mut();
-            state.entries = next_entries;
+            for (key, value) in mirror_ops {
+                match value {
+                    Some(value) => {
+                        state.entries.insert(key, value);
+                    }
+                    None => {
+                        state.entries.remove(&key);
+                    }
+                }
+            }
             state.next_txn_id = txn_id + 1;
         }
         self.active_meta.set(new_active);

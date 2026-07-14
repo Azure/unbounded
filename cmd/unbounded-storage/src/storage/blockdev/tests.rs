@@ -234,7 +234,6 @@ mod uring_tests {
         let (device, _installed) = open_installed(&path.0, page_size);
         assert_eq!(device.page_size(), page_size);
         assert_eq!(device.capacity_pages(), pages);
-        assert_eq!(device.write_queue_depth(), 8);
     }
 
     #[test]

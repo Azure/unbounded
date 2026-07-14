@@ -1,0 +1,79 @@
+#cloud-config
+manage_etc_hosts: true
+growpart:
+  mode: auto
+  devices:
+  - /
+resize_rootfs: true
+swap:
+  size: 0
+users:
+- name: unbounded-metal
+  lock_passwd: true
+  shell: /bin/bash
+  sudo: ALL=(ALL) NOPASSWD:ALL
+ssh_pwauth: false
+reporting:
+  unbounded:
+    type: webhook
+    endpoint: {{ .ServeURL }}/cloudinit/log
+write_files:
+- path: /etc/unbounded/agent/config.json
+  permissions: '0600'
+  content: |
+    {{ .AgentConfigJSON }}
+- path: /usr/local/bin/unbounded-agent-install.sh
+  permissions: '0755'
+  content: |
+{{ indent 4 .InstallScript }}
+- path: /etc/cloud/cloud-init.disabled
+  defer: true
+  content: ''
+# Block unattended-upgrades from restarting systemd-machined and tearing down
+# the running systemd-nspawn container. The agent re-asserts this file during
+# start; cloud-init writes it first so the protection exists from first boot.
+- path: /etc/apt/apt.conf.d/99-unbounded-no-restart-systemd
+  permissions: '0644'
+  content: |
+    Unattended-Upgrade::Package-Blacklist {
+        "systemd";
+        "systemd-container";
+        "systemd-sysv";
+        "libsystemd0";
+        "libcap2";
+        "libcap2-bin";
+        "libpam-cap";
+    };
+# Disable needrestart auto-restart of services after package upgrades.
+- path: /etc/needrestart/conf.d/99-unbounded.conf
+  permissions: '0644'
+  content: |
+    $nrconf{restart} = 'l';
+runcmd:
+- - /bin/bash
+  - -c
+  - |
+    set -eo pipefail
+    install_log=/var/log/unbounded-agent-install.log
+    report_unbounded_failure() {
+      status=$?
+      set +e
+      {
+        echo "unbounded-agent install exited with status ${status}"
+        echo
+        echo "last 120 lines of ${install_log}:"
+        if [ -f "$install_log" ]; then
+          tail -n 120 "$install_log"
+        else
+          echo "could not read ${install_log}: file does not exist"
+        fi
+      } | curl -fsS -m 10 -X POST -H "Content-Type: text/plain" --data-binary @- "{{ .ServeURL }}/unbounded-agent/install-log" >/dev/null 2>&1 || true
+      exit "$status"
+    }
+    trap report_unbounded_failure ERR
+    export UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json
+    {{ range .InstallEnv }}
+    export {{ . }}
+    {{ end }}
+    bash /usr/local/bin/unbounded-agent-install.sh 2>&1 | tee "$install_log"
+    echo "Node bootstrap complete."

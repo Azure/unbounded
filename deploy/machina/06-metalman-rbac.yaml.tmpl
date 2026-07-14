@@ -126,7 +126,7 @@ rules:
   # Secrets (Redfish passwords)
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get"]
+    verbs: ["get", "list", "watch"]
   # ConfigMaps (cloud-init user-data)
   - apiGroups: [""]
     resources: ["configmaps"]
@@ -182,7 +182,8 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 
 ---
-# Allow the metalman-bootstrap SA to get and create Machine CRs.
+# Allow the metalman-bootstrap SA to get and create Machine CRs and publish
+# initial agent bootstrap status.
 # The agent's register-machine phase uses this SA token to check whether a
 # Machine CR already exists and, if not, to create one during bootstrap.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -193,6 +194,9 @@ rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines"]
     verbs: ["get", "create"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machines/status"]
+    verbs: ["get", "update", "patch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

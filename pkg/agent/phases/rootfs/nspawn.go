@@ -9,7 +9,9 @@ import (
 	"embed"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"strings"
 	"text/template"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -63,13 +65,18 @@ func (e *ensureNSpawnWorkspace) bootstrapWorkspace(ctx context.Context) error {
 type nspawnTemplateData struct {
 	// MachineName is the nspawn machine name (e.g. "kube1"). Used by the
 	// service drop-in for the ExecStartPre `machinectl terminate` cleanup.
-	MachineName          string
-	BPFFSMountPath       string
-	HostDevicePaths      []string
-	NvidiaGPUDevicePaths []string
-	NvidiaLibDirMounts   []goalstates.NvidiaLibDirMount
-	AMDGPUDevicePaths    []string
-	AMDSysFSPaths        []string
+	MachineName                  string
+	BPFFSMountPath               string
+	ContainerImageArchiveDir     string
+	ContainerImageArchiveHostDir string
+	HostDevicePaths              []string
+	HostDeviceGroupSpecifiers    []string
+	NvidiaGPUDevicePaths         []string
+	NvidiaLibDirMounts           []goalstates.NvidiaLibDirMount
+	NvidiaI386LibDirMounts       []goalstates.NvidiaLibDirMount
+	NvidiaSMIDir                 string
+	AMDGPUDevicePaths            []string
+	AMDSysFSPaths                []string
 }
 
 // writeNSpawnConfigs renders the nspawn and service-override templates with
@@ -80,15 +87,32 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	// directory.
 	machineName := filepath.Base(e.goalState.MachineDir)
 	hostDevicePaths := e.goalState.HostDevices.Paths()
+	hostDeviceGroupSpecifiers := e.goalState.HostDevices.DeviceGroupSpecifiers()
 	amdGPUDevicePaths := pathsExcluding(e.goalState.AMD.GPUDevicePaths, e.goalState.Nvidia.GPUDevicePaths)
+
+	archiveDir := filepath.Join(e.goalState.MachineDir, strings.TrimPrefix(goalstates.ContainerImageArchiveDir, "/"))
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		return fmt.Errorf("create container image archive mount point: %w", err)
+	}
+
+	nvidiaSMIDir := ""
+	if e.goalState.Nvidia.NvidiaSMIPath != "" {
+		nvidiaSMIDir = filepath.Dir(e.goalState.Nvidia.NvidiaSMIPath)
+	}
+
 	templateData := nspawnTemplateData{
-		MachineName:          machineName,
-		BPFFSMountPath:       goalstates.BPFFSMountPath(machineName),
-		HostDevicePaths:      hostDevicePaths,
-		NvidiaGPUDevicePaths: e.goalState.Nvidia.GPUDevicePaths,
-		NvidiaLibDirMounts:   e.goalState.Nvidia.LibDirMounts,
-		AMDGPUDevicePaths:    amdGPUDevicePaths,
-		AMDSysFSPaths:        e.goalState.AMD.SysFSPaths,
+		MachineName:                  machineName,
+		BPFFSMountPath:               goalstates.BPFFSMountPath(machineName),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
+		HostDevicePaths:              hostDevicePaths,
+		HostDeviceGroupSpecifiers:    hostDeviceGroupSpecifiers,
+		NvidiaGPUDevicePaths:         e.goalState.Nvidia.GPUDevicePaths,
+		NvidiaLibDirMounts:           e.goalState.Nvidia.LibDirMounts,
+		NvidiaI386LibDirMounts:       e.goalState.Nvidia.I386LibDirMounts,
+		NvidiaSMIDir:                 nvidiaSMIDir,
+		AMDGPUDevicePaths:            amdGPUDevicePaths,
+		AMDSysFSPaths:                e.goalState.AMD.SysFSPaths,
 	}
 
 	if len(hostDevicePaths) > 0 {
@@ -97,7 +121,8 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 			"kvm", len(e.goalState.HostDevices.KVM),
 			"network", len(e.goalState.HostDevices.Network),
 			"block", len(e.goalState.HostDevices.Block),
-			"infiniband", len(e.goalState.HostDevices.Infiniband))
+			"infiniband", len(e.goalState.HostDevices.Infiniband),
+			"additional", len(e.goalState.HostDevices.Additional))
 	}
 
 	if len(e.goalState.Nvidia.GPUDevicePaths) > 0 {

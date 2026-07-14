@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"text/template"
 
 	"github.com/Azure/unbounded/internal/executil"
@@ -25,9 +26,7 @@ var assets embed.FS
 
 var assetsTemplate = template.Must(template.New("assets").ParseFS(assets, "assets/*"))
 
-const (
-	nvidiaRuntimeDropInName = "99-nvidia-runtime.toml"
-)
+const nvidiaRuntimeDropInName = "99-nvidia-runtime.toml"
 
 type configureContainerd struct {
 	goalState *goalstates.NodeStart
@@ -119,10 +118,21 @@ type startContainerd struct {
 	goalState *goalstates.NodeStart
 }
 
+type importContainerImages struct {
+	log       *slog.Logger
+	goalState *goalstates.NodeStart
+}
+
 // StartContainerd returns a task that enables and starts the containerd systemd service
 // inside the running nspawn machine.
 func StartContainerd(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
 	return &startContainerd{log: log, goalState: goalState}
+}
+
+// ImportContainerImages returns a task that preloads configured container
+// image archives into containerd.
+func ImportContainerImages(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
+	return &importContainerImages{log: log, goalState: goalState}
 }
 
 func (s *startContainerd) Name() string { return "start-containerd" }
@@ -136,6 +146,66 @@ func (s *startContainerd) Do(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (i *importContainerImages) Name() string { return "import-container-images" }
+
+func (i *importContainerImages) Do(ctx context.Context) error {
+	archives, err := stagedContainerImageArchives(goalstates.ContainerImageArchiveHostDir)
+	if err != nil {
+		return err
+	}
+
+	for _, archive := range archives {
+		i.log.Info("importing container image archive",
+			"archive", archive.machinePath,
+			"host_archive", archive.hostPath,
+		)
+
+		if _, err := executil.MachineRun(ctx, i.log, i.goalState.MachineName,
+			"ctr", "--namespace", "k8s.io", "images", "import", archive.machinePath,
+		); err != nil {
+			return fmt.Errorf("import container image archive %s in %s: %w", archive.machinePath, i.goalState.MachineName, err)
+		}
+
+		i.log.Info("imported container image archive", "archive", archive.machinePath)
+	}
+
+	return nil
+}
+
+type stagedContainerImageArchive struct {
+	hostPath    string
+	machinePath string
+}
+
+func stagedContainerImageArchives(hostDir string) ([]stagedContainerImageArchive, error) {
+	entries, err := os.ReadDir(hostDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("read staged container image archive directory %s: %w", hostDir, err)
+	}
+
+	archives := make([]stagedContainerImageArchive, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".tar" {
+			continue
+		}
+
+		archives = append(archives, stagedContainerImageArchive{
+			hostPath:    filepath.Join(hostDir, entry.Name()),
+			machinePath: filepath.Join(goalstates.ContainerImageArchiveDir, entry.Name()),
+		})
+	}
+
+	sort.Slice(archives, func(i, j int) bool {
+		return archives[i].machinePath < archives[j].machinePath
+	})
+
+	return archives, nil
 }
 
 // ensureDropInConfig writes or removes a containerd drop-in config file in the

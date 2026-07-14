@@ -6,7 +6,7 @@
 # host even when targeting a foreign TARGETPLATFORM. Without this, buildkit
 # would emulate the entire builder under QEMU when producing arm64 images on
 # an amd64 runner, which makes "go build" painfully slow.
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.4-trixie AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.5-trixie AS builder
 
 # Install build dependencies. The base image already provides the Go
 # toolchain at /usr/local/go/bin, so we don't install the apt golang package.
@@ -48,8 +48,9 @@ ARG TARGETARCH
 ARG VERSION=dev
 ARG GIT_COMMIT=
 ARG BUILD_TIME=
+ARG CONTAINER_REGISTRY=ghcr.io/azure
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    make metalman-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
+    make metalman-build VERSION=${VERSION} CONTAINER_REGISTRY=${CONTAINER_REGISTRY} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
 
 # Runtime stage
 FROM ubuntu:noble

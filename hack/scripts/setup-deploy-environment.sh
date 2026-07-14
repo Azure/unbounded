@@ -23,9 +23,15 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# This script is meant to run non-interactively (it is also invoked by
+# setup-nightly-cluster.sh). Disable gh's pager so the secret/variable list
+# summaries below never drop the caller into an interactive pager.
+export GH_PAGER=cat
+
 REPO="Azure/unbounded"
 MANAGE_CNI_PLUGIN="true"
 ASSUME_YES="false"
+DEPLOY_CHANNEL="stable"
 
 ENV_NAME=""
 KUBECONFIG_PATH=""
@@ -59,6 +65,7 @@ Required:
 
 Optional:
   --manage-cni-plugin BOOL   Whether unbounded manages the CNI (true|false). Default: true
+  --channel CHANNEL          Deploy channel for the "next steps" hint: stable|nightly. Default: stable
   --orca-azure-account NAME  Azure storage account for the Orca origin (enables Orca deploy)
   --orca-azure-container NAME Azure blob container for the Orca origin
   --orca-azure-endpoint URL  Azure blob endpoint (optional; blank => *.blob.core.windows.net)
@@ -96,6 +103,7 @@ while [[ $# -gt 0 ]]; do
         --site-node-cidr)      require_value "$1" "${2:-}"; SITE_NODE_CIDR="$2"; shift 2 ;;
         --site-pod-cidr)       require_value "$1" "${2:-}"; SITE_POD_CIDR="$2"; shift 2 ;;
         --manage-cni-plugin)   require_value "$1" "${2:-}"; MANAGE_CNI_PLUGIN="$2"; shift 2 ;;
+        --channel)             require_value "$1" "${2:-}"; DEPLOY_CHANNEL="$2"; shift 2 ;;
         --orca-azure-account)  require_value "$1" "${2:-}"; ORCA_AZURE_ACCOUNT="$2"; shift 2 ;;
         --orca-azure-container) require_value "$1" "${2:-}"; ORCA_AZURE_CONTAINER="$2"; shift 2 ;;
         --orca-azure-endpoint) require_value "$1" "${2:-}"; ORCA_AZURE_ENDPOINT="$2"; shift 2 ;;
@@ -133,6 +141,12 @@ done
 case "$MANAGE_CNI_PLUGIN" in
     true|false) ;;
     *) die "--manage-cni-plugin must be 'true' or 'false', got '$MANAGE_CNI_PLUGIN'" ;;
+esac
+
+# Validate deploy channel (only affects the "next steps" hint printed below).
+case "$DEPLOY_CHANNEL" in
+    stable|nightly) ;;
+    *) die "--channel must be 'stable' or 'nightly', got '$DEPLOY_CHANNEL'" ;;
 esac
 
 # Validate Orca config: account and container go together (endpoint is
@@ -227,6 +241,14 @@ fi
 set_var() {
     local name="$1"
     local value="$2"
+    # GitHub Actions variables cannot be empty (the API returns HTTP 422 on a
+    # missing value). An unset variable already resolves to "" in the workflow,
+    # which is the intended behavior (e.g. a blank ORCA_AZURE_ENDPOINT => the
+    # Orca driver uses the default *.blob.core.windows.net). So skip empties.
+    if [[ -z "$value" ]]; then
+        echo "==> Skipping empty variable $name"
+        return 0
+    fi
     echo "==> Setting variable $name"
     if ! gh variable set "$name" \
             --repo "$REPO" \
@@ -264,17 +286,34 @@ cat <<EOF
 
 Environment $ENV_NAME configured.
 
+EOF
+
+# Gateway nodes are labeled by forge's gateway pool, so no manual labeling
+# step is needed (both stable and nightly run on forge-built clusters). The
+# trigger differs per channel: stable deploys release tags via
+# release-upgrade.yaml; nightly deploys a snapshot of main via nightly.yaml.
+if [[ "$DEPLOY_CHANNEL" == "nightly" ]]; then
+    cat <<EOF
 Next steps:
 
-  1. Label at least one node as a gateway:
-       kubectl label node <node-name> \\
-         unbounded-cloud.io/unbounded-net-gateway=true --overwrite
+  1. Trigger the first install (run once per cluster):
+       gh workflow run nightly.yaml \\
+         --repo $REPO \\
+         -f force_init=true
 
-  2. Trigger the first install (run once per cluster):
+  2. Subsequent nightly snapshots of main deploy automatically to $ENV_NAME
+     at 06:00 UTC.
+EOF
+else
+    cat <<EOF
+Next steps:
+
+  1. Trigger the first install (run once per cluster):
        gh workflow run release-upgrade.yaml \\
          --repo $REPO \\
          -f tag=vX.Y.Z \\
          -f force_init=true
 
-  3. Subsequent published releases will deploy automatically to $ENV_NAME.
+  2. Subsequent published releases will deploy automatically to $ENV_NAME.
 EOF
+fi

@@ -5,11 +5,11 @@
 //!
 //! `DiskChannelDirectory` owns the set of currently-open disks (each
 //! represented by a [`PageChannel`] to its storage core) and
-//! publishes a `(channels, generation)` pair via `ArcSwap`. A
+//! publishes one immutable snapshot via `ArcSwap`. A
 //! [`Self::apply_channels`] call that actually changes the set builds
 //! a fresh pair and stores it as a single atomic publication, so
-//! consumers that resolve through [`Self::snapshot`] observe the
-//! channel set and its generation together; an apply of the identical
+//! consumers that resolve through [`Self::snapshot`] observe channels,
+//! topology, policy, and generation together; an apply of the identical
 //! set is skipped so the generation does not churn. Per-shard
 //! registration caches key off that generation, so "registered
 //! against gen N" always refers to the snapshot that was published as
@@ -27,15 +27,14 @@ use arc_swap::ArcSwap;
 
 use crate::storage::PageChannel;
 
-/// Snapshot of the currently-published channels. `None` means no
-/// disks are open and the data path is offline.
-pub type ChannelSnapshot = Option<Arc<ChannelSet>>;
-
 /// Published channel metadata, aligned index-for-index by path-sorted
 /// disk order.
 pub struct ChannelSet {
     pub channels: Vec<PageChannel>,
     pub page_cache_enabled: Vec<bool>,
+    pub drive_numa: Vec<Option<u16>>,
+    pub generation: u64,
+    key: Vec<(PathBuf, u64, Option<u16>)>,
 }
 
 /// Owns the published per-disk channel set. A change-bearing
@@ -43,27 +42,7 @@ pub struct ChannelSet {
 /// fresh, path-sorted [`PageChannel`] vector so `disk_for` indices
 /// stay stable across consumers.
 pub struct DiskChannelDirectory {
-    current: ArcSwap<ChannelSnapshotInner>,
-}
-
-/// Published unit: the channel snapshot and the generation it was
-/// published under, kept together so a single `ArcSwap` load returns
-/// a consistent pair. Consumers must go through
-/// [`DiskChannelDirectory::snapshot`] for any staleness decision so the
-/// pair cannot tear between two adjacent publications.
-struct ChannelSnapshotInner {
-    channels: ChannelSnapshot,
-    generation: u64,
-    /// Per-drive NUMA node, aligned index-for-index with `channels`
-    /// (and therefore with the `disk_for` drive index). `None` for a
-    /// drive whose storage core is unpinned or whose node is unknown.
-    /// Empty (not `None`-filled) when no channels are published, which
-    /// is the signal the router uses to fall back to plain hashing.
-    drive_numa: Arc<Vec<Option<u16>>>,
-    /// Path-sorted `(path, service identity, numa)` of the published
-    /// set. Policy-only changes republish the snapshot without bumping
-    /// the registration generation.
-    key: Vec<(PathBuf, usize, Option<u16>)>,
+    current: ArcSwap<ChannelSet>,
 }
 
 impl DiskChannelDirectory {
@@ -71,10 +50,11 @@ impl DiskChannelDirectory {
     /// channels.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            current: ArcSwap::new(Arc::new(ChannelSnapshotInner {
-                channels: None,
+            current: ArcSwap::new(Arc::new(ChannelSet {
+                channels: Vec::new(),
+                page_cache_enabled: Vec::new(),
+                drive_numa: Vec::new(),
                 generation: 0,
-                drive_numa: Arc::new(Vec::new()),
                 key: Vec::new(),
             })),
         })
@@ -93,7 +73,7 @@ impl DiskChannelDirectory {
     /// do not needlessly reseat per-shard registrations.
     pub fn apply_channels(&self, mut channels: Vec<(PathBuf, PageChannel, Option<u16>, bool)>) {
         channels.sort_by(|a, b| a.0.cmp(&b.0));
-        let key: Vec<(PathBuf, usize, Option<u16>)> = channels
+        let key: Vec<(PathBuf, u64, Option<u16>)> = channels
             .iter()
             .map(|(p, c, numa, _)| (p.clone(), c.service_id(), *numa))
             .collect();
@@ -107,12 +87,7 @@ impl DiskChannelDirectory {
         // reading the previous bundle and storing the new one is
         // race-free.
         let prev = self.current.load();
-        let prev_page_cache_enabled = prev
-            .channels
-            .as_ref()
-            .map(|set| set.page_cache_enabled.as_slice())
-            .unwrap_or(&[]);
-        if prev.key == key && prev_page_cache_enabled == page_cache_enabled.as_slice() {
+        if prev.key == key && prev.page_cache_enabled == page_cache_enabled {
             // Identical publication: nothing downstream needs to
             // reseat, so skip the generation bump and the store.
             return;
@@ -121,56 +96,35 @@ impl DiskChannelDirectory {
         let drive_numa: Vec<Option<u16>> = channels.iter().map(|(_, _, numa, _)| *numa).collect();
         let ordered: Vec<PageChannel> = channels.into_iter().map(|(_, c, _, _)| c).collect();
         let n = ordered.len();
-        let snapshot: ChannelSnapshot = if ordered.is_empty() {
-            None
-        } else {
-            Some(Arc::new(ChannelSet {
-                channels: ordered,
-                page_cache_enabled,
-            }))
-        };
-
         // The atomic `ArcSwap::store` is the entire publication: any
-        // consumer that loads the bundle sees both fields from the
-        // same generation.
+        // consumer sees all fields from the same generation.
         let gen_n = if prev.key == key {
             prev.generation
         } else {
             prev.generation + 1
         };
-        self.current.store(Arc::new(ChannelSnapshotInner {
-            channels: snapshot,
+        self.current.store(Arc::new(ChannelSet {
+            channels: ordered,
+            page_cache_enabled,
+            drive_numa,
             generation: gen_n,
-            drive_numa: Arc::new(drive_numa),
             key,
         }));
         eprintln!("disks: hot-swap to generation {gen_n} (cache cold; channel count={n})");
     }
 
-    /// Atomically load the currently-published channel set paired
-    /// with the generation it was published under. This is the only
-    /// API that yields a consistent (snapshot, gen) pair; staleness
-    /// checks must use it.
-    pub fn snapshot(&self) -> (ChannelSnapshot, u64) {
-        let inner = self.current.load_full();
-        (inner.channels.clone(), inner.generation)
+    /// Atomically load the current channels, topology, policy, and
+    /// generation as one immutable snapshot.
+    pub fn snapshot(&self) -> Arc<ChannelSet> {
+        self.current.load_full()
     }
 
     /// Load the currently-published channel set. `None` when no
     /// disks are open. Prefer [`Self::snapshot`] in any context that
     /// also needs the generation.
-    pub fn current(&self) -> ChannelSnapshot {
-        self.current.load_full().channels.clone()
-    }
-
-    /// Per-drive NUMA node, aligned with the published channel order
-    /// (and therefore with the `disk_for` drive index). Empty when no
-    /// disks are open, which the router treats as "no NUMA hint, hash
-    /// across all shards". A single atomic load, so the returned
-    /// vector's length always matches the channel set it was published
-    /// with.
-    pub fn drive_numa(&self) -> Arc<Vec<Option<u16>>> {
-        self.current.load_full().drive_numa.clone()
+    pub fn current(&self) -> Option<Arc<ChannelSet>> {
+        let snapshot = self.snapshot();
+        (!snapshot.channels.is_empty()).then_some(snapshot)
     }
 
     /// Generation of the currently-published snapshot. Observability
@@ -196,7 +150,7 @@ mod tests {
         let t = DiskChannelDirectory::new();
         assert!(t.current().is_none());
         assert_eq!(t.generation(), 0);
-        assert!(t.drive_numa().is_empty());
+        assert!(t.snapshot().drive_numa.is_empty());
     }
 
     #[test]
@@ -233,10 +187,11 @@ mod tests {
             (PathBuf::from("/a"), dummy_channel(), Some(0), true),
             (PathBuf::from("/b"), dummy_channel(), None, true),
         ]);
-        let numa = t.drive_numa();
+        let snapshot = t.snapshot();
+        let numa = &snapshot.drive_numa;
         // Path order /a,/b,/c -> NUMA 0, None, 2.
-        assert_eq!(&*numa, &[Some(0), None, Some(2)]);
-        assert_eq!(numa.len(), t.current().unwrap().channels.len());
+        assert_eq!(numa, &[Some(0), None, Some(2)]);
+        assert_eq!(numa.len(), snapshot.channels.len());
     }
 
     #[test]
@@ -269,10 +224,10 @@ mod tests {
         let t = DiskChannelDirectory::new();
         t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), Some(0), true)]);
         assert!(t.current().is_some());
-        assert_eq!(t.drive_numa().len(), 1);
+        assert_eq!(t.snapshot().drive_numa.len(), 1);
         t.apply_channels(vec![]);
         assert!(t.current().is_none());
-        assert!(t.drive_numa().is_empty());
+        assert!(t.snapshot().drive_numa.is_empty());
         assert_eq!(t.generation(), 2);
     }
 
@@ -284,22 +239,20 @@ mod tests {
         // matches the observability accessor; distinct apply calls
         // publish distinct snapshot `Arc`s.
         let t = DiskChannelDirectory::new();
-        let (c0, g0) = t.snapshot();
-        assert!(c0.is_none());
-        assert_eq!(g0, 0);
-        assert_eq!(g0, t.generation());
+        let c0 = t.snapshot();
+        assert!(c0.channels.is_empty());
+        assert_eq!(c0.generation, 0);
+        assert_eq!(c0.generation, t.generation());
 
         t.apply_channels(vec![(PathBuf::from("/a"), dummy_channel(), None, true)]);
-        let (c1, g1) = t.snapshot();
-        assert_eq!(g1, 1);
-        assert_eq!(g1, t.generation());
-        let c1 = c1.expect("snapshot present after apply");
+        let c1 = t.snapshot();
+        assert_eq!(c1.generation, 1);
+        assert_eq!(c1.generation, t.generation());
 
         t.apply_channels(vec![(PathBuf::from("/b"), dummy_channel(), None, true)]);
-        let (c2, g2) = t.snapshot();
-        assert_eq!(g2, 2);
-        assert_eq!(g2, t.generation());
-        let c2 = c2.expect("snapshot present after second apply");
+        let c2 = t.snapshot();
+        assert_eq!(c2.generation, 2);
+        assert_eq!(c2.generation, t.generation());
 
         // Each apply publishes a fresh vector, so the returned `Arc`s
         // do not alias across generations.
@@ -346,11 +299,11 @@ mod tests {
         let c = dummy_channel();
         t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(0), true)]);
         assert_eq!(t.generation(), 1);
-        assert_eq!(&*t.drive_numa(), &[Some(0)]);
+        assert_eq!(t.snapshot().drive_numa, vec![Some(0)]);
 
         t.apply_channels(vec![(PathBuf::from("/a"), c.clone(), Some(1), true)]);
         assert_eq!(t.generation(), 2, "NUMA move must bump");
-        assert_eq!(&*t.drive_numa(), &[Some(1)]);
+        assert_eq!(t.snapshot().drive_numa, vec![Some(1)]);
     }
 
     #[test]

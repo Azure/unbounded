@@ -38,7 +38,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -48,6 +48,8 @@ use crate::runtime::noop_waker;
 use crate::storage::blockdev::BlockDevice;
 use crate::storage::engine::StorageEngine;
 
+static NEXT_SERVICE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// `Send + Sync` clonable handle to a storage core's
 /// [`PageService`]. Every clone targets the same service; when the
 /// last handle is dropped the channel disconnects and the service
@@ -56,6 +58,7 @@ use crate::storage::engine::StorageEngine;
 /// See the module docs for the buffer-lifetime contract.
 pub struct PageChannel {
     cmd_tx: Sender<PageCommand>,
+    service_id: u64,
     /// Flipped to `false` by the service during shutdown so a send
     /// that raced the service's exit resolves with `EIO` instead of
     /// parking on a reply slot that nobody will set. Same mechanism
@@ -70,9 +73,13 @@ impl PageChannel {
     pub fn new() -> (PageChannel, PageChannelReceiver) {
         let (tx, rx) = channel();
         let service_alive = Arc::new(AtomicBool::new(true));
+        let service_id = NEXT_SERVICE_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("page service id space exhausted");
         (
             PageChannel {
                 cmd_tx: tx,
+                service_id,
                 service_alive: service_alive.clone(),
             },
             PageChannelReceiver { rx, service_alive },
@@ -157,12 +164,11 @@ impl PageChannel {
     /// Stable identity of the storage-core service this channel
     /// targets. All clones of one channel share it; a channel built by
     /// a distinct [`Self::new`] has a distinct identity. Used by the
-    /// channel directory to skip republishing an unchanged channel set
-    /// (the `service_alive` allocation is kept alive by the holder for
-    /// as long as the channel is published, so the pointer is a sound
-    /// identity for live channels).
-    pub(crate) fn service_id(&self) -> usize {
-        Arc::as_ptr(&self.service_alive) as usize
+    /// channel directory and shard registration cache to identify the
+    /// service across channel clones. IDs are never reused within a
+    /// process, including after a service is removed.
+    pub(crate) fn service_id(&self) -> u64 {
+        self.service_id
     }
 }
 
@@ -170,6 +176,7 @@ impl Clone for PageChannel {
     fn clone(&self) -> Self {
         Self {
             cmd_tx: self.cmd_tx.clone(),
+            service_id: self.service_id,
             service_alive: self.service_alive.clone(),
         }
     }

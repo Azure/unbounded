@@ -253,6 +253,149 @@ kubectl unbounded machine register \
 
 ---
 
+### `kubectl unbounded machine operation`
+
+Create and watch `MachineOperation` resources.
+
+This command group is the resource-oriented surface for day-2 machine
+operations. It creates the same `MachineOperation` CRD you can manage directly
+with `kubectl get mop`, `kubectl describe mop`, and `kubectl delete mop`.
+
+---
+
+### `kubectl unbounded machine operation create`
+
+Create a `MachineOperation`.
+
+#### Required Arguments and Flags
+
+| Name | Type | Description |
+|------|------|-------------|
+| `NAME` | argument | Name of the `MachineOperation` resource |
+| `--kind` | string | Operation kind: `NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostReboot`, `HostPowerOff`, `HostPowerOn`, or `HostReplace` |
+| `--machine` or `--selector` | string | Target one Machine by name or select Machines by label selector |
+
+`AgentUpgrade` also requires `--param downloadURL=<url>`.
+
+#### Optional Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--param` | `key=value` | none | Operation parameter. Repeat for multiple parameters. |
+| `--ttl` | `int32` | unset | Seconds after completion before cleanup. `0` keeps the operation indefinitely. |
+| `--wait` | `bool` | `false` | Wait until the operation reaches `Complete` or `Failed`. |
+| `--timeout` | duration | `0` | Client-side wait timeout. `0` waits indefinitely. |
+| `--dry-run` | string | `none` | `none`, `client`, or `server`. |
+| `-o`, `--output` | string | `name` | `name`, `yaml`, or `json`. |
+| `--field-manager` | string | `kubectl-unbounded` | Field manager used on create. |
+| `--kubeconfig` | string | `$KUBECONFIG` or default | Path to kubeconfig file. |
+
+`--wait` streams progress output and can only be used with the default
+`-o name` output.
+
+#### Examples
+
+Create a host reboot operation:
+
+```bash
+kubectl unbounded machine operation create reboot-worker-01 \
+  --kind HostReboot \
+  --machine worker-01
+```
+
+Create and wait for a node reboot operation selected by labels:
+
+```bash
+kubectl unbounded machine operation create reboot-gpu \
+  --kind NodeReboot \
+  --selector role=gpu \
+  --wait
+```
+
+Generate YAML without creating the operation:
+
+```bash
+kubectl unbounded machine operation create poweroff-worker-01 \
+  --kind HostPowerOff \
+  --machine worker-01 \
+  --dry-run=client \
+  -o yaml
+```
+
+Upgrade the agent:
+
+```bash
+kubectl unbounded machine operation create upgrade-worker-01 \
+  --kind AgentUpgrade \
+  --machine worker-01 \
+  --param downloadURL=https://example.com/unbounded-agent-linux-amd64.tar.gz
+```
+
+Selector support is implemented at the CRD level. Agent operations support
+selectors. Metalman bare-metal host operations support selectors when the
+selector includes `unbounded-cloud.io/site=<site>`. Cloud VM host operations
+currently require one operation per Machine.
+
+---
+
+### `kubectl unbounded machine operation wait`
+
+Wait for an existing `MachineOperation` to reach `Complete` or `Failed`.
+
+```bash
+kubectl unbounded machine operation wait reboot-worker-01 --timeout 5m
+```
+
+Use native kubectl commands for listing and inspection:
+
+```bash
+kubectl get mop
+kubectl describe mop reboot-worker-01
+kubectl get mop reboot-worker-01 -o yaml
+```
+
+---
+
+### Machine Operation Convenience Commands
+
+Convenience commands create a `MachineOperation` with a generated operation
+name, default `--ttl 300`, and `--wait=true`.
+
+| Command | Operation kind | Notes |
+|---------|----------------|-------|
+| `kubectl unbounded machine node-reboot NAME` | `NodeReboot` | Restarts the nspawn-backed Kubernetes node. |
+| `kubectl unbounded machine host-reboot NAME` | `HostReboot` | Reboots or power-cycles the host through the owning backend. |
+| `kubectl unbounded machine power-off NAME` | `HostPowerOff` | Powers off the host. |
+| `kubectl unbounded machine power-on NAME` | `HostPowerOn` | Powers on the host. |
+| `kubectl unbounded machine agent-upgrade NAME --download-url URL` | `AgentUpgrade` | Upgrades the host-side agent binary. |
+| `kubectl unbounded machine agent-reset NAME --force` | `AgentReset` | Removes the agent and managed resources from the host. Requires confirmation unless `--force` is set. |
+| `kubectl unbounded machine replace NAME --force` | `HostReplace` | Destructively replaces the host. Requires confirmation unless `--force` is set. |
+
+Common flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--operation-name` | generated | Explicit `MachineOperation` name. |
+| `--ttl` | `300` | Seconds after completion before cleanup. `0` keeps indefinitely. |
+| `--wait` | `true` | Wait for terminal operation phase. |
+| `--timeout` | `0` | Client-side wait timeout. |
+| `--kubeconfig` | `$KUBECONFIG` or default | Path to kubeconfig file. |
+
+---
+
+### Legacy Machine Operation Commands
+
+The older counter-backed commands remain available for compatibility:
+
+| Command | Mechanism |
+|---------|-----------|
+| `kubectl unbounded machine reboot NAME` | Patches `Machine.spec.operations.rebootCounter`. |
+| `kubectl unbounded machine repave NAME` | Patches `Machine.spec.operations.repaveCounter` and `rebootCounter`. |
+
+These commands do not create `MachineOperation` resources.
+
+---
+
 ## Environment Variables
 
 | Variable | Description |

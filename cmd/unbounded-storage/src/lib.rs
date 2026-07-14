@@ -8,7 +8,6 @@ pub mod fabric;
 pub mod fanout;
 pub mod frontend;
 pub mod http;
-pub mod io;
 pub mod memory;
 pub mod metrics;
 pub mod obs;

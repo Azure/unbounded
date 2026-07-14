@@ -765,13 +765,13 @@ fn spawn_clients(
                 yield_once().await;
             }
             for (op_idx, op) in client.ops.iter().enumerate() {
-                let (snapshot, generation) = directory.snapshot();
-                max_snapshot_generation.set(max_snapshot_generation.get().max(generation));
-                let Some(channels) = snapshot.as_ref() else {
+                let channels = directory.snapshot();
+                max_snapshot_generation.set(max_snapshot_generation.get().max(channels.generation));
+                if channels.channels.is_empty() {
                     channel_errors.set(channel_errors.get() + 1);
                     completed_ops.set(completed_ops.get() + 1);
                     continue;
-                };
+                }
                 let slot = start_slot + op_idx;
                 let base = unsafe { (pool_base as *mut u8).add(slot * page_size) };
                 match op {

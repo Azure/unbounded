@@ -790,7 +790,6 @@ a:hover {
   flex: 1;
   min-width: 0;
   padding-left: 6rem;
-  padding-right: 6rem;
 }
 
 /* Strip centering/padding from inner containers inside docs-layout */
@@ -1091,6 +1090,20 @@ pre code {
   background: none;
   padding: 0;
   font-size: 0.85rem;
+}
+
+pre.mermaid {
+  display: flex;
+  justify-content: center;
+  min-height: 12rem;
+  padding: 1.5rem;
+  color: var(--color-text);
+  background: var(--color-surface);
+}
+
+pre.mermaid svg {
+  max-width: 100%;
+  height: auto;
 }
 
 /* ── Tables ───────────────────────────────────────────────── */

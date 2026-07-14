@@ -3,7 +3,10 @@
 
 package goalstates
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 const (
 	// ConfigDir is the host-level configuration directory for unbounded-kube.
@@ -77,13 +80,41 @@ func AppliedConfigPath(machineName string) string {
 	return fmt.Sprintf("%s/%s-applied-config.json", AgentConfigDir, machineName)
 }
 
+// ContainerImageArchivePath returns the path inside the nspawn machine where a
+// preloaded container image archive is staged before importing into containerd.
+func ContainerImageArchivePath(index int) string {
+	return fmt.Sprintf("%s/image-%d.tar", ContainerImageArchiveDir, index)
+}
+
+func KubeProxyImage(kubernetesVersion string) string {
+	kubernetesVersion = strings.TrimSpace(kubernetesVersion)
+	if kubernetesVersion == "" {
+		kubernetesVersion = "latest"
+	} else if !strings.HasPrefix(kubernetesVersion, "v") {
+		kubernetesVersion = "v" + kubernetesVersion
+	}
+
+	return KubeProxyImageRepository + ":" + kubernetesVersion
+}
+
 const (
 	ContainerdVersion = "2.1.8"
 	RunCVersion       = "1.5.0"
 	CNIPluginVersion  = "1.5.1"
 
 	ContainerdMetricsAddress = "0.0.0.0:10257"
-	SandboxImage             = "mcr.microsoft.com/oss/kubernetes/pause:3.9"
+	SandboxImage             = "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9"
+	KubeProxyImageRepository = "mcr.microsoft.com/oss/v2/kubernetes/kube-proxy"
+
+	// ContainerImageArchiveDir is the path inside the nspawn machine where
+	// staged container image archives are mounted.
+	ContainerImageArchiveDir = "/var/lib/unbounded/container-images"
+	// ContainerImageArchiveHostDir is the stable host-side symlink bind-mounted
+	// read-only at ContainerImageArchiveDir inside nspawn machines.
+	ContainerImageArchiveHostDir = ContainerImageArchiveDir + "/current"
+	// ContainerImageArchiveHostSourceDir stores source-specific archive staging
+	// directories pointed to by ContainerImageArchiveHostDir.
+	ContainerImageArchiveHostSourceDir = ContainerImageArchiveDir
 
 	CNIBinDir    = "/opt/cni/bin"
 	CNIConfigDir = "/etc/cni/net.d"
@@ -97,6 +128,14 @@ const (
 	// host NVIDIA library directories are bind-mounted read-only. Each unique
 	// host directory gets a numbered subdirectory (e.g. /run/host-nvidia/0/).
 	NvidiaHostLibDir = "/run/host-nvidia"
+	// NvidiaHostI386LibDir is the base directory for optional i386 NVIDIA
+	// library bind mounts.
+	NvidiaHostI386LibDir = "/run/host-nvidia-i386"
+	// NvidiaHostBinDir exposes the host directory containing nvidia-smi.
+	NvidiaHostBinDir = "/run/host-nvidia-bin"
+	// NvidiaDriverDir is the driver-root layout used by NVIDIA tooling and
+	// device plugins inside the nspawn machine.
+	NvidiaDriverDir = "/run/nvidia/driver"
 
 	NvidiaContainerRuntimePath = "/usr/bin/nvidia-container-runtime"
 	NvidiaRuntimeClassName     = "nvidia"

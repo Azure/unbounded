@@ -19,6 +19,7 @@ install namespace, which defaults to `unbounded-system`. Render them with
 | `examples/registry-secret.example.yaml.tmpl` | `rendered/examples/registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
 | `examples/networkpolicy.yaml.tmpl` | `rendered/examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
 | `hosts.toml.template` | (not rendered) | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
+| `node-config.yaml` | (not rendered) | Standalone node configurator for containerd's default Gantry mirror. |
 
 The container image is built from `images/gantry/Containerfile` via
 `make image-gantry-local` (or `make image-gantry-push` to push).

@@ -222,6 +222,7 @@ func TestHostDevices_Paths_MergesDedupesSorts(t *testing.T) {
 		Network:    []string{"/dev/net/tun", "/dev/vhost-net"},
 		Block:      []string{"/dev/sdb", "/dev/sda", "/dev/kvm"},
 		Infiniband: []string{"/dev/infiniband/uverbs0"},
+		Additional: []string{"/dev/uinput", "/dev/net/tun"},
 	}
 
 	want := []string{
@@ -230,9 +231,32 @@ func TestHostDevices_Paths_MergesDedupesSorts(t *testing.T) {
 		"/dev/net/tun",
 		"/dev/sda",
 		"/dev/sdb",
+		"/dev/uinput",
 		"/dev/vhost-net",
 	}
 	require.Equal(t, want, d.Paths())
+}
+
+func TestDiscoverHostDevices_Additional(t *testing.T) {
+	t.Parallel()
+
+	additional := []string{"/dev/uinput"}
+
+	got := DiscoverHostDevices(additional)
+
+	require.Equal(t, additional, got.Additional)
+	require.Contains(t, got.Paths(), "/dev/uinput")
+}
+
+func TestHostDevices_DeviceGroupSpecifiers(t *testing.T) {
+	t.Parallel()
+
+	devices := HostDevices{
+		Additional: []string{"/dev/uinput", "char-pts", "char-input", "char-pts"},
+	}
+
+	require.Equal(t, []string{"/dev/uinput"}, devices.Paths())
+	require.Equal(t, []string{"char-input", "char-pts"}, devices.DeviceGroupSpecifiers())
 }
 
 func TestHostDevices_Paths_Empty(t *testing.T) {

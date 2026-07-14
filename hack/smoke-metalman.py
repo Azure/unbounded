@@ -13,6 +13,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import threading
@@ -30,6 +31,8 @@ API_GROUP = "unbounded-cloud.io"
 API_VERSION = f"{API_GROUP}/v1alpha3"
 NODE_LABEL_KEY = "unbounded-cloud.io/smoke-test"
 NODE_LABEL_VALUE = "metalman"
+METALMAN_NAMESPACE = "unbounded-system"
+METALMAN_CONTROLLER_SA = "metalman-controller"
 VM_NAME = "unbounded-metal-smoke"
 NET_NAME = "unbounded-metal-smoke"
 SUBNET = "192.168.200"
@@ -39,20 +42,25 @@ KIND_SMOKE_IP = f"{SUBNET}.2"  # IP assigned to the kind container on virbr-smok
 GATEWAY = SERVER_IP
 DNS_SERVER = "8.8.8.8"
 MAC_ADDRESS = "52:54:00:aa:bb:01"
-SUSHY_PORT = 8443
+REDFISH_PORT = 8443
 HTTP_PORT = 8880
+AGENT_DOWNLOAD_PORT = 8881
 CACHE_DIR = TMPDIR / "cache"
 ARTIFACT_DIR = TMPDIR / "artifacts"
 SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
+AGENT_TARBALL = ARTIFACT_DIR / "unbounded-agent-linux-amd64.tar.gz"
+AGENT_DOWNLOAD_URL = f"http://{SERVER_IP}:{AGENT_DOWNLOAD_PORT}/{AGENT_TARBALL.name}"
 REGISTRY_PORT = 5555
 REGISTRY_CONTAINER = "unbounded-smoke-registry"
 IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
+NETBOOT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/netboot:smoke"
 AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 # The agent runs inside a VM on an isolated libvirt network. "localhost" inside
 # the VM resolves to the VM's own loopback, not the host.  Use the host's
 # bridge IP so the VM can reach the registry over the virtual network.
 AGENT_IMAGE_NAME_VM = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
 BINARY = REPO_ROOT / "bin" / "metalman"
+AGENT_BINARY = REPO_ROOT / "bin" / "unbounded-agent"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 SERIAL_SOCK = TMPDIR / "console.sock"
 QGA_SOCK = TMPDIR / "qga.sock"
@@ -345,15 +353,17 @@ def clean_libvirt() -> None:
     run_quiet(["sudo", "ip", "link", "delete", "virbr-smoke"])
     # Remove veth pair used to connect kind container to virbr-smoke.
     run_quiet(["sudo", "ip", "link", "delete", "veth-kind-smoke"])
-    # Kill any leftover sushy-emulator from a previous run.
-    run_quiet(["sudo", "pkill", "-f", "sushy-emulator"])
+    # Kill any leftover Redfish fixture from a previous run.
+    run_quiet(["sudo", "pkill", "-f", "metalman-redfish-fixture.py"])
     # Kill any leftover metalman serve-pxe from a previous run.
     # Use the binary path to avoid matching this script (smoke-metalman.py).
     run_quiet(["sudo", "pkill", "-f", "bin/metalman"])
+    # Kill any leftover artifact download server from a previous run.
+    run_quiet(["sudo", "pkill", "-f", f"python3 -m http.server {AGENT_DOWNLOAD_PORT}"])
     # Stop and remove leftover local registry container.
     run_quiet(["docker", "rm", "-f", REGISTRY_CONTAINER])
     # Delete stale leader-election leases so new processes acquire immediately.
-    run_quiet([KUBECTL, "-n", "unbounded-system", "delete", "lease",
+    run_quiet([KUBECTL, "-n", METALMAN_NAMESPACE, "delete", "lease",
                f"metalman-{SITE}"])
     time.sleep(1)
 
@@ -399,6 +409,47 @@ def _sigint_handler(sig: int, frame: Any) -> None:
 
 def kubectl(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
     return run([KUBECTL, *args], **kw)
+
+
+def write_service_account_kubeconfig(namespace: str, service_account: str, path: Path) -> None:
+    token = run(
+        [KUBECTL, "-n", namespace, "create", "token", service_account, "--duration=2h"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if not token:
+        die(f"Failed to create token for ServiceAccount {namespace}/{service_account}")
+
+    raw_config = run(
+        [KUBECTL, "config", "view", "--raw", "--minify", "-o", "json"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    current = json.loads(raw_config)
+    clusters = current.get("clusters", [])
+    if len(clusters) != 1:
+        die(f"Expected one current kubeconfig cluster, got {len(clusters)}")
+    cluster_name = clusters[0]["name"]
+
+    user_name = f"{namespace}:{service_account}"
+    kubeconfig = {
+        "apiVersion": "v1",
+        "kind": "Config",
+        "clusters": clusters,
+        "contexts": [{
+            "name": user_name,
+            "context": {
+                "cluster": cluster_name,
+                "namespace": namespace,
+                "user": user_name,
+            },
+        }],
+        "current-context": user_name,
+        "users": [{"name": user_name, "user": {"token": token}}],
+    }
+
+    path.write_text(json.dumps(kubeconfig), encoding="utf-8")
+    os.chmod(path, 0o600)
 
 
 def apiserver_url() -> str:
@@ -467,6 +518,31 @@ def configure_kind_control_plane_node_ip(container: str, node_ip: str) -> None:
         time.sleep(1)
 
     die(f"Timed out waiting for Node '{container}' to advertise only InternalIP {node_ip}")
+
+
+def configure_kind_kube_proxy_apiserver(api_server: str) -> None:
+    """Make newly scheduled kind kube-proxy pods use the VM-reachable API URL."""
+    log(f"Configuring kind kube-proxy API server as {api_server}")
+    result = run(
+        [KUBECTL, "-n", "kube-system", "get", "configmap", "kube-proxy", "-o", "json"],
+        capture_output=True,
+        text=True,
+    )
+    config_map = json.loads(result.stdout)
+    kubeconfig = config_map["data"]["kubeconfig.conf"]
+    lines = kubeconfig.splitlines()
+    server_lines = [index for index, line in enumerate(lines) if line.lstrip().startswith("server:")]
+    if len(server_lines) != 1:
+        die(f"Expected one kube-proxy API server entry, got {len(server_lines)}")
+    index = server_lines[0]
+    indentation = lines[index][:-len(lines[index].lstrip())]
+    lines[index] = f"{indentation}server: {api_server}"
+    config_map["data"]["kubeconfig.conf"] = "\n".join(lines) + "\n"
+    run(
+        [KUBECTL, "replace", "-f", "-"],
+        input=json.dumps(config_map),
+        text=True,
+    )
 
 
 def _probe_vm_network() -> None:
@@ -703,47 +779,81 @@ def assert_node_label(name: str, key: str, value: str) -> None:
     log(f"  Node '{name}' has label {key}={value}")
 
 
+def operation_targets_node(op: dict[str, Any]) -> bool:
+    if op.get("spec", {}).get("machineRef") == NODE_NAME:
+        return True
+    for target in op.get("status", {}).get("targets", []):
+        if target.get("machineRef") == NODE_NAME:
+            return True
+    return False
+
+
+def find_host_replace_operation(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+    candidates = [
+        op for op in items
+        if op.get("spec", {}).get("operationKind") == "HostReplace" and operation_targets_node(op)
+    ]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda op: (
+        op.get("metadata", {}).get("creationTimestamp", ""),
+        op.get("metadata", {}).get("name", ""),
+    ))[0]
+
+
 def assert_cloud_init_done(timeout: int = 900) -> None:
-    """Assert the Machine's CloudInitDone condition reaches True/Succeeded.
+    """Assert the HostReplace operation's CloudInitDone condition is True/Succeeded.
 
     Called before waiting for the Kubernetes Node to appear because
     cloud-init must finish before the kubelet can join the cluster.
     Fails fast if the condition transitions to Failed so that the
     smoke test does not wait for the full node-join timeout.
     """
-    log(f"  Waiting for Machine '{NODE_NAME}' CloudInitDone condition...")
+    log(f"  Waiting for HostReplace MachineOperation CloudInitDone condition for '{NODE_NAME}'...")
     for elapsed in range(timeout):
         check_procs()
         result = subprocess.run(
-            [KUBECTL, "get", f"machines.{API_GROUP}", NODE_NAME, "-o", "json"],
+            [KUBECTL, "get", f"machineoperations.{API_GROUP}", "-o", "json"],
             capture_output=True, text=True,
         )
+        op_name = ""
+        phase = ""
         status = ""
         reason = ""
         message = ""
         if result.returncode == 0:
             try:
-                conditions = json.loads(result.stdout).get("status", {}).get("conditions", [])
-                for c in conditions:
-                    if c.get("type") == "CloudInitDone":
-                        status = c.get("status", "")
-                        reason = c.get("reason", "")
-                        message = c.get("message", "")
-                        break
+                op = find_host_replace_operation(json.loads(result.stdout).get("items", []))
+                if op is not None:
+                    op_name = op.get("metadata", {}).get("name", "")
+                    op_status = op.get("status", {})
+                    phase = op_status.get("phase", "")
+                    message = op_status.get("message", "")
+                    for c in op_status.get("conditions", []):
+                        if c.get("type") == "CloudInitDone":
+                            status = c.get("status", "")
+                            reason = c.get("reason", "")
+                            message = c.get("message", "")
+                            break
             except (json.JSONDecodeError, KeyError):
                 pass
 
+        if phase == "Failed":
+            die(f"HostReplace MachineOperation '{op_name}' failed: {message}")
         if status == "True":
             if reason != "Succeeded":
                 die(f"CloudInitDone condition is True but reason is {reason!r}, expected 'Succeeded'")
-            log(f"  Machine '{NODE_NAME}' CloudInitDone condition is True/Succeeded")
+            log(f"  MachineOperation '{op_name}' CloudInitDone condition is True/Succeeded")
             return
         if status == "False" and reason == "Failed":
             die(f"Cloud-init failed: {message}")
         if elapsed > 0 and elapsed % 30 == 0:
-            log(f"    ({elapsed}s) CloudInitDone status={status or 'not set'} reason={reason or 'not set'}")
+            if op_name:
+                log(f"    ({elapsed}s) MachineOperation '{op_name}' phase={phase or 'empty'} CloudInitDone status={status or 'not set'} reason={reason or 'not set'}")
+            else:
+                log(f"    ({elapsed}s) HostReplace MachineOperation not found yet")
         time.sleep(1)
-    die(f"Timed out waiting for CloudInitDone condition on Machine '{NODE_NAME}'")
+    die(f"Timed out waiting for CloudInitDone condition on HostReplace MachineOperation for '{NODE_NAME}'")
 
 
 def wait_machine_operation_complete(name: str, timeout: int = 1800) -> None:
@@ -803,6 +913,32 @@ def create_machine_operation(
     }
     kubectl(["apply", "-f", "-"], input=json.dumps(operation).encode(), stdout=DEVNULL)
     return name
+
+
+def run_kubectl_unbounded_operation(args: list[str], log_name: str) -> subprocess.Popen[Any]:
+    proc = spawn([str(KUBECTL_UNBOUNDED), "machine", *args], TMPDIR / log_name)
+    log(f"  kubectl-unbounded {' '.join(args)} PID={proc.pid}")
+    return proc
+
+
+def wait_process_success(proc: subprocess.Popen[Any], timeout: int) -> None:
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        die(f"Process {proc.args} did not finish within {timeout}s")
+    try:
+        _procs.remove(proc)
+    except ValueError:
+        # Process cleanup is best-effort because another cleanup path may have removed it.
+        pass
+    if rc != 0:
+        die(f"Process {proc.args} exited with code {rc}")
+
+
+def assert_log_contains(path: Path, needle: str) -> None:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if needle not in text:
+        die(f"Expected {path} to contain {needle!r}")
 
 
 def run_operation_smoke_suite() -> None:
@@ -911,6 +1047,7 @@ def main() -> None:
     })
     kubectl(["-n", "kube-system", "patch", "daemonset", "kindnet",
              "--type=strategic", "-p", patch])
+    configure_kind_kube_proxy_apiserver(f"https://{KIND_SMOKE_IP}:6443")
 
     log("Creating UEFI VM (powered off, with TPM)")
     ovmf_vars = TMPDIR / "OVMF_VARS.fd"
@@ -938,23 +1075,27 @@ def main() -> None:
     )
     console_thread.start()
 
-    log("Starting sushy-emulator")
+    log("Starting recording Redfish fixture")
     run_quiet([
         "openssl", "req", "-x509", "-newkey", "rsa:2048",
-        "-keyout", str(TMPDIR / "sushy.key"),
-        "-out", str(TMPDIR / "sushy.crt"),
+        "-keyout", str(TMPDIR / "redfish.key"),
+        "-out", str(TMPDIR / "redfish.crt"),
         "-days", "1", "-nodes",
-        "-subj", "/CN=sushy-emulator",
+        "-subj", "/CN=metalman-redfish-fixture",
         "-addext", "subjectAltName=IP:127.0.0.1",
     ], check=True)
-    sushy_url = f"https://127.0.0.1:{SUSHY_PORT}"
+    redfish_url = f"https://127.0.0.1:{REDFISH_PORT}"
     proc = spawn([
-        "sushy-emulator", "--libvirt-uri", "qemu:///system",
-        "-i", "127.0.0.1", "-p", str(SUSHY_PORT),
-        "--ssl-certificate", str(TMPDIR / "sushy.crt"),
-        "--ssl-key", str(TMPDIR / "sushy.key"),
-    ], TMPDIR / "sushy.log")
-    log(f"  sushy-emulator PID={proc.pid}")
+        sys.executable, str(REPO_ROOT / "hack" / "metalman-redfish-fixture.py"),
+        "--domain", VM_NAME, "--mac", MAC_ADDRESS,
+        "--bind", "127.0.0.1", "--port", str(REDFISH_PORT),
+        "--cert", str(TMPDIR / "redfish.crt"),
+        "--key", str(TMPDIR / "redfish.key"),
+        "--record", str(TMPDIR / "redfish.jsonl"),
+        "--username", "", "--password", "smoke",
+        "--manage-boot-order",
+    ], TMPDIR / "redfish.log")
+    log(f"  Redfish fixture PID={proc.pid}")
     time.sleep(2)
     check_procs()
 
@@ -966,10 +1107,14 @@ def main() -> None:
     log("Rendering machina and net manifests")
     run(["make", "machina-manifests", "net-manifests"], cwd=str(REPO_ROOT))
 
-    log("Building metalman and kubectl-unbounded (parallel)")
+    log("Building metalman, kubectl-unbounded, and unbounded-agent (parallel)")
     go_builds: list[tuple[str, subprocess.Popen[Any]]] = [
         ("metalman", subprocess.Popen(
             ["go", "build", "-o", str(BINARY), "./cmd/metalman"],
+            cwd=str(REPO_ROOT),
+        )),
+        ("unbounded-agent", subprocess.Popen(
+            ["go", "build", "-o", str(AGENT_BINARY), "./cmd/agent"],
             cwd=str(REPO_ROOT),
         )),
         ("kubectl-unbounded", subprocess.Popen(
@@ -1012,12 +1157,13 @@ def main() -> None:
     else:
         die("Local OCI registry did not become ready")
 
-    # Both Docker images (host-ubuntu2404 and agent-ubuntu2404) are pre-built
+    # Docker images are pre-built
     # by the GitHub Actions workflow using docker/build-push-action with GHA
     # layer caching.  They are already loaded into the local Docker daemon
-    # with the correct tags (IMAGE_NAME and AGENT_IMAGE_NAME).
+    # with the correct tags.
     log("Verifying pre-built OCI images are available")
     for name, tag in [("host-ubuntu2404", IMAGE_NAME),
+                      ("netboot", NETBOOT_IMAGE_NAME),
                       ("agent-ubuntu2404", AGENT_IMAGE_NAME)]:
         result = subprocess.run(
             ["docker", "image", "inspect", tag],
@@ -1035,8 +1181,23 @@ def main() -> None:
             die(f"go build {name} failed (exit code {rc})")
     log("  Go builds finished")
 
+    log("Packaging branch-built unbounded-agent")
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(AGENT_TARBALL, "w:gz") as tar:
+        tar.add(AGENT_BINARY, arcname="unbounded-agent")
+
+    log("Starting agent download server")
+    proc = spawn([
+        sys.executable, "-m", "http.server", str(AGENT_DOWNLOAD_PORT),
+        "--bind", SERVER_IP, "--directory", str(ARTIFACT_DIR),
+    ], TMPDIR / "agent-download.log")
+    log(f"  agent download PID={proc.pid}")
+    time.sleep(1)
+    check_procs()
+
     log("Pushing OCI images to local registry")
     run(["docker", "push", IMAGE_NAME])
+    run(["docker", "push", NETBOOT_IMAGE_NAME])
     run(["docker", "push", AGENT_IMAGE_NAME])
 
     # Reclaim disk space consumed by Docker build cache.  The host-ubuntu2404
@@ -1060,7 +1221,7 @@ def main() -> None:
             "pxe": {
                 "image": IMAGE_NAME,
                 "redfish": {
-                    "url": sushy_url,
+                    "url": redfish_url,
                     "username": "",
                     "deviceID": VM_NAME,
                     "passwordRef": {"name": "bmc-pass", "key": "password", "namespace": NODE_NS},
@@ -1075,6 +1236,7 @@ def main() -> None:
             },
             "agent": {
                 "image": AGENT_IMAGE_NAME_VM,
+                "url": AGENT_DOWNLOAD_URL,
             },
             "kubernetes": {
                 "nodeLabels": {NODE_LABEL_KEY: NODE_LABEL_VALUE},
@@ -1086,15 +1248,17 @@ def main() -> None:
     log("  Resources created")
 
     log("Starting metalman serve-pxe")
+    metalman_kubeconfig = TMPDIR / "metalman-controller.kubeconfig"
+    write_service_account_kubeconfig(METALMAN_NAMESPACE, METALMAN_CONTROLLER_SA, metalman_kubeconfig)
     metalman_env = [f"METALMAN_APISERVER_URL={server_url}"]
-    if kubeconfig := os.environ.get("KUBECONFIG"):
-        metalman_env.append(f"KUBECONFIG={kubeconfig}")
+    metalman_env.append(f"KUBECONFIG={metalman_kubeconfig}")
 
     proc = spawn([
         "sudo", "env", *metalman_env,
         str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
         f"--cache-dir={CACHE_DIR}",
         f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",
+        f"--default-netboot-image={NETBOOT_IMAGE_NAME}",
         "--leader-elect-lease-duration=60s",
         "--leader-elect-renew-deadline=40s",
         "--leader-elect-retry-period=5s",
@@ -1104,8 +1268,12 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
-    log("Triggering HostReplace MachineOperation")
-    operation_name = create_machine_operation("smoke-host-replace", "HostReplace")
+    log("Triggering HostReplace through kubectl-unbounded")
+    operation_log = TMPDIR / "kubectl-host-replace.log"
+    operation_proc = run_kubectl_unbounded_operation(
+        ["replace", NODE_NAME, "--force", "--ttl=3600"],
+        operation_log.name,
+    )
 
     # Log free space so we can correlate disk exhaustion with VM failures.
     df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
@@ -1114,7 +1282,8 @@ def main() -> None:
     log("Waiting for cloud-init to complete...")
     assert_cloud_init_done(timeout=900)
 
-    wait_machine_operation_complete(operation_name, timeout=900)
+    wait_process_success(operation_proc, timeout=900)
+    assert_log_contains(operation_log, "Condition CloudInitDone: True/Succeeded")
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)

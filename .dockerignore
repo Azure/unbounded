@@ -3,6 +3,9 @@ bin/
 unbounded-net*
 !unbounded-net*/
 __debug*
+tmp/
+.tmp/
+dist/
 
 # Docker
 .dockerignore

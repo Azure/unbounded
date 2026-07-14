@@ -183,12 +183,21 @@ that value.
 **OCI Instance** - not currently supported. An identity-preserving OCI
 replacement flow with fresh `user_data` injection has not been verified.
 
-**Bare metal (PXE)** - metalman boots the machine through PXE, writes the
-selected host OS image, installs or configures the agent, and lets the agent
-create the nspawn node. The `MachineOperation` records per-machine progress in
-`status.targets[]`; each target completes after the Machine status shows the
-requested repave and reboot counters were observed, `Repaved=True`, and the
-corresponding Kubernetes Node object exists.
+**Bare metal (PXE)** - metalman sets the PXE or HTTP boot override, force-restarts
+the machine through Redfish, writes the selected host OS image, installs or
+configures the agent, and lets the agent create the nspawn node. The
+`MachineOperation` records per-machine progress in `status.targets[]`; each
+target completes after `BootImageWritten=True`, `CloudInitDone=True`, and the
+corresponding Kubernetes Node object exists. Metalman also latches
+`status.conditions[type=BootLoaderDownloaded]` to `True` when the machine first
+downloads the initial PXE boot loader for the operation, typically over TFTP.
+For installer visibility, `status.conditions[type=BootImageWritten]` starts as
+`Unknown`, transitions to `False` when the PXE installer starts and requests the
+disk image, and transitions to `True` when the installer finishes and sends the
+existing PXE disable signal. `status.conditions[type=CloudInitDone]` tracks the
+first boot after the image is written: it starts as `Unknown`, moves to `False`
+when cloud-init starts, and then records either final success or a summarized
+failure without updating for every cloud-init log entry.
 
 ### HostReplace vs Node Recreation
 

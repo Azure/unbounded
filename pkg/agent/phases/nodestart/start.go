@@ -27,6 +27,7 @@ func StartNode(log *slog.Logger, gs *goalstates.NodeStart) phases.Task {
 		StartNSpawnMachine(log, gs),
 		SetupNVIDIA(log, gs),
 		StartContainerd(log, gs),
+		ImportContainerImages(log, gs),
 		StartKubelet(log, gs),
 	)
 }

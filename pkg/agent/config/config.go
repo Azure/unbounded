@@ -20,6 +20,7 @@ import (
 	"maps"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -48,6 +49,40 @@ type AgentConfig struct {
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
 	// When empty the agent uses the built-in default image.
 	OCIImage string `json:"OCIImage,omitempty"`
+
+	// AdditionalHostDevices lists extra host device nodes under /dev or systemd
+	// device group specifiers that should be exposed to the nspawn machine in
+	// addition to automatically discovered devices.
+	AdditionalHostDevices []string `json:"AdditionalHostDevices,omitempty"`
+
+	// OfflineArtifacts points to a complete offline binary artifact source.
+	// When set, it takes precedence over download overrides. Source is rendered
+	// as a strict Go template using the cluster Kubernetes version, then
+	// resolved as an absolute filesystem path, file:// URL, or oci:// artifact
+	// reference.
+	OfflineArtifacts *AgentOfflineArtifacts `json:"OfflineArtifacts,omitempty"`
+}
+
+// AgentOfflineArtifacts configures a complete offline source for binaries the
+// agent installs into the nspawn rootfs.
+type AgentOfflineArtifacts struct {
+	Source string `json:"Source,omitempty"`
+}
+
+// DeepCopy returns a copy of AgentOfflineArtifacts.
+func (a *AgentOfflineArtifacts) DeepCopy() *AgentOfflineArtifacts {
+	if a == nil {
+		return nil
+	}
+
+	out := *a
+
+	return &out
+}
+
+// OfflineArtifactsConfigured reports whether an offline artifact source is configured.
+func (a *AgentConfig) OfflineArtifactsConfigured() bool {
+	return a != nil && a.OfflineArtifacts != nil && strings.TrimSpace(a.OfflineArtifacts.Source) != ""
 }
 
 // BackfillNodeName resolves and stores the Kubernetes Node name once. An
@@ -108,6 +143,9 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	}
 
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
+	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
+
+	out.OfflineArtifacts = a.OfflineArtifacts.DeepCopy()
 
 	return &out
 }
@@ -136,6 +174,10 @@ func (a *AgentConfig) Validate() error {
 		errs = append(errs, fmt.Errorf("Cluster.ClusterDNS is required"))
 	}
 
+	if err := ValidateAdditionalHostDevices(a.AdditionalHostDevices); err != nil {
+		errs = append(errs, err)
+	}
+
 	apiServer := strings.TrimSpace(a.Kubelet.ApiServer)
 	if apiServer == "" {
 		errs = append(errs, fmt.Errorf("Kubelet.ApiServer is required"))
@@ -149,6 +191,62 @@ func (a *AgentConfig) Validate() error {
 	// static bootstrap credential should validate Kubelet.Auth separately.
 
 	return errors.Join(errs...)
+}
+
+// ValidateAdditionalHostDevices checks that configured host device paths and
+// systemd device group specifiers are safe to render into nspawn directives.
+func ValidateAdditionalHostDevices(paths []string) error {
+	var errs []error
+
+	for _, path := range paths {
+		if err := validateAdditionalHostDevice(path); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateAdditionalHostDevice(path string) error {
+	if path != strings.TrimSpace(path) || strings.ContainsAny(path, " \t\r\n:") {
+		return fmt.Errorf("AdditionalHostDevices entry %q must not contain whitespace or ':'", path)
+	}
+
+	if IsSystemdDeviceGroupSpecifier(path) {
+		return nil
+	}
+
+	if path == "" || !strings.HasPrefix(path, "/dev/") {
+		return fmt.Errorf("AdditionalHostDevices entry %q must be an absolute path under /dev or a systemd device group specifier", path)
+	}
+
+	if cleaned := filepath.Clean(path); cleaned != path || !strings.HasPrefix(cleaned, "/dev/") {
+		return fmt.Errorf("AdditionalHostDevices entry %q must be a clean absolute path under /dev", path)
+	}
+
+	return nil
+}
+
+// IsSystemdDeviceGroupSpecifier reports whether value is a systemd DeviceAllow
+// device group specifier, such as char-input or block-*. Group names accept
+// ASCII letters, digits, underscores, hyphens, and the '*' wildcard only.
+func IsSystemdDeviceGroupSpecifier(value string) bool {
+	for _, prefix := range []string{"char-", "block-"} {
+		if !strings.HasPrefix(value, prefix) {
+			continue
+		}
+
+		group := strings.TrimPrefix(value, prefix)
+
+		return group != "" && strings.IndexFunc(group, func(r rune) bool {
+			return (r < 'a' || r > 'z') &&
+				(r < 'A' || r > 'Z') &&
+				(r < '0' || r > '9') &&
+				r != '_' && r != '-' && r != '*'
+		}) == -1
+	}
+
+	return false
 }
 
 // AgentClusterConfig holds the cluster-level values the agent needs to
@@ -212,6 +310,10 @@ type CRIConfig struct {
 type ContainerdConfig struct {
 	// Version overrides the default containerd version (e.g. "2.1.8").
 	Version string `json:"Version,omitempty"`
+
+	// SandboxImage overrides the CRI sandbox image used by containerd
+	// (e.g. "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9").
+	SandboxImage string `json:"SandboxImage,omitempty"`
 }
 
 // RuncConfig holds runc-specific overrides.

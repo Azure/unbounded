@@ -69,22 +69,12 @@ const (
 	// attempts (e.g. after a controller restart).
 	MachineConditionProvisioning = "Provisioning"
 
-	// MachineConditionRepaved indicates the state of a repave operation.
-	// Status is set to False (with Reason "Pending") when a repave begins,
-	// and True (with Reason "Succeeded") when the repave completes.
-	// The lastTransitionTime records when the repave started, which is
-	// used to detect stale repave attempts.
-	MachineConditionRepaved = "Repaved"
-
-	// MachineConditionCloudInitDone indicates whether cloud-init has
-	// finished on the machine. Status is True with Reason "Succeeded"
-	// when cloud-init completes without errors, False with Reason
-	// "Running" while cloud-init stages are still executing, and
-	// False with Reason "Failed" when a cloud-init stage reports a
-	// failure. On failure the message includes the stage name and the
-	// error result so that operators can diagnose the problem without
-	// logging into the machine.
-	MachineConditionCloudInitDone = "CloudInitDone"
+	// MachineConditionAgentBootstrapped indicates whether the unbounded
+	// agent completed initial node bootstrap. Status is False with Reason
+	// "Running" while the agent is preparing the nspawn node, False with
+	// a failure reason when nspawn startup or kubelet TLS bootstrap fails,
+	// and True with Reason "Succeeded" once the kubelet has bootstrapped.
+	MachineConditionAgentBootstrapped = "AgentBootstrapped"
 
 	// MachineConditionNodeUpdated indicates the result of a node
 	// update performed by the agent daemon. Status is True with
@@ -137,10 +127,6 @@ type MachineSpec struct {
 	// Agent contains settings for the unbounded node agent.
 	// +optional
 	Agent *AgentSpec `json:"agent,omitempty"`
-
-	// Operations contains counter-based operation triggers.
-	// +optional
-	Operations *OperationsSpec `json:"operations,omitempty"`
 
 	// Provider identifies the external control provider for this machine.
 	// +optional
@@ -228,7 +214,7 @@ type BastionSSHSpec struct {
 	PrivateKeyRef *SecretKeySelector `json:"privateKeyRef,omitempty"`
 }
 
-// DHCPLease defines a static DHCP lease for PXE booting.
+// DHCPLease defines static IPv4 provisioning network settings.
 type DHCPLease struct {
 	// IPv4 is the IP address to assign.
 	IPv4 string `json:"ipv4"`
@@ -268,14 +254,58 @@ type RedfishSpec struct {
 
 // PXESpec defines PXE boot configuration for a Machine.
 type PXESpec struct {
-	// Image is an OCI image reference containing netboot artifacts.
-	// Example: "ghcr.io/azure/images/host-ubuntu2404:v1"
+	// Image is an OCI image reference containing the machine disk image.
+	// The image must contain /disk/disk.img.gz.
+	// Example: "ghcr.io/azure/host-ubuntu2404:v1"
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
 
-	// DHCPLeases defines static DHCP leases for PXE booting.
+	// PullSecretRef references a Docker registry credential Secret used to pull
+	// Image. The Secret must be type kubernetes.io/dockerconfigjson or
+	// kubernetes.io/dockercfg.
+	// +optional
+	PullSecretRef *NamespacedSecretReference `json:"pullSecretRef,omitempty"`
+
+	// Architecture is the target CPU architecture for PXE boot artifacts and
+	// machine images.
+	// +kubebuilder:validation:Enum=amd64;arm64
+	// +kubebuilder:default=amd64
+	// +optional
+	Architecture string `json:"architecture,omitempty"`
+
+	// NetbootImage is an OCI image reference containing the PXE boot
+	// artifacts used to install Image. When omitted, metalman uses the
+	// default netboot image that corresponds to its release.
+	// +optional
+	NetbootImage string `json:"netbootImage,omitempty"`
+
+	// NetbootPullSecretRef references a Docker registry credential Secret used to
+	// pull NetbootImage. It is ignored when NetbootImage is omitted; metalman's
+	// configured default netboot pull secret is used for the default netboot image.
+	// The Secret must be type kubernetes.io/dockerconfigjson or
+	// kubernetes.io/dockercfg.
+	// +optional
+	NetbootPullSecretRef *NamespacedSecretReference `json:"netbootPullSecretRef,omitempty"`
+
+	// BootProtocol selects how metalman should trigger network boot for
+	// repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
+	// HTTP boot with a URL derived from the netboot image metadata.
+	// +kubebuilder:validation:Enum=PXE;HTTP
+	// +kubebuilder:default=PXE
+	// +optional
+	BootProtocol string `json:"bootProtocol,omitempty"`
+
+	// DHCPLeases defines static IPv4 provisioning network settings. PXE boot
+	// uses them as DHCP leases. HTTP boot uses the first entry to configure the
+	// Redfish UEFI HTTP boot client.
 	// +optional
 	DHCPLeases []DHCPLease `json:"dhcpLeases,omitempty"`
+
+	// TargetDisk is the block device the installer writes the machine image to.
+	// Examples: /dev/nvme0n1, /dev/sda, /dev/disk/by-id/...
+	// When omitted, the installer chooses a target disk automatically.
+	// +optional
+	TargetDisk string `json:"targetDisk,omitempty"`
 
 	// Redfish configures optional Redfish BMC access.
 	// +optional
@@ -285,6 +315,39 @@ type PXESpec struct {
 	// machines.
 	// +optional
 	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
+}
+
+const (
+	// PXEBootProtocolPXE uses DHCP/TFTP PXE boot.
+	PXEBootProtocolPXE = "PXE"
+	// PXEBootProtocolHTTP uses Redfish UEFI HTTP boot.
+	PXEBootProtocolHTTP = "HTTP"
+	// PXEArchitectureAMD64 is the x86_64 target architecture for PXE boot.
+	PXEArchitectureAMD64 = "amd64"
+	// PXEArchitectureARM64 is the aarch64 target architecture for PXE boot.
+	PXEArchitectureARM64 = "arm64"
+	// DefaultPXEArchitecture is used when spec.pxe.architecture is omitted.
+	DefaultPXEArchitecture = PXEArchitectureAMD64
+	// DefaultPXEBootProtocol is used when spec.pxe.bootProtocol is omitted.
+	DefaultPXEBootProtocol = PXEBootProtocolPXE
+)
+
+// TargetArchitecture returns the effective PXE target architecture.
+func (p *PXESpec) TargetArchitecture() string {
+	if p == nil || p.Architecture == "" {
+		return DefaultPXEArchitecture
+	}
+
+	return p.Architecture
+}
+
+// TargetBootProtocol returns the effective network boot protocol.
+func (p *PXESpec) TargetBootProtocol() string {
+	if p == nil || p.BootProtocol == "" {
+		return DefaultPXEBootProtocol
+	}
+
+	return p.BootProtocol
 }
 
 // CloudInitSpec defines cloud-init customization for PXE-booted machines.
@@ -433,21 +496,6 @@ type DownloadSource struct {
 	Version string `json:"version,omitempty"`
 }
 
-// OperationsSpec defines counter-based operation triggers.
-// Controllers compare spec counters against status counters to
-// determine if an operation is needed.
-type OperationsSpec struct {
-	// RebootCounter triggers a reboot when it exceeds the status
-	// reboot counter.
-	// +optional
-	RebootCounter int64 `json:"rebootCounter,omitempty"`
-
-	// RepaveCounter triggers a repave when it exceeds the status
-	// repave counter.
-	// +optional
-	RepaveCounter int64 `json:"repaveCounter,omitempty"`
-}
-
 // LocalObjectReference contains enough information to locate the referenced resource.
 type LocalObjectReference struct {
 	// Name of the referenced resource.
@@ -505,10 +553,6 @@ type MachineStatus struct {
 	// Agent holds the applied agent settings.
 	// +optional
 	Agent *AgentStatus `json:"agent,omitempty"`
-
-	// Operations holds the last-observed operation counters.
-	// +optional
-	Operations *OperationsStatus `json:"operations,omitempty"`
 
 	// Configuration records the MachineConfigurationVersion that was
 	// applied to this machine during the most recent provisioning.
@@ -572,13 +616,4 @@ type AgentStatus struct {
 	// Image is the OCI image reference that was applied to the
 	// nspawn machine.
 	Image string `json:"image,omitempty"`
-}
-
-// OperationsStatus holds the last-observed operation counters.
-type OperationsStatus struct {
-	// RebootCounter is the last reboot counter value that was acted on.
-	RebootCounter int64 `json:"rebootCounter,omitempty"`
-
-	// RepaveCounter is the last repave counter value that was acted on.
-	RepaveCounter int64 `json:"repaveCounter,omitempty"`
 }

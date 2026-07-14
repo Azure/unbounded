@@ -12,7 +12,7 @@ metadata:
     app.kubernetes.io/component: controller
 spec:
   type: ClusterIP
-  # No selector — EndpointSlice managed by the leader pod
+  # No selector - Endpoints and EndpointSlice are managed by the leader pod.
   ports:
     - name: https
       port: 9999

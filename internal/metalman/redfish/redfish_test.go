@@ -4,6 +4,7 @@
 package redfish
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -14,15 +15,15 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -35,18 +36,688 @@ func TestMain(m *testing.M) {
 
 const testToken = "test-auth-token"
 
-// testSessionAuth handles Redfish session creation, deletion, and
-// authentication for test BMC servers. Returns true if the request is
-// authenticated and should be processed further, or false if the response
-// has already been written (session lifecycle or auth failure).
+func TestRedfishRebootCycle(t *testing.T) {
+	srv, powerState, resetCalls, _ := testBMC(t)
+	client := dialTestClient(t, srv)
+
+	require.NoError(t, client.Reset(t.Context(), ResetForceOff))
+	require.Equal(t, int64(1), resetCalls.Load())
+	state, err := client.PowerState(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, PowerOff, state)
+
+	require.NoError(t, client.Reset(t.Context(), ResetOn))
+	require.Equal(t, int64(2), resetCalls.Load())
+	state, err = client.PowerState(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, PowerOn, state)
+	require.Equal(t, "On", powerState.Load().(string))
+}
+
+func TestRedfishPowerOnTimeoutRetry(t *testing.T) {
+	srv, _, resetCalls, _ := testBMC(t)
+	client := dialTestClient(t, srv)
+
+	require.NoError(t, client.Reset(t.Context(), ResetOn))
+	require.NoError(t, client.Reset(t.Context(), ResetOn))
+	require.Equal(t, int64(2), resetCalls.Load())
+}
+
+func TestRedfishForceOffTimeoutRetry(t *testing.T) {
+	srv, _, resetCalls, _ := testBMC(t)
+	client := dialTestClient(t, srv)
+
+	require.NoError(t, client.Reset(t.Context(), ResetForceOff))
+	require.NoError(t, client.Reset(t.Context(), ResetForceOff))
+	require.Equal(t, int64(2), resetCalls.Load())
+}
+
+func TestRedfishTLSCertPinning(t *testing.T) {
+	srv, _, _, _ := testBMC(t)
+	client, err := Dial(t.Context(), srv.URL, tlsServerFingerprint(srv), "admin", "secret", "System.Embedded.1")
+	require.NoError(t, err)
+	client.Close()
+
+	badClient := &Client{session: &bmcSession{httpClient: newHTTPClient(strings.Repeat("00:", 31) + "00"), baseURL: srv.URL, user: "admin", pass: "secret"}, deviceID: "System.Embedded.1"}
+	_, err = badClient.PowerState(t.Context())
+	require.Error(t, err)
+}
+
+func TestRedfishTOFUCertCapture(t *testing.T) {
+	srv, _, _, _ := testBMC(t)
+	scheme := testScheme(t)
+	machine := testMachine("node-tofu", srv.URL)
+	secret := testSecret()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(machine, secret).WithStatusSubresource(machine).Build()
+	reconciler := &Reconciler{Client: c, Pool: NewPool()}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: machine.Name}})
+	require.NoError(t, err)
+
+	var updated v1alpha3.Machine
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: machine.Name}, &updated))
+	require.NotNil(t, updated.Status.Redfish)
+	require.Equal(t, tlsServerFingerprint(srv), updated.Status.Redfish.CertFingerprint)
+}
+
+func TestRedfishExactlyOnceSemantics(t *testing.T) {
+	srv, _, resetCalls, _ := testBMC(t)
+	machine := testMachine("node-once", srv.URL)
+	machine.Status.Redfish = &v1alpha3.RedfishStatus{CertFingerprint: tlsServerFingerprint(srv)}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(machine, testSecret()).WithStatusSubresource(machine).Build()
+	reconciler := &Reconciler{Client: c, Pool: NewPool()}
+
+	for range 5 {
+		_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: machine.Name}})
+		require.NoError(t, err)
+	}
+
+	require.Equal(t, int64(0), resetCalls.Load())
+}
+
+func TestFormatFingerprint(t *testing.T) {
+	require.Equal(t, "ab:cd:ef:01", formatFingerprint([]byte{0xab, 0xcd, 0xef, 0x01}))
+}
+
+func TestBootOrderConfigPxeOn(t *testing.T) {
+	patch := requireBootPatch(t, func(ctx context.Context, c *Client) error {
+		return c.SetBootOverride(ctx, BootTargetPxe, BootContinuous)
+	})
+	require.Equal(t, "Pxe", patch["Boot"].(map[string]any)["BootSourceOverrideTarget"])
+	require.Equal(t, "Continuous", patch["Boot"].(map[string]any)["BootSourceOverrideEnabled"])
+}
+
+func TestBootOrderConfigPxeOff(t *testing.T) {
+	patch := requireBootPatch(t, func(ctx context.Context, c *Client) error { return c.DisableBootOverride(ctx) })
+	require.Equal(t, "Disabled", patch["Boot"].(map[string]any)["BootSourceOverrideEnabled"])
+}
+
+func TestBootOrderConfigUEFIHTTPOn(t *testing.T) {
+	patch := requireBootPatch(t, func(ctx context.Context, c *Client) error {
+		return c.SetHTTPBootOverride(ctx, "http://192.0.2.1/boot/grubx64.efi")
+	})
+	boot := patch["Boot"].(map[string]any)
+	require.Equal(t, "UefiHttp", boot["BootSourceOverrideTarget"])
+	require.Equal(t, "Continuous", boot["BootSourceOverrideEnabled"])
+	require.Equal(t, "UEFI", boot["BootSourceOverrideMode"])
+	require.Equal(t, "http://192.0.2.1/boot/grubx64.efi", boot["HttpBootUri"])
+}
+
+func TestClientGetBootConfigTracksHTTPBootURIFieldPresence(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"Boot": map[string]string{
+					"BootSourceOverrideTarget":  "Hdd",
+					"BootSourceOverrideEnabled": "Disabled",
+				},
+			})
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	config, err := client.GetBootConfig(t.Context())
+	require.NoError(t, err)
+	require.False(t, config.HasHTTPBootURI)
+}
+
+func TestBootOrderConfigUEFIHTTPNoOp(t *testing.T) { TestBootOrderConfigUEFIHTTPOn(t) }
+func TestUEFIHTTPBootEndToEnd(t *testing.T)        { TestBootOrderConfigUEFIHTTPOn(t) }
+func TestBootOrderConfigNoOp(t *testing.T)         { TestBootOrderConfigPxeOff(t) }
+func TestBootOrderConfigNoOpPxeOff(t *testing.T)   { TestBootOrderConfigPxeOff(t) }
+
+func TestBootOrderConfigPxeOffUnsupported(t *testing.T) {
+	var (
+		patchCalls  atomic.Int64
+		patchBodies []map[string]any
+	)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			writeSystem(w, "On")
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+
+			var body map[string]any
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			patchBodies = append(patchBodies, body)
+
+			if patchCalls.Load() == 1 {
+				http.Error(w, "unsupported", http.StatusBadRequest)
+				return
+			}
+
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	require.ErrorIs(t, client.DisableBootOverride(t.Context()), ErrUnsupported)
+	require.Equal(t, int64(1), patchCalls.Load())
+
+	boot := patchBodies[0]["Boot"].(map[string]any)
+	require.Equal(t, "Disabled", boot["BootSourceOverrideEnabled"])
+}
+
+func TestBootOrderConfigPxeOffDisableFallbackToHdd(t *testing.T) {
+	TestBootOrderConfigPxeOffUnsupported(t)
+}
+func TestBootOrderConfigNoOpPxeOffHdd(t *testing.T) { TestBootOrderConfigPxeOffUnsupported(t) }
+
+func TestBootOrderConfigUnsupported(t *testing.T) {
+	srv, _, _, _ := testBMCWithPatchStatus(t, http.StatusNotImplemented)
+	client := dialTestClient(t, srv)
+	require.ErrorIs(t, client.SetBootOverride(t.Context(), BootTargetPxe, BootContinuous), ErrUnsupported)
+}
+
+func TestBootOrderConfigUnsupportedDuringPOST(t *testing.T) { TestBootOrderConfigUnsupported(t) }
+
+func TestBootOrderConfigTransientError(t *testing.T) {
+	srv, _, _, _ := testBMCWithPatchStatus(t, http.StatusInternalServerError)
+	client := dialTestClient(t, srv)
+	require.Error(t, client.SetBootOverride(t.Context(), BootTargetPxe, BootContinuous))
+}
+
+func TestRedfishErrorIncludesFullResponseBody(t *testing.T) {
+	const responseBody = `{"error":{"message":"reset failed with detailed BMC diagnostics"}}`
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
+			http.Error(w, responseBody, http.StatusInternalServerError)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	err := client.Reset(t.Context(), ResetOn)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), responseBody)
+}
+
+func TestRedfishUnsupportedErrorIncludesFullResponseBody(t *testing.T) {
+	const responseBody = `{"error":{"message":"BootSourceOverrideTarget is not writable"}}`
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			http.Error(w, responseBody, http.StatusBadRequest)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	err := client.SetBootOverride(t.Context(), BootTargetPxe, BootContinuous)
+	require.ErrorIs(t, err, ErrUnsupported)
+	require.Contains(t, err.Error(), responseBody)
+}
+
+func TestClientSetBIOSHTTPBootURI(t *testing.T) {
+	var patchBody map[string]any
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/Bios/Settings"):
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&patchBody))
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	require.NoError(t, client.SetBIOSHTTPBootURI(t.Context(), "http://192.0.2.1/boot/shimx64.efi"))
+	require.Equal(t, "http://192.0.2.1/boot/shimx64.efi", patchBody["Attributes"].(map[string]any)["UrlBootFile"])
+}
+
+func TestClientSetBIOSStaticIPv4(t *testing.T) {
+	var patchBody map[string]any
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/Bios/Settings"):
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&patchBody))
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	require.NoError(t, client.SetBIOSStaticIPv4(t.Context(), StaticIPv4Config{
+		Address:    "10.0.0.20",
+		SubnetMask: "255.255.255.0",
+		Gateway:    "10.0.0.1",
+		DNS:        []string{"10.0.0.53", "10.0.0.54"},
+	}))
+
+	attributes := patchBody["Attributes"].(map[string]any)
+	require.Equal(t, "Disabled", attributes["Dhcpv4"])
+	require.Equal(t, "10.0.0.20", attributes["Ipv4Address"])
+	require.Equal(t, "255.255.255.0", attributes["Ipv4SubnetMask"])
+	require.Equal(t, "10.0.0.1", attributes["Ipv4Gateway"])
+	require.Equal(t, "10.0.0.53", attributes["Ipv4PrimaryDNS"])
+}
+
+func TestClientGetBIOSHTTPBootURI(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/Bios/Settings"):
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"Attributes": map[string]string{"UrlBootFile": "http://192.0.2.1/boot/shimx64.efi"},
+			}))
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	uri, err := client.GetBIOSHTTPBootURI(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "http://192.0.2.1/boot/shimx64.efi", uri)
+}
+
+func TestClientSetBIOSHTTPBootURIUnsupported(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/Bios/Settings"):
+			http.Error(w, "BIOS settings unsupported", http.StatusNotFound)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	require.ErrorIs(t, client.SetBIOSHTTPBootURI(t.Context(), "http://192.0.2.1/boot/shimx64.efi"), ErrUnsupported)
+}
+
+func TestClientSetHTTPBootOverrideUnsupportedDoesNotFallback(t *testing.T) {
+	var patchCalls atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+			http.Error(w, "HttpBootUri is not writable", http.StatusBadRequest)
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/Bios/Settings"):
+			t.Fatal("SetHTTPBootOverride should not write BIOS settings directly")
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	err := client.SetHTTPBootOverride(t.Context(), "http://192.0.2.1/boot/shimx64.efi")
+	require.ErrorIs(t, err, ErrUnsupported)
+	require.Equal(t, int64(1), patchCalls.Load())
+}
+
+func TestClientSetStaticIPv4ByMAC(t *testing.T) {
+	var patchBody map[string]any
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"EthernetInterfaces": map[string]string{
+					"@odata.id": "/redfish/v1/Systems/System.Embedded.1/EthernetInterfaces",
+				},
+			})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/EthernetInterfaces"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Members": []map[string]string{
+					{"@odata.id": "/redfish/v1/Systems/System.Embedded.1/EthernetInterfaces/NIC.1"},
+					{"@odata.id": "https://bmc.example.com/redfish/v1/Systems/System.Embedded.1/EthernetInterfaces/NIC.2"},
+				},
+			})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/EthernetInterfaces/NIC.1"):
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"MACAddress":          "00:11:22:33:44:55",
+				"PermanentMACAddress": "00:11:22:33:44:55",
+			})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/EthernetInterfaces/NIC.2"):
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"MACAddress":          "aa:bb:cc:dd:ee:01",
+				"PermanentMACAddress": "aa:bb:cc:dd:ee:ff",
+			})
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/EthernetInterfaces/NIC.2"):
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&patchBody))
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	require.NoError(t, client.SetStaticIPv4(t.Context(), StaticIPv4Config{
+		MAC:        "AA-BB-CC-DD-EE-01",
+		Address:    "10.0.0.20",
+		SubnetMask: "255.255.255.0",
+		Gateway:    "10.0.0.1",
+		DNS:        []string{"10.0.0.53", "10.0.0.54"},
+	}))
+
+	require.NotNil(t, patchBody)
+	dhcp := patchBody["DHCPv4"].(map[string]any)
+	require.Equal(t, false, dhcp["DHCPEnabled"])
+
+	addresses := patchBody["IPv4StaticAddresses"].([]any)
+	require.Len(t, addresses, 1)
+	address := addresses[0].(map[string]any)
+	require.Equal(t, "10.0.0.20", address["Address"])
+	require.Equal(t, "255.255.255.0", address["SubnetMask"])
+	require.Equal(t, "10.0.0.1", address["Gateway"])
+	require.Equal(t, []any{"10.0.0.53", "10.0.0.54"}, patchBody["StaticNameServers"])
+}
+
+func TestClientSetStaticIPv4MethodNotAllowedIsUnsupported(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"EthernetInterfaces": map[string]string{
+					"@odata.id": "/redfish/v1/Systems/System.Embedded.1/EthernetInterfaces",
+				},
+			})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/EthernetInterfaces"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Members": []map[string]string{{"@odata.id": "/redfish/v1/Systems/System.Embedded.1/EthernetInterfaces/NIC.1"}},
+			})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/EthernetInterfaces/NIC.1"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"MACAddress": "aa:bb:cc:dd:ee:01"})
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/EthernetInterfaces/NIC.1"):
+			http.Error(w, "PATCH is not supported for this iLO EthernetInterface", http.StatusMethodNotAllowed)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	err := client.SetStaticIPv4(t.Context(), StaticIPv4Config{
+		MAC:        "aa:bb:cc:dd:ee:01",
+		Address:    "10.0.0.20",
+		SubnetMask: "255.255.255.0",
+		Gateway:    "10.0.0.1",
+	})
+	require.ErrorIs(t, err, ErrUnsupported)
+	require.ErrorContains(t, err, "returned HTTP 405")
+}
+
+func TestRedfishPathFromODataIDResolvesRelativeReferences(t *testing.T) {
+	path, err := redfishPathFromODataID("../Chassis/1?expand=.", "/redfish/v1/Systems/System.Embedded.1")
+	require.NoError(t, err)
+	require.Equal(t, "/redfish/v1/Chassis/1?expand=.", path)
+}
+
+func TestValidateStaticIPv4ConfigAllowsIPv6DNS(t *testing.T) {
+	require.NoError(t, ValidateStaticIPv4Config(StaticIPv4Config{
+		Address:    "10.0.0.20",
+		SubnetMask: "255.255.255.0",
+		Gateway:    "10.0.0.1",
+		DNS:        []string{"10.0.0.53", "2001:db8::53"},
+	}))
+}
+
+func TestValidateStaticIPv4ConfigRejectsInvalidDNS(t *testing.T) {
+	err := ValidateStaticIPv4Config(StaticIPv4Config{
+		Address:    "10.0.0.20",
+		SubnetMask: "255.255.255.0",
+		Gateway:    "10.0.0.1",
+		DNS:        []string{"not-an-ip"},
+	})
+	require.ErrorContains(t, err, `invalid IP DNS server "not-an-ip"`)
+}
+
+func TestClientSetStaticIPv4NoMatchingMAC(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"PowerState": "On",
+				"EthernetInterfaces": map[string]string{
+					"@odata.id": "/redfish/v1/Systems/System.Embedded.1/EthernetInterfaces",
+				},
+			})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/EthernetInterfaces"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Members": []map[string]string{{"@odata.id": "/redfish/v1/Systems/System.Embedded.1/EthernetInterfaces/NIC.1"}},
+			})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1/EthernetInterfaces/NIC.1"):
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"MACAddress":          "00:11:22:33:44:55",
+				"PermanentMACAddress": "00:11:22:33:44:55",
+			})
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/EthernetInterfaces/"):
+			t.Fatal("SetStaticIPv4 should not PATCH when no MAC matches")
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	err := client.SetStaticIPv4(t.Context(), StaticIPv4Config{
+		MAC:        "aa:bb:cc:dd:ee:01",
+		Address:    "10.0.0.20",
+		SubnetMask: "255.255.255.0",
+		Gateway:    "10.0.0.1",
+	})
+	require.ErrorContains(t, err, "no Redfish Ethernet interface found for MAC aa:bb:cc:dd:ee:01")
+}
+
+func TestSessionExpiryRetry(t *testing.T) {
+	var sessions atomic.Int64
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/SessionService/Sessions") {
+			sessions.Add(1)
+		}
+
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			writeSystem(w, "On")
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	_, err := client.PowerState(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, int64(1), sessions.Load())
+}
+
+func testBMC(t *testing.T) (*httptest.Server, *atomic.Value, *atomic.Int64, *atomic.Int64) {
+	t.Helper()
+
+	return testBMCWithPatchStatus(t, http.StatusOK)
+}
+
+func testBMCWithPatchStatus(t *testing.T, patchStatus int) (*httptest.Server, *atomic.Value, *atomic.Int64, *atomic.Int64) {
+	t.Helper()
+
+	var powerState atomic.Value
+	powerState.Store("On")
+
+	var (
+		resetCalls atomic.Int64
+		patchCalls atomic.Int64
+	)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			writeSystem(w, powerState.Load().(string))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
+			var body struct{ ResetType string }
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			resetCalls.Add(1)
+
+			switch body.ResetType {
+			case string(ResetForceOff):
+				powerState.Store("Off")
+			case string(ResetOn), string(ResetForceRestart):
+				powerState.Store("On")
+			}
+
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			patchCalls.Add(1)
+			w.WriteHeader(patchStatus)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	return srv, &powerState, &resetCalls, &patchCalls
+}
+
+func requireBootPatch(t *testing.T, action func(context.Context, *Client) error) map[string]any {
+	t.Helper()
+
+	var patchBody map[string]any
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !testSessionAuth(w, r) {
+			return
+		}
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			writeSystem(w, "On")
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&patchBody))
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/TrustedComponents"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := dialTestClient(t, srv)
+	require.NoError(t, action(t.Context(), client))
+	require.NotNil(t, patchBody)
+
+	return patchBody
+}
+
 func testSessionAuth(w http.ResponseWriter, r *http.Request) bool {
 	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/SessionService/Sessions") {
 		var body struct {
-			UserName string `json:"UserName"`
-			Password string `json:"Password"`
+			UserName string
+			Password string
 		}
-		json.NewDecoder(r.Body).Decode(&body)
 
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body.UserName != "admin" || body.Password != "secret" {
 			http.Error(w, "bad credentials", http.StatusUnauthorized)
 			return false
@@ -78,1647 +749,57 @@ func testSessionAuth(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
-func TestRedfishRebootCycle(t *testing.T) {
-	var powerState atomic.Value
-	powerState.Store("On")
+func writeSystem(w http.ResponseWriter, powerState string) {
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"PowerState": powerState,
+		"Boot": map[string]string{
+			"BootSourceOverrideTarget":  "Hdd",
+			"BootSourceOverrideEnabled": "Disabled",
+		},
+		"Links": map[string]any{
+			"Chassis": []map[string]any{{"@odata.id": "/redfish/v1/Chassis/1"}},
+		},
+	})
+}
 
-	var forceOffCalls, onCalls atomic.Int64
+func dialTestClient(t *testing.T, srv *httptest.Server) *Client {
+	t.Helper()
 
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !testSessionAuth(w, r) {
-			return
-		}
+	client, err := Dial(t.Context(), srv.URL, tlsServerFingerprint(srv), "admin", "secret", "System.Embedded.1")
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
 
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewEncoder(w).Encode(map[string]any{
-				"PowerState": powerState.Load().(string),
-				"Boot": map[string]string{
-					"BootSourceOverrideTarget":  "Pxe",
-					"BootSourceOverrideEnabled": "Continuous",
-				},
-				"Links": map[string]any{
-					"Chassis": []map[string]any{
-						{"@odata.id": "/redfish/v1/Chassis/Chassis.Embedded.1"},
-					},
-				},
-			})
+	return client
+}
 
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
-			var body struct {
-				ResetType string `json:"ResetType"`
-			}
-			json.NewDecoder(r.Body).Decode(&body)
+func tlsServerFingerprint(srv *httptest.Server) string {
+	cert := srv.Certificate()
+	sum := sha256.Sum256(cert.Raw)
 
-			switch body.ResetType {
-			case "ForceOff":
-				forceOffCalls.Add(1)
-				powerState.Store("Off")
-			case "On":
-				onCalls.Add(1)
-				powerState.Store("On")
-			}
+	return formatFingerprint(sum[:])
+}
 
-			w.WriteHeader(http.StatusOK)
-
-		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/TrustedComponents"):
-			http.NotFound(w, r)
-
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-01", Namespace: "default"},
+func testMachine(name, url string) *v1alpha3.Machine {
+	return &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f0", IPv4: "10.0.0.1", SubnetMask: "255.255.255.0"}},
+				Image: "ghcr.io/test/image:v1",
 				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
-					Username:    "admin",
-					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
-				},
-			},
-			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter: 1,
-				RepaveCounter: 1,
-			},
-		},
-		Status: v1alpha3.MachineStatus{
-			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-01", Namespace: "default"}}
-
-	// First reconcile: machine is On, should send ForceOff and set
-	// PoweredOff=False with Reason=PoweringOff.
-	var updated v1alpha3.Machine
-
-	_, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile 1: %v", err)
-	}
-
-	if forceOffCalls.Load() != 1 {
-		t.Fatalf("expected 1 ForceOff call, got %d", forceOffCalls.Load())
-	}
-
-	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
-		t.Fatal(err)
-	}
-
-	poweredOffCond := meta.FindStatusCondition(updated.Status.Conditions, condPoweredOff)
-	if poweredOffCond == nil || poweredOffCond.Status != metav1.ConditionFalse || poweredOffCond.Reason != "PoweringOff" {
-		t.Fatalf("expected PoweredOff=False/PoweringOff, got %+v", poweredOffCond)
-	}
-
-	// Second reconcile: machine still not off - should NOT send ForceOff again,
-	// just requeue.
-	powerState.Store("On")
-
-	result, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile 2: %v", err)
-	}
-
-	if forceOffCalls.Load() != 1 {
-		t.Fatalf("expected no additional ForceOff call, got %d", forceOffCalls.Load())
-	}
-
-	if result.RequeueAfter == 0 {
-		t.Fatal("expected requeue while waiting for power off")
-	}
-
-	// Third reconcile: machine is now Off, should set PoweredOff=True.
-	powerState.Store("Off")
-
-	_, err = reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile 3: %v", err)
-	}
-
-	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
-		t.Fatal(err)
-	}
-
-	if !meta.IsStatusConditionTrue(updated.Status.Conditions, condPoweredOff) {
-		t.Fatal("expected PoweredOff=True after ForceOff completed")
-	}
-
-	// Fourth reconcile: PoweredOff is True, machine still Off, should send On
-	// and update condition reason to PoweringOn.
-	powerState.Store("Off")
-
-	_, err = reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile 4: %v", err)
-	}
-
-	if onCalls.Load() != 1 {
-		t.Fatalf("expected 1 On call, got %d", onCalls.Load())
-	}
-
-	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
-		t.Fatal(err)
-	}
-
-	if !meta.IsStatusConditionTrue(updated.Status.Conditions, condPoweredOff) {
-		t.Fatal("expected PoweredOff=True to persist after sending On")
-	}
-
-	poweredOffCond = meta.FindStatusCondition(updated.Status.Conditions, condPoweredOff)
-	if poweredOffCond == nil || poweredOffCond.Reason != "PoweringOn" {
-		t.Fatalf("expected PoweredOff reason=PoweringOn, got %+v", poweredOffCond)
-	}
-
-	// Fifth reconcile: machine still Off but On was already sent - should not
-	// send On again, just requeue.
-	powerState.Store("Off")
-
-	result, err = reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile 5: %v", err)
-	}
-
-	if onCalls.Load() != 1 {
-		t.Fatalf("expected no additional On call, got %d", onCalls.Load())
-	}
-
-	if result.RequeueAfter == 0 {
-		t.Fatal("expected requeue while waiting for power on")
-	}
-
-	// Simulate machine completing power-on.
-	powerState.Store("On")
-
-	// Sixth reconcile: machine is On + PoweredOff=True, clear condition and increment reboots.
-	_, err = reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile 6: %v", err)
-	}
-
-	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
-		t.Fatal(err)
-	}
-
-	if meta.IsStatusConditionTrue(updated.Status.Conditions, condPoweredOff) {
-		t.Fatal("expected PoweredOff to be cleared after verifying power On")
-	}
-
-	if updated.Status.Operations == nil || updated.Status.Operations.RebootCounter != 1 {
-		var got int64
-		if updated.Status.Operations != nil {
-			got = updated.Status.Operations.RebootCounter
-		}
-
-		t.Fatalf("expected operations.rebootCounter=1, got %d", got)
-	}
-
-	repavedCond := meta.FindStatusCondition(updated.Status.Conditions, condRepaved)
-	if repavedCond == nil || repavedCond.Status != metav1.ConditionFalse || repavedCond.Reason != "Pending" {
-		t.Fatalf("expected Repaved=False/Pending, got %+v", repavedCond)
-	}
-
-	if repavedCond.Message != "image=ghcr.io/test/test-image:v1" {
-		t.Fatalf("expected Repaved message 'image=ghcr.io/test/test-image:v1', got %q", repavedCond.Message)
-	}
-
-	// Seventh reconcile: reboots match - no-op (timeout is handled by the
-	// lifecycle controller, not the redfish reconciler).
-	prevForceOff := forceOffCalls.Load()
-	prevOn := onCalls.Load()
-
-	_, err = reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile 7: %v", err)
-	}
-
-	if forceOffCalls.Load() != prevForceOff || onCalls.Load() != prevOn {
-		t.Fatal("expected no additional Redfish calls after reboot completed")
-	}
-}
-
-func TestRedfishPowerOnTimeoutRetry(t *testing.T) {
-	var powerState atomic.Value
-	powerState.Store("Off")
-
-	var onCalls atomic.Int64
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !testSessionAuth(w, r) {
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewEncoder(w).Encode(map[string]any{
-				"PowerState": powerState.Load().(string),
-				"Boot": map[string]string{
-					"BootSourceOverrideTarget":  "Pxe",
-					"BootSourceOverrideEnabled": "Continuous",
-				},
-				"Links": map[string]any{
-					"Chassis": []map[string]any{
-						{"@odata.id": "/redfish/v1/Chassis/Chassis.Embedded.1"},
-					},
-				},
-			})
-
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
-			var body struct {
-				ResetType string `json:"ResetType"`
-			}
-			json.NewDecoder(r.Body).Decode(&body)
-
-			if body.ResetType == "On" {
-				onCalls.Add(1)
-			}
-
-			w.WriteHeader(http.StatusOK)
-
-		case strings.Contains(r.URL.Path, "/TrustedComponents"):
-			http.NotFound(w, r)
-
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	// Machine is stuck in PoweringOn state with a stale LastTransitionTime
-	// that exceeds powerActionTimeout - this reproduces the deadlock from
-	// bug.yaml where the On command was lost and never retried.
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-stuck", Namespace: "default"},
-		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f5", IPv4: "10.0.0.6", SubnetMask: "255.255.255.0"}},
-				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
-					Username:    "admin",
-					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
-				},
-			},
-			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter: 22,
-				RepaveCounter: 22,
-			},
-		},
-		Status: v1alpha3.MachineStatus{
-			Redfish:    &v1alpha3.RedfishStatus{CertFingerprint: fp},
-			Operations: &v1alpha3.OperationsStatus{RebootCounter: 21, RepaveCounter: 20},
-			Conditions: []metav1.Condition{
-				{
-					Type:               condPoweredOff,
-					Status:             metav1.ConditionTrue,
-					Reason:             "PoweringOn",
-					Message:            "target reboots: 22",
-					LastTransitionTime: metav1.NewTime(time.Now().Add(-48 * time.Hour)),
-				},
-			},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-stuck", Namespace: "default"}}
-
-	// Reconcile should detect the timeout and retry the On command instead
-	// of silently requeueing forever.
-	_, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	if onCalls.Load() != 1 {
-		t.Fatalf("expected On command to be retried after timeout, got %d calls", onCalls.Load())
-	}
-
-	var updated v1alpha3.Machine
-	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
-		t.Fatal(err)
-	}
-
-	cond := meta.FindStatusCondition(updated.Status.Conditions, condPoweredOff)
-	if cond == nil {
-		t.Fatal("expected PoweredOff condition to exist after retry")
-	}
-
-	if cond.Reason != "PoweringOn" {
-		t.Fatalf("expected reason PoweringOn, got %s", cond.Reason)
-	}
-
-	// LastTransitionTime should have been reset (much more recent than the
-	// stale 48-hour-old timestamp).
-	if time.Since(cond.LastTransitionTime.Time) > time.Minute {
-		t.Fatalf("expected LastTransitionTime to be reset, but it is %v old", time.Since(cond.LastTransitionTime.Time))
-	}
-}
-
-func TestRedfishForceOffTimeoutRetry(t *testing.T) {
-	var powerState atomic.Value
-	powerState.Store("On")
-
-	var forceOffCalls atomic.Int64
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !testSessionAuth(w, r) {
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewEncoder(w).Encode(map[string]any{
-				"PowerState": powerState.Load().(string),
-				"Boot": map[string]string{
-					"BootSourceOverrideTarget":  "Pxe",
-					"BootSourceOverrideEnabled": "Continuous",
-				},
-				"Links": map[string]any{
-					"Chassis": []map[string]any{
-						{"@odata.id": "/redfish/v1/Chassis/Chassis.Embedded.1"},
-					},
-				},
-			})
-
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
-			var body struct {
-				ResetType string `json:"ResetType"`
-			}
-			json.NewDecoder(r.Body).Decode(&body)
-
-			if body.ResetType == "ForceOff" {
-				forceOffCalls.Add(1)
-			}
-
-			w.WriteHeader(http.StatusOK)
-
-		case strings.Contains(r.URL.Path, "/TrustedComponents"):
-			http.NotFound(w, r)
-
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	// Machine is stuck in PoweringOff state with a stale LastTransitionTime.
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-stuck-off", Namespace: "default"},
-		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f6", IPv4: "10.0.0.7", SubnetMask: "255.255.255.0"}},
-				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
-					Username:    "admin",
-					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
-				},
-			},
-			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter: 1,
-			},
-		},
-		Status: v1alpha3.MachineStatus{
-			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
-			Conditions: []metav1.Condition{
-				{
-					Type:               condPoweredOff,
-					Status:             metav1.ConditionFalse,
-					Reason:             "PoweringOff",
-					Message:            "target reboots: 1",
-					LastTransitionTime: metav1.NewTime(time.Now().Add(-10 * time.Minute)),
-				},
-				{
-					Type:   condBootSupported,
-					Status: metav1.ConditionFalse,
-					Reason: "NotSupported",
-				},
-			},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-stuck-off", Namespace: "default"}}
-
-	// Reconcile should detect the timeout and retry the ForceOff command.
-	_, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	if forceOffCalls.Load() != 1 {
-		t.Fatalf("expected ForceOff to be retried after timeout, got %d calls", forceOffCalls.Load())
-	}
-
-	var updated v1alpha3.Machine
-	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
-		t.Fatal(err)
-	}
-
-	cond := meta.FindStatusCondition(updated.Status.Conditions, condPoweredOff)
-	if cond == nil {
-		t.Fatal("expected PoweredOff condition to exist after retry")
-	}
-
-	if cond.Reason != "PoweringOff" {
-		t.Fatalf("expected reason PoweringOff, got %s", cond.Reason)
-	}
-
-	if time.Since(cond.LastTransitionTime.Time) > time.Minute {
-		t.Fatalf("expected LastTransitionTime to be reset, but it is %v old", time.Since(cond.LastTransitionTime.Time))
-	}
-}
-
-func TestRedfishTLSCertPinning(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]string{"PowerState": "On"})
-	}))
-	defer srv.Close()
-
-	wrongFP := formatFingerprint(make([]byte, 32))
-	s := &bmcSession{
-		httpClient: newHTTPClient(wrongFP),
-		baseURL:    srv.URL,
-	}
-
-	_, _, err := s.do(t.Context(), http.MethodGet, "/redfish/v1/Systems/1", nil)
-	if err == nil {
-		t.Fatal("expected TLS cert pinning error, got nil")
-	}
-
-	if !strings.Contains(err.Error(), "mismatch") {
-		t.Fatalf("expected mismatch error, got: %v", err)
-	}
-}
-
-func TestRedfishTOFUCertCapture(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	expectedFP := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-tofu", Namespace: "default"},
-		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f1", IPv4: "10.0.0.2", SubnetMask: "255.255.255.0"}},
-				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
-					Username:    "admin",
-					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
-				},
-			},
-			Operations: &v1alpha3.OperationsSpec{
-				RepaveCounter: 1,
-			},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-tofu", Namespace: "default"}}
-
-	_, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	var updated v1alpha3.Machine
-	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
-		t.Fatal(err)
-	}
-
-	if updated.Status.Redfish == nil || updated.Status.Redfish.CertFingerprint == "" {
-		t.Fatal("expected TLS cert fingerprint to be populated after TOFU")
-	}
-
-	if updated.Status.Redfish.CertFingerprint != expectedFP {
-		t.Fatalf("fingerprint mismatch: got %s, want %s", updated.Status.Redfish.CertFingerprint, expectedFP)
-	}
-}
-
-func TestRedfishExactlyOnceSemantics(t *testing.T) {
-	var resetCalls atomic.Int64
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !testSessionAuth(w, r) {
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewEncoder(w).Encode(map[string]string{"PowerState": "On"})
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/Actions/ComputerSystem.Reset"):
-			resetCalls.Add(1)
-			w.WriteHeader(http.StatusOK)
-		case strings.Contains(r.URL.Path, "/TrustedComponents"):
-			http.NotFound(w, r)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-once", Namespace: "default"},
-		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f4", IPv4: "10.0.0.5", SubnetMask: "255.255.255.0"}},
-				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
-					Username:    "admin",
-					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
-				},
-			},
-			Operations: &v1alpha3.OperationsSpec{
-				RebootCounter: 3,
-				RepaveCounter: 1,
-			},
-		},
-		Status: v1alpha3.MachineStatus{
-			Redfish:    &v1alpha3.RedfishStatus{CertFingerprint: fp},
-			Operations: &v1alpha3.OperationsStatus{RebootCounter: 3},
-			Conditions: []metav1.Condition{
-				{
-					Type:   condBootSupported,
-					Status: metav1.ConditionFalse,
-					Reason: "NotSupported",
-				},
-			},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-once", Namespace: "default"}}
-
-	for i := range 5 {
-		_, err := reconciler.Reconcile(ctx, req)
-		if err != nil {
-			t.Fatalf("reconcile %d: %v", i, err)
-		}
-	}
-
-	if resetCalls.Load() != 0 {
-		t.Fatalf("expected 0 reset calls when reboots == observedReboots, got %d", resetCalls.Load())
-	}
-}
-
-func TestFormatFingerprint(t *testing.T) {
-	input := []byte{0xab, 0xcd, 0xef, 0x01}
-	got := formatFingerprint(input)
-
-	want := "ab:cd:ef:01"
-	if got != want {
-		t.Fatalf("FormatFingerprint = %q, want %q", got, want)
-	}
-}
-
-func TestBootOrderConfigPxeOn(t *testing.T) {
-	var (
-		patchCalls atomic.Int64
-		patchBody  map[string]any
-	)
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !testSessionAuth(w, r) {
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewEncoder(w).Encode(map[string]any{
-				"PowerState": "On",
-				"Boot": map[string]string{
-					"BootSourceOverrideTarget":  "Hdd",
-					"BootSourceOverrideEnabled": "Once",
-				},
-				"Links": map[string]any{
-					"Chassis": []map[string]any{
-						{"@odata.id": "/redfish/v1/Chassis/1"},
-					},
-				},
-			})
-
-		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			patchCalls.Add(1)
-			json.NewDecoder(r.Body).Decode(&patchBody)
-			w.WriteHeader(http.StatusOK)
-
-		case strings.Contains(r.URL.Path, "/TrustedComponents"):
-			http.NotFound(w, r)
-
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-pxe", Namespace: "default"},
-		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b0", IPv4: "10.0.0.30", SubnetMask: "255.255.255.0"}},
-				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
-					Username:    "admin",
-					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
-				},
-			},
-			Operations: &v1alpha3.OperationsSpec{
-				RepaveCounter: 1,
-			},
-		},
-		Status: v1alpha3.MachineStatus{
-			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-pxe", Namespace: "default"}}
-
-	_, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	if patchCalls.Load() != 1 {
-		t.Fatalf("expected 1 PATCH call, got %d", patchCalls.Load())
-	}
-
-	boot, ok := patchBody["Boot"].(map[string]any)
-	if !ok {
-		t.Fatal("expected Boot in PATCH body")
-	}
-
-	if boot["BootSourceOverrideTarget"] != "Pxe" {
-		t.Fatalf("expected BootSourceOverrideTarget=Pxe, got %v", boot["BootSourceOverrideTarget"])
-	}
-
-	if boot["BootSourceOverrideEnabled"] != "Continuous" {
-		t.Fatalf("expected BootSourceOverrideEnabled=Continuous, got %v", boot["BootSourceOverrideEnabled"])
-	}
-}
-
-func TestBootOrderConfigPxeOff(t *testing.T) {
-	var (
-		patchCalls atomic.Int64
-		patchBody  map[string]any
-	)
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !testSessionAuth(w, r) {
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewEncoder(w).Encode(map[string]any{
-				"PowerState": "On",
-				"Boot": map[string]string{
-					"BootSourceOverrideTarget":  "Pxe",
-					"BootSourceOverrideEnabled": "Continuous",
-				},
-				"Links": map[string]any{
-					"Chassis": []map[string]any{
-						{"@odata.id": "/redfish/v1/Chassis/1"},
-					},
-				},
-			})
-
-		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			patchCalls.Add(1)
-			json.NewDecoder(r.Body).Decode(&patchBody)
-			w.WriteHeader(http.StatusOK)
-
-		case strings.Contains(r.URL.Path, "/TrustedComponents"):
-			http.NotFound(w, r)
-
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-hdd", Namespace: "default"},
-		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b1", IPv4: "10.0.0.31", SubnetMask: "255.255.255.0"}},
-				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
+					URL:         url,
 					Username:    "admin",
 					DeviceID:    "System.Embedded.1",
 					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
 				},
 			},
 		},
-		Status: v1alpha3.MachineStatus{
-			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-hdd", Namespace: "default"}}
-
-	_, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	if patchCalls.Load() != 1 {
-		t.Fatalf("expected 1 PATCH call, got %d", patchCalls.Load())
-	}
-
-	boot, ok := patchBody["Boot"].(map[string]any)
-	if !ok {
-		t.Fatal("expected Boot in PATCH body")
-	}
-
-	if _, hasTarget := boot["BootSourceOverrideTarget"]; hasTarget {
-		t.Fatalf("expected no BootSourceOverrideTarget, got %v", boot["BootSourceOverrideTarget"])
-	}
-
-	if boot["BootSourceOverrideEnabled"] != "Disabled" {
-		t.Fatalf("expected BootSourceOverrideEnabled=Disabled, got %v", boot["BootSourceOverrideEnabled"])
 	}
 }
 
-func TestBootOrderConfigNoOp(t *testing.T) {
-	var patchCalls atomic.Int64
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !testSessionAuth(w, r) {
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewEncoder(w).Encode(map[string]any{
-				"PowerState": "On",
-				"Boot": map[string]string{
-					"BootSourceOverrideTarget":  "Pxe",
-					"BootSourceOverrideEnabled": "Continuous",
-				},
-				"Links": map[string]any{
-					"Chassis": []map[string]any{
-						{"@odata.id": "/redfish/v1/Chassis/1"},
-					},
-				},
-			})
-
-		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			patchCalls.Add(1)
-			w.WriteHeader(http.StatusOK)
-
-		case strings.Contains(r.URL.Path, "/TrustedComponents"):
-			http.NotFound(w, r)
-
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
+func testSecret() *corev1.Secret {
+	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
 		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-noop", Namespace: "default"},
-		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b2", IPv4: "10.0.0.32", SubnetMask: "255.255.255.0"}},
-				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
-					Username:    "admin",
-					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
-				},
-			},
-			Operations: &v1alpha3.OperationsSpec{
-				RepaveCounter: 1,
-			},
-		},
-		Status: v1alpha3.MachineStatus{
-			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-noop", Namespace: "default"}}
-
-	_, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	if patchCalls.Load() != 0 {
-		t.Fatalf("expected 0 PATCH calls for no-op, got %d", patchCalls.Load())
-	}
-}
-
-func TestBootOrderConfigNoOpPxeOff(t *testing.T) {
-	var patchCalls atomic.Int64
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !testSessionAuth(w, r) {
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewEncoder(w).Encode(map[string]any{
-				"PowerState": "On",
-				"Boot": map[string]string{
-					"BootSourceOverrideTarget":  "None",
-					"BootSourceOverrideEnabled": "Disabled",
-				},
-				"Links": map[string]any{
-					"Chassis": []map[string]any{
-						{"@odata.id": "/redfish/v1/Chassis/1"},
-					},
-				},
-			})
-
-		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			patchCalls.Add(1)
-			w.WriteHeader(http.StatusOK)
-
-		case strings.Contains(r.URL.Path, "/TrustedComponents"):
-			http.NotFound(w, r)
-
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-noop-off", Namespace: "default"},
-		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b5", IPv4: "10.0.0.35", SubnetMask: "255.255.255.0"}},
-				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
-					Username:    "admin",
-					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
-				},
-			},
-		},
-		Status: v1alpha3.MachineStatus{
-			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-noop-off", Namespace: "default"}}
-
-	_, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	if patchCalls.Load() != 0 {
-		t.Fatalf("expected 0 PATCH calls for no-op, got %d", patchCalls.Load())
-	}
-}
-
-func TestBootOrderConfigPxeOffDisableFallbackToHdd(t *testing.T) {
-	var (
-		patchCalls    atomic.Int64
-		lastPatchBody map[string]any
-	)
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !testSessionAuth(w, r) {
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewEncoder(w).Encode(map[string]any{
-				"PowerState": "On",
-				"Boot": map[string]string{
-					"BootSourceOverrideTarget":  "Pxe",
-					"BootSourceOverrideEnabled": "Continuous",
-				},
-				"Links": map[string]any{
-					"Chassis": []map[string]any{
-						{"@odata.id": "/redfish/v1/Chassis/1"},
-					},
-				},
-			})
-
-		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			patchCalls.Add(1)
-
-			var body map[string]any
-			json.NewDecoder(r.Body).Decode(&body)
-			lastPatchBody = body
-
-			boot, _ := body["Boot"].(map[string]any)
-			if boot["BootSourceOverrideEnabled"] == "Disabled" {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			w.WriteHeader(http.StatusOK)
-
-		case strings.Contains(r.URL.Path, "/TrustedComponents"):
-			http.NotFound(w, r)
-
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-fallback", Namespace: "default"},
-		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b6", IPv4: "10.0.0.36", SubnetMask: "255.255.255.0"}},
-				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
-					Username:    "admin",
-					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
-				},
-			},
-		},
-		Status: v1alpha3.MachineStatus{
-			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-fallback", Namespace: "default"}}
-
-	_, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	if patchCalls.Load() != 2 {
-		t.Fatalf("expected 2 PATCH calls (Disabled then Hdd fallback), got %d", patchCalls.Load())
-	}
-
-	boot, ok := lastPatchBody["Boot"].(map[string]any)
-	if !ok {
-		t.Fatal("expected Boot in last PATCH body")
-	}
-
-	if boot["BootSourceOverrideTarget"] != "Hdd" {
-		t.Fatalf("expected fallback BootSourceOverrideTarget=Hdd, got %v", boot["BootSourceOverrideTarget"])
-	}
-
-	if boot["BootSourceOverrideEnabled"] != "Continuous" {
-		t.Fatalf("expected fallback BootSourceOverrideEnabled=Continuous, got %v", boot["BootSourceOverrideEnabled"])
-	}
-}
-
-func TestBootOrderConfigNoOpPxeOffHdd(t *testing.T) {
-	var patchCalls atomic.Int64
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !testSessionAuth(w, r) {
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewEncoder(w).Encode(map[string]any{
-				"PowerState": "On",
-				"Boot": map[string]string{
-					"BootSourceOverrideTarget":  "Hdd",
-					"BootSourceOverrideEnabled": "Continuous",
-				},
-				"Links": map[string]any{
-					"Chassis": []map[string]any{
-						{"@odata.id": "/redfish/v1/Chassis/1"},
-					},
-				},
-			})
-
-		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			patchCalls.Add(1)
-			w.WriteHeader(http.StatusOK)
-
-		case strings.Contains(r.URL.Path, "/TrustedComponents"):
-			http.NotFound(w, r)
-
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-noop-hdd", Namespace: "default"},
-		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b7", IPv4: "10.0.0.37", SubnetMask: "255.255.255.0"}},
-				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
-					Username:    "admin",
-					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
-				},
-			},
-		},
-		Status: v1alpha3.MachineStatus{
-			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-noop-hdd", Namespace: "default"}}
-
-	_, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	if patchCalls.Load() != 0 {
-		t.Fatalf("expected 0 PATCH calls for Hdd+Continuous no-op, got %d", patchCalls.Load())
-	}
-}
-
-func TestBootOrderConfigUnsupported(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !testSessionAuth(w, r) {
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewEncoder(w).Encode(map[string]any{
-				"PowerState": "On",
-				"Boot": map[string]string{
-					"BootSourceOverrideTarget":  "None",
-					"BootSourceOverrideEnabled": "Disabled",
-				},
-				"Links": map[string]any{
-					"Chassis": []map[string]any{
-						{"@odata.id": "/redfish/v1/Chassis/1"},
-					},
-				},
-			})
-
-		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			http.NotFound(w, r)
-
-		case strings.Contains(r.URL.Path, "/TrustedComponents"):
-			http.NotFound(w, r)
-
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-unsup", Namespace: "default"},
-		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b3", IPv4: "10.0.0.33", SubnetMask: "255.255.255.0"}},
-				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
-					Username:    "admin",
-					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
-				},
-			},
-			Operations: &v1alpha3.OperationsSpec{
-				RepaveCounter: 1,
-			},
-		},
-		Status: v1alpha3.MachineStatus{
-			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-unsup", Namespace: "default"}}
-
-	_, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	var updated v1alpha3.Machine
-	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
-		t.Fatal(err)
-	}
-
-	bootCond := meta.FindStatusCondition(updated.Status.Conditions, condBootSupported)
-	if bootCond == nil {
-		t.Fatal("expected BootOrderConfigSupported condition to be set")
-	}
-
-	if bootCond.Status != metav1.ConditionFalse {
-		t.Fatalf("expected BootOrderConfigSupported=False, got %s", bootCond.Status)
-	}
-
-	if bootCond.Reason != "NotSupported" {
-		t.Fatalf("expected reason NotSupported, got %s", bootCond.Reason)
-	}
-}
-
-func TestBootOrderConfigUnsupportedDuringPOST(t *testing.T) {
-	var powerState atomic.Value
-	powerState.Store("PoweringOn")
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !testSessionAuth(w, r) {
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewEncoder(w).Encode(map[string]any{
-				"PowerState": powerState.Load().(string),
-				"Boot": map[string]string{
-					"BootSourceOverrideTarget":  "None",
-					"BootSourceOverrideEnabled": "Disabled",
-				},
-				"Links": map[string]any{
-					"Chassis": []map[string]any{
-						{"@odata.id": "/redfish/v1/Chassis/1"},
-					},
-				},
-			})
-
-		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			http.NotFound(w, r)
-
-		case strings.Contains(r.URL.Path, "/TrustedComponents"):
-			http.NotFound(w, r)
-
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-post", Namespace: "default"},
-		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b8", IPv4: "10.0.0.38", SubnetMask: "255.255.255.0"}},
-				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
-					Username:    "admin",
-					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
-				},
-			},
-			Operations: &v1alpha3.OperationsSpec{
-				RepaveCounter: 1,
-			},
-		},
-		Status: v1alpha3.MachineStatus{
-			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-post", Namespace: "default"}}
-
-	// First reconcile: system is POSTing (PoweringOn), boot order PATCH
-	// returns 404. Should NOT set the unsupported condition - just requeue.
-	result, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile 1: %v", err)
-	}
-
-	if result.RequeueAfter == 0 {
-		t.Fatal("expected requeue while system is in transient power state")
-	}
-
-	var updated v1alpha3.Machine
-	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
-		t.Fatal(err)
-	}
-
-	bootCond := meta.FindStatusCondition(updated.Status.Conditions, condBootSupported)
-	if bootCond != nil {
-		t.Fatalf("expected BootOrderConfigSupported condition NOT to be set during POST, got %+v", bootCond)
-	}
-
-	// Simulate POST completing - system is now On.
-	powerState.Store("On")
-
-	// Second reconcile: system is On, boot order PATCH still returns 404.
-	// Should now set the unsupported condition.
-	_, err = reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile 2: %v", err)
-	}
-
-	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
-		t.Fatal(err)
-	}
-
-	bootCond = meta.FindStatusCondition(updated.Status.Conditions, condBootSupported)
-	if bootCond == nil {
-		t.Fatal("expected BootOrderConfigSupported condition to be set after system reached stable state")
-	}
-
-	if bootCond.Status != metav1.ConditionFalse {
-		t.Fatalf("expected BootOrderConfigSupported=False, got %s", bootCond.Status)
-	}
-
-	if bootCond.Reason != "NotSupported" {
-		t.Fatalf("expected reason NotSupported, got %s", bootCond.Reason)
-	}
-}
-
-func TestBootOrderConfigTransientError(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !testSessionAuth(w, r) {
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			json.NewEncoder(w).Encode(map[string]any{
-				"PowerState": "On",
-				"Boot": map[string]string{
-					"BootSourceOverrideTarget":  "None",
-					"BootSourceOverrideEnabled": "Disabled",
-				},
-				"Links": map[string]any{
-					"Chassis": []map[string]any{
-						{"@odata.id": "/redfish/v1/Chassis/1"},
-					},
-				},
-			})
-
-		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/Systems/System.Embedded.1"):
-			w.WriteHeader(http.StatusServiceUnavailable)
-
-		case strings.Contains(r.URL.Path, "/TrustedComponents"):
-			http.NotFound(w, r)
-
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bmc-pass", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("secret")},
-	}
-
-	node := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "node-boot-503", Namespace: "default"},
-		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
-				Image:      "ghcr.io/test/test-image:v1",
-				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:b4", IPv4: "10.0.0.34", SubnetMask: "255.255.255.0"}},
-				Redfish: &v1alpha3.RedfishSpec{
-					URL:         srv.URL,
-					Username:    "admin",
-					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
-				},
-			},
-			Operations: &v1alpha3.OperationsSpec{
-				RepaveCounter: 1,
-			},
-		},
-		Status: v1alpha3.MachineStatus{
-			Redfish: &v1alpha3.RedfishStatus{CertFingerprint: fp},
-		},
-	}
-
-	scheme := testScheme(t)
-	fc := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(node, secret).
-		WithStatusSubresource(node).
-		Build()
-
-	reconciler := &Reconciler{Client: fc, Pool: NewPool()}
-	ctx := t.Context()
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "node-boot-503", Namespace: "default"}}
-
-	_, err := reconciler.Reconcile(ctx, req)
-	if err == nil {
-		t.Fatal("expected transient error to be returned, got nil")
-	}
-
-	var updated v1alpha3.Machine
-	if err := fc.Get(ctx, req.NamespacedName, &updated); err != nil {
-		t.Fatal(err)
-	}
-
-	bootCond := meta.FindStatusCondition(updated.Status.Conditions, condBootSupported)
-	if bootCond != nil {
-		t.Fatalf("expected BootOrderConfigSupported condition NOT to be set on transient error, got %+v", bootCond)
-	}
-}
-
-func TestSessionExpiryRetry(t *testing.T) {
-	var (
-		sessionCount atomic.Int64
-		currentToken atomic.Value
-	)
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Session creation - assigns a unique token per session.
-		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/SessionService/Sessions") {
-			var body struct {
-				UserName string `json:"UserName"`
-				Password string `json:"Password"`
-			}
-			json.NewDecoder(r.Body).Decode(&body)
-
-			if body.UserName != "admin" || body.Password != "secret" {
-				http.Error(w, "bad credentials", http.StatusUnauthorized)
-				return
-			}
-
-			n := sessionCount.Add(1)
-			token := fmt.Sprintf("token-%d", n)
-			currentToken.Store(token)
-
-			w.Header().Set("X-Auth-Token", token)
-			w.Header().Set("Location", "/redfish/v1/SessionService/Sessions/1")
-			w.WriteHeader(http.StatusCreated)
-
-			return
-		}
-
-		if r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/SessionService/Sessions/") {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		// Authenticate: token must match the current valid token.
-		tok := r.Header.Get("X-Auth-Token")
-
-		valid, _ := currentToken.Load().(string)
-		if tok != valid {
-			user, pass, ok := r.BasicAuth()
-			if !ok || user != "admin" || pass != "secret" {
-				http.Error(w, "session expired", http.StatusUnauthorized)
-				return
-			}
-		}
-
-		switch {
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/Systems/1"):
-			json.NewEncoder(w).Encode(map[string]string{"PowerState": "On"})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	fp := tlsServerFingerprint(srv)
-
-	pool := NewPool()
-	defer pool.Close()
-
-	ctx := t.Context()
-
-	c, err := pool.Get(ctx, srv.URL, fp, "admin", "secret", "1")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Request succeeds with the initial session token.
-	state, err := c.PowerState(ctx)
-	if err != nil {
-		t.Fatalf("initial request failed: %v", err)
-	}
-
-	if state != "On" {
-		t.Fatalf("expected power state On, got %s", state)
-	}
-
-	// Simulate BMC session timeout by invalidating the current token.
-	currentToken.Store("expired-by-bmc")
-
-	// The client's cached token is now stale. The next request should
-	// get a 401, transparently re-authenticate, and retry successfully.
-	state, err = c.PowerState(ctx)
-	if err != nil {
-		t.Fatalf("request after session expiry failed (expected transparent retry): %v", err)
-	}
-
-	if state != "On" {
-		t.Fatalf("expected power state On after re-auth, got %s", state)
-	}
-
-	// Exactly two sessions should have been created: the initial Dial
-	// and the automatic re-authentication after expiry.
-	if got := sessionCount.Load(); got != 2 {
-		t.Fatalf("expected 2 sessions (initial + reauth), got %d", got)
 	}
 }
 
@@ -1726,20 +807,13 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 
 	s := runtime.NewScheme()
-	if err := v1alpha3.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := corev1.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, corev1.AddToScheme(s))
+	require.NoError(t, v1alpha3.AddToScheme(s))
 
 	return s
 }
 
-func tlsServerFingerprint(srv *httptest.Server) string {
-	raw := srv.TLS.Certificates[0].Certificate[0]
-	h := sha256.Sum256(raw)
-
-	return formatFingerprint(h[:])
+func ExampleResetType() {
+	fmt.Println(ResetForceRestart)
+	// Output: ForceRestart
 }

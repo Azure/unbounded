@@ -20,10 +20,9 @@
 //!   from the local `Backend` (origin fetch into the pool's pages).
 //! * `next_hop(target) == Some(peer)` - some other node is the next
 //!   hop; hand the request to the wrapped `FabricTransport`, whose
-//!   `FingerRouter` resolves the same peer. The request travels with
+//!   `ChainFingerRouter` resolves the same peer. The request travels with
 //!   the default `MAX_HOPS` TTL; recursion happens on the server.
 
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -35,10 +34,8 @@ use serde::de::DeserializeOwned;
 use crate::backend::Backend;
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream, Req, Transport};
 use crate::fabric::Result as FabResult;
-use crate::fabric::{Fabric, FabricTransport, MrHandle, PeerId};
-use crate::p2p::{
-    ChainFingerRouter, FingerTable, NodeId, RouteTableHandle, RoutingHandle, stripe_to_ring,
-};
+use crate::fabric::{Fabric, FabricTransport, MrHandle};
+use crate::p2p::{ChainFingerRouter, RouteTableHandle, stripe_to_ring};
 
 /// Transport that selects the first hop per request by finger-table
 /// ownership: the local origin `Backend` when this node owns the
@@ -46,7 +43,7 @@ use crate::p2p::{
 pub struct RoutedTransport<R, B: Backend<Req = R>> {
     fabric_transport: FabricTransport<R, ChainFingerRouter>,
     /// Shared, live-reloadable routing surface. The inner
-    /// `FabricTransport`'s `FingerRouter` shares this same handle, so a
+    /// `FabricTransport`'s router shares this same handle, so a
     /// peer-set republish through any clone updates both the
     /// local-ownership pre-check below and the fabric routing at once.
     routes: RouteTableHandle,
@@ -55,65 +52,6 @@ pub struct RoutedTransport<R, B: Backend<Req = R>> {
 }
 
 impl<R, B: Backend<Req = R>> RoutedTransport<R, B> {
-    /// Build a routed transport over a freshly-seeded routing surface.
-    /// The transport owns its own [`RoutingHandle`]; use
-    /// [`Self::with_routing`] to share one with other consumers for
-    /// live reload.
-    pub fn new(
-        fabric: Arc<Fabric>,
-        mr: MrHandle,
-        page_size: usize,
-        fingers: Arc<FingerTable>,
-        node_to_peer: Arc<HashMap<NodeId, PeerId>>,
-        backend: B,
-    ) -> FabResult<Self> {
-        let mut routes = HashMap::new();
-        routes.insert(
-            RouteTableHandle::LEGACY_ROUTE_ID.to_string(),
-            crate::p2p::RoutingSnapshot {
-                fingers,
-                node_to_peer,
-            },
-        );
-        Self::with_routes(
-            fabric,
-            mr,
-            page_size,
-            RouteTableHandle::new(routes),
-            backend,
-        )
-    }
-
-    /// Build a routed transport that shares `routing` with other
-    /// consumers. Constructs the inner `FabricTransport` with a
-    /// `FingerRouter` over a clone of the same handle, so the
-    /// local-ownership pre-check and the fabric routing always agree
-    /// and reload together.
-    pub fn with_routing(
-        fabric: Arc<Fabric>,
-        mr: MrHandle,
-        page_size: usize,
-        routing: RoutingHandle,
-        backend: B,
-    ) -> FabResult<Self> {
-        let snap = routing.snapshot();
-        let mut routes = HashMap::new();
-        routes.insert(
-            RouteTableHandle::LEGACY_ROUTE_ID.to_string(),
-            crate::p2p::RoutingSnapshot {
-                fingers: snap.fingers.clone(),
-                node_to_peer: snap.node_to_peer.clone(),
-            },
-        );
-        Self::with_routes(
-            fabric,
-            mr,
-            page_size,
-            RouteTableHandle::new(routes),
-            backend,
-        )
-    }
-
     pub fn with_routes(
         fabric: Arc<Fabric>,
         mr: MrHandle,
@@ -139,10 +77,10 @@ impl<R, B: Backend<Req = R>> RoutedTransport<R, B> {
     where
         R: Req,
     {
-        let Some(route) = self.routes.route_for_req(req) else {
+        let Some(fingers) = self.routes.route_for_req(req) else {
             return true;
         };
-        route.fingers.next_hop(stripe_to_ring(req.key())).is_none()
+        fingers.next_hop(stripe_to_ring(req.key())).is_none()
     }
 }
 
@@ -206,14 +144,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::pin::Pin;
-    use std::sync::Arc;
     use std::task::{Context, Poll};
 
     use crate::backend::Backend;
     use crate::bufferpool::{BulkRef, Error, PageRef, PageStream, Req, StripeKey};
-    use crate::fabric::PeerId;
     use crate::p2p::{
         FingerTable, FingerTableConfig, NodeId, PeerEntry, RingId, TopologyTags, node_to_ring,
         stripe_to_ring,
@@ -290,10 +225,6 @@ mod tests {
         StripeKey(k)
     }
 
-    fn node_to_peer_map(nodes: &[u64]) -> Arc<HashMap<NodeId, PeerId>> {
-        Arc::new(nodes.iter().map(|&n| (NodeId(n), PeerId(n))).collect())
-    }
-
     /// Build a `RoutedTransport` whose `FabricTransport` is never
     /// driven. Constructing it without a live fabric is infeasible, so
     /// these tests exercise the routing decision (`owns_locally`) and
@@ -310,7 +241,6 @@ mod tests {
         // routing decision is always "Backend arm".
         let local = peer(1);
         let fingers = FingerTable::build(local.clone(), &[], FingerTableConfig::with_k(8));
-        let _ = node_to_peer_map(&[1]);
         for target in [0u64, 1, 999, u64::MAX / 2, u64::MAX] {
             assert!(
                 fingers

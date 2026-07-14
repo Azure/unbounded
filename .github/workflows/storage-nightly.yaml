@@ -1,0 +1,218 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: storage-nightly
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Wall-clock budget for the DST loop (e.g. 20m, 1h)."
+        required: false
+        default: "20m"
+      proptest_cases:
+        description: "PROPTEST_CASES per cargo test invocation."
+        required: false
+        default: "32768"
+
+concurrency:
+  group: storage-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  arm64-build:
+    name: ARM64 build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Resolve native dependency versions from Makefile
+        run: |
+          set -euo pipefail
+          libfabric_version="$(sed -n 's/^LIBFABRIC_VERSION[[:space:]]*?=[[:space:]]*//p' Makefile | head -n1)"
+          openssl_version="$(sed -n 's/^OPENSSL_VERSION[[:space:]]*?=[[:space:]]*//p' Makefile | head -n1)"
+          if [[ -z "$libfabric_version" || -z "$openssl_version" ]]; then
+            echo "could not determine native dependency versions from Makefile" >&2
+            exit 1
+          fi
+          echo "LIBFABRIC_VERSION=$libfabric_version" >> "$GITHUB_ENV"
+          echo "OPENSSL_VERSION=$openssl_version" >> "$GITHUB_ENV"
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config ca-certificates curl liburing-dev \
+            libibverbs-dev librdmacm-dev
+
+      - name: Cache pinned libfabric
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tmp/libfabric
+          key: libfabric-${{ env.LIBFABRIC_VERSION }}-arm64-${{ runner.os }}-${{ hashFiles('Makefile') }}
+
+      - name: Build pinned libfabric
+        run: make libfabric LIBFABRIC_VERSION="$LIBFABRIC_VERSION"
+
+      - name: Cache pinned OpenSSL
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tmp/openssl
+          key: openssl-${{ env.OPENSSL_VERSION }}-arm64-${{ runner.os }}-${{ hashFiles('Makefile') }}
+
+      - name: Build pinned OpenSSL
+        run: make openssl OPENSSL_VERSION="$OPENSSL_VERSION"
+
+      - name: Set up Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cmd/unbounded-storage/target
+          key: cargo-storage-nightly-arm64-${{ runner.os }}-fabric-openssl-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c', 'cmd/unbounded-storage/src/tls/shim.c') }}
+          restore-keys: |
+            cargo-storage-nightly-arm64-${{ runner.os }}-fabric-openssl-
+            cargo-storage-nightly-arm64-${{ runner.os }}-
+
+      - name: Build release binary
+        run: make unbounded-storage-build LIBFABRIC_VERSION="$LIBFABRIC_VERSION" OPENSSL_VERSION="$OPENSSL_VERSION"
+
+  sim:
+    name: DST soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DST_DURATION: ${{ github.event.inputs.duration || '20m' }}
+      PROPTEST_CASES: ${{ github.event.inputs.proptest_cases || '32768' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config liburing-dev \
+            libibverbs-dev librdmacm-dev
+
+      - name: Set up Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      # The fabric shim is compiled against the pinned libfabric 2.5.1 built
+      # from source (see the Makefile). Distro `libfabric-dev` predates the
+      # `src_addr` member on `struct fi_cq_err_entry` that the shim references,
+      # so building against it fails to compile.
+      - name: Cache pinned libfabric
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tmp/libfabric
+          key: libfabric-${{ runner.os }}-${{ hashFiles('Makefile') }}
+
+      - name: Build pinned libfabric
+        run: make libfabric
+
+      - name: Export pinned libfabric to the environment
+        run: |
+          version="$(sed -n 's/^LIBFABRIC_VERSION ?= //p' Makefile | head -n1)"
+          prefix="${PWD}/tmp/libfabric/${version}"
+          echo "LIBFABRIC_PKG_CONFIG_PATH=${prefix}/lib/pkgconfig" >> "${GITHUB_ENV}"
+          echo "LD_LIBRARY_PATH=${prefix}/lib" >> "${GITHUB_ENV}"
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cmd/unbounded-storage/target
+          # Key on lockfile + manifest plus the native build inputs. The
+          # `storage-nightly` lets the soak job share a key space with the PR job's
+          # restore keys while keeping a dedicated primary key for release-mode
+          # artifacts.
+          key: cargo-storage-nightly-${{ runner.os }}-fabric-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c') }}
+          restore-keys: |
+            cargo-storage-nightly-${{ runner.os }}-fabric-
+            cargo-storage-nightly-${{ runner.os }}-
+            cargo-unbounded-storage-${{ runner.os }}-fabric-
+            cargo-unbounded-storage-${{ runner.os }}-
+
+      - name: Build DST test binary
+        working-directory: cmd/unbounded-storage
+        run: cargo test --release --locked --test dst --no-run
+
+      - name: Run DST soak
+        working-directory: cmd/unbounded-storage
+        # Loop `cargo test` against the `dst` integration test until
+        # the wall-clock budget expires. Each iteration uses a fresh
+        # PROPTEST_RNG_SEED so the soak keeps exploring new (seed, workload)
+        # pairs rather than re-running the same cases. `timeout` exits
+        # 124 when it kills the loop; treat that as success. Any
+        # non-zero exit from cargo test itself fails the job.
+        run: |
+          set -u
+          status=0
+          iteration=0
+          start=$SECONDS
+          # `timeout --preserve-status` would propagate a SIGTERM exit;
+          # instead we rely on the explicit 124 check below.
+          timeout "${DST_DURATION}" bash -c '
+            set -eu
+            i=0
+            while :; do
+              i=$((i + 1))
+              # Derive a per-iteration seed from /dev/urandom so each
+              # cargo invocation explores fresh proptest inputs.
+              PROPTEST_RNG_SEED="$(od -An -N8 -tu8 /dev/urandom | tr -d " ")"
+              export PROPTEST_RNG_SEED
+              echo "::group::DST iteration ${i} (seed=${PROPTEST_RNG_SEED}, elapsed=$((SECONDS))s)"
+              cargo test --release --locked --test dst -- --nocapture
+              echo "::endgroup::"
+            done
+          ' || status=$?
+          elapsed=$((SECONDS - start))
+          if [ "${status}" -eq 124 ] || [ "${status}" -eq 0 ]; then
+            echo "DST soak completed after ${elapsed}s (timeout exit=${status})."
+            exit 0
+          fi
+          echo "DST soak failed after ${elapsed}s with exit code ${status}." >&2
+          exit "${status}"
+
+  model-check:
+    name: TLA+ model check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up JDK
+        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache tla2tools.jar
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tmp/tla2tools.jar
+          # Key derives from the pinned TLA_TOOLS_VERSION / SHA in the
+          # top-level Makefile; bump those to invalidate this cache.
+          key: tla2tools-v1.8.0-237332bd
+
+      - name: Run TLC
+        run: make unbounded-storage-model-check

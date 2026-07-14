@@ -36,7 +36,9 @@ func TestNSpawnConfig_RenderedSnapshot(t *testing.T) {
 	t.Parallel()
 
 	requireRenderedSnapshot(t, "nspawn.conf.golden", "nspawn.conf", nspawnTemplateData{
-		BPFFSMountPath: goalstates.BPFFSMountPath("kube1"),
+		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 	})
 }
 
@@ -61,6 +63,29 @@ func TestServiceOverride_HostDevicesDeviceAllow(t *testing.T) {
 	require.Less(t, strings.Index(out, "[Service]"), strings.Index(out, "DeviceAllow=/dev/kvm rwm"))
 }
 
+func TestServiceOverride_HostDeviceGroupSpecifiers(t *testing.T) {
+	t.Parallel()
+
+	var nspawnBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
+		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
+		HostDeviceGroupSpecifiers:    []string{"char-input", "char-pts"},
+	}))
+
+	var overrideBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", nspawnTemplateData{
+		MachineName:               "kube1",
+		BPFFSMountPath:            goalstates.BPFFSMountPath("kube1"),
+		HostDeviceGroupSpecifiers: []string{"char-input", "char-pts"},
+	}))
+
+	require.NotContains(t, nspawnBuf.String(), "Bind=char-")
+	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-input rwm")
+	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-pts rwm")
+}
+
 func TestServiceOverride_MultipleHostDevices(t *testing.T) {
 	t.Parallel()
 
@@ -68,8 +93,10 @@ func TestServiceOverride_MultipleHostDevices(t *testing.T) {
 
 	var nspawnBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
-		BPFFSMountPath:  goalstates.BPFFSMountPath("kube1"),
-		HostDevicePaths: devices,
+		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
+		HostDevicePaths:              devices,
 	}))
 
 	var overrideBuf bytes.Buffer
@@ -95,9 +122,11 @@ func TestServiceOverride_AMDGPUDevices(t *testing.T) {
 
 	var nspawnBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
-		BPFFSMountPath:    goalstates.BPFFSMountPath("kube1"),
-		AMDGPUDevicePaths: devices,
-		AMDSysFSPaths:     []string{"/sys/module/amdgpu", "/sys/class/kfd"},
+		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
+		AMDGPUDevicePaths:            devices,
+		AMDSysFSPaths:                []string{"/sys/module/amdgpu", "/sys/class/kfd"},
 	}))
 
 	var overrideBuf bytes.Buffer
@@ -116,6 +145,50 @@ func TestServiceOverride_AMDGPUDevices(t *testing.T) {
 	require.Contains(t, overrideBuf.String(), "AMD GPU support")
 	require.Contains(t, nspawnBuf.String(), "BindReadOnly=/sys/module/amdgpu")
 	require.Contains(t, nspawnBuf.String(), "BindReadOnly=/sys/class/kfd")
+}
+
+func TestNSpawnConfig_NVIDIADriverRootMounts(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "nspawn.conf", nspawnTemplateData{
+		NvidiaGPUDevicePaths: []string{"/dev/nvidia0"},
+		NvidiaLibDirMounts: []goalstates.NvidiaLibDirMount{{
+			HostDir:      "/usr/lib/x86_64-linux-gnu",
+			ContainerDir: "/run/host-nvidia/0",
+		}},
+		NvidiaI386LibDirMounts: []goalstates.NvidiaLibDirMount{{
+			HostDir:      "/usr/lib/i386-linux-gnu",
+			ContainerDir: "/run/host-nvidia-i386/0",
+		}},
+		NvidiaSMIDir: "/usr/bin",
+	}))
+
+	require.Contains(t, buf.String(), "BindReadOnly=/usr/lib/x86_64-linux-gnu:/run/host-nvidia/0")
+	require.Contains(t, buf.String(), "BindReadOnly=/usr/lib/i386-linux-gnu:/run/host-nvidia-i386/0")
+	require.Contains(t, buf.String(), "BindReadOnly=/usr/bin:/run/host-nvidia-bin")
+}
+
+func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
+	t.Parallel()
+
+	const channel = "/dev/nvidia-caps-imex-channels/channel0"
+
+	data := nspawnTemplateData{
+		MachineName:                  "kube1",
+		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
+		NvidiaGPUDevicePaths:         []string{channel},
+	}
+
+	var nspawnBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
+	require.Contains(t, nspawnBuf.String(), "Bind="+channel)
+
+	var overrideBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
+	require.Contains(t, overrideBuf.String(), "DeviceAllow="+channel+" rwm")
 }
 
 func TestPathsExcluding(t *testing.T) {

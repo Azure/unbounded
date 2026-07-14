@@ -50,7 +50,7 @@ name: release upgrade
 #            SITE_NODE_CIDR, SITE_POD_CIDR, MANAGE_CNI_PLUGIN,
 #            ORCA_AZURE_ACCOUNT, ORCA_AZURE_CONTAINER,
 #            ORCA_AZURE_ENDPOINT
-#   - cluster Secret unbounded-kube/orca-credentials for confidential
+#   - cluster Secret unbounded-system/orca-credentials for confidential
 #     Orca values (Azure account key and Garage S3 credentials)
 #
 # To redirect this workflow at a different cluster: create a new
@@ -414,7 +414,7 @@ jobs:
   # part of the shippable release tarball. release.yaml DOES build and
   # push the Orca image (<registry>/orca:<tag>), but its manifests plus
   # the test-only Garage cachestore are deployed here from hack/orca via
-  # hack/orca/deploy-stable.sh.
+  # hack/orca/deploy-integration.sh.
   #
   # Origin is real Azure Blob storage; cachestore is an in-cluster
   # single-node Garage backed by a PVC. Confidential values (Azure
@@ -491,8 +491,8 @@ jobs:
       - name: Verify orca-credentials Secret exists
         run: |
           set -euo pipefail
-          if ! kubectl -n unbounded-kube get secret orca-credentials >/dev/null 2>&1; then
-            echo "::error::Secret orca-credentials not found in unbounded-kube; pre-create it with ORCA_AZUREBLOB_ACCOUNT_KEY, ORCA_CACHESTORE_S3_ACCESS_KEY, ORCA_CACHESTORE_S3_SECRET_KEY"
+          if ! kubectl -n unbounded-system get secret orca-credentials >/dev/null 2>&1; then
+            echo "::error::Secret orca-credentials not found in unbounded-system; pre-create it with ORCA_AZUREBLOB_ACCOUNT_KEY, ORCA_CACHESTORE_S3_ACCESS_KEY, ORCA_CACHESTORE_S3_SECRET_KEY"
             exit 1
           fi
 
@@ -501,7 +501,7 @@ jobs:
           set -euo pipefail
           IMAGE="${REGISTRY,,}/orca:${TAG}"
           echo "Deploying Orca image: ${IMAGE}"
-          ./hack/orca/deploy-stable.sh \
+          ./hack/orca/deploy-integration.sh \
             --image "${IMAGE}" \
             --azure-account "${ORCA_AZURE_ACCOUNT}" \
             --azure-container "${ORCA_AZURE_CONTAINER}" \
@@ -519,8 +519,8 @@ jobs:
             echo "- Environment: \`unbounded-stable\`"
             echo ""
             echo '```'
-            kubectl -n unbounded-kube get deploy orca -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
-            kubectl -n unbounded-kube get deploy garage -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-system get deploy orca -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-system get deploy garage -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
