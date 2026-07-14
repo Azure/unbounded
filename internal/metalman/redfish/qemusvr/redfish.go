@@ -458,11 +458,16 @@ func (s *Server) appendRecord(method, path string, body any, status int) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close() //nolint:errcheck // Best-effort close of append-only record file.
 
-	_, err = f.Write(append(data, '\n'))
+	_, writeErr := f.Write(append(data, '\n'))
 
-	return err
+	closeErr := f.Close()
+
+	if writeErr != nil {
+		return writeErr
+	}
+
+	return closeErr
 }
 
 func readBody(r *http.Request) (map[string]any, error) {
