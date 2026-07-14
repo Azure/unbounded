@@ -13,16 +13,21 @@ upgrades to the operator model built from the current tree via
 everything onto the unified `unbounded-system` namespace:
 
   * the pre-redesign net-group Sites are translated into machina-group Sites,
-  * operator/user Secrets and the machina-config ConfigMap are copied over,
+  * operator/user Secrets and ConfigMaps are copied over, including the exact
+    valid legacy unbounded-net-config Data and BinaryData payload,
   * cluster-scoped secret references (Machine.spec.pxe.redfish.passwordRef) are
     repointed,
   * the new net + machina workloads come up Ready (real datapath, via the
     net-node hostNetwork cutover),
+  * both net workload templates carry the exact production ConfigMap payload
+    hash, and a post-migration BinaryData-only edit rolls out both workloads,
   * the cluster Site's Nodes carry the canonical `unbounded-cloud.io/site`
     label alongside the deprecated `net.unbounded-cloud.io/site` (the net
     controller dual-writes both during the label deprecation window),
   * unbounded-net-controller restarts cleanly (its hostNetwork Deployment uses
     maxSurge=0 so a rollout does not deadlock on host port 9999), and
+  * rerunning the identical current install repairs a deleted required CRD by
+    changing only the operator repair token and restarting the operator, and
   * the legacy `unbounded-kube`/`unbounded-net` namespaces and the old
     `sites.net.unbounded-cloud.io` CRD are reaped.
 
@@ -56,6 +61,8 @@ Requires: docker, kind, kubectl, go, make, curl. Run from anywhere.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import platform
@@ -69,6 +76,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKDIR = REPO_ROOT / "tmp" / "operator-upgrade-e2e"
 KUBECONFIG = WORKDIR / "kubeconfig"
+LEGACY_NET_CONFIG_PAYLOAD = WORKDIR / "legacy-unbounded-net-config-payload.json"
 
 CLUSTER = "operator-upgrade-e2e"
 REGISTRY_CONTAINER = "operator-upgrade-e2e-registry"
@@ -79,6 +87,14 @@ LEGACY_NET = "unbounded-net"
 LEGACY_SITE_CRD = "sites.net.unbounded-cloud.io"
 REMOTE_SITE = "edge"
 CLUSTER_SITE = "cluster"
+
+NET_CONFIG_HASH_ANNOTATION = "unbounded-cloud.io/net-config-hash"
+OPERATOR_CONFIG_HASH_ANNOTATION = "unbounded-cloud.io/operator-config-hash"
+OPERATOR_REPAIR_ANNOTATION = "unbounded-cloud.io/operator-crd-repair-token"
+REPAIR_CRD = "machineoperationcredentials.unbounded-cloud.io"
+
+NET_CONFIG_DATA_SENTINEL = "operator-upgrade-e2e-sentinel"
+NET_CONFIG_BINARY_SENTINEL = "operator-upgrade-e2e-sentinel.bin"
 
 PAUSE_IMAGE = "registry.k8s.io/pause:3.10"
 
@@ -156,6 +172,70 @@ def resource_exists(args: list[str]) -> bool:
         capture_output=True, text=True,
     )
     return proc.returncode == 0
+
+
+def _resource_json(args: list[str]) -> dict | None:
+    out = kubectl_out(["get", *args, "-o", "json"], check=False)
+    try:
+        obj = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+    return obj if isinstance(obj, dict) else None
+
+
+def _configmap_payload(config: dict) -> dict[str, dict[str, str]]:
+    payload: dict[str, dict[str, str]] = {}
+    for field in ("data", "binaryData"):
+        values = config.get(field) or {}
+        if not isinstance(values, dict) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in values.items()):
+            raise ValueError(f"ConfigMap {field} is not a string map")
+        payload[field] = dict(values)
+
+    return payload
+
+
+def _go_json_map(values: dict[str, str]) -> str:
+    """Encode a string map like Go encoding/json with HTML escaping enabled."""
+    encoded = json.dumps(
+        {key: values[key] for key in sorted(values)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return (encoded.replace("&", "\\u0026")
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029"))
+
+
+def _configmap_payload_json(payload: dict[str, dict[str, str]]) -> str:
+    # This field order and map encoding exactly match configMapPayloadHash in Go.
+    return (f'{{"data":{_go_json_map(payload["data"])},'
+            f'"binaryData":{_go_json_map(payload["binaryData"])}}}')
+
+
+def _configmap_payload_hash(payload: dict[str, dict[str, str]]) -> str:
+    return hashlib.sha256(_configmap_payload_json(payload).encode()).hexdigest()
+
+
+def _load_legacy_net_config_payload() -> dict[str, dict[str, str]]:
+    if not LEGACY_NET_CONFIG_PAYLOAD.is_file():
+        die(f"required persisted legacy ConfigMap payload is missing: "
+            f"{LEGACY_NET_CONFIG_PAYLOAD}; run install-old first")
+
+    try:
+        stored = json.loads(LEGACY_NET_CONFIG_PAYLOAD.read_text(encoding="utf-8"))
+        if not isinstance(stored, dict) or set(stored) != {"data", "binaryData"}:
+            raise ValueError("expected exactly data and binaryData fields")
+        return _configmap_payload(stored)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        die(f"invalid persisted legacy ConfigMap payload "
+            f"{LEGACY_NET_CONFIG_PAYLOAD}: {exc}")
+
+    return {}
 
 
 # --------------------------------------------------------------------------- #
@@ -385,8 +465,56 @@ def download_old_plugin(version: str) -> Path:
     return binary
 
 
+def _stage_legacy_net_config_payload() -> None:
+    config = _resource_json([
+        "-n", LEGACY_NET, "configmap", "unbounded-net-config",
+    ])
+    if config is None:
+        die(f"legacy {LEGACY_NET}/unbounded-net-config is not readable")
+
+    try:
+        payload = _configmap_payload(config)
+    except ValueError as exc:
+        die(f"legacy {LEGACY_NET}/unbounded-net-config has invalid payload: {exc}")
+
+    original_config = payload["data"].get("config.yaml")
+    if not original_config:
+        die("legacy unbounded-net-config has no nonempty config.yaml to preserve")
+
+    payload["data"][NET_CONFIG_DATA_SENTINEL] = "legacy-payload-preserved"
+    payload["binaryData"][NET_CONFIG_BINARY_SENTINEL] = base64.b64encode(
+        b"legacy-payload-preserved\x00\xff",
+    ).decode("ascii")
+
+    kubectl([
+        "-n", LEGACY_NET, "patch", "configmap", "unbounded-net-config",
+        "--type=merge", "-p", json.dumps(payload, separators=(",", ":")),
+    ])
+
+    updated = _resource_json([
+        "-n", LEGACY_NET, "configmap", "unbounded-net-config",
+    ])
+    if updated is None:
+        die("legacy unbounded-net-config disappeared after staging its payload")
+
+    try:
+        exact_payload = _configmap_payload(updated)
+    except ValueError as exc:
+        die(f"updated legacy unbounded-net-config has invalid payload: {exc}")
+    if exact_payload != payload:
+        die("legacy unbounded-net-config payload did not retain the exact staged Data/BinaryData")
+    if exact_payload["data"].get("config.yaml") != original_config:
+        die("legacy unbounded-net-config config.yaml changed while staging sentinels")
+
+    LEGACY_NET_CONFIG_PAYLOAD.write_text(
+        _configmap_payload_json(exact_payload), encoding="utf-8",
+    )
+    log(f"saved exact legacy net ConfigMap payload to {LEGACY_NET_CONFIG_PAYLOAD}")
+
+
 def cmd_install_old(args: argparse.Namespace) -> None:
     ensure_kubeconfig()
+    LEGACY_NET_CONFIG_PAYLOAD.unlink(missing_ok=True)
 
     plugin = download_old_plugin(args.old_version)
 
@@ -411,6 +539,9 @@ def cmd_install_old(args: argparse.Namespace) -> None:
         "--node-cidr", SITE_NODE_CIDR,
         "--pod-cidr", SITE_POD_CIDR,
     ])
+
+    log("preserving valid legacy net config and adding Data/BinaryData sentinels")
+    _stage_legacy_net_config_payload()
 
     # Stage non-regenerable legacy state the reaper must carry across.
     log("staging legacy Secret / ConfigMap / Machine state")
@@ -451,24 +582,33 @@ def cmd_install_old(args: argparse.Namespace) -> None:
     log("legacy install ready")
 
 
-def cmd_upgrade(args: argparse.Namespace) -> None:
-    ensure_kubeconfig()
+def _current_install_command(args: argparse.Namespace) -> list[str]:
     imgs = images(args.registry_port)
-
-    log("building the current-tree kubectl-unbounded plugin")
-    make(["kubectl-unbounded-build"])
     plugin = REPO_ROOT / "bin" / "kubectl-unbounded"
     if not plugin.exists():
-        die(f"expected plugin at {plugin}")
+        die(f"expected current plugin at {plugin}; run upgrade first")
 
-    log("bootstrapping the operator via `kubectl unbounded install`")
-    run([
+    return [
         str(plugin), "install",
         "--kubeconfig", str(KUBECONFIG),
         "--operator-image", imgs["operator"],
         "--metalman-image", PAUSE_IMAGE,
         "--wait", "--timeout", "5m",
-    ])
+    ]
+
+
+def _run_current_install(args: argparse.Namespace) -> None:
+    run(_current_install_command(args))
+
+
+def cmd_upgrade(args: argparse.Namespace) -> None:
+    ensure_kubeconfig()
+
+    log("building the current-tree kubectl-unbounded plugin")
+    make(["kubectl-unbounded-build"])
+
+    log("bootstrapping the operator via `kubectl unbounded install`")
+    _run_current_install(args)
 
     log("operator installed; the reaper migrates asynchronously")
 
@@ -484,7 +624,9 @@ def _dump_diagnostics() -> None:
              "--tail=120"], check=False)
 
 
-def _migration_complete() -> tuple[bool, str]:
+def _migration_complete(
+        expected_net_payload: dict[str, dict[str, str]],
+) -> tuple[bool, str]:
     # 1. Translated machina-group Sites exist.
     for site in (CLUSTER_SITE, REMOTE_SITE):
         if not resource_exists(["sites.unbounded-cloud.io", site]):
@@ -512,6 +654,31 @@ def _migration_complete() -> tuple[bool, str]:
         return False, "redfish-password not yet copied"
     if not resource_exists(["-n", TARGET_NS, "configmap", "machina-config"]):
         return False, "configmap machina-config not yet copied"
+
+    net_config = _resource_json([
+        "-n", TARGET_NS, "configmap", "unbounded-net-config",
+    ])
+    if net_config is None:
+        return False, "configmap unbounded-net-config not yet copied"
+    try:
+        actual_net_payload = _configmap_payload(net_config)
+    except ValueError as exc:
+        return False, f"target unbounded-net-config payload is invalid: {exc}"
+    if actual_net_payload != expected_net_payload:
+        return False, "target unbounded-net-config payload does not exactly match legacy payload"
+
+    expected_hash = _configmap_payload_hash(expected_net_payload)
+    for kind, name in (("deployment", "unbounded-net-controller"),
+                       ("daemonset", "unbounded-net-node")):
+        workload = _resource_json(["-n", TARGET_NS, kind, name])
+        if workload is None:
+            return False, f"{kind}/{name} not readable for net config hash"
+        annotations = (workload.get("spec", {}).get("template", {})
+                       .get("metadata", {}).get("annotations", {}))
+        actual_hash = annotations.get(NET_CONFIG_HASH_ANNOTATION)
+        if actual_hash != expected_hash:
+            return False, (f"{kind}/{name} net config hash = {actual_hash!r}, "
+                           f"want exact payload hash {expected_hash}")
 
     # 5. Machine secret-ref namespace rewritten.
     out = kubectl_out(["get", "machine.unbounded-cloud.io", "m1", "-o", "json"],
@@ -567,7 +734,9 @@ def _crd_established(name: str) -> bool:
 
 
 def _crd_managed_by(name: str, manager: str) -> bool:
-    out = kubectl_out(["get", "crd", name, "-o", "json"], check=False)
+    out = kubectl_out([
+        "get", "crd", name, "-o", "json", "--show-managed-fields",
+    ], check=False)
     try:
         managed = json.loads(out).get("metadata", {}).get("managedFields", [])
     except json.JSONDecodeError:
@@ -601,15 +770,18 @@ def _workload_ready(kind: str, name: str) -> bool:
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
+    expected_net_payload = _load_legacy_net_config_payload()
     ensure_kubeconfig()
 
     deadline = time.time() + args.verify_timeout
     last = ""
     while time.time() < deadline:
-        ok, msg = _migration_complete()
+        ok, msg = _migration_complete(expected_net_payload)
         if ok:
             log("PASS: " + msg)
+            _assert_net_config_watch_rollout(expected_net_payload, args.verify_timeout)
             _assert_net_controller_restarts()
+            _assert_same_release_crd_repair(args)
             return
         if msg != last:
             log("waiting: " + msg)
@@ -618,6 +790,146 @@ def cmd_verify(args: argparse.Namespace) -> None:
 
     _dump_diagnostics()
     die(f"migration did not complete within {args.verify_timeout}s (last: {last})")
+
+
+def _template_hash(workload: dict) -> str:
+    return (workload.get("spec", {}).get("template", {}).get("metadata", {})
+            .get("annotations", {}).get(NET_CONFIG_HASH_ANNOTATION, ""))
+
+
+def _current_rollout_complete(kind: str, workload: dict) -> tuple[bool, str]:
+    metadata = workload.get("metadata", {})
+    spec = workload.get("spec", {})
+    status = workload.get("status", {})
+    generation = metadata.get("generation", 0)
+    observed = status.get("observedGeneration", 0)
+    if observed < generation:
+        return False, f"observedGeneration {observed} is behind generation {generation}"
+
+    if kind == "deployment":
+        desired = spec.get("replicas", 1)
+        fields = {
+            "replicas": status.get("replicas", 0),
+            "updatedReplicas": status.get("updatedReplicas", 0),
+            "availableReplicas": status.get("availableReplicas", 0),
+            "readyReplicas": status.get("readyReplicas", 0),
+        }
+    else:
+        desired = status.get("desiredNumberScheduled", 0)
+        fields = {
+            "currentNumberScheduled": status.get("currentNumberScheduled", 0),
+            "updatedNumberScheduled": status.get("updatedNumberScheduled", 0),
+            "numberAvailable": status.get("numberAvailable", 0),
+            "numberReady": status.get("numberReady", 0),
+        }
+
+    if desired <= 0:
+        return False, f"desired replicas = {desired}"
+    incomplete = {key: value for key, value in fields.items() if value != desired}
+    if incomplete:
+        return False, f"desired = {desired}, incomplete status = {incomplete}"
+
+    return True, "rollout complete"
+
+
+def _assert_net_config_watch_rollout(
+        migrated_payload: dict[str, dict[str, str]], timeout: int,
+) -> None:
+    workload_keys = (
+        ("deployment", "unbounded-net-controller"),
+        ("daemonset", "unbounded-net-node"),
+    )
+    old_hash = _configmap_payload_hash(migrated_payload)
+    old_workloads: dict[tuple[str, str], tuple[int, str]] = {}
+    for kind, name in workload_keys:
+        workload = _resource_json(["-n", TARGET_NS, kind, name])
+        if workload is None:
+            die(f"cannot record {kind}/{name} before ConfigMap watch test")
+        generation = workload.get("metadata", {}).get("generation")
+        template_hash = _template_hash(workload)
+        if not isinstance(generation, int) or template_hash != old_hash:
+            die(f"invalid {kind}/{name} baseline for ConfigMap watch test: "
+                f"generation={generation!r} hash={template_hash!r}, want hash={old_hash}")
+        old_workloads[(kind, name)] = (generation, template_hash)
+        log(f"recorded {kind}/{name}: generation={generation} "
+            f"template-hash={template_hash}")
+
+    changed_payload = {
+        "data": dict(migrated_payload["data"]),
+        "binaryData": dict(migrated_payload["binaryData"]),
+    }
+    changed_payload["binaryData"][NET_CONFIG_BINARY_SENTINEL] = base64.b64encode(
+        b"post-migration-watch-rollout\x00\xff",
+    ).decode("ascii")
+    new_hash = _configmap_payload_hash(changed_payload)
+    if new_hash == old_hash:
+        die("BinaryData watch-test mutation unexpectedly did not change payload hash")
+
+    log("changing only target unbounded-net-config BinaryData to trigger real rollouts")
+    kubectl([
+        "-n", TARGET_NS, "patch", "configmap", "unbounded-net-config",
+        "--type=merge", "-p", json.dumps({
+            "binaryData": {
+                NET_CONFIG_BINARY_SENTINEL:
+                    changed_payload["binaryData"][NET_CONFIG_BINARY_SENTINEL],
+            },
+        }, separators=(",", ":")),
+    ])
+
+    deadline = time.time() + timeout
+    last = ""
+    while time.time() < deadline:
+        config = _resource_json([
+            "-n", TARGET_NS, "configmap", "unbounded-net-config",
+        ])
+        if config is None:
+            last = "target unbounded-net-config is not readable"
+            time.sleep(2)
+            continue
+        try:
+            actual_payload = _configmap_payload(config)
+        except ValueError as exc:
+            last = f"target unbounded-net-config payload is invalid: {exc}"
+            time.sleep(2)
+            continue
+        if actual_payload != changed_payload:
+            last = "target ConfigMap does not contain only the expected BinaryData change"
+            time.sleep(2)
+            continue
+
+        pending = []
+        for kind, name in workload_keys:
+            workload = _resource_json(["-n", TARGET_NS, kind, name])
+            if workload is None:
+                pending.append(f"{kind}/{name} is not readable")
+                continue
+            generation = workload.get("metadata", {}).get("generation", 0)
+            baseline_generation, baseline_hash = old_workloads[(kind, name)]
+            template_hash = _template_hash(workload)
+            if template_hash != new_hash:
+                pending.append(f"{kind}/{name} hash={template_hash!r}, want {new_hash}")
+                continue
+            if template_hash == baseline_hash or generation <= baseline_generation:
+                pending.append(f"{kind}/{name} generation={generation}, "
+                               f"want > {baseline_generation}")
+                continue
+            complete, detail = _current_rollout_complete(kind, workload)
+            if not complete:
+                pending.append(f"{kind}/{name}: {detail}")
+
+        if not pending:
+            log(f"PASS: BinaryData watch rolled out both net workloads with hash {new_hash}")
+            return
+
+        current = "; ".join(pending)
+        if current != last:
+            log("waiting for ConfigMap watch rollout: " + current)
+            last = current
+        time.sleep(5)
+
+    _dump_diagnostics()
+    die(f"net workloads did not complete the BinaryData watch rollout "
+        f"within {timeout}s (last: {last})")
 
 
 def _assert_net_controller_restarts() -> None:
@@ -639,6 +951,93 @@ def _assert_net_controller_restarts() -> None:
             "(hostNetwork surge deadlock?)")
 
     log("PASS: unbounded-net-controller restarted cleanly")
+
+
+def _operator_state() -> tuple[str, str, str, str]:
+    deploy = _resource_json([
+        "-n", TARGET_NS, "deployment", "unbounded-operator",
+    ])
+    if deploy is None:
+        die("unbounded-operator Deployment is not readable")
+
+    template = deploy.get("spec", {}).get("template", {})
+    annotations = template.get("metadata", {}).get("annotations", {})
+    containers = template.get("spec", {}).get("containers", [])
+    image = next((container.get("image", "") for container in containers
+                  if container.get("name") == "controller"), "")
+    config_hash = annotations.get(OPERATOR_CONFIG_HASH_ANNOTATION, "")
+    repair_token = annotations.get(OPERATOR_REPAIR_ANNOTATION, "")
+    if not image or not config_hash:
+        die(f"operator baseline is incomplete: image={image!r} "
+            f"config-hash={config_hash!r}")
+
+    pods = _resource_json([
+        "-n", TARGET_NS, "pods", "-l",
+        "app.kubernetes.io/name=unbounded-operator",
+    ])
+    if pods is None:
+        die("unbounded-operator Pods are not readable")
+    active_uids = [
+        pod.get("metadata", {}).get("uid", "")
+        for pod in pods.get("items", [])
+        if not pod.get("metadata", {}).get("deletionTimestamp")
+    ]
+    active_uids = [uid for uid in active_uids if uid]
+    if len(active_uids) != 1:
+        die(f"expected exactly one active unbounded-operator Pod, got {active_uids}")
+
+    return image, config_hash, repair_token, active_uids[0]
+
+
+def _assert_same_release_crd_repair(args: argparse.Namespace) -> None:
+    crd = _resource_json(["crd", REPAIR_CRD])
+    if crd is None:
+        die(f"required repair-test CRD {REPAIR_CRD} is not readable")
+    old_crd_uid = crd.get("metadata", {}).get("uid", "")
+    if (not old_crd_uid or not _crd_established(REPAIR_CRD)
+            or not _crd_managed_by(REPAIR_CRD, "unbounded-operator")):
+        die(f"repair-test CRD {REPAIR_CRD} lacks a valid established/operator-managed baseline")
+
+    old_image, old_config_hash, old_repair_token, old_pod_uid = _operator_state()
+    log(f"recorded CRD repair baseline: image={old_image} "
+        f"config-hash={old_config_hash} repair-token={old_repair_token!r} "
+        f"pod-uid={old_pod_uid} crd-uid={old_crd_uid}")
+
+    log(f"deleting unused required CRD {REPAIR_CRD} for same-release repair test")
+    kubectl(["delete", "crd", REPAIR_CRD, "--wait=false"])
+    deadline = time.time() + 120
+    while time.time() < deadline and resource_exists(["crd", REPAIR_CRD]):
+        time.sleep(2)
+    if resource_exists(["crd", REPAIR_CRD]):
+        die(f"CRD {REPAIR_CRD} did not become absent after deletion")
+
+    log("rerunning identical current install to repair the missing CRD")
+    _run_current_install(args)
+
+    new_image, new_config_hash, new_repair_token, new_pod_uid = _operator_state()
+    repaired = _resource_json(["crd", REPAIR_CRD])
+    new_crd_uid = (repaired or {}).get("metadata", {}).get("uid", "")
+    failures = []
+    if new_image != old_image:
+        failures.append(f"operator image changed: {old_image!r} -> {new_image!r}")
+    if new_config_hash != old_config_hash:
+        failures.append("operator config hash changed")
+    if not new_repair_token or new_repair_token == old_repair_token:
+        failures.append(f"repair token did not change to a nonempty value: "
+                        f"{old_repair_token!r} -> {new_repair_token!r}")
+    if new_pod_uid == old_pod_uid:
+        failures.append(f"operator Pod UID did not change from {old_pod_uid}")
+    if not new_crd_uid or new_crd_uid == old_crd_uid:
+        failures.append(f"CRD UID did not change: {old_crd_uid!r} -> {new_crd_uid!r}")
+    if not _crd_established(REPAIR_CRD):
+        failures.append("repaired CRD is not Established")
+    if not _crd_managed_by(REPAIR_CRD, "unbounded-operator"):
+        failures.append("repaired CRD is not managed by unbounded-operator")
+    if failures:
+        _dump_diagnostics()
+        die("same-release CRD repair failed: " + "; ".join(failures))
+
+    log(f"PASS: identical install repaired {REPAIR_CRD} with new CRD/operator Pod UIDs")
 
 
 def cmd_cleanup(args: argparse.Namespace) -> None:

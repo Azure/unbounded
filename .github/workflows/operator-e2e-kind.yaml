@@ -7,9 +7,11 @@ on:
   pull_request:
     paths:
       - internal/operator/**
+      - internal/net/controller/**
       - cmd/unbounded-operator/**
       - deploy/unbounded-operator/**
       - deploy/machina/crd/**
+      - deploy/net/crd/**
       - e2e/operator/**
       - go.mod
       - go.sum
@@ -18,9 +20,11 @@ on:
     branches: [main]
     paths:
       - internal/operator/**
+      - internal/net/controller/**
       - cmd/unbounded-operator/**
       - deploy/unbounded-operator/**
       - deploy/machina/crd/**
+      - deploy/net/crd/**
       - e2e/operator/**
       - go.mod
       - go.sum
