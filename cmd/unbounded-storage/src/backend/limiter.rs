@@ -9,23 +9,17 @@
 //! blocks a thread: it parks the fetch future and wakes it when a
 //! permit frees up.
 //!
-//! The interior is `Arc<Mutex<..>>` rather than `Rc<RefCell<..>>`
-//! because a single backend is shared by the data-path transport (the
-//! shard thread) and the recursive RPC handler (the ephemeral
-//! `fabric-rpc-worker` threads that drive a `WorkerLocal` ring). Those
-//! threads can clone the limiter into their `'static` fetch futures
-//! concurrently, so the permit pool must be a thread-safe handle. The
-//! critical sections are tiny (a counter check plus a waker push/pop)
-//! and uncontended on the single-threaded shard path.
+//! The limiter is shard-local. Its handles may outlive a backend registry
+//! entry through in-flight fetch futures, but they never cross threads.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-/// A clonable handle to a permit pool shared across the shard thread
-/// and the RPC worker threads.
+/// A clonable shard-local handle to an origin fetch permit pool.
 ///
 /// `limit` permits are available at construction. `acquire().await`
 /// yields a [`FetchPermit`] once a permit is free; dropping the permit
@@ -33,7 +27,7 @@ use std::task::{Context, Poll, Waker};
 /// is treated as one so a backend always makes progress.
 #[derive(Clone)]
 pub struct FetchLimiter {
-    inner: Arc<Mutex<LimiterInner>>,
+    inner: Rc<RefCell<LimiterInner>>,
 }
 
 struct LimiterInner {
@@ -52,7 +46,7 @@ struct LimiterInner {
 impl FetchLimiter {
     pub fn new(limit: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(LimiterInner {
+            inner: Rc::new(RefCell::new(LimiterInner {
                 available: limit.max(1),
                 waiters: VecDeque::new(),
                 next_id: 0,
@@ -63,7 +57,7 @@ impl FetchLimiter {
     /// Acquire a permit, parking until one is free.
     pub fn acquire(&self) -> Acquire {
         Acquire {
-            inner: Arc::clone(&self.inner),
+            inner: Rc::clone(&self.inner),
             id: None,
         }
     }
@@ -71,11 +65,11 @@ impl FetchLimiter {
     /// Permits currently free. Exposed for tests.
     #[cfg(test)]
     pub fn available(&self) -> usize {
-        self.inner.lock().expect("limiter poisoned").available
+        self.inner.borrow().available
     }
 }
 
-/// Future returned by [`FetchLimiter::acquire`]. Owns an `Arc` clone of
+/// Future returned by [`FetchLimiter::acquire`]. Owns an `Rc` clone of
 /// the pool so it can live inside a `'static` fetch future.
 ///
 /// While parked it holds a uniquely-identified slot in the pool's waiter
@@ -83,7 +77,7 @@ impl FetchLimiter {
 /// (cancelled), so a cancelled acquirer can never leave an orphaned
 /// waker behind to swallow a later wake-up meant for a live waiter.
 pub struct Acquire {
-    inner: Arc<Mutex<LimiterInner>>,
+    inner: Rc<RefCell<LimiterInner>>,
     /// Id of this future's slot in `waiters`, assigned the first time it
     /// parks. `None` until then (and irrelevant once resolved).
     id: Option<u64>,
@@ -93,20 +87,20 @@ impl Future for Acquire {
     type Output = FetchPermit;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // `Acquire` is `Unpin` (it holds only an `Arc` and an `Option`),
+        // `Acquire` is `Unpin` (it holds only an `Rc` and an `Option`),
         // so taking a `&mut Self` out of the pin is sound.
         let this = self.get_mut();
-        let mut guard = this.inner.lock().expect("limiter poisoned");
-        if guard.available > 0 {
-            guard.available -= 1;
+        let mut inner = this.inner.borrow_mut();
+        if inner.available > 0 {
+            inner.available -= 1;
             // We are about to resolve: drop any slot we registered so a
             // later release does not waste a wake on us.
             if let Some(id) = this.id.take() {
-                guard.waiters.retain(|(i, _)| *i != id);
+                inner.waiters.retain(|(i, _)| *i != id);
             }
-            drop(guard);
+            drop(inner);
             return Poll::Ready(FetchPermit {
-                inner: Arc::clone(&this.inner),
+                inner: Rc::clone(&this.inner),
             });
         }
         // No permit free: register (or refresh) our waker under our own
@@ -115,16 +109,16 @@ impl Future for Acquire {
         let id = match this.id {
             Some(id) => id,
             None => {
-                let id = guard.next_id;
-                guard.next_id += 1;
+                let id = inner.next_id;
+                inner.next_id += 1;
                 this.id = Some(id);
                 id
             }
         };
-        if let Some(slot) = guard.waiters.iter_mut().find(|(i, _)| *i == id) {
+        if let Some(slot) = inner.waiters.iter_mut().find(|(i, _)| *i == id) {
             slot.1 = cx.waker().clone();
         } else {
-            guard.waiters.push_back((id, cx.waker().clone()));
+            inner.waiters.push_back((id, cx.waker().clone()));
         }
         Poll::Pending
     }
@@ -148,16 +142,15 @@ impl Drop for Acquire {
     fn drop(&mut self) {
         if let Some(id) = self.id {
             let waker = {
-                let mut guard = self.inner.lock().expect("limiter poisoned");
-                guard.waiters.retain(|(i, _)| *i != id);
-                if guard.available > 0 {
-                    guard.waiters.front().map(|(_, w)| w.clone())
+                let mut inner = self.inner.borrow_mut();
+                inner.waiters.retain(|(i, _)| *i != id);
+                if inner.available > 0 {
+                    inner.waiters.front().map(|(_, w)| w.clone())
                 } else {
                     None
                 }
             };
-            // Wake outside the lock so a waker that re-enters the limiter
-            // cannot deadlock, matching `FetchPermit::drop`.
+            // Wake outside the borrow so an eager re-poll can re-enter.
             if let Some(waker) = waker {
                 waker.wake();
             }
@@ -168,18 +161,17 @@ impl Drop for Acquire {
 /// An in-flight permit. Returns itself to the pool on drop and wakes
 /// the next parked waiter, if any.
 pub struct FetchPermit {
-    inner: Arc<Mutex<LimiterInner>>,
+    inner: Rc<RefCell<LimiterInner>>,
 }
 
 impl Drop for FetchPermit {
     fn drop(&mut self) {
         let waker = {
-            let mut guard = self.inner.lock().expect("limiter poisoned");
-            guard.available += 1;
-            guard.waiters.pop_front().map(|(_, w)| w)
+            let mut inner = self.inner.borrow_mut();
+            inner.available += 1;
+            inner.waiters.pop_front().map(|(_, w)| w)
         };
-        // Wake outside the lock so a waker that re-enters the limiter
-        // (e.g. an eager re-poll on the same thread) cannot deadlock.
+        // Wake outside the borrow so an eager re-poll can re-enter.
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -267,10 +259,9 @@ mod tests {
 
     /// A cancelled (dropped-while-parked) acquirer must not swallow the
     /// wake a later release owes to a live waiter behind it. This is the
-    /// cross-task case the limiter actually faces: the shard thread and
-    /// the RPC worker threads share one limiter, so parked acquirers can
-    /// carry distinct wakers. Regression for the orphaned-waker lost
-    /// wakeup.
+    /// cross-task case the limiter actually faces: concurrent shard-local
+    /// fetches can carry distinct wakers. Regression for the orphaned-waker
+    /// lost wakeup.
     #[test]
     fn cancelled_waiter_does_not_strand_live_waiter() {
         let limiter = FetchLimiter::new(1);
