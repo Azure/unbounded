@@ -37,6 +37,13 @@ const (
 	// crdEstablishedTimeout preserves the full establishment window after the
 	// apply phase while CRDBootstrapTimeout bounds the complete operation.
 	crdEstablishedTimeout = 2 * time.Minute
+
+	defaultCRDMaintenanceInterval = time.Minute
+
+	// defaultCRDMaintenanceFailures is the number of consecutive CRD maintenance
+	// failures tolerated before the maintainer stops the manager and lets the
+	// pod restart.
+	defaultCRDMaintenanceFailures = 3
 )
 
 // CRDBootstrapTimeout bounds the complete CRD bootstrap, including manifest
@@ -44,6 +51,23 @@ const (
 // health server only binds after bootstrap, so the startupProbe budget in
 // deploy/unbounded-operator/04-deployment.yaml.tmpl must exceed this timeout.
 const CRDBootstrapTimeout = 4 * time.Minute
+
+// RequiredCRDNames is the complete set of CRDs owned and bootstrapped by the
+// unbounded-operator.
+var RequiredCRDNames = [...]string{
+	"machines.unbounded-cloud.io",
+	"machineoperations.unbounded-cloud.io",
+	"sites.unbounded-cloud.io",
+	"machineconfigurations.unbounded-cloud.io",
+	"machineoperationcredentials.unbounded-cloud.io",
+	"machineconfigurationversions.unbounded-cloud.io",
+	"sitenodeslices.net.unbounded-cloud.io",
+	"gatewaypools.net.unbounded-cloud.io",
+	"gatewaypoolnodes.net.unbounded-cloud.io",
+	"sitegatewaypoolassignments.net.unbounded-cloud.io",
+	"sitepeerings.net.unbounded-cloud.io",
+	"gatewaypoolpeerings.net.unbounded-cloud.io",
+}
 
 // bootstrapManifestSets returns the embedded manifest filesystems whose CRDs the
 // operator installs at startup. The operator owns CRD lifecycle so a cluster can
@@ -62,6 +86,74 @@ func BootstrapCRDs(ctx context.Context, c client.Client) error {
 	return bootstrapCRDs(ctx, c, CRDBootstrapTimeout)
 }
 
+// CRDMaintainer periodically reapplies the operator-owned CRDs using an
+// uncached client. Transient maintenance failures are retried on the next
+// interval; only a run of MaxFailures consecutive failures stops the manager,
+// so the pod is restarted and retries after any terminating CRD has finished
+// deleting.
+type CRDMaintainer struct {
+	Client   client.Client
+	Interval time.Duration
+	// MaxFailures is the number of consecutive maintenance failures tolerated
+	// before Start returns an error and stops the manager. Defaults to
+	// defaultCRDMaintenanceFailures.
+	MaxFailures int
+	Bootstrap   func(context.Context, client.Client) error
+}
+
+// NeedLeaderElection ensures only the elected operator replica maintains CRDs.
+func (*CRDMaintainer) NeedLeaderElection() bool { return true }
+
+// Start runs CRD maintenance until the manager stops or maintenance fails
+// MaxFailures times in a row.
+func (m *CRDMaintainer) Start(ctx context.Context) error {
+	interval := m.Interval
+	if interval <= 0 {
+		interval = defaultCRDMaintenanceInterval
+	}
+
+	maxFailures := m.MaxFailures
+	if maxFailures <= 0 {
+		maxFailures = defaultCRDMaintenanceFailures
+	}
+
+	bootstrap := m.Bootstrap
+	if bootstrap == nil {
+		bootstrap = BootstrapCRDs
+	}
+
+	logger := log.FromContext(ctx).WithName("crd-maintainer")
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	failures := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := bootstrap(ctx, m.Client); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+
+				failures++
+				if failures >= maxFailures {
+					return fmt.Errorf("maintain CRDs after %d consecutive failures: %w", failures, err)
+				}
+
+				logger.Error(err, "CRD maintenance failed; will retry", "failures", failures, "maxFailures", maxFailures)
+
+				continue
+			}
+
+			failures = 0
+		}
+	}
+}
+
 func bootstrapCRDs(ctx context.Context, c client.Client, timeout time.Duration) error {
 	bootstrapCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -69,7 +161,7 @@ func bootstrapCRDs(ctx context.Context, c client.Client, timeout time.Duration) 
 	ctx = bootstrapCtx
 	logger := log.FromContext(ctx).WithName("crd-bootstrap")
 
-	var names []string
+	appliedCount := 0
 
 	for _, manifests := range bootstrapManifestSets() {
 		applied, err := applyCRDsFromFS(ctx, logger, c, manifests)
@@ -77,18 +169,18 @@ func bootstrapCRDs(ctx context.Context, c client.Client, timeout time.Duration) 
 			return err
 		}
 
-		names = append(names, applied...)
+		appliedCount += len(applied)
 	}
 
-	if len(names) == 0 {
+	if appliedCount == 0 {
 		return nil
 	}
 
-	if err := waitForCRDsEstablished(ctx, c, names); err != nil {
+	if err := waitForCRDsEstablished(ctx, c, RequiredCRDNames[:]); err != nil {
 		return err
 	}
 
-	logger.Info("CRDs installed and established", "count", len(names))
+	logger.Info("CRDs installed and established", "count", appliedCount)
 
 	return nil
 }
@@ -155,6 +247,10 @@ func waitForCRDsEstablished(ctx context.Context, c client.Client, names []string
 				return false, err
 			}
 
+			if crd.DeletionTimestamp != nil {
+				return false, fmt.Errorf("customresourcedefinition %s is being deleted", name)
+			}
+
 			if !crdEstablished(crd) {
 				return false, nil
 			}
@@ -166,6 +262,10 @@ func waitForCRDsEstablished(ctx context.Context, c client.Client, names []string
 
 // crdEstablished reports whether a CRD has the Established=True condition.
 func crdEstablished(crd *apiextensionsv1.CustomResourceDefinition) bool {
+	if crd.DeletionTimestamp != nil {
+		return false
+	}
+
 	for _, cond := range crd.Status.Conditions {
 		if cond.Type == apiextensionsv1.Established && cond.Status == apiextensionsv1.ConditionTrue {
 			return true

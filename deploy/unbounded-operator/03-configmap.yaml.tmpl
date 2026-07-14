@@ -28,4 +28,4 @@ data:
   UNBOUNDED_API_SERVER_ENDPOINT: {{ default "" .APIServerEndpoint | quote }}
   # Whether the operator translates legacy net-group Sites, migrates state into
   # this namespace, and reaps the pre-consolidation namespaces.
-  UNBOUNDED_REAP_LEGACY_RESOURCES: "true"
+  UNBOUNDED_REAP_LEGACY_RESOURCES: {{ default "true" .ReapLegacyResources | quote }}

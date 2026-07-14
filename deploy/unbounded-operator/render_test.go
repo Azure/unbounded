@@ -6,6 +6,7 @@ package unboundedoperator
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -56,13 +57,16 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 	// The Deployment pod template carries the matching hash annotation.
 	var deploy struct {
 		Spec struct {
+			Replicas int32          `yaml:"replicas"`
+			Strategy map[string]any `yaml:"strategy"`
 			Template struct {
 				Metadata struct {
 					Annotations map[string]string `yaml:"annotations"`
 				} `yaml:"metadata"`
 				Spec struct {
 					Containers []struct {
-						Name         string `yaml:"name"`
+						Name         string   `yaml:"name"`
+						Args         []string `yaml:"args"`
 						StartupProbe *struct {
 							PeriodSeconds    int32 `yaml:"periodSeconds"`
 							FailureThreshold int32 `yaml:"failureThreshold"`
@@ -75,16 +79,38 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 
 	readYAML(t, filepath.Join(outputDir, "04-deployment.yaml"), &deploy)
 
-	sum := sha256.Sum256([]byte(endpoint))
+	canonical, err := json.Marshal(cm.Data)
+	if err != nil {
+		t.Fatalf("marshal configmap data: %v", err)
+	}
+
+	sum := sha256.Sum256(canonical)
 	want := hex.EncodeToString(sum[:])
 
 	if got := deploy.Spec.Template.Metadata.Annotations["unbounded-cloud.io/operator-config-hash"]; got != want {
-		t.Fatalf("deployment operator-config-hash annotation = %q, want %q (sha256 of endpoint)", got, want)
+		t.Fatalf("deployment operator-config-hash annotation = %q, want %q (sha256 of complete ConfigMap data)", got, want)
+	}
+
+	if deploy.Spec.Replicas != 1 {
+		t.Fatalf("deployment replicas = %d, want 1", deploy.Spec.Replicas)
+	}
+
+	if got := deploy.Spec.Strategy["type"]; got != "Recreate" {
+		t.Fatalf("deployment strategy = %q, want Recreate", got)
+	}
+
+	rollingUpdate, found := deploy.Spec.Strategy["rollingUpdate"]
+	if !found || rollingUpdate != nil {
+		t.Fatalf("deployment strategy rollingUpdate = %#v (present: %t), want explicit null", rollingUpdate, found)
 	}
 
 	for _, container := range deploy.Spec.Template.Spec.Containers {
 		if container.Name != "controller" || container.StartupProbe == nil {
 			continue
+		}
+
+		if !contains(container.Args, "--leader-elect=true") {
+			t.Fatalf("controller args = %v, want --leader-elect=true", container.Args)
 		}
 
 		budget := time.Duration(container.StartupProbe.FailureThreshold) *
@@ -107,6 +133,73 @@ func contains(values []string, want string) bool {
 	}
 
 	return false
+}
+
+func TestOperatorConfigHashChangesWithEachConfigValue(t *testing.T) {
+	t.Parallel()
+
+	renderHash := func(endpoint, reapLegacyResources string) string {
+		t.Helper()
+
+		outputDir := t.TempDir()
+		if err := render.Render(filepath.Join(repoRoot(t), "deploy", "unbounded-operator"), outputDir, map[string]string{
+			"Namespace":           "unbounded-system",
+			"OperatorImage":       "operator:test",
+			"MetalmanImage":       "metalman:test",
+			"APIServerEndpoint":   endpoint,
+			"ReapLegacyResources": reapLegacyResources,
+		}); err != nil {
+			t.Fatalf("render.Render: %v", err)
+		}
+
+		var cm struct {
+			Data map[string]string `yaml:"data"`
+		}
+		readYAML(t, filepath.Join(outputDir, "03-configmap.yaml"), &cm)
+
+		if got := cm.Data["UNBOUNDED_API_SERVER_ENDPOINT"]; got != endpoint {
+			t.Fatalf("configmap endpoint = %q, want %q", got, endpoint)
+		}
+
+		if got := cm.Data["UNBOUNDED_REAP_LEGACY_RESOURCES"]; got != reapLegacyResources {
+			t.Fatalf("configmap reap legacy resources = %q, want %q", got, reapLegacyResources)
+		}
+
+		var deploy struct {
+			Spec struct {
+				Template struct {
+					Metadata struct {
+						Annotations map[string]string `yaml:"annotations"`
+					} `yaml:"metadata"`
+				} `yaml:"template"`
+			} `yaml:"spec"`
+		}
+		readYAML(t, filepath.Join(outputDir, "04-deployment.yaml"), &deploy)
+
+		canonical, err := json.Marshal(cm.Data)
+		if err != nil {
+			t.Fatalf("marshal configmap data: %v", err)
+		}
+
+		sum := sha256.Sum256(canonical)
+		wantHash := hex.EncodeToString(sum[:])
+
+		gotHash := deploy.Spec.Template.Metadata.Annotations["unbounded-cloud.io/operator-config-hash"]
+		if gotHash != wantHash {
+			t.Fatalf("deployment config hash = %q, want %q", gotHash, wantHash)
+		}
+
+		return gotHash
+	}
+
+	baseline := renderHash("https://api.example.test:6443", "true")
+	if got := renderHash("https://other.example.test:6443", "true"); got == baseline {
+		t.Fatal("changing UNBOUNDED_API_SERVER_ENDPOINT did not change the rendered config hash")
+	}
+
+	if got := renderHash("https://api.example.test:6443", "false"); got == baseline {
+		t.Fatal("changing UNBOUNDED_REAP_LEGACY_RESOURCES did not change the rendered config hash")
+	}
 }
 
 func TestOperatorRBACIncludesCachedReadKinds(t *testing.T) {

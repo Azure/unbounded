@@ -5,6 +5,8 @@ package app
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -14,11 +16,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/internal/operator"
 )
 
 func TestInstallCommandFlags(t *testing.T) {
@@ -100,8 +105,11 @@ func TestInstallHandlerApplyBootstrapManifests(t *testing.T) {
 	// operator at startup (BootstrapCRDs), so install must NOT apply them.
 	require.Contains(t, applied, "Deployment/unbounded-operator")
 	require.Contains(t, applied, "ConfigMap/unbounded-operator-config")
-	require.NotContains(t, applied, "CustomResourceDefinition/sites.unbounded-cloud.io")
-	require.NotContains(t, applied, "CustomResourceDefinition/gatewaypools.net.unbounded-cloud.io")
+
+	for _, resource := range applied {
+		require.NotContains(t, resource, "CustomResourceDefinition/", "install must leave CRD field ownership with unbounded-operator")
+	}
+
 	require.Less(t,
 		indexOf(applied, "ConfigMap/unbounded-operator-config"),
 		indexOf(applied, "Deployment/unbounded-operator"),
@@ -119,10 +127,54 @@ func indexOf(values []string, want string) int {
 	return -1
 }
 
+type capturedOperatorApply struct {
+	configMap  *unstructured.Unstructured
+	deployment *unstructured.Unstructured
+	applyCount int
+}
+
+func newCapturingInstallClient(objects ...client.Object) (client.Client, *capturedOperatorApply) {
+	captured := &capturedOperatorApply{}
+	cli := fakeclient.NewClientBuilder().
+		WithObjects(objects...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				named, ok := obj.(interface {
+					GetKind() string
+					GetName() string
+					DeepCopy() *unstructured.Unstructured
+				})
+				if !ok {
+					return fmt.Errorf("unexpected apply configuration %T", obj)
+				}
+
+				captured.applyCount++
+
+				switch {
+				case named.GetKind() == "ConfigMap" && named.GetName() == "unbounded-operator-config":
+					captured.configMap = named.DeepCopy()
+				case named.GetKind() == "Deployment" && named.GetName() == "unbounded-operator":
+					captured.deployment = named.DeepCopy()
+				}
+
+				return nil
+			},
+		}).
+		Build()
+
+	return cli, captured
+}
+
 func TestMutateOperatorObjectWritesConfigEndpoint(t *testing.T) {
 	t.Parallel()
 
-	h := &installHandler{namespace: "unbounded-system", apiServerEndpoint: "https://api.example.test:6443"}
+	h := &installHandler{
+		namespace: "unbounded-system",
+		operatorConfigData: map[string]string{
+			"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
+			"UNBOUNDED_REAP_LEGACY_RESOURCES": "true",
+		},
+	}
 
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1",
@@ -136,12 +188,181 @@ func TestMutateOperatorObjectWritesConfigEndpoint(t *testing.T) {
 	got, _, err := unstructured.NestedString(obj.Object, "data", "UNBOUNDED_API_SERVER_ENDPOINT")
 	require.NoError(t, err)
 	require.Equal(t, "https://api.example.test:6443", got)
+
+	got, _, err = unstructured.NestedString(obj.Object, "data", "UNBOUNDED_REAP_LEGACY_RESOURCES")
+	require.NoError(t, err)
+	require.Equal(t, "true", got)
+}
+
+func TestInstallMergesLiveReaperConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		existingConfig *unstructured.Unstructured
+		wantReaper     string
+	}{
+		{
+			name: "existing false remains false",
+			existingConfig: &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name":      "unbounded-operator-config",
+					"namespace": "unbounded-system",
+				},
+				"data": map[string]any{
+					"UNBOUNDED_API_SERVER_ENDPOINT":   "https://old.example.test:6443",
+					"UNBOUNDED_REAP_LEGACY_RESOURCES": "FALSE",
+				},
+			}},
+			wantReaper: "false",
+		},
+		{
+			name: "existing config without reaper defaults true",
+			existingConfig: &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name":      "unbounded-operator-config",
+					"namespace": "unbounded-system",
+				},
+				"data": map[string]any{"UNBOUNDED_API_SERVER_ENDPOINT": "https://old.example.test:6443"},
+			}},
+			wantReaper: "true",
+		},
+		{
+			name:       "missing config defaults true",
+			wantReaper: "true",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var objects []client.Object
+			if tt.existingConfig != nil {
+				objects = append(objects, tt.existingConfig)
+			}
+
+			cli, captured := newCapturingInstallClient(objects...)
+			h := installHandler{
+				namespace:         "unbounded-system",
+				apiServerEndpoint: "https://api.example.test:6443",
+				kubeResourcesCli:  cli,
+				logger:            discardLogger(),
+			}
+
+			require.NoError(t, h.execute(context.Background()))
+			require.NotNil(t, captured.configMap)
+			require.NotNil(t, captured.deployment)
+
+			data, found, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, map[string]string{
+				"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
+				"UNBOUNDED_REAP_LEGACY_RESOURCES": tt.wantReaper,
+			}, data)
+
+			gotHash, found, err := unstructured.NestedString(captured.deployment.Object, "spec", "template", "metadata", "annotations", operatorConfigHashAnnotation)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, operatorConfigHash(data), gotHash)
+
+			strategyType, found, err := unstructured.NestedString(captured.deployment.Object, "spec", "strategy", "type")
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, "Recreate", strategyType)
+
+			rollingUpdate, found, err := unstructured.NestedFieldNoCopy(captured.deployment.Object, "spec", "strategy", "rollingUpdate")
+			require.NoError(t, err)
+			require.True(t, found, "rollingUpdate must remain explicit through manifest apply conversion")
+			require.Nil(t, rollingUpdate)
+		})
+	}
+}
+
+func TestInstallRejectsInvalidLiveReaperConfigBeforeApply(t *testing.T) {
+	t.Parallel()
+
+	existing := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":      "unbounded-operator-config",
+			"namespace": "unbounded-system",
+		},
+		"data": map[string]any{"UNBOUNDED_REAP_LEGACY_RESOURCES": "not-a-bool"},
+	}}
+	cli, captured := newCapturingInstallClient(existing)
+	h := installHandler{
+		namespace:        "unbounded-system",
+		kubeResourcesCli: cli,
+		logger:           discardLogger(),
+	}
+
+	err := h.execute(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "UNBOUNDED_REAP_LEGACY_RESOURCES")
+	require.Zero(t, captured.applyCount)
+}
+
+func TestInstallExecuteReinitializesDerivedConfig(t *testing.T) {
+	t.Parallel()
+
+	existing := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":      "unbounded-operator-config",
+			"namespace": "unbounded-system",
+		},
+		"data": map[string]any{"UNBOUNDED_REAP_LEGACY_RESOURCES": "false"},
+	}}
+	firstClient, first := newCapturingInstallClient(existing)
+	h := installHandler{
+		namespace:        "unbounded-system",
+		kubeResourcesCli: firstClient,
+		restConfig:       &rest.Config{Host: "https://first.example.test:6443"},
+		logger:           discardLogger(),
+	}
+
+	require.NoError(t, h.execute(context.Background()))
+
+	firstData, _, err := unstructured.NestedStringMap(first.configMap.Object, "data")
+	require.NoError(t, err)
+	require.Equal(t, "false", firstData["UNBOUNDED_REAP_LEGACY_RESOURCES"])
+	require.Equal(t, "https://first.example.test:6443", firstData["UNBOUNDED_API_SERVER_ENDPOINT"])
+
+	secondClient, second := newCapturingInstallClient()
+	h.kubeResourcesCli = secondClient
+	h.restConfig.Host = "https://second.example.test:6443"
+	h.operatorRepairToken = "stale-repair-token"
+
+	require.NoError(t, h.execute(context.Background()))
+
+	secondData, _, err := unstructured.NestedStringMap(second.configMap.Object, "data")
+	require.NoError(t, err)
+	require.Equal(t, "true", secondData["UNBOUNDED_REAP_LEGACY_RESOURCES"])
+	require.Equal(t, "https://second.example.test:6443", secondData["UNBOUNDED_API_SERVER_ENDPOINT"])
+
+	_, found, err := unstructured.NestedString(second.deployment.Object, "spec", "template", "metadata", "annotations", operatorCRDRepairAnnotation)
+	require.NoError(t, err)
+	require.False(t, found)
 }
 
 func TestMutateOperatorObjectRetargetsNamespace(t *testing.T) {
 	t.Parallel()
 
-	h := &installHandler{namespace: "custom-system"}
+	h := &installHandler{
+		namespace: "custom-system",
+		operatorConfigData: map[string]string{
+			"UNBOUNDED_API_SERVER_ENDPOINT":   "",
+			"UNBOUNDED_REAP_LEGACY_RESOURCES": "true",
+		},
+	}
 
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apps/v1",
@@ -181,7 +402,7 @@ func TestMutateOperatorObjectRetargetsNamespace(t *testing.T) {
 func TestCRDEstablished(t *testing.T) {
 	t.Parallel()
 
-	obj := &apiextensionsv1.CustomResourceDefinition{
+	established := &apiextensionsv1.CustomResourceDefinition{
 		Status: apiextensionsv1.CustomResourceDefinitionStatus{
 			Conditions: []apiextensionsv1.CustomResourceDefinitionCondition{
 				{
@@ -192,9 +413,15 @@ func TestCRDEstablished(t *testing.T) {
 		},
 	}
 
-	unstructuredObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	unstructuredObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(established)
 	require.NoError(t, err)
-	require.True(t, crdEstablished(&unstructured.Unstructured{Object: unstructuredObj}))
+
+	obj := &unstructured.Unstructured{Object: unstructuredObj}
+	require.True(t, crdEstablished(obj))
+
+	now := metav1.Now()
+	obj.SetDeletionTimestamp(&now)
+	require.False(t, crdEstablished(obj), "a terminating CRD must not be treated as established")
 }
 
 // operatorDeployment builds an unbounded-operator Deployment with the given
@@ -203,6 +430,10 @@ func operatorDeployment(status appsv1.DeploymentStatus) *appsv1.Deployment {
 	replicas := int32(1)
 
 	return &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "apps/v1",
+			Kind:       "Deployment",
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:  "unbounded-system",
 			Name:       "unbounded-operator",
@@ -310,7 +541,16 @@ func TestWaitForOperatorSucceedsOnCompleteRollout(t *testing.T) {
 func TestMutateOperatorObjectStampsConfigHash(t *testing.T) {
 	t.Parallel()
 
-	newDeploy := func() *unstructured.Unstructured {
+	newConfigMap := func(data map[string]any) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata":   map[string]any{"name": "unbounded-operator-config", "namespace": "unbounded-system"},
+			"data":       data,
+		}}
+	}
+
+	newDeployment := func() *unstructured.Unstructured {
 		return &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": "apps/v1",
 			"kind":       "Deployment",
@@ -325,9 +565,16 @@ func TestMutateOperatorObjectStampsConfigHash(t *testing.T) {
 		}}
 	}
 
-	hashOf := func(endpoint string) string {
-		h := &installHandler{namespace: "unbounded-system", apiServerEndpoint: endpoint}
-		obj := newDeploy()
+	hashOf := func(data map[string]any) string {
+		configData := make(map[string]string, len(data))
+		for key, value := range data {
+			configData[key] = value.(string)
+		}
+
+		h := &installHandler{namespace: "unbounded-system", operatorConfigData: configData}
+		require.NoError(t, h.mutateOperatorObject(newConfigMap(data)))
+
+		obj := newDeployment()
 		require.NoError(t, h.mutateOperatorObject(obj))
 
 		got, found, err := unstructured.NestedString(obj.Object, "spec", "template", "metadata", "annotations", operatorConfigHashAnnotation)
@@ -337,12 +584,337 @@ func TestMutateOperatorObjectStampsConfigHash(t *testing.T) {
 		return got
 	}
 
-	// The stamp is a stable hash of the resolved endpoint, matching the
-	// render-time hash so both install and make-rendered manifests agree.
-	endpoint := "https://api.example.test:6443"
-	require.Equal(t, operatorConfigHash(endpoint), hashOf(endpoint))
+	first := map[string]any{
+		"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
+		"UNBOUNDED_REAP_LEGACY_RESOURCES": "true",
+	}
+	second := map[string]any{
+		"UNBOUNDED_REAP_LEGACY_RESOURCES": "true",
+		"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
+	}
 
-	// A changed endpoint changes the hash, which changes the pod template and
-	// therefore triggers a rollout (finding #3).
-	require.NotEqual(t, hashOf(endpoint), hashOf("https://other.example.test:6443"))
+	wantData := map[string]string{
+		"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
+		"UNBOUNDED_REAP_LEGACY_RESOURCES": "true",
+	}
+	require.Equal(t, operatorConfigHash(wantData), hashOf(first))
+	require.Equal(t, hashOf(first), hashOf(second), "hash must be independent of ConfigMap map order")
+
+	changedEndpoint := map[string]any{
+		"UNBOUNDED_API_SERVER_ENDPOINT":   "https://other.example.test:6443",
+		"UNBOUNDED_REAP_LEGACY_RESOURCES": "true",
+	}
+	changedReaper := map[string]any{
+		"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
+		"UNBOUNDED_REAP_LEGACY_RESOURCES": "false",
+	}
+
+	require.NotEqual(t, hashOf(first), hashOf(changedEndpoint))
+	require.NotEqual(t, hashOf(first), hashOf(changedReaper))
+}
+
+func TestWaitForCRDsChecksCompleteOperatorContract(t *testing.T) {
+	t.Parallel()
+
+	var names []string
+
+	cli := fakeclient.NewClientBuilder().
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(_ context.Context, _ client.WithWatch, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+				crd, ok := obj.(*unstructured.Unstructured)
+				if !ok || crd.GetKind() != "CustomResourceDefinition" {
+					return fmt.Errorf("unexpected get %s into %T", key, obj)
+				}
+
+				names = append(names, key.Name)
+				crd.SetName(key.Name)
+				crd.Object["status"] = map[string]any{
+					"conditions": []any{map[string]any{"type": "Established", "status": "True"}},
+				}
+
+				return nil
+			},
+		}).
+		Build()
+
+	h := installHandler{
+		timeout:          5 * time.Second,
+		kubeResourcesCli: cli,
+	}
+	require.NoError(t, h.waitForCRDs(context.Background()))
+
+	want := append([]string(nil), operator.RequiredCRDNames[:]...)
+
+	sort.Strings(names)
+	sort.Strings(want)
+	require.Equal(t, want, names)
+}
+
+func TestWaitForCRDsRejectsTerminatingEstablishedCRD(t *testing.T) {
+	t.Parallel()
+
+	terminatingName := operator.RequiredCRDNames[0]
+	now := metav1.Now()
+	cli := fakeclient.NewClientBuilder().
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(_ context.Context, _ client.WithWatch, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+				crd, ok := obj.(*unstructured.Unstructured)
+				if !ok || crd.GetKind() != "CustomResourceDefinition" {
+					return fmt.Errorf("unexpected get %s into %T", key, obj)
+				}
+
+				crd.SetName(key.Name)
+
+				crd.Object["status"] = map[string]any{
+					"conditions": []any{map[string]any{"type": "Established", "status": "True"}},
+				}
+				if key.Name == terminatingName {
+					crd.SetDeletionTimestamp(&now)
+				}
+
+				return nil
+			},
+		}).
+		Build()
+
+	h := installHandler{timeout: 100 * time.Millisecond, kubeResourcesCli: cli}
+	err := h.waitForCRDs(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "waiting for CRDs to be established")
+}
+
+func TestInstallRepairsCRDsOnlyByRestartingExistingOperator(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		existingDeploy    bool
+		unhealthyCRDName  string
+		unhealthyExists   bool
+		unhealthyDeleting bool
+		oldRepairToken    string
+		rolloutComplete   bool
+		wantRepairToken   string
+		wantTokenCalls    int
+	}{
+		{
+			name:             "missing CRD restarts existing operator",
+			existingDeploy:   true,
+			unhealthyCRDName: operator.RequiredCRDNames[0],
+			rolloutComplete:  true,
+			wantRepairToken:  "fresh-repair-token",
+			wantTokenCalls:   1,
+		},
+		{
+			name:             "unestablished CRD restarts existing operator",
+			existingDeploy:   true,
+			unhealthyCRDName: operator.RequiredCRDNames[1],
+			unhealthyExists:  true,
+			rolloutComplete:  true,
+			wantRepairToken:  "fresh-repair-token",
+			wantTokenCalls:   1,
+		},
+		{
+			name:              "terminating established CRD restarts existing operator",
+			existingDeploy:    true,
+			unhealthyCRDName:  operator.RequiredCRDNames[2],
+			unhealthyExists:   true,
+			unhealthyDeleting: true,
+			rolloutComplete:   true,
+			wantRepairToken:   "fresh-repair-token",
+			wantTokenCalls:    1,
+		},
+		{
+			name:             "fresh install needs no repair token",
+			unhealthyCRDName: operator.RequiredCRDNames[0],
+		},
+		{
+			name:            "healthy reinstall preserves existing token",
+			existingDeploy:  true,
+			oldRepairToken:  "existing-repair-token",
+			wantRepairToken: "existing-repair-token",
+		},
+		{
+			name:             "in-progress repair preserves existing token",
+			existingDeploy:   true,
+			unhealthyCRDName: operator.RequiredCRDNames[0],
+			oldRepairToken:   "existing-repair-token",
+			wantRepairToken:  "existing-repair-token",
+		},
+		{
+			name:             "in-progress repair preserves empty token",
+			existingDeploy:   true,
+			unhealthyCRDName: operator.RequiredCRDNames[0],
+		},
+		{
+			name:           "healthy reinstall adds no token",
+			existingDeploy: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			objects := make([]client.Object, 0, len(operator.RequiredCRDNames)+1)
+			for _, name := range operator.RequiredCRDNames {
+				if name == tt.unhealthyCRDName && !tt.unhealthyExists {
+					continue
+				}
+
+				crd := establishedCRD(name)
+				if name == tt.unhealthyCRDName {
+					if tt.unhealthyDeleting {
+						now := metav1.Now()
+						crd.SetDeletionTimestamp(&now)
+						crd.SetFinalizers([]string{"test.unbounded-cloud.io/hold"})
+					} else {
+						delete(crd.Object, "status")
+					}
+				}
+
+				objects = append(objects, crd)
+			}
+
+			if tt.existingDeploy {
+				annotations := map[string]string{}
+				if tt.oldRepairToken != "" {
+					annotations[operatorCRDRepairAnnotation] = tt.oldRepairToken
+				}
+
+				status := appsv1.DeploymentStatus{}
+				if tt.rolloutComplete {
+					status = appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: 1, UpdatedReplicas: 1, AvailableReplicas: 1}
+				}
+
+				deploy := operatorDeployment(status)
+				deploy.Spec.Template.Annotations = annotations
+				deployObject, err := runtime.DefaultUnstructuredConverter.ToUnstructured(deploy)
+				require.NoError(t, err)
+
+				objects = append(objects, &unstructured.Unstructured{Object: deployObject})
+			}
+
+			var (
+				appliedDeployment *unstructured.Unstructured
+				appliedKinds      []string
+				tokenCalls        int
+			)
+
+			cli := fakeclient.NewClientBuilder().
+				WithObjects(objects...).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+						named, ok := obj.(interface {
+							GetKind() string
+							GetName() string
+							DeepCopy() *unstructured.Unstructured
+						})
+						if !ok {
+							return fmt.Errorf("unexpected apply configuration %T", obj)
+						}
+
+						appliedKinds = append(appliedKinds, named.GetKind())
+						if named.GetKind() == "Deployment" && named.GetName() == "unbounded-operator" {
+							appliedDeployment = named.DeepCopy()
+						}
+
+						return nil
+					},
+				}).
+				Build()
+
+			h := installHandler{
+				namespace:        "unbounded-system",
+				wait:             false,
+				kubeResourcesCli: cli,
+				logger:           discardLogger(),
+				newRepairToken: func() (string, error) {
+					tokenCalls++
+
+					return "fresh-repair-token", nil
+				},
+			}
+
+			require.NoError(t, h.execute(context.Background()))
+			require.NotNil(t, appliedDeployment)
+			require.Equal(t, tt.wantTokenCalls, tokenCalls)
+
+			gotToken, _, err := unstructured.NestedString(appliedDeployment.Object, "spec", "template", "metadata", "annotations", operatorCRDRepairAnnotation)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantRepairToken, gotToken)
+
+			configHash, found, err := unstructured.NestedString(appliedDeployment.Object, "spec", "template", "metadata", "annotations", operatorConfigHashAnnotation)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.NotEmpty(t, configHash)
+			require.NotContains(t, appliedKinds, "CustomResourceDefinition")
+		})
+	}
+}
+
+func TestPrepareOperatorRepairRapidRetryPreservesNewToken(t *testing.T) {
+	t.Parallel()
+
+	objects := make([]client.Object, 0, len(operator.RequiredCRDNames))
+	for _, name := range operator.RequiredCRDNames[1:] {
+		objects = append(objects, establishedCRD(name))
+	}
+
+	deploy := operatorDeployment(appsv1.DeploymentStatus{
+		ObservedGeneration: 2,
+		Replicas:           1,
+		UpdatedReplicas:    1,
+		AvailableReplicas:  1,
+	})
+	deployObject, err := runtime.DefaultUnstructuredConverter.ToUnstructured(deploy)
+	require.NoError(t, err)
+
+	objects = append(objects, &unstructured.Unstructured{Object: deployObject})
+	cli := fakeclient.NewClientBuilder().WithObjects(objects...).Build()
+
+	tokenCalls := 0
+	h := installHandler{
+		namespace:        "unbounded-system",
+		kubeResourcesCli: cli,
+		newRepairToken: func() (string, error) {
+			tokenCalls++
+
+			return "first-repair-token", nil
+		},
+	}
+
+	require.NoError(t, h.prepareOperatorRepair(context.Background()))
+	require.Equal(t, "first-repair-token", h.operatorRepairToken)
+	require.Equal(t, 1, tokenCalls)
+
+	inProgressDeploy := operatorDeployment(appsv1.DeploymentStatus{
+		ObservedGeneration: 2,
+		Replicas:           1,
+		UpdatedReplicas:    1,
+	})
+	inProgressDeploy.Spec.Template.Annotations = map[string]string{
+		operatorCRDRepairAnnotation: "first-repair-token",
+	}
+	inProgressObject, err := runtime.DefaultUnstructuredConverter.ToUnstructured(inProgressDeploy)
+	require.NoError(t, err)
+
+	objects[len(objects)-1] = &unstructured.Unstructured{Object: inProgressObject}
+	h.kubeResourcesCli = fakeclient.NewClientBuilder().WithObjects(objects...).Build()
+
+	h.operatorRepairToken = ""
+	require.NoError(t, h.prepareOperatorRepair(context.Background()))
+	require.Equal(t, "first-repair-token", h.operatorRepairToken)
+	require.Equal(t, 1, tokenCalls, "rapid retry must not generate another rollout token")
+}
+
+func establishedCRD(name string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiextensions.k8s.io/v1",
+		"kind":       "CustomResourceDefinition",
+		"metadata":   map[string]any{"name": name},
+		"status": map[string]any{
+			"conditions": []any{map[string]any{"type": "Established", "status": "True"}},
+		},
+	}}
 }

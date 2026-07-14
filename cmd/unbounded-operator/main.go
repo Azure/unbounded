@@ -145,6 +145,10 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("create manager: %w", err)
 	}
 
+	if err := mgr.Add(&operator.CRDMaintainer{Client: bootstrapClient}); err != nil {
+		return fmt.Errorf("add CRD maintainer: %w", err)
+	}
+
 	if err := (&operator.SiteReconciler{
 		Client:    mgr.GetClient(),
 		Scheme:    scheme,
