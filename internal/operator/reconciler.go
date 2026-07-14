@@ -1265,6 +1265,26 @@ func metalmanDeployment(site *unboundedv1alpha3.Site, namespace string, cfg Conf
 		args = append(args, "--dhcp-auto-interface")
 	}
 
+	env := []corev1.EnvVar{{
+		// Metalman resolves its leader-election lease namespace from
+		// POD_NAMESPACE so the lease and its namespace-scoped RBAC stay
+		// co-located with the Deployment under any install namespace.
+		Name: "POD_NAMESPACE",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+		},
+	}}
+
+	// Advertise the operator-resolved API server endpoint to metalman so the
+	// kubeconfig it serves to provisioning nodes matches what machina writes,
+	// and so metalman does not need to rediscover it (managed control planes
+	// such as AKS do not publish kube-public/cluster-info). Metalman still
+	// sources the CA from the in-cluster service-account mount when cluster-info
+	// is unavailable.
+	if cfg.APIServerEndpoint != "" {
+		env = append(env, corev1.EnvVar{Name: "METALMAN_APISERVER_URL", Value: cfg.APIServerEndpoint})
+	}
+
 	// metalman is hostNetwork and binds host ports (DHCP/TFTP/HTTP), so a surge
 	// pod cannot start while the old pod holds them on the same node. Terminate
 	// the old pod before creating the new one to avoid a rollout deadlock.
@@ -1303,16 +1323,7 @@ func metalmanDeployment(site *unboundedv1alpha3.Site, namespace string, cfg Conf
 						Image:           image,
 						ImagePullPolicy: corev1.PullAlways,
 						Args:            args,
-						Env: []corev1.EnvVar{{
-							// Metalman resolves its leader-election lease
-							// namespace from POD_NAMESPACE so the lease and its
-							// namespace-scoped RBAC stay co-located with the
-							// Deployment under any install namespace.
-							Name: "POD_NAMESPACE",
-							ValueFrom: &corev1.EnvVarSource{
-								FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
-							},
-						}},
+						Env:             env,
 						Ports: []corev1.ContainerPort{
 							{Name: "http", ContainerPort: 8880, Protocol: corev1.ProtocolTCP},
 							{Name: "health", ContainerPort: 8081, Protocol: corev1.ProtocolTCP},

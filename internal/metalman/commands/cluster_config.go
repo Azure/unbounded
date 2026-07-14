@@ -24,9 +24,12 @@ import (
 const (
 	// apiserverURLOverrideEnv, when set, overrides the API server URL
 	// discovered from the cluster-info ConfigMap in kube-public. The CA
-	// certificate is still read from the ConfigMap. This is useful in
-	// test environments (e.g. kind) where the ConfigMap contains a
-	// hostname that is unreachable from provisioned nodes.
+	// certificate comes from the ConfigMap when available, otherwise from the
+	// in-cluster service-account mount. The operator injects this with the
+	// endpoint it resolved; it is also useful in test environments (e.g. kind)
+	// where the ConfigMap contains a hostname unreachable from provisioned
+	// nodes, and on managed control planes (e.g. AKS) that do not publish
+	// cluster-info at all.
 	apiserverURLOverrideEnv = "METALMAN_APISERVER_URL"
 )
 
@@ -41,6 +44,11 @@ type ClusterInfoWatcher struct {
 	log                  *slog.Logger
 	apiserverURLOverride string
 
+	// inClusterCA reads the fallback CA when cluster-info is unavailable. It is
+	// a field so tests can inject a fixture; it defaults to
+	// clusterinfo.InClusterCA.
+	inClusterCA func() ([]byte, error)
+
 	mu   sync.RWMutex
 	info netboot.ClusterInfo
 }
@@ -51,8 +59,9 @@ type ClusterInfoWatcher struct {
 // before the first template render.
 //
 // If the METALMAN_APISERVER_URL environment variable is set, its value
-// overrides the API server URL from the ConfigMap on every refresh. The
-// CA certificate is always read from the ConfigMap.
+// overrides the API server URL from the ConfigMap on every refresh. When
+// cluster-info is unavailable (e.g. AKS), the API server URL comes from that
+// override and the CA from the in-cluster service-account mount.
 func NewClusterInfoWatcher(
 	ctx context.Context,
 	clientset kubernetes.Interface,
@@ -62,6 +71,7 @@ func NewClusterInfoWatcher(
 		clientset:            clientset,
 		log:                  log,
 		apiserverURLOverride: os.Getenv(apiserverURLOverrideEnv),
+		inClusterCA:          clusterinfo.InClusterCA,
 	}
 
 	if w.apiserverURLOverride != "" {
@@ -114,20 +124,50 @@ func (w *ClusterInfoWatcher) Start(ctx context.Context) error {
 }
 
 // refresh re-resolves the cluster-info from the Kubernetes API.
+//
+// The API server URL comes from the METALMAN_APISERVER_URL override when set
+// (the operator injects the endpoint it resolved), otherwise from
+// kube-public/cluster-info. The CA comes from cluster-info when available and
+// otherwise from the in-cluster service-account mount, so metalman still works
+// on managed control planes (e.g. AKS) that do not publish cluster-info.
 func (w *ClusterInfoWatcher) refresh(ctx context.Context) error {
-	resolved, err := clusterinfo.Resolve(ctx, w.clientset)
-	if err != nil {
-		return fmt.Errorf("resolving cluster info: %w", err)
+	var (
+		apiserverURL string
+		caPEM        []byte
+	)
+
+	if resolved, err := clusterinfo.Resolve(ctx, w.clientset); err != nil {
+		w.log.Info("cluster-info unavailable; relying on overrides and the in-cluster CA", "error", err)
+	} else {
+		apiserverURL = resolved.ApiserverURL
+		caPEM = resolved.CACertPEM
 	}
 
-	apiserverURL := resolved.ApiserverURL
 	if w.apiserverURLOverride != "" {
 		apiserverURL = w.apiserverURLOverride
 	}
 
+	if len(caPEM) == 0 {
+		readCA := w.inClusterCA
+		if readCA == nil {
+			readCA = clusterinfo.InClusterCA
+		}
+
+		ca, err := readCA()
+		if err != nil {
+			return fmt.Errorf("no CA available: cluster-info absent and reading the in-cluster CA failed: %w", err)
+		}
+
+		caPEM = ca
+	}
+
+	if apiserverURL == "" {
+		return fmt.Errorf("no API server URL available: set %s or publish kube-public/cluster-info", apiserverURLOverrideEnv)
+	}
+
 	info := netboot.ClusterInfo{
 		ApiserverURL: apiserverURL,
-		CACertBase64: base64.StdEncoding.EncodeToString(resolved.CACertPEM),
+		CACertBase64: base64.StdEncoding.EncodeToString(caPEM),
 	}
 
 	w.mu.Lock()
