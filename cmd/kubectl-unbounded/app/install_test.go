@@ -319,7 +319,10 @@ func TestInstallExecuteReinitializesDerivedConfig(t *testing.T) {
 			"name":      "unbounded-operator-config",
 			"namespace": "unbounded-system",
 		},
-		"data": map[string]any{"UNBOUNDED_REAP_LEGACY_RESOURCES": "false"},
+		"data": map[string]any{
+			"UNBOUNDED_REAP_LEGACY_RESOURCES": "false",
+			"UNBOUNDED_API_SERVER_ENDPOINT":   "https://preserved.example.test:6443",
+		},
 	}}
 	firstClient, first := newCapturingInstallClient(existing)
 	h := installHandler{
@@ -334,7 +337,7 @@ func TestInstallExecuteReinitializesDerivedConfig(t *testing.T) {
 	firstData, _, err := unstructured.NestedStringMap(first.configMap.Object, "data")
 	require.NoError(t, err)
 	require.Equal(t, "false", firstData["UNBOUNDED_REAP_LEGACY_RESOURCES"])
-	require.Equal(t, "https://first.example.test:6443", firstData["UNBOUNDED_API_SERVER_ENDPOINT"])
+	require.Equal(t, "https://preserved.example.test:6443", firstData["UNBOUNDED_API_SERVER_ENDPOINT"])
 
 	secondClient, second := newCapturingInstallClient()
 	h.kubeResourcesCli = secondClient
@@ -346,7 +349,7 @@ func TestInstallExecuteReinitializesDerivedConfig(t *testing.T) {
 	secondData, _, err := unstructured.NestedStringMap(second.configMap.Object, "data")
 	require.NoError(t, err)
 	require.Equal(t, "true", secondData["UNBOUNDED_REAP_LEGACY_RESOURCES"])
-	require.Equal(t, "https://second.example.test:6443", secondData["UNBOUNDED_API_SERVER_ENDPOINT"])
+	require.Equal(t, "", secondData["UNBOUNDED_API_SERVER_ENDPOINT"])
 
 	_, found, err := unstructured.NestedString(second.deployment.Object, "spec", "template", "metadata", "annotations", operatorCRDRepairAnnotation)
 	require.NoError(t, err)

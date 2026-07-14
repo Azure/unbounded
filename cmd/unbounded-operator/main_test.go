@@ -8,6 +8,10 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestReapLegacyResourcesConfiguration(t *testing.T) {
@@ -83,6 +87,55 @@ func TestReapLegacyResourcesConfiguration(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveAPIServerEndpoint(t *testing.T) {
+	const clusterInfoKubeconfig = `apiVersion: v1
+clusters:
+- cluster:
+    certificate-authority-data: dGVzdC1jYQ==
+    server: https://discovered.example:6443
+  name: ""
+kind: Config
+`
+
+	clusterInfoCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespacePublic, Name: "cluster-info"},
+		Data:       map[string]string{"kubeconfig": clusterInfoKubeconfig},
+	}
+
+	t.Run("override wins without discovery", func(t *testing.T) {
+		client := fake.NewSimpleClientset() // no cluster-info; must not be consulted
+
+		got, err := resolveAPIServerEndpoint(context.Background(), "https://override.example:6443", client)
+		if err != nil {
+			t.Fatalf("resolveAPIServerEndpoint: %v", err)
+		}
+
+		if got != "https://override.example:6443" {
+			t.Fatalf("endpoint = %q, want override", got)
+		}
+	})
+
+	t.Run("discovers from cluster-info when override empty", func(t *testing.T) {
+		client := fake.NewSimpleClientset(clusterInfoCM)
+
+		got, err := resolveAPIServerEndpoint(context.Background(), "", client)
+		if err != nil {
+			t.Fatalf("resolveAPIServerEndpoint: %v", err)
+		}
+
+		if got != "https://discovered.example:6443" {
+			t.Fatalf("endpoint = %q, want discovered", got)
+		}
+	})
+
+	t.Run("fails hard when empty override and no cluster-info", func(t *testing.T) {
+		client := fake.NewSimpleClientset()
+		if _, err := resolveAPIServerEndpoint(context.Background(), "", client); err == nil {
+			t.Fatal("expected hard error when no override and cluster-info missing")
+		}
+	})
 }
 
 func unsetenv(t *testing.T, key string) {
