@@ -160,10 +160,11 @@ func run(ctx context.Context, cfg config) error {
 	if cfg.reapLegacyResources {
 		reaper := &operator.LegacyReaper{
 			Client:            mgr.GetClient(),
+			APIReader:         mgr.GetAPIReader(),
 			TargetNamespace:   namespace,
 			LegacyNamespaces:  operator.LegacyNamespaces,
 			SkipSecretNames:   map[string]struct{}{"unbounded-net-serving-cert": {}},
-			CopyConfigMaps:    []string{"machina-config"},
+			CopyConfigMaps:    []string{"machina-config", "unbounded-net-config"},
 			APIServerEndpoint: cfg.apiServerEndpoint,
 			Recorder:          mgr.GetEventRecorder("unbounded-operator-reaper"),
 		}

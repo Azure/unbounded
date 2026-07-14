@@ -4,6 +4,7 @@
 package operator
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -17,10 +18,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
@@ -170,7 +173,7 @@ func TestMutateStorageScopesDaemonSetToSite(t *testing.T) {
 		},
 	}}
 
-	if err := mutateStorageObject(site, obj); err != nil {
+	if err := mutateStorageObject(site, "storage-hash", obj); err != nil {
 		t.Fatalf("mutateStorageObject returned error: %v", err)
 	}
 
@@ -197,6 +200,11 @@ func TestMutateStorageScopesDaemonSetToSite(t *testing.T) {
 	}
 
 	assertSiteOwnerRef(t, obj.GetOwnerReferences(), "rack-a", "site-uid")
+
+	annotations, _, _ := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
+	if annotations[storageConfigHashAnnotation] != "storage-hash" {
+		t.Fatalf("storage config hash annotation = %q, want storage-hash", annotations[storageConfigHashAnnotation])
+	}
 
 	affinity, ok, err := unstructured.NestedMap(obj.Object, "spec", "template", "spec", "affinity")
 	if err != nil || !ok {
@@ -286,9 +294,416 @@ func TestEnsureMachinaConfigUpdatesEndpointAndPreservesData(t *testing.T) {
 		t.Fatalf("updated config = %#v", config)
 	}
 
-	if hash != machinaConfigHash(got.Data["config.yaml"]) {
+	if hash != configMapPayloadHash(&got) {
 		t.Fatalf("hash = %q, want hash of exact stored config", hash)
 	}
+}
+
+func TestEnsureMachinaConfigOptimisticConflictReloadsFreshState(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	existing := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "machina-config", Namespace: DefaultNamespace, ResourceVersion: "1"},
+		Data:       map[string]string{"config.yaml": "apiServerEndpoint: https://old.example:6443\n"},
+	}
+
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+	conflicted := false
+	cl := interceptor.NewClient(base, interceptor.Funcs{
+		Patch: func(ctx context.Context, underlying client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			data, err := patch.Data(obj)
+			if err != nil {
+				t.Fatalf("encode patch: %v", err)
+			}
+
+			if !bytes.Contains(data, []byte(`"resourceVersion":`)) {
+				t.Fatalf("optimistic patch does not include resourceVersion: %s", data)
+			}
+
+			if !conflicted {
+				conflicted = true
+
+				var latest corev1.ConfigMap
+				if err := underlying.Get(ctx, client.ObjectKeyFromObject(existing), &latest); err != nil {
+					t.Fatalf("get concurrent config: %v", err)
+				}
+
+				latest.Data["concurrent"] = "preserved"
+				if err := underlying.Update(ctx, &latest); err != nil {
+					t.Fatalf("write concurrent config: %v", err)
+				}
+
+				return apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, obj.GetName(), errors.New("concurrent edit"))
+			}
+
+			return underlying.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	r := &SiteReconciler{Client: cl, Config: Config{APIServerEndpoint: "https://new.example:6443"}}
+
+	if _, err := r.ensureMachinaConfig(t.Context()); !apierrors.IsConflict(err) {
+		t.Fatalf("first ensureMachinaConfig error = %v, want conflict", err)
+	}
+
+	if _, err := r.ensureMachinaConfig(t.Context()); err != nil {
+		t.Fatalf("retry ensureMachinaConfig: %v", err)
+	}
+
+	var got corev1.ConfigMap
+	if err := base.Get(t.Context(), client.ObjectKeyFromObject(existing), &got); err != nil {
+		t.Fatalf("get updated config: %v", err)
+	}
+
+	if got.Data["concurrent"] != "preserved" || !strings.Contains(got.Data["config.yaml"], "https://new.example:6443") {
+		t.Fatalf("retry did not preserve fresh config: %#v", got.Data)
+	}
+}
+
+func TestEnsureNetConfigCreatesDefaultOnlyWhenAbsent(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	r := &SiteReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+
+	hash, err := r.ensureNetConfig(t.Context())
+	if err != nil {
+		t.Fatalf("ensureNetConfig: %v", err)
+	}
+
+	var got corev1.ConfigMap
+
+	key := client.ObjectKey{Namespace: DefaultNamespace, Name: "unbounded-net-config"}
+	if err := r.Get(t.Context(), key, &got); err != nil {
+		t.Fatalf("get default net config: %v", err)
+	}
+
+	if got.Data["config.yaml"] == "" || hash != configMapPayloadHash(&got) {
+		t.Fatalf("default net config/hash missing: hash=%q data=%#v", hash, got.Data)
+	}
+}
+
+func TestEnsureNetConfigPreservesExistingPayload(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	existing := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "unbounded-net-config", Namespace: DefaultNamespace},
+		Data:       map[string]string{"config.yaml": "custom: true", "extra": "keep"},
+		BinaryData: map[string][]byte{"routing.bin": {0, 1, 2}},
+	}
+	r := &SiteReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()}
+
+	hash, err := r.ensureNetConfig(t.Context())
+	if err != nil {
+		t.Fatalf("ensureNetConfig: %v", err)
+	}
+
+	var got corev1.ConfigMap
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(existing), &got); err != nil {
+		t.Fatalf("get preserved net config: %v", err)
+	}
+
+	if got.Data["config.yaml"] != "custom: true" || got.Data["extra"] != "keep" || !bytes.Equal(got.BinaryData["routing.bin"], []byte{0, 1, 2}) {
+		t.Fatalf("existing net config changed: data=%#v binaryData=%#v", got.Data, got.BinaryData)
+	}
+
+	if hash != configMapPayloadHash(&got) {
+		t.Fatalf("hash = %q, want exact payload hash", hash)
+	}
+}
+
+func TestConfigMapPayloadHashIncludesDataAndBinaryData(t *testing.T) {
+	first := &corev1.ConfigMap{
+		Data:       map[string]string{"b": "2", "a": "1"},
+		BinaryData: map[string][]byte{"z": {3}, "x": {1, 2}},
+	}
+	orderedDifferently := &corev1.ConfigMap{
+		Data:       map[string]string{"a": "1", "b": "2"},
+		BinaryData: map[string][]byte{"x": {1, 2}, "z": {3}},
+	}
+
+	if configMapPayloadHash(first) != configMapPayloadHash(orderedDifferently) {
+		t.Fatal("payload hash depends on map iteration order")
+	}
+
+	changedData := first.DeepCopy()
+	changedData.Data["a"] = "changed"
+	changedBinary := first.DeepCopy()
+	changedBinary.BinaryData["x"] = []byte{2, 1}
+
+	if configMapPayloadHash(first) == configMapPayloadHash(changedData) ||
+		configMapPayloadHash(first) == configMapPayloadHash(changedBinary) {
+		t.Fatal("payload hash did not include all Data and BinaryData")
+	}
+}
+
+func TestManagedConfigPayloadChangesAndNames(t *testing.T) {
+	r := &SiteReconciler{Namespace: "target"}
+	for _, name := range []string{"machina-config", "unbounded-net-config", "unbounded-storage-config-edge"} {
+		if !r.isManagedConfig(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "target", Name: name}}) {
+			t.Fatalf("%s is not watched", name)
+		}
+	}
+
+	oldConfig := &corev1.ConfigMap{Data: map[string]string{"config.yaml": "same"}, BinaryData: map[string][]byte{"x": {1}}}
+	metadataOnly := oldConfig.DeepCopy()
+
+	metadataOnly.Labels = map[string]string{"changed": "true"}
+	if configMapPayloadChanged(oldConfig, metadataOnly) {
+		t.Fatal("metadata-only update should not enqueue Sites")
+	}
+
+	binaryChange := oldConfig.DeepCopy()
+
+	binaryChange.BinaryData["x"] = []byte{2}
+	if !configMapPayloadChanged(oldConfig, binaryChange) {
+		t.Fatal("BinaryData update should enqueue Sites")
+	}
+}
+
+func TestRequestsForManagedConfigEnqueuesAllSites(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	r := &SiteReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}},
+		&unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "cluster"}},
+	).Build()}
+
+	requests := r.requestsForManagedConfig(t.Context(), &corev1.ConfigMap{})
+
+	got := map[string]bool{}
+	for _, request := range requests {
+		got[request.Name] = true
+	}
+
+	if len(requests) != 3 || !got[singletonRequestName] || !got["edge"] || !got["cluster"] {
+		t.Fatalf("requestsForManagedConfig = %#v, want singleton, edge, and cluster", requests)
+	}
+}
+
+func TestRequestsForManagedConfigEnqueuesSingletonWithNoSites(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	r := &SiteReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+
+	requests := r.requestsForManagedConfig(t.Context(), &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: DefaultNamespace, Name: "unbounded-net-config"},
+	})
+
+	if len(requests) != 1 || requests[0].Name != singletonRequestName {
+		t.Fatalf("requestsForManagedConfig = %#v, want singleton request", requests)
+	}
+}
+
+func TestRequestsForManagedConfigEnqueuesStorageSiteDirectly(t *testing.T) {
+	r := &SiteReconciler{}
+	requests := r.requestsForManagedConfig(t.Context(), &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "unbounded-storage-config-edge"},
+	})
+
+	if len(requests) != 1 || requests[0].Name != "edge" {
+		t.Fatalf("requestsForManagedConfig = %#v, want only edge", requests)
+	}
+}
+
+func TestRequestsForManagedConfigPreservesSingletonWhenSiteListFails(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	listErr := errors.New("Site list failed")
+	r := &SiteReconciler{Client: fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+				return listErr
+			},
+		}).
+		Build()}
+
+	requests := r.requestsForManagedConfig(t.Context(), &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: DefaultNamespace, Name: "machina-config"},
+	})
+
+	if len(requests) != 1 || requests[0].Name != singletonRequestName {
+		t.Fatalf("requestsForManagedConfig = %#v, want singleton request after list failure", requests)
+	}
+}
+
+func TestManagedSingletonWorkloadStartupEventsEnqueueSingleton(t *testing.T) {
+	r := &SiteReconciler{Namespace: "target"}
+	predicates := r.managedSingletonWorkloadPredicates()
+
+	for _, workload := range []client.Object{
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "target", Name: "machina-controller"}},
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "target", Name: "unbounded-net-controller"}},
+		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "target", Name: "unbounded-net-node"}},
+	} {
+		if !predicates.Create(event.CreateEvent{Object: workload}) {
+			t.Fatalf("startup Create event for %T %q was filtered", workload, workload.GetName())
+		}
+
+		requests := r.requestsForManagedSingletonWorkload(t.Context(), workload)
+		if len(requests) != 1 || requests[0].Name != singletonRequestName {
+			t.Fatalf("startup requests for %s = %#v, want singleton", workload.GetName(), requests)
+		}
+
+		if !predicates.Delete(event.DeleteEvent{Object: workload}) {
+			t.Fatalf("Delete event for %T %q was filtered", workload, workload.GetName())
+		}
+
+		updated := workload.DeepCopyObject().(client.Object)
+		updated.SetGeneration(workload.GetGeneration() + 1)
+
+		if !predicates.Update(event.UpdateEvent{ObjectOld: workload, ObjectNew: updated}) {
+			t.Fatalf("generation update for %T %q was filtered", workload, workload.GetName())
+		}
+
+		if predicates.Update(event.UpdateEvent{ObjectOld: updated, ObjectNew: updated.DeepCopyObject().(client.Object)}) {
+			t.Fatalf("same-generation update for %T %q was accepted", workload, workload.GetName())
+		}
+	}
+
+	unmanaged := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "target", Name: "metalman-controller-edge"}}
+	if predicates.Create(event.CreateEvent{Object: unmanaged}) {
+		t.Fatal("unmanaged Deployment Create event was accepted")
+	}
+}
+
+func TestNetApplyMutatorStampsBothWorkloads(t *testing.T) {
+	for _, tc := range []struct {
+		kind string
+		name string
+	}{
+		{kind: "Deployment", name: "unbounded-net-controller"},
+		{kind: "DaemonSet", name: "unbounded-net-node"},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			obj := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "apps/v1",
+				"kind":       tc.kind,
+				"metadata":   map[string]any{"name": tc.name},
+				"spec": map[string]any{"template": map[string]any{
+					"metadata": map[string]any{"annotations": map[string]any{"existing": "kept"}},
+				}},
+			}}
+
+			if err := (&SiteReconciler{}).netApplyMutator("net-hash")(obj); err != nil {
+				t.Fatalf("netApplyMutator: %v", err)
+			}
+
+			annotations, _, _ := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
+			if annotations[netConfigHashAnnotation] != "net-hash" || annotations["existing"] != "kept" {
+				t.Fatalf("pod template annotations = %#v", annotations)
+			}
+		})
+	}
+
+	config := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "unbounded-net-config"},
+	}}
+	if err := (&SiteReconciler{}).netApplyMutator("net-hash")(config); err != nil || config.Object != nil {
+		t.Fatalf("embedded net ConfigMap was not skipped: err=%v object=%#v", err, config.Object)
+	}
+}
+
+func TestReconcileRetainedNetWithNoSites(t *testing.T) {
+	config := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: DefaultNamespace, Name: "unbounded-net-config"},
+		Data:       map[string]string{"config.yaml": "custom: retained"},
+	}
+	r, appliedHashes := retainedNetReconciler(t, config)
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: singletonRequestName}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	wantHash := configMapPayloadHash(config)
+	for _, name := range []string{"unbounded-net-controller", "unbounded-net-node"} {
+		if appliedHashes[name] != wantHash {
+			t.Fatalf("%s applied hash = %q, want %q", name, appliedHashes[name], wantHash)
+		}
+	}
+
+	var got corev1.ConfigMap
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(config), &got); err != nil {
+		t.Fatalf("get retained net config: %v", err)
+	}
+
+	if got.Data["config.yaml"] != "custom: retained" {
+		t.Fatalf("retained net config changed: %#v", got.Data)
+	}
+}
+
+func TestReconcileRecreatesDeletedRetainedNetConfigWithNoSites(t *testing.T) {
+	retained := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Namespace: DefaultNamespace,
+		Name:      "unbounded-net-controller",
+	}}
+	r, appliedHashes := retainedNetReconciler(t, retained)
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: singletonRequestName}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var config corev1.ConfigMap
+
+	key := client.ObjectKey{Namespace: DefaultNamespace, Name: "unbounded-net-config"}
+	if err := r.Get(t.Context(), key, &config); err != nil {
+		t.Fatalf("get recreated net config: %v", err)
+	}
+
+	wantHash := configMapPayloadHash(&config)
+	if config.Data["config.yaml"] == "" || appliedHashes["unbounded-net-controller"] != wantHash ||
+		appliedHashes["unbounded-net-node"] != wantHash {
+		t.Fatalf("recreated config/workload hashes = data=%#v hashes=%#v", config.Data, appliedHashes)
+	}
+}
+
+func TestReconcileDoesNotCreateNetFromNothingWithNoSites(t *testing.T) {
+	r, appliedHashes := retainedNetReconciler(t)
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: singletonRequestName}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	err := r.Get(t.Context(), client.ObjectKey{Namespace: DefaultNamespace, Name: "unbounded-net-config"}, &corev1.ConfigMap{})
+	if !apierrors.IsNotFound(err) || len(appliedHashes) != 0 {
+		t.Fatalf("zero-Site reconcile created net from nothing: config err=%v hashes=%#v", err, appliedHashes)
+	}
+}
+
+func retainedNetReconciler(t *testing.T, objects ...client.Object) (*SiteReconciler, map[string]string) {
+	t.Helper()
+
+	scheme := newReconcilerTestScheme(t)
+	appliedHashes := map[string]string{}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objects...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				applied, ok := obj.(interface {
+					GetName() string
+					GetKind() string
+					UnstructuredContent() map[string]any
+				})
+				if !ok {
+					t.Fatalf("applied object has unexpected type %T", obj)
+				}
+
+				name := applied.GetName()
+				if (applied.GetKind() != "Deployment" || name != "unbounded-net-controller") &&
+					(applied.GetKind() != "DaemonSet" || name != "unbounded-net-node") {
+					return nil
+				}
+
+				hash, _, err := unstructured.NestedString(
+					applied.UnstructuredContent(),
+					"spec", "template", "metadata", "annotations", netConfigHashAnnotation,
+				)
+				if err != nil {
+					t.Fatalf("get applied hash for %s: %v", name, err)
+				}
+
+				appliedHashes[name] = hash
+
+				return nil
+			},
+		}).
+		Build()
+
+	return &SiteReconciler{Client: cl, Scheme: scheme}, appliedHashes
 }
 
 func TestMachinaApplyMutatorStampsConfigHash(t *testing.T) {
@@ -311,6 +726,124 @@ func TestMachinaApplyMutatorStampsConfigHash(t *testing.T) {
 	if err != nil || !found || got != hash {
 		t.Fatalf("config hash = %q found=%t err=%v, want %q", got, found, err, hash)
 	}
+}
+
+func TestReconcileRetainedMachinaWithNoSitesUpdatesConfigAndHash(t *testing.T) {
+	config := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: DefaultNamespace, Name: "machina-config"},
+		Data: map[string]string{
+			"config.yaml": "apiServerEndpoint: https://old.example:6443\ncustom: retained\n",
+		},
+	}
+	r, appliedHashes := retainedMachinaReconciler(t, config)
+	r.Config.APIServerEndpoint = "https://new.example:6443"
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: singletonRequestName}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var got corev1.ConfigMap
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(config), &got); err != nil {
+		t.Fatalf("get retained machina config: %v", err)
+	}
+
+	if !strings.Contains(got.Data["config.yaml"], "https://new.example:6443") ||
+		!strings.Contains(got.Data["config.yaml"], "custom: retained") {
+		t.Fatalf("retained machina config was not merged: %q", got.Data["config.yaml"])
+	}
+
+	wantHash := configMapPayloadHash(&got)
+	if appliedHashes["machina-controller"] != wantHash {
+		t.Fatalf("applied Machina hash = %q, want %q", appliedHashes["machina-controller"], wantHash)
+	}
+}
+
+func TestReconcileRecreatesDeletedRetainedMachinaConfigWithNoSites(t *testing.T) {
+	retained := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Namespace: DefaultNamespace,
+		Name:      "machina-controller",
+	}}
+	deletedConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: DefaultNamespace, Name: "machina-config"},
+		Data:       map[string]string{"config.yaml": "apiServerEndpoint: https://deleted.example:6443\n"},
+	}
+	r, appliedHashes := retainedMachinaReconciler(t, retained, deletedConfig)
+
+	r.Config.APIServerEndpoint = "https://api.example:6443"
+	if err := r.Delete(t.Context(), deletedConfig); err != nil {
+		t.Fatalf("delete machina config: %v", err)
+	}
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: singletonRequestName}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var config corev1.ConfigMap
+
+	key := client.ObjectKey{Namespace: DefaultNamespace, Name: "machina-config"}
+	if err := r.Get(t.Context(), key, &config); err != nil {
+		t.Fatalf("get recreated machina config: %v", err)
+	}
+
+	wantHash := configMapPayloadHash(&config)
+	if !strings.Contains(config.Data["config.yaml"], "https://api.example:6443") ||
+		appliedHashes["machina-controller"] != wantHash {
+		t.Fatalf("recreated config/workload hash = data=%#v hashes=%#v", config.Data, appliedHashes)
+	}
+}
+
+func TestReconcileDoesNotCreateMachinaFromNothingWithNoSites(t *testing.T) {
+	r, appliedHashes := retainedMachinaReconciler(t)
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: singletonRequestName}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	err := r.Get(t.Context(), client.ObjectKey{Namespace: DefaultNamespace, Name: "machina-config"}, &corev1.ConfigMap{})
+	if !apierrors.IsNotFound(err) || len(appliedHashes) != 0 {
+		t.Fatalf("zero-Site reconcile created Machina from nothing: config err=%v hashes=%#v", err, appliedHashes)
+	}
+}
+
+func retainedMachinaReconciler(t *testing.T, objects ...client.Object) (*SiteReconciler, map[string]string) {
+	t.Helper()
+
+	scheme := newReconcilerTestScheme(t)
+	appliedHashes := map[string]string{}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objects...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				applied, ok := obj.(interface {
+					GetName() string
+					GetKind() string
+					UnstructuredContent() map[string]any
+				})
+				if !ok {
+					t.Fatalf("applied object has unexpected type %T", obj)
+				}
+
+				if applied.GetKind() != "Deployment" || applied.GetName() != "machina-controller" {
+					return nil
+				}
+
+				hash, _, err := unstructured.NestedString(
+					applied.UnstructuredContent(),
+					"spec", "template", "metadata", "annotations", machinaConfigHashAnnotation,
+				)
+				if err != nil {
+					t.Fatalf("get applied Machina hash: %v", err)
+				}
+
+				appliedHashes[applied.GetName()] = hash
+
+				return nil
+			},
+		}).
+		Build()
+
+	return &SiteReconciler{Client: cl, Scheme: scheme}, appliedHashes
 }
 
 func TestMutateMetalmanSupportObject(t *testing.T) {
@@ -437,7 +970,7 @@ func TestStorageDaemonSetPointsAtPerSiteConfig(t *testing.T) {
 		},
 	}}
 
-	if err := mutateStorageObject(site, obj); err != nil {
+	if err := mutateStorageObject(site, "storage-hash", obj); err != nil {
 		t.Fatalf("mutateStorageObject returned error: %v", err)
 	}
 
@@ -463,7 +996,8 @@ func TestEnsureStorageConfigCreatesDefaultWhenAbsent(t *testing.T) {
 	r := &SiteReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
 	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
 
-	if err := r.ensureStorageConfig(t.Context(), site); err != nil {
+	hash, err := r.ensureStorageConfig(t.Context(), site)
+	if err != nil {
 		t.Fatalf("ensureStorageConfig: %v", err)
 	}
 
@@ -474,6 +1008,10 @@ func TestEnsureStorageConfigCreatesDefaultWhenAbsent(t *testing.T) {
 
 	if got.Data["config.yaml"] == "" {
 		t.Fatalf("default config.yaml was not seeded")
+	}
+
+	if hash != configMapPayloadHash(&got) {
+		t.Fatalf("hash = %q, want exact stored payload hash", hash)
 	}
 
 	assertSiteOwnerRef(t, got.OwnerReferences, "rack-a", "site-uid")
@@ -492,7 +1030,8 @@ func TestEnsureStorageConfigAdoptsExistingAndPreservesData(t *testing.T) {
 	r := &SiteReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()}
 	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
 
-	if err := r.ensureStorageConfig(t.Context(), site); err != nil {
+	hash, err := r.ensureStorageConfig(t.Context(), site)
+	if err != nil {
 		t.Fatalf("ensureStorageConfig: %v", err)
 	}
 
@@ -503,6 +1042,10 @@ func TestEnsureStorageConfigAdoptsExistingAndPreservesData(t *testing.T) {
 
 	if got.Data["config.yaml"] != "custom: true" {
 		t.Fatalf("existing config data was not preserved: %q", got.Data["config.yaml"])
+	}
+
+	if hash != configMapPayloadHash(&got) {
+		t.Fatalf("hash = %q, want exact adopted payload hash", hash)
 	}
 
 	assertSiteOwnerRef(t, got.OwnerReferences, "rack-a", "site-uid")

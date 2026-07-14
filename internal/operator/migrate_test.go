@@ -4,11 +4,14 @@
 package operator
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/go-logr/logr"
 	"gopkg.in/yaml.v3"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -19,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
@@ -30,6 +34,7 @@ func reaperScheme(t *testing.T) *runtime.Scheme {
 	for _, add := range []func(*runtime.Scheme) error{
 		corev1.AddToScheme,
 		appsv1.AddToScheme,
+		batchv1.AddToScheme,
 		rbacv1.AddToScheme,
 		apiextensionsv1.AddToScheme,
 		unboundedv1alpha3.AddToScheme,
@@ -63,7 +68,7 @@ func newReaper(t *testing.T, objs ...client.Object) *LegacyReaper {
 		TargetNamespace:  "unbounded-system",
 		LegacyNamespaces: []string{legacyKubeNamespace, legacyNetNamespace},
 		SkipSecretNames:  map[string]struct{}{"unbounded-net-serving-cert": {}},
-		CopyConfigMaps:   []string{"machina-config"},
+		CopyConfigMaps:   []string{"machina-config", "unbounded-net-config"},
 	}
 }
 
@@ -306,29 +311,95 @@ func TestMetalmanDHCPAutoInterface(t *testing.T) {
 	}
 }
 
-func TestTranslateSitesDoesNotClobberExisting(t *testing.T) {
-	existing := &unboundedv1alpha3.Site{
-		ObjectMeta: metav1.ObjectMeta{Name: clusterSiteName},
-		Spec:       unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"172.16.0.0/16"}},
+func TestTranslateSiteValidatesExistingNetworkingSpec(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		targetCIDR   string
+		wantConflict bool
+	}{
+		{name: "matching target succeeds", targetCIDR: "10.0.0.0/16"},
+		{name: "mismatched target conflicts", targetCIDR: "172.16.0.0/16", wantConflict: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := legacySite("edge", map[string]any{
+				"nodeCidrs":          []any{tc.targetCIDR},
+				"podCidrAssignments": []any{},
+				"components": map[string]any{
+					"storage": map[string]any{"enabled": true},
+				},
+			})
+			target.SetGroupVersionKind(newSiteGVK())
+
+			source := legacySite("edge", map[string]any{
+				"nodeCidrs":          []any{"10.0.0.0/16"},
+				"podCidrAssignments": []any{},
+			})
+			r := newReaper(t, target, source)
+
+			err := r.translateSites(t.Context(), logr.Discard())
+			if tc.wantConflict {
+				if !apierrors.IsConflict(err) {
+					t.Fatalf("translateSites error = %v, want conflict", err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("translateSites: %v", err)
+			}
+		})
 	}
+}
 
-	r := newReaper(t,
-		ns(legacyKubeNamespace),
-		existing,
-		legacySite(clusterSiteName, map[string]any{"nodeCidrs": []any{"10.0.0.0/16"}}),
-	)
+func TestTranslateSiteCreateRaceValidatesSpec(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		targetCIDR   string
+		wantConflict bool
+	}{
+		{name: "matching target succeeds", targetCIDR: "10.0.0.0/16"},
+		{name: "mismatched target conflicts", targetCIDR: "172.16.0.0/16", wantConflict: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := legacySite("edge", map[string]any{
+				"nodeCidrs":          []any{tc.targetCIDR},
+				"podCidrAssignments": []any{},
+				"components":         map[string]any{},
+			})
+			target.SetGroupVersionKind(newSiteGVK())
+			base := fake.NewClientBuilder().WithScheme(reaperScheme(t)).WithObjects(target).Build()
+			gets := 0
+			r := &LegacyReaper{Client: base}
+			r.APIReader = interceptor.NewClient(base, interceptor.Funcs{
+				Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if key.Name == "edge" && obj.GetObjectKind().GroupVersionKind() == newSiteGVK() {
+						gets++
+						if gets == 1 {
+							return apierrors.NewNotFound(schema.GroupResource{Group: newSiteGVK().Group, Resource: "sites"}, key.Name)
+						}
+					}
 
-	if err := r.translateSites(t.Context(), logr.Discard()); err != nil {
-		t.Fatalf("translateSites: %v", err)
-	}
+					return underlying.Get(ctx, key, obj, opts...)
+				},
+			})
 
-	got := &unboundedv1alpha3.Site{}
-	if err := r.Get(t.Context(), client.ObjectKey{Name: clusterSiteName}, got); err != nil {
-		t.Fatalf("get site: %v", err)
-	}
+			err := r.translateSite(t.Context(), logr.Discard(), legacySite("edge", map[string]any{
+				"nodeCidrs":          []any{"10.0.0.0/16"},
+				"podCidrAssignments": []any{},
+			}))
+			if tc.wantConflict {
+				if !apierrors.IsConflict(err) {
+					t.Fatalf("translateSite error = %v, want conflict", err)
+				}
 
-	if len(got.Spec.NodeCidrs) != 1 || got.Spec.NodeCidrs[0] != "172.16.0.0/16" {
-		t.Fatalf("translate clobbered an existing machina site: %#v", got.Spec.NodeCidrs)
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("translateSite: %v", err)
+			}
+		})
 	}
 }
 
@@ -363,27 +434,56 @@ func TestMigrateSecretsCopiesNonAutoManaged(t *testing.T) {
 	}
 }
 
-func TestMigrateSecretsIsIdempotentAndDoesNotClobber(t *testing.T) {
-	r := newReaper(t,
-		ns(legacyKubeNamespace),
-		ns("unbounded-system"),
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "redfish-password", Namespace: legacyKubeNamespace}, Data: map[string][]byte{"password": []byte("legacy")}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "redfish-password", Namespace: "unbounded-system"}, Data: map[string][]byte{"password": []byte("already-migrated")}},
-	)
+func TestMigrateSecretsValidatesExistingTarget(t *testing.T) {
+	immutable := true
 
-	for range 2 {
-		if err := r.migrateSecrets(t.Context(), logr.Discard(), legacyKubeNamespace, "unbounded-system"); err != nil {
-			t.Fatalf("migrateSecrets: %v", err)
-		}
-	}
+	for _, tc := range []struct {
+		name         string
+		target       *corev1.Secret
+		wantConflict bool
+	}{
+		{
+			name: "matching",
+			target: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "redfish-password", Namespace: "unbounded-system"},
+				Type:       corev1.SecretTypeOpaque,
+				Data:       map[string][]byte{"password": []byte("legacy")},
+				Immutable:  &immutable,
+			},
+		},
+		{
+			name: "conflicting",
+			target: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "redfish-password", Namespace: "unbounded-system"},
+				Type:       corev1.SecretTypeOpaque,
+				Data:       map[string][]byte{"password": []byte("different")},
+				Immutable:  &immutable,
+			},
+			wantConflict: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "redfish-password", Namespace: legacyKubeNamespace},
+				Type:       corev1.SecretTypeOpaque,
+				Data:       map[string][]byte{"password": []byte("legacy")},
+				Immutable:  &immutable,
+			}
+			r := newReaper(t, source, tc.target)
 
-	var got corev1.Secret
-	if err := r.Get(t.Context(), client.ObjectKey{Namespace: "unbounded-system", Name: "redfish-password"}, &got); err != nil {
-		t.Fatalf("get: %v", err)
-	}
+			err := r.migrateSecrets(t.Context(), logr.Discard(), legacyKubeNamespace, "unbounded-system")
+			if tc.wantConflict {
+				if !apierrors.IsConflict(err) {
+					t.Fatalf("migrateSecrets error = %v, want conflict", err)
+				}
 
-	if string(got.Data["password"]) != "already-migrated" {
-		t.Fatalf("create-if-absent clobbered existing target secret: %q", got.Data["password"])
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("migrateSecrets: %v", err)
+			}
+		})
 	}
 }
 
@@ -412,6 +512,197 @@ func TestMigrateConfigMapsCopiesNamedOnly(t *testing.T) {
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("expected unrelated configmap NOT copied, got err=%v", err)
 	}
+}
+
+func TestMigrateConfigMapsPreservesNetConfigPayload(t *testing.T) {
+	legacy := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "unbounded-net-config", Namespace: legacyNetNamespace},
+		Data:       map[string]string{"config.yaml": "sentinel: legacy", "LOG_LEVEL": "7"},
+		BinaryData: map[string][]byte{"routes.bin": {0, 4, 2}},
+	}
+	defaultTarget := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: legacy.Name, Namespace: "unbounded-system"},
+		Data:       map[string]string{"config.yaml": "embedded: default"},
+	}
+	r := newReaper(t, legacy, defaultTarget)
+
+	if err := r.migrateConfigMaps(t.Context(), logr.Discard(), legacyNetNamespace, "unbounded-system"); err != nil {
+		t.Fatalf("migrateConfigMaps: %v", err)
+	}
+
+	var got corev1.ConfigMap
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(defaultTarget), &got); err != nil {
+		t.Fatalf("get migrated net config: %v", err)
+	}
+
+	if got.Data["config.yaml"] != "sentinel: legacy" || got.Data["LOG_LEVEL"] != "7" || string(got.BinaryData["routes.bin"]) != string([]byte{0, 4, 2}) {
+		t.Fatalf("migrated net payload = data=%#v binaryData=%#v", got.Data, got.BinaryData)
+	}
+}
+
+func TestMigrateConfigMapsReadsLiveSource(t *testing.T) {
+	stale := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "unbounded-net-config", Namespace: legacyNetNamespace},
+		Data:       map[string]string{"config.yaml": "stale: true"},
+	}
+	live := stale.DeepCopy()
+	live.Data["config.yaml"] = "live: true"
+
+	base := fake.NewClientBuilder().WithScheme(reaperScheme(t)).WithObjects(stale).Build()
+	r := &LegacyReaper{
+		Client: base,
+		APIReader: interceptor.NewClient(base, interceptor.Funcs{
+			Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if key == client.ObjectKeyFromObject(live) {
+					live.DeepCopyInto(obj.(*corev1.ConfigMap))
+
+					return nil
+				}
+
+				return underlying.Get(ctx, key, obj, opts...)
+			},
+		}),
+		CopyConfigMaps: []string{"unbounded-net-config"},
+	}
+
+	if err := r.migrateConfigMaps(t.Context(), logr.Discard(), legacyNetNamespace, "unbounded-system"); err != nil {
+		t.Fatalf("migrateConfigMaps: %v", err)
+	}
+
+	var got corev1.ConfigMap
+	if err := base.Get(t.Context(), client.ObjectKey{Namespace: "unbounded-system", Name: live.Name}, &got); err != nil {
+		t.Fatalf("get copied config: %v", err)
+	}
+
+	if got.Data["config.yaml"] != "live: true" {
+		t.Fatalf("copied config = %q, want live source payload", got.Data["config.yaml"])
+	}
+}
+
+func TestCreateIfAbsentConfirmsAlreadyExistingTargetLive(t *testing.T) {
+	wantErr := errors.New("live target lookup failed")
+	base := fake.NewClientBuilder().WithScheme(reaperScheme(t)).WithObjects(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "existing", Namespace: "unbounded-system"},
+	}).Build()
+	r := &LegacyReaper{Client: base}
+	r.APIReader = interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+			return wantErr
+		},
+	})
+
+	err := r.createIfAbsent(t.Context(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "existing", Namespace: "unbounded-system"},
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("createIfAbsent error = %v, want live-reader error %v", err, wantErr)
+	}
+}
+
+// TestCreateIfAbsentDetectsSubsetLiveTarget guards against a target whose live
+// payload is a strict subset of the desired payload. The real controller-runtime
+// client decodes a Get into the caller's object by merging into (not resetting)
+// its maps, so createIfAbsent must Get into a freshly zeroed object. The fake
+// client zeros the target on Get and would hide the bug, so the interceptor here
+// reproduces the real client's merge-into-existing-maps semantics.
+func TestCreateIfAbsentDetectsSubsetLiveTarget(t *testing.T) {
+	liveTarget := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "unbounded-net-config", Namespace: "unbounded-system"},
+		Data:       map[string]string{"config.yaml": "live"},
+	}
+	base := fake.NewClientBuilder().WithScheme(reaperScheme(t)).WithObjects(liveTarget).Build()
+	r := &LegacyReaper{Client: base}
+	r.APIReader = interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key != client.ObjectKeyFromObject(liveTarget) {
+				return underlying.Get(ctx, key, obj, opts...)
+			}
+			// Mimic JSON unmarshal: merge the live object's fields into obj's
+			// pre-existing maps without clearing keys the live object omits.
+			dst, ok := obj.(*corev1.ConfigMap)
+			if !ok {
+				return underlying.Get(ctx, key, obj, opts...)
+			}
+
+			dst.ObjectMeta = *liveTarget.ObjectMeta.DeepCopy()
+			if dst.Data == nil {
+				dst.Data = map[string]string{}
+			}
+
+			for k, v := range liveTarget.Data {
+				dst.Data[k] = v
+			}
+
+			return nil
+		},
+	})
+
+	// The desired (migrated) payload carries an extra key the live target lacks.
+	desired := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: liveTarget.Name, Namespace: liveTarget.Namespace},
+		Data:       map[string]string{"config.yaml": "live", "extra": "desired-only"},
+	}
+
+	err := r.createIfAbsent(t.Context(), desired)
+	if !apierrors.IsConflict(err) {
+		t.Fatalf("createIfAbsent error = %v, want conflict for subset live target", err)
+	}
+}
+
+func TestCopyConfigMapByNameValidatesExistingTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		targetData   string
+		wantConflict bool
+	}{
+		{name: "matching", targetData: "#cloud-config"},
+		{name: "conflicting", targetData: "different", wantConflict: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "user-data", Namespace: legacyKubeNamespace},
+				Data:       map[string]string{"user-data": "#cloud-config"},
+				BinaryData: map[string][]byte{"extra": {1, 2, 3}},
+			}
+			target := source.DeepCopy()
+			target.Namespace = "unbounded-system"
+			target.Data["user-data"] = tc.targetData
+			r := newReaper(t, source, target)
+
+			err := r.copyConfigMapByName(t.Context(), legacyKubeNamespace, source.Name, target.Namespace)
+			if tc.wantConflict {
+				if !apierrors.IsConflict(err) {
+					t.Fatalf("copyConfigMapByName error = %v, want conflict", err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("copyConfigMapByName: %v", err)
+			}
+		})
+	}
+}
+
+func TestCopyConfigMapByNameMissingSourceRequiresTarget(t *testing.T) {
+	t.Run("existing target succeeds", func(t *testing.T) {
+		r := newReaper(t, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+			Name: "user-data", Namespace: "unbounded-system",
+		}})
+
+		if err := r.copyConfigMapByName(t.Context(), legacyKubeNamespace, "user-data", "unbounded-system"); err != nil {
+			t.Fatalf("copyConfigMapByName: %v", err)
+		}
+	})
+
+	t.Run("missing target errors", func(t *testing.T) {
+		r := newReaper(t)
+
+		if err := r.copyConfigMapByName(t.Context(), legacyKubeNamespace, "user-data", "unbounded-system"); err == nil {
+			t.Fatal("expected missing source and target to error")
+		}
+	})
 }
 
 func TestMigrateMachinaConfigUsesConfiguredEndpoint(t *testing.T) {
@@ -519,7 +810,7 @@ func readyMachinaTarget(namespace, config string) (*corev1.ConfigMap, *appsv1.De
 	deploy := readyDeployment(namespace, "machina-controller")
 	deploy.Generation = 1
 	deploy.Spec.Template.Annotations = map[string]string{
-		machinaConfigHashAnnotation: machinaConfigHash(config),
+		machinaConfigHashAnnotation: configMapPayloadHash(cm),
 	}
 	deploy.Status.ObservedGeneration = 1
 	deploy.Status.Replicas = 1
@@ -531,8 +822,24 @@ func readyMachinaTarget(namespace, config string) (*corev1.ConfigMap, *appsv1.De
 func readyDaemonSet(namespace, name string) *appsv1.DaemonSet {
 	return &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-		Status:     appsv1.DaemonSetStatus{ObservedGeneration: 1 << 30, DesiredNumberScheduled: 2, NumberReady: 2},
+		Status: appsv1.DaemonSetStatus{
+			ObservedGeneration:     1 << 30,
+			DesiredNumberScheduled: 2,
+			UpdatedNumberScheduled: 2,
+			NumberReady:            2,
+		},
 	}
+}
+
+func storageConfigAndReadyDaemonSet(namespace, site, config string) (*corev1.ConfigMap, *appsv1.DaemonSet) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: storageConfigName(site)},
+		Data:       map[string]string{"config.yaml": config},
+	}
+	ds := readyDaemonSet(namespace, storageDaemonSetName(site))
+	ds.Spec.Template.Annotations = map[string]string{storageConfigHashAnnotation: configMapPayloadHash(cm)}
+
+	return cm, ds
 }
 
 func labeledDeployment(namespace, name, appName string) *appsv1.Deployment {
@@ -562,6 +869,26 @@ func notReadyDaemonSet(namespace, name string) *appsv1.DaemonSet {
 		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
 		Status:     appsv1.DaemonSetStatus{DesiredNumberScheduled: 2, NumberReady: 0},
 	}
+}
+
+func netConfigAndTargets(namespace, config string, ready bool) (*corev1.ConfigMap, *appsv1.Deployment, *appsv1.DaemonSet) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "unbounded-net-config"},
+		Data:       map[string]string{"config.yaml": config},
+	}
+	deploy := notReadyDeployment(namespace, "unbounded-net-controller")
+
+	ds := notReadyDaemonSet(namespace, "unbounded-net-node")
+	if ready {
+		deploy = readyDeployment(namespace, "unbounded-net-controller")
+		ds = readyDaemonSet(namespace, "unbounded-net-node")
+	}
+
+	hash := configMapPayloadHash(cm)
+	deploy.Spec.Template.Annotations = map[string]string{netConfigHashAnnotation: hash}
+	ds.Spec.Template.Annotations = map[string]string{netConfigHashAnnotation: hash}
+
+	return cm, deploy, ds
 }
 
 func TestTargetsReadyGating(t *testing.T) {
@@ -620,10 +947,15 @@ func TestReapComponentDeletesByLabelOnly(t *testing.T) {
 
 func TestReapOnceWaitsThenCompletesAndDeletesNamespaces(t *testing.T) {
 	// Legacy net controller present but target NOT ready yet: reap must wait.
+	legacyConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: legacyNetNamespace, Name: "unbounded-net-config"},
+		Data:       map[string]string{"config.yaml": "sentinel: current"},
+	}
 	r := newReaper(t,
 		ns(legacyNetNamespace),
 		ns("unbounded-system"),
 		labeledDeployment(legacyNetNamespace, "unbounded-net-controller", "unbounded-net-controller"),
+		legacyConfig,
 	)
 
 	done, err := r.reapOnce(t.Context(), logr.Discard())
@@ -639,13 +971,12 @@ func TestReapOnceWaitsThenCompletesAndDeletesNamespaces(t *testing.T) {
 		t.Fatalf("legacy controller should remain until target ready: %v", err)
 	}
 
-	// Make the target ready.
-	if err := r.Create(t.Context(), readyDeployment("unbounded-system", "unbounded-net-controller")); err != nil {
-		t.Fatalf("create target: %v", err)
-	}
-
-	if err := r.Create(t.Context(), readyDaemonSet("unbounded-system", "unbounded-net-node")); err != nil {
-		t.Fatalf("create target ds: %v", err)
+	// Make both targets carry the current live config hash.
+	_, deploy, ds := netConfigAndTargets("unbounded-system", "sentinel: current", true)
+	for _, obj := range []client.Object{deploy, ds} {
+		if err := r.Create(t.Context(), obj); err != nil {
+			t.Fatalf("create target %T: %v", obj, err)
+		}
 	}
 
 	// Second pass reaps the legacy controller and issues namespace deletion, so
@@ -696,9 +1027,11 @@ func TestNetTargetsPresent(t *testing.T) {
 		t.Fatalf("expected not present with no net workloads")
 	}
 
-	// Only the controller present: still not present.
-	if err := r.Create(t.Context(), notReadyDeployment("unbounded-system", "unbounded-net-controller")); err != nil {
-		t.Fatalf("create net controller: %v", err)
+	cm, deploy, ds := netConfigAndTargets("unbounded-system", "sentinel: current", false)
+	for _, obj := range []client.Object{cm, deploy} {
+		if err := r.Create(t.Context(), obj); err != nil {
+			t.Fatalf("create net target %T: %v", obj, err)
+		}
 	}
 
 	present, err = r.netTargetsPresent(t.Context(), "unbounded-system")
@@ -710,10 +1043,9 @@ func TestNetTargetsPresent(t *testing.T) {
 		t.Fatalf("expected not present with only the net controller")
 	}
 
-	// Both present but NOT Ready: present (readiness is deliberately ignored,
-	// since the new net cannot become Ready until the old net frees the shared
-	// host ports).
-	if err := r.Create(t.Context(), notReadyDaemonSet("unbounded-system", "unbounded-net-node")); err != nil {
+	// Both carry the live hash but are NOT Ready: present (readiness is
+	// deliberately ignored because the legacy workloads hold the host ports).
+	if err := r.Create(t.Context(), ds); err != nil {
 		t.Fatalf("create net node: %v", err)
 	}
 
@@ -727,17 +1059,63 @@ func TestNetTargetsPresent(t *testing.T) {
 	}
 }
 
+func TestNetTargetsPresentRequiresCurrentHashOnBothWorkloads(t *testing.T) {
+	const target = "unbounded-system"
+
+	cm, deploy, ds := netConfigAndTargets(target, "sentinel: current", false)
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*appsv1.Deployment, *appsv1.DaemonSet)
+		want   bool
+	}{
+		{name: "both match", want: true},
+		{name: "controller mismatch", mutate: func(d *appsv1.Deployment, _ *appsv1.DaemonSet) {
+			d.Spec.Template.Annotations[netConfigHashAnnotation] = "stale"
+		}},
+		{name: "node mismatch", mutate: func(_ *appsv1.Deployment, ds *appsv1.DaemonSet) {
+			ds.Spec.Template.Annotations[netConfigHashAnnotation] = "stale"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotDeploy := deploy.DeepCopy()
+
+			gotDS := ds.DeepCopy()
+			if tc.mutate != nil {
+				tc.mutate(gotDeploy, gotDS)
+			}
+
+			r := newReaper(t, cm.DeepCopy(), gotDeploy, gotDS)
+
+			got, err := r.netTargetsPresent(t.Context(), target)
+			if err != nil || got != tc.want {
+				t.Fatalf("netTargetsPresent = %t, err=%v, want %t", got, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestReapOnceReapsNetWhenNewNetNotReady(t *testing.T) {
 	// The new net workloads exist but are NOT Ready (they stay Pending until the
 	// old net frees the shared host ports). Net must still be reaped: gating net
 	// on readiness here would deadlock the cutover.
+	legacyConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: legacyNetNamespace, Name: "unbounded-net-config"},
+		Data:       map[string]string{"config.yaml": "sentinel: current"},
+	}
 	r := newReaper(t,
 		ns(legacyNetNamespace),
 		ns("unbounded-system"),
 		labeledDeployment(legacyNetNamespace, "unbounded-net-controller", "unbounded-net-controller"),
-		notReadyDeployment("unbounded-system", "unbounded-net-controller"),
-		notReadyDaemonSet("unbounded-system", "unbounded-net-node"),
+		legacyConfig,
 	)
+
+	cm, deploy, ds := netConfigAndTargets("unbounded-system", "sentinel: current", false)
+	for _, obj := range []client.Object{cm, deploy, ds} {
+		if err := r.Create(t.Context(), obj); err != nil {
+			t.Fatalf("create target %T: %v", obj, err)
+		}
+	}
 
 	if _, err := r.reapOnce(t.Context(), logr.Discard()); err != nil {
 		t.Fatalf("reapOnce: %v", err)
@@ -751,6 +1129,11 @@ func TestReapOnceReapsNetWhenNewNetNotReady(t *testing.T) {
 func TestStorageTargetsReadyGatesOnPerSiteDaemonSets(t *testing.T) {
 	r := newReaper(t, ns("unbounded-system"))
 
+	config, readyTarget := storageConfigAndReadyDaemonSet("unbounded-system", "cluster", "version: 7")
+	if err := r.Create(t.Context(), config); err != nil {
+		t.Fatalf("create storage config: %v", err)
+	}
+
 	// No per-site storage DaemonSet yet: not ready.
 	ready, err := r.storageTargetsReady(t.Context(), "unbounded-system")
 	if err != nil {
@@ -762,7 +1145,7 @@ func TestStorageTargetsReadyGatesOnPerSiteDaemonSets(t *testing.T) {
 	}
 
 	// A per-site DaemonSet that is not yet Ready keeps the gate closed.
-	notReady := readyDaemonSet("unbounded-system", "unbounded-storage-supervisor-cluster")
+	notReady := readyTarget.DeepCopy()
 	notReady.Status.NumberReady = 0
 
 	if err := r.Create(t.Context(), notReady); err != nil {
@@ -783,7 +1166,7 @@ func TestStorageTargetsReadyGatesOnPerSiteDaemonSets(t *testing.T) {
 		t.Fatalf("delete not-ready ds: %v", err)
 	}
 
-	if err := r.Create(t.Context(), readyDaemonSet("unbounded-system", "unbounded-storage-supervisor-cluster")); err != nil {
+	if err := r.Create(t.Context(), readyTarget); err != nil {
 		t.Fatalf("create ready ds: %v", err)
 	}
 
@@ -812,11 +1195,15 @@ func TestStorageTargetsReadyRequiresEveryStorageEnabledSite(t *testing.T) {
 	// Two storage-enabled Sites, but only the cluster Site has a Ready
 	// DaemonSet. The gate must stay closed until edge has one too, so a
 	// multi-site cluster never loses the legacy supervisor early.
+	clusterConfig, clusterDS := storageConfigAndReadyDaemonSet("unbounded-system", "cluster", "version: 7")
+	edgeConfig, edgeDS := storageConfigAndReadyDaemonSet("unbounded-system", "edge", "version: 7")
 	r := newReaper(t,
 		ns("unbounded-system"),
 		storageEnabledSite("cluster"),
 		storageEnabledSite("edge"),
-		readyDaemonSet("unbounded-system", "unbounded-storage-supervisor-cluster"),
+		clusterConfig,
+		clusterDS,
+		edgeConfig,
 	)
 
 	ready, err := r.storageTargetsReady(t.Context(), "unbounded-system")
@@ -829,7 +1216,7 @@ func TestStorageTargetsReadyRequiresEveryStorageEnabledSite(t *testing.T) {
 	}
 
 	// Add edge's Ready DaemonSet: every storage-enabled Site now has one.
-	if err := r.Create(t.Context(), readyDaemonSet("unbounded-system", "unbounded-storage-supervisor-edge")); err != nil {
+	if err := r.Create(t.Context(), edgeDS); err != nil {
 		t.Fatalf("create edge ds: %v", err)
 	}
 
@@ -945,6 +1332,10 @@ func TestReapOnceStorageGatedOnPerSiteDaemonSet(t *testing.T) {
 		ns(legacyKubeNamespace),
 		ns("unbounded-system"),
 		storageDaemonSet(legacyKubeNamespace),
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "unbounded-storage-config", Namespace: legacyKubeNamespace},
+			Data:       map[string]string{"config.yaml": "version: 7"},
+		},
 	)
 
 	// No per-site storage DaemonSet in the target yet: storage must not reap.
@@ -961,9 +1352,12 @@ func TestReapOnceStorageGatedOnPerSiteDaemonSet(t *testing.T) {
 		t.Fatalf("legacy storage DaemonSet should remain until target ready: %v", err)
 	}
 
-	// Bring up the per-site storage DaemonSet (Ready): storage reaps.
-	if err := r.Create(t.Context(), readyDaemonSet("unbounded-system", "unbounded-storage-supervisor-cluster")); err != nil {
-		t.Fatalf("create per-site storage ds: %v", err)
+	// Bring up the per-site storage config and DaemonSet (Ready): storage reaps.
+	config, ds := storageConfigAndReadyDaemonSet("unbounded-system", "cluster", "version: 7")
+	for _, obj := range []client.Object{config, ds} {
+		if err := r.Create(t.Context(), obj); err != nil {
+			t.Fatalf("create per-site storage target %T: %v", obj, err)
+		}
 	}
 
 	if _, err := r.reapOnce(t.Context(), logr.Discard()); err != nil {
@@ -983,6 +1377,10 @@ func TestReapOnceSkipsComponentsWithoutLegacyFootprint(t *testing.T) {
 		ns(legacyKubeNamespace),
 		ns("unbounded-system"),
 		labeledAppDeployment(legacyKubeNamespace, "machina-controller", map[string]string{"app": "machina-controller"}),
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "machina-config", Namespace: legacyKubeNamespace},
+			Data:       map[string]string{"config.yaml": "apiServerEndpoint: https://api.example:6443\n"},
+		},
 		config,
 		target,
 	)

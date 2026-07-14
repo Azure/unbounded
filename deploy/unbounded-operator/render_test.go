@@ -99,6 +99,16 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 	t.Fatal("controller startup probe not found")
 }
 
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+
+	return false
+}
+
 func TestOperatorRBACIncludesCachedReadKinds(t *testing.T) {
 	t.Parallel()
 
@@ -124,7 +134,7 @@ func TestOperatorRBACIncludesCachedReadKinds(t *testing.T) {
 		t.Helper()
 
 		for _, rule := range role.Rules {
-			if len(rule.APIGroups) != 1 || rule.APIGroups[0] != group || len(rule.Resources) != 1 || rule.Resources[0] != resource {
+			if !contains(rule.APIGroups, group) || !contains(rule.Resources, resource) {
 				continue
 			}
 

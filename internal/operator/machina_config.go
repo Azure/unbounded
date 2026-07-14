@@ -4,20 +4,10 @@
 package operator
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 
 	"gopkg.in/yaml.v3"
 )
-
-const machinaConfigHashAnnotation = "unbounded-cloud.io/machina-config-hash"
-
-func machinaConfigHash(config string) string {
-	sum := sha256.Sum256([]byte(config))
-
-	return hex.EncodeToString(sum[:])
-}
 
 // setMachinaAPIServerEndpoint updates only the top-level apiServerEndpoint
 // field. Using a YAML node preserves all other migrated or user-managed fields.

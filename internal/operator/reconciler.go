@@ -63,6 +63,10 @@ const (
 	// workloads target either key during the deprecation window so they schedule
 	// before the upgraded net has converged all Nodes to the canonical label.
 	deprecatedSiteLabelKey = "net.unbounded-cloud.io/site"
+
+	// singletonRequestName cannot collide with a valid Site name. Managed
+	// singleton resource events use it independently of Site fan-out.
+	singletonRequestName = "__singletons"
 )
 
 // DefaultNamespace is the namespace the operator installs components into. It
@@ -113,8 +117,8 @@ func (r *SiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	var site unboundedv1alpha3.Site
 	if err := r.Get(ctx, req.NamespacedName, &site); err != nil {
 		if apierrors.IsNotFound(err) {
-			// A Site was deleted; reconcile the cluster singletons so net/machina
-			// are torn down when the last Site goes away.
+			// A Site was deleted, or a managed singleton config event used the
+			// synthetic request; reconcile the cluster singletons without status.
 			return ctrl.Result{}, r.reconcileSingletons(ctx)
 		}
 
@@ -123,9 +127,9 @@ func (r *SiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	results := map[string]componentResult{}
 
-	// Cluster singletons: net is deployed whenever at least one Site exists;
-	// machina whenever any Site enables it. Reconciled idempotently on every
-	// Site event and reported on each Site's status for visibility.
+	// Cluster singletons: net is deployed whenever at least one Site exists and
+	// kept reconciled if retained; machina is deployed whenever any Site enables
+	// it. Reconcile them idempotently on every Site event and report status.
 	results[ComponentNet] = r.reconcileNet(ctx)
 	results[ComponentMachina] = r.reconcileMachina(ctx)
 
@@ -215,12 +219,12 @@ func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// driven by intent, not status noise.
 		Watches(
 			&corev1.ConfigMap{},
-			handler.EnqueueRequestsFromMapFunc(r.requestsForMachinaConfig),
+			handler.EnqueueRequestsFromMapFunc(r.requestsForManagedConfig),
 			builder.WithPredicates(predicate.Funcs{
-				CreateFunc: func(e event.CreateEvent) bool { return r.isMachinaConfig(e.Object) },
-				DeleteFunc: func(e event.DeleteEvent) bool { return r.isMachinaConfig(e.Object) },
+				CreateFunc: func(e event.CreateEvent) bool { return r.isManagedConfig(e.Object) },
+				DeleteFunc: func(e event.DeleteEvent) bool { return r.isManagedConfig(e.Object) },
 				UpdateFunc: func(e event.UpdateEvent) bool {
-					if !r.isMachinaConfig(e.ObjectNew) {
+					if !r.isManagedConfig(e.ObjectNew) {
 						return false
 					}
 
@@ -231,32 +235,87 @@ func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 						return false
 					}
 
-					return oldConfig.Data["config.yaml"] != newConfig.Data["config.yaml"]
+					return configMapPayloadChanged(oldConfig, newConfig)
 				},
 				GenericFunc: func(event.GenericEvent) bool { return false },
 			}),
 		).
+		Watches(
+			&appsv1.Deployment{},
+			handler.EnqueueRequestsFromMapFunc(r.requestsForManagedSingletonWorkload),
+			builder.WithPredicates(r.managedSingletonWorkloadPredicates()),
+		).
+		Watches(
+			&appsv1.DaemonSet{},
+			handler.EnqueueRequestsFromMapFunc(r.requestsForManagedSingletonWorkload),
+			builder.WithPredicates(r.managedSingletonWorkloadPredicates()),
+		).
 		Complete(r)
 }
 
-func (r *SiteReconciler) isMachinaConfig(obj client.Object) bool {
-	return obj.GetNamespace() == r.namespace() && obj.GetName() == "machina-config"
-}
-
-func (r *SiteReconciler) requestsForMachinaConfig(ctx context.Context, _ client.Object) []ctrl.Request {
-	sites, err := r.listSites(ctx)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "list Sites after machina config change")
-
-		return nil
+func (r *SiteReconciler) isManagedConfig(obj client.Object) bool {
+	if obj.GetNamespace() != r.namespace() {
+		return false
 	}
 
-	requests := make([]ctrl.Request, 0, len(sites))
+	if obj.GetName() == "machina-config" || obj.GetName() == "unbounded-net-config" {
+		return true
+	}
+
+	return strings.TrimPrefix(obj.GetName(), "unbounded-storage-config-") != obj.GetName() &&
+		strings.TrimPrefix(obj.GetName(), "unbounded-storage-config-") != ""
+}
+
+func (r *SiteReconciler) requestsForManagedConfig(ctx context.Context, obj client.Object) []ctrl.Request {
+	if siteName := strings.TrimPrefix(obj.GetName(), "unbounded-storage-config-"); siteName != obj.GetName() && siteName != "" {
+		return []ctrl.Request{{NamespacedName: client.ObjectKey{Name: siteName}}}
+	}
+
+	requests := []ctrl.Request{{NamespacedName: client.ObjectKey{Name: singletonRequestName}}}
+
+	sites, err := r.listSites(ctx)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "list Sites after managed config change")
+
+		return requests
+	}
+
 	for i := range sites {
 		requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKey{Name: sites[i].Name}})
 	}
 
 	return requests
+}
+
+func (r *SiteReconciler) requestsForManagedSingletonWorkload(context.Context, client.Object) []ctrl.Request {
+	return []ctrl.Request{{NamespacedName: client.ObjectKey{Name: singletonRequestName}}}
+}
+
+func (r *SiteReconciler) managedSingletonWorkloadPredicates() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool { return r.isManagedSingletonWorkload(e.Object) },
+		DeleteFunc: func(e event.DeleteEvent) bool { return r.isManagedSingletonWorkload(e.Object) },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return r.isManagedSingletonWorkload(e.ObjectNew) &&
+				e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration()
+		},
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+}
+
+func (r *SiteReconciler) isManagedSingletonWorkload(obj client.Object) bool {
+	if obj.GetNamespace() != r.namespace() {
+		return false
+	}
+
+	switch obj.(type) {
+	case *appsv1.Deployment:
+		return obj.GetName() == "machina-controller" || obj.GetName() == "unbounded-net-controller"
+	case *appsv1.DaemonSet:
+		return obj.GetName() == "unbounded-net-node"
+	default:
+		return false
+	}
 }
 
 // reconcilePerSiteComponent reconciles a per-site component when enabled and
@@ -278,7 +337,7 @@ func (r *SiteReconciler) reconcilePerSiteComponent(enabled bool, reconcile, clea
 }
 
 // reconcileSingletons reconciles just the cluster-singleton components (net,
-// machina); used when a Site is deleted.
+// machina); used for deleted Sites and synthetic singleton requests.
 func (r *SiteReconciler) reconcileSingletons(ctx context.Context) error {
 	if s := r.reconcileNet(ctx); !s.ready {
 		return fmt.Errorf("net: %s", s.message)
@@ -292,8 +351,8 @@ func (r *SiteReconciler) reconcileSingletons(ctx context.Context) error {
 }
 
 // reconcileNet deploys the unbounded-net cluster singleton whenever at least
-// one Site exists. Net is not a per-Site component: a single controller/node
-// pair reads the networking spec of every Site.
+// one Site exists and keeps an existing installation reconciled with no Sites.
+// Net is not a per-Site component: one controller/node pair reads every Site.
 func (r *SiteReconciler) reconcileNet(ctx context.Context) componentResult {
 	sites, err := r.listSites(ctx)
 	if err != nil {
@@ -304,18 +363,136 @@ func (r *SiteReconciler) reconcileNet(ctx context.Context) componentResult {
 		// Net is the cluster dataplane. Do not auto-delete it just because the
 		// last Site was removed; deleting net-node can break pod networking across
 		// the whole cluster. A future explicit uninstall flow should handle removal.
-		return componentResult{ready: true, reason: reasonNoSites, message: "no sites; net retained"}
+		retained, err := r.netResourcesExist(ctx)
+		if err != nil {
+			return componentResult{ready: false, reason: reasonReconcileError, message: err.Error(), err: err}
+		}
+
+		if !retained {
+			return componentResult{ready: true, reason: reasonNoSites, message: "no sites; net retained"}
+		}
 	}
 
-	if err := r.applyManifestFS(ctx, netmanifests.Manifests, skipCRDObjects); err != nil {
+	configHash, err := r.ensureNetConfig(ctx)
+	if err != nil {
+		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error(), err: err}
+	}
+
+	if err := r.applyManifestFS(ctx, netmanifests.Manifests, r.netApplyMutator(configHash)); err != nil {
 		return componentResult{ready: false, reason: reasonReconcileError, message: err.Error(), err: err}
 	}
 
 	return componentResult{ready: true, reason: reasonReconciled, message: "component reconciled"}
 }
 
+func (r *SiteReconciler) netResourcesExist(ctx context.Context) (bool, error) {
+	key := func(name string) client.ObjectKey {
+		return client.ObjectKey{Namespace: r.namespace(), Name: name}
+	}
+
+	for _, object := range []client.Object{
+		&corev1.ConfigMap{},
+		&appsv1.Deployment{},
+		&appsv1.DaemonSet{},
+	} {
+		name := "unbounded-net-config"
+
+		switch object.(type) {
+		case *appsv1.Deployment:
+			name = "unbounded-net-controller"
+		case *appsv1.DaemonSet:
+			name = "unbounded-net-node"
+		}
+
+		if err := r.Get(ctx, key(name), object); err == nil {
+			return true, nil
+		} else if !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("get retained net resource %s/%s: %w", r.namespace(), name, err)
+		}
+	}
+
+	return false, nil
+}
+
+// netApplyMutator skips the separately reconciled ConfigMap and stamps its
+// exact payload hash on both net workloads so config changes roll them together.
+func (r *SiteReconciler) netApplyMutator(configHash string) func(*unstructured.Unstructured) error {
+	return func(obj *unstructured.Unstructured) error {
+		if obj.GetKind() == crdKind {
+			obj.Object = nil
+
+			return nil
+		}
+
+		if obj.GetKind() == "ConfigMap" && obj.GetName() == "unbounded-net-config" {
+			obj.Object = nil
+
+			return nil
+		}
+
+		if (obj.GetKind() == "Deployment" && obj.GetName() == "unbounded-net-controller") ||
+			(obj.GetKind() == "DaemonSet" && obj.GetName() == "unbounded-net-node") {
+			annotations, _, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
+			if err != nil {
+				return fmt.Errorf("get net pod template annotations: %w", err)
+			}
+
+			if annotations == nil {
+				annotations = map[string]string{}
+			}
+
+			annotations[netConfigHashAnnotation] = configHash
+			if err := unstructured.SetNestedStringMap(obj.Object, annotations, "spec", "template", "metadata", "annotations"); err != nil {
+				return fmt.Errorf("set net config hash annotation: %w", err)
+			}
+		}
+
+		return nil
+	}
+}
+
+// ensureNetConfig creates the embedded default only when no config exists.
+// Existing migrated or user-managed payloads are never applied over.
+func (r *SiteReconciler) ensureNetConfig(ctx context.Context) (string, error) {
+	key := client.ObjectKey{Namespace: r.namespace(), Name: "unbounded-net-config"}
+	existing := &corev1.ConfigMap{}
+
+	err := r.Get(ctx, key, existing)
+	if err == nil {
+		return configMapPayloadHash(existing), nil
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return "", fmt.Errorf("get net config %s/%s: %w", key.Namespace, key.Name, err)
+	}
+
+	desired, err := defaultNetConfigMap(r.namespace())
+	if err != nil {
+		return "", err
+	}
+
+	if err := r.Create(ctx, desired); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return "", fmt.Errorf("create net config %s/%s: %w", key.Namespace, key.Name, err)
+		}
+
+		if err := r.Get(ctx, key, existing); err != nil {
+			return "", fmt.Errorf("get raced net config %s/%s: %w", key.Namespace, key.Name, err)
+		}
+
+		return configMapPayloadHash(existing), nil
+	}
+
+	return configMapPayloadHash(desired), nil
+}
+
+func defaultNetConfigMap(namespace string) (*corev1.ConfigMap, error) {
+	return defaultConfigMap(netmanifests.Manifests, namespace, "unbounded-net-config", "net")
+}
+
 // reconcileMachina deploys the machina controller singleton whenever any Site
-// enables it. (Machina is a singleton for now; it may become site-scoped.)
+// enables it and keeps an existing installation reconciled when none do.
+// (Machina is a singleton for now; it may become site-scoped.)
 func (r *SiteReconciler) reconcileMachina(ctx context.Context) componentResult {
 	sites, err := r.listSites(ctx)
 	if err != nil {
@@ -335,7 +512,14 @@ func (r *SiteReconciler) reconcileMachina(ctx context.Context) componentResult {
 		// Keep machina installed once the operator has taken ownership. Automatic
 		// singleton removal is surprising and can strand related controllers/RBAC;
 		// a future explicit uninstall flow should handle removal.
-		return componentResult{ready: true, reason: reasonDisabled, message: "no site enables machina; retained"}
+		retained, err := r.machinaResourcesExist(ctx)
+		if err != nil {
+			return componentResult{ready: false, reason: reasonReconcileError, message: err.Error(), err: err}
+		}
+
+		if !retained {
+			return componentResult{ready: true, reason: reasonDisabled, message: "no site enables machina; retained"}
+		}
 	}
 
 	configHash, err := r.ensureMachinaConfig(ctx)
@@ -348,6 +532,25 @@ func (r *SiteReconciler) reconcileMachina(ctx context.Context) componentResult {
 	}
 
 	return componentResult{ready: true, reason: reasonReconciled, message: "component reconciled"}
+}
+
+func (r *SiteReconciler) machinaResourcesExist(ctx context.Context) (bool, error) {
+	for _, resource := range []struct {
+		name   string
+		object client.Object
+	}{
+		{name: "machina-config", object: &corev1.ConfigMap{}},
+		{name: "machina-controller", object: &appsv1.Deployment{}},
+	} {
+		key := client.ObjectKey{Namespace: r.namespace(), Name: resource.name}
+		if err := r.Get(ctx, key, resource.object); err == nil {
+			return true, nil
+		} else if !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("get retained machina resource %s/%s: %w", key.Namespace, key.Name, err)
+		}
+	}
+
+	return false, nil
 }
 
 // machinaApplyMutator skips the separately reconciled ConfigMap and stamps its
@@ -400,7 +603,7 @@ func (r *SiteReconciler) ensureMachinaConfig(ctx context.Context) (string, error
 			return "", fmt.Errorf("create machina config %s/%s: %w", key.Namespace, key.Name, createErr)
 		}
 
-		return machinaConfigHash(config), nil
+		return configMapPayloadHash(desired), nil
 	}
 
 	if err != nil {
@@ -421,24 +624,30 @@ func (r *SiteReconciler) ensureMachinaConfig(ctx context.Context) (string, error
 		}
 
 		existing.Data["config.yaml"] = merged
-		if err := r.Patch(ctx, existing, client.MergeFrom(before)); err != nil {
+
+		patch := client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})
+		if err := r.Patch(ctx, existing, patch); err != nil {
 			return "", fmt.Errorf("update machina config %s/%s: %w", key.Namespace, key.Name, err)
 		}
 	}
 
-	return machinaConfigHash(merged), nil
+	return configMapPayloadHash(existing), nil
 }
 
 func defaultMachinaConfigMap(namespace string) (*corev1.ConfigMap, error) {
-	files, err := yamlFiles(machinamanifests.Manifests)
+	return defaultConfigMap(machinamanifests.Manifests, namespace, "machina-config", "machina")
+}
+
+func defaultConfigMap(manifests fs.FS, namespace, name, component string) (*corev1.ConfigMap, error) {
+	files, err := yamlFiles(manifests)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, file := range files {
-		data, err := fs.ReadFile(machinamanifests.Manifests, file)
+		data, err := fs.ReadFile(manifests, file)
 		if err != nil {
-			return nil, fmt.Errorf("read machina manifest %s: %w", file, err)
+			return nil, fmt.Errorf("read %s manifest %s: %w", component, file, err)
 		}
 
 		decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
@@ -450,16 +659,16 @@ func defaultMachinaConfigMap(namespace string) (*corev1.ConfigMap, error) {
 					break
 				}
 
-				return nil, fmt.Errorf("decode machina manifest %s: %w", file, err)
+				return nil, fmt.Errorf("decode %s manifest %s: %w", component, file, err)
 			}
 
-			if obj.Object == nil || obj.GetKind() != "ConfigMap" || obj.GetName() != "machina-config" {
+			if obj.Object == nil || obj.GetKind() != "ConfigMap" || obj.GetName() != name {
 				continue
 			}
 
 			cm := &corev1.ConfigMap{}
 			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, cm); err != nil {
-				return nil, fmt.Errorf("convert machina config template: %w", err)
+				return nil, fmt.Errorf("convert %s config template: %w", component, err)
 			}
 
 			cm.Namespace = namespace
@@ -468,7 +677,7 @@ func defaultMachinaConfigMap(namespace string) (*corev1.ConfigMap, error) {
 		}
 	}
 
-	return nil, errors.New("machina config template not found")
+	return nil, fmt.Errorf("%s config template not found", component)
 }
 
 // reconcileMetalman deploys the per-site metalman PXE controller and its RBAC.
@@ -483,12 +692,13 @@ func (r *SiteReconciler) reconcileMetalman(ctx context.Context, site *unboundedv
 // reconcileStorage deploys a site-scoped storage supervisor DaemonSet that runs
 // only on the nodes belonging to the Site.
 func (r *SiteReconciler) reconcileStorage(ctx context.Context, site *unboundedv1alpha3.Site) error {
-	if err := r.ensureStorageConfig(ctx, site); err != nil {
+	configHash, err := r.ensureStorageConfig(ctx, site)
+	if err != nil {
 		return err
 	}
 
 	return r.applyManifestFS(ctx, storagemanifests.Manifests, func(obj *unstructured.Unstructured) error {
-		return mutateStorageObject(site, obj)
+		return mutateStorageObject(site, configHash, obj)
 	})
 }
 
@@ -498,37 +708,45 @@ func (r *SiteReconciler) reconcileStorage(ctx context.Context, site *unboundedv1
 // so it is garbage-collected with the Site. Do not server-side-apply metadata
 // for existing ConfigMaps: if the operator previously owned data.config.yaml,
 // an apply that omits data would delete it.
-func (r *SiteReconciler) ensureStorageConfig(ctx context.Context, site *unboundedv1alpha3.Site) error {
+func (r *SiteReconciler) ensureStorageConfig(ctx context.Context, site *unboundedv1alpha3.Site) (string, error) {
 	key := client.ObjectKey{Namespace: r.namespace(), Name: storageConfigName(site.Name)}
 	existing := &corev1.ConfigMap{}
 
 	err := r.Get(ctx, key, existing)
 	switch {
 	case err == nil:
-		return r.adoptStorageConfig(ctx, site, existing)
+		if err := r.adoptStorageConfig(ctx, site, existing); err != nil {
+			return "", err
+		}
+
+		return configMapPayloadHash(existing), nil
 	case !apierrors.IsNotFound(err):
-		return fmt.Errorf("get storage config %s/%s: %w", key.Namespace, key.Name, err)
+		return "", fmt.Errorf("get storage config %s/%s: %w", key.Namespace, key.Name, err)
 	}
 
 	cm, err := defaultStorageConfigMap(site, r.namespace())
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	if err := r.Create(ctx, cm); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("create storage config %s/%s: %w", cm.Namespace, cm.Name, err)
+			return "", fmt.Errorf("create storage config %s/%s: %w", cm.Namespace, cm.Name, err)
 		}
 
 		// Race with a user/reaper create; adopt what won without touching data.
 		if getErr := r.Get(ctx, key, existing); getErr != nil {
-			return fmt.Errorf("get raced storage config %s/%s: %w", key.Namespace, key.Name, getErr)
+			return "", fmt.Errorf("get raced storage config %s/%s: %w", key.Namespace, key.Name, getErr)
 		}
 
-		return r.adoptStorageConfig(ctx, site, existing)
+		if err := r.adoptStorageConfig(ctx, site, existing); err != nil {
+			return "", err
+		}
+
+		return configMapPayloadHash(existing), nil
 	}
 
-	return nil
+	return configMapPayloadHash(cm), nil
 }
 
 func (r *SiteReconciler) adoptStorageConfig(ctx context.Context, site *unboundedv1alpha3.Site, cm *corev1.ConfigMap) error {
@@ -542,7 +760,8 @@ func (r *SiteReconciler) adoptStorageConfig(ctx context.Context, site *unbounded
 	before := cm.DeepCopy()
 	cm.OwnerReferences = refs
 
-	if err := r.Patch(ctx, cm, client.MergeFrom(before)); err != nil {
+	patch := client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})
+	if err := r.Patch(ctx, cm, patch); err != nil {
 		return fmt.Errorf("adopt storage config %s/%s: %w", cm.Namespace, cm.Name, err)
 	}
 
@@ -900,10 +1119,10 @@ func siteNodeSelectorTerm(key, siteName string) corev1.NodeSelectorTerm {
 // DaemonSet is per-site (name, labels, node affinity, and config mount). The
 // per-site ConfigMap is handled by ensureStorageConfig so existing config data
 // is preserved; the SA and RBAC are shared across sites.
-func mutateStorageObject(site *unboundedv1alpha3.Site, obj *unstructured.Unstructured) error {
+func mutateStorageObject(site *unboundedv1alpha3.Site, configHash string, obj *unstructured.Unstructured) error {
 	switch {
 	case obj.GetKind() == "DaemonSet" && obj.GetName() == "unbounded-storage-supervisor":
-		return scopeStorageDaemonSetToSite(site, obj)
+		return scopeStorageDaemonSetToSite(site, configHash, obj)
 	case obj.GetKind() == "ConfigMap" && obj.GetName() == "unbounded-storage-config":
 		obj.Object = nil
 
@@ -913,7 +1132,7 @@ func mutateStorageObject(site *unboundedv1alpha3.Site, obj *unstructured.Unstruc
 	}
 }
 
-func scopeStorageDaemonSetToSite(site *unboundedv1alpha3.Site, obj *unstructured.Unstructured) error {
+func scopeStorageDaemonSetToSite(site *unboundedv1alpha3.Site, configHash string, obj *unstructured.Unstructured) error {
 	obj.SetName(storageDaemonSetName(site.Name))
 	obj.SetOwnerReferences([]metav1.OwnerReference{siteOwnerReference(site)})
 
@@ -941,6 +1160,20 @@ func scopeStorageDaemonSetToSite(site *unboundedv1alpha3.Site, obj *unstructured
 
 	if err := unstructured.SetNestedMap(obj.Object, affinityMap, "spec", "template", "spec", "affinity"); err != nil {
 		return fmt.Errorf("set storage daemonset affinity: %w", err)
+	}
+
+	annotations, _, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
+	if err != nil {
+		return fmt.Errorf("get storage daemonset pod template annotations: %w", err)
+	}
+
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+
+	annotations[storageConfigHashAnnotation] = configHash
+	if err := unstructured.SetNestedStringMap(obj.Object, annotations, "spec", "template", "metadata", "annotations"); err != nil {
+		return fmt.Errorf("set storage config hash annotation: %w", err)
 	}
 
 	return pointDaemonSetAtSiteConfig(site, obj)

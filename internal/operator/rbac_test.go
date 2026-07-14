@@ -159,3 +159,28 @@ func TestOperatorClusterRoleGrantsReaperDeletes(t *testing.T) {
 		}
 	}
 }
+
+func TestOperatorClusterRoleGrantsForeignWorkloadAudit(t *testing.T) {
+	cr := loadOperatorClusterRole(t)
+	resources := []struct {
+		group    string
+		resource string
+	}{
+		{group: "", resource: "pods"},
+		{group: "", resource: "replicationcontrollers"},
+		{group: "apps", resource: "deployments"},
+		{group: "apps", resource: "replicasets"},
+		{group: "apps", resource: "daemonsets"},
+		{group: "apps", resource: "statefulsets"},
+		{group: "batch", resource: "jobs"},
+		{group: "batch", resource: "cronjobs"},
+	}
+
+	for _, audited := range resources {
+		for _, verb := range []string{"get", "list", "watch"} {
+			if !clusterRoleGrants(cr, audited.group, audited.resource, verb) {
+				t.Fatalf("operator ClusterRole must grant %s on %q (apiGroup %q) for the foreign workload audit", verb, audited.resource, audited.group)
+			}
+		}
+	}
+}
