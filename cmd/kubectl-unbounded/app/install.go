@@ -6,14 +6,17 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +24,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -28,18 +32,21 @@ import (
 
 	operatormanifests "github.com/Azure/unbounded/deploy/unbounded-operator"
 	"github.com/Azure/unbounded/internal/kube"
+	"github.com/Azure/unbounded/internal/operator"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 const defaultInstallTimeout = 5 * time.Minute
 
-// operatorConfigHashAnnotation is stamped onto the operator Deployment pod
-// template so a change to the environment-specific operator config (currently the
-// advertised api-server-endpoint) changes the pod template and triggers a
-// rollout. Without it a re-install that only edits the unbounded-operator-config
-// ConfigMap would not restart the operator, and envFrom is read once at pod
-// start, so the running operator would keep advertising the old endpoint.
-const operatorConfigHashAnnotation = "unbounded-cloud.io/operator-config-hash"
+const (
+	// operatorConfigHashAnnotation is stamped onto the operator Deployment pod
+	// template so a change to the operator ConfigMap data triggers a rollout.
+	operatorConfigHashAnnotation = "unbounded-cloud.io/operator-config-hash"
+
+	// operatorCRDRepairAnnotation restarts an existing operator when its startup
+	// CRD bootstrap needs to repair a missing or unestablished CRD.
+	operatorCRDRepairAnnotation = "unbounded-cloud.io/operator-crd-repair-token"
+)
 
 type installHandler struct {
 	kubeconfigPath string
@@ -56,6 +63,10 @@ type installHandler struct {
 	kubeResourcesCli client.Client
 	restConfig       *rest.Config
 	logger           *slog.Logger
+
+	operatorConfigData  map[string]string
+	operatorRepairToken string
+	newRepairToken      func() (string, error)
 }
 
 func installCommand() *cobra.Command {
@@ -89,6 +100,11 @@ func addInstallFlags(cmd *cobra.Command, handler *installHandler) {
 }
 
 func (h *installHandler) execute(ctx context.Context) error {
+	// execute can be called repeatedly in tests and by command embedders. Do not
+	// carry values derived from the previous cluster state into this run.
+	h.operatorConfigData = nil
+	h.operatorRepairToken = ""
+
 	if h.logger == nil {
 		h.logger = slog.Default()
 	}
@@ -117,14 +133,18 @@ func (h *installHandler) execute(ctx context.Context) error {
 		}
 	}
 
-	if h.apiServerEndpoint == "" && h.restConfig != nil {
-		h.apiServerEndpoint = h.restConfig.Host
+	if err := h.prepareOperatorConfig(ctx); err != nil {
+		return err
 	}
 
 	// CRDs are installed and upgraded by the operator itself at startup
 	// (operator.BootstrapCRDs). install only bootstraps the operator; applying
 	// the operator manifests and waiting for its rollout is enough, because the
 	// operator becomes Ready only after it has established the CRDs.
+	if err := h.prepareOperatorRepair(ctx); err != nil {
+		return err
+	}
+
 	if err := applyManifestFS(ctx, h.logger, h.kubeResourcesCli, operatormanifests.Manifests, fieldManagerID, h.mutateOperatorObject); err != nil {
 		return fmt.Errorf("applying unbounded-operator manifests: %w", err)
 	}
@@ -177,10 +197,29 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 	// The api-server-endpoint is delivered to the operator via the
 	// unbounded-operator-config ConfigMap (envFrom), not a Deployment arg, so
 	// install and the apply-only path share one config surface.
-	if obj.GetKind() == "ConfigMap" && obj.GetName() == "unbounded-operator-config" && h.apiServerEndpoint != "" {
-		if err := unstructured.SetNestedField(obj.Object, h.apiServerEndpoint, "data", "UNBOUNDED_API_SERVER_ENDPOINT"); err != nil {
-			return fmt.Errorf("set operator config api-server-endpoint: %w", err)
+	if obj.GetKind() == "ConfigMap" && obj.GetName() == "unbounded-operator-config" {
+		if h.operatorConfigData == nil {
+			return fmt.Errorf("operator config must be prepared before manifest mutation")
 		}
+
+		data, found, err := unstructured.NestedStringMap(obj.Object, "data")
+		if err != nil {
+			return fmt.Errorf("get operator config data: %w", err)
+		}
+
+		if !found {
+			return fmt.Errorf("operator config data not found")
+		}
+
+		for key, value := range h.operatorConfigData {
+			data[key] = value
+		}
+
+		if err := unstructured.SetNestedStringMap(obj.Object, data, "data"); err != nil {
+			return fmt.Errorf("set operator config data: %w", err)
+		}
+
+		h.operatorConfigData = data
 	}
 
 	if obj.GetKind() == "Deployment" && obj.GetName() == "unbounded-operator" {
@@ -201,24 +240,159 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 			}
 		}
 
-		// Stamp the config hash so a changed endpoint rolls the pod (see #3);
-		// this mirrors the render-time hash in 04-deployment.yaml.tmpl.
-		if err := unstructured.SetNestedField(obj.Object, operatorConfigHash(h.apiServerEndpoint), "spec", "template", "metadata", "annotations", operatorConfigHashAnnotation); err != nil {
+		if h.operatorConfigData == nil {
+			return fmt.Errorf("operator ConfigMap must be processed before Deployment")
+		}
+
+		// Hash the complete final ConfigMap data. Canonical JSON matches sprig's
+		// toJson in the deployment template and is independent of map order.
+		if err := unstructured.SetNestedField(obj.Object, operatorConfigHash(h.operatorConfigData), "spec", "template", "metadata", "annotations", operatorConfigHashAnnotation); err != nil {
 			return fmt.Errorf("set operator config hash annotation: %w", err)
+		}
+
+		if h.operatorRepairToken != "" {
+			if err := unstructured.SetNestedField(obj.Object, h.operatorRepairToken, "spec", "template", "metadata", "annotations", operatorCRDRepairAnnotation); err != nil {
+				return fmt.Errorf("set operator CRD repair annotation: %w", err)
+			}
 		}
 	}
 
 	return nil
 }
 
-// operatorConfigHash returns a stable hash of the environment-specific operator
-// config. It mirrors the render-time hash in 04-deployment.yaml.tmpl (sprig's
-// sha256sum of the endpoint) so both the install path and make-rendered
-// manifests roll the operator when the advertised api-server-endpoint changes.
-func operatorConfigHash(apiServerEndpoint string) string {
-	sum := sha256.Sum256([]byte(apiServerEndpoint))
+// operatorConfigHash returns the SHA-256 hash of the config data's canonical
+// JSON representation. encoding/json sorts map keys, matching sprig's toJson.
+func operatorConfigHash(data map[string]string) string {
+	canonical, err := json.Marshal(data)
+	if err != nil {
+		panic(fmt.Sprintf("marshal operator config data: %v", err))
+	}
+
+	sum := sha256.Sum256(canonical)
 
 	return hex.EncodeToString(sum[:])
+}
+
+func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
+	endpoint := h.apiServerEndpoint
+	if endpoint == "" && h.restConfig != nil {
+		endpoint = h.restConfig.Host
+	}
+
+	reapLegacyResources := true
+	configMap := &unstructured.Unstructured{}
+	configMap.SetAPIVersion("v1")
+	configMap.SetKind("ConfigMap")
+
+	key := client.ObjectKey{Namespace: h.namespace, Name: "unbounded-operator-config"}
+	if err := h.kubeResourcesCli.Get(ctx, key, configMap); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("inspect unbounded-operator-config ConfigMap: %w", err)
+		}
+	} else {
+		data, _, err := unstructured.NestedStringMap(configMap.Object, "data")
+		if err != nil {
+			return fmt.Errorf("get existing unbounded-operator-config data: %w", err)
+		}
+
+		if value, found := data["UNBOUNDED_REAP_LEGACY_RESOURCES"]; found {
+			parsed, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("parse existing UNBOUNDED_REAP_LEGACY_RESOURCES value %q: %w", value, err)
+			}
+
+			reapLegacyResources = parsed
+		}
+	}
+
+	h.operatorConfigData = map[string]string{
+		"UNBOUNDED_API_SERVER_ENDPOINT":   endpoint,
+		"UNBOUNDED_REAP_LEGACY_RESOURCES": strconv.FormatBool(reapLegacyResources),
+	}
+
+	return nil
+}
+
+func (h *installHandler) prepareOperatorRepair(ctx context.Context) error {
+	allEstablished := true
+
+	for _, name := range operator.RequiredCRDNames {
+		obj := &unstructured.Unstructured{}
+		obj.SetAPIVersion("apiextensions.k8s.io/v1")
+		obj.SetKind("CustomResourceDefinition")
+
+		if err := h.kubeResourcesCli.Get(ctx, client.ObjectKey{Name: name}, obj); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return fmt.Errorf("inspect customresourcedefinition %s: %w", name, err)
+			}
+
+			allEstablished = false
+
+			continue
+		}
+
+		if !crdEstablished(obj) {
+			allEstablished = false
+		}
+	}
+
+	deploy := &unstructured.Unstructured{}
+	deploy.SetAPIVersion("apps/v1")
+	deploy.SetKind("Deployment")
+
+	key := client.ObjectKey{Namespace: h.namespace, Name: "unbounded-operator"}
+	if err := h.kubeResourcesCli.Get(ctx, key, deploy); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+
+		return fmt.Errorf("inspect unbounded-operator deployment: %w", err)
+	}
+
+	token, _, err := unstructured.NestedString(deploy.Object, "spec", "template", "metadata", "annotations", operatorCRDRepairAnnotation)
+	if err != nil {
+		return fmt.Errorf("get operator CRD repair annotation: %w", err)
+	}
+
+	if allEstablished {
+		h.operatorRepairToken = token
+
+		return nil
+	}
+
+	typedDeploy := &appsv1.Deployment{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(deploy.Object, typedDeploy); err != nil {
+		return fmt.Errorf("convert unbounded-operator deployment: %w", err)
+	}
+
+	if !deploymentRolloutComplete(typedDeploy) {
+		h.operatorRepairToken = token
+
+		return nil
+	}
+
+	newRepairToken := h.newRepairToken
+	if newRepairToken == nil {
+		newRepairToken = randomRepairToken
+	}
+
+	token, err = newRepairToken()
+	if err != nil {
+		return fmt.Errorf("generate operator CRD repair token: %w", err)
+	}
+
+	h.operatorRepairToken = token
+
+	return nil
+}
+
+func randomRepairToken() (string, error) {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(value), nil
 }
 
 func (h *installHandler) waitForOperator(ctx context.Context) error {
@@ -249,20 +423,10 @@ func (h *installHandler) waitForCRDs(ctx context.Context) error {
 	deadlineCtx, cancel := context.WithTimeout(ctx, h.timeout)
 	defer cancel()
 
-	crds := []string{
-		"sites.unbounded-cloud.io",
-		"gatewaypools.net.unbounded-cloud.io",
-		"gatewaypoolnodes.net.unbounded-cloud.io",
-		"gatewaypoolpeerings.net.unbounded-cloud.io",
-		"sitegatewaypoolassignments.net.unbounded-cloud.io",
-		"sitenodeslices.net.unbounded-cloud.io",
-		"sitepeerings.net.unbounded-cloud.io",
-	}
-
 	for {
 		ready := true
 
-		for _, name := range crds {
+		for _, name := range operator.RequiredCRDNames {
 			obj := &unstructured.Unstructured{}
 			obj.SetAPIVersion("apiextensions.k8s.io/v1")
 			obj.SetKind("CustomResourceDefinition")
@@ -296,6 +460,10 @@ func (h *installHandler) waitForCRDs(ctx context.Context) error {
 }
 
 func crdEstablished(obj *unstructured.Unstructured) bool {
+	if obj.GetDeletionTimestamp() != nil {
+		return false
+	}
+
 	conditions, ok, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
 	if err != nil || !ok {
 		return false

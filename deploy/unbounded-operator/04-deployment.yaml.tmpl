@@ -12,6 +12,9 @@ metadata:
     app.kubernetes.io/component: controller
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
+    rollingUpdate: null
   selector:
     matchLabels:
       app.kubernetes.io/name: unbounded-operator
@@ -21,12 +24,9 @@ spec:
         app.kubernetes.io/name: unbounded-operator
         app.kubernetes.io/component: controller
       annotations:
-        # Rolls the operator when the advertised api-server-endpoint changes at
-        # render time. envFrom is read once at pod start, so without a pod-template
-        # change a re-render with a new endpoint would not restart the operator.
-        # The `kubectl unbounded install` path stamps the same annotation. See
-        # deploy/unbounded-operator/03-configmap.yaml.tmpl.
-        unbounded-cloud.io/operator-config-hash: {{ default "" .APIServerEndpoint | sha256sum | quote }}
+        # Rolls the operator when any ConfigMap data changes at render time.
+        # Canonical JSON matches the `kubectl unbounded install` hash.
+        unbounded-cloud.io/operator-config-hash: {{ dict "UNBOUNDED_API_SERVER_ENDPOINT" (default "" .APIServerEndpoint) "UNBOUNDED_REAP_LEGACY_RESOURCES" (default "true" .ReapLegacyResources) | toJson | sha256sum | quote }}
     spec:
       serviceAccountName: unbounded-operator
       containers:

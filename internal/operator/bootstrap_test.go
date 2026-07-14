@@ -6,34 +6,144 @@ package operator
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-// embeddedCRDNames are every CustomResourceDefinition the operator installs at
-// startup: the six machina-group and six net-group CRDs embedded in the machina
-// and net manifests. BootstrapCRDs must apply all of them so a cluster can be
-// maintained by applying the operator manifests alone.
-var embeddedCRDNames = []string{
-	"machines.unbounded-cloud.io",
-	"machineoperations.unbounded-cloud.io",
-	"sites.unbounded-cloud.io",
-	"machineconfigurations.unbounded-cloud.io",
-	"machineoperationcredentials.unbounded-cloud.io",
-	"machineconfigurationversions.unbounded-cloud.io",
-	"sitenodeslices.net.unbounded-cloud.io",
-	"gatewaypools.net.unbounded-cloud.io",
-	"gatewaypoolnodes.net.unbounded-cloud.io",
-	"sitegatewaypoolassignments.net.unbounded-cloud.io",
-	"sitepeerings.net.unbounded-cloud.io",
-	"gatewaypoolpeerings.net.unbounded-cloud.io",
+func TestCRDMaintainerNeedsLeaderElection(t *testing.T) {
+	if !(&CRDMaintainer{}).NeedLeaderElection() {
+		t.Fatal("CRDMaintainer must require leader election")
+	}
+}
+
+func TestCRDMaintainerInvokesBootstrap(t *testing.T) {
+	cli := fake.NewClientBuilder().Build()
+	ctx, cancel := context.WithCancel(context.Background())
+	called := make(chan struct{})
+
+	maintainer := &CRDMaintainer{
+		Client:   cli,
+		Interval: time.Millisecond,
+		Bootstrap: func(_ context.Context, got client.Client) error {
+			if got != cli {
+				t.Errorf("bootstrap client = %v, want direct client %v", got, cli)
+			}
+
+			close(called)
+			cancel()
+
+			return nil
+		},
+	}
+
+	if err := maintainer.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	select {
+	case <-called:
+	default:
+		t.Fatal("CRDMaintainer did not invoke Bootstrap")
+	}
+}
+
+func TestCRDMaintainerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	called := false
+	maintainer := &CRDMaintainer{
+		Interval: time.Hour,
+		Bootstrap: func(context.Context, client.Client) error {
+			called = true
+
+			return nil
+		},
+	}
+
+	if err := maintainer.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if called {
+		t.Fatal("Bootstrap called after cancellation")
+	}
+}
+
+func TestCRDMaintainerReturnsBootstrapError(t *testing.T) {
+	wantErr := errors.New("apply failed")
+	calls := 0
+	maintainer := &CRDMaintainer{
+		Interval:    time.Millisecond,
+		MaxFailures: 3,
+		Bootstrap: func(context.Context, client.Client) error {
+			calls++
+
+			return wantErr
+		},
+	}
+
+	err := maintainer.Start(context.Background())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Start error = %v, want %v", err, wantErr)
+	}
+
+	if calls != 3 {
+		t.Fatalf("Bootstrap called %d times, want 3 consecutive failures before crashing", calls)
+	}
+}
+
+func TestCRDMaintainerRetriesTransientFailureWithoutCrashing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	transient := errors.New("transient apply failure")
+	recovered := make(chan struct{})
+	calls := 0
+
+	maintainer := &CRDMaintainer{
+		Interval:    time.Millisecond,
+		MaxFailures: 3,
+		Bootstrap: func(context.Context, client.Client) error {
+			calls++
+
+			switch calls {
+			case 1:
+				return transient
+			case 2:
+				close(recovered)
+
+				return nil
+			default:
+				return nil
+			}
+		},
+	}
+
+	done := make(chan error, 1)
+
+	go func() { done <- maintainer.Start(ctx) }()
+
+	select {
+	case <-recovered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("maintainer did not recover from a transient failure")
+	}
+
+	cancel()
+
+	if err := <-done; err != nil {
+		t.Fatalf("Start after transient failure = %v, want nil", err)
+	}
 }
 
 func TestBootstrapCRDsTimeoutCancelsBlockedApply(t *testing.T) {
@@ -109,21 +219,19 @@ func TestBootstrapCRDsAppliesEmbeddedCRDs(t *testing.T) {
 		t.Fatalf("BootstrapCRDs: %v", err)
 	}
 
-	for _, name := range embeddedCRDNames {
+	for _, name := range RequiredCRDNames {
 		if !applied[name] {
 			t.Fatalf("expected CRD %q to be installed by BootstrapCRDs (applied=%v)", name, applied)
 		}
 	}
 
-	if len(applied) != len(embeddedCRDNames) {
-		t.Fatalf("BootstrapCRDs applied %d CRDs, want %d (applied=%v)", len(applied), len(embeddedCRDNames), applied)
+	if len(applied) != len(RequiredCRDNames) {
+		t.Fatalf("BootstrapCRDs applied %d CRDs, want %d (applied=%v)", len(applied), len(RequiredCRDNames), applied)
 	}
 }
 
 // TestBootstrapCRDsWaitsForEstablished proves BootstrapCRDs blocks on the
-// Established condition rather than returning as soon as a CRD exists: the fake
-// client reports the CRDs not-Established on the first observation and
-// Established thereafter, so BootstrapCRDs can only succeed by re-polling.
+// Established condition rather than returning as soon as a CRD exists.
 func TestBootstrapCRDsWaitsForEstablished(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := apiextensionsv1.AddToScheme(scheme); err != nil {
@@ -156,8 +264,6 @@ func TestBootstrapCRDsWaitsForEstablished(t *testing.T) {
 				firstSeen = true
 				mu.Unlock()
 
-				// First observation reports not-Established (no condition); every
-				// later poll reports Established.
 				if established {
 					crd.Status.Conditions = []apiextensionsv1.CustomResourceDefinitionCondition{{
 						Type:   apiextensionsv1.Established,
@@ -178,8 +284,80 @@ func TestBootstrapCRDsWaitsForEstablished(t *testing.T) {
 	defer mu.Unlock()
 
 	// A single pass (one Get) would mean it never waited for establishment.
-	if gets <= len(embeddedCRDNames) {
-		t.Fatalf("expected BootstrapCRDs to re-poll for establishment; got %d Gets for %d CRDs", gets, len(embeddedCRDNames))
+	if gets <= len(RequiredCRDNames) {
+		t.Fatalf("expected BootstrapCRDs to re-poll for establishment; got %d Gets for %d CRDs", gets, len(RequiredCRDNames))
+	}
+}
+
+func TestWaitForCRDsEstablishedRejectsDeletingCRDImmediately(t *testing.T) {
+	now := metav1.Now()
+	cli := fake.NewClientBuilder().
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(_ context.Context, _ client.WithWatch, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+				crd := obj.(*apiextensionsv1.CustomResourceDefinition)
+				crd.Name = key.Name
+				crd.DeletionTimestamp = &now
+				crd.Status.Conditions = []apiextensionsv1.CustomResourceDefinitionCondition{{
+					Type:   apiextensionsv1.Established,
+					Status: apiextensionsv1.ConditionTrue,
+				}}
+
+				return nil
+			},
+		}).
+		Build()
+
+	started := time.Now()
+
+	err := waitForCRDsEstablished(context.Background(), cli, []string{"deleting.example.com"})
+	if err == nil || !strings.Contains(err.Error(), "deleting.example.com is being deleted") {
+		t.Fatalf("waitForCRDsEstablished error = %v, want deleting CRD error", err)
+	}
+
+	if elapsed := time.Since(started); elapsed >= crdEstablishedPoll {
+		t.Fatalf("waitForCRDsEstablished polled for %v instead of failing immediately", elapsed)
+	}
+}
+
+func TestCRDEstablishedRejectsDeletingCRD(t *testing.T) {
+	crd := &apiextensionsv1.CustomResourceDefinition{
+		Status: apiextensionsv1.CustomResourceDefinitionStatus{
+			Conditions: []apiextensionsv1.CustomResourceDefinitionCondition{{
+				Type:   apiextensionsv1.Established,
+				Status: apiextensionsv1.ConditionTrue,
+			}},
+		},
+	}
+	if !crdEstablished(crd) {
+		t.Fatal("live Established CRD was rejected")
+	}
+
+	now := metav1.Now()
+
+	crd.DeletionTimestamp = &now
+	if crdEstablished(crd) {
+		t.Fatal("terminating CRD was treated as established")
+	}
+}
+
+func TestRequiredCRDNames(t *testing.T) {
+	want := [...]string{
+		"machines.unbounded-cloud.io",
+		"machineoperations.unbounded-cloud.io",
+		"sites.unbounded-cloud.io",
+		"machineconfigurations.unbounded-cloud.io",
+		"machineoperationcredentials.unbounded-cloud.io",
+		"machineconfigurationversions.unbounded-cloud.io",
+		"sitenodeslices.net.unbounded-cloud.io",
+		"gatewaypools.net.unbounded-cloud.io",
+		"gatewaypoolnodes.net.unbounded-cloud.io",
+		"sitegatewaypoolassignments.net.unbounded-cloud.io",
+		"sitepeerings.net.unbounded-cloud.io",
+		"gatewaypoolpeerings.net.unbounded-cloud.io",
+	}
+
+	if RequiredCRDNames != want {
+		t.Fatalf("RequiredCRDNames = %v, want %v", RequiredCRDNames, want)
 	}
 }
 
