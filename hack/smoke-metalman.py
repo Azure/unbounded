@@ -34,7 +34,6 @@ NODE_LABEL_VALUE = "metalman"
 METALMAN_NAMESPACE = "unbounded-kube"
 METALMAN_CONTROLLER_SA = "metalman-controller"
 VM_NAME = "unbounded-metal-smoke"
-NET_NAME = "unbounded-metal-smoke"
 SUBNET = "192.168.200"
 SERVER_IP = f"{SUBNET}.1"
 NODE_IP = f"{SUBNET}.10"
@@ -55,7 +54,7 @@ REGISTRY_CONTAINER = "unbounded-smoke-registry"
 IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
 NETBOOT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/netboot:smoke"
 AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
-# The agent runs inside a VM on an isolated libvirt network. "localhost" inside
+# The agent runs inside a VM on an isolated bridge network. "localhost" inside
 # the VM resolves to the VM's own loopback, not the host.  Use the host's
 # bridge IP so the VM can reach the registry over the virtual network.
 AGENT_IMAGE_NAME_VM = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
@@ -63,14 +62,24 @@ BINARY = REPO_ROOT / "bin" / "metalman"
 AGENT_BINARY = REPO_ROOT / "bin" / "unbounded-agent"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 REDFISH_FIXTURE_BINARY = REPO_ROOT / "bin" / "metalman-redfish-fixture"
-SERIAL_SOCK = TMPDIR / "console.sock"
-QGA_SOCK = TMPDIR / "qga.sock"
+BRIDGE = "virbr-smoke"
+# The fixture owns the VM state directory: NVRAM, TPM state, and the serial,
+# guest-agent (QGA), and QMP unix sockets all live here.
+STATE_DIR = TMPDIR / "vmstate"
+DISK = TMPDIR / "disk.qcow2"
+OVMF_CODE = "/usr/share/OVMF/OVMF_CODE_4M.fd"
+OVMF_VARS = "/usr/share/OVMF/OVMF_VARS_4M.fd"
+SERIAL_SOCK = STATE_DIR / "console.sock"
+QGA_SOCK = STATE_DIR / "qga.sock"
+QMP_SOCK = STATE_DIR / "qmp.sock"
+REDFISH_URL = f"https://127.0.0.1:{REDFISH_PORT}"
+REDFISH_USER = ""
+REDFISH_PASS = "smoke"
 # The nspawn machine name used by the agent (must match the constant in
 # cmd/agent/internal/goalstates/constants.go - NSpawnMachineKube1).
 NSPAWN_MACHINE = "kube1"
 
 KUBECTL = "kubectl"
-VIRSH = ["virsh", "--connect", "qemu:///system"]
 DEVNULL = subprocess.DEVNULL
 
 _procs: list[subprocess.Popen[Any]] = []
@@ -162,14 +171,44 @@ def forward_console(sock_path: Path) -> None:
         time.sleep(1)
 
 
+def _qga_call(request: dict[str, Any], timeout: int = 10) -> Any:
+    """Send a single JSON request to the QEMU guest agent unix socket.
+
+    Connects to QGA_SOCK, writes the newline-terminated request, reads the
+    newline-delimited JSON reply, and returns its "return" value.
+    """
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(timeout)
+    try:
+        conn.connect(str(QGA_SOCK))
+        conn.sendall((json.dumps(request) + "\n").encode("utf-8"))
+        buf = b""
+        while b"\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        conn.close()
+
+    line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
+    if not line:
+        raise RuntimeError("guest agent returned no response")
+    reply = json.loads(line)
+    if "error" in reply:
+        raise RuntimeError(f"guest agent error: {reply['error']}")
+    return reply.get("return")
+
+
 def guest_exec(command: str, timeout: int = 30) -> tuple[int, str, str]:
     """Execute a command inside the VM via the QEMU guest agent.
 
-    Returns (exit_code, stdout, stderr).  Requires the guest agent channel
-    to be configured on the VM and the qemu-guest-agent service running
+    Returns (exit_code, stdout, stderr).  Talks directly to the guest agent
+    unix socket (QGA_SOCK) exposed by the fixture.  Requires the guest agent
+    channel to be configured on the VM and the qemu-guest-agent service running
     inside the guest.
     """
-    exec_req = json.dumps({
+    ret = _qga_call({
         "execute": "guest-exec",
         "arguments": {
             "path": "/bin/bash",
@@ -177,28 +216,15 @@ def guest_exec(command: str, timeout: int = 30) -> tuple[int, str, str]:
             "capture-output": True,
         },
     })
-    result = subprocess.run(
-        [*VIRSH, "qemu-agent-command", VM_NAME, exec_req],
-        capture_output=True, text=True, timeout=10,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"guest-exec failed: {result.stderr.strip()}")
-    pid = json.loads(result.stdout)["return"]["pid"]
+    pid = ret["pid"]
 
     # Poll guest-exec-status until the process exits.
     deadline = time.monotonic() + timeout
     while True:
-        status_req = json.dumps({
+        status = _qga_call({
             "execute": "guest-exec-status",
             "arguments": {"pid": pid},
         })
-        result = subprocess.run(
-            [*VIRSH, "qemu-agent-command", VM_NAME, status_req],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"guest-exec-status failed: {result.stderr.strip()}")
-        status = json.loads(result.stdout)["return"]
         if status.get("exited"):
             exit_code = status.get("exitcode", -1)
             stdout = base64.b64decode(status.get("out-data", "")).decode("utf-8", errors="replace")
@@ -342,20 +368,18 @@ def collect_debug_logs() -> None:
     log("  --- end debug logs ---")
 
 
-def clean_libvirt() -> None:
-    for cmd in [
-        [*VIRSH, "destroy", VM_NAME],
-        [*VIRSH, "undefine", VM_NAME, "--nvram"],
-        [*VIRSH, "net-destroy", NET_NAME],
-        [*VIRSH, "net-undefine", NET_NAME],
-    ]:
-        run_quiet(cmd)
-    # Remove stale bridge left behind by a previous net-destroy.
-    run_quiet(["sudo", "ip", "link", "delete", "virbr-smoke"])
-    # Remove veth pair used to connect kind container to virbr-smoke.
-    run_quiet(["sudo", "ip", "link", "delete", "veth-kind-smoke"])
-    # Kill any leftover Redfish fixture from a previous run.
+def clean_stale() -> None:
+    # Kill any leftover Redfish fixture from a previous run before touching the
+    # bridge it owns.
     run_quiet(["sudo", "pkill", "-f", "metalman-redfish-fixture"])
+    # Kill any leftover qemu guest from a previous run.
+    run_quiet(["sudo", "pkill", "-f", f"qemu-system-x86_64.*{VM_NAME}"])
+    run_quiet(["sudo", "pkill", "-f", f"swtpm.*{STATE_DIR}"])
+    time.sleep(1)
+    # Remove stale bridge/tap/veth left behind by a previous run. The fixture
+    # recreates the bridge on startup.
+    run_quiet(["sudo", "ip", "link", "delete", BRIDGE])
+    run_quiet(["sudo", "ip", "link", "delete", "veth-kind-smoke"])
     # Kill any leftover metalman serve-pxe from a previous run.
     # Use the binary path to avoid matching this script (smoke-metalman.py).
     run_quiet(["sudo", "pkill", "-f", "bin/metalman"])
@@ -392,14 +416,16 @@ def cleanup() -> None:
                 proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 pass
-    clean_libvirt()
-    # Remove iptables rules that were added for VM ↔ kind connectivity.
+    clean_stale()
+    # Remove the raw PREROUTING rule added for VM to kind connectivity. The
+    # fixture removes its own FORWARD/MASQUERADE rules on shutdown, but the
+    # FORWARD deletes below stay as best-effort cleanup for older runs.
     # Use check=False so these are best-effort (rules may not exist if setup
     # failed before they were inserted).
-    run_quiet(["sudo", "iptables", "-D", "FORWARD", "-i", "virbr-smoke", "-j", "ACCEPT"], check=False)
-    run_quiet(["sudo", "iptables", "-D", "FORWARD", "-o", "virbr-smoke", "-j", "ACCEPT"], check=False)
+    run_quiet(["sudo", "iptables", "-D", "FORWARD", "-i", BRIDGE, "-j", "ACCEPT"], check=False)
+    run_quiet(["sudo", "iptables", "-D", "FORWARD", "-o", BRIDGE, "-j", "ACCEPT"], check=False)
     run_quiet(["sudo", "iptables", "-t", "raw", "-D", "PREROUTING",
-               "-i", "virbr-smoke", "-j", "ACCEPT"], check=False)
+               "-i", BRIDGE, "-j", "ACCEPT"], check=False)
     shutil.rmtree(TMPDIR, ignore_errors=True)
 
 
@@ -563,34 +589,62 @@ def _probe_vm_network() -> None:
             log(f"    [{label}] (failed: {e})")
 
 
-def _vm_is_running() -> bool:
-    """Return True if the VM domain is in 'running' state."""
-    result = subprocess.run(
-        [*VIRSH, "domstate", VM_NAME],
-        capture_output=True, text=True,
+def redfish_power_state() -> str:
+    """Return the VM power state ("On"/"Off") via the fixture's Redfish API."""
+    import ssl
+    import urllib.request
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    req = urllib.request.Request(
+        f"{REDFISH_URL}/redfish/v1/Systems/{VM_NAME}",
+        headers=_redfish_auth_header(),
     )
-    return result.returncode == 0 and "running" in result.stdout.strip()
+    with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    return str(body.get("PowerState", ""))
+
+
+def _redfish_auth_header() -> dict[str, str]:
+    if not REDFISH_USER and not REDFISH_PASS:
+        return {}
+    token = base64.b64encode(f"{REDFISH_USER}:{REDFISH_PASS}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
+def _vm_is_running() -> bool:
+    """Return True if the VM is powered on."""
+    try:
+        return redfish_power_state() == "On"
+    except Exception:
+        return False
 
 
 def wait_vm_state(expected: str, timeout: int = 300) -> None:
-    """Wait for the libvirt domain state to contain *expected*."""
-    log(f"  Waiting for VM '{VM_NAME}' state to contain {expected!r}...")
+    """Wait for the VM power state to reach *expected* ("On" or "Off").
+
+    For backwards compatibility with the previous libvirt-based callers,
+    "running" is treated as "On" and "shut off" as "Off".
+    """
+    target = {"running": "On", "shut off": "Off"}.get(expected, expected)
+    log(f"  Waiting for VM '{VM_NAME}' power state {target!r}...")
     last_state = ""
     for elapsed in range(timeout):
         check_procs()
-        result = subprocess.run(
-            [*VIRSH, "domstate", VM_NAME],
-            capture_output=True, text=True,
-        )
-        state = result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
-        if expected in state:
-            log(f"  VM '{VM_NAME}' state is {state!r}")
+        try:
+            state = redfish_power_state()
+        except Exception as e:  # noqa: BLE001 - transient during power cycles.
+            state = f"(unavailable: {e})"
+        if state == target:
+            log(f"  VM '{VM_NAME}' power state is {state!r}")
             return
         if elapsed > 0 and elapsed % 15 == 0 and state != last_state:
             last_state = state
-            log(f"    ({elapsed}s) VM state={state or 'unknown'}")
+            log(f"    ({elapsed}s) VM power state={state or 'unknown'}")
         time.sleep(1)
-    die(f"Timed out waiting for VM '{VM_NAME}' state to contain {expected!r}")
+    die(f"Timed out waiting for VM '{VM_NAME}' power state {target!r}")
 
 
 def wait_guest_agent(timeout: int = 300) -> None:
@@ -974,32 +1028,69 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sigint_handler)
     atexit.register(cleanup)
 
-    log("Cleaning up stale libvirt resources")
-    clean_libvirt()
+    log("Cleaning up stale resources")
+    clean_stale()
 
-    log("Creating libvirt network")
-    net_xml = TMPDIR / "net.xml"
-    net_xml.write_text(textwrap.dedent(f"""\
-        <network>
-          <name>{NET_NAME}</name>
-          <forward mode="nat"/>
-          <bridge name="virbr-smoke"/>
-          <ip address="{SERVER_IP}" netmask="255.255.255.0"/>
-        </network>
-    """))
-    run([*VIRSH, "net-define", str(net_xml)])
-    run([*VIRSH, "net-start", NET_NAME])
+    log("Preparing VM state directory and disk")
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o755)
+    run_quiet(["qemu-img", "create", "-f", "qcow2", str(DISK), "20G"], check=True)
 
-    # Allow the VM to reach the kind Docker network (Docker's bridge
-    # isolation rules block cross-bridge traffic by default).
-    log("Adding iptables rules for VM ↔ kind connectivity")
-    run(["sudo", "iptables", "-I", "FORWARD", "-i", "virbr-smoke", "-j", "ACCEPT"])
-    run(["sudo", "iptables", "-I", "FORWARD", "-o", "virbr-smoke", "-j", "ACCEPT"])
+    log("Generating Redfish fixture TLS certificate")
+    run_quiet([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", str(TMPDIR / "redfish.key"),
+        "-out", str(TMPDIR / "redfish.crt"),
+        "-days", "1", "-nodes",
+        "-subj", "/CN=metalman-redfish-fixture",
+        "-addext", "subjectAltName=IP:127.0.0.1",
+    ], check=True)
+
+    log("Building metalman-redfish-fixture")
+    run(["go", "build", "-o", str(REDFISH_FIXTURE_BINARY),
+         "./hack/metalman-redfish-fixture"], cwd=str(REPO_ROOT))
+
+    # The fixture owns the VM and its networking: it creates the bridge,
+    # assigns SERVER_IP, installs outbound NAT, and launches qemu on power-on.
+    # It must start before we attach the kind container to the bridge.
+    log("Starting recording Redfish fixture (creates bridge and NAT)")
+    proc = spawn([
+        "sudo", "-E",
+        str(REDFISH_FIXTURE_BINARY),
+        "--domain", VM_NAME, "--mac", MAC_ADDRESS,
+        "--bind", "127.0.0.1", "--port", str(REDFISH_PORT),
+        "--cert", str(TMPDIR / "redfish.crt"),
+        "--key", str(TMPDIR / "redfish.key"),
+        "--record", str(TMPDIR / "redfish.jsonl"),
+        "--username", REDFISH_USER, "--password", REDFISH_PASS,
+        "--disk", str(DISK),
+        "--state-dir", str(STATE_DIR),
+        "--ovmf-code", OVMF_CODE,
+        "--ovmf-vars", OVMF_VARS,
+        "--bridge", BRIDGE,
+        "--bridge-address", SERVER_IP,
+        "--manage-boot-order",
+    ], TMPDIR / "redfish.log")
+    log(f"  Redfish fixture PID={proc.pid}")
+
+    log(f"Waiting for bridge {BRIDGE} to appear")
+    for _ in range(60):
+        if subprocess.run(["ip", "link", "show", BRIDGE],
+                          capture_output=True).returncode == 0:
+            break
+        check_procs()
+        time.sleep(1)
+    else:
+        die(f"bridge {BRIDGE} did not appear")
+    check_procs()
+
     # Docker may insert a raw PREROUTING DROP rule that blocks non-Docker
     # traffic to its container IPs.  Insert an ACCEPT before it so the VM
-    # can reach the kind API server.
+    # can reach the kind API server.  (The fixture already installs the
+    # FORWARD ACCEPT and MASQUERADE rules for the bridge subnet.)
+    log("Adding iptables raw PREROUTING rule for VM to kind connectivity")
     run(["sudo", "iptables", "-t", "raw", "-I", "PREROUTING",
-         "-i", "virbr-smoke", "-j", "ACCEPT"])
+         "-i", BRIDGE, "-j", "ACCEPT"])
 
     # Connect the kind container directly to virbr-smoke so that the VM
     # subnet is *directly reachable* from inside the container.  Kindnet
@@ -1022,7 +1113,7 @@ def main() -> None:
     # gets an IP on the VM subnet.
     run(["sudo", "ip", "link", "add", "veth-kind-smoke", "type", "veth",
          "peer", "name", "eth-smoke"])
-    run(["sudo", "ip", "link", "set", "veth-kind-smoke", "master", "virbr-smoke"])
+    run(["sudo", "ip", "link", "set", "veth-kind-smoke", "master", BRIDGE])
     run(["sudo", "ip", "link", "set", "veth-kind-smoke", "up"])
     # Move the peer into the kind container's network namespace.
     run(["sudo", "ip", "link", "set", "eth-smoke", "netns", kind_pid])
@@ -1050,56 +1141,13 @@ def main() -> None:
              "--type=strategic", "-p", patch])
     configure_kind_kube_proxy_apiserver(f"https://{KIND_SMOKE_IP}:6443")
 
-    log("Creating UEFI VM (powered off, with TPM)")
-    ovmf_vars = TMPDIR / "OVMF_VARS.fd"
-    shutil.copy2("/usr/share/OVMF/OVMF_VARS_4M.fd", ovmf_vars)
-    disk = str(TMPDIR / "disk.qcow2")
-    run_quiet(["qemu-img", "create", "-f", "qcow2", disk, "20G"], check=True)
-    run_quiet([
-        "virt-install",
-        "--connect", "qemu:///system",
-        "--name", VM_NAME, "--ram", "4096", "--vcpus", "2",
-        "--disk", f"path={disk},format=qcow2,bus=virtio",
-        "--network", f"network={NET_NAME},mac={MAC_ADDRESS}",
-        "--boot", f"uefi,loader=/usr/share/OVMF/OVMF_CODE_4M.fd,nvram={ovmf_vars},hd,network",
-        "--tpm", "backend.type=emulator,backend.version=2.0",
-        "--serial", f"unix,path={SERIAL_SOCK},mode=bind",
-        "--channel", f"unix,path={QGA_SOCK},mode=bind,target.type=virtio,target.name=org.qemu.guest_agent.0",
-        "--os-variant", "generic",
-        "--noautoconsole", "--noreboot", "--import",
-    ], check=True)
-    run_quiet([*VIRSH, "destroy", VM_NAME])
-
     log("Starting serial console forwarding")
     console_thread = threading.Thread(
         target=forward_console, args=(SERIAL_SOCK,), daemon=True,
     )
     console_thread.start()
 
-    log("Starting recording Redfish fixture")
-    run_quiet([
-        "openssl", "req", "-x509", "-newkey", "rsa:2048",
-        "-keyout", str(TMPDIR / "redfish.key"),
-        "-out", str(TMPDIR / "redfish.crt"),
-        "-days", "1", "-nodes",
-        "-subj", "/CN=metalman-redfish-fixture",
-        "-addext", "subjectAltName=IP:127.0.0.1",
-    ], check=True)
-    redfish_url = f"https://127.0.0.1:{REDFISH_PORT}"
-    log("Building metalman-redfish-fixture")
-    run(["go", "build", "-o", str(REDFISH_FIXTURE_BINARY),
-         "./hack/metalman-redfish-fixture"], cwd=str(REPO_ROOT))
-    proc = spawn([
-        str(REDFISH_FIXTURE_BINARY),
-        "--domain", VM_NAME, "--mac", MAC_ADDRESS,
-        "--bind", "127.0.0.1", "--port", str(REDFISH_PORT),
-        "--cert", str(TMPDIR / "redfish.crt"),
-        "--key", str(TMPDIR / "redfish.key"),
-        "--record", str(TMPDIR / "redfish.jsonl"),
-        "--username", "", "--password", "smoke",
-        "--manage-boot-order",
-    ], TMPDIR / "redfish.log")
-    log(f"  Redfish fixture PID={proc.pid}")
+    redfish_url = REDFISH_URL
     time.sleep(2)
     check_procs()
 

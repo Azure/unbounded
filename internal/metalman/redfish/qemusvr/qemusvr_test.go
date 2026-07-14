@@ -483,31 +483,85 @@ func TestRecordFormat(t *testing.T) {
 	}
 }
 
-func TestRewriteBootOrder(t *testing.T) {
-	in := `<domain><os><type>hvm</type><boot dev="hd"/><boot dev="network"/></os><devices/></domain>`
+func TestQemuArgsBootOrder(t *testing.T) {
+	base := qemuSpec{
+		name: "smoke-vm", memoryMiB: 4096, vcpus: 2,
+		disk: "/tmp/disk.qcow2", ovmfCode: "/ovmf/code.fd", nvram: "/state/vars.fd",
+		mac: "52:54:00:ab:cd:ef", tap: "tap-smoke",
+		serialSock: "/state/console.sock", qgaSock: "/state/qga.sock",
+		qmpSock: "/state/qmp.sock", tpmSock: "/state/tpm/swtpm.sock",
+	}
 
-	out, err := rewriteBootOrder(in, []string{"network", "hd"})
+	netFirst := base
+	netFirst.bootNetwork = true
+
+	args := strings.Join(qemuArgs(netFirst), " ")
+	if !strings.Contains(args, "virtio-net-pci,netdev=net0,mac=52:54:00:ab:cd:ef,bootindex=1") {
+		t.Fatalf("expected network bootindex=1: %s", args)
+	}
+
+	if !strings.Contains(args, "virtio-blk-pci,drive=disk0,bootindex=2") {
+		t.Fatalf("expected disk bootindex=2: %s", args)
+	}
+
+	diskFirst := base
+
+	args = strings.Join(qemuArgs(diskFirst), " ")
+	if !strings.Contains(args, "virtio-blk-pci,drive=disk0,bootindex=1") {
+		t.Fatalf("expected disk bootindex=1: %s", args)
+	}
+
+	if !strings.Contains(args, "virtio-net-pci,netdev=net0,mac=52:54:00:ab:cd:ef,bootindex=2") {
+		t.Fatalf("expected network bootindex=2: %s", args)
+	}
+}
+
+func TestQemuArgsSecureBoot(t *testing.T) {
+	spec := qemuSpec{
+		name: "smoke-vm", memoryMiB: 4096, vcpus: 2,
+		disk: "/tmp/disk.qcow2", ovmfCode: "/ovmf/code.fd", nvram: "/state/vars.fd",
+		mac: "52:54:00:ab:cd:ef", tap: "tap-http",
+	}
+
+	plain := strings.Join(qemuArgs(spec), " ")
+	if strings.Contains(plain, "smm=on") || strings.Contains(plain, "property=secure,value=on") {
+		t.Fatalf("did not expect secure boot options without SecureBoot: %s", plain)
+	}
+
+	spec.secureBoot = true
+
+	secure := strings.Join(qemuArgs(spec), " ")
+	if !strings.Contains(secure, "q35,accel=kvm,smm=on") {
+		t.Fatalf("expected smm=on machine: %s", secure)
+	}
+
+	if !strings.Contains(secure, "driver=cfi.pflash01,property=secure,value=on") {
+		t.Fatalf("expected secure pflash global: %s", secure)
+	}
+}
+
+func TestSubnetCIDR(t *testing.T) {
+	got, err := subnetCIDR("192.168.200.1", 24)
 	if err != nil {
-		t.Fatalf("rewriteBootOrder: %v", err)
+		t.Fatalf("subnetCIDR: %v", err)
 	}
 
-	network := strings.Index(out, `dev="network"`)
-	hd := strings.Index(out, `dev="hd"`)
-
-	if network < 0 || hd < 0 {
-		t.Fatalf("missing boot entries: %s", out)
+	if got != "192.168.200.0/24" {
+		t.Fatalf("expected 192.168.200.0/24, got %s", got)
 	}
 
-	if network > hd {
-		t.Fatalf("expected network before hd: %s", out)
+	if _, err := subnetCIDR("not-an-ip", 24); err == nil {
+		t.Fatalf("expected error for invalid address")
+	}
+}
+
+func TestTapName(t *testing.T) {
+	if got := tapName("virbr-smoke"); got != "tap-smoke" {
+		t.Fatalf("expected tap-smoke, got %s", got)
 	}
 
-	if strings.Count(out, "<boot") != 2 {
-		t.Fatalf("expected exactly two boot entries: %s", out)
-	}
-
-	if !strings.Contains(out, "<type>hvm</type>") {
-		t.Fatalf("rewrite dropped os content: %s", out)
+	if got := tapName("virbr-a-very-long-bridge-name"); len(got) > 15 {
+		t.Fatalf("tap name exceeds 15 chars: %q", got)
 	}
 }
 

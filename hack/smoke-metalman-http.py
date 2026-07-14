@@ -42,7 +42,6 @@ spec.loader.exec_module(smoke)
 TMP = Path(tempfile.mkdtemp(prefix="metalman-http-"))
 os.chmod(TMP, 0o755)
 VM = "unbounded-metal-http-smoke"
-NETWORK = "unbounded-metal-http-smoke"
 BRIDGE = "virbr-http"
 SITE = "http-smoke"
 NODE = "http-smoke-node"
@@ -63,21 +62,38 @@ AGENT_IMAGE_VM = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:http-s
 SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
 RECORD = TMP / "redfish.jsonl"
 PCAP = TMP / "traffic.pcap"
-VIRSH = ["virsh", "--connect", "qemu:///system"]
+
+# The fixture launches qemu directly and owns all VM state under this directory.
+STATE_DIR = TMP / "vmstate"
+DISK = TMP / "os.qcow2"
+OVMF_CODE = "/usr/share/OVMF/OVMF_CODE_4M.ms.fd"
+OVMF_VARS = "/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
+SERIAL_SOCK = STATE_DIR / "console.sock"
+QGA_SOCK = STATE_DIR / "qga.sock"
+QMP_SOCK = STATE_DIR / "qmp.sock"
+REDFISH_URL = f"https://127.0.0.1:{REDFISH_PORT}"
+REDFISH_USER = "smoke"
+REDFISH_PASS = "smoke"
 PROCS: list[subprocess.Popen[Any]] = []
 PASSED = False
 
 # Point reused wait/guest helpers at this isolated test's resources.
 smoke.TMPDIR = TMP
 smoke.VM_NAME = VM
-smoke.NET_NAME = NETWORK
 smoke.NODE_NAME = NODE
 smoke.SITE = SITE
 smoke.SERVER_IP = SERVER_IP
 smoke.NODE_IP = NODE_IP
 smoke.KIND_SMOKE_IP = KIND_IP
 smoke.MAC_ADDRESS = MAC
-smoke.VIRSH = VIRSH
+smoke.STATE_DIR = STATE_DIR
+smoke.QGA_SOCK = QGA_SOCK
+smoke.QMP_SOCK = QMP_SOCK
+smoke.SERIAL_SOCK = SERIAL_SOCK
+smoke.REDFISH_URL = REDFISH_URL
+smoke.REDFISH_PORT = REDFISH_PORT
+smoke.REDFISH_USER = REDFISH_USER
+smoke.REDFISH_PASS = REDFISH_PASS
 smoke._procs = PROCS
 
 
@@ -115,11 +131,11 @@ def cleanup() -> None:
                 # The process group may already have exited during teardown.
                 pass
     for args in (
-        [*VIRSH, "destroy", VM],
-        [*VIRSH, "undefine", VM, "--nvram"],
-        [*VIRSH, "net-destroy", NETWORK],
-        [*VIRSH, "net-undefine", NETWORK],
+        ["sudo", "pkill", "-f", "metalman-redfish-fixture"],
+        ["sudo", "pkill", "-f", f"qemu-system-x86_64.*{VM}"],
+        ["sudo", "pkill", "-f", f"swtpm.*{STATE_DIR}"],
         ["sudo", "ip", "link", "delete", "veth-kind-http"],
+        ["sudo", "ip", "link", "delete", BRIDGE],
         ["docker", "rm", "-f", REGISTRY],
         # The fixture (run under sudo) launches dnsmasq as root; ensure it is
         # gone even if the fixture was killed before it could tear it down.
@@ -142,25 +158,12 @@ def write(path: Path, content: str) -> None:
     path.write_text(textwrap.dedent(content), encoding="utf-8")
 
 
-def setup_network() -> None:
-    log("Creating DHCP-free libvirt network")
-    network_xml = TMP / "network.xml"
-    write(network_xml, f"""
-        <network>
-          <name>{NETWORK}</name>
-          <forward mode='nat'/>
-          <bridge name='{BRIDGE}'/>
-          <ip address='{SERVER_IP}' netmask='255.255.255.0'/>
-        </network>
-    """)
-    run([*VIRSH, "net-define", str(network_xml)])
-    run([*VIRSH, "net-start", NETWORK])
-    for args in (
-        ["sudo", "iptables", "-I", "FORWARD", "-i", BRIDGE, "-j", "ACCEPT"],
-        ["sudo", "iptables", "-I", "FORWARD", "-o", BRIDGE, "-j", "ACCEPT"],
-        ["sudo", "iptables", "-t", "raw", "-I", "PREROUTING", "-i", BRIDGE, "-j", "ACCEPT"],
-    ):
-        run(args)
+def attach_kind_network() -> None:
+    log("Attaching the kind control plane to the fixture-created bridge")
+    # The fixture owns the bridge, host address, NAT, and bridge FORWARD rules.
+    # This raw-table accept keeps conntrack from dropping the cross-bridge kind
+    # traffic and is not installed by the fixture.
+    run(["sudo", "iptables", "-t", "raw", "-I", "PREROUTING", "-i", BRIDGE, "-j", "ACCEPT"])
     kind_pid = run(
         ["docker", "inspect", "kind-control-plane", "--format", "{{.State.Pid}}"],
         capture_output=True, text=True,
@@ -180,31 +183,33 @@ def setup_network() -> None:
     smoke.configure_kind_kube_proxy_apiserver(f"https://{KIND_IP}:6443")
 
 
-def create_vm() -> None:
-    log("Defining powered-off VM that boots via firmware-native UEFI HTTP")
-    os_disk = TMP / "os.qcow2"
-    nvram = TMP / "OVMF_VARS.fd"
-    run(["qemu-img", "create", "-f", "qcow2", str(os_disk), "20G"])
-    shutil.copyfile("/usr/share/OVMF/OVMF_VARS_4M.ms.fd", nvram)
-    domain = TMP / "domain.xml"
-    write(domain, f"""
-        <domain type='kvm'>
-          <name>{VM}</name><memory unit='MiB'>4096</memory><vcpu>2</vcpu>
-          <os><type arch='x86_64' machine='q35'>hvm</type>
-            <loader readonly='yes' secure='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE_4M.ms.fd</loader>
-            <nvram>{nvram}</nvram>
-          </os>
-          <features><acpi/><apic/><smm state='on'/></features><cpu mode='host-passthrough'/>
-          <devices>
-            <disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='{os_disk}'/><target dev='vda' bus='virtio'/><boot order='2'/></disk>
-            <interface type='network'><mac address='{MAC}'/><source network='{NETWORK}'/><model type='virtio'/><boot order='1'/></interface>
-            <tpm model='tpm-tis'><backend type='emulator' version='2.0'/></tpm>
-            <serial type='file'><source path='{TMP / "console.log"}'/><target port='0'/></serial>
-            <channel type='unix'><source mode='bind' path='{TMP / "qga.sock"}'/><target type='virtio' name='org.qemu.guest_agent.0'/></channel>
-          </devices>
-        </domain>
-    """)
-    run([*VIRSH, "define", str(domain)])
+def wait_for_bridge(timeout: int = 60) -> None:
+    log(f"Waiting for the fixture to create bridge {BRIDGE}")
+    for _ in range(timeout):
+        if subprocess.run(["ip", "link", "show", BRIDGE],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            return
+        for process in PROCS:
+            if process.poll() is not None:
+                raise RuntimeError("fixture exited before creating the bridge")
+        time.sleep(1)
+    raise RuntimeError(f"bridge {BRIDGE} was not created within {timeout}s")
+
+
+
+def build_and_prepare() -> None:
+    log("Building binaries and creating the empty guest disk")
+    run(["make", "machina-manifests"], cwd=ROOT)
+    for output, package in (("metalman", "./cmd/metalman"), ("unbounded-agent", "./cmd/agent"), ("metalman-redfish-fixture", "./hack/metalman-redfish-fixture")):
+        run(["go", "build", "-o", str(ROOT / "bin" / output), package], cwd=ROOT)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o755)
+    run(["qemu-img", "create", "-f", "qcow2", str(DISK), "20G"])
+
+
+def setup_kubernetes_and_images() -> None:
+    log("Applying Metalman RBAC/CRDs and publishing OCI images")
+    run(["kubectl", "apply", "--server-side", "--force-conflicts", "-f", str(ROOT / "deploy/machina/rendered/01-namespace.yaml")])
 
 
 def setup_kubernetes_and_images() -> None:
@@ -268,13 +273,17 @@ def start_fixture() -> None:
          "-keyout", str(TMP / "redfish.key"), "-out", str(TMP / "redfish.crt")])
     dnsmasq_dir = TMP / "dnsmasq"
     dnsmasq_dir.mkdir(exist_ok=True)
-    # Run the fixture under sudo so the dnsmasq it launches can bind the
-    # privileged DHCP port (UDP 67) on the boundary bridge.
+    # Run the fixture under sudo so it can create the bridge and NAT, launch
+    # qemu with KVM, and start the dnsmasq that binds the privileged DHCP port
+    # (UDP 67) on the boundary bridge.
     spawn(["sudo", "env", f"PATH={os.environ['PATH']}",
            str(ROOT / "bin/metalman-redfish-fixture"),
            "--domain", VM, "--mac", MAC, "--port", str(REDFISH_PORT),
             "--cert", str(TMP / "redfish.crt"), "--key", str(TMP / "redfish.key"),
             "--record", str(RECORD), "--bridge", BRIDGE,
+            "--bridge-address", SERVER_IP,
+            "--disk", str(DISK), "--state-dir", str(STATE_DIR),
+            "--ovmf-code", OVMF_CODE, "--ovmf-vars", OVMF_VARS, "--secure-boot",
             "--dnsmasq-dir", str(dnsmasq_dir), "--username", "smoke", "--password", "smoke"],
           "redfish.log")
     time.sleep(1)
@@ -416,14 +425,16 @@ def main() -> None:
     global PASSED
 
     atexit.register(cleanup)
-    setup_network()
-    create_vm()
-    # Capture starts while the domain is still off and remains active through
-    # installer power-on, installer reboot, OS validation, and the final reboot.
+    build_and_prepare()
+    start_fixture()
+    wait_for_bridge()
+    # Capture starts as early as the bridge exists (guest still powered off) and
+    # remains active through installer power-on, installer reboot, OS validation,
+    # and the final reboot.
     tcpdump = spawn(["sudo", "tcpdump", "-U", "-i", BRIDGE, "-w", str(PCAP)], "tcpdump.log")
     time.sleep(1)
+    attach_kind_network()
     setup_kubernetes_and_images()
-    start_fixture()
     start_metalman_and_replace()
     assert_contract()
     first_boot = assert_guest_network()

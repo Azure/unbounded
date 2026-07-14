@@ -15,8 +15,8 @@ import (
 )
 
 // Serve wires the QEMU machine layer to the Redfish server and serves the API
-// over TLS until the process is terminated. On SIGINT/SIGTERM it tears down any
-// child dnsmasq before exiting so no DHCP server is left bound to the bridge.
+// over TLS until the process is terminated. On SIGINT/SIGTERM it tears down the
+// guest, software TPM, dnsmasq, tap, and bridge before exiting.
 func Serve(cfg Config) error {
 	machine, err := NewMachine(cfg)
 	if err != nil {
@@ -44,8 +44,7 @@ func Serve(cfg Config) error {
 
 	go func() {
 		<-ctx.Done()
-		//nolint:errcheck // Best-effort teardown of the boundary dnsmasq on exit.
-		_ = machine.ClearHTTPBoot()
+		machine.Shutdown()
 		//nolint:errcheck // Best-effort shutdown; the process is exiting anyway.
 		_ = httpServer.Close()
 	}()

@@ -82,10 +82,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            dnsmasq qemu-kvm libvirt-daemon-system libvirt-clients virtinst \
+            dnsmasq qemu-kvm \
             ovmf qemu-utils swtpm swtpm-tools \
             python3-yaml cpio iptables
-          sudo systemctl start libvirtd
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -178,10 +177,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            qemu-kvm libvirt-daemon-system libvirt-clients ovmf qemu-utils \
+            qemu-kvm ovmf qemu-utils \
             swtpm swtpm-tools python3-yaml cpio iptables tcpdump dnsmasq \
             dosfstools mtools curl
-          sudo systemctl start libvirtd
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0

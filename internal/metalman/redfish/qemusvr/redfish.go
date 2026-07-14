@@ -1,16 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// Package qemusvr implements a recording Redfish fixture backed by one libvirt
-// domain. It is a Go reimplementation of hack/metalman-redfish-fixture.py used
-// by the metalman smoke tests.
+// Package qemusvr implements a recording Redfish fixture backed by one QEMU/KVM
+// virtual machine. It is a Go reimplementation of hack/metalman-redfish-fixture.py
+// used by the metalman smoke tests.
 //
 // The package is split into two layers: Server implements the Redfish semantics
 // (routing, authentication, request validation, and JSONL recording), and
-// Machine (see qemu.go) drives the underlying libvirt domain. Server talks to
-// the machine layer only through the Backend interface, which is faked in tests.
+// Machine (see qemu.go) launches and controls the QEMU process directly. Server
+// talks to the machine layer only through the Backend interface, which is faked
+// in tests.
 //
-// PXE overrides update the libvirt boot order directly. A UefiHttp PATCH is
+// PXE overrides update the QEMU boot order directly. A UefiHttp PATCH is
 // translated into a dnsmasq configuration bound to the boundary bridge: the
 // Redfish static-NIC address becomes a DHCP reservation and the HttpBootUri
 // becomes the UEFI HTTP boot URL. Stock OVMF then performs a genuine
@@ -37,21 +38,42 @@ import (
 	"time"
 )
 
-// Config holds the fixture's runtime configuration. It mirrors the command-line
-// flags of the original Python fixture and configures both the Redfish server
-// and the QEMU machine layers.
+// Config holds the fixture's runtime configuration. It configures both the
+// Redfish server and the QEMU machine layers.
 type Config struct {
-	Bind            string
-	Port            int
-	Cert            string
-	Key             string
-	Domain          string
-	MAC             string
-	Record          string
-	Bridge          string
-	DnsmasqDir      string
-	Username        string
-	Password        string
+	// Redfish server.
+	Bind     string
+	Port     int
+	Cert     string
+	Key      string
+	Username string
+	Password string
+	Record   string
+
+	// Machine identity. Domain is the Redfish system Id and the QEMU guest name.
+	Domain string
+	MAC    string
+
+	// QEMU virtual machine definition.
+	Disk       string // qcow2 disk image path
+	MemoryMiB  int    // guest RAM in MiB (default 4096)
+	VCPUs      int    // guest vCPU count (default 2)
+	OVMFCode   string // read-only OVMF firmware code pflash image
+	OVMFVars   string // OVMF variables template, copied once to the NVRAM store
+	SecureBoot bool   // enable SMM + secure boot pflash for .ms firmware
+	StateDir   string // working directory for NVRAM, sockets, and TPM state
+
+	// Networking. When Bridge is set the fixture creates the bridge, assigns
+	// BridgeAddress/BridgePrefix to it, brings it up, and installs outbound NAT
+	// for the derived subnet. Each power-on attaches a fresh tap to the bridge.
+	Bridge        string
+	BridgeAddress string // host IP on the bridge (the guest's gateway)
+	BridgePrefix  int    // CIDR prefix length for BridgeAddress (default 24)
+
+	// HTTP boot. DnsmasqDir is the working directory for the UEFI HTTP boot
+	// dnsmasq bound to the bridge.
+	DnsmasqDir string
+
 	ManageBootOrder bool
 }
 
@@ -67,7 +89,8 @@ type Backend interface {
 	PowerOn() error
 	// Restart resets a running domain or starts a stopped one.
 	Restart() error
-	// SetBootOrder sets the libvirt boot order for "Pxe" or "Hdd".
+	// SetBootOrder sets the boot order for "Pxe" (network first) or "Hdd"
+	// (disk first), applied at the next power-on.
 	SetBootOrder(target string) error
 	// ConfigureHTTPBoot programs a DHCP reservation plus UEFI HTTP boot URL so
 	// stock OVMF performs a firmware-native HTTP boot at the next power-on.
@@ -76,7 +99,7 @@ type Backend interface {
 	ClearHTTPBoot() error
 }
 
-// Server is the Redfish fixture state for a single libvirt domain.
+// Server is the Redfish fixture state for a single QEMU virtual machine.
 type Server struct {
 	cfg     Config
 	backend Backend
