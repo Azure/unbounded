@@ -339,9 +339,13 @@ type UpstreamRegistry struct {
 	// "https://registry.example.com".
 	Endpoint string `yaml:"endpoint"`
 
-	// CredentialsPath is a hostPath-mounted file containing the registry
+	// CredentialsPath is an optional fallback file containing registry
 	// credentials. Format: "username:password" (or "_json_key:<json>" for
-	// the well-known GCR pattern). Empty means anonymous pulls.
+	// the well-known GCR pattern). A request-scoped Basic/Bearer credential
+	// delegated by containerd takes precedence and is never cached. Setting
+	// this file opts the registry into legacy shared-identity mode for requests
+	// without delegated auth; leaving it empty enables containerd challenge
+	// negotiation for private HTTPS registries.
 	CredentialsPath string `yaml:"credentials_path"`
 
 	// NSAlias lets containerd's ?ns= use a different name than Name.
@@ -651,13 +655,13 @@ func (c *Config) Validate() error {
 		if host, _, err := net.SplitHostPort(c.MirrorListen); err == nil {
 			ip := net.ParseIP(host)
 			if ip != nil && !ip.IsLoopback() {
-				errs = append(errs, fmt.Errorf("mirror_listen %q is not loopback; only 127.0.0.1 / ::1 are safe (containerd mirror uses skip_verify=true) - set mirror_bind_allow_non_loopback: true to override (operator opt-in)", c.MirrorListen))
+				errs = append(errs, fmt.Errorf("mirror_listen %q is not loopback; only 127.0.0.1 / ::1 are safe - set mirror_bind_allow_non_loopback: true to override (operator opt-in)", c.MirrorListen))
 			}
 
 			// Empty host (e.g. ":5000") binds all interfaces, which is
 			// equivalent to 0.0.0.0 and must also require the opt-in.
 			if host == "" {
-				errs = append(errs, fmt.Errorf("mirror_listen %q binds all interfaces; only loopback is safe (containerd mirror uses skip_verify=true) - set mirror_bind_allow_non_loopback: true to override", c.MirrorListen))
+				errs = append(errs, fmt.Errorf("mirror_listen %q binds all interfaces; only loopback is safe - set mirror_bind_allow_non_loopback: true to override", c.MirrorListen))
 			}
 
 			if ip == nil && host != "localhost" && host != "" {

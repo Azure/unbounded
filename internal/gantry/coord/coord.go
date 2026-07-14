@@ -3,7 +3,7 @@
 
 // Package coord implements Gantry's libp2p coordination RPCs.
 //
-// Wire protocol: `/gantry/coord/1.0.0` (one libp2p stream per
+// Wire protocol: `/gantry/coord/1.1.0` (one libp2p stream per
 // request/response pair, closed after reply). Framing: length-delimited
 // protobuf via `go-msgio` - the design forbids gRPC (the design doc). Forward
 // compatibility: additive changes bump the minor (e.g. `1.1.0`);
@@ -53,10 +53,11 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/inflight"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	coordv1 "github.com/Azure/unbounded/internal/gantry/proto/coord/v1"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 // ProtocolID is the libp2p stream protocol the coord handler binds.
-const ProtocolID protocol.ID = "/gantry/coord/1.0.0"
+const ProtocolID protocol.ID = "/gantry/coord/1.1.0"
 
 // errUnauthorizedPeer is the sentinel returned by dispatch when peer
 // authorization is in enforce mode and the dialing peer is not a recognised
@@ -775,6 +776,11 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 		return &coordv1.PleasePullResponse{}, nil
 	}
 
+	pumpCtx := registryauth.WithAuthorization(ctx, req.GetAuthorization())
+	if req.GetAuthorization() != "" && registryauth.Authorization(pumpCtx) == "" {
+		return nil, errors.New("please_pull: invalid delegated authorization")
+	}
+
 	if s.maxDigestsPerPleasePull > 0 && len(req.GetDigests()) > s.maxDigestsPerPleasePull {
 		// Wire path rejects rather than chunks: a well-behaved client (see
 		// Client.PleasePull) already splits into <= max batches, so an
@@ -810,7 +816,7 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 			continue
 		}
 
-		res := s.pullerPump(ctx, req.GetUpstreamRegistry(), req.GetRepository(), d, pleasePullKindFromProto(req.GetKind()))
+		res := s.pullerPump(pumpCtx, req.GetUpstreamRegistry(), req.GetRepository(), d, pleasePullKindFromProto(req.GetKind()))
 		switch res.Status {
 		case PumpRecentlyFailed:
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_RECENTLY_FAILED
@@ -1019,6 +1025,7 @@ func (c *Client) PleasePull(ctx context.Context, target ifaces.NodeID, registry,
 			UpstreamRegistry: registry,
 			Repository:       repository,
 			Kind:             pleasePullKindToProto(kind),
+			Authorization:    registryauth.Authorization(ctx),
 		},
 	}}
 

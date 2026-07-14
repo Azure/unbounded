@@ -32,7 +32,7 @@ use super::http::copy_body_into_pages;
 /// [`HttpBackend`](super::http::HttpBackend): the raw `backing_base`
 /// pointer is only ever written on the single thread that drives the
 /// backend. Unlike the HTTP backend it holds no ring, so the only
-/// only unsafe concern is the backing pointer.
+/// unsafe concern is the backing pointer.
 pub struct FakeBackend {
     backend_id: String,
     stripe_size: u64,
