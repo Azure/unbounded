@@ -138,9 +138,8 @@ type SiteController struct {
 	// Mutex to prevent concurrent slice updates
 	sliceUpdateLock sync.Mutex
 
-	// slicesDirty is set when syncNode changes node state and cleared when
-	// updateAllSiteSlices runs. The periodic loop checks this to coalesce
-	// slice updates instead of rebuilding after every single node sync.
+	// slicesDirty is set when node or slice state changes. The periodic loop
+	// atomically consumes it to coalesce updates and restores it after failures.
 	slicesDirty atomic.Bool
 
 	// hasSynced indicates whether the informer caches have completed initial sync
@@ -249,6 +248,22 @@ func NewSiteController(
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("failed to add site event handler: %w", err)
+	}
+
+	// Reconcile externally modified slices. Events caused by this controller's
+	// own writes may trigger one redundant pass, which is harmless.
+	if _, err := sliceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			sc.markSlicesDirty()
+		},
+		UpdateFunc: func(old, new interface{}) {
+			sc.markSlicesDirty()
+		},
+		DeleteFunc: func(obj interface{}) {
+			sc.markSlicesDirty()
+		},
+	}); err != nil {
+		return nil, fmt.Errorf("failed to add site node slice event handler: %w", err)
 	}
 
 	// Set up event handlers for gateway pools
@@ -777,12 +792,12 @@ func (sc *SiteController) Run(ctx context.Context, workers int) error {
 		go wait.UntilWithContext(ctx, sc.runWorker, time.Second)
 	}
 
-	// Periodically update site statuses and slices when dirty or every 30s
+	// Periodically update site statuses and slices when dirty.
 	go wait.UntilWithContext(ctx, func(ctx context.Context) {
 		sc.reportDuplicateNodePodCIDRs()
 
-		if sc.slicesDirty.CompareAndSwap(true, false) {
-			sc.updateAllSiteSlices(ctx)
+		if err := sc.updateSiteSlicesIfDirty(ctx); err != nil {
+			klog.Errorf("Failed to update SiteNodeSlices: %v", err)
 		}
 	}, 5*time.Second)
 
@@ -934,24 +949,65 @@ func (sc *SiteController) reconcileAllNodes(_ context.Context) {
 	}
 }
 
+// updateSiteSlicesIfDirty updates slices after atomically consuming the dirty
+// flag. A failed pass restores the flag so the periodic loop retries it.
+func (sc *SiteController) updateSiteSlicesIfDirty(ctx context.Context) error {
+	if !sc.slicesDirty.CompareAndSwap(true, false) {
+		return nil
+	}
+
+	if err := sc.updateAllSiteSlices(ctx); err != nil {
+		sc.markSlicesDirty()
+
+		return err
+	}
+
+	return nil
+}
+
 // updateAllSiteSlices updates the SiteNodeSlice objects for all sites
-func (sc *SiteController) updateAllSiteSlices(ctx context.Context) {
+func (sc *SiteController) updateAllSiteSlices(ctx context.Context) error {
 	// Ensure only one slice update runs at a time to prevent conflicts
 	sc.sliceUpdateLock.Lock()
 	defer sc.sliceUpdateLock.Unlock()
 
 	sc.sitesCacheLock.RLock()
-	sites := sc.sitesCache
+	cachedSites := append([]unboundedv1alpha3.Site(nil), sc.sitesCache...)
 	sc.sitesCacheLock.RUnlock()
 
+	// Continue converging independent resources, but return every error so the
+	// periodic loop schedules another pass.
+	var updateErrors []error
+
+	if err := sc.cleanupOrphanSiteNodeSlices(ctx); err != nil {
+		updateErrors = append(updateErrors, fmt.Errorf("clean up orphan site node slices: %w", err))
+	}
+
+	// Never use an informer-cached Site as a mutation input. Besides protecting
+	// against stale fields, the UID check prevents a delete/recreate with the
+	// same name from receiving writes intended for the deleted Site.
+	sites := make([]unboundedv1alpha3.Site, 0, len(cachedSites))
+
+	for _, cachedSite := range cachedSites {
+		liveSite, err := sc.getLiveSiteWithUID(ctx, cachedSite.Name, cachedSite.UID)
+		if err != nil {
+			updateErrors = append(updateErrors, fmt.Errorf("site %s: %w", cachedSite.Name, err))
+
+			continue
+		}
+
+		sites = append(sites, liveSite)
+	}
+
 	if len(sites) == 0 {
-		return
+		return errors.Join(updateErrors...)
 	}
 
 	nodes, err := sc.nodeLister.List(labels.Everything())
 	if err != nil {
-		klog.Errorf("Failed to list nodes for slice update: %v", err)
-		return
+		updateErrors = append(updateErrors, fmt.Errorf("failed to list nodes for slice update: %w", err))
+
+		return errors.Join(updateErrors...)
 	}
 
 	// Track which nodes belong to each site
@@ -983,7 +1039,6 @@ func (sc *SiteController) updateAllSiteSlices(ctx context.Context) {
 		}
 	}
 
-	// Update slices for each site
 	for _, site := range sites {
 		nodesInfo := siteNodesInfo[site.Name]
 		// Sort by node name for consistent ordering
@@ -991,33 +1046,43 @@ func (sc *SiteController) updateAllSiteSlices(ctx context.Context) {
 			return nodesInfo[i].Name < nodesInfo[j].Name
 		})
 
-		sc.updateSiteSlices(ctx, site, nodesInfo)
+		if err := sc.updateSiteSlices(ctx, site, nodesInfo, allSiteNodeCounts[site.Name]); err != nil {
+			updateErrors = append(updateErrors, fmt.Errorf("site %s: %w", site.Name, err))
+		}
 	}
 
 	// Manage protection finalizers: add when nodes are assigned, remove when
 	// no nodes remain so the site can be deleted.
 	for _, site := range sites {
 		nodeCount := allSiteNodeCounts[site.Name]
-		hasFinalizer := containsFinalizer(site.Finalizers, ProtectionFinalizer)
-
-		if nodeCount > 0 && !hasFinalizer {
-			if err := ensureFinalizer(ctx, sc.dynamicClient, siteGVR, site.Name, site.Finalizers); err != nil {
-				klog.Warningf("Failed to add protection finalizer to site %s: %v", site.Name, err)
-			} else {
-				klog.V(2).Infof("Added protection finalizer to site %s (%d nodes)", site.Name, nodeCount)
+		if nodeCount > 0 {
+			if err := ensureFinalizer(ctx, sc.dynamicClient, siteGVR, site.Name, site.Finalizers, site.UID); err != nil {
+				updateErrors = append(updateErrors, fmt.Errorf("site %s protection finalizer: %w", site.Name, err))
 			}
-		} else if nodeCount == 0 && hasFinalizer {
-			if err := removeFinalizer(ctx, sc.dynamicClient, siteGVR, site.Name, site.Finalizers); err != nil {
-				klog.Warningf("Failed to remove protection finalizer from site %s: %v", site.Name, err)
-			} else {
-				klog.V(2).Infof("Removed protection finalizer from site %s (no nodes)", site.Name)
+		} else {
+			if err := removeFinalizer(ctx, sc.dynamicClient, siteGVR, site.Name, site.Finalizers, site.UID); err != nil {
+				updateErrors = append(updateErrors, fmt.Errorf("site %s protection finalizer: %w", site.Name, err))
 			}
 		}
 	}
+
+	return errors.Join(updateErrors...)
 }
 
 // updateSiteSlices creates/updates/deletes SiteNodeSlice objects for a site
-func (sc *SiteController) updateSiteSlices(ctx context.Context, site unboundedv1alpha3.Site, nodesInfo []unboundednetv1alpha1.NodeInfo) {
+func (sc *SiteController) updateSiteSlices(
+	ctx context.Context,
+	site unboundedv1alpha3.Site,
+	nodesInfo []unboundednetv1alpha1.NodeInfo,
+	allNodeCount int,
+) error {
+	var err error
+
+	site, err = sc.getLiveSiteWithUID(ctx, site.Name, site.UID)
+	if err != nil {
+		return err
+	}
+
 	// Calculate how many slices we need
 	numSlices := (len(nodesInfo) + unboundednetv1alpha1.MaxNodesPerSlice - 1) / unboundednetv1alpha1.MaxNodesPerSlice
 	if numSlices == 0 {
@@ -1026,9 +1091,12 @@ func (sc *SiteController) updateSiteSlices(ctx context.Context, site unboundedv1
 
 	// Get existing slices for this site
 	existingSlices := sc.getExistingSlices(site.Name)
+	desiredSliceNames := make(map[string]struct{}, numSlices)
 
 	// Create or update slices
 	for i := 0; i < numSlices; i++ {
+		desiredSliceNames[fmt.Sprintf("%s-%d", site.Name, i)] = struct{}{}
+
 		start := i * unboundednetv1alpha1.MaxNodesPerSlice
 
 		end := start + unboundednetv1alpha1.MaxNodesPerSlice
@@ -1038,23 +1106,64 @@ func (sc *SiteController) updateSiteSlices(ctx context.Context, site unboundedv1
 
 		sliceNodes := nodesInfo[start:end]
 
-		sc.createOrUpdateSlice(ctx, site, i, sliceNodes)
+		if err := sc.createOrUpdateSlice(ctx, site, i, sliceNodes); err != nil {
+			return err
+		}
 	}
 
-	// Delete extra slices
-	for i := numSlices; i < len(existingSlices); i++ {
-		sliceName := fmt.Sprintf("%s-%d", site.Name, i)
+	resource := sc.dynamicClient.Resource(siteNodeSliceGVR)
 
-		err := sc.dynamicClient.Resource(siteNodeSliceGVR).Delete(ctx, sliceName, metav1.DeleteOptions{})
+	// Delete any slice whose index is no longer desired. Re-read and revalidate
+	// each object so a stale informer entry cannot delete a reassigned slice.
+	for _, existingSlice := range existingSlices {
+		if _, desired := desiredSliceNames[existingSlice.Name]; desired {
+			continue
+		}
+
+		sliceName := existingSlice.Name
+
+		liveSlice, err := resource.Get(ctx, sliceName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+
+		if err != nil {
+			return fmt.Errorf("failed to get extra slice %s: %w", sliceName, err)
+		}
+
+		liveSiteName, found, err := unstructured.NestedString(liveSlice.Object, "siteName")
+		if err != nil {
+			return fmt.Errorf("failed to read siteName from extra slice %s: %w", sliceName, err)
+		}
+
+		if !found || liveSiteName != site.Name {
+			continue
+		}
+
+		if _, desired := desiredSliceNames[liveSlice.GetName()]; desired {
+			continue
+		}
+
+		if _, err := sc.getLiveSiteWithUID(ctx, site.Name, site.UID); err != nil {
+			return err
+		}
+
+		err = deleteLiveSiteNodeSlice(ctx, resource, liveSlice)
 		if err != nil && !apierrors.IsNotFound(err) {
-			klog.Errorf("Failed to delete extra slice %s: %v", sliceName, err)
-		} else {
+			return fmt.Errorf("failed to delete extra slice %s: %w", sliceName, err)
+		}
+
+		if err == nil {
 			klog.V(2).Infof("Deleted extra slice %s", sliceName)
 		}
 	}
 
 	// Update site status only if it changed
-	sc.updateSiteStatusIfChanged(ctx, site, len(nodesInfo), numSlices)
+	if err := sc.updateSiteStatusIfChanged(ctx, site, allNodeCount, numSlices); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // getExistingSlices returns the existing slices for a site
@@ -1096,8 +1205,101 @@ func (sc *SiteController) getExistingSlices(siteName string) []unboundednetv1alp
 	return slices
 }
 
+func (sc *SiteController) getLiveSiteWithUID(ctx context.Context, name string, expectedUID types.UID) (unboundedv1alpha3.Site, error) {
+	live, err := sc.dynamicClient.Resource(siteGVR).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return unboundedv1alpha3.Site{}, fmt.Errorf("expected site %s with UID %q no longer exists: %w", name, expectedUID, err)
+	}
+
+	if err != nil {
+		return unboundedv1alpha3.Site{}, fmt.Errorf("failed to get site %s: %w", name, err)
+	}
+
+	if live.GetUID() != expectedUID {
+		return unboundedv1alpha3.Site{}, fmt.Errorf("site %s UID changed from %q to %q", name, expectedUID, live.GetUID())
+	}
+
+	site := unboundedv1alpha3.Site{}
+
+	data, err := live.MarshalJSON()
+	if err != nil {
+		return unboundedv1alpha3.Site{}, fmt.Errorf("failed to marshal live site %s: %w", name, err)
+	}
+
+	if err := json.Unmarshal(data, &site); err != nil {
+		return unboundedv1alpha3.Site{}, fmt.Errorf("failed to unmarshal live site %s: %w", name, err)
+	}
+
+	return site, nil
+}
+
+func (sc *SiteController) cleanupOrphanSiteNodeSlices(ctx context.Context) error {
+	resource := sc.dynamicClient.Resource(siteNodeSliceGVR)
+	siteResource := sc.dynamicClient.Resource(siteGVR)
+
+	var cleanupErrors []error
+
+	for _, item := range sc.sliceInformer.GetStore().List() {
+		cachedSlice, ok := item.(*unstructured.Unstructured)
+		if !ok {
+			continue
+		}
+
+		name := cachedSlice.GetName()
+
+		liveSlice, err := resource.Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+
+		if err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("get slice %s: %w", name, err))
+
+			continue
+		}
+
+		siteName, found, err := unstructured.NestedString(liveSlice.Object, "siteName")
+		if err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("read siteName from slice %s: %w", name, err))
+
+			continue
+		}
+
+		if found && siteName != "" {
+			_, err = siteResource.Get(ctx, siteName, metav1.GetOptions{})
+			if err == nil {
+				continue
+			}
+
+			if !apierrors.IsNotFound(err) {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("check site %s for slice %s: %w", siteName, name, err))
+
+				continue
+			}
+		}
+
+		if err := deleteLiveSiteNodeSlice(ctx, resource, liveSlice); err != nil && !apierrors.IsNotFound(err) {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("delete orphan slice %s: %w", name, err))
+		}
+	}
+
+	return errors.Join(cleanupErrors...)
+}
+
+func deleteLiveSiteNodeSlice(ctx context.Context, resource dynamic.ResourceInterface, liveSlice *unstructured.Unstructured) error {
+	uid := liveSlice.GetUID()
+	resourceVersion := liveSlice.GetResourceVersion()
+
+	return resource.Delete(ctx, liveSlice.GetName(), metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{
+			UID:             &uid,
+			ResourceVersion: &resourceVersion,
+		},
+	})
+}
+
 // createOrUpdateSlice creates or updates a SiteNodeSlice with retry logic for conflicts
-func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unboundedv1alpha3.Site, sliceIndex int, nodes []unboundednetv1alpha1.NodeInfo) {
+func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unboundedv1alpha3.Site, sliceIndex int, nodes []unboundednetv1alpha1.NodeInfo) error {
 	sliceName := fmt.Sprintf("%s-%d", site.Name, sliceIndex)
 
 	// Convert nodes to unstructured format
@@ -1111,88 +1313,119 @@ func (sc *SiteController) createOrUpdateSlice(ctx context.Context, site unbounde
 		}
 
 		if len(ni.InternalIPs) > 0 {
-			nodeData["internalIPs"] = ni.InternalIPs
+			nodeData["internalIPs"] = stringSliceToInterfaceSlice(ni.InternalIPs)
 		}
 
 		if len(ni.PodCIDRs) > 0 {
-			nodeData["podCIDRs"] = ni.PodCIDRs
+			nodeData["podCIDRs"] = stringSliceToInterfaceSlice(ni.PodCIDRs)
 		}
 
 		nodesData[i] = nodeData
 	}
 
-	// Retry logic for conflicts
-	maxRetries := 5
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		if attempt > 0 {
-			// Exponential backoff: 100ms, 200ms, 400ms, 800ms
-			backoff := time.Duration(100<<uint(attempt-1)) * time.Millisecond
-			klog.V(2).Infof("Retrying slice %s update (attempt %d/%d) after %v", sliceName, attempt+1, maxRetries, backoff)
-			time.Sleep(backoff)
-		}
+	resource := sc.dynamicClient.Resource(siteNodeSliceGVR)
+	backoff := wait.Backoff{
+		Duration: 100 * time.Millisecond,
+		Factor:   2,
+		Steps:    5,
+	}
 
-		// Check if slice exists using informer cache
-		existingObj, exists, err := sc.sliceInformer.GetStore().GetByKey(sliceName)
-		if err != nil {
-			klog.Errorf("Failed to get slice %s from cache: %v", sliceName, err)
-			return
-		}
+	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
+		// Always read directly from the API. The informer may remain stale after
+		// an AlreadyExists or Conflict response.
+		existing, err := resource.Get(ctx, sliceName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			liveSite, siteErr := sc.getLiveSiteWithUID(ctx, site.Name, site.UID)
+			if siteErr != nil {
+				return false, siteErr
+			}
 
-		if !exists {
 			// Create new slice
-			sliceObj := sc.buildSliceObject(site, sliceName, sliceIndex, nodesData)
+			desired := sc.buildSliceObject(liveSite, sliceName, sliceIndex, nodesData)
 
-			_, err = sc.dynamicClient.Resource(siteNodeSliceGVR).Create(ctx, sliceObj, metav1.CreateOptions{})
+			_, err = resource.Create(ctx, desired, metav1.CreateOptions{})
 			if err != nil {
 				if apierrors.IsAlreadyExists(err) {
-					// Race condition: slice was created by another process, retry to update it
 					klog.V(2).Infof("Slice %s was created by another process, retrying", sliceName)
-					continue
+
+					return false, nil
 				}
 
-				klog.Errorf("Failed to create slice %s: %v", sliceName, err)
-			} else {
-				klog.V(2).Infof("Created slice %s with %d nodes", sliceName, len(nodes))
+				return false, fmt.Errorf("failed to create slice %s: %w", sliceName, err)
 			}
 
-			return
+			klog.V(2).Infof("Created slice %s with %d nodes", sliceName, len(nodes))
+
+			return true, nil
 		}
 
-		existing := existingObj.(*unstructured.Unstructured) //nolint:errcheck
+		if err != nil {
+			return false, fmt.Errorf("failed to get slice %s: %w", sliceName, err)
+		}
+
+		liveSite, err := sc.getLiveSiteWithUID(ctx, site.Name, site.UID)
+		if err != nil {
+			return false, err
+		}
+
+		desired := sc.buildSliceObject(liveSite, sliceName, sliceIndex, nodesData)
 
 		// Check if update is needed
-		existingNodes, _, _ := unstructured.NestedSlice(existing.Object, "nodes") //nolint:errcheck
+		existingNodes, _, _ := unstructured.NestedSlice(existing.Object, "nodes")                         //nolint:errcheck
+		existingNodeCount, foundNodeCount, _ := unstructured.NestedInt64(existing.Object, "nodeCount")    //nolint:errcheck
+		existingSiteName, foundSiteName, _ := unstructured.NestedString(existing.Object, "siteName")      //nolint:errcheck
+		existingSliceIndex, foundSliceIndex, _ := unstructured.NestedInt64(existing.Object, "sliceIndex") //nolint:errcheck
 
-		existingNodeCount, foundNodeCount, _ := unstructured.NestedInt64(existing.Object, "nodeCount") //nolint:errcheck
 		if sc.sliceNodesEqual(existingNodes, nodesData) &&
 			foundNodeCount && existingNodeCount == int64(len(nodesData)) &&
-			hasExactSiteOwnerReference(existing.GetOwnerReferences(), site) {
-			return
+			foundSiteName && existingSiteName == liveSite.Name &&
+			foundSliceIndex && existingSliceIndex == int64(sliceIndex) &&
+			hasExactSiteOwnerReference(existing.GetOwnerReferences(), liveSite) {
+			return true, nil
 		}
 
-		// Update existing slice
-		sliceObj := sc.buildSliceObject(site, sliceName, sliceIndex, nodesData)
-		sliceObj.SetResourceVersion(existing.GetResourceVersion())
+		// Mutate a copy of the live object so labels, annotations, finalizers,
+		// and metadata owned by other actors survive this update.
+		sliceObj := existing.DeepCopy()
+		sliceObj.SetOwnerReferences(desired.GetOwnerReferences())
+		sliceObj.Object["siteName"] = liveSite.Name
+		sliceObj.Object["sliceIndex"] = int64(sliceIndex)
+		sliceObj.Object["nodes"] = nodesData
+		sliceObj.Object["nodeCount"] = int64(len(nodesData))
 
-		_, err = sc.dynamicClient.Resource(siteNodeSliceGVR).Update(ctx, sliceObj, metav1.UpdateOptions{})
+		_, err = resource.Update(ctx, sliceObj, metav1.UpdateOptions{})
 		if err != nil {
-			if apierrors.IsConflict(err) {
-				// Conflict: resource was modified, retry with fresh version
-				klog.V(2).Infof("Conflict updating slice %s, will retry", sliceName)
-				continue
+			if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+				klog.V(2).Infof("Slice %s changed during update, will retry", sliceName)
+
+				return false, nil
 			}
 
-			klog.Errorf("Failed to update slice %s: %v", sliceName, err)
-
-			return
+			return false, fmt.Errorf("failed to update slice %s: %w", sliceName, err)
 		}
 
 		klog.V(2).Infof("Updated slice %s with %d nodes", sliceName, len(nodes))
 
-		return
+		return true, nil
+	})
+	if err != nil {
+		if wait.Interrupted(err) {
+			return fmt.Errorf("failed to converge slice %s after %d attempts: %w", sliceName, backoff.Steps, err)
+		}
+
+		return err
 	}
 
-	klog.Errorf("Failed to update slice %s after %d retries", sliceName, maxRetries)
+	return nil
+}
+
+func stringSliceToInterfaceSlice(values []string) []interface{} {
+	result := make([]interface{}, len(values))
+	for i, value := range values {
+		result[i] = value
+	}
+
+	return result
 }
 
 // buildSliceObject constructs the unstructured SiteNodeSlice object
@@ -1214,7 +1447,7 @@ func (sc *SiteController) buildSliceObject(site unboundedv1alpha3.Site, sliceNam
 						"name":               site.Name,
 						"uid":                string(site.UID),
 						"controller":         true,
-						"blockOwnerDeletion": true,
+						"blockOwnerDeletion": false,
 					},
 				},
 			},
@@ -1238,7 +1471,7 @@ func hasExactSiteOwnerReference(refs []metav1.OwnerReference, site unboundedv1al
 		ref.Name == site.Name &&
 		ref.UID == site.UID &&
 		ref.Controller != nil && *ref.Controller &&
-		ref.BlockOwnerDeletion != nil && *ref.BlockOwnerDeletion
+		(ref.BlockOwnerDeletion == nil || !*ref.BlockOwnerDeletion)
 }
 
 // sliceNodesEqual compares two node lists for equality
@@ -1334,61 +1567,73 @@ func (sc *SiteController) buildNodeInfo(node *corev1.Node) unboundednetv1alpha1.
 	return info
 }
 
-// updateSiteStatusIfChanged updates the status of a site only if it has changed
-func (sc *SiteController) updateSiteStatusIfChanged(ctx context.Context, site unboundedv1alpha3.Site, nodeCount, sliceCount int) {
+// updateSiteStatusIfChanged updates the status of a site only if it has changed.
+func (sc *SiteController) updateSiteStatusIfChanged(ctx context.Context, site unboundedv1alpha3.Site, nodeCount, sliceCount int) error {
 	// Always update gauges so they reflect the latest state.
 	SiteNodesGauge.WithLabelValues(site.Name).Set(float64(nodeCount))
 	SiteNodeSlicesGauge.WithLabelValues(site.Name).Set(float64(sliceCount))
 
-	// Check if status actually changed
-	if site.Status.NodeCount == nodeCount && site.Status.SliceCount == sliceCount {
-		klog.V(4).Infof("Site %s status unchanged (%d nodes, %d slices), skipping update", site.Name, nodeCount, sliceCount)
-		return
+	backoff := wait.Backoff{
+		Duration: 50 * time.Millisecond,
+		Factor:   2,
+		Steps:    3,
 	}
 
-	statusPatch := map[string]interface{}{
-		"status": map[string]interface{}{
-			"nodeCount":  nodeCount,
-			"sliceCount": sliceCount,
-		},
-	}
+	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
+		liveSite, err := sc.getLiveSiteWithUID(ctx, site.Name, site.UID)
+		if err != nil {
+			return false, err
+		}
 
-	patchData, err := json.Marshal(statusPatch)
-	if err != nil {
-		klog.Errorf("Failed to marshal status patch for site %s: %v", site.Name, err)
-		return
-	}
+		if liveSite.Status.NodeCount == nodeCount && liveSite.Status.SliceCount == sliceCount {
+			klog.V(4).Infof("Site %s status unchanged (%d nodes, %d slices), skipping update", site.Name, nodeCount, sliceCount)
 
-	// Retry logic for conflicts
-	maxRetries := 3
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		if attempt > 0 {
-			backoff := time.Duration(50<<uint(attempt-1)) * time.Millisecond
-			time.Sleep(backoff)
+			return true, nil
+		}
+
+		patchData, err := json.Marshal(map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"resourceVersion": liveSite.ResourceVersion,
+			},
+			"status": map[string]interface{}{
+				"nodeCount":  nodeCount,
+				"sliceCount": sliceCount,
+			},
+		})
+		if err != nil {
+			return false, fmt.Errorf("failed to marshal status patch for site %s: %w", site.Name, err)
 		}
 
 		_, err = sc.dynamicClient.Resource(siteGVR).Patch(ctx, site.Name, types.MergePatchType, patchData, metav1.PatchOptions{}, "status")
 		if err == nil {
 			klog.Infof("Updated site %s status: %d nodes, %d slices", site.Name, nodeCount, sliceCount)
-			return
+
+			return true, nil
 		}
 
 		if apierrors.IsConflict(err) {
 			klog.V(2).Infof("Conflict updating site %s status, retrying", site.Name)
-			continue
+
+			return false, nil
 		}
 
 		if apierrors.IsNotFound(err) {
-			klog.V(2).Infof("Site %s no longer exists, skipping status update", site.Name)
-			return
+			klog.V(2).Infof("Site %s changed during status update, retrying", site.Name)
+
+			return false, nil
 		}
 
-		klog.Errorf("Failed to update status for site %s: %v", site.Name, err)
+		return false, fmt.Errorf("failed to update status for site %s: %w", site.Name, err)
+	})
+	if err != nil {
+		if wait.Interrupted(err) {
+			return fmt.Errorf("failed to update site %s status after %d attempts: %w", site.Name, backoff.Steps, err)
+		}
 
-		return
+		return err
 	}
 
-	klog.Errorf("Failed to update site %s status after %d retries", site.Name, maxRetries)
+	return nil
 }
 
 func (sc *SiteController) logNoSiteMatchOnce(nodeName string, internalIPs []string) {
@@ -2271,59 +2516,90 @@ func containsFinalizer(finalizers []string, finalizer string) bool {
 	return false
 }
 
-// ensureFinalizer adds the protection finalizer to a resource if not already
-// present. It uses a merge patch to set the full finalizers list.
-func ensureFinalizer(ctx context.Context, client dynamic.Interface, gvr schema.GroupVersionResource, name string, finalizers []string) error {
-	if containsFinalizer(finalizers, ProtectionFinalizer) {
-		return nil
-	}
-
-	newFinalizers := make([]string, len(finalizers), len(finalizers)+1)
-	copy(newFinalizers, finalizers)
-	newFinalizers = append(newFinalizers, ProtectionFinalizer)
-
-	patch := map[string]interface{}{
-		"metadata": map[string]interface{}{
-			"finalizers": newFinalizers,
-		},
-	}
-
-	patchData, err := json.Marshal(patch)
-	if err != nil {
-		return fmt.Errorf("failed to marshal finalizer patch: %w", err)
-	}
-
-	_, err = client.Resource(gvr).Patch(ctx, name, types.MergePatchType, patchData, metav1.PatchOptions{})
-
-	return err
+// ensureFinalizer adds the protection finalizer using the live resource state.
+func ensureFinalizer(ctx context.Context, client dynamic.Interface, gvr schema.GroupVersionResource, name string, _ []string, expectedUID ...types.UID) error {
+	return updateProtectionFinalizer(ctx, client, gvr, name, true, expectedUID...)
 }
 
-// removeFinalizer removes the protection finalizer from a resource if present.
-// It uses a merge patch to replace the finalizers list with the filtered list.
-func removeFinalizer(ctx context.Context, client dynamic.Interface, gvr schema.GroupVersionResource, name string, finalizers []string) error {
-	if !containsFinalizer(finalizers, ProtectionFinalizer) {
-		return nil
+// removeFinalizer removes the protection finalizer using the live resource state.
+func removeFinalizer(ctx context.Context, client dynamic.Interface, gvr schema.GroupVersionResource, name string, _ []string, expectedUID ...types.UID) error {
+	return updateProtectionFinalizer(ctx, client, gvr, name, false, expectedUID...)
+}
+
+func updateProtectionFinalizer(
+	ctx context.Context,
+	client dynamic.Interface,
+	gvr schema.GroupVersionResource,
+	name string,
+	wantFinalizer bool,
+	expectedUID ...types.UID,
+) error {
+	if gvr == siteGVR && len(expectedUID) != 1 {
+		return fmt.Errorf("expected exactly one Site UID for finalizer update of %s", name)
 	}
 
-	newFinalizers := make([]string, 0, len(finalizers))
-	for _, f := range finalizers {
-		if f != ProtectionFinalizer {
-			newFinalizers = append(newFinalizers, f)
+	resource := client.Resource(gvr)
+	backoff := wait.Backoff{
+		Duration: 50 * time.Millisecond,
+		Factor:   2,
+		Steps:    3,
+	}
+
+	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
+		live, err := resource.Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			if len(expectedUID) == 1 {
+				return false, fmt.Errorf("expected %s %s with UID %q no longer exists: %w", gvr.Resource, name, expectedUID[0], err)
+			}
+
+			return true, nil
 		}
-	}
 
-	patch := map[string]interface{}{
-		"metadata": map[string]interface{}{
-			"finalizers": newFinalizers,
-		},
-	}
+		if err != nil {
+			return false, fmt.Errorf("failed to get %s %s for finalizer update: %w", gvr.Resource, name, err)
+		}
 
-	patchData, err := json.Marshal(patch)
-	if err != nil {
-		return fmt.Errorf("failed to marshal finalizer patch: %w", err)
-	}
+		if len(expectedUID) == 1 && live.GetUID() != expectedUID[0] {
+			return false, fmt.Errorf("%s %s UID changed from %q to %q", gvr.Resource, name, expectedUID[0], live.GetUID())
+		}
 
-	_, err = client.Resource(gvr).Patch(ctx, name, types.MergePatchType, patchData, metav1.PatchOptions{})
+		finalizers := live.GetFinalizers()
+
+		hasFinalizer := containsFinalizer(finalizers, ProtectionFinalizer)
+		if hasFinalizer == wantFinalizer {
+			return true, nil
+		}
+
+		updated := live.DeepCopy()
+
+		if wantFinalizer {
+			newFinalizers := append([]string(nil), finalizers...)
+			updated.SetFinalizers(append(newFinalizers, ProtectionFinalizer))
+		} else {
+			newFinalizers := make([]string, 0, len(finalizers)-1)
+			for _, finalizer := range finalizers {
+				if finalizer != ProtectionFinalizer {
+					newFinalizers = append(newFinalizers, finalizer)
+				}
+			}
+
+			updated.SetFinalizers(newFinalizers)
+		}
+
+		_, err = resource.Update(ctx, updated, metav1.UpdateOptions{})
+		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		if err != nil {
+			return false, fmt.Errorf("failed to update %s %s finalizers: %w", gvr.Resource, name, err)
+		}
+
+		return true, nil
+	})
+	if err != nil && wait.Interrupted(err) {
+		return fmt.Errorf("failed to update %s %s finalizers after %d attempts: %w", gvr.Resource, name, backoff.Steps, err)
+	}
 
 	return err
 }
