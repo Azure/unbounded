@@ -1,7 +1,7 @@
 # Hardening overlay (NOT applied by default).
 #
 # This NetworkPolicy is shipped as an EXAMPLE only - it is intentionally
-# excluded from the default `kubectl apply -f deploy/` workflow because
+# excluded from the default Gantry install workflow because
 # every rule below has at least one site-specific CIDR (apiserver
 # endpoint, kubelet probe source, mirror DNAT source, registry egress)
 # that no single shipped manifest can pick for an arbitrary cluster.
@@ -22,10 +22,10 @@
 #
 # Workflow:
 #
-#   1. Copy this file out of deploy/examples/ into your own overlay
+#   1. Copy deploy/gantry/examples/networkpolicy.yaml into your own overlay
 #      (Kustomize / Helm / plain git) and edit every ipBlock marked
 #      with "OPERATOR ACTION REQUIRED" below.
-#   2. Apply it AFTER deploy/daemonset.yaml has been rolled out and
+#   2. Apply it AFTER deploy/gantry/daemonset.yaml has been rolled out and
 #      verified, never as part of the initial install - a bad rule
 #      will leave you with a NotReady DaemonSet and no clear signal
 #      that the policy is the cause.

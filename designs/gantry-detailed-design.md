@@ -155,7 +155,7 @@ Per-node layout:
 
 The agent exposes two distinct wire surfaces. They are versioned independently.
 
-**Coordination RPCs (libp2p stream).** `pull_intent_query` and `please_pull` are carried as length-prefixed protobuf messages over libp2p streams. Single protocol ID `/gantry/coord/1.0.0`; one stream per request/response pair, closed after the response is written. Schema lives in `proto/gantry/coord/v1/coord.proto`. Forward-compat policy: additive changes bump the minor (`/gantry/coord/1.1.0`), breaking changes bump the major (`/gantry/coord/2.0.0`). gRPC is intentionally avoided  -  `go-msgio` length-delimited framing is sufficient and avoids HTTP-over-libp2p complexity. The message envelope uses `oneof` so a single protocol handler dispatches both RPC kinds:
+**Coordination RPCs (libp2p stream).** `pull_intent_query` and `please_pull` are carried as length-prefixed protobuf messages over libp2p streams. Single protocol ID `/gantry/coord/1.1.0`; one stream per request/response pair, closed after the response is written. Schema lives in `internal/gantry/proto/coord/v1/coord.proto`. Forward-compat policy: additive changes bump the minor, and breaking changes bump the major (`/gantry/coord/2.0.0`). gRPC is intentionally avoided  -  `go-msgio` length-delimited framing is sufficient and avoids HTTP-over-libp2p complexity. The message envelope uses `oneof` so a single protocol handler dispatches both RPC kinds:
 
 ```proto
 syntax = "proto3";
@@ -201,6 +201,9 @@ message PleasePullRequest {
                                             // OCI cross-repo blob mount) require separate calls.
   string upstream_registry  = 2;            // e.g. "registry.example.com"
   string repository         = 3;            // e.g. "library/nginx"
+  Kind kind                 = 4;
+  string authorization      = 5;            // requester Basic/Bearer auth;
+                                            // never persisted, logged, or cached
 }
 
 message PleasePullResponse {
@@ -233,11 +236,11 @@ message PleasePullResponse {
 
 **`Gantry-Mirrored: 1` header.** The requesting agent sets `Gantry-Mirrored: 1` on every fetch to a peer's `:5001`. Its presence switches the serving peer's handler into peer-fetch mode:
 
-- Serve **only** from local store. Return `404` on miss. Never trigger DHT lookup, HRW probe, `please_pull`, or origin contact in response to a peer fetch.
+- Forward incoming request-scoped Basic/Bearer authorization on every peer fetch. The serving peer ignores it when local content is present. Return `404` on miss; the requester then carries the same credential through the separate `please_pull` path if a designated peer must contact origin. Never trigger DHT lookup, HRW probe, `please_pull`, or origin contact directly in response to a transfer-endpoint fetch.
 - Tag-shaped manifest requests: `404` unconditionally (peers do not request tags in v1; the DHT carries no tag keys).
 - Increment `p2p_peer_serve_total` rather than `p2p_cache_hit_total` (which counts workload-side hits via the mirror endpoint).
 
-The header is a behavior switch, not an authorization mechanism. Trust comes from NetworkPolicy scoping `:5001` to inter-node traffic. Any peer reachable on that port is treated as trusted; see the `please_pull` abuse open question in §8.
+The `Gantry-Mirrored` header is a behavior switch, not an authorization mechanism. Trust comes from NetworkPolicy scoping `:5001` to inter-node traffic. Any peer reachable on that port is treated as trusted. Because `:5001` is plaintext h2c, forwarded Basic/Bearer credentials require a trusted network or an encryption layer such as a service mesh; see the `please_pull` abuse open question in §8.
 
 ---
 
@@ -250,7 +253,7 @@ Manifest requests come in two forms: by digest (`manifests/sha256:...`) and by t
 1. `containerd` requests `127.0.0.1:5000/v2/<image>/manifests/sha256:abc` (or a blob by digest).
 2. Agent checks the local containerd content store. **Miss.**
 3. Agent calls `dht.FindProviders(CID)` where CID derives from the OCI digest. **Hit**  -  returns peer multiaddrs.
-4. Agent picks the first reachable provider (ordered roughly by Kademlia proximity) and issues a single HTTP `GET` against that peer's `:5001` transfer endpoint (§4.4) with `Gantry-Mirrored: 1`. No `Range` header in v1.
+4. Agent picks the first reachable provider (ordered roughly by Kademlia proximity) and issues a single HTTP `GET` against that peer's `:5001` transfer endpoint (§4.4) with `Gantry-Mirrored: 1` and the requester's Basic/Bearer authorization when present. No `Range` header in v1. The peer ignores authorization on a local hit.
 5. Bytes stream through the agent to the requesting containerd. Gantry hashes the stream and records any mismatch, but containerd remains the final commit verifier because bytes have already been delivered by the time the final digest check completes.
 6. Gantry does **not** independently ingest the live mirror response into containerd. The requesting containerd commits the content; cdsub/advertiser reconciliation observes the later openable content and issues `DHT.Provide`.
 
@@ -306,10 +309,10 @@ The interesting case. Walked through in detail because every failure mode in §6
    5. **All-unreachable expansion.** If no top-K node responds within the timeout, expand the probe to top-2K and re-run step 4 against the new candidates. This rule applies regardless of DHT health score: a fully-unreachable top-K is itself a partition-or-failure symptom, and very likely a provider exists at rank-K+1..rank-2K. NF5 (§7.7) fires only if the expanded probe also fails.
    6. **Degraded-health eager expansion.** If DHT health is Degraded (§7.7) and all reachable top-K report `neither cached nor in-flight`, expand to top-2K before declaring cold-start. Under healthy DHT the honest "neither" answer is trusted; under degraded DHT it may be wrong (the top-K node may have evicted because `dht.Provide` is failing cluster-wide).
    7. **Cold-start.** Only if **all reachable top-K** report `has_cached: false`, `in_flight: false`, and `recently_failed: false`, **and** none of the expansion rules above apply, proceed to step 6. This is the only condition that justifies a true cold-start.
-6. Agent selects the **lowest-ranked reachable node** and sends it `please_pull(digest)`.
+6. Agent selects the **lowest-ranked reachable node** and sends it `please_pull(digest)`, including the requester's request-scoped Basic/Bearer authorization when present.
 7. The chosen designated puller checks its in-flight map for the digest:
    - If already pulling, responds `already_pulling(started_at)`. No-op.
-   - If not, starts pulling from origin, adds to in-flight map.
+  - If not, starts pulling from origin with the delegated credential, adds to in-flight map, and discards the credential when the request completes. A rejected delegated credential is not replaced with the puller's local identity.
 8. The requesting agent polls the **local DHT** for providers of the CID at the per-digest interval defined in §5.2a, bounded by the per-digest timeout. Requesters do **not** poll the puller's `:5001` directly  -  see §5.2a for the rationale.
 9. When the puller completes origin fetch, commit, reopen, and advertiser mark-present, the advertiser calls `DHT.Provide(CID)` and the puller removes the digest from its in-flight map.
 10. All polling requesters discover the provider and pull via the warm path (§5.1).
@@ -423,7 +426,7 @@ recent_failures[digest] = {
 
 **Requester behavior on `recently_failed`.** When a requester receives `recently_failed` from any reachable top-K node during the §5.2 step 5 probe:
 
-- `auth`, `not_found`: trust cluster-wide. Asking rank-1, rank-2, or any other node is futile  -  same credentials and same digest produce the same answer everywhere. Requester returns 5xx to `containerd` immediately. No `please_pull` to anyone for this digest.
+- `auth`, `not_found`: trust cluster-wide only for pulls that do not carry a delegated identity. A request carrying its own Basic/Bearer credential ignores a prior digest-wide `auth` cooldown because that failure may belong to another identity. Origin-side failures under delegated credentials are not inserted into the digest-only shared cooldown cache.
 - `rate_limited`: trust cluster-wide. Requester returns 5xx; `kubelet`'s exponential retry naturally surfaces a new attempt later, after origin's rate window has likely reset.
 - `transient`: trust per-digest, but apply a local **honor window** of `min(cooldown_until - now, 30 s)` before sending `please_pull` for this digest to *any* top-K node. A flapping origin will fail rank-1 the same way it failed rank-0; sequential retries within the cooldown window only generate origin pressure. After the honor window expires, the requester re-probes; by then rank-0's own cooldown may also have expired and the next attempt is single-shot.
 
@@ -477,12 +480,11 @@ server = "https://registry.example.com"
 
 [host."http://127.0.0.1:5000"]
   capabilities = ["pull", "resolve"]
-  skip_verify = true
 ```
 
 The agent must respond to standard OCI Distribution API endpoints (`/v2/`, `/v2/<name>/manifests/<ref>`, `/v2/<name>/blobs/<digest>`). On any internal error, the agent should return 5xx, prompting `containerd` to fall back to the next configured host (the actual origin).
 
-The `server = ...` directive causes containerd to attach `?ns=<registry>` to every mirrored request. This is required for tag references (§5.1a)  -  without it, the agent cannot determine which upstream registry a bare tag like `library/nginx:latest` belongs to. The mirror-fallback to origin on 5xx is load-bearing for tag references: every tag-shaped request to the agent returns `503` by design, and the fallback chain is the only mechanism by which tags are ever resolved (§5.1a). `skip_verify = true` is safe here because the mirror endpoint is `127.0.0.1` over loopback; do not propagate this setting to non-loopback mirrors.
+The `server = ...` directive causes containerd to attach `?ns=<registry>` to every mirrored request. This is required for tag references (§5.1a)  -  without it, the agent cannot determine which upstream registry a bare tag like `library/nginx:latest` belongs to. The mirror-fallback to origin on 5xx is load-bearing for tag references: every tag-shaped request to the agent returns `503` by design, and the fallback chain is the only mechanism by which tags are ever resolved (§5.1a). The mirror is plain HTTP on loopback, so no TLS `skip_verify` option is needed; retaining verified TLS on the mirror authorizer's client is important when containerd contacts a Bearer token realm.
 
 ### 7.2 libp2p configuration
 
@@ -580,7 +582,7 @@ the DHT consistent with it.
 
 - **Transport encryption:** libp2p Noise (built-in).
 - **Content verification:** OCI digest verification on every byte received from peers. Non-negotiable.
-- **Origin auth:** the agent uses the same registry credentials as `containerd` for pulls from origin (read from a Secret mounted into the DaemonSet pod). v1 assumes those credentials are uniform cluster-wide; per-node credentials (IRSA, Workload Identity, per-node ServiceAccount) are out of scope and have specific consequences for the authorization model documented in §7.8.
+- **Origin auth:** request-scoped Basic/Bearer authorization from the incoming containerd mirror request is forwarded through peer and `please_pull` paths and takes precedence for origin. It is never cached or persisted, is sent only to HTTPS origins, and a rejection never falls back to the puller node's identity. Secret-mounted `credentials_path` is explicit legacy shared-identity mode. See §7.8.
 - **NetworkPolicy:** the transfer port (HTTP/2) and libp2p listen ports are restricted to inter-node traffic only.
 - **Signature verification:** out of scope. Existing tooling (Cosign, admission controllers) handles this and is unaffected by the P2P layer.
 
@@ -652,24 +654,87 @@ Note that all-top-K-unreachable triggers top-2K expansion **regardless of health
 
 ### 7.8 Authorization model and registry credentials
 
-v1's authorization model rests on a single load-bearing assumption: **registry credentials are uniform across every node in the cluster.** Every agent holds the same Secret-mounted credential and uses it for origin pulls. Several pieces of the design rely on this directly:
+Gantry supports **requester-mediated origin authorization** for Basic and
+Bearer registries. On the first unauthenticated digest request, the agent makes
+an anonymous verified-HTTPS request to the configured upstream `/v2/`
+endpoint. A `200` marks the registry anonymous; a `401` carrying a valid Basic
+or Bearer challenge is cached and relayed to containerd. Containerd then uses
+the pull credential supplied by kubelet/CRI and retries the mirror:
 
-- **§5.8 cluster-wide trust of `auth` and `not_found`.** "Rank-1 will get the same answer as rank-0" is only true if rank-0 and rank-1 hold the same credentials and present the same identity to origin. Per-node credentials break this: rank-0's `401/403` does not imply rank-1 will fail, and propagating the `auth` failure class cluster-wide would incorrectly block requesters whose credentials are valid.
-- **Peer-fetch authorization (§4.4 `:5001`).** The transfer endpoint serves any cached blob to any peer that can reach it on the network (NetworkPolicy-scoped, but otherwise unauthenticated at the application layer). Under uniform credentials this is equivalent to the requester pulling from origin under its own (identical) credentials. Under per-node credentials, a peer with no origin-read authorization for a given blob can still fetch that blob from a peer that pulled it under different credentials  -  an authorization escalation.
+- Basic causes containerd to send the Basic credential to Gantry.
+- Bearer causes containerd to exchange the pull credential at the challenge's
+  absolute HTTPS token realm and send Gantry the resulting scoped access token.
 
-**Out of scope for v1.** Per-node identity models (IRSA on EKS, Workload Identity on GKE, ServiceAccount-mediated registry auth) are explicitly out of scope. Operators using these models must accept that:
+Authorization values larger than 64 KiB and malformed/unsupported schemes are
+rejected. A challenge lookup error returns `503` so containerd can fall through
+to origin; Gantry never silently selects a different identity.
 
-- F1's "small constant origin pulls" property degrades roughly to "one origin pull per credential-domain per digest," since each credential domain effectively forms an independent cluster from origin's perspective.
-- The §5.8 cluster-wide `auth`/`not_found` trust must be turned off or downgraded to per-digest-and-credentials trust, which requires a non-trivial protocol change.
-- A peer with weaker credentials can read content pulled by a peer with stronger credentials. This is acceptable only when all credential domains within a cluster trust each other transitively.
+The delegated credential follows both peer paths:
 
-**Future direction (deferred).** Candidate approaches for closing the gap, none of which v1 should absorb:
+- Every transfer `GET` to `:5001` carries the Basic/Bearer header. A peer that can
+  open the digest locally serves it without consulting or validating the
+  credential. A local miss still returns `404`; the transfer endpoint never
+  contacts origin.
+- `please_pull` protocol 1.1 carries the same value inside the encrypted
+  libp2p stream. If the designated puller must contact origin, it sends the
+  delegated value to the configured HTTPS registry. It does not cache the
+  token and does not fall back to its own configured identity if origin
+  rejects it.
 
-- *Requester-mediated pulls.* The requester forwards a short-lived origin credential token in `please_pull`; the puller uses it for one request and discards. Adds a credential-handling RPC and rotates the `please_pull` abuse surface (§8 open question) into a credential-laundering risk.
-- *Per-credential-domain HRW.* Form independent P2P swarms per credential, sacrificing cross-domain layer sharing for correctness. Cleanest semantics; worst load-balancing.
-- *Out-of-band authorization assertions* at the `:5001` endpoint. Requires an external trust source (e.g., SPIFFE/SPIRE), which is a substantial dependency.
+**Cross-node example.** A pod and its containerd run on node A, while HRW
+selects node B as the designated puller for one digest. Containerd A completes
+the registry challenge against Gantry A. Gantry A serializes the resulting
+Basic/Bearer `Authorization` value in `please_pull`; Gantry B validates it,
+detaches it from the short-lived RPC context, and attaches it to the background
+HTTPS origin request. Gantry B never needs A's `imagePullSecret`, access to A's
+kubelet, or a registry identity of its own. After B commits and advertises the
+digest, A fetches the bytes from B through the normal peer-transfer path, which
+also carries the same request-scoped authorization.
 
-See §8 open question on per-node credentials.
+The `please_pull` response reports `STARTED` before B's background origin pull
+completes. A later origin 401 on B therefore cannot be returned synchronously
+through that already-completed RPC. B advertises no provider, so A's DHT poll
+eventually exhausts; A may attempt its gated direct-origin fallback or return a
+5xx so containerd falls through/retries. A direct origin 401 includes the
+current challenge and re-enters containerd's normal credential refresh flow.
+
+Setting secret-mounted `credentials_path` explicitly opts a registry into the
+legacy shared-identity mode: Gantry skips requester challenge negotiation and
+authenticates to origin itself. Leaving it empty selects requester-mediated
+authentication.
+
+The standard containerd Docker authorizer caches handlers by HTTP destination
+host, so an origin token is not proactively reused for the loopback mirror.
+The relayed challenge intentionally creates a mirror-host auth handler.
+Kubernetes image-pull secrets and current kubelet credential-provider results
+normally reach CRI without a restrictive `ServerAddress`, allowing containerd
+to answer that challenge. Nonstandard CRI callers that bind a credential to a
+different non-empty `ServerAddress` may be unable to authenticate to Gantry and
+will fall through to origin.
+
+**Negative-cache semantics.** The existing negative cache is keyed by digest,
+not credential identity. An origin-side failure produced with delegated auth
+is therefore not inserted into the shared cooldown cache. A delegated request
+also ignores prior shared `auth`, `not_found`, and `rate_limited` cooldowns:
+registries may conceal authorization failures as `404`, and rate limits may be
+token-scoped. Downstream/transient failures after origin returns 2xx remain
+safe to cache. Non-delegated deployments retain the configured cluster-wide
+failure-class behavior.
+
+**Remaining authorization surface.** Cached content is still authorized by
+cluster membership and network reachability, not by validating the origin
+token. This matches the requirement that a peer may ignore auth on a local
+hit, but it means a weaker peer can read bytes previously pulled by a stronger
+identity. The cluster must be a single transitive trust domain, or a future
+per-credential-domain swarm / external authorization assertion must separate
+those identities.
+
+**Transport requirement.** `please_pull` is protected by libp2p Noise, but
+the transfer endpoint is plaintext h2c. Because Basic/Bearer authorization is
+forwarded on every peer transfer, deployments must isolate that network or add
+transport encryption with a service mesh or equivalent. Basic credentials may
+be long-lived; NetworkPolicy limits endpoints but does not protect a credential
+from an on-path observer.
 
 ---
 
@@ -678,7 +743,7 @@ See §8 open question on per-node credentials.
 - **K value tuning.** Default K=3 for HRW top-K. Is this right for our cluster sizes? Empirically validate. Also: when degraded, is top-2K sufficient or should the expansion be larger?
 - **Topology scoping.** Default to cluster-wide HRW or per-zone HRW? Depends on cross-zone bandwidth cost in our environment.
 - **Containerd retention tuning.** Gantry now serves from containerd directly and protects background-ingested content with bounded leases. Production rollout still needs empirical tuning of lease TTL, cleanup cadence, and containerd's own GC settings under real image churn.
-- **Per-node registry credentials.** v1 assumes uniform cluster-wide credentials (§7.8). Per-node IAM models (IRSA, Workload Identity, per-node ServiceAccount auth) break §5.8's cluster-wide `auth`/`not_found` trust and introduce an authorization-escalation surface at the peer-fetch endpoint. Out of scope for v1; v2 candidates are outlined in §7.8.
+- **Containerd credential compatibility.** Validate requester challenge negotiation against non-Kubernetes CRI clients and credential sources that set a restrictive non-empty `ServerAddress` (§7.8).
 - **Eviction provider-count threshold.** Removed in plan-final-copilot-v2 §Phase 8. Containerd's own GC is now the only eviction authority; the `EvictionProviderCountThreshold` knob, the 5% forced-eviction headroom, and the cache-pressure scoring loop no longer exist. The remaining operator knobs that affect retention of Gantry-ingested content are `containerd_lease_ttl` and `containerd_lease_cleanup_interval` (§7.4).
 - **Chunk-level granularity.** Deferred. Reconsider if cold-start convergence times for large images (>1 GB) are unacceptable in practice.
 - **Image admission signaling.** When a new image is pushed to origin, should the system pre-warm? Out of scope for v1; revisit if rollout latency is a problem.
@@ -687,15 +752,15 @@ See §8 open question on per-node credentials.
 - **NF6 RAM budget.** The <100 MB/<5% CPU target was set before the negative cache, DHT health stats, and view tracking were added. Re-validate against real workloads at 10k-node scale before committing to this number; IPFS server-mode DHT nodes typically run hotter than 100 MB.
 - **DHT inbound RPC fan-in under thundering herd.** §5.3 asserts that ~10,000 inbound `pull_intent_query` RPCs per top-K node is "manageable." This is asserted, not load-tested. Validate at scale before relying on it.
 - **Eviction-time DHT lookup load.** Removed in plan-final-copilot-v2 §Phase 8 along with the Gantry-owned eviction loop  -  there is no longer a per-eviction-candidate DHT lookup. Containerd's own GC owns content lifetime now.
-- **`please_pull` abuse and peer authorization.** Currently any peer can send `please_pull(arbitrary_digest)` (origin-pull oracle / cost DoS) or fetch any locally-cached blob from any node. Single-cluster context probably acceptable, but explicit decision needed: rate-limit per-source on `please_pull` (and reintroduce `OUTCOME_DECLINED` in the proto when this lands); explicit policy on cross-namespace blob access.
+- **`please_pull` abuse, peer authorization, and credential laundering.** Any accepted peer can send `please_pull(arbitrary_digest, authorization)` and ask another node to present that credential to an origin, or fetch locally cached content without token validation. Explicit enforcement and per-source rate limits are required before crossing trust domains; retain the reserved `OUTCOME_DECLINED` value for that work.
 - **HRW-coordinated tag resolution with TTL refresh (v2 candidate).** A peer-served tag-resolution layer that builds on top of v1's defer-to-origin design (§5.1a). v1's tag handling is correct and clean but has two operational costs: every pod-start hits origin for tag resolution (small per-pull  -  manifest body only  -  but proportional to pod-start rate), and tag-keyed pulls fail when origin is unreachable. The v2 mechanism converts both into bounded staleness. **Mechanism:** compute HRW on the tag key, designate rank-0 as the resolution leader, add a `tag_intent_query` RPC (analogous to `pull_intent_query`), have rank-0 maintain a `tag -> (digest, fetched_at, generation)` cache with a TTL and re-resolve against origin every `TTL/2` (jittered). Followers cache the answer locally for the remainder of the TTL window and re-query the leader on expiry. **Properties:**
   - *Origin contact rate per tag drops from one-per-pod-start to one-per-TTL* regardless of cluster size. Default TTL candidate: 30 s; validate empirically against rebinding rates observed in target environments.
   - *Availability under origin partition is restored* within the cached binding's TTL. Tag-keyed pulls succeed peer-to-peer as long as some node has resolved the tag within the last TTL period.
   - *Staleness is TTL-bounded.* Pods scheduled inside the staleness window get the previous binding; the cluster converges to current origin truth within at most TTL seconds. This deviates from OCI's implicit "resolve-on-every-pull" semantic and **must be operator-opt-in per registry**  -  expose a per-registry switch so operators who want exact origin-resolution semantics for specific registries (typically registries with frequent tag mutation like `latest` channels) can disable v2 tag resolution selectively.
-  - *Poisoning surface is bounded* to "the deterministic rank-0 node for that specific tag." In a hypothetical alternative design where any caching node can advertise a tag binding, an attacker who compromises any single node can poison any tag in the cluster; HRW-for-tags restricts the poisoning surface for each tag to the one deterministic leader for that tag's key, which the attacker can predict but not choose. Still not eliminated; tag resolution remains unverifiable by followers (tags aren't content-addressed). Under §7.8's uniform-cluster-credentials assumption, this is the most disciplined trust topology achievable without introducing peer-side tag signatures (out of scope).
+  - *Poisoning surface is bounded* to "the deterministic rank-0 node for that specific tag." In a hypothetical alternative design where any caching node can advertise a tag binding, an attacker who compromises any single node can poison any tag in the cluster; HRW-for-tags restricts the poisoning surface for each tag to the one deterministic leader for that tag's key, which the attacker can predict but not choose. Still not eliminated; tag resolution remains unverifiable by followers (tags aren't content-addressed). Within §7.8's single-cluster trust boundary, this is the most disciplined topology achievable without introducing peer-side tag signatures (out of scope).
   - *Pre-positioning attack  -  a v2-only surface that v1 entirely avoids.* Tag HRW introduces an attack surface that digest HRW does not have, because consumers cannot verify a tag->digest binding the way they verify content against a digest. A node-ID-grinding attacker who can add nodes to the cluster can target a specific tag by computing `SHA256(node_id || tag)` offline and choosing a `node_id` that outranks existing nodes for that tag; the attacker then becomes rank-0 for that tag and can advertise an arbitrary `tag -> digest` binding to followers within their TTL windows. Whether this matters depends on the cluster's threat model for node admission. Under typical Kubernetes RBAC, adding a node is operator-equivalent, so the attack reduces to “an operator can lie about tags,” which is true regardless of Gantry. The attack is sharper in environments with automated node admission  -  autoscalers with weak identity binding, multi-tenant clusters without per-tenant node pools, or any setting where node-ID choice is decoupled from operator authority. v2 should treat tag-binding integrity as a separable design problem rather than assuming HRW alone bounds the surface; candidate directions include constraining node IDs through a trusted identity authority (SPIFFE/SPIRE-style), requiring quorum agreement across multiple top-K nodes before followers cache a binding, or accepting the residual risk under an explicit cluster-trust assumption documented alongside §7.8. **This entire surface is absent from v1.** By deferring tag resolution to origin, v1 has no peer-served tag-binding state to attack  -  the only authority for `tag -> digest` is origin, accessed under each node's own credentials, exactly as OCI specifies. That is a genuine v1 advantage worth naming explicitly when weighing the v2 promotion.
   - *Leader failover* reuses the digest top-K mechanism: if rank-0 is unreachable, rank-1 takes over and resolves against origin on its next refresh tick. The view-skew dedupe machinery from §5.3 applies: two nodes can independently believe they are rank-0 during informer-convergence windows. If a rebinding lands between their queries they will advertise different digests and the cluster will oscillate until view skew heals  -  bounded by the same view-convergence dynamics as digest HRW.
-  - *Credentials* are subsumed by §7.8's uniform-cluster-credentials assumption; HRW-for-tags does not introduce a new credential delegation problem beyond what already exists for HRW-for-digests. Per-node credentials remain explicitly out of scope (§7.8).
+  - *Credentials* follow §7.8: requester Basic/Bearer challenge negotiation applies to digest requests. An HRW tag leader would require the same handoff or configured shared credentials.
   - *Rebinding invalidation* is handled by the refresh tick + generation number: when rank-0's re-resolve returns a different digest, generation increments and the new binding is advertised. Followers that re-query after their cache expires get the new digest. Followers that pulled during the prior generation are unaffected (already-running pods keep their pulled digest per normal OCI semantics).
   - *Per-registry opt-in.* Where enabled, the leader handles resolution for that registry's tags. Where disabled, v1's §5.1a defer-to-origin behavior applies exactly.
   - *Open sub-question:* should the cluster maintain a single TTL for all tags, per-registry TTLs, or per-tag-pattern TTLs (e.g., shorter TTL for `*:latest`, longer for `*:vX.Y.Z`)? Per-pattern is more powerful but adds configuration surface.
