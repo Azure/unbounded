@@ -344,9 +344,9 @@ func (r *registry) authenticationChallenge(ctx context.Context) (string, bool, e
 	if r.username != "" {
 		return "", false, nil
 	}
-	// Delegated credentials are never sent to plaintext origins. Preserve
-	// anonymous HTTP registry behavior and let any private HTTP registry fall
-	// through to containerd's direct-origin path.
+	// Challenge discovery and delegated credentials are HTTPS-only. Reporting
+	// no challenge preserves anonymous HTTP registries; private HTTP registries
+	// cannot use requester-delegated authentication.
 	if !strings.EqualFold(r.base.Scheme, "https") {
 		return "", false, nil
 	}
