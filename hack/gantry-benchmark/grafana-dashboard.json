@@ -1,0 +1,183 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 100,
+      "title": "Origin comparison",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "decbytes"}},
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 1},
+      "id": 1,
+      "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {"expr": "sum by (phase) (origin_bytes_upstream_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",gantry_benchmark=\"true\"})", "legendFormat": "{{phase}}", "refId": "A"}
+      ],
+      "title": "ACR upstream bytes",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "decbytes"}},
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 1},
+      "id": 2,
+      "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {"expr": "sum by (phase) (origin_bytes_to_client_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",gantry_benchmark=\"true\"})", "legendFormat": "{{phase}}", "refId": "A"}
+      ],
+      "title": "Bytes delivered to clients",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 1},
+      "id": 3,
+      "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {"expr": "sum by (phase,path_class) (origin_requests_completed_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",gantry_benchmark=\"true\"})", "legendFormat": "{{phase}} {{path_class}}", "refId": "A"}
+      ],
+      "title": "Origin requests by phase and path",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 1},
+      "id": 4,
+      "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {"expr": "1 - sum(origin_bytes_upstream_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=\"gantry_cold\",gantry_benchmark=\"true\"}) / sum(origin_bytes_upstream_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=\"baseline\",gantry_benchmark=\"true\"})", "refId": "A"}
+      ],
+      "title": "Origin byte reduction",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "Bps"}},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 7},
+      "id": 5,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}},
+      "targets": [
+        {"expr": "sum by (phase,path_class) (rate(origin_bytes_upstream_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",gantry_benchmark=\"true\"}[1m]))", "legendFormat": "{{phase}} {{path_class}}", "refId": "A"}
+      ],
+      "title": "ACR bytes/sec by phase and path",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 7},
+      "id": 6,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}},
+      "targets": [
+        {"expr": "sum by (phase,client_class,path_class) (rate(origin_requests_completed_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",gantry_benchmark=\"true\"}[1m]))", "legendFormat": "{{phase}} {{client_class}} {{path_class}}", "refId": "A"}
+      ],
+      "title": "Origin requests/sec by phase, caller, and path",
+      "type": "timeseries"
+    },
+    {
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 15},
+      "id": 200,
+      "title": "Gantry and rollout",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "id": 7,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}},
+      "targets": [
+        {"expr": "sum(rate(p2p_peer_fetch_total{namespace=\"$gantry_namespace\",outcome=\"hit\",gantry_benchmark=\"true\"}[1m]))", "legendFormat": "peer hits", "refId": "A"},
+        {"expr": "sum(rate(p2p_origin_pull_total{namespace=\"$gantry_namespace\",gantry_benchmark=\"true\"}[1m]))", "legendFormat": "origin pulls", "refId": "B"}
+      ],
+      "title": "Peer hits versus Gantry origin pulls",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 16},
+      "id": 8,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last"]}},
+      "targets": [
+        {"expr": "sum by (label_gantry_unbounded_cloud_io_phase) (kube_pod_status_phase{namespace=\"$namespace\",phase=\"Succeeded\"} * on(namespace,pod) group_left(label_gantry_unbounded_cloud_io_phase,label_gantry_unbounded_cloud_io_run_id) kube_pod_labels{namespace=\"$namespace\",label_gantry_unbounded_cloud_io_run_id=\"$run_id\",label_app_kubernetes_io_name=\"gantry-benchmark-pull\"})", "legendFormat": "{{label_gantry_unbounded_cloud_io_phase}}", "refId": "A"}
+      ],
+      "title": "Completed pull pods",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 16},
+      "id": 9,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {"expr": "min(p2p_dht_health_score{namespace=\"$gantry_namespace\",gantry_benchmark=\"true\"})", "refId": "A"}
+      ],
+      "title": "Minimum DHT health",
+      "type": "gauge"
+    },
+    {
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 24},
+      "id": 300,
+      "title": "Instrumentation overhead",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 25},
+      "id": 10,
+      "targets": [
+        {"expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"$namespace\",pod=~\"acr-origin-proxy-.*\",container=\"proxy\"}[1m]))", "legendFormat": "{{pod}}", "refId": "A"}
+      ],
+      "title": "Proxy CPU cores",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "Bps"}},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 25},
+      "id": 11,
+      "targets": [
+        {"expr": "sum(rate(container_network_receive_bytes_total{namespace=\"$namespace\",pod=~\"acr-origin-proxy-.*\"}[1m]))", "legendFormat": "receive", "refId": "A"},
+        {"expr": "sum(rate(container_network_transmit_bytes_total{namespace=\"$namespace\",pod=~\"acr-origin-proxy-.*\"}[1m]))", "legendFormat": "transmit", "refId": "B"}
+      ],
+      "title": "Proxy network",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 25},
+      "id": 12,
+      "targets": [
+        {"expr": "sum by (phase,path_class) (origin_inflight_requests{namespace=\"$namespace\",run_id=\"$run_id\",gantry_benchmark=\"true\"})", "legendFormat": "{{phase}} {{path_class}}", "refId": "A"}
+      ],
+      "title": "Proxy inflight requests",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["gantry", "benchmark", "acr"],
+  "templating": {
+    "list": [
+      {"current": {"text": "gantry-benchmark", "value": "gantry-benchmark"}, "hide": 0, "label": "Benchmark namespace", "name": "namespace", "options": [{"selected": true, "text": "gantry-benchmark", "value": "gantry-benchmark"}], "query": "gantry-benchmark", "type": "custom"},
+      {"current": {}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "definition": "label_values(origin_requests_completed_total{namespace=\"$namespace\",gantry_benchmark=\"true\"},run_id)", "includeAll": false, "label": "Run ID", "name": "run_id", "query": {"query": "label_values(origin_requests_completed_total{namespace=\"$namespace\",gantry_benchmark=\"true\"},run_id)", "refId": "PrometheusVariableQueryEditor-VariableQuery"}, "refresh": 1, "sort": 2, "type": "query"},
+      {"current": {"text": "gantry-system", "value": "gantry-system"}, "hide": 0, "label": "Gantry namespace", "name": "gantry_namespace", "options": [{"selected": true, "text": "gantry-system", "value": "gantry-system"}], "query": "gantry-system", "type": "custom"}
+    ]
+  },
+  "time": {"from": "now-2h", "to": "now"},
+  "timezone": "browser",
+  "title": "Gantry ACR Benchmark",
+  "uid": "gantry-acr-benchmark",
+  "version": 1
+}
