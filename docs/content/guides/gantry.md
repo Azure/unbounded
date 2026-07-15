@@ -20,30 +20,7 @@ to workloads. Pods continue to use normal OCI image references,
 
 ## Architecture
 
-```mermaid
-flowchart TB
-   subgraph requester["Requester node"]
-      direction LR
-      workload["Workload"] --> containerdA["containerd"]
-      containerdA <-->|"digest request and content"| gantryA["Gantry A"]
-   end
-
-   subgraph peerNetwork["Gantry peer network"]
-      direction LR
-      dht[("libp2p DHT<br/>provider records")]
-      subgraph puller["Selected puller node"]
-         direction LR
-         gantryB["Gantry B"] <--> containerdB[("containerd content store")]
-      end
-   end
-
-   origin[("Origin registry")]
-
-   gantryA <-->|"provider lookup"| dht
-   gantryA <-->|"coordinate pull + auth<br/>stream image content"| gantryB
-   gantryB <-->|"fetch once"| origin
-   containerdA -.->|"direct fallback"| origin
-```
+![Gantry architecture: Requester node with Workload, containerd, and Gantry A; Gantry peer network containing the libp2p DHT and a Selected puller node with Gantry B and its containerd content store; Gantry A looks up providers in the DHT and coordinates pull plus streams image content with Gantry B, which fetches once from the Origin registry, while the requester containerd retains a direct fallback path to the Origin registry](../../img/gantry-architecture.svg)
 
 The DHT contains provider records, not image data. Manifests and layers stream
 directly from the selected Gantry peer, while containerd remains responsible

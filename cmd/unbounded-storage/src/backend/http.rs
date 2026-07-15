@@ -12,8 +12,7 @@
 //!
 //! Origin connections are kept alive when the response has a known,
 //! fully-consumed body and the peer did not ask to close the stream. Idle
-//! sockets stay ring-local so the shard ring and worker-local RPC rings
-//! never share fds.
+//! sockets remain in the backend's shard-local pool.
 //!
 //! ## Address resolution and the `Host` header
 //!
@@ -49,20 +48,15 @@ use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
 use super::limiter::FetchLimiter;
-use super::origin_ring::OriginRing;
 
 /// Origin backend that fetches stripe byte ranges from an HTTP/1.1
 /// origin server (plaintext `http://` or kernel-TLS `https://`) into
 /// bufferpool pages.
 ///
-/// Shard-pinned: the [`OriginRing`] and the raw `backing_base` pointer
-/// are only ever touched on the owning shard thread that built this
-/// backend, OR (for the RPC-handler instance) on the ephemeral
-/// `fabric-rpc-worker` thread that uses an [`OriginRing::WorkerLocal`]
-/// ring private to that thread. Either way a single thread drives any
-/// one ring; see the `unsafe impl Send + Sync` below.
+/// Shard-pinned: the [`NetHandle`] and raw `backing_base` pointer are
+/// only ever touched on the owning shard thread that built this backend.
 pub struct HttpBackend {
-    ring: OriginRing,
+    handle: NetHandle,
     origin: SockAddr,
     /// Authority sent in the `Host:` header (`host` or `host:port`),
     /// derived from the configured endpoint URL.
@@ -81,20 +75,9 @@ pub struct HttpBackend {
     conns: OriginConnPool,
 }
 
-// SAFETY: mirrors `crate::memory::Backing`. `HttpBackend` is
-// shard-pinned: the embedder constructs it on, and only ever drives it
-// from, a single pinned shard thread. The `OriginRing`, any `Rc`/
-// `RefCell` it holds, and the raw `backing_base` pointer are never
-// shared across threads at runtime. The `Send + Sync` marker exists
-// solely to satisfy the `Backend: Send + Sync` bound the embedder
-// requires when it stores the backend in a cross-shard registry; it is
-// not an invitation to touch the backend off its shard.
-unsafe impl Send for HttpBackend {}
-unsafe impl Sync for HttpBackend {}
-
 impl HttpBackend {
     pub fn new(
-        ring: OriginRing,
+        handle: NetHandle,
         origin: SockAddr,
         host: String,
         sni_host: String,
@@ -106,7 +89,7 @@ impl HttpBackend {
         http_concurrency: usize,
     ) -> Self {
         Self {
-            ring,
+            handle,
             origin,
             host,
             sni_host,
@@ -168,8 +151,7 @@ impl HttpBackend {
     /// destination pages are copied into an owned `Vec`, and the ring
     /// handle is owned. That makes the stream `'static`, which is what
     /// lets a [`super::registry::BackendRegistry`] hand out streams from
-    /// a backend it only holds behind an `Arc`/`ArcSwap` (the temporary
-    /// `Arc` guard does not have to outlive the stream).
+    /// a backend it owns through an `Rc` without borrowing the registry.
     pub fn fetch_stream(
         &self,
         req: &StripeReq,
@@ -185,10 +167,7 @@ impl HttpBackend {
         let tls = self.tls.clone();
 
         let dsts_owned = dsts.to_vec();
-        let handle = match self.ring.handle() {
-            Ok(h) => h,
-            Err(e) => return HttpFetchStream::immediate_err(io_to_err(e)),
-        };
+        let handle = self.handle.clone();
         let origin_addr = self.origin;
         let backing_base = self.backing_base;
         let page_size = self.page_size;
@@ -315,14 +294,6 @@ impl<'a> HttpFetchStream<'a> {
     fn immediate_error(msg: &'static str) -> Self {
         Self {
             state: FetchState::Failed(Some(Error::from(msg))),
-            delivered: Vec::new(),
-            next: 0,
-        }
-    }
-
-    fn immediate_err(err: Error) -> Self {
-        Self {
-            state: FetchState::Failed(Some(err)),
             delivered: Vec::new(),
             next: 0,
         }
@@ -527,7 +498,7 @@ async fn fetch(
         leading.len(),
         filled,
     ) {
-        conns.put(&handle, conn);
+        conns.put(conn);
     }
     Ok(())
 }
@@ -599,7 +570,7 @@ async fn fetch_metadata(
     let body = ObjectMetadata::new(length).encode()?;
     copy_body_into_pages(&body, &dsts, backing_base, page_size)?;
     if head_response_reusable(version_minor, connection.as_deref(), header_end, buf.len()) {
-        conns.put(&handle, conn);
+        conns.put(conn);
     }
     Ok(())
 }
@@ -858,13 +829,6 @@ fn format_head_request(path: &str, host: &str) -> Result<Vec<u8>, Error> {
         .body(())
         .map_err(|_| Error::from("http backend: failed to build origin HEAD request"))?;
     Ok(serialize_request(&req))
-}
-
-fn io_to_err(e: std::io::Error) -> Error {
-    match e.raw_os_error() {
-        Some(code) => Error::Io(code),
-        None => Error::transport(e),
-    }
 }
 
 #[cfg(test)]

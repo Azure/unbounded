@@ -13,6 +13,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/machineops"
+	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
 )
 
 const (
@@ -70,16 +71,22 @@ func (p *Provider) Name() string {
 	return unboundedv1alpha3.ExternalProviderOCIInstance
 }
 
-func (p *Provider) Supports(operation unboundedv1alpha3.OperationKind) bool {
-	switch operation {
-	case unboundedv1alpha3.OperationHostReboot,
-		unboundedv1alpha3.OperationHostPowerOff,
-		unboundedv1alpha3.OperationHostPowerOn,
-		unboundedv1alpha3.OperationHostReplace:
-		return true
-	default:
-		return false
-	}
+// Registration returns this OCI adapter's MachineOperation lifecycle
+// registration.
+func (p *Provider) Registration() (*publicmachineops.Provider, error) {
+	return publicmachineops.NewProvider(
+		p.Name(),
+		publicmachineops.WithImmediateOperation(unboundedv1alpha3.OperationHostReboot, p.Execute),
+		publicmachineops.WithImmediateOperation(unboundedv1alpha3.OperationHostPowerOff, p.Execute),
+		publicmachineops.WithImmediateOperation(unboundedv1alpha3.OperationHostPowerOn, p.Execute),
+		publicmachineops.WithImmediateOperation(
+			unboundedv1alpha3.OperationHostReplace,
+			p.Execute,
+			publicmachineops.ReplaySafe(),
+			publicmachineops.RequiresReplaceUserData(),
+			publicmachineops.WithCleanup(p.Cleanup),
+		),
+	)
 }
 
 func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequest) (machineops.OperationResult, error) {
@@ -124,13 +131,8 @@ func (p *Provider) Cleanup(ctx context.Context, request machineops.OperationRequ
 		return fmt.Errorf("parse cleanup OCI providerID: %w", err)
 	}
 
-	if request.Machine != nil {
-		currentInstanceID, err := parseOCIInstanceProviderID(request.Machine.Spec.ProviderID)
-		if err == nil && currentInstanceID == instanceID {
-			// ProviderID handoff must happen before old-instance cleanup; otherwise a
-			// retry could delete the replacement that the Machine still references.
-			return fmt.Errorf("refusing to terminate cleanup target %s because Machine still points to it", result.CleanupProviderID)
-		}
+	if result.ProviderID != "" && result.CleanupProviderID == result.ProviderID {
+		return fmt.Errorf("refusing to terminate cleanup target %s because it is the replacement provider ID", result.CleanupProviderID)
 	}
 
 	client, err := p.client(request.Auth)
