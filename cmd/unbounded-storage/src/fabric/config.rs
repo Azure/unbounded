@@ -93,7 +93,9 @@ pub struct FabricConfig {
     /// to bound idle CPU. Default is 10.
     pub progress_poll_us: u32,
     pub runtime: Arc<dyn Threading>,
-    pub worker_idx: WorkerIdx,
+    /// Runtime workers available to this fabric unit. Progress and RPC
+    /// pools independently distribute their threads over this list.
+    pub worker_indices: Vec<WorkerIdx>,
     pub numa: Option<u16>,
     /// This node's own fabric identity, sent as the connection-manager
     /// private data on every outbound dial so the accepting peer learns
@@ -106,6 +108,9 @@ impl FabricConfig {
     pub fn validate(&self) -> Result<()> {
         if self.progress_threads < 1 {
             return Err(FabricError::BadConfig("progress_threads must be >= 1"));
+        }
+        if self.worker_indices.is_empty() {
+            return Err(FabricError::BadConfig("worker_indices must not be empty"));
         }
         if self.max_inflight == 0 {
             return Err(FabricError::BadConfig("max_inflight must be > 0"));
@@ -131,6 +136,10 @@ impl FabricConfig {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn worker_for_thread(&self, ordinal: usize) -> WorkerIdx {
+        self.worker_indices[ordinal % self.worker_indices.len()]
     }
 }
 
@@ -199,7 +208,7 @@ pub fn defaults_for(
         progress_threads: 2,
         progress_poll_us: 10,
         runtime,
-        worker_idx,
+        worker_indices: vec![worker_idx],
         numa: None,
         self_peer: PeerId(0),
     }
@@ -259,6 +268,22 @@ mod tests {
             Err(FabricError::BadConfig(_)) => {}
             other => panic!("expected BadConfig, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn validate_rejects_empty_worker_list() {
+        let mut c = defaults_for("eth0", rt(), WorkerIdx(0));
+        c.worker_indices.clear();
+        assert!(matches!(c.validate(), Err(FabricError::BadConfig(_))));
+    }
+
+    #[test]
+    fn worker_assignment_round_robins() {
+        let mut c = defaults_for("eth0", rt(), WorkerIdx(0));
+        c.worker_indices = vec![WorkerIdx(3), WorkerIdx(5)];
+        assert_eq!(c.worker_for_thread(0), WorkerIdx(3));
+        assert_eq!(c.worker_for_thread(1), WorkerIdx(5));
+        assert_eq!(c.worker_for_thread(2), WorkerIdx(3));
     }
 
     #[test]
