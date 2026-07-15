@@ -2652,6 +2652,13 @@ func TestResolveFile_NotYetDownloaded(t *testing.T) {
 	}
 }
 
+func TestMetadataForRefArchitecture_NotYetDownloaded(t *testing.T) {
+	cache := NewOCICache(t.TempDir())
+
+	_, err := cache.MetadataForRefArchitecture("ghcr.io/test/missing:v1", "amd64")
+	require.ErrorIs(t, err, ErrNotYetDownloaded)
+}
+
 func TestHTTPServer_DisablePXE(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "pxe-node"},
