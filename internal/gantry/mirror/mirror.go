@@ -1837,6 +1837,17 @@ func (s *Server) filterProvidersForDigest(d digest.Digest, providers []ifaces.Pr
 		filtered = append(filtered, p)
 	}
 
+	// Shuffle so each requester tries the surviving providers in a random
+	// order. Without this, every node walks the DHT/cold-start provider list
+	// in the same order and piles onto whichever seed sorts first, re-creating
+	// a single-seed hotspot even when the layer is seeded on N pullers
+	// (prefetch_puller_replicas) and finishers have joined the provider set.
+	// Randomizing spreads the maxPeerAttempts fetches across the available
+	// seeds, which is what turns the N initial seeds into an even fan-out.
+	rand.Shuffle(len(filtered), func(i, j int) {
+		filtered[i], filtered[j] = filtered[j], filtered[i]
+	})
+
 	return filtered, summary
 }
 
