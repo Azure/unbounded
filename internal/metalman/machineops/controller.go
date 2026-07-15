@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
 )
 
@@ -716,6 +717,12 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 
 	if machine.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
 		if _, _, err := r.httpBootConfig(machine); err != nil {
+			if errors.Is(err, netboot.ErrNotYetDownloaded) {
+				target.Message = "waiting for OCI image to become available"
+
+				return targetChange{target: target}
+			}
+
 			return retryTarget(target, err, now, r.maxAttempts())
 		}
 	}

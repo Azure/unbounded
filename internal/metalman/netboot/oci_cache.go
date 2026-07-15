@@ -168,7 +168,7 @@ func (c *OCICache) MetadataForRef(imageRef string) (*ImageMetadata, error) {
 func (c *OCICache) MetadataForRefArchitecture(imageRef, architecture string) (*ImageMetadata, error) {
 	digest := c.DigestForArchitecture(imageRef, architecture)
 	if digest == "" {
-		return nil, fmt.Errorf("image %q for architecture %q not yet pulled", imageRef, normalizeArchitecture(architecture))
+		return nil, fmt.Errorf("%w: image %q for architecture %q not yet pulled", ErrNotYetDownloaded, imageRef, normalizeArchitecture(architecture))
 	}
 
 	return c.MetadataForArchitecture(digest, architecture)
