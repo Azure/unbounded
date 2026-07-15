@@ -102,6 +102,7 @@ pub async fn write_inactive<B: BlockDevice>(
     new_txn_id: u64,
     new_root: Lba,
     new_hwm: u64,
+    durable: bool,
 ) -> Result<MetaSlot, Error> {
     let target = current_active.other();
     let ps = device.page_size();
@@ -110,6 +111,6 @@ pub async fn write_inactive<B: BlockDevice>(
     let slice = page.as_mut_slice();
     debug_assert_eq!(slice.len(), encoded.len());
     slice.copy_from_slice(&encoded);
-    device.write(target.lba(), slice).await?;
+    device.write(target.lba(), slice, durable).await?;
     Ok(target)
 }

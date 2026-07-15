@@ -71,7 +71,14 @@ pub trait BlockDevice {
     /// be a positive multiple of `page_size`; the write spans
     /// `src.len() / page_size` consecutive LBAs. Same error
     /// semantics as [`BlockDevice::read`].
-    async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), Error>;
+    ///
+    /// When `durable` is set, the write must not resolve `Ok` until
+    /// the bytes are on stable media (past any volatile drive
+    /// cache). The io_uring backend issues it as an `RWF_DSYNC`
+    /// data-integrity write; mocks record the flag. Non-durable
+    /// writes may still be sitting in a volatile cache when they
+    /// resolve.
+    async fn write(&self, lba: Lba, src: &[u8], durable: bool) -> Result<(), Error>;
 
     /// Drive any submitted-but-not-yet-completed I/O forward. The
     /// io_uring backend pushes queued SQEs to the kernel and reaps

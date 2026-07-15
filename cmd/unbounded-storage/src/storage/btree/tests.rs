@@ -103,7 +103,7 @@ fn insert_then_lookup() {
             value: entry(200),
         },
     ];
-    block_on(idx.apply_batch(muts)).unwrap();
+    block_on(idx.apply_batch(muts, true)).unwrap();
     assert_eq!(block_on(idx.lookup(&key(1))).unwrap(), Some(entry(100)));
     assert_eq!(block_on(idx.lookup(&key(2))).unwrap(), Some(entry(200)));
     assert_eq!(block_on(idx.lookup(&key(3))).unwrap(), None);
@@ -116,9 +116,9 @@ fn delete_removes_entry() {
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(1),
         value: entry(100),
-    }]))
+    }], true))
     .unwrap();
-    block_on(idx.apply_batch(vec![Mutation::Delete { key: key(1) }])).unwrap();
+    block_on(idx.apply_batch(vec![Mutation::Delete { key: key(1) }], true)).unwrap();
     assert_eq!(block_on(idx.lookup(&key(1))).unwrap(), None);
 }
 
@@ -134,7 +134,7 @@ fn large_batch_spans_multiple_leaves() {
             value: entry(1000 + i as u64),
         })
         .collect();
-    block_on(idx.apply_batch(muts)).unwrap();
+    block_on(idx.apply_batch(muts, true)).unwrap();
     for i in 0..200u32 {
         assert_eq!(
             block_on(idx.lookup(&key(i))).unwrap(),
@@ -154,7 +154,7 @@ fn restart_from_meta_restores_entries() {
             block_on(idx.apply_batch(vec![Mutation::Insert {
                 key: key(i),
                 value: entry(i as u64 * 10),
-            }]))
+            }], true))
             .unwrap();
         }
     }
@@ -179,7 +179,7 @@ fn force_format_ignores_existing_meta() {
         block_on(idx.apply_batch(vec![Mutation::Insert {
             key: key(1),
             value: entry(11),
-        }]))
+        }], true))
         .unwrap();
     }
 
@@ -198,7 +198,7 @@ fn lookup_uses_committed_mirror_without_leaf_io() {
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(1),
         value: entry(11),
-    }]))
+    }], true))
     .unwrap();
     let reads_after_commit = dev.reads();
 
@@ -218,7 +218,7 @@ fn skip_recovery_scan_does_not_ignore_existing_meta() {
         block_on(idx.apply_batch(vec![Mutation::Insert {
             key: key(1),
             value: entry(11),
-        }]))
+        }], true))
         .unwrap();
     }
 
@@ -238,12 +238,12 @@ fn restart_picks_highest_txn_meta() {
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(1),
         value: entry(11),
-    }]))
+    }], true))
     .unwrap();
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(2),
         value: entry(22),
-    }]))
+    }], true))
     .unwrap();
     let txn = idx.current_txn();
     drop(idx);
@@ -262,12 +262,12 @@ fn corrupted_active_meta_falls_back_to_other_slot() {
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(1),
         value: entry(11),
-    }]))
+    }], true))
     .unwrap();
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(2),
         value: entry(22),
-    }]))
+    }], true))
     .unwrap();
     let active_slot = idx.active_meta_slot();
     drop(idx);
@@ -305,7 +305,7 @@ fn double_corrupted_meta_triggers_lba_scan_rebuild() {
             key: key(3),
             value: entry(33),
         },
-    ]))
+    ], true))
     .unwrap();
     drop(idx);
 
@@ -333,7 +333,7 @@ fn snapshot_drop_frees_old_pages() {
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(1),
         value: entry(11),
-    }]))
+    }], true))
     .unwrap();
     let used_after_first = alloc.used_pages();
     assert!(
@@ -343,7 +343,7 @@ fn snapshot_drop_frees_old_pages() {
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(2),
         value: entry(22),
-    }]))
+    }], true))
     .unwrap();
     // After the second commit the new snapshot is the only
     // strong ref (no `Guard`s outstanding) so the old snapshot's
@@ -408,7 +408,7 @@ fn hwm_grows_with_commits() {
             value: entry(1000 + i as u64),
         })
         .collect();
-    block_on(idx.apply_batch(muts)).unwrap();
+    block_on(idx.apply_batch(muts, true)).unwrap();
     let root = idx.current_root();
     let (_txn, _root_meta, hwm) = read_live_meta(&dev).expect("post-commit meta must decode");
     assert!(
@@ -434,7 +434,7 @@ fn hwm_monotonic_across_reopen() {
                 key: key(2),
                 value: entry(22),
             },
-        ]))
+        ], true))
         .unwrap();
     }
     let (_t1, _r1, hwm_before) = read_live_meta(&dev).expect("post-first-commit meta");
@@ -444,7 +444,7 @@ fn hwm_monotonic_across_reopen() {
     block_on(idx2.apply_batch(vec![Mutation::Insert {
         key: key(3),
         value: entry(33),
-    }]))
+    }], true))
     .unwrap();
     let (_t2, _r2, hwm_after) = read_live_meta(&dev).expect("post-second-commit meta");
     assert!(
@@ -467,7 +467,7 @@ fn reopen_seeds_allocator_hwm() {
                 value: entry(2000 + i as u64),
             })
             .collect();
-        block_on(idx.apply_batch(muts)).unwrap();
+        block_on(idx.apply_batch(muts, true)).unwrap();
     }
     let (_t, _r, persisted_hwm) = read_live_meta(&dev).expect("post-commit meta must decode");
 
@@ -484,7 +484,7 @@ fn reopen_seeds_allocator_hwm() {
     block_on(idx2.apply_batch(vec![Mutation::Insert {
         key: key(999),
         value: entry(9999),
-    }]))
+    }], true))
     .unwrap();
     let (_t2, _r2, hwm_after) = read_live_meta(&dev).expect("post-reopen-commit meta");
     assert!(
@@ -521,7 +521,7 @@ fn reopen_marks_full_data_run_in_use() {
         block_on(idx.apply_batch(vec![Mutation::Insert {
             key: key(1),
             value: leaf_entry,
-        }]))
+        }], true))
         .unwrap();
     }
 
@@ -566,7 +566,7 @@ fn apply_batch_empty_is_noop() {
     let txn_before = idx.current_txn();
     let root_before = idx.current_root();
     let used_before = alloc.used_pages();
-    block_on(idx.apply_batch(Vec::new())).unwrap();
+    block_on(idx.apply_batch(Vec::new(), true)).unwrap();
     assert_eq!(idx.current_txn(), txn_before, "empty batch bumped txn");
     assert_eq!(idx.current_root(), root_before, "empty batch rotated root");
     assert_eq!(
@@ -592,7 +592,7 @@ fn many_commits_to_small_keyset_bounds_allocator_growth() {
             value: entry(i as u64),
         })
         .collect();
-    block_on(idx.apply_batch(seed)).unwrap();
+    block_on(idx.apply_batch(seed, true)).unwrap();
     let used_after_seed = alloc.used_pages();
     // Many commits, each touching one key. Each commit retires
     // the previous spine; on the next commit the published
@@ -601,7 +601,7 @@ fn many_commits_to_small_keyset_bounds_allocator_growth() {
         block_on(idx.apply_batch(vec![Mutation::Insert {
             key: key(round % 8),
             value: entry((round as u64) + 1000),
-        }]))
+        }], true))
         .unwrap();
     }
     let used_after_many = alloc.used_pages();
@@ -637,7 +637,7 @@ fn outstanding_snapshot_pins_retired_pages_until_drop() {
                     key: key(i),
                     value: entry(i as u64),
                 })
-                .collect(),
+                .collect(), true,
         ),
     )
     .unwrap();
@@ -654,7 +654,7 @@ fn outstanding_snapshot_pins_retired_pages_until_drop() {
         block_on(idx.apply_batch(vec![Mutation::Insert {
             key: key(round % 16),
             value: entry((round as u64) + 500),
-        }]))
+        }], true))
         .unwrap();
     }
     // Pinned snapshot must still be in the alive set: a commit
@@ -703,7 +703,7 @@ fn overwrites_and_deletes_path_copy_consistent() {
                     key: key(i),
                     value: entry(i as u64),
                 })
-                .collect(),
+                .collect(), true,
         ),
     )
     .unwrap();
@@ -719,7 +719,7 @@ fn overwrites_and_deletes_path_copy_consistent() {
             });
         }
     }
-    block_on(idx.apply_batch(muts)).unwrap();
+    block_on(idx.apply_batch(muts, true)).unwrap();
     for i in 0..32u32 {
         let got = block_on(idx.lookup(&key(i))).unwrap();
         if i % 5 == 0 {
@@ -748,7 +748,7 @@ fn overwrites_and_deletes_path_copy_consistent() {
             value: entry((i as u64) + 99_000),
         })
         .collect();
-    block_on(idx.apply_batch(muts)).unwrap();
+    block_on(idx.apply_batch(muts, true)).unwrap();
     for i in (0..32u32).step_by(5) {
         assert_eq!(
             block_on(idx.lookup(&key(i))).unwrap(),
@@ -863,7 +863,12 @@ impl BlockDevice for GateDevice {
         self.inner.read(lba, dst).await
     }
 
-    async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), crate::storage::types::Error> {
+    async fn write(
+        &self,
+        lba: Lba,
+        src: &[u8],
+        durable: bool,
+    ) -> Result<(), crate::storage::types::Error> {
         let seq = self.writes.get() + 1;
         self.writes.set(seq);
         let n = self.inflight.get() + 1;
@@ -877,7 +882,7 @@ impl BlockDevice for GateDevice {
         let res = if self.fail_at.get() == Some(seq) {
             Err(crate::storage::types::Error::Io(5))
         } else {
-            self.inner.write(lba, src).await
+            self.inner.write(lba, src, durable).await
         };
         self.inflight.set(self.inflight.get() - 1);
         res
@@ -931,7 +936,7 @@ fn commit_writes_independent_pages_concurrently() {
             value: entry(1000 + i as u64),
         })
         .collect();
-    block_on(idx.apply_batch(muts)).unwrap();
+    block_on(idx.apply_batch(muts, true)).unwrap();
     assert!(
         dev.max_inflight() >= 2,
         "expected >1 btree page write in flight within one commit, got {}",
@@ -959,7 +964,7 @@ fn failed_write_mid_commit_unwinds_and_preserves_tree() {
                     key: key(i),
                     value: entry(i as u64),
                 })
-                .collect(),
+                .collect(), true,
         ),
     )
     .unwrap();
@@ -976,7 +981,7 @@ fn failed_write_mid_commit_unwinds_and_preserves_tree() {
             value: entry(i as u64),
         })
         .collect();
-    let res = block_on(idx.apply_batch(muts));
+    let res = block_on(idx.apply_batch(muts, true));
     assert!(res.is_err(), "commit must surface the device write error");
 
     // The committed tree is untouched: same txn, same root, no
@@ -1023,7 +1028,7 @@ fn failed_write_mid_commit_unwinds_and_preserves_tree() {
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(500),
         value: entry(500),
-    }]))
+    }], true))
     .unwrap();
     assert_eq!(block_on(idx.lookup(&key(500))).unwrap(), Some(entry(500)));
 }
@@ -1048,7 +1053,7 @@ fn path_copy_writes_sibling_subtrees_concurrently() {
                     key: key(i),
                     value: entry(i as u64),
                 })
-                .collect(),
+                .collect(), true,
         ),
     )
     .unwrap();
@@ -1073,7 +1078,7 @@ fn path_copy_writes_sibling_subtrees_concurrently() {
             key: key(160),
             value: entry(9160),
         },
-    ]))
+    ], true))
     .unwrap();
 
     assert!(
@@ -1121,7 +1126,7 @@ fn commit_drains_in_waves_under_undersized_scratch_pool() {
                     key: key(i),
                     value: entry(i as u64),
                 })
-                .collect(),
+                .collect(), true,
         ),
     )
     .unwrap();

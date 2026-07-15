@@ -321,6 +321,12 @@ pub struct RunReport {
     pub device_pages: u64,
     pub device_reads: u64,
     pub device_writes: u64,
+    /// Count of device writes issued with the durability (RWF_DSYNC /
+    /// FUA) flag set. The storage-DST workload issues every
+    /// `write_page` through a `StripeKey` request, whose `Req::durable`
+    /// defaults to true, so every data-page and btree/meta write must
+    /// be durable: `device_durable_writes == device_writes`.
+    pub device_durable_writes: u64,
     pub device_io_errors: u64,
     /// Count of times the sim device flipped a byte after a
     /// successful inner read. Visible in reports so invariants can
@@ -477,6 +483,7 @@ struct EngineAggregate {
 struct DeviceAggregate {
     reads: u64,
     writes: u64,
+    durable_writes: u64,
     io_errors: u64,
     corruptions_injected: u64,
     writes_per_disk: Vec<u64>,
@@ -490,6 +497,7 @@ fn aggregate_devices(devices: &[Arc<SimBlockDevice>]) -> DeviceAggregate {
     for d in devices {
         agg.reads += d.reads();
         agg.writes += d.writes();
+        agg.durable_writes += d.durable_writes();
         agg.io_errors += d.io_errors();
         agg.corruptions_injected += d.corruptions_injected();
         agg.writes_per_disk.push(d.writes());
@@ -964,6 +972,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         device_pages: w.device_pages,
         device_reads: dev_agg.reads,
         device_writes: dev_agg.writes,
+        device_durable_writes: dev_agg.durable_writes,
         device_io_errors: dev_agg.io_errors,
         device_corruptions_injected: dev_agg.corruptions_injected,
         device_writes_per_disk: dev_agg.writes_per_disk,

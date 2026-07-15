@@ -117,6 +117,7 @@ struct TestReq {
     key: StripeKey,
     bypass: bool,
     cache_id: Option<String>,
+    durable: bool,
 }
 
 impl Req for TestReq {
@@ -131,6 +132,10 @@ impl Req for TestReq {
     fn cache_id(&self) -> Option<&String> {
         self.cache_id.as_ref()
     }
+
+    fn durable(&self) -> bool {
+        self.durable
+    }
 }
 
 impl TestReq {
@@ -139,6 +144,19 @@ impl TestReq {
             key,
             bypass: false,
             cache_id: None,
+            durable: true,
+        }
+    }
+
+    /// An ephemeral (best-effort tee) request: the leader publishes
+    /// the page before the writeback lands, so subscribers can consume
+    /// concurrently with the tee.
+    fn ephemeral(key: StripeKey) -> Self {
+        Self {
+            key,
+            bypass: false,
+            cache_id: None,
+            durable: false,
         }
     }
 
@@ -147,6 +165,7 @@ impl TestReq {
             key,
             bypass: true,
             cache_id: None,
+            durable: true,
         }
     }
 
@@ -155,6 +174,7 @@ impl TestReq {
             key,
             bypass: false,
             cache_id: Some(cache_id.to_string()),
+            durable: true,
         }
     }
 }
@@ -335,6 +355,8 @@ struct MockBlockStore {
     writes: RefCell<u32>,
     /// `write_page` pends this many polls before completing.
     write_pend_polls: RefCell<usize>,
+    /// When true, `write_page` returns an error instead of persisting.
+    write_fail: RefCell<bool>,
     page_cache_enabled: RefCell<HashMap<Option<String>, bool>>,
     base: RefCell<Option<*mut u8>>,
     page_size: RefCell<usize>,
@@ -347,6 +369,7 @@ impl MockBlockStore {
             reads: RefCell::new(0),
             writes: RefCell::new(0),
             write_pend_polls: RefCell::new(0),
+            write_fail: RefCell::new(false),
             page_cache_enabled: RefCell::new(HashMap::new()),
             base: RefCell::new(None),
             page_size: RefCell::new(0),
@@ -367,6 +390,10 @@ impl MockBlockStore {
 
     fn set_write_pend_polls(&self, n: usize) {
         *self.write_pend_polls.borrow_mut() = n;
+    }
+
+    fn set_write_fail(&self, fail: bool) {
+        *self.write_fail.borrow_mut() = fail;
     }
 
     fn set_page_cache_enabled(&self, enabled: bool) {
@@ -421,6 +448,9 @@ impl BlockStore for MockBlockStore {
             PendOnce { fired: false }.await;
         }
         *self.write_pend_polls.borrow_mut() = 0;
+        if *self.write_fail.borrow() {
+            return Err(Error::from("forced write failure"));
+        }
         *self.writes.borrow_mut() += 1;
         let base = self.base.borrow().expect("registered");
         let page_size = *self.page_size.borrow();
@@ -1220,8 +1250,8 @@ fn non_leader_consumes_concurrently_with_tee() {
     transport.put_stripe(k, stripe.clone());
     store.set_write_pend_polls(8);
 
-    let req1 = TestReq::new(k);
-    let req2 = TestReq::new(k);
+    let req1 = TestReq::ephemeral(k);
+    let req2 = TestReq::ephemeral(k);
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -1279,8 +1309,8 @@ fn page_pinned_across_tee_until_subscriber_drops() {
     transport.put_stripe(k, vec![0xAAu8; P]);
     store.set_write_pend_polls(4);
 
-    let req1 = TestReq::new(k);
-    let req2 = TestReq::new(k);
+    let req1 = TestReq::ephemeral(k);
+    let req2 = TestReq::ephemeral(k);
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -1332,6 +1362,118 @@ fn page_pinned_across_tee_until_subscriber_drops() {
     assert_eq!(v1, vec![0xAAu8; P]);
     assert_eq!(store.writes(), 1);
     assert_quiescent(&pool, 1, "tee subscriber drop");
+}
+
+#[test]
+fn durable_leader_publishes_ready_only_after_tee() {
+    // Durable request (the default): the leader must persist the tee
+    // to stable media BEFORE publishing Ready, so a coalesced
+    // subscriber cannot observe the page until the durable write has
+    // landed. This is the inverse of
+    // non_leader_consumes_concurrently_with_tee, which uses an
+    // ephemeral request and lets the subscriber race the tee.
+    const P: usize = 4096;
+    let (pool, transport, store) = make_pool_v2(P, 4);
+    let k = key(0xD1);
+    let mut stripe = vec![0u8; P];
+    for (i, b) in stripe.iter_mut().enumerate() {
+        *b = (i & 0xff) as u8;
+    }
+    transport.put_stripe(k, stripe.clone());
+    store.set_write_pend_polls(8);
+
+    let req1 = TestReq::new(k);
+    let req2 = TestReq::new(k);
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let f1 = async {
+        let mut s = pool.read(&req1, 0, P as u64).await.unwrap();
+        s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+    };
+    let f2 = async {
+        let mut s = pool.read(&req2, 0, P as u64).await.unwrap();
+        s.next_page().await.unwrap().unwrap().as_slice().to_vec()
+    };
+    let mut f1 = pin!(f1);
+    let mut f2 = pin!(f2);
+
+    // While the durable tee is still pending, NEITHER reader may
+    // complete: the leader has not published Ready. Only the leader
+    // (polled first) drives the pending write_page forward, so a few
+    // rounds keep the write from completing.
+    for _ in 0..4 {
+        let p1 = f1.as_mut().poll(&mut cx);
+        let p2 = f2.as_mut().poll(&mut cx);
+        assert_eq!(store.writes(), 0, "durable tee completed too early");
+        assert!(p1.is_pending(), "durable leader published before tee landed");
+        assert!(p2.is_pending(), "durable subscriber woke before tee landed");
+    }
+
+    // Drive to completion; both observe the page only after the
+    // durable write has landed.
+    let mut o1: Option<Vec<u8>> = None;
+    let mut o2: Option<Vec<u8>> = None;
+    let mut spins = 0u64;
+    while o1.is_none() || o2.is_none() {
+        if o1.is_none()
+            && let Poll::Ready(v) = f1.as_mut().poll(&mut cx)
+        {
+            assert_eq!(store.writes(), 1, "leader saw page before durable tee");
+            o1 = Some(v);
+        }
+        if o2.is_none()
+            && let Poll::Ready(v) = f2.as_mut().poll(&mut cx)
+        {
+            assert_eq!(store.writes(), 1, "subscriber saw page before durable tee");
+            o2 = Some(v);
+        }
+        spins += 1;
+        assert!(spins < 1_000_000, "durable readers stuck");
+    }
+    assert_eq!(o1.unwrap(), stripe);
+    assert_eq!(o2.unwrap(), stripe);
+    assert_eq!(store.writes(), 1);
+    assert_eq!(transport.calls(), 1);
+    assert_quiescent(&pool, 4, "durable tee");
+}
+
+#[test]
+fn durable_tee_failure_fails_read() {
+    // A durable read whose writeback tee fails must surface the error
+    // rather than serving a page that never reached stable media.
+    const P: usize = 4096;
+    let (pool, transport, store) = make_pool_v2(P, 4);
+    let k = key(0xD2);
+    transport.put_stripe(k, vec![0x5Au8; P]);
+    store.set_write_fail(true);
+
+    let req = TestReq::new(k);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let f = async {
+        let mut s = pool.read(&req, 0, P as u64).await?;
+        match s.next_page().await {
+            Some(r) => r.map(|_| ()),
+            None => Ok(()),
+        }
+    };
+    let mut f = pin!(f);
+    let r = loop {
+        if let Poll::Ready(r) = f.as_mut().poll(&mut cx) {
+            break r;
+        }
+    };
+    assert!(
+        matches!(r, Err(Error::Transport(_))),
+        "durable tee failure must fail the read, got {r:?}"
+    );
+    // The failed write never persisted, and the pool recycled the
+    // page rather than caching a non-durable copy.
+    assert_eq!(store.writes(), 0);
+    assert_quiescent(&pool, 4, "durable tee failure");
 }
 
 #[test]

@@ -323,6 +323,7 @@ pub async fn build_tree<B: BlockDevice>(
     allocator: &Allocator,
     txn_id: u64,
     sorted_entries: &[(PageKey, LeafEntry)],
+    durable: bool,
 ) -> Result<(Lba, Vec<Lba>), Error> {
     let mut allocated = Vec::new();
     match build_tree_inner(
@@ -332,6 +333,7 @@ pub async fn build_tree<B: BlockDevice>(
         txn_id,
         sorted_entries,
         &mut allocated,
+        durable,
     )
     .await
     {
@@ -350,6 +352,7 @@ async fn build_tree_inner<B: BlockDevice>(
     txn_id: u64,
     sorted_entries: &[(PageKey, LeafEntry)],
     allocated: &mut Vec<Lba>,
+    durable: bool,
 ) -> Result<Lba, Error> {
     let ps = device.page_size();
     let leaf_cap = max_leaf_entries(ps);
@@ -361,7 +364,7 @@ async fn build_tree_inner<B: BlockDevice>(
         let lba = allocator.alloc()?;
         allocated.push(lba);
         let page = page::encode_empty_leaf(ps, txn_id);
-        write_page(device, scratch, lba, &page).await?;
+        write_page(device, scratch, lba, &page, durable).await?;
         return Ok(lba);
     }
 
@@ -379,7 +382,7 @@ async fn build_tree_inner<B: BlockDevice>(
         current.push((chunk[0].0, lba));
         pages.push((lba, page));
     }
-    write_pages_concurrent(device, scratch, &pages).await?;
+    write_pages_concurrent(device, scratch, &pages, durable).await?;
 
     while current.len() > 1 {
         let mut next: Vec<(PageKey, Lba)> =
@@ -394,7 +397,7 @@ async fn build_tree_inner<B: BlockDevice>(
             next.push((chunk[0].0, lba));
             pages.push((lba, page));
         }
-        write_pages_concurrent(device, scratch, &pages).await?;
+        write_pages_concurrent(device, scratch, &pages, durable).await?;
         current = next;
     }
 
@@ -432,6 +435,7 @@ pub async fn apply_path_copy<B: BlockDevice>(
     parent_root: Lba,
     txn_id: u64,
     sorted_ops: Vec<(PageKey, Option<LeafEntry>)>,
+    durable: bool,
 ) -> Result<PathCopyResult, Error> {
     let ps = device.page_size();
     let ctx = PathCopyCtx {
@@ -444,6 +448,7 @@ pub async fn apply_path_copy<B: BlockDevice>(
         leaf_cap: max_leaf_entries(ps),
         internal_cap: max_internal_keys(ps),
         page_size: ps,
+        durable,
     };
     debug_assert!(ctx.leaf_cap >= 1);
     debug_assert!(ctx.internal_cap >= 2);
@@ -479,7 +484,7 @@ async fn apply_path_copy_inner<B: BlockDevice>(
         let lba = ctx.allocator.alloc()?;
         ctx.new_pages.borrow_mut().push(lba);
         let page = page::encode_empty_leaf(ctx.page_size, ctx.txn_id);
-        write_page(ctx.device, ctx.scratch, lba, &page).await?;
+        write_page(ctx.device, ctx.scratch, lba, &page, ctx.durable).await?;
         return Ok(lba);
     }
 
@@ -520,6 +525,7 @@ struct PathCopyCtx<'a, B: BlockDevice> {
     leaf_cap: usize,
     internal_cap: usize,
     page_size: usize,
+    durable: bool,
 }
 
 impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
@@ -664,7 +670,7 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
             out.push((chunk[0].0, lba));
             pages.push((lba, page));
         }
-        write_pages_concurrent(self.device, self.scratch, &pages).await?;
+        write_pages_concurrent(self.device, self.scratch, &pages, self.durable).await?;
         Ok(out)
     }
 
@@ -699,7 +705,7 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
             out.push((chunk[0].0, lba));
             pages.push((lba, page));
         }
-        write_pages_concurrent(self.device, self.scratch, &pages).await?;
+        write_pages_concurrent(self.device, self.scratch, &pages, self.durable).await?;
         Ok(out)
     }
 }
@@ -770,12 +776,13 @@ async fn write_page<B: BlockDevice>(
     scratch: &Rc<ScratchPool>,
     lba: Lba,
     page: &[u8],
+    durable: bool,
 ) -> Result<(), Error> {
     let mut buf = scratch.acquire().await;
     let slice = buf.as_mut_slice();
     debug_assert_eq!(slice.len(), page.len());
     slice.copy_from_slice(page);
-    device.write(lba, slice).await
+    device.write(lba, slice, durable).await
 }
 
 /// Submit every `(lba, encoded_page)` write concurrently and wait
@@ -792,6 +799,7 @@ async fn write_pages_concurrent<B: BlockDevice>(
     device: &B,
     scratch: &Rc<ScratchPool>,
     pages: &[(Lba, Vec<u8>)],
+    durable: bool,
 ) -> Result<(), Error> {
     if pages.is_empty() {
         return Ok(());
@@ -799,7 +807,7 @@ async fn write_pages_concurrent<B: BlockDevice>(
     let futs: Vec<WriteFut<'_>> = pages
         .iter()
         .map(|(lba, page)| {
-            Box::pin(write_page(device, scratch, *lba, page.as_slice())) as WriteFut<'_>
+            Box::pin(write_page(device, scratch, *lba, page.as_slice(), durable)) as WriteFut<'_>
         })
         .collect();
     let mut first_err: Option<Error> = None;

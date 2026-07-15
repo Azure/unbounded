@@ -1281,15 +1281,63 @@ where
                     }
                 };
 
-                // Phase 2: mark Ready and wake parked subscribers
-                // BEFORE running the tee, so non-leader subscribers
-                // can consume bytes concurrently with the leader's
-                // `write_page` (matches designs/bufferpool.md
-                // "Pull-through with tee"). The page stays pinned
-                // across the tee via `tee_pending` plus the
-                // leader's `ConsumerHold`.
+                // Phase 2: publish the page and drive the tee. The
+                // ordering depends on durability, which is a
+                // per-cache property: because a stripe key is derived
+                // from its cache namespace, every request coalescing
+                // on this slot shares the same `durable()` value, so
+                // the leader's flag speaks for all participants.
+                //
                 // A bypass request never admits to the disk cache.
                 let need_tee = !hit && !req.as_ref().bypass() && !req.as_ref().skip_local_disk();
+                let durable = req.as_ref().durable();
+
+                if need_tee && durable {
+                    // Durable miss: run the writeback tee to stable
+                    // media BEFORE publishing `Ready`. Parked
+                    // subscribers stay in `Loading` until the tee
+                    // lands, so any consumer that observes `Ready` is
+                    // guaranteed the page (and its btree commit) is
+                    // durable. A failed durable write fails the
+                    // triggering read (and every coalesced reader)
+                    // rather than silently serving a non-durable page.
+                    slot.tee_pending.set(true);
+                    let tee_res = {
+                        let _tee_pending_guard = TeePendingGuard { slot: &slot };
+                        inner
+                            .blockstore
+                            .write_page(req.as_ref(), stripe_off, dst)
+                            .await
+                    };
+                    let wakers = take_loading_wakers(&slot);
+                    match &tee_res {
+                        Ok(()) => *slot.state.borrow_mut() = SlotState::Ready,
+                        Err(e) => *slot.state.borrow_mut() = SlotState::Error(e.clone()),
+                    }
+                    leader_guard.completed = true;
+                    drop(leader_guard);
+                    for w in wakers {
+                        w.wake();
+                    }
+                    match tee_res {
+                        Ok(()) => {
+                            leader_hold.forget();
+                            return Ok(pi);
+                        }
+                        // `leader_hold` drops at the `return`,
+                        // recycling the page since the durable write
+                        // did not land; a later read re-fetches.
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                // Ephemeral (or hit / no-tee): mark Ready and wake
+                // parked subscribers BEFORE running the tee, so
+                // non-leader subscribers can consume bytes concurrently
+                // with the leader's best-effort `write_page` (matches
+                // designs/bufferpool.md "Pull-through with tee"). The
+                // page stays pinned across the tee via `tee_pending`
+                // plus the leader's `ConsumerHold`.
                 if need_tee {
                     slot.tee_pending.set(true);
                 }
@@ -1301,12 +1349,13 @@ where
                     w.wake();
                 }
 
-                // Phase 3: leader drives the tee. If the leader's
-                // future is dropped here, `TeePendingGuard` clears
-                // `tee_pending` first, then `leader_hold` drops and
-                // runs the same recycle path as `release_guard`.
-                // `write_page` errors are best-effort for v1 (see
-                // designs/bufferpool.md TODO(partial-failure)).
+                // The leader drives the best-effort tee. If the
+                // leader's future is dropped here, `TeePendingGuard`
+                // clears `tee_pending` first, then `leader_hold` drops
+                // and runs the same recycle path as `release_guard`.
+                // `write_page` errors are best-effort for ephemeral
+                // caches (see designs/bufferpool.md
+                // TODO(partial-failure)).
                 if need_tee {
                     let _tee_pending_guard = TeePendingGuard { slot: &slot };
                     let _ = inner

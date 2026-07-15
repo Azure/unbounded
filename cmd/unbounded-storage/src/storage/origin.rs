@@ -174,6 +174,16 @@ pub struct StripeReq {
     /// isolate remote RAM/backend + RDMA behavior without falling back to
     /// either node's disk cache.
     skip_local_disk: bool,
+    /// Local-only durability flag. Never serialized (like `bypass`):
+    /// v1 honors durability only on the node that originates the
+    /// request, so a request decoded from a peer defaults to
+    /// best-effort (`false`). When `true`, the writeback tee on a
+    /// miss is issued with data-integrity (FUA) writes and the pool
+    /// blocks the read until the page and its btree commit are on
+    /// stable media. Defaults to `true` for locally built requests
+    /// (durable by default); ephemeral caches set it to `false`.
+    #[serde(skip)]
+    durable: bool,
 }
 
 impl StripeReq {
@@ -187,6 +197,7 @@ impl StripeReq {
             bypass: false,
             fabric_only: false,
             skip_local_disk: false,
+            durable: true,
         }
     }
 
@@ -222,6 +233,21 @@ impl StripeReq {
     /// Mark the request to skip the initiator's local disk cache.
     pub fn with_skip_local_disk(mut self, skip_local_disk: bool) -> Self {
         self.skip_local_disk = skip_local_disk;
+        self
+    }
+
+    /// Set whether the writeback tee for this request must be durable
+    /// (FUA + block-until-persisted). See [`Req::durable`].
+    pub fn with_durable(mut self, durable: bool) -> Self {
+        self.durable = durable;
+        self
+    }
+
+    /// Convenience inverse of [`Self::with_durable`]: an ephemeral
+    /// request does not block on a durable tee. `with_ephemeral(true)`
+    /// is equivalent to `with_durable(false)`.
+    pub fn with_ephemeral(mut self, ephemeral: bool) -> Self {
+        self.durable = !ephemeral;
         self
     }
 
@@ -263,6 +289,10 @@ impl Req for StripeReq {
 
     fn skip_local_disk(&self) -> bool {
         self.skip_local_disk
+    }
+
+    fn durable(&self) -> bool {
+        self.durable
     }
 }
 
@@ -536,10 +566,32 @@ mod tests {
     }
 
     #[test]
+    fn stripe_req_durable_is_not_serialized() {
+        // `durable` is `#[serde(skip)]`: durability is a local-disk
+        // property that never crosses the fabric in v1, so a request
+        // decoded from the wire is always best-effort (non-durable)
+        // even when the local request opted into durability. `new()`
+        // defaults to durable; the wire default is `false`.
+        assert!(StripeReq::new(StripeKey([0u8; 32])).durable());
+        let origin = OriginRef::new("primary-s3", "models/llama.bin", 7);
+        let req = StripeReq::new(origin.stripe_key())
+            .with_origin(origin)
+            .with_durable(true);
+        let bytes = bincode::serialize(&req).unwrap();
+        let back: StripeReq = bincode::deserialize(&bytes).unwrap();
+        assert!(!back.durable());
+        // `with_ephemeral` is the inverse spelling frontends use.
+        assert!(!StripeReq::new(StripeKey([0u8; 32])).with_ephemeral(true).durable());
+    }
+
+    #[test]
     fn stripe_req_round_trips_through_bincode() {
-        // Without an origin mapping.
+        // Without an origin mapping. `durable` is local-only
+        // (`#[serde(skip)]`), so pin it to the wire default here and
+        // cover its non-serialization in
+        // `stripe_req_durable_is_not_serialized`.
         let k = OriginRef::new("primary-s3", "models/llama.bin", 7).stripe_key();
-        let req = StripeReq::new(k);
+        let req = StripeReq::new(k).with_durable(false);
         let bytes = bincode::serialize(&req).unwrap();
         let back: StripeReq = bincode::deserialize(&bytes).unwrap();
         assert_eq!(req, back);
@@ -547,7 +599,9 @@ mod tests {
 
         // With an origin mapping.
         let origin = OriginRef::new("primary-s3", "models/llama.bin", 7);
-        let req2 = StripeReq::new(origin.stripe_key()).with_origin(origin.clone());
+        let req2 = StripeReq::new(origin.stripe_key())
+            .with_origin(origin.clone())
+            .with_durable(false);
         let bytes2 = bincode::serialize(&req2).unwrap();
         let back2: StripeReq = bincode::deserialize(&bytes2).unwrap();
         assert_eq!(req2, back2);

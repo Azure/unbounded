@@ -93,10 +93,10 @@ impl BlockDevice for CoreLocalDevice {
         ring.read(self.file_index, offset, dst).await
     }
 
-    async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), Error> {
+    async fn write(&self, lba: Lba, src: &[u8], durable: bool) -> Result<(), Error> {
         let offset = self.io_offset(lba, src.len())?;
         let ring = current_storage_ring().ok_or_else(off_core_err)?;
-        ring.write(self.file_index, offset, src).await
+        ring.write(self.file_index, offset, src, durable).await
     }
 
     fn progress(&self) -> Result<(), Error> {
@@ -201,7 +201,7 @@ mod tests {
         clear_current_storage_ring();
         let dev = CoreLocalDevice::new(0, 4096, 16);
         let buf = vec![0u8; 4096];
-        let res = block_on(dev.write(Lba(0), &buf));
+        let res = block_on(dev.write(Lba(0), &buf, false));
         assert!(
             matches!(res, Err(Error::Io(n)) if n == libc::ENXIO),
             "expected ENXIO off-core, got {res:?}",

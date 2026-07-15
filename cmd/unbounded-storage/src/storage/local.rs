@@ -177,11 +177,12 @@ impl<B: BlockDevice + 'static> LocalStorage<B> {
         key: StripeKey,
         stripe_off: u64,
         src: *const [u8],
+        durable: bool,
     ) -> Result<(), Error> {
         let idx = self.disk_for(key, stripe_off);
         unsafe {
             self.engines[idx]
-                .write_page_from(key, stripe_off, src)
+                .write_page_from(key, stripe_off, src, durable)
                 .await
         }
     }
@@ -328,7 +329,7 @@ impl<B: BlockDevice + 'static> bufferpool::BlockStore for ShardLocalStore<B> {
         // SAFETY: see `read_page` above.
         unsafe {
             self.inner
-                .write_page_from(req.key(), stripe_off, slice)
+                .write_page_from(req.key(), stripe_off, slice, req.durable())
                 .await
         }
     }

@@ -123,6 +123,7 @@ impl PageChannel {
         key: StripeKey,
         stripe_off: u64,
         src: *const [u8],
+        durable: bool,
     ) -> Result<(), Error> {
         let len = src.len();
         let ptr = NonNull::new(src.cast::<u8>().cast_mut()).ok_or(Error::Io(libc::EINVAL))?;
@@ -133,6 +134,7 @@ impl PageChannel {
                 stripe_off,
                 src: SendPtr(ptr),
                 len,
+                durable,
                 reply: reply.clone(),
             })
             .map_err(|_| Error::Io(libc::EPIPE))?;
@@ -205,6 +207,7 @@ pub enum PageCommand {
         stripe_off: u64,
         src: SendPtr,
         len: usize,
+        durable: bool,
         reply: Arc<ReplySlot<()>>,
     },
     RegisterBuffer {
@@ -283,6 +286,7 @@ impl<B: BlockDevice + 'static> PageService<B> {
                     stripe_off,
                     src,
                     len,
+                    durable,
                     reply,
                 }) => {
                     let engine = self.engine.clone();
@@ -292,7 +296,7 @@ impl<B: BlockDevice + 'static> PageService<B> {
                             // service treats this region as immutable.
                             let slice =
                                 std::ptr::slice_from_raw_parts(src.0.as_ptr().cast_const(), len);
-                            unsafe { engine.write_page_from(key, stripe_off, slice).await }
+                            unsafe { engine.write_page_from(key, stripe_off, slice, durable).await }
                         });
                     self.in_flight.push(Inflight::Write { fut, reply });
                 }
@@ -725,8 +729,8 @@ mod tests {
         }
         let key = StripeKey([0x42; 32]);
         let src = std::ptr::slice_from_raw_parts(buf.as_ptr(), 4096);
-        block_on(channel.write_page(key, 0, src)).expect("write 1");
-        block_on(channel.write_page(key, 0, src)).expect("write 2");
+        block_on(channel.write_page(key, 0, src, false)).expect("write 1");
+        block_on(channel.write_page(key, 0, src, false)).expect("write 2");
 
         // Read into page 1 and confirm the bytes match.
         let dst = std::ptr::slice_from_raw_parts_mut(unsafe { buf.as_mut_ptr().add(4096) }, 4096);
@@ -824,7 +828,7 @@ mod tests {
 
         let mut buf = vec![0u8; 4096];
         let src = std::ptr::slice_from_raw_parts(buf.as_mut_ptr().cast_const(), 4096);
-        let result = block_on(channel.write_page(StripeKey([0; 32]), 0, src));
+        let result = block_on(channel.write_page(StripeKey([0; 32]), 0, src, false));
         assert!(
             matches!(result, Err(Error::Io(n)) if n == libc::EPIPE),
             "expected EPIPE after service exit, got {result:?}",

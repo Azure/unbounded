@@ -65,6 +65,17 @@ pub trait Req {
     fn fabric_only(&self) -> bool {
         false
     }
+
+    /// When `true`, the local-disk writeback tee for this request
+    /// must be durable: the data page and the btree commit (spine
+    /// plus meta) are issued with data-integrity (FUA) writes, and
+    /// the pool blocks the triggering read until the tee has landed
+    /// on stable media, propagating any write error. Defaults to
+    /// `true` so durability is the safe default; ephemeral caches
+    /// opt out per request by returning `false`.
+    fn durable(&self) -> bool {
+        true
+    }
 }
 
 impl Req for StripeKey {

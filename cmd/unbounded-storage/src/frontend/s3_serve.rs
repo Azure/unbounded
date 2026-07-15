@@ -132,6 +132,7 @@ pub struct S3Driver<P: BufferPool<Req = StripeReq> + 'static> {
     stripe_size: u64,
     page_size: usize,
     bypass: bool,
+    ephemeral: bool,
     accept_fut: Pin<Box<dyn Future<Output = std::io::Result<RawFd>>>>,
     conns: Vec<Pin<Box<dyn Future<Output = ()>>>>,
     waker: Waker,
@@ -153,6 +154,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
         stripe_size: u64,
         page_size: usize,
         bypass: bool,
+        ephemeral: bool,
     ) -> Self {
         let accept_fut = Box::pin(handle.accept(listen_fd));
         Self {
@@ -165,6 +167,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
             stripe_size,
             page_size,
             bypass,
+            ephemeral,
             accept_fut,
             conns: Vec::new(),
             waker: noop_waker(),
@@ -210,6 +213,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> S3Driver<P> {
                             self.stripe_size,
                             self.page_size,
                             self.bypass,
+                            self.ephemeral,
                         );
                         self.conns.push(Box::pin(serve));
                     }
@@ -268,6 +272,7 @@ async fn serve_connection_s3<P: BufferPool<Req = StripeReq>>(
     stripe_size: u64,
     page_size: usize,
     bypass: bool,
+    ephemeral: bool,
 ) {
     let _fd = FdGuard(conn_fd);
     let _conn = ConnGuard::new();
@@ -283,6 +288,7 @@ async fn serve_connection_s3<P: BufferPool<Req = StripeReq>>(
         stripe_size,
         page_size,
         bypass,
+        ephemeral,
         &mut log,
         &mut outcome,
     )
@@ -307,6 +313,7 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     stripe_size: u64,
     page_size: usize,
     bypass: bool,
+    ephemeral: bool,
     log: &mut crate::obs::ReqLog,
     outcome: &mut ReqOutcome,
 ) -> Result<(), ()> {
@@ -396,7 +403,9 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
     // the plain HTTP frontend, a length-read failure is never a silently
     // dropped connection.
     let len =
-        match read_object_length_s3(pool, backend_id, cache_id, &path, page_size, bypass).await {
+        match read_object_length_s3(pool, backend_id, cache_id, &path, page_size, bypass, ephemeral)
+            .await
+        {
             LenResult::Len(l) => l,
             LenResult::NotFound => {
                 let bytes = error_bytes(S3ErrorCode::NoSuchKey, &path, &request_id, is_head, None);
@@ -510,7 +519,8 @@ async fn serve_request_s3<P: BufferPool<Req = StripeReq>>(
                 req: StripeReq::new(key)
                     .with_origin(origin_ref)
                     .with_cache_id(cache_id.map(ToOwned::to_owned))
-                    .with_bypass(bypass),
+                    .with_bypass(bypass)
+                    .with_ephemeral(ephemeral),
                 intra_offset: slice.intra_offset,
                 intra_len: slice.intra_len,
             }
@@ -578,6 +588,7 @@ async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
     path: &str,
     page_size: usize,
     bypass: bool,
+    ephemeral: bool,
 ) -> LenResult {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
     let key = cache_id
@@ -586,7 +597,8 @@ async fn read_object_length_s3<P: BufferPool<Req = StripeReq>>(
     let req = StripeReq::new(key)
         .with_origin(origin_ref)
         .with_cache_id(cache_id.map(ToOwned::to_owned))
-        .with_bypass(bypass);
+        .with_bypass(bypass)
+        .with_ephemeral(ephemeral);
     let mut rs = match pool.read(&req, 0, page_size as u64).await {
         Ok(rs) => rs,
         Err(Error::OriginNotFound) => return LenResult::NotFound,
@@ -881,6 +893,7 @@ mod tests {
             None,
             4 * 1024 * 1024,
             2 * 1024 * 1024,
+            false,
             false,
         );
         // No client has connected: accept is pending, no conns, so the

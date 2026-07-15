@@ -151,6 +151,7 @@ pub struct HttpDriver<P: BufferPool<Req = StripeReq> + 'static> {
     page_size: usize,
     fanout: Rc<FanoutTable>,
     bypass: bool,
+    ephemeral: bool,
     max_requests_per_connection: usize,
     accept_fut: Pin<Box<dyn Future<Output = std::io::Result<RawFd>>>>,
     conns: Vec<Pin<Box<dyn Future<Output = ()>>>>,
@@ -165,6 +166,9 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
     /// ring; for single-shard deployments it routes every stripe to the
     /// local pool. When `bypass` is set, the frontend bridges straight
     /// to its backend: cache, peer routing, and fanout are all skipped.
+    /// When `ephemeral` is set, this frontend's miss-fill writebacks are
+    /// best-effort (reads do not block on durability); otherwise a miss
+    /// blocks the read until the page and its cache commit are durable.
     pub fn new(
         pool: Rc<P>,
         handle: NetHandle,
@@ -176,6 +180,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
         page_size: usize,
         fanout: Rc<FanoutTable>,
         bypass: bool,
+        ephemeral: bool,
         max_requests_per_connection: usize,
     ) -> Self {
         let accept_fut = Box::pin(handle.accept(listen_fd));
@@ -190,6 +195,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
             page_size,
             fanout,
             bypass,
+            ephemeral,
             max_requests_per_connection,
             accept_fut,
             conns: Vec::new(),
@@ -245,6 +251,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> HttpDriver<P> {
                             self.page_size,
                             Rc::clone(&self.fanout),
                             self.bypass,
+                            self.ephemeral,
                             self.max_requests_per_connection,
                         );
                         self.conns.push(Box::pin(serve));
@@ -304,6 +311,7 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
     page_size: usize,
     fanout: Rc<FanoutTable>,
     bypass: bool,
+    ephemeral: bool,
     max_requests_per_connection: usize,
 ) {
     let _fd = FdGuard(conn_fd);
@@ -325,6 +333,7 @@ async fn serve_connection<P: BufferPool<Req = StripeReq>>(
             page_size,
             &fanout,
             bypass,
+            ephemeral,
             &mut buf,
             deadline,
             requests_served.saturating_add(1) < max_requests_per_connection,
@@ -374,6 +383,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     page_size: usize,
     fanout: &Rc<FanoutTable>,
     bypass: bool,
+    ephemeral: bool,
     buf: &mut Vec<u8>,
     idle_deadline: Option<Instant>,
     allow_keep_alive_after_response: bool,
@@ -454,7 +464,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
     // metadata entry through the pool. The HTTP backend fills it from
     // an origin HEAD on a miss; local-disk and peer hits skip the
     // origin entirely.
-    let len = match read_object_length(pool, backend_id, cache_id, &path, page_size, bypass).await {
+    let len = match read_object_length(pool, backend_id, cache_id, &path, page_size, bypass, ephemeral).await {
         LenResult::Len(len) => len,
         LenResult::NotFound => {
             let _ = send_all(handle, conn_fd, status_line_response(404, keep_alive)).await;
@@ -528,6 +538,7 @@ async fn serve_request<P: BufferPool<Req = StripeReq>>(
         resolved,
         stripe_size,
         bypass,
+        ephemeral,
     )
     .await?;
     finish_request(buf, header_end);
@@ -560,6 +571,7 @@ fn stripe_request(
     path: &str,
     slice: StripeSlice,
     bypass: bool,
+    ephemeral: bool,
 ) -> (StripeKey, StripeReq) {
     let origin_ref = OriginRef {
         backend_id: backend_id.to_string(),
@@ -572,7 +584,8 @@ fn stripe_request(
     let req = StripeReq::new(key)
         .with_origin(origin_ref)
         .with_cache_id(cache_id.map(ToOwned::to_owned))
-        .with_bypass(bypass);
+        .with_bypass(bypass)
+        .with_ephemeral(ephemeral);
     (key, req)
 }
 
@@ -699,8 +712,9 @@ async fn dispatch_ticket(
     path: &str,
     slice: StripeSlice,
     bypass: bool,
+    ephemeral: bool,
 ) -> Ticket {
-    let (key, req) = stripe_request(backend_id, cache_id, path, slice, bypass);
+    let (key, req) = stripe_request(backend_id, cache_id, path, slice, bypass, ephemeral);
     match fanout.owner_of_cache(&key, cache_id, slice.intra_offset) {
         Owner::Local => Ticket::Local { slice },
         Owner::Peer(peer) => {
@@ -737,6 +751,7 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
     resolved: ResolvedRange,
     stripe_size: u64,
     bypass: bool,
+    ephemeral: bool,
 ) -> Result<(), ()> {
     let slices = stripe_set(resolved, stripe_size);
 
@@ -747,7 +762,7 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
         let plans: Vec<StripePlan<StripeReq>> = slices
             .into_iter()
             .map(|slice| {
-                let (_key, req) = stripe_request(backend_id, cache_id, path, slice, bypass);
+                let (_key, req) = stripe_request(backend_id, cache_id, path, slice, bypass, ephemeral);
                 StripePlan {
                     req,
                     intra_offset: slice.intra_offset,
@@ -770,13 +785,13 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
     let mut window: VecDeque<Ticket> = VecDeque::new();
     while next < slices.len() && window.len() < multi_shard_window() {
         window.push_back(
-            dispatch_ticket(fanout, backend_id, cache_id, path, slices[next], bypass).await,
+            dispatch_ticket(fanout, backend_id, cache_id, path, slices[next], bypass, ephemeral).await,
         );
         next += 1;
     }
 
     let local_plan = |slice: StripeSlice| {
-        let (_key, req) = stripe_request(backend_id, cache_id, path, slice, bypass);
+        let (_key, req) = stripe_request(backend_id, cache_id, path, slice, bypass, ephemeral);
         StripePlan {
             req,
             intra_offset: slice.intra_offset,
@@ -822,7 +837,7 @@ async fn stream_body<P: BufferPool<Req = StripeReq>>(
 
         while next < slices.len() && window.len() < multi_shard_window() {
             window.push_back(
-                dispatch_ticket(fanout, backend_id, cache_id, path, slices[next], bypass).await,
+                dispatch_ticket(fanout, backend_id, cache_id, path, slices[next], bypass, ephemeral).await,
             );
             next += 1;
         }
@@ -846,6 +861,7 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
     path: &str,
     page_size: usize,
     bypass: bool,
+    ephemeral: bool,
 ) -> LenResult {
     let origin_ref = OriginRef::metadata_entry(backend_id, path);
     let key = cache_id
@@ -854,7 +870,8 @@ async fn read_object_length<P: BufferPool<Req = StripeReq>>(
     let req = StripeReq::new(key)
         .with_origin(origin_ref)
         .with_cache_id(cache_id.map(ToOwned::to_owned))
-        .with_bypass(bypass);
+        .with_bypass(bypass)
+        .with_ephemeral(ephemeral);
     let mut rs: ReadStream = match pool.read(&req, 0, page_size as u64).await {
         Ok(rs) => rs,
         Err(e) => return classify_len_error(e),
@@ -1239,11 +1256,15 @@ mod tests {
             intra_len: 4,
         };
         // Non-bypass requests carry the cache path (bypass == false).
-        let (_k, normal) = stripe_request("primary", Some("cache-a"), "/o", slice, false);
+        let (_k, normal) = stripe_request("primary", Some("cache-a"), "/o", slice, false, false);
         assert!(!normal.bypass());
         assert_eq!(normal.cache_id(), Some("cache-a"));
+        // Durable is the default; an ephemeral frontend stamps it off.
+        assert!(normal.durable());
+        let (_ek, ephem) = stripe_request("primary", Some("cache-a"), "/o", slice, false, true);
+        assert!(!ephem.durable());
         // Bridge-mode frontends stamp bypass == true onto every request.
-        let (k, bridged) = stripe_request("primary", None, "/o", slice, true);
+        let (k, bridged) = stripe_request("primary", None, "/o", slice, true, false);
         assert!(bridged.bypass());
         // Cache id is the only logical key prefix, so cached and uncached
         // requests for the same origin intentionally use different keys.
@@ -1333,7 +1354,7 @@ mod tests {
         });
 
         let result = block_on(read_object_length(
-            &pool, "primary", None, "/missing", 4096, false,
+            &pool, "primary", None, "/missing", 4096, false, false,
         ));
 
         assert_eq!(result, LenResult::NotFound);
@@ -1346,7 +1367,7 @@ mod tests {
         });
 
         let result = block_on(read_object_length(
-            &pool, "primary", None, "/broken", 4096, false,
+            &pool, "primary", None, "/broken", 4096, false, false,
         ));
 
         assert_eq!(result, LenResult::Other);
@@ -1387,6 +1408,7 @@ mod tests {
                 NumaShardTable::from_shards([(0, None)]),
                 CacheDirectorySet::new(),
             )),
+            false,
             false,
             DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION as usize,
         );

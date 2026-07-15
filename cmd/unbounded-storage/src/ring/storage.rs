@@ -153,21 +153,37 @@ impl StorageRing {
     /// Write `src.len()` bytes from `src` to `offset_bytes` of the
     /// registered file `file_index`. `src` must lie fully inside a
     /// registered buffer region.
-    pub async fn write(&self, file_index: u32, offset_bytes: u64, src: &[u8]) -> Result<(), Error> {
+    ///
+    /// When `durable` is set, the SQE carries `RWF_DSYNC` so the write is
+    /// a data-integrity (FUA) write: the completion is not reaped until
+    /// the bytes have reached stable media, past any volatile drive
+    /// cache. `RWF_DSYNC` is a pollable read/write flag, so it works on
+    /// the production `IOPOLL` ring where a standalone `IORING_OP_FSYNC`
+    /// would never complete. Non-durable writes take the unchanged fast
+    /// path.
+    pub async fn write(
+        &self,
+        file_index: u32,
+        offset_bytes: u64,
+        src: &[u8],
+        durable: bool,
+    ) -> Result<(), Error> {
         let buf_index = self
             .core
             .resolve_buf_index(src.as_ptr(), src.len())
             .map_err(io_err_to_storage)?;
         let ud = self.core.alloc_user_data();
-        let sqe = opcode::WriteFixed::new(
+        let mut builder = opcode::WriteFixed::new(
             types::Fixed(file_index),
             src.as_ptr(),
             src.len() as u32,
             buf_index,
         )
-        .offset(offset_bytes)
-        .build()
-        .user_data(ud);
+        .offset(offset_bytes);
+        if durable {
+            builder = builder.rw_flags(libc::RWF_DSYNC);
+        }
+        let sqe = builder.build().user_data(ud);
         let expected = src.len();
         // SAFETY: `src` lives inside the registered region resolved
         // above and the caller holds it until this future resolves.
@@ -357,7 +373,7 @@ mod tests {
         {
             let wslice = unsafe { std::slice::from_raw_parts(write_ptr, PAGE) };
             let futs: Vec<Pin<Box<dyn Future<Output = Result<(), Error>> + '_>>> =
-                vec![Box::pin(ring.write(fidx, offset, wslice))];
+                vec![Box::pin(ring.write(fidx, offset, wslice, false))];
             for r in pump(&ring, futs) {
                 r.expect("write ok");
             }
@@ -403,7 +419,7 @@ mod tests {
         let mut futs: Vec<Pin<Box<dyn Future<Output = Result<(), Error>> + '_>>> =
             Vec::with_capacity(16);
         for i in 0..16u64 {
-            futs.push(Box::pin(ring.write(fidx, i * PAGE as u64, src_const)));
+            futs.push(Box::pin(ring.write(fidx, i * PAGE as u64, src_const, false)));
         }
 
         let waker = noop_waker();

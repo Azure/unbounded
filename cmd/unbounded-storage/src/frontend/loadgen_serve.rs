@@ -109,6 +109,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> LoadgenDriver<P> {
         page_size: usize,
         routes: RouteTableHandle,
         bypass: bool,
+        ephemeral: bool,
         shard_idx: u16,
         waker: Waker,
     ) -> Self {
@@ -120,6 +121,7 @@ impl<P: BufferPool<Req = StripeReq> + 'static> LoadgenDriver<P> {
             stripe_size,
             page_size,
             bypass,
+            ephemeral,
             shard_idx,
             seed: frontend.seed,
             expected_object_size_bytes: frontend.expected_object_size_bytes,
@@ -181,6 +183,7 @@ struct LoadgenRun {
     stripe_size: u64,
     page_size: usize,
     bypass: bool,
+    ephemeral: bool,
     shard_idx: u16,
     seed: u64,
     expected_object_size_bytes: Option<u64>,
@@ -393,6 +396,7 @@ fn request_from_origin(origin_ref: OriginRef, cfg: &LoadgenRun) -> StripeReq {
         .with_origin(origin_ref)
         .with_cache_id(cfg.cache_id.clone())
         .with_bypass(cfg.bypass)
+        .with_ephemeral(cfg.ephemeral)
         .with_fabric_only(cfg.fabric_only)
         .with_skip_local_disk(cfg.skip_local_disk)
 }
@@ -530,6 +534,7 @@ mod tests {
             stripe_size: 4096,
             page_size: 4096,
             bypass: false,
+            ephemeral: false,
             shard_idx: 2,
             seed: 7,
             expected_object_size_bytes: None,

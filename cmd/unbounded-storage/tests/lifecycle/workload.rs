@@ -790,7 +790,7 @@ fn spawn_clients(
                         let src = std::ptr::slice_from_raw_parts(base as *const u8, payload.len());
                         let disk = disk_for(&key, offset, channels.channels.len());
                         if channels.channels[disk]
-                            .write_page(key, offset, src)
+                            .write_page(key, offset, src, false)
                             .await
                             .is_err()
                         {
@@ -869,6 +869,7 @@ fn config_for_generation(version: u64, disks: Vec<DiskSpec>) -> Config {
     cfg.caches = vec![CacheSpec {
         name: "cache-0".to_string(),
         source: "backend-0".to_string(),
+        ephemeral: false,
     }];
     cfg.disks = disks;
     cfg.frontends = frontend_specs(0, 1);

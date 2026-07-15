@@ -38,6 +38,11 @@ pub(crate) enum MutatorReq {
         key: PageKey,
         entry: LeafEntry,
         done: Arc<MutatorReply>,
+        /// Whether this insert requested a durable (FUA) commit.
+        /// The mutator ORs this across a batch to decide if the
+        /// spine and meta writes are issued with data-integrity
+        /// flags.
+        durable: bool,
     },
     Delete {
         victims: Vec<Resident>,
@@ -557,6 +562,7 @@ mod tests {
                 key: page_key(idx as u32),
                 entry: leaf_entry(idx as u64 + 10),
                 done: reply.clone(),
+                durable: false,
             }
         } else {
             MutatorReq::Delete {

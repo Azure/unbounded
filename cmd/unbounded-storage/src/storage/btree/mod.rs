@@ -388,7 +388,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
         // tracked on the snapshot; those pages stay live until a
         // future path-copy commit retires them.
         let (root_lba, _bootstrap_pages) =
-            cow::build_tree(&*device, &scratch, &allocator, txn_id, &sorted).await?;
+            cow::build_tree(&*device, &scratch, &allocator, txn_id, &sorted, true).await?;
 
         // Write meta into slot A by default (active=B means we
         // wrote to A; on next commit we'll write to B).
@@ -399,6 +399,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
             txn_id,
             root_lba,
             allocator.high_water(),
+            true,
         )
         .await?;
 
@@ -455,7 +456,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
 
     /// Apply a batch of mutations atomically. Must be called by
     /// at most one task at a time (the engine's mutator).
-    pub async fn apply_batch(&self, mutations: Vec<Mutation>) -> Result<(), Error> {
+    pub async fn apply_batch(&self, mutations: Vec<Mutation>, durable: bool) -> Result<(), Error> {
         // Coalesce the input mutations into a sorted (key, op)
         // list with at most one entry per key. The live mirror is
         // not touched until the inactive meta write makes the new
@@ -495,6 +496,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
             parent_root,
             txn_id,
             sorted_ops,
+            durable,
         )
         .await?;
 
@@ -519,6 +521,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
             txn_id,
             result.new_root,
             self.allocator.high_water(),
+            durable,
         )
         .await
         {

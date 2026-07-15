@@ -114,6 +114,14 @@ message CacheSpec {
   string name = 1;
   // Backend source used for miss fills. Cache name is the only logical keyspace prefix.
   string source = 2;
+  // Opts this cache out of durable writes. When false (the default), a miss
+  // fill blocks the triggering read until the fetched page and its cache
+  // index commit are flushed to stable media (FUA/RWF_DSYNC). When true, the
+  // writeback tee is best-effort: reads complete as soon as the page is in
+  // memory and a crash may lose recently cached pages. Intended for caches
+  // over volatile or reconstructable backing where read latency matters more
+  // than crash durability.
+  bool ephemeral = 3;
 }
 
 message StartupCfg {

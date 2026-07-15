@@ -38,7 +38,7 @@ fn read_back_what_we_wrote() {
         ..Default::default()
     });
     let src = vec![0xabu8; 64];
-    block_on(dev.write(Lba(2), &src)).unwrap();
+    block_on(dev.write(Lba(2), &src, false)).unwrap();
     let mut dst = vec![0u8; 64];
     block_on(dev.read(Lba(2), &mut dst)).unwrap();
     assert_eq!(dst, src);
@@ -63,7 +63,7 @@ fn read_corruption_flips_byte() {
         ..Default::default()
     });
     let src = vec![0x11u8; 16];
-    block_on(dev.write(Lba(0), &src)).unwrap();
+    block_on(dev.write(Lba(0), &src, false)).unwrap();
     dev.set_fault_mode(MockFaultMode::ReadCorrupt);
     let mut dst = vec![0u8; 16];
     block_on(dev.read(Lba(0), &mut dst)).unwrap();
@@ -84,7 +84,7 @@ fn out_of_range_lba_errors() {
         Err(Error::OutOfRange)
     ));
     assert!(matches!(
-        block_on(dev.write(Lba(5), &dst)),
+        block_on(dev.write(Lba(5), &dst, false)),
         Err(Error::OutOfRange)
     ));
 }
@@ -109,7 +109,7 @@ fn peek_poke_match_read_write() {
     let mut buf = [0u8; 8];
     block_on(dev.read(Lba(1), &mut buf)).unwrap();
     assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8]);
-    block_on(dev.write(Lba(2), &[9, 9, 9, 9, 9, 9, 9, 9])).unwrap();
+    block_on(dev.write(Lba(2), &[9, 9, 9, 9, 9, 9, 9, 9], false)).unwrap();
     let mut peeked = [0u8; 8];
     dev.peek(Lba(2), &mut peeked);
     assert_eq!(peeked, [9, 9, 9, 9, 9, 9, 9, 9]);
@@ -253,7 +253,7 @@ mod uring_tests {
         for (i, b) in src.iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(31).wrapping_add(7);
         }
-        run_io(&installed, device.write(Lba(3), src)).expect("write");
+        run_io(&installed, device.write(Lba(3), src, true)).expect("write");
 
         let dst_ptr = unsafe { base.add(page_size * 2) };
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, page_size) };
@@ -304,7 +304,7 @@ mod uring_tests {
 
         let (_owner, base) = aligned_buffer(page_size);
         let src = unsafe { std::slice::from_raw_parts(base, page_size) };
-        let err = run_io(&installed, device.write(Lba(0), src));
+        let err = run_io(&installed, device.write(Lba(0), src, false));
         assert!(matches!(err, Err(Error::Io(_))));
     }
 }

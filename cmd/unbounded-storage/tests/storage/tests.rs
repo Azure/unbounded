@@ -382,6 +382,27 @@ proptest! {
         }
     }
 
+    /// Invariant: every device write issued by this workload is a
+    /// durable (RWF_DSYNC / FUA) write. The DST workload always
+    /// submits writes through a `StripeKey`, whose `Req::durable()`
+    /// defaults to true, so the data-page write plus the btree spine
+    /// and meta-page commits must all reach the device as durable
+    /// writes. `durable_writes` and `writes` are counted on the same
+    /// mock before any fault early-return, so the equality must hold
+    /// unconditionally, including under fault injection. A regression
+    /// that dropped the durable flag anywhere in the write stack
+    /// (engine data page, cow spine, or meta commit) would make
+    /// `device_durable_writes` fall short of `device_writes`.
+    #[test]
+    fn invariant_all_writes_durable(seed in any::<u64>(), w in workload_strategy()) {
+        let report = run_workload(seed, w).expect("run completed");
+        prop_assert_eq!(
+            report.device_durable_writes, report.device_writes,
+            "durable writes {} != total writes {}: a write lost its durable flag",
+            report.device_durable_writes, report.device_writes,
+        );
+    }
+
     /// Invariant: at end-of-run quiescence the deferred-reclaim
     /// queue is bounded. Every LBA pushed onto `pending_free`
     /// (either by an overwrite-while-pinned or an eviction-while-

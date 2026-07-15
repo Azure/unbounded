@@ -1354,6 +1354,7 @@ impl FrontendBuildCtx {
                     self.page_size,
                     self.fanout.clone(),
                     binding.bypass_cache,
+                    binding.ephemeral,
                     frontend.max_requests_per_connection(),
                 )))
             }
@@ -1373,6 +1374,7 @@ impl FrontendBuildCtx {
                     stripe_size,
                     self.page_size,
                     binding.bypass_cache,
+                    binding.ephemeral,
                 )))
             }
             Some(frontend_spec::Config::Loadgen(_)) => {
@@ -1387,6 +1389,7 @@ impl FrontendBuildCtx {
                     self.page_size,
                     self.routes.clone(),
                     binding.bypass_cache,
+                    binding.ephemeral,
                     self.worker_idx,
                     self.waker.clone(),
                 )))
@@ -2010,6 +2013,7 @@ mod tests {
             backend_id: backend_id.to_string(),
             cache_id: None,
             bypass_cache: true,
+            ephemeral: false,
         }
     }
 

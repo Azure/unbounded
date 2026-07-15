@@ -565,7 +565,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                         oracle.record_write(key, offset, bytes);
                         let src = std::ptr::slice_from_raw_parts(base as *const u8, byte_len);
                         let idx = disk_for(&key, offset, num_disks);
-                        match channels[idx].write_page(key, offset, src).await {
+                        match channels[idx].write_page(key, offset, src, false).await {
                             Ok(()) => outcomes.borrow_mut().push(Outcome::WriteOk),
                             Err(e) => outcomes
                                 .borrow_mut()
@@ -642,7 +642,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
             // The send fails at the channel before the buffer is ever
             // touched, but keep the pointer valid regardless.
             let src = std::ptr::slice_from_raw_parts(pool_base as *const u8, w.page_size);
-            let res = block_on_local(ch.write_page(StripeKey([0u8; 32]), 0, src));
+            let res = block_on_local(ch.write_page(StripeKey([0u8; 32]), 0, src, false));
             res.is_err()
         })
     } else {

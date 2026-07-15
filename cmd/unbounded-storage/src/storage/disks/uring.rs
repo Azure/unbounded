@@ -571,7 +571,7 @@ mod tests {
         let src_buf = vec![0u8; 4096];
         let src = std::ptr::slice_from_raw_parts(src_buf.as_ptr(), src_buf.len());
         let racing: Pin<Box<dyn Future<Output = Result<(), BpError>>>> =
-            Box::pin(channel.write_page(StripeKey([7; 32]), 0, src));
+            Box::pin(channel.write_page(StripeKey([7; 32]), 0, src, false));
         let racing = RefCell::new(racing);
 
         let injected = Cell::new(false);
@@ -867,7 +867,7 @@ mod tests {
         let src_buf = vec![0u8; 4096];
         let src = std::ptr::slice_from_raw_parts(src_buf.as_ptr(), src_buf.len());
         let mut parked: Pin<Box<dyn Future<Output = Result<(), BpError>>>> =
-            Box::pin(channel.write_page(StripeKey([9; 32]), 0, src));
+            Box::pin(channel.write_page(StripeKey([9; 32]), 0, src, false));
         {
             let w = noop_waker();
             let mut c = Context::from_waker(&w);

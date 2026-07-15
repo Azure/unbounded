@@ -66,6 +66,10 @@ pub struct MockDevice {
     storage: RefCell<Vec<u8>>,
     read_count: Cell<u64>,
     write_count: Cell<u64>,
+    /// Count of writes that carried the `durable` flag (FUA). Tests
+    /// assert on this to prove a durable request forced a
+    /// data-integrity write down to the device.
+    durable_write_count: Cell<u64>,
     /// Every region passed to [`Self::register_buffers`]. The
     /// real device demands the I/O pointer lies inside one of
     /// these; the mock accepts any pointer but records the
@@ -81,6 +85,7 @@ impl MockDevice {
             storage: RefCell::new(vec![0u8; bytes]),
             read_count: Cell::new(0),
             write_count: Cell::new(0),
+            durable_write_count: Cell::new(0),
             registered: RefCell::new(Vec::new()),
         }
     }
@@ -97,6 +102,11 @@ impl MockDevice {
 
     pub fn writes(&self) -> u64 {
         self.write_count.get()
+    }
+
+    /// Number of durable (FUA / `RWF_DSYNC`) writes seen so far.
+    pub fn durable_writes(&self) -> u64 {
+        self.durable_write_count.get()
     }
 
     /// Base of the first registered region, if any. Test-only
@@ -179,8 +189,12 @@ impl BlockDevice for MockDevice {
         Ok(())
     }
 
-    async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), Error> {
+    async fn write(&self, lba: Lba, src: &[u8], durable: bool) -> Result<(), Error> {
         self.write_count.set(self.write_count.get() + 1);
+        if durable {
+            self.durable_write_count
+                .set(self.durable_write_count.get() + 1);
+        }
         let cfg = self.cfg.get();
         // See [`Self::read`] for the rationale; same contract.
         if src.is_empty() || src.len() % cfg.page_size != 0 {

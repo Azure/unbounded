@@ -15,6 +15,12 @@ pub struct ResolvedFrontendBinding {
     pub backend_id: String,
     pub cache_id: Option<String>,
     pub bypass_cache: bool,
+    /// When true, miss-fill writebacks for this frontend are best-effort
+    /// (the read completes as soon as the page is in memory). When false
+    /// (the default), the read blocks until the page and its cache index
+    /// commit are durable. Mirrors the bound cache's `ephemeral` flag;
+    /// always false for a backend-direct (bypass) binding, which never tees.
+    pub ephemeral: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +39,7 @@ pub struct RuntimeMesh {
 pub struct RuntimeCache {
     pub id: String,
     pub backend_id: String,
+    pub ephemeral: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,6 +144,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
                 backend_id: frontend.source.clone(),
                 cache_id: None,
                 bypass_cache: true,
+                ephemeral: false,
             }
         } else if let Some(cache) = caches.get(frontend.source.as_str()) {
             ResolvedFrontendBinding {
@@ -144,6 +152,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
                 backend_id: cache.source.clone(),
                 cache_id: Some(cache.name.clone()),
                 bypass_cache: false,
+                ephemeral: cache.ephemeral,
             }
         } else {
             unreachable!("binding graph validation checked frontend target")
@@ -160,6 +169,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
                 RuntimeCache {
                     id: cache.name.clone(),
                     backend_id: cache.source.clone(),
+                    ephemeral: cache.ephemeral,
                 },
             )
         })
@@ -276,6 +286,7 @@ mod tests {
         CacheSpec {
             name: id.to_string(),
             source: source.to_string(),
+            ephemeral: false,
         }
     }
 
@@ -324,6 +335,31 @@ mod tests {
         assert_binding(&graph, "direct", "b", None, true);
         assert_binding(&graph, "cache", "b", Some("c-backend"), false);
         assert_eq!(graph.caches.len(), 1);
+    }
+
+    /// A cache's `ephemeral` flag must reach both its `RuntimeCache`
+    /// and every cache-bound frontend binding, while backend-direct
+    /// (bypass) bindings stay durable regardless: they never tee.
+    #[test]
+    fn runtime_projection_propagates_ephemeral() {
+        let mut cfg = Config::default();
+        cfg.backends.push(backend("b"));
+        let mut eph = cache("c-eph", "b");
+        eph.ephemeral = true;
+        cfg.caches.push(eph);
+        cfg.caches.push(cache("c-durable", "b"));
+        cfg.frontends.push(frontend("f-eph", "c-eph"));
+        cfg.frontends.push(frontend("f-durable", "c-durable"));
+        cfg.frontends.push(frontend("f-direct", "b"));
+
+        let graph = runtime_projection(&cfg).unwrap();
+
+        assert!(graph.caches.get("c-eph").unwrap().ephemeral);
+        assert!(!graph.caches.get("c-durable").unwrap().ephemeral);
+        assert!(graph.frontends.get("f-eph").unwrap().ephemeral);
+        assert!(!graph.frontends.get("f-durable").unwrap().ephemeral);
+        // Backend-direct binding never tees, so it is never ephemeral.
+        assert!(!graph.frontends.get("f-direct").unwrap().ephemeral);
     }
 
     #[test]

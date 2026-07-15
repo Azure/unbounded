@@ -486,7 +486,10 @@ impl<B: BlockDevice> bufferpool::BlockStore for StorageEngine<B> {
         // SAFETY: see register_pages contract.
         let src_buf: *const [u8] = unsafe { self.slice_from_ref(page) };
         // SAFETY: see comment above.
-        unsafe { self.write_page_from(req.key(), stripe_off, src_buf).await }
+        unsafe {
+            self.write_page_from(req.key(), stripe_off, src_buf, req.durable())
+                .await
+        }
     }
 }
 
@@ -600,6 +603,7 @@ impl<B: BlockDevice> StorageEngine<B> {
         key: StripeKey,
         stripe_off: u64,
         src: *const [u8],
+        durable: bool,
     ) -> Result<(), bufferpool::Error> {
         let pk = Self::page_key(&key, stripe_off, self.cfg.page_size_bytes);
 
@@ -641,7 +645,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             }
         };
 
-        if let Err(e) = self.device.write(lba, src_buf).await {
+        if let Err(e) = self.device.write(lba, src_buf, durable).await {
             // A device write that did not land on disk MUST surface
             // as an error to the caller. Returning Ok here would let
             // benchmarks and any other "I observed a successful
@@ -681,6 +685,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             key: pk,
             entry,
             done: done.clone(),
+            durable,
         });
         let prior = match done.wait().await {
             MutatorOutcome::InsertCommitted { prior } => prior,
@@ -786,9 +791,20 @@ impl<B: BlockDevice> StorageEngine<B> {
         let mut priors: Vec<Option<LeafEntry>> = Vec::with_capacity(batch.len());
         let mut removed_by_req: Vec<Vec<Resident>> = Vec::with_capacity(batch.len());
         let mut mutations: Vec<Mutation> = Vec::new();
+        // Durability of a commit is the OR of its members: if any
+        // participant requested a durable write, the whole batched
+        // btree commit (spine + meta) is issued with FUA so the
+        // reply, once set, implies the new root is on stable media.
+        let mut durable = false;
         for req in &batch {
             match req {
-                MutatorReq::Insert { key, entry, .. } => {
+                MutatorReq::Insert {
+                    key,
+                    entry,
+                    durable: req_durable,
+                    ..
+                } => {
+                    durable |= *req_durable;
                     let prior = if let Some(prior) = states.get(key) {
                         *prior
                     } else {
@@ -830,7 +846,7 @@ impl<B: BlockDevice> StorageEngine<B> {
             true
         } else {
             let started = std::time::Instant::now();
-            let res = self.btree.apply_batch(mutations).await.is_ok();
+            let res = self.btree.apply_batch(mutations, durable).await.is_ok();
             crate::metrics::storage_btree_commit_duration(started.elapsed().as_secs_f64());
             res
         };
@@ -995,6 +1011,7 @@ mod tests {
             key,
             entry: entry(200),
             done: seed.clone(),
+            durable: false,
         }]));
         assert!(matches!(
             block_on(seed.wait()),
@@ -1008,6 +1025,7 @@ mod tests {
                 key,
                 entry: entry(201),
                 done: overwrite.clone(),
+                durable: false,
             },
             MutatorReq::Delete {
                 victims: vec![resident(key, 200)],
@@ -1031,6 +1049,7 @@ mod tests {
             key,
             entry: entry(200),
             done: seed,
+            durable: false,
         }]));
 
         let overwrite = MutatorReply::new();
@@ -1038,6 +1057,7 @@ mod tests {
             key,
             entry: entry(201),
             done: overwrite,
+            durable: false,
         }]));
         let eviction = MutatorReply::new();
         block_on(eng.process_batch(vec![MutatorReq::Delete {

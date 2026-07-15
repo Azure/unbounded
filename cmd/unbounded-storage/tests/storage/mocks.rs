@@ -72,6 +72,7 @@ pub struct SimBlockDevice {
     cfg: Rc<MockSimConfig>,
     reads: Cell<u64>,
     writes: Cell<u64>,
+    durable_writes: Cell<u64>,
     io_errors: Cell<u64>,
     corruptions_injected: Cell<u64>,
     inflight: Cell<u32>,
@@ -86,6 +87,7 @@ impl SimBlockDevice {
             cfg: sim_cfg,
             reads: Cell::new(0),
             writes: Cell::new(0),
+            durable_writes: Cell::new(0),
             io_errors: Cell::new(0),
             corruptions_injected: Cell::new(0),
             inflight: Cell::new(0),
@@ -99,6 +101,9 @@ impl SimBlockDevice {
     }
     pub fn writes(&self) -> u64 {
         self.writes.get()
+    }
+    pub fn durable_writes(&self) -> u64 {
+        self.durable_writes.get()
     }
     pub fn io_errors(&self) -> u64 {
         self.io_errors.get()
@@ -215,17 +220,20 @@ impl BlockDevice for SimBlockDevice {
         Ok(())
     }
 
-    async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), Error> {
+    async fn write(&self, lba: Lba, src: &[u8], durable: bool) -> Result<(), Error> {
         let delay = draw_delay(&self.cfg);
         let fault = draw_fault(&self.cfg);
         let _guard = InflightGuard::enter(self);
         yield_n(delay).await;
         self.writes.set(self.writes.get() + 1);
+        if durable {
+            self.durable_writes.set(self.durable_writes.get() + 1);
+        }
         if fault {
             self.io_errors.set(self.io_errors.get() + 1);
             return Err(Error::Io(5));
         }
-        self.inner.write(lba, src).await
+        self.inner.write(lba, src, durable).await
     }
 }
 

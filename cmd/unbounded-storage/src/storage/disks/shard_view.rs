@@ -355,7 +355,7 @@ impl BlockStore for LiveShardLocalStore {
         let slice = std::ptr::slice_from_raw_parts(p.cast_const(), len);
         // SAFETY: see `read_page` above.
         channels.channels[idx]
-            .write_page(key, stripe_off, slice)
+            .write_page(key, stripe_off, slice, req.durable())
             .await
     }
 }
@@ -445,7 +445,7 @@ impl BlockStore for ChainLocalStore {
         let idx = disk_for(&req.key(), stripe_off, channels.channels.len());
         let slice = std::ptr::slice_from_raw_parts(p.cast_const(), len);
         channels.channels[idx]
-            .write_page(req.key(), stripe_off, slice)
+            .write_page(req.key(), stripe_off, slice, req.durable())
             .await
     }
 }
@@ -508,8 +508,8 @@ mod tests {
         async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), DevError> {
             self.inner.read(lba, dst).await
         }
-        async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), DevError> {
-            self.inner.write(lba, src).await
+        async fn write(&self, lba: Lba, src: &[u8], durable: bool) -> Result<(), DevError> {
+            self.inner.write(lba, src, durable).await
         }
     }
 
