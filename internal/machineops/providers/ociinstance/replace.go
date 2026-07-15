@@ -15,23 +15,16 @@ import (
 )
 
 func (p *Provider) executeReplace(ctx context.Context, client computeClient, instanceID string, request machineops.OperationRequest) (machineops.OperationResult, error) {
-	if request.Machine == nil {
-		return machineops.OperationResult{}, fmt.Errorf("machine is required for OCI HostReplace")
+	if strings.TrimSpace(request.MachineName) == "" {
+		return machineops.OperationResult{}, fmt.Errorf("machine name is required for OCI HostReplace")
 	}
 
 	// Reconcile retries may happen after providerID handoff but before cleanup.
 	// Detect that state from replacement tags and return the pending cleanup work.
-	currentID, err := parseOCIInstanceProviderID(request.Machine.Spec.ProviderID)
-	if err == nil && currentID != "" {
-		current, getErr := client.GetInstance(ctx, currentID)
-		if getErr == nil {
-			if currentID != instanceID && isReplacementFor(current, request, request.ProviderID) {
-				return machineops.OperationResult{ProviderID: providerIDPrefix + currentID, CleanupProviderID: request.ProviderID}, nil
-			}
-
-			if currentID == instanceID && isReplacementFor(current, request, current.FreeformTags[tagOldProviderID]) {
-				return machineops.OperationResult{ProviderID: providerIDPrefix + currentID, CleanupProviderID: current.FreeformTags[tagOldProviderID]}, nil
-			}
+	current, getErr := client.GetInstance(ctx, instanceID)
+	if getErr == nil {
+		if isReplacementFor(current, request, current.FreeformTags[tagOldProviderID]) {
+			return machineops.OperationResult{ProviderID: providerIDPrefix + instanceID, CleanupProviderID: current.FreeformTags[tagOldProviderID]}, nil
 		}
 	}
 
