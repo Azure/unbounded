@@ -545,7 +545,15 @@ type CacheSpec struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// Backend source used for miss fills. Cache name is the only logical keyspace prefix.
-	Source        string `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
+	Source string `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
+	// Opts this cache out of durable writes. When false (the default), a miss
+	// fill blocks the triggering read until the fetched page and its cache
+	// index commit are flushed to stable media (FUA/RWF_DSYNC). When true, the
+	// writeback tee is best-effort: reads complete as soon as the page is in
+	// memory and a crash may lose recently cached pages. Intended for caches
+	// over volatile or reconstructable backing where read latency matters more
+	// than crash durability.
+	Ephemeral     bool `protobuf:"varint,3,opt,name=ephemeral,proto3" json:"ephemeral,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -592,6 +600,13 @@ func (x *CacheSpec) GetSource() string {
 		return x.Source
 	}
 	return ""
+}
+
+func (x *CacheSpec) GetEphemeral() bool {
+	if x != nil {
+		return x.Ephemeral
+	}
+	return false
 }
 
 type StartupCfg struct {
@@ -2333,10 +2348,11 @@ const file_config_proto_rawDesc = "" +
 	"\x04addr\x18\x01 \x01(\tR\x04addr\":\n" +
 	"\x0eRdmaPeerConfig\x12\x12\n" +
 	"\x04addr\x18\x01 \x01(\tR\x04addr\x12\x14\n" +
-	"\x05addrs\x18\x02 \x03(\tR\x05addrs\"7\n" +
+	"\x05addrs\x18\x02 \x03(\tR\x05addrs\"U\n" +
 	"\tCacheSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
-	"\x06source\x18\x02 \x01(\tR\x06source\"\x89\x02\n" +
+	"\x06source\x18\x02 \x01(\tR\x06source\x12\x1c\n" +
+	"\tephemeral\x18\x03 \x01(\bR\tephemeral\"\x89\x02\n" +
 	"\n" +
 	"StartupCfg\x12;\n" +
 	"\x06memory\x18\x01 \x01(\v2#.unbounded.storage.config.MemoryCfgR\x06memory\x12;\n" +
