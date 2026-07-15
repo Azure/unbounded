@@ -131,9 +131,25 @@ kind: Config
 	})
 
 	t.Run("fails hard when empty override and no cluster-info", func(t *testing.T) {
+		// No cluster-info and no external KUBERNETES_SERVICE_HOST FQDN.
+		t.Setenv("KUBERNETES_SERVICE_HOST", "")
+		t.Setenv("KUBERNETES_SERVICE_PORT_HTTPS", "")
+
 		client := fake.NewSimpleClientset()
 		if _, err := resolveAPIServerEndpoint(context.Background(), "", client); err == nil {
 			t.Fatal("expected hard error when no override and cluster-info missing")
+		}
+	})
+
+	t.Run("fails hard when only the in-cluster ClusterIP is available", func(t *testing.T) {
+		// Without cluster-info, an in-cluster ClusterIP in KUBERNETES_SERVICE_HOST
+		// must not be advertised (a joining node cannot reach it).
+		t.Setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+		t.Setenv("KUBERNETES_SERVICE_PORT_HTTPS", "443")
+
+		client := fake.NewSimpleClientset()
+		if _, err := resolveAPIServerEndpoint(context.Background(), "", client); err == nil {
+			t.Fatal("expected hard error when only the in-cluster ClusterIP is available")
 		}
 	})
 }

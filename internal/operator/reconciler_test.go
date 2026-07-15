@@ -885,7 +885,7 @@ func TestMetalmanDeployment(t *testing.T) {
 		}}},
 	}
 
-	deployment := metalmanDeployment(site, DefaultNamespace, Config{MetalmanImage: "example/metalman:default"})
+	deployment := metalmanDeployment(site, DefaultNamespace, Config{MetalmanImage: "example/metalman:default", APIServerEndpoint: "https://api.example:6443"})
 	if deployment.Name != "metalman-controller-rack-a" {
 		t.Fatalf("name = %q", deployment.Name)
 	}
@@ -901,6 +901,19 @@ func TestMetalmanDeployment(t *testing.T) {
 
 	if got := container.Args; len(got) != 3 || got[0] != "serve-pxe" || got[1] != "--site=rack-a" || got[2] != "--dhcp-auto-interface" {
 		t.Fatalf("args = %#v", got)
+	}
+
+	// POD_NAMESPACE is sourced from the Downward API so the lease/RBAC stay
+	// co-located with the Deployment under any install namespace.
+	podNS := findEnv(container.Env, "POD_NAMESPACE")
+	if podNS == nil || podNS.ValueFrom == nil || podNS.ValueFrom.FieldRef == nil ||
+		podNS.ValueFrom.FieldRef.FieldPath != "metadata.namespace" {
+		t.Fatalf("POD_NAMESPACE env = %#v, want Downward API metadata.namespace", podNS)
+	}
+
+	// The operator-resolved endpoint is handed to metalman as METALMAN_APISERVER_URL.
+	if got := findEnv(container.Env, "METALMAN_APISERVER_URL"); got == nil || got.Value != "https://api.example:6443" {
+		t.Fatalf("METALMAN_APISERVER_URL env = %#v, want https://api.example:6443", got)
 	}
 
 	assertSiteOwnerRef(t, deployment.OwnerReferences, "rack-a", "site-uid")
@@ -935,6 +948,33 @@ func TestMetalmanDeploymentRespectsNamespace(t *testing.T) {
 	if deployment.Namespace != "custom-ns" {
 		t.Fatalf("namespace = %q, want custom-ns", deployment.Namespace)
 	}
+}
+
+func TestMetalmanDeploymentOmitsEmptyAPIServerURL(t *testing.T) {
+	enabled := true
+	site := &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "rack-a"},
+		Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{Metalman: &unboundedv1alpha3.MetalmanComponentSpec{
+			SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: &enabled},
+		}}},
+	}
+
+	deployment := metalmanDeployment(site, DefaultNamespace, Config{MetalmanImage: "example/metalman:default"})
+
+	container := deployment.Spec.Template.Spec.Containers[0]
+	if got := findEnv(container.Env, "METALMAN_APISERVER_URL"); got != nil {
+		t.Fatalf("METALMAN_APISERVER_URL env = %#v, want unset when APIServerEndpoint is empty", got)
+	}
+}
+
+func findEnv(env []corev1.EnvVar, name string) *corev1.EnvVar {
+	for i := range env {
+		if env[i].Name == name {
+			return &env[i]
+		}
+	}
+
+	return nil
 }
 
 func TestReconcilerNamespaceFallsBackToDefault(t *testing.T) {
