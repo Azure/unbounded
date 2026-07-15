@@ -6,11 +6,12 @@
 //
 // The primary source is the standard cluster-info ConfigMap in the kube-public
 // namespace, which kubeadm-provisioned clusters (including kind) publish. Some
-// managed control planes (notably AKS) do not publish it; for those, Discover
+// managed control planes (notably AKS) do not publish it; for those, DiscoverURL
 // falls back to the KUBERNETES_SERVICE_HOST/PORT the kubelet injects, but only
 // when it resolves to an external FQDN rather than the in-cluster ClusterIP (on
 // AKS the kubernetes.azure.com/set-kube-service-host-fqdn pod label makes it the
-// public API FQDN), pairing it with the in-cluster service-account CA.
+// public API FQDN). The CA for that fallback comes from the in-cluster
+// service-account mount (see InClusterCA).
 package clusterinfo
 
 import (
@@ -97,31 +98,25 @@ func ResolveApiserverURL(ctx context.Context, clientset kubernetes.Interface) (s
 	return info.ApiserverURL, nil
 }
 
-// Discover resolves the external API server URL and CA certificate, preferring
-// the kube-public/cluster-info ConfigMap and falling back to the
-// KUBERNETES_SERVICE_HOST FQDN paired with the in-cluster service-account CA.
+// DiscoverURL resolves only the external API server URL, preferring the
+// kube-public/cluster-info ConfigMap and falling back to the
+// KUBERNETES_SERVICE_HOST FQDN (see KubeServiceHostEndpoint).
 //
-// The fallback exists for managed control planes (e.g. AKS) that do not publish
-// cluster-info. It is only taken when KUBERNETES_SERVICE_HOST is an external
-// FQDN (see KubeServiceHostEndpoint); an in-cluster ClusterIP is rejected so we
-// never advertise an endpoint a joining node cannot reach.
-func Discover(ctx context.Context, clientset kubernetes.Interface) (*ClusterInfo, error) {
+// Unlike a CA-inclusive resolve it never reads the in-cluster CA, so callers
+// that advertise only the endpoint (e.g. the operator) do not fail when the CA
+// mount is unavailable or unreadable.
+func DiscoverURL(ctx context.Context, clientset kubernetes.Interface) (string, error) {
 	info, cmErr := Resolve(ctx, clientset)
 	if cmErr == nil {
-		return info, nil
+		return info.ApiserverURL, nil
 	}
 
 	endpoint, ok := KubeServiceHostEndpoint()
 	if !ok {
-		return nil, fmt.Errorf("cluster-info discovery failed (%w) and no external KUBERNETES_SERVICE_HOST FQDN is available", cmErr)
+		return "", fmt.Errorf("cluster-info discovery failed (%w) and no external KUBERNETES_SERVICE_HOST FQDN is available", cmErr)
 	}
 
-	caPEM, caErr := InClusterCA()
-	if caErr != nil {
-		return nil, fmt.Errorf("cluster-info discovery failed (%w); reading in-cluster CA for the KUBERNETES_SERVICE_HOST fallback: %w", cmErr, caErr)
-	}
-
-	return &ClusterInfo{ApiserverURL: endpoint, CACertPEM: caPEM}, nil
+	return endpoint, nil
 }
 
 // KubeServiceHostEndpoint builds the API server URL from the

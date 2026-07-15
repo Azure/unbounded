@@ -123,12 +123,12 @@ func resolveAPIServerEndpoint(ctx context.Context, override string, clientset ku
 		return override, nil
 	}
 
-	info, err := clusterinfo.Discover(ctx, clientset)
+	endpoint, err := clusterinfo.DiscoverURL(ctx, clientset)
 	if err != nil {
 		return "", fmt.Errorf("no API server endpoint configured (set --api-server-endpoint or $UNBOUNDED_API_SERVER_ENDPOINT) and endpoint discovery failed: %w", err)
 	}
 
-	return info.ApiserverURL, nil
+	return endpoint, nil
 }
 
 func run(ctx context.Context, cfg config) error {

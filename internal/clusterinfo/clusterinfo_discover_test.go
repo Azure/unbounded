@@ -134,48 +134,46 @@ func TestInClusterCA(t *testing.T) {
 	})
 }
 
-func TestDiscover(t *testing.T) {
-	t.Run("cluster-info wins when present", func(t *testing.T) {
+func TestDiscoverURL(t *testing.T) {
+	t.Run("cluster-info URL wins when present", func(t *testing.T) {
 		client := fake.NewSimpleClientset(clusterInfoCM(map[string]string{"kubeconfig": validKubeconfig}))
 		// A usable FQDN fallback exists too; cluster-info must take precedence.
 		t.Setenv("KUBERNETES_SERVICE_HOST", "fallback.example.com")
 		t.Setenv("KUBERNETES_SERVICE_PORT_HTTPS", "443")
 
-		info, err := Discover(context.Background(), client)
+		url, err := DiscoverURL(context.Background(), client)
 		if err != nil {
-			t.Fatalf("Discover: %v", err)
+			t.Fatalf("DiscoverURL: %v", err)
 		}
 
-		if info.ApiserverURL != "https://control-plane.example:6443" {
-			t.Fatalf("ApiserverURL = %q, want cluster-info value", info.ApiserverURL)
-		}
-
-		if string(info.CACertPEM) != "test-ca" {
-			t.Fatalf("CACertPEM = %q, want cluster-info CA", info.CACertPEM)
+		if url != "https://control-plane.example:6443" {
+			t.Fatalf("url = %q, want cluster-info value", url)
 		}
 	})
 
-	t.Run("falls back to FQDN + in-cluster CA when cluster-info absent", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "ca.crt")
-		if err := os.WriteFile(path, []byte("in-cluster-ca"), 0o600); err != nil {
-			t.Fatalf("write CA: %v", err)
-		}
-
-		withInClusterCAPath(t, path)
+	t.Run("falls back to FQDN when cluster-info absent", func(t *testing.T) {
 		t.Setenv("KUBERNETES_SERVICE_HOST", "my-aks.hcp.eastus.azmk8s.io")
 		t.Setenv("KUBERNETES_SERVICE_PORT_HTTPS", "443")
 
-		info, err := Discover(context.Background(), fake.NewSimpleClientset())
+		url, err := DiscoverURL(context.Background(), fake.NewSimpleClientset())
 		if err != nil {
-			t.Fatalf("Discover: %v", err)
+			t.Fatalf("DiscoverURL: %v", err)
 		}
 
-		if info.ApiserverURL != "https://my-aks.hcp.eastus.azmk8s.io:443" {
-			t.Fatalf("ApiserverURL = %q, want FQDN fallback", info.ApiserverURL)
+		if url != "https://my-aks.hcp.eastus.azmk8s.io:443" {
+			t.Fatalf("url = %q, want FQDN fallback", url)
 		}
+	})
 
-		if string(info.CACertPEM) != "in-cluster-ca" {
-			t.Fatalf("CACertPEM = %q, want in-cluster CA", info.CACertPEM)
+	t.Run("succeeds without reading the in-cluster CA", func(t *testing.T) {
+		// The URL path must never touch the CA: an unreadable CA mount must not
+		// prevent endpoint resolution.
+		withInClusterCAPath(t, filepath.Join(t.TempDir(), "absent.crt"))
+		t.Setenv("KUBERNETES_SERVICE_HOST", "my-aks.hcp.eastus.azmk8s.io")
+		t.Setenv("KUBERNETES_SERVICE_PORT_HTTPS", "443")
+
+		if _, err := DiscoverURL(context.Background(), fake.NewSimpleClientset()); err != nil {
+			t.Fatalf("DiscoverURL: %v", err)
 		}
 	})
 
@@ -183,18 +181,8 @@ func TestDiscover(t *testing.T) {
 		t.Setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
 		t.Setenv("KUBERNETES_SERVICE_PORT_HTTPS", "443")
 
-		if _, err := Discover(context.Background(), fake.NewSimpleClientset()); err == nil {
-			t.Fatal("Discover: expected error, got nil")
-		}
-	})
-
-	t.Run("errors when FQDN available but in-cluster CA unreadable", func(t *testing.T) {
-		withInClusterCAPath(t, filepath.Join(t.TempDir(), "absent.crt"))
-		t.Setenv("KUBERNETES_SERVICE_HOST", "my-aks.hcp.eastus.azmk8s.io")
-		t.Setenv("KUBERNETES_SERVICE_PORT_HTTPS", "443")
-
-		if _, err := Discover(context.Background(), fake.NewSimpleClientset()); err == nil {
-			t.Fatal("Discover: expected error, got nil")
+		if _, err := DiscoverURL(context.Background(), fake.NewSimpleClientset()); err == nil {
+			t.Fatal("DiscoverURL: expected error, got nil")
 		}
 	})
 }
