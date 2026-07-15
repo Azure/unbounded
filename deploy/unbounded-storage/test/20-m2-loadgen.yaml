@@ -1,0 +1,106 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+#
+# M2: prove a functional non-privileged data path.
+#
+# Same non-privileged security posture as M1, but the config wires a complete
+# object path: a synthetic "fake" backend -> a cache -> an in-process loadgen
+# frontend with verify=true. The loadgen worker fetches objects through the
+# backing pool + io_uring file disk and validates the returned bytes against
+# the deterministic synthetic dataset, so a clean run (GETs with status=200 and
+# no verification panic) proves the read/write path end to end without any
+# external origin or client.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-storage-m2
+  namespace: unbounded-storage-test
+data:
+  config.toml: |
+    version = 0
+
+    [startup.memory]
+    no_hugepages = true
+    memory_total_bytes = 134217728
+
+    [startup.fabric.binds.tcp]
+    addr = "0.0.0.0:0"
+
+    [startup.topology]
+    disable_rdma = true
+    serving_cores = 1
+    nic_workers = 1
+
+    [startup.metrics]
+    addr = "0.0.0.0:9100"
+
+    [[disks]]
+    [disks.config.file]
+    path = "/var/lib/unbounded-storage/cache.disk"
+    size = 2147483648
+
+    [[backends]]
+    name = "origin"
+    [backends.config.fake]
+    object_size_bytes = 1048576
+
+    [[caches]]
+    name = "cache0"
+    source = "origin"
+
+    [[frontends]]
+    name = "loadgen0"
+    source = "cache0"
+    [frontends.config.loadgen]
+    workers = 1
+    verify = true
+    object_size_bytes = 1048576
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unbounded-storage-m2
+  namespace: unbounded-storage-test
+  labels:
+    app: unbounded-storage
+    milestone: m2
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: node-1
+  containers:
+    - name: unbounded-storage
+      image: ghcr.io/azure/unbounded-storage:REPLACE_WITH_SHA
+      args:
+        - --config
+        - /etc/unbounded-storage/config.toml
+      ports:
+        - name: metrics
+          containerPort: 9100
+      securityContext:
+        privileged: false
+        runAsUser: 0
+        allowPrivilegeEscalation: true
+        capabilities:
+          drop: ["ALL"]
+          add: ["IPC_LOCK", "SYS_NICE"]
+        seccompProfile:
+          type: Unconfined
+      resources:
+        requests:
+          cpu: 500m
+          memory: 512Mi
+        limits:
+          memory: 1Gi
+      volumeMounts:
+        - name: config
+          mountPath: /etc/unbounded-storage
+          readOnly: true
+        - name: data
+          mountPath: /var/lib/unbounded-storage
+  volumes:
+    - name: config
+      configMap:
+        name: unbounded-storage-m2
+    - name: data
+      emptyDir: {}

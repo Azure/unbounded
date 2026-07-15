@@ -1,0 +1,95 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Hermetic build of the unbounded-storage daemon (the repository's only Rust
+# crate) plus its bundled native runtime dependency closure (libfabric >= 2.0,
+# OpenSSL >= 3.5 with kTLS, liburing). Unlike the supervisor image, this image
+# runs the daemon itself directly as a container process (no systemd, no host
+# install), which is what allows it to run as an ordinary, non-privileged pod.
+#
+# Both stages are pinned to ubuntu:noble so the daemon (dynamically linked
+# against glibc and the bundled .so closure) runs against the same libc it was
+# built with. Do not mix distro releases across the two stages.
+#
+# NOTE: this build compiles libfabric, OpenSSL and the Rust crate from source
+# via `make unbounded-storage-tarball`, so it is intentionally hermetic and
+# reproducible rather than fast. Build for a single native platform
+# (linux/amd64) to avoid emulating the whole toolchain under QEMU.
+
+# -----------------------------------------------------------------------------
+# Build stage
+# -----------------------------------------------------------------------------
+FROM ubuntu:noble AS builder
+
+# Native toolchain + libraries needed by the Makefile's source builds:
+#   - build-essential/make/gcc/g++/pkg-config: C/C++ toolchain for libfabric,
+#     OpenSSL, and the crate's cc-compiled fabric shim.
+#   - clang: some crates prefer clang for bindgen-style builds; harmless to have.
+#   - perl: required by OpenSSL's Configure.
+#   - autoconf/libtool/automake: libfabric's build tooling.
+#   - liburing-dev: libfabric --with-uring and the tarball's liburing.so.2
+#     bundling step both require it.
+#   - curl/ca-certificates/git/xz-utils/bzip2: fetch + unpack pinned sources.
+# The crate's build.rs uses a vendored protoc (protoc_bin_vendored), so no
+# system protobuf compiler is required.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    make \
+    gcc \
+    g++ \
+    pkg-config \
+    clang \
+    perl \
+    autoconf \
+    automake \
+    libtool \
+    liburing-dev \
+    curl \
+    ca-certificates \
+    git \
+    xz-utils \
+    bzip2 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install a pinned Rust toolchain. The crate uses edition 2024 (needs
+# Rust >= 1.85); pin to a known-good stable to keep the image reproducible.
+ARG RUST_VERSION=1.96.0
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}"
+
+WORKDIR /src
+COPY . .
+
+# Build the daemon and assemble the release tarball (bin/ + bundled lib/).
+# This reuses the exact same targets used for host releases, so the container
+# and host artifacts are byte-for-byte equivalent.
+RUN make unbounded-storage-tarball
+
+# -----------------------------------------------------------------------------
+# Runtime stage
+# -----------------------------------------------------------------------------
+FROM ubuntu:noble
+
+# ca-certificates for verifying TLS to origins. Everything else the daemon
+# needs at runtime (libfabric, libssl/libcrypto, liburing) is bundled in the
+# tarball's lib/ directory and loaded via LD_LIBRARY_PATH below.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Extract the release tarball into /opt/unbounded-storage/current so the layout
+# matches the host install (bin/ + lib/ side by side).
+COPY --from=builder /src/dist/unbounded-storage-linux-amd64.tar.gz /tmp/unbounded-storage.tar.gz
+RUN mkdir -p /opt/unbounded-storage/current \
+    && tar -xzf /tmp/unbounded-storage.tar.gz -C /opt/unbounded-storage/current --strip-components=1 \
+    && rm -f /tmp/unbounded-storage.tar.gz \
+    && test -x /opt/unbounded-storage/current/bin/unbounded-storage
+
+ENV LD_LIBRARY_PATH=/opt/unbounded-storage/current/lib
+
+# The daemon takes a single --config flag. The config path is mounted in by the
+# pod (a ConfigMap for the static-config PoC, or rendered by the supervisor).
+ENTRYPOINT ["/opt/unbounded-storage/current/bin/unbounded-storage", "--config", "/etc/unbounded-storage/config.toml"]

@@ -91,6 +91,11 @@ UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE ?= unbounded-kube
 UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-storage-supervisor
 UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-storage-supervisor/rendered
 
+# unbounded-storage daemon container image (the Rust crate below, packaged to
+# run directly as a container process rather than a host systemd service).
+UNBOUNDED_STORAGE_TAG ?= latest
+UNBOUNDED_STORAGE_IMAGE=$(CONTAINER_REGISTRY)/unbounded-storage:$(UNBOUNDED_STORAGE_TAG)
+
 # Rust binaries
 UNBOUNDED_STORAGE_BIN=bin/unbounded-storage
 UNBOUNDED_STORAGE_CRATE=./cmd/unbounded-storage
@@ -217,7 +222,7 @@ REACT_DEV ?= false
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
-.PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
+.PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push image-unbounded-storage-local image-unbounded-storage-push
 
 ##@ General
 
@@ -292,6 +297,8 @@ help: ## Show this help
 	@echo "  image-inventory-viewer-push      Build and push the inventory-viewer container image"
 	@echo "  image-unbounded-storage-supervisor-local Build a local unbounded-storage-supervisor container image"
 	@echo "  image-unbounded-storage-supervisor-push  Build and push the unbounded-storage-supervisor container image"
+	@echo "  image-unbounded-storage-local            Build a local unbounded-storage daemon container image"
+	@echo "  image-unbounded-storage-push             Build and push the unbounded-storage daemon container image"
 	@echo "  image-machina-local              Build machina image with \$$(CONTAINER_ENGINE)"
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-metalman-local             Build metalman image"
@@ -917,6 +924,17 @@ image-unbounded-storage-supervisor-local: ## Build the unbounded-storage-supervi
 .PHONY: image-unbounded-storage-supervisor-push
 image-unbounded-storage-supervisor-push: image-unbounded-storage-supervisor-local ## Build and push the unbounded-storage-supervisor container image
 	$(CONTAINER_ENGINE) push $(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE)
+
+.PHONY: image-unbounded-storage-local
+image-unbounded-storage-local: ## Build the unbounded-storage daemon container image locally (single-arch, hermetic Rust build)
+	$(CONTAINER_ENGINE) build \
+		-t unbounded-storage:$(UNBOUNDED_STORAGE_TAG) -t $(UNBOUNDED_STORAGE_IMAGE) \
+		-f ./images/unbounded-storage/Containerfile .
+	$(call trivy-maybe,$(UNBOUNDED_STORAGE_IMAGE))
+
+.PHONY: image-unbounded-storage-push
+image-unbounded-storage-push: image-unbounded-storage-local ## Build and push the unbounded-storage daemon container image
+	$(CONTAINER_ENGINE) push $(UNBOUNDED_STORAGE_IMAGE)
 
 image-machina-local: ## Build the machina container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \

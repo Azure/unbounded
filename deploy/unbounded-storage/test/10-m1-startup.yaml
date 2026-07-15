@@ -1,0 +1,94 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+#
+# M1: prove the unbounded-storage daemon starts as a NON-privileged pod.
+#
+# The daemon runs with privileged=false, dropping ALL capabilities and adding
+# back only IPC_LOCK (memlock for io_uring / fabric buffer registration; also
+# bypasses RLIMIT_MEMLOCK, which the daemon never raises itself) and SYS_NICE
+# (insurance for sched_setaffinity / mbind CPU + NUMA pinning). The seccomp
+# profile is Unconfined because the containerd default profile drops the
+# io_uring_setup / io_uring_enter / io_uring_register syscalls the daemon
+# depends on.
+#
+# This PoC targets a cluster with no hugepages and no RDMA device plugin, so
+# the config uses the heap backing (no_hugepages), the libfabric TCP provider
+# (disable_rdma), and a file-backed disk on an emptyDir. No frontends: this
+# milestone only proves clean startup + a live metrics endpoint.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-storage-m1
+  namespace: unbounded-storage-test
+data:
+  config.toml: |
+    version = 0
+
+    [startup.memory]
+    no_hugepages = true
+    memory_total_bytes = 134217728
+
+    [startup.fabric.binds.tcp]
+    addr = "0.0.0.0:0"
+
+    [startup.topology]
+    disable_rdma = true
+    serving_cores = 1
+    nic_workers = 1
+
+    [startup.metrics]
+    addr = "0.0.0.0:9100"
+
+    [[disks]]
+    [disks.config.file]
+    path = "/var/lib/unbounded-storage/cache.disk"
+    size = 2147483648
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unbounded-storage-m1
+  namespace: unbounded-storage-test
+  labels:
+    app: unbounded-storage
+    milestone: m1
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: node-1
+  containers:
+    - name: unbounded-storage
+      image: ghcr.io/azure/unbounded-storage:REPLACE_WITH_SHA
+      args:
+        - --config
+        - /etc/unbounded-storage/config.toml
+      ports:
+        - name: metrics
+          containerPort: 9100
+      securityContext:
+        privileged: false
+        runAsUser: 0
+        allowPrivilegeEscalation: true
+        capabilities:
+          drop: ["ALL"]
+          add: ["IPC_LOCK", "SYS_NICE"]
+        seccompProfile:
+          type: Unconfined
+      resources:
+        requests:
+          cpu: 500m
+          memory: 512Mi
+        limits:
+          memory: 1Gi
+      volumeMounts:
+        - name: config
+          mountPath: /etc/unbounded-storage
+          readOnly: true
+        - name: data
+          mountPath: /var/lib/unbounded-storage
+  volumes:
+    - name: config
+      configMap:
+        name: unbounded-storage-m1
+    - name: data
+      emptyDir: {}

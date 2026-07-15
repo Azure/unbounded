@@ -1,0 +1,16 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+#
+# Test namespace for the non-privileged unbounded-storage daemon proof of
+# concept. Pod Security Admission is set to "privileged" because the pod adds
+# the IPC_LOCK and SYS_NICE capabilities and runs with an Unconfined seccomp
+# profile (required for io_uring syscalls), both of which the baseline and
+# restricted PSA levels reject.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: unbounded-storage-test
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: privileged
+    pod-security.kubernetes.io/audit: privileged
