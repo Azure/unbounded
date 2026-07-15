@@ -8,6 +8,7 @@ import atexit
 import base64
 import json
 import os
+import re
 import signal
 import shutil
 import socket
@@ -18,6 +19,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +43,7 @@ KIND_SMOKE_IP = f"{SUBNET}.2"  # IP assigned to the kind container on virbr-smok
 GATEWAY = SERVER_IP
 DNS_SERVER = "8.8.8.8"
 MAC_ADDRESS = "52:54:00:aa:bb:01"
-REDFISH_PORT = 8443
+REDFISH_PORT = int(os.environ.get("SMOKE_REDFISH_PORT", "8443"))
 HTTP_PORT = 8880
 AGENT_DOWNLOAD_PORT = 8881
 CACHE_DIR = TMPDIR / "cache"
@@ -63,15 +65,21 @@ AGENT_BINARY = REPO_ROOT / "bin" / "unbounded-agent"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
 REDFISH_FIXTURE_BINARY = REPO_ROOT / "bin" / "metalman-redfish-fixture"
 BRIDGE = "virbr-smoke"
-# The fixture owns the VM state directory: NVRAM, TPM state, and the serial,
-# guest-agent (QGA), and QMP unix sockets all live here.
+# The fixture owns the VM state directory: TPM state and the Cloud Hypervisor
+# api/serial unix sockets all live here. Cloud Hypervisor exposes exactly one
+# socket-backed character device, the legacy serial port (ttyS0), which it
+# wires to console.sock. That single socket carries the kernel console and the
+# guest image's autologin root shell, which is the automation channel the tests
+# drive (via a marker-based protocol that tolerates interleaved kernel output).
 STATE_DIR = TMPDIR / "vmstate"
 DISK = TMPDIR / "disk.qcow2"
-OVMF_CODE = "/usr/share/OVMF/OVMF_CODE_4M.fd"
-OVMF_VARS = "/usr/share/OVMF/OVMF_VARS_4M.fd"
+# Custom Cloud Hypervisor OVMF firmware blob (built by
+# hack/scripts/build-cloudhv-firmware.sh). Cloud Hypervisor consumes a single
+# flat firmware via --firmware; there is no separate NVRAM/vars file.
+FIRMWARE = str(REPO_ROOT / "bin" / "cloudhv-firmware" / "CLOUDHV.fd")
+# The VM disk starts empty; the VM PXE-boots, installs the OS onto it, then
+# reboots into the installed image.
 SERIAL_SOCK = STATE_DIR / "console.sock"
-QGA_SOCK = STATE_DIR / "qga.sock"
-QMP_SOCK = STATE_DIR / "qmp.sock"
 REDFISH_URL = f"https://127.0.0.1:{REDFISH_PORT}"
 REDFISH_USER = ""
 REDFISH_PASS = "smoke"
@@ -139,108 +147,156 @@ def check_procs() -> None:
             die(f"Background process {proc.args} exited with code {ret}")
 
 
-def forward_console(sock_path: Path) -> None:
-    """Connect to the VM serial console and copy output to stderr.
+class _SerialConsole:
+    """Command driver for the guest's autologin root shell on ttyS0.
 
-    Runs in a daemon thread.  Re-connects whenever the socket disappears
-    (the VM may be powered off and back on during the test).
+    Cloud Hypervisor exposes exactly one socket-backed character device, the
+    legacy serial port, which the fixture wires to SERIAL_SOCK. The guest image
+    runs an autologin root getty there, giving a credential-free shell. The
+    kernel console shares that port, so its output interleaves with the shell.
+
+    A single background reader thread owns the one connection: it tees every
+    byte to stderr (so boot progress and kernel messages are visible even
+    before a shell exists) and appends to a shared buffer that exec() searches.
+    This lets one connection serve both the human console tee and the command
+    channel, which the single serial socket requires.
+
+    Commands are shipped base64-encoded and run via ``eval`` so the shell's
+    input echo never contains the result markers (which would otherwise create
+    false matches). stdout/stderr/exit-code are captured to files and emitted
+    base64-encoded between unique per-command sentinels, so binary output,
+    newlines, and interleaved kernel spew never confuse the parser.
     """
-    while True:
-        # Wait for the socket to appear.
-        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            conn.connect(str(sock_path))
-        except (FileNotFoundError, ConnectionRefusedError, OSError):
-            conn.close()
+
+    def __init__(self, sock_path: Path) -> None:
+        self.sock_path = sock_path
+        self.conn: socket.socket | None = None
+        self.buf = b""
+        self.buf_lock = threading.Lock()
+        self.cmd_lock = threading.Lock()
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self) -> None:
+        """Own the single console connection: tee to stderr and buffer."""
+        while True:
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                conn.connect(str(self.sock_path))
+            except (FileNotFoundError, ConnectionRefusedError, OSError):
+                conn.close()
+                time.sleep(1)
+                continue
+
+            with self.buf_lock:
+                self.conn = conn
+                self.buf = b""
+
+            try:
+                while True:
+                    data = conn.recv(65536)
+                    if not data:
+                        break
+                    sys.stderr.buffer.write(data)
+                    sys.stderr.buffer.flush()
+                    with self.buf_lock:
+                        self.buf += data
+                        if len(self.buf) > 4 * 1024 * 1024:
+                            self.buf = self.buf[-1024 * 1024:]
+            except OSError:
+                pass
+            finally:
+                with self.buf_lock:
+                    if self.conn is conn:
+                        self.conn = None
+                conn.close()
+
+            # Socket closed - VM probably rebooted or powered off.  Retry.
             time.sleep(1)
-            continue
 
+    def _wait_conn(self, deadline: float) -> socket.socket:
+        while True:
+            with self.buf_lock:
+                if self.conn is not None:
+                    return self.conn
+            if time.monotonic() > deadline:
+                raise ConnectionError("console not connected")
+            time.sleep(0.1)
+
+    def exec(self, command: str, timeout: int = 30) -> tuple[int, str, str]:
+        gid = uuid.uuid4().hex
+        script = (
+            f"{{ {command} ; }} >/tmp/ge_{gid}.out 2>/tmp/ge_{gid}.err; rc=$?; "
+            f'echo "GEO{gid}:$(base64 -w0 /tmp/ge_{gid}.out)"; '
+            f'echo "GEE{gid}:$(base64 -w0 /tmp/ge_{gid}.err)"; '
+            f'echo "GER{gid}:$rc"; '
+            f"rm -f /tmp/ge_{gid}.out /tmp/ge_{gid}.err"
+        )
+        payload = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        line = f'eval "$(echo {payload} | base64 -d)"\n'
+        end_re = re.compile(rf"GER{gid}:(\d+)".encode("ascii"))
+
+        with self.cmd_lock:
+            deadline = time.monotonic() + timeout
+            for attempt in range(2):
+                try:
+                    conn = self._wait_conn(deadline)
+                    conn.sendall(line.encode("utf-8"))
+                    while True:
+                        with self.buf_lock:
+                            m = end_re.search(self.buf)
+                            if m:
+                                return self._parse_locked(gid, m)
+                        if time.monotonic() > deadline:
+                            raise TimeoutError(
+                                f"guest command did not complete within {timeout}s"
+                            )
+                        time.sleep(0.05)
+                except (OSError, ConnectionError) as e:
+                    # The VM may have rebooted or power-cycled; retry once.
+                    if attempt == 1:
+                        raise RuntimeError(f"console exec failed: {e}") from e
+                    time.sleep(0.5)
+            raise RuntimeError("console exec failed")
+
+    def _parse_locked(self, gid: str, end_match: Any) -> tuple[int, str, str]:
+        """Parse captured output. Caller must hold buf_lock."""
+        exit_code = int(end_match.group(1))
+        out = self._extract_locked(f"GEO{gid}:")
+        err = self._extract_locked(f"GEE{gid}:")
+        # Drop everything up to and including the end marker so the next command
+        # starts from a clean buffer.
+        self.buf = self.buf[end_match.end():]
+        return exit_code, out, err
+
+    def _extract_locked(self, marker: str) -> str:
+        mre = re.compile(re.escape(marker).encode("ascii") + rb"([A-Za-z0-9+/=]*)")
+        m = mre.search(self.buf)
+        if not m:
+            return ""
         try:
-            while True:
-                data = conn.recv(4096)
-                if not data:
-                    break
-                sys.stderr.buffer.write(data)
-                sys.stderr.buffer.flush()
-        except OSError:
-            pass
-        finally:
-            conn.close()
-
-        # Socket closed - VM probably rebooted.  Retry.
-        time.sleep(1)
+            return base64.b64decode(m.group(1)).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
 
 
-def _qga_call(request: dict[str, Any], timeout: int = 10) -> Any:
-    """Send a single JSON request to the QEMU guest agent unix socket.
-
-    Connects to QGA_SOCK, writes the newline-terminated request, reads the
-    newline-delimited JSON reply, and returns its "return" value.
-    """
-    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    conn.settimeout(timeout)
-    try:
-        conn.connect(str(QGA_SOCK))
-        conn.sendall((json.dumps(request) + "\n").encode("utf-8"))
-        buf = b""
-        while b"\n" not in buf:
-            chunk = conn.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-    finally:
-        conn.close()
-
-    line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
-    if not line:
-        raise RuntimeError("guest agent returned no response")
-    reply = json.loads(line)
-    if "error" in reply:
-        raise RuntimeError(f"guest agent error: {reply['error']}")
-    return reply.get("return")
+_console = _SerialConsole(SERIAL_SOCK)
 
 
 def guest_exec(command: str, timeout: int = 30) -> tuple[int, str, str]:
-    """Execute a command inside the VM via the QEMU guest agent.
+    """Execute a command inside the VM over the ttyS0 autologin shell.
 
-    Returns (exit_code, stdout, stderr).  Talks directly to the guest agent
-    unix socket (QGA_SOCK) exposed by the fixture.  Requires the guest agent
-    channel to be configured on the VM and the qemu-guest-agent service running
-    inside the guest.
+    Returns (exit_code, stdout, stderr). Talks to the fixture's serial console
+    (SERIAL_SOCK); requires the guest image's autologin root getty on ttyS0.
     """
-    ret = _qga_call({
-        "execute": "guest-exec",
-        "arguments": {
-            "path": "/bin/bash",
-            "arg": ["-c", command],
-            "capture-output": True,
-        },
-    })
-    pid = ret["pid"]
-
-    # Poll guest-exec-status until the process exits.
-    deadline = time.monotonic() + timeout
-    while True:
-        status = _qga_call({
-            "execute": "guest-exec-status",
-            "arguments": {"pid": pid},
-        })
-        if status.get("exited"):
-            exit_code = status.get("exitcode", -1)
-            stdout = base64.b64decode(status.get("out-data", "")).decode("utf-8", errors="replace")
-            stderr = base64.b64decode(status.get("err-data", "")).decode("utf-8", errors="replace")
-            return exit_code, stdout, stderr
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"guest-exec pid {pid} did not exit within {timeout}s")
-        time.sleep(0.5)
+    return _console.exec(command, timeout=timeout)
 
 
 def collect_debug_logs() -> None:
-    """Use the QEMU guest agent to dump kubelet and agent debug information.
+    """Dump kubelet and agent debug information over the automation console.
 
     Best-effort: failures are logged but do not abort the test.
     """
-    log("Collecting debug logs from VM via QEMU guest agent...")
+    log("Collecting debug logs from VM via automation console...")
     commands = [
         # Network diagnostics - must come first to diagnose download hangs.
         ("resolv.conf", "cat /etc/resolv.conf"),
@@ -282,9 +338,9 @@ def collect_debug_logs() -> None:
             log(f"  (failed to collect {label}: {e})")
 
     # Kubernetes-side diagnostics (run from the host via kubectl).
-    # These commands survive the QEMU guest agent dying inside the VM, which
-    # is critical because the in-guest collectors above frequently fail with
-    # "Guest agent is not responding" by the time the test gives up.
+    # These commands survive the automation console dying inside the VM, which
+    # is critical because the in-guest collectors above frequently fail by the
+    # time the test gives up.
     k8s_commands = [
         ("kubectl describe node", [KUBECTL, "describe", "node", NODE_NAME]),
         ("kubectl get pods -A", [KUBECTL, "get", "pods", "-A", "-o", "wide"]),
@@ -372,8 +428,9 @@ def clean_stale() -> None:
     # Kill any leftover Redfish fixture from a previous run before touching the
     # bridge it owns.
     run_quiet(["sudo", "pkill", "-f", "metalman-redfish-fixture"])
-    # Kill any leftover qemu guest from a previous run.
-    run_quiet(["sudo", "pkill", "-f", f"qemu-system-x86_64.*{VM_NAME}"])
+    # Kill any leftover cloud-hypervisor guest from a previous run.
+    run_quiet(["sudo", "pkill", "-f", f"cloud-hypervisor.*{VM_NAME}"])
+    run_quiet(["sudo", "pkill", "-f", f"cloud-hypervisor.*{STATE_DIR}"])
     run_quiet(["sudo", "pkill", "-f", f"swtpm.*{STATE_DIR}"])
     time.sleep(1)
     # Remove stale bridge/tap/veth left behind by a previous run. The fixture
@@ -573,7 +630,7 @@ def configure_kind_kube_proxy_apiserver(api_server: str) -> None:
 
 
 def _probe_vm_network() -> None:
-    """Run quick network diagnostics inside the VM via guest agent."""
+    """Run quick network diagnostics inside the VM via the automation console."""
     log("  Probing VM network (one-time diagnostic)...")
     for label, cmd in [
         ("resolv.conf", "cat /etc/resolv.conf"),
@@ -648,21 +705,21 @@ def wait_vm_state(expected: str, timeout: int = 300) -> None:
 
 
 def wait_guest_agent(timeout: int = 300) -> None:
-    """Wait until the guest OS responds through the QEMU guest agent."""
-    log("  Waiting for QEMU guest agent to respond...")
+    """Wait until the guest OS responds through the ttyS0 automation console."""
+    log("  Waiting for guest automation console to respond...")
     for elapsed in range(timeout):
         check_procs()
         try:
             exit_code, _, _ = guest_exec("true", timeout=10)
             if exit_code == 0:
-                log("  QEMU guest agent is responsive")
+                log("  Guest automation console is responsive")
                 return
         except (RuntimeError, TimeoutError, subprocess.TimeoutExpired, OSError):
             pass
         if elapsed > 0 and elapsed % 15 == 0:
-            log(f"    ({elapsed}s) guest agent not responsive yet")
+            log(f"    ({elapsed}s) guest console not responsive yet")
         time.sleep(1)
-    die("Timed out waiting for QEMU guest agent")
+    die("Timed out waiting for guest automation console")
 
 
 def machine_status() -> str | None:
@@ -1065,8 +1122,7 @@ def main() -> None:
         "--username", REDFISH_USER, "--password", REDFISH_PASS,
         "--disk", str(DISK),
         "--state-dir", str(STATE_DIR),
-        "--ovmf-code", OVMF_CODE,
-        "--ovmf-vars", OVMF_VARS,
+        "--firmware", FIRMWARE,
         "--bridge", BRIDGE,
         "--bridge-address", SERVER_IP,
         "--manage-boot-order",
@@ -1141,11 +1197,9 @@ def main() -> None:
              "--type=strategic", "-p", patch])
     configure_kind_kube_proxy_apiserver(f"https://{KIND_SMOKE_IP}:6443")
 
-    log("Starting serial console forwarding")
-    console_thread = threading.Thread(
-        target=forward_console, args=(SERIAL_SOCK,), daemon=True,
-    )
-    console_thread.start()
+    # The _SerialConsole reader thread (started at module import) already tees
+    # the guest console to stderr as soon as the fixture creates the socket, so
+    # no separate forwarder is needed here.
 
     redfish_url = REDFISH_URL
     time.sleep(2)

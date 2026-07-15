@@ -1,24 +1,26 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// Package qemusvr implements a recording Redfish fixture backed by one QEMU/KVM
-// virtual machine. It is a Go reimplementation of hack/metalman-redfish-fixture.py
-// used by the metalman smoke tests.
+// Package qemusvr implements a recording Redfish fixture backed by one
+// Cloud Hypervisor virtual machine. It is a Go reimplementation of
+// hack/metalman-redfish-fixture.py used by the metalman smoke tests.
 //
 // The package is split into two layers: Server implements the Redfish semantics
 // (routing, authentication, request validation, and JSONL recording), and
-// Machine (see qemu.go) launches and controls the QEMU process directly. Server
-// talks to the machine layer only through the Backend interface, which is faked
-// in tests.
+// Machine (see qemu.go) launches and controls the cloud-hypervisor process
+// directly. Server talks to the machine layer only through the Backend
+// interface, which is faked in tests.
 //
-// PXE overrides update the QEMU boot order directly. A UefiHttp PATCH is
-// translated into a dnsmasq configuration bound to the boundary bridge: the
-// Redfish static-NIC address becomes a DHCP reservation and the HttpBootUri
-// becomes the UEFI HTTP boot URL. Stock OVMF then performs a genuine
-// firmware-native UEFI HTTP boot, fetching the boot entrypoint over HTTP itself.
-// The address and boot URL are delivered via a DHCP reservation rather than
-// firmware static configuration because upstream OVMF HttpBootDxe always DHCPs;
-// Metalman's Redfish behavior is exercised and asserted unchanged.
+// PXE overrides record the boot preference; the CloudHv OVMF firmware boots the
+// disk when it holds a bootable OS and otherwise falls back to network boot. A
+// UefiHttp PATCH is translated into a dnsmasq configuration bound to the
+// boundary bridge: the Redfish static-NIC address becomes a DHCP reservation and
+// the HttpBootUri becomes the UEFI HTTP boot URL. The OVMF firmware then
+// performs a genuine firmware-native UEFI HTTP boot, fetching the boot
+// entrypoint over HTTP itself. The address and boot URL are delivered via a DHCP
+// reservation rather than firmware static configuration because upstream OVMF
+// HttpBootDxe always DHCPs; Metalman's Redfish behavior is exercised and
+// asserted unchanged.
 package qemusvr
 
 import (
@@ -54,14 +56,14 @@ type Config struct {
 	Domain string
 	MAC    string
 
-	// QEMU virtual machine definition.
-	Disk       string // qcow2 disk image path
-	MemoryMiB  int    // guest RAM in MiB (default 4096)
-	VCPUs      int    // guest vCPU count (default 2)
-	OVMFCode   string // read-only OVMF firmware code pflash image
-	OVMFVars   string // OVMF variables template, copied once to the NVRAM store
-	SecureBoot bool   // enable SMM + secure boot pflash for .ms firmware
-	StateDir   string // working directory for NVRAM, sockets, and TPM state
+	// Cloud Hypervisor virtual machine definition.
+	Disk               string // qcow2 disk image path
+	MemoryMiB          int    // guest RAM in MiB (default 4096)
+	VCPUs              int    // guest vCPU count (default 2)
+	Firmware           string // CloudHv OVMF firmware blob (read-only)
+	FirmwareSecureBoot string // CloudHv OVMF firmware blob used when SecureBoot is set
+	SecureBoot         bool   // enroll a Secure Boot Platform Key via SMBIOS and use the secure-boot firmware
+	StateDir           string // working directory for sockets and TPM state
 
 	// Networking. When Bridge is set the fixture creates the bridge, assigns
 	// BridgeAddress/BridgePrefix to it, brings it up, and installs outbound NAT

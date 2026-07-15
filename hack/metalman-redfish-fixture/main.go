@@ -2,8 +2,9 @@
 // Licensed under the MIT License.
 
 // Command metalman-redfish-fixture runs a recording Redfish fixture backed by
-// one QEMU/KVM virtual machine launched directly (no libvirt). It is a small
-// example wrapper around the qemusvr library used by the metalman smoke tests.
+// one Cloud Hypervisor virtual machine launched directly (no libvirt). It is a
+// small example wrapper around the qemusvr library used by the metalman smoke
+// tests.
 package main
 
 import (
@@ -35,10 +36,10 @@ func run() error {
 	fs.StringVar(&cfg.Disk, "disk", "", "guest qcow2 disk image path (required)")
 	fs.IntVar(&cfg.MemoryMiB, "memory-mib", 4096, "guest RAM in MiB")
 	fs.IntVar(&cfg.VCPUs, "vcpus", 2, "guest vCPU count")
-	fs.StringVar(&cfg.OVMFCode, "ovmf-code", "", "read-only OVMF firmware code pflash image (required)")
-	fs.StringVar(&cfg.OVMFVars, "ovmf-vars", "", "OVMF variables template copied to the NVRAM store (required)")
-	fs.BoolVar(&cfg.SecureBoot, "secure-boot", false, "enable SMM and secure boot pflash")
-	fs.StringVar(&cfg.StateDir, "state-dir", "", "working directory for NVRAM, sockets, and TPM state (required)")
+	fs.StringVar(&cfg.Firmware, "firmware", "", "CloudHv OVMF firmware blob, read-only (required)")
+	fs.StringVar(&cfg.FirmwareSecureBoot, "firmware-secureboot", "", "CloudHv OVMF firmware blob used when --secure-boot is set")
+	fs.BoolVar(&cfg.SecureBoot, "secure-boot", false, "enroll a Secure Boot Platform Key via SMBIOS and use the secure-boot firmware")
+	fs.StringVar(&cfg.StateDir, "state-dir", "", "working directory for sockets and TPM state (required)")
 	fs.StringVar(&cfg.Bridge, "bridge", "", "boundary bridge interface the fixture creates and manages")
 	fs.StringVar(&cfg.BridgeAddress, "bridge-address", "", "host IP assigned to the bridge (the guest gateway)")
 	fs.IntVar(&cfg.BridgePrefix, "bridge-prefix", 24, "CIDR prefix length for the bridge address")
@@ -54,11 +55,19 @@ func run() error {
 	for name, value := range map[string]string{
 		"cert": cfg.Cert, "key": cfg.Key, "domain": cfg.Domain,
 		"mac": cfg.MAC, "record": cfg.Record, "disk": cfg.Disk,
-		"ovmf-code": cfg.OVMFCode, "ovmf-vars": cfg.OVMFVars, "state-dir": cfg.StateDir,
+		"state-dir": cfg.StateDir,
 	} {
 		if value == "" {
 			return fmt.Errorf("--%s is required", name)
 		}
+	}
+
+	if cfg.SecureBoot {
+		if cfg.FirmwareSecureBoot == "" {
+			return fmt.Errorf("--firmware-secureboot is required when --secure-boot is set")
+		}
+	} else if cfg.Firmware == "" {
+		return fmt.Errorf("--firmware is required")
 	}
 
 	if cfg.Bridge != "" && cfg.BridgeAddress == "" {

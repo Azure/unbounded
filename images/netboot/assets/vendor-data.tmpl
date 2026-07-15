@@ -49,7 +49,28 @@ write_files:
   permissions: '0644'
   content: |
     $nrconf{restart} = 'l';
+# Serial-console automation channel for the metalman smoke tests. Cloud
+# Hypervisor exposes exactly one socket-backed character device, the legacy
+# serial port (ttyS0), which it wires to a host unix socket the tests drive.
+# An autologin root getty on ttyS0 gives them a command shell without
+# credentials. The kernel console also lives on ttyS0, so kernel output
+# interleaves with the shell; the tests use a marker-based command protocol
+# that tolerates that interleaving. On real bare-metal hardware ttyS0 is a
+# genuine serial port, so autologin there is a deliberate console convenience
+# consistent with the appliance model.
+- path: /etc/systemd/system/[email protected]/autologin.conf
+  permissions: '0644'
+  content: |
+    [Service]
+    ExecStart=
+    ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud %I 115200,38400,9600 linux
 runcmd:
+- - /bin/bash
+  - -c
+  - |
+    set -eo pipefail
+    # Bring up the autologin shell the smoke tests drive on ttyS0. Best-effort.
+    systemctl enable --now [email protected] || true
 - - /bin/bash
   - -c
   - |

@@ -4,10 +4,14 @@
 package qemusvr
 
 import (
-	"bufio"
-	"encoding/json"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"os/exec"
@@ -19,33 +23,48 @@ import (
 	"time"
 )
 
-// Machine is the QEMU-interaction layer. It launches and controls a single
-// QEMU/KVM guest directly (no libvirt) and manages host networking. It performs
-// no Redfish semantics and holds no Redfish resource state; it shells out to
-// external commands directly via os/exec and satisfies the Backend interface
-// consumed by Server.
+// pkOemPrefixGUID is gOvmfPkKek1AppPrefixGuid from OvmfPkg.dec. The custom
+// CloudHv OVMF build ships an auto-dispatched EnrollDefaultKeys DXE driver that
+// scans the SMBIOS type-11 OEM strings for an entry of the form
+// "<pkOemPrefixGUID>:<base64 DER X509 cert>", enrolls that certificate as the
+// Platform Key together with the compiled-in Microsoft KEK/db certificates, and
+// so brings the guest up in Secure Boot user mode (SecureBoot=1, SetupMode=0) on
+// every cold boot. Cloud Hypervisor delivers the string via
+// --platform oem_strings=[...].
+const pkOemPrefixGUID = "4e32566d-8e9e-4f52-81d3-5bb9715f9727"
+
+// Machine is the Cloud Hypervisor interaction layer. It launches and controls a
+// single cloud-hypervisor guest directly (no libvirt) and manages host
+// networking. It performs no Redfish semantics and holds no Redfish resource
+// state; it shells out to external commands directly via os/exec and satisfies
+// the Backend interface consumed by Server.
 //
 // At construction it creates the boundary bridge, assigns the host IP, brings it
-// up, and installs outbound NAT, then seeds a per-run NVRAM store from the OVMF
-// variables template. Each power-on starts a swtpm software TPM, attaches a
-// fresh tap to the bridge, and launches qemu-system-x86_64 with the current boot
-// order. Power state tracks the qemu child; restarts issue a warm QMP
-// system_reset, so a new boot order only takes effect on the next cold power
-// cycle, mirroring the previous libvirt define/reset semantics.
+// up, and installs outbound NAT. Each power-on starts a swtpm software TPM,
+// attaches a fresh tap to the bridge, and launches cloud-hypervisor. Power state
+// tracks the cloud-hypervisor child; restarts issue a warm reboot over the
+// ch-remote control API, mirroring the previous warm-reset semantics.
+//
+// Cloud Hypervisor loads UEFI firmware read-only from a single --firmware blob
+// and has no separate NVRAM/pflash varstore, so there is no per-run NVRAM seed.
+// Boot order is not expressed with per-device bootindex; the custom CloudHv OVMF
+// falls back to network (PXE/HTTP) boot when the disk holds no bootable OS,
+// which is exactly what the install path relies on.
 //
 // For UefiHttp overrides it translates the Redfish static-NIC and HttpBootUri
-// settings into a dnsmasq configuration bound to the boundary bridge. Stock OVMF
-// then performs a genuine firmware-native UEFI HTTP boot: it DHCPs, learns its
-// reserved address and the HTTPClient boot URL, and fetches the boot entrypoint
-// over HTTP itself. No FAT boundary disk is built or staged.
+// settings into a dnsmasq configuration bound to the boundary bridge. The OVMF
+// firmware then performs a genuine firmware-native UEFI HTTP boot: it DHCPs,
+// learns its reserved address and the HTTPClient boot URL, and fetches the boot
+// entrypoint over HTTP itself. No FAT boundary disk is built or staged.
 type Machine struct {
 	domain          string
 	mac             string
 	disk            string
 	memoryMiB       int
 	vcpus           int
-	ovmfCode        string
+	firmware        string
 	secureBoot      bool
+	oemStringPK     string // SMBIOS PK OEM string, set only when secureBoot
 	manageBootOrder bool
 
 	bridge       string
@@ -55,24 +74,24 @@ type Machine struct {
 	tap          string
 
 	stateDir   string
-	nvram      string
+	apiSock    string
 	serialSock string
-	qgaSock    string
-	qmpSock    string
 	tpmStateD  string
 	tpmSock    string
 
 	dnsmasqDir string
 
 	mu          sync.Mutex
-	qemu        *exec.Cmd
+	ch          *exec.Cmd
 	swtpm       *exec.Cmd
 	dnsmasq     *exec.Cmd
-	bootNetwork bool // when true the next power-on boots the network first
+	bootNetwork bool // recorded boot preference; CloudHv OVMF falls back to net
 }
 
-// NewMachine builds the QEMU layer, deriving working paths from the state
-// directory, creating the boundary bridge and NAT, and seeding the NVRAM store.
+// NewMachine builds the Cloud Hypervisor layer, deriving working paths from the
+// state directory and creating the boundary bridge and NAT. When Secure Boot is
+// requested it generates an ephemeral Platform Key and encodes it as the SMBIOS
+// OEM string the firmware enrolls at boot.
 func NewMachine(cfg Config) (*Machine, error) {
 	if cfg.StateDir == "" {
 		return nil, errors.New("qemusvr: --state-dir is required")
@@ -82,8 +101,13 @@ func NewMachine(cfg Config) (*Machine, error) {
 		return nil, errors.New("qemusvr: --disk is required")
 	}
 
-	if cfg.OVMFCode == "" || cfg.OVMFVars == "" {
-		return nil, errors.New("qemusvr: --ovmf-code and --ovmf-vars are required")
+	firmware := cfg.Firmware
+	if cfg.SecureBoot {
+		firmware = cfg.FirmwareSecureBoot
+	}
+
+	if firmware == "" {
+		return nil, errors.New("qemusvr: --firmware (and --firmware-secureboot when --secure-boot is set) is required")
 	}
 
 	memoryMiB := cfg.MemoryMiB
@@ -107,21 +131,28 @@ func NewMachine(cfg Config) (*Machine, error) {
 		disk:            cfg.Disk,
 		memoryMiB:       memoryMiB,
 		vcpus:           vcpus,
-		ovmfCode:        cfg.OVMFCode,
+		firmware:        firmware,
 		secureBoot:      cfg.SecureBoot,
 		manageBootOrder: cfg.ManageBootOrder,
 		bridge:          cfg.Bridge,
 		bridgeAddr:      cfg.BridgeAddress,
 		bridgePrefix:    prefix,
 		stateDir:        cfg.StateDir,
-		nvram:           filepath.Join(cfg.StateDir, "OVMF_VARS.fd"),
+		apiSock:         filepath.Join(cfg.StateDir, "api.sock"),
 		serialSock:      filepath.Join(cfg.StateDir, "console.sock"),
-		qgaSock:         filepath.Join(cfg.StateDir, "qga.sock"),
-		qmpSock:         filepath.Join(cfg.StateDir, "qmp.sock"),
 		tpmStateD:       filepath.Join(cfg.StateDir, "tpm"),
 		tpmSock:         filepath.Join(cfg.StateDir, "tpm", "swtpm.sock"),
 		dnsmasqDir:      cfg.DnsmasqDir,
 		tap:             tapName(cfg.Bridge),
+	}
+
+	if m.secureBoot {
+		oemString, err := platformKeyOEMString()
+		if err != nil {
+			return nil, fmt.Errorf("generating Secure Boot platform key: %w", err)
+		}
+
+		m.oemStringPK = oemString
 	}
 
 	if err := os.MkdirAll(m.stateDir, 0o755); err != nil {
@@ -151,11 +182,34 @@ func NewMachine(cfg Config) (*Machine, error) {
 		}
 	}
 
-	if err := copyFile(cfg.OVMFVars, m.nvram); err != nil {
-		return nil, fmt.Errorf("seeding NVRAM store: %w", err)
+	return m, nil
+}
+
+// platformKeyOEMString generates an ephemeral self-signed X509 certificate and
+// encodes it as the "<pkOemPrefixGUID>:<base64 DER>" SMBIOS OEM string that the
+// CloudHv OVMF EnrollDefaultKeys driver consumes as the Secure Boot Platform Key.
+func platformKeyOEMString() (string, error) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return "", err
 	}
 
-	return m, nil
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "metalman-fixture-PK"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		return "", err
+	}
+
+	return pkOemPrefixGUID + ":" + base64.StdEncoding.EncodeToString(der), nil
 }
 
 // tapName derives a stable tap device name from the bridge name, keeping it
@@ -254,29 +308,30 @@ func (m *Machine) teardownNetwork() {
 	_, _ = run("ip", "link", "delete", m.bridge)
 }
 
-// PowerState returns "On" when the qemu child is running, otherwise "Off".
+// PowerState returns "On" when the cloud-hypervisor child is running, otherwise
+// "Off".
 func (m *Machine) PowerState() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.qemuRunningLocked() {
+	if m.chRunningLocked() {
 		return "On"
 	}
 
 	return "Off"
 }
 
-// qemuRunningLocked reports whether the qemu child is still alive. The caller
-// holds m.mu.
-func (m *Machine) qemuRunningLocked() bool {
-	if m.qemu == nil || m.qemu.Process == nil {
+// chRunningLocked reports whether the cloud-hypervisor child is still alive. The
+// caller holds m.mu.
+func (m *Machine) chRunningLocked() bool {
+	if m.ch == nil || m.ch.Process == nil {
 		return false
 	}
 
 	// Signal 0 probes liveness without affecting the process. A nil os.Signal
 	// is rejected by the runtime as an unsupported signal type, so the raw
 	// syscall.Signal(0) must be used to perform a genuine kill(pid, 0) probe.
-	return m.qemu.Process.Signal(syscall.Signal(0)) == nil
+	return m.ch.Process.Signal(syscall.Signal(0)) == nil
 }
 
 // PowerOff forces the guest off. It is best-effort and never returns an error.
@@ -293,30 +348,35 @@ func (m *Machine) PowerOn() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.qemuRunningLocked() {
+	if m.chRunningLocked() {
 		return nil
 	}
 
 	return m.startGuestLocked()
 }
 
-// Restart issues a warm QMP system_reset on a running guest, or cold-starts a
-// stopped one. A warm reset preserves the boot order, matching the previous
-// libvirt reset semantics; a new boot order only applies on the next cold cycle.
+// Restart issues a warm reboot over the ch-remote control API on a running
+// guest, or cold-starts a stopped one.
 func (m *Machine) Restart() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if !m.qemuRunningLocked() {
+	if !m.chRunningLocked() {
 		return m.startGuestLocked()
 	}
 
-	return qmpExecute(m.qmpSock, "system_reset")
+	if _, err := run("ch-remote", "--api-socket", m.apiSock, "reboot"); err != nil {
+		return fmt.Errorf("ch-remote reboot: %w", err)
+	}
+
+	return nil
 }
 
 // SetBootOrder records the boot order for the next power-on when boot-order
-// management is enabled. "Pxe" boots the network first; anything else boots the
-// disk first.
+// management is enabled. Cloud Hypervisor has no per-device boot index, so this
+// is a recorded preference only: the CloudHv OVMF firmware boots the disk when
+// it holds a bootable OS and otherwise falls back to network boot, which matches
+// what "Pxe" requests during install.
 func (m *Machine) SetBootOrder(target string) error {
 	if !m.manageBootOrder {
 		return nil
@@ -331,7 +391,7 @@ func (m *Machine) SetBootOrder(target string) error {
 }
 
 // startGuestLocked starts swtpm, attaches a fresh tap to the bridge, and
-// launches qemu with the current boot order. The caller holds m.mu.
+// launches cloud-hypervisor. The caller holds m.mu.
 func (m *Machine) startGuestLocked() error {
 	if err := m.startSwtpmLocked(); err != nil {
 		return err
@@ -342,24 +402,25 @@ func (m *Machine) startGuestLocked() error {
 		return err
 	}
 
-	spec := qemuSpec{
-		name:        m.domain,
+	//nolint:errcheck // Stale sockets from a prior run must not block bind (AddrInUse).
+	_ = os.Remove(m.apiSock)
+	//nolint:errcheck // The serial socket is recreated on each boot; a leftover file causes AddrInUse.
+	_ = os.Remove(m.serialSock)
+
+	spec := chSpec{
 		memoryMiB:   m.memoryMiB,
 		vcpus:       m.vcpus,
 		disk:        m.disk,
-		ovmfCode:    m.ovmfCode,
-		nvram:       m.nvram,
-		secureBoot:  m.secureBoot,
+		firmware:    m.firmware,
 		mac:         m.mac,
 		tap:         m.tap,
-		bootNetwork: m.bootNetwork,
+		apiSock:     m.apiSock,
 		serialSock:  m.serialSock,
-		qgaSock:     m.qgaSock,
-		qmpSock:     m.qmpSock,
 		tpmSock:     m.tpmSock,
+		oemStringPK: m.oemStringPK,
 	}
 
-	cmd := exec.Command("qemu-system-x86_64", qemuArgs(spec)...)
+	cmd := exec.Command("cloud-hypervisor", chArgs(spec)...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 
@@ -367,23 +428,23 @@ func (m *Machine) startGuestLocked() error {
 		m.stopSwtpmLocked()
 		m.deleteTap()
 
-		return fmt.Errorf("starting qemu: %w", err)
+		return fmt.Errorf("starting cloud-hypervisor: %w", err)
 	}
 
-	m.qemu = cmd
+	m.ch = cmd
 
 	return nil
 }
 
-// stopGuestLocked terminates and reaps qemu, then tears down swtpm and the tap.
-// The caller holds m.mu.
+// stopGuestLocked terminates and reaps cloud-hypervisor, then tears down swtpm
+// and the tap. The caller holds m.mu.
 func (m *Machine) stopGuestLocked() {
-	if m.qemu != nil && m.qemu.Process != nil {
+	if m.ch != nil && m.ch.Process != nil {
 		//nolint:errcheck // Best-effort forced power off.
-		_ = m.qemu.Process.Kill()
+		_ = m.ch.Process.Kill()
 		//nolint:errcheck // Reap the killed process; the wait error is expected.
-		_ = m.qemu.Wait()
-		m.qemu = nil
+		_ = m.ch.Wait()
+		m.ch = nil
 	}
 
 	m.stopSwtpmLocked()
@@ -391,7 +452,7 @@ func (m *Machine) stopGuestLocked() {
 }
 
 // startSwtpmLocked launches a fresh swtpm software TPM listening on a unix
-// control socket for the emulator chardev. The caller holds m.mu.
+// control socket for cloud-hypervisor's --tpm device. The caller holds m.mu.
 func (m *Machine) startSwtpmLocked() error {
 	m.stopSwtpmLocked()
 
@@ -412,7 +473,7 @@ func (m *Machine) startSwtpmLocked() error {
 
 	m.swtpm = cmd
 
-	// Wait briefly for the control socket so qemu's chardev connects cleanly.
+	// Wait briefly for the control socket so cloud-hypervisor connects cleanly.
 	for range 50 {
 		if _, err := os.Stat(m.tpmSock); err == nil {
 			return nil
@@ -438,7 +499,7 @@ func (m *Machine) stopSwtpmLocked() {
 }
 
 // ensureTap creates the tap device (if absent), enslaves it to the bridge, and
-// brings it up so qemu can open it with script=no.
+// brings it up so cloud-hypervisor can open it by name.
 func (m *Machine) ensureTap() error {
 	if m.bridge == "" {
 		return errors.New("qemusvr: a boundary bridge is required to attach the guest NIC")
@@ -482,148 +543,57 @@ func (m *Machine) Shutdown() {
 	m.teardownNetwork()
 }
 
-// qemuSpec is the pure input to qemuArgs, capturing everything needed to build
-// the qemu-system-x86_64 command line.
-type qemuSpec struct {
-	name        string
+// chSpec is the pure input to chArgs, capturing everything needed to build the
+// cloud-hypervisor command line.
+type chSpec struct {
 	memoryMiB   int
 	vcpus       int
 	disk        string
-	ovmfCode    string
-	nvram       string
-	secureBoot  bool
+	firmware    string
 	mac         string
 	tap         string
-	bootNetwork bool
+	apiSock     string
 	serialSock  string
-	qgaSock     string
-	qmpSock     string
 	tpmSock     string
+	oemStringPK string // when set, delivered via --platform oem_strings
 }
 
-// qemuArgs builds the qemu-system-x86_64 argument vector for spec. It is pure so
-// it can be unit tested without launching a guest. Boot order is expressed with
-// per-device bootindex: the network NIC leads when spec.bootNetwork is set,
-// otherwise the disk leads.
-func qemuArgs(spec qemuSpec) []string {
-	diskIndex, netIndex := 1, 2
-	if spec.bootNetwork {
-		netIndex, diskIndex = 1, 2
-	}
-
-	machine := "q35,accel=kvm"
-	if spec.secureBoot {
-		machine = "q35,accel=kvm,smm=on"
-	}
-
+// chArgs builds the cloud-hypervisor argument vector for spec. It is pure so it
+// can be unit tested without launching a guest.
+//
+// cloud-hypervisor exposes exactly one socket-backed character device: the
+// legacy serial port (--serial socket=). The virtio console (--console) only
+// supports off|null|pty|tty|file, so it cannot carry a socket. We therefore
+// bind ttyS0 to serialSock and disable the virtio console. serialSock carries
+// the kernel console, the autologin getty shell, and the automation channel the
+// smoke tests drive; the marker-based command protocol tolerates interleaved
+// kernel output. When oemStringPK is set it is delivered as an SMBIOS type-11
+// OEM string so the firmware enrolls the Secure Boot Platform Key.
+func chArgs(spec chSpec) []string {
 	args := []string{
-		"-name", spec.name,
-		"-machine", machine,
-		"-cpu", "host",
-		"-m", strconv.Itoa(spec.memoryMiB),
-		"-smp", strconv.Itoa(spec.vcpus),
+		"--api-socket", spec.apiSock,
+		"--cpus", "boot=" + strconv.Itoa(spec.vcpus),
+		"--memory", fmt.Sprintf("size=%dM", spec.memoryMiB),
+		"--firmware", spec.firmware,
+		"--disk", "path=" + spec.disk,
+		"--net", fmt.Sprintf("tap=%s,mac=%s", spec.tap, spec.mac),
+		"--tpm", "socket=" + spec.tpmSock,
+		"--serial", "socket=" + spec.serialSock,
+		"--console", "off",
+		"--rng", "src=/dev/urandom",
 	}
 
-	if spec.secureBoot {
-		args = append(args,
-			"-global", "driver=cfi.pflash01,property=secure,value=on",
-			"-global", "ICH9-LPC.disable_s3=1",
-		)
+	if spec.oemStringPK != "" {
+		args = append(args, "--platform", "oem_strings=["+spec.oemStringPK+"]")
 	}
-
-	args = append(args,
-		"-drive", "if=pflash,format=raw,unit=0,readonly=on,file="+spec.ovmfCode,
-		"-drive", "if=pflash,format=raw,unit=1,file="+spec.nvram,
-		"-drive", "if=none,id=disk0,format=qcow2,file="+spec.disk,
-		"-device", fmt.Sprintf("virtio-blk-pci,drive=disk0,bootindex=%d", diskIndex),
-		"-netdev", fmt.Sprintf("tap,id=net0,ifname=%s,script=no,downscript=no", spec.tap),
-		"-device", fmt.Sprintf("virtio-net-pci,netdev=net0,mac=%s,bootindex=%d", spec.mac, netIndex),
-		"-chardev", "socket,id=chrtpm,path="+spec.tpmSock,
-		"-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
-		"-device", "tpm-tis,tpmdev=tpm0",
-		"-chardev", fmt.Sprintf("socket,id=serial0,path=%s,server=on,wait=off", spec.serialSock),
-		"-serial", "chardev:serial0",
-		"-device", "virtio-serial",
-		"-chardev", fmt.Sprintf("socket,id=qga0,path=%s,server=on,wait=off", spec.qgaSock),
-		"-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
-		"-qmp", fmt.Sprintf("unix:%s,server=on,wait=off", spec.qmpSock),
-		"-display", "none",
-	)
 
 	return args
 }
 
-// qmpExecute connects to the QMP unix socket, negotiates capabilities, and runs
-// a single argument-less command such as system_reset.
-func qmpExecute(sock, command string) error {
-	conn, err := net.DialTimeout("unix", sock, 5*time.Second)
-	if err != nil {
-		return fmt.Errorf("connecting to QMP socket: %w", err)
-	}
-	defer conn.Close() //nolint:errcheck // Best-effort close of the QMP connection.
-
-	//nolint:errcheck // Deadline set best-effort; a stuck QMP call is a test bug.
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-
-	reader := bufio.NewReader(conn)
-
-	// Read the QMP greeting.
-	if _, err := reader.ReadBytes('\n'); err != nil {
-		return fmt.Errorf("reading QMP greeting: %w", err)
-	}
-
-	for _, cmd := range []string{"qmp_capabilities", command} {
-		payload, err := json.Marshal(map[string]any{"execute": cmd})
-		if err != nil {
-			return err
-		}
-
-		if _, err := conn.Write(append(payload, '\n')); err != nil {
-			return fmt.Errorf("writing QMP %s: %w", cmd, err)
-		}
-
-		if err := qmpReadResult(reader); err != nil {
-			return fmt.Errorf("QMP %s: %w", cmd, err)
-		}
-	}
-
-	return nil
-}
-
-// qmpReadResult reads QMP lines until a return or error response is seen,
-// skipping asynchronous events.
-func qmpReadResult(reader *bufio.Reader) error {
-	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			return err
-		}
-
-		var resp struct {
-			Return *json.RawMessage `json:"return"`
-			Error  *struct {
-				Desc string `json:"desc"`
-			} `json:"error"`
-		}
-
-		if err := json.Unmarshal(line, &resp); err != nil {
-			return err
-		}
-
-		if resp.Error != nil {
-			return errors.New(resp.Error.Desc)
-		}
-
-		if resp.Return != nil {
-			return nil
-		}
-	}
-}
-
 // ConfigureHTTPBoot writes a dnsmasq configuration that hands the VM its static
 // address plus a UEFI HTTP boot URL via a DHCP reservation, then (re)starts
-// dnsmasq bound to the boundary bridge. Stock OVMF then performs a genuine
-// firmware-native HTTP boot from the URL.
+// dnsmasq bound to the boundary bridge. The CloudHv OVMF firmware then performs
+// a genuine firmware-native HTTP boot from the URL.
 func (m *Machine) ConfigureHTTPBoot(mac, address, subnetMask, gateway string, dns []string, bootURL string) error {
 	if m.bridge == "" || m.dnsmasqDir == "" {
 		return errors.New("UefiHttp requested without a boundary bridge and dnsmasq directory")
@@ -720,15 +690,4 @@ func (m *Machine) stopDnsmasqLocked() {
 	_ = m.dnsmasq.Wait()
 
 	m.dnsmasq = nil
-}
-
-// copyFile copies src to dst, truncating dst. Used to seed the per-run NVRAM
-// store from the OVMF variables template.
-func copyFile(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(dst, data, 0o644)
 }

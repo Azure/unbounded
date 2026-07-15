@@ -483,60 +483,69 @@ func TestRecordFormat(t *testing.T) {
 	}
 }
 
-func TestQemuArgsBootOrder(t *testing.T) {
-	base := qemuSpec{
-		name: "smoke-vm", memoryMiB: 4096, vcpus: 2,
-		disk: "/tmp/disk.qcow2", ovmfCode: "/ovmf/code.fd", nvram: "/state/vars.fd",
+func TestChArgs(t *testing.T) {
+	spec := chSpec{
+		memoryMiB: 4096, vcpus: 2,
+		disk: "/tmp/disk.qcow2", firmware: "/fw/CLOUDHV.fd",
 		mac: "52:54:00:ab:cd:ef", tap: "tap-smoke",
-		serialSock: "/state/console.sock", qgaSock: "/state/qga.sock",
-		qmpSock: "/state/qmp.sock", tpmSock: "/state/tpm/swtpm.sock",
+		apiSock: "/state/api.sock", serialSock: "/state/console.sock",
+		tpmSock: "/state/tpm/swtpm.sock",
 	}
 
-	netFirst := base
-	netFirst.bootNetwork = true
+	args := strings.Join(chArgs(spec), " ")
 
-	args := strings.Join(qemuArgs(netFirst), " ")
-	if !strings.Contains(args, "virtio-net-pci,netdev=net0,mac=52:54:00:ab:cd:ef,bootindex=1") {
-		t.Fatalf("expected network bootindex=1: %s", args)
-	}
-
-	if !strings.Contains(args, "virtio-blk-pci,drive=disk0,bootindex=2") {
-		t.Fatalf("expected disk bootindex=2: %s", args)
-	}
-
-	diskFirst := base
-
-	args = strings.Join(qemuArgs(diskFirst), " ")
-	if !strings.Contains(args, "virtio-blk-pci,drive=disk0,bootindex=1") {
-		t.Fatalf("expected disk bootindex=1: %s", args)
-	}
-
-	if !strings.Contains(args, "virtio-net-pci,netdev=net0,mac=52:54:00:ab:cd:ef,bootindex=2") {
-		t.Fatalf("expected network bootindex=2: %s", args)
+	for _, want := range []string{
+		"--api-socket /state/api.sock",
+		"--cpus boot=2",
+		"--memory size=4096M",
+		"--firmware /fw/CLOUDHV.fd",
+		"--disk path=/tmp/disk.qcow2",
+		"--net tap=tap-smoke,mac=52:54:00:ab:cd:ef",
+		"--tpm socket=/state/tpm/swtpm.sock",
+		"--serial socket=/state/console.sock",
+		"--console off",
+	} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("expected %q in args: %s", want, args)
+		}
 	}
 }
 
-func TestQemuArgsSecureBoot(t *testing.T) {
-	spec := qemuSpec{
-		name: "smoke-vm", memoryMiB: 4096, vcpus: 2,
-		disk: "/tmp/disk.qcow2", ovmfCode: "/ovmf/code.fd", nvram: "/state/vars.fd",
+func TestChArgsSecureBoot(t *testing.T) {
+	spec := chSpec{
+		memoryMiB: 4096, vcpus: 2,
+		disk: "/tmp/disk.qcow2", firmware: "/fw/CLOUDHV_SECUREBOOT.fd",
 		mac: "52:54:00:ab:cd:ef", tap: "tap-http",
+		apiSock: "/state/api.sock", serialSock: "/state/console.sock",
+		tpmSock: "/state/tpm/swtpm.sock",
 	}
 
-	plain := strings.Join(qemuArgs(spec), " ")
-	if strings.Contains(plain, "smm=on") || strings.Contains(plain, "property=secure,value=on") {
-		t.Fatalf("did not expect secure boot options without SecureBoot: %s", plain)
+	plain := strings.Join(chArgs(spec), " ")
+	if strings.Contains(plain, "--platform") || strings.Contains(plain, "oem_strings") {
+		t.Fatalf("did not expect an OEM string without a platform key: %s", plain)
 	}
 
-	spec.secureBoot = true
+	spec.oemStringPK = pkOemPrefixGUID + ":QUJD"
 
-	secure := strings.Join(qemuArgs(spec), " ")
-	if !strings.Contains(secure, "q35,accel=kvm,smm=on") {
-		t.Fatalf("expected smm=on machine: %s", secure)
+	secure := strings.Join(chArgs(spec), " ")
+	if !strings.Contains(secure, "--platform oem_strings=["+pkOemPrefixGUID+":QUJD]") {
+		t.Fatalf("expected the platform key OEM string: %s", secure)
+	}
+}
+
+func TestPlatformKeyOEMString(t *testing.T) {
+	got, err := platformKeyOEMString()
+	if err != nil {
+		t.Fatalf("platformKeyOEMString: %v", err)
 	}
 
-	if !strings.Contains(secure, "driver=cfi.pflash01,property=secure,value=on") {
-		t.Fatalf("expected secure pflash global: %s", secure)
+	prefix := pkOemPrefixGUID + ":"
+	if !strings.HasPrefix(got, prefix) {
+		t.Fatalf("expected prefix %q, got %q", prefix, got)
+	}
+
+	if _, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(got, prefix)); err != nil {
+		t.Fatalf("OEM string payload is not valid base64: %v", err)
 	}
 }
 

@@ -3,6 +3,12 @@
 # Licensed under the MIT License.
 """Layered Metalman UEFI HTTP provisioning contract smoke test.
 
+NOTE: This test is not currently wired into CI. Under Cloud Hypervisor the
+CloudHv OVMF firmware does not auto-create a UEFI HTTPv4 boot option (only
+PXEv4/PXEv6), so firmware-native UEFI HTTP boot does not trigger and this test
+cannot pass as written. It is retained for when firmware-native HTTP boot is
+revisited. The PXE path (hack/smoke-metalman.py) is the supported smoke test.
+
 Metalman writes standard Redfish static IPv4 and UefiHttp settings. The
 recording BMC fixture translates those settings into a dnsmasq configuration
 bound to the boundary bridge: the static address becomes a DHCP reservation and
@@ -63,14 +69,14 @@ SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
 RECORD = TMP / "redfish.jsonl"
 PCAP = TMP / "traffic.pcap"
 
-# The fixture launches qemu directly and owns all VM state under this directory.
+# The fixture launches cloud-hypervisor directly and owns all VM state under
+# this directory. The secure-boot CloudHv OVMF firmware blob is built by
+# hack/scripts/build-cloudhv-firmware.sh; it auto-enrolls the fixture-supplied
+# SMBIOS Platform Key so SecureBoot=1/SetupMode=0 on every cold boot.
 STATE_DIR = TMP / "vmstate"
 DISK = TMP / "os.qcow2"
-OVMF_CODE = "/usr/share/OVMF/OVMF_CODE_4M.ms.fd"
-OVMF_VARS = "/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
+FIRMWARE_SECUREBOOT = str(ROOT / "bin" / "cloudhv-firmware" / "CLOUDHV_SECUREBOOT.fd")
 SERIAL_SOCK = STATE_DIR / "console.sock"
-QGA_SOCK = STATE_DIR / "qga.sock"
-QMP_SOCK = STATE_DIR / "qmp.sock"
 REDFISH_URL = f"https://127.0.0.1:{REDFISH_PORT}"
 REDFISH_USER = "smoke"
 REDFISH_PASS = "smoke"
@@ -87,14 +93,15 @@ smoke.NODE_IP = NODE_IP
 smoke.KIND_SMOKE_IP = KIND_IP
 smoke.MAC_ADDRESS = MAC
 smoke.STATE_DIR = STATE_DIR
-smoke.QGA_SOCK = QGA_SOCK
-smoke.QMP_SOCK = QMP_SOCK
 smoke.SERIAL_SOCK = SERIAL_SOCK
 smoke.REDFISH_URL = REDFISH_URL
 smoke.REDFISH_PORT = REDFISH_PORT
 smoke.REDFISH_USER = REDFISH_USER
 smoke.REDFISH_PASS = REDFISH_PASS
 smoke._procs = PROCS
+# The shared serial-console automation driver captured the PXE test's socket
+# path at import; rebind it to this test's console.sock.
+smoke._console = smoke._SerialConsole(SERIAL_SOCK)
 
 
 def log(message: str) -> None:
@@ -132,7 +139,7 @@ def cleanup() -> None:
                 pass
     for args in (
         ["sudo", "pkill", "-f", "metalman-redfish-fixture"],
-        ["sudo", "pkill", "-f", f"qemu-system-x86_64.*{VM}"],
+        ["sudo", "pkill", "-f", f"cloud-hypervisor.*{STATE_DIR}"],
         ["sudo", "pkill", "-f", f"swtpm.*{STATE_DIR}"],
         ["sudo", "ip", "link", "delete", "veth-kind-http"],
         ["sudo", "ip", "link", "delete", BRIDGE],
@@ -236,10 +243,7 @@ def setup_kubernetes_and_images() -> None:
     user_data = TMP / "user-data.yaml"
     write(user_data, """
         #cloud-config
-        packages:
-          - qemu-guest-agent
         runcmd:
-          - [systemctl, start, qemu-guest-agent]
           - [/bin/bash, -c, "export UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json; bash /usr/local/bin/unbounded-agent-install.sh"]
     """)
     run(["kubectl", "-n", "default", "create", "configmap", "http-smoke-user-data",
@@ -274,8 +278,8 @@ def start_fixture() -> None:
     dnsmasq_dir = TMP / "dnsmasq"
     dnsmasq_dir.mkdir(exist_ok=True)
     # Run the fixture under sudo so it can create the bridge and NAT, launch
-    # qemu with KVM, and start the dnsmasq that binds the privileged DHCP port
-    # (UDP 67) on the boundary bridge.
+    # cloud-hypervisor with KVM, and start the dnsmasq that binds the privileged
+    # DHCP port (UDP 67) on the boundary bridge.
     spawn(["sudo", "env", f"PATH={os.environ['PATH']}",
            str(ROOT / "bin/metalman-redfish-fixture"),
            "--domain", VM, "--mac", MAC, "--port", str(REDFISH_PORT),
@@ -283,7 +287,7 @@ def start_fixture() -> None:
             "--record", str(RECORD), "--bridge", BRIDGE,
             "--bridge-address", SERVER_IP,
             "--disk", str(DISK), "--state-dir", str(STATE_DIR),
-            "--ovmf-code", OVMF_CODE, "--ovmf-vars", OVMF_VARS, "--secure-boot",
+            "--firmware-secureboot", FIRMWARE_SECUREBOOT, "--secure-boot",
             "--dnsmasq-dir", str(dnsmasq_dir), "--username", "smoke", "--password", "smoke"],
           "redfish.log")
     time.sleep(1)
