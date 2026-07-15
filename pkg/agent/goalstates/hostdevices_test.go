@@ -248,6 +248,17 @@ func TestDiscoverHostDevices_Additional(t *testing.T) {
 	require.Contains(t, got.Paths(), "/dev/uinput")
 }
 
+func TestHostDevices_DeviceGroupSpecifiers(t *testing.T) {
+	t.Parallel()
+
+	devices := HostDevices{
+		Additional: []string{"/dev/uinput", "char-pts", "char-input", "char-pts"},
+	}
+
+	require.Equal(t, []string{"/dev/uinput"}, devices.Paths())
+	require.Equal(t, []string{"char-input", "char-pts"}, devices.DeviceGroupSpecifiers())
+}
+
 func TestHostDevices_Paths_Empty(t *testing.T) {
 	t.Parallel()
 

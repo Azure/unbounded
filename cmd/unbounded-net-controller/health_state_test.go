@@ -134,7 +134,9 @@ func TestHealthStateReadinessFailure(t *testing.T) {
 
 // TestUpdateAndClearServiceEndpoints tests UpdateAndClearServiceEndpoints.
 func TestUpdateAndClearServiceEndpoints(t *testing.T) {
-	client := k8sfake.NewClientset(&corev1.Endpoints{ObjectMeta: metav1.ObjectMeta{Name: "unbounded-net-controller", Namespace: "kube-system"}}) //nolint:staticcheck // testing cleanup of deprecated Endpoints resource
+	client := k8sfake.NewClientset(&corev1.Endpoints{ //nolint:staticcheck // required for Kubernetes 1.33 APIService compatibility
+		ObjectMeta: metav1.ObjectMeta{Name: "unbounded-net-controller", Namespace: "kube-system"},
+	})
 	h := &healthState{
 		clientset:        client,
 		healthPort:       9090,
@@ -146,8 +148,21 @@ func TestUpdateAndClearServiceEndpoints(t *testing.T) {
 		t.Fatalf("updateServiceEndpoints error: %v", err)
 	}
 
-	if _, err := client.CoreV1().Endpoints("kube-system").Get(context.Background(), "unbounded-net-controller", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("expected stale Endpoints to be removed, got err=%v", err)
+	endpoints, err := client.CoreV1().Endpoints("kube-system").Get(context.Background(), "unbounded-net-controller", metav1.GetOptions{}) //nolint:staticcheck // required for Kubernetes 1.33 APIService compatibility
+	if err != nil {
+		t.Fatalf("expected endpoints to be updated: %v", err)
+	}
+
+	if len(endpoints.Subsets) != 1 || len(endpoints.Subsets[0].Addresses) != 1 || endpoints.Subsets[0].Addresses[0].IP != "10.20.30.40" {
+		t.Fatalf("unexpected legacy endpoint addresses: %#v", endpoints.Subsets)
+	}
+
+	if len(endpoints.Subsets[0].Ports) != 1 || endpoints.Subsets[0].Ports[0].Name != "https" || endpoints.Subsets[0].Ports[0].Port != 9090 {
+		t.Fatalf("unexpected legacy endpoint ports: %#v", endpoints.Subsets[0].Ports)
+	}
+
+	if endpoints.Labels[discoveryv1.LabelSkipMirror] != "true" {
+		t.Fatalf("expected legacy endpoints to skip EndpointSlice mirroring, got labels %#v", endpoints.Labels)
 	}
 
 	slice, err := client.DiscoveryV1().EndpointSlices("kube-system").Get(context.Background(), "unbounded-net-controller", metav1.GetOptions{})
@@ -169,11 +184,81 @@ func TestUpdateAndClearServiceEndpoints(t *testing.T) {
 
 	h.clearServiceEndpoints(context.Background())
 
+	if _, err := client.CoreV1().Endpoints("kube-system").Get(context.Background(), "unbounded-net-controller", metav1.GetOptions{}); !apierrors.IsNotFound(err) { //nolint:staticcheck // required for Kubernetes 1.33 APIService compatibility
+		t.Fatalf("expected endpoints to be deleted, got err=%v", err)
+	}
+
 	if _, err := client.DiscoveryV1().EndpointSlices("kube-system").Get(context.Background(), "unbounded-net-controller", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected endpoint slice to be deleted, got err=%v", err)
 	}
 
+	if err := h.updateServiceEndpoints(context.Background()); err != nil {
+		t.Fatalf("expected endpoints to be recreated: %v", err)
+	}
+
+	if _, err := client.CoreV1().Endpoints("kube-system").Get(context.Background(), "unbounded-net-controller", metav1.GetOptions{}); err != nil { //nolint:staticcheck // required for Kubernetes 1.33 APIService compatibility
+		t.Fatalf("expected endpoints to be recreated: %v", err)
+	}
+
+	if _, err := client.DiscoveryV1().EndpointSlices("kube-system").Get(context.Background(), "unbounded-net-controller", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected endpoint slice to be recreated: %v", err)
+	}
+
 	h.clearServiceEndpoints(context.Background())
+}
+
+func TestUpdateServiceEndpointsReturnsEndpointsError(t *testing.T) {
+	client := k8sfake.NewClientset()
+	client.PrependReactor("create", "endpoints", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("create denied")
+	})
+
+	h := &healthState{
+		clientset:        client,
+		healthPort:       9090,
+		leaderElectionNS: "kube-system",
+		podIP:            "10.20.30.40",
+	}
+
+	err := h.updateServiceEndpoints(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "creating service endpoints: create denied") {
+		t.Fatalf("expected endpoints creation error, got %v", err)
+	}
+
+	if _, err := client.DiscoveryV1().EndpointSlices("kube-system").Get(context.Background(), "unbounded-net-controller", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected endpoint slice not to be created after endpoints failure, got err=%v", err)
+	}
+}
+
+func TestClearServiceEndpointsPreservesNewLeaderEndpoints(t *testing.T) {
+	client := k8sfake.NewClientset(
+		&corev1.Endpoints{ //nolint:staticcheck // required for Kubernetes 1.33 APIService compatibility
+			ObjectMeta: metav1.ObjectMeta{Name: "unbounded-net-controller", Namespace: "kube-system"},
+			Subsets: []corev1.EndpointSubset{{ //nolint:staticcheck // required for Kubernetes 1.33 APIService compatibility
+				Addresses: []corev1.EndpointAddress{{IP: "10.20.30.41"}},
+			}},
+		},
+		&discoveryv1.EndpointSlice{
+			ObjectMeta:  metav1.ObjectMeta{Name: "unbounded-net-controller", Namespace: "kube-system"},
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Endpoints:   []discoveryv1.Endpoint{{Addresses: []string{"10.20.30.41"}}},
+		},
+	)
+	h := &healthState{
+		clientset:        client,
+		leaderElectionNS: "kube-system",
+		podIP:            "10.20.30.40",
+	}
+
+	h.clearServiceEndpoints(context.Background())
+
+	if _, err := client.CoreV1().Endpoints("kube-system").Get(context.Background(), "unbounded-net-controller", metav1.GetOptions{}); err != nil { //nolint:staticcheck // required for Kubernetes 1.33 APIService compatibility
+		t.Fatalf("expected new leader endpoints to be preserved: %v", err)
+	}
+
+	if _, err := client.DiscoveryV1().EndpointSlices("kube-system").Get(context.Background(), "unbounded-net-controller", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected new leader endpoint slice to be preserved: %v", err)
+	}
 }
 
 // TestHealthStateGetLeaderInfoErrors tests HealthStateGetLeaderInfoErrors.

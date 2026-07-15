@@ -375,7 +375,7 @@ func TestResolveMachine_AdditionalHostDevices(t *testing.T) {
 	cfg := &config.AgentConfig{
 		MachineName:           "machine-1",
 		NodeName:              "configured-node",
-		AdditionalHostDevices: []string{"/dev/uinput"},
+		AdditionalHostDevices: []string{"char-input", "/dev/uinput"},
 		Cluster: config.AgentClusterConfig{
 			CaCertBase64: "Y2EtYnl0ZXM=",
 		},
@@ -387,8 +387,10 @@ func TestResolveMachine_AdditionalHostDevices(t *testing.T) {
 	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
 	require.NoError(t, err)
 
-	require.Equal(t, []string{"/dev/uinput"}, got.RootFS.HostDevices.Additional)
+	require.Equal(t, []string{"char-input", "/dev/uinput"}, got.RootFS.HostDevices.Additional)
 	require.Contains(t, got.RootFS.HostDevices.Paths(), "/dev/uinput")
+	require.NotContains(t, got.RootFS.HostDevices.Paths(), "char-input")
+	require.Equal(t, []string{"char-input"}, got.RootFS.HostDevices.DeviceGroupSpecifiers())
 }
 
 func TestResolveMachine_InvalidAdditionalHostDevice(t *testing.T) {
