@@ -126,6 +126,16 @@ data:
     hrw_k: 3
     hrw_topology_scope: "cluster"
     zone_label_key: "topology.kubernetes.io/zone"
+
+    # Number of HRW-ranked pullers each prefetched layer digest is pulled by.
+    # 1 designates a single origin puller (tightest dedup) but makes the whole
+    # swarm fan out from ONE initial seed, which bottlenecks a cold
+    # thundering-herd (peer transfers pile onto the lone seed and stall at the
+    # peer_fetch_timeout). N>1 seeds the layer on the top-N pullers in
+    # parallel, so peer transfers fan out N-fold, at the cost of up to N origin
+    # copies of each layer. At 300 nodes N=8 keeps origin ~= N GiB per 1 GiB
+    # layer (still >95% saved) while widening the initial fan-out 8x.
+    prefetch_puller_replicas: 8
     # Coord peer authorization. Default false ships observe-only: an
     # inbound coord request from a peer not in the membership view only
     # increments p2p_coord_unauthorized_peer_total and is still served.

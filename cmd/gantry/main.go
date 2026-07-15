@@ -445,19 +445,20 @@ func runAgent(args []string) error {
 	if hasMultiNodeMembership(memberView) {
 		selfZone := lookupSelfZone(memberView)
 		realResolver := coldstart.New(coldstart.Options{
-			Members:               memberView,
-			Discovery:             disco,
-			Coord:                 coordClient,
-			Inflight:              inflightMap,
-			Logger:                logger,
-			HrwK:                  c.HRWK,
-			HrwScope:              hrw.ParseScope(c.HRWTopologyScope),
-			SelfZone:              selfZone,
-			LocalIntent:           coordServer,
-			LocalPull:             coordServer,
-			TransientCooldownCap:  c.OriginFailureHonorWindowCap,
-			TopKExpansionFactor:   c.TopKExpansionFactorDegraded,
-			TrustedFailureClasses: parseTrustedFailureClasses(c.OriginFailureClassesTrustedClusterWide, logger),
+			Members:                memberView,
+			Discovery:              disco,
+			Coord:                  coordClient,
+			Inflight:               inflightMap,
+			Logger:                 logger,
+			HrwK:                   c.HRWK,
+			HrwScope:               hrw.ParseScope(c.HRWTopologyScope),
+			SelfZone:               selfZone,
+			LocalIntent:            coordServer,
+			LocalPull:              coordServer,
+			PrefetchPullerReplicas: c.PrefetchPullerReplicas,
+			TransientCooldownCap:   c.OriginFailureHonorWindowCap,
+			TopKExpansionFactor:    c.TopKExpansionFactorDegraded,
+			TrustedFailureClasses:  parseTrustedFailureClasses(c.OriginFailureClassesTrustedClusterWide, logger),
 			Metrics: coldstart.MetricsHooks{
 				OnRankMismatch: func(kindLabel string, _ ifaces.NodeID) {
 					p3.hrwRankMismatch.WithLabelValues(kindLabel).Inc()

@@ -249,6 +249,16 @@ type Config struct {
 	// open question).
 	HRWK int `yaml:"hrw_k"`
 
+	// PrefetchPullerReplicas is how many distinct HRW-ranked pullers each
+	// prefetched layer digest is dispatched to. 1 (default) designates a
+	// single origin puller per layer: tightest dedup, but the whole swarm
+	// then fans out from ONE initial seed, which bottlenecks a cold
+	// thundering-herd (peer transfers pile onto the lone seed and stall).
+	// N>1 asks the top-N pullers to origin-pull the layer in parallel,
+	// giving N initial seeds so peer transfers fan out N-fold, at the cost
+	// of up to N origin copies of each layer.
+	PrefetchPullerReplicas int `yaml:"prefetch_puller_replicas"`
+
 	// HRWTopologyScope selects "cluster" (HRW over all nodes) or "zone"
 	// (HRW within the requester's zone) - the design doc / the design doc open question.
 	HRWTopologyScope string `yaml:"hrw_topology_scope"`
@@ -440,9 +450,10 @@ func NewDefault() *Config {
 
 		UpstreamRegistries: nil,
 
-		HRWK:             3,
-		HRWTopologyScope: "cluster",
-		ZoneLabelKey:     "topology.kubernetes.io/zone",
+		HRWK:                   3,
+		PrefetchPullerReplicas: 1,
+		HRWTopologyScope:       "cluster",
+		ZoneLabelKey:           "topology.kubernetes.io/zone",
 
 		CoordPeerAuthzEnforce:       false,
 		CoordMaxDigestsPerRequest:   256,
@@ -559,6 +570,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setDur("CONTAINERD_LEASE_CLEANUP_INTERVAL", &c.ContainerdLeaseCleanupInterval)
 
 	setInt("HRW_K", &c.HRWK)
+	setInt("PREFETCH_PULLER_REPLICAS", &c.PrefetchPullerReplicas)
 	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
 	setStr("ZONE_LABEL_KEY", &c.ZoneLabelKey)
 	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
@@ -620,6 +632,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.ContainerdLeaseCleanupInterval, "containerd-lease-cleanup-interval", c.ContainerdLeaseCleanupInterval, "period of the expired-lease sweep loop (storage_mode=containerd only)")
 
 	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "HRW top-K size")
+	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "number of HRW-ranked pullers each prefetched layer digest is pulled by (initial seeds); 1 = single puller/tightest dedup, N = N-fold peer fan-out at N origin copies")
 	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, `HRW scope: "cluster" or "zone"`)
 	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "Kubernetes node label identifying the zone (used when hrw-topology-scope=zone)")
 	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "reject inbound coord requests from peers not in the membership view (default false = observe-only)")
@@ -795,6 +808,10 @@ func (c *Config) Validate() error {
 
 	if c.HRWK < 1 {
 		errs = append(errs, fmt.Errorf("hrw_k: must be >= 1, got %d", c.HRWK))
+	}
+
+	if c.PrefetchPullerReplicas < 1 {
+		errs = append(errs, fmt.Errorf("prefetch_puller_replicas: must be >= 1, got %d", c.PrefetchPullerReplicas))
 	}
 
 	switch c.HRWTopologyScope {
