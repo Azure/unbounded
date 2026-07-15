@@ -29,6 +29,10 @@ FROM ubuntu:noble AS builder
 #   - autoconf/libtool/automake: libfabric's build tooling.
 #   - liburing-dev: libfabric --with-uring and the tarball's liburing.so.2
 #     bundling step both require it.
+#   - libibverbs-dev/librdmacm-dev: libfabric is configured with
+#     --enable-verbs=yes (a hard requirement), which needs the InfiniBand
+#     verbs and RDMA-CM headers at build time even though this PoC runs over
+#     TCP. The bundled librdmacm/libibverbs .so closure ships in the tarball.
 #   - curl/ca-certificates/git/xz-utils/bzip2: fetch + unpack pinned sources.
 # The crate's build.rs uses a vendored protoc (protoc_bin_vendored), so no
 # system protobuf compiler is required.
@@ -44,6 +48,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     automake \
     libtool \
     liburing-dev \
+    libibverbs-dev \
+    librdmacm-dev \
     curl \
     ca-certificates \
     git \
