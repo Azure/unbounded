@@ -7,8 +7,8 @@ use proptest::prelude::*;
 
 use crate::storage::oracle::Oracle;
 use crate::storage::workload::{
-    ClientSpec, Op, Outcome, RunReport, Workload, run_workload, workload_strategy,
-    workload_strategy_no_faults_multi_client,
+    ClientSpec, Op, Outcome, RunReport, Workload, durability_crash_strategy, run_workload,
+    workload_strategy, workload_strategy_no_faults_multi_client,
 };
 
 proptest! {
@@ -37,7 +37,7 @@ proptest! {
         let oracle = Oracle::new();
         for c in &w.clients {
             for op in &c.ops {
-                if let Op::Write { key_idx, off_idx, payload_seed } = op {
+                if let Op::Write { key_idx, off_idx, payload_seed, .. } = op {
                     oracle.record_write(
                         w.key(*key_idx),
                         w.offset(*off_idx),
@@ -86,7 +86,7 @@ proptest! {
         let oracle = Oracle::new();
         for c in &w.clients {
             for op in &c.ops {
-                if let Op::Write { key_idx, off_idx, payload_seed } = op {
+                if let Op::Write { key_idx, off_idx, payload_seed, .. } = op {
                     oracle.record_write(
                         w.key(*key_idx),
                         w.offset(*off_idx),
@@ -115,7 +115,7 @@ proptest! {
         let oracle = Oracle::new();
         for c in &w.clients {
             for op in &c.ops {
-                if let Op::Write { key_idx, off_idx, payload_seed } = op {
+                if let Op::Write { key_idx, off_idx, payload_seed, .. } = op {
                     oracle.record_write(
                         w.key(*key_idx),
                         w.offset(*off_idx),
@@ -264,7 +264,7 @@ proptest! {
         let oracle = Oracle::new();
         for c in &w.clients {
             for op in &c.ops {
-                if let Op::Write { key_idx, off_idx, payload_seed } = op {
+                if let Op::Write { key_idx, off_idx, payload_seed, .. } = op {
                     oracle.record_write(
                         w.key(*key_idx),
                         w.offset(*off_idx),
@@ -400,6 +400,90 @@ proptest! {
             report.device_durable_writes, report.device_writes,
             "durable writes {} != total writes {}: a write lost its durable flag",
             report.device_durable_writes, report.device_writes,
+        );
+    }
+
+    /// Invariant: a write reported durable survives a crash; an
+    /// ephemeral write is lost but never corrupts the cache. The
+    /// `durability_crash_strategy` writes each key twice with a fixed
+    /// per-key durability, then drops the device's volatile write cache
+    /// at the crash point and reopens the engine. After recovery the
+    /// grid replay must:
+    ///
+    /// 1. Hit every durably-written key. Its data page reached stable
+    ///    media (RWF_DSYNC) and its batch commit carried the durable
+    ///    flag, so both the page and the btree entry that points at it
+    ///    survive the crash.
+    /// 2. Miss every ephemeral key. Its data page lived only in the
+    ///    volatile cache and was dropped by `crash()`; even if the
+    ///    btree entry persisted, the engine's per-page xxh3 checksum
+    ///    turns the stale/zeroed LBA into a miss rather than wrong
+    ///    bytes.
+    /// 3. Never return bytes that were not written for that cell.
+    ///
+    /// Because clients issue no reads, every read outcome in the report
+    /// comes from the post-crash replay, so the hit set can be compared
+    /// exactly against the durable key set. A regression that dropped
+    /// the durable flag would let an ephemeral page masquerade as
+    /// durable (spurious hit) or a durable page vanish (missing hit).
+    #[test]
+    fn invariant_durable_survives_crash(seed in any::<u64>(), w in durability_crash_strategy()) {
+        // Reconstruct the durable key set and a byte oracle from the
+        // ops. Every write to a key shares one durability, so a key
+        // with any durable write is a fully-durable key.
+        let oracle = Oracle::new();
+        let mut durable_keys: std::collections::BTreeSet<[u8; 32]> =
+            std::collections::BTreeSet::new();
+        for c in &w.clients {
+            for op in &c.ops {
+                if let Op::Write { key_idx, off_idx, payload_seed, durable } = op {
+                    let key = w.key(*key_idx);
+                    oracle.record_write(
+                        key,
+                        w.offset(*off_idx),
+                        w.payload(*key_idx, *off_idx, *payload_seed),
+                    );
+                    if *durable {
+                        durable_keys.insert(key.0);
+                    }
+                }
+            }
+        }
+
+        let report = run_workload(seed, w).expect("run completed");
+        prop_assert!(
+            report.restart_performed,
+            "crash workload must perform the post-crash replay",
+        );
+
+        let mut hit_keys: std::collections::BTreeSet<[u8; 32]> =
+            std::collections::BTreeSet::new();
+        for o in &report.outcomes {
+            match o {
+                Outcome::ReadHit { key, offset, bytes } => {
+                    prop_assert!(
+                        oracle.allows_read(*key, *offset, bytes),
+                        "post-crash hit returned bytes never written for ({:?}, {})",
+                        key.0, offset,
+                    );
+                    hit_keys.insert(key.0);
+                }
+                Outcome::ReadMiss { .. } => {}
+                // The pre-crash client writes push `WriteOk` onto the
+                // same outcome vec; they are not replay results, so
+                // ignore them. Only reads come from the post-crash
+                // replay.
+                Outcome::WriteOk => {}
+                Outcome::Err(e) => {
+                    prop_assert!(false, "post-crash replay error: {}", e);
+                }
+            }
+        }
+
+        prop_assert_eq!(
+            hit_keys, durable_keys,
+            "post-crash hit set must equal the durably-written key set: \
+             durable pages must survive and ephemeral pages must not",
         );
     }
 
@@ -568,11 +652,13 @@ fn smoke() {
                         key_idx: 0,
                         off_idx: 0,
                         payload_seed: 1,
+                        durable: true,
                     },
                     Op::Write {
                         key_idx: 0,
                         off_idx: 0,
                         payload_seed: 1,
+                        durable: true,
                     },
                     Op::Read {
                         key_idx: 0,
@@ -586,11 +672,13 @@ fn smoke() {
                         key_idx: 1,
                         off_idx: 1,
                         payload_seed: 9,
+                        durable: true,
                     },
                     Op::Write {
                         key_idx: 1,
                         off_idx: 1,
                         payload_seed: 9,
+                        durable: true,
                     },
                     Op::Read {
                         key_idx: 1,
@@ -601,6 +689,7 @@ fn smoke() {
         ],
         restart_after: false,
         num_disks: 1,
+        crash_before_reopen: false,
     };
     let report: RunReport = run_workload(0xC0FFEE, w).expect("smoke run");
     // At least one of the two reads should hit; admission filter
@@ -648,11 +737,13 @@ fn smoke_concurrent_reads_overlap() {
             key_idx: k,
             off_idx: 0,
             payload_seed: k,
+            durable: true,
         });
         ops.push(Op::Write {
             key_idx: k,
             off_idx: 0,
             payload_seed: k,
+            durable: true,
         });
         for _ in 0..16 {
             ops.push(Op::Read {
@@ -673,6 +764,7 @@ fn smoke_concurrent_reads_overlap() {
         clients,
         restart_after: false,
         num_disks: 1,
+        crash_before_reopen: false,
     };
     let report = run_workload(0xDEADBEEF, w).expect("smoke run");
     let peak = report

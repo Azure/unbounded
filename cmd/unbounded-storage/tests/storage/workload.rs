@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use proptest::collection::vec;
 use proptest::prelude::*;
-use unbounded_storage::bufferpool::{BlockStore, PageRef, StripeKey};
+use unbounded_storage::bufferpool::{BlockStore, PageRef, Req, StripeKey};
 use unbounded_storage::memory::Backing;
 use unbounded_storage::storage::blockdev::MockDeviceConfig;
 use unbounded_storage::storage::{EngineConfig, LocalStorage, StorageEngine};
@@ -83,6 +83,12 @@ pub struct Workload {
     /// with correct bytes, OR miss; they must never return wrong
     /// bytes.
     pub restart_after: bool,
+    /// If true (only meaningful together with `restart_after`), drop
+    /// the device's volatile write cache at the crash point between
+    /// closing the engines and reopening them. Non-durable writes are
+    /// lost; durable writes survive. Models a power loss rather than a
+    /// clean restart.
+    pub crash_before_reopen: bool,
     /// Number of simulated disks that back the `LocalStorage`
     /// router. `1` matches the original single-engine harness
     /// exactly; `>= 2` exercises the cross-disk routing path
@@ -101,11 +107,35 @@ pub enum Op {
         key_idx: u8,
         off_idx: u8,
         payload_seed: u8,
+        /// When true the write is issued through a request whose
+        /// `durable()` returns true (the `StripeKey` default), so the
+        /// data page and its btree commit reach stable media. When
+        /// false it is issued as a best-effort (ephemeral) write that
+        /// lands only in the device's volatile cache and is lost on a
+        /// crash.
+        durable: bool,
     },
     Read {
         key_idx: u8,
         off_idx: u8,
     },
+}
+
+/// Request wrapper that reports `durable() == false`, routing a write
+/// through the engine's best-effort (ephemeral) path. The stripe key
+/// is the only addressing input; every other `Req` hook keeps its
+/// default. Used by the crash workload to distinguish writes that must
+/// survive a power loss from those that may not.
+struct EphemeralReq(StripeKey);
+
+impl Req for EphemeralReq {
+    fn key(&self) -> StripeKey {
+        self.0
+    }
+
+    fn durable(&self) -> bool {
+        false
+    }
 }
 
 impl Workload {
@@ -213,6 +243,7 @@ pub fn workload_strategy() -> impl Strategy<Value = Workload> {
                     clients,
                     restart_after,
                     num_disks,
+                    crash_before_reopen: false,
                 }
             },
         )
@@ -254,13 +285,65 @@ fn client_strategy() -> impl Strategy<Value = ClientSpec> {
     vec(op_strategy(), 1..=8).prop_map(|ops| ClientSpec { ops })
 }
 
+/// Strategy for the crash-durability invariant. Assigns each key a
+/// fixed durability, then has two writer clients each write every key
+/// twice (admission needs a second touch) with that durability, so a
+/// key is entirely durable or entirely ephemeral, never mixed. Faults
+/// and corruption are off and the device is roomy (no eviction) so the
+/// only variable is whether a write reached stable media. The workload
+/// crashes (drops the volatile cache) and reopens, then replays the
+/// grid read-only; because clients issue no reads, every read outcome
+/// comes from the post-crash replay.
+pub fn durability_crash_strategy() -> impl Strategy<Value = Workload> {
+    (1u8..=6, 0u32..=8, 1u32..=2)
+        .prop_flat_map(|(key_count, max_io_delay, num_disks)| {
+            (
+                Just(key_count),
+                Just(max_io_delay),
+                Just(num_disks),
+                vec(any::<bool>(), key_count as usize),
+            )
+        })
+        .prop_map(|(key_count, max_io_delay, num_disks, key_durable)| {
+            let mut clients = Vec::new();
+            for _ in 0..2u8 {
+                let mut ops = Vec::new();
+                for k in 0..key_count {
+                    let durable = key_durable[k as usize];
+                    for _ in 0..2u8 {
+                        ops.push(Op::Write {
+                            key_idx: k,
+                            off_idx: 0,
+                            payload_seed: k,
+                            durable,
+                        });
+                    }
+                }
+                clients.push(ClientSpec { ops });
+            }
+            Workload {
+                page_size: 4096,
+                device_pages: 256,
+                max_io_delay,
+                io_fault_rate: 0,
+                read_corrupt_rate: 0,
+                key_count,
+                offset_count: 1,
+                clients,
+                restart_after: true,
+                num_disks,
+                crash_before_reopen: true,
+            }
+        })
+}
+
 fn op_strategy() -> impl Strategy<Value = Op> {
     // 60% writes, 40% reads. Writes dominate because admission
     // requires a second touch before anything lands; a read-heavy
     // mix would barely exercise the data path.
     prop_oneof![
         6 => (any::<u8>(), any::<u8>(), any::<u8>())
-            .prop_map(|(k, o, s)| Op::Write { key_idx: k, off_idx: o, payload_seed: s }),
+            .prop_map(|(k, o, s)| Op::Write { key_idx: k, off_idx: o, payload_seed: s, durable: true }),
         4 => (any::<u8>(), any::<u8>())
             .prop_map(|(k, o)| Op::Read { key_idx: k, off_idx: o }),
     ]
@@ -683,6 +766,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                         key_idx,
                         off_idx,
                         payload_seed,
+                        durable,
                     } => {
                         let key = w.key(*key_idx);
                         let offset = w.offset(*off_idx);
@@ -708,7 +792,17 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                             len: byte_len as u32,
                         };
                         oracle.record_write(key, offset, bytes);
-                        match local.write_page(&key, offset, page).await {
+                        // A durable write goes through the `StripeKey`
+                        // request (whose `durable()` defaults true); an
+                        // ephemeral write goes through `EphemeralReq`
+                        // (`durable() == false`) so it lands only in the
+                        // device volatile cache.
+                        let result = if *durable {
+                            local.write_page(&key, offset, page).await
+                        } else {
+                            local.write_page(&EphemeralReq(key), offset, page).await
+                        };
+                        match result {
                             Ok(()) => outcomes.borrow_mut().push(Outcome::WriteOk),
                             Err(e) => outcomes
                                 .borrow_mut()
@@ -843,6 +937,16 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         // tidiness; nothing reads it after this point.
         let pre = std::mem::replace(&mut *slot.borrow_mut(), BootstrapStatus::Failed);
         drop(pre);
+
+        // Crash point: with the engines dropped (so no in-flight app
+        // state survives), drop each device's volatile write cache.
+        // Non-durable writes vanish; durable writes remain on stable
+        // media. Skipped for a clean restart.
+        if w.crash_before_reopen {
+            for dev in &devices {
+                dev.crash();
+            }
+        }
 
         sim_cfg.max_io_delay.set(0);
         sim_cfg.io_fault_rate.set(0);

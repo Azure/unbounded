@@ -11,6 +11,7 @@
 //! behind an `Rc`, never on the framework's [`SimState`].
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use rand::Rng;
@@ -78,6 +79,16 @@ pub struct SimBlockDevice {
     inflight: Cell<u32>,
     max_inflight: Cell<u32>,
     read_pause: RefCell<Option<Rc<ReadPause>>>,
+    /// Volatile write cache model, expressed as an undo log. A
+    /// non-durable (best-effort) write lands in the device's volatile
+    /// cache: before it overwrites a page's stable content we snapshot
+    /// the prior *durable* bytes here (once per page, until the next
+    /// durable write or crash). A durable (RWF_DSYNC/FUA) write writes
+    /// through and clears the page's undo entry so it survives. A
+    /// `crash()` restores every logged page to its snapshot, dropping
+    /// all volatile writes exactly as a power loss would.
+    volatile: RefCell<HashMap<u64, Vec<u8>>>,
+    crashes: Cell<u64>,
 }
 
 impl SimBlockDevice {
@@ -93,6 +104,8 @@ impl SimBlockDevice {
             inflight: Cell::new(0),
             max_inflight: Cell::new(0),
             read_pause: RefCell::new(None),
+            volatile: RefCell::new(HashMap::new()),
+            crashes: Cell::new(0),
         }
     }
 
@@ -113,6 +126,31 @@ impl SimBlockDevice {
     }
     pub fn max_inflight(&self) -> u32 {
         self.max_inflight.get()
+    }
+
+    /// Number of volatile (non-durable) pages currently buffered in the
+    /// device's write cache, i.e. pages that would be lost on a crash.
+    pub fn volatile_pages(&self) -> usize {
+        self.volatile.borrow().len()
+    }
+
+    pub fn crashes(&self) -> u64 {
+        self.crashes.get()
+    }
+
+    /// Simulate a power loss: every page that was written
+    /// non-durably since its last durable write reverts to that last
+    /// durable content (or its initial zeroed state if it was never
+    /// durably written). Durable (RWF_DSYNC/FUA) writes are unaffected
+    /// because they never leave an undo entry behind. Call this after
+    /// the engine has been dropped and before it is reopened to model a
+    /// crash + recovery.
+    pub fn crash(&self) {
+        let undo = std::mem::take(&mut *self.volatile.borrow_mut());
+        for (lba, snapshot) in undo {
+            self.inner.poke(Lba(lba), &snapshot);
+        }
+        self.crashes.set(self.crashes.get() + 1);
     }
 
     /// Test-only backdoor: read raw bytes from the underlying
@@ -232,6 +270,33 @@ impl BlockDevice for SimBlockDevice {
         if fault {
             self.io_errors.set(self.io_errors.get() + 1);
             return Err(Error::Io(5));
+        }
+        // Maintain the volatile-cache undo log before the bytes hit
+        // stable storage. We only touch well-formed, in-range writes;
+        // malformed ones fall through to `inner.write` which rejects
+        // them without persisting anything.
+        let ps = self.inner.page_size();
+        let capacity = self.inner.capacity_pages();
+        if !src.is_empty() && src.len() % ps == 0 {
+            let n_pages = (src.len() / ps) as u64;
+            let mut undo = self.volatile.borrow_mut();
+            for i in 0..n_pages {
+                let page_lba = lba.0 + i;
+                if page_lba >= capacity {
+                    break;
+                }
+                if durable {
+                    // Write-through: the page is now stable, so it must
+                    // not be reverted by a later crash.
+                    undo.remove(&page_lba);
+                } else if !undo.contains_key(&page_lba) {
+                    // First volatile write since the last durable write:
+                    // remember the durable content to restore on crash.
+                    let mut snapshot = vec![0u8; ps];
+                    self.inner.peek(Lba(page_lba), &mut snapshot);
+                    undo.insert(page_lba, snapshot);
+                }
+            }
         }
         self.inner.write(lba, src, durable).await
     }
