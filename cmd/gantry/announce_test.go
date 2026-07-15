@@ -68,10 +68,22 @@ func TestRewriteWildcardMultiaddr(t *testing.T) {
 			want:  "/ip4/10.42.0.7/tcp/4001",
 		},
 		{
+			name:  "concrete ipv4 loopback returns empty",
+			in:    "/ip4/127.0.0.1/tcp/4001",
+			podIP: "10.42.0.7",
+			want:  "",
+		},
+		{
 			name:  "concrete ipv6 passes through",
 			in:    "/ip6/2001:db8::1/tcp/4001",
 			podIP: "10.42.0.7",
 			want:  "/ip6/2001:db8::1/tcp/4001",
+		},
+		{
+			name:  "concrete ipv6 loopback returns empty",
+			in:    "/ip6/::1/tcp/4001",
+			podIP: "fd00:10:244::7",
+			want:  "",
 		},
 	}
 	for _, tc := range cases {

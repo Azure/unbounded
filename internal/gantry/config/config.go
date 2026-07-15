@@ -277,6 +277,19 @@ type Config struct {
 	// goroutine state, and a lease, so this protects the node from fan-out.
 	CoordMaxConcurrentPulls int `yaml:"coord_max_concurrent_pulls"`
 
+	// PeerFetchTimeout caps the complete peer request, including streaming and
+	// committing the response body. It must accommodate the largest expected
+	// layer at the slowest acceptable per-peer throughput.
+	PeerFetchTimeout time.Duration `yaml:"peer_fetch_timeout"`
+
+	// AdvertiseReconcileInterval is the cadence of the background
+	// advertiser's full inventory reconcile. Eager per-digest advertise on
+	// stream completion is the fast path that makes finishers discoverable
+	// within milliseconds; this reconcile is the backstop that catches
+	// missed events and drives withdraws. Lower values converge faster
+	// after a missed event at the cost of more periodic inventory scans.
+	AdvertiseReconcileInterval time.Duration `yaml:"advertise_reconcile_interval"`
+
 	// ---------- DHT / direct-origin-fallback ----------
 
 	// NF5JitterBase is the base delay in the direct-origin-fallback jitter window
@@ -404,9 +417,11 @@ func NewDefault() *Config {
 		HRWTopologyScope: "cluster",
 		ZoneLabelKey:     "topology.kubernetes.io/zone",
 
-		CoordPeerAuthzEnforce:     false,
-		CoordMaxDigestsPerRequest: 256,
-		CoordMaxConcurrentPulls:   16,
+		CoordPeerAuthzEnforce:      false,
+		CoordMaxDigestsPerRequest:  256,
+		CoordMaxConcurrentPulls:    16,
+		PeerFetchTimeout:           time.Hour,
+		AdvertiseReconcileInterval: time.Minute,
 
 		NF5JitterBase:               3 * time.Second,
 		NF5JitterCap:                0, // no cap by default (original behaviour)
@@ -519,6 +534,8 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
 	setInt("COORD_MAX_DIGESTS_PER_REQUEST", &c.CoordMaxDigestsPerRequest)
 	setInt("COORD_MAX_CONCURRENT_PULLS", &c.CoordMaxConcurrentPulls)
+	setDur("PEER_FETCH_TIMEOUT", &c.PeerFetchTimeout)
+	setDur("ADVERTISE_RECONCILE_INTERVAL", &c.AdvertiseReconcileInterval)
 
 	setDur("NF5_JITTER_BASE", &c.NF5JitterBase)
 	setDur("NF5_JITTER_CAP", &c.NF5JitterCap)
@@ -575,6 +592,8 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "reject inbound coord requests from peers not in the membership view (default false = observe-only)")
 	fs.IntVar(&c.CoordMaxDigestsPerRequest, "coord-max-digests-per-request", c.CoordMaxDigestsPerRequest, "maximum digests accepted in one please_pull batch")
 	fs.IntVar(&c.CoordMaxConcurrentPulls, "coord-max-concurrent-pulls", c.CoordMaxConcurrentPulls, "maximum background origin pulls started by inbound please_pull")
+	fs.DurationVar(&c.PeerFetchTimeout, "peer-fetch-timeout", c.PeerFetchTimeout, "maximum time for a complete peer fetch, including body transfer and commit")
+	fs.DurationVar(&c.AdvertiseReconcileInterval, "advertise-reconcile-interval", c.AdvertiseReconcileInterval, "cadence of the background DHT advertiser inventory reconcile (backstop; eager advertise handles the fast path)")
 
 	fs.DurationVar(&c.NF5JitterBase, "nf5-jitter-base", c.NF5JitterBase, "base delay for the NF5 jitter window")
 	fs.DurationVar(&c.NF5JitterCap, "nf5-jitter-cap", c.NF5JitterCap, "hard ceiling on the NF5 jitter window (0 = no cap)")
@@ -754,6 +773,14 @@ func (c *Config) Validate() error {
 
 	if c.CoordMaxConcurrentPulls < 1 {
 		errs = append(errs, fmt.Errorf("coord_max_concurrent_pulls: must be >= 1, got %d", c.CoordMaxConcurrentPulls))
+	}
+
+	if c.PeerFetchTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("peer_fetch_timeout: must be > 0, got %v", c.PeerFetchTimeout))
+	}
+
+	if c.AdvertiseReconcileInterval <= 0 {
+		errs = append(errs, fmt.Errorf("advertise_reconcile_interval: must be > 0, got %v", c.AdvertiseReconcileInterval))
 	}
 
 	if c.NF5JitterBase <= 0 {

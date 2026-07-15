@@ -60,6 +60,14 @@ func startHandlerOnEphemeral(t *testing.T, handler http.Handler) string {
 	return ln.Addr().String()
 }
 
+func TestClientDefaultRequestTimeout(t *testing.T) {
+	client := NewClient()
+
+	if client.hc.Timeout != time.Hour {
+		t.Fatalf("request timeout = %v, want 1h", client.hc.Timeout)
+	}
+}
+
 func TestClientForwardsDelegatedAuthorization(t *testing.T) {
 	for _, authorization := range []string{
 		"Bearer requester-token",

@@ -70,10 +70,9 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 			writeAll(b.stderr, fmt.Sprintf("warning: switch proxy to idle during cleanup: %v\n", phaseErr))
 		}
 
-		hostsErr := b.restoreHosts(cleanupContext, state)
-		gantryErr := b.restoreGantry(cleanupContext, &state)
-
-		restoreErr := errors.Join(hostsErr, gantryErr)
+		// Gantry is patched at enable and restored at disable, so `run` never
+		// restarts Gantry. Only the containerd host routing is restored here.
+		restoreErr := b.restoreHosts(cleanupContext, state)
 		if restoreErr != nil {
 			state.Status = "restore-failed"
 
@@ -143,10 +142,9 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	if err := b.patchGantryForBenchmark(ctx, &state); err != nil {
-		return err
-	}
-
+	// Gantry was already patched and rolled out at enable time, so its DHT has
+	// long since re-converged. Only the containerd host routing changes here;
+	// `run` never restarts Gantry.
 	if err := b.installHosts(ctx, state, hostsModeGantry); err != nil {
 		return err
 	}

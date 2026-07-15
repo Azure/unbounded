@@ -5,6 +5,7 @@ package config
 
 import (
 	"bytes"
+	"flag"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,14 @@ import (
 
 func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	c := NewDefault()
+	if c.PeerFetchTimeout != time.Hour {
+		t.Fatalf("PeerFetchTimeout = %v, want 1h", c.PeerFetchTimeout)
+	}
+
+	if c.AdvertiseReconcileInterval != time.Minute {
+		t.Fatalf("AdvertiseReconcileInterval = %v, want 1m", c.AdvertiseReconcileInterval)
+	}
+
 	// Defaults intentionally have no upstream registries - operator must
 	// supply at least one. Seed one and re-validate.
 	c.UpstreamRegistries = []UpstreamRegistry{
@@ -111,6 +120,56 @@ func TestValidate_CoordBoundsMustBePositive(t *testing.T) {
 				t.Fatalf("want %s error, got %v", tt.want, err)
 			}
 		})
+	}
+}
+
+func TestValidate_PeerFetchTimeoutMustBePositive(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.PeerFetchTimeout = 0
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "peer_fetch_timeout") {
+		t.Fatalf("want peer_fetch_timeout error, got %v", err)
+	}
+}
+
+func TestBindFlags_PeerFetchTimeout(t *testing.T) {
+	c := NewDefault()
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	c.BindFlags(flags)
+
+	if err := flags.Parse([]string{"--peer-fetch-timeout=35m"}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if c.PeerFetchTimeout != 35*time.Minute {
+		t.Fatalf("PeerFetchTimeout = %v, want 35m", c.PeerFetchTimeout)
+	}
+}
+
+func TestValidate_AdvertiseReconcileIntervalMustBePositive(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.AdvertiseReconcileInterval = 0
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "advertise_reconcile_interval") {
+		t.Fatalf("want advertise_reconcile_interval error, got %v", err)
+	}
+}
+
+func TestBindFlags_AdvertiseReconcileInterval(t *testing.T) {
+	c := NewDefault()
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	c.BindFlags(flags)
+
+	if err := flags.Parse([]string{"--advertise-reconcile-interval=90s"}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if c.AdvertiseReconcileInterval != 90*time.Second {
+		t.Fatalf("AdvertiseReconcileInterval = %v, want 90s", c.AdvertiseReconcileInterval)
 	}
 }
 
@@ -253,6 +312,8 @@ hrw_k: 5
 coord_peer_authz_enforce: true
 coord_max_digests_per_request: 12
 coord_max_concurrent_pulls: 4
+peer_fetch_timeout: 45m
+advertise_reconcile_interval: 90s
 nf5_jitter_base: 7s
 log_level: debug
 `)
@@ -286,6 +347,14 @@ log_level: debug
 		t.Errorf("CoordMaxConcurrentPulls = %d, want 4", c.CoordMaxConcurrentPulls)
 	}
 
+	if c.PeerFetchTimeout != 45*time.Minute {
+		t.Errorf("PeerFetchTimeout = %v, want 45m", c.PeerFetchTimeout)
+	}
+
+	if c.AdvertiseReconcileInterval != 90*time.Second {
+		t.Errorf("AdvertiseReconcileInterval = %v, want 90s", c.AdvertiseReconcileInterval)
+	}
+
 	if c.NF5JitterBase != 7*time.Second {
 		t.Errorf("NF5JitterBase = %v, want 7s", c.NF5JitterBase)
 	}
@@ -305,6 +374,8 @@ func TestLoadEnv(t *testing.T) {
 		"GANTRY_HRW_K":                         "9",
 		"GANTRY_COORD_MAX_DIGESTS_PER_REQUEST": "11",
 		"GANTRY_COORD_MAX_CONCURRENT_PULLS":    "3",
+		"GANTRY_PEER_FETCH_TIMEOUT":            "50m",
+		"GANTRY_ADVERTISE_RECONCILE_INTERVAL":  "90s",
 		"GANTRY_NF5_JITTER_BASE":               "4500ms",
 	}
 
@@ -331,6 +402,14 @@ func TestLoadEnv(t *testing.T) {
 
 	if c.CoordMaxConcurrentPulls != 3 {
 		t.Errorf("CoordMaxConcurrentPulls = %d", c.CoordMaxConcurrentPulls)
+	}
+
+	if c.PeerFetchTimeout != 50*time.Minute {
+		t.Errorf("PeerFetchTimeout = %v", c.PeerFetchTimeout)
+	}
+
+	if c.AdvertiseReconcileInterval != 90*time.Second {
+		t.Errorf("AdvertiseReconcileInterval = %v", c.AdvertiseReconcileInterval)
 	}
 
 	if c.NF5JitterBase != 4500*time.Millisecond {

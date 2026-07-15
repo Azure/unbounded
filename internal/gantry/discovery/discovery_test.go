@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
+
 	"github.com/Azure/unbounded/internal/gantry/digest"
 )
 
@@ -109,6 +112,42 @@ func TestHostPersistsIdentity(t *testing.T) {
 
 	if second.PeerID() != id1 {
 		t.Errorf("PeerID changed across restarts: %s vs %s", id1, second.PeerID())
+	}
+}
+
+func TestTransferAddrWithPortSkipsLoopback(t *testing.T) {
+	tests := []struct {
+		name  string
+		addrs []string
+		want  string
+	}{
+		{
+			name:  "IPv4 pod address after loopback",
+			addrs: []string{"/ip4/127.0.0.1/tcp/4001", "/ip4/10.245.17.155/tcp/4001"},
+			want:  "10.245.17.155:5001",
+		},
+		{
+			name:  "IPv6 pod address after loopback",
+			addrs: []string{"/ip6/::1/tcp/4001", "/ip6/fd00::42/tcp/4001"},
+			want:  "[fd00::42]:5001",
+		},
+		{
+			name:  "loopback only is unusable",
+			addrs: []string{"/ip4/127.0.0.1/tcp/4001", "/ip6/::1/tcp/4001"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ai := peer.AddrInfo{Addrs: make([]multiaddr.Multiaddr, 0, len(tt.addrs))}
+			for _, addr := range tt.addrs {
+				ai.Addrs = append(ai.Addrs, multiaddr.StringCast(addr))
+			}
+
+			if got := transferAddrWithPort(ai, 5001); got != tt.want {
+				t.Fatalf("transferAddrWithPort() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

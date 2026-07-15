@@ -141,6 +141,15 @@ data:
     # one node. Each pull holds an HTTP body, containerd writer,
     # goroutine, and lease.
     coord_max_concurrent_pulls: 16
+    # Complete peer transfers include the response body and local containerd
+    # commit. Large layers under high fan-out can take substantially longer
+    # than a dial or metadata request.
+    peer_fetch_timeout: "1h"
+    # Cadence of the background DHT advertiser inventory reconcile. Eager
+    # per-digest advertise on stream completion is the fast path that makes
+    # finishers discoverable within milliseconds; this reconcile is the
+    # backstop for missed events and withdraws.
+    advertise_reconcile_interval: "1m"
 
     # ---------- DHT / NF5 (§7.7) ----------
     nf5_jitter_base: "3s"
@@ -160,5 +169,5 @@ data:
       - "rate_limited"
 
     # ---------- Logging ----------
-    log_level: "info"
+    log_level: "debug"
     log_format: "json"

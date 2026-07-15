@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
 
 	"github.com/Azure/unbounded/internal/gantry/advertise"
 	"github.com/Azure/unbounded/internal/gantry/cdsub"
@@ -190,7 +191,7 @@ func runAgent(args []string) error {
 	// mode the primary local content store IS the containerd content
 	// store; the transfer endpoint reads from it directly with no
 	// SecondaryBlobSource hop.
-	peerClient := transfer.NewClient()
+	peerClient := transfer.NewClient(transfer.WithRequestTimeout(c.PeerFetchTimeout))
 	transferOpts := []transfer.Option{
 		transfer.WithLogger(logger),
 		transfer.WithDescriber(cdstore),
@@ -348,6 +349,7 @@ func runAgent(args []string) error {
 
 	adv := advertise.New(containerdInv, disco,
 		advertise.WithLogger(logger),
+		advertise.WithReconcileInterval(c.AdvertiseReconcileInterval),
 		advertise.WithMetrics(advertise.MetricsHooks{
 			OnReconcileStart: func() { p9.advReconcileTotal.Inc() },
 			OnReconcileEnd: func(dur time.Duration, inventorySize, added, removed int) {
@@ -577,8 +579,16 @@ func runAgent(args []string) error {
 		),
 		mirror.WithLiveStreamCompletedHook(func(d digest.Digest) {
 			streamCommitTracker.RecordCompleted(d)
+			// Eagerly advertise as soon as the local containerd commit is
+			// visible so a node that just finished a live stream-through
+			// becomes a discoverable peer provider within milliseconds,
+			// instead of waiting for the periodic advertiser reconcile or
+			// the next containerd image event. The stream-commit tracker
+			// above remains the correctness backstop.
+			go advertiseOnCommit(ctx, adv, cstore, d, logger)
 		}),
 		mirror.WithDiscovery(disco, peerClient),
+		mirror.WithPeerBudgets(0, c.PeerFetchTimeout, 0),
 		mirror.WithSelfNodeID(memberView.Self()),
 		mirror.WithSelfPeerID(ifaces.NodeID(disco.PeerID().String())),
 		mirror.WithPeerMetrics(
@@ -1597,12 +1607,13 @@ func bootstrapPeerAddrs(mgr *members.Manager) []string {
 
 // rewriteWildcardMultiaddr returns ma with any wildcard IP component
 // (/ip4/0.0.0.0 or /ip6/::) replaced by /ip4/<podIP> or /ip6/<podIP>
-// of the *same family* as the wildcard. Non-wildcard multiaddrs are
-// returned unchanged. Returns "" when:
+// of the *same family* as the wildcard. Dialable non-wildcard
+// multiaddrs are returned unchanged. Returns "" when:
 //
 // - the multiaddr is a wildcard and no usable pod IP is available;
 // - the multiaddr is a wildcard and the pod IP belongs to the
-// opposite family (e.g. /ip4/0.0.0.0 with a v6 pod IP).
+// opposite family (e.g. /ip4/0.0.0.0 with a v6 pod IP);
+// - a concrete IP multiaddr is not globally unicast.
 //
 // The cross-family skip is critical: the wildcard family reflects
 // the family the libp2p host is actually listening on. Silently
@@ -1620,6 +1631,10 @@ func rewriteWildcardMultiaddr(ma, podIP string) string {
 
 	isWildcardV6 := strings.HasPrefix(ma, "/ip6/::/")
 	if !isWildcardV4 && !isWildcardV6 {
+		if !isDialableMultiaddr(ma) {
+			return ""
+		}
+
 		return ma
 	}
 
@@ -1657,6 +1672,26 @@ func rewriteWildcardMultiaddr(ma, podIP string) string {
 	}
 
 	return family + rest
+}
+
+func isDialableMultiaddr(value string) bool {
+	addr, err := multiaddr.NewMultiaddr(value)
+	if err != nil {
+		return false
+	}
+
+	for _, protocol := range []int{multiaddr.P_IP4, multiaddr.P_IP6} {
+		rawIP, err := addr.ValueForProtocol(protocol)
+		if err != nil {
+			continue
+		}
+
+		ip := net.ParseIP(rawIP)
+
+		return ip != nil && ip.IsGlobalUnicast()
+	}
+
+	return true
 }
 
 // advertisedTransferAddr returns the transfer endpoint to publish on
@@ -1809,6 +1844,55 @@ type layerPrefetchAdapter struct {
 // a misconfigured upstream (or attack), and we'd rather skip prefetch
 // than allocate a multi-MB buffer per manifest serve.
 const maxManifestBytes int64 = 4 * 1024 * 1024
+
+// advertiseOnCommit eagerly advertises d on the DHT as soon as the
+// local containerd content store can serve it, so a node that just
+// finished a live stream-through becomes a discoverable peer provider
+// within milliseconds instead of waiting for the periodic advertiser
+// reconcile or the next containerd image event. It polls Has briefly to
+// cover the short window between the mirror stream completing and
+// containerd finalizing the commit; adv.Notify re-verifies the digest is
+// openable before Provide, so a premature call is a harmless no-op. The
+// periodic reconcile remains the backstop, and a requester that races
+// the pre-commit window simply falls back to another provider or origin.
+func advertiseOnCommit(ctx context.Context, adv *advertise.Advertiser, store ifaces.LocalContentStore, d digest.Digest, logger *slog.Logger) {
+	const (
+		maxWait   = 5 * time.Second
+		pollEvery = 150 * time.Millisecond
+	)
+
+	deadline := time.Now().Add(maxWait)
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		hasCtx, cancel := context.WithTimeout(ctx, time.Second)
+		has, err := store.Has(hasCtx, d)
+
+		cancel()
+
+		if err == nil && has {
+			adv.Notify(ctx, d, true)
+			return
+		}
+
+		if time.Now().After(deadline) {
+			logger.Debug("advertise: eager post-stream advertise did not converge; reconcile will backstop",
+				slog.String("digest", d.String()),
+			)
+
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(pollEvery):
+		}
+	}
+}
 
 func newLayerPrefetcher(r *coldstart.Resolver, cache ifaces.LocalContentStore, logger *slog.Logger) mirror.LayerPrefetcher {
 	return &layerPrefetchAdapter{

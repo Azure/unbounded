@@ -483,7 +483,7 @@ func WithDiscovery(d ifaces.DHT, peer ifaces.PeerDialer) Option {
 }
 
 // WithPeerBudgets overrides the default peer-path budgets.
-// lookup ≤ 0 means "use default 2s"; fetch ≤ 0 means "use default 10s";
+// lookup ≤ 0 means "use default 2s"; fetch ≤ 0 means "use default 1h";
 // maxAttempts ≤ 0 means "use default 3".
 func WithPeerBudgets(lookup, fetch time.Duration, maxAttempts int) Option {
 	return func(s *Server) {
@@ -830,6 +830,8 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	// replaces this leg for the cold-start case.
 	if s.dht != nil && s.peer != nil {
 		switch s.tryPeerFallback(ctx, w, r, d, kind, upstream, repo, logger) {
+		case peerFallbackLocalHit:
+			return
 		case peerFallbackServed:
 			if !s.liveStreamThrough {
 				s.firePrefetch(ctx, kind, upstream, repo, d)
@@ -1206,7 +1208,7 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 	}
 }
 
-// peerFallbackResult is the tri-state outcome of tryPeerFallback.
+// peerFallbackResult is the outcome of tryPeerFallback.
 type peerFallbackResult int
 
 const (
@@ -1214,6 +1216,9 @@ const (
 	// fired (caller-gated), or it errored, or it returned no providers.
 	// The caller may fall through to origin (behavior).
 	peerFallbackUnused peerFallbackResult = iota
+	// peerFallbackLocalHit means cold-start populated the local cache after
+	// serveDigest's initial miss and the response has already been written.
+	peerFallbackLocalHit
 	// peerFallbackServed means a peer's bytes were fully delivered to the
 	// client. In default mode they were verified+committed to cache first;
 	// in live-stream-through mode they were proxied directly and the final
@@ -1297,6 +1302,12 @@ func (s peerAttemptSummary) allStaleOrFiltered() bool {
 // successful peer fetch streams directly to the caller and later
 // inventory observation is used to confirm the local containerd commit.
 func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, logger *slog.Logger) peerFallbackResult {
+	// Cold-start may designate this process as the puller, populating the
+	// local store after serveDigest's initial cache miss.
+	recheckLocalAfterColdStart := func() bool {
+		return s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger)
+	}
+
 	lookupBudget := s.peerLookupBudget
 	if lookupBudget <= 0 {
 		lookupBudget = 2 * time.Second
@@ -1304,7 +1315,7 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 
 	fetchBudget := s.peerFetchBudget
 	if fetchBudget <= 0 {
-		fetchBudget = 10 * time.Second
+		fetchBudget = time.Hour
 	}
 
 	maxAttempts := s.maxPeerAttempts
@@ -1337,6 +1348,11 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 
 	if err != nil || len(providers) == 0 {
 		csProviders, res := s.resolveViaColdStart(ctx, d, kind, upstream, repo, err != nil, false, peerAttemptSummary{}, logger)
+
+		if recheckLocalAfterColdStart() {
+			return peerFallbackLocalHit
+		}
+
 		if res != peerFallbackUnused {
 			return res
 		}
@@ -1375,6 +1391,11 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		)
 
 		csProviders, res := s.resolveViaColdStart(ctx, d, kind, upstream, repo, false, true, summary, logger)
+
+		if recheckLocalAfterColdStart() {
+			return peerFallbackLocalHit
+		}
+
 		if res != peerFallbackUnused {
 			return res
 		}
@@ -1419,6 +1440,11 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		)
 
 		csProviders, csResult := s.resolveViaColdStart(ctx, d, kind, upstream, repo, false, allStale, summary, logger)
+
+		if recheckLocalAfterColdStart() {
+			return peerFallbackLocalHit
+		}
+
 		if csResult != peerFallbackUnused {
 			return csResult
 		}

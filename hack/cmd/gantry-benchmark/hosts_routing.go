@@ -243,6 +243,7 @@ if [ -e "${active}" ]; then
     exec sleep 2147483647
   elif [ "$(cat "${backup}/original-state")" = absent ] && [ ! -e "${target}" ]; then
     rm -f "${active}"
+    rmdir "${target_dir}" 2>/dev/null || true
     rm -rf "${backup}"
     touch /tmp/ready
     echo "absent hosts.toml was already restored"
@@ -265,6 +266,7 @@ else
       ;;
     absent)
       if [ ! -e "${target}" ]; then
+        rmdir "${target_dir}" 2>/dev/null || true
         rm -rf "${backup}"
         touch /tmp/ready
         echo "absent hosts.toml was already restored"
@@ -276,7 +278,8 @@ else
   exit 1
 fi
 
-case "$(cat "${backup}/original-state")" in
+orig_state="$(cat "${backup}/original-state")"
+case "${orig_state}" in
   present)
     temp="${target_dir}/.hosts.toml.gantry-benchmark.restore"
     cp "${backup}/hosts.toml" "${temp}"
@@ -292,6 +295,9 @@ case "$(cat "${backup}/original-state")" in
     ;;
 esac
 rm -f "${active}"
+if [ "${orig_state}" = absent ]; then
+  rmdir "${target_dir}" 2>/dev/null || true
+fi
 rm -rf "${backup}"
 touch /tmp/ready
 echo "restored hosts.toml for ${REGISTRY_HOST}"

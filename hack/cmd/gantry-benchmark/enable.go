@@ -182,9 +182,20 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 
 	dashboardInstalled = true
 
-	state.Status = "enabled"
-
 	state.ProxyClusterIP = proxyIP
+
+	// Patch Gantry to route origin pulls through the counting proxy and roll it
+	// out now, at enable time. Restarting Gantry clears each agent's in-memory
+	// DHT routing table, and a 300-node cluster needs several minutes to
+	// re-converge. Doing it here - rather than inside `run`, immediately before
+	// the Gantry-cold phase - means `run` never restarts Gantry: the DHT is
+	// fully warm by the time the cold phase measures peer distribution.
+	// `disable` restores the original Gantry config.
+	if err := b.patchGantryForBenchmark(ctx, &state); err != nil {
+		return err
+	}
+
+	state.Status = "enabled"
 	if err := b.saveState(ctx, state); err != nil {
 		return err
 	}

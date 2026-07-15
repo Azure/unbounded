@@ -9,12 +9,12 @@ The validated layout is:
 
 | Pool | Mode | Nodes | Default VM size | Purpose |
 |---|---|---:|---|---|
-| `system` | System | 10 | `Standard_D2ds_v6` | Kubernetes system workloads |
-| `worker` | User | 290 | `Standard_D2ds_v6` | Application workloads |
+| `system` | System | 10 | `Standard_D8ds_v6` | Kubernetes system workloads |
+| `worker` | User | 290 | `Standard_D8ds_v6` | Application workloads |
 
-For an existing cluster, the system pool may use a different VM family. The
-validated expansion kept 10 `Standard_D2ds_v5` system nodes and added 290
-`Standard_D2ds_v6` worker nodes.
+Each `Standard_D8ds_v6` node has 8 vCPUs and 32 GiB of memory. For an existing
+cluster, the system pool may use a different VM family; calculate quota demand
+for every pool being added or scaled.
 
 ## Design constraints
 
@@ -24,8 +24,8 @@ validated expansion kept 10 `Standard_D2ds_v5` system nodes and added 290
   cannot support 300 nodes. A `/15` contains 512 blocks, leaving room for
   upgrade surge nodes.
 - Check the quota family reported for the exact VM SKU. Similar names can use
-  different quota families. `Standard_D2ds_v5` uses `standardDDSv5Family`,
-  while `Standard_D2ds_v6` uses `StandardDdsv6Family`.
+  different quota families. `Standard_D8ds_v6` uses
+  `StandardDdsv6Family`.
 - Scale pools through `az aks nodepool add` or `az aks nodepool scale`. Do not
   modify the AKS-managed VM scale set directly. Direct VMSS changes bypass AKS
   reconciliation and do not bypass family quota.
@@ -42,9 +42,9 @@ The operator needs:
 - `kubectl` and `jq`.
 - Permission to create resource groups and AKS clusters, or to update the
   target AKS cluster and its node pools.
-- At least 600 free vCPUs in the selected two-vCPU VM family for a fresh
-  cluster. Expanding an existing 10-node cluster requires 580 free vCPUs for
-  the worker pool.
+- At least 2,400 free vCPUs in the selected eight-vCPU VM family for a fresh
+  cluster. Expanding an existing 10-node cluster requires 2,320 free vCPUs for
+  the 290-node worker pool.
 - At least 300 free entries in the regional Virtual Machines quota.
 - A dedicated `KUBECONFIG` path.
 
@@ -75,7 +75,7 @@ SYSTEM_NODE_COUNT=10
 WORKER_NODE_COUNT=290
 TARGET_NODE_COUNT=300
 
-NODE_VM_SIZE="${NODE_VM_SIZE:-Standard_D2ds_v6}"
+NODE_VM_SIZE="${NODE_VM_SIZE:-Standard_D8ds_v6}"
 MAX_PODS=250
 OS_DISK_SIZE_GB=128
 
@@ -191,7 +191,7 @@ if (( VM_LIMIT - VM_USED < QUOTA_NODE_COUNT )); then
 fi
 ```
 
-If this check fails, select another unrestricted two-vCPU SKU with sufficient
+If this check fails, select another unrestricted eight-vCPU SKU with sufficient
 quota or request a quota increase. Do not continue with a direct VMSS scale.
 
 ## Create a new cluster
