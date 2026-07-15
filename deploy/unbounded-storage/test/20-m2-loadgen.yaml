@@ -70,10 +70,10 @@ spec:
     kubernetes.io/hostname: node-1
   containers:
     - name: unbounded-storage
-      image: ghcr.io/azure/unbounded-storage:REPLACE_WITH_SHA
-      args:
-        - --config
-        - /etc/unbounded-storage/config.toml
+      image: ghcr.io/azure/unbounded-storage:552f4c93ffeb1696b8e597736a879ed09c8faca9
+      # The image ENTRYPOINT already runs:
+      #   unbounded-storage --config /etc/unbounded-storage/config.toml
+      # so no args/command override is needed here.
       ports:
         - name: metrics
           containerPort: 9100
