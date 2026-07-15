@@ -96,6 +96,7 @@ export GANTRY_CONFIGMAP="gantry-config"
 export BENCHMARK_NAMESPACE="gantry-benchmark"
 export BENCHMARK_NODE_COUNT="300"
 export BENCHMARK_IMAGE_SIZE_MIB="1024"
+export BENCHMARK_IMAGE_LAYERS="1"
 export BENCHMARK_IMAGE_PLATFORM="linux/amd64"
 export BENCHMARK_WORKLOAD_REPOSITORY="gantry-benchmark-pull"
 export BENCHMARK_JOB_TIMEOUT="90m"
@@ -115,6 +116,25 @@ tool still sees them as eligible, either include them deliberately or adjust
 the node targeting before `enable`. The persisted benchmark state records the
 node count at enable time; changing `env.local` later does not rewrite existing
 state.
+
+## Image Shape (single vs multi-layer)
+
+`BENCHMARK_IMAGE_SIZE_MIB` and `BENCHMARK_IMAGE_LAYERS` together define the
+workload image. The tool splits the total payload across `BENCHMARK_IMAGE_LAYERS`
+separate `COPY` layers (each a fresh random blob per run, so every layer digest
+is unique and the pull is genuinely cold). The last layer absorbs any remainder.
+
+| Setting | Models | Notes |
+|---|---|---|
+| `IMAGE_LAYERS=1` | One giant layer | Pathological worst case. Whole-blob store-and-forward means no cross-layer pipelining, so the cascade pays the full per-layer `log(N)` fan-out penalty. |
+| `IMAGE_LAYERS=8`, `IMAGE_SIZE_MIB=8192` | 8 GiB / 8 x 1 GiB | Representative multi-layer image. The 8 layers form 8 independent per-digest cascades that pipeline across each other, so throughput per node is higher than the single-layer case. |
+
+Constraints: `IMAGE_LAYERS` must be `>= 1` and `<= IMAGE_SIZE_MIB`. Use a
+multi-layer shape when validating the target 20-40 GiB many-layer workload;
+use the single 1 GiB layer only to measure the worst case.
+
+Reference results for both shapes on a 300-node AKS cluster are recorded in
+[`hack/gantry-benchmark/BENCHMARK-RESULTS.md`](../gantry-benchmark/BENCHMARK-RESULTS.md).
 
 For admin-disabled ACR auth, inject the refresh token only when building,
 pushing, or running:

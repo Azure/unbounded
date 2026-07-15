@@ -250,13 +250,13 @@ type Config struct {
 	HRWK int `yaml:"hrw_k"`
 
 	// PrefetchPullerReplicas is how many distinct HRW-ranked pullers each
-	// prefetched layer digest is dispatched to. 1 (default) designates a
-	// single origin puller per layer: tightest dedup, but the whole swarm
-	// then fans out from ONE initial seed, which bottlenecks a cold
-	// thundering-herd (peer transfers pile onto the lone seed and stall).
-	// N>1 asks the top-N pullers to origin-pull the layer in parallel,
-	// giving N initial seeds so peer transfers fan out N-fold, at the cost
-	// of up to N origin copies of each layer.
+	// prefetched layer digest is dispatched to. 1 designates a single origin
+	// puller per layer (tightest dedup), but the whole swarm then fans out
+	// from ONE initial seed, which bottlenecks a cold thundering-herd (peer
+	// transfers pile onto the lone seed and stall). N>1 asks the top-N pullers
+	// to origin-pull the layer in parallel, giving N initial seeds so peer
+	// transfers fan out N-fold, at the cost of up to N origin copies of each
+	// layer. The default is 8.
 	PrefetchPullerReplicas int `yaml:"prefetch_puller_replicas"`
 
 	// HRWTopologyScope selects "cluster" (HRW over all nodes) or "zone"
@@ -304,6 +304,9 @@ type Config struct {
 	// finisher-seeds that advertise mid-swarm (the cascade) instead of
 	// exhausting a fixed provider set and going to origin. Zero disables
 	// re-discovery, restoring the historical single-shot provider attempt.
+	// The default is 5m: paired with the strict containerd hosts.toml (shipped
+	// in deploy/gantry/node-config.yaml) and TransferMaxConcurrentServes, this
+	// drives the validated cold-start cascade.
 	PeerRediscoverBudget time.Duration `yaml:"peer_rediscover_budget"`
 
 	// PeerRediscoverBackoff is the pause between re-discovery rounds. It gives
@@ -316,7 +319,10 @@ type Config struct {
 	// transfer endpoint. Requests over the cap receive 429 with a Retry-After
 	// hint so the requester re-discovers another provider instead of queueing
 	// behind a saturated seed. This load-shedding is what lets the first
-	// finishers complete early and seed the swarm. Zero means unlimited.
+	// finishers complete early and seed the swarm. Zero means unlimited; the
+	// default is 100. Shedding only preserves dedup with the strict containerd
+	// hosts.toml (mirror-only, no origin fall-through), where a shed request
+	// retries Gantry rather than falling through to origin.
 	TransferMaxConcurrentServes int `yaml:"transfer_max_concurrent_serves"`
 
 	// AdvertiseReconcileInterval is the cadence of the background
@@ -451,7 +457,7 @@ func NewDefault() *Config {
 		UpstreamRegistries: nil,
 
 		HRWK:                   3,
-		PrefetchPullerReplicas: 1,
+		PrefetchPullerReplicas: 8,
 		HRWTopologyScope:       "cluster",
 		ZoneLabelKey:           "topology.kubernetes.io/zone",
 
@@ -459,9 +465,9 @@ func NewDefault() *Config {
 		CoordMaxDigestsPerRequest:   256,
 		CoordMaxConcurrentPulls:     16,
 		PeerFetchTimeout:            60 * time.Second,
-		PeerRediscoverBudget:        0, // disabled by default (single-shot provider attempt)
-		PeerRediscoverBackoff:       0, // built-in 1s default when re-discovery is enabled
-		TransferMaxConcurrentServes: 0, // unlimited by default
+		PeerRediscoverBudget:        5 * time.Minute, // re-discovery cascade on by default (validated at 300 nodes)
+		PeerRediscoverBackoff:       time.Second,     // pause between re-discovery rounds
+		TransferMaxConcurrentServes: 100,             // serve cap sheds excess GETs with 429 (validated cascade)
 		AdvertiseReconcileInterval:  time.Minute,
 
 		NF5JitterBase:               3 * time.Second,

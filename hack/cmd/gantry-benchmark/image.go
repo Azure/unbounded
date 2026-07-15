@@ -50,21 +50,55 @@ func (b *benchmark) buildFreshImage(ctx context.Context, state benchmarkState, p
 		return "", fmt.Errorf("create image build directory: %w", err)
 	}
 
-	dockerfile := `FROM docker.io/library/alpine:3.20
-COPY payload.bin /payload.bin
-CMD ["sh", "-c", "date -u +%Y-%m-%dT%H:%M:%S.%NZ"]
-`
+	// Split the total image payload across ImageLayers separate COPY layers so
+	// the workload resembles a real multi-layer image (each COPY instruction
+	// produces one layer). Distributing layer-by-layer is what lets the P2P
+	// cascade pipeline across layers; a single giant layer is the pathological
+	// M=1 case. Each payload is fresh random bytes per run so every layer
+	// digest is unique and the pull is genuinely cold.
+	layers := b.config.ImageLayers
+	if layers < 1 {
+		layers = 1
+	}
+
+	perLayerMiB := b.config.ImageSizeMiB / layers
+	remainderMiB := b.config.ImageSizeMiB % layers
+
+	var (
+		copyLines    strings.Builder
+		payloadPaths []string
+	)
+
+	for i := 0; i < layers; i++ {
+		sizeMiB := perLayerMiB
+		if i == layers-1 {
+			sizeMiB += remainderMiB // last layer absorbs the remainder
+		}
+
+		name := fmt.Sprintf("payload%d.bin", i)
+		path := filepath.Join(buildDirectory, name)
+
+		if err := writeRandomPayload(path, int64(sizeMiB)*1024*1024); err != nil {
+			return "", fmt.Errorf("write random workload payload %d: %w", i, err)
+		}
+
+		payloadPaths = append(payloadPaths, path)
+
+		fmt.Fprintf(&copyLines, "COPY %s /%s\n", name, name)
+	}
+
+	dockerfile := fmt.Sprintf(`FROM docker.io/library/alpine:3.20
+%sCMD ["sh", "-c", "date -u +%%Y-%%m-%%dT%%H:%%M:%%S.%%NZ"]
+`, copyLines.String())
+
 	if err := os.WriteFile(filepath.Join(buildDirectory, "Dockerfile"), []byte(dockerfile), 0o640); err != nil {
 		return "", fmt.Errorf("write workload Dockerfile: %w", err)
 	}
 
-	payloadPath := filepath.Join(buildDirectory, "payload.bin")
-	if err := writeRandomPayload(payloadPath, int64(b.config.ImageSizeMiB)*1024*1024); err != nil {
-		return "", fmt.Errorf("write random workload payload: %w", err)
-	}
-
 	defer func() {
-		_ = os.Remove(payloadPath) //nolint:errcheck // The pushed image is authoritative; stale local payload cleanup is best effort.
+		for _, p := range payloadPaths {
+			_ = os.Remove(p) //nolint:errcheck // The pushed image is authoritative; stale local payload cleanup is best effort.
+		}
 	}()
 
 	var imageDigest string

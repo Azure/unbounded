@@ -158,20 +158,27 @@ data:
     # (e.g. 1h) removes re-selection and collapses to single-seed bandwidth
     # (the ~12min lockstep). Matches upstream gantry's hardcoded 60s.
     peer_fetch_timeout: "60s"
-    # Peer re-discovery loop (experimental, default OFF). On a cache miss the
-    # mirror can repeatedly re-run DHT FindProviders and retry peer fetches for
-    # up to peer_rediscover_budget to pick up finisher-seeds that advertise
-    # mid-swarm. "0" disables re-discovery (single-shot attempt).
-    # NOTE: pairing this with transfer_max_concurrent_serves below is NOT a
-    # working cascade: a 429-shed node has no bytes to stream, so containerd's
-    # mirror request stalls and falls through to origin, collapsing dedup. Kept
-    # behind flags (default 0) pending a byte-flow-preserving redesign.
-    peer_rediscover_budget: "0"
+    # Peer re-discovery loop. On a cache miss the mirror repeatedly re-runs DHT
+    # FindProviders and retries peer fetches for up to peer_rediscover_budget to
+    # pick up finisher-seeds that advertise mid-swarm (the cold-start cascade),
+    # instead of exhausting a fixed provider set and going to origin. "0"
+    # disables re-discovery (single-shot attempt). Default 5m.
+    # This IS a working cascade with the strict containerd hosts.toml shipped in
+    # deploy/gantry/node-config.yaml (mirror-only, no origin fall-through): a
+    # 429-shed request re-selects a fresher finisher-seed and, if exhausted,
+    # retries Gantry rather than falling through to origin, so dedup holds.
+    # Validated at 300 nodes: 99.67% (1 GiB) / 97.58% (8 GiB) origin reduction
+    # with zero containerd origin bypass.
+    peer_rediscover_budget: "5m"
     peer_rediscover_backoff: "1s"
-    # Cap on concurrent peer blob-body serves; over the cap returns 429.
-    # Default 0 (unlimited): see the re-discovery note above for why capping
-    # breaks dedup under containerd's mirror-fallthrough.
-    transfer_max_concurrent_serves: 0
+    # Cap on concurrent peer blob-body serves; over the cap returns 429 with a
+    # Retry-After hint so the requester re-selects a fresher finisher-seed
+    # instead of queueing behind a saturated seed. This load-shedding is what
+    # lets the first finishers complete early and seed the swarm ("leaders make
+    # leaders"). "0" means unlimited. Default 100. Requires the strict
+    # containerd hosts.toml (shipped in deploy/gantry/node-config.yaml) so a
+    # shed request retries Gantry rather than falling through to origin.
+    transfer_max_concurrent_serves: 100
     # Cadence of the background DHT advertiser inventory reconcile. Eager
     # per-digest advertise on stream completion is the fast path that makes
     # finishers discoverable within milliseconds; this reconcile is the

@@ -32,6 +32,7 @@ type benchmarkConfig struct {
 	ConfirmedContext     string
 	NodeCount            int
 	ImageSizeMiB         int
+	ImageLayers          int
 	JobTimeout           time.Duration
 	RolloutTimeout       time.Duration
 	MinimumByteReduction float64
@@ -51,6 +52,11 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 	}
 
 	imageSizeMiB, err := envInt(getenv, "BENCHMARK_IMAGE_SIZE_MIB", 1024)
+	if err != nil {
+		return benchmarkConfig{}, err
+	}
+
+	imageLayers, err := envInt(getenv, "BENCHMARK_IMAGE_LAYERS", 1)
 	if err != nil {
 		return benchmarkConfig{}, err
 	}
@@ -94,6 +100,7 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		ConfirmedContext:     getenv("BENCHMARK_CONFIRM_CONTEXT"),
 		NodeCount:            nodeCount,
 		ImageSizeMiB:         imageSizeMiB,
+		ImageLayers:          imageLayers,
 		JobTimeout:           jobTimeout,
 		RolloutTimeout:       rolloutTimeout,
 		MinimumByteReduction: minimumByteReduction,
@@ -107,6 +114,14 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 
 	if config.ImageSizeMiB <= 0 {
 		return benchmarkConfig{}, errors.New("benchmark image size must be greater than zero")
+	}
+
+	if config.ImageLayers <= 0 {
+		return benchmarkConfig{}, errors.New("benchmark image layers must be greater than zero")
+	}
+
+	if config.ImageLayers > config.ImageSizeMiB {
+		return benchmarkConfig{}, errors.New("benchmark image layers cannot exceed image size in MiB")
 	}
 
 	if config.MinimumByteReduction < 0 || config.MinimumByteReduction > 1 {
