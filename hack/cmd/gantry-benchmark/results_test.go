@@ -3,7 +3,10 @@
 
 package main
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestCompareResults(t *testing.T) {
 	config := benchmarkConfig{MinimumByteReduction: 0.90, MaximumLatencyRatio: 1.0}
@@ -36,5 +39,33 @@ func TestCompareResultsFailsWithoutPeerActivity(t *testing.T) {
 
 	if comparison := compareResults(config, baseline, gantry); comparison.Passed {
 		t.Fatal("comparison passed without Gantry peer activity")
+	}
+}
+
+type staticPrometheusRunner struct {
+	output []byte
+}
+
+func (r staticPrometheusRunner) Run(context.Context, []byte, string, ...string) ([]byte, error) {
+	return r.output, nil
+}
+
+func TestFetchGantryRevisionMetricsTreatsMissingCounterSeriesAsZero(t *testing.T) {
+	benchmark := &benchmark{
+		config: benchmarkConfig{
+			GantryNamespace:     "gantry-system",
+			MonitoringNamespace: "monitoring",
+			PrometheusService:   "prometheus",
+		},
+		commands: staticPrometheusRunner{output: []byte(`{"status":"success","data":{"result":[]}}`)},
+	}
+
+	metrics, err := benchmark.fetchGantryRevisionMetrics(context.Background(), "revision-1")
+	if err != nil {
+		t.Fatalf("fetchGantryRevisionMetrics: %v", err)
+	}
+
+	if metrics.OriginPulls != 0 || metrics.PeerFetchHits != 0 {
+		t.Fatalf("metrics = %+v, want zero values", metrics)
 	}
 }

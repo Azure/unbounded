@@ -26,10 +26,21 @@ const (
 
 func main() {
 	var err error
-	if len(os.Args) > 1 && os.Args[1] == "set-phase" {
-		err = runSetPhase(os.Args[2:])
-	} else {
+	if len(os.Args) <= 1 {
 		err = run()
+	} else {
+		switch os.Args[1] {
+		case "set-phase":
+			err = runSetPhase(os.Args[2:])
+		case "get-url":
+			err = runURLCheck(os.Args[2:], os.Stdout, false)
+		case "check-url":
+			err = runURLCheck(os.Args[2:], io.Discard, false)
+		case "probe-health":
+			err = runURLCheck(os.Args[2:], io.Discard, true)
+		default:
+			err = fmt.Errorf("unknown subcommand %q", os.Args[1])
+		}
 	}
 
 	if err != nil {

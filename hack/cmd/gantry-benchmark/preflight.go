@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -83,56 +82,17 @@ func (b *benchmark) smokeProxy(ctx context.Context, state benchmarkState) error 
 		return fmt.Errorf("use proxy image as ACR smoke image: %w", err)
 	}
 
-	podName := "acr-proxy-smoke"
-	if _, err := b.commands.Run(ctx, nil, "kubectl", "-n", b.config.Namespace, "delete", "pod", podName, "--ignore-not-found=true", "--wait=true"); err != nil {
-		return err
-	}
-
-	pod := map[string]any{
-		"apiVersion": "v1",
-		"kind":       "Pod",
-		"metadata": map[string]any{
-			"name":      podName,
-			"namespace": b.config.Namespace,
-			"labels": map[string]string{
-				"app.kubernetes.io/name":    "acr-proxy-smoke",
-				"app.kubernetes.io/part-of": "gantry-benchmark",
-			},
-		},
-		"spec": map[string]any{
-			"restartPolicy": "Never",
-			"containers": []any{
-				map[string]any{
-					"name":    "curl",
-					"image":   "curlimages/curl:8.10.1",
-					"command": []string{"sh", "-c", "exec sleep 600"},
-				},
-			},
-		},
-	}
-	if err := b.applyObject(ctx, pod); err != nil {
-		return err
-	}
-
-	defer func() {
-		_, _ = b.commands.Run(context.Background(), nil, "kubectl", "-n", b.config.Namespace, "delete", "pod", podName, "--ignore-not-found=true", "--wait=false") //nolint:errcheck // Best-effort smoke pod cleanup.
-	}()
-
-	if _, err := b.commands.Run(ctx, nil, "kubectl", "-n", b.config.Namespace, "wait", "--for=condition=Ready", "pod/"+podName, "--timeout=2m"); err != nil {
-		return err
-	}
-
 	base := "http://acr-origin-proxy:5002"
-	if _, err := b.curlFromPod(ctx, podName, "-fsS", "-o", "/dev/null", base+"/v2/"); err != nil {
+	if _, err := b.proxyHTTP(ctx, "check-url", base+"/v2/", "30s"); err != nil {
 		return fmt.Errorf("proxy registry ping failed: %w", err)
 	}
 
-	manifestBytes, err := b.curlFromPod(
+	manifestBytes, err := b.proxyHTTP(
 		ctx,
-		podName,
-		"-fsS",
-		"-H", "Accept: "+registryManifestAccept,
+		"get-url",
 		fmt.Sprintf("%s/v2/%s/manifests/%s", base, repository, reference),
+		"30s",
+		registryManifestAccept,
 	)
 	if err != nil {
 		return fmt.Errorf("proxy manifest request failed: %w", err)
@@ -158,12 +118,12 @@ func (b *benchmark) smokeProxy(ctx context.Context, state benchmarkState) error 
 			return fmt.Errorf("smoke image index has no linux/amd64 manifest")
 		}
 
-		manifestBytes, err = b.curlFromPod(
+		manifestBytes, err = b.proxyHTTP(
 			ctx,
-			podName,
-			"-fsS",
-			"-H", "Accept: "+registryManifestAccept,
+			"get-url",
 			fmt.Sprintf("%s/v2/%s/manifests/%s", base, repository, childDigest),
+			"30s",
+			registryManifestAccept,
 		)
 		if err != nil {
 			return fmt.Errorf("proxy child manifest request failed: %w", err)
@@ -178,28 +138,25 @@ func (b *benchmark) smokeProxy(ctx context.Context, state benchmarkState) error 
 		return fmt.Errorf("smoke manifest has no config digest")
 	}
 
-	statusOutput, err := b.curlFromPod(
+	_, err = b.proxyHTTP(
 		ctx,
-		podName,
-		"-sS",
-		"-o", "/dev/null",
-		"-w", "%{http_code}",
+		"check-url",
 		fmt.Sprintf("%s/v2/%s/blobs/%s", base, repository, manifest.Config.Digest),
+		"30s",
 	)
 	if err != nil {
 		return fmt.Errorf("proxy config blob request failed: %w", err)
 	}
 
-	status, err := strconv.Atoi(strings.TrimSpace(string(statusOutput)))
-	if err != nil || status < http.StatusOK || status >= http.StatusMultipleChoices {
-		return fmt.Errorf("proxy config blob returned HTTP %q", strings.TrimSpace(string(statusOutput)))
-	}
-
 	return nil
 }
 
-func (b *benchmark) curlFromPod(ctx context.Context, podName string, args ...string) ([]byte, error) {
-	commandArgs := []string{"-n", b.config.Namespace, "exec", "pod/" + podName, "--", "curl"}
+func (b *benchmark) proxyHTTP(ctx context.Context, args ...string) ([]byte, error) {
+	commandArgs := []string{
+		"-n", b.config.Namespace,
+		"exec", "deployment/acr-origin-proxy", "--",
+		"/usr/local/bin/acr-origin-proxy",
+	}
 	commandArgs = append(commandArgs, args...)
 
 	return b.commands.Run(ctx, nil, "kubectl", commandArgs...)
@@ -262,12 +219,22 @@ func (b *benchmark) checkNodeProxyReachability(ctx context.Context, state benchm
 					"tolerations":  []any{map[string]any{"operator": "Exists"}},
 					"containers": []any{
 						map[string]any{
-							"name":    "curl",
-							"image":   "curlimages/curl:8.10.1",
-							"command": []string{"sh", "-c", fmt.Sprintf("curl -fsS --connect-timeout 5 http://%s:5002/healthz && exec sleep 3600", state.ProxyClusterIP)},
+							"name":            "probe",
+							"image":           state.ProxyImage,
+							"imagePullPolicy": "Always",
+							"args": []string{
+								"probe-health",
+								fmt.Sprintf("http://%s:5002/healthz", state.ProxyClusterIP),
+								"5s",
+							},
 							"readinessProbe": map[string]any{
 								"exec": map[string]any{
-									"command": []string{"curl", "-fsS", "--connect-timeout", "5", fmt.Sprintf("http://%s:5002/healthz", state.ProxyClusterIP)},
+									"command": []string{
+										"/usr/local/bin/acr-origin-proxy",
+										"check-url",
+										fmt.Sprintf("http://%s:5002/healthz", state.ProxyClusterIP),
+										"5s",
+									},
 								},
 								"periodSeconds": 5,
 							},
@@ -372,6 +339,14 @@ func (b *benchmark) checkMonitoring(ctx context.Context, state benchmarkState) e
 }
 
 func (b *benchmark) queryPrometheus(ctx context.Context, query string) (float64, error) {
+	return b.queryPrometheusValue(ctx, query, false)
+}
+
+func (b *benchmark) queryPrometheusOrZero(ctx context.Context, query string) (float64, error) {
+	return b.queryPrometheusValue(ctx, query, true)
+}
+
+func (b *benchmark) queryPrometheusValue(ctx context.Context, query string, zeroOnEmpty bool) (float64, error) {
 	rawPath := fmt.Sprintf(
 		"/api/v1/namespaces/%s/services/http:%s:9090/proxy/api/v1/query?query=%s",
 		b.config.MonitoringNamespace,
@@ -401,6 +376,10 @@ func (b *benchmark) queryPrometheus(ctx context.Context, query string) (float64,
 	}
 
 	if len(response.Data.Result) == 0 {
+		if zeroOnEmpty {
+			return 0, nil
+		}
+
 		return 0, fmt.Errorf("prometheus query returned no samples")
 	}
 

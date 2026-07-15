@@ -101,19 +101,69 @@ func (b *benchmark) gantryRevision(ctx context.Context) (string, error) {
 		ctx,
 		nil,
 		"kubectl", "-n", b.config.GantryNamespace,
-		"get", "daemonset", b.config.GantryDaemonSet,
-		"-o", "jsonpath={.status.updateRevision}",
+		"get", "pods", "-l", "app.kubernetes.io/name="+b.config.GantryDaemonSet,
+		"-o", "json",
 	)
 	if err != nil {
 		return "", err
 	}
 
-	revision := strings.TrimSpace(string(output))
-	if revision == "" {
-		return "", fmt.Errorf("gantry DaemonSet has no updateRevision") //nolint:staticcheck // Kubernetes field name is updateRevision.
+	var pods struct {
+		Items []struct {
+			Metadata struct {
+				Name   string            `json:"name"`
+				Labels map[string]string `json:"labels"`
+			} `json:"metadata"`
+			Status struct {
+				Conditions []struct {
+					Type   string `json:"type"`
+					Status string `json:"status"`
+				} `json:"conditions"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(output, &pods); err != nil {
+		return "", fmt.Errorf("decode Gantry pods: %w", err)
 	}
 
-	return revision, nil
+	revisionCounts := make(map[string]int)
+
+	for _, pod := range pods.Items {
+		ready := false
+
+		for _, condition := range pod.Status.Conditions {
+			if condition.Type == "Ready" && condition.Status == "True" {
+				ready = true
+
+				break
+			}
+		}
+
+		if !ready {
+			continue
+		}
+
+		revision := strings.TrimSpace(pod.Metadata.Labels["controller-revision-hash"])
+		if revision == "" {
+			return "", fmt.Errorf("ready Gantry pod %s has no controller-revision-hash label", pod.Metadata.Name)
+		}
+
+		revisionCounts[revision]++
+	}
+
+	if len(revisionCounts) != 1 {
+		return "", fmt.Errorf("ready Gantry pods span %d controller revisions, want exactly 1", len(revisionCounts))
+	}
+
+	for revision, count := range revisionCounts {
+		if count != b.config.NodeCount {
+			return "", fmt.Errorf("ready Gantry pods for revision %s = %d, want %d", revision, count, b.config.NodeCount)
+		}
+
+		return revision, nil
+	}
+
+	return "", fmt.Errorf("no ready Gantry pods found")
 }
 
 func (b *benchmark) waitForGantryRevisionScrape(ctx context.Context, revision string) error {
@@ -154,7 +204,7 @@ func (b *benchmark) fetchGantryRevisionMetrics(ctx context.Context, revision str
 		revision,
 	)
 
-	originPulls, err := b.queryPrometheus(ctx, originQuery)
+	originPulls, err := b.queryPrometheusOrZero(ctx, originQuery)
 	if err != nil {
 		return gantryMetrics{}, fmt.Errorf("query Gantry origin pulls: %w", err)
 	}
@@ -165,7 +215,7 @@ func (b *benchmark) fetchGantryRevisionMetrics(ctx context.Context, revision str
 		revision,
 	)
 
-	peerHits, err := b.queryPrometheus(ctx, peerQuery)
+	peerHits, err := b.queryPrometheusOrZero(ctx, peerQuery)
 	if err != nil {
 		return gantryMetrics{}, fmt.Errorf("query Gantry peer hits: %w", err)
 	}
