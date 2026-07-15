@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strconv"
@@ -98,8 +99,15 @@ type Server struct {
 	peerLookupBudget time.Duration
 	peerFetchBudget  time.Duration
 	maxPeerAttempts  int
-	selfNodeID       ifaces.NodeID
-	selfPeerID       ifaces.NodeID
+	// peerRediscoverBudget, when > 0, enables the re-discovery loop: the
+	// mirror keeps re-running FindProviders and retrying peer fetches for up
+	// to this total wall-clock budget so it picks up finisher-seeds that
+	// advertise mid-swarm before falling to origin. Zero keeps the historical
+	// single-shot provider attempt.
+	peerRediscoverBudget  time.Duration
+	peerRediscoverBackoff time.Duration
+	selfNodeID            ifaces.NodeID
+	selfPeerID            ifaces.NodeID
 
 	staleProviderTTL         time.Duration
 	unavailablePeerTTL       time.Duration
@@ -490,6 +498,20 @@ func WithPeerBudgets(lookup, fetch time.Duration, maxAttempts int) Option {
 		s.peerLookupBudget = lookup
 		s.peerFetchBudget = fetch
 		s.maxPeerAttempts = maxAttempts
+	}
+}
+
+// WithPeerRediscover enables the peer re-discovery loop. budget is the total
+// wall-clock time the mirror keeps re-running DHT FindProviders and retrying
+// peer fetches on a cache miss before falling to origin; it lets a node pick
+// up finisher-seeds that advertise mid-swarm instead of exhausting a fixed
+// provider set. backoff is the pause between rounds (<= 0 uses a built-in 1s
+// default). budget <= 0 disables re-discovery, restoring the single-shot
+// provider attempt.
+func WithPeerRediscover(budget, backoff time.Duration) Option {
+	return func(s *Server) {
+		s.peerRediscoverBudget = budget
+		s.peerRediscoverBackoff = backoff
 	}
 }
 
@@ -1252,6 +1274,11 @@ const (
 	peerFetchOutcomeProtocolError
 	peerFetchOutcomeStall
 	peerFetchOutcomeLocalError
+	// peerFetchOutcomeBusy is a peer that answered 429: it is alive and
+	// healthy but at its serve cap. It is deliberately NOT a hard failure and
+	// the provider is NOT quarantined; the re-discovery loop retries it (or a
+	// finisher) on the next round.
+	peerFetchOutcomeBusy
 )
 
 type peerAttemptResult struct {
@@ -1275,6 +1302,7 @@ type peerAttemptSummary struct {
 	protocolError       int
 	stall               int
 	localError          int
+	busy                int
 	staleFiltered       int
 	unavailableFiltered int
 	suspiciousFiltered  int
@@ -1292,16 +1320,96 @@ func (s peerAttemptSummary) allStaleOrFiltered() bool {
 		s.peerServerError == 0 &&
 		s.protocolError == 0 &&
 		s.stall == 0 &&
-		s.localError == 0
+		s.localError == 0 &&
+		s.busy == 0
 }
 
-// tryPeerFallback attempts to satisfy a cache miss via a DHT-discovered
-// peer. Returns one of peerFallbackResult above. In default mode, no
-// bytes are written to w until a peer's body is digest-verified and
-// committed to the local cache. In live-stream-through mode, a
-// successful peer fetch streams directly to the caller and later
-// inventory observation is used to confirm the local containerd commit.
+// tryPeerFallback attempts to satisfy a cache miss via DHT-discovered peers.
+// When re-discovery is enabled (peerRediscoverBudget > 0) it repeatedly
+// re-runs a discovery round so it can pick up finisher-seeds that advertise
+// mid-swarm, turning a "fall to origin" cohort into a real peer cascade.
+//
+// Round 0 runs the full path including cold-start (please_pull), which
+// designates the HRW puller; its terminal result is the authoritative
+// origin-fallback decision returned if the swarm never delivers. Later rounds
+// suppress cold-start (so please_pull is not re-issued every iteration) and
+// exist only to catch a newly-advertised finisher. The result semantics
+// (peerFallbackUnused -> direct origin, peerFallbackExhausted -> 503,
+// peerFallbackColdExhausted -> NF5 gating) are preserved exactly.
 func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, logger *slog.Logger) peerFallbackResult {
+	budget := s.peerRediscoverBudget
+	if budget <= 0 {
+		// Re-discovery disabled: a single round with cold-start allowed,
+		// identical to the historical behavior.
+		return s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, true, logger)
+	}
+
+	backoff := s.peerRediscoverBackoff
+	if backoff <= 0 {
+		backoff = time.Second
+	}
+
+	deadline := time.Now().Add(budget)
+
+	firstResult := s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, true, logger)
+	switch firstResult {
+	case peerFallbackServed, peerFallbackLocalHit:
+		return firstResult
+	}
+
+	// Keep re-discovering. A seed that just finished advertises into the DHT,
+	// so a later FindProviders can hand us a provider even though round 0 fell
+	// through. We only look for a served/local-hit outcome here; if the swarm
+	// never delivers within the budget we return round 0's authoritative
+	// origin-fallback decision unchanged.
+	for time.Now().Before(deadline) {
+		// A concurrent request or the local puller may have populated the
+		// cache since the last round.
+		if s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger) {
+			return peerFallbackLocalHit
+		}
+
+		select {
+		case <-ctx.Done():
+			return firstResult
+		case <-time.After(jitteredBackoff(backoff)):
+		}
+
+		switch s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, false, logger) {
+		case peerFallbackServed:
+			return peerFallbackServed
+		case peerFallbackLocalHit:
+			return peerFallbackLocalHit
+		}
+	}
+
+	return firstResult
+}
+
+// jitteredBackoff returns base +/- 25% so a cohort of nodes that missed
+// together does not re-discover in lockstep.
+func jitteredBackoff(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+
+	delta := base / 4
+	if delta <= 0 {
+		return base
+	}
+
+	return base - delta + time.Duration(rand.Int64N(int64(2*delta)+1))
+}
+
+// tryPeerFallbackRound runs one discovery-and-fetch pass. Returns one of
+// peerFallbackResult above. In default mode, no bytes are written to w until a
+// peer's body is digest-verified and committed to the local cache. In
+// live-stream-through mode, a successful peer fetch streams directly to the
+// caller and later inventory observation is used to confirm the local
+// containerd commit. When allowColdStart is false, the cold-start
+// (please_pull) legs are skipped so the re-discovery loop does not re-issue
+// please_pull on every round.
+func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, allowColdStart bool, logger *slog.Logger) peerFallbackResult {
 	// Cold-start may designate this process as the puller, populating the
 	// local store after serveDigest's initial cache miss.
 	recheckLocalAfterColdStart := func() bool {
@@ -1347,6 +1455,16 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	}
 
 	if err != nil || len(providers) == 0 {
+		if !allowColdStart {
+			// Re-discovery round: cold-start is suppressed. No providers
+			// this round; a finisher may advertise before the next round.
+			if recheckLocalAfterColdStart() {
+				return peerFallbackLocalHit
+			}
+
+			return peerFallbackUnused
+		}
+
 		csProviders, res := s.resolveViaColdStart(ctx, d, kind, upstream, repo, err != nil, false, peerAttemptSummary{}, logger)
 
 		if recheckLocalAfterColdStart() {
@@ -1390,6 +1508,15 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 			slog.Int("self_filtered", summary.selfFiltered),
 		)
 
+		if !allowColdStart {
+			// Re-discovery round: cold-start is suppressed.
+			if recheckLocalAfterColdStart() {
+				return peerFallbackLocalHit
+			}
+
+			return peerFallbackUnused
+		}
+
 		csProviders, res := s.resolveViaColdStart(ctx, d, kind, upstream, repo, false, true, summary, logger)
 
 		if recheckLocalAfterColdStart() {
@@ -1424,7 +1551,7 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		}
 	}
 
-	if tried > 0 {
+	if tried > 0 && allowColdStart {
 		allStale := summary.allStaleOrFiltered()
 		logger.Debug("mirror: peer providers exhausted, consulting cold-start",
 			slog.Int("attempted", summary.attempted),
@@ -1485,10 +1612,18 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 	rc, psize, err := s.peer.FetchFromPeer(pCtx, p.Addr, pRef)
 	if err != nil {
 		outcome, label := classifyPeerFetchError(err)
-		if outcome == peerFetchOutcomeStaleProvider {
+
+		switch outcome {
+		case peerFetchOutcomeBusy:
+			// The peer answered 429: it is alive (dial succeeded) but at
+			// its serve cap. Do not quarantine it - it will serve once its
+			// load drops, and the re-discovery loop retries it or a
+			// finisher on the next round.
+			s.bumpPeerDial(true)
+		case peerFetchOutcomeStaleProvider:
 			s.bumpPeerDial(true)
 			s.markProviderStale(d, p)
-		} else {
+		default:
 			s.bumpPeerDial(false)
 
 			if outcome == peerFetchOutcomeUnavailable {
@@ -1728,6 +1863,8 @@ func updatePeerSummary(summary peerAttemptSummary, outcome peerFetchOutcomeKind)
 		summary.stall++
 	case peerFetchOutcomeLocalError:
 		summary.localError++
+	case peerFetchOutcomeBusy:
+		summary.busy++
 	}
 
 	return summary
@@ -1742,6 +1879,8 @@ func classifyPeerFetchError(err error) (peerFetchOutcomeKind, string) {
 	var statusErr *ifaces.ErrPeerHTTPStatus
 	if errors.As(err, &statusErr) {
 		switch {
+		case statusErr.StatusCode == http.StatusTooManyRequests:
+			return peerFetchOutcomeBusy, "busy"
 		case statusErr.StatusCode == http.StatusUnauthorized || statusErr.StatusCode == http.StatusForbidden:
 			return peerFetchOutcomeAuthOrConfigError, "auth_or_config"
 		case statusErr.StatusCode >= 500 && statusErr.StatusCode <= 599:

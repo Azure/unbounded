@@ -282,6 +282,27 @@ type Config struct {
 	// layer at the slowest acceptable per-peer throughput.
 	PeerFetchTimeout time.Duration `yaml:"peer_fetch_timeout"`
 
+	// PeerRediscoverBudget bounds the total wall-clock time the mirror keeps
+	// re-running DHT FindProviders and retrying peer fetches on a cache miss
+	// before it gives up and falls to origin. Re-discovery lets a node pick up
+	// finisher-seeds that advertise mid-swarm (the cascade) instead of
+	// exhausting a fixed provider set and going to origin. Zero disables
+	// re-discovery, restoring the historical single-shot provider attempt.
+	PeerRediscoverBudget time.Duration `yaml:"peer_rediscover_budget"`
+
+	// PeerRediscoverBackoff is the pause between re-discovery rounds. It gives
+	// newly-finished seeds time to advertise into the DHT before the next
+	// FindProviders. Zero uses a built-in default (1s) when re-discovery is
+	// enabled. Ignored when PeerRediscoverBudget is zero.
+	PeerRediscoverBackoff time.Duration `yaml:"peer_rediscover_backoff"`
+
+	// TransferMaxConcurrentServes caps concurrent peer blob-body serves on the
+	// transfer endpoint. Requests over the cap receive 429 with a Retry-After
+	// hint so the requester re-discovers another provider instead of queueing
+	// behind a saturated seed. This load-shedding is what lets the first
+	// finishers complete early and seed the swarm. Zero means unlimited.
+	TransferMaxConcurrentServes int `yaml:"transfer_max_concurrent_serves"`
+
 	// AdvertiseReconcileInterval is the cadence of the background
 	// advertiser's full inventory reconcile. Eager per-digest advertise on
 	// stream completion is the fast path that makes finishers discoverable
@@ -417,11 +438,14 @@ func NewDefault() *Config {
 		HRWTopologyScope: "cluster",
 		ZoneLabelKey:     "topology.kubernetes.io/zone",
 
-		CoordPeerAuthzEnforce:      false,
-		CoordMaxDigestsPerRequest:  256,
-		CoordMaxConcurrentPulls:    16,
-		PeerFetchTimeout:           time.Hour,
-		AdvertiseReconcileInterval: time.Minute,
+		CoordPeerAuthzEnforce:       false,
+		CoordMaxDigestsPerRequest:   256,
+		CoordMaxConcurrentPulls:     16,
+		PeerFetchTimeout:            time.Hour,
+		PeerRediscoverBudget:        0, // disabled by default (single-shot provider attempt)
+		PeerRediscoverBackoff:       0, // built-in 1s default when re-discovery is enabled
+		TransferMaxConcurrentServes: 0, // unlimited by default
+		AdvertiseReconcileInterval:  time.Minute,
 
 		NF5JitterBase:               3 * time.Second,
 		NF5JitterCap:                0, // no cap by default (original behaviour)
@@ -535,6 +559,9 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("COORD_MAX_DIGESTS_PER_REQUEST", &c.CoordMaxDigestsPerRequest)
 	setInt("COORD_MAX_CONCURRENT_PULLS", &c.CoordMaxConcurrentPulls)
 	setDur("PEER_FETCH_TIMEOUT", &c.PeerFetchTimeout)
+	setDur("PEER_REDISCOVER_BUDGET", &c.PeerRediscoverBudget)
+	setDur("PEER_REDISCOVER_BACKOFF", &c.PeerRediscoverBackoff)
+	setInt("TRANSFER_MAX_CONCURRENT_SERVES", &c.TransferMaxConcurrentServes)
 	setDur("ADVERTISE_RECONCILE_INTERVAL", &c.AdvertiseReconcileInterval)
 
 	setDur("NF5_JITTER_BASE", &c.NF5JitterBase)
@@ -593,6 +620,9 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.CoordMaxDigestsPerRequest, "coord-max-digests-per-request", c.CoordMaxDigestsPerRequest, "maximum digests accepted in one please_pull batch")
 	fs.IntVar(&c.CoordMaxConcurrentPulls, "coord-max-concurrent-pulls", c.CoordMaxConcurrentPulls, "maximum background origin pulls started by inbound please_pull")
 	fs.DurationVar(&c.PeerFetchTimeout, "peer-fetch-timeout", c.PeerFetchTimeout, "maximum time for a complete peer fetch, including body transfer and commit")
+	fs.DurationVar(&c.PeerRediscoverBudget, "peer-rediscover-budget", c.PeerRediscoverBudget, "total wall-clock budget for the peer re-discovery loop (0 disables re-discovery, restoring the single-shot provider attempt)")
+	fs.DurationVar(&c.PeerRediscoverBackoff, "peer-rediscover-backoff", c.PeerRediscoverBackoff, "pause between peer re-discovery rounds (0 uses the built-in 1s default when re-discovery is enabled)")
+	fs.IntVar(&c.TransferMaxConcurrentServes, "transfer-max-concurrent-serves", c.TransferMaxConcurrentServes, "cap on concurrent peer blob-body serves (over the cap returns 429; 0 = unlimited)")
 	fs.DurationVar(&c.AdvertiseReconcileInterval, "advertise-reconcile-interval", c.AdvertiseReconcileInterval, "cadence of the background DHT advertiser inventory reconcile (backstop; eager advertise handles the fast path)")
 
 	fs.DurationVar(&c.NF5JitterBase, "nf5-jitter-base", c.NF5JitterBase, "base delay for the NF5 jitter window")
@@ -777,6 +807,18 @@ func (c *Config) Validate() error {
 
 	if c.PeerFetchTimeout <= 0 {
 		errs = append(errs, fmt.Errorf("peer_fetch_timeout: must be > 0, got %v", c.PeerFetchTimeout))
+	}
+
+	if c.PeerRediscoverBudget < 0 {
+		errs = append(errs, fmt.Errorf("peer_rediscover_budget: must be >= 0, got %v", c.PeerRediscoverBudget))
+	}
+
+	if c.PeerRediscoverBackoff < 0 {
+		errs = append(errs, fmt.Errorf("peer_rediscover_backoff: must be >= 0, got %v", c.PeerRediscoverBackoff))
+	}
+
+	if c.TransferMaxConcurrentServes < 0 {
+		errs = append(errs, fmt.Errorf("transfer_max_concurrent_serves: must be >= 0, got %d", c.TransferMaxConcurrentServes))
 	}
 
 	if c.AdvertiseReconcileInterval <= 0 {

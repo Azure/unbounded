@@ -199,6 +199,7 @@ func runAgent(args []string) error {
 			func() { p2.peerServe.Inc() },
 			func() { p2.peerMiss.Inc() },
 		),
+		transfer.WithMaxConcurrentServes(c.TransferMaxConcurrentServes),
 	}
 	transferSrv := transfer.New(cstore, transferOpts...)
 
@@ -589,6 +590,7 @@ func runAgent(args []string) error {
 		}),
 		mirror.WithDiscovery(disco, peerClient),
 		mirror.WithPeerBudgets(0, c.PeerFetchTimeout, 0),
+		mirror.WithPeerRediscover(c.PeerRediscoverBudget, c.PeerRediscoverBackoff),
 		mirror.WithSelfNodeID(memberView.Self()),
 		mirror.WithSelfPeerID(ifaces.NodeID(disco.PeerID().String())),
 		mirror.WithPeerMetrics(
