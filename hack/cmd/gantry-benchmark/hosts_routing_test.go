@@ -31,8 +31,12 @@ func TestRenderHosts(t *testing.T) {
 		t.Fatalf("render Gantry: %v", err)
 	}
 
-	if !strings.Contains(gantry, `server = "http://10.0.0.42:5002"`) ||
+	// STRICT mode: Gantry is the ONLY upstream, so there must be no `server=`
+	// fall-through that would let containerd bypass Gantry to the proxy and
+	// miscount those pulls as origin load.
+	if strings.Contains(gantry, "server =") ||
 		!strings.Contains(gantry, `[host."http://127.0.0.1:5000"]`) ||
+		strings.Contains(gantry, "10.0.0.42") ||
 		strings.Contains(gantry, "skip_verify") {
 		t.Fatalf("unexpected Gantry hosts.toml:\n%s", gantry)
 	}

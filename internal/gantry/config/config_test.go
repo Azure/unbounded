@@ -13,8 +13,8 @@ import (
 
 func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	c := NewDefault()
-	if c.PeerFetchTimeout != time.Hour {
-		t.Fatalf("PeerFetchTimeout = %v, want 1h", c.PeerFetchTimeout)
+	if c.PeerFetchTimeout != 60*time.Second {
+		t.Fatalf("PeerFetchTimeout = %v, want 60s", c.PeerFetchTimeout)
 	}
 
 	if c.AdvertiseReconcileInterval != time.Minute {

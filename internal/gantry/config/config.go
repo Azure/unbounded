@@ -278,8 +278,14 @@ type Config struct {
 	CoordMaxConcurrentPulls int `yaml:"coord_max_concurrent_pulls"`
 
 	// PeerFetchTimeout caps the complete peer request, including streaming and
-	// committing the response body. It must accommodate the largest expected
-	// layer at the slowest acceptable per-peer throughput.
+	// committing the response body. It is deliberately SHORT (60s): a requester
+	// stuck on a lockstep-saturated seed must bail and re-select a fresher
+	// finisher-seed rather than ride the slow stream to completion. That
+	// bail-and-re-select is what drives the cold-start cascade (paired with the
+	// strict containerd hosts.toml, where an exhausted fetch 503s and containerd
+	// retries Gantry, re-discovering recent finishers). Setting this too high
+	// (e.g. 1h) removes the re-selection and collapses distribution to the
+	// single-seed bandwidth bound (the ~12min lockstep regression).
 	PeerFetchTimeout time.Duration `yaml:"peer_fetch_timeout"`
 
 	// PeerRediscoverBudget bounds the total wall-clock time the mirror keeps
@@ -441,7 +447,7 @@ func NewDefault() *Config {
 		CoordPeerAuthzEnforce:       false,
 		CoordMaxDigestsPerRequest:   256,
 		CoordMaxConcurrentPulls:     16,
-		PeerFetchTimeout:            time.Hour,
+		PeerFetchTimeout:            60 * time.Second,
 		PeerRediscoverBudget:        0, // disabled by default (single-shot provider attempt)
 		PeerRediscoverBackoff:       0, // built-in 1s default when re-discovery is enabled
 		TransferMaxConcurrentServes: 0, // unlimited by default
