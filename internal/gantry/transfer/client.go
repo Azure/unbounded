@@ -56,7 +56,7 @@ func WithReadIdleTimeout(d time.Duration) ClientOption {
 func NewClient(opts ...ClientOption) *Client {
 	o := clientOptions{
 		dialTimeout:     2 * time.Second,
-		requestTimeout:  60 * time.Second,
+		requestTimeout:  time.Hour,
 		readIdleTimeout: 10 * time.Second,
 	}
 	for _, fn := range opts {
