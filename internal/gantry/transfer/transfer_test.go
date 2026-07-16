@@ -148,6 +148,67 @@ func TestTagAlways404(t *testing.T) {
 	}
 }
 
+func TestServeCapShedsBlobGetWith429(t *testing.T) {
+	cache := fakes.NewCache()
+	body := []byte("a blob served under a concurrency cap")
+	d := mustDigest(body)
+	cache.Put(d, body)
+
+	s := New(cache, WithMaxConcurrentServes(1))
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	get := func(method string) *http.Response {
+		t.Helper()
+
+		req, _ := http.NewRequest(method, ts.URL+"/v2/r/blobs/"+d.String(), nil)
+		req.Header.Set(MirroredHeader, "1")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return resp
+	}
+
+	// Occupy the single serve slot so the server is at capacity.
+	release, ok := s.tryAcquireServe()
+	if !ok {
+		t.Fatal("expected to acquire the only serve slot")
+	}
+
+	// A blob GET while at capacity is shed with 429 + Retry-After.
+	resp := get(http.MethodGet)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("blob GET at capacity: status = %d, want 429", resp.StatusCode)
+	}
+
+	if got := resp.Header.Get("Retry-After"); got == "" {
+		t.Error("429 response missing Retry-After header")
+	}
+
+	_ = resp.Body.Close() //nolint:errcheck // best-effort body close
+
+	// A HEAD is never capped.
+	hresp := get(http.MethodHead)
+	if hresp.StatusCode != http.StatusOK {
+		t.Errorf("blob HEAD at capacity: status = %d, want 200 (HEAD is never capped)", hresp.StatusCode)
+	}
+
+	_ = hresp.Body.Close() //nolint:errcheck // best-effort body close
+
+	// After releasing the slot, the blob GET succeeds.
+	release()
+
+	resp2 := get(http.MethodGet)
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("blob GET after release: status = %d, want 200", resp2.StatusCode)
+	}
+
+	_ = resp2.Body.Close() //nolint:errcheck // best-effort body close
+}
+
 func TestRangeRequest(t *testing.T) {
 	ts, cache, _ := newTestServer(t)
 	body := []byte("0123456789ABCDEF")
