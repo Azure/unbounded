@@ -17,10 +17,13 @@ func TestIsWireGuardInterface(t *testing.T) {
 		iface  string
 		expect bool
 	}{
-		{name: "wg51820", iface: "wg51820", expect: true},
-		{name: "wg51821", iface: "wg51821", expect: true},
-		{name: "wg0", iface: "wg0", expect: true},
-		{name: "wg99999", iface: "wg99999", expect: true},
+		{name: "lower boundary", iface: "wg51820", expect: true},
+		{name: "upper boundary", iface: "wg51899", expect: true},
+		{name: "in range", iface: "wg51821", expect: true},
+		{name: "below range", iface: "wg51819", expect: false},
+		{name: "above range", iface: "wg51900", expect: false},
+		{name: "too small", iface: "wg0", expect: false},
+		{name: "too large", iface: "wg99999", expect: false},
 		{name: "not wg: eth0", iface: "eth0", expect: false},
 		{name: "not wg: lo", iface: "lo", expect: false},
 		{name: "not wg: geneve0", iface: "geneve0", expect: false},
