@@ -74,6 +74,43 @@ func TestNSpawnRenderedScenarios(t *testing.T) {
 
 			return data
 		}(),
+		"nvidia-gb300-rack-full": func() nspawnTemplateData {
+			data := nspawnRenderScenarioData()
+			data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{
+				"/dev/dri/card0",
+				"/dev/dri/card1",
+				"/dev/dri/card2",
+				"/dev/dri/card3",
+				"/dev/dri/card4",
+				"/dev/dri/renderD128",
+				"/dev/dri/renderD129",
+				"/dev/dri/renderD130",
+				"/dev/dri/renderD131",
+				"/dev/nvidia-modeset",
+				"/dev/nvidia-uvm",
+				"/dev/nvidia-uvm-tools",
+				"/dev/nvidia0",
+				"/dev/nvidia1",
+				"/dev/nvidia2",
+				"/dev/nvidia3",
+				"/dev/nvidiactl",
+				"/dev/nvidia-caps",
+				"/dev/nvidia-caps-imex-channels",
+			})
+			data.NvidiaLibDirMounts = []goalstates.NvidiaLibDirMount{
+				{
+					HostDir:      "/usr/lib/aarch64-linux-gnu",
+					ContainerDir: "/run/host-nvidia/0",
+				},
+				{
+					HostDir:      "/usr/lib/aarch64-linux-gnu/vdpau",
+					ContainerDir: "/run/host-nvidia/1",
+				},
+			}
+			data.NvidiaBinDir = "/usr/bin"
+
+			return data
+		}(),
 		"nvidia-smi-only": func() nspawnTemplateData {
 			data := nspawnRenderScenarioData()
 			data.NvidiaBinDir = nvidiaHostBinDir(goalstates.NvidiaHost{

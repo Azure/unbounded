@@ -191,6 +191,10 @@ func nvidiaNSpawnDeviceTargets(paths []string) []NSpawnDeviceTarget {
 			},
 		}
 
+		// The caps paths are directories that must be bind-mounted so dynamic
+		// NVIDIA capability and channel device nodes are visible inside nspawn.
+		// DeviceAllow operates on character device nodes and classes, so use
+		// the kernel device-class names to grant current and future nodes access.
 		switch path {
 		case "/dev/nvidia-caps":
 			target.Allow.Specifier = "char-nvidia-caps"
