@@ -165,25 +165,45 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 
 		seen[key] = struct{}{}
 
-		top := hrw.TopK(candidates, c.Digest, 1)
+		// Designate the top-N HRW pullers for this digest. N=1 is the
+		// historical single-puller behavior (one initial seed); N>1 asks
+		// several pullers to origin-pull the same layer in parallel so the
+		// swarm fans out from N seeds instead of one.
+		replicas := r.opts.PrefetchPullerReplicas
+		if replicas < 1 {
+			replicas = 1
+		}
+
+		top := hrw.TopK(candidates, c.Digest, replicas)
 		if len(top) == 0 {
 			skippedNoTop++
 			continue
 		}
 
-		puller := top[0].Node.ID
-		if puller == self {
-			if r.opts.LocalPull != nil {
-				selfByKind[c.Kind] = append(selfByKind[c.Kind], c.Digest)
-			} else {
-				skippedSelf++
+		routed := false
+
+		for _, scored := range top {
+			puller := scored.Node.ID
+			if puller == self {
+				// Self is a valid puller only when LocalPull is wired;
+				// otherwise the please_pull-to-self path is a no-op.
+				if r.opts.LocalPull != nil {
+					selfByKind[c.Kind] = append(selfByKind[c.Kind], c.Digest)
+					routed = true
+				}
+
+				continue
 			}
 
-			continue
+			gk := groupKey{node: puller, kind: c.Kind}
+			byGroup[gk] = append(byGroup[gk], c.Digest)
+			routed = true
 		}
 
-		gk := groupKey{node: puller, kind: c.Kind}
-		byGroup[gk] = append(byGroup[gk], c.Digest)
+		if !routed {
+			// Every designated puller was self with no LocalPull wired.
+			skippedSelf++
+		}
 	}
 
 	if len(byGroup) == 0 && len(selfByKind) == 0 {

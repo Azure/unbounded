@@ -30,8 +30,8 @@
 #     from the node CIDR (the overlay's default 127.0.0.1/32
 #     placeholder will drop mirror traffic on most CNIs because
 #     after DNAT the pod observes source = node IP, not 127.0.0.1).
-#   - Resource requests are placeholders (NF6 validation pending).
-#     Size them after observing real workload pressure:
+#   - Resource requests and limits are sized for high-fan-out benchmark nodes.
+#     Revisit them after observing real workload pressure:
 #       * CPU/memory: `kubectl top pod -l app.kubernetes.io/name=gantry`.
 #       * Network throughput: peer-fetch + origin-pull bandwidth via
 #         `p2p_peer_fetch_total`, `p2p_origin_pull_success_total`,
@@ -221,11 +221,11 @@ spec:
             failureThreshold: 3
           resources:
             requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
               cpu: "2"
-              memory: 1Gi
+              memory: 2Gi
+            limits:
+              cpu: "8"
+              memory: 8Gi
           securityContext:
             runAsNonRoot: true
             runAsUser: 65532

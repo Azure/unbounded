@@ -126,6 +126,16 @@ type Options struct {
 	HrwScope  hrw.Scope // default ScopeCluster
 	SelfZone  string    // required when HrwScope == ScopeZone
 
+	// PrefetchPullerReplicas is how many distinct HRW-ranked pullers each
+	// prefetched layer digest is dispatched to. 1 designates a single origin
+	// puller per layer (tightest dedup, but the whole swarm then fans out
+	// from ONE initial seed, which bottlenecks a cold thundering-herd and
+	// makes peer transfers pile up and stall). N>1 dispatches please_pull to
+	// the top-N pullers in parallel, giving N initial seeds so peer transfers
+	// fan out N-fold, at the cost of up to N origin copies of each layer.
+	// Default 1.
+	PrefetchPullerReplicas int
+
 	// LocalIntent computes self's PullIntent synchronously, without
 	// the libp2p coord round-trip. When non-nil, the cold-start
 	// orchestrator includes self as a first-class participant in the
@@ -240,6 +250,10 @@ func New(opts Options) *Resolver {
 
 	if opts.TopKExpansionFactor < 2 {
 		opts.TopKExpansionFactor = 2
+	}
+
+	if opts.PrefetchPullerReplicas < 1 {
+		opts.PrefetchPullerReplicas = 1
 	}
 
 	if len(opts.TrustedFailureClasses) == 0 {
