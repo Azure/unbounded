@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -40,6 +41,17 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 
 	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
 		return nil, err
+	}
+
+	if err := config.ValidateAdditionalHostMounts(cfg.AdditionalHostMounts); err != nil {
+		return nil, err
+	}
+
+	additionalHostMounts := slices.Clone(cfg.AdditionalHostMounts)
+	for i := range additionalHostMounts {
+		if additionalHostMounts[i].Target == "" {
+			additionalHostMounts[i].Target = additionalHostMounts[i].Source
+		}
 	}
 
 	kernel, err := hostKernel()
@@ -92,18 +104,19 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 			fmt.Sprintf("systemd-nspawn@%s.service.d", machineName),
 			"override.conf",
 		),
-		HostArch:          runtime.GOARCH,
-		HostKernel:        kernel,
-		Hostname:          hostname,
-		ContainerdVersion: containerdVersion,
-		RunCVersion:       runcVersion,
-		CNIPluginVersion:  cniVersion,
-		KubernetesVersion: cfg.Cluster.Version,
-		Downloads:         downloads,
-		OCIImage:          ociImage,
-		Nvidia:            nvidia,
-		AMD:               amd,
-		HostDevices:       DiscoverHostDevices(cfg.AdditionalHostDevices),
+		HostArch:             runtime.GOARCH,
+		HostKernel:           kernel,
+		Hostname:             hostname,
+		ContainerdVersion:    containerdVersion,
+		RunCVersion:          runcVersion,
+		CNIPluginVersion:     cniVersion,
+		KubernetesVersion:    cfg.Cluster.Version,
+		Downloads:            downloads,
+		OCIImage:             ociImage,
+		Nvidia:               nvidia,
+		AMD:                  amd,
+		HostDevices:          DiscoverHostDevices(cfg.AdditionalHostDevices),
+		AdditionalHostMounts: additionalHostMounts,
 	}
 
 	nodeStart := &NodeStart{

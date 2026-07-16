@@ -409,3 +409,48 @@ func TestResolveMachine_InvalidAdditionalHostDevice(t *testing.T) {
 	_, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
 	require.ErrorContains(t, err, "AdditionalHostDevices")
 }
+
+func TestResolveMachine_AdditionalHostMounts(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName: "machine-1",
+		NodeName:    "configured-node",
+		AdditionalHostMounts: []config.AdditionalHostMount{
+			{Source: "/opt/config", ReadOnly: true},
+			{Source: "/var/lib/data", Target: "/data"},
+		},
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+
+	require.Equal(t, []config.AdditionalHostMount{
+		{Source: "/opt/config", Target: "/opt/config", ReadOnly: true},
+		{Source: "/var/lib/data", Target: "/data"},
+	}, got.RootFS.AdditionalHostMounts)
+	require.Empty(t, cfg.AdditionalHostMounts[0].Target)
+}
+
+func TestResolveMachine_InvalidAdditionalHostMount(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName: "machine-1",
+		NodeName:    "configured-node",
+		AdditionalHostMounts: []config.AdditionalHostMount{{
+			Source: "../config",
+		}},
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	_, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.ErrorContains(t, err, "AdditionalHostMounts")
+}
