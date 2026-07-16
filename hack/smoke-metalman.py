@@ -1283,7 +1283,7 @@ def main() -> None:
     assert_cloud_init_done(timeout=900)
 
     wait_process_success(operation_proc, timeout=900)
-    assert_log_contains(operation_log, "Condition CloudInitDone: True/Succeeded")
+    assert_log_contains(operation_log, "Cloud-init complete")
 
     log("Waiting for kubelet to join the cluster...")
     wait_k8s_node(NODE_NAME, timeout=900)
