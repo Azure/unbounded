@@ -46,14 +46,45 @@ full sequence is:
    entries into the nspawn and systemd service override configs.
 4. **NVIDIA setup.** After the nspawn boots, creates symlinks in the
    container's multiarch library directory pointing into `/run/host-nvidia/`,
-   runs `ldconfig`, then runs `nvidia-ctk cdi generate` to produce the CDI
-   spec at `/etc/cdi/nvidia.yaml`. Most CDI hooks are disabled to avoid
-   interference with the nspawn environment.
+   then prepares `/run/nvidia/driver` for NVIDIA container tooling and device
+   plugins. The driver root contains copied 64-bit NVIDIA and VDPAU libraries,
+   `nvidia-smi` when present on the host, optional matching i386 libraries,
+   and multiarch compatibility symlinks. The agent then runs `ldconfig` and
+   `nvidia-ctk cdi generate` to produce the CDI spec at
+   `/etc/cdi/nvidia.yaml`. Most CDI hooks are disabled to avoid interference
+   with the nspawn environment.
 5. **containerd runtime configuration.** Writes a containerd drop-in that
    enables CDI support and registers the `nvidia` runtime class.
 6. **kubelet GPU advertisement.** Once kubelet starts and a user-deployed
    NVIDIA device plugin is running, GPUs are registered as `nvidia.com/gpu`
    extended resources on the node.
+
+## Prepared Driver Root
+
+CDI generation is explicitly directed at the host-derived driver root:
+
+```text
+nvidia-ctk cdi generate \
+  --driver-root=/run/nvidia/driver \
+  --dev-root=/ \
+  --output=/etc/cdi/nvidia.yaml
+```
+
+`--driver-root` makes `nvidia-ctk` discover userspace libraries, linker data,
+and helper binaries from `/run/nvidia/driver` instead of the nspawn OCI
+filesystem. This prevents the generated CDI specification from depending on
+libraries in the image that may be absent or may not match the host kernel
+driver. `--dev-root=/` is separate: NVIDIA device nodes are bind-mounted at
+their normal paths in the nspawn machine, so device discovery remains rooted
+at `/`.
+
+The prepared root includes `etc/ld.so.cache` so `nvidia-ctk` can resolve the
+copied libraries and their SONAME aliases. When the host provides
+`nvidia-smi`, the agent also copies that host-matched binary to
+`/run/nvidia/driver/usr/bin/nvidia-smi`. Because helper discovery is scoped by
+`--driver-root`, this copy allows the CDI specification to expose a
+version-compatible `nvidia-smi` to GPU containers. The binary is useful for
+diagnostics and monitoring but is not required for compute-only CUDA access.
 
 ## Architecture Support
 

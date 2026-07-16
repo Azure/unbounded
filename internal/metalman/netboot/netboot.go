@@ -8,9 +8,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	pathpkg "path"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
@@ -389,7 +391,11 @@ func operationRequestsInstall(op *v1alpha3.MachineOperation, machineName string)
 
 var (
 	templateFuncMap = template.FuncMap{
-		"indent": indentTemplateBlock,
+		"indent":       indentTemplateBlock,
+		"ipAddresses":  ipAddresses,
+		"join":         strings.Join,
+		"subnetPrefix": subnetPrefix,
+		"yamlQuote":    strconv.Quote,
 	}
 	templatePool = sync.Pool{
 		New: func() any {
@@ -397,6 +403,31 @@ var (
 		},
 	}
 )
+
+func ipAddresses(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if net.ParseIP(value) != nil {
+			result = append(result, value)
+		}
+	}
+
+	return result
+}
+
+func subnetPrefix(mask string) (int, error) {
+	ip := net.ParseIP(mask)
+	if ip == nil || ip.To4() == nil {
+		return 0, fmt.Errorf("invalid IPv4 subnet mask %q", mask)
+	}
+
+	ones, bits := net.IPMask(ip.To4()).Size()
+	if bits != net.IPv4len*8 || ones < 0 {
+		return 0, fmt.Errorf("non-contiguous IPv4 subnet mask %q", mask)
+	}
+
+	return ones, nil
+}
 
 func indentTemplateBlock(spaces int, value string) string {
 	if value == "" {

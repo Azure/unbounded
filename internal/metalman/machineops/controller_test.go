@@ -4,9 +4,11 @@
 package machineops
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -23,8 +25,29 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
 )
+
+func TestReconcilerAddsMachineOperationNameToHandlerLogs(t *testing.T) {
+	s := testScheme(t)
+	op := testOperation("op-logged", v1alpha3.OperationHostPowerOff)
+	op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"missing": "true"}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(op).WithStatusSubresource(op).Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	var logs bytes.Buffer
+
+	previousLogger := slog.Default()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	require.Contains(t, logs.String(), "machineOperation=op-logged")
+}
 
 func TestReconcilerCompletesMachineRefPowerOff(t *testing.T) {
 	t.Parallel()
@@ -630,6 +653,56 @@ func TestReconcilerRetriesHTTPHostReplaceWithoutStaticLease(t *testing.T) {
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[0].Phase)
 	require.Equal(t, "HTTP boot requires at least one static lease in spec.pxe.dhcpLeases", updated.Status.Targets[0].Message)
 	require.Empty(t, power.calls)
+}
+
+func TestReconcilerWaitsForHTTPBootImage(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
+	op := testOperation("op-replace-http-wait-image", v1alpha3.OperationHostReplace)
+	op.Spec.MachineRef = machine.Name
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
+	power := &recordingPowerClient{}
+	reconciler := testReconciler(c, power, "rack-a")
+	imageAvailable := false
+	reconciler.HTTPBootURL = func(m *v1alpha3.Machine) (string, error) {
+		require.Equal(t, machine.Name, m.Name)
+
+		if !imageAvailable {
+			return "", fmt.Errorf("resolve HTTP boot image: %w", netboot.ErrNotYetDownloaded)
+		}
+
+		return "http://10.0.0.10:8880/http/shimx64.efi", nil
+	}
+
+	for range reconciler.MaxAttempts + 1 {
+		_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+		require.NoError(t, err)
+	}
+
+	var waiting v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &waiting))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, waiting.Status.Phase)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, waiting.Status.Targets[0].Phase)
+	require.Zero(t, waiting.Status.Targets[0].Attempts)
+	require.Equal(t, "waiting for OCI image to become available", waiting.Status.Targets[0].Message)
+	require.Empty(t, power.calls)
+
+	imageAvailable = true
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	var resumed v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &resumed))
+	require.Equal(t, v1alpha3.OperationStageWaitingRepave, resumed.Status.Targets[0].Stage)
+	require.Equal(t, int32(1), resumed.Status.Targets[0].Attempts)
+	require.NotEmpty(t, power.calls)
 }
 
 func TestReconcilerRestoresMissingHostReplaceTriggerConditions(t *testing.T) {

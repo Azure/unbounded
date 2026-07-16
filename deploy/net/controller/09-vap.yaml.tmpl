@@ -5,7 +5,7 @@
 # Restrict what resources the unbounded-net controller service account may create.
 # RBAC cannot scope the "create" verb by resourceNames, so this VAP ensures the
 # controller can only create resources with the expected names. This prevents the
-# SA from creating arbitrary Secrets, ConfigMaps, or EndpointSlices.
+# SA from creating arbitrary Secrets, ConfigMaps, Endpoints, or EndpointSlices.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -20,7 +20,7 @@ spec:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE"]
-        resources: ["secrets", "configmaps"]
+        resources: ["secrets", "configmaps", "endpoints"]
       - apiGroups: ["discovery.k8s.io"]
         apiVersions: ["v1"]
         operations: ["CREATE"]
@@ -39,6 +39,11 @@ spec:
         request.resource.resource != 'configmaps' ||
         object.metadata.name == 'unbounded-net-serving-ca'
       message: "unbounded-net controller may only create the unbounded-net-serving-ca configmap"
+    # Endpoints: only unbounded-net-controller
+    - expression: >-
+        request.resource.resource != 'endpoints' ||
+        object.metadata.name == 'unbounded-net-controller'
+      message: "unbounded-net controller may only create the unbounded-net-controller endpoints"
     # EndpointSlices: only unbounded-net-controller
     - expression: >-
         request.resource.resource != 'endpointslices' ||

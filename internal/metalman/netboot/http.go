@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -70,7 +71,7 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /", h.handleFile)
 
 	addr := fmt.Sprintf("%s:%d", h.BindAddr, h.Port)
-	srv := &http.Server{Addr: addr, Handler: mux}
+	srv := &http.Server{Addr: addr, Handler: normalizePath(mux)}
 
 	go func() {
 		<-ctx.Done()
@@ -84,6 +85,41 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// normalizePath collapses redundant slashes in the request path before the
+// ServeMux routes it. When shim is HTTP-booted from the web root it requests
+// its second stage as "//grubx64.efi": it appends its absolute-path loader name
+// to its boot URL's directory. Go's ServeMux would answer that with a 307
+// redirect, which shim refuses to follow (it treats the 3xx as EFI_HTTP_ERROR
+// 0x23 and aborts the boot). Normalizing the path here makes the mux serve the
+// file directly with a 200.
+func normalizePath(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if cleaned := cleanRequestPath(r.URL.Path); cleaned != r.URL.Path {
+			r.URL.Path = cleaned
+			r.URL.RawPath = ""
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// cleanRequestPath normalizes a URL path the same way path.Clean does, so the
+// middleware can collapse unclean paths (e.g. "//grubx64.efi") that the
+// ServeMux would otherwise redirect. A trailing slash is preserved to mirror
+// ServeMux behavior.
+func cleanRequestPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+
+	cleaned := path.Clean(p)
+	if cleaned != "/" && strings.HasSuffix(p, "/") {
+		cleaned += "/"
+	}
+
+	return cleaned
 }
 
 func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {

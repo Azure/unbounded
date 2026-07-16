@@ -207,7 +207,7 @@ func replacementTags(oldInstance core.Instance, request machineops.OperationRequ
 	freeformTags := copyStringMap(oldInstance.FreeformTags)
 	// OCI freeform tag keys cannot use slash-delimited Kubernetes-style names.
 	// These tags are also the restart-safe replacement lookup keys.
-	freeformTags[tagMachine] = request.Machine.Name
+	freeformTags[tagMachine] = request.MachineName
 	freeformTags[tagOperation] = request.OperationName
 	freeformTags[tagOperationUID] = string(request.OperationUID)
 	freeformTags[tagOldProviderID] = request.ProviderID

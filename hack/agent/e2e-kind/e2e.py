@@ -22,6 +22,7 @@ Options:
 Subcommands (called as individual workflow steps):
     create-vm                          Create bridge networking and launch a QEMU VM.
     ensure-kind-bridge                 Verify/repair veth pair connecting Kind to VM bridge.
+    configure-kind-node-ip             Advertise the Kind control-plane's VM-bridge IP.
     run-agent                          Build agent, generate bootstrap script, run on VM.
     prepare-blocked-network-vm         Install host packages before blocking VM egress.
     block-external-network             Block VM egress outside the local e2e networks.
@@ -1719,6 +1720,79 @@ def ensure_kind_bridge() -> None:
     _nm_unmanage(VETH_HOST)
 
     log(f"  Repaired: {VETH_HOST} -> {BRIDGE_NAME} -> {VETH_KIND} in Kind container")
+
+
+# ---------------------------------------------------------------------------
+# configure-kind-node-ip
+# ---------------------------------------------------------------------------
+# The Kind control-plane container's address on the VM bridge (assigned to
+# eth-e2e / VETH_KIND by ensure_kind_bridge). Kept in sync with that setup.
+CONTROL_PLANE_BRIDGE_IP = f"{VM_SUBNET}.2"
+
+
+def configure_kind_node_ip() -> None:
+    """Advertise the Kind control-plane Node's VM-bridge IP.
+
+    By default the Kind control-plane Node advertises its Docker-network
+    address (for example 172.18.0.2). Kindnet running on a QEMU worker node -
+    which is only attached to the VM bridge subnet - then tries to install the
+    control-plane pod CIDR route with that Docker address as the
+    next hop. The Docker address is not on any interface the worker owns, so
+    ``ip route add ... via <docker-ip>`` fails with "network is unreachable",
+    kindnet panics ("Maximum retries reconciling node routes"), and the worker
+    never receives a CNI config (kubelet stays NetworkPluginNotReady).
+
+    Reconfiguring the control-plane kubelet to advertise the bridge-reachable
+    address (CONTROL_PLANE_BRIDGE_IP, assigned to eth-e2e by
+    ensure_kind_bridge) makes that next hop on-link for every worker, so route
+    reconciliation succeeds and the worker becomes Ready promptly.
+
+    Must run after the Kind container is attached to the VM bridge (so the IP
+    is a local address kubelet accepts) and before any worker node joins. It is
+    idempotent: re-running replaces any existing --node-ip with the same value.
+
+    The control-plane API TLS cert SANs cover the Docker address, so kindnet's
+    CONTROL_PLANE_ENDPOINT (API connection) is left pointing at the Docker IP;
+    only the Node's advertised InternalIP - used as a routing next hop, not for
+    TLS - is changed here.
+    """
+    node_ip = CONTROL_PLANE_BRIDGE_IP
+    log(f"Configuring {KIND_CONTAINER} kubelet to advertise node IP {node_ip}")
+
+    # Rewrite KUBELET_KUBEADM_ARGS in place: drop any existing --node-ip and
+    # append ours, then restart kubelet so the Node re-registers the new IP.
+    script = textwrap.dedent(f"""\
+        set -eu
+        . /var/lib/kubelet/kubeadm-flags.env
+        set -- $KUBELET_KUBEADM_ARGS
+        new_args=""
+        for arg do
+          case "$arg" in
+            --node-ip=*) ;;
+            *) new_args="$new_args $arg" ;;
+          esac
+        done
+        new_args="${{new_args# }}"
+        printf 'KUBELET_KUBEADM_ARGS="%s --node-ip={node_ip}"\\n' "$new_args" \\
+          >/var/lib/kubelet/kubeadm-flags.env
+        systemctl restart kubelet
+    """)
+    run([CONTAINER_ENGINE, "exec", KIND_CONTAINER, "sh", "-c", script])
+
+    log(f"Waiting for Node '{KIND_CONTAINER}' to advertise InternalIP {node_ip}...")
+    for elapsed in range(0, 120, 3):
+        result = subprocess.run(
+            [KUBECTL, "get", "node", KIND_CONTAINER, "-o",
+             "jsonpath={.status.addresses[?(@.type=='InternalIP')].address}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.split() == [node_ip]:
+            log(f"Node '{KIND_CONTAINER}' advertises InternalIP {node_ip} after {elapsed}s")
+            return
+        time.sleep(3)
+
+    kubectl(["get", "node", KIND_CONTAINER, "-o", "wide"])
+    die(f"Timed out waiting for Node '{KIND_CONTAINER}' to advertise InternalIP {node_ip}")
 
 
 # ---------------------------------------------------------------------------
@@ -3804,6 +3878,7 @@ COMMANDS: dict[str, Command] = {
     "block-external-network": _without_node_config(block_external_network),
     "unblock-external-network": _without_node_config(unblock_external_network),
     "ensure-kind-bridge": _without_node_config(ensure_kind_bridge),
+    "configure-kind-node-ip": _without_node_config(configure_kind_node_ip),
     "dump-persisted-agent-config": _without_node_config(dump_persisted_agent_config),
     "launch-vm": _without_node_config(launch_vm),
     "run-agent": run_agent,
