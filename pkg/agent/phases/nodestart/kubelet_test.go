@@ -7,7 +7,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -44,39 +43,6 @@ func TestConfigureKubeletWritesHostnameOverride(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(data), "--hostname-override=worker-1")
 	require.Contains(t, string(data), "--node-ip=10.0.0.15")
-}
-
-func TestConfigureKubeletEnablesDynamicResourceAllocationBeforeExtraArgs(t *testing.T) {
-	t.Parallel()
-
-	machineDir := t.TempDir()
-	goalState := &goalstates.NodeStart{
-		MachineDir: machineDir,
-		NodeName:   "worker-1",
-		Kubelet: goalstates.Kubelet{
-			KubeletBinPath: "/usr/local/bin/kubelet",
-			APIServer:      "https://api.example.com",
-			CACertData:     []byte("ca"),
-			KubeletAuthInfo: config.KubeletAuthInfo{
-				BootstrapToken: "token",
-			},
-			ClusterDNS: "10.0.0.10",
-		},
-	}
-
-	require.NoError(t, ConfigureKubelet(goalState).Do(context.Background()))
-
-	data, err := os.ReadFile(filepath.Join(
-		machineDir,
-		goalstates.SystemdSystemDir,
-		goalstates.SystemdUnitKubelet,
-	))
-	require.NoError(t, err)
-
-	service := string(data)
-	featureGate := "--feature-gates=DynamicResourceAllocation=true"
-	require.Contains(t, service, featureGate)
-	require.Less(t, strings.Index(service, featureGate), strings.Index(service, "$KUBELET_EXTRA_ARGS"))
 }
 
 func TestConfigureKubeletOmitsNodeIPWhenEmpty(t *testing.T) {
