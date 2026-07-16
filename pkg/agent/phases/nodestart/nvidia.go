@@ -149,6 +149,10 @@ func (s *setupNVIDIA) prepareDriverRoot(ctx context.Context) error {
 		return err
 	}
 
+	if err := s.copyNVIDIAIMEXBinaries(ctx, paths); err != nil {
+		return err
+	}
+
 	if err := s.createDriverRootLinks(ctx, paths); err != nil {
 		return err
 	}
@@ -284,6 +288,38 @@ func (s *setupNVIDIA) copyNVIDIASMI(ctx context.Context, paths nvidiaDriverRootP
 		slog.String("source", source),
 		slog.String("destination", destination),
 	)
+
+	return nil
+}
+
+// copyNVIDIAIMEXBinaries adds the host-matched IMEX helpers to the prepared
+// NVIDIA driver root. DRA ComputeDomain daemon pods run nvidia-imex from the
+// driver root exposed at /run/nvidia/driver.
+func (s *setupNVIDIA) copyNVIDIAIMEXBinaries(ctx context.Context, paths nvidiaDriverRootPaths) error {
+	binaries := []struct {
+		name string
+		path string
+	}{
+		{name: "nvidia-imex", path: s.goalState.Nvidia.NvidiaIMEXPath},
+		{name: "nvidia-imex-ctl", path: s.goalState.Nvidia.NvidiaIMEXCtlPath},
+	}
+
+	for _, binary := range binaries {
+		if binary.path == "" {
+			continue
+		}
+
+		source := filepath.Join(goalstates.NvidiaHostBinDir, filepath.Base(binary.path))
+		destination := filepath.Join(paths.rootDir, "usr", "bin", binary.name)
+		if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName, "cp", "-L", source, destination); err != nil {
+			return fmt.Errorf("copy %s: %w", binary.name, err)
+		}
+
+		s.log.Debug("copied NVIDIA IMEX binary",
+			slog.String("source", source),
+			slog.String("destination", destination),
+		)
+	}
 
 	return nil
 }

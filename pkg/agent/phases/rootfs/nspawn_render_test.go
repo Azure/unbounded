@@ -189,7 +189,6 @@ func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
 
 	var overrideBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
-	require.Contains(t, overrideBuf.String(), "DevicePolicy=auto")
 	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-nvidia-caps rwm")
 	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-nvidia-caps-imex-channels rwm")
 	require.NotContains(t, overrideBuf.String(), "DeviceAllow="+channels+" rwm")

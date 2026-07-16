@@ -74,6 +74,12 @@ type NvidiaHost struct {
 	// NvidiaSMIPath is the host path to nvidia-smi, when available.
 	NvidiaSMIPath string
 
+	// NvidiaIMEXPath is the host path to nvidia-imex, when available.
+	NvidiaIMEXPath string
+
+	// NvidiaIMEXCtlPath is the host path to nvidia-imex-ctl, when available.
+	NvidiaIMEXCtlPath string
+
 	// DriverVersion is the active NVIDIA kernel driver version. It is used to
 	// provide versioned library names when a host installation exposes only
 	// unversioned or SONAME aliases through ldconfig.
@@ -130,6 +136,8 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 		I386LibMappings:  libraries.i386LibMappings,
 		I386LibDirMounts: libraries.i386LibDirMounts,
 		NvidiaSMIPath:    discoverNVIDIASMI(),
+		NvidiaIMEXPath:   discoverNVIDIABinary("nvidia-imex"),
+		NvidiaIMEXCtlPath: discoverNVIDIABinary("nvidia-imex-ctl"),
 		DriverVersion:    libraries.driverVersion,
 	}, nil
 }
@@ -346,7 +354,12 @@ func resolveNVIDIALibraries(arch nvidiaArch) nvidiaLibraryResolution {
 }
 
 func discoverNVIDIASMI() string {
-	for _, path := range []string{"/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi"} {
+	return discoverNVIDIABinary("nvidia-smi")
+}
+
+func discoverNVIDIABinary(name string) string {
+	for _, dir := range []string{"/usr/bin", "/usr/local/bin", "/bin"} {
+		path := filepath.Join(dir, name)
 		if info, err := os.Stat(path); err == nil && !info.IsDir() {
 			return path
 		}
