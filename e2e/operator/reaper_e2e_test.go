@@ -972,19 +972,25 @@ func configMapHash(config *corev1.ConfigMap) string {
 func createCluster(t *testing.T) string {
 	t.Helper()
 
+	return createClusterNamed(t, clusterName)
+}
+
+func createClusterNamed(t *testing.T, name string) string {
+	t.Helper()
+
 	kubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
 
-	if err := run(context.Background(), "kind", "create", "cluster", "--name", clusterName, "--wait", "120s", "--kubeconfig", kubeconfig); err != nil {
+	if err := run(context.Background(), "kind", "create", "cluster", "--name", name, "--wait", "120s", "--kubeconfig", kubeconfig); err != nil {
 		t.Fatalf("kind create cluster: %v", err)
 	}
 
 	t.Cleanup(func() {
 		if os.Getenv("E2E_KEEP") == "1" {
-			t.Logf("E2E_KEEP=1; leaving kind cluster %q", clusterName)
+			t.Logf("E2E_KEEP=1; leaving kind cluster %q", name)
 			return
 		}
 
-		_ = run(context.Background(), "kind", "delete", "cluster", "--name", clusterName)
+		_ = run(context.Background(), "kind", "delete", "cluster", "--name", name)
 	})
 
 	return kubeconfig
