@@ -225,6 +225,7 @@ func (nspawnNodeOperator) RepaveNode(
 		rootfs.DownloadContainerImageArchives(log, containerImageArchives),
 		rootfs.Provision(log, gs.RootFS),
 		nodestop.StopNode(log, oldMachine),
+		reset.CleanupNetwork(log),
 		nodestart.StartNode(log, gs.NodeStart),
 		PersistAppliedConfig(log, gs.NodeStart.MachineName, &newCfg.AgentConfig),
 		nodestart.WaitForKubelet(log, newMachine),

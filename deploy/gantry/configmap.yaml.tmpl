@@ -126,6 +126,16 @@ data:
     hrw_k: 3
     hrw_topology_scope: "cluster"
     zone_label_key: "topology.kubernetes.io/zone"
+
+    # Number of HRW-ranked pullers each prefetched layer digest is pulled by.
+    # 1 designates a single origin puller (tightest dedup) but makes the whole
+    # swarm fan out from ONE initial seed, which bottlenecks a cold
+    # thundering-herd (peer transfers pile onto the lone seed and stall at the
+    # peer_fetch_timeout). N>1 seeds the layer on the top-N pullers in
+    # parallel, so peer transfers fan out N-fold, at the cost of up to N origin
+    # copies of each layer. At 300 nodes N=8 keeps origin ~= N GiB per 1 GiB
+    # layer (still >95% saved) while widening the initial fan-out 8x.
+    prefetch_puller_replicas: 8
     # Coord peer authorization. Default false ships observe-only: an
     # inbound coord request from a peer not in the membership view only
     # increments p2p_coord_unauthorized_peer_total and is still served.
@@ -141,6 +151,39 @@ data:
     # one node. Each pull holds an HTTP body, containerd writer,
     # goroutine, and lease.
     coord_max_concurrent_pulls: 16
+    # Deliberately SHORT. A requester stuck on a lockstep-saturated seed must
+    # bail at this deadline and re-select a fresher finisher-seed rather than
+    # ride the slow stream to completion; that bail-and-re-select (with the
+    # strict containerd hosts.toml) drives the cold-start cascade. Too high
+    # (e.g. 1h) removes re-selection and collapses to single-seed bandwidth
+    # (the ~12min lockstep). Matches upstream gantry's hardcoded 60s.
+    peer_fetch_timeout: "60s"
+    # Peer re-discovery loop. On a cache miss the mirror repeatedly re-runs DHT
+    # FindProviders and retries peer fetches for up to peer_rediscover_budget to
+    # pick up finisher-seeds that advertise mid-swarm (the cold-start cascade),
+    # instead of exhausting a fixed provider set and going to origin. "0"
+    # disables re-discovery (single-shot attempt). Default 5m.
+    # This IS a working cascade with the strict containerd hosts.toml shipped in
+    # deploy/gantry/node-config.yaml (mirror-only, no origin fall-through): a
+    # 429-shed request re-selects a fresher finisher-seed and, if exhausted,
+    # retries Gantry rather than falling through to origin, so dedup holds.
+    # Validated at 300 nodes: 99.67% (1 GiB) / 97.58% (8 GiB) origin reduction
+    # with zero containerd origin bypass.
+    peer_rediscover_budget: "5m"
+    peer_rediscover_backoff: "1s"
+    # Cap on concurrent peer blob-body serves; over the cap returns 429 with a
+    # Retry-After hint so the requester re-selects a fresher finisher-seed
+    # instead of queueing behind a saturated seed. This load-shedding is what
+    # lets the first finishers complete early and seed the swarm ("leaders make
+    # leaders"). "0" means unlimited. Default 100. Requires the strict
+    # containerd hosts.toml (shipped in deploy/gantry/node-config.yaml) so a
+    # shed request retries Gantry rather than falling through to origin.
+    transfer_max_concurrent_serves: 100
+    # Cadence of the background DHT advertiser inventory reconcile. Eager
+    # per-digest advertise on stream completion is the fast path that makes
+    # finishers discoverable within milliseconds; this reconcile is the
+    # backstop for missed events and withdraws.
+    advertise_reconcile_interval: "1m"
 
     # ---------- DHT / NF5 (§7.7) ----------
     nf5_jitter_base: "3s"
@@ -160,5 +203,5 @@ data:
       - "rate_limited"
 
     # ---------- Logging ----------
-    log_level: "info"
+    log_level: "debug"
     log_format: "json"

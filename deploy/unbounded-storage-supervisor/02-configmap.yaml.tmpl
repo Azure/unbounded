@@ -58,7 +58,8 @@ data:
       memory:
         # Allocate per-shard backing from the heap instead of 2 MiB hugepages.
         no_hugepages: false
-        # Total backing pool across all serving shards in bytes (128 MiB).
+        # Node-wide shard data pool in bytes (128 MiB). Partial 2 MiB pages are
+        # unused; RPC scratch adds 8 pages per fabric unit outside this pool.
         memory_total_bytes: 134217728
       fabric:
         tcp:
@@ -83,8 +84,8 @@ data:
         allow_inactive_port: false
         # Disable RDMA and force the libfabric tcp provider.
         disable_rdma: false
-        # Cap on serving-shard CPUs to pin. Omit to claim every usable core.
-        # serving_cores: 12
+        # Cap serving shards to fit the default data and RPC scratch budgets.
+        serving_cores: 8
         # NIC-worker CPUs to pin per active HCA.
         nic_workers: 4
       metrics:

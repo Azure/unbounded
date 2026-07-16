@@ -28,7 +28,7 @@ use unbounded_storage::fabric::{
 use unbounded_storage::fanout::FetchChannel;
 use unbounded_storage::memory::{Backing, BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
 use unbounded_storage::p2p::{
-    OwnerShardSource, OwnerShardTable, RecursiveHandler, RouteTableHandle, RouteTableSnapshot,
+    OwnerShardSource, OwnerShardTable, RecursiveHandler, RouteTableHandle,
 };
 use unbounded_storage::runtime::{Threading, WorkerIdx};
 use unbounded_storage::storage::StripeReq;
@@ -293,7 +293,7 @@ impl FabricGroup {
         fabric_startup: &FabricStartup,
         _backend_specs: &[BackendSpec],
         cache_directories: Arc<CacheDirectorySet>,
-        routes: &RouteTableSnapshot,
+        routes: &RouteTableHandle,
         peers: &[RuntimePeer],
         self_peer: PeerId,
     ) -> Result<Self, Vec<String>> {
@@ -348,15 +348,6 @@ impl FabricGroup {
                 addr: unit.self_addr.clone(),
             })
             .collect()
-    }
-
-    /// Reload every endpoint's RPC-handler routing from a new snapshot.
-    /// Driven in lockstep with the per-shard transport reload so the
-    /// classify and forward paths move together.
-    pub fn reload_routes(&self, snapshot: &RouteTableSnapshot) {
-        for unit in &self.units {
-            unit.routes.store_snapshot(snapshot.clone());
-        }
     }
 
     /// Start every shared RPC server after shards have published the
@@ -425,7 +416,8 @@ impl FabricGroup {
     /// Re-drive every endpoint's fabric connection table toward `peers`.
     /// Connections live at the fabric/address-vector level, so this runs
     /// once per endpoint rather than once per shard.
-    pub fn reconcile_peers(&mut self, peers: &[RuntimePeer]) {
+    pub fn reconcile_peers(&mut self, peers: &[RuntimePeer]) -> Result<(), Vec<String>> {
+        let mut failures = Vec::new();
         for (unit_idx, unit) in self.units.iter_mut().enumerate() {
             let desired = runtime_peer_connections_for_unit(peers, unit_idx);
             let report = config::reconcile::reconcile_connections(
@@ -436,6 +428,10 @@ impl FabricGroup {
             unit.applied_peers = report.applied;
             for (peer, err) in &report.failures {
                 eprintln!("fabric peer reconcile failed: peer={} err={err}", peer.0);
+                failures.push(format!(
+                    "unit={unit_idx} device={} peer={}: {err}",
+                    unit.device_name, peer.0
+                ));
             }
             // Publish the full desired set so the background reconnect
             // thread keeps retrying peers whose dial lost the startup
@@ -443,6 +439,12 @@ impl FabricGroup {
             // connected, hence were never removed by reconcile) are
             // pruned from the desired set.
             unit.fabric.set_desired_peers(desired);
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures)
         }
     }
 
@@ -462,7 +464,7 @@ fn build_unit(
     backing_kind: BackingKind,
     fabric_startup: &FabricStartup,
     cache_directories: &Arc<CacheDirectorySet>,
-    routes: &RouteTableSnapshot,
+    routes: &RouteTableHandle,
     peers: &[RuntimePeer],
     self_peer: PeerId,
 ) -> Result<FabricUnit, String> {
@@ -525,13 +527,23 @@ fn build_unit(
         .register_backing(&scratch, spec.numa)
         .map_err(|e| format!("worker={worker}: register rpc scratch: {e}"))?;
 
-    let routes = RouteTableHandle::from_snapshot(routes.clone());
-
     fabric.check_shared_domain_capacity(spec.expected_mr);
 
     let desired_peers = runtime_peer_connections_for_unit(peers, spec.unit_idx);
-    let applied_peers =
-        config::reconcile::reconcile_connections(&fabric, &desired_peers, None).applied;
+    let peer_report = config::reconcile::reconcile_connections(&fabric, &desired_peers, None);
+    if !peer_report.failures.is_empty() {
+        let details = peer_report
+            .failures
+            .iter()
+            .map(|(peer, error)| format!("peer={}: {error}", peer.0))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "worker={worker}: {} peer(s) failed to reconcile: {details}",
+            peer_report.failures.len()
+        ));
+    }
+    let applied_peers = peer_report.applied;
     // Seed the desired-peer set so the background reconnect thread can
     // retry any peer whose initial dial lost the startup race.
     fabric.set_desired_peers(desired_peers.clone());
@@ -539,7 +551,7 @@ fn build_unit(
     Ok(FabricUnit {
         rpc_server: None,
         scratch: Some(scratch),
-        routes,
+        routes: routes.clone(),
         fabric,
         scratch_mr,
         page_size,

@@ -12,7 +12,8 @@
 //! that retires just this layer's shards without touching the
 //! process-wide shutdown signal.
 //!
-//! [`spawn_shard_layer`] brings a layer up from a config;
+//! [`prepare_shard_layer`] brings a layer through phase B without
+//! serving, [`activate_shard_layer`] starts RPC and releases the shards;
 //! [`teardown_shard_layer`] drains and joins it (used at process
 //! shutdown). [`ProcessApplyTarget`] realizes a live config apply
 //! entirely in place via [`ProcessApplyTarget::apply_in_place`]:
@@ -28,19 +29,22 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use unbounded_storage::config::{
-    self, ApplyError, Config, ConfigApplyTarget, ConfigDiff, ShardControlGroup,
+    self, ApplyError, ConfigApplyTarget, ConfigDiff, LoadedConfig, ShardControlGroup,
 };
 use unbounded_storage::fabric::PeerId;
+use unbounded_storage::memory::HUGEPAGE_2MB;
 use unbounded_storage::p2p::RouteTableHandle;
 use unbounded_storage::runtime::{JoinHandle, Threading, WorkerIdx};
-use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{CacheDirectorySet, DiskRegistry, UringDiskTarget};
 use unbounded_storage::topology::ServingShard;
 
 use crate::StartupSettings;
 use crate::fabric_group::{FabricGroup, FabricPlan, FabricUnitAddress, RpcShardPublish};
+
+const SHARD_CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Inputs that are constant across the life of the process and used to
 /// spawn the shard layer. Cloned cheaply into every shard thread.
@@ -64,8 +68,22 @@ pub struct ShardSpawnDeps {
     pub fabric_plan: FabricPlan,
 }
 
+/// A prepared set of shard threads parked after phase B, before RPC
+/// startup and serving activation.
+pub struct PreparedShardLayer {
+    joins: Vec<JoinHandle>,
+    fabric_group: FabricGroup,
+    control: ShardControlGroup,
+    layer_stop: Arc<AtomicBool>,
+    backing_keepalives: Vec<Arc<dyn Send + Sync>>,
+    rpc_shards: Vec<RpcShardPublish>,
+    serve_start_txs: Vec<mpsc::Sender<()>>,
+    terminal_rx: mpsc::Receiver<crate::ShardTerminalReport>,
+    routes: RouteTableHandle,
+}
+
 /// A spawned set of shard threads plus the handles to drive and retire
-/// them. Produced by [`spawn_shard_layer`], consumed by
+/// them. Produced by [`activate_shard_layer`], consumed by
 /// [`teardown_shard_layer`].
 pub struct ShardLayer {
     /// Join handles for every shard thread, in spawn order.
@@ -89,6 +107,10 @@ pub struct ShardLayer {
     /// strictly after all joins, so no ring ever references unmapped
     /// memory.
     _backing_keepalives: Vec<Arc<dyn Send + Sync>>,
+    terminal_rx: mpsc::Receiver<crate::ShardTerminalReport>,
+    /// The sole writer for the process-wide routing publication. Every
+    /// shard transport and fabric RPC handler holds a clone.
+    routes: RouteTableHandle,
 }
 
 impl ShardLayer {
@@ -97,8 +119,9 @@ impl ShardLayer {
     }
 }
 
-/// Bring up a shard layer from `config` on the runtime in `deps`,
-/// blocking until every shard has reported readiness.
+/// Prepare a shard layer from `loaded` on the runtime in `deps`,
+/// blocking until every shard has completed phase B. The returned
+/// shards remain parked and no RPC server has started.
 ///
 /// Spawns one thread per worker in `deps.workers`, each with its own
 /// control channel (collected into the returned [`ShardControlGroup`])
@@ -110,37 +133,27 @@ impl ShardLayer {
 /// Returns `Err` with the collected per-shard error messages if any
 /// shard failed to come up; any shards that *did* come up are torn down
 /// first so no threads leak.
-pub fn spawn_shard_layer(
-    config: &Config,
+pub fn prepare_shard_layer(
+    loaded: Arc<LoadedConfig>,
     deps: &ShardSpawnDeps,
-) -> Result<ShardLayer, Vec<String>> {
+) -> Result<PreparedShardLayer, Vec<String>> {
     let layer_stop = Arc::new(AtomicBool::new(false));
     let worker_count = deps.workers.len();
     let settings = &deps.settings;
-    // `memory_total_bytes` is the whole host backing budget; split it
-    // evenly across the serving shards so each gets a NUMA-local slice
-    // and the host footprint stays fixed regardless of the auto-scaled
-    // serving-shard count.
-    let bytes_per_shard = if worker_count == 0 {
-        0
-    } else {
-        settings.memory_total_bytes / worker_count
-    };
-    let projection = config::runtime_projection(config)
-        .map_err(|e| vec![format!("config projection failed: {e}")])?;
-    let frontend_specs = Arc::new(config.frontends.clone());
-    let frontend_bindings = Arc::new(projection.frontends.clone());
-    let backend_specs = Arc::new(config.backends.clone());
-    let routes = crate::build_routes(config);
-    let runtime_peers = config::runtime_peers(&projection);
-    let self_peer = local_self_peer(&projection)
+    let shard_backing_sizes = shard_backing_sizes(settings.memory_total_bytes, worker_count)
+        .map_err(|e| vec![format!("invalid shard memory budget: {e}")])?;
+    let config = loaded.config();
+    let runtime = loaded.runtime();
+    let routes = RouteTableHandle::from_snapshot(loaded.routes().clone());
+    let runtime_peers = config::runtime_peers(runtime);
+    let self_peer = local_self_peer(runtime)
         .map_err(|e| vec![format!("unsupported fabric identity config: {e}")])?;
 
     // Bring up the shared fabric endpoints before spawning any shards:
     // each shard registers its data backing against the endpoint it maps
     // onto. RPC servers start after shards publish their pool MRs/fetch
     // channels because owner responses source those bufferpool pages.
-    let mut fabric_group = FabricGroup::new(
+    let fabric_group = FabricGroup::new(
         &deps.runtime,
         &deps.fabric_plan,
         settings.backing_kind,
@@ -158,6 +171,7 @@ pub fn spawn_shard_layer(
     // from `ready_tx` so the layer can wait for the second rendezvous
     // (peer registration) after broadcasting the full peer set.
     let (phaseb_tx, phaseb_rx) = mpsc::channel::<crate::PhaseBReport>();
+    let (terminal_tx, terminal_rx) = mpsc::channel::<crate::ShardTerminalReport>();
     let mut joins = Vec::with_capacity(worker_count);
     let mut control_senders = Vec::with_capacity(worker_count);
     // Per-shard senders for broadcasting the assembled peer set in phase
@@ -169,6 +183,7 @@ pub fn spawn_shard_layer(
 
     for (i, (shard, _)) in deps.workers.iter().enumerate() {
         let widx = WorkerIdx(u16::try_from(i).expect("worker index fits in u16"));
+        let backing_size = shard_backing_sizes[i];
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<config::ShardCommand>();
         control_senders.push((widx, ctrl_tx));
         let (peer_tx, peer_rx) = mpsc::channel::<Arc<Vec<crate::PeerPublish>>>();
@@ -182,34 +197,31 @@ pub fn spawn_shard_layer(
         let tx = ready_tx.clone();
         let backing_kind = settings.backing_kind;
         let cache_directories = deps.cache_directories.clone();
-        let route_handle = RouteTableHandle::from_snapshot(routes.clone());
-        let frontend_specs = frontend_specs.clone();
-        let frontend_bindings = frontend_bindings.clone();
-        let backend_specs = backend_specs.clone();
+        let route_handle = routes.clone();
+        let loaded = loaded.clone();
         let layer_stop = layer_stop.clone();
+        let terminal_tx = terminal_tx.clone();
         let rt = deps.runtime.clone();
-        let panic_tx = tx.clone();
         let handle = rt.spawn_pinned(
             widx,
             &format!("ub-storage-shard-{i}"),
             Box::new(move || {
-                crate::report_on_panic(panic_tx, widx, move || {
+                crate::report_on_panic(widx, move || {
                     crate::run_shard(
                         widx,
                         shard,
                         fabric,
                         tx,
                         backing_kind,
-                        bytes_per_shard,
+                        backing_size,
                         cache_directories,
                         route_handle,
-                        frontend_specs,
-                        frontend_bindings,
-                        backend_specs,
+                        loaded,
                         ctrl_rx,
                         peer_rx,
                         phaseb_tx,
                         serve_start_rx,
+                        terminal_tx,
                         layer_stop,
                     );
                 });
@@ -222,6 +234,7 @@ pub fn spawn_shard_layer(
     // bounded by the number of shards that came up, and each live shard
     // holds its sender, so this never closes the channel prematurely.
     drop(phaseb_tx);
+    drop(terminal_tx);
 
     // Bounded readiness collection: read exactly one message per spawned
     // thread. Shards that come up park holding their sender, so they
@@ -258,6 +271,9 @@ pub fn spawn_shard_layer(
         for h in joins.into_iter().rev() {
             let _ = h.join();
         }
+        drop(control_senders);
+        drop(fabric_group);
+        drop(publishes);
         return Err(errors);
     }
 
@@ -329,42 +345,158 @@ pub fn spawn_shard_layer(
         }
     }
     if !phaseb_errors.is_empty() {
-        layer_stop.store(true, Ordering::Relaxed);
-        drop(serve_start_txs);
-        for h in joins.into_iter().rev() {
-            let _ = h.join();
-        }
+        retire_failed_activation(
+            joins,
+            fabric_group,
+            ShardControlGroup::new(control_senders, SHARD_CONTROL_TIMEOUT),
+            layer_stop,
+            backing_keepalives,
+            serve_start_txs,
+            terminal_rx,
+            routes,
+        );
         return Err(phaseb_errors);
     }
 
-    if let Err(mut rpc_errors) = fabric_group.start_rpc_servers(&rpc_shards) {
-        layer_stop.store(true, Ordering::Relaxed);
-        drop(serve_start_txs);
-        for h in joins.into_iter().rev() {
-            let _ = h.join();
-        }
-        phaseb_errors.append(&mut rpc_errors);
-        return Err(phaseb_errors);
+    Ok(PreparedShardLayer {
+        joins,
+        fabric_group,
+        control: ShardControlGroup::new(control_senders, SHARD_CONTROL_TIMEOUT),
+        layer_stop,
+        backing_keepalives,
+        rpc_shards,
+        serve_start_txs,
+        terminal_rx,
+        routes,
+    })
+}
+
+/// Start recursive RPC servers and release every prepared shard into
+/// its serve loop. Any failure retires and joins the entire prepared
+/// layer before returning.
+pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, Vec<String>> {
+    let PreparedShardLayer {
+        joins,
+        mut fabric_group,
+        control,
+        layer_stop,
+        backing_keepalives,
+        rpc_shards,
+        serve_start_txs,
+        terminal_rx,
+        routes,
+    } = prepared;
+
+    if let Err(errors) = fabric_group.start_rpc_servers(&rpc_shards) {
+        retire_failed_activation(
+            joins,
+            fabric_group,
+            control,
+            layer_stop,
+            backing_keepalives,
+            serve_start_txs,
+            terminal_rx,
+            routes,
+        );
+        return Err(errors);
     }
-    for tx in serve_start_txs {
+    for tx in &serve_start_txs {
         if tx.send(()).is_err() {
-            layer_stop.store(true, Ordering::Relaxed);
-            for h in joins.into_iter().rev() {
-                let _ = h.join();
-            }
+            retire_failed_activation(
+                joins,
+                fabric_group,
+                control,
+                layer_stop,
+                backing_keepalives,
+                serve_start_txs,
+                terminal_rx,
+                routes,
+            );
             return Err(vec![
                 "shard exited before recursive RPC servers were ready".to_string(),
             ]);
         }
     }
+    drop(serve_start_txs);
 
     Ok(ShardLayer {
         joins,
         fabric_group,
-        control: ShardControlGroup::new(control_senders),
+        control,
         layer_stop,
         _backing_keepalives: backing_keepalives,
+        terminal_rx,
+        routes,
     })
+}
+
+/// Retire a prepared layer that must not be activated.
+pub fn retire_prepared_shard_layer(prepared: PreparedShardLayer) {
+    let PreparedShardLayer {
+        joins,
+        fabric_group,
+        control,
+        layer_stop,
+        backing_keepalives,
+        rpc_shards: _,
+        serve_start_txs,
+        terminal_rx,
+        routes,
+    } = prepared;
+    retire_failed_activation(
+        joins,
+        fabric_group,
+        control,
+        layer_stop,
+        backing_keepalives,
+        serve_start_txs,
+        terminal_rx,
+        routes,
+    );
+}
+
+fn retire_failed_activation(
+    joins: Vec<JoinHandle>,
+    fabric_group: FabricGroup,
+    control: ShardControlGroup,
+    layer_stop: Arc<AtomicBool>,
+    backing_keepalives: Vec<Arc<dyn Send + Sync>>,
+    serve_start_txs: Vec<mpsc::Sender<()>>,
+    terminal_rx: mpsc::Receiver<crate::ShardTerminalReport>,
+    routes: RouteTableHandle,
+) {
+    layer_stop.store(true, Ordering::Relaxed);
+    drop(serve_start_txs);
+    for h in joins.into_iter().rev() {
+        let _ = h.join();
+    }
+    drop(control);
+    drop(fabric_group);
+    drop(routes);
+    drop(backing_keepalives);
+    drop(terminal_rx);
+}
+
+fn shard_backing_sizes(
+    memory_total_bytes: usize,
+    shard_count: usize,
+) -> Result<Vec<usize>, String> {
+    if shard_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let total_pages = memory_total_bytes / HUGEPAGE_2MB;
+    if total_pages < shard_count {
+        return Err(format!(
+            "{memory_total_bytes} bytes provides {total_pages} whole 2 MiB pages for {shard_count} serving shards"
+        ));
+    }
+
+    let pages_per_shard = total_pages / shard_count;
+    let remainder = total_pages % shard_count;
+    Ok((0..shard_count)
+        .map(|i| (pages_per_shard + usize::from(i < remainder)) * HUGEPAGE_2MB)
+        .collect())
 }
 
 fn local_self_peer(projection: &config::RuntimeGraph) -> Result<PeerId, String> {
@@ -373,19 +505,30 @@ fn local_self_peer(projection: &config::RuntimeGraph) -> Result<PeerId, String> 
 
 /// Retire a shard layer: signal its shards to exit, then join every
 /// thread in reverse spawn order so teardown mirrors bring-up.
-pub fn teardown_shard_layer(layer: ShardLayer) {
+pub fn teardown_shard_layer(layer: ShardLayer) -> bool {
     let ShardLayer {
         joins,
         fabric_group,
         control,
         layer_stop,
         _backing_keepalives,
+        terminal_rx,
+        routes,
     } = layer;
     layer_stop.store(true, Ordering::Relaxed);
+    let mut failed = false;
     for h in joins.into_iter().rev() {
         if let Err(e) = h.join() {
             eprintln!("shard thread panicked during teardown: {e:?}");
+            failed = true;
         }
+    }
+    for report in terminal_rx.try_iter() {
+        eprintln!(
+            "shard worker={} terminal failure: {}",
+            report.worker_idx.0, report.message
+        );
+        failed = true;
     }
     // Drop the control senders only after every shard thread has
     // exited, so nothing observes a half-torn layer.
@@ -397,12 +540,14 @@ pub fn teardown_shard_layer(layer: ShardLayer) {
     // assigned shard's data backing. The shard threads have already
     // joined, so nothing still touches those regions.
     drop(fabric_group);
+    drop(routes);
     // Free every shard's backing only now: the fabrics above have closed
     // their MRs, and all shard threads (and thus every io_uring ring that
     // may still reference a peer's pages as a `SEND_ZC` source) have
     // joined, so no mapping is unmapped out from under a live ring or an
     // open MR.
     drop(_backing_keepalives);
+    failed
 }
 
 /// The binary's [`ConfigApplyTarget`]: owns the live shard layer and
@@ -432,8 +577,28 @@ impl ProcessApplyTarget {
     /// Reconcile projected cache disks in place and republish the
     /// resulting channel set to the live directory (idempotent when the
     /// disk set is unchanged).
-    fn reconcile_disks(&mut self, projection: &config::RuntimeGraph) {
-        crate::reconcile_cache_disks(&mut self.disk_registry, &self.cache_directories, projection);
+    fn reconcile_disks(&mut self, projection: &config::RuntimeGraph) -> Result<(), ApplyError> {
+        let report = crate::reconcile_cache_disks(
+            &mut self.disk_registry,
+            &self.cache_directories,
+            projection,
+        );
+        if report.failures.is_empty() {
+            return Ok(());
+        }
+
+        let failure_count = report.failures.len();
+        let mut failures = report.failures;
+        failures.sort_by(|a, b| a.0.cmp(&b.0));
+        let details = failures
+            .into_iter()
+            .map(|(path, error)| format!("{}: {error}", path.display()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(ApplyError::Target(format!(
+            "{} disk(s) failed to open: {details}",
+            failure_count
+        )))
     }
 
     /// Consume the target at shutdown, returning the live layer (if any)
@@ -445,15 +610,16 @@ impl ProcessApplyTarget {
 }
 
 impl ConfigApplyTarget for ProcessApplyTarget {
-    fn apply_in_place(&mut self, new: &Arc<Config>, diff: &ConfigDiff) -> Result<(), ApplyError> {
+    fn apply_in_place(
+        &mut self,
+        new: &Arc<LoadedConfig>,
+        diff: &ConfigDiff,
+    ) -> Result<(), ApplyError> {
         if diff.requires_restart() {
             return Err(ApplyError::Target(
                 "self peer identity changed; restart required".to_string(),
             ));
         }
-
-        let projection = config::runtime_projection(new)
-            .map_err(|e| ApplyError::Target(format!("config projection failed: {e}")))?;
 
         // The shards must see a new config whenever their routing surface,
         // graph projection, per-disk page-cache policy, or per-shard
@@ -466,23 +632,23 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             || diff.frontends_changed;
 
         if needs_broadcast {
-            let routes = crate::build_routes(new);
             let layer = self
                 .layer
                 .as_mut()
                 .expect("shard layer present between applies");
 
-            // Peer connections and the RPC handlers' routing live on the
-            // shared fabric endpoints, not on individual shards, so they
-            // are reconciled once per endpoint here. Both only need
-            // touching when the routing surface (p2p/peers) changed; a
-            // backend/frontend-only change leaves them untouched.
-            if diff.requires_routing_reload() {
-                layer.fabric_group.reload_routes(&routes);
-            }
+            // Peer connections live on the shared fabric endpoints, not
+            // on individual shards, so they are reconciled once per
+            // endpoint here.
             if diff.requires_peer_reconcile() {
-                let runtime_peers = config::runtime_peers(&projection);
-                layer.fabric_group.reconcile_peers(&runtime_peers);
+                let runtime_peers = config::runtime_peers(new.runtime());
+                if let Err(failures) = layer.fabric_group.reconcile_peers(&runtime_peers) {
+                    crate::SHUTDOWN.store(true, Ordering::Release);
+                    return Err(ApplyError::Target(format!(
+                        "hard peer reconciliation failure(s): {}",
+                        failures.join("; ")
+                    )));
+                }
             }
 
             // The RPC-side backend registries also live on the shared
@@ -490,14 +656,21 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             // rebuild their own transport registries against an already
             // up-to-date origin surface.
             if diff.backends_changed {
-                layer.fabric_group.reconcile_backends(&new.backends);
+                layer
+                    .fabric_group
+                    .reconcile_backends(&new.config().backends);
             }
 
             // Republish config + routing to every shard and block until
             // each has acked, so the routing surface and per-shard
             // backend/frontend reconcile each shard performs on receipt
             // have provably landed.
-            layer.control.broadcast_apply(new.clone(), routes, *diff)?;
+            if let Err(error) = layer.control.broadcast_apply(new.clone(), *diff) {
+                if error.apply_state_is_indeterminate() {
+                    crate::SHUTDOWN.store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
         }
 
         if diff.disks_changed {
@@ -505,15 +678,34 @@ impl ConfigApplyTarget for ProcessApplyTarget {
                 .layer
                 .as_mut()
                 .expect("shard layer present between applies");
-            layer.control.broadcast_drain_page_cache()?;
+            if let Err(error) = layer.control.broadcast_drain_page_cache() {
+                if error.apply_state_is_indeterminate() {
+                    crate::SHUTDOWN.store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
         }
 
         // Disk/channel changes mutate live registries and directories, so
         // all fallible shard broadcasts must complete before this point.
         // If a broadcast fails, ConfigController keeps the old config as
-        // current and the live disk topology remains on that same version.
+        // current and disk reconciliation does not begin. Once reconciliation
+        // begins, its realized subset is published even when an open fails;
+        // returning that failure keeps the desired snapshot retryable.
         if diff.caches_changed || diff.disks_changed {
-            self.reconcile_disks(&projection);
+            self.reconcile_disks(new.runtime())?;
+        }
+
+        // Routing is the process-wide visibility point for a successful
+        // apply. Publish it only after every fallible shard broadcast and
+        // the disk update have completed, so failed applies retain the
+        // prior route snapshot everywhere.
+        if diff.requires_routing_reload() {
+            self.layer
+                .as_ref()
+                .expect("shard layer present between applies")
+                .routes
+                .store_snapshot(new.routes().clone());
         }
 
         Ok(())
@@ -550,5 +742,49 @@ mod tests {
         let graph = graph_with_self_peer(PeerId(7));
 
         assert_eq!(local_self_peer(&graph).unwrap(), PeerId(7));
+    }
+
+    #[test]
+    fn shard_backing_sizes_split_evenly() {
+        assert_eq!(
+            shard_backing_sizes(4 * HUGEPAGE_2MB, 2).unwrap(),
+            vec![2 * HUGEPAGE_2MB, 2 * HUGEPAGE_2MB]
+        );
+    }
+
+    #[test]
+    fn shard_backing_sizes_assign_remainder_in_worker_order() {
+        assert_eq!(
+            shard_backing_sizes(5 * HUGEPAGE_2MB, 2).unwrap(),
+            vec![3 * HUGEPAGE_2MB, 2 * HUGEPAGE_2MB]
+        );
+    }
+
+    #[test]
+    fn shard_backing_sizes_ignore_partial_trailing_page() {
+        let total = 5 * HUGEPAGE_2MB + HUGEPAGE_2MB - 1;
+        let sizes = shard_backing_sizes(total, 2).unwrap();
+
+        assert_eq!(sizes, vec![3 * HUGEPAGE_2MB, 2 * HUGEPAGE_2MB]);
+        assert!(sizes.iter().sum::<usize>() <= total);
+    }
+
+    #[test]
+    fn shard_backing_sizes_accept_exact_minimum() {
+        assert_eq!(
+            shard_backing_sizes(3 * HUGEPAGE_2MB, 3).unwrap(),
+            vec![HUGEPAGE_2MB; 3]
+        );
+    }
+
+    #[test]
+    fn shard_backing_sizes_reject_insufficient_or_zero_budget() {
+        assert!(shard_backing_sizes(2 * HUGEPAGE_2MB, 3).is_err());
+        assert!(shard_backing_sizes(0, 1).is_err());
+    }
+
+    #[test]
+    fn shard_backing_sizes_allow_zero_shards() {
+        assert_eq!(shard_backing_sizes(0, 0).unwrap(), Vec::<usize>::new());
     }
 }

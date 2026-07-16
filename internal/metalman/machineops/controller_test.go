@@ -4,9 +4,11 @@
 package machineops
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +28,26 @@ import (
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
 )
+
+func TestReconcilerAddsMachineOperationNameToHandlerLogs(t *testing.T) {
+	s := testScheme(t)
+	op := testOperation("op-logged", v1alpha3.OperationHostPowerOff)
+	op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"missing": "true"}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(op).WithStatusSubresource(op).Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	var logs bytes.Buffer
+
+	previousLogger := slog.Default()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	require.Contains(t, logs.String(), "machineOperation=op-logged")
+}
 
 func TestReconcilerCompletesMachineRefPowerOff(t *testing.T) {
 	t.Parallel()

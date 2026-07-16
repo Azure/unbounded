@@ -54,7 +54,7 @@ impl UringDevice {
     /// capacity probe, file registration. The returned [`OpenDisk`]
     /// hands the ring back un-wrapped; the caller is responsible for
     /// installing it into the thread-local registry
-    /// ([`set_current_storage_ring`](crate::ring::set_current_storage_ring))
+    /// ([`install_current_storage_ring`](crate::ring::install_current_storage_ring))
     /// on the storage-core thread, and for keeping [`OpenDisk::file`]
     /// alive for as long as the ring's registered file table addresses
     /// it.
