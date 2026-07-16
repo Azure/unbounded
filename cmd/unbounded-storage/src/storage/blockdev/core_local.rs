@@ -11,7 +11,7 @@
 //! the engine that holds it can be published to any thread, but every
 //! [`BlockDevice`] call only succeeds on the storage core whose ring
 //! has been installed (via
-//! [`set_current_storage_ring`](crate::ring::set_current_storage_ring)).
+//! [`install_current_storage_ring`](crate::ring::install_current_storage_ring)).
 //! Off-core calls fail with `Err(Io(ENXIO))` rather than touching a
 //! foreign ring.
 

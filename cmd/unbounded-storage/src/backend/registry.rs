@@ -315,7 +315,6 @@ impl PageStream for RegistryFetchStream<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::ptr;
     use std::rc::Rc;
     use std::task::{RawWaker, RawWakerVTable, Waker};
@@ -353,7 +352,7 @@ mod tests {
     }
 
     fn registry(specs: &[BackendSpec]) -> BackendRegistry {
-        let ring = Rc::new(RefCell::new(NetworkRing::new(8).expect("network ring")));
+        let ring = Rc::new(NetworkRing::new(8).expect("network ring"));
         BackendRegistry::new(specs, NetHandle::new(ring), 4096, ptr::null_mut())
             .expect("seed registry")
     }

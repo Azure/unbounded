@@ -38,14 +38,15 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
 use crate::bufferpool::{Error, StripeKey};
 use crate::runtime::noop_waker;
 use crate::storage::blockdev::BlockDevice;
+use crate::storage::completion::{Completion, CompletionWait};
 use crate::storage::engine::StorageEngine;
 
 static NEXT_SERVICE_ID: AtomicU64 = AtomicU64::new(1);
@@ -400,63 +401,9 @@ enum Inflight {
     },
 }
 
-/// One-shot completion slot generic over the success type. The
-/// producer (service) stores a result and wakes any parked consumer;
-/// the consumer polls and returns the stored result if present.
-pub struct ReplySlot<T> {
-    inner: Mutex<ReplyInner<T>>,
-}
-
-struct ReplyInner<T> {
-    result: Option<Result<T, Error>>,
-    waker: Option<Waker>,
-}
-
-impl<T> ReplySlot<T> {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(ReplyInner {
-                result: None,
-                waker: None,
-            }),
-        })
-    }
-
-    pub fn set(&self, result: Result<T, Error>) {
-        let waker = {
-            let mut g = self.inner.lock().unwrap();
-            g.result = Some(result);
-            g.waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
-    }
-
-    fn wait(self: Arc<Self>) -> ReplyWait<T> {
-        ReplyWait { inner: self }
-    }
-}
-
-struct ReplyWait<T> {
-    inner: Arc<ReplySlot<T>>,
-}
-
-impl<T> Future for ReplyWait<T> {
-    type Output = Result<T, Error>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut g = self.inner.inner.lock().unwrap();
-        if let Some(r) = g.result.take() {
-            Poll::Ready(r)
-        } else {
-            if !g.waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
-                g.waker = Some(cx.waker().clone());
-            }
-            Poll::Pending
-        }
-    }
-}
+/// One-shot completion slot for page-service results.
+pub type ReplySlot<T> = Completion<Result<T, Error>>;
+type ReplyWait<T> = CompletionWait<Result<T, Error>>;
 
 /// `Future` adapter for the async paths (`read_page` / `write_page`).
 /// Resolves with `Err(Io(EIO))` if the slot is still pending once the
@@ -470,7 +417,7 @@ struct AliveAwareWait<T> {
 impl<T> AliveAwareWait<T> {
     fn new(reply: Arc<ReplySlot<T>>, service_alive: Arc<AtomicBool>) -> Self {
         Self {
-            reply: ReplyWait { inner: reply },
+            reply: reply.wait(),
             service_alive,
         }
     }
@@ -534,10 +481,10 @@ fn spin_block_on_with_alive<T>(fut: ReplyWait<T>, service_alive: &AtomicBool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::flag_waker;
     use crate::storage::blockdev::{MockDevice, MockDeviceConfig};
     use crate::storage::engine::EngineConfig;
     use std::sync::mpsc::channel as std_channel;
-    use std::task::{RawWaker, RawWakerVTable};
     use std::time::Duration;
 
     fn block_on<F: Future>(mut fut: F) -> F::Output {
@@ -553,48 +500,6 @@ mod tests {
             std::thread::yield_now();
         }
         panic!("block_on: future did not complete within spin budget");
-    }
-
-    /// Build a waker whose `wake` flips a shared `Arc<AtomicBool>`,
-    /// mirroring the shard loop's `flag_waker`. The shard polls
-    /// page-channel reply futures with exactly this kind of waker, so
-    /// the `ReplySlot` stashes it and a cross-thread `set` must flip
-    /// the flag. This local copy lets the page-channel tests pin that
-    /// contract from this side of the boundary.
-    fn flag_waker() -> (Waker, Arc<AtomicBool>) {
-        let flag = Arc::new(AtomicBool::new(false));
-        let data = Arc::into_raw(flag.clone()) as *const ();
-        // SAFETY: `data` is a freshly leaked `Arc<AtomicBool>` and the
-        // vtable upholds the matching clone/wake/drop refcounting.
-        let waker = unsafe { Waker::from_raw(RawWaker::new(data, &FLAG_VTABLE)) };
-        (waker, flag)
-    }
-
-    static FLAG_VTABLE: RawWakerVTable =
-        RawWakerVTable::new(flag_clone, flag_wake, flag_wake_by_ref, flag_drop);
-
-    unsafe fn flag_clone(data: *const ()) -> RawWaker {
-        // SAFETY: `data` points at a live `Arc<AtomicBool>`.
-        unsafe { Arc::increment_strong_count(data as *const AtomicBool) };
-        RawWaker::new(data, &FLAG_VTABLE)
-    }
-
-    unsafe fn flag_wake(data: *const ()) {
-        // SAFETY: consumes the one owned ref this waker held.
-        let arc = unsafe { Arc::from_raw(data as *const AtomicBool) };
-        arc.store(true, Ordering::Release);
-    }
-
-    unsafe fn flag_wake_by_ref(data: *const ()) {
-        // SAFETY: borrows without consuming; the ref is handed back.
-        let arc = unsafe { Arc::from_raw(data as *const AtomicBool) };
-        arc.store(true, Ordering::Release);
-        let _ = Arc::into_raw(arc);
-    }
-
-    unsafe fn flag_drop(data: *const ()) {
-        // SAFETY: balances one clone/into_raw strong ref.
-        unsafe { Arc::decrement_strong_count(data as *const AtomicBool) };
     }
 
     /// Run a storage-core-like loop on the current thread: build a

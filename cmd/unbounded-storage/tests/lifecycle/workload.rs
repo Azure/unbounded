@@ -17,9 +17,8 @@ use proptest::prelude::*;
 use unbounded_storage::bufferpool::{Error, StripeKey};
 use unbounded_storage::config::{
     ApplyError, BackendSpec, CacheSpec, Config, ConfigApplyTarget, ConfigController, ConfigDiff,
-    DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig, PeerSpec,
-    TcpPeerConfig, backend_spec, disk_spec, frontend_spec, peer_spec, runtime_disks,
-    runtime_projection,
+    DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig, LoadedConfig,
+    PeerSpec, TcpPeerConfig, backend_spec, disk_spec, frontend_spec, peer_spec, runtime_disks,
 };
 use unbounded_storage::runtime::ShardLoop;
 use unbounded_storage::storage::blockdev::MockDeviceConfig;
@@ -101,6 +100,7 @@ pub struct RunReport {
     pub phase_a_ready: usize,
     pub phase_b_ready: usize,
     pub serve_before_phase_b: u64,
+    pub serve_before_initial_disk_publication: u64,
     pub shard_apply_counts: Vec<usize>,
     pub broadcasts: usize,
     pub disk_applies: usize,
@@ -225,6 +225,7 @@ struct ShardState {
     apply_queue: RefCell<VecDeque<u64>>,
     applied: RefCell<Vec<u64>>,
     serve_before_phase_b: Cell<u64>,
+    serve_before_initial_disk_publication: Cell<u64>,
 }
 
 impl ShardState {
@@ -236,6 +237,7 @@ impl ShardState {
             apply_queue: RefCell::new(VecDeque::new()),
             applied: RefCell::new(Vec::new()),
             serve_before_phase_b: Cell::new(0),
+            serve_before_initial_disk_publication: Cell::new(0),
         }
     }
 }
@@ -251,23 +253,28 @@ struct SimApplyTarget {
 }
 
 impl ConfigApplyTarget for SimApplyTarget {
-    fn apply_in_place(&mut self, new: &Arc<Config>, diff: &ConfigDiff) -> Result<(), ApplyError> {
-        let projection = runtime_projection(new)
-            .map_err(|e| ApplyError::Target(format!("config projection failed: {e}")))?;
-
+    fn apply_in_place(
+        &mut self,
+        new: &Arc<LoadedConfig>,
+        diff: &ConfigDiff,
+    ) -> Result<(), ApplyError> {
         if diff.requires_routing_reload()
             || diff.caches_changed
+            || diff.disks_changed
             || diff.backends_changed
             || diff.frontends_changed
         {
             self.metrics.borrow_mut().broadcasts += 1;
             for shard in &self.shards {
-                shard.apply_queue.borrow_mut().push_back(new.version);
+                shard
+                    .apply_queue
+                    .borrow_mut()
+                    .push_back(new.config().version);
             }
         }
 
-        if diff.caches_changed {
-            let disks = runtime_disks(&projection);
+        if diff.caches_changed || diff.disks_changed {
+            let disks = runtime_disks(new.runtime());
             let report = self.registry.reconcile(&disks);
             let mut metrics = self.metrics.borrow_mut();
             metrics.disk_applies += 1;
@@ -321,6 +328,7 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         .map(|_| Rc::new(ShardState::new()))
         .collect();
     let peer_published = Rc::new(Cell::new(false));
+    let initial_disks_published = Rc::new(Cell::new(false));
     let serving_ready = Rc::new(Cell::new(false));
     let clients_finished = Rc::new(Cell::new(0usize));
     let completed_ops = Rc::new(Cell::new(0usize));
@@ -342,13 +350,21 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         pool_base,
         pool_len,
         bootstrap_done.clone(),
+        initial_disks_published.clone(),
     );
     spawn_storage_cores(&mut exec, generations.clone());
-    spawn_shards(&mut exec, &shard_states, peer_published.clone());
+    spawn_shards(
+        &mut exec,
+        &shard_states,
+        peer_published.clone(),
+        initial_disks_published.clone(),
+        serving_ready.clone(),
+    );
     spawn_phase_b_supervisor(
         &mut exec,
         &shard_states,
         peer_published.clone(),
+        initial_disks_published,
         serving_ready.clone(),
     );
     spawn_apply_driver(
@@ -409,6 +425,10 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
             .iter()
             .map(|s| s.serve_before_phase_b.get())
             .sum(),
+        serve_before_initial_disk_publication: shard_states
+            .iter()
+            .map(|s| s.serve_before_initial_disk_publication.get())
+            .sum(),
         shard_apply_counts: shard_states
             .iter()
             .map(|s| s.applied.borrow().len())
@@ -437,12 +457,13 @@ pub fn expected_apply_counts(w: &Workload) -> ExpectedApplyCounts {
         let diff = ConfigDiff::between(&current, &next);
         if diff.requires_routing_reload()
             || diff.caches_changed
+            || diff.disks_changed
             || diff.backends_changed
             || diff.frontends_changed
         {
             out.broadcasts += 1;
         }
-        if diff.caches_changed {
+        if diff.caches_changed || diff.disks_changed {
             out.disk_applies += 1;
         }
         if diff.any() {
@@ -523,6 +544,7 @@ fn spawn_bootstrap(
     pool_base: usize,
     pool_len: usize,
     bootstrap_done: Rc<Cell<bool>>,
+    initial_disks_published: Rc<Cell<bool>>,
 ) {
     exec.spawn(async move {
         sim_cfg.max_io_delay.set(0);
@@ -555,6 +577,7 @@ fn spawn_bootstrap(
         }
         sim_cfg.max_io_delay.set(w.max_io_delay);
         publish_generation(&directory, &generations[0]);
+        initial_disks_published.set(true);
         bootstrap_done.set(true);
     });
 }
@@ -620,15 +643,19 @@ fn spawn_shards(
     exec: &mut Executor,
     shard_states: &[Rc<ShardState>],
     peer_published: Rc<Cell<bool>>,
+    initial_disks_published: Rc<Cell<bool>>,
+    serving_ready: Rc<Cell<bool>>,
 ) {
     for state in shard_states {
         let state = state.clone();
         let peer_published = peer_published.clone();
+        let initial_disks_published = initial_disks_published.clone();
+        let serving_ready = serving_ready.clone();
         exec.spawn(async move {
             let mut loop_driver = ShardLoop::new();
             let serving_state = state.clone();
             loop_driver.spawn(async move {
-                while !serving_state.phase_b.get() && !serving_state.stop.get() {
+                while !serving_ready.get() && !serving_state.stop.get() {
                     yield_once().await;
                 }
                 while !serving_state.stop.get() {
@@ -636,6 +663,11 @@ fn spawn_shards(
                         serving_state
                             .serve_before_phase_b
                             .set(serving_state.serve_before_phase_b.get() + 1);
+                    }
+                    if !initial_disks_published.get() {
+                        serving_state
+                            .serve_before_initial_disk_publication
+                            .set(serving_state.serve_before_initial_disk_publication.get() + 1);
                     }
                     yield_once().await;
                 }
@@ -671,6 +703,7 @@ fn spawn_phase_b_supervisor(
     exec: &mut Executor,
     shard_states: &[Rc<ShardState>],
     peer_published: Rc<Cell<bool>>,
+    initial_disks_published: Rc<Cell<bool>>,
     serving_ready: Rc<Cell<bool>>,
 ) {
     let shards = shard_states.to_vec();
@@ -680,6 +713,9 @@ fn spawn_phase_b_supervisor(
         }
         peer_published.set(true);
         while !shards.iter().all(|s| s.phase_b.get()) {
+            yield_once().await;
+        }
+        while !initial_disks_published.get() {
             yield_once().await;
         }
         serving_ready.set(true);
@@ -700,13 +736,15 @@ fn spawn_apply_driver(
         while !bootstrap_done.get() || !shards.iter().all(|s| s.phase_b.get()) {
             yield_once().await;
         }
-        let initial = Arc::new(config_for_generation(
-            0,
-            generation_disk_specs(0, w.initial_disks),
-        ));
+        let initial = Arc::new(
+            LoadedConfig::from_config(config_for_generation(
+                0,
+                generation_disk_specs(0, w.initial_disks),
+            ))
+            .expect("initial sim config loads"),
+        );
         let mut registry = DiskRegistry::new(RegistryTarget, disk_slots());
-        let projection = runtime_projection(&initial).expect("initial sim config projects");
-        let initial_disks = runtime_disks(&projection);
+        let initial_disks = runtime_disks(initial.runtime());
         let initial_report = registry.reconcile(&initial_disks);
         metrics.borrow_mut().registry_failures += initial_report.failures.len();
         let target = SimApplyTarget {
@@ -721,10 +759,14 @@ fn spawn_apply_driver(
         let mut controller = ConfigController::new(target, initial);
         for (idx, apply) in w.applies.iter().enumerate() {
             yield_n(apply.delay).await;
-            let mut next = (*controller.current()).as_ref().clone();
+            let mut next = controller.current().config().clone();
             next.version = idx as u64 + 1;
             mutate_config(&mut next, apply, idx + 1);
-            controller.apply(Arc::new(next)).expect("sim config apply");
+            controller
+                .apply(Arc::new(
+                    LoadedConfig::from_config(next).expect("sim config loads"),
+                ))
+                .expect("sim config apply");
         }
         let versions = controller.config_versions().snapshot();
         let mut m = metrics.borrow_mut();
