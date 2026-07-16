@@ -535,11 +535,8 @@ impl Future for AliveAwareWait {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
-    use std::task::{RawWaker, RawWakerVTable, Waker};
-
     use super::*;
-    use crate::runtime::noop_waker;
+    use crate::runtime::{flag_waker, noop_waker};
 
     fn block_on<F: Future>(mut fut: F) -> F::Output {
         let waker = noop_waker();
@@ -556,32 +553,6 @@ mod tests {
             spins += 1;
             assert!(spins < 1_000_000, "block_on made no progress");
         }
-    }
-
-    // A waker that flips an AtomicBool when woken, so we can assert the
-    // event slot actually wakes a stored waker.
-    fn flag_waker(flag: Arc<AtomicBool>) -> Waker {
-        fn clone(p: *const ()) -> RawWaker {
-            let arc = unsafe { Arc::from_raw(p as *const AtomicBool) };
-            let cloned = arc.clone();
-            std::mem::forget(arc);
-            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTABLE)
-        }
-        fn wake(p: *const ()) {
-            let arc = unsafe { Arc::from_raw(p as *const AtomicBool) };
-            arc.store(true, Ordering::SeqCst);
-        }
-        fn wake_by_ref(p: *const ()) {
-            let arc = unsafe { Arc::from_raw(p as *const AtomicBool) };
-            arc.store(true, Ordering::SeqCst);
-            std::mem::forget(arc);
-        }
-        fn drop_fn(p: *const ()) {
-            unsafe { drop(Arc::from_raw(p as *const AtomicBool)) };
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_fn);
-        let raw = RawWaker::new(Arc::into_raw(flag) as *const (), &VTABLE);
-        unsafe { Waker::from_raw(raw) }
     }
 
     #[test]
@@ -634,8 +605,7 @@ mod tests {
     #[test]
     fn push_wakes_stored_waker() {
         let slot = EventSlot::new();
-        let flag = Arc::new(AtomicBool::new(false));
-        let waker = flag_waker(flag.clone());
+        let (waker, flag) = flag_waker();
         let mut cx = Context::from_waker(&waker);
 
         let mut wait = EventWait {

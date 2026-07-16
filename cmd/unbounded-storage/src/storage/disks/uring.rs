@@ -15,7 +15,7 @@
 //!    registered `Fixed` index and disk geometry that resolves the ring
 //!    from the thread-local registry at call time,
 //! 2. install the ring into the registry via
-//!    [`set_current_storage_ring`] so the device (and the engine built
+//!    [`install_current_storage_ring`] so the device (and the engine built
 //!    on it) reach the ring without it being threaded through every
 //!    signature,
 //! 3. drive [`StorageEngine::open`] interleaved with ring progress so
@@ -30,7 +30,7 @@
 //! sets the stop flag and joins. Once shutdown is observed the thread
 //! stops admitting new page ops from the channel, calls
 //! [`StorageEngine::close_mutator`], fails any in-flight or queued page
-//! ops, waits for in-flight ring I/O to drain, clears the thread-local
+//! ops, waits for in-flight ring I/O to drain, restores the thread-local
 //! ring, and drops the ring on its own stack. Not admitting new work
 //! after the mutator is closing is what keeps the join from hanging
 //! (see [`run_core_loop`]).
@@ -56,7 +56,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::config::schema::DiskSpec;
-use crate::ring::{StorageRingConfig, clear_current_storage_ring, set_current_storage_ring};
+use crate::ring::{StorageRingConfig, install_current_storage_ring};
 use crate::runtime::{PinnedRuntime, WorkerSpec, noop_waker};
 use crate::storage::blockdev::{
     BlockDevice, CoreLocalDevice, OpenDisk, UringDevice, provision_file,
@@ -217,7 +217,7 @@ fn run_storage_core(
     // This MUST run on this pinned storage-core thread: the device
     // resolves its ring from the thread-local registry, so installing it
     // anywhere else would strand every off-thread I/O with ENXIO.
-    set_current_storage_ring(ring.clone());
+    let ring_install = install_current_storage_ring(ring.clone());
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -230,19 +230,16 @@ fn run_storage_core(
             Poll::Ready(Ok(eng)) => break Arc::new(eng),
             Poll::Ready(Err(e)) => {
                 let _ = ready_tx.send(Err(format!("engine open: {e}")));
-                clear_current_storage_ring();
                 return;
             }
             Poll::Pending => {}
         }
         if let Err(e) = ring.progress() {
             let _ = ready_tx.send(Err(format!("ring progress during open: {e}")));
-            clear_current_storage_ring();
             return;
         }
         if stop.load(Ordering::Acquire) {
             let _ = ready_tx.send(Err("shutdown requested during open".into()));
-            clear_current_storage_ring();
             return;
         }
         thread::sleep(Duration::from_micros(100));
@@ -275,10 +272,10 @@ fn run_storage_core(
     );
 
     // Phase 6: tear down. Drop the mutator future first so any borrow
-    // of the engine is released, then clear the thread-local ring.
+    // of the engine is released, then restore the thread-local ring.
     drop(mutator_fut);
     drop(service);
-    clear_current_storage_ring();
+    drop(ring_install);
 }
 
 /// The progress surface of a storage ring the core loop drives: push
