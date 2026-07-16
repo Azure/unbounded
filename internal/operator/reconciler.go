@@ -75,9 +75,9 @@ var DefaultNamespace = unbounded.SystemNamespace()
 
 // buildDefaultNamespace is the namespace baked into the embedded component
 // manifests at build time (the render default). retargetNamespace rewrites it to
-// the operator's configured namespace when they differ. It must match the
-// manifest render default and internal/unbounded.systemNamespace.
-const buildDefaultNamespace = "unbounded-system"
+// the operator's configured namespace when they differ. It shares the single
+// build-default source of truth with the install tooling.
+const buildDefaultNamespace = unbounded.DefaultSystemNamespace
 
 type Config struct {
 	// MetalmanImage is the image for the synthesized per-site metalman
