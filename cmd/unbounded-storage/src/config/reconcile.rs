@@ -294,16 +294,15 @@ pub type FrontendReconcileReport = SpecReconcileReport<FrontendSpec>;
 /// Drive `target` toward the backend set described by `desired`,
 /// keyed by component name.
 ///
-/// The semantics mirror [`reconcile_peers`] exactly, specialized to
-/// the string-keyed `BackendSpec`: removals first, then additions; an
+/// The string-keyed registries can construct a replacement before
+/// inserting it, so true removals run first while updates are applied
+/// by adding the new resource over the old one. A
 /// name present in both `current` and `desired` whose spec differs from
-/// `last_applied` is a remove-then-add ("update"); failures are
+/// `last_applied` is an update; failures are
 /// accumulated and never abort the pass; the returned `applied` map is
 /// the set the target now holds and is the caller's input on the next
-/// pass. The failure carry-forward rules match `reconcile_peers`: a
-/// failed update-remove or plain remove preserves the old spec so the
-/// next pass retries, while a failed update-add (remove succeeded)
-/// drops the name so the next pass re-adds via the not-current branch.
+/// pass. A failed removal or update preserves the old applied spec so
+/// the next pass retries without taking the live resource offline.
 pub fn reconcile_backends(
     target: &dyn BackendReconcileTarget,
     desired: &[BackendSpec],
@@ -347,9 +346,8 @@ pub fn reconcile_frontends(
 ///
 /// Factored out because the two specs differ only in their concrete
 /// type, not in the diff algorithm. A name whose desired spec is not
-/// equal to its `last_applied` spec is treated as an update
-/// (remove-then-add). The carry-forward rules are identical to
-/// [`reconcile_peers`].
+/// equal to its `last_applied` spec is replaced by `add` while the old
+/// resource remains installed. Targets must build before insertion.
 ///
 /// Internally this is the remove phase followed immediately by the add
 /// phase with a no-op gate, so its observable behavior is exactly the
@@ -363,14 +361,14 @@ fn reconcile_specs<S: Clone + PartialEq>(
     add: impl Fn(&S) -> Result<(), String>,
     remove: impl Fn(&str) -> Result<(), String>,
 ) -> SpecReconcileReport<S> {
-    let state = reconcile_remove_phase(desired_map, last_applied, list, remove);
+    let state = reconcile_remove_phase(desired_map, last_applied, &HashSet::new(), list, remove);
     reconcile_add_phase(state, add, |_id, _spec| Ok(()))
 }
 
 /// Intermediate state carried from the remove phase into the add phase
 /// of a single string-keyed reconcile pass. Holds everything the add
-/// phase needs to reproduce the original single-pass behavior:
-/// `current`/`to_update`/`removed_ok` plus the in-progress report.
+/// phase needs to complete the pass: current resources, pending updates,
+/// successful true removals, and the in-progress report.
 struct SpecReconcileState<'a, S> {
     desired_map: &'a HashMap<String, S>,
     last_applied: Option<&'a HashMap<String, S>>,
@@ -380,13 +378,13 @@ struct SpecReconcileState<'a, S> {
     report: SpecReconcileReport<S>,
 }
 
-/// Removal half of a string-keyed reconcile pass: compute drift,
-/// remove ids that are no longer desired or that need a remove-then-add
-/// update, and accumulate failures. Mirrors the first half of the old
-/// monolithic `reconcile_specs`.
+/// Removal half of a string-keyed reconcile pass: compute drift, remove
+/// ids that are no longer desired, and accumulate failures. Updated ids
+/// remain live until the add phase has built their replacement.
 fn reconcile_remove_phase<'a, S: Clone + PartialEq>(
     desired_map: &'a HashMap<String, S>,
     last_applied: Option<&'a HashMap<String, S>>,
+    forced_updates: &HashSet<String>,
     list: impl Fn() -> Vec<String>,
     remove: impl Fn(&str) -> Result<(), String>,
 ) -> SpecReconcileState<'a, S> {
@@ -394,7 +392,7 @@ fn reconcile_remove_phase<'a, S: Clone + PartialEq>(
 
     let current: HashSet<String> = list().into_iter().collect();
 
-    let mut to_update: HashSet<String> = HashSet::new();
+    let mut to_update = forced_updates.clone();
     if let Some(prev) = last_applied {
         for (id, new_spec) in desired_map {
             if !current.contains(id) {
@@ -411,22 +409,18 @@ fn reconcile_remove_phase<'a, S: Clone + PartialEq>(
     let mut removed_ok: HashSet<String> = HashSet::new();
     let mut to_remove: Vec<String> = current
         .iter()
-        .filter(|id| !desired_map.contains_key(*id) || to_update.contains(*id))
+        .filter(|id| !desired_map.contains_key(*id))
         .cloned()
         .collect();
     to_remove.sort();
     for id in to_remove {
-        let is_update = to_update.contains(&id);
         match remove(&id) {
             Ok(()) => {
-                if !is_update {
-                    report.removed += 1;
-                }
+                report.removed += 1;
                 removed_ok.insert(id);
             }
             Err(e) => {
-                let op = if is_update { "update-remove" } else { "remove" };
-                report.failures.push((id, format!("{op}: {e}")));
+                report.failures.push((id, format!("remove: {e}")));
             }
         }
     }
@@ -444,9 +438,7 @@ fn reconcile_remove_phase<'a, S: Clone + PartialEq>(
 /// Addition half of a string-keyed reconcile pass. `can_add` gates each
 /// candidate add: `Ok(())` proceeds, `Err(reason)` defers the id
 /// (recorded in `report.deferred`, never added, never counted). The
-/// default no-op gate (`|_, _| Ok(())`) reproduces the original
-/// single-pass behavior. Carry-forward is identical to
-/// [`reconcile_peers`].
+/// default no-op gate (`|_, _| Ok(())`) permits every candidate.
 fn reconcile_add_phase<S: Clone + PartialEq>(
     state: SpecReconcileState<'_, S>,
     add: impl Fn(&S) -> Result<(), String>,
@@ -463,9 +455,7 @@ fn reconcile_add_phase<S: Clone + PartialEq>(
 
     let mut to_add: Vec<String> = desired_map
         .keys()
-        .filter(|id| {
-            !current.contains(*id) || (to_update.contains(*id) && removed_ok.contains(*id))
-        })
+        .filter(|id| !current.contains(*id) || to_update.contains(*id))
         .cloned()
         .collect();
     to_add.sort();
@@ -492,15 +482,11 @@ fn reconcile_add_phase<S: Clone + PartialEq>(
         }
     }
 
-    // Carry-forward identical in spirit to `reconcile_peers`: ids the
-    // target still holds (in `current`, not successfully removed) that
-    // we have not already recorded. A still-desired, non-updated id
-    // records the freshest desired spec; otherwise the old spec is
-    // preserved so the next pass can retry the removal / re-detect the
-    // drift. A deferred id falls out exactly like a failed update-add:
-    // if it was an update its remove already landed (in `removed_ok`)
-    // so it is dropped here, and the next pass re-adds it once the gate
-    // opens.
+    // Carry forward resources still held by the target but not recorded
+    // by a successful add. Stable resources use the desired spec. Failed
+    // or deferred replacements retain the old spec so the next pass
+    // retries without taking the live resource offline. Failed removals
+    // likewise retain the old spec until removal succeeds.
     if let Some(prev) = last_applied {
         for (id, old_spec) in prev {
             if current.contains(id) && !removed_ok.contains(id) && !report.applied.contains_key(id)
@@ -543,9 +529,9 @@ pub struct ResourceReconcileReport {
 ///    referenced backend is present first), and
 /// 4. frontend additions run last and are *gated*: a frontend whose
 ///    referenced backend is not present after steps 2-3 (never defined,
-///    removed, or whose `add` failed) is deferred - recorded in
-///    `frontends.deferred` and left unregistered - rather than added
-///    dangling. The next pass re-adds it once the backend is present.
+///    removed, or whose `add` failed) is deferred and recorded in
+///    `frontends.deferred` rather than replaced with a dangling resource.
+///    An existing frontend remains live; a new frontend remains absent.
 ///
 /// Each half preserves the exact drift/counter/carry-forward semantics
 /// of [`reconcile_backends`] / [`reconcile_frontends`].
@@ -555,6 +541,7 @@ pub fn reconcile_backends_and_frontends(
     desired_backends: &[BackendSpec],
     desired_frontends: &[FrontendSpec],
     frontend_backends: &HashMap<String, String>,
+    forced_frontend_updates: &HashSet<String>,
     last_backends: Option<&HashMap<String, BackendSpec>>,
     last_frontends: Option<&HashMap<String, FrontendSpec>>,
 ) -> ResourceReconcileReport {
@@ -571,6 +558,7 @@ pub fn reconcile_backends_and_frontends(
     let frontend_state = reconcile_remove_phase(
         &desired_frontend_map,
         last_frontends,
+        forced_frontend_updates,
         || frontend_target.list(),
         |id| frontend_target.remove(id),
     );
@@ -579,6 +567,7 @@ pub fn reconcile_backends_and_frontends(
     let backend_state = reconcile_remove_phase(
         &desired_backend_map,
         last_backends,
+        &HashSet::new(),
         || backend_target.list(),
         |id| backend_target.remove(id),
     );
@@ -590,9 +579,8 @@ pub fn reconcile_backends_and_frontends(
         |_id, _spec| Ok(()),
     );
 
-    // 4. Frontend additions, gated on the referenced backend being
-    //    present after steps 2-3.
-    let present_backends: HashSet<String> = backend_target.list().into_iter().collect();
+    // 4. Frontend additions and replacements, gated on the desired
+    //    backend spec having applied successfully in steps 2-3.
     let frontends = reconcile_add_phase(
         frontend_state,
         |spec| frontend_target.add(spec),
@@ -600,7 +588,9 @@ pub fn reconcile_backends_and_frontends(
             let Some(backend_id) = frontend_backends.get(id) else {
                 return Err("deferred: frontend has no resolved backend".to_string());
             };
-            if present_backends.contains(backend_id) {
+            if desired_backend_map.get(backend_id).is_some()
+                && backends.applied.get(backend_id) == desired_backend_map.get(backend_id)
+            {
                 Ok(())
             } else {
                 Err(format!(
@@ -1127,10 +1117,7 @@ mod tests {
         assert_eq!(r.removed, 0);
         assert_eq!(r.updated, 1);
         assert!(r.failures.is_empty());
-        assert_eq!(
-            *t.ops.borrow(),
-            vec![SpecOp::Remove("a".into()), SpecOp::Add("a".into())]
-        );
+        assert_eq!(*t.ops.borrow(), vec![SpecOp::Add("a".into())]);
         assert_eq!(r.applied["a"].url(), Some("new-url"));
     }
 
@@ -1165,17 +1152,17 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_backends_update_remove_failure_preserves_old_spec() {
-        let t = SpecMock::new(&["a"]).with_remove_failure("a");
+    fn reconcile_backends_update_add_failure_preserves_old_spec() {
+        let t = SpecMock::new(&["a"]).with_add_failure("a");
         let mut prev = HashMap::new();
         prev.insert("a".to_string(), backend("a", "old"));
         let desired = vec![backend("a", "new")];
         let r = reconcile_backends(&t, &desired, Some(&prev));
         assert_eq!(r.updated, 0);
         assert_eq!(r.failures.len(), 1);
-        assert!(r.failures[0].1.starts_with("update-remove:"));
+        assert!(r.failures[0].1.starts_with("update-add:"));
         assert_eq!(r.applied["a"].url(), Some("old"));
-        assert_eq!(*t.ops.borrow(), vec![SpecOp::Remove("a".into())]);
+        assert_eq!(*t.ops.borrow(), vec![SpecOp::Add("a".into())]);
     }
 
     #[test]
@@ -1194,10 +1181,7 @@ mod tests {
         let desired2 = vec![frontend("f1", "b2")];
         let r2 = reconcile_frontends(&t2, &desired2, Some(&prev));
         assert_eq!(r2.updated, 1);
-        assert_eq!(
-            *t2.ops.borrow(),
-            vec![SpecOp::Remove("f1".into()), SpecOp::Add("f1".into())]
-        );
+        assert_eq!(*t2.ops.borrow(), vec![SpecOp::Add("f1".into())]);
         assert_eq!(r2.applied["f1"].source, "b2");
 
         // Remove: no longer desired.
@@ -1294,6 +1278,7 @@ mod tests {
             &backends,
             &frontends,
             &frontend_backends,
+            &HashSet::new(),
             None,
             None,
         );
@@ -1330,6 +1315,7 @@ mod tests {
             &[],
             &[],
             &HashMap::new(),
+            &HashSet::new(),
             Some(&last_backends),
             Some(&last_frontends),
         );
@@ -1363,6 +1349,7 @@ mod tests {
             &backends,
             &frontends,
             &frontend_backends,
+            &HashSet::new(),
             None,
             None,
         );
@@ -1383,6 +1370,40 @@ mod tests {
     }
 
     #[test]
+    fn combined_failed_backend_update_preserves_dependent_resources() {
+        let combo = ComboMock::new(&["b"], &["f"]).with_backend_add_failure("b");
+        let mut last_backends = HashMap::new();
+        last_backends.insert("b".to_string(), backend("b", "old"));
+        let mut last_frontends = HashMap::new();
+        last_frontends.insert("f".to_string(), frontend("f", "b"));
+        let backends = vec![backend("b", "new")];
+        let frontends = vec![frontend("f", "b")];
+        let frontend_backends = frontend_backends(&frontends);
+        let forced_frontend_updates = HashSet::from(["f".to_string()]);
+
+        let r = reconcile_backends_and_frontends(
+            &combo,
+            &combo,
+            &backends,
+            &frontends,
+            &frontend_backends,
+            &forced_frontend_updates,
+            Some(&last_backends),
+            Some(&last_frontends),
+        );
+
+        assert_eq!(r.backends.failures.len(), 1);
+        assert_eq!(r.backends.applied["b"].url(), Some("old"));
+        assert_eq!(r.frontends.deferred.len(), 1);
+        assert_eq!(r.frontends.applied["f"].source, "b");
+        assert!(combo.backends.borrow().contains("b"));
+        assert!(combo.frontends.borrow().contains("f"));
+        assert!(combo.log_pos("backend-remove:b").is_none());
+        assert!(combo.log_pos("frontend-remove:f").is_none());
+        assert!(combo.log_pos("frontend-add:f").is_none());
+    }
+
+    #[test]
     fn combined_defers_frontend_when_backend_absent() {
         // Backend referenced by the frontend is not defined at all.
         let combo = ComboMock::new(&[], &[]);
@@ -1394,6 +1415,7 @@ mod tests {
             &[],
             &frontends,
             &frontend_backends,
+            &HashSet::new(),
             None,
             None,
         );
@@ -1419,6 +1441,7 @@ mod tests {
             &backends,
             &frontends,
             &frontend_backends,
+            &HashSet::new(),
             Some(&last_backends),
             None,
         );

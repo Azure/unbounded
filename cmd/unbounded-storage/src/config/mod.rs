@@ -23,7 +23,7 @@ pub use graph::{
     ResolvedFrontendBinding, RuntimeCache, RuntimeGraph, RuntimeMesh, RuntimePeer,
     frontend_backend_map, runtime_disks, runtime_peers, runtime_projection, validate_binding_graph,
 };
-pub use load::ConfigError;
+pub use load::{ConfigError, LoadedConfig};
 pub use reconcile::{
     ApplyReport, BackendReconcileReport, BackendReconcileTarget, FrontendReconcileReport,
     FrontendReconcileTarget, PeerReconcileTarget, ReconcileReport, SpecReconcileReport,

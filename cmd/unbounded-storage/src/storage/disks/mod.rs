@@ -139,8 +139,9 @@ impl<T: DiskTarget> DiskRegistry<T> {
     /// the disk is opened (config / queue_depth / page_size_bytes /
     /// skip_recovery_scan / force_format / bypass_admission /
     /// bypass_index_read / bypass_checksum) are treated as a remove followed by an add.
-    /// Partial failures during opens are reported but do not abort the
-    /// reconcile.
+    /// Partial failures during opens are reported after all desired paths
+    /// have been attempted. Callers publish the realized open subset before
+    /// deciding whether the desired configuration converged.
     pub fn reconcile(&mut self, desired: &[DiskSpec]) -> DiskReport {
         let mut report = DiskReport::default();
 
@@ -549,6 +550,44 @@ mod tests {
         // Failed open must not pollute the channel map.
         assert_eq!(reg.channels_snapshot().len(), 1);
         assert_eq!(reg.channels_snapshot()[0].0, PathBuf::from("/good"));
+    }
+
+    #[test]
+    fn failed_open_is_retried_by_the_same_desired_set() {
+        let (target, state) = MockDiskTarget::new();
+        state.lock().unwrap().fail_on.insert(PathBuf::from("/a"));
+        let mut reg = DiskRegistry::new(target, vec![]);
+        let desired = [spec("/a", None)];
+
+        let failed = reg.reconcile(&desired);
+        assert_eq!(failed.failures.len(), 1);
+        assert!(reg.entries.is_empty());
+
+        state.lock().unwrap().fail_on.clear();
+        let retried = reg.reconcile(&desired);
+        assert_eq!(retried.added, 1);
+        assert!(retried.failures.is_empty());
+        assert_eq!(reg.entries[&PathBuf::from("/a")].spec, desired[0]);
+    }
+
+    #[test]
+    fn failed_drift_replacement_remains_retryable() {
+        let (target, state) = MockDiskTarget::new();
+        let mut reg = DiskRegistry::new(target, vec![]);
+        reg.reconcile(&[spec("/a", Some(8))]);
+
+        state.lock().unwrap().fail_on.insert(PathBuf::from("/a"));
+        let desired = [spec("/a", Some(32))];
+        let failed = reg.reconcile(&desired);
+        assert_eq!(failed.removed, 1);
+        assert_eq!(failed.failures.len(), 1);
+        assert!(!reg.entries.contains_key(&PathBuf::from("/a")));
+
+        state.lock().unwrap().fail_on.clear();
+        let retried = reg.reconcile(&desired);
+        assert_eq!(retried.added, 1);
+        assert!(retried.failures.is_empty());
+        assert_eq!(reg.entries[&PathBuf::from("/a")].spec.queue_depth, Some(32));
     }
 
     /// Records the per-disk `(path, cpu_hint)` decisions so tests can
