@@ -1076,3 +1076,90 @@ func TestManualBootstrapHandler_BuildAgentConfig_AdditionalHostMounts(t *testing
 		{Source: "/var/lib/data", Target: "/data"},
 	}, cfg.AdditionalHostMounts)
 }
+
+// parseAdditionalHostDevice() tests
+// ---------------------------------------------------------------------------
+
+func TestParseAdditionalHostDevice(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		input      string
+		wantDevice string
+		wantErr    string
+	}{
+		{
+			name:       "absolute /dev path",
+			input:      "/dev/uinput",
+			wantDevice: "/dev/uinput",
+		},
+		{
+			name:       "systemd char group specifier",
+			input:      "char-input",
+			wantDevice: "char-input",
+		},
+		{
+			name:       "systemd block group wildcard",
+			input:      "block-*",
+			wantDevice: "block-*",
+		},
+		{
+			name:    "empty value",
+			input:   "",
+			wantErr: "device spec must not be empty",
+		},
+		{
+			name:    "relative path",
+			input:   "dev/uinput",
+			wantErr: "invalid --additional-host-device",
+		},
+		{
+			name:    "path outside /dev",
+			input:   "/etc/config",
+			wantErr: "invalid --additional-host-device",
+		},
+		{
+			name:    "unclean /dev path",
+			input:   "/dev/../dev/uinput",
+			wantErr: "invalid --additional-host-device",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseAdditionalHostDevice(tt.input)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.wantErr)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tt.wantDevice, got)
+		})
+	}
+}
+
+func TestManualBootstrapHandler_BuildAgentConfig_AdditionalHostDevices(t *testing.T) {
+	t.Parallel()
+
+	kubeCli := newFakeCluster(t, "dc1")
+
+	h := &manualBootstrapHandler{
+		siteName:              "dc1",
+		machineName:           "my-node",
+		additionalHostDevices: []string{"/dev/uinput", "char-input"},
+		kubeCli:               kubeCli,
+		kubeConfig:            &rest.Config{Host: "https://my-api-server:6443"},
+		logger:                discardLogger(),
+	}
+
+	cfg, err := h.buildAgentConfig(context.Background())
+	require.NoError(t, err)
+
+	require.Equal(t, []string{"/dev/uinput", "char-input"}, cfg.AdditionalHostDevices)
+}

@@ -13,5 +13,8 @@
       "source": "/etc/hostname",
       "readOnly": true
     }
+  ],
+  "additionalHostDevices": [
+    "/dev/null"
   ]
 }

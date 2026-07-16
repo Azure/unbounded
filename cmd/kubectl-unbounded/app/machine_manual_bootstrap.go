@@ -117,6 +117,10 @@ type manualBootstrapHandler struct {
 	// defaults to source when omitted and ":ro" marks the mount read-only.
 	additionalHostMounts []string
 
+	// additionalHostDevices is a list of extra host device nodes under /dev or
+	// systemd device group specifiers to expose in the nspawn machine.
+	additionalHostDevices []string
+
 	// Download override flags for rootfs binaries installed by the agent.
 	// See `kubectl unbounded machine register --help` for the equivalent
 	// flags on the machina controller path.
@@ -299,6 +303,21 @@ func parseAdditionalHostMount(value string) (config.AdditionalHostMount, error) 
 	return mount, nil
 }
 
+// parseAdditionalHostDevice validates a single --additional-host-device flag value.
+// The accepted format is a clean absolute path under /dev (e.g. /dev/uinput)
+// or a systemd device group specifier (e.g. char-input, block-*).
+func parseAdditionalHostDevice(value string) (string, error) {
+	if value == "" {
+		return "", errors.New("device spec must not be empty")
+	}
+
+	if err := config.ValidateAdditionalHostDevices([]string{value}); err != nil {
+		return "", fmt.Errorf("invalid --additional-host-device %q: %w", value, err)
+	}
+
+	return value, nil
+}
+
 func (h *manualBootstrapHandler) validate() error {
 	if isEmpty(h.siteName) {
 		return errors.New("site name is required")
@@ -453,6 +472,15 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		}
 
 		cfg.AdditionalHostMounts = append(cfg.AdditionalHostMounts, mount)
+	}
+
+	for _, raw := range h.additionalHostDevices {
+		device, err := parseAdditionalHostDevice(raw)
+		if err != nil {
+			return nil, err
+		}
+
+		cfg.AdditionalHostDevices = append(cfg.AdditionalHostDevices, device)
 	}
 
 	return &cfg, nil
@@ -657,6 +685,7 @@ Examples:
 	cmd.Flags().StringVar(&handler.sandboxImage, "sandbox-image", "", "Containerd CRI sandbox image reference")
 	cmd.Flags().StringVar(&handler.offlineArtifactsSource, "offline-artifacts-source", "", "Offline rootfs binary artifact source to embed in agent config (absolute path, file:// URL, or oci:// artifact reference)")
 	cmd.Flags().StringArrayVar(&handler.additionalHostMounts, "additional-host-mount", nil, `Extra host bind-mount for the nspawn machine in "source[:target][:ro]" format (can be repeated). target defaults to source; append :ro for a read-only mount`)
+	cmd.Flags().StringArrayVar(&handler.additionalHostDevices, "additional-host-device", nil, `Extra host device node or systemd device group specifier to expose in the nspawn machine (can be repeated). Accepts absolute /dev/* paths and systemd device group specifiers like char-input or block-*`)
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")
 	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script or cloud-init")
 	cmd.Flags().StringVar(&handler.agentVersion, "agent-version", "", "Pin the unbounded-agent release tag to download on the host (default: latest GitHub release)")
