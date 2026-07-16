@@ -44,7 +44,7 @@ impl NetHandle {
         async move {
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
-                let r = ring.borrow();
+                let r = ring.as_ref();
                 let ud = r.core.alloc_user_data();
                 let sqe = opcode::PollAdd::new(types::Fd(fd), flags)
                     .build()
@@ -72,7 +72,7 @@ impl NetHandle {
         async move {
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot, state) = {
-                let r = ring.borrow();
+                let r = ring.as_ref();
                 let state = RecvMsgState::new_heap(max_len);
                 let msg_ptr = state.borrow().msghdr_ptr();
                 let ud = r.core.alloc_user_data();
@@ -115,7 +115,7 @@ impl NetHandle {
         async move {
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot, state) = {
-                let r = ring.borrow();
+                let r = ring.as_ref();
                 let ptr = r.fixed_ptr(0, page_byte_offset)?;
                 let state = RecvMsgState::new(ptr as *mut u8, len);
                 let msg_ptr = state.borrow().msghdr_ptr();
@@ -143,7 +143,7 @@ impl NetHandle {
             // graceful close_notify from a fatal alert. The op has
             // completed, so the kernel-written bytes are stable.
             let alert_desc = if record_type == TLS_RECORD_TYPE_ALERT && n >= 2 {
-                let ptr = ring.borrow().fixed_ptr(0, page_byte_offset)?;
+                let ptr = ring.fixed_ptr(0, page_byte_offset)?;
                 // SAFETY: `ptr` addresses the registered page the kernel
                 // just decrypted at least two alert bytes into.
                 Some(unsafe { *ptr.add(1) })
