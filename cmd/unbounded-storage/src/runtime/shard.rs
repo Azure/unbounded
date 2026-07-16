@@ -41,9 +41,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::Duration;
+
+use super::flag_waker;
 
 /// Default *idle* sleep between [`ShardLoop`] iterations once nothing
 /// made progress. Matches the shard's shutdown poll interval in
@@ -209,58 +211,6 @@ impl Default for ShardLoop {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Build a `Waker` whose `wake` flips a shared `Arc<AtomicBool>` to
-/// `true`, returning the waker and a clone of that flag. The shard
-/// polls its futures with this waker so a cross-thread
-/// [`ReplySlot::set`](crate::storage::ReplySlot) -> `Waker::wake` on
-/// the storage core is observable on the shard thread (under a noop
-/// waker it would be a silent no-op). `clone`/`wake`/`drop` follow the
-/// standard `Arc` refcount discipline so the flag outlives every waker
-/// clone the futures may stash.
-fn flag_waker() -> (Waker, Arc<AtomicBool>) {
-    let flag = Arc::new(AtomicBool::new(false));
-    let data = Arc::into_raw(flag.clone()) as *const ();
-    // SAFETY: `data` is a freshly leaked `Arc<AtomicBool>` pointer and
-    // `FLAG_VTABLE` upholds the matching clone/wake/drop refcounting.
-    let waker = unsafe { Waker::from_raw(RawWaker::new(data, &FLAG_VTABLE)) };
-    (waker, flag)
-}
-
-static FLAG_VTABLE: RawWakerVTable =
-    RawWakerVTable::new(flag_clone, flag_wake, flag_wake_by_ref, flag_drop);
-
-unsafe fn flag_clone(data: *const ()) -> RawWaker {
-    // SAFETY: `data` points at a live `Arc<AtomicBool>`; bumping the
-    // strong count balances the `drop` the cloned waker will perform.
-    unsafe { Arc::increment_strong_count(data as *const AtomicBool) };
-    RawWaker::new(data, &FLAG_VTABLE)
-}
-
-unsafe fn flag_wake(data: *const ()) {
-    // `wake` consumes the waker: reclaim its strong ref, flip the
-    // flag, then drop the ref as `arc` falls out of scope.
-    // SAFETY: `data` came from `Arc::into_raw` and this consumes that
-    // owned ref exactly once.
-    let arc = unsafe { Arc::from_raw(data as *const AtomicBool) };
-    arc.store(true, Ordering::Release);
-}
-
-unsafe fn flag_wake_by_ref(data: *const ()) {
-    // `wake_by_ref` does not consume the waker: borrow the flag
-    // without taking ownership of the strong ref.
-    // SAFETY: `data` points at a live `Arc<AtomicBool>`; we hand the
-    // reclaimed ref straight back via `into_raw` so the count is
-    // unchanged.
-    let arc = unsafe { Arc::from_raw(data as *const AtomicBool) };
-    arc.store(true, Ordering::Release);
-    let _ = Arc::into_raw(arc);
-}
-
-unsafe fn flag_drop(data: *const ()) {
-    // SAFETY: balances one `clone`/`into_raw` strong ref.
-    unsafe { Arc::decrement_strong_count(data as *const AtomicBool) };
 }
 
 #[cfg(test)]

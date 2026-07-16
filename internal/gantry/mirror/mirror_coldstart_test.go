@@ -31,6 +31,7 @@ type stubColdStart struct {
 	providers []ifaces.Provider
 	err       error
 	calls     int32
+	onResolve func(digest.Digest)
 }
 
 type countingPeerDialer struct {
@@ -82,11 +83,15 @@ func (d *countingPeerDialer) Calls(addr string) int {
 	return d.counts[addr]
 }
 
-func (s *stubColdStart) Resolve(_ context.Context, _ digest.Digest, _ ifaces.OriginRefKind, _, _ string, _ int64) (*mirror.ColdStartResolution, error) {
+func (s *stubColdStart) Resolve(_ context.Context, d digest.Digest, _ ifaces.OriginRefKind, _, _ string, _ int64) (*mirror.ColdStartResolution, error) {
 	atomic.AddInt32(&s.calls, 1)
 
 	if s.err != nil {
 		return nil, s.err
+	}
+
+	if s.onResolve != nil {
+		s.onResolve(d)
 	}
 
 	return &mirror.ColdStartResolution{Providers: s.providers, Outcome: "stub"}, nil
@@ -139,6 +144,66 @@ func TestMirror_ColdStart_EmptyDHTRoutedThroughColdStartHit(t *testing.T) {
 
 	if atomic.LoadInt32(&cs.calls) != 1 {
 		t.Errorf("cold-start invocations = %d, want 1", cs.calls)
+	}
+}
+
+func TestMirror_ColdStart_SelfPullRechecksLocalCacheBeforeSelfFilter(t *testing.T) {
+	body := []byte("served from the completed local cold-start pull")
+	d := digestOf(body)
+	local := fakes.NewCache()
+	peerDialer := newCountingPeerDialer()
+	dht := fakes.NewDHT()
+	originPuller := fakes.NewOriginPuller()
+
+	const (
+		selfNode = ifaces.NodeID("self-node")
+		selfAddr = "self:5001"
+	)
+
+	cs := &stubColdStart{
+		providers: []ifaces.Provider{{NodeID: selfNode, Addr: selfAddr}},
+		onResolve: func(d digest.Digest) {
+			local.Put(d, body)
+		},
+	}
+	cfg := &config.Config{
+		UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: "http://unused"}},
+	}
+	m := mirror.New(cfg, local, originPuller,
+		mirror.WithLiveStreamThrough(),
+		mirror.WithDiscovery(dht, peerDialer),
+		mirror.WithColdStart(cs),
+		mirror.WithSelfNodeID(selfNode),
+	)
+	srv := httptest.NewServer(m.Handler())
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
+
+	got, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %q; want 200", resp.StatusCode, got)
+	}
+
+	if string(got) != string(body) {
+		t.Fatalf("body = %q, want %q", got, body)
+	}
+
+	if calls := atomic.LoadInt32(&cs.calls); calls != 1 {
+		t.Fatalf("cold-start invocations = %d, want 1", calls)
+	}
+
+	if calls := peerDialer.Calls(selfAddr); calls != 0 {
+		t.Fatalf("self peer fetch calls = %d, want 0", calls)
+	}
+
+	if calls := originPuller.PullCount(d); calls != 0 {
+		t.Fatalf("origin pull count = %d, want 0", calls)
 	}
 }
 

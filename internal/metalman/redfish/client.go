@@ -144,7 +144,7 @@ func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*C
 
 	token, location, err := createSession(ctx, httpClient, url, user, pass)
 	if err != nil {
-		slog.Info("Redfish session not available, using basic auth", "url", url, "err", err)
+		slog.InfoContext(ctx, "Redfish session not available, using basic auth", "url", url, "err", err)
 	} else {
 		s.token = token
 		s.location = location
@@ -156,7 +156,7 @@ func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*C
 		return nil, err
 	}
 
-	slog.Info("Redfish dialed BMC", "url", url, "device", id)
+	slog.InfoContext(ctx, "Redfish dialed BMC", "url", url, "device", id)
 
 	return &Client{session: s, deviceID: id}, nil
 }
@@ -186,7 +186,7 @@ func (c *Client) PowerState(ctx context.Context) (PowerState, error) {
 		return "", fmt.Errorf("parsing power state: %w", err)
 	}
 
-	slog.Info("Redfish read power state", "device", c.deviceID, "powerState", result.PowerState)
+	slog.InfoContext(ctx, "Redfish read power state", "device", c.deviceID, "powerState", result.PowerState)
 
 	return result.PowerState, nil
 }
@@ -205,7 +205,7 @@ func (c *Client) Reset(ctx context.Context, resetType ResetType) error {
 		return fmt.Errorf("reset %s failed: %w", resetType, redfishResponseError(http.MethodPost, path, status, data, nil))
 	}
 
-	slog.Info("Redfish reset", "device", c.deviceID, "resetType", resetType)
+	slog.InfoContext(ctx, "Redfish reset", "device", c.deviceID, "resetType", resetType)
 
 	return nil
 }
@@ -247,7 +247,7 @@ func (c *Client) GetBootConfig(ctx context.Context) (BootConfig, error) {
 		}
 	}
 
-	slog.Info("Redfish read boot config", "device", c.deviceID, "target", config.Target, "enabled", config.Enabled, "mode", config.Mode)
+	slog.InfoContext(ctx, "Redfish read boot config", "device", c.deviceID, "target", config.Target, "enabled", config.Enabled, "mode", config.Mode)
 
 	return config, nil
 }
@@ -277,7 +277,7 @@ func (c *Client) SetBootOverride(ctx context.Context, target BootTarget, enabled
 		return redfishResponseError(http.MethodPatch, path, status, data, nil)
 	}
 
-	slog.Info("Redfish set boot override", "device", c.deviceID, "target", target, "enabled", enabled)
+	slog.InfoContext(ctx, "Redfish set boot override", "device", c.deviceID, "target", target, "enabled", enabled)
 
 	return nil
 }
@@ -309,7 +309,7 @@ func (c *Client) SetHTTPBootOverride(ctx context.Context, bootURL string) error 
 		return redfishResponseError(http.MethodPatch, path, status, data, nil)
 	}
 
-	slog.Info("Redfish set HTTP boot override", "device", c.deviceID, "bootURL", bootURL)
+	slog.InfoContext(ctx, "Redfish set HTTP boot override", "device", c.deviceID, "bootURL", bootURL)
 
 	return nil
 }
@@ -341,7 +341,7 @@ func (c *Client) GetBIOSHTTPBootURI(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("parsing BIOS HTTP boot URI: %w", err)
 	}
 
-	slog.Info("Redfish read BIOS HTTP boot URI", "device", c.deviceID, "bootURI", result.Attributes.HTTPBootURI)
+	slog.InfoContext(ctx, "Redfish read BIOS HTTP boot URI", "device", c.deviceID, "bootURI", result.Attributes.HTTPBootURI)
 
 	return result.Attributes.HTTPBootURI, nil
 }
@@ -369,7 +369,7 @@ func (c *Client) SetBIOSHTTPBootURI(ctx context.Context, bootURL string) error {
 		return redfishResponseError(http.MethodPatch, path, status, data, nil)
 	}
 
-	slog.Info("Redfish set BIOS HTTP boot URI", "device", c.deviceID, "bootURL", bootURL)
+	slog.InfoContext(ctx, "Redfish set BIOS HTTP boot URI", "device", c.deviceID, "bootURL", bootURL)
 
 	return nil
 }
@@ -414,7 +414,7 @@ func (c *Client) SetBIOSStaticIPv4(ctx context.Context, config StaticIPv4Config)
 		return redfishResponseError(http.MethodPatch, path, status, data, nil)
 	}
 
-	slog.Info("Redfish set BIOS static IPv4", "device", c.deviceID, "address", config.Address)
+	slog.InfoContext(ctx, "Redfish set BIOS static IPv4", "device", c.deviceID, "address", config.Address)
 
 	return nil
 }
@@ -468,7 +468,7 @@ func (c *Client) SetStaticIPv4(ctx context.Context, config StaticIPv4Config) err
 		return redfishResponseError(http.MethodPatch, path, status, data, nil)
 	}
 
-	slog.Info("Redfish set static IPv4", "device", c.deviceID, "mac", mac, "address", config.Address, "path", path)
+	slog.InfoContext(ctx, "Redfish set static IPv4", "device", c.deviceID, "mac", mac, "address", config.Address, "path", path)
 
 	return nil
 }
@@ -497,7 +497,7 @@ func (c *Client) DisableBootOverride(ctx context.Context) error {
 		return redfishResponseError(http.MethodPatch, path, status, data, nil)
 	}
 
-	slog.Info("Redfish disabled boot override", "device", c.deviceID)
+	slog.InfoContext(ctx, "Redfish disabled boot override", "device", c.deviceID)
 
 	return nil
 }
@@ -705,7 +705,7 @@ func CaptureFingerprint(ctx context.Context, url string) (string, error) {
 
 	fingerprint := formatFingerprint(sha256Sum(resp.TLS.PeerCertificates[0].Raw))
 
-	slog.Info("Redfish captured TLS cert fingerprint", "url", url, "fingerprint", fingerprint)
+	slog.InfoContext(ctx, "Redfish captured TLS cert fingerprint", "url", url, "fingerprint", fingerprint)
 
 	return fingerprint, nil
 }

@@ -441,18 +441,18 @@ impl NetworkRing {
 /// `&'a NetworkRing`, so they are not `'static`. The serving frontend
 /// multiplexes many long-lived per-connection futures the shard loop
 /// polls each tick, so it needs `'static` futures. `NetHandle` owns an
-/// `Rc<RefCell<NetworkRing>>` clone instead of borrowing the ring: each
+/// `Rc<NetworkRing>` clone instead of borrowing the ring: each
 /// method parks on the ring's submission backpressure before submitting,
 /// then returns a future that owns its own ring clone plus the op's
-/// `Rc<Slot>` and re-borrows the ring inside `poll`/`drop`.
+/// `Rc<Slot>`.
 #[derive(Clone)]
 pub struct NetHandle {
-    ring: Rc<RefCell<NetworkRing>>,
+    ring: Rc<NetworkRing>,
 }
 
 impl NetHandle {
     /// Wrap a shared network ring.
-    pub fn new(ring: Rc<RefCell<NetworkRing>>) -> Self {
+    pub fn new(ring: Rc<NetworkRing>) -> Self {
         Self { ring }
     }
 
@@ -462,12 +462,12 @@ impl NetHandle {
     /// called during bring-up before any I/O is in flight (see
     /// [`NetworkRing::register_region_indexed`]).
     pub fn register_peer_region(&self, base: *mut u8, len: usize) -> io::Result<u16> {
-        self.ring.borrow().register_region_indexed(base, len)
+        self.ring.register_region_indexed(base, len)
     }
 
-    /// Shared access to the underlying ring cell, for sibling-module ops
+    /// Shared access to the underlying ring, for sibling-module ops
     /// (see `tls_recv`) that submit on this handle's ring.
-    pub(crate) fn ring_cell(&self) -> &Rc<RefCell<NetworkRing>> {
+    pub(crate) fn ring_cell(&self) -> &Rc<NetworkRing> {
         &self.ring
     }
 
@@ -493,7 +493,7 @@ impl NetHandle {
         async move {
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
-                let r = ring.borrow();
+                let r = ring.as_ref();
                 let ud = r.core.alloc_user_data();
                 let sqe = opcode::Accept::new(
                     types::Fd(listen_fd),
@@ -523,7 +523,7 @@ impl NetHandle {
             let addr = Box::new(addr);
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
-                let r = ring.borrow();
+                let r = ring.as_ref();
                 let ud = r.core.alloc_user_data();
                 let sqe = opcode::Connect::new(types::Fd(fd), addr.as_ptr(), addr.socklen())
                     .build()
@@ -548,7 +548,7 @@ impl NetHandle {
         async move {
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
-                let r = ring.borrow();
+                let r = ring.as_ref();
                 let ptr = buf.as_ptr();
                 let len = buf.len() as u32;
                 let ud = r.core.alloc_user_data();
@@ -576,7 +576,7 @@ impl NetHandle {
             let buf = Rc::new(RefCell::new(vec![0u8; max_len]));
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
-                let r = ring.borrow();
+                let r = ring.as_ref();
                 let ptr = buf.borrow_mut().as_mut_ptr();
                 let len = max_len as u32;
                 let ud = r.core.alloc_user_data();
@@ -614,7 +614,7 @@ impl NetHandle {
             }
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
-                let r = ring.borrow();
+                let r = ring.as_ref();
                 let ptr = r.fixed_ptr(buf_index, page_byte_offset)?;
                 let ud = r.core.alloc_user_data();
                 let sqe = opcode::SendZc::new(types::Fd(fd), ptr, len as u32)
@@ -649,7 +649,7 @@ impl NetHandle {
         async move {
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
-                let r = ring.borrow();
+                let r = ring.as_ref();
                 let ptr = r.fixed_ptr(buf_index, page_byte_offset)?;
                 let ud = r.core.alloc_user_data();
                 let sqe = opcode::SendZc::new(types::Fd(fd), ptr, len as u32)
@@ -680,7 +680,7 @@ impl NetHandle {
         async move {
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
-                let r = ring.borrow();
+                let r = ring.as_ref();
                 let ptr = r.fixed_ptr(buf_index, page_byte_offset)?;
                 let ud = r.core.alloc_user_data();
                 let sqe = opcode::Recv::new(types::Fd(fd), ptr as *mut u8, len as u32)
@@ -706,12 +706,11 @@ impl NetHandle {
 }
 
 /// `'static` op future for the [`NetHandle`] path. Owns an
-/// `Rc<RefCell<NetworkRing>>` clone instead of borrowing the ring, so it
-/// can be stored across shard-loop ticks. The owned slot carries the
-/// completion state; the ring borrow is taken transiently in `poll` (to
-/// pump `progress`) and `drop` (to best-effort cancel).
+/// `Rc<NetworkRing>` clone instead of borrowing the ring, so it can be
+/// stored across shard-loop ticks. The owned slot carries the completion
+/// state.
 pub(crate) struct OwnedNetFut {
-    ring: Rc<RefCell<NetworkRing>>,
+    ring: Rc<NetworkRing>,
     user_data: u64,
     slot: Rc<Slot>,
     /// When `Some(offset)`, this future is a fixed-buffer RECV whose
@@ -730,11 +729,11 @@ pub(crate) struct OwnedNetFut {
 }
 
 pub(crate) struct OwnedSubmitSlot {
-    ring: Rc<RefCell<NetworkRing>>,
+    ring: Rc<NetworkRing>,
 }
 
 impl OwnedSubmitSlot {
-    pub(crate) fn new(ring: Rc<RefCell<NetworkRing>>) -> Self {
+    pub(crate) fn new(ring: Rc<NetworkRing>) -> Self {
         Self { ring }
     }
 }
@@ -743,14 +742,15 @@ impl Future for OwnedSubmitSlot {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let ring = self.ring.borrow();
-        let mut submit = SubmitSlot { core: &ring.core };
+        let mut submit = SubmitSlot {
+            core: &self.ring.core,
+        };
         Pin::new(&mut submit).poll(cx)
     }
 }
 
 impl OwnedNetFut {
-    pub(crate) fn new(ring: Rc<RefCell<NetworkRing>>, user_data: u64, slot: Rc<Slot>) -> Self {
+    pub(crate) fn new(ring: Rc<NetworkRing>, user_data: u64, slot: Rc<Slot>) -> Self {
         Self {
             ring,
             user_data,
@@ -793,7 +793,7 @@ impl Future for OwnedNetFut {
         if this.slot.is_done() {
             return Poll::Ready(this.slot.result());
         }
-        this.ring.borrow().progress();
+        this.ring.progress();
         if this.slot.is_done() {
             return Poll::Ready(this.slot.result());
         }
@@ -805,20 +805,20 @@ impl Future for OwnedNetFut {
 impl Drop for OwnedNetFut {
     fn drop(&mut self) {
         if !self.slot.is_done() {
-            if let Ok(ring) = self.ring.try_borrow() {
-                match self.fixed_recv_offset {
-                    Some(off) => {
-                        ring.core.cancel_fixed_recv(self.user_data, off, &self.slot);
-                    }
-                    None if self.abandon_send_zc => {
-                        ring.core.abandon_send_zc(
-                            self.user_data,
-                            self.send_zc_source_offset,
-                            &self.slot,
-                        );
-                    }
-                    None => ring.core.cancel(self.user_data),
+            match self.fixed_recv_offset {
+                Some(off) => {
+                    self.ring
+                        .core
+                        .cancel_fixed_recv(self.user_data, off, &self.slot);
                 }
+                None if self.abandon_send_zc => {
+                    self.ring.core.abandon_send_zc(
+                        self.user_data,
+                        self.send_zc_source_offset,
+                        &self.slot,
+                    );
+                }
+                None => self.ring.core.cancel(self.user_data),
             }
         }
     }
@@ -1127,7 +1127,7 @@ mod tests {
             return;
         }
 
-        let ring = Rc::new(RefCell::new(ring));
+        let ring = Rc::new(ring);
         let handle = NetHandle::new(Rc::clone(&ring));
 
         let Some((a, b)) = tcp_loopback_pair() else {
@@ -1204,7 +1204,7 @@ mod tests {
             return;
         }
 
-        let ring = Rc::new(RefCell::new(ring));
+        let ring = Rc::new(ring);
         let handle = NetHandle::new(Rc::clone(&ring));
 
         let Some((a, b)) = tcp_loopback_pair() else {
@@ -1231,7 +1231,7 @@ mod tests {
             Poll::Pending => {}
         }
         assert_eq!(
-            ring.borrow().core.in_flight(),
+            ring.core.in_flight(),
             1,
             "the RECV should be outstanding after the first poll",
         );
@@ -1239,7 +1239,7 @@ mod tests {
         // Dropping the parked future must block until the RECV is reaped.
         drop(fut);
         assert_eq!(
-            ring.borrow().core.in_flight(),
+            ring.core.in_flight(),
             0,
             "dropping a draining recv_fixed must reap the in-flight op",
         );
@@ -1300,7 +1300,7 @@ mod tests {
             events: Rc::clone(&events),
         }));
 
-        let ring = Rc::new(RefCell::new(ring));
+        let ring = Rc::new(ring);
         let handle = NetHandle::new(Rc::clone(&ring));
 
         let Some((a, b)) = tcp_loopback_pair() else {
@@ -1325,7 +1325,7 @@ mod tests {
             Poll::Pending => {}
         }
         assert_eq!(
-            ring.borrow().core.in_flight(),
+            ring.core.in_flight(),
             1,
             "the RECV should be outstanding after the first poll",
         );
@@ -1335,7 +1335,7 @@ mod tests {
         // yet reclaimed.
         drop(fut);
         assert_eq!(
-            ring.borrow().core.in_flight(),
+            ring.core.in_flight(),
             1,
             "dropping a quarantined recv_fixed must not block to drain",
         );
@@ -1348,8 +1348,8 @@ mod tests {
         // Pump progress() until the cancelled RECV's CQE is reaped. Only
         // then is the page reclaimed back to the free list.
         let mut spins = 0u32;
-        while ring.borrow().core.in_flight() != 0 {
-            ring.borrow().progress();
+        while ring.core.in_flight() != 0 {
+            ring.progress();
             spins += 1;
             assert!(spins < 5_000_000, "cancelled RECV was never reaped");
         }
@@ -1370,7 +1370,7 @@ mod tests {
     #[test]
     fn handle_send_recv_roundtrip() {
         let ring = match NetworkRing::new(16) {
-            Ok(r) => Rc::new(RefCell::new(r)),
+            Ok(r) => Rc::new(r),
             Err(e) => {
                 eprintln!("handle_send_recv_roundtrip: ring unavailable: {e}; skipping");
                 return;
@@ -1428,7 +1428,7 @@ mod tests {
     #[test]
     fn handle_submission_parks_when_ring_depth_is_full() {
         let ring = match NetworkRing::new(1) {
-            Ok(r) => Rc::new(RefCell::new(r)),
+            Ok(r) => Rc::new(r),
             Err(e) => {
                 eprintln!("handle_backpressure: ring unavailable: {e}; skipping");
                 return;
@@ -1455,7 +1455,7 @@ mod tests {
             Poll::Ready(other) => panic!("first recv unexpectedly completed: {other:?}"),
             Poll::Pending => {}
         }
-        assert_eq!(ring.borrow().core.in_flight(), 1);
+        assert_eq!(ring.core.in_flight(), 1);
 
         let mut second = Box::pin(handle.recv(b, 64));
         match second.as_mut().poll(&mut cx) {
@@ -1463,7 +1463,7 @@ mod tests {
             Poll::Pending => {}
         }
         assert_eq!(
-            ring.borrow().core.in_flight(),
+            ring.core.in_flight(),
             1,
             "parked submitter must not push past ring depth",
         );
@@ -1541,7 +1541,7 @@ mod tests {
             return;
         }
 
-        let ring = Rc::new(RefCell::new(ring));
+        let ring = Rc::new(ring);
         let handle = NetHandle::new(Rc::clone(&ring));
 
         let Some((a, b)) = tcp_loopback_pair() else {
@@ -1592,7 +1592,7 @@ mod tests {
                 return;
             }
         };
-        let ring = Rc::new(RefCell::new(ring));
+        let ring = Rc::new(ring);
         let handle = NetHandle::new(Rc::clone(&ring));
 
         let Some((a, b)) = tcp_loopback_pair() else {
@@ -1637,7 +1637,7 @@ mod tests {
                 return;
             }
         };
-        let ring = Rc::new(RefCell::new(ring));
+        let ring = Rc::new(ring);
         let handle = NetHandle::new(Rc::clone(&ring));
 
         let Some((a, b)) = tcp_loopback_pair() else {

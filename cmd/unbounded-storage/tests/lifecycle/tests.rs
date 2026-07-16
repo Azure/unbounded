@@ -48,6 +48,11 @@ proptest! {
             report.serve_before_phase_b, 0,
             "serving future ran before phase-B peer publication",
         );
+        prop_assert_eq!(
+            report.serve_before_initial_disk_publication,
+            0,
+            "serving future ran before initial disk publication",
+        );
     }
 
     /// Invariant: disk config changes publish coherent directory generations
@@ -138,6 +143,9 @@ fn smoke_config_disk_and_shard_lifecycle() {
     };
     let report: RunReport = run_workload(0x51A7E, w).expect("smoke run");
     assert_eq!(report.phase_b_ready, 2);
-    assert_eq!(report.directory_generation, 1);
+    assert_eq!(report.broadcasts, 3);
+    assert_eq!(report.disk_applies, 1);
+    assert_eq!(report.shard_apply_counts, vec![3, 3]);
+    assert_eq!(report.directory_generation, 2);
     assert_eq!(report.clients_finished, 1);
 }
