@@ -33,6 +33,22 @@ type ensureNSpawnWorkspace struct {
 	goalState *goalstates.RootFS
 }
 
+type NSpawnBind struct {
+	Source   string
+	Target   string
+	ReadOnly bool
+}
+
+type NSpawnDeviceAllow struct {
+	Specifier string
+	Access    string
+}
+
+type NSpawnDeviceTarget struct {
+	Bind  NSpawnBind
+	Allow NSpawnDeviceAllow
+}
+
 // EnsureNSpawnWorkspace returns a task that bootstraps an OCI rootfs into the
 // machine directory (if it is empty or missing) and writes the
 // systemd-nspawn configuration files needed to run a Kubernetes node inside a
@@ -73,10 +89,10 @@ type nspawnTemplateData struct {
 	HostDevicePaths              []string
 	HostDeviceGroupSpecifiers    []string
 	AdditionalHostMounts         []config.AdditionalHostMount
-	NvidiaGPUDevicePaths         []string
+	NvidiaDeviceTargets          []NSpawnDeviceTarget
 	NvidiaLibDirMounts           []goalstates.NvidiaLibDirMount
 	NvidiaI386LibDirMounts       []goalstates.NvidiaLibDirMount
-	NvidiaSMIDir                 string
+	NvidiaBinDir                 string
 	AMDGPUDevicePaths            []string
 	AMDSysFSPaths                []string
 }
@@ -97,11 +113,6 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		return fmt.Errorf("create container image archive mount point: %w", err)
 	}
 
-	nvidiaSMIDir := ""
-	if e.goalState.Nvidia.NvidiaSMIPath != "" {
-		nvidiaSMIDir = filepath.Dir(e.goalState.Nvidia.NvidiaSMIPath)
-	}
-
 	templateData := nspawnTemplateData{
 		MachineName:                  machineName,
 		BPFFSMountPath:               goalstates.BPFFSMountPath(machineName),
@@ -110,10 +121,10 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		HostDevicePaths:              hostDevicePaths,
 		HostDeviceGroupSpecifiers:    hostDeviceGroupSpecifiers,
 		AdditionalHostMounts:         e.goalState.AdditionalHostMounts,
-		NvidiaGPUDevicePaths:         e.goalState.Nvidia.GPUDevicePaths,
+		NvidiaDeviceTargets:          nvidiaNSpawnDeviceTargets(e.goalState.Nvidia.GPUDevicePaths),
 		NvidiaLibDirMounts:           e.goalState.Nvidia.LibDirMounts,
 		NvidiaI386LibDirMounts:       e.goalState.Nvidia.I386LibDirMounts,
-		NvidiaSMIDir:                 nvidiaSMIDir,
+		NvidiaBinDir:                 nvidiaHostBinDir(e.goalState.Nvidia),
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
 		AMDSysFSPaths:                e.goalState.AMD.SysFSPaths,
 	}
@@ -164,6 +175,45 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	}
 
 	return nil
+}
+
+func nvidiaHostBinDir(nvidia goalstates.NvidiaHost) string {
+	for _, path := range []string{nvidia.NvidiaSMIPath, nvidia.NvidiaIMEXPath, nvidia.NvidiaIMEXCtlPath} {
+		if path != "" {
+			return filepath.Dir(path)
+		}
+	}
+
+	return ""
+}
+
+func nvidiaNSpawnDeviceTargets(paths []string) []NSpawnDeviceTarget {
+	targets := make([]NSpawnDeviceTarget, 0, len(paths))
+
+	for _, path := range paths {
+		target := NSpawnDeviceTarget{
+			Bind: NSpawnBind{Source: path},
+			Allow: NSpawnDeviceAllow{
+				Specifier: path,
+				Access:    "rwm",
+			},
+		}
+
+		// The caps paths are directories that must be bind-mounted so dynamic
+		// NVIDIA capability and channel device nodes are visible inside nspawn.
+		// DeviceAllow operates on character device nodes and classes, so use
+		// the kernel device-class names to grant current and future nodes access.
+		switch path {
+		case "/dev/nvidia-caps":
+			target.Allow.Specifier = "char-nvidia-caps"
+		case "/dev/nvidia-caps-imex-channels":
+			target.Allow.Specifier = "char-nvidia-caps-imex-channels"
+		}
+
+		targets = append(targets, target)
+	}
+
+	return targets
 }
 
 func pathsExcluding(paths, excluded []string) []string {

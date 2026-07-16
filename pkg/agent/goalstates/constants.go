@@ -131,7 +131,7 @@ const (
 	// NvidiaHostI386LibDir is the base directory for optional i386 NVIDIA
 	// library bind mounts.
 	NvidiaHostI386LibDir = "/run/host-nvidia-i386"
-	// NvidiaHostBinDir exposes the host directory containing nvidia-smi.
+	// NvidiaHostBinDir exposes the host directory containing NVIDIA helper binaries.
 	NvidiaHostBinDir = "/run/host-nvidia-bin"
 	// NvidiaDriverDir is the driver-root layout used by NVIDIA tooling and
 	// device plugins inside the nspawn machine.

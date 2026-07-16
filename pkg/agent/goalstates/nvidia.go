@@ -40,8 +40,8 @@ import (
 // bind-mount specifications for the nspawn container.
 type NvidiaHost struct {
 	// GPUDevicePaths lists NVIDIA GPU device paths discovered on the host
-	// (e.g. /dev/nvidia0, /dev/nvidiactl, /dev/nvidia-caps/*,
-	// /dev/nvidia-caps-imex-channels/*, /dev/dri/*).
+	// (e.g. /dev/nvidia0, /dev/nvidiactl, /dev/nvidia-caps,
+	// /dev/nvidia-caps-imex-channels, /dev/dri/*).
 	// When non-empty the nspawn configuration will bind-mount these devices
 	// and grant the container cgroup access to them.
 	GPUDevicePaths []string
@@ -73,6 +73,12 @@ type NvidiaHost struct {
 
 	// NvidiaSMIPath is the host path to nvidia-smi, when available.
 	NvidiaSMIPath string
+
+	// NvidiaIMEXPath is the host path to nvidia-imex, when available.
+	NvidiaIMEXPath string
+
+	// NvidiaIMEXCtlPath is the host path to nvidia-imex-ctl, when available.
+	NvidiaIMEXCtlPath string
 
 	// DriverVersion is the active NVIDIA kernel driver version. It is used to
 	// provide versioned library names when a host installation exposes only
@@ -123,14 +129,16 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 	libraries := resolveNVIDIALibraries(archInfo)
 
 	return NvidiaHost{
-		GPUDevicePaths:   devices,
-		ContainerLibDir:  archInfo.libDir,
-		LibMappings:      libraries.libMappings,
-		LibDirMounts:     libraries.libDirMounts,
-		I386LibMappings:  libraries.i386LibMappings,
-		I386LibDirMounts: libraries.i386LibDirMounts,
-		NvidiaSMIPath:    discoverNVIDIASMI(),
-		DriverVersion:    libraries.driverVersion,
+		GPUDevicePaths:    devices,
+		ContainerLibDir:   archInfo.libDir,
+		LibMappings:       libraries.libMappings,
+		LibDirMounts:      libraries.libDirMounts,
+		I386LibMappings:   libraries.i386LibMappings,
+		I386LibDirMounts:  libraries.i386LibDirMounts,
+		NvidiaSMIPath:     discoverNVIDIASMI(),
+		NvidiaIMEXPath:    discoverNVIDIABinary("nvidia-imex"),
+		NvidiaIMEXCtlPath: discoverNVIDIABinary("nvidia-imex-ctl"),
+		DriverVersion:     libraries.driverVersion,
 	}, nil
 }
 
@@ -147,12 +155,11 @@ func resolveNvidiaRuntime() NvidiaRuntime {
 }
 
 const (
-	devDir                  = "/dev"
-	nvidiaCapsDirName       = "nvidia-caps"
-	nvidiaIMEXDirName       = "nvidia-caps-imex-channels"
-	nvidiaIMEXChannelPrefix = "channel"
-	driDir                  = "/dev/dri"
-	nvidiaDevPrefix         = "nvidia"
+	devDir            = "/dev"
+	nvidiaCapsDirName = "nvidia-caps"
+	nvidiaIMEXDirName = "nvidia-caps-imex-channels"
+	driDir            = "/dev/dri"
+	nvidiaDevPrefix   = "nvidia"
 )
 
 // nvidiaArch contains architecture-specific values for NVIDIA library
@@ -188,8 +195,8 @@ var nvidiaArchMap = map[string]nvidiaArch{
 //   - /dev/nvidia-modeset              (modeset interface)
 //   - /dev/nvidia-uvm                  (unified virtual memory)
 //   - /dev/nvidia-uvm-tools            (UVM tools interface)
-//   - /dev/nvidia-caps/*               (capability devices)
-//   - /dev/nvidia-caps-imex-channels/* (IMEX channel devices)
+//   - /dev/nvidia-caps                 (capability devices)
+//   - /dev/nvidia-caps-imex-channels   (IMEX channel devices)
 //   - /dev/dri/card*, /dev/dri/renderD* (DRI render nodes, needed by CDI and
 //     some GPU workloads such as OpenGL/Vulkan)
 //
@@ -221,32 +228,19 @@ func discoverNVIDIADevicesIn(deviceDir string) []string {
 		devices = append(devices, filepath.Join(deviceDir, name))
 	}
 
-	// Collect /dev/nvidia-caps/* entries (e.g. nvidia-cap1, nvidia-cap2).
+	// Bind capability directories so devices created after nspawn starts are
+	// visible inside the machine.
 	capsDir := filepath.Join(deviceDir, nvidiaCapsDirName)
 
-	capsEntries, err := os.ReadDir(capsDir)
-	if err == nil {
-		for _, e := range capsEntries {
-			if e.IsDir() {
-				continue
-			}
-
-			devices = append(devices, filepath.Join(capsDir, e.Name()))
-		}
+	if _, err := os.ReadDir(capsDir); err == nil {
+		devices = append(devices, capsDir)
 	}
 
-	// Collect IMEX channel devices used for multi-node NVLink.
+	// Bind the IMEX channel directory for dynamically allocated channels.
 	imexDir := filepath.Join(deviceDir, nvidiaIMEXDirName)
 
-	imexEntries, err := os.ReadDir(imexDir)
-	if err == nil {
-		for _, e := range imexEntries {
-			if e.IsDir() || !strings.HasPrefix(e.Name(), nvidiaIMEXChannelPrefix) {
-				continue
-			}
-
-			devices = append(devices, filepath.Join(imexDir, e.Name()))
-		}
+	if _, err := os.ReadDir(imexDir); err == nil {
+		devices = append(devices, imexDir)
 	}
 
 	// When NVIDIA devices are present, also collect /dev/dri/* entries.
@@ -360,7 +354,12 @@ func resolveNVIDIALibraries(arch nvidiaArch) nvidiaLibraryResolution {
 }
 
 func discoverNVIDIASMI() string {
-	for _, path := range []string{"/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi"} {
+	return discoverNVIDIABinary("nvidia-smi")
+}
+
+func discoverNVIDIABinary(name string) string {
+	for _, dir := range []string{"/usr/bin", "/usr/local/bin", "/bin"} {
+		path := filepath.Join(dir, name)
 		if info, err := os.Stat(path); err == nil && !info.IsDir() {
 			return path
 		}
