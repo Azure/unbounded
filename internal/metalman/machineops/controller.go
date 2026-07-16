@@ -116,7 +116,8 @@ func shouldReconcile(op *v1alpha3.MachineOperation) bool {
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
+	logger := log.FromContext(ctx).WithValues("machineOperation", req.Name)
+	ctx = log.IntoContext(ctx, logger)
 
 	var op v1alpha3.MachineOperation
 	if err := r.Get(ctx, client.ObjectKey{Name: req.Name}, &op); err != nil {
