@@ -191,8 +191,8 @@ func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
 	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-nvidia-caps rwm")
 	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-nvidia-caps-imex-channels rwm")
-	require.Contains(t, overrideBuf.String(), "DeviceAllow=/dev/nvidia-caps rwm")
-	require.Contains(t, overrideBuf.String(), "DeviceAllow="+channels+" rwm")
+	require.NotContains(t, overrideBuf.String(), "DeviceAllow=/dev/nvidia-caps rwm")
+	require.NotContains(t, overrideBuf.String(), "DeviceAllow="+channels+" rwm")
 }
 
 func TestPathsExcluding(t *testing.T) {
