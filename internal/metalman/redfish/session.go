@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -157,4 +158,6 @@ func (s *bmcSession) close() {
 	}
 
 	resp.Body.Close() //nolint:errcheck // Best-effort close of session delete response.
+
+	slog.Info("Redfish deleted session", "url", s.baseURL)
 }

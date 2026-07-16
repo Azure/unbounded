@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-package controller_test
+package controller
 
 import (
 	"context"
@@ -11,47 +11,56 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/pkg/machineops"
-	"github.com/Azure/unbounded/pkg/machineops/controller"
 )
 
-func TestPublicControllerTypesAreReusable(t *testing.T) {
+func TestValidateProvidersAcceptsUniqueRegistrations(t *testing.T) {
 	t.Parallel()
 
-	provider := testProvider{name: "ExampleProvider"}
-	reconciler := &controller.MachineOperationReconciler{
-		Providers:    []machineops.Provider{provider},
-		SiteName:     "site-a",
-		ProviderName: provider.Name(),
+	provider := newTestProvider(t, "ExampleProvider")
+
+	require.NoError(t, validateProviders([]*machineops.Provider{provider}, provider.Name()))
+}
+
+func TestValidateProvidersRejectsInvalidRegistrations(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t, "ExampleProvider")
+
+	tests := []struct {
+		name      string
+		providers []*machineops.Provider
+		scope     string
+		message   string
+	}{
+		{name: "none", message: "at least one"},
+		{name: "nil", providers: []*machineops.Provider{nil}, message: "nil"},
+		{name: "duplicate", providers: []*machineops.Provider{provider, provider}, message: "more than once"},
+		{name: "scope missing", providers: []*machineops.Provider{provider}, scope: "OtherProvider", message: "not registered"},
 	}
 
-	require.Equal(t, "site-a", reconciler.SiteName)
-	require.Equal(t, provider.Name(), reconciler.ProviderName)
-	require.Len(t, reconciler.Providers, 1)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateProviders(tt.providers, tt.scope)
+			require.ErrorContains(t, err, tt.message)
+		})
+	}
 }
 
-type testProvider struct {
-	name string
-}
+func newTestProvider(t *testing.T, name string) *machineops.Provider {
+	t.Helper()
 
-func (p testProvider) Name() string {
-	return p.name
-}
+	provider, err := machineops.NewProvider(
+		name,
+		machineops.WithImmediateOperation(
+			unboundedv1alpha3.OperationHostPowerOn,
+			func(context.Context, machineops.OperationRequest) (machineops.OperationResult, error) {
+				return machineops.OperationResult{}, nil
+			},
+		),
+	)
+	require.NoError(t, err)
 
-func (testProvider) Supports(unboundedv1alpha3.OperationKind) bool {
-	return true
-}
-
-func (testProvider) Execute(
-	_ context.Context,
-	_ machineops.OperationRequest,
-) (machineops.OperationResult, error) {
-	return machineops.OperationResult{}, nil
-}
-
-func (testProvider) Cleanup(
-	_ context.Context,
-	_ machineops.OperationRequest,
-	_ machineops.OperationResult,
-) error {
-	return nil
+	return provider
 }

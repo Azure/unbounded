@@ -169,6 +169,28 @@ func TestNSpawnConfig_NVIDIADriverRootMounts(t *testing.T) {
 	require.Contains(t, buf.String(), "BindReadOnly=/usr/bin:/run/host-nvidia-bin")
 }
 
+func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
+	t.Parallel()
+
+	const channel = "/dev/nvidia-caps-imex-channels/channel0"
+
+	data := nspawnTemplateData{
+		MachineName:                  "kube1",
+		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
+		NvidiaGPUDevicePaths:         []string{channel},
+	}
+
+	var nspawnBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
+	require.Contains(t, nspawnBuf.String(), "Bind="+channel)
+
+	var overrideBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
+	require.Contains(t, overrideBuf.String(), "DeviceAllow="+channel+" rwm")
+}
+
 func TestPathsExcluding(t *testing.T) {
 	t.Parallel()
 

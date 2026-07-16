@@ -185,10 +185,20 @@ func TestProviderExecuteHostReplaceRequiresUserData(t *testing.T) {
 		return &recordingAzureVMClient{}, nil
 	}}
 
-	require.True(t, provider.Supports(unboundedv1alpha3.OperationHostReplace))
 	_, err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", Operation: unboundedv1alpha3.OperationHostReplace})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "replacement user data is required")
+}
+
+func TestProviderRegistrationDoesNotDeclareHostReplaceReplaySafe(t *testing.T) {
+	t.Parallel()
+
+	provider, err := (&Provider{}).Registration()
+	require.NoError(t, err)
+
+	operation, ok := provider.Operation(unboundedv1alpha3.OperationHostReplace)
+	require.True(t, ok)
+	require.False(t, operation.ReplaySafe())
 }
 
 func TestPrepareReplacementVM(t *testing.T) {

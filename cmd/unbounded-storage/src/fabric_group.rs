@@ -51,8 +51,8 @@ pub struct FabricUnitSpec {
     pub unit_idx: usize,
     pub device_name: String,
     pub provider: Provider,
-    /// Worker the fabric's progress and RPC threads pin to.
-    pub worker_idx: WorkerIdx,
+    /// Workers over which the fabric's progress and RPC threads are spread.
+    pub worker_indices: Vec<WorkerIdx>,
     pub numa: Option<u16>,
     /// Serving-shard indices that share this endpoint.
     pub shards_assigned: Vec<usize>,
@@ -92,9 +92,8 @@ pub struct FabricUnitAddress {
 ///   fabric endpoint on that fixed port; binding one endpoint per shard
 ///   would make every shard past the first collide on the port
 ///   (`fi_endpoint` -> EADDRINUSE) once `serving_cores > 1`.
-/// - verbs: one endpoint per distinct HCA device, pinned to the first
-///   worker of the matching nic-worker group and shared by every shard
-///   assigned that device.
+/// - verbs: one endpoint per distinct HCA device, using all workers in
+///   the matching nic-worker group and shared by every assigned shard.
 pub fn plan_fabric_units(
     serving_shards: &[ServingShard],
     shard_devices: &[Option<String>],
@@ -126,7 +125,7 @@ fn plan_tcp_units(serving_shards: &[ServingShard]) -> FabricPlan {
         unit_idx: 0,
         device_name: "lo".to_string(),
         provider: Provider::Tcp,
-        worker_idx: WorkerIdx(0),
+        worker_indices: vec![WorkerIdx(0)],
         numa: None,
         shards_assigned,
         // One data backing per assigned shard plus the one shared scratch.
@@ -160,13 +159,13 @@ fn plan_verbs_units(
         let device = dev.clone().unwrap_or_else(|| "lo".to_string());
         let unit_idx = *device_to_unit.entry(device.clone()).or_insert_with(|| {
             let idx = units.len();
-            let (worker_idx, numa) =
-                verbs_worker_for_device(&device, serving_count, nic_workers, hca_dev_names);
+            let (worker_indices, numa) =
+                verbs_workers_for_device(&device, serving_count, nic_workers, hca_dev_names);
             units.push(FabricUnitSpec {
                 unit_idx: idx,
                 device_name: device.clone(),
                 provider: Provider::from_device_name(&device),
-                worker_idx,
+                worker_indices,
                 numa,
                 shards_assigned: Vec::new(),
                 expected_mr: 0,
@@ -187,17 +186,17 @@ fn plan_verbs_units(
     }
 }
 
-/// Worker index (and NUMA) a verbs endpoint on `device` pins to: the
-/// first worker of the nic-worker group whose HCA matches `device`. The
+/// Worker indices (and NUMA) available to a verbs endpoint on `device`.
+/// The
 /// runtime lays serving shards out at `0..serving_count` and the
 /// nic-worker groups after them, flattened in order, so a group's base
 /// is `serving_count` plus the worker counts of all earlier groups.
-fn verbs_worker_for_device(
+fn verbs_workers_for_device(
     device: &str,
     serving_count: usize,
     nic_workers: &[NicWorkerGroup],
     hca_dev_names: &[String],
-) -> (WorkerIdx, Option<u16>) {
+) -> (Vec<WorkerIdx>, Option<u16>) {
     let mut flat_base = 0usize;
 
     for group in nic_workers {
@@ -205,7 +204,10 @@ fn verbs_worker_for_device(
             .get(group.hca)
             .is_some_and(|name| name == device);
         if matches && !group.workers.is_empty() {
-            return (WorkerIdx((serving_count + flat_base) as u16), group.numa);
+            let workers = (0..group.workers.len())
+                .map(|offset| WorkerIdx((serving_count + flat_base + offset) as u16))
+                .collect();
+            return (workers, group.numa);
         }
         flat_base += group.workers.len();
     }
@@ -213,7 +215,7 @@ fn verbs_worker_for_device(
     // No matching nic-worker group. Unreachable when `shard_devices`
     // came from `assign_shard_devices` over these same `nic_workers`;
     // fall back to worker 0 so the unit still pins somewhere valid.
-    (WorkerIdx(0), None)
+    (vec![WorkerIdx(0)], None)
 }
 
 /// A shard phase-A publication needed by shared RPC workers.
@@ -464,9 +466,15 @@ fn build_unit(
     peers: &[RuntimePeer],
     self_peer: PeerId,
 ) -> Result<FabricUnit, String> {
-    let worker = spec.worker_idx.0;
+    let worker_idx = spec
+        .worker_indices
+        .first()
+        .copied()
+        .ok_or_else(|| format!("fabric unit {} has no workers", spec.unit_idx))?;
+    let worker = worker_idx.0;
 
-    let mut cfg = fabric::defaults_for(spec.device_name.clone(), runtime.clone(), spec.worker_idx);
+    let mut cfg = fabric::defaults_for(spec.device_name.clone(), runtime.clone(), worker_idx);
+    cfg.worker_indices = spec.worker_indices.clone();
     cfg.provider = spec.provider;
     cfg.listen = true;
     cfg.listen_addr = Some(
@@ -537,7 +545,7 @@ fn build_unit(
         page_size,
         shards_assigned: spec.shards_assigned.clone(),
         cache_directories: cache_directories.clone(),
-        worker_idx: spec.worker_idx,
+        worker_idx,
         device_name: spec.device_name.clone(),
         rdma: spec.provider == Provider::Verbs,
         self_addr,
@@ -666,7 +674,7 @@ mod tests {
         let unit = &plan.units[0];
         assert_eq!(unit.device_name, "lo");
         assert_eq!(unit.provider, Provider::Tcp);
-        assert_eq!(unit.worker_idx, WorkerIdx(0));
+        assert_eq!(unit.worker_indices, vec![WorkerIdx(0)]);
         // No NUMA affinity, so shards across nodes can register against it.
         assert_eq!(unit.numa, None);
         assert_eq!(unit.shards_assigned, vec![0, 1, 2]);
@@ -709,7 +717,7 @@ mod tests {
         let u0 = &plan.units[0];
         assert_eq!(u0.device_name, "mlx5_0");
         assert_eq!(u0.provider, Provider::Verbs);
-        assert_eq!(u0.worker_idx, WorkerIdx(4)); // serving_count(4) + base(0)
+        assert_eq!(u0.worker_indices, vec![WorkerIdx(4), WorkerIdx(5)]);
         assert_eq!(u0.numa, Some(0));
         assert_eq!(u0.shards_assigned, vec![0, 2]);
         assert_eq!(u0.expected_mr, 3); // 2 shards + 1 scratch
@@ -717,7 +725,7 @@ mod tests {
         let u1 = &plan.units[1];
         assert_eq!(u1.device_name, "mlx5_1");
         assert_eq!(u1.provider, Provider::Verbs);
-        assert_eq!(u1.worker_idx, WorkerIdx(6)); // serving_count(4) + base(2)
+        assert_eq!(u1.worker_indices, vec![WorkerIdx(6)]);
         assert_eq!(u1.numa, Some(1));
         assert_eq!(u1.shards_assigned, vec![1, 3]);
         assert_eq!(u1.expected_mr, 3);
@@ -734,7 +742,10 @@ mod tests {
 
         assert_eq!(plan.units.len(), 1);
         assert_eq!(plan.shard_to_unit, vec![0, 0]);
-        assert_eq!(plan.units[0].worker_idx, WorkerIdx(2)); // serving_count(2) + base(0)
+        assert_eq!(
+            plan.units[0].worker_indices,
+            vec![WorkerIdx(2), WorkerIdx(3), WorkerIdx(4), WorkerIdx(5)]
+        );
         assert_eq!(plan.units[0].shards_assigned, vec![0, 1]);
         assert_eq!(plan.units[0].expected_mr, 3); // 2 shards + 1 scratch
     }

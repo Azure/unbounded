@@ -100,7 +100,16 @@ ID convention.
 | `providerID` | string | For external operations | -- | Provider-specific resource ID such as `azure:///subscriptions/.../virtualMachines/name` or `oci://ocid1.instance...`. |
 
 Machine operation credentials are selected by the Machine site label. Providers that support OIDC/workload identity use `WorkloadIdentity`; providers or sites that need provider-specific credential material use `ExternalPlugin` with a referenced Secret.
-Custom provider controllers can implement `pkg/machineops.Provider` and reuse `pkg/machineops/controller.MachineOperationReconciler` with `SiteName` and `ProviderName` set for their deployment.
+Custom Go controllers register the operations they support with
+`pkg/machineops.NewProvider`. Each operation selects either an immediate
+callback or long-running begin and poll callbacks, plus optional replay,
+replacement bootstrap, and cleanup behavior. The controller is installed with
+`pkg/machineops/controller.AddToManager`; provider code does not reconcile
+`MachineOperation` status directly. Long-running begin callbacks must be
+idempotent for `OperationRequest.OperationUID` because the controller may call
+them again until their operation handle has been persisted. Provider requests
+use the current `Machine.spec.providerID`, and host operations targeting the
+same Machine are serialized.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -152,7 +161,7 @@ spec:
 | `status.message` | string | No | Human-readable status message. |
 | `status.startedAt` | time | No | Operation start timestamp. |
 | `status.completedAt` | time | No | Terminal phase timestamp. |
-| `status.targets` | []TargetStatus | No | Per-Machine target status snapshot used by metalman host operations. |
+| `status.targets` | []TargetStatus | No | Per-Machine target status snapshot used by host operation controllers. |
 | `status.conditions` | []Condition | No | Operation conditions. `Completed` tracks terminal state. `BootLoaderDownloaded=True` is latched by metalman when a target first downloads the initial PXE boot loader, usually over TFTP. `BootImageWritten` starts as `Unknown` for metalman `HostReplace`, transitions to `False` when the PXE installer requests `disk.img.gz`, and transitions to `True` when the existing `/pxe/disable` completion signal is received. `CloudInitDone` starts as `Unknown`, transitions to `False` when first-boot cloud-init starts, and transitions to `True` on final cloud-init success or `False` with reason `Failed` and a summarized error when cloud-init reports a failure. |
 
 `AgentUpgrade` is handled by the in-host agent and requires `spec.parameters.downloadURL`. The URL must point to an `unbounded-agent` release tarball; the agent stages it as the inactive blue/green daemon binary, records the previous binary as last known good, and restarts `unbounded-agent-daemon.service`. If systemd cannot keep the upgraded daemon running, `unbounded-agent-daemon-recovery.service` switches the daemon back to the last known good binary.
@@ -189,8 +198,11 @@ target one Machine with `spec.machineRef` or a site-scoped set of Machines with
 `spec.machineSelector`. Selector-based bare-metal host operations must select a
 single metalman site with `unbounded-cloud.io/site=<site>`.
 
-For metalman operations, `status.targets[]` is snapshotted when execution starts
-and remains authoritative even if labels later change. Each entry includes:
+For host operations, `status.targets[]` is snapshotted when execution starts
+and remains authoritative even if labels later change. Metalman records its
+state-machine progress directly in each target. Resumable external providers
+also store the provider operation handle on the target so polling can continue
+after a controller restart. Each entry includes:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -203,6 +215,7 @@ and remains authoritative even if labels later change. Each entry includes:
 | `observedGeneration` | int64 | Machine generation acted on. |
 | `attempts` | int32 | External action attempts for retryable Redfish operations. |
 | `lastAttemptAt` | time | Most recent external action attempt timestamp. |
+| `providerOperation` | ProviderOperationStatus | Resumable external operation metadata, including provider, operation ID, and an opaque non-secret resume token. |
 
 ### status
 

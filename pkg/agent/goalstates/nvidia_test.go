@@ -11,6 +11,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestDiscoverNVIDIADevicesIncludesIMEXChannels(t *testing.T) {
+	t.Parallel()
+
+	deviceDir := t.TempDir()
+	imexDir := filepath.Join(deviceDir, nvidiaIMEXDirName)
+	channel := filepath.Join(imexDir, "channel0")
+	nonChannel := filepath.Join(imexDir, "not-a-channel")
+	require.NoError(t, os.MkdirAll(imexDir, 0o755))
+	require.NoError(t, os.WriteFile(channel, nil, 0o644))
+	require.NoError(t, os.WriteFile(nonChannel, nil, 0o644))
+
+	devices := discoverNVIDIADevicesIn(deviceDir)
+	require.Contains(t, devices, channel)
+	require.NotContains(t, devices, nonChannel)
+}
+
 func TestParseNVIDIALibraries(t *testing.T) {
 	ldconfigOutput := []byte(`	linux-vdso.so.1 (LINUX_VDSO) => linux-vdso.so.1
 	libcuda.so.1 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libcuda.so.1
