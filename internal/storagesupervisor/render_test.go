@@ -137,7 +137,7 @@ startup:
       addr: "0.0.0.0:0"
     max_inflight: 1024
   topology:
-    serving_cores: 0
+    serving_cores: 8
     nic_workers: 4
   metrics:
     addr: ""
@@ -153,7 +153,7 @@ startup:
 	assert.NotNil(t, cfg.GetStartup().GetFabric().MaxInflight)
 	assert.Equal(t, uint32(1024), cfg.GetStartup().GetFabric().GetMaxInflight())
 	assert.NotNil(t, cfg.GetStartup().GetTopology().ServingCores)
-	assert.Equal(t, uint64(0), cfg.GetStartup().GetTopology().GetServingCores())
+	assert.Equal(t, uint64(8), cfg.GetStartup().GetTopology().GetServingCores())
 	assert.NotNil(t, cfg.GetStartup().GetTopology().NicWorkers)
 	assert.Equal(t, uint64(4), cfg.GetStartup().GetTopology().GetNicWorkers())
 	assert.Empty(t, cfg.GetStartup().GetMetrics().GetAddr())

@@ -984,7 +984,6 @@ mod tests {
     use crate::frontend::range::StripeSlice;
     use crate::http::{request_is_bodyless, request_wants_keep_alive};
     use crate::storage::disks::CacheDirectorySet;
-    use std::cell::RefCell;
 
     fn spec(id: &str, addr: &str) -> FrontendSpec {
         FrontendSpec {
@@ -1356,7 +1355,7 @@ mod tests {
     fn driver_idle_progress_returns_false_without_clients() {
         // Needs a real socket ring; skip gracefully when unavailable.
         let ring = match crate::ring::NetworkRing::new(16) {
-            Ok(r) => Rc::new(RefCell::new(r)),
+            Ok(r) => Rc::new(r),
             Err(e) => {
                 eprintln!("driver_idle_progress: ring unavailable: {e}; skipping");
                 return;

@@ -600,7 +600,7 @@ fn run_shard(
     // register while `backing` is still owned, before `Pool::new` moves
     // it.
     let socket = match NetworkRing::new(256) {
-        Ok(s) => Rc::new(RefCell::new(s)),
+        Ok(s) => Rc::new(s),
         Err(e) => {
             let _ = tx.send(ShardReady::Failed(format!(
                 "worker={}: NetworkRing::new: {e}",
@@ -609,7 +609,7 @@ fn run_shard(
             return;
         }
     };
-    if let Err(e) = socket.borrow().register_backing(&backing) {
+    if let Err(e) = socket.register_backing(&backing) {
         let _ = tx.send(ShardReady::Failed(format!(
             "worker={}: socket register_backing: {e}",
             widx.0,
@@ -742,10 +742,7 @@ fn run_shard(
     // rings receive into their own scratch backing and keep the blocking
     // drain fallback. Installed before serving begins so every cancelled
     // RECV is covered.
-    unbounded_storage::backend::install_recv_quarantine(
-        &socket.borrow(),
-        pool.recv_quarantine_handle(),
-    );
+    unbounded_storage::backend::install_recv_quarantine(&socket, pool.recv_quarantine_handle());
 
     // The RPC server that serves peer cache-hits and forwards Chord hops
     // is brought up and owned by the `FabricGroup` (shared across every
@@ -758,12 +755,7 @@ fn run_shard(
     let mut shard_loop = ShardLoop::new();
     {
         let socket = socket.clone();
-        // `progress()` takes `&self`, so this must be a *shared* borrow:
-        // the origin backend holds `socket.borrow()` across its recv/send
-        // awaits (see `backend::http`), so a `borrow_mut()` here would hit
-        // a `BorrowMutError` panic whenever a cache-miss fetch is in
-        // flight across a shard tick. Shared borrows coexist.
-        shard_loop.add_tick_hook(move || socket.borrow().progress());
+        shard_loop.add_tick_hook(move || socket.progress());
     }
 
     // Cross-shard fan-out channel. This shard publishes the sender half
@@ -816,19 +808,17 @@ fn run_shard(
         if peer.shard_index == own_shard_index {
             continue;
         }
-        let buf_index = match socket
-            .borrow()
-            .register_region_indexed(peer.backing_base as *mut u8, peer.backing_len)
-        {
-            Ok(idx) => idx,
-            Err(e) => {
-                phaseb_guard.report_failed(format!(
-                    "worker={}: register peer shard {} backing: {e}",
-                    widx.0, peer.shard_index,
-                ));
-                return;
-            }
-        };
+        let buf_index =
+            match socket.register_region_indexed(peer.backing_base as *mut u8, peer.backing_len) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    phaseb_guard.report_failed(format!(
+                        "worker={}: register peer shard {} backing: {e}",
+                        widx.0, peer.shard_index,
+                    ));
+                    return;
+                }
+            };
         routed[peer.shard_index] = Some(FanoutPeer {
             channel: peer.channel.clone(),
             buf_index,

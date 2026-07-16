@@ -28,14 +28,18 @@ func TestReportConditionTransitions(t *testing.T) {
 		reportConditionTransitions([]metav1.Condition{cond}, seen)
 		reportConditionTransitions([]metav1.Condition{cond}, seen)
 
+		cond.Message = "Machine machine-1 is still running first-boot cloud-init"
+		reportConditionTransitions([]metav1.Condition{cond}, seen)
+
 		cond.Status = metav1.ConditionTrue
 		cond.Reason = "Succeeded"
 		cond.Message = "Machine machine-1 completed first-boot cloud-init successfully"
 		reportConditionTransitions([]metav1.Condition{cond}, seen)
 	})
 
-	require.Equal(t, 1, strings.Count(out, "Condition CloudInitDone: False/Running"))
-	require.Contains(t, out, "Condition CloudInitDone: True/Succeeded - Machine machine-1 completed first-boot cloud-init successfully")
+	require.Equal(t, 1, strings.Count(out, "Running first-boot cloud-init"))
+	require.Contains(t, out, "Cloud-init complete")
+	require.NotContains(t, out, "Condition CloudInitDone")
 }
 
 func TestReportTargetTransitions(t *testing.T) {
@@ -51,13 +55,16 @@ func TestReportTargetTransitions(t *testing.T) {
 		reportTargetTransitions([]v1alpha3.MachineOperationTargetStatus{target}, seen)
 		reportTargetTransitions([]v1alpha3.MachineOperationTargetStatus{target}, seen)
 
+		target.Message = "still waiting for PXE repave"
+		reportTargetTransitions([]v1alpha3.MachineOperationTargetStatus{target}, seen)
+
 		target.Stage = v1alpha3.OperationStageWaitingNode
 		target.Message = "waiting for Node machine-1 to exist"
 		reportTargetTransitions([]v1alpha3.MachineOperationTargetStatus{target}, seen)
 	})
 
-	require.Equal(t, 1, strings.Count(out, "Target machine-1: InProgress/WaitingRepave"))
-	require.Contains(t, out, "Target machine-1: InProgress/WaitingNode - waiting for Node machine-1 to exist")
+	require.Equal(t, 1, strings.Count(out, "Booting PXE installer"))
+	require.Contains(t, out, "Waiting for node to join cluster")
 }
 
 func captureStdout(t *testing.T, fn func()) string {

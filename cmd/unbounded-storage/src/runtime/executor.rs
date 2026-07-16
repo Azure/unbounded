@@ -37,6 +37,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
@@ -53,6 +54,29 @@ pub fn noop_waker() -> Waker {
     // no-ops, so the waker carries no state; the data pointer is never
     // dereferenced.
     unsafe { Waker::from_raw(raw()) }
+}
+
+struct FlagWaker {
+    flag: Arc<AtomicBool>,
+}
+
+impl Wake for FlagWaker {
+    fn wake(self: Arc<Self>) {
+        self.flag.store(true, Ordering::Release);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.flag.store(true, Ordering::Release);
+    }
+}
+
+/// A [`Waker`] whose wake methods set a shared flag to `true`.
+pub(crate) fn flag_waker() -> (Waker, Arc<AtomicBool>) {
+    let flag = Arc::new(AtomicBool::new(false));
+    let waker = Waker::from(Arc::new(FlagWaker {
+        flag: Arc::clone(&flag),
+    }));
+    (waker, flag)
 }
 
 /// Drive `fut` to completion on the current thread with a [`noop_waker`],
