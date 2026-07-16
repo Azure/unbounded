@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
@@ -27,6 +28,7 @@ func TestNewProviderRegistersMixedOperationStrategies(t *testing.T) {
 
 	provider, err := NewProvider(
 		"ExampleCloud",
+		WithProviderMachineKind(schema.GroupKind{Group: "infrastructure.example.io", Kind: "ExampleMachine"}),
 		WithImmediateOperation(
 			unboundedv1alpha3.OperationHostReplace,
 			execute,
@@ -41,6 +43,7 @@ func TestNewProviderRegistersMixedOperationStrategies(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Equal(t, "ExampleCloud", provider.Name())
+	require.Equal(t, schema.GroupKind{Group: "infrastructure.example.io", Kind: "ExampleMachine"}, mustProviderMachineKind(t, provider))
 
 	immediate, ok := provider.Operation(unboundedv1alpha3.OperationHostReplace)
 	require.True(t, ok)
@@ -76,6 +79,28 @@ func TestNewProviderRejectsInvalidRegistrations(t *testing.T) {
 		{name: "no operations", make: func() (*Provider, error) {
 			return NewProvider("ExampleCloud")
 		}, message: "operation"},
+		{name: "empty provider Machine group", make: func() (*Provider, error) {
+			return NewProvider(
+				"ExampleCloud",
+				WithProviderMachineKind(schema.GroupKind{Kind: "ExampleMachine"}),
+				WithImmediateOperation(unboundedv1alpha3.OperationHostPowerOn, execute),
+			)
+		}, message: "API group"},
+		{name: "empty provider Machine kind", make: func() (*Provider, error) {
+			return NewProvider(
+				"ExampleCloud",
+				WithProviderMachineKind(schema.GroupKind{Group: "infrastructure.example.io"}),
+				WithImmediateOperation(unboundedv1alpha3.OperationHostPowerOn, execute),
+			)
+		}, message: "kind"},
+		{name: "duplicate provider Machine kind", make: func() (*Provider, error) {
+			return NewProvider(
+				"ExampleCloud",
+				WithProviderMachineKind(schema.GroupKind{Group: "infrastructure.example.io", Kind: "ExampleMachine"}),
+				WithProviderMachineKind(schema.GroupKind{Group: "infrastructure.example.io", Kind: "OtherMachine"}),
+				WithImmediateOperation(unboundedv1alpha3.OperationHostPowerOn, execute),
+			)
+		}, message: "already registered"},
 		{name: "duplicate operation", make: func() (*Provider, error) {
 			return NewProvider(
 				"ExampleCloud",
@@ -128,4 +153,13 @@ func TestNewProviderRejectsInvalidRegistrations(t *testing.T) {
 			require.ErrorContains(t, err, tt.message)
 		})
 	}
+}
+
+func mustProviderMachineKind(t *testing.T, provider *Provider) schema.GroupKind {
+	t.Helper()
+
+	groupKind, ok := provider.ProviderMachineKind()
+	require.True(t, ok)
+
+	return groupKind
 }

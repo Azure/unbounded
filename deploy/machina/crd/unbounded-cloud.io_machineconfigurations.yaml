@@ -147,6 +147,15 @@ spec:
                     required:
                     - image
                     type: object
+                  host:
+                    description: Host contains provider-neutral desired host settings.
+                    properties:
+                      image:
+                        description: |-
+                          Image is an opaque provider-interpreted image identifier. If omitted,
+                          HostReplace preserves the host's current image.
+                        type: string
+                    type: object
                   kubernetes:
                     description: |-
                       Kubernetes contains Kubernetes-specific configuration such as

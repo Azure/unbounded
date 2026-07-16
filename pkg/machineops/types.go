@@ -15,14 +15,18 @@ import (
 
 // OperationRequest is the generic provider-facing view of a MachineOperation.
 type OperationRequest struct {
-	MachineName     string
-	OperationName   string
-	OperationUID    types.UID
-	ProviderID      string
-	Operation       unboundedv1alpha3.OperationKind
-	Parameters      map[string]string
-	ReplaceUserData string
-	Auth            *OperationAuth
+	MachineName       string
+	MachineUID        types.UID
+	MachineGeneration int64
+	OperationName     string
+	OperationUID      types.UID
+	ProviderRef       *unboundedv1alpha3.ProviderMachineSnapshot
+	ProviderID        string
+	HostImage         string
+	Operation         unboundedv1alpha3.OperationKind
+	Parameters        map[string]string
+	ReplaceUserData   string
+	Auth              *OperationAuth
 }
 
 // OperationAuth is the provider-facing credential material resolved for an

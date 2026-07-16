@@ -19,10 +19,12 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	infrastructurev1alpha1 "github.com/Azure/unbounded/api/infrastructure/v1alpha1"
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/machineops/providers/azurevm"
 	"github.com/Azure/unbounded/internal/machineops/providers/ociinstance"
@@ -92,11 +94,6 @@ func run(ctx context.Context, cfg config) error {
 		return errors.New(errSiteProviderPair)
 	}
 
-	providers, err := configuredProviders(cfg.providerName)
-	if err != nil {
-		return err
-	}
-
 	restConfig := ctrl.GetConfigOrDie()
 	scheme := runtimeScheme()
 
@@ -111,6 +108,11 @@ func run(ctx context.Context, cfg config) error {
 	})
 	if err != nil {
 		return fmt.Errorf("create manager: %w", err)
+	}
+
+	providers, err := configuredProvidersWithReader(cfg.providerName, mgr.GetAPIReader())
+	if err != nil {
+		return err
 	}
 
 	if err := machineopscontroller.AddToManager(mgr, providers, machineopscontroller.Options{
@@ -141,8 +143,14 @@ func run(ctx context.Context, cfg config) error {
 }
 
 func configuredProviders(providerName string) ([]*machineops.Provider, error) {
+	return configuredProvidersWithReader(providerName, nil)
+}
+
+func configuredProvidersWithReader(providerName string, kubeClient client.Reader) ([]*machineops.Provider, error) {
 	factories := map[string]func() (*machineops.Provider, error){
-		unboundedv1alpha3.ExternalProviderAzureVM:     func() (*machineops.Provider, error) { return (&azurevm.Provider{}).Registration() },
+		unboundedv1alpha3.ExternalProviderAzureVM: func() (*machineops.Provider, error) {
+			return (&azurevm.Provider{KubeClient: kubeClient}).Registration()
+		},
 		unboundedv1alpha3.ExternalProviderOCIInstance: func() (*machineops.Provider, error) { return (&ociinstance.Provider{}).Registration() },
 	}
 
@@ -216,6 +224,7 @@ func safeNamePart(value string) string {
 func runtimeScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(infrastructurev1alpha1.AddToScheme(scheme))
 	utilruntime.Must(unboundedv1alpha3.AddToScheme(scheme))
 
 	return scheme

@@ -241,6 +241,17 @@ spec:
                 required:
                 - name
                 type: object
+              host:
+                description: |-
+                  Host contains provider-neutral desired host settings. Provider
+                  controllers interpret these values for their infrastructure.
+                properties:
+                  image:
+                    description: |-
+                      Image is an opaque provider-interpreted image identifier. If omitted,
+                      HostReplace preserves the host's current image.
+                    type: string
+                type: object
               kubernetes:
                 description: Kubernetes contains Kubernetes-specific configuration.
                 properties:
@@ -299,7 +310,35 @@ spec:
                   ProviderID identifies the underlying infrastructure resource for this
                   machine, using a Kubernetes-style provider ID such as
                   azure:///subscriptions/.../virtualMachines/name or oci://ocid1.instance...
+
+                  ProviderID is deprecated in favor of ProviderRef and remains available
+                  during the provider resource migration window.
                 type: string
+              providerRef:
+                description: |-
+                  ProviderRef identifies the provider-owned Machine resource containing
+                  provider-specific state for this Machine. Once set, the reference is
+                  immutable. Provider controllers own the referenced resource's schema.
+                properties:
+                  apiGroup:
+                    description: APIGroup is the API group of the provider-owned Machine
+                      resource.
+                    minLength: 1
+                    type: string
+                  kind:
+                    description: Kind is the kind of the provider-owned Machine resource.
+                    minLength: 1
+                    type: string
+                  name:
+                    description: Name is the name of the cluster-scoped provider-owned
+                      Machine resource.
+                    minLength: 1
+                    type: string
+                required:
+                - apiGroup
+                - kind
+                - name
+                type: object
               pxe:
                 description: PXE contains PXE boot configuration for the machine.
                 properties:
@@ -555,6 +594,10 @@ spec:
                 - privateKeyRef
                 type: object
             type: object
+            x-kubernetes-validations:
+            - message: providerRef is immutable once set
+              rule: '!has(oldSelf.providerRef) || (has(self.providerRef) && self.providerRef
+                == oldSelf.providerRef)'
           status:
             description: MachineStatus defines the observed state of a Machine.
             properties:

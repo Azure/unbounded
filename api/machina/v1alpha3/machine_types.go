@@ -110,6 +110,7 @@ const (
 )
 
 // MachineSpec defines the desired state of a Machine.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.providerRef) || (has(self.providerRef) && self.providerRef == oldSelf.providerRef)",message="providerRef is immutable once set"
 type MachineSpec struct {
 	// SSH contains the SSH connection and credential details for the
 	// machine.
@@ -133,11 +134,25 @@ type MachineSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Provider string `json:"provider,omitempty"`
 
+	// ProviderRef identifies the provider-owned Machine resource containing
+	// provider-specific state for this Machine. Once set, the reference is
+	// immutable. Provider controllers own the referenced resource's schema.
+	// +optional
+	ProviderRef *ProviderMachineReference `json:"providerRef,omitempty"`
+
 	// ProviderID identifies the underlying infrastructure resource for this
 	// machine, using a Kubernetes-style provider ID such as
 	// azure:///subscriptions/.../virtualMachines/name or oci://ocid1.instance...
+	//
+	// ProviderID is deprecated in favor of ProviderRef and remains available
+	// during the provider resource migration window.
 	// +optional
 	ProviderID string `json:"providerID,omitempty"`
+
+	// Host contains provider-neutral desired host settings. Provider
+	// controllers interpret these values for their infrastructure.
+	// +optional
+	Host *HostSpec `json:"host,omitempty"`
 
 	// ConfigurationRef references a MachineConfiguration (and
 	// optionally a specific version) that defines the configuration
@@ -147,6 +162,34 @@ type MachineSpec struct {
 	// controller.
 	// +optional
 	ConfigurationRef *MachineConfigurationRef `json:"configurationRef,omitempty"`
+}
+
+// ProviderMachineReference identifies a cluster-scoped provider-owned Machine
+// resource. API version is intentionally omitted so providers can evolve the
+// served versions of their CRDs without rewriting every Machine reference.
+type ProviderMachineReference struct {
+	// APIGroup is the API group of the provider-owned Machine resource.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	APIGroup string `json:"apiGroup"`
+
+	// Kind is the kind of the provider-owned Machine resource.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Kind string `json:"kind"`
+
+	// Name is the name of the cluster-scoped provider-owned Machine resource.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+}
+
+// HostSpec contains provider-neutral desired host settings.
+type HostSpec struct {
+	// Image is an opaque provider-interpreted image identifier. If omitted,
+	// HostReplace preserves the host's current image.
+	// +optional
+	Image string `json:"image,omitempty"`
 }
 
 // External provider names.

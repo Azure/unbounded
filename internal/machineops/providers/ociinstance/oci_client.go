@@ -142,23 +142,6 @@ func (c *ociComputeClient) TerminateInstance(ctx context.Context, instanceID, re
 	return nil
 }
 
-func (c *ociComputeClient) ListImages(ctx context.Context, compartmentID, shape string) ([]core.Image, error) {
-	return listOCI(ctx, func(ctx context.Context, page *string) ([]core.Image, *string, error) {
-		response, err := c.compute.ListImages(ctx, core.ListImagesRequest{
-			CompartmentId:          &compartmentID,
-			OperatingSystem:        ptrTo(defaultUbuntuOS),
-			OperatingSystemVersion: ptrTo(defaultUbuntuOSVersion),
-			Shape:                  &shape,
-			LifecycleState:         core.ImageLifecycleStateAvailable,
-			SortBy:                 core.ListImagesSortByTimecreated,
-			SortOrder:              core.ListImagesSortOrderDesc,
-			Page:                   page,
-		})
-
-		return response.Items, response.OpcNextPage, err
-	})
-}
-
 func (c *ociComputeClient) ListVnicAttachments(ctx context.Context, compartmentID, instanceID string) ([]core.VnicAttachment, error) {
 	return listOCI(ctx, func(ctx context.Context, page *string) ([]core.VnicAttachment, *string, error) {
 		response, err := c.compute.ListVnicAttachments(ctx, core.ListVnicAttachmentsRequest{

@@ -88,6 +88,10 @@ type MachineConfigurationSpec struct {
 // MachineConfigurationTemplate holds the versioned configuration
 // fields. These fields are copied into each MachineConfigurationVersion.
 type MachineConfigurationTemplate struct {
+	// Host contains provider-neutral desired host settings.
+	// +optional
+	Host *HostSpec `json:"host,omitempty"`
+
 	// Kubernetes contains Kubernetes-specific configuration such as
 	// the target version, node labels, and taints.
 	// +optional

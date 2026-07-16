@@ -86,30 +86,78 @@ Kubernetes join configuration.
 | `kubernetes.nodeLabels` | map[string]string | No | - | Labels to apply to the Node (not yet propagated by the machina controller). |
 | `kubernetes.bootstrapTokenRef.name` | string | Yes | - | Name of the bootstrap token Secret in `kube-system`. |
 
-### spec.provider and spec.providerID
+### spec.provider, spec.providerRef, and spec.host
 
 `provider` selects the external control provider for out-of-band operations.
 Built-in providers are `AzureVM` and `OCIInstance`, and provider-specific
-controllers may use their own non-empty provider names. `providerID` identifies
-the underlying infrastructure resource and follows the Kubernetes Node provider
-ID convention.
+controllers may use their own non-empty provider names. `providerRef` identifies
+the cluster-scoped, provider-owned Machine resource that contains typed
+provider-specific state. The reference may be populated during migration, then
+is immutable. `providerID` remains available temporarily for providers and
+Machines that have not migrated.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `provider` | string | For external operations | -- | External control provider, such as `AzureVM`, `OCIInstance`, or a provider-specific value handled by a custom controller. |
-| `providerID` | string | For external operations | -- | Provider-specific resource ID such as `azure:///subscriptions/.../virtualMachines/name` or `oci://ocid1.instance...`. |
+| `providerRef.apiGroup` | string | For ref-based providers | -- | API group of the provider-owned Machine resource. |
+| `providerRef.kind` | string | For ref-based providers | -- | Kind registered by the selected provider. |
+| `providerRef.name` | string | For ref-based providers | -- | Name of the cluster-scoped provider-owned Machine resource. |
+| `providerID` | string | For legacy providers | -- | Deprecated provider-specific resource ID such as `azure:///subscriptions/.../virtualMachines/name` or `oci://ocid1.instance...`. |
+| `host.image` | string | No | Preserve current image | Opaque image identifier interpreted by the selected provider. |
+
+If `spec.host.image` is omitted, a `HostReplace` inherits
+`MachineConfigurationVersion.spec.template.host.image`. If both are omitted,
+the provider preserves the host's current image. The resolved value is frozen
+in the `MachineOperation` target before provider execution. Updating desired
+image state does not initiate replacement; only an explicit `HostReplace`
+MachineOperation authorizes that destructive action.
+
+The built-in Azure provider uses this companion resource:
+
+```yaml
+apiVersion: infrastructure.unbounded-cloud.io/v1alpha1
+kind: AzureMachine
+metadata:
+  name: worker-01
+  ownerReferences:
+  - apiVersion: unbounded-cloud.io/v1alpha3
+    kind: Machine
+    name: worker-01
+    uid: <machine-uid>
+    controller: true
+spec:
+  resourceID: /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Compute/virtualMachines/worker-01
+```
+
+The corresponding Machine sets `spec.provider: AzureVM` and references this
+object from `spec.providerRef`. During migration, Azure falls back to
+`spec.providerID` only when `providerRef` is absent. When both exist,
+`providerRef` is authoritative.
+
+Migrate an existing Azure Machine after installing the `AzureMachine` CRD:
+
+```bash
+kubectl unbounded machine migrate-azure-provider-ref worker-01
+```
+
+The command is idempotent. It creates or validates the `AzureMachine`, sets the
+Unbounded Machine as controller owner, and populates `providerRef`. It retains
+the deprecated `providerID` during the migration window.
 
 Machine operation credentials are selected by the Machine site label. Providers that support OIDC/workload identity use `WorkloadIdentity`; providers or sites that need provider-specific credential material use `ExternalPlugin` with a referenced Secret.
 Custom Go controllers register the operations they support with
-`pkg/machineops.NewProvider`. Each operation selects either an immediate
+`pkg/machineops.NewProvider` and declare their provider-owned resource with
+`WithProviderMachineKind`. Each operation selects either an immediate
 callback or long-running begin and poll callbacks, plus optional replay,
 replacement bootstrap, and cleanup behavior. The controller is installed with
 `pkg/machineops/controller.AddToManager`; provider code does not reconcile
 `MachineOperation` status directly. Long-running begin callbacks must be
 idempotent for `OperationRequest.OperationUID` because the controller may call
-them again until their operation handle has been persisted. Provider requests
-use the current `Machine.spec.providerID`, and host operations targeting the
-same Machine are serialized.
+them again until their operation handle has been persisted. `OperationRequest`
+contains the exact provider resource UID and generation, resolved host image,
+and observed Machine generation frozen in target status. Legacy providers
+continue to receive the current `Machine.spec.providerID`. Host operations
+targeting the same Machine are serialized.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -175,9 +223,9 @@ The Azure VM provider handles:
 | `HostPowerOn` | `VirtualMachinesClient.BeginStart` |
 | `HostReplace` | `VirtualMachinesClient.Get`, `BeginDelete`, then `BeginCreateOrUpdate` |
 
-`HostReplace` for `AzureVM` destructively replaces the VM: it reads the existing VM model, detaches NICs and data disks, deletes the VM resource, and recreates the same VM name with fresh cloud-init custom data that installs `unbounded-agent`. The old OS disk is not reused. Operation completion means the replacement VM create operation completed; it does not mean the Kubernetes `Node` is Ready. The `Machine` controller continues tracking whether the Kubernetes `Node` disappears and rejoins. Configure `machine-ops-controller --api-server-endpoint` with an API server address reachable from replaced hosts; the generated agent bootstrap config uses that value.
+`HostReplace` for `AzureVM` destructively replaces the VM: it reads the existing VM model, detaches NICs and data disks, deletes the VM resource, and recreates the same VM name with fresh cloud-init custom data that installs `unbounded-agent`. An explicit host image may be an Azure resource ID or a `publisher:offer:sku:version` reference; an omitted image preserves the existing image reference. The old OS disk is not reused. Operation completion means the replacement VM create operation completed; it does not mean the Kubernetes `Node` is Ready. The `Machine` controller continues tracking whether the Kubernetes `Node` disappears and rejoins. Configure `machine-ops-controller --api-server-endpoint` with an API server address reachable from replaced hosts; the generated agent bootstrap config uses that value.
 
-This replacement flow avoids Azure standalone VM `customData` immutability during native reimage. It intentionally destroys host-local state on the old OS disk.
+This replacement flow avoids Azure standalone VM `customData` immutability during native reimage. It intentionally destroys host-local state on the old OS disk. The initial implementation retains the existing blocking clone-delete-create flow; a controller crash after deletion can require manual recovery because the captured VM model is not yet durably checkpointed.
 
 The OCI instance provider handles:
 
@@ -190,7 +238,7 @@ The OCI instance provider handles:
 
 `HostReplace` for `OCIInstance` creates a replacement instance because OCI launch `user_data` is immutable after instance creation. The controller stops the old instance, launches a new instance in the same availability domain, subnet, shape, and fault domain, requests a public IP for bootstrap egress, patches `Machine.spec.providerID` to the new instance OCID after the replacement reaches `RUNNING`, and then terminates the old instance. The replacement reuses the original `Machine` name as the kubelet node name so it rejoins through the existing Kubernetes `Node` object. Operation completion means the replacement is running, provider ID handoff succeeded, and old-instance cleanup succeeded; it does not wait for the Kubernetes `Node` to become Ready.
 
-The OCI replacement flow copies display name, defined tags, freeform tags, selected agent/availability/shape settings, and primary VNIC subnet/NSG/source-destination-check settings. It adds Unbounded freeform tags for idempotent retry lookup. It does not preserve the exact private IP, boot volume, or attached data volumes; active attached data volumes fail the operation before the old instance is stopped. By default, the replacement uses the latest compatible `Canonical Ubuntu` `24.04` image for the source instance shape. Set `spec.parameters.imageID` to use a specific OCI image OCID. Set `spec.parameters.sshAuthorizedKeys` to append SSH authorized keys to replacement metadata for break-glass debugging.
+The OCI replacement flow copies display name, defined tags, freeform tags, selected agent/availability/shape settings, and primary VNIC subnet/NSG/source-destination-check settings. It adds Unbounded freeform tags for idempotent retry lookup. It does not preserve the exact private IP, boot volume, or attached data volumes; active attached data volumes fail the operation before the old instance is stopped. An omitted host image preserves the source instance image. `spec.parameters.imageID` remains as a temporary compatibility override, while new callers should use the Machine or MachineConfiguration host image. Set `spec.parameters.sshAuthorizedKeys` to append SSH authorized keys to replacement metadata for break-glass debugging.
 
 Metalman handles bare-metal host operations for Machines with `spec.pxe.redfish`
 and no external `spec.provider`/`spec.providerID`. Bare-metal host operations may
@@ -213,6 +261,8 @@ after a controller restart. Each entry includes:
 | `startedAt` | time | Target start timestamp. |
 | `completedAt` | time | Target terminal timestamp. |
 | `observedGeneration` | int64 | Machine generation acted on. |
+| `input.providerRef` | ProviderMachineSnapshot | Provider resource group, kind, name, UID, and generation frozen before execution. |
+| `input.hostImage` | string | Resolved provider-interpreted image frozen for `HostReplace`; empty means preserve the current image. |
 | `attempts` | int32 | External action attempts for retryable Redfish operations. |
 | `lastAttemptAt` | time | Most recent external action attempt timestamp. |
 | `providerOperation` | ProviderOperationStatus | Resumable external operation metadata, including provider, operation ID, and an opaque non-secret resume token. |

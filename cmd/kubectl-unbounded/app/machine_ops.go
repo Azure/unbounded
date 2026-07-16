@@ -16,6 +16,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	infrastructurev1alpha1 "github.com/Azure/unbounded/api/infrastructure/v1alpha1"
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
@@ -31,6 +32,7 @@ const (
 func buildScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	utilruntime.Must(corev1.AddToScheme(s))
+	utilruntime.Must(infrastructurev1alpha1.AddToScheme(s))
 	utilruntime.Must(v1alpha3.AddToScheme(s))
 
 	return s

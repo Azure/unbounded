@@ -322,6 +322,51 @@ spec:
                       x-kubernetes-list-map-keys:
                       - type
                       x-kubernetes-list-type: map
+                    input:
+                      description: Input is the immutable provider input resolved
+                        before execution begins.
+                      properties:
+                        hostImage:
+                          description: |-
+                            HostImage is the resolved provider-interpreted host image for HostReplace.
+                            An empty value instructs the provider to preserve the current image.
+                          type: string
+                        providerRef:
+                          description: |-
+                            ProviderRef identifies the exact provider-owned resource observed when the
+                            operation target was initialized.
+                          properties:
+                            apiGroup:
+                              description: APIGroup is the API group of the provider-owned
+                                Machine resource.
+                              type: string
+                            generation:
+                              description: |-
+                                Generation records the provider-owned resource generation whose inputs
+                                were observed.
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            kind:
+                              description: Kind is the kind of the provider-owned
+                                Machine resource.
+                              type: string
+                            name:
+                              description: Name is the name of the provider-owned
+                                Machine resource.
+                              type: string
+                            uid:
+                              description: UID detects deletion and recreation of
+                                the provider-owned resource.
+                              type: string
+                          required:
+                          - apiGroup
+                          - generation
+                          - kind
+                          - name
+                          - uid
+                          type: object
+                      type: object
                     lastAttemptAt:
                       description: LastAttemptAt records when the latest external
                         action attempt occurred.

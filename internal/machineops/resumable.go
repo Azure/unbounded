@@ -28,21 +28,10 @@ const (
 
 func (r *MachineOperationReconciler) reconcileResumableOperation(
 	ctx context.Context,
-	opKey client.ObjectKey,
 	op *unboundedv1alpha3.MachineOperation,
 	machine *unboundedv1alpha3.Machine,
 	providerMatch providerMatch,
 ) (ctrl.Result, error) {
-	if _, ok := operationTarget(op, machine.Name); !ok {
-		if err := r.initializeResumableTarget(ctx, op, machine, providerMatch); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		if err := r.Get(ctx, opKey, op); err != nil {
-			return ctrl.Result{}, client.IgnoreNotFound(err)
-		}
-	}
-
 	target, ok := operationTarget(op, machine.Name)
 	if !ok {
 		return r.failOperation(ctx, op, "TargetStateMissing", fmt.Sprintf("MachineOperation target %s is missing", machine.Name))
@@ -56,10 +45,20 @@ func (r *MachineOperationReconciler) reconcileResumableOperation(
 		return r.failOperation(ctx, op, "TargetFailed", target.Message)
 	}
 
+	message := fmt.Sprintf("executing %s via %s", op.Spec.OperationKind, providerMatch.provider.Name())
+	if err := r.ensureOperationInProgress(ctx, client.ObjectKey{Name: op.Name}, op, message); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	target, ok = operationTarget(op, machine.Name)
+	if !ok {
+		return r.failOperation(ctx, op, "TargetStateMissing", fmt.Sprintf("MachineOperation target %s is missing", machine.Name))
+	}
+
 	if target.ProviderOperation != nil && target.ProviderOperation.Provider != providerMatch.provider.Name() {
 		message := fmt.Sprintf("persisted provider operation belongs to %q, not %q", target.ProviderOperation.Provider, providerMatch.provider.Name())
 
-		return r.failResumableTarget(ctx, op, machine.Name, "ProviderOperationMismatch", message)
+		return r.failOperationTarget(ctx, op, machine.Name, "ProviderOperationMismatch", message)
 	}
 
 	auth, authFailure, err := r.resolveOperationAuth(ctx, machine)
@@ -72,14 +71,14 @@ func (r *MachineOperationReconciler) reconcileResumableOperation(
 			return r.waitForResumableOperation(ctx, op.Name, machine.Name, "ProviderAuthUnavailable", authFailure.Message, r.providerStalledPollInterval())
 		}
 
-		return r.failResumableTarget(ctx, op, machine.Name, authFailure.Reason, authFailure.Message)
+		return r.failOperationTarget(ctx, op, machine.Name, authFailure.Reason, authFailure.Message)
 	}
 
 	includeReplaceUserData := target.ProviderOperation == nil && providerMatch.operation.RequiresReplaceUserData()
 
-	request, err := r.operationRequest(ctx, op, machine, machine.Spec.ProviderID, auth, includeReplaceUserData)
+	request, err := r.operationRequest(ctx, op, machine, target, machine.Spec.ProviderID, auth, includeReplaceUserData)
 	if err != nil {
-		return r.failResumableTarget(ctx, op, machine.Name, "RequestBuildFailed", err.Error())
+		return r.failOperationTarget(ctx, op, machine.Name, "RequestBuildFailed", err.Error())
 	}
 
 	if target.ProviderOperation != nil {
@@ -96,41 +95,6 @@ func (r *MachineOperationReconciler) reconcileResumableOperation(
 	}
 
 	return r.applyBeginResult(ctx, op, machine, providerMatch, begin)
-}
-
-func (r *MachineOperationReconciler) initializeResumableTarget(
-	ctx context.Context,
-	op *unboundedv1alpha3.MachineOperation,
-	machine *unboundedv1alpha3.Machine,
-	providerMatch providerMatch,
-) error {
-	return r.updateOperationStatus(ctx, op.Name, func(latest *unboundedv1alpha3.MachineOperation) {
-		if _, ok := operationTarget(latest, machine.Name); ok {
-			return
-		}
-
-		now := r.now()
-		latest.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
-
-		latest.Status.Message = fmt.Sprintf("initialized target %s for %s", machine.Name, providerMatch.provider.Name())
-		if latest.Status.StartedAt == nil {
-			latest.Status.StartedAt = &now
-		}
-
-		latest.Status.Targets = []unboundedv1alpha3.MachineOperationTargetStatus{{
-			MachineRef:         machine.Name,
-			Phase:              unboundedv1alpha3.OperationPhasePending,
-			Message:            "target initialized",
-			ObservedGeneration: machine.Generation,
-		}}
-		apimeta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
-			Type:               OperationConditionCompleted,
-			Status:             metav1.ConditionFalse,
-			Reason:             "InProgress",
-			Message:            latest.Status.Message,
-			ObservedGeneration: latest.Generation,
-		})
-	})
 }
 
 func (r *MachineOperationReconciler) handleBeginError(
@@ -158,7 +122,7 @@ func (r *MachineOperationReconciler) handleBeginError(
 		}
 
 		if permanentErr != nil {
-			r.markResumableTargetFinished(target, unboundedv1alpha3.OperationPhaseFailed, fmt.Sprintf("%s: %s", reason, message))
+			r.markOperationTargetFinished(target, unboundedv1alpha3.OperationPhaseFailed, fmt.Sprintf("%s: %s", reason, message))
 			target.Stage = ""
 		}
 	}); err != nil {
@@ -227,7 +191,7 @@ func (r *MachineOperationReconciler) pollResumableOperation(
 		if errors.As(err, &permanentErr) {
 			reason := valueOrDefault(permanentErr.Reason, "PermanentPollFailure")
 
-			return r.failResumableTarget(ctx, op, machine.Name, reason, message)
+			return r.failOperationTarget(ctx, op, machine.Name, reason, message)
 		}
 
 		delay := r.providerPollInterval()
@@ -252,7 +216,7 @@ func (r *MachineOperationReconciler) pollResumableOperation(
 		}
 
 		message := valueOrDefault(result.Message, fmt.Sprintf("%s completed via %s", op.Spec.OperationKind, providerMatch.provider.Name()))
-		if err := r.finishResumableTarget(ctx, op.Name, machine.Name, unboundedv1alpha3.OperationPhaseComplete, message); err != nil {
+		if err := r.finishOperationTarget(ctx, op.Name, machine.Name, unboundedv1alpha3.OperationPhaseComplete, message); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -261,7 +225,7 @@ func (r *MachineOperationReconciler) pollResumableOperation(
 		reason := valueOrDefault(result.Reason, string(result.State))
 		message := valueOrDefault(result.Message, fmt.Sprintf("provider operation %s %s", providerOperation.OperationID, strings.ToLower(string(result.State))))
 
-		return r.failResumableTarget(ctx, op, machine.Name, reason, message)
+		return r.failOperationTarget(ctx, op, machine.Name, reason, message)
 	default:
 		message := fmt.Sprintf("provider operation %s returned unknown state %q", providerOperation.OperationID, result.State)
 
@@ -309,21 +273,21 @@ func (r *MachineOperationReconciler) waitForResumableOperation(
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
-func (r *MachineOperationReconciler) failResumableTarget(
+func (r *MachineOperationReconciler) failOperationTarget(
 	ctx context.Context,
 	op *unboundedv1alpha3.MachineOperation,
 	machineName string,
 	reason string,
 	message string,
 ) (ctrl.Result, error) {
-	if err := r.finishResumableTarget(ctx, op.Name, machineName, unboundedv1alpha3.OperationPhaseFailed, fmt.Sprintf("%s: %s", reason, message)); err != nil {
+	if err := r.finishOperationTarget(ctx, op.Name, machineName, unboundedv1alpha3.OperationPhaseFailed, fmt.Sprintf("%s: %s", reason, message)); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	return r.failOperation(ctx, op, reason, message)
 }
 
-func (r *MachineOperationReconciler) finishResumableTarget(
+func (r *MachineOperationReconciler) finishOperationTarget(
 	ctx context.Context,
 	opName string,
 	machineName string,
@@ -331,11 +295,11 @@ func (r *MachineOperationReconciler) finishResumableTarget(
 	message string,
 ) error {
 	return r.updateOperationTarget(ctx, opName, machineName, func(target *unboundedv1alpha3.MachineOperationTargetStatus) {
-		r.markResumableTargetFinished(target, phase, message)
+		r.markOperationTargetFinished(target, phase, message)
 	})
 }
 
-func (r *MachineOperationReconciler) markResumableTargetFinished(
+func (r *MachineOperationReconciler) markOperationTargetFinished(
 	target *unboundedv1alpha3.MachineOperationTargetStatus,
 	phase unboundedv1alpha3.OperationPhase,
 	message string,

@@ -8,9 +8,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"testing"
-	"time"
 
-	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/core"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
@@ -191,7 +189,7 @@ func TestProviderExecuteReturnsClientError(t *testing.T) {
 	require.Contains(t, err.Error(), "create OCI compute client")
 }
 
-func TestProviderExecuteHostReplaceLaunchesDefaultUbuntuReplacement(t *testing.T) {
+func TestProviderExecuteHostReplacePreservesCurrentImage(t *testing.T) {
 	t.Parallel()
 
 	client := newReplacementClient()
@@ -215,7 +213,7 @@ func TestProviderExecuteHostReplaceLaunchesDefaultUbuntuReplacement(t *testing.T
 	require.Equal(t, []string{"STOP:old-instance"}, client.calls)
 	require.Len(t, client.launches, 1)
 	launch := client.launches[0]
-	require.Equal(t, "image-new", *launch.SourceDetails.(core.InstanceSourceViaImageDetails).ImageId)
+	require.Equal(t, "image-old", *launch.SourceDetails.(core.InstanceSourceViaImageDetails).ImageId)
 	require.Equal(t, "subnet-1", *launch.CreateVnicDetails.SubnetId)
 	require.Equal(t, []string{"nsg-1"}, launch.CreateVnicDetails.NsgIds)
 	require.True(t, *launch.CreateVnicDetails.AssignPublicIp)
@@ -249,20 +247,19 @@ func TestProviderExecuteHostReplaceImageIDOverride(t *testing.T) {
 		OperationUID:    types.UID("operation-uid"),
 		ProviderID:      "oci://old-instance",
 		Operation:       unboundedv1alpha3.OperationHostReplace,
-		Parameters:      map[string]string{parameterImageID: "custom-image"},
+		HostImage:       "custom-image",
 		ReplaceUserData: "#cloud-config\n",
 	})
 
 	require.NoError(t, err)
 	require.Equal(t, "custom-image", *client.launches[0].SourceDetails.(core.InstanceSourceViaImageDetails).ImageId)
-	require.Empty(t, client.listImagesCalls)
 }
 
 func TestProviderExecuteHostReplacePreflightsBeforeStop(t *testing.T) {
 	t.Parallel()
 
 	client := newReplacementClient()
-	client.images = nil
+	client.instances[0].ImageId = nil
 	provider := &Provider{NewClient: func() (computeClient, error) { return client, nil }}
 	machine := &unboundedv1alpha3.Machine{}
 	machine.Name = "machine-1"
@@ -278,7 +275,7 @@ func TestProviderExecuteHostReplacePreflightsBeforeStop(t *testing.T) {
 	})
 
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "no compatible")
+	require.Contains(t, err.Error(), "cannot determine the current OCI image")
 	require.Empty(t, client.calls)
 	require.Empty(t, client.launches)
 }
@@ -436,10 +433,8 @@ type recordingComputeClient struct {
 	instances         []core.Instance
 	vnics             map[string]core.Vnic
 	volumeAttachments []core.VolumeAttachment
-	images            []core.Image
 	launches          []core.LaunchInstanceDetails
 	terminated        []string
-	listImagesCalls   []string
 	getCalls          map[string]int
 	stopAfterGet      map[string]int
 }
@@ -499,11 +494,6 @@ func (c *recordingComputeClient) TerminateInstance(_ context.Context, instanceID
 	return nil
 }
 
-func (c *recordingComputeClient) ListImages(_ context.Context, compartmentID, shape string) ([]core.Image, error) {
-	c.listImagesCalls = append(c.listImagesCalls, fmt.Sprintf("%s:%s", compartmentID, shape))
-	return c.images, nil
-}
-
 func (c *recordingComputeClient) ListVnicAttachments(_ context.Context, _, instanceID string) ([]core.VnicAttachment, error) {
 	return []core.VnicAttachment{{InstanceId: &instanceID, VnicId: ptrTo("vnic-1"), LifecycleState: core.VnicAttachmentLifecycleStateAttached}}, nil
 }
@@ -531,6 +521,7 @@ func newReplacementClient() *recordingComputeClient {
 			Shape:              ptrTo("VM.Standard.E4.Flex"),
 			DisplayName:        ptrTo("machine-1"),
 			FreeformTags:       map[string]string{"existing": "tag"},
+			ImageId:            ptrTo("image-old"),
 		}},
 		vnics: map[string]core.Vnic{
 			"vnic-1": {
@@ -539,22 +530,6 @@ func newReplacementClient() *recordingComputeClient {
 				SubnetId:            ptrTo("subnet-1"),
 				NsgIds:              []string{"nsg-1"},
 				SkipSourceDestCheck: ptrTo(true),
-			},
-		},
-		images: []core.Image{
-			{
-				Id:                     ptrTo("image-old"),
-				LifecycleState:         core.ImageLifecycleStateAvailable,
-				OperatingSystem:        ptrTo(defaultUbuntuOS),
-				OperatingSystemVersion: ptrTo(defaultUbuntuOSVersion),
-				TimeCreated:            &common.SDKTime{Time: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
-			},
-			{
-				Id:                     ptrTo("image-new"),
-				LifecycleState:         core.ImageLifecycleStateAvailable,
-				OperatingSystem:        ptrTo(defaultUbuntuOS),
-				OperatingSystemVersion: ptrTo(defaultUbuntuOSVersion),
-				TimeCreated:            &common.SDKTime{Time: time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)},
 			},
 		},
 	}
