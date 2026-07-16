@@ -172,23 +172,31 @@ func TestNSpawnConfig_NVIDIADriverRootMounts(t *testing.T) {
 func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
 	t.Parallel()
 
-	const channel = "/dev/nvidia-caps-imex-channels/channel0"
+	const channels = "/dev/nvidia-caps-imex-channels"
 
 	data := nspawnTemplateData{
 		MachineName:                  "kube1",
 		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
-		NvidiaGPUDevicePaths:         []string{channel},
+		NvidiaGPUDevicePaths:         []string{"/dev/nvidia-caps", channels},
+		NvidiaDriverRootLibDir:       "/lib/aarch64-linux-gnu",
 	}
 
 	var nspawnBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
-	require.Contains(t, nspawnBuf.String(), "Bind="+channel)
+	require.Contains(t, nspawnBuf.String(), "Bind=/dev/nvidia-caps")
+	require.Contains(t, nspawnBuf.String(), "Bind="+channels)
+	require.Contains(t, nspawnBuf.String(), "BindReadOnly=/usr/bin:/run/nvidia/driver/usr/bin")
+	require.Contains(t, nspawnBuf.String(),
+		"BindReadOnly=/lib/aarch64-linux-gnu:/run/nvidia/driver/lib/aarch64-linux-gnu")
 
 	var overrideBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
-	require.Contains(t, overrideBuf.String(), "DeviceAllow="+channel+" rwm")
+	require.Contains(t, overrideBuf.String(), "DevicePolicy=auto")
+	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-nvidia-caps rwm")
+	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-nvidia-caps-imex-channels rwm")
+	require.NotContains(t, overrideBuf.String(), "DeviceAllow="+channels+" rwm")
 }
 
 func TestPathsExcluding(t *testing.T) {

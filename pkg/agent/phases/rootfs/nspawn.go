@@ -75,6 +75,7 @@ type nspawnTemplateData struct {
 	NvidiaLibDirMounts           []goalstates.NvidiaLibDirMount
 	NvidiaI386LibDirMounts       []goalstates.NvidiaLibDirMount
 	NvidiaSMIDir                 string
+	NvidiaDriverRootLibDir       string
 	AMDGPUDevicePaths            []string
 	AMDSysFSPaths                []string
 }
@@ -111,6 +112,7 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		NvidiaLibDirMounts:           e.goalState.Nvidia.LibDirMounts,
 		NvidiaI386LibDirMounts:       e.goalState.Nvidia.I386LibDirMounts,
 		NvidiaSMIDir:                 nvidiaSMIDir,
+		NvidiaDriverRootLibDir:       e.goalState.Nvidia.DriverRootLibDir,
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
 		AMDSysFSPaths:                e.goalState.AMD.SysFSPaths,
 	}
