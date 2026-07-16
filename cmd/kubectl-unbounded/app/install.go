@@ -191,7 +191,16 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 		return nil
 	}
 
-	rewriteNamespace(obj, unbounded.SystemNamespace(), h.namespace)
+	// Retarget the build-time namespace baked into the rendered operator
+	// manifests to the install namespace. The rewrite source MUST be the
+	// build-time literal (DefaultSystemNamespace), not SystemNamespace(): the
+	// latter reflects this process's own POD_NAMESPACE, so when POD_NAMESPACE is
+	// set (an in-cluster installer) or the default namespace is used, the "from"
+	// value would no longer match the baked "unbounded-system" and cluster-scoped
+	// references that only rewriteNamespace can fix (for example the
+	// ClusterRoleBinding subject namespace) would be left pointing at the wrong
+	// namespace, leaving the operator with no RBAC.
+	rewriteNamespace(obj, unbounded.DefaultSystemNamespace, h.namespace)
 	setNamespace(obj, h.namespace)
 
 	// The api-server-endpoint is delivered to the operator via the

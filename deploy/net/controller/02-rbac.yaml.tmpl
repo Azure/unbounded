@@ -34,6 +34,14 @@ rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["sites/status"]
     verbs: ["get", "patch", "update"]
+  # Legacy net-group Sites: read-only, used only by SiteNodeSlice orphan cleanup
+  # during the unbounded-system migration window to distinguish a Site that has
+  # not been translated into the machina group yet (still present here) from one
+  # that is genuinely gone. Can be removed once legacy net-group Sites are fully
+  # retired.
+  - apiGroups: ["net.unbounded-cloud.io"]
+    resources: ["sites"]
+    verbs: ["get", "list", "watch"]
   # GatewayPools: read access and finalizer management for controllers
   - apiGroups: ["net.unbounded-cloud.io"]
     resources: ["gatewaypools"]

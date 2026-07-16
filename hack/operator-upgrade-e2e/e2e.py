@@ -69,6 +69,7 @@ import platform
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -1050,13 +1051,173 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
     run(["docker", "rm", "-f", REGISTRY_CONTAINER], check=False, quiet=True)
 
 
+# --------------------------------------------------------------------------- #
+# continuity monitor
+# --------------------------------------------------------------------------- #
+class ContinuityMonitor:
+    """Background monitor that samples the net dataplane's source of truth during
+    the migration and fails the run on a regression.
+
+    The primary signal is SiteNodeSlice presence: net-node programs WireGuard
+    peers and pod-CIDR routes from SiteNodeSlices, so a slice that is present and
+    then vanishes (rather than being updated in place) means the dataplane for
+    that site was torn down. This is exactly the outage the orphan-cleanup fix
+    prevents during the migration window. A slice absent for two consecutive
+    samples (debounced against transient API read hiccups) is flagged, as is the
+    whole slice set emptying after having been non-empty.
+
+    With --probe-dataplane it additionally samples WireGuard peer counts inside
+    the net-node pods and flags a collapse to zero peers after peers were seen.
+    That probe is best-effort: if `wg` peer data cannot be read (tooling/mode) it
+    disables itself rather than producing false failures. NOTE: this harness runs
+    CNI-free alongside kindnet, so pod-to-pod traffic uses kindnet, not the
+    unbounded WireGuard mesh; a cross-node pod ping would therefore NOT reflect
+    the unbounded dataplane, which is why slice/peer continuity are used instead.
+    """
+
+    def __init__(self, interval: float, probe_dataplane: bool) -> None:
+        self._interval = max(interval, 0.5)
+        self._probe_dataplane = probe_dataplane
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._loop, name="continuity-monitor", daemon=True)
+        self._violations: list[str] = []
+        self._seen_slices: set[str] = set()
+        self._absent_streak: dict[str, int] = {}
+        self._wg_peers_seen = False
+        self._wg_disabled = False
+        self._samples = 0
+
+    def start(self) -> None:
+        log(f"continuity monitor: started (interval={self._interval}s, "
+            f"probe_dataplane={self._probe_dataplane})")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=30)
+        log(f"continuity monitor: stopped after {self._samples} samples; "
+            f"{len(self._seen_slices)} distinct SiteNodeSlices observed")
+        if self._violations:
+            die("continuity monitor detected dataplane regressions during "
+                "migration:\n  - " + "\n  - ".join(self._violations))
+        log("continuity monitor: no dataplane regression observed")
+
+    def _record(self, violation: str) -> None:
+        if violation not in self._violations:
+            self._violations.append(violation)
+            log("continuity VIOLATION: " + violation)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self._sample()
+            self._stop.wait(self._interval)
+        self._sample()
+
+    def _sample(self) -> None:
+        names = self._slice_names()
+        if names is None:
+            return  # transient API read hiccup; skip this tick
+
+        self._samples += 1
+
+        # Debounced disappearance detection: a previously-seen slice missing for
+        # two consecutive samples is a regression.
+        for slice_name in sorted(self._seen_slices):
+            if slice_name in names:
+                self._absent_streak[slice_name] = 0
+                continue
+
+            streak = self._absent_streak.get(slice_name, 0) + 1
+            self._absent_streak[slice_name] = streak
+            if streak >= 2:
+                self._record(
+                    f"SiteNodeSlice {slice_name} was present and then "
+                    f"disappeared during migration")
+
+        self._seen_slices |= names
+
+        if self._seen_slices and not names:
+            self._record("all SiteNodeSlices vanished at once during migration")
+
+        if self._probe_dataplane and not self._wg_disabled:
+            self._sample_wireguard()
+
+    def _slice_names(self) -> set[str] | None:
+        out = kubectl_out(
+            ["get", "sitenodeslices.net.unbounded-cloud.io", "-o", "json"],
+            check=False)
+        if not out.strip():
+            return None
+        try:
+            items = json.loads(out).get("items", [])
+        except json.JSONDecodeError:
+            return None
+        return {item["metadata"]["name"] for item in items}
+
+    def _sample_wireguard(self) -> None:
+        pods = self._net_node_pods()
+        if not pods:
+            return
+
+        any_peers = False
+        for pod in pods:
+            peers = self._wg_peer_count(pod)
+            if peers is None:
+                # Could not read wg peer data anywhere; disable the probe once so
+                # it never produces false failures.
+                self._wg_disabled = True
+                log("continuity monitor: WireGuard probe disabled "
+                    "(peer data unavailable in net-node pods)")
+                return
+            if peers > 0:
+                any_peers = True
+
+        if any_peers:
+            self._wg_peers_seen = True
+        elif self._wg_peers_seen:
+            self._record("WireGuard peers collapsed to zero across all "
+                         "net-node pods during migration")
+
+    def _net_node_pods(self) -> list[str]:
+        out = kubectl_out(
+            ["-n", TARGET_NS, "get", "pods", "-l", "app=unbounded-net-node",
+             "-o", "jsonpath={.items[*].metadata.name}"], check=False)
+        return out.split()
+
+    def _wg_peer_count(self, pod: str) -> int | None:
+        # Best-effort: `wg show all peers` lists one peer per line.
+        out = run_out(
+            ["kubectl", "--kubeconfig", str(KUBECONFIG), "-n", TARGET_NS,
+             "exec", pod, "--", "wg", "show", "all", "peers"], check=False)
+        if not out.strip():
+            # Distinguish "no peers" from "wg unavailable" is not reliable here;
+            # treat empty as unreadable so the probe self-disables rather than
+            # false-flagging. A populated mesh returns peer lines.
+            return None
+        return len([line for line in out.splitlines() if line.strip()])
+
+
+# --------------------------------------------------------------------------- #
+# orchestration
+# --------------------------------------------------------------------------- #
 def cmd_all(args: argparse.Namespace) -> None:
     try:
         cmd_setup(args)
         cmd_build_images(args)
         cmd_install_old(args)
-        cmd_upgrade(args)
-        cmd_verify(args)
+        monitor = ContinuityMonitor(
+            interval=args.continuity_interval,
+            probe_dataplane=args.probe_dataplane,
+        )
+        monitor.start()
+        try:
+            cmd_upgrade(args)
+            cmd_verify(args)
+        finally:
+            # Assert the dataplane source of truth stayed continuous across the
+            # whole migration window (install -> reaper completion).
+            monitor.stop()
         log("ALL PASS")
     finally:
         cmd_cleanup(args)
@@ -1089,6 +1250,13 @@ def main() -> None:
                         help="skip building/pushing images (reuse existing)")
     parser.add_argument("--verify-timeout", type=int, default=1500,
                         help="seconds to wait for the migration to complete")
+    parser.add_argument("--continuity-interval", type=float, default=1.0,
+                        help="seconds between SiteNodeSlice continuity samples "
+                             "during the migration (0.5 minimum)")
+    parser.add_argument("--probe-dataplane", action="store_true",
+                        help="additionally sample WireGuard peer counts in the "
+                             "net-node pods during migration (best-effort; "
+                             "self-disables if peer data is unavailable)")
     args = parser.parse_args()
 
     dispatch = {

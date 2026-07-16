@@ -833,6 +833,49 @@ func TestForeignWorkloads(t *testing.T) {
 	}
 }
 
+// Finding 3: the whole-namespace delete also destroys resources the migration
+// never copies. The audit surfaces PersistentVolumeClaims and deliberately
+// skipped Secrets so operators see the full blast radius before deletion.
+func TestDataBearingResourcesAtRiskSurfacesPVCsAndSkippedSecrets(t *testing.T) {
+	r := newReaper(t,
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: legacyKubeNamespace, Name: "data"}},
+		// Skipped by migration (SkipSecretNames): never copied, so at risk.
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: legacyKubeNamespace, Name: "unbounded-net-serving-cert"}},
+		// Copied by migrateSecrets: not at risk, must not be reported.
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: legacyKubeNamespace, Name: "user-secret"}},
+	)
+
+	got, err := r.dataBearingResourcesAtRisk(t.Context(), legacyKubeNamespace)
+	if err != nil {
+		t.Fatalf("dataBearingResourcesAtRisk: %v", err)
+	}
+
+	want := []string{
+		"PersistentVolumeClaim/data",
+		"Secret/unbounded-net-serving-cert",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("dataBearingResourcesAtRisk = %v, want %v", got, want)
+	}
+
+	// The at-risk resources must be surfaced through the warning Event too.
+	recorder := events.NewFakeRecorder(1)
+	r.Recorder = recorder
+
+	if err := r.warnOnForeignWorkloads(t.Context(), logr.Discard(), legacyKubeNamespace); err != nil {
+		t.Fatalf("warnOnForeignWorkloads: %v", err)
+	}
+
+	select {
+	case event := <-recorder.Events:
+		if !strings.Contains(event, "PersistentVolumeClaim/data") || !strings.Contains(event, "Secret/unbounded-net-serving-cert") {
+			t.Fatalf("warning Event missing at-risk resources: %q", event)
+		}
+	default:
+		t.Fatal("at-risk resources did not emit a warning Event")
+	}
+}
+
 func TestForeignWorkloadsSkipsListedControllerDescendants(t *testing.T) {
 	controller := boolPtr(true)
 	owner := func(apiVersion, kind, name, uid string) metav1.OwnerReference {

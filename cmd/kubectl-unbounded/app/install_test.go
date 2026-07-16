@@ -402,6 +402,46 @@ func TestMutateOperatorObjectRetargetsNamespace(t *testing.T) {
 	require.Contains(t, args, "--leader-elect-namespace=custom-system")
 }
 
+// TestMutateOperatorObjectRetargetsClusterRoleBindingSubjectWithPodNamespaceSet
+// guards against a regression where the namespace rewrite source was
+// SystemNamespace() instead of the build-time literal. A ClusterRoleBinding is
+// cluster-scoped, so its subject namespace can only be corrected by
+// rewriteNamespace (setNamespace never touches it). When POD_NAMESPACE is set
+// (an in-cluster installer) the old source no longer matched the baked
+// "unbounded-system", so the subject was left pointing at the wrong namespace
+// and the operator ServiceAccount got no ClusterRole grant.
+func TestMutateOperatorObjectRetargetsClusterRoleBindingSubjectWithPodNamespaceSet(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "installer-ns")
+
+	h := &installHandler{namespace: "custom-system"}
+
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "rbac.authorization.k8s.io/v1",
+		"kind":       "ClusterRoleBinding",
+		"metadata":   map[string]any{"name": "unbounded-operator"},
+		"roleRef": map[string]any{
+			"apiGroup": "rbac.authorization.k8s.io",
+			"kind":     "ClusterRole",
+			"name":     "unbounded-operator",
+		},
+		"subjects": []any{map[string]any{
+			"kind":      "ServiceAccount",
+			"name":      "unbounded-operator",
+			"namespace": "unbounded-system",
+		}},
+	}}
+
+	require.NoError(t, h.mutateOperatorObject(obj))
+
+	subjects, _, err := unstructured.NestedSlice(obj.Object, "subjects")
+	require.NoError(t, err)
+	require.Len(t, subjects, 1)
+
+	ns, _, err := unstructured.NestedString(subjects[0].(map[string]any), "namespace")
+	require.NoError(t, err)
+	require.Equal(t, "custom-system", ns, "ClusterRoleBinding subject namespace must be retargeted even when POD_NAMESPACE is set")
+}
+
 func TestCRDEstablished(t *testing.T) {
 	t.Parallel()
 
