@@ -49,16 +49,14 @@ func printReady() {
 }
 
 type conditionState struct {
-	Status  metav1.ConditionStatus
-	Reason  string
-	Message string
+	Status metav1.ConditionStatus
+	Reason string
 }
 
 func conditionChanged(cond metav1.Condition, seen map[string]conditionState) bool {
 	state := conditionState{
-		Status:  cond.Status,
-		Reason:  cond.Reason,
-		Message: cond.Message,
+		Status: cond.Status,
+		Reason: cond.Reason,
 	}
 
 	last, ok := seen[cond.Type]
@@ -78,12 +76,38 @@ func reportConditionTransitions(conditions []metav1.Condition, seen map[string]c
 	})
 
 	for _, cond := range ordered {
+		if cond.Type == v1alpha3.MachineOperationConditionCompleted || cond.Status == metav1.ConditionUnknown {
+			continue
+		}
+
 		if !conditionChanged(cond, seen) {
 			continue
 		}
 
-		printStep(fmt.Sprintf("Condition %s: %s", cond.Type, formatConditionState(cond)))
+		printStep(conditionStepText(cond))
 	}
+}
+
+func conditionStepText(cond metav1.Condition) string {
+	switch cond.Type {
+	case v1alpha3.MachineOperationConditionBootLoaderDownloaded:
+		if cond.Status == metav1.ConditionTrue {
+			return "Boot loader downloaded"
+		}
+	case v1alpha3.MachineOperationConditionBootImageWritten:
+		if cond.Status == metav1.ConditionTrue {
+			return "OS image written to disk"
+		}
+	case v1alpha3.MachineOperationConditionCloudInitDone:
+		if cond.Status == metav1.ConditionTrue {
+			return "Cloud-init complete"
+		}
+		if cond.Reason == "Running" {
+			return "Running first-boot cloud-init"
+		}
+	}
+
+	return fmt.Sprintf("Condition %s: %s", cond.Type, formatConditionState(cond))
 }
 
 func formatConditionState(cond metav1.Condition) string {

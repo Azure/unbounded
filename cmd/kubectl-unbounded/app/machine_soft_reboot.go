@@ -202,13 +202,35 @@ func reportTargetTransitions(targets []v1alpha3.MachineOperationTargetStatus, se
 			continue
 		}
 
-		state := targetTransitionState(target)
-		if seen[key] == state {
+		dedup := string(target.Phase) + "/" + string(target.Stage)
+		if seen[key] == dedup {
 			continue
 		}
 
-		seen[key] = state
-		printStep(fmt.Sprintf("Target %s: %s", key, state))
+		seen[key] = dedup
+
+		text := stageText(target.Stage)
+		if text == "" {
+			text = targetTransitionState(target)
+		}
+		printStep(fmt.Sprintf("Target %s: %s", key, text))
+	}
+}
+
+func stageText(stage v1alpha3.OperationStage) string {
+	switch stage {
+	case v1alpha3.OperationStagePoweringOff, v1alpha3.OperationStageWaitingOff:
+		return "Powering off host"
+	case v1alpha3.OperationStagePoweringOn, v1alpha3.OperationStageWaitingOn:
+		return "Powering on host"
+	case v1alpha3.OperationStageRepaveRequested, v1alpha3.OperationStageWaitingRepave:
+		return "Booting PXE installer"
+	case v1alpha3.OperationStageWaitingCloudInit:
+		return "Running first-boot cloud-init"
+	case v1alpha3.OperationStageWaitingNode:
+		return "Waiting for node to join cluster"
+	default:
+		return ""
 	}
 }
 
