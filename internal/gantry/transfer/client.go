@@ -18,6 +18,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 // Client implements ifaces.PeerDialer over HTTP/2 cleartext (h2c).
@@ -55,7 +56,7 @@ func WithReadIdleTimeout(d time.Duration) ClientOption {
 func NewClient(opts ...ClientOption) *Client {
 	o := clientOptions{
 		dialTimeout:     2 * time.Second,
-		requestTimeout:  60 * time.Second,
+		requestTimeout:  time.Hour,
 		readIdleTimeout: 10 * time.Second,
 	}
 	for _, fn := range opts {
@@ -95,6 +96,10 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 
 	req.Header.Set(MirroredHeader, "1")
 	req.Header.Set("Accept", "*/*")
+
+	if authorization := registryauth.Authorization(ctx); authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
 	// Force h2c - the http.Transport will negotiate over plaintext.
 	req.URL.Scheme = "http"
 

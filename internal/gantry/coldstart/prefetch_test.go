@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 // pickHRW0 returns the HRW rank-0 node ID for d across the given
@@ -87,6 +88,86 @@ func digestHex(i int) string {
 	}
 
 	return string(out)
+}
+
+func TestPrefetchChildren_ReplicatesToTopNPullers(t *testing.T) {
+	cluster := clusterNodes() // n0..n3
+	self := ifaces.NodeID("n3")
+
+	// Find a digest whose top-3 HRW pullers are exactly the three
+	// non-self nodes, so replicas=3 fans the layer out to n0, n1, n2.
+	var (
+		d     digest.Digest
+		found bool
+	)
+
+	for i := 0; i < 8192; i++ {
+		cand := digest.MustParse("sha256:" + digestHex(i))
+
+		ids := make(map[ifaces.NodeID]struct{})
+		for _, s := range hrw.TopK(cluster, cand, 3) {
+			ids[s.Node.ID] = struct{}{}
+		}
+
+		if _, self3 := ids[self]; len(ids) == 3 && !self3 {
+			d = cand
+			found = true
+
+			break
+		}
+	}
+
+	if !found {
+		t.Fatal("could not find a digest whose top-3 pullers exclude self")
+	}
+
+	coord := &stubCoord{}
+	disco := &stubDisco{health: 1.0}
+	r := buildResolverWithReplicas(t, coord, disco, self, cluster, 3)
+
+	children := []coldstart.ChildDigest{{Digest: d, Kind: ifaces.KindBlob}}
+	if err := r.PrefetchChildren(context.Background(), children, "docker.io", "library/nginx"); err != nil {
+		t.Fatalf("PrefetchChildren: %v", err)
+	}
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+
+	// One layer digest, replicated to the top-3 pullers => 3 distinct
+	// please_pull RPCs (3 initial origin seeds instead of 1).
+	seen := make(map[ifaces.NodeID]struct{})
+	for _, id := range coord.pleasePullCalls {
+		seen[id] = struct{}{}
+	}
+
+	if len(coord.pleasePullCalls) != 3 || len(seen) != 3 {
+		t.Fatalf("PleasePull calls: got %v, want 3 distinct pullers (top-3 replication)", coord.pleasePullCalls)
+	}
+}
+
+func TestPrefetchChildren_SinglePullerByDefault(t *testing.T) {
+	cluster := clusterNodes()
+	self := ifaces.NodeID("n3")
+	// One digest whose rank-0 puller is non-self.
+	targets := map[ifaces.NodeID]int{"n0": 1}
+	digests := findManyDigestsForPullers(t, cluster, targets)
+
+	coord := &stubCoord{}
+	disco := &stubDisco{health: 1.0}
+	// buildResolver leaves PrefetchPullerReplicas unset => defaults to 1.
+	r := buildResolver(t, coord, disco, self, cluster, coldstart.MetricsHooks{}, time.Now)
+
+	children := []coldstart.ChildDigest{{Digest: digests[0], Kind: ifaces.KindBlob}}
+	if err := r.PrefetchChildren(context.Background(), children, "docker.io", "library/nginx"); err != nil {
+		t.Fatalf("PrefetchChildren: %v", err)
+	}
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+
+	if got := len(coord.pleasePullCalls); got != 1 {
+		t.Fatalf("PleasePull calls: got %d want 1 (default single puller): %v", got, coord.pleasePullCalls)
+	}
 }
 
 func TestPrefetchLayers_GroupsByPuller(t *testing.T) {
@@ -360,6 +441,37 @@ func TestPrefetchChildren_SplitsByKindOnSamePuller(t *testing.T) {
 	for i, ds := range coord.pleasePullDgs {
 		if len(ds) != 1 {
 			t.Errorf("call[%d] batch size: got %d want 1 (kind splitting must not pack across kinds)", i, len(ds))
+		}
+	}
+}
+
+func TestPrefetchChildren_PropagatesDelegatedAuthorization(t *testing.T) {
+	cluster := clusterNodes()
+	self := ifaces.NodeID("n3")
+	dgs := findManyDigestsForPullers(t, cluster, map[ifaces.NodeID]int{"n0": 2})
+	children := []coldstart.ChildDigest{
+		{Digest: dgs[0], Kind: ifaces.KindConfig},
+		{Digest: dgs[1], Kind: ifaces.KindBlob},
+	}
+
+	coord := &stubCoord{}
+	r := buildResolver(t, coord, &stubDisco{health: 1.0}, self, cluster, coldstart.MetricsHooks{}, time.Now)
+	ctx := registryauth.WithAuthorization(context.Background(), "Bearer requester-token")
+
+	if err := r.PrefetchChildren(ctx, children, "docker.io", "library/nginx"); err != nil {
+		t.Fatalf("PrefetchChildren: %v", err)
+	}
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+
+	if len(coord.pleasePullAuth) == 0 {
+		t.Fatal("no PleasePull calls recorded")
+	}
+
+	for i, authorization := range coord.pleasePullAuth {
+		if authorization != "Bearer requester-token" {
+			t.Fatalf("PleasePull[%d] authorization = %q, want requester token", i, authorization)
 		}
 	}
 }

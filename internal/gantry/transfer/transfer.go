@@ -58,6 +58,10 @@ type Server struct {
 	describer Describer
 	logger    *slog.Logger
 	metrics   metricsHooks
+	// serveSem, when non-nil, caps concurrent blob-body serves. A full
+	// channel means the server is at capacity and further blob GETs are
+	// shed with 429 so the requester re-discovers another provider.
+	serveSem chan struct{}
 }
 
 // Describer is an optional capability that callers (typically the
@@ -105,6 +109,21 @@ func WithMetrics(onPeerServe, onPeerMiss func()) Option {
 func WithDescriber(d Describer) Option {
 	return func(s *Server) {
 		s.describer = d
+	}
+}
+
+// WithMaxConcurrentServes caps concurrent peer blob-body serves. When the cap
+// is reached, further blob GETs receive 429 Too Many Requests with a
+// Retry-After hint so the requester re-selects another provider instead of
+// queueing behind a saturated seed. That load-shedding is what lets the first
+// finishers complete early and seed the swarm (the cascade). n <= 0 means
+// unlimited. HEAD requests and manifest serves are never capped: they are
+// cheap and are needed for discovery and verification.
+func WithMaxConcurrentServes(n int) Option {
+	return func(s *Server) {
+		if n > 0 {
+			s.serveSem = make(chan struct{}, n)
+		}
 	}
 }
 
@@ -185,6 +204,22 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind) {
+	// Shed load on a saturated seed so the requester re-discovers another
+	// provider (the cascade) instead of queueing behind us. Only full
+	// blob-body GETs are capped: HEADs are cheap and manifests are small and
+	// needed for discovery/verification.
+	if r.Method == http.MethodGet && kind == ifaces.KindBlob {
+		release, ok := s.tryAcquireServe()
+		if !ok {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "peer serving at capacity", http.StatusTooManyRequests)
+
+			return
+		}
+
+		defer release()
+	}
+
 	rc, size, err := s.openBlob(r.Context(), d)
 	if err != nil {
 		var enf *ifaces.ErrNotFound
@@ -289,6 +324,24 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 func (s *Server) bumpServe() {
 	if s.metrics.onPeerServe != nil {
 		s.metrics.onPeerServe()
+	}
+}
+
+// tryAcquireServe reserves a serve slot without blocking. The returned release
+// func MUST be called when the serve completes. ok is false when the server is
+// already at its configured serve cap; callers should shed the request (429)
+// rather than block. When no cap is configured (serveSem nil), it always
+// succeeds with a no-op release.
+func (s *Server) tryAcquireServe() (release func(), ok bool) {
+	if s.serveSem == nil {
+		return func() {}, true
+	}
+
+	select {
+	case s.serveSem <- struct{}{}:
+		return func() { <-s.serveSem }, true
+	default:
+		return nil, false
 	}
 }
 

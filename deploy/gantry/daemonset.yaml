@@ -4,9 +4,9 @@
 #   - hostNetwork: false (§7.5) - pods use the cluster Pod network and
 #     dial each other directly via Pod IPs. peering ports (5001 +
 #     libp2p) are restricted by the optional hardening overlay in
-#     deploy/examples/networkpolicy.yaml (see deploy/README.md §
-#     Hardening overlays for the workflow - the overlay is NOT part
-#     of the default install).
+#     deploy/gantry/examples/networkpolicy.yaml (see the Production
+#     Security section of docs/content/guides/gantry.md - the overlay
+#     is NOT part of the default install).
 #   - hostPath mounts:
 #       /var/lib/gantry/libp2p  - persistent libp2p identity key, so
 #                                  the same peer ID survives restarts
@@ -30,8 +30,8 @@
 #     from the node CIDR (the overlay's default 127.0.0.1/32
 #     placeholder will drop mirror traffic on most CNIs because
 #     after DNAT the pod observes source = node IP, not 127.0.0.1).
-#   - Resource requests are placeholders (NF6 validation pending).
-#     Size them after observing real workload pressure:
+#   - Resource requests and limits are sized for high-fan-out benchmark nodes.
+#     Revisit them after observing real workload pressure:
 #       * CPU/memory: `kubectl top pod -l app.kubernetes.io/name=gantry`.
 #       * Network throughput: peer-fetch + origin-pull bandwidth via
 #         `p2p_peer_fetch_total`, `p2p_origin_pull_success_total`,
@@ -48,17 +48,20 @@
 #       * Storage backend health: `gantry_containerd_unavailable_total`
 #         and `gantry_containerd_open_error_total` flag containerd-side
 #         saturation independently of Gantry's CPU/memory.
-#   - The registry-credentials Secret is mounted read-only into
-#     /etc/gantry/registry; CredentialsPath in the agent config
-#     points at files inside it.
+#   - The optional fallback registry-credentials Secret is mounted read-only
+#     into /etc/gantry/registry; CredentialsPath in the agent config points at
+#     files inside it. Request-scoped Basic/Bearer challenge negotiation does
+#     not use this Secret; mounting it opts into legacy shared-identity mode.
 #
 # Apply with:
-#   kubectl apply -f deploy/serviceaccount.yaml
-#   kubectl apply -f deploy/registry-secret.yaml   # operator-supplied
-#   kubectl apply -f deploy/daemonset.yaml
+#   kubectl apply -f deploy/gantry/serviceaccount.yaml
+#   kubectl apply -f deploy/gantry/configmap.yaml
+#   # Optional shared identity: apply an edited private copy of
+#   # deploy/gantry/examples/registry-secret.example.yaml first.
+#   kubectl apply -f deploy/gantry/daemonset.yaml
 #
 # After verifying rollout, optionally harden with:
-#   # 1. Copy deploy/examples/networkpolicy.yaml into your own overlay
+#   # 1. Copy deploy/gantry/examples/networkpolicy.yaml into your own overlay
 #   # 2. Edit every "OPERATOR ACTION REQUIRED" ipBlock
 #   # 3. kubectl apply -f <your-overlay>/networkpolicy.yaml
 ---
@@ -218,11 +221,11 @@ spec:
             failureThreshold: 3
           resources:
             requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
               cpu: "2"
-              memory: 1Gi
+              memory: 2Gi
+            limits:
+              cpu: "8"
+              memory: 8Gi
           securityContext:
             runAsNonRoot: true
             runAsUser: 65532

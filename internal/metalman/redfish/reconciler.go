@@ -48,7 +48,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := slog.With("node", req.Name, "namespace", req.Namespace)
+	logger := slog.With("node", req.Name, "namespace", req.Namespace)
 
 	var machine v1alpha3.Machine
 	if err := r.Client.Get(ctx, req.NamespacedName, &machine); err != nil {
@@ -78,7 +78,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 
 		machine.Status.Redfish.CertFingerprint = fp
-		log.Info("TOFU: captured TLS cert fingerprint", "fingerprint", fp)
+		logger.InfoContext(ctx, "TOFU: captured TLS cert fingerprint", "fingerprint", fp)
 
 		return ctrl.Result{}, r.Client.Status().Update(ctx, &machine)
 	}

@@ -18,6 +18,8 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
+	"github.com/Azure/unbounded/internal/gantry/negcache"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 type commitOnlyCache struct{}
@@ -87,6 +89,21 @@ func (p *blockingOriginPuller) Head(context.Context, ifaces.OriginRef) (int64, s
 	return 0, "", nil
 }
 
+type authorizationRecordingOriginPuller struct {
+	body []byte
+	seen chan string
+}
+
+func (p *authorizationRecordingOriginPuller) Pull(ctx context.Context, _ ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	p.seen <- registryauth.Authorization(ctx)
+
+	return io.NopCloser(strings.NewReader(string(p.body))), int64(len(p.body)), nil
+}
+
+func (p *authorizationRecordingOriginPuller) Head(context.Context, ifaces.OriginRef) (int64, string, error) {
+	return int64(len(p.body)), "", nil
+}
+
 func TestRunOriginPull_ReopenFailurePreventsAdvertiseAndSuccess(t *testing.T) {
 	body := []byte("committed-but-not-reopenable")
 	d := trackerDigestOf(body)
@@ -97,7 +114,7 @@ func TestRunOriginPull_ReopenFailurePreventsAdvertiseAndSuccess(t *testing.T) {
 
 	var markPresent, successes, downstream int32
 
-	runOriginPull(originPuller, commitOnlyCache{}, nil, logger, h, "registry.example.com", "library/test", d, ifaces.KindBlob,
+	runOriginPull(context.Background(), originPuller, commitOnlyCache{}, nil, logger, h, "registry.example.com", "library/test", d, ifaces.KindBlob,
 		func(context.Context, digest.Digest) bool {
 			atomic.AddInt32(&markPresent, 1)
 			return true
@@ -132,7 +149,7 @@ func TestRunOriginPull_MarkPresentFailurePreventsSuccess(t *testing.T) {
 
 	var successes, downstream int32
 
-	runOriginPull(originPuller, cache, nil, logger, h, "registry.example.com", "library/test", d, ifaces.KindBlob,
+	runOriginPull(context.Background(), originPuller, cache, nil, logger, h, "registry.example.com", "library/test", d, ifaces.KindBlob,
 		func(context.Context, digest.Digest) bool { return false },
 		func(string, int64) { atomic.AddInt32(&successes, 1) },
 		func(string, string) { atomic.AddInt32(&downstream, 1) },
@@ -196,6 +213,89 @@ func TestPullerPumpDeclinesWhenSaturated(t *testing.T) {
 
 	close(originPuller.release)
 	gate.Wait()
+}
+
+func TestPullerPumpRetainsDelegatedAuthorizationForBackgroundPull(t *testing.T) {
+	body := []byte("delegated background pull")
+	d := trackerDigestOf(body)
+	originPuller := &authorizationRecordingOriginPuller{body: body, seen: make(chan string, 1)}
+	cache := fakes.NewCache()
+	gate := newPullerPumpGate()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	neg := negcache.New(negcache.Options{})
+	neg.RecordFailure(d, ifaces.FailureAuth)
+
+	pump := newPullerPump(
+		inflight.New(inflight.DefaultStalls(), nil),
+		originPuller,
+		cache,
+		neg,
+		logger,
+		gate,
+		1,
+		func(context.Context, digest.Digest) bool { return true },
+		func(string, int64) {},
+		func(string, string) {},
+		leaseMetricHooks{},
+	)
+
+	ctx := registryauth.WithAuthorization(context.Background(), "Bearer requester-token")
+
+	res := pump(ctx, "registry.example.com", "library/test", d, ifaces.KindBlob)
+	if res.Status != coord.PumpStarted {
+		t.Fatalf("status = %v, want PumpStarted", res.Status)
+	}
+
+	select {
+	case got := <-originPuller.seen:
+		if got != "Bearer requester-token" {
+			t.Fatalf("origin authorization = %q, want requester token", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("background origin pull did not start")
+	}
+
+	gate.Wait()
+
+	if _, ok := neg.Lookup(d); ok {
+		t.Fatal("successful delegated pull did not clear prior auth cooldown")
+	}
+}
+
+func TestPullerPumpDoesNotCacheDelegatedOriginFailure(t *testing.T) {
+	d := trackerDigestOf([]byte("missing delegated content"))
+	originPuller := fakes.NewOriginPuller()
+	cache := fakes.NewCache()
+	gate := newPullerPumpGate()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	neg := negcache.New(negcache.Options{})
+
+	pump := newPullerPump(
+		inflight.New(inflight.DefaultStalls(), nil),
+		originPuller,
+		cache,
+		neg,
+		logger,
+		gate,
+		1,
+		func(context.Context, digest.Digest) bool { return true },
+		func(string, int64) {},
+		func(string, string) {},
+		leaseMetricHooks{},
+	)
+
+	ctx := registryauth.WithAuthorization(context.Background(), "Bearer requester-token")
+
+	res := pump(ctx, "registry.example.com", "library/test", d, ifaces.KindBlob)
+	if res.Status != coord.PumpStarted {
+		t.Fatalf("status = %v, want PumpStarted", res.Status)
+	}
+
+	gate.Wait()
+
+	if _, ok := neg.Lookup(d); ok {
+		t.Fatal("delegated origin failure poisoned shared negative cache")
+	}
 }
 
 // TestPullerPumpSameDigestPiggybacksWhenSaturated proves the fanout bound does

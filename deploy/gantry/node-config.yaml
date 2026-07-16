@@ -1,0 +1,116 @@
+# Installs Gantry as containerd's default mirror on every Linux node.
+#
+# Apply this DaemonSet only after containerd's CRI registry config_path points
+# at /etc/containerd/certs.d. The _default namespace sends every registry to
+# Gantry first; Gantry accelerates only registries in upstream_registries and
+# returns control to containerd for all others.
+#
+# The configurator refuses to overwrite an unrelated _default/hosts.toml. A
+# file carrying the managed marker below may be updated by a later rollout.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gantry-containerd-hosts
+  namespace: gantry-system
+  labels:
+    app.kubernetes.io/name: gantry-containerd-config
+    app.kubernetes.io/component: node-config
+data:
+  hosts.toml: |
+    # Managed by the Gantry node-config DaemonSet.
+    [host."http://127.0.0.1:5000"]
+      capabilities = ["pull", "resolve"]
+      dial_timeout = "200ms"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gantry-containerd-config
+  namespace: gantry-system
+  labels:
+    app.kubernetes.io/name: gantry-containerd-config
+    app.kubernetes.io/component: node-config
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry-containerd-config
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gantry-containerd-config
+        app.kubernetes.io/component: node-config
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: configure
+          image: mcr.microsoft.com/cbl-mariner/busybox:2.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+
+              target_dir=/host-certs/_default
+              target_file="$target_dir/hosts.toml"
+              source_file=/config/hosts.toml
+              managed_marker='# Managed by the Gantry node-config DaemonSet.'
+
+              mkdir -p "$target_dir"
+              if [ -e "$target_file" ] && \
+                 ! grep -Fqx "$managed_marker" "$target_file"; then
+                echo "refusing to overwrite unmanaged $target_file" >&2
+                exit 1
+              fi
+
+              temp_file="$target_dir/.hosts.toml.gantry.tmp"
+              cp "$source_file" "$temp_file"
+              chmod 0644 "$temp_file"
+              mv "$temp_file" "$target_file"
+              echo "configured $target_file"
+
+              exec sleep 2147483647
+          readinessProbe:
+            exec:
+              command:
+                - cmp
+                - -s
+                - /config/hosts.toml
+                - /host-certs/_default/hosts.toml
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              cpu: 50m
+              memory: 16Mi
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: host-certs
+              mountPath: /host-certs
+            - name: config
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: host-certs
+          hostPath:
+            path: /etc/containerd/certs.d
+            type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: gantry-containerd-hosts

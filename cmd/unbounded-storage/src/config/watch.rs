@@ -138,6 +138,17 @@ fn debounce_loop(
     update_tx: mpsc::Sender<ConfigUpdate>,
     shutdown: Arc<AtomicBool>,
 ) {
+    debounce_loop_with_receiver(path, update_tx, shutdown, |timeout| {
+        raw_rx.recv_timeout(timeout)
+    });
+}
+
+fn debounce_loop_with_receiver(
+    path: PathBuf,
+    update_tx: mpsc::Sender<ConfigUpdate>,
+    shutdown: Arc<AtomicBool>,
+    mut recv: impl FnMut(Duration) -> Result<(), mpsc::RecvTimeoutError>,
+) {
     let mut generation: u64 = 0;
     loop {
         if shutdown.load(Ordering::Acquire) {
@@ -145,7 +156,7 @@ fn debounce_loop(
         }
         // Block until we see *some* event, then drain follow-on
         // events for up to `DEBOUNCE` of quiet to coalesce bursts.
-        match raw_rx.recv_timeout(DEBOUNCE) {
+        match recv(DEBOUNCE) {
             Ok(()) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -154,7 +165,7 @@ fn debounce_loop(
             if shutdown.load(Ordering::Acquire) {
                 return;
             }
-            match raw_rx.recv_timeout(DEBOUNCE) {
+            match recv(DEBOUNCE) {
                 Ok(()) => continue,
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -220,9 +231,9 @@ impl From<notify::Error> for WatchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::fs;
     use std::io::Write;
-    use std::time::Instant;
     use tempfile::TempDir;
 
     const VALID_A: &str = r#"
@@ -298,40 +309,27 @@ name = "b"
     fn burst_is_coalesced() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        write(&path, VALID_A);
+        write(&path, &valid_config_with_fingers(4004));
 
-        let (_w, rx) = ConfigWatcher::new(path.clone()).unwrap();
-        thread::sleep(Duration::from_millis(100));
+        let (update_tx, update_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut events = VecDeque::from([
+            Ok(()),
+            Ok(()),
+            Ok(()),
+            Ok(()),
+            Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected),
+        ]);
 
-        // Five quick back-to-back writes. The debounce window is
-        // 200ms, so these should fold down into far fewer updates.
-        // We deliberately do not sleep between writes: any inter-write
-        // delay just eats into the debounce budget on slow/loaded
-        // systems (e.g. CI) and turns this into a flaky timing test.
-        let start = Instant::now();
-        for i in 0..5 {
-            let body = valid_config_with_fingers(4000 + i);
-            write(&path, &body);
-        }
-        assert!(
-            start.elapsed() < Duration::from_millis(200),
-            "test precondition: burst must finish inside the debounce window",
-        );
+        debounce_loop_with_receiver(path, update_tx, shutdown, |_| {
+            events.pop_front().expect("scripted receive result")
+        });
 
-        // Drain for ~2s.
-        let mut updates = 0;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(_) => updates += 1,
-                Err(_) => {}
-            }
-        }
-        assert!(updates >= 1, "expected at least one update from the burst");
-        assert!(
-            updates < 5,
-            "expected debounce to coalesce 5 writes into <5 updates, got {updates}",
-        );
+        let updates: Vec<_> = update_rx.iter().collect();
+        assert_eq!(updates.len(), 1, "the burst must emit exactly one update");
+        assert_eq!(updates[0].loaded.config().fingers_per_node, Some(4004));
     }
 
     #[test]

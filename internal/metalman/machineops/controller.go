@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"sort"
 	"strings"
@@ -22,10 +23,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
 )
 
@@ -116,7 +117,7 @@ func shouldReconcile(op *v1alpha3.MachineOperation) bool {
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
+	logger := slog.With("machineOperation", req.Name)
 
 	var op v1alpha3.MachineOperation
 	if err := r.Get(ctx, client.ObjectKey{Name: req.Name}, &op); err != nil {
@@ -158,7 +159,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	if len(op.Status.Targets) == 0 {
-		logger.V(1).Info("operation has no targets", "operation", op.Name)
+		logger.DebugContext(ctx, "operation has no targets", "operation", op.Name)
 		return ctrl.Result{}, nil
 	}
 
@@ -716,6 +717,12 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 
 	if machine.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
 		if _, _, err := r.httpBootConfig(machine); err != nil {
+			if errors.Is(err, netboot.ErrNotYetDownloaded) {
+				target.Message = "waiting for OCI image to become available"
+
+				return targetChange{target: target}
+			}
+
 			return retryTarget(target, err, now, r.maxAttempts())
 		}
 	}
