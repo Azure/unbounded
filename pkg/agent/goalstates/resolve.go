@@ -43,15 +43,9 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		return nil, err
 	}
 
-	if err := config.ValidateAdditionalHostMounts(cfg.AdditionalHostMounts); err != nil {
+	additionalHostMounts, err := resolveAdditionalHostMounts(cfg.AdditionalHostMounts)
+	if err != nil {
 		return nil, err
-	}
-
-	additionalHostMounts := slices.Clone(cfg.AdditionalHostMounts)
-	for i := range additionalHostMounts {
-		if additionalHostMounts[i].Target == "" {
-			additionalHostMounts[i].Target = additionalHostMounts[i].Source
-		}
 	}
 
 	kernel, err := hostKernel()
@@ -339,4 +333,22 @@ func normalizeOSReleaseID(value string) string {
 
 func normalizeOSReleaseValue(value string) string {
 	return strings.Trim(strings.TrimSpace(value), `"'`)
+}
+
+// resolveAdditionalHostMounts validates the supplied mount entries, clones the
+// slice so the caller's config is not mutated, and defaults any empty Target to
+// the corresponding Source.
+func resolveAdditionalHostMounts(mounts []config.AdditionalHostMount) ([]config.AdditionalHostMount, error) {
+	if err := config.ValidateAdditionalHostMounts(mounts); err != nil {
+		return nil, err
+	}
+
+	resolved := slices.Clone(mounts)
+	for i := range resolved {
+		if resolved[i].Target == "" {
+			resolved[i].Target = resolved[i].Source
+		}
+	}
+
+	return resolved, nil
 }
