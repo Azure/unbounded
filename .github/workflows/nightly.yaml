@@ -14,10 +14,12 @@ name: nightly
 # workflow deploys a PUBLISHED, signed release (downloaded as a manifests
 # tarball from a GitHub Release) to unbounded-stable. This one has no release
 # and no tag: it builds the current main HEAD from source, pushes images
-# tagged `nightly-<shortsha>`, renders manifests against those tags, and
-# deploys them to unbounded-nightly. There is deliberately no cosign signing,
-# SBOM, or Trivy gating here: the nightly cluster is a throwaway soak target,
-# not a customer artifact. The full supply chain stays on the release path.
+# tagged `nightly-<shortsha>`, then bootstraps the operator via
+# `kubectl unbounded install` and lets it reconcile the Site into
+# unbounded-nightly (same operator-driven flow as release-upgrade.yaml). There
+# is deliberately no cosign signing, SBOM, or Trivy gating here: the nightly
+# cluster is a throwaway soak target, not a customer artifact. The full supply
+# chain stays on the release path.
 #
 # Schedule
 # --------
@@ -236,11 +238,24 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Build and push the remaining images the deploy needs (amd64).
-  #   - machina  : applied as part of the core deploy
-  #   - orca      : deployed separately by the deploy-orca job
-  # machine-ops-controller is intentionally omitted: like release-upgrade.yaml,
-  # the deploy applies only net/ and machina/, so machine-ops is never rolled
-  # out here and would be dead weight to build.
+  #
+  # The operator deploys every component workload when it reconciles the Site,
+  # so each image the operator references must exist at the nightly tag:
+  #   - machina                       : machina-controller Deployment
+  #   - unbounded-operator            : the operator itself, bootstrapped by
+  #                                     'kubectl unbounded install'. Its embedded
+  #                                     net/machina/storage manifests are pinned
+  #                                     to the nightly images via the
+  #                                     NET_*/MACHINA/STORAGE build-args below.
+  #   - metalman                      : synthesized per-Site Deployment; its
+  #                                     binary bakes the nightly netboot image,
+  #                                     so it is built with CONTAINER_REGISTRY.
+  #   - netboot                       : PXE artifact referenced by metalman
+  #   - unbounded-storage-supervisor  : per-Site storage supervisor DaemonSet
+  #   - orca                          : deployed separately by the deploy-orca job
+  #
+  # machine-ops-controller is intentionally omitted: the operator synthesizes
+  # metalman per Site instead, so machine-ops is never rolled out here.
   # ---------------------------------------------------------------------------
   component-images:
     needs: resolve
@@ -250,6 +265,14 @@ jobs:
         component:
           - name: machina
             file: images/machina/Containerfile
+          - name: netboot
+            file: images/netboot/Containerfile
+          - name: metalman
+            file: images/metalman/Containerfile
+          - name: unbounded-storage-supervisor
+            file: images/unbounded-storage-supervisor/Containerfile
+          - name: unbounded-operator
+            file: images/unbounded-operator/Containerfile
           - name: orca
             file: images/orca/Containerfile
     env:
@@ -272,6 +295,31 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute per-component build args
+        # Some images need extra build-args beyond VERSION/GIT_COMMIT so the
+        # references they bake in point at THIS snapshot's nightly images:
+        #   - metalman bakes the default netboot image from CONTAINER_REGISTRY.
+        #   - unbounded-operator embeds the net/machina/storage manifests; pin
+        #     each to the nightly tag so the operator rolls out nightly images.
+        # REGISTRY is already lowercased by the step above; TAG is the job env.
+        run: |
+          set -euo pipefail
+          {
+            echo 'EXTRA_BUILD_ARGS<<EOF'
+            case "${{ matrix.component.name }}" in
+              metalman)
+                echo "CONTAINER_REGISTRY=${REGISTRY}"
+                ;;
+              unbounded-operator)
+                echo "NET_CONTROLLER_IMAGE=${REGISTRY}/unbounded-net-controller:${TAG}"
+                echo "NET_NODE_IMAGE=${REGISTRY}/unbounded-net-node:${TAG}"
+                echo "MACHINA_IMAGE=${REGISTRY}/machina:${TAG}"
+                echo "STORAGE_SUPERVISOR_IMAGE=${REGISTRY}/unbounded-storage-supervisor:${TAG}"
+                ;;
+            esac
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+
       - name: Build and push ${{ matrix.component.name }} image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -283,6 +331,7 @@ jobs:
           build-args: |
             VERSION=${{ env.TAG }}
             GIT_COMMIT=${{ env.SHA }}
+            ${{ env.EXTRA_BUILD_ARGS }}
           tags: ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ env.TAG }}
           cache-from: type=gha,scope=nightly-${{ matrix.component.name }}
           cache-to: type=gha,scope=nightly-${{ matrix.component.name }},mode=max
@@ -290,15 +339,21 @@ jobs:
   # ---------------------------------------------------------------------------
   # Deploy the snapshot to unbounded-nightly.
   #
-  #   MODE=init     -> 'kubectl unbounded site init' using manifests embedded
-  #                    into a plugin built from this snapshot (stamped with the
-  #                    nightly image tags). Used for the first bootstrap.
-  #   MODE=upgrade  -> render the machina + net manifests for the nightly tags
-  #                    and server-side apply them.
+  # Operator-driven, matching release-upgrade.yaml: 'kubectl unbounded install'
+  # bootstraps the CRDs and the operator, then the operator reconciles the Site
+  # and rolls out every component workload (net, machina, metalman, storage) in
+  # the unbounded-system namespace. The reaper migrates any legacy split-namespace
+  # state. We never render or apply component manifests directly here.
   #
-  # Unlike release-upgrade.yaml the manifests are rendered here from the
-  # snapshot checkout (no tarball download, no cosign verify): there is no
-  # release artifact for a nightly.
+  #   MODE=init     -> 'install' then 'site init --skip-install' (creates the
+  #                    Site the operator reconciles). Used for the first bootstrap.
+  #   MODE=upgrade  -> 'install' only; the operator reconciles the existing Site.
+  #
+  # The plugin is built from the snapshot checkout (no tarball download, no cosign
+  # verify): there is no release artifact for a nightly. Building it stamps the
+  # embedded operator manifests with this snapshot's nightly operator/metalman
+  # tags, and the operator image itself was built pinned to the nightly component
+  # images (see component-images).
   # ---------------------------------------------------------------------------
   deploy:
     needs: [resolve, net-images, component-images]
@@ -369,10 +424,13 @@ jobs:
           if [[ "${{ inputs.force_init }}" == "true" ]]; then
             MODE=init
             echo "force_init=true; selecting init mode"
-          elif ! kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1; then
+          elif kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1 && ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
+            echo "::error::Old Site CRD sites.net.unbounded-cloud.io is present but sites.unbounded-cloud.io is absent. Apply an explicit Site API migration before deploying this snapshot."
+            exit 1
+          elif ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
             MODE=init
             echo "Site CRD not present; selecting init mode"
-          elif ! kubectl get site.net.unbounded-cloud.io "${SITE_NAME}" >/dev/null 2>&1; then
+          elif ! kubectl get site.unbounded-cloud.io "${SITE_NAME}" >/dev/null 2>&1; then
             MODE=init
             echo "Site '${SITE_NAME}' not present; selecting init mode"
           else
@@ -381,14 +439,21 @@ jobs:
           echo "MODE=${MODE}" >> "$GITHUB_ENV"
           echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
 
-      - name: Build kubectl-unbounded plugin (init)
-        if: env.MODE == 'init'
-        # Building the plugin re-renders the embedded net + machina manifests
-        # stamped with this snapshot's nightly tags, so 'site init' installs
-        # manifests that reference the images built above.
+      - name: Build kubectl-unbounded plugin
+        # Building the plugin re-renders the embedded operator manifests stamped
+        # with this snapshot's nightly operator + metalman tags, so 'install'
+        # bootstraps an operator that references the images built above. Needed
+        # for both modes: upgrade also runs 'install'.
         run: |
           set -euo pipefail
           make kubectl-unbounded-build VERSION="${TAG}" CONTAINER_REGISTRY="${REGISTRY,,}"
+
+      - name: Bootstrap CRDs and operator
+        # Applies the operator manifests and waits for its rollout; the operator
+        # establishes the CRDs at startup. Runs for both init and upgrade.
+        run: |
+          set -euo pipefail
+          ./bin/kubectl-unbounded install --timeout=5m
 
       - name: Run site init (first install)
         if: env.MODE == 'init'
@@ -400,61 +465,38 @@ jobs:
             --cluster-pod-cidr  "${CLUSTER_POD_CIDR}" \
             --node-cidr         "${SITE_NODE_CIDR}" \
             --pod-cidr          "${SITE_POD_CIDR}" \
-            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}"
-
-      - name: Render manifests (upgrade)
-        if: env.MODE == 'upgrade'
-        run: |
-          set -euo pipefail
-          make machina-manifests net-manifests \
-            VERSION="${TAG}" \
-            CONTAINER_REGISTRY="${REGISTRY,,}"
-
-      - name: Apply CRDs (upgrade)
-        if: env.MODE == 'upgrade'
-        run: |
-          set -euo pipefail
-          kubectl apply --server-side --force-conflicts -f deploy/net/rendered/crd/
-          kubectl apply --server-side --force-conflicts -f deploy/machina/rendered/crd/
-          kubectl wait --for=condition=Established crd --all --timeout=120s
-
-      - name: Workaround for #235 - merge bundled machina-config with live ConfigMap
-        if: env.MODE == 'upgrade'
-        # Same #235 workaround as release-upgrade.yaml: preserve the live
-        # per-cluster apiServerEndpoint (only set by 'site init') when applying
-        # the freshly rendered machina-config. The merge script lives in-tree
-        # on the snapshot, so no default-branch sparse-checkout is needed.
-        #
-        # REMOVE once https://github.com/Azure/unbounded/issues/235 lands.
-        env:
-          BUNDLE_FILE: deploy/machina/rendered/03-config.yaml
-          MERGE_SCRIPT: hack/release/merge-machina-config.py
-        run: |
-          set -euo pipefail
-          if [[ ! -f "$BUNDLE_FILE" ]]; then
-            echo "::warning::Workaround for #235 expected ${BUNDLE_FILE} but it was not present; the workaround may no longer be needed"
-            exit 0
-          fi
-
-          LIVE_INNER=$(kubectl -n unbounded-system get cm machina-config \
-            -o jsonpath='{.data.config\.yaml}' --ignore-not-found)
-          export LIVE_INNER
-
-          python3 "$MERGE_SCRIPT"
-
-      - name: Apply manifests (upgrade)
-        if: env.MODE == 'upgrade'
-        run: |
-          set -euo pipefail
-          kubectl apply --server-side --force-conflicts -R -f deploy/net/rendered/
-          kubectl apply --server-side --force-conflicts -R -f deploy/machina/rendered/
+            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}" \
+            --skip-install
 
       - name: Wait for rollouts
         run: |
           set -euo pipefail
-          kubectl -n unbounded-system  rollout status deploy/unbounded-net-controller --timeout=5m
-          kubectl -n unbounded-system  rollout status ds/unbounded-net-node           --timeout=5m
-          kubectl -n unbounded-system rollout status deploy/machina-controller       --timeout=5m
+          # Post-redesign, all component workloads are created by the operator in
+          # the unified unbounded-system namespace. They appear asynchronously
+          # after the operator reconciles the Site, so wait for each object to
+          # exist before checking its rollout status.
+          NS=unbounded-system
+
+          wait_exists() {
+            local kind="$1" name="$2" deadline=$((SECONDS + 300))
+            until kubectl -n "$NS" get "$kind" "$name" >/dev/null 2>&1; do
+              if (( SECONDS >= deadline )); then
+                echo "::error::timed out waiting for $kind/$name in $NS to be created"
+                return 1
+              fi
+              sleep 5
+            done
+          }
+
+          for target in \
+            "deploy unbounded-operator" \
+            "deploy unbounded-net-controller" \
+            "ds unbounded-net-node" \
+            "deploy machina-controller"; do
+            set -- $target
+            wait_exists "$1" "$2"
+            kubectl -n "$NS" rollout status "$1/$2" --timeout=5m
+          done
 
       - name: Summarize deploy
         if: always()
@@ -471,6 +513,7 @@ jobs:
             echo "### Workload images"
             echo ""
             echo '```'
+            kubectl -n unbounded-system get deploy unbounded-operator       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system  get deploy unbounded-net-controller -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system  get ds     unbounded-net-node       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system get deploy machina-controller       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
