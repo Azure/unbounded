@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package acrcredentialprovider
 
 import (
@@ -111,6 +114,7 @@ func TestHandleRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 
 	var output bytes.Buffer
+
 	err = provider.Handle(context.Background(), bytes.NewReader(input), &output)
 	require.NoError(t, err)
 

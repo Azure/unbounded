@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 package acrcredentialprovider
 
 import (
@@ -40,7 +43,7 @@ func NewDefaultAzureCredentialSource() (*AzureCredentialSource, error) {
 
 func (s *AzureCredentialSource) Credential(ctx context.Context, registry string) (RegistryCredential, error) {
 	if s.TokenCredential == nil {
-		return RegistryCredential{}, fmt.Errorf("Azure token credential is required")
+		return RegistryCredential{}, fmt.Errorf("no Azure token credential configured")
 	}
 
 	aadScope := s.AADScope
@@ -77,6 +80,7 @@ func exchangeACRRefreshToken(ctx context.Context, client *http.Client, registry,
 	form.Set("grant_type", "access_token")
 	form.Set("service", registry)
 	form.Set("access_token", accessToken)
+
 	if tenantID != "" {
 		form.Set("tenant", tenantID)
 	}
@@ -85,13 +89,15 @@ func exchangeACRRefreshToken(ctx context.Context, client *http.Client, registry,
 	if err != nil {
 		return "", fmt.Errorf("create ACR token exchange request: %w", err)
 	}
+
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("exchange Azure AD token for ACR refresh token: %w", err)
 	}
-	defer resp.Body.Close()
+
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("ACR token exchange failed for %q: %s", registry, resp.Status)
