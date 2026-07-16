@@ -231,7 +231,6 @@ impl From<notify::Error> for WatchError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::fs;
     use std::io::Write;
@@ -314,7 +313,7 @@ name = "b"
 
         let (update_tx, update_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let events = RefCell::new(VecDeque::from([
+        let mut events = VecDeque::from([
             Ok(()),
             Ok(()),
             Ok(()),
@@ -322,16 +321,13 @@ name = "b"
             Ok(()),
             Err(mpsc::RecvTimeoutError::Timeout),
             Err(mpsc::RecvTimeoutError::Disconnected),
-        ]));
+        ]);
 
         debounce_loop_with_receiver(path, update_tx, shutdown, |_| {
-            events
-                .borrow_mut()
-                .pop_front()
-                .expect("scripted receive result")
+            events.pop_front().expect("scripted receive result")
         });
         assert!(
-            events.borrow().is_empty(),
+            events.is_empty(),
             "the debounce loop should consume the scripted burst completely",
         );
 
