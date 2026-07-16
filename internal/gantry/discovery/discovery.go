@@ -584,17 +584,22 @@ func DigestToCID(d digest.Digest) (cid.Cid, error) {
 }
 
 // transferAddrWithPort extracts the dial address for the peer's transfer
-// endpoint by walking its multiaddrs for an IPv4/IPv6 component and
-// appending the configured port. Returns the empty string if no
-// IP-based multiaddr is present.
+// endpoint by walking its multiaddrs for a remotely usable IPv4/IPv6
+// component and appending the configured port. Returns the empty string
+// if no usable IP-based multiaddr is present.
 func transferAddrWithPort(ai peer.AddrInfo, port int) string {
 	for _, ma := range ai.Addrs {
-		ip, ok := extractIP(ma)
+		value, ok := extractIP(ma)
 		if !ok {
 			continue
 		}
 
-		return ip + ":" + strconv.Itoa(port)
+		ip := net.ParseIP(value)
+		if ip == nil || !ip.IsGlobalUnicast() {
+			continue
+		}
+
+		return net.JoinHostPort(value, strconv.Itoa(port))
 	}
 
 	return ""
@@ -606,7 +611,7 @@ func extractIP(ma multiaddr.Multiaddr) (string, bool) {
 	}
 
 	if v, err := ma.ValueForProtocol(multiaddr.P_IP6); err == nil {
-		return "[" + v + "]", true
+		return v, true
 	}
 
 	return "", false

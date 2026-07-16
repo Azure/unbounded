@@ -1,0 +1,54 @@
+# Build stage
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.5-trixie AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    make \
+    gcc \
+    git \
+    ca-certificates \
+    && apt-get clean
+
+ENV CGO_ENABLED=0
+ENV GOPATH=/go
+ENV GOTOOLCHAIN=auto
+ENV PATH=$PATH:/go/bin
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ARG TARGETOS
+ARG TARGETARCH
+
+ARG VERSION=dev
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    make acr-credential-provider-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
+
+# Runtime stage. This image is intentionally shell-capable because it installs
+# host kubelet credential-provider files and restarts kubelet when needed.
+FROM ubuntu:noble
+
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    procps \
+    util-linux \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /unbounded/bin /unbounded/scripts
+
+COPY --from=builder /src/bin/acr-credential-provider /unbounded/bin/acr-credential-provider
+COPY hack/acr-credential-provider/installer/install.sh /unbounded/scripts/install.sh
+
+RUN chmod 0755 /unbounded/bin/acr-credential-provider /unbounded/scripts/install.sh
+
+ENV PATH="/unbounded/bin:/unbounded/scripts:${PATH}"
+
+WORKDIR /unbounded
+
+ENTRYPOINT ["/unbounded/scripts/install.sh"]

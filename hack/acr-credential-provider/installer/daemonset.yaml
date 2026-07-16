@@ -1,0 +1,86 @@
+# Installer for the repo-owned ACR kubelet exec credential provider fixture.
+#
+# This is an internal validation fixture. It mutates host kubelet configuration
+# and must be installed before private ACR pull tests run without
+# imagePullSecrets.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: acr-credential-provider-system
+  labels:
+    app.kubernetes.io/name: acr-credential-provider-installer
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: acr-credential-provider-installer
+  namespace: acr-credential-provider-system
+  labels:
+    app.kubernetes.io/name: acr-credential-provider-installer
+    app.kubernetes.io/component: node-config
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: acr-credential-provider-installer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: acr-credential-provider-installer
+        app.kubernetes.io/component: node-config
+    spec:
+      hostPID: true
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: install
+          image: ghcr.io/azure/acr-credential-provider-installer:53b9d94e
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ACR_PROVIDER_NAME
+              value: acr-credential-provider
+            - name: ACR_PROVIDER_BIN_DIR
+              value: /var/lib/kubelet/credential-provider/bin
+            - name: ACR_PROVIDER_CONFIG_PATH
+              value: /var/lib/kubelet/credential-provider/config.yaml
+            - name: ACR_PROVIDER_RESTART_JITTER_SECONDS
+              value: "180"
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  test -x /host/var/lib/kubelet/credential-provider/bin/acr-credential-provider && \
+                    grep -q 'Managed by the Unbounded ACR credential provider installer' /host/var/lib/kubelet/credential-provider/config.yaml && \
+                    grep -q -- '--image-credential-provider-config=/var/lib/kubelet/credential-provider/config.yaml' /host/etc/default/kubelet
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            privileged: true
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
