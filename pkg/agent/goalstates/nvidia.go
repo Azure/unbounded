@@ -12,10 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
-
-	"golang.org/x/sys/unix"
 )
 
 // NVIDIA host discovery and goal state resolution.
@@ -77,10 +74,6 @@ type NvidiaHost struct {
 	// NvidiaSMIPath is the host path to nvidia-smi, when available.
 	NvidiaSMIPath string
 
-	// DriverRootLibDir is the architecture-specific host library directory
-	// exposed under /run/nvidia/driver for NVIDIA DRA workloads.
-	DriverRootLibDir string
-
 	// DriverVersion is the active NVIDIA kernel driver version. It is used to
 	// provide versioned library names when a host installation exposes only
 	// unversioned or SONAME aliases through ldconfig.
@@ -126,10 +119,6 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 		return NvidiaHost{}, fmt.Errorf("unsupported architecture %q for NVIDIA library discovery", arch)
 	}
 
-	if err := ensureNVIDIAFabricIMEXManagementDevice(); err != nil {
-		return NvidiaHost{}, fmt.Errorf("ensure NVIDIA fabric IMEX management device: %w", err)
-	}
-
 	devices := discoverNVIDIADevices()
 	libraries := resolveNVIDIALibraries(archInfo)
 
@@ -141,7 +130,6 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 		I386LibMappings:  libraries.i386LibMappings,
 		I386LibDirMounts: libraries.i386LibDirMounts,
 		NvidiaSMIPath:    discoverNVIDIASMI(),
-		DriverRootLibDir: strings.TrimPrefix(archInfo.libDir, "/usr"),
 		DriverVersion:    libraries.driverVersion,
 	}, nil
 }
@@ -159,13 +147,11 @@ func resolveNvidiaRuntime() NvidiaRuntime {
 }
 
 const (
-	devDir                         = "/dev"
-	nvidiaCapsDirName              = "nvidia-caps"
-	nvidiaIMEXDirName              = "nvidia-caps-imex-channels"
-	driDir                         = "/dev/dri"
-	nvidiaDevPrefix                = "nvidia"
-	nvidiaFabricIMEXCapabilityPath = "/proc/driver/nvidia/capabilities/fabric-imex-mgmt"
-	procDevicesPath                = "/proc/devices"
+	devDir            = "/dev"
+	nvidiaCapsDirName = "nvidia-caps"
+	nvidiaIMEXDirName = "nvidia-caps-imex-channels"
+	driDir            = "/dev/dri"
+	nvidiaDevPrefix   = "nvidia"
 )
 
 // nvidiaArch contains architecture-specific values for NVIDIA library
@@ -271,88 +257,6 @@ func discoverNVIDIADevicesIn(deviceDir string) []string {
 	slices.Sort(devices)
 
 	return devices
-}
-
-func ensureNVIDIAFabricIMEXManagementDevice() error {
-	return ensureNVIDIAFabricIMEXManagementDeviceAt(
-		nvidiaFabricIMEXCapabilityPath,
-		procDevicesPath,
-		filepath.Join(devDir, nvidiaCapsDirName),
-		unix.Mknod,
-	)
-}
-
-func ensureNVIDIAFabricIMEXManagementDeviceAt(capabilityPath, devicesPath, capsDir string, mknod mknodFunc) error {
-	data, err := os.ReadFile(capabilityPath)
-	if os.IsNotExist(err) {
-		return nil
-	}
-
-	if err != nil {
-		return fmt.Errorf("read capability file: %w", err)
-	}
-
-	values := make(map[string]string)
-
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 2 {
-			values[strings.TrimSuffix(fields[0], ":")] = fields[1]
-		}
-	}
-
-	minor, err := strconv.ParseUint(values["DeviceFileMinor"], 0, 32)
-	if err != nil {
-		return fmt.Errorf("parse DeviceFileMinor: %w", err)
-	}
-
-	mode, err := strconv.ParseUint(values["DeviceFileMode"], 0, 32)
-	if err != nil {
-		return fmt.Errorf("parse DeviceFileMode: %w", err)
-	}
-
-	nodePath := filepath.Join(capsDir, fmt.Sprintf("nvidia-cap%d", minor))
-	if _, err := os.Lstat(nodePath); err == nil {
-		return nil
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("stat capability device: %w", err)
-	}
-
-	devices, err := os.ReadFile(devicesPath)
-	if err != nil {
-		return fmt.Errorf("read devices file: %w", err)
-	}
-
-	var major uint64
-
-	for _, line := range strings.Split(string(devices), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 || fields[1] != nvidiaCapsDirName {
-			continue
-		}
-
-		major, err = strconv.ParseUint(fields[0], 10, 32)
-		if err != nil {
-			return fmt.Errorf("parse nvidia-caps major: %w", err)
-		}
-
-		break
-	}
-
-	if major == 0 {
-		return fmt.Errorf("nvidia-caps major not found")
-	}
-
-	if err := os.MkdirAll(capsDir, 0o755); err != nil {
-		return fmt.Errorf("create capability directory: %w", err)
-	}
-
-	dev := int(unix.Mkdev(uint32(major), uint32(minor)))
-	if err := mknod(nodePath, unix.S_IFCHR|uint32(mode)&0o777, dev); err != nil && !os.IsExist(err) {
-		return fmt.Errorf("create capability device: %w", err)
-	}
-
-	return nil
 }
 
 // nvidiaLibPrefixes are the library name prefixes collected from ldconfig output.

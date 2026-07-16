@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sys/unix"
 )
 
 func TestDiscoverNVIDIADevicesIncludesIMEXChannels(t *testing.T) {
@@ -27,39 +26,6 @@ func TestDiscoverNVIDIADevicesIncludesIMEXChannels(t *testing.T) {
 	require.Contains(t, devices, imexDir)
 	require.NotContains(t, devices, channel)
 	require.NotContains(t, devices, nonChannel)
-}
-
-func TestEnsureNVIDIAFabricIMEXManagementDevice(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	capabilityPath := filepath.Join(root, "fabric-imex-mgmt")
-	devicesPath := filepath.Join(root, "devices")
-	capsDir := filepath.Join(root, nvidiaCapsDirName)
-
-	require.NoError(t, os.WriteFile(capabilityPath, []byte("DeviceFileMinor: 4323\nDeviceFileMode: 256\n"), 0o644))
-	require.NoError(t, os.WriteFile(devicesPath, []byte("Character devices:\n508 nvidia-caps\n"), 0o644))
-
-	var (
-		gotPath   string
-		gotMode   uint32
-		gotDevice int
-	)
-
-	err := ensureNVIDIAFabricIMEXManagementDeviceAt(
-		capabilityPath,
-		devicesPath,
-		capsDir,
-		func(path string, mode uint32, device int) error {
-			gotPath, gotMode, gotDevice = path, mode, device
-			return nil
-		},
-	)
-
-	require.NoError(t, err)
-	require.Equal(t, filepath.Join(capsDir, "nvidia-cap4323"), gotPath)
-	require.Equal(t, uint32(unix.S_IFCHR|0o400), gotMode)
-	require.Equal(t, unix.Mkdev(508, 4323), uint64(gotDevice))
 }
 
 func TestParseNVIDIALibraries(t *testing.T) {

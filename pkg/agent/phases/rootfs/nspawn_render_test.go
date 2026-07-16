@@ -180,16 +180,12 @@ func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 		NvidiaGPUDevicePaths:         []string{"/dev/nvidia-caps", channels},
-		NvidiaDriverRootLibDir:       "/lib/aarch64-linux-gnu",
 	}
 
 	var nspawnBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
 	require.Contains(t, nspawnBuf.String(), "Bind=/dev/nvidia-caps")
 	require.Contains(t, nspawnBuf.String(), "Bind="+channels)
-	require.Contains(t, nspawnBuf.String(), "BindReadOnly=/usr/bin:/run/nvidia/driver/usr/bin")
-	require.Contains(t, nspawnBuf.String(),
-		"BindReadOnly=/lib/aarch64-linux-gnu:/run/nvidia/driver/lib/aarch64-linux-gnu")
 
 	var overrideBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
