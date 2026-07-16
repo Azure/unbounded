@@ -33,18 +33,25 @@ type ensureNSpawnWorkspace struct {
 }
 
 type NSpawnBind struct {
-	Source   string
-	Target   string
+	// Source is the host path passed to Bind=/BindReadOnly=.
+	Source string
+	// Target is the optional container path. Empty means "bind at Source".
+	Target string
+	// ReadOnly controls whether BindReadOnly= is used instead of Bind=.
 	ReadOnly bool
 }
 
 type NSpawnDeviceAllow struct {
+	// Specifier is the systemd DeviceAllow selector (path or char-* class).
 	Specifier string
-	Access    string
+	// Access is the device permission mode, usually "rwm".
+	Access string
 }
 
 type NSpawnDeviceTarget struct {
-	Bind  NSpawnBind
+	// Bind controls visibility of a host path inside nspawn.
+	Bind NSpawnBind
+	// Allow controls cgroup device access for the corresponding target.
 	Allow NSpawnDeviceAllow
 }
 
@@ -87,13 +94,17 @@ type nspawnTemplateData struct {
 	ContainerImageArchiveHostDir string
 	HostDevicePaths              []string
 	HostDeviceGroupSpecifiers    []string
-	NvidiaDeviceTargets          []NSpawnDeviceTarget
-	NvidiaLibDirMounts           []goalstates.NvidiaLibDirMount
-	NvidiaI386LibDirMounts       []goalstates.NvidiaLibDirMount
-	NvidiaBinDir                 string
-	AMDGPUDevicePaths            []string
-	AMDSysFSPaths                []string
+	// NvidiaDeviceTargets contains render-ready Bind+DeviceAllow pairs.
+	NvidiaDeviceTargets    []NSpawnDeviceTarget
+	NvidiaLibDirMounts     []goalstates.NvidiaLibDirMount
+	NvidiaI386LibDirMounts []goalstates.NvidiaLibDirMount
+	NvidiaBinDir           string
+	AMDGPUDevicePaths      []string
+	AMDSysFSPaths          []string
 }
+
+// TODO: migrate HostDevicePaths/HostDeviceGroupSpecifiers and AMDGPUDevicePaths
+// to structured bind/device-allow targets in a follow-up PR.
 
 // writeNSpawnConfigs renders the nspawn and service-override templates with
 // device and GPU data (when present) and writes them to their configured paths.

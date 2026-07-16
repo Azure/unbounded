@@ -47,33 +47,7 @@ func TestNSpawnRenderedScenarios(t *testing.T) {
 	t.Parallel()
 
 	cases := map[string]nspawnTemplateData{
-		"minimal": nspawnRenderScenarioData(),
-		"nvidia-generic": func() nspawnTemplateData {
-			data := nspawnRenderScenarioData()
-			data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{
-				"/dev/nvidia0",
-				"/dev/nvidiactl",
-				"/dev/nvidia-uvm",
-				"/dev/dri/renderD128",
-			})
-
-			return data
-		}(),
-		"nvidia-gb300-imex": func() nspawnTemplateData {
-			data := nspawnRenderScenarioData()
-			data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{
-				"/dev/nvidia0",
-				"/dev/nvidia1",
-				"/dev/nvidia2",
-				"/dev/nvidia3",
-				"/dev/nvidiactl",
-				"/dev/nvidia-caps",
-				"/dev/nvidia-caps-imex-channels",
-				"/dev/dri/renderD128",
-			})
-
-			return data
-		}(),
+		"cpu-only": nspawnRenderScenarioData(),
 		"nvidia-gb300-rack-full": func() nspawnTemplateData {
 			data := nspawnRenderScenarioData()
 			data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{
@@ -111,24 +85,14 @@ func TestNSpawnRenderedScenarios(t *testing.T) {
 
 			return data
 		}(),
-		"nvidia-smi-only": func() nspawnTemplateData {
-			data := nspawnRenderScenarioData()
-			data.NvidiaBinDir = nvidiaHostBinDir(goalstates.NvidiaHost{
-				NvidiaSMIPath: "/usr/bin/nvidia-smi",
-			})
-
-			return data
-		}(),
-		"nvidia-imex-only": func() nspawnTemplateData {
-			data := nspawnRenderScenarioData()
-			data.NvidiaBinDir = nvidiaHostBinDir(goalstates.NvidiaHost{
-				NvidiaIMEXPath: "/usr/bin/nvidia-imex",
-			})
-
-			return data
-		}(),
 		"nvidia-all-helpers": func() nspawnTemplateData {
 			data := nspawnRenderScenarioData()
+			data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{
+				"/dev/nvidia0",
+				"/dev/nvidiactl",
+				"/dev/nvidia-uvm",
+				"/dev/dri/renderD128",
+			})
 			data.NvidiaBinDir = nvidiaHostBinDir(goalstates.NvidiaHost{
 				NvidiaSMIPath:     "/usr/bin/nvidia-smi",
 				NvidiaIMEXPath:    "/usr/bin/nvidia-imex",

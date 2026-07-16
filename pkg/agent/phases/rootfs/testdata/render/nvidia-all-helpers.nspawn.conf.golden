@@ -29,6 +29,12 @@ BindReadOnly=/lib/modules
 Bind=/run/bpffs/kube1:/sys/fs/bpf
 # Bind staged offline container image archives read-only into the container.
 BindReadOnly=/var/lib/unbounded/container-images/current:/var/lib/unbounded/container-images
+# GPU support - bind-mount NVIDIA device nodes into the container so that GPU
+# workloads (e.g. CUDA, container runtimes with GPU access) work inside nspawn.
+Bind=/dev/nvidia0
+Bind=/dev/nvidiactl
+Bind=/dev/nvidia-uvm
+Bind=/dev/dri/renderD128
 # Stage host-matched NVIDIA helpers so node-start can copy them into the root
 # passed to nvidia-ctk with --driver-root. They are not run from this mount.
 BindReadOnly=/usr/bin:/run/host-nvidia-bin
