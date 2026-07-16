@@ -106,8 +106,8 @@ Set `controller.managedKubeProxy.image` to override the image for all
 unbounded-managed kube-proxy DaemonSets, for example when pulling kube-proxy
 through a private registry. Set `controller.managedKubeProxy.enabled` to `false`
 to disable their creation. See the
-[managed kube-proxy design](../../designs/managed-kube-proxy.md) for scheduling
-and per-Site behavior.
+[rendered networking configuration](../content/reference/networking/configuration.md#managed-kube-proxy)
+for scheduling and per-Site behavior.
 
 | Flag | Runtime setting | Type | Default | Description |
 |------|-----------------|------|---------|-------------|
