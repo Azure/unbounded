@@ -132,6 +132,11 @@ The agent also auto-mounts host storage and InfiniBand hardware:
   device group specifiers, such as `char-input`, `char-pts`, and `block-*`.
   Device paths are bind-mounted and granted with `DeviceAllow=`. Group
   specifiers are rendered only as `DeviceAllow=` rules.
+- **Configured extra mounts.** `AdditionalHostMounts` binds non-device host
+  files or directories into the machine. `Source` must be an absolute host
+  path. `Target` is also absolute and defaults to `Source` when omitted.
+  Set `ReadOnly` to `true` unless the machine requires write access. Sources
+  are not created or required to exist during config validation.
 
 Device discovery runs once when the machine is provisioned. Disks or HCAs
 hot-plugged after the machine has started are not picked up until the machine
@@ -160,6 +165,7 @@ The configuration is written to two files on the host before the machine boots:
 | `Bind=<block device>` | nspawn config | Storage block device bind-mount (auto-generated for non-virtual `/sys/class/block` entries, including partitions, `dm-*`, and `md*`). |
 | `Bind=/dev/infiniband/*` | nspawn config | InfiniBand HCA device bind-mount (auto-generated when `/dev/infiniband` devices are present). |
 | `Bind=<configured /dev path>` | nspawn config | Additional host device bind-mount (configured with agent config `AdditionalHostDevices`). |
+| `Bind=` / `BindReadOnly=<source>:<target>` | nspawn config | Additional filesystem bind-mount configured through `AdditionalHostMounts`. |
 | `Bind=` / `BindReadOnly=` | nspawn config | GPU device and library bind-mounts (auto-generated when GPUs are present). |
 | `DeviceAllow=` | Service override | Cgroup device permissions for all bind-mounted host device nodes (KVM, block, InfiniBand, configured extra devices, GPU). |
 | `DeviceAllow=<char/block group> rwm` | Service override | Additional systemd device group access configured through `AdditionalHostDevices`, for example `char-input`. |

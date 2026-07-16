@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
@@ -167,6 +168,21 @@ func TestNSpawnConfig_NVIDIADriverRootMounts(t *testing.T) {
 	require.Contains(t, buf.String(), "BindReadOnly=/usr/lib/x86_64-linux-gnu:/run/host-nvidia/0")
 	require.Contains(t, buf.String(), "BindReadOnly=/usr/lib/i386-linux-gnu:/run/host-nvidia-i386/0")
 	require.Contains(t, buf.String(), "BindReadOnly=/usr/bin:/run/host-nvidia-bin")
+}
+
+func TestNSpawnConfig_AdditionalHostMounts(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "nspawn.conf", nspawnTemplateData{
+		AdditionalHostMounts: []config.AdditionalHostMount{
+			{Source: "/opt/config", Target: "/opt/config", ReadOnly: true},
+			{Source: "/var/lib/data", Target: "/data"},
+		},
+	}))
+
+	require.Contains(t, buf.String(), "BindReadOnly=/opt/config:/opt/config")
+	require.Contains(t, buf.String(), "Bind=/var/lib/data:/data")
 }
 
 func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {

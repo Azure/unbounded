@@ -91,6 +91,11 @@ func TestCRIConfig_JSONRoundTrip(t *testing.T) {
 		},
 		CNI:                   CNIConfig{PluginVersion: "1.6.0"},
 		AdditionalHostDevices: []string{"/dev/uinput"},
+		AdditionalHostMounts: []AdditionalHostMount{{
+			Source:   "/opt/config",
+			Target:   "/etc/config",
+			ReadOnly: true,
+		}},
 	}
 
 	data, err := json.Marshal(cfg)
@@ -103,6 +108,11 @@ func TestCRIConfig_JSONRoundTrip(t *testing.T) {
 	assert.Equal(t, "1.2.0", decoded.CRI.Runc.Version)
 	assert.Equal(t, "1.6.0", decoded.CNI.PluginVersion)
 	assert.Equal(t, []string{"/dev/uinput"}, decoded.AdditionalHostDevices)
+	assert.Equal(t, []AdditionalHostMount{{
+		Source:   "/opt/config",
+		Target:   "/etc/config",
+		ReadOnly: true,
+	}}, decoded.AdditionalHostMounts)
 }
 
 func TestIsSystemdDeviceGroupSpecifier(t *testing.T) {
@@ -224,6 +234,46 @@ func TestAgentConfig_Validate(t *testing.T) {
 			},
 			wantErr: "AdditionalHostDevices",
 		},
+		{
+			name: "additional host mounts",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostMounts = []AdditionalHostMount{
+					{Source: "/opt/config", ReadOnly: true},
+					{Source: "/var/lib/data", Target: "/data"},
+				}
+			},
+		},
+		{
+			name: "additional host mount relative source",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostMounts = []AdditionalHostMount{{Source: "opt/config"}}
+			},
+			wantErr: "AdditionalHostMounts[0].Source",
+		},
+		{
+			name: "additional host mount unclean target",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostMounts = []AdditionalHostMount{{
+					Source: "/opt/config",
+					Target: "/etc/../config",
+				}}
+			},
+			wantErr: "AdditionalHostMounts[0].Target",
+		},
+		{
+			name: "additional host mount unsafe path",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostMounts = []AdditionalHostMount{{Source: "/opt/config:/etc/config"}}
+			},
+			wantErr: "AdditionalHostMounts[0].Source",
+		},
+		{
+			name: "additional host mount control character",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostMounts = []AdditionalHostMount{{Source: "/opt/config\u0000"}}
+			},
+			wantErr: "AdditionalHostMounts[0].Source",
+		},
 	}
 
 	for _, tt := range tests {
@@ -281,6 +331,9 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 			RegisterWithTaints: []string{"dedicated=test:NoSchedule"},
 		},
 		AdditionalHostDevices: []string{"/dev/uinput"},
+		AdditionalHostMounts: []AdditionalHostMount{{
+			Source: "/opt/config",
+		}},
 	}
 
 	copy := original.DeepCopy()
@@ -290,10 +343,12 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	copy.Kubelet.Labels["env"] = "prod"
 	copy.Kubelet.RegisterWithTaints[0] = "dedicated=prod:NoSchedule"
 	copy.AdditionalHostDevices[0] = "/dev/input/event0"
+	copy.AdditionalHostMounts[0].Source = "/opt/other"
 
 	require.Equal(t, "test", original.Kubelet.Labels["env"])
 	require.Equal(t, "dedicated=test:NoSchedule", original.Kubelet.RegisterWithTaints[0])
 	require.Equal(t, "/dev/uinput", original.AdditionalHostDevices[0])
+	require.Equal(t, "/opt/config", original.AdditionalHostMounts[0].Source)
 }
 
 func TestAgentConfig_DeepCopyNil(t *testing.T) {
