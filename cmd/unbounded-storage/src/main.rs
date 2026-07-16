@@ -18,7 +18,7 @@ use clap::Parser;
 use unbounded_storage::backend::BackendRegistry;
 use unbounded_storage::bufferpool::{Pool, PoolConfig};
 use unbounded_storage::config::{
-    self, BackendSpec, Config, FrontendSpec, ResolvedFrontendBinding, frontend_spec,
+    self, BackendSpec, Config, FrontendSpec, LoadedConfig, ResolvedFrontendBinding, frontend_spec,
 };
 use unbounded_storage::fabric::{self, Fabric, MrHandle, Provider};
 use unbounded_storage::fanout::{
@@ -27,16 +27,12 @@ use unbounded_storage::fanout::{
 use unbounded_storage::frontend::{
     HttpDriver, HttpFrontend, LoadgenDriver, LoadgenFrontend, S3Driver, S3Frontend,
 };
-use unbounded_storage::p2p::{
-    FingerTable, FingerTableConfig, PeerEntry, RouteTableHandle, RouteTableSnapshot,
-    RoutedTransport, TopologyPrefixWeight, TopologySelection, TopologyTags, TopologyWeighting,
-    node_to_ring,
-};
+use unbounded_storage::p2p::{RouteTableHandle, RoutedTransport};
 use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
 use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{
-    CacheDirectorySet, ChainLocalStore, DiskRegistry, UringDiskTarget,
+    CacheDirectorySet, ChainLocalStore, DiskRegistry, DiskReport, UringDiskTarget,
 };
 use unbounded_storage::topology::{CorePlan, CorePlanConfig, DiskCpuSlot, Host, ServingShard};
 
@@ -223,7 +219,7 @@ fn main() -> ExitCode {
         None => (PathBuf::from(DEFAULT_CONFIG_PATH), false),
     };
 
-    let config = match load_config(&config_path, config_explicit) {
+    let loaded = match load_config(&config_path, config_explicit) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("config error: {e}");
@@ -237,7 +233,7 @@ fn main() -> ExitCode {
     // allocation, and only take effect at process start. `load_config`
     // has already run `apply_defaults`, so every startup field is
     // populated with its documented default when omitted.
-    let startup = config.startup();
+    let startup = loaded.config().startup();
     let memory = startup.memory();
     let fabric_cfg = startup.fabric();
     // The metrics exporter addr is a startup-fixed knob; capture
@@ -409,14 +405,38 @@ fn main() -> ExitCode {
         .collect();
     let mut disk_registry = DiskRegistry::new(UringDiskTarget::new(runtime.clone()), disk_slots);
 
-    // Bring up the initial shard layer. A bring-up failure is fatal:
-    // there is no running process to reconcile into.
-    let layer = match shard_layer::spawn_shard_layer(&config, &deps) {
-        Ok(layer) => layer,
+    // Prepare the initial shard layer through phase B. The shards remain
+    // parked and RPC serving stays off until initial disks are published.
+    let loaded = Arc::new(loaded);
+    let prepared = match shard_layer::prepare_shard_layer(loaded.clone(), &deps) {
+        Ok(prepared) => prepared,
         Err(errs) => {
             for e in &errs {
                 eprintln!("shard bring-up failed: {e}");
             }
+            return ExitCode::FAILURE;
+        }
+    };
+    // Reconcile and publish the startup disk set before any frontend or
+    // recursive RPC path can serve. There is no prior applied disk state
+    // to retain at startup, so an open failure aborts the prepared layer.
+    let disk_report =
+        reconcile_cache_disks(&mut disk_registry, &cache_directories, loaded.runtime());
+    if !disk_report.failures.is_empty() {
+        shard_layer::retire_prepared_shard_layer(prepared);
+        clear_cache_disk_publications(&cache_directories);
+        disk_registry.drain();
+        return ExitCode::FAILURE;
+    }
+
+    let layer = match shard_layer::activate_shard_layer(prepared) {
+        Ok(layer) => layer,
+        Err(errs) => {
+            for e in &errs {
+                eprintln!("shard activation failed: {e}");
+            }
+            clear_cache_disk_publications(&cache_directories);
+            disk_registry.drain();
             return ExitCode::FAILURE;
         }
     };
@@ -427,17 +447,12 @@ fn main() -> ExitCode {
     ));
     device_inventory.set_block(device_inventory::block_annotation(&host));
 
-    // Reconcile the startup disk set now that the shards are up, then
-    // publish the channel set so shards can reach their disks.
-    let projection =
-        config::runtime_projection(&config).expect("loaded config projects to runtime");
-    reconcile_cache_disks(&mut disk_registry, &cache_directories, &projection);
-
     // The config controller is the single funnel for live changes. It
     // owns the running shard layer and disk supervisor (via the apply
     // target) and blocks each apply until the process has converged onto
     // the new config.
-    let target = shard_layer::ProcessApplyTarget::new(layer, disk_registry, cache_directories);
+    let target =
+        shard_layer::ProcessApplyTarget::new(layer, disk_registry, cache_directories.clone());
     // Seeds the latest-known, latest-applied, and startup config
     // versions from the startup config's top-level `version`.
     // `controller.config_versions()` hands out a cloneable handle to all
@@ -446,7 +461,7 @@ fn main() -> ExitCode {
     // loaded and applied; the startup version stays pinned to the config
     // realized here at process start, since the `[startup]` knobs it
     // tracks only take effect on restart.
-    let mut controller = config::ConfigController::new(target, Arc::new(config));
+    let mut controller = config::ConfigController::new(target, loaded);
 
     // Start the Prometheus exporter once the controller exists, so it can
     // publish the live config-version gauges. A bind failure is logged
@@ -476,14 +491,14 @@ fn main() -> ExitCode {
     // Watch the config file and drive each update through the
     // controller until shutdown. Every apply is in place; an apply error
     // is logged and the process keeps serving on the last-good config.
-    let exit_code = ExitCode::SUCCESS;
+    let mut exit_code = ExitCode::SUCCESS;
     match config::ConfigWatcher::new(config_path.clone()) {
         Ok((_watcher, update_rx)) => {
             while !SHUTDOWN.load(Ordering::Acquire) {
                 match update_rx.recv_timeout(SHUTDOWN_POLL) {
                     Ok(update) => {
-                        let version = update.config.version;
-                        match controller.apply(update.config.clone()) {
+                        let version = update.loaded.config().version;
+                        match controller.apply(update.loaded.clone()) {
                             Ok(outcome) => eprintln!(
                                 "config: applied gen={} version={} tier={:?}",
                                 update.generation, version, outcome.tier
@@ -520,8 +535,11 @@ fn main() -> ExitCode {
     // stop flag.
     let (layer, disk_registry) = controller.into_target().into_parts();
     if let Some(layer) = layer {
-        shard_layer::teardown_shard_layer(layer);
+        if shard_layer::teardown_shard_layer(layer) {
+            exit_code = ExitCode::FAILURE;
+        }
     }
+    clear_cache_disk_publications(&cache_directories);
     disk_registry.drain();
 
     // The exporter polls `SHUTDOWN` on its accept loop; join it last so a
@@ -548,15 +566,18 @@ fn run_shard(
     bytes_per_shard: usize,
     cache_directories: Arc<CacheDirectorySet>,
     routes: RouteTableHandle,
-    frontend_specs: Arc<Vec<FrontendSpec>>,
-    frontend_bindings: Arc<HashMap<String, ResolvedFrontendBinding>>,
-    backend_specs: Arc<Vec<BackendSpec>>,
+    loaded: Arc<LoadedConfig>,
     ctrl_rx: mpsc::Receiver<config::ShardCommand>,
     peer_rx: mpsc::Receiver<Arc<Vec<PeerPublish>>>,
     phaseb_tx: mpsc::Sender<PhaseBReport>,
     serve_start_rx: mpsc::Receiver<()>,
+    terminal_tx: mpsc::Sender<ShardTerminalReport>,
     layer_stop: Arc<AtomicBool>,
 ) {
+    let frontend_specs = &loaded.config().frontends;
+    let frontend_bindings = &loaded.runtime().frontends;
+    let backend_specs = &loaded.config().backends;
+    let phase_a = PhaseAReporter::new(widx, tx);
     // The fabric endpoint is built and owned by the `FabricGroup` in the
     // shard layer and shared by every shard mapped onto it (one per shard
     // for the tcp fallback, one per HCA for verbs). This shard registers
@@ -575,10 +596,7 @@ fn run_shard(
     }) {
         Ok(b) => b,
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: backing allocation failed: {e}",
-                widx.0,
-            )));
+            phase_a.report_failed(format!("worker={}: backing allocation failed: {e}", widx.0,));
             return;
         }
     };
@@ -586,10 +604,7 @@ fn run_shard(
     let mr = match fabric.register_backing(&backing, shard.numa) {
         Ok(mr) => mr,
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: register_backing: {e}",
-                widx.0,
-            )));
+            phase_a.report_failed(format!("worker={}: register_backing: {e}", widx.0,));
             return;
         }
     };
@@ -602,18 +617,12 @@ fn run_shard(
     let socket = match NetworkRing::new(256) {
         Ok(s) => Rc::new(s),
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: NetworkRing::new: {e}",
-                widx.0,
-            )));
+            phase_a.report_failed(format!("worker={}: NetworkRing::new: {e}", widx.0,));
             return;
         }
     };
     if let Err(e) = socket.register_backing(&backing) {
-        let _ = tx.send(ShardReady::Failed(format!(
-            "worker={}: socket register_backing: {e}",
-            widx.0,
-        )));
+        phase_a.report_failed(format!("worker={}: socket register_backing: {e}", widx.0,));
         return;
     }
 
@@ -678,10 +687,7 @@ fn run_shard(
     ) {
         Ok(r) => r,
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: build backend registry: {e}",
-                widx.0,
-            )));
+            phase_a.report_failed(format!("worker={}: build backend registry: {e}", widx.0,));
             return;
         }
     };
@@ -700,10 +706,10 @@ fn run_shard(
     ) {
         Ok(t) => t,
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
+            phase_a.report_failed(format!(
                 "worker={}: RoutedTransport::with_routes: {e}",
                 widx.0,
-            )));
+            ));
             return;
         }
     };
@@ -722,10 +728,7 @@ fn run_shard(
     ) {
         Ok(p) => p,
         Err(e) => {
-            let _ = tx.send(ShardReady::Failed(format!(
-                "worker={}: Pool::new: {e}",
-                widx.0,
-            )));
+            phase_a.report_failed(format!("worker={}: Pool::new: {e}", widx.0,));
             return;
         }
     };
@@ -773,16 +776,13 @@ fn run_shard(
     // publishing; exit cleanly by returning (the shard locals drop in
     // reverse declaration order; the shared `fabric` is released by the
     // `FabricGroup`, not here).
-    let _ = tx.send(ShardReady::Up {
-        worker_idx: widx,
-        publish: ShardPublish {
-            backing_base: backing_base as usize,
-            backing_len,
-            fabric_mr: mr,
-            numa: shard.numa,
-            fetch_channel,
-            backing_keepalive,
-        },
+    phase_a.report_up(ShardPublish {
+        backing_base: backing_base as usize,
+        backing_len,
+        fabric_mr: mr,
+        numa: shard.numa,
+        fetch_channel,
+        backing_keepalive,
     });
     let peers = match peer_rx.recv() {
         Ok(peers) => peers,
@@ -793,7 +793,7 @@ fn run_shard(
     // The guard sends `Failed` on any early return or panic so the
     // layer's bounded Phase-B collection never hangs waiting on a shard
     // that aborted (mirroring `report_on_panic` for Phase A).
-    let mut phaseb_guard = PhaseBGuard::new(widx, phaseb_tx);
+    let phaseb_guard = PhaseBGuard::new(widx, phaseb_tx);
 
     // PHASE B: register every peer shard's backing on our socket ring
     // (recording the fixed-buffer index each lands at) and assemble the
@@ -858,7 +858,7 @@ fn run_shard(
         fanout: fanout.clone(),
         geometry: geometry.clone(),
         routes: routes.clone(),
-        bindings: Rc::new(RefCell::new((*frontend_bindings).clone())),
+        bindings: Rc::new(RefCell::new(frontend_bindings.clone())),
         page_size,
         worker_idx: widx.0,
         waker: shard_loop.waker(),
@@ -898,31 +898,17 @@ fn run_shard(
             .iter()
             .map(|f| (f.name.clone(), f.clone()))
             .collect();
-        let mut last_bindings: HashMap<String, ResolvedFrontendBinding> =
-            (*frontend_bindings).clone();
+        let mut last_bindings: HashMap<String, ResolvedFrontendBinding> = frontend_bindings.clone();
+        let mut pending_frontend_updates = HashSet::new();
         shard_loop.add_tick_hook(move || {
             let mut did_work = false;
             while let Ok(cmd) = ctrl_rx.try_recv() {
                 match cmd {
                     config::ShardCommand::ApplyConfig(apply) => {
-                        routes.store_snapshot(apply.routes.clone());
-
-                        let projection = match config::runtime_projection(&apply.config) {
-                            Ok(projection) => projection,
-                            Err(e) => {
-                                let _ = apply.ack.send(config::ShardAck {
-                                    worker: widx,
-                                    result: Err(format!("config projection failed: {e}")),
-                                });
-                                did_work = true;
-                                continue;
-                            }
-                        };
-
-                        let desired_backends = apply.config.backends.as_slice();
-                        let desired_frontends = apply.config.frontends.as_slice();
+                        let desired_backends = apply.loaded.config().backends.as_slice();
+                        let desired_frontends = apply.loaded.config().frontends.as_slice();
                         let desired_frontend_backends =
-                            config::frontend_backend_map(&projection.frontends);
+                            config::frontend_backend_map(&apply.loaded.runtime().frontends);
                         // Refresh stripe geometry before building any
                         // frontend so a co-applied backend stripe change
                         // is visible to a frontend add in the same pass.
@@ -936,20 +922,14 @@ fn run_shard(
 
                         let frontends_to_rebuild = frontend_rebuild_ids(
                             &last_bindings,
-                            &projection.frontends,
+                            &apply.loaded.runtime().frontends,
                             &last_backends,
                             desired_backends,
+                            &pending_frontend_updates,
                         );
-                        if !frontends_to_rebuild.is_empty() {
-                            for id in frontends_to_rebuild {
-                                let _ = config::reconcile::FrontendReconcileTarget::remove(
-                                    &frontend_registry,
-                                    &id,
-                                );
-                                last_frontends.remove(&id);
-                            }
-                        }
-                        *bindings.borrow_mut() = projection.frontends.clone();
+                        let forced_frontend_updates: HashSet<String> =
+                            frontends_to_rebuild.into_iter().collect();
+                        *bindings.borrow_mut() = apply.loaded.runtime().frontends.clone();
 
                         // Drive the transport backend registry and the
                         // frontend registry together so frontend adds are
@@ -960,12 +940,43 @@ fn run_shard(
                             desired_backends,
                             desired_frontends,
                             &desired_frontend_backends,
+                            &forced_frontend_updates,
                             Some(&last_backends),
                             Some(&last_frontends),
                         );
                         last_backends = combined.backends.applied;
                         last_frontends = combined.frontends.applied;
-                        last_bindings = projection.frontends;
+
+                        // Replacement construction happens against desired
+                        // geometry/bindings, then failed replacements retain
+                        // their prior live resource and prior auxiliary state.
+                        {
+                            let mut g = geometry.borrow_mut();
+                            g.clear();
+                            for spec in last_backends.values() {
+                                g.insert(spec.name.clone(), spec.stripe_size_bytes());
+                            }
+                        }
+                        let unsuccessful_frontends: HashSet<String> = combined
+                            .frontends
+                            .failures
+                            .iter()
+                            .chain(&combined.frontends.deferred)
+                            .map(|(id, _)| id.clone())
+                            .collect();
+                        pending_frontend_updates = forced_frontend_updates
+                            .intersection(&unsuccessful_frontends)
+                            .cloned()
+                            .collect();
+                        let applied_bindings = applied_frontend_bindings(
+                            &last_bindings,
+                            &apply.loaded.runtime().frontends,
+                            desired_frontends,
+                            &last_frontends,
+                            &unsuccessful_frontends,
+                        );
+                        *bindings.borrow_mut() = applied_bindings.clone();
+                        last_bindings = applied_bindings;
 
                         let mut failures = combined.backends.failures;
                         failures.extend(combined.frontends.failures);
@@ -1015,7 +1026,7 @@ fn run_shard(
         Ok(()) => {}
         Err(_) => return,
     }
-    metrics::shards_delta(1);
+    let serving_guard = ServingGuard::new(widx, terminal_tx, &SHUTDOWN);
 
     // Drive the shard's cooperative future set until shutdown. The loop
     // busy-polls socket I/O and frontend work while active and idles
@@ -1025,8 +1036,6 @@ fn run_shard(
         || SHUTDOWN.load(Ordering::Acquire) || layer_stop.load(Ordering::Acquire),
         Duration::from_micros(100),
     );
-
-    metrics::shards_delta(-1);
 
     // Drop order matters:
     //   1. `shard_loop` first - clears tick hooks and futures, releasing
@@ -1043,22 +1052,11 @@ fn run_shard(
     drop(shard_loop);
     drop(pool);
     drop(socket);
+    serving_guard.complete();
 }
 
-/// Run a shard thread body `f`, guaranteeing exactly one
-/// [`ShardReady`] is observed on `tx` even when `f` panics during
-/// bring-up.
-///
-/// `f` (i.e. [`run_shard`]) reports its own readiness on the normal
-/// success and error paths through a sender it owns. The `tx` handed
-/// here is a *separate* clone reserved solely for the panic path: if
-/// `f` unwinds before reporting, its own sender is dropped by the
-/// unwind, but the surviving shards stay parked holding their sender
-/// clones, so `main`'s bounded `recv()` would block forever. Emitting a
-/// `Failed` here keeps the readiness count whole. A panic *after* `f`
-/// already reported `Up` produces a harmless extra `Failed`: `main`
-/// reads exactly N messages and ignores any surplus.
-fn report_on_panic<F>(tx: mpsc::Sender<ShardReady>, widx: WorkerIdx, f: F)
+/// Log a shard panic and preserve it for the owning join handle.
+fn report_on_panic<F>(widx: WorkerIdx, f: F)
 where
     F: FnOnce(),
 {
@@ -1067,14 +1065,11 @@ where
     // process is headed for the coherent failure path regardless.
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         eprintln!(
-            "shard worker={} panicked during bring-up: {}",
+            "shard worker={} panicked: {}",
             widx.0,
-            panic_payload_str(&payload),
+            panic_payload_str(&payload)
         );
-        let _ = tx.send(ShardReady::Failed(format!(
-            "worker={}: panicked during bring-up",
-            widx.0,
-        )));
+        std::panic::resume_unwind(payload);
     }
 }
 
@@ -1092,91 +1087,11 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> &str {
     }
 }
 
-fn build_routes(config: &Config) -> RouteTableSnapshot {
-    let projection = config::runtime_projection(config).expect("loaded config projects to runtime");
-    if projection.caches.is_empty() {
-        return RouteTableSnapshot {
-            cache_ids: HashSet::new(),
-            fingers: None,
-        };
-    }
-
-    let mesh = &projection.mesh;
-    let local = PeerEntry {
-        node: mesh.self_node_id,
-        ring: node_to_ring(mesh.self_node_id),
-        tags: TopologyTags(mesh.self_tags.clone()),
-    };
-    let fingers = if let Some(plan) = &mesh.routing_plan {
-        let peer_by_name: HashMap<&str, &config::RuntimePeer> = mesh
-            .peers
-            .iter()
-            .map(|peer| (peer.name.as_str(), peer))
-            .collect();
-        let entry_of = |name: &str| {
-            let peer = peer_by_name
-                .get(name)
-                .expect("validated routing_plan names reference peers");
-            PeerEntry {
-                node: peer.node_id,
-                ring: node_to_ring(peer.node_id),
-                tags: TopologyTags(peer.spec.tags.clone()),
-            }
-        };
-        Arc::new(FingerTable::from_explicit(
-            local,
-            plan.fingers.iter().map(|name| entry_of(name)).collect(),
-            plan.successor.as_deref().map(entry_of),
-            plan.predecessor.as_deref().map(entry_of),
-        ))
-    } else {
-        let peers: Vec<PeerEntry> = mesh
-            .peers
-            .iter()
-            .map(|peer| PeerEntry {
-                node: peer.node_id,
-                ring: node_to_ring(peer.node_id),
-                tags: TopologyTags(peer.spec.tags.clone()),
-            })
-            .collect();
-        Arc::new(FingerTable::build(
-            local,
-            &peers,
-            FingerTableConfig {
-                k: mesh.fingers_per_node.max(1),
-                topology: mesh
-                    .topology_weighting
-                    .as_ref()
-                    .map(p2p_topology_weighting)
-                    .map(TopologySelection::Weighted)
-                    .unwrap_or_default(),
-            },
-        ))
-    };
-    RouteTableSnapshot {
-        cache_ids: projection.caches.keys().cloned().collect(),
-        fingers: Some(fingers),
-    }
-}
-
-fn p2p_topology_weighting(weighting: &config::TopologyWeighting) -> TopologyWeighting {
-    TopologyWeighting {
-        prefix_weights: weighting
-            .prefix_weights
-            .iter()
-            .map(|weight| TopologyPrefixWeight {
-                tag_index: weight.tag_index,
-                weight: weight.weight,
-            })
-            .collect(),
-    }
-}
-
 fn reconcile_cache_disks(
     disk_registry: &mut DiskRegistry<UringDiskTarget>,
     cache_directories: &CacheDirectorySet,
     projection: &config::RuntimeGraph,
-) {
+) -> DiskReport {
     let mut cache_ids: Vec<String> = projection.caches.keys().cloned().collect();
     cache_ids.sort();
     cache_directories.reconcile(cache_ids.iter().cloned());
@@ -1197,7 +1112,14 @@ fn reconcile_cache_disks(
     for cache_id in cache_ids {
         cache_directories.apply_channels(&cache_id, channels.clone());
     }
+
+    report
 }
+
+fn clear_cache_disk_publications(cache_directories: &CacheDirectorySet) {
+    cache_directories.reconcile(std::iter::empty::<String>());
+}
+
 
 /// Validate and log the configured backends.
 ///
@@ -1290,6 +1212,7 @@ fn frontend_rebuild_ids(
     next_bindings: &HashMap<String, ResolvedFrontendBinding>,
     last_backends: &HashMap<String, BackendSpec>,
     desired_backends: &[BackendSpec],
+    pending_updates: &HashSet<String>,
 ) -> Vec<String> {
     let changed_backend_geometry: HashSet<String> = desired_backends
         .iter()
@@ -1307,8 +1230,31 @@ fn frontend_rebuild_ids(
             .then(|| id.clone())
         })
         .collect();
+    rebuild.extend(pending_updates.iter().cloned());
     rebuild.sort();
+    rebuild.dedup();
     rebuild
+}
+
+fn applied_frontend_bindings(
+    last_bindings: &HashMap<String, ResolvedFrontendBinding>,
+    desired_bindings: &HashMap<String, ResolvedFrontendBinding>,
+    desired_frontends: &[FrontendSpec],
+    applied_frontends: &HashMap<String, FrontendSpec>,
+    unsuccessful_frontends: &HashSet<String>,
+) -> HashMap<String, ResolvedFrontendBinding> {
+    applied_frontends
+        .iter()
+        .filter_map(|(id, spec)| {
+            let desired_spec = desired_frontends.iter().find(|desired| desired.name == *id);
+            let binding = if desired_spec == Some(spec) && !unsuccessful_frontends.contains(id) {
+                desired_bindings.get(id)
+            } else {
+                last_bindings.get(id)
+            }?;
+            Some((id.clone(), binding.clone()))
+        })
+        .collect()
 }
 
 impl FrontendBuildCtx {
@@ -1466,6 +1412,48 @@ enum ShardReady {
     Failed(String),
 }
 
+/// Owning phase-A reporter. Consuming report methods and the Drop
+/// fallback guarantee exactly one readiness message per shard.
+struct PhaseAReporter {
+    worker_idx: WorkerIdx,
+    tx: Option<mpsc::Sender<ShardReady>>,
+}
+
+impl PhaseAReporter {
+    fn new(worker_idx: WorkerIdx, tx: mpsc::Sender<ShardReady>) -> Self {
+        Self {
+            worker_idx,
+            tx: Some(tx),
+        }
+    }
+
+    fn report_up(mut self, publish: ShardPublish) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(ShardReady::Up {
+                worker_idx: self.worker_idx,
+                publish,
+            });
+        }
+    }
+
+    fn report_failed(mut self, message: String) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(ShardReady::Failed(message));
+        }
+    }
+}
+
+impl Drop for PhaseAReporter {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(ShardReady::Failed(format!(
+                "worker={}: aborted during phase A bring-up",
+                self.worker_idx.0
+            )));
+        }
+    }
+}
+
 /// Phase-A publication from one shard: the backing region other shards
 /// must register to `SEND_ZC` from this shard's pinned pages, plus the
 /// channel to this shard's [`FetchService`]. The base is shipped as a
@@ -1536,14 +1524,65 @@ impl PhaseBGuard {
         }
     }
 
-    fn report_ready(&mut self) {
+    fn report_ready(mut self) {
         self.reported = true;
         let _ = self.tx.send(PhaseBReport::Ready(self.widx));
     }
 
-    fn report_failed(&mut self, msg: String) {
+    fn report_failed(mut self, msg: String) {
         self.reported = true;
         let _ = self.tx.send(PhaseBReport::Failed(msg));
+    }
+}
+
+#[derive(Debug)]
+struct ShardTerminalReport {
+    worker_idx: WorkerIdx,
+    message: String,
+}
+
+struct ServingGuard {
+    worker_idx: WorkerIdx,
+    tx: mpsc::Sender<ShardTerminalReport>,
+    shutdown: &'static AtomicBool,
+    completed: bool,
+}
+
+impl ServingGuard {
+    fn new(
+        worker_idx: WorkerIdx,
+        tx: mpsc::Sender<ShardTerminalReport>,
+        shutdown: &'static AtomicBool,
+    ) -> Self {
+        metrics::shards_delta(1);
+        Self {
+            worker_idx,
+            tx,
+            shutdown,
+            completed: false,
+        }
+    }
+
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for ServingGuard {
+    fn drop(&mut self) {
+        metrics::shards_delta(-1);
+        if !self.completed {
+            let message = format!(
+                "worker={}: shard terminated while serving",
+                self.worker_idx.0
+            );
+            eprintln!("{message}");
+            let _ = self.tx.send(ShardTerminalReport {
+                worker_idx: self.worker_idx,
+                message,
+            });
+            self.shutdown.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -1593,11 +1632,15 @@ struct Cli {
 /// the file is absent, fall back to [`Config::default`] with a
 /// warning. Any other failure - including explicit missing paths and
 /// parse errors - is fatal.
-fn load_config(path: &Path, explicit: bool) -> Result<Config, String> {
-    match Config::load(path) {
+fn load_config(path: &Path, explicit: bool) -> Result<LoadedConfig, String> {
+    match LoadedConfig::load(path) {
         Ok(c) => {
             if path.extension().and_then(|e| e.to_str()) == Some("binpb") {
-                eprintln!("config: loaded {} (binpb):\n{c:#?}", path.display());
+                eprintln!(
+                    "config: loaded {} (binpb):\n{:#?}",
+                    path.display(),
+                    c.config()
+                );
             }
             Ok(c)
         }
@@ -1613,9 +1656,8 @@ fn load_config(path: &Path, explicit: bool) -> Result<Config, String> {
             // (`startup()`, `p2p()`, ...) would panic. Promote the proto3
             // zero values to documented defaults exactly as the on-disk
             // path does.
-            let mut c = Config::default();
-            c.apply_defaults();
-            Ok(c)
+            LoadedConfig::from_config(Config::default())
+                .map_err(|e| format!("loading built-in defaults: {e}"))
         }
         Err(e) => Err(format!("loading {}: {e}", path.display())),
     }
@@ -1960,11 +2002,11 @@ mod tests {
         let cfg = load_config(path, false).expect("missing default path falls back to defaults");
         // These accessors panic if defaults were not applied.
         assert_eq!(
-            cfg.startup().fabric().default_listen_addr(),
+            cfg.config().startup().fabric().default_listen_addr(),
             Some("0.0.0.0:0")
         );
         assert_eq!(
-            cfg.startup().memory().memory_total_bytes,
+            cfg.config().startup().memory().memory_total_bytes,
             Some(128 * 1024 * 1024)
         );
     }
@@ -2025,29 +2067,79 @@ mod tests {
     }
 
     #[test]
-    fn backend_stripe_size_change_rebuilds_frontend() {
-        let mut last_bindings = HashMap::new();
-        last_bindings.insert("f".to_string(), binding("f", "b"));
-
-        let mut next_bindings = HashMap::new();
-        next_bindings.insert("f".to_string(), binding("f", "b"));
-
+    fn failed_stripe_size_rebuild_retries() {
+        let bindings = HashMap::from([("f".to_string(), binding("f", "b"))]);
         let old_backend = backend_spec("b");
         let mut new_backend = old_backend.clone();
         let Some(config::backend_spec::Config::Http(cfg)) = new_backend.config.as_mut() else {
             panic!("expected http backend config");
         };
         *cfg.stripe_size_bytes.as_mut().expect("stripe size set") *= 2;
-
-        let mut last_backends = HashMap::new();
-        last_backends.insert(old_backend.name.clone(), old_backend);
+        let desired_backends = [new_backend];
+        let last_backends = HashMap::from([("b".to_string(), old_backend)]);
 
         assert_eq!(
             frontend_rebuild_ids(
-                &last_bindings,
-                &next_bindings,
+                &bindings,
+                &bindings,
                 &last_backends,
-                &[new_backend]
+                &desired_backends,
+                &HashSet::new(),
+            ),
+            vec!["f".to_string()],
+        );
+
+        // The backend update can apply before the forced frontend replacement
+        // fails, so geometry drift alone disappears from the next diff.
+        let advanced_backends = HashMap::from([("b".to_string(), desired_backends[0].clone())]);
+        assert_eq!(
+            frontend_rebuild_ids(
+                &bindings,
+                &bindings,
+                &advanced_backends,
+                &desired_backends,
+                &HashSet::from(["f".to_string()]),
+            ),
+            vec!["f".to_string()],
+            "failed forced replacement must be retried",
+        );
+    }
+
+    #[test]
+    fn failed_binding_rebuild_preserves_old_binding() {
+        let old_bindings = HashMap::from([("f".to_string(), binding("f", "old"))]);
+        let new_bindings = HashMap::from([("f".to_string(), binding("f", "new"))]);
+        let frontend = FrontendSpec {
+            name: "f".to_string(),
+            source: "new".to_string(),
+            ..Default::default()
+        };
+        let desired_frontends = [frontend.clone()];
+        let applied_frontends = HashMap::from([("f".to_string(), frontend)]);
+
+        let after_failure = applied_frontend_bindings(
+            &old_bindings,
+            &new_bindings,
+            &desired_frontends,
+            &applied_frontends,
+            &HashSet::from(["f".to_string()]),
+        );
+        assert_eq!(
+            after_failure["f"].backend_id, "old",
+            "failed replacement must retain its live binding",
+        );
+        let last_backends = HashMap::from([
+            ("old".to_string(), backend_spec("old")),
+            ("new".to_string(), backend_spec("new")),
+        ]);
+        let desired_backends = [backend_spec("old"), backend_spec("new")];
+        assert_eq!(
+            frontend_rebuild_ids(
+                &after_failure,
+                &new_bindings,
+                &last_backends,
+                &desired_backends,
+                &HashSet::new(),
             ),
             vec!["f".to_string()],
         );
@@ -2061,33 +2153,51 @@ mod tests {
     }
 
     #[test]
-    fn report_on_panic_emits_failed_when_body_panics() {
-        // A shard body that panics before reporting must still leave
-        // exactly one `Failed` on the channel so `main`'s bounded recv
-        // count stays whole and startup cannot deadlock.
+    fn phase_a_reporter_drop_reports_failure_once() {
         let (tx, rx) = mpsc::channel::<ShardReady>();
-        report_on_panic(tx, WorkerIdx(7), || {
-            panic!("boom during bring-up");
-        });
+        drop(PhaseAReporter::new(WorkerIdx(7), tx));
         match rx.recv() {
             Ok(ShardReady::Failed(msg)) => {
                 assert!(msg.contains("worker=7"), "got: {msg}");
-                assert!(msg.contains("panicked during bring-up"), "got: {msg}");
+                assert!(msg.contains("aborted during phase A"), "got: {msg}");
             }
             other => panic!("expected Failed, got {:?}", other.is_ok()),
         }
-        // No second message: the panic path reports exactly once.
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn report_on_panic_is_silent_when_body_succeeds() {
-        // On the normal path `run_shard` owns the reporting; the
-        // panic-path clone must stay quiet so no spurious `Failed`
-        // is appended.
-        let (tx, rx) = mpsc::channel::<ShardReady>();
-        report_on_panic(tx, WorkerIdx(0), || {});
+    fn report_on_panic_resumes_unwind() {
+        let result = std::panic::catch_unwind(|| {
+            report_on_panic(WorkerIdx(7), || panic!("boom during serving"));
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serving_guard_reports_abnormal_termination() {
+        static TEST_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+        TEST_SHUTDOWN.store(false, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+
+        drop(ServingGuard::new(WorkerIdx(3), tx, &TEST_SHUTDOWN));
+
+        let report = rx.recv().unwrap();
+        assert_eq!(report.worker_idx, WorkerIdx(3));
+        assert!(report.message.contains("terminated while serving"));
+        assert!(TEST_SHUTDOWN.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn serving_guard_normal_completion_is_silent() {
+        static TEST_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+        TEST_SHUTDOWN.store(false, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+
+        ServingGuard::new(WorkerIdx(3), tx, &TEST_SHUTDOWN).complete();
+
         assert!(rx.try_recv().is_err());
+        assert!(!TEST_SHUTDOWN.load(Ordering::Acquire));
     }
 
     #[test]

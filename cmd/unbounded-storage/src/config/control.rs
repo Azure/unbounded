@@ -30,13 +30,14 @@
 //! blocking fan-out/fan-in primitive used by that implementation lives
 //! here as [`ShardControlGroup`].
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvError, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
 
-use crate::config::{Config, ConfigDiff};
-use crate::p2p::RouteTableSnapshot;
+use crate::config::{ConfigDiff, LoadedConfig};
 use crate::runtime::WorkerIdx;
 
 /// A command delivered to a single shard's control channel. The shard
@@ -62,11 +63,8 @@ pub struct ShardDrainPageCache {
 
 /// Payload of [`ShardCommand::ApplyConfig`].
 pub struct ShardApply {
-    /// The new, defaults-applied, validated configuration.
-    pub config: Arc<Config>,
-    /// The route table rebuilt from `config`. Published into the shard's
-    /// route-table handle so transports observe it atomically.
-    pub routes: RouteTableSnapshot,
+    /// The new finalized config, runtime graph, and route table.
+    pub loaded: Arc<LoadedConfig>,
     /// Section-level diff that selected this apply path.
     pub diff: ConfigDiff,
     /// Channel the shard sends its [`ShardAck`] on once the apply has
@@ -89,11 +87,22 @@ pub enum ApplyError {
     ShardSend(WorkerIdx),
     /// The ack channel disconnected before every shard reported, so we
     /// cannot prove the apply completed everywhere.
-    AckDisconnected { expected: usize, received: usize },
+    AckDisconnected {
+        expected: usize,
+        received: usize,
+        outstanding: Vec<WorkerIdx>,
+    },
+    /// Not every shard acknowledged before the control deadline. Commands
+    /// already delivered may still complete, so the live process can no
+    /// longer safely retry the apply.
+    AckTimeout {
+        expected: usize,
+        received: usize,
+        outstanding: Vec<WorkerIdx>,
+    },
     /// One or more shards reported a failure while applying.
     ShardApply(Vec<(WorkerIdx, String)>),
-    /// The process-level apply target rejected the config before shard
-    /// broadcast.
+    /// The process-level apply target rejected the config.
     Target(String),
 }
 
@@ -103,9 +112,23 @@ impl fmt::Display for ApplyError {
             ApplyError::ShardSend(w) => {
                 write!(f, "shard {} control channel closed before apply", w.0)
             }
-            ApplyError::AckDisconnected { expected, received } => write!(
+            ApplyError::AckDisconnected {
+                expected,
+                received,
+                outstanding,
+            } => write!(
                 f,
-                "ack channel disconnected after {received}/{expected} shards reported",
+                "ack channel disconnected after {received}/{expected} shards reported; outstanding workers: {}",
+                format_workers(outstanding),
+            ),
+            ApplyError::AckTimeout {
+                expected,
+                received,
+                outstanding,
+            } => write!(
+                f,
+                "ack deadline expired after {received}/{expected} shards reported; outstanding workers: {}",
+                format_workers(outstanding),
             ),
             ApplyError::ShardApply(failures) => {
                 write!(f, "{} shard(s) failed to apply config:", failures.len())?;
@@ -120,6 +143,18 @@ impl fmt::Display for ApplyError {
 }
 
 impl std::error::Error for ApplyError {}
+
+impl ApplyError {
+    /// Whether some shards may still apply a command after this error is
+    /// returned. The process must stop rather than retry against its old
+    /// controller snapshot.
+    pub fn apply_state_is_indeterminate(&self) -> bool {
+        matches!(
+            self,
+            Self::ShardSend(_) | Self::AckDisconnected { .. } | Self::AckTimeout { .. }
+        )
+    }
+}
 
 /// Which path an apply took. Returned so callers (and tests) can assert
 /// on the work that actually happened.
@@ -247,7 +282,11 @@ pub trait ConfigApplyTarget {
     /// Apply a change in place. `diff` reports exactly which sections
     /// changed so the implementation can skip untouched work (e.g. only
     /// reconcile fabric peers when `requires_routing_reload`).
-    fn apply_in_place(&mut self, new: &Arc<Config>, diff: &ConfigDiff) -> Result<(), ApplyError>;
+    fn apply_in_place(
+        &mut self,
+        new: &Arc<LoadedConfig>,
+        diff: &ConfigDiff,
+    ) -> Result<(), ApplyError>;
 }
 
 /// The single funnel for configuration changes. Holds the currently
@@ -255,7 +294,7 @@ pub trait ConfigApplyTarget {
 /// [`ConfigApplyTarget`].
 pub struct ConfigController<T: ConfigApplyTarget> {
     target: T,
-    current: Arc<Config>,
+    current: Arc<LoadedConfig>,
     versions: ConfigVersionStatus,
 }
 
@@ -264,8 +303,8 @@ impl<T: ConfigApplyTarget> ConfigController<T> {
     /// to the process at startup. The latest-known, latest-applied, and
     /// startup config versions are all seeded from `initial`'s
     /// [`Config::version`].
-    pub fn new(target: T, initial: Arc<Config>) -> Self {
-        let versions = ConfigVersionStatus::new(initial.version);
+    pub fn new(target: T, initial: Arc<LoadedConfig>) -> Self {
+        let versions = ConfigVersionStatus::new(initial.config().version);
         Self {
             target,
             current: initial,
@@ -274,7 +313,7 @@ impl<T: ConfigApplyTarget> ConfigController<T> {
     }
 
     /// The configuration currently realized by the process.
-    pub fn current(&self) -> &Arc<Config> {
+    pub fn current(&self) -> &Arc<LoadedConfig> {
         &self.current
     }
 
@@ -314,15 +353,15 @@ impl<T: ConfigApplyTarget> ConfigController<T> {
     /// latest-applied config version is advanced to the same value only on
     /// full success - including a no-op apply against the already-running
     /// config - so observers can tell the process has converged onto it.
-    pub fn apply(&mut self, new: Arc<Config>) -> Result<ApplyOutcome, ApplyError> {
+    pub fn apply(&mut self, new: Arc<LoadedConfig>) -> Result<ApplyOutcome, ApplyError> {
         // Record the loaded version before doing any work so the
         // latest-known version advances even if the apply fails below.
-        self.versions.record_known(new.version);
+        self.versions.record_known(new.config().version);
 
-        let diff = ConfigDiff::between(&self.current, &new);
+        let diff = ConfigDiff::between(self.current.config(), new.config());
 
         if !diff.any() {
-            self.versions.record_applied(new.version);
+            self.versions.record_applied(new.config().version);
             return Ok(ApplyOutcome {
                 tier: ApplyTier::NoChange,
                 diff,
@@ -331,7 +370,7 @@ impl<T: ConfigApplyTarget> ConfigController<T> {
 
         self.target.apply_in_place(&new, &diff)?;
 
-        self.versions.record_applied(new.version);
+        self.versions.record_applied(new.config().version);
         self.current = new;
         Ok(ApplyOutcome {
             tier: ApplyTier::InPlace,
@@ -345,17 +384,22 @@ impl<T: ConfigApplyTarget> ConfigController<T> {
 ///
 /// [`broadcast_apply`](Self::broadcast_apply) sends one
 /// [`ShardCommand::ApplyConfig`] to every shard and blocks until each
-/// has acknowledged, so the caller can guarantee the change has landed
-/// on every shard thread before returning. This is the concrete
+/// has acknowledged or the group's absolute deadline expires, so the caller
+/// can guarantee the change has landed on every shard thread before returning
+/// success. This is the concrete
 /// "close the loop" mechanism a [`ConfigApplyTarget`] builds its Tier 1
 /// path on.
 pub struct ShardControlGroup {
     senders: Vec<(WorkerIdx, Sender<ShardCommand>)>,
+    ack_timeout: Duration,
 }
 
 impl ShardControlGroup {
-    pub fn new(senders: Vec<(WorkerIdx, Sender<ShardCommand>)>) -> Self {
-        Self { senders }
+    pub fn new(senders: Vec<(WorkerIdx, Sender<ShardCommand>)>, ack_timeout: Duration) -> Self {
+        Self {
+            senders,
+            ack_timeout,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -366,81 +410,42 @@ impl ShardControlGroup {
         self.senders.is_empty()
     }
 
-    /// Send `config` + `routes` to every shard and block until all of
+    /// Send one loaded snapshot to every shard and block until all of
     /// them acknowledge.
     ///
     /// Returns `Ok(())` only when every shard reports success. If a
-    /// channel is closed at send time, or the ack channel disconnects
-    /// before all shards report, or any shard reports a failure, the
-    /// corresponding [`ApplyError`] is returned. The fan-in always
-    /// drains every ack that does arrive so a single failing shard does
-    /// not mask the others.
+    /// channel is closed at send time, the ack deadline expires, the ack
+    /// channel disconnects before all shards report, or any shard reports a
+    /// failure, the corresponding [`ApplyError`] is returned. Until a terminal
+    /// channel/deadline error, fan-in keeps collecting reports so one failing
+    /// shard does not mask failures from the others.
     pub fn broadcast_apply(
         &self,
-        config: Arc<Config>,
-        routes: RouteTableSnapshot,
+        loaded: Arc<LoadedConfig>,
         diff: ConfigDiff,
     ) -> Result<(), ApplyError> {
-        let expected = self.senders.len();
-        if expected == 0 {
-            return Ok(());
-        }
-
-        let (ack_tx, ack_rx) = mpsc::channel::<ShardAck>();
-
-        for (worker, sender) in &self.senders {
-            let cmd = ShardCommand::ApplyConfig(ShardApply {
-                config: config.clone(),
-                routes: routes.clone(),
+        self.broadcast(|ack| {
+            ShardCommand::ApplyConfig(ShardApply {
+                loaded: loaded.clone(),
                 diff,
-                ack: ack_tx.clone(),
-            });
-            sender
-                .send(cmd)
-                .map_err(|_| ApplyError::ShardSend(*worker))?;
-        }
-        // Drop our own handle so the channel closes once every shard's
-        // cloned sender is dropped; that is how the fan-in loop below
-        // detects "no more acks coming".
-        drop(ack_tx);
-
-        let mut received = 0usize;
-        let mut failures = Vec::new();
-        loop {
-            match ack_rx.recv() {
-                Ok(ack) => {
-                    received += 1;
-                    if let Err(e) = ack.result {
-                        failures.push((ack.worker, e));
-                    }
-                    if received == expected {
-                        break;
-                    }
-                }
-                Err(RecvError) => {
-                    return Err(ApplyError::AckDisconnected { expected, received });
-                }
-            }
-        }
-
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(ApplyError::ShardApply(failures))
-        }
+                ack,
+            })
+        })
     }
 
     /// Ask every shard to drain retained RAM page-cache entries and block
     /// until all have acknowledged.
     pub fn broadcast_drain_page_cache(&self) -> Result<(), ApplyError> {
-        self.broadcast_drain(|ack| ShardCommand::DrainPageCache(ShardDrainPageCache { ack }))
+        self.broadcast(|ack| ShardCommand::DrainPageCache(ShardDrainPageCache { ack }))
     }
 
-    fn broadcast_drain<F>(&self, make_cmd: F) -> Result<(), ApplyError>
+    fn broadcast<F>(&self, make_cmd: F) -> Result<(), ApplyError>
     where
         F: Fn(Sender<ShardAck>) -> ShardCommand,
     {
-        let expected = self.senders.len();
+        let mut outstanding: HashSet<WorkerIdx> =
+            self.senders.iter().map(|(worker, _)| *worker).collect();
+        let expected = outstanding.len();
         if expected == 0 {
             return Ok(());
         }
@@ -453,21 +458,39 @@ impl ShardControlGroup {
         }
         drop(ack_tx);
 
+        let deadline = Instant::now() + self.ack_timeout;
         let mut received = 0usize;
         let mut failures = Vec::new();
-        loop {
-            match ack_rx.recv() {
+        while !outstanding.is_empty() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(ApplyError::AckTimeout {
+                    expected,
+                    received,
+                    outstanding: sorted_workers(&outstanding),
+                });
+            };
+            match ack_rx.recv_timeout(remaining) {
                 Ok(ack) => {
-                    received += 1;
-                    if let Err(e) = ack.result {
-                        failures.push((ack.worker, e));
-                    }
-                    if received == expected {
-                        break;
+                    if outstanding.remove(&ack.worker) {
+                        received += 1;
+                        if let Err(e) = ack.result {
+                            failures.push((ack.worker, e));
+                        }
                     }
                 }
-                Err(RecvError) => {
-                    return Err(ApplyError::AckDisconnected { expected, received });
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(ApplyError::AckTimeout {
+                        expected,
+                        received,
+                        outstanding: sorted_workers(&outstanding),
+                    });
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(ApplyError::AckDisconnected {
+                        expected,
+                        received,
+                        outstanding: sorted_workers(&outstanding),
+                    });
                 }
             }
         }
@@ -480,17 +503,42 @@ impl ShardControlGroup {
     }
 }
 
+fn sorted_workers(workers: &HashSet<WorkerIdx>) -> Vec<WorkerIdx> {
+    let mut workers: Vec<_> = workers.iter().copied().collect();
+    workers.sort_by_key(|worker| worker.0);
+    workers
+}
+
+fn format_workers(workers: &[WorkerIdx]) -> String {
+    workers
+        .iter()
+        .map(|worker| worker.0.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     use super::*;
-    use crate::p2p::RouteTableSnapshot;
+    use crate::config::Config;
+    fn loaded(config: Config) -> Arc<LoadedConfig> {
+        Arc::new(LoadedConfig::from_config(config).unwrap())
+    }
 
-    fn empty_routes() -> RouteTableSnapshot {
-        RouteTableSnapshot::default()
+    fn control_group(senders: Vec<(WorkerIdx, Sender<ShardCommand>)>) -> ShardControlGroup {
+        ShardControlGroup::new(senders, Duration::from_secs(1))
+    }
+
+    fn ack_sender(cmd: ShardCommand) -> Sender<ShardAck> {
+        match cmd {
+            ShardCommand::ApplyConfig(apply) => apply.ack,
+            ShardCommand::DrainPageCache(drain) => drain.ack,
+        }
     }
 
     /// Spawn `n` mock shard threads that drain a control channel and ack
@@ -537,13 +585,9 @@ mod tests {
     #[test]
     fn broadcast_apply_blocks_until_every_shard_acks() {
         let (senders, joins) = spawn_mock_shards(vec![Ok(()), Ok(()), Ok(())]);
-        let group = ShardControlGroup::new(senders);
+        let group = control_group(senders);
 
-        let out = group.broadcast_apply(
-            Arc::new(Config::default()),
-            empty_routes(),
-            ConfigDiff::default(),
-        );
+        let out = group.broadcast_apply(loaded(Config::default()), ConfigDiff::default());
         assert!(out.is_ok(), "expected success, got {out:?}");
 
         // Closing the group drops the senders so the mock shard threads
@@ -555,16 +599,38 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_apply_delivers_the_same_loaded_snapshot() {
+        let (tx, rx) = mpsc::channel::<ShardCommand>();
+        let group = control_group(vec![(WorkerIdx(0), tx)]);
+        let loaded = loaded(Config::default());
+        let expected = loaded.clone();
+        let join = thread::spawn(move || {
+            let ShardCommand::ApplyConfig(apply) = rx.recv().unwrap() else {
+                panic!("expected config apply");
+            };
+            assert!(Arc::ptr_eq(&apply.loaded, &expected));
+            apply
+                .ack
+                .send(ShardAck {
+                    worker: WorkerIdx(0),
+                    result: Ok(()),
+                })
+                .unwrap();
+        });
+
+        group
+            .broadcast_apply(loaded, ConfigDiff::default())
+            .unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
     fn broadcast_apply_reports_shard_failures() {
         let (senders, joins) = spawn_mock_shards(vec![Ok(()), Err("boom".to_string()), Ok(())]);
-        let group = ShardControlGroup::new(senders);
+        let group = control_group(senders);
 
         let err = group
-            .broadcast_apply(
-                Arc::new(Config::default()),
-                empty_routes(),
-                ConfigDiff::default(),
-            )
+            .broadcast_apply(loaded(Config::default()), ConfigDiff::default())
             .expect_err("a failing shard must surface as an error");
         match err {
             ApplyError::ShardApply(failures) => {
@@ -583,15 +649,11 @@ mod tests {
 
     #[test]
     fn broadcast_apply_on_empty_group_is_a_noop() {
-        let group = ShardControlGroup::new(Vec::new());
+        let group = control_group(Vec::new());
         assert!(group.is_empty());
         assert!(
             group
-                .broadcast_apply(
-                    Arc::new(Config::default()),
-                    empty_routes(),
-                    ConfigDiff::default(),
-                )
+                .broadcast_apply(loaded(Config::default()), ConfigDiff::default(),)
                 .is_ok()
         );
     }
@@ -603,21 +665,129 @@ mod tests {
         let (dead_tx, dead_rx) = mpsc::channel::<ShardCommand>();
         drop(dead_rx);
         senders.push((WorkerIdx(99), dead_tx));
-        let group = ShardControlGroup::new(senders);
+        let group = control_group(senders);
 
         let err = group
-            .broadcast_apply(
-                Arc::new(Config::default()),
-                empty_routes(),
-                ConfigDiff::default(),
-            )
+            .broadcast_apply(loaded(Config::default()), ConfigDiff::default())
             .expect_err("closed channel must error");
         assert!(matches!(err, ApplyError::ShardSend(WorkerIdx(99))));
+        assert!(err.apply_state_is_indeterminate());
 
         drop(group);
         for j in joins {
             j.join().unwrap();
         }
+    }
+
+    #[test]
+    fn reported_shard_failure_is_not_indeterminate() {
+        assert!(
+            !ApplyError::ShardApply(vec![(WorkerIdx(1), "failed".to_string())])
+                .apply_state_is_indeterminate()
+        );
+        assert!(!ApplyError::Target("rejected".to_string()).apply_state_is_indeterminate());
+    }
+
+    #[test]
+    fn broadcast_apply_timeout_lists_outstanding_workers() {
+        let (tx0, rx0) = mpsc::channel::<ShardCommand>();
+        let (tx1, rx1) = mpsc::channel::<ShardCommand>();
+        let join0 = thread::spawn(move || {
+            let ack = ack_sender(rx0.recv().unwrap());
+            ack.send(ShardAck {
+                worker: WorkerIdx(0),
+                result: Ok(()),
+            })
+            .unwrap();
+        });
+        let join1 = thread::spawn(move || {
+            let ack = ack_sender(rx1.recv().unwrap());
+            thread::sleep(Duration::from_millis(100));
+            let _ = ack.send(ShardAck {
+                worker: WorkerIdx(1),
+                result: Ok(()),
+            });
+        });
+        let group = ShardControlGroup::new(
+            vec![(WorkerIdx(0), tx0), (WorkerIdx(1), tx1)],
+            Duration::from_millis(20),
+        );
+
+        let error = group
+            .broadcast_apply(loaded(Config::default()), ConfigDiff::default())
+            .expect_err("missing acknowledgement must time out");
+        assert!(matches!(
+            error,
+            ApplyError::AckTimeout {
+                expected: 2,
+                received: 1,
+                outstanding,
+            } if outstanding == vec![WorkerIdx(1)]
+        ));
+
+        join0.join().unwrap();
+        join1.join().unwrap();
+    }
+
+    #[test]
+    fn duplicate_ack_does_not_hide_outstanding_worker() {
+        let (tx0, rx0) = mpsc::channel::<ShardCommand>();
+        let (tx1, rx1) = mpsc::channel::<ShardCommand>();
+        let join0 = thread::spawn(move || {
+            let ack = ack_sender(rx0.recv().unwrap());
+            for _ in 0..2 {
+                ack.send(ShardAck {
+                    worker: WorkerIdx(0),
+                    result: Ok(()),
+                })
+                .unwrap();
+            }
+        });
+        let join1 = thread::spawn(move || {
+            let ack = ack_sender(rx1.recv().unwrap());
+            thread::sleep(Duration::from_millis(100));
+            drop(ack);
+        });
+        let group = ShardControlGroup::new(
+            vec![(WorkerIdx(0), tx0), (WorkerIdx(1), tx1)],
+            Duration::from_millis(20),
+        );
+
+        let error = group
+            .broadcast_drain_page_cache()
+            .expect_err("duplicate acknowledgement must not complete fan-in");
+        assert!(matches!(
+            error,
+            ApplyError::AckTimeout {
+                expected: 2,
+                received: 1,
+                outstanding,
+            } if outstanding == vec![WorkerIdx(1)]
+        ));
+
+        join0.join().unwrap();
+        join1.join().unwrap();
+    }
+
+    #[test]
+    fn disconnected_ack_channel_lists_outstanding_workers() {
+        let (tx, rx) = mpsc::channel::<ShardCommand>();
+        let join = thread::spawn(move || drop(ack_sender(rx.recv().unwrap())));
+        let group = control_group(vec![(WorkerIdx(7), tx)]);
+
+        let error = group
+            .broadcast_drain_page_cache()
+            .expect_err("dropped acknowledgement sender must disconnect fan-in");
+        assert!(matches!(
+            error,
+            ApplyError::AckDisconnected {
+                expected: 1,
+                received: 0,
+                outstanding,
+            } if outstanding == vec![WorkerIdx(7)]
+        ));
+
+        join.join().unwrap();
     }
 
     // ---- ConfigController classification ----
@@ -632,7 +802,7 @@ mod tests {
     impl ConfigApplyTarget for RecordingTarget {
         fn apply_in_place(
             &mut self,
-            _new: &Arc<Config>,
+            _new: &Arc<LoadedConfig>,
             diff: &ConfigDiff,
         ) -> Result<(), ApplyError> {
             self.last_diff = Some(*diff);
@@ -662,6 +832,10 @@ mod tests {
         c
     }
 
+    fn loaded_with_peer(version: u64) -> Arc<LoadedConfig> {
+        loaded(config_with_peer(version))
+    }
+
     fn tcp_peer(name: &str, addr: &str) -> crate::config::PeerSpec {
         crate::config::PeerSpec {
             name: name.to_string(),
@@ -676,7 +850,7 @@ mod tests {
 
     #[test]
     fn apply_no_change_runs_neither_tier() {
-        let base = Arc::new(config_with_peer(1));
+        let base = loaded_with_peer(1);
         let mut ctrl = ConfigController::new(RecordingTarget::default(), base.clone());
         assert_eq!(
             ctrl.config_versions().snapshot(),
@@ -692,7 +866,7 @@ mod tests {
         // advances both known and applied: the process is converged on it.
         let mut bumped = config_with_peer(1);
         bumped.version = 2;
-        let out = ctrl.apply(Arc::new(bumped)).unwrap();
+        let out = ctrl.apply(loaded(bumped)).unwrap();
         assert_eq!(out.tier, ApplyTier::NoChange);
         assert_eq!(ctrl.target_mut().in_place, 0);
         assert_eq!(ctrl.config_versions().known(), 2);
@@ -704,13 +878,13 @@ mod tests {
 
     #[test]
     fn apply_peer_change_takes_in_place_tier() {
-        let base = Arc::new(config_with_peer(1));
+        let base = loaded_with_peer(1);
         let mut ctrl = ConfigController::new(RecordingTarget::default(), base.clone());
 
         let mut next = config_with_peer(2);
         next.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
 
-        let out = ctrl.apply(Arc::new(next)).unwrap();
+        let out = ctrl.apply(loaded(next)).unwrap();
         assert_eq!(out.tier, ApplyTier::InPlace);
         assert_eq!(ctrl.target_mut().in_place, 1);
         assert!(
@@ -724,11 +898,11 @@ mod tests {
 
     #[test]
     fn apply_backend_change_takes_in_place_tier() {
-        let base = Arc::new(config_with_peer(1));
+        let base = loaded_with_peer(1);
         let mut ctrl = ConfigController::new(RecordingTarget::default(), base.clone());
 
         let mut next = config_with_peer(3);
-        next.backends.push(crate::config::schema::BackendSpec {
+        next.backends[0] = crate::config::schema::BackendSpec {
             name: "b".to_string(),
             config: Some(crate::config::backend_spec::Config::Http(
                 crate::config::HttpBackendConfig {
@@ -741,12 +915,12 @@ mod tests {
                     client_key_path: None,
                 },
             )),
-        });
+        };
 
         // A backend change is now reconciled in place on the live shard
         // layer (each shard rebuilds its origin-backend registry from the
         // broadcast config); it no longer rebuilds the shard layer.
-        let out = ctrl.apply(Arc::new(next)).unwrap();
+        let out = ctrl.apply(loaded(next)).unwrap();
         assert_eq!(out.tier, ApplyTier::InPlace);
         assert_eq!(ctrl.target_mut().in_place, 1);
         assert!(ctrl.target_mut().last_diff.unwrap().backends_changed);
@@ -755,7 +929,7 @@ mod tests {
 
     #[test]
     fn failed_apply_leaves_current_config_unchanged() {
-        let base = Arc::new(config_with_peer(1));
+        let base = loaded_with_peer(1);
         let target = RecordingTarget {
             fail_in_place: true,
             ..RecordingTarget::default()
@@ -764,12 +938,15 @@ mod tests {
 
         let mut next = config_with_peer(5);
         next.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
-        let next = Arc::new(next);
+        let next = loaded(next);
 
         assert!(ctrl.apply(next.clone()).is_err());
         // Current must still be the original so a retry re-derives the
         // same diff.
-        assert_eq!(ctrl.current().peers.len(), base.peers.len());
+        assert_eq!(
+            ctrl.current().config().peers.len(),
+            base.config().peers.len()
+        );
         // A failed apply records the version as known (we loaded it) but
         // must NOT advance the applied version: the process did not
         // converge on the submitted config.
@@ -779,7 +956,7 @@ mod tests {
 
     #[test]
     fn config_version_handle_observes_later_applies() {
-        let base = Arc::new(config_with_peer(1));
+        let base = loaded_with_peer(1);
         let mut ctrl = ConfigController::new(RecordingTarget::default(), base.clone());
 
         // A handle taken early must observe applies that happen later,
@@ -796,7 +973,7 @@ mod tests {
 
         let mut next = config_with_peer(11);
         next.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
-        ctrl.apply(Arc::new(next)).unwrap();
+        ctrl.apply(loaded(next)).unwrap();
 
         assert_eq!(versions.known(), 11);
         assert_eq!(versions.applied(), 11);
@@ -812,7 +989,7 @@ mod tests {
 
     #[test]
     fn startup_version_is_pinned_across_applies_and_failures() {
-        let base = Arc::new(config_with_peer(1));
+        let base = loaded_with_peer(1);
         let target = RecordingTarget {
             fail_in_place: true,
             ..RecordingTarget::default()
@@ -823,7 +1000,7 @@ mod tests {
         // A failed apply advances known but neither applied nor startup.
         let mut failing = config_with_peer(7);
         failing.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
-        assert!(ctrl.apply(Arc::new(failing)).is_err());
+        assert!(ctrl.apply(loaded(failing)).is_err());
         assert_eq!(ctrl.config_versions().known(), 7);
         assert_eq!(ctrl.config_versions().applied(), 1);
         assert_eq!(ctrl.config_versions().startup(), 1);
@@ -833,7 +1010,7 @@ mod tests {
         ctrl.target_mut().fail_in_place = false;
         let mut next = config_with_peer(8);
         next.peers.push(tcp_peer("node-c", "127.0.0.1:9997"));
-        ctrl.apply(Arc::new(next)).unwrap();
+        ctrl.apply(loaded(next)).unwrap();
         assert_eq!(ctrl.config_versions().applied(), 8);
         assert_eq!(ctrl.config_versions().startup(), 1);
     }
