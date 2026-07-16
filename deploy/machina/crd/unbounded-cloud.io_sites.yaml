@@ -19,17 +19,29 @@ spec:
   scope: Cluster
   versions:
   - additionalPrinterColumns:
+    - jsonPath: .spec.nodeCidrs
+      name: Node CIDRs
+      type: string
+    - jsonPath: .spec.podCidrAssignments
+      name: Pod CIDR Assignments
+      type: string
     - jsonPath: .spec.components.machina.enabled
       name: Machina
+      priority: 1
       type: boolean
     - jsonPath: .spec.components.metalman.enabled
       name: Metalman
+      priority: 1
       type: boolean
     - jsonPath: .spec.components.storage.enabled
       name: Storage
+      priority: 1
       type: boolean
     - jsonPath: .status.nodeCount
       name: Nodes
+      type: integer
+    - jsonPath: .status.sliceCount
+      name: Slices
       type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age

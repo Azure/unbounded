@@ -22,10 +22,13 @@ func init() {
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=st
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="Machina",type=boolean,JSONPath=".spec.components.machina.enabled"
-// +kubebuilder:printcolumn:name="Metalman",type=boolean,JSONPath=".spec.components.metalman.enabled"
-// +kubebuilder:printcolumn:name="Storage",type=boolean,JSONPath=".spec.components.storage.enabled"
+// +kubebuilder:printcolumn:name="Node CIDRs",type=string,JSONPath=".spec.nodeCidrs"
+// +kubebuilder:printcolumn:name="Pod CIDR Assignments",type=string,JSONPath=".spec.podCidrAssignments"
+// +kubebuilder:printcolumn:name="Machina",type=boolean,JSONPath=".spec.components.machina.enabled",priority=1
+// +kubebuilder:printcolumn:name="Metalman",type=boolean,JSONPath=".spec.components.metalman.enabled",priority=1
+// +kubebuilder:printcolumn:name="Storage",type=boolean,JSONPath=".spec.components.storage.enabled",priority=1
 // +kubebuilder:printcolumn:name="Nodes",type=integer,JSONPath=".status.nodeCount"
+// +kubebuilder:printcolumn:name="Slices",type=integer,JSONPath=".status.sliceCount"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
 // Site defines a top-level Unbounded location and the optional components
