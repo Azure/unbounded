@@ -79,26 +79,43 @@ func TestCRDMaintainerCancellation(t *testing.T) {
 	}
 }
 
-func TestCRDMaintainerReturnsBootstrapError(t *testing.T) {
+func TestCRDMaintainerKeepsRetryingOnPersistentFailureWithoutStopping(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	wantErr := errors.New("apply failed")
-	calls := 0
+	calls := make(chan struct{}, 16)
+
 	maintainer := &CRDMaintainer{
-		Interval:    time.Millisecond,
-		MaxFailures: 3,
+		Interval: time.Millisecond,
 		Bootstrap: func(context.Context, client.Client) error {
-			calls++
+			select {
+			case calls <- struct{}{}:
+			default:
+			}
 
 			return wantErr
 		},
 	}
 
-	err := maintainer.Start(context.Background())
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("Start error = %v, want %v", err, wantErr)
+	done := make(chan error, 1)
+
+	go func() { done <- maintainer.Start(ctx) }()
+
+	// A persistent failure must not stop the manager: established CRDs stay
+	// served regardless, so the maintainer keeps retrying rather than returning.
+	for i := 0; i < 4; i++ {
+		select {
+		case <-calls:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("maintainer stopped retrying after %d persistent failures", i)
+		}
 	}
 
-	if calls != 3 {
-		t.Fatalf("Bootstrap called %d times, want 3 consecutive failures before crashing", calls)
+	cancel()
+
+	if err := <-done; err != nil {
+		t.Fatalf("Start on persistent failure = %v, want nil (context cancel is the only clean stop)", err)
 	}
 }
 
@@ -111,8 +128,7 @@ func TestCRDMaintainerRetriesTransientFailureWithoutCrashing(t *testing.T) {
 	calls := 0
 
 	maintainer := &CRDMaintainer{
-		Interval:    time.Millisecond,
-		MaxFailures: 3,
+		Interval: time.Millisecond,
 		Bootstrap: func(context.Context, client.Client) error {
 			calls++
 

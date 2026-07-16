@@ -39,11 +39,6 @@ const (
 	crdEstablishedTimeout = 2 * time.Minute
 
 	defaultCRDMaintenanceInterval = time.Minute
-
-	// defaultCRDMaintenanceFailures is the number of consecutive CRD maintenance
-	// failures tolerated before the maintainer stops the manager and lets the
-	// pod restart.
-	defaultCRDMaintenanceFailures = 3
 )
 
 // CRDBootstrapTimeout bounds the complete CRD bootstrap, including manifest
@@ -87,34 +82,27 @@ func BootstrapCRDs(ctx context.Context, c client.Client) error {
 }
 
 // CRDMaintainer periodically reapplies the operator-owned CRDs using an
-// uncached client. Transient maintenance failures are retried on the next
-// interval; only a run of MaxFailures consecutive failures stops the manager,
-// so the pod is restarted and retries after any terminating CRD has finished
-// deleting.
+// uncached client. Maintenance failures are logged and retried on the next
+// interval; they never stop the manager. CRDs that are already established stay
+// served by the apiserver regardless of the operator's liveness, so stopping on
+// maintenance failures would needlessly take down the Site reconciler and the
+// migration reaper for what is typically a transient apiserver blip.
 type CRDMaintainer struct {
-	Client   client.Client
-	Interval time.Duration
-	// MaxFailures is the number of consecutive maintenance failures tolerated
-	// before Start returns an error and stops the manager. Defaults to
-	// defaultCRDMaintenanceFailures.
-	MaxFailures int
-	Bootstrap   func(context.Context, client.Client) error
+	Client    client.Client
+	Interval  time.Duration
+	Bootstrap func(context.Context, client.Client) error
 }
 
 // NeedLeaderElection ensures only the elected operator replica maintains CRDs.
 func (*CRDMaintainer) NeedLeaderElection() bool { return true }
 
-// Start runs CRD maintenance until the manager stops or maintenance fails
-// MaxFailures times in a row.
+// Start runs CRD maintenance until the manager stops (context cancellation).
+// Maintenance failures are logged and retried on the next interval; they do not
+// stop the manager.
 func (m *CRDMaintainer) Start(ctx context.Context) error {
 	interval := m.Interval
 	if interval <= 0 {
 		interval = defaultCRDMaintenanceInterval
-	}
-
-	maxFailures := m.MaxFailures
-	if maxFailures <= 0 {
-		maxFailures = defaultCRDMaintenanceFailures
 	}
 
 	bootstrap := m.Bootstrap
@@ -140,11 +128,8 @@ func (m *CRDMaintainer) Start(ctx context.Context) error {
 				}
 
 				failures++
-				if failures >= maxFailures {
-					return fmt.Errorf("maintain CRDs after %d consecutive failures: %w", failures, err)
-				}
 
-				logger.Error(err, "CRD maintenance failed; will retry", "failures", failures, "maxFailures", maxFailures)
+				logger.Error(err, "CRD maintenance failed; will retry on the next interval", "consecutiveFailures", failures)
 
 				continue
 			}
