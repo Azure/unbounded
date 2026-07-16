@@ -329,7 +329,7 @@ name = "b"
 
         let updates: Vec<_> = update_rx.iter().collect();
         assert_eq!(updates.len(), 1, "the burst must emit exactly one update");
-        assert_eq!(updates[0].config.fingers_per_node, Some(4004));
+        assert_eq!(updates[0].loaded.config().fingers_per_node, Some(4004));
     }
 
     #[test]
