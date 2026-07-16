@@ -73,7 +73,7 @@ pub(crate) trait AckSink: Send + Sync {
     /// Deliver one inbound control message (`RESPONSE_END` or
     /// `ERROR_ACK`) for this request. `body` is the message payload
     /// after the 8-byte header.
-    fn deliver(&self, kind: MsgKind, body: &[u8]);
+    fn deliver(&self, kind: MsgKind, body: Vec<u8>);
 
     /// Deliver one page-landed signal carried by an RDMA
     /// write-with-immediate completion (no framed message): `ordinal`
@@ -237,7 +237,7 @@ impl InboundDispatch {
             MsgKind::PageAck | MsgKind::ResponseEnd | MsgKind::ErrorAck => {
                 let sink = self.streams.lock().unwrap().get(&request_id).cloned();
                 match sink {
-                    Some(sink) => sink.deliver(kind, &body),
+                    Some(sink) => sink.deliver(kind, body),
                     None => {
                         // A late ack for a request whose stream has
                         // already completed and unregistered. Benign.
@@ -278,8 +278,8 @@ mod tests {
         pages: StdMutex<Vec<u32>>,
     }
     impl AckSink for RecordingAck {
-        fn deliver(&self, kind: MsgKind, body: &[u8]) {
-            self.got.lock().unwrap().push((kind, body.to_vec()));
+        fn deliver(&self, kind: MsgKind, body: Vec<u8>) {
+            self.got.lock().unwrap().push((kind, body));
         }
         fn deliver_page(&self, ordinal: u32) {
             self.pages.lock().unwrap().push(ordinal);

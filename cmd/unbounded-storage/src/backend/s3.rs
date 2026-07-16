@@ -43,21 +43,16 @@ use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
 use super::limiter::FetchLimiter;
-use super::origin_ring::OriginRing;
 
 /// Origin backend that fetches stripe byte ranges from an
 /// S3-compatible origin into bufferpool pages. The endpoint scheme
 /// selects plaintext HTTP/1.1 (`http://`) or TLS 1.3 with kTLS
 /// (`https://`); see the module docs.
 ///
-/// Shard-pinned: the [`OriginRing`] and the raw `backing_base` pointer
-/// are only ever touched on the owning shard thread that built this
-/// backend, OR (for the RPC-handler instance) on the ephemeral
-/// `fabric-rpc-worker` thread that uses an [`OriginRing::WorkerLocal`]
-/// ring private to that thread. See the `unsafe impl Send + Sync`
-/// below.
+/// Shard-pinned: the [`NetHandle`] and raw `backing_base` pointer are
+/// only ever touched on the owning shard thread that built this backend.
 pub struct S3Backend {
-    ring: OriginRing,
+    handle: NetHandle,
     origin: SockAddr,
     /// The origin hostname used for the `Host:` header. The TCP connect
     /// uses `origin` (the resolved IPv4), but the bucket's virtual-host
@@ -77,21 +72,10 @@ pub struct S3Backend {
     conns: OriginConnPool,
 }
 
-// SAFETY: mirrors `HttpBackend`'s justification. `S3Backend` is
-// shard-pinned: the embedder constructs it on, and only ever drives it
-// from, a single pinned shard thread. The `OriginRing`, any `Rc`/
-// `RefCell` it holds, and the raw `backing_base` pointer are never
-// shared across threads at runtime. The `Send + Sync` marker exists
-// solely to satisfy the `Backend: Send + Sync` bound the embedder
-// requires when it stores the backend in a cross-shard registry; it is
-// not an invitation to touch the backend off its shard.
-unsafe impl Send for S3Backend {}
-unsafe impl Sync for S3Backend {}
-
 impl S3Backend {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        ring: OriginRing,
+        handle: NetHandle,
         origin: SockAddr,
         host: String,
         sni_host: String,
@@ -103,7 +87,7 @@ impl S3Backend {
         http_concurrency: usize,
     ) -> Self {
         Self {
-            ring,
+            handle,
             origin,
             host,
             sni_host,
@@ -137,8 +121,8 @@ impl S3Backend {
     /// Owned-stream variant of [`Backend::bulk_get`]. Mirrors
     /// [`super::HttpBackend::fetch_stream`]: the returned stream borrows
     /// nothing from `self`, so it is `'static` and can be handed out by
-    /// a [`super::registry::BackendRegistry`] holding the backend behind
-    /// an `Arc`/`ArcSwap`.
+    /// a [`super::registry::BackendRegistry`] owning the backend through
+    /// an `Rc`.
     pub fn fetch_stream(
         &self,
         req: &StripeReq,
@@ -151,10 +135,7 @@ impl S3Backend {
         let path = origin.origin_object_id.clone();
 
         let dsts_owned = dsts.to_vec();
-        let handle = match self.ring.handle() {
-            Ok(h) => h,
-            Err(e) => return S3FetchStream::immediate_err(io_to_err(e)),
-        };
+        let handle = self.handle.clone();
         let origin_addr = self.origin;
         let backing_base = self.backing_base;
         let page_size = self.page_size;
@@ -278,14 +259,6 @@ impl<'a> S3FetchStream<'a> {
     fn immediate_error(msg: &'static str) -> Self {
         Self {
             state: FetchState::Failed(Some(Error::from(msg))),
-            delivered: Vec::new(),
-            next: 0,
-        }
-    }
-
-    fn immediate_err(err: Error) -> Self {
-        Self {
-            state: FetchState::Failed(Some(err)),
             delivered: Vec::new(),
             next: 0,
         }
@@ -487,7 +460,7 @@ async fn fetch(
         leading.len(),
         filled,
     ) {
-        conns.put(&handle, conn);
+        conns.put(conn);
     }
     Ok(())
 }
@@ -554,7 +527,7 @@ async fn fetch_metadata(
     let body = ObjectMetadata::new(length).encode()?;
     copy_body_into_pages(&body, &dsts, backing_base, page_size)?;
     if head_response_reusable(version_minor, connection.as_deref(), header_end, buf.len()) {
-        conns.put(&handle, conn);
+        conns.put(conn);
     }
     Ok(())
 }
@@ -796,13 +769,6 @@ fn format_head_request(path: &str, host: &str) -> Result<Vec<u8>, Error> {
         .body(())
         .map_err(|_| Error::from("s3 backend: failed to build origin HEAD request"))?;
     Ok(serialize_request(&req))
-}
-
-fn io_to_err(e: std::io::Error) -> Error {
-    match e.raw_os_error() {
-        Some(code) => Error::Io(code),
-        None => Error::transport(e),
-    }
 }
 
 #[cfg(test)]

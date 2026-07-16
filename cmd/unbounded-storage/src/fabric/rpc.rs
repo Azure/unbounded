@@ -28,9 +28,9 @@
 //! `dest_addr = FI_ADDR_UNSPEC`.
 //!
 //! **Worker model**: a fixed pool of `rpc_worker_threads` long-lived
-//! OS threads is spawned at `start_rpc_server`, each pinned to the
-//! shard's `worker_idx`. Inbound requests are demultiplexed on the
-//! progress thread by the connection's receive pool, handed to the
+//! OS threads is spawned at `start_rpc_server`, distributed over the
+//! fabric unit's reserved workers. Inbound requests are demultiplexed on
+//! the progress thread by the connection's receive pool, handed to the
 //! installed [`RequestSink`], decoded, and enqueued onto a bounded
 //! [`JobQueue`](super::rpc_queue::JobQueue) rather than spawning a
 //! thread per request. A pool worker pulls the job, drives the handler
@@ -67,6 +67,7 @@ use super::error::{FabricError, Result as FabResult};
 use super::fabric::{Fabric, FabricInner};
 use super::ffi;
 use super::handler::{FabricPage, Handler, HandlerStream, PageRelease, PageSource};
+use super::rpc_admission::RpcAdmission;
 use super::rpc_queue::{Job, JobQueue};
 use super::wire::{MsgHeader, MsgKind};
 
@@ -236,7 +237,7 @@ struct ServerShared {
     /// `max_inflight` as the server-side back-pressure limit: a request
     /// that would exceed it is rejected with a "server overloaded"
     /// `ERROR_ACK` instead of being enqueued.
-    inflight: AtomicU64,
+    admission: Arc<RpcAdmission>,
 }
 
 /// Inbound-request sink installed on the dispatch table. Decodes each
@@ -276,29 +277,20 @@ where
         // a fast "server overloaded" ack instead of being enqueued. This
         // runs on the progress thread, so the rejection ack is
         // fire-and-forget (see `reject_overloaded`).
-        let max_inflight = shared.fabric.cfg.max_inflight as u64;
-        let prev = shared.inflight.fetch_add(1, Ordering::AcqRel);
-        if prev >= max_inflight {
-            shared.inflight.fetch_sub(1, Ordering::AcqRel);
+        let Some(permit) = shared.admission.try_acquire() else {
             crate::metrics::fabric_rpc_served(crate::metrics::Outcome::Err);
             let _ = reject_overloaded(shared, reply.ep, request_id);
             return;
-        }
-        crate::metrics::fabric_inflight_delta(1);
+        };
 
         let shared_for_job = shared.clone();
         let handler_for_job = self.handler.clone();
         let job: Job = Box::new(move || {
+            let _permit = permit;
             run_worker::<R, H>(shared_for_job.clone(), handler_for_job, header, req, reply);
-            shared_for_job.inflight.fetch_sub(1, Ordering::AcqRel);
-            crate::metrics::fabric_inflight_delta(-1);
         });
-        if shared.queue.push(job).is_err() {
-            // Queue closed (server shutting down): the job never runs, so
-            // release the in-flight reservation it would have decremented.
-            shared.inflight.fetch_sub(1, Ordering::AcqRel);
-            crate::metrics::fabric_inflight_delta(-1);
-        }
+        // A closed queue returns the job; dropping it releases its permit.
+        drop(shared.queue.push(job));
     }
 }
 
@@ -357,18 +349,18 @@ impl Fabric {
             page_size,
             queue: Arc::new(JobQueue::new()),
             shutdown: AtomicBool::new(false),
-            inflight: AtomicU64::new(0),
+            admission: RpcAdmission::new(self.inner_arc().cfg.max_inflight),
         });
 
         // Spawn the persistent worker pool before installing the request
         // sink so a request that lands immediately has a consumer
-        // waiting. Pin to this shard's worker index so handler
-        // scratch/MR access stays NUMA-local.
+        // waiting. Distribute the pool over this fabric unit's reserved
+        // workers so handler scratch/MR access stays NUMA-local.
         let runtime = shared.fabric.cfg.runtime.clone();
-        let worker_idx = shared.fabric.cfg.worker_idx;
         let pool_size = shared.fabric.cfg.rpc_worker_threads.max(1);
         let mut workers = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
+        for i in 0..pool_size {
+            let worker_idx = shared.fabric.cfg.worker_for_thread(i);
             let queue = shared.queue.clone();
             workers.push(runtime.spawn_pinned(
                 worker_idx,
@@ -1214,7 +1206,7 @@ fn wait_for_small_send(
 
 /// Block the calling worker thread on a libfabric completion, parking
 /// (not spinning) between polls. The progress-thread completion path
-/// (`CompletionSlot::complete` -> `AtomicWaker::wake`) unparks us, so
+/// (`CompletionSlot::complete` wakes the registered task) unparks us, so
 /// the wait resolves as soon as the CQE is reaped. Returns
 /// `FabricError::Timeout` if `timeout` elapses first, or as soon as
 /// `shutdown` is set so a draining server does not block joining a
@@ -1274,7 +1266,7 @@ mod tests {
         let (slot, fut) = reg.allocate().unwrap();
         let raw = slot.into_raw();
         // SAFETY: raw was just produced by `into_raw`.
-        let reclaimed = unsafe { CompletionSlot::from_raw(raw) };
+        let mut reclaimed = unsafe { CompletionSlot::from_raw(raw) };
         reclaimed.complete(result);
         fut
     }

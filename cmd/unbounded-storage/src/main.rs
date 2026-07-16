@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use unbounded_storage::backend::{BackendRegistry, OriginRing};
+use unbounded_storage::backend::BackendRegistry;
 use unbounded_storage::bufferpool::{Pool, PoolConfig};
 use unbounded_storage::config::{
     self, BackendSpec, Config, FrontendSpec, ResolvedFrontendBinding, frontend_spec,
@@ -672,7 +672,7 @@ fn run_shard(
     // shard socket ring and writes origin bytes into the pool backing.
     let transport_registry = match BackendRegistry::new(
         &backend_specs,
-        OriginRing::Shard(socket.clone()),
+        NetHandle::new(socket.clone()),
         page_size,
         backing_base,
     ) {

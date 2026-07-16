@@ -402,6 +402,8 @@ streaming RPC server plus client `Transport`.
 - The completion machinery (`CompletionFuture`, `CompletionInfo`,
   `CompletionRegistry`, `CompletionSlot`) bridges libfabric CQ entries to
   futures.
+- Each connection keeps stable receive buffers posted and reuses each buffer's
+  local MR across successful reposts; completion slots remain one-shot.
 - **RPC server model** (`rpc.rs`): `start_rpc_server` spawns a fixed pool of
   `rpc_worker_threads` long-lived OS threads pinned to the shard's worker slot.
   The connection receive path decodes framed requests and enqueues jobs onto a
@@ -410,9 +412,10 @@ streaming RPC server plus client `Transport`.
   submits libfabric writes/sends, and parks on completion futures with a real
   thread waker. Wire framing uses an 8-byte `MsgHeader` prefix with a message
   kind and request id. The client sends a bincode `RequestHeader` plus request
-  body; the server `fi_write`s each page into the client's destination MR and
-  sends one `PageAck` per page. A short success sends `RESPONSE_END`; any error
-  sends `ERROR_ACK`. `RpcServerHandle::drop` uninstalls the request sink, closes
+  body. Verbs uses write-with-immediate to deliver typed page ordinals; the TCP
+  fallback follows each `fi_write` with a framed bincode `PageAck`. A short
+  success sends `RESPONSE_END`; any error sends `ERROR_ACK`.
+  `RpcServerHandle::drop` uninstalls the request sink, closes
   the queue, signals shutdown, and joins the workers.
 - `Handler`/`HandlerStream` is the server-side resolution trait;
   `PoolHandler`/`PoolHandlerStream` serve locally-resident pages.
@@ -640,8 +643,8 @@ required (kTLS receive on TLS 1.3).
 |-------|-----------|-------|
 | Shard | One pinned OS thread per `ServingShard` | Owns `!Send` pool, transport, frontend, RPC handler |
 | Shard loop | Cooperative tick hooks, noop waker | Busy-poll active, sleep 100us idle |
-| Fabric progress | One pinned thread per CQ | Self-driving |
-| Fabric RPC serve | Fixed worker pool per shard | Bounded job queue, real-waker completion waits |
+| Fabric progress | Fixed pool per fabric unit | Pinned across reserved workers, CQs distributed by NUMA |
+| Fabric RPC serve | Fixed worker pool per fabric unit | Bounded job queue, real-waker completion waits |
 | Storage engine | One pinned storage core per disk | Reached only via `PageChannel` mpsc |
 | Config watcher | `notify` thread + main loop | Reconciles peers/disks live |
 

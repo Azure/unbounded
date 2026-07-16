@@ -342,6 +342,28 @@ spec:
                     phase:
                       description: Phase is the current lifecycle phase for this target.
                       type: string
+                    providerOperation:
+                      description: |-
+                        ProviderOperation identifies the resumable external operation for this
+                        target, when the provider returned one.
+                      properties:
+                        operationID:
+                          description: OperationID is the provider-assigned operation
+                            identifier.
+                          type: string
+                        provider:
+                          description: Provider is the external provider that accepted
+                            the operation.
+                          type: string
+                        resumeToken:
+                          description: |-
+                            ResumeToken is opaque provider data needed to resume polling. Providers
+                            must not store credentials or other secrets in this field.
+                          type: string
+                      required:
+                      - operationID
+                      - provider
+                      type: object
                     stage:
                       description: Stage is the current operation-specific stage for
                         this target.

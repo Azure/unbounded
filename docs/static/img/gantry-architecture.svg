@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 970 510" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif">
+  <defs>
+    <marker id="arrowBlueR" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#4d8eff" stroke-width="1.5"/>
+    </marker>
+    <marker id="arrowBlueL" markerWidth="8" markerHeight="6" refX="0" refY="3" orient="auto">
+      <path d="M8,0 L0,3 L8,6" fill="none" stroke="#4d8eff" stroke-width="1.5"/>
+    </marker>
+    <marker id="arrowGrayR" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#a0a0a8" stroke-width="1.5"/>
+    </marker>
+    <marker id="arrowGrayD" markerWidth="8" markerHeight="6" refX="4" refY="6" orient="auto">
+      <path d="M0,0 L4,6 L8,0" fill="none" stroke="#a0a0a8" stroke-width="1.5"/>
+    </marker>
+    <marker id="arrowGrayU" markerWidth="8" markerHeight="6" refX="4" refY="0" orient="auto">
+      <path d="M0,6 L4,0 L8,6" fill="none" stroke="#a0a0a8" stroke-width="1.5"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#34d399" stroke-width="1.5"/>
+    </marker>
+    <marker id="arrowDim" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="none" stroke="#71717a" stroke-width="1.5"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="970" height="510" rx="12" fill="#111113"/>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Requester Node                                     -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="30" y="60" width="290" height="290" rx="10" fill="none" stroke="#2a2a2e" stroke-width="1.5"/>
+  <text x="175" y="85" text-anchor="middle" fill="#e4e4e7" font-size="14" font-weight="700">Requester node</text>
+
+  <!-- Workload -->
+  <rect x="110" y="100" width="130" height="45" rx="6" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="175" y="127" text-anchor="middle" fill="#e4e4e7" font-size="12" font-weight="600">Workload</text>
+
+  <!-- containerd -->
+  <rect x="110" y="175" width="130" height="45" rx="6" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="175" y="202" text-anchor="middle" fill="#e4e4e7" font-size="12" font-weight="600">containerd</text>
+
+  <!-- Workload -> containerd -->
+  <line x1="175" y1="147" x2="175" y2="173" stroke="#a0a0a8" stroke-width="1.5" marker-end="url(#arrowGrayR)"/>
+
+  <!-- Gantry A -->
+  <rect x="85" y="260" width="180" height="48" rx="6" fill="#18181b" stroke="#4d8eff" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="175" y="289" text-anchor="middle" fill="#4d8eff" font-size="13" font-weight="700">Gantry A</text>
+
+  <!-- containerd <-> Gantry A (two parallel arrows) -->
+  <line x1="158" y1="222" x2="158" y2="258" stroke="#a0a0a8" stroke-width="1.5" marker-end="url(#arrowGrayR)"/>
+  <line x1="192" y1="258" x2="192" y2="222" stroke="#a0a0a8" stroke-width="1.5" marker-end="url(#arrowGrayR)"/>
+  <text x="152" y="244" text-anchor="end" fill="#a0a0a8" font-size="10">digest request</text>
+  <text x="198" y="244" text-anchor="start" fill="#a0a0a8" font-size="10">content</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Gantry Peer Network                                -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <rect x="380" y="30" width="560" height="310" rx="10" fill="none" stroke="#4d8eff" stroke-width="1.2" stroke-opacity="0.4" stroke-dasharray="5,4"/>
+  <text x="660" y="55" text-anchor="middle" fill="#4d8eff" font-size="13" font-weight="700">Gantry peer network</text>
+
+  <!-- DHT (cylinder) -->
+  <ellipse cx="480" cy="145" rx="75" ry="10" fill="#18181b" stroke="#4d8eff" stroke-width="1.2" stroke-opacity="0.5"/>
+  <path d="M405,145 L405,215 A75,10 0 0 0 555,215 L555,145" fill="#18181b" stroke="#4d8eff" stroke-width="1.2" stroke-opacity="0.5"/>
+  <ellipse cx="480" cy="145" rx="75" ry="10" fill="none" stroke="#4d8eff" stroke-width="1.2" stroke-opacity="0.5"/>
+  <text x="480" y="180" text-anchor="middle" fill="#4d8eff" font-size="12" font-weight="600">libp2p DHT</text>
+  <text x="480" y="198" text-anchor="middle" fill="#a0a0a8" font-size="10">provider records</text>
+
+  <!-- Selected puller node -->
+  <rect x="600" y="100" width="340" height="220" rx="8" fill="none" stroke="#2a2a2e" stroke-width="1.2"/>
+  <text x="770" y="125" text-anchor="middle" fill="#e4e4e7" font-size="12" font-weight="700">Selected puller node</text>
+
+  <!-- Gantry B -->
+  <rect x="620" y="190" width="110" height="50" rx="6" fill="#18181b" stroke="#4d8eff" stroke-width="1.5" stroke-opacity="0.6"/>
+  <text x="675" y="220" text-anchor="middle" fill="#4d8eff" font-size="13" font-weight="700">Gantry B</text>
+
+  <!-- containerd content store (cylinder) -->
+  <ellipse cx="855" cy="175" rx="65" ry="10" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <path d="M790,175 L790,265 A65,10 0 0 0 920,265 L920,175" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <ellipse cx="855" cy="175" rx="65" ry="10" fill="none" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="855" y="210" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="600">containerd</text>
+  <text x="855" y="226" text-anchor="middle" fill="#e4e4e7" font-size="11" font-weight="600">content store</text>
+
+  <!-- Gantry B <-> content store -->
+  <line x1="732" y1="215" x2="788" y2="215" stroke="#a0a0a8" stroke-width="1.5" marker-end="url(#arrowGrayR)" marker-start="url(#arrowBlueL)"/>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Cross-boundary arrows                              -->
+  <!-- ═══════════════════════════════════════════════════ -->
+
+  <!-- Gantry A -> DHT (provider lookup) -->
+  <line x1="267" y1="275" x2="403" y2="195" stroke="#4d8eff" stroke-width="1.5" marker-end="url(#arrowBlueR)" marker-start="url(#arrowBlueL)"/>
+  <rect x="290" y="218" width="100" height="20" rx="4" fill="#111113"/>
+  <text x="340" y="232" text-anchor="middle" fill="#4d8eff" font-size="10" font-weight="600">provider lookup</text>
+
+  <!-- Gantry A <-> Gantry B (curved) -->
+  <path d="M267,290 Q450,320 618,225" fill="none" stroke="#4d8eff" stroke-width="2" marker-end="url(#arrowBlueR)" marker-start="url(#arrowBlueL)"/>
+  <rect x="358" y="268" width="180" height="36" rx="5" fill="#111113" stroke="#4d8eff" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="448" y="283" text-anchor="middle" fill="#4d8eff" font-size="10" font-weight="600">coordinate pull + auth</text>
+  <text x="448" y="297" text-anchor="middle" fill="#a0a0a8" font-size="10">stream image content</text>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Origin registry                                    -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <ellipse cx="510" cy="415" rx="90" ry="10" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <path d="M420,415 L420,460 A90,10 0 0 0 600,460 L600,415" fill="#18181b" stroke="#2a2a2e" stroke-width="1"/>
+  <ellipse cx="510" cy="415" rx="90" ry="10" fill="none" stroke="#2a2a2e" stroke-width="1"/>
+  <text x="510" y="448" text-anchor="middle" fill="#e4e4e7" font-size="13" font-weight="700">Origin registry</text>
+
+  <!-- Gantry B -> Origin (fetch once) -->
+  <line x1="670" y1="245" x2="580" y2="410" stroke="#34d399" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <rect x="563" y="350" width="90" height="22" rx="4" fill="#111113" stroke="#34d399" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="608" y="365" text-anchor="middle" fill="#34d399" font-size="10" font-weight="600">fetch once</text>
+
+  <!-- containerd A -.-> Origin (direct fallback) -->
+  <path d="M240,197 L340,197 L340,455 L418,455" fill="none" stroke="#71717a" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrowDim)"/>
+  <rect x="295" y="380" width="90" height="20" rx="4" fill="#111113"/>
+  <text x="340" y="394" text-anchor="middle" fill="#71717a" font-size="10" font-style="italic">direct fallback</text>
+</svg>

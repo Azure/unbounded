@@ -19,6 +19,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/machineops"
+	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
 )
 
 const azureCustomDataMaxBytes = 65535
@@ -65,9 +66,23 @@ func (p *Provider) Name() string {
 	return unboundedv1alpha3.ExternalProviderAzureVM
 }
 
-func (p *Provider) Supports(operation unboundedv1alpha3.OperationKind) bool {
-	_, ok := azureVMOperations[operation]
-	return ok
+// Registration returns this Azure adapter's MachineOperation lifecycle
+// registration.
+func (p *Provider) Registration() (*publicmachineops.Provider, error) {
+	options := make([]publicmachineops.ProviderOption, 0, len(azureVMOperations))
+	for kind := range azureVMOperations {
+		operationOptions := []publicmachineops.OperationOption(nil)
+		if kind == unboundedv1alpha3.OperationHostReplace {
+			operationOptions = append(
+				operationOptions,
+				publicmachineops.RequiresReplaceUserData(),
+			)
+		}
+
+		options = append(options, publicmachineops.WithImmediateOperation(kind, p.Execute, operationOptions...))
+	}
+
+	return publicmachineops.NewProvider(p.Name(), options...)
 }
 
 func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequest) (machineops.OperationResult, error) {
@@ -89,10 +104,6 @@ func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequ
 	}
 
 	return machineops.OperationResult{}, operation(ctx, client, ref)
-}
-
-func (p *Provider) Cleanup(context.Context, machineops.OperationRequest, machineops.OperationResult) error {
-	return nil
 }
 
 func (p *Provider) client(subscriptionID string, auth *machineops.OperationAuth) (azureVMClient, error) {
