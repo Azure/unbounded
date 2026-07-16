@@ -982,7 +982,6 @@ func requireValidBashSyntax(t *testing.T, script string) {
 	require.NoError(t, err, "bash -n failed: %s", string(out))
 }
 
-
 // ---------------------------------------------------------------------------
 // parseAdditionalHostMount() tests
 // ---------------------------------------------------------------------------

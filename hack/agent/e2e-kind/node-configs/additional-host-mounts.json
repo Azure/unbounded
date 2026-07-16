@@ -5,8 +5,8 @@
   },
   "additionalHostMounts": [
     {
-      "source": "/etc/motd",
-      "target": "/run/host-config/motd",
+      "source": "/etc/os-release",
+      "target": "/run/host-config/os-release",
       "readOnly": true
     },
     {

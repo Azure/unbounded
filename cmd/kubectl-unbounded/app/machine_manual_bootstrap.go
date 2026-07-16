@@ -275,6 +275,7 @@ func parseAdditionalHostMount(value string) (config.AdditionalHostMount, error) 
 	}
 
 	readOnly := false
+
 	spec := value
 	if strings.HasSuffix(spec, ":ro") {
 		readOnly = true
