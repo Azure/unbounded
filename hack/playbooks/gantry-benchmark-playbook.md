@@ -133,9 +133,6 @@ Constraints: `IMAGE_LAYERS` must be `>= 1` and `<= IMAGE_SIZE_MIB`. Use a
 multi-layer shape when validating the target 20-40 GiB many-layer workload;
 use the single 1 GiB layer only to measure the worst case.
 
-Reference results for both shapes on a 300-node AKS cluster are recorded in
-[`hack/gantry-benchmark/BENCHMARK-RESULTS.md`](../gantry-benchmark/BENCHMARK-RESULTS.md).
-
 For admin-disabled ACR auth, inject the refresh token only when building,
 pushing, or running:
 
