@@ -213,6 +213,7 @@ func reportTargetTransitions(targets []v1alpha3.MachineOperationTargetStatus, se
 		if text == "" {
 			text = targetTransitionState(target)
 		}
+
 		printStep(fmt.Sprintf("Target %s: %s", key, text))
 	}
 }

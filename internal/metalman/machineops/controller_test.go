@@ -4,15 +4,16 @@
 package machineops
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr/funcr"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -22,7 +23,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
@@ -30,24 +30,22 @@ import (
 
 func TestReconcilerAddsMachineOperationNameToHandlerLogs(t *testing.T) {
 	s := testScheme(t)
-	machine := testBareMetalMachine("machine-1", "rack-a")
 	op := testOperation("op-logged", v1alpha3.OperationHostPowerOff)
-	op.Spec.MachineRef = machine.Name
+	op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"missing": "true"}}
 
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op).Build()
-	factory := &contextLoggingPowerClientFactory{}
-	reconciler := testReconciler(c, factory, "rack-a")
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(op).WithStatusSubresource(op).Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
 
-	var entries []string
-	logger := funcr.New(func(prefix, args string) {
-		entries = append(entries, prefix+args)
-	}, funcr.Options{})
-	ctx := log.IntoContext(context.Background(), logger)
+	var logs bytes.Buffer
 
-	_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	previousLogger := slog.Default()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
 	require.NoError(t, err)
-	require.Len(t, entries, 1)
-	require.Contains(t, entries[0], `"machineOperation"="op-logged"`)
+	require.Contains(t, logs.String(), "machineOperation=op-logged")
 }
 
 func TestReconcilerCompletesMachineRefPowerOff(t *testing.T) {
@@ -1103,44 +1101,6 @@ func testReconciler(c client.Client, power PowerClientFactory, site string) *Rec
 		Now:                   fixedNow,
 	}
 }
-
-type contextLoggingPowerClientFactory struct{}
-
-func (f *contextLoggingPowerClientFactory) ForMachine(ctx context.Context, _ *v1alpha3.Machine) (PowerClient, error) {
-	log.FromContext(ctx).Info("handling machine operation")
-
-	return &contextLoggingPowerClient{}, nil
-}
-
-type contextLoggingPowerClient struct{}
-
-func (c *contextLoggingPowerClient) PowerState(context.Context) (redfish.PowerState, error) {
-	return redfish.PowerOff, nil
-}
-
-func (c *contextLoggingPowerClient) Reset(context.Context, redfish.ResetType) error { return nil }
-
-func (c *contextLoggingPowerClient) DisableBootOverride(context.Context) error { return nil }
-
-func (c *contextLoggingPowerClient) SetBootOverride(context.Context, redfish.BootTarget, redfish.BootEnabled) error {
-	return nil
-}
-
-func (c *contextLoggingPowerClient) GetBootConfig(context.Context) (redfish.BootConfig, error) {
-	return redfish.BootConfig{}, nil
-}
-
-func (c *contextLoggingPowerClient) SetStaticIPv4(context.Context, redfish.StaticIPv4Config) error {
-	return nil
-}
-
-func (c *contextLoggingPowerClient) SetHTTPBootOverride(context.Context, string) error { return nil }
-
-func (c *contextLoggingPowerClient) SetBIOSStaticIPv4(context.Context, redfish.StaticIPv4Config) error {
-	return nil
-}
-
-func (c *contextLoggingPowerClient) SetBIOSHTTPBootURI(context.Context, string) error { return nil }
 
 type recordingPowerClient struct {
 	mu                      sync.Mutex

@@ -102,6 +102,7 @@ func conditionStepText(cond metav1.Condition) string {
 		if cond.Status == metav1.ConditionTrue {
 			return "Cloud-init complete"
 		}
+
 		if cond.Reason == "Running" {
 			return "Running first-boot cloud-init"
 		}
