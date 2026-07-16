@@ -98,8 +98,9 @@ node:
 ### Managed kube-proxy
 
 The controller creates a kube-proxy DaemonSet for each Site whose nodes are not
-covered by the provider-managed kube-proxy. By default, it reuses the image from
-the `kube-system/kube-proxy` DaemonSet. If that DaemonSet does not exist, it uses
+covered by the provider-managed kube-proxy. The image setting defaults to an
+empty string. When it is empty, the controller reuses the image from the
+`kube-system/kube-proxy` DaemonSet. If that DaemonSet does not exist, it uses
 `registry.k8s.io/kube-proxy:<server version>`.
 
 Set `controller.managedKubeProxy.image` to override the image for all
@@ -112,7 +113,7 @@ for scheduling and per-Site behavior.
 | Flag | Runtime setting | Type | Default | Description |
 |------|-----------------|------|---------|-------------|
 | `--managed-kube-proxy` | `controller.managedKubeProxy.enabled` | bool | `true` | Create kube-proxy DaemonSets for unbounded-managed Site nodes not covered by provider kube-proxy. |
-| `--managed-kube-proxy-image` | `controller.managedKubeProxy.image` | string | empty | Override the kube-proxy image used by unbounded-managed DaemonSets. |
+| `--managed-kube-proxy-image` | `controller.managedKubeProxy.image` | string | `""` | Override the kube-proxy image used by unbounded-managed DaemonSets. |
 
 ### Pod CIDR Assignment (Site CRD)
 

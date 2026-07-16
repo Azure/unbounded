@@ -68,9 +68,9 @@ covered by the provider-managed kube-proxy. Each DaemonSet uses the Site's pod
 CIDR and runs only on nodes labeled for that Site and for unbounded-managed
 kube-proxy.
 
-By default, the controller reuses the image from the
-`kube-system/kube-proxy` DaemonSet. If that DaemonSet does not exist, it uses
-`registry.k8s.io/kube-proxy:<server version>`.
+The image setting defaults to an empty string. When it is empty, the controller
+reuses the image from the `kube-system/kube-proxy` DaemonSet. If that DaemonSet
+does not exist, it uses `registry.k8s.io/kube-proxy:<server version>`.
 
 Set `controller.managedKubeProxy.image` to override the image for all
 unbounded-managed kube-proxy DaemonSets, for example when pulling kube-proxy
@@ -80,7 +80,7 @@ to disable their creation.
 | Flag | Runtime setting | Default | Description |
 |------|-----------------|---------|-------------|
 | `--managed-kube-proxy` | `controller.managedKubeProxy.enabled` | `true` | Create kube-proxy DaemonSets for unbounded-managed Site nodes not covered by provider kube-proxy. |
-| `--managed-kube-proxy-image` | `controller.managedKubeProxy.image` | empty | Override the kube-proxy image used by unbounded-managed DaemonSets. |
+| `--managed-kube-proxy-image` | `controller.managedKubeProxy.image` | `""` | Override the kube-proxy image used by unbounded-managed DaemonSets. |
 
 ### Leader Election
 
