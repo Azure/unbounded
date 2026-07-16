@@ -1092,6 +1092,20 @@ pre code {
   font-size: 0.85rem;
 }
 
+pre.mermaid {
+  display: flex;
+  justify-content: center;
+  min-height: 12rem;
+  padding: 1.5rem;
+  color: var(--color-text);
+  background: var(--color-surface);
+}
+
+pre.mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
 /* ── Tables ───────────────────────────────────────────────── */
 table {
   width: 100%;

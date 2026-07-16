@@ -140,17 +140,16 @@ func TestProviderExecuteRequiresProviderID(t *testing.T) {
 	require.Contains(t, err.Error(), "providerID is required")
 }
 
-func TestProviderExecuteHostReplaceRequiresMachine(t *testing.T) {
+func TestProviderExecuteHostReplaceRequiresMachineName(t *testing.T) {
 	t.Parallel()
 
 	provider := &Provider{NewClient: func() (computeClient, error) {
 		return &recordingComputeClient{}, nil
 	}}
 
-	require.True(t, provider.Supports(unboundedv1alpha3.OperationHostReplace))
 	_, err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "oci://old-instance", Operation: unboundedv1alpha3.OperationHostReplace})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "machine is required")
+	require.Contains(t, err.Error(), "machine name is required")
 }
 
 func TestProviderExecuteHostReplaceRequiresUserData(t *testing.T) {
@@ -163,7 +162,7 @@ func TestProviderExecuteHostReplaceRequiresUserData(t *testing.T) {
 	machine.Name = "machine-1"
 	machine.Spec.ProviderID = "oci://old-instance"
 
-	_, err := provider.Execute(context.Background(), machineops.OperationRequest{Machine: machine, ProviderID: "oci://old-instance", Operation: unboundedv1alpha3.OperationHostReplace})
+	_, err := provider.Execute(context.Background(), machineops.OperationRequest{MachineName: machine.Name, ProviderID: "oci://old-instance", Operation: unboundedv1alpha3.OperationHostReplace})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "replacement user data is required")
 }
@@ -202,7 +201,7 @@ func TestProviderExecuteHostReplaceLaunchesDefaultUbuntuReplacement(t *testing.T
 	machine.Spec.ProviderID = "oci://old-instance"
 
 	result, err := provider.Execute(context.Background(), machineops.OperationRequest{
-		Machine:         machine,
+		MachineName:     machine.Name,
 		OperationName:   "replace-machine-1",
 		OperationUID:    types.UID("operation-uid"),
 		ProviderID:      "oci://old-instance",
@@ -245,7 +244,7 @@ func TestProviderExecuteHostReplaceImageIDOverride(t *testing.T) {
 	machine.Spec.ProviderID = "oci://old-instance"
 
 	_, err := provider.Execute(context.Background(), machineops.OperationRequest{
-		Machine:         machine,
+		MachineName:     machine.Name,
 		OperationName:   "replace-machine-1",
 		OperationUID:    types.UID("operation-uid"),
 		ProviderID:      "oci://old-instance",
@@ -270,7 +269,7 @@ func TestProviderExecuteHostReplacePreflightsBeforeStop(t *testing.T) {
 	machine.Spec.ProviderID = "oci://old-instance"
 
 	_, err := provider.Execute(context.Background(), machineops.OperationRequest{
-		Machine:         machine,
+		MachineName:     machine.Name,
 		OperationName:   "replace-machine-1",
 		OperationUID:    types.UID("operation-uid"),
 		ProviderID:      "oci://old-instance",
@@ -296,7 +295,7 @@ func TestProviderExecuteHostReplaceWaitsForStoppingInstance(t *testing.T) {
 	machine.Spec.ProviderID = "oci://old-instance"
 
 	result, err := provider.Execute(context.Background(), machineops.OperationRequest{
-		Machine:         machine,
+		MachineName:     machine.Name,
 		OperationName:   "replace-machine-1",
 		OperationUID:    types.UID("operation-uid"),
 		ProviderID:      "oci://old-instance",
@@ -322,7 +321,7 @@ func TestProviderExecuteHostReplaceFailsWithDataVolume(t *testing.T) {
 	machine.Spec.ProviderID = "oci://old-instance"
 
 	_, err := provider.Execute(context.Background(), machineops.OperationRequest{
-		Machine:         machine,
+		MachineName:     machine.Name,
 		OperationName:   "replace-machine-1",
 		OperationUID:    types.UID("operation-uid"),
 		ProviderID:      "oci://old-instance",
@@ -356,7 +355,7 @@ func TestProviderExecuteHostReplaceReusesTaggedReplacement(t *testing.T) {
 	machine.Spec.ProviderID = "oci://old-instance"
 
 	result, err := provider.Execute(context.Background(), machineops.OperationRequest{
-		Machine:         machine,
+		MachineName:     machine.Name,
 		OperationName:   "replace-machine-1",
 		OperationUID:    types.UID("operation-uid"),
 		ProviderID:      "oci://old-instance",
@@ -391,7 +390,7 @@ func TestProviderExecuteHostReplaceAfterProviderIDHandoffReturnsCleanup(t *testi
 	machine.Spec.ProviderID = "oci://new-instance"
 
 	result, err := provider.Execute(context.Background(), machineops.OperationRequest{
-		Machine:         machine,
+		MachineName:     machine.Name,
 		OperationName:   "replace-machine-1",
 		OperationUID:    types.UID("operation-uid"),
 		ProviderID:      "oci://new-instance",
@@ -415,7 +414,7 @@ func TestProviderCleanupTerminatesOldInstance(t *testing.T) {
 	machine.Spec.ProviderID = "oci://new-instance"
 
 	err := provider.Cleanup(context.Background(), machineops.OperationRequest{
-		Machine:       machine,
+		MachineName:   machine.Name,
 		OperationName: "replace-machine-1",
 		OperationUID:  types.UID("operation-uid"),
 	}, machineops.OperationResult{CleanupProviderID: "oci://old-instance"})

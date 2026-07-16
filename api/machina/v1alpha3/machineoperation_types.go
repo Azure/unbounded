@@ -112,6 +112,10 @@ const (
 	// MachineOperationConditionCloudInitDone indicates that a metalman PXE
 	// target has completed first-boot cloud-init after writing the boot image.
 	MachineOperationConditionCloudInitDone = "CloudInitDone"
+
+	// MachineOperationConditionProviderOperationStalled reports that an
+	// accepted external provider operation has exceeded its expected duration.
+	MachineOperationConditionProviderOperationStalled = "ProviderOperationStalled"
 )
 
 // Condition types for MachineOperation targets.
@@ -135,7 +139,25 @@ const (
 	OperationStageWaitingRepave    OperationStage = "WaitingRepave"
 	OperationStageWaitingCloudInit OperationStage = "WaitingCloudInit"
 	OperationStageWaitingNode      OperationStage = "WaitingNode"
+	OperationStageWaitingProvider  OperationStage = "WaitingProviderOperation"
 )
+
+// ProviderOperationStatus identifies a resumable operation owned by an
+// external provider.
+type ProviderOperationStatus struct {
+	// Provider is the external provider that accepted the operation.
+	// +kubebuilder:validation:Required
+	Provider string `json:"provider"`
+
+	// OperationID is the provider-assigned operation identifier.
+	// +kubebuilder:validation:Required
+	OperationID string `json:"operationID"`
+
+	// ResumeToken is opaque provider data needed to resume polling. Providers
+	// must not store credentials or other secrets in this field.
+	// +optional
+	ResumeToken string `json:"resumeToken,omitempty"`
+}
 
 // MachineOperationSpec defines the desired state of a MachineOperation.
 type MachineOperationSpec struct {
@@ -251,6 +273,11 @@ type MachineOperationTargetStatus struct {
 	// LastAttemptAt records when the latest external action attempt occurred.
 	// +optional
 	LastAttemptAt *metav1.Time `json:"lastAttemptAt,omitempty"`
+
+	// ProviderOperation identifies the resumable external operation for this
+	// target, when the provider returned one.
+	// +optional
+	ProviderOperation *ProviderOperationStatus `json:"providerOperation,omitempty"`
 
 	// Conditions represent target-scoped observations for this operation. These
 	// conditions are not persisted on the Machine, so BMC capability fallbacks

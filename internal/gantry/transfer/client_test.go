@@ -19,6 +19,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 // startTransferOnEphemeral starts an h2c transfer server on an ephemeral
@@ -28,13 +29,19 @@ func startTransferOnEphemeral(t *testing.T, cache ifaces.LocalContentStore) stri
 
 	srv := New(cache)
 
+	return startHandlerOnEphemeral(t, srv.Handler())
+}
+
+func startHandlerOnEphemeral(t *testing.T, handler http.Handler) string {
+	t.Helper()
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 
 	h2s := &http2.Server{}
-	handler := h2c.NewHandler(srv.Handler(), h2s) //nolint:staticcheck // h2c deliberate
+	handler = h2c.NewHandler(handler, h2s) //nolint:staticcheck // h2c deliberate
 
 	hsrv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 
@@ -51,6 +58,35 @@ func startTransferOnEphemeral(t *testing.T, cache ifaces.LocalContentStore) stri
 	})
 
 	return ln.Addr().String()
+}
+
+func TestClientForwardsDelegatedAuthorization(t *testing.T) {
+	for _, authorization := range []string{
+		"Bearer requester-token",
+		"Basic cmVxdWVzdGVyOnNlY3JldA==",
+	} {
+		t.Run(strings.Fields(authorization)[0], func(t *testing.T) {
+			body := []byte("peer-served bytes")
+			d := mustDigest(body)
+
+			addr := startHandlerOnEphemeral(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("Authorization"); got != authorization {
+					t.Errorf("Authorization = %q, want %q", got, authorization)
+				}
+
+				_, _ = w.Write(body) //nolint:errcheck // best-effort write
+			}))
+
+			ctx := registryauth.WithAuthorization(context.Background(), authorization)
+
+			rc, _, err := NewClient().FetchFromPeer(ctx, addr, ifaces.OriginRef{Repository: "repo", Digest: d})
+			if err != nil {
+				t.Fatalf("FetchFromPeer: %v", err)
+			}
+
+			_ = rc.Close() //nolint:errcheck // best-effort close
+		})
+	}
 }
 
 func TestClientFetchOK(t *testing.T) {

@@ -49,15 +49,23 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digestpipe"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 const providerFailureSweepInterval = time.Minute
+
+const authenticationChallengeTimeout = 2 * time.Second
+
+type AuthenticationChallenger interface {
+	AuthenticationChallenge(ctx context.Context, registry string) (challenge string, required bool, err error)
+}
 
 // Server is the mirror HTTP handler.
 type Server struct {
 	cfg     *config.Config
 	store   ifaces.LocalContentStore
 	origin  ifaces.OriginPuller
+	auth    AuthenticationChallenger
 	logger  *slog.Logger
 	metrics metricsHooks
 
@@ -587,6 +595,10 @@ func New(cfg *config.Config, store ifaces.LocalContentStore, origin ifaces.Origi
 		unavailablePeerTTL:   30 * time.Second,
 		suspiciousPeerTTL:    5 * time.Minute,
 	}
+	if auth, ok := origin.(AuthenticationChallenger); ok {
+		s.auth = auth
+	}
+
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -668,6 +680,21 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	// Common headers.
 	w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
+	// Keep the requester's request-scoped registry identity attached to this
+	// request as it moves through peer lookup, please_pull, and origin. Basic
+	// and Bearer auth are accepted for delegation. An unsupported or malformed
+	// credential falls through to containerd's next host rather than silently
+	// switching to this agent's configured fallback identity.
+	rawAuthorization := strings.TrimSpace(r.Header.Get("Authorization"))
+
+	authorization := registryauth.Normalize(rawAuthorization)
+	if rawAuthorization != "" && authorization == "" {
+		http.Error(w, "unsupported registry authorization", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	r = r.WithContext(registryauth.WithAuthorization(r.Context(), authorization))
 
 	path := r.URL.Path
 	if path == "/v2/" || path == "/v2" {
@@ -717,6 +744,30 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "invalid digest", http.StatusBadRequest)
 		return
+	}
+
+	if authorization == "" && s.auth != nil {
+		challengeCtx, cancel := context.WithTimeout(r.Context(), authenticationChallengeTimeout)
+		challenge, required, challengeErr := s.auth.AuthenticationChallenge(challengeCtx, upstream)
+
+		cancel()
+
+		if challengeErr != nil {
+			s.logger.Warn("mirror: registry authentication challenge unavailable",
+				slog.String("registry", upstream),
+				slog.Any("err", challengeErr),
+			)
+			http.Error(w, "registry authentication unavailable", http.StatusServiceUnavailable)
+
+			return
+		}
+
+		if required {
+			w.Header().Set("WWW-Authenticate", challenge)
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+
+			return
+		}
 	}
 
 	s.serveDigest(w, r, upstream, repo, d, kind)
@@ -781,7 +832,7 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		switch s.tryPeerFallback(ctx, w, r, d, kind, upstream, repo, logger) {
 		case peerFallbackServed:
 			if !s.liveStreamThrough {
-				s.firePrefetch(kind, upstream, repo, d)
+				s.firePrefetch(ctx, kind, upstream, repo, d)
 			}
 
 			return
@@ -854,7 +905,7 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 			return true
 		}
 
-		s.firePrefetch(kind, upstream, repo, d)
+		s.firePrefetch(ctx, kind, upstream, repo, d)
 
 		if _, err := io.Copy(w, br); err != nil {
 			logger.Debug("mirror: copy from cache failed", slog.Any("err", err))
@@ -966,7 +1017,11 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 		// could fire again on the next request through this node at
 		// the bottom of the next jitter window, retry-amplifying
 		// against an origin that just returned 4xx/5xx.
-		s.recordNegCacheFailure(d, perr)
+		// Requester-specific origin failures cannot be shared safely in a
+		// cache keyed only by digest. A later request may carry another token.
+		if registryauth.Authorization(ctx) == "" {
+			s.recordNegCacheFailure(d, perr)
+		}
 
 		if s.liveStreamThrough {
 			s.fireOriginStreamFailed(kind)
@@ -1136,7 +1191,7 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 		// the deduplication promise of the step 7 specifically for
 		// the cold-start-exhausted path that just escalated to origin.
 		s.reAdvertiseDigest(d, "mirror_origin_announce", logger)
-		s.firePrefetch(kind, upstream, repo, d)
+		s.firePrefetch(ctx, kind, upstream, repo, d)
 		// Bytes streamed AND committed: this is the canonical
 		// mirror-direct origin-pull success. Fire AFTER commit
 		// (not after Copy) so a commit failure correctly leaves
@@ -1825,12 +1880,14 @@ func (s *Server) isUnavailablePeerInWindow(addr string, now time.Time) bool {
 // callback; the prefetcher's job is to read the manifest body from
 // cache and dispatch batched please_pull RPCs entirely in the
 // background.
-func (s *Server) firePrefetch(kind ifaces.OriginRefKind, registry, repository string, d digest.Digest) {
+func (s *Server) firePrefetch(ctx context.Context, kind ifaces.OriginRefKind, registry, repository string, d digest.Digest) {
 	if s.prefetcher == nil || kind != ifaces.KindManifest {
 		return
 	}
 
-	go s.prefetcher.OnManifestServed(context.Background(), registry, repository, d)
+	// The callback outlives the HTTP request, so detach cancellation while
+	// retaining only the delegated registry credential.
+	go s.prefetcher.OnManifestServed(registryauth.Detach(ctx), registry, repository, d)
 }
 
 // reAdvertiseDigest does a fire-and-forget dht.Provide(d) in a
@@ -2193,6 +2250,10 @@ func writeOriginError(w http.ResponseWriter, err error, logger *slog.Logger) {
 
 	switch oe.Class {
 	case ifaces.FailureAuth:
+		if oe.Challenge != "" {
+			w.Header().Set("WWW-Authenticate", oe.Challenge)
+		}
+
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	case ifaces.FailureNotFound:
 		http.Error(w, "not found", http.StatusNotFound)
