@@ -350,6 +350,21 @@ func siteUnstructured(t *testing.T, site unboundedv1alpha3.Site) *unstructured.U
 	return &unstructured.Unstructured{Object: object}
 }
 
+// legacySiteUnstructured builds a minimal pre-migration net-group Site object
+// (net.unbounded-cloud.io/v1alpha1) for orphan-cleanup tests that exercise the
+// migration guard.
+func legacySiteUnstructured(name string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   legacySiteGVR.Group,
+		Version: legacySiteGVR.Version,
+		Kind:    "Site",
+	})
+	obj.SetName(name)
+
+	return obj
+}
+
 // TestNodeSiteLabelFallback verifies the canonical-first, deprecated-fallback
 // read of a Node's site membership.
 func TestNodeSiteLabelFallback(t *testing.T) {
@@ -969,25 +984,25 @@ func TestCreateOrUpdateSliceDoesNotUseSameNameReplacementSite(t *testing.T) {
 }
 
 func TestCleanupOrphanSiteNodeSlicesRevalidatesSitesAndDeletePreconditions(t *testing.T) {
-	oldSite := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a", UID: "old-site-uid"}}
-	replacement := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: oldSite.Name, UID: "replacement-site-uid"}}
+	site := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a", UID: "site-uid"}}
 
-	emptySiteName := (&SiteController{}).buildSliceObject(oldSite, "empty-site-name", 0, nil)
+	emptySiteName := (&SiteController{}).buildSliceObject(site, "empty-site-name", 0, nil)
 	emptySiteName.Object["siteName"] = ""
 	emptySiteName.SetUID("empty-uid")
 	emptySiteName.SetResourceVersion("empty-rv")
 
-	missingSite := (&SiteController{}).buildSliceObject(oldSite, "missing-site", 0, nil)
+	missingSite := (&SiteController{}).buildSliceObject(site, "missing-site", 0, nil)
 	missingSite.Object["siteName"] = "missing"
 	missingSite.SetUID("missing-uid")
 	missingSite.SetResourceVersion("missing-rv")
 
-	recreatedSite := (&SiteController{}).buildSliceObject(oldSite, "recreated-site", 0, nil)
-	recreatedSite.SetUID("recreated-slice-uid")
-	recreatedSite.SetResourceVersion("recreated-slice-rv")
+	presentSite := (&SiteController{}).buildSliceObject(site, "present-site", 0, nil)
+	presentSite.Object["siteName"] = site.Name
+	presentSite.SetUID("present-slice-uid")
+	presentSite.SetResourceVersion("present-slice-rv")
 
 	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
-	for _, slice := range []*unstructured.Unstructured{emptySiteName, missingSite, recreatedSite} {
+	for _, slice := range []*unstructured.Unstructured{emptySiteName, missingSite, presentSite} {
 		if err := store.Add(slice.DeepCopy()); err != nil {
 			t.Fatalf("add slice %s to cache: %v", slice.GetName(), err)
 		}
@@ -997,30 +1012,14 @@ func TestCleanupOrphanSiteNodeSlicesRevalidatesSitesAndDeletePreconditions(t *te
 		runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{
 			siteGVR:          "SiteList",
+			legacySiteGVR:    "SiteList",
 			siteNodeSliceGVR: "SiteNodeSliceList",
 		},
-		siteUnstructured(t, oldSite),
+		siteUnstructured(t, site),
 		emptySiteName.DeepCopy(),
 		missingSite.DeepCopy(),
-		recreatedSite.DeepCopy(),
+		presentSite.DeepCopy(),
 	)
-
-	dynamicClient.PrependReactor("get", "sites", func(action clienttesting.Action) (bool, runtime.Object, error) {
-		getAction := action.(clienttesting.GetAction) //nolint:errcheck
-		if getAction.GetName() != oldSite.Name {
-			return false, nil, nil
-		}
-
-		if err := dynamicClient.Tracker().Delete(siteGVR, "", oldSite.Name); err != nil {
-			t.Fatalf("delete old site: %v", err)
-		}
-
-		if err := dynamicClient.Tracker().Add(siteUnstructured(t, replacement)); err != nil {
-			t.Fatalf("add replacement site: %v", err)
-		}
-
-		return false, nil, nil
-	})
 
 	sc := &SiteController{
 		dynamicClient: dynamicClient,
@@ -1030,8 +1029,8 @@ func TestCleanupOrphanSiteNodeSlicesRevalidatesSitesAndDeletePreconditions(t *te
 		t.Fatalf("cleanupOrphanSiteNodeSlices: %v", err)
 	}
 
-	if _, err := dynamicClient.Resource(siteNodeSliceGVR).Get(context.Background(), recreatedSite.GetName(), metav1.GetOptions{}); err != nil {
-		t.Fatalf("slice for recreated same-name Site was deleted: %v", err)
+	if _, err := dynamicClient.Resource(siteNodeSliceGVR).Get(context.Background(), presentSite.GetName(), metav1.GetOptions{}); err != nil {
+		t.Fatalf("slice for present Site was deleted: %v", err)
 	}
 
 	wantPreconditions := map[string]metav1.Preconditions{
@@ -1086,12 +1085,15 @@ func TestCleanupOrphanSiteNodeSlicesPreservesSliceOnSiteLookupError(t *testing.T
 		runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{
 			siteGVR:          "SiteList",
+			legacySiteGVR:    "SiteList",
 			siteNodeSliceGVR: "SiteNodeSliceList",
 		},
 		slice.DeepCopy(),
 	)
-	dynamicClient.PrependReactor("get", "sites", func(action clienttesting.Action) (bool, runtime.Object, error) {
-		return true, nil, apierrors.NewForbidden(siteGVR.GroupResource(), site.Name, errors.New("test denial"))
+	// The live Site listing is the health check that gates all deletion. If it
+	// cannot be read the routine must not delete anything.
+	dynamicClient.PrependReactor("list", "sites", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(siteGVR.GroupResource(), "", errors.New("test denial"))
 	})
 
 	sc := &SiteController{
@@ -1106,6 +1108,104 @@ func TestCleanupOrphanSiteNodeSlicesPreservesSliceOnSiteLookupError(t *testing.T
 
 	if _, err := dynamicClient.Resource(siteNodeSliceGVR).Get(context.Background(), slice.GetName(), metav1.GetOptions{}); err != nil {
 		t.Fatalf("slice was deleted after conservative Site lookup failure: %v", err)
+	}
+}
+
+// TestCleanupOrphanSiteNodeSlicesSkipsWhenNoSitesPresent covers the
+// migration/upgrade window where the machina Site set is observed empty (Sites
+// not yet translated) while legacy slices still exist. Deleting them would tear
+// down every inter-node tunnel cluster-wide, so cleanup must be a no-op.
+func TestCleanupOrphanSiteNodeSlicesSkipsWhenNoSitesPresent(t *testing.T) {
+	site := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a", UID: "site-uid"}}
+	slice := (&SiteController{}).buildSliceObject(site, "site-a-0", 0, nil)
+	slice.Object["siteName"] = site.Name
+	slice.SetUID("slice-uid")
+	slice.SetResourceVersion("slice-rv")
+
+	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := store.Add(slice.DeepCopy()); err != nil {
+		t.Fatalf("add slice to cache: %v", err)
+	}
+
+	// No Site objects registered: the live Site listing returns zero items.
+	dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			siteGVR:          "SiteList",
+			legacySiteGVR:    "SiteList",
+			siteNodeSliceGVR: "SiteNodeSliceList",
+		},
+		slice.DeepCopy(),
+	)
+
+	sc := &SiteController{
+		dynamicClient: dynamicClient,
+		sliceInformer: &fakeInformer{store: store},
+	}
+
+	if err := sc.cleanupOrphanSiteNodeSlices(context.Background()); err != nil {
+		t.Fatalf("cleanupOrphanSiteNodeSlices: %v", err)
+	}
+
+	if _, err := dynamicClient.Resource(siteNodeSliceGVR).Get(context.Background(), slice.GetName(), metav1.GetOptions{}); err != nil {
+		t.Fatalf("slice was deleted while no Sites were present: %v", err)
+	}
+
+	for _, action := range dynamicClient.Actions() {
+		if _, ok := action.(clienttesting.DeleteAction); ok && action.GetResource() == siteNodeSliceGVR {
+			t.Fatalf("unexpected slice delete while Site source was empty")
+		}
+	}
+}
+
+// TestCleanupOrphanSiteNodeSlicesKeepsSliceForUntranslatedLegacySite covers a
+// partially-migrated cluster: at least one Site has been translated into the
+// machina group, but this slice references a Site that is still only in the
+// legacy net group. It is not an orphan and must be preserved.
+func TestCleanupOrphanSiteNodeSlicesKeepsSliceForUntranslatedLegacySite(t *testing.T) {
+	translated := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "translated", UID: "translated-uid"}}
+
+	const legacyName = "legacy-site"
+
+	slice := (&SiteController{}).buildSliceObject(translated, "legacy-site-0", 0, nil)
+	slice.Object["siteName"] = legacyName
+	slice.SetUID("slice-uid")
+	slice.SetResourceVersion("slice-rv")
+
+	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := store.Add(slice.DeepCopy()); err != nil {
+		t.Fatalf("add slice to cache: %v", err)
+	}
+
+	dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			siteGVR:          "SiteList",
+			legacySiteGVR:    "SiteList",
+			siteNodeSliceGVR: "SiteNodeSliceList",
+		},
+		siteUnstructured(t, translated),
+		legacySiteUnstructured(legacyName),
+		slice.DeepCopy(),
+	)
+
+	sc := &SiteController{
+		dynamicClient: dynamicClient,
+		sliceInformer: &fakeInformer{store: store},
+	}
+
+	if err := sc.cleanupOrphanSiteNodeSlices(context.Background()); err != nil {
+		t.Fatalf("cleanupOrphanSiteNodeSlices: %v", err)
+	}
+
+	if _, err := dynamicClient.Resource(siteNodeSliceGVR).Get(context.Background(), slice.GetName(), metav1.GetOptions{}); err != nil {
+		t.Fatalf("slice for untranslated legacy Site was deleted: %v", err)
+	}
+
+	for _, action := range dynamicClient.Actions() {
+		if _, ok := action.(clienttesting.DeleteAction); ok && action.GetResource() == siteNodeSliceGVR {
+			t.Fatalf("unexpected slice delete for an untranslated legacy Site")
+		}
 	}
 }
 

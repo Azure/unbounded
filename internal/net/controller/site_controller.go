@@ -85,6 +85,18 @@ var siteNodeSliceGVR = schema.GroupVersionResource{
 	Resource: "sitenodeslices",
 }
 
+// legacySiteGVR is the pre-migration net-group Site resource. During the
+// unbounded-system migration a SiteNodeSlice may still reference a Site that
+// has not yet been translated into the machina group (siteGVR); that Site
+// continues to exist here until the operator's reaper deletes the legacy CRD.
+// Orphan cleanup consults this group so it never deletes a live site's slices
+// mid-migration.
+var legacySiteGVR = schema.GroupVersionResource{
+	Group:    "net.unbounded-cloud.io",
+	Version:  "v1alpha1",
+	Resource: "sites",
+}
+
 var gatewayPoolGVRSite = schema.GroupVersionResource{
 	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
@@ -1235,11 +1247,42 @@ func (sc *SiteController) getLiveSiteWithUID(ctx context.Context, name string, e
 
 func (sc *SiteController) cleanupOrphanSiteNodeSlices(ctx context.Context) error {
 	resource := sc.dynamicClient.Resource(siteNodeSliceGVR)
-	siteResource := sc.dynamicClient.Resource(siteGVR)
+
+	cachedSlices := sc.sliceInformer.GetStore().List()
+	if len(cachedSlices) == 0 {
+		return nil
+	}
+
+	// Establish that the Site source is healthy and populated before concluding
+	// that any slice is orphaned. A failed or empty live Site listing (Sites not
+	// yet translated into the machina group during the unbounded-system
+	// migration, or the Site CRD briefly unavailable) must never be read as
+	// "every Site was deleted": doing so would delete every SiteNodeSlice
+	// cluster-wide and tear down all inter-node tunnels. Legitimate whole-Site
+	// deletion is handled by owner-reference garbage collection, so skipping
+	// cleanup in that state is safe.
+	liveSites, err := sc.dynamicClient.Resource(siteGVR).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list sites for orphan slice cleanup: %w", err)
+	}
+
+	if len(liveSites.Items) == 0 {
+		klog.V(2).Infof(
+			"Skipping orphan SiteNodeSlice cleanup: no Sites present but %d slice(s) exist (Site source not yet populated)",
+			len(cachedSlices),
+		)
+
+		return nil
+	}
+
+	liveSiteNames := make(map[string]struct{}, len(liveSites.Items))
+	for i := range liveSites.Items {
+		liveSiteNames[liveSites.Items[i].GetName()] = struct{}{}
+	}
 
 	var cleanupErrors []error
 
-	for _, item := range sc.sliceInformer.GetStore().List() {
+	for _, item := range cachedSlices {
 		cachedSlice, ok := item.(*unstructured.Unstructured)
 		if !ok {
 			continue
@@ -1266,24 +1309,55 @@ func (sc *SiteController) cleanupOrphanSiteNodeSlices(ctx context.Context) error
 		}
 
 		if found && siteName != "" {
-			_, err = siteResource.Get(ctx, siteName, metav1.GetOptions{})
-			if err == nil {
+			// The referenced Site still exists in the machina group: keep it.
+			if _, live := liveSiteNames[siteName]; live {
 				continue
 			}
 
-			if !apierrors.IsNotFound(err) {
-				cleanupErrors = append(cleanupErrors, fmt.Errorf("check site %s for slice %s: %w", siteName, name, err))
+			// Migration guard: the Site may not have been translated into the
+			// machina group yet while its legacy net-group Site still exists.
+			// Such a slice is not an orphan; deleting it would tear down a live
+			// site's tunnels mid-migration. Only a Site absent from BOTH groups
+			// is genuinely gone.
+			legacyPresent, err := sc.legacySiteExists(ctx, siteName)
+			if err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("check legacy site %s for slice %s: %w", siteName, name, err))
 
+				continue
+			}
+
+			if legacyPresent {
 				continue
 			}
 		}
 
+		// Either the slice carries no siteName (it can never be reconciled) or
+		// its Site is absent from both the machina and legacy groups. The Site
+		// source is confirmed healthy and non-empty, so this is a genuine orphan.
 		if err := deleteLiveSiteNodeSlice(ctx, resource, liveSlice); err != nil && !apierrors.IsNotFound(err) {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("delete orphan slice %s: %w", name, err))
 		}
 	}
 
 	return errors.Join(cleanupErrors...)
+}
+
+// legacySiteExists reports whether a pre-migration net-group Site with the given
+// name still exists. It lets orphan cleanup avoid deleting SiteNodeSlices for
+// Sites that have not yet been translated into the machina group during the
+// unbounded-system migration. A missing legacy Site object, or a legacy Site CRD
+// that has already been reaped (its API path returns NotFound), both report
+// false.
+func (sc *SiteController) legacySiteExists(ctx context.Context, name string) (bool, error) {
+	_, err := sc.dynamicClient.Resource(legacySiteGVR).Get(ctx, name, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		return true, nil
+	case apierrors.IsNotFound(err):
+		return false, nil
+	default:
+		return false, fmt.Errorf("get legacy site %s: %w", name, err)
+	}
 }
 
 func deleteLiveSiteNodeSlice(ctx context.Context, resource dynamic.ResourceInterface, liveSlice *unstructured.Unstructured) error {
