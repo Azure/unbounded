@@ -74,7 +74,7 @@ type nspawnTemplateData struct {
 	NvidiaGPUDevicePaths         []string
 	NvidiaLibDirMounts           []goalstates.NvidiaLibDirMount
 	NvidiaI386LibDirMounts       []goalstates.NvidiaLibDirMount
-	NvidiaSMIDir                 string
+	NvidiaBinDir                 string
 	AMDGPUDevicePaths            []string
 	AMDSysFSPaths                []string
 }
@@ -95,11 +95,6 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		return fmt.Errorf("create container image archive mount point: %w", err)
 	}
 
-	nvidiaSMIDir := ""
-	if e.goalState.Nvidia.NvidiaSMIPath != "" {
-		nvidiaSMIDir = filepath.Dir(e.goalState.Nvidia.NvidiaSMIPath)
-	}
-
 	templateData := nspawnTemplateData{
 		MachineName:                  machineName,
 		BPFFSMountPath:               goalstates.BPFFSMountPath(machineName),
@@ -110,7 +105,7 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		NvidiaGPUDevicePaths:         e.goalState.Nvidia.GPUDevicePaths,
 		NvidiaLibDirMounts:           e.goalState.Nvidia.LibDirMounts,
 		NvidiaI386LibDirMounts:       e.goalState.Nvidia.I386LibDirMounts,
-		NvidiaSMIDir:                 nvidiaSMIDir,
+		NvidiaBinDir:                 nvidiaHostBinDir(e.goalState.Nvidia),
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
 		AMDSysFSPaths:                e.goalState.AMD.SysFSPaths,
 	}
@@ -156,6 +151,16 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	}
 
 	return nil
+}
+
+func nvidiaHostBinDir(nvidia goalstates.NvidiaHost) string {
+	for _, path := range []string{nvidia.NvidiaSMIPath, nvidia.NvidiaIMEXPath, nvidia.NvidiaIMEXCtlPath} {
+		if path != "" {
+			return filepath.Dir(path)
+		}
+	}
+
+	return ""
 }
 
 func pathsExcluding(paths, excluded []string) []string {

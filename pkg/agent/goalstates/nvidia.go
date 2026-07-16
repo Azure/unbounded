@@ -40,8 +40,8 @@ import (
 // bind-mount specifications for the nspawn container.
 type NvidiaHost struct {
 	// GPUDevicePaths lists NVIDIA GPU device paths discovered on the host
-	// (e.g. /dev/nvidia0, /dev/nvidiactl, /dev/nvidia-caps/*,
-	// /dev/nvidia-caps-imex-channels/*, /dev/dri/*).
+	// (e.g. /dev/nvidia0, /dev/nvidiactl, /dev/nvidia-caps,
+	// /dev/nvidia-caps-imex-channels, /dev/dri/*).
 	// When non-empty the nspawn configuration will bind-mount these devices
 	// and grant the container cgroup access to them.
 	GPUDevicePaths []string
@@ -129,16 +129,16 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 	libraries := resolveNVIDIALibraries(archInfo)
 
 	return NvidiaHost{
-		GPUDevicePaths:   devices,
-		ContainerLibDir:  archInfo.libDir,
-		LibMappings:      libraries.libMappings,
-		LibDirMounts:     libraries.libDirMounts,
-		I386LibMappings:  libraries.i386LibMappings,
-		I386LibDirMounts: libraries.i386LibDirMounts,
-		NvidiaSMIPath:    discoverNVIDIASMI(),
-		NvidiaIMEXPath:   discoverNVIDIABinary("nvidia-imex"),
+		GPUDevicePaths:    devices,
+		ContainerLibDir:   archInfo.libDir,
+		LibMappings:       libraries.libMappings,
+		LibDirMounts:      libraries.libDirMounts,
+		I386LibMappings:   libraries.i386LibMappings,
+		I386LibDirMounts:  libraries.i386LibDirMounts,
+		NvidiaSMIPath:     discoverNVIDIASMI(),
+		NvidiaIMEXPath:    discoverNVIDIABinary("nvidia-imex"),
 		NvidiaIMEXCtlPath: discoverNVIDIABinary("nvidia-imex-ctl"),
-		DriverVersion:    libraries.driverVersion,
+		DriverVersion:     libraries.driverVersion,
 	}, nil
 }
 

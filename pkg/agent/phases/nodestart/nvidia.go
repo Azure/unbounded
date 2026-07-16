@@ -310,6 +310,7 @@ func (s *setupNVIDIA) copyNVIDIAIMEXBinaries(ctx context.Context, paths nvidiaDr
 		}
 
 		source := filepath.Join(goalstates.NvidiaHostBinDir, filepath.Base(binary.path))
+
 		destination := filepath.Join(paths.rootDir, "usr", "bin", binary.name)
 		if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName, "cp", "-L", source, destination); err != nil {
 			return fmt.Errorf("copy %s: %w", binary.name, err)

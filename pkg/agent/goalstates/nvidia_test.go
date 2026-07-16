@@ -11,19 +11,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestDiscoverNVIDIADevicesIncludesIMEXChannels(t *testing.T) {
+func TestDiscoverNVIDIADevicesBindsCapabilityDirectories(t *testing.T) {
 	t.Parallel()
 
 	deviceDir := t.TempDir()
+	capsDir := filepath.Join(deviceDir, nvidiaCapsDirName)
+	capability := filepath.Join(capsDir, "nvidia-cap4323")
 	imexDir := filepath.Join(deviceDir, nvidiaIMEXDirName)
 	channel := filepath.Join(imexDir, "channel0")
 	nonChannel := filepath.Join(imexDir, "not-a-channel")
+
+	require.NoError(t, os.MkdirAll(capsDir, 0o755))
 	require.NoError(t, os.MkdirAll(imexDir, 0o755))
+	require.NoError(t, os.WriteFile(capability, nil, 0o644))
 	require.NoError(t, os.WriteFile(channel, nil, 0o644))
 	require.NoError(t, os.WriteFile(nonChannel, nil, 0o644))
 
 	devices := discoverNVIDIADevicesIn(deviceDir)
+	require.Contains(t, devices, capsDir)
 	require.Contains(t, devices, imexDir)
+	require.NotContains(t, devices, capability)
 	require.NotContains(t, devices, channel)
 	require.NotContains(t, devices, nonChannel)
 }

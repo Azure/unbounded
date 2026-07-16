@@ -161,12 +161,13 @@ func TestNSpawnConfig_NVIDIADriverRootMounts(t *testing.T) {
 			HostDir:      "/usr/lib/i386-linux-gnu",
 			ContainerDir: "/run/host-nvidia-i386/0",
 		}},
-		NvidiaSMIDir: "/usr/bin",
+		NvidiaBinDir: "/usr/bin",
 	}))
 
 	require.Contains(t, buf.String(), "BindReadOnly=/usr/lib/x86_64-linux-gnu:/run/host-nvidia/0")
 	require.Contains(t, buf.String(), "BindReadOnly=/usr/lib/i386-linux-gnu:/run/host-nvidia-i386/0")
 	require.Contains(t, buf.String(), "BindReadOnly=/usr/bin:/run/host-nvidia-bin")
+	require.NotContains(t, buf.String(), ":/run/nvidia/driver")
 }
 
 func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
@@ -193,6 +194,16 @@ func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
 	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-nvidia-caps-imex-channels rwm")
 	require.NotContains(t, overrideBuf.String(), "DeviceAllow=/dev/nvidia-caps rwm")
 	require.NotContains(t, overrideBuf.String(), "DeviceAllow="+channels+" rwm")
+	require.NotContains(t, overrideBuf.String(), "DevicePolicy=")
+}
+
+func TestNvidiaHostBinDirFallsBackToIMEX(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "/usr/bin", nvidiaHostBinDir(goalstates.NvidiaHost{
+		NvidiaIMEXPath:    "/usr/bin/nvidia-imex",
+		NvidiaIMEXCtlPath: "/usr/bin/nvidia-imex-ctl",
+	}))
 }
 
 func TestPathsExcluding(t *testing.T) {
