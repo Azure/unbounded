@@ -2548,6 +2548,10 @@ def validate_additional_host_mounts_config(node_config: NodeConfig) -> None:
     log("Validating additional host mounts configuration...")
 
     # Check 1: the persisted agent config JSON must contain all configured mounts.
+    # Double-encode with json.dumps so the inner script receives a Python string literal
+    # that it can parse with json.loads(). Direct substitution would fail because
+    # json.dumps() produces lowercase JSON booleans (true/false) which are not valid
+    # Python literals.
     expected_mounts_json = json.dumps(
         [
             {
@@ -2559,13 +2563,14 @@ def validate_additional_host_mounts_config(node_config: NodeConfig) -> None:
         ],
         sort_keys=True,
     )
+    expected_mounts_literal = json.dumps(expected_mounts_json)
     ssh_cmd(f"""
 sudo python3 - <<'PY'
 import json
 import pathlib
 import sys
 
-expected_mounts = {expected_mounts_json}
+expected_mounts = json.loads({expected_mounts_literal})
 paths = sorted(pathlib.Path("/tmp").glob("unbounded-agent-config.*.json"))
 paths.append(pathlib.Path("/etc/unbounded/agent/config.json"))
 for config_path in paths:
