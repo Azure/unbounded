@@ -29,6 +29,7 @@ import (
 	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 //go:embed assets/node-bootstrap/script.sh
@@ -110,6 +111,11 @@ type manualBootstrapHandler struct {
 	// offlineArtifactsSource configures a complete offline source for rootfs
 	// binary artifacts installed by the agent.
 	offlineArtifactsSource string
+
+	// additionalHostMounts is a list of extra host bind-mounts for the nspawn
+	// machine. Each entry uses the format "source[:target][:ro]" where target
+	// defaults to source when omitted and ":ro" marks the mount read-only.
+	additionalHostMounts []string
 
 	// Download override flags for rootfs binaries installed by the agent.
 	// See `kubectl unbounded machine register --help` for the equivalent
@@ -252,6 +258,45 @@ func validatePathArtifactsSource(source string) error {
 	}
 
 	return nil
+}
+
+// parseAdditionalHostMount parses a single --additional-host-mount flag value.
+// The accepted format is "source[:target][:ro]" where:
+//   - source is a clean absolute host path.
+//   - target is an optional clean absolute path inside the container; defaults to source.
+//   - ":ro" marks the mount read-only.
+func parseAdditionalHostMount(value string) (config.AdditionalHostMount, error) {
+	if value == "" {
+		return config.AdditionalHostMount{}, errors.New("mount spec must not be empty")
+	}
+
+	readOnly := false
+	spec := value
+	if strings.HasSuffix(spec, ":ro") {
+		readOnly = true
+		spec = strings.TrimSuffix(spec, ":ro")
+	}
+
+	var source, target string
+
+	if i := strings.Index(spec, ":"); i >= 0 {
+		source = spec[:i]
+		target = spec[i+1:]
+	} else {
+		source = spec
+	}
+
+	mount := config.AdditionalHostMount{
+		Source:   source,
+		Target:   target,
+		ReadOnly: readOnly,
+	}
+
+	if err := config.ValidateAdditionalHostMounts([]config.AdditionalHostMount{mount}); err != nil {
+		return config.AdditionalHostMount{}, fmt.Errorf("invalid --additional-host-mount %q: %w", value, err)
+	}
+
+	return mount, nil
 }
 
 func (h *manualBootstrapHandler) validate() error {
@@ -400,6 +445,15 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 	}
 
 	cfg.CRI.Containerd.SandboxImage = strings.TrimSpace(h.sandboxImage)
+
+	for _, raw := range h.additionalHostMounts {
+		mount, err := parseAdditionalHostMount(raw)
+		if err != nil {
+			return nil, err
+		}
+
+		cfg.AdditionalHostMounts = append(cfg.AdditionalHostMounts, mount)
+	}
 
 	return &cfg, nil
 }
@@ -602,6 +656,7 @@ Examples:
 	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image reference for the agent rootfs")
 	cmd.Flags().StringVar(&handler.sandboxImage, "sandbox-image", "", "Containerd CRI sandbox image reference")
 	cmd.Flags().StringVar(&handler.offlineArtifactsSource, "offline-artifacts-source", "", "Offline rootfs binary artifact source to embed in agent config (absolute path, file:// URL, or oci:// artifact reference)")
+	cmd.Flags().StringArrayVar(&handler.additionalHostMounts, "additional-host-mount", nil, `Extra host bind-mount for the nspawn machine in "source[:target][:ro]" format (can be repeated). target defaults to source; append :ro for a read-only mount`)
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")
 	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script or cloud-init")
 	cmd.Flags().StringVar(&handler.agentVersion, "agent-version", "", "Pin the unbounded-agent release tag to download on the host (default: latest GitHub release)")

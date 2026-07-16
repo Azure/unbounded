@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 // ---------------------------------------------------------------------------
@@ -979,4 +980,99 @@ func requireValidBashSyntax(t *testing.T, script string) {
 
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "bash -n failed: %s", string(out))
+}
+
+
+// ---------------------------------------------------------------------------
+// parseAdditionalHostMount() tests
+// ---------------------------------------------------------------------------
+
+func TestParseAdditionalHostMount(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		input     string
+		wantMount config.AdditionalHostMount
+		wantErr   string
+	}{
+		{
+			name:      "source only",
+			input:     "/opt/config",
+			wantMount: config.AdditionalHostMount{Source: "/opt/config"},
+		},
+		{
+			name:      "source and target",
+			input:     "/opt/config:/etc/config",
+			wantMount: config.AdditionalHostMount{Source: "/opt/config", Target: "/etc/config"},
+		},
+		{
+			name:      "source only read-only",
+			input:     "/opt/config:ro",
+			wantMount: config.AdditionalHostMount{Source: "/opt/config", ReadOnly: true},
+		},
+		{
+			name:      "source and target read-only",
+			input:     "/opt/config:/etc/config:ro",
+			wantMount: config.AdditionalHostMount{Source: "/opt/config", Target: "/etc/config", ReadOnly: true},
+		},
+		{
+			name:    "empty value",
+			input:   "",
+			wantErr: "mount spec must not be empty",
+		},
+		{
+			name:    "relative source",
+			input:   "opt/config",
+			wantErr: "invalid --additional-host-mount",
+		},
+		{
+			name:    "unclean source",
+			input:   "/opt/../config",
+			wantErr: "invalid --additional-host-mount",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseAdditionalHostMount(tt.input)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.wantErr)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tt.wantMount, got)
+		})
+	}
+}
+
+func TestManualBootstrapHandler_BuildAgentConfig_AdditionalHostMounts(t *testing.T) {
+	t.Parallel()
+
+	kubeCli := newFakeCluster(t, "dc1")
+
+	h := &manualBootstrapHandler{
+		siteName:    "dc1",
+		machineName: "my-node",
+		additionalHostMounts: []string{
+			"/opt/config:ro",
+			"/var/lib/data:/data",
+		},
+		kubeCli:    kubeCli,
+		kubeConfig: &rest.Config{Host: "https://my-api-server:6443"},
+		logger:     discardLogger(),
+	}
+
+	cfg, err := h.buildAgentConfig(context.Background())
+	require.NoError(t, err)
+
+	require.Equal(t, []config.AdditionalHostMount{
+		{Source: "/opt/config", ReadOnly: true},
+		{Source: "/var/lib/data", Target: "/data"},
+	}, cfg.AdditionalHostMounts)
 }

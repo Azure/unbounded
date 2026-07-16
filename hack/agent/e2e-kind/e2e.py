@@ -574,6 +574,7 @@ class NodeConfig:
     offline_artifacts_oci_ref: str = ""
     rootfs_oci_image: str = ""
     block_external_network: bool = False
+    additional_host_mounts: tuple[dict[str, Any], ...] = ()
     path: str = ""
 
 
@@ -611,6 +612,7 @@ def load_node_config(
     offline_artifacts_oci_ref = offline_artifacts_oci_ref_override or cfg.get("offlineArtifactsOCIRef", "")
     rootfs_oci_image = offline_rootfs_oci_image_override or cfg.get("offlineRootfsOCIImage", "")
     block_external_network = cfg.get("blockExternalNetwork", False)
+    additional_host_mounts = cfg.get("additionalHostMounts", [])
 
     if not isinstance(name, str) or not name:
         die(f"node config {config_path} field 'name' must be a non-empty string")
@@ -631,6 +633,17 @@ def load_node_config(
         die(f"node config {config_path} field 'offlineRootfsOCIImage' must be a string")
     if not isinstance(block_external_network, bool):
         die(f"node config {config_path} field 'blockExternalNetwork' must be a boolean")
+    if not isinstance(additional_host_mounts, list) or not all(
+        isinstance(m, dict)
+        and isinstance(m.get("source", ""), str) and m.get("source", "")
+        and isinstance(m.get("target", ""), str)
+        and isinstance(m.get("readOnly", False), bool)
+        for m in additional_host_mounts
+    ):
+        die(
+            f"node config {config_path} field 'additionalHostMounts' must be a list of objects "
+            f"with string 'source', optional string 'target', and optional bool 'readOnly'"
+        )
 
     return NodeConfig(
         name=name,
@@ -640,6 +653,7 @@ def load_node_config(
         offline_artifacts_oci_ref=offline_artifacts_oci_ref,
         rootfs_oci_image=rootfs_oci_image,
         block_external_network=block_external_network,
+        additional_host_mounts=tuple(dict(m) for m in additional_host_mounts),
         path=str(config_path),
     )
 
@@ -690,6 +704,13 @@ def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
         args.extend(["--register-with-taint", taint])
     if node_config.rootfs_oci_image:
         args.extend(["--oci-image", node_config.rootfs_oci_image])
+    for mount in node_config.additional_host_mounts:
+        spec = mount["source"]
+        if mount.get("target"):
+            spec += ":" + mount["target"]
+        if mount.get("readOnly"):
+            spec += ":ro"
+        args.extend(["--additional-host-mount", spec])
     return args
 
 
@@ -704,6 +725,15 @@ def log_active_node_config(node_config: NodeConfig) -> None:
     log(f"  offline artifacts OCI ref: {node_config.offline_artifacts_oci_ref or '<none>'}")
     log(f"  rootfs OCI image: {node_config.rootfs_oci_image or '<default>'}")
     log(f"  block external network: {node_config.block_external_network}")
+    if node_config.additional_host_mounts:
+        mounts = [
+            f"{m['source']}" + (f":{m['target']}" if m.get("target") else "")
+            + (" (ro)" if m.get("readOnly") else "")
+            for m in node_config.additional_host_mounts
+        ]
+        log(f"  additional host mounts: {', '.join(mounts)}")
+    else:
+        log(f"  additional host mounts: <none>")
 
 
 def _safe_name(value: str) -> str:
@@ -2431,6 +2461,7 @@ def validate_node_config(node_config: NodeConfig) -> None:
     node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
     _assert_expected_node_config(node, node_config)
     validate_offline_bootstrap_config(node_config)
+    validate_additional_host_mounts_config(node_config)
 
     log("============================================")
     log("  Node config validation PASSED")
@@ -2490,6 +2521,82 @@ def validate_local_registry_served_offline_artifacts(oci_ref: str) -> None:
         die(f"local registry logs do not show offline artifact blob GETs for {repository}")
 
     log(f"Local registry served offline artifacts for {repository}")
+
+
+def validate_additional_host_mounts_config(node_config: NodeConfig) -> None:
+    """Verify AdditionalHostMounts are present in the persisted agent config and nspawn config."""
+    if not node_config.additional_host_mounts:
+        return
+
+    log("Validating additional host mounts configuration...")
+
+    # Check 1: the persisted agent config JSON must contain all configured mounts.
+    expected_mounts_json = json.dumps(
+        [
+            {
+                "Source": m["source"],
+                **({"Target": m["target"]} if m.get("target") else {}),
+                **({"ReadOnly": True} if m.get("readOnly") else {}),
+            }
+            for m in node_config.additional_host_mounts
+        ],
+        sort_keys=True,
+    )
+    ssh_cmd(f"""
+sudo python3 - <<'PY'
+import json
+import pathlib
+import sys
+
+expected_mounts = {expected_mounts_json}
+paths = sorted(pathlib.Path("/tmp").glob("unbounded-agent-config.*.json"))
+paths.append(pathlib.Path("/etc/unbounded/agent/config.json"))
+for config_path in paths:
+    if not config_path.exists():
+        continue
+    cfg = json.loads(config_path.read_text())
+    mounts = cfg.get("AdditionalHostMounts") or []
+    for want in expected_mounts:
+        src = want["Source"]
+        tgt = want.get("Target", src)
+        ro = want.get("ReadOnly", False)
+        found = any(
+            m.get("Source") == src
+            and m.get("Target", m.get("Source")) == tgt
+            and bool(m.get("ReadOnly")) == ro
+            for m in mounts
+        )
+        if not found:
+            sys.exit(
+                f"AdditionalHostMounts entry Source={{src!r}} Target={{tgt!r}} ReadOnly={{ro}} "
+                f"not found in {{config_path}}: mounts={{mounts}}"
+            )
+    print(f"AdditionalHostMounts verified in {{config_path}}: {{len(expected_mounts)}} entries")
+    sys.exit(0)
+sys.exit("No agent config file with AdditionalHostMounts found")
+PY
+""")
+
+    # Check 2: the nspawn config file must contain the correct Bind / BindReadOnly directives.
+    log("Validating additional host mounts in nspawn config...")
+    machine = active_nspawn_machine()
+    nspawn_config_path = f"/etc/systemd/nspawn/{machine}.nspawn"
+    nspawn_config = ssh_capture(f"sudo cat {nspawn_config_path}")
+
+    for mount in node_config.additional_host_mounts:
+        source = mount["source"]
+        target = mount.get("target") or source
+        read_only = bool(mount.get("readOnly"))
+        directive = "BindReadOnly" if read_only else "Bind"
+        expected_line = f"{directive}={source}:{target}"
+        if expected_line not in nspawn_config:
+            die(
+                f"nspawn config {nspawn_config_path} missing expected directive "
+                f"{expected_line!r}; full config:\n{nspawn_config}"
+            )
+        log(f"  found nspawn directive: {expected_line}")
+
+    log("Additional host mounts configuration validated")
 
 
 def _run_scenario_command(command: str, node_config: NodeConfig, env: dict[str, str]) -> None:

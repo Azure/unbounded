@@ -1,0 +1,17 @@
+{
+  "name": "additional-host-mounts",
+  "nodeLabels": {
+    "e2e.unbounded-cloud.io/config": "additional-host-mounts"
+  },
+  "additionalHostMounts": [
+    {
+      "source": "/etc/motd",
+      "target": "/run/host-config/motd",
+      "readOnly": true
+    },
+    {
+      "source": "/etc/hostname",
+      "readOnly": true
+    }
+  ]
+}
