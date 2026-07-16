@@ -37,6 +37,9 @@ controller:
   statusWebsocketKeepaliveInterval: 10s
   statusWsKeepaliveFailureCount: 2
   registerAggregatedAPIServer: true
+  managedKubeProxy:
+    enabled: true
+    image: ""
   leaderElection:
     enabled: true
     leaseDuration: 15s
@@ -91,6 +94,25 @@ node:
 ```
 
 ## Controller Configuration
+
+### Managed kube-proxy
+
+The controller creates a kube-proxy DaemonSet for each Site whose nodes are not
+covered by the provider-managed kube-proxy. By default, it reuses the image from
+the `kube-system/kube-proxy` DaemonSet. If that DaemonSet does not exist, it uses
+`registry.k8s.io/kube-proxy:<server version>`.
+
+Set `controller.managedKubeProxy.image` to override the image for all
+unbounded-managed kube-proxy DaemonSets, for example when pulling kube-proxy
+through a private registry. Set `controller.managedKubeProxy.enabled` to `false`
+to disable their creation. See the
+[managed kube-proxy design](../../designs/managed-kube-proxy.md) for scheduling
+and per-Site behavior.
+
+| Flag | Runtime setting | Type | Default | Description |
+|------|-----------------|------|---------|-------------|
+| `--managed-kube-proxy` | `controller.managedKubeProxy.enabled` | bool | `true` | Create kube-proxy DaemonSets for unbounded-managed Site nodes not covered by provider kube-proxy. |
+| `--managed-kube-proxy-image` | `controller.managedKubeProxy.image` | string | empty | Override the kube-proxy image used by unbounded-managed DaemonSets. |
 
 ### Pod CIDR Assignment (Site CRD)
 
