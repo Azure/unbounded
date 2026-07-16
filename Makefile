@@ -82,11 +82,6 @@ GANTRY_CMD=./cmd/gantry
 GANTRY_IMAGE ?= $(CONTAINER_REGISTRY)/gantry:$(VERSION)
 GANTRY_NAMESPACE ?= gantry
 
-# ACR kubelet credential provider fixture for internal validation
-ACR_CREDENTIAL_PROVIDER_BIN=bin/acr-credential-provider
-ACR_CREDENTIAL_PROVIDER_CMD=./hack/acr-credential-provider/cmd/acr-credential-provider
-ACR_CREDENTIAL_PROVIDER_INSTALLER_IMAGE ?= $(CONTAINER_REGISTRY)/acr-credential-provider-installer:$(VERSION)
-
 # unbounded-storage-supervisor (Go binary; distinct from the Rust crate below)
 UNBOUNDED_STORAGE_SUPERVISOR_BIN=bin/unbounded-storage-supervisor
 UNBOUNDED_STORAGE_SUPERVISOR_CMD=./cmd/unbounded-storage-supervisor
@@ -217,9 +212,9 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build acr-credential-provider acr-credential-provider-build
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
-.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push image-acr-credential-provider-installer-local image-acr-credential-provider-installer-push images-local
+.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
@@ -592,11 +587,6 @@ gantry-build: ## Build the gantry binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(GANTRY_BIN) $(GANTRY_CMD)
 
 gantry: test gantry-build ## Build gantry (implies test)
-
-acr-credential-provider-build: ## Build the ACR kubelet credential provider binary (no lint/test)
-	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(ACR_CREDENTIAL_PROVIDER_BIN) $(ACR_CREDENTIAL_PROVIDER_CMD)
-
-acr-credential-provider: test acr-credential-provider-build ## Build the ACR credential provider (implies test)
 
 unbounded-storage-supervisor-build: ## Build the unbounded-storage-supervisor binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_STORAGE_SUPERVISOR_BIN) $(UNBOUNDED_STORAGE_SUPERVISOR_CMD)
@@ -1064,18 +1054,6 @@ image-gantry-local: ## Build the gantry container image locally (single-arch)
 
 image-gantry-push: image-gantry-local ## Build and push the gantry container image
 	$(CONTAINER_ENGINE) push $(GANTRY_IMAGE)
-
-image-acr-credential-provider-installer-local: ## Build the ACR credential provider installer image locally (single-arch)
-	$(CONTAINER_ENGINE) build \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
-		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t acr-credential-provider-installer:$(VERSION) -t $(ACR_CREDENTIAL_PROVIDER_INSTALLER_IMAGE) \
-		-f ./hack/acr-credential-provider/installer/Containerfile .
-	$(call trivy-maybe,$(ACR_CREDENTIAL_PROVIDER_INSTALLER_IMAGE))
-
-image-acr-credential-provider-installer-push: image-acr-credential-provider-installer-local ## Build and push the ACR credential provider installer image
-	$(CONTAINER_ENGINE) push $(ACR_CREDENTIAL_PROVIDER_INSTALLER_IMAGE)
 
 ##@ Orca
 

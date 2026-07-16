@@ -1,14 +1,15 @@
 # Standalone Gantry Install Playbook
 
-This playbook installs Gantry on a fresh Kubernetes cluster and validates
-private Azure Container Registry pulls without workload `imagePullSecrets`.
-It uses the repo-owned ACR kubelet exec credential provider as a validation
-fixture, proves private ACR pulls work before Gantry, then installs Gantry and
-proves the same private pull path works through Gantry.
+This playbook installs Gantry on a fresh AKS cluster and validates private
+Azure Container Registry pulls without workload `imagePullSecrets`. It relies on
+the ACR kubelet exec credential provider that AKS already installs and
+configures on every node, proves private ACR pulls work before Gantry, then
+installs Gantry and proves the same private pull path works through Gantry.
 
-The credential provider is an independent fixture under
-`hack/acr-credential-provider`. This playbook consumes it, but Gantry does not
-own or depend on its source code.
+AKS ships the upstream `acr-credential-provider` binary and its
+`CredentialProviderConfig` on each node, so no provider installation is
+required. The operator only needs to grant the cluster's kubelet identity pull
+access to the registry.
 
 This is an internal operator playbook, not a design document and not the public
 Gantry guide.
@@ -18,22 +19,17 @@ Gantry guide.
 1. Create or reuse an ACR.
 2. Import a small private test image into ACR.
 3. Grant the AKS kubelet identity `AcrPull` on the ACR.
-4. Verify anonymous access to the published immutable provider installer image.
-5. Install the provider on every node with a DaemonSet.
-6. Validate a plain private ACR Pod before installing Gantry.
-7. Install Gantry service account, containerd node config, ConfigMap, and DaemonSet.
-8. Validate the same private ACR image on worker nodes after Gantry is running.
-9. Check Gantry logs, health, and node-local metrics.
+4. Validate a plain private ACR Pod before installing Gantry.
+5. Install Gantry service account, containerd node config, ConfigMap, and DaemonSet.
+6. Validate the same private ACR image on worker nodes after Gantry is running.
+7. Check Gantry logs, health, and node-local metrics.
 
 ## Assumptions
 
-- The target cluster uses Linux nodes and containerd.
-- The cluster nodes support kubelet exec credential providers.
+- The target cluster is AKS with Linux nodes and containerd.
+- AKS has installed and configured the ACR kubelet credential provider on every
+  node, which is the default for AKS.
 - The operator can assign ACR pull permissions to the AKS kubelet identity.
-- The provider installer image is in a public registry that nodes can pull
-  before ACR authentication is configured.
-- The provider installer image tag is durable. Do not use a short-lived tag for
-  ongoing clusters, because future nodes must be able to pull the installer.
 - Workload manifests do not use `imagePullSecrets` for this validation.
 - Commands run from the repository root so relative `hack/` and `deploy/`
   paths resolve correctly.
@@ -42,9 +38,8 @@ Gantry guide.
 
 ## Set Variables
 
-Set a dedicated kubeconfig and the AKS, ACR, Gantry, and provider image values.
-The provider installer image must be public. Gantry itself may live in the
-private ACR after the provider preflight succeeds.
+Set a dedicated kubeconfig and the AKS, ACR, and Gantry values. Gantry itself
+may live in the private ACR once the ACR pull role assignment has propagated.
 
 ```bash
 set -euo pipefail
@@ -59,11 +54,6 @@ export KUBECONFIG
 
 LOCATION="${LOCATION:-canadacentral}"
 WORK_DIR="${WORK_DIR:-tmp/gantry-standalone-live}"
-ACR_PROVIDER_ROOT="${ACR_PROVIDER_ROOT:-hack/acr-credential-provider}"
-ACR_PROVIDER_NAMESPACE="${ACR_PROVIDER_NAMESPACE:-acr-credential-provider-system}"
-ACR_PROVIDER_INSTALLER_REPOSITORY="${ACR_PROVIDER_INSTALLER_REPOSITORY:-azure/acr-credential-provider-installer}"
-ACR_PROVIDER_INSTALLER_TAG="${ACR_PROVIDER_INSTALLER_TAG:-53b9d94e}"
-ACR_PROVIDER_INSTALLER_IMAGE="ghcr.io/${ACR_PROVIDER_INSTALLER_REPOSITORY}:${ACR_PROVIDER_INSTALLER_TAG}"
 
 az account set --subscription "$SUBSCRIPTION_ID"
 mkdir -p "$WORK_DIR"
@@ -135,76 +125,23 @@ az role assignment create \
   --only-show-errors || true
 ```
 
-## Verify The Provider Installer Image
+## Confirm The AKS ACR Credential Provider
 
-The default provider installer is the public, immutable image validated by this
-playbook. Verify anonymous access before changing any node. Do not continue if
-either request fails, because new nodes must pull this image without registry
-credentials.
+AKS installs the ACR kubelet credential provider and its
+`CredentialProviderConfig` on every node, and wires the kubelet flags that
+enable it. No installation step is required. The `AcrPull` role assignment above
+is what lets that provider obtain pull tokens for your registry.
 
-```bash
-provider_token=$(curl -fsS \
-  "https://ghcr.io/token?service=ghcr.io&scope=repository:${ACR_PROVIDER_INSTALLER_REPOSITORY}:pull" | \
-  jq -r '.token // empty')
-
-if [ -z "$provider_token" ]; then
-  echo "GHCR did not issue an anonymous pull token" >&2
-  exit 1
-fi
-
-curl -fsS -o /dev/null \
-  -H "Authorization: Bearer ${provider_token}" \
-  -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
-  "https://ghcr.io/v2/${ACR_PROVIDER_INSTALLER_REPOSITORY}/manifests/${ACR_PROVIDER_INSTALLER_TAG}"
-
-unset provider_token
-echo "verified anonymous pull access to ${ACR_PROVIDER_INSTALLER_IMAGE}"
-```
-
-To validate provider source changes instead, build and publish a new immutable
-public tag using the commands in `hack/acr-credential-provider/README.md`, then
-override `ACR_PROVIDER_INSTALLER_REPOSITORY` and
-`ACR_PROVIDER_INSTALLER_TAG` before running this check.
-
-Render the installer DaemonSet with the verified image. The fixture manifest is
-multi-document and includes the Namespace, so use direct rendering instead of
-`kubectl set image --local`.
+If host access is available, confirm the provider is present on a representative
+node:
 
 ```bash
-sed \
-  -e "s#image: ghcr.io/azure/acr-credential-provider-installer:53b9d94e#image: ${ACR_PROVIDER_INSTALLER_IMAGE}#" \
-  -e "s#acr-credential-provider-system#${ACR_PROVIDER_NAMESPACE}#g" \
-  "$ACR_PROVIDER_ROOT/installer/daemonset.yaml" \
-  > "$WORK_DIR/acr-credential-provider-installer.yaml"
-
-kubectl apply --dry-run=client \
-  -f "$WORK_DIR/acr-credential-provider-installer.yaml" \
-  -o name
+stat /var/lib/kubelet/credential-provider/acr-credential-provider
+grep -R 'azurecr.io' /var/lib/kubelet/credential-provider-config.yaml
 ```
 
-## Install The ACR Credential Provider
-
-The installer DaemonSet writes host kubelet credential-provider state. It
-installs the `acr-credential-provider` binary, writes a
-`CredentialProviderConfig` matching `*.azurecr.io`, appends managed kubelet
-flags, and restarts kubelet only when it changed those flags.
-
-The default first-install restart jitter is 180 seconds, controlled by
-`ACR_PROVIDER_RESTART_JITTER_SECONDS`, so large clusters do not restart kubelet
-everywhere at once.
-
-```bash
-kubectl apply -f "$WORK_DIR/acr-credential-provider-installer.yaml"
-kubectl -n "$ACR_PROVIDER_NAMESPACE" rollout status daemonset/acr-credential-provider-installer --timeout=15m
-kubectl -n "$ACR_PROVIDER_NAMESPACE" get daemonset/acr-credential-provider-installer -o wide
-kubectl -n "$ACR_PROVIDER_NAMESPACE" get pods -o wide
-kubectl -n "$ACR_PROVIDER_NAMESPACE" logs daemonset/acr-credential-provider-installer --tail=20
-kubectl wait nodes --all --for=condition=Ready --timeout=10m
-```
-
-The DaemonSet targets Linux nodes and tolerates all taints. Existing nodes and
-future Linux nodes should converge automatically as long as the installer image
-remains pullable.
+Allow a few minutes for the `AcrPull` role assignment to propagate before the
+provider can mint tokens for new pulls.
 
 ## Validate Private ACR Pull Before Gantry
 
@@ -486,17 +423,14 @@ kubectl delete -f "$WORK_DIR/gantry-daemonset.yaml" --ignore-not-found
 kubectl delete -f "$WORK_DIR/gantry-configmap.yaml" --ignore-not-found
 kubectl delete -f deploy/gantry/node-config.yaml --ignore-not-found
 kubectl delete -f deploy/gantry/serviceaccount.yaml --ignore-not-found
-kubectl delete -f "$WORK_DIR/acr-credential-provider-installer.yaml" --ignore-not-found
 kubectl delete pod acr-provider-preflight acr-gantry-pull-a acr-gantry-pull-b --ignore-not-found
 ```
 
-Deleting Kubernetes objects does not remove host state. If host cleanup is
+Deleting Kubernetes objects does not remove host state. The ACR credential
+provider is managed by AKS, so leave it in place. If Gantry host cleanup is
 required, run a narrowly scoped cleanup DaemonSet that removes only files with
 our managed markers:
 
-- ACR provider binary and `CredentialProviderConfig` installed by the provider
-  installer.
-- The managed kubelet arg block in `/etc/default/kubelet`.
 - Gantry-managed `/etc/containerd/certs.d/_default/hosts.toml`.
 - Optional Gantry peer identity state under `/var/lib/gantry/libp2p`.
 
@@ -504,8 +438,7 @@ our managed markers:
 
 | Symptom | Likely cause | Check |
 | --- | --- | --- |
-| Private ACR Pod fails before Gantry | Provider installer, node identity, or ACR role assignment is wrong | `kubectl describe pod acr-provider-preflight` and installer pod logs |
-| Installer DaemonSet is not Ready | Host kubelet config path differs or privileged host access is blocked | `kubectl -n "$ACR_PROVIDER_NAMESPACE" logs ds/acr-credential-provider-installer` |
+| Private ACR Pod fails before Gantry | Node kubelet identity or ACR role assignment is wrong, or the assignment has not propagated | `kubectl describe pod acr-provider-preflight` and confirm the `AcrPull` assignment |
 | Gantry pod is not Ready | containerd socket or namespace mismatch | Gantry pod logs and `/readyz` |
 | Pulls bypass Gantry | containerd is not reading `certs.d` or `_default/hosts.toml` was not installed | Node `config_path` and `gantry-containerd-config` readiness |
 | Auth works before Gantry but fails after | ACR is not listed in Gantry `upstream_registries` or auth challenge relay failed | Gantry logs and ConfigMap |
