@@ -115,7 +115,7 @@ func envBoolDefault(name string, fallback bool) (bool, error) {
 // the standard kube-public/cluster-info ConfigMap, and failing that from the
 // KUBERNETES_SERVICE_HOST FQDN (managed control planes such as AKS do not
 // publish cluster-info; the kubernetes.azure.com/set-kube-service-host-fqdn pod
-// label makes that env the public API FQDN). Machina and metalman cannot
+// annotation makes that env the public API FQDN). Machina and metalman cannot
 // function without an endpoint, so an empty override with no discoverable value
 // is a hard error.
 func resolveAPIServerEndpoint(ctx context.Context, override string, clientset kubernetes.Interface) (string, error) {

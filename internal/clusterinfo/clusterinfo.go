@@ -9,7 +9,7 @@
 // managed control planes (notably AKS) do not publish it; for those, DiscoverURL
 // falls back to the KUBERNETES_SERVICE_HOST/PORT the kubelet injects, but only
 // when it resolves to an external FQDN rather than the in-cluster ClusterIP (on
-// AKS the kubernetes.azure.com/set-kube-service-host-fqdn pod label makes it the
+// AKS the kubernetes.azure.com/set-kube-service-host-fqdn pod annotation makes it the
 // public API FQDN). The CA for that fallback comes from the in-cluster
 // service-account mount (see InClusterCA).
 package clusterinfo
@@ -127,7 +127,7 @@ func DiscoverURL(ctx context.Context, clientset kubernetes.Interface) (string, e
 // literal (the in-cluster ClusterIP), or an in-cluster Service DNS name
 // (kubernetes.default.svc, ...) is rejected, since none of those are reachable
 // by a node that is still joining the cluster. On AKS the
-// kubernetes.azure.com/set-kube-service-host-fqdn pod label makes this env the
+// kubernetes.azure.com/set-kube-service-host-fqdn pod annotation makes this env the
 // public API FQDN, which is accepted.
 func KubeServiceHostEndpoint() (string, bool) {
 	host := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST"))

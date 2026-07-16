@@ -92,10 +92,11 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 		t.Fatalf("deployment operator-config-hash annotation = %q, want %q (sha256 of complete ConfigMap data)", got, want)
 	}
 
-	// The pod carries the AKS FQDN label so KUBERNETES_SERVICE_HOST resolves to
-	// the public API FQDN, the last-resort source for the advertised endpoint.
-	if got := deploy.Spec.Template.Metadata.Labels["kubernetes.azure.com/set-kube-service-host-fqdn"]; got != "true" {
-		t.Fatalf("deployment pod label kubernetes.azure.com/set-kube-service-host-fqdn = %q, want \"true\"", got)
+	// The pod carries the AKS FQDN annotation so KUBERNETES_SERVICE_HOST resolves
+	// to the public API FQDN, the last-resort source for the advertised endpoint.
+	// AKS only honors this as an annotation (not a label).
+	if got := deploy.Spec.Template.Metadata.Annotations["kubernetes.azure.com/set-kube-service-host-fqdn"]; got != "true" {
+		t.Fatalf("deployment pod annotation kubernetes.azure.com/set-kube-service-host-fqdn = %q, want \"true\"", got)
 	}
 
 	if deploy.Spec.Replicas != 1 {
