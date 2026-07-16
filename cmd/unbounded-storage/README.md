@@ -159,9 +159,12 @@ source = "cache"                # backend or cache component name.
 addr = "0.0.0.0:9000"
 
 [startup.memory]                 # startup-fixed; read once at process start.
-no_hugepages   = false           # true allocates per-shard backing from the heap.
-memory_total_bytes = 134217728   # u64 bytes (no K/M/G suffix). Total backing pool split
-                                 #   evenly across serving shards. 0 -> 128 MiB.
+no_hugepages   = false           # true allocates shard backings from the heap.
+memory_total_bytes = 134217728   # u64 bytes (no K/M/G suffix). Node-wide data pool;
+                                 #   partial 2 MiB pages are unused, then whole pages
+                                 #   are split across serving shards. Unset -> 128 MiB;
+                                 #   explicit 0 is invalid when shards are configured.
+                                 #   RPC scratch adds 8 pages per fabric unit.
 
 [startup.fabric]
 progress_threads    = 2          # libfabric progress threads per fabric unit.

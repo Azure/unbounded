@@ -99,7 +99,7 @@ dynamically reloadable cluster state and the startup-fixed settings - is
 read from the config file.
 
 The startup-fixed settings (collected into `StartupSettings`: the fabric
-endpoint and thread pools, per-shard memory sizing, and CPU-topology
+endpoint and thread pools, node-wide memory sizing, and CPU-topology
 selection) live in the config's `[startup]` section. They are read once
 at process start and cannot change without a restart, so they are
 excluded from the live-reload diff.
@@ -107,8 +107,10 @@ excluded from the live-reload diff.
 - `[startup.memory]` - `no_hugepages` (allocate shard backings from
   the heap instead of 2 MiB hugepages) and `memory_total_bytes` (u64
   bytes, no suffix; unset/null defaults to 128 MiB) - the total backing
-  pool, split evenly across the serving shards so the host footprint stays
-  fixed regardless of the auto-scaled shard count.
+  pool for shard data. The budget is floored to whole 2 MiB pages, requires
+  at least one page per serving shard, and distributes whole pages evenly
+  with any remainder assigned in worker order. Each fabric unit also allocates
+  a separate fixed eight-page RPC scratch backing outside this pool.
 - `[startup.fabric]` - one `binds` table (`tcp`, `rdma`, or `auto_rdma`),
   `progress_threads` (2), `progress_poll_us` (10), `rpc_worker_threads` (4),
   `max_inflight` (1024) - the fabric endpoint, thread pools, and in-flight
@@ -182,8 +184,9 @@ per-shard `!Send` object graph:
    `Provider::Tcp` fallback on `lo`); build a `FabricConfig` via
    `fabric::defaults_for(device_name, runtime, widx)`; `Fabric::new` and resolve
    `self_address()`.
-2. **Memory.** Allocate a NUMA-local `Backing` via `memory::allocate` **on the
-   pinned thread** (mempolicy keeps pages local; the hugepage variant `mbind`s).
+2. **Memory.** Allocate the shard's assigned whole-page share of the node-wide
+   data pool as a NUMA-local `Backing` via `memory::allocate` **on the pinned
+   thread** (mempolicy keeps pages local; the hugepage variant `mbind`s).
    Register it with the fabric as a memory region (MR), and register it with the
    socket ring as a fixed buffer for zero-copy send/recv.
 3. **Origin backend.** Resolve the origin URL and build an `HttpBackend`
@@ -191,11 +194,12 @@ per-shard `!Send` object graph:
 4. **Transport + blockstore + pool.** Build a `RoutedTransport` (Chord routing +
    fabric transport + origin backend), a `LiveShardLocalStore` over the disk
    channel directory as the `BlockStore`, then `Pool::new`.
-5. **RPC server.** Allocate a **separate** scratch backing
-   (`RPC_SCRATCH_PAGES = 8`, one scratch page per in-flight serve/forward),
-   register it as its own fabric MR and its own `LiveShardLocalStore` (a
-   `PageRef` resolves through exactly one backing's geometry, so scratch needs a
-   distinct store). Build a `RecursiveHandler` and start the fabric RPC server.
+5. **RPC server.** `FabricGroup`, constructed before the shards, allocates a
+   **separate** scratch backing for each fabric unit (`RPC_SCRATCH_PAGES = 8`,
+   one scratch page per in-flight serve/forward) and registers it as its own
+   fabric MR. After shard publication, it builds the unit's `RecursiveHandler`
+   and starts the RPC server. Scratch uses a distinct `LiveShardLocalStore`
+   because a `PageRef` resolves through exactly one backing's geometry.
 6. **Frontends.** A shard hosts a `FrontendRegistry` of any number of
    frontends keyed by component name. Each spec binds its listener with `SO_REUSEPORT` and
    builds an `HttpDriver`/`S3Driver`; the registry can add and remove frontends
